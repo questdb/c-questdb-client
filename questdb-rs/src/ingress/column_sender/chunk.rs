@@ -94,7 +94,7 @@ impl ImportedArrowColumn {
         if let Some(want_symbol) = symbol {
             let mut metadata = field.metadata().clone();
             metadata.insert(
-                crate::arrow_meta::SYMBOL.to_string(),
+                crate::arrow_metadata::SYMBOL.to_string(),
                 if want_symbol { "true" } else { "false" }.to_string(),
             );
             field = field.with_metadata(metadata);

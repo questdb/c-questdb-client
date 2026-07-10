@@ -5,7 +5,7 @@ use questdb::{
     ingress::{Sender, TimestampNanos},
 };
 
-const DEFAULT_CONF: &str = "qwpws::addr=127.0.0.1:9000;in_flight_window=128;";
+const DEFAULT_CONF: &str = "ws::addr=127.0.0.1:9000;in_flight_window=128;";
 const DEFAULT_TABLE: &str = "qwp_ws_unified_sfa_bench";
 const DEFAULT_ROWS: usize = 50_000_000;
 const DEFAULT_BATCH_SIZE: usize = 1_000;

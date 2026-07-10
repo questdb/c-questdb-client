@@ -71,12 +71,12 @@ extern "C" {
 //                           edge and no concurrent access — is undefined
 //                           behaviour.
 //
-//   `reader_error`   — has no thread affinity. May be created on one
+//   `questdb_error`   — has no thread affinity. May be created on one
 //                           thread and freed/inspected on another, but
 //                           must not be used from two threads at once.
 //
 // Borrowed pointers returned by this API — `reader_server_info*`,
-// `reader_failover_event*`, host byte slices, varchar/binary/symbol
+// `reader_failover_reset_event*`, host byte slices, varchar/binary/symbol
 // values, validity bitmaps, and array views — are invalidated by any
 // concurrent operation on their owning handle, with no library-side
 // synchronisation. A reader/cursor mutation on one thread can free or
@@ -112,78 +112,16 @@ extern "C" {
 // Unless explicitly documented as "idempotent on NULL" (e.g. the various
 // `_close` / `_free` functions), every pointer parameter on this API —
 // handle pointers (`reader*`, `reader_query*`, `reader_cursor*`,
-// `reader_error*`), the `err_out` slot, and every `out_*` output pointer
+// `questdb_error*`), the `err_out` slot, and every `out_*` output pointer
 // — MUST be non-NULL. Passing NULL is undefined behaviour: the library does
 // not check, and dereferencing the NULL slot will SIGSEGV (or worse, silently
 // corrupt memory if the page happens to be mapped).
 
-/////////// Error handling (unified with the line sender).
+/////////// Error handling.
 //
-// Ingest and query share ONE error object and ONE error-code enum. The
-// reader's error type and codes are back-compat aliases of the canonical
-// `line_sender_error` / `line_sender_error_code` declared in
-// <questdb/ingress/line_sender.h> (already included above). The query codes
-// live at discriminants 20..34 of that enum; the shared codes reuse the
-// frozen ingress numbers, so e.g. `reader_error_invalid_api_call == 1`.
-
-/** An error that occurred when using the line reader.
- *  Alias of `line_sender_error` — the client's single error object. */
-typedef line_sender_error reader_error;
-
-/** Category of error. Alias of the unified `line_sender_error_code`. */
-typedef line_sender_error_code reader_error_code;
-
-/* Back-compat names for the reader error codes — each maps onto its
- * canonical `line_sender_error_*` counterpart in the unified enum. */
-#define reader_error_could_not_resolve_addr line_sender_error_could_not_resolve_addr
-#define reader_error_config_error line_sender_error_config_error
-#define reader_error_invalid_api_call line_sender_error_invalid_api_call
-#define reader_error_socket_error line_sender_error_socket_error
-#define reader_error_tls_error line_sender_error_tls_error
-#define reader_error_handshake_error line_sender_error_handshake_error
-#define reader_error_auth_error line_sender_error_auth_error
-#define reader_error_unsupported_server line_sender_error_unsupported_server
-#define reader_error_role_mismatch line_sender_error_role_mismatch
-#define reader_error_protocol_error line_sender_error_protocol_error
-#define reader_error_invalid_utf8 line_sender_error_invalid_utf8
-#define reader_error_invalid_bind line_sender_error_invalid_bind
-#define reader_error_server_schema_mismatch line_sender_error_server_schema_mismatch
-#define reader_error_server_parse_error line_sender_error_server_parse_error
-#define reader_error_server_internal_error line_sender_error_server_internal_error
-#define reader_error_server_security_error line_sender_error_server_security_error
-#define reader_error_limit_exceeded line_sender_error_limit_exceeded
-#define reader_error_server_limit_exceeded line_sender_error_server_limit_exceeded
-#define reader_error_cancelled line_sender_error_cancelled
-#define reader_error_failover_would_duplicate line_sender_error_failover_would_duplicate
-#define reader_error_schema_drift line_sender_error_schema_drift
-#define reader_error_no_schema line_sender_error_no_schema
-#define reader_error_arrow_export line_sender_error_arrow_export
-#define reader_error_connect_timeout line_sender_error_connect_timeout
-
-/**
- * Error code categorising the error.
- * NULL-safe: returns `reader_error_invalid_api_call` for a NULL input.
- */
-QUESTDB_CLIENT_API
-reader_error_code reader_error_get_code(const reader_error*);
-
-/**
- * UTF-8 encoded error message. Never returns NULL.
- * The `len_out` argument is set to the number of bytes in the string.
- * The string is NOT null-terminated.
- *
- * NULL-safe on both arguments. A NULL `error` returns a static empty
- * string and writes `*len_out = 0` (if `len_out` is non-NULL); a NULL
- * `len_out` is silently ignored. The combination matches `_free`'s
- * NULL-safety so the canonical "log + free" pattern stays sound even
- * if a caller's bookkeeping leaves `err` as NULL on a particular path.
- */
-QUESTDB_CLIENT_API
-const char* reader_error_msg(const reader_error*, size_t* len_out);
-
-/** Free the error returned via an `err_out` parameter. Idempotent on NULL. */
-QUESTDB_CLIENT_API
-void reader_error_free(reader_error*);
+// Every fallible reader operation reports the client-wide `questdb_error`
+// declared in <questdb/ingress/line_sender.h>. Ingest and query share one
+// object, one code vocabulary, and the `questdb_error_*` accessor functions.
 
 /////////// Column kinds.
 
@@ -235,20 +173,12 @@ typedef struct reader_cursor reader_cursor;
 typedef struct reader_query reader_query;
 
 /* ---------------------------------------------------------------------------
- * Internal / test-only standalone reader constructors.
+ * Standalone reader constructors.
  *
- * NOT part of the supported public API. The supported way to obtain a
- * reader is the connection pool:
- *
- *     questdb_db_connect_reader(...)  ->  questdb_db_borrow_reader(...)
- *
- * (`questdb_db_connect` on the writer side opens the same pool). These
- * standalone constructors remain exported by the shared library for the
- * in-tree test-suite and internal tooling, but are hidden from the public
- * header surface. Define `QUESTDB_READER_INTERNAL_CONSTRUCTORS` before
- * including this header to make their declarations visible.
+ * Use these for a single dedicated reader connection. Applications that share
+ * a QuestDB endpoint across multiple readers and senders can instead obtain
+ * readers from the `questdb_db` connection pool below.
  * ------------------------------------------------------------------------- */
-#ifdef QUESTDB_READER_INTERNAL_CONSTRUCTORS
 
 /**
  * Construct a reader from a QuestDB config string.
@@ -260,7 +190,7 @@ typedef struct reader_query reader_query;
  *
  * The `config` payload is re-validated as UTF-8 on entry; a hand-rolled
  * `line_sender_utf8` carrying invalid bytes (i.e. one not built via
- * `line_sender_utf8_init`) surfaces as `reader_error_invalid_utf8`
+ * `line_sender_utf8_init`) surfaces as `questdb_error_invalid_utf8`
  * instead of triggering undefined behaviour.
  *
  * @param[in] config UTF-8 config string.
@@ -270,7 +200,7 @@ typedef struct reader_query reader_query;
 QUESTDB_CLIENT_API
 reader* reader_from_conf(
     line_sender_utf8 config,
-    reader_error** err_out);
+    questdb_error** err_out);
 
 /**
  * Construct a reader from the configuration stored in the
@@ -278,10 +208,10 @@ reader* reader_from_conf(
  * the same format as `reader_from_conf`.
  *
  * Returns NULL and sets `*err_out` with one of:
- *   - `reader_error_config_error` — `QDB_CLIENT_CONF` is not set,
+ *   - `questdb_error_config_error` — `QDB_CLIENT_CONF` is not set,
  *     or its value is set but malformed (the parser's error code is
  *     used for the latter).
- *   - `reader_error_invalid_utf8` — `QDB_CLIENT_CONF` is set but
+ *   - `questdb_error_invalid_utf8` — `QDB_CLIENT_CONF` is set but
  *     its bytes are not valid UTF-8.
  *
  * On success returns a non-NULL handle that must be released with
@@ -292,9 +222,7 @@ reader* reader_from_conf(
  */
 QUESTDB_CLIENT_API
 reader* reader_from_env(
-    reader_error** err_out);
-
-#endif /* QUESTDB_READER_INTERNAL_CONSTRUCTORS */
+    questdb_error** err_out);
 
 /**
  * Close the reader and release all associated resources. Idempotent on NULL.
@@ -327,50 +255,31 @@ void reader_close(reader* reader);
 QUESTDB_CLIENT_API
 void reader_drop_on_return(reader* reader);
 
-/* Reader pool (provided by `questdb/ingress/column_sender.h`'s
- * `questdb_db` opaque). Same FFI surface as the writer-side
- * `questdb_db_borrow_column_sender` / `questdb_db_return_column_sender`,
- * but for `reader` handles. Lives here because it wraps the `reader` type.
+/* Shared reader/sender connection pool. A reader-only consumer can drive the
+ * complete lifecycle through this header:
  *
- * A reader-only consumer can open, use, and close the pool through
- * this header alone, using only the `reader_error` type:
+ *     questdb_db_connect -> questdb_db_borrow_reader -> reader_close
+ *                        -> questdb_db_close
  *
- *     questdb_db_connect_reader  ->  questdb_db_borrow_reader
- *                                ->  reader_prepare / _query_* / _cursor_*
- *                                ->  questdb_db_return_reader
- *                                ->  questdb_db_close
- *
- * The writer-flavoured `questdb_db_connect` in
- * `questdb/ingress/column_sender.h` opens the same pool but reports the
- * ingress `line_sender_error`; prefer `questdb_db_connect_reader` on a
- * read-only path so you never have to include the ingress header or
- * juggle two error types. */
+ * `reader_close` returns a pooled reader to its owning pool; the handle carries
+ * the required pool back-reference. */
 struct questdb_db;
 
 /**
- * Open a connection pool, reporting connect-time failures through the
- * egress `reader_error` type. Reader-only counterpart to
- * `questdb_db_connect` (declared in `questdb/ingress/column_sender.h`,
- * which reports `line_sender_error`).
+ * Open the shared connection pool. This is the same entry point declared in
+ * `questdb/ingress/column_sender.h`; it is repeated here so reader-only C
+ * consumers need not include the column-sender header.
  *
- * Opens the *same* unified pool and returns the *same* `questdb_db*`;
- * only the error channel differs. `conf` is a UTF-8 `qwpws::` /
- * `qwpwss::` connect string of `conf_len` bytes. Returns NULL on
- * failure and, when `err_out != NULL`, stores a freshly-allocated
- * `reader_error*` into `*err_out` (release with
- * `reader_error_free`).
- *
- * Like `questdb_db_connect`, the pool is lazy: this opens no connections
- * during the call (so it succeeds even against an unreachable endpoint).
- * The reader pool opens a reader socket on the first
- * `questdb_db_borrow_reader`, which is where connect-time transport
- * failures surface.
+ * `conf` is a UTF-8 `ws::` / `wss::` connect string of `conf_len`
+ * bytes. The pool is lazy: the first borrow opens its connection. Returns NULL
+ * on configuration failure and stores a newly allocated `questdb_error` in
+ * `*err_out` when that pointer is non-NULL.
  */
 QUESTDB_CLIENT_API
-struct questdb_db* questdb_db_connect_reader(
+struct questdb_db* questdb_db_connect(
     const char* conf,
     size_t conf_len,
-    reader_error** err_out);
+    questdb_error** err_out);
 
 /**
  * Close the pool. Accepts NULL and no-ops.
@@ -384,7 +293,7 @@ struct questdb_db* questdb_db_connect_reader(
  * Outstanding `reader*` handles are independent leases: closing them after
  * pool close is safe, and already-created cursors may continue streaming,
  * but preparing a new query on a pooled reader after close fails with
- * `reader_error_invalid_api_call`. A reader returned after close is closed,
+ * `questdb_error_invalid_api_call`. A reader returned after close is closed,
  * not recycled.
  */
 QUESTDB_CLIENT_API
@@ -402,18 +311,7 @@ void questdb_db_close(struct questdb_db* db);
 QUESTDB_CLIENT_API
 reader* questdb_db_borrow_reader(
     struct questdb_db* db,
-    reader_error** err_out);
-
-/**
- * Return a borrowed reader to the pool. Invalidates `reader`.
- * Accepts NULL `reader` and no-ops. `db` is ignored — the reader
- * carries its own pool back-reference — but kept in the ABI for
- * symmetry with the borrow call.
- */
-QUESTDB_CLIENT_API
-void questdb_db_return_reader(
-    struct questdb_db* db,
-    reader* reader);
+    questdb_error** err_out);
 
 /** Snapshot of idle reader count. Diagnostics / test-only; not part of
  *  the supported API surface. */
@@ -465,14 +363,14 @@ QUESTDB_CLIENT_API void reader_reset_timing(reader*);
  * established yet (no `SERVER_INFO` received), the `reader` handle is
  * NULL, or a `reader_query` / `reader_cursor` produced by this
  * reader is still live — all surfaced as
- * `reader_error_invalid_api_call`. On success returns `true` and
+ * `questdb_error_invalid_api_call`. On success returns `true` and
  * writes the version to `*out_version`.
  */
 QUESTDB_CLIENT_API
 bool reader_server_version(
     const reader* reader,
     uint8_t* out_version,
-    reader_error** err_out);
+    questdb_error** err_out);
 
 /**
  * Borrow the current endpoint host as a UTF-8 byte slice. The pointer is
@@ -502,7 +400,7 @@ uint16_t reader_current_addr_port(const reader* reader);
 
 /**
  * Opaque borrowed handle to a `SERVER_INFO` body. Returned by
- * `reader_server_info` and `reader_failover_event_server_info`.
+ * `reader_server_info` and `reader_failover_reset_event_server_info`.
  * Never free — the underlying storage is owned by the reader / failover
  * event respectively.
  */
@@ -564,17 +462,21 @@ QUESTDB_CLIENT_API void reader_server_info_cluster_id(
 QUESTDB_CLIENT_API void reader_server_info_node_id(
     const reader_server_info*, const char** out_buf, size_t* out_len);
 
-/////////// Failover callback.
+/////////// Failover reset callback.
 
 /**
  * Opaque borrowed handle to a failover event. The pointer passed to your
  * callback is valid only for the duration of that callback invocation.
  */
-typedef struct reader_failover_event reader_failover_event;
+typedef struct reader_failover_reset_event reader_failover_reset_event;
 
 /**
- * User callback fired after each successful mid-query failover. The
- * `event` pointer is valid only for the duration of the call.
+ * User callback fired after each successful mid-query failover. Installing
+ * this callback authorizes replay after a batch has already reached the
+ * caller: the callback must discard any partial results before replay begins.
+ * Without it, a post-delivery failure returns
+ * `questdb_error_failover_would_duplicate`. The `event` pointer is valid only
+ * for the duration of the call.
  *
  * Reentrancy contract — the callback MUST NOT:
  *
@@ -613,47 +515,47 @@ typedef struct reader_failover_event reader_failover_event;
  * The callback runs on the thread driving the in-flight cursor
  * operation.
  */
-typedef void (*reader_failover_callback)(
-    const reader_failover_event* event,
+typedef void (*reader_failover_reset_callback)(
+    const reader_failover_reset_event* event,
     void* user_data);
 
 /** Host of the previously-connected endpoint that failed. UTF-8 byte slice
  *  borrowed for the duration of the callback. */
-QUESTDB_CLIENT_API void reader_failover_event_failed_host(
-    const reader_failover_event*, const char** out_buf, size_t* out_len);
+QUESTDB_CLIENT_API void reader_failover_reset_event_failed_host(
+    const reader_failover_reset_event*, const char** out_buf, size_t* out_len);
 /** Port of the previously-connected endpoint that failed. */
 QUESTDB_CLIENT_API uint16_t
-reader_failover_event_failed_port(const reader_failover_event*);
+reader_failover_reset_event_failed_port(const reader_failover_reset_event*);
 /** Host of the new endpoint the cursor is reconnecting to. UTF-8 byte slice
  *  borrowed for the duration of the callback. */
-QUESTDB_CLIENT_API void reader_failover_event_new_host(
-    const reader_failover_event*, const char** out_buf, size_t* out_len);
+QUESTDB_CLIENT_API void reader_failover_reset_event_new_host(
+    const reader_failover_reset_event*, const char** out_buf, size_t* out_len);
 /** Port of the new endpoint the cursor is reconnecting to. */
 QUESTDB_CLIENT_API uint16_t
-reader_failover_event_new_port(const reader_failover_event*);
+reader_failover_reset_event_new_port(const reader_failover_reset_event*);
 /** Request_id reissued on the new connection (the original request_id is
  *  invalidated by the failover; the cursor's request_id is updated). */
 QUESTDB_CLIENT_API int64_t
-reader_failover_event_new_request_id(const reader_failover_event*);
+reader_failover_reset_event_new_request_id(const reader_failover_reset_event*);
 /** Number of reconnect attempts that preceded this success (1 on the first
  *  retry, etc.). */
 QUESTDB_CLIENT_API uint32_t
-reader_failover_event_attempts(const reader_failover_event*);
+reader_failover_reset_event_attempts(const reader_failover_reset_event*);
 /** Wall-clock nanoseconds spent reconnecting — sleep + dial + handshake +
  *  `SERVER_INFO` read. Saturating. */
 QUESTDB_CLIENT_API uint64_t
-reader_failover_event_elapsed_ns(const reader_failover_event*);
+reader_failover_reset_event_elapsed_ns(const reader_failover_reset_event*);
 /** Error code that triggered the failover (cause-of-death of the previous
  *  connection). */
-QUESTDB_CLIENT_API reader_error_code
-reader_failover_event_trigger_code(const reader_failover_event*);
+QUESTDB_CLIENT_API questdb_error_code
+reader_failover_reset_event_trigger_code(const reader_failover_reset_event*);
 /** Trigger error message (UTF-8). Borrowed for the duration of the call. */
-QUESTDB_CLIENT_API void reader_failover_event_trigger_msg(
-    const reader_failover_event*, const char** out_buf, size_t* out_len);
+QUESTDB_CLIENT_API void reader_failover_reset_event_trigger_msg(
+    const reader_failover_reset_event*, const char** out_buf, size_t* out_len);
 /** `SERVER_INFO` for the new endpoint; NULL only if the server omitted
  *  it. */
 QUESTDB_CLIENT_API const reader_server_info*
-reader_failover_event_server_info(const reader_failover_event*);
+reader_failover_reset_event_server_info(const reader_failover_reset_event*);
 
 /////////// Failover progress callback.
 
@@ -681,7 +583,7 @@ typedef enum reader_failover_phase
     reader_failover_phase_retrying = 1,
     /** A reconnect succeeded; replayed batches will start arriving on
      *  the new connection. Fires immediately BEFORE the
-     *  `reader_failover_callback` registered via
+     *  `reader_failover_reset_callback` registered via
      *  `reader_query_on_failover_reset` (when both are installed)
      *  so a single sink sees the entire lifecycle in order. */
     reader_failover_phase_reset = 2,
@@ -709,7 +611,7 @@ typedef struct reader_failover_progress_event reader_failover_progress_event;
  * lifecycle. The `event` pointer is valid only for the duration of
  * the call.
  *
- * Reentrancy contract — identical to `reader_failover_callback`.
+ * Reentrancy contract — identical to `reader_failover_reset_callback`.
  * The callback MUST NOT:
  *
  *  - Call any function on the originating `reader`, the
@@ -790,7 +692,7 @@ QUESTDB_CLIENT_API uint32_t reader_failover_progress_event_attempt(
 /** Error code that triggered the failover (the original cause-of-
  *  death). Preserved across every phase so subscribers see consistent
  *  context regardless of when they latch on. */
-QUESTDB_CLIENT_API reader_error_code
+QUESTDB_CLIENT_API questdb_error_code
 reader_failover_progress_event_trigger_code(
     const reader_failover_progress_event*);
 
@@ -815,12 +717,12 @@ reader_failover_progress_event_server_info(
 
 /** Final error code (GaveUp phase only). Returns `true` and writes
  *  the code to `*out_code` on GaveUp; returns `false` and writes
- *  `reader_error_invalid_api_call` in every other phase. The
+ *  `questdb_error_invalid_api_call` in every other phase. The
  *  code matches what the cursor's next `_next_batch` / `_add_credit`
  *  call will surface. */
 QUESTDB_CLIENT_API bool reader_failover_progress_event_final_error_code(
     const reader_failover_progress_event*,
-    reader_error_code* out_code);
+    questdb_error_code* out_code);
 
 /** Final error message (GaveUp phase only). Returns `true` and writes
  *  the borrowed UTF-8 message on GaveUp; returns `false` and writes
@@ -851,7 +753,7 @@ QUESTDB_CLIENT_API bool reader_failover_progress_event_final_error_msg(
  * Returns NULL and sets `*err_out` if a query or cursor against this
  * reader is already in flight (only one may be live per reader at a
  * time), or if `sql` carries invalid UTF-8 (re-validated on entry —
- * `reader_error_invalid_utf8`). Server-side validation of the SQL
+ * `questdb_error_invalid_utf8`). Server-side validation of the SQL
  * itself is deferred to `reader_query_execute`.
  *
  * @return Query handle, or NULL on error.
@@ -860,7 +762,7 @@ QUESTDB_CLIENT_API
 reader_query* reader_prepare(
     reader* reader,
     line_sender_utf8 sql,
-    reader_error** err_out);
+    questdb_error** err_out);
 
 /**
  * Free a query without executing it. Idempotent on NULL.
@@ -881,7 +783,7 @@ void reader_query_free(reader_query* query);
  * `reader_query_free(*query_inout)` becomes a no-op. Passing NULL
  * for `query_inout` itself, or for `*query_inout`, is a contract
  * violation: the call sets `*err_out` to
- * `reader_error_invalid_api_call` and returns NULL.
+ * `questdb_error_invalid_api_call` and returns NULL.
  *
  * On success, ownership transfers to the returned cursor; on failure,
  * `*err_out` is set and NULL is returned.
@@ -889,7 +791,7 @@ void reader_query_free(reader_query* query);
 QUESTDB_CLIENT_API
 reader_cursor* reader_query_execute(
     reader_query** query_inout,
-    reader_error** err_out);
+    questdb_error** err_out);
 
 /**
  * Convenience: prepare + execute in one call, for SQL with no binds.
@@ -898,16 +800,16 @@ reader_cursor* reader_query_execute(
  * caller. The originating reader MUST outlive the returned cursor.
  *
  * Returns NULL and sets `*err_out` if `reader` is NULL, `sql` carries
- * invalid UTF-8 (`reader_error_invalid_utf8`), another query or
+ * invalid UTF-8 (`questdb_error_invalid_utf8`), another query or
  * cursor is already in flight on this reader
- * (`reader_error_invalid_api_call`), or the server rejects the
+ * (`questdb_error_invalid_api_call`), or the server rejects the
  * statement.
  */
 QUESTDB_CLIENT_API
 reader_cursor* reader_execute(
     reader* reader,
     line_sender_utf8 sql,
-    reader_error** err_out);
+    questdb_error** err_out);
 
 /* Bind parameters. All `reader_query_bind_*` functions append a bind
  * to the query in declaration order, matching the SQL placeholders
@@ -918,7 +820,7 @@ reader_cursor* reader_execute(
  * is NOT pushed and every subsequent `_bind_*` call on the same query is
  * a no-op — the upstream builder is frozen. This keeps placeholder
  * indices stable: a caller that ignores the deferred error and continues
- * binding will get a clean `reader_error_invalid_utf8` from
+ * binding will get a clean `questdb_error_invalid_utf8` from
  * `_query_execute` rather than a confusing "wrong parameter type at $K"
  * caused by index drift. To recover, drop the query and rebuild. */
 
@@ -980,7 +882,7 @@ QUESTDB_CLIENT_API void reader_query_bind_geohash(
  *  The `v` payload is re-validated as UTF-8 on entry. This function returns
  *  void, so an invalid-UTF-8 contract violation is stored on the query and
  *  surfaced from `reader_query_execute` as
- *  `reader_error_invalid_utf8` (first-error-wins; later binds and the
+ *  `questdb_error_invalid_utf8` (first-error-wins; later binds and the
  *  builder state are not touched once a deferred error is set). */
 QUESTDB_CLIENT_API void reader_query_bind_varchar(
     reader_query*, line_sender_utf8 v);
@@ -989,13 +891,13 @@ QUESTDB_CLIENT_API void reader_query_bind_varchar(
  *  `len == 0` (binds an empty byte slice). For any non-zero `len`, `buf`
  *  must be non-NULL and point to at least `len` readable bytes — a NULL
  *  `buf` with non-zero `len` stores a deferred
- *  `reader_error_invalid_bind` on the query that surfaces from
+ *  `questdb_error_invalid_bind` on the query that surfaces from
  *  `reader_query_execute`, matching the policy of
  *  `reader_query_bind_uuid`.
  *
  *  Not supported by Phase 1 servers: the call records the value, but
  *  `reader_query_execute` will fail with
- *  `reader_error_invalid_bind` because the server has no decoder
+ *  `questdb_error_invalid_bind` because the server has no decoder
  *  for the BINARY wire type. Listed in the public ABI for
  *  forward-compatibility — when the server adds support, no client
  *  change is needed. */
@@ -1004,7 +906,7 @@ QUESTDB_CLIENT_API void reader_query_bind_binary(
 
 /** Bind a 16-byte UUID value (raw bytes). `value` MUST be non-NULL and point
  *  to at least 16 readable bytes. A NULL `value` stores a deferred
- *  `reader_error_invalid_bind` on the query that surfaces from
+ *  `questdb_error_invalid_bind` on the query that surfaces from
  *  `reader_query_execute` — silently binding all-zero bytes would
  *  produce a valid-looking `00000000-0000-0000-0000-000000000000` UUID and
  *  corrupt the query. To bind SQL NULL, call `reader_query_bind_null`
@@ -1014,7 +916,7 @@ QUESTDB_CLIENT_API void reader_query_bind_uuid(
 
 /** Bind a 32-byte LONG256 value (raw little-endian bytes). `value` MUST be
  *  non-NULL and point to at least 32 readable bytes. A NULL `value` stores
- *  a deferred `reader_error_invalid_bind` on the query that surfaces
+ *  a deferred `questdb_error_invalid_bind` on the query that surfaces
  *  from `reader_query_execute`, for the same reason as
  *  `reader_query_bind_uuid`. To bind SQL NULL, call
  *  `reader_query_bind_null` with `reader_column_kind_long256`. */
@@ -1025,7 +927,7 @@ QUESTDB_CLIENT_API void reader_query_bind_long256(
  *
  *  Not supported by Phase 1 servers: the call records the value, but
  *  `reader_query_execute` will fail with
- *  `reader_error_invalid_bind` because the server has no decoder
+ *  `questdb_error_invalid_bind` because the server has no decoder
  *  for the IPv4 wire type. Listed in the public ABI for
  *  forward-compatibility — when the server adds support, no client
  *  change is needed. */
@@ -1053,7 +955,7 @@ QUESTDB_CLIENT_API void reader_query_bind_decimal128(
 
 /** Bind a DECIMAL256 mantissa as 32 little-endian raw bytes plus column scale.
  *  `value` MUST be non-NULL and point to at least 32 readable bytes. A NULL
- *  `value` stores a deferred `reader_error_invalid_bind` on the query
+ *  `value` stores a deferred `questdb_error_invalid_bind` on the query
  *  that surfaces from `reader_query_execute`, for the same reason as
  *  `reader_query_bind_uuid`. To bind SQL NULL, call
  *  `reader_query_bind_null_decimal256(query, scale)`. */
@@ -1069,13 +971,13 @@ QUESTDB_CLIENT_API void reader_query_bind_decimal256(
  * `uint32_t` (typed-enum constants implicitly convert). The integer ABI
  * keeps the FFI boundary sound when a caller hands across a value outside
  * the declared discriminants — out-of-range values surface as a deferred
- * `reader_error_invalid_bind` on `reader_query_execute` rather
+ * `questdb_error_invalid_bind` on `reader_query_execute` rather
  * than triggering undefined behaviour.
  *
  * Phase 1 servers don't accept all in-range kinds. Passing
  * `reader_column_kind_ipv4` is accepted by this call but
  * `reader_query_execute` will fail with
- * `reader_error_invalid_bind` — see `reader_query_bind_ipv4`.
+ * `questdb_error_invalid_bind` — see `reader_query_bind_ipv4`.
  * The IPv4 discriminant stays in the public ABI for
  * forward-compatibility.
  */
@@ -1090,7 +992,7 @@ QUESTDB_CLIENT_API void reader_query_bind_null_varchar(reader_query*);
  *  Not supported by Phase 1 servers — see
  *  `reader_query_bind_binary` for the rationale. The call records
  *  the null, but `reader_query_execute` will fail with
- *  `reader_error_invalid_bind`. */
+ *  `questdb_error_invalid_bind`. */
 QUESTDB_CLIENT_API void reader_query_bind_null_binary(reader_query*);
 
 /** Bind a SQL NULL of column kind DECIMAL64 with the given column `scale`. */
@@ -1131,7 +1033,7 @@ QUESTDB_CLIENT_API void reader_query_set_reset_symbol_dict(
  * `reader_cursor_next_batch`, *before* any replayed batch arrives on
  * a new connection.
  *
- * See `reader_failover_callback` for the full reentrancy contract:
+ * See `reader_failover_reset_callback` for the full reentrancy contract:
  * the callback MUST NOT call back into the originating reader / query /
  * cursor, MUST NOT throw or `longjmp` (an escaping unwind aborts the
  * process), and MUST NOT block — it runs synchronously in the cursor's
@@ -1139,7 +1041,7 @@ QUESTDB_CLIENT_API void reader_query_set_reset_symbol_dict(
  */
 QUESTDB_CLIENT_API void reader_query_on_failover_reset(
     reader_query* query,
-    reader_failover_callback callback,
+    reader_failover_reset_callback callback,
     void* user_data);
 
 /**
@@ -1149,12 +1051,11 @@ QUESTDB_CLIENT_API void reader_query_on_failover_reset(
  * phase of a mid-query failover lifecycle — see
  * `reader_failover_phase`.
  *
- * Installing this callback also opts the cursor in to "I will handle
- * replay-after-data-delivered correctly," the same way
- * `reader_query_on_failover_reset` does — either being installed
- * clears the silent-duplicate guard documented on
- * `reader_cursor_next_batch`. If you only want telemetry and not
- * replay semantics, set `failover=off` instead.
+ * This callback is telemetry-only. Installing it does not authorize replay
+ * after a batch has already reached the caller. Install
+ * `reader_query_on_failover_reset` as well when the caller can discard
+ * partial results safely; otherwise a post-delivery failure returns
+ * `questdb_error_failover_would_duplicate`.
  *
  * See `reader_failover_progress_callback` for the full
  * reentrancy contract: the callback MUST NOT call back into the
@@ -1191,7 +1092,7 @@ QUESTDB_CLIENT_API void reader_query_on_failover_progress(
  * cancellation that surfaces errors and drains pending frames before
  * the connection is closed. Idempotent on NULL.
  *
- * Naming note: aligns with `reader_query_free` / `reader_error_free`
+ * Naming note: aligns with `reader_query_free` / `questdb_error_free`
  * (and ingress `line_sender_buffer_free` / `_opts_free`) — the persistent
  * network transport is the reader, freed via `reader_close`; every
  * other handle, including this per-query cursor, uses `_free`.
@@ -1234,7 +1135,7 @@ typedef struct reader_batch reader_batch;
 QUESTDB_CLIENT_API
 const reader_batch* reader_cursor_next_batch(
     reader_cursor* cursor,
-    reader_error** err_out);
+    questdb_error** err_out);
 
 /** Rows in the batch. Returns 0 on a NULL handle. */
 QUESTDB_CLIENT_API
@@ -1272,7 +1173,7 @@ bool reader_batch_column_kind(
     const reader_batch* batch,
     size_t col_idx,
     reader_column_kind* out_kind,
-    reader_error** err_out);
+    questdb_error** err_out);
 
 /**
  * Borrowed UTF-8 column name for `col_idx`. NOT null-terminated; use
@@ -1287,7 +1188,7 @@ bool reader_batch_column_name(
     size_t col_idx,
     const char** out_buf,
     size_t* out_len,
-    reader_error** err_out);
+    questdb_error** err_out);
 
 /**
  * Bulk descriptor for one scalar / variable-width column. Every pointer
@@ -1338,7 +1239,7 @@ bool reader_batch_column_data(
     const reader_batch* batch,
     size_t col_idx,
     reader_column_data* out,
-    reader_error** err_out);
+    questdb_error** err_out);
 
 /**
  * Bulk descriptor for a `DOUBLE_ARRAY` column. Four-buffer ragged layout
@@ -1384,7 +1285,7 @@ bool reader_batch_array_column_data(
     const reader_batch* batch,
     size_t col_idx,
     reader_array_data* out,
-    reader_error** err_out);
+    questdb_error** err_out);
 
 /** One symbol-dictionary entry: a byte range into
  * `reader_symbol_dict.heap`. */
@@ -1426,7 +1327,7 @@ bool reader_batch_symbol(
     uint32_t code,
     const char** out_buf,
     size_t* out_len,
-    reader_error** err_out);
+    questdb_error** err_out);
 
 /**
  * Snapshot the connection-scoped symbol dictionary into `*out`.
@@ -1437,7 +1338,7 @@ QUESTDB_CLIENT_API
 bool reader_batch_symbol_dict(
     const reader_batch* batch,
     reader_symbol_dict* out,
-    reader_error** err_out);
+    questdb_error** err_out);
 
 /////////// Cursor introspection and lifecycle.
 
@@ -1481,7 +1382,7 @@ reader_cursor_current_addr_port(const reader_cursor*);
 QUESTDB_CLIENT_API bool reader_cursor_server_version(
     const reader_cursor* cursor,
     uint8_t* out_version,
-    reader_error** err_out);
+    questdb_error** err_out);
 
 /**
  * Last-seen `SERVER_INFO` of the cursor's currently connected endpoint.
@@ -1528,7 +1429,7 @@ QUESTDB_CLIENT_API bool reader_cursor_terminal_exec_done(
  * transport failure.
  */
 QUESTDB_CLIENT_API bool reader_cursor_cancel(
-    reader_cursor* cursor, reader_error** err_out);
+    reader_cursor* cursor, questdb_error** err_out);
 
 /**
  * Grant additional CREDIT to the server. Only valid when the cursor was
@@ -1539,7 +1440,7 @@ QUESTDB_CLIENT_API bool reader_cursor_cancel(
 QUESTDB_CLIENT_API bool reader_cursor_add_credit(
     reader_cursor* cursor,
     uint64_t additional_bytes,
-    reader_error** err_out);
+    questdb_error** err_out);
 
 /* =========================================================================
  * Inline single-cell read helpers for `reader_column_data`.
@@ -1924,7 +1825,7 @@ typedef enum reader_arrow_batch_result
  * untouched.
  *
  * Mid-stream schema drift (the underlying QuestDB table altered between
- * batches) surfaces as `reader_error_schema_drift` on the
+ * batches) surfaces as `questdb_error_schema_drift` on the
  * call that detects it; the cursor's pinned schema snapshot is then
  * cleared so the next call re-snapshots the new schema and resumes. The
  * batch that triggered the drift is preserved and re-delivered (under the
@@ -1935,7 +1836,7 @@ reader_arrow_batch_result reader_cursor_next_arrow_batch(
     reader_cursor* cursor,
     struct ArrowArray* out_array,
     struct ArrowSchema* out_schema,
-    reader_error** err_out);
+    questdb_error** err_out);
 
 /**
  * As `reader_cursor_next_arrow_batch` but emits each SYMBOL column compact:
@@ -1946,7 +1847,7 @@ reader_arrow_batch_result reader_cursor_next_arrow_batch_compact(
     reader_cursor* cursor,
     struct ArrowArray* out_array,
     struct ArrowSchema* out_schema,
-    reader_error** err_out);
+    questdb_error** err_out);
 #endif /* QUESTDB_CLIENT_ENABLE_ARROW */
 
 #ifdef __cplusplus

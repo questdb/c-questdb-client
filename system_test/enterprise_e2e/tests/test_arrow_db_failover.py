@@ -61,7 +61,7 @@ _SRC = "arrow_db"  # column sidecar SEND shape that drives Db::flush_arrow_batch
 def _connect_string(http_ports: list[int], *, request_durable_ack: bool = False,
                     reconnect_max_ms: int = 60_000,
                     close_flush_timeout_ms: int = 5_000) -> str:
-    """Direct Arrow facade connect string (``qwpws`` schema).
+    """Direct Arrow facade connect string (``ws`` schema).
 
     ``request_durable_ack`` defaults off: ``flush_arrow_batch`` then waits for
     the server ``Ok`` watermark (committed to the WAL) rather than the slower
@@ -74,7 +74,7 @@ def _connect_string(http_ports: list[int], *, request_durable_ack: bool = False,
     """
     addr = ",".join(f"127.0.0.1:{p}" for p in http_ports)
     parts = [
-        f"qwpws::addr={addr}",
+        f"ws::addr={addr}",
         "username=admin",
         "password=quest",
         f"reconnect_max_duration_millis={reconnect_max_ms}",

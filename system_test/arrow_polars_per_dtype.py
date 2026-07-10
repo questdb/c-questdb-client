@@ -8,7 +8,7 @@ from typing import Any, Callable, Optional
 import pyarrow as pa
 
 import arrow_fuzz_common as afc
-from arrow_ffi import ArrowSenderError, SenderErrorCode
+from arrow_ffi import ArrowSenderError, ClientErrorCode
 
 
 _ROWS = 4
@@ -370,7 +370,7 @@ class TestArrowPolarsPerDtype(afc.ArrowFuzzBase):
             }),
             "polars 2D ragged List(List(Float64)) construction",
         )
-        self._expect_client_reject(df, SenderErrorCode.ARROW_INGEST)
+        self._expect_client_reject(df, ClientErrorCode.ARROW_INGEST)
 
     def test_dtype_list_list_float64(self):
         import polars as pl
@@ -514,7 +514,7 @@ class TestArrowPolarsPerDtype(afc.ArrowFuzzBase):
             }),
             "polars Struct DataFrame construction",
         )
-        self._expect_client_reject(df, SenderErrorCode.ARROW_UNSUPPORTED_COLUMN_KIND)
+        self._expect_client_reject(df, ClientErrorCode.ARROW_UNSUPPORTED_COLUMN_KIND)
 
     def test_dtype_list_utf8_rejected(self):
         import polars as pl
@@ -525,7 +525,7 @@ class TestArrowPolarsPerDtype(afc.ArrowFuzzBase):
             ),
             "ts": _ts_series_ns(pl, _ROWS),
         })
-        self._expect_client_reject(df, SenderErrorCode.ARROW_UNSUPPORTED_COLUMN_KIND)
+        self._expect_client_reject(df, ClientErrorCode.ARROW_UNSUPPORTED_COLUMN_KIND)
 
     def test_dtype_list_int64_rejected(self):
         import polars as pl
@@ -536,7 +536,7 @@ class TestArrowPolarsPerDtype(afc.ArrowFuzzBase):
             ),
             "ts": _ts_series_ns(pl, _ROWS),
         })
-        self._expect_client_reject(df, SenderErrorCode.ARROW_UNSUPPORTED_COLUMN_KIND)
+        self._expect_client_reject(df, ClientErrorCode.ARROW_UNSUPPORTED_COLUMN_KIND)
 
     def test_dtype_list_boolean_rejected(self):
         import polars as pl
@@ -547,7 +547,7 @@ class TestArrowPolarsPerDtype(afc.ArrowFuzzBase):
             ),
             "ts": _ts_series_ns(pl, _ROWS),
         })
-        self._expect_client_reject(df, SenderErrorCode.ARROW_UNSUPPORTED_COLUMN_KIND)
+        self._expect_client_reject(df, ClientErrorCode.ARROW_UNSUPPORTED_COLUMN_KIND)
 
     def test_dtype_object_rejected(self):
         import polars as pl
@@ -577,7 +577,7 @@ class TestArrowPolarsPerDtype(afc.ArrowFuzzBase):
             }),
             "polars Null DataFrame construction",
         )
-        self._expect_client_reject(df, SenderErrorCode.ARROW_UNSUPPORTED_COLUMN_KIND)
+        self._expect_client_reject(df, ClientErrorCode.ARROW_UNSUPPORTED_COLUMN_KIND)
 
 
 def register(loop_registry):

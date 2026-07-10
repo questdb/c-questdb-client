@@ -248,7 +248,7 @@ struct ErrorInner {
     qwp_ws_rejection: Option<Box<crate::ingress::QwpWsSenderError>>,
     /// `421 + X-QuestDB-Role` topology reject seen on the QWP/WebSocket
     /// *sender* upgrade. Sender-only; kept distinct from the query-side
-    /// [`UpgradeReject`](crate::egress::server_event::UpgradeReject), which
+    /// [`UpgradeReject`](crate::egress::UpgradeReject), which
     /// carries the richer `SERVER_INFO` role byte.
     #[cfg(feature = "_sender-qwp-ws")]
     qwp_ws_role_reject: Option<crate::ingress::QwpWsRoleReject>,
@@ -287,6 +287,7 @@ impl Error {
     /// [`Error::in_doubt`]. See `ColumnSender::flush` and the `FlushFailure`
     /// delivery classification.
     #[must_use]
+    #[cfg(feature = "sync-sender-qwp-ws")]
     pub(crate) fn with_in_doubt(mut self, in_doubt: bool) -> Self {
         self.0.in_doubt = in_doubt;
         self
@@ -324,7 +325,7 @@ impl Error {
         self
     }
 
-    /// Builder: attach a query-side [`UpgradeReject`](crate::egress::server_event::UpgradeReject)
+    /// Builder: attach a query-side [`UpgradeReject`](crate::egress::UpgradeReject)
     /// (HTTP `421 + X-QuestDB-Role` or `SERVER_INFO` target mismatch) so the
     /// host-health tracker can read the role + zone without re-parsing.
     #[cfg(feature = "_egress")]
@@ -441,6 +442,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "sync-sender-qwp-ws")]
     fn with_in_doubt_sets_and_preserves_code_and_msg() {
         let err =
             Error::new(ErrorCode::FailoverRetry, "mid-frame write failed").with_in_doubt(true);

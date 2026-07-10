@@ -42,9 +42,9 @@ use bytes::Bytes;
 use crate::egress::arrow::schema::to_arrow_export;
 use crate::egress::column_kind::ColumnKind;
 use crate::egress::decoder::{ArrayBuffers, ColumnBuffer, DecodedBatch, DecodedColumn};
-use crate::egress::error::{Error, Result, fmt};
 use crate::egress::schema::Schema;
 use crate::egress::symbol_dict::SymbolDict;
+use crate::error::{Error, Result, fmt};
 
 type ABytes = AVec<u8, ConstAlign<64>>;
 
@@ -1051,7 +1051,7 @@ pub fn external_arrow_error(e: Error) -> ArrowError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::egress::error::ErrorCode;
+    use crate::error::ErrorCode;
 
     #[test]
     fn per_level_counts_rejects_degenerate_expansion() {

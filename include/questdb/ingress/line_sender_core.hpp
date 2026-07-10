@@ -44,13 +44,21 @@
 namespace questdb
 {
 
+// Forward declaration of the connection pool. `pool` lives in the top-level
+// `questdb` namespace — it is cross-cutting, handing out both write-side
+// senders and read-side readers — while the sender/error machinery lives in
+// `questdb::ingress`. Declared here so `ingress` classes can befriend
+// `::questdb::pool` and the egress reader can reference it, without its
+// definition (which lives in `column_sender.hpp`).
+class pool;
+
 /**
  * Category of error. Single, unified enum for the whole client: it spans both
  * ingest and query. Pinned to the C ABI enum `::line_sender_error_code`
  * (include/questdb/ingress/line_sender.h), which the Rust test
  * `c_header_line_sender_enum_matches_rust` cross-checks against the library.
- * `questdb::ingress::line_sender_error_code` and `questdb::egress::error_code`
- * are aliases of this type.
+ * The released `questdb::ingress::line_sender_error_code` remains an alias of
+ * this type.
  */
 enum class error_code : int
 {
@@ -94,12 +102,11 @@ enum class error_code : int
     store_resend_required = ::line_sender_error_store_resend_required,
 };
 
-// Bridge equality between the C++ `questdb::error_code` and the C ABI enum
-// `::line_sender_error_code` (identical `int` values), so existing comparisons
-// like `e.code() == line_sender_error_socket_error` — and, via the
-// `reader_error_*` aliases, `e.code() == reader_error_cancelled` — keep
-// compiling. Lives in `namespace questdb` so ADL on `error_code` finds it from
-// both `questdb::ingress` and `questdb::egress`.
+// Bridge equality between the C++ `questdb::error_code` and the released C ABI
+// enum `::line_sender_error_code` (identical `int` values), so existing
+// comparisons like `e.code() == line_sender_error_socket_error` keep compiling.
+// Lives in `namespace questdb` so ADL on `error_code` finds it from both
+// `questdb::ingress` and `questdb::egress`.
 inline bool operator==(error_code l, ::line_sender_error_code r) noexcept
 {
     return static_cast<int>(l) == static_cast<int>(r);
@@ -121,24 +128,44 @@ inline bool operator!=(::line_sender_error_code l, error_code r) noexcept
  * Base class for every QuestDB client error, ingest or query.
  *
  * `catch (const questdb::error&)` handles a failure from either direction.
- * `questdb::ingress::line_sender_error` (which additionally exposes
- * `in_doubt()` / `qwp_ws_diagnostic()`) and `questdb::egress::reader_error`
- * are subclasses for direction-specific `catch` sites.
+ * The released `questdb::ingress::line_sender_error` subclass additionally
+ * exposes `in_doubt()` / `qwp_ws_diagnostic()` for sender operations.
  */
 class error : public std::runtime_error
 {
 public:
+    error(error_code code, const std::string& what)
+        : std::runtime_error{what}
+        , _code{code}
+    {
+    }
+
     /** Error code categorising the error. */
     error_code code() const noexcept
     {
         return _code;
     }
 
-protected:
-    error(error_code code, const std::string& what)
-        : std::runtime_error{what}
-        , _code{code}
+    /** Convert and take ownership of a C client error. */
+    static error from_c(::questdb_error* c_err)
     {
+        const std::unique_ptr<::questdb_error, decltype(&::questdb_error_free)>
+            owned_err{c_err, ::questdb_error_free};
+        const auto code = static_cast<error_code>(
+            static_cast<int>(::questdb_error_get_code(owned_err.get())));
+        size_t len{0};
+        const char* msg{::questdb_error_msg(owned_err.get(), &len)};
+        return error{code, std::string{msg, len}};
+    }
+
+    /** Call a C function whose final argument is `questdb_error**`. */
+    template <typename F, typename... Args>
+    static auto wrapped_call(F&& f, Args&&... args)
+    {
+        ::questdb_error* c_err{nullptr};
+        auto result = f(std::forward<Args>(args)..., &c_err);
+        if (c_err) throw from_c(c_err);
+        return result;
     }
 
 private:
@@ -178,10 +205,10 @@ enum class protocol
     qwpudp,
 
     /** QuestWire Protocol over WebSocket. */
-    qwpws,
+    ws,
 
     /** QuestWire Protocol over WebSocket Secure (TLS). */
-    qwpwss,
+    wss,
 
     /**
      * Sentinel for a protocol the Rust `Protocol` enum knows about but
@@ -373,7 +400,7 @@ private:
     friend class column_sender_view;
     friend class column_chunk;
     friend class arrow_import;
-    friend class pool;
+    friend class ::questdb::pool;
     friend class borrowed_column_sender;
     friend class borrowed_row_sender;
 

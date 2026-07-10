@@ -1,8 +1,8 @@
 /*
  * Out-of-process QWP egress (read-side) client driven by a line-oriented
  * stdin/stdout protocol, implemented against the c-questdb-client *C* FFI
- * reader binding (`include/questdb/egress/reader.h`, symbols behind the
- * `sync-reader-qwp-ws` ffi feature).
+ * reader binding (`include/questdb/egress/reader.h`, whose symbols are always
+ * compiled into the C ABI).
  *
  * Same wire protocol as the Rust `qwp_egress_sidecar`
  * (system_test/failover_clients/src/bin/qwp_egress_sidecar.rs) and the Java
@@ -29,15 +29,11 @@
  *     future test that needs them should extend this sidecar rather than
  *     silently succeed.
  *
- * `QUESTDB_READER_INTERNAL_CONSTRUCTORS` unlocks `reader_from_conf` -- the
- * sanctioned in-tree-test standalone constructor (same shape as the Rust
- * sidecar's `Reader::from_conf`; the pool facade is the production entry
- * point but is not what these per-binding scenarios exercise).
+ * The standalone `reader_from_conf` constructor matches the Rust sidecar's
+ * `Reader::from_conf` and gives each CONNECT command one dedicated transport.
  */
 
 #define _POSIX_C_SOURCE 200809L
-#define QUESTDB_READER_INTERNAL_CONSTRUCTORS
-
 #include <questdb/egress/reader.h>
 
 #include <stdbool.h>
@@ -77,13 +73,13 @@ static void reply_err(const char* msg)
     reply_err_sanitized(msg, strlen(msg));
 }
 
-/* Consume a reader_error: emit it as ERR and free it. */
-static void reply_err_from(reader_error* err)
+/* Consume a questdb_error: emit it as ERR and free it. */
+static void reply_err_from(questdb_error* err)
 {
     size_t len = 0;
-    const char* msg = reader_error_msg(err, &len);
+    const char* msg = questdb_error_msg(err, &len);
     reply_err_sanitized(msg ? msg : "(null)", msg ? len : 6);
-    reader_error_free(err);
+    questdb_error_free(err);
 }
 
 static void reply_ok(const char* payload)
@@ -120,7 +116,7 @@ static void handle_connect(const char* rest)
      * the target-filter scenarios pin on the Rust binding. */
     close_quietly();
 
-    reader_error* err = NULL;
+    questdb_error* err = NULL;
     line_sender_utf8 conf = {0, NULL};
     if (!line_sender_utf8_init(&conf, strlen(rest), rest, &err))
     {
@@ -144,7 +140,7 @@ static void handle_query(const char* rest)
         reply_err("no reader");
         return;
     }
-    reader_error* err = NULL;
+    questdb_error* err = NULL;
     line_sender_utf8 sql = {0, NULL};
     if (!line_sender_utf8_init(&sql, strlen(rest), rest, &err))
     {

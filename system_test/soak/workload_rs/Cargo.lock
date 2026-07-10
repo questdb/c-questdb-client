@@ -2814,6 +2814,7 @@ dependencies = [
  "ureq",
  "webpki-roots",
  "windows-sys 0.60.2",
+ "zstd",
 ]
 
 [[package]]

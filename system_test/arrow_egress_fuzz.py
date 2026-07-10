@@ -228,9 +228,9 @@ class TestArrowEgressEmpty(afc.ArrowFuzzBase):
         try:
             batches = afc.read_back_arrow_batches(self._fixture, sql)
         except afc.ReaderError as e:
-            from arrow_ffi import ReaderErrorCode
+            from arrow_ffi import ClientErrorCode
             self.assertEqual(
-                e.code, ReaderErrorCode.NO_SCHEMA,
+                e.code, ClientErrorCode.NO_SCHEMA,
                 self.label(f"unexpected ReaderError code={e.code} msg={e.message!r}")
             )
             return

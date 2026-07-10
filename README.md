@@ -76,10 +76,10 @@ The C and C++ APIs expose the pool via
 (`questdb_db_connect`, `questdb_db_borrow_*`) and the reader via
 [`questdb/egress/reader.h`](include/questdb/egress/reader.h) /
 [`questdb/egress/reader.hpp`](include/questdb/egress/reader.hpp), handing
-data across the Arrow C Data Interface. In Rust, QWP ingestion is gated
-behind the `sync-sender-qwp-ws` feature and queries behind
-`sync-reader-qwp-ws`; Arrow and Polars conversions behind the `arrow` and
-`polars` features.
+data across the Arrow C Data Interface. In Rust, QWP ingestion
+(`sync-sender-qwp-ws`) and queries (`sync-reader-qwp-ws`) are both on by
+default; Arrow and Polars conversions sit behind the `arrow` and `polars`
+features.
 
 ## Getting Started
 

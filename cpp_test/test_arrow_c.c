@@ -76,14 +76,14 @@ TEST(test_tristate_egress_enum_values)
     CHECK(reader_arrow_batch_error == 2, "error = 2");
 }
 
-TEST(test_appended_reader_error_codes_have_distinct_values)
+TEST(test_appended_query_error_codes_have_distinct_values)
 {
     CHECK(
-        reader_error_schema_drift != reader_error_no_schema &&
-        reader_error_no_schema != reader_error_arrow_export &&
-        reader_error_arrow_export != reader_error_schema_drift,
+        questdb_error_schema_drift != questdb_error_no_schema &&
+        questdb_error_no_schema != questdb_error_arrow_export &&
+        questdb_error_arrow_export != questdb_error_schema_drift,
         "schema_drift / no_schema / arrow_export distinct");
-    CHECK(reader_error_schema_drift > reader_error_failover_would_duplicate,
+    CHECK(questdb_error_schema_drift > questdb_error_failover_would_duplicate,
           "schema_drift appended (not renumbered)");
 }
 
@@ -98,24 +98,24 @@ TEST(test_egress_null_cursor_returns_error_tristate)
 {
     struct ArrowArray arr;
     struct ArrowSchema sch;
-    reader_error* err = NULL;
+    questdb_error* err = NULL;
     reader_arrow_batch_result rc =
         reader_cursor_next_arrow_batch(NULL, &arr, &sch, &err);
     CHECK(rc == reader_arrow_batch_error, "NULL cursor → error");
     CHECK(err != NULL, "err_out populated");
     if (err)
-        reader_error_free(err);
+        questdb_error_free(err);
 }
 
 TEST(test_egress_null_out_array_returns_error_tristate)
 {
     struct ArrowSchema sch;
-    reader_error* err = NULL;
+    questdb_error* err = NULL;
     reader_arrow_batch_result rc =
         reader_cursor_next_arrow_batch(NULL, NULL, &sch, &err);
     CHECK(rc == reader_arrow_batch_error, "NULL out_array → error");
     if (err)
-        reader_error_free(err);
+        questdb_error_free(err);
 }
 
 TEST(test_ingress_null_conn_returns_false)
@@ -872,12 +872,12 @@ TEST(test_error_codes_survive_ffi_boundary)
 {
     int sender_code = (int)line_sender_error_arrow_unsupported_column_kind;
     int ingest_code = (int)line_sender_error_arrow_ingest;
-    int drift_code = (int)reader_error_schema_drift;
-    int no_schema_code = (int)reader_error_no_schema;
-    int export_code = (int)reader_error_arrow_export;
+    int drift_code = (int)questdb_error_schema_drift;
+    int no_schema_code = (int)questdb_error_no_schema;
+    int export_code = (int)questdb_error_arrow_export;
     CHECK(sender_code != ingest_code, "sender codes distinct");
-    CHECK(drift_code != no_schema_code, "reader codes distinct");
-    CHECK(no_schema_code != export_code, "reader codes distinct");
+    CHECK(drift_code != no_schema_code, "query codes distinct");
+    CHECK(no_schema_code != export_code, "query codes distinct");
 }
 
 /* ---------------------------------------------------------------------------
@@ -1048,7 +1048,7 @@ static column_sender* mock_borrow_column_sender(
     char conf[256];
     snprintf(
         conf, sizeof(conf),
-        "qwpws::addr=%s;pool_size=1;pool_reap=manual;",
+        "ws::addr=%s;pool_size=1;pool_reap=manual;",
         addr);
     line_sender_error* err = NULL;
     questdb_db* db = questdb_db_connect(conf, strlen(conf), &err);
@@ -1398,7 +1398,7 @@ TEST(test_mock_ingress_arrow_release_contract)
 int main(void)
 {
     RUN(test_tristate_egress_enum_values);
-    RUN(test_appended_reader_error_codes_have_distinct_values);
+    RUN(test_appended_query_error_codes_have_distinct_values);
     RUN(test_appended_sender_error_codes_exist);
     RUN(test_egress_null_cursor_returns_error_tristate);
     RUN(test_egress_null_out_array_returns_error_tristate);

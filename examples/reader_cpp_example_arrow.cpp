@@ -50,7 +50,7 @@ bool example()
         }
         return true;
     }
-    catch (const egress::reader_error& e)
+    catch (const questdb::error& e)
     {
         std::fprintf(stderr, "Error: %s\n", e.what());
         return false;

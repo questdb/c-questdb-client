@@ -41,7 +41,7 @@ std::shared_ptr<arrow::RecordBatch> build_batch()
 
 bool example(const std::string& host, const std::string& port)
 {
-    const std::string conf_str = "qwpws::addr=" + host + ":" + port + ";";
+    const std::string conf_str = "ws::addr=" + host + ":" + port + ";";
     ::line_sender_error* err = nullptr;
     ::questdb_db* db =
         ::questdb_db_connect(conf_str.data(), conf_str.size(), &err);

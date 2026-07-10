@@ -188,7 +188,7 @@ impl QuestDb {
     /// Open a pool. Eagerly opens `pool_size` connections (default 1).
     /// Pool knobs: `pool_size=N` (default 1), `pool_max=M` (default 64),
     /// `pool_idle_timeout_ms=T` (default 60000), `pool_reap=auto|manual`
-    /// (default auto). Plus all standard `qwpws::` keys.
+    /// (default auto). Plus all standard `ws::` keys.
     pub fn connect(conf: &str) -> Result<Self>;
 
     /// Borrow a sender. If a previously-returned sender is free, hand
@@ -356,7 +356,7 @@ land.
 
 - Create `questdb-rs/src/ingress/column_sender/db.rs` with the pool
   type, eagerly opening `pool_size` connections at `connect()`.
-- Connect-string parsing: lift the existing `qwpws::` parser; add
+- Connect-string parsing: lift the existing `ws::` parser; add
   `pool_size` (default 1), `pool_max` (default 64),
   `pool_idle_timeout_ms` (default 60000), `pool_reap`
   (`auto`|`manual`, default `auto`). Reject configs with

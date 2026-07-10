@@ -24,8 +24,11 @@
 
 use crate::{
     ErrorCode,
-    ingress::{Buffer, Sender, TableName, Timestamp, TimestampMicros, TimestampNanos},
+    ingress::{Buffer, TableName, Timestamp, TimestampMicros, TimestampNanos},
 };
+
+#[cfg(feature = "_sync-sender")]
+use crate::ingress::Sender;
 
 #[cfg(any(feature = "sync-sender-tcp", feature = "sync-sender-http"))]
 use crate::ingress::{DOUBLE_BINARY_FORMAT_TYPE, F64Serializer};

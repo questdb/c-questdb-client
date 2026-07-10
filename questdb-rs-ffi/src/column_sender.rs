@@ -49,8 +49,9 @@ use questdb::{Error, ErrorCode};
 #[cfg(feature = "arrow")]
 use crate::line_sender_column_name;
 use crate::{
-    line_sender_error, line_sender_qwpws_fsn, line_sender_table_name, qwpws_ack_level_durable,
-    qwpws_ack_level_ok, set_err_out_from_error, set_err_out_from_error_with_qwpws,
+    line_sender_error, line_sender_qwpws_fsn, line_sender_table_name, questdb_error,
+    qwpws_ack_level_durable, qwpws_ack_level_ok, set_err_out_from_error,
+    set_err_out_from_error_with_qwpws,
 };
 
 // ===========================================================================
@@ -401,7 +402,7 @@ fn ack_level_from_u32(value: u32, err_out: *mut *mut line_sender_error) -> Optio
                     err_out,
                     Error::new(
                         ErrorCode::InvalidApiCall,
-                        format!("qwpws ack_level: invalid value {other} (expected 0 or 1)"),
+                        format!("ws ack_level: invalid value {other} (expected 0 or 1)"),
                     ),
                 );
             }
@@ -585,12 +586,12 @@ macro_rules! bubble {
 ///
 /// Returns NULL on failure. When `err_out != NULL`, the error is placed
 /// in `*err_out` and ownership transfers to the caller (release with
-/// `line_sender_error_free`).
+/// `questdb_error_free`).
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn questdb_db_connect(
     conf: *const c_char,
     conf_len: size_t,
-    err_out: *mut *mut line_sender_error,
+    err_out: *mut *mut questdb_error,
 ) -> *mut questdb_db {
     let conf = match unsafe { name_str(conf, conf_len, err_out) } {
         Some(s) => s,
@@ -4063,7 +4064,7 @@ mod tests {
             listener.local_addr().expect("local_addr").port()
         };
         let conf = format!(
-            "qwpws::addr=127.0.0.1:{port};auth_timeout=2000;reconnect_max_duration_millis=1000;"
+            "ws::addr=127.0.0.1:{port};auth_timeout=2000;reconnect_max_duration_millis=1000;"
         );
         let mut err: *mut line_sender_error = std::ptr::null_mut();
         let db =

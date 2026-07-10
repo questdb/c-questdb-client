@@ -48,8 +48,7 @@ pub mod ingress;
 // and the egress adapter. Homed here so a sender-only `arrow-ingress` build
 // can use them without compiling the egress reader.
 #[cfg(feature = "_arrow")]
-#[doc(hidden)]
-pub mod arrow_meta;
+pub mod arrow_metadata;
 
 // Transport-neutral arrow<->polars_arrow FFI bridges, shared by both polars
 // directions.
@@ -101,7 +100,7 @@ pub use db::BorrowedReader;
 #[doc(hidden)]
 pub use db::ffi_support;
 
-#[cfg(test)]
+#[cfg(all(test, any(feature = "_sender-qwp-udp", feature = "_sender-qwp-ws")))]
 mod alloc_counter {
     use std::alloc::{GlobalAlloc, Layout, System};
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -152,7 +151,7 @@ mod alloc_counter {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, any(feature = "_sender-qwp-udp", feature = "_sender-qwp-ws")))]
 #[global_allocator]
 static GLOBAL: alloc_counter::CountingAllocator = alloc_counter::CountingAllocator;
 

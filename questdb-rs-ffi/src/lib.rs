@@ -83,7 +83,6 @@ use questdb::ffi_support::OwnedRowSender;
 mod ndarr;
 use ndarr::StrideArrayView;
 
-#[cfg(feature = "sync-reader-qwp-ws")]
 mod egress;
 
 pub mod column_sender;
@@ -225,14 +224,19 @@ macro_rules! upd_opts {
 
 /// An error that occurred when using the QuestDB client.
 ///
-/// This is the single, unified error object for both ingest and query;
-/// `reader_error` (egress) is a back-compat alias of it.
+/// This is the single, unified error object for both ingest and query. New
+/// cross-client APIs spell it [`questdb_error`]; the released
+/// `line_sender_error` name remains the underlying ABI type.
 pub struct line_sender_error {
     error: Error,
     qwp_ws_error: Option<QwpWsSenderError>,
 }
 
-#[cfg(feature = "sync-reader-qwp-ws")]
+/// Neutral spelling of the client-wide error object. The alias preserves the
+/// released `line_sender_error` layout and ownership ABI.
+#[allow(non_camel_case_types)]
+pub type questdb_error = line_sender_error;
+
 impl line_sender_error {
     /// Wrap a [`questdb::Error`] as the FFI error object, with no QWP/WS
     /// sender diagnostic attached. Used by the reader (egress) entry points,
@@ -388,9 +392,14 @@ pub enum line_sender_error_code {
     line_sender_error_store_resend_required = 36,
 }
 
-// The client error model is unified across ingest and query:
-// `line_sender_error_code` is the single C error enum. `reader_error_code`
-// (in the egress module) is a back-compat alias of it.
+/// Neutral spelling of the client-wide error category. The released
+/// `line_sender_error_code` enum remains the ABI source of its discriminants.
+#[allow(non_camel_case_types)]
+pub type questdb_error_code = line_sender_error_code;
+
+// The client error model is unified across ingest and query. The released
+// `line_sender_error_code` enum remains the single C ABI representation;
+// `questdb_error_code` is the neutral spelling used by new shared APIs.
 
 impl From<ErrorCode> for line_sender_error_code {
     fn from(code: ErrorCode) -> Self {
@@ -496,10 +505,10 @@ pub enum line_sender_protocol {
     line_sender_protocol_qwpudp,
 
     /// QuestWire Protocol over WebSocket.
-    line_sender_protocol_qwpws,
+    line_sender_protocol_ws,
 
     /// QuestWire Protocol over WebSocket Secure (TLS).
-    line_sender_protocol_qwpwss,
+    line_sender_protocol_wss,
 
     /// Sentinel for a protocol the Rust `Protocol` enum knows about but this
     /// FFI build does not. Returned by `line_sender_get_protocol` for future
@@ -517,8 +526,8 @@ impl From<Protocol> for line_sender_protocol {
             Protocol::Http => line_sender_protocol::line_sender_protocol_http,
             Protocol::Https => line_sender_protocol::line_sender_protocol_https,
             Protocol::QwpUdp => line_sender_protocol::line_sender_protocol_qwpudp,
-            Protocol::QwpWs => line_sender_protocol::line_sender_protocol_qwpws,
-            Protocol::QwpWss => line_sender_protocol::line_sender_protocol_qwpwss,
+            Protocol::Ws => line_sender_protocol::line_sender_protocol_ws,
+            Protocol::Wss => line_sender_protocol::line_sender_protocol_wss,
             _ => line_sender_protocol::line_sender_protocol_unknown,
         }
     }
@@ -533,8 +542,8 @@ impl TryFrom<line_sender_protocol> for Protocol {
             line_sender_protocol::line_sender_protocol_http => Protocol::Http,
             line_sender_protocol::line_sender_protocol_https => Protocol::Https,
             line_sender_protocol::line_sender_protocol_qwpudp => Protocol::QwpUdp,
-            line_sender_protocol::line_sender_protocol_qwpws => Protocol::QwpWs,
-            line_sender_protocol::line_sender_protocol_qwpwss => Protocol::QwpWss,
+            line_sender_protocol::line_sender_protocol_ws => Protocol::Ws,
+            line_sender_protocol::line_sender_protocol_wss => Protocol::Wss,
             line_sender_protocol::line_sender_protocol_unknown => return Err(()),
         })
     }
@@ -625,16 +634,14 @@ impl From<line_sender_ca> for CertificateAuthority {
     }
 }
 
-/// Error code categorising the error.
+/// Error code categorising a client-wide error.
 ///
 /// NULL-safe: passing `NULL` returns `line_sender_error_invalid_api_call`
 /// (the caller is misusing the accessor) rather than dereferencing.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn line_sender_error_get_code(
-    error: *const line_sender_error,
-) -> line_sender_error_code {
+pub unsafe extern "C" fn questdb_error_get_code(error: *const questdb_error) -> questdb_error_code {
     if error.is_null() {
-        return line_sender_error_code::line_sender_error_invalid_api_call;
+        return questdb_error_code::line_sender_error_invalid_api_call;
     }
     unsafe { (*error).error.code().into() }
 }
@@ -646,8 +653,8 @@ pub unsafe extern "C" fn line_sender_error_get_code(
 /// empty string with `*len_out = 0` (when `len_out` is non-NULL); a NULL
 /// `len_out` is silently ignored.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn line_sender_error_msg(
-    error: *const line_sender_error,
+pub unsafe extern "C" fn questdb_error_msg(
+    error: *const questdb_error,
     len_out: *mut size_t,
 ) -> *const c_char {
     unsafe {
@@ -678,7 +685,7 @@ pub unsafe extern "C" fn line_sender_error_msg(
 ///
 /// NULL-safe: passing `NULL` returns `false`.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn line_sender_error_in_doubt(error: *const line_sender_error) -> bool {
+pub unsafe extern "C" fn questdb_error_in_doubt(error: *const questdb_error) -> bool {
     if error.is_null() {
         return false;
     }
@@ -687,12 +694,41 @@ pub unsafe extern "C" fn line_sender_error_in_doubt(error: *const line_sender_er
 
 /// Clean up the error.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn line_sender_error_free(error: *mut line_sender_error) {
+pub unsafe extern "C" fn questdb_error_free(error: *mut questdb_error) {
     unsafe {
         if !error.is_null() {
             drop(Box::from_raw(error));
         }
     }
+}
+
+/// Released line-sender spelling of [`questdb_error_get_code`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn line_sender_error_get_code(
+    error: *const line_sender_error,
+) -> line_sender_error_code {
+    unsafe { questdb_error_get_code(error) }
+}
+
+/// Released line-sender spelling of [`questdb_error_msg`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn line_sender_error_msg(
+    error: *const line_sender_error,
+    len_out: *mut size_t,
+) -> *const c_char {
+    unsafe { questdb_error_msg(error, len_out) }
+}
+
+/// Released line-sender spelling of [`questdb_error_in_doubt`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn line_sender_error_in_doubt(error: *const line_sender_error) -> bool {
+    unsafe { questdb_error_in_doubt(error) }
+}
+
+/// Released line-sender spelling of [`questdb_error_free`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn line_sender_error_free(error: *mut line_sender_error) {
+    unsafe { questdb_error_free(error) }
 }
 
 /// Non-owning validated UTF-8 encoded string.
@@ -734,7 +770,6 @@ impl line_sender_utf8 {
     /// extract content from a `line_sender_utf8` are this method
     /// (always validates) and `as_str()` (trusted-caller-only, used by
     /// ingress where the inputs went through `line_sender_utf8_init`).
-    #[cfg(feature = "sync-reader-qwp-ws")]
     pub(crate) fn validated_utf8(&self) -> Result<&str, std::str::Utf8Error> {
         // Same NULL-guard as `as_str`: `slice::from_raw_parts` is UB on a
         // null pointer even with `len == 0`. Treat NULL+0 as the empty
@@ -2789,7 +2824,7 @@ pub unsafe extern "C" fn line_sender_opts_tls_ca(
 /// Set the path to a custom root certificate `.pem` file.
 /// This is used to validate the server's certificate during the TLS handshake.
 ///
-/// On QWP/WebSocket (`qwpwss::`) the same path may instead point at a JKS
+/// On QWP/WebSocket (`wss::`) the same path may instead point at a JKS
 /// or PKCS#12 keystore; pair it with `line_sender_opts_tls_roots_password`
 /// to unlock it.
 ///
@@ -2810,7 +2845,7 @@ pub unsafe extern "C" fn line_sender_opts_tls_roots(
 /// Set the password unlocking the JKS / PKCS#12 keystore named by
 /// `line_sender_opts_tls_roots`.
 ///
-/// QWP/WebSocket only (`qwpwss::`). Setting this on an ILP/TCP or
+/// QWP/WebSocket only (`wss::`). Setting this on an ILP/TCP or
 /// ILP/HTTP sender returns an `InvalidApiCall` error: those transports
 /// read unencrypted PEM via rustls and have no keystore concept.
 ///
@@ -3391,7 +3426,7 @@ pub unsafe extern "C" fn line_sender_buffer_new_for_sender(
         let buffer = sender.new_buffer();
         let empty_peek_buf_is_null = matches!(
             sender.protocol(),
-            Protocol::QwpUdp | Protocol::QwpWs | Protocol::QwpWss
+            Protocol::QwpUdp | Protocol::Ws | Protocol::Wss
         );
         Box::into_raw(Box::new(line_sender_buffer {
             buffer,
@@ -5787,7 +5822,6 @@ mod tests {
         write_server_binary_frame(stream, &payload)
     }
 
-    #[cfg(feature = "sync-reader-qwp-ws")]
     fn write_server_info_frame(stream: &mut TcpStream) -> std::io::Result<()> {
         let mut payload = Vec::new();
         payload.push(0x18); // SERVER_INFO
@@ -5841,7 +5875,6 @@ mod tests {
                                     Ok(request) => request,
                                     Err(_) => return,
                                 };
-                                #[cfg(feature = "sync-reader-qwp-ws")]
                                 if _request.starts_with("GET /read/v1 ") {
                                     let _ = write_server_info_frame(&mut stream);
                                 }
@@ -5878,7 +5911,7 @@ mod tests {
 
         fn conf(&self) -> String {
             format!(
-                "qwpws::addr=127.0.0.1:{};pool_size=1;pool_max=2;close_flush_timeout_millis=50;",
+                "ws::addr=127.0.0.1:{};pool_size=1;pool_max=2;close_flush_timeout_millis=50;",
                 self.port
             )
         }
@@ -5893,7 +5926,7 @@ mod tests {
         }
     }
 
-    fn connect_pool(conf: &str, err: &mut *mut line_sender_error) -> *mut questdb_db {
+    fn connect_pool(conf: &str, err: &mut *mut questdb_error) -> *mut questdb_db {
         let db = unsafe { questdb_db_connect(conf.as_ptr() as *const c_char, conf.len(), err) };
         assert!(!db.is_null(), "pool connect failed");
         assert!(err.is_null(), "pool connect set unexpected error");
@@ -5987,28 +6020,24 @@ mod tests {
         free_err(err);
     }
 
-    #[cfg(feature = "sync-reader-qwp-ws")]
-    fn assert_reader_error_contains(
-        err: &mut *mut egress::reader_error,
-        code: egress::reader_error_code,
+    fn assert_client_error_contains(
+        err: &mut *mut questdb_error,
+        code: questdb_error_code,
         needle: &str,
     ) {
-        assert!(!err.is_null(), "expected reader_error");
-        assert_eq!(
-            unsafe { egress::reader_error_get_code(*err) } as u32,
-            code as u32
-        );
+        assert!(!err.is_null(), "expected questdb_error");
+        assert_eq!(unsafe { questdb_error_get_code(*err) } as u32, code as u32);
         let message = unsafe {
             let mut len = 0;
-            let ptr = egress::reader_error_msg(*err, &mut len);
+            let ptr = questdb_error_msg(*err, &mut len);
             let bytes = std::slice::from_raw_parts(ptr as *const u8, len);
             String::from_utf8_lossy(bytes).into_owned()
         };
         assert!(
             message.contains(needle),
-            "expected reader error message to contain {needle:?}, got: {message}"
+            "expected client error message to contain {needle:?}, got: {message}"
         );
-        unsafe { egress::reader_error_free(*err) };
+        unsafe { questdb_error_free(*err) };
         *err = ptr::null_mut();
     }
 
@@ -6554,18 +6583,13 @@ mod tests {
         }
     }
 
-    #[cfg(feature = "sync-reader-qwp-ws")]
     #[test]
     fn pooled_reader_rejects_prepare_after_db_close_and_closes_safely() {
         let server = PooledQwpMock::spawn(2);
         unsafe {
             let mut err = ptr::null_mut();
             let conf = server.conf();
-            let db = egress::questdb_db_connect_reader(
-                conf.as_ptr() as *const c_char,
-                conf.len(),
-                &mut err,
-            );
+            let db = questdb_db_connect(conf.as_ptr() as *const c_char, conf.len(), &mut err);
             assert!(!db.is_null());
             assert!(err.is_null());
 
@@ -6577,9 +6601,9 @@ mod tests {
 
             let query = egress::reader_prepare(reader, utf8(b"select 1"), &mut err);
             assert!(query.is_null());
-            assert_reader_error_contains(
+            assert_client_error_contains(
                 &mut err,
-                egress::reader_error_code::line_sender_error_invalid_api_call,
+                questdb_error_code::line_sender_error_invalid_api_call,
                 "QuestDb pool is closed",
             );
 
@@ -6765,7 +6789,7 @@ mod tests {
             let mut err = ptr::null_mut();
             let callback_state = CallbackState::default();
             let opts = line_sender_opts_new(
-                line_sender_protocol::line_sender_protocol_qwpws,
+                line_sender_protocol::line_sender_protocol_ws,
                 utf8(b"127.0.0.1"),
                 port,
             );

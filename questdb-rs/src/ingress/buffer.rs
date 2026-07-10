@@ -455,6 +455,7 @@ impl Buffer {
         }
     }
 
+    #[cfg(feature = "_sync-sender")]
     pub(crate) fn as_ilp(&self) -> Option<&IlpBuffer> {
         match &self.inner {
             BufferInner::Ilp(inner) => Some(inner),
@@ -699,7 +700,7 @@ impl Buffer {
     }
 
     /// Validates that the buffer is ready to be flushed with
-    /// [`crate::ingress::Sender::flush`] or one of its variants.
+    /// `crate::ingress::Sender::flush` or one of its variants.
     ///
     /// Returns an error when the current API call sequence is incomplete, such
     /// as an unfinished row.
@@ -864,7 +865,7 @@ impl Buffer {
         match &mut self.inner {
             BufferInner::Ilp(_) => Err(error::fmt!(
                 InvalidApiCall,
-                "column_i8 requires a QWP transport (qwpws:: or qwpudp::)"
+                "column_i8 requires a QWP transport (ws:: or qwpudp::)"
             )),
             #[cfg(any(feature = "_sender-qwp-udp", feature = "_sender-qwp-ws"))]
             BufferInner::Qwp(inner) => {
@@ -902,7 +903,7 @@ impl Buffer {
         match &mut self.inner {
             BufferInner::Ilp(_) => Err(error::fmt!(
                 InvalidApiCall,
-                "column_i16 requires a QWP transport (qwpws:: or qwpudp::)"
+                "column_i16 requires a QWP transport (ws:: or qwpudp::)"
             )),
             #[cfg(any(feature = "_sender-qwp-udp", feature = "_sender-qwp-ws"))]
             BufferInner::Qwp(inner) => {
@@ -940,7 +941,7 @@ impl Buffer {
         match &mut self.inner {
             BufferInner::Ilp(_) => Err(error::fmt!(
                 InvalidApiCall,
-                "column_i32 requires a QWP transport (qwpws:: or qwpudp::)"
+                "column_i32 requires a QWP transport (ws:: or qwpudp::)"
             )),
             #[cfg(any(feature = "_sender-qwp-udp", feature = "_sender-qwp-ws"))]
             BufferInner::Qwp(inner) => {
@@ -978,7 +979,7 @@ impl Buffer {
         match &mut self.inner {
             BufferInner::Ilp(_) => Err(error::fmt!(
                 InvalidApiCall,
-                "column_f32 requires a QWP transport (qwpws:: or qwpudp::)"
+                "column_f32 requires a QWP transport (ws:: or qwpudp::)"
             )),
             #[cfg(any(feature = "_sender-qwp-udp", feature = "_sender-qwp-ws"))]
             BufferInner::Qwp(inner) => {
@@ -1148,7 +1149,7 @@ impl Buffer {
                 let _ = value.try_into().map_err(Error::from)?;
                 Err(error::fmt!(
                     InvalidApiCall,
-                    "column_dec64 requires a QWP transport (qwpws:: or qwpudp::)"
+                    "column_dec64 requires a QWP transport (ws:: or qwpudp::)"
                 ))
             }
             #[cfg(any(feature = "_sender-qwp-udp", feature = "_sender-qwp-ws"))]
@@ -1200,7 +1201,7 @@ impl Buffer {
                 let _ = value.try_into().map_err(Error::from)?;
                 Err(error::fmt!(
                     InvalidApiCall,
-                    "column_dec128 requires a QWP transport (qwpws:: or qwpudp::)"
+                    "column_dec128 requires a QWP transport (ws:: or qwpudp::)"
                 ))
             }
             #[cfg(any(feature = "_sender-qwp-udp", feature = "_sender-qwp-ws"))]
@@ -1249,7 +1250,7 @@ impl Buffer {
         match &mut self.inner {
             BufferInner::Ilp(_) => Err(error::fmt!(
                 InvalidApiCall,
-                "column_uuid requires a QWP transport (qwpws:: or qwpudp::)"
+                "column_uuid requires a QWP transport (ws:: or qwpudp::)"
             )),
             #[cfg(any(feature = "_sender-qwp-udp", feature = "_sender-qwp-ws"))]
             BufferInner::Qwp(inner) => {
@@ -1294,7 +1295,7 @@ impl Buffer {
         match &mut self.inner {
             BufferInner::Ilp(_) => Err(error::fmt!(
                 InvalidApiCall,
-                "column_long256 requires a QWP transport (qwpws:: or qwpudp::)"
+                "column_long256 requires a QWP transport (ws:: or qwpudp::)"
             )),
             #[cfg(any(feature = "_sender-qwp-udp", feature = "_sender-qwp-ws"))]
             BufferInner::Qwp(inner) => {
@@ -1347,7 +1348,7 @@ impl Buffer {
         match &mut self.inner {
             BufferInner::Ilp(_) => Err(error::fmt!(
                 InvalidApiCall,
-                "column_ipv4 requires a QWP transport (qwpws:: or qwpudp::)"
+                "column_ipv4 requires a QWP transport (ws:: or qwpudp::)"
             )),
             #[cfg(any(feature = "_sender-qwp-udp", feature = "_sender-qwp-ws"))]
             BufferInner::Qwp(inner) => {
@@ -1389,7 +1390,7 @@ impl Buffer {
         match &mut self.inner {
             BufferInner::Ilp(_) => Err(error::fmt!(
                 InvalidApiCall,
-                "column_date requires a QWP transport (qwpws:: or qwpudp::)"
+                "column_date requires a QWP transport (ws:: or qwpudp::)"
             )),
             #[cfg(any(feature = "_sender-qwp-udp", feature = "_sender-qwp-ws"))]
             BufferInner::Qwp(inner) => {
@@ -1431,7 +1432,7 @@ impl Buffer {
         match &mut self.inner {
             BufferInner::Ilp(_) => Err(error::fmt!(
                 InvalidApiCall,
-                "column_char requires a QWP transport (qwpws:: or qwpudp::)"
+                "column_char requires a QWP transport (ws:: or qwpudp::)"
             )),
             #[cfg(any(feature = "_sender-qwp-udp", feature = "_sender-qwp-ws"))]
             BufferInner::Qwp(inner) => {
@@ -1475,7 +1476,7 @@ impl Buffer {
         match &mut self.inner {
             BufferInner::Ilp(_) => Err(error::fmt!(
                 InvalidApiCall,
-                "column_binary requires a QWP transport (qwpws:: or qwpudp::)"
+                "column_binary requires a QWP transport (ws:: or qwpudp::)"
             )),
             #[cfg(any(feature = "_sender-qwp-udp", feature = "_sender-qwp-ws"))]
             BufferInner::Qwp(inner) => {
@@ -1523,7 +1524,7 @@ impl Buffer {
         match &mut self.inner {
             BufferInner::Ilp(_) => Err(error::fmt!(
                 InvalidApiCall,
-                "column_geohash requires a QWP transport (qwpws:: or qwpudp::)"
+                "column_geohash requires a QWP transport (ws:: or qwpudp::)"
             )),
             #[cfg(any(feature = "_sender-qwp-udp", feature = "_sender-qwp-ws"))]
             BufferInner::Qwp(inner) => {
@@ -1575,7 +1576,7 @@ impl Buffer {
                 if D::type_tag() != 10 {
                     return Err(error::fmt!(
                         InvalidApiCall,
-                        "column_arr with non-f64 element type requires a QWP transport (qwpws:: or qwpudp::)"
+                        "column_arr with non-f64 element type requires a QWP transport (ws:: or qwpudp::)"
                     ));
                 }
                 inner.column_arr(name, view)?;

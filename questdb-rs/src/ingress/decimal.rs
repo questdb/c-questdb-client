@@ -199,7 +199,7 @@ impl<'a> DecimalView<'a> {
 ///
 /// # Errors
 /// Returns [`Error`](crate::Error) with
-/// [`ErrorCode::InvalidDecimal`](crate::error::ErrorCode::InvalidDecimal)
+/// [`ErrorCode::InvalidDecimal`](crate::ErrorCode::InvalidDecimal)
 /// if the string contains non-numerical characters.
 impl<'a> TryInto<DecimalView<'a>> for &'a str {
     type Error = crate::Error;

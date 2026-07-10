@@ -31,28 +31,12 @@ option(
     "Build shared library dependencies instead of static."
     OFF)
 
-# Opt in to the synchronous WebSocket egress reader (`reader_*`
-# C/C++ surface). Pulls in the `tungstenite` + `zstd` Rust crates as
-# transitive dependencies, so downstreams that only need the line
-# sender can flip this OFF to keep the resulting library minimal.
-# Defaults ON for the in-tree build because the `reader_*`
-# examples and tests need it; external consumers who add this
-# project via `add_subdirectory` should set
-# `-DQUESTDB_ENABLE_READER=OFF` if they don't want the surface.
-option(
-    QUESTDB_ENABLE_READER
-    "Enable the synchronous WebSocket egress reader (reader_* API). Adds tungstenite+zstd."
-    ON)
-
-# When QUESTDB_TESTS_AND_EXAMPLES is enabled the reader-related
-# examples and tests need the reader API present. Refusing to build
-# in that combination is friendlier than producing a confusing link
-# error from missing `reader_*` symbols.
-if(QUESTDB_TESTS_AND_EXAMPLES AND NOT QUESTDB_ENABLE_READER)
-    message(FATAL_ERROR
-        "QUESTDB_TESTS_AND_EXAMPLES=ON requires QUESTDB_ENABLE_READER=ON: "
-        "the reader_* examples and tests would fail to link without it.")
-endif()
+# The synchronous WebSocket egress reader (`reader_*` C/C++ surface) is
+# always compiled in, on the same footing as the line senders — it is not
+# gated by any option. This pulls in the `tungstenite` + `zstd` Rust crates
+# as transitive dependencies. (The Rust-side switch still exists as the
+# `questdb-rs` `sync-reader` feature for downstreams that build that crate
+# directly; the C ABI always ships the surface.)
 
 # Compile in the `tls_verify=false` (sender) / `tls_verify=unsafe_off`
 # (egress reader) escape hatch. ON by default to preserve the legacy
@@ -87,9 +71,6 @@ option(
 # Imports `questdb_client` target.
 add_subdirectory(corrosion)
 set(QUESTDB_CARGO_FEATURES "")
-if(QUESTDB_ENABLE_READER)
-    list(APPEND QUESTDB_CARGO_FEATURES sync-reader-qwp-ws)
-endif()
 if(QUESTDB_ENABLE_INSECURE_SKIP_VERIFY)
     list(APPEND QUESTDB_CARGO_FEATURES insecure-skip-verify)
 endif()
@@ -405,7 +386,7 @@ if (QUESTDB_TESTS_AND_EXAMPLES)
     # Broker-independent C++ tests for the reader FFI. Covers the
     # error-handling surface, parser rejection paths, the connect-failure
     # path against a closed port, NULL-idempotent free / close functions,
-    # `from_env`, and the C++ `reader_error` exception wrapper.
+    # `from_env`, and the C++ `questdb::error` exception wrapper.
     compile_test(
         test_reader_offline
         cpp_test/test_reader_offline.cpp)
@@ -440,25 +421,6 @@ if (QUESTDB_TESTS_AND_EXAMPLES)
         test_column_sender
         cpp_test/qwp_mock_server.cpp
         cpp_test/test_column_sender.cpp)
-
-    # Standalone reader constructors are test-only (the supported API hands
-    # readers out from the connection pool); in-tree tests/examples opt into
-    # them here, base target plus any _cxx20 twin. Installed headers stay
-    # pool-only.
-    foreach(reader_direct_target
-            reader_c_example_from_conf reader_cpp_example_from_conf
-            reader_c_example_with_binds reader_cpp_example_with_binds
-            reader_cpp_example_columns reader_c_example_columns
-            reader_c_example_arrow reader_cpp_example_arrow
-            test_reader reader_c_smoke test_reader_offline test_reader_mock
-            test_arrow_egress)
-        foreach(v ${reader_direct_target} ${reader_direct_target}_cxx20)
-            if(TARGET ${v})
-                target_compile_definitions(
-                    ${v} PRIVATE QUESTDB_READER_INTERNAL_CONSTRUCTORS)
-            endif()
-        endforeach()
-    endforeach()
 
     # System testing Python3 script.
     # This will download the latest QuestDB instance from Github,

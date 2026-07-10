@@ -874,8 +874,8 @@ fn preopen_row_recovery_sender(
 impl QuestDb {
     /// Open a pool against `conf`.
     ///
-    /// The connect string must use a QWP/WebSocket schema (`qwpws::` /
-    /// `qwpwss::` / `ws::` / `wss::`). Pool-specific keys are recognised:
+    /// The connect string must use a QWP/WebSocket schema (`ws::` /
+    /// `wss::` / `ws::` / `wss::`). Pool-specific keys are recognised:
     ///
     /// | Key                    | Default | Meaning                                                        |
     /// |------------------------|---------|----------------------------------------------------------------|
@@ -1536,7 +1536,7 @@ impl QuestDb {
     /// live-connection ceiling across all three pools is `3 * pool_max`).
     ///
     /// Borrow at the cap returns
-    /// [`InvalidApiCall`](crate::egress::error::ErrorCode::InvalidApiCall).
+    /// [`InvalidApiCall`](crate::ErrorCode::InvalidApiCall).
     ///
     /// The returned [`BorrowedReader`] derefs to `Reader`, so the usual
     /// `prepare` / `execute` cursor flow works unchanged, and returns the
@@ -1547,7 +1547,7 @@ impl QuestDb {
     /// Like [`BorrowedColumnSender`], [`BorrowedReader`] is **not** `Send` or
     /// `Sync`: borrow one reader per worker thread from the same `QuestDb`.
     #[cfg(feature = "_egress")]
-    pub fn borrow_reader(&self) -> crate::egress::error::Result<BorrowedReader<'_>> {
+    pub fn borrow_reader(&self) -> crate::error::Result<BorrowedReader<'_>> {
         let reader = self.pick_reader()?;
         Ok(BorrowedReader::new(self, reader))
     }
@@ -1560,7 +1560,7 @@ impl QuestDb {
     /// [`OwnedReader`]'s Drop: see the sender variant for the same
     /// pattern.
     #[cfg(all(feature = "_egress", feature = "ffi-support"))]
-    pub(crate) fn borrow_reader_owned(&self) -> crate::egress::error::Result<OwnedReader> {
+    pub(crate) fn borrow_reader_owned(&self) -> crate::error::Result<OwnedReader> {
         let reader = self.pick_reader()?;
         Ok(OwnedReader {
             inner: Arc::clone(&self.inner),
@@ -1580,13 +1580,13 @@ impl QuestDb {
     }
 
     #[cfg(feature = "_egress")]
-    fn pick_reader(&self) -> crate::egress::error::Result<Reader> {
-        use crate::egress::error::{Error as EgressError, ErrorCode as EgressErrorCode};
+    fn pick_reader(&self) -> crate::error::Result<Reader> {
+        use crate::{Error, ErrorCode};
         let slot = {
             let mut state = lock_reader_state(&self.inner.reader_state);
             if self.inner.shutdown.load(Ordering::SeqCst) {
-                return Err(EgressError::new(
-                    EgressErrorCode::InvalidApiCall,
+                return Err(Error::new(
+                    ErrorCode::InvalidApiCall,
                     "QuestDb pool is closed; cannot borrow reader",
                 ));
             }
@@ -1596,8 +1596,8 @@ impl QuestDb {
                 return Ok(entry.reader);
             }
             if state.total() >= self.inner.pool_max {
-                return Err(EgressError::new(
-                    EgressErrorCode::InvalidApiCall,
+                return Err(Error::new(
+                    ErrorCode::InvalidApiCall,
                     format!(
                         "Reader pool exhausted: {} readers are currently borrowed and \
                          the pool is at its `pool_max` cap of {}. \

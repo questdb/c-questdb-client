@@ -38,8 +38,9 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use questdb::ErrorCode;
 use questdb::egress::{
-    ColumnView, ErrorCode, FailoverEvent, FailoverPhase, FailoverProgressEvent, Reader, ServerRole,
+    ColumnView, FailoverPhase, FailoverProgressEvent, FailoverResetEvent, Reader, ServerRole,
 };
 use tungstenite::handshake::server::{Request, Response};
 use tungstenite::http::HeaderValue;
@@ -1123,11 +1124,11 @@ fn mid_query_close_triggers_failover() {
         "initial connect lands on A"
     );
 
-    let observed: Arc<Mutex<Vec<FailoverEvent>>> = Arc::new(Mutex::new(Vec::new()));
+    let observed: Arc<Mutex<Vec<FailoverResetEvent>>> = Arc::new(Mutex::new(Vec::new()));
     let observed_clone = Arc::clone(&observed);
     let mut cursor = reader
         .prepare("select 1")
-        .on_failover_reset(move |ev: &FailoverEvent| {
+        .on_failover_reset(move |ev: &FailoverResetEvent| {
             observed_clone.lock().unwrap().push(ev.clone());
         })
         .execute()
@@ -1307,11 +1308,11 @@ fn failover_after_batch_replays_and_rereads_schema() {
     );
 
     let mut reader = Reader::from_conf(&conf).expect("connect to A");
-    let observed: Arc<Mutex<Vec<FailoverEvent>>> = Arc::new(Mutex::new(Vec::new()));
+    let observed: Arc<Mutex<Vec<FailoverResetEvent>>> = Arc::new(Mutex::new(Vec::new()));
     let observed_clone = Arc::clone(&observed);
     let mut cursor = reader
         .prepare("select 1")
-        .on_failover_reset(move |ev: &FailoverEvent| {
+        .on_failover_reset(move |ev: &FailoverResetEvent| {
             observed_clone.lock().unwrap().push(ev.clone());
         })
         .execute()
@@ -1396,7 +1397,7 @@ fn failover_arrow_reader_same_schema_continues() {
     // actually reaches the adapter instead of `FailoverWouldDuplicate`.
     let mut cursor = reader
         .prepare("select 1")
-        .on_failover_reset(|_: &FailoverEvent| {})
+        .on_failover_reset(|_: &FailoverResetEvent| {})
         .execute()
         .expect("execute");
     {
@@ -1476,7 +1477,7 @@ fn failover_arrow_reader_schema_drift_poisons() {
     // surfacing `FailoverWouldDuplicate`) and exercises the drift check.
     let mut cursor = reader
         .prepare("select 1")
-        .on_failover_reset(|_: &FailoverEvent| {})
+        .on_failover_reset(|_: &FailoverResetEvent| {})
         .execute()
         .expect("execute");
     {
@@ -1551,7 +1552,7 @@ fn failover_replay_continuation_before_schema_rejected() {
     let mut reader = Reader::from_conf(&conf).expect("connect to A");
     let mut cursor = reader
         .prepare("select 1")
-        .on_failover_reset(|_ev: &FailoverEvent| {})
+        .on_failover_reset(|_ev: &FailoverResetEvent| {})
         .execute()
         .expect("execute");
 
@@ -1696,11 +1697,11 @@ fn add_credit_failover_post_conditions_are_consistent() {
     let mut reader = Reader::from_conf(&conf).expect("connect to A");
     assert_eq!(reader.current_addr().port, srv_a.addr.port());
 
-    let observed: Arc<Mutex<Vec<FailoverEvent>>> = Arc::new(Mutex::new(Vec::new()));
+    let observed: Arc<Mutex<Vec<FailoverResetEvent>>> = Arc::new(Mutex::new(Vec::new()));
     let observed_clone = Arc::clone(&observed);
     let mut cursor = reader
         .prepare("select 1")
-        .on_failover_reset(move |ev: &FailoverEvent| {
+        .on_failover_reset(move |ev: &FailoverResetEvent| {
             observed_clone.lock().unwrap().push(ev.clone());
         })
         .execute()
@@ -2424,7 +2425,7 @@ fn replay_write_failure_uses_remaining_execute_budget() {
 
 #[test]
 fn failover_event_attempts_is_cumulative_across_rotations() {
-    // `FailoverEvent.attempts` must be the cumulative reconnect count
+    // `FailoverResetEvent.attempts` must be the cumulative reconnect count
     // across every dial inside the single `reconnect_with_failover`
     // walk that landed — not just the index of the dial that finally
     // succeeded. Force the rotation to skip past one dead endpoint
@@ -3201,7 +3202,7 @@ fn cursor_current_addr_tracks_failover_endpoint_switch() {
     //      no further reconnects happened.
     //
     // Without (2), users have to keep their own `Endpoint` shadow
-    // copy via `FailoverEvent.new_addr` instead of asking the cursor
+    // copy via `FailoverResetEvent.new_addr` instead of asking the cursor
     // directly — the whole point of adding `Cursor::current_addr`.
     let srv_a = MockServer::start(vec![drop_after_query_script(ServerRole::Standalone, "a")]);
     let srv_b = MockServer::start(vec![happy_script(ServerRole::Standalone, "b")]);
@@ -3223,7 +3224,7 @@ fn cursor_current_addr_tracks_failover_endpoint_switch() {
 
     let mut cursor = reader
         .prepare("select 1")
-        .on_failover_reset(move |ev: &FailoverEvent| {
+        .on_failover_reset(move |ev: &FailoverResetEvent| {
             // The callback receives the new endpoint via the event.
             // Record it; the test verifies `cursor.current_addr()`
             // matches once the closure returns.
@@ -3246,7 +3247,7 @@ fn cursor_current_addr_tracks_failover_endpoint_switch() {
     assert!(cursor.next_batch().expect("next after failover").is_none());
     assert_eq!(cursor.failover_resets(), 1);
 
-    // (2) In-callback observation: the FailoverEvent should already
+    // (2) In-callback observation: the FailoverResetEvent should already
     // describe B, and `cursor.current_addr` should agree once the
     // call completes — both must reflect the new endpoint.
     let cb_addr = observed_in_cb
@@ -3258,7 +3259,7 @@ fn cursor_current_addr_tracks_failover_endpoint_switch() {
     assert_eq!(
         cb_addr.1,
         srv_b.addr.port(),
-        "FailoverEvent.new_addr passed to the callback must be the failover target B"
+        "FailoverResetEvent.new_addr passed to the callback must be the failover target B"
     );
 
     // (3) Post-drain: the cursor's accessor must agree with what
@@ -3319,7 +3320,7 @@ fn failover_callback_runs_before_replayed_read() {
 
     let mut cursor = reader
         .prepare("select 1")
-        .on_failover_reset(move |_ev: &FailoverEvent| {
+        .on_failover_reset(move |_ev: &FailoverResetEvent| {
             *cb_started_clone.lock().unwrap() = Some(Instant::now());
             std::thread::sleep(parked_for);
         })
@@ -4973,9 +4974,9 @@ fn progress_callback_gave_up_on_single_endpoint_exhaustion() {
     }
 }
 
-// NOTE: the "progress callback alone unlocks replay after data
-// delivered" branch is covered by the C++ mock-driven test in
-// `cpp_test/test_reader_mock.cpp`. The reset-callback flavour of
+// NOTE: the C++ mock-driven test in `cpp_test/test_reader_mock.cpp` pins
+// that a progress callback alone does not authorize replay after data has
+// reached the caller. The reset-callback flavour of
 // replay-after-data — including the schema re-read from the new node's
 // batch 0 — is covered here via `Action::SendBatch` in
 // `failover_after_batch_replays_and_rereads_schema`, and the
@@ -5011,7 +5012,7 @@ fn progress_and_reset_callbacks_both_fire_on_reset() {
                 order_p.lock().unwrap().push("progress.reset");
             }
         })
-        .on_failover_reset(move |_ev: &FailoverEvent| {
+        .on_failover_reset(move |_ev: &FailoverResetEvent| {
             order_r.lock().unwrap().push("reset");
         })
         .execute()
@@ -5188,7 +5189,7 @@ fn fetch_all_polars_preserves_user_reset_callback() {
     let resets_cb = Arc::clone(&resets);
     let mut cursor = reader
         .prepare("select 1")
-        .on_failover_reset(move |_ev: &FailoverEvent| {
+        .on_failover_reset(move |_ev: &FailoverResetEvent| {
             resets_cb.fetch_add(1, Ordering::SeqCst);
         })
         .execute()
@@ -5363,7 +5364,7 @@ fn failover_replay_resets_symbol_cache_to_new_node_values() {
     // returns `FailoverWouldDuplicate` before any reconnect).
     let mut cursor = reader
         .prepare("select s from t")
-        .on_failover_reset(|_ev: &FailoverEvent| {})
+        .on_failover_reset(|_ev: &FailoverResetEvent| {})
         .execute()
         .expect("execute");
 

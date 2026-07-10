@@ -29,11 +29,11 @@ use std::sync::Arc;
 
 use arrow::datatypes::{DataType, Field, Schema as ArrowSchema, TimeUnit};
 
-use crate::egress::arrow::metadata::*;
+use crate::arrow_metadata::*;
 use crate::egress::column_kind::ColumnKind;
 use crate::egress::decoder::{DecodedBatch, DecodedColumn};
-use crate::egress::error::{Error, ErrorCode, Result, fmt};
 use crate::egress::schema::Schema;
+use crate::error::{Error, ErrorCode, Result, fmt};
 
 pub(crate) fn batch_arrow_schema(schema: &Schema, batch: &DecodedBatch) -> Result<ArrowSchema> {
     if schema.len() != batch.columns.len() {

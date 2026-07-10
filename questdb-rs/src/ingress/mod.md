@@ -267,7 +267,7 @@ To select one, use the `tls_ca` config option. These are the supported variants:
   automatically sets `tls_ca=pem_file`.
 
 * `tls_roots_password=<secret>;` unlocks a JKS / PKCS#12 keystore named by
-  `tls_roots`. QWP/WebSocket (`qwpwss::`) **only** — ILP/TCP and ILP/HTTP read
+  `tls_roots`. QWP/WebSocket (`wss::`) **only** — ILP/TCP and ILP/HTTP read
   unencrypted PEM via rustls and reject this key. With the password set, the
   `tls_roots` file is interpreted as a Java KeyStore (auto-detected: JKS magic
   `0xFEEDFEED`, or PKCS#12 ASN.1 SEQUENCE) and its trusted-certificate entries

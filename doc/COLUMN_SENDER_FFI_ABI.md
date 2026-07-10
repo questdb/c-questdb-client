@@ -218,21 +218,21 @@ return per work unit (or per thread).
 | `pool_reap`            | `auto`  | `auto` — pool spawns a background thread that periodically reaps idle connections per `pool_idle_timeout_ms`. `manual` — no background thread; caller invokes `questdb_db_reap_idle` on its own cadence. |
 
 All other connect-string keys are inherited from the existing
-`qwpws::` configuration (auth, TLS, `auth_timeout_ms`, retry,
+`ws::` configuration (auth, TLS, `auth_timeout_ms`, retry,
 durable-ack opt-in, etc.). See `doc/CONSIDERATIONS.md` and the
 row-API connect-string reference.
 
 **Not accepted in v1:** `sf_dir` and the other `sf_*` store-and-
 forward keys (`sender_id`, `sf_max_bytes`, `sf_max_total_bytes`,
 `sf_durability`, `sf_append_deadline_millis`). Passing any of them to
-`questdb_db_connect` returns `line_sender_error_config_error` with a
+`questdb_db_connect` returns `questdb_error_config_error` with a
 message pointing to the row-major `line_sender` API for users who
 need SF semantics. SF is fundamentally single-writer per slot and
 interacts awkwardly with the pool's auto-grow; revisit only if a
 real user needs both throughput and on-disk durability.
 
 Validity: `pool_size <= pool_max` must hold; otherwise
-`questdb_db_connect` returns `line_sender_error_config_error`.
+`questdb_db_connect` returns `questdb_error_config_error`.
 
 ### 4.3 Pool functions
 
@@ -242,33 +242,28 @@ Validity: `pool_size <= pool_max` must hold; otherwise
 > `questdb_db_borrow_row_sender` — build rows with a `line_sender_buffer`
 > and flush with `row_sender_flush` / `row_sender_flush_and_keep` or the
 > FSN-returning variants), and query readers (`reader`, in
-> `questdb/egress/reader.h`). Each has its own `_return_*` / `_drop_*`
-> (readers: `_return_reader` / `reader_close`) lifecycle.
+> `questdb/egress/reader.h`). Senders have explicit return/drop functions;
+> `reader_close` returns a pooled reader or destroys a standalone reader.
 
-> **Reader-only consumers:** `questdb_db_connect` reports the ingress
-> `line_sender_error`. A read-only path that only borrows readers can
-> instead call `questdb_db_connect_reader` (declared in
-> `questdb/egress/reader.h`), which opens the same pool but reports
-> the egress `reader_error` — so the whole lifecycle
-> (`questdb_db_connect_reader` → `questdb_db_borrow_reader` →
-> `questdb_db_return_reader` → `questdb_db_close`) uses a single error
-> type and never includes this ingress header. `questdb_db_close` is
-> re-declared in the egress header for the same reason.
+> **Reader-only consumers:** `questdb/egress/reader.h` declares the canonical
+> `questdb_db_connect` and `questdb_db_close` pool functions, both using the
+> client-wide `questdb_error`. Borrow with `questdb_db_borrow_reader`; close
+> the handle with `reader_close` to return it to the pool.
 
 ```c
 /**
  * Open a connection pool. Eagerly opens `pool_size` connections; any
  * server/auth/TLS error during those opens fails the call.
  *
- * `conf` is a standard `qwpws::` connect string. Non-WS schemes return
- * line_sender_error_config_error — the column-sender path is QWP/WS
+ * `conf` is a standard `ws::` connect string. Non-WS schemes return
+ * questdb_error_config_error — the column-sender path is QWP/WS
  * only.
  */
 QUESTDB_CLIENT_API
 questdb_db* questdb_db_connect(
     const char* conf,
     size_t conf_len,
-    line_sender_error** err_out);
+    questdb_error** err_out);
 
 /**
  * Close the pool. Accepts NULL and no-ops.
@@ -277,7 +272,7 @@ questdb_db* questdb_db_connect(
  * borrows and closes idle connections.
  * Senders still checked out are independent leases: return/drop is
  * safe after pool close, but new operations on them return
- * line_sender_error_invalid_api_call. A sender returned after close is
+ * questdb_error_invalid_api_call. A sender returned after close is
  * closed, not recycled. Calls already inside flush/sync may finish.
  */
 QUESTDB_CLIENT_API
@@ -291,7 +286,7 @@ void questdb_db_close(questdb_db* db);
  *  2. Otherwise, if pool size < `pool_max`, open a new connection on
  *     demand (auto-grow) and hand out a conn bound to it.
  *  3. Otherwise (at `pool_max` cap, all checked out), return
- *     line_sender_error_invalid_api_call. This is fail-fast: hitting
+ *     questdb_error_invalid_api_call. This is fail-fast: hitting
  *     the cap signals either a leaked borrow or a `pool_max` set too
  *     low — both want an error rather than silent blocking. Caller may
  *     retry after returning conns.
@@ -1450,7 +1445,7 @@ fail:
 int main(void) {
     line_sender_error* err = NULL;
     questdb_db* db = questdb_db_connect(
-        "qwpws::addr=localhost:9000;pool_size=1;", &err);
+        "ws::addr=localhost:9000;pool_size=1;", &err);
     if (!db) {
         if (err) line_sender_error_free(err);
         return 1;

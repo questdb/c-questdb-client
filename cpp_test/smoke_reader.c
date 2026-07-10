@@ -41,7 +41,7 @@ static int closed_port_phase(void)
     line_sender_utf8 conf =
         QDB_UTF8_LITERAL("ws::addr=127.0.0.1:1;");
 
-    reader_error* err = NULL;
+    questdb_error* err = NULL;
     reader* reader = reader_from_conf(conf, &err);
 
     if (reader != NULL)
@@ -64,46 +64,41 @@ static int closed_port_phase(void)
     }
 
     size_t msg_len = 0;
-    const char* msg = reader_error_msg(err, &msg_len);
+    const char* msg = questdb_error_msg(err, &msg_len);
     if (msg == NULL || msg_len == 0)
     {
         fprintf(
             stderr,
             "smoke: error has empty message — error-message accessor "
             "broken\n");
-        reader_error_free(err);
+        questdb_error_free(err);
         return 1;
     }
 
     /* Drop the error and confirm the NULL-idempotent close path. */
-    reader_error_free(err);
+    questdb_error_free(err);
     reader_close(NULL);
     return 0;
 }
 
 /*
- * Reader-only pool phase (always runs). Proves a read-only C consumer
- * can open, fail, and tear down the connection pool using ONLY
- * <questdb/egress/reader.h> and ONLY the `reader_error`
- * type — i.e. without including <questdb/ingress/column_sender.h> or
- * declaring a `line_sender_error`. This is the whole point of
- * `questdb_db_connect_reader`: the pool's connect call no longer drags
- * the ingress error type onto the read path.
+ * Reader-only pool phase (always runs). Proves a read-only C consumer can
+ * open, fail, and tear down the shared pool using only
+ * <questdb/egress/reader.h> and the client-wide `questdb_error` type.
  *
- * Targets the same guaranteed-closed 127.0.0.1:1 port via a `qwpws::`
- * connect string. The pool is lazy: `questdb_db_connect_reader` opens no
+ * Targets the same guaranteed-closed 127.0.0.1:1 port via a `ws::`
+ * connect string. The pool is lazy: `questdb_db_connect` opens no
  * socket, so the connect itself succeeds and the connect failure surfaces
- * on the first `questdb_db_borrow_reader` — reported as a `reader_error*`
- * (not a `line_sender_error*`). Also exercises the NULL-idempotent
- * `questdb_db_close` / `questdb_db_return_reader` paths.
+ * on the first `questdb_db_borrow_reader` — reported as a `questdb_error*`.
+ * Also exercises the NULL-idempotent `questdb_db_close` path.
  */
 static int pool_reader_only_phase(void)
 {
-    static const char conf[] = "qwpws::addr=127.0.0.1:1;";
+    static const char conf[] = "ws::addr=127.0.0.1:1;";
 
-    reader_error* err = NULL;
+    questdb_error* err = NULL;
     struct questdb_db* db =
-        questdb_db_connect_reader(conf, strlen(conf), &err);
+        questdb_db_connect(conf, strlen(conf), &err);
 
     /*
      * Lazy pool: connect opens nothing, so it succeeds even against a
@@ -113,21 +108,21 @@ static int pool_reader_only_phase(void)
     {
         size_t connect_msg_len = 0;
         const char* connect_msg =
-            err != NULL ? reader_error_msg(err, &connect_msg_len) : NULL;
+            err != NULL ? questdb_error_msg(err, &connect_msg_len) : NULL;
         fprintf(
             stderr,
-            "smoke pool: questdb_db_connect_reader unexpectedly failed for a "
+            "smoke pool: questdb_db_connect unexpectedly failed for a "
             "lazy pool: %.*s\n",
             (int)connect_msg_len,
             connect_msg ? connect_msg : "(no error)");
         if (err != NULL)
-            reader_error_free(err);
+            questdb_error_free(err);
         return 1;
     }
 
     /*
      * The connect failure must surface here, on the first borrow, as a
-     * `reader_error*`.
+     * `questdb_error*`.
      */
     reader* reader = questdb_db_borrow_reader(db, &err);
     if (reader != NULL)
@@ -139,7 +134,7 @@ static int pool_reader_only_phase(void)
         reader_close(reader);
         questdb_db_close(db);
         if (err != NULL)
-            reader_error_free(err);
+            questdb_error_free(err);
         return 1;
     }
 
@@ -154,24 +149,23 @@ static int pool_reader_only_phase(void)
     }
 
     size_t msg_len = 0;
-    const char* msg = reader_error_msg(err, &msg_len);
+    const char* msg = questdb_error_msg(err, &msg_len);
     if (msg == NULL || msg_len == 0)
     {
         fprintf(
             stderr,
-            "smoke pool: borrow error has empty message — egress error "
+            "smoke pool: borrow error has empty message — client error "
             "accessor broken on the pool borrow path\n");
-        reader_error_free(err);
+        questdb_error_free(err);
         questdb_db_close(db);
         return 1;
     }
 
-    /* Single egress error type, freed through the egress accessor. */
-    reader_error_free(err);
+    /* Single client-wide error type, freed through the neutral accessor. */
+    questdb_error_free(err);
     questdb_db_close(db);
 
     /* NULL-idempotent teardown paths reachable from this header. */
-    questdb_db_return_reader(NULL, NULL);
     questdb_db_close(NULL);
     return 0;
 }
@@ -184,7 +178,7 @@ static int pool_reader_only_phase(void)
  */
 static int live_lifecycle_phase(const char* addr)
 {
-    reader_error* err = NULL;
+    questdb_error* err = NULL;
     reader* reader = NULL;
     reader_query* query = NULL;
     reader_cursor* cursor = NULL;
@@ -325,7 +319,7 @@ fail:;
     if (err != NULL)
     {
         size_t err_len = 0;
-        const char* err_msg = reader_error_msg(err, &err_len);
+        const char* err_msg = questdb_error_msg(err, &err_len);
         fprintf(
             stderr,
             "smoke live: %.*s\n",
@@ -349,7 +343,7 @@ cleanup:
      * `_query_execute` itself failed before consuming the query.
      */
     if (err != NULL)
-        reader_error_free(err);
+        questdb_error_free(err);
     reader_cursor_free(cursor);
     reader_query_free(query);
     reader_close(reader);

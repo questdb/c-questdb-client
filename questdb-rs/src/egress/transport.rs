@@ -49,12 +49,13 @@ use std::time::Duration;
 use bytes::Bytes;
 
 use crate::egress::config::ReaderConfig;
-use crate::egress::error::{Error, ErrorCode, Result, UpgradeReject, fmt};
+use crate::egress::server_event::UpgradeReject;
 use crate::egress::tls::build_client_config;
 use crate::egress::wire::MsgKind;
 use crate::egress::wire::header::{FrameHeader, HEADER_LEN};
 use crate::egress::wire::roles;
 use crate::egress::ws::client::{Stream, WsClient, WsReadError};
+use crate::error::{Error, ErrorCode, Result, fmt};
 use crate::ws::handshake::{self, HandshakeError as WsHandshakeError, Headers, HttpReject};
 use crate::ws::mask::MaskKeySource;
 use crate::ws::nosigpipe::NoSigpipeTcp;

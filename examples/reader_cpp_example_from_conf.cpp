@@ -46,7 +46,7 @@ int main()
         }
         return 0;
     }
-    catch (const questdb::egress::reader_error& e)
+    catch (const questdb::error& e)
     {
         std::cerr << "Error (code " << static_cast<int>(e.code())
                   << "): " << e.what() << "\n";

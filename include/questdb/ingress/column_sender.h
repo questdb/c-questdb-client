@@ -138,7 +138,7 @@ typedef struct column_sender_validity
  * the borrow, not from here. `pool_size` (default 1) is the warm minimum the
  * reaper keeps once connections have been opened.
  *
- * `conf` is a `qwpws::` / `qwpwss::` connect string. Pool-specific keys:
+ * `conf` is a `ws::` / `wss::` connect string. Pool-specific keys:
  *   `pool_size`            (default 1)   warm/min connections;
  *   `pool_max`             (default 64)  hard cap on auto-grow;
  *   `pool_idle_timeout_ms` (default 60000)
@@ -164,7 +164,7 @@ QUESTDB_CLIENT_API
 questdb_db* questdb_db_connect(
     const char* conf,
     size_t conf_len,
-    line_sender_error** err_out);
+    questdb_error** err_out);
 
 /**
  * Close the pool. Accepts NULL and no-ops.
@@ -334,9 +334,8 @@ void questdb_db_drop_direct_column_sender(
     direct_column_sender* sender);
 
 /* Reader-pool entry points (`questdb_db_borrow_reader`,
- * `questdb_db_return_reader`, `questdb_db_dbg_reader_*_count`) live in
- * `questdb/egress/reader.h` alongside the `reader` type
- * they wrap. */
+ * `questdb_db_dbg_reader_*_count`) live in `questdb/egress/reader.h`
+ * alongside the `reader` type they wrap. */
 
 /**
  * Manually reap idle connections (closes free-list entries idle longer

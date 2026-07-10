@@ -162,15 +162,12 @@ def _build_native_sidecar(*, src_name: str, bin_name: str,
     ffi_manifest = client_root / "questdb-rs-ffi" / "Cargo.toml"
     if not ffi_manifest.is_file():
         raise RuntimeError(f"questdb-rs-ffi Cargo.toml not found at {ffi_manifest}")
-    # One shared library for every native sidecar: always enable the
-    # opt-in reader feature so the egress sidecars link against the same
-    # artifact the ingress sidecars use. The feature only ADDS `reader_*`
-    # symbols (the ingress line_sender surface is unchanged), and building
-    # a single feature set avoids cargo rebuild churn from alternating
-    # feature sets within one pytest session.
+    # One shared library for every native sidecar. The `reader_*` egress
+    # surface is always compiled into the C ABI (on the same footing as the
+    # ingress line_sender surface), so no feature flag is needed — the egress
+    # and ingress sidecars link against the same artifact.
     cargo = [
         "cargo", "build", "--manifest-path", str(ffi_manifest),
-        "--features", "sync-reader-qwp-ws",
     ]
     if profile == "release":
         cargo.append("--release")
@@ -226,7 +223,7 @@ def build_cpp_sidecar() -> Path:
 
 def build_c_egress_sidecar() -> Path:
     """Build the C-binding ``qwp_egress_c_sidecar`` (QWP egress ``reader_*``
-    C API behind the ``sync-reader-qwp-ws`` ffi feature)."""
+    C API, always compiled into the shared library)."""
     return _build_native_sidecar(
         src_name="qwp_egress_c_sidecar.c", bin_name="qwp_egress_c_sidecar",
         compiler_default="cc", compiler_env="CC", std_flag="-std=c11")
@@ -236,10 +233,8 @@ def build_cpp_egress_sidecar() -> Path:
     """Build the C++-binding ``qwp_egress_cpp_sidecar``. Unlike the ingress
     case, the egress C++ wrapper (``questdb::egress::reader`` in
     ``reader.hpp``) is a genuine C++ surface, so this sidecar drives the
-    C++ classes directly (constructor gated by
-    ``QUESTDB_READER_INTERNAL_CONSTRUCTORS``, the sanctioned in-tree-test
-    form -- same standalone-reader shape as the Rust sidecar's
-    ``Reader::from_conf``)."""
+    public standalone reader directly, matching the Rust sidecar's
+    ``Reader::from_conf`` shape."""
     return _build_native_sidecar(
         src_name="qwp_egress_cpp_sidecar.cpp", bin_name="qwp_egress_cpp_sidecar",
         compiler_default="c++", compiler_env="CXX", std_flag="-std=c++17")

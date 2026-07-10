@@ -1260,7 +1260,7 @@ public:
      * Create a new `opts` instance from the given configuration string.
      * The format of the string is: "tcp::addr=host:port;key=value;...;"
      * Instead of "tcp" you can also specify "tcps", "http", "https",
-     * "qwpudp", "qwpws", and "qwpwss".
+     * "qwpudp", "ws", and "wss".
      *
      * The accepted keys match one-for-one with the methods on `opts`.
      * For example, this is a valid configuration string:
@@ -1414,8 +1414,8 @@ public:
      * Control whether QWP/WebSocket progress is driven by a background thread
      * or manually by the caller. The default is background progress.
      *
-     * This setting is only supported for `protocol::qwpws` and
-     * `protocol::qwpwss`.
+     * This setting is only supported for `protocol::ws` and
+     * `protocol::wss`.
      */
     opts& qwp_ws_progress(qwp_ws_progress progress)
     {
@@ -1546,7 +1546,7 @@ public:
      * This is used to validate the server's certificate during the TLS
      * handshake.
      *
-     * On QWP/WebSocket (`qwpwss::`) the same path may instead point at
+     * On QWP/WebSocket (`wss::`) the same path may instead point at
      * a JKS or PKCS#12 keystore; pair it with `tls_roots_password()` to
      * unlock it.
      *
@@ -1754,7 +1754,7 @@ public:
      * Create a new line sender instance from the given configuration string.
      * The format of the string is: "tcp::addr=host:port;key=value;...;"
      * Instead of "tcp" you can also specify "tcps", "http", "https",
-     * "qwpudp", "qwpws", and "qwpwss".
+     * "qwpudp", "ws", and "wss".
      *
      * The accepted keys match one-for-one with the methods on `opts`.
      * For example, this is a valid configuration string:
@@ -1864,8 +1864,8 @@ public:
         auto version = this->protocol_version();
         auto max_name_len = ::line_sender_get_max_name_len(_impl);
         auto sender_protocol = this->protocol();
-        if (sender_protocol == protocol::qwpws ||
-            sender_protocol == protocol::qwpwss)
+        if (sender_protocol == protocol::ws ||
+            sender_protocol == protocol::wss)
         {
             throw line_sender_error{
                 line_sender_error_code::invalid_api_call,
@@ -1956,8 +1956,8 @@ public:
             auto sender_protocol = this->protocol();
             // A WebSocket sender has no row buffer (new_buffer() rejects it),
             // so an absent buffer here is simply nothing to flush.
-            if (sender_protocol == protocol::qwpws ||
-                sender_protocol == protocol::qwpwss)
+            if (sender_protocol == protocol::ws ||
+                sender_protocol == protocol::wss)
                 return;
             line_sender_buffer buffer2 = this->new_buffer(0);
             line_sender_error::wrapped_call(
@@ -2006,8 +2006,8 @@ public:
             auto sender_protocol = this->protocol();
             // A WebSocket sender has no row buffer (new_buffer() rejects it),
             // so an absent buffer here is simply nothing to flush.
-            if (sender_protocol == protocol::qwpws ||
-                sender_protocol == protocol::qwpwss)
+            if (sender_protocol == protocol::ws ||
+                sender_protocol == protocol::wss)
                 return;
             line_sender_buffer buffer2 = this->new_buffer(0);
             line_sender_error::wrapped_call(

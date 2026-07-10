@@ -33,7 +33,7 @@
 //! 8      4    payload_length Payload size in bytes
 //! ```
 
-use crate::egress::error::{Result, fmt};
+use crate::error::{Result, fmt};
 
 /// `"QWP1"` interpreted as a little-endian `u32`.
 pub const MAGIC: u32 = u32::from_le_bytes(*b"QWP1");
@@ -132,7 +132,7 @@ impl FrameHeader {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::egress::error::ErrorCode;
+    use crate::error::ErrorCode;
 
     #[test]
     fn magic_is_qwp1_le() {

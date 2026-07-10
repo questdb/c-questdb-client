@@ -257,14 +257,14 @@ _setsig(
 )
 
 # Reader error handling.
-_setsig("reader_error_get_code", _c_int32, ctypes.POINTER(_LineReaderError))
+_setsig("questdb_error_get_code", _c_int32, ctypes.POINTER(_LineReaderError))
 _setsig(
-    "reader_error_msg",
+    "questdb_error_msg",
     _c_char_p,
     ctypes.POINTER(_LineReaderError),
     ctypes.POINTER(_c_size_t),
 )
-_setsig("reader_error_free", None, ctypes.POINTER(_LineReaderError))
+_setsig("questdb_error_free", None, ctypes.POINTER(_LineReaderError))
 
 
 # ---------------------------------------------------------------------------
@@ -281,20 +281,20 @@ class ReaderError(RuntimeError):
 
 
 def _take_error(err_ptr) -> ReaderError:
-    """Build a ReaderError from a populated `reader_error*` and free it.
+    """Build a ReaderError from a populated `questdb_error*` and free it.
 
     `err_ptr` is the pointer variable the FFI wrote into (i.e. an
     instance of `ctypes.POINTER(_LineReaderError)`), not a byref to it.
     """
-    code = int(_DLL.reader_error_get_code(err_ptr))
+    code = int(_DLL.questdb_error_get_code(err_ptr))
     msg_len = _c_size_t(0)
-    raw = _DLL.reader_error_msg(err_ptr, ctypes.byref(msg_len))
+    raw = _DLL.questdb_error_msg(err_ptr, ctypes.byref(msg_len))
     msg = (
         bytes(ctypes.string_at(raw, msg_len.value)).decode("utf-8", "replace")
         if raw and msg_len.value
         else ""
     )
-    _DLL.reader_error_free(err_ptr)
+    _DLL.questdb_error_free(err_ptr)
     return ReaderError(code, msg)
 
 
@@ -929,7 +929,7 @@ class QwpEgressReader:
             # No SYMBOL columns in the batch is not an error — but the FFI
             # signals it via err_out anyway. Free the error and return empty.
             if err_ref:
-                _DLL.reader_error_free(err_ref)
+                _DLL.questdb_error_free(err_ref)
             return b"", []
         heap = _read_bytes(dict_struct.heap, int(dict_struct.heap_len))
         entries: List[Tuple[int, int]] = []

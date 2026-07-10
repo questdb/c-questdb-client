@@ -85,8 +85,8 @@ class Protocol(Enum):
     HTTP = (c_line_sender_protocol(2), 'http')
     HTTPS = (c_line_sender_protocol(3), 'https')
     QWPUDP = (c_line_sender_protocol(4), 'qwpudp')
-    QWPWS = (c_line_sender_protocol(5), 'qwpws')
-    QWPWSS = (c_line_sender_protocol(6), 'qwpwss')
+    WS = (c_line_sender_protocol(5), 'ws')
+    WSS = (c_line_sender_protocol(6), 'wss')
 
     @classmethod
     def from_int(cls, value: c_line_sender_protocol):
@@ -1439,7 +1439,7 @@ class Sender:
             port: Union[str, int],
             **kwargs):
 
-        if protocol in (Protocol.TCPS, Protocol.HTTPS, Protocol.QWPWSS):
+        if protocol in (Protocol.TCPS, Protocol.HTTPS, Protocol.WSS):
             if host == '127.0.0.1':
                 host = 'localhost'  # for TLS connections we need a hostname
 

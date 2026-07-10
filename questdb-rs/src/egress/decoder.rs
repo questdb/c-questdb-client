@@ -67,12 +67,12 @@ use crate::egress::column::{
     UuidColumn, Validity, VarcharColumn,
 };
 use crate::egress::column_kind::ColumnKind;
-use crate::egress::error::{Error, Result, fmt};
 use crate::egress::schema::Schema;
 use crate::egress::symbol_dict::SymbolDict;
 use crate::egress::wire::ByteReader;
 use crate::egress::wire::header::flags;
 use crate::egress::wire::msg_kind::MsgKind;
+use crate::error::{Error, Result, fmt};
 use bytes::Bytes;
 
 /// Per-batch caps mirrored from `java-questdb-client` (`QwpConstants.java`
@@ -1750,9 +1750,9 @@ fn is_null_at_opt(validity: &Option<Bytes>, row: usize) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::egress::error::ErrorCode;
     use crate::egress::schema::{Schema, SchemaColumn};
     use crate::egress::wire::varint::encode_u64;
+    use crate::error::ErrorCode;
 
     /// Reference implementation kept inline in the test: byte-by-byte
     /// popcount with the same tail-bit masking rule. We assert the
@@ -2791,7 +2791,7 @@ mod tests {
                 &mut ZstdScratch::new(),
             )
             .unwrap_err();
-            assert_eq!(err.code(), crate::egress::ErrorCode::ProtocolError);
+            assert_eq!(err.code(), crate::ErrorCode::ProtocolError);
             assert!(
                 err.msg().contains("scale"),
                 "expected scale error msg, got: {}",
@@ -2818,7 +2818,7 @@ mod tests {
             &mut ZstdScratch::new(),
         )
         .unwrap_err();
-        assert_eq!(err.code(), crate::egress::ErrorCode::ProtocolError);
+        assert_eq!(err.code(), crate::ErrorCode::ProtocolError);
     }
 
     fn decimal_col_data(scale: u8, width: usize) -> Vec<u8> {
@@ -2848,7 +2848,7 @@ mod tests {
         // DECIMAL64 (width 8) caps scale at 18 (server Decimal64.MAX_SCALE).
         assert!(decode_decimal_one_row(ColumnKind::Decimal64, 18, 8).is_ok());
         let err = decode_decimal_one_row(ColumnKind::Decimal64, 19, 8).unwrap_err();
-        assert_eq!(err.code(), crate::egress::ErrorCode::ProtocolError);
+        assert_eq!(err.code(), crate::ErrorCode::ProtocolError);
         assert!(err.msg().contains("DECIMAL"), "{}", err.msg());
     }
 
@@ -2857,7 +2857,7 @@ mod tests {
         // DECIMAL128 (width 16) caps scale at 38 (server Decimal128.MAX_SCALE).
         assert!(decode_decimal_one_row(ColumnKind::Decimal128, 38, 16).is_ok());
         let err = decode_decimal_one_row(ColumnKind::Decimal128, 39, 16).unwrap_err();
-        assert_eq!(err.code(), crate::egress::ErrorCode::ProtocolError);
+        assert_eq!(err.code(), crate::ErrorCode::ProtocolError);
         assert!(err.msg().contains("DECIMAL"), "{}", err.msg());
     }
 
@@ -2868,7 +2868,7 @@ mod tests {
         assert!(decode_decimal_one_row(ColumnKind::Decimal256, 39, 32).is_ok());
         assert!(decode_decimal_one_row(ColumnKind::Decimal256, 76, 32).is_ok());
         let err = decode_decimal_one_row(ColumnKind::Decimal256, 77, 32).unwrap_err();
-        assert_eq!(err.code(), crate::egress::ErrorCode::ProtocolError);
+        assert_eq!(err.code(), crate::ErrorCode::ProtocolError);
         assert!(err.msg().contains("DECIMAL"), "{}", err.msg());
     }
 
@@ -2910,7 +2910,7 @@ mod tests {
             .build();
         let err = decode_result_batch(&p, f, &mut dict, &mut schema, &mut ZstdScratch::new())
             .unwrap_err();
-        assert_eq!(err.code(), crate::egress::ErrorCode::ProtocolError);
+        assert_eq!(err.code(), crate::ErrorCode::ProtocolError);
     }
 
     #[cfg(feature = "sync-reader-zstd")]

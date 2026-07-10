@@ -5,6 +5,7 @@ use arrow::datatypes::{DataType, TimeUnit};
 use bytes::Bytes;
 
 use super::*;
+use crate::arrow_metadata;
 use crate::egress::column_kind::ColumnKind;
 use crate::egress::decoder::{ArrayBuffers, ColumnBuffer, DecodedBatch, DecodedColumn};
 use crate::egress::schema::{Schema, SchemaColumn};
@@ -227,14 +228,14 @@ fn uuid_field_carries_arrow_uuid_extension() {
     assert_eq!(
         field
             .metadata()
-            .get(metadata::ARROW_EXTENSION_NAME)
+            .get(arrow_metadata::ARROW_EXTENSION_NAME)
             .map(String::as_str),
         Some("arrow.uuid")
     );
     assert_eq!(
         field
             .metadata()
-            .get(metadata::COLUMN_TYPE)
+            .get(arrow_metadata::COLUMN_TYPE)
             .map(String::as_str),
         Some("uuid")
     );
@@ -457,7 +458,7 @@ fn geohash_widens_to_target_arrow_width() {
         arrow_schema
             .field(0)
             .metadata()
-            .get(metadata::GEOHASH_BITS)
+            .get(arrow_metadata::GEOHASH_BITS)
             .map(String::as_str),
         Some("6")
     );
@@ -636,7 +637,7 @@ fn char_column_is_uint16_with_metadata() {
         arrow_schema
             .field(0)
             .metadata()
-            .get(metadata::COLUMN_TYPE)
+            .get(arrow_metadata::COLUMN_TYPE)
             .map(String::as_str),
         Some("char")
     );
@@ -653,7 +654,7 @@ fn ipv4_column_is_uint32_with_metadata() {
         arrow_schema
             .field(0)
             .metadata()
-            .get(metadata::COLUMN_TYPE)
+            .get(arrow_metadata::COLUMN_TYPE)
             .map(String::as_str),
         Some("ipv4")
     );
@@ -987,7 +988,7 @@ fn empty_array_batch_emits_tentative_ndim_marker() {
     let arrow_schema = batch_arrow_schema(&s, &b).unwrap();
     let md = arrow_schema.field(0).metadata();
     assert_eq!(
-        md.get(crate::egress::arrow::metadata::ARRAY_DIM_TENTATIVE)
+        md.get(crate::arrow_metadata::ARRAY_DIM_TENTATIVE)
             .map(String::as_str),
         Some("true")
     );
@@ -1010,10 +1011,7 @@ fn firm_array_batch_has_no_tentative_marker() {
     let b = decoded_of(1, vec![DecodedColumn::DoubleArray(buffers)]);
     let arrow_schema = batch_arrow_schema(&s, &b).unwrap();
     let md = arrow_schema.field(0).metadata();
-    assert!(
-        md.get(crate::egress::arrow::metadata::ARRAY_DIM_TENTATIVE)
-            .is_none()
-    );
+    assert!(md.get(crate::arrow_metadata::ARRAY_DIM_TENTATIVE).is_none());
 }
 
 #[test]
@@ -1098,7 +1096,7 @@ fn schemas_equal_detects_array_dim_drift_when_both_firm() {
 // `panic = "abort"`).
 #[test]
 fn arrow_export_surfaces_on_malformed_decimal64() {
-    use crate::egress::error::ErrorCode;
+    use crate::error::ErrorCode;
     let values = vec![0u8; 8];
     let s = schema_of(&[("d", ColumnKind::Decimal64)]);
     let b = decoded_of(

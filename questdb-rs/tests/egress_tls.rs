@@ -41,7 +41,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
 
-use questdb::egress::{ErrorCode, Reader, ServerRole};
+use questdb::ErrorCode;
+use questdb::egress::{Reader, ServerRole};
 use rustls::ServerConfig;
 use rustls::server::ServerConnection;
 use rustls_pki_types::pem::PemObject;

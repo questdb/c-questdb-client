@@ -163,7 +163,7 @@ fn live_basic_auth_rejects_wrong_password() {
             // without the `WWW-Authenticate` header that triggers the
             // 401/403 → AuthError mapping); anything in the
             // transport/handshake family disproves "silently accepted."
-            use questdb::egress::ErrorCode;
+            use questdb::ErrorCode;
             assert!(
                 matches!(e.code(), ErrorCode::AuthError | ErrorCode::HandshakeError),
                 "wrong-password rejection should surface as AuthError or HandshakeError; \

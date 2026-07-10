@@ -167,7 +167,7 @@ struct MockConn
     explicit MockConn(qm::Script script = qm::Script{qm::ActionAwaitClientFrame{0x51}})
         : server(std::vector<qm::Script>{std::move(script)})
     {
-        const std::string conf = "qwpws::addr=" + server.addr() +
+        const std::string conf = "ws::addr=" + server.addr() +
             ";pool_size=1;pool_reap=manual;close_flush_timeout_millis=0;";
         line_sender_error* err = nullptr;
         db = questdb_db_connect(conf.c_str(), conf.size(), &err);
@@ -266,7 +266,7 @@ TEST_CASE("borrowed_column_sender exposes Arrow FSN helper")
     qm::MockServer server(std::vector<qm::Script>{
         qm::Script{qm::ActionAwaitClientFrame{0x51}}});
     questdb::pool db{
-        "qwpws::addr=" + server.addr() +
+        "ws::addr=" + server.addr() +
         ";pool_size=1;pool_reap=manual;close_flush_timeout_millis=0;"};
     auto conn = db.borrow_column_sender();
 
@@ -320,7 +320,7 @@ TEST_CASE("borrowed_column_sender exposes Arrow ACKing helpers")
         qm::ActionAwaitClientFrame{0x51},
         qm::ActionSendRaw{qm::ingress_ok_frame(1)}}});
     questdb::pool db{
-        "qwpws::addr=" + server.addr() +
+        "ws::addr=" + server.addr() +
         ";pool_size=1;pool_reap=manual;close_flush_timeout_millis=0;"};
     auto conn = db.borrow_column_sender();
 

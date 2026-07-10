@@ -2,8 +2,8 @@
 //! Arrow encoder (`RecordBatch` → `Buffer`) and the egress Arrow adapter
 //! (`Cursor` → `RecordBatch`). Lives here — rather than under `egress::arrow`
 //! — so a sender-only `arrow-ingress` build can reference the keys without
-//! pulling in the egress reader. The egress adapter re-exports this module as
-//! `egress::arrow::metadata` for backwards-compatible paths.
+//! pulling in the egress reader. This top-level module is the canonical public
+//! home for metadata used by either direction.
 //!
 //! These keys are written into the `Arc<Field>` of every column the client
 //! emits, and read back by `classify` on ingress and by mid-stream drift

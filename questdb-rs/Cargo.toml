@@ -123,7 +123,7 @@ ureq = { version = "3.1.2, <3.2.0", default-features = false }
 criterion = { version = "0.5", default-features = false }
 
 [features]
-default = ["sync-sender", "tls-webpki-certs", "ring-crypto"]
+default = ["sync-sender", "sync-reader", "tls-webpki-certs", "ring-crypto"]
 
 ## Reliable, connection-oriented senders: ILP/TCP + ILP/HTTP + QWP/WS.
 ## QWP/UDP is intentionally excluded: it is best-effort (no acks, no auth,
@@ -132,6 +132,15 @@ sync-sender = [
     "sync-sender-tcp",
     "sync-sender-http",
     "sync-sender-qwp-ws",
+]
+
+## QWP/WebSocket egress reader (queries). The read-side counterpart to
+## `sync-sender` and, like it, on by default — querying is first-class,
+## not opt-in. Bundles the WebSocket reader with zstd decompression so
+## results from a compressing server decode out of the box.
+sync-reader = [
+    "sync-reader-qwp-ws",
+    "sync-reader-zstd",
 ]
 
 ## Sync ILP/TCP
@@ -257,20 +266,6 @@ _keystore-roots = ["dep:jks", "dep:p12-keystore"]
 _arrow = ["dep:arrow", "dep:aligned-vec", "dep:bytes"]
 _polars = ["dep:polars", "dep:polars-arrow"]
 
-# -----------------------------------------------------------------------------
-# DEPRECATED back-compat aliases. These map the pre-rename feature names onto
-# their replacements so existing `Cargo.toml`s keep building. Slated for
-# removal in the next major; migrate to the new names:
-#   sync-reader-ws   -> sync-reader-qwp-ws
-#   compression-zstd -> sync-reader-zstd
-#   chrono_timestamp -> chrono-timestamp
-#   json_tests       -> json-tests
-# -----------------------------------------------------------------------------
-sync-reader-ws = ["sync-reader-qwp-ws"]
-compression-zstd = ["sync-reader-zstd"]
-chrono_timestamp = ["chrono-timestamp"]
-json_tests = ["json-tests"]
-
 ## Enable all cross-compatible features.
 ## The `aws-lc-crypto` and `ring-crypto` features are mutually exclusive,
 ## thus compiling with `--all-features` will not work.
@@ -297,15 +292,23 @@ almost-all-features = [
 
 [[example]]
 name = "basic"
-required-features = ["chrono-timestamp", "ndarray"]
+required-features = ["sync-sender-tcp", "chrono-timestamp", "ndarray"]
 
 [[example]]
 name = "auth"
-required-features = ["chrono-timestamp"]
+required-features = ["sync-sender-tcp", "chrono-timestamp"]
 
 [[example]]
 name = "auth_tls"
-required-features = ["chrono-timestamp"]
+required-features = ["sync-sender-tcp", "chrono-timestamp"]
+
+[[example]]
+name = "from_conf"
+required-features = ["sync-sender-tcp"]
+
+[[example]]
+name = "from_env"
+required-features = ["_sync-sender"]
 
 [[example]]
 name = "http"

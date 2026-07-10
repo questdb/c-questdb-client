@@ -106,8 +106,8 @@ NEXT_ARROW_BATCH_END = 1
 NEXT_ARROW_BATCH_ERROR = 2
 
 
-class SenderErrorCode:
-    """`line_sender_error_code` discriminants. Pinned in
+class ClientErrorCode:
+    """`questdb_error_code` discriminants. Pinned in
     `questdb-rs-ffi/src/lib.rs::line_sender_error_code_discriminants_are_abi_stable`."""
     COULD_NOT_RESOLVE_ADDR = 0
     INVALID_API_CALL = 1
@@ -126,34 +126,26 @@ class SenderErrorCode:
     SERVER_REJECTION = 14
     ARROW_UNSUPPORTED_COLUMN_KIND = 15
     ARROW_INGEST = 16
-
-
-class ReaderErrorCode:
-    """`reader_error_code` discriminants. Pinned in
-    `questdb-rs-ffi/src/egress.rs::reader_error_code`."""
-    COULD_NOT_RESOLVE_ADDR = 0
-    CONFIG_ERROR = 1
-    INVALID_API_CALL = 2
-    SOCKET_ERROR = 3
-    TLS_ERROR = 4
-    HANDSHAKE_ERROR = 5
-    AUTH_ERROR = 6
-    UNSUPPORTED_SERVER = 7
-    ROLE_MISMATCH = 8
-    PROTOCOL_ERROR = 9
-    INVALID_UTF8 = 10
-    INVALID_BIND = 11
-    SERVER_SCHEMA_MISMATCH = 14
-    SERVER_PARSE_ERROR = 15
-    SERVER_INTERNAL_ERROR = 16
-    SERVER_SECURITY_ERROR = 17
-    LIMIT_EXCEEDED = 18
-    SERVER_LIMIT_EXCEEDED = 19
-    CANCELLED = 20
-    FAILOVER_WOULD_DUPLICATE = 21
-    SCHEMA_DRIFT = 22
-    NO_SCHEMA = 23
-    ARROW_EXPORT = 24
+    FAILOVER_RETRY = 17
+    ROLE_MISMATCH = 18
+    CONNECT_TIMEOUT = 19
+    HANDSHAKE_ERROR = 20
+    UNSUPPORTED_SERVER = 21
+    PROTOCOL_ERROR = 22
+    INVALID_BIND = 23
+    SERVER_SCHEMA_MISMATCH = 24
+    SERVER_PARSE_ERROR = 25
+    SERVER_INTERNAL_ERROR = 26
+    SERVER_SECURITY_ERROR = 27
+    LIMIT_EXCEEDED = 28
+    SERVER_LIMIT_EXCEEDED = 29
+    CANCELLED = 30
+    FAILOVER_WOULD_DUPLICATE = 31
+    SCHEMA_DRIFT = 32
+    NO_SCHEMA = 33
+    ARROW_EXPORT = 34
+    BATCH_TOO_LARGE = 35
+    STORE_RESEND_REQUIRED = 36
 
 
 def _setsig(name, restype, *argtypes):

@@ -42,6 +42,9 @@ def run_cargo_tests():
     run_cmd('cargo', 'test', '--no-default-features',
             '--features=ring-crypto,tls-webpki-certs,sync-sender-http',
             '--', '--nocapture', cwd='questdb-rs')
+    run_cmd('cargo', 'test', '--lib', '--examples', '--no-default-features',
+            '--features=ring-crypto,tls-webpki-certs,sync-reader',
+            '--', '--nocapture', cwd='questdb-rs')
     run_cmd('cargo', 'test', '--features=almost-all-features',
             '--', '--nocapture', cwd='questdb-rs')
     run_cmd('cargo', 'test',

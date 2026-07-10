@@ -51,11 +51,11 @@ use crate::egress::column::ColumnView;
 use crate::egress::config::{Endpoint, ReaderConfig, Target};
 use crate::egress::decoder::DecodedBatch;
 use crate::egress::decoder::ZstdScratch;
-use crate::egress::error::{Error, ErrorCode, Result, UpgradeReject, fmt};
 use crate::egress::query_request::{
     QUERY_FLAG_RESET_DICT, QueryRequest, QueryRequestBuilder, REQUEST_ID_OFFSET,
 };
 use crate::egress::schema::Schema;
+use crate::egress::server_event::UpgradeReject;
 use crate::egress::server_event::{ServerEvent, ServerInfo, ServerRole, decode_frame};
 use crate::egress::symbol_dict::SymbolDict;
 use crate::egress::tracker::HostHealthTracker;
@@ -64,6 +64,7 @@ use crate::egress::wire::capabilities::has_query_flags;
 use crate::egress::wire::header::HEADER_LEN;
 use crate::egress::wire::msg_kind::MsgKind;
 use crate::egress::wire::varint;
+use crate::error::{Error, ErrorCode, Result, fmt};
 
 // ---------------------------------------------------------------------------
 // Reader
@@ -472,7 +473,7 @@ impl Reader {
             drop(dead);
         }
         // Cumulative dial count across every outer attempt's walk.
-        // `FailoverEvent.attempts` carries this back to the user so
+        // `FailoverResetEvent.attempts` carries this back to the user so
         // long-running diagnostics see real dial pressure, not just the
         // attempt index that landed.
         let mut total_dials: u32 = 0;
@@ -732,7 +733,7 @@ impl Reader {
 /// downstream pattern matches.
 #[derive(Debug, Clone)]
 #[non_exhaustive]
-pub struct FailoverEvent {
+pub struct FailoverResetEvent {
     /// Endpoint that just failed. Use `failed_addr.host` /
     /// `failed_addr.port` directly; the [`Endpoint`] struct replaces
     /// the older `(String, u16)` tuple.
@@ -777,7 +778,7 @@ pub struct FailoverEvent {
 }
 
 /// Boxed user callback type for failover-reset notifications.
-type FailoverResetCallback<'r> = Box<dyn FnMut(&FailoverEvent) + 'r>;
+type FailoverResetCallback<'r> = Box<dyn FnMut(&FailoverResetEvent) + 'r>;
 
 /// Phase discriminant on [`FailoverProgressEvent`].
 ///
@@ -884,7 +885,7 @@ pub struct ReaderQuery<'r> {
     /// `CAP_QUERY_FLAGS`.
     reset_symbol_dict: bool,
     /// Optional handler called every time the cursor reconnects after a
-    /// transport-level failure (see [`FailoverEvent`]).
+    /// transport-level failure (see [`FailoverResetEvent`]).
     on_failover_reset: Option<FailoverResetCallback<'r>>,
     /// Optional progress handler invoked at every phase of a mid-query
     /// failover lifecycle — see [`FailoverProgressEvent`] /
@@ -922,7 +923,7 @@ impl<'r> ReaderQuery<'r> {
 
     /// Install a callback fired every time the cursor's underlying
     /// connection is replaced via mid-query failover. The closure
-    /// receives a [`FailoverEvent`] describing the new endpoint and
+    /// receives a [`FailoverResetEvent`] describing the new endpoint and
     /// runs *before* any replayed `RESULT_BATCH` arrives — the
     /// user-side handler must use this signal to discard rows it had
     /// accumulated from the previous (now-dead) connection. The query
@@ -933,7 +934,7 @@ impl<'r> ReaderQuery<'r> {
     /// handle replay-after-data-delivered correctly."** Without it,
     /// [`Cursor::next_batch`] refuses to fail over once any batch has
     /// been yielded — returning
-    /// [`crate::egress::ErrorCode::FailoverWouldDuplicate`]
+    /// [`crate::ErrorCode::FailoverWouldDuplicate`]
     /// instead — to avoid silently doubling up rows in the caller's
     /// accumulator. Initial-connect failover (before any batch is
     /// yielded) is transparent and does not require this callback.
@@ -960,9 +961,9 @@ impl<'r> ReaderQuery<'r> {
     ///
     /// ```no_run
     /// use std::sync::{Arc, Mutex};
-    /// use questdb::egress::{FailoverEvent, Reader};
+    /// use questdb::egress::{FailoverResetEvent, Reader};
     ///
-    /// # fn ex() -> questdb::egress::Result<()> {
+    /// # fn ex() -> questdb::Result<()> {
     /// let mut reader = Reader::from_conf(
     ///     "ws::addr=db-a:9000,db-b:9000;target=primary",
     /// )?;
@@ -975,7 +976,7 @@ impl<'r> ReaderQuery<'r> {
     /// let rows_for_cb = Arc::clone(&rows);
     /// let mut cursor = reader
     ///     .prepare("select x from t order by ts")
-    ///     .on_failover_reset(move |ev: &FailoverEvent| {
+    ///     .on_failover_reset(move |ev: &FailoverResetEvent| {
     ///         eprintln!(
     ///             "failover: {} → {} after {} attempt(s) ({:?}, trigger={:?}: {})",
     ///             ev.failed_addr, ev.new_addr,
@@ -993,7 +994,7 @@ impl<'r> ReaderQuery<'r> {
     /// ```
     pub fn on_failover_reset<F>(mut self, callback: F) -> Self
     where
-        F: FnMut(&FailoverEvent) + 'r,
+        F: FnMut(&FailoverResetEvent) + 'r,
     {
         self.on_failover_reset = Some(Box::new(callback));
         self
@@ -1006,13 +1007,11 @@ impl<'r> ReaderQuery<'r> {
     /// [`Self::on_failover_reset`] runs), and `GaveUp` when the retry
     /// budget is exhausted.
     ///
-    /// **Replay opt-in.** Installing this callback also opts the cursor
-    /// in to "I will handle replay-after-data-delivered correctly," the
-    /// same way [`Self::on_failover_reset`] does — both callbacks fire
-    /// on `Reset`, and either being installed clears the silent-
-    /// duplicate guard documented on [`Cursor::next_batch`]. If you
-    /// only want telemetry and not replay semantics, set
-    /// `failover=off` instead.
+    /// This callback is observational: installing it does **not** authorize
+    /// replay after a batch has already reached the caller. Install
+    /// [`Self::on_failover_reset`] as well when the caller can discard partial
+    /// results safely. Without a reset callback, a post-delivery failure still
+    /// returns [`ErrorCode::FailoverWouldDuplicate`].
     ///
     /// Calling this method twice on the same `ReaderQuery` **replaces**
     /// the previous closure — only the most recent callback is invoked.
@@ -1596,7 +1595,7 @@ impl<'r> Cursor<'r> {
     /// **Silent-duplicate guard.** If a batch has already been
     /// yielded to the caller and no `on_failover_reset` callback was
     /// installed, the cursor refuses to fail over and returns
-    /// [`crate::egress::ErrorCode::FailoverWouldDuplicate`]
+    /// [`crate::ErrorCode::FailoverWouldDuplicate`]
     /// instead. Replay would otherwise re-deliver rows the caller
     /// already consumed — with no signal — because the server
     /// restarts streaming from `batch_seq=0` on the new connection.
@@ -1690,7 +1689,7 @@ impl<'r> Cursor<'r> {
     /// any batch is produced.
     ///
     /// [`RecordBatchReader`]: arrow::array::RecordBatchReader
-    /// [`ErrorCode::NoSchema`]: crate::egress::ErrorCode::NoSchema
+    /// [`ErrorCode::NoSchema`]: crate::ErrorCode::NoSchema
     #[cfg(feature = "arrow-egress")]
     pub fn as_arrow_reader<'c>(
         &'c mut self,
@@ -1705,8 +1704,8 @@ impl<'r> Cursor<'r> {
     /// producing a batch; surfaces drift as
     /// [`ErrorCode::SchemaDrift`].
     ///
-    /// [`ErrorCode::NoSchema`]: crate::egress::ErrorCode::NoSchema
-    /// [`ErrorCode::SchemaDrift`]: crate::egress::ErrorCode::SchemaDrift
+    /// [`ErrorCode::NoSchema`]: crate::ErrorCode::NoSchema
+    /// [`ErrorCode::SchemaDrift`]: crate::ErrorCode::SchemaDrift
     #[cfg(feature = "arrow-egress")]
     pub fn fetch_all_arrow(
         &mut self,
@@ -2143,8 +2142,8 @@ impl<'r> Cursor<'r> {
     /// opted into replays, that contract wins.
     #[cfg(feature = "arrow-egress")]
     pub(crate) fn enable_internal_replay(&mut self) {
-        if self.on_failover_reset.is_none() && self.on_failover_progress.is_none() {
-            self.on_failover_reset = Some(Box::new(|_: &FailoverEvent| {}));
+        if self.on_failover_reset.is_none() {
+            self.on_failover_reset = Some(Box::new(|_: &FailoverResetEvent| {}));
         }
     }
 
@@ -2155,7 +2154,7 @@ impl<'r> Cursor<'r> {
     /// endpoint did the last batch come from?". After mid-query
     /// failover, this reflects the new endpoint (matching the
     /// `new_addr` from the most recent
-    /// [`crate::egress::FailoverEvent`]).
+    /// [`crate::egress::FailoverResetEvent`]).
     pub fn current_addr(&self) -> &Endpoint {
         self.reader.current_addr()
     }
@@ -2214,7 +2213,7 @@ impl<'r> Cursor<'r> {
             return Err(e);
         }
         // Silent-duplicate guard. If at least one batch was already yielded
-        // to the caller and they didn't install a replay-aware callback,
+        // to the caller and they didn't install a reset callback,
         // replay would deliver those rows again with no signal — see
         // `ErrorCode::FailoverWouldDuplicate`. The exact-once contract is
         // "rows surface to the caller at most once unless they explicitly
@@ -2223,14 +2222,11 @@ impl<'r> Cursor<'r> {
         // The trigger error `e` is preserved in the message so the caller
         // still learns *why* the cursor died; diagnostics shouldn't get
         // worse just because we re-classified the surface.
-        if would_silently_duplicate(
-            self.data_delivered,
-            self.on_failover_reset.is_some() || self.on_failover_progress.is_some(),
-        ) {
+        if would_silently_duplicate(self.data_delivered, self.on_failover_reset.is_some()) {
             let err = fmt!(
                 FailoverWouldDuplicate,
                 "mid-query failover would replay rows already delivered to the caller \
-                 (install on_failover_reset or on_failover_progress to opt in to replays); \
+                 (install on_failover_reset to authorize replay); \
                  cursor terminated. Trigger: {} ({:?})",
                 e.msg(),
                 e.code()
@@ -2322,7 +2318,7 @@ impl<'r> Cursor<'r> {
             let started = std::time::Instant::now();
             let failed_idx = self.reader.addr_idx;
             // Snapshot the failing endpoint before reconnect mutates
-            // `addr_idx` — `FailoverEvent` reports it back to the user.
+            // `addr_idx` — `FailoverResetEvent` reports it back to the user.
             let failed_addr = self.reader.cfg.addrs[failed_idx].clone();
 
             // Phase: Disconnected. Fires before the retry loop runs so an
@@ -2456,12 +2452,9 @@ impl<'r> Cursor<'r> {
                     self.failover_resets = self.failover_resets.saturating_add(1);
                     let new_addr = self.reader.cfg.addrs[self.reader.addr_idx].clone();
                     let new_server_info = self.reader.server_info.clone();
-                    // Phase: Reset. Fire BEFORE the legacy on_failover_reset
-                    // so a single sink that subscribes to both sees a
-                    // consistent ordering. The two callbacks carry the same
-                    // logical event; on_failover_progress is the modern
-                    // surface and on_failover_reset is preserved for
-                    // backward compat.
+                    // Report the successful reconnect to telemetry first, then
+                    // invoke the reset hook that lets the caller discard its
+                    // partial result before any replayed batch is delivered.
                     if let Some(cb) = self.on_failover_progress.as_mut() {
                         let event = FailoverProgressEvent {
                             phase: FailoverPhase::Reset,
@@ -2477,7 +2470,7 @@ impl<'r> Cursor<'r> {
                         cb(&event);
                     }
                     if let Some(cb) = self.on_failover_reset.as_mut() {
-                        let event = FailoverEvent {
+                        let event = FailoverResetEvent {
                             failed_addr,
                             new_addr,
                             new_server_info,
@@ -2639,7 +2632,7 @@ impl<'r> Cursor<'r> {
                 Ok(Some(_)) => {} // discarded
                 Ok(None) => break,
                 Err(e) => {
-                    if matches!(e.code(), crate::egress::ErrorCode::Cancelled) {
+                    if matches!(e.code(), crate::ErrorCode::Cancelled) {
                         break;
                     }
                     drain_result = Err(e);
@@ -2696,14 +2689,11 @@ impl<'r> Cursor<'r> {
         // re-deliver those rows with no signal — violating the
         // exact-once contract. The trigger error is preserved in the
         // message so the caller still learns why the cursor died.
-        if would_silently_duplicate(
-            self.data_delivered,
-            self.on_failover_reset.is_some() || self.on_failover_progress.is_some(),
-        ) {
+        if would_silently_duplicate(self.data_delivered, self.on_failover_reset.is_some()) {
             let err = fmt!(
                 FailoverWouldDuplicate,
                 "mid-query failover would replay rows already delivered to the caller \
-                 (install on_failover_reset or on_failover_progress to opt in to replays); \
+                 (install on_failover_reset to authorize replay); \
                  cursor terminated. Trigger: {} ({:?})",
                 first_err.msg(),
                 first_err.code()
@@ -2887,18 +2877,17 @@ impl<'c> BatchView<'c> {
 ///
 /// Replay restarts at `batch_seq=0` against the new endpoint, so the
 /// caller's accumulator would see every previously-yielded row again.
-/// The opt-in for "I will discard partial state on each replay" is
-/// installing either [`ReaderQuery::on_failover_reset`] or
-/// [`ReaderQuery::on_failover_progress`] — both fire immediately
-/// before the first replayed batch arrives on the new connection, so
-/// either signal gives the caller the chance to clear its accumulator.
-/// Without one of them, the only safe response is to terminate the
-/// cursor and let the caller re-execute from scratch.
+/// The opt-in for "I will discard partial state on each replay" is installing
+/// [`ReaderQuery::on_failover_reset`], which fires immediately before the first
+/// replayed batch arrives on the new connection. The progress callback is
+/// telemetry-only and does not authorize replay. Without a reset hook, the
+/// only safe response is to terminate the cursor and let the caller re-execute
+/// from scratch.
 ///
 /// Extracted as a free function so the truth table is unit-testable
 /// without needing a live transport.
-fn would_silently_duplicate(data_delivered: bool, has_replay_aware_callback: bool) -> bool {
-    data_delivered && !has_replay_aware_callback
+fn would_silently_duplicate(data_delivered: bool, has_reset_callback: bool) -> bool {
+    data_delivered && !has_reset_callback
 }
 
 fn is_failover_eligible(code: ErrorCode) -> bool {
@@ -3064,7 +3053,7 @@ struct WalkOutcome {
     session: TransportSession,
     /// Number of `connect_endpoint` calls the walk made before
     /// landing on a successful endpoint. Includes failed picks before
-    /// the success. The `FailoverEvent.attempts` field carries this
+    /// the success. The `FailoverResetEvent.attempts` field carries this
     /// value back to the user (cumulative across outer reconnect
     /// cycles).
     dials: u32,
@@ -3256,8 +3245,8 @@ fn is_stale_plan_error(status: crate::egress::wire::msg_kind::StatusCode, messag
 fn map_server_status(
     status: crate::egress::wire::msg_kind::StatusCode,
     message: String,
-) -> crate::egress::Error {
-    use crate::egress::ErrorCode as C;
+) -> crate::Error {
+    use crate::ErrorCode as C;
     use crate::egress::wire::msg_kind::StatusCode as S;
     let code = match status {
         S::SchemaMismatch => C::ServerSchemaMismatch,
@@ -3267,7 +3256,7 @@ fn map_server_status(
         S::Cancelled => C::Cancelled,
         S::LimitExceeded => C::ServerLimitExceeded,
     };
-    crate::egress::Error::new(code, message)
+    crate::Error::new(code, message)
 }
 
 #[cfg(test)]
@@ -3595,12 +3584,11 @@ mod tests {
     ///
     /// The four input combinations cover every reachable cursor state
     /// at the moment a failover-eligible transport error fires.
-    /// "Replay-aware callback" means *either* `on_failover_reset` or
-    /// `on_failover_progress` is installed — both fire on a successful
-    /// reset and either is enough to opt the cursor in to replays.
+    /// Only `on_failover_reset` is replay-aware. The progress callback is
+    /// telemetry-only and does not affect this predicate.
     ///
-    /// | data_delivered | replay-aware cb installed | refuses replay? |
-    /// |----------------|---------------------------|-----------------|
+    /// | data_delivered | reset callback installed | refuses replay? |
+    /// |----------------|--------------------------|-----------------|
     /// | false          | false                     | no — initial-connect-style failover, transparent |
     /// | false          | true                      | no — caller will be notified anyway |
     /// | true           | false                     | **YES** — silent duplicates would otherwise reach the caller |
@@ -3611,10 +3599,10 @@ mod tests {
     /// at least one row of this matrix.
     #[test]
     fn would_silently_duplicate_truth_table() {
-        // No data yet — failover is always safe, regardless of callback.
+        // No data yet — failover is always safe, regardless of reset hook.
         assert!(!would_silently_duplicate(false, false));
         assert!(!would_silently_duplicate(false, true));
-        // Data already delivered — only the callback unlocks replay.
+        // Data already delivered — only the reset hook unlocks replay.
         assert!(would_silently_duplicate(true, false));
         assert!(!would_silently_duplicate(true, true));
     }

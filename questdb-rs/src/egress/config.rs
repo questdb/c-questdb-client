@@ -68,7 +68,7 @@ use std::path::PathBuf;
 use std::str::FromStr;
 
 use crate::egress::auth::AuthMode;
-use crate::egress::error::{Result, fmt};
+use crate::error::{Result, fmt};
 use crate::ingress::CertificateAuthority;
 
 /// Default endpoint path (mirrors the Java client).
@@ -107,7 +107,7 @@ const DEFAULT_TLS_PORT: &str = "9000";
 /// error to the operator rather than silently mis-decoding a
 /// compressed payload as raw wire bytes.
 ///
-/// [`ErrorCode::UnsupportedServer`]: crate::egress::ErrorCode::UnsupportedServer
+/// [`ErrorCode::UnsupportedServer`]: crate::ErrorCode::UnsupportedServer
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum Compression {
@@ -175,7 +175,7 @@ pub enum Target {
 
 /// A `host:port` endpoint as parsed from a connect string. Used in
 /// the [`ReaderConfig::addrs`] list and surfaced to user code via
-/// [`crate::egress::FailoverEvent`] and [`crate::egress::Reader::current_addr`].
+/// [`crate::egress::FailoverResetEvent`] and [`crate::egress::Reader::current_addr`].
 ///
 /// Named struct (rather than a `(String, u16)` tuple) so callers can
 /// write `ev.failed_addr.host` / `ep.port` instead of the opaque `.0`
@@ -483,7 +483,7 @@ pub struct ReaderConfig {
     /// uses the OS default, which can hang for tens of seconds against a
     /// black-holed host that silently drops SYNs. When `> 0`, each dial is
     /// a `TcpStream::connect_timeout` bounded by this value (per resolved
-    /// address); exceeding it surfaces [`ErrorCode::ConnectTimeout`] and,
+    /// address); exceeding it surfaces [`crate::ErrorCode::ConnectTimeout`] and,
     /// under failover, advances to the next endpoint. Connect-string key:
     /// `connect_timeout`. Does NOT bound name resolution, the TLS
     /// handshake, the WS upgrade (see `auth_timeout_ms`), or the
@@ -598,9 +598,9 @@ impl ReaderConfig {
         // multi-host parser. The sanitized conf string has duplicate
         // `addr=` params removed so the standard `questdb_confstr` parser
         // doesn't see them twice.
-        // The scan helper is shared with ingress and returns the crate-level
-        // `Error` type; remap onto the egress error here. The only failure
-        // mode is a malformed conf, which the helper actually signals as
+        // The scan helper is shared with ingress and already returns the
+        // crate-wide `Error` type. Add reader-specific context here. The only
+        // failure mode is a malformed conf, which the helper actually signals as
         // `Ok(None)` rather than `Err`, so the remap is defensive.
         let addr_scan = crate::ingress::scan_qwp_ws_addr_params(conf_str)
             .map_err(|e| fmt!(ConfigError, "{}", e.msg()))?;
@@ -613,13 +613,12 @@ impl ReaderConfig {
             .map_err(|e| fmt!(ConfigError, "Config parse error: {}", e))?;
         let scheme = conf.service();
         let tls = match scheme {
-            "ws" | "qwpws" => false,
-            "wss" | "qwpwss" => true,
+            "ws" => false,
+            "wss" => true,
             other => {
                 return Err(fmt!(
                     ConfigError,
-                    "Unknown scheme \"{}\" — expected \"ws\", \"wss\", \
-                     \"qwpws\", or \"qwpwss\"",
+                    "Unknown scheme \"{}\" — expected \"ws\" or \"wss\"",
                     other
                 ));
             }
@@ -1350,7 +1349,7 @@ fn reject_crlf(name: &str, val: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::egress::error::ErrorCode;
+    use crate::error::ErrorCode;
 
     #[test]
     fn minimal_plain_conf() {
@@ -1372,15 +1371,15 @@ mod tests {
     }
 
     #[test]
-    fn qwpws_scheme_alias_is_plain_ws() {
-        let c = ReaderConfig::from_conf("qwpws::addr=localhost:9000").unwrap();
+    fn ws_scheme_is_plain() {
+        let c = ReaderConfig::from_conf("ws::addr=localhost:9000").unwrap();
         assert!(!c.tls);
         assert_eq!(c.url(), "ws://localhost:9000/read/v1");
     }
 
     #[test]
-    fn qwpwss_scheme_alias_is_tls_wss() {
-        let c = ReaderConfig::from_conf("qwpwss::addr=h:8443").unwrap();
+    fn wss_scheme_is_tls() {
+        let c = ReaderConfig::from_conf("wss::addr=h:8443").unwrap();
         assert!(c.tls);
         assert_eq!(c.url(), "wss://h:8443/read/v1");
     }
@@ -2305,7 +2304,7 @@ mod tests {
     fn endpoint_display_common_cases() {
         // Hostnames and IPv4 literals format unbracketed — `host:port`
         // is the path users will actually see in connect strings,
-        // logs, and `FailoverEvent` output. This is the contract the
+        // logs, and `FailoverResetEvent` output. This is the contract the
         // failover doctest and example rely on.
         assert_eq!(
             Endpoint::new("localhost", 9000).to_string(),

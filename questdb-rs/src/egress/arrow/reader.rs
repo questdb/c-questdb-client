@@ -30,7 +30,7 @@ use arrow::error::ArrowError;
 
 use crate::egress::Cursor;
 use crate::egress::arrow::convert::external_arrow_error;
-use crate::egress::error::{Error, ErrorCode};
+use crate::error::{Error, ErrorCode};
 
 /// Adapter implementing [`arrow::array::RecordBatchReader`] over a
 /// [`Cursor`]. Snapshots the first batch's Arrow schema at construction
@@ -143,12 +143,13 @@ impl Iterator for CursorRecordBatchReader<'_, '_> {
     }
 }
 
-/// True if any field carries [`metadata::ARRAY_DIM_TENTATIVE`](crate::egress::arrow::metadata::ARRAY_DIM_TENTATIVE).
+/// True if any field carries
+/// [`arrow_metadata::ARRAY_DIM_TENTATIVE`](crate::arrow_metadata::ARRAY_DIM_TENTATIVE).
 /// Gates the tentative→firm ndim mid-stream upgrade.
 pub fn has_tentative_array(schema: &SchemaRef) -> bool {
     schema.fields().iter().any(|f| {
         f.metadata()
-            .get(crate::egress::arrow::metadata::ARRAY_DIM_TENTATIVE)
+            .get(crate::arrow_metadata::ARRAY_DIM_TENTATIVE)
             .is_some_and(|v| v == "true")
     })
 }

@@ -72,7 +72,7 @@ pub fn run_leg(cfg: &LegConfig) -> LegResult {
 /// column leg.
 pub(crate) fn build_conf(cfg: &LegConfig) -> String {
     let mut c = format!(
-        "qwpws::addr={};auth_timeout=5000;\
+        "ws::addr={};auth_timeout=5000;\
          reconnect_max_duration_millis=30000;pool_size=1;pool_max=4;",
         cfg.addr
     );
