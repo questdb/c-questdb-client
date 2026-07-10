@@ -176,6 +176,59 @@ pub(crate) fn is_valid_qwp_ws_sender_id(sender_id: &str) -> bool {
 
 #[cfg(feature = "_sender-qwp-ws")]
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct QwpWsManagedSlotExclusion {
+    /// Canonical pool-minted slot prefix, including the trailing separator
+    /// before the decimal index, for example `default-col-`.
+    pub(crate) prefix: String,
+    /// Exclude only indices in `[0, slot_count)`. Out-of-range same-prefix
+    /// slots remain drainable so shrinking a pool cannot strand old data.
+    pub(crate) slot_count: usize,
+}
+
+#[cfg(feature = "_sender-qwp-ws")]
+impl QwpWsManagedSlotExclusion {
+    pub(crate) fn new(prefix: String, slot_count: usize) -> Self {
+        Self { prefix, slot_count }
+    }
+
+    pub(crate) fn slot_name(&self, index: usize) -> String {
+        format!("{}{}", self.prefix, index)
+    }
+
+    pub(crate) fn parse_index(&self, name: &str) -> Option<usize> {
+        name.starts_with(&self.prefix)
+            .then(|| parse_canonical_slot_index(name, self.prefix.len()))
+            .flatten()
+    }
+
+    pub(crate) fn matches(&self, name: &str) -> bool {
+        self.parse_index(name)
+            .is_some_and(|index| index < self.slot_count)
+    }
+}
+
+#[cfg(feature = "_sender-qwp-ws")]
+fn parse_canonical_slot_index(name: &str, from: usize) -> Option<usize> {
+    let suffix = name.get(from..)?;
+    if suffix.is_empty() {
+        return None;
+    }
+    if suffix.len() > 1 && suffix.starts_with('0') {
+        return None;
+    }
+    let mut acc = 0usize;
+    for byte in suffix.bytes() {
+        if !byte.is_ascii_digit() {
+            return None;
+        }
+        acc = acc.checked_mul(10)?;
+        acc = acc.checked_add((byte - b'0') as usize)?;
+    }
+    Some(acc)
+}
+
+#[cfg(feature = "_sender-qwp-ws")]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct QwpWsEndpoint {
     pub(crate) host: String,
     pub(crate) port: String,
@@ -240,6 +293,18 @@ pub(crate) struct QwpWsConfig {
     pub(crate) sf_durability: ConfigSetting<SfDurability>,
     pub(crate) sf_append_deadline: ConfigSetting<std::time::Duration>,
     pub(crate) drain_orphans: ConfigSetting<bool>,
+    /// Internal pool hook: exact managed slot ranges that orphan scanning must
+    /// skip because this pool can recreate and recover them itself.
+    pub(crate) orphan_exclude_managed_slots: Vec<QwpWsManagedSlotExclusion>,
+    /// Internal pool hook: explicit managed slot directories owned by this pool
+    /// that should be tried by this sender's drainer regardless of the user's
+    /// general orphan-drain setting. These are candidates only; replay-only open
+    /// checks the publication log before doing any delivery work.
+    pub(crate) orphan_extra_slots: Vec<PathBuf>,
+    /// Internal pool hook: this QWP config opens a pool-minted slot, so a slot
+    /// flock collision is a deterministic producer-id conflict rather than a
+    /// retryable transport condition.
+    pub(crate) pool_managed_slot: bool,
     pub(crate) max_background_drainers: ConfigSetting<usize>,
     pub(crate) error_inbox_capacity: ConfigSetting<usize>,
     pub(crate) progress: ConfigSetting<QwpWsProgress>,
@@ -276,6 +341,9 @@ impl Default for QwpWsConfig {
             sf_durability: ConfigSetting::new_default(SfDurability::Memory),
             sf_append_deadline: ConfigSetting::new_default(std::time::Duration::from_secs(30)),
             drain_orphans: ConfigSetting::new_default(false),
+            orphan_exclude_managed_slots: Vec::new(),
+            orphan_extra_slots: Vec::new(),
+            pool_managed_slot: false,
             max_background_drainers: ConfigSetting::new_default(
                 QWP_WS_DEFAULT_MAX_BACKGROUND_DRAINERS,
             ),

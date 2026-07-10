@@ -131,11 +131,12 @@ typedef struct column_sender_validity
  * ------------------------------------------------------------------------- */
 
 /**
- * Open a connection pool. The pool is lazy: this call parses and validates
- * the connect string but opens no connections; the first borrow opens one,
- * so auth / TLS / connect errors surface from the borrow, not from here.
- * `pool_size` (default 1) is the warm minimum the reaper keeps once
- * connections have been opened.
+ * Open a connection pool. This call performs no blocking network I/O. In
+ * disk-backed store-and-forward mode it may pre-open parked recovery senders;
+ * their initial connect and replay run in the background. Otherwise, the first
+ * borrow opens a sender, so auth / TLS / connect errors usually surface from
+ * the borrow, not from here. `pool_size` (default 1) is the warm minimum the
+ * reaper keeps once connections have been opened.
  *
  * `conf` is a `qwpws::` / `qwpwss::` connect string. Pool-specific keys:
  *   `pool_size`            (default 1)   warm/min connections;
@@ -145,11 +146,19 @@ typedef struct column_sender_validity
  *   `pool_reap`            (`auto`|`manual`, default `auto`)
  *                                       background reaper opt-in.
  *
- * Store-and-forward is opt-in: `sf_dir` selects the queue-backed column
- * sender, and `sender_id` / `sf_*` keys are accepted only with `sf_dir`.
- * In store-and-forward v1 the effective pool size is one active borrower:
- * explicit `pool_size > 1` or `pool_max > 1` is rejected, and an omitted
- * `pool_max` is treated as 1 for the column sender.
+ * Disk-backed store-and-forward is opt-in: `sf_dir` selects disk-backed queues
+ * for row and column senders. `sender_id` names the slot *base* (default
+ * "default"); pooled senders mint kind-scoped slots
+ * `<sender_id>-col-<index>` and `<sender_id>-row-<index>`, with stable
+ * lowest-free-first indices in
+ * `[0, pool_max)`. `pool_size` / `pool_max` keep their normal per-kind
+ * meaning. The `<sender_id>-col-*` and `<sender_id>-row-*` directories under
+ * `sf_dir` belong to the pool namespace; use a unique `sender_id` for each
+ * pool sharing an `sf_dir`. At cap, disk-backed row/column borrows usually
+ * fail, but can wait up to `close_flush_timeout` (default 5s) if another
+ * sender is currently closing and has not yet released its slot lock. An
+ * unsuffixed slot `<sf_dir>/<sender_id>` is not pool-managed; it is treated
+ * like any other orphan slot and is drained only when `drain_orphans=on`.
  */
 QUESTDB_CLIENT_API
 questdb_db* questdb_db_connect(
@@ -175,11 +184,15 @@ void questdb_db_close(questdb_db* db);
  * Borrow a column-major sender from the pool. Selection rules:
  *  1. If a previously-returned sender is in the free list, hand it out.
  *  2. Otherwise, if pool size < `pool_max`, open a new connection.
- *  3. Otherwise (at cap), return NULL + `line_sender_error_invalid_api_call`.
+ *  3. Otherwise, in disk-backed store-and-forward mode only, wait up to
+ *     `close_flush_timeout` while an in-flight slot close releases its lock.
+ *  4. Otherwise (still at cap), return NULL +
+ *     `line_sender_error_invalid_api_call`.
  *
- * In store-and-forward mode, v1 supports one active borrower. A second
- * concurrent borrow fails until the borrowed sender is returned. If the previous
- * SFA backend was force-dropped, the next borrow reopens the same slot.
+ * In store-and-forward mode, each borrowed column sender owns its own
+ * `<sender_id>-col-<index>` slot, so concurrent borrows are allowed up to
+ * `pool_max`. Returning a sender parks that same slot for reuse; dropping a
+ * non-recycled sender releases its slot index after the slot lock is closed.
  *
  * The returned sender is bound to the calling thread until returned.
  */
@@ -267,9 +280,9 @@ void questdb_db_drop_column_sender(
 
 /**
  * Borrow a direct (pipelined, non-store-and-forward) column-major sender from
- * the always-direct pool, independent of `sf_dir`. Same selection rules as
- * `questdb_db_borrow_column_sender`, applied to the direct pool's free list
- * and `pool_max` cap.
+ * the always-direct pool, independent of `sf_dir`. It pops the direct pool's
+ * free list, grows below `pool_max`, and otherwise fails at cap with
+ * `line_sender_error_invalid_api_call`.
  */
 QUESTDB_CLIENT_API
 direct_column_sender* questdb_db_borrow_direct_column_sender(
@@ -346,9 +359,13 @@ size_t questdb_db_reap_idle(questdb_db* db);
 /**
  * Borrow a row-major sender from the pool. Returns NULL on failure and
  * sets `*err_out` if provided. The row-sender pool is lazy and
- * independently capped (it shares `pool_max`); a borrow at the cap returns
- * `line_sender_error_invalid_api_call`. The returned sender is bound to the
- * calling thread until returned.
+ * independently capped (it shares `pool_max`), except that disk-backed
+ * recovery senders may have been pre-opened by `questdb_db_connect` with
+ * background initial connect and replay. In disk-backed store-and-forward
+ * mode, an at-cap borrow can wait up to `close_flush_timeout` while an
+ * in-flight slot close releases its lock; otherwise a borrow at the cap
+ * returns `line_sender_error_invalid_api_call`.
+ * The returned sender is bound to the calling thread until returned.
  */
 QUESTDB_CLIENT_API
 row_sender* questdb_db_borrow_row_sender(
@@ -443,8 +460,7 @@ bool row_sender_flush(
  * `ack_level` carries a `qwpws_ack_level_*` constant. An out-of-range value,
  * or `qwpws_ack_level_durable` without `request_durable_ack=on`, returns
  * `line_sender_error_invalid_api_call` before the buffer is touched, matching
- * `column_sender_flush_and_wait`. (A standalone `row_sender_wait` instead
- * degrades durable to plain acceptance on a non-durable connection.)
+ * `column_sender_flush_and_wait`.
  * The wait uses the pool-wide `request_timeout` no-progress deadline; compose
  * `row_sender_flush` + `row_sender_wait` to choose a per-call timeout.
  *
@@ -543,6 +559,9 @@ bool row_sender_acked_fsn(
  *
  * `timeout_millis` is a no-progress deadline (it fires only if the ack
  * watermark fails to advance for that long); `0` waits indefinitely.
+ * `qwpws_ack_level_durable` requires `request_durable_ack=on`; otherwise this
+ * returns `line_sender_error_invalid_api_call` even when nothing has been
+ * published.
  * On timeout the frames remain queued and the background runner keeps
  * delivering them, so recover by calling `row_sender_wait` again, or by
  * observing the FSN watermark, rather than re-flushing the same data.

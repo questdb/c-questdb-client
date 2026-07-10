@@ -3617,6 +3617,9 @@ pub const qwpws_ack_level_durable: u32 = 1;
 ///
 /// `timeout_millis` is a no-progress deadline (it fires only if the ack
 /// watermark fails to advance for that long); `0` waits indefinitely.
+/// `qwpws_ack_level_durable` requires the sender to be opened with
+/// `request_durable_ack=on`; otherwise this returns
+/// `line_sender_error_invalid_api_call` even when nothing has been published.
 ///
 /// Returns `true` once the boundary is acknowledged. Returns `false` and sets
 /// `err_out` on the no-progress timeout (`line_sender_error_failover_retry`), a
@@ -4063,8 +4066,7 @@ pub unsafe extern "C" fn row_sender_flush(
 ///
 /// `qwpws_ack_level_durable` without `request_durable_ack=on` is rejected up
 /// front (`line_sender_error_invalid_api_call`) before the buffer is touched,
-/// matching `column_sender_flush_and_wait`. (A standalone `row_sender_wait`
-/// instead degrades durable to plain acceptance on a non-durable connection.)
+/// matching `column_sender_flush_and_wait`.
 ///
 /// On a flush failure the buffer is retained. After publication, only the
 /// no-progress timeout (`line_sender_error_failover_retry`) leaves the frames
@@ -4368,6 +4370,9 @@ pub unsafe extern "C" fn row_sender_acked_fsn(
 ///
 /// `timeout_millis` is a no-progress deadline (it fires only if the ack
 /// watermark fails to advance for that long); `0` waits indefinitely.
+/// `qwpws_ack_level_durable` requires the pool to be opened with
+/// `request_durable_ack=on`; otherwise this returns
+/// `line_sender_error_invalid_api_call` even when nothing has been published.
 ///
 /// Returns `true` once acknowledged. Returns `false` and sets `*err_out` on
 /// the no-progress timeout (`line_sender_error_failover_retry`), a server

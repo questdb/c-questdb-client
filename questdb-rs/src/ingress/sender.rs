@@ -70,6 +70,10 @@ mod qwp_ws_ownership;
 
 #[cfg(feature = "_sender-qwp-ws")]
 mod qwp_ws_orphan;
+#[cfg(all(test, feature = "_sender-qwp-ws"))]
+pub(crate) use qwp_ws_orphan::has_any_sfa_file;
+#[cfg(feature = "_sender-qwp-ws")]
+pub(crate) use qwp_ws_orphan::is_candidate_orphan;
 
 #[cfg(feature = "_sender-qwp-ws")]
 mod qwp_ws_publisher;
@@ -639,9 +643,9 @@ impl Sender {
     ///
     /// * [`AckLevel::Ok`] waits for the server to accept every published
     ///   frame.
-    /// * [`AckLevel::Durable`] waits for durable-ACK coverage. When the
-    ///   connection did not negotiate durable acks this watermark advances on
-    ///   ordinary acceptance, so it behaves like [`AckLevel::Ok`].
+    /// * [`AckLevel::Durable`] waits for durable-ACK coverage. It requires the
+    ///   sender to be opened with `request_durable_ack=on`; otherwise the call
+    ///   is rejected before checking whether any frame has been published.
     ///
     /// `timeout` is a **no-progress** deadline: it fires only if the ack
     /// watermark fails to advance for that long, so a steadily-progressing
@@ -653,8 +657,8 @@ impl Sender {
     /// A terminal server rejection of a frame in the pending range, or a
     /// terminal transport/protocol failure, is returned as an error. Retriable
     /// server rejections reconnect and replay until the frame is acknowledged or
-    /// the sender is stopped. When nothing has been published yet it returns
-    /// immediately. QWP/WebSocket only; other
+    /// the sender is stopped. When nothing has been published yet, a valid wait
+    /// returns immediately. QWP/WebSocket only; other
     /// protocols return `InvalidApiCall`. In manual progress mode this also
     /// drives WebSocket progress while waiting.
     #[cfg(feature = "sync-sender-qwp-ws")]
@@ -667,6 +671,21 @@ impl Sender {
                 InvalidApiCall,
                 "wait is only supported for QWP/WebSocket senders."
             ));
+        }
+
+        if ack_level == AckLevel::Durable {
+            let request_durable_ack = match &self.handler {
+                SyncProtocolHandler::SyncQwpWs(state) => state.request_durable_ack,
+                SyncProtocolHandler::ManualQwpWs(state) => state.request_durable_ack,
+                _ => unreachable!("QWP/WebSocket handler was checked above"),
+            };
+            if !request_durable_ack {
+                return Err(error::fmt!(
+                    InvalidApiCall,
+                    "AckLevel::Durable requires the pool to be opened with \
+                     `request_durable_ack=on` in the connect string."
+                ));
+            }
         }
 
         let Some(boundary) = self.published_fsn()? else {
@@ -705,9 +724,7 @@ impl Sender {
 
     /// Completion watermark for `ack_level` across both QWP/WebSocket progress
     /// modes. `Ok` tracks server acceptance; `Durable` tracks durable-ACK
-    /// coverage (which collapses onto acceptance in manual progress mode and
-    /// on connections without durable acks). Terminal failures surface here as
-    /// an `Err`.
+    /// coverage. Terminal failures surface here as an `Err`.
     #[cfg(feature = "sync-sender-qwp-ws")]
     fn qwp_ws_completed_fsn(&self, ack_level: AckLevel) -> Result<Option<u64>> {
         match (&self.handler, ack_level) {
@@ -897,6 +914,37 @@ impl Sender {
             _ => {}
         }
         false
+    }
+
+    /// Non-blocking: `true` once a background QWP/WebSocket
+    /// store-and-forward sender has no undelivered published frames, so a
+    /// parked pooled row sender can be retired without losing queued data.
+    /// Non-QWP/WebSocket handlers and terminal background handlers report
+    /// `true`.
+    pub(crate) fn sfa_fully_delivered(&self, durable: bool) -> bool {
+        #[cfg(feature = "sync-sender-qwp-ws")]
+        {
+            let SyncProtocolHandler::SyncQwpWs(state) = &self.handler else {
+                return true;
+            };
+            if qwp_ws_is_terminal_background(state) {
+                return true;
+            }
+            let Ok(Some(published)) = qwp_ws_published_fsn_background(state) else {
+                return true;
+            };
+            let watermark = if durable {
+                qwp_ws_acked_fsn_background(state)
+            } else {
+                qwp_ws_ok_fsn_background(state)
+            };
+            matches!(watermark, Ok(Some(w)) if w >= published)
+        }
+        #[cfg(not(feature = "sync-sender-qwp-ws"))]
+        {
+            let _ = durable;
+            true
+        }
     }
 
     /// Returns the sender's configured transport protocol.

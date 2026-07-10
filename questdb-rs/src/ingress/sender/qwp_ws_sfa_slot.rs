@@ -30,7 +30,9 @@
 //! layer owns the product protocol around that queue: `sf_dir` is a group root,
 //! `sender_id` names the slot under it, `<sf_dir>/<sender_id>/.lock` is held for
 //! the queue lifetime, and `<sf_dir>/<sender_id>/.lock.pid` records the
-//! diagnostic holder PID.
+//! diagnostic holder PID. `QuestDb` pools keep the user-configured `sender_id`
+//! as the base name and open concrete per-borrower slots such as
+//! `<base>-col-0` and `<base>-row-0`.
 
 use std::fs;
 use std::fs::{File, OpenOptions};

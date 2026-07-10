@@ -44,6 +44,7 @@
 
 static line_sender* g_sender = NULL;
 static line_sender_buffer* g_buffer = NULL;
+static int g_request_durable_ack = 0;
 
 /* Newlines in an ERR message would break the line-based protocol; match the
  * Rust/Java sidecars' substitution: CR -> space, LF -> '|'. */
@@ -105,6 +106,13 @@ static void close_quietly(void)
         line_sender_buffer_free(g_buffer);
         g_buffer = NULL;
     }
+    g_request_durable_ack = 0;
+}
+
+static int request_durable_ack_enabled(const char* conf)
+{
+    return strstr(conf, "request_durable_ack=on") != NULL ||
+           strstr(conf, "request_durable_ack=true") != NULL;
 }
 
 static void handle_connect(const char* rest)
@@ -135,6 +143,7 @@ static void handle_connect(const char* rest)
     }
     g_sender = sender;
     g_buffer = buffer;
+    g_request_durable_ack = request_durable_ack_enabled(rest);
     reply_ok("");
 }
 
@@ -229,11 +238,11 @@ static void handle_await_acked(const char* rest)
     }
     (void)fsn;
     line_sender_error* err = NULL;
-    /* Durable ack level matches the Rust sidecar's AckLevel::Durable; it
-     * falls back to ordinary acceptance when the connection did not negotiate
-     * durable acks, so the negative (durable-ack-off) test works too. */
+    uint32_t ack_level = g_request_durable_ack
+        ? qwpws_ack_level_durable
+        : qwpws_ack_level_ok;
     if (line_sender_qwpws_wait(
-            g_sender, qwpws_ack_level_durable, timeout_ms, &err))
+            g_sender, ack_level, timeout_ms, &err))
     {
         reply_ok("true");
         return;

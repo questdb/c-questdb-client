@@ -957,6 +957,8 @@ class TestArrowIngressSfa(afc.ArrowFuzzBase):
                 ts_column_name=b"ts",
             )
         finally:
+            if arr.release:
+                arr.release(ctypes.byref(arr))
             if sch.release:
                 sch.release(ctypes.byref(sch))
 
@@ -1067,7 +1069,7 @@ class TestArrowIngressSfa(afc.ArrowFuzzBase):
             self.label(),
         )
 
-    def test_sfa_write_rejection_reports_once_and_continues(self):
+    def test_sfa_terminal_write_rejection_reports_and_fences_future_flushes(self):
         table = self.fresh_table("arrow_sfa_reject")
         sender_id = f"arrow-sfa-{_uuid_mod.uuid4().hex[:8]}"
         afc.exec_ddl(
@@ -1113,6 +1115,18 @@ class TestArrowIngressSfa(afc.ArrowFuzzBase):
                 pa.field("ts", pa.timestamp("us", tz="UTC"), nullable=False),
             ]),
         )
+        after_terminal = pa.RecordBatch.from_arrays(
+            [
+                pa.array([3], type=pa.int64()),
+                pa.array([30.5], type=pa.float64()),
+                pa.array([1_700_000_000_003_000], type=pa.timestamp("us", tz="UTC")),
+            ],
+            schema=pa.schema([
+                pa.field("id", pa.int64(), nullable=False),
+                pa.field("px", pa.float64(), nullable=False),
+                pa.field("ts", pa.timestamp("us", tz="UTC"), nullable=False),
+            ]),
+        )
 
         with afc.temp_sf_dir("arrow_sfa_reject_") as sf_dir:
             with afc.borrowed_column_sender(
@@ -1142,6 +1156,13 @@ class TestArrowIngressSfa(afc.ArrowFuzzBase):
                 self.assertEqual(diagnostic.from_fsn, 1)
                 self.assertEqual(diagnostic.to_fsn, 1)
 
+                with self.assertRaises(ArrowSenderError) as post_terminal:
+                    self._flush_batch(conn, table, after_terminal)
+                self.assertEqual(
+                    post_terminal.exception.code,
+                    SenderErrorCode.SERVER_REJECTION,
+                )
+
             self.assertGreater(
                 afc.sfa_file_count(sf_dir, sender_id),
                 0,
@@ -1152,11 +1173,11 @@ class TestArrowIngressSfa(afc.ArrowFuzzBase):
         resp = self._fixture.http_sql_query(
             f"select id, px from '{table}' order by id"
         )
-        self.assertEqual(
-            resp["dataset"],
-            [[0, 10.5]],
-            self.label(),
-        )
+        # The third publish-only flush can already be in flight before the
+        # terminal rejection for fsn=1 is observed. That frame may therefore
+        # be visible. The guarantee is that the rejected frame itself is
+        # absent and future flushes after the terminal error are fenced.
+        self.assertIn(resp["dataset"], ([[0, 10.5]], [[0, 10.5], [2, 20.5]]))
 
     def test_sfa_new_owner_recovers_server_accepted_unacked_batch(self):
         from test import (

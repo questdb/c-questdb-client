@@ -24,6 +24,8 @@
 
 #![doc = include_str!("ingress/mod.md")]
 
+#[cfg(feature = "_sender-qwp-ws")]
+pub(crate) use self::conf::QwpWsManagedSlotExclusion;
 pub use self::ndarr::{ArrayElement, NdArrayView};
 pub use self::timestamp::*;
 use crate::error::{self, Result, fmt};
@@ -37,7 +39,7 @@ use std::fmt::Write;
 use std::fmt::{Debug, Display, Formatter};
 
 use std::ops::Deref;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
 mod tls;
@@ -468,6 +470,14 @@ impl QwpWsConnector {
         *self.qwp_ws.request_durable_ack
     }
 
+    pub(crate) fn sender_id(&self) -> &str {
+        self.qwp_ws.sender_id.as_str()
+    }
+
+    pub(crate) fn sf_dir(&self) -> Option<&Path> {
+        self.qwp_ws.sf_dir.as_deref()
+    }
+
     /// Per-call request timeout parsed from the connect string. The direct
     /// column backend arms this as the socket read/write timeout; the
     /// store-and-forward backend uses it as the no-progress deadline in its
@@ -555,9 +565,20 @@ impl QwpWsConnector {
         })
     }
 
-    pub(crate) fn connect_sfa_background(&self) -> Result<sender::qwp_ws::SyncQwpWsHandlerState> {
+    pub(crate) fn connect_sfa_background_with_pool_slot(
+        &self,
+        sender_id: Option<&str>,
+        managed_exclusions: &[conf::QwpWsManagedSlotExclusion],
+        extra_orphan_slots: &[PathBuf],
+    ) -> Result<sender::qwp_ws::SyncQwpWsHandlerState> {
         let mut qwp_ws = self.qwp_ws.clone();
         qwp_ws.force_async_initial_connect();
+        configure_qwp_ws_pool_slot(
+            &mut qwp_ws,
+            sender_id,
+            managed_exclusions,
+            extra_orphan_slots,
+        )?;
         sender::qwp_ws::connect_qwp_ws_background_state(
             self.host.as_str(),
             self.port.as_str(),
@@ -567,6 +588,28 @@ impl QwpWsConnector {
             self.auth_header.clone(),
         )
     }
+}
+
+#[cfg(feature = "sync-sender-qwp-ws")]
+fn configure_qwp_ws_pool_slot(
+    qwp_ws: &mut conf::QwpWsConfig,
+    sender_id: Option<&str>,
+    managed_exclusions: &[conf::QwpWsManagedSlotExclusion],
+    extra_orphan_slots: &[PathBuf],
+) -> Result<()> {
+    if let Some(sender_id) = sender_id {
+        if !conf::is_valid_qwp_ws_sender_id(sender_id) {
+            return Err(error::fmt!(
+                ConfigError,
+                "invalid pool-managed sender_id [value={sender_id}, allowed-chars=[A-Za-z0-9_-]]"
+            ));
+        }
+        qwp_ws.sender_id = ConfigSetting::new_specified(sender_id.to_owned());
+    }
+    qwp_ws.orphan_exclude_managed_slots = managed_exclusions.to_vec();
+    qwp_ws.orphan_extra_slots = extra_orphan_slots.to_vec();
+    qwp_ws.pool_managed_slot = sender_id.is_some();
+    Ok(())
 }
 
 /// One connection opened by `QwpWsConnector::connect_round_pooled`, tagged with the
@@ -1331,6 +1374,28 @@ impl SenderBuilder {
     {
         self.qwp_ws_error_handler = QwpWsErrorHandler::new(handler);
         Ok(self)
+    }
+
+    #[cfg(feature = "sync-sender-qwp-ws")]
+    pub(crate) fn build_with_qwp_ws_pool_slot(
+        &self,
+        sender_id: Option<&str>,
+        managed_exclusions: &[conf::QwpWsManagedSlotExclusion],
+        extra_orphan_slots: &[PathBuf],
+        force_async_initial_connect: bool,
+    ) -> Result<Sender> {
+        let mut builder = self.clone();
+        let qwp_ws = builder.qwp_ws.as_mut().ok_or_else(|| {
+            error::fmt!(
+                ConfigError,
+                "QWP/WebSocket configuration is missing for pool-managed sender"
+            )
+        })?;
+        configure_qwp_ws_pool_slot(qwp_ws, sender_id, managed_exclusions, extra_orphan_slots)?;
+        if force_async_initial_connect {
+            qwp_ws.force_async_initial_connect();
+        }
+        builder.build()
     }
 
     /// Select local outbound interface.

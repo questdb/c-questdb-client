@@ -36,9 +36,10 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use crate::ErrorCode;
+use crate::ingress::sender::has_any_sfa_file as slot_has_sfa_file;
 use crate::ingress::{
-    Buffer, ColumnName, Protocol, QwpWsEncodeScratch, QwpWsErrorCategory, QwpWsErrorPolicy,
-    QwpWsProgress, SenderBuilder, SymbolGlobalDict, TableName, TimestampNanos,
+    Buffer, ColumnName, Protocol, ProtocolVersion, QwpWsEncodeScratch, QwpWsErrorCategory,
+    QwpWsErrorPolicy, QwpWsProgress, SenderBuilder, SymbolGlobalDict, TableName, TimestampNanos,
 };
 
 pub(crate) const WS_GUID: &str = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
@@ -725,6 +726,40 @@ fn spawn_stalled_after_first_frame_server() -> (u16, mpsc::Receiver<Vec<u8>>, mp
     (port, frame_rx, release_tx)
 }
 
+fn spawn_delayed_durable_ack_server() -> (
+    u16,
+    mpsc::Receiver<Vec<u8>>,
+    mpsc::Sender<()>,
+    mpsc::Sender<()>,
+) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let (frame_tx, frame_rx) = mpsc::channel();
+    let (ok_tx, ok_rx) = mpsc::channel();
+    let (durable_tx, durable_rx) = mpsc::channel();
+
+    thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        perform_server_upgrade_durable(&mut stream).unwrap();
+        let (_fin, _opcode, payload) = read_frame(&mut stream).unwrap();
+        frame_tx.send(payload).unwrap();
+
+        ok_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        write_qwp_ok_response_with_table_entries(
+            &mut stream,
+            FIRST_WIRE_SEQUENCE,
+            &[("trades", 10)],
+        )
+        .unwrap();
+
+        durable_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        write_qwp_durable_ack_response(&mut stream, &[("trades", 10)]).unwrap();
+        thread::sleep(Duration::from_millis(50));
+    });
+
+    (port, frame_rx, ok_tx, durable_tx)
+}
+
 fn spawn_ack_each_frame_server() -> (u16, thread::JoinHandle<usize>) {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();
@@ -765,6 +800,17 @@ fn spawn_ack_each_frame_server() -> (u16, thread::JoinHandle<usize>) {
     });
 
     (port, handle)
+}
+
+fn wait_until<F: FnMut() -> bool>(timeout: Duration, mut predicate: F) -> bool {
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        if predicate() {
+            return true;
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    predicate()
 }
 
 fn spawn_upgrade_only_server() -> u16 {
@@ -1100,19 +1146,6 @@ fn spawn_role_reject_upgrade_server(
     (port, handle)
 }
 
-fn slot_has_sfa_file(slot_dir: &Path) -> bool {
-    let Ok(entries) = std::fs::read_dir(slot_dir) else {
-        return false;
-    };
-    entries.flatten().any(|entry| {
-        entry
-            .path()
-            .file_name()
-            .and_then(|name| name.to_str())
-            .is_some_and(|name| name.ends_with(".sfa"))
-    })
-}
-
 fn seed_orphan_slot(sf_dir: &Path) {
     let seed_port = spawn_upgrade_only_server();
     let seed_conf = format!(
@@ -1290,6 +1323,68 @@ fn qwp_ws_max_buf_size_rejects_oversized_replay_frame_in_all_progress_modes() {
     }
 }
 
+fn assert_durable_ack_without_opt_in(err: crate::Error, mode: ProgressCase) {
+    assert_eq!(
+        err.code(),
+        ErrorCode::InvalidApiCall,
+        "mode={}",
+        mode.name()
+    );
+    assert_eq!(
+        err.msg(),
+        "AckLevel::Durable requires the pool to be opened with \
+         `request_durable_ack=on` in the connect string.",
+        "mode={}",
+        mode.name()
+    );
+}
+
+#[test]
+fn qwp_ws_wait_durable_without_opt_in_fails_with_no_published_frames_in_all_progress_modes() {
+    for progress in [ProgressCase::Background, ProgressCase::Manual] {
+        let port = spawn_upgrade_only_server();
+        let mut sender = build_qwp_ws_sender(progress, port);
+
+        let err = sender
+            .wait(crate::ingress::AckLevel::Durable, Duration::from_secs(5))
+            .expect_err("durable wait without opt-in must fail before the empty-stream shortcut");
+        assert_durable_ack_without_opt_in(err, progress);
+        assert_eq!(sender.published_fsn().unwrap(), None);
+    }
+}
+
+#[test]
+fn qwp_ws_wait_durable_without_opt_in_fails_after_ok_ack_in_all_progress_modes() {
+    for progress in [ProgressCase::Background, ProgressCase::Manual] {
+        let (port, rx) = spawn_mock_server();
+        let mut sender = build_qwp_ws_sender(progress, port);
+
+        let mut buf = sender.new_buffer();
+        buf.table("trades")
+            .unwrap()
+            .symbol("sym", "ETH-USD")
+            .unwrap()
+            .column_i64("qty", 7)
+            .unwrap()
+            .at_now()
+            .unwrap();
+
+        let fsn = sender.flush_and_get_fsn(&mut buf).unwrap().unwrap();
+        sender
+            .wait(crate::ingress::AckLevel::Ok, Duration::from_secs(5))
+            .unwrap_or_else(|e| panic!("mode={}: {e}", progress.name()));
+        assert_eq!(sender.acked_fsn().unwrap(), Some(fsn));
+
+        let err = sender
+            .wait(crate::ingress::AckLevel::Durable, Duration::from_secs(5))
+            .expect_err("durable wait without opt-in must fail after OK coverage too");
+        assert_durable_ack_without_opt_in(err, progress);
+
+        let result = rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert_eq!(result.received_frames.len(), 1, "mode={}", progress.name());
+    }
+}
+
 #[test]
 fn qwp_ws_publish_ack_completes_in_all_progress_modes() {
     for progress in [ProgressCase::Background, ProgressCase::Manual] {
@@ -1312,7 +1407,7 @@ fn qwp_ws_publish_ack_completes_in_all_progress_modes() {
         assert_eq!(fsn, 0, "mode={}", progress.name());
         assert!(buf.is_empty(), "mode={}", progress.name());
         sender
-            .wait(crate::ingress::AckLevel::Durable, Duration::from_secs(5))
+            .wait(crate::ingress::AckLevel::Ok, Duration::from_secs(5))
             .unwrap_or_else(|e| panic!("mode={}: {e}", progress.name()));
         assert_eq!(sender.published_fsn().unwrap(), Some(fsn));
         assert_eq!(sender.acked_fsn().unwrap(), Some(fsn));
@@ -1345,7 +1440,7 @@ fn qwp_ws_schema_reject_terminalizes_in_all_progress_modes() {
         assert_eq!(fsn, 0, "mode={}", progress.name());
 
         let err = sender
-            .wait(crate::ingress::AckLevel::Durable, Duration::from_secs(5))
+            .wait(crate::ingress::AckLevel::Ok, Duration::from_secs(5))
             .unwrap_err();
         assert_eq!(err.code(), ErrorCode::ServerRejection);
         assert!(
@@ -1402,7 +1497,7 @@ fn qwp_ws_terminal_reject_terminalizes_in_all_progress_modes() {
         assert_eq!(fsn, 0, "mode={}", progress.name());
 
         let err = sender
-            .wait(crate::ingress::AckLevel::Durable, Duration::from_secs(5))
+            .wait(crate::ingress::AckLevel::Ok, Duration::from_secs(5))
             .unwrap_err();
         assert_eq!(err.code(), ErrorCode::ServerRejection);
         assert!(
@@ -1664,6 +1759,57 @@ fn qwp_ws_sender_fsn_watermarks_and_close_drain_work_in_all_progress_modes() {
 }
 
 #[test]
+fn sender_sfa_fully_delivered_tracks_ok_and_durable_watermarks() {
+    let (port, frame_rx, ok_tx, durable_tx) = spawn_delayed_durable_ack_server();
+    let conf = format!("qwpws::addr=127.0.0.1:{port};request_durable_ack=on;");
+    let mut sender = SenderBuilder::from_conf(conf).unwrap().build().unwrap();
+    assert!(sender.sfa_fully_delivered(false));
+    assert!(sender.sfa_fully_delivered(true));
+
+    let mut buf = sender.new_buffer();
+    buf.table("trades")
+        .unwrap()
+        .column_i64("qty", 7)
+        .unwrap()
+        .at_now()
+        .unwrap();
+    let fsn = sender.flush_and_get_fsn(&mut buf).unwrap().unwrap();
+    assert_eq!(fsn, FIRST_WIRE_SEQUENCE);
+    let payload = frame_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    assert_eq!(&payload[0..4], b"QWP1");
+    assert!(!sender.sfa_fully_delivered(false));
+    assert!(!sender.sfa_fully_delivered(true));
+
+    ok_tx.send(()).unwrap();
+    assert!(
+        wait_until(Duration::from_secs(5), || sender.sfa_fully_delivered(false)),
+        "OK watermark should cover the published frame"
+    );
+    assert!(
+        !sender.sfa_fully_delivered(true),
+        "durable watermark must wait for durable ACK coverage"
+    );
+
+    durable_tx.send(()).unwrap();
+    sender
+        .wait(crate::ingress::AckLevel::Durable, Duration::from_secs(5))
+        .unwrap();
+    assert!(sender.sfa_fully_delivered(false));
+    assert!(sender.sfa_fully_delivered(true));
+
+    #[cfg(feature = "sync-sender-http")]
+    {
+        let http_sender = SenderBuilder::new(Protocol::Http, "127.0.0.1", 1)
+            .protocol_version(ProtocolVersion::V1)
+            .unwrap()
+            .build()
+            .unwrap();
+        assert!(http_sender.sfa_fully_delivered(false));
+        assert!(http_sender.sfa_fully_delivered(true));
+    }
+}
+
+#[test]
 fn qwp_ws_close_flush_timeout_minus_one_skips_close_drain_wait() {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();
@@ -1904,7 +2050,7 @@ fn qwp_ws_manual_sender_can_pipeline_before_waiting() {
     assert_eq!(&frames[1][0..4], b"QWP1");
 
     sender
-        .wait(crate::ingress::AckLevel::Durable, Duration::from_secs(5))
+        .wait(crate::ingress::AckLevel::Ok, Duration::from_secs(5))
         .unwrap();
     assert_eq!(sender.acked_fsn().unwrap(), Some(second_fsn));
 }
@@ -2223,8 +2369,8 @@ fn qwp_ws_manual_orphan_drainer_walks_endpoint_list() {
 
     let bad_listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let bad_port = bad_listener.local_addr().unwrap().port();
-    drop(bad_listener);
     let (port, rx) = spawn_manual_orphan_drain_server();
+    drop(bad_listener);
     let drain_conf = format!(
         "qwpws::addr=127.0.0.1:{bad_port},127.0.0.1:{port};qwp_ws_progress=manual;\
          sf_dir={};sender_id=primary;drain_orphans=on;\
@@ -2859,7 +3005,7 @@ fn qwp_ws_schema_rejection_terminalizes_and_notifies_handler() {
     let received_frames = rx.recv_timeout(Duration::from_secs(5)).unwrap();
     assert_eq!(received_frames.len(), 1);
     let err = sender
-        .wait(crate::ingress::AckLevel::Durable, Duration::from_secs(5))
+        .wait(crate::ingress::AckLevel::Ok, Duration::from_secs(5))
         .unwrap_err();
     assert_eq!(err.code(), ErrorCode::ServerRejection);
     assert_eq!(
@@ -3552,7 +3698,7 @@ fn qwp_ws_reconnects_and_replays_in_all_progress_modes() {
 
         sender.flush_and_get_fsn(&mut buf).unwrap();
         sender
-            .wait(crate::ingress::AckLevel::Durable, Duration::from_secs(5))
+            .wait(crate::ingress::AckLevel::Ok, Duration::from_secs(5))
             .unwrap_or_else(|e| panic!("mode={}: {e}", progress.name()));
 
         // Both wire dumps should be identical QWP messages — replay re-encodes
@@ -3892,10 +4038,10 @@ fn qwp_ws_sync_initial_connect_retry_survives_dropped_upgrade() {
 fn qwp_ws_initial_connect_walks_endpoint_list_in_off_mode() {
     let bad_listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let bad_port = bad_listener.local_addr().unwrap().port();
-    drop(bad_listener);
 
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let good_port = listener.local_addr().unwrap().port();
+    drop(bad_listener);
     let (payload_tx, payload_rx) = mpsc::channel();
 
     thread::spawn(move || {

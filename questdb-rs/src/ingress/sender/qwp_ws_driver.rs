@@ -2381,7 +2381,10 @@ pub(crate) fn reconnect_error_is_terminal(err: &Error) -> bool {
     }
     matches!(
         err.code(),
-        ErrorCode::AuthError | ErrorCode::ProtocolVersionError | ErrorCode::StoreResendRequired
+        ErrorCode::AuthError
+            | ErrorCode::ConfigError
+            | ErrorCode::ProtocolVersionError
+            | ErrorCode::StoreResendRequired
     )
 }
 

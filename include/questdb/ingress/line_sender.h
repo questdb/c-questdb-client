@@ -1943,9 +1943,8 @@ typedef enum qwpws_ack_level
     /** Wait for the server to accept every published frame. */
     qwpws_ack_level_ok = 0,
 
-    /** Wait for durable-ACK coverage. Each wait/sync API documents whether
-     * unavailable durable ACKs are rejected or downgraded to ordinary
-     * acceptance. */
+    /** Wait for durable-ACK coverage. APIs accepting this level document the
+     * required `request_durable_ack=on` opt-in. */
     qwpws_ack_level_durable = 1,
 } qwpws_ack_level;
 
@@ -1956,6 +1955,9 @@ typedef enum qwpws_ack_level
  *
  * `timeout_millis` is a no-progress deadline (it fires only if the ack
  * watermark fails to advance for that long); `0` waits indefinitely.
+ * `qwpws_ack_level_durable` requires `request_durable_ack=on`; otherwise this
+ * returns `line_sender_error_invalid_api_call` even when nothing has been
+ * published.
  *
  * Returns `false` and sets `err_out` on the no-progress timeout
  * (`line_sender_error_failover_retry`), a server rejection, a transport

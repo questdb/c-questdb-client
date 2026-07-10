@@ -43,6 +43,7 @@ namespace {
 
 ::line_sender* g_sender = nullptr;
 ::line_sender_buffer* g_buffer = nullptr;
+bool g_request_durable_ack = false;
 
 std::string sanitize(const char* msg, std::size_t len)
 {
@@ -105,6 +106,13 @@ void close_quietly()
         ::line_sender_buffer_free(g_buffer);
         g_buffer = nullptr;
     }
+    g_request_durable_ack = false;
+}
+
+bool request_durable_ack_enabled(const std::string& conf)
+{
+    return conf.find("request_durable_ack=on") != std::string::npos ||
+           conf.find("request_durable_ack=true") != std::string::npos;
 }
 
 void handle_connect(const std::string& rest)
@@ -132,6 +140,7 @@ void handle_connect(const std::string& rest)
     }
     g_sender = sender;
     g_buffer = buffer;
+    g_request_durable_ack = request_durable_ack_enabled(rest);
     reply_ok("");
 }
 
@@ -220,10 +229,10 @@ void handle_await_acked(const std::string& rest)
     }
     (void)fsn;
     ::line_sender_error* err = nullptr;
-    // Durable matches the Rust AckLevel::Durable; it falls back to ordinary
-    // acceptance when durable acks were not negotiated.
+    const uint32_t ack_level = g_request_durable_ack ? qwpws_ack_level_durable
+                                                     : qwpws_ack_level_ok;
     if (::line_sender_qwpws_wait(
-            g_sender, qwpws_ack_level_durable, timeout_ms, &err))
+            g_sender, ack_level, timeout_ms, &err))
     {
         reply_ok("true");
         return;

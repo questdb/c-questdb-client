@@ -1733,9 +1733,8 @@ enum class qwpws_ack_level : uint32_t
     /** Wait for the server to accept every published frame. */
     ok = ::qwpws_ack_level_ok,
 
-    /** Wait for durable-ACK coverage. Each wait/sync API documents whether
-     * unavailable durable ACKs are rejected or downgraded to ordinary
-     * acceptance. */
+    /** Wait for durable-ACK coverage. APIs accepting this level document the
+     * required `request_durable_ack=on` opt-in. */
     durable = ::qwpws_ack_level_durable,
 };
 
@@ -2102,9 +2101,11 @@ public:
      * `ack_level`. Row-major counterpart to the column-major
      * store-and-forward wait. `timeout` is a no-progress deadline (it fires
      * only if the ack watermark fails to advance for that long); the default
-     * of zero waits indefinitely. Throws on the no-progress timeout, a server
-     * rejection, or a transport failure; returns immediately when nothing has
-     * been published yet.
+     * of zero waits indefinitely. `qwpws_ack_level::durable` requires
+     * `request_durable_ack=on`; otherwise this throws `invalid_api_call` even
+     * when nothing has been published. Throws on the no-progress timeout, a
+     * server rejection, or a transport failure; returns immediately when
+     * nothing has been published yet.
      */
     void wait(
         qwpws_ack_level ack_level = qwpws_ack_level::ok,

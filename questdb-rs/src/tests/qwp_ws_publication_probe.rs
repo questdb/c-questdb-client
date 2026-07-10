@@ -84,7 +84,7 @@ fn qwp_ws_public_manual_sender_submit_waits_and_row_is_queryable() -> TestResult
 
     sender.flush_and_get_fsn(&mut buffer)?;
     assert!(buffer.is_empty());
-    sender.wait(crate::ingress::AckLevel::Durable, Duration::from_secs(10))?;
+    sender.wait(crate::ingress::AckLevel::Ok, Duration::from_secs(10))?;
 
     let count = wait_for_count(&config, &table, 1, Duration::from_secs(10))?;
     assert_eq!(count, 1);

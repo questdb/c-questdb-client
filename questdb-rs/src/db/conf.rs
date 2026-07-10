@@ -26,7 +26,7 @@
 //!
 //! Extracts pool-specific keys (`pool_size`, `pool_max`,
 //! `pool_idle_timeout_ms`, `pool_reap`), detects explicit
-//! store-and-forward opt-in (`sf_dir`), enforces a QWP/WebSocket schema, and
+//! disk-backed store-and-forward opt-in (`sf_dir`), enforces a QWP/WebSocket schema, and
 //! produces a sanitized conf string that the underlying
 //! [`crate::ingress::SenderBuilder`] can consume to build connections.
 
@@ -79,12 +79,8 @@ impl Default for PoolConfig {
 #[derive(Debug, Clone)]
 pub(crate) struct ParsedConf {
     pub(crate) pool: PoolConfig,
-    /// `sf_dir` was set: the main pool is **disk-backed** store-and-forward,
-    /// which shares one queue + `sender_id` and therefore allows a single
-    /// active borrower. When false the main pool is **in-memory**
-    /// store-and-forward, which pools freely up to `pool_max` (like the
-    /// row-major sender pool). Either way the main pool is store-and-forward;
-    /// this flag only selects disk vs in-memory / single-borrower vs pooled.
+    /// `sf_dir` was set: store-and-forward senders use disk-backed,
+    /// pool-minted slot directories. When false they use in-memory queues.
     pub(crate) sf_disk: bool,
 }
 
@@ -115,12 +111,10 @@ pub(crate) fn parse(conf: &str) -> Result<ParsedConf> {
     }
 
     let mut pool = PoolConfig::default();
-    let mut pool_size_specified = false;
-    let mut pool_max_specified = false;
     let mut sf_dir_specified = false;
 
     walk_params(params, |key, value| {
-        // `sf_dir` selects disk-backed (single-borrower) store-and-forward;
+        // `sf_dir` selects disk-backed store-and-forward slots;
         // all other `sf_*` / `sender_id` keys are passthrough to the
         // `SenderBuilder`, tuning the in-memory or disk queue — the same as the
         // row-major sender, which accepts them with or without `sf_dir`.
@@ -141,8 +135,14 @@ pub(crate) fn parse(conf: &str) -> Result<ParsedConf> {
                 ));
             }
             "pool_size" => {
-                pool.pool_size = parse_pool_usize(key, value)?;
-                pool_size_specified = true;
+                let value = parse_pool_usize(key, value)?;
+                if value == 0 {
+                    return Err(error::fmt!(
+                        ConfigError,
+                        "\"pool_size\" must be greater than 0"
+                    ));
+                }
+                pool.pool_size = value;
             }
             "pool_max" => {
                 let value = parse_pool_usize(key, value)?;
@@ -153,7 +153,6 @@ pub(crate) fn parse(conf: &str) -> Result<ParsedConf> {
                     ));
                 }
                 pool.pool_max = value;
-                pool_max_specified = true;
             }
             "pool_idle_timeout_ms" => {
                 let millis: u64 = value.parse().map_err(|_| {
@@ -199,35 +198,6 @@ pub(crate) fn parse(conf: &str) -> Result<ParsedConf> {
         }
         Ok(())
     })?;
-
-    if pool_size_specified && pool.pool_size == 0 {
-        return Err(error::fmt!(
-            ConfigError,
-            "\"pool_size\" must be greater than 0"
-        ));
-    }
-
-    if sf_dir_specified {
-        if pool_size_specified && pool.pool_size > 1 {
-            return Err(error::fmt!(
-                ConfigError,
-                "The QuestDb pool store-and-forward mode supports only \"pool_size=1\" \
-                 in v1 (got {})",
-                pool.pool_size
-            ));
-        }
-        if pool_max_specified && pool.pool_max > 1 {
-            return Err(error::fmt!(
-                ConfigError,
-                "The QuestDb pool store-and-forward mode supports only \"pool_max=1\" \
-                 in v1 (got {})",
-                pool.pool_max
-            ));
-        }
-        if !pool_max_specified {
-            pool.pool_max = 1;
-        }
-    }
 
     if pool.pool_size > pool.pool_max {
         return Err(error::fmt!(
@@ -375,29 +345,29 @@ mod tests {
     }
 
     #[test]
-    fn sf_dir_selects_store_and_forward_and_caps_pool_max() {
+    fn sf_dir_selects_disk_store_and_forward_without_changing_pool_max() {
         let p = parse_ok("qwpws::addr=localhost:9000;sf_dir=/tmp/qdb-sf;");
         assert!(p.sf_disk);
         assert_eq!(p.pool.pool_size, 1);
-        assert_eq!(p.pool.pool_max, 1);
+        assert_eq!(p.pool.pool_max, DEFAULT_POOL_MAX);
     }
 
     #[test]
-    fn sf_dir_accepts_explicit_single_slot_pool() {
+    fn sf_dir_accepts_multi_slot_pool() {
         let p = parse_ok(
-            "qwpws::addr=localhost:9000;sf_dir=/tmp/qdb-sf;pool_size=1;pool_max=1;sender_id=abc;",
+            "qwpws::addr=localhost:9000;sf_dir=/tmp/qdb-sf;pool_size=4;pool_max=8;sender_id=abc;",
         );
         assert!(p.sf_disk);
-        assert_eq!(p.pool.pool_size, 1);
-        assert_eq!(p.pool.pool_max, 1);
+        assert_eq!(p.pool.pool_size, 4);
+        assert_eq!(p.pool.pool_max, 8);
     }
 
     #[test]
     fn accepts_sf_keys_without_sf_dir() {
         // In-memory store-and-forward is always on, so SF tuning keys are
         // accepted without `sf_dir` (passthrough to the SenderBuilder), matching
-        // the row-major sender. They select in-memory SF: `sf_disk` stays false
-        // and the pool is not capped to a single borrower.
+        // the row-major sender. They select in-memory SF: `sf_disk` stays
+        // false and the pool keeps the normal pool cap.
         for key in [
             "sender_id",
             "sf_max_bytes",
@@ -410,20 +380,6 @@ mod tests {
             assert!(!p.sf_disk, "{key} must not imply disk-backed SF");
             assert_eq!(p.pool.pool_max, DEFAULT_POOL_MAX, "key {key}");
         }
-    }
-
-    #[test]
-    fn refuses_multi_slot_store_and_forward_pool_size() {
-        let err = parse_err("qwpws::addr=localhost:9000;sf_dir=/tmp/qdb-sf;pool_size=2;");
-        assert_eq!(err.code(), ErrorCode::ConfigError);
-        assert!(err.msg().contains("pool_size") && err.msg().contains("store-and-forward"));
-    }
-
-    #[test]
-    fn refuses_multi_slot_store_and_forward_pool_max() {
-        let err = parse_err("qwpws::addr=localhost:9000;sf_dir=/tmp/qdb-sf;pool_max=2;");
-        assert_eq!(err.code(), ErrorCode::ConfigError);
-        assert!(err.msg().contains("pool_max") && err.msg().contains("store-and-forward"));
     }
 
     #[test]

@@ -42,6 +42,7 @@ use std::time::{Duration, Instant};
 use crate::ingress::buffer::SymbolGlobalDict;
 #[cfg(feature = "sync-sender-qwp-ws")]
 use crate::ingress::conf::QwpWsConfig;
+use crate::ingress::conf::QwpWsManagedSlotExclusion;
 #[cfg(feature = "sync-sender-qwp-ws")]
 use crate::ingress::tls::TlsSettings;
 
@@ -67,7 +68,11 @@ const ORPHAN_POOL_STOP_GRACE: Duration = Duration::from_millis(500);
 #[cfg(feature = "sync-sender-qwp-ws")]
 const ORPHAN_POOL_CLOSE_POLL: Duration = Duration::from_millis(10);
 
-pub(crate) fn scan_orphan_slots(sf_dir: &Path, own_sender_id: &str) -> Vec<PathBuf> {
+pub(crate) fn scan_orphan_slots(
+    sf_dir: &Path,
+    own_sender_id: &str,
+    managed_exclusions: &[QwpWsManagedSlotExclusion],
+) -> Vec<PathBuf> {
     let Ok(entries) = fs::read_dir(sf_dir) else {
         return Vec::new();
     };
@@ -80,12 +85,23 @@ pub(crate) fn scan_orphan_slots(sf_dir: &Path, own_sender_id: &str) -> Vec<PathB
         if entry.file_name().to_str() == Some(own_sender_id) {
             continue;
         }
-        if has_failed_sentinel(&slot_path) || !has_any_sfa_file(&slot_path) {
+        if entry.file_name().to_str().is_some_and(|name| {
+            managed_exclusions
+                .iter()
+                .any(|exclusion| exclusion.matches(name))
+        }) {
+            continue;
+        }
+        if !is_candidate_orphan(&slot_path) {
             continue;
         }
         orphans.push(slot_path);
     }
     orphans
+}
+
+pub(crate) fn is_candidate_orphan(slot_dir: &Path) -> bool {
+    !has_failed_sentinel(slot_dir) && has_any_sfa_file(slot_dir)
 }
 
 pub(crate) fn has_failed_sentinel(slot_dir: &Path) -> bool {
@@ -96,7 +112,7 @@ pub(crate) fn mark_failed(slot_dir: &Path, reason: &str) -> io::Result<()> {
     fs::write(slot_dir.join(FAILED_SENTINEL_NAME), reason)
 }
 
-fn has_any_sfa_file(slot_dir: &Path) -> bool {
+pub(crate) fn has_any_sfa_file(slot_dir: &Path) -> bool {
     let Ok(entries) = fs::read_dir(slot_dir) else {
         return false;
     };
@@ -323,6 +339,7 @@ impl ManualOrphanDrainers {
                 OrphanDriveOutcome::RetryLater(reason) => {
                     let drainer = self.active.remove(index);
                     drainer.record_last_error(&reason);
+                    self.pending.push_back(drainer.slot_dir.clone());
                     self.normalize_next_active();
                     return true;
                 }
@@ -743,7 +760,7 @@ mod tests {
     fn scan_returns_no_orphans_for_missing_root() {
         let temp = TempDir::new().unwrap();
 
-        assert!(scan_orphan_slots(&temp.path().join("missing"), "default").is_empty());
+        assert!(scan_orphan_slots(&temp.path().join("missing"), "default", &[]).is_empty());
     }
 
     #[test]
@@ -763,7 +780,42 @@ mod tests {
         fs::write(orphan.join("sf-initial.sfa"), b"orphan").unwrap();
         fs::write(temp.path().join("top-level.sfa"), b"not a slot").unwrap();
 
-        assert_eq!(scan_orphan_slots(temp.path(), "default"), vec![orphan]);
+        assert_eq!(scan_orphan_slots(temp.path(), "default", &[]), vec![orphan]);
+    }
+
+    #[test]
+    fn scan_filters_canonical_managed_slot_ranges_only() {
+        let temp = TempDir::new().unwrap();
+        for name in [
+            "default-col-0",
+            "default-col-1",
+            "default-col-2",
+            "default-col-02",
+            "default-col-x",
+            "default-row-1",
+            "default",
+        ] {
+            let slot = temp.path().join(name);
+            fs::create_dir(&slot).unwrap();
+            fs::write(slot.join("sf-initial.sfa"), b"queued").unwrap();
+        }
+
+        let exclusions = vec![
+            QwpWsManagedSlotExclusion::new("default-col-".to_owned(), 2),
+            QwpWsManagedSlotExclusion::new("default-row-".to_owned(), 2),
+        ];
+        let mut actual = scan_orphan_slots(temp.path(), "default-row-0", &exclusions);
+        actual.sort();
+
+        assert_eq!(
+            actual,
+            vec![
+                temp.path().join("default"),
+                temp.path().join("default-col-02"),
+                temp.path().join("default-col-2"),
+                temp.path().join("default-col-x"),
+            ]
+        );
     }
 
     #[test]
@@ -953,7 +1005,7 @@ mod tests {
             queue.close().unwrap();
         }
         assert_eq!(
-            scan_orphan_slots(&sf_dir, "primary"),
+            scan_orphan_slots(&sf_dir, "primary", &[]),
             vec![slot_dir.clone()]
         );
 
@@ -971,7 +1023,7 @@ mod tests {
             "transient connect failure must leave orphan slot recoverable"
         );
         assert!(slot_dir.join(LAST_ERROR_NAME).exists());
-        assert_eq!(scan_orphan_slots(&sf_dir, "primary"), vec![slot_dir]);
+        assert_eq!(scan_orphan_slots(&sf_dir, "primary", &[]), vec![slot_dir]);
     }
 
     #[cfg(all(feature = "sync-sender-qwp-ws", unix))]
