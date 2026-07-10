@@ -205,10 +205,10 @@ enum class protocol
     qwpudp,
 
     /** QuestWire Protocol over WebSocket. */
-    qwpws,
+    ws,
 
     /** QuestWire Protocol over WebSocket Secure (TLS). */
-    qwpwss,
+    wss,
 
     /**
      * Sentinel for a protocol the Rust `Protocol` enum knows about but

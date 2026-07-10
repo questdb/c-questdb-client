@@ -97,11 +97,11 @@ def _connect_string_columnar(http_port: int, sf_dir: Path, *,
                              reconnect_max_ms: int = 60_000,
                              close_flush_timeout_ms: int = 5_000) -> str:
     """Column-major QWP/WebSocket connect string. Same store-and-forward
-    knobs as :func:`_connect_string`, with the ``qwpws`` schema and the
+    knobs as :func:`_connect_string`, with the ``ws`` schema and the
     single-slot pool the column sender's store-and-forward path requires
     (``pool_size=1`` / ``pool_max=1``)."""
     parts = [
-        f"qwpws::addr=127.0.0.1:{http_port}",
+        f"ws::addr=127.0.0.1:{http_port}",
         "username=admin",
         "password=quest",
         f"sf_dir={sf_dir}",

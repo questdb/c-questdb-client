@@ -1569,7 +1569,7 @@ namespace questdb
 /**
  * RAII wrapper around `::questdb_db*` — the QWP/WS connection pool.
  *
- * `conf` is a `qwpws::` / `qwpwss::` connect string; see
+ * `conf` is a `ws::` / `wss::` connect string; see
  * `column_sender.h` for pool-specific keys (`pool_size`, `pool_max`,
  * `pool_idle_timeout_ms`, `pool_reap`). With `sf_dir`, `sender_id` is the
  * slot base; pooled senders mint `<sender_id>-col-<index>` and

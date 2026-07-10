@@ -23,7 +23,7 @@
  ******************************************************************************/
 
 // `SyncProtocolHandler` is cfg-pruned: with only `sync-sender-qwp-ws`
-// enabled, the enum has just the two `*QwpWs` variants and a number
+// enabled, the enum has just the two `*Ws` variants and a number
 // of `_ =>` fallbacks here become unreachable. Suppress only in that
 // exact configuration so a regression in the multi-handler builds
 // still surfaces.

@@ -303,10 +303,10 @@ typedef enum line_sender_protocol
     line_sender_protocol_qwpudp,
 
     /** QuestWire Protocol over WebSocket. */
-    line_sender_protocol_qwpws,
+    line_sender_protocol_ws,
 
     /** QuestWire Protocol over WebSocket Secure (TLS). */
-    line_sender_protocol_qwpwss,
+    line_sender_protocol_wss,
 
     /**
      * Sentinel for a protocol the Rust `Protocol` enum knows about but
@@ -1474,7 +1474,7 @@ typedef struct line_sender_opts line_sender_opts;
  * Create a new `line_sender_opts` instance from the given configuration
  * string. The format of the string is: "tcp::addr=host:port;key=value;...;"
  * Instead of "tcp" you can also specify "tcps", "http", "https", "qwpudp",
- * "qwpws", and "qwpwss".
+ * "ws", and "wss".
  *
  * The accepted keys match one-for-one with the functions on
  * `line_sender_opts`. For example, this is a valid configuration string:
@@ -1580,8 +1580,8 @@ bool line_sender_opts_multicast_ttl(
 /**
  * Control whether QWP/WebSocket progress is driven by a background thread or
  * manually by the caller. The default is background progress. This setting is
- * only supported for `line_sender_protocol_qwpws` and
- * `line_sender_protocol_qwpwss`.
+ * only supported for `line_sender_protocol_ws` and
+ * `line_sender_protocol_wss`.
  */
 QUESTDB_CLIENT_API
 bool line_sender_opts_qwpws_progress(
@@ -1713,7 +1713,7 @@ bool line_sender_opts_tls_ca(
  * This is used to validate the server's certificate during the TLS
  * handshake.
  *
- * On QWP/WebSocket (`qwpwss::`) the same path may instead point at a
+ * On QWP/WebSocket (`wss::`) the same path may instead point at a
  * JKS or PKCS#12 keystore; pair it with
  * `line_sender_opts_tls_roots_password` to unlock it.
  *
@@ -1728,7 +1728,7 @@ bool line_sender_opts_tls_roots(
  * Set the password unlocking the JKS / PKCS#12 keystore named by
  * `line_sender_opts_tls_roots`.
  *
- * QWP/WebSocket only (`qwpwss::`). Calling this on an ILP/TCP or
+ * QWP/WebSocket only (`wss::`). Calling this on an ILP/TCP or
  * ILP/HTTP sender returns an `invalid_api_call` error: those
  * transports read unencrypted PEM via rustls and have no keystore
  * concept.
@@ -1853,7 +1853,7 @@ line_sender* line_sender_build(
  * Create a new line sender instance from the given configuration string.
  * The format of the string is: "tcp::addr=host:port;key=value;...;"
  * Instead of "tcp" you can also specify "tcps", "http", "https",
- * "qwpudp", "qwpws", and "qwpwss".
+ * "qwpudp", "ws", and "wss".
  *
  * The accepted keys match one-for-one with the functions on
  * `line_sender_opts`. For example, this is a valid configuration string:

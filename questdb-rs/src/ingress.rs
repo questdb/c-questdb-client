@@ -304,11 +304,11 @@ pub enum Protocol {
 
     #[cfg(feature = "_sender-qwp-ws")]
     /// Quest Wire Protocol over WebSocket (RFC 6455).
-    QwpWs,
+    Ws,
 
     #[cfg(feature = "_sender-qwp-ws")]
     /// Quest Wire Protocol over WebSocket Secure (TLS).
-    QwpWss,
+    Wss,
 }
 
 #[cfg(feature = "_sync-sender")]
@@ -329,7 +329,7 @@ impl Protocol {
             #[cfg(feature = "_sender-qwp-udp")]
             Protocol::QwpUdp => "9007",
             #[cfg(feature = "_sender-qwp-ws")]
-            Protocol::QwpWs | Protocol::QwpWss => "9000",
+            Protocol::Ws | Protocol::Wss => "9000",
         }
     }
 
@@ -346,9 +346,9 @@ impl Protocol {
             #[cfg(feature = "_sender-qwp-udp")]
             Protocol::QwpUdp => false,
             #[cfg(feature = "_sender-qwp-ws")]
-            Protocol::QwpWs => false,
+            Protocol::Ws => false,
             #[cfg(feature = "_sender-qwp-ws")]
-            Protocol::QwpWss => true,
+            Protocol::Wss => true,
         }
     }
 
@@ -361,7 +361,7 @@ impl Protocol {
             #[cfg(feature = "_sender-qwp-udp")]
             Protocol::QwpUdp => false,
             #[cfg(feature = "_sender-qwp-ws")]
-            Protocol::QwpWs | Protocol::QwpWss => false,
+            Protocol::Ws | Protocol::Wss => false,
         }
     }
 
@@ -374,7 +374,7 @@ impl Protocol {
             #[cfg(feature = "_sender-qwp-udp")]
             Protocol::QwpUdp => false,
             #[cfg(feature = "_sender-qwp-ws")]
-            Protocol::QwpWs | Protocol::QwpWss => false,
+            Protocol::Ws | Protocol::Wss => false,
         }
     }
 
@@ -385,7 +385,7 @@ impl Protocol {
 
     #[cfg(feature = "_sender-qwp-ws")]
     fn is_qwp_ws(&self) -> bool {
-        matches!(self, Protocol::QwpWs | Protocol::QwpWss)
+        matches!(self, Protocol::Ws | Protocol::Wss)
     }
 
     /// True if the protocol authenticates via HTTP-style headers
@@ -417,9 +417,9 @@ impl Protocol {
             #[cfg(feature = "_sender-qwp-udp")]
             Protocol::QwpUdp => "qwpudp",
             #[cfg(feature = "_sender-qwp-ws")]
-            Protocol::QwpWs => "qwpws",
+            Protocol::Ws => "ws",
             #[cfg(feature = "_sender-qwp-ws")]
-            Protocol::QwpWss => "qwpwss",
+            Protocol::Wss => "wss",
         }
     }
 
@@ -445,12 +445,12 @@ impl Protocol {
             return Ok(Protocol::QwpUdp);
         }
         #[cfg(feature = "_sender-qwp-ws")]
-        if schema.eq_ignore_ascii_case("qwpws") || schema.eq_ignore_ascii_case("ws") {
-            return Ok(Protocol::QwpWs);
+        if schema.eq_ignore_ascii_case("ws") {
+            return Ok(Protocol::Ws);
         }
         #[cfg(feature = "_sender-qwp-ws")]
-        if schema.eq_ignore_ascii_case("qwpwss") || schema.eq_ignore_ascii_case("wss") {
-            return Ok(Protocol::QwpWss);
+        if schema.eq_ignore_ascii_case("wss") {
+            return Ok(Protocol::Wss);
         }
         Err(error::fmt!(ConfigError, "Unsupported protocol: {}", schema))
     }
@@ -657,7 +657,7 @@ pub(crate) struct RawQwpWsRoundStream {
 /// removed (the first one is kept so the downstream `questdb_confstr` parser
 /// still sees a value).
 ///
-/// Triggered when the schema is one of `qwpws`, `qwpwss`, `ws`, or `wss`; for
+/// Triggered when the schema is one of `ws` or `wss`; for
 /// any other schema (or a malformed conf), returns `None` and the caller
 /// should fall back to the standard `params.get("addr")` flow.
 #[cfg(any(feature = "_sender-qwp-ws", feature = "_egress"))]
@@ -665,11 +665,7 @@ pub(crate) fn scan_qwp_ws_addr_params(conf: &str) -> Result<Option<QwpWsAddrScan
     let Some((service, params)) = conf.split_once("::") else {
         return Ok(None);
     };
-    if !service.eq_ignore_ascii_case("qwpws")
-        && !service.eq_ignore_ascii_case("qwpwss")
-        && !service.eq_ignore_ascii_case("ws")
-        && !service.eq_ignore_ascii_case("wss")
-    {
+    if !service.eq_ignore_ascii_case("ws") && !service.eq_ignore_ascii_case("wss") {
         return Ok(None);
     }
 
@@ -899,8 +895,8 @@ impl SenderBuilder {
     /// The format of the string is: `"http::addr=host:port;key=value;...;"`.
     ///
     /// Instead of `"http"`, you can also specify `"https"`, `"tcp"`, `"tcps"`,
-    /// `"qwpudp"`, `"qwpws"`, `"qwpwss"`, and the QWP/WebSocket aliases
-    /// `"ws"` / `"wss"` when the corresponding sender features are enabled.
+    /// `"qwpudp"`, and the QWP/WebSocket schemes `"ws"` / `"wss"` when the
+    /// corresponding sender features are enabled.
     ///
     /// We recommend HTTP for most cases because it provides more features, like
     /// reporting errors to the client and supporting transaction control. TCP can
@@ -1245,7 +1241,7 @@ impl SenderBuilder {
                         return Err(error::fmt!(
                             ConfigError,
                             "\"tls_roots_password\" is only supported for QWP/WebSocket \
-                             (qwpws / qwpwss). ILP/TCP and ILP/HTTP transports read \
+                             (ws / wss). ILP/TCP and ILP/HTTP transports read \
                              unencrypted PEM via rustls."
                         ));
                     }
@@ -2186,7 +2182,7 @@ impl SenderBuilder {
     /// Set the path to a custom root certificate `.pem` file.
     /// This is used to validate the server's certificate during the TLS handshake.
     ///
-    /// On QWP/WebSocket (`qwpws::` / `qwpwss::`) the same path key
+    /// On QWP/WebSocket (`ws::` / `wss::`) the same path key
     /// also accepts a JKS or PKCS#12 keystore — see
     /// [`tls_roots_password`](SenderBuilder::tls_roots_password) for
     /// the unlock password.
@@ -2224,7 +2220,7 @@ impl SenderBuilder {
             return Err(error::fmt!(
                 ConfigError,
                 "\"tls_roots_password\" is only supported for QWP/WebSocket \
-                 (qwpws / qwpwss). ILP/TCP and ILP/HTTP transports read \
+                 (ws / wss). ILP/TCP and ILP/HTTP transports read \
                  unencrypted PEM via rustls."
             ));
         }
@@ -2652,7 +2648,7 @@ impl SenderBuilder {
                 )?
             }
             #[cfg(feature = "sync-sender-qwp-ws")]
-            Protocol::QwpWs | Protocol::QwpWss => {
+            Protocol::Ws | Protocol::Wss => {
                 if self.net_interface.is_some() {
                     return Err(error::fmt!(
                         InvalidApiCall,
@@ -2684,7 +2680,7 @@ impl SenderBuilder {
                     SyncProtocolHandler::ManualQwpWs(Box::new(open_manual_qwp_ws(
                         self.host.as_str(),
                         self.port.as_str(),
-                        matches!(self.protocol, Protocol::QwpWss),
+                        matches!(self.protocol, Protocol::Wss),
                         tls_settings,
                         qwp_ws,
                         basic_auth,
@@ -2693,7 +2689,7 @@ impl SenderBuilder {
                     connect_qwp_ws(
                         self.host.as_str(),
                         self.port.as_str(),
-                        matches!(self.protocol, Protocol::QwpWss),
+                        matches!(self.protocol, Protocol::Wss),
                         tls_settings,
                         qwp_ws,
                         basic_auth,
@@ -2741,7 +2737,7 @@ impl SenderBuilder {
                 #[cfg(feature = "sync-sender-qwp-udp")]
                 Protocol::QwpUdp => ProtocolVersion::V1,
                 #[cfg(feature = "sync-sender-qwp-ws")]
-                Protocol::QwpWs | Protocol::QwpWss => ProtocolVersion::V1,
+                Protocol::Ws | Protocol::Wss => ProtocolVersion::V1,
             },
         };
 
@@ -2793,7 +2789,7 @@ impl SenderBuilder {
             ));
         }
 
-        if !matches!(self.protocol, Protocol::QwpWs | Protocol::QwpWss) {
+        if !matches!(self.protocol, Protocol::Ws | Protocol::Wss) {
             return Err(error::fmt!(
                 ConfigError,
                 "Column-sender requires a QWP/WebSocket connect string \
@@ -2849,7 +2845,7 @@ impl SenderBuilder {
             ));
         }
 
-        let use_tls = matches!(self.protocol, Protocol::QwpWss);
+        let use_tls = matches!(self.protocol, Protocol::Wss);
         Ok((use_tls, tls_settings, qwp_ws, auth_header))
     }
 

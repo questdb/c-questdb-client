@@ -218,7 +218,7 @@ return per work unit (or per thread).
 | `pool_reap`            | `auto`  | `auto` — pool spawns a background thread that periodically reaps idle connections per `pool_idle_timeout_ms`. `manual` — no background thread; caller invokes `questdb_db_reap_idle` on its own cadence. |
 
 All other connect-string keys are inherited from the existing
-`qwpws::` configuration (auth, TLS, `auth_timeout_ms`, retry,
+`ws::` configuration (auth, TLS, `auth_timeout_ms`, retry,
 durable-ack opt-in, etc.). See `doc/CONSIDERATIONS.md` and the
 row-API connect-string reference.
 
@@ -255,7 +255,7 @@ Validity: `pool_size <= pool_max` must hold; otherwise
  * Open a connection pool. Eagerly opens `pool_size` connections; any
  * server/auth/TLS error during those opens fails the call.
  *
- * `conf` is a standard `qwpws::` connect string. Non-WS schemes return
+ * `conf` is a standard `ws::` connect string. Non-WS schemes return
  * questdb_error_config_error — the column-sender path is QWP/WS
  * only.
  */
@@ -1445,7 +1445,7 @@ fail:
 int main(void) {
     line_sender_error* err = NULL;
     questdb_db* db = questdb_db_connect(
-        "qwpws::addr=localhost:9000;pool_size=1;", &err);
+        "ws::addr=localhost:9000;pool_size=1;", &err);
     if (!db) {
         if (err) line_sender_error_free(err);
         return 1;

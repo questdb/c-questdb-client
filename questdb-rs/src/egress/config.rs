@@ -613,13 +613,12 @@ impl ReaderConfig {
             .map_err(|e| fmt!(ConfigError, "Config parse error: {}", e))?;
         let scheme = conf.service();
         let tls = match scheme {
-            "ws" | "qwpws" => false,
-            "wss" | "qwpwss" => true,
+            "ws" => false,
+            "wss" => true,
             other => {
                 return Err(fmt!(
                     ConfigError,
-                    "Unknown scheme \"{}\" — expected \"ws\", \"wss\", \
-                     \"qwpws\", or \"qwpwss\"",
+                    "Unknown scheme \"{}\" — expected \"ws\" or \"wss\"",
                     other
                 ));
             }
@@ -1372,15 +1371,15 @@ mod tests {
     }
 
     #[test]
-    fn qwpws_scheme_alias_is_plain_ws() {
-        let c = ReaderConfig::from_conf("qwpws::addr=localhost:9000").unwrap();
+    fn ws_scheme_is_plain() {
+        let c = ReaderConfig::from_conf("ws::addr=localhost:9000").unwrap();
         assert!(!c.tls);
         assert_eq!(c.url(), "ws://localhost:9000/read/v1");
     }
 
     #[test]
-    fn qwpwss_scheme_alias_is_tls_wss() {
-        let c = ReaderConfig::from_conf("qwpwss::addr=h:8443").unwrap();
+    fn wss_scheme_is_tls() {
+        let c = ReaderConfig::from_conf("wss::addr=h:8443").unwrap();
         assert!(c.tls);
         assert_eq!(c.url(), "wss://h:8443/read/v1");
     }

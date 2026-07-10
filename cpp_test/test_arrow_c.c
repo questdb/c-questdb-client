@@ -1048,7 +1048,7 @@ static column_sender* mock_borrow_column_sender(
     char conf[256];
     snprintf(
         conf, sizeof(conf),
-        "qwpws::addr=%s;pool_size=1;pool_reap=manual;",
+        "ws::addr=%s;pool_size=1;pool_reap=manual;",
         addr);
     line_sender_error* err = NULL;
     questdb_db* db = questdb_db_connect(conf, strlen(conf), &err);

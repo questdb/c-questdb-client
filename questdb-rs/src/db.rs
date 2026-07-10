@@ -874,8 +874,8 @@ fn preopen_row_recovery_sender(
 impl QuestDb {
     /// Open a pool against `conf`.
     ///
-    /// The connect string must use a QWP/WebSocket schema (`qwpws::` /
-    /// `qwpwss::` / `ws::` / `wss::`). Pool-specific keys are recognised:
+    /// The connect string must use a QWP/WebSocket schema (`ws::` /
+    /// `wss::` / `ws::` / `wss::`). Pool-specific keys are recognised:
     ///
     /// | Key                    | Default | Meaning                                                        |
     /// |------------------------|---------|----------------------------------------------------------------|

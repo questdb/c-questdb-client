@@ -127,7 +127,7 @@ SFA runner code from `sender/qwp_ws.rs` and `sender/qwp_ws_driver.rs`.
 The default configuration stays direct:
 
 ```text
-qwpws::addr=localhost:9000;
+ws::addr=localhost:9000;
 ```
 
 Dataframe helpers must not silently enable SFA. They use SFA only when the
@@ -160,7 +160,7 @@ effective SFA `pool_max` is `1` even though the direct-mode default is larger.
 This keeps the common opt-in string usable:
 
 ```text
-qwpws::addr=localhost:9000;sf_dir=/var/lib/questdb-client/sfa;
+ws::addr=localhost:9000;sf_dir=/var/lib/questdb-client/sfa;
 ```
 
 The single-slot v1 decision keeps slot ownership, replay order, and
@@ -918,8 +918,8 @@ Other future work:
 
 ### 12.1 Config and mode selection
 
-- `qwpws::addr=...` selects direct mode.
-- `qwpws::addr=...;sf_dir=...` selects SFA mode with effective
+- `ws::addr=...` selects direct mode.
+- `ws::addr=...;sf_dir=...` selects SFA mode with effective
   `pool_size=1`, `pool_max=1`.
 - Explicit `pool_size > 1` or `pool_max > 1` with `sf_dir` fails with a
   targeted `ConfigError`.

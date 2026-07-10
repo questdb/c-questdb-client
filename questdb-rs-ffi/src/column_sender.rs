@@ -402,7 +402,7 @@ fn ack_level_from_u32(value: u32, err_out: *mut *mut line_sender_error) -> Optio
                     err_out,
                     Error::new(
                         ErrorCode::InvalidApiCall,
-                        format!("qwpws ack_level: invalid value {other} (expected 0 or 1)"),
+                        format!("ws ack_level: invalid value {other} (expected 0 or 1)"),
                     ),
                 );
             }
@@ -4064,7 +4064,7 @@ mod tests {
             listener.local_addr().expect("local_addr").port()
         };
         let conf = format!(
-            "qwpws::addr=127.0.0.1:{port};auth_timeout=2000;reconnect_max_duration_millis=1000;"
+            "ws::addr=127.0.0.1:{port};auth_timeout=2000;reconnect_max_duration_millis=1000;"
         );
         let mut err: *mut line_sender_error = std::ptr::null_mut();
         let db =

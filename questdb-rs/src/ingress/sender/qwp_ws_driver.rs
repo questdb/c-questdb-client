@@ -5200,7 +5200,7 @@ mod tests {
         let mut buffer = qwp_buffer("SYM_REAL", 42, 42_000);
         let expected = replay_payload(&buffer);
 
-        let conf = format!("qwpws::addr={host}:{port};");
+        let conf = format!("ws::addr={host}:{port};");
         let mut sender = crate::ingress::Sender::from_conf(&conf).unwrap();
         sender.flush(&mut buffer).unwrap();
         sender.close_drain().unwrap();
@@ -5219,10 +5219,7 @@ mod tests {
         let expected = replay_payload(&buffer);
 
         let ca_path = tls_certs_dir().join("server_rootCA.pem");
-        let conf = format!(
-            "qwpwss::addr={host}:{port};tls_roots={};",
-            ca_path.display()
-        );
+        let conf = format!("wss::addr={host}:{port};tls_roots={};", ca_path.display());
         let mut sender = crate::ingress::Sender::from_conf(&conf).unwrap();
         sender.flush(&mut buffer).unwrap();
         sender.close_drain().unwrap();

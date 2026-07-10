@@ -158,7 +158,7 @@ _QWP_WS_UNSUPPORTED_MARKERS = (
     'unknown scheme',
     'missing endpoint',
     'endpoint not found',
-    # Ingest (Sender → qwpws://) error phrasing
+    # Ingest (Sender → ws://) error phrasing
     'websocket upgrade failed: http status 404',
     'websocket upgrade failed: http status 405',
     'websocket upgrade failed: http status 501',
@@ -1614,7 +1614,7 @@ class QwpWsTestSupport:
             sender_id,
             sf_dir,
             port=None,
-            scheme='qwpws',
+            scheme='ws',
             host=None,
             endpoints=None,
             **settings):
@@ -1769,7 +1769,7 @@ class TestQwpWsSender(QwpWsTestSupport, unittest.TestCase):
             include_auth=True,
             password=None,
             auth_timeout_ms=None):
-        scheme = 'qwpws'
+        scheme = 'ws'
         host = QDB_FIXTURE.host
         port = QDB_FIXTURE.http_server_port
         settings = {
@@ -1779,7 +1779,7 @@ class TestQwpWsSender(QwpWsTestSupport, unittest.TestCase):
         if auth_timeout_ms is not None:
             settings['auth_timeout_ms'] = auth_timeout_ms
         if QWP_WS_SMOKE_TLS:
-            scheme = 'qwpwss'
+            scheme = 'wss'
             host = 'localhost'
             port = TLS_PROXY_FIXTURE.listen_port
             settings['tls_roots'] = str(Project().tls_certs_dir / 'server_rootCA.pem')
@@ -2475,7 +2475,7 @@ class TestQwpWsFuzz(QwpWsTestSupport, unittest.TestCase):
         # format_actual_cell can hex-encode.
         import qwp_egress_reader
         # The reader's connect-string scheme is `ws::` (egress side), distinct
-        # from the sender's `qwpws::` (ingress side) — both hit the HTTP port.
+        # from the sender's `ws::` (ingress side) — both hit the HTTP port.
         conf = f'ws::addr={QDB_FIXTURE.host}:{QDB_FIXTURE.http_server_port};'
         return qwp_egress_reader.query_table_sorted(conf, table_name)
 

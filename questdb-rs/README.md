@@ -26,7 +26,7 @@ also supported for ingestion.
 
 The transport is selected by the scheme in the configuration string:
 
-* `ws::addr=...` / `wss::addr=...` (also `qwpws::` / `qwpwss::`) — QWP over
+* `ws::addr=...` / `wss::addr=...` (also `ws::` / `wss::`) — QWP over
   WebSocket, in both directions. For ingestion (`QuestDb::connect`): binary
   columnar frames with per-flush acknowledgements, a thread-safe connection
   pool with automatic reconnect/failover, and row, column, Arrow

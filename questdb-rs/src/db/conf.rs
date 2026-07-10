@@ -104,8 +104,7 @@ pub(crate) fn parse(conf: &str) -> Result<ParsedConf> {
         return Err(error::fmt!(
             ConfigError,
             "The QuestDb pool requires a QWP/WebSocket connect string \
-             (schema must be one of 'qwpws', 'qwpwss', 'ws', or 'wss', \
-             got {:?})",
+             (schema must be 'ws' or 'wss', got {:?})",
             service
         ));
     }
@@ -228,10 +227,7 @@ fn parse_on_off(key: &str, value: &str) -> Result<bool> {
 }
 
 fn is_qwp_ws_schema(service: &str) -> bool {
-    service.eq_ignore_ascii_case("qwpws")
-        || service.eq_ignore_ascii_case("qwpwss")
-        || service.eq_ignore_ascii_case("ws")
-        || service.eq_ignore_ascii_case("wss")
+    service.eq_ignore_ascii_case("ws") || service.eq_ignore_ascii_case("wss")
 }
 
 fn parse_pool_usize(key: &str, value: &str) -> Result<usize> {
@@ -318,7 +314,7 @@ mod tests {
 
     #[test]
     fn defaults() {
-        let p = parse_ok("qwpws::addr=localhost:9000;");
+        let p = parse_ok("ws::addr=localhost:9000;");
         assert_eq!(p.pool.pool_size, DEFAULT_POOL_SIZE);
         assert_eq!(p.pool.pool_max, DEFAULT_POOL_MAX);
         assert_eq!(p.pool.pool_idle_timeout, DEFAULT_POOL_IDLE_TIMEOUT);
@@ -329,7 +325,7 @@ mod tests {
     #[test]
     fn parses_pool_knobs() {
         let p = parse_ok(
-            "qwpws::addr=localhost:9000;pool_size=4;pool_max=8;pool_idle_timeout_ms=10000;pool_reap=manual;",
+            "ws::addr=localhost:9000;pool_size=4;pool_max=8;pool_idle_timeout_ms=10000;pool_reap=manual;",
         );
         assert_eq!(p.pool.pool_size, 4);
         assert_eq!(p.pool.pool_max, 8);
@@ -346,7 +342,7 @@ mod tests {
 
     #[test]
     fn sf_dir_selects_disk_store_and_forward_without_changing_pool_max() {
-        let p = parse_ok("qwpws::addr=localhost:9000;sf_dir=/tmp/qdb-sf;");
+        let p = parse_ok("ws::addr=localhost:9000;sf_dir=/tmp/qdb-sf;");
         assert!(p.sf_disk);
         assert_eq!(p.pool.pool_size, 1);
         assert_eq!(p.pool.pool_max, DEFAULT_POOL_MAX);
@@ -355,7 +351,7 @@ mod tests {
     #[test]
     fn sf_dir_accepts_multi_slot_pool() {
         let p = parse_ok(
-            "qwpws::addr=localhost:9000;sf_dir=/tmp/qdb-sf;pool_size=4;pool_max=8;sender_id=abc;",
+            "ws::addr=localhost:9000;sf_dir=/tmp/qdb-sf;pool_size=4;pool_max=8;sender_id=abc;",
         );
         assert!(p.sf_disk);
         assert_eq!(p.pool.pool_size, 4);
@@ -375,7 +371,7 @@ mod tests {
             "sf_durability",
             "sf_append_deadline_millis",
         ] {
-            let conf = format!("qwpws::addr=localhost:9000;{key}=whatever;");
+            let conf = format!("ws::addr=localhost:9000;{key}=whatever;");
             let p = parse_ok(&conf);
             assert!(!p.sf_disk, "{key} must not imply disk-backed SF");
             assert_eq!(p.pool.pool_max, DEFAULT_POOL_MAX, "key {key}");
@@ -384,21 +380,21 @@ mod tests {
 
     #[test]
     fn refuses_pool_size_zero() {
-        let err = parse_err("qwpws::addr=localhost:9000;pool_size=0;");
+        let err = parse_err("ws::addr=localhost:9000;pool_size=0;");
         assert_eq!(err.code(), ErrorCode::ConfigError);
         assert!(err.msg().contains("pool_size"));
     }
 
     #[test]
     fn refuses_pool_size_above_pool_max() {
-        let err = parse_err("qwpws::addr=localhost:9000;pool_size=10;pool_max=5;");
+        let err = parse_err("ws::addr=localhost:9000;pool_size=10;pool_max=5;");
         assert_eq!(err.code(), ErrorCode::ConfigError);
         assert!(err.msg().contains("pool_size") && err.msg().contains("pool_max"));
     }
 
     #[test]
     fn invalid_pool_reap_value() {
-        let err = parse_err("qwpws::addr=localhost:9000;pool_reap=sometimes;");
+        let err = parse_err("ws::addr=localhost:9000;pool_reap=sometimes;");
         assert_eq!(err.code(), ErrorCode::ConfigError);
         assert!(err.msg().contains("pool_reap"));
     }
@@ -408,7 +404,7 @@ mod tests {
         // Unknown keys are passed through to the underlying SenderBuilder,
         // which silently ignores its own unknowns. The pool config layer
         // must not error on them either.
-        let _ = parse_ok("qwpws::addr=localhost:9000;auth_timeout=5000;some_future_key=value;");
+        let _ = parse_ok("ws::addr=localhost:9000;auth_timeout=5000;some_future_key=value;");
     }
 
     #[test]
@@ -416,28 +412,28 @@ mod tests {
         // Syntactically valid values pass the pool config pre-check.
         // The actual `durable_ack_opt_in` flag is sourced from the
         // SenderBuilder inside `ColumnConn::connect`.
-        let _ = parse_ok("qwpws::addr=localhost:9000;");
-        let _ = parse_ok("qwpws::addr=localhost:9000;request_durable_ack=on;");
-        let _ = parse_ok("qwpws::addr=localhost:9000;request_durable_ack=off;");
+        let _ = parse_ok("ws::addr=localhost:9000;");
+        let _ = parse_ok("ws::addr=localhost:9000;request_durable_ack=on;");
+        let _ = parse_ok("ws::addr=localhost:9000;request_durable_ack=off;");
     }
 
     #[test]
     fn refuses_invalid_request_durable_ack_value() {
-        let err = parse_err("qwpws::addr=localhost:9000;request_durable_ack=true;");
+        let err = parse_err("ws::addr=localhost:9000;request_durable_ack=true;");
         assert_eq!(err.code(), ErrorCode::ConfigError);
         assert!(err.msg().contains("request_durable_ack"));
     }
 
     #[test]
     fn refuses_manual_progress_mode() {
-        let err = parse_err("qwpws::addr=localhost:9000;qwp_ws_progress=manual;");
+        let err = parse_err("ws::addr=localhost:9000;qwp_ws_progress=manual;");
         assert_eq!(err.code(), ErrorCode::ConfigError);
         assert!(err.msg().contains("qwp_ws_progress"));
     }
 
     #[test]
     fn accepts_explicit_background_progress_mode() {
-        let _ = parse_ok("qwpws::addr=localhost:9000;qwp_ws_progress=background;");
+        let _ = parse_ok("ws::addr=localhost:9000;qwp_ws_progress=background;");
     }
 
     #[test]
@@ -445,6 +441,6 @@ mod tests {
         // `;;` inside a value should be parsed as a literal `;`, not as a
         // record separator. Our walker mirrors `scan_qwp_ws_addr_params` so a
         // value containing `;;` does not bleed into the next key.
-        let _ = parse_ok("qwpws::addr=localhost:9000;password=a;;b;pool_size=2;");
+        let _ = parse_ok("ws::addr=localhost:9000;password=a;;b;pool_size=2;");
     }
 }

@@ -57,7 +57,7 @@ std::unique_ptr<qm::MockServer> spawn_acking_mock(int slot_count)
 
 std::string conf_for(const std::string& addr, const std::string& extras = {})
 {
-    return "qwpws::addr=" + addr + ";pool_size=1;pool_reap=manual;" + extras;
+    return "ws::addr=" + addr + ";pool_size=1;pool_reap=manual;" + extras;
 }
 
 } // namespace

@@ -39,7 +39,7 @@
 //!         --example qwp_ws_l1_quotes
 //!
 //! Positional args:
-//!     1: connect string  (default `qwpws::addr=localhost:9000;`)
+//!     1: connect string  (default `ws::addr=localhost:9000;`)
 //!     2: table name      (default `l1_quotes`)
 //!     3: row count       (default 5_000_000)
 //!
@@ -81,7 +81,7 @@ const EXCHANGES: &[&str] = &["NYSE", "NASDAQ", "BATS", "ARCA", "IEX"];
 fn main() -> questdb::Result<()> {
     let conf = std::env::args()
         .nth(1)
-        .unwrap_or_else(|| "qwpws::addr=localhost:9000;".to_string());
+        .unwrap_or_else(|| "ws::addr=localhost:9000;".to_string());
     let table_name = std::env::args()
         .nth(2)
         .unwrap_or_else(|| "l1_quotes".to_string());

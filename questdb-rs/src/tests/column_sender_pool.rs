@@ -570,7 +570,7 @@ fn read_then_close(stream: &mut std::net::TcpStream, stop: &AtomicBool, n: usize
 
 fn conf_for(port: u16, extras: &str) -> String {
     format!(
-        "qwpws::addr=127.0.0.1:{port};auth_timeout=2000;reconnect_max_duration_millis=1000;{extras}"
+        "ws::addr=127.0.0.1:{port};auth_timeout=2000;reconnect_max_duration_millis=1000;{extras}"
     )
 }
 
@@ -582,7 +582,7 @@ fn conf_for_endpoints(ports: &[u16], extras: &str) -> String {
         .map(|p| format!("127.0.0.1:{p}"))
         .collect::<Vec<_>>()
         .join(",");
-    format!("qwpws::addr={addrs};auth_timeout=2000;reconnect_max_duration_millis=1000;{extras}")
+    format!("ws::addr={addrs};auth_timeout=2000;reconnect_max_duration_millis=1000;{extras}")
 }
 
 fn append_one_symbol_row<'a>(chunk: &mut Chunk<'a>, symbol: &'a [u8], timestamp: &'a [i64; 1]) {
@@ -679,7 +679,7 @@ fn sorted_slot_names(sf_dir: &Path) -> Vec<String> {
 fn seed_async_qwp_ws_slot(sf_dir: &Path, sender_id: &str, value: i64) {
     let port = unused_local_port();
     let conf = format!(
-        "qwpws::addr=127.0.0.1:{port};initial_connect_retry=async;\
+        "ws::addr=127.0.0.1:{port};initial_connect_retry=async;\
          sf_dir={};sender_id={sender_id};sf_max_bytes=256;sf_max_total_bytes=1024;\
          close_flush_timeout_millis=0;",
         sf_dir.display()
@@ -959,7 +959,7 @@ fn disk_store_and_forward_duplicate_pool_collides_on_managed_slot() {
     let port = unused_local_port();
     let dir = TempDir::new().unwrap();
     let conf = format!(
-        "qwpws::addr=127.0.0.1:{port};auth_timeout=200;\
+        "ws::addr=127.0.0.1:{port};auth_timeout=200;\
          sf_dir={};sender_id=shared;pool_size=1;pool_max=2;\
          pool_reap=manual;close_flush_timeout_millis=0;",
         dir.path().display()
@@ -991,7 +991,7 @@ fn disk_store_and_forward_duplicate_pool_connect_warn_skips_flocked_slots() {
     let port = unused_local_port();
     let dir = TempDir::new().unwrap();
     let conf = format!(
-        "qwpws::addr=127.0.0.1:{port};auth_timeout=200;initial_connect_retry=async;\
+        "ws::addr=127.0.0.1:{port};auth_timeout=200;initial_connect_retry=async;\
          sf_dir={};sender_id=dupe;pool_size=1;pool_max=1;\
          pool_reap=manual;close_flush_timeout_millis=0;",
         dir.path().display()
@@ -1042,7 +1042,7 @@ fn disk_store_and_forward_restart_replays_reminted_and_out_of_range_managed_slot
     let dir = TempDir::new().unwrap();
     let seed_port = unused_local_port();
     let seed_conf = format!(
-        "qwpws::addr=127.0.0.1:{seed_port};auth_timeout=200;\
+        "ws::addr=127.0.0.1:{seed_port};auth_timeout=200;\
          reconnect_max_duration_millis=100;sf_dir={};sender_id=replay;\
          pool_size=1;pool_max=2;pool_reap=manual;close_flush_timeout_millis=0;",
         dir.path().display()
@@ -1095,7 +1095,7 @@ fn disk_store_and_forward_restart_same_pool_max_replays_in_range_slots_without_b
     let dir = TempDir::new().unwrap();
     let seed_port = unused_local_port();
     let seed_conf = format!(
-        "qwpws::addr=127.0.0.1:{seed_port};auth_timeout=200;\
+        "ws::addr=127.0.0.1:{seed_port};auth_timeout=200;\
          reconnect_max_duration_millis=100;sf_dir={};sender_id=samepool;\
          pool_size=1;pool_max=2;pool_reap=manual;close_flush_timeout_millis=0;",
         dir.path().display()
@@ -1811,7 +1811,7 @@ fn store_and_forward_runner_reconnects_and_replays_after_transport_death() {
     // No `sf_dir` -> in-memory SF; a longer reconnect budget so the runner can
     // rotate to the live endpoint.
     let conf = format!(
-        "qwpws::addr=127.0.0.1:{},127.0.0.1:{};auth_timeout=2000;\
+        "ws::addr=127.0.0.1:{},127.0.0.1:{};auth_timeout=2000;\
          reconnect_max_duration_millis=10000;pool_reap=manual;",
         dead.port(),
         live.port()
@@ -3063,7 +3063,7 @@ fn row_sender_build_failure_releases_in_use_slot() {
     let server = MockServer::spawn_acking(4);
     let port = server.port();
     let db = QuestDb::connect(&format!(
-        "qwpws::addr=127.0.0.1:{port};auth_timeout=500;reconnect_max_duration_millis=100;"
+        "ws::addr=127.0.0.1:{port};auth_timeout=500;reconnect_max_duration_millis=100;"
     ))
     .unwrap();
     drop(server); // the port now refuses connections
@@ -4795,7 +4795,7 @@ fn flush_polars_dataframe_single_endpoint_commits_in_one_pass() {
     use polars::prelude::{IntoColumn, NamedFrom, PlSmallStr, Series};
 
     let (server, frames) = MockServer::spawn_acking_capturing(1);
-    let db = QuestDb::connect(&format!("qwpws::addr=127.0.0.1:{};", server.port())).unwrap();
+    let db = QuestDb::connect(&format!("ws::addr=127.0.0.1:{};", server.port())).unwrap();
 
     let i = Series::new(PlSmallStr::from("i"), &[1i64, 2, 3, 4]).into_column();
     let df = crate::polars_ffi::df_from_columns(vec![i]).unwrap();
@@ -4830,7 +4830,7 @@ fn flush_polars_dataframe_applies_column_overrides() {
     // A Symbol override for a plain Utf8 column must now thread through to every
     // sliced batch and commit cleanly.
     let (server, frames) = MockServer::spawn_acking_capturing(1);
-    let db = QuestDb::connect(&format!("qwpws::addr=127.0.0.1:{};", server.port())).unwrap();
+    let db = QuestDb::connect(&format!("ws::addr=127.0.0.1:{};", server.port())).unwrap();
 
     let s = Series::new(PlSmallStr::from("s"), &["a", "b", "c", "d"]).into_column();
     let i = Series::new(PlSmallStr::from("i"), &[1i64, 2, 3, 4]).into_column();
@@ -4867,7 +4867,7 @@ fn flush_arrow_batch_at_now_commits_in_one_call() {
     // `Ok` ack, and returns the sender to the pool — all without the caller
     // touching a sender.
     let (server, frames) = MockServer::spawn_acking_capturing(1);
-    let db = QuestDb::connect(&format!("qwpws::addr=127.0.0.1:{};", server.port())).unwrap();
+    let db = QuestDb::connect(&format!("ws::addr=127.0.0.1:{};", server.port())).unwrap();
 
     let schema = Arc::new(Schema::new(vec![Field::new("i", DataType::Int64, false)]));
     let arr = Arc::new(Int64Array::from(vec![1i64, 2, 3, 4]));
@@ -4902,7 +4902,7 @@ fn flush_arrow_batch_durable_without_opt_in_is_rejected() {
     // caller-named `Durable` level must be rejected up front rather than
     // accepted without durable opt-in.
     let (server, _frames) = MockServer::spawn_acking_capturing(1);
-    let db = QuestDb::connect(&format!("qwpws::addr=127.0.0.1:{};", server.port())).unwrap();
+    let db = QuestDb::connect(&format!("ws::addr=127.0.0.1:{};", server.port())).unwrap();
 
     let schema = Arc::new(Schema::new(vec![Field::new("i", DataType::Int64, false)]));
     let arr = Arc::new(Int64Array::from(vec![1i64, 2]));
@@ -4925,7 +4925,7 @@ fn flush_arrow_batch_at_column_commits_in_one_call() {
     // The `Some(ts)` arm sources the designated timestamp from the named
     // column and threads through to `flush_arrow_batch_at_column_and_wait`.
     let (server, frames) = MockServer::spawn_acking_capturing(1);
-    let db = QuestDb::connect(&format!("qwpws::addr=127.0.0.1:{};", server.port())).unwrap();
+    let db = QuestDb::connect(&format!("ws::addr=127.0.0.1:{};", server.port())).unwrap();
 
     let schema = Arc::new(Schema::new(vec![
         Field::new("price", DataType::Float64, false),

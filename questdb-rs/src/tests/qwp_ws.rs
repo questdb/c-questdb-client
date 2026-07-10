@@ -85,7 +85,7 @@ fn build_qwp_ws_sender_from_builder(
 fn build_qwp_ws_sender(progress: ProgressCase, port: u16) -> crate::ingress::Sender {
     build_qwp_ws_sender_from_builder(
         progress,
-        SenderBuilder::new(Protocol::QwpWs, "127.0.0.1", port),
+        SenderBuilder::new(Protocol::Ws, "127.0.0.1", port),
     )
 }
 
@@ -1149,7 +1149,7 @@ fn spawn_role_reject_upgrade_server(
 fn seed_orphan_slot(sf_dir: &Path) {
     let seed_port = spawn_upgrade_only_server();
     let seed_conf = format!(
-        "qwpws::addr=127.0.0.1:{seed_port};qwp_ws_progress=manual;\
+        "ws::addr=127.0.0.1:{seed_port};qwp_ws_progress=manual;\
          sf_dir={};sender_id=orphan;sf_max_bytes=256;sf_max_total_bytes=1024;",
         sf_dir.display()
     );
@@ -1178,7 +1178,7 @@ fn seed_orphan_slot(sf_dir: &Path) {
 fn qwp_ws_round_trip_minimal_message() {
     let (port, rx) = spawn_mock_server();
 
-    let mut sender = SenderBuilder::new(Protocol::QwpWs, "127.0.0.1", port)
+    let mut sender = SenderBuilder::new(Protocol::Ws, "127.0.0.1", port)
         .build()
         .unwrap();
     let mut buf = sender.new_buffer();
@@ -1237,7 +1237,7 @@ fn qwp_ws_max_buf_size_allows_frame_when_encoded_replay_len_fits_in_all_progress
     for progress in [ProgressCase::Background, ProgressCase::Manual] {
         let max = 1024;
         let (port, rx) = spawn_mock_server();
-        let builder = SenderBuilder::new(Protocol::QwpWs, "127.0.0.1", port)
+        let builder = SenderBuilder::new(Protocol::Ws, "127.0.0.1", port)
             .max_buf_size(max)
             .unwrap();
         let mut sender = match progress {
@@ -1293,7 +1293,7 @@ fn qwp_ws_max_buf_size_rejects_oversized_replay_frame_in_all_progress_modes() {
         let max = encoded_len - 1;
 
         let port = spawn_upgrade_only_server();
-        let builder = SenderBuilder::new(Protocol::QwpWs, "127.0.0.1", port)
+        let builder = SenderBuilder::new(Protocol::Ws, "127.0.0.1", port)
             .max_buf_size(max)
             .unwrap();
         let mut sender = match progress {
@@ -1551,7 +1551,7 @@ fn qwp_ws_backpressure_timeout_matches_in_all_progress_modes() {
     for progress in [ProgressCase::Background, ProgressCase::Manual] {
         let (port, frame_rx, release_tx) = spawn_stalled_after_first_frame_server();
         let conf = format!(
-            "qwpws::addr=127.0.0.1:{port};\
+            "ws::addr=127.0.0.1:{port};\
              qwp_ws_progress={};\
              max_in_flight=1;\
              sf_append_deadline_millis=20;",
@@ -1610,7 +1610,7 @@ fn qwp_ws_durable_ack_requires_upgrade_echo() {
         request_tx.send(request_lines).unwrap();
     });
 
-    let conf = format!("qwpws::addr=127.0.0.1:{port};request_durable_ack=on;");
+    let conf = format!("ws::addr=127.0.0.1:{port};request_durable_ack=on;");
     let err = SenderBuilder::from_conf(conf).unwrap().build().unwrap_err();
     assert!(
         err.msg().contains("server did not enable durable ACK"),
@@ -1676,7 +1676,7 @@ fn qwp_ws_durable_ack_completion_waits_for_durable_confirmation_in_all_progress_
         });
 
         let conf = format!(
-            "qwpws::addr=127.0.0.1:{port};\
+            "ws::addr=127.0.0.1:{port};\
              qwp_ws_progress={};\
              request_durable_ack=on;\
              durable_ack_keepalive_interval_millis=1;",
@@ -1761,7 +1761,7 @@ fn qwp_ws_sender_fsn_watermarks_and_close_drain_work_in_all_progress_modes() {
 #[test]
 fn sender_sfa_fully_delivered_tracks_ok_and_durable_watermarks() {
     let (port, frame_rx, ok_tx, durable_tx) = spawn_delayed_durable_ack_server();
-    let conf = format!("qwpws::addr=127.0.0.1:{port};request_durable_ack=on;");
+    let conf = format!("ws::addr=127.0.0.1:{port};request_durable_ack=on;");
     let mut sender = SenderBuilder::from_conf(conf).unwrap().build().unwrap();
     assert!(sender.sfa_fully_delivered(false));
     assert!(sender.sfa_fully_delivered(true));
@@ -1829,7 +1829,7 @@ fn qwp_ws_close_flush_timeout_minus_one_skips_close_drain_wait() {
         thread::sleep(Duration::from_millis(500));
     });
 
-    let conf = format!("qwpws::addr=127.0.0.1:{port};close_flush_timeout_millis=-1;");
+    let conf = format!("ws::addr=127.0.0.1:{port};close_flush_timeout_millis=-1;");
     let mut sender = SenderBuilder::from_conf(&conf).unwrap().build().unwrap();
     let mut buf = sender.new_buffer();
     buf.table("trades")
@@ -1876,7 +1876,7 @@ fn qwp_ws_public_sender_batch_throughput_benchmark() {
     assert!(in_flight > 1);
 
     let (port, server) = spawn_ack_each_frame_server();
-    let conf = format!("qwpws::addr=127.0.0.1:{port};in_flight_window={in_flight};");
+    let conf = format!("ws::addr=127.0.0.1:{port};in_flight_window={in_flight};");
     let mut sender = SenderBuilder::from_conf(conf).unwrap().build().unwrap();
     let mut buffer = sender.new_buffer();
 
@@ -2003,7 +2003,7 @@ fn qwp_ws_manual_sender_can_pipeline_before_waiting() {
         thread::sleep(Duration::from_millis(50));
     });
 
-    let mut sender = SenderBuilder::new(Protocol::QwpWs, "127.0.0.1", port)
+    let mut sender = SenderBuilder::new(Protocol::Ws, "127.0.0.1", port)
         .max_in_flight(2)
         .unwrap()
         .qwp_ws_progress(QwpWsProgress::Manual)
@@ -2094,7 +2094,7 @@ fn qwp_ws_manual_sender_schema_rejection_terminalizes_without_ack_advance() {
         thread::sleep(Duration::from_millis(50));
     });
 
-    let mut sender = SenderBuilder::new(Protocol::QwpWs, "127.0.0.1", port)
+    let mut sender = SenderBuilder::new(Protocol::Ws, "127.0.0.1", port)
         .qwp_ws_progress(QwpWsProgress::Manual)
         .unwrap()
         .build()
@@ -2147,7 +2147,7 @@ fn qwp_ws_store_and_forward_config_opens_java_slot_layout() {
     let (port, rx) = spawn_mock_server();
     let sf_dir = tempfile::TempDir::new().unwrap();
     let conf = format!(
-        "qwpws::addr=127.0.0.1:{port};sf_dir={};sender_id=primary;",
+        "ws::addr=127.0.0.1:{port};sf_dir={};sender_id=primary;",
         sf_dir.path().display()
     );
 
@@ -2170,7 +2170,7 @@ fn qwp_ws_store_and_forward_config_opens_java_slot_layout() {
 fn qwp_ws_store_and_forward_rejects_one_segment_total_capacity() {
     let sf_dir = tempfile::TempDir::new().unwrap();
     let conf = format!(
-        "qwpws::addr=127.0.0.1:1;sf_dir={};sender_id=primary;\
+        "ws::addr=127.0.0.1:1;sf_dir={};sender_id=primary;\
          sf_max_bytes=256;sf_max_total_bytes=256;",
         sf_dir.path().display()
     );
@@ -2196,7 +2196,7 @@ fn qwp_ws_manual_orphan_drainer_replays_sibling_slot() {
     let seed_port = spawn_upgrade_only_server();
     let sf_dir = tempfile::TempDir::new().unwrap();
     let seed_conf = format!(
-        "qwpws::addr=127.0.0.1:{seed_port};qwp_ws_progress=manual;\
+        "ws::addr=127.0.0.1:{seed_port};qwp_ws_progress=manual;\
          sf_dir={};sender_id=orphan;sf_max_bytes=256;sf_max_total_bytes=1024;",
         sf_dir.path().display()
     );
@@ -2220,7 +2220,7 @@ fn qwp_ws_manual_orphan_drainer_replays_sibling_slot() {
 
     let (port, rx) = spawn_manual_orphan_drain_server();
     let drain_conf = format!(
-        "qwpws::addr=127.0.0.1:{port};qwp_ws_progress=manual;\
+        "ws::addr=127.0.0.1:{port};qwp_ws_progress=manual;\
          sf_dir={};sender_id=primary;drain_orphans=on;\
          max_background_drainers=1;sf_max_bytes=256;sf_max_total_bytes=1024;",
         sf_dir.path().display()
@@ -2321,7 +2321,7 @@ fn qwp_ws_orphan_drain_heals_a_zero_extended_side_file_and_replays_via_delta() {
 
     let (port, rx) = spawn_orphan_capture_first_frame_server();
     let drain_conf = format!(
-        "qwpws::addr=127.0.0.1:{port};qwp_ws_progress=manual;\
+        "ws::addr=127.0.0.1:{port};qwp_ws_progress=manual;\
          sf_dir={};sender_id=primary;drain_orphans=on;\
          max_background_drainers=1;sf_max_bytes=256;sf_max_total_bytes=1024;",
         sf_dir.path().display()
@@ -2371,7 +2371,7 @@ fn qwp_ws_manual_orphan_drainer_walks_endpoint_list() {
     let (port, rx) = spawn_manual_orphan_drain_server();
     drop(bad_listener);
     let drain_conf = format!(
-        "qwpws::addr=127.0.0.1:{bad_port},127.0.0.1:{port};qwp_ws_progress=manual;\
+        "ws::addr=127.0.0.1:{bad_port},127.0.0.1:{port};qwp_ws_progress=manual;\
          sf_dir={};sender_id=primary;drain_orphans=on;\
          max_background_drainers=1;sf_max_bytes=256;sf_max_total_bytes=1024;",
         sf_dir.path().display()
@@ -2407,7 +2407,7 @@ fn qwp_ws_manual_orphan_drainer_role_reject_tries_next_endpoint() {
     let (reject_port, reject_handle) = spawn_role_reject_upgrade_server(2, "REPLICA");
     let (port, rx) = spawn_manual_orphan_drain_server();
     let drain_conf = format!(
-        "qwpws::addr=127.0.0.1:{reject_port},127.0.0.1:{port};qwp_ws_progress=manual;\
+        "ws::addr=127.0.0.1:{reject_port},127.0.0.1:{port};qwp_ws_progress=manual;\
          sf_dir={};sender_id=primary;drain_orphans=on;\
          max_background_drainers=1;sf_max_bytes=256;sf_max_total_bytes=1024;",
         sf_dir.path().display()
@@ -2443,7 +2443,7 @@ fn qwp_ws_manual_orphan_drainer_terminal_reject_leaves_slot_recoverable() {
 
     let (port, rx) = spawn_manual_orphan_reject_server(QWP_STATUS_PARSE_ERROR);
     let drain_conf = format!(
-        "qwpws::addr=127.0.0.1:{port};qwp_ws_progress=manual;\
+        "ws::addr=127.0.0.1:{port};qwp_ws_progress=manual;\
          sf_dir={};sender_id=primary;drain_orphans=on;\
          max_background_drainers=1;sf_max_bytes=256;sf_max_total_bytes=1024;",
         sf_dir.path().display()
@@ -2483,7 +2483,7 @@ fn qwp_ws_background_orphan_close_is_bounded_and_leaves_orphan_recoverable() {
     let seed_port = spawn_upgrade_only_server();
     let sf_dir = tempfile::TempDir::new().unwrap();
     let seed_conf = format!(
-        "qwpws::addr=127.0.0.1:{seed_port};qwp_ws_progress=manual;\
+        "ws::addr=127.0.0.1:{seed_port};qwp_ws_progress=manual;\
          sf_dir={};sender_id=orphan;sf_max_bytes=256;sf_max_total_bytes=1024;",
         sf_dir.path().display()
     );
@@ -2509,7 +2509,7 @@ fn qwp_ws_background_orphan_close_is_bounded_and_leaves_orphan_recoverable() {
 
     let (port, rx, release_stalled_orphan) = spawn_stalled_background_orphan_drain_server();
     let drain_conf = format!(
-        "qwpws::addr=127.0.0.1:{port};\
+        "ws::addr=127.0.0.1:{port};\
          sf_dir={};sender_id=primary;drain_orphans=on;\
          max_background_drainers=1;sf_max_bytes=256;sf_max_total_bytes=1024;",
         sf_dir.path().display()
@@ -2539,7 +2539,7 @@ fn qwp_ws_background_orphan_close_is_bounded_and_leaves_orphan_recoverable() {
     // both and acks the data frame.
     let (recover_port, recover_rx) = spawn_recovery_mock_server();
     let recover_conf = format!(
-        "qwpws::addr=127.0.0.1:{recover_port};\
+        "ws::addr=127.0.0.1:{recover_port};\
          sf_dir={};sender_id=orphan;sf_max_bytes=256;sf_max_total_bytes=1024;",
         sf_dir.path().display()
     );
@@ -2602,7 +2602,7 @@ fn qwp_ws_subsequent_message_delta_encodes_dictionary_and_reemits_full_schema() 
         thread::sleep(Duration::from_millis(50));
     });
 
-    let mut sender = SenderBuilder::new(Protocol::QwpWs, "127.0.0.1", port)
+    let mut sender = SenderBuilder::new(Protocol::Ws, "127.0.0.1", port)
         .build()
         .unwrap();
     let mut buf = sender.new_buffer();
@@ -2686,7 +2686,7 @@ fn qwp_ws_replay_full_schema_used_when_columns_match() {
         thread::sleep(Duration::from_millis(50));
     });
 
-    let mut sender = SenderBuilder::new(Protocol::QwpWs, "127.0.0.1", port)
+    let mut sender = SenderBuilder::new(Protocol::Ws, "127.0.0.1", port)
         .build()
         .unwrap();
 
@@ -2764,7 +2764,7 @@ fn qwp_ws_full_schema_re_emitted_when_columns_change() {
         thread::sleep(Duration::from_millis(50));
     });
 
-    let mut sender = SenderBuilder::new(Protocol::QwpWs, "127.0.0.1", port)
+    let mut sender = SenderBuilder::new(Protocol::Ws, "127.0.0.1", port)
         .build()
         .unwrap();
 
@@ -2877,7 +2877,7 @@ fn qwp_ws_server_error_response_is_surfaced() {
         thread::sleep(Duration::from_millis(50));
     });
 
-    let mut sender = SenderBuilder::new(Protocol::QwpWs, "127.0.0.1", port)
+    let mut sender = SenderBuilder::new(Protocol::Ws, "127.0.0.1", port)
         .qwp_ws_error_handler(move |error| {
             error_tx.send(error.clone()).unwrap();
         })
@@ -2982,7 +2982,7 @@ fn qwp_ws_schema_rejection_terminalizes_and_notifies_handler() {
         thread::sleep(Duration::from_millis(50));
     });
 
-    let mut sender = SenderBuilder::new(Protocol::QwpWs, "127.0.0.1", port)
+    let mut sender = SenderBuilder::new(Protocol::Ws, "127.0.0.1", port)
         .qwp_ws_error_handler(move |error| {
             error_tx.send(error.clone()).unwrap();
         })
@@ -3051,7 +3051,7 @@ fn qwp_ws_repeated_head_close_poison_is_pollable_as_protocol_violation() {
         thread::sleep(Duration::from_millis(50));
     });
 
-    let mut sender = SenderBuilder::new(Protocol::QwpWs, "127.0.0.1", port)
+    let mut sender = SenderBuilder::new(Protocol::Ws, "127.0.0.1", port)
         .max_frame_rejections(1)
         .unwrap()
         .poison_min_escalation_window(Duration::ZERO)
@@ -3165,7 +3165,7 @@ fn qwp_ws_orderly_close_reconnects_without_poison_strike() {
         }
     });
 
-    let mut sender = SenderBuilder::new(Protocol::QwpWs, "127.0.0.1", port)
+    let mut sender = SenderBuilder::new(Protocol::Ws, "127.0.0.1", port)
         .max_frame_rejections(1)
         .unwrap()
         .poison_min_escalation_window(Duration::ZERO)
@@ -3201,7 +3201,7 @@ fn qwp_ws_orderly_close_reconnects_without_poison_strike() {
 fn run_paced_recycle_scenario(action: RecycleServerAction) -> usize {
     let run_for = Duration::from_millis(900);
     let (port, handle) = spawn_recycling_server(action, run_for);
-    let mut sender = SenderBuilder::new(Protocol::QwpWs, "127.0.0.1", port)
+    let mut sender = SenderBuilder::new(Protocol::Ws, "127.0.0.1", port)
         .max_frame_rejections(1000)
         .unwrap()
         .poison_min_escalation_window(Duration::from_secs(60))
@@ -3270,7 +3270,7 @@ where
         thread::sleep(Duration::from_millis(50));
     });
 
-    let mut sender = SenderBuilder::new(Protocol::QwpWs, "127.0.0.1", port)
+    let mut sender = SenderBuilder::new(Protocol::Ws, "127.0.0.1", port)
         .build()
         .unwrap();
     let mut buf = sender.new_buffer();
@@ -3499,7 +3499,7 @@ fn qwp_ws_high_level_flush_returns_before_ack() {
         thread::sleep(Duration::from_millis(50));
     });
 
-    let mut sender = SenderBuilder::new(Protocol::QwpWs, "127.0.0.1", port)
+    let mut sender = SenderBuilder::new(Protocol::Ws, "127.0.0.1", port)
         .build()
         .unwrap();
     let mut buf = sender.new_buffer();
@@ -3541,7 +3541,7 @@ fn qwp_ws_high_level_flush_and_keep_returns_before_ack_and_preserves_buffer() {
         thread::sleep(Duration::from_millis(50));
     });
 
-    let mut sender = SenderBuilder::new(Protocol::QwpWs, "127.0.0.1", port)
+    let mut sender = SenderBuilder::new(Protocol::Ws, "127.0.0.1", port)
         .build()
         .unwrap();
     let mut buf = sender.new_buffer();
@@ -3587,7 +3587,7 @@ fn qwp_ws_high_level_flushes_pipeline_before_ack() {
         thread::sleep(Duration::from_millis(50));
     });
 
-    let mut sender = SenderBuilder::new(Protocol::QwpWs, "127.0.0.1", port)
+    let mut sender = SenderBuilder::new(Protocol::Ws, "127.0.0.1", port)
         .max_in_flight(2)
         .unwrap()
         .build()
@@ -3678,7 +3678,7 @@ fn spawn_dropping_then_recovering_server() -> (u16, std::sync::mpsc::Receiver<Ve
 fn qwp_ws_reconnects_and_replays_in_all_progress_modes() {
     for progress in [ProgressCase::Background, ProgressCase::Manual] {
         let (port, rx) = spawn_dropping_then_recovering_server();
-        let builder = SenderBuilder::new(Protocol::QwpWs, "127.0.0.1", port)
+        let builder = SenderBuilder::new(Protocol::Ws, "127.0.0.1", port)
             .reconnect_initial_backoff(Duration::from_millis(20))
             .unwrap()
             .reconnect_max_backoff(Duration::from_millis(50))
@@ -3771,7 +3771,7 @@ fn qwp_ws_reconnect_catch_up_re_registers_the_real_multi_symbol_dictionary() {
     // unit tests yet corrupt recovery, so assert an integration catch-up carries
     // exactly the multi-symbol dictionary the real encoder produced, in id order.
     let (port, rx) = spawn_reconnect_forwarding_catch_up_server();
-    let builder = SenderBuilder::new(Protocol::QwpWs, "127.0.0.1", port)
+    let builder = SenderBuilder::new(Protocol::Ws, "127.0.0.1", port)
         .reconnect_initial_backoff(Duration::from_millis(20))
         .unwrap()
         .reconnect_max_backoff(Duration::from_millis(50))
@@ -3845,7 +3845,7 @@ fn qwp_ws_midstream_failure_reconnects_to_next_endpoint() {
     });
 
     let conf = format!(
-        "qwpws::addr=127.0.0.1:{first_port},127.0.0.1:{second_port};\
+        "ws::addr=127.0.0.1:{first_port},127.0.0.1:{second_port};\
          reconnect_initial_backoff_millis=1;\
          reconnect_max_backoff_millis=1;\
          reconnect_max_duration_millis=5000;"
@@ -3921,7 +3921,7 @@ fn qwp_ws_sync_reconnect_retries_failed_attempt() {
         thread::sleep(Duration::from_millis(50));
     });
 
-    let mut sender = SenderBuilder::new(Protocol::QwpWs, "127.0.0.1", port)
+    let mut sender = SenderBuilder::new(Protocol::Ws, "127.0.0.1", port)
         .reconnect_initial_backoff(Duration::from_millis(1))
         .unwrap()
         .reconnect_max_backoff(Duration::from_millis(1))
@@ -4001,7 +4001,7 @@ fn qwp_ws_sync_initial_connect_retry_survives_dropped_upgrade() {
         thread::sleep(Duration::from_millis(50));
     });
 
-    let mut sender = SenderBuilder::new(Protocol::QwpWs, "127.0.0.1", port)
+    let mut sender = SenderBuilder::new(Protocol::Ws, "127.0.0.1", port)
         .initial_connect_retry(true)
         .unwrap()
         .reconnect_initial_backoff(Duration::from_millis(1))
@@ -4052,7 +4052,7 @@ fn qwp_ws_initial_connect_walks_endpoint_list_in_off_mode() {
         thread::sleep(Duration::from_millis(50));
     });
 
-    let conf = format!("qwpws::addr=127.0.0.1:{bad_port},127.0.0.1:{good_port};");
+    let conf = format!("ws::addr=127.0.0.1:{bad_port},127.0.0.1:{good_port};");
     let mut sender = SenderBuilder::from_conf(&conf).unwrap().build().unwrap();
 
     let mut buf = sender.new_buffer();
@@ -4107,7 +4107,7 @@ fn qwp_ws_initial_connect_role_reject_tries_next_endpoint() {
         thread::sleep(Duration::from_millis(50));
     });
 
-    let conf = format!("qwpws::addr=127.0.0.1:{first_port},127.0.0.1:{second_port};");
+    let conf = format!("ws::addr=127.0.0.1:{first_port},127.0.0.1:{second_port};");
     let mut sender = SenderBuilder::from_conf(&conf).unwrap().build().unwrap();
 
     let mut buf = sender.new_buffer();
@@ -4161,7 +4161,7 @@ fn qwp_ws_initial_connect_retryable_status_tries_next_endpoint() {
         thread::sleep(Duration::from_millis(50));
     });
 
-    let conf = format!("qwpws::addr=127.0.0.1:{first_port},127.0.0.1:{second_port};");
+    let conf = format!("ws::addr=127.0.0.1:{first_port},127.0.0.1:{second_port};");
     let mut sender = SenderBuilder::from_conf(&conf).unwrap().build().unwrap();
 
     let mut buf = sender.new_buffer();
@@ -4219,7 +4219,7 @@ fn qwp_ws_initial_connect_mixed_role_and_transport_prefers_role_mismatch() {
     });
 
     let conf = format!(
-        "qwpws::addr=127.0.0.1:{role_port},127.0.0.1:{status_port};\
+        "ws::addr=127.0.0.1:{role_port},127.0.0.1:{status_port};\
          initial_connect_retry=off;"
     );
     let result = SenderBuilder::from_conf(&conf).unwrap().build();
@@ -4262,7 +4262,7 @@ fn qwp_ws_initial_connect_unsupported_version_tries_next_endpoint() {
         thread::sleep(Duration::from_millis(50));
     });
 
-    let conf = format!("qwpws::addr=127.0.0.1:{first_port},127.0.0.1:{second_port};");
+    let conf = format!("ws::addr=127.0.0.1:{first_port},127.0.0.1:{second_port};");
     let mut sender = SenderBuilder::from_conf(&conf).unwrap().build().unwrap();
 
     let mut buf = sender.new_buffer();
@@ -4335,7 +4335,7 @@ fn qwp_ws_sync_initial_retry_unsupported_version_retries_next_round() {
     };
 
     let conf = format!(
-        "qwpws::addr=127.0.0.1:{first_port},127.0.0.1:{second_port};\
+        "ws::addr=127.0.0.1:{first_port},127.0.0.1:{second_port};\
          initial_connect_retry=sync;\
          reconnect_initial_backoff_millis=1;\
          reconnect_max_backoff_millis=1;\
@@ -4418,7 +4418,7 @@ fn qwp_ws_sync_initial_retry_malformed_101_retries_after_round_exhaustion() {
     };
 
     let conf = format!(
-        "qwpws::addr=127.0.0.1:{first_port},127.0.0.1:{second_port};\
+        "ws::addr=127.0.0.1:{first_port},127.0.0.1:{second_port};\
          initial_connect_retry=sync;\
          reconnect_initial_backoff_millis=1;\
          reconnect_max_backoff_millis=1;\
@@ -4486,7 +4486,7 @@ fn qwp_ws_sync_initial_retry_mixed_role_and_transport_prefers_role_mismatch() {
     });
 
     let conf = format!(
-        "qwpws::addr=127.0.0.1:{role_port},127.0.0.1:{status_port};\
+        "ws::addr=127.0.0.1:{role_port},127.0.0.1:{status_port};\
          initial_connect_retry=sync;\
          reconnect_initial_backoff_millis=10;\
          reconnect_max_backoff_millis=10;\
@@ -4546,7 +4546,7 @@ fn qwp_ws_initial_connect_durable_ack_mismatch_tries_next_endpoint() {
     });
 
     let conf = format!(
-        "qwpws::addr=127.0.0.1:{first_port},127.0.0.1:{second_port};\
+        "ws::addr=127.0.0.1:{first_port},127.0.0.1:{second_port};\
          request_durable_ack=on;"
     );
     let mut sender = SenderBuilder::from_conf(&conf).unwrap().build().unwrap();
@@ -4572,7 +4572,7 @@ fn qwp_ws_sync_initial_retry_durable_ack_all_role_rejects_retry_until_budget() {
     let (second_port, second_handle) = spawn_role_reject_upgrade_server(1, "REPLICA");
 
     let conf = format!(
-        "qwpws::addr=127.0.0.1:{first_port},127.0.0.1:{second_port};\
+        "ws::addr=127.0.0.1:{first_port},127.0.0.1:{second_port};\
          request_durable_ack=on;\
          initial_connect_retry=sync;\
          reconnect_initial_backoff_millis=100;\
@@ -4602,7 +4602,7 @@ fn qwp_ws_sync_initial_retry_budget_exhaustion_reports_context() {
     drop(probe);
 
     let conf = format!(
-        "qwpws::addr=127.0.0.1:{port};\
+        "ws::addr=127.0.0.1:{port};\
          initial_connect_retry=sync;\
          reconnect_initial_backoff_millis=10;\
          reconnect_max_backoff_millis=10;\
@@ -4718,7 +4718,7 @@ fn qwp_ws_sync_initial_retry_resets_non_healthy_between_rounds() {
     });
 
     let conf = format!(
-        "qwpws::addr=127.0.0.1:{first_port},127.0.0.1:{second_port};\
+        "ws::addr=127.0.0.1:{first_port},127.0.0.1:{second_port};\
          initial_connect_retry=sync;\
          reconnect_initial_backoff_millis=100;\
          reconnect_max_backoff_millis=100;\
@@ -4761,7 +4761,7 @@ fn qwp_ws_async_initial_connect_background_can_flush() {
         thread::sleep(Duration::from_millis(50));
     });
 
-    let conf = format!("qwpws::addr=127.0.0.1:{port};initial_connect_retry=async;");
+    let conf = format!("ws::addr=127.0.0.1:{port};initial_connect_retry=async;");
     let mut sender = SenderBuilder::from_conf(&conf).unwrap().build().unwrap();
 
     let mut buf = sender.new_buffer();
@@ -4781,7 +4781,7 @@ fn qwp_ws_async_initial_connect_background_can_flush() {
 
 #[test]
 fn qwp_ws_async_initial_connect_rejects_manual_progress() {
-    let conf = "qwpws::addr=127.0.0.1:1;\
+    let conf = "ws::addr=127.0.0.1:1;\
                 initial_connect_retry=async;\
                 qwp_ws_progress=manual;";
     let err = SenderBuilder::from_conf(conf).unwrap().build().unwrap_err();
@@ -4797,7 +4797,7 @@ fn qwp_ws_async_initial_connect_rejects_manual_progress() {
 fn qwp_ws_from_conf_parses_java_reconnect_keys() {
     // Just exercises the parser surface: every new key is accepted. Building
     // would also work but isn't necessary for parser coverage.
-    let conf = "qwpws::addr=localhost:9000;\
+    let conf = "ws::addr=localhost:9000;\
                 max_in_flight=64;\
                 reconnect_max_duration_millis=20000;\
                 reconnect_initial_backoff_millis=200;\
@@ -4808,19 +4808,19 @@ fn qwp_ws_from_conf_parses_java_reconnect_keys() {
                 durable_ack_keepalive_interval_millis=250;";
     SenderBuilder::from_conf(conf).unwrap();
 
-    let disabled_keepalive = "qwpws::addr=localhost:9000;durable_ack_keepalive_interval_millis=0;";
+    let disabled_keepalive = "ws::addr=localhost:9000;durable_ack_keepalive_interval_millis=0;";
     SenderBuilder::from_conf(disabled_keepalive).unwrap();
 
-    let conf_sync = "qwpws::addr=localhost:9000;initial_connect_retry=sync;";
+    let conf_sync = "ws::addr=localhost:9000;initial_connect_retry=sync;";
     SenderBuilder::from_conf(conf_sync).unwrap();
 
-    let conf_false = "qwpws::addr=localhost:9000;initial_connect_retry=false;";
+    let conf_false = "ws::addr=localhost:9000;initial_connect_retry=false;";
     SenderBuilder::from_conf(conf_false).unwrap();
 
-    let conf_multi = "qwpws::addr=localhost:9000, localhost:9001;addr=localhost:9002;";
+    let conf_multi = "ws::addr=localhost:9000, localhost:9001;addr=localhost:9002;";
     SenderBuilder::from_conf(conf_multi).unwrap();
 
-    let zone_ignored = "qwpws::addr=localhost:9000;zone=dc-amsterdam;";
+    let zone_ignored = "ws::addr=localhost:9000;zone=dc-amsterdam;";
     SenderBuilder::from_conf(zone_ignored).unwrap();
 
     #[cfg(feature = "sync-sender-tcp")]
@@ -4831,14 +4831,14 @@ fn qwp_ws_from_conf_parses_java_reconnect_keys() {
 
     // Java Sender ignores unknown keys; this is parser compatibility, not
     // target-selection support.
-    let target_ignored = "qwpws::addr=localhost:9000;target=primary;";
+    let target_ignored = "ws::addr=localhost:9000;target=primary;";
     SenderBuilder::from_conf(target_ignored).unwrap();
 
-    let duplicate = "qwpws::addr=localhost:9000,localhost:9000;";
+    let duplicate = "ws::addr=localhost:9000,localhost:9000;";
     let err = SenderBuilder::from_conf(duplicate).unwrap_err();
     assert!(err.msg().contains("duplicate"), "got: {}", err.msg());
 
-    let duplicate_effective_port = "qwpws::addr=localhost:9000,localhost:09000;";
+    let duplicate_effective_port = "ws::addr=localhost:9000,localhost:09000;";
     let err = SenderBuilder::from_conf(duplicate_effective_port).unwrap_err();
     assert!(
         err.msg().contains("duplicate") && err.msg().contains("localhost:9000"),
@@ -4846,19 +4846,19 @@ fn qwp_ws_from_conf_parses_java_reconnect_keys() {
         err.msg()
     );
 
-    let empty_entry = "qwpws::addr=localhost:9000,,localhost:9001;";
+    let empty_entry = "ws::addr=localhost:9000,,localhost:9001;";
     let err = SenderBuilder::from_conf(empty_entry).unwrap_err();
     assert!(err.msg().contains("empty entry"), "got: {}", err.msg());
 
-    let empty_host = "qwpws::addr=:9000;";
+    let empty_host = "ws::addr=:9000;";
     let err = SenderBuilder::from_conf(empty_host).unwrap_err();
     assert!(err.msg().contains("empty host"), "got: {}", err.msg());
 
-    let invalid_port = "qwpws::addr=localhost:notaport;";
+    let invalid_port = "ws::addr=localhost:notaport;";
     let err = SenderBuilder::from_conf(invalid_port).unwrap_err();
     assert!(err.msg().contains("invalid port"), "got: {}", err.msg());
 
-    let zero_port = "qwpws::addr=localhost:0;";
+    let zero_port = "ws::addr=localhost:0;";
     let err = SenderBuilder::from_conf(zero_port).unwrap_err();
     assert!(err.msg().contains("invalid port"), "got: {}", err.msg());
 
@@ -4873,10 +4873,10 @@ fn qwp_ws_from_conf_parses_java_reconnect_keys() {
         );
     }
 
-    let conf_async = "qwpws::addr=localhost:9000;initial_connect_retry=async;";
+    let conf_async = "ws::addr=localhost:9000;initial_connect_retry=async;";
     SenderBuilder::from_conf(conf_async).unwrap();
 
-    let bad = "qwpws::addr=localhost:9000;initial_connect_retry=maybe;";
+    let bad = "ws::addr=localhost:9000;initial_connect_retry=maybe;";
     let err = SenderBuilder::from_conf(bad).unwrap_err();
     assert!(
         err.msg().contains("initial_connect_retry"),
@@ -4967,7 +4967,7 @@ fn server_max_batch_size_clamps_flush_below_configured_max_in_all_progress_modes
     for progress in [ProgressCase::Background, ProgressCase::Manual] {
         let server_cap: usize = 512;
         let port = spawn_max_batch_size_upgrade_only_server(Some(server_cap));
-        let builder = SenderBuilder::new(Protocol::QwpWs, "127.0.0.1", port)
+        let builder = SenderBuilder::new(Protocol::Ws, "127.0.0.1", port)
             .max_buf_size(100 * 1024 * 1024)
             .unwrap();
         let mut sender = build_qwp_ws_sender_from_builder(progress, builder);
@@ -5008,7 +5008,7 @@ fn server_max_batch_size_allows_flush_when_encoded_fits_in_all_progress_modes() 
     for progress in [ProgressCase::Background, ProgressCase::Manual] {
         let server_cap: usize = 100 * 1024;
         let (port, rx) = spawn_max_batch_size_server(Some(server_cap));
-        let builder = SenderBuilder::new(Protocol::QwpWs, "127.0.0.1", port)
+        let builder = SenderBuilder::new(Protocol::Ws, "127.0.0.1", port)
             .max_buf_size(100 * 1024 * 1024)
             .unwrap();
         let mut sender = build_qwp_ws_sender_from_builder(progress, builder);
@@ -5041,7 +5041,7 @@ fn absent_server_max_batch_size_falls_back_to_configured_max_in_all_progress_mod
     for progress in [ProgressCase::Background, ProgressCase::Manual] {
         let configured_max: usize = 1024;
         let port = spawn_max_batch_size_upgrade_only_server(None);
-        let builder = SenderBuilder::new(Protocol::QwpWs, "127.0.0.1", port)
+        let builder = SenderBuilder::new(Protocol::Ws, "127.0.0.1", port)
             .max_buf_size(configured_max)
             .unwrap();
         let mut sender = build_qwp_ws_sender_from_builder(progress, builder);
@@ -5076,7 +5076,7 @@ fn configured_max_wins_when_smaller_than_server_cap_in_all_progress_modes() {
         let configured_max: usize = 1024;
         let server_cap: usize = 16 * 1024 * 1024;
         let port = spawn_max_batch_size_upgrade_only_server(Some(server_cap));
-        let builder = SenderBuilder::new(Protocol::QwpWs, "127.0.0.1", port)
+        let builder = SenderBuilder::new(Protocol::Ws, "127.0.0.1", port)
             .max_buf_size(configured_max)
             .unwrap();
         let mut sender = build_qwp_ws_sender_from_builder(progress, builder);
@@ -5115,7 +5115,7 @@ fn server_cap_prevents_message_too_big_by_rejecting_locally_in_all_progress_mode
     for progress in [ProgressCase::Background, ProgressCase::Manual] {
         let server_cap: usize = 2048;
         let (port, _rx) = spawn_max_batch_size_server(Some(server_cap));
-        let builder = SenderBuilder::new(Protocol::QwpWs, "127.0.0.1", port)
+        let builder = SenderBuilder::new(Protocol::Ws, "127.0.0.1", port)
             .max_buf_size(100 * 1024 * 1024)
             .unwrap();
         let mut sender = build_qwp_ws_sender_from_builder(progress, builder);
@@ -5165,7 +5165,7 @@ fn server_cap_at_exact_boundary_allows_flush_in_all_progress_modes() {
 
         let server_cap = encoded_len;
         let (port, rx) = spawn_max_batch_size_server(Some(server_cap));
-        let builder = SenderBuilder::new(Protocol::QwpWs, "127.0.0.1", port)
+        let builder = SenderBuilder::new(Protocol::Ws, "127.0.0.1", port)
             .max_buf_size(100 * 1024 * 1024)
             .unwrap();
         let mut sender = build_qwp_ws_sender_from_builder(progress, builder);
@@ -5199,7 +5199,7 @@ fn server_cap_one_byte_below_encoded_len_rejects_flush_in_all_progress_modes() {
 
         let server_cap = encoded_len - 1;
         let port = spawn_max_batch_size_upgrade_only_server(Some(server_cap));
-        let builder = SenderBuilder::new(Protocol::QwpWs, "127.0.0.1", port)
+        let builder = SenderBuilder::new(Protocol::Ws, "127.0.0.1", port)
             .max_buf_size(100 * 1024 * 1024)
             .unwrap();
         let mut sender = build_qwp_ws_sender_from_builder(progress, builder);

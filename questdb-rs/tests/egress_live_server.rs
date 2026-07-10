@@ -84,9 +84,9 @@ fn make_sender(srv: &QuestDbServer, version: ProtocolVersion) -> Sender {
 /// QWP/WebSocket ingress sender. Used by the IPv4 / BINARY round-trip
 /// tests below: those wire types are QWP-only — the ILP/HTTP `Sender`
 /// has no `column_ipv4` / `column_binary` API at all — so the only
-/// way to exercise their ingress path is via `qwpws::`.
+/// way to exercise their ingress path is via `ws::`.
 fn make_qwp_ws_sender(srv: &QuestDbServer) -> Sender {
-    let conf = format!("qwpws::addr={}:{}", srv.host, srv.http_port);
+    let conf = format!("ws::addr={}:{}", srv.host, srv.http_port);
     Sender::from_conf(&conf).expect("qwp/ws sender")
 }
 

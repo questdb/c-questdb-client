@@ -86,7 +86,7 @@ static int closed_port_phase(void)
  * open, fail, and tear down the shared pool using only
  * <questdb/egress/reader.h> and the client-wide `questdb_error` type.
  *
- * Targets the same guaranteed-closed 127.0.0.1:1 port via a `qwpws::`
+ * Targets the same guaranteed-closed 127.0.0.1:1 port via a `ws::`
  * connect string. The pool is lazy: `questdb_db_connect` opens no
  * socket, so the connect itself succeeds and the connect failure surfaces
  * on the first `questdb_db_borrow_reader` — reported as a `questdb_error*`.
@@ -94,7 +94,7 @@ static int closed_port_phase(void)
  */
 static int pool_reader_only_phase(void)
 {
-    static const char conf[] = "qwpws::addr=127.0.0.1:1;";
+    static const char conf[] = "ws::addr=127.0.0.1:1;";
 
     questdb_error* err = NULL;
     struct questdb_db* db =

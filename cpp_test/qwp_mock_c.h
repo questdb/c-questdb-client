@@ -33,7 +33,7 @@ typedef struct qwp_mock_c qwp_mock_c;
 qwp_mock_c* qwp_mock_c_start(int slot_count);
 
 /* Return the mock's listening address as "127.0.0.1:NNNN", suitable for
- * splicing into a `qwpws::addr=...` connect string. Pointer is valid
+ * splicing into a `ws::addr=...` connect string. Pointer is valid
  * until `qwp_mock_c_stop`. */
 const char* qwp_mock_c_addr(qwp_mock_c* mock);
 

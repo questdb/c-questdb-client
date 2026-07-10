@@ -270,7 +270,7 @@ struct questdb_db;
  * `questdb/ingress/column_sender.h`; it is repeated here so reader-only C
  * consumers need not include the column-sender header.
  *
- * `conf` is a UTF-8 `qwpws::` / `qwpwss::` connect string of `conf_len`
+ * `conf` is a UTF-8 `ws::` / `wss::` connect string of `conf_len`
  * bytes. The pool is lazy: the first borrow opens its connection. Returns NULL
  * on configuration failure and stores a newly allocated `questdb_error` in
  * `*err_out` when that pointer is non-NULL.

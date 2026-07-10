@@ -505,10 +505,10 @@ pub enum line_sender_protocol {
     line_sender_protocol_qwpudp,
 
     /// QuestWire Protocol over WebSocket.
-    line_sender_protocol_qwpws,
+    line_sender_protocol_ws,
 
     /// QuestWire Protocol over WebSocket Secure (TLS).
-    line_sender_protocol_qwpwss,
+    line_sender_protocol_wss,
 
     /// Sentinel for a protocol the Rust `Protocol` enum knows about but this
     /// FFI build does not. Returned by `line_sender_get_protocol` for future
@@ -526,8 +526,8 @@ impl From<Protocol> for line_sender_protocol {
             Protocol::Http => line_sender_protocol::line_sender_protocol_http,
             Protocol::Https => line_sender_protocol::line_sender_protocol_https,
             Protocol::QwpUdp => line_sender_protocol::line_sender_protocol_qwpudp,
-            Protocol::QwpWs => line_sender_protocol::line_sender_protocol_qwpws,
-            Protocol::QwpWss => line_sender_protocol::line_sender_protocol_qwpwss,
+            Protocol::Ws => line_sender_protocol::line_sender_protocol_ws,
+            Protocol::Wss => line_sender_protocol::line_sender_protocol_wss,
             _ => line_sender_protocol::line_sender_protocol_unknown,
         }
     }
@@ -542,8 +542,8 @@ impl TryFrom<line_sender_protocol> for Protocol {
             line_sender_protocol::line_sender_protocol_http => Protocol::Http,
             line_sender_protocol::line_sender_protocol_https => Protocol::Https,
             line_sender_protocol::line_sender_protocol_qwpudp => Protocol::QwpUdp,
-            line_sender_protocol::line_sender_protocol_qwpws => Protocol::QwpWs,
-            line_sender_protocol::line_sender_protocol_qwpwss => Protocol::QwpWss,
+            line_sender_protocol::line_sender_protocol_ws => Protocol::Ws,
+            line_sender_protocol::line_sender_protocol_wss => Protocol::Wss,
             line_sender_protocol::line_sender_protocol_unknown => return Err(()),
         })
     }
@@ -2824,7 +2824,7 @@ pub unsafe extern "C" fn line_sender_opts_tls_ca(
 /// Set the path to a custom root certificate `.pem` file.
 /// This is used to validate the server's certificate during the TLS handshake.
 ///
-/// On QWP/WebSocket (`qwpwss::`) the same path may instead point at a JKS
+/// On QWP/WebSocket (`wss::`) the same path may instead point at a JKS
 /// or PKCS#12 keystore; pair it with `line_sender_opts_tls_roots_password`
 /// to unlock it.
 ///
@@ -2845,7 +2845,7 @@ pub unsafe extern "C" fn line_sender_opts_tls_roots(
 /// Set the password unlocking the JKS / PKCS#12 keystore named by
 /// `line_sender_opts_tls_roots`.
 ///
-/// QWP/WebSocket only (`qwpwss::`). Setting this on an ILP/TCP or
+/// QWP/WebSocket only (`wss::`). Setting this on an ILP/TCP or
 /// ILP/HTTP sender returns an `InvalidApiCall` error: those transports
 /// read unencrypted PEM via rustls and have no keystore concept.
 ///
@@ -3426,7 +3426,7 @@ pub unsafe extern "C" fn line_sender_buffer_new_for_sender(
         let buffer = sender.new_buffer();
         let empty_peek_buf_is_null = matches!(
             sender.protocol(),
-            Protocol::QwpUdp | Protocol::QwpWs | Protocol::QwpWss
+            Protocol::QwpUdp | Protocol::Ws | Protocol::Wss
         );
         Box::into_raw(Box::new(line_sender_buffer {
             buffer,
@@ -5911,7 +5911,7 @@ mod tests {
 
         fn conf(&self) -> String {
             format!(
-                "qwpws::addr=127.0.0.1:{};pool_size=1;pool_max=2;close_flush_timeout_millis=50;",
+                "ws::addr=127.0.0.1:{};pool_size=1;pool_max=2;close_flush_timeout_millis=50;",
                 self.port
             )
         }
@@ -6789,7 +6789,7 @@ mod tests {
             let mut err = ptr::null_mut();
             let callback_state = CallbackState::default();
             let opts = line_sender_opts_new(
-                line_sender_protocol::line_sender_protocol_qwpws,
+                line_sender_protocol::line_sender_protocol_ws,
                 utf8(b"127.0.0.1"),
                 port,
             );

@@ -917,7 +917,7 @@ class TestArrowIngressSfa(afc.ArrowFuzzBase):
     ) -> bytes:
         extras = self._sfa_extras(sender_id, sf_dir)
         extras.update(overrides)
-        parts = [f"qwpws::addr={self._fixture.host}:{port};"]
+        parts = [f"ws::addr={self._fixture.host}:{port};"]
         parts.extend(f"{key}={value};" for key, value in extras.items())
         return "".join(parts).encode("utf-8")
 
@@ -1561,7 +1561,7 @@ class TestColumnSenderBorrowWithRetry(unittest.TestCase):
         probe.bind(("127.0.0.1", 0))
         dead_port = probe.getsockname()[1]
         probe.close()
-        conf = f"qwpws::addr=127.0.0.1:{dead_port};".encode("utf-8")
+        conf = f"ws::addr=127.0.0.1:{dead_port};".encode("utf-8")
         db = db_connect(conf)  # lazy: opens no socket, so it succeeds
         try:
             # Non-zero budget exercises the retry loop (attempts + backoff).

@@ -138,7 +138,7 @@ typedef struct column_sender_validity
  * the borrow, not from here. `pool_size` (default 1) is the warm minimum the
  * reaper keeps once connections have been opened.
  *
- * `conf` is a `qwpws::` / `qwpwss::` connect string. Pool-specific keys:
+ * `conf` is a `ws::` / `wss::` connect string. Pool-specific keys:
  *   `pool_size`            (default 1)   warm/min connections;
  *   `pool_max`             (default 64)  hard cap on auto-grow;
  *   `pool_idle_timeout_ms` (default 60000)

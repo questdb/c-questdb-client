@@ -101,7 +101,7 @@ def egress_conf(fixture) -> str:
     return f"ws::addr={fixture.host}:{fixture.http_server_port};"
 
 def ingress_conf(fixture, **extras: str) -> str:
-    parts = [f"qwpws::addr={fixture.host}:{fixture.http_server_port};"]
+    parts = [f"ws::addr={fixture.host}:{fixture.http_server_port};"]
     for k, v in extras.items():
         parts.append(f"{k}={v};")
     return "".join(parts)
