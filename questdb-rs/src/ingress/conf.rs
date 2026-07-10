@@ -230,6 +230,12 @@ pub(crate) struct QwpWsConfig {
     pub(crate) sf_dir: ConfigSetting<Option<PathBuf>>,
     pub(crate) sender_id: ConfigSetting<String>,
     pub(crate) sf_max_bytes: ConfigSetting<u64>,
+    /// Ceiling on the store-and-forward **segment** files (`sf-*.sfa`) a slot may
+    /// allocate. It does NOT cover the slot's small side-files (`.symbol-dict`,
+    /// `.ack-watermark`, `.lock`). The `.symbol-dict` write-ahead is append-only
+    /// and bounded by the connection symbol-dictionary cap
+    /// (`MAX_CONN_SYMBOL_DICT_SIZE`), so a very-high-cardinality connection can
+    /// hold a side-file on top of this segment budget until the slot fully drains.
     pub(crate) sf_max_total_bytes: ConfigSetting<Option<u64>>,
     pub(crate) sf_durability: ConfigSetting<SfDurability>,
     pub(crate) sf_append_deadline: ConfigSetting<std::time::Duration>,

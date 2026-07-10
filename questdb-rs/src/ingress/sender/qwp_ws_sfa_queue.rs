@@ -49,6 +49,7 @@ use super::qwp_ws_sfa_segment::{
     FRAME_HEADER_SIZE, HEADER_SIZE, INITIAL_SEGMENT_FILE_NAME, SfaMappedPayload, SfaSegment,
     SfaSegmentError, scan_file_metadata, spare_segment_path,
 };
+use super::qwp_ws_sfa_symbol_dict::PersistedSymbolDict;
 
 const ACK_WATERMARK_FILE_NAME: &str = ".ack-watermark";
 const ACK_WATERMARK_MAGIC: u32 = 0x3157_4b41; // 'AKW1' in little-endian bytes.
@@ -236,6 +237,14 @@ pub(crate) struct SfaFrameQueue {
     engine: Arc<SfaEngine>,
     producer: Option<SfaProducer>,
     ack_watermark: Option<SfaAckWatermark>,
+    /// Delta symbol-dict mode for this slot: always on in memory mode; in file
+    /// mode on iff the persisted side-file opened (so recovery / orphan-drain can
+    /// rebuild the dictionary). When off, the sender keeps full-dict frames.
+    delta_dict_enabled: bool,
+    /// The slot's persisted symbol dictionary (file mode only). Taken by the
+    /// foreground for write-ahead; its recovered entries seed the producer dict
+    /// and the driver's catch-up mirror. `None` in memory mode / on open failure.
+    persisted_symbol_dict: Option<PersistedSymbolDict>,
 }
 
 #[derive(Debug)]
@@ -282,6 +291,31 @@ impl SfaFrameQueue {
 
         let recovered = recover_segments(&options)?;
         let recovery_diagnostics = recovered.diagnostics;
+        // Open the slot's persisted symbol dictionary aligned with segment
+        // recovery: a fresh slot (no recovered segments) clears any stale side-file
+        // and starts empty; a recovered slot loads it so its delta frames can be
+        // re-registered on the fresh server. Delta encoding is on iff it opened.
+        let persisted_symbol_dict = if recovered.segments.is_some() {
+            // Recovered slot: delta-encode ONLY when an existing, valid side-file
+            // loads. If it is absent / too short / bad-magic (no dictionary that
+            // mirrors the recovered segments), fall back to full-dictionary
+            // (self-sufficient) frames rather than seeding an EMPTY delta
+            // dictionary next to segments that already reference ids [0, K): under
+            // delta a later frame would resolve those stale ids to the wrong
+            // symbols on a fresh server (silent corruption). In dense mode a
+            // surviving dense frame replays self-sufficiently and a surviving
+            // delta frame is rejected loudly by the send loop's torn-dict guard.
+            // A transient I/O error still fails construction loudly (retryable,
+            // data intact) rather than destroying a dictionary it failed to read.
+            PersistedSymbolDict::open_recovered(&options.slot_dir)?
+        } else {
+            // Fresh slot: no stored frames depend on the dictionary, so a side-file
+            // that cannot be opened degrades gracefully to full-dictionary
+            // (self-sufficient) frames.
+            PersistedSymbolDict::remove_orphan(&options.slot_dir);
+            PersistedSymbolDict::open(&options.slot_dir).ok()
+        };
+        let delta_dict_enabled = persisted_symbol_dict.is_some();
         let (active, sealed_segments, next_fsn, next_generation, mut allocated_segment_bytes) =
             match recovered.segments {
                 Some(segments) => (
@@ -373,6 +407,8 @@ impl SfaFrameQueue {
             engine,
             producer,
             ack_watermark: recovered_completion.ack_watermark,
+            delta_dict_enabled,
+            persisted_symbol_dict,
         })
     }
 
@@ -436,6 +472,10 @@ impl SfaFrameQueue {
             engine,
             producer,
             ack_watermark: None,
+            // Memory mode: delta is always safe (in-process reconnect replay), and
+            // there is no side-file to persist.
+            delta_dict_enabled: true,
+            persisted_symbol_dict: None,
         })
     }
 
@@ -448,6 +488,18 @@ impl SfaFrameQueue {
             });
         }
         let recovery_diagnostics = recovered.diagnostics;
+        // Orphan-drain replays this slot's frames on a fresh server, so load its
+        // persisted symbol dictionary to re-register delta frames -- but ONLY when
+        // an existing, valid side-file loads. Absent / bad-magic (no dictionary
+        // that mirrors the segments) falls back to dense: a surviving dense frame
+        // replays self-sufficiently and a surviving delta frame is rejected loudly
+        // by the torn-dict guard, rather than seeding an empty delta dictionary
+        // that would misresolve stale ids. Replay-only has no producer, so the
+        // dictionary is read-only here. A transient I/O error fails this drain
+        // attempt (retryable; the orphan stays recoverable on disk) rather than
+        // truncating the load-bearing side-file.
+        let persisted_symbol_dict = PersistedSymbolDict::open_recovered(&options.slot_dir)?;
+        let delta_dict_enabled = persisted_symbol_dict.is_some();
         let (active, sealed_segments, next_fsn, allocated_segment_bytes) = match recovered.segments
         {
             Some(segments) => (
@@ -491,7 +543,36 @@ impl SfaFrameQueue {
             engine,
             producer: None,
             ack_watermark: recovered_completion.ack_watermark,
+            delta_dict_enabled,
+            persisted_symbol_dict,
         })
+    }
+
+    /// Whether this slot delta-encodes symbol dictionaries (see the field docs).
+    pub(crate) fn is_delta_dict_enabled(&self) -> bool {
+        self.delta_dict_enabled
+    }
+
+    /// The recovered symbol-dict entries (`[len][utf8]...` in id order) used to
+    /// seed the producer dict and the driver mirror on recovery / orphan-drain.
+    /// Empty for a fresh slot or memory mode.
+    pub(crate) fn recovered_symbol_dict_entries(&self) -> &[u8] {
+        self.persisted_symbol_dict
+            .as_ref()
+            .map_or(&[][..], |pd| pd.loaded_entries())
+    }
+
+    /// Number of recovered symbol-dict entries.
+    pub(crate) fn recovered_symbol_dict_count(&self) -> u32 {
+        self.persisted_symbol_dict
+            .as_ref()
+            .map_or(0, |pd| pd.size())
+    }
+
+    /// Takes the persisted symbol dictionary for the foreground producer's
+    /// write-ahead. `None` in memory mode / replay-only / on open failure.
+    pub(crate) fn take_persisted_symbol_dict(&mut self) -> Option<PersistedSymbolDict> {
+        self.persisted_symbol_dict.take()
     }
 
     pub(crate) fn close(&mut self) -> Result<(), SfaQueueError> {
@@ -1713,6 +1794,11 @@ fn validate_contiguous_segments(segments: &[RecoveredSegment]) -> Result<(), Sfa
     Ok(())
 }
 
+// Accounts for the `sf-*.sfa` segment files only. The slot's small side-files
+// (`.symbol-dict`, `.ack-watermark`, `.lock`) are deliberately excluded: the
+// `.symbol-dict` write-ahead is append-only and bounded by the connection
+// symbol-dictionary cap (`MAX_CONN_SYMBOL_DICT_SIZE`), not by this segment
+// budget. See the `sf_max_total_bytes` config doc.
 fn can_allocate_segment(
     allocated_segment_bytes: u64,
     segment_size_bytes: u64,
@@ -1812,6 +1898,11 @@ fn record_all_sfa_cleanup(
     }
     if !cleanup_failed {
         record_cleanup_remove_file(ack_watermark_path(slot_dir), diagnostics);
+        // The persisted symbol dictionary is slot state too: drop it alongside the
+        // watermark so a fully-drained slot leaves nothing behind. Best-effort --
+        // a leftover is meaningless without segments and is re-created cleanly (or
+        // removed as an orphan) on the next open.
+        PersistedSymbolDict::remove_orphan(slot_dir);
     }
     Ok(())
 }
@@ -2453,15 +2544,96 @@ mod tests {
     #[test]
     fn close_removes_sfa_files_after_all_published_frames_are_resolved() {
         let dir = TempDir::new().unwrap();
+        let symbol_dict = dir
+            .path()
+            .join(crate::ingress::sender::qwp_ws_sfa_symbol_dict::FILE_NAME);
         let mut queue = open(&dir);
         queue.try_submit(b"first").unwrap();
         queue.complete_through_fsn(0).unwrap();
 
         assert!(ack_watermark_path(dir.path()).exists());
+        // A file-mode slot opens a persisted symbol dictionary alongside its
+        // segments (delta encoding depends on it).
+        assert!(symbol_dict.exists());
         queue.close().unwrap();
 
         assert_eq!(sfa_file_count(dir.path()), 0);
         assert!(!ack_watermark_path(dir.path()).exists());
+        // The side-file is slot state too: a fully-drained close leaves nothing.
+        assert!(!symbol_dict.exists());
+    }
+
+    #[test]
+    fn recovered_slot_without_a_side_file_falls_back_to_dense() {
+        // Regression: a recovered slot whose segments already reference symbol ids
+        // but whose side-file is gone (a dense-fallback session that never wrote
+        // one, or a lost/deleted file) must NOT re-enable delta with an empty
+        // dictionary. Seeding ids from 0 next to segments that reference [0, K)
+        // would let a later delta frame resolve those stale ids to the wrong
+        // symbols on a fresh server (silent corruption). It falls back to dense
+        // (self-sufficient) frames instead, and does not fabricate a side-file.
+        let dir = TempDir::new().unwrap();
+        let symbol_dict = dir
+            .path()
+            .join(crate::ingress::sender::qwp_ws_sfa_symbol_dict::FILE_NAME);
+
+        // A first session leaves an unresolved (recoverable) segment behind.
+        let mut queue = open(&dir);
+        queue.try_submit(b"unresolved-frame").unwrap();
+        assert!(
+            queue.is_delta_dict_enabled(),
+            "a fresh file slot delta-encodes"
+        );
+        drop(queue);
+        assert!(
+            sfa_file_count(dir.path()) > 0,
+            "an unresolved segment survives"
+        );
+
+        // Simulate a slot whose side-file does not mirror its segments.
+        std::fs::remove_file(&symbol_dict).unwrap();
+
+        let recovered = open(&dir);
+        assert!(
+            !recovered.is_delta_dict_enabled(),
+            "a recovered slot with no matching side-file must fall back to dense"
+        );
+        assert!(
+            recovered.recovered_symbol_dict_entries().is_empty(),
+            "dense fallback seeds nothing"
+        );
+        assert!(
+            !symbol_dict.exists(),
+            "recovery must not fabricate an empty side-file next to the segments"
+        );
+    }
+
+    #[test]
+    fn recovered_slot_with_a_bad_magic_side_file_falls_back_to_dense() {
+        // A poisoned / externally-corrupted side-file (bad magic) beside
+        // recoverable segments is treated like an absent one: dense fallback, with
+        // the corrupt file left untouched (never silently rewritten fresh and
+        // re-enabled for delta).
+        let dir = TempDir::new().unwrap();
+        let symbol_dict = dir
+            .path()
+            .join(crate::ingress::sender::qwp_ws_sfa_symbol_dict::FILE_NAME);
+
+        let mut queue = open(&dir);
+        queue.try_submit(b"unresolved-frame").unwrap();
+        drop(queue);
+        std::fs::write(&symbol_dict, b"NOPEnope-poisoned-header").unwrap();
+
+        let recovered = open(&dir);
+        assert!(
+            !recovered.is_delta_dict_enabled(),
+            "a recovered slot with a bad-magic side-file must fall back to dense"
+        );
+        assert_eq!(
+            std::fs::read(&symbol_dict).unwrap(),
+            b"NOPEnope-poisoned-header",
+            "recovery must not rewrite the corrupt side-file"
+        );
     }
 
     #[test]

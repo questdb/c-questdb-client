@@ -3550,13 +3550,18 @@ impl QwpWsColumnarBuffer {
         Ok(out)
     }
 
+    /// Test-only convenience for the common non-deferred, full-dict replay
+    /// shape. Production code (`qwp_ws_publisher`) calls
+    /// [`Self::encode_ws_replay_message_with_defer`] directly to pass the
+    /// defer-commit / delta-dict flags.
+    #[cfg(test)]
     pub(crate) fn encode_ws_replay_message(
         &self,
         scratch: &mut QwpWsEncodeScratch,
         global_dict: &mut SymbolGlobalDict,
         version: u8,
     ) -> crate::Result<()> {
-        self.encode_ws_replay_message_with_defer(scratch, global_dict, version, false)
+        self.encode_ws_replay_message_with_defer(scratch, global_dict, version, false, false)
     }
 
     pub(crate) fn encode_ws_replay_message_with_defer(
@@ -3565,6 +3570,7 @@ impl QwpWsColumnarBuffer {
         global_dict: &mut SymbolGlobalDict,
         version: u8,
         defer_commit: bool,
+        delta_dict: bool,
     ) -> crate::Result<()> {
         self.check_can_flush()?;
         let out = &mut scratch.message;
@@ -3573,6 +3579,12 @@ impl QwpWsColumnarBuffer {
         let header_start = out.len();
         out.extend_from_slice(&[0u8; QWP_MESSAGE_HEADER_SIZE]);
         let payload_start = out.len();
+
+        // Delta mode ships only the ids new since the connection dict last grew;
+        // the driver re-registers the whole dictionary via a catch-up frame on
+        // reconnect. Dense mode (delta_dict = false) re-ships every id from 0 so
+        // each frame is self-sufficient. Capture the watermark before interning.
+        let delta_start = if delta_dict { global_dict.next_id() } else { 0 };
 
         while scratch.per_segment_symbol_globals.len() < self.tables.len() {
             scratch.per_segment_symbol_globals.push(Vec::new());
@@ -3601,10 +3613,18 @@ impl QwpWsColumnarBuffer {
             }
         }
 
-        write_qwp_varint(out, 0);
-        let dense_count = highest_referenced_symbol_id.map_or(0, |highest| highest + 1);
-        write_qwp_varint(out, dense_count);
-        for id in 0..dense_count {
+        // `delta_start` is the watermark captured above (0 in dense mode); the
+        // new entries are `[delta_start, dict_end)`. In dense mode `dict_end` is
+        // the dense prefix length (highest referenced id + 1); in delta mode it is
+        // the dict's post-intern length, so only this frame's new symbols ship.
+        write_qwp_varint(out, delta_start);
+        let dict_end = if delta_dict {
+            global_dict.next_id()
+        } else {
+            highest_referenced_symbol_id.map_or(0, |highest| highest + 1)
+        };
+        write_qwp_varint(out, dict_end - delta_start);
+        for id in delta_start..dict_end {
             let bytes = global_dict.entry(id).ok_or_else(|| {
                 error::fmt!(
                     InvalidApiCall,
@@ -5266,6 +5286,68 @@ impl SymbolGlobalDict {
         self.next_id += 1;
         Ok((id, true))
     }
+
+    /// Seeds the dictionary from a recovered persisted side-file's entry region
+    /// (`[len varint][utf8]...` in ascending id order, `count` entries), interning
+    /// each so the recovered ids (`0..count`) match the stored frames' references.
+    /// Called once at connection setup on file-mode recovery / orphan-drain, on a
+    /// fresh (empty) dictionary.
+    pub(crate) fn seed(&mut self, entries: &[u8], count: u32) -> crate::Result<()> {
+        let mut pos = 0usize;
+        for i in 0..count {
+            // Shared LEB128 decoder (with the >=10-byte-overflow guard) so this
+            // reader cannot silently diverge from the store-and-forward side-file /
+            // catch-up readers; see `decode_qwp_varint`.
+            let (len, after_len) = decode_qwp_varint(entries, pos).ok_or_else(|| {
+                crate::error::fmt!(
+                    StoreResendRequired,
+                    "corrupt persisted symbol dictionary: length varint truncated or too long"
+                )
+            })?;
+            // Cap the entry length exactly as the persisted side-file reader does
+            // (`qwp_ws_sfa_symbol_dict::open_existing`): a longer length is corrupt.
+            if len > MAX_PERSISTED_SYMBOL_ENTRY_LEN {
+                return Err(crate::error::fmt!(
+                    StoreResendRequired,
+                    "corrupt persisted symbol dictionary: entry length {} exceeds the maximum",
+                    len
+                ));
+            }
+            // `checked_add` so a hostile/torn length cannot wrap past the bound
+            // check into a reversed slice (a panic -> process abort under FFI).
+            let end = match after_len.checked_add(len as usize) {
+                Some(end) if end <= entries.len() => end,
+                _ => {
+                    return Err(crate::error::fmt!(
+                        StoreResendRequired,
+                        "corrupt persisted symbol dictionary: entry overruns buffer"
+                    ));
+                }
+            };
+            let (_, is_new) = self.intern(&entries[after_len..end])?;
+            // A well-formed persisted dictionary holds strictly unique symbols in
+            // ascending id order -- the producer interns each once before writing
+            // it ahead -- so every recovered entry must intern to a *fresh* id. A
+            // duplicate means the region is corrupt, most commonly a host/power
+            // crash that left the append-only file zero-extended so its tail
+            // parses as a run of empty ([len=0]) entries. Silently deduping it
+            // would leave this producer dictionary shorter than the driver's
+            // catch-up mirror (which takes `count` verbatim), desyncing the two so
+            // a later delta frame resolves ids to the wrong symbols on the server.
+            // Fail loud instead -- the slot's data is resent, not corrupted.
+            if !is_new {
+                return Err(crate::error::fmt!(
+                    StoreResendRequired,
+                    "corrupt persisted symbol dictionary: duplicate entry at index \
+                     {} (a torn or zero-extended tail); the affected data must be \
+                     resent",
+                    i
+                ));
+            }
+            pos = end;
+        }
+        Ok(())
+    }
 }
 
 /// Reusable scratch buffers for encoding a single QWP/WebSocket message.
@@ -6839,6 +6921,38 @@ fn write_qwp_varint(out: &mut Vec<u8>, mut value: u64) {
     }
     out.push(value as u8);
 }
+
+/// Decodes an unsigned LEB128 varint from `buf[pos..]`. Returns `(value, new_pos)`,
+/// or `None` if it is truncated (runs off the end) or implausibly long (a `>= 10`
+/// byte varint drives `shift >= 64` and would overflow the `<< shift`). The single
+/// shared decoder for every QWP delta-symbol-dictionary reader — [`SymbolGlobalDict::seed`],
+/// the store-and-forward catch-up mirror, and the persisted side-file — so their
+/// varint bounds cannot silently diverge.
+#[cfg(feature = "_sender-qwp-ws")]
+pub(crate) fn decode_qwp_varint(buf: &[u8], pos: usize) -> Option<(u64, usize)> {
+    let mut value: u64 = 0;
+    let mut shift = 0u32;
+    let mut cur = pos;
+    while cur < buf.len() {
+        let b = buf[cur];
+        cur += 1;
+        value |= u64::from(b & 0x7F) << shift;
+        if b & 0x80 == 0 {
+            return Some((value, cur));
+        }
+        shift += 7;
+        if shift > 63 {
+            return None;
+        }
+    }
+    None
+}
+
+/// Cap on a persisted symbol entry's length, mirroring the side-file reader's
+/// `qwp_ws_sfa_symbol_dict::MAX_ENTRY_LEN` so [`SymbolGlobalDict::seed`] rejects the
+/// same corrupt lengths the side-file reader does. A longer length is corrupt.
+#[cfg(feature = "_sender-qwp-ws")]
+const MAX_PERSISTED_SYMBOL_ENTRY_LEN: u64 = 1 << 20;
 
 fn write_qwp_bytes(out: &mut Vec<u8>, bytes: &[u8]) {
     write_qwp_varint(out, bytes.len() as u64);
@@ -9191,6 +9305,79 @@ mod tests {
         let (_, is_new) = dict.intern(b"c").unwrap();
         assert!(is_new);
         assert_eq!(dict.len(), 2);
+    }
+
+    #[cfg(feature = "_sender-qwp-ws")]
+    #[test]
+    fn symbol_dict_seed_recovers_entries_and_continues_ids() {
+        // Producer-side recovery: seeding the dictionary from a persisted
+        // side-file's `[len][utf8]...` region reproduces the recovered ids
+        // (0..count) and continues above them, so a delta frame encoded after
+        // recovery bases its `delta_start` on the recovered count -- not id 0.
+        let mut dict = SymbolGlobalDict::new();
+        // Two recovered entries: [len=1]"a", [len=2]"bb".
+        dict.seed(&[1, b'a', 2, b'b', b'b'], 2).unwrap();
+        assert_eq!(dict.next_id(), 2, "ids continue above the recovered count");
+        assert_eq!(dict.entry(0), Some(&b"a"[..]));
+        assert_eq!(dict.entry(1), Some(&b"bb"[..]));
+
+        // A recovered symbol re-interns to its existing id (not a fresh one)...
+        assert_eq!(dict.intern(b"a").unwrap(), (0, false));
+        // ...and a genuinely new symbol continues at the recovered watermark.
+        assert_eq!(dict.intern(b"c").unwrap(), (2, true));
+        assert_eq!(dict.next_id(), 3);
+    }
+
+    #[cfg(feature = "_sender-qwp-ws")]
+    #[test]
+    fn symbol_dict_seed_rejects_corrupt_region_without_panicking() {
+        // A torn / corrupt recovered side-file must surface as a recoverable
+        // StoreResendRequired error, never a panic (which is a process abort
+        // under the FFI `panic = "abort"` profile).
+
+        // A length that overruns the buffer.
+        let mut overrun = SymbolGlobalDict::new();
+        let err = overrun.seed(&[9, b'x'], 1).unwrap_err();
+        assert_eq!(err.code(), crate::ErrorCode::StoreResendRequired);
+        assert!(err.msg().contains("overruns buffer"), "msg: {}", err.msg());
+
+        // A truncated length varint (continuation bit set, no further bytes).
+        let mut truncated = SymbolGlobalDict::new();
+        assert_eq!(
+            truncated.seed(&[0x80], 1).unwrap_err().code(),
+            crate::ErrorCode::StoreResendRequired
+        );
+
+        // An over-long (>= 10-byte) length varint would overflow the decode
+        // shift; the guard must turn it into an error rather than a `<<` panic.
+        let mut overlong = SymbolGlobalDict::new();
+        assert_eq!(
+            overlong.seed(&[0x80u8; 11], 1).unwrap_err().code(),
+            crate::ErrorCode::StoreResendRequired
+        );
+    }
+
+    #[cfg(feature = "_sender-qwp-ws")]
+    #[test]
+    fn symbol_dict_seed_rejects_duplicate_entries_from_a_torn_tail() {
+        // A host/power-crash zero-extended tail parses as a run of empty
+        // ([len=0]) entries. Deduping them silently would leave this producer
+        // dict shorter than the driver's catch-up mirror (which trusts `count`),
+        // desyncing the two so a later delta frame resolves ids to the wrong
+        // symbols on the server. `seed` must reject the duplicate loudly instead.
+        let mut torn = SymbolGlobalDict::new();
+        // [len=1]"a" then TWO empty entries == a 2-byte zero tail after one real
+        // symbol; `count` claims 3.
+        let err = torn.seed(&[1, b'a', 0, 0], 3).unwrap_err();
+        assert_eq!(err.code(), crate::ErrorCode::StoreResendRequired);
+        assert!(err.msg().contains("duplicate entry"), "msg: {}", err.msg());
+
+        // A single legitimate empty symbol is still fine (it interns once, so the
+        // producer count stays in step with the mirror).
+        let mut ok = SymbolGlobalDict::new();
+        ok.seed(&[1, b'a', 0], 2).unwrap();
+        assert_eq!(ok.next_id(), 2);
+        assert_eq!(ok.entry(1), Some(&b""[..]));
     }
 
     #[cfg(all(feature = "_sender-qwp-ws", feature = "arrow-ingress"))]

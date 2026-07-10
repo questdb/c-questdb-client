@@ -58,6 +58,7 @@ use super::qwp_ws_sfa_queue::{
     SfaCleanupFailure, SfaFrameQueue, SfaMemoryQueueOptions, SfaProducer, SfaQueueError,
     SfaQueueOptions, SfaStorageFinish, SfaStorageResult, SfaStorageStep,
 };
+use super::qwp_ws_sfa_symbol_dict::PersistedSymbolDict;
 use crate::ingress::conf::{QWP_WS_DEFAULT_SENDER_ID, is_valid_qwp_ws_sender_id};
 
 pub(crate) const DEFAULT_SENDER_ID: &str = QWP_WS_DEFAULT_SENDER_ID;
@@ -124,6 +125,22 @@ impl SfaSlotQueue {
 
     pub(crate) fn slot_dir(&self) -> Option<&Path> {
         self.lock.as_ref().map(SlotLock::slot_dir)
+    }
+
+    pub(crate) fn is_delta_dict_enabled(&self) -> bool {
+        self.queue.is_delta_dict_enabled()
+    }
+
+    pub(crate) fn recovered_symbol_dict_entries(&self) -> &[u8] {
+        self.queue.recovered_symbol_dict_entries()
+    }
+
+    pub(crate) fn recovered_symbol_dict_count(&self) -> u32 {
+        self.queue.recovered_symbol_dict_count()
+    }
+
+    pub(crate) fn take_persisted_symbol_dict(&mut self) -> Option<PersistedSymbolDict> {
+        self.queue.take_persisted_symbol_dict()
     }
 }
 

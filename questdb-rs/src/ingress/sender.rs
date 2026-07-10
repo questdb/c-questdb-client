@@ -87,6 +87,12 @@ mod qwp_ws_sfa_queue;
 mod qwp_ws_sfa_slot;
 
 #[cfg(feature = "_sender-qwp-ws")]
+pub(crate) mod qwp_ws_sfa_symbol_dict;
+
+#[cfg(feature = "_sender-qwp-ws")]
+mod qwp_ws_sfa_catchup;
+
+#[cfg(feature = "_sender-qwp-ws")]
 pub(crate) use qwp_ws_ownership::QwpWsRoleReject;
 #[cfg(feature = "_sender-qwp-ws")]
 pub use qwp_ws_ownership::*;

@@ -60,6 +60,9 @@ use super::qwp_ws_ownership::{QwpWsErrorCategory, QwpWsErrorPolicy, QwpWsSenderE
 use super::qwp_ws_queue::{
     OutboundFrame, OutboundFrameView, QueueError, QwpReceipt, QwpReceiptStatus, SentFrame,
 };
+use super::qwp_ws_sfa_catchup::{
+    CatchUpEntryTooLarge, CatchUpStreamError, SentDictMirror, frame_delta_start,
+};
 #[cfg(test)]
 use super::qwp_ws_sfa_queue::SfaMemoryQueueOptions;
 use super::qwp_ws_sfa_queue::{
@@ -168,6 +171,16 @@ pub(crate) struct QwpWsCoreTestHarness<Q, T> {
 pub(crate) struct QwpWsSendCore<T> {
     transport: T,
     send_cursor: SendCursor,
+    /// I/O-thread-local mirror of every symbol dictionary entry sent on this
+    /// connection, used to re-register the whole dictionary via catch-up frame(s)
+    /// on reconnect. Inert (disabled) unless the store enables delta mode via
+    /// [`Self::enable_delta_dict`]; disabled keeps every frame self-sufficient.
+    dict_mirror: SentDictMirror,
+    /// Set on a successful reconnect when delta mode is active: the next send
+    /// iteration emits the full-dictionary catch-up frame(s) before replaying the
+    /// queued delta frames, so the fresh server can resolve them. Cleared once
+    /// emitted.
+    catch_up_pending: bool,
     durable_ack: Option<DurableAckTracker>,
     reconnect_policy: ReconnectPolicy,
     pending_reconnect: Option<QwpWsReconnectState>,
@@ -780,6 +793,8 @@ impl<T: QwpWsCoreTransport> QwpWsSendCore<T> {
         Self {
             transport,
             send_cursor: SendCursor::new(max_in_flight),
+            dict_mirror: SentDictMirror::new(false),
+            catch_up_pending: false,
             durable_ack: durable_ack.then(DurableAckTracker::new),
             reconnect_policy,
             pending_reconnect: None,
@@ -990,6 +1005,42 @@ impl<T: QwpWsCoreTransport> QwpWsSendCore<T> {
             )));
             Ok(DriveOutcome::Terminal)
         } else {
+            // A Retriable presend reject carries no FSN -- most commonly the server
+            // rejecting the table-less symbol-dictionary catch-up frame a reconnect
+            // emits before replaying the queued frames (e.g. a read-only replica
+            // after an in-place role switch). It still has to be bounded: the
+            // transport reconnect itself succeeds (the server accepts the
+            // connection, it just rejects the catch-up), so the reconnect retry
+            // budget -- which only counts failed dials -- never trips, and without
+            // escalation a server that persistently rejects the catch-up would
+            // reconnect-loop forever, masking a permanent failure as a hang until
+            // the caller's own deadline. Attribute it to the oldest unresolved
+            // frame (the one the catch-up exists to unblock) and run it through the
+            // same poison tracker as a real-frame reject, so repeated no-progress
+            // rejects escalate to a loud terminal ("resend required") after
+            // max_frame_rejections while a transient/role reject still failovers.
+            if let Some(oldest) = store.queue.oldest_unresolved_fsn()
+                && self.rejected_head_is_poison(store, oldest)
+            {
+                let strikes = self.poison_tracker.strikes();
+                let reason = if error.message.is_empty() {
+                    format!(
+                        "QWP/WebSocket symbol-dictionary catch-up before fsn {oldest} was \
+                         rejected {strikes} times without progress"
+                    )
+                } else {
+                    format!(
+                        "QWP/WebSocket symbol-dictionary catch-up before fsn {oldest} was \
+                         rejected {} times without progress; last server error: {}",
+                        strikes, error.message
+                    )
+                };
+                store.push_sender_error(sender_error);
+                store.last_server_error = Some(error);
+                let err = store.record_protocol_violation(None, reason);
+                store.mark_terminal(Some(err));
+                return Ok(DriveOutcome::Terminal);
+            }
             let initial_error = server_rejection_error(error.error.clone(), sender_error.clone());
             store.push_sender_error(sender_error);
             store.last_server_error = Some(error);
@@ -1118,8 +1169,168 @@ impl<T: QwpWsCoreTransport> QwpWsSendCore<T> {
     ) -> (SentFrame, Result<TransportSendResult, TransportFailure>) {
         let frame = outbound.sent_frame();
         self.sends_on_connection = self.sends_on_connection.saturating_add(1);
-        let result = outbound.with_view(|view| self.transport.send_frame(view));
+        // Split borrows so the mirror can capture the payload alongside the
+        // transport. `accumulate` is a no-op in full-dict mode.
+        let transport = &mut self.transport;
+        let dict_mirror = &mut self.dict_mirror;
+        let result = outbound.with_view(|view| {
+            let payload = view.payload;
+            let sent = transport.send_frame(view);
+            if sent.is_ok() {
+                // The frame's delta is on the wire; mirror the symbols it
+                // introduced so a later reconnect can re-register them.
+                dict_mirror.accumulate(payload);
+            }
+            sent
+        });
         (frame, result)
+    }
+
+    /// Torn-dictionary guard, checked just before a store-and-forward frame is
+    /// sent. A replayed delta frame whose base (`delta_start`) exceeds the symbols
+    /// the mirror has re-registered on this connection references dictionary
+    /// entries a host/power crash tore away from the side-file (and that no
+    /// surviving earlier frame carries): the frame is unrecoverable, so fail
+    /// loudly rather than send the server a frame it cannot decode. `Ok(())` for
+    /// non-dict frames and self-sufficient (base-0) frames.
+    pub(crate) fn guard_dict_not_torn(&self, payload: &[u8]) -> Result<(), Error> {
+        let Some(delta_start) = frame_delta_start(payload) else {
+            return Ok(()); // not a delta-dict frame -> nothing to re-register
+        };
+        if !self.dict_mirror.is_enabled() {
+            // Full-dict (dense) mode: every legitimate frame re-ships its whole
+            // dictionary from id 0 and is self-sufficient (`delta_start == 0`). A
+            // base above 0 with the mirror disabled means either the foreground
+            // encoder emitted delta while the driver mirror stayed dense (a lockstep
+            // wiring bug) or a delta-encoded slot was reopened with delta disabled
+            // (e.g. its side-file could not be opened) -- in both cases no catch-up
+            // will re-register ids [0, delta_start), so replaying the frame would
+            // corrupt the server dictionary. Fail loud rather than send it.
+            if delta_start > 0 {
+                return Err(error::fmt!(
+                    StoreResendRequired,
+                    "QWP/WebSocket store-and-forward: a stored frame bases at symbol \
+                     id {} but delta symbol-dictionary mode is disabled on this \
+                     connection, so the dictionary it depends on cannot be \
+                     re-registered; the affected data must be resent",
+                    delta_start
+                ));
+            }
+            return Ok(());
+        }
+        let registered = u64::from(self.dict_mirror.count());
+        if delta_start > registered {
+            return Err(error::fmt!(
+                StoreResendRequired,
+                "QWP/WebSocket store-and-forward symbol dictionary is torn: a stored \
+                 frame references symbol id {} but only {} dictionary entries were \
+                 recovered (a host crash lost entries the frame depends on); the \
+                 affected data must be resent",
+                delta_start,
+                registered
+            ));
+        }
+        Ok(())
+    }
+
+    /// Enables delta symbol-dict mode on this connection's send loop and seeds
+    /// the catch-up mirror from a recovered persisted dictionary (`seed_entries`
+    /// = the concatenated `[len][utf8]` region in id order, `seed_count`
+    /// entries). Called once at construction by the store when the slot's mode
+    /// supports delta (memory always; file iff the persisted dict opened). Pass
+    /// `(&[], 0)` to enable without a recovered dictionary (fresh memory-mode).
+    ///
+    /// A non-empty seed means this is a file-mode recovery / orphan-drain: the
+    /// queued frames are mid-stream deltas that reference a dictionary the fresh
+    /// server has never seen, so arm the catch-up to re-register it before the
+    /// first replay — exactly as [`Self::finish_reconnect_success`] does on a
+    /// reconnect. Without this, the initial connect replays a `delta_start > 0`
+    /// frame against an empty server dictionary (undecodable / silent
+    /// corruption). Redundant-but-safe when nothing was acked (seed count 0
+    /// stays disarmed; a seed covering already-registered ids reproduces the
+    /// tested reconnect-with-nothing-acked overlap case).
+    pub(crate) fn enable_delta_dict(&mut self, seed_entries: &[u8], seed_count: u32) {
+        self.dict_mirror = SentDictMirror::new(true);
+        self.dict_mirror.seed(seed_entries, seed_count);
+        self.catch_up_pending = !self.dict_mirror.is_empty();
+    }
+
+    /// Sends the full-dictionary catch-up frame(s) on the freshly reconnected
+    /// transport — split so none exceeds the server's batch cap — and returns how
+    /// many were sent (they consume wire seqs `[0, n)`). The caller then calls
+    /// [`SendCursor::begin_catch_up`] so the queued replay frames map onto
+    /// `fsn_at_zero`. Only invoked when the mirror is enabled and non-empty.
+    fn emit_dict_catch_up(&mut self) -> Result<u64, DictCatchUpError> {
+        let cap = self.transport.server_max_batch_size();
+        let version = self.transport.negotiated_qwp_version();
+        // Stream the catch-up frame(s): build, send, drop each before the next, so
+        // only one frame is resident rather than a second copy of the whole
+        // dictionary -- even on a flapping connection that repeats the catch-up on
+        // every reconnect.
+        let transport = &mut self.transport;
+        let mut wire_seq = 0u64;
+        self.dict_mirror
+            .for_each_catch_up_frame(cap, version, |frame_bytes| {
+                // A catch-up frame carries no FSN; the transport only reads
+                // `payload` and correlates acks by `wire_seq`, so seqs [0, n) keep
+                // the FIFO ack stream aligned (their acks resolve to no real FSN --
+                // see `SendCursor::ack_fsn_for_wire_seq`).
+                let view = OutboundFrameView {
+                    fsn: 0,
+                    wire_seq,
+                    payload: frame_bytes,
+                };
+                wire_seq += 1;
+                transport.send_frame(view).map(|_| ())
+            })
+            .map_err(|e| match e {
+                CatchUpStreamError::EntryTooLarge(e) => DictCatchUpError::EntryTooLarge(e),
+                CatchUpStreamError::Emit(failure) => DictCatchUpError::Transport(failure),
+            })
+    }
+
+    /// If a reconnect armed the symbol-dict catch-up, emit the catch-up frame(s)
+    /// and set up the cursor; otherwise a no-op. Shared by the manual send path
+    /// ([`Self::drive_send_available`]) and the background runner's send loop, so
+    /// both re-register the whole dictionary before replaying delta frames. A
+    /// transport drop means reconnect again; an oversized entry is terminal.
+    pub(crate) fn drive_catch_up(&mut self) -> Result<(), CatchUpDriveError> {
+        if !self.catch_up_pending {
+            return Ok(());
+        }
+        self.catch_up_pending = false;
+        match self.emit_dict_catch_up() {
+            Ok(catch_up_frames) => {
+                self.send_cursor.begin_catch_up(catch_up_frames);
+                Ok(())
+            }
+            Err(DictCatchUpError::Transport(failure)) => Err(CatchUpDriveError::Transport(failure)),
+            Err(DictCatchUpError::EntryTooLarge(e)) => {
+                // Decided entirely client-side from the server's advertised batch
+                // cap -- nothing was sent back -- so this is `BatchTooLarge` (the
+                // same code the foreground uses for a frame that overflows the cap
+                // in publish_chunk_sfa / publish_arrow_sfa), not `ServerFlushError`
+                // ("error sent back from the server").
+                //
+                // The foreground marks this terminal (the caller learns at once to
+                // resend / investigate), whereas an orphan drainer maps the same
+                // condition to RetryLater. The asymmetry is intentional and does not
+                // abandon data: `mark_terminal` only records the error -- it never
+                // deletes the slot's segments or side-file -- so a disk slot's queued
+                // frames stay on disk and a later orphan drain / borrow re-attempts
+                // them, giving a failover to a larger-cap endpoint another chance. (A
+                // single symbol larger than a server's batch cap -- caps are MBs,
+                // symbols tiny -- is essentially unreachable in practice.)
+                Err(CatchUpDriveError::Terminal(error::fmt!(
+                    BatchTooLarge,
+                    "QWP/WebSocket symbol dictionary entry ({} bytes) exceeds the server \
+                 batch cap ({} bytes) during reconnect catch-up; cannot re-register \
+                 the dictionary -- resend required",
+                    e.entry_bytes,
+                    e.budget
+                )))
+            }
+        }
     }
 
     pub(crate) fn finish_send_result<Q: PublicationLog>(
@@ -1464,6 +1675,10 @@ impl<T: QwpWsCoreTransport> QwpWsSendCore<T> {
         if let Some(tracker) = self.durable_ack.as_mut() {
             tracker.reset();
         }
+        // Delta mode: the fresh server's dictionary is empty. Arm the catch-up so
+        // the next send iteration re-registers the whole dictionary before the
+        // queued delta frames (which reference ids above 0) replay.
+        self.catch_up_pending = self.dict_mirror.is_enabled() && !self.dict_mirror.is_empty();
         store.counters.total_reconnects_succeeded += 1;
         store.push_event(DriverEvent::Reconnected { reason });
         DriveOutcome::Reconnected { reason }
@@ -1779,10 +1994,24 @@ impl<T: QwpWsCoreTransport> QwpWsSendCore<T> {
         &mut self,
         store: &mut QwpWsPublicationStore<Q>,
     ) -> Result<Option<DriveOutcome>, DriverError> {
+        match self.drive_catch_up() {
+            Ok(()) => {}
+            Err(CatchUpDriveError::Transport(failure)) => {
+                return Ok(Some(self.apply_transport_failure(store, failure)?));
+            }
+            Err(CatchUpDriveError::Terminal(err)) => {
+                store.mark_terminal(Some(err));
+                return Ok(Some(DriveOutcome::Terminal));
+            }
+        }
         let progress = store.progress_view();
         let Some(outbound) = self.next_outbound_sfa_frame(&progress)? else {
             return Ok(None);
         };
+        if let Err(err) = outbound.with_view(|view| self.guard_dict_not_torn(view.payload)) {
+            store.mark_terminal(Some(err));
+            return Ok(Some(DriveOutcome::Terminal));
+        }
 
         let (frame, send_result) = self.send_frame(outbound);
         let send_result = match send_result {
@@ -2152,7 +2381,7 @@ pub(crate) fn reconnect_error_is_terminal(err: &Error) -> bool {
     }
     matches!(
         err.code(),
-        ErrorCode::AuthError | ErrorCode::ProtocolVersionError
+        ErrorCode::AuthError | ErrorCode::ProtocolVersionError | ErrorCode::StoreResendRequired
     )
 }
 
@@ -2325,6 +2554,12 @@ pub(crate) struct SendCursor {
     fsn_at_zero: Option<u64>,
     next_fsn: Option<u64>,
     next_wire_seq: u64,
+    /// Number of out-of-band symbol-dict catch-up frames prepended on the
+    /// current connection. They occupy wire seqs `[0, catch_up_offset)`; real
+    /// replay frames start at `catch_up_offset` and map to `fsn_at_zero` onward.
+    /// 0 whenever no catch-up was sent (always, in full-dict mode), so the
+    /// mapping is unchanged there. Reset by [`Self::restart`].
+    catch_up_offset: u64,
     last_sent_wire_seq: Option<u64>,
     in_flight: VecDeque<SentFrame>,
     sfa_cursor: Option<SfaSendCursor>,
@@ -2337,6 +2572,7 @@ impl SendCursor {
             fsn_at_zero: None,
             next_fsn: None,
             next_wire_seq: 0,
+            catch_up_offset: 0,
             last_sent_wire_seq: None,
             in_flight: VecDeque::new(),
             sfa_cursor: None,
@@ -2406,8 +2642,11 @@ impl SendCursor {
             return Ok(None);
         };
         let effect_wire_seq = wire_seq.min(last_sent_wire_seq);
+        let Some(real_delta) = effect_wire_seq.checked_sub(self.catch_up_offset) else {
+            return Ok(None); // a catch-up frame; no real FSN to resolve
+        };
         let fsn = fsn_at_zero
-            .checked_add(effect_wire_seq)
+            .checked_add(real_delta)
             .ok_or(DriverError::Queue(QueueError::SequenceOverflow))?;
         Ok(Some((fsn, effect_wire_seq)))
     }
@@ -2420,8 +2659,14 @@ impl SendCursor {
             return Ok(None);
         };
         let ack_wire_seq = wire_seq.min(last_sent_wire_seq);
+        // Catch-up frames occupy wire seqs [0, catch_up_offset); their acks map to
+        // no real FSN (a harmless no-op — nothing to complete). Real replay frames
+        // start at catch_up_offset and map onto fsn_at_zero.
+        let Some(real_delta) = ack_wire_seq.checked_sub(self.catch_up_offset) else {
+            return Ok(None);
+        };
         let fsn = fsn_at_zero
-            .checked_add(ack_wire_seq)
+            .checked_add(real_delta)
             .ok_or(DriverError::Queue(QueueError::SequenceOverflow))?;
         Ok(Some((fsn, ack_wire_seq)))
     }
@@ -2441,8 +2686,19 @@ impl SendCursor {
         self.fsn_at_zero = log.oldest_unresolved_fsn();
         self.next_fsn = self.fsn_at_zero;
         self.next_wire_seq = 0;
+        self.catch_up_offset = 0;
         self.last_sent_wire_seq = None;
         self.sfa_cursor = None;
+    }
+
+    /// Records that `catch_up_frames` out-of-band symbol-dict catch-up frames
+    /// were sent on the fresh connection ahead of the queued replay frames. The
+    /// wire seqs they occupy (`[0, catch_up_frames)`) map to no real FSN, and the
+    /// first replay frame lands at `fsn_at_zero`. Must be called immediately
+    /// after [`Self::restart`], before any real frame is sent.
+    fn begin_catch_up(&mut self, catch_up_frames: u64) {
+        self.catch_up_offset = catch_up_frames;
+        self.next_wire_seq = catch_up_frames;
     }
 
     fn wire_seq_for_fsn(&self, fsn: u64) -> Option<u64> {
@@ -2472,6 +2728,19 @@ pub(crate) trait QwpWsCoreTransport {
 
     fn restart_connection(&mut self, _reason: ReconnectReason) -> Result<(), DriverError> {
         Ok(())
+    }
+
+    /// The server's advertised max batch size in bytes, or 0 when the server
+    /// advertised no cap. Used to split symbol-dict catch-up frames on reconnect
+    /// so no single frame exceeds it. Defaults to uncapped for test transports.
+    fn server_max_batch_size(&self) -> usize {
+        0
+    }
+
+    /// The negotiated QWP protocol version, written into catch-up frame headers.
+    /// Defaults to v1 (the only version) for test transports.
+    fn negotiated_qwp_version(&self) -> u8 {
+        1
     }
 }
 
@@ -2776,6 +3045,32 @@ impl QwpWsCoreTransport for BlockingQwpWsTransport {
     fn restart_connection(&mut self, reason: ReconnectReason) -> Result<(), DriverError> {
         self.reconnect(reason)
     }
+
+    fn server_max_batch_size(&self) -> usize {
+        self.server_max_batch_size.load(Ordering::Relaxed)
+    }
+
+    fn negotiated_qwp_version(&self) -> u8 {
+        self.negotiated_version
+    }
+}
+
+/// Failure emitting the reconnect symbol-dict catch-up (see
+/// [`QwpWsSendCore::emit_dict_catch_up`]).
+enum DictCatchUpError {
+    /// The transport dropped while sending a catch-up frame; recover by
+    /// reconnecting again.
+    Transport(TransportFailure),
+    /// A single dictionary entry does not fit the server's batch cap, so the
+    /// dictionary cannot be re-registered on the fresh server; terminal.
+    EntryTooLarge(CatchUpEntryTooLarge),
+}
+
+/// Outcome of [`QwpWsSendCore::drive_catch_up`] that the caller must act on: a
+/// transport drop (reconnect again) or a terminal error (fail the sender).
+pub(crate) enum CatchUpDriveError {
+    Transport(TransportFailure),
+    Terminal(Error),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -3340,6 +3635,10 @@ pub(crate) struct FakeOrderedServer {
     poll_responses: VecDeque<TransportResponse>,
     default_send_result: FakeSendResult,
     sent_frames: Vec<SentFrame>,
+    sent_payloads: Vec<Vec<u8>>,
+    /// Advertised max batch size in bytes (0 = uncapped), used to drive the
+    /// reconnect symbol-dict catch-up frame splitting.
+    server_max_batch_size: usize,
 }
 
 #[cfg(test)]
@@ -3366,12 +3665,26 @@ impl FakeOrderedServer {
         &self.sent_frames
     }
 
+    pub(crate) fn sent_payloads(&self) -> &[Vec<u8>] {
+        &self.sent_payloads
+    }
+
+    /// Advertise a server batch cap (bytes) so the reconnect catch-up splits its
+    /// symbol-dictionary re-registration across multiple frames (or fails when a
+    /// single entry cannot fit).
+    pub(crate) fn with_batch_cap(mut self, cap: usize) -> Self {
+        self.server_max_batch_size = cap;
+        self
+    }
+
     fn with_default(default_send_result: FakeSendResult) -> Self {
         Self {
             send_results: VecDeque::new(),
             poll_responses: VecDeque::new(),
             default_send_result,
             sent_frames: Vec::new(),
+            sent_payloads: Vec::new(),
+            server_max_batch_size: 0,
         }
     }
 }
@@ -3389,6 +3702,7 @@ impl QwpWsCoreTransport for FakeOrderedServer {
         &mut self,
         frame: OutboundFrameView<'_>,
     ) -> Result<TransportSendResult, TransportFailure> {
+        self.sent_payloads.push(frame.payload.to_vec());
         let frame = frame.sent_frame();
         let wire_seq = frame.wire_seq;
         self.sent_frames.push(frame);
@@ -3425,6 +3739,10 @@ impl QwpWsCoreTransport for FakeOrderedServer {
             ),
         })
     }
+
+    fn server_max_batch_size(&self) -> usize {
+        self.server_max_batch_size
+    }
 }
 
 #[cfg(test)]
@@ -3445,6 +3763,470 @@ mod tests {
     use super::*;
     use crate::ingress::buffer::{QwpWsColumnarBuffer, QwpWsEncodeScratch, SymbolGlobalDict};
     use crate::ingress::{Buffer, QwpWsErrorCategory, QwpWsErrorPolicy, TimestampNanos};
+
+    #[test]
+    fn catch_up_offset_maps_replay_acks_and_ignores_catch_up_acks() {
+        let mut cursor = SendCursor::new(100);
+        // Simulate a reconnect that rewound to oldest-unresolved FSN 5, then a
+        // 3-frame dictionary catch-up sent ahead of the replay frames.
+        cursor.fsn_at_zero = Some(5);
+        cursor.next_fsn = Some(5);
+        cursor.begin_catch_up(3);
+        assert_eq!(
+            cursor.next_wire_seq, 3,
+            "replay resumes past the catch-up frames"
+        );
+
+        // Two replay frames follow the catch-up: fsn 5 @ wire 3, fsn 6 @ wire 4.
+        cursor
+            .commit_sent(SentFrame {
+                fsn: 5,
+                wire_seq: 3,
+                payload_len: 0,
+            })
+            .unwrap();
+        cursor
+            .commit_sent(SentFrame {
+                fsn: 6,
+                wire_seq: 4,
+                payload_len: 0,
+            })
+            .unwrap();
+
+        // Acks for the catch-up frames (wire 0..3) resolve to no real FSN.
+        assert_eq!(cursor.ack_fsn_for_wire_seq(0).unwrap(), None);
+        assert_eq!(cursor.ack_fsn_for_wire_seq(2).unwrap(), None);
+        // Acks for the replay frames map back onto their FSNs.
+        assert_eq!(cursor.ack_fsn_for_wire_seq(3).unwrap(), Some((5, 3)));
+        assert_eq!(cursor.ack_fsn_for_wire_seq(4).unwrap(), Some((6, 4)));
+        // The reject path shares the mapping.
+        assert_eq!(cursor.reject_fsn_for_wire_seq(1).unwrap(), None);
+        assert_eq!(cursor.reject_fsn_for_wire_seq(4).unwrap(), Some((6, 4)));
+    }
+
+    #[test]
+    fn no_catch_up_leaves_wire_mapping_unchanged() {
+        // catch_up_offset stays 0 (full-dict mode / no reconnect catch-up), so the
+        // mapping is the plain fsn_at_zero + wire_seq it always was.
+        let mut cursor = SendCursor::new(100);
+        cursor.fsn_at_zero = Some(10);
+        cursor.next_fsn = Some(10);
+        cursor
+            .commit_sent(SentFrame {
+                fsn: 10,
+                wire_seq: 0,
+                payload_len: 0,
+            })
+            .unwrap();
+        cursor
+            .commit_sent(SentFrame {
+                fsn: 11,
+                wire_seq: 1,
+                payload_len: 0,
+            })
+            .unwrap();
+        assert_eq!(cursor.ack_fsn_for_wire_seq(0).unwrap(), Some((10, 0)));
+        assert_eq!(cursor.ack_fsn_for_wire_seq(1).unwrap(), Some((11, 1)));
+    }
+
+    fn write_frame_varint(out: &mut Vec<u8>, mut value: u64) {
+        while value > 0x7F {
+            out.push(((value & 0x7F) as u8) | 0x80);
+            value >>= 7;
+        }
+        out.push(value as u8);
+    }
+
+    fn read_frame_varint(buf: &[u8], mut pos: usize) -> (u64, usize) {
+        let mut value = 0u64;
+        let mut shift = 0;
+        loop {
+            let b = buf[pos];
+            pos += 1;
+            value |= u64::from(b & 0x7F) << shift;
+            if b & 0x80 == 0 {
+                return (value, pos);
+            }
+            shift += 7;
+        }
+    }
+
+    /// A valid QWP frame: 12-byte header (DELTA flag) + `[delta_start][count]` +
+    /// `[len][utf8]` symbols + a filler byte standing in for the table block the
+    /// dictionary mirror ignores.
+    fn make_delta_frame(delta_start: u64, symbols: &[&[u8]]) -> Vec<u8> {
+        let mut payload = Vec::new();
+        write_frame_varint(&mut payload, delta_start);
+        write_frame_varint(&mut payload, symbols.len() as u64);
+        for s in symbols {
+            write_frame_varint(&mut payload, s.len() as u64);
+            payload.extend_from_slice(s);
+        }
+        payload.push(0xAB); // stand-in for the table block
+        let mut frame = Vec::new();
+        frame.extend_from_slice(b"QWP1");
+        frame.push(1); // version
+        frame.push(0x08); // FLAG_DELTA_SYMBOL_DICT
+        frame.extend_from_slice(&1u16.to_le_bytes()); // table_count
+        frame.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+        frame.extend_from_slice(&payload);
+        frame
+    }
+
+    /// Asserts `frame` is a table-less full-dictionary catch-up frame carrying
+    /// exactly `expected` symbols starting at id 0.
+    fn assert_catch_up_frame(frame: &[u8], expected: &[&[u8]]) {
+        assert_eq!(&frame[0..4], b"QWP1", "catch-up frame magic");
+        assert_eq!(
+            frame[5] & 0x08,
+            0x08,
+            "catch-up frame carries the delta flag"
+        );
+        assert_eq!(
+            u16::from_le_bytes([frame[6], frame[7]]),
+            0,
+            "catch-up frame is table-less"
+        );
+        let (delta_start, p) = read_frame_varint(frame, 12);
+        assert_eq!(delta_start, 0, "catch-up re-registers from id 0");
+        let (count, mut p) = read_frame_varint(frame, p);
+        assert_eq!(count as usize, expected.len(), "catch-up entry count");
+        for exp in expected {
+            let (len, after) = read_frame_varint(frame, p);
+            let end = after + len as usize;
+            assert_eq!(&frame[after..end], *exp, "catch-up entry bytes");
+            p = end;
+        }
+        assert_eq!(p, frame.len(), "no trailing bytes after the dictionary");
+    }
+
+    #[test]
+    fn reconnect_emits_full_dict_catch_up_before_replay() {
+        let frame = make_delta_frame(0, &[b"AAPL", b"GOOG"]);
+
+        let mut driver = driver(FakeOrderedServer::no_response());
+        driver.send_core.enable_delta_dict(&[], 0);
+
+        // Send the frame: the I/O-thread mirror accumulates AAPL, GOOG.
+        driver.try_submit(&frame).unwrap();
+        driver.drive_send_once().unwrap();
+        assert_eq!(driver.send_core.dict_mirror.count(), 2);
+        assert_eq!(driver.send_core.transport.sent_payloads().len(), 1);
+
+        // The frame is unacked (NoResponse), so it stays queued for replay.
+        // Simulate a successful reconnect: restart the cursor and arm the catch-up.
+        let outcome = driver
+            .send_core
+            .finish_reconnect_success(&mut driver.store, ReconnectReason::Disconnect);
+        assert!(matches!(outcome, DriveOutcome::Reconnected { .. }));
+        assert!(driver.send_core.catch_up_pending);
+
+        // The next send re-registers the whole dictionary, then replays the frame.
+        driver.drive_send_once().unwrap();
+        assert!(!driver.send_core.catch_up_pending, "catch-up consumed");
+
+        let payloads = driver.send_core.transport.sent_payloads();
+        // [0] = original send, [1] = catch-up (table-less full dict), [2] = replay.
+        assert_eq!(payloads.len(), 3, "catch-up frame + replay emitted");
+        assert_catch_up_frame(&payloads[1], &[b"AAPL", b"GOOG"]);
+        assert_eq!(payloads[2], frame, "the original frame replays verbatim");
+    }
+
+    #[test]
+    fn recovery_seed_emits_catch_up_on_first_connect_before_replay() {
+        // Regression: a file-mode slot recovered / orphan-drained with a
+        // non-empty persisted dictionary (ids 0,1 = a,b) seeds the mirror, and
+        // its queued frames are mid-stream deltas (delta_start > 0). On the
+        // FIRST connect to a fresh server -- with NO reconnect -- the whole
+        // dictionary must be re-registered via a catch-up frame before the
+        // mid-stream frame replays, or the server cannot resolve ids
+        // [0, delta_start). The catch-up used to be armed only on reconnect, so
+        // this path replayed a delta_start > 0 frame against an empty server
+        // dictionary (undecodable / silent corruption).
+        let mut driver = driver(FakeOrderedServer::no_response());
+        driver.send_core.enable_delta_dict(&[1, b'a', 1, b'b'], 2);
+        // Enabling with a non-empty (recovered) seed arms the catch-up up front,
+        // without waiting for a reconnect.
+        assert!(
+            driver.send_core.catch_up_pending,
+            "a recovered seed must arm the first-connect catch-up"
+        );
+
+        // A queued mid-stream frame: base id 2, introduces id 2 = "c".
+        let frame = make_delta_frame(2, &[b"c"]);
+        driver.try_submit(&frame).unwrap();
+        driver.drive_send_once().unwrap();
+        assert!(
+            !driver.send_core.catch_up_pending,
+            "catch-up consumed on the first send"
+        );
+
+        let payloads = driver.send_core.transport.sent_payloads();
+        // [0] = catch-up (table-less, re-registers a,b from id 0), [1] = replay.
+        assert_eq!(payloads.len(), 2, "catch-up frame precedes the replay");
+        assert_catch_up_frame(&payloads[0], &[b"a", b"b"]);
+        assert_eq!(payloads[1], frame, "the stored frame replays verbatim");
+    }
+
+    #[test]
+    fn torn_dict_guard_rejects_a_frame_referencing_lost_symbols() {
+        let mut driver = driver(FakeOrderedServer::no_response());
+        // A recovered dictionary of two symbols (ids 0, 1).
+        driver.send_core.enable_delta_dict(&[1, b'a', 1, b'b'], 2);
+
+        // A frame whose base is within the re-registered dictionary is fine...
+        let ok = make_delta_frame(2, &[b"c"]);
+        assert!(driver.send_core.guard_dict_not_torn(&ok).is_ok());
+        // ...but a base beyond it references entries a host crash tore away (and
+        // that no surviving earlier frame carries): unrecoverable, so fail loudly.
+        let torn = make_delta_frame(5, &[b"z"]);
+        let err = driver.send_core.guard_dict_not_torn(&torn).unwrap_err();
+        assert_eq!(err.code(), ErrorCode::StoreResendRequired);
+        assert!(
+            err.msg().contains("dictionary is torn"),
+            "msg: {}",
+            err.msg()
+        );
+    }
+
+    #[test]
+    fn torn_dict_guard_in_full_dict_mode_passes_dense_frames_but_rejects_stray_deltas() {
+        // Full-dict (dense) mode: the driver mirror is disabled. A real dense frame
+        // always bases at id 0 (it re-ships its whole dictionary), so it passes.
+        let driver = driver(FakeOrderedServer::no_response());
+        let dense = make_delta_frame(0, &[b"z"]);
+        assert!(driver.send_core.guard_dict_not_torn(&dense).is_ok());
+        // But a frame basing above 0 with the mirror disabled is a lockstep
+        // violation (or a delta slot reopened with delta disabled): no catch-up will
+        // register ids [0, base), so it is rejected loudly rather than replayed into
+        // a corrupt server dictionary.
+        let stray = make_delta_frame(9, &[b"z"]);
+        let err = driver.send_core.guard_dict_not_torn(&stray).unwrap_err();
+        assert_eq!(err.code(), ErrorCode::StoreResendRequired);
+        assert!(
+            err.msg()
+                .contains("delta symbol-dictionary mode is disabled"),
+            "msg: {}",
+            err.msg()
+        );
+    }
+
+    #[test]
+    fn reconnect_error_is_terminal_treats_store_resend_required_as_terminal() {
+        // The torn-dict guard (above) and the corrupt-recovered-dict seed both
+        // fail with ErrorCode::StoreResendRequired ("resend from source"). The
+        // reconnect / failover classifier must treat that as TERMINAL so the
+        // sender's own retry loops (e.g. `reconnect_pick`) stop instead of
+        // re-reading the same unrecoverable on-disk state to their deadline --
+        // while a transient SocketError stays retryable.
+        assert!(
+            reconnect_error_is_terminal(&Error::new(
+                ErrorCode::StoreResendRequired,
+                "the affected data must be resent"
+            )),
+            "StoreResendRequired must be terminal so the reconnect loop stops"
+        );
+        assert!(
+            !reconnect_error_is_terminal(&Error::new(ErrorCode::SocketError, "connection reset")),
+            "a transient SocketError must stay retryable"
+        );
+    }
+
+    #[test]
+    fn reconnect_catch_up_splits_across_frames_when_server_caps_batch() {
+        // Five recovered symbols and a server batch cap too small for a one-frame
+        // re-registration: the driver must split the catch-up across multiple
+        // table-less frames (each within the cap), contiguous and gap-free, before
+        // the queued replay frame. Exercises emit -> multiple send_frame ->
+        // begin_catch_up(n>1) end-to-end (the split is unit-tested in SentDictMirror;
+        // this drives it through the send core).
+        let syms: Vec<Vec<u8>> = (0..5).map(|i| format!("sy{i:02}").into_bytes()).collect();
+        let mut seed = Vec::new();
+        for s in &syms {
+            write_frame_varint(&mut seed, s.len() as u64);
+            seed.extend_from_slice(s);
+        }
+        // Each entry is 5 bytes ([len=4]+4); budget = cap-12-16 = 12 fits two per
+        // frame, so 5 symbols span 3 frames.
+        let cap = 12 + 16 + 12;
+        let mut driver = driver(FakeOrderedServer::no_response().with_batch_cap(cap));
+        driver.send_core.enable_delta_dict(&seed, syms.len() as u32);
+        assert!(driver.send_core.catch_up_pending);
+
+        let replay = make_delta_frame(5, &[b"new"]);
+        driver.try_submit(&replay).unwrap();
+        driver.drive_send_once().unwrap();
+        assert!(!driver.send_core.catch_up_pending, "catch-up consumed");
+
+        let payloads = driver.send_core.transport.sent_payloads();
+        assert!(
+            payloads.len() > 2,
+            "expected a multi-frame catch-up split + replay, got {}",
+            payloads.len()
+        );
+        let (catch_up, replay_sent) = payloads.split_at(payloads.len() - 1);
+        assert!(catch_up.len() >= 2, "catch-up must span multiple frames");
+
+        // Every catch-up frame is within the cap, table-less, delta-flagged, and
+        // together they re-register all five symbols contiguously from id 0.
+        let mut expected_start = 0u64;
+        let mut reassembled: Vec<Vec<u8>> = Vec::new();
+        for f in catch_up {
+            assert!(
+                f.len() <= cap,
+                "catch-up frame ({}) exceeds cap {}",
+                f.len(),
+                cap
+            );
+            assert_eq!(&f[0..4], b"QWP1");
+            assert_eq!(f[5] & 0x08, 0x08, "catch-up carries the delta flag");
+            assert_eq!(
+                u16::from_le_bytes([f[6], f[7]]),
+                0,
+                "catch-up is table-less"
+            );
+            let (start, p) = read_frame_varint(f, 12);
+            assert_eq!(start, expected_start, "catch-up ranges are contiguous");
+            let (count, mut p) = read_frame_varint(f, p);
+            for _ in 0..count {
+                let (len, after) = read_frame_varint(f, p);
+                reassembled.push(f[after..after + len as usize].to_vec());
+                p = after + len as usize;
+            }
+            expected_start += count;
+        }
+        assert_eq!(
+            reassembled, syms,
+            "catch-up re-registers every symbol gap-free"
+        );
+        assert_eq!(
+            replay_sent[0], replay,
+            "the queued frame replays verbatim after the catch-up"
+        );
+    }
+
+    #[test]
+    fn catch_up_entry_exceeding_batch_cap_marks_terminal() {
+        // A single recovered symbol larger than the server's batch cap cannot be
+        // re-registered, so the reconnect catch-up is terminal (resend required)
+        // rather than sending an oversized frame.
+        let big = vec![b'x'; 64];
+        let mut seed = Vec::new();
+        write_frame_varint(&mut seed, big.len() as u64);
+        seed.extend_from_slice(&big);
+        let mut driver = driver(FakeOrderedServer::no_response().with_batch_cap(20));
+        driver.send_core.enable_delta_dict(&seed, 1);
+        assert!(driver.send_core.catch_up_pending);
+
+        let outcome = driver.drive_send_once().unwrap();
+        assert!(matches!(outcome, DriveOutcome::Terminal));
+        let err = driver
+            .store
+            .terminal_error()
+            .expect("terminal error recorded");
+        assert!(
+            err.msg().contains("exceeds the server") && err.msg().contains("batch cap"),
+            "msg: {}",
+            err.msg()
+        );
+        // Decided client-side from the advertised cap (nothing sent back), so it
+        // is BatchTooLarge -- the same code the foreground uses for an oversize
+        // frame -- not ServerFlushError.
+        assert_eq!(err.code(), ErrorCode::BatchTooLarge);
+    }
+
+    #[test]
+    fn drive_marks_terminal_when_a_stored_frame_outruns_the_recovered_dictionary() {
+        // A recovered dictionary of two symbols, but a stored frame bases at id 5
+        // (a host crash tore away ids [2, 5)). The guard, wired into the send loop,
+        // must mark the sender terminal rather than replay an unresolvable frame --
+        // covering the guard end-to-end, not just the predicate.
+        let mut driver = driver(FakeOrderedServer::no_response());
+        driver.send_core.enable_delta_dict(&[1, b'a', 1, b'b'], 2);
+        let torn = make_delta_frame(5, &[b"z"]);
+        driver.try_submit(&torn).unwrap();
+
+        let outcome = driver.drive_send_once().unwrap();
+        assert!(matches!(outcome, DriveOutcome::Terminal));
+        let err = driver
+            .store
+            .terminal_error()
+            .expect("terminal error recorded");
+        assert!(
+            err.msg().contains("dictionary is torn"),
+            "msg: {}",
+            err.msg()
+        );
+    }
+
+    #[test]
+    fn presend_reject_of_the_catch_up_escalates_to_terminal_not_an_infinite_loop() {
+        // A Retriable reject that maps to no FSN -- the table-less symbol-dictionary
+        // catch-up frame a reconnect emits carries no FSN, so its reject lands in
+        // `record_presend_reject`. That path must be bounded by the poison ceiling
+        // like a real-frame reject: a server that accepts the connection but keeps
+        // rejecting the catch-up (e.g. a read-only replica after an in-place role
+        // switch) would otherwise reconnect-loop forever, masking a permanent
+        // failure as a hang. It must escalate to a loud terminal after
+        // max_frame_rejections so the caller learns the queued data needs
+        // resending. (The catch-up wire-seq -> None mapping is covered by
+        // `catch_up_offset_maps_replay_acks_and_ignores_catch_up_acks`.)
+        let mut driver = driver(FakeOrderedServer::no_response());
+        let receipt = driver.try_submit(b"queued-frame").unwrap();
+        assert_eq!(
+            driver.receipt_status(receipt),
+            QwpReceiptStatus::Published { fsn: 0 },
+            "the queued frame the catch-up exists to unblock",
+        );
+
+        // The first rejections still failover (a transient / role reject may
+        // resolve on another endpoint), so they do not terminate...
+        for _ in 0..DEFAULT_MAX_FRAME_REJECTIONS - 1 {
+            let outcome = driver
+                .send_core
+                .record_presend_reject(
+                    &mut driver.store,
+                    0,
+                    write_error("replica rejects writes"),
+                    QwpWsErrorPolicy::Retriable,
+                    true,
+                )
+                .unwrap();
+            assert_ne!(outcome, DriveOutcome::Terminal, "must not terminate early");
+        }
+        // ...but with no ACK progress in between, the next one escalates.
+        let outcome = driver
+            .send_core
+            .record_presend_reject(
+                &mut driver.store,
+                0,
+                write_error("replica rejects writes"),
+                QwpWsErrorPolicy::Retriable,
+                true,
+            )
+            .unwrap();
+        assert_eq!(
+            outcome,
+            DriveOutcome::Terminal,
+            "a persistently-rejected catch-up must escalate, not loop forever",
+        );
+
+        // The queued data is surfaced as terminal (resend required) -- recoverable
+        // and reported, not silently retried into oblivion.
+        assert_eq!(
+            driver.receipt_status(receipt),
+            QwpReceiptStatus::Terminal { fsn: 0 }
+        );
+        let terminal = driver
+            .store
+            .terminal_error()
+            .expect("terminal error recorded");
+        assert!(
+            terminal.msg().contains("catch-up"),
+            "terminal error names the catch-up cause: {}",
+            terminal.msg(),
+        );
+    }
     use std::collections::VecDeque;
     #[cfg(feature = "sync-sender-qwp-ws")]
     use std::fs::File;

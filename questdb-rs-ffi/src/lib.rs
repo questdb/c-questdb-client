@@ -377,6 +377,15 @@ pub enum line_sender_error_code {
     /// `line_sender_error_invalid_api_call` so callers can recognise it without
     /// matching on the error message text.
     line_sender_error_batch_too_large = 35,
+
+    /// The QWP/WebSocket store-and-forward persisted symbol dictionary is
+    /// unrecoverable (a host/power crash tore the `.symbol-dict` side-file
+    /// relative to the queued frames), so the queued frames cannot be replayed
+    /// and the affected rows must be re-ingested from their source. Terminal.
+    /// Distinct from `line_sender_error_socket_error` (a transient, retryable
+    /// socket drop) so a caller can tell "resend from source" apart from
+    /// "reconnect and retry" by code, without matching on the message text.
+    line_sender_error_store_resend_required = 36,
 }
 
 // The client error model is unified across ingest and query:
@@ -459,6 +468,9 @@ impl From<ErrorCode> for line_sender_error_code {
             ErrorCode::NoSchema => line_sender_error_code::line_sender_error_no_schema,
             ErrorCode::ArrowExport => line_sender_error_code::line_sender_error_arrow_export,
             ErrorCode::BatchTooLarge => line_sender_error_code::line_sender_error_batch_too_large,
+            ErrorCode::StoreResendRequired => {
+                line_sender_error_code::line_sender_error_store_resend_required
+            }
             _ => line_sender_error_code::line_sender_error_invalid_api_call,
         }
     }
@@ -5393,6 +5405,11 @@ mod tests {
             (E::NoSchema, line_sender_error_no_schema, 33),
             (E::ArrowExport, line_sender_error_arrow_export, 34),
             (E::BatchTooLarge, line_sender_error_batch_too_large, 35),
+            (
+                E::StoreResendRequired,
+                line_sender_error_store_resend_required,
+                36,
+            ),
         ]
     }
 

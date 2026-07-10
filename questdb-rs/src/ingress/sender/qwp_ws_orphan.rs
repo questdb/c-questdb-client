@@ -39,6 +39,8 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 #[cfg(feature = "sync-sender-qwp-ws")]
+use crate::ingress::buffer::SymbolGlobalDict;
+#[cfg(feature = "sync-sender-qwp-ws")]
 use crate::ingress::conf::QwpWsConfig;
 #[cfg(feature = "sync-sender-qwp-ws")]
 use crate::ingress::tls::TlsSettings;
@@ -433,8 +435,18 @@ impl OrphanDrainer {
             return OrphanOpenOutcome::Stopped;
         }
         let max_in_flight = queue.max_in_flight();
+        // A delta-encoded slot's stored frames are not self-sufficient, so before
+        // replaying them to the fresh server the drainer must re-register the whole
+        // dictionary via a catch-up frame -- exactly as the foreground does on
+        // reconnect. Seed the mirror from the slot's persisted side-file (read-only
+        // here: draining only replays stored frames, so there is no write-ahead and
+        // the side-file handle stays with the queue). A dense (memory-mode) slot
+        // reports delta disabled and needs none of this.
+        let delta_dict_enabled = queue.is_delta_dict_enabled();
+        let recovered_dict_entries = queue.recovered_symbol_dict_entries().to_vec();
+        let recovered_dict_count = queue.recovered_symbol_dict_count();
         let store = QwpWsPublicationStore::new(queue, DEFAULT_EVENT_CAPACITY);
-        let send_core = QwpWsSendCore::new_with_durable_ack_and_rejection_limit(
+        let mut send_core = QwpWsSendCore::new_with_durable_ack_and_rejection_limit(
             transport,
             max_in_flight,
             ReconnectPolicy::bounded(
@@ -452,6 +464,42 @@ impl OrphanDrainer {
             *config.qwp_ws.max_frame_rejections,
             *config.qwp_ws.poison_min_escalation_window,
         );
+        if delta_dict_enabled {
+            // The orphan replay path builds no producer `SymbolGlobalDict`, so --
+            // unlike the foreground recovery paths (`new_store_and_forward` /
+            // `QwpWsReplayEncoder::seed_global_dict`, which seed one and propagate
+            // its error) -- it would otherwise arm the mirror without ever running
+            // `SymbolGlobalDict::seed`'s duplicate/torn-tail rejection. A host/power
+            // crash can zero-extend the persisted side-file into a run of empty
+            // `[len=0]` entries that inflate `recovered_dict_count`; seeding the
+            // driver mirror with that inflated count slackens the torn-dict guard
+            // (`delta_start > mirror.count()`) and lets a stored delta frame replay
+            // against a desynced dictionary -- resolving ids to the wrong / empty
+            // symbols on the fresh server (silent corruption). Validate the
+            // recovered region with the exact same check the foreground uses (the
+            // shared `SymbolGlobalDict::seed`, so the two paths cannot diverge):
+            // only arm delta if a throwaway seed rebuilds a well-formed
+            // (unique-entry) dictionary. On failure fall back to dense -- leave the
+            // mirror disabled -- so `guard_dict_not_torn` rejects any surviving
+            // `delta_start > 0` frame loudly ("resend required") instead of
+            // replaying it silently, exactly the dense fallback the queue already
+            // takes for an absent / bad-magic side-file.
+            let recovered_dict_intact = SymbolGlobalDict::new()
+                .seed(&recovered_dict_entries, recovered_dict_count)
+                .is_ok();
+            if recovered_dict_intact {
+                send_core.enable_delta_dict(&recovered_dict_entries, recovered_dict_count);
+            } else {
+                log::warn!(
+                    "QWP/WebSocket orphan slot {}: persisted symbol dictionary is \
+                     corrupt (duplicate / torn or zero-extended tail); draining with \
+                     full-dictionary (dense) frames -- any stored delta frame that \
+                     depends on the lost dictionary is rejected as resend-required \
+                     rather than replayed against a desynced dictionary.",
+                    slot_dir.display()
+                );
+            }
+        }
         OrphanOpenOutcome::Drainer(Box::new(Self {
             slot_dir,
             store,

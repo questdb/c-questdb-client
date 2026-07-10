@@ -553,6 +553,38 @@ fn spawn_mock_server() -> (u16, mpsc::Receiver<MockResult>) {
     (port, rx)
 }
 
+/// Like [`spawn_mock_server`] but for a recovered (file-mode) slot: delta mode
+/// re-registers the slot's symbol dictionary with a table-less catch-up frame
+/// (wire seq 0) before the replayed data frame (wire seq 1). Reads past the
+/// catch-up and acks the data frame so `close_drain` can complete; records only
+/// the data frame in `received_frames`.
+fn spawn_recovery_mock_server() -> (u16, mpsc::Receiver<MockResult>) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let (tx, rx) = mpsc::channel();
+
+    thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let request_lines = perform_server_upgrade(&mut stream).unwrap();
+
+        let mut received_frames = Vec::new();
+        if read_frame(&mut stream).is_ok()
+            && let Ok((_fin, _opcode, payload)) = read_frame(&mut stream)
+        {
+            received_frames.push(payload);
+            let _ = write_qwp_ok_response(&mut stream, FIRST_WIRE_SEQUENCE + 1);
+        }
+
+        let _ = tx.send(MockResult {
+            request_lines,
+            received_frames,
+        });
+        thread::sleep(Duration::from_millis(50));
+    });
+
+    (port, rx)
+}
+
 fn spawn_one_response_server(response: MockQwpResponse) -> (u16, mpsc::Receiver<MockResult>) {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();
@@ -957,8 +989,13 @@ fn spawn_manual_orphan_drain_server() -> (u16, mpsc::Receiver<Vec<u8>>) {
 
         let (mut orphan, _) = listener.accept().unwrap();
         perform_server_upgrade(&mut orphan).unwrap();
+        // Delta mode: a recovered/orphan-drained slot re-registers its whole
+        // symbol dictionary with a table-less catch-up frame (wire seq 0) before
+        // replaying the queued data frame (wire seq 1). Read past the catch-up
+        // and ack the data frame so the drain completes.
+        let (_fin, _opcode, _catch_up) = read_frame(&mut orphan).unwrap();
         let (_fin, _opcode, payload) = read_frame(&mut orphan).unwrap();
-        write_qwp_ok_response(&mut orphan, FIRST_WIRE_SEQUENCE).unwrap();
+        write_qwp_ok_response(&mut orphan, FIRST_WIRE_SEQUENCE + 1).unwrap();
         tx.send(payload).unwrap();
 
         thread::sleep(Duration::from_millis(50));
@@ -978,8 +1015,15 @@ fn spawn_manual_orphan_reject_server(status: u8) -> (u16, mpsc::Receiver<Vec<u8>
 
         let (mut orphan, _) = listener.accept().unwrap();
         perform_server_upgrade(&mut orphan).unwrap();
+        // Delta mode: the orphan re-registers its dictionary with a table-less
+        // catch-up frame (wire seq 0) before replaying the queued data frame (wire
+        // seq 1). Read past the catch-up and reject the DATA frame at seq 1, so the
+        // test exercises a rejected replayed data frame -- not the dictionary
+        // re-registration -- and reports back the data frame it was written to check.
+        let (_fin, _opcode, _catch_up) = read_frame(&mut orphan).unwrap();
         let (_fin, _opcode, payload) = read_frame(&mut orphan).unwrap();
-        write_qwp_error_response(&mut orphan, status, FIRST_WIRE_SEQUENCE, b"bad orphan").unwrap();
+        write_qwp_error_response(&mut orphan, status, FIRST_WIRE_SEQUENCE + 1, b"bad orphan")
+            .unwrap();
         tx.send(payload).unwrap();
 
         thread::sleep(Duration::from_millis(50));
@@ -2065,6 +2109,113 @@ fn qwp_ws_manual_orphan_drainer_replays_sibling_slot() {
     assert!(!orphan_slot.join(".failed").exists());
 }
 
+/// Captures the FIRST frame an orphan drainer sends, then acks it at wire seq 0
+/// (the dense-fallback case sends the data frame first, with no preceding
+/// table-less catch-up), so a corrupt-dict orphan drain can complete. The first
+/// accepted connection is the primary foreground sender (upgraded and ignored);
+/// the second is the orphan drainer.
+fn spawn_orphan_capture_first_frame_server() -> (u16, mpsc::Receiver<Vec<u8>>) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let (tx, rx) = mpsc::channel();
+
+    thread::spawn(move || {
+        // The primary foreground sender's own connection. Upgrade and ignore.
+        let (mut foreground, _) = listener.accept().unwrap();
+        perform_server_upgrade(&mut foreground).unwrap();
+
+        // The orphan drainer's connection: capture its first frame and ack it.
+        let (mut orphan, _) = listener.accept().unwrap();
+        orphan
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        orphan
+            .set_write_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        perform_server_upgrade(&mut orphan).unwrap();
+        if let Ok((_fin, _op, first)) = read_frame(&mut orphan) {
+            let _ = tx.send(first);
+            let _ = write_qwp_ok_response(&mut orphan, FIRST_WIRE_SEQUENCE);
+        }
+        thread::sleep(Duration::from_millis(50));
+    });
+
+    (port, rx)
+}
+
+#[test]
+fn qwp_ws_orphan_drain_with_zero_extended_side_file_falls_back_to_dense() {
+    // Regression for the orphan-drain seed-validation asymmetry: the orphan
+    // replay path builds no producer `SymbolGlobalDict`, so it must run the same
+    // duplicate/torn-tail validation the foreground recovery paths do before
+    // arming delta. A host/power crash can zero-extend a delta slot's
+    // `.symbol-dict` into a run of empty `[len=0]` entries that inflate the
+    // recovered count; seeding the driver mirror with that inflated count would
+    // slacken the torn-dict guard and emit a catch-up that re-registers phantom
+    // empty symbols on the fresh server (silent corruption). The drainer must
+    // instead fall back to dense (self-sufficient) replay.
+    //
+    // Observable: the orphan's FIRST sent frame is the DATA frame
+    // (`table_count >= 1`), not a table-less catch-up (`table_count == 0`).
+    // Without the validation gate the orphan would arm delta on the inflated
+    // dictionary and send the phantom catch-up first, failing this assertion.
+    let sf_dir = tempfile::TempDir::new().unwrap();
+    seed_orphan_slot(sf_dir.path());
+
+    // Simulate unflushed tail pages read back as zeros: append `[len=0]` entries
+    // to the slot's side-file so the recovered count is inflated past the one
+    // real symbol the seed persisted.
+    let side_file = sf_dir.path().join("orphan").join(".symbol-dict");
+    {
+        let mut f = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&side_file)
+            .expect("seed must have written a delta-mode side-file");
+        f.write_all(&[0u8; 4]).unwrap();
+    }
+
+    let (port, rx) = spawn_orphan_capture_first_frame_server();
+    let drain_conf = format!(
+        "qwpws::addr=127.0.0.1:{port};qwp_ws_progress=manual;\
+         sf_dir={};sender_id=primary;drain_orphans=on;\
+         max_background_drainers=1;sf_max_bytes=256;sf_max_total_bytes=1024;",
+        sf_dir.path().display()
+    );
+    let mut sender = SenderBuilder::from_conf(&drain_conf)
+        .unwrap()
+        .build()
+        .unwrap();
+
+    let mut first_frame = None;
+    for _ in 0..60 {
+        let _ = sender.drive_once().unwrap();
+        if let Ok(frame) = rx.try_recv() {
+            first_frame = Some(frame);
+            break;
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+
+    let frame = first_frame.expect("orphan drainer sent no frame");
+    assert!(
+        frame.len() >= 12 && &frame[..4] == b"QWP1",
+        "not a QWP frame: {:?}",
+        &frame[..frame.len().min(12)]
+    );
+    let table_count = u16::from_le_bytes([frame[6], frame[7]]);
+    assert!(
+        table_count >= 1,
+        "a corrupt-dict orphan must fall back to dense and replay the DATA frame \
+         first (table_count >= 1); a table-less catch-up (table_count == 0) means \
+         the inflated dictionary was seeded and phantom empty symbols were \
+         re-registered on the server. table_count = {table_count}"
+    );
+    assert!(
+        !sf_dir.path().join("orphan").join(".failed").exists(),
+        "a dense-fallback drain must keep the slot recoverable, not fail it"
+    );
+}
+
 #[test]
 fn qwp_ws_manual_orphan_drainer_walks_endpoint_list() {
     let sf_dir = tempfile::TempDir::new().unwrap();
@@ -2238,7 +2389,10 @@ fn qwp_ws_background_orphan_close_is_bounded_and_leaves_orphan_recoverable() {
 
     release_stalled_orphan.send(()).unwrap();
 
-    let (recover_port, recover_rx) = spawn_mock_server();
+    // The recovered slot delta-encodes, so it re-registers its dictionary with a
+    // catch-up frame before replaying the data frame; use a server that expects
+    // both and acks the data frame.
+    let (recover_port, recover_rx) = spawn_recovery_mock_server();
     let recover_conf = format!(
         "qwpws::addr=127.0.0.1:{recover_port};\
          sf_dir={};sender_id=orphan;sf_max_bytes=256;sf_max_total_bytes=1024;",
@@ -2262,7 +2416,7 @@ fn qwp_ws_background_orphan_close_is_bounded_and_leaves_orphan_recoverable() {
 }
 
 #[test]
-fn qwp_ws_subsequent_message_reemits_replay_dictionary_and_full_schema() {
+fn qwp_ws_subsequent_message_delta_encodes_dictionary_and_reemits_full_schema() {
     // Run two consecutive flushes against a server that processes both. We
     // build a slightly extended mock inline.
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -2317,9 +2471,9 @@ fn qwp_ws_subsequent_message_reemits_replay_dictionary_and_full_schema() {
         .unwrap();
     sender.flush(&mut buf).unwrap();
 
-    // Second flush reuses the same global symbol. The replay-safe public path
-    // still re-emits the dense dictionary prefix so the frame can stand alone
-    // after Store-and-Forward recovery or reconnect.
+    // Second flush reuses the same global symbol. In delta mode it is already
+    // registered, so the frame carries no new dictionary entries; on reconnect
+    // the driver re-registers the whole dictionary via a catch-up frame instead.
     buf.table("trades")
         .unwrap()
         .symbol("sym", "BTC-USD")
@@ -2335,11 +2489,11 @@ fn qwp_ws_subsequent_message_reemits_replay_dictionary_and_full_schema() {
 
     assert!(second.len() >= 12);
     let payload = &second[12..];
-    // delta_start = 0, delta_count = 1, followed by "BTC-USD".
-    assert_eq!(payload[0], 0x00);
-    assert_eq!(payload[1], 0x01);
-    assert_eq!(payload[2], 0x07);
-    assert_eq!(&payload[3..10], b"BTC-USD");
+    // Delta mode: "BTC-USD" is already registered (id 0), so the second frame
+    // resumes at the watermark (delta_start = 1) and ships no new symbols
+    // (delta_count = 0). The old dense encoder re-shipped the whole dictionary.
+    assert_eq!(payload[0], 0x01, "delta_start = 1");
+    assert_eq!(payload[1], 0x00, "delta_count = 0");
 
     // Replay-safe public QWP/WS frames always carry the full inline schema
     // (sym, qty) on every frame (at_now() carries no timestamp column).
@@ -3353,16 +3507,20 @@ fn spawn_dropping_then_recovering_server() -> (u16, std::sync::mpsc::Receiver<Ve
         tx.send(payload).unwrap();
         drop(s1);
 
-        // Second connection: upgrade, read replayed frame, ack it.
+        // Second connection: upgrade, then read the dictionary catch-up frame
+        // (delta mode re-registers the whole dictionary on the fresh connection
+        // via a table-less frame at wire seq 0) followed by the replayed data
+        // frame at wire seq 1, and ack that data frame.
         let (mut s2, _) = listener.accept().unwrap();
         s2.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
         s2.set_write_timeout(Some(Duration::from_secs(5))).unwrap();
         do_upgrade(&mut s2);
+        let (_fin, _op, _catch_up) = read_frame(&mut s2).unwrap();
         let (_fin, _op, payload) = read_frame(&mut s2).unwrap();
         tx.send(payload).unwrap();
         let mut ok = vec![0u8];
-        // First post-reconnect message gets sequence 0 from a fresh counter.
-        ok.extend_from_slice(&FIRST_WIRE_SEQUENCE.to_le_bytes());
+        // The catch-up consumed wire seq 0; ack the data frame at wire seq 1.
+        ok.extend_from_slice(&(FIRST_WIRE_SEQUENCE + 1).to_le_bytes());
         ok.extend_from_slice(&0u16.to_le_bytes());
         write_server_binary_frame(&mut s2, &ok).unwrap();
         thread::sleep(Duration::from_millis(50));
@@ -3406,6 +3564,112 @@ fn qwp_ws_reconnects_and_replays_in_all_progress_modes() {
     }
 }
 
+/// Parses a table-less symbol-dict catch-up frame into `(delta_start, symbols)`.
+/// Header (12) then `delta_start`, `count`, then each `[len][utf8]` symbol.
+fn catch_up_symbols(frame: &[u8]) -> (u64, Vec<Vec<u8>>) {
+    assert_eq!(&frame[0..4], b"QWP1", "catch-up frame magic");
+    assert_eq!(frame[5] & 0x08, 0x08, "catch-up carries the delta flag");
+    assert_eq!(
+        u16::from_le_bytes([frame[6], frame[7]]),
+        0,
+        "catch-up frame is table-less"
+    );
+    let mut pos = 12usize;
+    let delta_start = read_varint(frame, &mut pos);
+    let count = read_varint(frame, &mut pos);
+    let mut symbols = Vec::new();
+    for _ in 0..count {
+        let len = read_varint(frame, &mut pos) as usize;
+        symbols.push(frame[pos..pos + len].to_vec());
+        pos += len;
+    }
+    (delta_start, symbols)
+}
+
+/// Drops the first connection unacked, then on reconnect forwards the catch-up
+/// frame (wire seq 0) to the test before acking the replayed data frame (seq 1).
+fn spawn_reconnect_forwarding_catch_up_server() -> (u16, mpsc::Receiver<Vec<u8>>) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let (tx, rx) = mpsc::channel();
+
+    thread::spawn(move || {
+        // First connection: read the initial frame, then drop without acking so it
+        // stays queued for replay.
+        let (mut s1, _) = listener.accept().unwrap();
+        s1.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        perform_server_upgrade(&mut s1).unwrap();
+        let _ = read_frame(&mut s1);
+        drop(s1);
+
+        // Reconnect: forward the catch-up frame (wire seq 0), then ack the replayed
+        // data frame (wire seq 1) so the sender's wait completes.
+        let (mut s2, _) = listener.accept().unwrap();
+        s2.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        s2.set_write_timeout(Some(Duration::from_secs(5))).unwrap();
+        perform_server_upgrade(&mut s2).unwrap();
+        let (_fin, _op, catch_up) = read_frame(&mut s2).unwrap();
+        tx.send(catch_up).unwrap();
+        let (_fin, _op, _data) = read_frame(&mut s2).unwrap();
+        write_qwp_ok_response(&mut s2, FIRST_WIRE_SEQUENCE + 1).unwrap();
+        thread::sleep(Duration::from_millis(50));
+    });
+
+    (port, rx)
+}
+
+#[test]
+fn qwp_ws_reconnect_catch_up_re_registers_the_real_multi_symbol_dictionary() {
+    // Guards the encoder<->mirror seam end-to-end: the mirror accumulates the REAL
+    // encoder's delta section on every send and, on reconnect, rebuilds it into the
+    // catch-up frame. A parser/layout mismatch there would pass the synthetic-bytes
+    // unit tests yet corrupt recovery, so assert an integration catch-up carries
+    // exactly the multi-symbol dictionary the real encoder produced, in id order.
+    let (port, rx) = spawn_reconnect_forwarding_catch_up_server();
+    let builder = SenderBuilder::new(Protocol::QwpWs, "127.0.0.1", port)
+        .reconnect_initial_backoff(Duration::from_millis(20))
+        .unwrap()
+        .reconnect_max_backoff(Duration::from_millis(50))
+        .unwrap();
+    let mut sender = build_qwp_ws_sender_from_builder(ProgressCase::Background, builder);
+
+    // Two rows with distinct symbols -> the encoder interns ETH-USD (id 0) and
+    // BTC-USD (id 1) into the connection dictionary.
+    let mut buf = sender.new_buffer();
+    buf.table("trades")
+        .unwrap()
+        .symbol("sym", "ETH-USD")
+        .unwrap()
+        .column_i64("qty", 7)
+        .unwrap()
+        .at_now()
+        .unwrap();
+    buf.table("trades")
+        .unwrap()
+        .symbol("sym", "BTC-USD")
+        .unwrap()
+        .column_i64("qty", 8)
+        .unwrap()
+        .at_now()
+        .unwrap();
+    sender.flush_and_get_fsn(&mut buf).unwrap();
+    sender
+        .wait(crate::ingress::AckLevel::Ok, Duration::from_secs(5))
+        .unwrap();
+
+    let catch_up = rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    let (delta_start, symbols) = catch_up_symbols(&catch_up);
+    assert_eq!(
+        delta_start, 0,
+        "catch-up re-registers the dictionary from id 0"
+    );
+    assert_eq!(
+        symbols,
+        vec![b"ETH-USD".to_vec(), b"BTC-USD".to_vec()],
+        "catch-up re-registers the real encoder-produced dictionary in id order"
+    );
+}
+
 #[test]
 fn qwp_ws_midstream_failure_reconnects_to_next_endpoint() {
     let first_listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -3426,9 +3690,12 @@ fn qwp_ws_midstream_failure_reconnects_to_next_endpoint() {
     thread::spawn(move || {
         let (mut stream, _) = second_listener.accept().unwrap();
         perform_server_upgrade(&mut stream).unwrap();
+        // Delta mode: the reconnect re-registers the dictionary with a table-less
+        // catch-up frame (wire seq 0) before replaying the data frame (wire seq 1).
+        let (_fin, _op, _catch_up) = read_frame(&mut stream).unwrap();
         let (_fin, _op, payload) = read_frame(&mut stream).unwrap();
         tx.send(payload).unwrap();
-        write_qwp_ok_response(&mut stream, FIRST_WIRE_SEQUENCE).unwrap();
+        write_qwp_ok_response(&mut stream, FIRST_WIRE_SEQUENCE + 1).unwrap();
         thread::sleep(Duration::from_millis(50));
     });
 
@@ -3497,10 +3764,13 @@ fn qwp_ws_sync_reconnect_retries_failed_attempt() {
         s3.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
         s3.set_write_timeout(Some(Duration::from_secs(5))).unwrap();
         do_upgrade(&mut s3);
+        // Delta mode: the reconnect re-registers the dictionary with a table-less
+        // catch-up frame (wire seq 0) before replaying the data frame (wire seq 1).
+        let (_fin, _op, _catch_up) = read_frame(&mut s3).unwrap();
         let (_fin, _op, payload) = read_frame(&mut s3).unwrap();
         payload_tx.send(payload).unwrap();
         let mut ok = vec![0u8];
-        ok.extend_from_slice(&FIRST_WIRE_SEQUENCE.to_le_bytes());
+        ok.extend_from_slice(&(FIRST_WIRE_SEQUENCE + 1).to_le_bytes());
         ok.extend_from_slice(&0u16.to_le_bytes());
         write_server_binary_frame(&mut s3, &ok).unwrap();
         thread::sleep(Duration::from_millis(50));

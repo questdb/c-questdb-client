@@ -404,6 +404,24 @@ impl QuestDb {
     /// senders still open their transport on first borrow. `pool_size` is the
     /// warm minimum the reaper keeps once entries have been opened.
     ///
+    /// # Store-and-forward durability
+    ///
+    /// Disk store-and-forward (`sf_dir`) writes queued frames and their symbol
+    /// dictionary to disk but does **not** `fsync` — the data is *page-cache
+    /// durable*, matching the row-major sender. That survives a **process / JVM
+    /// crash** (unacked frames replay on the next borrow / recovery), but **not**
+    /// a **host / power crash**, which can lose or tear unflushed pages. A
+    /// recovery that finds a torn symbol dictionary (or a frame whose dictionary
+    /// cannot be re-registered on the fresh server) fails loudly with a
+    /// **terminal, resend-required** error —
+    /// [`StoreResendRequired`](crate::ErrorCode::StoreResendRequired), a code
+    /// *distinct from* the transient [`SocketError`](crate::ErrorCode::SocketError)
+    /// you would retry, so callers can branch on it directly. The sender's own
+    /// reconnect/failover loops treat it as terminal (they stop) rather than
+    /// retrying it to their deadline. Those rows must be re-ingested from their
+    /// source, not retried in place.
+    /// In-memory store-and-forward (no `sf_dir`) has no cross-restart durability.
+    ///
     pub fn connect(conf: &str) -> Result<Self> {
         let parsed = conf::parse(conf)?;
         // The main column pool is always store-and-forward, mirroring the
@@ -2221,12 +2239,12 @@ fn connect_sfa_pool(inner: &Arc<DbInner>) -> Result<ColumnSender> {
             ),
         )
     })?;
-    Ok(ColumnSender::new_store_and_forward(
+    ColumnSender::new_store_and_forward(
         state,
         inner.connector.max_buf_size(),
         inner.connector.request_durable_ack(),
         inner.connector.request_timeout(),
-    ))
+    )
 }
 
 /// Re-acquire a live connection within `deadline`, retrying with the row API's

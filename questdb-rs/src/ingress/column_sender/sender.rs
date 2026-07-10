@@ -32,12 +32,15 @@ use std::time::{Duration, Instant};
 use crate::ErrorCode;
 use crate::ingress::AckLevel;
 use crate::ingress::QwpWsSenderError;
-use crate::ingress::buffer::SymbolGlobalDict;
+use crate::ingress::buffer::{SymbolGlobalDict, SymbolGlobalDictMark};
 use crate::ingress::sender::qwp_ws::{
     SyncQwpWsHandlerState, publish_qwp_ws_payload_background, qwp_ws_acked_fsn_background,
     qwp_ws_begin_close_background, qwp_ws_check_error_background,
     qwp_ws_drain_to_deadline_background, qwp_ws_is_terminal_background, qwp_ws_ok_fsn_background,
     qwp_ws_poll_sender_error_in_range_background, qwp_ws_published_fsn_background,
+};
+use crate::ingress::sender::qwp_ws_sfa_symbol_dict::{
+    PersistedSymbolDict, PersistedSymbolDictMark,
 };
 #[cfg(feature = "arrow-ingress")]
 use crate::ingress::{ColumnName, TableName};
@@ -185,9 +188,13 @@ pub struct ColumnSender {
     backend: ColumnSenderBackend,
 }
 
+// Both variants are large (the direct backend owns a live connection; the
+// store-and-forward backend embeds the whole background handler state -- queue
+// producer, recovered dictionary, persisted side-file), so both are boxed to
+// keep `ColumnSender` itself pointer-sized as it is moved in and out of the pool.
 enum ColumnSenderBackend {
-    Direct(DirectColumnBackend),
-    StoreAndForward(SfaColumnBackend),
+    Direct(Box<DirectColumnBackend>),
+    StoreAndForward(Box<SfaColumnBackend>),
 }
 
 struct DirectColumnBackend {
@@ -200,6 +207,19 @@ struct DirectColumnBackend {
 struct SfaColumnBackend {
     state: SyncQwpWsHandlerState,
     symbol_dict: SymbolGlobalDict,
+    /// When true, SFA frames carry only the symbol ids new since the previous
+    /// frame (a delta), and the background driver re-registers the whole
+    /// dictionary via a catch-up frame on reconnect. When false, every frame
+    /// re-ships the full dictionary from id 0 (self-sufficient). Determined by
+    /// the store's mode (memory always; file iff the persisted dict opened);
+    /// see [`ColumnSender::new_store_and_forward`].
+    delta_dict_enabled: bool,
+    /// The slot's persisted symbol dictionary (file mode) for write-ahead: the
+    /// symbols each frame introduces are appended here before the frame is
+    /// published, and rolled back in lockstep with `symbol_dict` when an append
+    /// fails, so recovery / orphan-drain can rebuild the exact dictionary the
+    /// stored delta frames reference. `None` in memory mode / on open failure.
+    persisted_symbol_dict: Option<PersistedSymbolDict>,
     scratch: encoder::EncodeScratch,
     payload: Vec<u8>,
     max_buf_size: usize,
@@ -255,25 +275,44 @@ impl ColumnSender {
         first_frame_sent: bool,
     ) -> Self {
         Self {
-            backend: ColumnSenderBackend::Direct(DirectColumnBackend {
+            backend: ColumnSenderBackend::Direct(Box::new(DirectColumnBackend {
                 conn,
                 symbol_dict,
                 scratch,
                 first_frame_sent,
-            }),
+            })),
         }
     }
 
     pub(crate) fn new_store_and_forward(
-        state: SyncQwpWsHandlerState,
+        mut state: SyncQwpWsHandlerState,
         max_buf_size: usize,
         request_durable_ack: bool,
         sync_timeout: Duration,
-    ) -> Self {
-        Self {
-            backend: ColumnSenderBackend::StoreAndForward(SfaColumnBackend {
+    ) -> Result<Self> {
+        // The background driver enables its catch-up mirror on exactly the same
+        // condition as this foreground (memory mode always; file mode iff the
+        // side-file opened), so the two stay in lockstep: both emit delta, or both
+        // stay full-dict. In file mode, seed the dictionary from the recovered
+        // entries (so new symbols continue above the recovered ids) and claim the
+        // side-file for write-ahead -- the row encoder in this state is dormant for
+        // a column sender, so connect_sfa_background left the side-file for us.
+        let delta_dict_enabled = state.delta_dict_enabled;
+        let mut symbol_dict = SymbolGlobalDict::new();
+        if delta_dict_enabled {
+            // Take the recovered entries so the (potentially large) buffer is freed
+            // after seeding rather than living dead in `state` -- which the backend
+            // holds for its whole life -- for the connection's duration.
+            let recovered = std::mem::take(&mut state.recovered_dict_entries);
+            symbol_dict.seed(&recovered, state.recovered_dict_count)?;
+        }
+        let persisted_symbol_dict = state.persisted_symbol_dict.take();
+        Ok(Self {
+            backend: ColumnSenderBackend::StoreAndForward(Box::new(SfaColumnBackend {
                 state,
-                symbol_dict: SymbolGlobalDict::new(),
+                symbol_dict,
+                delta_dict_enabled,
+                persisted_symbol_dict,
                 scratch: encoder::EncodeScratch::new(),
                 payload: Vec::new(),
                 max_buf_size,
@@ -282,8 +321,8 @@ impl ColumnSender {
                 last_ok_sync_boundary: None,
                 last_durable_sync_boundary: None,
                 drop_on_return: false,
-            }),
-        }
+            })),
+        })
     }
 
     pub(crate) fn is_store_and_forward(&self) -> bool {
@@ -1151,11 +1190,13 @@ impl SfaColumnBackend {
         }
         let max_buf_size = self.effective_max_buf_size();
         // Whole-chunk fast path; only split when a single frame exceeds the cap.
-        // Each split frame is a self-sufficient replay frame committed on its
-        // own — the store-and-forward queue is frame-granular and at-least-once,
-        // so deferred (uncommitted) frames could be lost on a reconnect that
-        // trims them after their ack but before the commit. The boundary to wait
-        // for is the last frame's FSN; its cumulative ack covers the prefix.
+        // Each split frame commits on its own (never deferred) — the
+        // store-and-forward queue is frame-granular and at-least-once, so deferred
+        // (uncommitted) frames could be lost on a reconnect that trims them after
+        // their ack but before the commit. The boundary to wait for is the last
+        // frame's FSN; its cumulative ack covers the prefix. (In delta mode the
+        // frames are not individually self-sufficient; the driver re-registers the
+        // dictionary via a catch-up frame on reconnect.)
         let boundary = match self.publish_chunk_sfa(chunk, None, max_buf_size)? {
             SfaOutcome::Published(fsn) => fsn,
             SfaOutcome::TooLarge(err) => {
@@ -1182,6 +1223,69 @@ impl SfaColumnBackend {
     /// frame, check it against the cap, and append it to the queue. Returns
     /// [`SfaOutcome::TooLarge`] (nothing queued, dict rolled back) when the frame
     /// exceeds the cap so the caller can split.
+    /// Rolls the in-memory dictionary and its persisted side-file back to the
+    /// marks taken at the top of a frame's publish, discarding any symbols that
+    /// frame introduced. Keeps the side-file an exact mirror of the in-memory
+    /// dictionary, so an id the next frame reuses never maps to an abandoned
+    /// symbol on recovery. If the side-file truncate fails (a failing disk),
+    /// [`PersistedSymbolDict::rollback`] poisons the on-disk file so recovery
+    /// starts fresh (the torn-dict guard then fails loudly) instead of silently
+    /// aliasing the reused id; drop the handle so this slot stops persisting.
+    ///
+    /// Dropping the handle also disables delta encoding for subsequent frames: with
+    /// no side-file to write symbols ahead to, a delta frame appended from here on
+    /// would be unrecoverable after a restart (its base ids are gone from the
+    /// poisoned side-file). Falling back to dense (self-sufficient) frames keeps
+    /// everything ingested from here on crash-recoverable without the side-file.
+    fn rollback_frame(
+        &mut self,
+        dict_mark: SymbolGlobalDictMark,
+        pd_mark: Option<PersistedSymbolDictMark>,
+    ) {
+        self.symbol_dict.rollback(dict_mark);
+        if let Some(mark) = pd_mark {
+            let truncate_failed = self
+                .persisted_symbol_dict
+                .as_mut()
+                .is_some_and(|pd| pd.rollback(mark).is_err());
+            if truncate_failed {
+                self.persisted_symbol_dict = None;
+                self.delta_dict_enabled = false;
+            }
+        }
+    }
+
+    /// Write-ahead: appends the symbols `[from_id, next_id)` this frame introduced
+    /// to the persisted side-file before the frame is published, so a recovered /
+    /// orphan-drained slot can rebuild the dictionary its (non-self-sufficient)
+    /// delta frame references. No-op in memory mode (no side-file).
+    fn persist_new_symbols(&mut self, from_id: u64) -> crate::Result<()> {
+        let Self {
+            symbol_dict,
+            persisted_symbol_dict,
+            ..
+        } = self;
+        let Some(pd) = persisted_symbol_dict.as_mut() else {
+            return Ok(());
+        };
+        // Gather the frame's new symbols, then write them ahead in one batched
+        // write_all rather than one alloc + one write() syscall per symbol.
+        let mut new_symbols: Vec<&[u8]> = Vec::new();
+        for id in from_id..symbol_dict.next_id() {
+            let bytes = symbol_dict.entry(id).ok_or_else(|| {
+                error::fmt!(
+                    SocketError,
+                    "internal: missing symbol id {} for persistence",
+                    id
+                )
+            })?;
+            new_symbols.push(bytes);
+        }
+        pd.append_symbols(&new_symbols)
+            .map_err(|e| error::fmt!(SocketError, "could not persist symbols: {}", e))?;
+        Ok(())
+    }
+
     fn publish_chunk_sfa(
         &mut self,
         chunk: &Chunk<'_>,
@@ -1190,29 +1294,43 @@ impl SfaColumnBackend {
     ) -> std::result::Result<SfaOutcome, FlushFailure> {
         self.payload.clear();
         let dict_mark = self.symbol_dict.mark();
-        let encoded = match range {
-            None => encoder::encode_chunk_replay_into(
-                &mut self.payload,
-                chunk,
-                &mut self.symbol_dict,
-                &mut self.scratch,
-            ),
+        let dict_len_before = self.symbol_dict.next_id();
+        let pd_mark = self.persisted_symbol_dict.as_ref().map(|pd| pd.mark());
+        let view;
+        let target = match range {
+            None => chunk,
             Some((offset, count)) => {
-                let view = unsafe { chunk.slice_rows(offset, count) };
-                encoder::encode_chunk_replay_into(
-                    &mut self.payload,
-                    &view,
-                    &mut self.symbol_dict,
-                    &mut self.scratch,
-                )
+                view = unsafe { chunk.slice_rows(offset, count) };
+                &view
             }
         };
+        // Delta mode ships only the ids new since the previous frame; the driver
+        // re-registers the full dictionary on reconnect. Dense mode re-ships the
+        // whole dictionary from id 0 so every stored frame is self-sufficient.
+        // Both commit on their own (never deferred): the SFA queue is
+        // frame-granular and at-least-once.
+        let encoded = if self.delta_dict_enabled {
+            encoder::encode_chunk_into(
+                &mut self.payload,
+                target,
+                &mut self.symbol_dict,
+                &mut self.scratch,
+                false,
+            )
+        } else {
+            encoder::encode_chunk_replay_into(
+                &mut self.payload,
+                target,
+                &mut self.symbol_dict,
+                &mut self.scratch,
+            )
+        };
         if let Err(e) = encoded {
-            self.symbol_dict.rollback(dict_mark);
+            self.rollback_frame(dict_mark, pd_mark);
             return Err(FlushFailure::NotDelivered(e));
         }
         if self.payload.len() > max_buf_size {
-            self.symbol_dict.rollback(dict_mark);
+            self.rollback_frame(dict_mark, pd_mark);
             return Ok(SfaOutcome::TooLarge(error::fmt!(
                 BatchTooLarge,
                 "QWP frame ({} bytes) exceeds max_buf_size ({} bytes)",
@@ -1220,12 +1338,19 @@ impl SfaColumnBackend {
                 max_buf_size
             )));
         }
+        // Write-ahead the frame's new symbols before publishing (file mode); on any
+        // failure roll the dictionary and side-file back together so the next frame
+        // reuses the freed ids without desyncing recovery.
+        if let Err(e) = self.persist_new_symbols(dict_len_before) {
+            self.rollback_frame(dict_mark, pd_mark);
+            return Err(FlushFailure::NotDelivered(e));
+        }
         // Local append is atomic: a failed append did not accept the frame
         // (`NotDelivered`); the returned FSN is the boundary to wait for.
         match publish_qwp_ws_payload_background(&mut self.state, &self.payload, max_buf_size) {
             Ok(fsn) => Ok(SfaOutcome::Published(fsn)),
             Err(e) => {
-                self.symbol_dict.rollback(dict_mark);
+                self.rollback_frame(dict_mark, pd_mark);
                 Err(FlushFailure::NotDelivered(e))
             }
         }
@@ -1342,6 +1467,8 @@ impl SfaColumnBackend {
     ) -> std::result::Result<SfaOutcome, FlushFailure> {
         self.payload.clear();
         let dict_mark = self.symbol_dict.mark();
+        let dict_len_before = self.symbol_dict.next_id();
+        let pd_mark = self.persisted_symbol_dict.as_ref().map(|pd| pd.mark());
         let sliced;
         let batch = match range {
             None => spec.batch,
@@ -1350,20 +1477,34 @@ impl SfaColumnBackend {
                 &sliced
             }
         };
-        if let Err(e) = arrow_batch::encode_arrow_batch_replay_into(
-            &mut self.payload,
-            spec.table,
-            batch,
-            spec.ts_col_idx,
-            spec.server_stamp,
-            spec.overrides,
-            &mut self.symbol_dict,
-        ) {
-            self.symbol_dict.rollback(dict_mark);
+        let encoded = if self.delta_dict_enabled {
+            arrow_batch::encode_arrow_batch_into(
+                &mut self.payload,
+                spec.table,
+                batch,
+                spec.ts_col_idx,
+                spec.server_stamp,
+                spec.overrides,
+                &mut self.symbol_dict,
+                false,
+            )
+        } else {
+            arrow_batch::encode_arrow_batch_replay_into(
+                &mut self.payload,
+                spec.table,
+                batch,
+                spec.ts_col_idx,
+                spec.server_stamp,
+                spec.overrides,
+                &mut self.symbol_dict,
+            )
+        };
+        if let Err(e) = encoded {
+            self.rollback_frame(dict_mark, pd_mark);
             return Err(FlushFailure::NotDelivered(e));
         }
         if self.payload.len() > max_buf_size {
-            self.symbol_dict.rollback(dict_mark);
+            self.rollback_frame(dict_mark, pd_mark);
             return Ok(SfaOutcome::TooLarge(error::fmt!(
                 BatchTooLarge,
                 "QWP frame ({} bytes) exceeds max_buf_size ({} bytes)",
@@ -1371,10 +1512,16 @@ impl SfaColumnBackend {
                 max_buf_size
             )));
         }
+        // Write-ahead the frame's new symbols before publishing (file mode); see
+        // publish_chunk_sfa.
+        if let Err(e) = self.persist_new_symbols(dict_len_before) {
+            self.rollback_frame(dict_mark, pd_mark);
+            return Err(FlushFailure::NotDelivered(e));
+        }
         match publish_qwp_ws_payload_background(&mut self.state, &self.payload, max_buf_size) {
             Ok(fsn) => Ok(SfaOutcome::Published(fsn)),
             Err(e) => {
-                self.symbol_dict.rollback(dict_mark);
+                self.rollback_frame(dict_mark, pd_mark);
                 Err(FlushFailure::NotDelivered(e))
             }
         }

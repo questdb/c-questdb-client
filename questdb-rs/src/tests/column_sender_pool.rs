@@ -616,14 +616,17 @@ fn read_test_bytes<'a>(bytes: &'a [u8], pos: &mut usize) -> &'a [u8] {
     &bytes[start..start + len]
 }
 
-fn read_symbol_prefix(payload: &[u8]) -> Vec<Vec<u8>> {
+/// Returns `(delta_start, new_symbols)` from a captured frame's delta-dict
+/// prefix (header(12) then `delta_start`, count, then each new symbol).
+fn read_symbol_prefix(payload: &[u8]) -> (u64, Vec<Vec<u8>>) {
     const QWP_HEADER_LEN: usize = 12;
     let mut pos = QWP_HEADER_LEN;
-    assert_eq!(read_test_varint(payload, &mut pos), 0, "delta_start");
+    let delta_start = read_test_varint(payload, &mut pos);
     let count = read_test_varint(payload, &mut pos);
-    (0..count)
+    let symbols = (0..count)
         .map(|_| read_test_bytes(payload, &mut pos).to_vec())
-        .collect()
+        .collect();
+    (delta_start, symbols)
 }
 
 fn unused_local_port() -> u16 {
@@ -1055,7 +1058,10 @@ fn check_store_and_forward_append_timeout_rolls_back_symbols_and_keeps_chunk(ext
         "successful SFA flush should clear the chunk"
     );
     let first_payload = frames.recv_timeout(Duration::from_secs(5)).unwrap();
-    assert_eq!(read_symbol_prefix(&first_payload), vec![b"alpha".to_vec()]);
+    assert_eq!(
+        read_symbol_prefix(&first_payload),
+        (0, vec![b"alpha".to_vec()])
+    );
 
     let ts2 = [2_i64];
     let mut failed = Chunk::new("trades");
@@ -1084,9 +1090,14 @@ fn check_store_and_forward_append_timeout_rolls_back_symbols_and_keeps_chunk(ext
     sender.flush(&mut third).unwrap();
     sender.wait(AckLevel::Ok, Duration::from_secs(30)).unwrap();
     let third_payload = frames.recv_timeout(Duration::from_secs(5)).unwrap();
+    // Both storage modes delta-encode: the rolled-back "bravo" must leave no
+    // residue, so the third frame resumes from the watermark and ships only
+    // "gamma" at delta_start == 1 (bravo's would-be slot), not id 2. In file mode
+    // the dictionary rollback also truncated "bravo" from the persisted side-file,
+    // keeping it an exact mirror of the reused-id dictionary.
     assert_eq!(
         read_symbol_prefix(&third_payload),
-        vec![b"alpha".to_vec(), b"gamma".to_vec()],
+        (1, vec![b"gamma".to_vec()]),
         "failed bravo publish must not remain in the replay symbol dictionary"
     );
 }
@@ -1360,6 +1371,297 @@ fn store_and_forward_append_timeout_rolls_back_symbols_and_keeps_chunk_disk() {
 fn store_and_forward_append_timeout_rolls_back_symbols_and_keeps_chunk_memory() {
     check_store_and_forward_append_timeout_rolls_back_symbols_and_keeps_chunk(
         "pool_reap=manual;max_in_flight=1;sf_append_deadline_millis=25;",
+    );
+}
+
+#[test]
+fn store_and_forward_file_mode_writes_symbols_ahead_to_side_file() {
+    // File-mode SF delta-encodes, so each frame's new symbols are written ahead to
+    // the slot's `.symbol-dict` side-file *before* the frame is published -- that
+    // file is how a fresh process rebuilds the dictionary the stored delta frames
+    // reference. Drive two frames introducing "alpha" then "bravo" and assert the
+    // side-file mirrors them in id order. The peer never acks, so the frames stay
+    // in the slot and the side-file is not removed by a drained close.
+    let (server, _release, _frames) = MockServer::spawn_ack_when_released_capturing(1);
+    let dir = TempDir::new().unwrap();
+    let conf = conf_for_endpoints(
+        &[server.port()],
+        &sf_disk_extras(&dir, "pool_reap=manual;sender_id=recov;"),
+    );
+    let db = QuestDb::connect(&conf).unwrap();
+    let mut sender = db.borrow_column_sender().unwrap();
+
+    let mut first = Chunk::new("trades");
+    append_one_symbol_row(&mut first, b"alpha", &[1_i64]);
+    sender.flush(&mut first).unwrap();
+    let mut second = Chunk::new("trades");
+    append_one_symbol_row(&mut second, b"bravo", &[2_i64]);
+    sender.flush(&mut second).unwrap();
+
+    // Header (8 bytes) + [len=5]"alpha" + [len=5]"bravo": the write-ahead persisted
+    // both symbols, in ascending id order, exactly as a delta section carries them.
+    let side_file = dir.path().join("recov").join(".symbol-dict");
+    let bytes = std::fs::read(&side_file).expect("side-file must exist after file-mode flushes");
+    assert_eq!(
+        &bytes[8..],
+        b"\x05alpha\x05bravo",
+        "write-ahead must persist both symbols in id order"
+    );
+}
+
+#[test]
+fn store_and_forward_file_mode_recovers_and_replays_queued_frame_after_reopen() {
+    // Recoverability round-trip for the disk-backed column sender: a symbol frame
+    // flushed to a file-mode slot but left unacked must survive the sender/db being
+    // dropped (a process restart) and be replayed + delivered when a FRESH QuestDb
+    // reopens the same slot -- proving the queued data (and its persisted
+    // dictionary) is recovered from disk, not abandoned. Complements
+    // store_and_forward_file_mode_writes_symbols_ahead_to_side_file, which asserts
+    // only that the side-file bytes are written, never that they are recovered.
+    let dir = TempDir::new().unwrap();
+
+    // Phase 1: queue a symbol frame to the slot against a peer that never acks,
+    // then drop everything so only the on-disk slot survives.
+    {
+        let dead = MockServer::spawn_upgrade_then_close(1);
+        let conf = conf_for_endpoints(
+            &[dead.port()],
+            &sf_disk_extras(&dir, "pool_reap=manual;sender_id=recov;"),
+        );
+        let db = QuestDb::connect(&conf).unwrap();
+        let mut sender = db.borrow_column_sender().unwrap();
+        let mut chunk = Chunk::new("trades");
+        append_one_symbol_row(&mut chunk, b"alpha", &[1_i64]);
+        sender.flush(&mut chunk).unwrap();
+        drop(sender);
+        drop(db);
+    }
+
+    // Phase 2: a fresh acking peer + a fresh QuestDb over the SAME slot dir and
+    // sender_id. The recovered slot replays its queued frame there autonomously
+    // (background runner), re-registering the recovered dictionary via a catch-up
+    // first. (No port reuse: the on-disk slot, not the address, carries the data.)
+    let (live, frames) = MockServer::spawn_acking_capturing(4);
+    let conf = conf_for_endpoints(
+        &[live.port()],
+        &sf_disk_extras(&dir, "pool_reap=manual;sender_id=recov;"),
+    );
+    let db = QuestDb::connect(&conf).unwrap();
+    let _sender = db.borrow_column_sender().unwrap();
+
+    // Count replayed DATA frames (table_count >= 1 at bytes 6..8); the table-less
+    // catch-up frame that precedes them carries table_count == 0.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut data_frames = 0usize;
+    while Instant::now() < deadline && data_frames == 0 {
+        data_frames += frames
+            .try_iter()
+            .filter(|f| {
+                f.len() >= 12 && &f[..4] == b"QWP1" && u16::from_le_bytes([f[6], f[7]]) >= 1
+            })
+            .count();
+        thread::sleep(Duration::from_millis(50));
+    }
+    assert!(
+        data_frames >= 1,
+        "the reopened slot must replay the queued data frame to the fresh peer"
+    );
+    assert_eq!(
+        live.accepted(),
+        1,
+        "recovery must connect to the fresh peer and replay exactly once"
+    );
+}
+
+#[test]
+fn store_and_forward_file_mode_torn_dictionary_fails_terminal_and_keeps_data() {
+    // `new_store_and_forward` Err teardown + the terminal error taxonomy: a
+    // file-mode column slot whose persisted `.symbol-dict` was torn by a
+    // host/power crash (a zero-extended tail) must fail the borrow LOUDLY and
+    // TERMINALLY -- `ErrorCode::StoreResendRequired`, a code distinct from a
+    // transient `SocketError` so a caller can tell "resend from source" apart from
+    // "reconnect and retry" -- and must leave the queued segments on disk
+    // (recoverable), never delete or poison them on this borrow. It also pins that
+    // the failing borrow returns a clean Err (no hang, no panic-abort under FFI).
+    use std::io::Write;
+
+    let dir = TempDir::new().unwrap();
+
+    // Phase 1: queue a symbol frame to a file-mode slot (the write-ahead persists
+    // the dictionary), then drop so only the on-disk slot survives.
+    {
+        let dead = MockServer::spawn_upgrade_then_close(1);
+        let conf = conf_for_endpoints(
+            &[dead.port()],
+            &sf_disk_extras(&dir, "pool_reap=manual;sender_id=recov;"),
+        );
+        let db = QuestDb::connect(&conf).unwrap();
+        let mut sender = db.borrow_column_sender().unwrap();
+        let mut chunk = Chunk::new("trades");
+        append_one_symbol_row(&mut chunk, b"alpha", &[1_i64]);
+        sender.flush(&mut chunk).unwrap();
+        drop(sender);
+        drop(db);
+    }
+
+    // A host/power crash zero-extends the side-file: the unflushed tail pages read
+    // back as zeros, which parse as a run of empty `[len=0]` entries -- a torn
+    // dictionary the producer recovery seed rejects.
+    let side_file = dir.path().join("recov").join(".symbol-dict");
+    {
+        let mut f = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&side_file)
+            .expect("phase 1 must have written a delta-mode side-file");
+        f.write_all(&[0u8; 4]).unwrap();
+    }
+
+    // Phase 2: reopen the SAME slot. Seeding the producer dictionary from the
+    // recovered (now torn) region must fail terminally at connect or borrow.
+    let dead = MockServer::spawn_upgrade_then_close(1);
+    let conf = conf_for_endpoints(
+        &[dead.port()],
+        &sf_disk_extras(&dir, "pool_reap=manual;sender_id=recov;"),
+    );
+    let err = match QuestDb::connect(&conf) {
+        Ok(db) => db
+            .borrow_column_sender()
+            .expect_err("a torn recovered dictionary must fail the borrow, not silently proceed"),
+        Err(e) => e,
+    };
+    assert_eq!(
+        err.code(),
+        ErrorCode::StoreResendRequired,
+        "a torn recovered dict must be terminal resend-required, not a transient \
+         SocketError the reconnect loop would retry: {}",
+        err.msg()
+    );
+
+    // The queued data must stay recoverable on disk: a terminal resend-required
+    // failure records the error, it does not delete or poison the slot's segments.
+    let segment_survives = std::fs::read_dir(dir.path().join("recov"))
+        .unwrap()
+        .filter_map(Result::ok)
+        .any(|e| e.path().extension().is_some_and(|ext| ext == "sfa"));
+    assert!(
+        segment_survives,
+        "the queued frame's segment must survive a terminal borrow (recoverable)"
+    );
+}
+
+#[test]
+fn store_and_forward_file_mode_recovers_a_mid_stream_delta_frame() {
+    // The entire point of the persisted side-file + catch-up: a NON-self-sufficient
+    // stored frame (`delta_start > 0`) becomes recoverable across a process
+    // restart. Phase 1 flushes two distinct symbols to a file-mode slot, so the
+    // second frame is a mid-stream delta (`delta_start = 1`) that references a
+    // symbol registered by the first frame. Both are left unacked. Phase 2 reopens
+    // the slot against a fresh server that never saw the dictionary: recovery must
+    // re-register the whole dictionary (alpha, bravo) via a table-less catch-up,
+    // then replay BOTH data frames -- including the mid-stream delta -- so the
+    // fresh server can resolve its ids. Complements the reconnect-level catch-up
+    // test and the `delta_start = 0` recovery test, neither of which exercises a
+    // recovered `delta_start > 0` frame end-to-end.
+    let dir = TempDir::new().unwrap();
+
+    // Phase 1: alpha (id 0) then bravo (id 1 -> the second frame bases at 1), both
+    // unacked, then drop so only the on-disk slot survives.
+    {
+        let dead = MockServer::spawn_upgrade_then_close(1);
+        let conf = conf_for_endpoints(
+            &[dead.port()],
+            &sf_disk_extras(&dir, "pool_reap=manual;sender_id=recov;"),
+        );
+        let db = QuestDb::connect(&conf).unwrap();
+        let mut sender = db.borrow_column_sender().unwrap();
+        let mut first = Chunk::new("trades");
+        append_one_symbol_row(&mut first, b"alpha", &[1_i64]);
+        sender.flush(&mut first).unwrap();
+        let mut second = Chunk::new("trades");
+        append_one_symbol_row(&mut second, b"bravo", &[2_i64]);
+        sender.flush(&mut second).unwrap();
+        drop(sender);
+        drop(db);
+    }
+
+    // Phase 2: fresh acking server + fresh QuestDb over the SAME slot. It replays
+    // autonomously (background runner): a table-less catch-up (table_count 0) then
+    // the two data frames (table_count >= 1).
+    let (live, frames) = MockServer::spawn_acking_capturing(8);
+    let conf = conf_for_endpoints(
+        &[live.port()],
+        &sf_disk_extras(&dir, "pool_reap=manual;sender_id=recov;"),
+    );
+    let db = QuestDb::connect(&conf).unwrap();
+    let _sender = db.borrow_column_sender().unwrap();
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut captured: Vec<Vec<u8>> = Vec::new();
+    while Instant::now() < deadline {
+        captured.extend(frames.try_iter());
+        let data_seen = captured
+            .iter()
+            .filter(|f| {
+                f.len() >= 12 && &f[..4] == b"QWP1" && u16::from_le_bytes([f[6], f[7]]) >= 1
+            })
+            .count();
+        if data_seen >= 2 {
+            break;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+
+    let qwp: Vec<&Vec<u8>> = captured
+        .iter()
+        .filter(|f| f.len() >= 12 && &f[..4] == b"QWP1")
+        .collect();
+    let catch_ups: Vec<&Vec<u8>> = qwp
+        .iter()
+        .copied()
+        .filter(|f| u16::from_le_bytes([f[6], f[7]]) == 0)
+        .collect();
+    let data_frames: Vec<&Vec<u8>> = qwp
+        .iter()
+        .copied()
+        .filter(|f| u16::from_le_bytes([f[6], f[7]]) >= 1)
+        .collect();
+
+    // The recovered slot re-registers the whole dictionary from id 0 before replay.
+    let catch_up = catch_ups
+        .first()
+        .expect("recovery must re-register the dictionary via a table-less catch-up first");
+    let (cu_start, cu_syms) = parse_delta_dict_prefix(catch_up);
+    assert_eq!(cu_start, 0, "catch-up re-registers from id 0");
+    assert_eq!(
+        cu_syms,
+        vec![b"alpha".to_vec(), b"bravo".to_vec()],
+        "catch-up re-registers the whole recovered dictionary in id order"
+    );
+
+    assert_eq!(
+        data_frames.len(),
+        2,
+        "both queued frames replay after recovery"
+    );
+    // The second data frame is a recovered MID-STREAM delta: it bases at id 1
+    // (above 0, so it is NOT self-sufficient -- it relies on the catch-up having
+    // re-registered the id-0 prefix) and ships only its own new symbol. Proving a
+    // `delta_start > 0` frame survived the restart and replays correctly is the
+    // whole point of the persisted dictionary + catch-up.
+    let (start2, syms2) = parse_delta_dict_prefix(data_frames[1]);
+    assert_eq!(
+        start2, 1,
+        "the recovered second frame is a mid-stream delta (bases above id 0)"
+    );
+    assert_eq!(
+        syms2,
+        vec![b"bravo".to_vec()],
+        "the mid-stream frame ships its own new symbol (bravo, id 1)"
+    );
+    assert_eq!(
+        live.accepted(),
+        1,
+        "recovery connects to the fresh peer and replays exactly once"
     );
 }
 
@@ -2862,6 +3164,68 @@ fn symbol_dict_reuse_resends_only_new_symbols_on_the_wire() {
 }
 
 #[test]
+fn sfa_symbol_dict_reuse_delta_encodes_second_frame() {
+    let (server, frames) = MockServer::spawn_acking_capturing(2);
+    let db = QuestDb::connect(&conf_for(server.port(), "")).unwrap();
+    // borrow_column_sender is memory-mode store-and-forward, where delta symbol
+    // dictionaries are now enabled: the background driver re-registers the whole
+    // dictionary via a catch-up frame on reconnect, so per-frame deltas are safe.
+    let mut sender = db.borrow_column_sender().expect("borrow");
+
+    let dict_bytes = b"alphabetagamma";
+    let dict_offsets: [i32; 4] = [0, 5, 9, 14];
+
+    let mut chunk = Chunk::new("trades");
+    chunk
+        .symbol_i32("sym", &[0, 2, 0, 2], &dict_offsets, dict_bytes, None)
+        .unwrap();
+    chunk.at_nanos(&[1, 2, 3, 4]).unwrap();
+    sender.flush(&mut chunk).unwrap();
+    sender
+        .wait(AckLevel::Ok, Duration::from_secs(30))
+        .expect("symbol flush 1");
+
+    chunk
+        .symbol_i32("sym", &[1, 0, 1, 0], &dict_offsets, dict_bytes, None)
+        .unwrap();
+    chunk.at_nanos(&[5, 6, 7, 8]).unwrap();
+    sender.flush(&mut chunk).unwrap();
+    sender
+        .wait(AckLevel::Ok, Duration::from_secs(30))
+        .expect("symbol flush 2");
+
+    drop(sender);
+    drop(db);
+    drop(server);
+
+    let captured: Vec<Vec<u8>> = frames.try_iter().collect();
+    let data_frames: Vec<Vec<u8>> = captured
+        .into_iter()
+        .filter(|f| f.len() >= 12 && &f[..4] == b"QWP1" && u16::from_le_bytes([f[6], f[7]]) >= 1)
+        .collect();
+    assert_eq!(data_frames.len(), 2, "expected two SFA data frames");
+
+    // First frame interns alpha (id 0) and gamma (id 1) starting at id 0.
+    let (start0, syms0) = parse_delta_dict_prefix(&data_frames[0]);
+    assert_eq!(start0, 0);
+    assert_eq!(syms0, vec![b"alpha".to_vec(), b"gamma".to_vec()]);
+
+    // Memory-mode SFA now delta-encodes: the second frame resumes from the global
+    // watermark (id 2) and ships only the new symbol, instead of re-shipping the
+    // whole dictionary from id 0 as the old dense encoder did.
+    let (start1, syms1) = parse_delta_dict_prefix(&data_frames[1]);
+    assert_eq!(
+        start1, 2,
+        "SFA second frame resumes from the global watermark (delta)"
+    );
+    assert_eq!(
+        syms1,
+        vec![b"beta".to_vec()],
+        "SFA resends only the new symbol"
+    );
+}
+
+#[test]
 fn server_error_latches_conn_and_pool_drops_it() {
     // Status 0x09 = QWP write error → ServerFlushError.
     let server = MockServer::spawn_erroring(4, 0x09);
@@ -3494,6 +3858,57 @@ fn store_and_forward_arrow_batch_at_column_reports_fsn_progress() {
             .unwrap()
             .is_some_and(|acked| acked >= fsn),
         "acked watermark must cover Arrow at-column FSN"
+    );
+}
+
+#[cfg(feature = "arrow-ingress")]
+#[test]
+fn store_and_forward_file_mode_arrow_symbol_writes_symbols_ahead_to_side_file() {
+    // The Arrow SFA path (`publish_arrow_sfa`) delta-encodes symbol columns and
+    // write-aheads their symbols to the slot's `.symbol-dict` side-file, exactly
+    // like the chunk path (`store_and_forward_file_mode_writes_symbols_ahead_to_side_file`).
+    // A batch whose SYMBOL column introduces "alpha" then "bravo" must persist both
+    // in id order before the (unacked) frame is queued. The peer never acks, so the
+    // frame stays in the slot and the side-file is not removed by a drained close.
+    use std::sync::Arc;
+
+    use arrow::array::{Float64Array, RecordBatch, StringArray};
+    use arrow::datatypes::{DataType, Field, Schema};
+
+    use crate::ingress::column_sender::ArrowColumnOverride;
+
+    let (server, _release, _frames) = MockServer::spawn_ack_when_released_capturing(1);
+    let dir = TempDir::new().unwrap();
+    let conf = conf_for_endpoints(
+        &[server.port()],
+        &sf_disk_extras(&dir, "pool_reap=manual;sender_id=recov;"),
+    );
+    let db = QuestDb::connect(&conf).unwrap();
+    let mut sender = db.borrow_column_sender().unwrap();
+
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("sym", DataType::Utf8, false),
+        Field::new("price", DataType::Float64, false),
+    ]));
+    let sym = Arc::new(StringArray::from(vec!["alpha", "bravo"]));
+    let price = Arc::new(Float64Array::from(vec![1.0, 2.0]));
+    let batch = RecordBatch::try_new(schema, vec![sym, price]).unwrap();
+
+    let overrides = [ArrowColumnOverride::Symbol { column: "sym" }];
+    sender
+        .flush_arrow_batch_at_now_and_get_fsn("trades", &batch, &overrides)
+        .expect("Arrow SFA symbol flush should publish")
+        .expect("non-empty Arrow batch publishes a frame");
+
+    // Header (8) + [len=5]"alpha" + [len=5]"bravo": the Arrow write-ahead persisted
+    // both symbols, in ascending id order, exactly as the chunk path does.
+    let side_file = dir.path().join("recov").join(".symbol-dict");
+    let bytes =
+        std::fs::read(&side_file).expect("side-file must exist after an Arrow symbol flush");
+    assert_eq!(
+        &bytes[8..],
+        b"\x05alpha\x05bravo",
+        "Arrow write-ahead must persist both symbols in id order"
     );
 }
 

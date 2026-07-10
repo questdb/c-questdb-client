@@ -51,7 +51,14 @@ pub enum ErrorCode {
     /// Called methods in the wrong order. E.g. `symbol` after `column`.
     InvalidApiCall,
 
-    /// A network error connecting or flushing data out.
+    /// A network error connecting or flushing data out. **Transient** — obtain a
+    /// fresh connection (or let the pool rotate) and retry.
+    ///
+    /// The terminal, resend-required failure of the QWP/WebSocket
+    /// store-and-forward persisted symbol dictionary is a *distinct* code,
+    /// [`StoreResendRequired`](Self::StoreResendRequired), so a caller can tell it
+    /// apart from a retryable socket drop **by code**, without matching on the
+    /// error message text.
     SocketError,
 
     /// The TCP connect (dial) to the server exceeded the configured
@@ -205,6 +212,20 @@ pub enum ErrorCode {
     /// [`InvalidApiCall`](Self::InvalidApiCall) so callers can recognise it
     /// without matching on the error message text.
     BatchTooLarge,
+
+    /// The QWP/WebSocket store-and-forward persisted symbol dictionary is
+    /// unrecoverable, so the queued frames that reference it cannot be replayed:
+    /// a host/power crash tore the `.symbol-dict` side-file relative to the
+    /// queued frames, or it could not be written ahead of them. Retrying the
+    /// connection will not help — the affected rows must be **re-ingested from
+    /// their source**.
+    ///
+    /// Terminal, and **distinct from [`SocketError`](Self::SocketError)** (a
+    /// transient, retryable socket drop) so a caller can tell "resend from
+    /// source" apart from "reconnect and retry" **by code**, without matching on
+    /// the error message text. The sender's own reconnect/failover loops treat it
+    /// as terminal (they stop) rather than retrying it to their deadline.
+    StoreResendRequired,
 }
 
 /// An error that occurred when using the QuestDB client library.
@@ -515,6 +536,7 @@ mod tests {
                 ErrorCode::NoSchema => {}
                 ErrorCode::ArrowExport => {}
                 ErrorCode::BatchTooLarge => {}
+                ErrorCode::StoreResendRequired => {}
             }
         }
         let _ = _exhaustive;

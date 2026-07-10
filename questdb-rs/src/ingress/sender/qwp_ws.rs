@@ -50,11 +50,11 @@ use super::qwp_ws_codec::{
 #[cfg(test)]
 use super::qwp_ws_driver::QwpWsCoreTestHarness;
 use super::qwp_ws_driver::{
-    BlockingQwpWsTransport, CloseOutcome, DriveOutcome, DriverError, DriverEvent,
-    PublicationLifecycle, PublicationLog, PublicationState, QwpWsCoreTransport, QwpWsCounters,
-    QwpWsHotResponseProgress, QwpWsHotSendProgress, QwpWsPublicationStore, QwpWsReconnectState,
-    QwpWsReconnectStep, QwpWsSendCore, QwpWsTransportFailureAction, ReconnectPolicy,
-    ReconnectReason, TransportFailure, TransportPoll, TransportResponse,
+    BlockingQwpWsTransport, CatchUpDriveError, CloseOutcome, DriveOutcome, DriverError,
+    DriverEvent, PublicationLifecycle, PublicationLog, PublicationState, QwpWsCoreTransport,
+    QwpWsCounters, QwpWsHotResponseProgress, QwpWsHotSendProgress, QwpWsPublicationStore,
+    QwpWsReconnectState, QwpWsReconnectStep, QwpWsSendCore, QwpWsTransportFailureAction,
+    ReconnectPolicy, ReconnectReason, TransportFailure, TransportPoll, TransportResponse,
     reconnect_error_is_terminal, reconnect_sleep_duration, retry_budget_exhausted_error,
 };
 use super::qwp_ws_orphan::{
@@ -65,6 +65,7 @@ use super::qwp_ws_publisher::{QwpWsReplayEncoder, qwp_ws_encoded_message_size_er
 use super::qwp_ws_queue::OutboundFrame;
 use super::qwp_ws_sfa_queue::{SfaMemoryQueueOptions, SfaProducer, SfaProgressView};
 use super::qwp_ws_sfa_slot::{SfaSlotOptions, SfaSlotQueue};
+use super::qwp_ws_sfa_symbol_dict::PersistedSymbolDict;
 
 // ---------- transport ----------
 
@@ -178,6 +179,17 @@ struct QwpWsConnectedParts {
     encoder: QwpWsReplayEncoder,
     store: QwpWsPublicationStore<SfaSlotQueue>,
     send_core: QwpWsSendCore<BlockingQwpWsTransport>,
+    /// Delta symbol-dict mode for the slot (memory always; file iff the side-file
+    /// opened). Drives both the encoder and the driver mirror.
+    delta_dict_enabled: bool,
+    /// Recovered symbol-dict entries (`[len][utf8]...`) + count, to seed the
+    /// producer dict and the driver mirror on file-mode recovery / orphan-drain.
+    /// Empty otherwise.
+    recovered_dict_entries: Vec<u8>,
+    recovered_dict_count: u32,
+    /// The slot's persisted symbol dictionary (file mode) for the foreground's
+    /// write-ahead. `None` in memory mode / on open failure.
+    persisted_symbol_dict: Option<PersistedSymbolDict>,
 }
 
 pub(crate) struct SyncQwpWsHandlerState {
@@ -186,6 +198,23 @@ pub(crate) struct SyncQwpWsHandlerState {
     pub(crate) server_max_batch_size: Arc<AtomicUsize>,
     orphan_pool: Option<OrphanDrainerPool>,
     close_drain_timeout: Duration,
+    /// Whether the background driver enabled its symbol-dict catch-up mirror
+    /// (memory mode always; file mode iff the persisted side-file opened). The
+    /// column foreground reads this so it emits delta frames on exactly the same
+    /// condition — the two must stay in lockstep.
+    pub(crate) delta_dict_enabled: bool,
+    /// Symbols recovered from the slot's persisted dictionary on a file-mode
+    /// reconnect/adopt, in id order (empty in memory mode / on a fresh slot).
+    /// Seeds whichever foreground dictionary owns this state so newly ingested
+    /// symbols continue above the recovered ids.
+    pub(crate) recovered_dict_entries: Vec<u8>,
+    pub(crate) recovered_dict_count: u32,
+    /// The slot's persisted symbol dictionary (file mode) for foreground
+    /// write-ahead. Routed to whichever foreground owns this state — the row
+    /// encoder in [`connect_qwp_ws`] or the column backend in
+    /// [`super::column_sender::ColumnSender::new_store_and_forward`]; the two are
+    /// mutually exclusive. `None` in memory mode / on side-file open failure.
+    pub(crate) persisted_symbol_dict: Option<PersistedSymbolDict>,
 }
 
 pub(crate) struct ManualQwpWsHandlerState {
@@ -238,6 +267,14 @@ struct QwpWsPendingConnect {
     max_in_flight: usize,
     durable_ack: bool,
     server_max_batch_size: Arc<AtomicUsize>,
+    /// Whether the I/O thread enables its symbol-dict catch-up mirror once
+    /// connected (memory mode always; file mode iff the side-file opened).
+    delta_dict_enabled: bool,
+    /// Symbols recovered from the slot's persisted dictionary (file mode), in id
+    /// order, used to seed the catch-up mirror when the send core is first built.
+    /// Empty in memory mode / on a fresh slot.
+    recovered_dict_entries: Vec<u8>,
+    recovered_dict_count: u32,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -666,6 +703,9 @@ impl QwpWsPendingConnect {
         max_in_flight: usize,
         durable_ack: bool,
         server_max_batch_size: Arc<AtomicUsize>,
+        delta_dict_enabled: bool,
+        recovered_dict_entries: Vec<u8>,
+        recovered_dict_count: u32,
     ) -> Self {
         Self {
             host: host.to_string(),
@@ -682,6 +722,9 @@ impl QwpWsPendingConnect {
             max_in_flight,
             durable_ack,
             server_max_batch_size,
+            delta_dict_enabled,
+            recovered_dict_entries,
+            recovered_dict_count,
         }
     }
 
@@ -773,7 +816,7 @@ impl SyncQwpWsPendingRunnerCore {
 
         match self.pending_connect.connect_with_retry(stop) {
             Ok(Some(transport)) => {
-                let send_core = QwpWsSendCore::new_with_durable_ack_and_rejection_limit(
+                let mut send_core = QwpWsSendCore::new_with_durable_ack_and_rejection_limit(
                     transport,
                     self.pending_connect.max_in_flight,
                     self.pending_connect.reconnect_policy,
@@ -781,6 +824,21 @@ impl SyncQwpWsPendingRunnerCore {
                     *self.pending_connect.qwp_ws.max_frame_rejections,
                     *self.pending_connect.qwp_ws.poison_min_escalation_window,
                 );
+                // Enable the symbol-dict catch-up mirror on the same condition the
+                // foreground delta-encodes (memory mode always; file mode iff the
+                // side-file opened), seeding it from any recovered dictionary so
+                // the mirror's count matches the producer's baseline. The two must
+                // stay in lockstep.
+                if self.pending_connect.delta_dict_enabled {
+                    // Take the recovered entries so the buffer is freed after
+                    // seeding the mirror rather than living dead in
+                    // `pending_connect` (a permanent runner field) for the
+                    // connection's life.
+                    let recovered =
+                        std::mem::take(&mut self.pending_connect.recovered_dict_entries);
+                    send_core
+                        .enable_delta_dict(&recovered, self.pending_connect.recovered_dict_count);
+                }
                 self.connected = Some(SyncQwpWsRunnerCore {
                     send_core,
                     progress: self.progress.clone(),
@@ -837,10 +895,36 @@ where
             return self.finish_pending_reconnect(shared, stop, Duration::ZERO, None);
         }
 
+        // Re-register the whole symbol dictionary via a catch-up frame before the
+        // first replay frame, when a reconnect armed it (delta mode). The manual
+        // send path does the same in QwpWsSendCore::drive_send_available.
+        match self.send_core.drive_catch_up() {
+            Ok(()) => {}
+            Err(CatchUpDriveError::Transport(failure)) => {
+                return self.apply_transport_failure(shared, stop, failure);
+            }
+            Err(CatchUpDriveError::Terminal(err)) => {
+                // A terminal catch-up failure (the dictionary cannot be
+                // re-registered -- resend required) is a storage/data-integrity
+                // outcome, not a transport drop, so classify it the same as the
+                // sibling torn-dictionary guard below.
+                return self.store_shared_driver_error(shared, DriverError::Storage(err));
+            }
+        }
+
         let outbound = match self.send_core.next_outbound_sfa_frame(&self.progress) {
             Ok(outbound) => outbound,
             Err(err) => return self.store_shared_driver_error(shared, err),
         };
+        // Torn-dictionary guard (file mode): a replayed delta frame whose base
+        // exceeds the re-registered dictionary is unrecoverable -- fail loudly
+        // rather than send the server a frame it cannot decode.
+        if let Some(frame) = outbound.as_ref()
+            && let Err(err) =
+                frame.with_view(|view| self.send_core.guard_dict_not_torn(view.payload))
+        {
+            return self.store_shared_driver_error(shared, DriverError::Storage(err));
+        }
 
         let send_step = match outbound {
             Some(outbound) => self.finish_send(shared, stop, outbound),
@@ -2802,9 +2886,19 @@ pub(crate) fn connect_qwp_ws(
     qwp_ws: &QwpWsConfig,
     auth_header: Option<String>,
 ) -> crate::Result<SyncProtocolHandler> {
-    Ok(SyncProtocolHandler::SyncQwpWs(Box::new(
-        connect_qwp_ws_background_state(host, port, use_tls, tls_settings, qwp_ws, auth_header)?,
-    )))
+    let mut state =
+        connect_qwp_ws_background_state(host, port, use_tls, tls_settings, qwp_ws, auth_header)?;
+    // Row background sender: the encoder is the delta encode surface, so it owns
+    // the slot's persisted symbol dictionary for write-ahead. (The column sender
+    // claims it in new_store_and_forward instead; the two are mutually exclusive.)
+    let persisted = state.persisted_symbol_dict.take();
+    state.encoder.set_persisted_symbol_dict(persisted);
+    // The row encoder was already seeded from the recovered entries inside
+    // connect_qwp_ws_background_state (and the driver mirror seeds from the send
+    // core / pending_connect, not from here), so the copy kept in the handler
+    // state is dead weight for the row path -- free it.
+    let _ = std::mem::take(&mut state.recovered_dict_entries);
+    Ok(SyncProtocolHandler::SyncQwpWs(Box::new(state)))
 }
 
 pub(crate) fn connect_qwp_ws_background_state(
@@ -2824,8 +2918,23 @@ pub(crate) fn connect_qwp_ws_background_state(
         auth_header.clone(),
     );
     let server_max_batch_size = Arc::new(AtomicUsize::new(0));
-    let (runner, encoder) = if *qwp_ws.initial_connect_retry == QwpWsInitialConnectMode::Async {
-        let queue = open_configured_qwp_ws_queue(qwp_ws)?;
+    let (
+        runner,
+        encoder,
+        delta_dict_enabled,
+        recovered_dict_entries,
+        recovered_dict_count,
+        persisted_symbol_dict,
+    ) = if *qwp_ws.initial_connect_retry == QwpWsInitialConnectMode::Async {
+        let mut queue = open_configured_qwp_ws_queue(qwp_ws)?;
+        // Pull the slot's delta-dict state out of the queue before it moves into
+        // the runner: whether delta is on, the recovered entries (to seed the
+        // foreground dict + the I/O thread's catch-up mirror), and the side-file
+        // handle (routed to the owning foreground for write-ahead).
+        let delta_dict_enabled = queue.is_delta_dict_enabled();
+        let recovered_dict_entries = queue.recovered_symbol_dict_entries().to_vec();
+        let recovered_dict_count = queue.recovered_symbol_dict_count();
+        let persisted_symbol_dict = queue.take_persisted_symbol_dict();
         let pending_connect = QwpWsPendingConnect::new(
             host,
             port,
@@ -2836,18 +2945,37 @@ pub(crate) fn connect_qwp_ws_background_state(
             queue.max_in_flight(),
             *qwp_ws.request_durable_ack,
             Arc::clone(&server_max_batch_size),
+            delta_dict_enabled,
+            recovered_dict_entries.clone(),
+            recovered_dict_count,
         );
+        let runner = SyncQwpWsRunner::start_pending_connect(
+            queue,
+            pending_connect,
+            *qwp_ws.sf_append_deadline,
+            *qwp_ws.error_inbox_capacity,
+        );
+        // Async connect builds the send core lazily on the I/O thread; the driver
+        // enables its catch-up mirror there (see drive_step). The encoder (used by
+        // the row sender; dormant for the column sender) delta-encodes on the same
+        // condition, seeded from the recovered dictionary so new ids continue above
+        // it. The side-file is left in the handler state for the owning foreground
+        // to claim (row: connect_qwp_ws; column: new_store_and_forward).
+        let mut encoder = QwpWsReplayEncoder::new(1);
+        encoder.set_delta_dict_enabled(delta_dict_enabled);
+        if delta_dict_enabled {
+            encoder.seed_global_dict(&recovered_dict_entries, recovered_dict_count)?;
+        }
         (
-            SyncQwpWsRunner::start_pending_connect(
-                queue,
-                pending_connect,
-                *qwp_ws.sf_append_deadline,
-                *qwp_ws.error_inbox_capacity,
-            ),
-            QwpWsReplayEncoder::new(1),
+            runner,
+            encoder,
+            delta_dict_enabled,
+            recovered_dict_entries,
+            recovered_dict_count,
+            persisted_symbol_dict,
         )
     } else {
-        let parts = open_qwp_ws_parts(
+        let mut parts = open_qwp_ws_parts(
             host,
             port,
             use_tls,
@@ -2856,13 +2984,35 @@ pub(crate) fn connect_qwp_ws_background_state(
             auth_header,
             Arc::clone(&server_max_batch_size),
         )?;
+        // Delta symbol dictionaries: memory mode always (the in-process ring is
+        // replayed and the I/O thread re-registers the whole dictionary via a
+        // catch-up frame on reconnect); file mode iff the persisted side-file
+        // opened (its recovered entries seed the encoder dict + driver mirror so
+        // ids continue above them). This branch runs only for the row sender --
+        // the column sender forces async connect -- so the encoder is live here.
+        // Encoder and mirror enable together to stay in lockstep.
+        let delta_dict_enabled = parts.delta_dict_enabled;
+        parts.encoder.set_delta_dict_enabled(delta_dict_enabled);
+        if delta_dict_enabled {
+            parts
+                .encoder
+                .seed_global_dict(&parts.recovered_dict_entries, parts.recovered_dict_count)?;
+            parts
+                .send_core
+                .enable_delta_dict(&parts.recovered_dict_entries, parts.recovered_dict_count);
+        }
+        let runner = SyncQwpWsRunner::start_with_append_deadline(
+            parts.store,
+            parts.send_core,
+            *qwp_ws.sf_append_deadline,
+        );
         (
-            SyncQwpWsRunner::start_with_append_deadline(
-                parts.store,
-                parts.send_core,
-                *qwp_ws.sf_append_deadline,
-            ),
+            runner,
             parts.encoder,
+            delta_dict_enabled,
+            parts.recovered_dict_entries,
+            parts.recovered_dict_count,
+            parts.persisted_symbol_dict,
         )
     };
     let orphan_candidates = orphan_candidates(qwp_ws);
@@ -2878,6 +3028,10 @@ pub(crate) fn connect_qwp_ws_background_state(
         server_max_batch_size,
         orphan_pool,
         close_drain_timeout: *qwp_ws.close_flush_timeout,
+        delta_dict_enabled,
+        recovered_dict_entries,
+        recovered_dict_count,
+        persisted_symbol_dict,
     })
 }
 
@@ -2909,7 +3063,7 @@ pub(crate) fn open_manual_qwp_ws(
         auth_header.clone(),
     );
     let server_max_batch_size = Arc::new(AtomicUsize::new(0));
-    let parts = open_qwp_ws_parts(
+    let mut parts = open_qwp_ws_parts(
         host,
         port,
         use_tls,
@@ -2918,6 +3072,26 @@ pub(crate) fn open_manual_qwp_ws(
         auth_header,
         Arc::clone(&server_max_batch_size),
     )?;
+    // Delta symbol dictionaries: the encoder ships only ids new since the dict
+    // last grew, and the driver re-registers the whole dictionary via a catch-up
+    // frame on reconnect. Enabled in memory mode always, and in file mode once the
+    // persisted side-file opened -- then the recovered entries seed the encoder
+    // dict + driver mirror (ids continue above them) and the encoder owns the
+    // side-file for write-ahead. Manual progress is row-only, so the encoder is
+    // the live surface. Encoder and mirror enable together to stay in lockstep.
+    let delta_dict_enabled = parts.delta_dict_enabled;
+    parts.encoder.set_delta_dict_enabled(delta_dict_enabled);
+    if delta_dict_enabled {
+        parts
+            .encoder
+            .seed_global_dict(&parts.recovered_dict_entries, parts.recovered_dict_count)?;
+        parts
+            .encoder
+            .set_persisted_symbol_dict(parts.persisted_symbol_dict.take());
+        parts
+            .send_core
+            .enable_delta_dict(&parts.recovered_dict_entries, parts.recovered_dict_count);
+    }
     let orphan_drainers = ManualOrphanDrainers::new(
         orphan_candidates(qwp_ws),
         *qwp_ws.max_background_drainers,
@@ -2944,7 +3118,7 @@ fn open_qwp_ws_parts(
     auth_header: Option<String>,
     server_max_batch_size: Arc<AtomicUsize>,
 ) -> crate::Result<QwpWsConnectedParts> {
-    let queue = open_configured_qwp_ws_queue(qwp_ws)?;
+    let mut queue = open_configured_qwp_ws_queue(qwp_ws)?;
     let transport = connect_blocking_transport(
         host,
         port,
@@ -2956,6 +3130,13 @@ fn open_qwp_ws_parts(
     )?;
     let negotiated_version = transport.negotiated_version();
     let max_in_flight = queue.max_in_flight();
+    // Extract the slot's delta-dict state before the queue moves into the store:
+    // whether delta is on, the recovered entries (to seed the producer dict + the
+    // driver mirror), and the side-file handle (for the foreground's write-ahead).
+    let delta_dict_enabled = queue.is_delta_dict_enabled();
+    let recovered_dict_entries = queue.recovered_symbol_dict_entries().to_vec();
+    let recovered_dict_count = queue.recovered_symbol_dict_count();
+    let persisted_symbol_dict = queue.take_persisted_symbol_dict();
     let store = QwpWsPublicationStore::new(queue, *qwp_ws.error_inbox_capacity);
     let send_core = QwpWsSendCore::new_with_durable_ack_and_rejection_limit(
         transport,
@@ -2974,6 +3155,10 @@ fn open_qwp_ws_parts(
         encoder: QwpWsReplayEncoder::new(negotiated_version),
         store,
         send_core,
+        delta_dict_enabled,
+        recovered_dict_entries,
+        recovered_dict_count,
+        persisted_symbol_dict,
     })
 }
 
@@ -3150,10 +3335,15 @@ fn publish_qwp_ws_buffer(
     encoder: &mut QwpWsReplayEncoder,
     buffer: &QwpWsColumnarBuffer,
     max_buf_size: usize,
-    mut publish: impl FnMut(&[u8]) -> crate::Result<u64>,
+    publish: impl FnOnce(&[u8]) -> crate::Result<u64>,
 ) -> crate::Result<Option<u64>> {
-    let payload = encoder.encode_with_max_size(buffer, max_buf_size)?;
-    publish(payload).map(Some)
+    // `encode_and_publish` rolls the dict + side-file back if `publish` fails, so a
+    // recoverable publish failure (e.g. `SubmitTimedOut` back-pressure) does not
+    // leave the encoder dict ahead of the driver's send mirror and trip the
+    // torn-dict guard on the next frame (which would abandon all queued data).
+    encoder
+        .encode_and_publish(buffer, max_buf_size, publish)
+        .map(Some)
 }
 
 pub(crate) fn qwp_ws_drive_once(state: &mut ManualQwpWsHandlerState) -> crate::Result<bool> {
