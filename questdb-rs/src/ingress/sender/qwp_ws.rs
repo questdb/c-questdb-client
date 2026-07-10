@@ -2970,7 +2970,7 @@ pub(crate) fn connect_qwp_ws(
 /// surface an error, not abort the host via an infallible `to_vec`/`clone` -- that
 /// would defeat the fallible `try_reserve`/`MAX_FILE_LEN` guard the side-file
 /// reader already applies.
-fn try_dup_recovered(src: &[u8]) -> crate::Result<Vec<u8>> {
+pub(super) fn try_dup_recovered(src: &[u8]) -> crate::Result<Vec<u8>> {
     let mut v = Vec::new();
     v.try_reserve_exact(src.len()).map_err(|_| {
         error::fmt!(
@@ -3242,7 +3242,11 @@ fn open_qwp_ws_parts(
     // whether delta is on, the recovered entries (to seed the producer dict + the
     // driver mirror), and the side-file handle (for the foreground's write-ahead).
     let delta_dict_enabled = queue.is_delta_dict_enabled();
-    let recovered_dict_entries = queue.recovered_symbol_dict_entries().to_vec();
+    // Fallible copy: a large recovered dictionary (up to ~2 GiB for a crafted
+    // CRC-valid side-file) must surface an error, not abort the host via an
+    // infallible `to_vec` -- exactly the guard `try_dup_recovered` documents and the
+    // async connect path already applies.
+    let recovered_dict_entries = try_dup_recovered(queue.recovered_symbol_dict_entries())?;
     let recovered_dict_count = queue.recovered_symbol_dict_count();
     let persisted_symbol_dict = queue.take_persisted_symbol_dict();
     let store = QwpWsPublicationStore::new(queue, *qwp_ws.error_inbox_capacity);

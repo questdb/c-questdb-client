@@ -5260,13 +5260,31 @@ impl SymbolGlobalDict {
     /// yields a fresh `u64::MAX`-filled table. The caller fills any `u64::MAX`
     /// slot via [`intern`](Self::intern) and must hand the table back with
     /// [`restore_arrow_dict_memo`](Self::restore_arrow_dict_memo).
+    /// Fallibly (re)size a `slot -> global id` table to `dict_len`, filled with the
+    /// `u64::MAX` "unmapped" sentinel. `dict_len` is the caller-supplied Arrow
+    /// dictionary length, unbounded at this point (unlike the row path's
+    /// `chunk::push_symbol`), so the allocation must surface an error rather than
+    /// abort the FFI crate (`panic = "abort"`) on an infallible OOM.
+    #[cfg(feature = "arrow-ingress")]
+    fn try_resize_gid_table(table: &mut Vec<u64>, dict_len: usize) -> crate::Result<()> {
+        table.clear();
+        table.try_reserve(dict_len).map_err(|_| {
+            crate::error::fmt!(
+                InvalidApiCall,
+                "Arrow symbol dictionary too large to encode ({dict_len} entries)"
+            )
+        })?;
+        table.resize(dict_len, u64::MAX);
+        Ok(())
+    }
+
     #[cfg(feature = "arrow-ingress")]
     pub(crate) fn take_arrow_dict_memo(
         &mut self,
         identity: &[(usize, usize)],
         values_data: &arrow::array::ArrayData,
         dict_len: usize,
-    ) -> (usize, Vec<u64>) {
+    ) -> crate::Result<(usize, Vec<u64>)> {
         const MEMO_CAP: usize = 32;
         if let Some(idx) = self
             .arrow_dict_memo
@@ -5275,20 +5293,21 @@ impl SymbolGlobalDict {
         {
             let mut slot_to_gid = std::mem::take(&mut self.arrow_dict_memo[idx].slot_to_gid);
             if slot_to_gid.len() != dict_len {
-                slot_to_gid.clear();
-                slot_to_gid.resize(dict_len, u64::MAX);
+                Self::try_resize_gid_table(&mut slot_to_gid, dict_len)?;
             }
-            return (idx, slot_to_gid);
+            return Ok((idx, slot_to_gid));
         }
         if self.arrow_dict_memo.len() >= MEMO_CAP {
             self.arrow_dict_memo.clear();
         }
+        let mut slot_to_gid = Vec::new();
+        Self::try_resize_gid_table(&mut slot_to_gid, dict_len)?;
         self.arrow_dict_memo.push(ArrowDictSlotMemo {
             identity: identity.to_vec(),
             _pin: values_data.clone(),
             slot_to_gid: Vec::new(),
         });
-        (self.arrow_dict_memo.len() - 1, vec![u64::MAX; dict_len])
+        Ok((self.arrow_dict_memo.len() - 1, slot_to_gid))
     }
 
     #[cfg(feature = "arrow-ingress")]
@@ -9576,6 +9595,44 @@ mod tests {
 
     #[cfg(feature = "_sender-qwp-ws")]
     #[test]
+    fn symbol_dict_seed_rejects_an_over_cap_entry_length() {
+        // Defence in depth: `intern` caps a symbol at MAX_PERSISTED_SYMBOL_ENTRY_LEN
+        // before it is written, and the persisted side-file reader
+        // (`qwp_ws_sfa_symbol_dict::open_existing`) caps it on recovery. `seed` must
+        // enforce the same bound on the region it re-interns, so a corrupt / hostile
+        // on-disk length claiming more than the cap becomes a recoverable
+        // StoreResendRequired rather than a huge slice or a mis-registered symbol. The
+        // cap is checked right after the length varint decodes, before the body is
+        // indexed, so no oversized body is needed to exercise it.
+        let mut entries = Vec::new();
+        write_qwp_varint(&mut entries, MAX_PERSISTED_SYMBOL_ENTRY_LEN + 1);
+        let mut dict = SymbolGlobalDict::new();
+        let err = dict.seed(&entries, 1).unwrap_err();
+        assert_eq!(err.code(), crate::ErrorCode::StoreResendRequired);
+        assert!(
+            err.msg().contains("exceeds the maximum"),
+            "msg: {}",
+            err.msg()
+        );
+        assert_eq!(dict.next_id(), 0, "a rejected entry must not be interned");
+
+        // A length exactly AT the cap clears the `> MAX` check (proving the boundary
+        // is exclusive) and then fails on the buffer-overrun check because no body
+        // follows -- still a clean StoreResendRequired, never a panic.
+        let mut at_cap = Vec::new();
+        write_qwp_varint(&mut at_cap, MAX_PERSISTED_SYMBOL_ENTRY_LEN);
+        let mut dict2 = SymbolGlobalDict::new();
+        let err2 = dict2.seed(&at_cap, 1).unwrap_err();
+        assert_eq!(err2.code(), crate::ErrorCode::StoreResendRequired);
+        assert!(
+            err2.msg().contains("overruns buffer"),
+            "msg: {}",
+            err2.msg()
+        );
+    }
+
+    #[cfg(feature = "_sender-qwp-ws")]
+    #[test]
     fn symbol_dict_seed_rejects_duplicate_entries_from_a_torn_tail() {
         // A host/power-crash zero-extended tail parses as a run of empty
         // ([len=0]) entries. Deduping them silently would leave this producer
@@ -9607,26 +9664,26 @@ mod tests {
         // take/restore/rollback bookkeeping, so a placeholder array suffices.
         let pin = arrow::array::ArrayData::new_empty(&arrow::datatypes::DataType::Null);
 
-        let (idx, mut table) = dict.take_arrow_dict_memo(&identity, &pin, 3);
+        let (idx, mut table) = dict.take_arrow_dict_memo(&identity, &pin, 3).unwrap();
         assert_eq!(table, vec![u64::MAX; 3]);
         table[0] = 5;
         table[2] = 7;
         dict.restore_arrow_dict_memo(idx, table);
 
         // Same identity → cache hit: the stored table comes back verbatim.
-        let (idx2, table2) = dict.take_arrow_dict_memo(&identity, &pin, 3);
+        let (idx2, table2) = dict.take_arrow_dict_memo(&identity, &pin, 3).unwrap();
         assert_eq!(idx2, idx);
         assert_eq!(table2, vec![5, u64::MAX, 7]);
         dict.restore_arrow_dict_memo(idx2, table2);
 
         // A different values array → miss → fresh table.
         let other = [(0x9000usize, 8usize), (0x2000usize, 24usize)];
-        let (_, fresh) = dict.take_arrow_dict_memo(&other, &pin, 2);
+        let (_, fresh) = dict.take_arrow_dict_memo(&other, &pin, 2).unwrap();
         assert_eq!(fresh, vec![u64::MAX; 2]);
 
         // Rollback drops every memoised id.
         dict.rollback(mark);
-        let (_, after_rollback) = dict.take_arrow_dict_memo(&identity, &pin, 3);
+        let (_, after_rollback) = dict.take_arrow_dict_memo(&identity, &pin, 3).unwrap();
         assert_eq!(after_rollback, vec![u64::MAX; 3]);
     }
 

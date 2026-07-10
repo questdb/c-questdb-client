@@ -2451,11 +2451,19 @@ impl VarlenSource for BinaryViewArray {
 /// after the flush, so a steady flow of arrow-symbol flushes reuses the buffers
 /// instead of allocating one `Vec<u64>` per symbol column per flush -- mirroring
 /// the row path's `symbol_gid_pool`.
-fn take_pooled_gids(pool: &mut Vec<Vec<u64>>, cap: usize) -> Vec<u64> {
+fn take_pooled_gids(pool: &mut Vec<Vec<u64>>, cap: usize) -> Result<Vec<u64>> {
     let mut gids = pool.pop().unwrap_or_default();
     gids.clear();
-    gids.reserve(cap);
-    gids
+    // Fallible: `cap` is the non-null row count of a caller-supplied batch, so a huge
+    // batch must surface an error rather than abort the FFI crate (`panic = "abort"`)
+    // on an infallible `reserve` OOM -- matching the row path's `try_resize_filled`.
+    gids.try_reserve(cap).map_err(|_| {
+        fmt!(
+            ArrowIngest,
+            "SYMBOL column too large to encode ({cap} non-null rows)"
+        )
+    })?;
+    Ok(gids)
 }
 
 /// Reject a symbol dictionary value that is not valid UTF-8 before it is interned.
@@ -2490,7 +2498,7 @@ fn resolve_symbol_strings<S: VarlenSource>(
     use std::hash::BuildHasherDefault;
     let row_count = arr.len();
     let non_null = non_null_count(arr, "SYMBOL column")?;
-    let mut gids = take_pooled_gids(gids_pool, non_null);
+    let mut gids = take_pooled_gids(gids_pool, non_null)?;
     // Dedup within the column so the global dict is hit once per distinct
     // value rather than once per row — matching the dictionary path and the
     // row API's bulk-intern. Uses the dict's fast non-DoS hasher, not SipHash.
@@ -2560,10 +2568,10 @@ fn resolve_symbol_dict(
             .map(|b| (b.as_ptr() as usize, b.len()))
             .collect();
         let (memo_idx, mut slot_to_gid) =
-            symbol_dict.take_arrow_dict_memo(&identity, &values_data, dict_len);
+            symbol_dict.take_arrow_dict_memo(&identity, &values_data, dict_len)?;
 
         let resolved = (|| -> Result<Vec<u64>> {
-            let mut gids = take_pooled_gids(gids_pool, non_null);
+            let mut gids = take_pooled_gids(gids_pool, non_null)?;
             for row in 0..row_count {
                 if arr.is_null(row) {
                     continue;
