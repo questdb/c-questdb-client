@@ -73,6 +73,36 @@ use super::qwp_ws_sfa_symbol_dict::PersistedSymbolDict;
 type TlsStream = rustls::StreamOwned<rustls::ClientConnection, NoSigpipeTcp>;
 
 const QWP_WS_TLS_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
+const QWP_WS_DEFAULT_BACKGROUND_CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// Which lifecycle owns a shared QWP/WebSocket connect walk.
+///
+/// The main sender's initial connect and I/O-runner reconnects are foreground
+/// work, even when the runner itself lives on a worker thread. Only orphan-slot
+/// drainers use `BackgroundDrainer`, matching Java's background-connect policy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum QwpWsConnectKind {
+    Foreground,
+    BackgroundDrainer,
+}
+
+impl QwpWsConnectKind {
+    fn is_background(self) -> bool {
+        self == Self::BackgroundDrainer
+    }
+}
+
+/// Mirrors Java's `effectiveConnectTimeoutMs`: foreground connects preserve
+/// the configured value verbatim, while an unset background-drainer timeout
+/// receives a finite fallback so shutdown cannot remain parked until the OS
+/// TCP-connect deadline.
+fn effective_connect_timeout(background: bool, configured: Option<Duration>) -> Option<Duration> {
+    if background && configured.is_none() {
+        Some(QWP_WS_DEFAULT_BACKGROUND_CONNECT_TIMEOUT)
+    } else {
+        configured
+    }
+}
 
 pub(crate) enum WsStream {
     Plain(NoSigpipeTcp),
@@ -755,6 +785,7 @@ impl QwpWsPendingConnect {
                 None,
                 self.use_tls,
                 self.tls_settings.clone(),
+                QwpWsConnectKind::Foreground,
                 &self.qwp_ws,
                 self.auth_header.as_deref(),
             ) {
@@ -764,6 +795,7 @@ impl QwpWsPendingConnect {
                         tracker,
                         self.use_tls,
                         self.tls_settings.clone(),
+                        QwpWsConnectKind::Foreground,
                         self.qwp_ws.clone(),
                         self.auth_header.clone(),
                         Arc::clone(&self.server_max_batch_size),
@@ -2681,12 +2713,14 @@ pub(crate) fn establish_connection(
     port: &str,
     use_tls: bool,
     tls_settings: Option<TlsSettings>,
+    connect_kind: QwpWsConnectKind,
     qwp_ws: &QwpWsConfig,
     auth_header: Option<&str>,
 ) -> crate::Result<(WsStream, codec::QwpWsHandshakeResult, Vec<u8>)> {
     let auth_timeout = *qwp_ws.auth_timeout;
     let request_timeout = *qwp_ws.request_timeout;
-    let connect_timeout = *qwp_ws.connect_timeout;
+    let connect_timeout =
+        effective_connect_timeout(connect_kind.is_background(), *qwp_ws.connect_timeout);
 
     let mut tcp = connect_qwp_ws_tcp(host, port, request_timeout, connect_timeout)?;
 
@@ -2786,6 +2820,7 @@ pub(crate) fn connect_qwp_ws_endpoint_round<A: QwpWsHealthAccess>(
     previous_failure: Option<ReconnectReason>,
     use_tls: bool,
     tls_settings: Option<TlsSettings>,
+    connect_kind: QwpWsConnectKind,
     qwp_ws: &QwpWsConfig,
     auth_header: Option<&str>,
 ) -> crate::Result<QwpWsConnectRoundSuccess> {
@@ -2814,6 +2849,7 @@ pub(crate) fn connect_qwp_ws_endpoint_round<A: QwpWsHealthAccess>(
             &endpoint.port,
             use_tls,
             tls_settings.clone(),
+            connect_kind,
             qwp_ws,
             auth_header,
         ) {
@@ -3237,6 +3273,7 @@ fn connect_blocking_transport(
             port,
             use_tls,
             tls_settings,
+            QwpWsConnectKind::Foreground,
             qwp_ws.clone(),
             auth_header,
             server_max_batch_size,
@@ -3282,6 +3319,7 @@ fn connect_blocking_transport_with_retry(
             None,
             use_tls,
             tls_settings.clone(),
+            QwpWsConnectKind::Foreground,
             qwp_ws,
             auth_header.as_deref(),
         ) {
@@ -3291,6 +3329,7 @@ fn connect_blocking_transport_with_retry(
                     tracker,
                     use_tls,
                     tls_settings,
+                    QwpWsConnectKind::Foreground,
                     qwp_ws.clone(),
                     auth_header,
                     server_max_batch_size,
@@ -4009,6 +4048,18 @@ mod tests {
         let generation = notifier.generation();
 
         assert!(!notifier.wait_for_change(generation, Some(Instant::now())));
+    }
+
+    #[test]
+    fn effective_connect_timeout_defaults_only_for_background_drainers() {
+        let explicit = Some(Duration::from_millis(250));
+
+        assert_eq!(
+            effective_connect_timeout(true, None),
+            Some(Duration::from_secs(15))
+        );
+        assert_eq!(effective_connect_timeout(true, explicit), explicit);
+        assert_eq!(effective_connect_timeout(false, None), None);
     }
 
     #[test]

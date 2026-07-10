@@ -49,8 +49,8 @@ use crate::{Error, ErrorCode};
 
 #[cfg(feature = "sync-sender-qwp-ws")]
 use super::qwp_ws::{
-    QwpWsConnectRoundSuccess, QwpWsHostHealthTracker, WsFrameRead, WsFrameReader, WsStream,
-    connect_qwp_ws_endpoint_round, qwp_ws_configured_endpoints, write_binary_frame,
+    QwpWsConnectKind, QwpWsConnectRoundSuccess, QwpWsHostHealthTracker, WsFrameRead, WsFrameReader,
+    WsStream, connect_qwp_ws_endpoint_round, qwp_ws_configured_endpoints, write_binary_frame,
     write_ping_frame,
 };
 use super::qwp_ws_codec::{self as codec, PipelinedResponse};
@@ -2835,6 +2835,7 @@ pub(crate) struct BlockingQwpWsTransport {
     tracker: QwpWsHostHealthTracker,
     use_tls: bool,
     tls_settings: Option<TlsSettings>,
+    connect_kind: QwpWsConnectKind,
     qwp_ws: QwpWsConfig,
     auth_header: Option<String>,
     negotiated_version: u8,
@@ -2848,11 +2849,13 @@ pub(crate) struct BlockingQwpWsTransport {
 
 #[cfg(feature = "sync-sender-qwp-ws")]
 impl BlockingQwpWsTransport {
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn connect(
         host: impl Into<String>,
         port: impl Into<String>,
         use_tls: bool,
         tls_settings: Option<TlsSettings>,
+        connect_kind: QwpWsConnectKind,
         qwp_ws: QwpWsConfig,
         auth_header: Option<String>,
         server_max_batch_size: Arc<AtomicUsize>,
@@ -2869,6 +2872,7 @@ impl BlockingQwpWsTransport {
             None,
             use_tls,
             tls_settings.clone(),
+            connect_kind,
             &qwp_ws,
             auth_header.as_deref(),
         )?;
@@ -2877,6 +2881,7 @@ impl BlockingQwpWsTransport {
             tracker,
             use_tls,
             tls_settings,
+            connect_kind,
             qwp_ws,
             auth_header,
             server_max_batch_size,
@@ -2890,6 +2895,7 @@ impl BlockingQwpWsTransport {
         tracker: QwpWsHostHealthTracker,
         use_tls: bool,
         tls_settings: Option<TlsSettings>,
+        connect_kind: QwpWsConnectKind,
         qwp_ws: QwpWsConfig,
         auth_header: Option<String>,
         server_max_batch_size: Arc<AtomicUsize>,
@@ -2902,6 +2908,7 @@ impl BlockingQwpWsTransport {
             tracker,
             use_tls,
             tls_settings,
+            connect_kind,
             qwp_ws,
             auth_header,
             negotiated_version: connected.negotiated_version,
@@ -2926,6 +2933,7 @@ impl BlockingQwpWsTransport {
             Some(reason),
             self.use_tls,
             self.tls_settings.clone(),
+            self.connect_kind,
             &self.qwp_ws,
             self.auth_header.as_deref(),
         )

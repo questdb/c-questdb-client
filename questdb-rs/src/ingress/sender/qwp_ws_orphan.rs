@@ -47,6 +47,8 @@ use crate::ingress::conf::QwpWsManagedSlotExclusion;
 use crate::ingress::tls::TlsSettings;
 
 #[cfg(feature = "sync-sender-qwp-ws")]
+use super::qwp_ws::QwpWsConnectKind;
+#[cfg(feature = "sync-sender-qwp-ws")]
 use super::qwp_ws_driver::{
     BlockingQwpWsTransport, CloseStepOutcome, DEFAULT_EVENT_CAPACITY, DriverError, PublicationLog,
     QwpWsPublicationStore, QwpWsSendCore, ReconnectPolicy,
@@ -436,11 +438,19 @@ impl OrphanDrainer {
             let _ = clear_last_error(&slot_dir);
             return OrphanOpenOutcome::AlreadyDrained;
         }
+        // Threaded orphan drainers carry a stop flag; manual-progress drainers
+        // do not. Only the threaded/background form gets the finite fallback.
+        let connect_kind = if stop.is_some() {
+            QwpWsConnectKind::BackgroundDrainer
+        } else {
+            QwpWsConnectKind::Foreground
+        };
         let transport = match BlockingQwpWsTransport::connect(
             config.host.clone(),
             config.port.clone(),
             config.use_tls,
             config.tls_settings.clone(),
+            connect_kind,
             config.qwp_ws.clone(),
             config.auth_header.clone(),
             Arc::new(AtomicUsize::new(0)),

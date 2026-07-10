@@ -570,6 +570,7 @@ impl QwpWsConnector {
             None,
             self.use_tls,
             self.tls_settings.clone(),
+            sender::qwp_ws::QwpWsConnectKind::Foreground,
             &self.qwp_ws,
             self.auth_header.as_deref(),
         )?;
