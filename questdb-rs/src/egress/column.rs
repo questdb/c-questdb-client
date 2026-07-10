@@ -48,8 +48,8 @@
 use std::marker::PhantomData;
 
 use crate::egress::column_kind::ColumnKind;
-use crate::egress::error::{Result, fmt};
 use crate::egress::symbol_dict::SymbolDict;
+use crate::error::{Result, fmt};
 
 // ---------------------------------------------------------------------------
 // Validity bitmap
@@ -1392,7 +1392,7 @@ mod tests {
         // null rows as non-null.
         let bytes: [u8; 0] = [];
         let err = Validity::from_bitmap(&bytes, 100).unwrap_err();
-        assert_eq!(err.code(), crate::egress::ErrorCode::InvalidApiCall);
+        assert_eq!(err.code(), crate::ErrorCode::InvalidApiCall);
         assert!(err.msg().contains("Validity::from_bitmap: bitmap is"));
     }
 
@@ -1401,7 +1401,7 @@ mod tests {
         // 9 rows need 2 bytes; supplying 1 must surface InvalidApiCall.
         let bytes = [0xFFu8];
         let err = Validity::from_bitmap(&bytes, 9).unwrap_err();
-        assert_eq!(err.code(), crate::egress::ErrorCode::InvalidApiCall);
+        assert_eq!(err.code(), crate::ErrorCode::InvalidApiCall);
     }
 
     #[test]

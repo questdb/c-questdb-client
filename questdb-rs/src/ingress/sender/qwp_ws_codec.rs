@@ -29,19 +29,7 @@
 
 use crate::error;
 use crate::ingress::QwpWsRoleReject;
-#[cfg(test)]
-use crate::ws::crypto;
-use crate::ws::frame;
-
-// Re-export opcode constants from the shared `ws::frame` module so existing
-// `WS_OPCODE_*` call sites in qwp_ws.rs and qwp_ws_driver.rs keep working
-// with zero churn after the Phase A consolidation.
-pub(super) use crate::ws::frame::Opcode;
-pub(super) use crate::ws::frame::{
-    OPCODE_BINARY as WS_OPCODE_BINARY, OPCODE_CLOSE as WS_OPCODE_CLOSE,
-    OPCODE_CONTINUATION as WS_OPCODE_CONTINUATION, OPCODE_PING as WS_OPCODE_PING,
-    OPCODE_PONG as WS_OPCODE_PONG, OPCODE_TEXT as WS_OPCODE_TEXT,
-};
+use crate::ws::frame::{self, Opcode};
 
 pub(super) const WS_PATH: &str = "/api/v4/write";
 
@@ -57,22 +45,6 @@ pub(super) const WS_STATUS_NOT_WRITABLE: u8 = 0x0C;
 /// 256 MiB cap on a single inbound frame -- well above QWP's 16 MB batch limit
 /// but small enough to refuse obviously bogus declared lengths early.
 pub(super) const MAX_INBOUND_FRAME_BYTES: u64 = 256 * 1024 * 1024;
-
-// ---------- Sec-WebSocket-Accept (delegating to shared `ws::crypto`) ----------
-
-/// Compute the Sec-WebSocket-Accept value per RFC 6455 §4.2.2. Thin wrapper
-/// over [`crate::ws::crypto::compute_accept`] kept here so existing
-/// `codec::compute_accept` call sites in qwp_ws.rs / qwp_ws_driver.rs keep
-/// working with no churn.
-///
-/// Test-only: production code now drives `crate::ws::handshake::upgrade`
-/// directly, which validates the accept value internally. Test fixtures
-/// in qwp_ws / qwp_ws_driver still need to sign mocked responses, so the
-/// wrapper stays available under `cfg(test)`.
-#[cfg(test)]
-pub(super) fn compute_accept(key_b64: &str) -> String {
-    crypto::compute_accept(key_b64)
-}
 
 // ---------- frame builder (pure bytes) ----------
 

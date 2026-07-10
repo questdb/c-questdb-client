@@ -26,12 +26,12 @@
 //!
 //! Used by the various message decoders so each one can stay focused on
 //! the layout instead of repeating bounds-check boilerplate. All reads
-//! return [`Error`](crate::egress::Error) with
-//! [`ErrorCode::ProtocolError`](crate::egress::ErrorCode::ProtocolError)
+//! return [`Error`](crate::Error) with
+//! [`ErrorCode::ProtocolError`](crate::ErrorCode::ProtocolError)
 //! on underrun.
 
-use crate::egress::error::{Result, fmt};
 use crate::egress::wire::varint;
+use crate::error::{Result, fmt};
 
 pub(crate) struct ByteReader<'a> {
     bytes: &'a [u8],
@@ -146,7 +146,7 @@ impl<'a> ByteReader<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::egress::error::ErrorCode;
+    use crate::error::ErrorCode;
 
     #[test]
     fn reads_in_order() {

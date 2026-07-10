@@ -53,8 +53,6 @@ use super::qwp_ws::{
     connect_qwp_ws_endpoint_round, qwp_ws_configured_endpoints, write_binary_frame,
     write_ping_frame,
 };
-#[cfg(feature = "sync-sender-qwp-ws")]
-use super::qwp_ws_codec::WS_OPCODE_BINARY;
 use super::qwp_ws_codec::{self as codec, PipelinedResponse};
 use super::qwp_ws_ownership::{QwpWsErrorCategory, QwpWsErrorPolicy, QwpWsSenderError};
 use super::qwp_ws_queue::{
@@ -69,6 +67,8 @@ use super::qwp_ws_sfa_queue::{
     SfaCleanupFailure, SfaFrameQueue, SfaProducer, SfaProgressView, SfaSendCursor,
     SfaStorageFinish, SfaStorageResult, SfaStorageStep,
 };
+#[cfg(feature = "sync-sender-qwp-ws")]
+use crate::ws::frame::OPCODE_BINARY;
 
 pub(crate) const DEFAULT_EVENT_CAPACITY: usize = 1024;
 pub(crate) const DEFAULT_MAX_FRAME_REJECTIONS: usize = 4;
@@ -3026,7 +3026,7 @@ impl QwpWsCoreTransport for BlockingQwpWsTransport {
                 WsFrameRead::Message { .. } => unreachable!(),
             });
         };
-        if opcode != WS_OPCODE_BINARY {
+        if opcode != OPCODE_BINARY {
             self.reader.clear_message();
             return Err(TransportFailure::ProtocolViolation {
                 close_code: None,
@@ -5042,7 +5042,8 @@ mod tests {
         payload_tx: mpsc::Sender<Vec<u8>>,
     ) {
         let request = read_request_until_blank(stream).unwrap();
-        let accept = codec::compute_accept(&header_value(&request, "Sec-WebSocket-Key"));
+        let accept =
+            crate::ws::crypto::compute_accept(&header_value(&request, "Sec-WebSocket-Key"));
         let response = format!(
             "HTTP/1.1 101 Switching Protocols\r\n\
              Upgrade: websocket\r\n\

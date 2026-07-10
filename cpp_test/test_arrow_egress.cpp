@@ -99,7 +99,7 @@ TEST_CASE("arrow egress: empty stream returns _end without touching out_*")
 
     // `next_arrow_batch` snapshots schema eagerly. With ZERO batches the
     // adapter must EITHER:
-    //   - throw `reader_error_no_schema` (when QWP protocol path
+    //   - throw `questdb::error` with `questdb_error_no_schema` (when the QWP path
     //     reaches `as_arrow_reader` with no first batch), OR
     //   - return `nullopt` directly (when the inner pump terminates
     //     first).
@@ -108,7 +108,7 @@ TEST_CASE("arrow egress: empty stream returns _end without touching out_*")
         auto b = h.cursor.next_arrow_batch();
         CHECK(!b.has_value());
     }
-    catch (const egress::reader_error&)
+    catch (const questdb::error&)
     {
         // _error path acceptable per the doc.
     }
@@ -537,9 +537,9 @@ TEST_CASE("arrow egress: schema drift — array ndim change between batches thro
         (void)h.cursor.next_arrow_batch();
         FAIL("expected schema_drift on second batch with changed array ndim");
     }
-    catch (const egress::reader_error& e)
+    catch (const questdb::error& e)
     {
-        CHECK(e.code() == egress::error_code::schema_drift);
+        CHECK(e.code() == questdb::error_code::schema_drift);
     }
 }
 

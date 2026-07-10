@@ -233,10 +233,8 @@ def build_cpp_egress_sidecar() -> Path:
     """Build the C++-binding ``qwp_egress_cpp_sidecar``. Unlike the ingress
     case, the egress C++ wrapper (``questdb::egress::reader`` in
     ``reader.hpp``) is a genuine C++ surface, so this sidecar drives the
-    C++ classes directly (constructor gated by
-    ``QUESTDB_READER_INTERNAL_CONSTRUCTORS``, the sanctioned in-tree-test
-    form -- same standalone-reader shape as the Rust sidecar's
-    ``Reader::from_conf``)."""
+    public standalone reader directly, matching the Rust sidecar's
+    ``Reader::from_conf`` shape."""
     return _build_native_sidecar(
         src_name="qwp_egress_cpp_sidecar.cpp", bin_name="qwp_egress_cpp_sidecar",
         compiler_default="c++", compiler_env="CXX", std_flag="-std=c++17")

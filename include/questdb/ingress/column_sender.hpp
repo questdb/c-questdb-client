@@ -1593,7 +1593,7 @@ class pool
 public:
     explicit pool(std::string_view conf)
     {
-        _raw = ingress::line_sender_error::wrapped_call(
+        _raw = ::questdb::error::wrapped_call(
             ::questdb_db_connect, conf.data(), conf.size());
     }
 
@@ -1689,7 +1689,7 @@ public:
      * destruction — unless `reader::drop_on_return()` was called, in which
      * case it is dropped. If the pool has already been closed by the time the
      * reader is destroyed, it is closed instead of recycled. Throws
-     * `reader_error` on cap exhaustion or transport failure.
+     * `questdb::error` on cap exhaustion or transport failure.
      *
      * DEFINED in `questdb/egress/reader.hpp` (the reader-pool entry
      * points live alongside the `reader` type, matching the C headers).

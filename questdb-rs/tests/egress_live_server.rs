@@ -1198,7 +1198,7 @@ fn query_error_for_bad_sql() {
         Err(e) => {
             // QuestDB returns SQL_ERROR (mapped to ServerParseError or
             // ServerInternalError depending on the failure kind).
-            use questdb::egress::ErrorCode as C;
+            use questdb::ErrorCode as C;
             assert!(
                 matches!(
                     e.code(),
@@ -1555,7 +1555,7 @@ fn bind_ipv4_rejected_client_side() {
         .bind_ipv4(Ipv4Addr::new(127, 0, 0, 1))
         .execute()
     {
-        Err(e) => assert_eq!(e.code(), questdb::egress::ErrorCode::InvalidBind),
+        Err(e) => assert_eq!(e.code(), questdb::ErrorCode::InvalidBind),
         Ok(_) => panic!("expected client-side rejection"),
     }
 }
@@ -1629,7 +1629,7 @@ fn bind_binary_rejected_client_side() {
         .bind_binary(vec![0xDE, 0xAD])
         .execute()
     {
-        Err(e) => assert_eq!(e.code(), questdb::egress::ErrorCode::InvalidBind),
+        Err(e) => assert_eq!(e.code(), questdb::ErrorCode::InvalidBind),
         Ok(_) => panic!("expected client-side rejection"),
     }
 }
@@ -1732,7 +1732,7 @@ fn bind_null_binary_rejected_client_side() {
     let srv = server();
     let mut reader = make_reader(srv);
     match reader.prepare("select 1").bind_null_binary().execute() {
-        Err(e) => assert_eq!(e.code(), questdb::egress::ErrorCode::InvalidBind),
+        Err(e) => assert_eq!(e.code(), questdb::ErrorCode::InvalidBind),
         Ok(_) => panic!("expected client-side rejection"),
     }
 }
@@ -2347,7 +2347,7 @@ fn target_replica_rejects_standalone() {
     let conf = format!("{};target=replica", srv.qwp_conf());
     match Reader::from_conf(&conf) {
         Err(e) => {
-            assert_eq!(e.code(), questdb::egress::ErrorCode::RoleMismatch);
+            assert_eq!(e.code(), questdb::ErrorCode::RoleMismatch);
             assert!(
                 e.msg().contains("Replica") || e.msg().to_lowercase().contains("replica"),
                 "expected target name in message; got {:?}",
@@ -3079,10 +3079,10 @@ fn dropping_live_cursor_closes_connection() {
     // must also explain the *cause* (a cursor dropped before being
     // fully read) and the fix, rather than the misleading
     // "failed mid-query failover" wording.
-    let assert_closed = |e: &questdb::egress::Error| {
+    let assert_closed = |e: &questdb::Error| {
         assert_eq!(
             e.code(),
-            questdb::egress::ErrorCode::SocketError,
+            questdb::ErrorCode::SocketError,
             "expected SocketError after WS close, got {:?}: {}",
             e.code(),
             e.msg()
@@ -3400,10 +3400,7 @@ fn cursor_short_circuits_after_query_error() {
                 cur.next_batch().map(|o| o.is_none()).map_err(|e| e.code())
             });
         assert!(
-            matches!(
-                post_cancel,
-                Ok(true) | Err(questdb::egress::ErrorCode::Cancelled)
-            ),
+            matches!(post_cancel, Ok(true) | Err(questdb::ErrorCode::Cancelled)),
             "next_batch after cancel must return Ok(None) or replay Err(Cancelled), got {post_cancel:?}"
         );
 

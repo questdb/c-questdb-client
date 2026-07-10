@@ -118,7 +118,7 @@ pub fn reconnect_max_duration(db: &QuestDb) -> Duration {
 /// handle. FFI counterpart to `QuestDb::borrow_reader`; backs the C ABI's
 /// `questdb_db_borrow_reader`.
 #[cfg(feature = "_egress")]
-pub fn borrow_reader_owned(db: &QuestDb) -> crate::egress::error::Result<OwnedReader> {
+pub fn borrow_reader_owned(db: &QuestDb) -> crate::error::Result<OwnedReader> {
     db.borrow_reader_owned()
 }
 

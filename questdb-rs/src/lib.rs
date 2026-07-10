@@ -48,8 +48,7 @@ pub mod ingress;
 // and the egress adapter. Homed here so a sender-only `arrow-ingress` build
 // can use them without compiling the egress reader.
 #[cfg(feature = "_arrow")]
-#[doc(hidden)]
-pub mod arrow_meta;
+pub mod arrow_metadata;
 
 // Transport-neutral arrow<->polars_arrow FFI bridges, shared by both polars
 // directions.

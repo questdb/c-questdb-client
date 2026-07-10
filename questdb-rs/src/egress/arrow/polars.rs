@@ -14,8 +14,8 @@ use polars::prelude::{
 
 use crate::egress::Cursor;
 use crate::egress::arrow::has_tentative_array;
-use crate::egress::error::{Error, ErrorCode, Result, fmt};
 use crate::egress::symbol_dict::SymbolDict;
+use crate::error::{Error, ErrorCode, Result, fmt};
 
 // FFI cross-crate helpers in `crate::ingress::polars`.
 

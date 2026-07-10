@@ -34,7 +34,7 @@
 
 // Sub-modules.
 //
-// `pub mod` modules (column, column_kind, config, error, reader, wire)
+// `pub mod` modules (column, column_kind, config, reader, wire)
 // are part of the navigable API surface — tests and examples take
 // sub-paths through them (e.g. `egress::column::FixedColumn`,
 // `egress::wire::flags`, `egress::reader::Terminal`).
@@ -52,7 +52,6 @@ pub mod column;
 pub mod column_kind;
 pub mod config;
 pub(crate) mod decoder;
-pub mod error;
 pub(crate) mod gorilla;
 pub(crate) mod query_request;
 #[cfg(feature = "sync-reader-qwp-ws")]
@@ -89,13 +88,12 @@ pub use config::{
     Endpoint, MAX_ADDRS, MAX_COMPRESSION_LEVEL, MAX_FAILOVER_BACKOFF_MAX_MS,
     MAX_FAILOVER_MAX_ATTEMPTS, MIN_COMPRESSION_LEVEL, ReaderConfig, Target, TlsVerify,
 };
-pub use error::{Error, ErrorCode, Result};
 #[cfg(feature = "sync-reader-qwp-ws")]
 pub use reader::{
-    BatchView, Cursor, FailoverEvent, FailoverPhase, FailoverProgressEvent, Reader, ReaderQuery,
-    ReaderStats, Terminal,
+    BatchView, Cursor, FailoverPhase, FailoverProgressEvent, FailoverResetEvent, Reader,
+    ReaderQuery, ReaderStats, Terminal,
 };
-pub use server_event::{ServerInfo, ServerRole};
+pub use server_event::{ServerInfo, ServerRole, UpgradeReject};
 pub use symbol_dict::{SymbolDict, SymbolEntry};
 
 /// Decoder internals re-exported for the in-crate criterion benchmark
@@ -124,7 +122,7 @@ pub mod _bench_internals {
         schema: &Schema,
         batch: DecodedBatch,
         dict: &SymbolDict,
-    ) -> crate::egress::error::Result<arrow::array::RecordBatch> {
+    ) -> crate::error::Result<arrow::array::RecordBatch> {
         use std::sync::Arc;
         let arrow_schema = Arc::new(crate::egress::arrow::batch_arrow_schema(schema, &batch)?);
         crate::egress::arrow::batch_to_record_batch(arrow_schema, schema, batch, dict)
@@ -141,7 +139,7 @@ pub mod _bench_internals {
         schema: &Schema,
         batch: DecodedBatch,
         dict: &SymbolDict,
-    ) -> crate::egress::error::Result<polars::frame::DataFrame> {
+    ) -> crate::error::Result<polars::frame::DataFrame> {
         let rb = bench_batch_to_record_batch(schema, batch, dict)?;
         crate::egress::arrow::polars::record_batch_to_dataframe(rb)
     }

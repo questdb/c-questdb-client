@@ -224,12 +224,18 @@ macro_rules! upd_opts {
 
 /// An error that occurred when using the QuestDB client.
 ///
-/// This is the single, unified error object for both ingest and query; the
-/// egress reader spells it `reader_error`, backed by this same struct.
+/// This is the single, unified error object for both ingest and query. New
+/// cross-client APIs spell it [`questdb_error`]; the released
+/// `line_sender_error` name remains the underlying ABI type.
 pub struct line_sender_error {
     error: Error,
     qwp_ws_error: Option<QwpWsSenderError>,
 }
+
+/// Neutral spelling of the client-wide error object. The alias preserves the
+/// released `line_sender_error` layout and ownership ABI.
+#[allow(non_camel_case_types)]
+pub type questdb_error = line_sender_error;
 
 impl line_sender_error {
     /// Wrap a [`questdb::Error`] as the FFI error object, with no QWP/WS
@@ -386,9 +392,14 @@ pub enum line_sender_error_code {
     line_sender_error_store_resend_required = 36,
 }
 
-// The client error model is unified across ingest and query:
-// `line_sender_error_code` is the single C error enum. The egress module
-// spells the same enum `reader_error_code`.
+/// Neutral spelling of the client-wide error category. The released
+/// `line_sender_error_code` enum remains the ABI source of its discriminants.
+#[allow(non_camel_case_types)]
+pub type questdb_error_code = line_sender_error_code;
+
+// The client error model is unified across ingest and query. The released
+// `line_sender_error_code` enum remains the single C ABI representation;
+// `questdb_error_code` is the neutral spelling used by new shared APIs.
 
 impl From<ErrorCode> for line_sender_error_code {
     fn from(code: ErrorCode) -> Self {
@@ -623,16 +634,14 @@ impl From<line_sender_ca> for CertificateAuthority {
     }
 }
 
-/// Error code categorising the error.
+/// Error code categorising a client-wide error.
 ///
 /// NULL-safe: passing `NULL` returns `line_sender_error_invalid_api_call`
 /// (the caller is misusing the accessor) rather than dereferencing.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn line_sender_error_get_code(
-    error: *const line_sender_error,
-) -> line_sender_error_code {
+pub unsafe extern "C" fn questdb_error_get_code(error: *const questdb_error) -> questdb_error_code {
     if error.is_null() {
-        return line_sender_error_code::line_sender_error_invalid_api_call;
+        return questdb_error_code::line_sender_error_invalid_api_call;
     }
     unsafe { (*error).error.code().into() }
 }
@@ -644,8 +653,8 @@ pub unsafe extern "C" fn line_sender_error_get_code(
 /// empty string with `*len_out = 0` (when `len_out` is non-NULL); a NULL
 /// `len_out` is silently ignored.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn line_sender_error_msg(
-    error: *const line_sender_error,
+pub unsafe extern "C" fn questdb_error_msg(
+    error: *const questdb_error,
     len_out: *mut size_t,
 ) -> *const c_char {
     unsafe {
@@ -676,7 +685,7 @@ pub unsafe extern "C" fn line_sender_error_msg(
 ///
 /// NULL-safe: passing `NULL` returns `false`.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn line_sender_error_in_doubt(error: *const line_sender_error) -> bool {
+pub unsafe extern "C" fn questdb_error_in_doubt(error: *const questdb_error) -> bool {
     if error.is_null() {
         return false;
     }
@@ -685,12 +694,41 @@ pub unsafe extern "C" fn line_sender_error_in_doubt(error: *const line_sender_er
 
 /// Clean up the error.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn line_sender_error_free(error: *mut line_sender_error) {
+pub unsafe extern "C" fn questdb_error_free(error: *mut questdb_error) {
     unsafe {
         if !error.is_null() {
             drop(Box::from_raw(error));
         }
     }
+}
+
+/// Released line-sender spelling of [`questdb_error_get_code`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn line_sender_error_get_code(
+    error: *const line_sender_error,
+) -> line_sender_error_code {
+    unsafe { questdb_error_get_code(error) }
+}
+
+/// Released line-sender spelling of [`questdb_error_msg`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn line_sender_error_msg(
+    error: *const line_sender_error,
+    len_out: *mut size_t,
+) -> *const c_char {
+    unsafe { questdb_error_msg(error, len_out) }
+}
+
+/// Released line-sender spelling of [`questdb_error_in_doubt`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn line_sender_error_in_doubt(error: *const line_sender_error) -> bool {
+    unsafe { questdb_error_in_doubt(error) }
+}
+
+/// Released line-sender spelling of [`questdb_error_free`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn line_sender_error_free(error: *mut line_sender_error) {
+    unsafe { questdb_error_free(error) }
 }
 
 /// Non-owning validated UTF-8 encoded string.
@@ -5888,7 +5926,7 @@ mod tests {
         }
     }
 
-    fn connect_pool(conf: &str, err: &mut *mut line_sender_error) -> *mut questdb_db {
+    fn connect_pool(conf: &str, err: &mut *mut questdb_error) -> *mut questdb_db {
         let db = unsafe { questdb_db_connect(conf.as_ptr() as *const c_char, conf.len(), err) };
         assert!(!db.is_null(), "pool connect failed");
         assert!(err.is_null(), "pool connect set unexpected error");
@@ -5982,27 +6020,24 @@ mod tests {
         free_err(err);
     }
 
-    fn assert_reader_error_contains(
-        err: &mut *mut egress::reader_error,
-        code: egress::reader_error_code,
+    fn assert_client_error_contains(
+        err: &mut *mut questdb_error,
+        code: questdb_error_code,
         needle: &str,
     ) {
-        assert!(!err.is_null(), "expected reader_error");
-        assert_eq!(
-            unsafe { egress::reader_error_get_code(*err) } as u32,
-            code as u32
-        );
+        assert!(!err.is_null(), "expected questdb_error");
+        assert_eq!(unsafe { questdb_error_get_code(*err) } as u32, code as u32);
         let message = unsafe {
             let mut len = 0;
-            let ptr = egress::reader_error_msg(*err, &mut len);
+            let ptr = questdb_error_msg(*err, &mut len);
             let bytes = std::slice::from_raw_parts(ptr as *const u8, len);
             String::from_utf8_lossy(bytes).into_owned()
         };
         assert!(
             message.contains(needle),
-            "expected reader error message to contain {needle:?}, got: {message}"
+            "expected client error message to contain {needle:?}, got: {message}"
         );
-        unsafe { egress::reader_error_free(*err) };
+        unsafe { questdb_error_free(*err) };
         *err = ptr::null_mut();
     }
 
@@ -6554,11 +6589,7 @@ mod tests {
         unsafe {
             let mut err = ptr::null_mut();
             let conf = server.conf();
-            let db = egress::questdb_db_connect_reader(
-                conf.as_ptr() as *const c_char,
-                conf.len(),
-                &mut err,
-            );
+            let db = questdb_db_connect(conf.as_ptr() as *const c_char, conf.len(), &mut err);
             assert!(!db.is_null());
             assert!(err.is_null());
 
@@ -6570,9 +6601,9 @@ mod tests {
 
             let query = egress::reader_prepare(reader, utf8(b"select 1"), &mut err);
             assert!(query.is_null());
-            assert_reader_error_contains(
+            assert_client_error_contains(
                 &mut err,
-                egress::reader_error_code::line_sender_error_invalid_api_call,
+                questdb_error_code::line_sender_error_invalid_api_call,
                 "QuestDb pool is closed",
             );
 

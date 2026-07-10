@@ -771,7 +771,7 @@ impl ColumnSender {
     /// so far to reach `ack_level`. `timeout` is a no-progress deadline — it
     /// fires only if the ack watermark fails to advance for that long;
     /// `Duration::ZERO` waits indefinitely. On expiry it returns a
-    /// [`ErrorCode::FailoverRetry`](crate::error::ErrorCode::FailoverRetry)
+    /// [`ErrorCode::FailoverRetry`](crate::ErrorCode::FailoverRetry)
     /// error and the queued frames are retained for replay.
     pub fn wait(&mut self, ack_level: AckLevel, timeout: Duration) -> Result<()> {
         match &mut self.backend {

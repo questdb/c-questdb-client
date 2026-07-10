@@ -248,7 +248,7 @@ struct ErrorInner {
     qwp_ws_rejection: Option<Box<crate::ingress::QwpWsSenderError>>,
     /// `421 + X-QuestDB-Role` topology reject seen on the QWP/WebSocket
     /// *sender* upgrade. Sender-only; kept distinct from the query-side
-    /// [`UpgradeReject`](crate::egress::server_event::UpgradeReject), which
+    /// [`UpgradeReject`](crate::egress::UpgradeReject), which
     /// carries the richer `SERVER_INFO` role byte.
     #[cfg(feature = "_sender-qwp-ws")]
     qwp_ws_role_reject: Option<crate::ingress::QwpWsRoleReject>,
@@ -325,7 +325,7 @@ impl Error {
         self
     }
 
-    /// Builder: attach a query-side [`UpgradeReject`](crate::egress::server_event::UpgradeReject)
+    /// Builder: attach a query-side [`UpgradeReject`](crate::egress::UpgradeReject)
     /// (HTTP `421 + X-QuestDB-Role` or `SERVER_INFO` target mismatch) so the
     /// host-health tracker can read the role + zone without re-parsing.
     #[cfg(feature = "_egress")]

@@ -6,7 +6,7 @@
  * Unlike the ingress C++ sidecar (which must fall back to the C ABI because
  * the C++ wrapper has no row-major QWP-WS surface), the egress wrapper is a
  * genuine C++ API: this translation unit drives `questdb::egress::reader`,
- * `cursor` and `batch` directly, with `reader_error` exceptions mapped onto
+ * `cursor` and `batch` directly, with `questdb::error` exceptions mapped onto
  * the wire protocol's ERR replies. That is the c_client_cpp egress signal:
  * the QWP reader works through the real C++ classes.
  *
@@ -15,14 +15,9 @@
  * the C++ wrapper surfaces the same accessors as the C API, so it too has
  * no zone string).
  *
- * `QUESTDB_READER_INTERNAL_CONSTRUCTORS` unlocks the standalone
- * `reader{conf}` constructor -- the sanctioned in-tree-test form (the same
- * one cpp_test/test_reader_offline.cpp uses); the pool facade is the
- * production entry point but is not what these per-binding scenarios
- * exercise.
+ * The standalone `reader{conf}` constructor gives each CONNECT command one
+ * dedicated transport, matching the Rust sidecar's `Reader::from_conf`.
  */
-
-#define QUESTDB_READER_INTERNAL_CONSTRUCTORS
 
 #include <questdb/egress/reader.hpp>
 

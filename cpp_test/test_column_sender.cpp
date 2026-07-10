@@ -103,7 +103,7 @@ TEST_CASE("column_chunk fluent chaining returns the same chunk")
 
 TEST_CASE("pool construction throws on invalid connect string")
 {
-    CHECK_THROWS_AS(questdb::pool{"http::not-a-qwp-string;"}, qdb::line_sender_error);
+    CHECK_THROWS_AS(questdb::pool{"http::not-a-qwp-string;"}, questdb::error);
 }
 
 TEST_CASE("borrowed_column_sender returns conn to pool on destructor")

@@ -651,7 +651,7 @@ impl Sender {
     /// watermark fails to advance for that long, so a steadily-progressing
     /// large batch keeps waiting. `Duration::ZERO` waits indefinitely. On
     /// expiry it returns an
-    /// [`ErrorCode::FailoverRetry`](crate::error::ErrorCode::FailoverRetry)
+    /// [`ErrorCode::FailoverRetry`](crate::ErrorCode::FailoverRetry)
     /// error and the published frames are retained for replay.
     ///
     /// A terminal server rejection of a frame in the pending range, or a

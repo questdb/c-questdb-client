@@ -68,7 +68,7 @@ use std::path::PathBuf;
 use std::str::FromStr;
 
 use crate::egress::auth::AuthMode;
-use crate::egress::error::{Result, fmt};
+use crate::error::{Result, fmt};
 use crate::ingress::CertificateAuthority;
 
 /// Default endpoint path (mirrors the Java client).
@@ -107,7 +107,7 @@ const DEFAULT_TLS_PORT: &str = "9000";
 /// error to the operator rather than silently mis-decoding a
 /// compressed payload as raw wire bytes.
 ///
-/// [`ErrorCode::UnsupportedServer`]: crate::egress::ErrorCode::UnsupportedServer
+/// [`ErrorCode::UnsupportedServer`]: crate::ErrorCode::UnsupportedServer
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum Compression {
@@ -175,7 +175,7 @@ pub enum Target {
 
 /// A `host:port` endpoint as parsed from a connect string. Used in
 /// the [`ReaderConfig::addrs`] list and surfaced to user code via
-/// [`crate::egress::FailoverEvent`] and [`crate::egress::Reader::current_addr`].
+/// [`crate::egress::FailoverResetEvent`] and [`crate::egress::Reader::current_addr`].
 ///
 /// Named struct (rather than a `(String, u16)` tuple) so callers can
 /// write `ev.failed_addr.host` / `ep.port` instead of the opaque `.0`
@@ -598,9 +598,9 @@ impl ReaderConfig {
         // multi-host parser. The sanitized conf string has duplicate
         // `addr=` params removed so the standard `questdb_confstr` parser
         // doesn't see them twice.
-        // The scan helper is shared with ingress and returns the crate-level
-        // `Error` type; remap onto the egress error here. The only failure
-        // mode is a malformed conf, which the helper actually signals as
+        // The scan helper is shared with ingress and already returns the
+        // crate-wide `Error` type. Add reader-specific context here. The only
+        // failure mode is a malformed conf, which the helper actually signals as
         // `Ok(None)` rather than `Err`, so the remap is defensive.
         let addr_scan = crate::ingress::scan_qwp_ws_addr_params(conf_str)
             .map_err(|e| fmt!(ConfigError, "{}", e.msg()))?;
@@ -1350,7 +1350,7 @@ fn reject_crlf(name: &str, val: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::egress::error::ErrorCode;
+    use crate::error::ErrorCode;
 
     #[test]
     fn minimal_plain_conf() {
@@ -2305,7 +2305,7 @@ mod tests {
     fn endpoint_display_common_cases() {
         // Hostnames and IPv4 literals format unbracketed — `host:port`
         // is the path users will actually see in connect strings,
-        // logs, and `FailoverEvent` output. This is the contract the
+        // logs, and `FailoverResetEvent` output. This is the contract the
         // failover doctest and example rely on.
         assert_eq!(
             Endpoint::new("localhost", 9000).to_string(),

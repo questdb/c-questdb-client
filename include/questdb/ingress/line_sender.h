@@ -162,8 +162,7 @@ typedef enum line_sender_error_code
 
     /* Query / reader (egress) categories. The error model is unified across
      * ingest and query: these are emitted by the reader. Appended at 20..34
-     * so the ingress discriminants 0..19 stay frozen. The reader aliases
-     * (`reader_error_*` in <questdb/egress/reader.h>) map onto these. */
+     * so the ingress discriminants 0..19 stay frozen. */
 
     /** HTTP-upgrade or WebSocket handshake failure. */
     line_sender_error_handshake_error = 20,
@@ -233,6 +232,57 @@ typedef enum line_sender_error_code
      *  "reconnect and retry" by code, without matching on the message text. */
     line_sender_error_store_resend_required = 36,
 } line_sender_error_code;
+
+/**
+ * Client-wide error object and category.
+ *
+ * These are the neutral spellings used by APIs that span ingest and query.
+ * They alias the released `line_sender_error` ABI so existing line-sender
+ * binaries and source keep working unchanged.
+ */
+typedef line_sender_error questdb_error;
+typedef line_sender_error_code questdb_error_code;
+
+/* Neutral names for the unified error-code constants. The underlying
+ * `line_sender_error_code` enum and its enumerators are retained because they
+ * shipped before the client-wide error vocabulary was introduced. */
+#define questdb_error_could_not_resolve_addr line_sender_error_could_not_resolve_addr
+#define questdb_error_invalid_api_call line_sender_error_invalid_api_call
+#define questdb_error_socket_error line_sender_error_socket_error
+#define questdb_error_invalid_utf8 line_sender_error_invalid_utf8
+#define questdb_error_invalid_name line_sender_error_invalid_name
+#define questdb_error_invalid_timestamp line_sender_error_invalid_timestamp
+#define questdb_error_auth_error line_sender_error_auth_error
+#define questdb_error_tls_error line_sender_error_tls_error
+#define questdb_error_http_not_supported line_sender_error_http_not_supported
+#define questdb_error_server_flush_error line_sender_error_server_flush_error
+#define questdb_error_config_error line_sender_error_config_error
+#define questdb_error_array_error line_sender_error_array_error
+#define questdb_error_protocol_version_error line_sender_error_protocol_version_error
+#define questdb_error_invalid_decimal line_sender_error_invalid_decimal
+#define questdb_error_server_rejection line_sender_error_server_rejection
+#define questdb_error_arrow_unsupported_column_kind line_sender_error_arrow_unsupported_column_kind
+#define questdb_error_arrow_ingest line_sender_error_arrow_ingest
+#define questdb_error_failover_retry line_sender_error_failover_retry
+#define questdb_error_role_mismatch line_sender_error_role_mismatch
+#define questdb_error_connect_timeout line_sender_error_connect_timeout
+#define questdb_error_handshake_error line_sender_error_handshake_error
+#define questdb_error_unsupported_server line_sender_error_unsupported_server
+#define questdb_error_protocol_error line_sender_error_protocol_error
+#define questdb_error_invalid_bind line_sender_error_invalid_bind
+#define questdb_error_server_schema_mismatch line_sender_error_server_schema_mismatch
+#define questdb_error_server_parse_error line_sender_error_server_parse_error
+#define questdb_error_server_internal_error line_sender_error_server_internal_error
+#define questdb_error_server_security_error line_sender_error_server_security_error
+#define questdb_error_limit_exceeded line_sender_error_limit_exceeded
+#define questdb_error_server_limit_exceeded line_sender_error_server_limit_exceeded
+#define questdb_error_cancelled line_sender_error_cancelled
+#define questdb_error_failover_would_duplicate line_sender_error_failover_would_duplicate
+#define questdb_error_schema_drift line_sender_error_schema_drift
+#define questdb_error_no_schema line_sender_error_no_schema
+#define questdb_error_arrow_export line_sender_error_arrow_export
+#define questdb_error_batch_too_large line_sender_error_batch_too_large
+#define questdb_error_store_resend_required line_sender_error_store_resend_required
 
 /** The protocol used to connect with. */
 typedef enum line_sender_protocol
@@ -316,7 +366,31 @@ typedef enum line_sender_ca
     line_sender_ca_pem_file,
 } line_sender_ca;
 
-/** Error code categorizing the error. */
+/** Error code categorizing a client-wide error. NULL-safe: a NULL input
+ *  returns `questdb_error_invalid_api_call`. */
+QUESTDB_CLIENT_API
+questdb_error_code questdb_error_get_code(const questdb_error*);
+
+/**
+ * UTF-8 encoded client-wide error message. Never returns NULL. The returned
+ * string is not null-terminated; `len_out` receives its byte length.
+ * NULL-safe on both arguments: a NULL error returns an empty string and writes
+ * zero when `len_out` is non-NULL; a NULL `len_out` is ignored.
+ */
+QUESTDB_CLIENT_API
+const char* questdb_error_msg(const questdb_error*, size_t* len_out);
+
+/** Whether the failed operation may already have delivered its input. A true
+ *  result means replay can duplicate data unless the application has its own
+ *  deduplication guarantee. NULL-safe: a NULL input returns false. */
+QUESTDB_CLIENT_API
+bool questdb_error_in_doubt(const questdb_error*);
+
+/** Clean up a client-wide error. Idempotent on NULL. */
+QUESTDB_CLIENT_API
+void questdb_error_free(questdb_error*);
+
+/** Error code categorizing a line-sender error. */
 QUESTDB_CLIENT_API
 line_sender_error_code line_sender_error_get_code(const line_sender_error*);
 

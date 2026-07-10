@@ -23,7 +23,7 @@
 
 use std::sync::{Arc, Mutex};
 
-use questdb::egress::{FailoverEvent, Reader};
+use questdb::egress::{FailoverResetEvent, Reader};
 
 fn main() {
     // The default is single-endpoint so `cargo run --example` works
@@ -51,7 +51,7 @@ fn main() {
 
     let mut cursor = reader
         .prepare(&sql)
-        .on_failover_reset(move |ev: &FailoverEvent| {
+        .on_failover_reset(move |ev: &FailoverResetEvent| {
             // `ev.trigger` carries the full error of the previous
             // connection's death — code (for routing/metrics) and
             // message (for log diagnostics). Print both.

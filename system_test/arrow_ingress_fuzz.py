@@ -18,7 +18,7 @@ import arrow_fuzz_common as afc
 from arrow_fuzz_common import KIND_REGISTRY, KindSpec
 from arrow_ffi import (
     ArrowSenderError,
-    SenderErrorCode,
+    ClientErrorCode,
 )
 from questdb_line_sender import QwpWsErrorCategory, QwpWsErrorPolicy
 
@@ -559,7 +559,7 @@ class TestArrowIngressErrors(afc.ArrowFuzzBase):
             [("c_int", KIND_REGISTRY["int"])],
             null_mode="valid",
         )
-        self._expect_code(rb, SenderErrorCode.ARROW_INGEST,
+        self._expect_code(rb, ClientErrorCode.ARROW_INGEST,
                           ts_col=b"definitely_not_a_column")
 
     def test_err_designated_ts_wrong_type(self):
@@ -573,7 +573,7 @@ class TestArrowIngressErrors(afc.ArrowFuzzBase):
             pa.field("ts", pa.int64(), nullable=True),
         ])
         rb = pa.RecordBatch.from_arrays([arr_int, ts_arr], schema=schema)
-        self._expect_code(rb, SenderErrorCode.ARROW_INGEST)
+        self._expect_code(rb, ClientErrorCode.ARROW_INGEST)
 
     def test_err_designated_ts_has_nulls(self):
         n = 4
@@ -586,7 +586,7 @@ class TestArrowIngressErrors(afc.ArrowFuzzBase):
             pa.field("ts", pa.timestamp("us", tz="UTC"), nullable=True),
         ])
         rb = pa.RecordBatch.from_arrays([c_int, ts_arr], schema=schema)
-        self._expect_code(rb, SenderErrorCode.ARROW_INGEST)
+        self._expect_code(rb, ClientErrorCode.ARROW_INGEST)
 
     def test_err_list_non_float_leaf(self):
         n = 4
@@ -605,7 +605,7 @@ class TestArrowIngressErrors(afc.ArrowFuzzBase):
             pa.field("ts", pa.timestamp("us", tz="UTC"), nullable=False),
         ])
         rb = pa.RecordBatch.from_arrays([c_str_list, ts_arr], schema=schema)
-        self._expect_code(rb, SenderErrorCode.ARROW_UNSUPPORTED_COLUMN_KIND)
+        self._expect_code(rb, ClientErrorCode.ARROW_UNSUPPORTED_COLUMN_KIND)
 
     def test_err_geohash_bits_zero(self):
         n = 4
@@ -620,7 +620,7 @@ class TestArrowIngressErrors(afc.ArrowFuzzBase):
             pa.field("ts", pa.timestamp("us", tz="UTC"), nullable=False),
         ])
         rb = pa.RecordBatch.from_arrays([c_geo, ts_arr], schema=schema)
-        self._expect_code(rb, SenderErrorCode.ARROW_INGEST)
+        self._expect_code(rb, ClientErrorCode.ARROW_INGEST)
 
     def test_err_geohash_bits_too_large(self):
         n = 4
@@ -635,7 +635,7 @@ class TestArrowIngressErrors(afc.ArrowFuzzBase):
             pa.field("ts", pa.timestamp("us", tz="UTC"), nullable=False),
         ])
         rb = pa.RecordBatch.from_arrays([c_geo, ts_arr], schema=schema)
-        self._expect_code(rb, SenderErrorCode.ARROW_INGEST)
+        self._expect_code(rb, ClientErrorCode.ARROW_INGEST)
 
     def test_err_malformed_list_schema_zero_children(self):
         # pyarrow always emits structurally-valid Arrow, so hand-build a
@@ -676,7 +676,7 @@ class TestArrowIngressErrors(afc.ArrowFuzzBase):
                 )
             except ArrowSenderError as e:
                 self.assertEqual(
-                    e.code, SenderErrorCode.ARROW_INGEST,
+                    e.code, ClientErrorCode.ARROW_INGEST,
                     self.label(f"malformed +l → code={e.code} msg={e}"))
             else:
                 self.fail(self.label("malformed +l schema must be rejected"))
@@ -766,7 +766,7 @@ class TestArrowIngressUnsupportedTypes(afc.ArrowFuzzBase):
                                   ts_col=b"ts")
         except ArrowSenderError as e:
             self.assertEqual(
-                e.code, SenderErrorCode.ARROW_UNSUPPORTED_COLUMN_KIND,
+                e.code, ClientErrorCode.ARROW_UNSUPPORTED_COLUMN_KIND,
                 self.label(f"code={e.code} msg={e}")
             )
             return
@@ -1141,7 +1141,7 @@ class TestArrowIngressSfa(afc.ArrowFuzzBase):
                 with self.assertRaises(ArrowSenderError) as raised:
                     afc.column_sender_sync(conn, 0)
                 err = raised.exception
-                self.assertEqual(err.code, SenderErrorCode.SERVER_REJECTION)
+                self.assertEqual(err.code, ClientErrorCode.SERVER_REJECTION)
                 diagnostic = err.qwp_ws_error
                 self.assertIsNotNone(diagnostic)
                 self.assertEqual(
@@ -1160,7 +1160,7 @@ class TestArrowIngressSfa(afc.ArrowFuzzBase):
                     self._flush_batch(conn, table, after_terminal)
                 self.assertEqual(
                     post_terminal.exception.code,
-                    SenderErrorCode.SERVER_REJECTION,
+                    ClientErrorCode.SERVER_REJECTION,
                 )
 
             self.assertGreater(

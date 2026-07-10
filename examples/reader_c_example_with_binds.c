@@ -9,7 +9,7 @@ int main(int argc, const char* argv[])
     (void)argc;
     (void)argv;
 
-    reader_error* err = NULL;
+    questdb_error* err = NULL;
     reader* reader = NULL;
     reader_query* query = NULL;
     reader_cursor* cursor = NULL;
@@ -81,9 +81,9 @@ int main(int argc, const char* argv[])
 
 on_error:;
     size_t err_len = 0;
-    const char* err_msg = reader_error_msg(err, &err_len);
+    const char* err_msg = questdb_error_msg(err, &err_len);
     fprintf(stderr, "Error: %.*s\n", (int)err_len, err_msg);
-    reader_error_free(err);
+    questdb_error_free(err);
     reader_query_free(query);
     reader_cursor_free(cursor);
     reader_close(reader);

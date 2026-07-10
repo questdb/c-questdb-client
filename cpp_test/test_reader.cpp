@@ -472,10 +472,10 @@ TEST_CASE("single-cursor invariant: second query rejected")
         // Discard the result; we only care that this throws.
         (void)reader.execute("select x from long_sequence(1)"_utf8);
     }
-    catch (const questdb::egress::reader_error& e)
+    catch (const questdb::error& e)
     {
         threw = true;
-        CHECK(e.code() == reader_error_invalid_api_call);
+        CHECK(e.code() == questdb_error_invalid_api_call);
     }
     CHECK(threw);
     // cur1 closes at scope exit; the next test verifies a follow-up cursor
@@ -582,7 +582,7 @@ TEST_CASE("invalid SQL surfaces a server error")
 
     auto reader = make_reader();
     bool threw = false;
-    questdb::egress::error_code code{};
+    questdb::error_code code{};
     std::string msg;
     try
     {
@@ -595,7 +595,7 @@ TEST_CASE("invalid SQL surfaces a server error")
         auto cur = reader.execute("syntactically invalid !!!"_utf8);
         cur.next_batch();
     }
-    catch (const questdb::egress::reader_error& e)
+    catch (const questdb::error& e)
     {
         threw = true;
         code = e.code();
@@ -611,8 +611,8 @@ TEST_CASE("invalid SQL surfaces a server error")
     // (e.g.) `socket_error`, `cancelled`, or any client-side code
     // would fail this check loudly instead of being masked by an
     // any-message-is-fine assertion.
-    CHECK((code == reader_error_server_parse_error
-        || code == reader_error_server_internal_error));
+    CHECK((code == questdb_error_server_parse_error
+        || code == questdb_error_server_internal_error));
 }
 
 TEST_CASE("get_i64 type-mismatch on string column is reported, not a crash")
@@ -630,10 +630,10 @@ TEST_CASE("get_i64 type-mismatch on string column is reported, not a crash")
     {
         (void)batch.column(0).get<int64_t>(0);
     }
-    catch (const questdb::egress::reader_error& e)
+    catch (const questdb::error& e)
     {
         threw = true;
-        CHECK(e.code() == reader_error_invalid_api_call);
+        CHECK(e.code() == questdb_error_invalid_api_call);
     }
     CHECK(threw);
 }
@@ -715,7 +715,7 @@ TEST_CASE("ingress sender → egress reader round-trip for primitives")
                 break;
             }
         }
-        catch (const questdb::egress::reader_error&)
+        catch (const questdb::error&)
         {
             // Table may not be visible yet; retry.
         }
@@ -809,7 +809,7 @@ bool wait_for_rows(
             if (n >= expected)
                 return true;
         }
-        catch (const questdb::egress::reader_error&)
+        catch (const questdb::error&)
         {
         }
         std::this_thread::sleep_for(std::chrono::milliseconds(80));
@@ -998,7 +998,7 @@ TEST_CASE("live: batch::column — DOUBLE_ARRAY round-trip")
         REQUIRE(ac.is_array());
         REQUIRE(ac.kind() == eg::column_kind::double_array);
         // Scalar accessors on an array column raise.
-        CHECK_THROWS_AS(ac.values<double>(), eg::reader_error);
+        CHECK_THROWS_AS(ac.values<double>(), questdb::error);
 
         for (size_t r = 0; r < rows; ++r)
         {

@@ -31,7 +31,7 @@
 use std::io::{BufRead, Write};
 use std::sync::{Arc, Mutex};
 
-use questdb::egress::{FailoverEvent, FailoverPhase, FailoverProgressEvent, Reader};
+use questdb::egress::{FailoverResetEvent, FailoverPhase, FailoverProgressEvent, Reader};
 
 /// Initial byte-credit window. The server pauses streaming after this
 /// budget is exhausted, modulo the row floor (one extra batch
@@ -58,7 +58,7 @@ fn main() {
     let mut cursor = reader
         .prepare(&sql)
         .initial_credit(INITIAL_CREDIT_BYTES)
-        .on_failover_reset(move |ev: &FailoverEvent| {
+        .on_failover_reset(move |ev: &FailoverResetEvent| {
             eprintln!(
                 "[failover] {} -> {} attempts={} elapsed={:?} trigger={:?}: {}",
                 ev.failed_addr,

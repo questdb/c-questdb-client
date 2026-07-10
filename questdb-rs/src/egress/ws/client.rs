@@ -133,7 +133,7 @@ impl Write for Stream {
 
 /// Why a `read_binary_frame` call returned without yielding a Binary
 /// payload. Internal-only — the public API surfaces these as
-/// `egress::Error` variants in the transport layer.
+/// crate-wide [`Error`](crate::Error) variants in the transport layer.
 #[derive(Debug)]
 pub(crate) enum WsReadError {
     /// Underlying stream returned an `io::Error` (read failure,

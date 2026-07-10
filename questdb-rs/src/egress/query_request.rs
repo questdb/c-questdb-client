@@ -40,9 +40,9 @@
 use std::net::Ipv4Addr;
 
 use crate::egress::binds::{Bind, SimpleNullKind, check_bindable, encode_bind};
-use crate::egress::error::{Result, fmt};
 use crate::egress::wire::msg_kind::MsgKind;
 use crate::egress::wire::varint;
+use crate::error::{Result, fmt};
 
 /// Per-spec hard limit on SQL text length (1 MiB UTF-8 bytes).
 pub const MAX_SQL_BYTES: usize = 1024 * 1024;
@@ -277,7 +277,7 @@ impl QueryRequestBuilder {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::egress::error::ErrorCode;
+    use crate::error::ErrorCode;
 
     /// Locks the `REQUEST_ID_OFFSET` constant to the actual byte
     /// position the encoder emits. If `encode` ever shifts the

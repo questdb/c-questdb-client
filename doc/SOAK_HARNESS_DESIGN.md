@@ -97,7 +97,7 @@ harness.
 | Scheduled pipeline + Slack `#builds` alert | `ci/run_fuzz_pipeline.yaml` (`NotifyOnFailure`) | clone for the soak pipeline |
 | Server-from-master in CI | `ci/templates/clone_questdb.yaml`, `TestVsQuestDBMaster` job | same provisioning |
 | ASan/UBSan build | `SanitizeCppTests` (`-DQUESTDB_SANITIZE=ON`, CMakeLists.txt) | sanitize profile links the C leg against this build |
-| Egress failover event surface | `ReaderQuery::on_failover_reset` + `FailoverEvent` (attempts, elapsed, trigger); FFI `reader_query_on_failover_reset` | egress legs count/verify failovers |
+| Egress failover event surface | `ReaderQuery::on_failover_reset` + `FailoverResetEvent` (attempts, elapsed, trigger); FFI `reader_query_on_failover_reset` | egress legs count/verify failovers |
 | Egress stats | `ReaderStats` (`bytes_received`, …) + FFI getters; `questdb_db_dbg_reader_free_count` / `_in_use_count` | sampled directly; **naming precedent for S0** |
 
 **The gap** (why S0 exists): the sender side exposes almost nothing.
@@ -212,7 +212,7 @@ the expected result is exactly regenerable from the seed even while ingest
 continues. `rust-egress-whole` wires `on_failover_reset` and must return the
 complete, in-order result across failovers; `rust-egress-stream` treats
 `FailoverWouldDuplicate` as expected only inside episode windows, re-issues,
-and reports both counts plus `FailoverEvent` fields (attempts, elapsed) into
+and reports both counts plus `FailoverResetEvent` fields (attempts, elapsed) into
 its stats stream. Plain-flavour reads are dup-tolerant (distinct-seq checks
 only).
 

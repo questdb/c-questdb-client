@@ -27,7 +27,6 @@
 //! [`crate::egress::decoder`]; everything else is here.
 
 use crate::egress::decoder::{DecodedBatch, ZstdScratch, decode_result_batch};
-use crate::egress::error::{Result, fmt};
 use crate::egress::schema::Schema;
 use crate::egress::symbol_dict::SymbolDict;
 use crate::egress::wire::ByteReader;
@@ -36,6 +35,7 @@ use crate::egress::wire::capabilities::has_zone;
 use crate::egress::wire::header::FrameHeader;
 use crate::egress::wire::msg_kind::{MsgKind, StatusCode};
 use crate::egress::wire::roles;
+use crate::error::{Result, fmt};
 use bytes::Bytes;
 
 // ---------------------------------------------------------------------------
@@ -418,9 +418,9 @@ fn read_u16_string(r: &mut ByteReader<'_>, field: &str) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::egress::error::ErrorCode;
     use crate::egress::wire::header::{HEADER_LEN, PROTOCOL_VERSION};
     use crate::egress::wire::varint::encode_u64;
+    use crate::error::ErrorCode;
 
     fn header(payload_len: usize) -> FrameHeader {
         FrameHeader {

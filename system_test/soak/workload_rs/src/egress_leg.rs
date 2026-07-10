@@ -30,7 +30,7 @@ fn scan_seq(
     reader: &mut questdb::BorrowedReader<'_>,
     table: &str,
     worker_id: u32,
-) -> questdb::egress::error::Result<(u64, i64, i64)> {
+) -> questdb::Result<(u64, i64, i64)> {
     let sql = format!("SELECT c_seq FROM {table} WHERE worker_id = {worker_id}");
     let mut cursor = reader.prepare(&sql).execute()?;
     let mut count: u64 = 0;
@@ -41,8 +41,8 @@ fn scan_seq(
         let col = match view.column(0)? {
             ColumnView::Long(c) => c,
             other => {
-                return Err(questdb::egress::error::Error::new(
-                    questdb::egress::error::ErrorCode::ProtocolError,
+                return Err(questdb::Error::new(
+                    questdb::ErrorCode::ProtocolError,
                     format!("c_seq not a Long column: {other:?}"),
                 ))
             }

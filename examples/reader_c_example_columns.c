@@ -44,7 +44,7 @@ static void print_hex(const uint8_t* p, size_t n)
 }
 
 static int print_scalar_column(
-    const reader_batch* batch, size_t col_idx, reader_error** err)
+    const reader_batch* batch, size_t col_idx, questdb_error** err)
 {
     reader_column_data d = {0};
     if (!reader_batch_column_data(batch, col_idx, &d, err)) return -1;
@@ -171,7 +171,7 @@ static int print_scalar_column(
 }
 
 static int print_double_array_column(
-    const reader_batch* batch, size_t col_idx, reader_error** err)
+    const reader_batch* batch, size_t col_idx, questdb_error** err)
 {
     reader_array_data d = {0};
     if (!reader_batch_array_column_data(batch, col_idx, &d, err))
@@ -207,7 +207,7 @@ int main(int argc, const char* argv[])
     (void)argc;
     (void)argv;
 
-    reader_error* err = NULL;
+    questdb_error* err = NULL;
     reader* reader = NULL;
     reader_cursor* cursor = NULL;
 
@@ -255,9 +255,9 @@ int main(int argc, const char* argv[])
 
 on_error:;
     size_t err_len = 0;
-    const char* err_msg = reader_error_msg(err, &err_len);
+    const char* err_msg = questdb_error_msg(err, &err_len);
     fprintf(stderr, "Error: %.*s\n", (int)err_len, err_msg);
-    reader_error_free(err);
+    questdb_error_free(err);
     reader_cursor_free(cursor);
     reader_close(reader);
     return 1;

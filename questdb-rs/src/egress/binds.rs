@@ -51,8 +51,8 @@
 use std::net::Ipv4Addr;
 
 use crate::egress::column_kind::ColumnKind;
-use crate::egress::error::{Result, fmt};
 use crate::egress::wire::varint;
+use crate::error::{Result, fmt};
 
 // ============================================================================
 // PHASE 1 SERVER COMPATIBILITY — bind-type gap
@@ -619,7 +619,7 @@ mod tests {
         ] {
             let mut out = Vec::new();
             let err = encode_bind(&bind, &mut out).unwrap_err();
-            assert_eq!(err.code(), crate::egress::ErrorCode::InvalidBind);
+            assert_eq!(err.code(), crate::ErrorCode::InvalidBind);
             assert!(
                 err.msg().contains("decimal scale"),
                 "expected scale error msg, got: {}",
@@ -646,7 +646,7 @@ mod tests {
         ] {
             let mut out = Vec::new();
             let err = encode_bind(&bind, &mut out).unwrap_err();
-            assert_eq!(err.code(), crate::egress::ErrorCode::InvalidBind);
+            assert_eq!(err.code(), crate::ErrorCode::InvalidBind);
         }
     }
 
@@ -763,7 +763,7 @@ mod tests {
             &mut out,
         )
         .unwrap_err();
-        assert_eq!(err.code(), crate::egress::ErrorCode::InvalidBind);
+        assert_eq!(err.code(), crate::ErrorCode::InvalidBind);
     }
 
     #[test]
@@ -777,7 +777,7 @@ mod tests {
             &mut out,
         )
         .unwrap_err();
-        assert_eq!(err.code(), crate::egress::ErrorCode::InvalidBind);
+        assert_eq!(err.code(), crate::ErrorCode::InvalidBind);
     }
 
     // --- Varchar / Binary --------------------------------------------------

@@ -40,26 +40,15 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use libc::{c_char, c_void, size_t};
 
 use questdb::egress::{
-    BatchView, ColumnKind, ColumnView, Cursor, Error, ErrorCode, FailoverEvent, FailoverPhase,
-    FailoverProgressEvent, Reader, ReaderQuery, ReaderStats, ServerInfo, ServerRole,
-    SimpleNullKind, SymbolEntry, Terminal, Validity,
+    BatchView, ColumnKind, ColumnView, Cursor, FailoverPhase, FailoverProgressEvent,
+    FailoverResetEvent, Reader, ReaderQuery, ReaderStats, ServerInfo, ServerRole, SimpleNullKind,
+    SymbolEntry, Terminal, Validity,
 };
+use questdb::{Error, ErrorCode};
 
-use crate::line_sender_utf8;
-
-// ---------------------------------------------------------------------------
-// Error type
-// ---------------------------------------------------------------------------
-
-/// The egress reader exposes its own error-type spelling, `reader_error` /
-/// `reader_error_code`, over the client's single unified error object and code
-/// enum ([`crate::line_sender_error`] / [`crate::line_sender_error_code`]): the
-/// underlying struct is shared, the reader just names it in reader terms.
-/// The one `From<ErrorCode>` that maps every category — ingest and query —
-/// lives in `lib.rs`, so there is a single source of truth for the C error
-/// codes.
-pub type reader_error = crate::line_sender_error;
-pub type reader_error_code = crate::line_sender_error_code;
+use crate::{line_sender_utf8, questdb_error, questdb_error_code};
+#[cfg(test)]
+use crate::{questdb_error_free, questdb_error_get_code, questdb_error_msg};
 
 /// Stash a deferred error on a `reader_query` (first-error-wins).
 /// NULL-safe: logs and drops the error when `query` is NULL since the
@@ -115,7 +104,7 @@ macro_rules! reader_bubble {
 /// violation. Centralising the guard here makes every call site
 /// (including the 20+ in the bind-helper macros) safe by
 /// construction; future call sites cannot forget it.
-unsafe fn write_err_box(err_out: *mut *mut reader_error, err: Error) {
+unsafe fn write_err_box(err_out: *mut *mut questdb_error, err: Error) {
     if err_out.is_null() {
         return;
     }
@@ -163,7 +152,11 @@ pub unsafe extern "C" fn reader_drop_on_return(reader: *mut reader) {
     }
 }
 
-unsafe fn set_reader_err(err_out: *mut *mut reader_error, code: ErrorCode, msg: impl Into<String>) {
+unsafe fn set_reader_err(
+    err_out: *mut *mut questdb_error,
+    code: ErrorCode,
+    msg: impl Into<String>,
+) {
     unsafe { write_err_box(err_out, Error::new(code, msg.into())) }
 }
 
@@ -257,58 +250,6 @@ mod utf8_in {
 }
 
 use utf8_in::validated_utf8;
-
-/// Error code categorising the error.
-///
-/// NULL-safe: passing `NULL` returns `line_sender_error_invalid_api_call`
-/// (the caller is misusing the accessor) rather than dereferencing.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn reader_error_get_code(error: *const reader_error) -> reader_error_code {
-    if error.is_null() {
-        return reader_error_code::line_sender_error_invalid_api_call;
-    }
-    unsafe { (*error).error.code().into() }
-}
-
-/// UTF-8 encoded error message. Never returns NULL.
-/// `len_out` is set to the number of bytes; the string is NOT null-terminated.
-///
-/// NULL-safe on both `error` and `len_out`. A NULL `error` returns a static
-/// empty string with `*len_out = 0` (when `len_out` is non-NULL); a NULL
-/// `len_out` is silently ignored. The combination matches `_free`'s NULL-
-/// safety, so a defensive caller can write
-/// `_msg(err, &len); _free(err);` without first checking `err`.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn reader_error_msg(
-    error: *const reader_error,
-    len_out: *mut size_t,
-) -> *const c_char {
-    unsafe {
-        if error.is_null() {
-            if !len_out.is_null() {
-                *len_out = 0;
-            }
-            // Static empty string — guaranteed non-NULL, zero-length, and
-            // valid for any caller's lifetime.
-            return c"".as_ptr();
-        }
-        let msg: &str = (*error).error.msg();
-        if !len_out.is_null() {
-            *len_out = msg.len();
-        }
-        msg.as_ptr() as *const c_char
-    }
-}
-
-/// Free an error returned via an `err_out` parameter. Idempotent on NULL.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn reader_error_free(error: *mut reader_error) {
-    unsafe {
-        if !error.is_null() {
-            drop(Box::from_raw(error));
-        }
-    }
-}
 
 // ---------------------------------------------------------------------------
 // Column kind
@@ -471,7 +412,7 @@ unsafe fn pooled_reader_pool_closed(reader: *const reader) -> bool {
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn reader_from_conf(
     config: line_sender_utf8,
-    err_out: *mut *mut reader_error,
+    err_out: *mut *mut questdb_error,
 ) -> *mut reader {
     // Wrap the entire body to localize any unwind from allocator
     // panics (`Box::into_raw`, `set_reader_err`, or any future
@@ -514,7 +455,7 @@ pub unsafe extern "C" fn reader_from_conf(
 /// string. On success returns a non-NULL handle that must be released
 /// with `reader_close`.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn reader_from_env(err_out: *mut *mut reader_error) -> *mut reader {
+pub unsafe extern "C" fn reader_from_env(err_out: *mut *mut questdb_error) -> *mut reader {
     // See `reader_from_conf` for the full-body `catch_unwind`
     // rationale.
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
@@ -770,7 +711,7 @@ unsafe fn reader_active(reader: *const reader) -> bool {
 pub unsafe extern "C" fn reader_server_version(
     reader: *const reader,
     out_version: *mut u8,
-    err_out: *mut *mut reader_error,
+    err_out: *mut *mut questdb_error,
 ) -> bool {
     unsafe {
         if out_version.is_null() {
@@ -917,7 +858,7 @@ fn u128_to_u64_sat(v: u128) -> u64 {
 // ---------------------------------------------------------------------------
 
 /// Opaque borrowed handle to a `SERVER_INFO` body. Returned by
-/// `reader_server_info` and `reader_failover_event_server_info`.
+/// `reader_server_info` and `reader_failover_reset_event_server_info`.
 #[repr(C)]
 pub struct reader_server_info {
     _private: [u8; 0],
@@ -1074,35 +1015,35 @@ pub unsafe extern "C" fn reader_server_info_node_id(
 }
 
 // ---------------------------------------------------------------------------
-// FailoverEvent + on_failover_reset callback
+// FailoverResetEvent + on_failover_reset callback
 // ---------------------------------------------------------------------------
 
 /// Opaque borrowed handle to a failover event. The pointer is valid only
 /// for the duration of the user's failover callback invocation.
 #[repr(C)]
-pub struct reader_failover_event {
+pub struct reader_failover_reset_event {
     _private: [u8; 0],
 }
 
 /// User callback fired after each successful mid-query failover. The
 /// `event` pointer is valid only for the duration of the call.
-pub type reader_failover_callback =
-    Option<unsafe extern "C" fn(event: *const reader_failover_event, user_data: *mut c_void)>;
+pub type reader_failover_reset_callback =
+    Option<unsafe extern "C" fn(event: *const reader_failover_reset_event, user_data: *mut c_void)>;
 
-/// NULL-safe borrow of the opaque `FailoverEvent`. Returns `None` when
+/// NULL-safe borrow of the opaque `FailoverResetEvent`. Returns `None` when
 /// the caller passes a NULL pointer.
-unsafe fn ev_ref<'a>(ev: *const reader_failover_event) -> Option<&'a FailoverEvent> {
+unsafe fn ev_ref<'a>(ev: *const reader_failover_reset_event) -> Option<&'a FailoverResetEvent> {
     if ev.is_null() {
         None
     } else {
-        Some(unsafe { &*(ev as *const FailoverEvent) })
+        Some(unsafe { &*(ev as *const FailoverResetEvent) })
     }
 }
 
 /// NULL-safe: writes empty `(NULL, 0)` when `ev` is NULL.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn reader_failover_event_failed_host(
-    ev: *const reader_failover_event,
+pub unsafe extern "C" fn reader_failover_reset_event_failed_host(
+    ev: *const reader_failover_reset_event,
     out_buf: *mut *const c_char,
     out_len: *mut size_t,
 ) {
@@ -1128,16 +1069,16 @@ pub unsafe extern "C" fn reader_failover_event_failed_host(
 
 /// NULL-safe: returns 0 when `ev` is NULL.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn reader_failover_event_failed_port(
-    ev: *const reader_failover_event,
+pub unsafe extern "C" fn reader_failover_reset_event_failed_port(
+    ev: *const reader_failover_reset_event,
 ) -> u16 {
     unsafe { ev_ref(ev).map(|e| e.failed_addr.port).unwrap_or(0) }
 }
 
 /// NULL-safe: writes empty `(NULL, 0)` when `ev` is NULL.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn reader_failover_event_new_host(
-    ev: *const reader_failover_event,
+pub unsafe extern "C" fn reader_failover_reset_event_new_host(
+    ev: *const reader_failover_reset_event,
     out_buf: *mut *const c_char,
     out_len: *mut size_t,
 ) {
@@ -1163,21 +1104,25 @@ pub unsafe extern "C" fn reader_failover_event_new_host(
 
 /// NULL-safe: returns 0 when `ev` is NULL.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn reader_failover_event_new_port(ev: *const reader_failover_event) -> u16 {
+pub unsafe extern "C" fn reader_failover_reset_event_new_port(
+    ev: *const reader_failover_reset_event,
+) -> u16 {
     unsafe { ev_ref(ev).map(|e| e.new_addr.port).unwrap_or(0) }
 }
 
 /// NULL-safe: returns 0 when `ev` is NULL.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn reader_failover_event_new_request_id(
-    ev: *const reader_failover_event,
+pub unsafe extern "C" fn reader_failover_reset_event_new_request_id(
+    ev: *const reader_failover_reset_event,
 ) -> i64 {
     unsafe { ev_ref(ev).map(|e| e.new_request_id).unwrap_or(0) }
 }
 
 /// NULL-safe: returns 0 when `ev` is NULL.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn reader_failover_event_attempts(ev: *const reader_failover_event) -> u32 {
+pub unsafe extern "C" fn reader_failover_reset_event_attempts(
+    ev: *const reader_failover_reset_event,
+) -> u32 {
     unsafe { ev_ref(ev).map(|e| e.attempts).unwrap_or(0) }
 }
 
@@ -1185,7 +1130,9 @@ pub unsafe extern "C" fn reader_failover_event_attempts(ev: *const reader_failov
 /// `SERVER_INFO` read). Saturates at `u64::MAX`. NULL-safe: returns 0
 /// when `ev` is NULL.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn reader_failover_event_elapsed_ns(ev: *const reader_failover_event) -> u64 {
+pub unsafe extern "C" fn reader_failover_reset_event_elapsed_ns(
+    ev: *const reader_failover_reset_event,
+) -> u64 {
     unsafe {
         ev_ref(ev)
             .map(|e| u128_to_u64_sat(e.elapsed.as_nanos()))
@@ -1196,15 +1143,15 @@ pub unsafe extern "C" fn reader_failover_event_elapsed_ns(ev: *const reader_fail
 /// Error code that triggered the failover (the cause-of-death of the
 /// previous connection). NULL-safe: returns
 /// `line_sender_error_invalid_api_call` when `ev` is NULL (the same
-/// sentinel as `reader_error_get_code(NULL)`).
+/// sentinel as `questdb_error_get_code(NULL)`).
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn reader_failover_event_trigger_code(
-    ev: *const reader_failover_event,
-) -> reader_error_code {
+pub unsafe extern "C" fn reader_failover_reset_event_trigger_code(
+    ev: *const reader_failover_reset_event,
+) -> questdb_error_code {
     unsafe {
         match ev_ref(ev) {
             Some(e) => e.trigger.code().into(),
-            None => reader_error_code::line_sender_error_invalid_api_call,
+            None => questdb_error_code::line_sender_error_invalid_api_call,
         }
     }
 }
@@ -1212,8 +1159,8 @@ pub unsafe extern "C" fn reader_failover_event_trigger_code(
 /// Trigger error message (UTF-8). Borrowed for the duration of the call.
 /// NULL-safe: writes empty `(NULL, 0)` when `ev` is NULL.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn reader_failover_event_trigger_msg(
-    ev: *const reader_failover_event,
+pub unsafe extern "C" fn reader_failover_reset_event_trigger_msg(
+    ev: *const reader_failover_reset_event,
     out_buf: *mut *const c_char,
     out_len: *mut size_t,
 ) {
@@ -1241,8 +1188,8 @@ pub unsafe extern "C" fn reader_failover_event_trigger_msg(
 /// it. Borrowed for the duration of the call. NULL-safe: returns NULL
 /// when `ev` is NULL.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn reader_failover_event_server_info(
-    ev: *const reader_failover_event,
+pub unsafe extern "C" fn reader_failover_reset_event_server_info(
+    ev: *const reader_failover_reset_event,
 ) -> *const reader_server_info {
     unsafe {
         match ev_ref(ev).and_then(|e| e.new_server_info.as_ref()) {
@@ -1258,10 +1205,12 @@ pub unsafe extern "C" fn reader_failover_event_server_info(
 ///
 /// The callback is invoked just before any replayed `RESULT_BATCH` arrives
 /// on a new connection. The `event` pointer passed to the callback is
-/// valid only for the duration of that call.
+/// valid only for the duration of that call. Installing this callback
+/// authorizes replay after data has reached the caller; the callback must
+/// discard partial results before replay begins.
 ///
 /// Reentrancy contract — see the corresponding C header docs on
-/// `reader_failover_callback`. In short: the trampoline runs
+/// `reader_failover_reset_callback`. In short: the trampoline runs
 /// synchronously inside the in-flight cursor op, so the user callback
 /// MUST NOT touch the originating reader, query, or cursor (including
 /// read-only stat getters — they would alias the upstream `&mut Reader`
@@ -1269,19 +1218,20 @@ pub unsafe extern "C" fn reader_failover_event_server_info(
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn reader_query_on_failover_reset(
     query: *mut reader_query,
-    callback: reader_failover_callback,
+    callback: reader_failover_reset_callback,
     user_data: *mut c_void,
 ) {
     unsafe {
         // Wrap the C function pointer + user_data in a Rust closure that
-        // matches the `FnMut(&FailoverEvent) + 'r` signature `ReaderQuery`
+        // matches the `FnMut(&FailoverResetEvent) + 'r` signature `ReaderQuery`
         // expects. The trait bound has no `Send` requirement; the cursor
         // is single-threaded and the trampoline runs on the same thread
         // that drives `next_batch`. The C caller owns `user_data` and is
         // responsible for its lifetime — see the header docs.
-        let trampoline = move |event: &FailoverEvent| {
+        let trampoline = move |event: &FailoverResetEvent| {
             if let Some(c_cb) = callback {
-                let opaque = event as *const FailoverEvent as *const reader_failover_event;
+                let opaque =
+                    event as *const FailoverResetEvent as *const reader_failover_reset_event;
                 // The user callback is C code; it cannot itself panic, but it
                 // may re-enter Rust (e.g. by calling a stat getter — itself a
                 // contract violation but still possible) and that re-entrant
@@ -1502,11 +1452,11 @@ pub unsafe extern "C" fn reader_failover_progress_event_attempt(
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn reader_failover_progress_event_trigger_code(
     ev: *const reader_failover_progress_event,
-) -> reader_error_code {
+) -> questdb_error_code {
     unsafe {
         match pev_ref(ev) {
             Some(e) => e.trigger.code().into(),
-            None => reader_error_code::line_sender_error_invalid_api_call,
+            None => questdb_error_code::line_sender_error_invalid_api_call,
         }
     }
 }
@@ -1572,7 +1522,7 @@ pub unsafe extern "C" fn reader_failover_progress_event_server_info(
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn reader_failover_progress_event_final_error_code(
     ev: *const reader_failover_progress_event,
-    out_code: *mut reader_error_code,
+    out_code: *mut questdb_error_code,
 ) -> bool {
     unsafe {
         if out_code.is_null() {
@@ -1584,7 +1534,7 @@ pub unsafe extern "C" fn reader_failover_progress_event_final_error_code(
                 true
             }
             None => {
-                *out_code = reader_error_code::line_sender_error_invalid_api_call;
+                *out_code = questdb_error_code::line_sender_error_invalid_api_call;
                 false
             }
         }
@@ -1625,12 +1575,11 @@ pub unsafe extern "C" fn reader_failover_progress_event_final_error_msg(
 /// the library; pass NULL if not needed.
 ///
 /// The callback fires at every phase of a mid-query failover — see
-/// `reader_failover_phase`. Installing this callback also opts
-/// the cursor in to "I will handle replay-after-data-delivered
-/// correctly," the same way `reader_query_on_failover_reset`
-/// does — either being installed clears the silent-duplicate guard.
+/// `reader_failover_phase`. It is telemetry-only and does not authorize
+/// replay after data has reached the caller. Install
+/// `reader_query_on_failover_reset` as well to handle replay safely.
 ///
-/// Reentrancy contract — same as `reader_failover_callback`. In
+/// Reentrancy contract — same as `reader_failover_reset_callback`. In
 /// short: the trampoline runs synchronously inside the in-flight
 /// cursor op, so the user callback MUST NOT touch the originating
 /// reader, query, or cursor (including read-only stat getters — they
@@ -1701,7 +1650,7 @@ pub struct reader_query {
 pub unsafe extern "C" fn reader_prepare(
     reader: *mut reader,
     sql: line_sender_utf8,
-    err_out: *mut *mut reader_error,
+    err_out: *mut *mut questdb_error,
 ) -> *mut reader_query {
     unsafe {
         // NULL handle is a contract violation, but report it as a clean
@@ -1857,7 +1806,7 @@ pub unsafe extern "C" fn reader_query_free(query: *mut reader_query) {
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn reader_query_execute(
     query_inout: *mut *mut reader_query,
-    err_out: *mut *mut reader_error,
+    err_out: *mut *mut questdb_error,
 ) -> *mut reader_cursor {
     unsafe {
         // Defense-in-depth: `Box::from_raw(null)` is officially UB —
@@ -1959,7 +1908,7 @@ pub unsafe extern "C" fn reader_query_execute(
 pub unsafe extern "C" fn reader_execute(
     reader: *mut reader,
     sql: line_sender_utf8,
-    err_out: *mut *mut reader_error,
+    err_out: *mut *mut questdb_error,
 ) -> *mut reader_cursor {
     unsafe {
         if reader.is_null() {
@@ -2459,7 +2408,7 @@ impl reader_cursor {
 /// synchronous cancellation that surfaces errors and drains pending
 /// frames before the connection is closed. Idempotent on NULL.
 ///
-/// Naming aligns with `reader_query_free` / `reader_error_free`
+/// Naming aligns with `reader_query_free` / `questdb_error_free`
 /// (and the ingress `line_sender_buffer_free` / `_opts_free`): the only
 /// `_close` in the egress API is `reader_close`, which closes the
 /// persistent network transport. Every other handle, including this
@@ -2504,7 +2453,7 @@ pub unsafe extern "C" fn reader_cursor_free(cursor: *mut reader_cursor) {
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn reader_cursor_next_batch(
     cursor: *mut reader_cursor,
-    err_out: *mut *mut reader_error,
+    err_out: *mut *mut questdb_error,
 ) -> *const reader_batch {
     unsafe {
         if cursor.is_null() {
@@ -2669,7 +2618,7 @@ pub unsafe extern "C" fn reader_cursor_current_addr_port(cursor: *const reader_c
 pub unsafe extern "C" fn reader_cursor_server_version(
     cursor: *const reader_cursor,
     out_version: *mut u8,
-    err_out: *mut *mut reader_error,
+    err_out: *mut *mut questdb_error,
 ) -> bool {
     unsafe {
         if out_version.is_null() {
@@ -2849,7 +2798,7 @@ pub unsafe extern "C" fn reader_cursor_terminal_exec_done(
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn reader_cursor_cancel(
     cursor: *mut reader_cursor,
-    err_out: *mut *mut reader_error,
+    err_out: *mut *mut questdb_error,
 ) -> bool {
     unsafe {
         if cursor.is_null() {
@@ -2889,7 +2838,7 @@ pub unsafe extern "C" fn reader_cursor_cancel(
 pub unsafe extern "C" fn reader_cursor_add_credit(
     cursor: *mut reader_cursor,
     additional_bytes: u64,
-    err_out: *mut *mut reader_error,
+    err_out: *mut *mut questdb_error,
 ) -> bool {
     unsafe {
         if cursor.is_null() {
@@ -2938,7 +2887,7 @@ pub unsafe extern "C" fn reader_query_set_reset_symbol_dict(query: *mut reader_q
 
 /// Report a NULL out-param contract violation through `err_out`.
 #[inline]
-unsafe fn null_out_param_err(err_out: *mut *mut reader_error, fn_name: &str) {
+unsafe fn null_out_param_err(err_out: *mut *mut questdb_error, fn_name: &str) {
     unsafe {
         set_reader_err(
             err_out,
@@ -3047,7 +2996,7 @@ fn validity_ptr(v: Validity<'_>) -> *const u8 {
 
 unsafe fn batch_or_err<'a>(
     batch: *const reader_batch,
-    err_out: *mut *mut reader_error,
+    err_out: *mut *mut questdb_error,
     fn_name: &str,
 ) -> Option<&'a BatchView<'static>> {
     if batch.is_null() {
@@ -3126,7 +3075,7 @@ pub unsafe extern "C" fn reader_batch_column_kind(
     batch: *const reader_batch,
     col_idx: size_t,
     out_kind: *mut reader_column_kind,
-    err_out: *mut *mut reader_error,
+    err_out: *mut *mut questdb_error,
 ) -> bool {
     unsafe {
         if out_kind.is_null() {
@@ -3154,7 +3103,7 @@ pub unsafe extern "C" fn reader_batch_column_name(
     col_idx: size_t,
     out_buf: *mut *const c_char,
     out_len: *mut size_t,
-    err_out: *mut *mut reader_error,
+    err_out: *mut *mut questdb_error,
 ) -> bool {
     unsafe {
         if out_buf.is_null() || out_len.is_null() {
@@ -3195,7 +3144,7 @@ pub unsafe extern "C" fn reader_batch_column_data(
     batch: *const reader_batch,
     col_idx: size_t,
     out: *mut reader_column_data,
-    err_out: *mut *mut reader_error,
+    err_out: *mut *mut questdb_error,
 ) -> bool {
     unsafe {
         if out.is_null() {
@@ -3319,7 +3268,7 @@ pub unsafe extern "C" fn reader_batch_array_column_data(
     batch: *const reader_batch,
     col_idx: size_t,
     out: *mut reader_array_data,
-    err_out: *mut *mut reader_error,
+    err_out: *mut *mut questdb_error,
 ) -> bool {
     unsafe {
         if out.is_null() {
@@ -3395,7 +3344,7 @@ pub unsafe extern "C" fn reader_batch_symbol(
     code: u32,
     out_buf: *mut *const c_char,
     out_len: *mut size_t,
-    err_out: *mut *mut reader_error,
+    err_out: *mut *mut questdb_error,
 ) -> bool {
     unsafe {
         if out_buf.is_null() || out_len.is_null() {
@@ -3445,7 +3394,7 @@ pub unsafe extern "C" fn reader_batch_symbol(
 pub unsafe extern "C" fn reader_batch_symbol_dict(
     batch: *const reader_batch,
     out: *mut reader_symbol_dict,
-    err_out: *mut *mut reader_error,
+    err_out: *mut *mut questdb_error,
 ) -> bool {
     unsafe {
         if out.is_null() {
@@ -3473,7 +3422,7 @@ pub unsafe extern "C" fn reader_batch_symbol_dict(
 unsafe fn column_view_or_err<'a>(
     batch: &'a BatchView<'a>,
     col_idx: size_t,
-    err_out: *mut *mut reader_error,
+    err_out: *mut *mut questdb_error,
 ) -> Option<ColumnView<'a>> {
     if col_idx >= batch.column_count() {
         unsafe {
@@ -3512,94 +3461,12 @@ unsafe fn column_view_or_err<'a>(
 // Reader pool FFI
 //
 // These thin wrappers route between the `questdb_db` pool (in the
-// column-sender crate / FFI module) and the `reader` opaque
-// owned here. Living next to the `reader` type keeps the
-// wrap/unwrap discipline local: a borrow constructs a pooled
-// `reader` via `wrap_pooled_reader`; a return is just
-// `reader_close`, which the ownership tag dispatches.
+// column-sender FFI module) and the `reader` opaque owned here. Living next to
+// the `reader` type keeps the wrap/unwrap discipline local. `reader_close`
+// returns a pooled reader through its ownership tag.
 // ===========================================================================
 
 use crate::column_sender::questdb_db;
-use questdb::QuestDb;
-
-/// Open a connection pool, reporting connect-time failures through the
-/// egress `reader_error` type.
-///
-/// This is the reader-only counterpart to `questdb_db_connect` (declared
-/// in `<questdb/ingress/column_sender.h>`, which reports the ingress
-/// `line_sender_error`). It opens the **same** unified pool and returns
-/// the **same** `questdb_db*`; the only difference is the error channel.
-/// A read-only C consumer can therefore drive the entire pool lifecycle
-///
-/// ```text
-/// questdb_db_connect_reader  ->  questdb_db_borrow_reader
-///                            ->  reader_prepare / _query_* / _cursor_*
-///                            ->  questdb_db_return_reader
-///                            ->  questdb_db_close
-/// ```
-///
-/// using only `<questdb/egress/reader.h>` and only the
-/// `reader_error` type — without taking a source or physical
-/// dependency on the ingress (`line_sender_error`) surface.
-///
-/// `conf` is a UTF-8 `qwpws::` / `qwpwss::` connect string of `conf_len`
-/// bytes (the same string `questdb_db_connect` accepts). Returns NULL on
-/// failure; when `err_out != NULL` the error is placed in `*err_out` and
-/// ownership transfers to the caller (release with
-/// `reader_error_free`).
-///
-/// NOTE: the pool is unified and lazy. Like `questdb_db_connect`, this opens
-/// no connections during the call (so it succeeds even against an
-/// unreachable endpoint); the reader pool opens a reader socket on the
-/// first `questdb_db_borrow_reader`, which is where connect-time transport
-/// failures surface. Those errors are mapped from the ingress error
-/// category onto the closest `reader_error_code` (the diagnostic message is
-/// preserved verbatim).
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn questdb_db_connect_reader(
-    conf: *const c_char,
-    conf_len: size_t,
-    err_out: *mut *mut reader_error,
-) -> *mut questdb_db {
-    if conf.is_null() && conf_len != 0 {
-        unsafe {
-            set_reader_err(
-                err_out,
-                ErrorCode::InvalidApiCall,
-                "questdb_db_connect_reader: conf pointer is NULL with non-zero length",
-            );
-        }
-        return ptr::null_mut();
-    }
-    let slice: &[u8] = if conf_len == 0 {
-        &[]
-    } else {
-        unsafe { slice::from_raw_parts(conf as *const u8, conf_len) }
-    };
-    let conf = match std::str::from_utf8(slice) {
-        Ok(s) => s,
-        Err(_) => {
-            unsafe {
-                set_reader_err(
-                    err_out,
-                    ErrorCode::InvalidUtf8,
-                    "questdb_db_connect_reader: conf is not valid UTF-8",
-                );
-            }
-            return ptr::null_mut();
-        }
-    };
-    match QuestDb::connect(conf) {
-        Ok(db) => Box::into_raw(Box::new(questdb_db(db))),
-        Err(err) => {
-            // Ingest and query share one error type now, so the connect error
-            // flows straight into the reader's `err_out` with no conversion.
-            unsafe { write_err_box(err_out, err) };
-            ptr::null_mut()
-        }
-    }
-}
-
 /// Borrow a reader from the egress pool. Returns NULL and sets
 /// `*err_out` on failure (pool exhausted, transport failure, etc.).
 ///
@@ -3618,7 +3485,7 @@ pub unsafe extern "C" fn questdb_db_connect_reader(
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn questdb_db_borrow_reader(
     db: *mut questdb_db,
-    err_out: *mut *mut reader_error,
+    err_out: *mut *mut questdb_error,
 ) -> *mut reader {
     if db.is_null() {
         unsafe {
@@ -3648,21 +3515,6 @@ pub unsafe extern "C" fn questdb_db_borrow_reader(
             ptr::null_mut()
         }
     }
-}
-
-/// Return a borrowed reader to the pool. Invalidates `reader`.
-/// Accepts NULL `reader` and no-ops. `db` is ignored — the reader
-/// carries its own pool back-reference via its `ReaderOwnership::Pooled`
-/// variant — but kept in the ABI for symmetry with the borrow call.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn questdb_db_return_reader(_db: *mut questdb_db, reader: *mut reader) {
-    if reader.is_null() {
-        return;
-    }
-    // Return path == close path for pooled readers. `reader_close`
-    // matches on the ownership tag and dispatches to
-    // `ReaderPoolHandle::return_reader`.
-    unsafe { reader_close(reader) };
 }
 
 /// Snapshot the number of currently-idle (cached) readers in the
@@ -3696,7 +3548,7 @@ mod tests {
     use std::slice;
     use std::sync::atomic::{AtomicU32, Ordering};
 
-    fn make_error(code: ErrorCode, msg: &str) -> *mut reader_error {
+    fn make_error(code: ErrorCode, msg: &str) -> *mut questdb_error {
         Box::into_raw(Box::new(crate::line_sender_error::from_error(Error::new(
             code, msg,
         ))))
@@ -3706,22 +3558,22 @@ mod tests {
     fn error_round_trip_and_free() {
         unsafe {
             let err = make_error(ErrorCode::InvalidApiCall, "boom");
-            let got = reader_error_get_code(err) as u32;
-            let want = reader_error_code::line_sender_error_invalid_api_call as u32;
+            let got = questdb_error_get_code(err) as u32;
+            let want = questdb_error_code::line_sender_error_invalid_api_call as u32;
             assert_eq!(got, want);
             let mut len: size_t = 0;
-            let p = reader_error_msg(err, &mut len);
+            let p = questdb_error_msg(err, &mut len);
             assert_eq!(len, 4);
             let s = std::str::from_utf8(slice::from_raw_parts(p as *const u8, len)).unwrap();
             assert_eq!(s, "boom");
-            reader_error_free(err);
+            questdb_error_free(err);
         }
     }
 
     #[test]
     fn error_free_is_null_idempotent() {
         unsafe {
-            reader_error_free(ptr::null_mut());
+            questdb_error_free(ptr::null_mut());
         }
     }
 
@@ -3750,14 +3602,14 @@ mod tests {
     fn server_version_null_handle_sets_err_out() {
         unsafe {
             let mut version: u8 = 0xFF;
-            let mut err: *mut reader_error = ptr::null_mut();
+            let mut err: *mut questdb_error = ptr::null_mut();
             let ok = reader_server_version(ptr::null(), &mut version, &mut err);
             assert!(!ok);
             assert!(!err.is_null(), "err_out must be set on NULL handle");
-            let code = reader_error_get_code(err) as u32;
-            let want = reader_error_code::line_sender_error_invalid_api_call as u32;
+            let code = questdb_error_get_code(err) as u32;
+            let want = questdb_error_code::line_sender_error_invalid_api_call as u32;
             assert_eq!(code, want);
-            reader_error_free(err);
+            questdb_error_free(err);
         }
     }
 
@@ -3861,15 +3713,15 @@ mod tests {
             ErrorCode::ConnectTimeout,
         ];
         for code in codes {
-            let c: reader_error_code = code.into();
+            let c: questdb_error_code = code.into();
             // Trip through the public C accessor as well.
             unsafe {
                 let err = Box::into_raw(Box::new(crate::line_sender_error::from_error(
                     Error::new(code, ""),
                 )));
-                let got = reader_error_get_code(err);
+                let got = questdb_error_get_code(err);
                 assert_eq!(c as u32, got as u32, "round-trip mismatch for {:?}", code);
-                reader_error_free(err);
+                questdb_error_free(err);
             }
         }
     }
@@ -4020,12 +3872,12 @@ mod tests {
             buf: conf.as_ptr() as *const c_char,
             len: conf.len(),
         };
-        let mut err: *mut reader_error = ptr::null_mut();
+        let mut err: *mut questdb_error = ptr::null_mut();
         unsafe {
             let r = reader_from_conf(utf8, &mut err);
             assert!(r.is_null());
             assert!(!err.is_null());
-            reader_error_free(err);
+            questdb_error_free(err);
         }
     }
 
@@ -4038,24 +3890,24 @@ mod tests {
     // live Reader.
     static CB_HITS: AtomicU32 = AtomicU32::new(0);
 
-    unsafe extern "C" fn test_cb(_ev: *const reader_failover_event, user_data: *mut c_void) {
+    unsafe extern "C" fn test_cb(_ev: *const reader_failover_reset_event, user_data: *mut c_void) {
         CB_HITS.fetch_add(1, Ordering::SeqCst);
         // The user_data round-trip must preserve the bit pattern.
         assert_eq!(user_data as usize, 0xdead_beef_usize);
     }
 
     /// Trampoline shape mirrored from `reader_query_on_failover_reset`,
-    /// but parameterised over a raw `*const reader_failover_event`
-    /// instead of `&FailoverEvent`. The real trampoline never dereferences
+    /// but parameterised over a raw `*const reader_failover_reset_event`
+    /// instead of `&FailoverResetEvent`. The real trampoline never dereferences
     /// the event reference — it forwards an opaque pointer to the C
     /// callback — so testing it via raw pointer preserves the dispatch
     /// invariant we care about while sidestepping the validity invariants
-    /// of `FailoverEvent` (which would be violated by an all-zeros buffer
-    /// transmuted to `&FailoverEvent`).
+    /// of `FailoverResetEvent` (which would be violated by an all-zeros buffer
+    /// transmuted to `&FailoverResetEvent`).
     fn dispatch_via_trampoline(
-        cb: reader_failover_callback,
+        cb: reader_failover_reset_callback,
         user_data: *mut c_void,
-        ev: *const reader_failover_event,
+        ev: *const reader_failover_reset_event,
     ) {
         if let Some(c_cb) = cb {
             unsafe { c_cb(ev, user_data) };
@@ -4065,20 +3917,20 @@ mod tests {
     #[test]
     fn failover_trampoline_dispatches_to_c_callback() {
         CB_HITS.store(0, Ordering::SeqCst);
-        let cb: reader_failover_callback = Some(test_cb);
+        let cb: reader_failover_reset_callback = Some(test_cb);
         let user_data = 0xdead_beef_usize as *mut c_void;
         // The C callback receives the event as an opaque pointer; we never
-        // construct a Rust `&FailoverEvent`, so a bogus address is fine.
-        let ev = std::ptr::dangling::<reader_failover_event>();
+        // construct a Rust `&FailoverResetEvent`, so a bogus address is fine.
+        let ev = std::ptr::dangling::<reader_failover_reset_event>();
         dispatch_via_trampoline(cb, user_data, ev);
         assert_eq!(CB_HITS.load(Ordering::SeqCst), 1);
     }
 
     #[test]
     fn failover_trampoline_no_op_when_callback_is_null() {
-        let cb: reader_failover_callback = None;
+        let cb: reader_failover_reset_callback = None;
         let user_data: *mut c_void = ptr::null_mut();
-        let ev: *const reader_failover_event = ptr::null();
+        let ev: *const reader_failover_reset_event = ptr::null();
         dispatch_via_trampoline(cb, user_data, ev);
         // No assertion on side-effects: the goal is to confirm dispatch
         // is a no-op when the C callback slot is empty.
@@ -4110,7 +3962,7 @@ pub unsafe extern "C" fn reader_cursor_next_arrow_batch(
     cursor: *mut reader_cursor,
     out_array: *mut arrow::ffi::FFI_ArrowArray,
     out_schema: *mut arrow::ffi::FFI_ArrowSchema,
-    err_out: *mut *mut reader_error,
+    err_out: *mut *mut questdb_error,
 ) -> reader_arrow_batch_result {
     unsafe { reader_cursor_next_arrow_batch_export(cursor, out_array, out_schema, err_out, false) }
 }
@@ -4123,7 +3975,7 @@ pub unsafe extern "C" fn reader_cursor_next_arrow_batch_compact(
     cursor: *mut reader_cursor,
     out_array: *mut arrow::ffi::FFI_ArrowArray,
     out_schema: *mut arrow::ffi::FFI_ArrowSchema,
-    err_out: *mut *mut reader_error,
+    err_out: *mut *mut questdb_error,
 ) -> reader_arrow_batch_result {
     unsafe { reader_cursor_next_arrow_batch_export(cursor, out_array, out_schema, err_out, true) }
 }
@@ -4133,7 +3985,7 @@ unsafe fn reader_cursor_next_arrow_batch_export(
     cursor: *mut reader_cursor,
     out_array: *mut arrow::ffi::FFI_ArrowArray,
     out_schema: *mut arrow::ffi::FFI_ArrowSchema,
-    err_out: *mut *mut reader_error,
+    err_out: *mut *mut questdb_error,
     compact: bool,
 ) -> reader_arrow_batch_result {
     use arrow::array::{Array, StructArray};

@@ -46,9 +46,9 @@ namespace questdb::egress
 // ---------------------------------------------------------------------------
 // Thread safety (mirrors the contract documented in `reader.h`).
 //
-// All four wrapper handles (`reader`, `query`, `cursor`, `reader_error`)
-// are move-only — `std::move` lets you transfer ownership, but the
-// destination thread inherits the same per-handle access rules:
+// The three wrapper handles (`reader`, `query`, `cursor`) are move-only —
+// `std::move` lets you transfer ownership, but the destination thread inherits
+// the same per-handle access rules:
 //
 //   `reader`               — may be moved between threads (no concurrent
 //                            access). Insert a happens-before edge on
@@ -59,18 +59,9 @@ namespace questdb::egress
 //                            either across threads is undefined behaviour
 //                            (their internal failover-callback closure is
 //                            `!Send`).
-//   `reader_error`    — has no thread affinity; may be created on
-//                            one thread and destroyed/inspected on
-//                            another, but must not be used concurrently.
-//
 // The wrappers cannot statically enforce these rules; they document the
 // same contract the C API does.
 // ---------------------------------------------------------------------------
-
-/** Egress error code. Alias of the unified `questdb::error_code`
- *  (so `error_code::config_error` and the C `reader_error_config_error`
- *  name the same value). */
-using error_code = ::questdb::error_code;
 
 /**
  * Stripped-prefix `enum class` mirroring `::reader_column_kind`. The
@@ -129,13 +120,10 @@ enum class terminal_kind : int
 // ---------------------------------------------------------------------------
 // Bridging equality operators between the C enums and their stripped-prefix
 // `enum class` counterparts. The discriminants match (same `int` underlying
-// type, same values), so a `static_cast<int>` round-trip is exact. This
-// keeps existing C-prefix usage (`e.code() == reader_error_config_error`)
-// compiling while new code can prefer `error_code::config_error`.
+// type, same values), so a `static_cast<int>` round-trip is exact.
 // ---------------------------------------------------------------------------
 // (The `error_code` <-> C error-enum bridge lives in `namespace questdb`
-// alongside the unified `questdb::error_code`, since `egress::error_code` is
-// now an alias of it — see line_sender_core.hpp.)
+// alongside the unified `questdb::error_code`; see line_sender_core.hpp.)
 
 inline bool operator==(column_kind l, ::reader_column_kind r) noexcept
 { return static_cast<int>(l) == static_cast<int>(r); }
@@ -163,57 +151,6 @@ inline bool operator!=(terminal_kind l, ::reader_terminal_kind r) noexcept
 { return !(l == r); }
 inline bool operator!=(::reader_terminal_kind l, terminal_kind r) noexcept
 { return !(l == r); }
-
-/**
- * Egress error. Mirrors `reader_error` from the C API.
- *
- * Thrown by `reader` and `cursor` methods on failure. The raw error code is
- * available via `code()`; the human-readable message via `what()`.
- */
-class reader_error : public ::questdb::error
-{
-public:
-    reader_error(error_code code, const std::string& what)
-        : ::questdb::error{code, what}
-    {
-    }
-
-    // `code()` is inherited from `questdb::error`.
-
-private:
-    static reader_error from_c(::reader_error* c_err)
-    {
-        const auto c_code = ::reader_error_get_code(c_err);
-        size_t c_len = 0;
-        const char* c_msg = ::reader_error_msg(c_err, &c_len);
-        std::string msg;
-        try
-        {
-            msg.assign(c_msg, c_len);
-        }
-        catch (...)
-        {
-            ::reader_error_free(c_err);
-            throw;
-        }
-        ::reader_error_free(c_err);
-        return reader_error{static_cast<error_code>(c_code), msg};
-    }
-
-    template <typename F, typename... Args>
-    static auto wrapped_call(F&& f, Args&&... args)
-    {
-        ::reader_error* c_err{nullptr};
-        auto result = f(std::forward<Args>(args)..., &c_err);
-        if (c_err) throw from_c(c_err);
-        return result;
-    }
-
-    friend class reader;
-    friend class cursor;
-    friend class query;
-    friend class batch;
-};
 
 /**
  * Optional value for nullable cells. Returned by the typed getters on
@@ -363,76 +300,76 @@ private:
  * Borrowed view over a failover event passed to a user callback. Valid
  * only for the duration of the callback invocation.
  */
-class failover_event_view
+class failover_reset_event_view
 {
 public:
-    explicit failover_event_view(const ::reader_failover_event* impl) noexcept
+    explicit failover_reset_event_view(const ::reader_failover_reset_event* impl) noexcept
         : _impl{impl} {}
 
     // Non-copyable: `_impl` is borrowed, valid only during the callback.
-    failover_event_view(const failover_event_view&) = delete;
-    failover_event_view& operator=(const failover_event_view&) = delete;
-    failover_event_view(failover_event_view&&) = delete;
-    failover_event_view& operator=(failover_event_view&&) = delete;
+    failover_reset_event_view(const failover_reset_event_view&) = delete;
+    failover_reset_event_view& operator=(const failover_reset_event_view&) = delete;
+    failover_reset_event_view(failover_reset_event_view&&) = delete;
+    failover_reset_event_view& operator=(failover_reset_event_view&&) = delete;
 
     std::string_view failed_host() const noexcept
     {
         const char* buf = nullptr;
         size_t len = 0;
-        ::reader_failover_event_failed_host(_impl, &buf, &len);
+        ::reader_failover_reset_event_failed_host(_impl, &buf, &len);
         return {buf, len};
     }
     uint16_t failed_port() const noexcept
     {
-        return ::reader_failover_event_failed_port(_impl);
+        return ::reader_failover_reset_event_failed_port(_impl);
     }
     std::string_view new_host() const noexcept
     {
         const char* buf = nullptr;
         size_t len = 0;
-        ::reader_failover_event_new_host(_impl, &buf, &len);
+        ::reader_failover_reset_event_new_host(_impl, &buf, &len);
         return {buf, len};
     }
     uint16_t new_port() const noexcept
     {
-        return ::reader_failover_event_new_port(_impl);
+        return ::reader_failover_reset_event_new_port(_impl);
     }
     int64_t new_request_id() const noexcept
     {
-        return ::reader_failover_event_new_request_id(_impl);
+        return ::reader_failover_reset_event_new_request_id(_impl);
     }
     uint32_t attempts() const noexcept
     {
-        return ::reader_failover_event_attempts(_impl);
+        return ::reader_failover_reset_event_attempts(_impl);
     }
     uint64_t elapsed_ns() const noexcept
     {
-        return ::reader_failover_event_elapsed_ns(_impl);
+        return ::reader_failover_reset_event_elapsed_ns(_impl);
     }
     error_code trigger_code() const noexcept
     {
         return static_cast<error_code>(
-            ::reader_failover_event_trigger_code(_impl));
+            ::reader_failover_reset_event_trigger_code(_impl));
     }
     std::string_view trigger_msg() const noexcept
     {
         const char* buf = nullptr;
         size_t len = 0;
-        ::reader_failover_event_trigger_msg(_impl, &buf, &len);
+        ::reader_failover_reset_event_trigger_msg(_impl, &buf, &len);
         return {buf, len};
     }
     server_info_view server_info() const noexcept
     {
         return server_info_view{
-            ::reader_failover_event_server_info(_impl)};
+            ::reader_failover_reset_event_server_info(_impl)};
     }
 
 private:
-    const ::reader_failover_event* _impl;
+    const ::reader_failover_reset_event* _impl;
 };
 
 /** User callback type for failover-reset notifications. */
-using failover_callback = std::function<void(const failover_event_view&)>;
+using failover_reset_callback = std::function<void(const failover_reset_event_view&)>;
 
 /**
  * Lifecycle phase of a failover-progress event. Numeric values match
@@ -552,8 +489,8 @@ public:
     /** Final error code (GaveUp phase only). `std::nullopt` otherwise. */
     std::optional<error_code> final_error_code() const noexcept
     {
-        ::reader_error_code raw =
-            ::reader_error_code::reader_error_invalid_api_call;
+        ::questdb_error_code raw =
+            ::questdb_error_code::questdb_error_invalid_api_call;
         if (::reader_failover_progress_event_final_error_code(_impl, &raw))
             return static_cast<error_code>(raw);
         return std::nullopt;
@@ -594,19 +531,13 @@ inline ::line_sender_utf8 to_c_utf8(::questdb::ingress::utf8_view view) noexcept
 class reader
 {
 public:
-#ifdef QUESTDB_READER_INTERNAL_CONSTRUCTORS
-    // Internal / test-only standalone constructors. NOT part of the
-    // supported public API: obtain a reader from the pool via
-    // `questdb::pool::borrow_reader()`. Visible only when
-    // `QUESTDB_READER_INTERNAL_CONSTRUCTORS` is defined (the in-tree
-    // test-suite / example programs). See `reader.h` for the rationale.
     /**
      * Open a reader using the given config string (e.g.
      * `"ws::addr=localhost:9000;"`).
-     * @throws reader_error on failure.
+     * @throws questdb::error on failure.
      */
     explicit reader(::questdb::ingress::utf8_view config)
-        : _impl{reader_error::wrapped_call(
+        : _impl{::questdb::error::wrapped_call(
               ::reader_from_conf, to_c_utf8(config))}
     {
     }
@@ -615,16 +546,15 @@ public:
      * Open a reader using the config string stored in the
      * `QDB_CLIENT_CONF` environment variable. The variable's value
      * follows the same format as the constructor's `config` argument.
-     * @throws reader_error with `config_error` if the variable is
+     * @throws questdb::error with `config_error` if the variable is
      *         unset or its value is malformed; with `invalid_utf8` if
      *         the variable is set but its bytes are not valid UTF-8.
      */
     static reader from_env()
     {
         return reader{
-            reader_error::wrapped_call(::reader_from_env)};
+            ::questdb::error::wrapped_call(::reader_from_env)};
     }
-#endif /* QUESTDB_READER_INTERNAL_CONSTRUCTORS */
 
     reader(const reader&) = delete;
     reader& operator=(const reader&) = delete;
@@ -668,7 +598,7 @@ public:
      * Convenience for `query(sql).execute()`. The cursor borrows from
      * this reader; this reader MUST outlive the cursor. Only one cursor
      * may be live at a time.
-     * @throws reader_error on failure.
+     * @throws questdb::error on failure.
      */
     cursor execute(::questdb::ingress::utf8_view sql);
 
@@ -678,40 +608,40 @@ public:
      * outlive the query and the cursor. Validation of the SQL is
      * deferred to `query::execute`.
      *
-     * @throws reader_error if a query or cursor is already in flight
+     * @throws questdb::error if a query or cursor is already in flight
      *         on this reader.
      */
     query prepare(::questdb::ingress::utf8_view sql);
 
     /** Cumulative bytes successfully read from the wire.
-     *  @throws reader_error if this reader has been moved from. */
+     *  @throws questdb::error if this reader has been moved from. */
     uint64_t bytes_received() const
     {
         ensure_impl();
         return ::reader_bytes_received(_impl);
     }
     /** Cumulative CREDIT bytes granted to the server on this connection.
-     *  @throws reader_error if this reader has been moved from. */
+     *  @throws questdb::error if this reader has been moved from. */
     uint64_t credit_granted_total() const
     {
         ensure_impl();
         return ::reader_credit_granted_total(_impl);
     }
     /** Cumulative `read` time in nanoseconds (saturating).
-     *  @throws reader_error if this reader has been moved from. */
+     *  @throws questdb::error if this reader has been moved from. */
     uint64_t read_ns() const
     {
         ensure_impl();
         return ::reader_read_ns(_impl);
     }
     /** Cumulative decode time in nanoseconds (saturating).
-     *  @throws reader_error if this reader has been moved from. */
+     *  @throws questdb::error if this reader has been moved from. */
     uint64_t decode_ns() const
     {
         ensure_impl();
         return ::reader_decode_ns(_impl);
     }
-    /** @throws reader_error if this reader has been moved from. */
+    /** @throws questdb::error if this reader has been moved from. */
     void reset_timing()
     {
         ensure_impl();
@@ -721,7 +651,7 @@ public:
     /** Force a pool-borrowed reader to drop on return instead of recycling.
      *  No-op for standalone readers (constructed from a config string /
      *  `from_env`), which are closed on destruction regardless.
-     *  @throws reader_error if this reader has been moved from. */
+     *  @throws questdb::error if this reader has been moved from. */
     void drop_on_return()
     {
         ensure_impl();
@@ -729,13 +659,13 @@ public:
     }
 
     /** Negotiated QWP server version.
-     *  @throws reader_error if the connection is not yet established
+     *  @throws questdb::error if the connection is not yet established
      *          or this reader has been moved from. */
     uint8_t server_version() const
     {
         ensure_impl();
         uint8_t v = 0;
-        reader_error::wrapped_call(
+        ::questdb::error::wrapped_call(
             ::reader_server_version, _impl, &v);
         return v;
     }
@@ -743,7 +673,7 @@ public:
     /** Last-seen `SERVER_INFO`. The server always sends one, so the view
      *  is empty only while a reconnect is in flight; it is invalidated by
      *  any reader operation that may reconnect.
-     *  @throws reader_error if this reader has been moved from. */
+     *  @throws questdb::error if this reader has been moved from. */
     server_info_view server_info() const
     {
         ensure_impl();
@@ -751,7 +681,7 @@ public:
     }
 
     /** Host of the endpoint the reader is currently connected to.
-     *  @throws reader_error if this reader has been moved from. */
+     *  @throws questdb::error if this reader has been moved from. */
     std::string_view current_host() const
     {
         ensure_impl();
@@ -761,7 +691,7 @@ public:
         return {buf, len};
     }
     /** Port of the endpoint the reader is currently connected to.
-     *  @throws reader_error if this reader has been moved from. */
+     *  @throws questdb::error if this reader has been moved from. */
     uint16_t current_port() const
     {
         ensure_impl();
@@ -780,10 +710,10 @@ private:
     static reader borrow_from_pool(::questdb_db* db)
     {
         return reader{
-            reader_error::wrapped_call(::questdb_db_borrow_reader, db)};
+            ::questdb::error::wrapped_call(::questdb_db_borrow_reader, db)};
     }
 
-    /// Throw `reader_error{invalid_api_call}` if `_impl` is null.
+    /// Throw `questdb::error{invalid_api_call}` if `_impl` is null.
     /// A null `_impl` means the reader has been moved from or already
     /// closed — calling any method that derefs it would pass `nullptr`
     /// into the C layer where `(*reader).0.get()` is instant UB. Throwing
@@ -791,7 +721,7 @@ private:
     void ensure_impl() const
     {
         if (!_impl)
-            throw reader_error{
+            throw ::questdb::error{
                 error_code::invalid_api_call,
                 "reader has been closed or moved from."};
     }
@@ -955,7 +885,7 @@ public:
     {
         ensure_impl();
         if (buf == nullptr && len != 0)
-            throw reader_error{
+            throw ::questdb::error{
                 error_code::invalid_api_call,
                 "bind_binary: NULL buffer with non-zero length"};
         ::reader_query_bind_binary(_impl, buf, len);
@@ -1079,7 +1009,7 @@ public:
      * The callback runs on the thread driving the in-flight cursor
      * operation.
      */
-    query& on_failover_reset(failover_callback cb)
+    query& on_failover_reset(failover_reset_callback cb)
     {
         ensure_impl();
         // Store the callback on the heap so its address is stable when we
@@ -1096,7 +1026,7 @@ public:
         // allocator), the C side would be left holding a dangling
         // pointer to the destroyed callback.
         auto new_callback =
-            std::make_unique<failover_callback>(std::move(cb));
+            std::make_unique<failover_reset_callback>(std::move(cb));
         ::reader_query_on_failover_reset(
             _impl,
             &query::trampoline,
@@ -1111,9 +1041,11 @@ public:
      * GaveUp). The view passed to the callback is borrowed and valid
      * only for the duration of the call.
      *
-     * Installing this callback also opts the cursor in to replay-after-
-     * data-delivered, the same way `on_failover_reset` does — either
-     * being installed clears the silent-duplicate guard.
+     * This callback is telemetry-only. It does not authorize replay after a
+     * batch has reached the caller. Install `on_failover_reset` as well when
+     * the caller can discard partial results safely; otherwise a
+     * post-delivery failure throws `questdb::error` with
+     * `questdb_error_failover_would_duplicate`.
      *
      * Reentrancy contract is identical to `on_failover_reset`: the
      * callback MUST NOT touch the originating reader / query / cursor,
@@ -1134,15 +1066,15 @@ public:
     }
 
     /** Consume the query and return a streaming cursor.
-     *  @throws reader_error with `invalid_api_call` if the query has
+     *  @throws questdb::error with `invalid_api_call` if the query has
      *  already been consumed (by a previous `execute()`) or moved from.
-     *  @throws reader_error on transport / protocol failure. */
+     *  @throws questdb::error on transport / protocol failure. */
     cursor execute();
 
 private:
     explicit query(::reader_query* impl) noexcept : _impl{impl} {}
 
-    /// Throw `reader_error{invalid_api_call}` if `_impl` is null.
+    /// Throw `questdb::error{invalid_api_call}` if `_impl` is null.
     /// A null `_impl` means the query has been moved from or already
     /// consumed by `execute()` — calling any method that derefs it would
     /// pass `nullptr` into the C layer, where `Box::from_raw(nullptr)` /
@@ -1151,20 +1083,20 @@ private:
     void ensure_impl() const
     {
         if (!_impl)
-            throw reader_error{
+            throw ::questdb::error{
                 error_code::invalid_api_call,
                 "query has been consumed by execute() or moved from."};
     }
 
     static void trampoline(
-        const ::reader_failover_event* ev, void* user_data) noexcept
+        const ::reader_failover_reset_event* ev, void* user_data) noexcept
     {
-        auto* cb = static_cast<failover_callback*>(user_data);
+        auto* cb = static_cast<failover_reset_callback*>(user_data);
         if (cb && *cb)
         {
             try
             {
-                (*cb)(failover_event_view{ev});
+                (*cb)(failover_reset_event_view{ev});
             }
             catch (...)
             {
@@ -1194,7 +1126,7 @@ private:
     }
 
     ::reader_query* _impl;
-    std::unique_ptr<failover_callback> _callback;
+    std::unique_ptr<failover_reset_callback> _callback;
     std::unique_ptr<failover_progress_callback> _progress_callback;
     friend class reader;
     friend class cursor;
@@ -1268,7 +1200,7 @@ public:
     std::string_view operator[](size_t i) const
     {
         if (i >= _d.entry_count)
-            throw reader_error{
+            throw ::questdb::error{
                 error_code::invalid_api_call,
                 "symbol_dict_view: index out of range"};
         const auto& e = _d.entries[i];
@@ -1455,7 +1387,7 @@ struct symbol_view
             return std::nullopt;
         const uint32_t code = codes[row];
         if (code >= dict.entry_count())
-            throw reader_error{
+            throw ::questdb::error{
                 error_code::invalid_api_call,
                 "symbol_view::resolve: code out of dictionary range"};
         return dict[code];
@@ -1604,16 +1536,16 @@ public:
     {
         ensure_scalar("column::values<T>");
         if (!_scalar.values)
-            throw reader_error{
+            throw ::questdb::error{
                 error_code::invalid_api_call,
                 "column::values<T>: column has no dense values "
                 "(variable-width or SYMBOL)"};
         if (sizeof(T) != _scalar.value_stride)
-            throw reader_error{
+            throw ::questdb::error{
                 error_code::invalid_api_call,
                 "column::values<T>: sizeof(T) != value_stride"};
         if (!is_kind_compatible<T>(kind()))
-            throw reader_error{
+            throw ::questdb::error{
                 error_code::invalid_api_call,
                 "column::values<T>: T is not in the kind whitelist for this "
                 "column kind (stride matches but semantics differ); use the "
@@ -1632,15 +1564,15 @@ public:
     {
         ensure_scalar("column::values<T>(kind)");
         if (kind() != required)
-            throw reader_error{
+            throw ::questdb::error{
                 error_code::invalid_api_call,
                 "column::values<T>(kind): column kind mismatch"};
         if (!_scalar.values)
-            throw reader_error{
+            throw ::questdb::error{
                 error_code::invalid_api_call,
                 "column::values<T>(kind): column has no dense values"};
         if (sizeof(T) != _scalar.value_stride)
-            throw reader_error{
+            throw ::questdb::error{
                 error_code::invalid_api_call,
                 "column::values<T>(kind): sizeof(T) != value_stride"};
         return static_cast<const T*>(_scalar.values);
@@ -1710,7 +1642,7 @@ public:
             return std::nullopt;
         const uint32_t code = _scalar.symbol_codes[row];
         if (code >= _dict.entry_count())
-            throw reader_error{
+            throw ::questdb::error{
                 error_code::invalid_api_call,
                 "column::symbol: code out of dictionary range"};
         return _dict[code];
@@ -1970,11 +1902,11 @@ public:
         case column_kind::double_array:
             return std::forward<Visitor>(v)(make_array_view<double>());
         case column_kind::long_array:
-            throw reader_error{
+            throw ::questdb::error{
                 error_code::invalid_api_call,
                 "column::visit: LONG_ARRAY is not supported in this revision"};
         default:
-            throw reader_error{
+            throw ::questdb::error{
                 error_code::invalid_api_call,
                 "column::visit: unknown column kind"};
         }
@@ -2083,7 +2015,7 @@ private:
     void ensure_scalar(const char* what) const
     {
         if (_is_array)
-            throw reader_error{
+            throw ::questdb::error{
                 error_code::invalid_api_call,
                 std::string{what} +
                     ": column is an array; use the array "
@@ -2092,7 +2024,7 @@ private:
     void ensure_array(const char* what) const
     {
         if (!_is_array)
-            throw reader_error{
+            throw ::questdb::error{
                 error_code::invalid_api_call,
                 std::string{what} +
                     ": column is not an array; use the "
@@ -2101,14 +2033,14 @@ private:
     void ensure_kind(egress::column_kind expected, const char* what) const
     {
         if (kind() != expected)
-            throw reader_error{
+            throw ::questdb::error{
                 error_code::invalid_api_call,
                 std::string{what} + ": column kind mismatch"};
     }
     void ensure_row_in_range(size_t row, const char* what) const
     {
         if (row >= row_count())
-            throw reader_error{
+            throw ::questdb::error{
                 error_code::invalid_api_call,
                 std::string{what} + ": row index out of range"};
     }
@@ -2196,7 +2128,7 @@ inline const double* column::elements<double>(
 {
     ensure_array("column::elements<double>");
     if (kind() != column_kind::double_array)
-        throw reader_error{
+        throw ::questdb::error{
             error_code::invalid_api_call,
             "column::elements<double>: column is not DOUBLE_ARRAY"};
     size_t bytes = 0;
@@ -2261,7 +2193,7 @@ public:
     {
         ensure_impl();
         ::reader_column_kind k{};
-        reader_error::wrapped_call(
+        ::questdb::error::wrapped_call(
             ::reader_batch_column_kind, _impl, col_idx, &k);
         return static_cast<egress::column_kind>(k);
     }
@@ -2271,7 +2203,7 @@ public:
         ensure_impl();
         const char* buf = nullptr;
         size_t len = 0;
-        reader_error::wrapped_call(
+        ::questdb::error::wrapped_call(
             ::reader_batch_column_name, _impl, col_idx, &buf, &len);
         return std::string_view{buf, len};
     }
@@ -2287,21 +2219,21 @@ public:
     {
         ensure_impl();
         ::reader_column_kind k_raw{};
-        reader_error::wrapped_call(
+        ::questdb::error::wrapped_call(
             ::reader_batch_column_kind, _impl, col_idx, &k_raw);
         if (k_raw == ::reader_column_kind_double_array)
         {
             ::reader_array_data d{};
-            reader_error::wrapped_call(
+            ::questdb::error::wrapped_call(
                 ::reader_batch_array_column_data, _impl, col_idx, &d);
             return egress::column::make_array(d);
         }
         if (k_raw == ::reader_column_kind_long_array)
-            throw reader_error{
+            throw ::questdb::error{
                 error_code::invalid_api_call,
                 "batch::column: LONG_ARRAY is not supported in this revision"};
         ::reader_column_data d{};
-        reader_error::wrapped_call(
+        ::questdb::error::wrapped_call(
             ::reader_batch_column_data, _impl, col_idx, &d);
         symbol_dict_view dict{};
         if (d.kind == ::reader_column_kind_symbol)
@@ -2313,7 +2245,7 @@ public:
      * Look up a column by name. O(N) over `column_count()`, intended
      * for the common case where N is small (typically < 50). For tight
      * loops cache the index from a one-time lookup.
-     * @throws reader_error with `invalid_api_call` if no column
+     * @throws questdb::error with `invalid_api_call` if no column
      *         matches `name`.
      */
     egress::column column_by_name(std::string_view name) const
@@ -2324,7 +2256,7 @@ public:
             if (column_name(i) == name)
                 return column(i);
         }
-        throw reader_error{
+        throw ::questdb::error{
             error_code::invalid_api_call,
             "batch::column_by_name: no column named '" + std::string{name} +
                 "'"};
@@ -2350,7 +2282,7 @@ public:
     {
         ensure_impl();
         ::reader_symbol_dict d{};
-        reader_error::wrapped_call(
+        ::questdb::error::wrapped_call(
             ::reader_batch_symbol_dict, _impl, &d);
         return egress::symbol_dict_view{d};
     }
@@ -2364,7 +2296,7 @@ public:
         ensure_impl();
         const char* buf = nullptr;
         size_t len = 0;
-        reader_error::wrapped_call(
+        ::questdb::error::wrapped_call(
             ::reader_batch_symbol, _impl, col_idx, code, &buf, &len);
         return std::string_view{buf, len};
     }
@@ -2378,7 +2310,7 @@ private:
     void ensure_impl() const
     {
         if (!_impl)
-            throw reader_error{
+            throw ::questdb::error{
                 error_code::invalid_api_call,
                 "batch handle is invalid (no batch loaded)"};
     }
@@ -2435,18 +2367,18 @@ public:
      *         `batch::symbol_dict`). Invalidated by the next `next_batch`,
      *         `cancel`, `add_credit`, cursor destruction, or mid-query
      *         failover; do not cache across batches.
-     * @throws reader_error on transport / protocol failure.
+     * @throws questdb::error on transport / protocol failure.
      */
     std::optional<egress::batch> next_batch()
     {
         ensure_impl();
-        ::reader_error* c_err{nullptr};
+        ::questdb_error* c_err{nullptr};
         const ::reader_batch* p =
             ::reader_cursor_next_batch(_impl, &c_err);
         if (!p)
         {
             if (c_err)
-                throw reader_error::from_c(c_err);
+                throw ::questdb::error::from_c(c_err);
             return std::nullopt;
         }
         return egress::batch{p};
@@ -2525,7 +2457,7 @@ public:
      *         (no further batches).
      * @return An owned `arrow_batch` on success. See the struct's
      *         documentation for release responsibilities.
-     * @throws reader_error on transport / protocol failure or any
+     * @throws questdb::error on transport / protocol failure or any
      *         Arrow-specific error (`schema_drift`, `no_schema`,
      *         `arrow_export`).
      *
@@ -2536,7 +2468,7 @@ public:
     std::optional<arrow_batch> next_arrow_batch()
     {
         ensure_impl();
-        ::reader_error* c_err{nullptr};
+        ::questdb_error* c_err{nullptr};
         arrow_batch out{};
         const auto rc = ::reader_cursor_next_arrow_batch(
             _impl, &out.array, &out.schema, &c_err);
@@ -2548,14 +2480,14 @@ public:
                 return std::nullopt;
             case ::reader_arrow_batch_error:
             default:
-                throw reader_error::from_c(c_err);
+                throw ::questdb::error::from_c(c_err);
         }
     }
 #endif /* QUESTDB_CLIENT_ENABLE_ARROW */
 
     // ---- Introspection -----------------------------------------------------
 
-    /** @throws reader_error if this cursor has been moved from. */
+    /** @throws questdb::error if this cursor has been moved from. */
     int64_t request_id() const
     {
         ensure_impl();
@@ -2567,20 +2499,20 @@ public:
      * `reader::credit_granted_total()` instead — same counter, served
      * by an atomic on the reader handle.
      *
-     * @throws reader_error if this cursor has been moved from.
+     * @throws questdb::error if this cursor has been moved from.
      */
     uint64_t credit_granted_total() const
     {
         ensure_impl();
         return ::reader_cursor_credit_granted_total(_impl);
     }
-    /** @throws reader_error if this cursor has been moved from. */
+    /** @throws questdb::error if this cursor has been moved from. */
     uint32_t failover_resets() const
     {
         ensure_impl();
         return ::reader_cursor_failover_resets(_impl);
     }
-    /** @throws reader_error if this cursor has been moved from. */
+    /** @throws questdb::error if this cursor has been moved from. */
     std::string_view current_host() const
     {
         ensure_impl();
@@ -2589,20 +2521,20 @@ public:
         ::reader_cursor_current_addr_host(_impl, &buf, &len);
         return {buf, len};
     }
-    /** @throws reader_error if this cursor has been moved from. */
+    /** @throws questdb::error if this cursor has been moved from. */
     uint16_t current_port() const
     {
         ensure_impl();
         return ::reader_cursor_current_addr_port(_impl);
     }
     /** Negotiated QWP version of the cursor's underlying connection.
-     *  @throws reader_error if the connection is poisoned after a
+     *  @throws questdb::error if the connection is poisoned after a
      *          failed failover, or this cursor has been moved from. */
     uint8_t server_version() const
     {
         ensure_impl();
         uint8_t v = 0;
-        reader_error::wrapped_call(
+        ::questdb::error::wrapped_call(
             ::reader_cursor_server_version, _impl, &v);
         return v;
     }
@@ -2610,7 +2542,7 @@ public:
      *  server always sends one, so the view is empty only while a
      *  reconnect is in flight; it is invalidated by any cursor operation
      *  that may reconnect.
-     *  @throws reader_error if this cursor has been moved from. */
+     *  @throws questdb::error if this cursor has been moved from. */
     server_info_view server_info() const
     {
         ensure_impl();
@@ -2618,7 +2550,7 @@ public:
             ::reader_cursor_current_server_info(_impl)};
     }
 
-    /** @throws reader_error if this cursor has been moved from. */
+    /** @throws questdb::error if this cursor has been moved from. */
     egress::terminal_kind terminal_kind() const
     {
         ensure_impl();
@@ -2627,7 +2559,7 @@ public:
     }
 
     /** If the terminal is `RESULT_END`, return its info; otherwise nullopt.
-     *  @throws reader_error if this cursor has been moved from. */
+     *  @throws questdb::error if this cursor has been moved from. */
     nullable<terminal_end_info> terminal_end() const
     {
         ensure_impl();
@@ -2638,7 +2570,7 @@ public:
         return info;
     }
     /** If the terminal is `EXEC_DONE`, return its info; otherwise nullopt.
-     *  @throws reader_error if this cursor has been moved from. */
+     *  @throws questdb::error if this cursor has been moved from. */
     nullable<terminal_exec_done_info> terminal_exec_done() const
     {
         ensure_impl();
@@ -2652,30 +2584,30 @@ public:
     // ---- Lifecycle ---------------------------------------------------------
 
     /** Send a CANCEL frame and drain the stream until terminal.
-     *  @throws reader_error on transport failure or if this cursor
+     *  @throws questdb::error on transport failure or if this cursor
      *          has been moved from. */
     void cancel()
     {
         ensure_impl();
-        reader_error::wrapped_call(::reader_cursor_cancel, _impl);
+        ::questdb::error::wrapped_call(::reader_cursor_cancel, _impl);
     }
 
     /** Grant additional CREDIT to the server. Invalidates the current
      *  `batch` and everything borrowed from it, and may transparently
      *  trigger mid-query failover on a transport failure.
-     *  @throws reader_error on transport failure or if this cursor
+     *  @throws questdb::error on transport failure or if this cursor
      *          has been moved from. */
     void add_credit(uint64_t additional_bytes)
     {
         ensure_impl();
-        reader_error::wrapped_call(
+        ::questdb::error::wrapped_call(
             ::reader_cursor_add_credit, _impl, additional_bytes);
     }
 
 private:
     explicit cursor(::reader_cursor* impl) noexcept : _impl{impl} {}
 
-    /// Throw `reader_error{invalid_api_call}` if `_impl` is null.
+    /// Throw `questdb::error{invalid_api_call}` if `_impl` is null.
     /// A null `_impl` means the cursor has been moved from or already
     /// closed — calling any method that derefs it would pass `nullptr`
     /// into the C layer where `&mut *cursor` is instant UB. Throwing
@@ -2683,7 +2615,7 @@ private:
     void ensure_impl() const
     {
         if (!_impl)
-            throw reader_error{
+            throw ::questdb::error{
                 error_code::invalid_api_call,
                 "cursor has been closed or moved from."};
     }
@@ -2692,7 +2624,7 @@ private:
     /// Heap-stored failover callback transferred from `query::execute()`.
     /// The C trampoline holds a raw pointer to this object via `user_data`,
     /// so it MUST live as long as the cursor.
-    std::unique_ptr<failover_callback> _failover_callback;
+    std::unique_ptr<failover_reset_callback> _failover_callback;
     /// Same lifetime contract as `_failover_callback` but for the
     /// progress callback registered via `query::on_failover_progress`.
     std::unique_ptr<failover_progress_callback> _failover_progress_callback;
@@ -2703,14 +2635,14 @@ private:
 inline query reader::prepare(::questdb::ingress::utf8_view sql)
 {
     ensure_impl();
-    return query{reader_error::wrapped_call(
+    return query{::questdb::error::wrapped_call(
         ::reader_prepare, _impl, to_c_utf8(sql))};
 }
 
 inline cursor reader::execute(::questdb::ingress::utf8_view sql)
 {
     ensure_impl();
-    return cursor{reader_error::wrapped_call(
+    return cursor{::questdb::error::wrapped_call(
         ::reader_execute, _impl, to_c_utf8(sql))};
 }
 
@@ -2719,12 +2651,12 @@ inline cursor query::execute()
     ensure_impl();
     auto cb = std::move(_callback); // transfer to cursor (or drop on error)
     auto pcb = std::move(_progress_callback);
-    ::reader_error* c_err = nullptr;
+    ::questdb_error* c_err = nullptr;
     // The C call consumes `_impl` regardless of outcome and sets it to
     // NULL on return — so a subsequent `~query()` calling `_query_free`
     // is a NULL no-op without us having to clear `_impl` explicitly here.
     auto* c = ::reader_query_execute(&_impl, &c_err);
-    if (!c) throw reader_error::from_c(c_err);
+    if (!c) throw ::questdb::error::from_c(c_err);
     cursor result{c};
     result._failover_callback = std::move(cb);
     result._failover_progress_callback = std::move(pcb);

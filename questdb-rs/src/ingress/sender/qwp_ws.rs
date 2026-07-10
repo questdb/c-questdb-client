@@ -41,12 +41,12 @@ use crate::ingress::SyncProtocolHandler;
 use crate::ingress::buffer::QwpWsColumnarBuffer;
 use crate::ingress::conf::{QwpWsConfig, QwpWsEndpoint, QwpWsInitialConnectMode, SfDurability};
 use crate::ingress::tls::{TlsSettings, configure_tls};
+use crate::ws::frame::{
+    OPCODE_BINARY, OPCODE_CLOSE, OPCODE_CONTINUATION, OPCODE_PING, OPCODE_PONG, OPCODE_TEXT, Opcode,
+};
 use crate::ws::nosigpipe::NoSigpipeTcp;
 
-use super::qwp_ws_codec::{
-    self as codec, MAX_INBOUND_FRAME_BYTES, Opcode, WS_OPCODE_BINARY, WS_OPCODE_CLOSE,
-    WS_OPCODE_CONTINUATION, WS_OPCODE_PING, WS_OPCODE_PONG, WS_OPCODE_TEXT,
-};
+use super::qwp_ws_codec::{self as codec, MAX_INBOUND_FRAME_BYTES};
 #[cfg(test)]
 use super::qwp_ws_driver::QwpWsCoreTestHarness;
 use super::qwp_ws_driver::{
@@ -1747,7 +1747,7 @@ pub(crate) fn read_message_with_close<S: Read + Write>(
     loop {
         let header = read_frame_header(stream)?;
         match header.opcode {
-            WS_OPCODE_PING => {
+            OPCODE_PING => {
                 let payload = read_control_frame_payload(stream, header, &mut control_payload)?;
                 codec::write_frame_to_buf(scratch, Opcode::Pong, payload, random_mask());
                 stream.write_all(scratch).map_err(|io| {
@@ -1759,18 +1759,18 @@ pub(crate) fn read_message_with_close<S: Read + Write>(
                 })?;
                 continue;
             }
-            WS_OPCODE_PONG => {
+            OPCODE_PONG => {
                 read_control_frame_payload(stream, header, &mut control_payload)?;
                 continue;
             }
-            WS_OPCODE_CLOSE => {
+            OPCODE_CLOSE => {
                 let payload = read_control_frame_payload(stream, header, &mut control_payload)?;
                 return match codec::parse_ws_close_payload(payload) {
                     Ok((code, reason)) => Err(WsMessageError::Close(WsCloseFrame { code, reason })),
                     Err(reason) => Err(WsMessageError::ProtocolViolation(reason)),
                 };
             }
-            WS_OPCODE_TEXT | WS_OPCODE_BINARY => {
+            OPCODE_TEXT | OPCODE_BINARY => {
                 if first_opcode.is_some() {
                     return Err(WsMessageError::ProtocolViolation(
                         "Unexpected new data frame mid-message".to_string(),
@@ -1779,7 +1779,7 @@ pub(crate) fn read_message_with_close<S: Read + Write>(
                 first_opcode = Some(header.opcode);
                 read_payload_into(stream, out, header.payload_len)?;
             }
-            WS_OPCODE_CONTINUATION => {
+            OPCODE_CONTINUATION => {
                 if first_opcode.is_none() {
                     return Err(WsMessageError::ProtocolViolation(
                         "Continuation frame without prior data frame".to_string(),
@@ -1908,7 +1908,7 @@ impl WsFrameReader {
             return Ok(WsFrameRead::Idle);
         };
         match header.opcode {
-            WS_OPCODE_PING => {
+            OPCODE_PING => {
                 let payload = self.payload_slice(header);
                 codec::write_frame_to_buf(scratch, Opcode::Pong, payload, random_mask());
                 writer.write_all(scratch).map_err(|io| {
@@ -1921,11 +1921,11 @@ impl WsFrameReader {
                 self.consume_frame(header.frame_end);
                 Ok(WsFrameRead::Progress)
             }
-            WS_OPCODE_PONG => {
+            OPCODE_PONG => {
                 self.consume_frame(header.frame_end);
                 Ok(WsFrameRead::Progress)
             }
-            WS_OPCODE_CLOSE => {
+            OPCODE_CLOSE => {
                 let parse_result = codec::parse_ws_close_payload(self.payload_slice(header));
                 self.consume_frame(header.frame_end);
                 match parse_result {
@@ -1933,7 +1933,7 @@ impl WsFrameReader {
                     Err(reason) => Err(WsMessageError::ProtocolViolation(reason)),
                 }
             }
-            WS_OPCODE_TEXT | WS_OPCODE_BINARY => {
+            OPCODE_TEXT | OPCODE_BINARY => {
                 if self.fragment_opcode.is_some() {
                     return Err(WsMessageError::ProtocolViolation(
                         "Unexpected new data frame mid-message".to_string(),
@@ -1951,7 +1951,7 @@ impl WsFrameReader {
                     Ok(WsFrameRead::Progress)
                 }
             }
-            WS_OPCODE_CONTINUATION => {
+            OPCODE_CONTINUATION => {
                 let Some(opcode) = self.fragment_opcode else {
                     return Err(WsMessageError::ProtocolViolation(
                         "Continuation frame without prior data frame".to_string(),
@@ -2140,7 +2140,7 @@ fn validate_control_frame_header(
     opcode: u8,
     payload_len: usize,
 ) -> Result<(), WsMessageError> {
-    if !matches!(opcode, WS_OPCODE_PING | WS_OPCODE_PONG | WS_OPCODE_CLOSE) {
+    if !matches!(opcode, OPCODE_PING | OPCODE_PONG | OPCODE_CLOSE) {
         return Ok(());
     }
     if !fin {
@@ -2154,7 +2154,7 @@ fn validate_control_frame_header(
             payload_len
         )));
     }
-    if opcode == WS_OPCODE_CLOSE && payload_len == 1 {
+    if opcode == OPCODE_CLOSE && payload_len == 1 {
         return Err(WsMessageError::ProtocolViolation(
             "WebSocket close frame payload length must be 0 or at least 2 bytes".to_string(),
         ));
@@ -4099,7 +4099,7 @@ mod tests {
 
         write_ping_frame(&mut stream, &mut scratch, b"da").unwrap();
 
-        assert_eq!(stream.written[0], 0x80 | WS_OPCODE_PING);
+        assert_eq!(stream.written[0], 0x80 | OPCODE_PING);
         assert_eq!(stream.written[1] & 0x80, 0x80);
         assert_eq!(stream.written[1] & 0x7f, 2);
     }
@@ -4126,7 +4126,7 @@ mod tests {
     #[test]
     fn frame_reader_rejects_rsv_bits_without_extension() {
         let mut frame = Vec::new();
-        append_server_frame(&mut frame, true, WS_OPCODE_BINARY, b"hello");
+        append_server_frame(&mut frame, true, OPCODE_BINARY, b"hello");
         frame[0] |= 0x40;
         let mut reader = WsFrameReader::new();
         reader.append_input_for_test(&frame);
@@ -4143,7 +4143,7 @@ mod tests {
     #[test]
     fn frame_reader_rejects_one_byte_close_payload() {
         let mut frame = Vec::new();
-        append_server_frame(&mut frame, true, WS_OPCODE_CLOSE, &[0x03]);
+        append_server_frame(&mut frame, true, OPCODE_CLOSE, &[0x03]);
         let mut reader = WsFrameReader::new();
         reader.append_input_for_test(&frame);
         let mut written = Vec::new();
@@ -4158,7 +4158,7 @@ mod tests {
 
     #[test]
     fn frame_reader_rejects_non_minimal_16_bit_payload_length() {
-        let frame = [0x80 | WS_OPCODE_BINARY, 126, 0, 125];
+        let frame = [0x80 | OPCODE_BINARY, 126, 0, 125];
         let mut reader = WsFrameReader::new();
         reader.append_input_for_test(&frame);
         let mut written = Vec::new();
@@ -4173,7 +4173,7 @@ mod tests {
 
     #[test]
     fn frame_reader_rejects_non_minimal_64_bit_payload_length() {
-        let mut frame = vec![0x80 | WS_OPCODE_BINARY, 127];
+        let mut frame = vec![0x80 | OPCODE_BINARY, 127];
         frame.extend_from_slice(&0xffffu64.to_be_bytes());
         let mut reader = WsFrameReader::new();
         reader.append_input_for_test(&frame);
@@ -4245,7 +4245,7 @@ mod tests {
                         .then(|| value.trim())
                 })
                 .unwrap();
-            let accept = codec::compute_accept(key);
+            let accept = crate::ws::crypto::compute_accept(key);
             let mut response = format!(
                 "HTTP/1.1 101 Switching Protocols\r\n\
                  Upgrade: websocket\r\n\
@@ -4255,7 +4255,7 @@ mod tests {
                  \r\n"
             )
             .into_bytes();
-            append_server_frame(&mut response, true, WS_OPCODE_BINARY, &self.payload);
+            append_server_frame(&mut response, true, OPCODE_BINARY, &self.payload);
             self.read = std::io::Cursor::new(response);
             self.response_built = true;
         }
@@ -4321,7 +4321,7 @@ mod tests {
                 .try_read_buffered_for_test(&mut written, &mut scratch)
                 .unwrap(),
             WsFrameRead::Message {
-                opcode: WS_OPCODE_BINARY
+                opcode: OPCODE_BINARY
             }
         );
         assert_eq!(reader.message(), b"\x02\x00");
@@ -4339,7 +4339,7 @@ mod tests {
     #[test]
     fn normal_close_is_reconnectable_role_movement_shape() {
         let mut frames = Vec::new();
-        append_server_frame(&mut frames, true, WS_OPCODE_CLOSE, &1000u16.to_be_bytes());
+        append_server_frame(&mut frames, true, OPCODE_CLOSE, &1000u16.to_be_bytes());
         let mut stream = InMemoryWs::new(frames);
         let mut scratch = Vec::new();
         let mut out = Vec::new();
@@ -4358,16 +4358,16 @@ mod tests {
     #[test]
     fn read_message_preserves_fragment_across_ping() {
         let mut frames = Vec::new();
-        append_server_frame(&mut frames, false, WS_OPCODE_BINARY, b"hello ");
-        append_server_frame(&mut frames, true, WS_OPCODE_PING, b"p");
-        append_server_frame(&mut frames, true, WS_OPCODE_CONTINUATION, b"world");
+        append_server_frame(&mut frames, false, OPCODE_BINARY, b"hello ");
+        append_server_frame(&mut frames, true, OPCODE_PING, b"p");
+        append_server_frame(&mut frames, true, OPCODE_CONTINUATION, b"world");
         let mut stream = InMemoryWs::new(frames);
         let mut scratch = Vec::new();
         let mut out = Vec::new();
 
         let opcode = read_message_with_close(&mut stream, &mut scratch, &mut out).unwrap();
 
-        assert_eq!(opcode, WS_OPCODE_BINARY);
+        assert_eq!(opcode, OPCODE_BINARY);
         assert_eq!(out, b"hello world");
         assert!(!stream.written.is_empty());
     }
@@ -4375,8 +4375,8 @@ mod tests {
     #[test]
     fn frame_reader_rejects_fragmented_message_over_aggregate_limit() {
         let mut frames = Vec::new();
-        append_server_frame(&mut frames, false, WS_OPCODE_BINARY, b"abc");
-        append_server_frame(&mut frames, true, WS_OPCODE_CONTINUATION, b"def");
+        append_server_frame(&mut frames, false, OPCODE_BINARY, b"abc");
+        append_server_frame(&mut frames, true, OPCODE_CONTINUATION, b"def");
         let mut reader = WsFrameReader::with_max_message_bytes_for_test(5);
         reader.append_input_for_test(&frames);
         let mut written = Vec::new();
@@ -4399,8 +4399,8 @@ mod tests {
     #[test]
     fn frame_reader_consumes_pong_then_buffered_binary_message() {
         let mut frames = Vec::new();
-        append_server_frame(&mut frames, true, WS_OPCODE_PONG, b"");
-        append_server_frame(&mut frames, true, WS_OPCODE_BINARY, b"\x02\x00");
+        append_server_frame(&mut frames, true, OPCODE_PONG, b"");
+        append_server_frame(&mut frames, true, OPCODE_BINARY, b"\x02\x00");
         let mut reader = WsFrameReader::new();
         reader.append_input_for_test(&frames);
         let mut written = Vec::new();
@@ -4418,7 +4418,7 @@ mod tests {
                 .try_read_buffered_for_test(&mut written, &mut scratch)
                 .unwrap(),
             WsFrameRead::Message {
-                opcode: WS_OPCODE_BINARY
+                opcode: OPCODE_BINARY
             }
         );
         assert_eq!(reader.message(), b"\x02\x00");
@@ -4427,7 +4427,7 @@ mod tests {
     #[test]
     fn frame_reader_answers_ping_and_returns_progress() {
         let mut frame = Vec::new();
-        append_server_frame(&mut frame, true, WS_OPCODE_PING, b"p");
+        append_server_frame(&mut frame, true, OPCODE_PING, b"p");
         let mut reader = WsFrameReader::new();
         reader.append_input_for_test(&frame);
         let mut written = Vec::new();
@@ -4439,7 +4439,7 @@ mod tests {
                 .unwrap(),
             WsFrameRead::Progress
         );
-        assert_eq!(written[0], 0x80 | WS_OPCODE_PONG);
+        assert_eq!(written[0], 0x80 | OPCODE_PONG);
         assert_eq!(written[1] & 0x80, 0x80);
         assert_eq!(written[1] & 0x7f, 1);
     }
@@ -4447,7 +4447,7 @@ mod tests {
     #[test]
     fn frame_reader_preserves_incomplete_buffered_payload_until_complete() {
         let mut frame = Vec::new();
-        append_server_frame(&mut frame, true, WS_OPCODE_BINARY, b"ok");
+        append_server_frame(&mut frame, true, OPCODE_BINARY, b"ok");
         let mut reader = WsFrameReader::new();
         reader.append_input_for_test(&frame[..3]);
         let mut written = Vec::new();
@@ -4465,7 +4465,7 @@ mod tests {
                 .try_read_buffered_for_test(&mut written, &mut scratch)
                 .unwrap(),
             WsFrameRead::Message {
-                opcode: WS_OPCODE_BINARY
+                opcode: OPCODE_BINARY
             }
         );
         assert_eq!(reader.message(), b"ok");
@@ -4475,9 +4475,9 @@ mod tests {
     fn frame_reader_compacts_consumed_small_frames() {
         let mut frames = Vec::new();
         for _ in 0..2500 {
-            append_server_frame(&mut frames, true, WS_OPCODE_PONG, b"");
+            append_server_frame(&mut frames, true, OPCODE_PONG, b"");
         }
-        append_server_frame(&mut frames, true, WS_OPCODE_BINARY, b"done");
+        append_server_frame(&mut frames, true, OPCODE_BINARY, b"done");
         let original_len = frames.len();
         let mut reader = WsFrameReader::new();
         reader.append_input_for_test(&frames);
@@ -4501,7 +4501,7 @@ mod tests {
                 .try_read_buffered_for_test(&mut written, &mut scratch)
                 .unwrap(),
             WsFrameRead::Message {
-                opcode: WS_OPCODE_BINARY
+                opcode: OPCODE_BINARY
             }
         );
         assert_eq!(reader.message(), b"done");
@@ -4515,14 +4515,14 @@ mod tests {
         use crate::alloc_counter;
 
         let mut frame = Vec::new();
-        append_server_frame(&mut frame, true, WS_OPCODE_BINARY, b"\x00\x00");
+        append_server_frame(&mut frame, true, OPCODE_BINARY, b"\x00\x00");
         let mut scratch = Vec::with_capacity(64);
         let mut out = Vec::with_capacity(64);
 
         let mut warmup = InMemoryWs::new(frame.clone());
         assert_eq!(
             read_message_with_close(&mut warmup, &mut scratch, &mut out).unwrap(),
-            WS_OPCODE_BINARY
+            OPCODE_BINARY
         );
         assert_eq!(out, b"\x00\x00");
 
@@ -4530,7 +4530,7 @@ mod tests {
         alloc_counter::start_counting();
         assert_eq!(
             read_message_with_close(&mut counted, &mut scratch, &mut out).unwrap(),
-            WS_OPCODE_BINARY
+            OPCODE_BINARY
         );
         let alloc_count = alloc_counter::stop_counting();
 

@@ -4977,7 +4977,7 @@ mod reader_pool {
     use std::time::Duration;
 
     use super::{conf_for, park_connection, wait_until};
-    use crate::egress::error::ErrorCode as EgressErrorCode;
+    use crate::ErrorCode;
     // Front-door import: `QuestDb` is re-exported at the crate root.
     use crate::QuestDb;
     use crate::tests::qwp_ws::{perform_server_upgrade, write_server_info_frame};
@@ -5196,7 +5196,7 @@ mod reader_pool {
         let err = db
             .borrow_reader()
             .expect_err("must fail-fast at the reader cap");
-        assert_eq!(err.code(), EgressErrorCode::InvalidApiCall);
+        assert_eq!(err.code(), ErrorCode::InvalidApiCall);
         assert!(
             err.msg().contains("Reader pool exhausted"),
             "unexpected message: {}",
@@ -5296,7 +5296,7 @@ mod reader_pool {
             .expect_err("reader build must fail against a dead endpoint");
         assert_ne!(
             err.code(),
-            EgressErrorCode::InvalidApiCall,
+            ErrorCode::InvalidApiCall,
             "expected a connect error, not a pool-cap error: {}",
             err.msg()
         );

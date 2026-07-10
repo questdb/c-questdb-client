@@ -386,7 +386,7 @@ if (QUESTDB_TESTS_AND_EXAMPLES)
     # Broker-independent C++ tests for the reader FFI. Covers the
     # error-handling surface, parser rejection paths, the connect-failure
     # path against a closed port, NULL-idempotent free / close functions,
-    # `from_env`, and the C++ `reader_error` exception wrapper.
+    # `from_env`, and the C++ `questdb::error` exception wrapper.
     compile_test(
         test_reader_offline
         cpp_test/test_reader_offline.cpp)
@@ -421,25 +421,6 @@ if (QUESTDB_TESTS_AND_EXAMPLES)
         test_column_sender
         cpp_test/qwp_mock_server.cpp
         cpp_test/test_column_sender.cpp)
-
-    # Standalone reader constructors are test-only (the supported API hands
-    # readers out from the connection pool); in-tree tests/examples opt into
-    # them here, base target plus any _cxx20 twin. Installed headers stay
-    # pool-only.
-    foreach(reader_direct_target
-            reader_c_example_from_conf reader_cpp_example_from_conf
-            reader_c_example_with_binds reader_cpp_example_with_binds
-            reader_cpp_example_columns reader_c_example_columns
-            reader_c_example_arrow reader_cpp_example_arrow
-            test_reader reader_c_smoke test_reader_offline test_reader_mock
-            test_arrow_egress)
-        foreach(v ${reader_direct_target} ${reader_direct_target}_cxx20)
-            if(TARGET ${v})
-                target_compile_definitions(
-                    ${v} PRIVATE QUESTDB_READER_INTERNAL_CONSTRUCTORS)
-            endif()
-        endforeach()
-    endforeach()
 
     # System testing Python3 script.
     # This will download the latest QuestDB instance from Github,

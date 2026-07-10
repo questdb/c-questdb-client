@@ -27,7 +27,7 @@
 //! ABI-stable: variants append-only, never reorder. `0x08` is reserved
 //! (formerly `STRING`, removed); senders use [`Varchar`](ColumnKind::Varchar).
 
-use crate::egress::error::{Result, fmt};
+use crate::error::{Result, fmt};
 
 /// QWP wire type code.
 ///
