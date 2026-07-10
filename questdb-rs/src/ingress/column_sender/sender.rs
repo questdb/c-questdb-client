@@ -184,6 +184,19 @@ fn direct_delivery_unknown(e: crate::Error) -> FlushFailure {
     FlushFailure::DeliveryUnknown(classify_flush_error(e))
 }
 
+/// Downgrade a split sub-range failure once an earlier sub-range has already
+/// committed (direct) or been enqueued (store-and-forward): the chunk is now
+/// partially on the server, so it is no longer safe to blind-retry the whole
+/// chunk. `NotDelivered` (safe to re-export) becomes `DeliveryUnknown` (in
+/// doubt, must not re-export); `DeliveryUnknown` is left unchanged so we never
+/// mask an in-doubt failure as retryable.
+fn deny_retry_after_partial(f: FlushFailure) -> FlushFailure {
+    match f {
+        FlushFailure::NotDelivered(e) => FlushFailure::DeliveryUnknown(e),
+        other => other,
+    }
+}
+
 pub struct ColumnSender {
     backend: ColumnSenderBackend,
 }
@@ -849,13 +862,29 @@ impl DirectColumnBackend {
                         // on the wire uncommitted; tear the connection down so
                         // the drop-time best-effort commit discards them instead
                         // of committing a partial chunk under a later boundary.
-                        let mut result = self.publish_split(chunk, 0, mid, true);
+                        let mut committed = false;
+                        let mut result = self.publish_split(chunk, 0, mid, true, &mut committed);
                         if result.is_ok() {
-                            result = self.publish_split(chunk, mid, row_count - mid, defer_commit);
+                            result = self.publish_split(
+                                chunk,
+                                mid,
+                                row_count - mid,
+                                defer_commit,
+                                &mut committed,
+                            );
                         }
                         if let Err(e) = result {
                             self.conn.mark_must_close();
-                            return Err(e);
+                            // A mid-split sync may already have committed a
+                            // prefix. The deferred remainder is discarded on
+                            // drop, but a committed prefix is real, so downgrade
+                            // a "safe to retry" failure to in-doubt to avoid
+                            // duplicating it.
+                            return Err(if committed {
+                                deny_retry_after_partial(e)
+                            } else {
+                                e
+                            });
                         }
                     }
                     None => return Err(direct_not_delivered(err)),
@@ -953,6 +982,7 @@ impl DirectColumnBackend {
         row_offset: usize,
         row_count: usize,
         defer_commit: bool,
+        committed: &mut bool,
     ) -> std::result::Result<(), FlushFailure> {
         let outcome =
             match self.publish_frame(chunk, Some((row_offset, row_count)), defer_commit)? {
@@ -964,6 +994,10 @@ impl DirectColumnBackend {
                     // rows are complete.
                     self.sync(AckLevel::Ok)
                         .map_err(FlushFailure::DeliveryUnknown)?;
+                    // The prefix is now committed on the server: a later failure
+                    // anywhere in this split must not report the whole chunk as
+                    // safe to blind-retry (it would duplicate this prefix).
+                    *committed = true;
                     self.publish_frame(chunk, Some((row_offset, row_count)), defer_commit)?
                 }
                 outcome => outcome,
@@ -973,8 +1007,14 @@ impl DirectColumnBackend {
             FrameOutcome::NoSlot(err) => Err(FlushFailure::NotDelivered(err)),
             FrameOutcome::TooLarge(err) => match split_mid(row_count) {
                 Some(mid) => {
-                    self.publish_split(chunk, row_offset, mid, true)?;
-                    self.publish_split(chunk, row_offset + mid, row_count - mid, defer_commit)
+                    self.publish_split(chunk, row_offset, mid, true, committed)?;
+                    self.publish_split(
+                        chunk,
+                        row_offset + mid,
+                        row_count - mid,
+                        defer_commit,
+                        committed,
+                    )
                 }
                 None => Err(direct_not_delivered(err)),
             },
@@ -1021,14 +1061,28 @@ impl DirectColumnBackend {
                 let row_count = batch.num_rows();
                 match split_mid(row_count) {
                     Some(mid) => {
-                        let mut result = self.publish_arrow_split(&spec, 0, mid, true);
+                        let mut committed = false;
+                        let mut result =
+                            self.publish_arrow_split(&spec, 0, mid, true, &mut committed);
                         if result.is_ok() {
-                            result =
-                                self.publish_arrow_split(&spec, mid, row_count - mid, defer_commit);
+                            result = self.publish_arrow_split(
+                                &spec,
+                                mid,
+                                row_count - mid,
+                                defer_commit,
+                                &mut committed,
+                            );
                         }
                         if let Err(e) = result {
                             self.conn.mark_must_close();
-                            return Err(e);
+                            // See `flush_inner`: a mid-split sync may have
+                            // committed a prefix, so a blind retry would
+                            // duplicate it.
+                            return Err(if committed {
+                                deny_retry_after_partial(e)
+                            } else {
+                                e
+                            });
                         }
                     }
                     None => return Err(direct_not_delivered(err)),
@@ -1118,6 +1172,7 @@ impl DirectColumnBackend {
         row_offset: usize,
         row_count: usize,
         defer_commit: bool,
+        committed: &mut bool,
     ) -> std::result::Result<(), FlushFailure> {
         let outcome =
             match self.publish_arrow_frame(spec, Some((row_offset, row_count)), defer_commit)? {
@@ -1126,6 +1181,8 @@ impl DirectColumnBackend {
                     // published prefix and retry this range.
                     self.sync(AckLevel::Ok)
                         .map_err(FlushFailure::DeliveryUnknown)?;
+                    // Prefix committed on the server: see `publish_split`.
+                    *committed = true;
                     self.publish_arrow_frame(spec, Some((row_offset, row_count)), defer_commit)?
                 }
                 outcome => outcome,
@@ -1135,8 +1192,14 @@ impl DirectColumnBackend {
             FrameOutcome::NoSlot(err) => Err(FlushFailure::NotDelivered(err)),
             FrameOutcome::TooLarge(err) => match split_mid(row_count) {
                 Some(mid) => {
-                    self.publish_arrow_split(spec, row_offset, mid, true)?;
-                    self.publish_arrow_split(spec, row_offset + mid, row_count - mid, defer_commit)
+                    self.publish_arrow_split(spec, row_offset, mid, true, committed)?;
+                    self.publish_arrow_split(
+                        spec,
+                        row_offset + mid,
+                        row_count - mid,
+                        defer_commit,
+                        committed,
+                    )
                 }
                 None => Err(direct_not_delivered(err)),
             },
@@ -1204,7 +1267,11 @@ impl SfaColumnBackend {
                 match split_mid(row_count) {
                     Some(mid) => {
                         self.publish_split_sfa(chunk, 0, mid, max_buf_size)?;
-                        self.publish_split_sfa(chunk, mid, row_count - mid, max_buf_size)?
+                        // The prefix is now durably queued (at-least-once); a
+                        // failure on the remainder leaves it enqueued, so the
+                        // chunk must not be reported as safe to blind-retry.
+                        self.publish_split_sfa(chunk, mid, row_count - mid, max_buf_size)
+                            .map_err(deny_retry_after_partial)?
                     }
                     None => return Err(FlushFailure::NotDelivered(err)),
                 }
@@ -1371,6 +1438,7 @@ impl SfaColumnBackend {
                 Some(mid) => {
                     self.publish_split_sfa(chunk, row_offset, mid, max_buf_size)?;
                     self.publish_split_sfa(chunk, row_offset + mid, row_count - mid, max_buf_size)
+                        .map_err(deny_retry_after_partial)
                 }
                 None => Err(FlushFailure::NotDelivered(err)),
             },
@@ -1444,7 +1512,9 @@ impl SfaColumnBackend {
                 match split_mid(row_count) {
                     Some(mid) => {
                         self.publish_arrow_split_sfa(&spec, 0, mid, max_buf_size)?;
-                        self.publish_arrow_split_sfa(&spec, mid, row_count - mid, max_buf_size)?
+                        // Prefix is durably queued; see `flush_chunk_boundary`.
+                        self.publish_arrow_split_sfa(&spec, mid, row_count - mid, max_buf_size)
+                            .map_err(deny_retry_after_partial)?
                     }
                     None => return Err(FlushFailure::NotDelivered(err)),
                 }
@@ -1548,6 +1618,7 @@ impl SfaColumnBackend {
                         row_count - mid,
                         max_buf_size,
                     )
+                    .map_err(deny_retry_after_partial)
                 }
                 None => Err(FlushFailure::NotDelivered(err)),
             },
@@ -1726,5 +1797,31 @@ mod tests {
                 "split point must make progress for count {count}"
             );
         }
+    }
+
+    #[test]
+    fn deny_retry_after_partial_downgrades_not_delivered_and_never_upgrades() {
+        use super::{FlushFailure, deny_retry_after_partial};
+        use crate::{Error, ErrorCode};
+
+        // Once a split has put a prefix on the server, a "safe to retry"
+        // (`NotDelivered`) failure on the remainder must become in-doubt
+        // (`DeliveryUnknown`) so the caller does not blind-retry and duplicate
+        // the committed / enqueued prefix.
+        let nd = FlushFailure::NotDelivered(Error::new(ErrorCode::SocketError, "boom"));
+        assert!(nd.is_not_delivered());
+        let downgraded = deny_retry_after_partial(nd);
+        assert!(!downgraded.is_not_delivered());
+        assert!(
+            downgraded.into_error().in_doubt(),
+            "downgraded failure must be flagged in-doubt"
+        );
+
+        // The reverse must never happen: an already in-doubt failure stays in
+        // doubt — upgrading it back to retryable could cause data loss.
+        let du = FlushFailure::DeliveryUnknown(Error::new(ErrorCode::SocketError, "boom"));
+        let still = deny_retry_after_partial(du);
+        assert!(!still.is_not_delivered());
+        assert!(still.into_error().in_doubt());
     }
 }
