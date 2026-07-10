@@ -38,24 +38,21 @@
 //! # Layout (little-endian)
 //!
 //! ```text
-//!   offset 0: u32 magic = 'SYD2'
+//!   offset 0: u32 magic = 'SYD1'
 //!   offset 4: u8  version = 2
 //!   offset 5: 3 bytes reserved (zero)
-//!   offset 8: records, each written by one write-ahead append
-//!               [payload_len: u32]
-//!               [payload: entries, each [len: varint][utf8 bytes], ascending id]
-//!               [crc32c: u32 over (payload_len || payload)]
+//!   offset 8: entries, each [len: varint][utf8 bytes][crc32c: u32], ascending id
 //! ```
 //!
-//! Symbol id `i` is the `i`-th entry across all record payloads (ids are dense
-//! and assigned sequentially from 0), so no id needs to be stored. Each record
-//! carries the symbols one write-ahead batch (a frame) introduced, committed by a
-//! trailing CRC32C exactly as the segment records are (see
-//! [`super::qwp_ws_sfa_segment`]): a bit-flip in a length or a symbol byte is
-//! caught on recovery instead of silently mis-registering a symbol. The
-//! concatenated record *payloads* (framing stripped) are byte-for-byte the shape a
-//! QWP delta-dict section carries, so a recovered region can be spliced into a
-//! catch-up frame verbatim.
+//! Symbol id `i` is the `i`-th entry (ids are dense and assigned sequentially from
+//! 0), so no id needs to be stored. Each entry carries a CRC32C over its
+//! `[len][utf8]` bytes — the same checksum the SF segment frames use (see
+//! [`super::qwp_ws_sfa_segment`]) and matching the Java reference client — so a
+//! torn, zero-page or stale entry is detected on recovery and the parse stops
+//! there, instead of silently mis-registering a symbol and shifting the dense
+//! id->symbol map. The concatenated entry *wire* bytes (CRCs stripped) are
+//! byte-for-byte the shape a QWP delta-dict section carries, so a recovered region
+//! can be spliced into a catch-up frame verbatim.
 //!
 //! # Durability / write-ahead ordering
 //!
@@ -67,14 +64,20 @@
 //! recoverable frame's references. It is **not** sufficient for a **host/power
 //! crash**, where unflushed pages can be lost out of order and the dictionary
 //! may end up torn relative to the frames it serves — exactly as the segment
-//! frames themselves may be lost on a host crash. A torn dictionary is caught at
-//! replay by the send loop's guard, which fails loudly (the unreplayable data
-//! must be resent) rather than corrupting the target table.
+//! frames themselves may be lost on a host crash. Two layers keep a host-crash
+//! tear from silently corrupting data: the per-entry CRC32C makes [`open`] stop at
+//! the first entry whose checksum fails — an interior page lost out of order
+//! (reading back as zeroes) or a stale entry left past the end is detected and the
+//! trusted region ends before it, so recovery never mis-parses a corrupt entry nor
+//! shifts the dense id->symbol map — and the send loop's replay guard then fails
+//! loudly on any surviving frame whose delta start id exceeds that trusted prefix
+//! (the unreplayable data must be resent) rather than corrupting the target table.
+//! A tear that happens to leave bytes whose CRC still matches is a 1-in-2^32
+//! collision per entry, no weaker than the frames' own checksum.
 //!
-//! A torn trailing record from a crash mid-append is self-healing: [`open`] stops
-//! parsing at the first incomplete or CRC-failed record and truncates the file
-//! there, so the
-//! next append overwrites it.
+//! A torn trailing entry from a crash mid-append is self-healing: [`open`] stops
+//! parsing at the first incomplete or CRC-failed entry and truncates the file
+//! there, so the next append overwrites it.
 //!
 //! # Lifecycle
 //!
@@ -102,25 +105,25 @@ use crate::ingress::buffer::MAX_PERSISTED_SYMBOL_ENTRY_LEN as MAX_ENTRY_LEN;
 /// it automatically, exactly like `.lock` and `.ack-watermark`.
 pub(crate) const FILE_NAME: &str = ".symbol-dict";
 
-/// `'SYD2'` little-endian. Bumped from `'SYD1'` when per-record CRC32C framing was
-/// added: an old unframed file has a different magic, so [`open`] rejects it as
-/// bad-magic and recovers fresh rather than misparsing it.
+/// `'SYD1'` little-endian, matching the Java reference client's `.symbol-dict`.
+/// The [`VERSION`] byte distinguishes the layout: v1 was unframed `[len][utf8]`
+/// entries (no CRC), v2 appends a per-entry CRC32C. [`open`] checks BOTH the magic
+/// and the version, so an older v1 file — or any file with a different magic — is
+/// rejected as proven-corrupt and recovered fresh rather than misparsed.
 ///
 /// [`open`]: PersistedSymbolDict::open
-const FILE_MAGIC: u32 = 0x3244_5953;
+const FILE_MAGIC: u32 = 0x3144_5953;
 const HEADER_SIZE: u64 = 8;
 const VERSION: u8 = 2;
 
-/// Bytes of framing each record adds around its payload: a `u32` payload length
-/// prefix and a trailing `u32` CRC32C.
-const RECORD_LEN_PREFIX: usize = 4;
-const RECORD_CRC_LEN: usize = 4;
+/// Bytes of the CRC32C trailing every entry's `[len][utf8]` on disk.
+const CRC_SIZE: usize = 4;
 
 /// Upper bound on the side-file size accepted at [`open`](PersistedSymbolDict::open) /
 /// [`open_recovered`](PersistedSymbolDict::open_recovered). A legitimate dictionary's
 /// UTF-8 bytes are bounded writer-side by the connection heap cap
 /// (`MAX_CONN_SYMBOL_DICT_HEAP_BYTES`, 256 MiB, enforced at `intern`); adding the
-/// per-entry length prefixes and per-record framing keeps a legitimate file well
+/// per-entry length prefixes and per-entry CRC32Cs keeps a legitimate file well
 /// under this ceiling, so a larger file is corrupt. Capping `file_len` before
 /// reading keeps a corrupt/oversized file from driving `read_to_end` to an OOM
 /// abort — its allocation is infallible and aborts the host regardless of the
@@ -321,24 +324,20 @@ impl PersistedSymbolDict {
             return Err(io::Error::other("injected partial-write cleanup failure"));
         }
         let start = self.append_offset;
-        // One CRC-committed record: [payload_len u32][payload][crc32c u32]. The
-        // payload is the frame's `[len][utf8]...` symbols; the CRC covers the length
-        // prefix + payload (mirroring the segment codec) so a bit-flip in either is
-        // caught on recovery instead of silently mis-registering a symbol. Built in
-        // scratch and written in one `write_all` so a wide flush does not do a
-        // syscall per symbol.
+        // Encode each entry as [len varint][utf8][crc32c], the CRC covering its
+        // [len][utf8] bytes (matching the Java client and the segment codec) so a
+        // torn/stale entry is caught on recovery instead of silently mis-registering
+        // a symbol. Built in scratch and written in one `write_all` so a wide flush
+        // does not do a syscall per symbol.
         self.append_scratch.clear();
-        self.append_scratch
-            .extend_from_slice(&[0u8; RECORD_LEN_PREFIX]); // reserved; filled below
         for symbol in symbols {
+            let entry_start = self.append_scratch.len();
             write_varint(&mut self.append_scratch, symbol.len() as u64);
             self.append_scratch.extend_from_slice(symbol);
+            let crc = crc32c::crc32c_append(0, &self.append_scratch[entry_start..]);
+            self.append_scratch.extend_from_slice(&crc.to_le_bytes());
         }
-        let payload_len = (self.append_scratch.len() - RECORD_LEN_PREFIX) as u32;
-        self.append_scratch[..RECORD_LEN_PREFIX].copy_from_slice(&payload_len.to_le_bytes());
-        let crc = crc32c::crc32c_append(0, &self.append_scratch);
-        self.append_scratch.extend_from_slice(&crc.to_le_bytes());
-        let rec_len = self.append_scratch.len() as u64;
+        let batch_len = self.append_scratch.len() as u64;
         // Disjoint field borrows: write the scratch (shared) into the file (mut).
         if let Err(e) = self.file.write_all(&self.append_scratch) {
             // Restore the file to the pre-write tip. `set_len` (ftruncate) does not
@@ -357,7 +356,7 @@ impl PersistedSymbolDict {
             }
             return Err(e);
         }
-        self.append_offset = start + rec_len;
+        self.append_offset = start + batch_len;
         self.size += symbols.len() as u32;
         Ok(())
     }
@@ -529,16 +528,20 @@ impl PersistedSymbolDict {
                 "persisted symbol dictionary: short or inconsistent read",
             ));
         }
-        // buf.len() >= HEADER_SIZE (== 8) is guaranteed above, so the first four
-        // bytes are always present — index directly rather than risk a panic.
-        if u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]) != FILE_MAGIC {
-            return Ok(None); // proven-corrupt header -> caller re-creates fresh
+        // buf.len() >= HEADER_SIZE (== 8) is guaranteed above, so the magic and
+        // version bytes are always present — index directly rather than risk a panic.
+        if u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]) != FILE_MAGIC || buf[4] != VERSION {
+            // Proven-corrupt or unknown-version header -> caller re-creates fresh.
+            return Ok(None);
         }
 
-        // Parse CRC-committed records after the header; stop at the first torn,
-        // incomplete, or CRC-failed record (self-healing tail). `loaded_entries` is
-        // rebuilt from the record payloads only (framing stripped) so it stays the
-        // byte-for-byte shape a delta section carries.
+        // Parse `[len varint][utf8][crc32c]` entries after the header; stop at the
+        // first torn/incomplete OR crc-mismatched entry (self-healing tail). The
+        // per-entry CRC turns an interior tear or a stale post-end entry into a
+        // clean stop point, so recovery trusts only the intact prefix instead of
+        // silently mis-parsing a corrupt entry and shifting the dense id->symbol
+        // map. `loaded_entries` is rebuilt as WIRE bytes (`[len][utf8]...`, CRCs
+        // stripped) so it stays the byte-for-byte shape a delta section carries.
         let mut pos = HEADER_SIZE as usize;
         let mut count: u32 = 0;
         // Fallible up-front reservation, upper-bounded by the file (itself capped at
@@ -551,48 +554,42 @@ impl PersistedSymbolDict {
             .try_reserve(buf.len())
             .map_err(|_| io::Error::other("persisted symbol dictionary: allocation too large"))?;
         while pos < buf.len() {
-            // [payload_len: u32][payload][crc32c: u32]
-            let Some(payload_start) = pos.checked_add(RECORD_LEN_PREFIX) else {
-                break;
+            let entry_start = pos;
+            let Some((len, after_len)) = decode_varint(&buf, pos) else {
+                break; // torn length varint
             };
-            if payload_start > buf.len() {
-                break; // torn length prefix
+            // Enforce the shared per-entry cap (defence in depth: `intern` rejects
+            // oversized symbols before they are written); a longer length is corrupt.
+            if len > MAX_ENTRY_LEN {
+                break;
             }
-            let payload_len =
-                u32::from_le_bytes([buf[pos], buf[pos + 1], buf[pos + 2], buf[pos + 3]]) as usize;
-            let Some(crc_start) = payload_start.checked_add(payload_len) else {
+            let Some(wire_end) = after_len.checked_add(len as usize) else {
                 break;
             };
-            let Some(record_end) = crc_start.checked_add(RECORD_CRC_LEN) else {
+            let Some(entry_end) = wire_end.checked_add(CRC_SIZE) else {
                 break;
             };
-            if record_end > buf.len() {
-                break; // payload / crc overruns the buffer -> torn tail
+            if entry_end > buf.len() {
+                break; // torn/incomplete trailing entry ([utf8] or CRC does not fit)
             }
             let crc_read = u32::from_le_bytes([
-                buf[crc_start],
-                buf[crc_start + 1],
-                buf[crc_start + 2],
-                buf[crc_start + 3],
+                buf[wire_end],
+                buf[wire_end + 1],
+                buf[wire_end + 2],
+                buf[wire_end + 3],
             ]);
-            // CRC covers the length prefix + payload.
-            if crc32c::crc32c_append(0, &buf[pos..crc_start]) != crc_read {
-                break; // corrupt / half-committed record -> torn tail
+            // CRC covers the entry's [len][utf8] bytes.
+            if crc32c::crc32c_append(0, &buf[entry_start..wire_end]) != crc_read {
+                break; // corrupt / stale entry -> stop before it (fail-clean)
             }
-            // Count the verified payload's entries and enforce the per-entry cap
-            // (defence in depth: `intern` already rejects oversized symbols before
-            // they are written). A malformed entry inside a CRC-valid payload would
-            // be a writer bug, so stop before adopting the record.
-            let payload = &buf[payload_start..crc_start];
-            let Some(record_count) = count_payload_entries(payload) else {
+            let Some(new_count) = count.checked_add(1) else {
                 break;
             };
-            let Some(new_count) = count.checked_add(record_count) else {
-                break;
-            };
-            loaded_entries.extend_from_slice(payload);
+            // Wire bytes only: strip the on-disk CRC so `loaded_entries` stays the
+            // shape a delta section / catch-up frame carries.
+            loaded_entries.extend_from_slice(&buf[entry_start..wire_end]);
             count = new_count;
-            pos = record_end;
+            pos = entry_end;
         }
 
         let append_offset = pos as u64;
@@ -651,30 +648,6 @@ fn write_varint(out: &mut Vec<u8>, mut value: u64) {
         value >>= 7;
     }
     out.push(value as u8);
-}
-
-/// Walks a CRC-verified record payload's `[len varint][utf8]` entries, returning
-/// the entry count when every entry is well-formed and within [`MAX_ENTRY_LEN`],
-/// or `None` when the payload is malformed (a torn varint, an entry that overruns
-/// the payload, or one exceeding the cap). The CRC has already proven the payload
-/// intact, so `None` indicates a writer bug rather than corruption; either way the
-/// record is not adopted. Never panics on malformed input.
-fn count_payload_entries(payload: &[u8]) -> Option<u32> {
-    let mut pos = 0usize;
-    let mut count: u32 = 0;
-    while pos < payload.len() {
-        let (len, next) = decode_varint(payload, pos)?;
-        if len > MAX_ENTRY_LEN {
-            return None;
-        }
-        let end = next.checked_add(len as usize)?;
-        if end > payload.len() {
-            return None;
-        }
-        pos = end;
-        count = count.checked_add(1)?;
-    }
-    Some(count)
 }
 
 #[cfg(test)]
@@ -955,14 +928,13 @@ mod tests {
     }
 
     #[test]
-    fn zero_extended_tail_is_healed_at_open_by_the_record_crc() {
-        // A host/power crash can zero-extend the append-only side-file. Pre-CRC the
-        // trailing `0x00` bytes parsed as valid empty `[len=0]` entries that
-        // inflated the recovered count (a hazard the orphan drainer's seed gate had
-        // to catch later). With the per-record CRC, a zero run cannot form a valid
-        // record -- it overruns as a torn record or fails the CRC -- so `open` heals
-        // it at recovery and the recovered dictionary stays exactly the real
-        // symbols, never inflated.
+    fn zero_extended_tail_is_healed_at_open_by_the_per_entry_crc() {
+        // A host/power crash can zero-extend the append-only side-file. Without a
+        // CRC the trailing `0x00` bytes parse as valid empty `[len=0]` entries that
+        // inflate the recovered count. With the per-entry CRC a zero run cannot form
+        // a valid entry -- a `[len=0]` prefix's CRC-32C is non-zero, so the all-zero
+        // trailing CRC fails -- so `open` heals it at recovery and the recovered
+        // dictionary stays exactly the real symbols, never inflated.
         let dir = tmp_slot();
         {
             let mut d = PersistedSymbolDict::open(dir.path()).unwrap();
@@ -973,8 +945,8 @@ mod tests {
                 .append(true)
                 .open(dir.path().join(FILE_NAME))
                 .unwrap();
-            // A structurally-complete zero record ([len=0][crc=0]) whose CRC is
-            // wrong, plus extra zeros -- all healed.
+            // A structurally-complete zero entry ([len=0][crc=0]) whose CRC is wrong
+            // (crc32c of the len byte is non-zero), plus extra zeros -- all healed.
             f.write_all(&[0u8; 12]).unwrap();
         }
 
@@ -988,22 +960,23 @@ mod tests {
     }
 
     #[test]
-    fn same_length_value_flip_fails_the_record_crc_and_is_healed() {
+    fn same_length_value_flip_fails_the_per_entry_crc_and_is_healed() {
         // The Issue-4 corruption: a bit-flip that changes a symbol's VALUE but not
-        // its length. Pre-CRC it parsed as a valid (wrong) symbol and seeded the
-        // dictionary silently; now the record CRC catches it and `open` heals to the
-        // records before it, so recovery never registers the wrong symbol. A queued
-        // frame that referenced the dropped id then fails loudly at the send loop's
-        // torn-dict guard (StoreResendRequired) rather than corrupting the table.
+        // its length. Without a CRC it parsed as a valid (wrong) symbol and seeded
+        // the dictionary silently; now the per-entry CRC catches it and `open` heals
+        // to the entries before it, so recovery never registers the wrong symbol. A
+        // queued frame that referenced the dropped id then fails loudly at the send
+        // loop's torn-dict guard (StoreResendRequired) rather than corrupting the
+        // table.
         let dir = tmp_slot();
         {
             let mut d = PersistedSymbolDict::open(dir.path()).unwrap();
-            d.append_symbol(b"alpha").unwrap(); // record 0
-            d.append_symbol(b"bravo").unwrap(); // record 1
+            d.append_symbol(b"alpha").unwrap(); // entry 0
+            d.append_symbol(b"bravo").unwrap(); // entry 1
         }
         let path = dir.path().join(FILE_NAME);
         let mut bytes = fs::read(&path).unwrap();
-        // Flip one byte of "bravo" in record 1's payload (record 0 stays intact).
+        // Flip one byte of "bravo" (entry 1's utf8); entry 0 stays intact.
         let idx = bytes
             .windows(5)
             .position(|w| w == b"bravo")
@@ -1015,7 +988,7 @@ mod tests {
         assert_eq!(
             d.read_loaded_symbols(),
             vec![b"alpha".to_vec()],
-            "the CRC-failed record is dropped; the corrupt symbol is never recovered"
+            "the CRC-failed entry is dropped; the corrupt symbol is never recovered"
         );
         assert_eq!(d.size(), 1);
     }
@@ -1187,66 +1160,92 @@ mod tests {
     }
 
     #[test]
-    fn count_payload_entries_rejects_malformed_payloads_without_panicking() {
-        // The per-record CRC only proves the bytes are intact, not that the
-        // payload is well-formed; a malformed entry inside a CRC-valid record is a
-        // writer bug that must be rejected (record dropped) rather than adopted or
-        // panicked on. This pins the module's "Never panics on malformed input"
-        // contract.
-
-        // Well-formed: [len=1]['a'][len=2]['b']['c'] -> 2 entries.
-        assert_eq!(count_payload_entries(&[1, b'a', 2, b'b', b'c']), Some(2));
-        // Empty payload -> 0 entries.
-        assert_eq!(count_payload_entries(&[]), Some(0));
-        // A single empty ([len=0]) entry.
-        assert_eq!(count_payload_entries(&[0]), Some(1));
-        // Torn length varint: a lone continuation byte with nothing after it.
-        assert_eq!(count_payload_entries(&[0x80]), None);
-        // Entry length overruns the payload: claims 5 bytes, only 1 present.
-        assert_eq!(count_payload_entries(&[5, b'a']), None);
-        // Entry length exceeds the per-entry cap (checked before the body, so no
-        // 1 MiB body is needed to reject it).
-        let mut over_cap = Vec::new();
-        write_varint(&mut over_cap, MAX_ENTRY_LEN + 1);
-        over_cap.push(b'x');
-        assert_eq!(count_payload_entries(&over_cap), None);
-    }
-
-    #[test]
-    fn crc_valid_record_with_malformed_payload_is_dropped_at_open() {
-        // A CRC-valid record whose payload is malformed (a length varint that
-        // overruns the payload) must be dropped at `open` -- `count_payload_entries`
-        // rejects it, so `open_existing` stops before adopting it and heals the
-        // file -- keeping the earlier valid records and never mis-registering a
-        // symbol or panicking.
+    fn over_cap_entry_len_is_rejected_at_open() {
+        // Defence in depth: `intern` caps a symbol at MAX_ENTRY_LEN before it is
+        // written, but a corrupt on-disk length varint claiming more than the cap is
+        // stopped at `open` -- before the CRC check and before any huge slice -- so a
+        // hostile/torn length cannot drive recovery past the intact prefix. Keeps the
+        // earlier valid entry and never panics.
         let dir = tmp_slot();
         {
             let mut d = PersistedSymbolDict::open(dir.path()).unwrap();
-            d.append_symbol(b"good").unwrap(); // record 0: well-formed
+            d.append_symbol(b"good").unwrap(); // entry 0: well-formed
         }
-        // Append a hand-built record whose CRC is VALID but whose payload is
-        // malformed: [payload_len u32][payload][crc32c u32], payload = [len=5]['a']
-        // (claims a 5-byte entry, only 1 byte follows).
+        // Append a hand-built entry whose length varint exceeds the per-entry cap
+        // (no body/CRC needed -- the cap check precedes them).
         {
-            let payload = [5u8, b'a'];
-            let mut rec = Vec::new();
-            rec.extend_from_slice(&(payload.len() as u32).to_le_bytes());
-            rec.extend_from_slice(&payload);
-            let crc = crc32c::crc32c_append(0, &rec); // over [len_prefix][payload]
-            rec.extend_from_slice(&crc.to_le_bytes());
+            let mut over = Vec::new();
+            write_varint(&mut over, MAX_ENTRY_LEN + 1);
+            over.push(b'x');
             let mut f = OpenOptions::new()
                 .append(true)
                 .open(dir.path().join(FILE_NAME))
                 .unwrap();
-            f.write_all(&rec).unwrap();
+            f.write_all(&over).unwrap();
         }
 
         let d = PersistedSymbolDict::open(dir.path()).unwrap();
-        assert_eq!(
-            d.size(),
-            1,
-            "the CRC-valid-but-malformed record is dropped, not adopted"
-        );
+        assert_eq!(d.size(), 1, "the over-cap entry is stopped, not adopted");
         assert_eq!(d.read_loaded_symbols(), vec![b"good".to_vec()]);
+    }
+
+    #[test]
+    fn interior_corruption_is_caught_not_silently_misattributed() {
+        // A host-crash interior tear (a lost page reading back as zeroes) or a stale
+        // entry left past the end can change the bytes of a NON-trailing entry.
+        // Without the per-entry CRC the parse would accept those bytes, shifting the
+        // dense id->symbol map and silently misattributing symbol-column values on
+        // replay. With the CRC the corrupt entry fails verification and the parse
+        // stops there, so recovery trusts only the intact prefix (fail-clean: the
+        // send loop's torn-dict guard then forces a resend of the rest). Mirrors the
+        // Java client's testInteriorCorruptionIsCaughtNotSilentlyMisattributed.
+        let dir = tmp_slot();
+        {
+            let mut d = PersistedSymbolDict::open(dir.path()).unwrap();
+            for s in [b"s0", b"s1", b"s2", b"s3", b"s4"] {
+                d.append_symbol(s).unwrap();
+            }
+            assert_eq!(d.size(), 5);
+        }
+
+        // On-disk entry layout is [len varint][utf8][crc32c u32]; a 2-byte ASCII
+        // symbol is 1 + 2 + 4 = 7 bytes, after the 8-byte header:
+        //   header[0,8) e0[8,15) e1[15,22) e2[22,29) ...
+        // Offset 23 is "s2"'s first utf8 byte; flipping it leaves e2's stored CRC
+        // stale.
+        let path = dir.path().join(FILE_NAME);
+        let mut bytes = fs::read(&path).unwrap();
+        bytes[23] ^= 0x7F;
+        fs::write(&path, &bytes).unwrap();
+
+        let d = PersistedSymbolDict::open(dir.path()).unwrap();
+        // Only the intact prefix [s0, s1] is trusted; the corrupt e2 and everything
+        // after it are dropped. No recovered symbol is the corrupted string.
+        assert_eq!(d.size(), 2, "parse must stop at the corrupt interior entry");
+        assert_eq!(
+            d.read_loaded_symbols(),
+            vec![b"s0".to_vec(), b"s1".to_vec()]
+        );
+    }
+
+    #[test]
+    fn unknown_version_is_recreated_fresh() {
+        // A file with the right magic but an unrecognised version byte (e.g. an
+        // older v1 no-CRC file, or a future format) is proven-incompatible: `open`
+        // checks magic AND version and recreates fresh rather than misparsing.
+        let dir = tmp_slot();
+        let path = dir.path().join(FILE_NAME);
+        // Valid magic, header-only, but version 1 (the old no-CRC layout).
+        let mut header = [0u8; HEADER_SIZE as usize];
+        header[0..4].copy_from_slice(&FILE_MAGIC.to_le_bytes());
+        header[4] = 1;
+        fs::write(&path, header).unwrap();
+
+        let d = PersistedSymbolDict::open(dir.path()).unwrap();
+        assert_eq!(d.size(), 0, "an unknown-version file recovers fresh");
+        assert!(d.read_loaded_symbols().is_empty());
+        // The header was rewritten to the current version.
+        let bytes = fs::read(&path).unwrap();
+        assert_eq!(bytes[4], VERSION);
     }
 }

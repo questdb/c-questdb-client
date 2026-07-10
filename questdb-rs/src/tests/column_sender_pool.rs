@@ -2030,10 +2030,10 @@ fn store_and_forward_file_mode_recovers_and_replays_queued_frame_after_reopen() 
 #[test]
 fn store_and_forward_file_mode_value_corruption_is_healed_and_segment_kept() {
     // Issue-4 end-to-end: a same-length VALUE corruption in the persisted
-    // `.symbol-dict` -- a host/power-crash bit-flip that keeps a record's length
-    // but changes a symbol byte -- must be caught by the per-record CRC on
+    // `.symbol-dict` -- a host/power-crash bit-flip that keeps an entry's length
+    // but changes a symbol byte -- must be caught by the per-entry CRC on
     // recovery and NOT silently recovered as the wrong symbol. The CRC-failed
-    // record is dropped (healed) at open, so the corrupt symbol never reaches the
+    // entry is dropped (healed) at open, so the corrupt symbol never reaches the
     // dictionary, and the queued segment stays on disk (recoverable). (A recovered
     // mid-stream delta that DEPENDS on a dropped id then fails loudly at the send
     // loop's torn-dict guard -- `StoreResendRequired` -- covered by the driver- and
@@ -2075,7 +2075,7 @@ fn store_and_forward_file_mode_value_corruption_is_healed_and_segment_kept() {
         std::fs::write(&side_file, &bytes).unwrap();
     }
 
-    // Recovery: the record's CRC now fails, so `open` heals it -- the corrupt
+    // Recovery: the entry's CRC now fails, so `open` heals it -- the corrupt
     // symbol is NOT recovered (the recovered dictionary is empty, never "Xlpha").
     let recovered = PersistedSymbolDict::open(&slot_dir).unwrap();
     assert!(
