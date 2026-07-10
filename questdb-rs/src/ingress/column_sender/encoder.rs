@@ -718,6 +718,7 @@ unsafe fn encode_column(
         ColumnKind::NumpyDeferred {
             dtype,
             data,
+            src_stride: _,
             row_count: numpy_rows,
         } => {
             debug_assert_eq!(numpy_rows, row_count);
@@ -1326,9 +1327,10 @@ mod tests {
         assert_eq!(sliced, direct);
     }
 
-    /// NUMPY slicing advances the raw data pointer by `offset * bytes_per_row`.
-    /// A slice must encode identically to a fresh column built from the rows'
-    /// bytes at offset 0.
+    /// NUMPY slicing advances the raw data pointer by `offset *
+    /// source_elem_size` (the source stride, which for `I64Direct` happens to
+    /// equal the wire width). A slice must encode identically to a fresh column
+    /// built from the rows' bytes at offset 0.
     #[test]
     fn slice_rows_subrange_numpy_matches_freshly_built_subchunk() {
         use crate::ingress::column_sender::NumpyDtype;
@@ -1351,6 +1353,49 @@ mod tests {
         unsafe {
             fresh
                 .push_numpy_deferred("v", NumpyDtype::I64Direct, fresh_bytes.as_ptr(), 8, None)
+                .unwrap();
+        }
+        fresh.at_nanos(&ts[8..16]).unwrap();
+        let direct = encode_fresh(&fresh);
+
+        assert_eq!(sliced, direct);
+    }
+
+    /// C-1 regression, end-to-end: for a *widening* dtype the source stride (4
+    /// bytes for `I32WidenToI64`) differs from the wire width (8), so a split
+    /// must advance the source pointer by the source stride. The source buffer
+    /// carries `0xEE` sentinel padding past row 16, so an (old, buggy)
+    /// wire-width advance stays in bounds but reads the padding — yielding a
+    /// clean mismatch instead of an OOB read.
+    #[test]
+    fn slice_rows_subrange_numpy_widening_matches_freshly_built_subchunk() {
+        use crate::ingress::column_sender::NumpyDtype;
+
+        let values: Vec<i32> = (0..16).map(|i| i * 1_000 + 7).collect();
+        let mut bytes: Vec<u8> = values.iter().flat_map(|v| v.to_le_bytes()).collect();
+        bytes.resize(16 * 8, 0xEE); // sentinel padding past the 16 real i32 rows
+        let ts: Vec<i64> = (0..16).collect();
+
+        let mut src = Chunk::new("trades");
+        unsafe {
+            src.push_numpy_deferred("v", NumpyDtype::I32WidenToI64, bytes.as_ptr(), 16, None)
+                .unwrap();
+        }
+        src.at_nanos(&ts).unwrap();
+        let view = unsafe { src.slice_rows(8, 8) };
+        let sliced = encode_fresh(&view);
+
+        let fresh_bytes: Vec<u8> = values[8..16].iter().flat_map(|v| v.to_le_bytes()).collect();
+        let mut fresh = Chunk::new("trades");
+        unsafe {
+            fresh
+                .push_numpy_deferred(
+                    "v",
+                    NumpyDtype::I32WidenToI64,
+                    fresh_bytes.as_ptr(),
+                    8,
+                    None,
+                )
                 .unwrap();
         }
         fresh.at_nanos(&ts[8..16]).unwrap();

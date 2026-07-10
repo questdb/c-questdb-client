@@ -334,9 +334,17 @@ pub(crate) enum ColumnKind {
     /// [`numpy_wire::emit_into_wire`]. `data` is caller-owned: lifetime
     /// must extend through the next flush / sync call. Validity (if
     /// any) lives in the enclosing [`ColumnDescriptor`].
+    ///
+    /// `src_stride` is the source element size in bytes
+    /// (`NumpyDtype::source_elem_size`), captured at construction. It is
+    /// how far `data` advances per row, which for the widening / ndarray
+    /// dtypes differs from the *wire* width (`bytes_per_row`); slicing
+    /// must use the source stride so the split tail reads the right rows
+    /// (and stays in bounds).
     NumpyDeferred {
         dtype: numpy_wire::NumpyDtype,
         data: *const u8,
+        src_stride: usize,
         row_count: usize,
     },
 }
@@ -506,10 +514,17 @@ impl ColumnKind {
                 ColumnKind::NumpyDeferred {
                     dtype,
                     data,
+                    src_stride,
                     row_count: _,
                 } => ColumnKind::NumpyDeferred {
                     dtype: *dtype,
-                    data: data.add(row_offset * dtype.bytes_per_row()),
+                    // Advance by the *source* element stride, not the wire
+                    // width: the two differ for the widening / ndarray dtypes,
+                    // and `data` points into the caller's numpy buffer (sized
+                    // `row_count * src_stride`). Using the wire width here
+                    // over-advances and reads past the buffer / wrong rows.
+                    data: data.add(row_offset * src_stride),
+                    src_stride: *src_stride,
                     row_count,
                 },
             }
@@ -1294,6 +1309,10 @@ impl<'a> Chunk<'a> {
             ));
         }
         dtype.validate()?;
+        // Captured once here (in this fallible path) so the infallible
+        // `slice_rows` can advance `data` by the source stride without
+        // re-running the fallible ndarray size math.
+        let src_stride = dtype.source_elem_size()?;
         let row_count = check_row_count(self.row_count, row_count, validity)?;
         let wire_type = dtype.wire_type();
         self.push_column(
@@ -1302,6 +1321,7 @@ impl<'a> Chunk<'a> {
             ColumnKind::NumpyDeferred {
                 dtype,
                 data,
+                src_stride,
                 row_count,
             },
             validity,
@@ -1778,5 +1798,64 @@ mod tests {
         chunk
             .symbol_i32("sym", &codes, &dict_offsets, b"alpha", Some(&v))
             .expect("null row's bogus code is ignored");
+    }
+
+    /// Regression: splitting a numpy chunk must advance the source pointer by
+    /// the *source* element stride, not the wire width. The two differ for the
+    /// widening / ndarray dtypes, so using the wire width over-advances and the
+    /// split tail would read past the buffer (OOB read) or the wrong rows
+    /// (silent wire corruption).
+    #[test]
+    fn numpy_split_advances_by_source_stride_not_wire_width() {
+        use numpy_wire::NumpyDtype;
+
+        // All widening, so the source stride is strictly smaller than the wire
+        // width — the combination that used to over-advance on a split.
+        let cases = [
+            NumpyDtype::I8WidenToI32,
+            NumpyDtype::U8WidenToI32,
+            NumpyDtype::I16WidenToI32,
+            NumpyDtype::I32WidenToI64,
+        ];
+        for (i, dtype) in cases.into_iter().enumerate() {
+            let expected_stride = dtype.source_elem_size().unwrap();
+            let wire = dtype.bytes_per_row();
+            assert!(
+                expected_stride < wire,
+                "case {i}: expected a widening dtype"
+            );
+            // Oversize so the (buggy) wire-stride advance also lands in bounds,
+            // giving a clean assertion instead of forming an OOB pointer.
+            let buf = vec![0u8; 16 * wire];
+            let mut chunk = Chunk::new("t");
+            unsafe {
+                chunk
+                    .push_numpy_deferred("a", dtype, buf.as_ptr(), 16, None)
+                    .unwrap();
+            }
+            // `row_offset` must be a multiple of 8; split off the tail 8 rows.
+            let sliced = unsafe { chunk.slice_rows(8, 8) };
+            match &sliced.columns[0].kind {
+                ColumnKind::NumpyDeferred {
+                    data, src_stride, ..
+                } => {
+                    assert_eq!(
+                        *src_stride, expected_stride,
+                        "case {i}: stored source stride is wrong"
+                    );
+                    let want = unsafe { buf.as_ptr().add(8 * expected_stride) };
+                    let buggy = unsafe { buf.as_ptr().add(8 * wire) };
+                    assert_eq!(
+                        *data, want,
+                        "case {i}: pointer not advanced by the source stride"
+                    );
+                    assert_ne!(
+                        *data, buggy,
+                        "case {i}: pointer advanced by the wire width (the bug)"
+                    );
+                }
+                _ => panic!("case {i}: expected a NumpyDeferred column"),
+            }
+        }
     }
 }
