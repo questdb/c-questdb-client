@@ -1,8 +1,8 @@
 /*
  * Out-of-process QWP egress (read-side) client driven by a line-oriented
  * stdin/stdout protocol, implemented against the c-questdb-client *C* FFI
- * reader binding (`include/questdb/egress/reader.h`, symbols behind the
- * `sync-reader-qwp-ws` ffi feature).
+ * reader binding (`include/questdb/egress/reader.h`, whose symbols are always
+ * compiled into the C ABI).
  *
  * Same wire protocol as the Rust `qwp_egress_sidecar`
  * (system_test/failover_clients/src/bin/qwp_egress_sidecar.rs) and the Java

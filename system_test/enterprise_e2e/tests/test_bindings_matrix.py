@@ -18,8 +18,8 @@ the paths correctly, mirroring the Rust originals:
   3. graceful in-place demotion underneath an actively-sending sender
      -- from ``test_demotion_mid_stream.py``.
   4. egress happy-path read with ``target=replica``
-     -- the reader C API (``include/questdb/egress/reader.h``, ffi feature
-     ``sync-reader-qwp-ws``) and the genuine C++ wrapper
+     -- the always-compiled reader C API
+     (``include/questdb/egress/reader.h``) and the genuine C++ wrapper
      (``reader.hpp``) driven via ``qwp_egress_c_sidecar`` /
      ``qwp_egress_cpp_sidecar``.
 

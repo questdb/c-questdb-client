@@ -455,6 +455,7 @@ impl Buffer {
         }
     }
 
+    #[cfg(feature = "_sync-sender")]
     pub(crate) fn as_ilp(&self) -> Option<&IlpBuffer> {
         match &self.inner {
             BufferInner::Ilp(inner) => Some(inner),
@@ -699,7 +700,7 @@ impl Buffer {
     }
 
     /// Validates that the buffer is ready to be flushed with
-    /// [`crate::ingress::Sender::flush`] or one of its variants.
+    /// `crate::ingress::Sender::flush` or one of its variants.
     ///
     /// Returns an error when the current API call sequence is incomplete, such
     /// as an unfinished row.

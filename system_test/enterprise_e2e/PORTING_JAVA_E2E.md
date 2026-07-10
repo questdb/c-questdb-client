@@ -387,9 +387,9 @@ scenarios via cmake-built sidecars). All ported duplicates live in
 - [x] `test_graceful_demotion_mid_stream_sender_survives` → C
 - [x] `test_graceful_demotion_mid_stream_sender_survives` → C++
 - [x] egress happy-path read with `target=replica` → C
-      (`qwp_egress_c_sidecar.c`: the `reader_*` C API behind the
-      `sync-reader-qwp-ws` ffi feature — verdict: the C API **does**
-      expose the reader, `include/questdb/egress/reader.h`)
+      (`qwp_egress_c_sidecar.c`: the always-compiled `reader_*` C API —
+      verdict: the C API **does** expose the reader,
+      `include/questdb/egress/reader.h`)
 - [x] egress happy-path read with `target=replica` → C++
       (`qwp_egress_cpp_sidecar.cpp`: the genuine `questdb::egress`
       C++ wrapper classes in `reader.hpp`)
@@ -445,10 +445,10 @@ C-FFI observability substitutions (same precedent as
 3. C/C++ sidecars: **no new ingress verbs needed** (CONNECT / SEND /
    FLUSH / AWAIT_ACKED / STATS / CLOSE sufficed); NEW egress sidecars
    added (`qwp_egress_c_sidecar.c`, `qwp_egress_cpp_sidecar.cpp`). The
-   shared `libquestdb_client` for native sidecars is now always built
-   with `--features sync-reader-qwp-ws` (additive `reader_*` symbols),
-   and the build helper resolves the platform library name (`.dylib`
-   on macOS, `.so` elsewhere — fixes local C/C++ runs on macOS).
+   shared `libquestdb_client` for native sidecars always includes the
+   `reader_*` symbols without a feature flag, and the build helper resolves
+   the platform library name (`.dylib` on macOS, `.so` elsewhere — fixes
+   local C/C++ runs on macOS).
 4. Rust sender multi-flush transaction semantics: **verified ABSENT**
    (explicit QWP/WS rejection in `sender.rs`; no `transaction` conf
    key; deferred-commit encoder is dead capability) — the 3 Group 1

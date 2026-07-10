@@ -83,7 +83,6 @@ use questdb::ffi_support::OwnedRowSender;
 mod ndarr;
 use ndarr::StrideArrayView;
 
-#[cfg(feature = "sync-reader-qwp-ws")]
 mod egress;
 
 pub mod column_sender;
@@ -225,14 +224,13 @@ macro_rules! upd_opts {
 
 /// An error that occurred when using the QuestDB client.
 ///
-/// This is the single, unified error object for both ingest and query;
-/// `reader_error` (egress) is a back-compat alias of it.
+/// This is the single, unified error object for both ingest and query; the
+/// egress reader spells it `reader_error`, backed by this same struct.
 pub struct line_sender_error {
     error: Error,
     qwp_ws_error: Option<QwpWsSenderError>,
 }
 
-#[cfg(feature = "sync-reader-qwp-ws")]
 impl line_sender_error {
     /// Wrap a [`questdb::Error`] as the FFI error object, with no QWP/WS
     /// sender diagnostic attached. Used by the reader (egress) entry points,
@@ -389,8 +387,8 @@ pub enum line_sender_error_code {
 }
 
 // The client error model is unified across ingest and query:
-// `line_sender_error_code` is the single C error enum. `reader_error_code`
-// (in the egress module) is a back-compat alias of it.
+// `line_sender_error_code` is the single C error enum. The egress module
+// spells the same enum `reader_error_code`.
 
 impl From<ErrorCode> for line_sender_error_code {
     fn from(code: ErrorCode) -> Self {
@@ -734,7 +732,6 @@ impl line_sender_utf8 {
     /// extract content from a `line_sender_utf8` are this method
     /// (always validates) and `as_str()` (trusted-caller-only, used by
     /// ingress where the inputs went through `line_sender_utf8_init`).
-    #[cfg(feature = "sync-reader-qwp-ws")]
     pub(crate) fn validated_utf8(&self) -> Result<&str, std::str::Utf8Error> {
         // Same NULL-guard as `as_str`: `slice::from_raw_parts` is UB on a
         // null pointer even with `len == 0`. Treat NULL+0 as the empty
@@ -5787,7 +5784,6 @@ mod tests {
         write_server_binary_frame(stream, &payload)
     }
 
-    #[cfg(feature = "sync-reader-qwp-ws")]
     fn write_server_info_frame(stream: &mut TcpStream) -> std::io::Result<()> {
         let mut payload = Vec::new();
         payload.push(0x18); // SERVER_INFO
@@ -5841,7 +5837,6 @@ mod tests {
                                     Ok(request) => request,
                                     Err(_) => return,
                                 };
-                                #[cfg(feature = "sync-reader-qwp-ws")]
                                 if _request.starts_with("GET /read/v1 ") {
                                     let _ = write_server_info_frame(&mut stream);
                                 }
@@ -5987,7 +5982,6 @@ mod tests {
         free_err(err);
     }
 
-    #[cfg(feature = "sync-reader-qwp-ws")]
     fn assert_reader_error_contains(
         err: &mut *mut egress::reader_error,
         code: egress::reader_error_code,
@@ -6554,7 +6548,6 @@ mod tests {
         }
     }
 
-    #[cfg(feature = "sync-reader-qwp-ws")]
     #[test]
     fn pooled_reader_rejects_prepare_after_db_close_and_closes_safely() {
         let server = PooledQwpMock::spawn(2);

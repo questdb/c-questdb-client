@@ -483,7 +483,7 @@ pub struct ReaderConfig {
     /// uses the OS default, which can hang for tens of seconds against a
     /// black-holed host that silently drops SYNs. When `> 0`, each dial is
     /// a `TcpStream::connect_timeout` bounded by this value (per resolved
-    /// address); exceeding it surfaces [`ErrorCode::ConnectTimeout`] and,
+    /// address); exceeding it surfaces [`crate::ErrorCode::ConnectTimeout`] and,
     /// under failover, advances to the next endpoint. Connect-string key:
     /// `connect_timeout`. Does NOT bound name resolution, the TLS
     /// handshake, the WS upgrade (see `auth_timeout_ms`), or the

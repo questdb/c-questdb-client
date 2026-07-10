@@ -44,6 +44,14 @@
 namespace questdb
 {
 
+// Forward declaration of the connection pool. `pool` lives in the top-level
+// `questdb` namespace — it is cross-cutting, handing out both write-side
+// senders and read-side readers — while the sender/error machinery lives in
+// `questdb::ingress`. Declared here so `ingress` classes can befriend
+// `::questdb::pool` and the egress reader can reference it, without its
+// definition (which lives in `column_sender.hpp`).
+class pool;
+
 /**
  * Category of error. Single, unified enum for the whole client: it spans both
  * ingest and query. Pinned to the C ABI enum `::line_sender_error_code`
@@ -373,7 +381,7 @@ private:
     friend class column_sender_view;
     friend class column_chunk;
     friend class arrow_import;
-    friend class pool;
+    friend class ::questdb::pool;
     friend class borrowed_column_sender;
     friend class borrowed_row_sender;
 

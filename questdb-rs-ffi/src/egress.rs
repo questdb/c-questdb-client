@@ -51,9 +51,10 @@ use crate::line_sender_utf8;
 // Error type
 // ---------------------------------------------------------------------------
 
-/// The egress reader shares the client's single unified error object and code
-/// enum. `reader_error` / `reader_error_code` are back-compat aliases of the
-/// canonical [`crate::line_sender_error`] / [`crate::line_sender_error_code`].
+/// The egress reader exposes its own error-type spelling, `reader_error` /
+/// `reader_error_code`, over the client's single unified error object and code
+/// enum ([`crate::line_sender_error`] / [`crate::line_sender_error_code`]): the
+/// underlying struct is shared, the reader just names it in reader terms.
 /// The one `From<ErrorCode>` that maps every category — ingest and query —
 /// lives in `lib.rs`, so there is a single source of truth for the C error
 /// codes.
@@ -126,7 +127,6 @@ unsafe fn write_err_box(err_out: *mut *mut reader_error, err: Error) {
 /// Wrap a pool-borrowed `Reader` + `ReaderPoolHandle` in a
 /// `reader` opaque so the rest of the egress FFI can treat
 /// it identically to a standalone reader.
-#[cfg(feature = "sync-reader-qwp-ws")]
 fn wrap_pooled_reader(reader: Reader, pool: questdb::ffi_support::ReaderPoolHandle) -> *mut reader {
     let stats = Arc::clone(reader.stats());
     Box::into_raw(Box::new(reader {
@@ -148,7 +148,6 @@ fn wrap_pooled_reader(reader: Reader, pool: questdb::ffi_support::ReaderPoolHand
 /// Useful when the cursor lifecycle detected a state that makes the
 /// reader unsafe to recycle (e.g. a cursor abandoned mid-stream,
 /// which causes the Rust `Cursor::Drop` to tear down the transport).
-#[cfg(feature = "sync-reader-qwp-ws")]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn reader_drop_on_return(reader: *mut reader) {
     if reader.is_null() {
@@ -3520,9 +3519,7 @@ unsafe fn column_view_or_err<'a>(
 // `reader_close`, which the ownership tag dispatches.
 // ===========================================================================
 
-#[cfg(feature = "sync-reader-qwp-ws")]
 use crate::column_sender::questdb_db;
-#[cfg(feature = "sync-reader-qwp-ws")]
 use questdb::QuestDb;
 
 /// Open a connection pool, reporting connect-time failures through the
@@ -3558,7 +3555,6 @@ use questdb::QuestDb;
 /// failures surface. Those errors are mapped from the ingress error
 /// category onto the closest `reader_error_code` (the diagnostic message is
 /// preserved verbatim).
-#[cfg(feature = "sync-reader-qwp-ws")]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn questdb_db_connect_reader(
     conf: *const c_char,
@@ -3619,7 +3615,6 @@ pub unsafe extern "C" fn questdb_db_connect_reader(
 /// failover all work the same. On `reader_close` the reader is
 /// returned to the pool (or dropped if `reader_drop_on_return` was called,
 /// or if the pool has been closed).
-#[cfg(feature = "sync-reader-qwp-ws")]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn questdb_db_borrow_reader(
     db: *mut questdb_db,
@@ -3659,7 +3654,6 @@ pub unsafe extern "C" fn questdb_db_borrow_reader(
 /// Accepts NULL `reader` and no-ops. `db` is ignored — the reader
 /// carries its own pool back-reference via its `ReaderOwnership::Pooled`
 /// variant — but kept in the ABI for symmetry with the borrow call.
-#[cfg(feature = "sync-reader-qwp-ws")]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn questdb_db_return_reader(_db: *mut questdb_db, reader: *mut reader) {
     if reader.is_null() {
@@ -3674,7 +3668,6 @@ pub unsafe extern "C" fn questdb_db_return_reader(_db: *mut questdb_db, reader: 
 /// Snapshot the number of currently-idle (cached) readers in the
 /// reader pool. Returns 0 for a NULL `db`. Diagnostics / test-only;
 /// not part of the supported API surface.
-#[cfg(feature = "sync-reader-qwp-ws")]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn questdb_db_dbg_reader_free_count(db: *mut questdb_db) -> usize {
     if db.is_null() {
@@ -3687,7 +3680,6 @@ pub unsafe extern "C" fn questdb_db_dbg_reader_free_count(db: *mut questdb_db) -
 /// Snapshot the number of currently-borrowed (in-use) readers.
 /// Returns 0 for a NULL `db`. Diagnostics / test-only; not part of
 /// the supported API surface.
-#[cfg(feature = "sync-reader-qwp-ws")]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn questdb_db_dbg_reader_in_use_count(db: *mut questdb_db) -> usize {
     if db.is_null() {

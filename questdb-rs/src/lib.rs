@@ -101,7 +101,7 @@ pub use db::BorrowedReader;
 #[doc(hidden)]
 pub use db::ffi_support;
 
-#[cfg(test)]
+#[cfg(all(test, any(feature = "_sender-qwp-udp", feature = "_sender-qwp-ws")))]
 mod alloc_counter {
     use std::alloc::{GlobalAlloc, Layout, System};
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -152,7 +152,7 @@ mod alloc_counter {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, any(feature = "_sender-qwp-udp", feature = "_sender-qwp-ws")))]
 #[global_allocator]
 static GLOBAL: alloc_counter::CountingAllocator = alloc_counter::CountingAllocator;
 

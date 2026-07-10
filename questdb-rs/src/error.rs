@@ -287,6 +287,7 @@ impl Error {
     /// [`Error::in_doubt`]. See `ColumnSender::flush` and the `FlushFailure`
     /// delivery classification.
     #[must_use]
+    #[cfg(feature = "sync-sender-qwp-ws")]
     pub(crate) fn with_in_doubt(mut self, in_doubt: bool) -> Self {
         self.0.in_doubt = in_doubt;
         self
@@ -441,6 +442,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "sync-sender-qwp-ws")]
     fn with_in_doubt_sets_and_preserves_code_and_msg() {
         let err =
             Error::new(ErrorCode::FailoverRetry, "mid-frame write failed").with_in_doubt(true);

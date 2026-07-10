@@ -120,7 +120,8 @@ extern "C" {
 /////////// Error handling (unified with the line sender).
 //
 // Ingest and query share ONE error object and ONE error-code enum. The
-// reader's error type and codes are back-compat aliases of the canonical
+// reader spells its error type and codes `reader_error` / `reader_error_code`,
+// backed by the canonical
 // `line_sender_error` / `line_sender_error_code` declared in
 // <questdb/ingress/line_sender.h> (already included above). The query codes
 // live at discriminants 20..34 of that enum; the shared codes reuse the
@@ -133,7 +134,7 @@ typedef line_sender_error reader_error;
 /** Category of error. Alias of the unified `line_sender_error_code`. */
 typedef line_sender_error_code reader_error_code;
 
-/* Back-compat names for the reader error codes — each maps onto its
+/* The reader's spelling of each error code — each maps onto its
  * canonical `line_sender_error_*` counterpart in the unified enum. */
 #define reader_error_could_not_resolve_addr line_sender_error_could_not_resolve_addr
 #define reader_error_config_error line_sender_error_config_error

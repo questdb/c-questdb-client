@@ -175,16 +175,18 @@ A selection of usage examples is available in the [examples directory](https://g
 The crate provides several optional features to enable additional functionality. You can enable features using Cargo's `--features` flag or in your `Cargo.toml`.
 
 ### Default features
-- **sync-sender**: Enables both `sync-sender-tcp` and `sync-sender-http`.
+- **sync-sender**: Enables `sync-sender-tcp`, `sync-sender-http` and `sync-sender-qwp-ws` (ingestion).
+- **sync-reader**: Enables `sync-reader-qwp-ws` and `sync-reader-zstd` (queries). Querying is first-class, on by default.
 - **sync-sender-tcp**: Enables ILP/TCP (legacy). Depends on the `socket2` crate.
 - **sync-sender-http**: Enables ILP/HTTP support. Depends on the `ureq` crate.
+- **sync-sender-qwp-ws**: Enables QWP/WebSocket ingestion (`QuestDb` pool, row and column senders).
+- **sync-reader-qwp-ws**: Enables QWP/WebSocket queries (`Reader` / `Cursor`).
+- **sync-reader-zstd**: Enables zstd decompression of query result batches.
 - **tls-webpki-certs**: Uses a snapshot of the [Common CA Database](https://www.ccadb.org/) as root TLS certificates. Depends on the `webpki-roots` crate.
 - **ring-crypto**: Uses the `ring` crate as the cryptography backend for TLS (default crypto backend).
 
 ### Optional features
 
-- **sync-sender-qwp-ws**: Enables QWP/WebSocket ingestion (`QuestDb` pool, row and column senders).
-- **sync-reader-qwp-ws**: Enables QWP/WebSocket queries (`Reader` / `Cursor`).
 - **arrow**: Apache Arrow integration in both directions — ingest `RecordBatch`es, read query results as `RecordBatch`es. Also available as the single-direction `arrow-ingress` / `arrow-egress` features.
 - **polars**: Polars integration in both directions — ingest `DataFrame`s, read query results as `DataFrame`s. Also available as `polars-ingress` / `polars-egress`.
 - **chrono-timestamp**: Allows specifying timestamps as `chrono::DateTime` objects. Depends on the `chrono` crate.

@@ -22,15 +22,25 @@
  *
  ******************************************************************************/
 
-#![doc = include_str!("ingress/mod.md")]
+#![cfg_attr(feature = "_sync-sender", doc = include_str!("ingress/mod.md"))]
+#![cfg_attr(
+    not(feature = "_sync-sender"),
+    doc = "Shared data types used by the egress reader. Enable a `sync-sender-*` \
+           feature to expose the sender APIs and their full module documentation."
+)]
 
 #[cfg(feature = "_sender-qwp-ws")]
 pub(crate) use self::conf::QwpWsManagedSlotExclusion;
 pub use self::ndarr::{ArrayElement, NdArrayView};
 pub use self::timestamp::*;
-use crate::error::{self, Result, fmt};
+use crate::error::Result;
+#[cfg(feature = "_sync-sender")]
+use crate::error::{self, fmt};
+#[cfg(feature = "_sync-sender")]
 use crate::ingress::conf::ConfigSetting;
+#[cfg(feature = "_sync-sender")]
 use core::time::Duration;
+#[cfg(feature = "_sync-sender")]
 use std::collections::HashMap;
 #[cfg(feature = "_sender-qwp-ws")]
 use std::collections::HashSet;
@@ -38,10 +48,16 @@ use std::collections::HashSet;
 use std::fmt::Write;
 use std::fmt::{Debug, Display, Formatter};
 
+#[cfg(feature = "_sync-sender")]
 use std::ops::Deref;
-use std::path::{Path, PathBuf};
+#[cfg(feature = "_sender-qwp-ws")]
+use std::path::Path;
+#[cfg(feature = "_sync-sender")]
+use std::path::PathBuf;
+#[cfg(feature = "_sync-sender")]
 use std::str::FromStr;
 
+#[cfg(feature = "_sync-sender")]
 mod tls;
 
 #[cfg(all(feature = "_sender-tcp", feature = "aws-lc-crypto"))]
@@ -53,6 +69,7 @@ use ring::{
     signature::{ECDSA_P256_SHA256_FIXED_SIGNING, EcdsaKeyPair},
 };
 
+#[cfg(feature = "_sync-sender")]
 mod conf;
 
 pub(crate) mod ndarr;
@@ -62,13 +79,15 @@ mod timestamp;
 mod buffer;
 pub use buffer::*;
 
+#[cfg(feature = "_sync-sender")]
 pub(crate) mod sender;
 #[cfg(feature = "_sender-qwp-ws")]
 pub(crate) use sender::QwpWsRoleReject;
-#[cfg(any(feature = "polars-ingress", feature = "polars-egress"))]
+#[cfg(feature = "polars-ingress")]
 pub(crate) use sender::ReconnectPolicy;
 #[cfg(feature = "sync-sender-qwp-ws")]
 pub(crate) use sender::ReconnectReason;
+#[cfg(feature = "_sync-sender")]
 pub use sender::*;
 #[cfg(feature = "sync-sender-qwp-ws")]
 pub(crate) use sender::{reconnect_backoff_step, reconnect_error_is_terminal};
@@ -205,26 +224,31 @@ pub enum CertificateAuthority {
 /// // Assuming the service name is registered.
 /// let service: Port = "qdb_ilp".into();  // or with a String too.
 /// ```
+#[cfg(feature = "_sync-sender")]
 pub struct Port(String);
 
+#[cfg(feature = "_sync-sender")]
 impl From<String> for Port {
     fn from(s: String) -> Self {
         Port(s)
     }
 }
 
+#[cfg(feature = "_sync-sender")]
 impl From<&str> for Port {
     fn from(s: &str) -> Self {
         Port(s.to_owned())
     }
 }
 
+#[cfg(feature = "_sync-sender")]
 impl From<u16> for Port {
     fn from(p: u16) -> Self {
         Port(p.to_string())
     }
 }
 
+#[cfg(feature = "_sync-sender")]
 fn validate_auto_flush_params(params: &HashMap<String, String>) -> Result<()> {
     if let Some(auto_flush) = params.get("auto_flush")
         && auto_flush.as_str() != "off"
@@ -255,6 +279,7 @@ fn validate_auto_flush_params(params: &HashMap<String, String>) -> Result<()> {
 /// ILP/HTTP, QWP/UDP, and QWP/WS, and is expected to grow).
 #[derive(PartialEq, Debug, Clone, Copy)]
 #[non_exhaustive]
+#[cfg(feature = "_sync-sender")]
 pub enum Protocol {
     #[cfg(feature = "_sender-tcp")]
     /// ILP over TCP (streaming).
@@ -286,15 +311,17 @@ pub enum Protocol {
     QwpWss,
 }
 
+#[cfg(feature = "_sync-sender")]
 impl Display for Protocol {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::result::Result<(), std::fmt::Error> {
         f.write_str(self.schema())
     }
 }
 
+#[cfg(feature = "_sync-sender")]
 impl Protocol {
     fn default_port(&self) -> &str {
-        match self {
+        match *self {
             #[cfg(feature = "_sender-tcp")]
             Protocol::Tcp | Protocol::Tcps => "9009",
             #[cfg(feature = "_sender-http")]
@@ -307,7 +334,7 @@ impl Protocol {
     }
 
     fn tls_enabled(&self) -> bool {
-        match self {
+        match *self {
             #[cfg(feature = "_sender-tcp")]
             Protocol::Tcp => false,
             #[cfg(feature = "_sender-tcp")]
@@ -378,7 +405,7 @@ impl Protocol {
     }
 
     fn schema(&self) -> &str {
-        match self {
+        match *self {
             #[cfg(feature = "_sender-tcp")]
             Protocol::Tcp => "tcp",
             #[cfg(feature = "_sender-tcp")]
@@ -818,6 +845,7 @@ fn parse_qwp_ws_endpoints(
 /// # }
 /// ```
 #[derive(Debug, Clone)]
+#[cfg(feature = "_sync-sender")]
 pub struct SenderBuilder {
     protocol: Protocol,
     host: ConfigSetting<String>,
@@ -864,6 +892,7 @@ pub struct SenderBuilder {
     qwp_ws_error_handler: QwpWsErrorHandler,
 }
 
+#[cfg(feature = "_sync-sender")]
 impl SenderBuilder {
     /// Create a new `SenderBuilder` instance from the configuration string.
     ///
@@ -2877,6 +2906,7 @@ impl SenderBuilder {
 
 /// When parsing from config, we exclude certain characters.
 /// Here we repeat the same validation logic for consistency.
+#[cfg(feature = "_sync-sender")]
 fn validate_value<T: AsRef<str>>(value: T) -> Result<T> {
     let str_ref = value.as_ref();
     for (p, c) in str_ref.chars().enumerate() {
@@ -2890,6 +2920,7 @@ fn validate_value<T: AsRef<str>>(value: T) -> Result<T> {
     Ok(value)
 }
 
+#[cfg(feature = "_sync-sender")]
 fn parse_conf_value<T>(param_name: &str, str_value: &str) -> Result<T>
 where
     T: FromStr,
@@ -3145,5 +3176,5 @@ impl Debug for DebugBytes<'_> {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "_sync-sender"))]
 mod tests;

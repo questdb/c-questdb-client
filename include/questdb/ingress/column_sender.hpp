@@ -1006,9 +1006,6 @@ private:
     ::column_sender* _raw;
 };
 
-/** Forward decl. */
-class pool;
-
 /**
  * RAII guard for a borrowed store-and-forward column sender. On destruction the
  * sender is returned to the pool (or dropped if `drop_on_return()` was called,
@@ -1259,7 +1256,7 @@ public:
     void drop_on_return() noexcept { _force_drop = true; }
 
 private:
-    friend class pool;
+    friend class ::questdb::pool;
 
     borrowed_column_sender(::questdb_db* db, ::column_sender* raw) noexcept
         : _db{db}
@@ -1531,7 +1528,7 @@ public:
     void drop_on_return() noexcept { _force_drop = true; }
 
 private:
-    friend class pool;
+    friend class ::questdb::pool;
 
     borrowed_row_sender(::questdb_db* db, ::row_sender* raw) noexcept
         : _db{db}
@@ -1565,6 +1562,10 @@ private:
     }
 };
 
+} // namespace questdb::ingress
+
+namespace questdb
+{
 /**
  * RAII wrapper around `::questdb_db*` — the QWP/WS connection pool.
  *
@@ -1592,7 +1593,7 @@ class pool
 public:
     explicit pool(std::string_view conf)
     {
-        _raw = line_sender_error::wrapped_call(
+        _raw = ingress::line_sender_error::wrapped_call(
             ::questdb_db_connect, conf.data(), conf.size());
     }
 
@@ -1625,11 +1626,11 @@ public:
      * up to `close_flush_timeout` (default 5s) while an in-flight close
      * releases its lock; otherwise throws on cap exhaustion or transport
      * failure. */
-    borrowed_column_sender borrow_column_sender()
+    ingress::borrowed_column_sender borrow_column_sender()
     {
-        auto* raw = line_sender_error::wrapped_call(
+        auto* raw = ingress::line_sender_error::wrapped_call(
             ::questdb_db_borrow_column_sender, _raw);
-        return borrowed_column_sender{_raw, raw};
+        return ingress::borrowed_column_sender{_raw, raw};
     }
 
     /**
@@ -1639,11 +1640,12 @@ public:
      * your tracked remaining budget). Throws on a terminal error or budget
      * exhaustion.
      */
-    borrowed_column_sender borrow_column_sender_with_retry(uint64_t budget_ms)
+    ingress::borrowed_column_sender borrow_column_sender_with_retry(
+        uint64_t budget_ms)
     {
-        auto* raw = line_sender_error::wrapped_call(
+        auto* raw = ingress::line_sender_error::wrapped_call(
             ::questdb_db_borrow_column_sender_with_retry, _raw, budget_ms);
-        return borrowed_column_sender{_raw, raw};
+        return ingress::borrowed_column_sender{_raw, raw};
     }
 
     /**
@@ -1658,11 +1660,11 @@ public:
      * through the returned guard. Otherwise throws on cap exhaustion or
      * transport failure.
      */
-    borrowed_row_sender borrow_row_sender()
+    ingress::borrowed_row_sender borrow_row_sender()
     {
-        auto* raw = line_sender_error::wrapped_call(
+        auto* raw = ingress::line_sender_error::wrapped_call(
             ::questdb_db_borrow_row_sender, _raw);
-        return borrowed_row_sender{_raw, raw};
+        return ingress::borrowed_row_sender{_raw, raw};
     }
 
     /**
@@ -1670,11 +1672,11 @@ public:
      * using the pool's reconnect backoff. Throws on a terminal error or
      * budget exhaustion.
      */
-    borrowed_row_sender borrow_row_sender_with_retry(uint64_t budget_ms)
+    ingress::borrowed_row_sender borrow_row_sender_with_retry(uint64_t budget_ms)
     {
-        auto* raw = line_sender_error::wrapped_call(
+        auto* raw = ingress::line_sender_error::wrapped_call(
             ::questdb_db_borrow_row_sender_with_retry, _raw, budget_ms);
-        return borrowed_row_sender{_raw, raw};
+        return ingress::borrowed_row_sender{_raw, raw};
     }
 
     /**
@@ -1731,15 +1733,4 @@ private:
     ::questdb_db* _raw{nullptr};
 };
 
-} // namespace questdb::ingress
-
-namespace questdb
-{
-// `questdb::pool` is the canonical, top-level spelling of the connection
-// pool. The pool is cross-cutting — it hands out write-side senders
-// (`borrow_column_sender`) and read-side query readers (`borrow_reader`) — so it
-// belongs at the top-level `questdb` namespace rather than under `ingress`.
-// This re-export is the C++ analogue of the Rust `questdb::QuestDb`
-// re-export; `questdb::ingress::pool` remains valid for back-compat.
-using ingress::pool;
 } // namespace questdb

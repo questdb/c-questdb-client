@@ -38,7 +38,7 @@
 #include <utility>
 
 #include "../ingress/line_sender_core.hpp" // utf8_view
-#include "../ingress/column_sender.hpp" // questdb::ingress::pool (borrow_reader)
+#include "../ingress/column_sender.hpp" // questdb::pool (borrow_reader)
 
 namespace questdb::egress
 {
@@ -597,7 +597,7 @@ public:
 #ifdef QUESTDB_READER_INTERNAL_CONSTRUCTORS
     // Internal / test-only standalone constructors. NOT part of the
     // supported public API: obtain a reader from the pool via
-    // `questdb::ingress::pool::borrow_reader()`. Visible only when
+    // `questdb::pool::borrow_reader()`. Visible only when
     // `QUESTDB_READER_INTERNAL_CONSTRUCTORS` is defined (the in-tree
     // test-suite / example programs). See `reader.h` for the rationale.
     /**
@@ -772,7 +772,7 @@ private:
     explicit reader(::reader* impl) noexcept : _impl{impl} {}
 
     /// Borrow a pooled reader from a `questdb_db` pool. Backs
-    /// `questdb::ingress::pool::borrow_reader`. The returned reader is
+    /// `questdb::pool::borrow_reader`. The returned reader is
     /// equivalent to a standalone one; on destruction `reader_close`
     /// returns it to the pool (or drops it if `drop_on_return()` was called
     /// or the pool has been closed). Preparing a new query after pool close
@@ -799,7 +799,7 @@ private:
     ::reader* _impl;
     friend class cursor;
     friend class ::questdb::egress::query;
-    friend class ::questdb::ingress::pool;
+    friend class ::questdb::pool;
 };
 
 /**
@@ -2733,7 +2733,7 @@ inline cursor query::execute()
 
 } // namespace questdb::egress
 
-namespace questdb::ingress
+namespace questdb
 {
 /**
  * Out-of-line definition of `pool::borrow_reader` (declared in
@@ -2746,4 +2746,4 @@ inline ::questdb::egress::reader pool::borrow_reader()
 {
     return ::questdb::egress::reader::borrow_from_pool(_raw);
 }
-} // namespace questdb::ingress
+} // namespace questdb
