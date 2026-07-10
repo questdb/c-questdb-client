@@ -369,7 +369,10 @@ Only after the 4 headline numbers exist.
   in `examples/qwp_{ingress,egress}_polars.rs`, sharing one parity contract
   (column layout, DDL, value generators) via `examples/bench_schema/mod.rs` so
   both clients put byte-identical column data on the wire. The high-card delta-dict
-  overflows the 1m default — run the server with `http.receive.buffer.size=16M`.
+  overflows the server's **2 MiB** default receive buffer — run the server with
+  `http.recv.buffer.size=16M` (`QDB_HTTP_RECV_BUFFER_SIZE`; the older
+  `http.receive.buffer.size` spelling is deprecated but still honored —
+  `PropServerConfiguration.java:1375,3389`).
   Headline 10M parity numbers feed the existing §7 aggregator (`schema` field
   already carried per-path).
 - **DataFrame-specific knobs (cheap):** output-backend matrix (numpy / pyarrow /
@@ -386,7 +389,10 @@ Each gated on a prior number implicating it: zstd (raw vs `sync-reader-zstd`);
 TLS (`wss`); ack-level (`Ok` vs `Durable`, Enterprise); pooled-vs-per-call;
 **concurrency** — N pooled senders / one frame in flight each
 (`COLUMN_SENDER_PLAN.md` parallelism model; the Go "single-stream is
-pipeline-coupling-bound" missing axis).
+pipeline-coupling-bound" missing axis); **network** — real-network
+reproduction on AWS (channel bandwidth × RTT × server receive-buffer config),
+gated by the standing "can clients even utilize 1 Gbps?" concern →
+[`QWP_NETWORK_BENCH_PLAN.md`](./QWP_NETWORK_BENCH_PLAN.md) + `doc/net_bench/`.
 
 ## 10. Step 7 — Soak  *[summary]*
 
