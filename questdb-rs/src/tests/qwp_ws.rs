@@ -2290,21 +2290,20 @@ fn spawn_orphan_capture_first_frame_server() -> (u16, mpsc::Receiver<Vec<u8>>) {
 }
 
 #[test]
-fn qwp_ws_orphan_drain_with_zero_extended_side_file_falls_back_to_dense() {
-    // Regression for the orphan-drain seed-validation asymmetry: the orphan
-    // replay path builds no producer `SymbolGlobalDict`, so it must run the same
-    // duplicate/torn-tail validation the foreground recovery paths do before
-    // arming delta. A host/power crash can zero-extend a delta slot's
-    // `.symbol-dict` into a run of empty `[len=0]` entries that inflate the
-    // recovered count; seeding the driver mirror with that inflated count would
-    // slacken the torn-dict guard and emit a catch-up that re-registers phantom
-    // empty symbols on the fresh server (silent corruption). The drainer must
-    // instead fall back to dense (self-sufficient) replay.
+fn qwp_ws_orphan_drain_heals_a_zero_extended_side_file_and_replays_via_delta() {
+    // A host/power crash can zero-extend a delta slot's `.symbol-dict`. With the
+    // per-record CRC (see `qwp_ws_sfa_symbol_dict`), those trailing zeros cannot
+    // form a valid record, so `open` heals them at recovery and the recovered
+    // dictionary is exactly the real symbols -- never inflated with phantom
+    // `[len=0]` entries (the pre-CRC hazard this test used to exercise). The orphan
+    // drainer therefore arms delta on the CLEAN recovered dictionary and
+    // re-registers the real symbol via a table-less catch-up frame before replaying
+    // the DATA frame, and the slot stays recoverable.
     //
-    // Observable: the orphan's FIRST sent frame is the DATA frame
-    // (`table_count >= 1`), not a table-less catch-up (`table_count == 0`).
-    // Without the validation gate the orphan would arm delta on the inflated
-    // dictionary and send the phantom catch-up first, failing this assertion.
+    // Observable: the orphan's FIRST sent frame is the table-less catch-up
+    // (`table_count == 0`) that re-registers the one real recovered symbol. (Before
+    // the CRC, the zero tail inflated the count and the drainer fell back to dense,
+    // sending the DATA frame first with `table_count >= 1`.)
     let sf_dir = tempfile::TempDir::new().unwrap();
     seed_orphan_slot(sf_dir.path());
 
@@ -2349,16 +2348,16 @@ fn qwp_ws_orphan_drain_with_zero_extended_side_file_falls_back_to_dense() {
         &frame[..frame.len().min(12)]
     );
     let table_count = u16::from_le_bytes([frame[6], frame[7]]);
-    assert!(
-        table_count >= 1,
-        "a corrupt-dict orphan must fall back to dense and replay the DATA frame \
-         first (table_count >= 1); a table-less catch-up (table_count == 0) means \
-         the inflated dictionary was seeded and phantom empty symbols were \
-         re-registered on the server. table_count = {table_count}"
+    assert_eq!(
+        table_count, 0,
+        "the zero tail is healed at open, so the orphan arms delta on the clean \
+         recovered dictionary and re-registers the real symbol via a table-less \
+         catch-up first (table_count == 0); a DATA frame first (table_count >= 1) \
+         would mean it fell back to dense. table_count = {table_count}"
     );
     assert!(
         !sf_dir.path().join("orphan").join(".failed").exists(),
-        "a dense-fallback drain must keep the slot recoverable, not fail it"
+        "healing a zero tail must keep the slot recoverable, not fail it"
     );
 }
 

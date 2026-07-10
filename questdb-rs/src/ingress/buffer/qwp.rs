@@ -5258,9 +5258,26 @@ impl SymbolGlobalDict {
         self.entries.get(index).map(|a| a.as_ref())
     }
 
-    /// Returns `(global_id, is_new)`. Errors with `InvalidApiCall` if
-    /// the dictionary has reached [`MAX_CONN_SYMBOL_DICT_SIZE`].
+    /// Returns `(global_id, is_new)`. Errors with `InvalidApiCall` if the symbol
+    /// exceeds [`MAX_PERSISTED_SYMBOL_ENTRY_LEN`] or the dictionary has reached
+    /// [`MAX_CONN_SYMBOL_DICT_SIZE`].
     pub(crate) fn intern(&mut self, bytes: &[u8]) -> crate::Result<(u64, bool)> {
+        // A symbol larger than the persisted side-file's per-entry cap would be
+        // interned, used in a frame and ACKed, then rejected as torn by the
+        // side-file reader on recovery (`open_existing` and `SymbolGlobalDict::seed`
+        // both cap entries at MAX_PERSISTED_SYMBOL_ENTRY_LEN), leaving a dependent
+        // queued frame unreplayable. Enforce the reader's bound here, at the single
+        // ingestion choke point, so an oversized symbol never gets an id or is
+        // written ahead -- writer and reader stay in lockstep.
+        if bytes.len() as u64 > MAX_PERSISTED_SYMBOL_ENTRY_LEN {
+            return Err(crate::error::fmt!(
+                InvalidApiCall,
+                "QWP/WS symbol value is {} bytes, exceeding the {}-byte per-symbol \
+                 maximum",
+                bytes.len(),
+                MAX_PERSISTED_SYMBOL_ENTRY_LEN
+            ));
+        }
         if let Some(&id) = self.map.get(bytes) {
             return Ok((id, false));
         }
@@ -6948,11 +6965,14 @@ pub(crate) fn decode_qwp_varint(buf: &[u8], pos: usize) -> Option<(u64, usize)> 
     None
 }
 
-/// Cap on a persisted symbol entry's length, mirroring the side-file reader's
-/// `qwp_ws_sfa_symbol_dict::MAX_ENTRY_LEN` so [`SymbolGlobalDict::seed`] rejects the
-/// same corrupt lengths the side-file reader does. A longer length is corrupt.
+/// Cap on a single symbol entry's length, shared by ingestion
+/// ([`SymbolGlobalDict::intern`]), recovery validation ([`SymbolGlobalDict::seed`]),
+/// and the persisted side-file reader/writer (`qwp_ws_sfa_symbol_dict`) so all
+/// three enforce one bound and cannot diverge (a symbol the writer accepts but the
+/// reader rejects would leave a queued frame unreplayable). Mirrors the Java
+/// client's `MAX_ENTRY_LEN`; a longer symbol is rejected at ingestion.
 #[cfg(feature = "_sender-qwp-ws")]
-const MAX_PERSISTED_SYMBOL_ENTRY_LEN: u64 = 1 << 20;
+pub(crate) const MAX_PERSISTED_SYMBOL_ENTRY_LEN: u64 = 1 << 20;
 
 fn write_qwp_bytes(out: &mut Vec<u8>, bytes: &[u8]) {
     write_qwp_varint(out, bytes.len() as u64);
@@ -9288,6 +9308,27 @@ mod tests {
         assert!(!is_new);
         assert_eq!(id_a, 0);
         assert_eq!(dict.len(), 3);
+    }
+
+    #[cfg(feature = "_sender-qwp-ws")]
+    #[test]
+    fn symbol_dict_intern_rejects_symbols_above_the_persisted_entry_cap() {
+        // A symbol larger than the persisted side-file's per-entry cap must be
+        // rejected at ingestion (writer == reader), so it never gets an id, is
+        // written ahead, or is ACKed -- otherwise the side-file reader would reject
+        // it as torn on recovery and strand a dependent queued frame.
+        let mut dict = SymbolGlobalDict::new();
+        let max = MAX_PERSISTED_SYMBOL_ENTRY_LEN as usize;
+
+        // Exactly at the cap is accepted (writer and reader both allow `==`).
+        let at_cap = vec![b'a'; max];
+        assert!(dict.intern(&at_cap).unwrap().1);
+
+        // One byte over is rejected with InvalidApiCall.
+        let over = vec![b'b'; max + 1];
+        let err = dict.intern(&over).unwrap_err();
+        assert_eq!(err.code(), ErrorCode::InvalidApiCall);
+        assert!(err.msg().contains("exceeding"), "{}", err.msg());
     }
 
     #[cfg(feature = "_sender-qwp-ws")]

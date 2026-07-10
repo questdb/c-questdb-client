@@ -1941,13 +1941,22 @@ fn store_and_forward_file_mode_writes_symbols_ahead_to_side_file() {
     append_one_symbol_row(&mut second, b"bravo", &[2_i64]);
     sender.flush(&mut second).unwrap();
 
-    // Header (8 bytes) + [len=5]"alpha" + [len=5]"bravo": the write-ahead persisted
-    // both symbols, in ascending id order, exactly as a delta section carries them.
+    // The write-ahead persisted both symbols, in ascending id order, each in its
+    // own CRC-committed record. Assert format-agnostically (each record's payload
+    // carries the `[len]"symbol"` entry) that both are present and alpha precedes
+    // bravo, rather than hardcoding the framing/CRC bytes.
     let side_file = dir.path().join("recov").join(".symbol-dict");
     let bytes = std::fs::read(&side_file).expect("side-file must exist after file-mode flushes");
-    assert_eq!(
-        &bytes[8..],
-        b"\x05alpha\x05bravo",
+    let alpha_pos = bytes
+        .windows(6)
+        .position(|w| w == b"\x05alpha")
+        .expect("alpha persisted");
+    let bravo_pos = bytes
+        .windows(6)
+        .position(|w| w == b"\x05bravo")
+        .expect("bravo persisted");
+    assert!(
+        alpha_pos < bravo_pos,
         "write-ahead must persist both symbols in id order"
     );
 }
@@ -2017,16 +2026,17 @@ fn store_and_forward_file_mode_recovers_and_replays_queued_frame_after_reopen() 
 }
 
 #[test]
-fn store_and_forward_file_mode_torn_dictionary_fails_terminal_and_keeps_data() {
-    // `new_store_and_forward` Err teardown + the terminal error taxonomy: a
-    // file-mode column slot whose persisted `.symbol-dict` was torn by a
-    // host/power crash (a zero-extended tail) must fail the borrow LOUDLY and
-    // TERMINALLY -- `ErrorCode::StoreResendRequired`, a code distinct from a
-    // transient `SocketError` so a caller can tell "resend from source" apart from
-    // "reconnect and retry" -- and must leave the queued segments on disk
-    // (recoverable), never delete or poison them on this borrow. It also pins that
-    // the failing borrow returns a clean Err (no hang, no panic-abort under FFI).
-    use std::io::Write;
+fn store_and_forward_file_mode_value_corruption_is_healed_and_segment_kept() {
+    // Issue-4 end-to-end: a same-length VALUE corruption in the persisted
+    // `.symbol-dict` -- a host/power-crash bit-flip that keeps a record's length
+    // but changes a symbol byte -- must be caught by the per-record CRC on
+    // recovery and NOT silently recovered as the wrong symbol. The CRC-failed
+    // record is dropped (healed) at open, so the corrupt symbol never reaches the
+    // dictionary, and the queued segment stays on disk (recoverable). (A recovered
+    // mid-stream delta that DEPENDS on a dropped id then fails loudly at the send
+    // loop's torn-dict guard -- `StoreResendRequired` -- covered by the driver- and
+    // dict-level unit tests.)
+    use crate::ingress::sender::qwp_ws_sfa_symbol_dict::PersistedSymbolDict;
 
     let dir = TempDir::new().unwrap();
 
@@ -2047,48 +2057,39 @@ fn store_and_forward_file_mode_torn_dictionary_fails_terminal_and_keeps_data() {
         drop(db);
     }
 
-    // A host/power crash zero-extends the side-file: the unflushed tail pages read
-    // back as zeros, which parse as a run of empty `[len=0]` entries -- a torn
-    // dictionary the producer recovery seed rejects.
-    let side_file = dir.path().join("recov").join(".symbol-dict");
+    // A host/power crash flips a byte of the persisted symbol, keeping its length.
+    let slot_dir = dir.path().join("recov");
+    let side_file = slot_dir.join(".symbol-dict");
     {
-        let mut f = std::fs::OpenOptions::new()
-            .append(true)
-            .open(&side_file)
-            .expect("phase 1 must have written a delta-mode side-file");
-        f.write_all(&[0u8; 4]).unwrap();
+        let mut bytes =
+            std::fs::read(&side_file).expect("phase 1 must have written a delta-mode side-file");
+        let idx = bytes
+            .windows(5)
+            .position(|w| w == b"alpha")
+            .expect("alpha payload present");
+        bytes[idx] = b'X'; // same length ("Xlpha"), different value
+        std::fs::write(&side_file, &bytes).unwrap();
     }
 
-    // Phase 2: reopen the SAME slot. Seeding the producer dictionary from the
-    // recovered (now torn) region must fail terminally at connect or borrow.
-    let dead = MockServer::spawn_upgrade_then_close(1);
-    let conf = conf_for_endpoints(
-        &[dead.port()],
-        &sf_disk_extras(&dir, "pool_reap=manual;sender_id=recov;"),
-    );
-    let err = match QuestDb::connect(&conf) {
-        Ok(db) => db
-            .borrow_column_sender()
-            .expect_err("a torn recovered dictionary must fail the borrow, not silently proceed"),
-        Err(e) => e,
-    };
-    assert_eq!(
-        err.code(),
-        ErrorCode::StoreResendRequired,
-        "a torn recovered dict must be terminal resend-required, not a transient \
-         SocketError the reconnect loop would retry: {}",
-        err.msg()
+    // Recovery: the record's CRC now fails, so `open` heals it -- the corrupt
+    // symbol is NOT recovered (the recovered dictionary is empty, never "Xlpha").
+    let recovered = PersistedSymbolDict::open(&slot_dir).unwrap();
+    assert!(
+        recovered.read_loaded_symbols().is_empty(),
+        "a CRC-failed record must be dropped on recovery, never recovered as the \
+         corrupted symbol; got {:?}",
+        recovered.read_loaded_symbols()
     );
 
-    // The queued data must stay recoverable on disk: a terminal resend-required
-    // failure records the error, it does not delete or poison the slot's segments.
-    let segment_survives = std::fs::read_dir(dir.path().join("recov"))
+    // The queued frame's segment must stay on disk (recoverable), never deleted by
+    // the corrupt-dict recovery.
+    let segment_survives = std::fs::read_dir(&slot_dir)
         .unwrap()
         .filter_map(Result::ok)
         .any(|e| e.path().extension().is_some_and(|ext| ext == "sfa"));
     assert!(
         segment_survives,
-        "the queued frame's segment must survive a terminal borrow (recoverable)"
+        "the queued frame's segment must survive corrupt-dict recovery (recoverable)"
     );
 }
 
