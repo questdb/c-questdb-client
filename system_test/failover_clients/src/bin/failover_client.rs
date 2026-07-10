@@ -31,7 +31,7 @@
 use std::io::{BufRead, Write};
 use std::sync::{Arc, Mutex};
 
-use questdb::egress::{FailoverResetEvent, FailoverPhase, FailoverProgressEvent, Reader};
+use questdb::egress::{FailoverPhase, FailoverProgressEvent, FailoverResetEvent, Reader};
 
 /// Initial byte-credit window. The server pauses streaming after this
 /// budget is exhausted, modulo the row floor (one extra batch
