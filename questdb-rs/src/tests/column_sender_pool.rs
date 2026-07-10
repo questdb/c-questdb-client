@@ -1943,7 +1943,9 @@ fn store_and_forward_file_mode_writes_symbols_ahead_to_side_file() {
 
     // Header (8 bytes) + [len=5]"alpha" + [len=5]"bravo": the write-ahead persisted
     // both symbols, in ascending id order, exactly as a delta section carries them.
-    let side_file = dir.path().join("recov").join(".symbol-dict");
+    // The pool mints a kind-scoped slot per borrowed column sender, so the first
+    // one lives under `<sender_id>-col-0`, not the bare `sender_id`.
+    let side_file = dir.path().join("recov-col-0").join(".symbol-dict");
     let bytes = std::fs::read(&side_file).expect("side-file must exist after file-mode flushes");
     assert_eq!(
         &bytes[8..],
@@ -2049,8 +2051,10 @@ fn store_and_forward_file_mode_torn_dictionary_fails_terminal_and_keeps_data() {
 
     // A host/power crash zero-extends the side-file: the unflushed tail pages read
     // back as zeros, which parse as a run of empty `[len=0]` entries -- a torn
-    // dictionary the producer recovery seed rejects.
-    let side_file = dir.path().join("recov").join(".symbol-dict");
+    // dictionary the producer recovery seed rejects. The pool mints a kind-scoped
+    // slot per borrowed column sender, so the first one lives under
+    // `<sender_id>-col-0`, not the bare `sender_id`.
+    let side_file = dir.path().join("recov-col-0").join(".symbol-dict");
     {
         let mut f = std::fs::OpenOptions::new()
             .append(true)
@@ -2082,7 +2086,7 @@ fn store_and_forward_file_mode_torn_dictionary_fails_terminal_and_keeps_data() {
 
     // The queued data must stay recoverable on disk: a terminal resend-required
     // failure records the error, it does not delete or poison the slot's segments.
-    let segment_survives = std::fs::read_dir(dir.path().join("recov"))
+    let segment_survives = std::fs::read_dir(dir.path().join("recov-col-0"))
         .unwrap()
         .filter_map(Result::ok)
         .any(|e| e.path().extension().is_some_and(|ext| ext == "sfa"));
@@ -4516,8 +4520,10 @@ fn store_and_forward_file_mode_arrow_symbol_writes_symbols_ahead_to_side_file() 
         .expect("non-empty Arrow batch publishes a frame");
 
     // Header (8) + [len=5]"alpha" + [len=5]"bravo": the Arrow write-ahead persisted
-    // both symbols, in ascending id order, exactly as the chunk path does.
-    let side_file = dir.path().join("recov").join(".symbol-dict");
+    // both symbols, in ascending id order, exactly as the chunk path does. The pool
+    // mints a kind-scoped slot per borrowed column sender, so the first one lives
+    // under `<sender_id>-col-0`, not the bare `sender_id`.
+    let side_file = dir.path().join("recov-col-0").join(".symbol-dict");
     let bytes =
         std::fs::read(&side_file).expect("side-file must exist after an Arrow symbol flush");
     assert_eq!(
