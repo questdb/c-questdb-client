@@ -517,6 +517,51 @@ fn try_resize_filled<T: Clone>(v: &mut Vec<T>, len: usize, value: T) -> Result<(
     Ok(())
 }
 
+/// Validate a symbol code re-read from the caller's borrowed `codes` buffer at
+/// flush into an in-range slot index. `range_check_codes` already proved every
+/// code in range at append, but the buffer is borrowed until flush; a caller that
+/// mutates it in that window (documented UB, but a plausible footgun for a binding
+/// reusing a codes buffer) could push a code out of range. Returning an error
+/// keeps that a recoverable `InvalidApiCall` instead of an out-of-bounds index --
+/// which, under the FFI `panic = "abort"` profile, would abort the whole process.
+#[inline]
+fn checked_symbol_slot(code: i64, row: usize, dict_len: usize) -> Result<usize> {
+    match usize::try_from(code) {
+        Ok(slot) if slot < dict_len => Ok(slot),
+        _ => Err(error::fmt!(
+            InvalidApiCall,
+            "symbol code {} at row {} is out of range for dict_len {}; the borrowed \
+             codes/dict buffers must stay unchanged between append and flush",
+            code,
+            row,
+            dict_len
+        )),
+    }
+}
+
+/// Slice dict entry `slot`'s bytes from the borrowed `dict_bytes` at flush,
+/// guarding a `dict_offsets` mutated between append and flush (see
+/// [`checked_symbol_slot`]) that could yield a reversed or out-of-range range --
+/// a slice index that would otherwise abort under `panic = "abort"`.
+#[inline]
+fn checked_symbol_entry(dict_bytes: &[u8], start: i64, end: i64, slot: usize) -> Result<&[u8]> {
+    usize::try_from(start)
+        .ok()
+        .zip(usize::try_from(end).ok())
+        .and_then(|(s, e)| dict_bytes.get(s..e))
+        .ok_or_else(|| {
+            error::fmt!(
+                InvalidApiCall,
+                "symbol dict entry {} spans {}..{}, out of range for dict_bytes len {}; \
+                 the borrowed codes/dict buffers must stay unchanged between append and flush",
+                slot,
+                start,
+                end,
+                dict_bytes.len()
+            )
+        })
+}
+
 /// Walk symbol columns, intern referenced entries against the
 /// connection-scoped global dict, and emit one [`ResolvedColumn`] per
 /// chunk column into `per_column` (length == `chunk.columns.len()`).
@@ -551,12 +596,8 @@ fn resolve_symbols(
                     if !is_valid_row(col.validity.as_ref(), i) {
                         continue;
                     }
-                    let slot = unsafe { codes.read_i64(i) } as usize;
-                    debug_assert!(
-                        slot < referenced_scratch.len(),
-                        "symbol code {slot} out of range (dict_len {dict_len}); \
-                         range_check_codes should have rejected it at append"
-                    );
+                    let slot = checked_symbol_slot(unsafe { codes.read_i64(i) }, i, dict_len)?;
+                    // slot < dict_len == referenced_scratch.len(), so this cannot panic.
                     referenced_scratch[slot] = 1;
                     non_null_count += 1;
                 }
@@ -566,9 +607,9 @@ fn resolve_symbols(
                     if *mark == 0 {
                         continue;
                     }
-                    let start = unsafe { dict_offsets.read_i64(slot) } as usize;
-                    let end = unsafe { dict_offsets.read_i64(slot + 1) } as usize;
-                    let entry_bytes = &dict_bytes_slice[start..end];
+                    let start = unsafe { dict_offsets.read_i64(slot) };
+                    let end = unsafe { dict_offsets.read_i64(slot + 1) };
+                    let entry_bytes = checked_symbol_entry(dict_bytes_slice, start, end, slot)?;
                     let (gid, is_new) = symbol_dict.intern(entry_bytes)?;
                     if is_new {
                         new_symbols.push(entry_bytes.to_vec());
@@ -709,7 +750,7 @@ unsafe fn encode_column(
                 }
             };
             unsafe {
-                encode_symbol(out, codes, resolved, row_count, validity);
+                encode_symbol(out, codes, resolved, row_count, validity)?;
             }
         }
         #[cfg(feature = "arrow-ingress")]
@@ -1055,7 +1096,7 @@ unsafe fn encode_symbol(
     resolved: &RowResolvedSymbol,
     row_count: usize,
     validity: Option<&ValidityDescriptor>,
-) {
+) -> Result<()> {
     let validity = validity.filter(|v| v.has_nulls());
     match validity {
         None => out.push(0),
@@ -1070,13 +1111,13 @@ unsafe fn encode_symbol(
     // dispatch overhead is amortised across the whole column.
     match codes {
         SymbolCodesPtr::I8(p) => unsafe {
-            emit_symbol_rows(out, p, row_count, validity, &resolved.local_to_global);
+            emit_symbol_rows(out, p, row_count, validity, &resolved.local_to_global)
         },
         SymbolCodesPtr::I16(p) => unsafe {
-            emit_symbol_rows(out, p, row_count, validity, &resolved.local_to_global);
+            emit_symbol_rows(out, p, row_count, validity, &resolved.local_to_global)
         },
         SymbolCodesPtr::I32(p) => unsafe {
-            emit_symbol_rows(out, p, row_count, validity, &resolved.local_to_global);
+            emit_symbol_rows(out, p, row_count, validity, &resolved.local_to_global)
         },
     }
 }
@@ -1087,7 +1128,8 @@ unsafe fn emit_symbol_rows<T>(
     row_count: usize,
     validity: Option<&ValidityDescriptor>,
     local_to_global: &[u64],
-) where
+) -> Result<()>
+where
     T: Copy + Into<i64>,
 {
     for i in 0..row_count {
@@ -1095,11 +1137,14 @@ unsafe fn emit_symbol_rows<T>(
         if !valid {
             continue;
         }
-        let slot = unsafe { (*codes.add(i)).into() } as usize;
+        let code: i64 = unsafe { (*codes.add(i)).into() };
+        let slot = checked_symbol_slot(code, i, local_to_global.len())?;
+        // slot < local_to_global.len(), so this cannot panic.
         let gid = local_to_global[slot];
         debug_assert_ne!(gid, u64::MAX, "referenced symbol slot has no global id");
         write_qwp_varint(out, gid);
     }
+    Ok(())
 }
 
 fn encode_designated_ts(
@@ -1190,6 +1235,43 @@ mod tests {
         let mut scratch = EncodeScratch::new();
         encode_chunk_into(&mut out, chunk, &mut dict, &mut scratch, false).unwrap();
         out
+    }
+
+    #[test]
+    fn checked_symbol_slot_rejects_out_of_range_and_negative_codes() {
+        // Defence-in-depth for a codes buffer mutated between append and flush
+        // (documented UB, but a footgun): an out-of-range or negative code must
+        // yield a recoverable InvalidApiCall, never an out-of-bounds index -- which
+        // under the FFI `panic = "abort"` profile would abort the whole process.
+        assert_eq!(checked_symbol_slot(0, 0, 3).unwrap(), 0);
+        assert_eq!(checked_symbol_slot(2, 5, 3).unwrap(), 2); // last in-range slot
+        for bad in [3i64, 99, i64::MAX] {
+            let err = checked_symbol_slot(bad, 7, 3).unwrap_err();
+            assert_eq!(err.code(), crate::ErrorCode::InvalidApiCall);
+            assert!(err.msg().contains("out of range"), "{}", err.msg());
+        }
+        for neg in [-1i64, i64::MIN] {
+            assert_eq!(
+                checked_symbol_slot(neg, 7, 3).unwrap_err().code(),
+                crate::ErrorCode::InvalidApiCall
+            );
+        }
+        // An empty dict makes every code out of range.
+        assert!(checked_symbol_slot(0, 0, 0).is_err());
+    }
+
+    #[test]
+    fn checked_symbol_entry_rejects_reversed_or_out_of_range_spans() {
+        let dict = b"aabbcc"; // len 6
+        assert_eq!(checked_symbol_entry(dict, 2, 4, 1).unwrap(), b"bb");
+        assert_eq!(checked_symbol_entry(dict, 0, 6, 0).unwrap(), dict);
+        assert_eq!(checked_symbol_entry(dict, 3, 3, 0).unwrap(), b""); // empty span is fine
+        // Reversed (start > end), past-the-end, and negative offsets all reject
+        // rather than panicking on the slice index.
+        for (s, e) in [(4i64, 2i64), (0, 7), (5, 100), (-1, 3), (2, -1)] {
+            let err = checked_symbol_entry(dict, s, e, 0).unwrap_err();
+            assert_eq!(err.code(), crate::ErrorCode::InvalidApiCall);
+        }
     }
 
     /// `slice_rows(0, n)` must reproduce the whole-chunk bytes for every column
