@@ -6953,6 +6953,14 @@ pub(crate) fn decode_qwp_varint(buf: &[u8], pos: usize) -> Option<(u64, usize)> 
     while cur < buf.len() {
         let b = buf[cur];
         cur += 1;
+        // The 10th byte sits at shift 63, so only its low bit fits in the u64; any
+        // higher payload bit overflows. Reject that BEFORE shifting -- a shift would
+        // silently drop the overflowing bits and accept a wrong value (e.g. nine
+        // 0x80 bytes then 0x02 would decode to 0) -- matching the server's varint
+        // decoder, which rejects it too.
+        if shift == 63 && b & 0x7F > 1 {
+            return None;
+        }
         value |= u64::from(b & 0x7F) << shift;
         if b & 0x80 == 0 {
             return Some((value, cur));
@@ -9329,6 +9337,51 @@ mod tests {
         let err = dict.intern(&over).unwrap_err();
         assert_eq!(err.code(), ErrorCode::InvalidApiCall);
         assert!(err.msg().contains("exceeding"), "{}", err.msg());
+    }
+
+    #[cfg(feature = "_sender-qwp-ws")]
+    #[test]
+    fn decode_qwp_varint_rejects_overflowing_ten_byte_encodings() {
+        // Boundary values round-trip through the writer + decoder unchanged.
+        for v in [0u64, 1, 127, 128, u32::MAX as u64, u64::MAX - 1, u64::MAX] {
+            let mut buf = Vec::new();
+            write_qwp_varint(&mut buf, v);
+            assert_eq!(
+                decode_qwp_varint(&buf, 0),
+                Some((v, buf.len())),
+                "value {v}"
+            );
+        }
+
+        // u64::MAX is a valid 10-byte encoding whose 10th byte's payload is 0x01
+        // (only the low bit fits at shift 63).
+        assert_eq!(
+            decode_qwp_varint(
+                &[0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x01],
+                0
+            ),
+            Some((u64::MAX, 10))
+        );
+
+        // A 10th-byte payload > 1 overflows u64: reject, don't silently truncate to
+        // a wrong value. Pre-fix this returned Some((0, 10)); the server rejects it.
+        assert_eq!(
+            decode_qwp_varint(
+                &[0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x02],
+                0
+            ),
+            None
+        );
+        // Any higher payload bit on the 10th byte overflows too.
+        assert_eq!(
+            decode_qwp_varint(
+                &[0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x7F],
+                0
+            ),
+            None
+        );
+        // An 11th continuation byte is rejected regardless.
+        assert_eq!(decode_qwp_varint(&[0x80; 11], 0), None);
     }
 
     #[cfg(feature = "_sender-qwp-ws")]
