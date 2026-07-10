@@ -551,6 +551,48 @@ impl RowSenderPoolState {
     }
 }
 
+/// Connection counts for a single pool inside a [`QuestDb`], part of the
+/// unstable diagnostics snapshot returned by [`QuestDb::dbg_pool_counts`].
+///
+/// **Not semver-stable.** `#[doc(hidden)]` and `#[non_exhaustive]`; exists for
+/// soak / leak harnesses to assert the pool drains back to a steady baseline
+/// after load and failover episodes.
+#[doc(hidden)]
+#[non_exhaustive]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct DbgPoolCount {
+    /// Idle connections parked on the free list.
+    pub free: usize,
+    /// Borrowed connections plus in-flight grow operations.
+    pub in_use: usize,
+    /// Disk store-and-forward slots that have begun close/drop but have not
+    /// yet released their slot flock. Always 0 for the direct and reader
+    /// pools (they hold no disk slots).
+    pub closing: usize,
+}
+
+/// Per-pool connection-count snapshot for a [`QuestDb`], for soak / leak
+/// diagnostics. **Not semver-stable** (`#[doc(hidden)]`, `#[non_exhaustive]`).
+///
+/// Each pool is capped independently at `pool_max`, so `free + in_use` summed
+/// across all four fields can reach `4 * pool_max`.
+#[doc(hidden)]
+#[non_exhaustive]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct DbgPoolCounts {
+    /// General-purpose / store-and-forward column-sender pool (the pool behind
+    /// `borrow_column_sender`).
+    pub column_sf: DbgPoolCount,
+    /// Always-direct column-sender pool (DataFrame ingest, the pool behind
+    /// `borrow_direct_column_sender`).
+    pub column_direct: DbgPoolCount,
+    /// Row-major ([`crate::ingress::Sender`]) sender pool.
+    pub row_sender: DbgPoolCount,
+    /// Reader (egress) pool. Always zero when the crate is built without an
+    /// egress feature.
+    pub reader: DbgPoolCount,
+}
+
 struct RowSenderPoolEntry {
     /// A classic ILP row sender. It owns its connection and per-connection
     /// state internally, so (like the reader pool) we don't track extra
@@ -1349,6 +1391,62 @@ impl QuestDb {
     /// their own cadence.
     pub fn reap_idle(&self) -> usize {
         reap_idle_inner(&self.inner)
+    }
+
+    /// Snapshot per-pool connection counts for diagnostics.
+    ///
+    /// Soak / leak harnesses read this on a cadence and assert every pool
+    /// returns to a steady baseline after load and failover episodes (an FD /
+    /// connection leak shows up as `in_use` or `free` failing to fall back).
+    ///
+    /// Each pool's lock is taken in turn (never two at once), so every field
+    /// is internally consistent but the four are not a single atomic instant —
+    /// fine for a monitoring snapshot. **Not semver-stable** (`#[doc(hidden)]`,
+    /// `#[non_exhaustive]` result); mirrors the `questdb_db_dbg_reader_*_count`
+    /// FFI diagnostics precedent.
+    #[doc(hidden)]
+    pub fn dbg_pool_counts(&self) -> DbgPoolCounts {
+        let column_sf = {
+            let s = lock_state(&self.inner.state);
+            DbgPoolCount {
+                free: s.free.len(),
+                in_use: s.in_use,
+                closing: s.closing,
+            }
+        };
+        let column_direct = {
+            let s = lock_state(&self.inner.direct_state);
+            DbgPoolCount {
+                free: s.free.len(),
+                in_use: s.in_use,
+                closing: s.closing,
+            }
+        };
+        let row_sender = {
+            let s = lock_row_sender_state(&self.inner.row_sender_state);
+            DbgPoolCount {
+                free: s.free.len(),
+                in_use: s.in_use,
+                closing: s.closing,
+            }
+        };
+        #[cfg(feature = "_egress")]
+        let reader = {
+            let s = lock_reader_state(&self.inner.reader_state);
+            DbgPoolCount {
+                free: s.free.len(),
+                in_use: s.in_use,
+                closing: 0,
+            }
+        };
+        #[cfg(not(feature = "_egress"))]
+        let reader = DbgPoolCount::default();
+        DbgPoolCounts {
+            column_sf,
+            column_direct,
+            row_sender,
+            reader,
+        }
     }
 
     /// Close the pool: stop the reaper (if any), reject future borrows, drop

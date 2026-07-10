@@ -829,6 +829,52 @@ pub unsafe extern "C" fn questdb_db_reap_idle(db: *mut questdb_db) -> size_t {
     db_ref.0.reap_idle()
 }
 
+/// Per-pool connection counts, mirroring `questdb::DbgPoolCount`. Diagnostics
+/// only (soak / leak harnesses); the field set is not part of the stable ABI.
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub struct questdb_dbg_pool_count {
+    pub free: size_t,
+    pub in_use: size_t,
+    pub closing: size_t,
+}
+
+/// Snapshot of connection counts across all four pools, mirroring
+/// `questdb::DbgPoolCounts`. Diagnostics only; not part of the stable ABI.
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub struct questdb_dbg_pool_counts {
+    pub column_sf: questdb_dbg_pool_count,
+    pub column_direct: questdb_dbg_pool_count,
+    pub row_sender: questdb_dbg_pool_count,
+    pub reader: questdb_dbg_pool_count,
+}
+
+/// Snapshot per-pool connection counts for diagnostics. Soak / leak harnesses
+/// sample this and assert every pool drains back to a steady baseline after
+/// load and failover episodes. Returns all-zero for a NULL `db`. Not part of
+/// the supported ABI; the field set may change.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn questdb_db_dbg_pool_counts(
+    db: *const questdb_db,
+) -> questdb_dbg_pool_counts {
+    if db.is_null() {
+        return questdb_dbg_pool_counts::default();
+    }
+    let counts = unsafe { &*db }.0.dbg_pool_counts();
+    let conv = |p: &questdb::DbgPoolCount| questdb_dbg_pool_count {
+        free: p.free,
+        in_use: p.in_use,
+        closing: p.closing,
+    };
+    questdb_dbg_pool_counts {
+        column_sf: conv(&counts.column_sf),
+        column_direct: conv(&counts.column_direct),
+        row_sender: conv(&counts.row_sender),
+        reader: conv(&counts.reader),
+    }
+}
+
 // ===========================================================================
 // Arrow C Data Interface mirror types
 //

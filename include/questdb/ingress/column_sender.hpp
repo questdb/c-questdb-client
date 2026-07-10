@@ -1707,6 +1707,17 @@ public:
         return ::questdb_db_reap_idle(_raw);
     }
 
+    /**
+     * Snapshot per-pool connection counts for diagnostics (soak / leak
+     * harnesses assert every pool drains back to a steady baseline after
+     * load and failover). Not part of the stable ABI; the field set may
+     * change.
+     */
+    ::questdb_dbg_pool_counts dbg_pool_counts() const noexcept
+    {
+        return ::questdb_db_dbg_pool_counts(_raw);
+    }
+
 private:
     void close() noexcept
     {

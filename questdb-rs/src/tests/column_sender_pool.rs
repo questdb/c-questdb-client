@@ -1944,8 +1944,10 @@ fn store_and_forward_file_mode_writes_symbols_ahead_to_side_file() {
     // The write-ahead persisted both symbols, in ascending id order, each in its
     // own CRC-committed record. Assert format-agnostically (each record's payload
     // carries the `[len]"symbol"` entry) that both are present and alpha precedes
-    // bravo, rather than hardcoding the framing/CRC bytes.
-    let side_file = dir.path().join("recov").join(".symbol-dict");
+    // bravo, rather than hardcoding the framing/CRC bytes. The pool mints a
+    // kind-scoped slot per borrowed column sender, so the first one lives under
+    // `<sender_id>-col-0`, not the bare `sender_id`.
+    let side_file = dir.path().join("recov-col-0").join(".symbol-dict");
     let bytes = std::fs::read(&side_file).expect("side-file must exist after file-mode flushes");
     let alpha_pos = bytes
         .windows(6)
@@ -2058,7 +2060,9 @@ fn store_and_forward_file_mode_value_corruption_is_healed_and_segment_kept() {
     }
 
     // A host/power crash flips a byte of the persisted symbol, keeping its length.
-    let slot_dir = dir.path().join("recov");
+    // The pool mints a kind-scoped slot per borrowed column sender, so the first
+    // one lives under `<sender_id>-col-0`, not the bare `sender_id`.
+    let slot_dir = dir.path().join("recov-col-0");
     let side_file = slot_dir.join(".symbol-dict");
     {
         let mut bytes =
@@ -4516,14 +4520,26 @@ fn store_and_forward_file_mode_arrow_symbol_writes_symbols_ahead_to_side_file() 
         .expect("Arrow SFA symbol flush should publish")
         .expect("non-empty Arrow batch publishes a frame");
 
-    // Header (8) + [len=5]"alpha" + [len=5]"bravo": the Arrow write-ahead persisted
-    // both symbols, in ascending id order, exactly as the chunk path does.
-    let side_file = dir.path().join("recov").join(".symbol-dict");
+    // The Arrow write-ahead persisted both symbols, in ascending id order, each in
+    // its own CRC-committed record, exactly as the chunk path does. Assert
+    // format-agnostically (each record's payload carries the `[len]"symbol"` entry)
+    // that both are present and alpha precedes bravo, rather than hardcoding the
+    // framing/CRC bytes. The pool mints a kind-scoped slot per borrowed column
+    // sender, so the first one lives under `<sender_id>-col-0`, not the bare
+    // `sender_id`.
+    let side_file = dir.path().join("recov-col-0").join(".symbol-dict");
     let bytes =
         std::fs::read(&side_file).expect("side-file must exist after an Arrow symbol flush");
-    assert_eq!(
-        &bytes[8..],
-        b"\x05alpha\x05bravo",
+    let alpha_pos = bytes
+        .windows(6)
+        .position(|w| w == b"\x05alpha")
+        .expect("alpha persisted");
+    let bravo_pos = bytes
+        .windows(6)
+        .position(|w| w == b"\x05bravo")
+        .expect("bravo persisted");
+    assert!(
+        alpha_pos < bravo_pos,
         "Arrow write-ahead must persist both symbols in id order"
     );
 }
@@ -5078,6 +5094,39 @@ mod reader_pool {
             server.accepted(),
             after_first_borrow,
             "reuse must not open a new connection"
+        );
+    }
+
+    /// `dbg_pool_counts` reflects a reader borrow in the `reader` field, leaves
+    /// the three sender pools at zero, and returns to baseline on drop. This is
+    /// the snapshot the soak harness samples to catch connection / FD leaks.
+    #[test]
+    fn dbg_pool_counts_tracks_borrow_and_return() {
+        let server = ReaderMockServer::spawn(8);
+        let db = QuestDb::connect(&conf_for(server.port(), "pool_size=1;pool_max=2;")).unwrap();
+
+        let before = db.dbg_pool_counts();
+        assert_eq!(before.reader.in_use, 0);
+        assert_eq!(before.reader.free, 0);
+        assert_eq!(before.column_sf.in_use, 0);
+        assert_eq!(before.column_direct.in_use, 0);
+        assert_eq!(before.row_sender.in_use, 0);
+
+        let reader = db.borrow_reader().expect("borrow reader");
+        let during = db.dbg_pool_counts();
+        assert_eq!(during.reader.in_use, 1);
+        assert_eq!(during.reader.free, 0);
+        // Borrowing a reader must not perturb the sender pools.
+        assert_eq!(during.column_sf.in_use, 0);
+        assert_eq!(during.column_direct.in_use, 0);
+        assert_eq!(during.row_sender.in_use, 0);
+
+        drop(reader);
+        let after = db.dbg_pool_counts();
+        assert_eq!(after.reader.in_use, 0);
+        assert_eq!(
+            after.reader.free, 1,
+            "a clean reader must be recycled, not leaked"
         );
     }
 

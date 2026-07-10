@@ -76,6 +76,11 @@ mod db;
 
 #[cfg(feature = "sync-sender-qwp-ws")]
 pub use db::{BorrowedColumnSender, BorrowedRowSender, QuestDb};
+// Unstable per-pool connection-count snapshot for soak / leak harnesses.
+// `#[doc(hidden)]` at the definition site; re-exported so `QuestDb`'s
+// `dbg_pool_counts` return type is nameable.
+#[cfg(feature = "sync-sender-qwp-ws")]
+pub use db::{DbgPoolCount, DbgPoolCounts};
 // Internal transport behind `QuestDb::flush_arrow_batch` /
 // `QuestDb::flush_polars_dataframe`. Not part of the public API: hidden from
 // the docs and has no documented constructor. Kept reachable only so the
