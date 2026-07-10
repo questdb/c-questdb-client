@@ -261,7 +261,12 @@ impl SentDictMirror {
                 .saturating_sub(QWP_HEADER_SIZE + CATCH_UP_VARINT_HEADROOM)
                 .max(1)
         } else {
-            usize::MAX
+            // No server-advertised cap: still bound each frame by the QWP header's
+            // u32 payload-length field so a huge recovered dictionary splits into
+            // u32-sized frames rather than one frame whose length would wrap mod
+            // 2^32 in `build_catch_up_frame`. The wire format's own limit is the
+            // natural bound.
+            (u32::MAX as usize).saturating_sub(QWP_HEADER_SIZE + CATCH_UP_VARINT_HEADROOM)
         };
 
         let mut emitted: u64 = 0;
@@ -305,7 +310,8 @@ impl SentDictMirror {
                     chunk_symbols,
                     &self.bytes[chunk_start_off..entry_start],
                     version,
-                );
+                )
+                .ok_or(CatchUpStreamError::FrameBuildFailed)?;
                 emit(&frame).map_err(CatchUpStreamError::Emit)?;
                 emitted += 1;
                 chunk_start_id += chunk_symbols;
@@ -324,7 +330,8 @@ impl SentDictMirror {
                 chunk_symbols,
                 &self.bytes[chunk_start_off..p],
                 version,
-            );
+            )
+            .ok_or(CatchUpStreamError::FrameBuildFailed)?;
             emit(&frame).map_err(CatchUpStreamError::Emit)?;
             emitted += 1;
         }
@@ -352,17 +359,27 @@ impl SentDictMirror {
         ) {
             Ok(_) => Ok(frames),
             Err(CatchUpStreamError::EntryTooLarge(e)) => Err(e),
+            Err(CatchUpStreamError::FrameBuildFailed) => {
+                unreachable!("catch-up frame build cannot fail at test scale")
+            }
             Err(CatchUpStreamError::Emit(never)) => match never {},
         }
     }
 }
 
-/// Error from [`SentDictMirror::for_each_catch_up_frame`]: either a single
-/// dictionary entry too large for the server's batch cap (terminal — the entry
-/// cannot be re-registered), or a failure returned by the caller's `emit` (e.g.
-/// the transport dropped mid-catch-up, which recovers by reconnecting again).
+/// Error from [`SentDictMirror::for_each_catch_up_frame`]: a single dictionary
+/// entry too large for the server's batch cap (terminal — the entry cannot be
+/// re-registered), a catch-up frame that could not be built (allocation failed,
+/// or its payload would overflow the QWP `u32` length field), or a failure
+/// returned by the caller's `emit` (e.g. the transport dropped mid-catch-up,
+/// which recovers by reconnecting again).
 pub(crate) enum CatchUpStreamError<E> {
     EntryTooLarge(CatchUpEntryTooLarge),
+    /// A catch-up frame could not be allocated (fallible `try_reserve` failed) or
+    /// its payload would exceed the QWP `u32` payload-length field. Recoverable:
+    /// nothing was sent, and the queued data stays persisted for a later retry /
+    /// drain.
+    FrameBuildFailed,
     Emit(E),
 }
 
@@ -420,19 +437,36 @@ fn parse_delta_section(frame: &[u8]) -> Option<DeltaSection<'_>> {
 
 /// Builds one table-less catch-up frame carrying dictionary ids
 /// `[delta_start .. delta_start+delta_count)` whose `[len][utf8]` bytes are
-/// `entries`.
+/// `entries`. Returns `None` when the frame cannot be built:
+///
+/// * the allocation cannot be reserved — fallible `try_reserve` (rather than an
+///   infallible `Vec::with_capacity`) so a huge recovered dictionary degrades to
+///   a recoverable error instead of aborting the FFI crate's `panic = "abort"`
+///   profile on OOM, and
+/// * the payload would overflow the QWP header's `u32` length field — a checked
+///   conversion instead of a truncating `as u32`. The frame-size budget in
+///   [`SentDictMirror::for_each_catch_up_frame`] already keeps the payload under
+///   `u32::MAX`, so this is defence in depth.
+///
+/// The caller surfaces `None` as a recoverable `FrameBuildFailed`: nothing is
+/// sent and the queued data stays persisted for a later retry / drain.
 fn build_catch_up_frame(
     delta_start: u32,
     delta_count: u32,
     entries: &[u8],
     version: u8,
-) -> Vec<u8> {
-    let mut payload = Vec::with_capacity(CATCH_UP_VARINT_HEADROOM + entries.len());
+) -> Option<Vec<u8>> {
+    let mut payload = Vec::new();
+    payload
+        .try_reserve(CATCH_UP_VARINT_HEADROOM + entries.len())
+        .ok()?;
     write_varint(&mut payload, u64::from(delta_start));
     write_varint(&mut payload, u64::from(delta_count));
     payload.extend_from_slice(entries);
+    let payload_len = u32::try_from(payload.len()).ok()?;
 
-    let mut frame = Vec::with_capacity(QWP_HEADER_SIZE + payload.len());
+    let mut frame = Vec::new();
+    frame.try_reserve(QWP_HEADER_SIZE + payload.len()).ok()?;
     frame.extend_from_slice(&QWP_MAGIC);
     frame.push(version);
     // Table-less: DELTA_SYMBOL_DICT only. No DEFER_COMMIT — the catch-up runs on
@@ -440,9 +474,9 @@ fn build_catch_up_frame(
     // no-op; and no rows means the flag is otherwise irrelevant.
     frame.push(QWP_FLAG_DELTA_SYMBOL_DICT);
     frame.extend_from_slice(&0u16.to_le_bytes()); // table_count = 0
-    frame.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+    frame.extend_from_slice(&payload_len.to_le_bytes());
     frame.extend_from_slice(&payload);
-    frame
+    Some(frame)
 }
 
 /// Byte offset in `entries` (a `[len][utf8]...` region) just past the first `n`

@@ -1352,6 +1352,7 @@ impl<T: QwpWsCoreTransport> QwpWsSendCore<T> {
             })
             .map_err(|e| match e {
                 CatchUpStreamError::EntryTooLarge(e) => DictCatchUpError::EntryTooLarge(e),
+                CatchUpStreamError::FrameBuildFailed => DictCatchUpError::FrameBuildFailed,
                 CatchUpStreamError::Emit(failure) => DictCatchUpError::Transport(failure),
             })
     }
@@ -1395,6 +1396,19 @@ impl<T: QwpWsCoreTransport> QwpWsSendCore<T> {
                  the dictionary -- resend required",
                     e.entry_bytes,
                     e.budget
+                )))
+            }
+            Err(DictCatchUpError::FrameBuildFailed) => {
+                // Building a catch-up frame failed (allocation, or a payload beyond
+                // the QWP u32 length field). Like EntryTooLarge this only records the
+                // error -- it never deletes the slot's segments or side-file -- so a
+                // disk slot's queued frames stay on disk for a later orphan drain /
+                // borrow to retry; no recoverable data is abandoned.
+                Err(CatchUpDriveError::Terminal(error::fmt!(
+                    SocketError,
+                    "QWP/WebSocket reconnect catch-up could not build a symbol-dictionary \
+                     frame (allocation failed or payload too large); queued data is \
+                     preserved for a later retry"
                 )))
             }
         }
@@ -3134,6 +3148,10 @@ enum DictCatchUpError {
     /// A single dictionary entry does not fit the server's batch cap, so the
     /// dictionary cannot be re-registered on the fresh server; terminal.
     EntryTooLarge(CatchUpEntryTooLarge),
+    /// A catch-up frame could not be built (allocation failed, or its payload
+    /// would overflow the QWP u32 length field). Nothing was sent; the queued
+    /// data stays persisted for a later drain / borrow to retry.
+    FrameBuildFailed,
 }
 
 /// Outcome of [`QwpWsSendCore::drive_catch_up`] that the caller must act on: a
