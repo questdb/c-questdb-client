@@ -2458,6 +2458,27 @@ fn take_pooled_gids(pool: &mut Vec<Vec<u64>>, cap: usize) -> Vec<u64> {
     gids
 }
 
+/// Reject a symbol dictionary value that is not valid UTF-8 before it is interned.
+///
+/// QuestDB SYMBOLs are UTF-8, and the row / column `symbol_i*` path validates this
+/// eagerly at append (`chunk::validate_varchar_utf8_cells`). Arrow string arrays
+/// nominally carry UTF-8, but a producer that builds an `ArrowArray` by hand and
+/// hands it over the C Data Interface is only structurally validated on import
+/// (`validate()`, not `validate_full()` -- see `checked_offset_bytes`), so the
+/// value bytes are not guaranteed UTF-8 at this point. Interning a non-UTF-8 symbol
+/// would assign it a global id, write it ahead to the store-and-forward side-file,
+/// and locally ACK the frame -- only for the server to reject the non-UTF-8 symbol
+/// on send, stranding the dependent queued frame. That breaks the same
+/// "writer-accepted => server-acceptable" invariant the per-symbol length/heap caps
+/// enforce at `SymbolGlobalDict::intern`, so close the gap here, at the Arrow
+/// ingestion choke point, exactly as the row path does at append.
+#[inline]
+fn validate_symbol_utf8(bytes: &[u8]) -> Result<()> {
+    std::str::from_utf8(bytes)
+        .map(|_| ())
+        .map_err(|e| fmt!(ArrowIngest, "SYMBOL value is not valid UTF-8: {}", e))
+}
+
 fn resolve_symbol_strings<S: VarlenSource>(
     arr: &dyn Array,
     source: &S,
@@ -2482,6 +2503,7 @@ fn resolve_symbol_strings<S: VarlenSource>(
         let gid = match seen.get(bytes) {
             Some(&gid) => gid,
             None => {
+                validate_symbol_utf8(bytes)?;
                 let (gid, is_new) = symbol_dict.intern(bytes)?;
                 if is_new {
                     new_symbols.push(bytes.to_vec());
@@ -2566,6 +2588,7 @@ fn resolve_symbol_dict(
                             ));
                         }
                         let bytes = values_typed.value_bytes(slot)?;
+                        validate_symbol_utf8(bytes)?;
                         let (gid, is_new) = symbol_dict.intern(bytes)?;
                         if is_new {
                             new_symbols.push(bytes.to_vec());
@@ -4190,6 +4213,85 @@ mod tests {
         .unwrap();
         assert_qwp_header(&out, 1);
         assert_eq!(dict.next_id(), 2);
+    }
+
+    #[test]
+    fn arrow_symbol_non_utf8_is_rejected_not_interned() {
+        // QuestDB SYMBOLs are UTF-8, and the row / column `symbol_i*` path validates
+        // this eagerly at append. Arrow string arrays nominally carry UTF-8, but an
+        // ArrowArray built by hand and imported over the C Data Interface is only
+        // structurally validated (`validate()`, not `validate_full()`), so its value
+        // bytes are not guaranteed UTF-8. Interning a non-UTF-8 symbol would give it a
+        // global id, write it ahead to the store-and-forward side-file, and locally
+        // ACK the frame -- only for the server to reject it on send, stranding the
+        // queued frame. The Arrow resolve path must reject it at ingestion and leave
+        // the dict untouched (no id assigned, nothing staged in `new_symbols`).
+        use arrow::array::types::Int8Type;
+        use arrow::array::{ArrayDataBuilder, DictionaryArray, Int8Array};
+        use arrow::buffer::Buffer;
+
+        // A `build_unchecked` Utf8 array whose single value is invalid UTF-8
+        // (0xFF 0xFE): valid offsets (cheap `validate()` passes), bad content.
+        let bad_utf8 = || -> StringArray {
+            let data = unsafe {
+                ArrayDataBuilder::new(DataType::Utf8)
+                    .len(1)
+                    .add_buffer(Buffer::from_vec(vec![0i32, 2]))
+                    .add_buffer(Buffer::from_vec(vec![0xFFu8, 0xFE]))
+                    .build_unchecked()
+            };
+            StringArray::from(data)
+        };
+
+        // (a) Plain SYMBOL (Utf8) path -> `resolve_symbol_strings`.
+        {
+            let arr = bad_utf8();
+            let mut gd = SymbolGlobalDict::new();
+            let mut new_symbols: Vec<Vec<u8>> = Vec::new();
+            let mut gids_pool: Vec<Vec<u64>> = Vec::new();
+            let Err(err) = resolve_arrow_symbol_column(
+                &arr,
+                ColumnKind::SymbolUtf8,
+                &mut gd,
+                &mut new_symbols,
+                &mut gids_pool,
+            ) else {
+                panic!("a non-UTF-8 SYMBOL value must be rejected");
+            };
+            assert_eq!(err.code(), crate::ErrorCode::ArrowIngest);
+            assert!(err.msg().contains("not valid UTF-8"), "{}", err.msg());
+            assert_eq!(gd.next_id(), 0, "a rejected symbol must not get an id");
+            assert!(
+                new_symbols.is_empty(),
+                "nothing may be staged for the delta"
+            );
+        }
+
+        // (b) Dictionary-encoded SYMBOL path -> `resolve_symbol_dict`: the referenced
+        // dictionary *values* slot carries the bad bytes.
+        {
+            let keys = Int8Array::from(vec![0i8]);
+            let dict = DictionaryArray::<Int8Type>::try_new(keys, std::sync::Arc::new(bad_utf8()))
+                .unwrap();
+            let mut gd = SymbolGlobalDict::new();
+            let mut new_symbols: Vec<Vec<u8>> = Vec::new();
+            let mut gids_pool: Vec<Vec<u64>> = Vec::new();
+            let Err(err) = resolve_arrow_symbol_column(
+                &dict,
+                ColumnKind::SymbolDict {
+                    key: DictKey::I8,
+                    value: DictValue::Utf8,
+                },
+                &mut gd,
+                &mut new_symbols,
+                &mut gids_pool,
+            ) else {
+                panic!("a non-UTF-8 dictionary SYMBOL value must be rejected");
+            };
+            assert_eq!(err.code(), crate::ErrorCode::ArrowIngest);
+            assert!(err.msg().contains("not valid UTF-8"), "{}", err.msg());
+            assert_eq!(gd.next_id(), 0, "a rejected dict symbol must not get an id");
+        }
     }
 
     #[test]
