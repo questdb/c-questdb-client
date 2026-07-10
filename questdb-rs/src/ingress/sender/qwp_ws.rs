@@ -219,6 +219,18 @@ pub(crate) struct SyncQwpWsHandlerState {
     pub(crate) persisted_symbol_dict: Option<PersistedSymbolDict>,
 }
 
+impl SyncQwpWsHandlerState {
+    /// Releases the recovered dictionary seeded into the (row) replay encoder at
+    /// connect. The column sender uses its own dictionary and never touches this
+    /// encoder, so for a column-owned state that seed is dead weight; called from
+    /// [`ColumnSender::new_store_and_forward`].
+    ///
+    /// [`ColumnSender::new_store_and_forward`]: super::column_sender::ColumnSender::new_store_and_forward
+    pub(crate) fn release_dormant_encoder_dict(&mut self) {
+        self.encoder.release_dormant_dict();
+    }
+}
+
 pub(crate) struct ManualQwpWsHandlerState {
     encoder: QwpWsReplayEncoder,
     store: QwpWsPublicationStore<SfaSlotQueue>,

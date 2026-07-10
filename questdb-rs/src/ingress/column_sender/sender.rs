@@ -320,6 +320,11 @@ impl ColumnSender {
             symbol_dict.seed(&recovered, state.recovered_dict_count)?;
         }
         let persisted_symbol_dict = state.persisted_symbol_dict.take();
+        // The row encoder in `state` is dormant for a column sender (we use our own
+        // `symbol_dict` above and never touch it); release the recovered dictionary
+        // seeded into it at connect so it is not carried dead for the connection's
+        // life -- matching the `recovered_dict_entries` take above.
+        state.release_dormant_encoder_dict();
         Ok(Self {
             backend: ColumnSenderBackend::StoreAndForward(Box::new(SfaColumnBackend {
                 state,

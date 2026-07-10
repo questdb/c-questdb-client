@@ -369,6 +369,17 @@ impl PersistedSymbolDict {
         &self.loaded_entries
     }
 
+    /// Frees the recovered entry region once it has been copied out for seeding
+    /// (via [`loaded_entries`]). The write-ahead handle the foreground keeps for
+    /// the whole connection only needs the `file` / `append_offset` / `size`, so
+    /// retaining this (up to ~2 GiB) region for the connection lifetime is pure
+    /// dead weight. `Vec::new` (not `clear`) so the backing capacity is released.
+    ///
+    /// [`loaded_entries`]: PersistedSymbolDict::loaded_entries
+    pub(crate) fn clear_loaded_entries(&mut self) {
+        self.loaded_entries = Vec::new();
+    }
+
     /// Materialises the loaded entries as symbol byte strings in ascending-id
     /// order (entry `i` is symbol id `i`). Production recovery seeds directly from
     /// the raw [`loaded_entries`] region (via `SymbolGlobalDict::seed`), so this
@@ -774,6 +785,40 @@ mod tests {
         let d = PersistedSymbolDict::open(dir.path()).unwrap();
         // [len=1]['a'][len=2]['b']['b']
         assert_eq!(d.loaded_entries(), &[1, b'a', 2, b'b', b'b']);
+    }
+
+    #[test]
+    fn clear_loaded_entries_frees_the_region_but_keeps_size_and_appends() {
+        // After the recovered entries are copied out for seeding, the write-ahead
+        // handle no longer needs them; clear_loaded_entries frees the (up to ~2 GiB)
+        // region without disturbing the append tip (size) or further write-ahead
+        // appends.
+        let dir = tmp_slot();
+        {
+            let mut d = PersistedSymbolDict::open(dir.path()).unwrap();
+            d.append_symbol(b"alpha").unwrap();
+            d.append_symbol(b"bravo").unwrap();
+        }
+        let mut d = PersistedSymbolDict::open(dir.path()).unwrap();
+        assert!(!d.loaded_entries().is_empty());
+        assert_eq!(d.size(), 2);
+
+        d.clear_loaded_entries();
+        assert!(
+            d.loaded_entries().is_empty(),
+            "the recovered region is freed"
+        );
+        assert_eq!(d.size(), 2, "the append tip is unchanged");
+
+        // Write-ahead still works: a new symbol continues at the recovered tip.
+        d.append_symbol(b"charlie").unwrap();
+        assert_eq!(d.size(), 3);
+        drop(d);
+        let d = PersistedSymbolDict::open(dir.path()).unwrap();
+        assert_eq!(
+            d.read_loaded_symbols(),
+            vec![b"alpha".to_vec(), b"bravo".to_vec(), b"charlie".to_vec()]
+        );
     }
 
     #[test]
