@@ -697,6 +697,35 @@ impl<Q: PublicationLog> QwpWsPublicationStore<Q> {
         .with_qwp_ws_rejection(sender_error)
     }
 
+    /// Terminal for a well-formed frame the server keeps rejecting without ACK
+    /// progress because of its role/writability state — a read-only replica
+    /// after an in-place primary→replica switch — not because the frame is
+    /// malformed. Unlike [`Self::record_protocol_violation`] this is NOT a
+    /// protocol violation: it is recorded under the reject's own category
+    /// (`NotWritable`) and surfaced as `StoreResendRequired`, so a file-backed
+    /// slot's orphan drainer (or a fresh sender) resends the affected data
+    /// rather than mislabeling a graceful role switch as a wire-protocol
+    /// violation.
+    pub(crate) fn record_role_reject_resend(&mut self, status: u8, reason: String) -> Error {
+        let from_fsn = self
+            .queue
+            .completed_fsn()
+            .map_or(0, |fsn| fsn.saturating_add(1));
+        let to_fsn = self.queue.published_fsn().unwrap_or(from_fsn).max(from_fsn);
+        let sender_error = QwpWsSenderError {
+            category: server_error_category(status),
+            applied_policy: QwpWsErrorPolicy::Terminal,
+            status: Some(status),
+            message: Some(reason.clone()),
+            message_sequence: None,
+            from_fsn,
+            to_fsn,
+        };
+        self.terminal_sender_error = Some(sender_error.clone());
+        self.push_sender_error(sender_error.clone());
+        error::fmt!(StoreResendRequired, "{reason}").with_qwp_ws_rejection(sender_error)
+    }
+
     pub(crate) fn poll_sender_error(&mut self) -> Option<QwpWsSenderError> {
         self.sender_errors.poll()
     }
@@ -884,8 +913,20 @@ impl<T: QwpWsCoreTransport> QwpWsSendCore<T> {
                             strikes, error.message
                         )
                     };
+                    let status = error.status;
                     store.last_server_error = Some(error);
-                    let err = store.record_protocol_violation(None, reason);
+                    // A read-only/role reject (RetriableOther, e.g. a replica
+                    // after an in-place role switch) is not a protocol
+                    // violation: the frame is well-formed, the server just will
+                    // not take it while read-only. Terminalize it as "resend
+                    // required" under its own category so a file-backed slot's
+                    // orphan drainer resends it, instead of mislabeling a
+                    // graceful role switch as a wire-protocol violation.
+                    let err = if policy == QwpWsErrorPolicy::RetriableOther {
+                        store.record_role_reject_resend(status, reason)
+                    } else {
+                        store.record_protocol_violation(None, reason)
+                    };
                     store.mark_terminal(Some(err));
                     return Ok(DriveOutcome::Terminal);
                 }
@@ -1035,9 +1076,16 @@ impl<T: QwpWsCoreTransport> QwpWsSendCore<T> {
                         strikes, error.message
                     )
                 };
+                let status = error.status;
                 store.push_sender_error(sender_error);
                 store.last_server_error = Some(error);
-                let err = store.record_protocol_violation(None, reason);
+                // See `handle_reject`: a role/read-only catch-up reject is
+                // "resend required", not a protocol violation.
+                let err = if policy == QwpWsErrorPolicy::RetriableOther {
+                    store.record_role_reject_resend(status, reason)
+                } else {
+                    store.record_protocol_violation(None, reason)
+                };
                 store.mark_terminal(Some(err));
                 return Ok(DriveOutcome::Terminal);
             }
@@ -3731,6 +3779,16 @@ impl QwpWsCoreTransport for FakeOrderedServer {
                     },
                 })
             }
+            FakeSendResult::RejectWireNotWritable { wire_seq } => {
+                TransportSendResult::Response(TransportResponse::Reject {
+                    wire_seq,
+                    error: QwpServerError {
+                        status: codec::WS_STATUS_NOT_WRITABLE,
+                        message: "replica is read-only".to_string(),
+                        error: Error::new(ErrorCode::ServerFlushError, "replica is read-only"),
+                    },
+                })
+            }
             FakeSendResult::Disconnect => TransportSendResult::Failure(
                 TransportFailure::Disconnect(fake_transport_error("fake disconnect")),
             ),
@@ -3753,8 +3811,17 @@ impl QwpWsCoreTransport for FakeOrderedServer {
 pub(crate) enum FakeSendResult {
     NoResponse,
     AckSent,
-    AckWire { wire_seq: u64 },
-    RejectWire { wire_seq: u64 },
+    AckWire {
+        wire_seq: u64,
+    },
+    RejectWire {
+        wire_seq: u64,
+    },
+    /// A read-only / role reject (`WS_STATUS_NOT_WRITABLE`) — e.g. a replica
+    /// after an in-place primary→replica switch.
+    RejectWireNotWritable {
+        wire_seq: u64,
+    },
     Disconnect,
     RetryableFailure,
     TerminalFailure,
@@ -8071,6 +8138,48 @@ mod tests {
             "poison terminal must carry the last server error, got: {:?}",
             terminal_error.message
         );
+    }
+
+    #[test]
+    fn role_reject_poison_terminal_is_resend_required_not_protocol_violation() {
+        // A read-only / role reject (NOT_WRITABLE, e.g. a replica after an
+        // in-place role switch) that persists past the poison budget must
+        // terminalize under the NotWritable category as "resend required" - NOT
+        // as a ProtocolViolation. A graceful role switch is not a wire-protocol
+        // violation, and the queued data stays recoverable for a resend.
+        let mut driver = driver(FakeOrderedServer::scripted([
+            FakeSendResult::RejectWireNotWritable { wire_seq: 0 },
+            FakeSendResult::RejectWireNotWritable { wire_seq: 1 },
+            FakeSendResult::RejectWireNotWritable { wire_seq: 2 },
+            FakeSendResult::RejectWireNotWritable { wire_seq: 3 },
+        ]));
+        let receipt = driver.try_submit(b"payload").unwrap();
+
+        let mut outcome = driver.drive_once().unwrap();
+        for _ in 0..8 {
+            if outcome == DriveOutcome::Terminal {
+                break;
+            }
+            outcome = driver.drive_once().unwrap();
+        }
+        assert_eq!(outcome, DriveOutcome::Terminal);
+        assert_eq!(
+            driver.receipt_status(receipt),
+            QwpReceiptStatus::Terminal { fsn: 0 }
+        );
+
+        let terminal_error = driver.terminal_sender_error().unwrap();
+        assert_eq!(
+            terminal_error.category,
+            QwpWsErrorCategory::NotWritable,
+            "role reject must terminalize under its own category, not ProtocolViolation"
+        );
+        assert_ne!(
+            terminal_error.category,
+            QwpWsErrorCategory::ProtocolViolation
+        );
+        assert_eq!(terminal_error.applied_policy, QwpWsErrorPolicy::Terminal);
+        assert_eq!(terminal_error.status, Some(codec::WS_STATUS_NOT_WRITABLE));
     }
 
     #[test]
