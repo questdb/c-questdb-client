@@ -60,6 +60,11 @@ pub(crate) struct EncodeScratch {
     /// Reused across symbol columns within one flush; bytes (not bools)
     /// so `resize(n, 0)` is a single `memset`.
     pub(crate) referenced: Vec<u8>,
+    /// Free list of per-symbol-column `slot -> global id` tables, reclaimed from
+    /// `per_column` on [`reset`](Self::reset) so a steady flow of flushes reuses
+    /// them instead of allocating one `Vec<u64>` per row-symbol column per flush.
+    /// Mirrors the row replay encoder's `per_segment_symbol_globals` pooling.
+    symbol_gid_pool: Vec<Vec<u64>>,
 }
 
 impl EncodeScratch {
@@ -70,7 +75,15 @@ impl EncodeScratch {
     fn reset(&mut self) {
         self.signature.clear();
         self.new_symbols.clear();
-        self.per_column.clear();
+        // Reclaim each row-symbol column's `slot -> gid` table into the free list
+        // before dropping the resolutions, so it is reused next flush.
+        for col in self.per_column.drain(..) {
+            if let Some(ResolvedColumn::Row(row)) = col {
+                let mut gids = row.local_to_global;
+                gids.clear();
+                self.symbol_gid_pool.push(gids);
+            }
+        }
         self.referenced.clear();
     }
 }
@@ -166,6 +179,7 @@ fn encode_chunk_into_mode(
         &mut scratch.new_symbols,
         &mut scratch.per_column,
         &mut scratch.referenced,
+        &mut scratch.symbol_gid_pool,
     ) {
         Ok(d) => d,
         Err(e) => {
@@ -514,6 +528,7 @@ fn resolve_symbols(
     new_symbols: &mut Vec<Vec<u8>>,
     per_column: &mut Vec<Option<ResolvedColumn>>,
     referenced_scratch: &mut Vec<u8>,
+    symbol_gid_pool: &mut Vec<Vec<u64>>,
 ) -> Result<u64> {
     let delta_start = symbol_dict.next_id();
     per_column.reserve(chunk.columns.len());
@@ -545,7 +560,7 @@ fn resolve_symbols(
                     referenced_scratch[slot] = 1;
                     non_null_count += 1;
                 }
-                let mut local_to_global = Vec::new();
+                let mut local_to_global = symbol_gid_pool.pop().unwrap_or_default();
                 try_resize_filled(&mut local_to_global, dict_len, u64::MAX)?;
                 for (slot, mark) in referenced_scratch.iter().enumerate() {
                     if *mark == 0 {
@@ -1824,5 +1839,48 @@ mod tests {
             out.windows(16).any(|w| w == uuid),
             "UUID bytes must appear verbatim in the wire frame"
         );
+    }
+
+    #[test]
+    fn symbol_gid_table_is_pooled_and_reused_across_flushes() {
+        // The per-symbol-column `slot -> global id` table is reclaimed into the
+        // scratch free list on reset and reused next flush, rather than allocating
+        // a fresh Vec<u64> per row-symbol column per flush. The reused buffer is
+        // cleared/refilled, not stale, so the wire is unchanged. (The chunk borrows
+        // these arrays zero-copy, so they must outlive it.)
+        let codes = [0i32, 1, 0];
+        let dict_offsets = [0i32, 4, 8];
+        let ts = [1i64, 2, 3];
+
+        let mut scratch = EncodeScratch::new();
+
+        // Flush 1 (fresh dict): interns AAPL, MSFT and builds the slot->gid table.
+        let mut chunk1 = Chunk::new("trades");
+        chunk1
+            .symbol_i32("sym", &codes, &dict_offsets, b"AAPLMSFT", None)
+            .unwrap();
+        chunk1.at_nanos(&ts).unwrap();
+        let mut dict1 = SymbolGlobalDict::new();
+        let mut out1 = Vec::new();
+        encode_chunk_into(&mut out1, &chunk1, &mut dict1, &mut scratch, false).unwrap();
+
+        // A reset after the flush reclaims the table into the free list.
+        scratch.reset();
+        assert!(
+            !scratch.symbol_gid_pool.is_empty(),
+            "the symbol gid table must be reclaimed into the free list on reset"
+        );
+
+        // Flush 2 (fresh dict) pops the pooled table; the wire must match flush 1.
+        let mut chunk2 = Chunk::new("trades");
+        chunk2
+            .symbol_i32("sym", &codes, &dict_offsets, b"AAPLMSFT", None)
+            .unwrap();
+        chunk2.at_nanos(&ts).unwrap();
+        let mut dict2 = SymbolGlobalDict::new();
+        let mut out2 = Vec::new();
+        encode_chunk_into(&mut out2, &chunk2, &mut dict2, &mut scratch, false).unwrap();
+
+        assert_eq!(out1, out2, "pooled reuse must not change the encoded wire");
     }
 }
