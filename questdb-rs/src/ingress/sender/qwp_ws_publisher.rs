@@ -145,8 +145,14 @@ impl QwpWsReplayEncoder {
     /// the side-file must never linger ahead of the in-memory dictionary and the
     /// driver's send mirror. Dropping the handle also disables delta encoding
     /// (falls back to dense, self-sufficient frames) so subsequent frames stay
-    /// crash-recoverable without the side-file. Mirrors
-    /// `SfaColumnBackend::rollback_frame`.
+    /// crash-recoverable without the side-file.
+    ///
+    /// The driver's send mirror lives on the I/O thread and cannot be reached from
+    /// here, so it stays enabled while the foreground goes dense. That is safe: the
+    /// dense frames this fallback emits base at id 0 and re-ship the whole dictionary,
+    /// which the torn-dict guard accepts as an idempotent overlap of the mirrored
+    /// prefix (see `guard_dict_not_torn` in `qwp_ws_driver`) and `accumulate` folds
+    /// back into lockstep. Mirrors `SfaColumnBackend::rollback_frame`.
     fn rollback_frame(
         &mut self,
         global_dict_mark: SymbolGlobalDictMark,

@@ -1266,6 +1266,18 @@ impl<T: QwpWsCoreTransport> QwpWsSendCore<T> {
             }
             return Ok(());
         }
+        // Mirror enabled. Two legitimate sources emit a frame whose `delta_start` is
+        // `<= registered` -- an overlap the server tolerates idempotently, exactly as
+        // the reconnect catch-up + replay of already-registered ids relies on: a
+        // replayed already-sent frame, and a mid-connection DENSE fallback
+        // (`delta_start = 0`, self-sufficient) produced after a failed side-file
+        // rollback dropped delta encoding on the foreground while this mirror -- which
+        // the foreground cannot reach across the I/O-thread boundary -- stayed enabled
+        // (see `SfaColumnBackend::rollback_frame` / `QwpWsReplayEncoder::rollback_frame`).
+        // Both are safe *iff* the overlapping bytes match the mirror; a *differing*
+        // redefinition of a held id is the torn case rejected by `conflicts_with`
+        // below, and `accumulate` folds only the non-overlapping suffix so the mirror
+        // stays in lockstep. A `delta_start` ABOVE the mirror is an unrecoverable gap.
         let registered = u64::from(self.dict_mirror.count());
         if delta_start > registered {
             return Err(error::fmt!(
@@ -4153,6 +4165,55 @@ mod tests {
             "msg: {}",
             err.msg()
         );
+    }
+
+    #[test]
+    fn torn_dict_guard_accepts_a_dense_frame_while_the_mirror_is_enabled() {
+        // Mid-connection dense fallback: when a failed side-file rollback forces the
+        // foreground to drop delta encoding (`SfaColumnBackend::rollback_frame` /
+        // `QwpWsReplayEncoder::rollback_frame` set `delta_dict_enabled = false`), it
+        // starts emitting DENSE frames (`delta_start = 0`, re-shipping the whole
+        // dictionary from id 0). The driver mirror -- which the foreground cannot
+        // reach across the I/O-thread boundary -- stays enabled with the count it
+        // reached in delta mode. Such a dense frame re-registers ids [0, K) the mirror
+        // already holds as [0, M<=K): the guard must ACCEPT it (the server tolerates
+        // the idempotent overlap exactly as it does the reconnect catch-up + replay of
+        // already-registered ids), and `accumulate` must fold only the [M, K) suffix
+        // so the mirror stays in lockstep. A dense frame that DISAGREES on an
+        // already-held id, however, is still the torn case and must be rejected.
+        {
+            let mut driver = driver(FakeOrderedServer::no_response());
+            // The connection sent two symbols in delta mode: mirror = [a, b], count 2.
+            driver.send_core.enable_delta_dict(&[1, b'a', 1, b'b'], 2);
+            assert_eq!(driver.send_core.dict_mirror.count(), 2);
+
+            // Post-fallback dense frame: re-ships [a, b] and adds c, based at id 0.
+            let dense = make_delta_frame(0, &[b"a", b"b", b"c"]);
+            assert!(
+                driver.send_core.guard_dict_not_torn(&dense).is_ok(),
+                "a self-sufficient dense frame re-shipping the mirrored prefix is safe"
+            );
+            // Accumulating it folds only the new suffix [c]; the mirror stays consistent.
+            driver.send_core.dict_mirror.accumulate(&dense);
+            assert_eq!(
+                driver.send_core.dict_mirror.count(),
+                3,
+                "accumulate folds only the [M, K) suffix, keeping the mirror in lockstep"
+            );
+        }
+
+        // A dense frame that redefines an already-held id (id1: b -> X) disagrees with
+        // the mirror: the torn-dict guard must still reject it, even at delta_start 0.
+        {
+            let mut driver = driver(FakeOrderedServer::no_response());
+            driver.send_core.enable_delta_dict(&[1, b'a', 1, b'b'], 2);
+            let conflicting = make_delta_frame(0, &[b"a", b"X", b"c"]);
+            let err = driver
+                .send_core
+                .guard_dict_not_torn(&conflicting)
+                .unwrap_err();
+            assert_eq!(err.code(), ErrorCode::StoreResendRequired);
+        }
     }
 
     #[test]
