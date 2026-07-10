@@ -5126,6 +5126,10 @@ pub(crate) struct SymbolGlobalDict {
 /// (categorical) values array. Keyed by the array's buffer pointers+lengths:
 /// every batch sliced from the same chunk shares those buffers, so the costly
 /// per-string `intern` runs once per chunk instead of once per batch. The
+/// buffer pointers are a sufficient key because arrow's typed `to_data()`
+/// bakes any logical array offset into the buffer pointer (a different-offset
+/// window yields a different pointer, never the same pointer with a different
+/// `offset()`), so two distinct windows can never collide on this key. The
 /// stored ids are only valid against the current dict contents, so
 /// [`SymbolGlobalDict::rollback`] drops the whole memo.
 #[cfg(feature = "arrow-ingress")]

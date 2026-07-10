@@ -5254,6 +5254,77 @@ mod tests {
         assert_eq!(gd.next_id(), 1);
     }
 
+    #[test]
+    fn arrow_dict_memo_distinguishes_different_offset_windows_of_one_pool() {
+        // The per-connection `slot -> global id` memo is keyed on the dictionary
+        // values array's buffer pointers+lengths. That is a *sufficient* key only
+        // because arrow's typed `to_data()` bakes any logical `ArrayData::offset()`
+        // into the buffer pointer: two different-offset windows of one values pool
+        // resolve to different buffer pointers (never the same pointer with a
+        // different `offset()`), so they cannot collide on the memo key and alias
+        // to each other's symbols.
+        //
+        // This test pins that invariant: it resolves two different-offset windows
+        // of one pool against the SAME connection dict (memo live across both, no
+        // intervening rollback) and asserts each resolves to ITS OWN symbols. If a
+        // future arrow version ever stopped normalising the offset into the pointer
+        // (so the two windows shared a pointer), the memo would need the offset in
+        // its key and this test would fail with the second window aliasing the
+        // first — the tripwire for that regression.
+        use arrow::array::types::Int16Type;
+        use arrow::array::{DictionaryArray, Int16Array, make_array};
+
+        let pool = StringArray::from(vec!["A", "B", "C", "D"]).into_data();
+        let v_ab = make_array(pool.slice(0, 2)); // window ["A", "B"]
+        let v_cd = make_array(pool.slice(2, 2)); // window ["C", "D"]
+
+        // The invariant the buffer-only key relies on: distinct windows -> distinct
+        // buffer pointers, with the offset baked in (== 0 after `to_data()`).
+        let d_ab = v_ab.to_data();
+        let d_cd = v_cd.to_data();
+        assert_eq!(
+            d_ab.offset(),
+            0,
+            "to_data() bakes the offset into the pointer"
+        );
+        assert_eq!(
+            d_cd.offset(),
+            0,
+            "to_data() bakes the offset into the pointer"
+        );
+        assert_ne!(
+            d_ab.buffers()[0].as_ptr(),
+            d_cd.buffers()[0].as_ptr(),
+            "distinct windows must yield distinct buffer pointers (memo key soundness)"
+        );
+
+        let keys = Int16Array::from(vec![0i16, 1]);
+        let dict_ab = DictionaryArray::<Int16Type>::try_new(keys.clone(), v_ab).unwrap();
+        let dict_cd = DictionaryArray::<Int16Type>::try_new(keys, v_cd).unwrap();
+
+        let kind = ColumnKind::SymbolDict {
+            key: DictKey::I16,
+            value: DictValue::Utf8,
+        };
+        let mut gd = SymbolGlobalDict::new();
+        let mut new_symbols: Vec<Vec<u8>> = Vec::new();
+
+        let r_ab = resolve_arrow_symbol_column(&dict_ab, kind, &mut gd, &mut new_symbols)
+            .unwrap()
+            .unwrap();
+        let r_cd = resolve_arrow_symbol_column(&dict_cd, kind, &mut gd, &mut new_symbols)
+            .unwrap()
+            .unwrap();
+
+        let sym = |gid: u64| gd.entry(gid).unwrap().to_vec();
+        assert_eq!(sym(r_ab.gids[0]), b"A");
+        assert_eq!(sym(r_ab.gids[1]), b"B");
+        assert_eq!(sym(r_cd.gids[0]), b"C");
+        assert_eq!(sym(r_cd.gids[1]), b"D");
+        // All four distinct symbols interned: the windows did not alias.
+        assert_eq!(gd.next_id(), 4);
+    }
+
     // -----------------------------------------------------------------
     // LargeUtf8 / LargeBinary bulk-memcpy + slow-path
     // -----------------------------------------------------------------
