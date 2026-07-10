@@ -180,6 +180,52 @@ impl SentDictMirror {
         self.count = frame_end as u32;
     }
 
+    /// Returns `true` when `frame`'s delta section redefines an already-mirrored
+    /// symbol id to a **different** symbol.
+    ///
+    /// The foreground [`SymbolGlobalDict`](crate::ingress::buffer::SymbolGlobalDict)
+    /// is append-only, so an id the mirror already holds can legitimately be
+    /// re-registered only with the *same* bytes (a benign replay of history, e.g.
+    /// an earlier queued frame re-registering ids a short recovery seed missed —
+    /// see [`accumulate`](Self::accumulate)). A *differing* redefinition means the
+    /// recovered history and the queued frames disagree: a host/power crash tore
+    /// the side-file so its recovered entries desynced from a later frame that
+    /// reused those ids. `accumulate` folds in only the suffix beyond the tip and
+    /// drops fully-overlapping regions, so it would silently keep the stale mapping
+    /// and the reconnect catch-up would re-register the wrong symbol. The send loop
+    /// calls this before sending so `guard_dict_not_torn` can reject such a frame
+    /// as torn ("resend required") instead of corrupting the server dictionary.
+    ///
+    /// Only the overlap prefix `[delta_start, min(frame_end, count))` is compared
+    /// (verbatim, since both sides are `[len][utf8]` for the same ids); the suffix
+    /// beyond the tip is genuinely new, and a `delta_start > count` gap is the
+    /// separate torn case `guard_dict_not_torn` already rejects. No-op (false) when
+    /// disabled, for a non-delta frame, or when there is no overlap.
+    pub(crate) fn conflicts_with(&self, frame: &[u8]) -> bool {
+        if !self.enabled {
+            return false;
+        }
+        let Some(section) = parse_delta_section(frame) else {
+            return false;
+        };
+        let tip = u64::from(self.count);
+        // No already-held ids: an empty delta, a gap, or an exactly-contiguous
+        // extension (`delta_start == tip`) introduces nothing the mirror holds.
+        if section.delta_count == 0 || section.delta_start >= tip {
+            return false;
+        }
+        let frame_end = section
+            .delta_start
+            .saturating_add(u64::from(section.delta_count));
+        let overlap_end = frame_end.min(tip);
+        let overlap_entries = (overlap_end - section.delta_start) as usize;
+        // Byte ranges of the overlapping entries in the mirror and in the frame.
+        let mirror_lo = skip_entries(&self.bytes, section.delta_start as usize);
+        let mirror_hi = skip_entries(&self.bytes, overlap_end as usize);
+        let frame_hi = skip_entries(section.entries, overlap_entries);
+        self.bytes[mirror_lo..mirror_hi] != section.entries[..frame_hi]
+    }
+
     /// Streams the table-less catch-up frame(s) that re-register the whole
     /// mirrored dictionary on a fresh connection, split so no frame exceeds
     /// `server_max_batch_size` (0 = server advertised no cap → a single frame).
@@ -523,6 +569,44 @@ mod tests {
             symbols_from_catch_up(&frames),
             vec![b"a".to_vec(), b"b".to_vec(), b"c".to_vec()]
         );
+    }
+
+    #[test]
+    fn conflicts_with_flags_a_differing_redefinition_but_not_a_matching_one() {
+        // Torn recovery: the seed recovered only id0 = A; an older queued frame
+        // re-registers id1 = B; then a fresh foreground frame reuses id1 for a
+        // DIFFERENT symbol C (the append-only foreground was seeded with the short
+        // recovered count). `accumulate` would drop that fully-overlapping frame and
+        // keep B, so the reconnect catch-up would re-register the wrong symbol.
+        // `conflicts_with` must flag it so the send loop rejects it as torn.
+        let mut m = SentDictMirror::new(true);
+        m.seed(&[1, b'A'], 1); // id0 = A
+        m.accumulate(&make_frame(1, &[b"B"], b"")); // id1 = B
+        assert_eq!(m.count(), 2);
+
+        // Fresh frame redefines id1 = C (different) -> conflict.
+        assert!(m.conflicts_with(&make_frame(1, &[b"C"], b"")));
+        // Partial overlap: id1 differs (C), id2 is new -> still a conflict.
+        assert!(m.conflicts_with(&make_frame(1, &[b"C", b"D"], b"")));
+
+        // Re-registering id1 = B (same symbol) is a benign replay -> no conflict.
+        assert!(!m.conflicts_with(&make_frame(1, &[b"B"], b"")));
+        // Replay of the whole held prefix, verbatim -> no conflict.
+        assert!(!m.conflicts_with(&make_frame(0, &[b"A", b"B"], b"")));
+        // Matching prefix that extends past the tip (the legitimate fold case
+        // `accumulate` handles) -> no conflict.
+        assert!(!m.conflicts_with(&make_frame(1, &[b"B", b"D"], b"")));
+        // Exactly-contiguous extension (no overlap) -> no conflict.
+        assert!(!m.conflicts_with(&make_frame(2, &[b"C"], b"")));
+        // A gap (delta_start > count) is the separate torn case the driver already
+        // guards, not a redefinition -> no conflict here.
+        assert!(!m.conflicts_with(&make_frame(5, &[b"X"], b"")));
+        // Empty delta (a commit frame) -> no conflict.
+        assert!(!m.conflicts_with(&make_frame(2, &[], b"")));
+
+        // A disabled mirror never conflicts.
+        let disabled = SentDictMirror::new(false);
+        assert!(!disabled.conflicts_with(&make_frame(1, &[b"C"], b"")));
     }
 
     #[test]

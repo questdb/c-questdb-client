@@ -1278,6 +1278,25 @@ impl<T: QwpWsCoreTransport> QwpWsSendCore<T> {
                 registered
             ));
         }
+        // Overlap without a gap: the frame re-registers ids the mirror already
+        // holds. That is a benign replay only if the symbols MATCH. The foreground
+        // dict is append-only, so a *differing* redefinition of an already-mirrored
+        // id can only mean the recovered history and the queued frames disagree (a
+        // host crash that tore the side-file so its recovered entries desynced from
+        // a later frame that reused those ids). `accumulate` would keep the stale
+        // mapping (it drops fully-overlapping regions), so the reconnect catch-up
+        // would re-register the wrong symbol and mis-decode later delta-less
+        // references -- silent corruption. Reject it as torn instead.
+        if self.dict_mirror.conflicts_with(payload) {
+            return Err(error::fmt!(
+                StoreResendRequired,
+                "QWP/WebSocket store-and-forward symbol dictionary is torn: a stored \
+                 frame redefines an already-registered symbol id to a different \
+                 symbol (the recovered dictionary disagrees with the queued frames, \
+                 most often a host crash that tore the side-file); the affected data \
+                 must be resent"
+            ));
+        }
         Ok(())
     }
 
@@ -4036,6 +4055,35 @@ mod tests {
         assert_eq!(payloads.len(), 2, "catch-up frame precedes the replay");
         assert_catch_up_frame(&payloads[0], &[b"a", b"b"]);
         assert_eq!(payloads[1], frame, "the stored frame replays verbatim");
+    }
+
+    #[test]
+    fn torn_dict_guard_rejects_a_conflicting_symbol_redefinition() {
+        let mut driver = driver(FakeOrderedServer::no_response());
+        // Torn recovery: the side-file recovered only id0 = a, but an earlier queued
+        // frame re-registers id1 = b, extending the mirror to [a, b].
+        driver.send_core.enable_delta_dict(&[1, b'a'], 1);
+        driver
+            .send_core
+            .dict_mirror
+            .accumulate(&make_delta_frame(1, &[b"b"]));
+        assert_eq!(driver.send_core.dict_mirror.count(), 2);
+
+        // Re-registering id1 = b (the same symbol) is a benign replay -> allowed.
+        let same = make_delta_frame(1, &[b"b"]);
+        assert!(driver.send_core.guard_dict_not_torn(&same).is_ok());
+
+        // But a fresh frame redefining id1 = c to a DIFFERENT symbol -- which the
+        // append-only foreground only did because it was seeded with the short
+        // recovered count -- means the recovered dictionary disagrees with the
+        // queue. `accumulate` would drop it (fully overlapping) and keep the stale
+        // b, so the reconnect catch-up would mis-register id1; reject it as torn.
+        let conflicting = make_delta_frame(1, &[b"c"]);
+        let err = driver
+            .send_core
+            .guard_dict_not_torn(&conflicting)
+            .unwrap_err();
+        assert_eq!(err.code(), ErrorCode::StoreResendRequired);
     }
 
     #[test]
