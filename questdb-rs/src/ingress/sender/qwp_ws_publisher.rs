@@ -257,6 +257,44 @@ mod tests {
     }
 
     #[test]
+    fn file_mode_side_file_rollback_failure_drops_handle_and_disables_delta() {
+        // When the slot's persisted side-file cannot be rolled back (a failing
+        // disk), the encoder must drop the side-file handle AND disable delta so
+        // subsequent frames fall back to dense (self-sufficient) encoding -- a
+        // delta frame the poisoned/desynced side-file can no longer rebuild on
+        // recovery would strand the queued data at the send loop's torn-dict guard.
+        // Injected via the side-file's fail-next-append-cleanup hook, which poisons
+        // the handle so the write-ahead append fails and the ensuing rollback fails
+        // too, exercising `rollback_frame`'s truncate-failed branch. (The only other
+        // publisher test runs in memory mode, so this `Some(pd_mark)` branch was
+        // otherwise unexercised.)
+        let dir = tempfile::tempdir().unwrap();
+        let mut pd = PersistedSymbolDict::open(dir.path()).unwrap();
+        pd.arm_fail_next_append_cleanup();
+
+        let mut encoder = QwpWsReplayEncoder::new(1);
+        encoder.set_delta_dict_enabled(true);
+        encoder.set_persisted_symbol_dict(Some(pd));
+
+        // The frame interns a new symbol, so write-ahead appends it -- which the
+        // armed hook fails, poisoning the side-file and failing the rollback.
+        let err = encoder
+            .encode_and_publish(&one_symbol_buffer("alpha"), usize::MAX, |_payload| Ok(1))
+            .unwrap_err();
+        assert_eq!(err.code(), ErrorCode::SocketError);
+        assert!(err.msg().contains("persist"), "{err}");
+
+        assert!(
+            encoder.persisted_symbol_dict.is_none(),
+            "a failed side-file rollback must drop the handle"
+        );
+        assert!(
+            !encoder.delta_dict_enabled,
+            "dropping the side-file must disable delta so frames go dense"
+        );
+    }
+
+    #[test]
     fn replay_encoder_max_size_accounts_for_connection_global_symbol_prefix() {
         let mut encoder = QwpWsReplayEncoder::new(1);
         for idx in 0..130 {

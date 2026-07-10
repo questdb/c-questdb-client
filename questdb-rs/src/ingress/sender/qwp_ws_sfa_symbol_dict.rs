@@ -269,6 +269,16 @@ impl PersistedSymbolDict {
         self.append_symbols(&[symbol])
     }
 
+    /// Test-only: arm the failed-partial-write-cleanup path so the next
+    /// [`append_symbols`](Self::append_symbols) poisons the handle (and a later
+    /// [`rollback`](Self::rollback) fails). Lets other modules' tests (e.g. the
+    /// replay encoder / column backend) drive the drop-handle / disable-delta
+    /// fallback without a real disk fault.
+    #[cfg(test)]
+    pub(crate) fn arm_fail_next_append_cleanup(&mut self) {
+        self.fail_next_append_cleanup = true;
+    }
+
     /// Appends `symbols` in id order in a **single** buffered `write_all`, each
     /// taking the next dense id implicitly (its position). The write-ahead path
     /// calls this once per frame with the symbols that frame introduced; batching
@@ -1120,5 +1130,69 @@ mod tests {
             assert_eq!(decoded, v);
             assert_eq!(pos, out.len());
         }
+    }
+
+    #[test]
+    fn count_payload_entries_rejects_malformed_payloads_without_panicking() {
+        // The per-record CRC only proves the bytes are intact, not that the
+        // payload is well-formed; a malformed entry inside a CRC-valid record is a
+        // writer bug that must be rejected (record dropped) rather than adopted or
+        // panicked on. This pins the module's "Never panics on malformed input"
+        // contract.
+
+        // Well-formed: [len=1]['a'][len=2]['b']['c'] -> 2 entries.
+        assert_eq!(count_payload_entries(&[1, b'a', 2, b'b', b'c']), Some(2));
+        // Empty payload -> 0 entries.
+        assert_eq!(count_payload_entries(&[]), Some(0));
+        // A single empty ([len=0]) entry.
+        assert_eq!(count_payload_entries(&[0]), Some(1));
+        // Torn length varint: a lone continuation byte with nothing after it.
+        assert_eq!(count_payload_entries(&[0x80]), None);
+        // Entry length overruns the payload: claims 5 bytes, only 1 present.
+        assert_eq!(count_payload_entries(&[5, b'a']), None);
+        // Entry length exceeds the per-entry cap (checked before the body, so no
+        // 1 MiB body is needed to reject it).
+        let mut over_cap = Vec::new();
+        write_varint(&mut over_cap, MAX_ENTRY_LEN + 1);
+        over_cap.push(b'x');
+        assert_eq!(count_payload_entries(&over_cap), None);
+    }
+
+    #[test]
+    fn crc_valid_record_with_malformed_payload_is_dropped_at_open() {
+        // A CRC-valid record whose payload is malformed (a length varint that
+        // overruns the payload) must be dropped at `open` -- `count_payload_entries`
+        // rejects it, so `open_existing` stops before adopting it and heals the
+        // file -- keeping the earlier valid records and never mis-registering a
+        // symbol or panicking.
+        let dir = tmp_slot();
+        {
+            let mut d = PersistedSymbolDict::open(dir.path()).unwrap();
+            d.append_symbol(b"good").unwrap(); // record 0: well-formed
+        }
+        // Append a hand-built record whose CRC is VALID but whose payload is
+        // malformed: [payload_len u32][payload][crc32c u32], payload = [len=5]['a']
+        // (claims a 5-byte entry, only 1 byte follows).
+        {
+            let payload = [5u8, b'a'];
+            let mut rec = Vec::new();
+            rec.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+            rec.extend_from_slice(&payload);
+            let crc = crc32c::crc32c_append(0, &rec); // over [len_prefix][payload]
+            rec.extend_from_slice(&crc.to_le_bytes());
+            let mut f = OpenOptions::new()
+                .append(true)
+                .open(dir.path().join(FILE_NAME))
+                .unwrap();
+            f.write_all(&rec).unwrap();
+        }
+
+        let d = PersistedSymbolDict::open(dir.path()).unwrap();
+        assert_eq!(
+            d.size(),
+            1,
+            "the CRC-valid-but-malformed record is dropped, not adopted"
+        );
+        assert_eq!(d.read_loaded_symbols(), vec![b"good".to_vec()]);
     }
 }
