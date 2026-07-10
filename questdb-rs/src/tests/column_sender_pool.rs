@@ -5080,6 +5080,39 @@ mod reader_pool {
         );
     }
 
+    /// `dbg_pool_counts` reflects a reader borrow in the `reader` field, leaves
+    /// the three sender pools at zero, and returns to baseline on drop. This is
+    /// the snapshot the soak harness samples to catch connection / FD leaks.
+    #[test]
+    fn dbg_pool_counts_tracks_borrow_and_return() {
+        let server = ReaderMockServer::spawn(8);
+        let db = QuestDb::connect(&conf_for(server.port(), "pool_size=1;pool_max=2;")).unwrap();
+
+        let before = db.dbg_pool_counts();
+        assert_eq!(before.reader.in_use, 0);
+        assert_eq!(before.reader.free, 0);
+        assert_eq!(before.column_sf.in_use, 0);
+        assert_eq!(before.column_direct.in_use, 0);
+        assert_eq!(before.row_sender.in_use, 0);
+
+        let reader = db.borrow_reader().expect("borrow reader");
+        let during = db.dbg_pool_counts();
+        assert_eq!(during.reader.in_use, 1);
+        assert_eq!(during.reader.free, 0);
+        // Borrowing a reader must not perturb the sender pools.
+        assert_eq!(during.column_sf.in_use, 0);
+        assert_eq!(during.column_direct.in_use, 0);
+        assert_eq!(during.row_sender.in_use, 0);
+
+        drop(reader);
+        let after = db.dbg_pool_counts();
+        assert_eq!(after.reader.in_use, 0);
+        assert_eq!(
+            after.reader.free, 1,
+            "a clean reader must be recycled, not leaked"
+        );
+    }
+
     /// `BorrowedReader` derefs to the underlying [`crate::egress::Reader`] for
     /// both `&self` and `&mut self` methods.
     #[test]

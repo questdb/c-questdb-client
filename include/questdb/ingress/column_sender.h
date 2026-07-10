@@ -347,6 +347,50 @@ QUESTDB_CLIENT_API
 size_t questdb_db_reap_idle(questdb_db* db);
 
 /* -------------------------------------------------------------------------
+ * Diagnostics: per-pool connection counts
+ *
+ * Soak / leak harnesses sample these and assert every pool drains back to a
+ * steady baseline after load and failover episodes (a leaked connection / FD
+ * shows up as `in_use` or `free` failing to fall back). Not part of the
+ * stable ABI; the field set may change. Mirrors the
+ * `questdb_db_dbg_reader_*_count` precedent in `questdb/egress/reader.h`.
+ * ------------------------------------------------------------------------- */
+
+/** Connection counts for a single pool. */
+typedef struct questdb_dbg_pool_count
+{
+    /** Idle connections parked on the free list. */
+    size_t free;
+    /** Borrowed connections plus in-flight grow operations. */
+    size_t in_use;
+    /** Disk store-and-forward slots mid-close, awaiting flock release. Always
+     *  0 for the direct and reader pools. */
+    size_t closing;
+} questdb_dbg_pool_count;
+
+/** Connection-count snapshot across all four pools. Each pool is capped
+ *  independently at `pool_max`, so `free + in_use` summed across the fields
+ *  can reach `4 * pool_max`. */
+typedef struct questdb_dbg_pool_counts
+{
+    /** General-purpose / store-and-forward column-sender pool. */
+    questdb_dbg_pool_count column_sf;
+    /** Always-direct column-sender pool (DataFrame ingest). */
+    questdb_dbg_pool_count column_direct;
+    /** Row-major (`row_sender`) pool. */
+    questdb_dbg_pool_count row_sender;
+    /** Reader (egress) pool. */
+    questdb_dbg_pool_count reader;
+} questdb_dbg_pool_counts;
+
+/**
+ * Snapshot per-pool connection counts for diagnostics. Returns an all-zero
+ * snapshot for a NULL `db`.
+ */
+QUESTDB_CLIENT_API
+questdb_dbg_pool_counts questdb_db_dbg_pool_counts(const questdb_db* db);
+
+/* -------------------------------------------------------------------------
  * Row-major sender borrow
  *
  * The pool hands out three kinds of borrow: column-major senders
