@@ -2802,6 +2802,12 @@ pub(crate) fn write_arrow_column_body(
     arr: &dyn Array,
     sym_resolution: Option<&ArrowResolvedSymbolColumn>,
 ) -> Result<()> {
+    // `null_count()` is consistent with the null buffer the writers below (and
+    // the symbol resolve pass) key off via `is_null` / `arr.nulls()`: arrow drops
+    // the null buffer entirely when the count is 0 (so `nulls()` is `None` and no
+    // row reads as null when `use_bitmap` is false), and keeps it when the count
+    // is > 0 (so the bitmap is written from the real buffer). A count and buffer
+    // that disagree cannot desync the frame here.
     let null_count = arr.null_count();
     let use_bitmap = kind_supports_sparse_nulls(kind) && null_count > 0;
     out.push(u8::from(use_bitmap));

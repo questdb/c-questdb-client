@@ -953,8 +953,12 @@ bool column_sender_chunk_column_binary(
  * `dict_offsets_len`) and `dict_bytes` (length `dict_bytes_len`)
  * describe the dictionary in Arrow Utf8 layout. The library interns
  * only referenced dict entries against the connection-scoped global
- * symbol table — `dict_offsets_len - 1` may be huge (Pandas
- * `Categorical`) without paying the cost for unused entries.
+ * symbol table, so `dict_offsets_len - 1` (the number of distinct
+ * values — e.g. a wide Pandas `Categorical`) may greatly exceed the
+ * referenced set without paying the cost for unused entries. It is
+ * capped at 8,388,608 (2^23) distinct entries per column, and each
+ * entry at 1 MiB (1 << 20 bytes); exceeding either is rejected at
+ * append.
  *
  * `codes[i]` must be in `0 .. dict_len` for non-null rows; null-row
  * codes are not inspected.
