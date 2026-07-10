@@ -134,6 +134,16 @@ impl SentDictMirror {
             return;
         }
         self.bytes.clear();
+        // Fallible: a very large recovered dictionary (~2 GiB) must not abort the
+        // host via an infallible copy. On OOM, disable the mirror instead -- the
+        // send loop's torn-dict guard then rejects the recovered delta frames
+        // (`StoreResendRequired`, resend from source), a graceful degrade rather
+        // than a crash.
+        if self.bytes.try_reserve(entries.len()).is_err() {
+            self.enabled = false;
+            self.count = 0;
+            return;
+        }
         self.bytes.extend_from_slice(entries);
         self.count = count;
     }

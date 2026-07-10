@@ -155,6 +155,22 @@ pub(crate) struct PersistedSymbolDict {
     ///
     /// [`append_symbols`]: PersistedSymbolDict::append_symbols
     append_scratch: Vec<u8>,
+    /// Latched when a partial-write cleanup (`set_len`/`seek` back to the pre-write
+    /// tip) itself fails, leaving the OS file cursor stranded past the logical tip.
+    /// The handle can no longer be written or rolled back safely, so [`rollback`]
+    /// and [`append_symbols`] both fail once set -- forcing the caller to drop the
+    /// handle and fall back to dense (self-sufficient) frames. Set even when the
+    /// best-effort on-disk [`poison`] cannot reach a dying disk, so the in-memory
+    /// latch alone protects the live connection.
+    ///
+    /// [`rollback`]: PersistedSymbolDict::rollback
+    /// [`poison`]: PersistedSymbolDict::poison
+    poisoned: bool,
+    /// Test-only: force the next [`append_symbols`] down the failed-partial-write
+    /// cleanup path (write fails and the restore cannot be completed), so the
+    /// poison + latch behaviour can be exercised without a real disk fault.
+    #[cfg(test)]
+    fail_next_append_cleanup: bool,
 }
 
 impl PersistedSymbolDict {
@@ -265,14 +281,31 @@ impl PersistedSymbolDict {
     /// On a partial write the file is restored to the pre-write tip so the
     /// in-memory `append_offset`/`size` stay authoritative and the caller's
     /// rollback-to-mark is a clean no-op. If even that restore fails the disk is
-    /// failing: the caller's [`rollback`] then poisons the side-file, and
-    /// [`open`]'s torn-tail healer trims any residue on the next recovery.
+    /// failing and the OS file cursor is stranded past the logical tip: the
+    /// side-file is [`poison`]ed and the handle latched so this and every later
+    /// [`rollback`] fail, forcing the caller to drop the handle and fall back to
+    /// dense frames. [`open`]'s torn-tail healer trims any on-disk residue on the
+    /// next recovery.
     ///
     /// [`rollback`]: PersistedSymbolDict::rollback
+    /// [`poison`]: PersistedSymbolDict::poison
     /// [`open`]: PersistedSymbolDict::open
     pub(crate) fn append_symbols(&mut self, symbols: &[&[u8]]) -> io::Result<()> {
+        if self.poisoned {
+            return Err(io::Error::other(
+                "persisted symbol dictionary poisoned by a failed partial-write cleanup",
+            ));
+        }
         if symbols.is_empty() {
             return Ok(());
+        }
+        // Test-only: exercise the failed-cleanup path without a real disk fault.
+        #[cfg(test)]
+        if self.fail_next_append_cleanup {
+            self.fail_next_append_cleanup = false;
+            self.poison();
+            self.poisoned = true;
+            return Err(io::Error::other("injected partial-write cleanup failure"));
         }
         let start = self.append_offset;
         // One CRC-committed record: [payload_len u32][payload][crc32c u32]. The
@@ -295,8 +328,20 @@ impl PersistedSymbolDict {
         let rec_len = self.append_scratch.len() as u64;
         // Disjoint field borrows: write the scratch (shared) into the file (mut).
         if let Err(e) = self.file.write_all(&self.append_scratch) {
-            let _ = self.file.set_len(start);
-            let _ = self.file.seek(SeekFrom::Start(start));
+            // Restore the file to the pre-write tip. `set_len` (ftruncate) does not
+            // move the cursor, so the `seek` is required to keep the OS cursor in
+            // lockstep with `append_offset`. If EITHER restore fails, the cursor is
+            // stranded past the tip -- a later append would write at the wrong
+            // offset and a torn partial record could be misread -- so poison the
+            // side-file and latch the handle (unconditionally, even if the poison
+            // write cannot reach a dying disk) so the caller's rollback fails and
+            // delta is disabled on this connection.
+            let truncated = self.file.set_len(start).is_ok();
+            let seeked = self.file.seek(SeekFrom::Start(start)).is_ok();
+            if !(truncated && seeked) {
+                self.poison();
+                self.poisoned = true;
+            }
             return Err(e);
         }
         self.append_offset = start + rec_len;
@@ -375,6 +420,17 @@ impl PersistedSymbolDict {
     /// [`poison`]: PersistedSymbolDict::poison
     /// [`open`]: PersistedSymbolDict::open
     pub(crate) fn rollback(&mut self, mark: PersistedSymbolDictMark) -> io::Result<()> {
+        // A poisoned handle (a partial-write cleanup failed, stranding the cursor)
+        // cannot be truncated to a trustworthy offset. Fail so the caller drops the
+        // handle and disables delta, rather than silently returning Ok and reusing a
+        // desynced file. Checked before the no-op fast path below, which would
+        // otherwise mask the poison after a failed append left `append_offset`
+        // unchanged.
+        if self.poisoned {
+            return Err(io::Error::other(
+                "persisted symbol dictionary poisoned by a failed partial-write cleanup",
+            ));
+        }
         if mark.append_offset >= self.append_offset {
             return Ok(());
         }
@@ -455,7 +511,15 @@ impl PersistedSymbolDict {
         // byte-for-byte shape a delta section carries.
         let mut pos = HEADER_SIZE as usize;
         let mut count: u32 = 0;
+        // Fallible up-front reservation, upper-bounded by the file (itself capped at
+        // MAX_FILE_LEN): the `extend_from_slice` in the loop below then fills it
+        // without re-allocating, so a ~2 GiB recovery surfaces a transient error
+        // rather than defeating `buf`'s OOM guard with a second infallible ~2 GiB
+        // allocation.
         let mut loaded_entries: Vec<u8> = Vec::new();
+        loaded_entries
+            .try_reserve(buf.len())
+            .map_err(|_| io::Error::other("persisted symbol dictionary: allocation too large"))?;
         while pos < buf.len() {
             // [payload_len: u32][payload][crc32c: u32]
             let Some(payload_start) = pos.checked_add(RECORD_LEN_PREFIX) else {
@@ -516,6 +580,9 @@ impl PersistedSymbolDict {
             size: count,
             loaded_entries,
             append_scratch: Vec::new(),
+            poisoned: false,
+            #[cfg(test)]
+            fail_next_append_cleanup: false,
         }))
     }
 
@@ -540,6 +607,9 @@ impl PersistedSymbolDict {
             size: 0,
             loaded_entries: Vec::new(),
             append_scratch: Vec::new(),
+            poisoned: false,
+            #[cfg(test)]
+            fail_next_append_cleanup: false,
         })
     }
 }
@@ -994,6 +1064,41 @@ mod tests {
         drop(d);
         let d = PersistedSymbolDict::open(dir.path()).unwrap();
         assert_eq!(d.read_loaded_symbols(), vec![b"one".to_vec()]);
+    }
+
+    #[test]
+    fn failed_partial_write_cleanup_poisons_the_handle_and_fails_rollback() {
+        // When a partial write's cleanup (set_len/seek back to the tip) fails, the
+        // OS cursor is stranded past the logical tip, so the handle must poison
+        // itself: a later rollback must FAIL (so the caller drops the handle and
+        // disables delta) rather than silently no-op, a later append must fail, and
+        // a fresh open must recover clean (the poisoned magic reads as bad-magic).
+        let dir = tmp_slot();
+        let mut d = PersistedSymbolDict::open(dir.path()).unwrap();
+        d.append_symbol(b"alpha").unwrap();
+        let mark = d.mark();
+
+        // Force the next append down the failed-partial-write-cleanup path.
+        d.fail_next_append_cleanup = true;
+        let err = d.append_symbol(b"bravo").unwrap_err();
+        assert!(err.to_string().contains("cleanup"), "{err}");
+
+        // Poisoned: rollback fails (not a silent Ok no-op), and further appends fail.
+        assert!(
+            d.rollback(mark).is_err(),
+            "a poisoned handle must fail rollback, not silently no-op -- otherwise \
+             the caller never disables delta"
+        );
+        assert!(
+            d.append_symbol(b"charlie").is_err(),
+            "a poisoned handle must reject further appends"
+        );
+        drop(d);
+
+        // The on-disk magic was poisoned, so a fresh open recovers empty.
+        let reopened = PersistedSymbolDict::open(dir.path()).unwrap();
+        assert_eq!(reopened.size(), 0, "a poisoned side-file recovers fresh");
+        assert!(reopened.read_loaded_symbols().is_empty());
     }
 
     #[test]

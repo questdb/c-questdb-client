@@ -2918,6 +2918,23 @@ pub(crate) fn connect_qwp_ws(
     Ok(SyncProtocolHandler::SyncQwpWs(Box::new(state)))
 }
 
+/// Fallible copy of a recovered-dictionary byte region. A ~2 GiB recovery must
+/// surface an error, not abort the host via an infallible `to_vec`/`clone` -- that
+/// would defeat the fallible `try_reserve`/`MAX_FILE_LEN` guard the side-file
+/// reader already applies.
+fn try_dup_recovered(src: &[u8]) -> crate::Result<Vec<u8>> {
+    let mut v = Vec::new();
+    v.try_reserve_exact(src.len()).map_err(|_| {
+        error::fmt!(
+            SocketError,
+            "recovered symbol dictionary is too large to allocate ({} bytes)",
+            src.len()
+        )
+    })?;
+    v.extend_from_slice(src);
+    Ok(v)
+}
+
 pub(crate) fn connect_qwp_ws_background_state(
     host: &str,
     port: &str,
@@ -2949,7 +2966,7 @@ pub(crate) fn connect_qwp_ws_background_state(
         // foreground dict + the I/O thread's catch-up mirror), and the side-file
         // handle (routed to the owning foreground for write-ahead).
         let delta_dict_enabled = queue.is_delta_dict_enabled();
-        let recovered_dict_entries = queue.recovered_symbol_dict_entries().to_vec();
+        let recovered_dict_entries = try_dup_recovered(queue.recovered_symbol_dict_entries())?;
         let recovered_dict_count = queue.recovered_symbol_dict_count();
         let persisted_symbol_dict = queue.take_persisted_symbol_dict();
         // Async connect builds the send core lazily on the I/O thread; the driver
@@ -2986,7 +3003,7 @@ pub(crate) fn connect_qwp_ws_background_state(
             *qwp_ws.request_durable_ack,
             Arc::clone(&server_max_batch_size),
             delta_dict_enabled,
-            recovered_dict_entries.clone(),
+            try_dup_recovered(&recovered_dict_entries)?,
             recovered_dict_count,
         );
         let runner = SyncQwpWsRunner::start_pending_connect(
