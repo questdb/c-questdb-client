@@ -2177,12 +2177,18 @@ pub(crate) fn resolve_arrow_symbols(
     let mut new_symbols: Vec<Vec<u8>> = Vec::new();
     let mut per_column: Vec<Option<ArrowResolvedSymbolColumn>> =
         Vec::with_capacity(classified.len());
+    // The full-batch path does not yet reuse gids buffers across flushes (a
+    // follow-up would hold this in per-sender scratch); a local pool keeps the
+    // shared `resolve_arrow_symbol_column` signature uniform without changing
+    // full-batch allocation behaviour.
+    let mut gids_pool: Vec<Vec<u64>> = Vec::new();
     for col in classified {
         per_column.push(resolve_arrow_symbol_column(
             col.arr,
             col.kind,
             symbol_dict,
             &mut new_symbols,
+            &mut gids_pool,
         )?);
     }
     Ok(ArrowSymbolResolution {
@@ -2263,6 +2269,7 @@ pub(crate) fn resolve_arrow_symbol_column(
     kind: ColumnKind,
     symbol_dict: &mut SymbolGlobalDict,
     new_symbols: &mut Vec<Vec<u8>>,
+    gids_pool: &mut Vec<Vec<u64>>,
 ) -> Result<Option<ArrowResolvedSymbolColumn>> {
     let resolved = match kind {
         ColumnKind::SymbolUtf8 => resolve_symbol_strings(
@@ -2270,21 +2277,24 @@ pub(crate) fn resolve_arrow_symbol_column(
             arr.as_any().downcast_ref::<StringArray>().unwrap(),
             symbol_dict,
             new_symbols,
+            gids_pool,
         )?,
         ColumnKind::SymbolLargeUtf8 => resolve_symbol_strings(
             arr,
             arr.as_any().downcast_ref::<LargeStringArray>().unwrap(),
             symbol_dict,
             new_symbols,
+            gids_pool,
         )?,
         ColumnKind::SymbolUtf8View => resolve_symbol_strings(
             arr,
             arr.as_any().downcast_ref::<StringViewArray>().unwrap(),
             symbol_dict,
             new_symbols,
+            gids_pool,
         )?,
         ColumnKind::SymbolDict { key, value } => {
-            resolve_symbol_dict(arr, key, value, symbol_dict, new_symbols)?
+            resolve_symbol_dict(arr, key, value, symbol_dict, new_symbols, gids_pool)?
         }
         _ => return Ok(None),
     };
@@ -2436,17 +2446,30 @@ impl VarlenSource for BinaryViewArray {
     }
 }
 
+/// Pop a reusable `gids` buffer from the pool (or allocate one), cleared and
+/// reserved for `cap` entries. Reclaimed into the pool by `EncodeScratch::reset`
+/// after the flush, so a steady flow of arrow-symbol flushes reuses the buffers
+/// instead of allocating one `Vec<u64>` per symbol column per flush -- mirroring
+/// the row path's `symbol_gid_pool`.
+fn take_pooled_gids(pool: &mut Vec<Vec<u64>>, cap: usize) -> Vec<u64> {
+    let mut gids = pool.pop().unwrap_or_default();
+    gids.clear();
+    gids.reserve(cap);
+    gids
+}
+
 fn resolve_symbol_strings<S: VarlenSource>(
     arr: &dyn Array,
     source: &S,
     symbol_dict: &mut SymbolGlobalDict,
     new_symbols: &mut Vec<Vec<u8>>,
+    gids_pool: &mut Vec<Vec<u64>>,
 ) -> Result<ArrowResolvedSymbolColumn> {
     use std::collections::HashMap;
     use std::hash::BuildHasherDefault;
     let row_count = arr.len();
     let non_null = non_null_count(arr, "SYMBOL column")?;
-    let mut gids = Vec::with_capacity(non_null);
+    let mut gids = take_pooled_gids(gids_pool, non_null);
     // Dedup within the column so the global dict is hit once per distinct
     // value rather than once per row — matching the dictionary path and the
     // row API's bulk-intern. Uses the dict's fast non-DoS hasher, not SipHash.
@@ -2478,6 +2501,7 @@ fn resolve_symbol_dict(
     value: DictValue,
     symbol_dict: &mut SymbolGlobalDict,
     new_symbols: &mut Vec<Vec<u8>>,
+    gids_pool: &mut Vec<Vec<u64>>,
 ) -> Result<ArrowResolvedSymbolColumn> {
     let non_null = non_null_count(arr, "SYMBOL dictionary column")?;
 
@@ -2486,6 +2510,7 @@ fn resolve_symbol_dict(
         non_null: usize,
         symbol_dict: &mut SymbolGlobalDict,
         new_symbols: &mut Vec<Vec<u8>>,
+        gids_pool: &mut Vec<Vec<u64>>,
         get_slot: impl Fn(&DictionaryArray<K::ArrowType>, usize) -> usize,
     ) -> Result<ArrowResolvedSymbolColumn>
     where
@@ -2516,7 +2541,7 @@ fn resolve_symbol_dict(
             symbol_dict.take_arrow_dict_memo(&identity, &values_data, dict_len);
 
         let resolved = (|| -> Result<Vec<u64>> {
-            let mut gids = Vec::with_capacity(non_null);
+            let mut gids = take_pooled_gids(gids_pool, non_null);
             for row in 0..row_count {
                 if arr.is_null(row) {
                     continue;
@@ -2560,96 +2585,150 @@ fn resolve_symbol_dict(
     }
 
     match (key, value) {
-        (DictKey::I8, DictValue::Utf8) => {
-            run::<I8KeyTag, StringArray>(arr, non_null, symbol_dict, new_symbols, |d, r| {
-                d.keys().value(r) as usize
-            })
-        }
-        (DictKey::I8, DictValue::LargeUtf8) => {
-            run::<I8KeyTag, LargeStringArray>(arr, non_null, symbol_dict, new_symbols, |d, r| {
-                d.keys().value(r) as usize
-            })
-        }
-        (DictKey::I8, DictValue::Utf8View) => {
-            run::<I8KeyTag, StringViewArray>(arr, non_null, symbol_dict, new_symbols, |d, r| {
-                d.keys().value(r) as usize
-            })
-        }
-        (DictKey::I16, DictValue::Utf8) => {
-            run::<I16KeyTag, StringArray>(arr, non_null, symbol_dict, new_symbols, |d, r| {
-                d.keys().value(r) as usize
-            })
-        }
-        (DictKey::I16, DictValue::LargeUtf8) => {
-            run::<I16KeyTag, LargeStringArray>(arr, non_null, symbol_dict, new_symbols, |d, r| {
-                d.keys().value(r) as usize
-            })
-        }
-        (DictKey::I16, DictValue::Utf8View) => {
-            run::<I16KeyTag, StringViewArray>(arr, non_null, symbol_dict, new_symbols, |d, r| {
-                d.keys().value(r) as usize
-            })
-        }
-        (DictKey::I32, DictValue::Utf8) => {
-            run::<I32KeyTag, StringArray>(arr, non_null, symbol_dict, new_symbols, |d, r| {
-                d.keys().value(r) as usize
-            })
-        }
-        (DictKey::I32, DictValue::LargeUtf8) => {
-            run::<I32KeyTag, LargeStringArray>(arr, non_null, symbol_dict, new_symbols, |d, r| {
-                d.keys().value(r) as usize
-            })
-        }
-        (DictKey::I32, DictValue::Utf8View) => {
-            run::<I32KeyTag, StringViewArray>(arr, non_null, symbol_dict, new_symbols, |d, r| {
-                d.keys().value(r) as usize
-            })
-        }
-        (DictKey::U8, DictValue::Utf8) => {
-            run::<U8KeyTag, StringArray>(arr, non_null, symbol_dict, new_symbols, |d, r| {
-                d.keys().value(r) as usize
-            })
-        }
-        (DictKey::U8, DictValue::LargeUtf8) => {
-            run::<U8KeyTag, LargeStringArray>(arr, non_null, symbol_dict, new_symbols, |d, r| {
-                d.keys().value(r) as usize
-            })
-        }
-        (DictKey::U8, DictValue::Utf8View) => {
-            run::<U8KeyTag, StringViewArray>(arr, non_null, symbol_dict, new_symbols, |d, r| {
-                d.keys().value(r) as usize
-            })
-        }
-        (DictKey::U16, DictValue::Utf8) => {
-            run::<U16KeyTag, StringArray>(arr, non_null, symbol_dict, new_symbols, |d, r| {
-                d.keys().value(r) as usize
-            })
-        }
-        (DictKey::U16, DictValue::LargeUtf8) => {
-            run::<U16KeyTag, LargeStringArray>(arr, non_null, symbol_dict, new_symbols, |d, r| {
-                d.keys().value(r) as usize
-            })
-        }
-        (DictKey::U16, DictValue::Utf8View) => {
-            run::<U16KeyTag, StringViewArray>(arr, non_null, symbol_dict, new_symbols, |d, r| {
-                d.keys().value(r) as usize
-            })
-        }
-        (DictKey::U32, DictValue::Utf8) => {
-            run::<U32KeyTag, StringArray>(arr, non_null, symbol_dict, new_symbols, |d, r| {
-                d.keys().value(r) as usize
-            })
-        }
-        (DictKey::U32, DictValue::LargeUtf8) => {
-            run::<U32KeyTag, LargeStringArray>(arr, non_null, symbol_dict, new_symbols, |d, r| {
-                d.keys().value(r) as usize
-            })
-        }
-        (DictKey::U32, DictValue::Utf8View) => {
-            run::<U32KeyTag, StringViewArray>(arr, non_null, symbol_dict, new_symbols, |d, r| {
-                d.keys().value(r) as usize
-            })
-        }
+        (DictKey::I8, DictValue::Utf8) => run::<I8KeyTag, StringArray>(
+            arr,
+            non_null,
+            symbol_dict,
+            new_symbols,
+            gids_pool,
+            |d, r| d.keys().value(r) as usize,
+        ),
+        (DictKey::I8, DictValue::LargeUtf8) => run::<I8KeyTag, LargeStringArray>(
+            arr,
+            non_null,
+            symbol_dict,
+            new_symbols,
+            gids_pool,
+            |d, r| d.keys().value(r) as usize,
+        ),
+        (DictKey::I8, DictValue::Utf8View) => run::<I8KeyTag, StringViewArray>(
+            arr,
+            non_null,
+            symbol_dict,
+            new_symbols,
+            gids_pool,
+            |d, r| d.keys().value(r) as usize,
+        ),
+        (DictKey::I16, DictValue::Utf8) => run::<I16KeyTag, StringArray>(
+            arr,
+            non_null,
+            symbol_dict,
+            new_symbols,
+            gids_pool,
+            |d, r| d.keys().value(r) as usize,
+        ),
+        (DictKey::I16, DictValue::LargeUtf8) => run::<I16KeyTag, LargeStringArray>(
+            arr,
+            non_null,
+            symbol_dict,
+            new_symbols,
+            gids_pool,
+            |d, r| d.keys().value(r) as usize,
+        ),
+        (DictKey::I16, DictValue::Utf8View) => run::<I16KeyTag, StringViewArray>(
+            arr,
+            non_null,
+            symbol_dict,
+            new_symbols,
+            gids_pool,
+            |d, r| d.keys().value(r) as usize,
+        ),
+        (DictKey::I32, DictValue::Utf8) => run::<I32KeyTag, StringArray>(
+            arr,
+            non_null,
+            symbol_dict,
+            new_symbols,
+            gids_pool,
+            |d, r| d.keys().value(r) as usize,
+        ),
+        (DictKey::I32, DictValue::LargeUtf8) => run::<I32KeyTag, LargeStringArray>(
+            arr,
+            non_null,
+            symbol_dict,
+            new_symbols,
+            gids_pool,
+            |d, r| d.keys().value(r) as usize,
+        ),
+        (DictKey::I32, DictValue::Utf8View) => run::<I32KeyTag, StringViewArray>(
+            arr,
+            non_null,
+            symbol_dict,
+            new_symbols,
+            gids_pool,
+            |d, r| d.keys().value(r) as usize,
+        ),
+        (DictKey::U8, DictValue::Utf8) => run::<U8KeyTag, StringArray>(
+            arr,
+            non_null,
+            symbol_dict,
+            new_symbols,
+            gids_pool,
+            |d, r| d.keys().value(r) as usize,
+        ),
+        (DictKey::U8, DictValue::LargeUtf8) => run::<U8KeyTag, LargeStringArray>(
+            arr,
+            non_null,
+            symbol_dict,
+            new_symbols,
+            gids_pool,
+            |d, r| d.keys().value(r) as usize,
+        ),
+        (DictKey::U8, DictValue::Utf8View) => run::<U8KeyTag, StringViewArray>(
+            arr,
+            non_null,
+            symbol_dict,
+            new_symbols,
+            gids_pool,
+            |d, r| d.keys().value(r) as usize,
+        ),
+        (DictKey::U16, DictValue::Utf8) => run::<U16KeyTag, StringArray>(
+            arr,
+            non_null,
+            symbol_dict,
+            new_symbols,
+            gids_pool,
+            |d, r| d.keys().value(r) as usize,
+        ),
+        (DictKey::U16, DictValue::LargeUtf8) => run::<U16KeyTag, LargeStringArray>(
+            arr,
+            non_null,
+            symbol_dict,
+            new_symbols,
+            gids_pool,
+            |d, r| d.keys().value(r) as usize,
+        ),
+        (DictKey::U16, DictValue::Utf8View) => run::<U16KeyTag, StringViewArray>(
+            arr,
+            non_null,
+            symbol_dict,
+            new_symbols,
+            gids_pool,
+            |d, r| d.keys().value(r) as usize,
+        ),
+        (DictKey::U32, DictValue::Utf8) => run::<U32KeyTag, StringArray>(
+            arr,
+            non_null,
+            symbol_dict,
+            new_symbols,
+            gids_pool,
+            |d, r| d.keys().value(r) as usize,
+        ),
+        (DictKey::U32, DictValue::LargeUtf8) => run::<U32KeyTag, LargeStringArray>(
+            arr,
+            non_null,
+            symbol_dict,
+            new_symbols,
+            gids_pool,
+            |d, r| d.keys().value(r) as usize,
+        ),
+        (DictKey::U32, DictValue::Utf8View) => run::<U32KeyTag, StringViewArray>(
+            arr,
+            non_null,
+            symbol_dict,
+            new_symbols,
+            gids_pool,
+            |d, r| d.keys().value(r) as usize,
+        ),
     }
 }
 
@@ -5320,13 +5399,16 @@ mod tests {
         };
         let mut gd = SymbolGlobalDict::new();
         let mut new_symbols: Vec<Vec<u8>> = Vec::new();
+        let mut gids_pool: Vec<Vec<u64>> = Vec::new();
 
-        let r_ab = resolve_arrow_symbol_column(&dict_ab, kind, &mut gd, &mut new_symbols)
-            .unwrap()
-            .unwrap();
-        let r_cd = resolve_arrow_symbol_column(&dict_cd, kind, &mut gd, &mut new_symbols)
-            .unwrap()
-            .unwrap();
+        let r_ab =
+            resolve_arrow_symbol_column(&dict_ab, kind, &mut gd, &mut new_symbols, &mut gids_pool)
+                .unwrap()
+                .unwrap();
+        let r_cd =
+            resolve_arrow_symbol_column(&dict_cd, kind, &mut gd, &mut new_symbols, &mut gids_pool)
+                .unwrap()
+                .unwrap();
 
         let sym = |gid: u64| gd.entry(gid).unwrap().to_vec();
         assert_eq!(sym(r_ab.gids[0]), b"A");

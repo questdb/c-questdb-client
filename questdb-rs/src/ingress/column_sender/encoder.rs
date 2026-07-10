@@ -75,13 +75,23 @@ impl EncodeScratch {
     fn reset(&mut self) {
         self.signature.clear();
         self.new_symbols.clear();
-        // Reclaim each row-symbol column's `slot -> gid` table into the free list
-        // before dropping the resolutions, so it is reused next flush.
+        // Reclaim each symbol column's `slot -> gid` / per-row gid table into the
+        // free list before dropping the resolutions, so it is reused next flush.
+        // Row and arrow buffers share one `Vec<u64>` pool.
         for col in self.per_column.drain(..) {
-            if let Some(ResolvedColumn::Row(row)) = col {
-                let mut gids = row.local_to_global;
-                gids.clear();
-                self.symbol_gid_pool.push(gids);
+            match col {
+                Some(ResolvedColumn::Row(row)) => {
+                    let mut gids = row.local_to_global;
+                    gids.clear();
+                    self.symbol_gid_pool.push(gids);
+                }
+                #[cfg(feature = "arrow-ingress")]
+                Some(ResolvedColumn::Arrow(arrow)) => {
+                    let mut gids = arrow.gids;
+                    gids.clear();
+                    self.symbol_gid_pool.push(gids);
+                }
+                None => {}
             }
         }
         self.referenced.clear();
@@ -631,6 +641,7 @@ fn resolve_symbols(
                     arrow_kind,
                     symbol_dict,
                     new_symbols,
+                    symbol_gid_pool,
                 )?;
                 per_column.push(resolved.map(ResolvedColumn::Arrow));
             }
@@ -1964,5 +1975,53 @@ mod tests {
         encode_chunk_into(&mut out2, &chunk2, &mut dict2, &mut scratch, false).unwrap();
 
         assert_eq!(out1, out2, "pooled reuse must not change the encoded wire");
+    }
+
+    #[cfg(feature = "arrow-ingress")]
+    #[test]
+    fn arrow_symbol_gids_are_pooled_and_reused_across_flushes() {
+        // The arrow symbol path's per-column gids buffer is reclaimed into the same
+        // scratch free list as the row path on reset, so a steady flow of
+        // arrow-symbol flushes reuses it instead of allocating a fresh Vec<u64> per
+        // column per flush. The reused buffer is cleared/refilled, so the wire is
+        // unchanged.
+        use crate::ingress::column_sender::arrow_batch;
+        use arrow::array::{ArrayRef, StringArray};
+        use std::sync::Arc;
+
+        let build = || {
+            let arr: ArrayRef = Arc::new(StringArray::from(vec!["AAPL", "MSFT", "AAPL"]));
+            let mut chunk = Chunk::new("trades");
+            chunk
+                .push_arrow_deferred("sym", arrow_batch::ColumnKind::SymbolUtf8, arr)
+                .unwrap();
+            chunk.at_nanos(&[1i64, 2, 3]).unwrap();
+            chunk
+        };
+
+        let mut scratch = EncodeScratch::new();
+
+        let chunk1 = build();
+        let mut dict1 = SymbolGlobalDict::new();
+        let mut out1 = Vec::new();
+        encode_chunk_into(&mut out1, &chunk1, &mut dict1, &mut scratch, false).unwrap();
+
+        // A reset after the flush reclaims the arrow gids buffer into the free list.
+        scratch.reset();
+        assert!(
+            !scratch.symbol_gid_pool.is_empty(),
+            "the arrow symbol gids buffer must be reclaimed into the free list on reset"
+        );
+
+        // Flush 2 pops the pooled buffer; the wire must match flush 1.
+        let chunk2 = build();
+        let mut dict2 = SymbolGlobalDict::new();
+        let mut out2 = Vec::new();
+        encode_chunk_into(&mut out2, &chunk2, &mut dict2, &mut scratch, false).unwrap();
+
+        assert_eq!(
+            out1, out2,
+            "the reused gids buffer must be refilled, not stale"
+        );
     }
 }
