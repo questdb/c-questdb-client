@@ -117,13 +117,16 @@ const RECORD_LEN_PREFIX: usize = 4;
 const RECORD_CRC_LEN: usize = 4;
 
 /// Upper bound on the side-file size accepted at [`open`](PersistedSymbolDict::open) /
-/// [`open_recovered`](PersistedSymbolDict::open_recovered). A legitimate dictionary
-/// is bounded by the connection symbol-dict cap (`MAX_CONN_SYMBOL_DICT_SIZE`,
-/// 8,388,608 entries), so a larger file is corrupt. Capping `file_len` before
+/// [`open_recovered`](PersistedSymbolDict::open_recovered). A legitimate dictionary's
+/// UTF-8 bytes are bounded writer-side by the connection heap cap
+/// (`MAX_CONN_SYMBOL_DICT_HEAP_BYTES`, 256 MiB, enforced at `intern`); adding the
+/// per-entry length prefixes and per-record framing keeps a legitimate file well
+/// under this ceiling, so a larger file is corrupt. Capping `file_len` before
 /// reading keeps a corrupt/oversized file from driving `read_to_end` to an OOM
 /// abort — its allocation is infallible and aborts the host regardless of the
-/// panic setting. Generous (the entry cap at 256 bytes average, ~2 GiB); exceeding
-/// it degrades to a fresh/dense recovery rather than loading the file.
+/// panic setting. Deliberately generous defence-in-depth (~2 GiB, ~8x the
+/// legitimate maximum); exceeding it degrades to a fresh/dense recovery rather
+/// than loading the file.
 const MAX_FILE_LEN: u64 = HEADER_SIZE + (8 * 1024 * 1024) * 256;
 
 /// A point in the persisted dictionary's append history, taken before a frame's

@@ -5118,6 +5118,16 @@ pub(crate) struct SymbolGlobalDict {
     entries: Vec<std::sync::Arc<[u8]>>,
     next_id: u64,
     cap: usize,
+    /// Running total of the UTF-8 bytes held across every entry, so
+    /// [`intern`](Self::intern) can enforce the connection heap cap in O(1)
+    /// instead of summing `entries` on each call. Advanced in lockstep with
+    /// `entries`/`next_id`, snapshotted by [`mark`](Self::mark), and restored by
+    /// [`rollback`](Self::rollback).
+    heap_bytes: usize,
+    /// Aggregate heap-byte ceiling, defaulting to
+    /// [`MAX_CONN_SYMBOL_DICT_HEAP_BYTES`]; a field (like `cap`) so tests can
+    /// shrink it without interning 256 MiB.
+    heap_cap: usize,
     #[cfg(feature = "arrow-ingress")]
     arrow_dict_memo: Vec<ArrowDictSlotMemo>,
 }
@@ -5157,11 +5167,27 @@ impl Default for SymbolGlobalDict {
 #[cfg(feature = "_sender-qwp-ws")]
 pub(crate) const MAX_CONN_SYMBOL_DICT_SIZE: usize = 8_388_608;
 
+/// Per-connection cap on the cumulative UTF-8 heap (in bytes) the QWP/WS global
+/// symbol dictionary holds. Matches `MAX_CONN_DICT_HEAP_BYTES` in the egress
+/// reader (`egress/symbol_dict.rs`) and the Java reference client. The entry
+/// count ([`MAX_CONN_SYMBOL_DICT_SIZE`]) and per-entry length
+/// ([`MAX_PERSISTED_SYMBOL_ENTRY_LEN`]) caps do NOT bound the aggregate heap
+/// (8M entries * 1 MiB ~= 8 TiB), so without this cap a high-cardinality /
+/// large-symbol connection could (a) build a dictionary the server rejects with
+/// no ingestion-side error, and (b) grow the persisted side-file past
+/// `MAX_FILE_LEN` (~2 GiB), which recovery then discards as over-cap -- stranding
+/// the slot's queued delta frames at the torn-dict guard. Enforcing the same
+/// 256 MiB bound the reader/server use keeps writer and reader in lockstep and a
+/// legitimate side-file well under `MAX_FILE_LEN`.
+#[cfg(feature = "_sender-qwp-ws")]
+pub(crate) const MAX_CONN_SYMBOL_DICT_HEAP_BYTES: usize = 256 * 1024 * 1024;
+
 #[cfg(feature = "_sender-qwp-ws")]
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct SymbolGlobalDictMark {
     entries_len: usize,
     next_id: u64,
+    heap_bytes: usize,
 }
 
 #[cfg(feature = "_sender-qwp-ws")]
@@ -5172,6 +5198,8 @@ impl SymbolGlobalDict {
             entries: Vec::new(),
             next_id: 0,
             cap: MAX_CONN_SYMBOL_DICT_SIZE,
+            heap_bytes: 0,
+            heap_cap: MAX_CONN_SYMBOL_DICT_HEAP_BYTES,
             #[cfg(feature = "arrow-ingress")]
             arrow_dict_memo: Vec::new(),
         }
@@ -5183,6 +5211,17 @@ impl SymbolGlobalDict {
     #[cfg(test)]
     pub(crate) fn with_cap(cap: usize) -> Self {
         Self { cap, ..Self::new() }
+    }
+
+    /// Same as [`new`](Self::new) but with a smaller heap-byte cap so the
+    /// heap-cap-rejection path can be exercised without interning 256 MiB of
+    /// symbols.
+    #[cfg(test)]
+    pub(crate) fn with_heap_cap(heap_cap: usize) -> Self {
+        Self {
+            heap_cap,
+            ..Self::new()
+        }
     }
 
     #[cfg(test)]
@@ -5201,6 +5240,7 @@ impl SymbolGlobalDict {
         SymbolGlobalDictMark {
             entries_len: self.entries.len(),
             next_id: self.next_id,
+            heap_bytes: self.heap_bytes,
         }
     }
 
@@ -5209,6 +5249,7 @@ impl SymbolGlobalDict {
             self.map.remove(entry.as_ref());
         }
         self.next_id = mark.next_id;
+        self.heap_bytes = mark.heap_bytes;
         #[cfg(feature = "arrow-ingress")]
         self.arrow_dict_memo.clear();
     }
@@ -5263,8 +5304,9 @@ impl SymbolGlobalDict {
     }
 
     /// Returns `(global_id, is_new)`. Errors with `InvalidApiCall` if the symbol
-    /// exceeds [`MAX_PERSISTED_SYMBOL_ENTRY_LEN`] or the dictionary has reached
-    /// [`MAX_CONN_SYMBOL_DICT_SIZE`].
+    /// exceeds [`MAX_PERSISTED_SYMBOL_ENTRY_LEN`], or interning it would push the
+    /// dictionary past its entry-count cap ([`MAX_CONN_SYMBOL_DICT_SIZE`]) or its
+    /// cumulative heap cap ([`MAX_CONN_SYMBOL_DICT_HEAP_BYTES`]).
     pub(crate) fn intern(&mut self, bytes: &[u8]) -> crate::Result<(u64, bool)> {
         // A symbol larger than the persisted side-file's per-entry cap would be
         // interned, used in a frame and ACKed, then rejected as torn by the
@@ -5294,6 +5336,27 @@ impl SymbolGlobalDict {
                 self.cap
             ));
         }
+        // Aggregate heap cap: the entry-count and per-entry caps above do NOT
+        // bound the total bytes (8M entries * 1 MiB ~= 8 TiB). Enforce the same
+        // 256 MiB connection heap the egress reader / server / Java client use,
+        // at this single ingestion choke point, so an oversized *aggregate* never
+        // gets an id or is written ahead -- otherwise the persisted side-file
+        // could grow past `MAX_FILE_LEN` and be discarded on recovery, stranding
+        // queued frames. `checked_add` is defensive: `bytes.len()` is already
+        // <= 1 MiB and `heap_bytes` <= the cap, so it cannot actually overflow.
+        let new_heap = self
+            .heap_bytes
+            .checked_add(bytes.len())
+            .filter(|&h| h <= self.heap_cap)
+            .ok_or_else(|| {
+                crate::error::fmt!(
+                    InvalidApiCall,
+                    "QWP/WS connection-scoped symbol dictionary reached its \
+                     {}-byte heap cap; drop and reopen the connection to reset \
+                     the dictionary",
+                    self.heap_cap
+                )
+            })?;
         self.entries
             .try_reserve(1)
             .map_err(|_| crate::error::fmt!(InvalidApiCall, "symbol dict allocation failed"))?;
@@ -5305,6 +5368,7 @@ impl SymbolGlobalDict {
         self.entries.push(std::sync::Arc::clone(&owned));
         self.map.insert(owned, id);
         self.next_id += 1;
+        self.heap_bytes = new_heap;
         Ok((id, true))
     }
 
@@ -9341,6 +9405,61 @@ mod tests {
         let err = dict.intern(&over).unwrap_err();
         assert_eq!(err.code(), ErrorCode::InvalidApiCall);
         assert!(err.msg().contains("exceeding"), "{}", err.msg());
+    }
+
+    #[cfg(feature = "_sender-qwp-ws")]
+    #[test]
+    fn symbol_dict_enforces_heap_byte_cap_independently_of_entry_and_per_entry_caps() {
+        // The entry-count and per-entry caps do not bound the aggregate heap, so
+        // intern enforces the connection heap cap separately. A small heap cap
+        // exercises the path without interning 256 MiB; every entry here is well
+        // under the per-entry cap and the count under the entry cap, so only the
+        // heap cap can reject.
+        let mut dict = SymbolGlobalDict::with_heap_cap(10);
+        assert!(dict.intern(b"aaaaa").unwrap().1); // heap 5/10
+        assert!(dict.intern(b"bbbbb").unwrap().1); // heap 10/10 -- exactly at the cap is accepted
+        assert_eq!(dict.len(), 2);
+
+        // A distinct symbol that would push the heap past the cap is rejected, and
+        // gets no id.
+        let err = dict.intern(b"c").unwrap_err();
+        assert_eq!(err.code(), ErrorCode::InvalidApiCall);
+        assert!(err.msg().contains("heap"), "{}", err.msg());
+        assert_eq!(dict.len(), 2);
+
+        // A duplicate does not grow the heap (it resolves before the cap check), so
+        // it still interns at the cap.
+        let (id, is_new) = dict.intern(b"aaaaa").unwrap();
+        assert!(!is_new);
+        assert_eq!(id, 0);
+    }
+
+    #[cfg(feature = "_sender-qwp-ws")]
+    #[test]
+    fn symbol_dict_rollback_restores_the_heap_counter() {
+        // mark/rollback must restore heap_bytes in lockstep with entries/next_id --
+        // a frame write-aheads its symbols, then on a publish failure rolls them
+        // back and reuses the ids AND the freed heap budget for the next frame. If
+        // the counter were not restored, the freed bytes would leak and a later
+        // intern be wrongly rejected.
+        let mut dict = SymbolGlobalDict::with_heap_cap(10);
+        assert!(dict.intern(b"aaaaa").unwrap().1); // heap 5/10, id 0
+        let mark = dict.mark();
+        assert!(dict.intern(b"bbbbb").unwrap().1); // heap 10/10, id 1
+
+        dict.rollback(mark); // discard "bbbbb": frees its id AND its 5 heap bytes
+        assert_eq!(dict.len(), 1);
+
+        // The freed 5 bytes are reusable: a fresh 5-byte symbol fits again at id 1.
+        // (Were the counter stuck at 10, this would be wrongly rejected.)
+        let (id, is_new) = dict.intern(b"ccccc").unwrap();
+        assert!(is_new);
+        assert_eq!(id, 1);
+
+        // The cap is still enforced against the restored counter.
+        let err = dict.intern(b"d").unwrap_err();
+        assert_eq!(err.code(), ErrorCode::InvalidApiCall);
+        assert!(err.msg().contains("heap"), "{}", err.msg());
     }
 
     #[cfg(feature = "_sender-qwp-ws")]
