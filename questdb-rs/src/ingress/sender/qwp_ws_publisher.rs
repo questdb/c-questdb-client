@@ -75,6 +75,16 @@ impl QwpWsReplayEncoder {
         self.global_dict.seed(entries, count)
     }
 
+    /// Releases the connection dictionary this (row) encoder interned at connect.
+    /// A column sender forces async connect, which seeds the recovered dictionary
+    /// into this encoder as a synchronous validator -- but the column backend uses
+    /// its own dictionary and never touches this encoder, so the seeded copy (up to
+    /// one full dictionary) is dead weight for the connection's life. Called by the
+    /// column sender once it has claimed the side-file.
+    pub(crate) fn release_dormant_dict(&mut self) {
+        self.global_dict = SymbolGlobalDict::new();
+    }
+
     /// Appends the symbols `[from_id, next_id)` this frame introduced to the
     /// persisted side-file. No-op in memory mode (no side-file).
     fn persist_new_symbols(&mut self, from_id: u64) -> crate::Result<()> {
@@ -135,8 +145,14 @@ impl QwpWsReplayEncoder {
     /// the side-file must never linger ahead of the in-memory dictionary and the
     /// driver's send mirror. Dropping the handle also disables delta encoding
     /// (falls back to dense, self-sufficient frames) so subsequent frames stay
-    /// crash-recoverable without the side-file. Mirrors
-    /// `SfaColumnBackend::rollback_frame`.
+    /// crash-recoverable without the side-file.
+    ///
+    /// The driver's send mirror lives on the I/O thread and cannot be reached from
+    /// here, so it stays enabled while the foreground goes dense. That is safe: the
+    /// dense frames this fallback emits base at id 0 and re-ship the whole dictionary,
+    /// which the torn-dict guard accepts as an idempotent overlap of the mirrored
+    /// prefix (see `guard_dict_not_torn` in `qwp_ws_driver`) and `accumulate` folds
+    /// back into lockstep. Mirrors `SfaColumnBackend::rollback_frame`.
     fn rollback_frame(
         &mut self,
         global_dict_mark: SymbolGlobalDictMark,
@@ -257,6 +273,44 @@ mod tests {
     }
 
     #[test]
+    fn file_mode_side_file_rollback_failure_drops_handle_and_disables_delta() {
+        // When the slot's persisted side-file cannot be rolled back (a failing
+        // disk), the encoder must drop the side-file handle AND disable delta so
+        // subsequent frames fall back to dense (self-sufficient) encoding -- a
+        // delta frame the poisoned/desynced side-file can no longer rebuild on
+        // recovery would strand the queued data at the send loop's torn-dict guard.
+        // Injected via the side-file's fail-next-append-cleanup hook, which poisons
+        // the handle so the write-ahead append fails and the ensuing rollback fails
+        // too, exercising `rollback_frame`'s truncate-failed branch. (The only other
+        // publisher test runs in memory mode, so this `Some(pd_mark)` branch was
+        // otherwise unexercised.)
+        let dir = tempfile::tempdir().unwrap();
+        let mut pd = PersistedSymbolDict::open(dir.path()).unwrap();
+        pd.arm_fail_next_append_cleanup();
+
+        let mut encoder = QwpWsReplayEncoder::new(1);
+        encoder.set_delta_dict_enabled(true);
+        encoder.set_persisted_symbol_dict(Some(pd));
+
+        // The frame interns a new symbol, so write-ahead appends it -- which the
+        // armed hook fails, poisoning the side-file and failing the rollback.
+        let err = encoder
+            .encode_and_publish(&one_symbol_buffer("alpha"), usize::MAX, |_payload| Ok(1))
+            .unwrap_err();
+        assert_eq!(err.code(), ErrorCode::SocketError);
+        assert!(err.msg().contains("persist"), "{err}");
+
+        assert!(
+            encoder.persisted_symbol_dict.is_none(),
+            "a failed side-file rollback must drop the handle"
+        );
+        assert!(
+            !encoder.delta_dict_enabled,
+            "dropping the side-file must disable delta so frames go dense"
+        );
+    }
+
+    #[test]
     fn replay_encoder_max_size_accounts_for_connection_global_symbol_prefix() {
         let mut encoder = QwpWsReplayEncoder::new(1);
         for idx in 0..130 {
@@ -321,5 +375,27 @@ mod tests {
             .encode_and_publish(&one_symbol_buffer("beta"), usize::MAX, |_payload| Ok(8))
             .unwrap();
         assert_eq!(encoder.global_dict.len(), 2);
+    }
+
+    #[test]
+    fn release_dormant_dict_frees_the_seeded_connection_dictionary() {
+        // A column sender forces async connect, which seeds the recovered dictionary
+        // into this (row) encoder as a synchronous validator -- but the column
+        // backend uses its own dictionary and never touches this encoder, so the
+        // seeded copy is dead weight. release_dormant_dict frees it.
+        let mut encoder = QwpWsReplayEncoder::new(1);
+        encoder.set_delta_dict_enabled(true);
+        // Two recovered entries: [len=3]"abc", [len=2]"xy".
+        encoder
+            .seed_global_dict(&[3, b'a', b'b', b'c', 2, b'x', b'y'], 2)
+            .unwrap();
+        assert_eq!(encoder.global_dict.len(), 2);
+
+        encoder.release_dormant_dict();
+        assert_eq!(
+            encoder.global_dict.len(),
+            0,
+            "the dormant encoder's seeded dictionary must be freed"
+        );
     }
 }

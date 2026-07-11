@@ -49,8 +49,8 @@ use crate::{Error, ErrorCode};
 
 #[cfg(feature = "sync-sender-qwp-ws")]
 use super::qwp_ws::{
-    QwpWsConnectRoundSuccess, QwpWsHostHealthTracker, WsFrameRead, WsFrameReader, WsStream,
-    connect_qwp_ws_endpoint_round, qwp_ws_configured_endpoints, write_binary_frame,
+    QwpWsConnectKind, QwpWsConnectRoundSuccess, QwpWsHostHealthTracker, WsFrameRead, WsFrameReader,
+    WsStream, connect_qwp_ws_endpoint_round, qwp_ws_configured_endpoints, write_binary_frame,
     write_ping_frame,
 };
 use super::qwp_ws_codec::{self as codec, PipelinedResponse};
@@ -1266,6 +1266,18 @@ impl<T: QwpWsCoreTransport> QwpWsSendCore<T> {
             }
             return Ok(());
         }
+        // Mirror enabled. Two legitimate sources emit a frame whose `delta_start` is
+        // `<= registered` -- an overlap the server tolerates idempotently, exactly as
+        // the reconnect catch-up + replay of already-registered ids relies on: a
+        // replayed already-sent frame, and a mid-connection DENSE fallback
+        // (`delta_start = 0`, self-sufficient) produced after a failed side-file
+        // rollback dropped delta encoding on the foreground while this mirror -- which
+        // the foreground cannot reach across the I/O-thread boundary -- stayed enabled
+        // (see `SfaColumnBackend::rollback_frame` / `QwpWsReplayEncoder::rollback_frame`).
+        // Both are safe *iff* the overlapping bytes match the mirror; a *differing*
+        // redefinition of a held id is the torn case rejected by `conflicts_with`
+        // below, and `accumulate` folds only the non-overlapping suffix so the mirror
+        // stays in lockstep. A `delta_start` ABOVE the mirror is an unrecoverable gap.
         let registered = u64::from(self.dict_mirror.count());
         if delta_start > registered {
             return Err(error::fmt!(
@@ -1352,6 +1364,7 @@ impl<T: QwpWsCoreTransport> QwpWsSendCore<T> {
             })
             .map_err(|e| match e {
                 CatchUpStreamError::EntryTooLarge(e) => DictCatchUpError::EntryTooLarge(e),
+                CatchUpStreamError::FrameBuildFailed => DictCatchUpError::FrameBuildFailed,
                 CatchUpStreamError::Emit(failure) => DictCatchUpError::Transport(failure),
             })
     }
@@ -1395,6 +1408,19 @@ impl<T: QwpWsCoreTransport> QwpWsSendCore<T> {
                  the dictionary -- resend required",
                     e.entry_bytes,
                     e.budget
+                )))
+            }
+            Err(DictCatchUpError::FrameBuildFailed) => {
+                // Building a catch-up frame failed (allocation, or a payload beyond
+                // the QWP u32 length field). Like EntryTooLarge this only records the
+                // error -- it never deletes the slot's segments or side-file -- so a
+                // disk slot's queued frames stay on disk for a later orphan drain /
+                // borrow to retry; no recoverable data is abandoned.
+                Err(CatchUpDriveError::Terminal(error::fmt!(
+                    SocketError,
+                    "QWP/WebSocket reconnect catch-up could not build a symbol-dictionary \
+                     frame (allocation failed or payload too large); queued data is \
+                     preserved for a later retry"
                 )))
             }
         }
@@ -2821,6 +2847,7 @@ pub(crate) struct BlockingQwpWsTransport {
     tracker: QwpWsHostHealthTracker,
     use_tls: bool,
     tls_settings: Option<TlsSettings>,
+    connect_kind: QwpWsConnectKind,
     qwp_ws: QwpWsConfig,
     auth_header: Option<String>,
     negotiated_version: u8,
@@ -2834,11 +2861,13 @@ pub(crate) struct BlockingQwpWsTransport {
 
 #[cfg(feature = "sync-sender-qwp-ws")]
 impl BlockingQwpWsTransport {
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn connect(
         host: impl Into<String>,
         port: impl Into<String>,
         use_tls: bool,
         tls_settings: Option<TlsSettings>,
+        connect_kind: QwpWsConnectKind,
         qwp_ws: QwpWsConfig,
         auth_header: Option<String>,
         server_max_batch_size: Arc<AtomicUsize>,
@@ -2855,6 +2884,7 @@ impl BlockingQwpWsTransport {
             None,
             use_tls,
             tls_settings.clone(),
+            connect_kind,
             &qwp_ws,
             auth_header.as_deref(),
         )?;
@@ -2863,6 +2893,7 @@ impl BlockingQwpWsTransport {
             tracker,
             use_tls,
             tls_settings,
+            connect_kind,
             qwp_ws,
             auth_header,
             server_max_batch_size,
@@ -2876,6 +2907,7 @@ impl BlockingQwpWsTransport {
         tracker: QwpWsHostHealthTracker,
         use_tls: bool,
         tls_settings: Option<TlsSettings>,
+        connect_kind: QwpWsConnectKind,
         qwp_ws: QwpWsConfig,
         auth_header: Option<String>,
         server_max_batch_size: Arc<AtomicUsize>,
@@ -2888,6 +2920,7 @@ impl BlockingQwpWsTransport {
             tracker,
             use_tls,
             tls_settings,
+            connect_kind,
             qwp_ws,
             auth_header,
             negotiated_version: connected.negotiated_version,
@@ -2912,6 +2945,7 @@ impl BlockingQwpWsTransport {
             Some(reason),
             self.use_tls,
             self.tls_settings.clone(),
+            self.connect_kind,
             &self.qwp_ws,
             self.auth_header.as_deref(),
         )
@@ -3134,6 +3168,10 @@ enum DictCatchUpError {
     /// A single dictionary entry does not fit the server's batch cap, so the
     /// dictionary cannot be re-registered on the fresh server; terminal.
     EntryTooLarge(CatchUpEntryTooLarge),
+    /// A catch-up frame could not be built (allocation failed, or its payload
+    /// would overflow the QWP u32 length field). Nothing was sent; the queued
+    /// data stays persisted for a later drain / borrow to retry.
+    FrameBuildFailed,
 }
 
 /// Outcome of [`QwpWsSendCore::drive_catch_up`] that the caller must act on: a
@@ -4127,6 +4165,55 @@ mod tests {
             "msg: {}",
             err.msg()
         );
+    }
+
+    #[test]
+    fn torn_dict_guard_accepts_a_dense_frame_while_the_mirror_is_enabled() {
+        // Mid-connection dense fallback: when a failed side-file rollback forces the
+        // foreground to drop delta encoding (`SfaColumnBackend::rollback_frame` /
+        // `QwpWsReplayEncoder::rollback_frame` set `delta_dict_enabled = false`), it
+        // starts emitting DENSE frames (`delta_start = 0`, re-shipping the whole
+        // dictionary from id 0). The driver mirror -- which the foreground cannot
+        // reach across the I/O-thread boundary -- stays enabled with the count it
+        // reached in delta mode. Such a dense frame re-registers ids [0, K) the mirror
+        // already holds as [0, M<=K): the guard must ACCEPT it (the server tolerates
+        // the idempotent overlap exactly as it does the reconnect catch-up + replay of
+        // already-registered ids), and `accumulate` must fold only the [M, K) suffix
+        // so the mirror stays in lockstep. A dense frame that DISAGREES on an
+        // already-held id, however, is still the torn case and must be rejected.
+        {
+            let mut driver = driver(FakeOrderedServer::no_response());
+            // The connection sent two symbols in delta mode: mirror = [a, b], count 2.
+            driver.send_core.enable_delta_dict(&[1, b'a', 1, b'b'], 2);
+            assert_eq!(driver.send_core.dict_mirror.count(), 2);
+
+            // Post-fallback dense frame: re-ships [a, b] and adds c, based at id 0.
+            let dense = make_delta_frame(0, &[b"a", b"b", b"c"]);
+            assert!(
+                driver.send_core.guard_dict_not_torn(&dense).is_ok(),
+                "a self-sufficient dense frame re-shipping the mirrored prefix is safe"
+            );
+            // Accumulating it folds only the new suffix [c]; the mirror stays consistent.
+            driver.send_core.dict_mirror.accumulate(&dense);
+            assert_eq!(
+                driver.send_core.dict_mirror.count(),
+                3,
+                "accumulate folds only the [M, K) suffix, keeping the mirror in lockstep"
+            );
+        }
+
+        // A dense frame that redefines an already-held id (id1: b -> X) disagrees with
+        // the mirror: the torn-dict guard must still reject it, even at delta_start 0.
+        {
+            let mut driver = driver(FakeOrderedServer::no_response());
+            driver.send_core.enable_delta_dict(&[1, b'a', 1, b'b'], 2);
+            let conflicting = make_delta_frame(0, &[b"a", b"X", b"c"]);
+            let err = driver
+                .send_core
+                .guard_dict_not_torn(&conflicting)
+                .unwrap_err();
+            assert_eq!(err.code(), ErrorCode::StoreResendRequired);
+        }
     }
 
     #[test]

@@ -727,6 +727,18 @@ size_t column_sender_chunk_row_count(
  * return value here rather than deferring error handling to
  * `column_sender_flush*`. There is intentionally no separate pre-validated
  * column-name overload on the column-sender surface.
+ *
+ * Buffer lifetime (applies to EVERY column-append entry point below —
+ * numeric/fixed-width, VARCHAR/BINARY, and symbol): the chunk stores the
+ * `data` / `offsets` / `bytes` / `codes` / `dict_offsets` / `dict_bytes`
+ * pointers and `validity->bits` WITHOUT copying, and dereferences them at
+ * flush time. Every buffer passed to a column append MUST therefore stay alive
+ * and unchanged until the next `column_sender_flush` / `column_sender_wait`
+ * returns. This differs from the row API (`line_sender_buffer_symbol` /
+ * `line_sender_buffer_column_*`), which serialize the value immediately — there
+ * the input is safe to free right after the call. Freeing, reallocating, or
+ * mutating a column buffer between its append and the next flush is undefined
+ * behaviour (use-after-free at flush).
  * ------------------------------------------------------------------------- */
 
 QUESTDB_CLIENT_API
@@ -880,6 +892,11 @@ bool column_sender_chunk_column_date(
  * call. The per-type entry point here is the lower-level building block,
  * useful when the caller has raw int32 offsets + bytes and no Arrow
  * schema.
+ *
+ * Buffer lifetime: `offsets`, `bytes`, and (if present) `validity->bits` are
+ * borrowed, not copied — they MUST stay alive and unchanged until the next
+ * `column_sender_flush` / `column_sender_wait` returns (see the buffer-lifetime
+ * note in the numeric-column-append preamble above).
  * ------------------------------------------------------------------------- */
 
 /**
@@ -935,8 +952,12 @@ bool column_sender_chunk_column_binary(
  * `dict_offsets_len`) and `dict_bytes` (length `dict_bytes_len`)
  * describe the dictionary in Arrow Utf8 layout. The library interns
  * only referenced dict entries against the connection-scoped global
- * symbol table — `dict_offsets_len - 1` may be huge (Pandas
- * `Categorical`) without paying the cost for unused entries.
+ * symbol table, so `dict_offsets_len - 1` (the number of distinct
+ * values — e.g. a wide Pandas `Categorical`) may greatly exceed the
+ * referenced set without paying the cost for unused entries. It is
+ * capped at 8,388,608 (2^23) distinct entries per column, and each
+ * entry at 1 MiB (1 << 20 bytes); exceeding either is rejected at
+ * append.
  *
  * `codes[i]` must be in `0 .. dict_len` for non-null rows; null-row
  * codes are not inspected.
@@ -945,6 +966,15 @@ bool column_sender_chunk_column_binary(
  * `column_sender_chunk_append_arrow_column`, which dispatches on the
  * outer schema's index width (`c`/`s`/`i`) automatically. The per-type
  * entries here remain the lower-level building block.
+ *
+ * Each dictionary entry must be valid UTF-8 (QuestDB SYMBOLs are UTF-8),
+ * validated eagerly at this call — a non-UTF-8 entry returns `false` with
+ * `*err_out` set and leaves the chunk unchanged.
+ *
+ * Buffer lifetime: `codes`, `dict_offsets`, `dict_bytes`, and (if present)
+ * `validity->bits` are borrowed, not copied — they MUST stay alive and
+ * unchanged until the next `column_sender_flush` / `column_sender_wait` returns
+ * (see the buffer-lifetime note in the numeric-column-append preamble above).
  * ------------------------------------------------------------------------- */
 
 QUESTDB_CLIENT_API

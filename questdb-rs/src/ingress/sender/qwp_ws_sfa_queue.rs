@@ -571,8 +571,20 @@ impl SfaFrameQueue {
 
     /// Takes the persisted symbol dictionary for the foreground producer's
     /// write-ahead. `None` in memory mode / replay-only / on open failure.
+    ///
+    /// The recovered entry region (up to ~2 GiB) has already been copied out for
+    /// seeding by this point: a take removes the dict from the queue, so any code
+    /// needing the entries must read them via
+    /// [`recovered_symbol_dict_entries`](Self::recovered_symbol_dict_entries) first
+    /// (both recovery paths do — async and sync). The write-ahead handle only needs
+    /// the file / append offset / size, so free that region rather than carry it
+    /// dead for the whole connection lifetime.
     pub(crate) fn take_persisted_symbol_dict(&mut self) -> Option<PersistedSymbolDict> {
-        self.persisted_symbol_dict.take()
+        let mut pd = self.persisted_symbol_dict.take();
+        if let Some(pd) = pd.as_mut() {
+            pd.clear_loaded_entries();
+        }
+        pd
     }
 
     pub(crate) fn close(&mut self) -> Result<(), SfaQueueError> {

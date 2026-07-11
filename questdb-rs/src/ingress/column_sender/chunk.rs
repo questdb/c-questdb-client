@@ -1083,6 +1083,12 @@ impl<'a> Chunk<'a> {
     /// Utf8 layout. Wire type is `SYMBOL`; the encoder interns each
     /// referenced dictionary entry against the connection-scoped
     /// `SymbolGlobalDict` at flush time.
+    ///
+    /// Validated eagerly at append (like the row `symbol` API): `dict_offsets`
+    /// must be monotonic, non-negative, and end at `≤ dict_bytes.len()`; each
+    /// dictionary entry must be valid UTF-8 (QuestDB SYMBOLs are UTF-8); and
+    /// every non-null `codes[i]` must be in `0..dict_len` (`dict_len =
+    /// dict_offsets.len() - 1`). A per-entry `1 MiB` cap is enforced at flush.
     pub fn symbol_i8(
         &mut self,
         name: &str,
@@ -1231,14 +1237,26 @@ impl<'a> Chunk<'a> {
                 super::MAX_SYMBOL_DICT_ENTRIES
             ));
         }
+        // Validate the dictionary offsets, then that each dictionary entry is
+        // valid UTF-8 — the same eager checks `column_str` / `column_str_large`
+        // run for VARCHAR (`validate_varchar_utf8_cells`). QuestDB SYMBOLs are
+        // UTF-8, and the row `symbol` API enforces it via its `&str` value; a
+        // non-UTF-8 symbol accepted here would be interned, written ahead to the
+        // SFA side-file, and locally ACKed, then rejected by the server on send,
+        // stranding the dependent queued frame (the same "writer-accepted =>
+        // server-acceptable" invariant the per-symbol length cap enforces). Reject
+        // it at this single ingestion choke point instead. The offset check runs
+        // first so the UTF-8 cell walk indexes only in-bounds slices.
         match dict_offsets {
             SymbolOffsetsPtr::I32(p) => {
                 let offsets = unsafe { slice::from_raw_parts(p, dict_offsets_len) };
                 validate_varchar_offsets(offsets, dict_bytes.len())?;
+                validate_varchar_utf8_cells(dict_bytes, offsets)?;
             }
             SymbolOffsetsPtr::I64(p) => {
                 let offsets = unsafe { slice::from_raw_parts(p, dict_offsets_len) };
                 validate_varchar_offsets_i64(offsets, dict_bytes.len())?;
+                validate_varchar_utf8_cells(dict_bytes, offsets)?;
             }
         }
 
@@ -1786,6 +1804,35 @@ mod tests {
             .unwrap_err();
         assert_eq!(err.code(), crate::ErrorCode::InvalidApiCall);
         assert!(err.msg().contains("out of range"));
+    }
+
+    #[test]
+    fn symbol_rejects_invalid_utf8_dict_bytes() {
+        // A SYMBOL dictionary entry that is not valid UTF-8 must be rejected at
+        // append (as `column_str` does for VARCHAR), not silently interned,
+        // persisted to the SFA side-file, and locally ACKed, then rejected by the
+        // server on send -- which would strand the dependent queued frame.
+        let mut chunk = Chunk::new("t");
+        let codes = [0i32];
+        let dict_offsets = [0i32, 2];
+        let err = chunk
+            .symbol_i32("sym", &codes, &dict_offsets, &[0xff, 0xfe], None)
+            .unwrap_err();
+        assert_eq!(err.code(), crate::ErrorCode::InvalidApiCall);
+        assert!(err.msg().contains("UTF-8"));
+    }
+
+    #[test]
+    fn symbol_accepts_valid_multibyte_utf8_dict_bytes() {
+        // "a" then "é" (0xC3 0xA9): both dictionary entries are valid UTF-8 on
+        // char boundaries, so the column is accepted.
+        let mut chunk = Chunk::new("t");
+        let codes = [0i32, 1];
+        let dict_offsets = [0i32, 1, 3];
+        chunk
+            .symbol_i32("sym", &codes, &dict_offsets, &[0x61, 0xC3, 0xA9], None)
+            .expect("valid UTF-8 dictionary is accepted");
+        assert_eq!(chunk.row_count(), 2);
     }
 
     #[test]

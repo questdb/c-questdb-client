@@ -60,6 +60,65 @@ fn qwp_ws_replay_payloads_match_java_golden_bytes() {
     assert_eq!(second, hex_to_bytes(JAVA_SECOND_REPLAY_HEX));
 }
 
+/// The column-major (chunk) encoder must produce the SAME 12-byte QWP header and
+/// delta symbol-dict section as the row encoder — which is locked to the Java
+/// golden above. `wire.rs` documents this byte-compatibility, and the persisted
+/// side-file / reconnect catch-up splice these exact delta bytes verbatim, so a
+/// framing drift between the column and row encoders would be an invisible wire
+/// bug the row-only golden could never catch. Encode the same 10-symbol
+/// dictionary column-major and assert its header + delta section equal the Java
+/// golden's.
+#[test]
+fn column_encoder_delta_dict_section_matches_the_java_golden() {
+    use crate::ingress::column_sender::Chunk;
+    use crate::ingress::column_sender::encoder::{EncodeScratch, encode_chunk_into};
+
+    // Build the 10-symbol dictionary column-major: one distinct symbol per row,
+    // so slots 0..10 are all referenced and interned in id order (SYM_000..009),
+    // matching the row encoder's reference order in the golden.
+    let mut dict_bytes = Vec::new();
+    let mut dict_offsets = vec![0i32];
+    for idx in 0..SYMBOL_COUNT {
+        dict_bytes.extend_from_slice(format!("SYM_{idx:03}").as_bytes());
+        dict_offsets.push(dict_bytes.len() as i32);
+    }
+    let codes: Vec<i32> = (0..SYMBOL_COUNT as i32).collect();
+    let ts: Vec<i64> = (0..SYMBOL_COUNT as i64)
+        .map(|i| BASE_TS_NANOS + i)
+        .collect();
+
+    let mut chunk = Chunk::new("trades");
+    chunk
+        .symbol_i32("sym", &codes, &dict_offsets, &dict_bytes, None)
+        .unwrap();
+    chunk.at_nanos(&ts).unwrap();
+
+    let mut out = Vec::new();
+    let mut dict = SymbolGlobalDict::new();
+    let mut scratch = EncodeScratch::new();
+    encode_chunk_into(&mut out, &chunk, &mut dict, &mut scratch, false).unwrap();
+
+    let golden = hex_to_bytes(JAVA_FIRST_REPLAY_HEX);
+
+    // Header magic/version/flags/table_count (bytes 0..8) must match; the
+    // payload-length field (8..12) legitimately differs (different column layout).
+    assert_eq!(
+        &out[0..8],
+        &golden[0..8],
+        "column frame header (magic/version/flags/table_count) must match the Java golden"
+    );
+
+    // Delta section: [delta_start varint][count varint][entries], right after the
+    // 12-byte header. For 10 one-byte-len entries it is 2 + 10 * (1 + 7) = 82 bytes.
+    const HEADER: usize = 12;
+    const DELTA_SECTION_LEN: usize = 2 + SYMBOL_COUNT * (1 + 7);
+    assert_eq!(
+        &out[HEADER..HEADER + DELTA_SECTION_LEN],
+        &golden[HEADER..HEADER + DELTA_SECTION_LEN],
+        "column encoder delta symbol-dict section must be byte-identical to the row/Java golden"
+    );
+}
+
 fn rust_replay_payloads() -> (Vec<u8>, Vec<u8>) {
     let mut scratch = QwpWsEncodeScratch::new();
     let mut global_dict = SymbolGlobalDict::new();

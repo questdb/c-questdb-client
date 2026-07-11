@@ -166,6 +166,109 @@ TEST_CASE("column_chunk flush round-trips through the mock")
     conn.drop_on_return();
 }
 
+TEST_CASE("column_chunk symbol column round-trips through the mock")
+{
+    // Exercises the columnar symbol FFI (column_sender_chunk_symbol_i32) end to
+    // end: append a dictionary-encoded SYMBOL column, flush, and confirm the
+    // frame reaches the mock. Previously only the row API's .symbol() was covered
+    // in C/C++; the column-major symbol appender had no test on the C ABI.
+    auto mock = spawn_mock(1);
+    questdb::pool db{conf_for(mock->addr())};
+    auto conn = db.borrow_column_sender();
+
+    qdb::column_chunk chunk{"trades"};
+    const int32_t codes[] = {0, 1, 0};
+    const int32_t dict_offsets[] = {0, 4, 8};
+    const uint8_t dict_bytes[] = {'A', 'A', 'P', 'L', 'M', 'S', 'F', 'T'};
+    int64_t ts[] = {
+        1'700'000'000'000'000'000LL,
+        1'700'000'000'000'000'001LL,
+        1'700'000'000'000'000'002LL};
+    chunk.symbol_i32("sym", codes, 3, dict_offsets, 3, dict_bytes, 8)
+        .at_nanos(ts, 3);
+    CHECK(chunk.row_count() == 3);
+
+    const auto fsn = conn.flush_and_get_fsn(chunk);
+    REQUIRE(fsn.has_value());
+    CHECK(chunk.row_count() == 0);
+    CHECK(conn.published_fsn() == fsn);
+    conn.drop_on_return();
+}
+
+TEST_CASE("column_chunk symbol_i8 / symbol_i16 round-trip through the mock")
+{
+    // The i32 case is covered above; the narrow-width appenders
+    // (column_sender_chunk_symbol_i8 / _i16) do their own code -> global-id
+    // conversion and range check at the C boundary, so exercise them end to end
+    // too. Under the FFI `panic = "abort"` profile a width-specific bug (a bad cast
+    // or an out-of-range slot index) would abort the host rather than error.
+    const int32_t dict_offsets[] = {0, 4, 8};
+    const uint8_t dict_bytes[] = {'A', 'A', 'P', 'L', 'M', 'S', 'F', 'T'};
+    int64_t ts[] = {
+        1'700'000'000'000'000'000LL,
+        1'700'000'000'000'000'001LL,
+        1'700'000'000'000'000'002LL};
+
+    auto mock = spawn_mock(1);
+    questdb::pool db{conf_for(mock->addr())};
+    auto conn = db.borrow_column_sender();
+
+    SUBCASE("i8 codes")
+    {
+        qdb::column_chunk chunk{"trades"};
+        const int8_t codes[] = {0, 1, 0};
+        chunk.symbol_i8("sym", codes, 3, dict_offsets, 3, dict_bytes, 8)
+            .at_nanos(ts, 3);
+        CHECK(chunk.row_count() == 3);
+        const auto fsn = conn.flush_and_get_fsn(chunk);
+        REQUIRE(fsn.has_value());
+        CHECK(chunk.row_count() == 0);
+    }
+
+    SUBCASE("i16 codes")
+    {
+        qdb::column_chunk chunk{"trades"};
+        const int16_t codes[] = {1, 0, 1};
+        chunk.symbol_i16("sym", codes, 3, dict_offsets, 3, dict_bytes, 8)
+            .at_nanos(ts, 3);
+        CHECK(chunk.row_count() == 3);
+        const auto fsn = conn.flush_and_get_fsn(chunk);
+        REQUIRE(fsn.has_value());
+        CHECK(chunk.row_count() == 0);
+    }
+
+    conn.drop_on_return();
+}
+
+TEST_CASE("column_chunk symbol append validates codes and UTF-8 at the C ABI")
+{
+    // The encoder relies on every non-null code being a valid dict index, and
+    // QuestDB SYMBOLs are UTF-8, so both are rejected eagerly at append -- a bad
+    // value would otherwise be interned, persisted to the store-and-forward
+    // side-file, and locally ACKed, then rejected by the server, stranding the
+    // dependent queued frame.
+    SUBCASE("out-of-range code is rejected")
+    {
+        qdb::column_chunk chunk{"trades"};
+        const int32_t bad_codes[] = {0, 99};
+        const int32_t dict_offsets[] = {0, 5};
+        const uint8_t dict_bytes[] = {'a', 'l', 'p', 'h', 'a'};
+        CHECK_THROWS_AS(
+            chunk.symbol_i32("sym", bad_codes, 2, dict_offsets, 2, dict_bytes, 5),
+            qdb::line_sender_error);
+    }
+    SUBCASE("non-UTF-8 dictionary bytes are rejected")
+    {
+        qdb::column_chunk chunk{"trades"};
+        const int32_t codes[] = {0};
+        const int32_t dict_offsets[] = {0, 2};
+        const uint8_t bad_bytes[] = {0xff, 0xfe};
+        CHECK_THROWS_AS(
+            chunk.symbol_i32("sym", codes, 1, dict_offsets, 2, bad_bytes, 2),
+            qdb::line_sender_error);
+    }
+}
+
 TEST_CASE("column_chunk flush_and_wait round-trips through the mock")
 {
     auto mock = spawn_acking_mock(1);

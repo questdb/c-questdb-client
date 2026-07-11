@@ -60,6 +60,11 @@ pub(crate) struct EncodeScratch {
     /// Reused across symbol columns within one flush; bytes (not bools)
     /// so `resize(n, 0)` is a single `memset`.
     pub(crate) referenced: Vec<u8>,
+    /// Free list of per-symbol-column `slot -> global id` tables, reclaimed from
+    /// `per_column` on [`reset`](Self::reset) so a steady flow of flushes reuses
+    /// them instead of allocating one `Vec<u64>` per row-symbol column per flush.
+    /// Mirrors the row replay encoder's `per_segment_symbol_globals` pooling.
+    symbol_gid_pool: Vec<Vec<u64>>,
 }
 
 impl EncodeScratch {
@@ -70,7 +75,25 @@ impl EncodeScratch {
     fn reset(&mut self) {
         self.signature.clear();
         self.new_symbols.clear();
-        self.per_column.clear();
+        // Reclaim each symbol column's `slot -> gid` / per-row gid table into the
+        // free list before dropping the resolutions, so it is reused next flush.
+        // Row and arrow buffers share one `Vec<u64>` pool.
+        for col in self.per_column.drain(..) {
+            match col {
+                Some(ResolvedColumn::Row(row)) => {
+                    let mut gids = row.local_to_global;
+                    gids.clear();
+                    self.symbol_gid_pool.push(gids);
+                }
+                #[cfg(feature = "arrow-ingress")]
+                Some(ResolvedColumn::Arrow(arrow)) => {
+                    let mut gids = arrow.gids;
+                    gids.clear();
+                    self.symbol_gid_pool.push(gids);
+                }
+                None => {}
+            }
+        }
         self.referenced.clear();
     }
 }
@@ -160,12 +183,13 @@ fn encode_chunk_into_mode(
     // later fails — symbol entries that never hit the wire must not be
     // remembered. ---
     let dict_mark = symbol_dict.mark();
-    let mut delta_start = match resolve_symbols(
+    let delta_start = match resolve_symbols(
         chunk,
         symbol_dict,
         &mut scratch.new_symbols,
         &mut scratch.per_column,
         &mut scratch.referenced,
+        &mut scratch.symbol_gid_pool,
     ) {
         Ok(d) => d,
         Err(e) => {
@@ -173,19 +197,22 @@ fn encode_chunk_into_mode(
             return Err(e);
         }
     };
-    if replay_symbols {
-        delta_start = match build_replay_symbol_prefix(
-            symbol_dict,
-            &mut scratch.new_symbols,
-            &scratch.per_column,
-        ) {
-            Ok(delta_start) => delta_start,
+    let delta_source = if replay_symbols {
+        // Dense/replay fallback re-ships the whole dictionary from id 0 so every
+        // stored frame is self-sufficient. Emit it straight from `symbol_dict` at
+        // encode time (below) rather than copying every entry into `new_symbols`
+        // first, which would allocate one `Vec` per dict entry per frame.
+        let count = match replay_symbol_dense_count(&scratch.per_column) {
+            Ok(count) => count,
             Err(e) => {
                 symbol_dict.rollback(dict_mark);
                 return Err(e);
             }
         };
-    }
+        DeltaSource::Dense { count }
+    } else {
+        DeltaSource::New { delta_start }
+    };
 
     // --- Schema signature ---
     let column_count = chunk.columns.len() + 1; // +1 for designated timestamp
@@ -205,7 +232,8 @@ fn encode_chunk_into_mode(
         row_count,
         column_count,
         table_bytes,
-        delta_start,
+        delta_source,
+        symbol_dict,
         defer_commit,
         scratch,
     );
@@ -219,38 +247,29 @@ fn encode_chunk_into_mode(
     }
 }
 
-fn build_replay_symbol_prefix(
-    symbol_dict: &SymbolGlobalDict,
-    new_symbols: &mut Vec<Vec<u8>>,
-    per_column: &[Option<ResolvedColumn>],
-) -> Result<u64> {
-    let dense_count = replay_symbol_dense_count(per_column)?;
-    new_symbols.clear();
-    new_symbols.try_reserve(dense_count).map_err(|_| {
+/// How a frame's delta symbol-dictionary section is sourced.
+#[derive(Clone, Copy)]
+enum DeltaSource {
+    /// Delta mode: emit exactly the newly-interned symbols gathered in
+    /// `scratch.new_symbols`, based at `delta_start`.
+    New { delta_start: u64 },
+    /// Dense/replay fallback: re-emit the whole connection dictionary `[0, count)`
+    /// straight from `symbol_dict` at encode time (no intermediate per-entry
+    /// `Vec`), based at id 0 so the frame is self-sufficient.
+    Dense { count: usize },
+}
+
+/// Look up dict entry `id` for the dense/replay path, mapping a missing id (an
+/// internal invariant break) to a recoverable error rather than a panic.
+#[inline]
+fn dense_entry(symbol_dict: &SymbolGlobalDict, id: usize) -> Result<&[u8]> {
+    symbol_dict.entry(id as u64).ok_or_else(|| {
         error::fmt!(
             InvalidApiCall,
-            "symbol dictionary too large to encode ({} entries)",
-            dense_count
+            "internal: missing symbol dictionary entry for global id {}",
+            id
         )
-    })?;
-    for id in 0..dense_count {
-        let id_u64 = u64::try_from(id).map_err(|_| {
-            error::fmt!(
-                InvalidApiCall,
-                "symbol dictionary too large to encode ({} entries)",
-                dense_count
-            )
-        })?;
-        let entry = symbol_dict.entry(id_u64).ok_or_else(|| {
-            error::fmt!(
-                InvalidApiCall,
-                "internal: missing symbol dictionary entry for global id {}",
-                id_u64
-            )
-        })?;
-        new_symbols.push(entry.to_vec());
-    }
-    Ok(0)
+    })
 }
 
 fn replay_symbol_dense_count(per_column: &[Option<ResolvedColumn>]) -> Result<usize> {
@@ -299,15 +318,33 @@ fn encode_frame_after_signature(
     row_count: usize,
     column_count: usize,
     table_bytes: &[u8],
-    delta_start: u64,
+    delta: DeltaSource,
+    symbol_dict: &SymbolGlobalDict,
     defer_commit: bool,
     scratch: &EncodeScratch,
 ) -> Result<()> {
+    // Byte size of the delta symbol-dict entries we will emit, for the up-front
+    // reservation. For dense/replay this walks the dict directly rather than an
+    // intermediate `new_symbols` copy.
+    let delta_entries_bytes = match delta {
+        DeltaSource::New { .. } => scratch.new_symbols.iter().fold(0usize, |acc, s| {
+            acc.saturating_add(10).saturating_add(s.len())
+        }),
+        DeltaSource::Dense { count } => {
+            let mut sum = 0usize;
+            for id in 0..count {
+                sum = sum
+                    .saturating_add(10)
+                    .saturating_add(dense_entry(symbol_dict, id)?.len());
+            }
+            sum
+        }
+    };
     let estimated = estimate_frame_size(
         chunk,
         row_count,
         &scratch.signature,
-        &scratch.new_symbols,
+        delta_entries_bytes,
         &scratch.per_column,
     );
     out.try_reserve(estimated).map_err(|_| {
@@ -322,10 +359,21 @@ fn encode_frame_after_signature(
     write_header_placeholder(out, /* table_count = */ 1, defer_commit);
     let payload_start = out.len();
 
-    write_qwp_varint(out, delta_start);
-    write_qwp_varint(out, scratch.new_symbols.len() as u64);
-    for bytes in &scratch.new_symbols {
-        write_qwp_bytes(out, bytes);
+    match delta {
+        DeltaSource::New { delta_start } => {
+            write_qwp_varint(out, delta_start);
+            write_qwp_varint(out, scratch.new_symbols.len() as u64);
+            for bytes in &scratch.new_symbols {
+                write_qwp_bytes(out, bytes);
+            }
+        }
+        DeltaSource::Dense { count } => {
+            write_qwp_varint(out, 0); // dense frames base at id 0
+            write_qwp_varint(out, count as u64);
+            for id in 0..count {
+                write_qwp_bytes(out, dense_entry(symbol_dict, id)?);
+            }
+        }
     }
 
     write_qwp_bytes(out, table_bytes);
@@ -365,7 +413,7 @@ fn estimate_frame_size(
     chunk: &Chunk<'_>,
     row_count: usize,
     signature: &[u8],
-    new_symbols: &[Vec<u8>],
+    delta_entries_bytes: usize,
     _per_column: &[Option<ResolvedColumn>],
 ) -> usize {
     // Saturating arithmetic throughout: the encoder's job is to size a
@@ -375,9 +423,7 @@ fn estimate_frame_size(
     // on the infallible `Vec::reserve` call.
     let mut total: usize = QWP_HEADER_LEN;
     total = total.saturating_add(20);
-    for s in new_symbols {
-        total = total.saturating_add(10).saturating_add(s.len());
-    }
+    total = total.saturating_add(delta_entries_bytes);
     total = total
         .saturating_add(10)
         .saturating_add(chunk.table.len())
@@ -503,6 +549,51 @@ fn try_resize_filled<T: Clone>(v: &mut Vec<T>, len: usize, value: T) -> Result<(
     Ok(())
 }
 
+/// Validate a symbol code re-read from the caller's borrowed `codes` buffer at
+/// flush into an in-range slot index. `range_check_codes` already proved every
+/// code in range at append, but the buffer is borrowed until flush; a caller that
+/// mutates it in that window (documented UB, but a plausible footgun for a binding
+/// reusing a codes buffer) could push a code out of range. Returning an error
+/// keeps that a recoverable `InvalidApiCall` instead of an out-of-bounds index --
+/// which, under the FFI `panic = "abort"` profile, would abort the whole process.
+#[inline]
+fn checked_symbol_slot(code: i64, row: usize, dict_len: usize) -> Result<usize> {
+    match usize::try_from(code) {
+        Ok(slot) if slot < dict_len => Ok(slot),
+        _ => Err(error::fmt!(
+            InvalidApiCall,
+            "symbol code {} at row {} is out of range for dict_len {}; the borrowed \
+             codes/dict buffers must stay unchanged between append and flush",
+            code,
+            row,
+            dict_len
+        )),
+    }
+}
+
+/// Slice dict entry `slot`'s bytes from the borrowed `dict_bytes` at flush,
+/// guarding a `dict_offsets` mutated between append and flush (see
+/// [`checked_symbol_slot`]) that could yield a reversed or out-of-range range --
+/// a slice index that would otherwise abort under `panic = "abort"`.
+#[inline]
+fn checked_symbol_entry(dict_bytes: &[u8], start: i64, end: i64, slot: usize) -> Result<&[u8]> {
+    usize::try_from(start)
+        .ok()
+        .zip(usize::try_from(end).ok())
+        .and_then(|(s, e)| dict_bytes.get(s..e))
+        .ok_or_else(|| {
+            error::fmt!(
+                InvalidApiCall,
+                "symbol dict entry {} spans {}..{}, out of range for dict_bytes len {}; \
+                 the borrowed codes/dict buffers must stay unchanged between append and flush",
+                slot,
+                start,
+                end,
+                dict_bytes.len()
+            )
+        })
+}
+
 /// Walk symbol columns, intern referenced entries against the
 /// connection-scoped global dict, and emit one [`ResolvedColumn`] per
 /// chunk column into `per_column` (length == `chunk.columns.len()`).
@@ -514,6 +605,7 @@ fn resolve_symbols(
     new_symbols: &mut Vec<Vec<u8>>,
     per_column: &mut Vec<Option<ResolvedColumn>>,
     referenced_scratch: &mut Vec<u8>,
+    symbol_gid_pool: &mut Vec<Vec<u64>>,
 ) -> Result<u64> {
     let delta_start = symbol_dict.next_id();
     per_column.reserve(chunk.columns.len());
@@ -536,24 +628,20 @@ fn resolve_symbols(
                     if !is_valid_row(col.validity.as_ref(), i) {
                         continue;
                     }
-                    let slot = unsafe { codes.read_i64(i) } as usize;
-                    debug_assert!(
-                        slot < referenced_scratch.len(),
-                        "symbol code {slot} out of range (dict_len {dict_len}); \
-                         range_check_codes should have rejected it at append"
-                    );
+                    let slot = checked_symbol_slot(unsafe { codes.read_i64(i) }, i, dict_len)?;
+                    // slot < dict_len == referenced_scratch.len(), so this cannot panic.
                     referenced_scratch[slot] = 1;
                     non_null_count += 1;
                 }
-                let mut local_to_global = Vec::new();
+                let mut local_to_global = symbol_gid_pool.pop().unwrap_or_default();
                 try_resize_filled(&mut local_to_global, dict_len, u64::MAX)?;
                 for (slot, mark) in referenced_scratch.iter().enumerate() {
                     if *mark == 0 {
                         continue;
                     }
-                    let start = unsafe { dict_offsets.read_i64(slot) } as usize;
-                    let end = unsafe { dict_offsets.read_i64(slot + 1) } as usize;
-                    let entry_bytes = &dict_bytes_slice[start..end];
+                    let start = unsafe { dict_offsets.read_i64(slot) };
+                    let end = unsafe { dict_offsets.read_i64(slot + 1) };
+                    let entry_bytes = checked_symbol_entry(dict_bytes_slice, start, end, slot)?;
                     let (gid, is_new) = symbol_dict.intern(entry_bytes)?;
                     if is_new {
                         new_symbols.push(entry_bytes.to_vec());
@@ -575,6 +663,7 @@ fn resolve_symbols(
                     arrow_kind,
                     symbol_dict,
                     new_symbols,
+                    symbol_gid_pool,
                 )?;
                 per_column.push(resolved.map(ResolvedColumn::Arrow));
             }
@@ -694,7 +783,7 @@ unsafe fn encode_column(
                 }
             };
             unsafe {
-                encode_symbol(out, codes, resolved, row_count, validity);
+                encode_symbol(out, codes, resolved, row_count, validity)?;
             }
         }
         #[cfg(feature = "arrow-ingress")]
@@ -1040,7 +1129,7 @@ unsafe fn encode_symbol(
     resolved: &RowResolvedSymbol,
     row_count: usize,
     validity: Option<&ValidityDescriptor>,
-) {
+) -> Result<()> {
     let validity = validity.filter(|v| v.has_nulls());
     match validity {
         None => out.push(0),
@@ -1055,13 +1144,13 @@ unsafe fn encode_symbol(
     // dispatch overhead is amortised across the whole column.
     match codes {
         SymbolCodesPtr::I8(p) => unsafe {
-            emit_symbol_rows(out, p, row_count, validity, &resolved.local_to_global);
+            emit_symbol_rows(out, p, row_count, validity, &resolved.local_to_global)
         },
         SymbolCodesPtr::I16(p) => unsafe {
-            emit_symbol_rows(out, p, row_count, validity, &resolved.local_to_global);
+            emit_symbol_rows(out, p, row_count, validity, &resolved.local_to_global)
         },
         SymbolCodesPtr::I32(p) => unsafe {
-            emit_symbol_rows(out, p, row_count, validity, &resolved.local_to_global);
+            emit_symbol_rows(out, p, row_count, validity, &resolved.local_to_global)
         },
     }
 }
@@ -1072,7 +1161,8 @@ unsafe fn emit_symbol_rows<T>(
     row_count: usize,
     validity: Option<&ValidityDescriptor>,
     local_to_global: &[u64],
-) where
+) -> Result<()>
+where
     T: Copy + Into<i64>,
 {
     for i in 0..row_count {
@@ -1080,11 +1170,14 @@ unsafe fn emit_symbol_rows<T>(
         if !valid {
             continue;
         }
-        let slot = unsafe { (*codes.add(i)).into() } as usize;
+        let code: i64 = unsafe { (*codes.add(i)).into() };
+        let slot = checked_symbol_slot(code, i, local_to_global.len())?;
+        // slot < local_to_global.len(), so this cannot panic.
         let gid = local_to_global[slot];
         debug_assert_ne!(gid, u64::MAX, "referenced symbol slot has no global id");
         write_qwp_varint(out, gid);
     }
+    Ok(())
 }
 
 fn encode_designated_ts(
@@ -1175,6 +1268,43 @@ mod tests {
         let mut scratch = EncodeScratch::new();
         encode_chunk_into(&mut out, chunk, &mut dict, &mut scratch, false).unwrap();
         out
+    }
+
+    #[test]
+    fn checked_symbol_slot_rejects_out_of_range_and_negative_codes() {
+        // Defence-in-depth for a codes buffer mutated between append and flush
+        // (documented UB, but a footgun): an out-of-range or negative code must
+        // yield a recoverable InvalidApiCall, never an out-of-bounds index -- which
+        // under the FFI `panic = "abort"` profile would abort the whole process.
+        assert_eq!(checked_symbol_slot(0, 0, 3).unwrap(), 0);
+        assert_eq!(checked_symbol_slot(2, 5, 3).unwrap(), 2); // last in-range slot
+        for bad in [3i64, 99, i64::MAX] {
+            let err = checked_symbol_slot(bad, 7, 3).unwrap_err();
+            assert_eq!(err.code(), crate::ErrorCode::InvalidApiCall);
+            assert!(err.msg().contains("out of range"), "{}", err.msg());
+        }
+        for neg in [-1i64, i64::MIN] {
+            assert_eq!(
+                checked_symbol_slot(neg, 7, 3).unwrap_err().code(),
+                crate::ErrorCode::InvalidApiCall
+            );
+        }
+        // An empty dict makes every code out of range.
+        assert!(checked_symbol_slot(0, 0, 0).is_err());
+    }
+
+    #[test]
+    fn checked_symbol_entry_rejects_reversed_or_out_of_range_spans() {
+        let dict = b"aabbcc"; // len 6
+        assert_eq!(checked_symbol_entry(dict, 2, 4, 1).unwrap(), b"bb");
+        assert_eq!(checked_symbol_entry(dict, 0, 6, 0).unwrap(), dict);
+        assert_eq!(checked_symbol_entry(dict, 3, 3, 0).unwrap(), b""); // empty span is fine
+        // Reversed (start > end), past-the-end, and negative offsets all reject
+        // rather than panicking on the slice index.
+        for (s, e) in [(4i64, 2i64), (0, 7), (5, 100), (-1, 3), (2, -1)] {
+            let err = checked_symbol_entry(dict, s, e, 0).unwrap_err();
+            assert_eq!(err.code(), crate::ErrorCode::InvalidApiCall);
+        }
     }
 
     /// `slice_rows(0, n)` must reproduce the whole-chunk bytes for every column
@@ -1823,6 +1953,97 @@ mod tests {
         assert!(
             out.windows(16).any(|w| w == uuid),
             "UUID bytes must appear verbatim in the wire frame"
+        );
+    }
+
+    #[test]
+    fn symbol_gid_table_is_pooled_and_reused_across_flushes() {
+        // The per-symbol-column `slot -> global id` table is reclaimed into the
+        // scratch free list on reset and reused next flush, rather than allocating
+        // a fresh Vec<u64> per row-symbol column per flush. The reused buffer is
+        // cleared/refilled, not stale, so the wire is unchanged. (The chunk borrows
+        // these arrays zero-copy, so they must outlive it.)
+        let codes = [0i32, 1, 0];
+        let dict_offsets = [0i32, 4, 8];
+        let ts = [1i64, 2, 3];
+
+        let mut scratch = EncodeScratch::new();
+
+        // Flush 1 (fresh dict): interns AAPL, MSFT and builds the slot->gid table.
+        let mut chunk1 = Chunk::new("trades");
+        chunk1
+            .symbol_i32("sym", &codes, &dict_offsets, b"AAPLMSFT", None)
+            .unwrap();
+        chunk1.at_nanos(&ts).unwrap();
+        let mut dict1 = SymbolGlobalDict::new();
+        let mut out1 = Vec::new();
+        encode_chunk_into(&mut out1, &chunk1, &mut dict1, &mut scratch, false).unwrap();
+
+        // A reset after the flush reclaims the table into the free list.
+        scratch.reset();
+        assert!(
+            !scratch.symbol_gid_pool.is_empty(),
+            "the symbol gid table must be reclaimed into the free list on reset"
+        );
+
+        // Flush 2 (fresh dict) pops the pooled table; the wire must match flush 1.
+        let mut chunk2 = Chunk::new("trades");
+        chunk2
+            .symbol_i32("sym", &codes, &dict_offsets, b"AAPLMSFT", None)
+            .unwrap();
+        chunk2.at_nanos(&ts).unwrap();
+        let mut dict2 = SymbolGlobalDict::new();
+        let mut out2 = Vec::new();
+        encode_chunk_into(&mut out2, &chunk2, &mut dict2, &mut scratch, false).unwrap();
+
+        assert_eq!(out1, out2, "pooled reuse must not change the encoded wire");
+    }
+
+    #[cfg(feature = "arrow-ingress")]
+    #[test]
+    fn arrow_symbol_gids_are_pooled_and_reused_across_flushes() {
+        // The arrow symbol path's per-column gids buffer is reclaimed into the same
+        // scratch free list as the row path on reset, so a steady flow of
+        // arrow-symbol flushes reuses it instead of allocating a fresh Vec<u64> per
+        // column per flush. The reused buffer is cleared/refilled, so the wire is
+        // unchanged.
+        use crate::ingress::column_sender::arrow_batch;
+        use arrow::array::{ArrayRef, StringArray};
+        use std::sync::Arc;
+
+        let build = || {
+            let arr: ArrayRef = Arc::new(StringArray::from(vec!["AAPL", "MSFT", "AAPL"]));
+            let mut chunk = Chunk::new("trades");
+            chunk
+                .push_arrow_deferred("sym", arrow_batch::ColumnKind::SymbolUtf8, arr)
+                .unwrap();
+            chunk.at_nanos(&[1i64, 2, 3]).unwrap();
+            chunk
+        };
+
+        let mut scratch = EncodeScratch::new();
+
+        let chunk1 = build();
+        let mut dict1 = SymbolGlobalDict::new();
+        let mut out1 = Vec::new();
+        encode_chunk_into(&mut out1, &chunk1, &mut dict1, &mut scratch, false).unwrap();
+
+        // A reset after the flush reclaims the arrow gids buffer into the free list.
+        scratch.reset();
+        assert!(
+            !scratch.symbol_gid_pool.is_empty(),
+            "the arrow symbol gids buffer must be reclaimed into the free list on reset"
+        );
+
+        // Flush 2 pops the pooled buffer; the wire must match flush 1.
+        let chunk2 = build();
+        let mut dict2 = SymbolGlobalDict::new();
+        let mut out2 = Vec::new();
+        encode_chunk_into(&mut out2, &chunk2, &mut dict2, &mut scratch, false).unwrap();
+
+        assert_eq!(
+            out1, out2,
+            "the reused gids buffer must be refilled, not stale"
         );
     }
 }

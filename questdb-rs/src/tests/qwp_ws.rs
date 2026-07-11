@@ -2292,8 +2292,8 @@ fn spawn_orphan_capture_first_frame_server() -> (u16, mpsc::Receiver<Vec<u8>>) {
 #[test]
 fn qwp_ws_orphan_drain_heals_a_zero_extended_side_file_and_replays_via_delta() {
     // A host/power crash can zero-extend a delta slot's `.symbol-dict`. With the
-    // per-record CRC (see `qwp_ws_sfa_symbol_dict`), those trailing zeros cannot
-    // form a valid record, so `open` heals them at recovery and the recovered
+    // per-entry CRC (see `qwp_ws_sfa_symbol_dict`), those trailing zeros cannot
+    // form a valid entry, so `open` heals them at recovery and the recovered
     // dictionary is exactly the real symbols -- never inflated with phantom
     // `[len=0]` entries (the pre-CRC hazard this test used to exercise). The orphan
     // drainer therefore arms delta on the CLEAN recovered dictionary and

@@ -743,10 +743,21 @@ The implementation interns the dict against the connection-scoped
 symbol table once (cost ∝ dict cardinality, not row count) and then
 remaps codes in bulk.
 
-For each `symbol_dict_<IDX>` variant, `codes[i]` is the index into the
-dict for row `i`. Codes must be in range `0..dict_len` for valid rows;
-behaviour is undefined for out-of-range codes when validity is NULL.
-When a row's validity bit is 0, its code is ignored.
+For each `column_sender_chunk_symbol_i{8,16,32}` variant, `codes[i]` is
+the index into the dict for row `i` and must be in range `0..dict_len`
+for every non-null row. Codes are **validated eagerly at append**: an
+out-of-range or negative code is rejected with
+`line_sender_error_invalid_api_call` — it is *not* undefined behaviour, so
+a binding need not pre-validate. This holds regardless of `validity`:
+when `validity` is NULL every row is non-null and therefore checked; when
+a row's validity bit is 0 its code is ignored and not inspected.
+
+The dict is validated at the same append call: `dict_offsets` must be
+monotonic, non-negative, and end at `<= dict_bytes_len`, and `dict_bytes`
+must be valid UTF-8 — each violation is rejected with
+`line_sender_error_invalid_api_call`. A symbol accepted here is therefore
+always server-acceptable, so it can never strand a queued
+store-and-forward frame on recovery.
 
 `dict_offsets` has `dict_len + 1` entries; `dict_offsets[d]..dict_offsets[d+1]`
 slices `dict_bytes` for dict entry `d`. `dict_len` is implicit:

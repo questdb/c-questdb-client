@@ -2177,12 +2177,18 @@ pub(crate) fn resolve_arrow_symbols(
     let mut new_symbols: Vec<Vec<u8>> = Vec::new();
     let mut per_column: Vec<Option<ArrowResolvedSymbolColumn>> =
         Vec::with_capacity(classified.len());
+    // The full-batch path does not yet reuse gids buffers across flushes (a
+    // follow-up would hold this in per-sender scratch); a local pool keeps the
+    // shared `resolve_arrow_symbol_column` signature uniform without changing
+    // full-batch allocation behaviour.
+    let mut gids_pool: Vec<Vec<u64>> = Vec::new();
     for col in classified {
         per_column.push(resolve_arrow_symbol_column(
             col.arr,
             col.kind,
             symbol_dict,
             &mut new_symbols,
+            &mut gids_pool,
         )?);
     }
     Ok(ArrowSymbolResolution {
@@ -2263,6 +2269,7 @@ pub(crate) fn resolve_arrow_symbol_column(
     kind: ColumnKind,
     symbol_dict: &mut SymbolGlobalDict,
     new_symbols: &mut Vec<Vec<u8>>,
+    gids_pool: &mut Vec<Vec<u64>>,
 ) -> Result<Option<ArrowResolvedSymbolColumn>> {
     let resolved = match kind {
         ColumnKind::SymbolUtf8 => resolve_symbol_strings(
@@ -2270,21 +2277,24 @@ pub(crate) fn resolve_arrow_symbol_column(
             arr.as_any().downcast_ref::<StringArray>().unwrap(),
             symbol_dict,
             new_symbols,
+            gids_pool,
         )?,
         ColumnKind::SymbolLargeUtf8 => resolve_symbol_strings(
             arr,
             arr.as_any().downcast_ref::<LargeStringArray>().unwrap(),
             symbol_dict,
             new_symbols,
+            gids_pool,
         )?,
         ColumnKind::SymbolUtf8View => resolve_symbol_strings(
             arr,
             arr.as_any().downcast_ref::<StringViewArray>().unwrap(),
             symbol_dict,
             new_symbols,
+            gids_pool,
         )?,
         ColumnKind::SymbolDict { key, value } => {
-            resolve_symbol_dict(arr, key, value, symbol_dict, new_symbols)?
+            resolve_symbol_dict(arr, key, value, symbol_dict, new_symbols, gids_pool)?
         }
         _ => return Ok(None),
     };
@@ -2436,17 +2446,59 @@ impl VarlenSource for BinaryViewArray {
     }
 }
 
+/// Pop a reusable `gids` buffer from the pool (or allocate one), cleared and
+/// reserved for `cap` entries. Reclaimed into the pool by `EncodeScratch::reset`
+/// after the flush, so a steady flow of arrow-symbol flushes reuses the buffers
+/// instead of allocating one `Vec<u64>` per symbol column per flush -- mirroring
+/// the row path's `symbol_gid_pool`.
+fn take_pooled_gids(pool: &mut Vec<Vec<u64>>, cap: usize) -> Result<Vec<u64>> {
+    let mut gids = pool.pop().unwrap_or_default();
+    gids.clear();
+    // Fallible: `cap` is the non-null row count of a caller-supplied batch, so a huge
+    // batch must surface an error rather than abort the FFI crate (`panic = "abort"`)
+    // on an infallible `reserve` OOM -- matching the row path's `try_resize_filled`.
+    gids.try_reserve(cap).map_err(|_| {
+        fmt!(
+            ArrowIngest,
+            "SYMBOL column too large to encode ({cap} non-null rows)"
+        )
+    })?;
+    Ok(gids)
+}
+
+/// Reject a symbol dictionary value that is not valid UTF-8 before it is interned.
+///
+/// QuestDB SYMBOLs are UTF-8, and the row / column `symbol_i*` path validates this
+/// eagerly at append (`chunk::validate_varchar_utf8_cells`). Arrow string arrays
+/// nominally carry UTF-8, but a producer that builds an `ArrowArray` by hand and
+/// hands it over the C Data Interface is only structurally validated on import
+/// (`validate()`, not `validate_full()` -- see `checked_offset_bytes`), so the
+/// value bytes are not guaranteed UTF-8 at this point. Interning a non-UTF-8 symbol
+/// would assign it a global id, write it ahead to the store-and-forward side-file,
+/// and locally ACK the frame -- only for the server to reject the non-UTF-8 symbol
+/// on send, stranding the dependent queued frame. That breaks the same
+/// "writer-accepted => server-acceptable" invariant the per-symbol length/heap caps
+/// enforce at `SymbolGlobalDict::intern`, so close the gap here, at the Arrow
+/// ingestion choke point, exactly as the row path does at append.
+#[inline]
+fn validate_symbol_utf8(bytes: &[u8]) -> Result<()> {
+    std::str::from_utf8(bytes)
+        .map(|_| ())
+        .map_err(|e| fmt!(ArrowIngest, "SYMBOL value is not valid UTF-8: {}", e))
+}
+
 fn resolve_symbol_strings<S: VarlenSource>(
     arr: &dyn Array,
     source: &S,
     symbol_dict: &mut SymbolGlobalDict,
     new_symbols: &mut Vec<Vec<u8>>,
+    gids_pool: &mut Vec<Vec<u64>>,
 ) -> Result<ArrowResolvedSymbolColumn> {
     use std::collections::HashMap;
     use std::hash::BuildHasherDefault;
     let row_count = arr.len();
     let non_null = non_null_count(arr, "SYMBOL column")?;
-    let mut gids = Vec::with_capacity(non_null);
+    let mut gids = take_pooled_gids(gids_pool, non_null)?;
     // Dedup within the column so the global dict is hit once per distinct
     // value rather than once per row — matching the dictionary path and the
     // row API's bulk-intern. Uses the dict's fast non-DoS hasher, not SipHash.
@@ -2459,6 +2511,7 @@ fn resolve_symbol_strings<S: VarlenSource>(
         let gid = match seen.get(bytes) {
             Some(&gid) => gid,
             None => {
+                validate_symbol_utf8(bytes)?;
                 let (gid, is_new) = symbol_dict.intern(bytes)?;
                 if is_new {
                     new_symbols.push(bytes.to_vec());
@@ -2478,6 +2531,7 @@ fn resolve_symbol_dict(
     value: DictValue,
     symbol_dict: &mut SymbolGlobalDict,
     new_symbols: &mut Vec<Vec<u8>>,
+    gids_pool: &mut Vec<Vec<u64>>,
 ) -> Result<ArrowResolvedSymbolColumn> {
     let non_null = non_null_count(arr, "SYMBOL dictionary column")?;
 
@@ -2486,6 +2540,7 @@ fn resolve_symbol_dict(
         non_null: usize,
         symbol_dict: &mut SymbolGlobalDict,
         new_symbols: &mut Vec<Vec<u8>>,
+        gids_pool: &mut Vec<Vec<u64>>,
         get_slot: impl Fn(&DictionaryArray<K::ArrowType>, usize) -> usize,
     ) -> Result<ArrowResolvedSymbolColumn>
     where
@@ -2513,10 +2568,10 @@ fn resolve_symbol_dict(
             .map(|b| (b.as_ptr() as usize, b.len()))
             .collect();
         let (memo_idx, mut slot_to_gid) =
-            symbol_dict.take_arrow_dict_memo(&identity, &values_data, dict_len);
+            symbol_dict.take_arrow_dict_memo(&identity, &values_data, dict_len)?;
 
         let resolved = (|| -> Result<Vec<u64>> {
-            let mut gids = Vec::with_capacity(non_null);
+            let mut gids = take_pooled_gids(gids_pool, non_null)?;
             for row in 0..row_count {
                 if arr.is_null(row) {
                     continue;
@@ -2541,6 +2596,7 @@ fn resolve_symbol_dict(
                             ));
                         }
                         let bytes = values_typed.value_bytes(slot)?;
+                        validate_symbol_utf8(bytes)?;
                         let (gid, is_new) = symbol_dict.intern(bytes)?;
                         if is_new {
                             new_symbols.push(bytes.to_vec());
@@ -2560,96 +2616,150 @@ fn resolve_symbol_dict(
     }
 
     match (key, value) {
-        (DictKey::I8, DictValue::Utf8) => {
-            run::<I8KeyTag, StringArray>(arr, non_null, symbol_dict, new_symbols, |d, r| {
-                d.keys().value(r) as usize
-            })
-        }
-        (DictKey::I8, DictValue::LargeUtf8) => {
-            run::<I8KeyTag, LargeStringArray>(arr, non_null, symbol_dict, new_symbols, |d, r| {
-                d.keys().value(r) as usize
-            })
-        }
-        (DictKey::I8, DictValue::Utf8View) => {
-            run::<I8KeyTag, StringViewArray>(arr, non_null, symbol_dict, new_symbols, |d, r| {
-                d.keys().value(r) as usize
-            })
-        }
-        (DictKey::I16, DictValue::Utf8) => {
-            run::<I16KeyTag, StringArray>(arr, non_null, symbol_dict, new_symbols, |d, r| {
-                d.keys().value(r) as usize
-            })
-        }
-        (DictKey::I16, DictValue::LargeUtf8) => {
-            run::<I16KeyTag, LargeStringArray>(arr, non_null, symbol_dict, new_symbols, |d, r| {
-                d.keys().value(r) as usize
-            })
-        }
-        (DictKey::I16, DictValue::Utf8View) => {
-            run::<I16KeyTag, StringViewArray>(arr, non_null, symbol_dict, new_symbols, |d, r| {
-                d.keys().value(r) as usize
-            })
-        }
-        (DictKey::I32, DictValue::Utf8) => {
-            run::<I32KeyTag, StringArray>(arr, non_null, symbol_dict, new_symbols, |d, r| {
-                d.keys().value(r) as usize
-            })
-        }
-        (DictKey::I32, DictValue::LargeUtf8) => {
-            run::<I32KeyTag, LargeStringArray>(arr, non_null, symbol_dict, new_symbols, |d, r| {
-                d.keys().value(r) as usize
-            })
-        }
-        (DictKey::I32, DictValue::Utf8View) => {
-            run::<I32KeyTag, StringViewArray>(arr, non_null, symbol_dict, new_symbols, |d, r| {
-                d.keys().value(r) as usize
-            })
-        }
-        (DictKey::U8, DictValue::Utf8) => {
-            run::<U8KeyTag, StringArray>(arr, non_null, symbol_dict, new_symbols, |d, r| {
-                d.keys().value(r) as usize
-            })
-        }
-        (DictKey::U8, DictValue::LargeUtf8) => {
-            run::<U8KeyTag, LargeStringArray>(arr, non_null, symbol_dict, new_symbols, |d, r| {
-                d.keys().value(r) as usize
-            })
-        }
-        (DictKey::U8, DictValue::Utf8View) => {
-            run::<U8KeyTag, StringViewArray>(arr, non_null, symbol_dict, new_symbols, |d, r| {
-                d.keys().value(r) as usize
-            })
-        }
-        (DictKey::U16, DictValue::Utf8) => {
-            run::<U16KeyTag, StringArray>(arr, non_null, symbol_dict, new_symbols, |d, r| {
-                d.keys().value(r) as usize
-            })
-        }
-        (DictKey::U16, DictValue::LargeUtf8) => {
-            run::<U16KeyTag, LargeStringArray>(arr, non_null, symbol_dict, new_symbols, |d, r| {
-                d.keys().value(r) as usize
-            })
-        }
-        (DictKey::U16, DictValue::Utf8View) => {
-            run::<U16KeyTag, StringViewArray>(arr, non_null, symbol_dict, new_symbols, |d, r| {
-                d.keys().value(r) as usize
-            })
-        }
-        (DictKey::U32, DictValue::Utf8) => {
-            run::<U32KeyTag, StringArray>(arr, non_null, symbol_dict, new_symbols, |d, r| {
-                d.keys().value(r) as usize
-            })
-        }
-        (DictKey::U32, DictValue::LargeUtf8) => {
-            run::<U32KeyTag, LargeStringArray>(arr, non_null, symbol_dict, new_symbols, |d, r| {
-                d.keys().value(r) as usize
-            })
-        }
-        (DictKey::U32, DictValue::Utf8View) => {
-            run::<U32KeyTag, StringViewArray>(arr, non_null, symbol_dict, new_symbols, |d, r| {
-                d.keys().value(r) as usize
-            })
-        }
+        (DictKey::I8, DictValue::Utf8) => run::<I8KeyTag, StringArray>(
+            arr,
+            non_null,
+            symbol_dict,
+            new_symbols,
+            gids_pool,
+            |d, r| d.keys().value(r) as usize,
+        ),
+        (DictKey::I8, DictValue::LargeUtf8) => run::<I8KeyTag, LargeStringArray>(
+            arr,
+            non_null,
+            symbol_dict,
+            new_symbols,
+            gids_pool,
+            |d, r| d.keys().value(r) as usize,
+        ),
+        (DictKey::I8, DictValue::Utf8View) => run::<I8KeyTag, StringViewArray>(
+            arr,
+            non_null,
+            symbol_dict,
+            new_symbols,
+            gids_pool,
+            |d, r| d.keys().value(r) as usize,
+        ),
+        (DictKey::I16, DictValue::Utf8) => run::<I16KeyTag, StringArray>(
+            arr,
+            non_null,
+            symbol_dict,
+            new_symbols,
+            gids_pool,
+            |d, r| d.keys().value(r) as usize,
+        ),
+        (DictKey::I16, DictValue::LargeUtf8) => run::<I16KeyTag, LargeStringArray>(
+            arr,
+            non_null,
+            symbol_dict,
+            new_symbols,
+            gids_pool,
+            |d, r| d.keys().value(r) as usize,
+        ),
+        (DictKey::I16, DictValue::Utf8View) => run::<I16KeyTag, StringViewArray>(
+            arr,
+            non_null,
+            symbol_dict,
+            new_symbols,
+            gids_pool,
+            |d, r| d.keys().value(r) as usize,
+        ),
+        (DictKey::I32, DictValue::Utf8) => run::<I32KeyTag, StringArray>(
+            arr,
+            non_null,
+            symbol_dict,
+            new_symbols,
+            gids_pool,
+            |d, r| d.keys().value(r) as usize,
+        ),
+        (DictKey::I32, DictValue::LargeUtf8) => run::<I32KeyTag, LargeStringArray>(
+            arr,
+            non_null,
+            symbol_dict,
+            new_symbols,
+            gids_pool,
+            |d, r| d.keys().value(r) as usize,
+        ),
+        (DictKey::I32, DictValue::Utf8View) => run::<I32KeyTag, StringViewArray>(
+            arr,
+            non_null,
+            symbol_dict,
+            new_symbols,
+            gids_pool,
+            |d, r| d.keys().value(r) as usize,
+        ),
+        (DictKey::U8, DictValue::Utf8) => run::<U8KeyTag, StringArray>(
+            arr,
+            non_null,
+            symbol_dict,
+            new_symbols,
+            gids_pool,
+            |d, r| d.keys().value(r) as usize,
+        ),
+        (DictKey::U8, DictValue::LargeUtf8) => run::<U8KeyTag, LargeStringArray>(
+            arr,
+            non_null,
+            symbol_dict,
+            new_symbols,
+            gids_pool,
+            |d, r| d.keys().value(r) as usize,
+        ),
+        (DictKey::U8, DictValue::Utf8View) => run::<U8KeyTag, StringViewArray>(
+            arr,
+            non_null,
+            symbol_dict,
+            new_symbols,
+            gids_pool,
+            |d, r| d.keys().value(r) as usize,
+        ),
+        (DictKey::U16, DictValue::Utf8) => run::<U16KeyTag, StringArray>(
+            arr,
+            non_null,
+            symbol_dict,
+            new_symbols,
+            gids_pool,
+            |d, r| d.keys().value(r) as usize,
+        ),
+        (DictKey::U16, DictValue::LargeUtf8) => run::<U16KeyTag, LargeStringArray>(
+            arr,
+            non_null,
+            symbol_dict,
+            new_symbols,
+            gids_pool,
+            |d, r| d.keys().value(r) as usize,
+        ),
+        (DictKey::U16, DictValue::Utf8View) => run::<U16KeyTag, StringViewArray>(
+            arr,
+            non_null,
+            symbol_dict,
+            new_symbols,
+            gids_pool,
+            |d, r| d.keys().value(r) as usize,
+        ),
+        (DictKey::U32, DictValue::Utf8) => run::<U32KeyTag, StringArray>(
+            arr,
+            non_null,
+            symbol_dict,
+            new_symbols,
+            gids_pool,
+            |d, r| d.keys().value(r) as usize,
+        ),
+        (DictKey::U32, DictValue::LargeUtf8) => run::<U32KeyTag, LargeStringArray>(
+            arr,
+            non_null,
+            symbol_dict,
+            new_symbols,
+            gids_pool,
+            |d, r| d.keys().value(r) as usize,
+        ),
+        (DictKey::U32, DictValue::Utf8View) => run::<U32KeyTag, StringViewArray>(
+            arr,
+            non_null,
+            symbol_dict,
+            new_symbols,
+            gids_pool,
+            |d, r| d.keys().value(r) as usize,
+        ),
     }
 }
 
@@ -2808,6 +2918,12 @@ pub(crate) fn write_arrow_column_body(
     arr: &dyn Array,
     sym_resolution: Option<&ArrowResolvedSymbolColumn>,
 ) -> Result<()> {
+    // `null_count()` is consistent with the null buffer the writers below (and
+    // the symbol resolve pass) key off via `is_null` / `arr.nulls()`: arrow drops
+    // the null buffer entirely when the count is 0 (so `nulls()` is `None` and no
+    // row reads as null when `use_bitmap` is false), and keeps it when the count
+    // is > 0 (so the bitmap is written from the real buffer). A count and buffer
+    // that disagree cannot desync the frame here.
     let null_count = arr.null_count();
     let use_bitmap = kind_supports_sparse_nulls(kind) && null_count > 0;
     out.push(u8::from(use_bitmap));
@@ -4108,6 +4224,85 @@ mod tests {
     }
 
     #[test]
+    fn arrow_symbol_non_utf8_is_rejected_not_interned() {
+        // QuestDB SYMBOLs are UTF-8, and the row / column `symbol_i*` path validates
+        // this eagerly at append. Arrow string arrays nominally carry UTF-8, but an
+        // ArrowArray built by hand and imported over the C Data Interface is only
+        // structurally validated (`validate()`, not `validate_full()`), so its value
+        // bytes are not guaranteed UTF-8. Interning a non-UTF-8 symbol would give it a
+        // global id, write it ahead to the store-and-forward side-file, and locally
+        // ACK the frame -- only for the server to reject it on send, stranding the
+        // queued frame. The Arrow resolve path must reject it at ingestion and leave
+        // the dict untouched (no id assigned, nothing staged in `new_symbols`).
+        use arrow::array::types::Int8Type;
+        use arrow::array::{ArrayDataBuilder, DictionaryArray, Int8Array};
+        use arrow::buffer::Buffer;
+
+        // A `build_unchecked` Utf8 array whose single value is invalid UTF-8
+        // (0xFF 0xFE): valid offsets (cheap `validate()` passes), bad content.
+        let bad_utf8 = || -> StringArray {
+            let data = unsafe {
+                ArrayDataBuilder::new(DataType::Utf8)
+                    .len(1)
+                    .add_buffer(Buffer::from_vec(vec![0i32, 2]))
+                    .add_buffer(Buffer::from_vec(vec![0xFFu8, 0xFE]))
+                    .build_unchecked()
+            };
+            StringArray::from(data)
+        };
+
+        // (a) Plain SYMBOL (Utf8) path -> `resolve_symbol_strings`.
+        {
+            let arr = bad_utf8();
+            let mut gd = SymbolGlobalDict::new();
+            let mut new_symbols: Vec<Vec<u8>> = Vec::new();
+            let mut gids_pool: Vec<Vec<u64>> = Vec::new();
+            let Err(err) = resolve_arrow_symbol_column(
+                &arr,
+                ColumnKind::SymbolUtf8,
+                &mut gd,
+                &mut new_symbols,
+                &mut gids_pool,
+            ) else {
+                panic!("a non-UTF-8 SYMBOL value must be rejected");
+            };
+            assert_eq!(err.code(), crate::ErrorCode::ArrowIngest);
+            assert!(err.msg().contains("not valid UTF-8"), "{}", err.msg());
+            assert_eq!(gd.next_id(), 0, "a rejected symbol must not get an id");
+            assert!(
+                new_symbols.is_empty(),
+                "nothing may be staged for the delta"
+            );
+        }
+
+        // (b) Dictionary-encoded SYMBOL path -> `resolve_symbol_dict`: the referenced
+        // dictionary *values* slot carries the bad bytes.
+        {
+            let keys = Int8Array::from(vec![0i8]);
+            let dict = DictionaryArray::<Int8Type>::try_new(keys, std::sync::Arc::new(bad_utf8()))
+                .unwrap();
+            let mut gd = SymbolGlobalDict::new();
+            let mut new_symbols: Vec<Vec<u8>> = Vec::new();
+            let mut gids_pool: Vec<Vec<u64>> = Vec::new();
+            let Err(err) = resolve_arrow_symbol_column(
+                &dict,
+                ColumnKind::SymbolDict {
+                    key: DictKey::I8,
+                    value: DictValue::Utf8,
+                },
+                &mut gd,
+                &mut new_symbols,
+                &mut gids_pool,
+            ) else {
+                panic!("a non-UTF-8 dictionary SYMBOL value must be rejected");
+            };
+            assert_eq!(err.code(), crate::ErrorCode::ArrowIngest);
+            assert!(err.msg().contains("not valid UTF-8"), "{}", err.msg());
+            assert_eq!(gd.next_id(), 0, "a rejected dict symbol must not get an id");
+        }
+    }
+
+    #[test]
     fn classify_rejects_unsupported_type() {
         let arr: ArrayRef = Arc::new(arrow::array::NullArray::new(3));
         let f = Field::new("c", DataType::Null, true);
@@ -5258,6 +5453,80 @@ mod tests {
         )
         .unwrap();
         assert_eq!(gd.next_id(), 1);
+    }
+
+    #[test]
+    fn arrow_dict_memo_distinguishes_different_offset_windows_of_one_pool() {
+        // The per-connection `slot -> global id` memo is keyed on the dictionary
+        // values array's buffer pointers+lengths. That is a *sufficient* key only
+        // because arrow's typed `to_data()` bakes any logical `ArrayData::offset()`
+        // into the buffer pointer: two different-offset windows of one values pool
+        // resolve to different buffer pointers (never the same pointer with a
+        // different `offset()`), so they cannot collide on the memo key and alias
+        // to each other's symbols.
+        //
+        // This test pins that invariant: it resolves two different-offset windows
+        // of one pool against the SAME connection dict (memo live across both, no
+        // intervening rollback) and asserts each resolves to ITS OWN symbols. If a
+        // future arrow version ever stopped normalising the offset into the pointer
+        // (so the two windows shared a pointer), the memo would need the offset in
+        // its key and this test would fail with the second window aliasing the
+        // first — the tripwire for that regression.
+        use arrow::array::types::Int16Type;
+        use arrow::array::{DictionaryArray, Int16Array, make_array};
+
+        let pool = StringArray::from(vec!["A", "B", "C", "D"]).into_data();
+        let v_ab = make_array(pool.slice(0, 2)); // window ["A", "B"]
+        let v_cd = make_array(pool.slice(2, 2)); // window ["C", "D"]
+
+        // The invariant the buffer-only key relies on: distinct windows -> distinct
+        // buffer pointers, with the offset baked in (== 0 after `to_data()`).
+        let d_ab = v_ab.to_data();
+        let d_cd = v_cd.to_data();
+        assert_eq!(
+            d_ab.offset(),
+            0,
+            "to_data() bakes the offset into the pointer"
+        );
+        assert_eq!(
+            d_cd.offset(),
+            0,
+            "to_data() bakes the offset into the pointer"
+        );
+        assert_ne!(
+            d_ab.buffers()[0].as_ptr(),
+            d_cd.buffers()[0].as_ptr(),
+            "distinct windows must yield distinct buffer pointers (memo key soundness)"
+        );
+
+        let keys = Int16Array::from(vec![0i16, 1]);
+        let dict_ab = DictionaryArray::<Int16Type>::try_new(keys.clone(), v_ab).unwrap();
+        let dict_cd = DictionaryArray::<Int16Type>::try_new(keys, v_cd).unwrap();
+
+        let kind = ColumnKind::SymbolDict {
+            key: DictKey::I16,
+            value: DictValue::Utf8,
+        };
+        let mut gd = SymbolGlobalDict::new();
+        let mut new_symbols: Vec<Vec<u8>> = Vec::new();
+        let mut gids_pool: Vec<Vec<u64>> = Vec::new();
+
+        let r_ab =
+            resolve_arrow_symbol_column(&dict_ab, kind, &mut gd, &mut new_symbols, &mut gids_pool)
+                .unwrap()
+                .unwrap();
+        let r_cd =
+            resolve_arrow_symbol_column(&dict_cd, kind, &mut gd, &mut new_symbols, &mut gids_pool)
+                .unwrap()
+                .unwrap();
+
+        let sym = |gid: u64| gd.entry(gid).unwrap().to_vec();
+        assert_eq!(sym(r_ab.gids[0]), b"A");
+        assert_eq!(sym(r_ab.gids[1]), b"B");
+        assert_eq!(sym(r_cd.gids[0]), b"C");
+        assert_eq!(sym(r_cd.gids[1]), b"D");
+        // All four distinct symbols interned: the windows did not alias.
+        assert_eq!(gd.next_id(), 4);
     }
 
     // -----------------------------------------------------------------

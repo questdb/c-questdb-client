@@ -47,6 +47,8 @@ use crate::ingress::conf::QwpWsManagedSlotExclusion;
 use crate::ingress::tls::TlsSettings;
 
 #[cfg(feature = "sync-sender-qwp-ws")]
+use super::qwp_ws::{QwpWsConnectKind, try_dup_recovered};
+#[cfg(feature = "sync-sender-qwp-ws")]
 use super::qwp_ws_driver::{
     BlockingQwpWsTransport, CloseStepOutcome, DEFAULT_EVENT_CAPACITY, DriverError, PublicationLog,
     QwpWsPublicationStore, QwpWsSendCore, ReconnectPolicy,
@@ -436,11 +438,19 @@ impl OrphanDrainer {
             let _ = clear_last_error(&slot_dir);
             return OrphanOpenOutcome::AlreadyDrained;
         }
+        // Threaded orphan drainers carry a stop flag; manual-progress drainers
+        // do not. Only the threaded/background form gets the finite fallback.
+        let connect_kind = if stop.is_some() {
+            QwpWsConnectKind::BackgroundDrainer
+        } else {
+            QwpWsConnectKind::Foreground
+        };
         let transport = match BlockingQwpWsTransport::connect(
             config.host.clone(),
             config.port.clone(),
             config.use_tls,
             config.tls_settings.clone(),
+            connect_kind,
             config.qwp_ws.clone(),
             config.auth_header.clone(),
             Arc::new(AtomicUsize::new(0)),
@@ -460,7 +470,28 @@ impl OrphanDrainer {
         // the side-file handle stays with the queue). A dense (memory-mode) slot
         // reports delta disabled and needs none of this.
         let delta_dict_enabled = queue.is_delta_dict_enabled();
-        let recovered_dict_entries = queue.recovered_symbol_dict_entries().to_vec();
+        // Fallible copy: a large recovered dictionary (up to ~2 GiB for a crafted
+        // CRC-valid side-file) must not abort the drainer via an infallible `to_vec`;
+        // the foreground guards the same copy with `try_dup_recovered`. On OOM, degrade
+        // to dense (leave the mirror disabled) -- the same fallback the corrupt-dict
+        // branch below takes -- so the drainer still replays the slot's frames instead
+        // of crashing.
+        let recovered_dict_entries = if delta_dict_enabled {
+            match try_dup_recovered(queue.recovered_symbol_dict_entries()) {
+                Ok(entries) => Some(entries),
+                Err(err) => {
+                    log::warn!(
+                        "QWP/WebSocket orphan slot {}: recovered symbol dictionary is \
+                         too large to allocate ({err}); draining with full-dictionary \
+                         (dense) frames.",
+                        slot_dir.display()
+                    );
+                    None
+                }
+            }
+        } else {
+            None
+        };
         let recovered_dict_count = queue.recovered_symbol_dict_count();
         let store = QwpWsPublicationStore::new(queue, DEFAULT_EVENT_CAPACITY);
         let mut send_core = QwpWsSendCore::new_with_durable_ack_and_rejection_limit(
@@ -481,7 +512,7 @@ impl OrphanDrainer {
             *config.qwp_ws.max_frame_rejections,
             *config.qwp_ws.poison_min_escalation_window,
         );
-        if delta_dict_enabled {
+        if let Some(recovered_dict_entries) = recovered_dict_entries {
             // The orphan replay path builds no producer `SymbolGlobalDict`, so --
             // unlike the foreground recovery paths (`new_store_and_forward` /
             // `QwpWsReplayEncoder::seed_global_dict`, which seed one and propagate

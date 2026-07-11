@@ -73,6 +73,36 @@ use super::qwp_ws_sfa_symbol_dict::PersistedSymbolDict;
 type TlsStream = rustls::StreamOwned<rustls::ClientConnection, NoSigpipeTcp>;
 
 const QWP_WS_TLS_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
+const QWP_WS_DEFAULT_BACKGROUND_CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// Which lifecycle owns a shared QWP/WebSocket connect walk.
+///
+/// The main sender's initial connect and I/O-runner reconnects are foreground
+/// work, even when the runner itself lives on a worker thread. Only orphan-slot
+/// drainers use `BackgroundDrainer`, matching Java's background-connect policy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum QwpWsConnectKind {
+    Foreground,
+    BackgroundDrainer,
+}
+
+impl QwpWsConnectKind {
+    fn is_background(self) -> bool {
+        self == Self::BackgroundDrainer
+    }
+}
+
+/// Mirrors Java's `effectiveConnectTimeoutMs`: foreground connects preserve
+/// the configured value verbatim, while an unset background-drainer timeout
+/// receives a finite fallback so shutdown cannot remain parked until the OS
+/// TCP-connect deadline.
+fn effective_connect_timeout(background: bool, configured: Option<Duration>) -> Option<Duration> {
+    if background && configured.is_none() {
+        Some(QWP_WS_DEFAULT_BACKGROUND_CONNECT_TIMEOUT)
+    } else {
+        configured
+    }
+}
 
 pub(crate) enum WsStream {
     Plain(NoSigpipeTcp),
@@ -217,6 +247,18 @@ pub(crate) struct SyncQwpWsHandlerState {
     /// [`super::column_sender::ColumnSender::new_store_and_forward`]; the two are
     /// mutually exclusive. `None` in memory mode / on side-file open failure.
     pub(crate) persisted_symbol_dict: Option<PersistedSymbolDict>,
+}
+
+impl SyncQwpWsHandlerState {
+    /// Releases the recovered dictionary seeded into the (row) replay encoder at
+    /// connect. The column sender uses its own dictionary and never touches this
+    /// encoder, so for a column-owned state that seed is dead weight; called from
+    /// [`ColumnSender::new_store_and_forward`].
+    ///
+    /// [`ColumnSender::new_store_and_forward`]: super::column_sender::ColumnSender::new_store_and_forward
+    pub(crate) fn release_dormant_encoder_dict(&mut self) {
+        self.encoder.release_dormant_dict();
+    }
 }
 
 pub(crate) struct ManualQwpWsHandlerState {
@@ -755,6 +797,7 @@ impl QwpWsPendingConnect {
                 None,
                 self.use_tls,
                 self.tls_settings.clone(),
+                QwpWsConnectKind::Foreground,
                 &self.qwp_ws,
                 self.auth_header.as_deref(),
             ) {
@@ -764,6 +807,7 @@ impl QwpWsPendingConnect {
                         tracker,
                         self.use_tls,
                         self.tls_settings.clone(),
+                        QwpWsConnectKind::Foreground,
                         self.qwp_ws.clone(),
                         self.auth_header.clone(),
                         Arc::clone(&self.server_max_batch_size),
@@ -2681,12 +2725,14 @@ pub(crate) fn establish_connection(
     port: &str,
     use_tls: bool,
     tls_settings: Option<TlsSettings>,
+    connect_kind: QwpWsConnectKind,
     qwp_ws: &QwpWsConfig,
     auth_header: Option<&str>,
 ) -> crate::Result<(WsStream, codec::QwpWsHandshakeResult, Vec<u8>)> {
     let auth_timeout = *qwp_ws.auth_timeout;
     let request_timeout = *qwp_ws.request_timeout;
-    let connect_timeout = *qwp_ws.connect_timeout;
+    let connect_timeout =
+        effective_connect_timeout(connect_kind.is_background(), *qwp_ws.connect_timeout);
 
     let mut tcp = connect_qwp_ws_tcp(host, port, request_timeout, connect_timeout)?;
 
@@ -2786,6 +2832,7 @@ pub(crate) fn connect_qwp_ws_endpoint_round<A: QwpWsHealthAccess>(
     previous_failure: Option<ReconnectReason>,
     use_tls: bool,
     tls_settings: Option<TlsSettings>,
+    connect_kind: QwpWsConnectKind,
     qwp_ws: &QwpWsConfig,
     auth_header: Option<&str>,
 ) -> crate::Result<QwpWsConnectRoundSuccess> {
@@ -2814,6 +2861,7 @@ pub(crate) fn connect_qwp_ws_endpoint_round<A: QwpWsHealthAccess>(
             &endpoint.port,
             use_tls,
             tls_settings.clone(),
+            connect_kind,
             qwp_ws,
             auth_header,
         ) {
@@ -2922,7 +2970,7 @@ pub(crate) fn connect_qwp_ws(
 /// surface an error, not abort the host via an infallible `to_vec`/`clone` -- that
 /// would defeat the fallible `try_reserve`/`MAX_FILE_LEN` guard the side-file
 /// reader already applies.
-fn try_dup_recovered(src: &[u8]) -> crate::Result<Vec<u8>> {
+pub(super) fn try_dup_recovered(src: &[u8]) -> crate::Result<Vec<u8>> {
     let mut v = Vec::new();
     v.try_reserve_exact(src.len()).map_err(|_| {
         error::fmt!(
@@ -3194,7 +3242,11 @@ fn open_qwp_ws_parts(
     // whether delta is on, the recovered entries (to seed the producer dict + the
     // driver mirror), and the side-file handle (for the foreground's write-ahead).
     let delta_dict_enabled = queue.is_delta_dict_enabled();
-    let recovered_dict_entries = queue.recovered_symbol_dict_entries().to_vec();
+    // Fallible copy: a large recovered dictionary (up to ~2 GiB for a crafted
+    // CRC-valid side-file) must surface an error, not abort the host via an
+    // infallible `to_vec` -- exactly the guard `try_dup_recovered` documents and the
+    // async connect path already applies.
+    let recovered_dict_entries = try_dup_recovered(queue.recovered_symbol_dict_entries())?;
     let recovered_dict_count = queue.recovered_symbol_dict_count();
     let persisted_symbol_dict = queue.take_persisted_symbol_dict();
     let store = QwpWsPublicationStore::new(queue, *qwp_ws.error_inbox_capacity);
@@ -3237,6 +3289,7 @@ fn connect_blocking_transport(
             port,
             use_tls,
             tls_settings,
+            QwpWsConnectKind::Foreground,
             qwp_ws.clone(),
             auth_header,
             server_max_batch_size,
@@ -3282,6 +3335,7 @@ fn connect_blocking_transport_with_retry(
             None,
             use_tls,
             tls_settings.clone(),
+            QwpWsConnectKind::Foreground,
             qwp_ws,
             auth_header.as_deref(),
         ) {
@@ -3291,6 +3345,7 @@ fn connect_blocking_transport_with_retry(
                     tracker,
                     use_tls,
                     tls_settings,
+                    QwpWsConnectKind::Foreground,
                     qwp_ws.clone(),
                     auth_header,
                     server_max_batch_size,
@@ -4009,6 +4064,18 @@ mod tests {
         let generation = notifier.generation();
 
         assert!(!notifier.wait_for_change(generation, Some(Instant::now())));
+    }
+
+    #[test]
+    fn effective_connect_timeout_defaults_only_for_background_drainers() {
+        let explicit = Some(Duration::from_millis(250));
+
+        assert_eq!(
+            effective_connect_timeout(true, None),
+            Some(Duration::from_secs(15))
+        );
+        assert_eq!(effective_connect_timeout(true, explicit), explicit);
+        assert_eq!(effective_connect_timeout(false, None), None);
     }
 
     #[test]

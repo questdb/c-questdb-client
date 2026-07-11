@@ -320,6 +320,11 @@ impl ColumnSender {
             symbol_dict.seed(&recovered, state.recovered_dict_count)?;
         }
         let persisted_symbol_dict = state.persisted_symbol_dict.take();
+        // The row encoder in `state` is dormant for a column sender (we use our own
+        // `symbol_dict` above and never touch it); release the recovered dictionary
+        // seeded into it at connect so it is not carried dead for the connection's
+        // life -- matching the `recovered_dict_entries` take above.
+        state.release_dormant_encoder_dict();
         Ok(Self {
             backend: ColumnSenderBackend::StoreAndForward(Box::new(SfaColumnBackend {
                 state,
@@ -1304,6 +1309,12 @@ impl SfaColumnBackend {
     /// would be unrecoverable after a restart (its base ids are gone from the
     /// poisoned side-file). Falling back to dense (self-sufficient) frames keeps
     /// everything ingested from here on crash-recoverable without the side-file.
+    ///
+    /// The background driver's send mirror lives on the I/O thread and cannot be
+    /// reached from here, so it stays enabled while the foreground goes dense. That is
+    /// safe: the dense frames base at id 0 and re-ship the whole dictionary, which the
+    /// torn-dict guard accepts as an idempotent overlap of the mirrored prefix (see
+    /// `guard_dict_not_torn` in `qwp_ws_driver`) and `accumulate` keeps in lockstep.
     fn rollback_frame(
         &mut self,
         dict_mark: SymbolGlobalDictMark,

@@ -5118,6 +5118,16 @@ pub(crate) struct SymbolGlobalDict {
     entries: Vec<std::sync::Arc<[u8]>>,
     next_id: u64,
     cap: usize,
+    /// Running total of the UTF-8 bytes held across every entry, so
+    /// [`intern`](Self::intern) can enforce the connection heap cap in O(1)
+    /// instead of summing `entries` on each call. Advanced in lockstep with
+    /// `entries`/`next_id`, snapshotted by [`mark`](Self::mark), and restored by
+    /// [`rollback`](Self::rollback).
+    heap_bytes: usize,
+    /// Aggregate heap-byte ceiling, defaulting to
+    /// [`MAX_CONN_SYMBOL_DICT_HEAP_BYTES`]; a field (like `cap`) so tests can
+    /// shrink it without interning 256 MiB.
+    heap_cap: usize,
     #[cfg(feature = "arrow-ingress")]
     arrow_dict_memo: Vec<ArrowDictSlotMemo>,
 }
@@ -5126,6 +5136,10 @@ pub(crate) struct SymbolGlobalDict {
 /// (categorical) values array. Keyed by the array's buffer pointers+lengths:
 /// every batch sliced from the same chunk shares those buffers, so the costly
 /// per-string `intern` runs once per chunk instead of once per batch. The
+/// buffer pointers are a sufficient key because arrow's typed `to_data()`
+/// bakes any logical array offset into the buffer pointer (a different-offset
+/// window yields a different pointer, never the same pointer with a different
+/// `offset()`), so two distinct windows can never collide on this key. The
 /// stored ids are only valid against the current dict contents, so
 /// [`SymbolGlobalDict::rollback`] drops the whole memo.
 #[cfg(feature = "arrow-ingress")]
@@ -5153,11 +5167,27 @@ impl Default for SymbolGlobalDict {
 #[cfg(feature = "_sender-qwp-ws")]
 pub(crate) const MAX_CONN_SYMBOL_DICT_SIZE: usize = 8_388_608;
 
+/// Per-connection cap on the cumulative UTF-8 heap (in bytes) the QWP/WS global
+/// symbol dictionary holds. Matches `MAX_CONN_DICT_HEAP_BYTES` in the egress
+/// reader (`egress/symbol_dict.rs`) and the Java reference client. The entry
+/// count ([`MAX_CONN_SYMBOL_DICT_SIZE`]) and per-entry length
+/// ([`MAX_PERSISTED_SYMBOL_ENTRY_LEN`]) caps do NOT bound the aggregate heap
+/// (8M entries * 1 MiB ~= 8 TiB), so without this cap a high-cardinality /
+/// large-symbol connection could (a) build a dictionary the server rejects with
+/// no ingestion-side error, and (b) grow the persisted side-file past
+/// `MAX_FILE_LEN` (~2 GiB), which recovery then discards as over-cap -- stranding
+/// the slot's queued delta frames at the torn-dict guard. Enforcing the same
+/// 256 MiB bound the reader/server use keeps writer and reader in lockstep and a
+/// legitimate side-file well under `MAX_FILE_LEN`.
+#[cfg(feature = "_sender-qwp-ws")]
+pub(crate) const MAX_CONN_SYMBOL_DICT_HEAP_BYTES: usize = 256 * 1024 * 1024;
+
 #[cfg(feature = "_sender-qwp-ws")]
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct SymbolGlobalDictMark {
     entries_len: usize,
     next_id: u64,
+    heap_bytes: usize,
 }
 
 #[cfg(feature = "_sender-qwp-ws")]
@@ -5168,6 +5198,8 @@ impl SymbolGlobalDict {
             entries: Vec::new(),
             next_id: 0,
             cap: MAX_CONN_SYMBOL_DICT_SIZE,
+            heap_bytes: 0,
+            heap_cap: MAX_CONN_SYMBOL_DICT_HEAP_BYTES,
             #[cfg(feature = "arrow-ingress")]
             arrow_dict_memo: Vec::new(),
         }
@@ -5179,6 +5211,17 @@ impl SymbolGlobalDict {
     #[cfg(test)]
     pub(crate) fn with_cap(cap: usize) -> Self {
         Self { cap, ..Self::new() }
+    }
+
+    /// Same as [`new`](Self::new) but with a smaller heap-byte cap so the
+    /// heap-cap-rejection path can be exercised without interning 256 MiB of
+    /// symbols.
+    #[cfg(test)]
+    pub(crate) fn with_heap_cap(heap_cap: usize) -> Self {
+        Self {
+            heap_cap,
+            ..Self::new()
+        }
     }
 
     #[cfg(test)]
@@ -5197,6 +5240,7 @@ impl SymbolGlobalDict {
         SymbolGlobalDictMark {
             entries_len: self.entries.len(),
             next_id: self.next_id,
+            heap_bytes: self.heap_bytes,
         }
     }
 
@@ -5205,6 +5249,7 @@ impl SymbolGlobalDict {
             self.map.remove(entry.as_ref());
         }
         self.next_id = mark.next_id;
+        self.heap_bytes = mark.heap_bytes;
         #[cfg(feature = "arrow-ingress")]
         self.arrow_dict_memo.clear();
     }
@@ -5215,13 +5260,31 @@ impl SymbolGlobalDict {
     /// yields a fresh `u64::MAX`-filled table. The caller fills any `u64::MAX`
     /// slot via [`intern`](Self::intern) and must hand the table back with
     /// [`restore_arrow_dict_memo`](Self::restore_arrow_dict_memo).
+    /// Fallibly (re)size a `slot -> global id` table to `dict_len`, filled with the
+    /// `u64::MAX` "unmapped" sentinel. `dict_len` is the caller-supplied Arrow
+    /// dictionary length, unbounded at this point (unlike the row path's
+    /// `chunk::push_symbol`), so the allocation must surface an error rather than
+    /// abort the FFI crate (`panic = "abort"`) on an infallible OOM.
+    #[cfg(feature = "arrow-ingress")]
+    fn try_resize_gid_table(table: &mut Vec<u64>, dict_len: usize) -> crate::Result<()> {
+        table.clear();
+        table.try_reserve(dict_len).map_err(|_| {
+            crate::error::fmt!(
+                InvalidApiCall,
+                "Arrow symbol dictionary too large to encode ({dict_len} entries)"
+            )
+        })?;
+        table.resize(dict_len, u64::MAX);
+        Ok(())
+    }
+
     #[cfg(feature = "arrow-ingress")]
     pub(crate) fn take_arrow_dict_memo(
         &mut self,
         identity: &[(usize, usize)],
         values_data: &arrow::array::ArrayData,
         dict_len: usize,
-    ) -> (usize, Vec<u64>) {
+    ) -> crate::Result<(usize, Vec<u64>)> {
         const MEMO_CAP: usize = 32;
         if let Some(idx) = self
             .arrow_dict_memo
@@ -5230,20 +5293,21 @@ impl SymbolGlobalDict {
         {
             let mut slot_to_gid = std::mem::take(&mut self.arrow_dict_memo[idx].slot_to_gid);
             if slot_to_gid.len() != dict_len {
-                slot_to_gid.clear();
-                slot_to_gid.resize(dict_len, u64::MAX);
+                Self::try_resize_gid_table(&mut slot_to_gid, dict_len)?;
             }
-            return (idx, slot_to_gid);
+            return Ok((idx, slot_to_gid));
         }
         if self.arrow_dict_memo.len() >= MEMO_CAP {
             self.arrow_dict_memo.clear();
         }
+        let mut slot_to_gid = Vec::new();
+        Self::try_resize_gid_table(&mut slot_to_gid, dict_len)?;
         self.arrow_dict_memo.push(ArrowDictSlotMemo {
             identity: identity.to_vec(),
             _pin: values_data.clone(),
             slot_to_gid: Vec::new(),
         });
-        (self.arrow_dict_memo.len() - 1, vec![u64::MAX; dict_len])
+        Ok((self.arrow_dict_memo.len() - 1, slot_to_gid))
     }
 
     #[cfg(feature = "arrow-ingress")]
@@ -5259,8 +5323,9 @@ impl SymbolGlobalDict {
     }
 
     /// Returns `(global_id, is_new)`. Errors with `InvalidApiCall` if the symbol
-    /// exceeds [`MAX_PERSISTED_SYMBOL_ENTRY_LEN`] or the dictionary has reached
-    /// [`MAX_CONN_SYMBOL_DICT_SIZE`].
+    /// exceeds [`MAX_PERSISTED_SYMBOL_ENTRY_LEN`], or interning it would push the
+    /// dictionary past its entry-count cap ([`MAX_CONN_SYMBOL_DICT_SIZE`]) or its
+    /// cumulative heap cap ([`MAX_CONN_SYMBOL_DICT_HEAP_BYTES`]).
     pub(crate) fn intern(&mut self, bytes: &[u8]) -> crate::Result<(u64, bool)> {
         // A symbol larger than the persisted side-file's per-entry cap would be
         // interned, used in a frame and ACKed, then rejected as torn by the
@@ -5290,6 +5355,27 @@ impl SymbolGlobalDict {
                 self.cap
             ));
         }
+        // Aggregate heap cap: the entry-count and per-entry caps above do NOT
+        // bound the total bytes (8M entries * 1 MiB ~= 8 TiB). Enforce the same
+        // 256 MiB connection heap the egress reader / server / Java client use,
+        // at this single ingestion choke point, so an oversized *aggregate* never
+        // gets an id or is written ahead -- otherwise the persisted side-file
+        // could grow past `MAX_FILE_LEN` and be discarded on recovery, stranding
+        // queued frames. `checked_add` is defensive: `bytes.len()` is already
+        // <= 1 MiB and `heap_bytes` <= the cap, so it cannot actually overflow.
+        let new_heap = self
+            .heap_bytes
+            .checked_add(bytes.len())
+            .filter(|&h| h <= self.heap_cap)
+            .ok_or_else(|| {
+                crate::error::fmt!(
+                    InvalidApiCall,
+                    "QWP/WS connection-scoped symbol dictionary reached its \
+                     {}-byte heap cap; drop and reopen the connection to reset \
+                     the dictionary",
+                    self.heap_cap
+                )
+            })?;
         self.entries
             .try_reserve(1)
             .map_err(|_| crate::error::fmt!(InvalidApiCall, "symbol dict allocation failed"))?;
@@ -5301,6 +5387,7 @@ impl SymbolGlobalDict {
         self.entries.push(std::sync::Arc::clone(&owned));
         self.map.insert(owned, id);
         self.next_id += 1;
+        self.heap_bytes = new_heap;
         Ok((id, true))
     }
 
@@ -9341,6 +9428,61 @@ mod tests {
 
     #[cfg(feature = "_sender-qwp-ws")]
     #[test]
+    fn symbol_dict_enforces_heap_byte_cap_independently_of_entry_and_per_entry_caps() {
+        // The entry-count and per-entry caps do not bound the aggregate heap, so
+        // intern enforces the connection heap cap separately. A small heap cap
+        // exercises the path without interning 256 MiB; every entry here is well
+        // under the per-entry cap and the count under the entry cap, so only the
+        // heap cap can reject.
+        let mut dict = SymbolGlobalDict::with_heap_cap(10);
+        assert!(dict.intern(b"aaaaa").unwrap().1); // heap 5/10
+        assert!(dict.intern(b"bbbbb").unwrap().1); // heap 10/10 -- exactly at the cap is accepted
+        assert_eq!(dict.len(), 2);
+
+        // A distinct symbol that would push the heap past the cap is rejected, and
+        // gets no id.
+        let err = dict.intern(b"c").unwrap_err();
+        assert_eq!(err.code(), ErrorCode::InvalidApiCall);
+        assert!(err.msg().contains("heap"), "{}", err.msg());
+        assert_eq!(dict.len(), 2);
+
+        // A duplicate does not grow the heap (it resolves before the cap check), so
+        // it still interns at the cap.
+        let (id, is_new) = dict.intern(b"aaaaa").unwrap();
+        assert!(!is_new);
+        assert_eq!(id, 0);
+    }
+
+    #[cfg(feature = "_sender-qwp-ws")]
+    #[test]
+    fn symbol_dict_rollback_restores_the_heap_counter() {
+        // mark/rollback must restore heap_bytes in lockstep with entries/next_id --
+        // a frame write-aheads its symbols, then on a publish failure rolls them
+        // back and reuses the ids AND the freed heap budget for the next frame. If
+        // the counter were not restored, the freed bytes would leak and a later
+        // intern be wrongly rejected.
+        let mut dict = SymbolGlobalDict::with_heap_cap(10);
+        assert!(dict.intern(b"aaaaa").unwrap().1); // heap 5/10, id 0
+        let mark = dict.mark();
+        assert!(dict.intern(b"bbbbb").unwrap().1); // heap 10/10, id 1
+
+        dict.rollback(mark); // discard "bbbbb": frees its id AND its 5 heap bytes
+        assert_eq!(dict.len(), 1);
+
+        // The freed 5 bytes are reusable: a fresh 5-byte symbol fits again at id 1.
+        // (Were the counter stuck at 10, this would be wrongly rejected.)
+        let (id, is_new) = dict.intern(b"ccccc").unwrap();
+        assert!(is_new);
+        assert_eq!(id, 1);
+
+        // The cap is still enforced against the restored counter.
+        let err = dict.intern(b"d").unwrap_err();
+        assert_eq!(err.code(), ErrorCode::InvalidApiCall);
+        assert!(err.msg().contains("heap"), "{}", err.msg());
+    }
+
+    #[cfg(feature = "_sender-qwp-ws")]
+    #[test]
     fn decode_qwp_varint_rejects_overflowing_ten_byte_encodings() {
         // Boundary values round-trip through the writer + decoder unchanged.
         for v in [0u64, 1, 127, 128, u32::MAX as u64, u64::MAX - 1, u64::MAX] {
@@ -9453,6 +9595,44 @@ mod tests {
 
     #[cfg(feature = "_sender-qwp-ws")]
     #[test]
+    fn symbol_dict_seed_rejects_an_over_cap_entry_length() {
+        // Defence in depth: `intern` caps a symbol at MAX_PERSISTED_SYMBOL_ENTRY_LEN
+        // before it is written, and the persisted side-file reader
+        // (`qwp_ws_sfa_symbol_dict::open_existing`) caps it on recovery. `seed` must
+        // enforce the same bound on the region it re-interns, so a corrupt / hostile
+        // on-disk length claiming more than the cap becomes a recoverable
+        // StoreResendRequired rather than a huge slice or a mis-registered symbol. The
+        // cap is checked right after the length varint decodes, before the body is
+        // indexed, so no oversized body is needed to exercise it.
+        let mut entries = Vec::new();
+        write_qwp_varint(&mut entries, MAX_PERSISTED_SYMBOL_ENTRY_LEN + 1);
+        let mut dict = SymbolGlobalDict::new();
+        let err = dict.seed(&entries, 1).unwrap_err();
+        assert_eq!(err.code(), crate::ErrorCode::StoreResendRequired);
+        assert!(
+            err.msg().contains("exceeds the maximum"),
+            "msg: {}",
+            err.msg()
+        );
+        assert_eq!(dict.next_id(), 0, "a rejected entry must not be interned");
+
+        // A length exactly AT the cap clears the `> MAX` check (proving the boundary
+        // is exclusive) and then fails on the buffer-overrun check because no body
+        // follows -- still a clean StoreResendRequired, never a panic.
+        let mut at_cap = Vec::new();
+        write_qwp_varint(&mut at_cap, MAX_PERSISTED_SYMBOL_ENTRY_LEN);
+        let mut dict2 = SymbolGlobalDict::new();
+        let err2 = dict2.seed(&at_cap, 1).unwrap_err();
+        assert_eq!(err2.code(), crate::ErrorCode::StoreResendRequired);
+        assert!(
+            err2.msg().contains("overruns buffer"),
+            "msg: {}",
+            err2.msg()
+        );
+    }
+
+    #[cfg(feature = "_sender-qwp-ws")]
+    #[test]
     fn symbol_dict_seed_rejects_duplicate_entries_from_a_torn_tail() {
         // A host/power-crash zero-extended tail parses as a run of empty
         // ([len=0]) entries. Deduping them silently would leave this producer
@@ -9484,26 +9664,26 @@ mod tests {
         // take/restore/rollback bookkeeping, so a placeholder array suffices.
         let pin = arrow::array::ArrayData::new_empty(&arrow::datatypes::DataType::Null);
 
-        let (idx, mut table) = dict.take_arrow_dict_memo(&identity, &pin, 3);
+        let (idx, mut table) = dict.take_arrow_dict_memo(&identity, &pin, 3).unwrap();
         assert_eq!(table, vec![u64::MAX; 3]);
         table[0] = 5;
         table[2] = 7;
         dict.restore_arrow_dict_memo(idx, table);
 
         // Same identity → cache hit: the stored table comes back verbatim.
-        let (idx2, table2) = dict.take_arrow_dict_memo(&identity, &pin, 3);
+        let (idx2, table2) = dict.take_arrow_dict_memo(&identity, &pin, 3).unwrap();
         assert_eq!(idx2, idx);
         assert_eq!(table2, vec![5, u64::MAX, 7]);
         dict.restore_arrow_dict_memo(idx2, table2);
 
         // A different values array → miss → fresh table.
         let other = [(0x9000usize, 8usize), (0x2000usize, 24usize)];
-        let (_, fresh) = dict.take_arrow_dict_memo(&other, &pin, 2);
+        let (_, fresh) = dict.take_arrow_dict_memo(&other, &pin, 2).unwrap();
         assert_eq!(fresh, vec![u64::MAX; 2]);
 
         // Rollback drops every memoised id.
         dict.rollback(mark);
-        let (_, after_rollback) = dict.take_arrow_dict_memo(&identity, &pin, 3);
+        let (_, after_rollback) = dict.take_arrow_dict_memo(&identity, &pin, 3).unwrap();
         assert_eq!(after_rollback, vec![u64::MAX; 3]);
     }
 
