@@ -38,25 +38,10 @@ jobs:
     timeout-minutes: 25
     steps:
       - uses: actions/checkout@v4
-      - name: Python component selftests
-        run: |
-          set -euxo pipefail
-          python3 system_test/soak/fault_proxy.py selftest
-          python3 system_test/soak/gen.py selftest
-          python3 system_test/soak/oracle.py selftest
-          python3 system_test/soak/soak.py selftest
-      - name: Workload crate build + unit tests
-        run: cargo test --manifest-path system_test/soak/workload_rs/Cargo.toml
-      - name: Generator parity (Rust vs Python golden vectors)
-        run: |
-          set -euxo pipefail
-          cargo build --release --manifest-path system_test/soak/workload_rs/Cargo.toml
-          BIN=system_test/soak/workload_rs/target/release/soak-workload
-          for seed in 1 7 12345; do
-            "$BIN" gen-vectors --seed "$seed" --rows 200 > /tmp/rust_vec.txt
-            python3 system_test/soak/gen.py gen-vectors --seed "$seed" --rows 200 > /tmp/py_vec.txt
-            diff -u /tmp/rust_vec.txt /tmp/py_vec.txt
-          done
+      # Same selftest the per-PR Azure test pipeline runs (via `unit`), so
+      # there is a single definition of it in ci/run_all_tests.py.
+      - name: Soak harness selftest
+        run: python3 ci/run_all_tests.py soak-selftest
 
   soak-full:
     name: Soak vs QuestDB release
