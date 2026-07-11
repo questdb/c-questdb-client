@@ -99,12 +99,42 @@ def run_integration_tests():
     # run_cmd('python3', str(system_test_path), 'run', '--versions', qdb_v, '-v')
 
 
+def run_soak_selftest():
+    """Fast pre-gate for the soak / stress harness (`system_test/soak`): the
+    pure-Python component selftests, the workload crate's build + unit tests,
+    and the Rust<->Python generator golden-vector parity. Linux-first (the
+    sampler / fault proxy target Linux). The full multi-hour soak runs
+    separately in `.github/workflows/soak.yml`."""
+    soak = pathlib.Path('system_test') / 'soak'
+    for name in ('fault_proxy', 'gen', 'oracle', 'soak'):
+        run_cmd('python3', str(soak / f'{name}.py'), 'selftest')
+    workload = str(soak / 'workload_rs')
+    run_cmd('cargo', 'test', cwd=workload)
+    run_cmd('cargo', 'build', cwd=workload)
+    exe_suffix = '.exe' if platform.system() == 'Windows' else ''
+    bin_path = soak / 'workload_rs' / 'target' / 'debug' / f'soak-workload{exe_suffix}'
+    gen_py = str(soak / 'gen.py')
+    # The Rust reference and the Python mirror must emit byte-identical golden
+    # vectors — the contract the oracle relies on.
+    for seed in ('1', '7', '12345'):
+        rust = subprocess.check_output(
+            [str(bin_path), 'gen-vectors', '--seed', seed, '--rows', '200'])
+        py = subprocess.check_output(
+            ['python3', gen_py, 'gen-vectors', '--seed', seed, '--rows', '200'])
+        if rust != py:
+            sys.stderr.write(
+                f'Generator parity mismatch (Rust vs Python) at seed {seed}.\n')
+            sys.exit(1)
+    sys.stderr.write('soak selftest: ok.\n')
+
+
 def main():
     mode = sys.argv[1] if len(sys.argv) > 1 else 'all'
-    if mode not in ('all', 'unit', 'cargo', 'cpp', 'integration'):
+    if mode not in ('all', 'unit', 'cargo', 'cpp', 'integration', 'soak-selftest'):
         sys.stderr.write(
             f'Unknown mode {mode!r}; expected one of: '
-            'cargo, cpp, unit, integration (or no argument for all).\n')
+            'cargo, cpp, unit, integration, soak-selftest '
+            '(or no argument for all).\n')
         sys.exit(2)
     if mode in ('all', 'unit', 'cargo'):
         run_cargo_tests()
@@ -112,6 +142,10 @@ def main():
         run_cpp_tests()
     if mode in ('all', 'integration'):
         run_integration_tests()
+    # Linux per-PR (`unit`) + `all` + explicit `soak-selftest`; skipped on the
+    # mac/windows `cargo` job (the harness is Linux-first).
+    if mode in ('all', 'unit', 'soak-selftest'):
+        run_soak_selftest()
 
 
 if __name__ == '__main__':
