@@ -2362,6 +2362,97 @@ fn qwp_ws_orphan_drain_heals_a_zero_extended_side_file_and_replays_via_delta() {
 }
 
 #[test]
+fn qwp_ws_orphan_drain_falls_back_to_dense_when_recovered_dict_has_a_duplicate_entry() {
+    // A recovered `.symbol-dict` can be corrupt in a way the per-entry CRC does NOT
+    // catch: a host/power crash that leaves the append-only file with a duplicate
+    // entry (e.g. a torn tail whose bytes re-form an already-present, still-CRC-valid
+    // entry). `open` loads every CRC-valid entry -- so the recovered count is
+    // inflated -- but a well-formed dictionary holds strictly unique symbols, so
+    // `SymbolGlobalDict::seed` rejects the duplicate id (`StoreResendRequired`).
+    //
+    // The orphan drainer builds no producer `SymbolGlobalDict`, so it must validate
+    // the recovered region itself with a throwaway `SymbolGlobalDict::seed` and arm
+    // the delta catch-up mirror ONLY when that succeeds (see `qwp_ws_orphan::open`).
+    // Seeding the unvalidated `SentDictMirror` verbatim with the inflated count would
+    // slacken the torn-dict guard (`delta_start > mirror.count()`) and let a stored
+    // delta frame replay against a desynced dictionary -- resolving ids to the wrong
+    // symbols on the fresh server (silent corruption). On rejection the drainer must
+    // instead leave the mirror disabled and drain with full-dictionary (dense)
+    // frames, keeping the slot recoverable.
+    //
+    // This is the inverse of
+    // `qwp_ws_orphan_drain_heals_a_zero_extended_side_file_and_replays_via_delta`,
+    // where the CRC heals the tail to a CLEAN dictionary and delta stays armed.
+    //
+    // Observable: the orphan's FIRST sent frame is the DATA frame (`table_count >=
+    // 1`) with no preceding table-less catch-up (`table_count == 0`), and the slot
+    // stays recoverable (no `.failed`).
+    let sf_dir = tempfile::TempDir::new().unwrap();
+    seed_orphan_slot(sf_dir.path());
+
+    // Duplicate the recovered entry region (everything after the 8-byte
+    // `SYD1`+version header) back onto the file. Each copied entry keeps its original
+    // valid CRC, so `open` accepts them all and reports an inflated count, but the
+    // repeat makes `SymbolGlobalDict::seed` fail on the first duplicate id.
+    let side_file = sf_dir.path().join("orphan").join(".symbol-dict");
+    {
+        let existing =
+            std::fs::read(&side_file).expect("seed must have written a delta-mode side-file");
+        let entries_region = existing[8..].to_vec();
+        assert!(
+            !entries_region.is_empty(),
+            "seed must have persisted at least one symbol entry to duplicate"
+        );
+        let mut f = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&side_file)
+            .unwrap();
+        f.write_all(&entries_region).unwrap();
+    }
+
+    let (port, rx) = spawn_orphan_capture_first_frame_server();
+    let drain_conf = format!(
+        "ws::addr=127.0.0.1:{port};qwp_ws_progress=manual;\
+         sf_dir={};sender_id=primary;drain_orphans=on;\
+         max_background_drainers=1;sf_max_bytes=256;sf_max_total_bytes=1024;",
+        sf_dir.path().display()
+    );
+    let mut sender = SenderBuilder::from_conf(&drain_conf)
+        .unwrap()
+        .build()
+        .unwrap();
+
+    let mut first_frame = None;
+    for _ in 0..60 {
+        let _ = sender.drive_once().unwrap();
+        if let Ok(frame) = rx.try_recv() {
+            first_frame = Some(frame);
+            break;
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+
+    let frame = first_frame.expect("orphan drainer sent no frame");
+    assert!(
+        frame.len() >= 12 && &frame[..4] == b"QWP1",
+        "not a QWP frame: {:?}",
+        &frame[..frame.len().min(12)]
+    );
+    let table_count = u16::from_le_bytes([frame[6], frame[7]]);
+    assert!(
+        table_count >= 1,
+        "a corrupt (duplicate-entry) recovered dictionary must leave the delta mirror \
+         disabled, so the orphan drains dense and sends the DATA frame first \
+         (table_count >= 1); a table-less catch-up first (table_count == 0) would mean \
+         it wrongly armed delta on the corrupt dictionary. table_count = {table_count}"
+    );
+    assert!(
+        !sf_dir.path().join("orphan").join(".failed").exists(),
+        "a corrupt recovered dictionary must degrade to dense, not fail the slot"
+    );
+}
+
+#[test]
 fn qwp_ws_manual_orphan_drainer_walks_endpoint_list() {
     let sf_dir = tempfile::TempDir::new().unwrap();
     seed_orphan_slot(sf_dir.path());

@@ -493,6 +493,16 @@ impl OrphanDrainer {
             None
         };
         let recovered_dict_count = queue.recovered_symbol_dict_count();
+        // The orphan drainer is replay-only: it seeds the catch-up mirror from the
+        // recovered dictionary (copied out above) and never write-aheads, so it does
+        // not need the side-file handle. Drop it now -- freeing the recovered entry
+        // region (up to ~2 GiB) and closing the fd -- rather than carrying it dead for
+        // the whole drain. This mirrors the foreground recovery paths, which
+        // `take_persisted_symbol_dict` once the entries have been copied out for
+        // seeding; here the taken handle is simply dropped (no write-ahead). Must
+        // follow the `recovered_symbol_dict_{entries,count}` reads above, since a take
+        // clears the region they borrow.
+        let _ = queue.take_persisted_symbol_dict();
         let store = QwpWsPublicationStore::new(queue, DEFAULT_EVENT_CAPACITY);
         let mut send_core = QwpWsSendCore::new_with_durable_ack_and_rejection_limit(
             transport,
