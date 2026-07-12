@@ -220,6 +220,19 @@ struct DirectColumnBackend {
 }
 
 struct SfaColumnBackend {
+    /// The slot's persisted symbol dictionary (file mode) for write-ahead: the
+    /// symbols each frame introduces are appended here before the frame is
+    /// published, and rolled back in lockstep with `symbol_dict` when an append
+    /// fails, so recovery / orphan-drain can rebuild the exact dictionary the
+    /// stored delta frames reference. `None` in memory mode / on open failure.
+    ///
+    /// Declared *before* `state` so Rust drops it first (fields drop in
+    /// declaration order): the `.symbol-dict` write handle is closed before
+    /// `state`'s runner is joined and its slot lock -- the cross-process guard on
+    /// this slot -- is released, so the OS file handle never outlives the lock that
+    /// guards it. Mirrors the row path, where the encoder owning this handle is
+    /// declared ahead of the runner.
+    persisted_symbol_dict: Option<PersistedSymbolDict>,
     state: SyncQwpWsHandlerState,
     symbol_dict: SymbolGlobalDict,
     /// When true, SFA frames carry only the symbol ids new since the previous
@@ -229,12 +242,6 @@ struct SfaColumnBackend {
     /// the store's mode (memory always; file iff the persisted dict opened);
     /// see [`ColumnSender::new_store_and_forward`].
     delta_dict_enabled: bool,
-    /// The slot's persisted symbol dictionary (file mode) for write-ahead: the
-    /// symbols each frame introduces are appended here before the frame is
-    /// published, and rolled back in lockstep with `symbol_dict` when an append
-    /// fails, so recovery / orphan-drain can rebuild the exact dictionary the
-    /// stored delta frames reference. `None` in memory mode / on open failure.
-    persisted_symbol_dict: Option<PersistedSymbolDict>,
     scratch: encoder::EncodeScratch,
     payload: Vec<u8>,
     max_buf_size: usize,

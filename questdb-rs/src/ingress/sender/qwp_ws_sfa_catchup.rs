@@ -187,6 +187,16 @@ impl SentDictMirror {
         let skip = (tip - section.delta_start) as usize;
         let suffix_off = skip_entries(section.entries, skip);
         self.bytes.extend_from_slice(&section.entries[suffix_off..]);
+        // `frame_end` is bounded by the connection dict cap
+        // (`MAX_CONN_SYMBOL_DICT_SIZE`, ~8.4M) so it always fits `u32`; the
+        // truncating cast is only reachable via a ~4 GB single frame, which the
+        // frame-size caps preclude. Assert in debug so a future cap change that
+        // breaks the invariant is caught in tests rather than silently wrapping the
+        // mirror's count in release.
+        debug_assert!(
+            frame_end <= u64::from(u32::MAX),
+            "catch-up mirror count {frame_end} exceeds u32::MAX"
+        );
         self.count = frame_end as u32;
     }
 

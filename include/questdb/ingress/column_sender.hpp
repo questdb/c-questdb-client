@@ -446,6 +446,18 @@ public:
 
     // -- Symbol-dict appenders ----------------------------------------
 
+    /**
+     * SYMBOL via the dictionary fast path. `codes[i]` is the per-row
+     * dictionary index (in `0 .. dict_offsets_len - 1`) for non-null rows;
+     * `dict_offsets` (length `dict_offsets_len`, Arrow `Utf8` layout) and
+     * `dict_bytes` (length `dict_bytes_len`) describe the dictionary. Only
+     * referenced entries are interned into the connection symbol table, so a
+     * wide dictionary (e.g. a Pandas `Categorical`) costs nothing for unused
+     * entries. Each entry must be valid UTF-8 (validated eagerly here) and
+     * every non-null code must be in range (checked here); the borrowed
+     * buffers must stay alive and unchanged until the next `flush()` /
+     * `wait()` returns. See `column_sender.h` for the full contract and caps.
+     */
     column_chunk& symbol_i8(
         std::string_view name,
         const int8_t* codes,
@@ -471,6 +483,7 @@ public:
         return *this;
     }
 
+    /** Same as `symbol_i8`, for `int16_t` dictionary codes. */
     column_chunk& symbol_i16(
         std::string_view name,
         const int16_t* codes,
@@ -496,6 +509,7 @@ public:
         return *this;
     }
 
+    /** Same as `symbol_i8`, for `int32_t` dictionary codes. */
     column_chunk& symbol_i32(
         std::string_view name,
         const int32_t* codes,

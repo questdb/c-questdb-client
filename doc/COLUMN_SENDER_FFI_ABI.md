@@ -755,9 +755,15 @@ a row's validity bit is 0 its code is ignored and not inspected.
 The dict is validated at the same append call: `dict_offsets` must be
 monotonic, non-negative, and end at `<= dict_bytes_len`, and `dict_bytes`
 must be valid UTF-8 — each violation is rejected with
-`line_sender_error_invalid_api_call`. A symbol accepted here is therefore
-always server-acceptable, so it can never strand a queued
-store-and-forward frame on recovery.
+`line_sender_error_invalid_api_call`. One bound is deferred: each distinct
+entry's UTF-8 length is capped at 1 MiB (1 << 20 bytes) only when that
+entry is interned into the connection dictionary, at the next
+`column_sender_flush` — not at append (only referenced entries are
+interned, so the cap is charged there). A symbol that passes both the
+append checks and this flush-time length cap is server-acceptable, so it
+can never strand a queued store-and-forward frame on recovery; an
+over-length entry is rejected at flush *before* the frame is queued, so it
+strands nothing either.
 
 `dict_offsets` has `dict_len + 1` entries; `dict_offsets[d]..dict_offsets[d+1]`
 slices `dict_bytes` for dict entry `d`. `dict_len` is implicit:

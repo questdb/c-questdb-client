@@ -954,10 +954,12 @@ bool column_sender_chunk_column_binary(
  * only referenced dict entries against the connection-scoped global
  * symbol table, so `dict_offsets_len - 1` (the number of distinct
  * values — e.g. a wide Pandas `Categorical`) may greatly exceed the
- * referenced set without paying the cost for unused entries. It is
- * capped at 8,388,608 (2^23) distinct entries per column, and each
- * entry at 1 MiB (1 << 20 bytes); exceeding either is rejected at
- * append.
+ * referenced set without paying the cost for unused entries. The distinct
+ * entry count is capped at 8,388,608 (2^23) per column, rejected at this
+ * append call; each entry's UTF-8 is capped at 1 MiB (1 << 20 bytes),
+ * rejected at the next `column_sender_flush` (only referenced entries are
+ * interned into the connection dictionary, which is where the length cap
+ * applies). Either rejection returns `false` with `*err_out` set.
  *
  * `codes[i]` must be in `0 .. dict_len` for non-null rows; null-row
  * codes are not inspected.
@@ -965,7 +967,11 @@ bool column_sender_chunk_column_binary(
  * Callers passing an Arrow Dictionary array should prefer
  * `column_sender_chunk_append_arrow_column`, which dispatches on the
  * outer schema's index width (`c`/`s`/`i`) automatically. The per-type
- * entries here remain the lower-level building block.
+ * entries here remain the lower-level building block. These entrypoints
+ * take 32-bit `dict_offsets` (Arrow `Utf8` layout); a dictionary whose
+ * offsets are 64-bit (Arrow `LargeUtf8`) has no direct entrypoint here —
+ * route it through `column_sender_chunk_append_arrow_column`, which
+ * handles both offset widths.
  *
  * Each dictionary entry must be valid UTF-8 (QuestDB SYMBOLs are UTF-8),
  * validated eagerly at this call — a non-UTF-8 entry returns `false` with
