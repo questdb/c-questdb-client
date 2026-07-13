@@ -76,6 +76,7 @@ pub fn run_egress_leg(cfg: &LegConfig) -> LegResult {
     let mut dup_surplus: u64 = 0; // last-seen count - span (>0 => duplicates)
     let mut max_dup_surplus: u64 = 0; // high-water mark for the end-of-run summary
     let mut stuck: u32 = 0;
+    let mut last_err: Option<String> = None; // dedupe transient-error logging
     const STUCK_LIMIT: u32 = 500;
 
     let mut reader = db.borrow_reader()?;
@@ -86,6 +87,7 @@ pub fn run_egress_leg(cfg: &LegConfig) -> LegResult {
                 queries += 1;
                 rows_read += count;
                 stuck = 0;
+                last_err = None; // a successful scan closes any error streak
                 if count > 0 {
                     let span = (max - min + 1) as u64;
                     if count < span {
@@ -118,7 +120,15 @@ pub fn run_egress_leg(cfg: &LegConfig) -> LegResult {
                 }
             }
             Err(e) => {
-                eprintln!("{}: egress query error: {e}", cfg.leg);
+                // Transport churn during a server bounce (Broken pipe) and the
+                // brief startup window before the ingest leg creates `c_seq`
+                // (Invalid column) are both expected and self-heal on retry.
+                // Log once per error streak so the churn doesn't flood the log.
+                let msg = e.to_string();
+                if last_err.as_deref() != Some(msg.as_str()) {
+                    eprintln!("{}: egress query error (retrying): {msg}", cfg.leg);
+                    last_err = Some(msg);
+                }
                 stuck += 1;
                 if stuck > STUCK_LIMIT {
                     return Err(format!(
