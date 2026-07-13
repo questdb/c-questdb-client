@@ -184,48 +184,70 @@ fn measure_row_build(
     Ok((wall, cpu))
 }
 
-/// e2e `row-flush`: same appends as `row-build`, but each batch is published
-/// with `Sender::flush_and_get_fsn` and, every `CHECKPOINT_BATCHES` batches,
-/// `Sender::wait` blocks for `AckLevel::Ok` coverage (mirrors the C twin's
-/// `commit(ok)` checkpoint in `ingest_pass()`); a final unconditional `wait`
-/// after the loop covers the tail batch. Both the checkpoint waits and the
-/// final wait are inside the timed region for every warmup/iteration pass,
-/// so `row-flush` reports the full acked-publish cost, not just local
-/// buffering.
-fn measure_row_flush(
-    sender: &mut Sender,
+/// One e2e pass: every sender thread drives its own row range with the
+/// single-sender cadence (flush per `max_batch_rows` batch, ack checkpoint
+/// every `CHECKPOINT_BATCHES` of its OWN batches, final ack). Worker errors
+/// are stringified so they can cross the thread boundary.
+fn flush_pass(
+    senders: &mut [Sender],
+    buffers: &mut [Buffer],
     ctx: &RowBenchCtx,
+    ranges: &[(usize, usize)],
+) -> Result<(), Box<dyn Error>> {
+    std::thread::scope(|scope| -> Result<(), String> {
+        let mut handles = Vec::with_capacity(senders.len());
+        for ((sender, buffer), &(lo, hi)) in
+            senders.iter_mut().zip(buffers.iter_mut()).zip(ranges)
+        {
+            handles.push(scope.spawn(move || -> Result<(), String> {
+                let mut start = lo;
+                let mut batch_no = 0usize;
+                while start < hi {
+                    let end = (start + ctx.max_batch_rows).min(hi);
+                    fill_batch(buffer, ctx, start, end).map_err(|e| e.to_string())?;
+                    sender
+                        .flush_and_get_fsn(buffer)
+                        .map_err(|e| e.to_string())?;
+                    batch_no += 1;
+                    if batch_no % CHECKPOINT_BATCHES == 0 {
+                        sender
+                            .wait(AckLevel::Ok, WAIT_TIMEOUT)
+                            .map_err(|e| e.to_string())?;
+                    }
+                    start = end;
+                }
+                sender
+                    .wait(AckLevel::Ok, WAIT_TIMEOUT)
+                    .map_err(|e| e.to_string())?;
+                Ok(())
+            }));
+        }
+        for h in handles {
+            h.join().map_err(|_| "sender thread panicked".to_string())??;
+        }
+        Ok(())
+    })?;
+    Ok(())
+}
+
+/// e2e `row-flush` over `senders.len()` parallel connections (1 = classic
+/// single-sender). Buffers are per-sender and reused across passes; sender
+/// construction happens in `main`, outside every timed region.
+fn measure_row_flush(
+    senders: &mut [Sender],
+    ctx: &RowBenchCtx,
+    ranges: &[(usize, usize)],
     iterations: usize,
     warmups: usize,
 ) -> Result<(Vec<u64>, Vec<u64>), Box<dyn Error>> {
-    let mut buffer = sender.new_buffer();
-    let mut run = || -> Result<(), Box<dyn Error>> {
-        let mut start = 0usize;
-        let mut batch_no = 0usize;
-        while start < ctx.rows {
-            let end = (start + ctx.max_batch_rows).min(ctx.rows);
-            fill_batch(&mut buffer, ctx, start, end)?;
-            sender.flush_and_get_fsn(&mut buffer)?;
-            batch_no += 1;
-            if batch_no % CHECKPOINT_BATCHES == 0 {
-                sender.wait(AckLevel::Ok, WAIT_TIMEOUT)?;
-            }
-            start = end;
-        }
-        // Unconditional: `Sender::wait` returns immediately when nothing new
-        // has been published since the last checkpoint (its `published_fsn`
-        // watermark check), so this is a no-op tail-batch barrier, not a
-        // redundant stall.
-        sender.wait(AckLevel::Ok, WAIT_TIMEOUT)?;
-        Ok(())
-    };
+    let mut buffers: Vec<Buffer> = senders.iter().map(|s| s.new_buffer()).collect();
     for _ in 0..warmups {
-        run()?;
+        flush_pass(senders, &mut buffers, ctx, ranges)?;
     }
     let mut wall = Vec::with_capacity(iterations);
     let mut cpu = Vec::with_capacity(iterations);
     for _ in 0..iterations {
-        let (w, c, r) = timed(&mut run);
+        let (w, c, r) = timed(&mut || flush_pass(senders, &mut buffers, ctx, ranges));
         r?;
         wall.push(w);
         cpu.push(c);
@@ -303,6 +325,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     let iterations: usize = env_usize("ITERATIONS", 5);
     let warmups: usize = env_usize("WARMUPS", 2);
     let max_batch_rows: usize = env_usize("MAX_BATCH_ROWS", 10_000);
+    let senders_n: usize = env_usize("SENDERS", 1).max(1);
     let run_mode = std::env::var("RUN_MODE").unwrap_or_else(|_| "full".into());
     let host = std::env::var("QDB_HOST").unwrap_or_else(|_| "127.0.0.1".into());
     let port: u16 = env_usize("QDB_PORT", 9000) as u16;
@@ -310,7 +333,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     eprintln!(
         "[qwp_ingress_row] schema={} rows={rows} columns={columns} sym_card={sym_card} \
          varchar_len={varchar_len} hi_sym_card={hi_sym_card} iterations={iterations} \
-         warmups={warmups} max_batch_rows={max_batch_rows}",
+         warmups={warmups} max_batch_rows={max_batch_rows} senders={senders_n}",
         kind.name()
     );
 
@@ -332,6 +355,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     let mut report = Report::new(kind.name(), rows, columns, "ingress", "rust-row", &run_mode);
     report.warmups = warmups;
     report.wire_bytes = 0;
+    report.senders = senders_n;
     report.env = Env::collect(&[]);
 
     // --- Floor: row-build (no network). ---
@@ -360,10 +384,14 @@ fn main() -> Result<(), Box<dyn Error>> {
     // comment above) and no pool to size, unlike `qwp_ingress_polars.rs`'s
     // `QuestDb::connect` pool string.
     let conf = format!("ws::addr={host}:{port};");
-    let mut sender = Sender::from_conf(&conf)?;
+    let mut senders: Vec<Sender> = (0..senders_n)
+        .map(|_| Sender::from_conf(&conf))
+        .collect::<Result<_, _>>()?;
+    let ranges = bench_schema::sender_ranges(rows, senders_n);
 
-    eprintln!("[qwp_ingress_row] measuring row-flush e2e ...");
-    let (flush_wall, flush_cpu) = measure_row_flush(&mut sender, &ctx, iterations, warmups)?;
+    eprintln!("[qwp_ingress_row] measuring row-flush e2e ({senders_n} sender(s)) ...");
+    let (flush_wall, flush_cpu) =
+        measure_row_flush(&mut senders, &ctx, &ranges, iterations, warmups)?;
     report.add_path(
         "row-flush",
         PathSummary::new(
