@@ -15,7 +15,7 @@ cd doc/net_bench
 
 ./provision.sh                                    # ~3 min; prints instance ids
 ./ssmx.sh runfile server box_bootstrap_server.sh  # JDK + QuestDB build (~10-15 min)
-./ssmx.sh runfile client box_bootstrap_client.sh  # rust/py toolchains + repos (~10 min)
+./ssmx.sh runfile client box_bootstrap_client.sh  # rust/py/java toolchains + repos (~10 min)
 
 # P0 — validate the channel before trusting any bench number
 ./ssmx.sh runfile client box_channel.sh verify    # gate: >= 9 Gbps single flow
@@ -33,6 +33,13 @@ cd doc/net_bench
 # C client cells (same knobs; binaries prebuilt by the bootstrap):
 ./run_cell.sh --client c --label p1-s1-ingress-c --schema s1-narrow --direction ingress --rows 10000000
 ./run_cell.sh --client c --label p1-s1-egress-c  --schema s1-narrow --direction egress  --rows 10000000 --skip-populate
+
+# Java client cells (columnar bench jar, prebuilt by the bootstrap via maven):
+./run_cell.sh --client java --label p1-s2-egress-java --schema s2-wide --direction egress --rows 10000000
+
+# Rust row-API client cell (row-major counterpart to the default polars-based
+# rust client; ingress only):
+./run_cell.sh --client rust-row --label p1-s2-ingress-rustrow --schema s2-wide --direction ingress --rows 10000000
 
 # ENT server axis (image ref from internal docs; instance role handles ECR auth;
 # built-in admin is enabled — note the harness conf strings need auth support first):
@@ -60,3 +67,16 @@ cd doc/net_bench
   capacity is not reserved while stopped — if `start-instances` fails, retry.
 - Python cells are blocked on W1 (plan §8): the py harness hardcodes
   `127.0.0.1`. Rust cells cover the matrix until that patch lands.
+- Java cells run with a fixed `-Xms4g -Xmx4g` heap (no dynamic sizing, so GC
+  behavior is comparable across runs); the JSON contract adds a per-path
+  `gc_ms_median` field (GC time delta per pass) on top of the shared stats.
+  Java ingress reports **e2e only** — no offline row-build floor (the client
+  API has no offline staging path). The Java client is pinned to our
+  `sm_qwp_bench` branch (based on the upstream delta-symbol-dict PR) until
+  that PR merges — see `QNB_JAVA_CLIENT_COMMIT` in `env.sh`. java-row's flush
+  is a handoff to an async engine (up to a checkpoint window of batches can
+  pipeline ahead of the wire), while rust-row's flush writes the socket
+  synchronously — each client's idiomatic discipline; expect this to matter
+  on shaped/RTT cells. Egress materialize checksums must be compared as
+  parsed float64 values, not strings (clients format the number
+  differently).

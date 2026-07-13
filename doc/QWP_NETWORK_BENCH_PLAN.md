@@ -197,6 +197,19 @@ The §3.2 JSON contract is unchanged; each cell directory adds a sidecar
   examples/) mirror the Rust cells via `run_cell.sh --client c`. Floor paths
   differ by construction (chunk staging vs encode; decode-only matches);
   `rows_per_s_median` is the cross-client metric (C reports `wire_bytes: 0`).
+- **W6 — Java client cells**: `qwp-bench` (Maven module in
+  `questdb/java-questdb-client`, reports `java-row` for ingress and
+  `java-columnar` for egress) via `run_cell.sh --client java`; a Rust
+  row-API counterpart (`qwp_ingress_row`, reports `rust-row`) joins via
+  `run_cell.sh --client rust-row` for a direct row-vs-row comparison on
+  ingress. Java ingress is e2e-only (no offline row-build floor — the client
+  API has no offline staging path); the JSON contract adds a per-path
+  `gc_ms_median` field. **Dependency:** the Java client + bench module is
+  developed on our `sm_qwp_bench` branch of `questdb/java-questdb-client`,
+  based on the upstream delta-symbol-dict branch (PR #66 — required so
+  high-cardinality ingress doesn't measure a known wire bug); rig cells are
+  only meaningful at that pin until PR #66 merges to `main`, at which point
+  `QNB_JAVA_CLIENT_COMMIT` should be rebased/bumped accordingly.
 
 ## 9. Deferred (each gated on a v1 number)
 

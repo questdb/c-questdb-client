@@ -7,11 +7,12 @@
 #       --schema s1-narrow --direction ingress --rows 10000000 \
 #       [--rate 2.5gbit] [--rtt-ms 5] [--recv-buf 16m] \
 #       [--iterations 5] [--warmups 2] [--max-batch-rows 10000] [--skip-populate] \
-#       [--client rust|c]
+#       [--client rust|rust-row|c|java]
 #
 # direction: ingress | egress   (egress with --skip-populate reuses the table
 # a prior ingress cell filled; without it the egress example populates first).
-# Python cells are blocked until W1 (remote-host patch) — Rust only for now.
+# rust-row (row-API Rust bench) supports ingress only. Python cells remain
+# blocked until W1 (remote-host patch); rust/rust-row/c/java are available.
 set -euo pipefail
 cd "$(dirname "$0")"
 . ./env.sh
@@ -36,7 +37,7 @@ while [ $# -gt 0 ]; do
         *) echo "unknown arg $1" >&2; exit 1 ;;
     esac
 done
-case "$CLIENT_KIND" in rust|c) ;; *) echo "unknown --client '$CLIENT_KIND' (rust|c)" >&2; exit 1 ;; esac
+case "$CLIENT_KIND" in rust|rust-row|c|java) ;; *) echo "unknown --client '$CLIENT_KIND' (rust|rust-row|c|java)" >&2; exit 1 ;; esac
 [ -n "$LABEL" ] || { echo "--label required" >&2; exit 1; }
 
 SERVER_ID=$(qnb_instance_id server); CLIENT_ID=$(qnb_instance_id client)
@@ -71,8 +72,16 @@ echo "== bench ($CLIENT_KIND, $DIRECTION, $SCHEMA, ${ROWS} rows, it=$ITERATIONS/
 BENCH_ENV="SCHEMA=$SCHEMA ROWS=$ROWS ITERATIONS=$ITERATIONS WARMUPS=$WARMUPS \
 MAX_BATCH_ROWS=$MAX_BATCH_ROWS QDB_HOST=$SERVER_IP QDB_PORT=9000"
 [ "$SKIP_POPULATE" = "1" ] && BENCH_ENV="$BENCH_ENV SKIP_POPULATE=1"
+JAVA_ENV_EXPORT=""
 if [ "$CLIENT_KIND" = "c" ]; then
     BENCH_CMD="/opt/qwp-bench/c-questdb-client/build/qwp_${DIRECTION}_c"
+elif [ "$CLIENT_KIND" = "java" ]; then
+    BENCH_ENV="$BENCH_ENV JAVA_QUESTDB_CLIENT_COMMIT=$QNB_JAVA_CLIENT_COMMIT"
+    JAVA_ENV_EXPORT="export JAVA_HOME=/usr/lib/jvm/java-25-openjdk-arm64; export PATH=\$JAVA_HOME/bin:\$PATH; "
+    BENCH_CMD="java -Xms4g -Xmx4g -jar /opt/qwp-bench/java-questdb-client/qwp-bench/target/qwp-bench-java.jar ${DIRECTION}"
+elif [ "$CLIENT_KIND" = "rust-row" ]; then
+    [ "$DIRECTION" = "ingress" ] || { echo "rust-row supports ingress only" >&2; exit 1; }
+    BENCH_CMD="cargo run --release --features sync-sender-qwp-ws,sync-sender-http --example qwp_ingress_row"
 else
     EXAMPLE="qwp_ingress_polars"
     [ "$DIRECTION" = "egress" ] && EXAMPLE="qwp_egress_polars"
@@ -80,7 +89,7 @@ else
     --features polars,sync-sender-qwp-ws,sync-sender-http \
     --example $EXAMPLE"
 fi
-./ssmx.sh run client "export PATH=/root/.cargo/bin:\$PATH; \
+./ssmx.sh run client "${JAVA_ENV_EXPORT}export PATH=/root/.cargo/bin:\$PATH; \
 cd /opt/qwp-bench/c-questdb-client/questdb-rs && mkdir -p $OUT_BOX && \
 { time env $BENCH_ENV $BENCH_CMD > $OUT_BOX/$CLIENT_KIND-$DIRECTION.json ; } \
     2> $OUT_BOX/$CLIENT_KIND-$DIRECTION.log; \
