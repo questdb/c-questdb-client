@@ -121,6 +121,15 @@ stages:
                 --duration "$DUR" --seed "$SEED" \
                 --outdir "$(Build.ArtifactStagingDirectory)/soak-out"
             displayName: "Build workload + run soak"
+          - bash: |
+              # The soak's two QuestDB instances accumulate the full ingested
+              # dataset (100s of GB over a multi-hour run). Publish only the
+              # diagnostics + server logs, not the databases / SF spools.
+              OUT="$(Build.ArtifactStagingDirectory)/soak-out"
+              rm -rf "$OUT"/servers/*/db "$OUT"/*.sfdir 2>/dev/null || true
+              du -sh "$OUT" 2>/dev/null || true
+            displayName: "Trim QuestDB data dirs before publish"
+            condition: always()
           - task: PublishBuildArtifacts@1
             displayName: "Publish soak artifacts (stats / summary / journals)"
             condition: always()
