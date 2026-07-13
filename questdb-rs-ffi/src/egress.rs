@@ -1014,6 +1014,39 @@ pub unsafe extern "C" fn reader_server_info_node_id(
     }
 }
 
+/// Zone identifier, present iff the server advertised `CAP_ZONE` in its
+/// capabilities. Returns `true` and writes the borrowed UTF-8 slice when
+/// present; returns `false` with `*out_buf = NULL`, `*out_len = 0` when
+/// the server sent no zone (distinguishing "absent" from an empty
+/// string). Same lifetime and NULL-safety contract as
+/// `reader_server_info_cluster_id`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn reader_server_info_zone_id(
+    si: *const reader_server_info,
+    out_buf: *mut *const c_char,
+    out_len: *mut size_t,
+) -> bool {
+    unsafe {
+        // Defensive: a NULL out-param is a contract violation. Skip the
+        // write rather than dereferencing NULL.
+        if out_buf.is_null() || out_len.is_null() {
+            return false;
+        }
+        match server_info_ref(si).and_then(|s| s.zone_id.as_deref()) {
+            Some(zid) => {
+                *out_buf = zid.as_ptr() as *const c_char;
+                *out_len = zid.len();
+                true
+            }
+            None => {
+                *out_buf = ptr::null();
+                *out_len = 0;
+                false
+            }
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // FailoverResetEvent + on_failover_reset callback
 // ---------------------------------------------------------------------------

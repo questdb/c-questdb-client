@@ -462,6 +462,14 @@ QUESTDB_CLIENT_API void reader_server_info_cluster_id(
 QUESTDB_CLIENT_API void reader_server_info_node_id(
     const reader_server_info*, const char** out_buf, size_t* out_len);
 
+/** Zone identifier, present iff the server advertised `CAP_ZONE`.
+ *  Returns `true` and writes the borrowed UTF-8 slice when present;
+ *  `false` with `*out_buf = NULL`, `*out_len = 0` when absent
+ *  (distinguishing absent from an empty string). Same lifetime contract
+ *  as `_cluster_id`. */
+QUESTDB_CLIENT_API bool reader_server_info_zone_id(
+    const reader_server_info*, const char** out_buf, size_t* out_len);
+
 /////////// Failover reset callback.
 
 /**
