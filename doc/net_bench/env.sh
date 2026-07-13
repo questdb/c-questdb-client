@@ -19,13 +19,13 @@ QNB_UBUNTU_SSM_PARAM="/aws/service/canonical/ubuntu/server/24.04/stable/current/
 # ENT 3.3.4 release (so the OSS source build and the ENT docker image are the
 # same lineage); local loopback baselines are being re-measured against it.
 QNB_QUESTDB_COMMIT="${QNB_QUESTDB_COMMIT:-5b2efe5e58fbb77ef25f87a7aa604365c9c1eb55}"
-QNB_C_CLIENT_COMMIT="${QNB_C_CLIENT_COMMIT:-214830a9ac749800b41501d2722358a634a003ab}"
+# c pin = sm_qwp_bench head with the Rust bench twins (rust-row ingress,
+# materialize egress); the env.sh bump commit itself is laptop-side only.
+QNB_C_CLIENT_COMMIT="${QNB_C_CLIENT_COMMIT:-5ae8446a57b8ca755aa9cd69d53f980afade4233}"
 QNB_PY_CLIENT_COMMIT="${QNB_PY_CLIENT_COMMIT:-7334503e84e2d149f9d6550dd023ef484d2edc1e}"
 # Head of our sm_qwp_bench branch of questdb/java-questdb-client (adds the
-# qwp-bench module). LOCAL-ONLY as of this writing — fetchable from GitHub
-# only once that branch is pushed upstream.
-# pin = pushed head of sm_qwp_bench; bump if the branch moves before push.
-QNB_JAVA_CLIENT_COMMIT="${QNB_JAVA_CLIENT_COMMIT:-7bd72b0a2e3381b4b42e06eca756897b5d68f072}"
+# qwp-bench module). Pin = pushed head of that branch; bump when it moves.
+QNB_JAVA_CLIENT_COMMIT="${QNB_JAVA_CLIENT_COMMIT:-28ca61ccde033d0b14a79130f63ed0e6eb05bd92}"
 
 qnb_account_id() { aws sts get-caller-identity --query Account --output text; }
 
