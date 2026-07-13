@@ -70,10 +70,12 @@ echo "== python env (editable install builds the native ext against the vendored
 if [ "$(cat .qnb-venv 2>/dev/null)" = "$QNB_PY_CLIENT_COMMIT" ]; then
     echo "   venv already built at this commit — skipping"
 else
-    uv venv --python 3.10 .venv >/var/tmp/py-install.log 2>&1
+    # --clear: a half-built .venv from an earlier failed install must not
+    # abort the bootstrap (venv creation is inside the non-fatal guard).
     # shellcheck disable=SC1091
-    . .venv/bin/activate
-    if uv pip install -e . pandas pyarrow polars numpy >>/var/tmp/py-install.log 2>&1; then
+    if uv venv --clear --python 3.10 .venv >/var/tmp/py-install.log 2>&1 \
+        && . .venv/bin/activate \
+        && uv pip install -e . pandas pyarrow polars numpy >>/var/tmp/py-install.log 2>&1; then
         echo "$QNB_PY_CLIENT_COMMIT" > .qnb-venv
     else
         tail -40 /var/tmp/py-install.log
