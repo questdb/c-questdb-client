@@ -32,8 +32,9 @@ type LegResult = Result<(), Box<dyn std::error::Error>>;
 /// completes a query and the leg stalls. A bounded window keeps each scan fast
 /// and streaming regardless of table size, while still exercising the reader
 /// and catching a gap/dup in the recent tail (table-wide completeness is the
-/// oracle's job at reconcile).
-const SCAN_WINDOW: u64 = 200_000;
+/// oracle's job at reconcile). The QWP egress reader caps an absolute `LIMIT`
+/// at 10000, so the window can't exceed that.
+const SCAN_WINDOW: u64 = 10_000;
 
 /// Full-scan `c_seq` for `worker_id`, returning (count, min, max) over the
 /// non-null values. Exercises the reader transport + batch decode.
