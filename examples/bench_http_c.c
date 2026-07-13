@@ -1,3 +1,9 @@
+/* glibc hides XSI names (usleep) under strict -std=c11 (CMAKE_C_EXTENSIONS
+ * OFF); macOS headers expose them unconditionally. */
+#if defined(__linux__)
+#define _XOPEN_SOURCE 600
+#endif
+
 #include "bench_http_c.h"
 #include <curl/curl.h>
 #include <stdio.h>

@@ -1,3 +1,9 @@
+/* glibc hides XSI names (strdup, getrusage) under strict -std=c11
+ * (CMAKE_C_EXTENSIONS OFF); macOS headers expose them unconditionally. */
+#if defined(__linux__)
+#define _XOPEN_SOURCE 600
+#endif
+
 #include "bench_json_c.h"
 #include <math.h>
 #include <stdio.h>
