@@ -208,9 +208,8 @@ def c_client_c_egress_sidecar(
     c_client_c_egress_sidecar_binary: Path, log_dir: Path
 ) -> Iterator[CClientCEgressSidecar]:
     """Read-side sidecar driven by the **C** binding's ``qwp_egress_c_sidecar``
-    binary (the ``reader_*`` C API). Speaks the same EgressSidecar line
-    protocol subset as the Rust egress sidecar (no zone accessor in the C
-    API; SHOW_ZONE / QUERY_ROW unsupported)."""
+    binary (the ``reader_*`` C API). Its reduced sidecar protocol omits the
+    zone token and leaves SHOW_ZONE / QUERY_ROW unsupported."""
     s = CClientCEgressSidecar(
         log_dir=log_dir,
         classpath=None,

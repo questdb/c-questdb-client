@@ -39,6 +39,8 @@
 #include <memory>
 #include <string>
 #include <thread>
+#include <type_traits>
+#include <utility>
 
 using namespace questdb::ingress::literals;
 namespace qm = qwp_mock;
@@ -103,7 +105,6 @@ TEST_CASE("mock: handshake + immediate ResultEnd drives cursor terminus")
 
     // Server identity from SERVER_INFO is exposed via the wrapper.
     auto info = reader.server_info();
-    REQUIRE(static_cast<bool>(info));
     CHECK(info.role_byte() == qm::ROLE_PRIMARY);
     CHECK(info.cluster_id() == "test-cluster");
     CHECK(info.node_id() == "node-A");
@@ -960,6 +961,8 @@ TEST_CASE("mock: failover trampoline fires once with populated event fields")
         "ws::addr=" + srv_a.addr() + "," + srv_b.addr() +
         ";failover_backoff_initial_ms=1;failover_backoff_max_ms=10";
     questdb::egress::reader reader{questdb::ingress::utf8_view{conf}};
+    const auto initial_info = reader.server_info();
+    CHECK(initial_info.node_id() == "a");
 
     struct Capture
     {
@@ -972,6 +975,7 @@ TEST_CASE("mock: failover trampoline fires once with populated event fields")
         questdb::error_code trigger_code{};
         bool server_info_present{false};
         std::string new_node_id;
+        std::optional<eg::server_info> server_info_snapshot;
     };
     auto cap = std::make_shared<Capture>();
 
@@ -987,6 +991,7 @@ TEST_CASE("mock: failover trampoline fires once with populated event fields")
                            cap->attempts = ev.attempts();
                            cap->trigger_code = ev.trigger_code();
                            auto si = ev.server_info();
+                           cap->server_info_snapshot = si.snapshot();
                            if (static_cast<bool>(si))
                            {
                                cap->server_info_present = true;
@@ -1011,6 +1016,14 @@ TEST_CASE("mock: failover trampoline fires once with populated event fields")
            cap->trigger_code == questdb_error_protocol_error));
     REQUIRE(cap->server_info_present);
     CHECK(cap->new_node_id == "b");
+    REQUIRE(cap->server_info_snapshot.has_value());
+    CHECK(cap->server_info_snapshot->node_id() == "b");
+
+    // The cursor reports the replacement endpoint, while the owning snapshot
+    // captured before execution remains a safe record of the original one.
+    const auto current_info = cur.server_info();
+    CHECK(current_info.node_id() == "b");
+    CHECK(initial_info.node_id() == "a");
 }
 
 TEST_CASE("mock: failover callback NOT invoked on the happy path")
@@ -2259,7 +2272,7 @@ TEST_CASE(
 TEST_CASE("mock: server_info exposes role / epoch / capabilities / wall_ns")
 {
     constexpr uint64_t expected_epoch = 0xCAFEBABEDEADBEEFULL;
-    constexpr uint32_t expected_caps  = 0x12345678u;
+    constexpr uint32_t expected_caps  = 0x12345678u | qm::CAP_ZONE;
     constexpr int64_t  expected_wall  = 1'700'000'000'000'000'000LL;
 
     qm::ActionSendServerInfo si{};
@@ -2269,13 +2282,13 @@ TEST_CASE("mock: server_info exposes role / epoch / capabilities / wall_ns")
     si.epoch          = expected_epoch;
     si.capabilities   = expected_caps;
     si.server_wall_ns = expected_wall;
+    si.zone_id        = "eu-west-1a";
 
     qm::Script s = {si, qm::ActionAwaitQueryRequest{}, qm::ActionSendResultEnd{}};
     qm::MockServer srv({s});
 
     auto reader = connect_to(srv);
     auto info = reader.server_info();
-    REQUIRE(static_cast<bool>(info));
     CHECK(info.role_byte() == qm::ROLE_PRIMARY);
     CHECK(info.role() == questdb::egress::server_role::primary);
     CHECK(info.epoch() == expected_epoch);
@@ -2283,6 +2296,46 @@ TEST_CASE("mock: server_info exposes role / epoch / capabilities / wall_ns")
     CHECK(info.server_wall_ns() == expected_wall);
     CHECK(info.cluster_id() == "cluster-x");
     CHECK(info.node_id() == "node-x");
+    REQUIRE(info.zone_id().has_value());
+    CHECK(*info.zone_id() == "eu-west-1a");
+
+    // Rvalue-qualified string getters return owning values. Chained access on
+    // the by-value server_info result therefore cannot refer into a destroyed
+    // temporary.
+    static_assert(std::is_same_v<
+        decltype(std::declval<eg::server_info&&>().cluster_id()),
+        std::string>);
+    static_assert(std::is_same_v<
+        decltype(std::declval<eg::server_info&&>().zone_id()),
+        std::optional<std::string>>);
+    const std::string& temporary_cluster =
+        reader.server_info().cluster_id();
+    const auto& temporary_zone = reader.server_info().zone_id();
+    CHECK(temporary_cluster == "cluster-x");
+    REQUIRE(temporary_zone.has_value());
+    CHECK(*temporary_zone == "eu-west-1a");
+}
+
+TEST_CASE("mock: owning server_info preserves unknown role and outlives reader")
+{
+    std::optional<eg::server_info> captured;
+    {
+        qm::Script s = {
+            qm::ActionSendServerInfo{0x55, "cluster-owned", "node-owned"},
+        };
+        qm::MockServer srv({s});
+        auto reader = connect_to(srv);
+        captured.emplace(reader.server_info());
+        CHECK(captured->role() == eg::server_role::other);
+        CHECK(captured->role_byte() == 0x55);
+    }
+
+    // The reader and its Rust-owned strings are gone. The C++ snapshot keeps
+    // independent storage rather than a dangling reader_server_info pointer.
+    REQUIRE(captured.has_value());
+    CHECK(captured->cluster_id() == "cluster-owned");
+    CHECK(captured->node_id() == "node-owned");
+    CHECK_FALSE(captured->zone_id().has_value());
 }
 
 // ---------------------------------------------------------------------------
@@ -2798,12 +2851,24 @@ TEST_CASE("mock: ActionSendRaw delivers a hand-built SERVER_INFO frame")
     qm::MockServer srv({s});
     auto reader = connect_to(srv);
     auto info = reader.server_info();
-    REQUIRE(static_cast<bool>(info));
     CHECK(info.role_byte() == qm::ROLE_PRIMARY);
     CHECK(info.cluster_id() == "raw-cluster");
     CHECK(info.node_id() == "raw-node");
     auto cur = reader.execute("select 1"_utf8);
     CHECK_FALSE(cur.next_batch());
+}
+
+TEST_CASE("mock: SERVER_INFO zone trailer presence must match CAP_ZONE")
+{
+    CHECK_THROWS_AS(
+        (qm::server_info_frame(
+            qm::ROLE_PRIMARY, "c", "n", 0, 0, 0,
+            std::optional<std::string>{"zone-A"})),
+        std::invalid_argument);
+    CHECK_THROWS_AS(
+        (qm::server_info_frame(
+            qm::ROLE_PRIMARY, "c", "n", 0, qm::CAP_ZONE, 0)),
+        std::invalid_argument);
 }
 
 // Move-assigning over a reader that still owns a live cursor drives
@@ -2895,33 +2960,39 @@ TEST_CASE("mock: reader metadata getters reject while a cursor is live")
     CHECK(version == 1);
     CHECK_FALSE(host.empty());
     CHECK(port != 0);
-    CHECK(static_cast<bool>(reader.server_info()));
+    const auto initial_info = reader.server_info();
+    CHECK(initial_info.role_byte() == qm::ROLE_STANDALONE);
 
     {
         auto cur = reader.execute("select 1"_utf8);
 
-        bool threw = false;
-        try
+        const auto expect_live_cursor_error = [](auto&& fn)
         {
-            (void)reader.server_version();
-        }
-        catch (const questdb::error& e)
-        {
-            threw = true;
-            CHECK(e.code() == questdb_error_invalid_api_call);
-        }
-        CHECK(threw);
-
-        CHECK_FALSE(static_cast<bool>(reader.server_info()));
-        CHECK(reader.current_host().empty());
-        CHECK(reader.current_port() == 0);
+            bool threw = false;
+            try
+            {
+                fn();
+            }
+            catch (const questdb::error& e)
+            {
+                threw = true;
+                CHECK(e.code() == questdb_error_invalid_api_call);
+                CHECK(std::string{e.what()}.find("cursor") !=
+                      std::string::npos);
+            }
+            CHECK(threw);
+        };
+        expect_live_cursor_error([&]{ (void)reader.server_version(); });
+        expect_live_cursor_error([&]{ (void)reader.server_info(); });
+        expect_live_cursor_error([&]{ (void)reader.current_host(); });
+        expect_live_cursor_error([&]{ (void)reader.current_port(); });
 
         // The cursor handle owns the borrow — its mirror getters are the
         // sound path for the same metadata.
         CHECK(cur.server_version() == version);
         CHECK(cur.current_host() == host);
         CHECK(cur.current_port() == port);
-        CHECK(static_cast<bool>(cur.server_info()));
+        CHECK(cur.server_info().role_byte() == qm::ROLE_STANDALONE);
 
         CHECK_FALSE(cur.next_batch());
     }
@@ -2929,7 +3000,11 @@ TEST_CASE("mock: reader metadata getters reject while a cursor is live")
     CHECK(reader.server_version() == version);
     CHECK(reader.current_host() == host);
     CHECK(reader.current_port() == port);
-    CHECK(static_cast<bool>(reader.server_info()));
+    CHECK(reader.server_info().role_byte() == qm::ROLE_STANDALONE);
+
+    // The pre-query value is an owning snapshot, not an invalidated view.
+    CHECK(initial_info.cluster_id() == "test-cluster");
+    CHECK(initial_info.node_id() == "n1");
 }
 
 // ---------------------------------------------------------------------------
@@ -3322,6 +3397,9 @@ TEST_CASE("mock: progress callback observes Disconnected -> Retrying -> Reset on
         uint16_t new_port;
         std::optional<int64_t> new_request_id;
         bool has_final_error;
+        bool server_info_present;
+        questdb::egress::server_role server_role;
+        bool snapshot_present;
     };
     auto events = std::make_shared<std::vector<Capture>>();
 
@@ -3329,6 +3407,7 @@ TEST_CASE("mock: progress callback observes Disconnected -> Retrying -> Reset on
                    .on_failover_progress(
                        [events](const questdb::egress::failover_progress_event_view& ev)
                        {
+                           const auto server_info = ev.server_info();
                            events->push_back({
                                ev.phase(),
                                ev.attempt(),
@@ -3338,6 +3417,9 @@ TEST_CASE("mock: progress callback observes Disconnected -> Retrying -> Reset on
                                ev.new_port(),
                                ev.new_request_id(),
                                ev.final_error_code().has_value(),
+                               static_cast<bool>(server_info),
+                               server_info.role(),
+                               server_info.snapshot().has_value(),
                            });
                        })
                    .execute();
@@ -3351,6 +3433,10 @@ TEST_CASE("mock: progress callback observes Disconnected -> Retrying -> Reset on
     CHECK(events->front().new_port == 0);
     CHECK_FALSE(events->front().new_request_id.has_value());
     CHECK_FALSE(events->front().has_final_error);
+    CHECK_FALSE(events->front().server_info_present);
+    CHECK(events->front().server_role ==
+          questdb::egress::server_role::other);
+    CHECK_FALSE(events->front().snapshot_present);
 
     // At least one Retrying event with attempt >= 1.
     bool saw_retry = false;
@@ -3362,6 +3448,9 @@ TEST_CASE("mock: progress callback observes Disconnected -> Retrying -> Reset on
             CHECK(e.attempt >= 1);
             CHECK(e.new_port == 0);
             CHECK_FALSE(e.has_final_error);
+            CHECK_FALSE(e.server_info_present);
+            CHECK(e.server_role == questdb::egress::server_role::other);
+            CHECK_FALSE(e.snapshot_present);
         }
     }
     CHECK(saw_retry);
@@ -3378,6 +3467,9 @@ TEST_CASE("mock: progress callback observes Disconnected -> Retrying -> Reset on
     CHECK(last.failed_port != last.new_port);
     CHECK(last.new_request_id.has_value());
     CHECK_FALSE(last.has_final_error);
+    CHECK(last.server_info_present);
+    CHECK(last.server_role == questdb::egress::server_role::standalone);
+    CHECK(last.snapshot_present);
 
     // No GaveUp on the successful path.
     for (const auto& e : *events)

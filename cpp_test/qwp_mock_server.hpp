@@ -67,6 +67,9 @@ inline constexpr uint8_t ROLE_PRIMARY = 0x01;
 inline constexpr uint8_t ROLE_REPLICA = 0x02;
 inline constexpr uint8_t ROLE_PRIMARY_CATCHUP = 0x03;
 
+// SERVER_INFO capability bits.
+inline constexpr uint32_t CAP_ZONE = 0x00000001u;
+
 // ColumnKind wire codes (mirror questdb-rs/src/egress/column_kind.rs).
 inline constexpr uint8_t COL_BOOLEAN = 0x01;
 inline constexpr uint8_t COL_BYTE = 0x02;
@@ -124,7 +127,8 @@ std::vector<uint8_t> server_info_frame(
     const std::string& node_id,
     uint64_t epoch = 0,
     uint32_t capabilities = 0,
-    int64_t server_wall_ns = 0);
+    int64_t server_wall_ns = 0,
+    const std::optional<std::string>& zone_id = std::nullopt);
 std::vector<uint8_t> result_end_frame(int64_t request_id);
 std::vector<uint8_t> exec_done_frame(
     int64_t request_id, uint8_t op_type = 0, uint64_t rows_affected = 0);
@@ -238,6 +242,7 @@ struct ActionSendServerInfo
     uint64_t epoch = 0;
     uint32_t capabilities = 0;
     int64_t server_wall_ns = 0;
+    std::optional<std::string> zone_id = std::nullopt;
 };
 struct ActionAwaitQueryRequest
 {};

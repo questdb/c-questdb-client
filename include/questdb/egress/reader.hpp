@@ -182,11 +182,13 @@ struct overload : Fs...
 template <typename... Fs>
 overload(Fs...) -> overload<Fs...>;
 
+class reader;           // fwd
 class cursor;           // fwd
 class query;            // fwd
 class batch;            // fwd
 class column;           // fwd
 class symbol_dict_view; // fwd
+class server_info_view; // fwd
 
 // ---------------------------------------------------------------------------
 // Borrowed views and value types returned by `cursor` getters. These are
@@ -244,9 +246,70 @@ struct terminal_exec_done_info
 };
 
 /**
- * Borrowed `SERVER_INFO` of an endpoint. Returned by `reader::server_info`
- * and `failover_event::server_info`. Never owned by the C++ wrapper —
- * underlying storage is the reader / failover event.
+ * Owning snapshot of an endpoint's `SERVER_INFO` handshake metadata.
+ *
+ * Unlike the C ABI's borrowed `reader_server_info*`, every string is copied,
+ * so this value may safely outlive the reader/cursor and may be retained
+ * across query execution or failover. An unrecognised role remains
+ * `server_role::other` while `role_byte()` preserves its original wire byte.
+ */
+class server_info
+{
+public:
+    server_role role() const noexcept { return _role; }
+    uint8_t role_byte() const noexcept { return _role_byte; }
+    uint64_t epoch() const noexcept { return _epoch; }
+    uint32_t capabilities() const noexcept { return _capabilities; }
+    int64_t server_wall_ns() const noexcept { return _server_wall_ns; }
+
+    // Lvalue access is zero-copy; chained access on a temporary transfers an
+    // owning value instead of returning a reference into a destroyed object.
+    const std::string& cluster_id() const & noexcept { return _cluster_id; }
+    std::string cluster_id() && noexcept { return std::move(_cluster_id); }
+    const std::string& node_id() const & noexcept { return _node_id; }
+    std::string node_id() && noexcept { return std::move(_node_id); }
+    const nullable<std::string>& zone_id() const & noexcept { return _zone_id; }
+    nullable<std::string> zone_id() && noexcept { return std::move(_zone_id); }
+
+private:
+    server_info(
+        server_role role,
+        uint8_t role_byte,
+        uint64_t epoch,
+        uint32_t capabilities,
+        int64_t server_wall_ns,
+        std::string cluster_id,
+        std::string node_id,
+        nullable<std::string> zone_id)
+        : _role{role}
+        , _role_byte{role_byte}
+        , _epoch{epoch}
+        , _capabilities{capabilities}
+        , _server_wall_ns{server_wall_ns}
+        , _cluster_id{std::move(cluster_id)}
+        , _node_id{std::move(node_id)}
+        , _zone_id{std::move(zone_id)}
+    {
+    }
+
+    server_role _role;
+    uint8_t _role_byte;
+    uint64_t _epoch;
+    uint32_t _capabilities;
+    int64_t _server_wall_ns;
+    std::string _cluster_id;
+    std::string _node_id;
+    nullable<std::string> _zone_id;
+
+    friend class server_info_view;
+};
+
+/**
+ * Borrowed `SERVER_INFO` used by failover callback views. It is valid only
+ * for the lifetime documented by the owning callback event. Reader and cursor
+ * accessors return the owning `server_info` value instead. An empty view is
+ * legitimate; its accessors return the C ABI's documented sentinels and
+ * `snapshot()` returns `std::nullopt`.
  */
 class server_info_view
 {
@@ -290,6 +353,43 @@ public:
         size_t len = 0;
         ::reader_server_info_node_id(_impl, &buf, &len);
         return {buf, len};
+    }
+    nullable<std::string_view> zone_id() const noexcept
+    {
+        const char* buf = nullptr;
+        size_t len = 0;
+        if (!::reader_server_info_zone_id(_impl, &buf, &len))
+            return std::nullopt;
+        return std::string_view{buf, len};
+    }
+
+    /**
+     * Copy this callback-scoped value into a freely-retainable snapshot.
+     * Returns `std::nullopt` when this view is empty, which is legitimate
+     * outside the Reset failover-progress phase and when a reset event's
+     * endpoint omitted `SERVER_INFO`.
+     */
+    nullable<egress::server_info> snapshot() const
+    {
+        if (!_impl)
+            return std::nullopt;
+
+        const auto copy = [](std::string_view value)
+        {
+            return value.empty() ? std::string{} : std::string{value};
+        };
+        nullable<std::string> zone;
+        if (const auto value = zone_id())
+            zone = copy(*value);
+        return egress::server_info{
+            role(),
+            role_byte(),
+            epoch(),
+            capabilities(),
+            server_wall_ns(),
+            copy(cluster_id()),
+            copy(node_id()),
+            std::move(zone)};
     }
 
 private:
@@ -659,42 +759,58 @@ public:
     }
 
     /** Negotiated QWP server version.
-     *  @throws questdb::error if the connection is not yet established
-     *          or this reader has been moved from. */
+     *  @throws questdb::error if a query/cursor produced by this reader is
+     *          still live (use `cursor::server_version()`), the connection is
+     *          not yet established, or this reader has been moved from. */
     uint8_t server_version() const
     {
         ensure_impl();
+        ensure_connection_metadata_access("server_version");
         uint8_t v = 0;
         ::questdb::error::wrapped_call(
             ::reader_server_version, _impl, &v);
         return v;
     }
 
-    /** Last-seen `SERVER_INFO`. The server always sends one, so the view
-     *  is empty only while a reconnect is in flight; it is invalidated by
-     *  any reader operation that may reconnect.
-     *  @throws questdb::error if this reader has been moved from. */
-    server_info_view server_info() const
+    /** Owning snapshot of the connected endpoint's last-seen `SERVER_INFO`.
+     *  The returned value remains valid across later reader operations.
+     *  @throws questdb::error if a query/cursor produced by this reader is
+     *          still live (use `cursor::server_info()`), the metadata is
+     *          unavailable, or this reader has been moved from. */
+    egress::server_info server_info() const
     {
         ensure_impl();
-        return server_info_view{::reader_current_server_info(_impl)};
+        ensure_connection_metadata_access("server_info");
+        auto info = server_info_view{
+            ::reader_current_server_info(_impl)}.snapshot();
+        if (!info)
+            throw ::questdb::error{
+                error_code::invalid_api_call,
+                "reader::server_info(): SERVER_INFO is currently unavailable"};
+        return std::move(*info);
     }
 
     /** Host of the endpoint the reader is currently connected to.
-     *  @throws questdb::error if this reader has been moved from. */
+     *  @throws questdb::error if a query/cursor produced by this reader is
+     *          still live (use `cursor::current_host()`) or this reader has
+     *          been moved from. */
     std::string_view current_host() const
     {
         ensure_impl();
+        ensure_connection_metadata_access("current_host");
         const char* buf = nullptr;
         size_t len = 0;
         ::reader_current_addr_host(_impl, &buf, &len);
         return {buf, len};
     }
     /** Port of the endpoint the reader is currently connected to.
-     *  @throws questdb::error if this reader has been moved from. */
+     *  @throws questdb::error if a query/cursor produced by this reader is
+     *          still live (use `cursor::current_port()`) or this reader has
+     *          been moved from. */
     uint16_t current_port() const
     {
         ensure_impl();
+        ensure_connection_metadata_access("current_port");
         return ::reader_current_addr_port(_impl);
     }
 
@@ -724,6 +840,16 @@ private:
             throw ::questdb::error{
                 error_code::invalid_api_call,
                 "reader has been closed or moved from."};
+    }
+
+    void ensure_connection_metadata_access(const char* accessor) const
+    {
+        if (::reader_has_active_query(_impl) != 0)
+            throw ::questdb::error{
+                error_code::invalid_api_call,
+                std::string{"reader::"} + accessor +
+                    "() called while a query or cursor produced by this "
+                    "reader is still live; use cursor::" + accessor + "()"};
     }
 
     ::reader* _impl;
@@ -2538,16 +2664,21 @@ public:
             ::reader_cursor_server_version, _impl, &v);
         return v;
     }
-    /** Last-seen `SERVER_INFO` of the cursor's connected endpoint. The
-     *  server always sends one, so the view is empty only while a
-     *  reconnect is in flight; it is invalidated by any cursor operation
-     *  that may reconnect.
-     *  @throws questdb::error if this cursor has been moved from. */
-    server_info_view server_info() const
+    /** Owning snapshot of the cursor's currently connected endpoint. The
+     *  returned value remains valid across later cursor operations and
+     *  reflects a replacement endpoint after failover.
+     *  @throws questdb::error if the metadata is unavailable or this cursor
+     *          has been moved from. */
+    egress::server_info server_info() const
     {
         ensure_impl();
-        return server_info_view{
-            ::reader_cursor_current_server_info(_impl)};
+        auto info = server_info_view{
+            ::reader_cursor_current_server_info(_impl)}.snapshot();
+        if (!info)
+            throw ::questdb::error{
+                error_code::invalid_api_call,
+                "cursor::server_info(): SERVER_INFO is currently unavailable"};
+        return std::move(*info);
     }
 
     /** @throws questdb::error if this cursor has been moved from. */

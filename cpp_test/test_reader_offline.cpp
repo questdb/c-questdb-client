@@ -216,6 +216,28 @@ TEST_CASE("server_info accessors return documented sentinels on NULL")
         CHECK(buf == nullptr);
         CHECK(len == 0);
     }
+    {
+        const char* buf = reinterpret_cast<const char*>(0x1);
+        size_t len = 999;
+        CHECK_FALSE(reader_server_info_zone_id(nullptr, &buf, &len));
+        CHECK(buf == nullptr);
+        CHECK(len == 0);
+    }
+
+    // Callback event views are legitimately empty outside their metadata
+    // phase. Every accessor mirrors the C ABI sentinel and snapshot()
+    // makes absence explicit without throwing through the callback trampoline.
+    const questdb::egress::server_info_view empty{nullptr};
+    CHECK_FALSE(static_cast<bool>(empty));
+    CHECK(empty.role() == questdb::egress::server_role::other);
+    CHECK(empty.role_byte() == 0xFF);
+    CHECK(empty.epoch() == 0);
+    CHECK(empty.capabilities() == 0);
+    CHECK(empty.server_wall_ns() == 0);
+    CHECK(empty.cluster_id().empty());
+    CHECK(empty.node_id().empty());
+    CHECK_FALSE(empty.zone_id().has_value());
+    CHECK_FALSE(empty.snapshot().has_value());
 }
 
 TEST_CASE("failover_event accessors return documented sentinels on NULL")
