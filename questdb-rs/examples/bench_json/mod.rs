@@ -385,6 +385,9 @@ pub struct Report {
     run_mode: String,
     pub warmups: usize,
     pub wire_bytes: u64,
+    /// Parallel e2e senders (ingress only; `1` = the classic single-sender
+    /// bench). Emitted as a top-level `"senders"` key on ingress reports.
+    pub senders: usize,
     pub env: Env,
     paths: Vec<(String, PathSummary)>,
     headline: Obj,
@@ -411,6 +414,7 @@ impl Report {
             run_mode: run_mode.to_string(),
             warmups: 0,
             wire_bytes: 0,
+            senders: 1,
             env: Env::collect(&[]),
             paths: Vec::new(),
             headline: Obj::new(),
@@ -513,6 +517,9 @@ impl Report {
         top.str("run_mode", &self.run_mode);
         top.int("warmups", self.warmups as u64);
         top.int("wire_bytes", self.wire_bytes);
+        if self.direction == "ingress" {
+            top.int("senders", self.senders as u64);
+        }
         top.raw("machine", self.env.obj.to_json(0));
         top.raw("commits", commits_block().to_json(0));
         if !self.headline.0.is_empty() {

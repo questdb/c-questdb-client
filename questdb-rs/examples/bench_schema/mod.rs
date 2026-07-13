@@ -147,3 +147,22 @@ pub fn sym_label(v: usize) -> String {
 pub fn hi_sym_label(col: usize, v: usize) -> String {
     format!("s{}_{:06}", col - 1, v)
 }
+
+/// Contiguous per-sender row ranges tiling `[0, rows)` exactly: sender `k`
+/// of `n` owns `[rows*k/n, rows*(k+1)/n)` (multiply-first integer math, so
+/// the ranges never drift). Panics if the tiling invariants break — a bad
+/// edit fails at startup instead of silently corrupting parity. Empty
+/// ranges (when `n > rows`) are legal and loop as no-ops.
+#[allow(dead_code)] // not every example that includes this module ingests
+pub fn sender_ranges(rows: usize, senders: usize) -> Vec<(usize, usize)> {
+    let n = senders.max(1);
+    let ranges: Vec<(usize, usize)> = (0..n)
+        .map(|k| (rows * k / n, rows * (k + 1) / n))
+        .collect();
+    assert_eq!(ranges[0].0, 0, "first range must start at 0");
+    assert_eq!(ranges[n - 1].1, rows, "last range must end at rows");
+    for pair in ranges.windows(2) {
+        assert_eq!(pair[0].1, pair[1].0, "ranges must tile without gaps");
+    }
+    ranges
+}
