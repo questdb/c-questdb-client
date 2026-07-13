@@ -104,7 +104,8 @@ def run_soak_selftest():
     pure-Python component selftests, the workload crate's build + unit tests,
     and the Rust<->Python generator golden-vector parity. Linux-first (the
     sampler / fault proxy target Linux). The full multi-hour soak runs
-    separately in `.github/workflows/soak.yml`."""
+    separately on hetzner (ci/run_soak_pipeline.yaml), which uses this as its
+    pre-gate."""
     soak = pathlib.Path('system_test') / 'soak'
     for name in ('fault_proxy', 'gen', 'oracle', 'soak'):
         run_cmd('python3', str(soak / f'{name}.py'), 'selftest')
@@ -142,9 +143,9 @@ def main():
         run_cpp_tests()
     if mode in ('all', 'integration'):
         run_integration_tests()
-    # Linux per-PR (`unit`) + `all` + explicit `soak-selftest`; skipped on the
-    # mac/windows `cargo` job (the harness is Linux-first).
-    if mode in ('all', 'unit', 'soak-selftest'):
+    # Its own `soak-selftest` mode (the soak pipeline's pre-gate) + `all` for a
+    # full local run. Not folded into `unit`, so it never runs on unrelated PRs.
+    if mode in ('all', 'soak-selftest'):
         run_soak_selftest()
 
 

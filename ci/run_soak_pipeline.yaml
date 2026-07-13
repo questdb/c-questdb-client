@@ -1,0 +1,150 @@
+# Full soak / stress watchdog (see the harness under system_test/soak/).
+#
+# Runs the actual multi-hour soak on the self-hosted hetzner-incus pool — the
+# workload spins up two QuestDB instances + a fault proxy + ~9 concurrent legs,
+# which does not fit a GitHub-hosted runner (the fuzz suite hit OOM / low disk
+# there and moved here too). GitHub Actions can't use this pool, so this stays
+# an Azure pipeline. The harness self-test runs here as the pre-gate below
+# (`run_all_tests.py soak-selftest`).
+#
+#   * daily schedule   -> 2h deep run (fresh seed = build id, fuzz-style)
+#   * merge to main    -> 30 min regression run, attributable to the merge
+#   * manual dispatch  -> custom duration / seed
+#
+# QuestDB is built from master (like run_fuzz_pipeline.yaml): the
+# clone_questdb template + a Maven build produce the SNAPSHOT jar, and soak.py
+# runs against it via --repo ./questdb. Testing master (ahead of the latest
+# release) catches server-side regressions before they ship.
+
+parameters:
+  - name: soakDurationMin
+    displayName: "Manual-run duration (minutes)"
+    type: number
+    default: 120
+  - name: soakSeed
+    displayName: "Seed (blank = build id)"
+    type: string
+    default: ""
+
+# Merge to main -> a 30 min regression run.
+trigger:
+  branches:
+    include:
+      - main
+
+pr: none
+
+schedules:
+  - cron: "0 3 * * *"
+    displayName: Daily 2h soak
+    branches:
+      include:
+        - main
+    always: true
+
+stages:
+  - stage: Soak
+    displayName: "Soak / stress"
+    jobs:
+      - job: SoakFull
+        displayName: "Soak vs QuestDB (linux/hetzner-incus)"
+        pool:
+          name: hetzner-incus
+        timeoutInMinutes: 160
+        variables:
+          imageName: hetzner-incus
+        steps:
+          - checkout: self
+            fetchDepth: 1
+            lfs: false
+            submodules: false
+          - bash: |
+              rm -rf /tmp/junit* /tmp/surefire-agent /tmp/libquestdbr* /tmp/soak-out
+            displayName: "Cleanup /tmp leftovers"
+          - bash: |
+              set -eux
+              sudo apt-get update
+              sudo apt-get install -y --no-install-recommends cmake python3-pip
+              sudo python3 -m pip install --break-system-packages psutil
+              # Image-provided JDK 25 (see provision.sh). soak.py's fixture
+              # launches QuestDB via JAVA_HOME.
+              JAVA_PATH_25="/usr/lib/jvm/java-25-openjdk-amd64"
+              if [ ! -x "$JAVA_PATH_25/bin/java" ]; then
+                echo "Expected JDK 25 missing at $JAVA_PATH_25" >&2
+                ls /usr/lib/jvm/ >&2 || true
+                exit 1
+              fi
+              set +x
+              echo "##vso[task.setvariable variable=JAVA_HOME]$JAVA_PATH_25"
+            displayName: "Install deps + resolve JDK 25"
+          - bash: |
+              set -eux
+              if [ -f /etc/profile.d/rust.sh ]; then . /etc/profile.d/rust.sh || true; fi
+              if [ -f "$HOME/.cargo/env" ]; then . "$HOME/.cargo/env" || true; fi
+              if ! command -v cargo >/dev/null 2>&1; then
+                curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+                  | sh -s -- -y --default-toolchain stable --profile minimal
+                . "$HOME/.cargo/env"
+              fi
+              set +x
+              echo "##vso[task.prependpath]$(dirname "$(command -v cargo)")"
+            displayName: "Resolve Rust toolchain"
+          # Build QuestDB master (same as run_fuzz_pipeline.yaml): clone_questdb
+          # sets CLIENT_PROFILE, the Maven step produces the SNAPSHOT jar that
+          # soak.py picks up via --repo ./questdb.
+          - template: templates/clone_questdb.yaml
+          - task: Maven@3
+            displayName: "Compile QuestDB"
+            inputs:
+              mavenPOMFile: "questdb/pom.xml"
+              javaHomeOption: "Path"
+              jdkDirectory: "$(JAVA_HOME)"
+              options: "-DskipTests -Pbuild-web-console$(CLIENT_PROFILE)"
+          # Fast fail-fast pre-gate before spending the soak time.
+          - script: python3 ci/run_all_tests.py soak-selftest
+            displayName: "Harness selftest (pre-gate)"
+          - bash: |
+              set -eux
+              if [ -f "$HOME/.cargo/env" ]; then . "$HOME/.cargo/env" || true; fi
+              case "$(Build.Reason)" in
+                Schedule) DUR=120 ;;                            # daily deep run
+                Manual)   DUR=${{ parameters.soakDurationMin }} ;;
+                *)        DUR=30  ;;                            # merge to main
+              esac
+              SEED="${{ parameters.soakSeed }}"
+              [ -z "$SEED" ] && SEED="$(Build.BuildId)"
+              cargo build --release --features dataframe \
+                --manifest-path system_test/soak/workload_rs/Cargo.toml
+              # --repo ./questdb => soak.py runs the master build compiled above.
+              python3 system_test/soak/soak.py run \
+                --repo ./questdb \
+                --duration "$DUR" --seed "$SEED" \
+                --outdir "$(Build.ArtifactStagingDirectory)/soak-out"
+            displayName: "Build workload + run soak"
+          - task: PublishBuildArtifacts@1
+            displayName: "Publish soak artifacts (stats / summary / journals)"
+            condition: always()
+            inputs:
+              pathToPublish: $(Build.ArtifactStagingDirectory)/soak-out
+              artifactName: soak-out
+
+      # Mirrors run_fuzz_pipeline.yaml: BUILDS_SLACK_HOOK_URL must be a secret
+      # pipeline variable (or shared variable group) before this is enabled.
+      - job: NotifyOnFailure
+        displayName: "Notify Slack on failure"
+        dependsOn:
+          - SoakFull
+        condition: failed()
+        pool:
+          vmImage: "ubuntu-latest"
+        steps:
+          - checkout: none
+          - task: CmdLine@2
+            displayName: Notify Slack on Failure
+            inputs:
+              script: |
+                curl -X POST -H 'Content-type: application/json' \
+                  --data '{"text":"🚨 *c-questdb-client soak failed*\n\nBranch: `$(Build.SourceBranchName)`\nBuild: <$(System.CollectionUri)$(System.TeamProject)/_build/results?buildId=$(Build.BuildId)|#$(Build.BuildId)>\nCommit: `$(Build.SourceVersion)`"}' \
+                  "$(BUILDS_SLACK_HOOK_URL)"
+            env:
+              BUILDS_SLACK_HOOK_URL: $(BUILDS_SLACK_HOOK_URL)
