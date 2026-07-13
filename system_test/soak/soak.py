@@ -239,7 +239,10 @@ class SoakRun:
         import fault_proxy
         import oracle as oracle_mod
         # StandaloneInstance / jar resolution are proven in the failover system
-        # test; reuse rather than re-implement the launch dance.
+        # test; reuse rather than re-implement the launch dance. It lives in the
+        # parent system_test/ dir, which isn't on sys.path when soak.py runs as
+        # a script (only its own dir is).
+        sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
         from test_egress_failover import StandaloneInstance, _resolve_jar
 
         outdir = self.opts['outdir']
