@@ -333,19 +333,22 @@ def compare_value(ty, expected, actual):
 
     # Types whose calibrated /exec projection differs from the raw value.
     if ty == 'ipv4':
-        if tag == 'null':
+        v = None if tag == 'null' else expected[1]
+        # QuestDB uses 0.0.0.0 as the IPv4 NULL sentinel: a sent value of 0
+        # reads back as NULL, indistinguishable from an explicit null.
+        if v is None or v == 0:
             return (actual is None), 'ipv4-null'
         if actual is None:
             return False, 'ipv4 unexpected null'
-        v = expected[1]
         dotted = '%d.%d.%d.%d' % ((v >> 24) & 0xFF, (v >> 16) & 0xFF,
                                   (v >> 8) & 0xFF, v & 0xFF)
         return (str(actual) == dotted), 'ipv4-dotted'
     if ty == 'binary':
-        # /exec cannot render BINARY bytes; the projection is length(). Verify
-        # the byte count landed (NULL binary reads back as NULL length).
+        # /exec cannot render BINARY bytes; the projection is length(). A NULL
+        # binary reads back as length -1 (QuestDB's length(NULL) == -1), not
+        # SQL NULL.
         if tag == 'null':
-            return (actual is None), 'binary-null'
+            return (actual is None or int(actual) == -1), 'binary-null'
         return (actual is not None and int(actual) == len(expected[1])), 'binary-length'
     if ty == 'double_array':
         # /exec returns a list of doubles; gen's canonical form is the elements'
@@ -608,11 +611,17 @@ def _selftest():
     check(not compare_value('ipv4', ('int', 3435573785), '1.2.3.4')[0],
           'I3 ipv4 mismatch')
     check(compare_value('ipv4', ('null',), None)[0], 'I3 ipv4 null')
+    # 0.0.0.0 is QuestDB's IPv4 NULL sentinel: a sent 0 reads back as NULL.
+    check(compare_value('ipv4', ('int', 0), None)[0], 'I3 ipv4 zero reads null')
+    check(not compare_value('ipv4', ('int', 0), '0.0.0.0')[0],
+          'I3 ipv4 zero never renders dotted')
     check(compare_value('binary', ('bytes', b'\x01\x02\x03'), 3)[0],
           'I3 binary length match')
     check(not compare_value('binary', ('bytes', b'\x01\x02\x03'), 2)[0],
           'I3 binary length mismatch')
     check(compare_value('binary', ('null',), None)[0], 'I3 binary null')
+    # length(NULL binary) reads back as -1, not SQL NULL.
+    check(compare_value('binary', ('null',), -1)[0], 'I3 binary null reads -1')
 
     # reconcile_values honours a per-leg type subset: a fake query returning
     # the expected value for the leg's single type passes and counts it.

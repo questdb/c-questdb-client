@@ -2,10 +2,12 @@
 //!
 //! The egress legs exercise the QWP/WebSocket **reader** under sustained query
 //! load with server restarts, complementing the ingest legs. They read back a
-//! table an ingest leg populated and assert a cheap correctness invariant
-//! (every `c_seq` in the scanned range is present — `count == max - min + 1`),
-//! so a decode / failover bug shows up as a gap or a query error rather than a
-//! silent wrong answer.
+//! table an ingest leg populated and assert a cheap correctness invariant:
+//! every `c_seq` in the scanned range is present, i.e. `count >= max - min + 1`.
+//! `count < span` means a missing `c_seq` — real loss (fatal). `count > span`
+//! is duplicate `c_seq`, expected under Direct-backend failover re-drive (I2;
+//! the oracle bounds it at reconcile) and only logged, not fatal. So a decode /
+//! loss bug shows up as LOSS or a query error rather than a silent wrong answer.
 //!
 //! `rust-egress-whole` full-scans and materialises the whole `c_seq` column;
 //! `rust-egress-stream` does the same but is driven batch-by-batch. Both share
@@ -70,7 +72,9 @@ pub fn run_egress_leg(cfg: &LegConfig) -> LegResult {
     let mut last_stats = Instant::now();
     let mut queries: u64 = 0;
     let mut rows_read: u64 = 0;
-    let mut gaps: u64 = 0;
+    let mut losses: u64 = 0; // count < span: a missing c_seq => real loss (fatal)
+    let mut dup_surplus: u64 = 0; // last-seen count - span (>0 => duplicates)
+    let mut max_dup_surplus: u64 = 0; // high-water mark for the end-of-run summary
     let mut stuck: u32 = 0;
     const STUCK_LIMIT: u32 = 500;
 
@@ -82,10 +86,35 @@ pub fn run_egress_leg(cfg: &LegConfig) -> LegResult {
                 queries += 1;
                 rows_read += count;
                 stuck = 0;
-                // Every seq in [min, max] must be present: a gap means loss.
-                if count > 0 && (max - min + 1) as u64 != count {
-                    gaps += 1;
-                    eprintln!("{}: egress gap: count={count} min={min} max={max}", cfg.leg);
+                if count > 0 {
+                    let span = (max - min + 1) as u64;
+                    if count < span {
+                        // Fewer rows than the seq range spans => a missing
+                        // c_seq => real loss. This is what the egress leg guards.
+                        losses += 1;
+                        eprintln!(
+                            "{}: egress LOSS: count={count} < span={span} (min={min} max={max})",
+                            cfg.leg
+                        );
+                    } else if count > span {
+                        // More rows than the range spans => duplicate c_seq,
+                        // expected under Direct-backend failover re-drive (I2,
+                        // bounded dup; the oracle bounds it at reconcile). Log
+                        // only when the surplus changes so we don't flood.
+                        let surplus = count - span;
+                        if surplus != dup_surplus {
+                            eprintln!(
+                                "{}: egress dup surplus={surplus} (count={count} span={span}); \
+                                 expected under failover re-drive",
+                                cfg.leg
+                            );
+                            dup_surplus = surplus;
+                            max_dup_surplus = max_dup_surplus.max(surplus);
+                        }
+                    } else {
+                        // count == span: clean. Reset so a later recurrence logs.
+                        dup_surplus = 0;
+                    }
                 }
             }
             Err(e) => {
@@ -111,14 +140,21 @@ pub fn run_egress_leg(cfg: &LegConfig) -> LegResult {
         sleep(Duration::from_secs_f64(1.0 / qps as f64));
 
         if last_stats.elapsed() >= Duration::from_secs(5) {
-            stats.emit(&db, rows_read, rows_read, Some(queries), Some(gaps))?;
+            stats.emit(&db, rows_read, rows_read, Some(queries), Some(losses))?;
             last_stats = Instant::now();
         }
     }
 
-    stats.emit(&db, rows_read, rows_read, Some(queries), Some(gaps))?;
-    if gaps > 0 {
-        return Err(format!("{}: {gaps} egress gap(s) detected", cfg.leg).into());
+    stats.emit(&db, rows_read, rows_read, Some(queries), Some(losses))?;
+    if max_dup_surplus > 0 {
+        eprintln!(
+            "{}: egress observed max dup surplus={max_dup_surplus} \
+             (duplicates are bounded by the oracle's I2 check)",
+            cfg.leg
+        );
+    }
+    if losses > 0 {
+        return Err(format!("{}: {losses} egress LOSS event(s) detected", cfg.leg).into());
     }
     Ok(())
 }

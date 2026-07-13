@@ -52,8 +52,16 @@ import time
 # Episodes — the seeded fault schedule (§6). Deterministic from --seed.
 # ---------------------------------------------------------------------------
 
+# Server restarts are graceful (SIGTERM) only: QuestDB flushes + fsyncs on the
+# way out, so no committed data is lost — matching the fuzz suite's bounce. The
+# hard-kill (SIGKILL) server path is intentionally omitted; surviving it needs
+# `request_durable_ack=on` (an ack means fsynced, so the client re-drives only
+# the un-acked tail), which these legs don't set. That crash-durability guarantee
+# is covered by the durable-ack kill9 tests under system_test/enterprise_e2e/.
+# `client_kill9` stays: the client's ack journal is fsynced, so a killed client
+# resumes from its durable watermark and re-drives — no loss.
 EPISODE_KINDS = [
-    'server_graceful', 'server_kill9', 'client_kill9', 'client_graceful',
+    'server_graceful', 'client_kill9', 'client_graceful',
     'conn_reset', 'stall', 'throttle', 'sf_disk_full',
 ]
 
@@ -75,17 +83,17 @@ class EpisodeSchedule:
     identical schedule (so a failing run replays exactly)."""
 
     def __init__(self, seed, duration_sec, min_gap=180, max_gap=420,
-                 warmup_sec=120, kinds=None):
+                 warmup_sec=120, kinds=None, tail_quiet=180):
         self.seed = seed
         self.duration_sec = duration_sec
         self.kinds = kinds or EPISODE_KINDS
-        self._episodes = self._build(min_gap, max_gap, warmup_sec)
+        self._episodes = self._build(min_gap, max_gap, warmup_sec, tail_quiet)
 
-    def _build(self, min_gap, max_gap, warmup_sec):
+    def _build(self, min_gap, max_gap, warmup_sec, tail_quiet):
         rng = random.Random(self.seed)
         episodes = []
-        # Leave a quiet tail so the final reconciliation runs undisturbed.
-        tail_quiet = 180
+        # `tail_quiet` leaves a quiet tail so the final reconciliation runs
+        # undisturbed.
         t = warmup_sec + rng.uniform(min_gap, max_gap)
         while t < self.duration_sec - tail_quiet:
             kind = rng.choice(self.kinds)
@@ -226,7 +234,11 @@ class SoakRun:
         self.sampler = Sampler()
         self.samples = []
         self.workloads = []
-        self.schedule = EpisodeSchedule(opts['seed'], opts['duration_sec'])
+        self.schedule = EpisodeSchedule(
+            opts['seed'], opts['duration_sec'],
+            min_gap=opts.get('min_gap', 180), max_gap=opts.get('max_gap', 420),
+            warmup_sec=opts.get('warmup', 120), kinds=opts.get('kinds'),
+            tail_quiet=opts.get('tail_quiet', 180))
 
     #: Workload binary, built by `cargo build --release` in the crate.
     WORKLOAD_BIN = os.path.join(
@@ -243,7 +255,41 @@ class SoakRun:
         # parent system_test/ dir, which isn't on sys.path when soak.py runs as
         # a script (only its own dir is).
         sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-        from test_egress_failover import StandaloneInstance, _resolve_jar
+        from test_egress_failover import (
+            StandaloneInstance, _resolve_jar, _find_java, _wait_for_ping)
+
+        class _RestartableInstance(StandaloneInstance):
+            """A `StandaloneInstance` that can bounce without wiping its data.
+
+            The base `start()` resets the data dir and re-picks ports on every
+            call (correct for a fresh start, but a *restart* must keep both or
+            the server comes back empty — which masquerades as data loss).
+            `restart()` relaunches the same jar against the existing data dir,
+            conf, and ports. Keep the launch args in sync with
+            `StandaloneInstance.start()`.
+            """
+
+            def restart(self):
+                self._log_file = open(self.data_dir / 'log' / 'log.txt', 'ab')
+                self._proc = subprocess.Popen(
+                    [
+                        str(_find_java()),
+                        f'-DQuestDB-{self.label}',
+                        '-ea',
+                        '-Dnoebug',
+                        '-XX:+UnlockExperimentalVMOptions',
+                        '-XX:+AlwaysPreTouch',
+                        '--add-exports=java.base/jdk.internal.vm=io.questdb',
+                        '-p', str(self.jar),
+                        '-m', 'io.questdb/io.questdb.ServerMain',
+                        '-d', str(self.data_dir),
+                    ],
+                    cwd=str(self.data_dir),
+                    stdout=self._log_file,
+                    stderr=subprocess.STDOUT,
+                    close_fds=True,
+                )
+                _wait_for_ping(self.host, self.http_port)
 
         outdir = self.opts['outdir']
         os.makedirs(outdir, exist_ok=True)
@@ -255,22 +301,57 @@ class SoakRun:
                 f'build it first: cargo build --release '
                 f'--manifest-path system_test/soak/workload_rs/Cargo.toml')
 
-        jar = _resolve_jar(argparse.Namespace(
-            repo=self.opts.get('repo'), versions=None))
-        root = os.path.join(outdir, 'servers')
-        os.makedirs(root, exist_ok=True)
+        server_addr = self.opts.get('server')
+        if server_addr:
+            # Run against an already-running QuestDB: skip the build + provision
+            # dance. No managed process, so server-restart episodes are no-ops
+            # and the faulted + control legs share this single instance.
+            from test_egress_failover import _http_exec
 
-        self.faulted = StandaloneInstance(jar, os.path.join(root, 'faulted'), 'faulted')
-        self.control = StandaloneInstance(jar, os.path.join(root, 'control'), 'control')
-        self.faulted.start()
-        try:
-            self.control.start()
-        except Exception:
-            self.faulted.kill()
-            raise
+            class _ExistingServer:
+                def __init__(self, host, port):
+                    self.host, self.http_port, self._proc = host, port, None
 
-        self.proxy = fault_proxy.FaultProxy(self.faulted.host, self.faulted.http_port)
-        proxy_port = self.proxy.start()
+                def start(self):
+                    pass
+
+                def kill(self):
+                    pass
+
+                def is_alive(self):
+                    return True
+
+                def http_exec(self, sql):
+                    return _http_exec(self.host, self.http_port, sql)
+
+            host, _, port = server_addr.partition(':')
+            self.faulted = _ExistingServer(host or '127.0.0.1', int(port or 9000))
+            self.control = self.faulted
+            self._managed_server = False
+        else:
+            jar = _resolve_jar(argparse.Namespace(
+                repo=self.opts.get('repo'), versions=None))
+            root = os.path.join(outdir, 'servers')
+            os.makedirs(root, exist_ok=True)
+
+            self.faulted = _RestartableInstance(jar, os.path.join(root, 'faulted'), 'faulted')
+            self.control = _RestartableInstance(jar, os.path.join(root, 'control'), 'control')
+            self.faulted.start()
+            try:
+                self.control.start()
+            except Exception:
+                self.faulted.kill()
+                raise
+            self._managed_server = True
+
+        if self.opts.get('no_proxy'):
+            # Legs hit the server directly; proxy-based faults become no-ops.
+            self.proxy = None
+            faulted_addr = f'{self.faulted.host}:{self.faulted.http_port}'
+        else:
+            self.proxy = fault_proxy.FaultProxy(self.faulted.host, self.faulted.http_port)
+            proxy_port = self.proxy.start()
+            faulted_addr = f'{self.faulted.host}:{proxy_port}'
 
         # v1 legs: one faulted row leg (through the proxy) + one control leg
         # (straight to the never-faulted server). The full matrix (SF / column
@@ -285,21 +366,21 @@ class SoakRun:
         self.legs = [
             {'name': 'rust-row-direct', 'faulted': True, 'worker': 0,
              'table': 'soak_row_direct', 'types': row_types,
-             'addr': f'{self.faulted.host}:{proxy_port}', 'server': self.faulted},
+             'addr': faulted_addr, 'server': self.faulted},
             {'name': 'rust-col-direct', 'faulted': True, 'worker': 2,
              'table': 'soak_col_direct', 'types': col_types,
-             'addr': f'{self.faulted.host}:{proxy_port}', 'server': self.faulted},
+             'addr': faulted_addr, 'server': self.faulted},
             # DataFrame->Arrow->wire path (needs a `--features dataframe` binary).
             {'name': 'rust-col-df', 'faulted': True, 'worker': 3,
              'table': 'soak_df', 'types': ['boolean', 'long', 'double', 'symbol'],
-             'addr': f'{self.faulted.host}:{proxy_port}', 'server': self.faulted},
+             'addr': faulted_addr, 'server': self.faulted},
             # Store-and-forward: disk-backed and in-memory (item 1's core ask).
             {'name': 'rust-row-saf-disk', 'faulted': True, 'worker': 4,
              'table': 'soak_saf_disk', 'types': row_types, 'sf': 'disk',
-             'addr': f'{self.faulted.host}:{proxy_port}', 'server': self.faulted},
+             'addr': faulted_addr, 'server': self.faulted},
             {'name': 'rust-row-saf-mem', 'faulted': True, 'worker': 5,
              'table': 'soak_saf_mem', 'types': row_types, 'sf': 'mem',
-             'addr': f'{self.faulted.host}:{proxy_port}', 'server': self.faulted},
+             'addr': faulted_addr, 'server': self.faulted},
             {'name': 'control-ingress', 'faulted': False, 'worker': 1,
              'table': 'soak_control', 'types': row_types,
              'addr': f'{self.control.host}:{self.control.http_port}',
@@ -308,7 +389,7 @@ class SoakRun:
             # read-side failover. No journal; its own contiguity check gates it.
             {'name': 'rust-egress-whole', 'faulted': True, 'worker': 2,
              'table': 'soak_col_direct', 'kind': 'egress',
-             'addr': f'{self.faulted.host}:{proxy_port}', 'server': self.faulted},
+             'addr': faulted_addr, 'server': self.faulted},
         ]
 
         try:
@@ -325,7 +406,8 @@ class SoakRun:
         with open(os.path.join(outdir, 'summary.json'), 'w') as f:
             json.dump(summary, f, indent=2)
 
-        self.proxy.stop()
+        if self.proxy is not None:
+            self.proxy.stop()
         self.faulted.kill()
         self.control.kill()
 
@@ -402,9 +484,22 @@ class SoakRun:
     def _fire_episode(self, ep, reverts, start):
         import time as _time
         sys.stderr.write(f'[soak] episode @ {ep.at:.0f}s: {ep.kind} {ep.params}\n')
+        if ep.kind == 'server_graceful':
+            if not self._managed_server:
+                sys.stderr.write('[soak]   skipped: no managed server (existing-server mode)\n')
+                return
+            if self.proxy is None:
+                sys.stderr.write('[soak]   skipped: no proxy to remap the restarted port (--no-proxy)\n')
+                return
+        if ep.kind in ('conn_reset', 'stall', 'throttle') and self.proxy is None:
+            sys.stderr.write('[soak]   skipped: no proxy (--no-proxy)\n')
+            return
         p = ep.params
-        if ep.kind in ('server_graceful', 'server_kill9'):
-            if ep.kind == 'server_graceful' and self.faulted._proc:
+        if ep.kind == 'server_graceful':
+            # Graceful SIGTERM, then `restart()` (not `start()`): the bounce
+            # preserves the data dir + port so the server recovers its committed
+            # data. A fresh `start()` would wipe it and masquerade as data loss.
+            if self.faulted._proc:
                 self.faulted._proc.terminate()
                 try:
                     self.faulted._proc.wait(timeout=30)
@@ -412,7 +507,8 @@ class SoakRun:
                     self.faulted.kill()
             else:
                 self.faulted.kill()
-            self.faulted.start()
+            _time.sleep(0.1)  # let the port free up before rebinding
+            self.faulted.restart()
             self.proxy.set_upstream(self.faulted.host, self.faulted.http_port)
         elif ep.kind in ('client_kill9', 'client_graceful'):
             faulted_wls = [w for w in self.workloads if w.meta.get('faulted')]
@@ -658,6 +754,22 @@ def _main(argv):
     run.add_argument('--profile', default='full', choices=['full', 'sanitize', 'quick'])
     run.add_argument('--outdir', default='soak-out')
     run.add_argument('--repo', help='path to a QuestDB checkout to build+run')
+    run.add_argument('--server', metavar='HOST:PORT',
+                     help='run against an already-running QuestDB instead of '
+                          'provisioning (skips --repo); server-restart episodes '
+                          'become no-ops')
+    run.add_argument('--no-proxy', action='store_true',
+                     help='connect legs straight to the server (no fault proxy); '
+                          'proxy faults (conn_reset/stall/throttle) become no-ops')
+    # Schedule knobs — defaults match EpisodeSchedule. Compressing warmup/gap
+    # (e.g. --warmup 15 --min-gap 15 --max-gap 30) fires faults early for a
+    # quick reproduction instead of the multi-minute production cadence.
+    run.add_argument('--warmup', type=int, default=120, help='quiet seconds before the first fault')
+    run.add_argument('--min-gap', type=int, default=180, help='min seconds between faults')
+    run.add_argument('--max-gap', type=int, default=420, help='max seconds between faults')
+    run.add_argument('--tail-quiet', type=int, default=180, help='quiet seconds before reconcile')
+    run.add_argument('--kinds', help='comma-separated episode kinds to restrict to '
+                                     f'(default all: {",".join(EPISODE_KINDS)})')
 
     sub.add_parser('selftest', help='test the scheduler + sampler, no server')
 
@@ -675,12 +787,25 @@ def _main(argv):
         print(f'\n{len(sched)} episodes over {args.duration} min (seed {args.seed})')
         return 0
     if args.cmd == 'run':
+        kinds = None
+        if args.kinds:
+            kinds = [k.strip() for k in args.kinds.split(',') if k.strip()]
+            bad = [k for k in kinds if k not in EPISODE_KINDS]
+            if bad:
+                ap.error(f'unknown episode kind(s): {bad}; choose from {EPISODE_KINDS}')
         run = SoakRun({
             'seed': args.seed,
             'duration_sec': args.duration * 60,
             'profile': args.profile,
             'outdir': args.outdir,
             'repo': args.repo,
+            'server': args.server,
+            'no_proxy': args.no_proxy,
+            'warmup': args.warmup,
+            'min_gap': args.min_gap,
+            'max_gap': args.max_gap,
+            'tail_quiet': args.tail_quiet,
+            'kinds': kinds,
         })
         return run.run() or 0
     return 2
