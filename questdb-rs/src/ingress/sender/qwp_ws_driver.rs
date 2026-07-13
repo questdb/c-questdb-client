@@ -2887,6 +2887,7 @@ impl BlockingQwpWsTransport {
             connect_kind,
             &qwp_ws,
             auth_header.as_deref(),
+            None,
         )?;
         Ok(Self::from_connected(
             endpoints,
@@ -2948,6 +2949,7 @@ impl BlockingQwpWsTransport {
             self.connect_kind,
             &self.qwp_ws,
             self.auth_header.as_deref(),
+            None,
         )
         .map_err(DriverError::Transport)?;
         self.previous_idx = Some(connected.endpoint_idx);

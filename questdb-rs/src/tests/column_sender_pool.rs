@@ -5404,3 +5404,215 @@ mod reader_pool {
         drop(db);
     }
 }
+
+// ===========================================================================
+// Connection lifecycle events
+// ===========================================================================
+
+mod conn_event_tests {
+    use super::*;
+    use crate::ingress::conn_events::{ConnectionEvent, ConnectionEventKind};
+    use std::sync::Mutex as StdMutex;
+    use std::time::Instant;
+
+    fn collecting_listener() -> (
+        Arc<StdMutex<Vec<ConnectionEvent>>>,
+        crate::ingress::ConnectionListener,
+    ) {
+        let seen: Arc<StdMutex<Vec<ConnectionEvent>>> = Arc::new(StdMutex::new(Vec::new()));
+        let seen_in_listener = Arc::clone(&seen);
+        let listener: crate::ingress::ConnectionListener =
+            Arc::new(move |event: &ConnectionEvent| {
+                seen_in_listener.lock().unwrap().push(event.clone());
+            });
+        (seen, listener)
+    }
+
+    fn wait_for_kinds(
+        seen: &Arc<StdMutex<Vec<ConnectionEvent>>>,
+        want: &[ConnectionEventKind],
+    ) -> Vec<ConnectionEvent> {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            {
+                let events = seen.lock().unwrap();
+                let kinds: Vec<ConnectionEventKind> = events.iter().map(|e| e.kind).collect();
+                if want.iter().all(|k| kinds.contains(k)) {
+                    return events.clone();
+                }
+            }
+            assert!(
+                Instant::now() < deadline,
+                "timed out waiting for {want:?}; saw {:?}",
+                seen.lock()
+                    .unwrap()
+                    .iter()
+                    .map(|e| e.kind)
+                    .collect::<Vec<_>>()
+            );
+            thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    #[test]
+    fn first_borrow_fires_connected_with_endpoint() {
+        let server = MockServer::spawn(4);
+        let conf = conf_for(server.port(), "pool_size=1;pool_max=2;pool_reap=manual;");
+        let db = QuestDb::connect(&conf).unwrap();
+        let (seen, listener) = collecting_listener();
+        db.set_connection_listener(listener, 0).unwrap();
+
+        let borrowed = db.borrow_direct_column_sender().expect("borrow");
+        let events = wait_for_kinds(&seen, &[ConnectionEventKind::Connected]);
+        let connected = events
+            .iter()
+            .find(|e| e.kind == ConnectionEventKind::Connected)
+            .unwrap();
+        assert_eq!(connected.host.as_deref(), Some("127.0.0.1"));
+        assert_eq!(
+            connected.port.as_deref(),
+            Some(server.port().to_string()).as_deref()
+        );
+        assert_eq!(db.connection_events_delivered(), 1);
+        assert_eq!(db.connection_events_dropped(), 0);
+        drop(borrowed);
+
+        // Pool growth to the same endpoint with no intervening failure is
+        // narration-silent: a second fresh connection fires nothing.
+        let a = db.borrow_direct_column_sender().expect("reuse");
+        let b = db.borrow_direct_column_sender().expect("grow");
+        thread::sleep(Duration::from_millis(50));
+        assert_eq!(
+            seen.lock()
+                .unwrap()
+                .iter()
+                .filter(|e| e.kind == ConnectionEventKind::Connected)
+                .count(),
+            1
+        );
+        drop(a);
+        drop(b);
+    }
+
+    #[test]
+    fn second_listener_registration_rejected() {
+        let server = MockServer::spawn(2);
+        let conf = conf_for(server.port(), "pool_size=1;pool_max=1;pool_reap=manual;");
+        let db = QuestDb::connect(&conf).unwrap();
+        let (_seen, listener) = collecting_listener();
+        db.set_connection_listener(listener, 0).unwrap();
+        let (_seen2, listener2) = collecting_listener();
+        let err = db.set_connection_listener(listener2, 0).unwrap_err();
+        assert_eq!(err.code(), ErrorCode::InvalidApiCall);
+    }
+
+    #[test]
+    fn unreachable_endpoint_fires_attempt_failed_and_unreachable() {
+        // Bind a port and close the listener so connects are refused.
+        let port = {
+            let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+            listener.local_addr().unwrap().port()
+        };
+        let conf = format!(
+            "ws::addr=127.0.0.1:{port};auth_timeout=2000;\
+             reconnect_max_duration_millis=200;connect_timeout=100;\
+             pool_size=1;pool_max=1;pool_reap=manual;"
+        );
+        let db = QuestDb::connect(&conf).unwrap();
+        let (seen, listener) = collecting_listener();
+        db.set_connection_listener(listener, 0).unwrap();
+
+        let err = db
+            .borrow_direct_column_sender()
+            .expect_err("no server listening");
+        assert_eq!(err.code(), ErrorCode::SocketError);
+
+        let events = wait_for_kinds(
+            &seen,
+            &[
+                ConnectionEventKind::EndpointAttemptFailed,
+                ConnectionEventKind::AllEndpointsUnreachable,
+            ],
+        );
+        let attempt = events
+            .iter()
+            .find(|e| e.kind == ConnectionEventKind::EndpointAttemptFailed)
+            .unwrap();
+        assert_eq!(attempt.host.as_deref(), Some("127.0.0.1"));
+        assert!(attempt.attempt_number.is_some());
+        assert!(attempt.cause_code.is_some());
+        let unreachable = events
+            .iter()
+            .find(|e| e.kind == ConnectionEventKind::AllEndpointsUnreachable)
+            .unwrap();
+        assert!(
+            unreachable
+                .cause_msg
+                .as_deref()
+                .unwrap_or("")
+                .contains("unreachable")
+        );
+    }
+
+    #[test]
+    fn failover_to_second_endpoint_fires_failed_over() {
+        // First endpoint accepts exactly one connection then refuses; the
+        // second endpoint accepts. The first borrow lands on endpoint A
+        // (Connected); after its connection dies, the next borrow walks to
+        // endpoint B (FailedOver with previous endpoint recorded).
+        let server_a = MockServer::spawn(1);
+        let server_b = MockServer::spawn(4);
+        let conf = conf_for_endpoints(
+            &[server_a.port(), server_b.port()],
+            "connect_timeout=200;pool_size=1;pool_max=2;pool_reap=manual;",
+        );
+        let db = QuestDb::connect(&conf).unwrap();
+        let (seen, listener) = collecting_listener();
+        db.set_connection_listener(listener, 0).unwrap();
+
+        let first = db.borrow_direct_column_sender().expect("first borrow");
+        let events = wait_for_kinds(&seen, &[ConnectionEventKind::Connected]);
+        let connected_port = events
+            .iter()
+            .find(|e| e.kind == ConnectionEventKind::Connected)
+            .unwrap()
+            .port
+            .clone()
+            .unwrap();
+        drop(first);
+
+        // Kill both mock accept loops for endpoint A by stopping the server;
+        // then force fresh connects until the pool walks to endpoint B.
+        drop(server_a);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            match db.borrow_direct_column_sender() {
+                Ok(mut borrowed) => {
+                    borrowed.drop_on_return();
+                    let saw_failover = seen
+                        .lock()
+                        .unwrap()
+                        .iter()
+                        .any(|e| e.kind == ConnectionEventKind::FailedOver);
+                    if saw_failover {
+                        break;
+                    }
+                }
+                Err(_) => {}
+            }
+            assert!(Instant::now() < deadline, "no FailedOver observed");
+            thread::sleep(Duration::from_millis(10));
+        }
+        let events = seen.lock().unwrap();
+        let failed_over = events
+            .iter()
+            .find(|e| e.kind == ConnectionEventKind::FailedOver)
+            .unwrap();
+        assert_eq!(
+            failed_over.previous_port.as_deref(),
+            Some(connected_port.as_str())
+        );
+        drop(events);
+        drop(server_b);
+    }
+}

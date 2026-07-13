@@ -72,6 +72,13 @@ use ring::{
 #[cfg(feature = "_sync-sender")]
 mod conf;
 
+#[cfg(feature = "sync-sender-qwp-ws")]
+pub mod conn_events;
+#[cfg(feature = "sync-sender-qwp-ws")]
+pub use conn_events::{
+    ConnectionEvent, ConnectionEventDispatcher, ConnectionEventKind, ConnectionListener,
+};
+
 pub(crate) mod ndarr;
 
 mod timestamp;
@@ -489,6 +496,11 @@ impl QwpWsConnector {
         self.endpoints.len()
     }
 
+    /// Endpoint at `idx`, for event narration. `None` when out of range.
+    pub(crate) fn endpoint(&self, idx: usize) -> Option<&conf::QwpWsEndpoint> {
+        self.endpoints.get(idx)
+    }
+
     pub(crate) fn max_buf_size(&self) -> usize {
         self.max_buf_size
     }
@@ -554,13 +566,15 @@ impl QwpWsConnector {
     pub(crate) fn connect_round_pooled(
         &self,
         health: &std::sync::Mutex<sender::qwp_ws::QwpWsHostHealthTracker>,
+        events: Option<&conn_events::ConnectionEventSource>,
     ) -> Result<RawQwpWsRoundStream> {
-        self.connect_round_with(sender::qwp_ws::LockedQwpWsHealth::new(health))
+        self.connect_round_with(sender::qwp_ws::LockedQwpWsHealth::new(health), events)
     }
 
     fn connect_round_with<A: sender::qwp_ws::QwpWsHealthAccess>(
         &self,
         health: A,
+        events: Option<&conn_events::ConnectionEventSource>,
     ) -> Result<RawQwpWsRoundStream> {
         let mut previous_idx = None;
         let connected = sender::qwp_ws::connect_qwp_ws_endpoint_round(
@@ -573,6 +587,7 @@ impl QwpWsConnector {
             sender::qwp_ws::QwpWsConnectKind::Foreground,
             &self.qwp_ws,
             self.auth_header.as_deref(),
+            events,
         )?;
         // The per-frame cap is the negotiated one: the configured
         // max_buf_size clamped to the server's advertised

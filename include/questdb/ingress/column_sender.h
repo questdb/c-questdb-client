@@ -346,6 +346,79 @@ QUESTDB_CLIENT_API
 size_t questdb_db_reap_idle(questdb_db* db);
 
 /* -------------------------------------------------------------------------
+ * Connection lifecycle events
+ *
+ * Register one listener per pool with
+ * `questdb_db_set_connection_event_handler`. Events are delivered on a
+ * dedicated dispatcher thread (never an I/O or producer thread) through a
+ * bounded inbox with a drop-oldest overflow policy, so a slow callback
+ * cannot stall connects or publishing. Register before the first borrow to
+ * observe the initial `connected` event.
+ * ------------------------------------------------------------------------- */
+
+/** Connection lifecycle event kinds. */
+#define questdb_connection_event_connected 0u
+#define questdb_connection_event_disconnected 1u
+#define questdb_connection_event_reconnected 2u
+#define questdb_connection_event_failed_over 3u
+#define questdb_connection_event_endpoint_attempt_failed 4u
+#define questdb_connection_event_all_endpoints_unreachable 5u
+#define questdb_connection_event_auth_failed 6u
+
+/** One connection-state transition. String fields are borrowed UTF-8
+ * slices valid only for the duration of the callback; absent strings are
+ * NULL with length 0. */
+typedef struct questdb_connection_event
+{
+    /** One of the `questdb_connection_event_*` kind constants. */
+    uint32_t kind;
+    const char* host;
+    size_t host_len;
+    const char* port;
+    size_t port_len;
+    const char* previous_host;
+    size_t previous_host_len;
+    const char* previous_port;
+    size_t previous_port_len;
+    bool has_attempt;
+    uint64_t attempt_number;
+    bool has_cause;
+    line_sender_error_code cause_code;
+    const char* cause_msg;
+    size_t cause_msg_len;
+    /** Wall-clock time of the event, milliseconds since the Unix epoch. */
+    int64_t timestamp_millis;
+} questdb_connection_event;
+
+/** Callback invoked once per connection event on the dispatcher thread.
+ * The `event` pointer and every string it references are valid only for
+ * the duration of the call. Must not unwind. */
+typedef void (*questdb_connection_event_cb)(
+    void* user_data,
+    const questdb_connection_event* event);
+
+/** Register a connection lifecycle listener on the pool. `inbox_capacity`
+ * of 0 selects the default (64). At most one listener per pool; a second
+ * registration fails with `line_sender_error_invalid_api_call`. The
+ * caller guarantees `user_data` is safe to use from the dispatcher
+ * thread. */
+QUESTDB_CLIENT_API
+bool questdb_db_set_connection_event_handler(
+    questdb_db* db,
+    questdb_connection_event_cb callback,
+    void* user_data,
+    size_t inbox_capacity,
+    line_sender_error** err_out);
+
+/** Total events discarded by the inbox's drop-oldest policy. */
+QUESTDB_CLIENT_API
+uint64_t questdb_db_connection_events_dropped(const questdb_db* db);
+
+/** Total events delivered to the listener. */
+QUESTDB_CLIENT_API
+uint64_t questdb_db_connection_events_delivered(const questdb_db* db);
+
+/* -------------------------------------------------------------------------
  * Diagnostics: per-pool connection counts
  *
  * Soak / leak harnesses sample these and assert every pool drains back to a

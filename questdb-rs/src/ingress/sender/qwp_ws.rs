@@ -800,6 +800,7 @@ impl QwpWsPendingConnect {
                 QwpWsConnectKind::Foreground,
                 &self.qwp_ws,
                 self.auth_header.as_deref(),
+                None,
             ) {
                 Ok(connected) => {
                     return Ok(Some(BlockingQwpWsTransport::from_connected(
@@ -2835,6 +2836,7 @@ pub(crate) fn connect_qwp_ws_endpoint_round<A: QwpWsHealthAccess>(
     connect_kind: QwpWsConnectKind,
     qwp_ws: &QwpWsConfig,
     auth_header: Option<&str>,
+    events: Option<&crate::ingress::conn_events::ConnectionEventSource>,
 ) -> crate::Result<QwpWsConnectRoundSuccess> {
     if let Some(idx) = previous_idx.take() {
         health.with_tracker(|t| t.record_mid_stream_failure(idx, previous_failure));
@@ -2867,6 +2869,9 @@ pub(crate) fn connect_qwp_ws_endpoint_round<A: QwpWsHealthAccess>(
         ) {
             Ok((stream, handshake_result, leftover)) => {
                 health.with_tracker(|t| t.record_success(idx));
+                if let Some(events) = events {
+                    events.connect_succeeded(&endpoint.host, &endpoint.port);
+                }
                 *previous_idx = Some(idx);
                 return Ok(QwpWsConnectRoundSuccess {
                     endpoint_idx: idx,
@@ -2876,7 +2881,12 @@ pub(crate) fn connect_qwp_ws_endpoint_round<A: QwpWsHealthAccess>(
                     leftover,
                 });
             }
-            Err(err) if err.code() == crate::ErrorCode::AuthError => return Err(err),
+            Err(err) if err.code() == crate::ErrorCode::AuthError => {
+                if let Some(events) = events {
+                    events.auth_failed(&endpoint.host, &endpoint.port, &err, events.next_attempt());
+                }
+                return Err(err);
+            }
             Err(err) if is_qwp_ws_role_reject_error(&err) => {
                 role_reject_count += 1;
                 let role_reject = err.qwp_ws_role_reject().cloned();
@@ -2896,12 +2906,28 @@ pub(crate) fn connect_qwp_ws_endpoint_round<A: QwpWsHealthAccess>(
                 if let Some(role_reject) = role_reject {
                     err = err.with_qwp_ws_role_reject(role_reject);
                 }
+                if let Some(events) = events {
+                    events.connect_attempt_failed(
+                        &endpoint.host,
+                        &endpoint.port,
+                        &err,
+                        events.next_attempt(),
+                    );
+                }
                 last_role_mismatch = Some(err);
             }
             Err(err) => {
                 health.with_tracker(|t| t.record_transport_error(idx));
                 if err.code() == crate::ErrorCode::ProtocolVersionError {
                     latched_typed_error = Some(err.clone());
+                }
+                if let Some(events) = events {
+                    events.connect_attempt_failed(
+                        &endpoint.host,
+                        &endpoint.port,
+                        &err,
+                        events.next_attempt(),
+                    );
                 }
                 last_transport_endpoint_idx = Some(idx);
                 last_transport_err = Some(err);
@@ -2929,17 +2955,21 @@ pub(crate) fn connect_qwp_ws_endpoint_round<A: QwpWsHealthAccess>(
         return Err(err);
     }
     if let Some(err) = last_transport_err {
-        return Err(qwp_ws_all_endpoints_unreachable_error(
+        let err = qwp_ws_all_endpoints_unreachable_error(
             endpoints,
             last_transport_endpoint_idx,
             Some(err),
-        ));
+        );
+        if let Some(events) = events {
+            events.all_endpoints_unreachable(&err);
+        }
+        return Err(err);
     }
-    Err(qwp_ws_all_endpoints_unreachable_error(
-        endpoints,
-        last_transport_endpoint_idx,
-        None,
-    ))
+    let err = qwp_ws_all_endpoints_unreachable_error(endpoints, last_transport_endpoint_idx, None);
+    if let Some(events) = events {
+        events.all_endpoints_unreachable(&err);
+    }
+    Err(err)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3338,6 +3368,7 @@ fn connect_blocking_transport_with_retry(
             QwpWsConnectKind::Foreground,
             qwp_ws,
             auth_header.as_deref(),
+            None,
         ) {
             Ok(connected) => {
                 return Ok(BlockingQwpWsTransport::from_connected(

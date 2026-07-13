@@ -55,12 +55,13 @@ use std::ops::{Deref, DerefMut};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 #[cfg(feature = "_egress")]
 use crate::egress::Reader;
+use crate::ingress::conn_events;
 use crate::ingress::sender::is_candidate_orphan;
 use crate::ingress::sender::qwp_ws::QwpWsHostHealthTracker;
 use crate::ingress::{Buffer, Sender, SenderBuilder};
@@ -342,6 +343,11 @@ struct DbInner {
     /// senders do not adopt each other's live pool slots.
     managed_slot_exclusions: Vec<QwpWsManagedSlotExclusion>,
     pool_idle_timeout: Duration,
+    /// Optional connection lifecycle event source (dispatcher + attempt
+    /// counter + success-classification state). Set at most once via
+    /// [`QuestDb::set_connection_listener`]; every ingress pool connect
+    /// and transport-death return reports through it.
+    conn_events: OnceLock<conn_events::ConnectionEventSource>,
     state: Mutex<PoolState>,
     /// Always-direct column-sender pool, independent of `sf_dir`. Backs
     /// [`QuestDb::borrow_direct_column_sender`] (DataFrame ingestion). Lazy-init
@@ -982,6 +988,7 @@ impl QuestDb {
             row_cv: Condvar::new(),
             cv: Condvar::new(),
             shutdown: AtomicBool::new(false),
+            conn_events: OnceLock::new(),
         });
 
         preopen_recovery_senders(&inner);
@@ -1391,6 +1398,53 @@ impl QuestDb {
     /// their own cadence.
     pub fn reap_idle(&self) -> usize {
         reap_idle_inner(&self.inner)
+    }
+
+    /// Register a connection lifecycle listener for this pool's ingress
+    /// connections. Events (see
+    /// [`ConnectionEventKind`](crate::ingress::ConnectionEventKind)) are
+    /// delivered on a dedicated dispatcher thread through a bounded
+    /// inbox — a slow listener can never stall connect, publish, or
+    /// reconnect paths; on overflow the oldest undelivered event is
+    /// dropped (counted by [`Self::connection_events_dropped`]).
+    ///
+    /// `inbox_capacity == 0` selects the default (64). At most one
+    /// listener per pool; a second registration fails. Register before
+    /// the first borrow to observe the initial
+    /// [`Connected`](crate::ingress::ConnectionEventKind::Connected)
+    /// event.
+    pub fn set_connection_listener(
+        &self,
+        listener: crate::ingress::ConnectionListener,
+        inbox_capacity: usize,
+    ) -> Result<()> {
+        let source = conn_events::ConnectionEventSource::new(listener, inbox_capacity);
+        self.inner.conn_events.set(source).map_err(|_| {
+            crate::Error::new(
+                crate::ErrorCode::InvalidApiCall,
+                "a connection listener is already registered on this pool".to_string(),
+            )
+        })
+    }
+
+    /// Total connection events discarded by the listener inbox's
+    /// drop-oldest policy. `0` when no listener is registered.
+    pub fn connection_events_dropped(&self) -> u64 {
+        self.inner
+            .conn_events
+            .get()
+            .map(|events| events.dropped())
+            .unwrap_or(0)
+    }
+
+    /// Total connection events delivered to the listener. `0` when no
+    /// listener is registered.
+    pub fn connection_events_delivered(&self) -> u64 {
+        self.inner
+            .conn_events
+            .get()
+            .map(|events| events.delivered())
+            .unwrap_or(0)
     }
 
     /// Snapshot per-pool connection counts for diagnostics.
@@ -3043,7 +3097,9 @@ fn sleep_until_deadline(sleep_for: Duration, deadline: Option<Instant>) {
 /// `inner.health` (via [`record_sender_transport_failure`]) are not stalled
 /// behind one slow / black-holed connect.
 fn connect_conn_pool(inner: &Arc<DbInner>) -> Result<ColumnConn> {
-    let raw: RawQwpWsRoundStream = inner.connector.connect_round_pooled(&inner.health)?;
+    let raw: RawQwpWsRoundStream = inner
+        .connector
+        .connect_round_pooled(&inner.health, inner.conn_events.get())?;
     ColumnConn::from_round_stream(raw)
 }
 
@@ -3208,6 +3264,11 @@ fn record_sender_transport_failure(inner: &Arc<DbInner>, sender: &ColumnSender) 
     {
         lock_health(&inner.health)
             .record_mid_stream_failure(idx, Some(ReconnectReason::RetryableFailure));
+        if let Some(events) = inner.conn_events.get()
+            && let Some(endpoint) = inner.connector.endpoint(idx)
+        {
+            events.disconnected(&endpoint.host, &endpoint.port);
+        }
     }
 }
 

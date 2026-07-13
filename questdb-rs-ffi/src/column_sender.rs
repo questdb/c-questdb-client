@@ -32,7 +32,7 @@
 
 #![allow(non_upper_case_globals)]
 
-use libc::{c_char, size_t};
+use libc::{c_char, c_void, size_t};
 use std::slice;
 use std::str;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -49,8 +49,8 @@ use questdb::{Error, ErrorCode};
 #[cfg(feature = "arrow")]
 use crate::line_sender_column_name;
 use crate::{
-    line_sender_error, line_sender_qwpws_fsn, line_sender_table_name, questdb_error,
-    qwpws_ack_level_durable, qwpws_ack_level_ok, set_err_out_from_error,
+    line_sender_error, line_sender_error_code, line_sender_qwpws_fsn, line_sender_table_name,
+    questdb_error, qwpws_ack_level_durable, qwpws_ack_level_ok, set_err_out_from_error,
     set_err_out_from_error_with_qwpws,
 };
 
@@ -828,6 +828,193 @@ pub unsafe extern "C" fn questdb_db_reap_idle(db: *mut questdb_db) -> size_t {
     }
     let db_ref = unsafe { &*db };
     db_ref.0.reap_idle()
+}
+
+/// Connection lifecycle event kinds. Values mirror
+/// `questdb::ingress::ConnectionEventKind`.
+pub const questdb_connection_event_connected: u32 = 0;
+pub const questdb_connection_event_disconnected: u32 = 1;
+pub const questdb_connection_event_reconnected: u32 = 2;
+pub const questdb_connection_event_failed_over: u32 = 3;
+pub const questdb_connection_event_endpoint_attempt_failed: u32 = 4;
+pub const questdb_connection_event_all_endpoints_unreachable: u32 = 5;
+pub const questdb_connection_event_auth_failed: u32 = 6;
+
+/// One connection-state transition, delivered to a
+/// `questdb_connection_event_cb`. String fields are borrowed UTF-8
+/// slices valid only for the duration of the callback; absent strings
+/// are `NULL` with length `0`.
+#[repr(C)]
+pub struct questdb_connection_event {
+    /// One of the `questdb_connection_event_*` kind constants.
+    pub kind: u32,
+    pub host: *const c_char,
+    pub host_len: size_t,
+    pub port: *const c_char,
+    pub port_len: size_t,
+    pub previous_host: *const c_char,
+    pub previous_host_len: size_t,
+    pub previous_port: *const c_char,
+    pub previous_port_len: size_t,
+    pub has_attempt: bool,
+    pub attempt_number: u64,
+    pub has_cause: bool,
+    pub cause_code: line_sender_error_code,
+    pub cause_msg: *const c_char,
+    pub cause_msg_len: size_t,
+    /// Wall-clock time of the event, milliseconds since the Unix epoch.
+    pub timestamp_millis: i64,
+}
+
+/// Callback invoked on a dedicated dispatcher thread — never on an I/O
+/// or producer thread — once per connection event. The `event` pointer
+/// (and every string it references) is valid only for the duration of
+/// the call. The callback must not unwind.
+pub type questdb_connection_event_cb =
+    unsafe extern "C" fn(user_data: *mut c_void, event: *const questdb_connection_event);
+
+struct ConnectionEventCbHandle {
+    callback: questdb_connection_event_cb,
+    user_data: *mut c_void,
+}
+
+// The dispatcher thread invokes the callback; the caller promises
+// `user_data` is safe to use from that thread (documented contract,
+// same as `line_sender_opts_qwpws_error_handler`).
+unsafe impl Send for ConnectionEventCbHandle {}
+unsafe impl Sync for ConnectionEventCbHandle {}
+
+impl ConnectionEventCbHandle {
+    fn invoke(&self, view: &questdb_connection_event) {
+        unsafe { (self.callback)(self.user_data, view) };
+    }
+}
+
+fn str_or_null(value: Option<&str>) -> (*const c_char, size_t) {
+    match value {
+        Some(s) => (s.as_ptr() as *const c_char, s.len()),
+        None => (std::ptr::null(), 0),
+    }
+}
+
+/// Register a connection lifecycle listener on the pool. Events fire for
+/// every ingress pool connect (initial connect, per-endpoint attempt
+/// failures, all-endpoints-unreachable sweeps, failover to a different
+/// endpoint, terminal auth rejection) and for transport deaths observed
+/// when a connection is returned.
+///
+/// Delivery is via a bounded inbox (`inbox_capacity`; `0` = default 64)
+/// drained by a dedicated dispatcher thread: a slow callback cannot
+/// stall connects or publishing, and on overflow the oldest undelivered
+/// event is dropped. At most one listener per pool; a second
+/// registration fails with `line_sender_error_invalid_api_call`.
+/// Register before the first borrow to observe the initial `connected`
+/// event.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn questdb_db_set_connection_event_handler(
+    db: *mut questdb_db,
+    callback: questdb_connection_event_cb,
+    user_data: *mut c_void,
+    inbox_capacity: size_t,
+    err_out: *mut *mut line_sender_error,
+) -> bool {
+    if db.is_null() {
+        unsafe {
+            set_err_out_from_error(
+                err_out,
+                Error::new(
+                    ErrorCode::InvalidApiCall,
+                    "questdb_db_set_connection_event_handler: db pointer is NULL".to_string(),
+                ),
+            );
+        }
+        return false;
+    }
+    let handle = ConnectionEventCbHandle {
+        callback,
+        user_data,
+    };
+    let listener: questdb::ingress::ConnectionListener =
+        std::sync::Arc::new(move |event: &questdb::ingress::ConnectionEvent| {
+            let kind = match event.kind {
+                questdb::ingress::ConnectionEventKind::Connected => {
+                    questdb_connection_event_connected
+                }
+                questdb::ingress::ConnectionEventKind::Disconnected => {
+                    questdb_connection_event_disconnected
+                }
+                questdb::ingress::ConnectionEventKind::Reconnected => {
+                    questdb_connection_event_reconnected
+                }
+                questdb::ingress::ConnectionEventKind::FailedOver => {
+                    questdb_connection_event_failed_over
+                }
+                questdb::ingress::ConnectionEventKind::EndpointAttemptFailed => {
+                    questdb_connection_event_endpoint_attempt_failed
+                }
+                questdb::ingress::ConnectionEventKind::AllEndpointsUnreachable => {
+                    questdb_connection_event_all_endpoints_unreachable
+                }
+                questdb::ingress::ConnectionEventKind::AuthFailed => {
+                    questdb_connection_event_auth_failed
+                }
+                _ => return,
+            };
+            let (host, host_len) = str_or_null(event.host.as_deref());
+            let (port, port_len) = str_or_null(event.port.as_deref());
+            let (previous_host, previous_host_len) = str_or_null(event.previous_host.as_deref());
+            let (previous_port, previous_port_len) = str_or_null(event.previous_port.as_deref());
+            let (cause_msg, cause_msg_len) = str_or_null(event.cause_msg.as_deref());
+            let view = questdb_connection_event {
+                kind,
+                host,
+                host_len,
+                port,
+                port_len,
+                previous_host,
+                previous_host_len,
+                previous_port,
+                previous_port_len,
+                has_attempt: event.attempt_number.is_some(),
+                attempt_number: event.attempt_number.unwrap_or(0),
+                has_cause: event.cause_code.is_some(),
+                cause_code: event.cause_code.unwrap_or(ErrorCode::InvalidApiCall).into(),
+                cause_msg,
+                cause_msg_len,
+                timestamp_millis: event.timestamp_millis,
+            };
+            handle.invoke(&view);
+        });
+    let db_ref = unsafe { &*db };
+    match db_ref.0.set_connection_listener(listener, inbox_capacity) {
+        Ok(()) => true,
+        Err(err) => {
+            unsafe { set_err_out_from_error(err_out, err) };
+            false
+        }
+    }
+}
+
+/// Total connection events discarded by the listener inbox's drop-oldest
+/// policy. `0` for a NULL `db` or when no listener is registered.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn questdb_db_connection_events_dropped(db: *const questdb_db) -> u64 {
+    if db.is_null() {
+        return 0;
+    }
+    let db_ref = unsafe { &*db };
+    db_ref.0.connection_events_dropped()
+}
+
+/// Total connection events delivered to the listener. `0` for a NULL
+/// `db` or when no listener is registered.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn questdb_db_connection_events_delivered(db: *const questdb_db) -> u64 {
+    if db.is_null() {
+        return 0;
+    }
+    let db_ref = unsafe { &*db };
+    db_ref.0.connection_events_delivered()
 }
 
 /// Per-pool connection counts, mirroring `questdb::DbgPoolCount`. Diagnostics
