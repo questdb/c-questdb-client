@@ -450,13 +450,11 @@ pub fn run_column_leg(cfg: &LegConfig) -> LegResult {
     }
 
     let rows_acked = journal.watermark().map_or(0, |w| w + 1);
-    stats.emit(
-        &db,
-        rows_sent,
-        rows_acked,
-        sender.published_fsn().ok().flatten(),
-        sender.acked_fsn().ok().flatten(),
-    )?;
+    let published = sender.published_fsn().ok().flatten();
+    let acked = sender.acked_fsn().ok().flatten();
+    // Release the sender so the final quiesce sample sees the pool drained (I4).
+    drop(sender);
+    stats.emit(&db, rows_sent, rows_acked, published, acked)?;
     Ok(())
 }
 

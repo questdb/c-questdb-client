@@ -171,13 +171,11 @@ fn run_row_leg(cfg: &LegConfig) -> LegResult {
     // baseline (I4) and the final watermark (I1).
     let _ = row.wait(AckLevel::Ok, Duration::from_secs(60));
     let rows_acked = journal.watermark().map_or(0, |w| w + 1);
-    stats.emit(
-        &db,
-        rows_sent,
-        rows_acked,
-        row.published_fsn().ok().flatten(),
-        row.acked_fsn().ok().flatten(),
-    )?;
+    let published = row.published_fsn().ok().flatten();
+    let acked = row.acked_fsn().ok().flatten();
+    // Release the sender so the final quiesce sample sees the pool drained (I4).
+    drop(row);
+    stats.emit(&db, rows_sent, rows_acked, published, acked)?;
     Ok(())
 }
 
