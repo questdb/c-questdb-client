@@ -128,16 +128,28 @@ struct DispatcherInner {
     delivered: AtomicU64,
 }
 
+impl DispatcherInner {
+    fn lock_inbox(&self) -> std::sync::MutexGuard<'_, VecDeque<ConnectionEvent>> {
+        match self.inbox.lock() {
+            Ok(inbox) => inbox,
+            Err(poisoned) => poisoned.into_inner(),
+        }
+    }
+}
+
 /// Bounded inbox plus a dedicated dispatcher thread delivering
 /// [`ConnectionEvent`]s to one [`ConnectionListener`].
 ///
 /// `offer` never blocks: when the inbox is full the oldest undelivered
 /// event is discarded (drop-oldest) and counted in [`Self::dropped`].
-/// Dropping the dispatcher signals the thread to drain and exit; the
-/// thread is detached, so a listener blocked forever leaks the thread
-/// rather than hanging the owner's drop.
+/// Dropping the dispatcher discards undelivered events and **joins** the
+/// dispatcher thread, waiting for at most the one in-flight listener
+/// invocation — after drop returns, the listener is guaranteed to never
+/// run again, so FFI callers may release listener resources (e.g. a
+/// Python callable behind `user_data`) immediately afterwards.
 pub struct ConnectionEventDispatcher {
     inner: Arc<DispatcherInner>,
+    thread: Option<std::thread::JoinHandle<()>>,
 }
 
 impl ConnectionEventDispatcher {
@@ -157,14 +169,18 @@ impl ConnectionEventDispatcher {
             delivered: AtomicU64::new(0),
         });
         let thread_inner = Arc::clone(&inner);
-        let spawned = std::thread::Builder::new()
+        let thread = match std::thread::Builder::new()
             .name("questdb-conn-events".to_string())
-            .spawn(move || dispatch_loop(thread_inner));
-        if let Err(err) = spawned {
-            log::warn!("connection-event dispatcher thread failed to spawn: {err}");
-            inner.closed.store(true, Ordering::Release);
-        }
-        Self { inner }
+            .spawn(move || dispatch_loop(thread_inner))
+        {
+            Ok(handle) => Some(handle),
+            Err(err) => {
+                log::warn!("connection-event dispatcher thread failed to spawn: {err}");
+                inner.closed.store(true, Ordering::Release);
+                None
+            }
+        };
+        Self { inner, thread }
     }
 
     /// Queue one event for delivery. Non-blocking; drop-oldest on a full
@@ -175,10 +191,7 @@ impl ConnectionEventDispatcher {
             return;
         }
         {
-            let mut inbox = match self.inner.inbox.lock() {
-                Ok(inbox) => inbox,
-                Err(poisoned) => poisoned.into_inner(),
-            };
+            let mut inbox = self.inner.lock_inbox();
             if inbox.len() >= self.inner.capacity {
                 inbox.pop_front();
                 self.inner.dropped.fetch_add(1, Ordering::Relaxed);
@@ -205,22 +218,32 @@ impl Drop for ConnectionEventDispatcher {
     fn drop(&mut self) {
         self.inner.closed.store(true, Ordering::Release);
         self.inner.available.notify_one();
+        if let Some(handle) = self.thread.take()
+            && handle.thread().id() != std::thread::current().id()
+        {
+            let _ = handle.join();
+        }
     }
 }
 
 fn dispatch_loop(inner: Arc<DispatcherInner>) {
     loop {
         let event = {
-            let mut inbox = match inner.inbox.lock() {
-                Ok(inbox) => inbox,
-                Err(poisoned) => poisoned.into_inner(),
-            };
+            let mut inbox = inner.lock_inbox();
             loop {
+                // Once closed, discard the backlog (counted as dropped)
+                // so the joining drop waits for at most the in-flight
+                // listener invocation, not the whole queue.
+                if inner.closed.load(Ordering::Acquire) {
+                    let discarded = inbox.len() as u64;
+                    if discarded > 0 {
+                        inbox.clear();
+                        inner.dropped.fetch_add(discarded, Ordering::Relaxed);
+                    }
+                    break None;
+                }
                 if let Some(event) = inbox.pop_front() {
                     break Some(event);
-                }
-                if inner.closed.load(Ordering::Acquire) {
-                    break None;
                 }
                 inbox = match inner.available.wait(inbox) {
                     Ok(inbox) => inbox,
@@ -447,6 +470,53 @@ mod tests {
         dispatcher.offer(ConnectionEvent::new(ConnectionEventKind::Reconnected).attempt(1));
         wait_for(|| dispatcher.delivered() == 2);
         assert_eq!(*seen.lock().unwrap(), vec![1]);
+    }
+
+    #[test]
+    fn drop_joins_in_flight_delivery_and_discards_backlog() {
+        // FFI callers (e.g. the Python binding) release listener
+        // resources right after the owning pool closes; drop() must
+        // therefore wait for the in-flight invocation and guarantee no
+        // delivery ever runs afterwards.
+        let release = Arc::new(AtomicBool::new(false));
+        let delivered_after_drop = Arc::new(AtomicBool::new(false));
+        let dropped_flag = Arc::new(AtomicBool::new(false));
+        let release_in_listener = Arc::clone(&release);
+        let delivered_after_drop_in_listener = Arc::clone(&delivered_after_drop);
+        let dropped_flag_in_listener = Arc::clone(&dropped_flag);
+        let dispatcher = ConnectionEventDispatcher::new(
+            Arc::new(move |_: &ConnectionEvent| {
+                while !release_in_listener.load(Ordering::Acquire) {
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                if dropped_flag_in_listener.load(Ordering::Acquire) {
+                    delivered_after_drop_in_listener.store(true, Ordering::Release);
+                }
+            }),
+            8,
+        );
+        dispatcher.offer(ConnectionEvent::new(ConnectionEventKind::Connected).attempt(0));
+        wait_for(|| dispatcher.inner.inbox.lock().unwrap().is_empty());
+        // Backlog behind the stalled in-flight event: must be discarded.
+        for attempt in 1..=3u64 {
+            dispatcher
+                .offer(ConnectionEvent::new(ConnectionEventKind::Disconnected).attempt(attempt));
+        }
+        let inner = Arc::clone(&dispatcher.inner);
+        let releaser = {
+            let release = Arc::clone(&release);
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(100));
+                release.store(true, Ordering::Release);
+            })
+        };
+        drop(dispatcher);
+        dropped_flag.store(true, Ordering::Release);
+        releaser.join().unwrap();
+        std::thread::sleep(Duration::from_millis(50));
+        assert!(!delivered_after_drop.load(Ordering::Acquire));
+        assert_eq!(inner.delivered.load(Ordering::Relaxed), 1);
+        assert_eq!(inner.dropped.load(Ordering::Relaxed), 3);
     }
 
     #[test]
