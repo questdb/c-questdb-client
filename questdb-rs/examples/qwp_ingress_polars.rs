@@ -323,28 +323,55 @@ fn measure_encode_floor(
     Ok((wall, cpu))
 }
 
-/// e2e: time `flush_polars_dataframe()` against the real server. Each
-/// iteration re-flushes the whole frame (DEDUP UPSERT KEYS(ts) folds the
-/// repeats, so `count() == rows` holds regardless of iteration count).
-fn measure_e2e(
-    db: &QuestDb,
+/// e2e over `dbs.len()` parallel connections: thread k flushes its
+/// pre-sliced DataFrame view (zero-copy `df.slice`) through its own pooled
+/// connection. `PolarsIngestOptions` borrows a `ColumnName`, so each thread
+/// builds its own options — negligible next to a 10M-row flush.
+fn e2e_pass(
+    dbs: &[QuestDb],
     table: &str,
-    df: &DataFrame,
-    opts: &PolarsIngestOptions<'_>,
+    slices: &[DataFrame],
+    max_batch_rows: usize,
+) -> Result<(), Box<dyn Error>> {
+    std::thread::scope(|scope| -> Result<(), String> {
+        let handles: Vec<_> = dbs
+            .iter()
+            .zip(slices)
+            .map(|(db, df)| {
+                scope.spawn(move || -> Result<(), String> {
+                    let ts_col = ColumnName::new("ts").map_err(|e| e.to_string())?;
+                    let opts = PolarsIngestOptions::new()
+                        .max_rows(max_batch_rows)
+                        .timestamp_column(ts_col);
+                    db.flush_polars_dataframe(table, df, &opts)
+                        .map_err(|e| e.to_string())?;
+                    Ok(())
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().map_err(|_| "sender thread panicked".to_string())??;
+        }
+        Ok(())
+    })?;
+    Ok(())
+}
+
+fn measure_e2e(
+    dbs: &[QuestDb],
+    table: &str,
+    slices: &[DataFrame],
+    max_batch_rows: usize,
     iterations: usize,
     warmups: usize,
 ) -> Result<(Vec<u64>, Vec<u64>), Box<dyn Error>> {
-    let mut run = || -> Result<(), Box<dyn Error>> {
-        db.flush_polars_dataframe(table, df, opts)?;
-        Ok(())
-    };
     for _ in 0..warmups {
-        run()?;
+        e2e_pass(dbs, table, slices, max_batch_rows)?;
     }
     let mut wall = Vec::with_capacity(iterations);
     let mut cpu = Vec::with_capacity(iterations);
     for _ in 0..iterations {
-        let (w, c, r) = timed(&mut run);
+        let (w, c, r) = timed(&mut || e2e_pass(dbs, table, slices, max_batch_rows));
         r?;
         wall.push(w);
         cpu.push(c);
@@ -418,6 +445,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     let iterations: usize = env_usize("ITERATIONS", 5);
     let warmups: usize = env_usize("WARMUPS", 2);
     let max_batch_rows: usize = env_usize("MAX_BATCH_ROWS", 10_000);
+    let senders_n: usize = env_usize("SENDERS", 1).max(1);
     let run_mode = std::env::var("RUN_MODE").unwrap_or_else(|_| "full".into());
     let host = std::env::var("QDB_HOST").unwrap_or_else(|_| "127.0.0.1".into());
     let port: u16 = env_usize("QDB_PORT", 9000) as u16;
@@ -426,7 +454,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     eprintln!(
         "[qwp_ingress_polars] schema={} rows={rows} columns={columns} sym_card={sym_card} \
          varchar_len={varchar_len} hi_sym_card={hi_sym_card} iterations={iterations} \
-         warmups={warmups} max_batch_rows={max_batch_rows}",
+         warmups={warmups} max_batch_rows={max_batch_rows} senders={senders_n}",
         kind.name()
     );
 
@@ -445,6 +473,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     report.warmups = warmups;
     report.wire_bytes = wire_bytes;
     report.env = Env::collect(&[]);
+    report.senders = senders_n;
 
     // --- Encode floor (no network). ---
     eprintln!("[qwp_ingress_polars] measuring encode floor ...");
@@ -477,14 +506,22 @@ fn main() -> Result<(), Box<dyn Error>> {
 
         let conf =
             format!("ws::addr={host}:{port};sender_pool_min=1;sender_pool_max=1;pool_reap=manual;");
-        let db = QuestDb::connect(&conf)?;
-        let ts_col = ColumnName::new("ts")?;
-        let opts = PolarsIngestOptions::new()
-            .max_rows(max_batch_rows)
-            .timestamp_column(ts_col);
+        let dbs: Vec<QuestDb> = (0..senders_n)
+            .map(|_| QuestDb::connect(&conf))
+            .collect::<Result<_, _>>()?;
+        let ranges = bench_schema::sender_ranges(rows, senders_n);
+        // Zero-copy views: `DataFrame::slice` shares the Arc'd buffers, so
+        // per-sender slices add no staging cost or memory.
+        let slices: Vec<DataFrame> = ranges
+            .iter()
+            .map(|&(lo, hi)| df.slice(lo as i64, hi - lo))
+            .collect();
 
-        eprintln!("[qwp_ingress_polars] measuring flush_polars_dataframe e2e ...");
-        let (e2e_wall, e2e_cpu) = measure_e2e(&db, table, &df, &opts, iterations, warmups)?;
+        eprintln!(
+            "[qwp_ingress_polars] measuring flush_polars_dataframe e2e ({senders_n} sender(s)) ..."
+        );
+        let (e2e_wall, e2e_cpu) =
+            measure_e2e(&dbs, table, &slices, max_batch_rows, iterations, warmups)?;
         report.add_path(
             "flush-polars-dataframe",
             PathSummary::new(
