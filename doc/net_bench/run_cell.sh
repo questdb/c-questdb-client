@@ -6,7 +6,7 @@
 #   ./run_cell.sh --label p1-s1-ingress \
 #       --schema s1-narrow --direction ingress --rows 10000000 \
 #       [--rate 2.5gbit] [--rtt-ms 5] [--recv-buf 16m] \
-#       [--iterations 5] [--warmups 2] [--max-batch-rows 10000] [--skip-populate] \
+#       [--iterations 5] [--warmups 2] [--max-batch-rows 10000] [--senders N] [--skip-populate] \
 #       [--client rust|rust-row|c|java]
 #
 # direction: ingress | egress   (egress with --skip-populate reuses the table
@@ -19,7 +19,7 @@ cd "$(dirname "$0")"
 
 LABEL="" SCHEMA="s1-narrow" DIRECTION="ingress" ROWS=10000000
 RATE="" RTT_MS="" RECV_BUF="16m" ITERATIONS=5 WARMUPS=2 MAX_BATCH_ROWS=10000
-SKIP_POPULATE=0 CLIENT_KIND=rust
+SKIP_POPULATE=0 CLIENT_KIND=rust SENDERS=1
 while [ $# -gt 0 ]; do
     case "$1" in
         --label) LABEL="$2"; shift 2 ;;
@@ -32,12 +32,14 @@ while [ $# -gt 0 ]; do
         --iterations) ITERATIONS="$2"; shift 2 ;;
         --warmups) WARMUPS="$2"; shift 2 ;;
         --max-batch-rows) MAX_BATCH_ROWS="$2"; shift 2 ;;
+        --senders) SENDERS="$2"; shift 2 ;;
         --skip-populate) SKIP_POPULATE=1; shift ;;
         --client) CLIENT_KIND="$2"; shift 2 ;;
         *) echo "unknown arg $1" >&2; exit 1 ;;
     esac
 done
 case "$CLIENT_KIND" in rust|rust-row|c|java) ;; *) echo "unknown --client '$CLIENT_KIND' (rust|rust-row|c|java)" >&2; exit 1 ;; esac
+case "$SENDERS" in ''|0|*[!0-9]*) echo "--senders wants a positive integer" >&2; exit 1 ;; esac
 [ -n "$LABEL" ] || { echo "--label required" >&2; exit 1; }
 
 SERVER_ID=$(qnb_instance_id server); CLIENT_ID=$(qnb_instance_id client)
@@ -68,9 +70,9 @@ for box in server client; do
 nohup sar -o $OUT_BOX/sar-$box.bin 1 >/dev/null 2>&1 & echo sar started"
 done
 
-echo "== bench ($CLIENT_KIND, $DIRECTION, $SCHEMA, ${ROWS} rows, it=$ITERATIONS/wu=$WARMUPS)"
+echo "== bench ($CLIENT_KIND, $DIRECTION, $SCHEMA, ${ROWS} rows, it=$ITERATIONS/wu=$WARMUPS, senders=$SENDERS)"
 BENCH_ENV="SCHEMA=$SCHEMA ROWS=$ROWS ITERATIONS=$ITERATIONS WARMUPS=$WARMUPS \
-MAX_BATCH_ROWS=$MAX_BATCH_ROWS QDB_HOST=$SERVER_IP QDB_PORT=9000"
+MAX_BATCH_ROWS=$MAX_BATCH_ROWS QDB_HOST=$SERVER_IP QDB_PORT=9000 SENDERS=$SENDERS"
 [ "$SKIP_POPULATE" = "1" ] && BENCH_ENV="$BENCH_ENV SKIP_POPULATE=1"
 JAVA_ENV_EXPORT=""
 if [ "$CLIENT_KIND" = "c" ]; then
@@ -112,9 +114,9 @@ jq -n \
     --arg recv "$RECV_BUF" --arg rows "$ROWS" \
     --arg itype "$QNB_INSTANCE_TYPE" --arg iperf "$IPERF_NOTE" \
     --arg qdb "$QNB_QUESTDB_COMMIT" --arg cc "$QNB_C_CLIENT_COMMIT" \
-    --arg py "$QNB_PY_CLIENT_COMMIT" --arg ck "$CLIENT_KIND" \
+    --arg py "$QNB_PY_CLIENT_COMMIT" --arg ck "$CLIENT_KIND" --arg senders "$SENDERS" \
     '{cell: $cell, schema: $schema, direction: $direction, rows: ($rows|tonumber),
-      client_kind: $ck,
+      client_kind: $ck, senders: ($senders|tonumber),
       channel: {rate: $rate, rtt_ms: $rtt, placement_group: true, iperf3: $iperf},
       server: {instance_type: $itype, questdb_commit: $qdb,
                recv_buffer: $recv, data_dir: "tmpfs"},

@@ -41,6 +41,18 @@ cd doc/net_bench
 # rust client; ingress only):
 ./run_cell.sh --client rust-row --label p1-s2-ingress-rustrow --schema s2-wide --direction ingress --rows 10000000
 
+# Multi-sender mode: the --senders N flag (default 1) distributes ingress load across N
+# parallel e2e senders in parallel threads. Each sender k of N ingests a disjoint range
+# [ROWS*k/N, ROWS*(k+1)/N) into the same table over its own connection. Follows the
+# server repo's LineTCPSenderMain precedent with one deliberate deviation: the fixed
+# ROWS total is split into disjoint contiguous ranges instead of sending a fixed count
+# per thread, so the parity aggregates and the count() == ROWS gate stay byte-identical
+# for every N. Checkpoint cadence (ack every 64 batches + final ack) applies per sender.
+# Connections are created outside the timed region. Reported as a top-level "senders"
+# key in the bench JSON and cell sidecar.
+./run_cell.sh --label p3-s2-ingress-java-x4 --schema s2-wide --direction ingress --client java --senders 4
+./run_cell.sh --label p3-s2-ingress-rustrow-x4 --schema s2-wide --direction ingress --client rust-row --senders 4
+
 # ENT server axis (image ref from internal docs; instance role handles ECR auth;
 # built-in admin is enabled — note the harness conf strings need auth support first):
 ./ssmx.sh run server "qdb-server use-ent <registry>/questdb:<ver>-enterprise"
@@ -53,6 +65,10 @@ cd doc/net_bench
 
 ## Notes
 
+- **SENDERS (default 1)** — parallel e2e senders for ingress benches; sender k of N
+  ingests global rows [ROWS*k/N, ROWS*(k+1)/N) over its own connection into the
+  same table. Floor paths stay single-threaded. Reported as a top-level
+  "senders" key in the bench JSON and in the cell sidecar.
 - **Nothing survives teardown** except (optionally) the S3 results bucket —
   sync down what you need first; the final tag audit must print an empty list.
 - Access is SSM-only (no SSH keys, no inbound rules). `./ssmx.sh shell <server|client>`
