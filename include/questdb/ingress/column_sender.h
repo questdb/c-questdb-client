@@ -1508,6 +1508,19 @@ bool column_sender_chunk_at_now(
     column_sender_chunk* chunk,
     line_sender_error** err_out);
 
+/** Pin one scalar nanosecond-precision Unix epoch timestamp as every
+ * row's designated timestamp, encoded as a repeated constant (wire type
+ * TIMESTAMP_NANOS, 0x10). Unlike `column_sender_chunk_at_now` the value
+ * is fixed at the caller, so resubmission is idempotent under
+ * DEDUP UPSERT KEYS. Rejects negative (pre-epoch) values and any
+ * already-set designated timestamp. Cleared by
+ * `column_sender_chunk_clear`. */
+QUESTDB_CLIENT_API
+bool column_sender_chunk_at_scalar_nanos(
+    column_sender_chunk* chunk,
+    int64_t nanos,
+    line_sender_error** err_out);
+
 /* -------------------------------------------------------------------------
  * Flush / sync
  *
@@ -1831,6 +1844,25 @@ bool direct_column_sender_flush_arrow_batch_at_column(
     struct ArrowArray* array,
     const struct ArrowSchema* schema,
     line_sender_column_name ts_column,
+    const column_sender_arrow_override* overrides,
+    size_t overrides_len,
+    line_sender_error** err_out);
+
+/**
+ * `direct_column_sender_flush_arrow_batch_at_now` with one scalar
+ * nanosecond-precision Unix epoch timestamp as every row's designated
+ * timestamp, encoded as a repeated constant. Unlike `_at_now` the value is
+ * fixed at the caller, so resubmission is idempotent under DEDUP UPSERT
+ * KEYS. Rejects negative (pre-epoch) values. Same ownership and
+ * `overrides` contract.
+ */
+QUESTDB_CLIENT_API
+bool direct_column_sender_flush_arrow_batch_at_scalar_nanos(
+    direct_column_sender* sender,
+    line_sender_table_name table,
+    struct ArrowArray* array,
+    const struct ArrowSchema* schema,
+    int64_t at_nanos,
     const column_sender_arrow_override* overrides,
     size_t overrides_len,
     line_sender_error** err_out);

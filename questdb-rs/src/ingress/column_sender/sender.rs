@@ -47,7 +47,7 @@ use crate::ingress::{ColumnName, TableName};
 use crate::{Result, error};
 
 #[cfg(feature = "arrow-ingress")]
-use super::arrow_batch::{self, ArrowColumnOverride};
+use super::arrow_batch::{self, ArrowColumnOverride, ArrowTsSource};
 use super::chunk::Chunk;
 use super::conn::{ColumnConn, PublishError};
 use super::encoder;
@@ -94,8 +94,7 @@ enum SfaOutcome {
 struct ArrowFrameSpec<'a> {
     table: TableName<'a>,
     batch: &'a RecordBatch,
-    ts_col_idx: Option<usize>,
-    server_stamp: bool,
+    ts: ArrowTsSource,
     overrides: &'a [ArrowColumnOverride<'a>],
 }
 
@@ -541,8 +540,14 @@ impl ColumnSender {
         crate::Error: From<T::Error>,
     {
         let table: TableName<'t> = table.try_into()?;
-        self.flush_arrow_batch_dispatch(table, batch, None, true, overrides, WaitForAck::No)
-            .map_err(FlushFailure::into_error)
+        self.flush_arrow_batch_dispatch(
+            table,
+            batch,
+            ArrowTsSource::ServerNow,
+            overrides,
+            WaitForAck::No,
+        )
+        .map_err(FlushFailure::into_error)
     }
 
     /// Store-and-forward only: Arrow counterpart of [`Self::flush_and_get_fsn`]
@@ -559,7 +564,7 @@ impl ColumnSender {
         crate::Error: From<T::Error>,
     {
         let table: TableName<'t> = table.try_into()?;
-        self.flush_arrow_batch_dispatch_get_fsn(table, batch, None, true, overrides)
+        self.flush_arrow_batch_dispatch_get_fsn(table, batch, ArrowTsSource::ServerNow, overrides)
             .map_err(FlushFailure::into_error)
     }
 
@@ -582,8 +587,7 @@ impl ColumnSender {
         self.flush_arrow_batch_dispatch(
             table,
             batch,
-            None,
-            true,
+            ArrowTsSource::ServerNow,
             overrides,
             WaitForAck::Yes(ack_level),
         )
@@ -612,8 +616,36 @@ impl ColumnSender {
         self.flush_arrow_batch_dispatch(
             table,
             batch,
-            Some(ts_col_idx),
-            false,
+            ArrowTsSource::Column(ts_col_idx),
+            overrides,
+            WaitForAck::No,
+        )
+        .map_err(FlushFailure::into_error)
+    }
+
+    /// Encode and publish an Arrow [`RecordBatch`] with one scalar
+    /// nanosecond-precision Unix epoch timestamp as every row's designated
+    /// timestamp, encoded as a repeated constant. Unlike
+    /// [`Self::flush_arrow_batch_at_now`] the value is fixed at the caller,
+    /// so resubmission is idempotent under `DEDUP UPSERT KEYS`. Rejects
+    /// negative (pre-epoch) values.
+    #[cfg(feature = "arrow-ingress")]
+    pub fn flush_arrow_batch_at_scalar_nanos<'t, T>(
+        &mut self,
+        table: T,
+        batch: &RecordBatch,
+        nanos: i64,
+        overrides: &[ArrowColumnOverride<'_>],
+    ) -> Result<()>
+    where
+        T: TryInto<TableName<'t>>,
+        crate::Error: From<T::Error>,
+    {
+        let table: TableName<'t> = table.try_into()?;
+        self.flush_arrow_batch_dispatch(
+            table,
+            batch,
+            ArrowTsSource::ScalarNanos(nanos),
             overrides,
             WaitForAck::No,
         )
@@ -636,8 +668,13 @@ impl ColumnSender {
     {
         let table: TableName<'t> = table.try_into()?;
         let ts_col_idx = arrow_batch::resolve_ts_column(batch, ts_column)?;
-        self.flush_arrow_batch_dispatch_get_fsn(table, batch, Some(ts_col_idx), false, overrides)
-            .map_err(FlushFailure::into_error)
+        self.flush_arrow_batch_dispatch_get_fsn(
+            table,
+            batch,
+            ArrowTsSource::Column(ts_col_idx),
+            overrides,
+        )
+        .map_err(FlushFailure::into_error)
     }
 
     /// ACKing counterpart of [`Self::flush_arrow_batch_at_column`]: publish
@@ -661,8 +698,7 @@ impl ColumnSender {
         self.flush_arrow_batch_dispatch(
             table,
             batch,
-            Some(ts_col_idx),
-            false,
+            ArrowTsSource::Column(ts_col_idx),
             overrides,
             WaitForAck::Yes(ack_level),
         )
@@ -675,22 +711,16 @@ impl ColumnSender {
         &mut self,
         table: TableName<'_>,
         batch: &RecordBatch,
-        ts_col_idx: Option<usize>,
-        server_stamp: bool,
+        ts: ArrowTsSource,
         overrides: &[ArrowColumnOverride<'_>],
         wait: WaitForAck,
     ) -> std::result::Result<(), FlushFailure> {
         match &mut self.backend {
-            ColumnSenderBackend::Direct(direct) => direct.flush_arrow_batch_inner(
-                table,
-                batch,
-                ts_col_idx,
-                server_stamp,
-                overrides,
-                wait,
-            ),
+            ColumnSenderBackend::Direct(direct) => {
+                direct.flush_arrow_batch_inner(table, batch, ts, overrides, wait)
+            }
             ColumnSenderBackend::StoreAndForward(sfa) => {
-                sfa.flush_arrow_batch(table, batch, ts_col_idx, server_stamp, overrides, wait)
+                sfa.flush_arrow_batch(table, batch, ts, overrides, wait)
             }
         }
     }
@@ -700,13 +730,12 @@ impl ColumnSender {
         &mut self,
         table: TableName<'_>,
         batch: &RecordBatch,
-        ts_col_idx: Option<usize>,
-        server_stamp: bool,
+        ts: ArrowTsSource,
         overrides: &[ArrowColumnOverride<'_>],
     ) -> std::result::Result<Option<u64>, FlushFailure> {
         match &mut self.backend {
             ColumnSenderBackend::StoreAndForward(sfa) => sfa
-                .flush_arrow_batch_and_get_fsn(table, batch, ts_col_idx, server_stamp, overrides)
+                .flush_arrow_batch_and_get_fsn(table, batch, ts, overrides)
                 .map(Some),
             ColumnSenderBackend::Direct(_) => Err(FlushFailure::NotDelivered(error::fmt!(
                 InvalidApiCall,
@@ -742,8 +771,7 @@ impl ColumnSender {
         self.flush_arrow_batch_dispatch(
             table,
             batch,
-            None,
-            true,
+            ArrowTsSource::ServerNow,
             overrides,
             WaitForAck::Yes(ack_level),
         )
@@ -767,8 +795,7 @@ impl ColumnSender {
         self.flush_arrow_batch_dispatch(
             table,
             batch,
-            Some(ts_col_idx),
-            false,
+            ArrowTsSource::Column(ts_col_idx),
             overrides,
             WaitForAck::Yes(ack_level),
         )
@@ -1041,8 +1068,7 @@ impl DirectColumnBackend {
         &mut self,
         table: TableName<'_>,
         batch: &RecordBatch,
-        ts_col_idx: Option<usize>,
-        server_stamp: bool,
+        ts: ArrowTsSource,
         overrides: &[ArrowColumnOverride<'_>],
         wait: WaitForAck,
     ) -> std::result::Result<(), FlushFailure> {
@@ -1061,8 +1087,7 @@ impl DirectColumnBackend {
         let spec = ArrowFrameSpec {
             table,
             batch,
-            ts_col_idx,
-            server_stamp,
+            ts,
             overrides,
         };
         // Whole-batch fast path; split the row range only when a single frame
@@ -1150,8 +1175,7 @@ impl DirectColumnBackend {
                 out,
                 spec.table,
                 batch,
-                spec.ts_col_idx,
-                spec.server_stamp,
+                spec.ts,
                 spec.overrides,
                 &mut self.symbol_dict,
                 defer_commit,
@@ -1567,12 +1591,11 @@ impl SfaColumnBackend {
         &mut self,
         table: TableName<'_>,
         batch: &RecordBatch,
-        ts_col_idx: Option<usize>,
-        server_stamp: bool,
+        ts: ArrowTsSource,
         overrides: &[ArrowColumnOverride<'_>],
         wait: WaitForAck,
     ) -> std::result::Result<(), FlushFailure> {
-        self.flush_arrow_batch_boundary(table, batch, ts_col_idx, server_stamp, overrides, wait)
+        self.flush_arrow_batch_boundary(table, batch, ts, overrides, wait)
             .map(|_| ())
     }
 
@@ -1581,18 +1604,10 @@ impl SfaColumnBackend {
         &mut self,
         table: TableName<'_>,
         batch: &RecordBatch,
-        ts_col_idx: Option<usize>,
-        server_stamp: bool,
+        ts: ArrowTsSource,
         overrides: &[ArrowColumnOverride<'_>],
     ) -> std::result::Result<u64, FlushFailure> {
-        self.flush_arrow_batch_boundary(
-            table,
-            batch,
-            ts_col_idx,
-            server_stamp,
-            overrides,
-            WaitForAck::No,
-        )
+        self.flush_arrow_batch_boundary(table, batch, ts, overrides, WaitForAck::No)
     }
 
     #[cfg(feature = "arrow-ingress")]
@@ -1600,8 +1615,7 @@ impl SfaColumnBackend {
         &mut self,
         table: TableName<'_>,
         batch: &RecordBatch,
-        ts_col_idx: Option<usize>,
-        server_stamp: bool,
+        ts: ArrowTsSource,
         overrides: &[ArrowColumnOverride<'_>],
         wait: WaitForAck,
     ) -> std::result::Result<u64, FlushFailure> {
@@ -1616,8 +1630,7 @@ impl SfaColumnBackend {
         let spec = ArrowFrameSpec {
             table,
             batch,
-            ts_col_idx,
-            server_stamp,
+            ts,
             overrides,
         };
         // Whole-batch fast path; split into self-sufficient frames only when one
@@ -1669,8 +1682,7 @@ impl SfaColumnBackend {
                 &mut self.payload,
                 spec.table,
                 batch,
-                spec.ts_col_idx,
-                spec.server_stamp,
+                spec.ts,
                 spec.overrides,
                 &mut self.symbol_dict,
                 false,
@@ -1680,8 +1692,7 @@ impl SfaColumnBackend {
                 &mut self.payload,
                 spec.table,
                 batch,
-                spec.ts_col_idx,
-                spec.server_stamp,
+                spec.ts,
                 spec.overrides,
                 &mut self.symbol_dict,
             )

@@ -533,11 +533,17 @@ impl ColumnKind {
 }
 
 impl DesignatedTsDescriptor {
-    /// SAFETY: the source buffer must cover `row_offset` rows and still be alive.
+    /// SAFETY: a column source buffer must cover `row_offset` rows and still
+    /// be alive.
     unsafe fn slice_rows(&self, row_offset: usize) -> Self {
         Self {
             unit: self.unit,
-            data: unsafe { self.data.add(row_offset) },
+            data: match self.data {
+                DesignatedTsData::Column(ptr) => {
+                    DesignatedTsData::Column(unsafe { ptr.add(row_offset) })
+                }
+                DesignatedTsData::Scalar(value) => DesignatedTsData::Scalar(value),
+            },
         }
     }
 }
@@ -579,11 +585,19 @@ impl DesignatedTsUnit {
     }
 }
 
+/// Designated timestamp source: a borrowed per-row column, or one scalar
+/// shared by every row (encoded as a repeated constant on the wire).
+#[derive(Clone, Copy)]
+pub(crate) enum DesignatedTsData {
+    Column(*const i64),
+    Scalar(i64),
+}
+
 /// Designated timestamp descriptor. Required exactly once per chunk
 /// before flush. Designated timestamps are non-null by spec.
 pub(crate) struct DesignatedTsDescriptor {
     pub(crate) unit: DesignatedTsUnit,
-    pub(crate) data: *const i64,
+    pub(crate) data: DesignatedTsData,
 }
 
 // ===========================================================================
@@ -1399,6 +1413,41 @@ impl<'a> Chunk<'a> {
         Ok(self)
     }
 
+    /// Pin one scalar nanosecond-precision Unix epoch timestamp as the
+    /// designated timestamp of every row, encoded as a repeated constant
+    /// (wire type `TIMESTAMP_NANOS`). Unlike server stamping the value is
+    /// fixed at the caller, so resubmission is idempotent under
+    /// `DEDUP UPSERT KEYS`. Rejects negative (pre-epoch) values and any
+    /// already-set designated timestamp. Does not lock the row count;
+    /// the first appended column does.
+    pub fn at_scalar_nanos(&mut self, nanos: i64) -> Result<&mut Self> {
+        if self.designated_ts.is_some() {
+            return Err(error::fmt!(
+                InvalidApiCall,
+                "designated timestamp already set on this chunk"
+            ));
+        }
+        if self.server_now {
+            return Err(error::fmt!(
+                InvalidApiCall,
+                "scalar designated timestamp conflicts with at_now \
+                 (server-assigned timestamps) already set on this chunk"
+            ));
+        }
+        if nanos < 0 {
+            return Err(error::fmt!(
+                InvalidTimestamp,
+                "scalar designated timestamp is negative ({})",
+                nanos
+            ));
+        }
+        self.designated_ts = Some(DesignatedTsDescriptor {
+            unit: DesignatedTsUnit::Nanos,
+            data: DesignatedTsData::Scalar(nanos),
+        });
+        Ok(self)
+    }
+
     fn set_designated_ts(&mut self, unit: DesignatedTsUnit, data: &'a [i64]) -> Result<&mut Self> {
         if self.designated_ts.is_some() {
             return Err(error::fmt!(
@@ -1416,7 +1465,7 @@ impl<'a> Chunk<'a> {
         let row_count = check_row_count(self.row_count, data.len(), None)?;
         self.designated_ts = Some(DesignatedTsDescriptor {
             unit,
-            data: data.as_ptr(),
+            data: DesignatedTsData::Column(data.as_ptr()),
         });
         self.row_count = Some(row_count);
         Ok(self)

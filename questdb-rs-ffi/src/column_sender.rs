@@ -2712,6 +2712,39 @@ pub unsafe extern "C" fn column_sender_chunk_at_now(
     true
 }
 
+/// Pin one scalar nanosecond-precision Unix epoch timestamp as every
+/// row's designated timestamp, encoded as a repeated constant (wire type
+/// `TIMESTAMP_NANOS`). Unlike `column_sender_chunk_at_now` the value is
+/// fixed at the caller, so resubmission is idempotent under
+/// `DEDUP UPSERT KEYS`. Rejects negative (pre-epoch) values and any
+/// already-set designated timestamp. Cleared by
+/// `column_sender_chunk_clear` like every other chunk property.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn column_sender_chunk_at_scalar_nanos(
+    chunk: *mut column_sender_chunk,
+    nanos: i64,
+    err_out: *mut *mut line_sender_error,
+) -> bool {
+    if chunk.is_null() {
+        return reject_null_chunk(err_out);
+    }
+    let _guard = match unsafe {
+        InUseGuard::acquire(
+            chunk,
+            &raw const (*chunk).1,
+            "column_sender_chunk_at_scalar_nanos",
+            "column_sender_chunk",
+            err_out,
+        )
+    } {
+        Some(g) => g,
+        None => return false,
+    };
+    let inner: &mut Chunk = unsafe { &mut (*chunk).0 };
+    bubble!(err_out, inner.at_scalar_nanos(nanos));
+    true
+}
+
 // ===========================================================================
 // Flush
 // ===========================================================================
@@ -3142,7 +3175,7 @@ pub unsafe extern "C" fn column_sender_flush_arrow_batch_at_now(
             table,
             array,
             schema,
-            None,
+            FfiArrowTs::ServerNow,
             overrides,
             overrides_len,
             err_out,
@@ -3235,7 +3268,7 @@ pub unsafe extern "C" fn direct_column_sender_flush_arrow_batch_at_now(
             table,
             array,
             schema,
-            None,
+            FfiArrowTs::ServerNow,
             overrides,
             overrides_len,
             err_out,
@@ -3267,7 +3300,7 @@ pub unsafe extern "C" fn column_sender_flush_arrow_batch_at_column(
             table,
             array,
             schema,
-            Some(ts_column),
+            FfiArrowTs::Column(ts_column),
             overrides,
             overrides_len,
             err_out,
@@ -3361,7 +3394,41 @@ pub unsafe extern "C" fn direct_column_sender_flush_arrow_batch_at_column(
             table,
             array,
             schema,
-            Some(ts_column),
+            FfiArrowTs::Column(ts_column),
+            overrides,
+            overrides_len,
+            err_out,
+        )
+    }
+}
+
+/// Direct-handle publish-only Arrow flush with one scalar
+/// nanosecond-precision Unix epoch timestamp as every row's designated
+/// timestamp, encoded as a repeated constant. Unlike
+/// `direct_column_sender_flush_arrow_batch_at_now` the value is fixed at
+/// the caller, so resubmission is idempotent under `DEDUP UPSERT KEYS`.
+/// Rejects negative (pre-epoch) values. Same ownership and `overrides`
+/// contract as `direct_column_sender_flush_arrow_batch_at_now`.
+#[cfg(feature = "arrow")]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn direct_column_sender_flush_arrow_batch_at_scalar_nanos(
+    sender: *mut direct_column_sender,
+    table: line_sender_table_name,
+    array: *mut arrow::ffi::FFI_ArrowArray,
+    schema: *const arrow::ffi::FFI_ArrowSchema,
+    at_nanos: i64,
+    overrides: *const column_sender_arrow_override,
+    overrides_len: size_t,
+    err_out: *mut *mut line_sender_error,
+) -> bool {
+    unsafe {
+        arrow_batch_impl(
+            "direct_column_sender_flush_arrow_batch_at_scalar_nanos",
+            sender,
+            table,
+            array,
+            schema,
+            FfiArrowTs::ScalarNanos(at_nanos),
             overrides,
             overrides_len,
             err_out,
@@ -3609,6 +3676,16 @@ unsafe fn arrow_overrides_from_c<'a>(
     Some(out)
 }
 
+/// Designated timestamp source for the plain (publish-only) Arrow FFI
+/// entry points.
+#[cfg(feature = "arrow")]
+#[derive(Clone, Copy)]
+enum FfiArrowTs {
+    Column(line_sender_column_name),
+    ScalarNanos(i64),
+    ServerNow,
+}
+
 #[cfg(feature = "arrow")]
 #[allow(clippy::too_many_arguments)]
 unsafe fn arrow_batch_impl<T: CsHandle>(
@@ -3617,7 +3694,7 @@ unsafe fn arrow_batch_impl<T: CsHandle>(
     table: line_sender_table_name,
     array: *mut arrow::ffi::FFI_ArrowArray,
     schema: *const arrow::ffi::FFI_ArrowSchema,
-    ts_column: Option<line_sender_column_name>,
+    ts: FfiArrowTs,
     overrides_ptr: *const column_sender_arrow_override,
     overrides_len: size_t,
     err_out: *mut *mut line_sender_error,
@@ -3651,9 +3728,14 @@ unsafe fn arrow_batch_impl<T: CsHandle>(
     };
     let table_name = unsafe { table.as_name() };
     let sender = unsafe { T::owned_mut(sender).get_mut() };
-    let result = match ts_column {
-        Some(ts) => sender.flush_arrow_batch_at_column(table_name, &rb, ts.as_name(), &overrides),
-        None => sender.flush_arrow_batch_at_now(table_name, &rb, &overrides),
+    let result = match ts {
+        FfiArrowTs::Column(c) => {
+            sender.flush_arrow_batch_at_column(table_name, &rb, c.as_name(), &overrides)
+        }
+        FfiArrowTs::ScalarNanos(nanos) => {
+            sender.flush_arrow_batch_at_scalar_nanos(table_name, &rb, nanos, &overrides)
+        }
+        FfiArrowTs::ServerNow => sender.flush_arrow_batch_at_now(table_name, &rb, &overrides),
     };
     match result {
         Ok(()) => true,
@@ -4185,6 +4267,45 @@ mod tests {
         err = std::ptr::null_mut();
 
         // clear() resets the opt-in: the ts column is accepted again.
+        assert!(unsafe { column_sender_chunk_clear(chunk, &mut err) });
+        assert!(unsafe { column_sender_chunk_at_micros(chunk, ts.as_ptr(), ts.len(), &mut err) });
+        assert!(err.is_null());
+
+        unsafe { column_sender_chunk_free(chunk) };
+    }
+
+    #[test]
+    fn chunk_at_scalar_nanos_null_guard_validation_and_conflict() {
+        let mut err: *mut line_sender_error = std::ptr::null_mut();
+
+        let ok = unsafe { column_sender_chunk_at_scalar_nanos(std::ptr::null_mut(), 7, &mut err) };
+        assert!(!ok);
+        assert!(!err.is_null());
+        unsafe { line_sender_error_free(err) };
+        err = std::ptr::null_mut();
+
+        let table = b"trades";
+        let chunk = unsafe {
+            column_sender_chunk_new(table.as_ptr() as *const c_char, table.len(), &mut err)
+        };
+        assert!(!chunk.is_null());
+
+        let ok = unsafe { column_sender_chunk_at_scalar_nanos(chunk, -1, &mut err) };
+        assert!(!ok);
+        assert!(!err.is_null());
+        unsafe { line_sender_error_free(err) };
+        err = std::ptr::null_mut();
+
+        assert!(unsafe { column_sender_chunk_at_scalar_nanos(chunk, 7, &mut err) });
+        assert!(err.is_null());
+
+        let ts = [1i64, 2, 3];
+        let ok = unsafe { column_sender_chunk_at_micros(chunk, ts.as_ptr(), ts.len(), &mut err) };
+        assert!(!ok);
+        assert!(!err.is_null());
+        unsafe { line_sender_error_free(err) };
+        err = std::ptr::null_mut();
+
         assert!(unsafe { column_sender_chunk_clear(chunk, &mut err) });
         assert!(unsafe { column_sender_chunk_at_micros(chunk, ts.as_ptr(), ts.len(), &mut err) });
         assert!(err.is_null());

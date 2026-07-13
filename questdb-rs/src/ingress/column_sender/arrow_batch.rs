@@ -3569,13 +3569,22 @@ fn write_header_placeholder(out: &mut Vec<u8>, table_count: u16, defer_commit: b
     debug_assert_eq!(out.len() - start, QWP_HEADER_LEN);
 }
 
+/// Designated timestamp source of an Arrow batch flush: a `Timestamp(_)`
+/// column inside the batch, one scalar nanosecond value shared by every
+/// row (encoded as a repeated constant), or explicit server stamping.
+#[derive(Clone, Copy)]
+pub(crate) enum ArrowTsSource {
+    Column(usize),
+    ScalarNanos(i64),
+    ServerNow,
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn encode_arrow_batch_into(
     out: &mut Vec<u8>,
     table: TableName<'_>,
     batch: &RecordBatch,
-    ts_col_idx: Option<usize>,
-    server_stamp: bool,
+    ts: ArrowTsSource,
     overrides: &[ArrowColumnOverride<'_>],
     symbol_dict: &mut SymbolGlobalDict,
     defer_commit: bool,
@@ -3584,8 +3593,7 @@ pub(crate) fn encode_arrow_batch_into(
         out,
         table,
         batch,
-        ts_col_idx,
-        server_stamp,
+        ts,
         overrides,
         symbol_dict,
         defer_commit,
@@ -3597,8 +3605,7 @@ pub(crate) fn encode_arrow_batch_replay_into(
     out: &mut Vec<u8>,
     table: TableName<'_>,
     batch: &RecordBatch,
-    ts_col_idx: Option<usize>,
-    server_stamp: bool,
+    ts: ArrowTsSource,
     overrides: &[ArrowColumnOverride<'_>],
     symbol_dict: &mut SymbolGlobalDict,
 ) -> Result<()> {
@@ -3606,8 +3613,7 @@ pub(crate) fn encode_arrow_batch_replay_into(
         out,
         table,
         batch,
-        ts_col_idx,
-        server_stamp,
+        ts,
         overrides,
         symbol_dict,
         /* defer_commit = */ false,
@@ -3620,8 +3626,7 @@ fn encode_arrow_batch_into_mode(
     out: &mut Vec<u8>,
     table: TableName<'_>,
     batch: &RecordBatch,
-    ts_col_idx: Option<usize>,
-    server_stamp: bool,
+    ts: ArrowTsSource,
     overrides: &[ArrowColumnOverride<'_>],
     symbol_dict: &mut SymbolGlobalDict,
     defer_commit: bool,
@@ -3655,22 +3660,12 @@ fn encode_arrow_batch_into_mode(
             MAX_ARROW_INGEST_ROWS
         ));
     }
-    // Server-stamping (no per-row designated timestamp) must be an explicit
-    // opt-in: a caller who simply forgot to designate their event-time column
-    // would otherwise get silent server-assigned timestamps → wrong
-    // partitions/order, discoverable only by querying. Mirror the chunk path,
-    // which hard-errors when no designated timestamp was set.
-    if ts_col_idx.is_none() && !server_stamp {
-        return Err(fmt!(
-            ArrowIngest,
-            "RecordBatch has no designated timestamp; call \
-             flush_arrow_batch_at_column to source it from a Timestamp(_) column, \
-             or flush_arrow_batch_at_now to explicitly let the server \
-             stamp each row on arrival."
-        ));
-    }
     check_batch_data_bounds(batch)?;
     validate_table_name(table.as_ref())?;
+    let ts_col_idx = match ts {
+        ArrowTsSource::Column(idx) => Some(idx),
+        _ => None,
+    };
     let user_col_count = total_cols - if ts_col_idx.is_some() { 1 } else { 0 };
     if user_col_count == 0 {
         return Err(fmt!(
@@ -3721,21 +3716,24 @@ fn encode_arrow_batch_into_mode(
         return Err(e);
     }
 
-    let designated_dtype = ts_col_idx.map(|idx| schema.field(idx).data_type().clone());
-    let ts_wire_type = match designated_dtype.as_ref() {
-        Some(DataType::Timestamp(TimeUnit::Nanosecond, _)) => Some(QWP_TYPE_TIMESTAMP_NANOS),
-        Some(DataType::Timestamp(TimeUnit::Microsecond, _))
-        | Some(DataType::Timestamp(TimeUnit::Millisecond, _))
-        | Some(DataType::Timestamp(TimeUnit::Second, _)) => Some(QWP_TYPE_TIMESTAMP),
-        Some(other) => {
-            symbol_dict.rollback(dict_mark);
-            return Err(fmt!(
-                ArrowIngest,
-                "designated timestamp column has unsupported Arrow type {:?}",
-                other
-            ));
-        }
-        None => None,
+    let ts_wire_type = match ts {
+        ArrowTsSource::ServerNow => None,
+        ArrowTsSource::ScalarNanos(_) => Some(QWP_TYPE_TIMESTAMP_NANOS),
+        ArrowTsSource::Column(idx) => match schema.field(idx).data_type() {
+            DataType::Timestamp(TimeUnit::Nanosecond, _) => Some(QWP_TYPE_TIMESTAMP_NANOS),
+            DataType::Timestamp(
+                TimeUnit::Microsecond | TimeUnit::Millisecond | TimeUnit::Second,
+                _,
+            ) => Some(QWP_TYPE_TIMESTAMP),
+            other => {
+                symbol_dict.rollback(dict_mark);
+                return Err(fmt!(
+                    ArrowIngest,
+                    "designated timestamp column has unsupported Arrow type {:?}",
+                    other
+                ));
+            }
+        },
     };
 
     let column_count = classified.len() + if ts_wire_type.is_some() { 1 } else { 0 };
@@ -3750,7 +3748,13 @@ fn encode_arrow_batch_into_mode(
         signature.push(ts_byte);
     }
     let frame_start = out.len();
-    let estimated = estimate_frame_size(&classified, &resolution, ts_col_idx, row_count, table);
+    let estimated = estimate_frame_size(
+        &classified,
+        &resolution,
+        ts_wire_type.is_some(),
+        row_count,
+        table,
+    );
     if let Err(_e) = out.try_reserve(estimated) {
         symbol_dict.rollback(dict_mark);
         return Err(fmt!(
@@ -3792,17 +3796,25 @@ fn encode_arrow_batch_into_mode(
         }
     }
 
-    if let Some(idx) = ts_col_idx {
-        let arr = batch.column(idx);
-        let field_name = schema.field(idx).name().to_string();
-        let dtype = designated_dtype.as_ref().unwrap();
-        if let Err(e) = write_arrow_designated_ts_body(out, dtype, arr.as_ref()) {
-            return Err(rollback_on_err(
-                out,
-                symbol_dict,
-                decorate_column(e, &field_name),
-            ));
+    match ts {
+        ArrowTsSource::Column(idx) => {
+            let arr = batch.column(idx);
+            let field = schema.field(idx);
+            if let Err(e) = write_arrow_designated_ts_body(out, field.data_type(), arr.as_ref()) {
+                let field_name = field.name().to_string();
+                return Err(rollback_on_err(
+                    out,
+                    symbol_dict,
+                    decorate_column(e, &field_name),
+                ));
+            }
         }
+        ArrowTsSource::ScalarNanos(nanos) => {
+            if let Err(e) = write_scalar_designated_ts_body(out, nanos, row_count) {
+                return Err(rollback_on_err(out, symbol_dict, e));
+            }
+        }
+        ArrowTsSource::ServerNow => {}
     }
 
     let payload_len_usize = out.len() - payload_start;
@@ -3830,7 +3842,7 @@ fn encode_arrow_batch_into_mode(
 fn estimate_frame_size(
     classified: &[ClassifiedColumn<'_>],
     resolution: &ArrowSymbolResolution,
-    ts_col_idx: Option<usize>,
+    has_designated_ts: bool,
     row_count: usize,
     table: TableName<'_>,
 ) -> usize {
@@ -3890,11 +3902,28 @@ fn estimate_frame_size(
             ColumnKind::ArrayDouble(ndim) => row_count.saturating_mul(1 + 4 * ndim + 8 * 32),
         };
     }
-    if ts_col_idx.is_some() {
+    if has_designated_ts {
         total += 10 + 1;
         total += 1 + 8 * row_count;
     }
     total
+}
+
+fn write_scalar_designated_ts_body(out: &mut Vec<u8>, nanos: i64, row_count: usize) -> Result<()> {
+    if nanos < 0 {
+        return Err(fmt!(
+            ArrowIngest,
+            "scalar designated timestamp is negative ({})",
+            nanos
+        ));
+    }
+    out.push(0);
+    out.reserve(8 * row_count);
+    let bytes = nanos.to_le_bytes();
+    for _ in 0..row_count {
+        out.extend_from_slice(&bytes);
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -4015,8 +4044,7 @@ mod tests {
             &mut out,
             tbl(table_name),
             batch,
-            None,
-            /* server_stamp = */ true,
+            ArrowTsSource::ServerNow,
             &[],
             &mut dict,
             false,
@@ -4034,8 +4062,7 @@ mod tests {
             &mut out,
             tbl("t"),
             batch,
-            Some(ts_idx),
-            /* server_stamp = */ false,
+            ArrowTsSource::Column(ts_idx),
             &[],
             &mut dict,
             false,
@@ -4051,26 +4078,7 @@ mod tests {
             &mut out,
             tbl("t"),
             batch,
-            None,
-            /* server_stamp = */ true,
-            &[],
-            &mut dict,
-            false,
-        )
-        .unwrap_err()
-    }
-
-    /// Encode `batch` with neither a designated ts column nor the
-    /// server-stamp opt-in, returning the resulting error.
-    fn encode_err_no_ts_no_opt_in(batch: &RecordBatch) -> Error {
-        let mut out = Vec::new();
-        let mut dict = SymbolGlobalDict::new();
-        encode_arrow_batch_into(
-            &mut out,
-            tbl("t"),
-            batch,
-            None,
-            /* server_stamp = */ false,
+            ArrowTsSource::ServerNow,
             &[],
             &mut dict,
             false,
@@ -4085,8 +4093,7 @@ mod tests {
             &mut out,
             tbl("t"),
             batch,
-            Some(ts_idx),
-            /* server_stamp = */ false,
+            ArrowTsSource::Column(ts_idx),
             &[],
             &mut dict,
             false,
@@ -4139,25 +4146,6 @@ mod tests {
     }
 
     #[test]
-    fn no_ts_without_server_stamp_opt_in_rejected() {
-        // A batch with no designated timestamp and no explicit server-stamp
-        // opt-in must hard-error rather than silently server-stamp every row.
-        let mut b = Int64Builder::new();
-        b.append_value(1);
-        b.append_value(2);
-        let rb = single_col_batch(Field::new("c", DataType::Int64, false), b.finish());
-        let err = encode_err_no_ts_no_opt_in(&rb);
-        assert_eq!(err.code(), ErrorCode::ArrowIngest);
-        assert!(
-            err.msg().contains("no designated timestamp")
-                && err.msg().contains("flush_arrow_batch_at_column")
-                && err.msg().contains("flush_arrow_batch_at_now"),
-            "unexpected message: {}",
-            err.msg()
-        );
-    }
-
-    #[test]
     fn no_ts_with_server_stamp_opt_in_encodes() {
         // The same batch encodes cleanly once server-stamping is opted into.
         let mut b = Int64Builder::new();
@@ -4193,6 +4181,78 @@ mod tests {
         assert_qwp_header(&out, 1);
     }
 
+    /// A scalar designated timestamp encodes byte-identically to a
+    /// trailing `Timestamp(Nanosecond)` column of the same constant, so
+    /// the wire shape needs no server-side awareness of the scalar form.
+    #[test]
+    fn scalar_ts_matches_constant_column_frame() {
+        let ts_value = 1_700_000_000_000_000_000i64;
+
+        let mut payload = Float64Builder::new();
+        payload.append_value(1.0);
+        payload.append_value(2.0);
+        let scalar_batch = single_col_batch(
+            Field::new("price", DataType::Float64, false),
+            payload.finish(),
+        );
+        let mut out = Vec::new();
+        let mut dict = SymbolGlobalDict::new();
+        encode_arrow_batch_into(
+            &mut out,
+            tbl("t"),
+            &scalar_batch,
+            ArrowTsSource::ScalarNanos(ts_value),
+            &[],
+            &mut dict,
+            false,
+        )
+        .unwrap();
+
+        let mut payload = Float64Builder::new();
+        payload.append_value(1.0);
+        payload.append_value(2.0);
+        let mut ts = TimestampNanosecondBuilder::new();
+        ts.append_value(ts_value);
+        ts.append_value(ts_value);
+        let schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("price", DataType::Float64, false),
+            Field::new("ts", DataType::Timestamp(TimeUnit::Nanosecond, None), false),
+        ]));
+        let column_batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(payload.finish()) as ArrayRef,
+                Arc::new(ts.finish()) as ArrayRef,
+            ],
+        )
+        .unwrap();
+        let column_frame = encode_at_ts(&column_batch, 1);
+
+        assert_eq!(out, column_frame);
+    }
+
+    #[test]
+    fn scalar_ts_negative_rejected_and_frame_rolled_back() {
+        let mut b = Int64Builder::new();
+        b.append_value(1);
+        let rb = single_col_batch(Field::new("c", DataType::Int64, false), b.finish());
+        let mut out = Vec::new();
+        let mut dict = SymbolGlobalDict::new();
+        let err = encode_arrow_batch_into(
+            &mut out,
+            tbl("t"),
+            &rb,
+            ArrowTsSource::ScalarNanos(-1),
+            &[],
+            &mut dict,
+            false,
+        )
+        .unwrap_err();
+        assert_eq!(err.code(), ErrorCode::ArrowIngest);
+        assert!(err.msg().contains("negative"), "{}", err.msg());
+        assert!(out.is_empty());
+    }
+
     #[test]
     fn symbol_column_interns_into_global_dict() {
         let mut sb = StringBuilder::new();
@@ -4212,8 +4272,7 @@ mod tests {
             &mut out,
             tbl("t"),
             &rb,
-            None,
-            /* server_stamp = */ true,
+            ArrowTsSource::ServerNow,
             &[],
             &mut dict,
             false,
@@ -4997,8 +5056,7 @@ mod tests {
             &mut out,
             tbl("t"),
             &rb,
-            None,
-            /* server_stamp = */ true,
+            ArrowTsSource::ServerNow,
             &[],
             &mut dict,
             false,
@@ -5022,8 +5080,7 @@ mod tests {
             &mut out,
             tbl("t"),
             &rb,
-            None,
-            /* server_stamp = */ true,
+            ArrowTsSource::ServerNow,
             &[],
             &mut dict,
             false,
@@ -5415,8 +5472,7 @@ mod tests {
             &mut out,
             tbl("t"),
             &rb,
-            None,
-            /* server_stamp = */ true,
+            ArrowTsSource::ServerNow,
             &[],
             &mut gd,
             false,
@@ -5445,8 +5501,7 @@ mod tests {
             &mut out,
             tbl("t"),
             &rb,
-            None,
-            /* server_stamp = */ true,
+            ArrowTsSource::ServerNow,
             &[],
             &mut gd,
             false,
@@ -6204,8 +6259,7 @@ mod tests {
             &mut out,
             tbl("t"),
             &rb,
-            None,
-            /* server_stamp = */ true,
+            ArrowTsSource::ServerNow,
             &[],
             &mut dict,
             false,
@@ -6808,8 +6862,7 @@ mod tests {
             &mut out,
             tbl("t"),
             batch,
-            None,
-            /* server_stamp = */ true,
+            ArrowTsSource::ServerNow,
             overrides,
             &mut dict,
             false,

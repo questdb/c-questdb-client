@@ -39,7 +39,8 @@ use crate::{Result, error};
 #[cfg(feature = "arrow-ingress")]
 use super::arrow_batch;
 use super::chunk::{
-    Chunk, ColumnDescriptor, ColumnKind, DesignatedTsDescriptor, SymbolCodesPtr, ValidityDescriptor,
+    Chunk, ColumnDescriptor, ColumnKind, DesignatedTsData, DesignatedTsDescriptor, SymbolCodesPtr,
+    ValidityDescriptor,
 };
 use super::numpy_wire;
 use super::wire::{
@@ -1193,7 +1194,26 @@ fn encode_designated_ts(
     ts: &DesignatedTsDescriptor,
     row_count: usize,
 ) -> Result<()> {
-    let values = unsafe { slice::from_raw_parts(ts.data, row_count) };
+    let data = match ts.data {
+        DesignatedTsData::Column(ptr) => ptr,
+        DesignatedTsData::Scalar(value) => {
+            let scaled = value.checked_mul(ts.unit.scale()).ok_or_else(|| {
+                error::fmt!(
+                    InvalidTimestamp,
+                    "scalar designated timestamp overflows microseconds ({})",
+                    value
+                )
+            })?;
+            out.push(0);
+            out.reserve(8 * row_count);
+            let bytes = scaled.to_le_bytes();
+            for _ in 0..row_count {
+                out.extend_from_slice(&bytes);
+            }
+            return Ok(());
+        }
+    };
+    let values = unsafe { slice::from_raw_parts(data, row_count) };
     for (row, &v) in values.iter().enumerate() {
         if v < 0 {
             return Err(error::fmt!(
@@ -1221,7 +1241,7 @@ fn encode_designated_ts(
         }
     } else if cfg!(target_endian = "little") {
         let bytes = unsafe {
-            slice::from_raw_parts(ts.data as *const u8, row_count * std::mem::size_of::<i64>())
+            slice::from_raw_parts(data as *const u8, row_count * std::mem::size_of::<i64>())
         };
         out.extend_from_slice(bytes);
     } else {
@@ -1705,6 +1725,80 @@ mod tests {
         let mut fresh = Chunk::new("trades");
         fresh.column_i64("v", &vals[8..16], None).unwrap();
         fresh.at_now().unwrap();
+        let direct = encode_fresh(&fresh);
+
+        assert_eq!(sliced, direct);
+    }
+
+    /// A scalar designated timestamp encodes byte-identically to a column
+    /// of the same constant, so the wire shape needs no server-side
+    /// awareness of the scalar form.
+    #[test]
+    fn at_scalar_chunk_matches_constant_column_frame() {
+        let data = [1i64, 2, 3];
+        let ts_value = 1_700_000_000_000_000_000i64;
+
+        let mut scalar = Chunk::new("trades");
+        scalar.column_i64("v", &data, None).unwrap();
+        scalar.at_scalar_nanos(ts_value).unwrap();
+        let scalar_frame = encode_fresh(&scalar);
+
+        let ts_col = [ts_value; 3];
+        let mut column = Chunk::new("trades");
+        column.column_i64("v", &data, None).unwrap();
+        column.at_nanos(&ts_col).unwrap();
+        let column_frame = encode_fresh(&column);
+
+        assert_eq!(scalar_frame, column_frame);
+    }
+
+    #[test]
+    fn at_scalar_conflicts_and_validates() {
+        let data = [1i64, 2, 3];
+
+        let mut chunk = Chunk::new("trades");
+        assert_eq!(
+            chunk.at_scalar_nanos(-1).unwrap_err().code(),
+            crate::ErrorCode::InvalidTimestamp
+        );
+
+        chunk.at_scalar_nanos(7).unwrap();
+        assert_eq!(
+            chunk.at_nanos(&data).unwrap_err().code(),
+            crate::ErrorCode::InvalidApiCall
+        );
+        assert_eq!(
+            chunk.at_now().unwrap_err().code(),
+            crate::ErrorCode::InvalidApiCall
+        );
+
+        let mut now_first = Chunk::new("trades");
+        now_first.at_now().unwrap();
+        assert_eq!(
+            now_first.at_scalar_nanos(7).unwrap_err().code(),
+            crate::ErrorCode::InvalidApiCall
+        );
+
+        chunk.clear();
+        chunk.column_i64("v", &data, None).unwrap();
+        chunk.at_nanos(&data).unwrap();
+        encode_fresh(&chunk);
+    }
+
+    #[test]
+    fn slice_rows_preserves_at_scalar() {
+        let n = 16usize;
+        let vals: Vec<i64> = (0..n as i64).collect();
+        let mut src = Chunk::new("trades");
+        src.column_i64("v", &vals, None).unwrap();
+        src.at_scalar_nanos(42).unwrap();
+
+        let view = unsafe { src.slice_rows(8, 8) };
+        let sliced = encode_fresh(&view);
+
+        let mut fresh = Chunk::new("trades");
+        fresh.column_i64("v", &vals[8..16], None).unwrap();
+        fresh.at_scalar_nanos(42).unwrap();
         let direct = encode_fresh(&fresh);
 
         assert_eq!(sliced, direct);
