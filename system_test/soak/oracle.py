@@ -45,6 +45,7 @@ import sys
 sys.dont_write_bytecode = True
 
 import json
+import urllib.error
 import urllib.parse
 import urllib.request
 
@@ -498,8 +499,20 @@ class HttpQuery:
         url = (f'http://{self.host}:{self.http_port}/exec?'
                + urllib.parse.urlencode({'query': sql}))
         req = urllib.request.Request(url, method='GET')
-        with urllib.request.urlopen(req, timeout=self.timeout) as resp:
-            data = json.loads(resp.read())
+        try:
+            with urllib.request.urlopen(req, timeout=self.timeout) as resp:
+                data = json.loads(resp.read())
+        except urllib.error.HTTPError as e:
+            # QuestDB returns a 4xx with a JSON body carrying the SQL error
+            # (e.g. a table in flux mid-reconcile). Surface it as a normal
+            # RuntimeError instead of an opaque HTTPError so the reconcile can
+            # record a failed verdict rather than abort.
+            body = ''
+            try:
+                body = e.read().decode('utf-8', 'replace')
+            except Exception:  # noqa: BLE001
+                pass
+            raise RuntimeError(f'query HTTP {e.code}: {body}: {sql}') from None
         if 'error' in data:
             raise RuntimeError(f'query error: {data["error"]}: {sql}')
         return data.get('dataset', [])

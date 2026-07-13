@@ -568,21 +568,29 @@ class SoakRun:
                 verdicts.append(oracle_mod.Verdict(
                     'I1', leg['name'], False, 'no journal watermark'))
                 continue
-            query = oracle_mod.HttpQuery(leg['server'].host, leg['server'].http_port)
-            # WAL apply is async; wait until the server has applied everything
-            # so completeness/value queries see the full ingested set.
-            oracle_mod.wait_wal_applied(query, leg['table'])
-            is_control = not leg['faulted']
-            verdicts.append(oracle_mod.check_completeness(
-                query, leg['table'], leg['worker'], wm))
-            verdicts.append(oracle_mod.check_duplication(
-                query, leg['table'], leg['worker'], wm,
-                replay_budget=0, is_control=is_control, dedup=True))
-            # I3: value correctness on a seeded sample of the leg's rows.
-            sample = self._sample_seqs(wm)
-            verdicts.append(oracle_mod.reconcile_values(
-                query, leg['table'], self.opts['seed'], leg['worker'],
-                sample, types=leg.get('types')))
+            try:
+                query = oracle_mod.HttpQuery(leg['server'].host, leg['server'].http_port)
+                # WAL apply is async; wait until the server has applied
+                # everything so completeness/value queries see the full set.
+                oracle_mod.wait_wal_applied(query, leg['table'])
+                is_control = not leg['faulted']
+                verdicts.append(oracle_mod.check_completeness(
+                    query, leg['table'], leg['worker'], wm))
+                verdicts.append(oracle_mod.check_duplication(
+                    query, leg['table'], leg['worker'], wm,
+                    replay_budget=0, is_control=is_control, dedup=True))
+                # I3: value correctness on a seeded sample of the leg's rows.
+                sample = self._sample_seqs(wm)
+                verdicts.append(oracle_mod.reconcile_values(
+                    query, leg['table'], self.opts['seed'], leg['worker'],
+                    sample, types=leg.get('types')))
+            except Exception as e:  # noqa: BLE001
+                # A degraded server (or a table in flux at the end of a long
+                # run) can fail a reconcile query; record a failed verdict for
+                # this leg and keep going so one bad query can't abort the
+                # whole reconcile.
+                verdicts.append(oracle_mod.Verdict(
+                    'I1', leg['name'], False, f'reconcile query failed: {e}'))
         return oracle_mod.summarize(
             verdicts, seed=self.opts['seed'],
             duration_min=self.opts['duration_sec'] // 60,

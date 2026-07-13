@@ -26,6 +26,15 @@ use crate::stats::StatsWriter;
 
 type LegResult = Result<(), Box<dyn std::error::Error>>;
 
+/// Scan only the most recent `SCAN_WINDOW` rows (QuestDB `LIMIT -N` reads the
+/// tail). An unbounded full-scan grows with the table and, over a multi-hour
+/// run, eventually can't finish between fault episodes — so the reader never
+/// completes a query and the leg stalls. A bounded window keeps each scan fast
+/// and streaming regardless of table size, while still exercising the reader
+/// and catching a gap/dup in the recent tail (table-wide completeness is the
+/// oracle's job at reconcile).
+const SCAN_WINDOW: u64 = 200_000;
+
 /// Full-scan `c_seq` for `worker_id`, returning (count, min, max) over the
 /// non-null values. Exercises the reader transport + batch decode.
 fn scan_seq(
@@ -33,7 +42,8 @@ fn scan_seq(
     table: &str,
     worker_id: u32,
 ) -> questdb::Result<(u64, i64, i64)> {
-    let sql = format!("SELECT c_seq FROM {table} WHERE worker_id = {worker_id}");
+    let sql =
+        format!("SELECT c_seq FROM {table} WHERE worker_id = {worker_id} LIMIT -{SCAN_WINDOW}");
     let mut cursor = reader.prepare(&sql).execute()?;
     let mut count: u64 = 0;
     let mut min = i64::MAX;
