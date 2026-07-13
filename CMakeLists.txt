@@ -67,6 +67,10 @@ option(
     "Also build a C++20 twin of each C++ test/example target (header conformance)."
     OFF)
 
+option(QUESTDB_QWP_BENCH
+    "Build the C QWP bench examples (qwp_ingress_c/qwp_egress_c need libcurl)"
+    OFF)
+
 # Build static and dynamic lib written in Rust by invoking `cargo`.
 # Imports `questdb_client` target.
 add_subdirectory(corrosion)
@@ -442,4 +446,31 @@ if (QUESTDB_TESTS_AND_EXAMPLES)
             system_test PROPERTIES
             ENVIRONMENT BUILD_DIR_PATH=${CMAKE_BINARY_DIR})
     endif(QUESTDB_SYSTEM_TESTING)
+endif()
+
+if(QUESTDB_QWP_BENCH)
+    compile_example(
+        qwp_bench_selftest
+        examples/bench_schema_c.c
+        examples/bench_json_c.c
+        examples/qwp_bench_selftest.c)
+
+    find_package(CURL REQUIRED)
+    compile_example(
+        qwp_ingress_c
+        examples/bench_schema_c.c
+        examples/bench_json_c.c
+        examples/bench_http_c.c
+        examples/bench_ingest_c.c
+        examples/qwp_ingress_c.c)
+    target_link_libraries(qwp_ingress_c CURL::libcurl)
+
+    compile_example(
+        qwp_egress_c
+        examples/bench_schema_c.c
+        examples/bench_json_c.c
+        examples/bench_http_c.c
+        examples/bench_ingest_c.c
+        examples/qwp_egress_c.c)
+    target_link_libraries(qwp_egress_c CURL::libcurl)
 endif()

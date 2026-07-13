@@ -30,6 +30,10 @@ cd doc/net_bench
 ./run_cell.sh --label p5-s2-ingress-default-buf --schema s2-wide --direction ingress \
     --rows 10000000 --recv-buf 2m       # expected to fail: capture the error UX
 
+# C client cells (same knobs; binaries prebuilt by the bootstrap):
+./run_cell.sh --client c --label p1-s1-ingress-c --schema s1-narrow --direction ingress --rows 10000000
+./run_cell.sh --client c --label p1-s1-egress-c  --schema s1-narrow --direction egress  --rows 10000000 --skip-populate
+
 # ENT server axis (image ref from internal docs; instance role handles ECR auth;
 # built-in admin is enabled — note the harness conf strings need auth support first):
 ./ssmx.sh run server "qdb-server use-ent <registry>/questdb:<ver>-enterprise"

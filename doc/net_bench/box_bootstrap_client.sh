@@ -9,7 +9,8 @@ export DEBIAN_FRONTEND=noninteractive
 echo "== packages (full log on the box: /var/tmp/apt-install.log — SSM caps output at 24 KB)"
 apt-get update -q >/var/tmp/apt-install.log 2>&1
 apt-get install -qy build-essential pkg-config libssl-dev cmake git \
-    iperf3 sysstat curl jq python3-dev >>/var/tmp/apt-install.log 2>&1 \
+    iperf3 sysstat curl jq python3-dev libcurl4-openssl-dev \
+    >>/var/tmp/apt-install.log 2>&1 \
     || { tail -40 /var/tmp/apt-install.log; exit 1; }
 
 echo "== rust toolchain"
@@ -50,6 +51,14 @@ cargo build --release \
     --example qwp_ingress_polars --example qwp_egress_polars \
     >/var/tmp/cargo-build.log 2>&1 \
     || { tail -60 /var/tmp/cargo-build.log; exit 1; }
+
+echo "== c bench build (log: /var/tmp/cmake-build.log)"
+cd "$WORK/c-questdb-client"
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DQUESTDB_QWP_BENCH=ON \
+    >/var/tmp/cmake-build.log 2>&1 \
+    && cmake --build build --target qwp_ingress_c qwp_egress_c -j "$(nproc)" \
+        >>/var/tmp/cmake-build.log 2>&1 \
+    || { tail -60 /var/tmp/cmake-build.log; exit 1; }
 
 echo "== py-questdb-client @ ${QNB_PY_CLIENT_COMMIT}"
 shallow_at "$WORK/py-questdb-client" \

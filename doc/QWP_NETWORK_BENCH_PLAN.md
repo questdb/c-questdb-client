@@ -192,6 +192,10 @@ The §3.2 JSON contract is unchanged; each cell directory adds a sidecar
 - **W4 — results home:** aggregate with `bench_parity_aggregate.py` (it
   already warns on mixed `(os, arch)` — network cells are same-arch so it
   holds), post the delta table to PR #153 as the next comment in the series.
+- **W5 — C client cells**: `qwp_ingress_c` / `qwp_egress_c` (client `c-columnar`,
+  examples/) mirror the Rust cells via `run_cell.sh --client c`. Floor paths
+  differ by construction (chunk staging vs encode; decode-only matches);
+  `rows_per_s_median` is the cross-client metric (C reports `wire_bytes: 0`).
 
 ## 9. Deferred (each gated on a v1 number)
 
