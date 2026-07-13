@@ -481,9 +481,11 @@ if(QUESTDB_QWP_BENCH)
         qwp_bench_selftest
         examples/bench_schema_c.c
         examples/bench_json_c.c
+        examples/bench_ingest_c.c
         examples/qwp_bench_selftest.c)
 
     find_package(CURL REQUIRED)
+    find_package(Threads REQUIRED)
     compile_example(
         qwp_ingress_c
         examples/bench_schema_c.c
@@ -491,7 +493,7 @@ if(QUESTDB_QWP_BENCH)
         examples/bench_http_c.c
         examples/bench_ingest_c.c
         examples/qwp_ingress_c.c)
-    target_link_libraries(qwp_ingress_c CURL::libcurl)
+    target_link_libraries(qwp_ingress_c CURL::libcurl Threads::Threads)
 
     compile_example(
         qwp_egress_c

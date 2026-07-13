@@ -9,6 +9,7 @@
 #include <string.h>
 #include "bench_schema_c.h"
 #include "bench_json_c.h"
+#include "bench_ingest_c.h"
 
 static void test_schema(void)
 {
@@ -121,6 +122,28 @@ static void test_json(void)
     (void)process_cpu_ns();
 }
 
+static void test_sender_range(void)
+{
+    size_t lo, hi;
+    sender_range(10, 1, 0, &lo, &hi); assert(lo == 0 && hi == 10);
+    sender_range(10, 3, 0, &lo, &hi); assert(lo == 0 && hi == 3);
+    sender_range(10, 3, 1, &lo, &hi); assert(lo == 3 && hi == 6);
+    sender_range(10, 3, 2, &lo, &hi); assert(lo == 6 && hi == 10);
+    /* exact tiling on an awkward split */
+    size_t prev = 0;
+    for (size_t k = 0; k < 7; k++) {
+        sender_range(1000003, 7, k, &lo, &hi);
+        assert(lo == prev && hi >= lo);
+        prev = hi;
+    }
+    assert(prev == 1000003);
+    /* n > rows: empty tail ranges are legal. Note k=n-1 (the true last
+     * sender) always ends at hi==rows and can never be empty for rows>=1
+     * (lo=rows*(n-1)/n < rows strictly); the empty ranges live at the
+     * interior tail indices before that, e.g. k=6 here (k=7 is (1,2)). */
+    sender_range(2, 8, 6, &lo, &hi); assert(lo == 1 && hi == 1);
+}
+
 int main(void)
 {
     test_schema();
@@ -128,6 +151,7 @@ int main(void)
     test_data_build();
     test_stats();
     test_json();
+    test_sender_range();
     printf("qwp_bench_selftest: OK\n");
     return 0;
 }

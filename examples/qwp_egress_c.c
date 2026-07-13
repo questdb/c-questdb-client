@@ -60,7 +60,9 @@ static void populate(const char* host, size_t port, const char* base,
     column_sender_chunk* chunk = column_sender_chunk_new(table, strlen(table), &err);
     if (!chunk) bench_die(PROG, "chunk_new", err);
 
-    ingest_pass(sender, chunk, &d, kind, POPULATE_BATCH_ROWS, PROG);
+    stage_scratch scratch = {0};
+    ingest_pass(sender, chunk, &d, kind, 0, d.rows, POPULATE_BATCH_ROWS, &scratch, PROG);
+    free(scratch.note_off);
 
     column_sender_chunk_free(chunk);
     questdb_db_return_direct_column_sender(db, sender);

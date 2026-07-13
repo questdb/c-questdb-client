@@ -10,6 +10,7 @@
  * the C API has no encode-only hook — rows/s is the cross-client metric.
  * Env knobs identical to the Rust example (see bench_schema_c.h header). */
 #include <inttypes.h>
+#include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -22,6 +23,42 @@
 #include "bench_schema_c.h"
 
 #define PROG "qwp_ingress_c"
+
+/* One parallel sender: its own connection, chunk, scratch and row range.
+ * bench_die() exits the whole process on error — acceptable for a bench. */
+typedef struct {
+    direct_column_sender* sender;
+    column_sender_chunk* chunk;
+    const bench_data* d;
+    schema_kind kind;
+    size_t lo, hi, max_batch_rows;
+    stage_scratch scratch;
+} sender_job;
+
+static void* sender_thread(void* arg)
+{
+    sender_job* j = arg;
+    ingest_pass(j->sender, j->chunk, j->d, j->kind, j->lo, j->hi,
+                j->max_batch_rows, &j->scratch, PROG);
+    return NULL;
+}
+
+static void run_multi_pass(sender_job* jobs, size_t n)
+{
+    if (n == 1) { /* classic path: no thread overhead in the timed region */
+        sender_thread(&jobs[0]);
+        return;
+    }
+    pthread_t* tids = malloc(n * sizeof(pthread_t));
+    for (size_t k = 0; k < n; k++)
+        if (pthread_create(&tids[k], NULL, sender_thread, &jobs[k]) != 0) {
+            fprintf(stderr, "[" PROG "] pthread_create failed\n");
+            exit(1);
+        }
+    for (size_t k = 0; k < n; k++)
+        pthread_join(tids[k], NULL);
+    free(tids);
+}
 
 int main(void)
 {
@@ -37,6 +74,8 @@ int main(void)
     size_t iterations = env_zu("ITERATIONS", 5);
     size_t warmups = env_zu("WARMUPS", 2);
     size_t max_batch_rows = env_zu("MAX_BATCH_ROWS", 10000);
+    size_t n_senders = env_zu("SENDERS", 1);
+    if (n_senders < 1) n_senders = 1;
     const char* run_mode = env_str("RUN_MODE", "full");
     const char* host = env_str("QDB_HOST", "127.0.0.1");
     size_t port = env_zu("QDB_PORT", 9000);
@@ -45,8 +84,8 @@ int main(void)
     const char* table = schema_table(kind);
 
     fprintf(stderr,
-        "[" PROG "] schema=%s rows=%zu it=%zu wu=%zu batch=%zu host=%s:%zu\n",
-        schema_name(kind), rows, iterations, warmups, max_batch_rows, host, port);
+        "[" PROG "] schema=%s rows=%zu it=%zu wu=%zu batch=%zu senders=%zu host=%s:%zu\n",
+        schema_name(kind), rows, iterations, warmups, max_batch_rows, n_senders, host, port);
 
     bench_data d;
     if (bench_data_build(&d, kind, rows, sym_card, varchar_len, hi_sym_card) != 0) {
@@ -63,14 +102,16 @@ int main(void)
     /* ---- floor: chunk-build (no server) ---- */
     column_sender_chunk* chunk = column_sender_chunk_new(table, strlen(table), &err);
     if (!chunk) bench_die(PROG, "chunk_new", err);
+    stage_scratch floor_scratch = {0};
     for (size_t w = 0; w < warmups; w++)
-        ingest_pass(NULL, chunk, &d, kind, max_batch_rows, PROG);
+        ingest_pass(NULL, chunk, &d, kind, 0, rows, max_batch_rows, &floor_scratch, PROG);
     for (size_t i = 0; i < iterations; i++) {
         uint64_t c0 = process_cpu_ns(), t0 = now_ns();
-        ingest_pass(NULL, chunk, &d, kind, max_batch_rows, PROG);
+        ingest_pass(NULL, chunk, &d, kind, 0, rows, max_batch_rows, &floor_scratch, PROG);
         wall[i] = now_ns() - t0;
         cpu[i] = process_cpu_ns() - c0;
     }
+    free(floor_scratch.note_off);
     double floor_median = median_s_of(wall, iterations);
     json_obj_obj(paths, "chunk-build",
         path_summary(wall, cpu, iterations, rows, columns, 0, "floor", warmups > 0));
@@ -90,22 +131,31 @@ int main(void)
             || http_exec_sql(base, schema_create_sql(kind)) != 0)
             return 1;
 
-        questdb_db* db = questdb_db_connect(conf, strlen(conf), &err);
-        if (!db) bench_die(PROG, "connect", err);
         /* Direct sender = the pipelined backend flush_polars_dataframe uses
          * (parity with the Rust bench). Unlike the store-and-forward sender
          * it never re-states the connection-lifetime symbol dict in replay
          * frames, and it has no internal failover — errors are fatal for the
          * bench (bench_die), which is the intended behavior. */
-        direct_column_sender* sender =
-            questdb_db_borrow_direct_column_sender(db, &err);
-        if (!sender) bench_die(PROG, "borrow sender", err);
+        questdb_db** dbs = malloc(n_senders * sizeof(questdb_db*));
+        sender_job* jobs = calloc(n_senders, sizeof(sender_job));
+        for (size_t k = 0; k < n_senders; k++) {
+            dbs[k] = questdb_db_connect(conf, strlen(conf), &err);
+            if (!dbs[k]) bench_die(PROG, "connect", err);
+            jobs[k].sender = questdb_db_borrow_direct_column_sender(dbs[k], &err);
+            if (!jobs[k].sender) bench_die(PROG, "borrow sender", err);
+            jobs[k].chunk = column_sender_chunk_new(table, strlen(table), &err);
+            if (!jobs[k].chunk) bench_die(PROG, "chunk_new", err);
+            jobs[k].d = &d;
+            jobs[k].kind = kind;
+            sender_range(rows, n_senders, k, &jobs[k].lo, &jobs[k].hi);
+            jobs[k].max_batch_rows = max_batch_rows;
+        }
 
         for (size_t w = 0; w < warmups; w++)
-            ingest_pass(sender, chunk, &d, kind, max_batch_rows, PROG);
+            run_multi_pass(jobs, n_senders);
         for (size_t i = 0; i < iterations; i++) {
             uint64_t c0 = process_cpu_ns(), t0 = now_ns();
-            ingest_pass(sender, chunk, &d, kind, max_batch_rows, PROG);
+            run_multi_pass(jobs, n_senders);
             wall[i] = now_ns() - t0;
             cpu[i] = process_cpu_ns() - c0;
         }
@@ -113,8 +163,14 @@ int main(void)
         json_obj_obj(paths, "flush-chunks",
             path_summary(wall, cpu, iterations, rows, columns, 0, "e2e", warmups > 0));
 
-        questdb_db_return_direct_column_sender(db, sender);
-        questdb_db_close(db);
+        for (size_t k = 0; k < n_senders; k++) {
+            questdb_db_return_direct_column_sender(dbs[k], jobs[k].sender);
+            questdb_db_close(dbs[k]);
+            column_sender_chunk_free(jobs[k].chunk);
+            free(jobs[k].scratch.note_off);
+        }
+        free(jobs);
+        free(dbs);
 
         fprintf(stderr, "[" PROG "] waiting for WAL apply (count == %zu)\n", rows);
         count = wait_for_count(base, table, (long long)rows);
@@ -133,6 +189,7 @@ int main(void)
     json_obj_str(report, "run_mode", run_mode);
     json_obj_int(report, "warmups", (uint64_t)warmups);
     json_obj_int(report, "wire_bytes", 0);
+    json_obj_int(report, "senders", (uint64_t)n_senders);
 
     json_obj* machine = json_obj_new();
 #if defined(__APPLE__)
