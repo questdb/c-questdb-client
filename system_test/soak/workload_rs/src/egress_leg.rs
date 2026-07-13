@@ -166,6 +166,8 @@ pub fn run_egress_leg(cfg: &LegConfig) -> LegResult {
         }
     }
 
+    // Release the reader so the final quiesce sample sees the pool drained (I4).
+    drop(reader);
     stats.emit(&db, rows_read, rows_read, Some(queries), Some(losses))?;
     if max_dup_surplus > 0 {
         eprintln!(

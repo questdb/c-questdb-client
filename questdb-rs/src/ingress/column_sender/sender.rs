@@ -858,10 +858,25 @@ impl DirectColumnBackend {
         // (`sync_all_acks`). `sync` is not a data flush, so it must leave the
         // deferral state untouched — the next data flush still chooses defer
         // from `first_frame_sent` exactly as before.
+        //
+        // With frames pending at entry, ANY failure of this call is
+        // delivery-unknown for the operation: the pending frames' fate —
+        // including a prefix an earlier split already committed
+        // server-side — is unresolved, so a caller that retried on a
+        // not-delivered classification would duplicate committed rows.
+        // The per-site classifications inside `flush_inner` (the entry
+        // ack drain, a commit-frame write that provably never left) are
+        // about the commit frame itself; `deny_retry_after_partial`
+        // re-scopes them to the sync's actual question. A sync with
+        // nothing pending keeps its classification: retrying it is safe.
+        let pending_at_entry = self.conn.in_flight() > 0;
         let first_frame_sent = self.first_frame_sent;
         let mut commit_chunk = Chunk::new("");
-        let result = self.flush_inner(&mut commit_chunk, WaitForAck::Yes(ack_level));
+        let mut result = self.flush_inner(&mut commit_chunk, WaitForAck::Yes(ack_level));
         self.first_frame_sent = first_frame_sent;
+        if pending_at_entry {
+            result = result.map_err(deny_retry_after_partial);
+        }
         result.map_err(FlushFailure::into_error)
     }
 
