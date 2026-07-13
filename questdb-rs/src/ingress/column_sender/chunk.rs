@@ -604,6 +604,7 @@ pub struct Chunk<'a> {
     pub(crate) row_count: Option<usize>,
     pub(crate) columns: Vec<ColumnDescriptor>,
     pub(crate) designated_ts: Option<DesignatedTsDescriptor>,
+    pub(crate) server_now: bool,
     _marker: PhantomData<&'a ()>,
 }
 
@@ -616,6 +617,7 @@ impl<'a> Chunk<'a> {
             row_count: None,
             columns: Vec::new(),
             designated_ts: None,
+            server_now: false,
             _marker: PhantomData,
         }
     }
@@ -644,6 +646,7 @@ impl<'a> Chunk<'a> {
         self.row_count = None;
         self.columns.clear();
         self.designated_ts = None;
+        self.server_now = false;
     }
 
     /// Build a chunk viewing rows `[row_offset, row_offset + row_count)` of
@@ -675,6 +678,7 @@ impl<'a> Chunk<'a> {
                 .designated_ts
                 .as_ref()
                 .map(|ts| unsafe { ts.slice_rows(row_offset) }),
+            server_now: self.server_now,
             _marker: PhantomData,
         }
     }
@@ -1376,11 +1380,37 @@ impl<'a> Chunk<'a> {
         self.set_designated_ts(DesignatedTsUnit::Seconds, data)
     }
 
+    /// Opt the chunk into server-assigned timestamps: the frame carries
+    /// no designated timestamp column and the server stamps each row on
+    /// arrival. Mirrors the arrow-batch `flush_arrow_batch_at_now` entry
+    /// point — an **explicit opt-in**, since server-assigned timestamps
+    /// generate unique rows on resubmission and so defeat `DEDUP UPSERT
+    /// KEYS`. Rejects if a designated timestamp column has already been
+    /// set on this chunk (and vice versa). Does not lock the row count;
+    /// the first appended column does.
+    pub fn at_now(&mut self) -> Result<&mut Self> {
+        if self.designated_ts.is_some() {
+            return Err(error::fmt!(
+                InvalidApiCall,
+                "designated timestamp already set on this chunk"
+            ));
+        }
+        self.server_now = true;
+        Ok(self)
+    }
+
     fn set_designated_ts(&mut self, unit: DesignatedTsUnit, data: &'a [i64]) -> Result<&mut Self> {
         if self.designated_ts.is_some() {
             return Err(error::fmt!(
                 InvalidApiCall,
                 "designated timestamp already set on this chunk"
+            ));
+        }
+        if self.server_now {
+            return Err(error::fmt!(
+                InvalidApiCall,
+                "designated timestamp column conflicts with at_now \
+                 (server-assigned timestamps) already set on this chunk"
             ));
         }
         let row_count = check_row_count(self.row_count, data.len(), None)?;
@@ -1652,6 +1682,7 @@ impl Debug for Chunk<'_> {
             .field("row_count", &self.row_count())
             .field("columns", &self.columns.len())
             .field("has_designated_ts", &self.designated_ts.is_some())
+            .field("server_now", &self.server_now)
             .finish()
     }
 }

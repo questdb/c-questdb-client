@@ -1496,6 +1496,18 @@ bool column_sender_chunk_at_seconds(
     size_t row_count,
     line_sender_error** err_out);
 
+/** Opt the chunk into server-assigned timestamps: the encoded frame
+ * carries no designated timestamp column and the server stamps each row
+ * on arrival. An explicit opt-in mirroring
+ * `column_sender_flush_arrow_batch_at_now`; server-assigned timestamps
+ * generate unique rows on resubmission and so defeat DEDUP UPSERT KEYS.
+ * Rejects if a designated timestamp column is already set (and vice
+ * versa). Cleared by `column_sender_chunk_clear`. */
+QUESTDB_CLIENT_API
+bool column_sender_chunk_at_now(
+    column_sender_chunk* chunk,
+    line_sender_error** err_out);
+
 /* -------------------------------------------------------------------------
  * Flush / sync
  *

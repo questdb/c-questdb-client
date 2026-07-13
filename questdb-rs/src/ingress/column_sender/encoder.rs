@@ -163,20 +163,21 @@ fn encode_chunk_into_mode(
             super::MAX_CHUNK_ROWS
         ));
     }
-    if chunk.designated_ts.is_none() {
+    // Server-stamping (no per-row designated timestamp) must be an
+    // explicit opt-in via `Chunk::at_now`, mirroring the arrow-batch
+    // `flush_arrow_batch_at_now` entry point.
+    if chunk.designated_ts.is_none() && !chunk.server_now {
         return Err(error::fmt!(
             InvalidApiCall,
             "Chunk has no designated timestamp; \
-             call at_micros or at_nanos before flush."
+             call at_micros or at_nanos before flush, or at_now to \
+             explicitly let the server stamp each row on arrival."
         ));
     }
     validate_table_name(&chunk.table)?;
     let table_bytes = chunk.table.as_bytes();
 
-    let designated = chunk
-        .designated_ts
-        .as_ref()
-        .expect("guarded by is_none() check above");
+    let designated = chunk.designated_ts.as_ref();
 
     // --- Pass 1: resolve symbol columns against the connection-scoped
     // global dict. We snapshot the dict so we can roll back if encoding
@@ -215,14 +216,19 @@ fn encode_chunk_into_mode(
     };
 
     // --- Schema signature ---
-    let column_count = chunk.columns.len() + 1; // +1 for designated timestamp
+    // +1 for the designated timestamp, unless the server stamps rows
+    // (`at_now`), in which case the frame carries no ts entry at all —
+    // the same shape the arrow-batch `at_now` route emits.
+    let column_count = chunk.columns.len() + if designated.is_some() { 1 } else { 0 };
     scratch.signature.reserve(column_count.saturating_mul(8));
     for col in &chunk.columns {
         write_qwp_bytes(&mut scratch.signature, col.name.as_bytes());
         scratch.signature.push(col.wire_type);
     }
-    write_qwp_bytes(&mut scratch.signature, &[]); // designated_ts has empty name
-    scratch.signature.push(designated.unit.wire_type());
+    if let Some(designated) = designated {
+        write_qwp_bytes(&mut scratch.signature, &[]); // designated_ts has empty name
+        scratch.signature.push(designated.unit.wire_type());
+    }
 
     let frame_start = out.len();
     let result = encode_frame_after_signature(
@@ -314,7 +320,7 @@ fn replay_symbol_dense_count(per_column: &[Option<ResolvedColumn>]) -> Result<us
 fn encode_frame_after_signature(
     out: &mut Vec<u8>,
     chunk: &Chunk<'_>,
-    designated: &DesignatedTsDescriptor,
+    designated: Option<&DesignatedTsDescriptor>,
     row_count: usize,
     column_count: usize,
     table_bytes: &[u8],
@@ -388,7 +394,9 @@ fn encode_frame_after_signature(
         }
     }
 
-    encode_designated_ts(out, designated, row_count)?;
+    if let Some(designated) = designated {
+        encode_designated_ts(out, designated, row_count)?;
+    }
 
     let payload_len_usize = out.len() - payload_start;
     let payload_len = u32::try_from(payload_len_usize).map_err(|_| {
@@ -1606,6 +1614,100 @@ mod tests {
         let err = encode_chunk_into(&mut out, &chunk, &mut dict, &mut scratch, false).unwrap_err();
         assert_eq!(err.code(), crate::ErrorCode::InvalidApiCall);
         assert!(err.msg().contains("designated"));
+        // The error must advertise the explicit server-stamping opt-in.
+        assert!(err.msg().contains("at_now"), "{}", err.msg());
+    }
+
+    /// `at_now` (server-assigned timestamps) encodes the same frame shape
+    /// the arrow-batch `at_now` route emits: the column count excludes the
+    /// designated timestamp and the signature carries no empty-name entry.
+    #[test]
+    fn at_now_chunk_encodes_without_ts_signature_entry() {
+        let data = [1i64, 2, 3];
+
+        let mut server_now = Chunk::new("trades");
+        server_now.column_i64("a", &data, None).unwrap();
+        server_now.at_now().unwrap();
+        let now_frame = encode_fresh(&server_now);
+
+        let mut with_ts = Chunk::new("trades");
+        with_ts.column_i64("a", &data, None).unwrap();
+        with_ts.at_nanos(&data).unwrap();
+        let ts_frame = encode_fresh(&with_ts);
+
+        // [12B header][delta_start][new_symbols][table "trades"][row_count]
+        let col_count_offset = 12 + 1 + 1 + 1 + "trades".len() + 1;
+        assert_eq!(now_frame[col_count_offset], 1); // just column "a"
+        assert_eq!(ts_frame[col_count_offset], 2); // column "a" + ts
+
+        // First (and only) signature entry is column "a", not the ts.
+        let schema_offset = col_count_offset + 1;
+        assert_eq!(now_frame[schema_offset], 1);
+        assert_eq!(now_frame[schema_offset + 1], b'a');
+
+        // The at_now frame drops exactly the ts signature entry (empty
+        // name varint + wire type = 2 bytes) and the ts body (null_flag +
+        // 8 bytes per row).
+        assert_eq!(ts_frame.len() - now_frame.len(), 2 + 1 + 8 * data.len());
+    }
+
+    #[test]
+    fn at_now_conflicts_with_designated_ts_column() {
+        let data = [1i64, 2, 3];
+
+        let mut ts_first = Chunk::new("trades");
+        ts_first.at_micros(&data).unwrap();
+        let err = ts_first.at_now().unwrap_err();
+        assert_eq!(err.code(), crate::ErrorCode::InvalidApiCall);
+
+        let mut now_first = Chunk::new("trades");
+        now_first.at_now().unwrap();
+        let err = now_first.at_micros(&data).unwrap_err();
+        assert_eq!(err.code(), crate::ErrorCode::InvalidApiCall);
+        assert!(err.msg().contains("at_now"), "{}", err.msg());
+    }
+
+    #[test]
+    fn at_now_only_chunk_is_header_only_and_clear_resets() {
+        // No columns appended: still the empty-chunk no-op frame.
+        let mut chunk = Chunk::new("trades");
+        chunk.at_now().unwrap();
+        assert!(chunk.is_empty());
+        let out = encode_fresh(&chunk);
+        // Header-only frame: 12B header + delta_start(0) + new_symbols(0).
+        assert_eq!(out.len(), 14);
+
+        // clear() drops the opt-in: the next flush demands a ts again.
+        let data = [1i64, 2];
+        chunk.clear();
+        chunk.column_i64("a", &data, None).unwrap();
+        let mut out = Vec::new();
+        let mut dict = SymbolGlobalDict::new();
+        let mut scratch = EncodeScratch::new();
+        let err = encode_chunk_into(&mut out, &chunk, &mut dict, &mut scratch, false).unwrap_err();
+        assert_eq!(err.code(), crate::ErrorCode::InvalidApiCall);
+        assert!(err.msg().contains("designated"));
+    }
+
+    /// Splitting an oversize `at_now` chunk must preserve the opt-in on
+    /// every slice.
+    #[test]
+    fn slice_rows_preserves_at_now() {
+        let n = 16usize;
+        let vals: Vec<i64> = (0..n as i64).collect();
+        let mut src = Chunk::new("trades");
+        src.column_i64("v", &vals, None).unwrap();
+        src.at_now().unwrap();
+
+        let view = unsafe { src.slice_rows(8, 8) };
+        let sliced = encode_fresh(&view);
+
+        let mut fresh = Chunk::new("trades");
+        fresh.column_i64("v", &vals[8..16], None).unwrap();
+        fresh.at_now().unwrap();
+        let direct = encode_fresh(&fresh);
+
+        assert_eq!(sliced, direct);
     }
 
     #[test]

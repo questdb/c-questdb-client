@@ -2676,6 +2676,42 @@ pub unsafe extern "C" fn column_sender_chunk_at_seconds(
     true
 }
 
+/// Opt the chunk into server-assigned timestamps: the encoded frame
+/// carries no designated timestamp column and the server stamps each row
+/// on arrival. This is an **explicit opt-in** mirroring
+/// `column_sender_flush_arrow_batch_at_now` — if your data carries a real
+/// event-time column, pin it with `column_sender_chunk_at_micros` /
+/// `_at_nanos` instead; server-assigned timestamps generate unique rows
+/// on resubmission and so defeat `DEDUP UPSERT KEYS`.
+///
+/// Rejects if a designated timestamp column is already set on this chunk
+/// (and the `at_*` setters reject after this call). Cleared by
+/// `column_sender_chunk_clear` like every other chunk property.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn column_sender_chunk_at_now(
+    chunk: *mut column_sender_chunk,
+    err_out: *mut *mut line_sender_error,
+) -> bool {
+    if chunk.is_null() {
+        return reject_null_chunk(err_out);
+    }
+    let _guard = match unsafe {
+        InUseGuard::acquire(
+            chunk,
+            &raw const (*chunk).1,
+            "column_sender_chunk_at_now",
+            "column_sender_chunk",
+            err_out,
+        )
+    } {
+        Some(g) => g,
+        None => return false,
+    };
+    let inner: &mut Chunk = unsafe { &mut (*chunk).0 };
+    bubble!(err_out, inner.at_now());
+    true
+}
+
 // ===========================================================================
 // Flush
 // ===========================================================================
@@ -4118,6 +4154,42 @@ mod tests {
         assert!(chunk.is_null());
         assert!(!err.is_null());
         unsafe { line_sender_error_free(err) };
+    }
+
+    #[test]
+    fn chunk_at_now_null_guard_happy_path_and_ts_conflict() {
+        let mut err: *mut line_sender_error = std::ptr::null_mut();
+
+        // NULL chunk rejects without touching err-free invariants.
+        let ok = unsafe { column_sender_chunk_at_now(std::ptr::null_mut(), &mut err) };
+        assert!(!ok);
+        assert!(!err.is_null());
+        unsafe { line_sender_error_free(err) };
+        err = std::ptr::null_mut();
+
+        let table = b"trades";
+        let chunk = unsafe {
+            column_sender_chunk_new(table.as_ptr() as *const c_char, table.len(), &mut err)
+        };
+        assert!(!chunk.is_null());
+
+        assert!(unsafe { column_sender_chunk_at_now(chunk, &mut err) });
+        assert!(err.is_null());
+
+        // A designated ts column now conflicts with the at_now opt-in.
+        let ts = [1i64, 2, 3];
+        let ok = unsafe { column_sender_chunk_at_micros(chunk, ts.as_ptr(), ts.len(), &mut err) };
+        assert!(!ok);
+        assert!(!err.is_null());
+        unsafe { line_sender_error_free(err) };
+        err = std::ptr::null_mut();
+
+        // clear() resets the opt-in: the ts column is accepted again.
+        assert!(unsafe { column_sender_chunk_clear(chunk, &mut err) });
+        assert!(unsafe { column_sender_chunk_at_micros(chunk, ts.as_ptr(), ts.len(), &mut err) });
+        assert!(err.is_null());
+
+        unsafe { column_sender_chunk_free(chunk) };
     }
 
     #[test]
