@@ -2636,6 +2636,68 @@ pub unsafe extern "C" fn line_sender_opts_qwpws_progress(
     unsafe { upd_opts!(opts, err_out, qwp_ws_progress, progress) }
 }
 
+/// Register a connection lifecycle listener on the sender being built.
+/// One `questdb_connection_event` per connection-state transition of the
+/// sender's QWP/WebSocket connection, delivered on a dedicated dispatcher
+/// thread through a bounded inbox (`inbox_capacity`; `0` = default 64)
+/// with a drop-oldest overflow policy. The caller guarantees `user_data`
+/// is safe to use from that thread. QWP/WebSocket only; at most one
+/// listener per builder.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn line_sender_opts_connection_event_handler(
+    opts: *mut line_sender_opts,
+    cb: crate::column_sender::questdb_connection_event_cb,
+    user_data: *mut c_void,
+    inbox_capacity: size_t,
+    err_out: *mut *mut line_sender_error,
+) -> bool {
+    unsafe {
+        if opts.is_null() {
+            set_err_out(
+                err_out,
+                ErrorCode::InvalidApiCall,
+                "line_sender_opts_connection_event_handler requires non-NULL opts".to_string(),
+            );
+            return false;
+        }
+        let builder_ref: &mut SenderBuilder = &mut (*opts).0;
+        let current = builder_ref.clone();
+        let listener = crate::column_sender::connection_listener_from_c(cb, user_data);
+        let new_builder = match current.connection_listener(listener, inbox_capacity) {
+            Ok(builder) => builder,
+            Err(err) => {
+                set_err_out_from_error(err_out, err);
+                return false;
+            }
+        };
+        *builder_ref = new_builder;
+        true
+    }
+}
+
+/// Total connection events discarded by the sender listener inbox's
+/// drop-oldest policy. `0` for a NULL sender or when no listener is
+/// registered.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn line_sender_connection_events_dropped(sender: *const line_sender) -> u64 {
+    if sender.is_null() {
+        return 0;
+    }
+    unsafe { (*sender).0.connection_events_dropped() }
+}
+
+/// Total connection events delivered to the sender listener. `0` for a
+/// NULL sender or when no listener is registered.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn line_sender_connection_events_delivered(
+    sender: *const line_sender,
+) -> u64 {
+    if sender.is_null() {
+        return 0;
+    }
+    unsafe { (*sender).0.connection_events_delivered() }
+}
+
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn line_sender_opts_qwpws_error_handler(
     opts: *mut line_sender_opts,

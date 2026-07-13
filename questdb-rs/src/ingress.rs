@@ -72,9 +72,9 @@ use ring::{
 #[cfg(feature = "_sync-sender")]
 mod conf;
 
-#[cfg(feature = "sync-sender-qwp-ws")]
+#[cfg(feature = "_sender-qwp-ws")]
 pub mod conn_events;
-#[cfg(feature = "sync-sender-qwp-ws")]
+#[cfg(feature = "_sender-qwp-ws")]
 pub use conn_events::{
     ConnectionEvent, ConnectionEventDispatcher, ConnectionEventKind, ConnectionListener,
 };
@@ -1687,6 +1687,38 @@ impl SenderBuilder {
     }
 
     #[cfg(feature = "_sender-qwp-ws")]
+    /// Register a connection lifecycle listener: one
+    /// [`ConnectionEvent`](crate::ingress::ConnectionEvent) per
+    /// connection-state transition of this sender's QWP/WebSocket
+    /// connection (initial connect, per-endpoint attempt failures,
+    /// disconnect, reconnect/failover, terminal auth rejection).
+    /// Delivered on a dedicated dispatcher thread through a bounded inbox
+    /// (`inbox_capacity`; `0` selects the default of 64) with a
+    /// drop-oldest overflow policy. At most one listener per sender.
+    pub fn connection_listener(
+        mut self,
+        listener: crate::ingress::ConnectionListener,
+        inbox_capacity: usize,
+    ) -> Result<Self> {
+        let Some(qwp_ws) = &mut self.qwp_ws else {
+            return Err(error::fmt!(
+                ConfigError,
+                "The \"connection_listener\" setting is only supported for QWP/WebSocket."
+            ));
+        };
+        if qwp_ws.conn_events.is_some() {
+            return Err(error::fmt!(
+                ConfigError,
+                "A connection listener is already registered on this builder."
+            ));
+        }
+        qwp_ws.conn_events = Some(std::sync::Arc::new(
+            conn_events::ConnectionEventSource::new(listener, inbox_capacity),
+        ));
+        Ok(self)
+    }
+
+    #[cfg(feature = "_sender-qwp-ws")]
     /// Control whether QWP/WebSocket progress is driven by a background thread
     /// or manually by the caller. The default is [`QwpWsProgress::Background`],
     /// matching the Java sender.
@@ -2778,6 +2810,10 @@ impl SenderBuilder {
             max_name_len,
             #[cfg(feature = "_sender-qwp-ws")]
             self.qwp_ws_error_handler.clone(),
+            #[cfg(feature = "_sender-qwp-ws")]
+            self.qwp_ws
+                .as_ref()
+                .and_then(|qwp_ws| qwp_ws.conn_events.clone()),
         );
 
         Ok(sender)

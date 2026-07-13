@@ -800,7 +800,7 @@ impl QwpWsPendingConnect {
                 QwpWsConnectKind::Foreground,
                 &self.qwp_ws,
                 self.auth_header.as_deref(),
-                None,
+                self.qwp_ws.conn_events.as_deref(),
             ) {
                 Ok(connected) => {
                     return Ok(Some(BlockingQwpWsTransport::from_connected(
@@ -2838,6 +2838,15 @@ pub(crate) fn connect_qwp_ws_endpoint_round<A: QwpWsHealthAccess>(
     auth_header: Option<&str>,
     events: Option<&crate::ingress::conn_events::ConnectionEventSource>,
 ) -> crate::Result<QwpWsConnectRoundSuccess> {
+    // Background (orphan-drainer) walks never narrate: reporting their
+    // failures would claim an outage against an endpoint the foreground
+    // may be healthily using. Mirrors the Java sender's `if (!background)`
+    // guards; health tracking is recorded either way.
+    let events = if matches!(connect_kind, QwpWsConnectKind::Foreground) {
+        events
+    } else {
+        None
+    };
     if let Some(idx) = previous_idx.take() {
         health.with_tracker(|t| t.record_mid_stream_failure(idx, previous_failure));
     }
@@ -3368,7 +3377,7 @@ fn connect_blocking_transport_with_retry(
             QwpWsConnectKind::Foreground,
             qwp_ws,
             auth_header.as_deref(),
-            None,
+            qwp_ws.conn_events.as_deref(),
         ) {
             Ok(connected) => {
                 return Ok(BlockingQwpWsTransport::from_connected(

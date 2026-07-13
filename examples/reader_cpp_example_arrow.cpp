@@ -52,11 +52,8 @@ bool example()
     }
     catch (const questdb::error& e)
     {
-        std::fprintf(stderr, "Error: %s\n", e.what());
-        return false;
-    }
-    catch (const ingress::line_sender_error& e)
-    {
+        // `ingress::line_sender_error` derives from `questdb::error`, so
+        // this one handler covers both.
         std::fprintf(stderr, "Error: %s\n", e.what());
         return false;
     }

@@ -273,6 +273,15 @@ fn dispatch_loop(inner: Arc<DispatcherInner>) {
 ///   different endpoint than the previous one;
 /// - nothing for a same-endpoint success with no intervening failure
 ///   (e.g. pool growth opening additional connections).
+impl std::fmt::Debug for ConnectionEventSource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ConnectionEventSource")
+            .field("delivered", &self.delivered())
+            .field("dropped", &self.dropped())
+            .finish()
+    }
+}
+
 pub(crate) struct ConnectionEventSource {
     dispatcher: ConnectionEventDispatcher,
     attempts: AtomicU64,
@@ -383,10 +392,11 @@ mod tests {
         }
     }
 
+    type SeenKindsAndHosts = Arc<Mutex<Vec<(ConnectionEventKind, Option<String>)>>>;
+
     #[test]
     fn delivers_in_order_on_dispatcher_thread() {
-        let seen: Arc<Mutex<Vec<(ConnectionEventKind, Option<String>)>>> =
-            Arc::new(Mutex::new(Vec::new()));
+        let seen: SeenKindsAndHosts = Arc::new(Mutex::new(Vec::new()));
         let seen_in_listener = Arc::clone(&seen);
         let offering_thread = std::thread::current().id();
         let dispatcher = ConnectionEventDispatcher::new(

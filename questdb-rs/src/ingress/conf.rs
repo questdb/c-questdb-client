@@ -312,6 +312,12 @@ pub(crate) struct QwpWsConfig {
     pub(crate) progress: ConfigSetting<QwpWsProgress>,
     pub(crate) max_frame_rejections: ConfigSetting<usize>,
     pub(crate) poison_min_escalation_window: ConfigSetting<std::time::Duration>,
+    /// Optional connection lifecycle event source, set by
+    /// `SenderBuilder::connection_listener`. Carried in the config so the
+    /// blocking transport and the store-and-forward runner (which clone
+    /// this config) can narrate their connects; the endpoint walk fires
+    /// through it for foreground connects only.
+    pub(crate) conn_events: Option<std::sync::Arc<super::conn_events::ConnectionEventSource>>,
 }
 
 #[cfg(feature = "_sender-qwp-ws")]
@@ -355,6 +361,7 @@ impl Default for QwpWsConfig {
             poison_min_escalation_window: ConfigSetting::new_default(
                 QWP_WS_DEFAULT_POISON_MIN_ESCALATION_WINDOW,
             ),
+            conn_events: None,
         }
     }
 }

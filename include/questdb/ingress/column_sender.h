@@ -356,46 +356,10 @@ size_t questdb_db_reap_idle(questdb_db* db);
  * observe the initial `connected` event.
  * ------------------------------------------------------------------------- */
 
-/** Connection lifecycle event kinds. */
-#define questdb_connection_event_connected 0u
-#define questdb_connection_event_disconnected 1u
-#define questdb_connection_event_reconnected 2u
-#define questdb_connection_event_failed_over 3u
-#define questdb_connection_event_endpoint_attempt_failed 4u
-#define questdb_connection_event_all_endpoints_unreachable 5u
-#define questdb_connection_event_auth_failed 6u
-
-/** One connection-state transition. String fields are borrowed UTF-8
- * slices valid only for the duration of the callback; absent strings are
- * NULL with length 0. */
-typedef struct questdb_connection_event
-{
-    /** One of the `questdb_connection_event_*` kind constants. */
-    uint32_t kind;
-    const char* host;
-    size_t host_len;
-    const char* port;
-    size_t port_len;
-    const char* previous_host;
-    size_t previous_host_len;
-    const char* previous_port;
-    size_t previous_port_len;
-    bool has_attempt;
-    uint64_t attempt_number;
-    bool has_cause;
-    line_sender_error_code cause_code;
-    const char* cause_msg;
-    size_t cause_msg_len;
-    /** Wall-clock time of the event, milliseconds since the Unix epoch. */
-    int64_t timestamp_millis;
-} questdb_connection_event;
-
-/** Callback invoked once per connection event on the dispatcher thread.
- * The `event` pointer and every string it references are valid only for
- * the duration of the call. Must not unwind. */
-typedef void (*questdb_connection_event_cb)(
-    void* user_data,
-    const questdb_connection_event* event);
+/* Connection-event types (`questdb_connection_event`, the kind constants,
+ * and `questdb_connection_event_cb`) are declared in
+ * `questdb/ingress/line_sender.h`, shared with the sender-level
+ * `line_sender_opts_connection_event_handler`. */
 
 /** Register a connection lifecycle listener on the pool. `inbox_capacity`
  * of 0 selects the default (64). At most one listener per pool; a second

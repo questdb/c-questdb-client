@@ -897,6 +897,67 @@ fn str_or_null(value: Option<&str>) -> (*const c_char, size_t) {
     }
 }
 
+/// Adapt a C callback + user_data pair into a [`ConnectionListener`].
+/// The caller guarantees `user_data` is safe to use from the dispatcher
+/// thread.
+pub(crate) fn connection_listener_from_c(
+    callback: questdb_connection_event_cb,
+    user_data: *mut c_void,
+) -> questdb::ingress::ConnectionListener {
+    let handle = ConnectionEventCbHandle {
+        callback,
+        user_data,
+    };
+    std::sync::Arc::new(move |event: &questdb::ingress::ConnectionEvent| {
+        let kind = match event.kind {
+            questdb::ingress::ConnectionEventKind::Connected => questdb_connection_event_connected,
+            questdb::ingress::ConnectionEventKind::Disconnected => {
+                questdb_connection_event_disconnected
+            }
+            questdb::ingress::ConnectionEventKind::Reconnected => {
+                questdb_connection_event_reconnected
+            }
+            questdb::ingress::ConnectionEventKind::FailedOver => {
+                questdb_connection_event_failed_over
+            }
+            questdb::ingress::ConnectionEventKind::EndpointAttemptFailed => {
+                questdb_connection_event_endpoint_attempt_failed
+            }
+            questdb::ingress::ConnectionEventKind::AllEndpointsUnreachable => {
+                questdb_connection_event_all_endpoints_unreachable
+            }
+            questdb::ingress::ConnectionEventKind::AuthFailed => {
+                questdb_connection_event_auth_failed
+            }
+            _ => return,
+        };
+        let (host, host_len) = str_or_null(event.host.as_deref());
+        let (port, port_len) = str_or_null(event.port.as_deref());
+        let (previous_host, previous_host_len) = str_or_null(event.previous_host.as_deref());
+        let (previous_port, previous_port_len) = str_or_null(event.previous_port.as_deref());
+        let (cause_msg, cause_msg_len) = str_or_null(event.cause_msg.as_deref());
+        let view = questdb_connection_event {
+            kind,
+            host,
+            host_len,
+            port,
+            port_len,
+            previous_host,
+            previous_host_len,
+            previous_port,
+            previous_port_len,
+            has_attempt: event.attempt_number.is_some(),
+            attempt_number: event.attempt_number.unwrap_or(0),
+            has_cause: event.cause_code.is_some(),
+            cause_code: event.cause_code.unwrap_or(ErrorCode::InvalidApiCall).into(),
+            cause_msg,
+            cause_msg_len,
+            timestamp_millis: event.timestamp_millis,
+        };
+        handle.invoke(&view);
+    })
+}
+
 /// Register a connection lifecycle listener on the pool. Events fire for
 /// every ingress pool connect (initial connect, per-endpoint attempt
 /// failures, all-endpoints-unreachable sweeps, failover to a different
@@ -930,61 +991,7 @@ pub unsafe extern "C" fn questdb_db_set_connection_event_handler(
         }
         return false;
     }
-    let handle = ConnectionEventCbHandle {
-        callback,
-        user_data,
-    };
-    let listener: questdb::ingress::ConnectionListener =
-        std::sync::Arc::new(move |event: &questdb::ingress::ConnectionEvent| {
-            let kind = match event.kind {
-                questdb::ingress::ConnectionEventKind::Connected => {
-                    questdb_connection_event_connected
-                }
-                questdb::ingress::ConnectionEventKind::Disconnected => {
-                    questdb_connection_event_disconnected
-                }
-                questdb::ingress::ConnectionEventKind::Reconnected => {
-                    questdb_connection_event_reconnected
-                }
-                questdb::ingress::ConnectionEventKind::FailedOver => {
-                    questdb_connection_event_failed_over
-                }
-                questdb::ingress::ConnectionEventKind::EndpointAttemptFailed => {
-                    questdb_connection_event_endpoint_attempt_failed
-                }
-                questdb::ingress::ConnectionEventKind::AllEndpointsUnreachable => {
-                    questdb_connection_event_all_endpoints_unreachable
-                }
-                questdb::ingress::ConnectionEventKind::AuthFailed => {
-                    questdb_connection_event_auth_failed
-                }
-                _ => return,
-            };
-            let (host, host_len) = str_or_null(event.host.as_deref());
-            let (port, port_len) = str_or_null(event.port.as_deref());
-            let (previous_host, previous_host_len) = str_or_null(event.previous_host.as_deref());
-            let (previous_port, previous_port_len) = str_or_null(event.previous_port.as_deref());
-            let (cause_msg, cause_msg_len) = str_or_null(event.cause_msg.as_deref());
-            let view = questdb_connection_event {
-                kind,
-                host,
-                host_len,
-                port,
-                port_len,
-                previous_host,
-                previous_host_len,
-                previous_port,
-                previous_port_len,
-                has_attempt: event.attempt_number.is_some(),
-                attempt_number: event.attempt_number.unwrap_or(0),
-                has_cause: event.cause_code.is_some(),
-                cause_code: event.cause_code.unwrap_or(ErrorCode::InvalidApiCall).into(),
-                cause_msg,
-                cause_msg_len,
-                timestamp_millis: event.timestamp_millis,
-            };
-            handle.invoke(&view);
-        });
+    let listener = connection_listener_from_c(callback, user_data);
     let db_ref = unsafe { &*db };
     match db_ref.0.set_connection_listener(listener, inbox_capacity) {
         Ok(()) => true,

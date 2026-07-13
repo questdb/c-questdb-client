@@ -5586,19 +5586,16 @@ mod conn_event_tests {
         drop(server_a);
         let deadline = Instant::now() + Duration::from_secs(5);
         loop {
-            match db.borrow_direct_column_sender() {
-                Ok(mut borrowed) => {
-                    borrowed.drop_on_return();
-                    let saw_failover = seen
-                        .lock()
-                        .unwrap()
-                        .iter()
-                        .any(|e| e.kind == ConnectionEventKind::FailedOver);
-                    if saw_failover {
-                        break;
-                    }
+            if let Ok(mut borrowed) = db.borrow_direct_column_sender() {
+                borrowed.drop_on_return();
+                let saw_failover = seen
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .any(|e| e.kind == ConnectionEventKind::FailedOver);
+                if saw_failover {
+                    break;
                 }
-                Err(_) => {}
             }
             assert!(Instant::now() < deadline, "no FailedOver observed");
             thread::sleep(Duration::from_millis(10));
@@ -5614,5 +5611,122 @@ mod conn_event_tests {
         );
         drop(events);
         drop(server_b);
+    }
+}
+
+mod sender_conn_event_tests {
+    use super::*;
+    use crate::ingress::SenderBuilder;
+    use crate::ingress::conn_events::{ConnectionEvent, ConnectionEventKind};
+    use std::sync::Mutex as StdMutex;
+    use std::time::Instant;
+
+    fn collecting_listener() -> (
+        Arc<StdMutex<Vec<ConnectionEvent>>>,
+        crate::ingress::ConnectionListener,
+    ) {
+        let seen: Arc<StdMutex<Vec<ConnectionEvent>>> = Arc::new(StdMutex::new(Vec::new()));
+        let seen_in_listener = Arc::clone(&seen);
+        let listener: crate::ingress::ConnectionListener =
+            Arc::new(move |event: &ConnectionEvent| {
+                seen_in_listener.lock().unwrap().push(event.clone());
+            });
+        (seen, listener)
+    }
+
+    fn wait_for_kind(
+        seen: &Arc<StdMutex<Vec<ConnectionEvent>>>,
+        want: ConnectionEventKind,
+    ) -> ConnectionEvent {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if let Some(event) = seen
+                .lock()
+                .unwrap()
+                .iter()
+                .find(|e| e.kind == want)
+                .cloned()
+            {
+                return event;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "timed out waiting for {want:?}; saw {:?}",
+                seen.lock()
+                    .unwrap()
+                    .iter()
+                    .map(|e| e.kind)
+                    .collect::<Vec<_>>()
+            );
+            thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    #[test]
+    fn sender_build_fires_connected() {
+        let server = MockServer::spawn(2);
+        let (seen, listener) = collecting_listener();
+        let sender = SenderBuilder::from_conf(conf_for(server.port(), ""))
+            .unwrap()
+            .connection_listener(listener, 0)
+            .unwrap()
+            .build()
+            .unwrap();
+        let connected = wait_for_kind(&seen, ConnectionEventKind::Connected);
+        assert_eq!(connected.host.as_deref(), Some("127.0.0.1"));
+        assert_eq!(
+            connected.port.as_deref(),
+            Some(server.port().to_string()).as_deref()
+        );
+        assert_eq!(sender.connection_events_delivered(), 1);
+        assert_eq!(sender.connection_events_dropped(), 0);
+        drop(sender);
+    }
+
+    #[test]
+    fn sender_unreachable_fires_attempt_failed_and_unreachable() {
+        let port = {
+            let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+            listener.local_addr().unwrap().port()
+        };
+        let (seen, listener) = collecting_listener();
+        let conf = format!(
+            "ws::addr=127.0.0.1:{port};auth_timeout=2000;\
+             reconnect_max_duration_millis=200;connect_timeout=100;"
+        );
+        let err = SenderBuilder::from_conf(conf)
+            .unwrap()
+            .connection_listener(listener, 0)
+            .unwrap()
+            .build()
+            .expect_err("no server listening");
+        assert_eq!(err.code(), ErrorCode::SocketError);
+        let attempt = wait_for_kind(&seen, ConnectionEventKind::EndpointAttemptFailed);
+        assert!(attempt.attempt_number.is_some());
+        assert!(attempt.cause_code.is_some());
+        wait_for_kind(&seen, ConnectionEventKind::AllEndpointsUnreachable);
+    }
+
+    #[test]
+    fn second_builder_listener_rejected() {
+        let (_seen, listener) = collecting_listener();
+        let (_seen2, listener2) = collecting_listener();
+        let err = SenderBuilder::from_conf("ws::addr=127.0.0.1:1;")
+            .unwrap()
+            .connection_listener(listener, 0)
+            .unwrap()
+            .connection_listener(listener2, 0)
+            .unwrap_err();
+        assert_eq!(err.code(), ErrorCode::ConfigError);
+    }
+
+    #[test]
+    fn non_ws_builder_listener_rejected() {
+        let (_seen, listener) = collecting_listener();
+        let err = SenderBuilder::from_conf("http::addr=127.0.0.1:9000;")
+            .unwrap()
+            .connection_listener(listener, 0)
+            .unwrap_err();
+        assert_eq!(err.code(), ErrorCode::ConfigError);
     }
 }

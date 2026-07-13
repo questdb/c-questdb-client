@@ -2213,6 +2213,72 @@ int64_t line_sender_now_nanos(void);
 QUESTDB_CLIENT_API
 int64_t line_sender_now_micros(void);
 
+/* -------------------------------------------------------------------------
+ * Connection lifecycle events (QWP/WebSocket senders and pools)
+ * ------------------------------------------------------------------------- */
+
+/** Connection lifecycle event kinds. */
+#define questdb_connection_event_connected 0u
+#define questdb_connection_event_disconnected 1u
+#define questdb_connection_event_reconnected 2u
+#define questdb_connection_event_failed_over 3u
+#define questdb_connection_event_endpoint_attempt_failed 4u
+#define questdb_connection_event_all_endpoints_unreachable 5u
+#define questdb_connection_event_auth_failed 6u
+
+/** One connection-state transition. String fields are borrowed UTF-8
+ * slices valid only for the duration of the callback; absent strings are
+ * NULL with length 0. */
+typedef struct questdb_connection_event
+{
+    /** One of the `questdb_connection_event_*` kind constants. */
+    uint32_t kind;
+    const char* host;
+    size_t host_len;
+    const char* port;
+    size_t port_len;
+    const char* previous_host;
+    size_t previous_host_len;
+    const char* previous_port;
+    size_t previous_port_len;
+    bool has_attempt;
+    uint64_t attempt_number;
+    bool has_cause;
+    line_sender_error_code cause_code;
+    const char* cause_msg;
+    size_t cause_msg_len;
+    /** Wall-clock time of the event, milliseconds since the Unix epoch. */
+    int64_t timestamp_millis;
+} questdb_connection_event;
+
+/** Callback invoked once per connection event on the dispatcher thread.
+ * The `event` pointer and every string it references are valid only for
+ * the duration of the call. Must not unwind. */
+typedef void (*questdb_connection_event_cb)(
+    void* user_data,
+    const questdb_connection_event* event);
+
+/** Register a connection lifecycle listener on the sender being built.
+ * Events are delivered on a dedicated dispatcher thread through a bounded
+ * inbox (`inbox_capacity`; 0 = default 64) with a drop-oldest overflow
+ * policy. The caller guarantees `user_data` is safe to use from that
+ * thread. QWP/WebSocket only; at most one listener per builder. */
+QUESTDB_CLIENT_API
+bool line_sender_opts_connection_event_handler(
+    line_sender_opts* opts,
+    questdb_connection_event_cb cb,
+    void* user_data,
+    size_t inbox_capacity,
+    line_sender_error** err_out);
+
+/** Total connection events dropped by the sender listener inbox. */
+QUESTDB_CLIENT_API
+uint64_t line_sender_connection_events_dropped(const line_sender* sender);
+
+/** Total connection events delivered to the sender listener. */
+QUESTDB_CLIENT_API
+uint64_t line_sender_connection_events_delivered(const line_sender* sender);
+
 #ifdef __cplusplus
 }
 #endif

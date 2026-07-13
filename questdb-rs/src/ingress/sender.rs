@@ -170,6 +170,8 @@ pub struct Sender {
     max_name_len: usize,
     #[cfg(feature = "_sender-qwp-ws")]
     qwp_ws_error_handler: QwpWsErrorHandler,
+    #[cfg(feature = "_sender-qwp-ws")]
+    conn_events: Option<std::sync::Arc<crate::ingress::conn_events::ConnectionEventSource>>,
 }
 
 impl Debug for Sender {
@@ -179,6 +181,26 @@ impl Debug for Sender {
 }
 
 impl Sender {
+    /// Total connection events discarded by the listener inbox's
+    /// drop-oldest policy. `0` when no listener is registered.
+    #[cfg(feature = "_sender-qwp-ws")]
+    pub fn connection_events_dropped(&self) -> u64 {
+        self.conn_events
+            .as_deref()
+            .map(|events| events.dropped())
+            .unwrap_or(0)
+    }
+
+    /// Total connection events delivered to the listener. `0` when no
+    /// listener is registered.
+    #[cfg(feature = "_sender-qwp-ws")]
+    pub fn connection_events_delivered(&self) -> u64 {
+        self.conn_events
+            .as_deref()
+            .map(|events| events.delivered())
+            .unwrap_or(0)
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         descr: String,
@@ -189,6 +211,9 @@ impl Sender {
         protocol_version: ProtocolVersion,
         max_name_len: usize,
         #[cfg(feature = "_sender-qwp-ws")] qwp_ws_error_handler: QwpWsErrorHandler,
+        #[cfg(feature = "_sender-qwp-ws")] conn_events: Option<
+            std::sync::Arc<crate::ingress::conn_events::ConnectionEventSource>,
+        >,
     ) -> Self {
         Self {
             descr,
@@ -201,6 +226,8 @@ impl Sender {
             max_name_len,
             #[cfg(feature = "_sender-qwp-ws")]
             qwp_ws_error_handler,
+            #[cfg(feature = "_sender-qwp-ws")]
+            conn_events,
         }
     }
 

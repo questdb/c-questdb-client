@@ -2887,7 +2887,7 @@ impl BlockingQwpWsTransport {
             connect_kind,
             &qwp_ws,
             auth_header.as_deref(),
-            None,
+            qwp_ws.conn_events.as_deref(),
         )?;
         Ok(Self::from_connected(
             endpoints,
@@ -2939,6 +2939,13 @@ impl BlockingQwpWsTransport {
     }
 
     fn reconnect(&mut self, reason: ReconnectReason) -> Result<(), DriverError> {
+        if matches!(self.connect_kind, QwpWsConnectKind::Foreground)
+            && let Some(events) = self.qwp_ws.conn_events.as_deref()
+            && let Some(idx) = self.previous_idx
+            && let Some(endpoint) = self.endpoints.get(idx)
+        {
+            events.disconnected(&endpoint.host, &endpoint.port);
+        }
         let connected = connect_qwp_ws_endpoint_round(
             &self.endpoints,
             &mut self.tracker,
@@ -2949,7 +2956,7 @@ impl BlockingQwpWsTransport {
             self.connect_kind,
             &self.qwp_ws,
             self.auth_header.as_deref(),
-            None,
+            self.qwp_ws.conn_events.as_deref(),
         )
         .map_err(DriverError::Transport)?;
         self.previous_idx = Some(connected.endpoint_idx);
