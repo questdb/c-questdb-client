@@ -41,7 +41,9 @@
 #include <optional>
 #include <sstream>
 #include <string>
+#include <string_view>
 #include <thread>
+#include <type_traits>
 #include <utility>
 #include <vector>
 
@@ -2968,6 +2970,52 @@ TEST_CASE("line_sender c++ qwpudp decimal column")
     CHECK(*decoded.values[2] == trimmed_signed_i64_be(-34'500));
     REQUIRE(decoded.values[3].has_value());
     CHECK(*decoded.values[3] == trimmed_signed_i64_be(12'000));
+}
+
+TEST_CASE("line_sender c++ string view constructors")
+{
+    using questdb::ingress::utf8_view;
+    using questdb::ingress::decimal::decimal_str_view;
+
+    static_assert(std::is_constructible_v<decimal_str_view, const char*>);
+    static_assert(!std::is_convertible_v<const char*, decimal_str_view>);
+    static_assert(std::is_constructible_v<utf8_view, const char*>);
+    static_assert(!std::is_convertible_v<const char*, utf8_view>);
+
+    // Regression: the array constructor must strip the NUL terminator, so a
+    // brace-initialised literal yields the visible length, not length + 1.
+    const decimal_str_view dec_lit{"1.23"};
+    CHECK(dec_lit.size() == 4);
+
+    const utf8_view utf8_lit{"hello"};
+    CHECK(utf8_lit.size() == 5);
+
+    // An embedded NUL distinguishes the length-aware array overload from the
+    // C-string pointer overload, which intentionally stops at the first NUL.
+    const decimal_str_view dec_embedded{"1\0.2"};
+    CHECK(dec_embedded.size() == 4);
+    CHECK(
+        std::string_view{dec_embedded.data(), dec_embedded.size()} ==
+        std::string_view{"1\0.2", 4});
+
+    const utf8_view utf8_embedded{"a\0b"};
+    CHECK(utf8_embedded.size() == 3);
+    CHECK(utf8_embedded.to_string_view() == std::string_view{"a\0b", 3});
+
+    CHECK_THROWS_AS(
+        questdb::ingress::column_name_view{"a\0b"},
+        questdb::ingress::line_sender_error);
+
+    // Regression: a bare `const char*` must be unambiguous (previously a
+    // compile error between the string_view and std::string overloads), while
+    // remaining an explicit conversion for compatibility with main.
+    const char* dec_ptr = "45.6789";
+    const decimal_str_view dec_from_ptr{dec_ptr};
+    CHECK(dec_from_ptr.size() == 7);
+
+    const char* utf8_ptr = "world!";
+    const utf8_view utf8_from_ptr{utf8_ptr};
+    CHECK(utf8_from_ptr.size() == 6);
 }
 
 TEST_CASE("line_sender c++ qwpudp decimal signed boundaries")
