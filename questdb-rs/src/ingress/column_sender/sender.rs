@@ -216,6 +216,12 @@ struct DirectColumnBackend {
     symbol_dict: SymbolGlobalDict,
     scratch: encoder::EncodeScratch,
     first_frame_sent: bool,
+    /// A mid-split internal `sync` committed a prefix server-side since the
+    /// last successful commit+ack boundary (a caller `sync` or a waited
+    /// flush). While set, a failed `sync` classifies as delivery-unknown
+    /// even at "provably not delivered" sites: a blind whole-operation
+    /// resend would duplicate that prefix.
+    commit_since_sync: bool,
 }
 
 struct SfaColumnBackend {
@@ -301,6 +307,7 @@ impl ColumnSender {
                 symbol_dict,
                 scratch,
                 first_frame_sent,
+                commit_since_sync: false,
             })),
         }
     }
@@ -859,22 +866,17 @@ impl DirectColumnBackend {
         // deferral state untouched — the next data flush still chooses defer
         // from `first_frame_sent` exactly as before.
         //
-        // With frames pending at entry, ANY failure of this call is
-        // delivery-unknown for the operation: the pending frames' fate —
-        // including a prefix an earlier split already committed
-        // server-side — is unresolved, so a caller that retried on a
-        // not-delivered classification would duplicate committed rows.
-        // The per-site classifications inside `flush_inner` (the entry
-        // ack drain, a commit-frame write that provably never left) are
-        // about the commit frame itself; `deny_retry_after_partial`
-        // re-scopes them to the sync's actual question. A sync with
-        // nothing pending keeps its classification: retrying it is safe.
-        let pending_at_entry = self.conn.in_flight() > 0;
+        // Pending deferred frames die uncommitted with the connection, so a
+        // failure before this sync's commit frame could reach the wire is
+        // genuinely not-delivered and a whole-operation resend is safe —
+        // unless a mid-split internal sync already committed a prefix
+        // (`commit_since_sync`): then the same sites must report
+        // delivery-unknown or a blind resend would duplicate that prefix.
         let first_frame_sent = self.first_frame_sent;
         let mut commit_chunk = Chunk::new("");
         let mut result = self.flush_inner(&mut commit_chunk, WaitForAck::Yes(ack_level));
         self.first_frame_sent = first_frame_sent;
-        if pending_at_entry {
+        if self.commit_since_sync {
             result = result.map_err(deny_retry_after_partial);
         }
         result.map_err(FlushFailure::into_error)
@@ -956,6 +958,7 @@ impl DirectColumnBackend {
             self.conn
                 .sync_all_acks(level)
                 .map_err(direct_delivery_unknown)?;
+            self.commit_since_sync = false;
         }
         Ok(())
     }
@@ -1054,6 +1057,7 @@ impl DirectColumnBackend {
                     // anywhere in this split must not report the whole chunk as
                     // safe to blind-retry (it would duplicate this prefix).
                     *committed = true;
+                    self.commit_since_sync = true;
                     self.publish_frame(chunk, Some((row_offset, row_count)), defer_commit)?
                 }
                 outcome => outcome,
@@ -1148,6 +1152,7 @@ impl DirectColumnBackend {
             self.conn
                 .sync_all_acks(level)
                 .map_err(direct_delivery_unknown)?;
+            self.commit_since_sync = false;
         }
         Ok(())
     }
@@ -1236,6 +1241,7 @@ impl DirectColumnBackend {
                         .map_err(FlushFailure::DeliveryUnknown)?;
                     // Prefix committed on the server: see `publish_split`.
                     *committed = true;
+                    self.commit_since_sync = true;
                     self.publish_arrow_frame(spec, Some((row_offset, row_count)), defer_commit)?
                 }
                 outcome => outcome,
