@@ -1260,7 +1260,7 @@ public:
      * Create a new `opts` instance from the given configuration string.
      * The format of the string is: "tcp::addr=host:port;key=value;...;"
      * Instead of "tcp" you can also specify "tcps", "http", "https",
-     * "qwpudp", "ws", and "wss".
+     * "udp", "ws", and "wss".
      *
      * The accepted keys match one-for-one with the methods on `opts`.
      * For example, this is a valid configuration string:
@@ -1385,7 +1385,7 @@ public:
      * or dropped when it is not; fragmented UDP is fragile because losing any
      * fragment loses the whole datagram.
      *
-     * This setting is only supported for `protocol::qwpudp`.
+     * This setting is only supported for `protocol::udp`.
      */
     opts& max_datagram_size(size_t max_datagram_size)
     {
@@ -1401,7 +1401,7 @@ public:
      * address. A value of 0 prevents multicast datagrams from leaving the local
      * host.
      *
-     * This setting is only supported for `protocol::qwpudp`.
+     * This setting is only supported for `protocol::udp`.
      */
     opts& multicast_ttl(uint32_t multicast_ttl)
     {
@@ -1754,7 +1754,7 @@ public:
      * Create a new line sender instance from the given configuration string.
      * The format of the string is: "tcp::addr=host:port;key=value;...;"
      * Instead of "tcp" you can also specify "tcps", "http", "https",
-     * "qwpudp", "ws", and "wss".
+     * "udp", "ws", and "wss".
      *
      * The accepted keys match one-for-one with the methods on `opts`.
      * For example, this is a valid configuration string:
@@ -1873,7 +1873,7 @@ public:
                 "use the column_sender chunk API instead."};
         }
         auto backend = line_sender_buffer::_backend_kind::ilp;
-        if (sender_protocol == protocol::qwpudp)
+        if (sender_protocol == protocol::udp)
             backend = line_sender_buffer::_backend_kind::qwp_udp;
         auto* raw_buffer = ::line_sender_buffer_new_for_sender(_impl);
         try

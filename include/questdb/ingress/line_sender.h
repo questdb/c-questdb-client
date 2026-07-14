@@ -300,7 +300,7 @@ typedef enum line_sender_protocol
     line_sender_protocol_https,
 
     /** QuestWire Protocol over UDP (IPv4-only). */
-    line_sender_protocol_qwpudp,
+    line_sender_protocol_udp,
 
     /** QuestWire Protocol over WebSocket. */
     line_sender_protocol_ws,
@@ -1473,7 +1473,7 @@ typedef struct line_sender_opts line_sender_opts;
 /**
  * Create a new `line_sender_opts` instance from the given configuration
  * string. The format of the string is: "tcp::addr=host:port;key=value;...;"
- * Instead of "tcp" you can also specify "tcps", "http", "https", "qwpudp",
+ * Instead of "tcp" you can also specify "tcps", "http", "https", "udp",
  * "ws", and "wss".
  *
  * The accepted keys match one-for-one with the functions on
@@ -1547,7 +1547,7 @@ bool line_sender_opts_bind_interface(
  * or dropped when it is not; fragmented UDP is fragile because losing any
  * fragment loses the whole datagram.
  *
- * This setting is only supported for `line_sender_protocol_qwpudp`.
+ * This setting is only supported for `line_sender_protocol_udp`.
  * Returns `false` and sets `err_out` on constraint violation or
  * protocol mismatch.
  */
@@ -1567,7 +1567,7 @@ bool line_sender_opts_max_datagram_size(
  * `multicast_ttl` must be in the 0–255 range (inclusive).
  * Values greater than 255 are treated as an error.
  *
- * This setting is only supported for `line_sender_protocol_qwpudp`.
+ * This setting is only supported for `line_sender_protocol_udp`.
  * Returns `false` and sets `err_out` on constraint violation or
  * protocol mismatch.
  */
@@ -1853,7 +1853,7 @@ line_sender* line_sender_build(
  * Create a new line sender instance from the given configuration string.
  * The format of the string is: "tcp::addr=host:port;key=value;...;"
  * Instead of "tcp" you can also specify "tcps", "http", "https",
- * "qwpudp", "ws", and "wss".
+ * "udp", "ws", and "wss".
  *
  * The accepted keys match one-for-one with the functions on
  * `line_sender_opts`. For example, this is a valid configuration string:

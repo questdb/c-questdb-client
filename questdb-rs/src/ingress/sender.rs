@@ -236,7 +236,7 @@ impl Sender {
     /// The format of the string is: `"http::addr=host:port;key=value;...;"`.
     ///
     /// Instead of `"http"`, you can also specify `"https"`, `"tcp"`, `"tcps"`,
-    /// and `"qwpudp"`.
+    /// and `"udp"`.
     ///
     /// We recommend HTTP for most cases because it provides more features, like
     /// reporting errors to the client and supporting transaction control. TCP can

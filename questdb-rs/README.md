@@ -37,10 +37,10 @@ The transport is selected by the scheme in the configuration string:
   returned to the client, supports authentication and TLS.
 * `tcp::addr=...` / `tcps::addr=...` — ILP streaming, legacy; errors cause
   server-side disconnect and surface only in server logs.
-* `qwpudp::addr=...` — best-effort UDP datagrams (IPv4-only); no
+* `udp::addr=...` — best-effort UDP datagrams (IPv4-only); no
   acknowledgements, no authentication, no TLS, no transactional guarantees.
   See the [`ingress`](https://docs.rs/questdb-rs/latest/questdb/ingress/)
-  module docs (in particular `Protocol::QwpUdp`) for semantics and
+  module docs (in particular `Protocol::Udp`) for semantics and
   configuration parameters.
 
 ## ILP Protocol Versions

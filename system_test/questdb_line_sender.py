@@ -84,7 +84,7 @@ class Protocol(Enum):
     TCPS = (c_line_sender_protocol(1), 'tcps')
     HTTP = (c_line_sender_protocol(2), 'http')
     HTTPS = (c_line_sender_protocol(3), 'https')
-    QWPUDP = (c_line_sender_protocol(4), 'qwpudp')
+    QWPUDP = (c_line_sender_protocol(4), 'udp')
     WS = (c_line_sender_protocol(5), 'ws')
     WSS = (c_line_sender_protocol(6), 'wss')
 

@@ -25,8 +25,8 @@
 - [Example using HTTP](../examples/line_sender_c_example_http.c)
 
 **QWP/UDP**
-- [Example using QWP/UDP](../examples/line_sender_c_example_qwpudp.c)
-- [Batched QWP/UDP ingestion](../examples/line_sender_c_example_qwpudp_batch.c)
+- [Example using QWP/UDP](../examples/line_sender_c_example_udp.c)
+- [Batched QWP/UDP ingestion](../examples/line_sender_c_example_udp_batch.c)
 
 **Array Handling**
 - [Array with byte strides](../examples/line_sender_c_example_array_byte_strides.c)

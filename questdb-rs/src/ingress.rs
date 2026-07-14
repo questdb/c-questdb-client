@@ -307,7 +307,7 @@ pub enum Protocol {
 
     #[cfg(feature = "_sender-qwp-udp")]
     /// Quest Wire Protocol over UDP datagrams (IPv4-only).
-    QwpUdp,
+    Udp,
 
     #[cfg(feature = "_sender-qwp-ws")]
     /// Quest Wire Protocol over WebSocket (RFC 6455).
@@ -334,7 +334,7 @@ impl Protocol {
             #[cfg(feature = "_sender-http")]
             Protocol::Http | Protocol::Https => "9000",
             #[cfg(feature = "_sender-qwp-udp")]
-            Protocol::QwpUdp => "9007",
+            Protocol::Udp => "9007",
             #[cfg(feature = "_sender-qwp-ws")]
             Protocol::Ws | Protocol::Wss => "9000",
         }
@@ -351,7 +351,7 @@ impl Protocol {
             #[cfg(feature = "_sender-http")]
             Protocol::Https => true,
             #[cfg(feature = "_sender-qwp-udp")]
-            Protocol::QwpUdp => false,
+            Protocol::Udp => false,
             #[cfg(feature = "_sender-qwp-ws")]
             Protocol::Ws => false,
             #[cfg(feature = "_sender-qwp-ws")]
@@ -366,7 +366,7 @@ impl Protocol {
             #[cfg(feature = "_sender-http")]
             Protocol::Http | Protocol::Https => false,
             #[cfg(feature = "_sender-qwp-udp")]
-            Protocol::QwpUdp => false,
+            Protocol::Udp => false,
             #[cfg(feature = "_sender-qwp-ws")]
             Protocol::Ws | Protocol::Wss => false,
         }
@@ -379,7 +379,7 @@ impl Protocol {
             Protocol::Tcp | Protocol::Tcps => false,
             Protocol::Http | Protocol::Https => true,
             #[cfg(feature = "_sender-qwp-udp")]
-            Protocol::QwpUdp => false,
+            Protocol::Udp => false,
             #[cfg(feature = "_sender-qwp-ws")]
             Protocol::Ws | Protocol::Wss => false,
         }
@@ -387,7 +387,7 @@ impl Protocol {
 
     #[cfg(feature = "_sender-qwp-udp")]
     fn is_qwp_udp(&self) -> bool {
-        matches!(self, Protocol::QwpUdp)
+        matches!(self, Protocol::Udp)
     }
 
     #[cfg(feature = "_sender-qwp-ws")]
@@ -422,7 +422,7 @@ impl Protocol {
             #[cfg(feature = "_sender-http")]
             Protocol::Https => "https",
             #[cfg(feature = "_sender-qwp-udp")]
-            Protocol::QwpUdp => "qwpudp",
+            Protocol::Udp => "udp",
             #[cfg(feature = "_sender-qwp-ws")]
             Protocol::Ws => "ws",
             #[cfg(feature = "_sender-qwp-ws")]
@@ -448,8 +448,12 @@ impl Protocol {
             return Ok(Protocol::Https);
         }
         #[cfg(feature = "_sender-qwp-udp")]
-        if schema.eq_ignore_ascii_case("qwpudp") {
-            return Ok(Protocol::QwpUdp);
+        if schema.eq_ignore_ascii_case("udp") {
+            return Ok(Protocol::Udp);
+        }
+        #[cfg(feature = "_sender-qwp-udp")]
+        if schema.eq_ignore_ascii_case("udps") {
+            return Err(error::fmt!(ConfigError, "TLS is not supported for UDP."));
         }
         #[cfg(feature = "_sender-qwp-ws")]
         if schema.eq_ignore_ascii_case("ws") {
@@ -911,7 +915,7 @@ impl SenderBuilder {
     /// The format of the string is: `"http::addr=host:port;key=value;...;"`.
     ///
     /// Instead of `"http"`, you can also specify `"https"`, `"tcp"`, `"tcps"`,
-    /// `"qwpudp"`, and the QWP/WebSocket schemes `"ws"` / `"wss"` when the
+    /// `"udp"`, and the QWP/WebSocket schemes `"ws"` / `"wss"` when the
     /// corresponding sender features are enabled.
     ///
     /// We recommend HTTP for most cases because it provides more features, like
@@ -2681,7 +2685,7 @@ impl SenderBuilder {
                 })
             }
             #[cfg(feature = "sync-sender-qwp-udp")]
-            Protocol::QwpUdp => {
+            Protocol::Udp => {
                 let Some(qwp_udp) = self.qwp_udp.as_ref() else {
                     return Err(error::fmt!(
                         ConfigError,
@@ -2783,7 +2787,7 @@ impl SenderBuilder {
                     }
                 }
                 #[cfg(feature = "sync-sender-qwp-udp")]
-                Protocol::QwpUdp => ProtocolVersion::V1,
+                Protocol::Udp => ProtocolVersion::V1,
                 #[cfg(feature = "sync-sender-qwp-ws")]
                 Protocol::Ws | Protocol::Wss => ProtocolVersion::V1,
             },

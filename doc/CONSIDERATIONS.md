@@ -139,7 +139,7 @@ apply some and miss others.
 When rows do not appear server-side, inspect the
 [server logs](https://questdb.io/docs/troubleshooting/log/) and confirm that
 `qwp.udp.enabled=true` (and the matching bind address) are set on the
-server. The Rust module docs for `Protocol::QwpUdp` cover the full set of
+server. The Rust module docs for `Protocol::Udp` cover the full set of
 configuration parameters and their semantics.
 
 You can inspect the contents of a constructed buffer at any time calling:

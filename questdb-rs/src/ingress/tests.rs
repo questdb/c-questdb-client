@@ -82,11 +82,11 @@ fn tcps_simple() {
 
 #[cfg(feature = "sync-sender-qwp-udp")]
 #[test]
-fn qwpudp_simple() {
-    let builder = SenderBuilder::from_conf("qwpudp::addr=127.0.0.1;").unwrap();
-    assert_eq!(builder.protocol, Protocol::QwpUdp);
+fn udp_simple() {
+    let builder = SenderBuilder::from_conf("udp::addr=127.0.0.1;").unwrap();
+    assert_eq!(builder.protocol, Protocol::Udp);
     assert_specified_eq(&builder.host, "127.0.0.1");
-    assert_specified_eq(&builder.port, Protocol::QwpUdp.default_port());
+    assert_specified_eq(&builder.port, Protocol::Udp.default_port());
     assert!(!builder.protocol.tls_enabled());
     let qwp_udp = builder.qwp_udp.as_ref().unwrap();
     assert_defaulted_eq(&qwp_udp.max_datagram_size, 1400usize);
@@ -95,12 +95,12 @@ fn qwpudp_simple() {
 
 #[cfg(feature = "sync-sender-qwp-udp")]
 #[test]
-fn qwpudp_custom_config() {
+fn udp_custom_config() {
     let builder = SenderBuilder::from_conf(
-        "qwpudp::addr=239.1.2.3:19002;bind_interface=192.168.1.10;max_datagram_size=1200;multicast_ttl=7;",
+        "udp::addr=239.1.2.3:19002;bind_interface=192.168.1.10;max_datagram_size=1200;multicast_ttl=7;",
     )
     .unwrap();
-    assert_eq!(builder.protocol, Protocol::QwpUdp);
+    assert_eq!(builder.protocol, Protocol::Udp);
     assert_specified_eq(&builder.host, "239.1.2.3");
     assert_specified_eq(&builder.port, "19002");
     assert_specified_eq(&builder.net_interface, Some("192.168.1.10".to_string()));
@@ -111,17 +111,17 @@ fn qwpudp_custom_config() {
 
 #[cfg(feature = "sync-sender-qwp-udp")]
 #[test]
-fn qwpudp_sender_reports_transport_protocol() {
-    let sender = SenderBuilder::new(Protocol::QwpUdp, "127.0.0.1", 9007)
+fn udp_sender_reports_transport_protocol() {
+    let sender = SenderBuilder::new(Protocol::Udp, "127.0.0.1", 9007)
         .build()
         .unwrap();
-    assert_eq!(sender.protocol(), Protocol::QwpUdp);
+    assert_eq!(sender.protocol(), Protocol::Udp);
 }
 
 #[cfg(all(feature = "sync-sender-qwp-ws", feature = "sync-sender-qwp-udp"))]
 #[test]
 fn qwpws_error_polling_rejects_non_websocket_sender() {
-    let mut sender = SenderBuilder::new(Protocol::QwpUdp, "127.0.0.1", 9007)
+    let mut sender = SenderBuilder::new(Protocol::Udp, "127.0.0.1", 9007)
         .build()
         .unwrap();
 
@@ -623,9 +623,9 @@ fn uppercase_scheme_accepted_https() {
 
 #[cfg(feature = "sync-sender-qwp-udp")]
 #[test]
-fn uppercase_scheme_accepted_qwpudp() {
+fn uppercase_scheme_accepted_udp() {
     let builder = SenderBuilder::from_conf("QWPUDP::addr=localhost:9009;").unwrap();
-    assert_eq!(builder.protocol, Protocol::QwpUdp);
+    assert_eq!(builder.protocol, Protocol::Udp);
 }
 
 #[cfg(feature = "sync-sender-qwp-ws")]
@@ -821,9 +821,9 @@ fn cant_use_ecdsa_auth_with_http_ex_tcp_support() {
 
 #[cfg(feature = "sync-sender-qwp-udp")]
 #[test]
-fn qwpudp_protocol_version_unsupported() {
+fn udp_protocol_version_unsupported() {
     for version in ["1", "2", "3"] {
-        let conf = format!("qwpudp::addr=localhost;protocol_version={version};");
+        let conf = format!("udp::addr=localhost;protocol_version={version};");
         assert_conf_err(
             SenderBuilder::from_conf(&conf),
             "The \"protocol_version\" setting is not supported for QWP/UDP.",
@@ -836,7 +836,7 @@ fn qwpudp_protocol_version_unsupported() {
         ProtocolVersion::V3,
     ] {
         assert_conf_err(
-            SenderBuilder::new(Protocol::QwpUdp, "localhost", 9007).protocol_version(version),
+            SenderBuilder::new(Protocol::Udp, "localhost", 9007).protocol_version(version),
             "The \"protocol_version\" setting is not supported for QWP/UDP.",
         );
     }
@@ -844,9 +844,9 @@ fn qwpudp_protocol_version_unsupported() {
 
 #[cfg(feature = "sync-sender-qwp-udp")]
 #[test]
-fn qwpudp_max_datagram_size_requires_qwp_udp() {
+fn udp_max_datagram_size_requires_qwp_udp() {
     assert_conf_err(
-        SenderBuilder::new(Protocol::QwpUdp, "localhost", 9007).max_datagram_size(0),
+        SenderBuilder::new(Protocol::Udp, "localhost", 9007).max_datagram_size(0),
         "\"max_datagram_size\" must be greater than 0.",
     );
 
@@ -859,8 +859,8 @@ fn qwpudp_max_datagram_size_requires_qwp_udp() {
 
 #[cfg(feature = "sync-sender-qwp-udp")]
 #[test]
-fn qwpudp_max_datagram_size_accepts_udp_limit_and_rejects_above_it() {
-    let builder = SenderBuilder::new(Protocol::QwpUdp, "localhost", 9007)
+fn udp_max_datagram_size_accepts_udp_limit_and_rejects_above_it() {
+    let builder = SenderBuilder::new(Protocol::Udp, "localhost", 9007)
         .max_datagram_size(65507)
         .unwrap();
     let Some(qwp_udp) = builder.qwp_udp.as_ref() else {
@@ -869,16 +869,16 @@ fn qwpudp_max_datagram_size_accepts_udp_limit_and_rejects_above_it() {
     assert_specified_eq(&qwp_udp.max_datagram_size, 65507usize);
 
     assert_conf_err(
-        SenderBuilder::new(Protocol::QwpUdp, "localhost", 9007).max_datagram_size(65508),
+        SenderBuilder::new(Protocol::Udp, "localhost", 9007).max_datagram_size(65508),
         "\"max_datagram_size\" must not exceed 65507 (UDP/IPv4 limit).",
     );
 }
 
 #[cfg(feature = "sync-sender-qwp-udp")]
 #[test]
-fn qwpudp_multicast_ttl_requires_qwp_udp() {
+fn udp_multicast_ttl_requires_qwp_udp() {
     assert_conf_err(
-        SenderBuilder::new(Protocol::QwpUdp, "localhost", 9007).multicast_ttl(256),
+        SenderBuilder::new(Protocol::Udp, "localhost", 9007).multicast_ttl(256),
         "\"multicast_ttl\" must be between 0 and 255.",
     );
 
@@ -891,86 +891,86 @@ fn qwpudp_multicast_ttl_requires_qwp_udp() {
 
 #[cfg(feature = "sync-sender-qwp-udp")]
 #[test]
-fn qwpudp_config_string_rejects_invalid_datagram_size_and_multicast_ttl() {
+fn udp_config_string_rejects_invalid_datagram_size_and_multicast_ttl() {
     assert_conf_err(
-        SenderBuilder::from_conf("qwpudp::addr=localhost;max_datagram_size=0;"),
+        SenderBuilder::from_conf("udp::addr=localhost;max_datagram_size=0;"),
         "\"max_datagram_size\" must be greater than 0.",
     );
     assert_conf_err(
-        SenderBuilder::from_conf("qwpudp::addr=localhost;max_datagram_size=65508;"),
+        SenderBuilder::from_conf("udp::addr=localhost;max_datagram_size=65508;"),
         "\"max_datagram_size\" must not exceed 65507 (UDP/IPv4 limit).",
     );
     assert_conf_err(
-        SenderBuilder::from_conf("qwpudp::addr=localhost;multicast_ttl=256;"),
+        SenderBuilder::from_conf("udp::addr=localhost;multicast_ttl=256;"),
         "\"multicast_ttl\" must be between 0 and 255.",
     );
 }
 
 #[cfg(feature = "sync-sender-qwp-udp")]
 #[test]
-fn qwpudp_bind_interface_is_supported_via_builder_api() {
-    let builder = SenderBuilder::new(Protocol::QwpUdp, "239.1.2.3", 9007)
+fn udp_bind_interface_is_supported_via_builder_api() {
+    let builder = SenderBuilder::new(Protocol::Udp, "239.1.2.3", 9007)
         .bind_interface("192.168.1.10")
         .unwrap();
-    assert_eq!(builder.protocol, Protocol::QwpUdp);
+    assert_eq!(builder.protocol, Protocol::Udp);
     assert_specified_eq(&builder.net_interface, Some("192.168.1.10".to_string()));
 }
 
 #[cfg(feature = "sync-sender-qwp-udp")]
 #[test]
-fn qwpudp_auth_settings_are_rejected_at_config_time() {
+fn udp_auth_settings_are_rejected_at_config_time() {
     // Config string: from_conf itself must fail.
     assert_conf_err(
-        SenderBuilder::from_conf("qwpudp::addr=localhost;username=user123;"),
+        SenderBuilder::from_conf("udp::addr=localhost;username=user123;"),
         "The \"username\" setting is not supported for QWP/UDP.",
     );
     assert_conf_err(
-        SenderBuilder::from_conf("qwpudp::addr=localhost;password=pass321;"),
+        SenderBuilder::from_conf("udp::addr=localhost;password=pass321;"),
         "The \"password\" setting is not supported for QWP/UDP.",
     );
     assert_conf_err(
-        SenderBuilder::from_conf("qwpudp::addr=localhost;token=token123;"),
+        SenderBuilder::from_conf("udp::addr=localhost;token=token123;"),
         "The \"token\" setting is not supported for QWP/UDP.",
     );
 
     #[cfg(feature = "sync-sender-tcp")]
     {
         assert_conf_err(
-            SenderBuilder::from_conf("qwpudp::addr=localhost;token_x=pub_key1;"),
+            SenderBuilder::from_conf("udp::addr=localhost;token_x=pub_key1;"),
             "The \"token_x\" setting is not supported for QWP/UDP.",
         );
         assert_conf_err(
-            SenderBuilder::from_conf("qwpudp::addr=localhost;token_y=pub_key2;"),
+            SenderBuilder::from_conf("udp::addr=localhost;token_y=pub_key2;"),
             "The \"token_y\" setting is not supported for QWP/UDP.",
         );
     }
 
     // Builder API: setter must fail.
     assert_conf_err(
-        SenderBuilder::new(Protocol::QwpUdp, "localhost", 9007).username("user123"),
+        SenderBuilder::new(Protocol::Udp, "localhost", 9007).username("user123"),
         "The \"username\" setting is not supported for QWP/UDP.",
     );
     assert_conf_err(
-        SenderBuilder::new(Protocol::QwpUdp, "localhost", 9007).password("pass321"),
+        SenderBuilder::new(Protocol::Udp, "localhost", 9007).password("pass321"),
         "The \"password\" setting is not supported for QWP/UDP.",
     );
     assert_conf_err(
-        SenderBuilder::new(Protocol::QwpUdp, "localhost", 9007).token("token123"),
+        SenderBuilder::new(Protocol::Udp, "localhost", 9007).token("token123"),
         "The \"token\" setting is not supported for QWP/UDP.",
     );
 }
 
 #[cfg(feature = "sync-sender-qwp-udp")]
 #[test]
-fn qwpudp_auth_timeout_is_rejected_at_config_time() {
+fn udp_auth_timeout_is_rejected_at_config_time() {
     // Config string: from_conf itself must fail.
     assert_conf_err(
-        SenderBuilder::from_conf("qwpudp::addr=localhost;auth_timeout=100;"),
+        SenderBuilder::from_conf("udp::addr=localhost;auth_timeout=100;"),
         "The \"auth_timeout\" setting is not supported for QWP/UDP.",
     );
     // Builder API: setter must fail.
     assert_conf_err(
-        SenderBuilder::new(Protocol::QwpUdp, "localhost", 9007)
+        SenderBuilder::new(Protocol::Udp, "localhost", 9007)
             .auth_timeout(Duration::from_millis(100)),
         "The \"auth_timeout\" setting is not supported for QWP/UDP.",
     );

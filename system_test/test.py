@@ -3230,7 +3230,7 @@ class TestQwpUdpSender(unittest.TestCase):
         QDB_FIXTURE.http_sql_query(
             f'select * from long_sequence(1) -- <<<<<<<<< END PYTHON UNIT TEST: {test_name}')
 
-    def _mk_qwpudp_sender(self, **kwargs):
+    def _mk_udp_sender(self, **kwargs):
         return qls.Sender(
             BUILD_MODE,
             qls.Protocol.QWPUDP,
@@ -3307,7 +3307,7 @@ class TestQwpUdpSender(unittest.TestCase):
     def test_c_example_qwp_udp(self):
         table_name = 'c_qwp_ex_' + uuid.uuid4().hex[:8]
         self._test_qwp_udp_example(
-            'line_sender_c_example_qwpudp',
+            'line_sender_c_example_udp',
             table_name,
             [[
                 'srv-api',
@@ -3344,7 +3344,7 @@ class TestQwpUdpSender(unittest.TestCase):
     def test_cpp_example_qwp_udp(self):
         table_name = 'cpp_qwp_ex_' + uuid.uuid4().hex[:8]
         self._test_qwp_udp_example(
-            'line_sender_cpp_example_qwpudp',
+            'line_sender_cpp_example_udp',
             table_name,
             [[
                 'srv-api',
@@ -3381,7 +3381,7 @@ class TestQwpUdpSender(unittest.TestCase):
     def test_c_batch_example_qwp_udp(self):
         table_name = 'c_qwp_bt_' + uuid.uuid4().hex[:8]
         self._test_qwp_udp_example(
-            'line_sender_c_example_qwpudp_batch',
+            'line_sender_c_example_udp_batch',
             table_name,
             [
                 ['srv-a', True, 1, 20.5, 'batch-a'],
@@ -3391,7 +3391,7 @@ class TestQwpUdpSender(unittest.TestCase):
     def test_cpp_batch_example_qwp_udp(self):
         table_name = 'cpp_qwp_bt_' + uuid.uuid4().hex[:8]
         self._test_qwp_udp_example(
-            'line_sender_cpp_example_qwpudp_batch',
+            'line_sender_cpp_example_udp_batch',
             table_name,
             [
                 ['srv-a', True, 1, 20.5, 'batch-a'],
@@ -3402,7 +3402,7 @@ class TestQwpUdpSender(unittest.TestCase):
         self._require_qwp_udp_system_test()
 
         table_name = 'qwp_udp_' + uuid.uuid4().hex
-        with self._mk_qwpudp_sender() as sender:
+        with self._mk_udp_sender() as sender:
             self.assertEqual(sender.protocol, qls.Protocol.QWPUDP)
             for i in range(3):
                 (sender
@@ -3447,7 +3447,7 @@ class TestQwpUdpSender(unittest.TestCase):
         array2 = array1.T
         array3 = array1[::-1, ::-1]
 
-        with self._mk_qwpudp_sender() as sender:
+        with self._mk_udp_sender() as sender:
             (sender
              .table(table_name)
              .column_f64_arr('f64_arr1', array1)
@@ -3488,7 +3488,7 @@ class TestQwpUdpSender(unittest.TestCase):
         ]
         base_ts = 1_700_000_000_000_000
 
-        with self._mk_qwpudp_sender() as sender:
+        with self._mk_udp_sender() as sender:
             for idx, dec in enumerate(decimals):
                 (sender
                  .table(table_name)
@@ -3512,7 +3512,7 @@ class TestQwpUdpSender(unittest.TestCase):
     def test_decimal_signed_overflow_is_rejected_over_qwp_udp(self):
         self._require_qwp_udp_system_test()
         table_name = 'qwp_dec_over_' + uuid.uuid4().hex[:8]
-        with self._mk_qwpudp_sender() as sender:
+        with self._mk_udp_sender() as sender:
             (sender
              .table(table_name)
              .column('d', QWP_DECIMAL256_POSITIVE_OVERFLOW)
@@ -3523,7 +3523,7 @@ class TestQwpUdpSender(unittest.TestCase):
     def test_decimal_signed_rescale_overflow_is_rejected_over_qwp_udp(self):
         self._require_qwp_udp_system_test()
         table_name = 'qwp_dec_scale_' + uuid.uuid4().hex[:8]
-        with self._mk_qwpudp_sender() as sender:
+        with self._mk_udp_sender() as sender:
             (sender
              .table(table_name)
              .column('d', Decimal('0.1'))
@@ -3541,7 +3541,7 @@ class TestQwpUdpSender(unittest.TestCase):
         first_ts_us = 1_700_000_000_000_000
         third_ts_us = 1_700_000_000_100_000
         table_name = 'qwp_udp_at_now_' + uuid.uuid4().hex
-        with self._mk_qwpudp_sender() as sender:
+        with self._mk_udp_sender() as sender:
             (sender
              .table(table_name)
              .symbol('host', 'exp-a')
@@ -3590,7 +3590,7 @@ class TestQwpUdpSender(unittest.TestCase):
 
         row_ts_us = 1_700_000_000_200_000
         table_name = 'qwp_udp_keep_' + uuid.uuid4().hex
-        with self._mk_qwpudp_sender() as sender:
+        with self._mk_udp_sender() as sender:
             (sender
              .table(table_name)
              .symbol('host', 'dup-host')
@@ -3619,7 +3619,7 @@ class TestQwpUdpSender(unittest.TestCase):
         self._require_qwp_udp_system_test()
 
         table_name = 'q' + uuid.uuid4().hex[:8]
-        with self._mk_qwpudp_sender(max_datagram_size=58) as sender:
+        with self._mk_udp_sender(max_datagram_size=58) as sender:
             (sender
              .table(table_name)
              .symbol('sym', 'ETH-USD')
@@ -3654,7 +3654,7 @@ class TestQwpUdpSender(unittest.TestCase):
 
         trades_table = 'qwp_tr_' + uuid.uuid4().hex[:8]
         quotes_table = 'qwp_qt_' + uuid.uuid4().hex[:8]
-        with self._mk_qwpudp_sender() as sender:
+        with self._mk_udp_sender() as sender:
             (sender
              .table(trades_table)
              .symbol('sym', 'ETH-USD')
@@ -3688,7 +3688,7 @@ class TestQwpUdpSender(unittest.TestCase):
         self._require_qwp_udp_system_test()
 
         table_name = 'qwp_schema_' + uuid.uuid4().hex[:8]
-        with self._mk_qwpudp_sender() as sender:
+        with self._mk_udp_sender() as sender:
             (sender
              .table(table_name)
              .symbol('host', 'r1')
@@ -3727,7 +3727,7 @@ class TestQwpUdpSender(unittest.TestCase):
         self._require_qwp_udp_system_test()
 
         table_name = 'qwp_bool_' + uuid.uuid4().hex[:8]
-        with self._mk_qwpudp_sender() as sender:
+        with self._mk_udp_sender() as sender:
             (sender
              .table(table_name)
              .symbol('host', 'r1')
@@ -3764,7 +3764,7 @@ class TestQwpUdpSender(unittest.TestCase):
         self._require_qwp_udp_system_test()
 
         table_name = 'qwp_num_' + uuid.uuid4().hex[:8]
-        with self._mk_qwpudp_sender() as sender:
+        with self._mk_udp_sender() as sender:
             (sender
              .table(table_name)
              .symbol('host', 'r1')
@@ -3810,7 +3810,7 @@ class TestQwpUdpSender(unittest.TestCase):
 
         table_name = 'qwp_sts_' + uuid.uuid4().hex[:8]
         event_ts_us = 123_456
-        with self._mk_qwpudp_sender() as sender:
+        with self._mk_udp_sender() as sender:
             (sender
              .table(table_name)
              .symbol('host', 'r1')
@@ -3847,7 +3847,7 @@ class TestQwpUdpSender(unittest.TestCase):
 
         table_name = 'qwp_nts_' + uuid.uuid4().hex[:8]
         event_ts_ns = 123_456_789
-        with self._mk_qwpudp_sender() as sender:
+        with self._mk_udp_sender() as sender:
             (sender
              .table(table_name)
              .symbol('host', 'r1')
@@ -3892,7 +3892,7 @@ class TestQwpUdpSender(unittest.TestCase):
                     timestamp TIMESTAMP
                 ) TIMESTAMP(timestamp) PARTITION BY DAY;''')
 
-        with self._mk_qwpudp_sender() as sender:
+        with self._mk_udp_sender() as sender:
             (sender
              .table(table_name)
              .symbol('host', 'r1')
@@ -3925,7 +3925,7 @@ class TestQwpUdpSender(unittest.TestCase):
                     timestamp TIMESTAMP
                 ) TIMESTAMP(timestamp) PARTITION BY DAY;''')
 
-        with self._mk_qwpudp_sender() as sender:
+        with self._mk_udp_sender() as sender:
             (sender
              .table(table_name)
              .symbol('host', 'r1')
@@ -3950,7 +3950,7 @@ class TestQwpUdpSender(unittest.TestCase):
 
         table_name = 'qwp_dtns_' + uuid.uuid4().hex[:8]
         row_ts_ns = 1_700_000_000_000_000_123
-        with self._mk_qwpudp_sender() as sender:
+        with self._mk_udp_sender() as sender:
             (sender
              .table(table_name)
              .symbol('host', 'nano-row')
@@ -3982,7 +3982,7 @@ class TestQwpUdpSender(unittest.TestCase):
                     timestamp TIMESTAMP_NS
                 ) TIMESTAMP(timestamp) PARTITION BY DAY;''')
 
-        with self._mk_qwpudp_sender() as sender:
+        with self._mk_udp_sender() as sender:
             (sender
              .table(table_name)
              .symbol('host', 'micro-row')
@@ -4014,7 +4014,7 @@ class TestQwpUdpSender(unittest.TestCase):
                     timestamp TIMESTAMP
                 ) TIMESTAMP(timestamp) PARTITION BY DAY;''')
 
-        with self._mk_qwpudp_sender() as sender:
+        with self._mk_udp_sender() as sender:
             (sender
              .table(table_name)
              .symbol('host', 'nano-row')
@@ -4038,7 +4038,7 @@ class TestQwpUdpSender(unittest.TestCase):
         self._require_qwp_udp_system_test()
 
         table_name = 'qwp_utf8_' + uuid.uuid4().hex[:8]
-        with self._mk_qwpudp_sender() as sender:
+        with self._mk_udp_sender() as sender:
             (sender
              .table(table_name)
              .symbol('host', 'r1')
@@ -4080,7 +4080,7 @@ class TestQwpUdpSender(unittest.TestCase):
 
         table_name = 'qwp_txn_' + uuid.uuid4().hex[:8]
         with self.assertRaisesRegex(qls.SenderError, r'Transactional flushes are not supported for QWP/UDP'):
-            with self._mk_qwpudp_sender() as sender:
+            with self._mk_udp_sender() as sender:
                 (sender
                  .table(table_name)
                  .symbol('host', 'txn-host')
@@ -4092,7 +4092,7 @@ class TestQwpUdpSender(unittest.TestCase):
         self._require_qwp_udp_system_test()
 
         table_name = 'qwp_mk_' + uuid.uuid4().hex[:8]
-        with self._mk_qwpudp_sender() as sender:
+        with self._mk_udp_sender() as sender:
             (sender
              .table(table_name)
              .symbol('host', 'keep-a')
@@ -4133,7 +4133,7 @@ class TestQwpUdpSender(unittest.TestCase):
         with self.assertRaisesRegex(
                 qls.SenderError,
                 r'QWP/UDP designated timestamp changes type within a batched table'):
-            with self._mk_qwpudp_sender() as sender:
+            with self._mk_udp_sender() as sender:
                 (sender
                  .table(table_name)
                  .symbol('host', 'micros-row')
@@ -4151,7 +4151,7 @@ class TestQwpUdpSender(unittest.TestCase):
 
         table_name = 'qwp_cts_' + uuid.uuid4().hex[:8]
         with self.assertRaisesRegex(qls.SenderError, r'QWP/UDP column "event_ts" changes type within a batched table'):
-            with self._mk_qwpudp_sender() as sender:
+            with self._mk_udp_sender() as sender:
                 (sender
                  .table(table_name)
                  .symbol('host', 'micros-row')

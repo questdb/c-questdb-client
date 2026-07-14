@@ -13,7 +13,7 @@ static bool example(const char* host, const char* port, const char* table)
     int conf_len = snprintf(
         conf_str,
         sizeof(conf_str),
-        "qwpudp::addr=%s:%s;max_datagram_size=256;",
+        "udp::addr=%s:%s;max_datagram_size=256;",
         host,
         port);
     if ((conf_len < 0) || ((size_t)conf_len >= sizeof(conf_str)))
@@ -41,44 +41,61 @@ static bool example(const char* host, const char* port, const char* table)
     line_sender_column_name host_name = QDB_COLUMN_NAME_LITERAL("host");
     line_sender_column_name active_name = QDB_COLUMN_NAME_LITERAL("active");
     line_sender_column_name qty_name = QDB_COLUMN_NAME_LITERAL("qty");
+    line_sender_column_name retries_name = QDB_COLUMN_NAME_LITERAL("retries");
+    line_sender_column_name port_name = QDB_COLUMN_NAME_LITERAL("port");
+    line_sender_column_name region_name = QDB_COLUMN_NAME_LITERAL("region");
     line_sender_column_name temp_name = QDB_COLUMN_NAME_LITERAL("temp");
+    line_sender_column_name temp_f_name = QDB_COLUMN_NAME_LITERAL("temp_f");
+    line_sender_column_name trace_id_name = QDB_COLUMN_NAME_LITERAL("trace_id");
+    line_sender_column_name first_seen_name =
+        QDB_COLUMN_NAME_LITERAL("first_seen");
+    line_sender_column_name price_name = QDB_COLUMN_NAME_LITERAL("price");
+    line_sender_column_name loc_name = QDB_COLUMN_NAME_LITERAL("loc");
     line_sender_column_name note_name = QDB_COLUMN_NAME_LITERAL("note");
 
     if (!line_sender_buffer_table(buffer, table_name, &err))
         goto on_error;
 
-    line_sender_utf8 host_a = QDB_UTF8_LITERAL("srv-a");
-    if (!line_sender_buffer_symbol(buffer, host_name, host_a, &err))
+    line_sender_utf8 host_value = QDB_UTF8_LITERAL("srv-api");
+    if (!line_sender_buffer_symbol(buffer, host_name, host_value, &err))
         goto on_error;
     if (!line_sender_buffer_column_bool(buffer, active_name, true, &err))
         goto on_error;
-    if (!line_sender_buffer_column_i64(buffer, qty_name, 1, &err))
+    if (!line_sender_buffer_column_i64(buffer, qty_name, 7, &err))
         goto on_error;
-    if (!line_sender_buffer_column_f64(buffer, temp_name, 20.5, &err))
+    if (!line_sender_buffer_column_i8(buffer, retries_name, 3, &err))
         goto on_error;
-    line_sender_utf8 note_a = QDB_UTF8_LITERAL("batch-a");
-    if (!line_sender_buffer_column_str(buffer, note_name, note_a, &err))
+    if (!line_sender_buffer_column_i16(buffer, port_name, 9009, &err))
+        goto on_error;
+    if (!line_sender_buffer_column_i32(buffer, region_name, 42, &err))
+        goto on_error;
+    if (!line_sender_buffer_column_f64(buffer, temp_name, 21.5, &err))
+        goto on_error;
+    if (!line_sender_buffer_column_f32(buffer, temp_f_name, 21.5f, &err))
+        goto on_error;
+    if (!line_sender_buffer_column_uuid(
+            buffer,
+            trace_id_name,
+            0x0102030405060708ULL,
+            0x090A0B0C0D0E0F10ULL,
+            &err))
+        goto on_error;
+    if (!line_sender_buffer_column_date(
+            buffer, first_seen_name, 1700000000000LL, &err))
+        goto on_error;
+    line_sender_utf8 price_value = QDB_UTF8_LITERAL("1.25");
+    if (!line_sender_buffer_column_dec64_str(
+            buffer, price_name, price_value.buf, price_value.len, &err))
+        goto on_error;
+    if (!line_sender_buffer_column_geohash(
+            buffer, loc_name, 0x012EA85BULL, 25, &err))
+        goto on_error;
+
+    line_sender_utf8 note_value = QDB_UTF8_LITERAL("example-row");
+    if (!line_sender_buffer_column_str(buffer, note_name, note_value, &err))
         goto on_error;
     if (!line_sender_buffer_at_now(buffer, &err))
         goto on_error;
-
-    if (!line_sender_buffer_table(buffer, table_name, &err))
-        goto on_error;
-    line_sender_utf8 host_b = QDB_UTF8_LITERAL("srv-b");
-    if (!line_sender_buffer_symbol(buffer, host_name, host_b, &err))
-        goto on_error;
-    if (!line_sender_buffer_column_bool(buffer, active_name, false, &err))
-        goto on_error;
-    if (!line_sender_buffer_column_i64(buffer, qty_name, 2, &err))
-        goto on_error;
-    if (!line_sender_buffer_column_f64(buffer, temp_name, 22.5, &err))
-        goto on_error;
-    line_sender_utf8 note_b = QDB_UTF8_LITERAL("batch-b");
-    if (!line_sender_buffer_column_str(buffer, note_name, note_b, &err))
-        goto on_error;
-    if (!line_sender_buffer_at_now(buffer, &err))
-        goto on_error;
-
     if (!line_sender_flush(sender, buffer, &err))
         goto on_error;
 
@@ -109,7 +126,7 @@ static bool displayed_help(int argc, const char* argv[])
             fprintf(stderr, "Usage:\n");
             fprintf(
                 stderr,
-                "line_sender_c_example_qwpudp_batch: [HOST [PORT [TABLE]]]\n");
+                "line_sender_c_example_udp: [HOST [PORT [TABLE]]]\n");
             fprintf(
                 stderr,
                 "    HOST: QWP/UDP host (defaults to \"localhost\").\n");
@@ -118,7 +135,7 @@ static bool displayed_help(int argc, const char* argv[])
                 "    PORT: QWP/UDP port (defaults to \"9007\").\n");
             fprintf(
                 stderr,
-                "    TABLE: Target table (defaults to \"c_qwpudp_batch_example\").\n");
+                "    TABLE: Target table (defaults to \"c_udp_example\").\n");
             return true;
         }
     }
@@ -136,7 +153,7 @@ int main(int argc, const char* argv[])
     const char* port = "9007";
     if (argc >= 3)
         port = argv[2];
-    const char* table = "c_qwpudp_batch_example";
+    const char* table = "c_udp_example";
     if (argc >= 4)
         table = argv[3];
 

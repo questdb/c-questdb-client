@@ -2298,7 +2298,7 @@ TEST_CASE("line sender protocol version v2")
     CHECK(server.msgs(0) == expect);
 }
 
-TEST_CASE("line_sender c api qwpudp basics")
+TEST_CASE("line_sender c api udp basics")
 {
     udp_capture receiver;
     ::line_sender_error* err = nullptr;
@@ -2309,7 +2309,7 @@ TEST_CASE("line_sender c api qwpudp basics")
 
     const auto host = QDB_UTF8_LITERAL("127.0.0.1");
     ::line_sender_opts* opts =
-        ::line_sender_opts_new(::line_sender_protocol_qwpudp, host, receiver.port());
+        ::line_sender_opts_new(::line_sender_protocol_udp, host, receiver.port());
     REQUIRE(opts != nullptr);
     on_scope_exit opts_free_guard{[&] { ::line_sender_opts_free(opts); }};
 
@@ -2319,7 +2319,7 @@ TEST_CASE("line_sender c api qwpudp basics")
     ::line_sender* sender = ::line_sender_build(opts, &err);
     REQUIRE(sender != nullptr);
     on_scope_exit sender_close_guard{[&] { ::line_sender_close(sender); }};
-    CHECK(::line_sender_get_protocol(sender) == ::line_sender_protocol_qwpudp);
+    CHECK(::line_sender_get_protocol(sender) == ::line_sender_protocol_udp);
     CHECK(
         ::line_sender_get_protocol_version(sender) ==
         ::line_sender_protocol_version_1);
@@ -2356,7 +2356,7 @@ TEST_CASE("line_sender c api qwpudp basics")
     CHECK(std::to_integer<uint8_t>(datagram[7]) == 0);
 }
 
-TEST_CASE("line_sender c api standalone qwpudp buffer")
+TEST_CASE("line_sender c api standalone udp buffer")
 {
     udp_capture receiver;
     ::line_sender_error* err = nullptr;
@@ -2367,7 +2367,7 @@ TEST_CASE("line_sender c api standalone qwpudp buffer")
 
     const auto host = QDB_UTF8_LITERAL("127.0.0.1");
     ::line_sender_opts* opts =
-        ::line_sender_opts_new(::line_sender_protocol_qwpudp, host, receiver.port());
+        ::line_sender_opts_new(::line_sender_protocol_udp, host, receiver.port());
     REQUIRE(opts != nullptr);
     on_scope_exit opts_free_guard{[&] { ::line_sender_opts_free(opts); }};
 
@@ -2398,7 +2398,7 @@ TEST_CASE("line_sender c api standalone qwpudp buffer")
     CHECK(datagram_starts_with_qwp1(datagram));
 }
 
-TEST_CASE("line_sender c api qwpudp f64 array column")
+TEST_CASE("line_sender c api udp f64 array column")
 {
     udp_capture receiver;
     ::line_sender_error* err = nullptr;
@@ -2409,7 +2409,7 @@ TEST_CASE("line_sender c api qwpudp f64 array column")
 
     const auto host = QDB_UTF8_LITERAL("127.0.0.1");
     ::line_sender_opts* opts =
-        ::line_sender_opts_new(::line_sender_protocol_qwpudp, host, receiver.port());
+        ::line_sender_opts_new(::line_sender_protocol_udp, host, receiver.port());
     REQUIRE(opts != nullptr);
     on_scope_exit opts_free_guard{[&] { ::line_sender_opts_free(opts); }};
 
@@ -2450,7 +2450,7 @@ TEST_CASE("line_sender c api qwpudp f64 array column")
         CHECK(decoded.values[i] == doctest::Approx(arr_data[i]));
 }
 
-TEST_CASE("line_sender c api qwpudp decimal column")
+TEST_CASE("line_sender c api udp decimal column")
 {
     udp_capture receiver;
     ::line_sender_error* err = nullptr;
@@ -2461,7 +2461,7 @@ TEST_CASE("line_sender c api qwpudp decimal column")
 
     const auto host = QDB_UTF8_LITERAL("127.0.0.1");
     ::line_sender_opts* opts =
-        ::line_sender_opts_new(::line_sender_protocol_qwpudp, host, receiver.port());
+        ::line_sender_opts_new(::line_sender_protocol_udp, host, receiver.port());
     REQUIRE(opts != nullptr);
     on_scope_exit opts_free_guard{[&] { ::line_sender_opts_free(opts); }};
 
@@ -2521,7 +2521,7 @@ TEST_CASE("line_sender c api qwpudp decimal column")
     CHECK(*decoded.values[3] == trimmed_signed_i64_be(12'000));
 }
 
-TEST_CASE("line_sender c api qwpudp decimal signed boundaries")
+TEST_CASE("line_sender c api udp decimal signed boundaries")
 {
     udp_capture receiver;
     ::line_sender_error* err = nullptr;
@@ -2532,7 +2532,7 @@ TEST_CASE("line_sender c api qwpudp decimal signed boundaries")
 
     const auto host = QDB_UTF8_LITERAL("127.0.0.1");
     ::line_sender_opts* opts =
-        ::line_sender_opts_new(::line_sender_protocol_qwpudp, host, receiver.port());
+        ::line_sender_opts_new(::line_sender_protocol_udp, host, receiver.port());
     REQUIRE(opts != nullptr);
     on_scope_exit opts_free_guard{[&] { ::line_sender_opts_free(opts); }};
 
@@ -2585,7 +2585,7 @@ TEST_CASE("line_sender c api qwpudp decimal signed boundaries")
     CHECK(*decoded.values[1] == qwp_decimal256_min_negative_bytes());
 }
 
-TEST_CASE("line_sender c api qwpudp decimal rejects signed overflow")
+TEST_CASE("line_sender c api udp decimal rejects signed overflow")
 {
     udp_capture receiver;
     ::line_sender_error* err = nullptr;
@@ -2596,7 +2596,7 @@ TEST_CASE("line_sender c api qwpudp decimal rejects signed overflow")
 
     const auto host = QDB_UTF8_LITERAL("127.0.0.1");
     ::line_sender_opts* opts =
-        ::line_sender_opts_new(::line_sender_protocol_qwpudp, host, receiver.port());
+        ::line_sender_opts_new(::line_sender_protocol_udp, host, receiver.port());
     REQUIRE(opts != nullptr);
     on_scope_exit opts_free_guard{[&] { ::line_sender_opts_free(opts); }};
 
@@ -2669,7 +2669,7 @@ TEST_CASE("line_sender_buffer_clone rejects NULL input via err_out")
         ::line_sender_error_invalid_api_call);
 }
 
-TEST_CASE("line_sender c api qwpudp max name len and peek")
+TEST_CASE("line_sender c api udp max name len and peek")
 {
     ::line_sender_error* err = nullptr;
     on_scope_exit error_free_guard{[&] {
@@ -2715,10 +2715,10 @@ TEST_CASE("line_sender c api qwpudp max name len and peek")
     CHECK(peek.buf == nullptr);
 }
 
-TEST_CASE("line_sender c api qwpudp from env")
+TEST_CASE("line_sender c api udp from env")
 {
     udp_capture receiver;
-    const std::string conf = "qwpudp::addr=127.0.0.1:"s +
+    const std::string conf = "udp::addr=127.0.0.1:"s +
         std::to_string(receiver.port()) +
         ";max_datagram_size=256;multicast_ttl=1;";
     scoped_env_var env_var{"QDB_CLIENT_CONF", conf};
@@ -2732,7 +2732,7 @@ TEST_CASE("line_sender c api qwpudp from env")
     ::line_sender* sender = ::line_sender_from_env(&err);
     REQUIRE(sender != nullptr);
     on_scope_exit sender_close_guard{[&] { ::line_sender_close(sender); }};
-    CHECK(::line_sender_get_protocol(sender) == ::line_sender_protocol_qwpudp);
+    CHECK(::line_sender_get_protocol(sender) == ::line_sender_protocol_udp);
 
     ::line_sender_buffer* buffer = ::line_sender_buffer_new_for_sender(sender);
     REQUIRE(buffer != nullptr);
@@ -2752,11 +2752,11 @@ TEST_CASE("line_sender c api qwpudp from env")
     CHECK(datagram_starts_with_qwp1(datagram));
 }
 
-TEST_CASE("line_sender c++ qwpudp flush_and_keep resends datagram")
+TEST_CASE("line_sender c++ udp flush_and_keep resends datagram")
 {
     udp_capture receiver;
     questdb::ingress::opts opts{
-        questdb::ingress::protocol::qwpudp,
+        questdb::ingress::protocol::udp,
         std::string("127.0.0.1"),
         std::to_string(receiver.port())};
     opts.max_datagram_size(256);
@@ -2781,11 +2781,11 @@ TEST_CASE("line_sender c++ qwpudp flush_and_keep resends datagram")
     CHECK(second == first);
 }
 
-TEST_CASE("line_sender c++ qwpws extension helpers reject qwpudp sender")
+TEST_CASE("line_sender c++ qwpws extension helpers reject udp sender")
 {
     udp_capture receiver;
     questdb::ingress::opts opts{
-        questdb::ingress::protocol::qwpudp,
+        questdb::ingress::protocol::udp,
         std::string("127.0.0.1"),
         std::to_string(receiver.port())};
     questdb::ingress::line_sender sender{opts};
@@ -2847,11 +2847,11 @@ TEST_CASE("line_sender_error c++ can carry qwpws diagnostic")
     CHECK(error.qwp_ws_diagnostic()->to_fsn == 6);
 }
 
-TEST_CASE("line_sender c++ qwpws progress option rejects qwpudp opts")
+TEST_CASE("line_sender c++ qwpws progress option rejects udp opts")
 {
     udp_capture receiver;
     questdb::ingress::opts opts{
-        questdb::ingress::protocol::qwpudp,
+        questdb::ingress::protocol::udp,
         std::string("127.0.0.1"),
         std::to_string(receiver.port())};
 
@@ -2868,11 +2868,11 @@ TEST_CASE("line_sender c++ qwpws progress option rejects qwpudp opts")
     }
 }
 
-TEST_CASE("line_sender c++ standalone qwpudp buffer")
+TEST_CASE("line_sender c++ standalone udp buffer")
 {
     udp_capture receiver;
     questdb::ingress::opts opts{
-        questdb::ingress::protocol::qwpudp,
+        questdb::ingress::protocol::udp,
         std::string("127.0.0.1"),
         std::to_string(receiver.port())};
     questdb::ingress::line_sender sender{opts};
@@ -2890,11 +2890,11 @@ TEST_CASE("line_sender c++ standalone qwpudp buffer")
     CHECK(datagram_starts_with_qwp1(datagram));
 }
 
-TEST_CASE("line_sender c++ qwpudp f64 array column")
+TEST_CASE("line_sender c++ udp f64 array column")
 {
     udp_capture receiver;
     questdb::ingress::opts opts{
-        questdb::ingress::protocol::qwpudp,
+        questdb::ingress::protocol::udp,
         std::string("127.0.0.1"),
         std::to_string(receiver.port())};
     questdb::ingress::line_sender sender{opts};
@@ -2920,11 +2920,11 @@ TEST_CASE("line_sender c++ qwpudp f64 array column")
         CHECK(decoded.values[i] == doctest::Approx(arr_data[i]));
 }
 
-TEST_CASE("line_sender c++ qwpudp decimal column")
+TEST_CASE("line_sender c++ udp decimal column")
 {
     udp_capture receiver;
     questdb::ingress::opts opts{
-        questdb::ingress::protocol::qwpudp,
+        questdb::ingress::protocol::udp,
         std::string("127.0.0.1"),
         std::to_string(receiver.port())};
     questdb::ingress::line_sender sender{opts};
@@ -3018,11 +3018,11 @@ TEST_CASE("line_sender c++ string view constructors")
     CHECK(utf8_from_ptr.size() == 6);
 }
 
-TEST_CASE("line_sender c++ qwpudp decimal signed boundaries")
+TEST_CASE("line_sender c++ udp decimal signed boundaries")
 {
     udp_capture receiver;
     questdb::ingress::opts opts{
-        questdb::ingress::protocol::qwpudp,
+        questdb::ingress::protocol::udp,
         std::string("127.0.0.1"),
         std::to_string(receiver.port())};
     questdb::ingress::line_sender sender{opts};
@@ -3059,11 +3059,11 @@ TEST_CASE("line_sender c++ qwpudp decimal signed boundaries")
     CHECK(*decoded.values[1] == qwp_decimal256_min_negative_bytes());
 }
 
-TEST_CASE("line_sender c++ qwpudp decimal rejects signed overflow")
+TEST_CASE("line_sender c++ udp decimal rejects signed overflow")
 {
     udp_capture receiver;
     questdb::ingress::opts opts{
-        questdb::ingress::protocol::qwpudp,
+        questdb::ingress::protocol::udp,
         std::string("127.0.0.1"),
         std::to_string(receiver.port())};
     questdb::ingress::line_sender sender{opts};
@@ -3090,11 +3090,11 @@ TEST_CASE("line_sender c++ qwpudp decimal rejects signed overflow")
     CHECK(buffer.row_count() == 1);
 }
 
-TEST_CASE("line_sender c++ qwpudp rejects flush with incomplete row")
+TEST_CASE("line_sender c++ udp rejects flush with incomplete row")
 {
     udp_capture receiver;
     questdb::ingress::opts opts{
-        questdb::ingress::protocol::qwpudp,
+        questdb::ingress::protocol::udp,
         std::string("127.0.0.1"),
         std::to_string(receiver.port())};
     questdb::ingress::line_sender sender{opts};
@@ -3111,11 +3111,11 @@ TEST_CASE("line_sender c++ qwpudp rejects flush with incomplete row")
         questdb::ingress::line_sender_error);
 }
 
-TEST_CASE("line_sender c++ qwpudp rejects ilp buffer")
+TEST_CASE("line_sender c++ udp rejects ilp buffer")
 {
     udp_capture receiver;
     questdb::ingress::opts opts{
-        questdb::ingress::protocol::qwpudp,
+        questdb::ingress::protocol::udp,
         std::string("127.0.0.1"),
         std::to_string(receiver.port())};
     questdb::ingress::line_sender sender{opts};
@@ -3130,11 +3130,11 @@ TEST_CASE("line_sender c++ qwpudp rejects ilp buffer")
         questdb::ingress::line_sender_error);
 }
 
-TEST_CASE("line_sender c++ qwpudp rejects rows exceeding max datagram size")
+TEST_CASE("line_sender c++ udp rejects rows exceeding max datagram size")
 {
     udp_capture receiver;
     questdb::ingress::opts opts{
-        questdb::ingress::protocol::qwpudp,
+        questdb::ingress::protocol::udp,
         std::string("127.0.0.1"),
         std::to_string(receiver.port())};
     opts.max_datagram_size(24);
@@ -3293,7 +3293,7 @@ TEST_CASE("line_sender c api max_datagram_size rejected for tcp opts")
     CHECK(line_sender_error_message(err).find("only supported for QWP/UDP") != std::string::npos);
 }
 
-TEST_CASE("line_sender c api qwpudp opts reject invalid datagram settings")
+TEST_CASE("line_sender c api udp opts reject invalid datagram settings")
 {
     ::line_sender_error* err = nullptr;
     on_scope_exit error_free_guard{[&] {
@@ -3303,7 +3303,7 @@ TEST_CASE("line_sender c api qwpudp opts reject invalid datagram settings")
 
     const auto host = QDB_UTF8_LITERAL("127.0.0.1");
     ::line_sender_opts* opts =
-        ::line_sender_opts_new(::line_sender_protocol_qwpudp, host, 9009);
+        ::line_sender_opts_new(::line_sender_protocol_udp, host, 9009);
     REQUIRE(opts != nullptr);
     on_scope_exit opts_free_guard{[&] { ::line_sender_opts_free(opts); }};
 
@@ -3322,7 +3322,7 @@ TEST_CASE("line_sender c api qwpudp opts reject invalid datagram settings")
         std::string::npos);
 }
 
-TEST_CASE("line_sender c api qwpudp array rank bounds are rejected")
+TEST_CASE("line_sender c api udp array rank bounds are rejected")
 {
     ::line_sender_error* err = nullptr;
     on_scope_exit error_free_guard{[&] {
@@ -3359,11 +3359,11 @@ TEST_CASE("line_sender c api qwpudp array rank bounds are rejected")
         std::string::npos);
 }
 
-TEST_CASE("line_sender c++ qwpudp bookmark rewind and clear")
+TEST_CASE("line_sender c++ udp bookmark rewind and clear")
 {
     udp_capture receiver;
     questdb::ingress::opts opts{
-        questdb::ingress::protocol::qwpudp,
+        questdb::ingress::protocol::udp,
         std::string("127.0.0.1"),
         std::to_string(receiver.port())};
     questdb::ingress::line_sender sender{opts};
@@ -3394,7 +3394,7 @@ TEST_CASE("line_sender c++ qwpudp bookmark rewind and clear")
         questdb::ingress::line_sender_error);
 }
 
-TEST_CASE("line_sender c api flush empty qwpudp buffer is noop")
+TEST_CASE("line_sender c api flush empty udp buffer is noop")
 {
     udp_capture receiver;
     ::line_sender_error* err = nullptr;
@@ -3405,7 +3405,7 @@ TEST_CASE("line_sender c api flush empty qwpudp buffer is noop")
 
     const auto host = QDB_UTF8_LITERAL("127.0.0.1");
     ::line_sender_opts* opts =
-        ::line_sender_opts_new(::line_sender_protocol_qwpudp, host, receiver.port());
+        ::line_sender_opts_new(::line_sender_protocol_udp, host, receiver.port());
     REQUIRE(opts != nullptr);
     on_scope_exit opts_free_guard{[&] { ::line_sender_opts_free(opts); }};
 
@@ -3461,11 +3461,11 @@ TEST_CASE("line_sender c api qwp buffer rejected by tcp sender")
         std::string::npos);
 }
 
-TEST_CASE("line_sender c++ qwpudp opts reusable after protocol_version error")
+TEST_CASE("line_sender c++ udp opts reusable after protocol_version error")
 {
     udp_capture receiver;
     questdb::ingress::opts opts{
-        questdb::ingress::protocol::qwpudp,
+        questdb::ingress::protocol::udp,
         std::string("127.0.0.1"),
         std::to_string(receiver.port())};
 
@@ -3482,11 +3482,11 @@ TEST_CASE("line_sender c++ qwpudp opts reusable after protocol_version error")
     sender.flush(buffer);
 }
 
-TEST_CASE("line_sender c++ qwpudp all column types with designated timestamp")
+TEST_CASE("line_sender c++ udp all column types with designated timestamp")
 {
     udp_capture receiver;
     questdb::ingress::opts opts{
-        questdb::ingress::protocol::qwpudp,
+        questdb::ingress::protocol::udp,
         std::string("127.0.0.1"),
         std::to_string(receiver.port())};
     questdb::ingress::line_sender sender{opts};
@@ -3531,11 +3531,11 @@ TEST_CASE("line_sender c++ qwpudp all column types with designated timestamp")
     qwp_expect_timestamp_nanos(qwp_cell(decoded, 0, ""), 1000000000);
 }
 
-TEST_CASE("line_sender c++ qwpudp at_micros designated timestamp")
+TEST_CASE("line_sender c++ udp at_micros designated timestamp")
 {
     udp_capture receiver;
     questdb::ingress::opts opts{
-        questdb::ingress::protocol::qwpudp,
+        questdb::ingress::protocol::udp,
         std::string("127.0.0.1"),
         std::to_string(receiver.port())};
     questdb::ingress::line_sender sender{opts};
@@ -3560,11 +3560,11 @@ TEST_CASE("line_sender c++ qwpudp at_micros designated timestamp")
     qwp_expect_timestamp_micros(qwp_cell(decoded, 0, ""), 5000000);
 }
 
-TEST_CASE("line_sender c++ qwpudp sparse columns across rows")
+TEST_CASE("line_sender c++ udp sparse columns across rows")
 {
     udp_capture receiver;
     questdb::ingress::opts opts{
-        questdb::ingress::protocol::qwpudp,
+        questdb::ingress::protocol::udp,
         std::string("127.0.0.1"),
         std::to_string(receiver.port())};
     questdb::ingress::line_sender sender{opts};
@@ -3616,11 +3616,11 @@ TEST_CASE("line_sender c++ qwpudp sparse columns across rows")
     qwp_expect_f64_nan(qwp_cell(decoded, 2, "px"));
 }
 
-TEST_CASE("line_sender c++ qwpudp multiple tables in one flush")
+TEST_CASE("line_sender c++ udp multiple tables in one flush")
 {
     udp_capture receiver;
     questdb::ingress::opts opts{
-        questdb::ingress::protocol::qwpudp,
+        questdb::ingress::protocol::udp,
         std::string("127.0.0.1"),
         std::to_string(receiver.port())};
     questdb::ingress::line_sender sender{opts};
@@ -3669,11 +3669,11 @@ TEST_CASE("line_sender c++ qwpudp multiple tables in one flush")
     // Three contiguous table batches: trades, quotes, trades -> 3 datagrams.
 }
 
-TEST_CASE("line_sender c++ qwpudp clear and reuse buffer")
+TEST_CASE("line_sender c++ udp clear and reuse buffer")
 {
     udp_capture receiver;
     questdb::ingress::opts opts{
-        questdb::ingress::protocol::qwpudp,
+        questdb::ingress::protocol::udp,
         std::string("127.0.0.1"),
         std::to_string(receiver.port())};
     questdb::ingress::line_sender sender{opts};
@@ -3700,11 +3700,11 @@ TEST_CASE("line_sender c++ qwpudp clear and reuse buffer")
     qwp_expect_i64(qwp_cell(decoded, 0, "x"), 2);
 }
 
-TEST_CASE("line_sender c++ qwpudp flush_and_keep empty buffer is noop")
+TEST_CASE("line_sender c++ udp flush_and_keep empty buffer is noop")
 {
     udp_capture receiver;
     questdb::ingress::opts opts{
-        questdb::ingress::protocol::qwpudp,
+        questdb::ingress::protocol::udp,
         std::string("127.0.0.1"),
         std::to_string(receiver.port())};
     questdb::ingress::line_sender sender{opts};
@@ -3718,7 +3718,7 @@ TEST_CASE("line_sender c++ qwpudp flush_and_keep empty buffer is noop")
     CHECK_FALSE(receiver.has_datagram());
 }
 
-TEST_CASE("line_sender c api qwpudp marker rewind rows")
+TEST_CASE("line_sender c api udp marker rewind rows")
 {
     udp_capture receiver;
     ::line_sender_error* err = nullptr;
@@ -3729,7 +3729,7 @@ TEST_CASE("line_sender c api qwpudp marker rewind rows")
 
     const auto host = QDB_UTF8_LITERAL("127.0.0.1");
     ::line_sender_opts* opts =
-        ::line_sender_opts_new(::line_sender_protocol_qwpudp, host, receiver.port());
+        ::line_sender_opts_new(::line_sender_protocol_udp, host, receiver.port());
     REQUIRE(opts != nullptr);
     on_scope_exit opts_free_guard{[&] { ::line_sender_opts_free(opts); }};
 
@@ -3790,7 +3790,7 @@ TEST_CASE("line_sender c api qwpudp marker rewind rows")
     CHECK_FALSE(receiver.has_datagram());
 }
 
-TEST_CASE("line_sender c api qwpudp bookmark rewind and stale rejection")
+TEST_CASE("line_sender c api udp bookmark rewind and stale rejection")
 {
     udp_capture receiver;
     ::line_sender_error* err = nullptr;
@@ -3801,7 +3801,7 @@ TEST_CASE("line_sender c api qwpudp bookmark rewind and stale rejection")
 
     const auto host = QDB_UTF8_LITERAL("127.0.0.1");
     ::line_sender_opts* opts =
-        ::line_sender_opts_new(::line_sender_protocol_qwpudp, host, receiver.port());
+        ::line_sender_opts_new(::line_sender_protocol_udp, host, receiver.port());
     REQUIRE(opts != nullptr);
     on_scope_exit opts_free_guard{[&] { ::line_sender_opts_free(opts); }};
 
@@ -3847,7 +3847,7 @@ TEST_CASE("line_sender c api qwpudp bookmark rewind and stale rejection")
     err = nullptr;
 }
 
-TEST_CASE("line_sender c api qwpudp flush_and_keep via c api")
+TEST_CASE("line_sender c api udp flush_and_keep via c api")
 {
     udp_capture receiver;
     ::line_sender_error* err = nullptr;
@@ -3858,7 +3858,7 @@ TEST_CASE("line_sender c api qwpudp flush_and_keep via c api")
 
     const auto host = QDB_UTF8_LITERAL("127.0.0.1");
     ::line_sender_opts* opts =
-        ::line_sender_opts_new(::line_sender_protocol_qwpudp, host, receiver.port());
+        ::line_sender_opts_new(::line_sender_protocol_udp, host, receiver.port());
     REQUIRE(opts != nullptr);
     on_scope_exit opts_free_guard{[&] { ::line_sender_opts_free(opts); }};
 
@@ -3894,7 +3894,7 @@ TEST_CASE("line_sender c api qwpudp flush_and_keep via c api")
     CHECK(::line_sender_buffer_row_count(buffer) == 0);
 }
 
-TEST_CASE("line_sender c api qwpudp all column types with at_nanos")
+TEST_CASE("line_sender c api udp all column types with at_nanos")
 {
     udp_capture receiver;
     ::line_sender_error* err = nullptr;
@@ -3905,7 +3905,7 @@ TEST_CASE("line_sender c api qwpudp all column types with at_nanos")
 
     const auto host = QDB_UTF8_LITERAL("127.0.0.1");
     ::line_sender_opts* opts =
-        ::line_sender_opts_new(::line_sender_protocol_qwpudp, host, receiver.port());
+        ::line_sender_opts_new(::line_sender_protocol_udp, host, receiver.port());
     REQUIRE(opts != nullptr);
     on_scope_exit opts_free_guard{[&] { ::line_sender_opts_free(opts); }};
 
@@ -3962,7 +3962,7 @@ TEST_CASE("line_sender c api qwpudp all column types with at_nanos")
     qwp_expect_timestamp_nanos(qwp_cell(decoded, 0, ""), 1000000000);
 }
 
-TEST_CASE("line_sender c api qwpudp at_micros designated timestamp")
+TEST_CASE("line_sender c api udp at_micros designated timestamp")
 {
     udp_capture receiver;
     ::line_sender_error* err = nullptr;
@@ -3973,7 +3973,7 @@ TEST_CASE("line_sender c api qwpudp at_micros designated timestamp")
 
     const auto host = QDB_UTF8_LITERAL("127.0.0.1");
     ::line_sender_opts* opts =
-        ::line_sender_opts_new(::line_sender_protocol_qwpudp, host, receiver.port());
+        ::line_sender_opts_new(::line_sender_protocol_udp, host, receiver.port());
     REQUIRE(opts != nullptr);
     on_scope_exit opts_free_guard{[&] { ::line_sender_opts_free(opts); }};
 
@@ -4004,7 +4004,7 @@ TEST_CASE("line_sender c api qwpudp at_micros designated timestamp")
     qwp_expect_timestamp_micros(qwp_cell(decoded, 0, ""), 5000000);
 }
 
-TEST_CASE("line_sender c api qwpudp sparse columns across rows")
+TEST_CASE("line_sender c api udp sparse columns across rows")
 {
     udp_capture receiver;
     ::line_sender_error* err = nullptr;
@@ -4015,7 +4015,7 @@ TEST_CASE("line_sender c api qwpudp sparse columns across rows")
 
     const auto host = QDB_UTF8_LITERAL("127.0.0.1");
     ::line_sender_opts* opts =
-        ::line_sender_opts_new(::line_sender_protocol_qwpudp, host, receiver.port());
+        ::line_sender_opts_new(::line_sender_protocol_udp, host, receiver.port());
     REQUIRE(opts != nullptr);
     on_scope_exit opts_free_guard{[&] { ::line_sender_opts_free(opts); }};
 
@@ -4081,7 +4081,7 @@ TEST_CASE("line_sender c api qwpudp sparse columns across rows")
     qwp_expect_f64_nan(qwp_cell(decoded, 2, "px"));
 }
 
-TEST_CASE("line_sender c++ qwpudp rejects duplicate column name")
+TEST_CASE("line_sender c++ udp rejects duplicate column name")
 {
     questdb::ingress::line_sender_buffer buffer =
         questdb::ingress::line_sender_buffer::qwp_udp();
@@ -4092,11 +4092,11 @@ TEST_CASE("line_sender c++ qwpudp rejects duplicate column name")
         questdb::ingress::line_sender_error);
 }
 
-TEST_CASE("line_sender c++ qwpudp new_buffer inherits max_name_len")
+TEST_CASE("line_sender c++ udp new_buffer inherits max_name_len")
 {
     udp_capture receiver;
     questdb::ingress::opts opts{
-        questdb::ingress::protocol::qwpudp,
+        questdb::ingress::protocol::udp,
         std::string("127.0.0.1"),
         std::to_string(receiver.port())};
     opts.max_name_len(16);
@@ -4124,7 +4124,7 @@ TEST_CASE("line_sender c qwp narrow integer + decimal columns happy path")
     auto port_s = std::to_string(receiver.port());
     CHECK(::line_sender_utf8_init(&port_str, port_s.size(), port_s.c_str(), &err));
     line_sender_opts* opts = ::line_sender_opts_new_service(
-        line_sender_protocol_qwpudp, host, port_str);
+        line_sender_protocol_udp, host, port_str);
     line_sender* sender = ::line_sender_build(opts, &err);
     ::line_sender_opts_free(opts);
     REQUIRE(sender != nullptr);
@@ -4266,11 +4266,11 @@ TEST_CASE("line_sender c++ narrow column methods reject ilp buffer")
         "column_dec128");
 }
 
-TEST_CASE("line_sender c++ qwpudp narrow integer + decimal happy path")
+TEST_CASE("line_sender c++ udp narrow integer + decimal happy path")
 {
     udp_capture receiver;
     questdb::ingress::line_sender sender{questdb::ingress::opts{
-        questdb::ingress::protocol::qwpudp,
+        questdb::ingress::protocol::udp,
         std::string("127.0.0.1"),
         std::to_string(receiver.port())}};
 
@@ -4302,7 +4302,7 @@ TEST_CASE("line_sender c qwp uuid+long256+ipv4 happy path")
     auto port_s = std::to_string(receiver.port());
     CHECK(::line_sender_utf8_init(&port_str, port_s.size(), port_s.c_str(), &err));
     line_sender_opts* opts = ::line_sender_opts_new_service(
-        line_sender_protocol_qwpudp, host, port_str);
+        line_sender_protocol_udp, host, port_str);
     line_sender* sender = ::line_sender_build(opts, &err);
     ::line_sender_opts_free(opts);
     REQUIRE(sender != nullptr);
@@ -4341,7 +4341,7 @@ TEST_CASE("line_sender c++ qwp uuid+long256+ipv4 happy path")
 {
     udp_capture receiver;
     questdb::ingress::line_sender sender{questdb::ingress::opts{
-        questdb::ingress::protocol::qwpudp,
+        questdb::ingress::protocol::udp,
         std::string("127.0.0.1"),
         std::to_string(receiver.port())}};
 
@@ -4364,7 +4364,7 @@ TEST_CASE("line_sender c++ qwp date+char+binary happy path")
 {
     udp_capture receiver;
     questdb::ingress::line_sender sender{questdb::ingress::opts{
-        questdb::ingress::protocol::qwpudp,
+        questdb::ingress::protocol::udp,
         std::string("127.0.0.1"),
         std::to_string(receiver.port())}};
 
@@ -4384,7 +4384,7 @@ TEST_CASE("line_sender c++ qwp geohash happy path")
 {
     udp_capture receiver;
     questdb::ingress::line_sender sender{questdb::ingress::opts{
-        questdb::ingress::protocol::qwpudp,
+        questdb::ingress::protocol::udp,
         std::string("127.0.0.1"),
         std::to_string(receiver.port())}};
 
@@ -4401,7 +4401,7 @@ TEST_CASE("line_sender c++ qwp float happy path")
 {
     udp_capture receiver;
     questdb::ingress::line_sender sender{questdb::ingress::opts{
-        questdb::ingress::protocol::qwpudp,
+        questdb::ingress::protocol::udp,
         std::string("127.0.0.1"),
         std::to_string(receiver.port())}};
 
@@ -4442,7 +4442,7 @@ TEST_CASE("line_sender c++ qwp long_array happy path")
 {
     udp_capture receiver;
     questdb::ingress::line_sender sender{questdb::ingress::opts{
-        questdb::ingress::protocol::qwpudp,
+        questdb::ingress::protocol::udp,
         std::string("127.0.0.1"),
         std::to_string(receiver.port())}};
 

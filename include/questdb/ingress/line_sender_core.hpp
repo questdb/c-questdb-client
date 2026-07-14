@@ -202,7 +202,7 @@ enum class protocol
     https,
 
     /** QuestWire Protocol over UDP. */
-    qwpudp,
+    udp,
 
     /** QuestWire Protocol over WebSocket. */
     ws,

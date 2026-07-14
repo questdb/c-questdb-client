@@ -42,15 +42,15 @@ For API usage:
 
 ## QWP/UDP security posture
 
-The `qwpudp::` transport carries **no authentication and no TLS**. UDP is
+The `udp::` transport carries **no authentication and no TLS**. UDP is
 connectionless, so the server cannot verify client identity at the protocol
 layer, and datagram contents travel unencrypted.
 
 Passing `username`, `password`, `token`, `token_x`, `token_y`, or
-`auth_timeout` to a `qwpudp::` sender is rejected when the setting is applied,
+`auth_timeout` to a `udp::` sender is rejected when the setting is applied,
 either while parsing a config string or while calling the corresponding builder
 method. The error names the unsupported setting, for example
-`The "username" setting is not supported for QWP/UDP.` There is no `qwpudps://`
+`The "username" setting is not supported for QWP/UDP.` There is no `udps://`
 (TLS) scheme.
 
 QWP/UDP is therefore intended for **trusted private networks only** —

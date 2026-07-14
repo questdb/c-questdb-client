@@ -502,7 +502,7 @@ pub enum line_sender_protocol {
     line_sender_protocol_https,
 
     /// QuestWire Protocol over UDP.
-    line_sender_protocol_qwpudp,
+    line_sender_protocol_udp,
 
     /// QuestWire Protocol over WebSocket.
     line_sender_protocol_ws,
@@ -525,7 +525,7 @@ impl From<Protocol> for line_sender_protocol {
             Protocol::Tcps => line_sender_protocol::line_sender_protocol_tcps,
             Protocol::Http => line_sender_protocol::line_sender_protocol_http,
             Protocol::Https => line_sender_protocol::line_sender_protocol_https,
-            Protocol::QwpUdp => line_sender_protocol::line_sender_protocol_qwpudp,
+            Protocol::Udp => line_sender_protocol::line_sender_protocol_udp,
             Protocol::Ws => line_sender_protocol::line_sender_protocol_ws,
             Protocol::Wss => line_sender_protocol::line_sender_protocol_wss,
             _ => line_sender_protocol::line_sender_protocol_unknown,
@@ -541,7 +541,7 @@ impl TryFrom<line_sender_protocol> for Protocol {
             line_sender_protocol::line_sender_protocol_tcps => Protocol::Tcps,
             line_sender_protocol::line_sender_protocol_http => Protocol::Http,
             line_sender_protocol::line_sender_protocol_https => Protocol::Https,
-            line_sender_protocol::line_sender_protocol_qwpudp => Protocol::QwpUdp,
+            line_sender_protocol::line_sender_protocol_udp => Protocol::Udp,
             line_sender_protocol::line_sender_protocol_ws => Protocol::Ws,
             line_sender_protocol::line_sender_protocol_wss => Protocol::Wss,
             line_sender_protocol::line_sender_protocol_unknown => return Err(()),
@@ -3488,7 +3488,7 @@ pub unsafe extern "C" fn line_sender_buffer_new_for_sender(
         let buffer = sender.new_buffer();
         let empty_peek_buf_is_null = matches!(
             sender.protocol(),
-            Protocol::QwpUdp | Protocol::Ws | Protocol::Wss
+            Protocol::Udp | Protocol::Ws | Protocol::Wss
         );
         Box::into_raw(Box::new(line_sender_buffer {
             buffer,
@@ -6103,10 +6103,10 @@ mod tests {
         *err = ptr::null_mut();
     }
 
-    fn new_qwpudp_sender(err: &mut *mut line_sender_error) -> *mut line_sender {
+    fn new_udp_sender(err: &mut *mut line_sender_error) -> *mut line_sender {
         unsafe {
             let opts = line_sender_opts_new(
-                line_sender_protocol::line_sender_protocol_qwpudp,
+                line_sender_protocol::line_sender_protocol_udp,
                 utf8(b"127.0.0.1"),
                 9009,
             );
@@ -6678,7 +6678,7 @@ mod tests {
         unsafe {
             let mut err = ptr::null_mut();
             let opts = line_sender_opts_new(
-                line_sender_protocol::line_sender_protocol_qwpudp,
+                line_sender_protocol::line_sender_protocol_udp,
                 utf8(b"127.0.0.1"),
                 9009,
             );
@@ -6704,7 +6704,7 @@ mod tests {
     fn qwpws_fsn_outputs_are_required() {
         unsafe {
             let mut err = ptr::null_mut();
-            let sender = new_qwpudp_sender(&mut err);
+            let sender = new_udp_sender(&mut err);
 
             assert!(!line_sender_qwpws_published_fsn(
                 sender,
@@ -6726,7 +6726,7 @@ mod tests {
     fn qwpws_extensions_reject_non_websocket_sender() {
         unsafe {
             let mut err = ptr::null_mut();
-            let sender = new_qwpudp_sender(&mut err);
+            let sender = new_udp_sender(&mut err);
             let mut fsn = line_sender_qwpws_fsn {
                 has_value: true,
                 value: u64::MAX,
