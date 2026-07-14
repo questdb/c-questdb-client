@@ -88,8 +88,12 @@ const S_NAMES: [&str; N_WIDE_SYMS] = ["s1", "s2", "s3", "s4", "s5"];
 struct RowBenchCtx<'a> {
     kind: SchemaKind,
     rows: usize,
-    sym_card: usize,
-    hi_sym_card: usize,
+    /// Precomputed `sym` labels (`bench_schema::sym_pool`), indexed by
+    /// `i % len()` -- same values as the old per-row `sym_label(i % card)`.
+    sym_pool: &'a [String],
+    /// Precomputed s1..s5 labels (`bench_schema::hi_sym_pools`), outer index
+    /// = 0-based wide-column position; empty for s1-narrow.
+    hi_pools: &'a [Vec<String>],
     /// Precomputed VARCHAR `note` templates (`bench_schema::note_template`),
     /// cycled by `i % templates.len()` — identical values to the polars
     /// example's `note_values`.
@@ -102,9 +106,10 @@ struct RowBenchCtx<'a> {
 /// `id/price/note` (`d1..d5` for S2-wide), then the designated timestamp.
 /// Shared by both passes so `row-build` and `row-flush` append
 /// byte-identical rows — same values as `qwp_ingress_polars.rs`'s
-/// `build_data`/`build_sym_col` (`sym_label(i % sym_card)`,
-/// `hi_sym_label(col, i % hi_sym_card)`, `id = i`, `price = i * 0.25`,
-/// `wide_double(i, k)`).
+/// `build_data`/`build_sym_col`; symbol labels come from pools precomputed
+/// outside the timed region (`ctx.sym_pool[i % len]`, `ctx.hi_pools[col][i %
+/// len]` — identical strings to the per-row `sym_label`/`hi_sym_label` calls
+/// they replace), `id = i`, `price = i * 0.25`, `wide_double(i, k)`.
 fn fill_batch(
     buffer: &mut Buffer,
     ctx: &RowBenchCtx,
@@ -114,13 +119,11 @@ fn fill_batch(
     let table = ctx.kind.table();
     for i in start..end {
         buffer.table(table)?;
-        buffer.symbol("sym", bench_schema::sym_label(i % ctx.sym_card))?;
+        buffer.symbol("sym", ctx.sym_pool[i % ctx.sym_pool.len()].as_str())?;
         if ctx.kind.is_wide() {
             for (col, name) in S_NAMES.iter().enumerate() {
-                buffer.symbol(
-                    *name,
-                    bench_schema::hi_sym_label(col + 1, i % ctx.hi_sym_card),
-                )?;
+                let pool = &ctx.hi_pools[col];
+                buffer.symbol(*name, pool[i % pool.len()].as_str())?;
             }
         }
         buffer.column_i64("id", i as i64)?;
@@ -347,11 +350,19 @@ fn main() -> Result<(), Box<dyn Error>> {
     let templates: Vec<String> = (0..template_count)
         .map(|i| bench_schema::note_template(i, varchar_len))
         .collect();
+    // Label pools -- built once, outside every timed region (mirrors the
+    // Java twin). The timed loop then does O(1) lookups only.
+    let sym_pool = bench_schema::sym_pool(sym_card);
+    let hi_pools = if kind.is_wide() {
+        bench_schema::hi_sym_pools(hi_sym_card)
+    } else {
+        Vec::new()
+    };
     let ctx = RowBenchCtx {
         kind,
         rows,
-        sym_card,
-        hi_sym_card,
+        sym_pool: &sym_pool,
+        hi_pools: &hi_pools,
         templates: &templates,
         max_batch_rows,
     };
