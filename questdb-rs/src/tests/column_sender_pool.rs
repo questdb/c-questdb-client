@@ -5720,6 +5720,7 @@ mod sender_conn_event_tests {
         assert_eq!(err.code(), ErrorCode::ConfigError);
     }
 
+    #[cfg(feature = "sync-sender-http")]
     #[test]
     fn non_ws_builder_listener_rejected() {
         let (_seen, listener) = collecting_listener();
