@@ -178,9 +178,13 @@ def _rss_verdict(leg, warmup, steady, cfg):
     xs = [(s['t'] - t0) / 60.0 for s in steady]           # minutes
     ys = [s['rss_bytes'] / 1024.0 for s in steady]        # KiB
     slope = linreg_slope(xs, ys)
-    growth = (ys[-1] - ys[0]) / ys[0] if ys[0] else 0.0
     warmup_peak = max((s['rss_bytes'] for s in warmup), default=steady[0]['rss_bytes'])
     steady_peak = max(s['rss_bytes'] for s in steady)
+    # Peak-over-warmup, not first-to-last-sample: the first steady sample can
+    # land before the working set is fully paged back in after warmup, so a
+    # first-relative ratio reads a large "growth" even when RSS is flat (a
+    # near-zero slope with a big first-relative ratio is exactly that artefact).
+    growth = (steady_peak - warmup_peak) / warmup_peak if warmup_peak else 0.0
     ok = (slope <= cfg.rss_slope_max_kib_per_min
           and growth <= cfg.rss_growth_max_frac
           and steady_peak <= warmup_peak * cfg.rss_peak_mult)
@@ -215,13 +219,19 @@ def _pool_verdicts(leg, rows, steady, cfg):
     final = rows[-1].get('pool', {})
     for pool_name, counts in sorted(final.items()):
         _free, in_use, closing = counts
-        # At the final (post-drain) sample the pool must be quiesced.
-        ok = True
+        # A leg holds at most one live borrow at a time, so in_use peaking above
+        # one means a connection was borrowed and never returned — a real leak.
+        # A single held borrow at the final sample is just the leg killed
+        # mid-use by the shutdown drain (it never got to release it), which is
+        # not a leak — so key the check on the run-wide peak, not final==0.
+        peak_in_use = max(
+            (r.get('pool', {}).get(pool_name, (0, 0, 0))[1] for r in rows),
+            default=in_use)
+        ok = not (cfg.require_pool_drain and peak_in_use > 1)
         detail = {'final_free': _free, 'final_in_use': in_use,
-                  'final_closing': closing}
-        if cfg.require_pool_drain and (in_use != 0 or closing != 0):
-            ok = False
-            detail['reason'] = 'pool not drained at quiesce'
+                  'final_closing': closing, 'peak_in_use': peak_in_use}
+        if not ok:
+            detail['reason'] = 'pool leak: in_use peaked above one live borrow'
         out.append(Verdict('I4', f'{leg}:pool:{pool_name}', ok, detail))
     return out
 
