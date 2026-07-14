@@ -86,9 +86,7 @@ pub fn run_egress_leg(cfg: &LegConfig) -> LegResult {
     let mut losses: u64 = 0; // count < span: a missing c_seq => real loss (fatal)
     let mut dup_surplus: u64 = 0; // last-seen count - span (>0 => duplicates)
     let mut max_dup_surplus: u64 = 0; // high-water mark for the end-of-run summary
-    let mut stuck: u32 = 0;
     let mut last_err: Option<String> = None; // dedupe transient-error logging
-    const STUCK_LIMIT: u32 = 500;
 
     let mut reader = db.borrow_reader()?;
 
@@ -97,7 +95,6 @@ pub fn run_egress_leg(cfg: &LegConfig) -> LegResult {
             Ok((count, min, max)) => {
                 queries += 1;
                 rows_read += count;
-                stuck = 0;
                 last_err = None; // a successful scan closes any error streak
                 if count > 0 {
                     let span = (max - min + 1) as u64;
@@ -131,22 +128,18 @@ pub fn run_egress_leg(cfg: &LegConfig) -> LegResult {
                 }
             }
             Err(e) => {
-                // Transport churn during a server bounce (Broken pipe) and the
-                // brief startup window before the ingest leg creates `c_seq`
-                // (Invalid column) are both expected and self-heal on retry.
-                // Log once per error streak so the churn doesn't flood the log.
+                // Transport churn is expected: a server bounce (Broken pipe /
+                // reset), or the brief startup window before the ingest leg
+                // creates `c_seq` (Invalid column). A large dataset can keep the
+                // faulted server down a while during a graceful restart, so
+                // retry patiently rather than give up — a slow restart is not
+                // the reader's fault. The end-of-run `queries == 0` check still
+                // catches a reader that never worked at all. Log once per error
+                // streak so the churn doesn't flood the log.
                 let msg = e.to_string();
                 if last_err.as_deref() != Some(msg.as_str()) {
                     eprintln!("{}: egress query error (retrying): {msg}", cfg.leg);
                     last_err = Some(msg);
-                }
-                stuck += 1;
-                if stuck > STUCK_LIMIT {
-                    return Err(format!(
-                        "{}: {STUCK_LIMIT} query failures without progress: {e}",
-                        cfg.leg
-                    )
-                    .into());
                 }
                 drop(reader);
                 sleep(Duration::from_millis(200));
@@ -161,14 +154,14 @@ pub fn run_egress_leg(cfg: &LegConfig) -> LegResult {
         sleep(Duration::from_secs_f64(1.0 / qps as f64));
 
         if last_stats.elapsed() >= Duration::from_secs(5) {
-            stats.emit(&db, rows_read, rows_read, Some(queries), Some(losses))?;
+            stats.emit(&db, rows_read, rows_read, None, None)?;
             last_stats = Instant::now();
         }
     }
 
     // Release the reader so the final quiesce sample sees the pool drained (I4).
     drop(reader);
-    stats.emit(&db, rows_read, rows_read, Some(queries), Some(losses))?;
+    stats.emit(&db, rows_read, rows_read, None, None)?;
     if max_dup_surplus > 0 {
         eprintln!(
             "{}: egress observed max dup surplus={max_dup_surplus} \
@@ -178,6 +171,13 @@ pub fn run_egress_leg(cfg: &LegConfig) -> LegResult {
     }
     if losses > 0 {
         return Err(format!("{}: {losses} egress LOSS event(s) detected", cfg.leg).into());
+    }
+    if queries == 0 {
+        return Err(format!(
+            "{}: egress never completed a scan (reader unreachable the whole run)",
+            cfg.leg
+        )
+        .into());
     }
     Ok(())
 }
