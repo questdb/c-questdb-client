@@ -5,7 +5,7 @@
 //! flushes it via [`QuestDb::flush_polars_dataframe`], advancing the same
 //! fsync'd journal as the other legs. Covers a representative column set
 //! (i64 / f64 / bool / symbol / designated timestamp) — enough to drive the
-//! DataFrame conversion machinery; the full 22-type matrix is the column leg's.
+//! DataFrame conversion machinery; the broader type matrix is the Chunk leg's.
 
 use std::thread::sleep;
 use std::time::{Duration, Instant};

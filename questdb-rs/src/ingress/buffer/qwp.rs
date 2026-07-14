@@ -3561,11 +3561,22 @@ impl QwpWsColumnarBuffer {
         global_dict: &mut SymbolGlobalDict,
         version: u8,
     ) -> crate::Result<()> {
-        self.encode_ws_replay_message_with_defer(scratch, global_dict, version, false, false)
+        let mut message = std::mem::take(&mut scratch.message);
+        let result = self.encode_ws_replay_message_with_defer(
+            &mut message,
+            scratch,
+            global_dict,
+            version,
+            false,
+            false,
+        );
+        scratch.message = message;
+        result
     }
 
     pub(crate) fn encode_ws_replay_message_with_defer(
         &self,
+        out: &mut Vec<u8>,
         scratch: &mut QwpWsEncodeScratch,
         global_dict: &mut SymbolGlobalDict,
         version: u8,
@@ -3573,7 +3584,6 @@ impl QwpWsColumnarBuffer {
         delta_dict: bool,
     ) -> crate::Result<()> {
         self.check_can_flush()?;
-        let out = &mut scratch.message;
         out.clear();
 
         let header_start = out.len();
@@ -5322,6 +5332,16 @@ impl SymbolGlobalDict {
         self.entries.get(index).map(|a| a.as_ref())
     }
 
+    pub(crate) fn entries_from(&self, from_id: u64) -> Option<impl Iterator<Item = &[u8]>> {
+        let index = usize::try_from(from_id).ok()?;
+        Some(
+            self.entries
+                .get(index..)?
+                .iter()
+                .map(|entry| entry.as_ref()),
+        )
+    }
+
     /// Returns `(global_id, is_new)`. Errors with `InvalidApiCall` if the symbol
     /// exceeds [`MAX_PERSISTED_SYMBOL_ENTRY_LEN`], or interning it would push the
     /// dictionary past its entry-count cap ([`MAX_CONN_SYMBOL_DICT_SIZE`]) or its
@@ -5458,6 +5478,10 @@ impl SymbolGlobalDict {
 #[cfg(feature = "_sender-qwp-ws")]
 #[derive(Default)]
 pub(crate) struct QwpWsEncodeScratch {
+    /// Test-only retained output for the convenience encoders in this module.
+    /// Production publishers own their payload separately and pass it into the
+    /// encoder, so the pooled path never allocates or copies through scratch.
+    #[cfg(test)]
     pub(crate) message: Vec<u8>,
     /// Per-segment, per-column-local-index mapping to global symbol IDs.
     /// Populated during the pre-pass of `encode_ws_message` and consumed by
@@ -5474,6 +5498,7 @@ pub(crate) struct QwpWsEncodeScratch {
 impl QwpWsEncodeScratch {
     pub(crate) fn new() -> Self {
         Self {
+            #[cfg(test)]
             message: Vec::with_capacity(16 * 1024),
             per_segment_symbol_globals: Vec::new(),
             schema_signature: Vec::new(),

@@ -22,14 +22,14 @@
  *
  ******************************************************************************/
 
-//! Column-sender QWP/WebSocket frame encoder.
+//! Columnar QWP/WebSocket frame encoder.
 //!
 //! Writes the QWP frame body for a `Chunk` directly into the connection's
 //! reusable outbound buffer — no allocation per flush, no per-column
 //! aggregation copy. The no-null hot path for fixed-width columns is a
 //! single `extend_from_slice` (memcpy) straight from the caller's buffer.
 //!
-//! See `doc/COLUMN_SENDER_PLAN.md` for the design rationale.
+//! See `doc/QWP_UNIFIED_SENDER_DESIGN.md` for the shared publication design.
 
 use std::slice;
 
@@ -1576,7 +1576,7 @@ mod tests {
             let canonical_rejects = TableName::new(name).is_err();
 
             // Build a minimal otherwise-valid chunk and encode it — this
-            // is exactly what `ColumnSender::flush` does at flush time.
+            // is exactly what `PooledSenderCore::flush` does at flush time.
             let mut chunk = Chunk::new(name);
             let ts = [1i64];
             chunk.at_micros(&ts).unwrap();

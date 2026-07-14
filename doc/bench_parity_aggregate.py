@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Step 4 parity-table aggregator (QWP_DATAFRAME_BENCH_PLAN.md §7).
+"""Step 4 parity-table aggregator (historical/QWP_DATAFRAME_BENCH_PLAN.md §7).
 
 Consumes the §3.2 JSON metric contract emitted by every bench path -- Python
 (``py-questdb-client``: ``benchmark_pandas_columnar.py`` ingress,

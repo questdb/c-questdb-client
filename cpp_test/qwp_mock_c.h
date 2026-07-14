@@ -3,7 +3,7 @@
  *
  * Spins up an in-process mock that accepts one WS-Upgrade per slot and
  * silently swallows the first inbound QWP binary frame on each
- * connection — enough to drive `column_sender_flush_arrow_batch`
+ * connection — enough to drive `qwp_sender_flush_arrow_batch`
  * end-to-end without hitting a live QuestDB instance.
  *
  * CMake note: when wiring this into the build, add
@@ -31,6 +31,9 @@ typedef struct qwp_mock_c qwp_mock_c;
  *
  * Returns NULL on failure (e.g. OS-level bind failure). */
 qwp_mock_c* qwp_mock_c_start(int slot_count);
+
+/* Variant for tests that publish multiple frames through one connection. */
+qwp_mock_c* qwp_mock_c_start_frames(int slot_count, int frame_count);
 
 /* Return the mock's listening address as "127.0.0.1:NNNN", suitable for
  * splicing into a `ws::addr=...` connect string. Pointer is valid

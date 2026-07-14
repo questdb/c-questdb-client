@@ -177,6 +177,11 @@ pub(crate) struct PersistedSymbolDict {
     /// poison + latch behaviour can be exercised without a real disk fault.
     #[cfg(test)]
     fail_next_append_cleanup: bool,
+    /// Test-only: fail the next append before writing any byte. This models a
+    /// clean write-ahead rejection whose rollback must leave the live handle,
+    /// cursor, and on-disk prefix unchanged.
+    #[cfg(test)]
+    fail_next_append: bool,
 }
 
 impl PersistedSymbolDict {
@@ -285,6 +290,13 @@ impl PersistedSymbolDict {
         self.fail_next_append_cleanup = true;
     }
 
+    /// Test-only: fail the next [`append_symbols`](Self::append_symbols) before
+    /// it writes anything, leaving the side-file at its current mark.
+    #[cfg(test)]
+    pub(crate) fn arm_fail_next_append(&mut self) {
+        self.fail_next_append = true;
+    }
+
     /// Appends `symbols` in id order in a **single** buffered `write_all`, each
     /// taking the next dense id implicitly (its position). The write-ahead path
     /// calls this once per frame with the symbols that frame introduced; batching
@@ -307,13 +319,29 @@ impl PersistedSymbolDict {
     /// [`poison`]: PersistedSymbolDict::poison
     /// [`open`]: PersistedSymbolDict::open
     pub(crate) fn append_symbols(&mut self, symbols: &[&[u8]]) -> io::Result<()> {
+        self.append_symbols_iter(symbols.iter().copied())
+    }
+
+    /// Iterator form used by the pooled foreground to stream entries directly
+    /// from its global dictionary without allocating an intermediate
+    /// `Vec<&[u8]>`. Entries are still batched in the retained append scratch.
+    pub(crate) fn append_symbols_iter<'a>(
+        &mut self,
+        symbols: impl IntoIterator<Item = &'a [u8]>,
+    ) -> io::Result<()> {
         if self.poisoned {
             return Err(io::Error::other(
                 "persisted symbol dictionary poisoned by a failed partial-write cleanup",
             ));
         }
-        if symbols.is_empty() {
+        let mut symbols = symbols.into_iter().peekable();
+        if symbols.peek().is_none() {
             return Ok(());
+        }
+        #[cfg(test)]
+        if self.fail_next_append {
+            self.fail_next_append = false;
+            return Err(io::Error::other("injected clean append failure"));
         }
         // Test-only: exercise the failed-cleanup path without a real disk fault.
         #[cfg(test)]
@@ -330,12 +358,14 @@ impl PersistedSymbolDict {
         // a symbol. Built in scratch and written in one `write_all` so a wide flush
         // does not do a syscall per symbol.
         self.append_scratch.clear();
+        let mut symbol_count = 0u32;
         for symbol in symbols {
             let entry_start = self.append_scratch.len();
             write_varint(&mut self.append_scratch, symbol.len() as u64);
             self.append_scratch.extend_from_slice(symbol);
             let crc = crc32c::crc32c_append(0, &self.append_scratch[entry_start..]);
             self.append_scratch.extend_from_slice(&crc.to_le_bytes());
+            symbol_count += 1;
         }
         let batch_len = self.append_scratch.len() as u64;
         // Disjoint field borrows: write the scratch (shared) into the file (mut).
@@ -357,7 +387,7 @@ impl PersistedSymbolDict {
             return Err(e);
         }
         self.append_offset = start + batch_len;
-        self.size += symbols.len() as u32;
+        self.size += symbol_count;
         Ok(())
     }
 
@@ -610,6 +640,8 @@ impl PersistedSymbolDict {
             poisoned: false,
             #[cfg(test)]
             fail_next_append_cleanup: false,
+            #[cfg(test)]
+            fail_next_append: false,
         }))
     }
 
@@ -637,6 +669,8 @@ impl PersistedSymbolDict {
             poisoned: false,
             #[cfg(test)]
             fail_next_append_cleanup: false,
+            #[cfg(test)]
+            fail_next_append: false,
         })
     }
 }
@@ -702,14 +736,15 @@ mod tests {
 
     #[test]
     fn append_symbols_batches_multiple_in_one_write_and_round_trips() {
-        // The write-ahead path persists a frame's new symbols in one batched call
-        // (one alloc + one write_all) rather than per symbol. The on-disk result
-        // must be identical to per-symbol appends: entries in id order, empty
-        // symbols preserved, and ids continuing across successive batches.
+        // The write-ahead path streams a frame's new symbols into retained scratch
+        // and persists them with one write_all. The on-disk result must be identical
+        // to per-symbol appends: entries in id order, empty symbols preserved, and
+        // ids continuing across successive batches.
         let dir = tmp_slot();
         {
             let mut d = PersistedSymbolDict::open(dir.path()).unwrap();
-            d.append_symbols(&[b"AAPL", b"", b"GOOG"]).unwrap();
+            let first: [&[u8]; 3] = [b"AAPL", b"", b"GOOG"];
+            d.append_symbols_iter(first).unwrap();
             assert_eq!(d.size(), 3);
             d.append_symbols(&[b"MSFT"]).unwrap(); // a later frame continues ids
             assert_eq!(d.size(), 4);

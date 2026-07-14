@@ -64,8 +64,8 @@ pub use error::*;
 // --- Primary entry point -------------------------------------------------
 //
 // `QuestDb` is the connection/pool handle for a QuestDB instance. It spans
-// both directions — it hands out column-major and row-major senders (write)
-// *and* query readers (read) — so it lives in its own top-level `db` module,
+// both directions — it hands out unified ingestion senders (write) and query
+// readers (read) — so it lives in its own top-level `db` module,
 // a peer of `ingress` and `egress` rather than a child of either. Those
 // modules remain the home of the specialised, direction-specific types
 // (`Chunk`, `AckLevel`, `ColumnView`, `Cursor`, `Bind`, …); the common entry
@@ -74,7 +74,7 @@ pub use error::*;
 mod db;
 
 #[cfg(feature = "sync-sender-qwp-ws")]
-pub use db::{BorrowedColumnSender, BorrowedRowSender, QuestDb};
+pub use db::{BorrowedSender, QuestDb};
 // Unstable per-pool connection-count snapshot for soak / leak harnesses.
 // `#[doc(hidden)]` at the definition site; re-exported so `QuestDb`'s
 // `dbg_pool_counts` return type is nameable.

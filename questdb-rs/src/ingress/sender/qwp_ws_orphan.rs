@@ -828,12 +828,12 @@ mod tests {
     fn scan_filters_canonical_managed_slot_ranges_only() {
         let temp = TempDir::new().unwrap();
         for name in [
-            "default-col-0",
-            "default-col-1",
-            "default-col-2",
-            "default-col-02",
-            "default-col-x",
-            "default-row-1",
+            "default-ingest-0",
+            "default-ingest-1",
+            "default-ingest-2",
+            "default-ingest-02",
+            "default-ingest-x",
+            "unmanaged-1",
             "default",
         ] {
             let slot = temp.path().join(name);
@@ -841,20 +841,20 @@ mod tests {
             fs::write(slot.join("sf-initial.sfa"), b"queued").unwrap();
         }
 
-        let exclusions = vec![
-            QwpWsManagedSlotExclusion::new("default-col-".to_owned(), 2),
-            QwpWsManagedSlotExclusion::new("default-row-".to_owned(), 2),
-        ];
-        let mut actual = scan_orphan_slots(temp.path(), "default-row-0", &exclusions);
+        let exclusions = vec![QwpWsManagedSlotExclusion::new(
+            "default-ingest-".to_owned(),
+            2,
+        )];
+        let mut actual = scan_orphan_slots(temp.path(), "unmanaged-1", &exclusions);
         actual.sort();
 
         assert_eq!(
             actual,
             vec![
                 temp.path().join("default"),
-                temp.path().join("default-col-02"),
-                temp.path().join("default-col-2"),
-                temp.path().join("default-col-x"),
+                temp.path().join("default-ingest-02"),
+                temp.path().join("default-ingest-2"),
+                temp.path().join("default-ingest-x"),
             ]
         );
     }

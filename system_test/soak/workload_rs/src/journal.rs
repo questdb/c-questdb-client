@@ -1,12 +1,13 @@
 //! Fsync'd ack journal — the "gap-free by construction" mechanism (§S1).
 //!
-//! Every ingest leg appends its highest **durably-acked** `seq` to a per-worker
-//! journal after each ack watermark advance, and `fsync`s it. Two guarantees
+//! Every ingest leg appends its highest **acknowledged** `seq` to a per-worker
+//! journal after each ACK boundary, and `fsync`s it. Two guarantees
 //! fall out:
 //!
 //! * **Recovery point.** After a client kill/restart the leg resumes at
-//!   `watermark + 1`, so it never re-sends already-acked rows on the direct /
-//!   SF-mem paths, and never skips a row on any path.
+//!   `watermark + 1`, so it never skips a journaled row. A kill in the narrow
+//!   interval after the server ACK but before the journal fsync can replay one
+//!   batch; the soak tables use DEDUP and I2 verifies the resulting exactness.
 //! * **Oracle lower bound.** The journal is the authoritative "every `seq` up
 //!   to here must be readable back" watermark the completeness invariant (I1)
 //!   checks against — independent of the client under test.

@@ -140,10 +140,10 @@ typedef enum line_sender_error_code
      *  `arrow` feature only. */
     line_sender_error_arrow_ingest = 16,
 
-    /** Reconnectable failure on the column-major sender's flush/sync
+    /** Reconnectable failure on the QWP sender's flush/sync
      *  path (transport error, EOF, closed connection). The operation
-     *  has not committed: drop the connection with `questdb_db_drop_column_sender`,
-     *  re-acquire one with `questdb_db_borrow_column_sender_with_retry` (row-aligned
+     *  has not committed: drop the connection with `questdb_db_drop_sender`,
+     *  re-acquire one with `questdb_db_borrow_sender_with_retry` (shared
      *  reconnect backoff, bounded by `reconnect_max_duration`), and re-drive
      *  from your source. */
     line_sender_error_failover_retry = 17,
@@ -216,8 +216,8 @@ typedef enum line_sender_error_code
     line_sender_error_arrow_export = 34,
 
     /** An irreducible QWP/WebSocket unit (the table schema plus a single row
-     *  block) exceeds the negotiated per-batch cap. The column sender splits
-     *  oversize chunks into smaller frames automatically, so this only surfaces
+     *  block) exceeds the negotiated per-batch cap. Chunk publication splits
+     *  oversize inputs into smaller frames automatically, so this only surfaces
      *  when splitting cannot make a frame fit. Distinct from
      *  `line_sender_error_invalid_api_call` so callers can recognise it without
      *  matching on the error message text. */
@@ -624,10 +624,10 @@ line_sender_buffer* line_sender_buffer_new_qwp_with_max_name_len(
     size_t max_name_len);
 
 /**
- * Construct a QWP/WebSocket columnar `line_sender_buffer` with a fixed
- * 127-byte name length limit. This is the buffer kind a `row_sender`
- * borrowed from a `questdb_db` pool requires; when you hold the `row_sender`,
- * prefer `row_sender_new_buffer` (see `column_sender.h`).
+ * Construct a QWP/WebSocket `line_sender_buffer` with a fixed 127-byte name
+ * length limit. For pooled ingestion, prefer `questdb_db_new_buffer` so the
+ * buffer inherits the pool's configured name-length limit (see
+ * `column_sender.h`).
  */
 QUESTDB_CLIENT_API
 line_sender_buffer* line_sender_buffer_new_qwp_ws(void);
@@ -2025,7 +2025,7 @@ typedef enum qwpws_ack_level
 /**
  * Wait until every QWP/WebSocket frame published so far reaches `ack_level`
  * (a `qwpws_ack_level` value). This is the row-major counterpart
- * to `column_sender_wait`.
+ * to `qwp_sender_wait`.
  *
  * `timeout_millis` is a no-progress deadline (it fires only if the ack
  * watermark fails to advance for that long); `0` waits indefinitely.

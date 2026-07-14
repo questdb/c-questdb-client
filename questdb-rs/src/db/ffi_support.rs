@@ -26,19 +26,19 @@
 //!
 //! The `questdb-rs-ffi` C-ABI crate builds the C / C++ / Python clients on top
 //! of [`QuestDb`]. C and Python cannot express Rust lifetimes, so the C ABI
-//! cannot hand out the lifetime-bound `BorrowedColumnSender` /
-//! `BorrowedRowSender` / `BorrowedReader` handles that the normal Rust API
+//! cannot hand out the lifetime-bound `BorrowedSender` / `BorrowedReader`
+//! handles that the normal Rust API
 //! uses. Instead it hands out *owned* (lifetime-free) handles that carry their
 //! own pool reference internally, so a C caller can free its `questdb_db*`
-//! before dropping outstanding `column_sender*` / `row_sender*` / `reader*`
+//! before dropping outstanding `qwp_sender*` / `reader*`
 //! handles. After the pool is closed those handles still return / drop safely;
 //! new operations on them fail cleanly with `InvalidApiCall`.
 //!
 //! Those owned handles and the entry points that mint them live here, behind
 //! the `ffi-support` feature, so they never appear on the public [`QuestDb`]
 //! surface that ordinary Rust users see. **Rust users want the lifetime-bound
-//! API** — [`QuestDb::borrow_column_sender`], [`QuestDb::borrow_row_sender`],
-//! and (with egress) `QuestDb::borrow_reader` — which catches use-after-close
+//! API** — [`QuestDb::borrow_sender`] and (with egress)
+//! `QuestDb::borrow_reader` — which catch use-after-close
 //! at compile time.
 //!
 //! Everything re-exported or defined here is `#[doc(hidden)]` via the module
@@ -49,34 +49,31 @@ use std::time::Duration;
 use super::QuestDb;
 use crate::Result;
 
-pub use super::{OwnedColumnSender, OwnedRowSender};
+pub use super::{OwnedDirectColumnSender, OwnedSender};
 
 #[cfg(feature = "_egress")]
 pub use super::{OwnedReader, ReaderPoolHandle};
 
-/// Borrow a column-major sender as an owned, lifetime-free handle.
+/// Borrow the store-and-forward QWP sender as an owned, lifetime-free handle.
 ///
-/// FFI counterpart to [`QuestDb::borrow_column_sender`]; backs the C ABI's
-/// `questdb_db_borrow_column_sender`.
-pub fn borrow_column_sender_owned(db: &QuestDb) -> Result<OwnedColumnSender> {
-    db.borrow_column_sender_owned()
+/// FFI counterpart to [`QuestDb::borrow_sender`]; backs the C ABI's
+/// `questdb_db_borrow_sender`.
+pub fn borrow_sender_owned(db: &QuestDb) -> Result<OwnedSender> {
+    db.borrow_sender_owned()
 }
 
-/// Like [`borrow_column_sender_owned`] but retries the connect within `budget`
-/// using the row API's reconnect backoff (the cluster may be electing a
-/// primary). Backs the C ABI's `questdb_db_borrow_column_sender_with_retry`.
-pub fn borrow_column_sender_owned_with_retry(
-    db: &QuestDb,
-    budget: Duration,
-) -> Result<OwnedColumnSender> {
-    db.borrow_column_sender_owned_with_retry(budget)
+/// Like [`borrow_sender_owned`] but retries the connect within `budget`
+/// using the pool reconnect backoff (the cluster may be electing a
+/// primary). Backs the C ABI's `questdb_db_borrow_sender_with_retry`.
+pub fn borrow_sender_owned_with_retry(db: &QuestDb, budget: Duration) -> Result<OwnedSender> {
+    db.borrow_sender_owned_with_retry(budget)
 }
 
 /// Borrow a **direct** (non-store-and-forward) column-major sender as an
 /// owned, lifetime-free handle. FFI counterpart to
 /// [`QuestDb::borrow_direct_column_sender`]; backs the C ABI's
 /// `questdb_db_borrow_direct_column_sender`.
-pub fn borrow_direct_column_sender_owned(db: &QuestDb) -> Result<OwnedColumnSender> {
+pub fn borrow_direct_column_sender_owned(db: &QuestDb) -> Result<OwnedDirectColumnSender> {
     db.borrow_direct_column_sender_owned()
 }
 
@@ -86,26 +83,8 @@ pub fn borrow_direct_column_sender_owned(db: &QuestDb) -> Result<OwnedColumnSend
 pub fn borrow_direct_column_sender_owned_with_retry(
     db: &QuestDb,
     budget: Duration,
-) -> Result<OwnedColumnSender> {
+) -> Result<OwnedDirectColumnSender> {
     db.borrow_direct_column_sender_owned_with_retry(budget)
-}
-
-/// Borrow a row-major ([`crate::ingress::Sender`]) sender as an owned,
-/// lifetime-free handle. FFI counterpart to [`QuestDb::borrow_row_sender`];
-/// backs the C ABI's `questdb_db_borrow_row_sender`.
-pub fn borrow_row_sender_owned(db: &QuestDb) -> Result<OwnedRowSender> {
-    db.borrow_row_sender_owned()
-}
-
-/// Like [`borrow_row_sender_owned`] but retries the connect within `budget`
-/// using the pool's reconnect backoff (`AuthError` / protocol-version errors
-/// are terminal). `budget` `Duration::ZERO` makes a single attempt. Backs the
-/// C ABI's `questdb_db_borrow_row_sender_with_retry`.
-pub fn borrow_row_sender_owned_with_retry(
-    db: &QuestDb,
-    budget: Duration,
-) -> Result<OwnedRowSender> {
-    db.borrow_row_sender_owned_with_retry(budget)
 }
 
 /// The pool's failover budget (`reconnect_max_duration`, default 300s).

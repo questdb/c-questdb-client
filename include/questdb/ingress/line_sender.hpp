@@ -104,9 +104,8 @@ public:
     /**
      * Construct a standalone QWP/WebSocket columnar buffer.
      *
-     * This is the buffer kind a `borrowed_row_sender` requires. When you hold
-     * the row sender, prefer `borrowed_row_sender::new_buffer()`, which
-     * matches the sender's configured name-length cap automatically.
+     * This is the buffer kind a pooled `borrowed_sender` requires. Prefer
+     * `borrowed_sender::new_buffer()`, which uses the pool configuration.
      */
     static line_sender_buffer qwp_ws(
         size_t init_buf_size = 64 * 1024,
@@ -1232,10 +1231,10 @@ private:
     _backend_kind _backend{_backend_kind::ilp};
 
     friend class line_sender;
-    // Pool-borrowed row sender (defined in column_sender.hpp); flushes this
-    // buffer through `row_sender_flush`, so it needs the same `_impl` access
-    // as `line_sender`.
-    friend class borrowed_row_sender;
+    // Pool-borrowed QWP sender (defined in column_sender.hpp) flushes this
+    // buffer through `qwp_sender_flush_buffer`, so it needs the same `_impl`
+    // access as `line_sender`.
+    friend class borrowed_sender;
 };
 
 class _user_agent

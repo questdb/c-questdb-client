@@ -178,7 +178,7 @@ pub(crate) fn is_valid_qwp_ws_sender_id(sender_id: &str) -> bool {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct QwpWsManagedSlotExclusion {
     /// Canonical pool-minted slot prefix, including the trailing separator
-    /// before the decimal index, for example `default-col-`.
+    /// before the decimal index, for example `default-ingest-`.
     pub(crate) prefix: String,
     /// Exclude only indices in `[0, slot_count)`. Out-of-range same-prefix
     /// slots remain drainable so shrinking a pool cannot strand old data.

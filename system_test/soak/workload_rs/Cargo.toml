@@ -26,9 +26,10 @@ dataframe = ["questdb/polars-ingress", "dep:polars"]
 
 [dependencies]
 # The leg drivers drive real ingest/egress through the pool; the generator and
-# journal stay std-only. Base features cover the row (sync sender), column
-# (same), and egress (reader) legs; polars is behind the `dataframe` feature.
-questdb = { package = "questdb-rs", path = "../../../questdb-rs", features = ["sync-sender-qwp-ws", "sync-reader-qwp-ws"] }
+# journal stay std-only. Base features cover Buffer, Chunk, Arrow, and reader
+# legs; polars is behind the `dataframe` feature.
+questdb = { package = "questdb-rs", path = "../../../questdb-rs", features = ["arrow-ingress", "sync-reader-qwp-ws"] }
+arrow = { version = ">=58, <60", default-features = false }
 # Version range unified with questdb-rs so the shared DataFrame type matches.
 polars = { version = ">=0.52, <0.55", optional = true, default-features = false, features = ["dtype-datetime"] }
 # SIGTERM/SIGINT handling so the orchestrator's graceful stop lets a leg finish

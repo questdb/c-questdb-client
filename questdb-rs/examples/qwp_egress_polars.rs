@@ -1,4 +1,4 @@
-//! Step 3 (QWP_DATAFRAME_BENCH_PLAN.md §6) — Rust **Polars egress**
+//! Step 3 (doc/historical/QWP_DATAFRAME_BENCH_PLAN.md §6) — Rust **Polars egress**
 //! parity for the shared S1 narrow / S2 wide schemas.
 //!
 //! Reads the bench table back over QWP/WS and measures the decode →

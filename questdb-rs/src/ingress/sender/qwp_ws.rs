@@ -242,20 +242,20 @@ pub(crate) struct SyncQwpWsHandlerState {
     pub(crate) recovered_dict_entries: Vec<u8>,
     pub(crate) recovered_dict_count: u32,
     /// The slot's persisted symbol dictionary (file mode) for foreground
-    /// write-ahead. Routed to whichever foreground owns this state — the row
-    /// encoder in [`connect_qwp_ws`] or the column backend in
-    /// [`super::column_sender::ColumnSender::new_store_and_forward`]; the two are
+    /// write-ahead. Routed to whichever foreground owns this state — the
+    /// standalone replay encoder in [`connect_qwp_ws`] or the pooled core in
+    /// [`super::column_sender::PooledSenderCore::new_store_and_forward`]; the two are
     /// mutually exclusive. `None` in memory mode / on side-file open failure.
     pub(crate) persisted_symbol_dict: Option<PersistedSymbolDict>,
 }
 
 impl SyncQwpWsHandlerState {
-    /// Releases the recovered dictionary seeded into the (row) replay encoder at
-    /// connect. The column sender uses its own dictionary and never touches this
-    /// encoder, so for a column-owned state that seed is dead weight; called from
-    /// [`ColumnSender::new_store_and_forward`].
+    /// Releases the recovered dictionary seeded into the standalone replay
+    /// encoder at connect. The pooled core uses its own dictionary and never
+    /// touches this encoder, so that seed is dead weight once the pooled core
+    /// claims the state; called from [`PooledSenderCore::new_store_and_forward`].
     ///
-    /// [`ColumnSender::new_store_and_forward`]: super::column_sender::ColumnSender::new_store_and_forward
+    /// [`PooledSenderCore::new_store_and_forward`]: super::column_sender::PooledSenderCore::new_store_and_forward
     pub(crate) fn release_dormant_encoder_dict(&mut self) {
         self.encoder.release_dormant_dict();
     }
@@ -624,7 +624,7 @@ where
 
     /// Stop accepting new publications and wake the background runner so it
     /// flushes whatever is already queued. Non-blocking and idempotent; pairs
-    /// with [`Self::drain_to_deadline`]. The column-sender pool calls this on
+    /// with [`Self::drain_to_deadline`]. The unified sender pool calls this on
     /// every connection being retired *before* waiting on any of them, so a
     /// multi-connection close drains in parallel rather than serially.
     fn begin_close(&self) {
@@ -3058,10 +3058,10 @@ pub(crate) fn connect_qwp_ws_background_state(
         let persisted_symbol_dict = queue.take_persisted_symbol_dict();
         // Async connect builds the send core lazily on the I/O thread; the driver
         // enables its catch-up mirror there (see drive_step). The encoder (used by
-        // the row sender; dormant for the column sender) delta-encodes on the same
+        // standalone ingress sender; dormant for the pooled core) delta-encodes on the same
         // condition, seeded from the recovered dictionary so new ids continue above
         // it. The side-file is left in the handler state for the owning foreground
-        // to claim (row: connect_qwp_ws; column: new_store_and_forward).
+        // to claim (standalone: connect_qwp_ws; pooled: new_store_and_forward).
         //
         // Validate the recovered dictionary SYNCHRONOUSLY here, *before* the runner
         // is spawned. `seed_global_dict` is the fallible validator
@@ -3121,8 +3121,9 @@ pub(crate) fn connect_qwp_ws_background_state(
         // replayed and the I/O thread re-registers the whole dictionary via a
         // catch-up frame on reconnect); file mode iff the persisted side-file
         // opened (its recovered entries seed the encoder dict + driver mirror so
-        // ids continue above them). This branch runs only for the row sender --
-        // the column sender forces async connect -- so the encoder is live here.
+        // ids continue above them). This branch runs only for the standalone
+        // ingress sender -- the pooled core forces async connect -- so the
+        // encoder is live here.
         // Encoder and mirror enable together to stay in lockstep.
         let delta_dict_enabled = parts.delta_dict_enabled;
         parts.encoder.set_delta_dict_enabled(delta_dict_enabled);
@@ -3664,7 +3665,7 @@ pub(crate) fn qwp_ws_close_drain_background(
 }
 
 /// Non-blocking: stop accepting new publications and wake the runner to flush
-/// what is queued. The column-sender pool signals every connection being
+/// what is queued. The unified sender pool signals every connection being
 /// retired before waiting on any, so a batched close drains in parallel.
 pub(crate) fn qwp_ws_begin_close_background(state: &SyncQwpWsHandlerState) {
     state.runner.begin_close();

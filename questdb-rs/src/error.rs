@@ -106,13 +106,13 @@ pub enum ErrorCode {
     /// QWP/WebSocket server rejection or terminal protocol violation.
     ServerRejection,
 
-    /// `ColumnSender::flush_arrow_batch_*` was passed a column whose Arrow /
+    /// `PooledSenderCore::flush_arrow_batch_*` was passed a column whose Arrow /
     /// QuestDB kind cannot be persisted to a QuestDB table (e.g.
     /// `ARRAY(LONG, N-D)` is query-result-only on the egress side and has
     /// no QWP wire tag for ingress). Only emitted on the `arrow` feature.
     ArrowUnsupportedColumnKind,
 
-    /// `ColumnSender::flush_arrow_batch_*` was passed a `RecordBatch` that
+    /// `PooledSenderCore::flush_arrow_batch_*` was passed a `RecordBatch` that
     /// failed client-side structural validation (column count vs schema,
     /// name encoding, ARROW C Data Interface invariants on a freshly
     /// imported array, etc.). Only emitted on the `arrow` feature.
@@ -206,8 +206,8 @@ pub enum ErrorCode {
 
     /// An irreducible QWP/WebSocket unit (the table schema plus a single
     /// row block) exceeds the negotiated per-batch cap
-    /// (`min(max_buf_size, server X-QWP-Max-Batch-Size)`). The column sender
-    /// splits oversize chunks into smaller frames automatically, so this only
+    /// (`min(max_buf_size, server X-QWP-Max-Batch-Size)`). Chunk publication
+    /// splits oversize inputs into smaller frames automatically, so this only
     /// surfaces when splitting cannot make a frame fit. Distinct from
     /// [`InvalidApiCall`](Self::InvalidApiCall) so callers can recognise it
     /// without matching on the error message text.
@@ -284,7 +284,7 @@ impl Error {
     /// bytes may already have reached the server even though the operation
     /// reported failure (e.g. a socket write that failed mid-frame, or a
     /// post-publish ACK wait that failed). Surfaced to callers via
-    /// [`Error::in_doubt`]. See `ColumnSender::flush` and the `FlushFailure`
+    /// [`Error::in_doubt`]. See `PooledSenderCore::flush` and the `FlushFailure`
     /// delivery classification.
     #[must_use]
     #[cfg(feature = "sync-sender-qwp-ws")]

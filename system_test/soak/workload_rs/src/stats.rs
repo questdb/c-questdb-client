@@ -1,6 +1,6 @@
 //! Per-leg stats emitter (§S1). Writes one JSON line per sampling tick with the
 //! **internal** signals the orchestrator can't see from outside: the pool
-//! counts (via the S0 `dbg_pool_counts` surface) and the sender's own
+//! counts (via the `dbg_pool_counts` surface) and the sender's own
 //! published / acked frame watermarks plus row counters. The orchestrator
 //! merges these with the externally-sampled RSS / FD and stamps `t` + `leg`
 //! (see `soak.py` `_read_latest_internal`).
@@ -45,14 +45,12 @@ impl StatsWriter {
             self.out,
             concat!(
                 "{{\"pool\":{{",
-                "\"column_sf\":{},\"column_direct\":{},",
-                "\"row_sender\":{},\"reader\":{}}},",
+                "\"ingress\":{},\"column_direct\":{},\"reader\":{}}},",
                 "\"rows_sent\":{},\"rows_acked\":{},",
                 "\"published_fsn\":{},\"acked_fsn\":{}}}"
             ),
-            triple(p.column_sf),
+            triple(p.ingress),
             triple(p.column_direct),
-            triple(p.row_sender),
             triple(p.reader),
             rows_sent,
             rows_acked,

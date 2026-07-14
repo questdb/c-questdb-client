@@ -363,6 +363,34 @@ if (QUESTDB_TESTS_AND_EXAMPLES)
         endif()
     endfunction()
 
+    # These probes must fail to compile: the unified C++ lease is move-only,
+    # and its non-owning view does not expose the raw pooled handle. Normal
+    # test targets compile the same header first, so a failure here cannot hide
+    # a general header error.
+    function(expect_cxx_compile_failure PROBE_NAME SOURCE_FILE)
+        try_compile(
+            PROBE_COMPILED
+            ${CMAKE_CURRENT_BINARY_DIR}/compile_fail/${PROBE_NAME}
+            ${CMAKE_CURRENT_SOURCE_DIR}/${SOURCE_FILE}
+            CMAKE_FLAGS
+                -DCMAKE_CXX_STANDARD=${CMAKE_CXX_STANDARD}
+                -DCMAKE_CXX_STANDARD_REQUIRED=ON
+                -DCMAKE_CXX_EXTENSIONS=OFF
+                -DINCLUDE_DIRECTORIES=${CMAKE_CURRENT_SOURCE_DIR}/include
+            OUTPUT_VARIABLE PROBE_OUTPUT)
+        if(PROBE_COMPILED)
+            message(FATAL_ERROR
+                "compile-fail probe ${PROBE_NAME} unexpectedly compiled:\n${PROBE_OUTPUT}")
+        endif()
+    endfunction()
+
+    expect_cxx_compile_failure(
+        borrowed_sender_copy
+        cpp_test/compile_fail_borrowed_sender_copy.cpp)
+    expect_cxx_compile_failure(
+        sender_view_raw_escape
+        cpp_test/compile_fail_sender_view_raw.cpp)
+
     compile_test(
         test_line_sender
         cpp_test/mock_server.cpp

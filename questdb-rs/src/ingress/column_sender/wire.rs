@@ -22,18 +22,17 @@
  *
  ******************************************************************************/
 
-//! Wire-format helpers for the column-major sender encoder.
+//! Wire-format helpers for the columnar payload encoder.
 //!
-//! These are intentionally duplicated from the row-API encoder
-//! (`buffer/qwp.rs`): the row helpers are private to that module and the
-//! plan calls out the wire surface as a place where we accept the ~100
-//! lines of duplication to keep the column-sender hot path free of
-//! cross-module hops. See `doc/COLUMN_SENDER_PLAN.md` §2.1.
+//! These are intentionally duplicated from the Buffer wire encoder
+//! (`buffer/qwp.rs`): those helpers are private to that module, and keeping
+//! this small wire surface local leaves the columnar hot path free of
+//! cross-module hops.
 
 /// QWP message header magic.
 pub(crate) const QWP_MAGIC: [u8; 4] = *b"QWP1";
 pub(crate) const QWP_VERSION_1: u8 = 1;
-/// Wire-spec flag set on every column-sender frame (matches the row-API
+/// Wire-spec flag set on every columnar frame (matches the Buffer
 /// `QwpBuffer::encode_ws_message`).
 pub(crate) const QWP_FLAG_DEFER_COMMIT: u8 = 0x01;
 pub(crate) const QWP_FLAG_DELTA_SYMBOL_DICT: u8 = 0x08;

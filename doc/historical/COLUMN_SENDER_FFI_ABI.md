@@ -1,6 +1,7 @@
 # Column-Major Sender — C ABI Specification
 
-**Status:** draft. The shipped header
+**Status:** retired pre-unification design record; not a current API contract.
+See [`README.md`](README.md). The shipped header
 `include/questdb/ingress/column_sender.h` is the authoritative ABI; where
 this document and the header disagree, the header wins. Bindings must be
 generated against the header, not this spec.
@@ -102,7 +103,7 @@ For every column-append function:
   `column_sender_chunk_clear` is called without a flush). The FFI stores
   raw pointers into the caller's buffers; it does **not** copy at
   append time. This is required to hit memcpy-bandwidth throughput on
-  the no-null hot path — see `doc/COLUMN_SENDER_PLAN.md` §2.
+  the no-null hot path — see `doc/historical/COLUMN_SENDER_PLAN.md` §2.
 - For Python wrappers, the typical pattern is to fill the chunk from a
   live DataFrame's numpy / Arrow buffers and flush before letting the
   DataFrame go out of scope — the contract is naturally satisfied

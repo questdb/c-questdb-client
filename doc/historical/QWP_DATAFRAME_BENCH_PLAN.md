@@ -1,15 +1,20 @@
 # QWP DataFrame Benchmark Plan — pandas (Python) & Polars (Rust), ingress + egress
 
-**Status:** draft, pending approval
+**Status:** implemented historical benchmark plan; not a current sender API
+reference. See [`README.md`](README.md) and
+[`QWP_UNIFIED_SENDER_M0_BASELINE.md`](../QWP_UNIFIED_SENDER_M0_BASELINE.md)
+for the current performance record.
+
+**Original status:** draft, pending approval
 **Scope:** benchmark suite for the QWP/WebSocket DataFrame paths — pandas in
 `py-questdb-client`, Polars in `c-questdb-client/questdb-rs`. Both directions:
 **ingress** (DataFrame → wire) and **egress** (query result → DataFrame).
 **Supersedes:** the missing `plan-pandas-columnar-performance.md` (referenced 4×
 in the now-deleted `plan-egress-to-pandas.md` / `plan-conn-pool-and-writers.md`).
 **Relationship:** this is the concrete realisation of `c-questdb-client`'s
-`doc/COLUMN_SENDER_PLAN.md` **WS-6** (Rust benches) and **WS-7** (Python
+`doc/historical/COLUMN_SENDER_PLAN.md` **WS-6** (Rust benches) and **WS-7** (Python
 end-to-end throughput, the `pandas_to_questdb_throughput` deliverable). Methodology
-is inherited from `doc/COLUMN_SENDER_PERF.md`.
+is inherited from `doc/historical/COLUMN_SENDER_PERF.md`.
 
 **This doc lives in `c-questdb-client/doc/`.** Path conventions: Rust paths are
 relative to `c-questdb-client/questdb-rs/` (e.g. `benches/decoder.rs`,
@@ -461,7 +466,8 @@ is reported as a **% on top of these floors** per type.
 `qwp_egress_read_wide.rs`, `qwp_egress_latency.rs`, `qwp_egress_hits.rs`,
 `qwp_ws_l1_quotes.rs`, `qwp_ws_unified_sfa_bench.rs`, `polars.rs`;
 `src/ingress/polars.rs`, `src/egress/arrow/polars.rs`;
-`doc/COLUMN_SENDER_PLAN.md`, `doc/COLUMN_SENDER_PERF.md`.
+`doc/historical/COLUMN_SENDER_PLAN.md`,
+`doc/historical/COLUMN_SENDER_PERF.md`.
 
 **Anchors:** Java `StacBenchmarkClient.java`, `QwpIngressLatencyBenchmark.java`;
 Go `bench/qwp-egress-read[-wide]/main.go`.

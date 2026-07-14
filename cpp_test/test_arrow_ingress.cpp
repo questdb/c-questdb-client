@@ -1,4 +1,4 @@
-// FFI-boundary test for the C++ wrapper `column_sender_view::flush_arrow_batch`
+// FFI-boundary test for the C++ wrapper `sender_view::flush_arrow_batch`
 // over the conn-level Arrow batch ingest API.
 //
 // This layer is a thin, type-agnostic forwarder: it packs `table_name_view` /
@@ -11,7 +11,7 @@
 //     the marshalling paths reach the C ABI.
 //
 // Per-type Arrow->column classification is backend-agnostic Rust code, exercised
-// exhaustively in `questdb-rs/src/ingress/column_sender/arrow_batch.rs` and
+// exhaustively in `questdb-rs/src/ingress/qwp_sender/arrow_batch.rs` and
 // round-tripped in C in `cpp_test/test_arrow_c.c`; re-testing it per type here
 // would add no coverage.
 
@@ -35,40 +35,40 @@ namespace qdb = questdb::ingress;
 namespace qm = qwp_mock;
 using namespace questdb::ingress::literals;
 
-TEST_CASE("column_sender_view::flush_arrow_batch rejects NULL conn")
+TEST_CASE("sender_view::flush_arrow_batch rejects NULL conn")
 {
     ArrowArray arr;
     ArrowSchema sch;
     std::memset(&arr, 0, sizeof(arr));
     std::memset(&sch, 0, sizeof(sch));
 
-    qdb::column_sender_view conn{nullptr};
+    qdb::sender_view conn{nullptr};
     CHECK_THROWS_AS(
         conn.flush_arrow_batch_at_now("t"_tn, arr, sch),
         qdb::line_sender_error);
 }
 
-TEST_CASE("column_sender_view::flush_arrow_batch at_column rejects NULL conn")
+TEST_CASE("sender_view::flush_arrow_batch at_column rejects NULL conn")
 {
     ArrowArray arr;
     ArrowSchema sch;
     std::memset(&arr, 0, sizeof(arr));
     std::memset(&sch, 0, sizeof(sch));
 
-    qdb::column_sender_view conn{nullptr};
+    qdb::sender_view conn{nullptr};
     CHECK_THROWS_AS(
         conn.flush_arrow_batch("t"_tn, arr, sch, "ts"_cn),
         qdb::line_sender_error);
 }
 
-TEST_CASE("column_sender_view surfaces error_code on NULL-conn failure")
+TEST_CASE("sender_view surfaces error_code on NULL-conn failure")
 {
     ArrowArray arr;
     ArrowSchema sch;
     std::memset(&arr, 0, sizeof(arr));
     std::memset(&sch, 0, sizeof(sch));
 
-    qdb::column_sender_view conn{nullptr};
+    qdb::sender_view conn{nullptr};
     try
     {
         conn.flush_arrow_batch_at_now("t"_tn, arr, sch);
@@ -162,7 +162,7 @@ struct MockConn
 {
     qm::MockServer server;
     questdb_db* db = nullptr;
-    column_sender* conn = nullptr;
+    qwp_sender* conn = nullptr;
 
     explicit MockConn(qm::Script script = qm::Script{qm::ActionAwaitClientFrame{0x51}})
         : server(std::vector<qm::Script>{std::move(script)})
@@ -173,7 +173,7 @@ struct MockConn
         db = questdb_db_connect(conf.c_str(), conf.size(), &err);
         REQUIRE(db != nullptr);
         REQUIRE(err == nullptr);
-        conn = questdb_db_borrow_column_sender(db, &err);
+        conn = questdb_db_borrow_sender(db, &err);
         REQUIRE(conn != nullptr);
         REQUIRE(err == nullptr);
     }
@@ -183,7 +183,7 @@ struct MockConn
         if (db != nullptr)
         {
             if (conn != nullptr)
-                questdb_db_drop_column_sender(db, conn);
+                questdb_db_drop_sender(db, conn);
             questdb_db_close(db);
         }
     }
@@ -201,7 +201,7 @@ TEST_CASE("flush_arrow_batch: NULL array -> invalid_api_call")
     std::memset(&sch, 0, sizeof(sch));
     line_sender_error* err = nullptr;
     line_sender_table_name tbl{1, "t"};
-    bool ok = column_sender_flush_arrow_batch_at_now(
+    bool ok = qwp_sender_flush_arrow_batch_at_now(
         mc.conn, tbl, nullptr, &sch, nullptr, 0, &err);
     CHECK_FALSE(ok);
     REQUIRE(err != nullptr);
@@ -216,7 +216,7 @@ TEST_CASE("flush_arrow_batch: NULL schema -> invalid_api_call")
     std::memset(&arr, 0, sizeof(arr));
     line_sender_error* err = nullptr;
     line_sender_table_name tbl{1, "t"};
-    bool ok = column_sender_flush_arrow_batch_at_now(
+    bool ok = qwp_sender_flush_arrow_batch_at_now(
         mc.conn, tbl, &arr, nullptr, nullptr, 0, &err);
     CHECK_FALSE(ok);
     REQUIRE(err != nullptr);
@@ -243,7 +243,7 @@ TEST_CASE("flush_arrow_batch_at_column: empty ts_column_name throws invalid_name
 TEST_CASE("flush_arrow_batch_at_now: happy path marshals through to the C ABI")
 {
     MockConn mc;
-    qdb::column_sender_view conn{mc.conn};
+    qdb::sender_view conn{mc.conn};
 
     auto col = pack_le<int64_t>({10, 20, 30});
     auto arr = make_array(3, 0, {nullptr, col});
@@ -261,14 +261,14 @@ TEST_CASE("flush_arrow_batch_at_now: happy path marshals through to the C ABI")
     }
 }
 
-TEST_CASE("borrowed_column_sender exposes Arrow FSN helper")
+TEST_CASE("borrowed_sender exposes Arrow FSN helper")
 {
     qm::MockServer server(std::vector<qm::Script>{
         qm::Script{qm::ActionAwaitClientFrame{0x51}}});
     questdb::pool db{
         "ws::addr=" + server.addr() +
         ";pool_size=1;pool_reap=manual;close_flush_timeout_millis=0;"};
-    auto conn = db.borrow_column_sender();
+    auto conn = db.borrow_sender();
 
     auto col = pack_le<int64_t>({10, 20, 30});
     auto arr = make_array(3, 0, {nullptr, col});
@@ -287,7 +287,7 @@ TEST_CASE("borrowed_column_sender exposes Arrow FSN helper")
     conn.drop_on_return();
 }
 
-TEST_CASE("column_sender_flush_arrow_batch_at_now_and_wait: C ABI happy path")
+TEST_CASE("qwp_sender_flush_arrow_batch_at_now_and_wait: C ABI happy path")
 {
     MockConn mc{qm::Script{
         qm::ActionAwaitClientFrame{0x51},
@@ -298,7 +298,7 @@ TEST_CASE("column_sender_flush_arrow_batch_at_now_and_wait: C ABI happy path")
     auto sch = make_schema("l", "v");
     line_sender_error* err = nullptr;
     line_sender_table_name tbl{6, "t_wait"};
-    const bool ok = column_sender_flush_arrow_batch_at_now_and_wait(
+    const bool ok = qwp_sender_flush_arrow_batch_at_now_and_wait(
         mc.conn,
         tbl,
         &arr,
@@ -312,7 +312,7 @@ TEST_CASE("column_sender_flush_arrow_batch_at_now_and_wait: C ABI happy path")
     CHECK_FALSE(static_cast<bool>(arr.release));
 }
 
-TEST_CASE("borrowed_column_sender exposes Arrow ACKing helpers")
+TEST_CASE("borrowed_sender exposes Arrow ACKing helpers")
 {
     qm::MockServer server(std::vector<qm::Script>{qm::Script{
         qm::ActionAwaitClientFrame{0x51},
@@ -322,7 +322,7 @@ TEST_CASE("borrowed_column_sender exposes Arrow ACKing helpers")
     questdb::pool db{
         "ws::addr=" + server.addr() +
         ";pool_size=1;pool_reap=manual;close_flush_timeout_millis=0;"};
-    auto conn = db.borrow_column_sender();
+    auto conn = db.borrow_sender();
 
     auto col = pack_le<int64_t>({10, 20, 30});
     auto arr = make_array(3, 0, {nullptr, col});
@@ -438,7 +438,7 @@ TEST_CASE("flush_arrow_batch (at_column): happy path picks ts from named column"
     outer_sch.children = child_schema_ptrs;
     outer_sch.release = schema_release_noop;
 
-    qdb::column_sender_view conn{mc.conn};
+    qdb::sender_view conn{mc.conn};
     try
     {
         const auto fsn = conn.flush_arrow_batch_and_get_fsn(

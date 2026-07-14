@@ -248,8 +248,8 @@ live-server-tests = [
 ## crate. Exposes the hidden `questdb::ffi_support` module: owned
 ## (lifetime-free) pool handles and the entry points that mint them, which
 ## C / Python cannot express as Rust lifetimes. NOT for normal Rust users —
-## they get the lifetime-bound `QuestDb::borrow_column_sender` /
-## `borrow_row_sender` / `borrow_reader`. Hidden from docs and exempt from
+## they get the lifetime-bound `QuestDb::borrow_sender` / `borrow_reader`.
+## Hidden from docs and exempt from
 ## semver; do not depend on it from regular Rust code.
 ffi-support = ["sync-sender-qwp-ws"]
 
@@ -340,7 +340,7 @@ required-features = ["sync-reader-qwp-ws"]
 
 [[example]]
 name = "qwp_ws_unified_sfa_bench"
-required-features = ["sync-sender-qwp-ws"]
+required-features = ["sync-sender-qwp-ws", "arrow-ingress"]
 
 # Synthetic equities L1 quote feed → QuestDB via the column-major
 # sender. End-to-end throughput sanity check against a real server.
@@ -352,7 +352,7 @@ required-features = ["sync-sender-qwp-ws"]
 name = "polars"
 required-features = ["polars", "sync-sender-qwp-ws"]
 
-# Step 3 (doc/QWP_DATAFRAME_BENCH_PLAN.md §6) — Rust Polars ingress parity
+# Step 3 (doc/historical/QWP_DATAFRAME_BENCH_PLAN.md §6) — Rust Polars ingress parity
 # on the S1 narrow schema. Measures flush_polars_dataframe() e2e + the
 # column-sender encode floor and emits the §3.2 JSON metric contract
 # (client="rust-polars", direction="ingress"). Uses ureq for the DEDUP
@@ -390,8 +390,8 @@ name = "decoder"
 harness = false
 required-features = ["sync-reader-qwp-ws"]
 
-# Column-major sender hot-path bench. Anchors the perf claims from
-# `doc/COLUMN_SENDER_PLAN.md` §2 (memcpy-bound no-null path,
+# Columnar payload hot-path bench. Anchors the encoder floor in
+# `doc/QWP_UNIFIED_SENDER_M0_BASELINE.md` (memcpy-bound no-null path and
 # referenced-only symbol intern). Run with:
 #
 #   cargo bench --features sync-sender-qwp-ws --bench column_sender

@@ -172,7 +172,7 @@ fn main() -> questdb::Result<()> {
 
     println!("\nConnecting to {conf} ...");
     let db = QuestDb::connect(&conf)?;
-    let mut sender = db.borrow_column_sender()?;
+    let mut sender = db.borrow_sender()?;
 
     // One chunk reused across flushes — the bench design exists exactly
     // for this case: per-column `Vec<u8>` capacity is retained across

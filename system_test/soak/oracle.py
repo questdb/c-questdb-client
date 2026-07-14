@@ -23,7 +23,7 @@
 ################################################################################
 
 """
-Soak oracle (see ``doc/SOAK_HARNESS_DESIGN.md`` §7). Turns the raw signals into
+Soak oracle (see ``doc/QWP_SOAK_HARNESS.md``). Turns the raw signals into
 pass/fail invariant verdicts and a ``summary.json``:
 
 * **I1 Completeness** — every acked ``seq`` up to the journal watermark is
@@ -34,6 +34,9 @@ pass/fail invariant verdicts and a ``summary.json``:
   against the regenerated expected value (:mod:`gen`).
 * **I4 Resource boundedness** — RSS / FD / pool / SF curves return to a steady
   baseline (the leak detector).
+* **I5 Mixed-shape coverage** — the mixed SFA leg has fsync-journaled ACKs for
+  at least one complete Arrow, Buffer, and Chunk batch in its deterministic
+  cycle.
 
 The reconciliation queries (I1–I3) run over an **independent** query path (HTTP
 ``/exec``), never through the client under test. Pure logic here is unit-tested
@@ -74,12 +77,32 @@ class Verdict:
         }
 
 
+def check_mixed_shape_coverage(name, watermark, batch_size, shapes):
+    """Prove every shape in a deterministic batch cycle reached an ACK.
+
+    The mixed leg chooses its shape from ``batch_index % len(shapes)`` and only
+    advances the fsync'd journal after the whole batch is acked. Therefore the
+    journal watermark independently proves how many leading shapes completed,
+    including across process restart.
+    """
+    completed_batches = (watermark + 1) // batch_size
+    completed_shapes = list(shapes[:min(completed_batches, len(shapes))])
+    return Verdict('I5', f'{name}:mixed-shapes',
+                   completed_batches >= len(shapes), {
+                       'cycle': list(shapes),
+                       'completed_batches': completed_batches,
+                       'completed_shapes': completed_shapes,
+                       'batch_size': batch_size,
+                       'journal_watermark': watermark,
+                   })
+
+
 # ---------------------------------------------------------------------------
 # I4 — resource boundedness (the leak detector). Pure functions over samples.
 # A sample (one JSON line the orchestrator merges) looks like:
-#   {"t": <epoch_s>, "leg": "rust-row-direct",
+#   {"t": <epoch_s>, "leg": "rust-buffer-saf-default",
 #    "rss_bytes": N, "fd_count": N,
-#    "pool": {"column_sf":[free,in_use,closing], ...},
+#    "pool": {"ingress":[free,in_use,closing], ...},
 #    "sf": {"mem_backlog_bytes": N, "max_bytes": N, "disk_bytes": N}}
 # ---------------------------------------------------------------------------
 
@@ -228,18 +251,19 @@ def _pool_verdicts(leg, rows, steady, cfg):
     for pool_name, counts in sorted(final.items()):
         _free, in_use, closing = counts
         # A leg holds at most one live borrow at a time, so in_use peaking above
-        # one means a connection was borrowed and never returned — a real leak.
-        # A single held borrow at the final sample is just the leg killed
-        # mid-use by the shutdown drain (it never got to release it), which is
-        # not a leak — so key the check on the run-wide peak, not final==0.
+        # one is a leak. The orchestrator also merges the post-release stats
+        # emitted during graceful shutdown, so the final sample must be fully
+        # drained rather than excusing one still-held borrow.
         peak_in_use = max(
             (r.get('pool', {}).get(pool_name, (0, 0, 0))[1] for r in rows),
             default=in_use)
-        ok = not (cfg.require_pool_drain and peak_in_use > 1)
+        ok = not (cfg.require_pool_drain
+                  and (peak_in_use > 1 or in_use != 0 or closing != 0))
         detail = {'final_free': _free, 'final_in_use': in_use,
                   'final_closing': closing, 'peak_in_use': peak_in_use}
         if not ok:
-            detail['reason'] = 'pool leak: in_use peaked above one live borrow'
+            detail['reason'] = (
+                'pool leak: more than one live borrow or final pool not drained')
         out.append(Verdict('I4', f'{leg}:pool:{pool_name}', ok, detail))
     return out
 
@@ -419,7 +443,7 @@ def compare_value(ty, expected, actual):
         if ty == 'float':
             # A FLOAT column stores f32, which /exec renders at f32 precision.
             # Compare at f32 precision — idempotent, so it also holds when the
-            # value sits in a widening-preserving DOUBLE column (the row leg).
+            # value sits in a widening-preserving DOUBLE column (the Buffer leg).
             return (gen.f32_round(a) == gen.f32_round(expected[1])), 'f32'
         # DOUBLE: exact via f64 bit pattern (QuestDB emits shortest
         # round-trippable text, so reparsing recovers the double).
@@ -490,16 +514,21 @@ def reconcile_values(query, table, seed, worker, sample_seqs,
 # summary.json
 # ---------------------------------------------------------------------------
 
-def summarize(verdicts, seed=None, duration_min=None, profile=None):
+def summarize(verdicts, seed=None, duration_min=None, profile=None, rate=None):
     failed = [v for v in verdicts if not v.passed]
     by_inv = {}
     for v in verdicts:
         b = by_inv.setdefault(v.invariant, {'pass': 0, 'fail': 0})
         b['pass' if v.passed else 'fail'] += 1
+    repro = None
+    if seed is not None:
+        repro = (f'soak.py run --seed {seed} --duration {duration_min} '
+                 f'--profile {profile}')
+        if rate is not None:
+            repro += f' --rate {rate}'
     return {
         'passed': not failed,
-        'repro': (f'soak.py run --seed {seed} --duration {duration_min} '
-                  f'--profile {profile}') if seed is not None else None,
+        'repro': repro,
         'totals': {'checks': len(verdicts), 'failed': len(failed)},
         'by_invariant': by_inv,
         'failures': [v.to_dict() for v in failed],
@@ -579,7 +608,7 @@ def _selftest():
     # I4: a clean run (flat RSS/FD, drained pools) passes.
     def sample(t, rss, fd, in_use=0, backlog=0, mx=0, leg='L'):
         return {'t': t, 'leg': leg, 'rss_bytes': rss, 'fd_count': fd,
-                'pool': {'row_sender': [1, in_use, 0]},
+                'pool': {'ingress': [1, in_use, 0]},
                 'sf': {'mem_backlog_bytes': backlog, 'max_bytes': mx,
                        'disk_bytes': 0}}
 
@@ -611,6 +640,10 @@ def _selftest():
     vn = analyze_bounds(nodrain, cfg)
     check(any('pool' in v.name and not v.passed for v in vn),
           'I4 detects undrained pool')
+    held = [sample(i, 100_000_000, 20, in_use=1) for i in range(20)]
+    vh = analyze_bounds(held, cfg)
+    check(any('pool' in v.name and not v.passed for v in vh),
+          'I4 requires final single borrow to drain')
 
     # I4: a store-and-forward backlog leak (in-flight frames grow unbounded).
     def isample(t, pub, ack):
@@ -651,6 +684,18 @@ def _selftest():
     v2_ctl = check_duplication(fake_stats(1001, 999, 0), 't', 0, 999,
                                replay_budget=64, is_control=True)
     check(not v2_ctl.passed, 'I2 control dup fails (must be exact)')
+
+    # I5: the fsync'd journal watermark proves which deterministic mixed-shape
+    # batches reached an ACK. A partial cycle fails; one full cycle passes.
+    shapes = ['arrow', 'buffer', 'chunk']
+    v5_partial = check_mixed_shape_coverage('mixed', 3999, 2000, shapes)
+    check(not v5_partial.passed
+          and v5_partial.detail['completed_shapes'] == shapes[:2],
+          'I5 partial mixed-shape cycle fails')
+    v5_full = check_mixed_shape_coverage('mixed', 5999, 2000, shapes)
+    check(v5_full.passed
+          and v5_full.detail['completed_shapes'] == shapes,
+          'I5 complete mixed-shape cycle passes')
 
     # I3: value comparison for scalars.
     check(compare_value('boolean', ('bool', True), True)[0], 'I3 bool match')
@@ -706,8 +751,9 @@ def _selftest():
           'I3 array hex match')
 
     # summary.json shape.
-    s = summarize(vl, seed=7, duration_min=60, profile='full')
+    s = summarize(vl, seed=7, duration_min=60, profile='full', rate=1000)
     check(s['passed'] is False and s['totals']['failed'] >= 1, 'summary marks failure')
+    check(s['repro'].endswith('--rate 1000'), 'summary repro includes rate')
     check(json.dumps(s), 'summary is json-serialisable')
 
     if failures:

@@ -78,16 +78,6 @@ use questdb::{
 };
 use std::time::Duration;
 
-use questdb::ffi_support::OwnedRowSender;
-
-mod ndarr;
-use ndarr::StrideArrayView;
-
-mod egress;
-
-pub mod column_sender;
-pub use column_sender::*;
-
 macro_rules! bubble_err_to_c {
     ($err_out:expr, $expression:expr) => {
         bubble_err_to_c!($err_out, $expression, false)
@@ -96,12 +86,23 @@ macro_rules! bubble_err_to_c {
         match $expression {
             Ok(value) => value,
             Err(err) => {
-                set_err_out_from_error($err_out, err);
+                #[allow(unused_unsafe)]
+                unsafe {
+                    set_err_out_from_error($err_out, err)
+                };
                 return $sentinel;
             }
         }
     };
 }
+
+mod ndarr;
+use ndarr::StrideArrayView;
+
+mod egress;
+
+pub mod column_sender;
+pub use column_sender::*;
 
 #[macro_export]
 macro_rules! fmt_error {
@@ -302,12 +303,12 @@ pub enum line_sender_error_code {
     /// QWP/WebSocket server rejection or terminal protocol violation.
     line_sender_error_server_rejection = 14,
 
-    /// `column_sender_flush_arrow_batch_*` was passed a column whose
+    /// `qwp_sender_flush_arrow_batch_*` was passed a column whose
     /// Arrow / QuestDB kind cannot be persisted to a QuestDB table.
     /// Only emitted with the `arrow` feature enabled.
     line_sender_error_arrow_unsupported_column_kind = 15,
 
-    /// `column_sender_flush_arrow_batch_*` rejected a `RecordBatch` at
+    /// `qwp_sender_flush_arrow_batch_*` rejected a `RecordBatch` at
     /// client-side structural validation (column count, name encoding,
     /// FFI struct contract). Only emitted with the `arrow` feature
     /// enabled.
@@ -315,7 +316,7 @@ pub enum line_sender_error_code {
 
     /// A reconnectable failure on the column-major sender's flush/sync
     /// path (transport error, EOF, closed connection). The operation has
-    /// not committed: drop the connection (`questdb_db_drop_column_sender`),
+    /// not committed: drop the connection (`questdb_db_drop_sender`),
     /// borrow a fresh one (the pool rotates to a live endpoint), and
     /// re-drive from your source.
     line_sender_error_failover_retry = 17,
@@ -375,8 +376,8 @@ pub enum line_sender_error_code {
     line_sender_error_arrow_export = 34,
 
     /// An irreducible QWP/WebSocket unit (the table schema plus a single row
-    /// block) exceeds the negotiated per-batch cap. The column sender splits
-    /// oversize chunks into smaller frames automatically, so this only surfaces
+    /// block) exceeds the negotiated per-batch cap. Chunk publication splits
+    /// oversize inputs into smaller frames automatically, so this only surfaces
     /// when splitting cannot make a frame fit. Distinct from
     /// `line_sender_error_invalid_api_call` so callers can recognise it without
     /// matching on the error message text.
@@ -812,7 +813,8 @@ fn describe_buf(buf: &[u8]) -> String {
 
 #[cold]
 unsafe fn set_err_out_from_error(err_out: *mut *mut line_sender_error, err: Error) {
-    unsafe { set_err_out_from_error_with_qwpws(err_out, err, None) };
+    let qwp_ws_error = err.qwp_ws_rejection().cloned();
+    unsafe { set_err_out_from_error_with_qwpws(err_out, err, qwp_ws_error) };
 }
 
 #[cold]
@@ -1195,9 +1197,8 @@ pub unsafe extern "C" fn line_sender_buffer_new_qwp_with_max_name_len(
 /// Construct a QWP/WebSocket columnar `line_sender_buffer` with a
 /// `max_name_len` of `127` (the QuestDB server default).
 ///
-/// This is the buffer kind a `row_sender` borrowed from a `questdb_db` pool
-/// requires. When you hold the `row_sender`, prefer `row_sender_new_buffer`,
-/// which matches the sender's configured name-length cap automatically.
+/// This is the buffer kind accepted by a pooled `qwp_sender`. Prefer
+/// `questdb_db_new_buffer`, which uses the pool's configured name-length cap.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn line_sender_buffer_new_qwp_ws() -> *mut line_sender_buffer {
     let buffer = Buffer::new_qwp_ws();
@@ -1760,12 +1761,10 @@ pub unsafe extern "C" fn line_sender_buffer_column_dec_str(
         }
     }
     let value = unsafe { str::from_utf8_unchecked(value) };
-    unsafe {
-        bubble_err_to_c!(
-            err_out,
-            buffer.column_dec(name, DecimalView::String { value })
-        );
-    }
+    bubble_err_to_c!(
+        err_out,
+        buffer.column_dec(name, DecimalView::String { value })
+    );
     true
 }
 
@@ -1852,12 +1851,10 @@ pub unsafe extern "C" fn line_sender_buffer_column_dec64_str(
             return false;
         }
     };
-    unsafe {
-        bubble_err_to_c!(
-            err_out,
-            buffer.column_dec64(name, DecimalView::String { value })
-        );
-    }
+    bubble_err_to_c!(
+        err_out,
+        buffer.column_dec64(name, DecimalView::String { value })
+    );
     true
 }
 
@@ -1933,12 +1930,10 @@ pub unsafe extern "C" fn line_sender_buffer_column_dec128_str(
             return false;
         }
     };
-    unsafe {
-        bubble_err_to_c!(
-            err_out,
-            buffer.column_dec128(name, DecimalView::String { value })
-        );
-    }
+    bubble_err_to_c!(
+        err_out,
+        buffer.column_dec128(name, DecimalView::String { value })
+    );
     true
 }
 
@@ -2510,12 +2505,10 @@ pub unsafe extern "C" fn line_sender_opts_from_conf(
     config: line_sender_utf8,
     err_out: *mut *mut line_sender_error,
 ) -> *mut line_sender_opts {
-    unsafe {
-        let config = config.as_str();
-        let builder = bubble_err_to_c!(err_out, SenderBuilder::from_conf(config), ptr::null_mut());
-        let builder = with_c_qwp_ws_default_error_handler(builder);
-        Box::into_raw(Box::new(line_sender_opts(builder)))
-    }
+    let config = config.as_str();
+    let builder = bubble_err_to_c!(err_out, SenderBuilder::from_conf(config), ptr::null_mut());
+    let builder = with_c_qwp_ws_default_error_handler(builder);
+    Box::into_raw(Box::new(line_sender_opts(builder)))
 }
 
 /// Create a new `line_sender_opts` instance from the configuration stored in the
@@ -2524,11 +2517,9 @@ pub unsafe extern "C" fn line_sender_opts_from_conf(
 pub unsafe extern "C" fn line_sender_opts_from_env(
     err_out: *mut *mut line_sender_error,
 ) -> *mut line_sender_opts {
-    unsafe {
-        let builder = bubble_err_to_c!(err_out, SenderBuilder::from_env(), ptr::null_mut());
-        let builder = with_c_qwp_ws_default_error_handler(builder);
-        Box::into_raw(Box::new(line_sender_opts(builder)))
-    }
+    let builder = bubble_err_to_c!(err_out, SenderBuilder::from_env(), ptr::null_mut());
+    let builder = with_c_qwp_ws_default_error_handler(builder);
+    Box::into_raw(Box::new(line_sender_opts(builder)))
 }
 
 /// Create a new `line_sender_opts` instance with the given protocol, hostname and
@@ -3395,18 +3386,16 @@ pub unsafe extern "C" fn line_sender_from_conf(
     config: line_sender_utf8,
     err_out: *mut *mut line_sender_error,
 ) -> *mut line_sender {
-    unsafe {
-        let config = config.as_str();
-        let builder = bubble_err_to_c!(err_out, SenderBuilder::from_conf(config), ptr::null_mut());
-        let builder = bubble_err_to_c!(
-            err_out,
-            builder.user_agent(concat!("questdb/c/", env!("CARGO_PKG_VERSION"))),
-            ptr::null_mut()
-        );
-        let builder = with_c_qwp_ws_default_error_handler(builder);
-        let sender = bubble_err_to_c!(err_out, builder.build(), ptr::null_mut());
-        Box::into_raw(Box::new(line_sender(sender)))
-    }
+    let config = config.as_str();
+    let builder = bubble_err_to_c!(err_out, SenderBuilder::from_conf(config), ptr::null_mut());
+    let builder = bubble_err_to_c!(
+        err_out,
+        builder.user_agent(concat!("questdb/c/", env!("CARGO_PKG_VERSION"))),
+        ptr::null_mut()
+    );
+    let builder = with_c_qwp_ws_default_error_handler(builder);
+    let sender = bubble_err_to_c!(err_out, builder.build(), ptr::null_mut());
+    Box::into_raw(Box::new(line_sender(sender)))
 }
 
 /// Create a new `line_sender` instance from the configuration stored in the
@@ -3422,17 +3411,15 @@ pub unsafe extern "C" fn line_sender_from_conf(
 pub unsafe extern "C" fn line_sender_from_env(
     err_out: *mut *mut line_sender_error,
 ) -> *mut line_sender {
-    unsafe {
-        let builder = bubble_err_to_c!(err_out, SenderBuilder::from_env(), ptr::null_mut());
-        let builder = bubble_err_to_c!(
-            err_out,
-            builder.user_agent(concat!("questdb/c/", env!("CARGO_PKG_VERSION"))),
-            ptr::null_mut()
-        );
-        let builder = with_c_qwp_ws_default_error_handler(builder);
-        let sender = bubble_err_to_c!(err_out, builder.build(), ptr::null_mut());
-        Box::into_raw(Box::new(line_sender(sender)))
-    }
+    let builder = bubble_err_to_c!(err_out, SenderBuilder::from_env(), ptr::null_mut());
+    let builder = bubble_err_to_c!(
+        err_out,
+        builder.user_agent(concat!("questdb/c/", env!("CARGO_PKG_VERSION"))),
+        ptr::null_mut()
+    );
+    let builder = with_c_qwp_ws_default_error_handler(builder);
+    let sender = bubble_err_to_c!(err_out, builder.build(), ptr::null_mut());
+    Box::into_raw(Box::new(line_sender(sender)))
 }
 
 unsafe fn unwrap_sender<'a>(sender: *const line_sender) -> &'a Sender {
@@ -3710,7 +3697,7 @@ pub const qwpws_ack_level_durable: u32 = 1;
 
 /// Wait until every QWP/WebSocket frame published so far on `sender` reaches
 /// `ack_level` (a `qwpws_ack_level_*` value). This is the
-/// row-major counterpart to the column-major `column_sender_wait`.
+/// row-major counterpart to the column-major `qwp_sender_wait`.
 ///
 /// `timeout_millis` is a no-progress deadline (it fires only if the ack
 /// watermark fails to advance for that long); `0` waits indefinitely.
@@ -3933,590 +3920,6 @@ pub unsafe extern "C" fn line_sender_flush(
             Ok(()) => true,
             Err(err) => {
                 set_err_out_from_sender_error(err_out, sender, err);
-                false
-            }
-        }
-    }
-}
-
-// ===========================================================================
-// Row-sender pool borrow (row-major QWP/WS sender)
-//
-// The pool (`questdb_db`) hands out three kinds of borrow: column-major
-// senders (`column_sender`), row-major senders (`row_sender`, below), and
-// query readers (`reader`). A `row_sender` builds rows with the ordinary
-// `line_sender_buffer` and flushes them with `row_sender_flush`.
-// ===========================================================================
-
-/// A row-major QWP/WS sender borrowed from a `questdb_db` pool. Opaque and
-/// not thread-safe: it belongs to the borrowing thread until returned with
-/// `questdb_db_return_row_sender` (recycle) or `questdb_db_drop_row_sender`
-/// (force-close). If the pool has been closed, return closes the sender
-/// instead of recycling it. Build rows with a `line_sender_buffer` and send
-/// them with `row_sender_flush` / `row_sender_flush_and_keep` or the
-/// FSN-returning variants.
-pub struct row_sender(OwnedRowSender);
-
-unsafe fn reject_closed_pool_row_sender(
-    sender: *const row_sender,
-    fn_name: &str,
-    err_out: *mut *mut line_sender_error,
-) -> bool {
-    if unsafe { (*sender).0.pool_closed() } {
-        unsafe {
-            set_err_out_from_error(
-                err_out,
-                Error::new(
-                    ErrorCode::InvalidApiCall,
-                    format!("{fn_name}: QuestDb pool is closed"),
-                ),
-            );
-        }
-        true
-    } else {
-        false
-    }
-}
-
-/// Borrow a row-major sender from the pool. Returns NULL on failure and sets
-/// `*err_out` if provided. The row-sender pool is lazy and independently
-/// capped (shares `pool_max`); a borrow at the cap returns
-/// `line_sender_error_invalid_api_call`.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn questdb_db_borrow_row_sender(
-    db: *mut questdb_db,
-    err_out: *mut *mut line_sender_error,
-) -> *mut row_sender {
-    if db.is_null() {
-        unsafe {
-            set_err_out_from_error(
-                err_out,
-                Error::new(
-                    ErrorCode::InvalidApiCall,
-                    "questdb_db_borrow_row_sender: db pointer is NULL".to_string(),
-                ),
-            );
-        }
-        return ptr::null_mut();
-    }
-    let db_ref = unsafe { &*db };
-    match questdb::ffi_support::borrow_row_sender_owned(&db_ref.0) {
-        Ok(owned) => Box::into_raw(Box::new(row_sender(owned))),
-        Err(err) => {
-            unsafe { set_err_out_from_error(err_out, err) };
-            ptr::null_mut()
-        }
-    }
-}
-
-/// Like `questdb_db_borrow_row_sender` but retries the connect within
-/// `budget_ms` using the pool's reconnect backoff (auth / protocol-version
-/// errors are terminal). `budget_ms == 0` makes a single attempt. Returns
-/// NULL on failure; sets `*err_out` if provided.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn questdb_db_borrow_row_sender_with_retry(
-    db: *mut questdb_db,
-    budget_ms: u64,
-    err_out: *mut *mut line_sender_error,
-) -> *mut row_sender {
-    if db.is_null() {
-        unsafe {
-            set_err_out_from_error(
-                err_out,
-                Error::new(
-                    ErrorCode::InvalidApiCall,
-                    "questdb_db_borrow_row_sender_with_retry: db pointer is NULL".to_string(),
-                ),
-            );
-        }
-        return ptr::null_mut();
-    }
-    let db_ref = unsafe { &*db };
-    match questdb::ffi_support::borrow_row_sender_owned_with_retry(
-        &db_ref.0,
-        Duration::from_millis(budget_ms),
-    ) {
-        Ok(owned) => Box::into_raw(Box::new(row_sender(owned))),
-        Err(err) => {
-            unsafe { set_err_out_from_error(err_out, err) };
-            ptr::null_mut()
-        }
-    }
-}
-
-/// Return a borrowed row sender to the pool. Invalidates `sender`. Accepts
-/// NULL and no-ops. `db` is ignored (the sender carries its own pool
-/// back-reference) but kept in the ABI for symmetry with the borrow call. If
-/// the sender has latched terminal state, or if the pool has been closed, the
-/// sender is closed instead of recycled.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn questdb_db_return_row_sender(
-    _db: *mut questdb_db,
-    sender: *mut row_sender,
-) {
-    if sender.is_null() {
-        return;
-    }
-    unsafe { drop(Box::from_raw(sender)) };
-}
-
-/// Force-drop a borrowed row sender instead of recycling it: the underlying
-/// connection is closed and the next borrow opens a fresh one. Invalidates
-/// `sender`. Accepts NULL and no-ops.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn questdb_db_drop_row_sender(_db: *mut questdb_db, sender: *mut row_sender) {
-    if sender.is_null() {
-        return;
-    }
-    unsafe {
-        (*sender).0.mark_must_close();
-        drop(Box::from_raw(sender));
-    }
-}
-
-/// Returns the configured max_name_len for buffers created from this row
-/// sender, or 0 if `sender` is NULL.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn row_sender_get_max_name_len(sender: *const row_sender) -> size_t {
-    if sender.is_null() {
-        return 0;
-    }
-    unsafe { (*sender).0.get().max_name_len() }
-}
-
-/// Construct a `line_sender_buffer` matching the row sender's protocol
-/// settings — a QWP/WebSocket columnar buffer. This is the row-sender
-/// counterpart of `line_sender_buffer_new_for_sender`, and the only buffer a
-/// `row_sender` accepts: build rows with the ordinary `line_sender_buffer`
-/// API, then publish via `row_sender_flush` / `row_sender_flush_and_keep` or
-/// the FSN-returning variants.
-/// Returns NULL and sets `*err_out` if `sender` is NULL. The returned buffer
-/// must be released with `line_sender_buffer_free`.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn row_sender_new_buffer(
-    sender: *const row_sender,
-    err_out: *mut *mut line_sender_error,
-) -> *mut line_sender_buffer {
-    if sender.is_null() {
-        unsafe {
-            set_err_out_from_error(
-                err_out,
-                Error::new(
-                    ErrorCode::InvalidApiCall,
-                    "row_sender_new_buffer: sender pointer is NULL".to_string(),
-                ),
-            );
-        }
-        return ptr::null_mut();
-    }
-    let buffer = unsafe { (*sender).0.get().new_buffer() };
-    Box::into_raw(Box::new(line_sender_buffer {
-        buffer,
-        empty_peek_buf_is_null: true,
-    }))
-}
-
-/// Flush the buffer of rows through the borrowed row sender, then clear the
-/// buffer. Returns `true` on success; on failure returns `false` and sets
-/// `*err_out`. Mirrors `line_sender_flush` for the standalone sender.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn row_sender_flush(
-    sender: *mut row_sender,
-    buffer: *mut line_sender_buffer,
-    err_out: *mut *mut line_sender_error,
-) -> bool {
-    if sender.is_null() {
-        unsafe {
-            set_err_out_from_error(
-                err_out,
-                Error::new(
-                    ErrorCode::InvalidApiCall,
-                    "row_sender_flush: sender pointer is NULL".to_string(),
-                ),
-            );
-        }
-        return false;
-    }
-    if unsafe { reject_closed_pool_row_sender(sender, "row_sender_flush", err_out) } {
-        return false;
-    }
-    unsafe {
-        let s = (*sender).0.get_mut();
-        let buffer = unwrap_buffer_mut(buffer);
-        match s.flush(buffer) {
-            Ok(()) => true,
-            Err(err) => {
-                set_err_out_from_sender_error(err_out, s, err);
-                false
-            }
-        }
-    }
-}
-
-/// Flush the buffer of rows through the borrowed row sender as a completion
-/// boundary, clear the buffer, then wait until every frame published so far
-/// through this sender reaches `ack_level` — `row_sender_flush` +
-/// `row_sender_wait` in one call, the row-major counterpart of
-/// `column_sender_flush_and_wait`. The wait uses the pool-wide
-/// `request_timeout` no-progress deadline; compose the two calls to choose a
-/// per-call timeout.
-///
-/// `qwpws_ack_level_durable` without `request_durable_ack=on` is rejected up
-/// front (`line_sender_error_invalid_api_call`) before the buffer is touched,
-/// matching `column_sender_flush_and_wait`.
-///
-/// On a flush failure the buffer is retained. After publication, only the
-/// no-progress timeout (`line_sender_error_failover_retry`) leaves the frames
-/// queued and still delivering — recover from it by calling `row_sender_wait`
-/// again, not by re-flushing the same rows. A terminal server rejection or
-/// transport/protocol failure ends delivery on this sender: drop it and
-/// re-drive undelivered rows on a fresh borrow.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn row_sender_flush_and_wait(
-    sender: *mut row_sender,
-    buffer: *mut line_sender_buffer,
-    ack_level: u32,
-    err_out: *mut *mut line_sender_error,
-) -> bool {
-    if sender.is_null() {
-        unsafe {
-            set_err_out_from_error(
-                err_out,
-                Error::new(
-                    ErrorCode::InvalidApiCall,
-                    "row_sender_flush_and_wait: sender pointer is NULL".to_string(),
-                ),
-            );
-        }
-        return false;
-    }
-    let ack_level = match ack_level {
-        value if value == qwpws_ack_level_ok => questdb::ingress::AckLevel::Ok,
-        value if value == qwpws_ack_level_durable => questdb::ingress::AckLevel::Durable,
-        other => {
-            unsafe {
-                set_err_out(
-                    err_out,
-                    ErrorCode::InvalidApiCall,
-                    format!(
-                        "row_sender_flush_and_wait: invalid ack_level {other} (expected 0 or 1)"
-                    ),
-                );
-            }
-            return false;
-        }
-    };
-    if unsafe { reject_closed_pool_row_sender(sender, "row_sender_flush_and_wait", err_out) } {
-        return false;
-    }
-    unsafe {
-        let Some(buffer) = qwpws_buffer_ptr_mut(buffer, err_out, "row_sender_flush_and_wait")
-        else {
-            return false;
-        };
-        match (*sender).0.flush_and_wait(buffer, ack_level) {
-            Ok(()) => true,
-            Err(err) => {
-                set_err_out_from_sender_error(err_out, (*sender).0.get_mut(), err);
-                false
-            }
-        }
-    }
-}
-
-/// Flush the buffer of rows through the borrowed row sender, keeping the
-/// buffer intact (clear it before starting a new batch). Mirrors
-/// `line_sender_flush_and_keep`.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn row_sender_flush_and_keep(
-    sender: *mut row_sender,
-    buffer: *const line_sender_buffer,
-    err_out: *mut *mut line_sender_error,
-) -> bool {
-    if sender.is_null() {
-        unsafe {
-            set_err_out_from_error(
-                err_out,
-                Error::new(
-                    ErrorCode::InvalidApiCall,
-                    "row_sender_flush_and_keep: sender pointer is NULL".to_string(),
-                ),
-            );
-        }
-        return false;
-    }
-    if unsafe { reject_closed_pool_row_sender(sender, "row_sender_flush_and_keep", err_out) } {
-        return false;
-    }
-    unsafe {
-        let s = (*sender).0.get_mut();
-        let buffer = unwrap_buffer(buffer);
-        match s.flush_and_keep(buffer) {
-            Ok(()) => true,
-            Err(err) => {
-                set_err_out_from_sender_error(err_out, s, err);
-                false
-            }
-        }
-    }
-}
-
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn row_sender_flush_and_get_fsn(
-    sender: *mut row_sender,
-    buffer: *mut line_sender_buffer,
-    fsn_out: *mut line_sender_qwpws_fsn,
-    err_out: *mut *mut line_sender_error,
-) -> bool {
-    if fsn_out.is_null() {
-        unsafe {
-            set_err_out(
-                err_out,
-                ErrorCode::InvalidApiCall,
-                "row_sender_flush_and_get_fsn requires non-NULL fsn_out".to_string(),
-            );
-        }
-        return false;
-    }
-    if sender.is_null() {
-        unsafe {
-            set_err_out_from_error(
-                err_out,
-                Error::new(
-                    ErrorCode::InvalidApiCall,
-                    "row_sender_flush_and_get_fsn: sender pointer is NULL".to_string(),
-                ),
-            );
-        }
-        return false;
-    }
-    if unsafe { reject_closed_pool_row_sender(sender, "row_sender_flush_and_get_fsn", err_out) } {
-        return false;
-    }
-    let Some(buffer) =
-        (unsafe { qwpws_buffer_ptr_mut(buffer, err_out, "row_sender_flush_and_get_fsn") })
-    else {
-        return false;
-    };
-    unsafe {
-        let s = (*sender).0.get_mut();
-        match s.flush_and_get_fsn(buffer) {
-            Ok(fsn) => {
-                *fsn_out = line_sender_qwpws_fsn::from_option(fsn);
-                true
-            }
-            Err(err) => {
-                set_err_out_from_sender_error(err_out, s, err);
-                false
-            }
-        }
-    }
-}
-
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn row_sender_flush_and_keep_and_get_fsn(
-    sender: *mut row_sender,
-    buffer: *const line_sender_buffer,
-    fsn_out: *mut line_sender_qwpws_fsn,
-    err_out: *mut *mut line_sender_error,
-) -> bool {
-    if fsn_out.is_null() {
-        unsafe {
-            set_err_out(
-                err_out,
-                ErrorCode::InvalidApiCall,
-                "row_sender_flush_and_keep_and_get_fsn requires non-NULL fsn_out".to_string(),
-            );
-        }
-        return false;
-    }
-    if sender.is_null() {
-        unsafe {
-            set_err_out_from_error(
-                err_out,
-                Error::new(
-                    ErrorCode::InvalidApiCall,
-                    "row_sender_flush_and_keep_and_get_fsn: sender pointer is NULL".to_string(),
-                ),
-            );
-        }
-        return false;
-    }
-    if unsafe {
-        reject_closed_pool_row_sender(sender, "row_sender_flush_and_keep_and_get_fsn", err_out)
-    } {
-        return false;
-    }
-    let Some(buffer) =
-        (unsafe { qwpws_buffer_ptr_ref(buffer, err_out, "row_sender_flush_and_keep_and_get_fsn") })
-    else {
-        return false;
-    };
-    unsafe {
-        let s = (*sender).0.get_mut();
-        match s.flush_and_keep_and_get_fsn(buffer) {
-            Ok(fsn) => {
-                *fsn_out = line_sender_qwpws_fsn::from_option(fsn);
-                true
-            }
-            Err(err) => {
-                set_err_out_from_sender_error(err_out, s, err);
-                false
-            }
-        }
-    }
-}
-
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn row_sender_published_fsn(
-    sender: *const row_sender,
-    fsn_out: *mut line_sender_qwpws_fsn,
-    err_out: *mut *mut line_sender_error,
-) -> bool {
-    if fsn_out.is_null() {
-        unsafe {
-            set_err_out(
-                err_out,
-                ErrorCode::InvalidApiCall,
-                "row_sender_published_fsn requires non-NULL fsn_out".to_string(),
-            );
-        }
-        return false;
-    }
-    if sender.is_null() {
-        unsafe {
-            set_err_out_from_error(
-                err_out,
-                Error::new(
-                    ErrorCode::InvalidApiCall,
-                    "row_sender_published_fsn: sender pointer is NULL".to_string(),
-                ),
-            );
-        }
-        return false;
-    }
-    if unsafe { reject_closed_pool_row_sender(sender, "row_sender_published_fsn", err_out) } {
-        return false;
-    }
-    unsafe {
-        let s = (*sender).0.get();
-        match s.published_fsn() {
-            Ok(fsn) => {
-                *fsn_out = line_sender_qwpws_fsn::from_option(fsn);
-                true
-            }
-            Err(err) => {
-                set_err_out_from_sender_error(err_out, s, err);
-                false
-            }
-        }
-    }
-}
-
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn row_sender_acked_fsn(
-    sender: *const row_sender,
-    fsn_out: *mut line_sender_qwpws_fsn,
-    err_out: *mut *mut line_sender_error,
-) -> bool {
-    if fsn_out.is_null() {
-        unsafe {
-            set_err_out(
-                err_out,
-                ErrorCode::InvalidApiCall,
-                "row_sender_acked_fsn requires non-NULL fsn_out".to_string(),
-            );
-        }
-        return false;
-    }
-    if sender.is_null() {
-        unsafe {
-            set_err_out_from_error(
-                err_out,
-                Error::new(
-                    ErrorCode::InvalidApiCall,
-                    "row_sender_acked_fsn: sender pointer is NULL".to_string(),
-                ),
-            );
-        }
-        return false;
-    }
-    if unsafe { reject_closed_pool_row_sender(sender, "row_sender_acked_fsn", err_out) } {
-        return false;
-    }
-    unsafe {
-        let s = (*sender).0.get();
-        match s.acked_fsn() {
-            Ok(fsn) => {
-                *fsn_out = line_sender_qwpws_fsn::from_option(fsn);
-                true
-            }
-            Err(err) => {
-                set_err_out_from_sender_error(err_out, s, err);
-                false
-            }
-        }
-    }
-}
-
-/// Wait until every frame published so far through `sender` reaches
-/// `ack_level` (a `qwpws_ack_level_*` value). This is the row-major
-/// counterpart of `column_sender_wait`: the store-and-forward queue owns
-/// delivery, so this is needed only to *observe* the ack (e.g. before reading
-/// the rows back), never for durability.
-///
-/// `timeout_millis` is a no-progress deadline (it fires only if the ack
-/// watermark fails to advance for that long); `0` waits indefinitely.
-/// `qwpws_ack_level_durable` requires the pool to be opened with
-/// `request_durable_ack=on`; otherwise this returns
-/// `line_sender_error_invalid_api_call` even when nothing has been published.
-///
-/// Returns `true` once acknowledged. Returns `false` and sets `*err_out` on
-/// the no-progress timeout (`line_sender_error_failover_retry`), a server
-/// rejection, a transport failure, an invalid `ack_level`, or NULL `sender`.
-/// With nothing published yet it succeeds immediately.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn row_sender_wait(
-    sender: *mut row_sender,
-    ack_level: u32,
-    timeout_millis: u64,
-    err_out: *mut *mut line_sender_error,
-) -> bool {
-    if sender.is_null() {
-        unsafe {
-            set_err_out_from_error(
-                err_out,
-                Error::new(
-                    ErrorCode::InvalidApiCall,
-                    "row_sender_wait: sender pointer is NULL".to_string(),
-                ),
-            );
-        }
-        return false;
-    }
-    let ack_level = match ack_level {
-        value if value == qwpws_ack_level_ok => questdb::ingress::AckLevel::Ok,
-        value if value == qwpws_ack_level_durable => questdb::ingress::AckLevel::Durable,
-        other => {
-            unsafe {
-                set_err_out(
-                    err_out,
-                    ErrorCode::InvalidApiCall,
-                    format!("row_sender_wait: invalid ack_level {other} (expected 0 or 1)"),
-                );
-            }
-            return false;
-        }
-    };
-    if unsafe { reject_closed_pool_row_sender(sender, "row_sender_wait", err_out) } {
-        return false;
-    }
-    unsafe {
-        let s = (*sender).0.get_mut();
-        match s.wait(ack_level, Duration::from_millis(timeout_millis)) {
-            Ok(()) => true,
-            Err(err) => {
-                set_err_out_from_sender_error(err_out, s, err);
                 false
             }
         }
@@ -5106,7 +4509,7 @@ unsafe fn validate_arrow_array_depth(
 ///
 /// Shared by every FFI entry point that consumes a caller-built Arrow
 /// C Data Interface pair (currently
-/// `column_sender_flush_arrow_batch_at_now` / `_at_column`).
+/// `qwp_sender_flush_arrow_batch_at_now` / `_at_column`).
 #[cfg(feature = "arrow")]
 pub(crate) unsafe fn arrow_ffi_import_record_batch(
     array: *mut arrow::ffi::FFI_ArrowArray,
@@ -6120,14 +5523,14 @@ mod tests {
     }
 
     #[test]
-    fn pooled_column_sender_rejects_flush_after_db_close_and_returns_safely() {
+    fn pooled_qwp_sender_rejects_flush_after_db_close_and_returns_safely() {
         let server = PooledQwpMock::spawn(1);
         unsafe {
             let mut err = ptr::null_mut();
             let conf = server.conf();
             let db = connect_pool(&conf, &mut err);
 
-            let sender = questdb_db_borrow_column_sender(db, &mut err);
+            let sender = questdb_db_borrow_sender(db, &mut err);
             assert!(!sender.is_null());
             assert!(err.is_null());
 
@@ -6139,27 +5542,27 @@ mod tests {
 
             questdb_db_close(db);
 
-            assert!(!column_sender_flush(sender, chunk, &mut err));
+            assert!(!qwp_sender_flush_chunk(sender, chunk, &mut err));
             assert_line_error_contains(
                 &mut err,
                 line_sender_error_code::line_sender_error_invalid_api_call,
                 "QuestDb pool is closed",
             );
 
-            questdb_db_return_column_sender(ptr::null_mut(), sender);
+            questdb_db_return_sender(ptr::null_mut(), sender);
             column_sender_chunk_free(chunk);
         }
     }
 
     #[test]
-    fn pooled_column_sender_fsn_apis_report_publication_progress() {
+    fn pooled_qwp_sender_fsn_apis_report_publication_progress() {
         let server = PooledQwpMock::spawn(1);
         unsafe {
             let mut err = ptr::null_mut();
             let conf = server.conf();
             let db = connect_pool(&conf, &mut err);
 
-            let sender = questdb_db_borrow_column_sender(db, &mut err);
+            let sender = questdb_db_borrow_sender(db, &mut err);
             assert!(!sender.is_null());
             assert!(err.is_null());
 
@@ -6173,7 +5576,7 @@ mod tests {
                 has_value: true,
                 value: u64::MAX,
             };
-            assert!(column_sender_published_fsn(sender, &mut fsn, &mut err));
+            assert!(qwp_sender_published_fsn(sender, &mut fsn, &mut err));
             assert!(err.is_null());
             assert!(!fsn.has_value);
             assert_eq!(fsn.value, 0);
@@ -6182,14 +5585,14 @@ mod tests {
                 has_value: true,
                 value: u64::MAX,
             };
-            assert!(column_sender_acked_fsn(sender, &mut fsn, &mut err));
+            assert!(qwp_sender_acked_fsn(sender, &mut fsn, &mut err));
             assert!(err.is_null());
             assert!(!fsn.has_value);
             assert_eq!(fsn.value, 0);
 
             fill_column_chunk(chunk, 42, &mut err);
 
-            assert!(column_sender_flush_and_get_fsn(
+            assert!(qwp_sender_flush_chunk_and_get_fsn(
                 sender, chunk, &mut fsn, &mut err
             ));
             assert!(err.is_null());
@@ -6198,27 +5601,27 @@ mod tests {
             assert_eq!(column_sender_chunk_row_count(chunk, &mut err), 0);
             assert!(err.is_null());
 
-            assert!(column_sender_published_fsn(sender, &mut fsn, &mut err));
+            assert!(qwp_sender_published_fsn(sender, &mut fsn, &mut err));
             assert!(err.is_null());
             assert!(fsn.has_value);
             assert_eq!(fsn.value, first_fsn);
 
-            assert!(column_sender_acked_fsn(sender, &mut fsn, &mut err));
+            assert!(qwp_sender_acked_fsn(sender, &mut fsn, &mut err));
             assert!(err.is_null());
             assert!(!fsn.has_value);
 
-            questdb_db_return_column_sender(ptr::null_mut(), sender);
+            questdb_db_return_sender(ptr::null_mut(), sender);
             column_sender_chunk_free(chunk);
             questdb_db_close(db);
         }
     }
 
     #[test]
-    fn column_sender_fsn_outputs_are_required() {
+    fn qwp_sender_fsn_outputs_are_required() {
         unsafe {
             let mut err = ptr::null_mut();
 
-            assert!(!column_sender_flush_and_get_fsn(
+            assert!(!qwp_sender_flush_chunk_and_get_fsn(
                 ptr::null_mut(),
                 ptr::null_mut(),
                 ptr::null_mut(),
@@ -6227,10 +5630,10 @@ mod tests {
             assert_line_error_contains(
                 &mut err,
                 line_sender_error_code::line_sender_error_invalid_api_call,
-                "column_sender_flush_and_get_fsn requires non-NULL fsn_out",
+                "qwp_sender_flush_chunk_and_get_fsn requires non-NULL fsn_out",
             );
 
-            assert!(!column_sender_published_fsn(
+            assert!(!qwp_sender_published_fsn(
                 ptr::null(),
                 ptr::null_mut(),
                 &mut err
@@ -6238,10 +5641,10 @@ mod tests {
             assert_line_error_contains(
                 &mut err,
                 line_sender_error_code::line_sender_error_invalid_api_call,
-                "column_sender_published_fsn requires non-NULL fsn_out",
+                "qwp_sender_published_fsn requires non-NULL fsn_out",
             );
 
-            assert!(!column_sender_acked_fsn(
+            assert!(!qwp_sender_acked_fsn(
                 ptr::null(),
                 ptr::null_mut(),
                 &mut err
@@ -6249,13 +5652,13 @@ mod tests {
             assert_line_error_contains(
                 &mut err,
                 line_sender_error_code::line_sender_error_invalid_api_call,
-                "column_sender_acked_fsn requires non-NULL fsn_out",
+                "qwp_sender_acked_fsn requires non-NULL fsn_out",
             );
         }
     }
 
     #[test]
-    fn column_sender_fsn_apis_reject_null_sender() {
+    fn qwp_sender_fsn_apis_reject_null_sender() {
         unsafe {
             let mut err = ptr::null_mut();
             let mut fsn = line_sender_qwpws_fsn {
@@ -6263,7 +5666,7 @@ mod tests {
                 value: u64::MAX,
             };
 
-            assert!(!column_sender_flush_and_get_fsn(
+            assert!(!qwp_sender_flush_chunk_and_get_fsn(
                 ptr::null_mut(),
                 ptr::null_mut(),
                 &mut fsn,
@@ -6272,39 +5675,35 @@ mod tests {
             assert_line_error_contains(
                 &mut err,
                 line_sender_error_code::line_sender_error_invalid_api_call,
-                "column_sender_flush_and_get_fsn: sender pointer is NULL",
+                "qwp_sender_flush_chunk_and_get_fsn: sender pointer is NULL",
             );
 
-            assert!(!column_sender_published_fsn(
-                ptr::null(),
-                &mut fsn,
-                &mut err
-            ));
+            assert!(!qwp_sender_published_fsn(ptr::null(), &mut fsn, &mut err));
             assert_line_error_contains(
                 &mut err,
                 line_sender_error_code::line_sender_error_invalid_api_call,
-                "column_sender_published_fsn: sender pointer is NULL",
+                "qwp_sender_published_fsn: sender pointer is NULL",
             );
 
-            assert!(!column_sender_acked_fsn(ptr::null(), &mut fsn, &mut err));
+            assert!(!qwp_sender_acked_fsn(ptr::null(), &mut fsn, &mut err));
             assert_line_error_contains(
                 &mut err,
                 line_sender_error_code::line_sender_error_invalid_api_call,
-                "column_sender_acked_fsn: sender pointer is NULL",
+                "qwp_sender_acked_fsn: sender pointer is NULL",
             );
         }
     }
 
     #[cfg(feature = "arrow")]
     #[test]
-    fn pooled_column_sender_arrow_fsn_api_reports_publication_progress() {
+    fn pooled_qwp_sender_arrow_fsn_api_reports_publication_progress() {
         let server = PooledQwpMock::spawn(1);
         unsafe {
             let mut err = ptr::null_mut();
             let conf = server.conf();
             let db = connect_pool(&conf, &mut err);
 
-            let sender = questdb_db_borrow_column_sender(db, &mut err);
+            let sender = questdb_db_borrow_sender(db, &mut err);
             assert!(!sender.is_null());
             assert!(err.is_null());
 
@@ -6313,7 +5712,7 @@ mod tests {
                 has_value: false,
                 value: 0,
             };
-            let ok = column_sender_flush_arrow_batch_at_now_and_get_fsn(
+            let ok = qwp_sender_flush_arrow_batch_at_now_and_get_fsn(
                 sender,
                 table_name(b"trades"),
                 &mut array,
@@ -6339,31 +5738,31 @@ mod tests {
             assert!(fsn.has_value);
             let first_fsn = fsn.value;
 
-            assert!(column_sender_published_fsn(sender, &mut fsn, &mut err));
+            assert!(qwp_sender_published_fsn(sender, &mut fsn, &mut err));
             assert!(err.is_null());
             assert!(fsn.has_value);
             assert_eq!(fsn.value, first_fsn);
 
-            questdb_db_return_column_sender(ptr::null_mut(), sender);
+            questdb_db_return_sender(ptr::null_mut(), sender);
             questdb_db_close(db);
         }
     }
 
     #[cfg(feature = "arrow")]
     #[test]
-    fn column_sender_arrow_fsn_output_is_required_before_import() {
+    fn qwp_sender_arrow_fsn_output_is_required_before_import() {
         let server = PooledQwpMock::spawn(1);
         unsafe {
             let mut err = ptr::null_mut();
             let conf = server.conf();
             let db = connect_pool(&conf, &mut err);
 
-            let sender = questdb_db_borrow_column_sender(db, &mut err);
+            let sender = questdb_db_borrow_sender(db, &mut err);
             assert!(!sender.is_null());
             assert!(err.is_null());
 
             let (mut array, schema) = export_i64_arrow_array(vec![1, 2, 3]);
-            assert!(!column_sender_flush_arrow_batch_at_now_and_get_fsn(
+            assert!(!qwp_sender_flush_arrow_batch_at_now_and_get_fsn(
                 sender,
                 table_name(b"trades"),
                 &mut array,
@@ -6376,7 +5775,7 @@ mod tests {
             assert_line_error_contains(
                 &mut err,
                 line_sender_error_code::line_sender_error_invalid_api_call,
-                "column_sender_flush_arrow_batch_at_now_and_get_fsn requires non-NULL fsn_out",
+                "qwp_sender_flush_arrow_batch_at_now_and_get_fsn requires non-NULL fsn_out",
             );
             assert!(
                 array.release.is_some(),
@@ -6384,7 +5783,7 @@ mod tests {
             );
             release_arrow_array_if_needed(&mut array);
 
-            assert!(!column_sender_flush_arrow_batch_at_column_and_get_fsn(
+            assert!(!qwp_sender_flush_arrow_batch_at_column_and_get_fsn(
                 sender,
                 table_name(b"trades"),
                 ptr::null_mut(),
@@ -6398,56 +5797,56 @@ mod tests {
             assert_line_error_contains(
                 &mut err,
                 line_sender_error_code::line_sender_error_invalid_api_call,
-                "column_sender_flush_arrow_batch_at_column_and_get_fsn requires non-NULL fsn_out",
+                "qwp_sender_flush_arrow_batch_at_column_and_get_fsn requires non-NULL fsn_out",
             );
 
-            questdb_db_return_column_sender(ptr::null_mut(), sender);
+            questdb_db_return_sender(ptr::null_mut(), sender);
             questdb_db_close(db);
         }
     }
 
     #[test]
-    fn pooled_row_sender_rejects_flush_after_db_close_and_returns_safely() {
+    fn pooled_qwp_sender_rejects_buffer_flush_after_db_close_and_returns_safely() {
         let server = PooledQwpMock::spawn(2);
         unsafe {
             let mut err = ptr::null_mut();
             let conf = server.conf();
             let db = connect_pool(&conf, &mut err);
 
-            let sender = questdb_db_borrow_row_sender(db, &mut err);
+            let sender = questdb_db_borrow_sender(db, &mut err);
             assert!(!sender.is_null());
             assert!(err.is_null());
 
-            let buffer = line_sender_buffer_new_qwp();
+            let buffer = questdb_db_new_buffer(db, &mut err);
             assert!(!buffer.is_null());
 
             questdb_db_close(db);
 
-            assert!(!row_sender_flush(sender, buffer, &mut err));
+            assert!(!qwp_sender_flush_buffer(sender, buffer, &mut err));
             assert_line_error_contains(
                 &mut err,
                 line_sender_error_code::line_sender_error_invalid_api_call,
                 "QuestDb pool is closed",
             );
 
-            questdb_db_return_row_sender(ptr::null_mut(), sender);
+            questdb_db_return_sender(ptr::null_mut(), sender);
             line_sender_buffer_free(buffer);
         }
     }
 
     #[test]
-    fn pooled_row_sender_fsn_apis_report_publication_progress() {
+    fn pooled_qwp_sender_buffer_fsn_apis_report_publication_progress() {
         let server = PooledQwpMock::spawn(1);
         unsafe {
             let mut err = ptr::null_mut();
             let conf = server.conf();
             let db = connect_pool(&conf, &mut err);
 
-            let sender = questdb_db_borrow_row_sender(db, &mut err);
+            let sender = questdb_db_borrow_sender(db, &mut err);
             assert!(!sender.is_null());
             assert!(err.is_null());
 
-            let buffer = row_sender_new_buffer(sender, &mut err);
+            let buffer = questdb_db_new_buffer(db, &mut err);
             assert!(!buffer.is_null());
             assert!(err.is_null());
 
@@ -6455,7 +5854,7 @@ mod tests {
                 has_value: true,
                 value: u64::MAX,
             };
-            assert!(row_sender_published_fsn(sender, &mut fsn, &mut err));
+            assert!(qwp_sender_published_fsn(sender, &mut fsn, &mut err));
             assert!(err.is_null());
             assert!(!fsn.has_value);
             assert_eq!(fsn.value, 0);
@@ -6464,7 +5863,7 @@ mod tests {
                 has_value: true,
                 value: u64::MAX,
             };
-            assert!(row_sender_acked_fsn(sender, &mut fsn, &mut err));
+            assert!(qwp_sender_acked_fsn(sender, &mut fsn, &mut err));
             assert!(err.is_null());
             assert!(!fsn.has_value);
             assert_eq!(fsn.value, 0);
@@ -6473,14 +5872,14 @@ mod tests {
                 has_value: true,
                 value: u64::MAX,
             };
-            assert!(row_sender_flush_and_keep_and_get_fsn(
+            assert!(qwp_sender_flush_buffer_and_keep_and_get_fsn(
                 sender, buffer, &mut fsn, &mut err
             ));
             assert!(err.is_null());
             assert!(!fsn.has_value);
             assert_eq!(fsn.value, 0);
 
-            assert!(!row_sender_flush_and_get_fsn(
+            assert!(!qwp_sender_flush_buffer_and_get_fsn(
                 sender,
                 ptr::null_mut(),
                 &mut fsn,
@@ -6491,7 +5890,7 @@ mod tests {
                 line_sender_error_code::line_sender_error_invalid_api_call,
                 "requires a non-NULL buffer",
             );
-            assert!(!row_sender_flush_and_keep_and_get_fsn(
+            assert!(!qwp_sender_flush_buffer_and_keep_and_get_fsn(
                 sender,
                 ptr::null(),
                 &mut fsn,
@@ -6506,7 +5905,7 @@ mod tests {
             fill_qwp_ws_row(buffer, 42, &mut err);
             assert_eq!(line_sender_buffer_row_count(buffer), 1);
 
-            assert!(row_sender_flush_and_keep_and_get_fsn(
+            assert!(qwp_sender_flush_buffer_and_keep_and_get_fsn(
                 sender, buffer, &mut fsn, &mut err
             ));
             assert!(err.is_null());
@@ -6514,12 +5913,12 @@ mod tests {
             let first_fsn = fsn.value;
             assert_eq!(line_sender_buffer_row_count(buffer), 1);
 
-            assert!(row_sender_published_fsn(sender, &mut fsn, &mut err));
+            assert!(qwp_sender_published_fsn(sender, &mut fsn, &mut err));
             assert!(err.is_null());
             assert!(fsn.has_value);
             assert_eq!(fsn.value, first_fsn);
 
-            assert!(row_sender_flush_and_get_fsn(
+            assert!(qwp_sender_flush_buffer_and_get_fsn(
                 sender, buffer, &mut fsn, &mut err
             ));
             assert!(err.is_null());
@@ -6528,27 +5927,27 @@ mod tests {
             assert!(second_fsn > first_fsn);
             assert_eq!(line_sender_buffer_row_count(buffer), 0);
 
-            assert!(row_sender_published_fsn(sender, &mut fsn, &mut err));
+            assert!(qwp_sender_published_fsn(sender, &mut fsn, &mut err));
             assert!(err.is_null());
             assert!(fsn.has_value);
             assert_eq!(fsn.value, second_fsn);
 
-            assert!(row_sender_acked_fsn(sender, &mut fsn, &mut err));
+            assert!(qwp_sender_acked_fsn(sender, &mut fsn, &mut err));
             assert!(err.is_null());
             assert!(!fsn.has_value);
 
-            questdb_db_return_row_sender(ptr::null_mut(), sender);
+            questdb_db_return_sender(ptr::null_mut(), sender);
             line_sender_buffer_free(buffer);
             questdb_db_close(db);
         }
     }
 
     #[test]
-    fn row_sender_fsn_outputs_are_required() {
+    fn buffer_fsn_outputs_are_required() {
         unsafe {
             let mut err = ptr::null_mut();
 
-            assert!(!row_sender_flush_and_get_fsn(
+            assert!(!qwp_sender_flush_buffer_and_get_fsn(
                 ptr::null_mut(),
                 ptr::null_mut(),
                 ptr::null_mut(),
@@ -6557,10 +5956,10 @@ mod tests {
             assert_line_error_contains(
                 &mut err,
                 line_sender_error_code::line_sender_error_invalid_api_call,
-                "row_sender_flush_and_get_fsn requires non-NULL fsn_out",
+                "qwp_sender_flush_buffer_and_get_fsn requires non-NULL fsn_out",
             );
 
-            assert!(!row_sender_flush_and_keep_and_get_fsn(
+            assert!(!qwp_sender_flush_buffer_and_keep_and_get_fsn(
                 ptr::null_mut(),
                 ptr::null(),
                 ptr::null_mut(),
@@ -6569,10 +5968,10 @@ mod tests {
             assert_line_error_contains(
                 &mut err,
                 line_sender_error_code::line_sender_error_invalid_api_call,
-                "row_sender_flush_and_keep_and_get_fsn requires non-NULL fsn_out",
+                "qwp_sender_flush_buffer_and_keep_and_get_fsn requires non-NULL fsn_out",
             );
 
-            assert!(!row_sender_published_fsn(
+            assert!(!qwp_sender_published_fsn(
                 ptr::null(),
                 ptr::null_mut(),
                 &mut err
@@ -6580,10 +5979,10 @@ mod tests {
             assert_line_error_contains(
                 &mut err,
                 line_sender_error_code::line_sender_error_invalid_api_call,
-                "row_sender_published_fsn requires non-NULL fsn_out",
+                "qwp_sender_published_fsn requires non-NULL fsn_out",
             );
 
-            assert!(!row_sender_acked_fsn(
+            assert!(!qwp_sender_acked_fsn(
                 ptr::null(),
                 ptr::null_mut(),
                 &mut err
@@ -6591,13 +5990,13 @@ mod tests {
             assert_line_error_contains(
                 &mut err,
                 line_sender_error_code::line_sender_error_invalid_api_call,
-                "row_sender_acked_fsn requires non-NULL fsn_out",
+                "qwp_sender_acked_fsn requires non-NULL fsn_out",
             );
         }
     }
 
     #[test]
-    fn row_sender_fsn_apis_reject_null_sender() {
+    fn buffer_fsn_apis_reject_null_sender() {
         unsafe {
             let mut err = ptr::null_mut();
             let mut fsn = line_sender_qwpws_fsn {
@@ -6605,7 +6004,7 @@ mod tests {
                 value: u64::MAX,
             };
 
-            assert!(!row_sender_flush_and_get_fsn(
+            assert!(!qwp_sender_flush_buffer_and_get_fsn(
                 ptr::null_mut(),
                 ptr::null_mut(),
                 &mut fsn,
@@ -6614,10 +6013,10 @@ mod tests {
             assert_line_error_contains(
                 &mut err,
                 line_sender_error_code::line_sender_error_invalid_api_call,
-                "row_sender_flush_and_get_fsn: sender pointer is NULL",
+                "qwp_sender_flush_buffer_and_get_fsn: sender pointer is NULL",
             );
 
-            assert!(!row_sender_flush_and_keep_and_get_fsn(
+            assert!(!qwp_sender_flush_buffer_and_keep_and_get_fsn(
                 ptr::null_mut(),
                 ptr::null(),
                 &mut fsn,
@@ -6626,21 +6025,21 @@ mod tests {
             assert_line_error_contains(
                 &mut err,
                 line_sender_error_code::line_sender_error_invalid_api_call,
-                "row_sender_flush_and_keep_and_get_fsn: sender pointer is NULL",
+                "qwp_sender_flush_buffer_and_keep_and_get_fsn: sender pointer is NULL",
             );
 
-            assert!(!row_sender_published_fsn(ptr::null(), &mut fsn, &mut err));
+            assert!(!qwp_sender_published_fsn(ptr::null(), &mut fsn, &mut err));
             assert_line_error_contains(
                 &mut err,
                 line_sender_error_code::line_sender_error_invalid_api_call,
-                "row_sender_published_fsn: sender pointer is NULL",
+                "qwp_sender_published_fsn: sender pointer is NULL",
             );
 
-            assert!(!row_sender_acked_fsn(ptr::null(), &mut fsn, &mut err));
+            assert!(!qwp_sender_acked_fsn(ptr::null(), &mut fsn, &mut err));
             assert_line_error_contains(
                 &mut err,
                 line_sender_error_code::line_sender_error_invalid_api_call,
-                "row_sender_acked_fsn: sender pointer is NULL",
+                "qwp_sender_acked_fsn: sender pointer is NULL",
             );
         }
     }

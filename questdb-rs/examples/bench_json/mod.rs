@@ -1,4 +1,4 @@
-//! Shared JSON metric contract (QWP_DATAFRAME_BENCH_PLAN.md §3.2) for the
+//! Shared JSON metric contract (doc/historical/QWP_DATAFRAME_BENCH_PLAN.md §3.2) for the
 //! Rust Polars ingress/egress examples. Emits the **same** field names as
 //! the Python harness (`py-questdb-client/test/benchmark_pandas_columnar.py`:
 //! `summarize` + `add_rates` + `_path_summary` + the top-level report) so a

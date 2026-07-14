@@ -1,7 +1,7 @@
 /* C ABI FFI-boundary tests for the conn-level Arrow batch ingest API
- * (`column_sender_flush_arrow_batch_at_now[_at_column]`) and the unchanged
+ * (`qwp_sender_flush_arrow_batch_at_now[_at_column]`) and the unchanged
  * egress reader API. Successful round-trip coverage lives in the Rust
- * unit tests under `questdb-rs/src/ingress/column_sender/arrow_batch.rs`
+ * unit tests under `questdb-rs/src/ingress/qwp_sender/arrow_batch.rs`
  * and the Python system tests under `system_test/`. */
 
 #include <questdb/ingress/column_sender.h>
@@ -126,7 +126,7 @@ TEST(test_ingress_null_conn_returns_false)
     memset(&sch, 0, sizeof(sch));
     line_sender_error* err = NULL;
     line_sender_table_name tbl = make_table("t");
-    bool ok = column_sender_flush_arrow_batch_at_now(
+    bool ok = qwp_sender_flush_arrow_batch_at_now(
         NULL, tbl, &arr, &sch, NULL, 0, &err);
     CHECK(!ok, "NULL conn → false");
     CHECK(err != NULL, "err_out populated");
@@ -151,7 +151,7 @@ TEST(test_ingress_null_array_returns_false)
      * checks conn before array. To validate the NULL-array branch we'd
      * need a real conn, which requires a live mock server. Coverage moved
      * to Rust unit tests. */
-    bool ok = column_sender_flush_arrow_batch_at_now(
+    bool ok = qwp_sender_flush_arrow_batch_at_now(
         NULL, make_table("t"), NULL, &sch, NULL, 0, &err);
     CHECK(!ok, "NULL array path through NULL-conn short-circuit");
     if (err)
@@ -165,7 +165,7 @@ TEST(test_ingress_at_column_null_conn_returns_false)
     memset(&arr, 0, sizeof(arr));
     memset(&sch, 0, sizeof(sch));
     line_sender_error* err = NULL;
-    bool ok = column_sender_flush_arrow_batch_at_column(
+    bool ok = qwp_sender_flush_arrow_batch_at_column(
         NULL, make_table("t"), &arr, &sch, make_col("ts"),
         NULL, 0, &err);
     CHECK(!ok, "NULL conn → false");
@@ -885,11 +885,11 @@ TEST(test_error_codes_survive_ffi_boundary)
  * `line_sender_buffer_append_arrow` C suite. Each test:
  *   1. Builds a single-column ArrowArray + ArrowSchema on the stack.
  *   2. Spins up `qwp_mock_c` (1-slot, accepts one QWP1 binary frame).
- *   3. Opens a `questdb_db` against the mock + borrows a `column_sender`.
- *   4. Calls `column_sender_flush_arrow_batch[_at_column]`.
+ *   3. Opens a `questdb_db` against the mock + borrows a `qwp_sender`.
+ *   4. Calls `qwp_sender_flush_arrow_batch[_at_column]`.
  *   5. Accepts either ok=true OR a documented structured error code.
  * Per-column wire correctness is owned by the Rust unit tests under
- * `questdb-rs/src/ingress/column_sender/arrow_batch.rs`.
+ * `questdb-rs/src/ingress/qwp_sender/arrow_batch.rs`.
  * ------------------------------------------------------------------------- */
 
 #define ARROW_FLAG_NULLABLE 2
@@ -1035,13 +1035,14 @@ TEST(test_chunk_append_arrow_column_malformed_array_rejected)
 
 /* Open a mock + questdb_db + borrow a conn. Returns NULL on any setup
  * failure; populates *out_db / *out_mock on success. */
-static column_sender* mock_borrow_column_sender(
+static qwp_sender* mock_borrow_sender_frames(
     qwp_mock_c** out_mock,
-    questdb_db** out_db)
+    questdb_db** out_db,
+    int frame_count)
 {
     *out_mock = NULL;
     *out_db = NULL;
-    qwp_mock_c* mock = qwp_mock_c_start(1);
+    qwp_mock_c* mock = qwp_mock_c_start_frames(1, frame_count);
     if (mock == NULL)
         return NULL;
     const char* addr = qwp_mock_c_addr(mock);
@@ -1059,7 +1060,7 @@ static column_sender* mock_borrow_column_sender(
         qwp_mock_c_stop(mock);
         return NULL;
     }
-    column_sender* conn = questdb_db_borrow_column_sender(db, &err);
+    qwp_sender* conn = questdb_db_borrow_sender(db, &err);
     if (conn == NULL)
     {
         if (err)
@@ -1073,15 +1074,77 @@ static column_sender* mock_borrow_column_sender(
     return conn;
 }
 
+static qwp_sender* mock_borrow_sender(
+    qwp_mock_c** out_mock,
+    questdb_db** out_db)
+{
+    return mock_borrow_sender_frames(out_mock, out_db, 1);
+}
+
 static void mock_return_close(
-    qwp_mock_c* mock, questdb_db* db, column_sender* conn)
+    qwp_mock_c* mock, questdb_db* db, qwp_sender* conn)
 {
     if (conn != NULL && db != NULL)
-        questdb_db_return_column_sender(db, conn);
+        questdb_db_return_sender(db, conn);
     if (db != NULL)
         questdb_db_close(db);
     if (mock != NULL)
         qwp_mock_c_stop(mock);
+}
+
+TEST(test_one_sender_flushes_buffer_and_chunk)
+{
+    qwp_mock_c* mock;
+    questdb_db* db;
+    qwp_sender* sender = mock_borrow_sender_frames(&mock, &db, 2);
+    CHECK(sender != NULL, "unified sender borrowed");
+    if (sender == NULL)
+        return;
+
+    line_sender_error* err = NULL;
+    line_sender_buffer* buffer = questdb_db_new_buffer(db, &err);
+    CHECK(buffer != NULL, "buffer constructed from pool");
+    CHECK(err == NULL, "no error constructing buffer");
+    if (buffer != NULL)
+    {
+        line_sender_table_name table = make_table("mixed_c_buffer");
+        line_sender_column_name value = make_col("value");
+        CHECK(line_sender_buffer_table(buffer, table, &err), "buffer table");
+        CHECK(
+            line_sender_buffer_column_i64(buffer, value, 1, &err),
+            "buffer value");
+        CHECK(line_sender_buffer_at_now(buffer, &err), "buffer timestamp");
+        CHECK(
+            qwp_sender_flush_buffer(sender, buffer, &err),
+            "buffer published through unified sender");
+    }
+
+    column_sender_chunk* chunk = column_sender_chunk_new(
+        "mixed_c_chunk", strlen("mixed_c_chunk"), &err);
+    CHECK(chunk != NULL, "chunk constructed");
+    if (chunk != NULL)
+    {
+        int64_t value = 2;
+        CHECK(
+            column_sender_chunk_column_i64(
+                chunk, "value", strlen("value"), &value, 1, NULL, &err),
+            "chunk value");
+        CHECK(column_sender_chunk_at_now(chunk, &err), "chunk timestamp");
+        CHECK(
+            qwp_sender_flush_chunk(sender, chunk, &err),
+            "chunk published through the same unified sender");
+    }
+
+    if (err != NULL)
+    {
+        line_sender_error_free(err);
+        err = NULL;
+    }
+    if (chunk != NULL)
+        column_sender_chunk_free(chunk);
+    if (buffer != NULL)
+        line_sender_buffer_free(buffer);
+    mock_return_close(mock, db, sender);
 }
 
 static void run_arrow_flush(
@@ -1090,7 +1153,7 @@ static void run_arrow_flush(
 {
     qwp_mock_c* mock;
     questdb_db* db;
-    column_sender* conn = mock_borrow_column_sender(&mock, &db);
+    qwp_sender* conn = mock_borrow_sender(&mock, &db);
     CHECK(conn != NULL, "mock conn borrowed");
     if (conn == NULL)
     {
@@ -1102,7 +1165,7 @@ static void run_arrow_flush(
     }
     line_sender_error* err = NULL;
     line_sender_table_name tbl = make_table(table);
-    bool ok = column_sender_flush_arrow_batch_at_now(
+    bool ok = qwp_sender_flush_arrow_batch_at_now(
         conn, tbl, arr, sch, NULL, 0, &err);
     if (!ok)
     {
@@ -1132,14 +1195,14 @@ TEST(test_mock_ingress_null_array_via_real_conn)
      * covered above. */
     qwp_mock_c* mock;
     questdb_db* db;
-    column_sender* conn = mock_borrow_column_sender(&mock, &db);
+    qwp_sender* conn = mock_borrow_sender(&mock, &db);
     CHECK(conn != NULL, "mock conn borrowed");
     if (conn == NULL)
         return;
     struct ArrowSchema sch;
     memset(&sch, 0, sizeof(sch));
     line_sender_error* err = NULL;
-    bool ok = column_sender_flush_arrow_batch_at_now(
+    bool ok = qwp_sender_flush_arrow_batch_at_now(
         conn, make_table("t"), NULL, &sch, NULL, 0, &err);
     CHECK(!ok, "NULL array → false");
     CHECK(err != NULL, "err_out populated");
@@ -1249,9 +1312,9 @@ TEST(test_mock_ingress_both_designated_timestamp_variants)
 {
     /* The original test exercised three DesignatedTimestamp kinds
      * (Now / ServerNow / Column). In the new conn-level API the first
-     * two collapse onto `column_sender_flush_arrow_batch_at_now`
+     * two collapse onto `qwp_sender_flush_arrow_batch_at_now`
      * (no per-row stamp — server stamps on arrival), and Column maps to the
-     * dedicated `column_sender_flush_arrow_batch_at_column`. We cover
+     * dedicated `qwp_sender_flush_arrow_batch_at_column`. We cover
      * both surviving variants here. */
 
     /* No-TS variant. */
@@ -1273,7 +1336,7 @@ TEST(test_mock_ingress_both_designated_timestamp_variants)
         build_primitive(2, sizeof(int64_t), values, "l", "v", &arr, &sch);
         qwp_mock_c* mock;
         questdb_db* db;
-        column_sender* conn = mock_borrow_column_sender(&mock, &db);
+        qwp_sender* conn = mock_borrow_sender(&mock, &db);
         CHECK(conn != NULL, "mock conn borrowed");
         if (conn == NULL)
         {
@@ -1286,7 +1349,7 @@ TEST(test_mock_ingress_both_designated_timestamp_variants)
         line_sender_error* err = NULL;
         line_sender_table_name tbl = make_table("dts_t_col");
         line_sender_column_name ts_col = make_col("missing_ts");
-        bool ok = column_sender_flush_arrow_batch_at_column(
+        bool ok = qwp_sender_flush_arrow_batch_at_column(
             conn, tbl, &arr, &sch, ts_col, NULL, 0, &err);
         CHECK(!ok, "missing ts column → false");
         if (err)
@@ -1307,7 +1370,7 @@ TEST(test_mock_ingress_both_designated_timestamp_variants)
 }
 
 /* Exercises the documented `array->release` ownership contract of
- * `column_sender_flush_arrow_batch_at_now` on all three states: pre-import
+ * `qwp_sender_flush_arrow_batch_at_now` on all three states: pre-import
  * failure leaves release intact (caller frees), a malformed nested schema
  * is rejected gracefully (not by aborting the panic=abort FFI crate) with
  * release intact, and a structurally-valid batch that reaches the Arrow
@@ -1316,7 +1379,7 @@ TEST(test_mock_ingress_arrow_release_contract)
 {
     qwp_mock_c* mock;
     questdb_db* db;
-    column_sender* conn = mock_borrow_column_sender(&mock, &db);
+    qwp_sender* conn = mock_borrow_sender(&mock, &db);
     CHECK(conn != NULL, "mock conn borrowed");
     if (conn == NULL)
         return;
@@ -1328,7 +1391,7 @@ TEST(test_mock_ingress_arrow_release_contract)
         struct ArrowSchema sch;
         build_primitive(2, sizeof(int64_t), values, "l", "v", &arr, &sch);
         line_sender_error* err = NULL;
-        bool ok = column_sender_flush_arrow_batch_at_now(
+        bool ok = qwp_sender_flush_arrow_batch_at_now(
             conn, make_table("rc_a"), &arr, NULL, NULL, 0, &err);
         CHECK(!ok, "NULL schema → false");
         CHECK(
@@ -1350,7 +1413,7 @@ TEST(test_mock_ingress_arrow_release_contract)
         struct ArrowSchema sch;
         build_primitive(2, sizeof(int64_t), values, "+l", "v", &arr, &sch);
         line_sender_error* err = NULL;
-        bool ok = column_sender_flush_arrow_batch_at_now(
+        bool ok = qwp_sender_flush_arrow_batch_at_now(
             conn, make_table("rc_b"), &arr, &sch, NULL, 0, &err);
         CHECK(!ok, "malformed +l schema → false");
         CHECK(err != NULL, "err_out populated on malformed schema");
@@ -1380,7 +1443,7 @@ TEST(test_mock_ingress_arrow_release_contract)
         struct ArrowSchema sch;
         build_primitive(2, sizeof(int64_t), values, "l", "v", &arr, &sch);
         line_sender_error* err = NULL;
-        bool ok = column_sender_flush_arrow_batch_at_now(
+        bool ok = qwp_sender_flush_arrow_batch_at_now(
             conn, make_table("rc_c"), &arr, &sch, NULL, 0, &err);
         (void)ok;
         CHECK(
@@ -1429,6 +1492,7 @@ int main(void)
     RUN(test_chunk_append_numpy_column_mistagged_dtype_rejected);
     RUN(test_chunk_append_numpy_column_data_len_exact_ok);
     RUN(test_error_codes_survive_ffi_boundary);
+    RUN(test_one_sender_flushes_buffer_and_chunk);
     RUN(test_mock_ingress_null_array_via_real_conn);
     RUN(test_mock_ingress_at_column_empty_name_via_real_conn);
     RUN(test_mock_ingress_boolean_column);

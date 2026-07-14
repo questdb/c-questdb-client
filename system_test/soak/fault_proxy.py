@@ -24,7 +24,7 @@
 
 """
 Fault-injecting TCP proxy for the soak / stress harness (see
-``doc/SOAK_HARNESS_DESIGN.md`` §S3).
+``doc/QWP_SOAK_HARNESS.md``).
 
 A faulted workload leg connects *through* this proxy instead of straight to
 QuestDB. The orchestrator drives the proxy to sever, stall, or throttle those

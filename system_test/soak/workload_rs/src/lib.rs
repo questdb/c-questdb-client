@@ -5,13 +5,14 @@
 //! data generator that lets the soak oracle regenerate every expected
 //! read-back value from `(seed, worker_id, seq)` alone.
 
-pub mod column_leg;
+pub mod chunk_leg;
 #[cfg(feature = "dataframe")]
 pub mod dataframe_leg;
 pub mod egress_leg;
 pub mod gen;
 pub mod journal;
 pub mod legs;
+pub mod mixed_leg;
 pub mod stats;
 
 use std::sync::atomic::{AtomicBool, Ordering};

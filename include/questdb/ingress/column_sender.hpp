@@ -79,7 +79,7 @@ private:
 };
 
 /** Forward decl. */
-class column_sender_view;
+class sender_view;
 
 /**
  * RAII wrapper around `::column_sender_chunk*`. Move-only.
@@ -721,22 +721,19 @@ inline column_chunk& column_chunk::append_arrow_import(
 #endif
 
 /**
- * Thin non-owning view over a borrowed `::column_sender*`: publish-only
+ * Thin non-owning view over a borrowed `::qwp_sender*`: publish-only
  * `flush`, FSN-returning publish/progress helpers, the `wait` ack barrier, and
  * Arrow-batch ingest. The store-and-forward queue owns delivery. Use this
- * directly when adapting a raw C-borrowed handle; `borrowed_column_sender`
+ * directly when adapting a raw C-borrowed handle; `borrowed_sender`
  * keeps the same view private so pooled leases cannot escape the guard.
  */
-class column_sender_view
+class sender_view
 {
 public:
-    explicit column_sender_view(::column_sender* raw) noexcept
+    explicit sender_view(::qwp_sender* raw) noexcept
         : _raw{raw}
     {
     }
-
-    ::column_sender* c_ptr() noexcept { return _raw; }
-    const ::column_sender* c_ptr() const noexcept { return _raw; }
 
     /**
      * Encode `chunk` and publish it into the store-and-forward queue, returning
@@ -747,7 +744,7 @@ public:
     void flush(column_chunk& chunk)
     {
         line_sender_error::wrapped_call(
-            ::column_sender_flush, _raw, chunk.c_ptr());
+            ::qwp_sender_flush_chunk, _raw, chunk.c_ptr());
     }
 
     /**
@@ -760,7 +757,7 @@ public:
         qwpws_ack_level level = qwpws_ack_level::ok)
     {
         line_sender_error::wrapped_call(
-            ::column_sender_flush_and_wait,
+            ::qwp_sender_flush_chunk_and_wait,
             _raw,
             chunk.c_ptr(),
             static_cast<uint32_t>(level));
@@ -775,7 +772,7 @@ public:
     {
         ::line_sender_qwpws_fsn fsn{};
         line_sender_error::wrapped_call(
-            ::column_sender_flush_and_get_fsn,
+            ::qwp_sender_flush_chunk_and_get_fsn,
             _raw,
             chunk.c_ptr(),
             &fsn);
@@ -790,7 +787,7 @@ public:
     {
         ::line_sender_qwpws_fsn fsn{};
         line_sender_error::wrapped_call(
-            ::column_sender_published_fsn, _raw, &fsn);
+            ::qwp_sender_published_fsn, _raw, &fsn);
         return optional_fsn(fsn);
     }
 
@@ -802,7 +799,7 @@ public:
     {
         ::line_sender_qwpws_fsn fsn{};
         line_sender_error::wrapped_call(
-            ::column_sender_acked_fsn, _raw, &fsn);
+            ::qwp_sender_acked_fsn, _raw, &fsn);
         return optional_fsn(fsn);
     }
 
@@ -822,7 +819,7 @@ public:
                 line_sender_error_code::invalid_api_call,
                 "QWP/WebSocket wait timeout must not be negative."};
         line_sender_error::wrapped_call(
-            ::column_sender_wait,
+            ::qwp_sender_wait,
             _raw,
             static_cast<uint32_t>(level),
             static_cast<uint64_t>(timeout.count()));
@@ -843,7 +840,7 @@ public:
     {
         ::line_sender_table_name table_c{table.size(), table.data()};
         line_sender_error::wrapped_call(
-            ::column_sender_flush_arrow_batch_at_now,
+            ::qwp_sender_flush_arrow_batch_at_now,
             _raw,
             table_c,
             &array,
@@ -880,7 +877,7 @@ public:
     {
         ::line_sender_table_name table_c{table.size(), table.data()};
         line_sender_error::wrapped_call(
-            ::column_sender_flush_arrow_batch_at_now_and_wait,
+            ::qwp_sender_flush_arrow_batch_at_now_and_wait,
             _raw,
             table_c,
             &array,
@@ -903,7 +900,7 @@ public:
         ::line_sender_table_name table_c{table.size(), table.data()};
         ::line_sender_qwpws_fsn fsn{};
         line_sender_error::wrapped_call(
-            ::column_sender_flush_arrow_batch_at_now_and_get_fsn,
+            ::qwp_sender_flush_arrow_batch_at_now_and_get_fsn,
             _raw,
             table_c,
             &array,
@@ -929,7 +926,7 @@ public:
         ::line_sender_table_name table_c{table.size(), table.data()};
         ::line_sender_column_name ts_c{ts_column.size(), ts_column.data()};
         line_sender_error::wrapped_call(
-            ::column_sender_flush_arrow_batch_at_column,
+            ::qwp_sender_flush_arrow_batch_at_column,
             _raw,
             table_c,
             &array,
@@ -969,7 +966,7 @@ public:
         ::line_sender_table_name table_c{table.size(), table.data()};
         ::line_sender_column_name ts_c{ts_column.size(), ts_column.data()};
         line_sender_error::wrapped_call(
-            ::column_sender_flush_arrow_batch_at_column_and_wait,
+            ::qwp_sender_flush_arrow_batch_at_column_and_wait,
             _raw,
             table_c,
             &array,
@@ -995,7 +992,7 @@ public:
         ::line_sender_column_name ts_c{ts_column.size(), ts_column.data()};
         ::line_sender_qwpws_fsn fsn{};
         line_sender_error::wrapped_call(
-            ::column_sender_flush_arrow_batch_at_column_and_get_fsn,
+            ::qwp_sender_flush_arrow_batch_at_column_and_get_fsn,
             _raw,
             table_c,
             &array,
@@ -1009,6 +1006,11 @@ public:
 #endif
 
 private:
+    friend class borrowed_sender;
+
+    ::qwp_sender* c_ptr() noexcept { return _raw; }
+    const ::qwp_sender* c_ptr() const noexcept { return _raw; }
+
     static std::optional<uint64_t> optional_fsn(
         const ::line_sender_qwpws_fsn& fsn)
     {
@@ -1017,14 +1019,14 @@ private:
         return std::nullopt;
     }
 
-    ::column_sender* _raw;
+    ::qwp_sender* _raw;
 };
 
 /**
- * RAII guard for a borrowed store-and-forward column sender. On destruction the
+ * RAII guard for a borrowed store-and-forward QWP sender. On destruction the
  * sender is returned to the pool (or dropped if `drop_on_return()` was called,
  * it has latched terminal state, or the pool has been closed). Constructed only
- * via `pool::borrow_column_sender()`.
+ * via `pool::borrow_sender()`.
  *
  * The store-and-forward queue owns delivery, so destruction does not lose
  * accepted frames; `wait()` is an ack barrier, not a commit step. The
@@ -1032,23 +1034,23 @@ private:
  * everything published so far; use FSNs for non-blocking progress tracking
  * while you still hold the same borrowed sender.
  */
-class borrowed_column_sender
+class borrowed_sender
 {
 public:
-    borrowed_column_sender(const borrowed_column_sender&) = delete;
-    borrowed_column_sender& operator=(const borrowed_column_sender&) = delete;
+    borrowed_sender(const borrowed_sender&) = delete;
+    borrowed_sender& operator=(const borrowed_sender&) = delete;
 
-    borrowed_column_sender(borrowed_column_sender&& other) noexcept
+    borrowed_sender(borrowed_sender&& other) noexcept
         : _db{other._db}
         , _view{std::move(other._view)}
         , _force_drop{other._force_drop}
     {
         other._db = nullptr;
-        other._view = column_sender_view{nullptr};
+        other._view = sender_view{nullptr};
         other._force_drop = false;
     }
 
-    borrowed_column_sender& operator=(borrowed_column_sender&& other) noexcept
+    borrowed_sender& operator=(borrowed_sender&& other) noexcept
     {
         if (this != &other)
         {
@@ -1057,18 +1059,101 @@ public:
             _view = std::move(other._view);
             _force_drop = other._force_drop;
             other._db = nullptr;
-            other._view = column_sender_view{nullptr};
+            other._view = sender_view{nullptr};
             other._force_drop = false;
         }
         return *this;
     }
 
-    ~borrowed_column_sender() noexcept { release(); }
+    ~borrowed_sender() noexcept { release(); }
 
     /** `true` if this guard currently owns a borrowed sender. */
     explicit operator bool() const noexcept
     {
         return _db && _view.c_ptr();
+    }
+
+    /** Create a caller-owned QWP/WebSocket buffer using the pool settings. */
+    line_sender_buffer new_buffer(size_t init_buf_size = 64 * 1024)
+    {
+        ::line_sender_error* c_err{nullptr};
+        auto* raw = ::questdb_db_new_buffer(_db, &c_err);
+        if (!raw)
+            throw line_sender_error::from_c(c_err);
+        try
+        {
+            line_sender_error::wrapped_call(
+                ::line_sender_buffer_reserve, raw, init_buf_size);
+        }
+        catch (...)
+        {
+            ::line_sender_buffer_free(raw);
+            throw;
+        }
+        return line_sender_buffer{
+            raw,
+            protocol_version::v1,
+            init_buf_size,
+            ::questdb_db_buffer_max_name_len(_db),
+            line_sender_buffer::_backend_kind::qwp_ws};
+    }
+
+    /** Publish and clear a Buffer after local queue acceptance. */
+    void flush(line_sender_buffer& buffer)
+    {
+        buffer.may_init();
+        line_sender_error::wrapped_call(
+            ::qwp_sender_flush_buffer, _view.c_ptr(), buffer._impl);
+    }
+
+    /** Publish and clear a Buffer, then wait for `level`. */
+    void flush_and_wait(
+        line_sender_buffer& buffer,
+        qwpws_ack_level level = qwpws_ack_level::ok)
+    {
+        buffer.may_init();
+        line_sender_error::wrapped_call(
+            ::qwp_sender_flush_buffer_and_wait,
+            _view.c_ptr(),
+            buffer._impl,
+            static_cast<uint32_t>(level));
+    }
+
+    /** Publish a Buffer without clearing it. */
+    void flush_and_keep(const line_sender_buffer& buffer)
+    {
+        if (buffer._impl)
+            line_sender_error::wrapped_call(
+                ::qwp_sender_flush_buffer_and_keep,
+                _view.c_ptr(),
+                buffer._impl);
+    }
+
+    /** Publish and clear a Buffer and return its local FSN boundary. */
+    std::optional<uint64_t> flush_and_get_fsn(line_sender_buffer& buffer)
+    {
+        buffer.may_init();
+        ::line_sender_qwpws_fsn fsn{};
+        line_sender_error::wrapped_call(
+            ::qwp_sender_flush_buffer_and_get_fsn,
+            _view.c_ptr(),
+            buffer._impl,
+            &fsn);
+        return optional_fsn(fsn);
+    }
+
+    /** Publish a Buffer without clearing it and return its local FSN. */
+    std::optional<uint64_t> flush_and_keep_and_get_fsn(
+        const line_sender_buffer& buffer)
+    {
+        ::line_sender_qwpws_fsn fsn{};
+        if (buffer._impl)
+            line_sender_error::wrapped_call(
+                ::qwp_sender_flush_buffer_and_keep_and_get_fsn,
+                _view.c_ptr(),
+                buffer._impl,
+                &fsn);
+        return optional_fsn(fsn);
     }
 
     /**
@@ -1272,7 +1357,7 @@ public:
 private:
     friend class ::questdb::pool;
 
-    borrowed_column_sender(::questdb_db* db, ::column_sender* raw) noexcept
+    borrowed_sender(::questdb_db* db, ::qwp_sender* raw) noexcept
         : _db{db}
         , _view{raw}
     {
@@ -1280,291 +1365,20 @@ private:
 
     void release() noexcept
     {
-        ::column_sender* raw = _view.c_ptr();
+        ::qwp_sender* raw = _view.c_ptr();
         if (_db && raw)
         {
             if (_force_drop)
-                ::questdb_db_drop_column_sender(_db, raw);
+                ::questdb_db_drop_sender(_db, raw);
             else
-                ::questdb_db_return_column_sender(_db, raw);
+                ::questdb_db_return_sender(_db, raw);
         }
         _db = nullptr;
-        _view = column_sender_view{nullptr};
+        _view = sender_view{nullptr};
     }
 
     ::questdb_db* _db;
-    column_sender_view _view;
-    bool _force_drop{false};
-};
-
-/**
- * RAII guard for a borrowed row-major sender. On destruction the sender is
- * returned to the pool (or dropped if `drop_on_return()` was called, the
- * connection has latched terminal state, or the pool has been closed). Build
- * rows with a `questdb::ingress::line_sender_buffer` and send them via
- * `flush()` / `flush_and_keep()` or the FSN-returning variants.
- *
- * Use `wait()` for the simple case: a blocking barrier for everything
- * published so far through this borrowed sender. Use FSNs for non-blocking
- * pipelining while you still hold the same borrowed sender: publish with
- * `flush_and_get_fsn()`, keep doing work, then compare the saved FSN with
- * `acked_fsn()`. FSNs are stream watermarks, not portable receipts to check
- * through an arbitrary later pool borrow.
- *
- * Constructed only via `pool::borrow_row_sender()`.
- */
-class borrowed_row_sender
-{
-public:
-    borrowed_row_sender(const borrowed_row_sender&) = delete;
-    borrowed_row_sender& operator=(const borrowed_row_sender&) = delete;
-
-    borrowed_row_sender(borrowed_row_sender&& other) noexcept
-        : _db{other._db}
-        , _sender{other._sender}
-        , _force_drop{other._force_drop}
-    {
-        other._db = nullptr;
-        other._sender = nullptr;
-        other._force_drop = false;
-    }
-
-    borrowed_row_sender& operator=(borrowed_row_sender&& other) noexcept
-    {
-        if (this != &other)
-        {
-            release();
-            _db = other._db;
-            _sender = other._sender;
-            _force_drop = other._force_drop;
-            other._db = nullptr;
-            other._sender = nullptr;
-            other._force_drop = false;
-        }
-        return *this;
-    }
-
-    ~borrowed_row_sender() noexcept { release(); }
-
-    explicit operator bool() const noexcept
-    {
-        return _db && _sender;
-    }
-
-    /**
-     * Construct a buffer matching this sender's protocol settings: the
-     * QWP/WebSocket columnar buffer that this sender requires. Build rows
-     * with the usual `line_sender_buffer` API (`table` / `symbol` /
-     * `column_*` / `at`), then publish them with `flush()` /
-     * `flush_and_keep()` or the FSN-returning variants. Mirrors Rust's
-     * `Sender::new_buffer()` and the standalone `line_sender::new_buffer()`.
-     * @throws line_sender_error on failure.
-     */
-    line_sender_buffer new_buffer(size_t init_buf_size = 64 * 1024)
-    {
-        ::line_sender_error* c_err{nullptr};
-        auto* raw = ::row_sender_new_buffer(_sender, &c_err);
-        if (!raw)
-            throw line_sender_error::from_c(c_err);
-        const size_t max_name_len = ::row_sender_get_max_name_len(_sender);
-        try
-        {
-            line_sender_error::wrapped_call(
-                ::line_sender_buffer_reserve, raw, init_buf_size);
-        }
-        catch (...)
-        {
-            ::line_sender_buffer_free(raw);
-            throw;
-        }
-        // `borrowed_row_sender` is a friend of `line_sender_buffer`, so it can
-        // wrap the already-built impl directly. The protocol version is not
-        // meaningful for a QWP/WS columnar buffer; the name-length cap below
-        // only feeds the lazy re-init path (the impl already carries the
-        // sender's configured cap).
-        return line_sender_buffer{
-            raw,
-            protocol_version::v1,
-            init_buf_size,
-            max_name_len,
-            line_sender_buffer::_backend_kind::qwp_ws};
-    }
-
-    /**
-     * Send the buffer of rows to QuestDB, then clear the buffer.
-     * @throws line_sender_error on failure.
-     */
-    void flush(line_sender_buffer& buffer)
-    {
-        buffer.may_init();
-        line_sender_error::wrapped_call(
-            ::row_sender_flush, _sender, buffer._impl);
-    }
-
-    /**
-     * Send the buffer of rows to QuestDB as a completion boundary, clear the
-     * buffer, then block until every frame published so far through this
-     * sender reaches `level` — `flush()` followed by `wait()` in one call.
-     * The wait is bounded by the pool-wide `request_timeout` setting; compose
-     * `flush()` + `wait()` to choose a per-call timeout instead.
-     * `qwpws_ack_level::durable` requires `request_durable_ack=on`; otherwise
-     * this throws `invalid_api_call` before the buffer is touched.
-     * @throws line_sender_error on failure.
-     */
-    void flush_and_wait(
-        line_sender_buffer& buffer,
-        qwpws_ack_level level = qwpws_ack_level::ok)
-    {
-        buffer.may_init();
-        line_sender_error::wrapped_call(
-            ::row_sender_flush_and_wait,
-            _sender,
-            buffer._impl,
-            static_cast<uint32_t>(level));
-    }
-
-    /**
-     * Send the buffer of rows to QuestDB, keeping the buffer intact (clear
-     * it before starting a new batch). A never-initialised (empty) buffer
-     * is a no-op.
-     * @throws line_sender_error on failure.
-     */
-    void flush_and_keep(const line_sender_buffer& buffer)
-    {
-        if (buffer._impl)
-            line_sender_error::wrapped_call(
-                ::row_sender_flush_and_keep, _sender, buffer._impl);
-    }
-
-    /**
-     * Publish a QWP/WebSocket buffer locally, clear it on success, and return
-     * the assigned frame sequence number. Empty buffers return `std::nullopt`.
-     * Local publication means the frame was accepted by this sender's replay
-     * queue, before the server necessarily ACKs it.
-     */
-    std::optional<uint64_t> flush_and_get_fsn(line_sender_buffer& buffer)
-    {
-        buffer.may_init();
-        ::line_sender_qwpws_fsn fsn{};
-        line_sender_error::wrapped_call(
-            ::row_sender_flush_and_get_fsn,
-            _sender,
-            buffer._impl,
-            &fsn);
-        return optional_fsn(fsn);
-    }
-
-    /**
-     * Publish a QWP/WebSocket buffer locally without clearing it and return the
-     * assigned frame sequence number. Empty buffers return `std::nullopt`.
-     * The returned FSN has the same local-publication semantics as
-     * `flush_and_get_fsn()`.
-     */
-    std::optional<uint64_t> flush_and_keep_and_get_fsn(
-        const line_sender_buffer& buffer)
-    {
-        ::line_sender_qwpws_fsn fsn{};
-        if (buffer._impl)
-            line_sender_error::wrapped_call(
-                ::row_sender_flush_and_keep_and_get_fsn,
-                _sender,
-                buffer._impl,
-                &fsn);
-        return optional_fsn(fsn);
-    }
-
-    /**
-     * Return the highest QWP/WebSocket frame sequence number published locally,
-     * or `std::nullopt` if no frame has been published.
-     * This is a stream watermark for the currently borrowed sender.
-     */
-    std::optional<uint64_t> published_fsn() const
-    {
-        ::line_sender_qwpws_fsn fsn{};
-        line_sender_error::wrapped_call(
-            ::row_sender_published_fsn, _sender, &fsn);
-        return optional_fsn(fsn);
-    }
-
-    /**
-     * Return the highest QWP/WebSocket frame sequence number completed by ACK,
-     * or `std::nullopt` if none has completed.
-     * After `flush_and_get_fsn()` returns `fsn`, the publication boundary has
-     * completed once `acked_fsn()` returns a value greater than or equal to
-     * `fsn`. In durable-ACK mode this watermark advances after durable ACK
-     * coverage; use `wait()` when you need an explicit OK or durable barrier.
-     */
-    std::optional<uint64_t> acked_fsn() const
-    {
-        ::line_sender_qwpws_fsn fsn{};
-        line_sender_error::wrapped_call(::row_sender_acked_fsn, _sender, &fsn);
-        return optional_fsn(fsn);
-    }
-
-    /**
-     * Block until every frame published so far through this sender reaches
-     * `level`. The store-and-forward queue owns delivery, so this is needed
-     * only to *observe* the ack (e.g. before reading the rows back), never
-     * for durability. `timeout` is a no-progress deadline (it fires only if
-     * the ack watermark fails to advance for that long); the default of zero
-     * waits indefinitely. Mirrors `column_sender_view::wait` and Rust's
-     * `Sender::wait`. `qwpws_ack_level::durable` requires
-     * `request_durable_ack=on`; otherwise this throws `invalid_api_call` even
-     * when nothing has been published. If it times out, the frames remain
-     * queued; retry `wait()` or keep observing the watermark instead of
-     * re-flushing the same data.
-     * @throws line_sender_error on failure.
-     */
-    void wait(
-        qwpws_ack_level level = qwpws_ack_level::ok,
-        std::chrono::milliseconds timeout = std::chrono::milliseconds::zero())
-    {
-        if (timeout.count() < 0)
-            throw line_sender_error{
-                line_sender_error_code::invalid_api_call,
-                "QWP/WebSocket wait timeout must not be negative."};
-        line_sender_error::wrapped_call(
-            ::row_sender_wait,
-            _sender,
-            static_cast<uint32_t>(level),
-            static_cast<uint64_t>(timeout.count()));
-    }
-
-    /**
-     * Force this borrowed sender to be closed instead of recycled when the
-     * guard is destroyed.
-     *
-     * Use normal destruction for healthy senders: the return path already
-     * closes senders that have latched terminal state, or whose pool has been
-     * closed. Call this after abandoning work or handling an error where the
-     * next borrower must not inherit this connection.
-     */
-    void drop_on_return() noexcept { _force_drop = true; }
-
-private:
-    friend class ::questdb::pool;
-
-    borrowed_row_sender(::questdb_db* db, ::row_sender* raw) noexcept
-        : _db{db}
-        , _sender{raw}
-    {
-    }
-
-    void release() noexcept
-    {
-        if (_db && _sender)
-        {
-            if (_force_drop)
-                ::questdb_db_drop_row_sender(_db, _sender);
-            else
-                ::questdb_db_return_row_sender(_db, _sender);
-        }
-        _db = nullptr;
-        _sender = nullptr;
-    }
-
-    ::questdb_db* _db;
-    ::row_sender* _sender;
+    sender_view _view;
     bool _force_drop{false};
 
     static std::optional<uint64_t> optional_fsn(
@@ -1586,9 +1400,8 @@ namespace questdb
  * `conf` is a `ws::` / `wss::` connect string; see
  * `column_sender.h` for pool-specific keys (`pool_size`, `pool_max`,
  * `pool_idle_timeout_ms`, `pool_reap`). With `sf_dir`, `sender_id` is the
- * slot base; pooled senders mint `<sender_id>-col-<index>` and
- * `<sender_id>-row-<index>` disk slots. Those `<sender_id>-col-*` and
- * `<sender_id>-row-*` directories under `sf_dir` belong to the pool namespace;
+ * slot base; pooled senders mint `<sender_id>-ingest-<index>` disk slots.
+ * Those `<sender_id>-ingest-*` directories under `sf_dir` belong to the pool namespace;
  * use a unique `sender_id` for each pool sharing an `sf_dir`.
  *
  * Construction performs no blocking network I/O. In disk-backed
@@ -1640,57 +1453,26 @@ public:
      * up to `close_flush_timeout` (default 5s) while an in-flight close
      * releases its lock; otherwise throws on cap exhaustion or transport
      * failure. */
-    ingress::borrowed_column_sender borrow_column_sender()
+    ingress::borrowed_sender borrow_sender()
     {
         auto* raw = ingress::line_sender_error::wrapped_call(
-            ::questdb_db_borrow_column_sender, _raw);
-        return ingress::borrowed_column_sender{_raw, raw};
+            ::questdb_db_borrow_sender, _raw);
+        return ingress::borrowed_sender{_raw, raw};
     }
 
     /**
      * Borrow a store-and-forward sender, retrying the connect within `budget_ms`
-     * using the row sender's reconnect backoff. On a transient `failover_retry`,
+     * using the pool's reconnect backoff. On a transient `failover_retry`,
      * drop the dead sender then call this with `reconnect_max_duration_ms()` (or
      * your tracked remaining budget). Throws on a terminal error or budget
      * exhaustion.
      */
-    ingress::borrowed_column_sender borrow_column_sender_with_retry(
+    ingress::borrowed_sender borrow_sender_with_retry(
         uint64_t budget_ms)
     {
         auto* raw = ingress::line_sender_error::wrapped_call(
-            ::questdb_db_borrow_column_sender_with_retry, _raw, budget_ms);
-        return ingress::borrowed_column_sender{_raw, raw};
-    }
-
-    /**
-     * Borrow a row-major sender from the pool, mirroring Rust
-     * `QuestDb::borrow_row_sender`. Row senders are pooled on a separate,
-     * independently-capped free list that shares the pool budget; the pool
-     * is lazy except that disk-backed recovery senders may have been
-     * pre-opened by pool construction with background initial connect and
-     * replay. In disk-backed store-and-forward mode, an at-cap borrow can wait
-     * up to `close_flush_timeout` (default 5s) while an in-flight slot close
-     * releases its lock. Build rows with a `line_sender_buffer` and flush them
-     * through the returned guard. Otherwise throws on cap exhaustion or
-     * transport failure.
-     */
-    ingress::borrowed_row_sender borrow_row_sender()
-    {
-        auto* raw = ingress::line_sender_error::wrapped_call(
-            ::questdb_db_borrow_row_sender, _raw);
-        return ingress::borrowed_row_sender{_raw, raw};
-    }
-
-    /**
-     * Borrow a row-major sender, retrying the connect within `budget_ms`
-     * using the pool's reconnect backoff. Throws on a terminal error or
-     * budget exhaustion.
-     */
-    ingress::borrowed_row_sender borrow_row_sender_with_retry(uint64_t budget_ms)
-    {
-        auto* raw = ingress::line_sender_error::wrapped_call(
-            ::questdb_db_borrow_row_sender_with_retry, _raw, budget_ms);
-        return ingress::borrowed_row_sender{_raw, raw};
+            ::questdb_db_borrow_sender_with_retry, _raw, budget_ms);
+        return ingress::borrowed_sender{_raw, raw};
     }
 
     /**

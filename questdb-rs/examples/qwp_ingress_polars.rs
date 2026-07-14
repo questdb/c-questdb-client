@@ -1,9 +1,9 @@
-//! Step 3 (QWP_DATAFRAME_BENCH_PLAN.md §6) — Rust **Polars ingress**
+//! Step 3 (doc/historical/QWP_DATAFRAME_BENCH_PLAN.md §6) — Rust **Polars ingress**
 //! parity for the shared S1 narrow / S2 wide schemas.
 //!
-//! Measures `BorrowedColumnSender::flush_polars_dataframe()` end-to-end on a
+//! Measures `BorrowedSender::flush_polars_dataframe()` end-to-end on a
 //! `bench_schema::SchemaKind` (the same columns the pandas harness ingests),
-//! and separately the column-sender **encode floor**
+//! and separately the columnar-payload **encode floor**
 //! (`bench_encode_chunk_into`, the same path `benches/column_sender.rs`
 //! reports) on identical data, so the DataFrame→batches overhead is
 //! isolated. Emits the plan §3.2 JSON metric contract with
@@ -32,7 +32,7 @@
 //! `http.receive.buffer.size=16M` (QuestDB `QDB_HTTP_RECEIVE_BUFFER_SIZE=16M`)
 //! or the QWP/WS connection is closed mid-flush.
 //!
-//! Env knobs (parity with the Rust column-sender suite / Python harness):
+//! Env knobs (parity with the Rust columnar suite / Python harness):
 //!   SCHEMA=s1-narrow         scenario (s1-narrow | s2-wide)
 //!   ROWS=10000000            headline row count (default 10M)
 //!   QUESTDB_COLUMN_BENCH_SYM_CARD=8        low-card SYMBOL cardinality
@@ -73,7 +73,7 @@ const TS_BASE_NANOS: i64 = 1_704_067_200_000_000_000;
 const D_NAMES: [&str; N_WIDE_DOUBLES] = ["d1", "d2", "d3", "d4", "d5"];
 const S_NAMES: [&str; N_WIDE_SYMS] = ["s1", "s2", "s3", "s4", "s5"];
 
-/// One SYMBOL column in the compact form the column sender wants: per-row
+/// One SYMBOL column in the compact form the columnar encoder wants: per-row
 /// `codes` into a `(offsets, bytes)` dictionary. Shared by the low-card
 /// `sym` and the S2-wide high-card `s1..s5`.
 struct SymCol {
@@ -235,7 +235,7 @@ fn build_dataframe(kind: SchemaKind, data: &BenchData) -> Result<DataFrame, Box<
     Ok(DataFrame::new(data.rows, columns)?)
 }
 
-/// Build the matching column-sender [`Chunk`] for the encode floor. Same
+/// Build the matching columnar [`Chunk`] for the encode floor. Same
 /// column set + designated timestamp as the e2e path, all borrowing the
 /// shared buffers (no copy of row data).
 fn build_chunk<'a>(kind: SchemaKind, data: &'a BenchData) -> Result<Chunk<'a>, Box<dyn Error>> {

@@ -102,10 +102,9 @@ The pool's main handles:
   ingestion (`polars` feature).
 * `db.flush_arrow_batch(table, &batch, ts_column, overrides, ack)` —
   one-call Arrow `RecordBatch` ingestion (`arrow` feature).
-* `db.borrow_column_sender()` — columnar streaming: fill a `Chunk` column by
-  column, `flush` it, reuse the allocation.
-* `db.borrow_row_sender()` — row-by-row ingestion with the familiar
-  `Buffer` API (`table(..).symbol(..).column_f64(..).at(..)`).
+* `db.borrow_sender()` — unified ingestion: publish row-built `Buffer`
+  payloads (`table(..).symbol(..).column_f64(..).at(..)`) or fill and reuse a
+  columnar `Chunk`; the same lease also accepts Arrow batches.
 * `db.borrow_reader()` — run SQL and stream the result set back.
 
 Handles return to the pool on drop; the pool reconnects and fails over
@@ -179,7 +178,7 @@ The crate provides several optional features to enable additional functionality.
 - **sync-reader**: Enables `sync-reader-qwp-ws` and `sync-reader-zstd` (queries). Querying is first-class, on by default.
 - **sync-sender-tcp**: Enables ILP/TCP (legacy). Depends on the `socket2` crate.
 - **sync-sender-http**: Enables ILP/HTTP support. Depends on the `ureq` crate.
-- **sync-sender-qwp-ws**: Enables QWP/WebSocket ingestion (`QuestDb` pool, row and column senders).
+- **sync-sender-qwp-ws**: Enables unified QWP/WebSocket ingestion through the `QuestDb` pool.
 - **sync-reader-qwp-ws**: Enables QWP/WebSocket queries (`Reader` / `Cursor`).
 - **sync-reader-zstd**: Enables zstd decompression of query result batches.
 - **tls-webpki-certs**: Uses a snapshot of the [Common CA Database](https://www.ccadb.org/) as root TLS certificates. Depends on the `webpki-roots` crate.

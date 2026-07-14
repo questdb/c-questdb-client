@@ -31,6 +31,7 @@ use crate::ingress::buffer::{
 };
 
 pub(crate) struct QwpWsReplayEncoder {
+    payload: Vec<u8>,
     scratch: QwpWsEncodeScratch,
     global_dict: SymbolGlobalDict,
     version: u8,
@@ -49,6 +50,7 @@ pub(crate) struct QwpWsReplayEncoder {
 impl QwpWsReplayEncoder {
     pub(crate) fn new(version: u8) -> Self {
         Self {
+            payload: Vec::with_capacity(16 * 1024),
             scratch: QwpWsEncodeScratch::new(),
             global_dict: SymbolGlobalDict::new(),
             version,
@@ -122,6 +124,7 @@ impl QwpWsReplayEncoder {
             ));
         }
         buffer.encode_ws_replay_message_with_defer(
+            &mut self.payload,
             &mut self.scratch,
             &mut self.global_dict,
             self.version,
@@ -134,7 +137,7 @@ impl QwpWsReplayEncoder {
     #[cfg(test)]
     pub(crate) fn encode(&mut self, buffer: &QwpWsColumnarBuffer) -> crate::Result<&[u8]> {
         self.encode_to_scratch(buffer)?;
-        Ok(&self.scratch.message)
+        Ok(&self.payload)
     }
 
     /// Rolls the connection dict and its persisted side-file back to the marks
@@ -191,7 +194,7 @@ impl QwpWsReplayEncoder {
             self.rollback_frame(global_dict_mark, pd_mark);
             return Err(err);
         }
-        let encoded_len = self.scratch.message.len();
+        let encoded_len = self.payload.len();
         if encoded_len > max_buf_size {
             self.rollback_frame(global_dict_mark, pd_mark);
             return Err(qwp_ws_encoded_message_size_error(encoded_len, max_buf_size));
@@ -210,7 +213,7 @@ impl QwpWsReplayEncoder {
         max_buf_size: usize,
     ) -> crate::Result<&[u8]> {
         self.encode_and_persist(buffer, max_buf_size)?;
-        Ok(&self.scratch.message)
+        Ok(&self.payload)
     }
 
     /// Encodes `buffer`, write-aheads its new symbols, then hands the payload to
@@ -233,7 +236,7 @@ impl QwpWsReplayEncoder {
         publish: impl FnOnce(&[u8]) -> crate::Result<u64>,
     ) -> crate::Result<u64> {
         let (global_dict_mark, pd_mark) = self.encode_and_persist(buffer, max_buf_size)?;
-        match publish(&self.scratch.message) {
+        match publish(&self.payload) {
             Ok(fsn) => Ok(fsn),
             Err(err) => {
                 self.rollback_frame(global_dict_mark, pd_mark);

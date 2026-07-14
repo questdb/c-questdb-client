@@ -1,6 +1,9 @@
 # Column-Major Sender — Implementation Plan
 
-**Status:** draft, pending approval
+**Status:** retired pre-unification design record; not a current API contract.
+See [`README.md`](README.md).
+
+**Original status:** draft, pending approval
 **Owner:** TBD
 **Audience:** engineers implementing the Rust core, the C FFI, and the
 separate Python wrapper repo.
@@ -106,7 +109,7 @@ On the Rust API, the lifetime parameter `'a` ties the chunk to every
 borrowed buffer, so the borrow checker catches use-after-free at
 compile time. The FFI layer carries the same shape via
 `Chunk<'static>` and an explicit ABI contract — see
-`doc/COLUMN_SENDER_FFI_ABI.md` §2.3.
+`doc/historical/COLUMN_SENDER_FFI_ABI.md` §2.3.
 
 ### 2.2 Two code paths per type
 
@@ -518,7 +521,7 @@ land.
 - Owner: 1 engineer.
 - Depends on: WS-2 minimum.
 - Done when: benchmark numbers documented in `doc/DEV_NOTES.md` or a
-  new `doc/COLUMN_SENDER_PERF.md`.
+  new `doc/historical/COLUMN_SENDER_PERF.md`.
 
 ### WS-7 — Python repo coordination (out-of-tree, tracked here)
 

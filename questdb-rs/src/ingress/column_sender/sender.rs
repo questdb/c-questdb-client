@@ -32,16 +32,14 @@ use std::time::{Duration, Instant};
 use crate::ErrorCode;
 use crate::ingress::AckLevel;
 use crate::ingress::QwpWsSenderError;
-use crate::ingress::buffer::{SymbolGlobalDict, SymbolGlobalDictMark};
+use crate::ingress::buffer::{Buffer, QwpWsColumnarBuffer, QwpWsEncodeScratch, SymbolGlobalDict};
 use crate::ingress::sender::qwp_ws::{
     SyncQwpWsHandlerState, publish_qwp_ws_payload_background, qwp_ws_acked_fsn_background,
     qwp_ws_begin_close_background, qwp_ws_check_error_background,
     qwp_ws_drain_to_deadline_background, qwp_ws_is_terminal_background, qwp_ws_ok_fsn_background,
     qwp_ws_poll_sender_error_in_range_background, qwp_ws_published_fsn_background,
 };
-use crate::ingress::sender::qwp_ws_sfa_symbol_dict::{
-    PersistedSymbolDict, PersistedSymbolDictMark,
-};
+use crate::ingress::sender::qwp_ws_sfa_publisher::{SfaForegroundPublisher, SfaPublishOutcome};
 #[cfg(feature = "arrow-ingress")]
 use crate::ingress::{ColumnName, TableName};
 use crate::{Result, error};
@@ -51,6 +49,7 @@ use super::arrow_batch::{self, ArrowColumnOverride, ArrowTsSource};
 use super::chunk::Chunk;
 use super::conn::{ColumnConn, PublishError};
 use super::encoder;
+use super::qwp_frame_size_error;
 
 #[cfg(feature = "arrow-ingress")]
 use arrow::array::RecordBatch;
@@ -75,16 +74,6 @@ enum FrameOutcome {
     /// retry the range) since its extra frames are an implementation detail
     /// the caller cannot account for.
     NoSlot(crate::Error),
-}
-
-/// Outcome of appending a single frame on the store-and-forward backend.
-#[derive(Debug)]
-enum SfaOutcome {
-    Published(u64),
-    /// The encoded frame exceeded the negotiated cap before it was queued, so
-    /// the caller may split the row range and retry. Carries the detailed size
-    /// error so the split floor can surface exact byte counts.
-    TooLarge(crate::Error),
 }
 
 /// The immutable inputs to an Arrow-batch flush, bundled so the recursive split
@@ -121,9 +110,8 @@ pub(crate) enum WaitForAck {
 
 /// Delivery certainty of the **current input** when an ACKing flush fails.
 ///
-/// Drives the C FFI Arrow re-export decision (see
-/// `doc/COLUMN_SENDER_ACK_BOUNDARY_FLUSH.md` §7.5): `NotDelivered` may
-/// re-export the caller's batch for retry; `DeliveryUnknown` must not. The
+/// Drives the C FFI Arrow re-export decision: `NotDelivered` may re-export the
+/// caller's batch for retry; `DeliveryUnknown` must not. The
 /// distinction is delivery certainty of the current input, *not* the error
 /// code — a direct-mode `write_all`/`flush` error or a post-publish ACK-wait
 /// failure is `DeliveryUnknown` even though it reports `FailoverRetry`.
@@ -139,9 +127,8 @@ pub enum FlushFailure {
     /// or the post-write ACK wait failed. The current input must not be
     /// re-exported (Arrow) or blindly replayed (manual chunk).
     ///
-    /// Manual-chunk state depends on the sub-case, per the publish-only
-    /// clearing rule (`doc/COLUMN_SENDER_ACK_BOUNDARY_FLUSH.md` §7.4): the
-    /// chunk is cleared once publication succeeds (so an ACKing flush whose
+    /// Manual-chunk state depends on the sub-case: the chunk is cleared once
+    /// publication succeeds (so an ACKing flush whose
     /// later ACK wait fails leaves it cleared), but a *partial write*
     /// (`PublishError::DuringWrite`) returns before the chunk is cleared and so
     /// leaves it populated. Either way delivery is uncertain — chunk state is
@@ -198,17 +185,16 @@ fn deny_retry_after_partial(f: FlushFailure) -> FlushFailure {
     }
 }
 
-pub struct ColumnSender {
-    backend: ColumnSenderBackend,
+pub struct PooledSenderCore {
+    backend: Box<SfaBackend>,
 }
 
-// Both variants are large (the direct backend owns a live connection; the
-// store-and-forward backend embeds the whole background handler state -- queue
-// producer, recovered dictionary, persisted side-file), so both are boxed to
-// keep `ColumnSender` itself pointer-sized as it is moved in and out of the pool.
-enum ColumnSenderBackend {
-    Direct(Box<DirectColumnBackend>),
-    StoreAndForward(Box<SfaColumnBackend>),
+/// Hidden direct sender used by whole-source DataFrame ingestion. It is a
+/// distinct type from [`PooledSenderCore`] so store-and-forward-only methods
+/// (Buffer publication, FSNs, and timed waits) cannot be called on it.
+#[doc(hidden)]
+pub struct DirectSenderCore {
+    backend: Box<DirectColumnBackend>,
 }
 
 struct DirectColumnBackend {
@@ -224,31 +210,14 @@ struct DirectColumnBackend {
     commit_since_sync: bool,
 }
 
-struct SfaColumnBackend {
-    /// The slot's persisted symbol dictionary (file mode) for write-ahead: the
-    /// symbols each frame introduces are appended here before the frame is
-    /// published, and rolled back in lockstep with `symbol_dict` when an append
-    /// fails, so recovery / orphan-drain can rebuild the exact dictionary the
-    /// stored delta frames reference. `None` in memory mode / on open failure.
-    ///
-    /// Declared *before* `state` so Rust drops it first (fields drop in
-    /// declaration order): the `.symbol-dict` write handle is closed before
-    /// `state`'s runner is joined and its slot lock -- the cross-process guard on
-    /// this slot -- is released, so the OS file handle never outlives the lock that
-    /// guards it. Mirrors the row path, where the encoder owning this handle is
-    /// declared ahead of the runner.
-    persisted_symbol_dict: Option<PersistedSymbolDict>,
+struct SfaBackend {
+    /// Owns the retained payload and the one in-memory/persisted symbol namespace
+    /// shared by every pooled encoder. Declared before `state` so its side-file
+    /// handle closes before the runner releases the slot lock.
+    foreground: SfaForegroundPublisher,
     state: SyncQwpWsHandlerState,
-    symbol_dict: SymbolGlobalDict,
-    /// When true, SFA frames carry only the symbol ids new since the previous
-    /// frame (a delta), and the background driver re-registers the whole
-    /// dictionary via a catch-up frame on reconnect. When false, every frame
-    /// re-ships the full dictionary from id 0 (self-sufficient). Determined by
-    /// the store's mode (memory always; file iff the persisted dict opened);
-    /// see [`ColumnSender::new_store_and_forward`].
-    delta_dict_enabled: bool,
+    buffer_scratch: QwpWsEncodeScratch,
     scratch: encoder::EncodeScratch,
-    payload: Vec<u8>,
     max_buf_size: usize,
     request_durable_ack: bool,
     /// No-progress deadline for the `sync` poll loop. Mirrors the direct
@@ -263,55 +232,28 @@ struct SfaColumnBackend {
     drop_on_return: bool,
 }
 
-impl Debug for ColumnSender {
+impl Debug for PooledSenderCore {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
-        match &self.backend {
-            ColumnSenderBackend::Direct(direct) => f
-                .debug_struct("ColumnSender")
-                .field("mode", &"direct")
-                .field("must_close", &direct.conn.must_close())
-                .field("in_flight", &direct.conn.in_flight())
-                .finish(),
-            ColumnSenderBackend::StoreAndForward(sfa) => f
-                .debug_struct("ColumnSender")
-                .field("mode", &"store_and_forward")
-                .field(
-                    "must_close",
-                    &(sfa.drop_on_return || qwp_ws_is_terminal_background(&sfa.state)),
-                )
-                .field("in_flight", &0u32)
-                .finish(),
-        }
+        f.debug_struct("PooledSenderCore")
+            .field(
+                "must_close",
+                &(self.backend.drop_on_return
+                    || qwp_ws_is_terminal_background(&self.backend.state)),
+            )
+            .finish()
     }
 }
 
-impl ColumnSender {
-    pub(crate) fn new(
-        conn: ColumnConn,
-        symbol_dict: SymbolGlobalDict,
-        scratch: encoder::EncodeScratch,
-        first_frame_sent: bool,
-    ) -> Self {
-        Self::new_direct(conn, symbol_dict, scratch, first_frame_sent)
+impl Debug for DirectSenderCore {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        f.debug_struct("DirectSenderCore")
+            .field("must_close", &self.backend.conn.must_close())
+            .field("in_flight", &self.backend.conn.in_flight())
+            .finish()
     }
+}
 
-    pub(crate) fn new_direct(
-        conn: ColumnConn,
-        symbol_dict: SymbolGlobalDict,
-        scratch: encoder::EncodeScratch,
-        first_frame_sent: bool,
-    ) -> Self {
-        Self {
-            backend: ColumnSenderBackend::Direct(Box::new(DirectColumnBackend {
-                conn,
-                symbol_dict,
-                scratch,
-                first_frame_sent,
-                commit_since_sync: false,
-            })),
-        }
-    }
-
+impl PooledSenderCore {
     pub(crate) fn new_store_and_forward(
         mut state: SyncQwpWsHandlerState,
         max_buf_size: usize,
@@ -323,82 +265,59 @@ impl ColumnSender {
         // side-file opened), so the two stay in lockstep: both emit delta, or both
         // stay full-dict. In file mode, seed the dictionary from the recovered
         // entries (so new symbols continue above the recovered ids) and claim the
-        // side-file for write-ahead -- the row encoder in this state is dormant for
-        // a column sender, so connect_sfa_background left the side-file for us.
+        // side-file for write-ahead -- the standalone replay encoder in this state
+        // is dormant for the pooled core, so connect_sfa_background left the
+        // side-file for us.
         let delta_dict_enabled = state.delta_dict_enabled;
-        let mut symbol_dict = SymbolGlobalDict::new();
+        let persisted_symbol_dict = state.persisted_symbol_dict.take();
+        let mut foreground = SfaForegroundPublisher::new(delta_dict_enabled, persisted_symbol_dict);
         if delta_dict_enabled {
             // Take the recovered entries so the (potentially large) buffer is freed
             // after seeding rather than living dead in `state` -- which the backend
             // holds for its whole life -- for the connection's duration.
             let recovered = std::mem::take(&mut state.recovered_dict_entries);
-            symbol_dict.seed(&recovered, state.recovered_dict_count)?;
+            foreground.seed(&recovered, state.recovered_dict_count)?;
         }
-        let persisted_symbol_dict = state.persisted_symbol_dict.take();
-        // The row encoder in `state` is dormant for a column sender (we use our own
-        // `symbol_dict` above and never touch it); release the recovered dictionary
-        // seeded into it at connect so it is not carried dead for the connection's
-        // life -- matching the `recovered_dict_entries` take above.
+        // The standalone replay encoder in `state` is dormant for the pooled core
+        // (the foreground above owns the live dictionary); release the recovered
+        // dictionary seeded into it at connect so it is not carried dead for the
+        // connection's life -- matching the `recovered_dict_entries` take above.
         state.release_dormant_encoder_dict();
         Ok(Self {
-            backend: ColumnSenderBackend::StoreAndForward(Box::new(SfaColumnBackend {
+            backend: Box::new(SfaBackend {
+                foreground,
                 state,
-                symbol_dict,
-                delta_dict_enabled,
-                persisted_symbol_dict,
+                buffer_scratch: QwpWsEncodeScratch::new(),
                 scratch: encoder::EncodeScratch::new(),
-                payload: Vec::new(),
                 max_buf_size,
                 request_durable_ack,
                 sync_timeout,
                 last_ok_sync_boundary: None,
                 last_durable_sync_boundary: None,
                 drop_on_return: false,
-            })),
+            }),
         })
-    }
-
-    pub(crate) fn is_store_and_forward(&self) -> bool {
-        matches!(self.backend, ColumnSenderBackend::StoreAndForward(_))
     }
 
     #[must_use]
     pub fn must_close(&self) -> bool {
-        match &self.backend {
-            ColumnSenderBackend::Direct(direct) => direct.conn.must_close(),
-            ColumnSenderBackend::StoreAndForward(sfa) => {
-                sfa.drop_on_return || qwp_ws_is_terminal_background(&sfa.state)
-            }
-        }
+        self.backend.drop_on_return || qwp_ws_is_terminal_background(&self.backend.state)
     }
 
     pub fn mark_must_close(&mut self) {
-        match &mut self.backend {
-            ColumnSenderBackend::Direct(direct) => direct.conn.mark_must_close(),
-            ColumnSenderBackend::StoreAndForward(sfa) => sfa.drop_on_return = true,
-        }
-    }
-
-    pub(crate) fn in_flight(&self) -> u32 {
-        match &self.backend {
-            ColumnSenderBackend::Direct(direct) => direct.conn.in_flight(),
-            ColumnSenderBackend::StoreAndForward(_) => 0,
-        }
+        self.backend.drop_on_return = true;
     }
 
     /// Non-blocking: `true` once the store-and-forward backend has no
     /// undelivered frames — every published frame has reached the pool's ack
     /// watermark (durable when `durable`, otherwise the OK watermark) — so the
     /// connection can be retired without losing data. A terminal backend
-    /// reports `true`: its queued frames are already unrecoverable. Always
-    /// `true` for the direct backend, which owns no background queue.
+    /// reports `true`: its queued frames are already unrecoverable.
     ///
     /// The pool reaper uses this to avoid evicting an idle connection whose
     /// background runner is still flushing.
     pub(crate) fn sfa_fully_delivered(&self, durable: bool) -> bool {
-        let ColumnSenderBackend::StoreAndForward(sfa) = &self.backend else {
-            return true;
-        };
+        let sfa = &self.backend;
         if qwp_ws_is_terminal_background(&sfa.state) {
             return true;
         }
@@ -417,64 +336,90 @@ impl ColumnSender {
 
     /// Non-blocking: stop accepting new store-and-forward publications and wake
     /// the background runner to flush what is queued. Pairs with
-    /// [`Self::drain_to_deadline`]. No-op for the direct backend.
+    /// [`Self::drain_to_deadline`].
     pub(crate) fn begin_close(&self) {
-        if let ColumnSenderBackend::StoreAndForward(sfa) = &self.backend {
-            qwp_ws_begin_close_background(&sfa.state);
-        }
+        qwp_ws_begin_close_background(&self.backend.state);
     }
 
     /// Block until the store-and-forward queue has delivered every published
     /// frame, or `deadline` elapses. `Ok(())` means fully drained (or nothing
     /// was queued); `Err` means the drain timed out or the transport went
-    /// terminal with frames still undelivered. No-op `Ok(())` for the direct
-    /// backend, whose deferred frames are handled by `commit_in_flight_on_drop`.
+    /// terminal with frames still undelivered.
     pub(crate) fn drain_to_deadline(&mut self, deadline: Option<Instant>) -> crate::Result<()> {
-        match &mut self.backend {
-            ColumnSenderBackend::Direct(_) => Ok(()),
-            ColumnSenderBackend::StoreAndForward(sfa) => {
-                qwp_ws_drain_to_deadline_background(&mut sfa.state, deadline)
-            }
-        }
+        qwp_ws_drain_to_deadline_background(&mut self.backend.state, deadline)
     }
 
-    pub(crate) fn transport_dead(&self) -> bool {
-        match &self.backend {
-            ColumnSenderBackend::Direct(direct) => direct.conn.transport_dead(),
-            ColumnSenderBackend::StoreAndForward(_) => false,
-        }
-    }
-
-    pub(crate) fn endpoint_idx(&self) -> Option<usize> {
-        match &self.backend {
-            ColumnSenderBackend::Direct(direct) => Some(direct.conn.endpoint_idx()),
-            ColumnSenderBackend::StoreAndForward(_) => None,
-        }
-    }
-
-    /// Encode and publish `chunk` as a QWP/WebSocket frame **without** waiting
-    /// for a server completion boundary. Call [`Self::sync`] (or use
-    /// [`Self::flush_and_wait`]) to wait for the requested [`AckLevel`].
-    ///
-    /// Frames published by `flush` are not committed until the next
-    /// [`Self::sync`] / [`Self::flush_and_wait`] completes: that ACK boundary is
-    /// the only durability and replay checkpoint. If a later flush or sync fails
-    /// and you reborrow onto a fresh connection, re-drive the source from the
-    /// last successful `sync`, not just the failing `chunk` — every frame
-    /// published since that checkpoint is discarded with the dead connection.
-    ///
-    /// On success `chunk` is cleared. On failure `chunk` is left untouched and
-    /// the data is **not** guaranteed undelivered: a transport error that fails
-    /// mid-frame may already have put bytes on the wire. Such a failure reports
-    /// [`ErrorCode::FailoverRetry`] but tags the error
-    /// [`in_doubt`](crate::Error::in_doubt) — inspect it before re-flushing the
-    /// retained `chunk` on a fresh connection, since replay can duplicate rows.
+    /// Encode and publish `chunk` into the store-and-forward queue without
+    /// waiting for a server completion boundary.
     pub fn flush(&mut self, chunk: &mut Chunk<'_>) -> Result<()> {
-        match &mut self.backend {
-            ColumnSenderBackend::Direct(direct) => direct.flush_inner(chunk, WaitForAck::No),
-            ColumnSenderBackend::StoreAndForward(sfa) => sfa.flush_chunk(chunk, WaitForAck::No),
+        self.backend
+            .flush_chunk(chunk, WaitForAck::No)
+            .map_err(FlushFailure::into_error)
+    }
+
+    /// Encode and publish a QWP/WebSocket row [`Buffer`] into the local
+    /// store-and-forward queue. The buffer is cleared only after local
+    /// publication succeeds.
+    pub fn flush_buffer(&mut self, buffer: &mut Buffer) -> Result<()> {
+        self.flush_buffer_and_get_fsn(buffer).map(|_| ())
+    }
+
+    /// Encode and publish a QWP/WebSocket row [`Buffer`] without clearing it.
+    pub fn flush_buffer_and_keep(&mut self, buffer: &Buffer) -> Result<()> {
+        self.flush_buffer_and_keep_and_get_fsn(buffer).map(|_| ())
+    }
+
+    /// Publish a QWP/WebSocket row [`Buffer`], clear it after local acceptance,
+    /// and return the frame sequence number. Empty buffers publish no frame and
+    /// return `None`.
+    pub fn flush_buffer_and_get_fsn(&mut self, buffer: &mut Buffer) -> Result<Option<u64>> {
+        let fsn = self.publish_buffer(buffer, None)?;
+        buffer.clear();
+        Ok(fsn)
+    }
+
+    /// Publish a QWP/WebSocket row [`Buffer`] without clearing it and return the
+    /// frame sequence number. Empty buffers publish no frame and return `None`.
+    pub fn flush_buffer_and_keep_and_get_fsn(&mut self, buffer: &Buffer) -> Result<Option<u64>> {
+        self.publish_buffer(buffer, None)
+    }
+
+    /// Publish a QWP/WebSocket row [`Buffer`] as a completion boundary, clear
+    /// it after local acceptance, and wait for every prior publication to reach
+    /// `ack_level`. A wait failure after publication still leaves the buffer
+    /// cleared because replay is owned by the store-and-forward queue.
+    pub fn flush_buffer_and_wait(
+        &mut self,
+        buffer: &mut Buffer,
+        ack_level: AckLevel,
+    ) -> Result<()> {
+        let boundary = self.publish_buffer(buffer, Some(ack_level))?;
+        buffer.clear();
+
+        let sfa = &mut self.backend;
+        match boundary {
+            Some(fsn) => sfa
+                .wait_for_boundary(ack_level, fsn, sfa.sync_timeout)
+                .map_err(FlushFailure::DeliveryUnknown)
+                .map_err(FlushFailure::into_error),
+            None => sfa.wait(ack_level, sfa.sync_timeout),
         }
-        .map_err(FlushFailure::into_error)
+    }
+
+    fn publish_buffer(
+        &mut self,
+        buffer: &Buffer,
+        ack_level: Option<AckLevel>,
+    ) -> Result<Option<u64>> {
+        let qwp = buffer.as_qwp_ws().ok_or_else(|| {
+            error::fmt!(
+                InvalidApiCall,
+                "Pooled QWP ingestion requires a QWP/WebSocket buffer created by `QuestDb::new_buffer()`."
+            )
+        })?;
+        self.backend
+            .publish_buffer(qwp, ack_level)
+            .map_err(FlushFailure::into_error)
     }
 
     /// Store-and-forward only: encode and publish `chunk` into the local SFA
@@ -482,21 +427,15 @@ impl ColumnSender {
     /// split into multiple frames, the returned FSN is the final frame boundary;
     /// cumulative ACK coverage of that boundary covers the whole chunk.
     pub fn flush_and_get_fsn(&mut self, chunk: &mut Chunk<'_>) -> Result<Option<u64>> {
-        match &mut self.backend {
-            ColumnSenderBackend::StoreAndForward(sfa) => sfa
-                .flush_chunk_and_get_fsn(chunk)
-                .map(Some)
-                .map_err(FlushFailure::into_error),
-            ColumnSenderBackend::Direct(_) => Err(error::fmt!(
-                InvalidApiCall,
-                "flush_and_get_fsn is store-and-forward only; direct column senders do not expose FSNs."
-            )),
-        }
+        self.backend
+            .flush_chunk_and_get_fsn(chunk)
+            .map(Some)
+            .map_err(FlushFailure::into_error)
     }
 
     /// Publish `chunk` as a completion boundary, then wait until every frame
     /// published before or by this call on this borrowed sender reaches
-    /// `ack_level` (see `doc/COLUMN_SENDER_ACK_BOUNDARY_FLUSH.md`).
+    /// `ack_level`.
     ///
     /// The boundary is cumulative: a successful return means all prior no-wait
     /// flushes plus this one are acknowledged at `ack_level`. An empty `chunk`
@@ -515,15 +454,9 @@ impl ColumnSender {
     /// There is no internal failover retry; replay is the caller's
     /// responsibility.
     pub fn flush_and_wait(&mut self, chunk: &mut Chunk<'_>, ack_level: AckLevel) -> Result<()> {
-        match &mut self.backend {
-            ColumnSenderBackend::Direct(direct) => {
-                direct.flush_inner(chunk, WaitForAck::Yes(ack_level))
-            }
-            ColumnSenderBackend::StoreAndForward(sfa) => {
-                sfa.flush_chunk(chunk, WaitForAck::Yes(ack_level))
-            }
-        }
-        .map_err(FlushFailure::into_error)
+        self.backend
+            .flush_chunk(chunk, WaitForAck::Yes(ack_level))
+            .map_err(FlushFailure::into_error)
     }
 
     /// Encode and publish an Arrow [`RecordBatch`] **without** a per-row
@@ -722,14 +655,8 @@ impl ColumnSender {
         overrides: &[ArrowColumnOverride<'_>],
         wait: WaitForAck,
     ) -> std::result::Result<(), FlushFailure> {
-        match &mut self.backend {
-            ColumnSenderBackend::Direct(direct) => {
-                direct.flush_arrow_batch_inner(table, batch, ts, overrides, wait)
-            }
-            ColumnSenderBackend::StoreAndForward(sfa) => {
-                sfa.flush_arrow_batch(table, batch, ts, overrides, wait)
-            }
-        }
+        self.backend
+            .flush_arrow_batch(table, batch, ts, overrides, wait)
     }
 
     #[cfg(feature = "arrow-ingress")]
@@ -740,27 +667,18 @@ impl ColumnSender {
         ts: ArrowTsSource,
         overrides: &[ArrowColumnOverride<'_>],
     ) -> std::result::Result<Option<u64>, FlushFailure> {
-        match &mut self.backend {
-            ColumnSenderBackend::StoreAndForward(sfa) => sfa
-                .flush_arrow_batch_and_get_fsn(table, batch, ts, overrides)
-                .map(Some),
-            ColumnSenderBackend::Direct(_) => Err(FlushFailure::NotDelivered(error::fmt!(
-                InvalidApiCall,
-                "flush_arrow_batch_*_and_get_fsn is store-and-forward only; direct column senders do not expose FSNs."
-            ))),
-        }
+        self.backend
+            .flush_arrow_batch_and_get_fsn(table, batch, ts, overrides)
+            .map(Some)
     }
 
     /// Preflight ACK-level validation for the C FFI ACKing-flush entry points.
     /// Run before the Arrow C Data Interface import consumes `array->release`
     /// (and before chunk encode), so a rejected `AckLevel::Durable` leaves
-    /// caller-owned input untouched. Dispatches per backend.
+    /// caller-owned input untouched.
     #[doc(hidden)]
     pub fn validate_ack_level(&self, ack_level: AckLevel) -> Result<()> {
-        match &self.backend {
-            ColumnSenderBackend::Direct(direct) => direct.conn.validate_ack_level(ack_level),
-            ColumnSenderBackend::StoreAndForward(sfa) => sfa.validate_ack_level(ack_level),
-        }
+        self.backend.validate_ack_level(ack_level)
     }
 
     /// FFI-only ACKing Arrow flush (server-stamped) that surfaces the
@@ -809,10 +727,7 @@ impl ColumnSender {
     }
 
     pub fn sync(&mut self, ack_level: AckLevel) -> Result<()> {
-        match &mut self.backend {
-            ColumnSenderBackend::Direct(direct) => direct.sync(ack_level),
-            ColumnSenderBackend::StoreAndForward(sfa) => sfa.sync(ack_level),
-        }
+        self.backend.sync(ack_level)
     }
 
     /// Store-and-forward only: wait up to `timeout` for every frame published
@@ -822,39 +737,243 @@ impl ColumnSender {
     /// [`ErrorCode::FailoverRetry`](crate::ErrorCode::FailoverRetry)
     /// error and the queued frames are retained for replay.
     pub fn wait(&mut self, ack_level: AckLevel, timeout: Duration) -> Result<()> {
-        match &mut self.backend {
-            ColumnSenderBackend::StoreAndForward(sfa) => sfa.wait(ack_level, timeout),
-            ColumnSenderBackend::Direct(_) => Err(error::fmt!(
-                InvalidApiCall,
-                "wait(timeout) is store-and-forward only; the direct sender uses commit()."
-            )),
-        }
+        self.backend.wait(ack_level, timeout)
     }
 
     /// Store-and-forward only: return the highest frame sequence number
     /// published locally by this sender, or `None` if no frame has been
     /// published.
     pub fn published_fsn(&self) -> Result<Option<u64>> {
-        match &self.backend {
-            ColumnSenderBackend::StoreAndForward(sfa) => sfa.published_fsn(),
-            ColumnSenderBackend::Direct(_) => Err(error::fmt!(
-                InvalidApiCall,
-                "published_fsn is store-and-forward only; direct column senders do not expose FSNs."
-            )),
-        }
+        self.backend.published_fsn()
     }
 
     /// Store-and-forward only: return the highest frame sequence number
     /// completed by server ACK or server-side reject-and-continue, or `None`
     /// if no frame has completed.
     pub fn acked_fsn(&self) -> Result<Option<u64>> {
-        match &self.backend {
-            ColumnSenderBackend::StoreAndForward(sfa) => sfa.acked_fsn(),
-            ColumnSenderBackend::Direct(_) => Err(error::fmt!(
-                InvalidApiCall,
-                "acked_fsn is store-and-forward only; direct column senders do not expose FSNs."
-            )),
+        self.backend.acked_fsn()
+    }
+}
+
+impl DirectSenderCore {
+    pub(crate) fn new(
+        conn: ColumnConn,
+        symbol_dict: SymbolGlobalDict,
+        scratch: encoder::EncodeScratch,
+        first_frame_sent: bool,
+    ) -> Self {
+        Self {
+            backend: Box::new(DirectColumnBackend {
+                conn,
+                symbol_dict,
+                scratch,
+                first_frame_sent,
+                commit_since_sync: false,
+            }),
         }
+    }
+
+    #[must_use]
+    pub fn must_close(&self) -> bool {
+        self.backend.conn.must_close()
+    }
+
+    pub fn mark_must_close(&mut self) {
+        self.backend.conn.mark_must_close();
+    }
+
+    pub(crate) fn in_flight(&self) -> u32 {
+        self.backend.conn.in_flight()
+    }
+
+    pub(crate) fn transport_dead(&self) -> bool {
+        self.backend.conn.transport_dead()
+    }
+
+    pub(crate) fn endpoint_idx(&self) -> usize {
+        self.backend.conn.endpoint_idx()
+    }
+
+    pub fn flush(&mut self, chunk: &mut Chunk<'_>) -> Result<()> {
+        self.backend
+            .flush_inner(chunk, WaitForAck::No)
+            .map_err(FlushFailure::into_error)
+    }
+
+    pub fn flush_and_wait(&mut self, chunk: &mut Chunk<'_>, ack_level: AckLevel) -> Result<()> {
+        self.backend
+            .flush_inner(chunk, WaitForAck::Yes(ack_level))
+            .map_err(FlushFailure::into_error)
+    }
+
+    #[cfg(feature = "arrow-ingress")]
+    pub fn flush_arrow_batch_at_now<'t, T>(
+        &mut self,
+        table: T,
+        batch: &RecordBatch,
+        overrides: &[ArrowColumnOverride<'_>],
+    ) -> Result<()>
+    where
+        T: TryInto<TableName<'t>>,
+        crate::Error: From<T::Error>,
+    {
+        let table: TableName<'t> = table.try_into()?;
+        self.backend
+            .flush_arrow_batch_inner(
+                table,
+                batch,
+                ArrowTsSource::ServerNow,
+                overrides,
+                WaitForAck::No,
+            )
+            .map_err(FlushFailure::into_error)
+    }
+
+    #[cfg(feature = "arrow-ingress")]
+    pub fn flush_arrow_batch_at_column<'t, T>(
+        &mut self,
+        table: T,
+        batch: &RecordBatch,
+        ts_column: ColumnName<'_>,
+        overrides: &[ArrowColumnOverride<'_>],
+    ) -> Result<()>
+    where
+        T: TryInto<TableName<'t>>,
+        crate::Error: From<T::Error>,
+    {
+        let table: TableName<'t> = table.try_into()?;
+        let ts_col_idx = arrow_batch::resolve_ts_column(batch, ts_column)?;
+        self.backend
+            .flush_arrow_batch_inner(
+                table,
+                batch,
+                ArrowTsSource::Column(ts_col_idx),
+                overrides,
+                WaitForAck::No,
+            )
+            .map_err(FlushFailure::into_error)
+    }
+
+    #[cfg(feature = "arrow-ingress")]
+    pub fn flush_arrow_batch_at_scalar_nanos<'t, T>(
+        &mut self,
+        table: T,
+        batch: &RecordBatch,
+        nanos: i64,
+        overrides: &[ArrowColumnOverride<'_>],
+    ) -> Result<()>
+    where
+        T: TryInto<TableName<'t>>,
+        crate::Error: From<T::Error>,
+    {
+        let table: TableName<'t> = table.try_into()?;
+        self.backend
+            .flush_arrow_batch_inner(
+                table,
+                batch,
+                ArrowTsSource::ScalarNanos(nanos),
+                overrides,
+                WaitForAck::No,
+            )
+            .map_err(FlushFailure::into_error)
+    }
+
+    #[cfg(feature = "arrow-ingress")]
+    pub fn flush_arrow_batch_at_now_and_wait<'t, T>(
+        &mut self,
+        table: T,
+        batch: &RecordBatch,
+        overrides: &[ArrowColumnOverride<'_>],
+        ack_level: AckLevel,
+    ) -> Result<()>
+    where
+        T: TryInto<TableName<'t>>,
+        crate::Error: From<T::Error>,
+    {
+        let table: TableName<'t> = table.try_into()?;
+        self.backend
+            .flush_arrow_batch_inner(
+                table,
+                batch,
+                ArrowTsSource::ServerNow,
+                overrides,
+                WaitForAck::Yes(ack_level),
+            )
+            .map_err(FlushFailure::into_error)
+    }
+
+    #[cfg(feature = "arrow-ingress")]
+    pub fn flush_arrow_batch_at_column_and_wait<'t, T>(
+        &mut self,
+        table: T,
+        batch: &RecordBatch,
+        ts_column: ColumnName<'_>,
+        overrides: &[ArrowColumnOverride<'_>],
+        ack_level: AckLevel,
+    ) -> Result<()>
+    where
+        T: TryInto<TableName<'t>>,
+        crate::Error: From<T::Error>,
+    {
+        let table: TableName<'t> = table.try_into()?;
+        let ts_col_idx = arrow_batch::resolve_ts_column(batch, ts_column)?;
+        self.backend
+            .flush_arrow_batch_inner(
+                table,
+                batch,
+                ArrowTsSource::Column(ts_col_idx),
+                overrides,
+                WaitForAck::Yes(ack_level),
+            )
+            .map_err(FlushFailure::into_error)
+    }
+
+    #[doc(hidden)]
+    pub fn validate_ack_level(&self, ack_level: AckLevel) -> Result<()> {
+        self.backend.conn.validate_ack_level(ack_level)
+    }
+
+    #[doc(hidden)]
+    #[cfg(feature = "arrow-ingress")]
+    pub fn flush_arrow_batch_at_now_and_wait_ffi(
+        &mut self,
+        table: TableName<'_>,
+        batch: &RecordBatch,
+        overrides: &[ArrowColumnOverride<'_>],
+        ack_level: AckLevel,
+    ) -> std::result::Result<(), FlushFailure> {
+        self.backend.flush_arrow_batch_inner(
+            table,
+            batch,
+            ArrowTsSource::ServerNow,
+            overrides,
+            WaitForAck::Yes(ack_level),
+        )
+    }
+
+    #[doc(hidden)]
+    #[cfg(feature = "arrow-ingress")]
+    pub fn flush_arrow_batch_at_column_and_wait_ffi(
+        &mut self,
+        table: TableName<'_>,
+        batch: &RecordBatch,
+        ts_column: ColumnName<'_>,
+        overrides: &[ArrowColumnOverride<'_>],
+        ack_level: AckLevel,
+    ) -> std::result::Result<(), FlushFailure> {
+        let ts_col_idx =
+            arrow_batch::resolve_ts_column(batch, ts_column).map_err(FlushFailure::NotDelivered)?;
+        self.backend.flush_arrow_batch_inner(
+            table,
+            batch,
+            ArrowTsSource::Column(ts_col_idx),
+            overrides,
+            WaitForAck::Yes(ack_level),
+        )
+    }
+
+    pub fn sync(&mut self, ack_level: AckLevel) -> Result<()> {
+        self.backend.sync(ack_level)
     }
 }
 
@@ -1266,7 +1385,7 @@ impl DirectColumnBackend {
     }
 }
 
-impl SfaColumnBackend {
+impl SfaBackend {
     /// Lifted out of [`Self::sync`] so an ACKing flush can reject a
     /// durable-without-opt-in request *before* encode mutates the symbol dict
     /// or the Arrow import consumes the caller's array.
@@ -1279,6 +1398,57 @@ impl SfaColumnBackend {
             ));
         }
         Ok(())
+    }
+
+    fn publish_buffer(
+        &mut self,
+        buffer: &QwpWsColumnarBuffer,
+        ack_level: Option<AckLevel>,
+    ) -> std::result::Result<Option<u64>, FlushFailure> {
+        if let Some(level) = ack_level {
+            self.validate_ack_level(level)
+                .map_err(FlushFailure::NotDelivered)?;
+        }
+        if let Err(err) = qwp_ws_check_error_background(&self.state) {
+            return Err(FlushFailure::NotDelivered(err));
+        }
+        if buffer.is_empty() {
+            return Ok(None);
+        }
+
+        let max_buf_size = self.effective_max_buf_size();
+        let Self {
+            foreground,
+            state,
+            buffer_scratch,
+            ..
+        } = self;
+        match foreground
+            .encode_persist_publish(
+                max_buf_size,
+                |payload, symbol_dict, delta_enabled| {
+                    buffer.encode_ws_replay_message_with_defer(
+                        payload,
+                        buffer_scratch,
+                        symbol_dict,
+                        super::wire::QWP_VERSION_1,
+                        false,
+                        delta_enabled,
+                    )
+                },
+                |payload| publish_qwp_ws_payload_background(state, payload, max_buf_size),
+            )
+            .map_err(FlushFailure::NotDelivered)?
+        {
+            SfaPublishOutcome::Published(fsn) => Ok(Some(fsn)),
+            SfaPublishOutcome::TooLarge {
+                encoded_len,
+                max_buf_size,
+            } => Err(FlushFailure::NotDelivered(qwp_frame_size_error(
+                encoded_len,
+                max_buf_size,
+            ))),
+        }
     }
 
     fn flush_chunk(
@@ -1320,8 +1490,12 @@ impl SfaColumnBackend {
         // frames are not individually self-sufficient; the driver re-registers the
         // dictionary via a catch-up frame on reconnect.)
         let boundary = match self.publish_chunk_sfa(chunk, None, max_buf_size)? {
-            SfaOutcome::Published(fsn) => fsn,
-            SfaOutcome::TooLarge(err) => {
+            SfaPublishOutcome::Published(fsn) => fsn,
+            SfaPublishOutcome::TooLarge {
+                encoded_len,
+                max_buf_size,
+            } => {
+                let err = qwp_frame_size_error(encoded_len, max_buf_size);
                 let row_count = chunk.row_count();
                 match split_mid(row_count) {
                     Some(mid) => {
@@ -1345,214 +1519,16 @@ impl SfaColumnBackend {
         Ok(boundary)
     }
 
-    /// Rolls the in-memory dictionary and its persisted side-file back to the
-    /// marks taken at the top of a frame's publish, discarding any symbols that
-    /// frame introduced. Keeps the side-file an exact mirror of the in-memory
-    /// dictionary, so an id the next frame reuses never maps to an abandoned
-    /// symbol on recovery. If the side-file truncate fails (a failing disk),
-    /// [`PersistedSymbolDict::rollback`] poisons the on-disk file so recovery
-    /// starts fresh (the torn-dict guard then fails loudly) instead of silently
-    /// aliasing the reused id; drop the handle so this slot stops persisting.
-    ///
-    /// Dropping the handle also disables delta encoding for subsequent frames: with
-    /// no side-file to write symbols ahead to, a delta frame appended from here on
-    /// would be unrecoverable after a restart (its base ids are gone from the
-    /// poisoned side-file). Falling back to dense (self-sufficient) frames keeps
-    /// everything ingested from here on crash-recoverable without the side-file.
-    ///
-    /// The background driver's send mirror lives on the I/O thread and cannot be
-    /// reached from here, so it stays enabled while the foreground goes dense. That is
-    /// safe: the dense frames base at id 0 and re-ship the whole dictionary, which the
-    /// torn-dict guard accepts as an idempotent overlap of the mirrored prefix (see
-    /// `guard_dict_not_torn` in `qwp_ws_driver`) and `accumulate` keeps in lockstep.
-    ///
-    /// Takes the symbol fields by disjoint borrow (not `&mut self`) so
-    /// [`Self::encode_persist_publish_chunk`] can roll back while the transport
-    /// `state` is separately borrowed by its publish closure. Mirrors the row path's
-    /// `QwpWsReplayEncoder::rollback_frame`.
-    fn rollback_symbol_frame(
-        symbol_dict: &mut SymbolGlobalDict,
-        persisted_symbol_dict: &mut Option<PersistedSymbolDict>,
-        delta_dict_enabled: &mut bool,
-        dict_mark: SymbolGlobalDictMark,
-        pd_mark: Option<PersistedSymbolDictMark>,
-    ) {
-        symbol_dict.rollback(dict_mark);
-        if let Some(mark) = pd_mark {
-            let truncate_failed = persisted_symbol_dict
-                .as_mut()
-                .is_some_and(|pd| pd.rollback(mark).is_err());
-            if truncate_failed {
-                *persisted_symbol_dict = None;
-                *delta_dict_enabled = false;
-            }
-        }
-    }
-
-    /// `&mut self` wrapper over [`Self::rollback_symbol_frame`] for the Arrow
-    /// publish path, which is not structured around a publish closure.
-    #[cfg(feature = "arrow-ingress")]
-    fn rollback_frame(
-        &mut self,
-        dict_mark: SymbolGlobalDictMark,
-        pd_mark: Option<PersistedSymbolDictMark>,
-    ) {
-        Self::rollback_symbol_frame(
-            &mut self.symbol_dict,
-            &mut self.persisted_symbol_dict,
-            &mut self.delta_dict_enabled,
-            dict_mark,
-            pd_mark,
-        );
-    }
-
-    /// Write-ahead: appends the symbols `[from_id, next_id)` this frame introduced
-    /// to the persisted side-file before the frame is published, so a recovered /
-    /// orphan-drained slot can rebuild the dictionary its (non-self-sufficient)
-    /// delta frame references. No-op in memory mode (no side-file). Takes the symbol
-    /// fields by disjoint borrow so it composes with the transport-free
-    /// [`Self::encode_persist_publish_chunk`].
-    fn persist_new_symbols_into(
-        symbol_dict: &SymbolGlobalDict,
-        persisted_symbol_dict: &mut Option<PersistedSymbolDict>,
-        from_id: u64,
-    ) -> crate::Result<()> {
-        let Some(pd) = persisted_symbol_dict.as_mut() else {
-            return Ok(());
-        };
-        // Gather the frame's new symbols, then write them ahead in one batched
-        // write_all rather than one alloc + one write() syscall per symbol.
-        let mut new_symbols: Vec<&[u8]> = Vec::new();
-        for id in from_id..symbol_dict.next_id() {
-            let bytes = symbol_dict.entry(id).ok_or_else(|| {
-                error::fmt!(
-                    SocketError,
-                    "internal: missing symbol id {} for persistence",
-                    id
-                )
-            })?;
-            new_symbols.push(bytes);
-        }
-        pd.append_symbols(&new_symbols)
-            .map_err(|e| error::fmt!(SocketError, "could not persist symbols: {}", e))?;
-        Ok(())
-    }
-
-    /// `&mut self` wrapper over [`Self::persist_new_symbols_into`] for the Arrow
-    /// publish path.
-    #[cfg(feature = "arrow-ingress")]
-    fn persist_new_symbols(&mut self, from_id: u64) -> crate::Result<()> {
-        Self::persist_new_symbols_into(&self.symbol_dict, &mut self.persisted_symbol_dict, from_id)
-    }
-
-    /// Transport-free core of [`Self::publish_chunk_sfa`]: mark the dictionary and
-    /// side-file, encode `target`, size-check it, write-ahead its new symbols, then
-    /// hand the payload to `publish`. On **any** failure (encode / size / persist /
-    /// publish) the dictionary and side-file are rolled back together via
-    /// [`Self::rollback_symbol_frame`], so the aborted frame's symbol ids are freed
-    /// and reused by the next frame instead of running one step ahead of the
-    /// driver's send mirror (which only advances on a successful send) and tripping
-    /// the torn-dict guard.
-    ///
-    /// The symbol fields are passed as disjoint borrows rather than `&mut self` so
-    /// the caller can lend the transport `state` to the `publish` closure without a
-    /// borrow conflict; that separation is also what makes this write-ahead/rollback
-    /// lockstep unit-testable with a synthetic `publish` (see the tests), mirroring
-    /// the row path's `QwpWsReplayEncoder::encode_and_publish`.
-    #[allow(clippy::too_many_arguments)]
-    fn encode_persist_publish_chunk(
-        payload: &mut Vec<u8>,
-        scratch: &mut encoder::EncodeScratch,
-        symbol_dict: &mut SymbolGlobalDict,
-        persisted_symbol_dict: &mut Option<PersistedSymbolDict>,
-        delta_dict_enabled: &mut bool,
-        target: &Chunk<'_>,
-        max_buf_size: usize,
-        publish: impl FnOnce(&[u8]) -> std::result::Result<u64, FlushFailure>,
-    ) -> std::result::Result<SfaOutcome, FlushFailure> {
-        payload.clear();
-        let dict_mark = symbol_dict.mark();
-        let dict_len_before = symbol_dict.next_id();
-        let pd_mark = persisted_symbol_dict.as_ref().map(|pd| pd.mark());
-        // Delta mode ships only the ids new since the previous frame; the driver
-        // re-registers the full dictionary on reconnect. Dense mode re-ships the
-        // whole dictionary from id 0 so every stored frame is self-sufficient. Both
-        // commit on their own (never deferred): the SFA queue is frame-granular and
-        // at-least-once.
-        let encoded = if *delta_dict_enabled {
-            encoder::encode_chunk_into(payload, target, symbol_dict, scratch, false)
-        } else {
-            encoder::encode_chunk_replay_into(payload, target, symbol_dict, scratch)
-        };
-        if let Err(e) = encoded {
-            Self::rollback_symbol_frame(
-                symbol_dict,
-                persisted_symbol_dict,
-                delta_dict_enabled,
-                dict_mark,
-                pd_mark,
-            );
-            return Err(FlushFailure::NotDelivered(e));
-        }
-        if payload.len() > max_buf_size {
-            Self::rollback_symbol_frame(
-                symbol_dict,
-                persisted_symbol_dict,
-                delta_dict_enabled,
-                dict_mark,
-                pd_mark,
-            );
-            return Ok(SfaOutcome::TooLarge(error::fmt!(
-                BatchTooLarge,
-                "QWP frame ({} bytes) exceeds max_buf_size ({} bytes)",
-                payload.len(),
-                max_buf_size
-            )));
-        }
-        // Write-ahead the frame's new symbols before publishing (file mode); on any
-        // failure roll the dictionary and side-file back together so the next frame
-        // reuses the freed ids without desyncing recovery.
-        if let Err(e) =
-            Self::persist_new_symbols_into(symbol_dict, persisted_symbol_dict, dict_len_before)
-        {
-            Self::rollback_symbol_frame(
-                symbol_dict,
-                persisted_symbol_dict,
-                delta_dict_enabled,
-                dict_mark,
-                pd_mark,
-            );
-            return Err(FlushFailure::NotDelivered(e));
-        }
-        // Local append is atomic: a failed append did not accept the frame
-        // (`NotDelivered`); the returned FSN is the boundary to wait for.
-        match publish(payload) {
-            Ok(fsn) => Ok(SfaOutcome::Published(fsn)),
-            Err(e) => {
-                Self::rollback_symbol_frame(
-                    symbol_dict,
-                    persisted_symbol_dict,
-                    delta_dict_enabled,
-                    dict_mark,
-                    pd_mark,
-                );
-                Err(e)
-            }
-        }
-    }
-
     /// Encode `range` (`None` = whole chunk, no slice allocation) as a replay
     /// frame, check it against the cap, and append it to the queue. Returns
-    /// [`SfaOutcome::TooLarge`] (nothing queued, dict rolled back) when the frame
-    /// exceeds the cap so the caller can split. The write-ahead/rollback lockstep
-    /// lives in the transport-free [`Self::encode_persist_publish_chunk`]; this
-    /// wrapper only resolves the row range and lends it the real background publish.
+    /// [`SfaPublishOutcome::TooLarge`] (nothing queued, dict rolled back) when the
+    /// frame exceeds the cap so the caller can split.
     fn publish_chunk_sfa(
         &mut self,
         chunk: &Chunk<'_>,
         range: Option<(usize, usize)>,
         max_buf_size: usize,
-    ) -> std::result::Result<SfaOutcome, FlushFailure> {
+    ) -> std::result::Result<SfaPublishOutcome, FlushFailure> {
         let view;
         let target = match range {
             None => chunk,
@@ -1563,26 +1539,23 @@ impl SfaColumnBackend {
         };
         let Self {
             state,
-            symbol_dict,
-            persisted_symbol_dict,
-            delta_dict_enabled,
+            foreground,
             scratch,
-            payload,
             ..
         } = self;
-        Self::encode_persist_publish_chunk(
-            payload,
-            scratch,
-            symbol_dict,
-            persisted_symbol_dict,
-            delta_dict_enabled,
-            target,
-            max_buf_size,
-            |encoded| {
-                publish_qwp_ws_payload_background(state, encoded, max_buf_size)
-                    .map_err(FlushFailure::NotDelivered)
-            },
-        )
+        foreground
+            .encode_persist_publish(
+                max_buf_size,
+                |payload, symbol_dict, delta_enabled| {
+                    if delta_enabled {
+                        encoder::encode_chunk_into(payload, target, symbol_dict, scratch, false)
+                    } else {
+                        encoder::encode_chunk_replay_into(payload, target, symbol_dict, scratch)
+                    }
+                },
+                |encoded| publish_qwp_ws_payload_background(state, encoded, max_buf_size),
+            )
+            .map_err(FlushFailure::NotDelivered)
     }
 
     /// Append rows `[row_offset, row_offset + row_count)`, halving the range
@@ -1595,14 +1568,20 @@ impl SfaColumnBackend {
         max_buf_size: usize,
     ) -> std::result::Result<u64, FlushFailure> {
         match self.publish_chunk_sfa(chunk, Some((row_offset, row_count)), max_buf_size)? {
-            SfaOutcome::Published(fsn) => Ok(fsn),
-            SfaOutcome::TooLarge(err) => match split_mid(row_count) {
+            SfaPublishOutcome::Published(fsn) => Ok(fsn),
+            SfaPublishOutcome::TooLarge {
+                encoded_len,
+                max_buf_size,
+            } => match split_mid(row_count) {
                 Some(mid) => {
                     self.publish_split_sfa(chunk, row_offset, mid, max_buf_size)?;
                     self.publish_split_sfa(chunk, row_offset + mid, row_count - mid, max_buf_size)
                         .map_err(deny_retry_after_partial)
                 }
-                None => Err(FlushFailure::NotDelivered(err)),
+                None => Err(FlushFailure::NotDelivered(qwp_frame_size_error(
+                    encoded_len,
+                    max_buf_size,
+                ))),
             },
         }
     }
@@ -1657,8 +1636,12 @@ impl SfaColumnBackend {
         // Whole-batch fast path; split into self-sufficient frames only when one
         // exceeds the cap (see the rationale on `flush_chunk`).
         let boundary = match self.publish_arrow_sfa(&spec, None, max_buf_size)? {
-            SfaOutcome::Published(fsn) => fsn,
-            SfaOutcome::TooLarge(err) => {
+            SfaPublishOutcome::Published(fsn) => fsn,
+            SfaPublishOutcome::TooLarge {
+                encoded_len,
+                max_buf_size,
+            } => {
+                let err = qwp_frame_size_error(encoded_len, max_buf_size);
                 let row_count = batch.num_rows();
                 match split_mid(row_count) {
                     Some(mid) => {
@@ -1685,11 +1668,7 @@ impl SfaColumnBackend {
         spec: &ArrowFrameSpec<'_>,
         range: Option<(usize, usize)>,
         max_buf_size: usize,
-    ) -> std::result::Result<SfaOutcome, FlushFailure> {
-        self.payload.clear();
-        let dict_mark = self.symbol_dict.mark();
-        let dict_len_before = self.symbol_dict.next_id();
-        let pd_mark = self.persisted_symbol_dict.as_ref().map(|pd| pd.mark());
+    ) -> std::result::Result<SfaPublishOutcome, FlushFailure> {
         let sliced;
         let batch = match range {
             None => spec.batch,
@@ -1698,52 +1677,37 @@ impl SfaColumnBackend {
                 &sliced
             }
         };
-        let encoded = if self.delta_dict_enabled {
-            arrow_batch::encode_arrow_batch_into(
-                &mut self.payload,
-                spec.table,
-                batch,
-                spec.ts,
-                spec.overrides,
-                &mut self.symbol_dict,
-                false,
+        let Self {
+            state, foreground, ..
+        } = self;
+        foreground
+            .encode_persist_publish(
+                max_buf_size,
+                |payload, symbol_dict, delta_enabled| {
+                    if delta_enabled {
+                        arrow_batch::encode_arrow_batch_into(
+                            payload,
+                            spec.table,
+                            batch,
+                            spec.ts,
+                            spec.overrides,
+                            symbol_dict,
+                            false,
+                        )
+                    } else {
+                        arrow_batch::encode_arrow_batch_replay_into(
+                            payload,
+                            spec.table,
+                            batch,
+                            spec.ts,
+                            spec.overrides,
+                            symbol_dict,
+                        )
+                    }
+                },
+                |payload| publish_qwp_ws_payload_background(state, payload, max_buf_size),
             )
-        } else {
-            arrow_batch::encode_arrow_batch_replay_into(
-                &mut self.payload,
-                spec.table,
-                batch,
-                spec.ts,
-                spec.overrides,
-                &mut self.symbol_dict,
-            )
-        };
-        if let Err(e) = encoded {
-            self.rollback_frame(dict_mark, pd_mark);
-            return Err(FlushFailure::NotDelivered(e));
-        }
-        if self.payload.len() > max_buf_size {
-            self.rollback_frame(dict_mark, pd_mark);
-            return Ok(SfaOutcome::TooLarge(error::fmt!(
-                BatchTooLarge,
-                "QWP frame ({} bytes) exceeds max_buf_size ({} bytes)",
-                self.payload.len(),
-                max_buf_size
-            )));
-        }
-        // Write-ahead the frame's new symbols before publishing (file mode); see
-        // publish_chunk_sfa.
-        if let Err(e) = self.persist_new_symbols(dict_len_before) {
-            self.rollback_frame(dict_mark, pd_mark);
-            return Err(FlushFailure::NotDelivered(e));
-        }
-        match publish_qwp_ws_payload_background(&mut self.state, &self.payload, max_buf_size) {
-            Ok(fsn) => Ok(SfaOutcome::Published(fsn)),
-            Err(e) => {
-                self.rollback_frame(dict_mark, pd_mark);
-                Err(FlushFailure::NotDelivered(e))
-            }
-        }
+            .map_err(FlushFailure::NotDelivered)
     }
 
     /// Arrow counterpart of [`Self::publish_split_sfa`]. Returns the last
@@ -1757,8 +1721,11 @@ impl SfaColumnBackend {
         max_buf_size: usize,
     ) -> std::result::Result<u64, FlushFailure> {
         match self.publish_arrow_sfa(spec, Some((row_offset, row_count)), max_buf_size)? {
-            SfaOutcome::Published(fsn) => Ok(fsn),
-            SfaOutcome::TooLarge(err) => match split_mid(row_count) {
+            SfaPublishOutcome::Published(fsn) => Ok(fsn),
+            SfaPublishOutcome::TooLarge {
+                encoded_len,
+                max_buf_size,
+            } => match split_mid(row_count) {
                 Some(mid) => {
                     self.publish_arrow_split_sfa(spec, row_offset, mid, max_buf_size)?;
                     self.publish_arrow_split_sfa(
@@ -1769,7 +1736,10 @@ impl SfaColumnBackend {
                     )
                     .map_err(deny_retry_after_partial)
                 }
-                None => Err(FlushFailure::NotDelivered(err)),
+                None => Err(FlushFailure::NotDelivered(qwp_frame_size_error(
+                    encoded_len,
+                    max_buf_size,
+                ))),
             },
         }
     }
@@ -1972,189 +1942,5 @@ mod tests {
         let still = deny_retry_after_partial(du);
         assert!(!still.is_not_delivered());
         assert!(still.into_error().in_doubt());
-    }
-
-    // Builds a one-row chunk whose single symbol column references the sole
-    // dictionary entry `sym`, so each successive frame interns exactly one new
-    // symbol into the connection-scoped global dictionary.
-    #[cfg(test)]
-    fn one_symbol_chunk<'a>(
-        codes: &'a [i32],
-        offsets: &'a [i32],
-        ts: &'a [i64],
-        sym: &'a [u8],
-    ) -> super::Chunk<'a> {
-        let mut chunk = super::Chunk::new("trades");
-        chunk.symbol_i32("sym", codes, offsets, sym, None).unwrap();
-        chunk.at_nanos(ts).unwrap();
-        chunk
-    }
-
-    #[test]
-    fn column_sfa_write_ahead_rolls_back_dict_and_side_file_when_publish_fails() {
-        // The *column* SFA path's write-ahead + rollback lockstep (the primary
-        // QWP/WS store-and-forward path; the row encoder is dormant for it). A
-        // transient, recoverable publish failure must roll BOTH the in-memory
-        // dictionary and the persisted side-file back together, so the aborted
-        // frame's symbol id is reused by the next frame -- never left one step ahead
-        // of the driver's send mirror (which only advances on a successful send),
-        // which would trip the torn-dict guard and strand the whole queue. The
-        // column twin of the row path's
-        // `encode_and_publish_rolls_back_dict_when_publish_fails` (qwp_ws_publisher),
-        // additionally asserting the *side-file* rolls back in lockstep and mirrors
-        // the live dictionary on reopen.
-        use super::{FlushFailure, SfaColumnBackend, SfaOutcome};
-        use crate::ErrorCode;
-        use crate::error;
-        use crate::ingress::buffer::SymbolGlobalDict;
-        use crate::ingress::sender::qwp_ws_sfa_symbol_dict::PersistedSymbolDict;
-
-        let dir = tempfile::tempdir().unwrap();
-        let mut dict = SymbolGlobalDict::new();
-        let mut pd = Some(PersistedSymbolDict::open(dir.path()).unwrap());
-        let mut delta = true;
-        let mut scratch = super::encoder::EncodeScratch::new();
-        let mut payload = Vec::new();
-        let codes = [0i32];
-        let offsets = [0i32, 2];
-
-        // Frame 1: "S0" -> id 0, published OK; lands in dict + side-file.
-        let chunk = one_symbol_chunk(&codes, &offsets, &[1i64], b"S0");
-        let out = SfaColumnBackend::encode_persist_publish_chunk(
-            &mut payload,
-            &mut scratch,
-            &mut dict,
-            &mut pd,
-            &mut delta,
-            &chunk,
-            usize::MAX,
-            |_| Ok(1),
-        )
-        .unwrap();
-        assert!(matches!(out, SfaOutcome::Published(1)));
-        assert_eq!(dict.next_id(), 1);
-        assert_eq!(dict.entry(0), Some(&b"S0"[..]));
-        assert_eq!(pd.as_ref().unwrap().size(), 1);
-
-        // Frame 2: "S1" would be id 1, but the publish fails -> the dict AND the
-        // side-file must roll back so "S1" leaves no trace.
-        let chunk = one_symbol_chunk(&codes, &offsets, &[2i64], b"S1");
-        let err = SfaColumnBackend::encode_persist_publish_chunk(
-            &mut payload,
-            &mut scratch,
-            &mut dict,
-            &mut pd,
-            &mut delta,
-            &chunk,
-            usize::MAX,
-            |_| {
-                Err(FlushFailure::NotDelivered(error::fmt!(
-                    SocketError,
-                    "simulated back-pressure"
-                )))
-            },
-        )
-        .unwrap_err();
-        assert!(err.is_not_delivered());
-        assert_eq!(err.into_error().code(), ErrorCode::SocketError);
-        assert_eq!(
-            dict.next_id(),
-            1,
-            "a failed publish must roll the dict back so ids are reused, not skipped"
-        );
-        assert_eq!(
-            pd.as_ref().unwrap().size(),
-            1,
-            "the side-file must roll back in lockstep with the dict"
-        );
-        assert!(delta, "a clean rollback must leave delta enabled");
-
-        // Frame 3: "S2" must REUSE the freed id 1 in both dict and side-file.
-        let chunk = one_symbol_chunk(&codes, &offsets, &[3i64], b"S2");
-        let out = SfaColumnBackend::encode_persist_publish_chunk(
-            &mut payload,
-            &mut scratch,
-            &mut dict,
-            &mut pd,
-            &mut delta,
-            &chunk,
-            usize::MAX,
-            |_| Ok(2),
-        )
-        .unwrap();
-        assert!(matches!(out, SfaOutcome::Published(2)));
-        assert_eq!(dict.next_id(), 2);
-        assert_eq!(
-            dict.entry(1),
-            Some(&b"S2"[..]),
-            "S2 reuses the id S1 vacated"
-        );
-
-        // Reopen the side-file: it must mirror the live dictionary exactly
-        // [S0, S2], with no trace of the rolled-back S1.
-        drop(pd.take());
-        let reopened = PersistedSymbolDict::open(dir.path()).unwrap();
-        assert_eq!(
-            reopened.read_loaded_symbols(),
-            vec![b"S0".to_vec(), b"S2".to_vec()]
-        );
-    }
-
-    #[test]
-    fn column_sfa_side_file_rollback_failure_drops_handle_and_disables_delta() {
-        // When the slot's persisted side-file cannot be rolled back (a failing
-        // disk), the write-ahead path must drop the side-file handle AND disable
-        // delta so subsequent frames fall back to dense (self-sufficient) encoding
-        // -- a delta frame the poisoned/desynced side-file can no longer rebuild on
-        // recovery would strand the queued data at the send loop's torn-dict guard.
-        // Injected via the side-file's fail-next-append-cleanup hook (poisons the
-        // handle so the write-ahead append fails and the ensuing rollback fails
-        // too), exercising `rollback_symbol_frame`'s truncate-failed branch on the
-        // column path. The column twin of the row path's
-        // `file_mode_side_file_rollback_failure_drops_handle_and_disables_delta`.
-        use super::SfaColumnBackend;
-        use crate::ErrorCode;
-        use crate::ingress::buffer::SymbolGlobalDict;
-        use crate::ingress::sender::qwp_ws_sfa_symbol_dict::PersistedSymbolDict;
-
-        let dir = tempfile::tempdir().unwrap();
-        let mut pd_handle = PersistedSymbolDict::open(dir.path()).unwrap();
-        pd_handle.arm_fail_next_append_cleanup();
-        let mut dict = SymbolGlobalDict::new();
-        let mut pd = Some(pd_handle);
-        let mut delta = true;
-        let mut scratch = super::encoder::EncodeScratch::new();
-        let mut payload = Vec::new();
-        let codes = [0i32];
-        let offsets = [0i32, 5];
-
-        // The frame interns a new symbol, so write-ahead appends it -- which the
-        // armed hook fails, poisoning the side-file so the ensuing rollback fails
-        // too. The `Ok`-returning publish closure is never reached.
-        let chunk = one_symbol_chunk(&codes, &offsets, &[1i64], b"alpha");
-        let err = SfaColumnBackend::encode_persist_publish_chunk(
-            &mut payload,
-            &mut scratch,
-            &mut dict,
-            &mut pd,
-            &mut delta,
-            &chunk,
-            usize::MAX,
-            |_| Ok(1),
-        )
-        .unwrap_err();
-        assert!(err.is_not_delivered());
-        let e = err.into_error();
-        assert_eq!(e.code(), ErrorCode::SocketError);
-        assert!(e.msg().contains("persist"), "{e}");
-
-        assert!(
-            pd.is_none(),
-            "a failed side-file rollback must drop the handle"
-        );
-        assert!(
-            !delta,
-            "dropping the side-file must disable delta so frames go dense"
-        );
     }
 }

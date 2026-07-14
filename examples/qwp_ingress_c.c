@@ -1,4 +1,5 @@
-/* C twin of questdb-rs/examples/qwp_ingress_polars.rs (plan §6 Step 3).
+/* C twin of questdb-rs/examples/qwp_ingress_polars.rs
+ * (doc/historical/QWP_DATAFRAME_BENCH_PLAN.md §6 Step 3).
  * Measures the columnar C API end-to-end on the shared S1/S2 schemas:
  *   chunk-build   (floor) — stage all batches into a chunk, no network
  *   flush-chunks  (e2e)   — stage + direct_column_sender_flush per

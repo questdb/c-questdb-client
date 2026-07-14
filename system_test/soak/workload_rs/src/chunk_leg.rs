@@ -1,7 +1,7 @@
-//! Column-sender (columnar / QWP-WS) leg drivers (§S1).
+//! Chunk-payload QWP/WebSocket soak leg.
 //!
 //! The columnar path is the Polars/Pandas ingest path and the newer, riskier
-//! code, so it gets its own soak legs. Unlike the row leg (ILP `Buffer`,
+//! code, so it gets its own soak leg. Unlike the Buffer leg,
 //! one value at a time), this builds a whole [`Chunk`] per batch: one slice per
 //! column, plus validity bitmaps for nullable columns, a symbol dictionary, and
 //! Arrow-style varchar/binary offset+byte buffers — then flushes it.
@@ -328,7 +328,7 @@ fn opt_float(e: &Expected) -> (f64, bool) {
 /// `Validity` objects and the chunk borrow `b`'s buffers; everything lives in
 /// this one scope, so `b` is free to be reset by the caller afterwards.
 fn flush_batch(
-    sender: &mut questdb::BorrowedColumnSender<'_>,
+    sender: &mut questdb::BorrowedSender<'_>,
     table: &str,
     b: &Batch,
 ) -> questdb::Result<()> {
@@ -376,9 +376,9 @@ fn flush_batch(
     sender.flush_and_wait(&mut chunk, AckLevel::Ok)
 }
 
-/// Drive a column-sender leg: batches of columnar rows through the pool, with
+/// Drive the Chunk leg: batches of columnar rows through the unified pool, with
 /// the journal watermark advanced on ack and transient re-drive from it.
-pub fn run_column_leg(cfg: &LegConfig) -> LegResult {
+pub fn run_chunk_leg(cfg: &LegConfig) -> LegResult {
     let conf = crate::legs::build_conf(cfg);
     let db = QuestDb::connect(&conf)?;
     let mut journal = AckJournal::open(&cfg.journal_path)?;
@@ -391,7 +391,7 @@ pub fn run_column_leg(cfg: &LegConfig) -> LegResult {
     let mut stuck: u32 = 0;
     const STUCK_LIMIT: u32 = 500;
 
-    let mut sender = db.borrow_column_sender()?;
+    let mut sender = db.borrow_sender()?;
     let mut batch = Batch::default();
     batch.reset();
 
@@ -461,10 +461,10 @@ pub fn run_column_leg(cfg: &LegConfig) -> LegResult {
 fn reborrow<'a>(
     db: &'a QuestDb,
     leg: &str,
-) -> Result<questdb::BorrowedColumnSender<'a>, Box<dyn std::error::Error>> {
+) -> Result<questdb::BorrowedSender<'a>, Box<dyn std::error::Error>> {
     let deadline = Instant::now() + Duration::from_secs(120);
     loop {
-        match db.borrow_column_sender() {
+        match db.borrow_sender() {
             Ok(s) => return Ok(s),
             Err(e) => {
                 if Instant::now() >= deadline {

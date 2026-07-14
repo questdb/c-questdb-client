@@ -3522,6 +3522,7 @@ checksum = "8ed6a63f02c8539c91a8685a86f4099661ba3da017932f6ebbea6de3f0fa7c90"
 name = "soak-workload"
 version = "0.0.0"
 dependencies = [
+ "arrow",
  "polars",
  "questdb-rs",
  "signal-hook 0.3.18",

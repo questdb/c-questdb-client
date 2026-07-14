@@ -69,7 +69,7 @@ __all__ = [
     "EDGE_GEOHASH_BITS",
     "arrow_cursor",
     "existing_sender",
-    "borrowed_column_sender",
+    "borrowed_sender",
     "temp_sf_dir",
     "sfa_file_count",
     "wait_for_rows",
@@ -160,8 +160,8 @@ def temp_sf_dir(prefix: str = "arrow_"):
         shutil.rmtree(d, ignore_errors=True)
 
 def sfa_file_count(sf_dir: str, sender_id: str) -> int:
-    def is_pool_column_slot(name: str) -> bool:
-        prefix = f"{sender_id}-col-"
+    def is_pool_ingest_slot(name: str) -> bool:
+        prefix = f"{sender_id}-ingest-"
         if not name.startswith(prefix):
             return False
         suffix = name[len(prefix):]
@@ -177,7 +177,7 @@ def sfa_file_count(sf_dir: str, sender_id: str) -> int:
 
     total = 0
     for name in slot_names:
-        if name != sender_id and not is_pool_column_slot(name):
+        if name != sender_id and not is_pool_ingest_slot(name):
             continue
         slot_dir = os.path.join(sf_dir, name)
         if os.path.isdir(slot_dir):
@@ -235,12 +235,12 @@ def drop_table_safe(fixture, table: str) -> None:
         )
 
 @contextlib.contextmanager
-def borrowed_column_sender(fixture, *, sync_on_exit: bool = True, **conf_extras: str):
+def borrowed_sender(fixture, *, sync_on_exit: bool = True, **conf_extras: str):
     """Open a `questdb_db*` pool from the fixture, borrow one
-    `column_sender*`, and yield the raw conn pointer. Returns the conn
+    `qwp_sender*`, and yield the raw conn pointer. Returns the conn
     to the pool on exit (or drops it if the conn latched as terminal)
     and closes the pool. Set `sync_on_exit=False` when a test needs to
-    assert the exact `column_sender_sync` error."""
+    assert the exact `qwp_sender_wait` error."""
     from test import skip_if_unsupported_qwp_ws_fixture
     conf = ingress_conf(fixture, **conf_extras).encode("utf-8")
     try:
@@ -276,8 +276,8 @@ def ingest_via_arrow(
     sender_conf_extras: Optional[Dict[str, str]] = None,
     slice_window: Optional[Tuple[int, int]] = None,
 ) -> None:
-    """Ingest one RecordBatch through `column_sender_flush_arrow_batch_at_column`
-    (when `ts_col` is set) or `column_sender_flush_arrow_batch_at_now`
+    """Ingest one RecordBatch through `qwp_sender_flush_arrow_batch_at_column`
+    (when `ts_col` is set) or `qwp_sender_flush_arrow_batch_at_now`
     (when `ts_col` is None — the server stamps each row on arrival).
 
     When `slice_window=(offset, length)` is supplied the batch is sliced to
@@ -293,7 +293,7 @@ def ingest_via_arrow(
     if slice_window is not None:
         window_offset, window_length = slice_window
         record_batch = record_batch.slice(window_offset, window_length)
-    with borrowed_column_sender(fixture, **extras) as conn:
+    with borrowed_sender(fixture, **extras) as conn:
         table_name = _c_table_name(table)
         arr, sch = pyarrow_export_record_batch(record_batch)
         try:

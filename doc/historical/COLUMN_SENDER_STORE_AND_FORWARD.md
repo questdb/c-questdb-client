@@ -1,6 +1,9 @@
 # Column Sender Store-and-Forward Design
 
-**Status:** draft
+**Status:** retired pre-unification design record; not a current API contract.
+See [`README.md`](README.md).
+
+**Original status:** draft
 **Audience:** Rust core, C FFI, C++ wrapper, and Python dataframe ingestion
 engineers
 **Scope:** first implementation of store-and-forward for

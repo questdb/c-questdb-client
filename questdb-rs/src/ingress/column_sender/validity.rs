@@ -31,8 +31,8 @@
 
 use crate::{Result, error};
 
-/// Public validity bitmap. See `doc/COLUMN_SENDER_FFI_ABI.md` §2.4 for the
-/// Arrow semantics the API accepts.
+/// Public Arrow-shaped validity bitmap: one LSB-first bit per row, where one
+/// means valid and zero means null.
 #[derive(Debug)]
 pub struct Validity<'a> {
     pub(crate) bits: &'a [u8],

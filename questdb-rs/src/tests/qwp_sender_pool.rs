@@ -22,7 +22,7 @@
  *
  ******************************************************************************/
 
-//! Column-sender pool + flush integration tests (WS-0 through WS-2).
+//! Unified QWP sender pool + flush integration tests (WS-0 through WS-2).
 //!
 //! - WS-0: eager-open, borrow/return, multi-thread concurrent borrows,
 //!   fail-fast at `pool_max`, idle reaper.
@@ -31,10 +31,9 @@
 //! - WS-2: numeric / fixed-width column round-trip with a designated
 //!   timestamp; schema reuse across repeated flushes.
 //!
-//! Pool slots are real [`crate::ingress::Sender`] instances. The mock server
-//! defined here accepts the HTTP→WebSocket upgrade so `Sender::build()`
-//! succeeds, then either parks on the connection or reads each QWP frame
-//! and replies with an OK ack (status 0x00).
+//! Pool slots own unified QWP publication cores. The mock server accepts the
+//! HTTP→WebSocket upgrade, then either parks on the connection or reads each
+//! QWP frame and replies with an OK ack (status 0x00).
 
 use std::collections::BTreeSet;
 use std::fs;
@@ -51,7 +50,7 @@ use crate::ErrorCode;
 use crate::QuestDb;
 use crate::ingress::column_sender::Chunk;
 use crate::ingress::sender::has_any_sfa_file as slot_has_sfa_file;
-use crate::ingress::{AckLevel, SenderBuilder};
+use crate::ingress::{AckLevel, ProtocolVersion, SenderBuilder, TimestampNanos};
 use crate::tests::qwp_ws::{
     perform_server_upgrade, perform_server_upgrade_durable, read_frame,
     write_qwp_durable_ack_response, write_qwp_error_response, write_qwp_ok_response,
@@ -79,7 +78,7 @@ enum MockMode {
     /// Ack the first `n` binary frames, then close the socket — a peer that
     /// dies mid-stream after committing a prefix. The client's next read hits
     /// EOF and surfaces a transient (`FailoverRetry`) failure.
-    #[cfg(feature = "polars-ingress")]
+    #[cfg(feature = "arrow-ingress")]
     AckThenClose(usize),
     /// Read (consume) the first `n` binary frames — so the client's writes
     /// provably succeed — then close **without** acking. Models a peer that
@@ -137,7 +136,7 @@ impl MockServer {
         Self::spawn_with_mode(max_accepts, MockMode::ReadThenClose(frames))
     }
 
-    #[cfg(feature = "polars-ingress")]
+    #[cfg(feature = "arrow-ingress")]
     fn spawn_ack_then_close(max_accepts: usize, ack_first: usize) -> Self {
         Self::spawn_with_mode(max_accepts, MockMode::AckThenClose(ack_first))
     }
@@ -170,7 +169,7 @@ impl MockServer {
         let accepted_clone = Arc::clone(&accepted);
 
         let join = thread::Builder::new()
-            .name("column-sender-pool-delayed-mock-server".to_string())
+            .name("qwp-ingress-pool-delayed-mock-server".to_string())
             .spawn(move || {
                 thread::sleep(delay);
                 let listener = TcpListener::bind(("127.0.0.1", port)).expect("bind delayed port");
@@ -213,7 +212,7 @@ impl MockServer {
         let accepted_clone = Arc::clone(&accepted);
 
         let join = thread::Builder::new()
-            .name("column-sender-pool-mock-server".to_string())
+            .name("qwp-ingress-pool-mock-server".to_string())
             .spawn(move || {
                 run_mock_server_accept_loop(
                     listener,
@@ -291,7 +290,7 @@ fn run_mock_server_accept_loop(
                                 // Drop the stream immediately: the client's
                                 // next read sees EOF.
                             }
-                            #[cfg(feature = "polars-ingress")]
+                            #[cfg(feature = "arrow-ingress")]
                             MockMode::AckThenClose(n) => ack_then_close(&mut stream, &stop, n),
                             MockMode::ReadThenClose(n) => read_then_close(&mut stream, &stop, n),
                         }
@@ -507,7 +506,7 @@ fn ack_when_released(
 /// Ack the first `n` binary frames the client sends, then close the socket so
 /// the client's next read hits EOF. Models a peer that commits a prefix and
 /// then dies mid-stream.
-#[cfg(feature = "polars-ingress")]
+#[cfg(feature = "arrow-ingress")]
 fn ack_then_close(stream: &mut std::net::TcpStream, stop: &AtomicBool, n: usize) {
     let _ = stream.set_read_timeout(Some(Duration::from_millis(50)));
     let mut next_wire_seq: u64 = 0;
@@ -599,6 +598,28 @@ fn append_one_symbol_row<'a>(chunk: &mut Chunk<'a>, symbol: &'a [u8], timestamp:
     chunk.at_nanos(timestamp).unwrap();
 }
 
+fn one_symbol_buffer(db: &QuestDb, symbol: &str) -> crate::ingress::Buffer {
+    let mut buffer = db.new_buffer();
+    buffer
+        .table("trades")
+        .unwrap()
+        .symbol("sym", symbol)
+        .unwrap()
+        .at_now()
+        .unwrap();
+    buffer
+}
+
+#[cfg(feature = "arrow-ingress")]
+fn symbol_arrow_batch(values: Vec<&str>) -> arrow::array::RecordBatch {
+    use arrow::array::StringArray;
+    use arrow::datatypes::{DataType, Field, Schema};
+
+    let schema = Arc::new(Schema::new(vec![Field::new("sym", DataType::Utf8, false)]));
+    let symbols = Arc::new(StringArray::from(values));
+    arrow::array::RecordBatch::try_new(schema, vec![symbols]).unwrap()
+}
+
 fn read_test_varint(bytes: &[u8], pos: &mut usize) -> u64 {
     let mut shift = 0;
     let mut value = 0u64;
@@ -618,6 +639,21 @@ fn read_test_bytes<'a>(bytes: &'a [u8], pos: &mut usize) -> &'a [u8] {
     let start = *pos;
     *pos += len;
     &bytes[start..start + len]
+}
+
+fn decode_test_hex(hex: &str) -> Vec<u8> {
+    let compact: Vec<u8> = hex
+        .bytes()
+        .filter(|byte| !byte.is_ascii_whitespace())
+        .collect();
+    assert_eq!(compact.len() % 2, 0, "hex fixture must contain byte pairs");
+    compact
+        .chunks_exact(2)
+        .map(|pair| {
+            let text = std::str::from_utf8(pair).unwrap();
+            u8::from_str_radix(text, 16).unwrap()
+        })
+        .collect()
 }
 
 /// Returns `(delta_start, new_symbols)` from a captured frame's delta-dict
@@ -708,7 +744,7 @@ fn refuses_non_qwp_ws_schema() {
 }
 
 #[test]
-fn disk_store_and_forward_column_pool_uses_distinct_slots_up_to_pool_max() {
+fn disk_store_and_forward_ingress_pool_uses_distinct_slots_up_to_pool_max() {
     let server = MockServer::spawn(4);
     let dir = TempDir::new().unwrap();
     let conf = conf_for_endpoints(
@@ -720,28 +756,26 @@ fn disk_store_and_forward_column_pool_uses_distinct_slots_up_to_pool_max() {
     );
     let db = QuestDb::connect(&conf).unwrap();
 
-    let b0 = db.borrow_column_sender().expect("slot 0");
-    let b1 = db.borrow_column_sender().expect("slot 1");
-    let b2 = db.borrow_column_sender().expect("slot 2");
+    let b0 = db.borrow_sender().expect("slot 0");
+    let b1 = db.borrow_sender().expect("slot 1");
+    let b2 = db.borrow_sender().expect("slot 2");
     assert_eq!(db.in_use_count(), 3);
     assert_eq!(
         sorted_slot_names(dir.path()),
-        vec!["cols-col-0", "cols-col-1", "cols-col-2"]
+        vec!["cols-ingest-0", "cols-ingest-1", "cols-ingest-2"]
     );
 
     let err = db
-        .borrow_column_sender()
+        .borrow_sender()
         .expect_err("fourth borrow exceeds pool_max");
     assert_eq!(err.code(), ErrorCode::InvalidApiCall);
     assert!(err.msg().contains("pool_max"), "{}", err.msg());
 
     drop(b1);
-    let _again = db
-        .borrow_column_sender()
-        .expect("returned slot is reusable");
+    let _again = db.borrow_sender().expect("returned slot is reusable");
     assert_eq!(
         sorted_slot_names(dir.path()),
-        vec!["cols-col-0", "cols-col-1", "cols-col-2"]
+        vec!["cols-ingest-0", "cols-ingest-1", "cols-ingest-2"]
     );
 
     drop(b0);
@@ -751,7 +785,7 @@ fn disk_store_and_forward_column_pool_uses_distinct_slots_up_to_pool_max() {
 #[test]
 fn disk_store_and_forward_preopens_dirty_in_range_slot_at_connect() {
     let dir = TempDir::new().unwrap();
-    seed_async_qwp_ws_slot(dir.path(), "selfrace-col-1", 44);
+    seed_async_qwp_ws_slot(dir.path(), "selfrace-ingest-1", 44);
 
     let (server, frames) = MockServer::spawn_acking_capturing(1);
     let conf = conf_for_endpoints(
@@ -790,11 +824,9 @@ fn disk_store_and_forward_borrower_rechecks_free_sender_after_close_wait_wake() 
     let db = Arc::new(QuestDb::connect(&conf).unwrap());
 
     let mut closing = db
-        .borrow_column_sender_owned()
+        .borrow_sender_owned()
         .expect("borrow slot that will close");
-    let healthy = db
-        .borrow_column_sender_owned()
-        .expect("borrow healthy slot");
+    let healthy = db.borrow_sender_owned().expect("borrow healthy slot");
 
     let values = [42_i64];
     let timestamps = [42_i64];
@@ -819,7 +851,7 @@ fn disk_store_and_forward_borrower_rechecks_free_sender_after_close_wait_wake() 
     let waiter_db = Arc::clone(&db);
     let waiter = thread::spawn(move || {
         let result = waiter_db
-            .borrow_column_sender_owned()
+            .borrow_sender_owned()
             .map(|_| ())
             .map_err(|err| err.msg().to_owned());
         tx.send(result).expect("send waiter result");
@@ -856,7 +888,7 @@ fn disk_store_and_forward_at_cap_borrow_waits_for_closing_slot_to_release_index(
     let db = Arc::new(QuestDb::connect(&conf).unwrap());
 
     let mut closing = db
-        .borrow_column_sender_owned()
+        .borrow_sender_owned()
         .expect("borrow slot that will close");
     let values = [55_i64];
     let timestamps = [55_i64];
@@ -881,7 +913,7 @@ fn disk_store_and_forward_at_cap_borrow_waits_for_closing_slot_to_release_index(
     let waiter_db = Arc::clone(&db);
     let waiter = thread::spawn(move || {
         let result = waiter_db
-            .borrow_column_sender_owned()
+            .borrow_sender_owned()
             .map(|_| ())
             .map_err(|err| err.msg().to_owned());
         tx.send(result).expect("send waiter result");
@@ -901,7 +933,7 @@ fn disk_store_and_forward_at_cap_borrow_waits_for_closing_slot_to_release_index(
 }
 
 #[test]
-fn disk_store_and_forward_row_and_column_borrow_and_flush_together() {
+fn disk_store_and_forward_buffer_and_chunk_borrow_and_flush_together() {
     let (server, frames) = MockServer::spawn_acking_capturing(4);
     let dir = TempDir::new().unwrap();
     let conf = conf_for_endpoints(
@@ -913,28 +945,30 @@ fn disk_store_and_forward_row_and_column_borrow_and_flush_together() {
     );
     let db = QuestDb::connect(&conf).unwrap();
 
-    let mut col = db.borrow_column_sender().expect("column sender");
-    let mut row = db.borrow_row_sender().expect("row sender");
+    let mut chunk_sender = db.borrow_sender().expect("chunk sender");
+    let mut buffer_sender = db.borrow_sender().expect("buffer sender");
     assert_eq!(
         sorted_slot_names(dir.path()),
-        vec!["mixed-col-0", "mixed-row-0"]
+        vec!["mixed-ingest-0", "mixed-ingest-1"]
     );
 
     let val = [11_i64];
     let ts = [11_i64];
     let mut chunk = one_i64_row("col_table", &val, &ts);
-    col.flush_and_wait(&mut chunk, AckLevel::Ok)
-        .expect("column flush while row sender is borrowed");
+    chunk_sender
+        .flush_and_wait(&mut chunk, AckLevel::Ok)
+        .expect("Chunk flush while Buffer sender is borrowed");
 
-    let mut buf = row.new_buffer();
+    let mut buf = buffer_sender.new_buffer();
     buf.table("row_table")
         .unwrap()
         .column_i64("value", 22)
         .unwrap()
         .at_now()
         .unwrap();
-    row.flush_and_wait(&mut buf, AckLevel::Ok)
-        .expect("row flush while column sender is borrowed");
+    buffer_sender
+        .flush_buffer_and_wait(&mut buf, AckLevel::Ok)
+        .expect("Buffer flush while Chunk sender is borrowed");
 
     assert!(
         !frames
@@ -948,10 +982,11 @@ fn disk_store_and_forward_row_and_column_borrow_and_flush_together() {
             .unwrap()
             .is_empty()
     );
+    assert_eq!(db.in_use_count(), 2);
+    drop(buffer_sender);
     assert_eq!(db.in_use_count(), 1);
-    assert_eq!(db.row_sender_in_use_count(), 1);
-    drop(row);
-    drop(col);
+    drop(chunk_sender);
+    assert_eq!(db.in_use_count(), 0);
 }
 
 #[test]
@@ -968,14 +1003,14 @@ fn disk_store_and_forward_duplicate_pool_collides_on_managed_slot() {
     let db2 = QuestDb::connect(&conf).unwrap();
 
     let _held = db1
-        .borrow_column_sender()
-        .expect("first pool owns shared-col-0");
+        .borrow_sender()
+        .expect("first pool owns shared-ingest-0");
     let err = db2
-        .borrow_column_sender()
+        .borrow_sender()
         .expect_err("second pool must hit the slot flock");
     assert_eq!(err.code(), ErrorCode::ConfigError);
     assert!(
-        err.msg().contains("shared-col-0")
+        err.msg().contains("shared-ingest-0")
             && err
                 .msg()
                 .to_ascii_lowercase()
@@ -998,43 +1033,47 @@ fn disk_store_and_forward_duplicate_pool_connect_warn_skips_flocked_slots() {
     );
     let db1 = QuestDb::connect(&conf).unwrap();
 
-    let mut col = db1
-        .borrow_column_sender()
-        .expect("first pool owns dupe-col-0");
-    let mut row = db1.borrow_row_sender().expect("first pool owns dupe-row-0");
+    let mut sender = db1.borrow_sender().expect("first pool owns dupe-ingest-0");
 
     let val = [1_i64];
     let ts = [1_i64];
     let mut chunk = one_i64_row("dupecol", &val, &ts);
-    col.flush(&mut chunk).expect("queue column frame");
+    sender.flush(&mut chunk).expect("queue Chunk frame");
 
-    let mut buf = row.new_buffer();
+    let mut buf = sender.new_buffer();
     buf.table("duperow")
         .unwrap()
         .column_i64("value", 1)
         .unwrap()
         .at_now()
         .unwrap();
-    row.flush(&mut buf).expect("queue row frame");
+    sender.flush_buffer(&mut buf).expect("queue Buffer frame");
 
     let db2 = QuestDb::connect(&conf).expect("duplicate pool connect skips recovery failures");
     assert_eq!(db2.free_count(), 0);
-    assert_eq!(db2.row_sender_free_count(), 0);
 
-    let col_err = db2
-        .borrow_column_sender()
-        .expect_err("borrow still collides on the flocked column slot");
-    assert_eq!(col_err.code(), ErrorCode::ConfigError);
-    assert!(col_err.msg().contains("dupe-col-0"), "{}", col_err.msg());
+    let first_err = db2
+        .borrow_sender()
+        .expect_err("borrow still collides on the flocked ingestion slot");
+    assert_eq!(first_err.code(), ErrorCode::ConfigError);
+    assert!(
+        first_err.msg().contains("dupe-ingest-0"),
+        "{}",
+        first_err.msg()
+    );
 
-    let row_err = db2
-        .borrow_row_sender()
-        .expect_err("borrow still collides on the flocked row slot");
-    assert_eq!(row_err.code(), ErrorCode::ConfigError);
-    assert!(row_err.msg().contains("dupe-row-0"), "{}", row_err.msg());
+    let retry_err = db2
+        .borrow_sender()
+        .expect_err("a retry still collides without leaking the pool cap");
+    assert_eq!(retry_err.code(), ErrorCode::ConfigError);
+    assert!(
+        retry_err.msg().contains("dupe-ingest-0"),
+        "{}",
+        retry_err.msg()
+    );
+    assert_eq!(db2.in_use_count(), 0);
 
-    drop(row);
-    drop(col);
+    drop(sender);
 }
 
 #[test]
@@ -1049,8 +1088,8 @@ fn disk_store_and_forward_restart_replays_reminted_and_out_of_range_managed_slot
     );
     {
         let db = QuestDb::connect(&seed_conf).unwrap();
-        let mut s0 = db.borrow_column_sender().expect("seed slot 0");
-        let mut s1 = db.borrow_column_sender().expect("seed slot 1");
+        let mut s0 = db.borrow_sender().expect("seed slot 0");
+        let mut s1 = db.borrow_sender().expect("seed slot 1");
 
         let v0 = [101_i64];
         let t0 = [101_i64];
@@ -1062,8 +1101,8 @@ fn disk_store_and_forward_restart_replays_reminted_and_out_of_range_managed_slot
         let mut c1 = one_i64_row("replay1", &v1, &t1);
         s1.flush(&mut c1).expect("append slot 1");
     }
-    assert!(slot_has_sfa_file(&dir.path().join("replay-col-0")));
-    assert!(slot_has_sfa_file(&dir.path().join("replay-col-1")));
+    assert!(slot_has_sfa_file(&dir.path().join("replay-ingest-0")));
+    assert!(slot_has_sfa_file(&dir.path().join("replay-ingest-1")));
 
     let (server, frames) = MockServer::spawn_acking_capturing(4);
     let replay_conf = conf_for_endpoints(
@@ -1075,7 +1114,7 @@ fn disk_store_and_forward_restart_replays_reminted_and_out_of_range_managed_slot
     );
     let db = QuestDb::connect(&replay_conf).unwrap();
     let mut s0 = db
-        .borrow_column_sender()
+        .borrow_sender()
         .expect("reopen slot 0 and start out-of-range managed-slot recovery");
 
     let first = frames
@@ -1102,8 +1141,8 @@ fn disk_store_and_forward_restart_same_pool_max_replays_in_range_slots_without_b
     );
     {
         let db = QuestDb::connect(&seed_conf).unwrap();
-        let mut s0 = db.borrow_column_sender().expect("seed slot 0");
-        let mut s1 = db.borrow_column_sender().expect("seed slot 1");
+        let mut s0 = db.borrow_sender().expect("seed slot 0");
+        let mut s1 = db.borrow_sender().expect("seed slot 1");
 
         let v0 = [301_i64];
         let t0 = [301_i64];
@@ -1115,8 +1154,8 @@ fn disk_store_and_forward_restart_same_pool_max_replays_in_range_slots_without_b
         let mut c1 = one_i64_row("samepool1", &v1, &t1);
         s1.flush(&mut c1).expect("append slot 1");
     }
-    assert!(slot_has_sfa_file(&dir.path().join("samepool-col-0")));
-    assert!(slot_has_sfa_file(&dir.path().join("samepool-col-1")));
+    assert!(slot_has_sfa_file(&dir.path().join("samepool-ingest-0")));
+    assert!(slot_has_sfa_file(&dir.path().join("samepool-ingest-1")));
 
     let (server, frames) = MockServer::spawn_acking_capturing(4);
     let replay_conf = conf_for_endpoints(
@@ -1147,10 +1186,8 @@ fn disk_store_and_forward_restart_same_pool_max_replays_in_range_slots_without_b
         BTreeSet::from(["samepool0".to_string(), "samepool1".to_string()])
     );
 
-    let mut s0 = db.borrow_column_sender().expect("borrow replayed slot");
-    let mut s1 = db
-        .borrow_column_sender()
-        .expect("borrow other replayed slot");
+    let mut s0 = db.borrow_sender().expect("borrow replayed slot");
+    let mut s1 = db.borrow_sender().expect("borrow other replayed slot");
     s0.wait(AckLevel::Ok, Duration::from_secs(5))
         .expect("first replay acked");
     s1.wait(AckLevel::Ok, Duration::from_secs(5))
@@ -1178,7 +1215,7 @@ fn disk_store_and_forward_pool_drains_unsuffixed_slot_only_with_orphan_drain_ena
     {
         let db = QuestDb::connect(&default_conf).unwrap();
         let _sender = db
-            .borrow_column_sender()
+            .borrow_sender()
             .expect("managed slot opens without adopting unsuffixed slot by default");
         assert!(
             frames.recv_timeout(Duration::from_millis(200)).is_err(),
@@ -1197,7 +1234,7 @@ fn disk_store_and_forward_pool_drains_unsuffixed_slot_only_with_orphan_drain_ena
     );
     let db = QuestDb::connect(&drain_conf).unwrap();
     let _sender = db
-        .borrow_column_sender()
+        .borrow_sender()
         .expect("managed slot opens and starts orphan drainer");
 
     let payload = frames
@@ -1213,7 +1250,7 @@ fn disk_store_and_forward_pool_drains_unsuffixed_slot_only_with_orphan_drain_ena
     assert!(!dir.path().join("legacy").join(".failed").exists());
     assert_eq!(
         sorted_slot_names(dir.path()),
-        vec!["legacy", "legacy-col-0"]
+        vec!["legacy", "legacy-ingest-0"]
     );
 }
 
@@ -1222,7 +1259,7 @@ fn store_and_forward_column_sender_reports_fsn_progress() {
     let server = MockServer::spawn_acking(8);
     let conf = conf_for_endpoints(&[server.port()], "pool_reap=manual;");
     let db = QuestDb::connect(&conf).unwrap();
-    let mut sender = db.borrow_column_sender().unwrap();
+    let mut sender = db.borrow_sender().unwrap();
 
     assert_eq!(sender.published_fsn().unwrap(), None);
     assert_eq!(sender.acked_fsn().unwrap(), None);
@@ -1257,7 +1294,7 @@ fn store_and_forward_pool_borrow_buffers_with_no_server() {
     let db = QuestDb::connect(&conf).unwrap();
 
     let mut sender = db
-        .borrow_column_sender()
+        .borrow_sender()
         .expect("lazy SF pool borrow must not require a live server");
     let mut chunk = Chunk::new("trades");
     let qty = [1_i64];
@@ -1275,11 +1312,801 @@ fn store_and_forward_pool_borrow_buffers_with_no_server() {
     assert_eq!(sender.acked_fsn().unwrap(), None);
 }
 
+#[test]
+fn pooled_buffer_factory_uses_configured_name_limit_without_borrow() {
+    let port = unused_local_port();
+    let conf = conf_for_endpoints(
+        &[port],
+        "max_name_len=16;pool_reap=manual;close_flush_timeout_millis=0;",
+    );
+    let db = QuestDb::connect(&conf).unwrap();
+
+    let mut buffer = db.new_buffer();
+    let err = buffer
+        .table("table_name_len_17")
+        .expect_err("the pool-configured name limit must be applied at creation");
+    assert_eq!(err.code(), ErrorCode::InvalidName);
+    assert_eq!(db.in_use_count(), 0, "buffer creation must not borrow");
+    assert_eq!(db.free_count(), 0, "buffer creation must not open a slot");
+}
+
+#[test]
+fn pooled_buffer_rejects_non_qwp_ws_without_modification() {
+    let port = unused_local_port();
+    let db = QuestDb::connect(&conf_for_endpoints(
+        &[port],
+        "pool_reap=manual;close_flush_timeout_millis=0;",
+    ))
+    .unwrap();
+    let mut sender = db.borrow_sender().unwrap();
+    let mut buffer = crate::ingress::Buffer::new(ProtocolVersion::V2);
+    buffer
+        .table("trades")
+        .unwrap()
+        .column_i64("qty", 7)
+        .unwrap()
+        .at_now()
+        .unwrap();
+    let len = buffer.len();
+    let rows = buffer.row_count();
+
+    let err = sender
+        .flush_buffer(&mut buffer)
+        .expect_err("an ILP buffer must be rejected by pooled QWP ingestion");
+    assert_eq!(err.code(), ErrorCode::InvalidApiCall);
+    assert_eq!(buffer.len(), len);
+    assert_eq!(buffer.row_count(), rows);
+    assert!(!buffer.is_empty());
+    assert_eq!(sender.published_fsn().unwrap(), None);
+}
+
+#[test]
+fn pooled_buffer_empty_incomplete_keep_clear_multi_table_and_fsn_contract() {
+    let (server, frames) = MockServer::spawn_acking_capturing(4);
+    let db = QuestDb::connect(&conf_for(server.port(), "pool_reap=manual;")).unwrap();
+    let mut sender = db.borrow_sender().unwrap();
+
+    let mut empty = db.new_buffer();
+    empty.set_marker().unwrap();
+    assert_eq!(
+        sender.flush_buffer_and_keep_and_get_fsn(&empty).unwrap(),
+        None
+    );
+    empty
+        .rewind_to_marker()
+        .expect("keep must preserve an empty buffer's marker");
+    empty.set_marker().unwrap();
+    assert_eq!(sender.flush_buffer_and_get_fsn(&mut empty).unwrap(), None);
+    assert!(
+        empty.rewind_to_marker().is_err(),
+        "clearing flush must clear retained marker state even when empty"
+    );
+    assert!(frames.try_recv().is_err(), "empty buffers publish no frame");
+
+    let mut single = db.new_buffer();
+    single
+        .table("trades")
+        .unwrap()
+        .symbol("sym", "ETH-USD")
+        .unwrap()
+        .column_f64("price", 2615.54)
+        .unwrap();
+    let err = sender
+        .flush_buffer_and_keep(&single)
+        .expect_err("an incomplete row must be rejected before encoding");
+    assert_eq!(err.code(), ErrorCode::InvalidApiCall);
+    assert!(!single.is_empty(), "incomplete rejection must retain input");
+    assert_eq!(sender.published_fsn().unwrap(), None);
+
+    single.at_now().unwrap();
+    let first_fsn = sender
+        .flush_buffer_and_keep_and_get_fsn(&single)
+        .unwrap()
+        .expect("a completed row publishes one frame");
+    assert_eq!(single.row_count(), 1, "keep must retain completed rows");
+    let single_payload = frames.recv_timeout(Duration::from_secs(5)).unwrap();
+    assert_eq!(
+        u16::from_le_bytes([single_payload[6], single_payload[7]]),
+        1
+    );
+
+    let mut barrier = db.new_buffer();
+    barrier.set_marker().unwrap();
+    sender
+        .flush_buffer_and_wait(&mut barrier, AckLevel::Ok)
+        .expect("an empty waited flush is a barrier for prior publications");
+    assert!(
+        sender
+            .acked_fsn()
+            .unwrap()
+            .is_some_and(|acked| acked >= first_fsn)
+    );
+    assert!(barrier.rewind_to_marker().is_err());
+
+    let mut multi = db.new_buffer();
+    multi
+        .table("trades")
+        .unwrap()
+        .column_i64("qty", 1)
+        .unwrap()
+        .at_now()
+        .unwrap();
+    multi
+        .table("quotes")
+        .unwrap()
+        .column_f64("bid", 42.5)
+        .unwrap()
+        .at_now()
+        .unwrap();
+    sender
+        .flush_buffer_and_wait(&mut multi, AckLevel::Ok)
+        .unwrap();
+    assert!(multi.is_empty(), "successful waited flush must clear");
+    let multi_payload = frames.recv_timeout(Duration::from_secs(5)).unwrap();
+    assert_eq!(u16::from_le_bytes([multi_payload[6], multi_payload[7]]), 2);
+    assert!(
+        sender.published_fsn().unwrap().unwrap() > first_fsn,
+        "Buffer FSNs must advance monotonically"
+    );
+}
+
+#[test]
+fn pooled_buffer_too_large_is_not_split_and_keeps_input() {
+    let port = unused_local_port();
+    let db = QuestDb::connect(&conf_for_endpoints(
+        &[port],
+        "max_buf_size=1024;pool_reap=manual;close_flush_timeout_millis=0;",
+    ))
+    .unwrap();
+    let mut sender = db.borrow_sender().unwrap();
+    let oversized = "x".repeat(2048);
+    let mut buffer = db.new_buffer();
+    buffer
+        .table("trades")
+        .unwrap()
+        .column_str("payload", &oversized)
+        .unwrap()
+        .at_now()
+        .unwrap();
+
+    let err = sender
+        .flush_buffer(&mut buffer)
+        .expect_err("a Buffer is one indivisible publication");
+    assert_eq!(err.code(), ErrorCode::BatchTooLarge);
+    assert!(err.msg().contains("QWP frame"));
+    assert!(!buffer.is_empty(), "size rejection must retain input");
+    assert_eq!(buffer.row_count(), 1);
+    assert_eq!(sender.published_fsn().unwrap(), None);
+}
+
+#[test]
+fn pooled_buffer_append_timeout_rolls_back_symbols_and_keeps_input() {
+    let (server, release_acks, frames) = MockServer::spawn_ack_when_released_capturing(1);
+    let db = QuestDb::connect(&conf_for(
+        server.port(),
+        "pool_reap=manual;max_in_flight=1;sf_append_deadline_millis=25;",
+    ))
+    .unwrap();
+    let mut sender = db.borrow_sender().unwrap();
+
+    let mut first = db.new_buffer();
+    first
+        .table("trades")
+        .unwrap()
+        .symbol("sym", "alpha")
+        .unwrap()
+        .at_now()
+        .unwrap();
+    sender.flush_buffer(&mut first).unwrap();
+    let first_payload = frames.recv_timeout(Duration::from_secs(5)).unwrap();
+    assert_eq!(
+        read_symbol_prefix(&first_payload),
+        (0, vec![b"alpha".to_vec()])
+    );
+
+    let mut failed = db.new_buffer();
+    failed
+        .table("trades")
+        .unwrap()
+        .symbol("sym", "bravo")
+        .unwrap()
+        .at_now()
+        .unwrap();
+    let err = sender
+        .flush_buffer(&mut failed)
+        .expect_err("the full local queue must reject before append");
+    assert_eq!(err.code(), ErrorCode::SocketError);
+    assert!(
+        err.msg()
+            .contains("timed out waiting for local queue capacity")
+    );
+    assert!(!failed.is_empty(), "failed local append must retain input");
+
+    release_acks.store(true, Ordering::SeqCst);
+    sender.wait(AckLevel::Ok, Duration::from_secs(30)).unwrap();
+
+    let mut third = db.new_buffer();
+    third
+        .table("trades")
+        .unwrap()
+        .symbol("sym", "gamma")
+        .unwrap()
+        .at_now()
+        .unwrap();
+    sender.flush_buffer(&mut third).unwrap();
+    sender.wait(AckLevel::Ok, Duration::from_secs(30)).unwrap();
+    let third_payload = frames.recv_timeout(Duration::from_secs(5)).unwrap();
+    assert_eq!(
+        read_symbol_prefix(&third_payload),
+        (1, vec![b"gamma".to_vec()]),
+        "the failed Buffer's symbol ID must be rolled back and reused"
+    );
+}
+
+#[test]
+fn pooled_buffer_wait_preflight_and_post_publish_failure_contract() {
+    let durable_server = MockServer::spawn(1);
+    let durable_db =
+        QuestDb::connect(&conf_for(durable_server.port(), "pool_reap=manual;")).unwrap();
+    let mut durable_sender = durable_db.borrow_sender().unwrap();
+    let mut retained = durable_db.new_buffer();
+    retained
+        .table("trades")
+        .unwrap()
+        .column_i64("qty", 1)
+        .unwrap()
+        .at_now()
+        .unwrap();
+    let err = durable_sender
+        .flush_buffer_and_wait(&mut retained, AckLevel::Durable)
+        .expect_err("durable ACK must be rejected before publication without opt-in");
+    assert_eq!(err.code(), ErrorCode::InvalidApiCall);
+    assert!(!retained.is_empty());
+    assert_eq!(durable_sender.published_fsn().unwrap(), None);
+
+    let rejecting_server = MockServer::spawn_erroring(1, QWP_STATUS_SCHEMA_MISMATCH);
+    let rejecting_db =
+        QuestDb::connect(&conf_for(rejecting_server.port(), "pool_reap=manual;")).unwrap();
+    let mut rejecting_sender = rejecting_db.borrow_sender().unwrap();
+    let mut published = rejecting_db.new_buffer();
+    published
+        .table("trades")
+        .unwrap()
+        .column_i64("qty", 2)
+        .unwrap()
+        .at_now()
+        .unwrap();
+    let err = rejecting_sender
+        .flush_buffer_and_wait(&mut published, AckLevel::Ok)
+        .expect_err("a terminal ACK must surface after local publication");
+    assert_eq!(err.code(), ErrorCode::ServerRejection);
+    assert!(err.in_doubt());
+    assert!(published.is_empty(), "post-publish wait failure must clear");
+}
+
+#[test]
+fn pooled_buffer_is_origin_independent_sendable_and_offline_first() {
+    let port = unused_local_port();
+    let db = Arc::new(
+        QuestDb::connect(&conf_for_endpoints(
+            &[port],
+            "pool_reap=manual;close_flush_timeout_millis=0;",
+        ))
+        .unwrap(),
+    );
+    let buffer = db.new_buffer();
+    let mut buffer = thread::spawn(move || {
+        let mut buffer = buffer;
+        buffer
+            .table("trades")
+            .unwrap()
+            .symbol("sym", "offline")
+            .unwrap()
+            .column_i64("qty", 1)
+            .unwrap()
+            .at_now()
+            .unwrap();
+        buffer
+    })
+    .join()
+    .unwrap();
+
+    let worker_db = Arc::clone(&db);
+    let (fsn, published, empty) = thread::spawn(move || {
+        let mut sender = worker_db
+            .borrow_sender()
+            .expect("offline-first borrow must not require an endpoint");
+        let fsn = sender
+            .flush_buffer_and_get_fsn(&mut buffer)
+            .expect("local acceptance must work while the endpoint is unavailable")
+            .expect("the non-empty Buffer publishes a frame");
+        (fsn, sender.published_fsn().unwrap(), buffer.is_empty())
+    })
+    .join()
+    .unwrap();
+    assert_eq!(published, Some(fsn));
+    assert!(empty);
+}
+
+#[test]
+fn pooled_buffer_payload_matches_m0_checked_in_golden() {
+    const SYMBOL_COUNT: usize = 10;
+    const BASE_TS_NANOS: i64 = 1_700_000_000_000_000_000;
+    const GOLDEN: &str = include_str!("interop/qwp-unified-ingress/m0-equivalent-buffer.hex");
+
+    let (server, frames) = MockServer::spawn_acking_capturing(1);
+    let db = QuestDb::connect(&conf_for(server.port(), "pool_reap=manual;")).unwrap();
+    let mut buffer = db.new_buffer();
+    for idx in 0..SYMBOL_COUNT {
+        buffer
+            .table("trades")
+            .unwrap()
+            .symbol("sym", format!("SYM_{idx:03}"))
+            .unwrap()
+            .column_i64("qty", idx as i64)
+            .unwrap()
+            .column_f64("px", 100.0 + idx as f64)
+            .unwrap()
+            .at(TimestampNanos::new(BASE_TS_NANOS + idx as i64))
+            .unwrap();
+    }
+
+    let mut sender = db.borrow_sender().unwrap();
+    sender
+        .flush_buffer_and_wait(&mut buffer, AckLevel::Ok)
+        .unwrap();
+    let payload = frames.recv_timeout(Duration::from_secs(5)).unwrap();
+    assert_eq!(payload, decode_test_hex(GOLDEN));
+    assert!(buffer.is_empty());
+}
+
+#[cfg(feature = "arrow-ingress")]
+#[test]
+fn mixed_sfa_shapes_share_symbols_fsns_ack_timeout_and_pool_reborrow() {
+    use crate::ingress::column_sender::ArrowColumnOverride;
+
+    let (server, release_acks, frames) = MockServer::spawn_ack_when_released_capturing(1);
+    let db = QuestDb::connect(&conf_for(server.port(), "pool_reap=manual;")).unwrap();
+
+    let first_fsn = {
+        let mut sender = db.borrow_sender().unwrap();
+        let mut buffer = one_symbol_buffer(&db, "alpha");
+        let fsn = sender
+            .flush_buffer_and_get_fsn(&mut buffer)
+            .unwrap()
+            .unwrap();
+        assert!(buffer.is_empty());
+        fsn
+    };
+    assert_eq!(db.free_count(), 1, "the live SFA stream is pooled");
+
+    let mut sender = db
+        .borrow_sender()
+        .expect("reborrow the same stream with its queued Buffer frame");
+    assert_eq!(sender.published_fsn().unwrap(), Some(first_fsn));
+
+    let codes = [0_i32, 1_i32];
+    let offsets = [0_i32, 5_i32, 10_i32];
+    let timestamps = [1_i64, 2_i64];
+    let mut chunk = Chunk::new("trades");
+    chunk
+        .symbol_i32("sym", &codes, &offsets, b"alphabravo", None)
+        .unwrap();
+    chunk.at_nanos(&timestamps).unwrap();
+    let chunk_fsn = sender.flush_and_get_fsn(&mut chunk).unwrap().unwrap();
+    assert!(chunk.is_empty());
+
+    let batch = symbol_arrow_batch(vec!["bravo", "charlie"]);
+    let overrides = [ArrowColumnOverride::Symbol { column: "sym" }];
+    let arrow_fsn = sender
+        .flush_arrow_batch_at_now_and_get_fsn("trades", &batch, &overrides)
+        .unwrap()
+        .unwrap();
+
+    let mut reused = one_symbol_buffer(&db, "alpha");
+    let final_fsn = sender
+        .flush_buffer_and_get_fsn(&mut reused)
+        .unwrap()
+        .unwrap();
+    assert!(reused.is_empty());
+    assert!(
+        first_fsn < chunk_fsn && chunk_fsn < arrow_fsn && arrow_fsn < final_fsn,
+        "FSNs must be monotonic across Buffer, Chunk, Arrow, Buffer"
+    );
+
+    let first_payload = frames
+        .recv_timeout(Duration::from_secs(5))
+        .expect("the peer must receive the first frame before withholding ACKs");
+    let err = sender
+        .wait(AckLevel::Ok, Duration::from_millis(150))
+        .expect_err("one wait over the mixed sequence must observe ACK starvation");
+    assert_eq!(err.code(), ErrorCode::FailoverRetry);
+    assert!(err.msg().contains("no ack progress"), "{err}");
+
+    release_acks.store(true, Ordering::SeqCst);
+    sender
+        .wait(AckLevel::Ok, Duration::from_secs(30))
+        .expect("one cumulative wait must cover every mixed-shape FSN");
+    assert!(
+        sender
+            .acked_fsn()
+            .unwrap()
+            .is_some_and(|acked| acked >= final_fsn)
+    );
+
+    let mut captured = vec![first_payload];
+    captured.extend(frames.try_iter());
+    let data_frames: Vec<&Vec<u8>> = captured
+        .iter()
+        .filter(|frame| {
+            frame.len() >= 12
+                && &frame[..4] == b"QWP1"
+                && u16::from_le_bytes([frame[6], frame[7]]) >= 1
+        })
+        .collect();
+    assert_eq!(data_frames.len(), 4);
+    assert_eq!(
+        parse_delta_dict_prefix(data_frames[0]),
+        (0, vec![b"alpha".to_vec()])
+    );
+    assert_eq!(
+        parse_delta_dict_prefix(data_frames[1]),
+        (1, vec![b"bravo".to_vec()])
+    );
+    assert_eq!(
+        parse_delta_dict_prefix(data_frames[2]),
+        (2, vec![b"charlie".to_vec()])
+    );
+    assert_eq!(
+        parse_delta_dict_prefix(data_frames[3]),
+        (3, Vec::new()),
+        "a Buffer must reuse alpha's id after Chunk and Arrow extended the namespace"
+    );
+}
+
+#[cfg(feature = "arrow-ingress")]
+#[test]
+fn mixed_sfa_queue_pressure_rolls_back_the_failing_encoder_namespace() {
+    use crate::ingress::column_sender::ArrowColumnOverride;
+
+    let (server, release_acks, frames) = MockServer::spawn_ack_when_released_capturing(1);
+    let db = QuestDb::connect(&conf_for(
+        server.port(),
+        "pool_reap=manual;max_in_flight=2;sf_append_deadline_millis=25;",
+    ))
+    .unwrap();
+    let mut sender = db.borrow_sender().unwrap();
+
+    let mut first = one_symbol_buffer(&db, "alpha");
+    let first_fsn = sender
+        .flush_buffer_and_get_fsn(&mut first)
+        .unwrap()
+        .unwrap();
+    let first_payload = frames.recv_timeout(Duration::from_secs(5)).unwrap();
+
+    let codes = [0_i32];
+    let offsets = [0_i32, 5_i32];
+    let timestamps = [2_i64];
+    let mut second = Chunk::new("trades");
+    second
+        .symbol_i32("sym", &codes, &offsets, b"bravo", None)
+        .unwrap();
+    second.at_nanos(&timestamps).unwrap();
+    let second_fsn = sender.flush_and_get_fsn(&mut second).unwrap().unwrap();
+    assert!(second_fsn > first_fsn);
+
+    let failed_batch = symbol_arrow_batch(vec!["charlie"]);
+    let overrides = [ArrowColumnOverride::Symbol { column: "sym" }];
+    let err = sender
+        .flush_arrow_batch_at_now_and_get_fsn("trades", &failed_batch, &overrides)
+        .expect_err("the third mixed frame must time out behind max_in_flight=2");
+    assert_eq!(err.code(), ErrorCode::SocketError);
+    assert!(
+        err.msg()
+            .contains("timed out waiting for local queue capacity")
+    );
+    assert_eq!(sender.published_fsn().unwrap(), Some(second_fsn));
+
+    release_acks.store(true, Ordering::SeqCst);
+    sender.wait(AckLevel::Ok, Duration::from_secs(30)).unwrap();
+    let second_payload = frames.recv_timeout(Duration::from_secs(5)).unwrap();
+
+    let mut after_failure = one_symbol_buffer(&db, "delta");
+    let final_fsn = sender
+        .flush_buffer_and_get_fsn(&mut after_failure)
+        .unwrap()
+        .unwrap();
+    sender.wait(AckLevel::Ok, Duration::from_secs(30)).unwrap();
+    let final_payload = frames.recv_timeout(Duration::from_secs(5)).unwrap();
+    assert!(final_fsn > second_fsn);
+
+    assert_eq!(
+        parse_delta_dict_prefix(&first_payload),
+        (0, vec![b"alpha".to_vec()])
+    );
+    assert_eq!(
+        parse_delta_dict_prefix(&second_payload),
+        (1, vec![b"bravo".to_vec()])
+    );
+    assert_eq!(
+        parse_delta_dict_prefix(&final_payload),
+        (2, vec![b"delta".to_vec()]),
+        "the rejected Arrow frame must free charlie's id for the next Buffer"
+    );
+}
+
+#[cfg(feature = "arrow-ingress")]
+#[test]
+fn mixed_sfa_namespace_survives_endpoint_failover_and_catch_up() {
+    use crate::ingress::column_sender::ArrowColumnOverride;
+
+    let first = MockServer::spawn_ack_then_close(1, 1);
+    let (live, frames) = MockServer::spawn_acking_capturing(4);
+    let conf = format!(
+        "ws::addr=127.0.0.1:{},127.0.0.1:{};auth_timeout=2000;\
+         reconnect_max_duration_millis=10000;pool_reap=manual;",
+        first.port(),
+        live.port()
+    );
+    let db = QuestDb::connect(&conf).unwrap();
+    let mut sender = db.borrow_sender().unwrap();
+
+    let mut initial = one_symbol_buffer(&db, "alpha");
+    sender
+        .flush_buffer_and_wait(&mut initial, AckLevel::Ok)
+        .expect("the first endpoint ACKs alpha before closing");
+    let initial_fsn = sender.published_fsn().unwrap().unwrap();
+
+    let codes = [0_i32, 1_i32];
+    let offsets = [0_i32, 5_i32, 10_i32];
+    let timestamps = [2_i64, 3_i64];
+    let mut chunk = Chunk::new("trades");
+    chunk
+        .symbol_i32("sym", &codes, &offsets, b"alphabravo", None)
+        .unwrap();
+    chunk.at_nanos(&timestamps).unwrap();
+    let chunk_fsn = sender.flush_and_get_fsn(&mut chunk).unwrap().unwrap();
+
+    let batch = symbol_arrow_batch(vec!["bravo", "charlie"]);
+    let overrides = [ArrowColumnOverride::Symbol { column: "sym" }];
+    let arrow_fsn = sender
+        .flush_arrow_batch_at_now_and_get_fsn("trades", &batch, &overrides)
+        .unwrap()
+        .unwrap();
+
+    let mut reused = one_symbol_buffer(&db, "alpha");
+    let final_fsn = sender
+        .flush_buffer_and_get_fsn(&mut reused)
+        .unwrap()
+        .unwrap();
+    assert!(initial_fsn < chunk_fsn && chunk_fsn < arrow_fsn && arrow_fsn < final_fsn);
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        match sender.wait(AckLevel::Ok, Duration::from_secs(30)) {
+            Ok(()) => break,
+            Err(err) if err.code() == ErrorCode::FailoverRetry && Instant::now() < deadline => {
+                thread::sleep(Duration::from_millis(50));
+            }
+            Err(err) => panic!("mixed failover did not recover: {err}"),
+        }
+    }
+
+    let captured: Vec<Vec<u8>> = frames.try_iter().collect();
+    let catch_ups: Vec<&Vec<u8>> = captured
+        .iter()
+        .filter(|frame| {
+            frame.len() >= 12
+                && &frame[..4] == b"QWP1"
+                && u16::from_le_bytes([frame[6], frame[7]]) == 0
+        })
+        .collect();
+    let data_frames: Vec<&Vec<u8>> = captured
+        .iter()
+        .filter(|frame| {
+            frame.len() >= 12
+                && &frame[..4] == b"QWP1"
+                && u16::from_le_bytes([frame[6], frame[7]]) >= 1
+        })
+        .collect();
+    let catch_up = catch_ups
+        .first()
+        .expect("the replacement endpoint must receive a dictionary catch-up");
+    let (catch_up_start, catch_up_symbols) = parse_delta_dict_prefix(catch_up);
+    assert_eq!(catch_up_start, 0);
+    assert!(
+        catch_up_symbols == vec![b"alpha".to_vec()]
+            || catch_up_symbols == vec![b"alpha".to_vec(), b"bravo".to_vec()],
+        "the old socket may fail before or after its final write, but catch-up must be a contiguous alpha[/bravo] prefix: {catch_up_symbols:?}"
+    );
+    assert_eq!(data_frames.len(), 3);
+    assert_eq!(
+        parse_delta_dict_prefix(data_frames[0]),
+        (1, vec![b"bravo".to_vec()])
+    );
+    assert_eq!(
+        parse_delta_dict_prefix(data_frames[1]),
+        (2, vec![b"charlie".to_vec()])
+    );
+    assert_eq!(parse_delta_dict_prefix(data_frames[2]), (3, Vec::new()));
+    assert_eq!(live.accepted(), 1);
+}
+
+#[cfg(feature = "arrow-ingress")]
+#[test]
+fn disk_recovery_orphan_drains_mixed_shapes_with_one_dictionary() {
+    use crate::ingress::column_sender::ArrowColumnOverride;
+
+    let dir = TempDir::new().unwrap();
+    let seed_port = unused_local_port();
+    let seed_conf = format!(
+        "ws::addr=127.0.0.1:{seed_port};auth_timeout=200;\
+         reconnect_max_duration_millis=10000;sf_dir={};sender_id=mixedrec;\
+         pool_size=1;pool_max=2;pool_reap=manual;close_flush_timeout_millis=0;",
+        dir.path().display()
+    );
+    {
+        let db = QuestDb::connect(&seed_conf).unwrap();
+        let _slot_zero = db.borrow_sender().expect("hold slot zero");
+        let mut sender = db.borrow_sender().expect("seed slot one");
+
+        let mut first = one_symbol_buffer(&db, "alpha");
+        sender.flush_buffer(&mut first).unwrap();
+
+        let codes = [0_i32, 1_i32];
+        let offsets = [0_i32, 5_i32, 10_i32];
+        let timestamps = [2_i64, 3_i64];
+        let mut chunk = Chunk::new("trades");
+        chunk
+            .symbol_i32("sym", &codes, &offsets, b"alphabravo", None)
+            .unwrap();
+        chunk.at_nanos(&timestamps).unwrap();
+        sender.flush(&mut chunk).unwrap();
+
+        let batch = symbol_arrow_batch(vec!["bravo", "charlie"]);
+        let overrides = [ArrowColumnOverride::Symbol { column: "sym" }];
+        sender
+            .flush_arrow_batch_at_now_and_get_fsn("trades", &batch, &overrides)
+            .unwrap()
+            .unwrap();
+
+        let mut reused = one_symbol_buffer(&db, "alpha");
+        sender.flush_buffer(&mut reused).unwrap();
+    }
+
+    let orphan = dir.path().join("mixedrec-ingest-1");
+    assert!(slot_has_sfa_file(&orphan));
+    let side_file = std::fs::read(orphan.join(".symbol-dict")).unwrap();
+    for symbol in [
+        b"alpha".as_slice(),
+        b"bravo".as_slice(),
+        b"charlie".as_slice(),
+    ] {
+        assert!(
+            side_file
+                .windows(symbol.len())
+                .any(|window| window == symbol),
+            "persisted mixed dictionary must contain {}",
+            String::from_utf8_lossy(symbol)
+        );
+    }
+
+    let (live, frames) = MockServer::spawn_acking_capturing(8);
+    let replay_conf = conf_for_endpoints(
+        &[live.port()],
+        &format!(
+            "sf_dir={};sender_id=mixedrec;pool_size=1;pool_max=1;\
+             pool_reap=manual;max_background_drainers=1;",
+            dir.path().display()
+        ),
+    );
+    let db = QuestDb::connect(&replay_conf).unwrap();
+    let _sender = db
+        .borrow_sender()
+        .expect("slot zero starts out-of-range orphan recovery");
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut captured = Vec::new();
+    while Instant::now() < deadline {
+        captured.extend(frames.try_iter());
+        let data_count = captured
+            .iter()
+            .filter(|frame| {
+                frame.len() >= 12
+                    && &frame[..4] == b"QWP1"
+                    && u16::from_le_bytes([frame[6], frame[7]]) >= 1
+            })
+            .count();
+        if data_count >= 4 {
+            break;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+
+    let catch_ups: Vec<&Vec<u8>> = captured
+        .iter()
+        .filter(|frame| {
+            frame.len() >= 12
+                && &frame[..4] == b"QWP1"
+                && u16::from_le_bytes([frame[6], frame[7]]) == 0
+        })
+        .collect();
+    let data_frames: Vec<&Vec<u8>> = captured
+        .iter()
+        .filter(|frame| {
+            frame.len() >= 12
+                && &frame[..4] == b"QWP1"
+                && u16::from_le_bytes([frame[6], frame[7]]) >= 1
+        })
+        .collect();
+    assert_eq!(
+        parse_delta_dict_prefix(
+            catch_ups
+                .first()
+                .expect("orphan recovery must register its persisted dictionary")
+        ),
+        (
+            0,
+            vec![b"alpha".to_vec(), b"bravo".to_vec(), b"charlie".to_vec()]
+        )
+    );
+    assert_eq!(data_frames.len(), 4, "all mixed frames must replay");
+    assert_eq!(
+        parse_delta_dict_prefix(data_frames[0]),
+        (0, vec![b"alpha".to_vec()])
+    );
+    assert_eq!(
+        parse_delta_dict_prefix(data_frames[1]),
+        (1, vec![b"bravo".to_vec()])
+    );
+    assert_eq!(
+        parse_delta_dict_prefix(data_frames[2]),
+        (2, vec![b"charlie".to_vec()])
+    );
+    assert_eq!(parse_delta_dict_prefix(data_frames[3]), (3, Vec::new()));
+    assert!(
+        wait_until(Duration::from_secs(5), || !slot_has_sfa_file(&orphan)),
+        "the out-of-range mixed slot must drain completely"
+    );
+    assert!(!orphan.join(".failed").exists());
+}
+
+#[test]
+fn terminal_sfa_sender_is_not_recycled_into_the_next_borrow() {
+    let server = MockServer::spawn_erroring(2, QWP_STATUS_SCHEMA_MISMATCH);
+    let db = QuestDb::connect(&conf_for(server.port(), "pool_reap=manual;")).unwrap();
+    {
+        let mut sender = db.borrow_sender().unwrap();
+        let mut buffer = one_symbol_buffer(&db, "alpha");
+        let err = sender
+            .flush_buffer_and_wait(&mut buffer, AckLevel::Ok)
+            .expect_err("the first stream must latch the terminal server rejection");
+        assert_eq!(err.code(), ErrorCode::ServerRejection);
+        assert!(sender.must_close_for_test());
+        assert!(
+            buffer.is_empty(),
+            "the rejected frame was locally published"
+        );
+    }
+    assert_eq!(db.free_count(), 0, "terminal SFA state must not recycle");
+    assert_eq!(db.in_use_count(), 0);
+
+    let fresh = db
+        .borrow_sender()
+        .expect("the next borrow must construct a fresh SFA stream");
+    assert!(!fresh.must_close_for_test());
+    assert_eq!(fresh.published_fsn().unwrap(), None);
+    assert!(
+        wait_until(Duration::from_secs(2), || server.accepted() == 2),
+        "the fresh borrow must open a new physical connection"
+    );
+}
+
 fn check_store_and_forward_sync_reports_terminal_schema_rejection(extras: &str) {
     let server = MockServer::spawn_erroring(1, QWP_STATUS_SCHEMA_MISMATCH);
     let conf = conf_for_endpoints(&[server.port()], extras);
     let db = QuestDb::connect(&conf).unwrap();
-    let mut sender = db.borrow_column_sender().unwrap();
+    let mut sender = db.borrow_sender().unwrap();
 
     let mut chunk = Chunk::new("trades");
     let qty1 = [1_i64];
@@ -1308,7 +2135,7 @@ fn check_store_and_forward_sync_times_out_on_silent_but_alive_peer(extras: &str)
     let server = MockServer::spawn(1);
     let conf = conf_for_endpoints(&[server.port()], extras);
     let db = QuestDb::connect(&conf).unwrap();
-    let mut sender = db.borrow_column_sender().unwrap();
+    let mut sender = db.borrow_sender().unwrap();
 
     let mut chunk = Chunk::new("trades");
     let qty = [1_i64];
@@ -1506,7 +2333,7 @@ fn store_and_forward_flush_splits_oversize_chunk_into_self_sufficient_frames() {
     chunk.column_i64("qty", &qty, None).unwrap();
     chunk.at_nanos(&ts).unwrap();
 
-    let mut sender = db.borrow_column_sender().unwrap();
+    let mut sender = db.borrow_sender().unwrap();
     let fsn = sender
         .flush_and_get_fsn(&mut chunk)
         .expect("oversize chunk splits and appends")
@@ -1563,7 +2390,7 @@ fn check_store_and_forward_drop_on_return_drops_backend_and_reopens_on_next_borr
     let db = QuestDb::connect(&conf).unwrap();
 
     {
-        let mut sender = db.borrow_column_sender().unwrap();
+        let mut sender = db.borrow_sender().unwrap();
         assert!(
             wait_until(Duration::from_secs(2), || server.accepted() == 1),
             "first SFA borrow should start its background connection; accepted={}",
@@ -1577,7 +2404,7 @@ fn check_store_and_forward_drop_on_return_drops_backend_and_reopens_on_next_borr
     assert_eq!(db.in_use_count(), 0);
 
     let _again = db
-        .borrow_column_sender()
+        .borrow_sender()
         .expect("next borrow should reopen the SFA slot");
     assert!(
         wait_until(Duration::from_secs(2), || server.accepted() == 2),
@@ -1590,7 +2417,7 @@ fn check_store_and_forward_append_timeout_rolls_back_symbols_and_keeps_chunk(ext
     let (server, release_acks, frames) = MockServer::spawn_ack_when_released_capturing(1);
     let conf = conf_for_endpoints(&[server.port()], extras);
     let db = QuestDb::connect(&conf).unwrap();
-    let mut sender = db.borrow_column_sender().unwrap();
+    let mut sender = db.borrow_sender().unwrap();
 
     let ts1 = [1_i64];
     let mut first = Chunk::new("trades");
@@ -1649,7 +2476,7 @@ fn check_store_and_forward_flush_and_wait_waits_for_ok_boundary(extras: &str) {
     let server = MockServer::spawn_acking(1);
     let conf = conf_for_endpoints(&[server.port()], extras);
     let db = QuestDb::connect(&conf).unwrap();
-    let mut sender = db.borrow_column_sender().unwrap();
+    let mut sender = db.borrow_sender().unwrap();
 
     let mut chunk = Chunk::new("trades");
     let qty = [1_i64];
@@ -1680,7 +2507,7 @@ fn store_and_forward_flush_and_wait_durable_without_opt_in_keeps_chunk() {
         &format!("sf_dir={};pool_reap=manual;", dir.path().display()),
     );
     let db = QuestDb::connect(&conf).unwrap();
-    let mut sender = db.borrow_column_sender().unwrap();
+    let mut sender = db.borrow_sender().unwrap();
 
     let mut chunk = Chunk::new("trades");
     let qty = [1_i64];
@@ -1711,7 +2538,7 @@ fn check_store_and_forward_flush_and_wait_timeout_after_append_clears_chunk(extr
     let server = MockServer::spawn(1);
     let conf = conf_for_endpoints(&[server.port()], extras);
     let db = QuestDb::connect(&conf).unwrap();
-    let mut sender = db.borrow_column_sender().unwrap();
+    let mut sender = db.borrow_sender().unwrap();
 
     let mut chunk = Chunk::new("trades");
     let qty = [1_i64];
@@ -1740,7 +2567,7 @@ fn check_store_and_forward_flush_and_wait_surfaces_server_rejection(extras: &str
     let server = MockServer::spawn_erroring(1, QWP_STATUS_SCHEMA_MISMATCH);
     let conf = conf_for_endpoints(&[server.port()], extras);
     let db = QuestDb::connect(&conf).unwrap();
-    let mut sender = db.borrow_column_sender().unwrap();
+    let mut sender = db.borrow_sender().unwrap();
 
     let mut chunk = Chunk::new("trades");
     let qty = [1_i64];
@@ -1764,7 +2591,7 @@ fn check_store_and_forward_flush_and_wait_durable_succeeds_with_opt_in(extras: &
     let (server, _frames) = MockServer::spawn_acking_durable_capturing(2);
     let conf = conf_for_endpoints(&[server.port()], extras);
     let db = QuestDb::connect(&conf).unwrap();
-    let mut sender = db.borrow_column_sender().unwrap();
+    let mut sender = db.borrow_sender().unwrap();
     assert!(sender.is_store_and_forward());
     // Bound the no-progress wait so a protocol regression fails fast instead of
     // blocking on the 30s request timeout.
@@ -1817,7 +2644,7 @@ fn store_and_forward_runner_reconnects_and_replays_after_transport_death() {
         live.port()
     );
     let db = QuestDb::connect(&conf).unwrap();
-    let mut sender = db.borrow_column_sender().expect("borrow");
+    let mut sender = db.borrow_sender().expect("borrow");
     assert!(sender.is_store_and_forward());
 
     let mut chunk = Chunk::new("trades");
@@ -1854,7 +2681,7 @@ fn store_and_forward_runner_reconnects_and_replays_after_transport_death() {
 }
 
 // Each `check_store_and_forward_*` behaviour above runs on both backends that
-// `borrow_column_sender` uses: disk-backed SF (`sf_dir` set, pool-minted slot
+// `borrow_sender` uses: disk-backed SF (`sf_dir` set, pool-minted slot
 // dirs) and in-memory SF (no `sf_dir`). The body is backend-agnostic; only the
 // conf differs. The `_dir` `TempDir` outlives each `check_*` call because the
 // call opens and drops its `QuestDb` before the wrapper returns.
@@ -1932,7 +2759,7 @@ fn store_and_forward_file_mode_writes_symbols_ahead_to_side_file() {
         &sf_disk_extras(&dir, "pool_reap=manual;sender_id=recov;"),
     );
     let db = QuestDb::connect(&conf).unwrap();
-    let mut sender = db.borrow_column_sender().unwrap();
+    let mut sender = db.borrow_sender().unwrap();
 
     let mut first = Chunk::new("trades");
     append_one_symbol_row(&mut first, b"alpha", &[1_i64]);
@@ -1945,9 +2772,9 @@ fn store_and_forward_file_mode_writes_symbols_ahead_to_side_file() {
     // own CRC-committed record. Assert format-agnostically (each record's payload
     // carries the `[len]"symbol"` entry) that both are present and alpha precedes
     // bravo, rather than hardcoding the framing/CRC bytes. The pool mints a
-    // kind-scoped slot per borrowed column sender, so the first one lives under
-    // `<sender_id>-col-0`, not the bare `sender_id`.
-    let side_file = dir.path().join("recov-col-0").join(".symbol-dict");
+    // managed slot per borrowed sender, so the first one lives under
+    // `<sender_id>-ingest-0`, not the bare `sender_id`.
+    let side_file = dir.path().join("recov-ingest-0").join(".symbol-dict");
     let bytes = std::fs::read(&side_file).expect("side-file must exist after file-mode flushes");
     let alpha_pos = bytes
         .windows(6)
@@ -1965,7 +2792,7 @@ fn store_and_forward_file_mode_writes_symbols_ahead_to_side_file() {
 
 #[test]
 fn store_and_forward_file_mode_recovers_and_replays_queued_frame_after_reopen() {
-    // Recoverability round-trip for the disk-backed column sender: a symbol frame
+    // Recoverability round-trip for the disk-backed unified sender: a symbol frame
     // flushed to a file-mode slot but left unacked must survive the sender/db being
     // dropped (a process restart) and be replayed + delivered when a FRESH QuestDb
     // reopens the same slot -- proving the queued data (and its persisted
@@ -1983,7 +2810,7 @@ fn store_and_forward_file_mode_recovers_and_replays_queued_frame_after_reopen() 
             &sf_disk_extras(&dir, "pool_reap=manual;sender_id=recov;"),
         );
         let db = QuestDb::connect(&conf).unwrap();
-        let mut sender = db.borrow_column_sender().unwrap();
+        let mut sender = db.borrow_sender().unwrap();
         let mut chunk = Chunk::new("trades");
         append_one_symbol_row(&mut chunk, b"alpha", &[1_i64]);
         sender.flush(&mut chunk).unwrap();
@@ -2001,7 +2828,7 @@ fn store_and_forward_file_mode_recovers_and_replays_queued_frame_after_reopen() 
         &sf_disk_extras(&dir, "pool_reap=manual;sender_id=recov;"),
     );
     let db = QuestDb::connect(&conf).unwrap();
-    let _sender = db.borrow_column_sender().unwrap();
+    let _sender = db.borrow_sender().unwrap();
 
     // Count replayed DATA frames (table_count >= 1 at bytes 6..8); the table-less
     // catch-up frame that precedes them carries table_count == 0.
@@ -2051,7 +2878,7 @@ fn store_and_forward_file_mode_value_corruption_is_healed_and_segment_kept() {
             &sf_disk_extras(&dir, "pool_reap=manual;sender_id=recov;"),
         );
         let db = QuestDb::connect(&conf).unwrap();
-        let mut sender = db.borrow_column_sender().unwrap();
+        let mut sender = db.borrow_sender().unwrap();
         let mut chunk = Chunk::new("trades");
         append_one_symbol_row(&mut chunk, b"alpha", &[1_i64]);
         sender.flush(&mut chunk).unwrap();
@@ -2060,9 +2887,9 @@ fn store_and_forward_file_mode_value_corruption_is_healed_and_segment_kept() {
     }
 
     // A host/power crash flips a byte of the persisted symbol, keeping its length.
-    // The pool mints a kind-scoped slot per borrowed column sender, so the first
-    // one lives under `<sender_id>-col-0`, not the bare `sender_id`.
-    let slot_dir = dir.path().join("recov-col-0");
+    // The pool mints a managed slot per borrowed sender, so the first
+    // one lives under `<sender_id>-ingest-0`, not the bare `sender_id`.
+    let slot_dir = dir.path().join("recov-ingest-0");
     let side_file = slot_dir.join(".symbol-dict");
     {
         let mut bytes =
@@ -2121,7 +2948,7 @@ fn store_and_forward_file_mode_recovers_a_mid_stream_delta_frame() {
             &sf_disk_extras(&dir, "pool_reap=manual;sender_id=recov;"),
         );
         let db = QuestDb::connect(&conf).unwrap();
-        let mut sender = db.borrow_column_sender().unwrap();
+        let mut sender = db.borrow_sender().unwrap();
         let mut first = Chunk::new("trades");
         append_one_symbol_row(&mut first, b"alpha", &[1_i64]);
         sender.flush(&mut first).unwrap();
@@ -2141,7 +2968,7 @@ fn store_and_forward_file_mode_recovers_a_mid_stream_delta_frame() {
         &sf_disk_extras(&dir, "pool_reap=manual;sender_id=recov;"),
     );
     let db = QuestDb::connect(&conf).unwrap();
-    let _sender = db.borrow_column_sender().unwrap();
+    let _sender = db.borrow_sender().unwrap();
 
     let deadline = Instant::now() + Duration::from_secs(10);
     let mut captured: Vec<Vec<u8>> = Vec::new();
@@ -2261,7 +3088,7 @@ fn pool_is_lazy_and_opens_on_first_borrow() {
     assert_eq!(db.in_use_count(), 0);
     assert_eq!(server.accepted(), 0);
     // The first borrow opens exactly one connection.
-    let _b = db.borrow_column_sender().expect("borrow");
+    let _b = db.borrow_sender().expect("borrow");
     assert_eq!(db.in_use_count(), 1);
     assert!(
         wait_until(Duration::from_secs(2), || server.accepted() == 1),
@@ -2271,27 +3098,23 @@ fn pool_is_lazy_and_opens_on_first_borrow() {
 }
 
 #[test]
-fn borrow_column_sender_is_in_memory_store_and_forward_without_sf_dir() {
-    // Without `sf_dir`, `borrow_column_sender` yields an in-memory
+fn borrow_sender_is_in_memory_store_and_forward_without_sf_dir() {
+    // Without `sf_dir`, `borrow_sender` yields an in-memory
     // store-and-forward sender (mirroring the row-major sender). It pools
     // freely up to `pool_max`, just like disk-backed SF with per-borrower
     // slots.
     let server = MockServer::spawn(8);
     let db = QuestDb::connect(&conf_for(server.port(), "pool_size=1;pool_max=3;")).unwrap();
 
-    let b1 = db.borrow_column_sender().expect("b1");
+    let b1 = db.borrow_sender().expect("b1");
     assert!(
         b1.is_store_and_forward(),
-        "borrow_column_sender must be store-and-forward even without sf_dir"
+        "borrow_sender must be store-and-forward even without sf_dir"
     );
 
     // In-memory SF pools freely: concurrent borrows succeed up to `pool_max`.
-    let b2 = db
-        .borrow_column_sender()
-        .expect("b2 (in-memory SF pools freely)");
-    let b3 = db
-        .borrow_column_sender()
-        .expect("b3 (in-memory SF pools freely)");
+    let b2 = db.borrow_sender().expect("b2 (in-memory SF pools freely)");
+    let b3 = db.borrow_sender().expect("b3 (in-memory SF pools freely)");
     assert!(b2.is_store_and_forward());
     assert!(b3.is_store_and_forward());
     assert_eq!(db.in_use_count(), 3);
@@ -2304,9 +3127,7 @@ fn borrow_column_sender_is_in_memory_store_and_forward_without_sf_dir() {
     );
 
     // At the cap, the next borrow fails fast like any pooled resource.
-    let err = db
-        .borrow_column_sender()
-        .expect_err("must fail-fast at pool_max");
+    let err = db.borrow_sender().expect_err("must fail-fast at pool_max");
     assert_eq!(err.code(), ErrorCode::InvalidApiCall);
     assert!(err.msg().contains("pool_max"), "msg: {}", err.msg());
 }
@@ -2318,7 +3139,7 @@ fn borrow_and_return_reuses_connection() {
     // Lazy pool: nothing open until the first borrow.
     assert_eq!(db.free_count(), 0);
     {
-        let _borrow = db.borrow_column_sender().expect("borrow");
+        let _borrow = db.borrow_sender().expect("borrow");
         assert_eq!(db.free_count(), 0);
         assert_eq!(db.in_use_count(), 1);
         assert!(
@@ -2331,22 +3152,20 @@ fn borrow_and_return_reuses_connection() {
     assert_eq!(db.free_count(), 1);
     assert_eq!(db.in_use_count(), 0);
     // Re-borrow reuses it — the server only ever accepted one connection.
-    let _again = db.borrow_column_sender().expect("reuse");
+    let _again = db.borrow_sender().expect("reuse");
     assert_eq!(server.accepted(), 1);
 }
 
 #[cfg(feature = "ffi-support")]
 #[test]
-fn owned_column_sender_observes_pool_close_and_drops_after_close() {
+fn owned_sender_observes_pool_close_and_drops_after_close() {
     let server = MockServer::spawn(2);
     let db = QuestDb::connect(&conf_for(
         server.port(),
         "pool_size=1;pool_max=2;close_flush_timeout_millis=50;",
     ))
     .unwrap();
-    let owned = db
-        .borrow_column_sender_owned()
-        .expect("borrow owned column sender");
+    let owned = db.borrow_sender_owned().expect("borrow owned sender");
     assert_eq!(db.free_count(), 0);
     assert_eq!(db.in_use_count(), 1);
     assert!(!owned.pool_closed());
@@ -2360,9 +3179,9 @@ fn owned_column_sender_observes_pool_close_and_drops_after_close() {
 fn auto_grow_opens_new_connection_until_pool_max() {
     let server = MockServer::spawn(4);
     let db = QuestDb::connect(&conf_for(server.port(), "pool_size=1;pool_max=3;")).unwrap();
-    let b1 = db.borrow_column_sender().expect("b1");
-    let b2 = db.borrow_column_sender().expect("b2 (auto-grow)");
-    let b3 = db.borrow_column_sender().expect("b3 (auto-grow)");
+    let b1 = db.borrow_sender().expect("b1");
+    let b2 = db.borrow_sender().expect("b2 (auto-grow)");
+    let b3 = db.borrow_sender().expect("b3 (auto-grow)");
     assert_eq!(db.free_count(), 0);
     assert_eq!(db.in_use_count(), 3);
     wait_until(Duration::from_secs(2), || server.accepted() == 3);
@@ -2377,11 +3196,9 @@ fn auto_grow_opens_new_connection_until_pool_max() {
 fn fail_fast_at_pool_max() {
     let server = MockServer::spawn(4);
     let db = QuestDb::connect(&conf_for(server.port(), "pool_size=1;pool_max=2;")).unwrap();
-    let _b1 = db.borrow_column_sender().expect("b1");
-    let _b2 = db.borrow_column_sender().expect("b2");
-    let err = db
-        .borrow_column_sender()
-        .expect_err("must fail-fast at cap");
+    let _b1 = db.borrow_sender().expect("b1");
+    let _b2 = db.borrow_sender().expect("b2");
+    let err = db.borrow_sender().expect_err("must fail-fast at cap");
     assert_eq!(err.code(), ErrorCode::InvalidApiCall);
     assert!(err.msg().contains("pool_max"), "msg: {}", err.msg());
 }
@@ -2391,7 +3208,7 @@ fn fail_fast_at_pool_max() {
 //
 // A second, always-direct pool that exists independently of `sf_dir`: it is
 // lazy (no eager open), never store-and-forward, and poolable up to `pool_max`
-// on its own free list, separate from the main `borrow_column_sender` pool.
+// on its own free list, separate from the main `borrow_sender` pool.
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -2478,7 +3295,7 @@ fn direct_and_main_pools_are_independent() {
     let server = MockServer::spawn(8);
     let db = QuestDb::connect(&conf_for(server.port(), "pool_size=1;pool_max=2;")).unwrap();
 
-    let _main = db.borrow_column_sender().expect("main borrow");
+    let _main = db.borrow_sender().expect("main borrow");
     assert_eq!(db.in_use_count(), 1);
     assert_eq!(db.direct_in_use_count(), 0);
 
@@ -2488,7 +3305,7 @@ fn direct_and_main_pools_are_independent() {
 
     // Each pool enforces `pool_max` on its own free list, so the main pool can
     // still grow to its cap while a direct borrow is outstanding.
-    let _main2 = db.borrow_column_sender().expect("main grows to cap");
+    let _main2 = db.borrow_sender().expect("main grows to cap");
     assert_eq!(db.in_use_count(), 2);
     assert_eq!(db.direct_in_use_count(), 1);
 }
@@ -2509,18 +3326,18 @@ fn direct_pool_is_direct_even_when_sf_dir_is_set() {
     );
     let db = QuestDb::connect(&conf).unwrap();
 
-    let main = db.borrow_column_sender().expect("main SFA borrow");
+    let main = db.borrow_sender().expect("main SFA borrow");
     assert!(
         main.is_store_and_forward(),
         "with sf_dir the main pool must be store-and-forward"
     );
     let main2 = db
-        .borrow_column_sender()
+        .borrow_sender()
         .expect("second main SFA borrow gets its own slot");
     assert!(main2.is_store_and_forward());
     assert_eq!(
         sorted_slot_names(dir.path()),
-        vec!["directmix-col-0", "directmix-col-1"]
+        vec!["directmix-ingest-0", "directmix-ingest-1"]
     );
 
     // The direct pool is unaffected: it yields a direct sender concurrently.
@@ -2566,54 +3383,54 @@ fn direct_pool_reaps_idle_connections() {
 }
 
 #[test]
-fn row_sender_pool_borrows_recycles_and_caps() {
+fn buffer_sender_pool_borrows_recycles_and_caps() {
     let server = MockServer::spawn_acking(16);
     let db = QuestDb::connect(&conf_for(server.port(), "pool_size=1;pool_max=2;")).unwrap();
 
-    // Without disk-SF recovery, nothing exists until the first row borrow.
-    assert_eq!(db.row_sender_free_count(), 0);
-    assert_eq!(db.row_sender_in_use_count(), 0);
+    // Without disk-SF recovery, nothing exists until the first borrow.
+    assert_eq!(db.free_count(), 0);
+    assert_eq!(db.in_use_count(), 0);
 
     {
-        let _s1 = db.borrow_row_sender().expect("borrow row sender");
-        assert_eq!(db.row_sender_in_use_count(), 1);
-        assert_eq!(db.row_sender_free_count(), 0);
-    } // Drop returns it to the row pool.
+        let _s1 = db.borrow_sender().expect("borrow sender");
+        assert_eq!(db.in_use_count(), 1);
+        assert_eq!(db.free_count(), 0);
+    } // Drop returns it to the ingestion pool.
 
-    assert_eq!(db.row_sender_in_use_count(), 0);
+    assert_eq!(db.in_use_count(), 0);
     assert_eq!(
-        db.row_sender_free_count(),
+        db.free_count(),
         1,
-        "a clean row sender must be recycled on return"
+        "a clean sender must be recycled on return"
     );
 
     // Re-borrow reuses the recycled sender (no new connection).
-    let s2 = db.borrow_row_sender().expect("reuse recycled");
-    assert_eq!(db.row_sender_free_count(), 0);
-    assert_eq!(db.row_sender_in_use_count(), 1);
+    let s2 = db.borrow_sender().expect("reuse recycled");
+    assert_eq!(db.free_count(), 0);
+    assert_eq!(db.in_use_count(), 1);
 
-    // Auto-grow up to the row pool's independent `pool_max`.
-    let s3 = db.borrow_row_sender().expect("grow to pool_max");
-    assert_eq!(db.row_sender_in_use_count(), 2);
+    // Auto-grow up to the unified ingestion pool's `pool_max`.
+    let s3 = db.borrow_sender().expect("grow to pool_max");
+    assert_eq!(db.in_use_count(), 2);
 
     // A third concurrent borrow exceeds pool_max=2 — fail-fast.
-    let err = db.borrow_row_sender().expect_err("must fail-fast at cap");
+    let err = db.borrow_sender().expect_err("must fail-fast at cap");
     assert_eq!(err.code(), ErrorCode::InvalidApiCall);
     assert!(err.msg().contains("pool_max"), "msg: {}", err.msg());
 
     drop(s2);
     drop(s3);
-    assert_eq!(db.row_sender_in_use_count(), 0);
-    assert_eq!(db.row_sender_free_count(), 2);
+    assert_eq!(db.in_use_count(), 0);
+    assert_eq!(db.free_count(), 2);
     drop(db);
 }
 
 #[test]
-fn row_sender_pool_flush_round_trip() {
+fn buffer_sender_pool_flush_round_trip() {
     let server = MockServer::spawn_acking(8);
     let db = QuestDb::connect(&conf_for(server.port(), "pool_size=1;pool_max=2;")).unwrap();
 
-    let mut sender = db.borrow_row_sender().expect("borrow row sender");
+    let mut sender = db.borrow_sender().expect("borrow sender");
     let mut buf = sender.new_buffer();
     buf.table("trades")
         .unwrap()
@@ -2624,13 +3441,13 @@ fn row_sender_pool_flush_round_trip() {
         .at_now()
         .unwrap();
     let fsn = sender
-        .flush_and_get_fsn(&mut buf)
-        .expect("row-major flush over a pooled QWP/WS sender")
+        .flush_buffer_and_get_fsn(&mut buf)
+        .expect("Buffer flush over a pooled QWP/WS sender")
         .expect("non-empty buffer publishes a frame");
     assert_eq!(sender.published_fsn().expect("published fsn"), Some(fsn));
     sender
         .wait(AckLevel::Ok, Duration::from_secs(2))
-        .expect("row-major wait over a pooled QWP/WS sender");
+        .expect("Buffer wait over a pooled QWP/WS sender");
     assert!(
         sender
             .acked_fsn()
@@ -2642,29 +3459,28 @@ fn row_sender_pool_flush_round_trip() {
     let empty = sender.new_buffer();
     assert_eq!(
         sender
-            .flush_and_keep_and_get_fsn(&empty)
+            .flush_buffer_and_keep_and_get_fsn(&empty)
             .expect("empty keep flush"),
         None
     );
-    #[cfg(feature = "sync-sender-http")]
     sender
-        .flush_and_keep_with_flags(&empty, false)
-        .expect("empty non-transactional flush with explicit flags");
+        .flush_buffer_and_keep(&empty)
+        .expect("empty keep flush");
 
     drop(sender);
 
     // The flushed sender is clean, so it returns to the pool for reuse.
-    assert_eq!(db.row_sender_in_use_count(), 0);
-    assert_eq!(db.row_sender_free_count(), 1);
+    assert_eq!(db.in_use_count(), 0);
+    assert_eq!(db.free_count(), 1);
     drop(db);
 }
 
 #[test]
-fn row_sender_flush_and_wait_commits_at_boundary() {
+fn buffer_sender_flush_and_wait_commits_at_boundary() {
     let server = MockServer::spawn_acking(8);
     let db = QuestDb::connect(&conf_for(server.port(), "pool_size=1;pool_max=2;")).unwrap();
 
-    let mut sender = db.borrow_row_sender().expect("borrow row sender");
+    let mut sender = db.borrow_sender().expect("borrow sender");
     let mut buf = sender.new_buffer();
     buf.table("trades")
         .unwrap()
@@ -2675,8 +3491,8 @@ fn row_sender_flush_and_wait_commits_at_boundary() {
         .at_now()
         .unwrap();
     sender
-        .flush_and_wait(&mut buf, AckLevel::Ok)
-        .expect("combined row-major publish+wait over a pooled QWP/WS sender");
+        .flush_buffer_and_wait(&mut buf, AckLevel::Ok)
+        .expect("combined Buffer publish+wait over a pooled QWP/WS sender");
     assert!(
         buf.is_empty(),
         "successful flush_and_wait clears the buffer"
@@ -2695,11 +3511,11 @@ fn row_sender_flush_and_wait_commits_at_boundary() {
 }
 
 #[test]
-fn row_sender_flush_and_wait_durable_without_opt_in_keeps_buffer() {
+fn buffer_sender_flush_and_wait_durable_without_opt_in_keeps_buffer() {
     let server = MockServer::spawn(1);
     let db = QuestDb::connect(&conf_for(server.port(), "pool_size=1;pool_max=2;")).unwrap();
 
-    let mut sender = db.borrow_row_sender().expect("borrow row sender");
+    let mut sender = db.borrow_sender().expect("borrow sender");
     let mut buf = sender.new_buffer();
     buf.table("trades")
         .unwrap()
@@ -2708,7 +3524,7 @@ fn row_sender_flush_and_wait_durable_without_opt_in_keeps_buffer() {
         .at_now()
         .unwrap();
     let err = sender
-        .flush_and_wait(&mut buf, AckLevel::Durable)
+        .flush_buffer_and_wait(&mut buf, AckLevel::Durable)
         .expect_err("durable without opt-in must be rejected up front");
     assert_eq!(err.code(), ErrorCode::InvalidApiCall);
     assert!(
@@ -2724,21 +3540,18 @@ fn row_sender_flush_and_wait_durable_without_opt_in_keeps_buffer() {
 
 #[cfg(feature = "ffi-support")]
 #[test]
-fn row_sender_owned_borrow_flushes_and_recycles() {
+fn buffer_sender_owned_borrow_flushes_and_recycles() {
     let server = MockServer::spawn_acking(8);
     let db = QuestDb::connect(&conf_for(server.port(), "pool_size=1;pool_max=2;")).unwrap();
 
     // The owned handle is the FFI escape hatch backing
-    // `questdb_db_borrow_row_sender`: it carries an `Arc<DbInner>` and
+    // `questdb_db_borrow_sender`: it carries an `Arc<DbInner>` and
     // returns the sender to the pool on Drop.
-    let mut owned = db
-        .borrow_row_sender_owned()
-        .expect("borrow owned row sender");
-    assert_eq!(db.row_sender_in_use_count(), 1);
+    let mut owned = db.borrow_sender_owned().expect("borrow owned sender");
+    assert_eq!(db.in_use_count(), 1);
     assert!(!owned.must_close());
 
-    let sender = owned.get_mut();
-    let mut buf = sender.new_buffer();
+    let mut buf = db.new_buffer();
     buf.table("trades")
         .unwrap()
         .symbol("sym", "ETH-USD")
@@ -2747,47 +3560,48 @@ fn row_sender_owned_borrow_flushes_and_recycles() {
         .unwrap()
         .at_now()
         .unwrap();
-    sender
-        .flush(&mut buf)
-        .expect("row-major flush over an owned pooled QWP/WS sender");
+    owned
+        .get_mut()
+        .flush_buffer(&mut buf)
+        .expect("Buffer flush over an owned pooled QWP/WS sender");
     drop(owned);
 
     // Clean sender returns to the pool for reuse.
-    assert_eq!(db.row_sender_in_use_count(), 0);
-    assert_eq!(db.row_sender_free_count(), 1);
+    assert_eq!(db.in_use_count(), 0);
+    assert_eq!(db.free_count(), 1);
 
     // `_with_retry` with a zero budget makes a single attempt and reuses the
     // recycled sender.
     let owned2 = db
-        .borrow_row_sender_owned_with_retry(Duration::ZERO)
+        .borrow_sender_owned_with_retry(Duration::ZERO)
         .expect("owned retry borrow");
-    assert_eq!(db.row_sender_in_use_count(), 1);
-    assert_eq!(db.row_sender_free_count(), 0);
+    assert_eq!(db.in_use_count(), 1);
+    assert_eq!(db.free_count(), 0);
     drop(owned2);
-    assert_eq!(db.row_sender_free_count(), 1);
+    assert_eq!(db.free_count(), 1);
     drop(db);
 }
 
 #[cfg(feature = "ffi-support")]
 #[test]
-fn row_sender_owned_mark_must_close_drops_not_recycles() {
+fn buffer_sender_owned_mark_must_close_drops_not_recycles() {
     let server = MockServer::spawn_acking(8);
     let db = QuestDb::connect(&conf_for(server.port(), "pool_size=1;pool_max=2;")).unwrap();
 
-    let mut owned = db.borrow_row_sender_owned().expect("borrow owned");
+    let mut owned = db.borrow_sender_owned().expect("borrow owned");
     owned.mark_must_close();
     assert!(owned.must_close());
     drop(owned);
 
     // Marked must-close: dropped, not recycled.
-    assert_eq!(db.row_sender_in_use_count(), 0);
-    assert_eq!(db.row_sender_free_count(), 0);
+    assert_eq!(db.in_use_count(), 0);
+    assert_eq!(db.free_count(), 0);
     drop(db);
 }
 
 #[cfg(feature = "ffi-support")]
 #[test]
-fn owned_row_sender_observes_pool_close_and_drops_after_close() {
+fn owned_buffer_sender_observes_pool_close_and_drops_after_close() {
     let server = MockServer::spawn_acking(8);
     let db = QuestDb::connect(&conf_for(
         server.port(),
@@ -2795,10 +3609,8 @@ fn owned_row_sender_observes_pool_close_and_drops_after_close() {
     ))
     .unwrap();
 
-    let owned = db
-        .borrow_row_sender_owned()
-        .expect("borrow owned row sender");
-    assert_eq!(db.row_sender_in_use_count(), 1);
+    let owned = db.borrow_sender_owned().expect("borrow owned sender");
+    assert_eq!(db.in_use_count(), 1);
     assert!(!owned.pool_closed());
     assert!(!owned.must_close());
 
@@ -2809,7 +3621,7 @@ fn owned_row_sender_observes_pool_close_and_drops_after_close() {
 }
 
 #[test]
-fn manual_reap_closes_idle_row_senders() {
+fn manual_reap_closes_idle_buffer_senders() {
     let server = MockServer::spawn_acking(8);
     let db = QuestDb::connect(&conf_for(
         server.port(),
@@ -2817,35 +3629,35 @@ fn manual_reap_closes_idle_row_senders() {
     ))
     .unwrap();
 
-    // Park two row senders in the free list.
-    let b1 = db.borrow_row_sender().expect("b1");
-    let b2 = db.borrow_row_sender().expect("b2 (grow)");
+    // Park two Buffer-capable senders in the unified free list.
+    let b1 = db.borrow_sender().expect("b1");
+    let b2 = db.borrow_sender().expect("b2 (grow)");
     drop(b1);
     drop(b2);
-    assert_eq!(db.row_sender_free_count(), 2);
+    assert_eq!(db.free_count(), 2);
 
     // Reap before the idle timeout — nothing closed.
     assert_eq!(db.reap_idle(), 0);
-    assert_eq!(db.row_sender_free_count(), 2);
+    assert_eq!(db.free_count(), 2);
 
-    // Past the timeout: the row pool keeps no warm floor, so both are reaped.
+    // Past the timeout: reap the excess sender while preserving `pool_size=1`.
     thread::sleep(Duration::from_millis(120));
     let closed = db.reap_idle();
-    assert_eq!(closed, 2, "both idle row senders must be reaped");
-    assert_eq!(db.row_sender_free_count(), 0);
+    assert_eq!(closed, 1, "the excess idle Buffer sender must be reaped");
+    assert_eq!(db.free_count(), 1, "the warm minimum must remain");
     drop(db);
 }
 
 #[test]
-fn reaper_keeps_undelivered_recovery_row_sender() {
+fn reaper_keeps_undelivered_recovery_buffer_sender() {
     let dir = TempDir::new().unwrap();
-    seed_async_qwp_ws_slot(dir.path(), "rowreap-row-0", 77);
+    seed_async_qwp_ws_slot(dir.path(), "rowreap-ingest-0", 77);
 
     let (_server, release, frames) = MockServer::spawn_ack_when_released_capturing(1);
     let conf = conf_for_endpoints(
         &[_server.port()],
         &format!(
-            "sf_dir={};sender_id=rowreap;pool_size=1;pool_max=1;\
+            "sf_dir={};sender_id=rowreap;pool_size=1;pool_max=2;\
              pool_idle_timeout_ms=1;pool_reap=manual;close_flush_timeout_millis=2000;",
             dir.path().display()
         ),
@@ -2854,31 +3666,42 @@ fn reaper_keeps_undelivered_recovery_row_sender() {
 
     let payload = frames
         .recv_timeout(Duration::from_secs(5))
-        .expect("recovery row frame reaches mock server");
+        .expect("recovery Buffer frame reaches mock server");
     assert_eq!(frame_table_name(&payload), "legacy");
     assert!(
-        wait_until(Duration::from_secs(2), || db.row_sender_free_count() == 1),
-        "pre-opened row recovery sender should park in the free list"
+        wait_until(Duration::from_secs(2), || db.free_count() == 1),
+        "pre-opened Buffer recovery sender should park in the free list"
     );
 
     thread::sleep(Duration::from_millis(50));
-    assert_eq!(db.reap_idle(), 0, "undelivered row sender must stay parked");
-    assert_eq!(db.row_sender_free_count(), 1);
+    assert_eq!(
+        db.reap_idle(),
+        0,
+        "undelivered Buffer sender must stay parked"
+    );
+    assert_eq!(db.free_count(), 1);
 
     release.store(true, Ordering::SeqCst);
+    // Create one excess idle sender after delivery. The recovered sender may
+    // satisfy the first borrow, so hold it while opening the second slot.
+    let first = db.borrow_sender().expect("borrow recovered sender");
+    let second = db.borrow_sender().expect("open excess sender");
+    drop(first);
+    drop(second);
+    assert_eq!(db.free_count(), 2);
     assert!(
         wait_until(Duration::from_secs(5), || {
             db.reap_idle();
-            db.row_sender_free_count() == 0
+            db.free_count() == 1
         }),
-        "row sender should become reapable after the held ack is released"
+        "delivered recovery sender should become reapable above the warm minimum"
     );
 }
 
 #[test]
-fn disk_store_and_forward_restart_preopens_dirty_row_slot() {
+fn disk_store_and_forward_restart_preopens_dirty_buffer_slot() {
     let dir = TempDir::new().unwrap();
-    seed_async_qwp_ws_slot(dir.path(), "rowrec-row-0", 55);
+    seed_async_qwp_ws_slot(dir.path(), "rowrec-ingest-0", 55);
 
     let (server, frames) = MockServer::spawn_acking_capturing(1);
     let conf = conf_for_endpoints(
@@ -2893,85 +3716,97 @@ fn disk_store_and_forward_restart_preopens_dirty_row_slot() {
 
     let payload = frames
         .recv_timeout(Duration::from_secs(5))
-        .expect("dirty row slot should replay during connect-time pre-open");
+        .expect("dirty Buffer slot should replay during connect-time pre-open");
     assert_eq!(frame_table_name(&payload), "legacy");
     assert!(
-        wait_until(Duration::from_secs(2), || db.row_sender_free_count() == 1),
-        "pre-opened row recovery sender should park in the free list"
+        wait_until(Duration::from_secs(2), || db.free_count() == 1),
+        "pre-opened Buffer recovery sender should park in the free list"
     );
 }
 
 #[test]
-fn row_sender_pool_grows_and_reuses_physical_connections() {
+fn buffer_sender_pool_grows_and_reuses_physical_connections() {
     let server = MockServer::spawn_acking(16);
     let db = QuestDb::connect(&conf_for(server.port(), "pool_size=1;pool_max=4;")).unwrap();
 
     // Without disk-SF recovery, `connect` opens nothing.
     assert_eq!(server.accepted(), 0);
 
-    // Three concurrent row borrows each open a fresh connection.
-    let r1 = db.borrow_row_sender().expect("r1");
-    let r2 = db.borrow_row_sender().expect("r2 (grow)");
-    let r3 = db.borrow_row_sender().expect("r3 (grow)");
-    assert_eq!(db.row_sender_in_use_count(), 3);
+    // Three concurrent unified borrows each open a fresh connection.
+    let r1 = db.borrow_sender().expect("r1");
+    let r2 = db.borrow_sender().expect("r2 (grow)");
+    let r3 = db.borrow_sender().expect("r3 (grow)");
+    assert_eq!(db.in_use_count(), 3);
     assert!(
         wait_until(Duration::from_secs(2), || server.accepted() == 3),
-        "each row borrow must open a fresh connection; accepted={}",
+        "each sender borrow must open a fresh connection; accepted={}",
         server.accepted()
     );
 
     drop(r1);
     drop(r2);
     drop(r3);
-    assert_eq!(db.row_sender_in_use_count(), 0);
-    assert_eq!(db.row_sender_free_count(), 3);
+    assert_eq!(db.in_use_count(), 0);
+    assert_eq!(db.free_count(), 3);
 
     // Re-borrowing reuses recycled connections — no new accepts.
-    let _a = db.borrow_row_sender().expect("reuse 1");
-    let _b = db.borrow_row_sender().expect("reuse 2");
-    assert_eq!(db.row_sender_free_count(), 1);
+    let _a = db.borrow_sender().expect("reuse 1");
+    let _b = db.borrow_sender().expect("reuse 2");
+    assert_eq!(db.free_count(), 1);
     assert_eq!(server.accepted(), 3, "reuse must not open new connections");
 }
 
 #[test]
-fn row_sender_drop_on_return_drops_instead_of_recycling() {
+fn buffer_sender_drop_on_return_drops_instead_of_recycling() {
     let server = MockServer::spawn_acking(8);
     let db = QuestDb::connect(&conf_for(server.port(), "pool_size=1;pool_max=2;")).unwrap();
 
-    let mut sender = db.borrow_row_sender().expect("borrow");
+    let mut sender = db.borrow_sender().expect("borrow");
+    assert!(
+        wait_until(Duration::from_secs(2), || server.accepted() == 1),
+        "the first sender must connect before it is forced closed"
+    );
     sender.drop_on_return();
     drop(sender);
 
-    assert_eq!(db.row_sender_in_use_count(), 0);
+    assert_eq!(db.in_use_count(), 0);
     assert_eq!(
-        db.row_sender_free_count(),
+        db.free_count(),
         0,
-        "a must-close row sender must be dropped, not recycled"
+        "a must-close sender must be dropped, not recycled"
     );
 
     // The next borrow therefore opens a brand-new connection.
-    let _fresh = db.borrow_row_sender().expect("re-borrow after drop");
+    let _fresh = db.borrow_sender().expect("re-borrow after drop");
     assert!(
         wait_until(Duration::from_secs(2), || server.accepted() == 2),
-        "re-borrow must open a new connection (2 row borrows total); accepted={}",
+        "re-borrow must open a new connection (2 borrows total); accepted={}",
         server.accepted()
     );
 }
 
 #[test]
-fn row_and_column_senders_borrowed_together_are_independent() {
+fn one_cap_covers_buffer_and_chunk_senders_borrowed_together() {
     let server = MockServer::spawn_acking(16);
     let db = QuestDb::connect(&conf_for(server.port(), "pool_size=1;pool_max=2;")).unwrap();
 
-    let col = db.borrow_column_sender().expect("column sender");
-    let mut row = db.borrow_row_sender().expect("row sender");
+    let mut chunk_sender = db.borrow_sender().expect("Chunk sender");
+    let mut buffer_sender = db.borrow_sender().expect("Buffer sender");
 
-    // Each pool tracks its own borrow on an independent counter.
-    assert_eq!(db.in_use_count(), 1);
-    assert_eq!(db.row_sender_in_use_count(), 1);
+    assert_eq!(db.in_use_count(), 2);
+    let cap_err = db
+        .borrow_sender()
+        .expect_err("payload shape must not create another pool allowance");
+    assert_eq!(cap_err.code(), ErrorCode::InvalidApiCall);
 
-    // The row sender works while a column sender is concurrently held.
-    let mut buf = row.new_buffer();
+    let value = [7_i64];
+    let timestamp = [7_i64];
+    let mut chunk = one_i64_row("chunk_table", &value, &timestamp);
+    chunk_sender
+        .flush(&mut chunk)
+        .expect("Chunk flush while a Buffer sender is borrowed");
+
+    let mut buf = buffer_sender.new_buffer();
     buf.table("trades")
         .unwrap()
         .symbol("sym", "x")
@@ -2980,24 +3815,22 @@ fn row_and_column_senders_borrowed_together_are_independent() {
         .unwrap()
         .at_now()
         .unwrap();
-    row.flush(&mut buf)
-        .expect("row flush while a column sender is also borrowed");
+    buffer_sender
+        .flush_buffer(&mut buf)
+        .expect("Buffer flush while a Chunk sender is borrowed");
 
-    drop(row);
-    assert_eq!(db.row_sender_in_use_count(), 0);
-    assert_eq!(db.row_sender_free_count(), 1);
-    // The column borrow is unaffected by row-pool activity.
+    drop(buffer_sender);
     assert_eq!(db.in_use_count(), 1);
-    assert_eq!(db.free_count(), 0);
-
-    drop(col);
-    assert_eq!(db.in_use_count(), 0);
     assert_eq!(db.free_count(), 1);
+
+    drop(chunk_sender);
+    assert_eq!(db.in_use_count(), 0);
+    assert_eq!(db.free_count(), 2);
     drop(db);
 }
 
 #[test]
-fn concurrent_row_borrow_and_return_does_not_deadlock_or_leak() {
+fn concurrent_buffer_sender_borrow_and_return_does_not_deadlock_or_leak() {
     let server = MockServer::spawn_acking(32);
     let db =
         Arc::new(QuestDb::connect(&conf_for(server.port(), "pool_size=1;pool_max=8;")).unwrap());
@@ -3006,9 +3839,7 @@ fn concurrent_row_borrow_and_return_does_not_deadlock_or_leak() {
         let db = Arc::clone(&db);
         handles.push(thread::spawn(move || {
             for _ in 0..16 {
-                let borrow = db
-                    .borrow_row_sender()
-                    .expect("borrow_row_sender under contention");
+                let borrow = db.borrow_sender().expect("borrow_sender under contention");
                 std::hint::black_box(&borrow);
                 thread::yield_now();
             }
@@ -3019,79 +3850,69 @@ fn concurrent_row_borrow_and_return_does_not_deadlock_or_leak() {
     }
     // After all workers finish: every borrow returned, nothing leaked, and the
     // free list never exceeded the cap.
-    assert_eq!(db.row_sender_in_use_count(), 0);
-    assert!(db.row_sender_free_count() >= 1);
+    assert_eq!(db.in_use_count(), 0);
+    assert!(db.free_count() >= 1);
     assert!(
-        db.row_sender_free_count() <= 8,
+        db.free_count() <= 8,
         "free list must not exceed pool_max; free={}",
-        db.row_sender_free_count()
+        db.free_count()
     );
 }
 
 #[test]
-fn auto_reaper_closes_idle_row_senders() {
+fn auto_reaper_closes_idle_buffer_senders() {
     let server = MockServer::spawn_acking(8);
     let db = QuestDb::connect(&conf_for(
         server.port(),
         "pool_size=1;pool_max=3;pool_idle_timeout_ms=100;pool_reap=auto;",
     ))
     .unwrap();
-    let b1 = db.borrow_row_sender().expect("b1");
-    let b2 = db.borrow_row_sender().expect("b2 (grow)");
+    let b1 = db.borrow_sender().expect("b1");
+    let b2 = db.borrow_sender().expect("b2 (grow)");
     drop(b1);
     drop(b2);
-    assert_eq!(db.row_sender_free_count(), 2);
+    assert_eq!(db.free_count(), 2);
 
     // The background reaper wakes on a `max(5s, timeout/12)` ticker (the 5s
-    // floor applies here). The row pool keeps no warm floor, so every idle row
-    // sender is drained.
-    let reaped = wait_until(Duration::from_secs(8), || db.row_sender_free_count() == 0);
+    // floor applies here). The unified pool preserves its one warm sender.
+    let reaped = wait_until(Duration::from_secs(8), || db.free_count() == 1);
     assert!(
         reaped,
-        "auto reaper failed to drain idle row senders; free={}",
-        db.row_sender_free_count()
+        "auto reaper failed to drain the excess Buffer sender; free={}",
+        db.free_count()
     );
     drop(db);
 }
 
 #[test]
-fn row_sender_build_failure_releases_in_use_slot() {
-    // Bring the pool up against a live server, then kill the server so a
-    // subsequent row-sender build cannot connect. The
-    // failed build must release the `in_use` slot it reserved rather than
-    // permanently burning a pool slot.
-    let server = MockServer::spawn_acking(4);
-    let port = server.port();
-    let db = QuestDb::connect(&format!(
-        "ws::addr=127.0.0.1:{port};auth_timeout=500;reconnect_max_duration_millis=100;"
-    ))
-    .unwrap();
-    drop(server); // the port now refuses connections
-
-    // Make sure the port is actually closed before exercising the build path.
-    assert!(
-        wait_until(Duration::from_secs(2), || {
-            std::net::TcpStream::connect(("127.0.0.1", port)).is_err()
-        }),
-        "mock server port must stop accepting after drop"
+fn buffer_sender_local_build_failure_releases_in_use_slot() {
+    // Network unavailability is not a build failure for this offline-first
+    // pool. Force a local build failure instead by flocking its only managed
+    // disk slot from another pool, then prove the failed borrow releases the
+    // in-use reservation rather than permanently burning the cap.
+    let dir = TempDir::new().unwrap();
+    let port = unused_local_port();
+    let conf = format!(
+        "ws::addr=127.0.0.1:{port};auth_timeout=200;sf_dir={};\
+         sender_id=buildfail;pool_size=1;pool_max=1;pool_reap=manual;\
+         close_flush_timeout_millis=0;",
+        dir.path().display()
     );
+    let owner = QuestDb::connect(&conf).unwrap();
+    let _held = owner.borrow_sender().expect("owner flocks ingest slot 0");
+    let contender = QuestDb::connect(&conf).unwrap();
 
-    let err = db
-        .borrow_row_sender()
-        .expect_err("build must fail against a dead endpoint");
-    assert_ne!(
-        err.code(),
-        ErrorCode::InvalidApiCall,
-        "expected a connect error, not a pool-cap error: {}",
-        err.msg()
-    );
+    let err = contender
+        .borrow_sender()
+        .expect_err("local sender build must fail on the flocked slot");
+    assert_eq!(err.code(), ErrorCode::ConfigError);
+    assert!(err.msg().contains("buildfail-ingest-0"), "{}", err.msg());
     assert_eq!(
-        db.row_sender_in_use_count(),
+        contender.in_use_count(),
         0,
         "a failed build must not leak an in_use slot"
     );
-    assert_eq!(db.row_sender_free_count(), 0);
-    drop(db);
+    assert_eq!(contender.free_count(), 0);
 }
 
 #[test]
@@ -3104,9 +3925,7 @@ fn concurrent_borrow_and_return_does_not_deadlock_or_leak() {
         let db = Arc::clone(&db);
         handles.push(thread::spawn(move || {
             for _ in 0..16 {
-                let borrow = db
-                    .borrow_column_sender()
-                    .expect("borrow_column_sender under contention");
+                let borrow = db.borrow_sender().expect("borrow_sender under contention");
                 // Tiny critical section to encourage contention.
                 std::hint::black_box(&borrow);
                 thread::yield_now();
@@ -3129,9 +3948,9 @@ fn manual_reap_closes_excess_idle_connections() {
         "pool_size=1;pool_max=3;pool_idle_timeout_ms=50;pool_reap=manual;",
     ))
     .unwrap();
-    let b1 = db.borrow_column_sender().expect("b1");
-    let b2 = db.borrow_column_sender().expect("b2 (grow)");
-    let b3 = db.borrow_column_sender().expect("b3 (grow)");
+    let b1 = db.borrow_sender().expect("b1");
+    let b2 = db.borrow_sender().expect("b2 (grow)");
+    let b3 = db.borrow_sender().expect("b3 (grow)");
     drop(b1);
     drop(b2);
     drop(b3);
@@ -3158,10 +3977,10 @@ fn manual_reap_keeps_warm_floor_with_borrows_outstanding() {
         "pool_size=3;pool_max=5;pool_idle_timeout_ms=50;pool_reap=manual;",
     ))
     .unwrap();
-    let b1 = db.borrow_column_sender().expect("b1");
-    let b2 = db.borrow_column_sender().expect("b2");
-    let b3 = db.borrow_column_sender().expect("b3 (grow)");
-    let b4 = db.borrow_column_sender().expect("b4 (grow)");
+    let b1 = db.borrow_sender().expect("b1");
+    let b2 = db.borrow_sender().expect("b2");
+    let b3 = db.borrow_sender().expect("b3 (grow)");
+    let b4 = db.borrow_sender().expect("b4 (grow)");
     // Two stay borrowed; two return to the free list. total()=4, in_use=2.
     drop(b3);
     drop(b4);
@@ -3199,9 +4018,9 @@ fn auto_reaper_closes_excess_idle_connections() {
         "pool_size=1;pool_max=3;pool_idle_timeout_ms=100;pool_reap=auto;",
     ))
     .unwrap();
-    let b1 = db.borrow_column_sender().expect("b1");
-    let b2 = db.borrow_column_sender().expect("b2");
-    let b3 = db.borrow_column_sender().expect("b3");
+    let b1 = db.borrow_sender().expect("b1");
+    let b2 = db.borrow_sender().expect("b2");
+    let b3 = db.borrow_sender().expect("b3");
     drop(b1);
     drop(b2);
     drop(b3);
@@ -3224,7 +4043,7 @@ fn auto_reaper_closes_excess_idle_connections() {
 fn refuses_durable_ack_without_opt_in() {
     let server = MockServer::spawn(2);
     let db = QuestDb::connect(&conf_for(server.port(), "")).unwrap();
-    let mut sender = db.borrow_column_sender().expect("borrow");
+    let mut sender = db.borrow_sender().expect("borrow");
     let err = sender
         .wait(AckLevel::Durable, Duration::from_secs(30))
         .expect_err("durable without opt-in must fail");
@@ -3262,7 +4081,7 @@ fn durable_ack_without_opt_in_does_not_publish_commit_frame() {
     });
 
     let db = QuestDb::connect(&conf_for(port, "")).unwrap();
-    let mut sender = db.borrow_column_sender().expect("borrow");
+    let mut sender = db.borrow_sender().expect("borrow");
     let err = sender
         .wait(AckLevel::Durable, Duration::from_secs(30))
         .expect_err("durable without opt-in must fail before publish");
@@ -3288,7 +4107,7 @@ fn durable_ack_without_opt_in_does_not_publish_commit_frame() {
 fn empty_chunk_flush_round_trips() {
     let server = MockServer::spawn_acking(2);
     let db = QuestDb::connect(&conf_for(server.port(), "")).unwrap();
-    let mut sender = db.borrow_column_sender().expect("borrow");
+    let mut sender = db.borrow_sender().expect("borrow");
     let mut chunk = Chunk::new("trades");
     assert_eq!(chunk.row_count(), 0);
     sender.flush(&mut chunk).unwrap();
@@ -3334,7 +4153,7 @@ fn deferred_flush_reserves_slot_for_sync_commit() {
 fn flush_clears_chunk_for_reuse_and_can_repeat() {
     let server = MockServer::spawn_acking(2);
     let db = QuestDb::connect(&conf_for(server.port(), "")).unwrap();
-    let mut sender = db.borrow_column_sender().expect("borrow");
+    let mut sender = db.borrow_sender().expect("borrow");
     let mut chunk = Chunk::new("trades");
     for _ in 0..3 {
         sender.flush(&mut chunk).unwrap();
@@ -3360,7 +4179,7 @@ fn one_i64_row<'a>(table: &'a str, val: &'a [i64; 1], ts: &'a [i64; 1]) -> Chunk
 fn flush_and_wait_publishes_and_waits_for_ok() {
     let server = MockServer::spawn_acking(2);
     let db = QuestDb::connect(&conf_for(server.port(), "")).unwrap();
-    let mut sender = db.borrow_column_sender().expect("borrow");
+    let mut sender = db.borrow_sender().expect("borrow");
 
     let val = [42_i64];
     let ts = [1_700_000_000_000_000_000_i64];
@@ -3378,7 +4197,7 @@ fn flush_and_wait_publishes_and_waits_for_ok() {
 fn flush_and_wait_empty_chunk_behaves_like_sync() {
     let server = MockServer::spawn_acking(2);
     let db = QuestDb::connect(&conf_for(server.port(), "")).unwrap();
-    let mut sender = db.borrow_column_sender().expect("borrow");
+    let mut sender = db.borrow_sender().expect("borrow");
     let mut chunk = Chunk::new("trades");
     assert_eq!(chunk.row_count(), 0);
     sender
@@ -3419,7 +4238,7 @@ fn flush_and_wait_durable_without_opt_in_leaves_chunk_untouched() {
     });
 
     let db = QuestDb::connect(&conf_for(port, "")).unwrap();
-    let mut sender = db.borrow_column_sender().expect("borrow");
+    let mut sender = db.borrow_sender().expect("borrow");
     let val = [7_i64];
     let ts = [1_i64];
     let chunk = one_i64_row("trades", &val, &ts);
@@ -3458,7 +4277,7 @@ fn flush_and_wait_boundary_covers_prior_flush() {
     // returns.
     let server = MockServer::spawn_acking(2);
     let db = QuestDb::connect(&conf_for(server.port(), "")).unwrap();
-    let mut sender = db.borrow_column_sender().expect("borrow");
+    let mut sender = db.borrow_sender().expect("borrow");
 
     let a_val = [1_i64];
     let a_ts = [1_i64];
@@ -3556,7 +4375,7 @@ fn flush_and_wait_ack_wait_failure_after_publish_clears_chunk() {
 fn flush_rejects_chunk_with_no_designated_timestamp() {
     let server = MockServer::spawn(2);
     let db = QuestDb::connect(&conf_for(server.port(), "")).unwrap();
-    let mut sender = db.borrow_column_sender().expect("borrow");
+    let mut sender = db.borrow_sender().expect("borrow");
     let mut chunk = Chunk::new("trades");
     chunk
         .column_i64("price", &[1, 2, 3], None)
@@ -3576,7 +4395,7 @@ fn non_empty_chunk_with_numeric_columns_round_trips() {
 
     let server = MockServer::spawn_acking(2);
     let db = QuestDb::connect(&conf_for(server.port(), "")).unwrap();
-    let mut sender = db.borrow_column_sender().expect("borrow");
+    let mut sender = db.borrow_sender().expect("borrow");
 
     let mut chunk = Chunk::new("trades");
     chunk.column_i64("qty", &[10, 20, 30], None).unwrap();
@@ -3625,7 +4444,7 @@ fn varchar_chunk_round_trips() {
 
     let server = MockServer::spawn_acking(2);
     let db = QuestDb::connect(&conf_for(server.port(), "")).unwrap();
-    let mut sender = db.borrow_column_sender().expect("borrow");
+    let mut sender = db.borrow_sender().expect("borrow");
 
     let mut chunk = Chunk::new("logs");
     // 4 rows: "alpha", null, "gamma", "δ" (multi-byte UTF-8).
@@ -3660,7 +4479,7 @@ fn varchar_chunk_round_trips() {
 fn symbol_chunk_round_trips_and_reuses_global_dict() {
     let server = MockServer::spawn_acking(2);
     let db = QuestDb::connect(&conf_for(server.port(), "")).unwrap();
-    let mut sender = db.borrow_column_sender().expect("borrow");
+    let mut sender = db.borrow_sender().expect("borrow");
 
     // Caller has a 3-entry dict; first chunk only references entries 0 and 2,
     // so the wire's delta-symbol-dict prefix carries those two new symbols.
@@ -3787,10 +4606,10 @@ fn symbol_dict_reuse_resends_only_new_symbols_on_the_wire() {
 fn sfa_symbol_dict_reuse_delta_encodes_second_frame() {
     let (server, frames) = MockServer::spawn_acking_capturing(2);
     let db = QuestDb::connect(&conf_for(server.port(), "")).unwrap();
-    // borrow_column_sender is memory-mode store-and-forward, where delta symbol
+    // borrow_sender is memory-mode store-and-forward, where delta symbol
     // dictionaries are now enabled: the background driver re-registers the whole
     // dictionary via a catch-up frame on reconnect, so per-frame deltas are safe.
-    let mut sender = db.borrow_column_sender().expect("borrow");
+    let mut sender = db.borrow_sender().expect("borrow");
 
     let dict_bytes = b"alphabetagamma";
     let dict_offsets: [i32; 4] = [0, 5, 9, 14];
@@ -3897,7 +4716,7 @@ fn close_joins_reaper_cleanly() {
     .unwrap();
     // Borrow + return so we have something to reap eventually.
     {
-        let _sender = db.borrow_column_sender().expect("borrow");
+        let _sender = db.borrow_sender().expect("borrow");
     }
     // close() must return promptly (no hang) — the join is the test.
     let start = Instant::now();
@@ -3916,7 +4735,7 @@ fn close_joins_reaper_cleanly() {
 // ---------------------------------------------------------------------------
 // Store-and-forward durability on pool close / reap (in-memory queue).
 //
-// The BorrowedColumnSender contract is that a parked connection's background runner
+// The BorrowedSender contract is that a parked connection's background runner
 // keeps delivering, and that pool close / reap do not silently drop frames the
 // runner has accepted but not yet delivered. These tests pin the three teardown
 // paths that enforce it. The mock captures a frame when it is *sent* (eagerly,
@@ -3945,9 +4764,9 @@ fn reap_skips_connections_with_undelivered_frames() {
 
     // Open three distinct connections; b1 stays empty, b2 and b3 each publish a
     // frame whose ack the server withholds, so they read as undelivered.
-    let b1 = db.borrow_column_sender().expect("b1");
-    let mut b2 = db.borrow_column_sender().expect("b2");
-    let mut b3 = db.borrow_column_sender().expect("b3");
+    let b1 = db.borrow_sender().expect("b1");
+    let mut b2 = db.borrow_sender().expect("b2");
+    let mut b3 = db.borrow_sender().expect("b3");
     assert!(wait_until(Duration::from_secs(5), || server.accepted() == 3));
 
     let v = [1_i64];
@@ -3999,7 +4818,7 @@ fn close_blocks_until_store_and_forward_queue_is_delivered() {
     .unwrap();
 
     {
-        let mut sender = db.borrow_column_sender().expect("borrow");
+        let mut sender = db.borrow_sender().expect("borrow");
         let v = [7_i64];
         let t = [7_i64];
         let mut chunk = one_i64_row("trades", &v, &t);
@@ -4043,7 +4862,7 @@ fn close_drain_is_bounded_when_peer_never_acks() {
     .unwrap();
 
     {
-        let mut sender = db.borrow_column_sender().expect("borrow");
+        let mut sender = db.borrow_sender().expect("borrow");
         let v = [5_i64];
         let t = [5_i64];
         let mut chunk = one_i64_row("trades", &v, &t);
@@ -4396,7 +5215,7 @@ fn store_and_forward_arrow_batch_reports_fsn_progress_and_split_boundary() {
     let arr: ArrayRef = Arc::new(Int64Array::from(vals.clone()));
     let batch = RecordBatch::try_from_iter([("seq", arr)]).unwrap();
 
-    let mut sender = db.borrow_column_sender().unwrap();
+    let mut sender = db.borrow_sender().unwrap();
     assert_eq!(sender.published_fsn().unwrap(), None);
     assert_eq!(sender.acked_fsn().unwrap(), None);
 
@@ -4464,7 +5283,7 @@ fn store_and_forward_arrow_batch_at_column_reports_fsn_progress() {
     ]));
     let batch = RecordBatch::try_new(schema, vec![price, ts]).unwrap();
 
-    let mut sender = db.borrow_column_sender().unwrap();
+    let mut sender = db.borrow_sender().unwrap();
     let ts_col = crate::ingress::ColumnName::new("ts").unwrap();
     let fsn = sender
         .flush_arrow_batch_at_column_and_get_fsn("trades", &batch, ts_col, &[])
@@ -4504,7 +5323,7 @@ fn store_and_forward_file_mode_arrow_symbol_writes_symbols_ahead_to_side_file() 
         &sf_disk_extras(&dir, "pool_reap=manual;sender_id=recov;"),
     );
     let db = QuestDb::connect(&conf).unwrap();
-    let mut sender = db.borrow_column_sender().unwrap();
+    let mut sender = db.borrow_sender().unwrap();
 
     let schema = Arc::new(Schema::new(vec![
         Field::new("sym", DataType::Utf8, false),
@@ -4525,9 +5344,9 @@ fn store_and_forward_file_mode_arrow_symbol_writes_symbols_ahead_to_side_file() 
     // format-agnostically (each record's payload carries the `[len]"symbol"` entry)
     // that both are present and alpha precedes bravo, rather than hardcoding the
     // framing/CRC bytes. The pool mints a kind-scoped slot per borrowed column
-    // sender, so the first one lives under `<sender_id>-col-0`, not the bare
+    // sender, so the first one lives under `<sender_id>-ingest-0`, not the bare
     // `sender_id`.
-    let side_file = dir.path().join("recov-col-0").join(".symbol-dict");
+    let side_file = dir.path().join("recov-ingest-0").join(".symbol-dict");
     let bytes =
         std::fs::read(&side_file).expect("side-file must exist after an Arrow symbol flush");
     let alpha_pos = bytes
@@ -4606,7 +5425,7 @@ fn store_and_forward_flush_arrow_batch_and_wait_commits_at_boundary() {
             let qty: ArrayRef = Arc::new(Int64Array::from(vec![1_i64, 2]));
             let batch = RecordBatch::try_from_iter([("qty", qty)]).unwrap();
             let mut sender = db
-                .borrow_column_sender()
+                .borrow_sender()
                 .map_err(|e| format!("{:?}: {}", e.code(), e.msg()))?;
             sender
                 .flush_arrow_batch_at_now_and_wait("trades", &batch, &[], AckLevel::Ok)
@@ -4632,7 +5451,7 @@ fn store_and_forward_flush_arrow_batch_and_wait_commits_at_boundary() {
             let batch = RecordBatch::try_new(schema, vec![price, ts]).unwrap();
             let ts_col = crate::ingress::ColumnName::new("ts").unwrap();
             let mut sender = db
-                .borrow_column_sender()
+                .borrow_sender()
                 .map_err(|e| format!("{:?}: {}", e.code(), e.msg()))?;
             sender
                 .flush_arrow_batch_at_column_and_wait("trades", &batch, ts_col, &[], AckLevel::Ok)
@@ -4966,7 +5785,7 @@ fn flush_arrow_batch_at_column_commits_in_one_call() {
 /// minimal `SERVER_INFO` frame — the reader's first expected frame at connect
 /// — then parks the connection, draining to EOF. That is enough to drive
 /// pool borrow / return / grow / reap / cap mechanics without a full query
-/// round-trip. The same endpoint also serves any lazily-opened column-sender
+/// round-trip. The same endpoint also serves any lazily-opened ingestion-sender
 /// borrow (which ignores the unsolicited `SERVER_INFO` while parked).
 #[cfg(feature = "sync-reader-qwp-ws")]
 mod reader_pool {
@@ -5108,18 +5927,18 @@ mod reader_pool {
         let before = db.dbg_pool_counts();
         assert_eq!(before.reader.in_use, 0);
         assert_eq!(before.reader.free, 0);
-        assert_eq!(before.column_sf.in_use, 0);
+        assert_eq!(before.ingress.in_use, 0);
         assert_eq!(before.column_direct.in_use, 0);
-        assert_eq!(before.row_sender.in_use, 0);
+        assert_eq!(before.ingress.in_use, 0);
 
         let reader = db.borrow_reader().expect("borrow reader");
         let during = db.dbg_pool_counts();
         assert_eq!(during.reader.in_use, 1);
         assert_eq!(during.reader.free, 0);
         // Borrowing a reader must not perturb the sender pools.
-        assert_eq!(during.column_sf.in_use, 0);
+        assert_eq!(during.ingress.in_use, 0);
         assert_eq!(during.column_direct.in_use, 0);
-        assert_eq!(during.row_sender.in_use, 0);
+        assert_eq!(during.ingress.in_use, 0);
 
         drop(reader);
         let after = db.dbg_pool_counts();
@@ -5233,26 +6052,26 @@ mod reader_pool {
         );
     }
 
-    /// The reader, column-sender, and row-sender pools are capped and tracked
-    /// independently: all three can be borrowed at once from a single
-    /// `QuestDb` even when each pool's `pool_max` is only 2 (combined live
-    /// connection ceiling `3 * pool_max`).
+    /// The reader, unified ingestion, and direct-ingestion pools are capped
+    /// and tracked independently: all three can be borrowed at once from a
+    /// single `QuestDb` even when each pool's `pool_max` is only 2 (combined
+    /// live connection ceiling `3 * pool_max`).
     #[test]
     fn reader_and_sender_pools_are_independent() {
         let server = ReaderMockServer::spawn(8);
         let db = QuestDb::connect(&conf_for(server.port(), "pool_size=1;pool_max=2;")).unwrap();
 
-        let col = db.borrow_column_sender().expect("column sender"); // opens a fresh connection
-        let row = db.borrow_row_sender().expect("row sender"); // opens a fresh connection
+        let sender = db.borrow_sender().expect("unified sender"); // opens a fresh connection
+        let direct = db.borrow_direct_column_sender().expect("direct sender"); // opens a fresh connection
         let reader = db.borrow_reader().expect("reader"); // opens a fresh connection
 
         // Each pool tracks its own borrow on an independent counter.
         assert_eq!(db.in_use_count(), 1);
-        assert_eq!(db.row_sender_in_use_count(), 1);
+        assert_eq!(db.direct_in_use_count(), 1);
         assert_eq!(db.reader_in_use_count(), 1);
 
-        // 1 column + 1 row + 1 reader = three independent live connections,
-        // each pool capped separately at pool_max=2.
+        // 1 unified ingress + 1 direct ingress + 1 reader = three independent
+        // live connections, each pool capped separately at pool_max=2.
         assert!(
             wait_until(Duration::from_secs(2), || server.accepted() == 3),
             "expected 3 independent connections; accepted={}",
@@ -5264,12 +6083,12 @@ mod reader_pool {
         assert_eq!(db.reader_free_count(), 1);
         // The sender borrows are unaffected by reader-pool activity.
         assert_eq!(db.in_use_count(), 1);
-        assert_eq!(db.row_sender_in_use_count(), 1);
+        assert_eq!(db.direct_in_use_count(), 1);
 
-        drop(row);
-        drop(col);
+        drop(direct);
+        drop(sender);
         assert_eq!(db.in_use_count(), 0);
-        assert_eq!(db.row_sender_in_use_count(), 0);
+        assert_eq!(db.direct_in_use_count(), 0);
         assert_eq!(db.reader_in_use_count(), 0);
         drop(db);
     }

@@ -91,6 +91,9 @@ mod qwp_ws_sfa_queue;
 mod qwp_ws_sfa_slot;
 
 #[cfg(feature = "_sender-qwp-ws")]
+pub(crate) mod qwp_ws_sfa_publisher;
+
+#[cfg(feature = "_sender-qwp-ws")]
 pub(crate) mod qwp_ws_sfa_symbol_dict;
 
 #[cfg(feature = "_sender-qwp-ws")]
@@ -664,7 +667,7 @@ impl Sender {
     /// reaches `ack_level`, or until the wait makes no progress for `timeout`.
     ///
     /// This is the row-major counterpart to the column-major
-    /// [`crate::BorrowedColumnSender::wait`]: it takes the cumulative publication
+    /// [`crate::BorrowedSender::wait`]: it takes the cumulative publication
     /// boundary ([`Self::published_fsn`]) and blocks until the requested
     /// completion watermark covers it.
     ///
@@ -943,11 +946,12 @@ impl Sender {
         false
     }
 
-    /// Non-blocking: `true` once a background QWP/WebSocket
-    /// store-and-forward sender has no undelivered published frames, so a
-    /// parked pooled row sender can be retired without losing queued data.
+    /// Test-only non-blocking view of whether a background QWP/WebSocket
+    /// store-and-forward sender has no undelivered published frames.
     /// Non-QWP/WebSocket handlers and terminal background handlers report
-    /// `true`.
+    /// `true`. Retained for the standalone sender regression test after the
+    /// pooled row reaper that consumed it was removed.
+    #[cfg(test)]
     pub(crate) fn sfa_fully_delivered(&self, durable: bool) -> bool {
         #[cfg(feature = "sync-sender-qwp-ws")]
         {

@@ -1,6 +1,10 @@
 # Column-Major Sender — Performance Notes
 
-Tracks the bench results that anchor `doc/COLUMN_SENDER_PLAN.md` §2.1
+**Status:** retired pre-unification measurement record. See
+[`README.md`](README.md) and the current
+[`QWP_UNIFIED_SENDER_M0_BASELINE.md`](../QWP_UNIFIED_SENDER_M0_BASELINE.md).
+
+Tracks the bench results that anchor `doc/historical/COLUMN_SENDER_PLAN.md` §2.1
 ("encode is a header + extend_from_slice per column") and §2.2 ("no-null
 = memcpy; nullable = invert+gather").
 
@@ -53,7 +57,7 @@ the connection's reusable write buffer.
 A second-pass `encode_chunk/encode_only` on the same workload should
 land in **REFERENCE mode** for the schema (because the registry caches
 the signature from the first encode), shaving off the FULL-mode
-signature bytes — see `doc/COLUMN_SENDER_PLAN.md` §2.1.
+signature bytes — see `doc/historical/COLUMN_SENDER_PLAN.md` §2.1.
 
 The per-column microbenches no longer measure data movement: with raw
 pointers stored, `column_iN`/`column_fN` are essentially constant-time

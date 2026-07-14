@@ -1,7 +1,7 @@
 """ctypes bindings for the Apache Arrow C Data Interface exports.
 
 Wraps `reader_cursor_next_arrow_batch` (egress) and
-`column_sender_flush_arrow_batch_at_now[_at_column]` (ingress) from
+`qwp_sender_flush_arrow_batch_at_now[_at_column]` (ingress) from
 `libquestdb_client`. Layout of `ArrowArray` / `ArrowSchema` mirrors
 the Apache Arrow spec:
 <https://arrow.apache.org/docs/format/CDataInterface.html>.
@@ -31,8 +31,8 @@ class _QuestdbDb(ctypes.Structure):
     """Opaque `questdb_db*` (connection pool)."""
 
 
-class _QwpwsConn(ctypes.Structure):
-    """Opaque `column_sender*` (borrowed pooled connection)."""
+class _QwpSender(ctypes.Structure):
+    """Opaque `qwp_sender*` (borrowed pooled connection)."""
 
 
 class _DirectColumnSender(ctypes.Structure):
@@ -182,15 +182,15 @@ _db_close = _setsig(
 )
 
 _db_borrow_conn = _setsig(
-    "questdb_db_borrow_column_sender",
-    ctypes.POINTER(_QwpwsConn),
+    "questdb_db_borrow_sender",
+    ctypes.POINTER(_QwpSender),
     ctypes.POINTER(_QuestdbDb),
     ctypes.POINTER(ctypes.POINTER(_LineSenderError)),
 )
 
 _db_borrow_conn_with_retry = _setsig(
-    "questdb_db_borrow_column_sender_with_retry",
-    ctypes.POINTER(_QwpwsConn),
+    "questdb_db_borrow_sender_with_retry",
+    ctypes.POINTER(_QwpSender),
     ctypes.POINTER(_QuestdbDb),
     ctypes.c_uint64,
     ctypes.POINTER(ctypes.POINTER(_LineSenderError)),
@@ -205,17 +205,17 @@ _db_borrow_direct_conn_with_retry = _setsig(
 )
 
 _db_return_conn = _setsig(
-    "questdb_db_return_column_sender",
+    "questdb_db_return_sender",
     None,
     ctypes.POINTER(_QuestdbDb),
-    ctypes.POINTER(_QwpwsConn),
+    ctypes.POINTER(_QwpSender),
 )
 
 _db_drop_conn = _setsig(
-    "questdb_db_drop_column_sender",
+    "questdb_db_drop_sender",
     None,
     ctypes.POINTER(_QuestdbDb),
-    ctypes.POINTER(_QwpwsConn),
+    ctypes.POINTER(_QwpSender),
 )
 
 class _ColumnSenderArrowOverride(ctypes.Structure):
@@ -229,9 +229,9 @@ class _ColumnSenderArrowOverride(ctypes.Structure):
 
 # Conn-level Arrow batch flush.
 _flush_arrow_batch = _setsig(
-    "column_sender_flush_arrow_batch_at_now",
+    "qwp_sender_flush_arrow_batch_at_now",
     ctypes.c_bool,
-    ctypes.POINTER(_QwpwsConn),
+    ctypes.POINTER(_QwpSender),
     _LineSenderTableName,
     ctypes.POINTER(ArrowArray),
     ctypes.POINTER(ArrowSchema),
@@ -241,9 +241,9 @@ _flush_arrow_batch = _setsig(
 )
 
 _flush_arrow_batch_at_column = _setsig(
-    "column_sender_flush_arrow_batch_at_column",
+    "qwp_sender_flush_arrow_batch_at_column",
     ctypes.c_bool,
-    ctypes.POINTER(_QwpwsConn),
+    ctypes.POINTER(_QwpSender),
     _LineSenderTableName,
     ctypes.POINTER(ArrowArray),
     ctypes.POINTER(ArrowSchema),
@@ -255,13 +255,13 @@ _flush_arrow_batch_at_column = _setsig(
 
 
 # Ack barrier over everything published so far (mirrors
-# `column_sender_wait` in `column_sender.h`). Acknowledgement levels:
+# `qwp_sender_wait` in `column_sender.h`). Acknowledgement levels:
 #   0 → wait for WAL-commit
 #   1 → wait for object-store durability watermarks
 _column_sender_sync = _setsig(
-    "column_sender_wait",
+    "qwp_sender_wait",
     ctypes.c_bool,
-    ctypes.POINTER(_QwpwsConn),
+    ctypes.POINTER(_QwpSender),
     ctypes.c_uint32,
     ctypes.c_uint64,
     ctypes.POINTER(ctypes.POINTER(_LineSenderError)),
@@ -294,7 +294,7 @@ def conn_flush_arrow_batch(
     schema_ptr,
     ts_column_name: Optional[bytes] = None,
 ) -> None:
-    """Drive `column_sender_flush_arrow_batch_at_now` (or its
+    """Drive `qwp_sender_flush_arrow_batch_at_now` (or its
     `_at_column` variant when `ts_column_name` is set). Consumes `array_ptr`'s
     ownership; `schema_ptr` remains the caller's."""
     err_ref = ctypes.POINTER(_LineSenderError)()
@@ -343,7 +343,7 @@ def db_close(db_ptr) -> None:
 
 
 def db_borrow_conn(db_ptr):
-    """Borrow a pooled `column_sender*`."""
+    """Borrow a pooled `qwp_sender*`."""
     err_ref = ctypes.POINTER(_LineSenderError)()
     conn = _db_borrow_conn(db_ptr, ctypes.byref(err_ref))
     if not conn:
@@ -352,7 +352,7 @@ def db_borrow_conn(db_ptr):
 
 
 def db_borrow_conn_with_retry(db_ptr, budget_ms: int):
-    """Borrow a store-and-forward `column_sender*`, retrying the connect
+    """Borrow a store-and-forward `qwp_sender*`, retrying the connect
     within `budget_ms` (`0` makes a single attempt)."""
     err_ref = ctypes.POINTER(_LineSenderError)()
     conn = _db_borrow_conn_with_retry(db_ptr, budget_ms, ctypes.byref(err_ref))

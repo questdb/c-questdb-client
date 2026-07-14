@@ -50,6 +50,8 @@ use crate::{Result, error};
 
 use crate::ingress::AckLevel;
 
+use super::qwp_frame_size_error;
+
 /// Bytes the encoder leaves untouched at the start of `write_buf` so the
 /// WS header can be prepended in place without a copy. RFC 6455 §5.2: the
 /// client-to-server header is at most 14 bytes (1 flag + 1 len + 8 ext len
@@ -271,11 +273,9 @@ impl ColumnConn {
 
         let payload_len = self.write_buf.len() - WS_HEADER_RESERVE;
         if payload_len > self.max_buf_size {
-            return Err(PublishError::BeforeWrite(error::fmt!(
-                BatchTooLarge,
-                "QWP frame ({} bytes) exceeds max_buf_size ({} bytes)",
+            return Err(PublishError::BeforeWrite(qwp_frame_size_error(
                 payload_len,
-                self.max_buf_size
+                self.max_buf_size,
             )));
         }
 
@@ -327,7 +327,7 @@ impl ColumnConn {
     }
 
     /// Record a just-published frame as in-flight. Called by
-    /// `ColumnSender::flush` after `publish_qwp` succeeds.
+    /// `PooledSenderCore::flush` after `publish_qwp` succeeds.
     pub(crate) fn push_pending(&mut self, fsn: u64) {
         self.pending_acks.push_back(PendingAck { fsn });
         self.in_flight += 1;
@@ -488,7 +488,8 @@ impl ColumnConn {
         // re-reports an already-durable table would otherwise re-insert a
         // pending target with no matching watermark and strand `sync(Durable)`
         // forever. The map grows by at most one entry per distinct table over
-        // the connection's life, matching the row sender's `DurableAckTracker`.
+        // the connection's life, matching the standalone ingress sender's
+        // `DurableAckTracker`.
     }
 
     /// Dispatch a parsed QWP response: validate OK sequence, update

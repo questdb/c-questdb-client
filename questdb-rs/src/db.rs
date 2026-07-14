@@ -22,31 +22,24 @@
  *
  ******************************************************************************/
 
-//! Column-sender connection pool.
+//! QWP ingestion connection pool.
 //!
 //! `QuestDb` is a thread-safe pool of store-and-forward producer handles to a
 //! single QuestDB QWP/WebSocket endpoint. The pool is lazy: `connect` performs
 //! no blocking network I/O. In disk-backed store-and-forward mode it may
 //! pre-open parked recovery senders whose initial connect and replay run in the
-//! background. Borrowing [`QuestDb::borrow_column_sender`] creates a local
+//! background. Borrowing [`QuestDb::borrow_sender`] creates a local
 //! store-and-forward producer immediately and lets its background runner connect
-//! later, so callers can buffer while the server is absent. Direct column
-//! senders, readers, and row senders still open their transport on first borrow.
+//! later, so callers can buffer while the server is absent. Direct ingestion
+//! senders and readers still open their transport on first borrow.
 //! The pools auto-grow up to `pool_max` on demand and (under `pool_reap=auto`)
 //! run a background thread that closes above-`pool_size` idle entries after
 //! `pool_idle_timeout_ms`.
 //!
-//! Each pool slot is handed out as a [`BorrowedColumnSender`] which returns
+//! Each pool slot is handed out as a [`BorrowedSender`] which returns
 //! itself to the pool on `Drop`. Slots whose underlying connection has
 //! latched terminal state are dropped on return instead of being
 //! recycled.
-//!
-//! The same `QuestDb` can also hand out **row-major**
-//! [`crate::ingress::Sender`] handles via [`QuestDb::borrow_row_sender`]
-//! ([`BorrowedRowSender`]) — the classic ILP `Buffer` + `flush` API. These
-//! live in an independent, lazily-grown free list (rebuilt from the connect
-//! string), capped separately by `pool_max`, so a caller can pull either a
-//! column-major or a row-major sender from one shared pool handle.
 
 use std::fmt::{self, Debug, Formatter};
 use std::marker::PhantomData;
@@ -64,12 +57,12 @@ use crate::egress::Reader;
 use crate::ingress::conn_events;
 use crate::ingress::sender::is_candidate_orphan;
 use crate::ingress::sender::qwp_ws::QwpWsHostHealthTracker;
-use crate::ingress::{Buffer, Sender, SenderBuilder};
+use crate::ingress::{Buffer, SenderBuilder};
 use crate::ingress::{
     QwpWsConnector, QwpWsManagedSlotExclusion, RawQwpWsRoundStream, ReconnectReason,
 };
 // The reconnect backoff helpers are only consumed by the retry-capable borrow
-// paths: the row-major polars `reborrow_with_retry` and the FFI owned
+// paths: Polars `reborrow_with_retry` and the FFI owned
 // `*_with_retry` entry points. Keep the import unconditional (so the shared
 // re-export chain that feeds it stays live) but quiet the unused-import lint in
 // the plain library build that compiles neither retry path.
@@ -85,20 +78,20 @@ use crate::ingress::{reconnect_backoff_step, reconnect_error_is_terminal};
 use crate::{Result, error};
 
 /// Connect-string parsing for the [`QuestDb`] pool. Shared by every borrow
-/// kind (column-major sender, row-major sender, reader), so it lives with the
-/// pool rather than under the column sender.
+/// kind (store-and-forward ingestion, direct ingestion, reader), so it lives
+/// with the pool rather than under a payload encoder.
 mod conf;
 
 use crate::ingress::AckLevel;
-use crate::ingress::column_sender::ColumnSender;
 use crate::ingress::column_sender::conn::ColumnConn;
+use crate::ingress::column_sender::{DirectSenderCore, PooledSenderCore};
 use conf::PoolReap;
 
 /// FFI escape-hatch surface: owned (lifetime-free) pool handles and the entry
 /// points that mint them, for the `questdb-rs-ffi` C-ABI crate. Hidden,
 /// feature-gated, and not part of the public Rust API — normal Rust users
-/// borrow lifetime-bound handles via [`QuestDb::borrow_column_sender`] /
-/// [`QuestDb::borrow_row_sender`] (and, with egress, `QuestDb::borrow_reader`).
+/// borrow lifetime-bound handles via [`QuestDb::borrow_sender`] (and, with
+/// egress, `QuestDb::borrow_reader`).
 /// Only `questdb-rs-ffi` enables the `ffi-support` feature.
 #[cfg(feature = "ffi-support")]
 #[doc(hidden)]
@@ -112,41 +105,8 @@ const REAPER_MIN_TICK: Duration = Duration::from_secs(5);
 /// can never be observed, but `questdb-rs` library consumers run with
 /// `panic=unwind` and a single panicking thread would otherwise turn
 /// every subsequent borrow/return into a panic via `.expect("poisoned")`.
-fn lock_state(m: &Mutex<PoolState>) -> std::sync::MutexGuard<'_, PoolState> {
+fn lock_state<S>(m: &Mutex<PoolState<S>>) -> std::sync::MutexGuard<'_, PoolState<S>> {
     m.lock().unwrap_or_else(|e| e.into_inner())
-}
-
-/// Which column-sender pool a borrow / return targets.
-///
-/// The two pools are structurally identical (`Mutex<PoolState>`) but differ in
-/// what they hand out:
-/// * [`ColumnPoolKind::Main`] — the general-purpose pool behind
-///   [`QuestDb::borrow_column_sender`]: always store-and-forward — an
-///   in-memory queue when no `sf_dir` is set (pools freely up to `pool_max`),
-///   disk-backed with one managed slot directory per pooled sender when it is.
-///   A parked connection's background runner keeps delivering, and pool close / reap
-///   flush queued frames best-effort within `close_flush_timeout`; for a hard
-///   delivery guarantee on an in-memory queue, call [`BorrowedColumnSender::wait`]
-///   before close (or use `sf_dir`). `wait` is an ack-wait barrier (block until
-///   the published frame reaches the requested [`AckLevel`]), not a
-///   commit-or-lose-data step.
-/// * [`ColumnPoolKind::Direct`] — the always-direct pool behind
-///   [`QuestDb::borrow_direct_column_sender`], independent of `sf_dir`. Used by
-///   DataFrame ingestion (Polars / Pandas), which drives its own replay from
-///   the source frame and so wants a plain pipelined connection, never the SFA
-///   queue.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum ColumnPoolKind {
-    Main,
-    Direct,
-}
-
-/// Select the `PoolState` mutex for `kind`.
-fn column_pool_state(inner: &DbInner, kind: ColumnPoolKind) -> &Mutex<PoolState> {
-    match kind {
-        ColumnPoolKind::Main => &inner.state,
-        ColumnPoolKind::Direct => &inner.direct_state,
-    }
 }
 
 fn lock_health(
@@ -160,32 +120,26 @@ fn lock_reader_state(m: &Mutex<ReaderPoolState>) -> std::sync::MutexGuard<'_, Re
     m.lock().unwrap_or_else(|e| e.into_inner())
 }
 
-fn lock_row_sender_state(
-    m: &Mutex<RowSenderPoolState>,
-) -> std::sync::MutexGuard<'_, RowSenderPoolState> {
-    m.lock().unwrap_or_else(|e| e.into_inner())
-}
-
 /// RAII guard that increments `state.in_use` on construction and
 /// decrements it on drop unless [`InUseSlot::commit`] is called first.
 /// Closes the leak window between `state.in_use += 1` and the connect
 /// round: a panic in the connect path (allocator OOM,
 /// TLS handshake panic) would otherwise skip the matching decrement
 /// and permanently strand a pool slot.
-struct InUseSlot<'a> {
-    state: &'a Mutex<PoolState>,
+struct InUseSlot<'a, S> {
+    state: &'a Mutex<PoolState<S>>,
     cv: &'a Condvar,
     slot_index: Option<usize>,
     armed: bool,
 }
 
-impl InUseSlot<'_> {
+impl<S> InUseSlot<'_, S> {
     fn commit(mut self) {
         self.armed = false;
     }
 }
 
-impl Drop for InUseSlot<'_> {
+impl<S> Drop for InUseSlot<'_, S> {
     fn drop(&mut self) {
         if self.armed {
             let mut state = lock_state(self.state);
@@ -219,46 +173,19 @@ impl Drop for ReaderInUseSlot<'_> {
     }
 }
 
-/// Row-major sender equivalent of `ReaderInUseSlot`: reserves an `in_use`
-/// slot under the cap and releases it on drop unless `commit` is called.
-struct RowSenderInUseSlot<'a> {
-    state: &'a Mutex<RowSenderPoolState>,
-    cv: &'a Condvar,
-    slot_index: Option<usize>,
-    armed: bool,
-}
-
-impl RowSenderInUseSlot<'_> {
-    fn commit(mut self) {
-        self.armed = false;
-    }
-}
-
-impl Drop for RowSenderInUseSlot<'_> {
-    fn drop(&mut self) {
-        if self.armed {
-            let mut state = lock_row_sender_state(self.state);
-            state.in_use = state.in_use.saturating_sub(1);
-            state.free_slot_index(self.slot_index);
-            self.cv.notify_all();
-        }
-    }
-}
-
-struct ColumnSlotRelease<'a> {
+struct SenderSlotRelease<'a> {
     inner: &'a DbInner,
-    kind: ColumnPoolKind,
     slot_index: Option<usize>,
     decrement_in_use: bool,
     decrement_closing: bool,
 }
 
-impl Drop for ColumnSlotRelease<'_> {
+impl Drop for SenderSlotRelease<'_> {
     fn drop(&mut self) {
         if self.slot_index.is_none() && !self.decrement_in_use && !self.decrement_closing {
             return;
         }
-        let mut state = lock_state(column_pool_state(self.inner, self.kind));
+        let mut state = lock_state(&self.inner.state);
         if self.decrement_in_use {
             state.in_use = state.in_use.saturating_sub(1);
         }
@@ -270,39 +197,15 @@ impl Drop for ColumnSlotRelease<'_> {
     }
 }
 
-struct RowSlotRelease<'a> {
-    inner: &'a DbInner,
-    slot_index: Option<usize>,
-    decrement_in_use: bool,
-    decrement_closing: bool,
-}
-
-impl Drop for RowSlotRelease<'_> {
-    fn drop(&mut self) {
-        if self.slot_index.is_none() && !self.decrement_in_use && !self.decrement_closing {
-            return;
-        }
-        let mut state = lock_row_sender_state(&self.inner.row_sender_state);
-        if self.decrement_in_use {
-            state.in_use = state.in_use.saturating_sub(1);
-        }
-        if self.decrement_closing {
-            state.closing = state.closing.saturating_sub(1);
-        }
-        state.free_slot_index(self.slot_index);
-        self.inner.row_cv.notify_all();
-    }
-}
-
-/// Connection pool for the column-major sender API.
+/// Connection pool for QWP/WebSocket ingestion and egress.
 ///
 /// Construct with [`QuestDb::connect`]. Share the pool across threads — its
-/// internal state is `Mutex`-guarded so [`QuestDb::borrow_column_sender`] /
+/// internal state is `Mutex`-guarded so [`QuestDb::borrow_sender`] /
 /// [`QuestDb::reap_idle`] / Drop-driven returns are safe to interleave.
 ///
-/// Each borrow ([`BorrowedColumnSender`] / the internal direct sender) is **not** `Send` — it belongs to the
-/// thread that borrowed it. To ingest in parallel, borrow one sender per
-/// worker thread from the same `QuestDb`.
+/// Each borrow ([`BorrowedSender`] / the internal direct sender) is **not**
+/// `Send` — it belongs to the thread that borrowed it. To ingest in parallel,
+/// borrow one sender per worker thread from the same `QuestDb`.
 pub struct QuestDb {
     inner: Arc<DbInner>,
     reaper: Option<JoinHandle<()>>,
@@ -321,10 +224,9 @@ struct DbInner {
     /// across the configured endpoints. A single-endpoint pool behaves
     /// exactly as before (one endpoint, no rotation).
     connector: QwpWsConnector,
-    /// Parsed row-sender builder retained so the pool can build row-major
-    /// senders with the same validated config while overriding only the
-    /// managed disk-SF slot id.
-    row_sender_builder: SenderBuilder,
+    /// Buffer-factory configuration retained directly on the pool root so a
+    /// caller can create a QWP/WebSocket Buffer without borrowing a sender.
+    buffer_max_name_len: usize,
     /// One health tracker shared by every connect attempt. A connect failure
     /// or a mid-stream transport death marks the offending endpoint unhealthy
     /// so subsequent borrows skip it until it re-probes healthy; role rejects
@@ -337,44 +239,35 @@ struct DbInner {
     /// `sf_dir` set: store-and-forward senders use pool-minted disk slots.
     sf_disk: bool,
     /// Configured `sender_id` kept as the slot base. Disk-backed pool slots are
-    /// minted as `<base>-col-<index>` and `<base>-row-<index>`.
+    /// minted as `<base>-ingest-<index>`.
     slot_base_id: String,
-    /// Managed row/column slot ranges excluded from orphan scans so sibling
+    /// Managed ingestion slot range excluded from orphan scans so sibling
     /// senders do not adopt each other's live pool slots.
-    managed_slot_exclusions: Vec<QwpWsManagedSlotExclusion>,
+    managed_slot_exclusion: Option<QwpWsManagedSlotExclusion>,
     pool_idle_timeout: Duration,
     /// Optional connection lifecycle event source (dispatcher + attempt
     /// counter + success-classification state). Set at most once via
     /// [`QuestDb::set_connection_listener`]; every ingress pool connect
     /// and transport-death return reports through it.
     conn_events: OnceLock<conn_events::ConnectionEventSource>,
-    state: Mutex<PoolState>,
+    state: Mutex<PoolState<PooledSenderCore>>,
     /// Always-direct column-sender pool, independent of `sf_dir`. Backs
     /// [`QuestDb::borrow_direct_column_sender`] (DataFrame ingestion). Lazy-init
-    /// like the reader / row-sender pools: starts empty, opens a direct
+    /// like the reader pool: starts empty, opens a direct
     /// connection on demand, recycles through its own free list and the shared
     /// `pool_max` cap. Kept separate from `state` so DataFrame ingest always
     /// gets a plain pipelined connection even when `state` is in
     /// store-and-forward mode.
-    direct_state: Mutex<PoolState>,
+    direct_state: Mutex<PoolState<DirectSenderCore>>,
     /// Reader pool. Lazy-init: starts empty, populated on first
     /// `borrow_reader_owned` call. Applies the same `pool_size` /
     /// `pool_max` / `pool_idle_timeout` values as the sender pool but
     /// tracks and caps them on an independent free list, so heavy ingest
     /// can't starve queries. The caps are enforced separately, so the
-    /// combined live connection count across the column-sender, direct
-    /// column-sender, reader, and row-major-sender pools can reach up to
-    /// `4 * pool_max`.
+    /// combined live connection count across the store-and-forward ingress,
+    /// direct ingestion, and reader pools can reach up to `3 * pool_max`.
     #[cfg(feature = "_egress")]
     reader_state: Mutex<ReaderPoolState>,
-    /// Row-major (`crate::ingress::Sender`) pool. Lazy-init, independent free
-    /// list and `pool_max` cap, rebuilt from `conf` via
-    /// `SenderBuilder::from_conf`. Lets callers borrow a classic ILP row
-    /// sender from the same `QuestDb` handle as the column-major senders.
-    row_sender_state: Mutex<RowSenderPoolState>,
-    /// Row-sender counterpart to `cv`; kept separate because a Rust `Condvar`
-    /// must not be waited on with multiple mutexes.
-    row_cv: Condvar,
     /// Wakes the reaper thread on `shutdown` and lets a disk-SF borrow wait
     /// briefly for an in-flight slot close to release its flock.
     cv: Condvar,
@@ -426,13 +319,12 @@ impl SlotReservations {
     }
 }
 
-#[derive(Default)]
-struct PoolState {
+struct PoolState<S> {
     /// Idle connections. Borrow/return is LIFO on the back (push/pop);
     /// the reaper drains the oldest entries from the front. Keeps hot
     /// connections warm in the common case while the reaper still
     /// retires entries in age order.
-    free: Vec<PoolEntry>,
+    free: Vec<PoolEntry<S>>,
     /// Sum of currently-borrowed senders + in-flight grow operations.
     in_use: usize,
     /// Reserved disk slots whose sender has started close/drop but has not yet
@@ -443,7 +335,18 @@ struct PoolState {
     slots: SlotReservations,
 }
 
-impl PoolState {
+impl<S> Default for PoolState<S> {
+    fn default() -> Self {
+        Self {
+            free: Vec::new(),
+            in_use: 0,
+            closing: 0,
+            slots: SlotReservations::default(),
+        }
+    }
+}
+
+impl<S> PoolState<S> {
     fn total(&self) -> usize {
         self.free.len() + self.in_use
     }
@@ -474,14 +377,14 @@ impl PoolState {
     }
 }
 
-struct PoolEntry {
-    sender: ColumnSender,
+struct PoolEntry<S> {
+    sender: S,
     slot_index: Option<usize>,
     last_idle_at: Instant,
 }
 
-struct PooledColumnSender {
-    sender: ColumnSender,
+struct PooledSender<S> {
+    sender: S,
     slot_index: Option<usize>,
 }
 
@@ -511,52 +414,6 @@ struct ReaderPoolEntry {
     last_idle_at: Instant,
 }
 
-#[derive(Default)]
-struct RowSenderPoolState {
-    /// Idle row-major senders, oldest at front, newest at back (push on
-    /// return / pop on borrow). Same FIFO/LIFO discipline as the column
-    /// sender free list.
-    free: Vec<RowSenderPoolEntry>,
-    /// Currently-borrowed row senders + in-flight grow operations.
-    in_use: usize,
-    /// Reserved disk slots whose sender has started close/drop but has not yet
-    /// released the slot flock.
-    closing: usize,
-    /// Disk-backed store-and-forward slot reservations, as in [`PoolState`].
-    slots: SlotReservations,
-}
-
-impl RowSenderPoolState {
-    fn total(&self) -> usize {
-        self.free.len() + self.in_use
-    }
-
-    fn with_disk_slots(pool_max: usize) -> Self {
-        Self {
-            free: Vec::new(),
-            in_use: 0,
-            closing: 0,
-            slots: SlotReservations::with_disk_slots(pool_max),
-        }
-    }
-
-    fn reserved_total(&self) -> usize {
-        self.slots.reserved_total(self.total())
-    }
-
-    fn allocate_slot_index(&mut self) -> Option<usize> {
-        self.slots.allocate()
-    }
-
-    fn reserve_slot_index(&mut self, index: usize) -> bool {
-        self.slots.reserve(index)
-    }
-
-    fn free_slot_index(&mut self, slot_index: Option<usize>) {
-        self.slots.free(slot_index);
-    }
-}
-
 /// Connection counts for a single pool inside a [`QuestDb`], part of the
 /// unstable diagnostics snapshot returned by [`QuestDb::dbg_pool_counts`].
 ///
@@ -581,57 +438,22 @@ pub struct DbgPoolCount {
 /// diagnostics. **Not semver-stable** (`#[doc(hidden)]`, `#[non_exhaustive]`).
 ///
 /// Each pool is capped independently at `pool_max`, so `free + in_use` summed
-/// across all four fields can reach `4 * pool_max`.
+/// across all three fields can reach `3 * pool_max` when egress is enabled.
 #[doc(hidden)]
 #[non_exhaustive]
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct DbgPoolCounts {
-    /// General-purpose / store-and-forward column-sender pool (the pool behind
-    /// `borrow_column_sender`).
-    pub column_sf: DbgPoolCount,
+    /// Store-and-forward ingestion pool (the pool behind `borrow_sender`).
+    pub ingress: DbgPoolCount,
     /// Always-direct column-sender pool (DataFrame ingest, the pool behind
     /// `borrow_direct_column_sender`).
     pub column_direct: DbgPoolCount,
-    /// Row-major ([`crate::ingress::Sender`]) sender pool.
-    pub row_sender: DbgPoolCount,
     /// Reader (egress) pool. Always zero when the crate is built without an
     /// egress feature.
     pub reader: DbgPoolCount,
 }
 
-struct RowSenderPoolEntry {
-    /// A classic ILP row sender. It owns its connection and per-connection
-    /// state internally, so (like the reader pool) we don't track extra
-    /// fields alongside it.
-    sender: Sender,
-    slot_index: Option<usize>,
-    last_idle_at: Instant,
-}
-
-struct PooledRowSender {
-    sender: Sender,
-    slot_index: Option<usize>,
-}
-
-#[derive(Clone, Copy)]
-enum ManagedSlotKind {
-    Column,
-    Row,
-}
-
-impl ManagedSlotKind {
-    fn label(self) -> &'static str {
-        match self {
-            Self::Column => "col",
-            Self::Row => "row",
-        }
-    }
-}
-
-const MANAGED_SLOT_KINDS: [ManagedSlotKind; 2] = [ManagedSlotKind::Column, ManagedSlotKind::Row];
-
 struct ManagedSlotRecoveryCandidate {
-    kind: ManagedSlotKind,
     index: usize,
     path: PathBuf,
 }
@@ -642,37 +464,20 @@ struct ManagedSlotRecoveryScan {
     out_of_range: Vec<PathBuf>,
 }
 
-fn managed_slot_exclusions(base: &str, pool_max: usize) -> Vec<QwpWsManagedSlotExclusion> {
-    vec![
-        managed_slot_exclusion(base, ManagedSlotKind::Column, pool_max),
-        managed_slot_exclusion(base, ManagedSlotKind::Row, pool_max),
-    ]
+fn managed_slot_exclusion(base: &str, pool_max: usize) -> QwpWsManagedSlotExclusion {
+    QwpWsManagedSlotExclusion::new(managed_slot_prefix(base), pool_max)
 }
 
-fn managed_slot_exclusion(
-    base: &str,
-    kind: ManagedSlotKind,
-    pool_max: usize,
-) -> QwpWsManagedSlotExclusion {
-    QwpWsManagedSlotExclusion::new(managed_slot_prefix(base, kind), pool_max)
+fn managed_slot_id(base: &str, index: usize) -> String {
+    managed_slot_exclusion(base, usize::MAX).slot_name(index)
 }
 
-fn managed_slot_id(base: &str, kind: ManagedSlotKind, index: usize) -> String {
-    managed_slot_exclusion(base, kind, usize::MAX).slot_name(index)
+fn managed_slot_prefix(base: &str) -> String {
+    format!("{base}-ingest-")
 }
 
-fn managed_slot_prefix(base: &str, kind: ManagedSlotKind) -> String {
-    format!("{}-{}-", base, kind.label())
-}
-
-fn parse_managed_slot_id(base: &str, name: &str) -> Option<(ManagedSlotKind, usize)> {
-    for kind in MANAGED_SLOT_KINDS {
-        let exclusion = QwpWsManagedSlotExclusion::new(managed_slot_prefix(base, kind), usize::MAX);
-        if let Some(index) = exclusion.parse_index(name) {
-            return Some((kind, index));
-        }
-    }
-    None
+fn parse_managed_slot_id(base: &str, name: &str) -> Option<usize> {
+    managed_slot_exclusion(base, usize::MAX).parse_index(name)
 }
 
 fn managed_slot_recovery_candidates(inner: &DbInner) -> Vec<PathBuf> {
@@ -710,7 +515,7 @@ fn managed_slot_recovery_scan_from(
         let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
             continue;
         };
-        let Some((kind, index)) = parse_managed_slot_id(base, &name) else {
+        let Some(index) = parse_managed_slot_id(base, &name) else {
             continue;
         };
         if !is_candidate_orphan(&slot_path) {
@@ -721,7 +526,6 @@ fn managed_slot_recovery_scan_from(
         // recovery, so a sibling drainer must not take their flock.
         if index < pool_max {
             scan.in_range.push(ManagedSlotRecoveryCandidate {
-                kind,
                 index,
                 path: slot_path,
             });
@@ -731,7 +535,7 @@ fn managed_slot_recovery_scan_from(
             // DbInner-level dedupe set is a follow-up, not part of this fix.
             log::warn!(
                 "adopting out-of-range store-and-forward slot `{}`; \
-                 `<sender_id>-col-*` and `<sender_id>-row-*` directories under \
+                 `<sender_id>-ingest-*` directories under \
                  sf_dir belong to the QuestDb pool namespace, so use a unique \
                  sender_id for pools sharing an sf_dir",
                 slot_path.display()
@@ -746,15 +550,11 @@ fn managed_slot_recovery_scan_from(
 /// concurrency still replays all recoverable queued frames without waiting for
 /// the exact high index to be borrowed again.
 ///
-/// The recovery senders count toward the pool total like ordinary parked
-/// senders: the column pool keeps up to `pool_size` warm, and excess senders
-/// are reaped only after their queues are delivered and idle past the timeout.
-/// Parked column recovery senders drain on pool close via
-/// `drain_sfa_senders_bounded`; row queues remain persisted on disk and recover
-/// on the next connect. Each pre-opened sender also enrolls out-of-range managed
-/// slots in its orphan-drainer set, so those slots may begin replay at connect
-/// as well. In the worst case this temporarily starts roughly `2 * pool_max`
-/// background runners, bounded by the configured row and column slot caps.
+/// Recovery senders count toward the ingestion pool total like ordinary parked
+/// senders. They are reaped only after their queues are delivered and idle past
+/// the timeout, and drain on pool close via `drain_sfa_senders_bounded`. Each
+/// pre-opened sender also enrolls out-of-range managed slots in its
+/// orphan-drainer set, so those slots may begin replay at connect as well.
 fn preopen_recovery_senders(inner: &Arc<DbInner>) {
     if !inner.sf_disk {
         return;
@@ -764,24 +564,11 @@ fn preopen_recovery_senders(inner: &Arc<DbInner>) {
     };
     let scan = managed_slot_recovery_scan_from(sf_dir, &inner.slot_base_id, inner.pool_max);
     for candidate in scan.in_range {
-        match candidate.kind {
-            ManagedSlotKind::Column => preopen_column_recovery_sender(
-                inner,
-                candidate.index,
-                &candidate.path,
-                &scan.out_of_range,
-            ),
-            ManagedSlotKind::Row => preopen_row_recovery_sender(
-                inner,
-                candidate.index,
-                &candidate.path,
-                &scan.out_of_range,
-            ),
-        }
+        preopen_recovery_sender(inner, candidate.index, &candidate.path, &scan.out_of_range);
     }
 }
 
-fn preopen_column_recovery_sender(
+fn preopen_recovery_sender(
     inner: &Arc<DbInner>,
     index: usize,
     slot_path: &Path,
@@ -818,58 +605,7 @@ fn preopen_column_recovery_sender(
         }
         Err(err) => {
             log::warn!(
-                "skipping parked store-and-forward column slot `{}` during recovery: {}",
-                slot_path.display(),
-                err
-            );
-        }
-    }
-}
-
-fn preopen_row_recovery_sender(
-    inner: &Arc<DbInner>,
-    index: usize,
-    slot_path: &Path,
-    recovery_candidates: &[PathBuf],
-) {
-    let slot = {
-        let mut state = lock_row_sender_state(&inner.row_sender_state);
-        if !state.reserve_slot_index(index) {
-            return;
-        }
-        state.in_use += 1;
-        RowSenderInUseSlot {
-            state: &inner.row_sender_state,
-            cv: &inner.row_cv,
-            slot_index: Some(index),
-            armed: true,
-        }
-    };
-
-    let sender_id = managed_slot_id(&inner.slot_base_id, ManagedSlotKind::Row, index);
-    match inner.row_sender_builder.build_with_qwp_ws_pool_slot(
-        Some(sender_id.as_str()),
-        &inner.managed_slot_exclusions,
-        recovery_candidates,
-        true,
-    ) {
-        Ok(sender) => {
-            let slot_index = slot.slot_index;
-            {
-                let mut state = lock_row_sender_state(&inner.row_sender_state);
-                state.in_use = state.in_use.saturating_sub(1);
-                state.free.push(RowSenderPoolEntry {
-                    sender,
-                    slot_index,
-                    last_idle_at: Instant::now(),
-                });
-            }
-            slot.commit();
-            inner.row_cv.notify_all();
-        }
-        Err(err) => {
-            log::warn!(
-                "skipping parked store-and-forward row slot `{}` during recovery: {}",
+                "skipping parked store-and-forward ingestion slot `{}` during recovery: {}",
                 slot_path.display(),
                 err
             );
@@ -890,17 +626,15 @@ impl QuestDb {
     /// | `pool_idle_timeout_ms` | 60000   | Above-`pool_size` idle connections are closed after this long. |
     /// | `pool_reap`            | `auto`  | `auto` runs a background reaper; `manual` requires `reap_idle`. |
     ///
-    /// [`Self::borrow_column_sender`] is always store-and-forward (in-memory
-    /// when no `sf_dir`, disk-backed when set), mirroring the row-major sender.
-    /// Setting `sf_dir` selects disk-backed SF: every pooled row or column
-    /// sender gets its own slot directory, minted from the configured
-    /// `sender_id` base as `<base>-row-<index>` or `<base>-col-<index>`.
-    /// Those `<sender_id>-row-*` and `<sender_id>-col-*` directories are
-    /// reserved for this pool namespace under `sf_dir`; use a unique
-    /// `sender_id` for each pool that shares an `sf_dir`.
-    /// `pool_size` / `pool_max` keep the same per-kind meaning as in memory
-    /// mode. At cap, borrows return `InvalidApiCall` except disk-backed
-    /// row/column SF borrows can wait up to `close_flush_timeout` (default 5s)
+    /// [`Self::borrow_sender`] is always store-and-forward (in-memory when no
+    /// `sf_dir`, disk-backed when set). Setting `sf_dir` gives every pooled
+    /// sender its own slot directory, minted from the configured `sender_id`
+    /// base as `<base>-ingest-<index>`. Those `<sender_id>-ingest-*`
+    /// directories are reserved for this pool namespace under `sf_dir`; use a
+    /// unique `sender_id` for each pool that shares an `sf_dir`.
+    /// `pool_size` / `pool_max` apply once to this unified ingestion pool. At
+    /// cap, borrows return `InvalidApiCall` except disk-backed
+    /// ingestion borrows can wait up to `close_flush_timeout` (default 5s)
     /// while an in-flight slot close releases its lock. For a plain pipelined
     /// (non-SF) connection — used by DataFrame ingestion — see
     /// [`Self::borrow_direct_column_sender`].
@@ -908,19 +642,17 @@ impl QuestDb {
     /// Pools are **lazy**: `connect` performs no blocking network I/O. In
     /// disk-backed store-and-forward mode, it may pre-open parked recovery
     /// senders whose initial connect and replay run in the background. The
-    /// store-and-forward column pool creates a local producer on first borrow
+    /// store-and-forward ingestion pool creates a local producer on first borrow
     /// and starts its initial connect in the background, so the borrower can
-    /// buffer immediately even while the server is absent. Direct column
-    /// senders, readers, and row senders still open their transport on first
-    /// borrow, except for parked disk-SF recovery senders pre-opened at
-    /// connect. `pool_size` is the warm minimum the reaper keeps once entries
-    /// have been opened.
+    /// buffer immediately even while the server is absent. Direct senders and
+    /// readers still open their transport on first borrow. `pool_size` is the
+    /// warm minimum the reaper keeps once entries have been opened.
     ///
     /// # Store-and-forward durability
     ///
     /// Disk store-and-forward (`sf_dir`) writes queued frames and their symbol
     /// dictionary to disk but does **not** `fsync` — the data is *page-cache
-    /// durable*, matching the row-major sender. That survives a **process / JVM
+    /// durable*, matching the standalone QWP/WebSocket sender. That survives a **process / JVM
     /// crash** (unacked frames replay on the next borrow / recovery), but **not**
     /// a **host / power crash**, which can lose or tear unflushed pages. A
     /// recovery that finds a torn symbol dictionary (or a frame whose dictionary
@@ -936,21 +668,20 @@ impl QuestDb {
     ///
     pub fn connect(conf: &str) -> Result<Self> {
         let parsed = conf::parse(conf)?;
-        // The main column and row pools are always store-and-forward:
-        // in-memory queues when no `sf_dir`, disk-backed pool-minted slots when
-        // set. Disk slots are kind-scoped (`<base>-col-N`, `<base>-row-N`) so
-        // row and column pools do not churn each other's replay directories.
+        // The public ingestion pool is always store-and-forward: in-memory
+        // queues when no `sf_dir`, disk-backed pool-minted slots when set.
         let sf_disk = parsed.sf_disk;
         let pool_cfg = parsed.pool;
 
-        let row_sender_builder = SenderBuilder::from_conf(conf)?;
-        let connector = row_sender_builder.build_qwp_ws_connector()?;
+        let builder = SenderBuilder::from_conf(conf)?;
+        let buffer_max_name_len = builder.configured_max_name_len();
+        let connector = builder.build_qwp_ws_connector()?;
         let health = QwpWsHostHealthTracker::new(connector.endpoint_count());
         let slot_base_id = connector.sender_id().to_owned();
-        let managed_slot_exclusions = if sf_disk {
-            managed_slot_exclusions(&slot_base_id, pool_cfg.pool_max)
+        let managed_slot_exclusion = if sf_disk {
+            Some(managed_slot_exclusion(&slot_base_id, pool_cfg.pool_max))
         } else {
-            Vec::new()
+            None
         };
 
         // Start empty; connect-time recovery may pre-open dirty disk-SF slots
@@ -961,13 +692,13 @@ impl QuestDb {
             #[cfg(feature = "_egress")]
             conf: conf.to_owned(),
             connector,
-            row_sender_builder,
+            buffer_max_name_len,
             health: Mutex::new(health),
             pool_size: pool_cfg.pool_size,
             pool_max: pool_cfg.pool_max,
             sf_disk,
             slot_base_id,
-            managed_slot_exclusions,
+            managed_slot_exclusion,
             pool_idle_timeout: pool_cfg.pool_idle_timeout,
             state: Mutex::new(if sf_disk {
                 PoolState::with_disk_slots(pool_cfg.pool_max)
@@ -980,12 +711,6 @@ impl QuestDb {
             direct_state: Mutex::new(PoolState::default()),
             #[cfg(feature = "_egress")]
             reader_state: Mutex::new(ReaderPoolState::default()),
-            row_sender_state: Mutex::new(if sf_disk {
-                RowSenderPoolState::with_disk_slots(pool_cfg.pool_max)
-            } else {
-                RowSenderPoolState::default()
-            }),
-            row_cv: Condvar::new(),
             cv: Condvar::new(),
             shutdown: AtomicBool::new(false),
             conn_events: OnceLock::new(),
@@ -1007,6 +732,22 @@ impl QuestDb {
         Ok(Self { inner, reaper })
     }
 
+    /// Create a caller-owned QWP/WebSocket row buffer using this pool's
+    /// configured table/column name limit. The buffer is independent of any
+    /// particular sender borrow and may be filled or moved before it is
+    /// published by a store-and-forward sender from this pool.
+    pub fn new_buffer(&self) -> Buffer {
+        Buffer::qwp_ws_with_max_name_len(self.inner.buffer_max_name_len)
+    }
+
+    /// Configured name limit used by [`Self::new_buffer`]. Exposed for the C++
+    /// wrapper so a moved-from buffer can lazily recreate the same kind of
+    /// buffer without retaining a pool reference.
+    #[doc(hidden)]
+    pub fn buffer_max_name_len(&self) -> usize {
+        self.inner.buffer_max_name_len
+    }
+
     /// Borrow a sender.
     ///
     /// Selection: pop the most-recently-returned slot from the free list;
@@ -1014,14 +755,9 @@ impl QuestDb {
     /// failing that, in disk-backed store-and-forward mode only, wait up to
     /// `close_flush_timeout` (default 5s) while an in-flight slot close
     /// releases its lock; failing that, return `InvalidApiCall`.
-    pub fn borrow_column_sender(&self) -> Result<BorrowedColumnSender<'_>> {
-        let cs = self.pick_column_sender()?;
-        Ok(BorrowedColumnSender(ColumnSenderHandle::new(
-            self,
-            cs.sender,
-            ColumnPoolKind::Main,
-            cs.slot_index,
-        )))
+    pub fn borrow_sender(&self) -> Result<BorrowedSender<'_>> {
+        let cs = self.pick_sender()?;
+        Ok(BorrowedSender(SenderHandle::new(self, cs)))
     }
 
     /// Borrow a **direct** (non-store-and-forward) column sender from the
@@ -1033,12 +769,9 @@ impl QuestDb {
     /// those entry points rather than handling a sender.
     #[doc(hidden)]
     pub fn borrow_direct_column_sender(&self) -> Result<BorrowedDirectColumnSender<'_>> {
-        let cs = pick_column_sender_inner(&self.inner, ColumnPoolKind::Direct)?;
-        Ok(BorrowedDirectColumnSender(ColumnSenderHandle::new(
-            self,
-            cs.sender,
-            ColumnPoolKind::Direct,
-            cs.slot_index,
+        let cs = pick_direct_sender(&self.inner)?;
+        Ok(BorrowedDirectColumnSender(DirectSenderHandle::new(
+            self, cs,
         )))
     }
 
@@ -1116,33 +849,7 @@ impl QuestDb {
         }
     }
 
-    /// Borrow a **row-major** ([`crate::ingress::Sender`]) ILP sender from the
-    /// pool, the companion to the column-major [`Self::borrow_column_sender`].
-    ///
-    /// The row-sender pool is lazy except for disk-backed recovery senders
-    /// pre-opened by [`Self::connect`]: it otherwise opens a fresh `Sender`
-    /// (via `SenderBuilder::from_conf` on the original connect string) on
-    /// demand, recycling returned senders through an independent free list and
-    /// `pool_max` cap. In disk-backed store-and-forward mode, an at-cap borrow
-    /// can wait up to `close_flush_timeout` (default 5s) while an in-flight slot
-    /// close releases its lock; otherwise borrow at the cap returns
-    /// [`ErrorCode::InvalidApiCall`](crate::ErrorCode::InvalidApiCall).
-    ///
-    /// The returned [`BorrowedRowSender`] exposes the usual `Buffer` build +
-    /// `flush` flow directly, and returns the sender to the pool on `Drop`
-    /// (unless its connection latched terminal state, or
-    /// [`BorrowedRowSender::drop_on_return`] was called, in which case it is
-    /// dropped and the next borrow opens a fresh one).
-    pub fn borrow_row_sender(&self) -> Result<BorrowedRowSender<'_>> {
-        let sender = self.pick_row_sender()?;
-        Ok(BorrowedRowSender::new(
-            self,
-            sender.sender,
-            sender.slot_index,
-        ))
-    }
-
-    /// FFI escape hatch: like [`Self::borrow_column_sender`] but the returned
+    /// FFI escape hatch: like [`Self::borrow_sender`] but the returned
     /// handle is not lifetime-bound to `&self`. Carries an `Arc<DbInner>`
     /// internally so it can outlive the user-facing `QuestDb` pointer
     /// (the pool's return path stays alive as long as any borrow is
@@ -1150,37 +857,22 @@ impl QuestDb {
     /// recycled).
     ///
     /// Hidden from the Rust API because Rust callers should prefer the
-    /// lifetime-bound `borrow_column_sender`, which catches use-after-close at
-    /// compile time. C callers reach this through `questdb_db_borrow_column_sender`.
+    /// lifetime-bound `borrow_sender`, which catches use-after-close at
+    /// compile time. C callers reach this through `questdb_db_borrow_sender`.
     #[cfg(feature = "ffi-support")]
-    pub(crate) fn borrow_column_sender_owned(&self) -> Result<OwnedColumnSender> {
-        let cs = self.pick_column_sender()?;
-        Ok(OwnedColumnSender {
-            inner: Arc::clone(&self.inner),
-            sender: Some(cs.sender),
-            kind: ColumnPoolKind::Main,
-            slot_index: cs.slot_index,
-        })
+    pub(crate) fn borrow_sender_owned(&self) -> Result<OwnedSender> {
+        let cs = self.pick_sender()?;
+        Ok(OwnedSender::new(Arc::clone(&self.inner), cs))
     }
 
-    /// Like [`borrow_column_sender_owned`] but retries the connect within `budget`
-    /// using the row API's reconnect backoff (the cluster may be electing a
-    /// primary). Backs the C ABI's `questdb_db_borrow_column_sender_with_retry`, so
-    /// C / C++ / Python callers fail over with the same backoff and budget as
-    /// the row sender.
+    /// Like [`borrow_sender_owned`] but retries the connect within `budget`
+    /// using the pool's reconnect backoff (the cluster may be electing a
+    /// primary). Backs the C ABI's `questdb_db_borrow_sender_with_retry`.
     #[cfg(feature = "ffi-support")]
-    pub(crate) fn borrow_column_sender_owned_with_retry(
-        &self,
-        budget: Duration,
-    ) -> Result<OwnedColumnSender> {
+    pub(crate) fn borrow_sender_owned_with_retry(&self, budget: Duration) -> Result<OwnedSender> {
         let deadline = Instant::now().checked_add(budget);
-        let cs = reconnect_pick(&self.inner, ColumnPoolKind::Main, deadline)?;
-        Ok(OwnedColumnSender {
-            inner: Arc::clone(&self.inner),
-            sender: Some(cs.sender),
-            kind: ColumnPoolKind::Main,
-            slot_index: cs.slot_index,
-        })
+        let cs = reconnect_pick(&self.inner, deadline, pick_sfa_sender)?;
+        Ok(OwnedSender::new(Arc::clone(&self.inner), cs))
     }
 
     /// FFI escape hatch: like [`Self::borrow_direct_column_sender`] but the
@@ -1190,14 +882,9 @@ impl QuestDb {
     /// the Rust API; Rust callers should prefer the lifetime-bound
     /// [`Self::borrow_direct_column_sender`].
     #[cfg(feature = "ffi-support")]
-    pub(crate) fn borrow_direct_column_sender_owned(&self) -> Result<OwnedColumnSender> {
-        let cs = pick_column_sender_inner(&self.inner, ColumnPoolKind::Direct)?;
-        Ok(OwnedColumnSender {
-            inner: Arc::clone(&self.inner),
-            sender: Some(cs.sender),
-            kind: ColumnPoolKind::Direct,
-            slot_index: cs.slot_index,
-        })
+    pub(crate) fn borrow_direct_column_sender_owned(&self) -> Result<OwnedDirectColumnSender> {
+        let cs = pick_direct_sender(&self.inner)?;
+        Ok(OwnedDirectColumnSender::new(Arc::clone(&self.inner), cs))
     }
 
     /// Like [`borrow_direct_column_sender_owned`] but retries the connect
@@ -1207,176 +894,36 @@ impl QuestDb {
     pub(crate) fn borrow_direct_column_sender_owned_with_retry(
         &self,
         budget: Duration,
-    ) -> Result<OwnedColumnSender> {
+    ) -> Result<OwnedDirectColumnSender> {
         let deadline = Instant::now().checked_add(budget);
-        let cs = reconnect_pick(&self.inner, ColumnPoolKind::Direct, deadline)?;
-        Ok(OwnedColumnSender {
-            inner: Arc::clone(&self.inner),
-            sender: Some(cs.sender),
-            kind: ColumnPoolKind::Direct,
-            slot_index: cs.slot_index,
-        })
+        let cs = reconnect_pick(&self.inner, deadline, pick_direct_sender)?;
+        Ok(OwnedDirectColumnSender::new(Arc::clone(&self.inner), cs))
     }
 
-    /// FFI escape hatch: like [`Self::borrow_row_sender`] but the returned
-    /// handle is not lifetime-bound to `&self` (it carries an `Arc<DbInner>`
-    /// so it can outlive the user-facing `QuestDb` pointer). Backs the C ABI's
-    /// `questdb_db_borrow_row_sender`. See [`Self::borrow_column_sender_owned`]
-    /// for the owned-handle rationale.
-    #[cfg(feature = "ffi-support")]
-    pub(crate) fn borrow_row_sender_owned(&self) -> Result<OwnedRowSender> {
-        let sender = self.pick_row_sender()?;
-        Ok(OwnedRowSender {
-            inner: Arc::clone(&self.inner),
-            sender: Some(sender.sender),
-            must_close: false,
-            slot_index: sender.slot_index,
-        })
+    fn pick_sender(&self) -> Result<PooledSender<PooledSenderCore>> {
+        pick_sfa_sender(&self.inner)
     }
 
-    /// Like [`Self::borrow_row_sender_owned`] but retries the connect within
-    /// `budget` using the pool's reconnect backoff (the cluster may be electing
-    /// a primary; `AuthError` / protocol-version errors are terminal). Backs
-    /// the C ABI's `questdb_db_borrow_row_sender_with_retry`. `budget`
-    /// `Duration::ZERO` makes a single attempt.
-    #[cfg(feature = "ffi-support")]
-    pub(crate) fn borrow_row_sender_owned_with_retry(
-        &self,
-        budget: Duration,
-    ) -> Result<OwnedRowSender> {
-        let deadline = Instant::now().checked_add(budget);
-        let policy = self.inner.connector.reconnect_policy();
-        let mut backoff = policy.initial_backoff();
-        loop {
-            match self.pick_row_sender() {
-                Ok(sender) => {
-                    return Ok(OwnedRowSender {
-                        inner: Arc::clone(&self.inner),
-                        sender: Some(sender.sender),
-                        must_close: false,
-                        slot_index: sender.slot_index,
-                    });
-                }
-                Err(e)
-                    if reconnect_error_is_terminal(&e) || reconnect_deadline_expired(deadline) =>
-                {
-                    return Err(e);
-                }
-                Err(e) => {
-                    let (sleep_for, next) = reconnect_backoff_step(
-                        &e,
-                        policy.initial_backoff(),
-                        policy.max_backoff(),
-                        backoff,
-                    );
-                    sleep_until_deadline(sleep_for, deadline);
-                    backoff = next;
-                }
-            }
-        }
-    }
-
-    fn pick_column_sender(&self) -> Result<PooledColumnSender> {
-        pick_column_sender_inner(&self.inner, ColumnPoolKind::Main)
-    }
-
-    fn pick_row_sender(&self) -> Result<PooledRowSender> {
-        let slot = {
-            let mut state = lock_row_sender_state(&self.inner.row_sender_state);
-            let mut close_wait_deadline = None;
-            loop {
-                if self.inner.shutdown.load(Ordering::SeqCst) {
-                    return Err(error::fmt!(
-                        InvalidApiCall,
-                        "QuestDb pool is closed; cannot borrow row sender"
-                    ));
-                }
-                if let Some(entry) = state.free.pop() {
-                    state.in_use += 1;
-                    drop(state);
-                    return Ok(PooledRowSender {
-                        sender: entry.sender,
-                        slot_index: entry.slot_index,
-                    });
-                }
-                if state.reserved_total() < self.inner.pool_max {
-                    break;
-                }
-                let wait_timeout = self.inner.connector.close_flush_timeout();
-                if self.inner.sf_disk
-                    && state.closing > 0
-                    && let Some(wait_for) =
-                        remaining_close_wait(&mut close_wait_deadline, wait_timeout)
-                {
-                    let (next_state, _) = match self.inner.row_cv.wait_timeout(state, wait_for) {
-                        Ok((guard, result)) => (guard, result),
-                        Err(poisoned) => poisoned.into_inner(),
-                    };
-                    state = next_state;
-                    continue;
-                }
-                return Err(error::fmt!(
-                    InvalidApiCall,
-                    "Row-sender pool exhausted: {} row senders are currently borrowed \
-                     and the pool is at its `pool_max` cap of {}. Return a sender or \
-                     raise `pool_max`.",
-                    state.in_use,
-                    self.inner.pool_max
-                ));
-            }
-            let slot_index = state.allocate_slot_index();
-            debug_assert_eq!(slot_index.is_some(), self.inner.sf_disk);
-            state.in_use += 1;
-            RowSenderInUseSlot {
-                state: &self.inner.row_sender_state,
-                cv: &self.inner.row_cv,
-                slot_index,
-                armed: true,
-            }
-        };
-        let sender_id = slot
-            .slot_index
-            .map(|index| managed_slot_id(&self.inner.slot_base_id, ManagedSlotKind::Row, index));
-        let recovery_candidates = managed_slot_recovery_candidates(&self.inner);
-        let sender = self.inner.row_sender_builder.build_with_qwp_ws_pool_slot(
-            sender_id.as_deref(),
-            &self.inner.managed_slot_exclusions,
-            &recovery_candidates,
-            false,
-        )?;
-        let slot_index = slot.slot_index;
-        slot.commit();
-        Ok(PooledRowSender { sender, slot_index })
-    }
-
-    fn pick_replacement_sender(&self, kind: ColumnPoolKind) -> Result<PooledColumnSender> {
+    fn pick_replacement_sender(&self) -> Result<PooledSender<DirectSenderCore>> {
         if self.inner.shutdown.load(Ordering::SeqCst) {
             return Err(error::fmt!(
                 InvalidApiCall,
-                "QuestDb pool is closed; cannot replace column sender"
+                "QuestDb pool is closed; cannot replace sender"
             ));
         }
-        // The main pool is always store-and-forward; its background runner owns
-        // reconnects, so there is nothing to swap here.
-        if kind == ColumnPoolKind::Main {
-            return Err(error::fmt!(
-                InvalidApiCall,
-                "column sender store-and-forward manages reconnects in its background runner"
-            ));
-        }
-        // Same-handle replacement: the borrowed column sender already owns one
+        // Same-handle replacement: the borrowed direct sender already owns one
         // logical in-use slot, so this must not reserve another one or
         // pool_max=1 would reject replacing a dead direct connection.
-        if let Some(entry) = lock_state(column_pool_state(&self.inner, kind)).free.pop() {
-            return Ok(PooledColumnSender {
+        if let Some(entry) = lock_state(&self.inner.direct_state).free.pop() {
+            return Ok(PooledSender {
                 sender: entry.sender,
                 slot_index: entry.slot_index,
             });
         }
 
         let conn = connect_conn_pool(&self.inner)?;
-        Ok(PooledColumnSender {
-            sender: ColumnSender::new(
+        Ok(PooledSender {
+            sender: DirectSenderCore::new(
                 conn,
                 crate::ingress::SymbolGlobalDict::new(),
                 crate::ingress::column_sender::encoder::EncodeScratch::new(),
@@ -1454,13 +1001,13 @@ impl QuestDb {
     /// connection leak shows up as `in_use` or `free` failing to fall back).
     ///
     /// Each pool's lock is taken in turn (never two at once), so every field
-    /// is internally consistent but the four are not a single atomic instant —
+    /// is internally consistent but the three are not a single atomic instant —
     /// fine for a monitoring snapshot. **Not semver-stable** (`#[doc(hidden)]`,
     /// `#[non_exhaustive]` result); mirrors the `questdb_db_dbg_reader_*_count`
     /// FFI diagnostics precedent.
     #[doc(hidden)]
     pub fn dbg_pool_counts(&self) -> DbgPoolCounts {
-        let column_sf = {
+        let ingress = {
             let s = lock_state(&self.inner.state);
             DbgPoolCount {
                 free: s.free.len(),
@@ -1470,14 +1017,6 @@ impl QuestDb {
         };
         let column_direct = {
             let s = lock_state(&self.inner.direct_state);
-            DbgPoolCount {
-                free: s.free.len(),
-                in_use: s.in_use,
-                closing: s.closing,
-            }
-        };
-        let row_sender = {
-            let s = lock_row_sender_state(&self.inner.row_sender_state);
             DbgPoolCount {
                 free: s.free.len(),
                 in_use: s.in_use,
@@ -1496,9 +1035,8 @@ impl QuestDb {
         #[cfg(not(feature = "_egress"))]
         let reader = DbgPoolCount::default();
         DbgPoolCounts {
-            column_sf,
+            ingress,
             column_direct,
-            row_sender,
             reader,
         }
     }
@@ -1564,28 +1102,13 @@ impl QuestDb {
         lock_state(&self.inner.direct_state).in_use
     }
 
-    /// Snapshot the number of idle (free) row senders currently in the pool.
-    #[cfg(test)]
-    pub(crate) fn row_sender_free_count(&self) -> usize {
-        lock_row_sender_state(&self.inner.row_sender_state)
-            .free
-            .len()
-    }
-
-    /// Snapshot the number of currently-borrowed row senders.
-    #[cfg(test)]
-    pub(crate) fn row_sender_in_use_count(&self) -> usize {
-        lock_row_sender_state(&self.inner.row_sender_state).in_use
-    }
-
     /// Borrow a query [`Reader`] from the egress pool.
     ///
-    /// Egress companion to [`Self::borrow_column_sender`] (column-major ingest) and
-    /// [`Self::borrow_row_sender`] (row-major ingest): pulls a [`Reader`]
+    /// Egress companion to [`Self::borrow_sender`]: pulls a [`Reader`]
     /// from the pool's reader free list, lazily opening a fresh connection
     /// (via `Reader::from_conf` on the original connect string) when the
     /// free list is empty and the pool is below `pool_max`. The reader pool
-    /// is lazily grown and capped **independently** of the two sender pools,
+    /// is lazily grown and capped **independently** of the two ingestion pools,
     /// so heavy ingest can't starve queries and vice versa (the combined
     /// live-connection ceiling across all three pools is `3 * pool_max`).
     ///
@@ -1598,7 +1121,7 @@ impl QuestDb {
     /// down (or [`BorrowedReader::drop_on_return`] was called), in which
     /// case it is dropped and the next borrow opens a fresh one.
     ///
-    /// Like [`BorrowedColumnSender`], [`BorrowedReader`] is **not** `Send` or
+    /// Like [`BorrowedSender`], [`BorrowedReader`] is **not** `Send` or
     /// `Sync`: borrow one reader per worker thread from the same `QuestDb`.
     #[cfg(feature = "_egress")]
     pub fn borrow_reader(&self) -> crate::error::Result<BorrowedReader<'_>> {
@@ -1608,7 +1131,7 @@ impl QuestDb {
 
     /// FFI escape hatch: borrow a reader from the egress pool.
     ///
-    /// Same shape as [`Self::borrow_column_sender_owned`] but pulls a
+    /// Same shape as [`Self::borrow_sender_owned`] but pulls a
     /// [`Reader`] from the reader free list (lazily opens one if the
     /// free list is empty and total < `pool_max`). Returned via
     /// [`OwnedReader`]'s Drop: see the sender variant for the same
@@ -1706,10 +1229,6 @@ impl Drop for QuestDb {
             let _g = lock_state(&self.inner.state);
             self.inner.cv.notify_all();
         }
-        {
-            let _g = lock_row_sender_state(&self.inner.row_sender_state);
-            self.inner.row_cv.notify_all();
-        }
         if let Some(handle) = self.reaper.take() {
             let _ = handle.join();
         }
@@ -1719,58 +1238,65 @@ impl Drop for QuestDb {
     }
 }
 
-/// Shared pool plumbing behind the two public column-sender handles
-/// ([`BorrowedColumnSender`] and [`BorrowedDirectColumnSender`]). Holds the borrowed
-/// [`ColumnSender`] plus the bookkeeping needed to return it to the pool on
-/// drop / reborrow. The public wrappers expose only the mode-appropriate
-/// method surface; this type is private.
-///
-/// On `Drop` the underlying connection is returned to the pool unless it
-/// has latched terminal state, in which case it is dropped (and
-/// auto-grow will open a fresh one for the next borrow).
-///
-/// Not `Send` or `Sync`: the borrowed connection belongs to the borrowing
-/// thread for the duration of the borrow.
-struct ColumnSenderHandle<'a> {
+struct SenderHandle<'a> {
     db: &'a QuestDb,
-    sender: Option<ColumnSender>,
-    /// Which pool this handle returns to on drop / reborrow.
-    kind: ColumnPoolKind,
+    sender: Option<PooledSenderCore>,
     slot_index: Option<usize>,
-    /// !Send / !Sync marker — `Rc<()>` poisons both auto traits without any
-    /// runtime cost.
     _not_send: PhantomData<Rc<()>>,
 }
 
-impl<'a> ColumnSenderHandle<'a> {
-    fn new(
-        db: &'a QuestDb,
-        sender: ColumnSender,
-        kind: ColumnPoolKind,
-        slot_index: Option<usize>,
-    ) -> Self {
+impl<'a> SenderHandle<'a> {
+    fn new(db: &'a QuestDb, sender: PooledSender<PooledSenderCore>) -> Self {
         Self {
             db,
-            sender: Some(sender),
-            kind,
-            slot_index,
+            sender: Some(sender.sender),
+            slot_index: sender.slot_index,
             _not_send: PhantomData,
         }
     }
 
-    fn inner_mut(&mut self) -> &mut ColumnSender {
+    fn inner_mut(&mut self) -> &mut PooledSenderCore {
         self.sender
             .as_mut()
-            .expect("borrowed column sender already returned")
+            .expect("borrowed sender already returned")
     }
 
-    fn inner_ref(&self) -> &ColumnSender {
+    fn inner_ref(&self) -> &PooledSenderCore {
         self.sender
             .as_ref()
-            .expect("borrowed column sender already returned")
+            .expect("borrowed sender already returned")
+    }
+}
+
+struct DirectSenderHandle<'a> {
+    db: &'a QuestDb,
+    sender: Option<DirectSenderCore>,
+    _not_send: PhantomData<Rc<()>>,
+}
+
+impl<'a> DirectSenderHandle<'a> {
+    fn new(db: &'a QuestDb, sender: PooledSender<DirectSenderCore>) -> Self {
+        debug_assert!(sender.slot_index.is_none());
+        Self {
+            db,
+            sender: Some(sender.sender),
+            _not_send: PhantomData,
+        }
     }
 
-    /// The pool's reconnect backoff budget; see [`QuestDb::reconnect_policy`].
+    fn inner_mut(&mut self) -> &mut DirectSenderCore {
+        self.sender
+            .as_mut()
+            .expect("borrowed direct sender already returned")
+    }
+
+    #[cfg(test)]
+    fn inner_ref(&self) -> &DirectSenderCore {
+        self.sender
+            .as_ref()
+            .expect("borrowed direct sender already returned")
+    }
+
     #[cfg(any(feature = "polars-ingress", feature = "polars-egress"))]
     pub(crate) fn reconnect_policy(&self) -> crate::ingress::ReconnectPolicy {
         self.db.reconnect_policy()
@@ -1778,9 +1304,9 @@ impl<'a> ColumnSenderHandle<'a> {
 
     /// Drop the current connection (and its paired connection-scoped
     /// `SymbolGlobalDict`) back to the pool and obtain a fresh one **behind
-    /// the same handle**, so the caller's borrowed column sender stays valid.
+    /// the same handle**, so the caller's borrowed direct sender stays valid.
     ///
-    /// This is the column sender's failover primitive: after a transient
+    /// This is the direct sender's failover primitive: after a transient
     /// (`ErrorCode::FailoverRetry`) flush/sync failure, call this to swap onto
     /// a live connection — the pool's connect path rotates across endpoints,
     /// skips the dead one, and follows the writable primary. The dropped
@@ -1797,9 +1323,6 @@ impl<'a> ColumnSenderHandle<'a> {
     /// commits this caller's data.
     pub fn reborrow_from_pool(&mut self) -> Result<()> {
         if let Some(sender) = self.sender.as_mut() {
-            if sender.is_store_and_forward() {
-                return Ok(());
-            }
             // reborrow is a failover path, not a forced rotate. A healthy,
             // fully-sync'd connection needs no replacement; replacing it would
             // open a fresh connection and recycle this one, growing the pool.
@@ -1808,7 +1331,7 @@ impl<'a> ColumnSenderHandle<'a> {
             }
             if sender.in_flight() > 0 {
                 log::warn!(
-                    "column sender failover dropped a connection with un-sync'd \
+                    "direct sender failover dropped a connection with un-sync'd \
                      deferred frame(s); their data is discarded. Re-drive the source \
                      from the last successful sync(), not from the failing chunk."
                 );
@@ -1816,10 +1339,10 @@ impl<'a> ColumnSenderHandle<'a> {
             }
             record_sender_transport_failure(&self.db.inner, sender);
         }
-        let fresh = self.db.pick_replacement_sender(self.kind)?;
-        let old_slot_index = std::mem::replace(&mut self.slot_index, fresh.slot_index);
+        let fresh = self.db.pick_replacement_sender()?;
+        debug_assert!(fresh.slot_index.is_none());
         if let Some(old) = self.sender.replace(fresh.sender) {
-            finish_replaced_sender(&self.db.inner, old, self.kind, old_slot_index);
+            finish_replaced_sender(&self.db.inner, old);
         }
         Ok(())
     }
@@ -1856,16 +1379,24 @@ impl<'a> ColumnSenderHandle<'a> {
     }
 }
 
-impl Debug for ColumnSenderHandle<'_> {
+impl Debug for SenderHandle<'_> {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
-        f.debug_struct("ColumnSenderHandle")
+        f.debug_struct("SenderHandle")
             .field("sender", &self.sender)
             .finish()
     }
 }
 
-/// Store-and-forward column sender borrowed from a [`QuestDb`] pool — the
-/// handle returned by [`QuestDb::borrow_column_sender`].
+impl Debug for DirectSenderHandle<'_> {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        f.debug_struct("DirectSenderHandle")
+            .field("sender", &self.sender)
+            .finish()
+    }
+}
+
+/// Store-and-forward QWP sender borrowed from a [`QuestDb`] pool — the
+/// handle returned by [`QuestDb::borrow_sender`].
 ///
 /// [`Self::flush`] appends a frame to the connection's store-and-forward queue
 /// and returns as soon as it is accepted locally (no server round-trip); the
@@ -1889,15 +1420,90 @@ impl Debug for ColumnSenderHandle<'_> {
 /// through an arbitrary later pool borrow.
 ///
 /// Not `Send` or `Sync`.
-pub struct BorrowedColumnSender<'a>(ColumnSenderHandle<'a>);
+///
+/// The lease cannot outlive its pool:
+///
+/// ```compile_fail
+/// use questdb::{BorrowedSender, QuestDb};
+///
+/// fn escape() -> BorrowedSender<'static> {
+///     let db = QuestDb::connect("ws::addr=localhost:9000;").unwrap();
+///     db.borrow_sender().unwrap()
+/// }
+/// ```
+///
+/// It cannot be moved to another thread:
+///
+/// ```compile_fail
+/// use questdb::QuestDb;
+///
+/// let db = QuestDb::connect("ws::addr=localhost:9000;").unwrap();
+/// let sender = db.borrow_sender().unwrap();
+/// std::thread::scope(|scope| {
+///     scope.spawn(move || drop(sender));
+/// });
+/// ```
+///
+/// Nor can a shared reference be sent to another thread:
+///
+/// ```compile_fail
+/// use questdb::QuestDb;
+///
+/// let db = QuestDb::connect("ws::addr=localhost:9000;").unwrap();
+/// let sender = db.borrow_sender().unwrap();
+/// std::thread::scope(|scope| {
+///     scope.spawn(|| std::hint::black_box(&sender));
+/// });
+/// ```
+pub struct BorrowedSender<'a>(SenderHandle<'a>);
 
-impl<'a> BorrowedColumnSender<'a> {
+impl<'a> BorrowedSender<'a> {
+    /// Create a caller-owned QWP/WebSocket [`Buffer`] using the pool's
+    /// configured name limit. The buffer is not tied to this lease and may be
+    /// flushed by another sender borrowed from the same pool.
+    pub fn new_buffer(&self) -> Buffer {
+        self.0.db.new_buffer()
+    }
+
     /// Encode and publish `chunk` into the store-and-forward queue, returning
     /// as soon as the frame is accepted locally (no server round-trip). On
     /// success `chunk` is cleared; on a delivery-uncertain failure the error
     /// is tagged [`in_doubt`](crate::Error::in_doubt).
     pub fn flush(&mut self, chunk: &mut crate::ingress::column_sender::Chunk<'_>) -> Result<()> {
         self.0.inner_mut().flush(chunk)
+    }
+
+    /// Publish a caller-owned QWP/WebSocket [`Buffer`] into this sender's local
+    /// store-and-forward queue and clear it after local acceptance.
+    pub fn flush_buffer(&mut self, buffer: &mut Buffer) -> Result<()> {
+        self.0.inner_mut().flush_buffer(buffer)
+    }
+
+    /// Publish a caller-owned QWP/WebSocket [`Buffer`] without clearing it.
+    pub fn flush_buffer_and_keep(&mut self, buffer: &Buffer) -> Result<()> {
+        self.0.inner_mut().flush_buffer_and_keep(buffer)
+    }
+
+    /// Publish and clear a QWP/WebSocket [`Buffer`], returning its local frame
+    /// sequence number. Empty buffers publish no frame and return `None`.
+    pub fn flush_buffer_and_get_fsn(&mut self, buffer: &mut Buffer) -> Result<Option<u64>> {
+        self.0.inner_mut().flush_buffer_and_get_fsn(buffer)
+    }
+
+    /// Publish a QWP/WebSocket [`Buffer`] without clearing it and return its
+    /// local frame sequence number. Empty buffers return `None`.
+    pub fn flush_buffer_and_keep_and_get_fsn(&mut self, buffer: &Buffer) -> Result<Option<u64>> {
+        self.0.inner_mut().flush_buffer_and_keep_and_get_fsn(buffer)
+    }
+
+    /// Publish and clear a QWP/WebSocket [`Buffer`], then wait for the requested
+    /// ACK boundary using the pool's configured request timeout.
+    pub fn flush_buffer_and_wait(
+        &mut self,
+        buffer: &mut Buffer,
+        ack_level: AckLevel,
+    ) -> Result<()> {
+        self.0.inner_mut().flush_buffer_and_wait(buffer, ack_level)
     }
 
     /// Publish `chunk` into the store-and-forward queue as a completion
@@ -2004,14 +1610,14 @@ impl<'a> BorrowedColumnSender<'a> {
     /// Retained for symmetry with [`BorrowedDirectColumnSender`] and test assertions.
     #[cfg(test)]
     pub(crate) fn is_store_and_forward(&self) -> bool {
-        self.0.inner_ref().is_store_and_forward()
+        true
     }
 
     /// In-flight (published-but-unacked) frame count. Always 0 for the SF
     /// backend, whose queue tracks delivery internally.
     #[cfg(test)]
     pub(crate) fn in_flight(&self) -> u32 {
-        self.0.inner_ref().in_flight()
+        0
     }
 
     /// Encode and publish an Arrow [`RecordBatch`](arrow::array::RecordBatch)
@@ -2132,11 +1738,9 @@ impl<'a> BorrowedColumnSender<'a> {
     }
 }
 
-impl Debug for BorrowedColumnSender<'_> {
+impl Debug for BorrowedSender<'_> {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
-        f.debug_tuple("BorrowedColumnSender")
-            .field(&self.0)
-            .finish()
+        f.debug_tuple("BorrowedSender").field(&self.0).finish()
     }
 }
 
@@ -2154,7 +1758,7 @@ impl Debug for BorrowedColumnSender<'_> {
 /// commit after failure.
 ///
 /// Not `Send` or `Sync`.
-pub struct BorrowedDirectColumnSender<'a>(ColumnSenderHandle<'a>);
+pub struct BorrowedDirectColumnSender<'a>(DirectSenderHandle<'a>);
 
 impl<'a> BorrowedDirectColumnSender<'a> {
     /// Encode and pipeline `chunk` as a deferred frame without waiting. The
@@ -2226,10 +1830,10 @@ impl<'a> BorrowedDirectColumnSender<'a> {
     }
 
     /// Always `false` for a direct handle. Retained for symmetry with
-    /// [`BorrowedColumnSender`] and test assertions.
+    /// [`BorrowedSender`] and test assertions.
     #[cfg(test)]
     pub(crate) fn is_store_and_forward(&self) -> bool {
-        self.0.inner_ref().is_store_and_forward()
+        false
     }
 
     /// In-flight (published-but-unacked) deferred frame count.
@@ -2326,45 +1930,61 @@ impl Debug for BorrowedDirectColumnSender<'_> {
     }
 }
 
-impl Drop for ColumnSenderHandle<'_> {
+impl Drop for SenderHandle<'_> {
+    fn drop(&mut self) {
+        let Some(sender) = self.sender.take() else {
+            return;
+        };
+        return_sfa_to_pool(&self.db.inner, sender, self.slot_index);
+    }
+}
+
+impl Drop for DirectSenderHandle<'_> {
     fn drop(&mut self) {
         let Some(mut sender) = self.sender.take() else {
             return;
         };
         commit_in_flight_on_drop(&self.db.inner, &mut sender);
-        return_to_pool(&self.db.inner, sender, self.kind, self.slot_index);
+        return_direct_to_pool(&self.db.inner, sender);
     }
 }
 
-/// Owned (lifetime-free) variant of a borrowed column sender used by the C FFI.
+/// Owned (lifetime-free) variant of a borrowed sender used by the C FFI.
 ///
 /// Holds an `Arc<DbInner>` so the pool's return path outlives the
 /// user-facing `QuestDb` pointer — the C ABI can free its `questdb_db*`
-/// before dropping outstanding `column_sender*` handles. After pool close,
-/// returned handles are dropped instead of recycled.
+/// before dropping outstanding `qwp_sender*` or `direct_column_sender*`
+/// handles. After pool close, returned handles are dropped instead of recycled.
 #[cfg(feature = "ffi-support")]
-pub struct OwnedColumnSender {
+pub struct OwnedSender {
     inner: Arc<DbInner>,
-    sender: Option<ColumnSender>,
-    kind: ColumnPoolKind,
+    sender: Option<PooledSenderCore>,
     slot_index: Option<usize>,
 }
 
 #[cfg(feature = "ffi-support")]
-impl OwnedColumnSender {
-    /// Borrow the underlying [`ColumnSender`] mutably. Always returns a
+impl OwnedSender {
+    fn new(inner: Arc<DbInner>, sender: PooledSender<PooledSenderCore>) -> Self {
+        Self {
+            inner,
+            sender: Some(sender.sender),
+            slot_index: sender.slot_index,
+        }
+    }
+
+    /// Borrow the underlying [`PooledSenderCore`] mutably. Always returns a
     /// live reference until `Drop` runs.
-    pub fn get_mut(&mut self) -> &mut ColumnSender {
+    pub fn get_mut(&mut self) -> &mut PooledSenderCore {
         self.sender
             .as_mut()
-            .expect("OwnedColumnSender already returned to the pool")
+            .expect("OwnedSender already returned to the pool")
     }
 
     /// Inspect the wrapped sender without taking ownership.
-    pub fn get(&self) -> &ColumnSender {
+    pub fn get(&self) -> &PooledSenderCore {
         self.sender
             .as_ref()
-            .expect("OwnedColumnSender already returned to the pool")
+            .expect("OwnedSender already returned to the pool")
     }
 
     /// `true` after the originating pool has been closed. FFI callers use
@@ -2373,340 +1993,84 @@ impl OwnedColumnSender {
     pub fn pool_closed(&self) -> bool {
         self.inner.shutdown.load(Ordering::SeqCst)
     }
+
+    /// Force this sender to be dropped instead of recycled when the owned FFI
+    /// handle is released.
+    pub fn mark_must_close(&mut self) {
+        self.get_mut().mark_must_close();
+    }
+
+    /// `true` when this sender cannot be returned to the pool, either because
+    /// the sender is terminal or because its originating pool has closed.
+    pub fn must_close(&self) -> bool {
+        self.pool_closed() || self.get().must_close()
+    }
 }
 
 #[cfg(feature = "ffi-support")]
-impl Drop for OwnedColumnSender {
-    fn drop(&mut self) {
-        if let Some(mut sender) = self.sender.take() {
-            commit_in_flight_on_drop(&self.inner, &mut sender);
-            return_to_pool(&self.inner, sender, self.kind, self.slot_index);
-        }
-    }
-}
-
-/// A row-major [`crate::ingress::Sender`] borrowed from a [`QuestDb`] pool.
-///
-/// Companion to [`BorrowedColumnSender`] (the column-major handle). Exposes the row
-/// ingestion and progress-tracking surface directly, except for the standalone
-/// [`Sender::must_close`] lifecycle predicate. On `Drop` the sender is returned
-/// to the row-sender pool, unless its connection has latched terminal state (or
-/// [`Self::drop_on_return`] was called), in which case it is dropped and the
-/// next borrow opens a fresh one.
-///
-/// Use [`Self::flush_and_wait`] for the common safe shape ("publish this
-/// batch and return once it is acknowledged"). Use [`Self::wait`] as a
-/// standalone blocking barrier for everything published so far through this
-/// borrowed sender. Use FSNs for non-blocking
-/// pipelining while you still hold the same borrowed sender: publish with
-/// [`Self::flush_and_get_fsn`], keep doing work, then compare the saved FSN
-/// with [`Self::acked_fsn`]. FSNs are stream watermarks, not portable receipts
-/// to check through an arbitrary later pool borrow.
-///
-/// `BorrowedRowSender` is **not** `Send` or `Sync`: the borrowed connection
-/// belongs to the borrowing thread for the duration of the borrow.
-pub struct BorrowedRowSender<'a> {
-    db: &'a QuestDb,
-    sender: Option<Sender>,
-    must_close: bool,
-    slot_index: Option<usize>,
-    /// !Send / !Sync marker, mirroring [`BorrowedColumnSender`].
-    _not_send: PhantomData<Rc<()>>,
-}
-
-impl<'a> BorrowedRowSender<'a> {
-    fn new(db: &'a QuestDb, sender: Sender, slot_index: Option<usize>) -> Self {
-        Self {
-            db,
-            sender: Some(sender),
-            must_close: false,
-            slot_index,
-            _not_send: PhantomData,
-        }
-    }
-
-    fn sender_ref(&self) -> &Sender {
-        self.sender
-            .as_ref()
-            .expect("borrowed row sender already returned")
-    }
-
-    fn sender_mut(&mut self) -> &mut Sender {
-        self.sender
-            .as_mut()
-            .expect("borrowed row sender already returned")
-    }
-
-    /// Create a new row buffer using this sender's protocol settings.
-    pub fn new_buffer(&self) -> Buffer {
-        self.sender_ref().new_buffer()
-    }
-
-    /// Send the batch of rows in the buffer to the QuestDB server, and, if
-    /// `transactional` is true, require a transactional flush.
-    #[cfg(feature = "sync-sender-http")]
-    pub fn flush_and_keep_with_flags(&mut self, buf: &Buffer, transactional: bool) -> Result<()> {
-        self.sender_mut()
-            .flush_and_keep_with_flags(buf, transactional)
-    }
-
-    /// Send the buffer of rows, then clear the buffer.
-    pub fn flush(&mut self, buf: &mut Buffer) -> Result<()> {
-        self.sender_mut().flush(buf)
-    }
-
-    /// Publish the buffer, clear it, then block until every frame published
-    /// so far through this sender reaches `ack_level` — [`Self::flush`]
-    /// followed by [`Self::wait`] in one call, the row-major counterpart of
-    /// [`BorrowedColumnSender::flush_and_wait`]. Unlike [`Self::wait`], which
-    /// takes an explicit timeout argument, this call's wait is bounded by
-    /// the pool-wide `request_timeout` setting (the no-progress timeout
-    /// fires when the ack watermark stops advancing for that long); compose
-    /// the two calls yourself to choose the timeout per call.
-    ///
-    /// `AckLevel::Durable` requires the pool to be opened with
-    /// `request_durable_ack=on`; otherwise the call is rejected up front
-    /// (`InvalidApiCall`) before the buffer is touched, matching
-    /// [`BorrowedColumnSender::flush_and_wait`].
-    ///
-    /// On a flush failure the buffer is retained. After publication, only the
-    /// no-progress timeout ([`ErrorCode::FailoverRetry`](crate::ErrorCode))
-    /// leaves the frames queued with the runner still delivering — recover
-    /// from it by calling [`Self::wait`] until it returns `Ok`, not by
-    /// re-flushing (which would deliver the same rows twice). A terminal
-    /// server rejection or transport/protocol failure ends delivery on this
-    /// sender: drop the borrow and re-drive undelivered rows on a fresh one.
-    pub fn flush_and_wait(&mut self, buf: &mut Buffer, ack_level: AckLevel) -> Result<()> {
-        validate_row_sender_ack_level(&self.db.inner, ack_level)?;
-        let timeout = self.db.inner.connector.request_timeout();
-        let sender = self.sender_mut();
-        sender.flush(buf)?;
-        sender.wait(ack_level, timeout)
-    }
-
-    /// Send the buffer of rows, keeping the buffer intact.
-    pub fn flush_and_keep(&mut self, buf: &Buffer) -> Result<()> {
-        self.sender_mut().flush_and_keep(buf)
-    }
-
-    /// Publish the QWP/WebSocket buffer, clear it, and return the highest
-    /// published frame sequence number.
-    ///
-    /// This is the non-blocking progress-tracking form of [`Self::flush`]:
-    /// success means the frame was accepted by this sender's local replay
-    /// queue, not that the server has ACKed it. Keep the returned FSN while
-    /// this borrowed sender is still held, then compare it with
-    /// [`Self::acked_fsn`] to observe when the publication boundary has
-    /// completed. Use [`Self::wait`] instead when you only need a simple
-    /// blocking barrier for everything published so far.
-    pub fn flush_and_get_fsn(&mut self, buf: &mut Buffer) -> Result<Option<u64>> {
-        self.sender_mut().flush_and_get_fsn(buf)
-    }
-
-    /// Publish the QWP/WebSocket buffer without clearing it and return the
-    /// highest published frame sequence number.
-    ///
-    /// The returned FSN has the same local-publication semantics as
-    /// [`Self::flush_and_get_fsn`].
-    pub fn flush_and_keep_and_get_fsn(&mut self, buf: &Buffer) -> Result<Option<u64>> {
-        self.sender_mut().flush_and_keep_and_get_fsn(buf)
-    }
-
-    /// Return the highest frame sequence number published locally by this
-    /// sender, or `None` if no frame has been published.
-    ///
-    /// This is a stream watermark for the currently borrowed sender. Treat
-    /// saved FSNs as meaningful only with the sender stream that produced
-    /// them; returning the handle to the pool does not create a portable
-    /// receipt that can be checked through an arbitrary later borrow.
-    pub fn published_fsn(&self) -> Result<Option<u64>> {
-        self.sender_ref().published_fsn()
-    }
-
-    /// Return the highest frame sequence number completed by server ACK or
-    /// server-side reject-and-continue, or `None` if no frame has completed.
-    ///
-    /// This is useful for non-blocking pipelining: after
-    /// [`Self::flush_and_get_fsn`] returns `Some(fsn)`, that publication
-    /// boundary has completed once this method returns a value greater than
-    /// or equal to `fsn`. In durable-ACK mode this watermark advances after
-    /// durable ACK coverage; use [`Self::wait`] when you need an explicit
-    /// [`AckLevel::Ok`] or [`AckLevel::Durable`] barrier.
-    pub fn acked_fsn(&self) -> Result<Option<u64>> {
-        self.sender_ref().acked_fsn()
-    }
-
-    /// Block until every frame published so far through this sender reaches
-    /// `ack_level`.
-    ///
-    /// Prefer this over FSN polling unless you need to keep publishing or doing
-    /// other work while ACKs arrive. If it times out, the frames remain queued;
-    /// retry `wait()` or keep observing the watermark rather than re-flushing
-    /// the same data. `AckLevel::Durable` requires the pool to have been opened
-    /// with `request_durable_ack=on`; otherwise the call is rejected even when
-    /// no frames have been published.
-    pub fn wait(&mut self, ack_level: AckLevel, timeout: Duration) -> Result<()> {
-        self.sender_mut().wait(ack_level, timeout)
-    }
-
-    /// Force this borrowed sender to be dropped (not recycled) when the borrow
-    /// ends.
-    ///
-    /// Use normal `Drop` for healthy senders: the return path already retires
-    /// senders that latched terminal state, or whose pool has been closed.
-    /// Call this after abandoning work or handling an error where the next
-    /// borrower must not inherit this connection.
-    pub fn drop_on_return(&mut self) {
-        self.must_close = true;
-    }
-}
-
-impl Debug for BorrowedRowSender<'_> {
-    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
-        f.debug_struct("BorrowedRowSender")
-            .field("sender", &self.sender)
-            .finish()
-    }
-}
-
-impl Drop for BorrowedRowSender<'_> {
+impl Drop for OwnedSender {
     fn drop(&mut self) {
         if let Some(sender) = self.sender.take() {
-            return_row_sender_to_pool(&self.db.inner, sender, self.must_close, self.slot_index);
+            return_sfa_to_pool(&self.inner, sender, self.slot_index);
         }
     }
 }
 
-/// Durable-ack preflight shared by the row-sender `flush_and_wait` forms:
-/// mirrors the column senders' `validate_ack_level`, rejecting
-/// `AckLevel::Durable` before any publication when the pool did not opt in.
-fn validate_row_sender_ack_level(inner: &DbInner, ack_level: AckLevel) -> Result<()> {
-    if ack_level == AckLevel::Durable && !inner.connector.request_durable_ack() {
-        return Err(error::fmt!(
-            InvalidApiCall,
-            "AckLevel::Durable requires the pool to be opened with \
-             `request_durable_ack=on` in the connect string."
-        ));
-    }
-    Ok(())
-}
-
-fn return_row_sender_to_pool(
-    inner: &Arc<DbInner>,
-    sender: Sender,
-    must_close: bool,
-    slot_index: Option<usize>,
-) {
-    let must_close = must_close || sender.must_close();
-    let release_slot;
-    {
-        let mut state = lock_row_sender_state(&inner.row_sender_state);
-        if !must_close && !inner.shutdown.load(Ordering::SeqCst) {
-            state.in_use = state.in_use.saturating_sub(1);
-            state.free.push(RowSenderPoolEntry {
-                sender,
-                slot_index,
-                last_idle_at: Instant::now(),
-            });
-            inner.row_cv.notify_all();
-            return;
-        }
-        release_slot = slot_index.is_some();
-        if release_slot {
-            state.closing += 1;
-        } else {
-            state.in_use = state.in_use.saturating_sub(1);
-        }
-    }
-    let _release = release_slot.then_some(RowSlotRelease {
-        inner: inner.as_ref(),
-        slot_index,
-        decrement_in_use: true,
-        decrement_closing: true,
-    });
-    drop(sender);
-}
-
-/// Owned, non-lifetime-bound row-major [`Sender`] borrowed from a [`QuestDb`]
-/// pool — the row-sender analogue of [`OwnedColumnSender`].
-///
-/// Holds an `Arc<DbInner>` so the pool's return path outlives the
-/// user-facing `QuestDb` pointer: the C ABI can free its `questdb_db*`
-/// before dropping outstanding `row_sender*` handles. On `Drop` the sender
-/// is returned to the row-sender pool unless it (or the caller, via
-/// [`Self::mark_must_close`]) marked it must-close, or the pool has been
-/// closed, in which case it is dropped and the next borrow opens a fresh one.
+/// Owned variant of the hidden direct sender used by the C FFI.
 #[cfg(feature = "ffi-support")]
-pub struct OwnedRowSender {
+pub struct OwnedDirectColumnSender {
     inner: Arc<DbInner>,
-    sender: Option<Sender>,
-    must_close: bool,
-    slot_index: Option<usize>,
+    sender: Option<DirectSenderCore>,
 }
 
 #[cfg(feature = "ffi-support")]
-impl OwnedRowSender {
-    /// Borrow the underlying [`Sender`] mutably. Always returns a live
-    /// reference until `Drop` runs.
-    pub fn get_mut(&mut self) -> &mut Sender {
+impl OwnedDirectColumnSender {
+    fn new(inner: Arc<DbInner>, sender: PooledSender<DirectSenderCore>) -> Self {
+        debug_assert!(sender.slot_index.is_none());
+        Self {
+            inner,
+            sender: Some(sender.sender),
+        }
+    }
+
+    pub fn get_mut(&mut self) -> &mut DirectSenderCore {
         self.sender
             .as_mut()
-            .expect("OwnedRowSender already returned to the pool")
+            .expect("OwnedDirectColumnSender already returned to the pool")
     }
 
-    /// Inspect the wrapped sender without taking ownership.
-    pub fn get(&self) -> &Sender {
+    pub fn get(&self) -> &DirectSenderCore {
         self.sender
             .as_ref()
-            .expect("OwnedRowSender already returned to the pool")
+            .expect("OwnedDirectColumnSender already returned to the pool")
     }
 
-    /// Combined [`Sender::flush`] + [`Sender::wait`] with the pool-wide
-    /// `request_timeout` as the wait's no-progress deadline — the owned
-    /// counterpart of [`BorrowedRowSender::flush_and_wait`] (same durable
-    /// opt-in preflight and failure contract), used by the C FFI.
-    pub fn flush_and_wait(&mut self, buf: &mut Buffer, ack_level: AckLevel) -> Result<()> {
-        validate_row_sender_ack_level(&self.inner, ack_level)?;
-        let timeout = self.inner.connector.request_timeout();
-        let sender = self.get_mut();
-        sender.flush(buf)?;
-        sender.wait(ack_level, timeout)
-    }
-
-    /// Force this sender to be dropped (not recycled) when it is returned.
-    /// Use after an error that may have left the connection unusable.
-    pub fn mark_must_close(&mut self) {
-        self.must_close = true;
-    }
-
-    /// `true` if this sender will be dropped rather than recycled on return —
-    /// either marked explicitly, its connection latched must-close, or the
-    /// originating pool has been closed.
-    pub fn must_close(&self) -> bool {
-        self.must_close
-            || self.inner.shutdown.load(Ordering::SeqCst)
-            || self.sender.as_ref().is_some_and(|s| s.must_close())
-    }
-
-    /// `true` after the originating pool has been closed.
     pub fn pool_closed(&self) -> bool {
         self.inner.shutdown.load(Ordering::SeqCst)
     }
+
+    pub fn mark_must_close(&mut self) {
+        self.get_mut().mark_must_close();
+    }
+
+    pub fn must_close(&self) -> bool {
+        self.pool_closed() || self.get().must_close()
+    }
 }
 
 #[cfg(feature = "ffi-support")]
-impl Drop for OwnedRowSender {
+impl Drop for OwnedDirectColumnSender {
     fn drop(&mut self) {
-        if let Some(sender) = self.sender.take() {
-            return_row_sender_to_pool(&self.inner, sender, self.must_close, self.slot_index);
+        if let Some(mut sender) = self.sender.take() {
+            commit_in_flight_on_drop(&self.inner, &mut sender);
+            return_direct_to_pool(&self.inner, sender);
         }
     }
 }
 
 /// A query [`Reader`] borrowed from a [`QuestDb`] pool.
 ///
-/// Egress companion to [`BorrowedColumnSender`] (column-major) and
-/// [`BorrowedRowSender`] (row-major). Derefs to `Reader`, so the usual
+/// Egress companion to [`BorrowedSender`]. Derefs to `Reader`, so the usual
 /// `prepare` / `execute` cursor flow works unchanged. On `Drop` the reader
 /// is returned to the reader pool, unless its transport has been torn down
 /// (or [`Self::drop_on_return`] was called), in which case it is dropped
@@ -2719,7 +2083,7 @@ pub struct BorrowedReader<'a> {
     db: &'a QuestDb,
     reader: Option<Reader>,
     must_close: bool,
-    /// !Send / !Sync marker, mirroring [`BorrowedColumnSender`].
+    /// !Send / !Sync marker, mirroring [`BorrowedSender`].
     _not_send: PhantomData<Rc<()>>,
 }
 
@@ -2788,7 +2152,7 @@ impl Drop for BorrowedReader<'_> {
 
 /// Owned (lifetime-free) variant of a borrowed reader used by the C FFI.
 ///
-/// Holds an `Arc<DbInner>` for the same reason [`OwnedColumnSender`] does: the
+/// Holds an `Arc<DbInner>` for the same reason [`OwnedSender`] does: the
 /// C ABI can free its `questdb_db*` pointer before dropping outstanding
 /// reader handles. After pool close, returned readers are dropped instead of
 /// recycled.
@@ -2903,13 +2267,12 @@ fn return_reader_to_pool(inner: &Arc<DbInner>, reader: Reader, must_close: bool)
 
 /// Pop a free connection or open a fresh one within `pool_max`. Reserves the
 /// pool slot under one lock so a concurrent return can't race past `pool_size`.
-fn pick_column_sender_inner(
+fn pick_sender_inner<S>(
     inner: &Arc<DbInner>,
-    kind: ColumnPoolKind,
-) -> Result<PooledColumnSender> {
-    // The main pool is always store-and-forward; the direct pool never is.
-    let sfa = kind == ColumnPoolKind::Main;
-    let pool = column_pool_state(inner, kind);
+    pool: &Mutex<PoolState<S>>,
+    sfa: bool,
+    connect: impl FnOnce(Option<usize>) -> Result<S>,
+) -> Result<PooledSender<S>> {
     let slot = {
         let mut state = lock_state(pool);
         let mut close_wait_deadline = None;
@@ -2917,13 +2280,13 @@ fn pick_column_sender_inner(
             if inner.shutdown.load(Ordering::SeqCst) {
                 return Err(error::fmt!(
                     InvalidApiCall,
-                    "QuestDb pool is closed; cannot borrow column sender"
+                    "QuestDb pool is closed; cannot borrow sender"
                 ));
             }
             if let Some(entry) = state.free.pop() {
                 state.in_use += 1;
                 drop(state);
-                return Ok(PooledColumnSender {
+                return Ok(PooledSender {
                     sender: entry.sender,
                     slot_index: entry.slot_index,
                 });
@@ -2947,7 +2310,7 @@ fn pick_column_sender_inner(
             return Err(error::fmt!(
                 InvalidApiCall,
                 "Connection pool exhausted: {} sender(s) in use, pool_max={}. \
-                 Drop a borrowed column sender or increase pool_max.",
+                 Drop a borrowed sender or increase pool_max.",
                 state.in_use,
                 inner.pool_max
             ));
@@ -2962,27 +2325,31 @@ fn pick_column_sender_inner(
             armed: true,
         }
     };
-    if sfa {
-        let sender = connect_sfa_pool(inner, slot.slot_index)?;
-        let slot_index = slot.slot_index;
-        slot.commit();
-        return Ok(PooledColumnSender { sender, slot_index });
-    }
-    let conn = connect_conn_pool(inner)?;
+    let sender = connect(slot.slot_index)?;
     let slot_index = slot.slot_index;
     slot.commit();
-    Ok(PooledColumnSender {
-        sender: ColumnSender::new_direct(
+    Ok(PooledSender { sender, slot_index })
+}
+
+fn pick_sfa_sender(inner: &Arc<DbInner>) -> Result<PooledSender<PooledSenderCore>> {
+    pick_sender_inner(inner, &inner.state, true, |slot_index| {
+        connect_sfa_pool(inner, slot_index)
+    })
+}
+
+fn pick_direct_sender(inner: &Arc<DbInner>) -> Result<PooledSender<DirectSenderCore>> {
+    pick_sender_inner(inner, &inner.direct_state, false, |_slot_index| {
+        let conn = connect_conn_pool(inner)?;
+        Ok(DirectSenderCore::new(
             conn,
             crate::ingress::SymbolGlobalDict::new(),
             crate::ingress::column_sender::encoder::EncodeScratch::new(),
             false,
-        ),
-        slot_index,
+        ))
     })
 }
 
-fn connect_sfa_pool(inner: &Arc<DbInner>, slot_index: Option<usize>) -> Result<ColumnSender> {
+fn connect_sfa_pool(inner: &Arc<DbInner>, slot_index: Option<usize>) -> Result<PooledSenderCore> {
     let recovery_candidates = managed_slot_recovery_candidates(inner);
     connect_sfa_pool_with_recovery_candidates(inner, slot_index, &recovery_candidates)
 }
@@ -2991,26 +2358,22 @@ fn connect_sfa_pool_with_recovery_candidates(
     inner: &Arc<DbInner>,
     slot_index: Option<usize>,
     recovery_candidates: &[PathBuf],
-) -> Result<ColumnSender> {
-    let sender_id = slot_index
-        .map(|index| managed_slot_id(&inner.slot_base_id, ManagedSlotKind::Column, index));
+) -> Result<PooledSenderCore> {
+    let sender_id = slot_index.map(|index| managed_slot_id(&inner.slot_base_id, index));
     let state = inner
         .connector
         .connect_sfa_background_with_pool_slot(
             sender_id.as_deref(),
-            &inner.managed_slot_exclusions,
+            inner.managed_slot_exclusion.as_slice(),
             recovery_candidates,
         )
         .map_err(|err| {
             crate::Error::new(
                 err.code(),
-                format!(
-                    "Failed to open store-and-forward column sender: {}",
-                    err.msg()
-                ),
+                format!("Failed to open store-and-forward sender: {}", err.msg()),
             )
         })?;
-    ColumnSender::new_store_and_forward(
+    PooledSenderCore::new_store_and_forward(
         state,
         inner.connector.max_buf_size(),
         inner.connector.request_durable_ack(),
@@ -3018,21 +2381,21 @@ fn connect_sfa_pool_with_recovery_candidates(
     )
 }
 
-/// Re-acquire a live connection within `deadline`, retrying with the row API's
+/// Re-acquire a live connection within `deadline`, retrying with the pool's
 /// reconnect backoff: a failed pick (every endpoint role-rejecting while the
 /// cluster elects a primary, or a transient transport error) backs off and
 /// retries; `AuthError` / `ProtocolVersionError` and deadline exhaustion are
 /// terminal.
 #[cfg(feature = "ffi-support")]
-fn reconnect_pick(
+fn reconnect_pick<S>(
     inner: &Arc<DbInner>,
-    kind: ColumnPoolKind,
     deadline: Option<Instant>,
-) -> Result<PooledColumnSender> {
+    mut pick: impl FnMut(&Arc<DbInner>) -> Result<PooledSender<S>>,
+) -> Result<PooledSender<S>> {
     let policy = inner.connector.reconnect_policy();
     let mut backoff = policy.initial_backoff();
     loop {
-        match pick_column_sender_inner(inner, kind) {
+        match pick(inner) {
             Ok(cs) => return Ok(cs),
             Err(e) if reconnect_error_is_terminal(&e) || reconnect_deadline_expired(deadline) => {
                 return Err(e);
@@ -3109,7 +2472,7 @@ fn connect_conn_pool(inner: &Arc<DbInner>) -> Result<ColumnConn> {
 /// the durability ACK instead of silently downgrading to `Ok`. On failure the
 /// connection is latched `must_close` so the next borrower can't commit these
 /// frames under a foreign table.
-fn commit_in_flight_on_drop(inner: &Arc<DbInner>, sender: &mut ColumnSender) {
+fn commit_in_flight_on_drop(inner: &Arc<DbInner>, sender: &mut DirectSenderCore) {
     if sender.in_flight() == 0 {
         return;
     }
@@ -3121,7 +2484,7 @@ fn commit_in_flight_on_drop(inner: &Arc<DbInner>, sender: &mut ColumnSender) {
     let committed = !sender.must_close() && !sender.transport_dead() && sender.sync(ack).is_ok();
     if !committed {
         log::warn!(
-            "column sender dropped with un-sync'd deferred frame(s) that could \
+            "direct sender dropped with un-sync'd deferred frame(s) that could \
              not be committed; their data is discarded. Call sync() (or \
              flush_and_wait() on the final chunk) before the handle is dropped."
         );
@@ -3135,9 +2498,8 @@ fn commit_in_flight_on_drop(inner: &Arc<DbInner>, sender: &mut ColumnSender) {
 /// keeps delivering, but dropping it stops the runner, so we give the queue a
 /// bounded window (the configured `close_flush_timeout`) to finish. On timeout
 /// or a terminal transport the undelivered frames are discarded with a warning,
-/// mirroring [`commit_in_flight_on_drop`] for the direct backend. No-op for the
-/// direct backend and for a connection that has already drained.
-fn drain_sfa_before_drop(inner: &DbInner, sender: &mut ColumnSender) {
+/// mirroring [`commit_in_flight_on_drop`] for the direct backend.
+fn drain_sfa_before_drop(inner: &DbInner, sender: &mut PooledSenderCore) {
     let timeout = inner.connector.close_flush_timeout();
     if timeout.is_zero() {
         return;
@@ -3149,7 +2511,7 @@ fn drain_sfa_before_drop(inner: &DbInner, sender: &mut ColumnSender) {
     sender.begin_close();
     if let Err(err) = sender.drain_to_deadline(Instant::now().checked_add(timeout)) {
         log::warn!(
-            "store-and-forward column sender dropped with frame(s) that could \
+            "store-and-forward sender dropped with frame(s) that could \
              not be delivered within close_flush_timeout; their data is \
              discarded. Call wait() before closing the pool, or set sf_dir for \
              crash-durable persistence. Cause: {err}"
@@ -3162,7 +2524,7 @@ fn drain_sfa_before_drop(inner: &DbInner, sender: &mut ColumnSender) {
 /// deliveries overlap, then each is awaited under a *single* shared deadline —
 /// so total close time is roughly one `close_flush_timeout` no matter how many
 /// connections are draining, instead of the sum.
-fn drain_sfa_senders_bounded(inner: &DbInner, senders: &mut [ColumnSender]) {
+fn drain_sfa_senders_bounded(inner: &DbInner, senders: &mut [PooledSenderCore]) {
     let timeout = inner.connector.close_flush_timeout();
     if timeout.is_zero() || senders.is_empty() {
         return;
@@ -3178,7 +2540,7 @@ fn drain_sfa_senders_bounded(inner: &DbInner, senders: &mut [ColumnSender]) {
         }
         if let Err(err) = sender.drain_to_deadline(deadline) {
             log::warn!(
-                "store-and-forward column sender dropped on pool close with \
+                "store-and-forward sender dropped on pool close with \
                  frame(s) that could not be delivered within close_flush_timeout; \
                  their data is discarded. Call wait() before close, or set \
                  sf_dir for crash-durable persistence. Cause: {err}"
@@ -3187,21 +2549,15 @@ fn drain_sfa_senders_bounded(inner: &DbInner, senders: &mut [ColumnSender]) {
     }
 }
 
-fn return_to_pool(
+fn return_sfa_to_pool(
     inner: &Arc<DbInner>,
-    mut sender: ColumnSender,
-    kind: ColumnPoolKind,
+    mut sender: PooledSenderCore,
     slot_index: Option<usize>,
 ) {
     let must_close = sender.must_close();
-    // A transport-dead connection marks its endpoint unhealthy in the shared
-    // tracker so the next borrow rotates away from the dead peer (until it
-    // re-probes healthy). A pool-driven `mark_must_close` (un-sync'd pending
-    // frames) or a server-data rejection leaves the endpoint healthy.
-    record_sender_transport_failure(inner, &sender);
     let release_slot;
     {
-        let mut state = lock_state(column_pool_state(inner, kind));
+        let mut state = lock_state(&inner.state);
         if !must_close && !inner.shutdown.load(Ordering::SeqCst) {
             state.in_use = state.in_use.saturating_sub(1);
             state.free.push(PoolEntry {
@@ -3219,49 +2575,50 @@ fn return_to_pool(
             state.in_use = state.in_use.saturating_sub(1);
         }
     }
-    let _release = release_slot.then_some(ColumnSlotRelease {
+    let _release = release_slot.then_some(SenderSlotRelease {
         inner: inner.as_ref(),
-        kind,
         slot_index,
         decrement_in_use: true,
         decrement_closing: true,
     });
     // Not recycling: this connection and its background runner are about to be
-    // dropped. The store-and-forward (Main) pool owns a delivery contract, so
-    // drain its queue first (bounded, outside the pool lock); the direct pool
-    // discards uncommitted deferred frames by design, so this is a no-op there.
+    // dropped, so drain its queue first (bounded, outside the pool lock).
     drain_sfa_before_drop(inner, &mut sender);
     drop(sender);
 }
 
-fn finish_replaced_sender(
-    inner: &Arc<DbInner>,
-    sender: ColumnSender,
-    kind: ColumnPoolKind,
-    slot_index: Option<usize>,
-) {
-    debug_assert!(slot_index.is_none());
+fn return_direct_to_pool(inner: &Arc<DbInner>, sender: DirectSenderCore) {
     let must_close = sender.must_close();
     record_sender_transport_failure(inner, &sender);
-    {
-        let mut state = lock_state(column_pool_state(inner, kind));
-        if !must_close && !inner.shutdown.load(Ordering::SeqCst) && state.total() < inner.pool_max {
-            state.free.push(PoolEntry {
-                sender,
-                slot_index: None,
-                last_idle_at: Instant::now(),
-            });
-            inner.cv.notify_all();
-            return;
-        }
+    let mut state = lock_state(&inner.direct_state);
+    state.in_use = state.in_use.saturating_sub(1);
+    if !must_close && !inner.shutdown.load(Ordering::SeqCst) {
+        state.free.push(PoolEntry {
+            sender,
+            slot_index: None,
+            last_idle_at: Instant::now(),
+        });
+        inner.cv.notify_all();
     }
-    drop(sender);
 }
 
-fn record_sender_transport_failure(inner: &Arc<DbInner>, sender: &ColumnSender) {
-    if sender.transport_dead()
-        && let Some(idx) = sender.endpoint_idx()
-    {
+fn finish_replaced_sender(inner: &Arc<DbInner>, sender: DirectSenderCore) {
+    let must_close = sender.must_close();
+    record_sender_transport_failure(inner, &sender);
+    let mut state = lock_state(&inner.direct_state);
+    if !must_close && !inner.shutdown.load(Ordering::SeqCst) && state.total() < inner.pool_max {
+        state.free.push(PoolEntry {
+            sender,
+            slot_index: None,
+            last_idle_at: Instant::now(),
+        });
+        inner.cv.notify_all();
+    }
+}
+
+fn record_sender_transport_failure(inner: &Arc<DbInner>, sender: &DirectSenderCore) {
+    if sender.transport_dead() {
+        let idx = sender.endpoint_idx();
         lock_health(&inner.health)
             .record_mid_stream_failure(idx, Some(ReconnectReason::RetryableFailure));
         if let Some(events) = inner.conn_events.get()
@@ -3275,7 +2632,7 @@ fn record_sender_transport_failure(inner: &Arc<DbInner>, sender: &ColumnSender) 
 fn spawn_reaper(inner: Arc<DbInner>) -> std::io::Result<JoinHandle<()>> {
     let tick = reaper_tick(inner.pool_idle_timeout);
     thread::Builder::new()
-        .name("questdb-column-sender-pool-reaper".to_string())
+        .name("questdb-ingress-pool-reaper".to_string())
         .spawn(move || reaper_loop(inner, tick))
 }
 
@@ -3314,7 +2671,6 @@ fn reaper_loop(inner: Arc<DbInner>, tick: Duration) {
 fn reap_idle_inner(inner: &DbInner) -> usize {
     let mut dropped = reap_idle_senders(inner);
     dropped += reap_idle_direct_senders(inner);
-    dropped += reap_idle_row_senders(inner);
     #[cfg(feature = "_egress")]
     {
         dropped += reap_idle_readers(inner);
@@ -3325,7 +2681,6 @@ fn reap_idle_inner(inner: &DbInner) -> usize {
 fn drain_idle_inner(inner: &DbInner) -> usize {
     let mut dropped = drain_idle_senders(inner);
     dropped += drain_idle_direct_senders(inner);
-    dropped += drain_idle_row_senders(inner);
     #[cfg(feature = "_egress")]
     {
         dropped += drain_idle_readers(inner);
@@ -3334,7 +2689,7 @@ fn drain_idle_inner(inner: &DbInner) -> usize {
 }
 
 fn drain_idle_senders(inner: &DbInner) -> usize {
-    let mut to_drop: Vec<ColumnSender> = {
+    let mut to_drop: Vec<PooledSenderCore> = {
         let mut state = lock_state(&inner.state);
         state.free.drain(..).map(|entry| entry.sender).collect()
     };
@@ -3348,18 +2703,8 @@ fn drain_idle_senders(inner: &DbInner) -> usize {
 }
 
 fn drain_idle_direct_senders(inner: &DbInner) -> usize {
-    let to_drop: Vec<ColumnSender> = {
+    let to_drop: Vec<DirectSenderCore> = {
         let mut state = lock_state(&inner.direct_state);
-        state.free.drain(..).map(|entry| entry.sender).collect()
-    };
-    let dropped = to_drop.len();
-    drop(to_drop);
-    dropped
-}
-
-fn drain_idle_row_senders(inner: &DbInner) -> usize {
-    let to_drop: Vec<Sender> = {
-        let mut state = lock_row_sender_state(&inner.row_sender_state);
         state.free.drain(..).map(|entry| entry.sender).collect()
     };
     let dropped = to_drop.len();
@@ -3382,9 +2727,8 @@ fn reap_idle_senders(inner: &DbInner) -> usize {
     let durable = inner.connector.request_durable_ack();
     let mut dropped = 0;
     while let Some((sender, slot_index)) = take_reapable_column_sender(inner, durable) {
-        let _release = slot_index.is_some().then_some(ColumnSlotRelease {
+        let _release = slot_index.is_some().then_some(SenderSlotRelease {
             inner,
-            kind: ColumnPoolKind::Main,
             slot_index,
             decrement_in_use: false,
             decrement_closing: true,
@@ -3398,7 +2742,7 @@ fn reap_idle_senders(inner: &DbInner) -> usize {
 fn take_reapable_column_sender(
     inner: &DbInner,
     durable: bool,
-) -> Option<(ColumnSender, Option<usize>)> {
+) -> Option<(PooledSenderCore, Option<usize>)> {
     let mut state = lock_state(&inner.state);
     let now = Instant::now();
     // Free-list is oldest at front, newest at back (push on return /
@@ -3430,8 +2774,8 @@ fn take_reapable_column_sender(
 fn reap_idle_direct_senders(inner: &DbInner) -> usize {
     // Direct pool is lazy-init (no pre-population at connect), so there is no
     // warm-min floor to preserve — reap any sender parked longer than the idle
-    // timeout, mirroring the row-sender pool.
-    let to_drop: Vec<ColumnSender> = {
+    // timeout. The direct pool has no configured warm minimum.
+    let to_drop: Vec<DirectSenderCore> = {
         let mut state = lock_state(&inner.direct_state);
         let mut to_drop = Vec::new();
         let now = Instant::now();
@@ -3450,44 +2794,6 @@ fn reap_idle_direct_senders(inner: &DbInner) -> usize {
     let dropped = to_drop.len();
     drop(to_drop);
     dropped
-}
-
-fn reap_idle_row_senders(inner: &DbInner) -> usize {
-    let durable = inner.connector.request_durable_ack();
-    let mut dropped = 0;
-    while let Some((sender, slot_index)) = take_reapable_row_sender(inner, durable) {
-        let _release = slot_index.is_some().then_some(RowSlotRelease {
-            inner,
-            slot_index,
-            decrement_in_use: false,
-            decrement_closing: true,
-        });
-        drop(sender);
-        dropped += 1;
-    }
-    dropped
-}
-
-fn take_reapable_row_sender(inner: &DbInner, durable: bool) -> Option<(Sender, Option<usize>)> {
-    // The row-sender pool has no warm-min floor to preserve, even when
-    // connect-time recovery pre-opened dirty disk-SF slots. Reap only senders
-    // parked longer than the idle timeout and whose store-and-forward queue has
-    // no undelivered frames.
-    let mut state = lock_row_sender_state(&inner.row_sender_state);
-    let now = Instant::now();
-    let mut i = 0;
-    while i < state.free.len() {
-        let idle_for = now.saturating_duration_since(state.free[i].last_idle_at);
-        if idle_for > inner.pool_idle_timeout && state.free[i].sender.sfa_fully_delivered(durable) {
-            let entry = state.free.remove(i);
-            if entry.slot_index.is_some() {
-                state.closing += 1;
-            }
-            return Some((entry.sender, entry.slot_index));
-        }
-        i += 1;
-    }
-    None
 }
 
 #[cfg(feature = "_egress")]
@@ -3522,7 +2828,8 @@ const _: fn() = || {
     #[cfg(feature = "ffi-support")]
     {
         fn assert_send<T: Send>() {}
-        assert_send::<OwnedColumnSender>();
+        assert_send::<OwnedSender>();
+        assert_send::<OwnedDirectColumnSender>();
     }
 };
 
@@ -3535,12 +2842,27 @@ const _: fn() = || {
     fn assert_not_send<T: ?Sized>() {
         let _: fn() = <T as AmbiguousIfSend<_>>::_disambiguate;
     }
-    assert_not_send::<BorrowedColumnSender<'_>>();
+    assert_not_send::<BorrowedSender<'_>>();
     assert_not_send::<BorrowedDirectColumnSender<'_>>();
-    assert_not_send::<BorrowedRowSender<'_>>();
     #[cfg(feature = "_egress")]
     assert_not_send::<BorrowedReader<'_>>();
     assert_not_send::<crate::ingress::column_sender::Chunk<'_>>();
+};
+
+const _: fn() = || {
+    trait AmbiguousIfSync<A> {
+        fn _disambiguate() {}
+    }
+    impl<T: ?Sized> AmbiguousIfSync<()> for T {}
+    impl<T: ?Sized + Sync> AmbiguousIfSync<u8> for T {}
+    fn assert_not_sync<T: ?Sized>() {
+        let _: fn() = <T as AmbiguousIfSync<_>>::_disambiguate;
+    }
+    assert_not_sync::<BorrowedSender<'_>>();
+    assert_not_sync::<BorrowedDirectColumnSender<'_>>();
+    #[cfg(feature = "_egress")]
+    assert_not_sync::<BorrowedReader<'_>>();
+    assert_not_sync::<crate::ingress::column_sender::Chunk<'_>>();
 };
 
 #[cfg(test)]
@@ -3560,22 +2882,16 @@ mod tests {
     #[test]
     fn managed_slot_recovery_candidates_exclude_live_pool_range() {
         let temp = TempDir::new().unwrap();
-        dirty_slot(temp.path(), "default-col-0");
-        dirty_slot(temp.path(), "default-col-1");
-        dirty_slot(temp.path(), "default-col-2");
-        dirty_slot(temp.path(), "default-row-0");
-        dirty_slot(temp.path(), "default-row-2");
+        dirty_slot(temp.path(), "default-ingest-0");
+        dirty_slot(temp.path(), "default-ingest-1");
+        dirty_slot(temp.path(), "default-ingest-2");
+        dirty_slot(temp.path(), &format!("default-{}-2", "col"));
+        dirty_slot(temp.path(), &format!("default-{}-2", "row"));
 
         let mut actual = managed_slot_recovery_candidates_from(temp.path(), "default", 2);
         actual.sort();
 
-        assert_eq!(
-            actual,
-            vec![
-                temp.path().join("default-col-2"),
-                temp.path().join("default-row-2")
-            ]
-        );
+        assert_eq!(actual, vec![temp.path().join("default-ingest-2")]);
     }
 
     #[test]

@@ -1,7 +1,8 @@
 # QWP Real-Network Benchmark Plan — reproducing the DataFrame parity suite over AWS
 
 **Status:** draft, pending approval. Scripts live in [`doc/net_bench/`](./net_bench/).
-**Relationship:** direct continuation of [`QWP_DATAFRAME_BENCH_PLAN.md`](./QWP_DATAFRAME_BENCH_PLAN.md)
+**Relationship:** direct continuation of the implemented historical
+[`QWP_DATAFRAME_BENCH_PLAN.md`](./historical/QWP_DATAFRAME_BENCH_PLAN.md)
 (same S1/S2 schemas, JSON contract, DEDUP fixture, aggregator — "the spine").
 That plan deliberately locks parity runs to *single-box, single-stream, loopback*
 (§3.7). This plan adds the axis it deferred implicitly: **the network**.

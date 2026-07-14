@@ -6,11 +6,11 @@
 //! from the pool and re-drives from the journal watermark (bounded so a terminal
 //! error can't spin forever).
 //!
-//! Implemented: the **row API** legs (`rust-row-direct`, `rust-row-saf-disk`,
-//! `rust-row-saf-mem`) — the conf string selects the backend, the driver is
-//! shared. The column-sender / DataFrame / egress legs share this shape and
-//! attach here next (they cover the full 22-type matrix; the row Buffer covers
-//! the ILP-expressible subset).
+//! The Buffer, Chunk, and mixed Buffer/Chunk/Arrow SFA legs all use the unified
+//! ingestion pool. The conf string selects default memory, explicitly bounded
+//! memory, or disk storage. The DataFrame leg uses direct whole-source delivery;
+//! Chunk and DataFrame cover the full 22-type matrix while Buffer covers its
+//! expressible subset.
 
 use std::path::PathBuf;
 use std::thread::sleep;
@@ -50,26 +50,28 @@ type LegResult = Result<(), Box<dyn std::error::Error>>;
 /// Dispatch to the leg driver by name.
 pub fn run_leg(cfg: &LegConfig) -> LegResult {
     match cfg.leg.as_str() {
-        "rust-row-direct" | "rust-row-saf-disk" | "rust-row-saf-mem" | "control-ingress" => {
-            run_row_leg(cfg)
-        }
-        "rust-col-direct" | "rust-col-sf" | "control-col" => crate::column_leg::run_column_leg(cfg),
+        "rust-buffer-saf-default"
+        | "rust-buffer-saf-disk"
+        | "rust-buffer-saf-mem"
+        | "control-buffer-saf-default" => run_buffer_leg(cfg),
+        "rust-chunk-saf-default" => crate::chunk_leg::run_chunk_leg(cfg),
+        "rust-mixed-saf-disk" | "rust-mixed-saf-mem" => crate::mixed_leg::run_mixed_leg(cfg),
         "rust-egress-whole" | "rust-egress-stream" | "control-egress" => {
             crate::egress_leg::run_egress_leg(cfg)
         }
         #[cfg(feature = "dataframe")]
-        "rust-col-df" => crate::dataframe_leg::run_dataframe_leg(cfg),
+        "rust-dataframe-direct" => crate::dataframe_leg::run_dataframe_leg(cfg),
         other => Err(format!(
             "leg {other:?} not available (the DataFrame leg needs the \
-             `dataframe` cargo feature; see SOAK_HARNESS_DESIGN.md §S1)"
+             `dataframe` cargo feature; see doc/QWP_SOAK_HARNESS.md)"
         )
         .into()),
     }
 }
 
-/// Build the pool connect string. Direct by default; `sf_dir` / `sf_mem_bytes`
-/// switch the pool into store-and-forward (disk / in-memory). Shared with the
-/// column leg.
+/// Build the pool connect string. A unified sender is memory
+/// store-and-forward by default; `sf_dir` selects disk storage and
+/// `sf_mem_bytes` sets an explicit memory bound. Shared with the Chunk leg.
 pub(crate) fn build_conf(cfg: &LegConfig) -> String {
     let mut c = format!(
         "ws::addr={};auth_timeout=5000;\
@@ -87,7 +89,7 @@ pub(crate) fn build_conf(cfg: &LegConfig) -> String {
     c
 }
 
-fn run_row_leg(cfg: &LegConfig) -> LegResult {
+fn run_buffer_leg(cfg: &LegConfig) -> LegResult {
     let conf = build_conf(cfg);
     let db = QuestDb::connect(&conf)?;
     let mut journal = AckJournal::open(&cfg.journal_path)?;
@@ -102,8 +104,8 @@ fn run_row_leg(cfg: &LegConfig) -> LegResult {
     let mut stuck: u32 = 0;
     const STUCK_LIMIT: u32 = 500;
 
-    let mut row = db.borrow_row_sender()?;
-    let mut buf = row.new_buffer();
+    let mut sender = db.borrow_sender()?;
+    let mut buf = sender.new_buffer();
 
     while !crate::stop_requested() && start.elapsed() < cfg.duration {
         let batch_start = seq;
@@ -118,8 +120,8 @@ fn run_row_leg(cfg: &LegConfig) -> LegResult {
         // Flush the batch and block until it is acked, then the journal
         // watermark is durable. On a transient error, re-drive from the
         // journal; the pool re-borrow rotates endpoints / reconnects.
-        let outcome = match row.flush(&mut buf) {
-            Ok(()) => row.wait(AckLevel::Ok, Duration::from_secs(60)),
+        let outcome = match sender.flush_buffer(&mut buf) {
+            Ok(()) => sender.wait(AckLevel::Ok, Duration::from_secs(60)),
             Err(e) => Err(e),
         };
 
@@ -146,10 +148,10 @@ fn run_row_leg(cfg: &LegConfig) -> LegResult {
                 }
                 // Re-borrow a live sender and re-drive from the durable
                 // watermark. Back off so a flapping endpoint isn't hammered.
-                drop(row);
+                drop(sender);
                 sleep(Duration::from_millis(200));
-                row = reborrow(&db, &cfg.leg)?;
-                buf = row.new_buffer();
+                sender = reborrow(&db, &cfg.leg)?;
+                buf = sender.new_buffer();
                 seq = journal.resume_seq();
                 continue;
             }
@@ -159,8 +161,8 @@ fn run_row_leg(cfg: &LegConfig) -> LegResult {
         rate_limit(cfg, rows_sent, start);
 
         if last_stats.elapsed() >= Duration::from_secs(5) {
-            let published = row.published_fsn().ok().flatten();
-            let acked = row.acked_fsn().ok().flatten();
+            let published = sender.published_fsn().ok().flatten();
+            let acked = sender.acked_fsn().ok().flatten();
             let rows_acked = journal.watermark().map_or(0, |w| w + 1);
             stats.emit(&db, rows_sent, rows_acked, published, acked)?;
             last_stats = Instant::now();
@@ -172,21 +174,21 @@ fn run_row_leg(cfg: &LegConfig) -> LegResult {
     // journal (I1 reads that), and a graceful-stop SIGTERM landing in it would
     // kill the leg before the drop.
     let rows_acked = journal.watermark().map_or(0, |w| w + 1);
-    let published = row.published_fsn().ok().flatten();
-    let acked = row.acked_fsn().ok().flatten();
-    drop(row);
+    let published = sender.published_fsn().ok().flatten();
+    let acked = sender.acked_fsn().ok().flatten();
+    drop(sender);
     stats.emit(&db, rows_sent, rows_acked, published, acked)?;
     Ok(())
 }
 
-/// Re-borrow a row sender, retrying with backoff while the endpoint recovers.
+/// Re-borrow a unified sender, retrying with backoff while the endpoint recovers.
 fn reborrow<'a>(
     db: &'a QuestDb,
     leg: &str,
-) -> Result<questdb::BorrowedRowSender<'a>, Box<dyn std::error::Error>> {
+) -> Result<questdb::BorrowedSender<'a>, Box<dyn std::error::Error>> {
     let deadline = Instant::now() + Duration::from_secs(120);
     loop {
-        match db.borrow_row_sender() {
+        match db.borrow_sender() {
             Ok(s) => return Ok(s),
             Err(e) => {
                 if Instant::now() >= deadline {
@@ -199,8 +201,8 @@ fn reborrow<'a>(
 }
 
 /// Append one full row (table + symbols + fields + designated timestamp) for
-/// `seq`. Symbols precede fields (ILP ordering). Covers the row Buffer's
-/// expressible subset of the 22 types; the rest are the column-sender leg's.
+/// `seq`. Symbols precede fields (ILP ordering). Covers Buffer's expressible
+/// subset of the 22 types; the rest are covered by the Chunk leg.
 fn build_row(buf: &mut Buffer, cfg: &LegConfig, seq: u64) -> LegResult {
     buf.table(cfg.table.as_str())?;
 
@@ -256,10 +258,10 @@ fn expected_of(cfg: &LegConfig, seq: u64, ty: QwpType) -> Expected {
     gen::gen_expected(cfg.seed, cfg.worker_id, seq, ty)
 }
 
-/// Emit one non-symbol cell as a Buffer field, if the row API can express it.
+/// Emit one non-symbol cell as a Buffer field, if Buffer can express it.
 /// Narrow ints widen to `column_i64`; unsupported types (uuid, long256,
 /// geohash, ipv4, binary, timestamps) are skipped here and covered by the
-/// column-sender leg.
+/// Chunk leg.
 fn emit_field(buf: &mut Buffer, ty: QwpType, exp: &Expected) -> LegResult {
     let name = ty.col_name();
     match ty {
@@ -319,14 +321,14 @@ fn emit_field(buf: &mut Buffer, ty: QwpType, exp: &Expected) -> LegResult {
         },
         // DoubleArray is emitted in build_row (it needs the raw f64 values);
         // the remaining types (uuid/long256/geohash/ipv4/binary/timestamps)
-        // are the column-sender leg's.
+        // are covered by the Chunk leg.
         _ => {}
     }
     Ok(())
 }
 
 /// Batch-granular rate control: sleep so cumulative `rows_sent` tracks
-/// `target_rows_per_sec`. `0` means unlimited. Shared with the column leg.
+/// `target_rows_per_sec`. `0` means unlimited. Shared with the Chunk leg.
 pub(crate) fn rate_limit(cfg: &LegConfig, rows_sent: u64, start: Instant) {
     if cfg.target_rows_per_sec == 0 {
         return;

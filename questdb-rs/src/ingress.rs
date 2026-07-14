@@ -475,8 +475,8 @@ pub(crate) struct QwpWsAddrScan {
 
 /// Resolved, reusable ingredients for opening QWP/WebSocket connections to a
 /// rotating set of endpoints. Built once by
-/// [`SenderBuilder::build_qwp_ws_connector`] and held by the column-sender
-/// pool ([`crate::ingress::column_sender`]), which drives it through a
+/// [`SenderBuilder::build_qwp_ws_connector`] and held by the ingestion pool,
+/// which drives it through a
 /// shared [`sender::qwp_ws::QwpWsHostHealthTracker`] so every borrow lands on
 /// a live, writable endpoint (skipping unhealthy / role-rejecting ones)
 /// without re-parsing the connect string.
@@ -530,7 +530,7 @@ impl QwpWsConnector {
         *self.qwp_ws.request_timeout
     }
 
-    /// Bound on how long the store-and-forward column-sender pool waits for a
+    /// Bound on how long the store-and-forward ingestion pool waits for a
     /// connection's background runner to deliver its queued frames before the
     /// connection is dropped (pool close / shutdown return). `Duration::ZERO`
     /// disables the wait. Parsed from `close_flush_timeout_millis`.
@@ -1021,7 +1021,7 @@ impl SenderBuilder {
         // matched by an arm below: `addr` (consumed before this loop), the
         // auto-flush keys (validated by `validate_auto_flush_params`), the
         // egress query-client keys (a single connect string drives both the
-        // sender and the `QwpQueryClient`), and the column-sender pool keys
+        // sender and the `QwpQueryClient`), and the ingestion-pool keys
         // (`pool_*`, consumed by `QuestDb::connect` before it opens each
         // per-slot `SenderBuilder::from_conf` connection). Any other key on a
         // QWP/WebSocket connect string is rejected as unknown. Keys added to
@@ -1419,28 +1419,6 @@ impl SenderBuilder {
     {
         self.qwp_ws_error_handler = QwpWsErrorHandler::new(handler);
         Ok(self)
-    }
-
-    #[cfg(feature = "sync-sender-qwp-ws")]
-    pub(crate) fn build_with_qwp_ws_pool_slot(
-        &self,
-        sender_id: Option<&str>,
-        managed_exclusions: &[conf::QwpWsManagedSlotExclusion],
-        extra_orphan_slots: &[PathBuf],
-        force_async_initial_connect: bool,
-    ) -> Result<Sender> {
-        let mut builder = self.clone();
-        let qwp_ws = builder.qwp_ws.as_mut().ok_or_else(|| {
-            error::fmt!(
-                ConfigError,
-                "QWP/WebSocket configuration is missing for pool-managed sender"
-            )
-        })?;
-        configure_qwp_ws_pool_slot(qwp_ws, sender_id, managed_exclusions, extra_orphan_slots)?;
-        if force_async_initial_connect {
-            qwp_ws.force_async_initial_connect();
-        }
-        builder.build()
     }
 
     /// Select local outbound interface.
@@ -2339,6 +2317,10 @@ impl SenderBuilder {
         Ok(self)
     }
 
+    pub(crate) fn configured_max_name_len(&self) -> usize {
+        *self.max_name_len
+    }
+
     #[cfg(feature = "sync-sender-http")]
     /// Set the cumulative duration spent in retries.
     /// The value is in milliseconds, and the default is 10 seconds.
@@ -2906,12 +2888,12 @@ impl SenderBuilder {
     }
 
     /// Build a reusable [`QwpWsConnector`] capturing the full configured
-    /// endpoint list — the column-major sender's sole entry point into the
+    /// endpoint list — the pooled QWP ingress path's entry point into the
     /// network. The pool drives it through a shared health tracker so each
     /// connect rotates across endpoints, skips unhealthy ones, and follows
     /// the writable primary on a role reject; the resulting `WsStream` does
-    /// its own synchronous frame I/O and never touches the row-API publisher
-    /// / driver / queue stack. See `doc/COLUMN_SENDER_PLAN.md`.
+    /// its own synchronous frame I/O and does not use the standalone
+    /// [`Sender`]'s replay encoder or transaction ownership.
     #[cfg(feature = "sync-sender-qwp-ws")]
     pub(crate) fn build_qwp_ws_connector(&self) -> Result<QwpWsConnector> {
         let (use_tls, tls_settings, qwp_ws, auth_header) = self.resolve_qwp_ws_ingredients()?;

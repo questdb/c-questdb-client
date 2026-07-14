@@ -2,7 +2,7 @@
 //! line-oriented stdin/stdout protocol as `qwp_sidecar`.
 //!
 //! Sibling to `qwp_sidecar.rs`, which drives the row-major `Sender`. This one
-//! drives the column-major path — `QuestDb` → `borrow_column_sender()` →
+//! drives the column-major path — `QuestDb` → `borrow_sender()` →
 //! `ColumnSender` — over a store-and-forward QWP/WebSocket connection, so the
 //! Enterprise pytest harness can run the same kill-9 failover scenario against
 //! the columnar ingest API. Matching `qwp_sidecar`'s wire protocol byte-for-byte
@@ -21,7 +21,7 @@
 //! accumulated rows:
 //!   - `chunk` (default; a `Chunk` of borrowed column slices) and `arrow` (an
 //!     Arrow `RecordBatch`) both go through the **store-and-forward** column
-//!     sender (`borrow_column_sender`), so the SF replay/failover contract is
+//!     sender (`borrow_sender`), so the SF replay/failover contract is
 //!     identical to the row sidecar.
 //!   - `arrow_db` drives the **direct** (non-store-and-forward) `Db` facade
 //!     entry point `Db::flush_arrow_batch`, the one application code calls.
@@ -199,11 +199,11 @@ fn handle(line: &str, state: &mut State, out: &mut impl Write) -> Result<(), Str
                 // in the sf_dir until durably acked, so a kill-9 of the primary
                 // before that durable ack leaves it to replay to the successor —
                 // the row sidecar's OK-but-not-durable case. The store-and-forward
-                // (`borrow_column_sender`) handle composes publish-only `flush`
+                // (`borrow_sender`) handle composes publish-only `flush`
                 // with the `wait` ack barrier.
                 match state.src {
                     SendSrc::Chunk => {
-                        let mut sender = db.borrow_column_sender().map_err(|e| e.to_string())?;
+                        let mut sender = db.borrow_sender().map_err(|e| e.to_string())?;
                         let mut chunk = Chunk::new(table.as_str());
                         chunk
                             .column_i64("v", state.v.as_slice(), None)
@@ -217,7 +217,7 @@ fn handle(line: &str, state: &mut State, out: &mut impl Write) -> Result<(), Str
                             .map_err(|e| e.to_string())?;
                     }
                     SendSrc::Arrow => {
-                        let mut sender = db.borrow_column_sender().map_err(|e| e.to_string())?;
+                        let mut sender = db.borrow_sender().map_err(|e| e.to_string())?;
                         let batch = build_arrow_batch(&state.v, &state.ts)?;
                         let ts_col = ColumnName::new("ts").map_err(|e| e.to_string())?;
                         sender

@@ -13,21 +13,23 @@ struct qwp_mock_c
     std::string addr_cached;
 };
 
-extern "C" qwp_mock_c* qwp_mock_c_start(int slot_count)
+static qwp_mock_c* start_mock(int slot_count, int frame_count)
 {
     if (slot_count < 1)
         slot_count = 1;
-    // Per-connection script: wait for one client binary frame whose
-    // first byte is 'Q' (the QWP1 magic byte that every column-sender
+    if (frame_count < 1)
+        frame_count = 1;
+    // Per-connection script: wait for client binary frames whose
+    // first byte is 'Q' (the QWP1 magic byte that every ingress
     // publish frame starts with). This blocks the worker from
     // `graceful_close`ing before the client has finished writing.
-    qm::Script accept_one_frame = {
-        qm::ActionAwaitClientFrame{0x51},
-    };
+    qm::Script accept_frames;
+    for (int i = 0; i < frame_count; ++i)
+        accept_frames.push_back(qm::ActionAwaitClientFrame{0x51});
     std::vector<qm::Script> scripts;
     scripts.reserve(static_cast<size_t>(slot_count));
     for (int i = 0; i < slot_count; ++i)
-        scripts.push_back(accept_one_frame);
+        scripts.push_back(accept_frames);
 
     auto holder = new qwp_mock_c{};
     try
@@ -41,6 +43,17 @@ extern "C" qwp_mock_c* qwp_mock_c_start(int slot_count)
         return nullptr;
     }
     return holder;
+}
+
+extern "C" qwp_mock_c* qwp_mock_c_start(int slot_count)
+{
+    return start_mock(slot_count, 1);
+}
+
+extern "C" qwp_mock_c* qwp_mock_c_start_frames(
+    int slot_count, int frame_count)
+{
+    return start_mock(slot_count, frame_count);
 }
 
 extern "C" const char* qwp_mock_c_addr(qwp_mock_c* mock)

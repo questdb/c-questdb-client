@@ -23,7 +23,7 @@
 ################################################################################
 
 """
-Soak / stress orchestrator (see ``doc/SOAK_HARNESS_DESIGN.md`` §S2).
+Soak / stress orchestrator (see ``doc/QWP_SOAK_HARNESS.md``).
 
 Conducts a run: provision QuestDB (control + faulted), start the fault proxy,
 spawn the workload legs, then loop — sampling RSS/FD + workload stats every few
@@ -62,7 +62,7 @@ import time
 # resumes from its durable watermark and re-drives — no loss.
 EPISODE_KINDS = [
     'server_graceful', 'client_kill9', 'client_graceful',
-    'conn_reset', 'stall', 'throttle', 'sf_disk_full',
+    'conn_reset', 'stall', 'throttle',
 ]
 
 
@@ -187,6 +187,20 @@ class Sampler:
     def sample(self, pid):
         return {'rss_bytes': self.rss_bytes(pid), 'fd_count': self.fd_count(pid)}
 
+    def dir_size(self, path):
+        """Logical bytes in a directory tree, or zero if it vanished."""
+        total = 0
+        try:
+            for root, _dirs, files in os.walk(path):
+                for name in files:
+                    try:
+                        total += os.path.getsize(os.path.join(root, name))
+                    except OSError:
+                        pass
+        except OSError:
+            pass
+        return total
+
 
 # ---------------------------------------------------------------------------
 # Workload process — spawn / graceful-stop / kill9 / restart. Emits stats to a
@@ -242,19 +256,6 @@ class Workload:
 # ---------------------------------------------------------------------------
 
 class SoakRun:
-    #: Legs and their workload flags. `faulted` legs connect via the proxy.
-    #: `control` legs go straight to the never-faulted control server.
-    DEFAULT_LEGS = [
-        {'leg': 'rust-row-direct', 'faulted': True},
-        {'leg': 'rust-row-saf-disk', 'faulted': True, 'sf': 'disk'},
-        {'leg': 'rust-row-saf-mem', 'faulted': True, 'sf': 'mem'},
-        {'leg': 'rust-col-direct', 'faulted': True},
-        {'leg': 'rust-col-df', 'faulted': True},
-        {'leg': 'rust-egress-whole', 'faulted': True},
-        {'leg': 'control-ingress', 'faulted': False},
-        {'leg': 'control-egress', 'faulted': False},
-    ]
-
     def __init__(self, opts):
         self.opts = opts
         self.sampler = Sampler()
@@ -379,42 +380,53 @@ class SoakRun:
             proxy_port = self.proxy.start()
             faulted_addr = f'{self.faulted.host}:{proxy_port}'
 
-        # v1 legs: one faulted row leg (through the proxy) + one control leg
-        # (straight to the never-faulted server). The full matrix (SF / column
-        # / DataFrame / egress) attaches as those legs land.
-        # The type slice each leg actually writes (for I3 value reconciliation).
-        row_types = ['boolean', 'byte', 'short', 'int', 'long', 'float',
-                     'double', 'symbol', 'varchar', 'char', 'decimal64',
-                     'decimal128', 'decimal256', 'double_array', 'geohash']
-        col_types = ['boolean', 'byte', 'short', 'int', 'long', 'float',
-                     'double', 'symbol', 'timestamp', 'date', 'uuid', 'varchar',
-                     'timestamp_nanos', 'binary', 'ipv4', 'long256']
+        # The type slice each payload leg actually writes, used for I3 value
+        # reconciliation. Faulted legs use the proxy; the control leg connects
+        # straight to the never-faulted server.
+        buffer_types = ['boolean', 'byte', 'short', 'int', 'long', 'float',
+                        'double', 'symbol', 'varchar', 'char', 'decimal64',
+                        'decimal128', 'decimal256', 'double_array', 'geohash']
+        chunk_types = ['boolean', 'byte', 'short', 'int', 'long', 'float',
+                       'double', 'symbol', 'timestamp', 'date', 'uuid', 'varchar',
+                       'timestamp_nanos', 'binary', 'ipv4', 'long256']
+        mixed_types = ['boolean', 'long', 'double', 'symbol', 'varchar']
         self.legs = [
-            {'name': 'rust-row-direct', 'faulted': True, 'worker': 0,
-             'table': 'soak_row_direct', 'types': row_types,
+            # One borrowed SFA sender cycles Arrow -> Buffer -> Chunk. Keep the
+            # disk leg first so client kill/restart episodes exercise persisted
+            # mixed-shape dictionary and frame recovery.
+            {'name': 'rust-mixed-saf-disk', 'faulted': True, 'worker': 6,
+             'table': 'soak_mixed_saf_disk', 'types': mixed_types, 'sf': 'disk',
+             'mixed_shapes': ['arrow', 'buffer', 'chunk'], 'batch': 2000,
              'addr': faulted_addr, 'server': self.faulted},
-            {'name': 'rust-col-direct', 'faulted': True, 'worker': 2,
-             'table': 'soak_col_direct', 'types': col_types,
+            {'name': 'rust-mixed-saf-mem', 'faulted': True, 'worker': 7,
+             'table': 'soak_mixed_saf_mem', 'types': mixed_types, 'sf': 'mem',
+             'mixed_shapes': ['arrow', 'buffer', 'chunk'], 'batch': 2000,
+             'addr': faulted_addr, 'server': self.faulted},
+            {'name': 'rust-buffer-saf-default', 'faulted': True, 'worker': 0,
+             'table': 'soak_buffer_saf_default', 'types': buffer_types,
+             'addr': faulted_addr, 'server': self.faulted},
+            {'name': 'rust-chunk-saf-default', 'faulted': True, 'worker': 2,
+             'table': 'soak_chunk_saf_default', 'types': chunk_types,
              'addr': faulted_addr, 'server': self.faulted},
             # DataFrame->Arrow->wire path (needs a `--features dataframe` binary).
-            {'name': 'rust-col-df', 'faulted': True, 'worker': 3,
-             'table': 'soak_df', 'types': ['boolean', 'long', 'double', 'symbol'],
+            {'name': 'rust-dataframe-direct', 'faulted': True, 'worker': 3,
+             'table': 'soak_dataframe_direct',
+             'types': ['boolean', 'long', 'double', 'symbol'],
              'addr': faulted_addr, 'server': self.faulted},
-            # Store-and-forward: disk-backed and in-memory (item 1's core ask).
-            {'name': 'rust-row-saf-disk', 'faulted': True, 'worker': 4,
-             'table': 'soak_saf_disk', 'types': row_types, 'sf': 'disk',
+            {'name': 'rust-buffer-saf-disk', 'faulted': True, 'worker': 4,
+             'table': 'soak_buffer_saf_disk', 'types': buffer_types, 'sf': 'disk',
              'addr': faulted_addr, 'server': self.faulted},
-            {'name': 'rust-row-saf-mem', 'faulted': True, 'worker': 5,
-             'table': 'soak_saf_mem', 'types': row_types, 'sf': 'mem',
+            {'name': 'rust-buffer-saf-mem', 'faulted': True, 'worker': 5,
+             'table': 'soak_buffer_saf_mem', 'types': buffer_types, 'sf': 'mem',
              'addr': faulted_addr, 'server': self.faulted},
-            {'name': 'control-ingress', 'faulted': False, 'worker': 1,
-             'table': 'soak_control', 'types': row_types,
+            {'name': 'control-buffer-saf-default', 'faulted': False, 'worker': 1,
+             'table': 'soak_control_buffer_saf_default', 'types': buffer_types,
              'addr': f'{self.control.host}:{self.control.http_port}',
              'server': self.control},
-            # Read-only: full-scans the faulted column table under query load +
+            # Read-only: full-scans the faulted Chunk table under query load +
             # read-side failover. No journal; its own contiguity check gates it.
             {'name': 'rust-egress-whole', 'faulted': True, 'worker': 2,
-             'table': 'soak_col_direct', 'kind': 'egress',
+             'table': 'soak_chunk_saf_default', 'kind': 'egress',
              'addr': faulted_addr, 'server': self.faulted},
         ]
 
@@ -464,9 +476,10 @@ class SoakRun:
                 '--stats', stats,
                 '--rate', str(rate),
                 '--duration-sec', str(dur),
-                '--batch', '2000',
+                '--batch', str(leg.get('batch', 2000)),
             ]
             # Store-and-forward backends.
+            sfdir = None
             if leg.get('sf') == 'disk':
                 sfdir = os.path.join(outdir, f'{leg["name"]}.sfdir')
                 os.makedirs(sfdir, exist_ok=True)
@@ -476,6 +489,7 @@ class SoakRun:
             w = Workload(leg['name'], self.WORKLOAD_BIN, args)
             w.stats_file = stats
             w.journal_file = journal
+            w.sf_dir = sfdir
             w.meta = leg
             w.start()
             self.workloads.append(w)
@@ -559,18 +573,40 @@ class SoakRun:
             self.proxy.throttle(p['bps'])
             reverts.append((_time.monotonic() + p['seconds'],
                             lambda: self.proxy.throttle(0)))
-        elif ep.kind == 'sf_disk_full':
-            sys.stderr.write('[soak] sf_disk_full skipped (no SF leg in v1)\n')
 
     def _drain_and_stop(self):
         import time as _time
-        # Let the legs finish their duration and drain, then a final quiesce
-        # sample so the oracle sees pools return to baseline.
+        # Let the legs finish their duration and drain, then merge the final
+        # internal stats each leg writes after releasing its borrowed handle.
         for w in self.workloads:
             if w.is_alive():
                 w.graceful(timeout=90)
         _time.sleep(2.0)
-        self.sample_all(_time.time())
+        self._append_quiesce_samples(_time.time())
+
+    def _append_quiesce_samples(self, now):
+        for w in self.workloads:
+            previous = next(
+                (sample for sample in reversed(self.samples)
+                 if sample.get('leg') == w.leg),
+                None)
+            internal = self._read_latest_internal(w)
+            if previous is None or internal is None:
+                continue
+            # The process has exited, so retain its final live RSS/FD sample for
+            # trend analysis while replacing pool/watermark state with the
+            # post-release record it flushed immediately before exit.
+            row = {
+                't': now,
+                'leg': w.leg,
+                'pid': w.pid,
+                'rss_bytes': previous.get('rss_bytes'),
+                'fd_count': previous.get('fd_count'),
+            }
+            row.update(internal)
+            if w.sf_dir:
+                row['sf'] = {'disk_bytes': self.sampler.dir_size(w.sf_dir)}
+            self.samples.append(row)
 
     def _reconcile(self, oracle_mod):
         verdicts = []
@@ -605,6 +641,9 @@ class SoakRun:
                 verdicts.append(oracle_mod.Verdict(
                     'I1', leg['name'], False, 'no journal watermark'))
                 continue
+            if leg.get('mixed_shapes'):
+                verdicts.append(oracle_mod.check_mixed_shape_coverage(
+                    leg['name'], wm, leg['batch'], leg['mixed_shapes']))
             try:
                 query = oracle_mod.HttpQuery(leg['server'].host, leg['server'].http_port)
                 # WAL apply is async; wait until the server has applied
@@ -631,7 +670,7 @@ class SoakRun:
         return oracle_mod.summarize(
             verdicts, seed=self.opts['seed'],
             duration_min=self.opts['duration_sec'] // 60,
-            profile=self.opts.get('profile'))
+            profile=self.opts.get('profile'), rate=self.opts.get('rate'))
 
     def _journal_watermark(self, path):
         """Last complete (newline-terminated) record — mirrors AckJournal."""
@@ -698,13 +737,15 @@ class SoakRun:
             internal = self._read_latest_internal(w)
             if internal:
                 row.update(internal)
+            if w.sf_dir:
+                row['sf'] = {'disk_bytes': self.sampler.dir_size(w.sf_dir)}
             rows.append(row)
             self.samples.append(row)
         return rows
 
     def _read_latest_internal(self, workload):
-        """Read the last JSON line of a workload's stats file (pool counts, SF
-        bytes, fsn watermarks it self-reports)."""
+        """Read the last JSON line of a workload's stats file (pool counts,
+        row counters, and FSN watermarks it self-reports)."""
         path = getattr(workload, 'stats_file', None)
         if not path or not os.path.exists(path):
             return None
@@ -768,6 +809,8 @@ def _selftest():
     # either, but if present they must be sane.
     check(rss is None or rss > 0, 'sampler rss sane')
     check(fd is None or fd > 0, 'sampler fd sane')
+    check(smp.dir_size(os.path.dirname(os.path.abspath(__file__))) > 0,
+          'sampler directory size sane')
 
     # Internal-stats tail reader.
     run = SoakRun({'seed': 1, 'duration_sec': 3600, 'outdir': '/tmp'})
@@ -778,8 +821,8 @@ def _selftest():
 
     import tempfile
     with tempfile.NamedTemporaryFile('w', suffix='.jsonl', delete=False) as tf:
-        tf.write('{"pool":{"row_sender":[1,0,0]}}\n')
-        tf.write('{"pool":{"row_sender":[1,2,0]},"acked_fsn":99}\n')
+        tf.write('{"pool":{"ingress":[1,0,0]}}\n')
+        tf.write('{"pool":{"ingress":[1,2,0]},"acked_fsn":99}\n')
         stats_path = tf.name
 
     class FakeWL2:
@@ -804,6 +847,8 @@ def _main(argv):
     run.add_argument('--seed', type=int, default=1)
     run.add_argument('--duration', type=int, default=60, help='minutes')
     run.add_argument('--profile', default='full', choices=['full', 'sanitize', 'quick'])
+    run.add_argument('--rate', type=int, default=20000,
+                     help='target rows/second per ingest leg (0 is unlimited)')
     run.add_argument('--outdir', default='soak-out')
     run.add_argument('--repo', help='path to a QuestDB checkout to build+run')
     run.add_argument('--server', metavar='HOST:PORT',
@@ -839,6 +884,8 @@ def _main(argv):
         print(f'\n{len(sched)} episodes over {args.duration} min (seed {args.seed})')
         return 0
     if args.cmd == 'run':
+        if args.rate < 0:
+            ap.error('--rate must be zero or greater')
         kinds = None
         if args.kinds:
             kinds = [k.strip() for k in args.kinds.split(',') if k.strip()]
@@ -849,6 +896,7 @@ def _main(argv):
             'seed': args.seed,
             'duration_sec': args.duration * 60,
             'profile': args.profile,
+            'rate': args.rate,
             'outdir': args.outdir,
             'repo': args.repo,
             'server': args.server,

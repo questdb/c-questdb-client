@@ -1,6 +1,9 @@
 # Column Sender ACK Boundary Flush Design
 
-**Status:** historical design record — implemented with post-split names.
+**Status:** retired pre-unification design record; not a current API contract.
+See [`README.md`](README.md).
+
+This was implemented with post-split names.
 The `*_and_wait` entry points below shipped as the `direct_column_sender_*`
 FFI family (kept out of the public C headers); the pooled store-and-forward
 barrier shipped as `column_sender_wait` (the `column_sender_sync` named below
@@ -674,7 +677,7 @@ Arrow ownership is covered by the C ABI contract below.
 
 If implemented, update:
 
-- `doc/COLUMN_SENDER_FFI_ABI.md` section 13;
+- `doc/historical/COLUMN_SENDER_FFI_ABI.md` section 13;
 - `include/questdb/ingress/column_sender.h` flush/sync comments;
 - `include/questdb/ingress/column_sender.hpp` C++ overload docs;
 - Rust rustdoc in `questdb-rs/src/ingress/column_sender`;

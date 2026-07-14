@@ -106,20 +106,20 @@ TEST_CASE("pool construction throws on invalid connect string")
     CHECK_THROWS_AS(questdb::pool{"http::not-a-qwp-string;"}, questdb::error);
 }
 
-TEST_CASE("borrowed_column_sender returns conn to pool on destructor")
+TEST_CASE("borrowed_sender returns conn to pool on destructor")
 {
     auto mock = spawn_mock(1);
     questdb::pool db{conf_for(mock->addr())};
 
     {
-        auto conn = db.borrow_column_sender();
+        auto conn = db.borrow_sender();
         CHECK(static_cast<bool>(conn));
         // The background runner opens one connection; wait for it to land.
         REQUIRE(mock->wait_for_accepts(1));
     }
     // Drop returns the sender to the pool (recycled, not dropped).
     {
-        auto conn = db.borrow_column_sender();
+        auto conn = db.borrow_sender();
         CHECK(static_cast<bool>(conn));
     }
     // The re-borrow reused the recycled connection: the mock only ever
@@ -127,11 +127,11 @@ TEST_CASE("borrowed_column_sender returns conn to pool on destructor")
     CHECK(mock->accepts() == 1);
 }
 
-TEST_CASE("borrowed_column_sender move transfers ownership without double-return")
+TEST_CASE("borrowed_sender move transfers ownership without double-return")
 {
     auto mock = spawn_mock(1);
     questdb::pool db{conf_for(mock->addr())};
-    auto a = db.borrow_column_sender();
+    auto a = db.borrow_sender();
     REQUIRE(static_cast<bool>(a));
 
     auto b = std::move(a);
@@ -143,7 +143,7 @@ TEST_CASE("column_chunk flush round-trips through the mock")
 {
     auto mock = spawn_mock(1);
     questdb::pool db{conf_for(mock->addr())};
-    auto conn = db.borrow_column_sender();
+    auto conn = db.borrow_sender();
 
     qdb::column_chunk chunk{"trades"};
     int64_t qty[] = {10, 20, 30};
@@ -174,7 +174,7 @@ TEST_CASE("column_chunk symbol column round-trips through the mock")
     // in C/C++; the column-major symbol appender had no test on the C ABI.
     auto mock = spawn_mock(1);
     questdb::pool db{conf_for(mock->addr())};
-    auto conn = db.borrow_column_sender();
+    auto conn = db.borrow_sender();
 
     qdb::column_chunk chunk{"trades"};
     const int32_t codes[] = {0, 1, 0};
@@ -211,7 +211,7 @@ TEST_CASE("column_chunk symbol_i8 / symbol_i16 round-trip through the mock")
 
     auto mock = spawn_mock(1);
     questdb::pool db{conf_for(mock->addr())};
-    auto conn = db.borrow_column_sender();
+    auto conn = db.borrow_sender();
 
     SUBCASE("i8 codes")
     {
@@ -273,7 +273,7 @@ TEST_CASE("column_chunk flush_and_wait round-trips through the mock")
 {
     auto mock = spawn_acking_mock(1);
     questdb::pool db{conf_for(mock->addr())};
-    auto conn = db.borrow_column_sender();
+    auto conn = db.borrow_sender();
 
     qdb::column_chunk chunk{"trades"};
     int64_t qty[] = {10, 20, 30};
@@ -288,40 +288,50 @@ TEST_CASE("column_chunk flush_and_wait round-trips through the mock")
     conn.drop_on_return();
 }
 
-TEST_CASE("borrowed_row_sender exposes QWP/WS buffer and FSN helpers")
+TEST_CASE("one borrowed_sender sends a Buffer and a Chunk")
 {
-    // Regression guard: a pooled row sender must be able to construct the
-    // QWP/WS columnar buffer it requires (`row_sender_new_buffer`). Before
-    // this was wired, C/C++ callers had no way to build a buffer that
-    // `row_sender_flush` would accept.
-    auto mock = spawn_mock(1);
+    qm::Script ack_two_frames = {
+        qm::ActionAwaitClientFrame{0x51},
+        qm::ActionSendRaw{qm::ingress_ok_frame()},
+        qm::ActionAwaitClientFrame{0x51},
+        qm::ActionSendRaw{qm::ingress_ok_frame(1)}};
+    auto mock = std::make_unique<qm::MockServer>(
+        std::vector<qm::Script>{std::move(ack_two_frames)});
     questdb::pool db{conf_for(mock->addr())};
-    auto rs = db.borrow_row_sender();
-    CHECK(rs);
+    auto sender = db.borrow_sender();
+    CHECK(sender);
 
-    auto empty = rs.new_buffer();
-    CHECK_FALSE(rs.published_fsn().has_value());
-    CHECK_FALSE(rs.acked_fsn().has_value());
-    CHECK_FALSE(rs.flush_and_keep_and_get_fsn(empty).has_value());
+    auto empty = sender.new_buffer();
+    CHECK_FALSE(sender.published_fsn().has_value());
+    CHECK_FALSE(sender.acked_fsn().has_value());
+    CHECK_FALSE(sender.flush_and_keep_and_get_fsn(empty).has_value());
 
-    auto buf = rs.new_buffer();
+    auto buf = sender.new_buffer();
     buf.table("trades")
         .symbol("sym", "ETH-USD")
         .column("price", 2615.54)
         .at(qdb::timestamp_nanos::now());
-    const auto fsn = rs.flush_and_get_fsn(buf);
-    REQUIRE(fsn.has_value());
-    CHECK(rs.published_fsn() == fsn);
+    const auto buffer_fsn = sender.flush_and_get_fsn(buf);
+    REQUIRE(buffer_fsn.has_value());
 
-    // The mock graceful-closes after one frame, so wait() would hang.
-    rs.drop_on_return();
+    qdb::column_chunk chunk{"trades"};
+    const int64_t qty[] = {10};
+    const int64_t ts[] = {1'700'000'000'000'000'000LL};
+    chunk.column_i64("qty", qty, 1).at_nanos(ts, 1);
+    const auto chunk_fsn = sender.flush_and_get_fsn(chunk);
+    REQUIRE(chunk_fsn.has_value());
+    CHECK(*chunk_fsn > *buffer_fsn);
+    sender.wait(qdb::qwpws_ack_level::ok, std::chrono::seconds{2});
+    CHECK(sender.acked_fsn().value_or(0) >= *chunk_fsn);
+
+    sender.drop_on_return();
 }
 
-TEST_CASE("borrowed_row_sender flush_and_wait round-trips through the mock")
+TEST_CASE("borrowed_sender flush_and_wait round-trips through the mock")
 {
     auto mock = spawn_acking_mock(1);
     questdb::pool db{conf_for(mock->addr())};
-    auto rs = db.borrow_row_sender();
+    auto rs = db.borrow_sender();
 
     auto buf = rs.new_buffer();
     buf.table("trades")
@@ -337,7 +347,7 @@ TEST_CASE("borrowed_row_sender flush_and_wait round-trips through the mock")
     rs.drop_on_return();
 }
 
-TEST_CASE("row_sender_flush_and_wait: NULL buffer -> invalid_api_call")
+TEST_CASE("qwp_sender_flush_buffer_and_wait: NULL buffer -> invalid_api_call")
 {
     // Raw C-ABI guard: a NULL buffer must report invalid_api_call, not
     // dereference the pointer.
@@ -347,12 +357,12 @@ TEST_CASE("row_sender_flush_and_wait: NULL buffer -> invalid_api_call")
     questdb_db* db = questdb_db_connect(conf.c_str(), conf.size(), &err);
     REQUIRE(db != nullptr);
     REQUIRE(err == nullptr);
-    row_sender* rs = questdb_db_borrow_row_sender(db, &err);
+    qwp_sender* rs = questdb_db_borrow_sender(db, &err);
     REQUIRE(rs != nullptr);
     REQUIRE(err == nullptr);
 
     const bool ok =
-        row_sender_flush_and_wait(rs, nullptr, qwpws_ack_level_ok, &err);
+        qwp_sender_flush_buffer_and_wait(rs, nullptr, qwpws_ack_level_ok, &err);
     CHECK_FALSE(ok);
     REQUIRE(err != nullptr);
     CHECK(
@@ -360,13 +370,13 @@ TEST_CASE("row_sender_flush_and_wait: NULL buffer -> invalid_api_call")
         line_sender_error_invalid_api_call);
     line_sender_error_free(err);
 
-    questdb_db_drop_row_sender(db, rs);
+    questdb_db_drop_sender(db, rs);
     questdb_db_close(db);
 }
 
-TEST_CASE("borrowed_row_sender::new_buffer preserves max_name_len on lazy reinit")
+TEST_CASE("borrowed_sender::new_buffer preserves max_name_len on lazy reinit")
 {
-    // A buffer minted from a row sender configured with `max_name_len=16`
+    // A buffer minted from a unified sender configured with `max_name_len=16`
     // must, after a move nulls its impl, lazily re-init with that same cap —
     // not the default 127. The cap check is `name.len() > max_name_len`, so
     // the boundary is exact: 16 chars is accepted, 17 rejected. Pinning both
@@ -375,7 +385,7 @@ TEST_CASE("borrowed_row_sender::new_buffer preserves max_name_len on lazy reinit
     // already accepted one would fail with a *state* error, masking the cap.
     auto mock = spawn_mock(1);
     questdb::pool db{conf_for(mock->addr(), "max_name_len=16;")};
-    auto rs = db.borrow_row_sender();
+    auto rs = db.borrow_sender();
 
     {
         // 17 chars: rejected by the cap-16 re-init (pins cap <= 16).
@@ -403,14 +413,14 @@ TEST_CASE("borrowed_row_sender::new_buffer preserves max_name_len on lazy reinit
     rs.drop_on_return();
 }
 
-TEST_CASE("borrowed_row_sender::wait rejects a negative timeout")
+TEST_CASE("borrowed_sender::wait rejects a negative timeout")
 {
     // The negative-timeout guard throws before any FFI call, so it is safe to
     // exercise against the one-shot mock: nothing is published, so there is no
     // ack to wait for and no hang risk.
     auto mock = spawn_mock(1);
     questdb::pool db{conf_for(mock->addr())};
-    auto rs = db.borrow_row_sender();
+    auto rs = db.borrow_sender();
 
     CHECK_THROWS_AS(
         rs.wait(qdb::qwpws_ack_level::ok, std::chrono::milliseconds{-1}),
@@ -419,11 +429,11 @@ TEST_CASE("borrowed_row_sender::wait rejects a negative timeout")
     rs.drop_on_return();
 }
 
-TEST_CASE("borrowed_row_sender::wait rejects durable ACK without opt-in")
+TEST_CASE("borrowed_sender::wait rejects durable ACK without opt-in")
 {
     auto mock = spawn_mock(1);
     questdb::pool db{conf_for(mock->addr())};
-    auto rs = db.borrow_row_sender();
+    auto rs = db.borrow_sender();
 
     try
     {
@@ -444,7 +454,7 @@ TEST_CASE("flush rejects oversized table name")
 {
     auto mock = spawn_mock(1);
     questdb::pool db{conf_for(mock->addr())};
-    auto conn = db.borrow_column_sender();
+    auto conn = db.borrow_sender();
 
     std::string oversized(200, 'x');
     qdb::column_chunk chunk{oversized};
@@ -461,7 +471,7 @@ TEST_CASE("wait rejects durable ACK without opt-in and keeps the chunk")
 {
     auto mock = spawn_mock(1);
     questdb::pool db{conf_for(mock->addr())};
-    auto conn = db.borrow_column_sender();
+    auto conn = db.borrow_sender();
 
     qdb::column_chunk chunk{"trades"};
     int64_t qty[] = {10};
@@ -490,12 +500,12 @@ TEST_CASE("drop_on_return drops the conn instead of recycling it")
     questdb::pool db{conf_for(mock->addr())};
 
     {
-        auto conn = db.borrow_column_sender();
+        auto conn = db.borrow_sender();
         REQUIRE(mock->wait_for_accepts(1)); // first borrow opens conn #1
         conn.drop_on_return();              // force drop instead of recycle
     }
     {
-        auto conn = db.borrow_column_sender();
+        auto conn = db.borrow_sender();
         CHECK(static_cast<bool>(conn));
         // The slot was dropped (not recycled), so the re-borrow must open a
         // fresh conn #2 rather than reuse the first.
@@ -520,7 +530,7 @@ TEST_CASE("pool reap_idle is callable")
     auto mock = spawn_mock(2);
     questdb::pool db{conf_for(mock->addr(), "pool_idle_timeout_ms=1;")};
     {
-        auto conn = db.borrow_column_sender();
+        auto conn = db.borrow_sender();
         (void)conn;
     }
     [[maybe_unused]] size_t closed = db.reap_idle();

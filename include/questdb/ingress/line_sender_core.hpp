@@ -397,12 +397,11 @@ private:
     friend class line_sender;
     friend class line_sender_buffer;
     friend class opts;
-    friend class column_sender_view;
+    friend class sender_view;
     friend class column_chunk;
     friend class arrow_import;
     friend class ::questdb::pool;
-    friend class borrowed_column_sender;
-    friend class borrowed_row_sender;
+    friend class borrowed_sender;
 
     template <
         typename T,

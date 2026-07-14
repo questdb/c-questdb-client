@@ -1,6 +1,6 @@
 //! Soak workload driver CLI.
 //!
-//! Subcommands land incrementally per `doc/SOAK_HARNESS_DESIGN.md` §S1. Today:
+//! Workload commands for the matrix in `doc/QWP_SOAK_HARNESS.md`:
 //!
 //!   soak-workload gen-vectors [--seed N] [--worker N] [--rows N]
 //!       Emit the deterministic golden vectors (JSON lines) that the C /

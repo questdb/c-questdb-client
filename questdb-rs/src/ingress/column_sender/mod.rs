@@ -22,29 +22,30 @@
  *
  ******************************************************************************/
 
-//! Column-major sender for QWP/WebSocket.
+//! Columnar payload support for the unified QWP/WebSocket ingress sender.
 //!
-//! This is a separate API surface from [`crate::ingress::Sender`] / [`crate::ingress::Buffer`].
-//! It exists to ingest **Pandas/Polars DataFrames into QuestDB at the maximum
-//! throughput the QWP/WebSocket wire allows**. See `doc/COLUMN_SENDER_PLAN.md`
-//! for the design rationale.
+//! [`Chunk`] and Arrow batches are payload orientations accepted by the same
+//! [`crate::BorrowedSender`] that flushes row-built [`crate::ingress::Buffer`]
+//! values. The columnar path ingests Pandas/Polars DataFrames without adding
+//! per-row conversion, copies, or dispatch. See
+//! `doc/QWP_UNIFIED_SENDER_DESIGN.md` for the architecture.
 //!
 //! The user model is `DataFrame → Table`:
 //!
 //! - Open a connection pool with [`crate::QuestDb::connect`].
-//! - Borrow a sender with [`crate::QuestDb::borrow_column_sender`].
+//! - Borrow a sender with [`crate::QuestDb::borrow_sender`].
 //! - Build a [`Chunk`] of column buffers for one table, then pin a
 //!   designated timestamp on it.
 //! - Publish a batch and wait for the server to commit it in one call with
-//!   [`ColumnSender::flush_and_wait`] (the common safe shape: "send this batch
+//!   [`PooledSenderCore::flush_and_wait`] (the common safe shape: "send this batch
 //!   and return when it is committed"). To pipeline many batches for
-//!   throughput instead, publish each with [`ColumnSender::flush`] and drain
-//!   once at the end with [`ColumnSender::sync`] at the requested
+//!   throughput instead, publish each with [`PooledSenderCore::flush`] and drain
+//!   once at the end with [`PooledSenderCore::sync`] at the requested
 //!   [`crate::ingress::AckLevel`].
-//! - Drop the [`crate::BorrowedColumnSender`] to return its connection to the pool.
+//! - Drop the [`crate::BorrowedSender`] to return its connection to the pool.
 //!
 //! ```ignore
-//! let mut sender = db.borrow_column_sender()?;
+//! let mut sender = db.borrow_sender()?;
 //! let mut chunk = Chunk::new("trades");
 //! chunk.column_f64("price", &prices, None)?;
 //! chunk.at_nanos(&timestamps_ns)?;
@@ -68,10 +69,12 @@ pub use chunk::Chunk;
 #[cfg(feature = "arrow-ingress")]
 pub use chunk::ImportedArrowColumn;
 pub use numpy_wire::NumpyDtype;
-pub use sender::ColumnSender;
+#[doc(hidden)]
+pub use sender::DirectSenderCore;
+pub use sender::PooledSenderCore;
 pub use validity::Validity;
 
-/// Per-flush row-count ceiling shared across every column-sender input
+/// Per-flush row-count ceiling shared across every columnar input
 /// path (`Chunk::column_*`, `Chunk::push_numpy_deferred`,
 /// `Chunk::push_arrow_column`, `flush_arrow_batch_*`). Bounds:
 ///   * upstream allocations sized as `row_count * element_size`
@@ -109,6 +112,15 @@ const _: () = assert!(
     "column_sender bulk-copy fast paths assume a little-endian host; \
      QuestDB QWP wire encoding is little-endian."
 );
+
+pub(crate) fn qwp_frame_size_error(encoded_len: usize, max_buf_size: usize) -> crate::Error {
+    crate::error::fmt!(
+        BatchTooLarge,
+        "QWP frame ({} bytes) exceeds max_buf_size ({} bytes)",
+        encoded_len,
+        max_buf_size
+    )
+}
 
 /// Delivery classification surfaced to the C FFI so the Arrow `_and_wait`
 /// entry points can decide whether to re-export the caller's batch. Not part

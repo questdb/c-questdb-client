@@ -28,7 +28,7 @@
 //! `Chunk<'a>` stores **descriptors** — raw pointers + lengths + an
 //! optional validity bitmap — for each column. No data is copied at
 //! append time. Caller buffers must remain alive from
-//! [`ColumnSender::flush`](super::ColumnSender::flush) call setup until
+//! [`PooledSenderCore::flush`](super::PooledSenderCore::flush) call setup until
 //! the call returns; the lifetime parameter `'a` enforces this on the
 //! safe Rust API.
 //!
@@ -612,7 +612,7 @@ pub(crate) struct DesignatedTsDescriptor {
 /// inputs and stores a descriptor referencing the caller's buffer; no
 /// data is copied. The caller's buffers must outlive the chunk —
 /// concretely, they must remain alive from each column append through
-/// the next [`ColumnSender::flush`](super::ColumnSender::flush) call.
+/// the next [`PooledSenderCore::flush`](super::PooledSenderCore::flush) call.
 pub struct Chunk<'a> {
     pub(crate) table: String,
     pub(crate) row_count: Option<usize>,
@@ -1498,7 +1498,7 @@ impl<'a> Chunk<'a> {
 
     /// Append an Arrow column to the chunk. The column's QWP wire type
     /// is derived from `field` (Arrow datatype + extension metadata)
-    /// via the same classifier used by [`ColumnSender::flush_arrow_batch_at_column`].
+    /// via the same classifier used by [`PooledSenderCore::flush_arrow_batch_at_column`].
     /// `arr.len()` participates in the chunk's row-count lock; validity
     /// is read from `arr.nulls()` at flush time.
     ///
@@ -1507,7 +1507,7 @@ impl<'a> Chunk<'a> {
     /// schema, regardless of how the upstream Arrow producer named the
     /// column).
     ///
-    /// [`ColumnSender::flush_arrow_batch_at_column`]: super::ColumnSender::flush_arrow_batch_at_column
+    /// [`PooledSenderCore::flush_arrow_batch_at_column`]: super::PooledSenderCore::flush_arrow_batch_at_column
     #[cfg(feature = "arrow-ingress")]
     pub fn push_arrow_column(
         &mut self,

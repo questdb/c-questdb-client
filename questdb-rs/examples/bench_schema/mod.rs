@@ -1,5 +1,6 @@
 //! Shared scenario definitions for the QWP DataFrame benchmark examples
-//! (QWP_DATAFRAME_BENCH_PLAN.md §3.1 / §8). Both `qwp_ingress_polars` and
+//! (doc/historical/QWP_DATAFRAME_BENCH_PLAN.md §3.1 / §8). Both
+//! `qwp_ingress_polars` and
 //! `qwp_egress_polars` build their data from these helpers so the Rust
 //! `rust-polars` numbers compare against the Python `py-pandas` harness
 //! (`py-questdb-client/test/benchmark_pandas_columnar.py`).

@@ -66,10 +66,10 @@ let back = db
 ```
 
 Besides `flush_polars_dataframe` and `flush_arrow_batch`, the pool hands out
-`borrow_column_sender()` (columnar streaming), `borrow_row_sender()` (row-by-row
-`Buffer` API) and `borrow_reader()` (SQL queries); handles return to the pool on
-drop. `Reader::from_conf` runs queries without a pool, yielding native columnar
-batches, Arrow `RecordBatch`es or Polars `DataFrame`s.
+`borrow_sender()` for both row-built `Buffer` payloads and columnar `Chunk` /
+Arrow payloads, plus `borrow_reader()` for SQL queries. Handles return to the
+pool on drop. `Reader::from_conf` runs queries without a pool, yielding native
+columnar batches, Arrow `RecordBatch`es or Polars `DataFrame`s.
 
 The C and C++ APIs expose the pool via
 [`questdb/ingress/column_sender.h`](include/questdb/ingress/column_sender.h)
@@ -111,6 +111,7 @@ Read the language-specific guides:
 
 * [Data quality and threading considerations](doc/CONSIDERATIONS.md)
 * [Authentication and TLS encryption](doc/SECURITY.md)
+* [QWP ingress and egress soak harness](doc/QWP_SOAK_HARNESS.md)
 
 ## Community
 

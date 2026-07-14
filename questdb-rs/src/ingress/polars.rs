@@ -1,7 +1,7 @@
 //! Polars sub-feature: convert a [`DataFrame`] into Arrow
 //! [`RecordBatch`]es for consumption by
-//! [`ColumnSender::flush_arrow_batch_at_column`][crate::ingress::column_sender::ColumnSender::flush_arrow_batch_at_column]
-//! (or [`ColumnSender::flush_arrow_batch_at_now`][crate::ingress::column_sender::ColumnSender::flush_arrow_batch_at_now]
+//! [`PooledSenderCore::flush_arrow_batch_at_column`][crate::ingress::column_sender::PooledSenderCore::flush_arrow_batch_at_column]
+//! (or [`PooledSenderCore::flush_arrow_batch_at_now`][crate::ingress::column_sender::PooledSenderCore::flush_arrow_batch_at_now]
 //! when the server should assign timestamps).
 //!
 //! [`dataframe_to_batches`] is the primary entry point. It returns an
@@ -348,7 +348,7 @@ impl<'a> PolarsIngestOptions<'a> {
 
     /// Source the per-row designated timestamp from `column` (a `Timestamp(_)`
     /// column of the frame) instead of letting the server stamp each row on
-    /// arrival. Mirrors `ColumnSender::flush_arrow_batch_at_column`.
+    /// arrival. Mirrors `PooledSenderCore::flush_arrow_batch_at_column`.
     #[must_use]
     pub fn timestamp_column(mut self, column: crate::ingress::ColumnName<'a>) -> Self {
         self.timestamp_column = Some(column);
@@ -357,7 +357,7 @@ impl<'a> PolarsIngestOptions<'a> {
 
     /// Per-column wire-type hints, applied to every batch sliced out of the
     /// frame. Same meaning as the `overrides` argument of
-    /// `ColumnSender::flush_arrow_batch_at_now` — the intended path for Polars frames
+    /// `PooledSenderCore::flush_arrow_batch_at_now` — the intended path for Polars frames
     /// built without pyarrow, whose Arrow schema carries no `questdb.*` field
     /// metadata.
     #[must_use]

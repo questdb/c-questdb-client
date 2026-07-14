@@ -24,9 +24,8 @@
 
 //! Column-major sender hot-path bench (`questdb-rs/benches/column_sender.rs`).
 //!
-//! Anchors the perf claims in `doc/COLUMN_SENDER_PLAN.md` §2.1
-//! ("encode is a header + extend_from_slice per column") and §2.2
-//! ("no-null = memcpy; nullable = invert+gather"). Each bench reports
+//! Anchors the encoder floor tracked in
+//! `doc/QWP_UNIFIED_SENDER_M0_BASELINE.md`. Each bench reports
 //! throughput in rows/s and bytes/s so a regression shows up as either
 //! a row-rate or bandwidth drop.
 //!
@@ -37,7 +36,7 @@
 //!    [`Chunk::symbol_i32`] in both no-null and nullable shapes.
 //!    Baseline: a raw `extend_from_slice` from the caller's typed
 //!    buffer into a fresh `Vec<u8>`, the absolute floor any
-//!    column-sender hot path is competing with.
+//!    columnar payload hot path is competing with.
 //!
 //! 2. **Symbol bulk-intern** — compares the column path
 //!    ([`Chunk::symbol_i32`] + flush-time interning) with a
