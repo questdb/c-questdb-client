@@ -31,6 +31,9 @@ dataframe = ["questdb/polars-ingress", "dep:polars"]
 questdb = { package = "questdb-rs", path = "../../../questdb-rs", features = ["sync-sender-qwp-ws", "sync-reader-qwp-ws"] }
 # Version range unified with questdb-rs so the shared DataFrame type matches.
 polars = { version = ">=0.52, <0.55", optional = true, default-features = false, features = ["dtype-datetime"] }
+# SIGTERM/SIGINT handling so the orchestrator's graceful stop lets a leg finish
+# its loop and release its pooled sender/reader before exiting (I4 pool drain).
+signal-hook = { version = "0.3", default-features = false }
 
 [profile.release]
 # Soak legs run for an hour; favour steady throughput and debuggable panics

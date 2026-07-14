@@ -100,7 +100,7 @@ pub fn run_dataframe_leg(cfg: &LegConfig) -> LegResult {
     let mut stuck: u32 = 0;
     const STUCK_LIMIT: u32 = 500;
 
-    while start.elapsed() < cfg.duration {
+    while !crate::stop_requested() && start.elapsed() < cfg.duration {
         let batch_start = seq;
         let rows = cfg.batch as usize;
         let df = build_df(cfg, batch_start, rows)?;

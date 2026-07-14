@@ -105,7 +105,7 @@ fn run_row_leg(cfg: &LegConfig) -> LegResult {
     let mut row = db.borrow_row_sender()?;
     let mut buf = row.new_buffer();
 
-    while start.elapsed() < cfg.duration {
+    while !crate::stop_requested() && start.elapsed() < cfg.duration {
         let batch_start = seq;
         // `flush` (success) and a fresh re-borrow (failure) both leave `buf`
         // empty at the top of each batch, so no explicit clear is needed.
@@ -167,13 +167,13 @@ fn run_row_leg(cfg: &LegConfig) -> LegResult {
         }
     }
 
-    // Final drain + quiesce sample so the oracle sees the pool return to
-    // baseline (I4) and the final watermark (I1).
-    let _ = row.wait(AckLevel::Ok, Duration::from_secs(60));
+    // Release the sender before the final quiesce sample so the oracle sees the
+    // pool drained (I4). No blocking final wait here: it does not advance the
+    // journal (I1 reads that), and a graceful-stop SIGTERM landing in it would
+    // kill the leg before the drop.
     let rows_acked = journal.watermark().map_or(0, |w| w + 1);
     let published = row.published_fsn().ok().flatten();
     let acked = row.acked_fsn().ok().flatten();
-    // Release the sender so the final quiesce sample sees the pool drained (I4).
     drop(row);
     stats.emit(&db, rows_sent, rows_acked, published, acked)?;
     Ok(())

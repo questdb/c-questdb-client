@@ -127,6 +127,7 @@ fn cmd_run(args: &[String]) -> ExitCode {
         batch: batch.max(1),
     };
 
+    soak_workload::install_stop_handler();
     match legs::run_leg(&cfg) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {

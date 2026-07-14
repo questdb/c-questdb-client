@@ -395,7 +395,7 @@ pub fn run_column_leg(cfg: &LegConfig) -> LegResult {
     let mut batch = Batch::default();
     batch.reset();
 
-    while start.elapsed() < cfg.duration {
+    while !crate::stop_requested() && start.elapsed() < cfg.duration {
         let batch_start = seq;
         batch.reset();
         for _ in 0..cfg.batch {

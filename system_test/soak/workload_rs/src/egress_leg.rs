@@ -90,7 +90,7 @@ pub fn run_egress_leg(cfg: &LegConfig) -> LegResult {
 
     let mut reader = db.borrow_reader()?;
 
-    while start.elapsed() < cfg.duration {
+    while !crate::stop_requested() && start.elapsed() < cfg.duration {
         match scan_seq(&mut reader, &cfg.table, cfg.worker_id) {
             Ok((count, min, max)) => {
                 queries += 1;
