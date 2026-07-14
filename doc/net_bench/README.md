@@ -96,3 +96,10 @@ cd doc/net_bench
   on shaped/RTT cells. Egress materialize checksums must be compared as
   parsed float64 values, not strings (clients format the number
   differently).
+- Row-bench data generation: both row benches (java-row, rust-row) pull
+  symbol labels from pools precomputed outside the timed region; the timed
+  loop does O(1) lookups and scalar arithmetic only, matching the columnar
+  benches' prebuilt-data convention. Row-flush numbers from earlier runs
+  (p1-p5 results) include per-row `String.format`/`format!` label cost
+  (~45-50% of a pass) and are NOT comparable with numbers produced after
+  this change.

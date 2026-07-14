@@ -21,11 +21,11 @@ QNB_UBUNTU_SSM_PARAM="/aws/service/canonical/ubuntu/server/24.04/stable/current/
 QNB_QUESTDB_COMMIT="${QNB_QUESTDB_COMMIT:-5b2efe5e58fbb77ef25f87a7aa604365c9c1eb55}"
 # c pin = sm_qwp_bench head with the Rust bench twins (rust-row ingress,
 # materialize egress); the env.sh bump commit itself is laptop-side only.
-QNB_C_CLIENT_COMMIT="${QNB_C_CLIENT_COMMIT:-5ae8446a57b8ca755aa9cd69d53f980afade4233}"
+QNB_C_CLIENT_COMMIT="${QNB_C_CLIENT_COMMIT:-f9852978f34758318aaf5089c88a1c931013c579}"
 QNB_PY_CLIENT_COMMIT="${QNB_PY_CLIENT_COMMIT:-7334503e84e2d149f9d6550dd023ef484d2edc1e}"
 # Head of our sm_qwp_bench branch of questdb/java-questdb-client (adds the
 # qwp-bench module). Pin = pushed head of that branch; bump when it moves.
-QNB_JAVA_CLIENT_COMMIT="${QNB_JAVA_CLIENT_COMMIT:-28ca61ccde033d0b14a79130f63ed0e6eb05bd92}"
+QNB_JAVA_CLIENT_COMMIT="${QNB_JAVA_CLIENT_COMMIT:-5be55759da6f643b332cd7819dedc2577a8af480}"
 
 qnb_account_id() { aws sts get-caller-identity --query Account --output text; }
 
