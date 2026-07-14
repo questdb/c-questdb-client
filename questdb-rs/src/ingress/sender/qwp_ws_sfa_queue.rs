@@ -934,17 +934,28 @@ impl SfaProducer {
                 reason: "producer active segment is not the engine active segment",
             });
         }
-        let Some(mut new_active) = state.hot_spare.take() else {
-            return Err(self.engine.storage_backpressure_error(&state).into());
+        let new_active = match state.hot_spare.take() {
+            Some(mut new_active) => {
+                if let Some(shared) = Arc::get_mut(&mut new_active) {
+                    shared.rebase_empty(self.next_fsn)?;
+                } else {
+                    state.hot_spare = Some(new_active);
+                    return Err(SfaQueueError::CorruptSegments {
+                        reason: "hot spare segment is shared before promotion",
+                    });
+                }
+                new_active
+            }
+            // No prepared spare. The runner's maintenance step is the normal
+            // supplier, but it runs only between `drive_step` iterations — a
+            // runner parked in a blocking socket send (peer zero-window) never
+            // reaches it, and waiting on the backpressure notifier would starve
+            // the appender until `sf_append_deadline` with the byte budget
+            // still unused. Store-and-forward must keep absorbing appends up
+            // to `max_bytes` through exactly that kind of outage, so allocate
+            // the replacement segment inline instead.
+            None => self.engine.allocate_segment_inline(&mut state, self.next_fsn)?,
         };
-        if let Some(shared) = Arc::get_mut(&mut new_active) {
-            shared.rebase_empty(self.next_fsn)?;
-        } else {
-            state.hot_spare = Some(new_active);
-            return Err(SfaQueueError::CorruptSegments {
-                reason: "hot spare segment is shared before promotion",
-            });
-        }
 
         let old_active = state.active.replace(Arc::clone(&new_active)).unwrap();
         state.sealed_segments.push_back(old_active);
@@ -1212,6 +1223,49 @@ impl SfaEngine {
                 max_total_bytes: self.max_bytes as u64,
             }
         }
+    }
+
+    /// Creates a fresh segment on the appender thread when rotation finds no
+    /// prepared hot spare, charging it to the byte budget under the state
+    /// lock. Mirrors the `CreateHotSpare` maintenance step (same path /
+    /// generation / budget bookkeeping); the runner's maintenance remains an
+    /// optimization that pre-warms the spare, not a liveness requirement for
+    /// appends. Fails with the storage backpressure error when creation is
+    /// not allowed or the budget is exhausted, and propagates segment-creation
+    /// I/O errors (the runner's maintenance path treats those as terminal
+    /// storage errors too).
+    fn allocate_segment_inline(
+        &self,
+        state: &mut SfaEngineState,
+        base_seq: u64,
+    ) -> Result<Arc<SfaSharedSegment>, SfaQueueError> {
+        if !self.allow_segment_creation
+            || !can_allocate_segment(
+                state.allocated_segment_bytes,
+                self.segment_size_bytes,
+                self.max_bytes,
+            )
+        {
+            return Err(self.storage_backpressure_error(state).into());
+        }
+        let segment = match self.slot_dir.as_deref() {
+            Some(slot_dir) => {
+                let path = next_segment_path(slot_dir, &mut state.next_generation)?;
+                SfaSegment::create_new(&path, base_seq, self.segment_size_bytes, unix_time_micros())?
+            }
+            None => {
+                state.next_generation = state
+                    .next_generation
+                    .checked_add(1)
+                    .ok_or(QueueError::SequenceOverflow)?;
+                SfaSegment::create_memory(base_seq, self.segment_size_bytes, unix_time_micros())?
+            }
+        };
+        state.allocated_segment_bytes = state
+            .allocated_segment_bytes
+            .checked_add(self.segment_size_bytes)
+            .ok_or(QueueError::SequenceOverflow)?;
+        Ok(Arc::new(SfaSharedSegment::new(segment)))
     }
 
     fn take_one_acked_sealed_segment(
@@ -2163,15 +2217,12 @@ mod tests {
         assert_eq!(queue.allocated_segment_bytes(), 48);
         assert!(!queue.hot_spare_installed());
 
-        assert!(matches!(
-            queue.try_submit(b"uvwxyz1234"),
-            Err(SfaQueueError::Queue(
-                QueueError::StorageSpareNotReady { .. }
-            ))
-        ));
-        assert!(queue.maintain_storage().unwrap());
+        // Rotation self-provisions under the freed budget; no maintenance
+        // step is needed for the appender to make progress.
         let third = queue.try_submit(b"uvwxyz1234").unwrap();
         assert_eq!(third.fsn, 2);
+        assert_eq!(queue.allocated_segment_bytes(), 96);
+        assert!(!queue.hot_spare_installed());
     }
 
     #[test]
@@ -3100,6 +3151,64 @@ mod tests {
     }
 
     #[test]
+    fn rotation_allocates_inline_when_hot_spare_missing() {
+        // Budget for 4 segments; active + hot spare are pre-created. After the
+        // spare is consumed by the first rotation, further rotations must
+        // self-provision segments inline — without any maintenance running
+        // (the runner may be parked in a blocking socket send) — until the
+        // byte budget is exhausted.
+        let mut queue = SfaFrameQueue::open_memory(memory_options(48, 192, 16)).unwrap();
+
+        assert_eq!(queue.try_submit(b"abcdefghij").unwrap().fsn, 0);
+        assert_eq!(queue.try_submit(b"klmnopqrst").unwrap().fsn, 1);
+        assert!(!queue.hot_spare_installed());
+
+        assert_eq!(queue.try_submit(b"uvwxyz1234").unwrap().fsn, 2);
+        assert_eq!(queue.allocated_segment_bytes(), 144);
+        assert_eq!(queue.try_submit(b"5678901234").unwrap().fsn, 3);
+        assert_eq!(queue.allocated_segment_bytes(), 192);
+        assert!(matches!(
+            queue.try_submit(b"abcdefghij"),
+            Err(SfaQueueError::Queue(QueueError::StorageSegmentCapFull {
+                segment_size_bytes: 48,
+                allocated_segment_bytes: 192,
+                max_total_bytes: 192,
+            }))
+        ));
+        assert_eq!(
+            queue.payload_vec_for_fsn(2).as_deref(),
+            Some(&b"uvwxyz1234"[..])
+        );
+        assert_eq!(
+            queue.payload_vec_for_fsn(3).as_deref(),
+            Some(&b"5678901234"[..])
+        );
+    }
+
+    #[test]
+    fn detached_producer_rotation_survives_stalled_runner_maintenance() {
+        let dir = TempDir::new().unwrap();
+        let mut queue = SfaFrameQueue::open(options_with(&dir, 38, 152, 8)).unwrap();
+        let mut producer = queue.take_producer().unwrap();
+
+        assert_eq!(producer.try_submit(b"one").unwrap().fsn, 0);
+        assert_eq!(producer.try_submit(b"two").unwrap().fsn, 1);
+        // No maintenance between submits (runner parked in a blocking send):
+        // the detached producer must provision segment files inline up to the
+        // byte budget, and every stall-window frame stays replayable.
+        assert_eq!(producer.try_submit(b"tri").unwrap().fsn, 2);
+        assert_eq!(sfa_file_count(dir.path()), 3);
+        assert_eq!(producer.try_submit(b"for").unwrap().fsn, 3);
+        assert_eq!(sfa_file_count(dir.path()), 4);
+        assert!(matches!(
+            producer.try_submit(b"fiv"),
+            Err(SfaQueueError::Queue(QueueError::StorageSegmentCapFull { .. }))
+        ));
+        assert_eq!(queue.payload_vec_for_fsn(2).as_deref(), Some(&b"tri"[..]));
+        assert_eq!(queue.payload_vec_for_fsn(3).as_deref(), Some(&b"for"[..]));
+    }
+
+    #[test]
     fn progress_maintains_missing_hot_spare_when_capacity_allows() {
         let dir = TempDir::new().unwrap();
         let mut queue = SfaFrameQueue::open(options_with(&dir, 38, 114, 4)).unwrap();
@@ -3107,18 +3216,16 @@ mod tests {
         queue.try_submit(b"first").unwrap();
         queue.try_submit(b"second").unwrap();
         assert_eq!(sfa_file_count(dir.path()), 2);
-        assert!(matches!(
-            queue.try_submit(b"third"),
-            Err(SfaQueueError::Queue(QueueError::StorageSpareNotReady {
-                segment_size_bytes: 38,
-                allocated_segment_bytes: 76,
-                max_total_bytes: 114,
-            }))
-        ));
-        assert_eq!(sfa_file_count(dir.path()), 2);
+        assert!(!queue.hot_spare_installed());
 
         assert!(queue.maintain_storage().unwrap());
+        assert!(queue.hot_spare_installed());
+        assert_eq!(sfa_file_count(dir.path()), 3);
+
+        // Rotation prefers the prepared spare: no extra segment is created.
         assert_eq!(queue.try_submit(b"third").unwrap(), QwpReceipt { fsn: 2 });
+        assert_eq!(sfa_file_count(dir.path()), 3);
+        assert!(!queue.hot_spare_installed());
     }
 
     #[test]
@@ -3129,16 +3236,10 @@ mod tests {
 
         assert_eq!(producer.try_submit(b"one").unwrap(), QwpReceipt { fsn: 0 });
         assert_eq!(producer.try_submit(b"two").unwrap(), QwpReceipt { fsn: 1 });
-        assert!(matches!(
-            producer.try_submit(b"tri"),
-            Err(SfaQueueError::Queue(
-                QueueError::StorageSpareNotReady { .. }
-            ))
-        ));
-        assert_eq!(sfa_file_count(dir.path()), 2);
-
-        assert!(queue.maintain_storage().unwrap());
+        // The detached producer self-provisions its rotation segment when no
+        // spare is prepared (no maintenance has run).
         assert_eq!(producer.try_submit(b"tri").unwrap(), QwpReceipt { fsn: 2 });
+        assert_eq!(sfa_file_count(dir.path()), 3);
         assert_eq!(queue.published_fsn(), Some(2));
         assert_eq!(queue.payload_vec_for_fsn(0).as_deref(), Some(&b"one"[..]));
         assert_eq!(queue.payload_vec_for_fsn(1).as_deref(), Some(&b"two"[..]));
@@ -3285,15 +3386,10 @@ mod tests {
                 SfaRecoveryDiagnostic::CleanupFailed { path, .. } if path == &first_path
             )
         }));
-        assert!(matches!(
-            queue.try_submit(b"third"),
-            Err(SfaQueueError::Queue(QueueError::StorageSpareNotReady {
-                allocated_segment_bytes: 38,
-                ..
-            }))
-        ));
-        assert!(queue.maintain_storage().unwrap());
+        // The failed unlink freed logical capacity, so rotation
+        // self-provisions a new segment under the budget.
         assert_eq!(queue.try_submit(b"third").unwrap(), QwpReceipt { fsn: 2 });
+        assert_eq!(queue.allocated_segment_bytes(), 76);
     }
 
     #[test]
