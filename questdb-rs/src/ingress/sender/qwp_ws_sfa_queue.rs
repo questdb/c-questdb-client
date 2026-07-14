@@ -1663,6 +1663,10 @@ fn recover_segments(options: &SfaQueueOptions) -> Result<RecoveredState, SfaQueu
 
         let scan = match scan_file_metadata(&path) {
             Ok(scan) => scan,
+            // An IO error means the segment could not be read, not that it is
+            // absent — skipping it would silently drop a committed tail the
+            // between-segments contiguity check cannot detect as missing.
+            Err(err @ SfaSegmentError::Io(_)) => return Err(err.into()),
             Err(err) => {
                 diagnostics.push(SfaRecoveryDiagnostic::SkippedSegment {
                     path: path.clone(),
@@ -2488,6 +2492,21 @@ mod tests {
         ));
         assert!(bad_middle_path.exists());
         assert!(!corrupt_segment_path(&bad_middle_path).exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn recovery_propagates_io_error_instead_of_dropping_segment() {
+        let dir = TempDir::new().unwrap();
+        write_segment_with_one_frame(&initial_segment_path(dir.path()), 0, b"first");
+        let unreadable = spare_segment_path(dir.path(), 7);
+        std::os::unix::fs::symlink("no-such-target.sfa", &unreadable).unwrap();
+
+        let err = SfaFrameQueue::open(options(&dir)).unwrap_err();
+        assert!(matches!(
+            err,
+            SfaQueueError::Segment(SfaSegmentError::Io(_))
+        ));
     }
 
     #[test]
