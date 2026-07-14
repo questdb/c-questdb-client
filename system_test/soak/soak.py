@@ -120,8 +120,33 @@ class EpisodeSchedule:
 
 # ---------------------------------------------------------------------------
 # Sampler — per-pid RSS + FD. Linux /proc first (design is Linux-first),
-# psutil if available, else best-effort.
+# psutil if available, else `ps`/`lsof` so a macOS dev box can still run the
+# I4 resource checks locally (without a sampler, I4 silently collects nothing).
 # ---------------------------------------------------------------------------
+
+def _ps_rss_bytes(pid):
+    """RSS via `ps` (KiB) — fallback when neither psutil nor /proc is present.
+    Returns None for a dead pid (ps prints nothing)."""
+    try:
+        out = subprocess.run(['ps', '-o', 'rss=', '-p', str(pid)],
+                             capture_output=True, text=True, timeout=5)
+    except Exception:  # noqa: BLE001
+        return None
+    val = out.stdout.strip()
+    return int(val) * 1024 if val.isdigit() else None
+
+
+def _lsof_fd_count(pid):
+    """Open-fd count via `lsof` — same fallback niche. Best-effort: None if
+    lsof is unavailable or the pid is gone."""
+    try:
+        out = subprocess.run(['lsof', '-p', str(pid)],
+                             capture_output=True, text=True, timeout=10)
+    except Exception:  # noqa: BLE001
+        return None
+    lines = [ln for ln in out.stdout.splitlines() if ln]
+    return max(len(lines) - 1, 0) if lines else None  # drop the header row
+
 
 class Sampler:
     def __init__(self):
@@ -144,8 +169,8 @@ class Sampler:
                     if line.startswith('VmRSS:'):
                         return int(line.split()[1]) * 1024
         except OSError:
-            return None
-        return None
+            pass
+        return _ps_rss_bytes(pid)
 
     def fd_count(self, pid):
         if self._psutil:
@@ -156,7 +181,8 @@ class Sampler:
         try:
             return len(os.listdir(f'/proc/{pid}/fd'))
         except OSError:
-            return None
+            pass
+        return _lsof_fd_count(pid)
 
     def sample(self, pid):
         return {'rss_bytes': self.rss_bytes(pid), 'fd_count': self.fd_count(pid)}
@@ -549,7 +575,18 @@ class SoakRun:
     def _reconcile(self, oracle_mod):
         verdicts = []
         # I4 boundedness over all samples.
-        verdicts.extend(oracle_mod.analyze_bounds(self.samples))
+        bounds = oracle_mod.analyze_bounds(self.samples)
+        if not bounds:
+            # No I4 verdicts means no usable RSS samples were collected (no
+            # psutil / procfs / ps on the box). Fail loudly instead of letting
+            # the run report a green summary that silently skipped every
+            # resource, pool and leak bound.
+            verdicts.append(oracle_mod.Verdict(
+                'I4', 'resource-sampling', False,
+                {'reason': 'no RSS samples collected; I4 resource/pool/leak '
+                           'bounds were not evaluated',
+                 'samples': len(self.samples)}))
+        verdicts.extend(bounds)
         wl_by_name = {w.leg: w for w in self.workloads}
         for leg in self.legs:
             # Egress legs are read-only: no journal to reconcile. Their own
@@ -649,8 +686,15 @@ class SoakRun:
         for w in self.workloads:
             if not w.is_alive():
                 continue
+            metrics = self.sampler.sample(w.pid)
+            if metrics.get('rss_bytes') is None:
+                # The process exited between the is_alive() check and the
+                # sample (a leg finishing, or one killed mid-drain), so this is
+                # a dead-pid read, not a measurement. Recording it would poison
+                # the I4 bounds analysis (None / KiB crashes the reconcile).
+                continue
             row = {'t': now, 'leg': w.leg, 'pid': w.pid}
-            row.update(self.sampler.sample(w.pid))
+            row.update(metrics)
             internal = self._read_latest_internal(w)
             if internal:
                 row.update(internal)

@@ -120,6 +120,11 @@ def analyze_bounds(samples, cfg=None):
     cfg = cfg or BoundsConfig()
     by_leg = {}
     for s in samples:
+        # A dead-pid read (rss unavailable) is not a measurement; keeping it
+        # would crash the numeric bounds below (None / KiB). Drop it so one
+        # unlucky sample can't take down the whole reconcile.
+        if s.get('rss_bytes') is None:
+            continue
         by_leg.setdefault(s.get('leg', '?'), []).append(s)
 
     verdicts = []
@@ -202,7 +207,10 @@ def _rss_verdict(leg, warmup, steady, cfg):
 
 
 def _fd_verdict(leg, steady, cfg):
-    fds = [s['fd_count'] for s in steady]
+    fds = [s['fd_count'] for s in steady if s.get('fd_count') is not None]
+    if len(fds) < 3:
+        return Verdict('I4', f'{leg}:fd', True,
+                       f'inconclusive: only {len(fds)} fd samples')
     baseline = min(fds)
     final = fds[-1]
     peak = max(fds)
@@ -270,35 +278,46 @@ SEQ_COL = 'c_seq'
 
 
 def check_completeness(query, table, worker, watermark):
-    """I1: every seq in [0, watermark] present, no gaps."""
-    sql = (f'SELECT count(), count_distinct({SEQ_COL}), '
-           f'max({SEQ_COL}), min({SEQ_COL}) '
+    """I1: every seq in [0, watermark] present, no gaps.
+
+    Uses count()/max/min — streaming O(1) aggregates. count_distinct(c_seq)
+    over a 100M+-row table needs a multi-GB hash set and the server refuses it
+    ("too large allocation requested"). These are DEDUP tables fed by a
+    deterministic c_seq->timestamp generator, so each c_seq maps to exactly one
+    row: count() == the distinct count. watermark+1 rows within [0,watermark]
+    with min 0 and max watermark can only be the full sequence, no gaps."""
+    sql = (f'SELECT count(), max({SEQ_COL}), min({SEQ_COL}) '
            f'FROM {table} WHERE {WORKER_COL}={worker} '
            f'AND {SEQ_COL} <= {watermark}')
-    total, distinct, mx, mn = query(sql)[0]
+    total, mx, mn = query(sql)[0]
     expected = watermark + 1
-    gaps = expected - (distinct or 0)
-    ok = (distinct == expected and mx == watermark and (mn == 0))
+    ok = (total == expected and mx == watermark and (mn == 0))
     return Verdict('I1', f'{table}:w{worker}', ok, {
-        'watermark': watermark, 'expected_distinct': expected,
-        'distinct': distinct, 'total': total, 'max': mx, 'min': mn,
-        'missing': gaps,
+        'watermark': watermark, 'expected': expected,
+        'total': total, 'max': mx, 'min': mn,
+        'missing': expected - (total or 0),
     })
 
 
 def check_duplication(query, table, worker, watermark, replay_budget,
                       is_control=False, dedup=False):
-    """I2: duplicates within budget (0 for control legs / dedup tables)."""
-    sql = (f'SELECT count(), count_distinct({SEQ_COL}) '
+    """I2: duplicates within budget (0 for control legs / dedup tables).
+
+    On these DEDUP tables each c_seq maps to one row, so the row count can never
+    exceed the sequence length unless a duplicate slipped past dedup — surplus
+    over ``watermark+1`` is the observable duplication. Avoids count_distinct
+    (multi-GB on a huge table); c_seq<=watermark is a streaming count()."""
+    sql = (f'SELECT count() '
            f'FROM {table} WHERE {WORKER_COL}={worker} '
            f'AND {SEQ_COL} <= {watermark}')
-    total, distinct = query(sql)[0]
-    dups = total - distinct
+    (total,) = query(sql)[0]
+    expected = watermark + 1
+    dups = max(0, (total or 0) - expected)
     budget = 0 if (is_control or dedup) else replay_budget
     ok = dups <= budget
     return Verdict('I2', f'{table}:w{worker}', ok, {
         'duplicates': dups, 'budget': budget,
-        'total': total, 'distinct': distinct,
+        'total': total, 'expected': expected,
         'is_control': is_control, 'dedup': dedup,
     })
 
@@ -429,15 +448,27 @@ def reconcile_values(query, table, seed, worker, sample_seqs,
                        {'checked': 0, 'note': 'no verifiable columns'})
     select_list = ', '.join(projection.get(c, c) for c in cols)
 
+    # Fetch all sampled rows keyed by c_seq in a few IN() scans rather than one
+    # query per seq. c_seq is not indexed, so a per-seq point lookup is a full
+    # table scan; 1000 of them over a 100M+-row table is 1000 scans. Chunk the
+    # IN list so the query URL stays small.
+    seqs = list(sample_seqs)
+    by_seq = {}
+    chunk = 200
+    for i in range(0, len(seqs), chunk):
+        in_list = ','.join(str(s) for s in seqs[i:i + chunk])
+        rows = query(f'SELECT {SEQ_COL}, {select_list} FROM {table} '
+                     f'WHERE {WORKER_COL}={worker} AND {SEQ_COL} IN ({in_list})')
+        for r in rows:
+            by_seq[r[0]] = r[1:]
+
     mismatches = []
     checked = 0
-    for seq in sample_seqs:
-        rows = query(f'SELECT {select_list} FROM {table} '
-                     f'WHERE {WORKER_COL}={worker} AND {SEQ_COL}={seq}')
-        if len(rows) != 1:
-            mismatches.append({'seq': seq, 'reason': f'{len(rows)} rows'})
+    for seq in seqs:
+        row = by_seq.get(seq)
+        if row is None:
+            mismatches.append({'seq': seq, 'reason': 'missing'})
             continue
-        row = rows[0]
         for ty, actual, col in zip(check_types, row, cols):
             exp = gen.gen_expected(seed, worker, seq, ty)
             ok, reason = compare_value(ty, exp, actual)
@@ -596,26 +627,28 @@ def _selftest():
               if v.name.endswith(':inflight')),
           'I4 bounded in-flight passes')
 
-    # I1: fake query — complete vs gapped. Completeness selects 4 aggregates
-    # (it has `max(`); duplication selects 2.
-    def fake_counts(total, distinct, mx, mn):
+    # I1/I2: fake query. Completeness selects count()/max/min (has `max(`);
+    # duplication selects count() only. No count_distinct (multi-GB on a huge
+    # table); these are DEDUP tables so count() == the distinct count.
+    def fake_stats(total, mx, mn):
         def q(sql):
             if 'max(' in sql:
-                return [[total, distinct, mx, mn]]
-            return [[total, distinct]]
+                return [[total, mx, mn]]
+            return [[total]]
         return q
 
-    v1_ok = check_completeness(fake_counts(1000, 1000, 999, 0), 't', 0, 999)
+    v1_ok = check_completeness(fake_stats(1000, 999, 0), 't', 0, 999)
     check(v1_ok.passed, 'I1 complete passes')
-    v1_gap = check_completeness(fake_counts(999, 999, 999, 0), 't', 0, 999)
+    v1_gap = check_completeness(fake_stats(999, 999, 0), 't', 0, 999)
     check(not v1_gap.passed, 'I1 gap fails (missing seq)')
 
-    # I2: within budget vs over; control must be exact.
-    v2_ok = check_duplication(fake_counts(1010, 1000, 999, 0), 't', 0, 999, replay_budget=64)
+    # I2: surplus over the sequence length is the duplication; within budget vs
+    # over; control / dedup must be exact (budget 0).
+    v2_ok = check_duplication(fake_stats(1010, 999, 0), 't', 0, 999, replay_budget=64)
     check(v2_ok.passed, 'I2 within budget passes')
-    v2_over = check_duplication(fake_counts(1100, 1000, 999, 0), 't', 0, 999, replay_budget=64)
+    v2_over = check_duplication(fake_stats(1100, 999, 0), 't', 0, 999, replay_budget=64)
     check(not v2_over.passed, 'I2 over budget fails')
-    v2_ctl = check_duplication(fake_counts(1001, 1000, 999, 0), 't', 0, 999,
+    v2_ctl = check_duplication(fake_stats(1001, 999, 0), 't', 0, 999,
                                replay_budget=64, is_control=True)
     check(not v2_ctl.passed, 'I2 control dup fails (must be exact)')
 
@@ -649,10 +682,16 @@ def _selftest():
     # reconcile_values honours a per-leg type subset: a fake query returning
     # the expected value for the leg's single type passes and counts it.
     exp_bool = gen.gen_expected(1, 0, 0, 'boolean')
-    v3 = reconcile_values(lambda sql: [[exp_bool[1]]], 't', 1, 0, [0],
+    # Query now selects c_seq first, then the value columns, and is batched by
+    # IN(): the fake returns one [c_seq, value] row.
+    v3 = reconcile_values(lambda sql: [[0, exp_bool[1]]], 't', 1, 0, [0],
                           types=['boolean'])
     check(v3.passed and v3.detail['checked'] == 1,
           'I3 subset reconcile passes')
+    # A sampled seq missing from the table is a mismatch (not a silent pass).
+    v3_missing = reconcile_values(lambda sql: [], 't', 1, 0, [0],
+                                  types=['boolean'])
+    check(not v3_missing.passed, 'I3 missing row fails')
     # long256 normalization: leading-zero-padded / empty-string forms.
     check(compare_value('long256', ('text', '0xb5d'), '0x0b5d')[0],
           'I3 long256 leading-zero')
