@@ -624,7 +624,7 @@ fn uppercase_scheme_accepted_https() {
 #[cfg(feature = "sync-sender-qwp-udp")]
 #[test]
 fn uppercase_scheme_accepted_udp() {
-    let builder = SenderBuilder::from_conf("QWPUDP::addr=localhost:9009;").unwrap();
+    let builder = SenderBuilder::from_conf("UDP::addr=localhost:9009;").unwrap();
     assert_eq!(builder.protocol, Protocol::Udp);
 }
 
