@@ -19,11 +19,10 @@
  *   EXIT                        -> (no reply, exits 0)
  *
  * Deliberate protocol subset vs the Rust sidecar:
- *   - SERVER_INFO omits the `zone=` token: the C API's reader_server_info
- *     accessors expose role / epoch / capabilities / cluster_id / node_id but
- *     no zone string (reader.h), so only `cap_zone` (capabilities bit 0x1,
- *     CAP_ZONE) is reported. The Python wrapper defaults a missing zone to
- *     unset.
+ *   - SERVER_INFO omits the `zone=` token: this reduced sidecar does not
+ *     consume the C API's zone accessor, so only `cap_zone` (capabilities
+ *     bit 0x1, CAP_ZONE) is reported. The Python wrapper defaults a missing
+ *     zone to unset.
  *   - SHOW_ZONE and QUERY_ROW reply `ERR unsupported ...`: both need string
  *     column extraction that the bindings-matrix scenarios do not use; a
  *     future test that needs them should extend this sidecar rather than

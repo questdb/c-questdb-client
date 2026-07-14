@@ -287,8 +287,14 @@ std::vector<uint8_t> server_info_frame(
     const std::string& node_id,
     uint64_t epoch,
     uint32_t capabilities,
-    int64_t server_wall_ns)
+    int64_t server_wall_ns,
+    const std::optional<std::string>& zone_id)
 {
+    const bool has_zone_capability = (capabilities & CAP_ZONE) != 0;
+    if (has_zone_capability != zone_id.has_value())
+        throw std::invalid_argument{
+            "SERVER_INFO zone_id presence must match CAP_ZONE"};
+
     std::vector<uint8_t> p;
     p.push_back(MSG_SERVER_INFO);
     p.push_back(role);
@@ -306,6 +312,13 @@ std::vector<uint8_t> server_info_frame(
     p.push_back(uint8_t(nl));
     p.push_back(uint8_t(nl >> 8));
     p.insert(p.end(), node_id.begin(), node_id.end());
+    if (has_zone_capability)
+    {
+        uint16_t zl = uint16_t(zone_id->size());
+        p.push_back(uint8_t(zl));
+        p.push_back(uint8_t(zl >> 8));
+        p.insert(p.end(), zone_id->begin(), zone_id->end());
+    }
     return framed(1, 0, 0, p);
 }
 
@@ -1038,7 +1051,8 @@ struct MockServer::Impl
             {
                 auto frame = server_info_frame(
                     a->role, a->cluster_id, a->node_id,
-                    a->epoch, a->capabilities, a->server_wall_ns);
+                    a->epoch, a->capabilities, a->server_wall_ns,
+                    a->zone_id);
                 if (!ws_write_binary(fd, frame))
                 {
                     close_socket(fd);

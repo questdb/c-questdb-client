@@ -10,10 +10,10 @@
  * the wire protocol's ERR replies. That is the c_client_cpp egress signal:
  * the QWP reader works through the real C++ classes.
  *
- * Same protocol subset as `qwp_egress_c_sidecar.c` (see that file's header
- * comment for the verb table and the SERVER_INFO / SHOW_ZONE caveats --
- * the C++ wrapper surfaces the same accessors as the C API, so it too has
- * no zone string).
+ * The C++ metadata wrapper exposes the decoded SERVER_INFO zone and its
+ * column API can read SHOW PARAMETERS, so both SERVER_INFO and SHOW_ZONE use
+ * the full Rust-sidecar wire shape. QUERY_ROW remains outside this sidecar's
+ * deliberately small verb set.
  *
  * The standalone `reader{conf}` constructor gives each CONNECT command one
  * dedicated transport, matching the Rust sidecar's `Reader::from_conf`.
@@ -26,6 +26,7 @@
 #include <exception>
 #include <iostream>
 #include <optional>
+#include <stdexcept>
 #include <string>
 
 /* CAP_ZONE bit (questdb-rs/src/egress/wire/capabilities.rs). */
@@ -103,17 +104,62 @@ void handle_server_info()
         return;
     }
     /* In-memory snapshot from the most recent bind; no SQL round-trip. */
-    const questdb::egress::server_info_view info = g_reader->server_info();
-    if (!info)
+    try
     {
-        reply_ok("role=-1 cap_zone=0");
+        const questdb::egress::server_info info = g_reader->server_info();
+        const auto& zone = info.zone_id();
+        reply_ok(
+            "zone=" + (zone ? *zone : std::string{"<unset>"}) +
+            " role=" + std::to_string(static_cast<unsigned>(info.role_byte())) +
+            " cap_zone=" +
+            std::to_string((info.capabilities() & QDB_CAP_ZONE) != 0 ? 1 : 0));
+    }
+    catch (const questdb::error& e)
+    {
+        /* Preserve the cross-binding sidecar contract for the transient
+         * no-snapshot state. Product callers still receive the C++ error. */
+        if (e.code() != questdb::error_code::invalid_api_call)
+            throw;
+        reply_ok("zone=<unset> role=-1 cap_zone=0");
+    }
+}
+
+void handle_show_zone()
+{
+    if (!g_reader)
+    {
+        reply_err("no reader");
         return;
     }
-    char payload[64];
-    std::snprintf(payload, sizeof(payload), "role=%u cap_zone=%d",
-                  static_cast<unsigned>(info.role_byte()),
-                  (info.capabilities() & QDB_CAP_ZONE) != 0 ? 1 : 0);
-    reply_ok(payload);
+
+    auto cur = g_reader->execute(questdb::ingress::utf8_view{
+        "(SHOW PARAMETERS) WHERE property_path = 'replication.zone'"});
+    std::optional<std::string> value;
+    while (auto batch = cur.next_batch())
+    {
+        /* Always drain to the terminal frame. Dropping a part-read cursor
+         * poisons the connection for the next command. */
+        if (value || batch->row_count() == 0)
+            continue;
+
+        const auto value_col = batch->column_by_name("value");
+        std::optional<std::string_view> cell;
+        switch (value_col.kind())
+        {
+            case questdb::egress::column_kind::varchar:
+                cell = value_col.varchar(0);
+                break;
+            case questdb::egress::column_kind::symbol:
+                cell = value_col.symbol(0);
+                break;
+            default:
+                throw std::runtime_error{
+                    "SHOW PARAMETERS 'value' column is not a string"};
+        }
+        if (cell && !cell->empty())
+            value.emplace(*cell);
+    }
+    reply_ok(value ? *value : std::string{"<unset>"});
 }
 
 } // namespace
@@ -147,10 +193,11 @@ int main()
                 handle_query(rest);
             else if (verb == "SERVER_INFO")
                 handle_server_info();
-            else if (verb == "SHOW_ZONE" || verb == "QUERY_ROW")
-                reply_err("unsupported verb in the C++ egress sidecar (needs "
-                          "string column extraction; extend "
-                          "qwp_egress_cpp_sidecar.cpp)");
+            else if (verb == "SHOW_ZONE")
+                handle_show_zone();
+            else if (verb == "QUERY_ROW")
+                reply_err("unsupported verb in the C++ egress sidecar: "
+                          "QUERY_ROW rendering is not implemented");
             else if (verb == "CLOSE")
             {
                 g_reader.reset();

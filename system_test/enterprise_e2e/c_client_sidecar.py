@@ -392,9 +392,8 @@ class CClientRustEgressSidecar(EgressSidecar):
 class CClientCEgressSidecar(CClientRustEgressSidecar):
     """c-questdb-client **C-binding** egress (read-side) sidecar
     (``qwp_egress_c_sidecar``): the ``reader_*`` C API driven from a C11
-    translation unit. Speaks the same EgressSidecar line protocol; the C
-    API exposes no zone accessor, so ``SERVER_INFO`` omits the ``zone=``
-    token (the Python wrapper defaults it to unset) and ``SHOW_ZONE`` /
+    translation unit. Its reduced protocol omits the ``SERVER_INFO zone=``
+    token (the Python wrapper defaults it to unset), and ``SHOW_ZONE`` /
     ``QUERY_ROW`` reply ``ERR unsupported``."""
 
     def _default_binary(self) -> Path:
@@ -405,8 +404,10 @@ class CClientCEgressSidecar(CClientRustEgressSidecar):
 class CClientCppEgressSidecar(CClientRustEgressSidecar):
     """c-questdb-client **C++-binding** egress sidecar
     (``qwp_egress_cpp_sidecar``): the genuine C++ wrapper classes
-    (``questdb::egress::reader`` / ``cursor`` / ``batch``). Same protocol
-    subset as :class:`CClientCEgressSidecar`."""
+    (``questdb::egress::reader`` / ``cursor`` / ``batch``). Its owning
+    ``server_info`` and string-column accessors provide the full
+    ``SERVER_INFO`` and ``SHOW_ZONE`` protocol used by the Rust sidecar;
+    ``QUERY_ROW`` remains unsupported."""
 
     def _default_binary(self) -> Path:
         return build_cpp_egress_sidecar()

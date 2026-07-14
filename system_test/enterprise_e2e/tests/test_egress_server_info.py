@@ -1,6 +1,7 @@
 """
 QWP egress ``SERVER_INFO`` role + zone advertisement tests for the
-c-questdb-client Rust binding's ``Reader``.
+c-questdb-client Rust binding's ``Reader``, plus focused parity coverage
+for the C++ owning metadata surface.
 
 Ported from the Enterprise Java JUnit suites
 ``questdb-ent/src/test/java/com/questdb/cairo/wal/transfer/QwpEgressServerInfoRoleTest.java``
@@ -27,7 +28,8 @@ Dedup notes (vs. the committed egress ports):
   both directions are pinned because they exercise different reject
   classifications (STANDALONE acceptance differs between the two filters).
 
-Sidecar surface used (``qwp_egress_sidecar.rs``):
+Sidecar surface used (the Rust implementation and the focused C++ parity
+sidecar):
 
 * ``SERVER_INFO`` -> ``zone=<id|<unset>> role=<byte> cap_zone=<0|1>``;
   ``cap_zone`` is the decoded ``capabilities & CAP_ZONE`` bit, added so
@@ -52,7 +54,10 @@ import pytest
 from lib.pg_query import execute_ddl
 from lib.sidecar import SidecarError
 
-from c_client_sidecar import CClientRustEgressSidecar
+from c_client_sidecar import (
+    CClientCppEgressSidecar,
+    CClientRustEgressSidecar,
+)
 from tests.qwp_sql_switch import wait_count_at_least
 
 LOG = logging.getLogger(__name__)
@@ -422,6 +427,30 @@ def test_primary_advertises_configured_zone_c_client_rust(
     assert kv["cap_zone"] == "1", \
         f"CAP_ZONE bit must be set when replication.zone is configured; got {kv}"
     assert kv["zone"] == "eu-west-1a", f"got {kv}"
+
+
+@pytest.mark.c_client
+@pytest.mark.c_client_cpp
+def test_cpp_server_info_and_show_zone_surface_configured_zone_c_client_cpp(
+    server_factory,
+    c_client_cpp_egress_sidecar: CClientCppEgressSidecar,
+) -> None:
+    """The C++ sidecar exercises both C++ zone paths: the owning
+    ``reader::server_info`` snapshot and VARCHAR/SYMBOL extraction used by
+    ``SHOW_ZONE``."""
+    p1 = server_factory("p1", role="primary", zone=ZONE_UTF8)
+    p1_ports = p1.start()
+
+    c_client_cpp_egress_sidecar.connect(
+        _connect_string([("127.0.0.1", p1_ports.http)])
+    )
+    kv = _server_info_kv(c_client_cpp_egress_sidecar)
+    assert kv == {
+        "zone": ZONE_UTF8,
+        "role": str(ROLE_PRIMARY),
+        "cap_zone": "1",
+    }, f"unexpected C++ SERVER_INFO reply: {kv}"
+    assert c_client_cpp_egress_sidecar.show_zone() == ZONE_UTF8
 
 
 @pytest.mark.c_client

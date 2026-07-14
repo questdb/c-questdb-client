@@ -404,10 +404,10 @@ C-FFI observability substitutions (same precedent as
 - The demotion scenario's `server_errors == 0` wire pin is dropped in the
   C/C++ duplicates (counter zeroed by the FFI → vacuous); it stays pinned
   by the Rust variant.
-- The egress C API exposes no zone accessor (`reader.h` server-info
-  surface: role / epoch / capabilities / cluster_id / node_id), so the
-  C/C++ egress sidecars' `SERVER_INFO` omits the `zone=` token and
-  `SHOW_ZONE` / `QUERY_ROW` reply `ERR unsupported`.
+- The C egress sidecar retains its reduced protocol: `SERVER_INFO` omits
+  the `zone=` token and `SHOW_ZONE` / `QUERY_ROW` reply
+  `ERR unsupported`. The C++ sidecar exposes its owning `server_info`
+  zone and implements `SHOW_ZONE`; only `QUERY_ROW` remains unsupported.
 
 (Extend if review flags more binding-sensitive paths.)
 
