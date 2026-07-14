@@ -7,7 +7,11 @@
 #       --schema s1-narrow --direction ingress --rows 10000000 \
 #       [--rate 2.5gbit] [--rtt-ms 5] [--recv-buf 16m] \
 #       [--iterations 5] [--warmups 2] [--max-batch-rows 10000] [--senders N] [--skip-populate] \
-#       [--client rust|rust-row|c|java]
+#       [--client rust|rust-row|c|java] [--conf-extra 'key=value;...']
+#
+# --conf-extra appends extra conf params to the bench's connect string
+# (e.g. 'sf_append_deadline_millis=300000;'). Only the rust-row bench reads
+# QDB_CONF_EXTRA today; other clients silently ignore it.
 #
 # direction: ingress | egress   (egress with --skip-populate reuses the table
 # a prior ingress cell filled; without it the egress example populates first).
@@ -19,7 +23,7 @@ cd "$(dirname "$0")"
 
 LABEL="" SCHEMA="s1-narrow" DIRECTION="ingress" ROWS=10000000
 RATE="" RTT_MS="" RECV_BUF="16m" ITERATIONS=5 WARMUPS=2 MAX_BATCH_ROWS=10000
-SKIP_POPULATE=0 CLIENT_KIND=rust SENDERS=1
+SKIP_POPULATE=0 CLIENT_KIND=rust SENDERS=1 CONF_EXTRA=""
 while [ $# -gt 0 ]; do
     case "$1" in
         --label) LABEL="$2"; shift 2 ;;
@@ -33,6 +37,7 @@ while [ $# -gt 0 ]; do
         --warmups) WARMUPS="$2"; shift 2 ;;
         --max-batch-rows) MAX_BATCH_ROWS="$2"; shift 2 ;;
         --senders) SENDERS="$2"; shift 2 ;;
+        --conf-extra) CONF_EXTRA="$2"; shift 2 ;;
         --skip-populate) SKIP_POPULATE=1; shift ;;
         --client) CLIENT_KIND="$2"; shift 2 ;;
         *) echo "unknown arg $1" >&2; exit 1 ;;
@@ -74,6 +79,9 @@ echo "== bench ($CLIENT_KIND, $DIRECTION, $SCHEMA, ${ROWS} rows, it=$ITERATIONS/
 BENCH_ENV="SCHEMA=$SCHEMA ROWS=$ROWS ITERATIONS=$ITERATIONS WARMUPS=$WARMUPS \
 MAX_BATCH_ROWS=$MAX_BATCH_ROWS QDB_HOST=$SERVER_IP QDB_PORT=9000 SENDERS=$SENDERS"
 [ "$SKIP_POPULATE" = "1" ] && BENCH_ENV="$BENCH_ENV SKIP_POPULATE=1"
+# Single-quote the value: BENCH_ENV lands unquoted in the remote command and
+# conf strings end in ';', which the box's shell would treat as a separator.
+[ -n "$CONF_EXTRA" ] && BENCH_ENV="$BENCH_ENV QDB_CONF_EXTRA='$CONF_EXTRA'"
 JAVA_ENV_EXPORT=""
 if [ "$CLIENT_KIND" = "c" ]; then
     BENCH_CMD="/opt/qwp-bench/c-questdb-client/build/qwp_${DIRECTION}_c"
@@ -115,8 +123,9 @@ jq -n \
     --arg itype "$QNB_INSTANCE_TYPE" --arg iperf "$IPERF_NOTE" \
     --arg qdb "$QNB_QUESTDB_COMMIT" --arg cc "$QNB_C_CLIENT_COMMIT" \
     --arg py "$QNB_PY_CLIENT_COMMIT" --arg ck "$CLIENT_KIND" --arg senders "$SENDERS" \
+    --arg confx "$CONF_EXTRA" \
     '{cell: $cell, schema: $schema, direction: $direction, rows: ($rows|tonumber),
-      client_kind: $ck, senders: ($senders|tonumber),
+      client_kind: $ck, senders: ($senders|tonumber), conf_extra: $confx,
       channel: {rate: $rate, rtt_ms: $rtt, placement_group: true, iperf3: $iperf},
       server: {instance_type: $itype, questdb_commit: $qdb,
                recv_buffer: $recv, data_dir: "tmpfs"},

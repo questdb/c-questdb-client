@@ -37,6 +37,9 @@
 //!   HI_SYM_CARD=100000       s2-wide high-card SYMBOL s1..s5 (uniform)
 //!   ITERATIONS=5  WARMUPS=2  MAX_BATCH_ROWS=10000  RUN_MODE=full
 //!   QDB_HOST=127.0.0.1  QDB_PORT=9000
+//!   SENDERS=1                e2e sender/connection count (rows split evenly)
+//!   QDB_CONF_EXTRA=          extra `key=value;` conf params appended to the
+//!                            connect string (e.g. `sf_append_deadline_millis=300000;`)
 //!
 //! **Auto-flush knob finding**: unlike the Java client (whose row `Sender`
 //! auto-flushes by default and needs `auto_flush=off` in the connect string
@@ -46,7 +49,8 @@
 //! `validate_auto_flush_params` (`src/ingress.rs`) only *validates* an
 //! `auto_flush` connect-string key (rejecting anything but `"off"`); it never
 //! stores or acts on the value. So no explicit auto-flush-off knob is set
-//! here — the connect string is the minimal `ws::addr={host}:{port};`.
+//! here — the connect string is the minimal `ws::addr={host}:{port};` plus
+//! whatever `QDB_CONF_EXTRA` supplies.
 
 use std::error::Error;
 use std::time::{Duration, Instant};
@@ -382,8 +386,10 @@ fn main() -> Result<(), Box<dyn Error>> {
     // Minimal connect string: the row-API `Sender` has no auto-flush
     // machinery to disable (see the auto-flush finding in the module doc
     // comment above) and no pool to size, unlike `qwp_ingress_polars.rs`'s
-    // `QuestDb::connect` pool string.
-    let conf = format!("ws::addr={host}:{port};");
+    // `QuestDb::connect` pool string. `QDB_CONF_EXTRA` must be empty or a
+    // `;`-terminated `key=value;` sequence — `from_conf` rejects it otherwise.
+    let conf_extra = std::env::var("QDB_CONF_EXTRA").unwrap_or_default();
+    let conf = format!("ws::addr={host}:{port};{conf_extra}");
     let mut senders: Vec<Sender> = (0..senders_n)
         .map(|_| Sender::from_conf(&conf))
         .collect::<Result<_, _>>()?;
