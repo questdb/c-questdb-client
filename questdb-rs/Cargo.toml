@@ -223,7 +223,10 @@ sync-reader-zstd = ["_egress", "dep:zstd"]
 ##   arrow-egress : streaming Cursor → RecordBatchReader (read path)
 ##   arrow-ingress: RecordBatch → Buffer (write path)
 ## See `doc/QUESTDB_ARROW_INTEGRATION_DESIGN.md`.
-arrow-egress = ["_arrow", "sync-reader-qwp-ws"]
+## Egress enables `arrow/chrono-tz` because it types every designated
+## timestamp as `Timestamp(_, Some("UTC"))`: without chrono-tz, consumer-side
+## formatting, casts, and temporal kernels fail at runtime on the named zone.
+arrow-egress = ["_arrow", "sync-reader-qwp-ws", "arrow?/chrono-tz"]
 arrow-ingress = ["_arrow", "sync-sender-qwp-ws"]
 arrow = ["arrow-ingress", "arrow-egress"]
 
