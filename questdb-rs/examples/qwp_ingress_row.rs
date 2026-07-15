@@ -42,6 +42,19 @@
 //!   QDB_CONF_EXTRA=          extra `key=value;` conf params appended to the
 //!                            connect string (e.g. `sf_append_deadline_millis=300000;`)
 //!
+//! **`RUN_MODE`** gates which pass(es) run (any value other than `floor` or
+//! `e2e` — including unset — behaves as `full`):
+//!   - `full` (default): `row-build` floor, then `row-flush` e2e. Identical
+//!     to the historical (pre-gating) behavior of this binary.
+//!   - `e2e`: skips the `row-build` floor pass; still creates the table,
+//!     connects the sender pool, runs `row-flush`, and gates on `count()`.
+//!   - `floor`: `row-build` **only** — no HTTP table create/drop, no
+//!     `Sender` construction/connection, no `row-flush` pass, no
+//!     `count()` gate, no `row_count_check` in the JSON report, and
+//!     `paths` contains only `row-build`. Always exits `0`. This is what
+//!     makes `RUN_MODE=floor` safe to run with no server listening at all
+//!     — see `prof-session-runbook.md`.
+//!
 //! **Auto-flush knob finding**: unlike the Java client (whose row `Sender`
 //! auto-flushes by default and needs `auto_flush=off` in the connect string
 //! to get manual-only control), this Rust client's row-API `Sender`/`Buffer`
@@ -341,6 +354,13 @@ fn main() -> Result<(), Box<dyn Error>> {
     let senders_n: usize = env_usize("SENDERS", 1).max(1);
     let checkpoint_batches: usize = env_usize("CHECKPOINT_BATCHES", DEFAULT_CHECKPOINT_BATCHES);
     let run_mode = std::env::var("RUN_MODE").unwrap_or_else(|_| "full".into());
+    // Gating (module doc comment above): any value other than the literal
+    // strings "e2e"/"floor" (including unset/"full"/typos) runs both passes
+    // — matches the Java twin's `Env.str("RUN_MODE", "full")` +
+    // `!"e2e".equals(runMode)` / `!"floor".equals(runMode)` semantics
+    // (`IngressBench.java:88-90`).
+    let do_floor = run_mode != "e2e";
+    let do_e2e = run_mode != "floor";
     let host = std::env::var("QDB_HOST").unwrap_or_else(|_| "127.0.0.1".into());
     let port: u16 = env_usize("QDB_PORT", 9000) as u16;
 
@@ -381,75 +401,91 @@ fn main() -> Result<(), Box<dyn Error>> {
     report.senders = senders_n;
     report.env = Env::collect(&[]);
 
-    // --- Floor: row-build (no network). ---
-    eprintln!("[qwp_ingress_row] measuring row-build floor ...");
-    let (build_wall, build_cpu) = measure_row_build(&ctx, iterations, warmups)?;
-    report.add_path(
-        "row-build",
-        PathSummary::new(
-            &build_wall,
-            &build_cpu,
-            rows,
-            columns,
-            "floor",
-            warmups > 0,
-            Some(0),
-        ),
-    );
+    // --- Floor: row-build (no network). RUN_MODE=e2e skips this. ---
+    if do_floor {
+        eprintln!("[qwp_ingress_row] measuring row-build floor ...");
+        let (build_wall, build_cpu) = measure_row_build(&ctx, iterations, warmups)?;
+        report.add_path(
+            "row-build",
+            PathSummary::new(
+                &build_wall,
+                &build_cpu,
+                rows,
+                columns,
+                "floor",
+                warmups > 0,
+                Some(0),
+            ),
+        );
+    } else {
+        eprintln!("[qwp_ingress_row] RUN_MODE=e2e — skipping row-build floor");
+    }
 
-    // --- e2e: row-flush (real server). ---
-    let base = http_base(&host, port);
-    eprintln!("[qwp_ingress_row] creating DEDUP table {table} on {base} ...");
-    create_table(&base, kind)?;
+    // --- e2e: row-flush (real server). RUN_MODE=floor skips this entirely
+    // — no HTTP table create/drop, no Sender construction/connection, no
+    // count() gate, no `row_count_check` in the report. This is what makes
+    // `RUN_MODE=floor` runnable with no server listening at all. ---
+    let mut ok = true;
+    if do_e2e {
+        let base = http_base(&host, port);
+        eprintln!("[qwp_ingress_row] creating DEDUP table {table} on {base} ...");
+        create_table(&base, kind)?;
 
-    // Minimal connect string: the row-API `Sender` has no auto-flush
-    // machinery to disable (see the auto-flush finding in the module doc
-    // comment above) and no pool to size, unlike `qwp_ingress_polars.rs`'s
-    // `QuestDb::connect` pool string. `QDB_CONF_EXTRA` must be empty or a
-    // `;`-terminated `key=value;` sequence — `from_conf` rejects it otherwise.
-    let conf_extra = std::env::var("QDB_CONF_EXTRA").unwrap_or_default();
-    let conf = format!("ws::addr={host}:{port};{conf_extra}");
-    let mut senders: Vec<Sender> = (0..senders_n)
-        .map(|_| Sender::from_conf(&conf))
-        .collect::<Result<_, _>>()?;
-    let ranges = bench_schema::sender_ranges(rows, senders_n);
+        // Minimal connect string: the row-API `Sender` has no auto-flush
+        // machinery to disable (see the auto-flush finding in the module doc
+        // comment above) and no pool to size, unlike `qwp_ingress_polars.rs`'s
+        // `QuestDb::connect` pool string. `QDB_CONF_EXTRA` must be empty or a
+        // `;`-terminated `key=value;` sequence — `from_conf` rejects it
+        // otherwise.
+        let conf_extra = std::env::var("QDB_CONF_EXTRA").unwrap_or_default();
+        let conf = format!("ws::addr={host}:{port};{conf_extra}");
+        let mut senders: Vec<Sender> = (0..senders_n)
+            .map(|_| Sender::from_conf(&conf))
+            .collect::<Result<_, _>>()?;
+        let ranges = bench_schema::sender_ranges(rows, senders_n);
 
-    eprintln!("[qwp_ingress_row] measuring row-flush e2e ({senders_n} sender(s)) ...");
-    let (flush_wall, flush_cpu) =
-        measure_row_flush(&mut senders, &ctx, &ranges, iterations, warmups)?;
-    report.add_path(
-        "row-flush",
-        PathSummary::new(
-            &flush_wall,
-            &flush_cpu,
-            rows,
-            columns,
-            "e2e",
-            warmups > 0,
-            Some(0),
-        ),
-    );
+        eprintln!("[qwp_ingress_row] measuring row-flush e2e ({senders_n} sender(s)) ...");
+        let (flush_wall, flush_cpu) =
+            measure_row_flush(&mut senders, &ctx, &ranges, iterations, warmups)?;
+        report.add_path(
+            "row-flush",
+            PathSummary::new(
+                &flush_wall,
+                &flush_cpu,
+                rows,
+                columns,
+                "e2e",
+                warmups > 0,
+                Some(0),
+            ),
+        );
 
-    // DEDUP gate: count() must equal rows exactly (same semantics as
-    // `qwp_ingress_polars.rs`; `wait_for_count`'s poll loop itself only
-    // requires count() >= rows to stop polling).
-    eprintln!("[qwp_ingress_row] waiting for WAL apply (count() == {rows}) ...");
-    let count = wait_for_count(&base, table, rows as u64)?;
-    let ok = count == rows as u64;
-    report.row_count_check = Some(bench_json::RowCountCheck {
-        expected: rows as u64,
-        actual: count,
-        ok,
-        inflated: count > rows as u64,
-    });
-    if !ok {
+        // DEDUP gate: count() must equal rows exactly (same semantics as
+        // `qwp_ingress_polars.rs`; `wait_for_count`'s poll loop itself only
+        // requires count() >= rows to stop polling).
+        eprintln!("[qwp_ingress_row] waiting for WAL apply (count() == {rows}) ...");
+        let count = wait_for_count(&base, table, rows as u64)?;
+        ok = count == rows as u64;
+        report.row_count_check = Some(bench_json::RowCountCheck {
+            expected: rows as u64,
+            actual: count,
+            ok,
+            inflated: count > rows as u64,
+        });
+        if !ok {
+            eprintln!(
+                "[qwp_ingress_row] WARNING: count() == {count}, expected {rows} (inflated={})",
+                count > rows as u64
+            );
+        }
+        report.real_conf = Some(conf);
+        report.http_base = Some(base);
+    } else {
         eprintln!(
-            "[qwp_ingress_row] WARNING: count() == {count}, expected {rows} (inflated={})",
-            count > rows as u64
+            "[qwp_ingress_row] RUN_MODE=floor — skipping row-flush e2e (no table, no Sender, \
+             no count() gate)"
         );
     }
-    report.real_conf = Some(conf);
-    report.http_base = Some(base);
 
     report.compute_row_headline();
     println!("{}", report.into_json());
