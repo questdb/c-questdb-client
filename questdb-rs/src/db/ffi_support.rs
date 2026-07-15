@@ -87,6 +87,13 @@ pub fn borrow_direct_column_sender_owned_with_retry(
     db.borrow_direct_column_sender_owned_with_retry(budget)
 }
 
+/// Build a **direct** (non-store-and-forward) column-major sender from a
+/// QWP/WebSocket config string, owning its own connection with no pool.
+/// Backs the C ABI's `direct_column_sender_from_conf`.
+pub fn direct_column_sender_from_conf(conf: &str) -> Result<OwnedDirectColumnSender> {
+    OwnedDirectColumnSender::from_conf(conf)
+}
+
 /// The pool's failover budget (`reconnect_max_duration`, default 300s).
 /// Exposed so the C ABI can let callers bound an overall failover deadline.
 pub fn reconnect_max_duration(db: &QuestDb) -> Duration {

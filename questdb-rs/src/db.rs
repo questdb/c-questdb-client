@@ -1944,7 +1944,7 @@ impl Drop for DirectSenderHandle<'_> {
         let Some(mut sender) = self.sender.take() else {
             return;
         };
-        commit_in_flight_on_drop(&self.db.inner, &mut sender);
+        commit_in_flight_on_drop(self.db.inner.connector.request_durable_ack(), &mut sender);
         return_direct_to_pool(&self.db.inner, sender);
     }
 }
@@ -2016,10 +2016,19 @@ impl Drop for OwnedSender {
     }
 }
 
-/// Owned variant of the hidden direct sender used by the C FFI.
+/// Backing of an [`OwnedDirectColumnSender`]: either a slot returned to a
+/// pool, or a poolless connection owned outright.
+#[cfg(feature = "ffi-support")]
+enum DirectBacking {
+    Pool(Arc<DbInner>),
+    Standalone { request_durable_ack: bool },
+}
+
+/// Owned variant of the hidden direct sender used by the C FFI. Either
+/// borrowed from a [`QuestDb`] pool or built standalone from a config string.
 #[cfg(feature = "ffi-support")]
 pub struct OwnedDirectColumnSender {
-    inner: Arc<DbInner>,
+    backing: DirectBacking,
     sender: Option<DirectSenderCore>,
 }
 
@@ -2028,25 +2037,49 @@ impl OwnedDirectColumnSender {
     fn new(inner: Arc<DbInner>, sender: PooledSender<DirectSenderCore>) -> Self {
         debug_assert!(sender.slot_index.is_none());
         Self {
-            inner,
+            backing: DirectBacking::Pool(inner),
             sender: Some(sender.sender),
         }
+    }
+
+    /// Build a direct column sender from a QWP/WebSocket config string,
+    /// opening its own connection and owning it outright — no pool.
+    pub fn from_conf(conf: &str) -> Result<Self> {
+        let connector = SenderBuilder::from_conf(conf)?.build_qwp_ws_connector()?;
+        let health = Mutex::new(QwpWsHostHealthTracker::new(connector.endpoint_count()));
+        let raw = connector.connect_round_pooled(&health, None)?;
+        let conn = ColumnConn::from_round_stream(raw)?;
+        let sender = DirectSenderCore::new(
+            conn,
+            crate::ingress::SymbolGlobalDict::new(),
+            crate::ingress::column_sender::encoder::EncodeScratch::new(),
+            false,
+        );
+        Ok(Self {
+            backing: DirectBacking::Standalone {
+                request_durable_ack: connector.request_durable_ack(),
+            },
+            sender: Some(sender),
+        })
     }
 
     pub fn get_mut(&mut self) -> &mut DirectSenderCore {
         self.sender
             .as_mut()
-            .expect("OwnedDirectColumnSender already returned to the pool")
+            .expect("OwnedDirectColumnSender already released")
     }
 
     pub fn get(&self) -> &DirectSenderCore {
         self.sender
             .as_ref()
-            .expect("OwnedDirectColumnSender already returned to the pool")
+            .expect("OwnedDirectColumnSender already released")
     }
 
     pub fn pool_closed(&self) -> bool {
-        self.inner.shutdown.load(Ordering::SeqCst)
+        match &self.backing {
+            DirectBacking::Pool(inner) => inner.shutdown.load(Ordering::SeqCst),
+            DirectBacking::Standalone { .. } => false,
+        }
     }
 
     pub fn mark_must_close(&mut self) {
@@ -2061,9 +2094,19 @@ impl OwnedDirectColumnSender {
 #[cfg(feature = "ffi-support")]
 impl Drop for OwnedDirectColumnSender {
     fn drop(&mut self) {
-        if let Some(mut sender) = self.sender.take() {
-            commit_in_flight_on_drop(&self.inner, &mut sender);
-            return_direct_to_pool(&self.inner, sender);
+        let Some(mut sender) = self.sender.take() else {
+            return;
+        };
+        match &self.backing {
+            DirectBacking::Pool(inner) => {
+                commit_in_flight_on_drop(inner.connector.request_durable_ack(), &mut sender);
+                return_direct_to_pool(inner, sender);
+            }
+            DirectBacking::Standalone {
+                request_durable_ack,
+            } => {
+                commit_in_flight_on_drop(*request_durable_ack, &mut sender);
+            }
         }
     }
 }
@@ -2472,11 +2515,11 @@ fn connect_conn_pool(inner: &Arc<DbInner>) -> Result<ColumnConn> {
 /// the durability ACK instead of silently downgrading to `Ok`. On failure the
 /// connection is latched `must_close` so the next borrower can't commit these
 /// frames under a foreign table.
-fn commit_in_flight_on_drop(inner: &Arc<DbInner>, sender: &mut DirectSenderCore) {
+fn commit_in_flight_on_drop(request_durable_ack: bool, sender: &mut DirectSenderCore) {
     if sender.in_flight() == 0 {
         return;
     }
-    let ack = if inner.connector.request_durable_ack() {
+    let ack = if request_durable_ack {
         AckLevel::Durable
     } else {
         AckLevel::Ok

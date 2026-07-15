@@ -293,6 +293,20 @@ direct_column_sender* questdb_db_borrow_direct_column_sender_with_retry(
     line_sender_error** err_out);
 
 /**
+ * Build a direct (pipelined, non-store-and-forward) column-major sender from a
+ * QWP/WebSocket config string, owning its own connection with no pool — for
+ * one-off DataFrame bulk loads without a `questdb_db`. `conf` is a UTF-8
+ * string of `conf_len` bytes. Returns NULL on failure and sets `*err_out` if
+ * provided. Free the returned handle with `direct_column_sender_free` (there
+ * is no pool to return it to).
+ */
+QUESTDB_CLIENT_API
+direct_column_sender* direct_column_sender_from_conf(
+    const char* conf,
+    size_t conf_len,
+    line_sender_error** err_out);
+
+/**
  * Return a direct sender to the pool. Accepts NULL `sender` and no-ops.
  * Invalidates the `sender` pointer. If the sender has latched terminal state,
  * or if the pool has been closed, it is closed instead of recycled. A sender
@@ -321,6 +335,17 @@ void questdb_db_return_direct_column_sender(
 QUESTDB_CLIENT_API
 void questdb_db_drop_direct_column_sender(
     questdb_db* db,
+    direct_column_sender* sender);
+
+/**
+ * Free a standalone `direct_column_sender_from_conf` handle, committing any
+ * un-sync'd deferred frames best-effort first (call
+ * `direct_column_sender_commit` or a waited flush beforehand for delivery
+ * certainty). Invalidates `sender`. Accepts NULL and no-ops. For a
+ * pool-borrowed handle use `questdb_db_return_direct_column_sender` instead.
+ */
+QUESTDB_CLIENT_API
+void direct_column_sender_free(
     direct_column_sender* sender);
 
 /* Reader-pool entry points (`questdb_db_borrow_reader`,

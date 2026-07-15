@@ -1053,6 +1053,30 @@ pub unsafe extern "C" fn questdb_db_borrow_direct_column_sender_with_retry(
     }
 }
 
+/// Build a direct (pipelined, non-store-and-forward) column sender from a
+/// QWP/WebSocket config string, owning its own connection with no pool. `conf`
+/// is a UTF-8 string of `conf_len` bytes. Free the returned handle with
+/// `direct_column_sender_free`; there is no pool to return it to. Returns NULL
+/// on failure; sets `*err_out` if provided.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn direct_column_sender_from_conf(
+    conf: *const c_char,
+    conf_len: size_t,
+    err_out: *mut *mut line_sender_error,
+) -> *mut direct_column_sender {
+    let conf = match unsafe { name_str(conf, conf_len, err_out) } {
+        Some(s) => s,
+        None => return std::ptr::null_mut(),
+    };
+    match questdb::ffi_support::direct_column_sender_from_conf(conf) {
+        Ok(owned) => Box::into_raw(Box::new(direct_column_sender(owned, AtomicU32::new(0)))),
+        Err(err) => {
+            unsafe { set_err_out_from_error(err_out, err) };
+            std::ptr::null_mut()
+        }
+    }
+}
+
 /// The pool's failover budget (`reconnect_max_duration`, default 300000 ms).
 /// Callers tracking an overall failover deadline pass the remaining budget to
 /// `questdb_db_borrow_sender_with_retry`. Returns 0 if `db` is NULL.
@@ -1122,6 +1146,16 @@ pub unsafe extern "C" fn questdb_db_drop_direct_column_sender(
     sender: *mut direct_column_sender,
 ) {
     unsafe { return_or_drop_cs(sender, LATCH_DROP) };
+}
+
+/// Free a standalone `direct_column_sender_from_conf` handle, committing any
+/// un-sync'd deferred frames first (call `direct_column_sender_commit` or a
+/// waited flush beforehand for delivery certainty). Accepts NULL and no-ops.
+/// For a pool-borrowed handle use `questdb_db_return_direct_column_sender`
+/// instead. A racing in-flight call defers the free to that call's exit path.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn direct_column_sender_free(sender: *mut direct_column_sender) {
+    unsafe { return_or_drop_cs(sender, 0) };
 }
 
 /// Manually reap idle connections. Returns the number of connections
@@ -5795,6 +5829,32 @@ mod tests {
         assert!(!ok);
         assert!(!err.is_null());
         unsafe { line_sender_error_free(err) };
+    }
+
+    #[test]
+    fn direct_column_sender_from_conf_rejects_non_ws() {
+        let conf = b"tcp::addr=localhost:9009;";
+        let mut err: *mut line_sender_error = std::ptr::null_mut();
+        let sender = unsafe {
+            direct_column_sender_from_conf(conf.as_ptr() as *const c_char, conf.len(), &mut err)
+        };
+        assert!(sender.is_null());
+        assert!(!err.is_null());
+        unsafe { line_sender_error_free(err) };
+    }
+
+    #[test]
+    fn direct_column_sender_from_conf_null_conf_errors() {
+        let mut err: *mut line_sender_error = std::ptr::null_mut();
+        let sender = unsafe { direct_column_sender_from_conf(std::ptr::null(), 1, &mut err) };
+        assert!(sender.is_null());
+        assert!(!err.is_null());
+        unsafe { line_sender_error_free(err) };
+    }
+
+    #[test]
+    fn direct_column_sender_free_accepts_null() {
+        unsafe { direct_column_sender_free(std::ptr::null_mut()) };
     }
 
     #[test]
