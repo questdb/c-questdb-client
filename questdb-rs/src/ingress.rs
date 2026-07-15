@@ -617,9 +617,15 @@ impl QwpWsConnector {
         sender_id: Option<&str>,
         managed_exclusions: &[conf::QwpWsManagedSlotExclusion],
         extra_orphan_slots: &[PathBuf],
+        conn_events: std::sync::Arc<conn_events::ConnectionEventSource>,
     ) -> Result<sender::qwp_ws::SyncQwpWsHandlerState> {
         let mut qwp_ws = self.qwp_ws.clone();
         qwp_ws.force_async_initial_connect();
+        // The pool's shared source exists (listener already attached, or
+        // permanently disabled) before connect-time recovery senders are
+        // pre-opened, so every runner narrates through it from its first
+        // connect.
+        qwp_ws.conn_events = Some(conn_events);
         configure_qwp_ws_pool_slot(
             &mut qwp_ws,
             sender_id,

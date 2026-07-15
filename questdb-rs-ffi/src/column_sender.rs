@@ -889,6 +889,9 @@ pub unsafe extern "C" fn questdb_db_connect(
 /// Outstanding `qwp_sender` handles are independent leases:
 /// return/drop remains safe after close, but new operations on them fail with
 /// `InvalidApiCall`. A handle returned after close is closed, not recycled.
+/// Close also detaches and joins the connection-event dispatcher; after this
+/// function returns no callback can use its `user_data`, including callbacks
+/// from an outstanding sender's background runner.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn questdb_db_close(db: *mut questdb_db) {
     if !db.is_null() {
@@ -1332,8 +1335,8 @@ pub(crate) fn connection_listener_from_c(
     })
 }
 
-/// Register a connection lifecycle listener on the pool. Events fire for
-/// every ingress pool connect (initial connect, per-endpoint attempt
+/// `questdb_db_connect` with a connection lifecycle listener. Events fire
+/// for every ingress pool connect (initial connect, per-endpoint attempt
 /// failures, all-endpoints-unreachable sweeps, failover to a different
 /// endpoint, terminal auth rejection) and for transport deaths observed
 /// when a connection is returned.
@@ -1341,37 +1344,36 @@ pub(crate) fn connection_listener_from_c(
 /// Delivery is via a bounded inbox (`inbox_capacity`; `0` = default 64)
 /// drained by a dedicated dispatcher thread: a slow callback cannot
 /// stall connects or publishing, and on overflow the oldest undelivered
-/// event is dropped. At most one listener per pool; a second
-/// registration fails with `line_sender_error_invalid_api_call`.
-/// Register before the first borrow to observe the initial `connected`
-/// event.
+/// event is dropped. Direct and store-and-forward senders share one source
+/// and inbox.
+///
+/// The handler is registered before the pool opens anything, so it observes
+/// every transition — including the initial `connected` of disk recovery
+/// senders pre-opened by this call. This is the only way to attach a
+/// handler; there is no post-connect registration. The caller guarantees
+/// `user_data` is safe to use from the dispatcher thread until
+/// `questdb_db_close` returns. On failure (NULL return) the dispatcher is
+/// already torn down: no callback runs after this function returns and
+/// `user_data` may be released immediately.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn questdb_db_set_connection_event_handler(
-    db: *mut questdb_db,
+pub unsafe extern "C" fn questdb_db_connect_with_event_handler(
+    conf: *const c_char,
+    conf_len: size_t,
     callback: questdb_connection_event_cb,
     user_data: *mut c_void,
     inbox_capacity: size_t,
-    err_out: *mut *mut line_sender_error,
-) -> bool {
-    if db.is_null() {
-        unsafe {
-            set_err_out_from_error(
-                err_out,
-                Error::new(
-                    ErrorCode::InvalidApiCall,
-                    "questdb_db_set_connection_event_handler: db pointer is NULL".to_string(),
-                ),
-            );
-        }
-        return false;
-    }
+    err_out: *mut *mut questdb_error,
+) -> *mut questdb_db {
+    let conf = match unsafe { name_str(conf, conf_len, err_out) } {
+        Some(s) => s,
+        None => return std::ptr::null_mut(),
+    };
     let listener = connection_listener_from_c(callback, user_data);
-    let db_ref = unsafe { &*db };
-    match db_ref.0.set_connection_listener(listener, inbox_capacity) {
-        Ok(()) => true,
+    match QuestDb::connect_with_listener(conf, listener, inbox_capacity) {
+        Ok(db) => Box::into_raw(Box::new(questdb_db(db))),
         Err(err) => {
             unsafe { set_err_out_from_error(err_out, err) };
-            false
+            std::ptr::null_mut()
         }
     }
 }

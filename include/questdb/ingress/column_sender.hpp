@@ -1415,7 +1415,9 @@ namespace questdb
  * Destruction is the final owner release: do not destroy the pool while
  * another thread may still call methods on this object. Borrowed guards that
  * outlive the pool remain safe to destroy; after pool close they are dropped
- * instead of recycled, and new operations on them fail.
+ * instead of recycled, and new operations on them fail. Destruction also
+ * joins the C connection-event dispatcher, so callback `user_data` may be
+ * released once it returns.
  */
 class pool
 {

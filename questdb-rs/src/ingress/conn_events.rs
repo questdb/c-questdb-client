@@ -262,8 +262,9 @@ fn dispatch_loop(inner: Arc<DispatcherInner>) {
     }
 }
 
-/// Per-source event context: one dispatcher plus the state needed to
-/// classify successes. `connect_succeeded` fires:
+/// Per-source event context: one dispatcher (fixed at construction — either
+/// present for the source's whole life or absent, never attached later) plus
+/// the state needed to classify successes. `connect_succeeded` fires:
 ///
 /// - [`ConnectionEventKind::Connected`] for the source's first-ever
 ///   success;
@@ -283,7 +284,7 @@ impl std::fmt::Debug for ConnectionEventSource {
 }
 
 pub(crate) struct ConnectionEventSource {
-    dispatcher: ConnectionEventDispatcher,
+    dispatcher: Mutex<Option<ConnectionEventDispatcher>>,
     attempts: AtomicU64,
     last_endpoint: Mutex<Option<(String, String)>>,
     failed_since_success: AtomicBool,
@@ -291,11 +292,46 @@ pub(crate) struct ConnectionEventSource {
 
 impl ConnectionEventSource {
     pub(crate) fn new(listener: ConnectionListener, inbox_capacity: usize) -> Self {
+        Self::with_dispatcher(Some(ConnectionEventDispatcher::new(
+            listener,
+            inbox_capacity,
+        )))
+    }
+
+    /// A source with no listener: emissions are discarded, but the attempt
+    /// counter and classification state still track. Lets pool emitters hold
+    /// one source unconditionally instead of threading `Option` everywhere.
+    pub(crate) fn disabled() -> Self {
+        Self::with_dispatcher(None)
+    }
+
+    fn with_dispatcher(dispatcher: Option<ConnectionEventDispatcher>) -> Self {
         Self {
-            dispatcher: ConnectionEventDispatcher::new(listener, inbox_capacity),
+            dispatcher: Mutex::new(dispatcher),
             attempts: AtomicU64::new(0),
             last_endpoint: Mutex::new(None),
             failed_since_success: AtomicBool::new(false),
+        }
+    }
+
+    fn lock_dispatcher(&self) -> std::sync::MutexGuard<'_, Option<ConnectionEventDispatcher>> {
+        match self.dispatcher.lock() {
+            Ok(dispatcher) => dispatcher,
+            Err(poisoned) => poisoned.into_inner(),
+        }
+    }
+
+    /// Detach and join the dispatcher. `offer` holds the same mutex while it
+    /// queues an event, so after this returns no emitter can reach the user
+    /// listener, even if an FFI-owned sender outlives its pool handle.
+    pub(crate) fn close(&self) {
+        let dispatcher = self.lock_dispatcher().take();
+        drop(dispatcher);
+    }
+
+    fn offer(&self, event: ConnectionEvent) {
+        if let Some(dispatcher) = self.lock_dispatcher().as_ref() {
+            dispatcher.offer(event);
         }
     }
 
@@ -311,7 +347,7 @@ impl ConnectionEventSource {
         attempt: u64,
     ) {
         self.failed_since_success.store(true, Ordering::Relaxed);
-        self.dispatcher.offer(
+        self.offer(
             ConnectionEvent::new(ConnectionEventKind::EndpointAttemptFailed)
                 .at(host, port)
                 .attempt(attempt)
@@ -321,7 +357,7 @@ impl ConnectionEventSource {
 
     pub(crate) fn auth_failed(&self, host: &str, port: &str, err: &crate::Error, attempt: u64) {
         self.failed_since_success.store(true, Ordering::Relaxed);
-        self.dispatcher.offer(
+        self.offer(
             ConnectionEvent::new(ConnectionEventKind::AuthFailed)
                 .at(host, port)
                 .attempt(attempt)
@@ -331,15 +367,14 @@ impl ConnectionEventSource {
 
     pub(crate) fn all_endpoints_unreachable(&self, err: &crate::Error) {
         self.failed_since_success.store(true, Ordering::Relaxed);
-        self.dispatcher.offer(
+        self.offer(
             ConnectionEvent::new(ConnectionEventKind::AllEndpointsUnreachable).caused_by(err),
         );
     }
 
     pub(crate) fn disconnected(&self, host: &str, port: &str) {
         self.failed_since_success.store(true, Ordering::Relaxed);
-        self.dispatcher
-            .offer(ConnectionEvent::new(ConnectionEventKind::Disconnected).at(host, port));
+        self.offer(ConnectionEvent::new(ConnectionEventKind::Disconnected).at(host, port));
     }
 
     pub(crate) fn connect_succeeded(&self, host: &str, port: &str) {
@@ -366,16 +401,22 @@ impl ConnectionEventSource {
         *last = Some((host.to_string(), port.to_string()));
         drop(last);
         if let Some(event) = event {
-            self.dispatcher.offer(event);
+            self.offer(event);
         }
     }
 
     pub(crate) fn dropped(&self) -> u64 {
-        self.dispatcher.dropped()
+        self.lock_dispatcher()
+            .as_ref()
+            .map(ConnectionEventDispatcher::dropped)
+            .unwrap_or(0)
     }
 
     pub(crate) fn delivered(&self) -> u64 {
-        self.dispatcher.delivered()
+        self.lock_dispatcher()
+            .as_ref()
+            .map(ConnectionEventDispatcher::delivered)
+            .unwrap_or(0)
     }
 }
 
@@ -536,5 +577,44 @@ mod tests {
         drop(dispatcher);
         wait_for(|| Arc::strong_count(&inner) == 1);
         assert!(inner.closed.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn source_close_fences_listener() {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let seen_in_listener = Arc::clone(&seen);
+        let source = ConnectionEventSource::new(
+            Arc::new(move |event: &ConnectionEvent| {
+                seen_in_listener.lock().unwrap().push(event.kind);
+            }),
+            8,
+        );
+
+        source.connect_succeeded("a", "1");
+        source.disconnected("a", "1");
+        source.connect_succeeded("a", "1");
+        wait_for(|| seen.lock().unwrap().len() == 3);
+        assert_eq!(
+            *seen.lock().unwrap(),
+            vec![
+                ConnectionEventKind::Connected,
+                ConnectionEventKind::Disconnected,
+                ConnectionEventKind::Reconnected
+            ]
+        );
+
+        source.close();
+        source.disconnected("a", "1");
+        std::thread::sleep(Duration::from_millis(20));
+        assert_eq!(seen.lock().unwrap().len(), 3);
+    }
+
+    #[test]
+    fn disabled_source_discards_events() {
+        let source = ConnectionEventSource::disabled();
+        source.connect_succeeded("a", "1");
+        source.disconnected("a", "1");
+        assert_eq!(source.delivered(), 0);
+        assert_eq!(source.dropped(), 0);
     }
 }

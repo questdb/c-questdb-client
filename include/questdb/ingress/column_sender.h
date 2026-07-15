@@ -173,7 +173,9 @@ questdb_db* questdb_db_connect(
  * Outstanding `qwp_sender` handles are independent leases: returning or
  * dropping them after close is safe, but new operations on them fail with
  * `line_sender_error_invalid_api_call`. A handle returned after close is
- * closed, not recycled.
+ * closed, not recycled. Close detaches and joins the connection-event
+ * dispatcher; after it returns no event callback can use its `user_data`,
+ * including callbacks from an outstanding sender's background runner.
  */
 QUESTDB_CLIENT_API
 void questdb_db_close(questdb_db* db);
@@ -389,12 +391,17 @@ size_t questdb_db_reap_idle(questdb_db* db);
 /* -------------------------------------------------------------------------
  * Connection lifecycle events
  *
- * Register one listener per pool with
- * `questdb_db_set_connection_event_handler`. Events are delivered on a
- * dedicated dispatcher thread (never an I/O or producer thread) through a
- * bounded inbox with a drop-oldest overflow policy, so a slow callback
- * cannot stall connects or publishing. Register before the first borrow to
- * observe the initial `connected` event.
+ * Open the pool with `questdb_db_connect_with_event_handler` to register one
+ * listener per pool. Events are delivered on a dedicated dispatcher thread
+ * (never an I/O or producer thread) through a bounded inbox with a
+ * drop-oldest overflow policy, so a slow callback cannot stall connects or
+ * publishing. Direct and store-and-forward senders share this one source and
+ * inbox; concurrent events are delivered in the order they enter that inbox.
+ *
+ * Registration happens before the pool opens anything, so the listener
+ * observes every transition — including the initial `connected` of disk
+ * recovery senders pre-opened during connect. There is no post-connect
+ * registration.
  * ------------------------------------------------------------------------- */
 
 /* Connection-event types (`questdb_connection_event`, the kind constants,
@@ -402,18 +409,20 @@ size_t questdb_db_reap_idle(questdb_db* db);
  * `questdb/ingress/line_sender.h`, shared with the sender-level
  * `line_sender_opts_connection_event_handler`. */
 
-/** Register a connection lifecycle listener on the pool. `inbox_capacity`
- * of 0 selects the default (64). At most one listener per pool; a second
- * registration fails with `line_sender_error_invalid_api_call`. The
- * caller guarantees `user_data` is safe to use from the dispatcher
- * thread. */
+/** `questdb_db_connect` with a connection lifecycle listener.
+ * `inbox_capacity` of 0 selects the default (64). The caller guarantees
+ * `user_data` is safe to use from the dispatcher thread until
+ * `questdb_db_close` returns. On failure (NULL return) no callback runs
+ * after this function returns and `user_data` may be released
+ * immediately. */
 QUESTDB_CLIENT_API
-bool questdb_db_set_connection_event_handler(
-    questdb_db* db,
+questdb_db* questdb_db_connect_with_event_handler(
+    const char* conf,
+    size_t conf_len,
     questdb_connection_event_cb callback,
     void* user_data,
     size_t inbox_capacity,
-    line_sender_error** err_out);
+    questdb_error** err_out);
 
 /** Total events discarded by the inbox's drop-oldest policy. */
 QUESTDB_CLIENT_API

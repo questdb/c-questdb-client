@@ -5076,6 +5076,24 @@ mod tests {
         state.to_fsn.store(view.to_fsn, Ordering::SeqCst);
     }
 
+    #[derive(Default)]
+    struct PoolConnectionEventState {
+        calls: AtomicU64,
+        saw_connected: AtomicBool,
+    }
+
+    unsafe extern "C" fn record_pool_connection_event(
+        user_data: *mut libc::c_void,
+        event: *const questdb_connection_event,
+    ) {
+        let state = unsafe { &*(user_data as *const PoolConnectionEventState) };
+        let event = unsafe { &*event };
+        if event.kind == questdb_connection_event_connected {
+            state.saw_connected.store(true, Ordering::SeqCst);
+        }
+        state.calls.fetch_add(1, Ordering::SeqCst);
+    }
+
     fn read_request_until_blank(stream: &mut TcpStream) -> std::io::Result<Vec<u8>> {
         // The mock server sets a short per-read timeout (~50ms) on accepted
         // sockets so the post-handshake read loop can poll for shutdown. That
@@ -5557,6 +5575,58 @@ mod tests {
 
             questdb_db_return_sender(ptr::null_mut(), sender);
             column_sender_chunk_free(chunk);
+        }
+    }
+
+    #[test]
+    fn pooled_sfa_borrow_delivers_connection_event_through_c_abi() {
+        let server = PooledQwpMock::spawn(1);
+        let callback_state = PoolConnectionEventState::default();
+        unsafe {
+            let mut err = ptr::null_mut();
+            let conf = server.conf();
+            let db = questdb_db_connect_with_event_handler(
+                conf.as_ptr() as *const c_char,
+                conf.len(),
+                record_pool_connection_event,
+                &callback_state as *const PoolConnectionEventState as *mut libc::c_void,
+                0,
+                &mut err,
+            );
+            assert!(!db.is_null(), "pool connect failed");
+            assert!(err.is_null());
+
+            let sender = questdb_db_borrow_sender(db, &mut err);
+            assert!(!sender.is_null());
+            assert!(err.is_null());
+
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            while callback_state.calls.load(Ordering::SeqCst) == 0
+                || questdb_db_connection_events_delivered(db) == 0
+            {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "timed out waiting for pooled SFA Connected callback"
+                );
+                thread::sleep(Duration::from_millis(5));
+            }
+            assert!(callback_state.saw_connected.load(Ordering::SeqCst));
+            assert_eq!(questdb_db_connection_events_dropped(db), 0);
+
+            // Keep the owned sender alive across pool close. close() must
+            // detach and join the dispatcher before the binding may release
+            // user_data; a later transport death from this runner is silent.
+            questdb_db_close(db);
+            let calls_after_close = callback_state.calls.load(Ordering::SeqCst);
+            drop(server);
+            thread::sleep(Duration::from_millis(200));
+            assert_eq!(
+                callback_state.calls.load(Ordering::SeqCst),
+                calls_after_close,
+                "callback ran after questdb_db_close returned"
+            );
+
+            questdb_db_return_sender(ptr::null_mut(), sender);
         }
     }
 

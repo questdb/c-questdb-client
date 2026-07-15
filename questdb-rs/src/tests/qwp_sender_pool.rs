@@ -37,7 +37,7 @@
 
 use std::collections::BTreeSet;
 use std::fs;
-use std::io::Read;
+use std::io::{Read, Write};
 use std::net::TcpListener;
 use std::path::Path;
 use std::sync::Arc;
@@ -90,6 +90,12 @@ enum MockMode {
     /// data frame with a `trades` table seq_txn, and answer every keepalive
     /// ping with a pong + a durable-ACK frame so a `Durable` boundary commits.
     AckEachFrameDurable,
+    /// The first accepted connection reads one data frame and closes without
+    /// ACKing; later connections ACK normally. Drives deterministic replay and
+    /// same-endpoint reconnect in the store-and-forward runner.
+    ReconnectAfterFirstFrame,
+    /// Reject the WebSocket upgrade with HTTP 401.
+    RejectAuth,
 }
 
 /// Spawn a mock server that performs the WS upgrade for up to `max_accepts`
@@ -159,6 +165,14 @@ impl MockServer {
         let server =
             Self::spawn_with_mode_capture(max_accepts, MockMode::AckEachFrameDurable, Some(tx));
         (server, rx)
+    }
+
+    fn spawn_reconnecting(max_accepts: usize) -> Self {
+        Self::spawn_with_mode(max_accepts, MockMode::ReconnectAfterFirstFrame)
+    }
+
+    fn spawn_auth_rejecting(max_accepts: usize) -> Self {
+        Self::spawn_with_mode(max_accepts, MockMode::RejectAuth)
     }
 
     #[cfg(feature = "polars-ingress")]
@@ -254,7 +268,8 @@ fn run_mock_server_accept_loop(
     while !stop.load(Ordering::SeqCst) {
         match listener.accept() {
             Ok((mut stream, _)) => {
-                if accepted.fetch_add(1, Ordering::SeqCst) >= max_accepts {
+                let accept_index = accepted.fetch_add(1, Ordering::SeqCst);
+                if accept_index >= max_accepts {
                     // Past the budget — drop without upgrade so the client sees
                     // a failed connect.
                     continue;
@@ -266,6 +281,10 @@ fn run_mock_server_accept_loop(
                 let capture = capture.clone();
                 let mode = mode.clone();
                 let h = thread::spawn(move || {
+                    if matches!(mode, MockMode::RejectAuth) {
+                        reject_upgrade_auth(&mut stream);
+                        return;
+                    }
                     // Durable mode needs the `X-QWP-Durable-Ack: enabled` upgrade
                     // header; every other mode uses the plain upgrade.
                     let upgraded = if matches!(mode, MockMode::AckEachFrameDurable) {
@@ -280,6 +299,13 @@ fn run_mock_server_accept_loop(
                             MockMode::AckEachFrameDurable => {
                                 ack_each_frame_durable(&mut stream, &stop, capture)
                             }
+                            MockMode::ReconnectAfterFirstFrame if accept_index == 0 => {
+                                read_then_close(&mut stream, &stop, 1)
+                            }
+                            MockMode::ReconnectAfterFirstFrame => {
+                                ack_each_frame(&mut stream, &stop, capture)
+                            }
+                            MockMode::RejectAuth => unreachable!("handled before upgrade"),
                             MockMode::ErrorEachFrame(status) => {
                                 error_each_frame(&mut stream, &stop, status)
                             }
@@ -307,6 +333,20 @@ fn run_mock_server_accept_loop(
     for h in handles {
         let _ = h.join();
     }
+}
+
+fn reject_upgrade_auth(stream: &mut std::net::TcpStream) {
+    let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
+    let mut request = Vec::new();
+    let mut buf = [0u8; 256];
+    while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+        match stream.read(&mut buf) {
+            Ok(0) | Err(_) => return,
+            Ok(n) => request.extend_from_slice(&buf[..n]),
+        }
+    }
+    let _ = stream
+        .write_all(b"HTTP/1.1 401 Unauthorized\r\nConnection: close\r\nContent-Length: 0\r\n\r\n");
 }
 
 impl Drop for MockServer {
@@ -6458,9 +6498,8 @@ mod conn_event_tests {
             server.port(),
             "sender_pool_min=1;sender_pool_max=2;pool_reap=manual;",
         );
-        let db = QuestDb::connect(&conf).unwrap();
         let (seen, listener) = collecting_listener();
-        db.set_connection_listener(listener, 0).unwrap();
+        let db = QuestDb::connect_with_listener(&conf, listener, 0).unwrap();
 
         let borrowed = db.borrow_direct_column_sender().expect("borrow");
         let events = wait_for_kinds(&seen, &[ConnectionEventKind::Connected]);
@@ -6473,7 +6512,13 @@ mod conn_event_tests {
             connected.port.as_deref(),
             Some(server.port().to_string()).as_deref()
         );
-        assert_eq!(db.connection_events_delivered(), 1);
+        // The delivered counter advances after the listener returns, so it can
+        // trail the `seen` push observed by wait_for_kinds.
+        assert!(
+            wait_until(Duration::from_secs(2), || db.connection_events_delivered()
+                == 1),
+            "Connected event did not advance the delivered counter"
+        );
         assert_eq!(db.connection_events_dropped(), 0);
         drop(borrowed);
 
@@ -6495,21 +6540,6 @@ mod conn_event_tests {
     }
 
     #[test]
-    fn second_listener_registration_rejected() {
-        let server = MockServer::spawn(2);
-        let conf = conf_for(
-            server.port(),
-            "sender_pool_min=1;sender_pool_max=1;pool_reap=manual;",
-        );
-        let db = QuestDb::connect(&conf).unwrap();
-        let (_seen, listener) = collecting_listener();
-        db.set_connection_listener(listener, 0).unwrap();
-        let (_seen2, listener2) = collecting_listener();
-        let err = db.set_connection_listener(listener2, 0).unwrap_err();
-        assert_eq!(err.code(), ErrorCode::InvalidApiCall);
-    }
-
-    #[test]
     fn unreachable_endpoint_fires_attempt_failed_and_unreachable() {
         // Bind a port and close the listener so connects are refused.
         let port = {
@@ -6521,9 +6551,8 @@ mod conn_event_tests {
              reconnect_max_duration_millis=200;connect_timeout=100;\
              sender_pool_min=1;sender_pool_max=1;pool_reap=manual;"
         );
-        let db = QuestDb::connect(&conf).unwrap();
         let (seen, listener) = collecting_listener();
-        db.set_connection_listener(listener, 0).unwrap();
+        let db = QuestDb::connect_with_listener(&conf, listener, 0).unwrap();
 
         let err = db
             .borrow_direct_column_sender()
@@ -6569,9 +6598,8 @@ mod conn_event_tests {
             &[server_a.port(), server_b.port()],
             "connect_timeout=200;sender_pool_min=1;sender_pool_max=2;pool_reap=manual;",
         );
-        let db = QuestDb::connect(&conf).unwrap();
         let (seen, listener) = collecting_listener();
-        db.set_connection_listener(listener, 0).unwrap();
+        let db = QuestDb::connect_with_listener(&conf, listener, 0).unwrap();
 
         let first = db.borrow_direct_column_sender().expect("first borrow");
         let events = wait_for_kinds(&seen, &[ConnectionEventKind::Connected]);
@@ -6614,6 +6642,176 @@ mod conn_event_tests {
         );
         drop(events);
         drop(server_b);
+    }
+
+    #[test]
+    fn sfa_first_borrow_fires_connected_with_endpoint_and_counter() {
+        let server = MockServer::spawn(2);
+        let conf = conf_for(
+            server.port(),
+            "sender_pool_min=1;sender_pool_max=1;pool_reap=manual;close_flush_timeout_millis=0;",
+        );
+        let (seen, listener) = collecting_listener();
+        let db = QuestDb::connect_with_listener(&conf, listener, 0).unwrap();
+
+        let borrowed = db.borrow_sender().expect("SFA borrow");
+        let events = wait_for_kinds(&seen, &[ConnectionEventKind::Connected]);
+        let connected = events
+            .iter()
+            .find(|event| event.kind == ConnectionEventKind::Connected)
+            .unwrap();
+        assert_eq!(connected.host.as_deref(), Some("127.0.0.1"));
+        assert_eq!(
+            connected.port.as_deref(),
+            Some(server.port().to_string()).as_deref()
+        );
+        assert!(
+            wait_until(Duration::from_secs(2), || db.connection_events_delivered()
+                >= 1),
+            "SFA Connected event did not advance the delivered counter"
+        );
+        assert_eq!(db.connection_events_dropped(), 0);
+        drop(borrowed);
+    }
+
+    #[test]
+    fn sfa_unreachable_endpoint_fires_attempt_failed_and_unreachable() {
+        let port = unused_local_port();
+        let conf = format!(
+            "ws::addr=127.0.0.1:{port};auth_timeout=2000;\
+             reconnect_max_duration_millis=200;connect_timeout=100;\
+             sender_pool_min=1;sender_pool_max=1;pool_reap=manual;close_flush_timeout_millis=0;"
+        );
+        let (seen, listener) = collecting_listener();
+        let db = QuestDb::connect_with_listener(&conf, listener, 0).unwrap();
+
+        // Pool SFA opens asynchronously: the borrow succeeds and the runner
+        // narrates its failed endpoint sweep on the shared source.
+        let borrowed = db.borrow_sender().expect("async SFA borrow");
+        let events = wait_for_kinds(
+            &seen,
+            &[
+                ConnectionEventKind::EndpointAttemptFailed,
+                ConnectionEventKind::AllEndpointsUnreachable,
+            ],
+        );
+        let attempt = events
+            .iter()
+            .find(|event| event.kind == ConnectionEventKind::EndpointAttemptFailed)
+            .unwrap();
+        assert_eq!(attempt.host.as_deref(), Some("127.0.0.1"));
+        assert!(attempt.attempt_number.is_some());
+        assert!(attempt.cause_code.is_some());
+        assert!(
+            wait_until(Duration::from_secs(2), || db.connection_events_delivered()
+                >= 2),
+            "SFA endpoint failures did not advance the delivered counter"
+        );
+        drop(borrowed);
+    }
+
+    #[test]
+    fn sfa_auth_rejection_fires_auth_failed() {
+        let server = MockServer::spawn_auth_rejecting(1);
+        let conf = conf_for(
+            server.port(),
+            "sender_pool_min=1;sender_pool_max=1;pool_reap=manual;close_flush_timeout_millis=0;",
+        );
+        let (seen, listener) = collecting_listener();
+        let db = QuestDb::connect_with_listener(&conf, listener, 0).unwrap();
+
+        let borrowed = db.borrow_sender().expect("async SFA borrow");
+        let events = wait_for_kinds(&seen, &[ConnectionEventKind::AuthFailed]);
+        let auth = events
+            .iter()
+            .find(|event| event.kind == ConnectionEventKind::AuthFailed)
+            .unwrap();
+        assert_eq!(auth.cause_code, Some(ErrorCode::AuthError));
+        assert!(auth.attempt_number.is_some());
+        assert!(
+            wait_until(Duration::from_secs(2), || db.connection_events_delivered()
+                >= 1),
+            "SFA AuthFailed event did not advance the delivered counter"
+        );
+        drop(borrowed);
+    }
+
+    #[test]
+    fn sfa_transport_death_fires_disconnected_then_reconnected() {
+        let server = MockServer::spawn_reconnecting(4);
+        let conf = conf_for(
+            server.port(),
+            "sender_pool_min=1;sender_pool_max=1;pool_reap=manual;close_flush_timeout_millis=0;",
+        );
+        let (seen, listener) = collecting_listener();
+        let db = QuestDb::connect_with_listener(&conf, listener, 0).unwrap();
+
+        let mut sender = db.borrow_sender().expect("SFA borrow");
+        let mut buffer = one_symbol_buffer(&db, "alpha");
+        sender
+            .flush_buffer_and_wait(&mut buffer, AckLevel::Ok)
+            .expect("runner should reconnect and replay the unacked frame");
+
+        let events = wait_for_kinds(
+            &seen,
+            &[
+                ConnectionEventKind::Connected,
+                ConnectionEventKind::Disconnected,
+                ConnectionEventKind::Reconnected,
+            ],
+        );
+        let position = |kind| {
+            events
+                .iter()
+                .position(|event| event.kind == kind)
+                .expect("event kind present")
+        };
+        assert!(
+            position(ConnectionEventKind::Connected) < position(ConnectionEventKind::Disconnected)
+        );
+        assert!(
+            position(ConnectionEventKind::Disconnected)
+                < position(ConnectionEventKind::Reconnected)
+        );
+        assert!(server.accepted() >= 2, "runner did not reconnect");
+        assert!(
+            wait_until(Duration::from_secs(2), || db.connection_events_delivered()
+                >= 3),
+            "SFA reconnect events did not advance the delivered counter"
+        );
+    }
+
+    #[test]
+    fn disk_sfa_recovery_runner_reports_through_connect_time_listener() {
+        let dir = TempDir::new().unwrap();
+        seed_async_qwp_ws_slot(dir.path(), "late-events-ingest-0", 71);
+        let (server, frames) = MockServer::spawn_acking_capturing(1);
+        let conf = conf_for_endpoints(
+            &[server.port()],
+            &format!(
+                "sf_dir={};sender_id=late-events;sender_pool_min=1;sender_pool_max=1;\
+                 pool_reap=manual;max_background_drainers=1;\
+                 close_flush_timeout_millis=0;",
+                dir.path().display()
+            ),
+        );
+
+        // connect() registers the listener before it constructs and starts
+        // the dirty-slot recovery runner, so the runner's initial connect is
+        // observed even though it happens in the background.
+        let (seen, listener) = collecting_listener();
+        let db = QuestDb::connect_with_listener(&conf, listener, 0).unwrap();
+
+        wait_for_kinds(&seen, &[ConnectionEventKind::Connected]);
+        let payload = frames
+            .recv_timeout(Duration::from_secs(5))
+            .expect("pre-opened recovery sender should replay its frame");
+        assert_eq!(frame_table_name(&payload), "legacy");
+        assert!(
+            wait_until(Duration::from_secs(2), || db.connection_events_delivered()
+                >= 1),
+            "recovery runner event did not advance the delivered counter"
+        );
     }
 }
 
@@ -6681,7 +6879,14 @@ mod sender_conn_event_tests {
             connected.port.as_deref(),
             Some(server.port().to_string()).as_deref()
         );
-        assert_eq!(sender.connection_events_delivered(), 1);
+        // The delivered counter advances after the listener returns, so it can
+        // trail the `seen` push observed by wait_for_kind.
+        assert!(
+            wait_until(Duration::from_secs(2), || sender
+                .connection_events_delivered()
+                == 1),
+            "Connected event did not advance the delivered counter"
+        );
         assert_eq!(sender.connection_events_dropped(), 0);
         drop(sender);
     }
