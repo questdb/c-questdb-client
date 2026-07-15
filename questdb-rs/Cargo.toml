@@ -367,6 +367,18 @@ required-features = ["polars", "sync-sender-qwp-ws"]
 name = "qwp_ingress_polars"
 required-features = ["polars", "sync-sender-qwp-ws", "sync-sender-http"]
 
+# Rust row-API ingress bench, the row-major counterpart to qwp_ingress_polars:
+# row-build floor (Buffer append + clear, no network) + row-flush e2e
+# (flush per batch, AckLevel::Ok checkpoint every 64 batches). No polars
+# dependency. Uses ureq for the DEDUP table create + WAL count gate, hence
+# sync-sender-http. Run with:
+#
+#   cargo run --release --example qwp_ingress_row \
+#       --features sync-sender-qwp-ws,sync-sender-http
+[[example]]
+name = "qwp_ingress_row"
+required-features = ["sync-sender-qwp-ws", "sync-sender-http"]
+
 # Step 3 (§6) — Rust Polars egress parity on S1. Reads the table back via
 # fetch_all_polars / iter_polars / next_polars and reports decode vs
 # assemble vs the honest decode_plus_assemble sum, emitting the §3.2 JSON

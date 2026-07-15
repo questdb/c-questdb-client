@@ -28,10 +28,17 @@ void bench_die(const char* prog, const char* what, line_sender_error* err)
     exit(1);
 }
 
+void sender_range(size_t rows, size_t n, size_t k, size_t* lo, size_t* hi)
+{
+    *lo = rows * k / n;
+    *hi = rows * (k + 1) / n;
+}
+
 /* Append rows [start, start+n) of every column + the designated ts.
  * Chunk appends are zero-copy: the bench_data buffers outlive the flush. */
 void stage_batch(column_sender_chunk* chunk, const bench_data* d,
-                 schema_kind kind, size_t start, size_t n, const char* prog)
+                 schema_kind kind, size_t start, size_t n,
+                 stage_scratch* scratch, const char* prog)
 {
     line_sender_error* err = NULL;
     const column_sender_validity* NOV = NULL;
@@ -43,14 +50,13 @@ void stage_batch(column_sender_chunk* chunk, const bench_data* d,
             d->sym.offsets, d->sym.card + 1, d->sym.bytes, d->sym.bytes_len, NOV, &err))
         bench_die(prog, "append sym", err);
     /* notes are fixed-length: rebased offsets are just i*varchar_len */
-    static int32_t* note_off = NULL;
-    static size_t note_off_cap = 0;
-    if (note_off_cap < n + 1) {
-        note_off = realloc(note_off, (n + 1) * sizeof(int32_t));
-        note_off_cap = n + 1;
-        for (size_t i = 0; i <= n; i++) note_off[i] = (int32_t)(i * d->varchar_len);
+    if (scratch->cap < n + 1) {
+        scratch->note_off = realloc(scratch->note_off, (n + 1) * sizeof(int32_t));
+        scratch->cap = n + 1;
+        for (size_t i = 0; i <= n; i++)
+            scratch->note_off[i] = (int32_t)(i * d->varchar_len);
     }
-    if (!column_sender_chunk_column_str(chunk, "note", 4, note_off,
+    if (!column_sender_chunk_column_str(chunk, "note", 4, scratch->note_off,
             d->note_bytes + start * d->varchar_len, n * d->varchar_len, n, NOV, &err))
         bench_die(prog, "append note", err);
     if (kind == SCHEMA_S2_WIDE) {
@@ -80,14 +86,15 @@ void stage_batch(column_sender_chunk* chunk, const bench_data* d,
  * pipeline; the commit's no-progress wait is bounded by the pool's
  * request_timeout). */
 void ingest_pass(direct_column_sender* sender, column_sender_chunk* chunk,
-                 const bench_data* d, schema_kind kind, size_t max_batch_rows,
+                 const bench_data* d, schema_kind kind, size_t lo, size_t hi,
+                 size_t max_batch_rows, stage_scratch* scratch,
                  const char* prog)
 {
     line_sender_error* err = NULL;
     size_t batch_no = 0;
-    for (size_t start = 0; start < d->rows; start += max_batch_rows) {
-        size_t n = d->rows - start < max_batch_rows ? d->rows - start : max_batch_rows;
-        stage_batch(chunk, d, kind, start, n, prog);
+    for (size_t start = lo; start < hi; start += max_batch_rows) {
+        size_t n = hi - start < max_batch_rows ? hi - start : max_batch_rows;
+        stage_batch(chunk, d, kind, start, n, scratch, prog);
         if (sender) {
             if (!direct_column_sender_flush(sender, chunk, &err)) /* clears chunk */
                 bench_die(prog, "flush", err);

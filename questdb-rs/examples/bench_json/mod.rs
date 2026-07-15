@@ -385,6 +385,9 @@ pub struct Report {
     run_mode: String,
     pub warmups: usize,
     pub wire_bytes: u64,
+    /// Parallel e2e senders (ingress only; `1` = the classic single-sender
+    /// bench). Emitted as a top-level `"senders"` key on ingress reports.
+    pub senders: usize,
     pub env: Env,
     paths: Vec<(String, PathSummary)>,
     headline: Obj,
@@ -411,6 +414,7 @@ impl Report {
             run_mode: run_mode.to_string(),
             warmups: 0,
             wire_bytes: 0,
+            senders: 1,
             env: Env::collect(&[]),
             paths: Vec::new(),
             headline: Obj::new(),
@@ -471,6 +475,35 @@ impl Report {
             assemble.rows_per_s_median,
         );
         h.opt_float("decode_plus_assemble_mib_per_s", assemble.mib_per_s);
+        // Cross-language comparand (plan §3.6): the strict analog of the
+        // Java and C `materialize` headline field, folded in when the
+        // caller also measured a `materialize` path.
+        if let Some(materialize) = self.path("materialize") {
+            h.opt_float("materialize_rows_per_s", materialize.rows_per_s_median);
+        }
+        self.headline = h;
+    }
+
+    /// Row-API ingress headline (`qwp_ingress_row.rs`): pairs the
+    /// floor `row-build` (Buffer append + clear, no network) with the e2e
+    /// `row-flush` (flush-per-batch + ack-checkpoint) path. Unlike
+    /// [`Self::compute_ingress_headline`] (the Polars DataFrame path), the
+    /// row API has no wire-encode step to isolate — `row-build` measures the
+    /// Buffer-append cost only, so there is no `*_mib_per_s` floor rate; the
+    /// e2e side still gets one since `wire_bytes` is a real (if `0`)
+    /// per-path value on that path.
+    pub fn compute_row_headline(&mut self) {
+        let (Some(build), Some(flush)) = (self.path("row-build"), self.path("row-flush")) else {
+            return;
+        };
+        let build_s = build.median_s;
+        let flush_s = flush.median_s;
+        let mut h = Obj::new();
+        h.float("row_build_s", build_s);
+        h.float("row_flush_s", flush_s);
+        h.opt_float("row_build_rows_per_s", build.rows_per_s_median);
+        h.opt_float("row_flush_rows_per_s", flush.rows_per_s_median);
+        h.opt_float("row_flush_mib_per_s", flush.mib_per_s);
         self.headline = h;
     }
 
@@ -484,6 +517,9 @@ impl Report {
         top.str("run_mode", &self.run_mode);
         top.int("warmups", self.warmups as u64);
         top.int("wire_bytes", self.wire_bytes);
+        if self.direction == "ingress" {
+            top.int("senders", self.senders as u64);
+        }
         top.raw("machine", self.env.obj.to_json(0));
         top.raw("commits", commits_block().to_json(0));
         if !self.headline.0.is_empty() {

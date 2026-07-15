@@ -56,7 +56,7 @@ use polars::prelude::{
     NamedFrom, PlSmallStr, Series, TimeUnit,
 };
 use questdb::QuestDb;
-use questdb::egress::Reader;
+use questdb::egress::{ColumnView, Reader};
 use questdb::ingress::ColumnName;
 use questdb::ingress::polars::PolarsIngestOptions;
 
@@ -207,6 +207,103 @@ fn measure_decode_only(
         cpu.push(c);
     }
     Ok((wall, cpu))
+}
+
+/// Row-count assertion for the `materialize` pass only. Exits the
+/// process with code 2 (rather than propagating a `Box<dyn Error>`,
+/// which would make `main` exit 1) to match the C twin's
+/// (`examples/qwp_egress_c.c`) `read_pass`/`main` mismatch handling
+/// exactly.
+fn assert_rows_materialize(seen: u64, expected: u64) {
+    if seen != expected {
+        eprintln!("[qwp_egress_polars] materialize rows {seen} != {expected}");
+        std::process::exit(2);
+    }
+}
+
+/// e2e: the Rust analog of the C twin's `read_pass(materialize=1)` and
+/// Java's `materialize` path — touch every cell in every batch through
+/// the typed `ColumnView` accessors (the Rust-user analog of assembling
+/// a DataFrame) and fold everything into one `f64` checksum, so the
+/// reads cannot be optimized away and the result is cross-checkable
+/// against the other clients' stderr checksum for the same table.
+///
+/// Same kind mapping as C: `i64`-backed kinds (long / timestamp /
+/// timestamp_nanos) add the raw value; double adds the value; symbol
+/// adds the resolved string length; varchar adds the byte length; every
+/// other kind is skipped. NULL cells contribute `0` for every kind —
+/// matching the C twin's `reader_column_data_get_{i64,f64}`, whose
+/// null branch returns `0`/`0.0` rather than the underlying bit
+/// pattern (unlike `FixedColumn::value`, which does not consult
+/// validity). Fresh `Reader` per iteration, same construction as
+/// [`measure_decode_only`].
+fn measure_materialize(
+    host: &str,
+    port: u16,
+    select: &str,
+    rows: u64,
+    iterations: usize,
+    warmups: usize,
+) -> Result<(Samples, f64), Box<dyn Error>> {
+    let conf = format!("ws::addr={host}:{port};compression=raw;");
+    let mut checksum = 0.0f64;
+    let mut run = || -> Result<u64, Box<dyn Error>> {
+        let mut reader = Reader::from_conf(&conf)?;
+        let mut cursor = reader.prepare(select).execute()?;
+        let mut seen: u64 = 0;
+        let mut sum = 0.0f64;
+        while let Some(view) = cursor.next_batch()? {
+            let nrows = view.row_count();
+            for c in 0..view.column_count() {
+                match view.column(c)? {
+                    ColumnView::Long(fc)
+                    | ColumnView::Timestamp(fc)
+                    | ColumnView::TimestampNanos(fc) => {
+                        for row in 0..nrows {
+                            if !fc.is_null(row) {
+                                sum += fc.value(row) as f64;
+                            }
+                        }
+                    }
+                    ColumnView::Double(fc) => {
+                        for row in 0..nrows {
+                            if !fc.is_null(row) {
+                                sum += fc.value(row);
+                            }
+                        }
+                    }
+                    ColumnView::Symbol(sc) => {
+                        for row in 0..nrows {
+                            sum += sc.resolve(row).map_or(0.0, |s| s.len() as f64);
+                        }
+                    }
+                    ColumnView::Varchar(vc) => {
+                        for row in 0..nrows {
+                            sum += vc.value(row).map_or(0.0, |s| s.len() as f64);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            seen += nrows as u64;
+        }
+        checksum = sum;
+        Ok(seen)
+    };
+    for _ in 0..warmups {
+        let seen = run()?;
+        assert_rows_materialize(seen, rows);
+    }
+    let mut wall = Vec::with_capacity(iterations);
+    let mut cpu = Vec::with_capacity(iterations);
+    for _ in 0..iterations {
+        let (w, c, r) = timed(&mut run);
+        let seen = r?;
+        assert_rows_materialize(seen, rows);
+        wall.push(w);
+        cpu.push(c);
+    }
+    Ok(((wall, cpu), checksum))
 }
 
 /// Split point: build the Arrow `RecordBatch` per batch (decode + `convert.rs`)
@@ -516,6 +613,24 @@ fn main() -> Result<(), Box<dyn Error>> {
             Some(wire_bytes),
         ),
     );
+
+    // --- materialize e2e (checksum walk, the Java/C `materialize` comparand). ---
+    eprintln!("[qwp_egress_polars] measuring materialize ...");
+    let ((mat_wall, mat_cpu), checksum) =
+        measure_materialize(&host, port, select, rows as u64, iterations, warmups)?;
+    report.add_path(
+        "materialize",
+        PathSummary::new(
+            &mat_wall,
+            &mat_cpu,
+            rows,
+            columns,
+            "e2e",
+            warmups > 0,
+            Some(wire_bytes),
+        ),
+    );
+    eprintln!("[qwp_egress_polars] checksum={checksum}");
 
     // --- to-arrow split (decode + Arrow RecordBatch build, no polars). ---
     eprintln!("[qwp_egress_polars] measuring to-arrow ...");

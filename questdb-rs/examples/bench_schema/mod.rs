@@ -147,3 +147,41 @@ pub fn sym_label(v: usize) -> String {
 pub fn hi_sym_label(col: usize, v: usize) -> String {
     format!("s{}_{:06}", col - 1, v)
 }
+
+/// Precomputed pool of low-cardinality `sym` labels: `pool[v] ==
+/// sym_label(v)`, so `pool[i % pool.len()]` reproduces the per-row
+/// `sym_label(i % card)` call byte-for-byte. Built once outside the timed
+/// loop -- per-row `format!` would otherwise be ~45% of a row-bench pass.
+#[allow(dead_code)] // not every example that includes this module ingests
+pub fn sym_pool(card: usize) -> Vec<String> {
+    (0..card).map(sym_label).collect()
+}
+
+/// Precomputed pools for the high-cardinality s1..s5 SYMBOL labels, indexed
+/// by 0-based wide-column position: `pools[col - 1][v] == hi_sym_label(col,
+/// v)` for the 1-based `col` used by `hi_sym_label`.
+#[allow(dead_code)]
+pub fn hi_sym_pools(card: usize) -> Vec<Vec<String>> {
+    (1..=N_WIDE_SYMS)
+        .map(|col| (0..card).map(|v| hi_sym_label(col, v)).collect())
+        .collect()
+}
+
+/// Contiguous per-sender row ranges tiling `[0, rows)` exactly: sender `k`
+/// of `n` owns `[rows*k/n, rows*(k+1)/n)` (multiply-first integer math, so
+/// the ranges never drift). Panics if the tiling invariants break — a bad
+/// edit fails at startup instead of silently corrupting parity. Empty
+/// ranges (when `n > rows`) are legal and loop as no-ops.
+#[allow(dead_code)] // not every example that includes this module ingests
+pub fn sender_ranges(rows: usize, senders: usize) -> Vec<(usize, usize)> {
+    let n = senders.max(1);
+    let ranges: Vec<(usize, usize)> = (0..n)
+        .map(|k| (rows * k / n, rows * (k + 1) / n))
+        .collect();
+    assert_eq!(ranges[0].0, 0, "first range must start at 0");
+    assert_eq!(ranges[n - 1].1, rows, "last range must end at rows");
+    for pair in ranges.windows(2) {
+        assert_eq!(pair[0].1, pair[1].0, "ranges must tile without gaps");
+    }
+    ranges
+}

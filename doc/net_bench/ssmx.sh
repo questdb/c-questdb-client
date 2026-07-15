@@ -29,7 +29,8 @@ box_env() {
     echo "export HOME=/root QNB_BUCKET='$BUCKET' QNB_PEER_IP='$peer_ip'" \
          "QNB_QUESTDB_COMMIT='$QNB_QUESTDB_COMMIT'" \
          "QNB_C_CLIENT_COMMIT='$QNB_C_CLIENT_COMMIT'" \
-         "QNB_PY_CLIENT_COMMIT='$QNB_PY_CLIENT_COMMIT'"
+         "QNB_PY_CLIENT_COMMIT='$QNB_PY_CLIENT_COMMIT'" \
+         "QNB_JAVA_CLIENT_COMMIT='$QNB_JAVA_CLIENT_COMMIT'"
 }
 
 send_and_wait() { # $1 = command string, $2 = timeout seconds
