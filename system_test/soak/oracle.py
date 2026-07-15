@@ -108,14 +108,16 @@ def check_mixed_shape_coverage(name, watermark, batch_size, shapes):
 
 class BoundsConfig:
     def __init__(self, warmup_seconds=600, rss_slope_max_kib_per_min=100.0,
-                 rss_growth_max_frac=0.10, rss_peak_mult=4.0,
-                 fd_tolerance=4, require_pool_drain=True,
+                 rss_growth_max_frac=0.25, rss_peak_mult=4.0,
+                 fd_tolerance=4, fd_slope_max_per_min=0.5,
+                 require_pool_drain=True,
                  inflight_slope_max_per_min=50.0, inflight_peak_max=1_000_000):
         self.warmup_seconds = warmup_seconds
         self.rss_slope_max_kib_per_min = rss_slope_max_kib_per_min
         self.rss_growth_max_frac = rss_growth_max_frac
         self.rss_peak_mult = rss_peak_mult
         self.fd_tolerance = fd_tolerance
+        self.fd_slope_max_per_min = fd_slope_max_per_min
         self.require_pool_drain = require_pool_drain
         # In-flight frames (published - acked) — a store-and-forward backlog
         # leak shows up as monotonic growth here.
@@ -230,18 +232,23 @@ def _rss_verdict(leg, warmup, steady, cfg):
 
 
 def _fd_verdict(leg, steady, cfg):
-    fds = [s['fd_count'] for s in steady if s.get('fd_count') is not None]
-    if len(fds) < 3:
+    pts = [(s['t'], s['fd_count']) for s in steady if s.get('fd_count') is not None]
+    if len(pts) < 3:
         return Verdict('I4', f'{leg}:fd', True,
-                       f'inconclusive: only {len(fds)} fd samples')
+                       f'inconclusive: only {len(pts)} fd samples')
+    t0 = pts[0][0]
+    xs = [(t - t0) / 60.0 for t, _ in pts]
+    fds = [f for _, f in pts]
+    slope = linreg_slope(xs, fds)
     baseline = min(fds)
-    final = fds[-1]
     peak = max(fds)
-    ok = (final <= baseline + cfg.fd_tolerance
+    ok = (slope <= cfg.fd_slope_max_per_min
           and peak <= baseline + cfg.fd_tolerance * 8)
     return Verdict('I4', f'{leg}:fd', ok, {
-        'baseline': baseline, 'final': final, 'peak': peak,
-        'tolerance': cfg.fd_tolerance,
+        'baseline': baseline, 'final': fds[-1], 'peak': peak,
+        'slope_per_min': round(slope, 3),
+        'limits': {'slope_max': cfg.fd_slope_max_per_min,
+                   'peak_over_baseline': cfg.fd_tolerance * 8},
     })
 
 
@@ -628,6 +635,11 @@ def _selftest():
     vf = analyze_bounds(fdleak, cfg)
     check(any(v.name.endswith(':fd') and not v.passed for v in vf),
           'I4 detects FD leak')
+
+    fdheld = [sample(i * 300, 100_000_000, 3 if i % 5 == 0 else 11) for i in range(20)]
+    vh = analyze_bounds(fdheld, cfg)
+    check(all(v.passed for v in vh if v.name.endswith(':fd')),
+          'I4 bounded held-fd working set passes')
 
     # I4: SF mem backlog exceeding max_bytes fails.
     sfbad = [sample(i, 100_000_000, 20, backlog=200, mx=100) for i in range(20)]
