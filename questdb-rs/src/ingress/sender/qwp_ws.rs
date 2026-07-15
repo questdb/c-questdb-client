@@ -2423,9 +2423,22 @@ fn connect_tcp_to_any_addr(
                 tcp.set_nodelay(true).ok();
                 tcp.set_read_timeout(Some(request_timeout)).ok();
                 tcp.set_write_timeout(Some(request_timeout)).ok();
-                let sock = socket2::SockRef::from(&tcp);
-                sock.set_send_buffer_size(4 * 1024 * 1024).ok();
-                sock.set_recv_buffer_size(4 * 1024 * 1024).ok();
+                // macOS only: its default send buffer (~128KB, autotune ramp)
+                // is smaller than a typical QWP chunk, so `write_all` blocks
+                // mid-frame; an explicit 4MiB is honored there (maxsockbuf
+                // 8MiB) and skips the ramp. On Linux an explicit SO_SNDBUF /
+                // SO_RCVBUF is silently clamped to net.core.{w,r}mem_max
+                // (208KiB stock, granted 2x = ~416KiB) and DISABLES kernel
+                // autotuning, which left alone grows the buffers to
+                // tcp_{w,r}mem[2] (>= the 4MiB requested here) — the explicit
+                // set caps per-connection throughput at ~426KB/RTT on any
+                // real-latency path.
+                #[cfg(target_os = "macos")]
+                {
+                    let sock = socket2::SockRef::from(&tcp);
+                    sock.set_send_buffer_size(4 * 1024 * 1024).ok();
+                    sock.set_recv_buffer_size(4 * 1024 * 1024).ok();
+                }
                 match NoSigpipeTcp::new(tcp) {
                     Ok(wrapped) => return Ok(wrapped),
                     Err(err) => {
