@@ -38,6 +38,7 @@
 //!   ITERATIONS=5  WARMUPS=2  MAX_BATCH_ROWS=10000  RUN_MODE=full
 //!   QDB_HOST=127.0.0.1  QDB_PORT=9000
 //!   SENDERS=1                e2e sender/connection count (rows split evenly)
+//!   CHECKPOINT_BATCHES=64    e2e ack-checkpoint cadence, in batches
 //!   QDB_CONF_EXTRA=          extra `key=value;` conf params appended to the
 //!                            connect string (e.g. `sf_append_deadline_millis=300000;`)
 //!
@@ -68,9 +69,11 @@ use bench_schema::{N_WIDE_DOUBLES, N_WIDE_SYMS, SchemaKind};
 const TS_STEP_NANOS: i64 = 1_000;
 const TS_BASE_NANOS: i64 = 1_704_067_200_000_000_000;
 
-/// Ack-checkpoint cadence for the e2e `row-flush` path — matches
-/// `CHECKPOINT_BATCHES` in `examples/bench_ingest_c.h`.
-const CHECKPOINT_BATCHES: usize = 64;
+/// Default ack-checkpoint cadence for the e2e `row-flush` path — matches
+/// `CHECKPOINT_BATCHES` in `examples/bench_ingest_c.h`. Overridable via the
+/// `CHECKPOINT_BATCHES` env var (see `RowBenchCtx::checkpoint_batches`,
+/// threaded in from `main` via `env_usize`).
+const DEFAULT_CHECKPOINT_BATCHES: usize = 64;
 
 /// No-progress deadline for `Sender::wait` — see `sender.rs:692`'s doc: it
 /// only fires if the ack watermark stalls for this long, not a hard cap on
@@ -99,6 +102,9 @@ struct RowBenchCtx<'a> {
     /// example's `note_values`.
     templates: &'a [String],
     max_batch_rows: usize,
+    /// Ack-checkpoint cadence for `flush_pass`, in batches — env-overridable
+    /// via `CHECKPOINT_BATCHES` (default `DEFAULT_CHECKPOINT_BATCHES`).
+    checkpoint_batches: usize,
 }
 
 /// Appends rows `[start, end)` to `buffer` in the schema's row-API column
@@ -216,7 +222,7 @@ fn flush_pass(
                         .flush_and_get_fsn(buffer)
                         .map_err(|e| e.to_string())?;
                     batch_no += 1;
-                    if batch_no % CHECKPOINT_BATCHES == 0 {
+                    if batch_no % ctx.checkpoint_batches == 0 {
                         sender
                             .wait(AckLevel::Ok, WAIT_TIMEOUT)
                             .map_err(|e| e.to_string())?;
@@ -333,6 +339,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     let warmups: usize = env_usize("WARMUPS", 2);
     let max_batch_rows: usize = env_usize("MAX_BATCH_ROWS", 10_000);
     let senders_n: usize = env_usize("SENDERS", 1).max(1);
+    let checkpoint_batches: usize = env_usize("CHECKPOINT_BATCHES", DEFAULT_CHECKPOINT_BATCHES);
     let run_mode = std::env::var("RUN_MODE").unwrap_or_else(|_| "full".into());
     let host = std::env::var("QDB_HOST").unwrap_or_else(|_| "127.0.0.1".into());
     let port: u16 = env_usize("QDB_PORT", 9000) as u16;
@@ -365,6 +372,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         hi_pools: &hi_pools,
         templates: &templates,
         max_batch_rows,
+        checkpoint_batches,
     };
 
     let mut report = Report::new(kind.name(), rows, columns, "ingress", "rust-row", &run_mode);
