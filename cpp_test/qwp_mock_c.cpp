@@ -24,8 +24,9 @@ static qwp_mock_c* start_mock(int slot_count, int frame_count)
     // publish frame starts with). This blocks the worker from
     // `graceful_close`ing before the client has finished writing.
     qm::Script accept_frames;
+    accept_frames.reserve(static_cast<size_t>(frame_count));
     for (int i = 0; i < frame_count; ++i)
-        accept_frames.push_back(qm::ActionAwaitClientFrame{0x51});
+        accept_frames.emplace_back(qm::ActionAwaitClientFrame{0x51});
     std::vector<qm::Script> scripts;
     scripts.reserve(static_cast<size_t>(slot_count));
     for (int i = 0; i < slot_count; ++i)
