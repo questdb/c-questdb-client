@@ -307,6 +307,21 @@ direct_column_sender* direct_column_sender_from_conf(
     line_sender_error** err_out);
 
 /**
+ * Build a direct (pipelined, non-store-and-forward) column-major sender from a
+ * configured `line_sender_opts`, owning its own connection with no pool. The
+ * opts carry the full auth/TLS configuration — including options set through
+ * the `line_sender_opts_*` builder functions rather than a config string — so
+ * this works for a sender configured either way. `opts` is borrowed, not
+ * consumed: the caller retains ownership and must still free it. Returns NULL
+ * on failure and sets `*err_out` if provided. Free the returned handle with
+ * `direct_column_sender_free` (there is no pool to return it to).
+ */
+QUESTDB_CLIENT_API
+direct_column_sender* direct_column_sender_from_opts(
+    const line_sender_opts* opts,
+    line_sender_error** err_out);
+
+/**
  * Return a direct sender to the pool. Accepts NULL `sender` and no-ops.
  * Invalidates the `sender` pointer. If the sender has latched terminal state,
  * or if the pool has been closed, it is closed instead of recycled. A sender

@@ -2045,7 +2045,15 @@ impl OwnedDirectColumnSender {
     /// Build a direct column sender from a QWP/WebSocket config string,
     /// opening its own connection and owning it outright — no pool.
     pub fn from_conf(conf: &str) -> Result<Self> {
-        let connector = SenderBuilder::from_conf(conf)?.build_qwp_ws_connector()?;
+        Self::from_builder(&SenderBuilder::from_conf(conf)?)
+    }
+
+    /// Build a direct column sender from an already-configured
+    /// [`SenderBuilder`] (which carries auth/TLS applied programmatically,
+    /// not just what a config string encodes), owning its own connection
+    /// with no pool. The builder is only borrowed.
+    pub fn from_builder(builder: &SenderBuilder) -> Result<Self> {
+        let connector = builder.build_qwp_ws_connector()?;
         let health = Mutex::new(QwpWsHostHealthTracker::new(connector.endpoint_count()));
         let raw = connector.connect_round_pooled(&health, None)?;
         let conn = ColumnConn::from_round_stream(raw)?;

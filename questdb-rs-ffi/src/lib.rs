@@ -2486,6 +2486,12 @@ pub unsafe extern "C" fn line_sender_buffer_check_can_flush(
 /// Accumulates parameters for a new `line_sender` object.
 pub struct line_sender_opts(SenderBuilder);
 
+impl line_sender_opts {
+    pub(crate) fn builder(&self) -> &SenderBuilder {
+        &self.0
+    }
+}
+
 /// Create a new `line_sender_opts` instance from the given configuration string.
 /// The format of the string is: "tcp::addr=host:port;key=value;...;"
 /// Instead of "tcp" you can also specify "tcps", "http", and "https".

@@ -94,6 +94,17 @@ pub fn direct_column_sender_from_conf(conf: &str) -> Result<OwnedDirectColumnSen
     OwnedDirectColumnSender::from_conf(conf)
 }
 
+/// Build a **direct** column-major sender from an already-configured
+/// [`SenderBuilder`], owning its own connection with no pool — the builder's
+/// full auth/TLS config (including options set programmatically rather than
+/// via a config string) is honoured. Backs the C ABI's
+/// `direct_column_sender_from_opts`.
+pub fn direct_column_sender_from_opts(
+    builder: &crate::ingress::SenderBuilder,
+) -> Result<OwnedDirectColumnSender> {
+    OwnedDirectColumnSender::from_builder(builder)
+}
+
 /// The pool's failover budget (`reconnect_max_duration`, default 300s).
 /// Exposed so the C ABI can let callers bound an overall failover deadline.
 pub fn reconnect_max_duration(db: &QuestDb) -> Duration {

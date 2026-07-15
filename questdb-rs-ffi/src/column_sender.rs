@@ -51,9 +51,9 @@ use questdb::{Error, ErrorCode};
 #[cfg(feature = "arrow")]
 use crate::line_sender_column_name;
 use crate::{
-    line_sender_buffer, line_sender_error, line_sender_error_code, line_sender_qwpws_fsn,
-    line_sender_table_name, questdb_error, qwpws_ack_level_durable, qwpws_ack_level_ok,
-    qwpws_buffer_ptr_mut, qwpws_buffer_ptr_ref, set_err_out_from_error,
+    line_sender_buffer, line_sender_error, line_sender_error_code, line_sender_opts,
+    line_sender_qwpws_fsn, line_sender_table_name, questdb_error, qwpws_ack_level_durable,
+    qwpws_ack_level_ok, qwpws_buffer_ptr_mut, qwpws_buffer_ptr_ref, set_err_out_from_error,
 };
 
 // ===========================================================================
@@ -1069,6 +1069,41 @@ pub unsafe extern "C" fn direct_column_sender_from_conf(
         None => return std::ptr::null_mut(),
     };
     match questdb::ffi_support::direct_column_sender_from_conf(conf) {
+        Ok(owned) => Box::into_raw(Box::new(direct_column_sender(owned, AtomicU32::new(0)))),
+        Err(err) => {
+            unsafe { set_err_out_from_error(err_out, err) };
+            std::ptr::null_mut()
+        }
+    }
+}
+
+/// Build a direct (pipelined, non-store-and-forward) column sender from a
+/// configured `line_sender_opts`, owning its own connection with no pool. The
+/// opts carry the full auth/TLS configuration (including options set through
+/// the `line_sender_opts_*` builder functions rather than a config string), so
+/// this works for senders built either way. `opts` is borrowed, not consumed:
+/// the caller retains ownership and must still free it. Free the returned
+/// handle with `direct_column_sender_free`. Returns NULL on failure; sets
+/// `*err_out` if provided.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn direct_column_sender_from_opts(
+    opts: *const line_sender_opts,
+    err_out: *mut *mut line_sender_error,
+) -> *mut direct_column_sender {
+    if opts.is_null() {
+        unsafe {
+            set_err_out_from_error(
+                err_out,
+                Error::new(
+                    ErrorCode::InvalidApiCall,
+                    "direct_column_sender_from_opts: opts pointer is NULL".to_string(),
+                ),
+            );
+        }
+        return std::ptr::null_mut();
+    }
+    let builder = unsafe { &*opts }.builder();
+    match questdb::ffi_support::direct_column_sender_from_opts(builder) {
         Ok(owned) => Box::into_raw(Box::new(direct_column_sender(owned, AtomicU32::new(0)))),
         Err(err) => {
             unsafe { set_err_out_from_error(err_out, err) };
@@ -5855,6 +5890,15 @@ mod tests {
     #[test]
     fn direct_column_sender_free_accepts_null() {
         unsafe { direct_column_sender_free(std::ptr::null_mut()) };
+    }
+
+    #[test]
+    fn direct_column_sender_from_opts_null_errors() {
+        let mut err: *mut line_sender_error = std::ptr::null_mut();
+        let sender = unsafe { direct_column_sender_from_opts(std::ptr::null(), &mut err) };
+        assert!(sender.is_null());
+        assert!(!err.is_null());
+        unsafe { line_sender_error_free(err) };
     }
 
     #[test]
