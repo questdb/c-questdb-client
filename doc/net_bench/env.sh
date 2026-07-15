@@ -19,12 +19,12 @@ QNB_UBUNTU_SSM_PARAM="/aws/service/canonical/ubuntu/server/24.04/stable/current/
 # ENT 3.3.4 release (so the OSS source build and the ENT docker image are the
 # same lineage); local loopback baselines are being re-measured against it.
 QNB_QUESTDB_COMMIT="${QNB_QUESTDB_COMMIT:-5b2efe5e58fbb77ef25f87a7aa604365c9c1eb55}"
-# c pin = sm_qwp_bench head with qwp_ingress_row.rs's RUN_MODE gating fix
-# (RUN_MODE=floor now genuinely skips the e2e leg — no HTTP table
-# create/drop, no Sender, no count() gate — instead of silently running
-# the combined floor+e2e workload regardless of RUN_MODE); the env.sh bump
-# commit itself is laptop-side only.
-QNB_C_CLIENT_COMMIT="${QNB_C_CLIENT_COMMIT:-16688bc16aaa678ae27e464818184d0a2a18821f}"
+# c pin = sm_qwp_bench head after the rebase onto jh_conn_pool_refactor
+# @ e97f88c8 (all 15 bench commits replayed; upstream renamed the pool conf
+# keys to sender_pool_min/sender_pool_max, picked up in qwp_ingress_polars).
+# Pre-rebase SHAs (16688bc1 lineage) are unreachable after the force-push;
+# the env.sh bump commit itself is laptop-side only.
+QNB_C_CLIENT_COMMIT="${QNB_C_CLIENT_COMMIT:-65b5881edc29ce86dd5101c8f359eeac7d43e88f}"
 QNB_PY_CLIENT_COMMIT="${QNB_PY_CLIENT_COMMIT:-7334503e84e2d149f9d6550dd023ef484d2edc1e}"
 # Head of our sm_qwp_bench branch of questdb/java-questdb-client (adds the
 # qwp-bench module). Pin = pushed head of that branch; bump when it moves.
