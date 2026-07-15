@@ -892,6 +892,125 @@ impl<'a> Decimal256Column<'a> {
 }
 
 // ---------------------------------------------------------------------------
+// Width-agnostic decimal view
+// ---------------------------------------------------------------------------
+
+/// Borrowed view over a DECIMAL64, DECIMAL128, or DECIMAL256 column.
+///
+/// The mantissas remain in their decoded little-endian two's-complement
+/// representation. This view does not convert or copy them, and it preserves
+/// the physical QWP width exposed by [`kind`](Self::kind).
+#[derive(Debug, Clone, Copy)]
+pub struct DecimalColumn<'a> {
+    kind: ColumnKind,
+    raw: &'a [u8],
+    scale: i8,
+    validity: Validity<'a>,
+}
+
+impl<'a> DecimalColumn<'a> {
+    #[inline]
+    fn new(kind: ColumnKind, raw: &'a [u8], validity: Validity<'a>, scale: i8) -> Self {
+        debug_assert!(matches!(
+            kind,
+            ColumnKind::Decimal64 | ColumnKind::Decimal128 | ColumnKind::Decimal256
+        ));
+        let column = Self {
+            kind,
+            raw,
+            scale,
+            validity,
+        };
+        debug_assert_eq!(raw.len() % usize::from(column.byte_width()), 0);
+        column
+    }
+
+    /// Physical QWP decimal kind.
+    #[inline]
+    pub fn kind(&self) -> ColumnKind {
+        self.kind
+    }
+
+    /// Mantissa width in bytes: 8, 16, or 32.
+    #[inline]
+    pub fn byte_width(&self) -> u8 {
+        match self.kind {
+            ColumnKind::Decimal64 => 8,
+            ColumnKind::Decimal128 => 16,
+            ColumnKind::Decimal256 => 32,
+            _ => unreachable!("DecimalColumn contains a non-decimal kind"),
+        }
+    }
+
+    /// Maximum SQL precision represented by this physical width.
+    ///
+    /// This is 18, 38, or 76. It is not necessarily the result expression's
+    /// declared precision because QWP carries the physical kind, not the exact
+    /// SQL precision.
+    #[inline]
+    pub fn max_precision(&self) -> u8 {
+        match self.kind {
+            ColumnKind::Decimal64 => 18,
+            ColumnKind::Decimal128 => 38,
+            ColumnKind::Decimal256 => 76,
+            _ => unreachable!("DecimalColumn contains a non-decimal kind"),
+        }
+    }
+
+    #[inline]
+    pub fn scale(&self) -> i8 {
+        self.scale
+    }
+
+    #[inline]
+    pub fn len(&self) -> usize {
+        self.raw.len() / usize::from(self.byte_width())
+    }
+
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.raw.is_empty()
+    }
+
+    #[inline]
+    pub fn validity(&self) -> Validity<'a> {
+        self.validity
+    }
+
+    #[inline]
+    pub fn is_null(&self, row: usize) -> bool {
+        self.validity.is_null(row)
+    }
+
+    /// Dense mantissa bytes for the complete column, including NULL slots.
+    #[inline]
+    pub fn raw(&self) -> &'a [u8] {
+        self.raw
+    }
+
+    /// Little-endian two's-complement mantissa bytes for `row`.
+    ///
+    /// Check [`is_null`](Self::is_null) before interpreting the bytes. Like the
+    /// width-specific decimal accessors, this returns the decoded slot even
+    /// when the row is NULL.
+    ///
+    /// # Panics
+    /// Panics if `row >= self.len()`.
+    #[inline]
+    #[track_caller]
+    pub fn mantissa_le(&self, row: usize) -> &'a [u8] {
+        let len = self.len();
+        assert!(
+            row < len,
+            "DecimalColumn::mantissa_le: row {row} out of range (len={len})"
+        );
+        let width = usize::from(self.byte_width());
+        let start = row * width;
+        &self.raw[start..start + width]
+    }
+}
+
+// ---------------------------------------------------------------------------
 // DOUBLE_ARRAY / LONG_ARRAY
 // ---------------------------------------------------------------------------
 
@@ -1193,7 +1312,7 @@ pub enum ColumnView<'a> {
     LongArray(LongArrayColumn<'a>),
 }
 
-impl ColumnView<'_> {
+impl<'a> ColumnView<'a> {
     #[inline]
     pub fn kind(&self) -> ColumnKind {
         match self {
@@ -1220,6 +1339,35 @@ impl ColumnView<'_> {
             ColumnView::Decimal256(_) => ColumnKind::Decimal256,
             ColumnView::DoubleArray(_) => ColumnKind::DoubleArray,
             ColumnView::LongArray(_) => ColumnKind::LongArray,
+        }
+    }
+
+    /// Project any DECIMAL64/128/256 variant to one width-agnostic view.
+    ///
+    /// The returned view borrows the same decoded buffers and performs no
+    /// conversion or copy. Returns `None` for non-decimal columns.
+    #[inline]
+    pub fn as_decimal(&self) -> Option<DecimalColumn<'a>> {
+        match self {
+            ColumnView::Decimal64(c) => Some(DecimalColumn::new(
+                ColumnKind::Decimal64,
+                c.raw(),
+                c.validity(),
+                c.scale(),
+            )),
+            ColumnView::Decimal128(c) => Some(DecimalColumn::new(
+                ColumnKind::Decimal128,
+                c.raw(),
+                c.validity(),
+                c.scale(),
+            )),
+            ColumnView::Decimal256(c) => Some(DecimalColumn::new(
+                ColumnKind::Decimal256,
+                c.raw(),
+                c.validity(),
+                c.scale(),
+            )),
+            _ => None,
         }
     }
 
@@ -1523,6 +1671,67 @@ mod tests {
         assert_eq!(col.scale(), 2);
         assert_eq!(col.value(0), 12345);
         assert_eq!(col.value(1), 6789);
+    }
+
+    #[test]
+    fn column_view_as_decimal_unifies_widths() {
+        let raw64 = le_i64s(&[12345, -678]);
+        let bitmap = [0x02u8];
+        let view64 = ColumnView::Decimal64(Decimal64Column::new(
+            &raw64,
+            Validity::from_bitmap(&bitmap, 2).unwrap(),
+            2,
+        ));
+        let decimal64 = view64.as_decimal().unwrap();
+        assert_eq!(decimal64.kind(), ColumnKind::Decimal64);
+        assert_eq!(decimal64.byte_width(), 8);
+        assert_eq!(decimal64.max_precision(), 18);
+        assert_eq!(decimal64.scale(), 2);
+        assert_eq!(decimal64.len(), 2);
+        assert!(!decimal64.is_empty());
+        assert_eq!(decimal64.raw(), raw64.as_slice());
+        assert_eq!(decimal64.mantissa_le(0), &raw64[..8]);
+        assert!(decimal64.is_null(1));
+        assert_eq!(decimal64.mantissa_le(1), &raw64[8..16]);
+        assert_eq!(decimal64.validity().bytes(), Some(bitmap.as_slice()));
+
+        let raw128 = (-1_i128).to_le_bytes();
+        let view128 = ColumnView::Decimal128(Decimal128Column::new(&raw128, Validity::None, 4));
+        let decimal128 = view128.as_decimal().unwrap();
+        assert_eq!(decimal128.kind(), ColumnKind::Decimal128);
+        assert_eq!(decimal128.byte_width(), 16);
+        assert_eq!(decimal128.max_precision(), 38);
+        assert_eq!(decimal128.scale(), 4);
+        assert_eq!(decimal128.mantissa_le(0), raw128.as_slice());
+
+        let raw256 = [0xFFu8; 32];
+        let view256 = ColumnView::Decimal256(Decimal256Column::new(&raw256, Validity::None, 6));
+        let decimal256 = view256.as_decimal().unwrap();
+        assert_eq!(decimal256.kind(), ColumnKind::Decimal256);
+        assert_eq!(decimal256.byte_width(), 32);
+        assert_eq!(decimal256.max_precision(), 76);
+        assert_eq!(decimal256.scale(), 6);
+        assert_eq!(decimal256.mantissa_le(0), raw256.as_slice());
+
+        let non_decimal = ColumnView::Long(FixedColumn::<i64>::new(&raw64, Validity::None));
+        assert!(non_decimal.as_decimal().is_none());
+    }
+
+    #[test]
+    #[should_panic(expected = "DecimalColumn::mantissa_le: row 1 out of range (len=1)")]
+    fn decimal_column_mantissa_le_panics_out_of_range() {
+        let raw = 1_i64.to_le_bytes();
+        let view = ColumnView::Decimal64(Decimal64Column::new(&raw, Validity::None, 0));
+        view.as_decimal().unwrap().mantissa_le(1);
+    }
+
+    #[test]
+    #[should_panic(expected = "DecimalColumn::mantissa_le: row")]
+    fn decimal_column_mantissa_le_panics_before_offset_wraps() {
+        let raw = 1_i64.to_le_bytes();
+        let view = ColumnView::Decimal64(Decimal64Column::new(&raw, Validity::None, 0));
+        let wrapping_row = 1usize << (usize::BITS - 3);
+        view.as_decimal().unwrap().mantissa_le(wrapping_row);
     }
 
     #[test]

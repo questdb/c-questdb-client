@@ -1407,7 +1407,8 @@ struct fixed_view
 };
 
 /** DECIMAL64 / DECIMAL128 / DECIMAL256 view. `values` is the dense raw
- *  little-endian mantissa bytes; cast to `int64_t*` for DECIMAL64. */
+ *  little-endian two's-complement mantissa bytes. Use `mantissa_bytes()` for
+ *  alignment-safe row access. */
 struct decimal_view
 {
     egress::column_kind kind;
@@ -1420,6 +1421,14 @@ struct decimal_view
     bool is_null(size_t row) const noexcept
     {
         return detail::bitmap_is_null(validity, row, row_count);
+    }
+
+    /** Borrowed mantissa bytes for `row`; nullopt for NULL or out of range. */
+    nullable<binary_view> mantissa_bytes(size_t row) const noexcept
+    {
+        if (row >= row_count || is_null(row))
+            return std::nullopt;
+        return binary_view{values + row * value_stride, value_stride};
     }
 };
 

@@ -4274,6 +4274,40 @@ TEST_CASE("mock: array accessors on a scalar column raise")
     CHECK_THROWS_AS(col.elements<double>(0, &dummy), questdb::error);
 }
 
+TEST_CASE("decimal_view: mantissa_bytes is width-agnostic and null-safe")
+{
+    struct decimal_case
+    {
+        eg::column_kind kind;
+        size_t stride;
+    };
+    const decimal_case cases[] = {
+        {eg::column_kind::decimal64, 8},
+        {eg::column_kind::decimal128, 16},
+        {eg::column_kind::decimal256, 32},
+    };
+
+    for (const auto& c : cases)
+    {
+        // Offset by one so the accessor is exercised with an unaligned buffer.
+        std::vector<uint8_t> storage(1 + 2 * c.stride);
+        auto* values = storage.data() + 1;
+        for (size_t i = 0; i < 2 * c.stride; ++i)
+            values[i] = static_cast<uint8_t>(i + 1);
+        const uint8_t validity = 0x02; // row 1 is NULL
+        const eg::decimal_view view{
+            c.kind, values, c.stride, 2, 3, &validity};
+
+        const auto first = view.mantissa_bytes(0);
+        REQUIRE(first.has_value());
+        CHECK(first->data == values);
+        CHECK(first->size == c.stride);
+        CHECK(first->data[c.stride - 1] == c.stride);
+        CHECK_FALSE(view.mantissa_bytes(1).has_value());
+        CHECK_FALSE(view.mantissa_bytes(2).has_value());
+    }
+}
+
 TEST_CASE(
     "mock: column::visit dispatches to the matching typed view per kind")
 {

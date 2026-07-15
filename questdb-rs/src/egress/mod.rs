@@ -77,7 +77,7 @@ pub(crate) mod ws;
 pub use crate::ingress::CertificateAuthority;
 pub use binds::{Bind, SimpleNullKind};
 pub use column::{
-    BinaryColumn, ColumnView, Decimal64Column, Decimal128Column, Decimal256Column,
+    BinaryColumn, ColumnView, Decimal64Column, Decimal128Column, Decimal256Column, DecimalColumn,
     DoubleArrayColumn, FixedBytesColumn, FixedColumn, FixedWidth, GeohashColumn, Long256Column,
     LongArrayColumn, SymbolColumn, UuidColumn, Validity, VarcharColumn,
 };
