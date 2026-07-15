@@ -1398,8 +1398,10 @@ namespace questdb
  * RAII wrapper around `::questdb_db*` — the QWP/WS connection pool.
  *
  * `conf` is a `ws::` / `wss::` connect string; see
- * `column_sender.h` for pool-specific keys (`pool_size`, `pool_max`,
- * `pool_idle_timeout_ms`, `pool_reap`). With `sf_dir`, `sender_id` is the
+ * `column_sender.h` for pool-specific keys (`sender_pool_min`,
+ * `sender_pool_max`, `query_pool_min`, `query_pool_max`,
+ * `acquire_timeout_ms`, `idle_timeout_ms`, `pool_reap`). With `sf_dir`,
+ * `sender_id` is the
  * slot base; pooled senders mint `<sender_id>-ingest-<index>` disk slots.
  * Those `<sender_id>-ingest-*` directories under `sf_dir` belong to the pool namespace;
  * use a unique `sender_id` for each pool sharing an `sf_dir`.
@@ -1478,8 +1480,8 @@ public:
     /**
      * Borrow a query reader from the pool, mirroring Rust
      * `QuestDb::borrow_reader`. Readers are pooled on a separate,
-     * independently-capped free list that shares the `pool_size` /
-     * `pool_max` / `pool_idle_timeout_ms` budget; the reader pool is lazy (a
+     * independently-capped free list with its own `query_pool_min` /
+     * `query_pool_max` budget; the reader pool is lazy (a
      * connection opens on first borrow). The returned `reader` is
      * equivalent to a standalone one and returns itself to the pool on
      * destruction — unless `reader::drop_on_return()` was called, in which
@@ -1499,7 +1501,8 @@ public:
         return ::questdb_db_reconnect_max_duration_ms(_raw);
     }
 
-    /** Close idle connections beyond `pool_size`. Returns count closed. */
+    /** Close idle connections beyond the pool minimums. Returns count
+     *  closed. */
     size_t reap_idle() noexcept
     {
         return ::questdb_db_reap_idle(_raw);

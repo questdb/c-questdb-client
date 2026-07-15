@@ -127,21 +127,29 @@ typedef struct column_sender_validity
  * disk-backed store-and-forward mode it may pre-open parked recovery senders;
  * their initial connect and replay run in the background. Otherwise, the first
  * borrow opens a sender, so auth / TLS / connect errors usually surface from
- * the borrow, not from here. `pool_size` (default 1) is the warm minimum the
- * reaper keeps once connections have been opened.
+ * the borrow, not from here. `sender_pool_min` (default 1) is the warm
+ * minimum the reaper keeps once connections have been opened.
  *
- * `conf` is a `ws::` / `wss::` connect string. Pool-specific keys:
- *   `pool_size`            (default 1)   warm/min connections;
- *   `pool_max`             (default 64)  hard cap on auto-grow;
- *   `pool_idle_timeout_ms` (default 60000)
- *                                       reap above-pool_size idle connections;
+ * `conf` is a `ws::` / `wss::` connect string. Pool-specific keys (aligned
+ * with the Java client's `QuestDBBuilder`):
+ *   `sender_pool_min`      (default 1)    warm/min sender connections;
+ *   `sender_pool_max`      (default 4)    cap on the ingestion and direct
+ *                                         pools, each capped independently;
+ *   `query_pool_min`       (default 1)    warm/min reader connections;
+ *   `query_pool_max`       (default 4)    cap on the reader pool;
+ *   `acquire_timeout_ms`   (default 5000) how long a borrow at cap waits for
+ *                                         a return before failing; 0 fails
+ *                                         fast;
+ *   `idle_timeout_ms`      (default 60000)
+ *                                         reap above-minimum idle
+ *                                         connections;
  *   `pool_reap`            (`auto`|`manual`, default `auto`)
- *                                       background reaper opt-in.
+ *                                         background reaper opt-in.
  *
  * Disk-backed store-and-forward is opt-in: `sf_dir` selects disk-backed queues
  * for the public ingestion pool. `sender_id` names the slot *base* (default
  * "default"); pooled senders mint `<sender_id>-ingest-<index>` slots with
- * stable lowest-free-first indices in `[0, pool_max)`. The
+ * stable lowest-free-first indices in `[0, sender_pool_max)`. The
  * `<sender_id>-ingest-*` directories under `sf_dir` belong to the pool
  * namespace; use a unique `sender_id` for each pool sharing an `sf_dir`. At
  * cap, disk-backed ingestion borrows usually
@@ -173,15 +181,17 @@ void questdb_db_close(questdb_db* db);
 /**
  * Borrow a sender from the store-and-forward ingestion pool. Selection rules:
  *  1. If a previously-returned sender is in the free list, hand it out.
- *  2. Otherwise, if pool size < `pool_max`, open a new connection.
+ *  2. Otherwise, if pool size < `sender_pool_max`, open a new connection.
  *  3. Otherwise, in disk-backed store-and-forward mode only, wait up to
  *     `close_flush_timeout` while an in-flight slot close releases its lock.
- *  4. Otherwise (still at cap), return NULL +
- *     `line_sender_error_invalid_api_call`.
+ *  4. Otherwise (still at cap), wait up to `acquire_timeout_ms` for another
+ *     thread to return a sender; on timeout, return NULL +
+ *     `line_sender_error_invalid_api_call`. `acquire_timeout_ms=0` fails
+ *     fast.
  *
  * In store-and-forward mode, each borrowed sender owns its own
  * `<sender_id>-ingest-<index>` slot, so concurrent borrows are allowed up to
- * `pool_max`. Returning a sender parks that same slot for reuse; dropping a
+ * `sender_pool_max`. Returning a sender parks that same slot for reuse; dropping a
  * non-recycled sender releases its slot index after the slot lock is closed.
  *
  * The returned sender is bound to the calling thread until returned.
@@ -271,8 +281,8 @@ void questdb_db_drop_sender(
 /**
  * Borrow a direct (pipelined, non-store-and-forward) column-major sender from
  * the always-direct pool, independent of `sf_dir`. It pops the direct pool's
- * free list, grows below `pool_max`, and otherwise fails at cap with
- * `line_sender_error_invalid_api_call`.
+ * free list, grows below `sender_pool_max`, waits up to `acquire_timeout_ms`
+ * at cap, and otherwise fails with `line_sender_error_invalid_api_call`.
  */
 QUESTDB_CLIENT_API
 direct_column_sender* questdb_db_borrow_direct_column_sender(
@@ -369,7 +379,8 @@ void direct_column_sender_free(
 
 /**
  * Manually reap idle connections (closes free-list entries idle longer
- * than `pool_idle_timeout_ms`, never shrinking below `pool_size`).
+ * than `idle_timeout_ms`, never shrinking the sender pools below
+ * `sender_pool_min` or the reader pool below `query_pool_min`).
  * Returns the number of connections closed.
  */
 QUESTDB_CLIENT_API
@@ -434,9 +445,10 @@ typedef struct questdb_dbg_pool_count
     size_t closing;
 } questdb_dbg_pool_count;
 
-/** Connection-count snapshot across all three pools. Each pool is capped
- *  independently at `pool_max`, so `free + in_use` summed across the fields
- *  can reach `3 * pool_max`. */
+/** Connection-count snapshot across all three pools. The ingestion and
+ *  direct pools are each capped at `sender_pool_max` and the reader pool at
+ *  `query_pool_max`, so `free + in_use` summed across the fields can reach
+ *  `2 * sender_pool_max + query_pool_max`. */
 typedef struct questdb_dbg_pool_counts
 {
     /** Store-and-forward ingestion pool. */

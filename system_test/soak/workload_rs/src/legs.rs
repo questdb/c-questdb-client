@@ -75,7 +75,7 @@ pub fn run_leg(cfg: &LegConfig) -> LegResult {
 pub(crate) fn build_conf(cfg: &LegConfig) -> String {
     let mut c = format!(
         "ws::addr={};auth_timeout=5000;\
-         reconnect_max_duration_millis=30000;pool_size=1;pool_max=4;",
+         reconnect_max_duration_millis=30000;sender_pool_min=1;sender_pool_max=4;",
         cfg.addr
     );
     if let Some(dir) = &cfg.sf_dir {

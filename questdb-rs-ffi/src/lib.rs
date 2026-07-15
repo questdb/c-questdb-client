@@ -5382,7 +5382,7 @@ mod tests {
 
         fn conf(&self) -> String {
             format!(
-                "ws::addr=127.0.0.1:{};pool_size=1;pool_max=2;close_flush_timeout_millis=50;",
+                "ws::addr=127.0.0.1:{};sender_pool_min=1;sender_pool_max=2;close_flush_timeout_millis=50;",
                 self.port
             )
         }

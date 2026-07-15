@@ -4511,7 +4511,7 @@ qm::Script reader_park_script(uint8_t role = qm::ROLE_PRIMARY)
 
 std::string pool_conf(const std::string& addr)
 {
-    return "ws::addr=" + addr + ";pool_size=1;pool_reap=manual;";
+    return "ws::addr=" + addr + ";sender_pool_min=1;pool_reap=manual;";
 }
 } // namespace
 

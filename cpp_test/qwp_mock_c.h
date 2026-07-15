@@ -27,7 +27,7 @@ typedef struct qwp_mock_c qwp_mock_c;
  * `slot_count` WS upgrades and, on each, waits for one inbound QWP
  * binary frame (first payload byte == 'Q', i.e. the QWP1 magic) before
  * cleanly closing the connection. `slot_count` must be >= 1 — pass 1
- * when using the default `pool_size=1` connect string.
+ * when using the default `sender_pool_min=1` connect string.
  *
  * Returns NULL on failure (e.g. OS-level bind failure). */
 qwp_mock_c* qwp_mock_c_start(int slot_count);

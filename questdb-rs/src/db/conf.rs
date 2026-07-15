@@ -24,9 +24,11 @@
 
 //! [`crate::QuestDb`] pool connect-string parsing (shared by the column-major sender, row-major sender, and reader borrow kinds).
 //!
-//! Extracts pool-specific keys (`pool_size`, `pool_max`,
-//! `pool_idle_timeout_ms`, `pool_reap`), detects explicit
-//! disk-backed store-and-forward opt-in (`sf_dir`), enforces a QWP/WebSocket schema, and
+//! Extracts pool-specific keys (`sender_pool_min`, `sender_pool_max`,
+//! `query_pool_min`, `query_pool_max`, `acquire_timeout_ms`,
+//! `idle_timeout_ms`, `pool_reap` — names and defaults matching the Java
+//! client's `QuestDBBuilder`), detects explicit disk-backed
+//! store-and-forward opt-in (`sf_dir`), enforces a QWP/WebSocket schema, and
 //! produces a sanitized conf string that the underlying
 //! [`crate::ingress::SenderBuilder`] can consume to build connections.
 
@@ -34,22 +36,27 @@ use std::time::Duration;
 
 use crate::{Result, error};
 
-/// Default number of warm connections opened eagerly at
-/// [`crate::QuestDb::connect`].
-pub(crate) const DEFAULT_POOL_SIZE: usize = 1;
-/// Default hard cap on auto-grow.
-pub(crate) const DEFAULT_POOL_MAX: usize = 64;
-/// Default idle timeout before the reaper closes an above-`pool_size`
-/// connection.
-pub(crate) const DEFAULT_POOL_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
+/// Default warm minimum per pool, matching the Java client's
+/// `DEFAULT_POOL_MIN`.
+pub(crate) const DEFAULT_POOL_MIN: usize = 1;
+/// Default hard cap on per-pool auto-grow, matching the Java client's
+/// `DEFAULT_POOL_MAX`.
+pub(crate) const DEFAULT_POOL_MAX: usize = 4;
+/// Default bound on how long an at-cap borrow waits for a connection to be
+/// returned before failing, matching the Java client's
+/// `DEFAULT_ACQUIRE_TIMEOUT_MILLIS`. Zero disables waiting (fail-fast).
+pub(crate) const DEFAULT_ACQUIRE_TIMEOUT: Duration = Duration::from_millis(5_000);
+/// Default idle timeout before the reaper closes an above-minimum
+/// connection, matching the Java client's `DEFAULT_IDLE_TIMEOUT_MILLIS`.
+pub(crate) const DEFAULT_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 
-/// Hard cap on parsed `pool_size` / `pool_max`. Bounds the eager
-/// `Vec::with_capacity` allocation in [`crate::QuestDb::connect`] so a
-/// malformed conf string cannot abort the host via allocator OOM.
+/// Hard cap on parsed pool sizes. Bounds the eager `Vec::with_capacity`
+/// allocation in [`crate::QuestDb::connect`] so a malformed conf string
+/// cannot abort the host via allocator OOM.
 pub(crate) const MAX_POOL_SIZE: usize = 65_536;
-/// Hard cap on parsed `pool_idle_timeout_ms` (one year). Keeps `Duration`
+/// Hard cap on parsed timeout keys (one year). Keeps `Duration`
 /// arithmetic inside `i64`-microsecond range used downstream.
-pub(crate) const MAX_POOL_IDLE_TIMEOUT_MS: u64 = 365 * 24 * 3600 * 1000;
+pub(crate) const MAX_POOL_TIMEOUT_MS: u64 = 365 * 24 * 3600 * 1000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum PoolReap {
@@ -59,18 +66,24 @@ pub(crate) enum PoolReap {
 
 #[derive(Debug, Clone)]
 pub(crate) struct PoolConfig {
-    pub(crate) pool_size: usize,
-    pub(crate) pool_max: usize,
-    pub(crate) pool_idle_timeout: Duration,
+    pub(crate) sender_pool_min: usize,
+    pub(crate) sender_pool_max: usize,
+    pub(crate) query_pool_min: usize,
+    pub(crate) query_pool_max: usize,
+    pub(crate) acquire_timeout: Duration,
+    pub(crate) idle_timeout: Duration,
     pub(crate) pool_reap: PoolReap,
 }
 
 impl Default for PoolConfig {
     fn default() -> Self {
         Self {
-            pool_size: DEFAULT_POOL_SIZE,
-            pool_max: DEFAULT_POOL_MAX,
-            pool_idle_timeout: DEFAULT_POOL_IDLE_TIMEOUT,
+            sender_pool_min: DEFAULT_POOL_MIN,
+            sender_pool_max: DEFAULT_POOL_MAX,
+            query_pool_min: DEFAULT_POOL_MIN,
+            query_pool_max: DEFAULT_POOL_MAX,
+            acquire_timeout: DEFAULT_ACQUIRE_TIMEOUT,
+            idle_timeout: DEFAULT_IDLE_TIMEOUT,
             pool_reap: PoolReap::Auto,
         }
     }
@@ -133,43 +146,37 @@ pub(crate) fn parse(conf: &str) -> Result<ParsedConf> {
                     value
                 ));
             }
-            "pool_size" => {
+            "sender_pool_min" => {
+                pool.sender_pool_min = parse_pool_usize(key, value)?;
+            }
+            "sender_pool_max" => {
                 let value = parse_pool_usize(key, value)?;
                 if value == 0 {
                     return Err(error::fmt!(
                         ConfigError,
-                        "\"pool_size\" must be greater than 0"
+                        "\"sender_pool_max\" must be greater than 0"
                     ));
                 }
-                pool.pool_size = value;
+                pool.sender_pool_max = value;
             }
-            "pool_max" => {
+            "query_pool_min" => {
+                pool.query_pool_min = parse_pool_usize(key, value)?;
+            }
+            "query_pool_max" => {
                 let value = parse_pool_usize(key, value)?;
                 if value == 0 {
                     return Err(error::fmt!(
                         ConfigError,
-                        "\"pool_max\" must be greater than 0"
+                        "\"query_pool_max\" must be greater than 0"
                     ));
                 }
-                pool.pool_max = value;
+                pool.query_pool_max = value;
             }
-            "pool_idle_timeout_ms" => {
-                let millis: u64 = value.parse().map_err(|_| {
-                    error::fmt!(
-                        ConfigError,
-                        "Invalid value for \"pool_idle_timeout_ms\" (expected an unsigned integer): {:?}",
-                        value
-                    )
-                })?;
-                if millis > MAX_POOL_IDLE_TIMEOUT_MS {
-                    return Err(error::fmt!(
-                        ConfigError,
-                        "\"pool_idle_timeout_ms\" {} exceeds maximum ({})",
-                        millis,
-                        MAX_POOL_IDLE_TIMEOUT_MS
-                    ));
-                }
-                pool.pool_idle_timeout = Duration::from_millis(millis);
+            "acquire_timeout_ms" => {
+                pool.acquire_timeout = parse_pool_timeout_ms("acquire_timeout_ms", value)?;
+            }
+            "idle_timeout_ms" => {
+                pool.idle_timeout = parse_pool_timeout_ms("idle_timeout_ms", value)?;
             }
             "pool_reap" => {
                 pool.pool_reap = match value {
@@ -183,6 +190,15 @@ pub(crate) fn parse(conf: &str) -> Result<ParsedConf> {
                         ));
                     }
                 };
+            }
+            "pool_size" | "pool_max" | "pool_idle_timeout_ms" => {
+                return Err(error::fmt!(
+                    ConfigError,
+                    "{:?} was renamed; use \"sender_pool_min\" / \
+                     \"sender_pool_max\" / \"query_pool_min\" / \
+                     \"query_pool_max\" / \"idle_timeout_ms\" instead",
+                    key
+                ));
             }
             other if other.starts_with("pool_") => {
                 return Err(error::fmt!(
@@ -198,12 +214,20 @@ pub(crate) fn parse(conf: &str) -> Result<ParsedConf> {
         Ok(())
     })?;
 
-    if pool.pool_size > pool.pool_max {
+    if pool.sender_pool_min > pool.sender_pool_max {
         return Err(error::fmt!(
             ConfigError,
-            "\"pool_size\" ({}) must not exceed \"pool_max\" ({})",
-            pool.pool_size,
-            pool.pool_max
+            "\"sender_pool_min\" ({}) must not exceed \"sender_pool_max\" ({})",
+            pool.sender_pool_min,
+            pool.sender_pool_max
+        ));
+    }
+    if pool.query_pool_min > pool.query_pool_max {
+        return Err(error::fmt!(
+            ConfigError,
+            "\"query_pool_min\" ({}) must not exceed \"query_pool_max\" ({})",
+            pool.query_pool_min,
+            pool.query_pool_max
         ));
     }
 
@@ -228,6 +252,27 @@ fn parse_on_off(key: &str, value: &str) -> Result<bool> {
 
 fn is_qwp_ws_schema(service: &str) -> bool {
     service.eq_ignore_ascii_case("ws") || service.eq_ignore_ascii_case("wss")
+}
+
+fn parse_pool_timeout_ms(key: &str, value: &str) -> Result<Duration> {
+    let millis: u64 = value.parse().map_err(|_| {
+        error::fmt!(
+            ConfigError,
+            "Invalid value for {:?} (expected an unsigned integer): {:?}",
+            key,
+            value
+        )
+    })?;
+    if millis > MAX_POOL_TIMEOUT_MS {
+        return Err(error::fmt!(
+            ConfigError,
+            "{:?} ({}) exceeds maximum ({})",
+            key,
+            millis,
+            MAX_POOL_TIMEOUT_MS
+        ));
+    }
+    Ok(Duration::from_millis(millis))
 }
 
 fn parse_pool_usize(key: &str, value: &str) -> Result<usize> {
@@ -315,9 +360,12 @@ mod tests {
     #[test]
     fn defaults() {
         let p = parse_ok("ws::addr=localhost:9000;");
-        assert_eq!(p.pool.pool_size, DEFAULT_POOL_SIZE);
-        assert_eq!(p.pool.pool_max, DEFAULT_POOL_MAX);
-        assert_eq!(p.pool.pool_idle_timeout, DEFAULT_POOL_IDLE_TIMEOUT);
+        assert_eq!(p.pool.sender_pool_min, DEFAULT_POOL_MIN);
+        assert_eq!(p.pool.sender_pool_max, DEFAULT_POOL_MAX);
+        assert_eq!(p.pool.query_pool_min, DEFAULT_POOL_MIN);
+        assert_eq!(p.pool.query_pool_max, DEFAULT_POOL_MAX);
+        assert_eq!(p.pool.acquire_timeout, DEFAULT_ACQUIRE_TIMEOUT);
+        assert_eq!(p.pool.idle_timeout, DEFAULT_IDLE_TIMEOUT);
         assert_eq!(p.pool.pool_reap, PoolReap::Auto);
         assert!(!p.sf_disk);
     }
@@ -325,12 +373,40 @@ mod tests {
     #[test]
     fn parses_pool_knobs() {
         let p = parse_ok(
-            "ws::addr=localhost:9000;pool_size=4;pool_max=8;pool_idle_timeout_ms=10000;pool_reap=manual;",
+            "ws::addr=localhost:9000;sender_pool_min=4;sender_pool_max=8;\
+             query_pool_min=2;query_pool_max=6;acquire_timeout_ms=250;\
+             idle_timeout_ms=10000;pool_reap=manual;",
         );
-        assert_eq!(p.pool.pool_size, 4);
-        assert_eq!(p.pool.pool_max, 8);
-        assert_eq!(p.pool.pool_idle_timeout, Duration::from_secs(10));
+        assert_eq!(p.pool.sender_pool_min, 4);
+        assert_eq!(p.pool.sender_pool_max, 8);
+        assert_eq!(p.pool.query_pool_min, 2);
+        assert_eq!(p.pool.query_pool_max, 6);
+        assert_eq!(p.pool.acquire_timeout, Duration::from_millis(250));
+        assert_eq!(p.pool.idle_timeout, Duration::from_secs(10));
         assert_eq!(p.pool.pool_reap, PoolReap::Manual);
+    }
+
+    #[test]
+    fn renamed_legacy_keys_are_rejected_with_guidance() {
+        for key in ["pool_size", "pool_max", "pool_idle_timeout_ms"] {
+            let conf = format!("ws::addr=localhost:9000;{key}=2;");
+            let err = parse_err(&conf);
+            assert_eq!(err.code(), ErrorCode::ConfigError, "{key}");
+            assert!(err.msg().contains("renamed"), "{key}: {}", err.msg());
+        }
+    }
+
+    #[test]
+    fn pool_min_zero_is_allowed() {
+        let p = parse_ok("ws::addr=localhost:9000;sender_pool_min=0;query_pool_min=0;");
+        assert_eq!(p.pool.sender_pool_min, 0);
+        assert_eq!(p.pool.query_pool_min, 0);
+    }
+
+    #[test]
+    fn acquire_timeout_zero_is_allowed() {
+        let p = parse_ok("ws::addr=localhost:9000;acquire_timeout_ms=0;");
+        assert_eq!(p.pool.acquire_timeout, Duration::ZERO);
     }
 
     #[test]
@@ -344,18 +420,18 @@ mod tests {
     fn sf_dir_selects_disk_store_and_forward_without_changing_pool_max() {
         let p = parse_ok("ws::addr=localhost:9000;sf_dir=/tmp/qdb-sf;");
         assert!(p.sf_disk);
-        assert_eq!(p.pool.pool_size, 1);
-        assert_eq!(p.pool.pool_max, DEFAULT_POOL_MAX);
+        assert_eq!(p.pool.sender_pool_min, 1);
+        assert_eq!(p.pool.sender_pool_max, DEFAULT_POOL_MAX);
     }
 
     #[test]
     fn sf_dir_accepts_multi_slot_pool() {
         let p = parse_ok(
-            "ws::addr=localhost:9000;sf_dir=/tmp/qdb-sf;pool_size=4;pool_max=8;sender_id=abc;",
+            "ws::addr=localhost:9000;sf_dir=/tmp/qdb-sf;sender_pool_min=4;sender_pool_max=8;sender_id=abc;",
         );
         assert!(p.sf_disk);
-        assert_eq!(p.pool.pool_size, 4);
-        assert_eq!(p.pool.pool_max, 8);
+        assert_eq!(p.pool.sender_pool_min, 4);
+        assert_eq!(p.pool.sender_pool_max, 8);
     }
 
     #[test]
@@ -374,22 +450,28 @@ mod tests {
             let conf = format!("ws::addr=localhost:9000;{key}=whatever;");
             let p = parse_ok(&conf);
             assert!(!p.sf_disk, "{key} must not imply disk-backed SF");
-            assert_eq!(p.pool.pool_max, DEFAULT_POOL_MAX, "key {key}");
+            assert_eq!(p.pool.sender_pool_max, DEFAULT_POOL_MAX, "key {key}");
         }
     }
 
     #[test]
-    fn refuses_pool_size_zero() {
-        let err = parse_err("ws::addr=localhost:9000;pool_size=0;");
-        assert_eq!(err.code(), ErrorCode::ConfigError);
-        assert!(err.msg().contains("pool_size"));
+    fn refuses_pool_max_zero() {
+        for key in ["sender_pool_max", "query_pool_max"] {
+            let conf = format!("ws::addr=localhost:9000;{key}=0;");
+            let err = parse_err(&conf);
+            assert_eq!(err.code(), ErrorCode::ConfigError, "{key}");
+            assert!(err.msg().contains(key), "{key}: {}", err.msg());
+        }
     }
 
     #[test]
-    fn refuses_pool_size_above_pool_max() {
-        let err = parse_err("ws::addr=localhost:9000;pool_size=10;pool_max=5;");
+    fn refuses_pool_min_above_pool_max() {
+        let err = parse_err("ws::addr=localhost:9000;sender_pool_min=10;sender_pool_max=5;");
         assert_eq!(err.code(), ErrorCode::ConfigError);
-        assert!(err.msg().contains("pool_size") && err.msg().contains("pool_max"));
+        assert!(err.msg().contains("sender_pool_min") && err.msg().contains("sender_pool_max"));
+        let err = parse_err("ws::addr=localhost:9000;query_pool_min=10;query_pool_max=5;");
+        assert_eq!(err.code(), ErrorCode::ConfigError);
+        assert!(err.msg().contains("query_pool_min") && err.msg().contains("query_pool_max"));
     }
 
     #[test]
@@ -441,6 +523,6 @@ mod tests {
         // `;;` inside a value should be parsed as a literal `;`, not as a
         // record separator. Our walker mirrors `scan_qwp_ws_addr_params` so a
         // value containing `;;` does not bleed into the next key.
-        let _ = parse_ok("ws::addr=localhost:9000;password=a;;b;pool_size=2;");
+        let _ = parse_ok("ws::addr=localhost:9000;password=a;;b;sender_pool_min=2;");
     }
 }

@@ -78,7 +78,7 @@ int main(void)
     char base[256], conf[256];
     snprintf(base, sizeof(base), "http://%s:%zu", host, port);
     snprintf(conf, sizeof(conf),
-             "ws::addr=%s:%zu;pool_size=1;pool_max=1;pool_reap=manual;",
+             "ws::addr=%s:%zu;sender_pool_min=1;sender_pool_max=1;pool_reap=manual;",
              host, port);
 
     long long count = -1;

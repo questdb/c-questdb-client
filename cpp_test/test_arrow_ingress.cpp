@@ -168,7 +168,7 @@ struct MockConn
         : server(std::vector<qm::Script>{std::move(script)})
     {
         const std::string conf = "ws::addr=" + server.addr() +
-            ";pool_size=1;pool_reap=manual;close_flush_timeout_millis=0;";
+            ";sender_pool_min=1;pool_reap=manual;close_flush_timeout_millis=0;";
         line_sender_error* err = nullptr;
         db = questdb_db_connect(conf.c_str(), conf.size(), &err);
         REQUIRE(db != nullptr);
@@ -267,7 +267,7 @@ TEST_CASE("borrowed_sender exposes Arrow FSN helper")
         qm::Script{qm::ActionAwaitClientFrame{0x51}}});
     questdb::pool db{
         "ws::addr=" + server.addr() +
-        ";pool_size=1;pool_reap=manual;close_flush_timeout_millis=0;"};
+        ";sender_pool_min=1;pool_reap=manual;close_flush_timeout_millis=0;"};
     auto conn = db.borrow_sender();
 
     auto col = pack_le<int64_t>({10, 20, 30});
@@ -321,7 +321,7 @@ TEST_CASE("borrowed_sender exposes Arrow ACKing helpers")
         qm::ActionSendRaw{qm::ingress_ok_frame(1)}}});
     questdb::pool db{
         "ws::addr=" + server.addr() +
-        ";pool_size=1;pool_reap=manual;close_flush_timeout_millis=0;"};
+        ";sender_pool_min=1;pool_reap=manual;close_flush_timeout_millis=0;"};
     auto conn = db.borrow_sender();
 
     auto col = pack_le<int64_t>({10, 20, 30});

@@ -475,7 +475,8 @@ fn main() -> Result<(), Box<dyn Error>> {
             df.schema()
         );
 
-        let conf = format!("ws::addr={host}:{port};pool_size=1;pool_max=1;pool_reap=manual;");
+        let conf =
+            format!("ws::addr={host}:{port};sender_pool_min=1;sender_pool_max=1;pool_reap=manual;");
         let db = QuestDb::connect(&conf)?;
         let ts_col = ColumnName::new("ts")?;
         let opts = PolarsIngestOptions::new()

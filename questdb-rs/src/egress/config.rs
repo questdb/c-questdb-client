@@ -581,9 +581,12 @@ pub(crate) const INGRESS_ONLY_CONFIG_KEYS: &[&str] = &[
     // readers on the reader's behalf — but a Client that holds both
     // a sender and a reader pool is configured by one conf-string,
     // so the reader's parser accepts and ignores these.
-    "pool_size",
-    "pool_max",
-    "pool_idle_timeout_ms",
+    "sender_pool_min",
+    "sender_pool_max",
+    "query_pool_min",
+    "query_pool_max",
+    "acquire_timeout_ms",
+    "idle_timeout_ms",
     "pool_reap",
 ];
 

@@ -535,7 +535,7 @@ pub unsafe extern "C" fn reader_close(reader: *mut reader) {
             let stats_ptr = std::ptr::addr_of!((*reader).stats);
             let bytes_in_flight = (&*stats_ptr).bytes_received.load(Ordering::Relaxed);
             // Release the pool slot before leaking the box so the pool's
-            // `pool_max` budget isn't permanently burned by misuse.
+            // `query_pool_max` budget isn't permanently burned by misuse.
             // The Reader stays inside the leaked box (cursor still holds
             // a `&mut Reader`); only the bookkeeping slot is freed.
             let ownership_ptr = std::ptr::addr_of!((*reader).ownership);
@@ -3504,8 +3504,9 @@ use crate::column_sender::questdb_db;
 /// `*err_out` on failure (pool exhausted, transport failure, etc.).
 ///
 /// Reader connections are pooled separately from writer connections
-/// but share the same `pool_size` / `pool_max` /
-/// `pool_idle_timeout_ms` budget. The reader pool is lazy: a
+/// with their own `query_pool_min` / `query_pool_max` budget
+/// (senders use `sender_pool_min` / `sender_pool_max`; both pools
+/// share `acquire_timeout_ms` and `idle_timeout_ms`). The reader pool is lazy: a
 /// connection is opened on first borrow, not at `questdb_db_connect`
 /// time, so callers that never use egress don't pay any handshake
 /// cost.

@@ -57,7 +57,9 @@ std::unique_ptr<qm::MockServer> spawn_acking_mock(int slot_count)
 
 std::string conf_for(const std::string& addr, const std::string& extras = {})
 {
-    return "ws::addr=" + addr + ";pool_size=1;pool_reap=manual;" + extras;
+    return "ws::addr=" + addr +
+           ";sender_pool_min=1;pool_reap=manual;close_flush_timeout_millis=0;" +
+           extras;
 }
 
 } // namespace
@@ -528,7 +530,7 @@ TEST_CASE("pool is move-constructible and move-assignable")
 TEST_CASE("pool reap_idle is callable")
 {
     auto mock = spawn_mock(2);
-    questdb::pool db{conf_for(mock->addr(), "pool_idle_timeout_ms=1;")};
+    questdb::pool db{conf_for(mock->addr(), "idle_timeout_ms=1;")};
     {
         auto conn = db.borrow_sender();
         (void)conn;

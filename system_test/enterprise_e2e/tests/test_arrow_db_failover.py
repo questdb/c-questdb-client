@@ -79,8 +79,8 @@ def _connect_string(http_ports: list[int], *, request_durable_ack: bool = False,
         "password=quest",
         f"reconnect_max_duration_millis={reconnect_max_ms}",
         f"close_flush_timeout_millis={close_flush_timeout_ms}",
-        "pool_size=1",
-        "pool_max=1",
+        "sender_pool_min=1",
+        "sender_pool_max=1",
     ]
     if request_durable_ack:
         parts.append("request_durable_ack=on")

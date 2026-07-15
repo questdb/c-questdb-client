@@ -1049,7 +1049,7 @@ static qwp_sender* mock_borrow_sender_frames(
     char conf[256];
     snprintf(
         conf, sizeof(conf),
-        "ws::addr=%s;pool_size=1;pool_reap=manual;",
+        "ws::addr=%s;sender_pool_min=1;pool_reap=manual;close_flush_timeout_millis=0;",
         addr);
     line_sender_error* err = NULL;
     questdb_db* db = questdb_db_connect(conf, strlen(conf), &err);

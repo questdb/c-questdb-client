@@ -32,9 +32,10 @@
 //! store-and-forward producer immediately and lets its background runner connect
 //! later, so callers can buffer while the server is absent. Direct ingestion
 //! senders and readers still open their transport on first borrow.
-//! The pools auto-grow up to `pool_max` on demand and (under `pool_reap=auto`)
-//! run a background thread that closes above-`pool_size` idle entries after
-//! `pool_idle_timeout_ms`.
+//! The pools auto-grow up to their configured caps (`sender_pool_max` /
+//! `query_pool_max`) on demand and (under `pool_reap=auto`)
+//! run a background thread that closes above-minimum idle entries after
+//! `idle_timeout_ms`.
 //!
 //! Each pool slot is handed out as a [`BorrowedSender`] which returns
 //! itself to the pool on `Drop`. Slots whose underlying connection has
@@ -152,7 +153,7 @@ impl<S> Drop for InUseSlot<'_, S> {
 
 #[cfg(feature = "_egress")]
 struct ReaderInUseSlot<'a> {
-    state: &'a Mutex<ReaderPoolState>,
+    inner: &'a DbInner,
     armed: bool,
 }
 
@@ -167,8 +168,11 @@ impl ReaderInUseSlot<'_> {
 impl Drop for ReaderInUseSlot<'_> {
     fn drop(&mut self) {
         if self.armed {
-            let mut state = lock_reader_state(self.state);
-            state.in_use = state.in_use.saturating_sub(1);
+            {
+                let mut state = lock_reader_state(&self.inner.reader_state);
+                state.in_use = state.in_use.saturating_sub(1);
+            }
+            self.inner.reader_cv.notify_all();
         }
     }
 }
@@ -234,8 +238,21 @@ struct DbInner {
     /// stops handing out connections to a dead peer rather than rediscovering
     /// it one connection at a time.
     health: Mutex<QwpWsHostHealthTracker>,
-    pool_size: usize,
-    pool_max: usize,
+    /// Warm minimum the reaper preserves in the store-and-forward
+    /// ingestion pool.
+    sender_pool_min: usize,
+    /// Hard cap on the store-and-forward ingestion pool and on the direct
+    /// column-sender pool (both are ingestion-side connections).
+    sender_pool_max: usize,
+    /// Warm minimum the reaper preserves in the reader pool.
+    #[cfg(feature = "_egress")]
+    query_pool_min: usize,
+    /// Hard cap on the reader pool.
+    #[cfg(feature = "_egress")]
+    query_pool_max: usize,
+    /// How long an at-cap borrow waits for a connection to be returned
+    /// before failing. Zero disables waiting (fail-fast).
+    acquire_timeout: Duration,
     /// `sf_dir` set: store-and-forward senders use pool-minted disk slots.
     sf_disk: bool,
     /// Configured `sender_id` kept as the slot base. Disk-backed pool slots are
@@ -244,7 +261,7 @@ struct DbInner {
     /// Managed ingestion slot range excluded from orphan scans so sibling
     /// senders do not adopt each other's live pool slots.
     managed_slot_exclusion: Option<QwpWsManagedSlotExclusion>,
-    pool_idle_timeout: Duration,
+    idle_timeout: Duration,
     /// Optional connection lifecycle event source (dispatcher + attempt
     /// counter + success-classification state). Set at most once via
     /// [`QuestDb::set_connection_listener`]; every ingress pool connect
@@ -255,22 +272,30 @@ struct DbInner {
     /// [`QuestDb::borrow_direct_column_sender`] (DataFrame ingestion). Lazy-init
     /// like the reader pool: starts empty, opens a direct
     /// connection on demand, recycles through its own free list and the shared
-    /// `pool_max` cap. Kept separate from `state` so DataFrame ingest always
+    /// `sender_pool_max` cap. Kept separate from `state` so DataFrame ingest always
     /// gets a plain pipelined connection even when `state` is in
     /// store-and-forward mode.
     direct_state: Mutex<PoolState<DirectSenderCore>>,
     /// Reader pool. Lazy-init: starts empty, populated on first
-    /// `borrow_reader_owned` call. Applies the same `pool_size` /
-    /// `pool_max` / `pool_idle_timeout` values as the sender pool but
+    /// `borrow_reader_owned` call. Sized by `query_pool_min` /
+    /// `query_pool_max` with the shared `idle_timeout`, but
     /// tracks and caps them on an independent free list, so heavy ingest
     /// can't starve queries. The caps are enforced separately, so the
     /// combined live connection count across the store-and-forward ingress,
-    /// direct ingestion, and reader pools can reach up to `3 * pool_max`.
+    /// direct ingestion, and reader pools can reach up to
+    /// `2 * sender_pool_max + query_pool_max`.
     #[cfg(feature = "_egress")]
     reader_state: Mutex<ReaderPoolState>,
     /// Wakes the reaper thread on `shutdown` and lets a disk-SF borrow wait
     /// briefly for an in-flight slot close to release its flock.
     cv: Condvar,
+    /// Wakes at-cap direct-pool borrows when a direct sender is returned
+    /// or a reservation is rolled back. Paired with `direct_state`.
+    direct_cv: Condvar,
+    /// Wakes at-cap reader borrows when a reader is returned or a
+    /// reservation is rolled back. Paired with `reader_state`.
+    #[cfg(feature = "_egress")]
+    reader_cv: Condvar,
     shutdown: AtomicBool,
 }
 
@@ -437,8 +462,10 @@ pub struct DbgPoolCount {
 /// Per-pool connection-count snapshot for a [`QuestDb`], for soak / leak
 /// diagnostics. **Not semver-stable** (`#[doc(hidden)]`, `#[non_exhaustive]`).
 ///
-/// Each pool is capped independently at `pool_max`, so `free + in_use` summed
-/// across all three fields can reach `3 * pool_max` when egress is enabled.
+/// The ingestion and direct pools are each capped at `sender_pool_max` and
+/// the reader pool at `query_pool_max`, so `free + in_use` summed across all
+/// three fields can reach `2 * sender_pool_max + query_pool_max` when egress
+/// is enabled.
 #[doc(hidden)]
 #[non_exhaustive]
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -487,7 +514,7 @@ fn managed_slot_recovery_candidates(inner: &DbInner) -> Vec<PathBuf> {
     let Some(sf_dir) = inner.connector.sf_dir() else {
         return Vec::new();
     };
-    managed_slot_recovery_candidates_from(sf_dir, &inner.slot_base_id, inner.pool_max)
+    managed_slot_recovery_candidates_from(sf_dir, &inner.slot_base_id, inner.sender_pool_max)
 }
 
 fn managed_slot_recovery_candidates_from(
@@ -562,7 +589,7 @@ fn preopen_recovery_senders(inner: &Arc<DbInner>) {
     let Some(sf_dir) = inner.connector.sf_dir() else {
         return;
     };
-    let scan = managed_slot_recovery_scan_from(sf_dir, &inner.slot_base_id, inner.pool_max);
+    let scan = managed_slot_recovery_scan_from(sf_dir, &inner.slot_base_id, inner.sender_pool_max);
     for candidate in scan.in_range {
         preopen_recovery_sender(inner, candidate.index, &candidate.path, &scan.out_of_range);
     }
@@ -619,12 +646,20 @@ impl QuestDb {
     /// The connect string must use a QWP/WebSocket schema (`ws::` /
     /// `wss::` / `ws::` / `wss::`). Pool-specific keys are recognised:
     ///
-    /// | Key                    | Default | Meaning                                                        |
-    /// |------------------------|---------|----------------------------------------------------------------|
-    /// | `pool_size`            | 1       | Warm / minimum entries once opened. |
-    /// | `pool_max`             | 64      | Hard cap on auto-grow. |
-    /// | `pool_idle_timeout_ms` | 60000   | Above-`pool_size` idle connections are closed after this long. |
-    /// | `pool_reap`            | `auto`  | `auto` runs a background reaper; `manual` requires `reap_idle`. |
+    /// | Key                  | Default | Meaning                                                          |
+    /// |----------------------|---------|------------------------------------------------------------------|
+    /// | `sender_pool_min`    | 1       | Warm minimum of the ingestion pool once opened. |
+    /// | `sender_pool_max`    | 4       | Hard cap on the ingestion pool; the direct column-sender pool used by DataFrame ingestion is capped separately at the same value. |
+    /// | `query_pool_min`     | 1       | Warm minimum of the reader pool once opened. |
+    /// | `query_pool_max`     | 4       | Hard cap on the reader pool. |
+    /// | `acquire_timeout_ms` | 5000    | How long an at-cap borrow waits for a return before failing; `0` fails immediately. |
+    /// | `idle_timeout_ms`    | 60000   | Above-minimum idle connections are closed after this long. |
+    /// | `pool_reap`          | `auto`  | `auto` runs a background reaper; `manual` requires `reap_idle`. |
+    ///
+    /// Key names and defaults match the Java client's `QuestDBBuilder`; the
+    /// Java-only lifecycle keys (`max_lifetime_ms`, `housekeeper_interval_ms`,
+    /// `query_close_timeout_ms`) have no counterpart here — the reaper tick
+    /// and `close_flush_timeout` own those responsibilities.
     ///
     /// [`Self::borrow_sender`] is always store-and-forward (in-memory when no
     /// `sf_dir`, disk-backed when set). Setting `sf_dir` gives every pooled
@@ -632,7 +667,7 @@ impl QuestDb {
     /// base as `<base>-ingest-<index>`. Those `<sender_id>-ingest-*`
     /// directories are reserved for this pool namespace under `sf_dir`; use a
     /// unique `sender_id` for each pool that shares an `sf_dir`.
-    /// `pool_size` / `pool_max` apply once to this unified ingestion pool. At
+    /// `sender_pool_min` / `sender_pool_max` apply to this unified ingestion pool. At
     /// cap, borrows return `InvalidApiCall` except disk-backed
     /// ingestion borrows can wait up to `close_flush_timeout` (default 5s)
     /// while an in-flight slot close releases its lock. For a plain pipelined
@@ -645,8 +680,9 @@ impl QuestDb {
     /// store-and-forward ingestion pool creates a local producer on first borrow
     /// and starts its initial connect in the background, so the borrower can
     /// buffer immediately even while the server is absent. Direct senders and
-    /// readers still open their transport on first borrow. `pool_size` is the
-    /// warm minimum the reaper keeps once entries have been opened.
+    /// readers still open their transport on first borrow. `sender_pool_min` /
+    /// `query_pool_min` are the warm minimums the reaper keeps once entries
+    /// have been opened.
     ///
     /// # Store-and-forward durability
     ///
@@ -679,7 +715,10 @@ impl QuestDb {
         let health = QwpWsHostHealthTracker::new(connector.endpoint_count());
         let slot_base_id = connector.sender_id().to_owned();
         let managed_slot_exclusion = if sf_disk {
-            Some(managed_slot_exclusion(&slot_base_id, pool_cfg.pool_max))
+            Some(managed_slot_exclusion(
+                &slot_base_id,
+                pool_cfg.sender_pool_max,
+            ))
         } else {
             None
         };
@@ -694,14 +733,19 @@ impl QuestDb {
             connector,
             buffer_max_name_len,
             health: Mutex::new(health),
-            pool_size: pool_cfg.pool_size,
-            pool_max: pool_cfg.pool_max,
+            sender_pool_min: pool_cfg.sender_pool_min,
+            sender_pool_max: pool_cfg.sender_pool_max,
+            #[cfg(feature = "_egress")]
+            query_pool_min: pool_cfg.query_pool_min,
+            #[cfg(feature = "_egress")]
+            query_pool_max: pool_cfg.query_pool_max,
+            acquire_timeout: pool_cfg.acquire_timeout,
             sf_disk,
             slot_base_id,
             managed_slot_exclusion,
-            pool_idle_timeout: pool_cfg.pool_idle_timeout,
+            idle_timeout: pool_cfg.idle_timeout,
             state: Mutex::new(if sf_disk {
-                PoolState::with_disk_slots(pool_cfg.pool_max)
+                PoolState::with_disk_slots(pool_cfg.sender_pool_max)
             } else {
                 PoolState {
                     free,
@@ -712,6 +756,9 @@ impl QuestDb {
             #[cfg(feature = "_egress")]
             reader_state: Mutex::new(ReaderPoolState::default()),
             cv: Condvar::new(),
+            direct_cv: Condvar::new(),
+            #[cfg(feature = "_egress")]
+            reader_cv: Condvar::new(),
             shutdown: AtomicBool::new(false),
             conn_events: OnceLock::new(),
         });
@@ -751,10 +798,12 @@ impl QuestDb {
     /// Borrow a sender.
     ///
     /// Selection: pop the most-recently-returned slot from the free list;
-    /// failing that, open a new connection if we are below `pool_max`;
+    /// failing that, open a new connection if we are below `sender_pool_max`;
     /// failing that, in disk-backed store-and-forward mode only, wait up to
     /// `close_flush_timeout` (default 5s) while an in-flight slot close
-    /// releases its lock; failing that, return `InvalidApiCall`.
+    /// releases its lock; failing that, wait up to `acquire_timeout_ms` for a
+    /// return (`acquire_timeout_ms=0` fails fast); failing that, return
+    /// `InvalidApiCall`.
     pub fn borrow_sender(&self) -> Result<BorrowedSender<'_>> {
         let cs = self.pick_sender()?;
         Ok(BorrowedSender(SenderHandle::new(self, cs)))
@@ -913,7 +962,7 @@ impl QuestDb {
         }
         // Same-handle replacement: the borrowed direct sender already owns one
         // logical in-use slot, so this must not reserve another one or
-        // pool_max=1 would reject replacing a dead direct connection.
+        // sender_sender_pool_max=1 would reject replacing a dead direct connection.
         if let Some(entry) = lock_state(&self.inner.direct_state).free.pop() {
             return Ok(PooledSender {
                 sender: entry.sender,
@@ -936,8 +985,9 @@ impl QuestDb {
     /// Manually reap idle connections.
     ///
     /// Closes free-list entries that have been idle longer than
-    /// `pool_idle_timeout_ms`, never shrinking total connection count below
-    /// `pool_size`. Returns the number of connections closed.
+    /// `idle_timeout_ms`, never shrinking the sender pools below
+    /// `sender_pool_min` or the reader pool below `query_pool_min`. Returns
+    /// the number of connections closed.
     ///
     /// Under the default `pool_reap=auto`, a background thread invokes this
     /// logic periodically and this call is harmless. Under
@@ -1107,12 +1157,14 @@ impl QuestDb {
     /// Egress companion to [`Self::borrow_sender`]: pulls a [`Reader`]
     /// from the pool's reader free list, lazily opening a fresh connection
     /// (via `Reader::from_conf` on the original connect string) when the
-    /// free list is empty and the pool is below `pool_max`. The reader pool
-    /// is lazily grown and capped **independently** of the two ingestion pools,
-    /// so heavy ingest can't starve queries and vice versa (the combined
-    /// live-connection ceiling across all three pools is `3 * pool_max`).
+    /// free list is empty and the pool is below `query_pool_max`. The reader
+    /// pool is lazily grown and capped **independently** of the two ingestion
+    /// pools, so heavy ingest can't starve queries and vice versa (the
+    /// combined live-connection ceiling across all three pools is
+    /// `2 * sender_pool_max + query_pool_max`).
     ///
-    /// Borrow at the cap returns
+    /// Borrow at the cap waits up to `acquire_timeout_ms` for a return
+    /// (`acquire_timeout_ms=0` fails fast), then returns
     /// [`InvalidApiCall`](crate::ErrorCode::InvalidApiCall).
     ///
     /// The returned [`BorrowedReader`] derefs to `Reader`, so the usual
@@ -1133,7 +1185,7 @@ impl QuestDb {
     ///
     /// Same shape as [`Self::borrow_sender_owned`] but pulls a
     /// [`Reader`] from the reader free list (lazily opens one if the
-    /// free list is empty and total < `pool_max`). Returned via
+    /// free list is empty and total < `query_pool_max`). Returned via
     /// [`OwnedReader`]'s Drop: see the sender variant for the same
     /// pattern.
     #[cfg(all(feature = "_egress", feature = "ffi-support"))]
@@ -1161,31 +1213,48 @@ impl QuestDb {
         use crate::{Error, ErrorCode};
         let slot = {
             let mut state = lock_reader_state(&self.inner.reader_state);
-            if self.inner.shutdown.load(Ordering::SeqCst) {
-                return Err(Error::new(
-                    ErrorCode::InvalidApiCall,
-                    "QuestDb pool is closed; cannot borrow reader",
-                ));
-            }
-            if let Some(entry) = state.free.pop() {
-                state.in_use += 1;
-                drop(state);
-                return Ok(entry.reader);
-            }
-            if state.total() >= self.inner.pool_max {
+            let mut acquire_deadline = None;
+            loop {
+                if self.inner.shutdown.load(Ordering::SeqCst) {
+                    return Err(Error::new(
+                        ErrorCode::InvalidApiCall,
+                        "QuestDb pool is closed; cannot borrow reader",
+                    ));
+                }
+                if let Some(entry) = state.free.pop() {
+                    state.in_use += 1;
+                    drop(state);
+                    return Ok(entry.reader);
+                }
+                if state.total() < self.inner.query_pool_max {
+                    break;
+                }
+                if let Some(wait_for) =
+                    remaining_wait(&mut acquire_deadline, self.inner.acquire_timeout)
+                {
+                    let (next_state, _) = match self.inner.reader_cv.wait_timeout(state, wait_for) {
+                        Ok((guard, result)) => (guard, result),
+                        Err(poisoned) => poisoned.into_inner(),
+                    };
+                    state = next_state;
+                    continue;
+                }
                 return Err(Error::new(
                     ErrorCode::InvalidApiCall,
                     format!(
-                        "Reader pool exhausted: {} readers are currently borrowed and \
-                         the pool is at its `pool_max` cap of {}. \
-                         Release a reader or raise `pool_max`.",
-                        state.in_use, self.inner.pool_max
+                        "Reader pool exhausted: {} readers are currently borrowed at \
+                         the `query_pool_max` cap of {} after waiting \
+                         acquire_timeout_ms={}. Release a reader, or raise \
+                         `query_pool_max` / `acquire_timeout_ms`.",
+                        state.in_use,
+                        self.inner.query_pool_max,
+                        self.inner.acquire_timeout.as_millis()
                     ),
                 ));
             }
             state.in_use += 1;
             ReaderInUseSlot {
-                state: &self.inner.reader_state,
+                inner: &self.inner,
                 armed: true,
             }
         };
@@ -1211,8 +1280,11 @@ impl Debug for QuestDb {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         let state = lock_state(&self.inner.state);
         f.debug_struct("QuestDb")
-            .field("pool_size", &self.inner.pool_size)
-            .field("pool_max", &self.inner.pool_max)
+            .field("sender_pool_min", &self.inner.sender_pool_min)
+            .field("sender_pool_max", &self.inner.sender_pool_max)
+            .field("query_pool_min", &self.inner.query_pool_min)
+            .field("query_pool_max", &self.inner.query_pool_max)
+            .field("acquire_timeout", &self.inner.acquire_timeout)
             .field("free", &state.free.len())
             .field("in_use", &state.in_use)
             .finish()
@@ -1221,13 +1293,23 @@ impl Debug for QuestDb {
 
 impl Drop for QuestDb {
     fn drop(&mut self) {
-        // Wake the reaper and let it observe shutdown.
+        // Wake the reaper and any at-cap borrow waits, and let them
+        // observe shutdown.
         self.inner.shutdown.store(true, Ordering::SeqCst);
         // Notifying under the mutex avoids the lost-wakeup race where the
-        // reaper has just released the lock and is about to wait.
+        // waiter has just released the lock and is about to wait.
         {
             let _g = lock_state(&self.inner.state);
             self.inner.cv.notify_all();
+        }
+        {
+            let _g = lock_state(&self.inner.direct_state);
+            self.inner.direct_cv.notify_all();
+        }
+        #[cfg(feature = "_egress")]
+        {
+            let _g = lock_reader_state(&self.inner.reader_state);
+            self.inner.reader_cv.notify_all();
         }
         if let Some(handle) = self.reaper.take() {
             let _ = handle.join();
@@ -2295,7 +2377,7 @@ impl ReaderPoolHandle {
     /// with a cursor still live, the underlying `Reader` cannot be
     /// extracted (UnsafeCell aliasing with the in-flight `&mut Reader`),
     /// so it leaks — but the pool's borrow accounting must still drop
-    /// the slot or `pool_max` is permanently burned.
+    /// the slot or a `query_pool_max` slot is permanently burned.
     pub fn release_leaked_slot(&self) {
         let mut state = lock_reader_state(&self.inner.reader_state);
         state.in_use = state.in_use.saturating_sub(1);
@@ -2314,19 +2396,23 @@ fn return_reader_to_pool(inner: &Arc<DbInner>, reader: Reader, must_close: bool)
         });
     }
     drop(state);
+    inner.reader_cv.notify_all();
 }
 
-/// Pop a free connection or open a fresh one within `pool_max`. Reserves the
-/// pool slot under one lock so a concurrent return can't race past `pool_size`.
+/// Pop a free connection or open a fresh one within `sender_pool_max`; at cap,
+/// wait up to `acquire_timeout_ms` for a return. Reserves the pool slot under
+/// one lock so a concurrent return can't race past the cap.
 fn pick_sender_inner<S>(
     inner: &Arc<DbInner>,
     pool: &Mutex<PoolState<S>>,
+    cv: &Condvar,
     sfa: bool,
     connect: impl FnOnce(Option<usize>) -> Result<S>,
 ) -> Result<PooledSender<S>> {
     let slot = {
         let mut state = lock_state(pool);
         let mut close_wait_deadline = None;
+        let mut acquire_deadline = None;
         loop {
             if inner.shutdown.load(Ordering::SeqCst) {
                 return Err(error::fmt!(
@@ -2342,16 +2428,24 @@ fn pick_sender_inner<S>(
                     slot_index: entry.slot_index,
                 });
             }
-            if state.reserved_total() < inner.pool_max {
+            if state.reserved_total() < inner.sender_pool_max {
                 break;
             }
             let wait_timeout = inner.connector.close_flush_timeout();
             if sfa
                 && inner.sf_disk
                 && state.closing > 0
-                && let Some(wait_for) = remaining_close_wait(&mut close_wait_deadline, wait_timeout)
+                && let Some(wait_for) = remaining_wait(&mut close_wait_deadline, wait_timeout)
             {
-                let (next_state, _) = match inner.cv.wait_timeout(state, wait_for) {
+                let (next_state, _) = match cv.wait_timeout(state, wait_for) {
+                    Ok((guard, result)) => (guard, result),
+                    Err(poisoned) => poisoned.into_inner(),
+                };
+                state = next_state;
+                continue;
+            }
+            if let Some(wait_for) = remaining_wait(&mut acquire_deadline, inner.acquire_timeout) {
+                let (next_state, _) = match cv.wait_timeout(state, wait_for) {
                     Ok((guard, result)) => (guard, result),
                     Err(poisoned) => poisoned.into_inner(),
                 };
@@ -2360,10 +2454,13 @@ fn pick_sender_inner<S>(
             }
             return Err(error::fmt!(
                 InvalidApiCall,
-                "Connection pool exhausted: {} sender(s) in use, pool_max={}. \
-                 Drop a borrowed sender or increase pool_max.",
+                "Connection pool exhausted: {} sender(s) in use at the \
+                 sender_pool_max cap of {} after waiting acquire_timeout_ms={}. \
+                 Drop a borrowed sender, or raise sender_pool_max / \
+                 acquire_timeout_ms.",
                 state.in_use,
-                inner.pool_max
+                inner.sender_pool_max,
+                inner.acquire_timeout.as_millis()
             ));
         }
         let slot_index = state.allocate_slot_index();
@@ -2371,7 +2468,7 @@ fn pick_sender_inner<S>(
         state.in_use += 1;
         InUseSlot {
             state: pool,
-            cv: &inner.cv,
+            cv,
             slot_index,
             armed: true,
         }
@@ -2383,21 +2480,27 @@ fn pick_sender_inner<S>(
 }
 
 fn pick_sfa_sender(inner: &Arc<DbInner>) -> Result<PooledSender<PooledSenderCore>> {
-    pick_sender_inner(inner, &inner.state, true, |slot_index| {
+    pick_sender_inner(inner, &inner.state, &inner.cv, true, |slot_index| {
         connect_sfa_pool(inner, slot_index)
     })
 }
 
 fn pick_direct_sender(inner: &Arc<DbInner>) -> Result<PooledSender<DirectSenderCore>> {
-    pick_sender_inner(inner, &inner.direct_state, false, |_slot_index| {
-        let conn = connect_conn_pool(inner)?;
-        Ok(DirectSenderCore::new(
-            conn,
-            crate::ingress::SymbolGlobalDict::new(),
-            crate::ingress::column_sender::encoder::EncodeScratch::new(),
-            false,
-        ))
-    })
+    pick_sender_inner(
+        inner,
+        &inner.direct_state,
+        &inner.direct_cv,
+        false,
+        |_slot_index| {
+            let conn = connect_conn_pool(inner)?;
+            Ok(DirectSenderCore::new(
+                conn,
+                crate::ingress::SymbolGlobalDict::new(),
+                crate::ingress::column_sender::encoder::EncodeScratch::new(),
+                false,
+            ))
+        },
+    )
 }
 
 fn connect_sfa_pool(inner: &Arc<DbInner>, slot_index: Option<usize>) -> Result<PooledSenderCore> {
@@ -2474,7 +2577,7 @@ pub(crate) fn reconnect_deadline_expired(deadline: Option<Instant>) -> bool {
     deadline.is_some_and(|d| Instant::now() >= d)
 }
 
-fn remaining_close_wait(deadline: &mut Option<Instant>, timeout: Duration) -> Option<Duration> {
+fn remaining_wait(deadline: &mut Option<Instant>, timeout: Duration) -> Option<Duration> {
     if timeout.is_zero() {
         return None;
     }
@@ -2641,30 +2744,37 @@ fn return_sfa_to_pool(
 fn return_direct_to_pool(inner: &Arc<DbInner>, sender: DirectSenderCore) {
     let must_close = sender.must_close();
     record_sender_transport_failure(inner, &sender);
-    let mut state = lock_state(&inner.direct_state);
-    state.in_use = state.in_use.saturating_sub(1);
-    if !must_close && !inner.shutdown.load(Ordering::SeqCst) {
-        state.free.push(PoolEntry {
-            sender,
-            slot_index: None,
-            last_idle_at: Instant::now(),
-        });
-        inner.cv.notify_all();
+    {
+        let mut state = lock_state(&inner.direct_state);
+        state.in_use = state.in_use.saturating_sub(1);
+        if !must_close && !inner.shutdown.load(Ordering::SeqCst) {
+            state.free.push(PoolEntry {
+                sender,
+                slot_index: None,
+                last_idle_at: Instant::now(),
+            });
+        }
     }
+    inner.direct_cv.notify_all();
 }
 
 fn finish_replaced_sender(inner: &Arc<DbInner>, sender: DirectSenderCore) {
     let must_close = sender.must_close();
     record_sender_transport_failure(inner, &sender);
-    let mut state = lock_state(&inner.direct_state);
-    if !must_close && !inner.shutdown.load(Ordering::SeqCst) && state.total() < inner.pool_max {
-        state.free.push(PoolEntry {
-            sender,
-            slot_index: None,
-            last_idle_at: Instant::now(),
-        });
-        inner.cv.notify_all();
+    {
+        let mut state = lock_state(&inner.direct_state);
+        if !must_close
+            && !inner.shutdown.load(Ordering::SeqCst)
+            && state.total() < inner.sender_pool_max
+        {
+            state.free.push(PoolEntry {
+                sender,
+                slot_index: None,
+                last_idle_at: Instant::now(),
+            });
+        }
     }
+    inner.direct_cv.notify_all();
 }
 
 fn record_sender_transport_failure(inner: &Arc<DbInner>, sender: &DirectSenderCore) {
@@ -2681,7 +2791,7 @@ fn record_sender_transport_failure(inner: &Arc<DbInner>, sender: &DirectSenderCo
 }
 
 fn spawn_reaper(inner: Arc<DbInner>) -> std::io::Result<JoinHandle<()>> {
-    let tick = reaper_tick(inner.pool_idle_timeout);
+    let tick = reaper_tick(inner.idle_timeout);
     thread::Builder::new()
         .name("questdb-ingress-pool-reaper".to_string())
         .spawn(move || reaper_loop(inner, tick))
@@ -2797,11 +2907,11 @@ fn take_reapable_column_sender(
     let mut state = lock_state(&inner.state);
     let now = Instant::now();
     // Free-list is oldest at front, newest at back (push on return /
-    // pop on borrow). We must protect `total() >= pool_size` after the
+    // pop on borrow). We must protect `total() >= sender_pool_min` after the
     // drop, so we only remove an entry if total stays above the floor.
     let mut i = 0;
     while i < state.free.len() {
-        if state.total() <= inner.pool_size {
+        if state.total() <= inner.sender_pool_min {
             return None;
         }
         let idle_for = now.saturating_duration_since(state.free[i].last_idle_at);
@@ -2810,7 +2920,7 @@ fn take_reapable_column_sender(
         // dropping it now would lose that data. It becomes reapable once the
         // runner drains it (or the transport goes terminal). `sfa_fully_delivered`
         // is a lock-free progress read in the healthy case.
-        if idle_for > inner.pool_idle_timeout && state.free[i].sender.sfa_fully_delivered(durable) {
+        if idle_for > inner.idle_timeout && state.free[i].sender.sfa_fully_delivered(durable) {
             let entry = state.free.remove(i);
             if entry.slot_index.is_some() {
                 state.closing += 1;
@@ -2833,7 +2943,7 @@ fn reap_idle_direct_senders(inner: &DbInner) -> usize {
         let mut i = 0;
         while i < state.free.len() {
             let idle_for = now.saturating_duration_since(state.free[i].last_idle_at);
-            if idle_for > inner.pool_idle_timeout {
+            if idle_for > inner.idle_timeout {
                 let entry = state.free.remove(i);
                 to_drop.push(entry.sender);
             } else {
@@ -2849,17 +2959,20 @@ fn reap_idle_direct_senders(inner: &DbInner) -> usize {
 
 #[cfg(feature = "_egress")]
 fn reap_idle_readers(inner: &DbInner) -> usize {
-    // Reader pool is lazy-init (no pre-population at connect), so there
-    // is no warm-min floor to preserve — reap any reader that has been
-    // parked longer than the idle timeout.
+    // The reader pool is lazy-init (no pre-population at connect);
+    // `query_pool_min` acts purely as the reaper's floor once readers
+    // have been opened.
     let to_drop: Vec<Reader> = {
         let mut state = lock_reader_state(&inner.reader_state);
         let mut to_drop = Vec::new();
         let now = Instant::now();
         let mut i = 0;
         while i < state.free.len() {
+            if state.total() <= inner.query_pool_min {
+                break;
+            }
             let idle_for = now.saturating_duration_since(state.free[i].last_idle_at);
-            if idle_for > inner.pool_idle_timeout {
+            if idle_for > inner.idle_timeout {
                 let entry = state.free.remove(i);
                 to_drop.push(entry.reader);
             } else {

@@ -744,13 +744,72 @@ fn refuses_non_qwp_ws_schema() {
 }
 
 #[test]
+fn at_cap_borrow_waits_for_a_return_within_acquire_timeout() {
+    let server = MockServer::spawn(2);
+    let conf = conf_for_endpoints(
+        &[server.port()],
+        "sender_pool_min=1;sender_pool_max=1;pool_reap=manual;",
+    );
+    let db = std::sync::Arc::new(QuestDb::connect(&conf).unwrap());
+    let held = db.borrow_sender().expect("first borrow fills the cap");
+
+    let db2 = std::sync::Arc::clone(&db);
+    let waiter = std::thread::spawn(move || {
+        let start = std::time::Instant::now();
+        let borrowed = db2.borrow_sender();
+        (start.elapsed(), borrowed.is_ok())
+    });
+
+    std::thread::sleep(std::time::Duration::from_millis(150));
+    drop(held);
+
+    let (waited, ok) = waiter.join().unwrap();
+    assert!(ok, "the at-cap waiter must receive the returned sender");
+    assert!(
+        waited >= std::time::Duration::from_millis(100),
+        "the waiter must have blocked for the return, waited {waited:?}"
+    );
+    assert!(
+        waited < std::time::Duration::from_secs(5),
+        "the waiter must not run into the acquire timeout, waited {waited:?}"
+    );
+}
+
+#[test]
+fn at_cap_borrow_fails_fast_with_zero_acquire_timeout() {
+    let server = MockServer::spawn(2);
+    let conf = conf_for_endpoints(
+        &[server.port()],
+        "sender_pool_min=1;sender_pool_max=1;acquire_timeout_ms=0;pool_reap=manual;",
+    );
+    let db = QuestDb::connect(&conf).unwrap();
+    let _held = db.borrow_sender().expect("first borrow fills the cap");
+
+    let start = std::time::Instant::now();
+    let err = db
+        .borrow_sender()
+        .expect_err("second borrow exceeds sender_pool_max");
+    assert_eq!(err.code(), ErrorCode::InvalidApiCall);
+    assert!(
+        err.msg().contains("sender_pool_max") && err.msg().contains("acquire_timeout_ms"),
+        "{}",
+        err.msg()
+    );
+    assert!(
+        start.elapsed() < std::time::Duration::from_secs(1),
+        "acquire_timeout_ms=0 must fail fast"
+    );
+}
+
+#[test]
 fn disk_store_and_forward_ingress_pool_uses_distinct_slots_up_to_pool_max() {
     let server = MockServer::spawn(4);
     let dir = TempDir::new().unwrap();
     let conf = conf_for_endpoints(
         &[server.port()],
         &format!(
-            "sf_dir={};sender_id=cols;pool_size=1;pool_max=3;pool_reap=manual;",
+            "sf_dir={};sender_id=cols;sender_pool_min=1;sender_pool_max=3;\
+             acquire_timeout_ms=0;pool_reap=manual;",
             dir.path().display()
         ),
     );
@@ -791,7 +850,7 @@ fn disk_store_and_forward_preopens_dirty_in_range_slot_at_connect() {
     let conf = conf_for_endpoints(
         &[server.port()],
         &format!(
-            "sf_dir={};sender_id=selfrace;pool_size=1;pool_max=2;\
+            "sf_dir={};sender_id=selfrace;sender_pool_min=1;sender_pool_max=2;\
              pool_reap=manual;max_background_drainers=1;close_flush_timeout_millis=0;",
             dir.path().display()
         ),
@@ -816,7 +875,7 @@ fn disk_store_and_forward_borrower_rechecks_free_sender_after_close_wait_wake() 
     let conf = conf_for_endpoints(
         &[server.port()],
         &format!(
-            "sf_dir={};sender_id=waitfree;pool_size=1;pool_max=2;\
+            "sf_dir={};sender_id=waitfree;sender_pool_min=1;sender_pool_max=2;\
              pool_reap=manual;close_flush_timeout_millis=2000;",
             dir.path().display()
         ),
@@ -880,7 +939,7 @@ fn disk_store_and_forward_at_cap_borrow_waits_for_closing_slot_to_release_index(
     let conf = conf_for_endpoints(
         &[server.port()],
         &format!(
-            "sf_dir={};sender_id=closefree;pool_size=1;pool_max=1;\
+            "sf_dir={};sender_id=closefree;sender_pool_min=1;sender_pool_max=1;\
              pool_reap=manual;close_flush_timeout_millis=2000;",
             dir.path().display()
         ),
@@ -939,7 +998,7 @@ fn disk_store_and_forward_buffer_and_chunk_borrow_and_flush_together() {
     let conf = conf_for_endpoints(
         &[server.port()],
         &format!(
-            "sf_dir={};sender_id=mixed;pool_size=1;pool_max=2;pool_reap=manual;",
+            "sf_dir={};sender_id=mixed;sender_pool_min=1;sender_pool_max=2;pool_reap=manual;",
             dir.path().display()
         ),
     );
@@ -995,7 +1054,7 @@ fn disk_store_and_forward_duplicate_pool_collides_on_managed_slot() {
     let dir = TempDir::new().unwrap();
     let conf = format!(
         "ws::addr=127.0.0.1:{port};auth_timeout=200;\
-         sf_dir={};sender_id=shared;pool_size=1;pool_max=2;\
+         sf_dir={};sender_id=shared;sender_pool_min=1;sender_pool_max=2;\
          pool_reap=manual;close_flush_timeout_millis=0;",
         dir.path().display()
     );
@@ -1027,7 +1086,7 @@ fn disk_store_and_forward_duplicate_pool_connect_warn_skips_flocked_slots() {
     let dir = TempDir::new().unwrap();
     let conf = format!(
         "ws::addr=127.0.0.1:{port};auth_timeout=200;initial_connect_retry=async;\
-         sf_dir={};sender_id=dupe;pool_size=1;pool_max=1;\
+         sf_dir={};sender_id=dupe;sender_pool_min=1;sender_pool_max=1;\
          pool_reap=manual;close_flush_timeout_millis=0;",
         dir.path().display()
     );
@@ -1083,7 +1142,7 @@ fn disk_store_and_forward_restart_replays_reminted_and_out_of_range_managed_slot
     let seed_conf = format!(
         "ws::addr=127.0.0.1:{seed_port};auth_timeout=200;\
          reconnect_max_duration_millis=100;sf_dir={};sender_id=replay;\
-         pool_size=1;pool_max=2;pool_reap=manual;close_flush_timeout_millis=0;",
+         sender_pool_min=1;sender_pool_max=2;pool_reap=manual;close_flush_timeout_millis=0;",
         dir.path().display()
     );
     {
@@ -1108,7 +1167,7 @@ fn disk_store_and_forward_restart_replays_reminted_and_out_of_range_managed_slot
     let replay_conf = conf_for_endpoints(
         &[server.port()],
         &format!(
-            "sf_dir={};sender_id=replay;pool_size=1;pool_max=1;pool_reap=manual;",
+            "sf_dir={};sender_id=replay;sender_pool_min=1;sender_pool_max=1;pool_reap=manual;",
             dir.path().display()
         ),
     );
@@ -1136,7 +1195,7 @@ fn disk_store_and_forward_restart_same_pool_max_replays_in_range_slots_without_b
     let seed_conf = format!(
         "ws::addr=127.0.0.1:{seed_port};auth_timeout=200;\
          reconnect_max_duration_millis=100;sf_dir={};sender_id=samepool;\
-         pool_size=1;pool_max=2;pool_reap=manual;close_flush_timeout_millis=0;",
+         sender_pool_min=1;sender_pool_max=2;pool_reap=manual;close_flush_timeout_millis=0;",
         dir.path().display()
     );
     {
@@ -1161,7 +1220,7 @@ fn disk_store_and_forward_restart_same_pool_max_replays_in_range_slots_without_b
     let replay_conf = conf_for_endpoints(
         &[server.port()],
         &format!(
-            "sf_dir={};sender_id=samepool;pool_size=1;pool_max=2;\
+            "sf_dir={};sender_id=samepool;sender_pool_min=1;sender_pool_max=2;\
              pool_reap=manual;max_background_drainers=1;",
             dir.path().display()
         ),
@@ -1207,7 +1266,7 @@ fn disk_store_and_forward_pool_drains_unsuffixed_slot_only_with_orphan_drain_ena
     let default_conf = conf_for_endpoints(
         &[server.port()],
         &format!(
-            "sf_dir={};sender_id=legacy;pool_size=1;pool_max=2;\
+            "sf_dir={};sender_id=legacy;sender_pool_min=1;sender_pool_max=2;\
              pool_reap=manual;max_background_drainers=1;",
             dir.path().display()
         ),
@@ -1227,7 +1286,7 @@ fn disk_store_and_forward_pool_drains_unsuffixed_slot_only_with_orphan_drain_ena
     let drain_conf = conf_for_endpoints(
         &[server.port()],
         &format!(
-            "sf_dir={};sender_id=legacy;pool_size=1;pool_max=2;\
+            "sf_dir={};sender_id=legacy;sender_pool_min=1;sender_pool_max=2;\
              pool_reap=manual;max_background_drainers=1;drain_orphans=on;",
             dir.path().display()
         ),
@@ -1942,7 +2001,7 @@ fn disk_recovery_orphan_drains_mixed_shapes_with_one_dictionary() {
     let seed_conf = format!(
         "ws::addr=127.0.0.1:{seed_port};auth_timeout=200;\
          reconnect_max_duration_millis=10000;sf_dir={};sender_id=mixedrec;\
-         pool_size=1;pool_max=2;pool_reap=manual;close_flush_timeout_millis=0;",
+         sender_pool_min=1;sender_pool_max=2;pool_reap=manual;close_flush_timeout_millis=0;",
         dir.path().display()
     );
     {
@@ -1995,7 +2054,7 @@ fn disk_recovery_orphan_drains_mixed_shapes_with_one_dictionary() {
     let replay_conf = conf_for_endpoints(
         &[live.port()],
         &format!(
-            "sf_dir={};sender_id=mixedrec;pool_size=1;pool_max=1;\
+            "sf_dir={};sender_id=mixedrec;sender_pool_min=1;sender_pool_max=1;\
              pool_reap=manual;max_background_drainers=1;",
             dir.path().display()
         ),
@@ -3082,7 +3141,11 @@ fn store_and_forward_flush_and_wait_surfaces_server_rejection_memory() {
 #[test]
 fn pool_is_lazy_and_opens_on_first_borrow() {
     let server = MockServer::spawn(8);
-    let db = QuestDb::connect(&conf_for(server.port(), "pool_size=3;pool_max=4;")).unwrap();
+    let db = QuestDb::connect(&conf_for(
+        server.port(),
+        "sender_pool_min=3;sender_pool_max=4;",
+    ))
+    .unwrap();
     // Lazy pool, like the row-major sender: `connect` opens nothing.
     assert_eq!(db.free_count(), 0);
     assert_eq!(db.in_use_count(), 0);
@@ -3104,7 +3167,11 @@ fn borrow_sender_is_in_memory_store_and_forward_without_sf_dir() {
     // freely up to `pool_max`, just like disk-backed SF with per-borrower
     // slots.
     let server = MockServer::spawn(8);
-    let db = QuestDb::connect(&conf_for(server.port(), "pool_size=1;pool_max=3;")).unwrap();
+    let db = QuestDb::connect(&conf_for(
+        server.port(),
+        "sender_pool_min=1;sender_pool_max=3;acquire_timeout_ms=0;",
+    ))
+    .unwrap();
 
     let b1 = db.borrow_sender().expect("b1");
     assert!(
@@ -3135,7 +3202,11 @@ fn borrow_sender_is_in_memory_store_and_forward_without_sf_dir() {
 #[test]
 fn borrow_and_return_reuses_connection() {
     let server = MockServer::spawn(2);
-    let db = QuestDb::connect(&conf_for(server.port(), "pool_size=1;pool_max=2;")).unwrap();
+    let db = QuestDb::connect(&conf_for(
+        server.port(),
+        "sender_pool_min=1;sender_pool_max=2;",
+    ))
+    .unwrap();
     // Lazy pool: nothing open until the first borrow.
     assert_eq!(db.free_count(), 0);
     {
@@ -3162,7 +3233,7 @@ fn owned_sender_observes_pool_close_and_drops_after_close() {
     let server = MockServer::spawn(2);
     let db = QuestDb::connect(&conf_for(
         server.port(),
-        "pool_size=1;pool_max=2;close_flush_timeout_millis=50;",
+        "sender_pool_min=1;sender_pool_max=2;close_flush_timeout_millis=50;",
     ))
     .unwrap();
     let owned = db.borrow_sender_owned().expect("borrow owned sender");
@@ -3178,7 +3249,11 @@ fn owned_sender_observes_pool_close_and_drops_after_close() {
 #[test]
 fn auto_grow_opens_new_connection_until_pool_max() {
     let server = MockServer::spawn(4);
-    let db = QuestDb::connect(&conf_for(server.port(), "pool_size=1;pool_max=3;")).unwrap();
+    let db = QuestDb::connect(&conf_for(
+        server.port(),
+        "sender_pool_min=1;sender_pool_max=3;",
+    ))
+    .unwrap();
     let b1 = db.borrow_sender().expect("b1");
     let b2 = db.borrow_sender().expect("b2 (auto-grow)");
     let b3 = db.borrow_sender().expect("b3 (auto-grow)");
@@ -3195,7 +3270,11 @@ fn auto_grow_opens_new_connection_until_pool_max() {
 #[test]
 fn fail_fast_at_pool_max() {
     let server = MockServer::spawn(4);
-    let db = QuestDb::connect(&conf_for(server.port(), "pool_size=1;pool_max=2;")).unwrap();
+    let db = QuestDb::connect(&conf_for(
+        server.port(),
+        "sender_pool_min=1;sender_pool_max=2;acquire_timeout_ms=0;",
+    ))
+    .unwrap();
     let _b1 = db.borrow_sender().expect("b1");
     let _b2 = db.borrow_sender().expect("b2");
     let err = db.borrow_sender().expect_err("must fail-fast at cap");
@@ -3214,7 +3293,11 @@ fn fail_fast_at_pool_max() {
 #[test]
 fn direct_pool_is_lazy_and_hands_out_direct_senders() {
     let server = MockServer::spawn(4);
-    let db = QuestDb::connect(&conf_for(server.port(), "pool_size=1;pool_max=4;")).unwrap();
+    let db = QuestDb::connect(&conf_for(
+        server.port(),
+        "sender_pool_min=1;sender_pool_max=4;",
+    ))
+    .unwrap();
 
     // Both pools are lazy: `connect` opens nothing.
     assert_eq!(db.free_count(), 0);
@@ -3243,7 +3326,11 @@ fn direct_pool_is_lazy_and_hands_out_direct_senders() {
 #[test]
 fn direct_pool_recycles_the_same_connection() {
     let server = MockServer::spawn(4);
-    let db = QuestDb::connect(&conf_for(server.port(), "pool_size=1;pool_max=4;")).unwrap();
+    let db = QuestDb::connect(&conf_for(
+        server.port(),
+        "sender_pool_min=1;sender_pool_max=4;",
+    ))
+    .unwrap();
 
     {
         let _b = db
@@ -3269,7 +3356,11 @@ fn direct_pool_recycles_the_same_connection() {
 #[test]
 fn direct_pool_auto_grows_and_fails_fast_at_pool_max() {
     let server = MockServer::spawn(8);
-    let db = QuestDb::connect(&conf_for(server.port(), "pool_size=1;pool_max=3;")).unwrap();
+    let db = QuestDb::connect(&conf_for(
+        server.port(),
+        "sender_pool_min=1;sender_pool_max=3;acquire_timeout_ms=0;",
+    ))
+    .unwrap();
 
     let b1 = db.borrow_direct_column_sender().expect("d1");
     let b2 = db.borrow_direct_column_sender().expect("d2 (auto-grow)");
@@ -3293,7 +3384,11 @@ fn direct_pool_auto_grows_and_fails_fast_at_pool_max() {
 #[test]
 fn direct_and_main_pools_are_independent() {
     let server = MockServer::spawn(8);
-    let db = QuestDb::connect(&conf_for(server.port(), "pool_size=1;pool_max=2;")).unwrap();
+    let db = QuestDb::connect(&conf_for(
+        server.port(),
+        "sender_pool_min=1;sender_pool_max=2;",
+    ))
+    .unwrap();
 
     let _main = db.borrow_sender().expect("main borrow");
     assert_eq!(db.in_use_count(), 1);
@@ -3320,7 +3415,7 @@ fn direct_pool_is_direct_even_when_sf_dir_is_set() {
     let conf = conf_for_endpoints(
         &[server.port()],
         &format!(
-            "sf_dir={};sender_id=directmix;pool_max=2;pool_reap=manual;",
+            "sf_dir={};sender_id=directmix;sender_pool_max=2;pool_reap=manual;",
             dir.path().display()
         ),
     );
@@ -3362,7 +3457,7 @@ fn direct_pool_reaps_idle_connections() {
     // Short idle timeout + manual reap so the test drives reaping itself.
     let db = QuestDb::connect(&conf_for(
         server.port(),
-        "pool_size=1;pool_max=4;pool_idle_timeout_ms=1;pool_reap=manual;",
+        "sender_pool_min=1;sender_pool_max=4;idle_timeout_ms=1;pool_reap=manual;",
     ))
     .unwrap();
 
@@ -3385,7 +3480,11 @@ fn direct_pool_reaps_idle_connections() {
 #[test]
 fn buffer_sender_pool_borrows_recycles_and_caps() {
     let server = MockServer::spawn_acking(16);
-    let db = QuestDb::connect(&conf_for(server.port(), "pool_size=1;pool_max=2;")).unwrap();
+    let db = QuestDb::connect(&conf_for(
+        server.port(),
+        "sender_pool_min=1;sender_pool_max=2;acquire_timeout_ms=0;",
+    ))
+    .unwrap();
 
     // Without disk-SF recovery, nothing exists until the first borrow.
     assert_eq!(db.free_count(), 0);
@@ -3413,7 +3512,7 @@ fn buffer_sender_pool_borrows_recycles_and_caps() {
     let s3 = db.borrow_sender().expect("grow to pool_max");
     assert_eq!(db.in_use_count(), 2);
 
-    // A third concurrent borrow exceeds pool_max=2 — fail-fast.
+    // A third concurrent borrow exceeds sender_pool_max=2 — fail-fast.
     let err = db.borrow_sender().expect_err("must fail-fast at cap");
     assert_eq!(err.code(), ErrorCode::InvalidApiCall);
     assert!(err.msg().contains("pool_max"), "msg: {}", err.msg());
@@ -3428,7 +3527,11 @@ fn buffer_sender_pool_borrows_recycles_and_caps() {
 #[test]
 fn buffer_sender_pool_flush_round_trip() {
     let server = MockServer::spawn_acking(8);
-    let db = QuestDb::connect(&conf_for(server.port(), "pool_size=1;pool_max=2;")).unwrap();
+    let db = QuestDb::connect(&conf_for(
+        server.port(),
+        "sender_pool_min=1;sender_pool_max=2;",
+    ))
+    .unwrap();
 
     let mut sender = db.borrow_sender().expect("borrow sender");
     let mut buf = sender.new_buffer();
@@ -3478,7 +3581,11 @@ fn buffer_sender_pool_flush_round_trip() {
 #[test]
 fn buffer_sender_flush_and_wait_commits_at_boundary() {
     let server = MockServer::spawn_acking(8);
-    let db = QuestDb::connect(&conf_for(server.port(), "pool_size=1;pool_max=2;")).unwrap();
+    let db = QuestDb::connect(&conf_for(
+        server.port(),
+        "sender_pool_min=1;sender_pool_max=2;",
+    ))
+    .unwrap();
 
     let mut sender = db.borrow_sender().expect("borrow sender");
     let mut buf = sender.new_buffer();
@@ -3513,7 +3620,11 @@ fn buffer_sender_flush_and_wait_commits_at_boundary() {
 #[test]
 fn buffer_sender_flush_and_wait_durable_without_opt_in_keeps_buffer() {
     let server = MockServer::spawn(1);
-    let db = QuestDb::connect(&conf_for(server.port(), "pool_size=1;pool_max=2;")).unwrap();
+    let db = QuestDb::connect(&conf_for(
+        server.port(),
+        "sender_pool_min=1;sender_pool_max=2;",
+    ))
+    .unwrap();
 
     let mut sender = db.borrow_sender().expect("borrow sender");
     let mut buf = sender.new_buffer();
@@ -3542,7 +3653,11 @@ fn buffer_sender_flush_and_wait_durable_without_opt_in_keeps_buffer() {
 #[test]
 fn buffer_sender_owned_borrow_flushes_and_recycles() {
     let server = MockServer::spawn_acking(8);
-    let db = QuestDb::connect(&conf_for(server.port(), "pool_size=1;pool_max=2;")).unwrap();
+    let db = QuestDb::connect(&conf_for(
+        server.port(),
+        "sender_pool_min=1;sender_pool_max=2;",
+    ))
+    .unwrap();
 
     // The owned handle is the FFI escape hatch backing
     // `questdb_db_borrow_sender`: it carries an `Arc<DbInner>` and
@@ -3586,7 +3701,11 @@ fn buffer_sender_owned_borrow_flushes_and_recycles() {
 #[test]
 fn buffer_sender_owned_mark_must_close_drops_not_recycles() {
     let server = MockServer::spawn_acking(8);
-    let db = QuestDb::connect(&conf_for(server.port(), "pool_size=1;pool_max=2;")).unwrap();
+    let db = QuestDb::connect(&conf_for(
+        server.port(),
+        "sender_pool_min=1;sender_pool_max=2;",
+    ))
+    .unwrap();
 
     let mut owned = db.borrow_sender_owned().expect("borrow owned");
     owned.mark_must_close();
@@ -3605,7 +3724,7 @@ fn owned_buffer_sender_observes_pool_close_and_drops_after_close() {
     let server = MockServer::spawn_acking(8);
     let db = QuestDb::connect(&conf_for(
         server.port(),
-        "pool_size=1;pool_max=2;close_flush_timeout_millis=50;",
+        "sender_pool_min=1;sender_pool_max=2;close_flush_timeout_millis=50;",
     ))
     .unwrap();
 
@@ -3625,7 +3744,7 @@ fn manual_reap_closes_idle_buffer_senders() {
     let server = MockServer::spawn_acking(8);
     let db = QuestDb::connect(&conf_for(
         server.port(),
-        "pool_size=1;pool_max=3;pool_idle_timeout_ms=50;pool_reap=manual;",
+        "sender_pool_min=1;sender_pool_max=3;idle_timeout_ms=50;pool_reap=manual;",
     ))
     .unwrap();
 
@@ -3640,7 +3759,7 @@ fn manual_reap_closes_idle_buffer_senders() {
     assert_eq!(db.reap_idle(), 0);
     assert_eq!(db.free_count(), 2);
 
-    // Past the timeout: reap the excess sender while preserving `pool_size=1`.
+    // Past the timeout: reap the excess sender while preserving `sender_pool_min=1`.
     thread::sleep(Duration::from_millis(120));
     let closed = db.reap_idle();
     assert_eq!(closed, 1, "the excess idle Buffer sender must be reaped");
@@ -3657,8 +3776,8 @@ fn reaper_keeps_undelivered_recovery_buffer_sender() {
     let conf = conf_for_endpoints(
         &[_server.port()],
         &format!(
-            "sf_dir={};sender_id=rowreap;pool_size=1;pool_max=2;\
-             pool_idle_timeout_ms=1;pool_reap=manual;close_flush_timeout_millis=2000;",
+            "sf_dir={};sender_id=rowreap;sender_pool_min=1;sender_pool_max=2;\
+             idle_timeout_ms=1;pool_reap=manual;close_flush_timeout_millis=2000;",
             dir.path().display()
         ),
     );
@@ -3707,7 +3826,7 @@ fn disk_store_and_forward_restart_preopens_dirty_buffer_slot() {
     let conf = conf_for_endpoints(
         &[server.port()],
         &format!(
-            "sf_dir={};sender_id=rowrec;pool_size=1;pool_max=1;\
+            "sf_dir={};sender_id=rowrec;sender_pool_min=1;sender_pool_max=1;\
              pool_reap=manual;max_background_drainers=1;close_flush_timeout_millis=0;",
             dir.path().display()
         ),
@@ -3727,7 +3846,11 @@ fn disk_store_and_forward_restart_preopens_dirty_buffer_slot() {
 #[test]
 fn buffer_sender_pool_grows_and_reuses_physical_connections() {
     let server = MockServer::spawn_acking(16);
-    let db = QuestDb::connect(&conf_for(server.port(), "pool_size=1;pool_max=4;")).unwrap();
+    let db = QuestDb::connect(&conf_for(
+        server.port(),
+        "sender_pool_min=1;sender_pool_max=4;",
+    ))
+    .unwrap();
 
     // Without disk-SF recovery, `connect` opens nothing.
     assert_eq!(server.accepted(), 0);
@@ -3759,7 +3882,11 @@ fn buffer_sender_pool_grows_and_reuses_physical_connections() {
 #[test]
 fn buffer_sender_drop_on_return_drops_instead_of_recycling() {
     let server = MockServer::spawn_acking(8);
-    let db = QuestDb::connect(&conf_for(server.port(), "pool_size=1;pool_max=2;")).unwrap();
+    let db = QuestDb::connect(&conf_for(
+        server.port(),
+        "sender_pool_min=1;sender_pool_max=2;",
+    ))
+    .unwrap();
 
     let mut sender = db.borrow_sender().expect("borrow");
     assert!(
@@ -3788,7 +3915,11 @@ fn buffer_sender_drop_on_return_drops_instead_of_recycling() {
 #[test]
 fn one_cap_covers_buffer_and_chunk_senders_borrowed_together() {
     let server = MockServer::spawn_acking(16);
-    let db = QuestDb::connect(&conf_for(server.port(), "pool_size=1;pool_max=2;")).unwrap();
+    let db = QuestDb::connect(&conf_for(
+        server.port(),
+        "sender_pool_min=1;sender_pool_max=2;acquire_timeout_ms=0;",
+    ))
+    .unwrap();
 
     let mut chunk_sender = db.borrow_sender().expect("Chunk sender");
     let mut buffer_sender = db.borrow_sender().expect("Buffer sender");
@@ -3832,8 +3963,13 @@ fn one_cap_covers_buffer_and_chunk_senders_borrowed_together() {
 #[test]
 fn concurrent_buffer_sender_borrow_and_return_does_not_deadlock_or_leak() {
     let server = MockServer::spawn_acking(32);
-    let db =
-        Arc::new(QuestDb::connect(&conf_for(server.port(), "pool_size=1;pool_max=8;")).unwrap());
+    let db = Arc::new(
+        QuestDb::connect(&conf_for(
+            server.port(),
+            "sender_pool_min=1;sender_pool_max=8;",
+        ))
+        .unwrap(),
+    );
     let mut handles = Vec::new();
     for _ in 0..8 {
         let db = Arc::clone(&db);
@@ -3864,7 +4000,7 @@ fn auto_reaper_closes_idle_buffer_senders() {
     let server = MockServer::spawn_acking(8);
     let db = QuestDb::connect(&conf_for(
         server.port(),
-        "pool_size=1;pool_max=3;pool_idle_timeout_ms=100;pool_reap=auto;",
+        "sender_pool_min=1;sender_pool_max=3;idle_timeout_ms=100;pool_reap=auto;",
     ))
     .unwrap();
     let b1 = db.borrow_sender().expect("b1");
@@ -3894,7 +4030,7 @@ fn buffer_sender_local_build_failure_releases_in_use_slot() {
     let port = unused_local_port();
     let conf = format!(
         "ws::addr=127.0.0.1:{port};auth_timeout=200;sf_dir={};\
-         sender_id=buildfail;pool_size=1;pool_max=1;pool_reap=manual;\
+         sender_id=buildfail;sender_pool_min=1;sender_pool_max=1;pool_reap=manual;\
          close_flush_timeout_millis=0;",
         dir.path().display()
     );
@@ -3918,8 +4054,13 @@ fn buffer_sender_local_build_failure_releases_in_use_slot() {
 #[test]
 fn concurrent_borrow_and_return_does_not_deadlock_or_leak() {
     let server = MockServer::spawn(16);
-    let db =
-        Arc::new(QuestDb::connect(&conf_for(server.port(), "pool_size=1;pool_max=8;")).unwrap());
+    let db = Arc::new(
+        QuestDb::connect(&conf_for(
+            server.port(),
+            "sender_pool_min=1;sender_pool_max=8;",
+        ))
+        .unwrap(),
+    );
     let mut handles = Vec::new();
     for _ in 0..8 {
         let db = Arc::clone(&db);
@@ -3945,7 +4086,7 @@ fn manual_reap_closes_excess_idle_connections() {
     let server = MockServer::spawn(4);
     let db = QuestDb::connect(&conf_for(
         server.port(),
-        "pool_size=1;pool_max=3;pool_idle_timeout_ms=50;pool_reap=manual;",
+        "sender_pool_min=1;sender_pool_max=3;idle_timeout_ms=50;pool_reap=manual;",
     ))
     .unwrap();
     let b1 = db.borrow_sender().expect("b1");
@@ -3974,7 +4115,7 @@ fn manual_reap_keeps_warm_floor_with_borrows_outstanding() {
     let server = MockServer::spawn(5);
     let db = QuestDb::connect(&conf_for(
         server.port(),
-        "pool_size=3;pool_max=5;pool_idle_timeout_ms=50;pool_reap=manual;",
+        "sender_pool_min=3;sender_pool_max=5;idle_timeout_ms=50;pool_reap=manual;",
     ))
     .unwrap();
     let b1 = db.borrow_sender().expect("b1");
@@ -3987,7 +4128,7 @@ fn manual_reap_keeps_warm_floor_with_borrows_outstanding() {
     assert_eq!(db.in_use_count(), 2);
     assert_eq!(db.free_count(), 2);
 
-    // Reap while b1/b2 are still in use. total()=4 exceeds pool_size=3 by one,
+    // Reap while b1/b2 are still in use. total()=4 exceeds sender_pool_min=3 by one,
     // so exactly one idle slot is reaped and the other is kept warm to hold
     // total() at the pool_size floor — the warm floor under `in_use < pool_size`.
     thread::sleep(Duration::from_millis(120));
@@ -4015,7 +4156,7 @@ fn auto_reaper_closes_excess_idle_connections() {
     // > 5s so the reaper wakes promptly on its own ticker.
     let db = QuestDb::connect(&conf_for(
         server.port(),
-        "pool_size=1;pool_max=3;pool_idle_timeout_ms=100;pool_reap=auto;",
+        "sender_pool_min=1;sender_pool_max=3;idle_timeout_ms=100;pool_reap=auto;",
     ))
     .unwrap();
     let b1 = db.borrow_sender().expect("b1");
@@ -4670,7 +4811,7 @@ fn server_error_latches_conn_and_pool_drops_it() {
     let server = MockServer::spawn_erroring(4, 0x09);
     let db = QuestDb::connect(&conf_for(
         server.port(),
-        "pool_size=1;pool_max=2;close_flush_timeout_millis=50;",
+        "sender_pool_min=1;sender_pool_max=2;close_flush_timeout_millis=50;",
     ))
     .unwrap();
     {
@@ -4711,7 +4852,7 @@ fn close_joins_reaper_cleanly() {
         // close_flush_timeout_millis bounds the per-Sender close drain, which
         // otherwise can wait up to 5s for the mock server's (absent) WS close
         // handshake. We only care here that the reaper thread joins.
-        "pool_size=1;pool_max=2;pool_idle_timeout_ms=500;pool_reap=auto;close_flush_timeout_millis=200;",
+        "sender_pool_min=1;sender_pool_max=2;idle_timeout_ms=500;pool_reap=auto;close_flush_timeout_millis=200;",
     ))
     .unwrap();
     // Borrow + return so we have something to reap eventually.
@@ -4757,7 +4898,7 @@ fn reap_skips_connections_with_undelivered_frames() {
     let (server, release, _frames) = MockServer::spawn_ack_when_released_capturing(3);
     let db = QuestDb::connect(&conf_for(
         server.port(),
-        "pool_size=1;pool_max=3;pool_idle_timeout_ms=1;pool_reap=manual;\
+        "sender_pool_min=1;sender_pool_max=3;idle_timeout_ms=1;pool_reap=manual;\
          close_flush_timeout_millis=2000;",
     ))
     .unwrap();
@@ -4925,7 +5066,7 @@ fn reborrow_after_primary_failure_lands_on_live_endpoint_and_skips_dead() {
     let live = MockServer::spawn_acking(2);
     let db = QuestDb::connect(&conf_for_endpoints(
         &[primary.port(), live.port()],
-        "pool_size=1;pool_max=1;",
+        "sender_pool_min=1;sender_pool_max=1;",
     ))
     .unwrap();
 
@@ -4969,7 +5110,7 @@ fn failed_reborrow_keeps_handle_erroring_without_panicking() {
     let unreachable_port = unused_local_port();
     let db = QuestDb::connect(&conf_for_endpoints(
         &[primary.port(), unreachable_port],
-        "pool_size=1;pool_max=1;\
+        "sender_pool_min=1;sender_pool_max=1;\
          reconnect_initial_backoff_millis=1;\
          reconnect_max_backoff_millis=1;",
     ))
@@ -5011,7 +5152,11 @@ fn reborrow_on_single_endpoint_pool_reuses_the_same_endpoint() {
     // A single-endpoint pool must behave exactly as today: a re-borrow simply
     // opens a fresh connection to the one endpoint.
     let server = MockServer::spawn_acking(3);
-    let db = QuestDb::connect(&conf_for(server.port(), "pool_size=1;pool_max=2;")).unwrap();
+    let db = QuestDb::connect(&conf_for(
+        server.port(),
+        "sender_pool_min=1;sender_pool_max=2;",
+    ))
+    .unwrap();
 
     let mut sender = db.borrow_direct_column_sender().expect("borrow");
     sender.commit(AckLevel::Ok).expect("first sync");
@@ -5039,7 +5184,7 @@ fn dead_endpoint_stays_skipped_across_repeated_reborrows() {
     let live = MockServer::spawn_acking(8);
     let db = QuestDb::connect(&conf_for_endpoints(
         &[dead.port(), live.port()],
-        "pool_size=1;pool_max=2;",
+        "sender_pool_min=1;sender_pool_max=2;",
     ))
     .unwrap();
     let mut sender = db.borrow_direct_column_sender().expect("borrow");
@@ -5474,7 +5619,7 @@ fn flush_polars_dataframe_redrives_whole_df_onto_live_endpoint() {
     let (live, frames) = MockServer::spawn_acking_capturing(2);
     let db = QuestDb::connect(&conf_for_endpoints(
         &[primary.port(), live.port()],
-        "pool_size=1;pool_max=2;",
+        "sender_pool_min=1;sender_pool_max=2;",
     ))
     .unwrap();
 
@@ -5526,7 +5671,7 @@ fn flush_polars_dataframe_redrives_only_the_uncommitted_tail() {
     let (live, frames) = MockServer::spawn_acking_capturing(2);
     let db = QuestDb::connect(&conf_for_endpoints(
         &[primary.port(), live.port()],
-        "pool_size=1;pool_max=2;",
+        "sender_pool_min=1;sender_pool_max=2;",
     ))
     .unwrap();
 
@@ -5580,7 +5725,7 @@ fn flush_polars_dataframe_retries_reborrow_connect_until_endpoint_recovers() {
         MockServer::spawn_acking_on_port_after_delay(recovery_port, 2, Duration::from_millis(150));
     let db = QuestDb::connect(&conf_for_endpoints(
         &[primary.port(), recovery_port],
-        "pool_size=1;pool_max=2;\
+        "sender_pool_min=1;sender_pool_max=2;\
          reconnect_initial_backoff_millis=20;\
          reconnect_max_backoff_millis=20;",
     ))
@@ -5890,7 +6035,11 @@ mod reader_pool {
     #[test]
     fn reader_borrow_returns_and_recycles_connection() {
         let server = ReaderMockServer::spawn(8);
-        let db = QuestDb::connect(&conf_for(server.port(), "pool_size=1;pool_max=2;")).unwrap();
+        let db = QuestDb::connect(&conf_for(
+            server.port(),
+            "sender_pool_min=1;sender_pool_max=2;",
+        ))
+        .unwrap();
 
         // The reader pool starts empty; it has no disk-SF recovery pre-open.
         assert_eq!(db.reader_free_count(), 0);
@@ -5922,7 +6071,11 @@ mod reader_pool {
     #[test]
     fn dbg_pool_counts_tracks_borrow_and_return() {
         let server = ReaderMockServer::spawn(8);
-        let db = QuestDb::connect(&conf_for(server.port(), "pool_size=1;pool_max=2;")).unwrap();
+        let db = QuestDb::connect(&conf_for(
+            server.port(),
+            "sender_pool_min=1;sender_pool_max=2;",
+        ))
+        .unwrap();
 
         let before = db.dbg_pool_counts();
         assert_eq!(before.reader.in_use, 0);
@@ -5954,7 +6107,11 @@ mod reader_pool {
     #[test]
     fn borrowed_reader_derefs_to_underlying_reader() {
         let server = ReaderMockServer::spawn(4);
-        let db = QuestDb::connect(&conf_for(server.port(), "pool_size=1;pool_max=2;")).unwrap();
+        let db = QuestDb::connect(&conf_for(
+            server.port(),
+            "sender_pool_min=1;sender_pool_max=2;",
+        ))
+        .unwrap();
 
         let mut reader = db.borrow_reader().expect("borrow reader");
         // Deref (&Reader): a `&self` accessor.
@@ -5974,7 +6131,11 @@ mod reader_pool {
     #[test]
     fn reader_pool_grows_and_reuses_physical_connections() {
         let server = ReaderMockServer::spawn(16);
-        let db = QuestDb::connect(&conf_for(server.port(), "pool_size=1;pool_max=4;")).unwrap();
+        let db = QuestDb::connect(&conf_for(
+            server.port(),
+            "sender_pool_min=1;sender_pool_max=4;",
+        ))
+        .unwrap();
 
         // Without disk-SF recovery, `connect` opens nothing.
         assert_eq!(server.accepted(), 0);
@@ -6003,12 +6164,16 @@ mod reader_pool {
         assert_eq!(server.accepted(), 3, "reuse must not open new connections");
     }
 
-    /// Borrowing past `pool_max` fails fast with an egress `InvalidApiCall`
-    /// rather than blocking or over-committing.
+    /// Borrowing past `query_pool_max` with `acquire_timeout_ms=0` fails
+    /// fast with an egress `InvalidApiCall` instead of over-committing.
     #[test]
     fn reader_pool_fails_fast_at_cap() {
         let server = ReaderMockServer::spawn(8);
-        let db = QuestDb::connect(&conf_for(server.port(), "pool_size=1;pool_max=2;")).unwrap();
+        let db = QuestDb::connect(&conf_for(
+            server.port(),
+            "query_pool_min=1;query_pool_max=2;acquire_timeout_ms=0;",
+        ))
+        .unwrap();
 
         let _r1 = db.borrow_reader().expect("r1");
         let _r2 = db.borrow_reader().expect("r2 (grow to cap)");
@@ -6030,7 +6195,11 @@ mod reader_pool {
     #[test]
     fn reader_drop_on_return_drops_instead_of_recycling() {
         let server = ReaderMockServer::spawn(8);
-        let db = QuestDb::connect(&conf_for(server.port(), "pool_size=1;pool_max=2;")).unwrap();
+        let db = QuestDb::connect(&conf_for(
+            server.port(),
+            "sender_pool_min=1;sender_pool_max=2;",
+        ))
+        .unwrap();
 
         let mut reader = db.borrow_reader().expect("borrow");
         reader.drop_on_return();
@@ -6059,7 +6228,11 @@ mod reader_pool {
     #[test]
     fn reader_and_sender_pools_are_independent() {
         let server = ReaderMockServer::spawn(8);
-        let db = QuestDb::connect(&conf_for(server.port(), "pool_size=1;pool_max=2;")).unwrap();
+        let db = QuestDb::connect(&conf_for(
+            server.port(),
+            "sender_pool_min=1;sender_pool_max=2;",
+        ))
+        .unwrap();
 
         let sender = db.borrow_sender().expect("unified sender"); // opens a fresh connection
         let direct = db.borrow_direct_column_sender().expect("direct sender"); // opens a fresh connection
@@ -6071,7 +6244,7 @@ mod reader_pool {
         assert_eq!(db.reader_in_use_count(), 1);
 
         // 1 unified ingress + 1 direct ingress + 1 reader = three independent
-        // live connections, each pool capped separately at pool_max=2.
+        // live connections, each pool capped separately at sender_pool_max=2.
         assert!(
             wait_until(Duration::from_secs(2), || server.accepted() == 3),
             "expected 3 independent connections; accepted={}",
@@ -6134,7 +6307,11 @@ mod reader_pool {
     fn concurrent_reader_borrow_and_return_does_not_deadlock_or_leak() {
         let server = ReaderMockServer::spawn(64);
         let db = Arc::new(
-            QuestDb::connect(&conf_for(server.port(), "pool_size=1;pool_max=8;")).unwrap(),
+            QuestDb::connect(&conf_for(
+                server.port(),
+                "sender_pool_min=1;sender_pool_max=8;",
+            ))
+            .unwrap(),
         );
         let mut handles = Vec::new();
         for _ in 0..8 {
@@ -6161,14 +6338,15 @@ mod reader_pool {
         );
     }
 
-    /// `pool_reap=manual`: idle readers above the (zero) warm floor are closed
-    /// only when `reap_idle` is called, and only after the idle timeout.
+    /// `pool_reap=manual`: idle readers above the `query_pool_min` warm floor
+    /// are closed only when `reap_idle` is called, and only after the idle
+    /// timeout.
     #[test]
     fn manual_reap_closes_idle_readers() {
         let server = ReaderMockServer::spawn(8);
         let db = QuestDb::connect(&conf_for(
             server.port(),
-            "pool_size=1;pool_max=3;pool_idle_timeout_ms=50;pool_reap=manual;",
+            "query_pool_min=0;query_pool_max=3;idle_timeout_ms=50;pool_reap=manual;",
         ))
         .unwrap();
 
@@ -6182,7 +6360,7 @@ mod reader_pool {
         let _ = db.reap_idle();
         assert_eq!(db.reader_free_count(), 2);
 
-        // Past the timeout: the reader pool keeps no warm floor (lazy-init),
+        // Past the timeout: with `query_pool_min=0` there is no warm floor,
         // so every idle reader is drained.
         thread::sleep(Duration::from_millis(120));
         let _ = db.reap_idle();
@@ -6201,7 +6379,7 @@ mod reader_pool {
         let server = ReaderMockServer::spawn(8);
         let db = QuestDb::connect(&conf_for(
             server.port(),
-            "pool_size=1;pool_max=3;pool_idle_timeout_ms=100;pool_reap=auto;",
+            "query_pool_min=0;query_pool_max=3;idle_timeout_ms=100;pool_reap=auto;",
         ))
         .unwrap();
 
@@ -6212,8 +6390,8 @@ mod reader_pool {
         assert_eq!(db.reader_free_count(), 2);
 
         // The background reaper wakes on a `max(5s, timeout/12)` ticker (the
-        // 5s floor applies here). The reader pool keeps no warm floor, so
-        // every idle reader is drained.
+        // 5s floor applies here). With `query_pool_min=0` there is no warm
+        // floor, so every idle reader is drained.
         let reaped = wait_until(Duration::from_secs(8), || db.reader_free_count() == 0);
         assert!(
             reaped,
@@ -6276,7 +6454,10 @@ mod conn_event_tests {
     #[test]
     fn first_borrow_fires_connected_with_endpoint() {
         let server = MockServer::spawn(4);
-        let conf = conf_for(server.port(), "pool_size=1;pool_max=2;pool_reap=manual;");
+        let conf = conf_for(
+            server.port(),
+            "sender_pool_min=1;sender_pool_max=2;pool_reap=manual;",
+        );
         let db = QuestDb::connect(&conf).unwrap();
         let (seen, listener) = collecting_listener();
         db.set_connection_listener(listener, 0).unwrap();
@@ -6316,7 +6497,10 @@ mod conn_event_tests {
     #[test]
     fn second_listener_registration_rejected() {
         let server = MockServer::spawn(2);
-        let conf = conf_for(server.port(), "pool_size=1;pool_max=1;pool_reap=manual;");
+        let conf = conf_for(
+            server.port(),
+            "sender_pool_min=1;sender_pool_max=1;pool_reap=manual;",
+        );
         let db = QuestDb::connect(&conf).unwrap();
         let (_seen, listener) = collecting_listener();
         db.set_connection_listener(listener, 0).unwrap();
@@ -6335,7 +6519,7 @@ mod conn_event_tests {
         let conf = format!(
             "ws::addr=127.0.0.1:{port};auth_timeout=2000;\
              reconnect_max_duration_millis=200;connect_timeout=100;\
-             pool_size=1;pool_max=1;pool_reap=manual;"
+             sender_pool_min=1;sender_pool_max=1;pool_reap=manual;"
         );
         let db = QuestDb::connect(&conf).unwrap();
         let (seen, listener) = collecting_listener();
@@ -6383,7 +6567,7 @@ mod conn_event_tests {
         let server_b = MockServer::spawn(4);
         let conf = conf_for_endpoints(
             &[server_a.port(), server_b.port()],
-            "connect_timeout=200;pool_size=1;pool_max=2;pool_reap=manual;",
+            "connect_timeout=200;sender_pool_min=1;sender_pool_max=2;pool_reap=manual;",
         );
         let db = QuestDb::connect(&conf).unwrap();
         let (seen, listener) = collecting_listener();

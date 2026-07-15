@@ -901,8 +901,8 @@ class TestArrowIngressSfa(afc.ArrowFuzzBase):
         return {
             "sender_id": sender_id,
             "sf_dir": sf_dir,
-            "pool_size": "1",
-            "pool_max": "1",
+            "sender_pool_min": "1",
+            "sender_pool_max": "1",
             "pool_reap": "manual",
             "reconnect_max_duration_millis": "30000",
             "close_flush_timeout_millis": "30000",

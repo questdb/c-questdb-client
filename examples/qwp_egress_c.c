@@ -44,7 +44,7 @@ static void populate(const char* host, size_t port, const char* base,
     }
     char conf[256];
     snprintf(conf, sizeof(conf),
-             "ws::addr=%s:%zu;pool_size=1;pool_max=1;pool_reap=manual;",
+             "ws::addr=%s:%zu;sender_pool_min=1;sender_pool_max=1;pool_reap=manual;",
              host, port);
     line_sender_error* err = NULL;
     questdb_db* db = questdb_db_connect(conf, strlen(conf), &err);
