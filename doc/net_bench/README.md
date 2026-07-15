@@ -86,8 +86,14 @@ cd doc/net_bench
 - Java cells run with a fixed `-Xms4g -Xmx4g` heap (no dynamic sizing, so GC
   behavior is comparable across runs); the JSON contract adds a per-path
   `gc_ms_median` field (GC time delta per pass) on top of the shared stats.
-  Java ingress reports **e2e only** — no offline row-build floor (the client
-  API has no offline staging path). The Java client is pinned to our
+  Java ingress now measures a row-build floor too (`RUN_MODE=full|e2e|floor`,
+  parity with rust). The floor is asymmetric across languages: java's floor
+  runs through a connected `Sender` (inline global-symbol-dict resolution at
+  append, a live server required, the table still DROP/CREATEd, and all
+  `SENDERS` still connect), while rust's floor is a standalone offline
+  `Buffer` with dict interning deferred to flush — floor-vs-floor
+  cross-language comparisons need the parity-matrix corrections for this
+  asymmetry. The Java client is pinned to our
   `sm_qwp_bench` branch (based on the upstream delta-symbol-dict PR) until
   that PR merges — see `QNB_JAVA_CLIENT_COMMIT` in `env.sh`. java-row's flush
   is a handoff to an async engine (up to a checkpoint window of batches can

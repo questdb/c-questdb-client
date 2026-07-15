@@ -28,7 +28,7 @@ QNB_C_CLIENT_COMMIT="${QNB_C_CLIENT_COMMIT:-16688bc16aaa678ae27e464818184d0a2a18
 QNB_PY_CLIENT_COMMIT="${QNB_PY_CLIENT_COMMIT:-7334503e84e2d149f9d6550dd023ef484d2edc1e}"
 # Head of our sm_qwp_bench branch of questdb/java-questdb-client (adds the
 # qwp-bench module). Pin = pushed head of that branch; bump when it moves.
-QNB_JAVA_CLIENT_COMMIT="${QNB_JAVA_CLIENT_COMMIT:-36d1f51a552cbccc81f87b526a387bb838dc550e}"
+QNB_JAVA_CLIENT_COMMIT="${QNB_JAVA_CLIENT_COMMIT:-bb30c29627977900a397bbc447ea0fd2e3f1cf6f}"
 
 qnb_account_id() { aws sts get-caller-identity --query Account --output text; }
 
