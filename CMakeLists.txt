@@ -325,6 +325,16 @@ if (QUESTDB_TESTS_AND_EXAMPLES)
     compile_example(
         reader_c_example_arrow
         examples/reader_c_example_arrow.c)
+    find_package(Threads REQUIRED)
+    compile_example(
+        qwp_ws_chunk_and_query_cpp_example
+        examples/qwp_ws_chunk_and_query_cpp_example.cpp)
+    foreach(v qwp_ws_chunk_and_query_cpp_example
+              qwp_ws_chunk_and_query_cpp_example_cxx20)
+        if(TARGET ${v})
+            target_link_libraries(${v} Threads::Threads)
+        endif()
+    endforeach()
 
     find_package(Arrow QUIET)
     if(Arrow_FOUND)
