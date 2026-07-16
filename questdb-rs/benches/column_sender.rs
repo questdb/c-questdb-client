@@ -111,7 +111,7 @@ fn make_validity_bits(rows: usize) -> Vec<u8> {
     let mut out = vec![0xFFu8; bytes];
     for (row_idx, byte) in (0..rows).zip(0..) {
         let _ = byte; // pacify clippy if unused
-        if row_idx % 16 == 0 {
+        if row_idx.is_multiple_of(16) {
             out[row_idx / 8] &= !(1u8 << (row_idx % 8));
         }
     }

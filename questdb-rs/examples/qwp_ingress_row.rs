@@ -233,7 +233,7 @@ fn flush_pass(
                         .flush_and_get_fsn(buffer)
                         .map_err(|e| e.to_string())?;
                     batch_no += 1;
-                    if batch_no % ctx.checkpoint_batches == 0 {
+                    if batch_no.is_multiple_of(ctx.checkpoint_batches) {
                         sender
                             .wait(AckLevel::Ok, WAIT_TIMEOUT)
                             .map_err(|e| e.to_string())?;

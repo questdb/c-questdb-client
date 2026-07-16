@@ -118,7 +118,7 @@ fn boolean_body(row_count: usize) -> Vec<u8> {
     for row in 0..row_count {
         // Mix some pattern so the bit reader doesn't get a constant
         // input. Every 3rd row is `true`.
-        if row % 3 == 0 {
+        if row.is_multiple_of(3) {
             out[1 + (row >> 3)] |= 1 << (row & 7);
         }
     }
