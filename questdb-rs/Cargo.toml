@@ -361,6 +361,16 @@ required-features = ["sync-sender-qwp-ws"]
 name = "qwp_ws_shared_pool"
 required-features = ["sync-sender-qwp-ws", "sync-reader-qwp-ws"]
 
+# One Arc-shared QuestDb pool behind an ingestion thread that publishes
+# column-major Chunk batches and a query thread that polls the same table.
+# Run with:
+#
+#   cargo run --release --example qwp_ws_chunk_and_query \
+#       --features sync-sender-qwp-ws,sync-reader-qwp-ws
+[[example]]
+name = "qwp_ws_chunk_and_query"
+required-features = ["sync-sender-qwp-ws", "sync-reader-qwp-ws"]
+
 [[example]]
 name = "polars"
 required-features = ["polars", "sync-sender-qwp-ws"]
