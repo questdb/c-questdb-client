@@ -21,14 +21,13 @@
 //! The example recreates its own `rust_shared_pool_trades` table on every run.
 
 use std::{
-    error::Error,
     sync::Arc,
     thread,
     time::{Duration, Instant},
 };
 
 use questdb::{
-    QuestDb,
+    Error, ErrorCode, QuestDb,
     egress::column::ColumnView,
     ingress::{AckLevel, TimestampNanos, column_sender::Chunk},
 };
@@ -65,12 +64,21 @@ const LARGE_TRADE: f64 = 0.005;
 const ACK_TIMEOUT: Duration = Duration::from_secs(30);
 const VISIBILITY_TIMEOUT: Duration = Duration::from_secs(60);
 
-/// Errors crossing a thread boundary must be `Send`; `questdb::Error` converts
-/// into this through the blanket `From` impl for `std::error::Error`.
-type BoxError = Box<dyn Error + Send + Sync>;
-type ThreadResult = Result<(), BoxError>;
+/// The client's own operations report `questdb::Error`. The visibility
+/// deadline below is this example's own policy rather than a client failure, so
+/// it needs an application error type; `questdb::Error` converts into this one.
+type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
-fn main() -> ThreadResult {
+/// Reports a result column that is not the type this program expects, in the
+/// client's error vocabulary rather than as a panic.
+fn column_type_error(column: &str, expected: &str) -> Error {
+    Error::new(
+        ErrorCode::InvalidApiCall,
+        format!("result column {column} is not a {expected}"),
+    )
+}
+
+fn main() -> Result<(), BoxError> {
     let db = Arc::new(QuestDb::connect(CONF)?);
 
     recreate_table(&db)?;
@@ -89,7 +97,7 @@ fn main() -> ThreadResult {
 
 /// Runs DDL through a reader borrow. `execute` drives statements that return no
 /// rows, and the cursor is drained to reach its terminal value.
-fn recreate_table(db: &QuestDb) -> ThreadResult {
+fn recreate_table(db: &QuestDb) -> questdb::Result<()> {
     let mut reader = db.borrow_reader()?;
 
     for statement in [
@@ -112,7 +120,7 @@ fn recreate_table(db: &QuestDb) -> ThreadResult {
 }
 
 /// Publishes `TOTAL_ROWS` rows as column-major chunks.
-fn ingest_trades(db: &QuestDb) -> ThreadResult {
+fn ingest_trades(db: &QuestDb) -> questdb::Result<()> {
     let mut sender = db.borrow_sender()?;
 
     // Arrow-style dictionary shared by every batch: a flat UTF-8 block plus
@@ -184,7 +192,7 @@ fn ingest_trades(db: &QuestDb) -> ThreadResult {
 }
 
 /// Polls for query visibility, then reports per-symbol stats.
-fn follow_trades(db: &QuestDb) -> ThreadResult {
+fn follow_trades(db: &QuestDb) -> Result<(), BoxError> {
     let deadline = Instant::now() + VISIBILITY_TIMEOUT;
 
     loop {
@@ -200,19 +208,20 @@ fn follow_trades(db: &QuestDb) -> ThreadResult {
         thread::sleep(POLL_INTERVAL);
     }
 
-    report_large_trades(db)
+    report_large_trades(db)?;
+    Ok(())
 }
 
 /// An `Ok` ack means the server accepted the frame; a row becomes visible only
 /// once the WAL is applied, which happens asynchronously.
-fn count_rows(db: &QuestDb) -> Result<i64, BoxError> {
+fn count_rows(db: &QuestDb) -> questdb::Result<i64> {
     let mut reader = db.borrow_reader()?;
     let mut cursor = reader.execute(format!("SELECT count() FROM {TABLE}"))?;
     let mut count = 0;
 
     while let Some(batch) = cursor.next_batch()? {
         let ColumnView::Long(counts) = batch.column(0)? else {
-            unreachable!("count() is a LONG")
+            return Err(column_type_error("count()", "LONG"));
         };
         if batch.row_count() > 0 && !counts.is_null(0) {
             count = counts.value(0);
@@ -222,7 +231,7 @@ fn count_rows(db: &QuestDb) -> Result<i64, BoxError> {
     Ok(count)
 }
 
-fn report_large_trades(db: &QuestDb) -> ThreadResult {
+fn report_large_trades(db: &QuestDb) -> questdb::Result<()> {
     let mut reader = db.borrow_reader()?;
     let mut cursor = reader
         .prepare(format!(
@@ -235,13 +244,13 @@ fn report_large_trades(db: &QuestDb) -> ThreadResult {
     println!("\ntrades with amount > {LARGE_TRADE}:");
     while let Some(batch) = cursor.next_batch()? {
         let ColumnView::Symbol(symbol) = batch.column(0)? else {
-            unreachable!("symbol is a SYMBOL")
+            return Err(column_type_error("symbol", "SYMBOL"));
         };
         let ColumnView::Long(trades) = batch.column(1)? else {
-            unreachable!("count() is a LONG")
+            return Err(column_type_error("count()", "LONG"));
         };
         let ColumnView::Double(avg_price) = batch.column(2)? else {
-            unreachable!("avg() is a DOUBLE")
+            return Err(column_type_error("avg(price)", "DOUBLE"));
         };
 
         for row in 0..batch.row_count() {
