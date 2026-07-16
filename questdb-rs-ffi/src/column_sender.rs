@@ -5401,7 +5401,7 @@ mod tests {
         // non-decreasing; bytes is the concatenated buffer.
         let name = b"payload";
         let offsets: [i32; 4] = [0, 2, 2, 5];
-        let bytes: [u8; 5] = [b'a', b'b', b'x', b'y', b'z'];
+        let bytes: [u8; 5] = *b"abxyz";
         let row_count: usize = 3;
         let ok = unsafe {
             column_sender_chunk_column_binary(
@@ -5450,7 +5450,7 @@ mod tests {
         // A binary column with 2 rows (offsets len 3) must be rejected.
         let name_b = b"payload";
         let offsets: [i32; 3] = [0, 1, 2];
-        let bytes: [u8; 2] = [b'a', b'b'];
+        let bytes: [u8; 2] = *b"ab";
         let ok = unsafe {
             column_sender_chunk_column_binary(
                 chunk,
@@ -5480,7 +5480,7 @@ mod tests {
         // Last offset (5) exceeds the 2-byte bytes buffer.
         let name = b"payload";
         let offsets: [i32; 2] = [0, 5];
-        let bytes: [u8; 2] = [b'a', b'b'];
+        let bytes: [u8; 2] = *b"ab";
         let ok = unsafe {
             column_sender_chunk_column_binary(
                 chunk,
@@ -5569,7 +5569,7 @@ mod tests {
         // A varchar column with 2 rows (offsets len 3) must be rejected.
         let name_b = b"text";
         let offsets: [i32; 3] = [0, 2, 4];
-        let bytes: [u8; 4] = [b'a', b'b', b'c', b'd'];
+        let bytes: [u8; 4] = *b"abcd";
         let ok = unsafe {
             column_sender_chunk_column_str(
                 chunk,
@@ -5599,7 +5599,7 @@ mod tests {
         // Last offset (9) exceeds the 4-byte bytes buffer.
         let name = b"text";
         let offsets: [i32; 2] = [0, 9];
-        let bytes: [u8; 4] = [b'a', b'b', b'c', b'd'];
+        let bytes: [u8; 4] = *b"abcd";
         let ok = unsafe {
             column_sender_chunk_column_str(
                 chunk,
