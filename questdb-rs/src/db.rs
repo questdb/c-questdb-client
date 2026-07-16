@@ -1277,12 +1277,13 @@ impl QuestDb {
 impl Debug for QuestDb {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         let state = lock_state(&self.inner.state);
-        f.debug_struct("QuestDb")
-            .field("sender_pool_min", &self.inner.sender_pool_min)
-            .field("sender_pool_max", &self.inner.sender_pool_max)
-            .field("query_pool_min", &self.inner.query_pool_min)
-            .field("query_pool_max", &self.inner.query_pool_max)
-            .field("acquire_timeout", &self.inner.acquire_timeout)
+        let mut s = f.debug_struct("QuestDb");
+        s.field("sender_pool_min", &self.inner.sender_pool_min)
+            .field("sender_pool_max", &self.inner.sender_pool_max);
+        #[cfg(feature = "_egress")]
+        s.field("query_pool_min", &self.inner.query_pool_min)
+            .field("query_pool_max", &self.inner.query_pool_max);
+        s.field("acquire_timeout", &self.inner.acquire_timeout)
             .field("free", &state.free.len())
             .field("in_use", &state.in_use)
             .finish()
