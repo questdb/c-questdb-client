@@ -175,9 +175,7 @@ pub fn hi_sym_pools(card: usize) -> Vec<Vec<String>> {
 #[allow(dead_code)] // not every example that includes this module ingests
 pub fn sender_ranges(rows: usize, senders: usize) -> Vec<(usize, usize)> {
     let n = senders.max(1);
-    let ranges: Vec<(usize, usize)> = (0..n)
-        .map(|k| (rows * k / n, rows * (k + 1) / n))
-        .collect();
+    let ranges: Vec<(usize, usize)> = (0..n).map(|k| (rows * k / n, rows * (k + 1) / n)).collect();
     assert_eq!(ranges[0].0, 0, "first range must start at 0");
     assert_eq!(ranges[n - 1].1, rows, "last range must end at rows");
     for pair in ranges.windows(2) {

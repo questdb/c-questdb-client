@@ -350,7 +350,8 @@ fn e2e_pass(
             })
             .collect();
         for h in handles {
-            h.join().map_err(|_| "sender thread panicked".to_string())??;
+            h.join()
+                .map_err(|_| "sender thread panicked".to_string())??;
         }
         Ok(())
     })?;

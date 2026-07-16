@@ -887,13 +887,13 @@ impl Sender {
                 return Err(error::fmt!(
                     InvalidApiCall,
                     "drive_once is only supported when qwp_ws_progress is manual."
-                ))
+                ));
             }
             _ => {
                 return Err(error::fmt!(
                     InvalidApiCall,
                     "drive_once is only supported for QWP/WebSocket senders."
-                ))
+                ));
             }
         };
         let drain_result = self.drain_qwp_ws_error_notifications();

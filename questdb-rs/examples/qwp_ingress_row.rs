@@ -221,8 +221,7 @@ fn flush_pass(
 ) -> Result<(), Box<dyn Error>> {
     std::thread::scope(|scope| -> Result<(), String> {
         let mut handles = Vec::with_capacity(senders.len());
-        for ((sender, buffer), &(lo, hi)) in
-            senders.iter_mut().zip(buffers.iter_mut()).zip(ranges)
+        for ((sender, buffer), &(lo, hi)) in senders.iter_mut().zip(buffers.iter_mut()).zip(ranges)
         {
             handles.push(scope.spawn(move || -> Result<(), String> {
                 let mut start = lo;
@@ -248,7 +247,8 @@ fn flush_pass(
             }));
         }
         for h in handles {
-            h.join().map_err(|_| "sender thread panicked".to_string())??;
+            h.join()
+                .map_err(|_| "sender thread panicked".to_string())??;
         }
         Ok(())
     })?;
