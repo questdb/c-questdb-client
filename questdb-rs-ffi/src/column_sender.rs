@@ -890,9 +890,12 @@ pub unsafe extern "C" fn questdb_db_connect(
 /// Outstanding `qwp_sender` handles are independent leases:
 /// return/drop remains safe after close, but new operations on them fail with
 /// `InvalidApiCall`. A handle returned after close is closed, not recycled.
-/// Close also detaches and joins the connection-event dispatcher; after this
-/// function returns no callback can use its `user_data`, including callbacks
-/// from an outstanding sender's background runner.
+/// Close also detaches and joins the connection-event and rejection
+/// dispatchers; after this function returns no callback can use its
+/// `user_data`, including callbacks from an outstanding sender's background
+/// runner. Exception: when close is called from a dispatcher thread, that
+/// thread is not joined (avoiding a self-join deadlock) and its in-flight
+/// callback finishes after close returns.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn questdb_db_close(db: *mut questdb_db) {
     if !db.is_null() {

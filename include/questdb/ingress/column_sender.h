@@ -173,9 +173,12 @@ questdb_db* questdb_db_connect(
  * Outstanding `qwp_sender` handles are independent leases: returning or
  * dropping them after close is safe, but new operations on them fail with
  * `line_sender_error_invalid_api_call`. A handle returned after close is
- * closed, not recycled. Close detaches and joins the connection-event
- * dispatcher; after it returns no event callback can use its `user_data`,
- * including callbacks from an outstanding sender's background runner.
+ * closed, not recycled. Close detaches and joins the connection-event and
+ * rejection dispatchers; after it returns no callback can use its
+ * `user_data`, including callbacks from an outstanding sender's background
+ * runner. Exception: when close is called from a dispatcher thread, that
+ * thread is not joined (avoiding a self-join deadlock) and its in-flight
+ * callback finishes after close returns.
  */
 QUESTDB_CLIENT_API
 void questdb_db_close(questdb_db* db);
