@@ -74,7 +74,7 @@ pub use error::*;
 mod db;
 
 #[cfg(feature = "sync-sender-qwp-ws")]
-pub use db::{BorrowedSender, QuestDb};
+pub use db::{BorrowedSender, ConnectHandlers, QuestDb};
 // Unstable per-pool connection-count snapshot for soak / leak harnesses.
 // `#[doc(hidden)]` at the definition site; re-exported so `QuestDb`'s
 // `dbg_pool_counts` return type is nameable.

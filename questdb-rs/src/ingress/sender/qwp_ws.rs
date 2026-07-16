@@ -431,8 +431,10 @@ where
         pending_connect: QwpWsPendingConnect,
         append_deadline: Duration,
         event_capacity: usize,
+        rejection_sink: Option<Arc<crate::ingress::rejection_events::RejectionEventSource>>,
     ) -> Self {
         let mut store = QwpWsPublicationStore::new(queue, event_capacity);
+        store.set_rejection_sink(rejection_sink);
         let lifecycle = store.lifecycle();
         let progress = store.progress_view();
         let producer = store.take_producer();
@@ -589,24 +591,9 @@ where
         Ok(upper.checked_sub(1))
     }
 
-    fn poll_sender_error_overlapping(
-        &self,
-        from_fsn: u64,
-        to_fsn: u64,
-        skipped: &mut Vec<QwpWsSenderError>,
-    ) -> crate::Result<Option<QwpWsSenderError>> {
-        let mut store = self.lock_shared()?;
-        Ok(store.poll_sender_error_overlapping(from_fsn, to_fsn, skipped))
-    }
-
     fn poll_sender_error(&self) -> crate::Result<Option<QwpWsSenderError>> {
         let mut store = self.lock_shared()?;
         Ok(store.poll_sender_error())
-    }
-
-    fn drain_sender_errors(&self) -> crate::Result<Vec<QwpWsSenderError>> {
-        let mut store = self.lock_shared()?;
-        Ok(store.drain_sender_errors())
     }
 
     fn poll_sender_error_notification(&self) -> crate::Result<Option<QwpWsSenderError>> {
@@ -3130,6 +3117,7 @@ pub(crate) fn connect_qwp_ws_background_state(
             pending_connect,
             *qwp_ws.sf_append_deadline,
             *qwp_ws.error_inbox_capacity,
+            qwp_ws.rejection_sink.clone(),
         );
         (
             runner,
@@ -3323,7 +3311,8 @@ fn open_qwp_ws_parts(
     let recovered_dict_entries = try_dup_recovered(queue.recovered_symbol_dict_entries())?;
     let recovered_dict_count = queue.recovered_symbol_dict_count();
     let persisted_symbol_dict = queue.take_persisted_symbol_dict();
-    let store = QwpWsPublicationStore::new(queue, *qwp_ws.error_inbox_capacity);
+    let mut store = QwpWsPublicationStore::new(queue, *qwp_ws.error_inbox_capacity);
+    store.set_rejection_sink(qwp_ws.rejection_sink.clone());
     let send_core = QwpWsSendCore::new_with_durable_ack_and_rejection_limit(
         transport,
         max_in_flight,
@@ -3580,23 +3569,6 @@ pub(crate) fn qwp_ws_ok_fsn_background(
     state: &SyncQwpWsHandlerState,
 ) -> crate::Result<Option<u64>> {
     state.runner.ok_fsn()
-}
-
-pub(crate) fn qwp_ws_poll_sender_error_in_range_background(
-    state: &SyncQwpWsHandlerState,
-    from_fsn: u64,
-    to_fsn: u64,
-    skipped: &mut Vec<QwpWsSenderError>,
-) -> crate::Result<Option<QwpWsSenderError>> {
-    state
-        .runner
-        .poll_sender_error_overlapping(from_fsn, to_fsn, skipped)
-}
-
-pub(crate) fn qwp_ws_drain_sender_errors_background(
-    state: &SyncQwpWsHandlerState,
-) -> crate::Result<Vec<QwpWsSenderError>> {
-    state.runner.drain_sender_errors()
 }
 
 pub(crate) fn qwp_ws_published_fsn_manual(

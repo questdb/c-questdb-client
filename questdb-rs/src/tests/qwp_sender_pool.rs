@@ -6927,10 +6927,23 @@ mod conn_event_tests {
 #[test]
 fn borrow_recheck_retires_connection_that_latched_terminal_while_parked() {
     let server = MockServer::spawn_erroring(2, QWP_STATUS_SCHEMA_MISMATCH);
-    let db = QuestDb::connect(&conf_for(
-        server.port(),
-        "pool_reap=manual;sender_pool_max=2;close_flush_timeout_millis=0;",
-    ))
+    let seen: Arc<std::sync::Mutex<Vec<crate::ingress::QwpWsSenderError>>> =
+        Arc::new(std::sync::Mutex::new(Vec::new()));
+    let seen_in_handler = Arc::clone(&seen);
+    let db = QuestDb::connect_with_handlers(
+        &conf_for(
+            server.port(),
+            "pool_reap=manual;sender_pool_max=2;close_flush_timeout_millis=0;",
+        ),
+        crate::db::ConnectHandlers {
+            error_handler: Some(crate::ingress::QwpWsErrorHandler::new(
+                move |error: &crate::ingress::QwpWsSenderError| {
+                    seen_in_handler.lock().unwrap().push(error.clone());
+                },
+            )),
+            ..Default::default()
+        },
+    )
     .unwrap();
 
     {
@@ -6949,9 +6962,20 @@ fn borrow_recheck_retires_connection_that_latched_terminal_while_parked() {
         "borrow must retire the parked terminal connection and lend a fresh one"
     );
     assert!(
-        db.unobserved_rejections_total() >= 1,
-        "the rejection nobody waited for must reach the pool counter"
+        wait_until(Duration::from_secs(5), || db.rejection_events_delivered()
+            >= 1),
+        "the rejection nobody waited for must reach the pool handler"
     );
+    let seen = seen.lock().unwrap();
+    let rejection = seen
+        .iter()
+        .find(|error| error.category == crate::ingress::QwpWsErrorCategory::SchemaMismatch)
+        .expect("handler must receive the schema-mismatch rejection");
+    assert_eq!(
+        rejection.applied_policy,
+        crate::ingress::QwpWsErrorPolicy::Terminal
+    );
+    assert_eq!(db.rejection_events_dropped(), 0);
 }
 
 #[test]
@@ -6989,7 +7013,7 @@ fn reborrowed_lease_wait_covers_only_its_own_publications() {
     sender
         .wait(AckLevel::Ok, Duration::from_secs(30))
         .expect("released acks must complete the lease's own frame");
-    assert_eq!(db.unobserved_rejections_total(), 0);
+    assert_eq!(db.rejection_events_delivered(), 0);
 }
 
 mod sender_conn_event_tests {

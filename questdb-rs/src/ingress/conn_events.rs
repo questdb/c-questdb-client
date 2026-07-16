@@ -118,18 +118,19 @@ impl ConnectionEvent {
 /// keeps running.
 pub type ConnectionListener = Arc<dyn Fn(&ConnectionEvent) + Send + Sync>;
 
-struct DispatcherInner {
-    inbox: Mutex<VecDeque<ConnectionEvent>>,
+struct DispatcherInner<T> {
+    inbox: Mutex<VecDeque<T>>,
     available: Condvar,
     capacity: usize,
-    listener: ConnectionListener,
+    listener: Arc<dyn Fn(&T) + Send + Sync>,
+    name: &'static str,
     closed: AtomicBool,
     dropped: AtomicU64,
     delivered: AtomicU64,
 }
 
-impl DispatcherInner {
-    fn lock_inbox(&self) -> std::sync::MutexGuard<'_, VecDeque<ConnectionEvent>> {
+impl<T> DispatcherInner<T> {
+    fn lock_inbox(&self) -> std::sync::MutexGuard<'_, VecDeque<T>> {
         match self.inbox.lock() {
             Ok(inbox) => inbox,
             Err(poisoned) => poisoned.into_inner(),
@@ -137,8 +138,8 @@ impl DispatcherInner {
     }
 }
 
-/// Bounded inbox plus a dedicated dispatcher thread delivering
-/// [`ConnectionEvent`]s to one [`ConnectionListener`].
+/// Bounded inbox plus a dedicated dispatcher thread delivering events of
+/// one type to one listener.
 ///
 /// `offer` never blocks: when the inbox is full the oldest undelivered
 /// event is discarded (drop-oldest) and counted in [`Self::dropped`].
@@ -147,13 +148,25 @@ impl DispatcherInner {
 /// invocation — after drop returns, the listener is guaranteed to never
 /// run again, so FFI callers may release listener resources (e.g. a
 /// Python callable behind `user_data`) immediately afterwards.
-pub struct ConnectionEventDispatcher {
-    inner: Arc<DispatcherInner>,
+pub struct EventDispatcher<T> {
+    inner: Arc<DispatcherInner<T>>,
     thread: Option<std::thread::JoinHandle<()>>,
 }
 
-impl ConnectionEventDispatcher {
-    pub fn new(listener: ConnectionListener, capacity: usize) -> Self {
+/// [`EventDispatcher`] delivering [`ConnectionEvent`]s to one
+/// [`ConnectionListener`].
+pub type ConnectionEventDispatcher = EventDispatcher<ConnectionEvent>;
+
+impl<T: std::fmt::Debug + Send + 'static> EventDispatcher<T> {
+    pub fn new(listener: Arc<dyn Fn(&T) + Send + Sync>, capacity: usize) -> Self {
+        Self::named("conn-events", listener, capacity)
+    }
+
+    pub(crate) fn named(
+        name: &'static str,
+        listener: Arc<dyn Fn(&T) + Send + Sync>,
+        capacity: usize,
+    ) -> Self {
         let capacity = if capacity == 0 {
             DEFAULT_CONNECTION_EVENT_INBOX_CAPACITY
         } else {
@@ -164,18 +177,19 @@ impl ConnectionEventDispatcher {
             available: Condvar::new(),
             capacity,
             listener,
+            name,
             closed: AtomicBool::new(false),
             dropped: AtomicU64::new(0),
             delivered: AtomicU64::new(0),
         });
         let thread_inner = Arc::clone(&inner);
         let thread = match std::thread::Builder::new()
-            .name("questdb-conn-events".to_string())
+            .name(format!("questdb-{name}"))
             .spawn(move || dispatch_loop(thread_inner))
         {
             Ok(handle) => Some(handle),
             Err(err) => {
-                log::warn!("connection-event dispatcher thread failed to spawn: {err}");
+                log::warn!("{name} dispatcher thread failed to spawn: {err}");
                 inner.closed.store(true, Ordering::Release);
                 None
             }
@@ -185,7 +199,7 @@ impl ConnectionEventDispatcher {
 
     /// Queue one event for delivery. Non-blocking; drop-oldest on a full
     /// inbox; discarded outright after close.
-    pub fn offer(&self, event: ConnectionEvent) {
+    pub fn offer(&self, event: T) {
         if self.inner.closed.load(Ordering::Acquire) {
             self.inner.dropped.fetch_add(1, Ordering::Relaxed);
             return;
@@ -212,9 +226,20 @@ impl ConnectionEventDispatcher {
     pub fn delivered(&self) -> u64 {
         self.inner.delivered.load(Ordering::Relaxed)
     }
+
+    /// Drop the dispatcher (joining its thread, so any in-flight listener
+    /// invocation completes) and return the final `(delivered, dropped)`.
+    pub(crate) fn shutdown(self) -> (u64, u64) {
+        let inner = Arc::clone(&self.inner);
+        drop(self);
+        (
+            inner.delivered.load(Ordering::Relaxed),
+            inner.dropped.load(Ordering::Relaxed),
+        )
+    }
 }
 
-impl Drop for ConnectionEventDispatcher {
+impl<T> Drop for EventDispatcher<T> {
     fn drop(&mut self) {
         self.inner.closed.store(true, Ordering::Release);
         self.inner.available.notify_one();
@@ -226,7 +251,7 @@ impl Drop for ConnectionEventDispatcher {
     }
 }
 
-fn dispatch_loop(inner: Arc<DispatcherInner>) {
+fn dispatch_loop<T: std::fmt::Debug>(inner: Arc<DispatcherInner<T>>) {
     loop {
         let event = {
             let mut inbox = inner.lock_inbox();
@@ -256,7 +281,7 @@ fn dispatch_loop(inner: Arc<DispatcherInner>) {
         };
         let listener = &inner.listener;
         if catch_unwind(AssertUnwindSafe(|| listener(&event))).is_err() {
-            log::warn!("connection-event listener panicked; event: {event:?}");
+            log::warn!("{} listener panicked; event: {event:?}", inner.name);
         }
         inner.delivered.fetch_add(1, Ordering::Relaxed);
     }

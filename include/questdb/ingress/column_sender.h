@@ -424,6 +424,33 @@ questdb_db* questdb_db_connect_with_event_handler(
     size_t inbox_capacity,
     questdb_error** err_out);
 
+/** Like `questdb_db_connect_with_event_handler`, additionally registering a
+ * server-rejection handler. Either callback may be NULL: a NULL
+ * `event_callback` disables connection lifecycle events; a NULL
+ * `rejection_callback` selects the default of logging every rejection (warn
+ * for retriable policies — the frames are replayed, not lost — error for
+ * terminal ones), so silence is never the default.
+ *
+ * The rejection handler receives every server rejection any of the pool's
+ * store-and-forward connections records — including rejections for frames
+ * whose sender was already returned to the pool — on a dedicated dispatcher
+ * thread through a bounded inbox (`rejection_inbox_capacity` of 0 selects
+ * the default 64; overflow drops the oldest event, counted by
+ * `questdb_db_rejection_events_dropped`). The caller guarantees each
+ * `user_data` is safe to use from its dispatcher thread until
+ * `questdb_db_close` returns. */
+QUESTDB_CLIENT_API
+questdb_db* questdb_db_connect_with_handlers(
+    const char* conf,
+    size_t conf_len,
+    questdb_connection_event_cb event_callback,
+    void* event_user_data,
+    size_t event_inbox_capacity,
+    line_sender_qwpws_error_cb rejection_callback,
+    void* rejection_user_data,
+    size_t rejection_inbox_capacity,
+    questdb_error** err_out);
+
 /** Total events discarded by the inbox's drop-oldest policy. */
 QUESTDB_CLIENT_API
 uint64_t questdb_db_connection_events_dropped(const questdb_db* db);
@@ -432,12 +459,16 @@ uint64_t questdb_db_connection_events_dropped(const questdb_db* db);
 QUESTDB_CLIENT_API
 uint64_t questdb_db_connection_events_delivered(const questdb_db* db);
 
-/** Total server rejections no lease observed through `qwp_sender_wait` (or a
- *  waited flush) before the rejecting connection was re-leased, returned, or
- *  retired. Each is also logged at warn level; the affected frames were not
- *  ingested. `0` for a NULL `db`. */
+/** Total server rejections delivered to the rejection handler (or to the
+ *  default log handler when none was registered). `0` for a NULL `db`. */
 QUESTDB_CLIENT_API
-uint64_t questdb_db_unobserved_rejections_total(const questdb_db* db);
+uint64_t questdb_db_rejection_events_delivered(const questdb_db* db);
+
+/** Total server rejections discarded by the rejection handler inbox's
+ *  drop-oldest policy. Always `0` without a registered handler: the default
+ *  log handler has no inbox. `0` for a NULL `db`. */
+QUESTDB_CLIENT_API
+uint64_t questdb_db_rejection_events_dropped(const questdb_db* db);
 
 /* -------------------------------------------------------------------------
  * Diagnostics: per-pool connection counts
@@ -1547,10 +1578,11 @@ bool qwp_sender_acked_fsn(
 
 /**
  * Ack barrier scoped to this borrow: blocks until every frame published
- * through it reaches `ack_level`. Frames published by earlier borrows of the
- * same pooled connection are outside its scope; rejections recorded for them
- * are logged and counted in `questdb_db_unobserved_rejections_total` instead
- * of failing this borrow.
+ * through it reaches `ack_level`, short-circuiting when the borrow
+ * published nothing. The barrier is a watermark check plus a terminal-latch
+ * check: only a terminal connection failure fails it. Server rejections are
+ * delivered to the pool's rejection handler (default: logged) rather than
+ * raised here; retriable ones are replayed by the queue.
  *
  * `ack_level` carries a `qwpws_ack_level_*` constant. The
  * parameter is `uint32_t` rather than `enum qwpws_ack_level` so

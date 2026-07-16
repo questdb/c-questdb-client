@@ -52,8 +52,9 @@ use questdb::{Error, ErrorCode};
 use crate::line_sender_column_name;
 use crate::{
     line_sender_buffer, line_sender_error, line_sender_error_code, line_sender_opts,
-    line_sender_qwpws_fsn, line_sender_table_name, questdb_error, qwpws_ack_level_durable,
-    qwpws_ack_level_ok, qwpws_buffer_ptr_mut, qwpws_buffer_ptr_ref, set_err_out_from_error,
+    line_sender_qwpws_error_cb, line_sender_qwpws_fsn, line_sender_table_name, questdb_error,
+    qwp_ws_sender_error_view, qwpws_ack_level_durable, qwpws_ack_level_ok, qwpws_buffer_ptr_mut,
+    qwpws_buffer_ptr_ref, set_err_out_from_error,
 };
 
 // ===========================================================================
@@ -1400,17 +1401,82 @@ pub unsafe extern "C" fn questdb_db_connection_events_delivered(db: *const quest
     db_ref.0.connection_events_delivered()
 }
 
-/// Total server rejections no lease observed through `qwp_sender_wait` (or a
-/// waited flush) before the rejecting connection was re-leased, returned, or
-/// retired. Each is also logged at warn level; the affected frames were not
-/// ingested. `0` for a NULL `db`.
+/// Like `questdb_db_connect_with_event_handler`, additionally registering a
+/// server-rejection handler. Either callback may be NULL: a NULL
+/// `event_callback` disables connection lifecycle events; a NULL
+/// `rejection_callback` selects the default behaviour of logging every
+/// rejection (warn for retriable policies — the frames are replayed, not
+/// lost — error for terminal ones), so silence is never the default.
+///
+/// The rejection handler receives every server rejection any of the pool's
+/// store-and-forward connections records — including rejections for frames
+/// whose sender was already returned to the pool — on a dedicated dispatcher
+/// thread through a bounded inbox (`rejection_inbox_capacity`; `0` = default
+/// 64; overflow drops the oldest event, counted by
+/// `questdb_db_rejection_events_dropped`). The caller guarantees each
+/// `user_data` is safe to use from its dispatcher thread until
+/// `questdb_db_close` returns.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn questdb_db_unobserved_rejections_total(db: *const questdb_db) -> u64 {
+pub unsafe extern "C" fn questdb_db_connect_with_handlers(
+    conf: *const c_char,
+    conf_len: size_t,
+    event_callback: Option<questdb_connection_event_cb>,
+    event_user_data: *mut c_void,
+    event_inbox_capacity: size_t,
+    rejection_callback: line_sender_qwpws_error_cb,
+    rejection_user_data: *mut c_void,
+    rejection_inbox_capacity: size_t,
+    err_out: *mut *mut questdb_error,
+) -> *mut questdb_db {
+    let conf = match unsafe { name_str(conf, conf_len, err_out) } {
+        Some(s) => s,
+        None => return std::ptr::null_mut(),
+    };
+    let mut handlers = questdb::ConnectHandlers::default();
+    if let Some(cb) = event_callback {
+        handlers.connection_listener = Some(connection_listener_from_c(cb, event_user_data));
+        handlers.connection_event_inbox_capacity = event_inbox_capacity;
+    }
+    if let Some(cb) = rejection_callback {
+        let user_data = rejection_user_data as usize;
+        handlers.error_handler = Some(questdb::ingress::QwpWsErrorHandler::new(
+            move |error: &questdb::ingress::QwpWsSenderError| {
+                let view = qwp_ws_sender_error_view(error);
+                unsafe { cb(user_data as *mut c_void, &view) };
+            },
+        ));
+        handlers.error_inbox_capacity = rejection_inbox_capacity;
+    }
+    match QuestDb::connect_with_handlers(conf, handlers) {
+        Ok(db) => Box::into_raw(Box::new(questdb_db(db))),
+        Err(err) => {
+            unsafe { set_err_out_from_error(err_out, err) };
+            std::ptr::null_mut()
+        }
+    }
+}
+
+/// Total server rejections delivered to the rejection handler (or to the
+/// default log handler when none was registered). `0` for a NULL `db`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn questdb_db_rejection_events_delivered(db: *const questdb_db) -> u64 {
     if db.is_null() {
         return 0;
     }
     let db_ref = unsafe { &*db };
-    db_ref.0.unobserved_rejections_total()
+    db_ref.0.rejection_events_delivered()
+}
+
+/// Total server rejections discarded by the rejection handler inbox's
+/// drop-oldest policy. Always `0` without a registered handler: the default
+/// log handler has no inbox. `0` for a NULL `db`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn questdb_db_rejection_events_dropped(db: *const questdb_db) -> u64 {
+    if db.is_null() {
+        return 0;
+    }
+    let db_ref = unsafe { &*db };
+    db_ref.0.rejection_events_dropped()
 }
 
 /// Per-pool connection counts, mirroring `questdb::DbgPoolCount`. Diagnostics
@@ -4778,10 +4844,13 @@ unsafe fn cs_wait_body<T: CsHandle>(
 
 /// Store-and-forward ack barrier: block until every frame published through
 /// this borrow of `sender` reaches `ack_level`. The SFA queue owns delivery,
-/// so this is needed only to *observe* the ack, never for durability. Frames
-/// published by earlier borrows of the same pooled connection are outside
-/// this wait's scope; rejections recorded for them are logged and counted in
-/// `questdb_db_unobserved_rejections_total` instead of failing this borrow.
+/// so this is needed only to *observe* the ack, never for durability.
+///
+/// The barrier is a watermark check plus a terminal-latch check: only a
+/// terminal connection failure fails it. Server rejections — the borrow's
+/// own and earlier borrows' alike — are delivered to the pool's rejection
+/// handler (default: logged) rather than raised here; retriable ones are
+/// replayed by the queue.
 ///
 /// `timeout_millis` is a no-progress deadline (it fires only if the ack
 /// watermark fails to advance for that long); `0` waits indefinitely.

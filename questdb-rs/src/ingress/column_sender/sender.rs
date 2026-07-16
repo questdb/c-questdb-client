@@ -31,14 +31,12 @@ use std::time::{Duration, Instant};
 
 use crate::ErrorCode;
 use crate::ingress::AckLevel;
-use crate::ingress::QwpWsSenderError;
 use crate::ingress::buffer::{Buffer, QwpWsColumnarBuffer, QwpWsEncodeScratch, SymbolGlobalDict};
 use crate::ingress::sender::qwp_ws::{
     SyncQwpWsHandlerState, publish_qwp_ws_payload_background, qwp_ws_acked_fsn_background,
     qwp_ws_begin_close_background, qwp_ws_check_error_background,
-    qwp_ws_drain_sender_errors_background, qwp_ws_drain_to_deadline_background,
-    qwp_ws_is_terminal_background, qwp_ws_ok_fsn_background,
-    qwp_ws_poll_sender_error_in_range_background, qwp_ws_published_fsn_background,
+    qwp_ws_drain_to_deadline_background, qwp_ws_is_terminal_background, qwp_ws_ok_fsn_background,
+    qwp_ws_published_fsn_background,
 };
 use crate::ingress::sender::qwp_ws_sfa_publisher::{SfaForegroundPublisher, SfaPublishOutcome};
 #[cfg(feature = "arrow-ingress")]
@@ -272,7 +270,6 @@ struct SfaBackend {
     sync_timeout: Duration,
     last_ok_sync_boundary: Option<u64>,
     last_durable_sync_boundary: Option<u64>,
-    unobserved_rejections: u64,
     drop_on_return: bool,
 }
 
@@ -338,32 +335,22 @@ impl PooledSenderCore {
                 sync_timeout,
                 last_ok_sync_boundary: None,
                 last_durable_sync_boundary: None,
-                unobserved_rejections: 0,
                 drop_on_return: false,
             }),
         })
     }
 
-    /// Scope ack observation to the borrowing lease: `wait` on the new lease
-    /// covers only its own publications; rejections recorded for earlier
-    /// leases are drained and reported as unobserved.
-    pub(crate) fn rebase_lease_observation(&mut self) -> u64 {
+    /// Scope the ack barrier to the borrowing lease: fast-forward the sync
+    /// boundaries past everything already published so `wait` covers only
+    /// the lease's own publications and short-circuits when it published
+    /// nothing. Rejections are not consumed here — they reach the pool's
+    /// rejection handler when recorded.
+    pub(crate) fn rebase_lease_observation(&mut self) {
         let sfa = &mut self.backend;
         if let Ok(published) = qwp_ws_published_fsn_background(&sfa.state) {
             sfa.last_ok_sync_boundary = published;
             sfa.last_durable_sync_boundary = published;
         }
-        self.take_unobserved_rejections()
-    }
-
-    pub(crate) fn take_unobserved_rejections(&mut self) -> u64 {
-        let sfa = &mut self.backend;
-        if let Ok(drained) = qwp_ws_drain_sender_errors_background(&sfa.state) {
-            for error in &drained {
-                sfa.note_unobserved_rejection(error);
-            }
-        }
-        std::mem::take(&mut sfa.unobserved_rejections)
     }
 
     #[must_use]
@@ -1855,7 +1842,6 @@ impl SfaBackend {
         if last_boundary.is_some_and(|last| last >= boundary) {
             return Ok(());
         }
-        let from_fsn = last_boundary.map_or(0, |last| last.saturating_add(1));
 
         // No-progress deadline: reset every time the ack/durable watermark
         // advances, so this only fires when the peer stays alive yet silent
@@ -1865,21 +1851,7 @@ impl SfaBackend {
         let mut deadline_anchor = Instant::now();
         let mut last_completed: Option<u64> = None;
 
-        let mut skipped = Vec::new();
         loop {
-            let hit = qwp_ws_poll_sender_error_in_range_background(
-                &self.state,
-                from_fsn,
-                boundary,
-                &mut skipped,
-            )?;
-            for error in skipped.drain(..) {
-                self.note_unobserved_rejection(&error);
-            }
-            if let Some(sender_error) = hit {
-                return Err(sfa_sender_error(sender_error));
-            }
-
             let completed = match ack_level {
                 AckLevel::Ok => qwp_ws_ok_fsn_background(&self.state)?,
                 AckLevel::Durable => qwp_ws_acked_fsn_background(&self.state)?,
@@ -1903,20 +1875,6 @@ impl SfaBackend {
             }
             thread::sleep(Duration::from_millis(10));
         }
-    }
-
-    fn note_unobserved_rejection(&mut self, error: &QwpWsSenderError) {
-        self.unobserved_rejections += 1;
-        log::warn!(
-            "QWP/WebSocket server rejected frame range [{}, {}] \
-             (category {:?}, policy {:?}) and no wait() on the publishing \
-             lease observed it; the rows in that range were not ingested: {}",
-            error.from_fsn,
-            error.to_fsn,
-            error.category,
-            error.applied_policy,
-            error.message.as_deref().unwrap_or("no server message")
-        );
     }
 
     fn effective_frame_caps(&self) -> SfaFrameCaps {
@@ -1973,21 +1931,6 @@ fn sfa_sync_timeout(
             level, sync_timeout, boundary, progress
         ),
     )
-}
-
-fn sfa_sender_error(sender_error: QwpWsSenderError) -> crate::Error {
-    let message = sender_error
-        .message
-        .as_deref()
-        .unwrap_or("server rejected frame");
-    crate::Error::new(
-        ErrorCode::ServerRejection,
-        format!(
-            "QWP/WebSocket server rejected store-and-forward frame range [{}, {}]: {}",
-            sender_error.from_fsn, sender_error.to_fsn, message
-        ),
-    )
-    .with_qwp_ws_rejection(sender_error)
 }
 
 #[cfg(test)]

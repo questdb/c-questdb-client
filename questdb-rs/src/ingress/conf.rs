@@ -318,6 +318,12 @@ pub(crate) struct QwpWsConfig {
     /// cloned into the runner. Carried in the config so blocking transports
     /// and store-and-forward runners can narrate foreground connects.
     pub(crate) conn_events: Option<std::sync::Arc<super::conn_events::ConnectionEventSource>>,
+    /// Optional pool-wide rejection event sink. Set by the pool before the
+    /// config is cloned into each store-and-forward runner; the runner
+    /// publishes every recorded server rejection through it. `None` for
+    /// standalone senders, whose handler is pulled at API-call boundaries.
+    pub(crate) rejection_sink:
+        Option<std::sync::Arc<super::rejection_events::RejectionEventSource>>,
 }
 
 #[cfg(feature = "_sender-qwp-ws")]
@@ -362,6 +368,7 @@ impl Default for QwpWsConfig {
                 QWP_WS_DEFAULT_POISON_MIN_ESCALATION_WINDOW,
             ),
             conn_events: None,
+            rejection_sink: None,
         }
     }
 }
