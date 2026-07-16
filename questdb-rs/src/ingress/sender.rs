@@ -693,6 +693,13 @@ impl Sender {
     /// drives WebSocket progress while waiting.
     #[cfg(feature = "sync-sender-qwp-ws")]
     pub fn wait(&mut self, ack_level: AckLevel, timeout: Duration) -> Result<()> {
+        let result = self.wait_inner(ack_level, timeout);
+        let drain_result = self.drain_qwp_ws_error_notifications();
+        result.and(drain_result)
+    }
+
+    #[cfg(feature = "sync-sender-qwp-ws")]
+    fn wait_inner(&mut self, ack_level: AckLevel, timeout: Duration) -> Result<()> {
         if !matches!(
             &self.handler,
             SyncProtocolHandler::SyncQwpWs(_) | SyncProtocolHandler::ManualQwpWs(_)
@@ -874,17 +881,25 @@ impl Sender {
     /// turns.
     #[cfg(feature = "sync-sender-qwp-ws")]
     pub fn drive_once(&mut self) -> Result<bool> {
-        match &mut self.handler {
+        let result = match &mut self.handler {
             SyncProtocolHandler::ManualQwpWs(state) => qwp_ws_drive_once(state),
-            SyncProtocolHandler::SyncQwpWs(_) => Err(error::fmt!(
-                InvalidApiCall,
-                "drive_once is only supported when qwp_ws_progress is manual."
-            )),
-            _ => Err(error::fmt!(
-                InvalidApiCall,
-                "drive_once is only supported for QWP/WebSocket senders."
-            )),
-        }
+            SyncProtocolHandler::SyncQwpWs(_) => {
+                return Err(error::fmt!(
+                    InvalidApiCall,
+                    "drive_once is only supported when qwp_ws_progress is manual."
+                ))
+            }
+            _ => {
+                return Err(error::fmt!(
+                    InvalidApiCall,
+                    "drive_once is only supported for QWP/WebSocket senders."
+                ))
+            }
+        };
+        let drain_result = self.drain_qwp_ws_error_notifications();
+        let progressed = result?;
+        drain_result?;
+        Ok(progressed)
     }
 
     /// Stop accepting new QWP/WebSocket publications and wait for all already
