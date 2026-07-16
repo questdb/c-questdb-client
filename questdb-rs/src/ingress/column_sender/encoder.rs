@@ -34,6 +34,7 @@
 use std::slice;
 
 use crate::ingress::buffer::SymbolGlobalDict;
+use crate::ingress::gorilla;
 use crate::{Result, error};
 
 #[cfg(feature = "arrow-ingress")]
@@ -45,8 +46,8 @@ use super::chunk::{
 use super::numpy_wire;
 use super::wire::{
     F32_NULL, F64_NULL, I8_NULL, I16_NULL, I32_NULL, I64_NULL, QWP_FLAG_DEFER_COMMIT,
-    QWP_FLAG_DELTA_SYMBOL_DICT, QWP_HEADER_LEN, QWP_MAGIC, QWP_VERSION_1, validate_table_name,
-    write_qwp_bytes, write_qwp_varint,
+    QWP_FLAG_DELTA_SYMBOL_DICT, QWP_FLAG_GORILLA, QWP_HEADER_LEN, QWP_MAGIC, QWP_VERSION_1,
+    validate_table_name, write_qwp_bytes, write_qwp_varint,
 };
 
 /// Per-sender reusable scratch state for one flush. The contained `Vec`s
@@ -490,8 +491,10 @@ fn estimate_frame_size(
             .saturating_add(payload_size)
             .saturating_add(8);
     }
+    // null_flag + encoding discriminator + worst-case raw payload; the
+    // Gorilla payload is never larger than raw, so this stays an upper bound.
     total = total
-        .saturating_add(1)
+        .saturating_add(2)
         .saturating_add(row_count.saturating_mul(8));
     total
 }
@@ -510,7 +513,7 @@ fn write_header_placeholder(out: &mut Vec<u8>, table_count: u16, defer_commit: b
     let start = out.len();
     out.extend_from_slice(&QWP_MAGIC);
     out.push(QWP_VERSION_1);
-    let mut flags = QWP_FLAG_DELTA_SYMBOL_DICT;
+    let mut flags = QWP_FLAG_DELTA_SYMBOL_DICT | QWP_FLAG_GORILLA;
     if defer_commit {
         flags |= QWP_FLAG_DEFER_COMMIT;
     }
@@ -721,9 +724,12 @@ unsafe fn encode_column(
         ColumnKind::Ipv4 { data } => unsafe {
             encode_bitmap_le::<u32, 4>(out, data, row_count, validity, u32::to_le_bytes);
         },
-        ColumnKind::TsNanos { data }
-        | ColumnKind::TsMicros { data }
-        | ColumnKind::DateMillis { data } => unsafe {
+        ColumnKind::TsNanos { data } | ColumnKind::TsMicros { data } => unsafe {
+            encode_temporal_gorilla(out, data, row_count, validity);
+        },
+        // DATE ships raw with no discriminator, matching the Java ingress
+        // encoder (only TIMESTAMP/TIMESTAMP_NANOS participate in Gorilla).
+        ColumnKind::DateMillis { data } => unsafe {
             encode_bitmap_le::<i64, 8>(out, data, row_count, validity, i64::to_le_bytes);
         },
         ColumnKind::Uuid { data } => unsafe {
@@ -907,6 +913,33 @@ unsafe fn encode_bitmap_le<T, const N: usize>(
                     out.extend_from_slice(&to_le(value));
                 }
             }
+        }
+    }
+}
+
+/// Temporal (TIMESTAMP / TIMESTAMP_NANOS) column: null_flag + optional QWP
+/// bitmap, then the Gorilla/raw discriminator and the dense non-null values.
+unsafe fn encode_temporal_gorilla(
+    out: &mut Vec<u8>,
+    data: *const i64,
+    row_count: usize,
+    validity: Option<&ValidityDescriptor>,
+) {
+    match validity.filter(|v| v.has_nulls()) {
+        None => {
+            out.push(0);
+            gorilla::write_temporal_column(out, row_count, || {
+                (0..row_count).map(|i| unsafe { *data.add(i) })
+            });
+        }
+        Some(v) => {
+            out.push(1);
+            unsafe { write_qwp_bitmap_from_validity(out, v) };
+            gorilla::write_temporal_column(out, v.non_null_count, || {
+                (0..row_count)
+                    .filter(|&i| unsafe { v.is_valid(i) })
+                    .map(|i| unsafe { *data.add(i) })
+            });
         }
     }
 }
@@ -1205,15 +1238,14 @@ fn encode_designated_ts(
                 )
             })?;
             out.push(0);
-            out.reserve(8 * row_count);
-            let bytes = scaled.to_le_bytes();
-            for _ in 0..row_count {
-                out.extend_from_slice(&bytes);
-            }
+            gorilla::write_temporal_column(out, row_count, || {
+                std::iter::repeat_n(scaled, row_count)
+            });
             return Ok(());
         }
     };
     let values = unsafe { slice::from_raw_parts(data, row_count) };
+    let scale = ts.unit.scale();
     for (row, &v) in values.iter().enumerate() {
         if v < 0 {
             return Err(error::fmt!(
@@ -1223,32 +1255,19 @@ fn encode_designated_ts(
                 v
             ));
         }
+        if v.checked_mul(scale).is_none() {
+            return Err(error::fmt!(
+                InvalidTimestamp,
+                "designated timestamp at row {} overflows microseconds ({})",
+                row,
+                v
+            ));
+        }
     }
     out.push(0); // designated_ts is always non-null
-    out.reserve(8 * row_count);
-    let scale = ts.unit.scale();
-    if scale != 1 {
-        for (row, &v) in values.iter().enumerate() {
-            let scaled = v.checked_mul(scale).ok_or_else(|| {
-                error::fmt!(
-                    InvalidTimestamp,
-                    "designated timestamp at row {} overflows microseconds ({})",
-                    row,
-                    v
-                )
-            })?;
-            out.extend_from_slice(&scaled.to_le_bytes());
-        }
-    } else if cfg!(target_endian = "little") {
-        let bytes = unsafe {
-            slice::from_raw_parts(data as *const u8, row_count * std::mem::size_of::<i64>())
-        };
-        out.extend_from_slice(bytes);
-    } else {
-        for &v in values {
-            out.extend_from_slice(&v.to_le_bytes());
-        }
-    }
+    gorilla::write_temporal_column(out, row_count, || {
+        values.iter().map(|&v| v.wrapping_mul(scale))
+    });
     Ok(())
 }
 
@@ -1296,6 +1315,59 @@ mod tests {
         let mut scratch = EncodeScratch::new();
         encode_chunk_into(&mut out, chunk, &mut dict, &mut scratch, false).unwrap();
         out
+    }
+
+    #[test]
+    fn chunk_frame_sets_gorilla_flag_and_compresses_designated_ts() {
+        let ts: Vec<i64> = (0..4096)
+            .map(|i| 1_700_000_000_000_000_000 + i * 1_000)
+            .collect();
+        let out = make_chunk_i64("qty", &ts);
+        assert_eq!(out[5] & QWP_FLAG_GORILLA, QWP_FLAG_GORILLA);
+        // qty stays raw (~32 KiB); the designated ts column collapses from
+        // ~32 KiB to ~0.5 KiB. Generous bound: well under raw total (~66 KiB).
+        assert!(
+            out.len() < 50_000,
+            "expected gorilla shrink, got {}",
+            out.len()
+        );
+    }
+
+    #[test]
+    fn chunk_designated_ts_dod_overflow_falls_back_to_raw() {
+        let n = 4096i64;
+        let regular: Vec<i64> = (0..n)
+            .map(|i| 1_700_000_000_000_000_000 + i * 1_000)
+            .collect();
+        // Alternating ~6s jumps: every DoD ≈ ±12e9, outside i32 → raw fallback.
+        let wild: Vec<i64> = (0..n)
+            .map(|i| 1_700_000_000_000_000_000 + (i % 2) * 6_000_000_000)
+            .collect();
+        let small = make_chunk_i64("qty", &regular);
+        let big = make_chunk_i64("qty", &wild);
+        // Same frame shape; only the designated-ts payload differs
+        // (~1 bit/row gorilla vs 8 bytes/row raw).
+        assert!(big.len() > small.len() + (n as usize) * 6);
+    }
+
+    // Gated on `_egress`: the reference decoder lives behind that feature and
+    // sender-only CI combos must still compile `cargo test`.
+    #[cfg(feature = "_egress")]
+    #[test]
+    fn encode_temporal_gorilla_dense_roundtrip() {
+        let values: Vec<i64> = (0..64).map(|i| 1_700_000_000_000_000 + i * 500).collect();
+        let mut out = Vec::new();
+        unsafe { encode_temporal_gorilla(&mut out, values.as_ptr(), values.len(), None) };
+        assert_eq!(out[0], 0, "null flag");
+        assert_eq!(out[1], 0x01, "gorilla discriminator");
+        let s0 = i64::from_le_bytes(out[2..10].try_into().unwrap());
+        let s1 = i64::from_le_bytes(out[10..18].try_into().unwrap());
+        let mut dec = crate::egress::gorilla::GorillaDecoder::new(s0, s1, &out[18..]);
+        let mut got = vec![s0, s1];
+        for _ in 2..values.len() {
+            got.push(dec.decode_next().unwrap());
+        }
+        assert_eq!(got, values);
     }
 
     #[test]
@@ -1605,7 +1677,7 @@ mod tests {
         encode_chunk_into(&mut out, &chunk, &mut dict, &mut scratch, false).unwrap();
         assert_eq!(out.len(), 14);
         assert_eq!(&out[0..4], b"QWP1");
-        assert_eq!(out[5], QWP_FLAG_DELTA_SYMBOL_DICT);
+        assert_eq!(out[5], QWP_FLAG_DELTA_SYMBOL_DICT | QWP_FLAG_GORILLA);
         assert_eq!(u16::from_le_bytes([out[6], out[7]]), 0);
     }
 
@@ -1667,8 +1739,12 @@ mod tests {
 
         // The at_now frame drops exactly the ts signature entry (empty
         // name varint + wire type = 2 bytes) and the ts body (null_flag +
-        // 8 bytes per row).
-        assert_eq!(ts_frame.len() - now_frame.len(), 2 + 1 + 8 * data.len());
+        // Gorilla/raw discriminator + payload for `data`) — computed via the
+        // production encoder rather than a fixed byte count, since the
+        // payload size depends on Gorilla-compressibility.
+        let mut ts_body = Vec::new();
+        unsafe { encode_temporal_gorilla(&mut ts_body, data.as_ptr(), data.len(), None) };
+        assert_eq!(ts_frame.len() - now_frame.len(), 2 + ts_body.len());
     }
 
     #[test]

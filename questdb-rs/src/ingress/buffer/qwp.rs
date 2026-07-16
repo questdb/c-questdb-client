@@ -34,6 +34,7 @@ use crate::Error;
 use crate::ErrorCode;
 use crate::error;
 use crate::ingress::decimal::DecimalView;
+use crate::ingress::gorilla;
 use crate::ingress::ndarr::{self, ArrayElementSealed};
 use crate::ingress::{ArrayElement, MAX_ARRAY_DIMS, NdArrayView, Timestamp};
 use std::collections::hash_map::RandomState;
@@ -3684,9 +3685,9 @@ impl QwpWsColumnarBuffer {
             magic: *b"QWP1",
             version,
             flags: if defer_commit {
-                QWP_FLAG_DELTA_SYMBOL_DICT | QWP_FLAG_DEFER_COMMIT
+                QWP_FLAG_DELTA_SYMBOL_DICT | QWP_FLAG_DEFER_COMMIT | QWP_FLAG_GORILLA
             } else {
-                QWP_FLAG_DELTA_SYMBOL_DICT
+                QWP_FLAG_DELTA_SYMBOL_DICT | QWP_FLAG_GORILLA
             },
             table_count,
             payload_len: checked_qwp_u32(
@@ -4578,7 +4579,9 @@ impl QwpWsColumnValues {
             Self::I64 { .. } | Self::F64 { .. } => row_count.saturating_mul(8),
             Self::F32 { .. } => row_count.saturating_mul(4),
             Self::TimestampMicros { cells } | Self::TimestampNanos { cells } => {
-                cells.len().saturating_mul(8)
+                // 1 encoding-discriminator byte + worst-case raw payload;
+                // the Gorilla payload is never larger than raw.
+                1usize.saturating_add(cells.len().saturating_mul(8))
             }
             Self::String { cells, data } => (cells.len() + 1).saturating_mul(4) + data.len(),
             Self::Symbol { cells, .. } => cells
@@ -4778,9 +4781,9 @@ impl QwpWsColumnValues {
                 Ok(())
             }
             Self::TimestampMicros { cells } | Self::TimestampNanos { cells } => {
-                for cell in cells {
-                    out.extend_from_slice(&cell.value.to_le_bytes());
-                }
+                gorilla::write_temporal_column(out, cells.len(), || {
+                    cells.iter().map(|cell| cell.value)
+                });
                 Ok(())
             }
             Self::String { cells, data } => {
@@ -5112,6 +5115,11 @@ fn type_mismatch_error_ws(entry_name: &[u8]) -> crate::Error {
 const QWP_FLAG_DELTA_SYMBOL_DICT: u8 = 0x08;
 #[cfg(feature = "_sender-qwp-ws")]
 const QWP_FLAG_DEFER_COMMIT: u8 = 0x01;
+/// Message-header flag: timestamp columns carry a per-column encoding
+/// discriminator (raw vs Gorilla delta-of-delta). Matches the Java client's
+/// `QwpConstants.FLAG_GORILLA`.
+#[cfg(feature = "_sender-qwp-ws")]
+const QWP_FLAG_GORILLA: u8 = 0x04;
 
 /// Connection-scoped global symbol dictionary used by the QWP/WebSocket
 /// transport's delta-symbol-dict mode.
@@ -5620,6 +5628,7 @@ impl QwpBuffer {
                         &planner.cells,
                         &planner.symbol_dict,
                         &self.value_bytes,
+                        true,
                         out,
                     )?;
                 }
@@ -5630,7 +5639,7 @@ impl QwpBuffer {
         let header = QwpMessageHeader {
             magic: *b"QWP1",
             version,
-            flags: QWP_FLAG_DELTA_SYMBOL_DICT,
+            flags: QWP_FLAG_DELTA_SYMBOL_DICT | QWP_FLAG_GORILLA,
             table_count,
             payload_len: checked_qwp_u32(out.len() - payload_start, "WS message payload length")?,
         };
@@ -5754,6 +5763,7 @@ impl QwpBuffer {
                         &planner.cells,
                         &planner.symbol_dict,
                         &self.value_bytes,
+                        true,
                         out,
                     )?;
                 }
@@ -5764,7 +5774,7 @@ impl QwpBuffer {
         let header = QwpMessageHeader {
             magic: *b"QWP1",
             version,
-            flags: QWP_FLAG_DELTA_SYMBOL_DICT,
+            flags: QWP_FLAG_DELTA_SYMBOL_DICT | QWP_FLAG_GORILLA,
             table_count,
             payload_len: checked_qwp_u32(
                 out.len() - payload_start,
@@ -7176,6 +7186,7 @@ fn encode_row_group_from_scratch(
             &planner.cells,
             &planner.symbol_dict,
             value_bytes,
+            false,
             out,
         )?;
     }
@@ -7282,6 +7293,7 @@ fn encode_column_from_cells(
     cells: &[CellRef],
     symbol_dict: &[SymbolEntry],
     value_bytes: &[u8],
+    use_gorilla: bool,
     out: &mut Vec<u8>,
 ) -> crate::Result<()> {
     let uses_null_bitmap = col.uses_null_bitmap(row_count);
@@ -7420,8 +7432,16 @@ fn encode_column_from_cells(
         }
 
         ColumnKind::TimestampMicros | ColumnKind::TimestampNanos => {
-            for cell in CellIter::new(cells, col.cell_head) {
-                if let ValueRef::TimestampMicros(v) | ValueRef::TimestampNanos(v) = cell.value {
+            let values = || {
+                CellIter::new(cells, col.cell_head).filter_map(|cell| match cell.value {
+                    ValueRef::TimestampMicros(v) | ValueRef::TimestampNanos(v) => Some(v),
+                    _ => None,
+                })
+            };
+            if use_gorilla {
+                gorilla::write_temporal_column(out, col.non_null_count as usize, values);
+            } else {
+                for v in values() {
                     out.extend_from_slice(&v.to_le_bytes());
                 }
             }
@@ -9409,6 +9429,176 @@ mod tests {
             vec![b"BTC-USD".to_vec()],
             "replay frames must re-emit already-known symbols"
         );
+    }
+
+    /// Walk a single-table, two-column WS frame (dense i64 column first,
+    /// designated timestamp last) and return the timestamp column's
+    /// encoding discriminator plus its decoded values.
+    ///
+    /// Gated on `_egress` too: the reference decoder lives behind that
+    /// feature and sender-only CI combos must still compile `cargo test`.
+    #[cfg(all(feature = "_sender-qwp-ws", feature = "_egress"))]
+    fn ws_two_column_ts_payload(
+        message: &[u8],
+        row_count: usize,
+        first_col_type: u8,
+        ts_type: u8,
+    ) -> (u8, Vec<i64>) {
+        let (_, _, mut pos) = ws_delta_entries(message);
+        let _table_name = read_test_bytes(message, &mut pos);
+        assert_eq!(read_test_varint(message, &mut pos) as usize, row_count);
+        assert_eq!(
+            read_test_varint(message, &mut pos),
+            2,
+            "expected two columns"
+        );
+        let _first_name = read_test_bytes(message, &mut pos);
+        assert_eq!(message[pos], first_col_type);
+        pos += 1;
+        let _ts_name = read_test_bytes(message, &mut pos);
+        assert_eq!(message[pos], ts_type);
+        pos += 1;
+
+        // First column: sentinel-dense i64 (null_flag 0x00 + row_count * 8).
+        assert_eq!(message[pos], 0);
+        pos += 1 + row_count * 8;
+
+        // Timestamp column: null_flag, then encoding discriminator, then payload.
+        assert_eq!(message[pos], 0, "designated ts never uses a null bitmap");
+        pos += 1;
+        let disc = message[pos];
+        pos += 1;
+        let values: Vec<i64> = match disc {
+            0x00 => (0..row_count)
+                .map(|i| {
+                    i64::from_le_bytes(message[pos + i * 8..pos + (i + 1) * 8].try_into().unwrap())
+                })
+                .collect(),
+            0x01 => {
+                let s0 = i64::from_le_bytes(message[pos..pos + 8].try_into().unwrap());
+                let s1 = i64::from_le_bytes(message[pos + 8..pos + 16].try_into().unwrap());
+                let mut vals = vec![s0, s1];
+                let mut dec =
+                    crate::egress::gorilla::GorillaDecoder::new(s0, s1, &message[pos + 16..]);
+                for _ in 2..row_count {
+                    vals.push(dec.decode_next().unwrap());
+                }
+                vals
+            }
+            other => panic!("unknown temporal discriminator 0x{other:02X}"),
+        };
+        (disc, values)
+    }
+
+    #[cfg(all(feature = "_sender-qwp-ws", feature = "_egress"))]
+    #[test]
+    fn qwp_ws_message_gorilla_encodes_designated_ts() {
+        let mut buf = QwpBuffer::new(127);
+        let base = 1_700_000_000_000_000_000i64;
+        let expected: Vec<i64> = (0..16).map(|i| base + i * 1_000_000).collect();
+        for (i, &ts) in expected.iter().enumerate() {
+            buf.table("trades")
+                .unwrap()
+                .column_i64("qty", i as i64)
+                .unwrap();
+            buf.at(TimestampNanos::new(ts)).unwrap();
+        }
+        let mut scratch = QwpWsEncodeScratch::new();
+        let mut global_dict = SymbolGlobalDict::new();
+        buf.encode_ws_message(&mut scratch, &mut global_dict, QWP_VERSION_1)
+            .unwrap();
+        let message = &scratch.message;
+        assert_eq!(message[5] & QWP_FLAG_GORILLA, QWP_FLAG_GORILLA);
+        let (disc, values) = ws_two_column_ts_payload(
+            message,
+            expected.len(),
+            QWP_TYPE_LONG,
+            QWP_TYPE_TIMESTAMP_NANOS,
+        );
+        assert_eq!(disc, 0x01, "regular intervals must gorilla-encode");
+        assert_eq!(values, expected);
+    }
+
+    #[cfg(all(feature = "_sender-qwp-ws", feature = "_egress"))]
+    #[test]
+    fn qwp_ws_message_gorilla_falls_back_to_raw_on_dod_overflow() {
+        let mut buf = QwpBuffer::new(127);
+        let base = 1_700_000_000_000_000_000i64;
+        // Jump of ~5 seconds in nanos: DoD ≈ 5e9 > i32::MAX → whole column raw.
+        let expected = vec![
+            base,
+            base + 1_000,
+            base + 5_000_000_000,
+            base + 5_000_001_000,
+        ];
+        for (i, &ts) in expected.iter().enumerate() {
+            buf.table("trades")
+                .unwrap()
+                .column_i64("qty", i as i64)
+                .unwrap();
+            buf.at(TimestampNanos::new(ts)).unwrap();
+        }
+        let mut scratch = QwpWsEncodeScratch::new();
+        let mut global_dict = SymbolGlobalDict::new();
+        buf.encode_ws_message(&mut scratch, &mut global_dict, QWP_VERSION_1)
+            .unwrap();
+        let message = &scratch.message;
+        assert_eq!(message[5] & QWP_FLAG_GORILLA, QWP_FLAG_GORILLA);
+        let (disc, values) = ws_two_column_ts_payload(
+            message,
+            expected.len(),
+            QWP_TYPE_LONG,
+            QWP_TYPE_TIMESTAMP_NANOS,
+        );
+        assert_eq!(disc, 0x00, "i32 DoD overflow must fall back to raw");
+        assert_eq!(values, expected);
+    }
+
+    #[cfg(all(feature = "_sender-qwp-ws", feature = "_egress"))]
+    #[test]
+    fn qwp_ws_replay_message_gorilla_encodes_designated_ts() {
+        let mut buf = QwpBuffer::new(127);
+        let base = 1_700_000_000_000_000_000i64;
+        let expected: Vec<i64> = (0..16).map(|i| base + i * 1_000_000).collect();
+        for (i, &ts) in expected.iter().enumerate() {
+            buf.table("trades")
+                .unwrap()
+                .column_i64("qty", i as i64)
+                .unwrap();
+            buf.at(TimestampNanos::new(ts)).unwrap();
+        }
+        let mut scratch = QwpWsEncodeScratch::new();
+        let mut global_dict = SymbolGlobalDict::new();
+        buf.encode_ws_replay_message(&mut scratch, &mut global_dict, QWP_VERSION_1)
+            .unwrap();
+        let message = &scratch.message;
+        assert_eq!(message[5] & QWP_FLAG_GORILLA, QWP_FLAG_GORILLA);
+        let (disc, values) = ws_two_column_ts_payload(
+            message,
+            expected.len(),
+            QWP_TYPE_LONG,
+            QWP_TYPE_TIMESTAMP_NANOS,
+        );
+        assert_eq!(disc, 0x01);
+        assert_eq!(values, expected);
+    }
+
+    #[test]
+    fn qwp_udp_datagram_stays_raw_without_gorilla_flag() {
+        let mut buf = QwpBuffer::new(127);
+        for i in 0..8i64 {
+            buf.table("trades").unwrap().column_i64("qty", i).unwrap();
+            buf.at(TimestampNanos::new(1_000_000 * i + 1)).unwrap();
+        }
+        let datagrams = buf.encode_datagrams(64 * 1024).unwrap();
+        assert_eq!(datagrams.len(), 1);
+        assert_eq!(
+            datagrams[0][5] & 0x04,
+            0,
+            "UDP frames must not set FLAG_GORILLA"
+        );
+        // Raw layout (no discriminators) must still parse cleanly.
+        decode_datagram(&datagrams[0]).unwrap();
     }
 
     #[cfg(feature = "_sender-qwp-ws")]
