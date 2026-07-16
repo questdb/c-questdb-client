@@ -35,11 +35,9 @@ use std::collections::VecDeque;
 use std::fs::{self, File, OpenOptions};
 use std::io;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicI64, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
-
-use memmap2::{MmapMut, MmapOptions};
 
 use crate::error;
 
@@ -47,7 +45,7 @@ use super::qwp_ws_driver::{DriverError, PublicationLog, SendCursor};
 use super::qwp_ws_queue::{OutboundFrame, QueueError, QwpReceipt, QwpReceiptStatus};
 use super::qwp_ws_sfa_segment::{
     FRAME_HEADER_SIZE, HEADER_SIZE, INITIAL_SEGMENT_FILE_NAME, SfaMappedPayload, SfaSegment,
-    SfaSegmentError, scan_file_metadata, spare_segment_path,
+    SfaSegmentError, read_exact_at, scan_file_metadata, spare_segment_path, write_all_at,
 };
 use super::qwp_ws_sfa_symbol_dict::PersistedSymbolDict;
 
@@ -1554,10 +1552,17 @@ struct RecoveredCompletion {
     ack_watermark: Option<SfaAckWatermark>,
 }
 
+/// The persisted ACK watermark record, kept via plain positional file I/O —
+/// deliberately never mmap'd. The record is a best-effort recovery hint
+/// (recovery falls back to the segments' own completed upper), so a failing
+/// file must degrade to "stop persisting", not SIGBUS the host on a write
+/// fault (ENOSPC into a sparse page, unreadable sector after a power loss).
 struct SfaAckWatermark {
-    _file: File,
-    mmap: MmapMut,
+    file: File,
     valid: bool,
+    /// Latched on the first failed write so a broken file is not re-poked on
+    /// every trim; the in-memory queue state remains authoritative.
+    disabled: bool,
 }
 
 impl std::fmt::Debug for SfaAckWatermark {
@@ -1576,34 +1581,36 @@ impl SfaAckWatermark {
             .write(true)
             .open(path)
             .ok()?;
-        if file.metadata().ok()?.len() < ACK_WATERMARK_SIZE
-            && file.set_len(ACK_WATERMARK_SIZE).is_err()
-        {
-            return None;
+        if file.metadata().ok()?.len() < ACK_WATERMARK_SIZE {
+            // Write real zeroes rather than `set_len`: an explicit write
+            // allocates the record's blocks up front, so a full disk fails
+            // here (where `open` already degrades to `None`) instead of at
+            // some later persist.
+            write_all_at(&file, &[0u8; ACK_WATERMARK_SIZE as usize], 0).ok()?;
         }
-        // SAFETY: the SFA slot lock gives this process exclusive write access
-        // to the slot. The queue reads and writes only the first fixed-size
-        // watermark record.
-        let mmap = unsafe {
-            MmapOptions::new()
-                .len(ACK_WATERMARK_SIZE as usize)
-                .map_mut(&file)
-                .ok()?
-        };
-        let valid = decode_ack_watermark(&mmap).is_some();
+        let valid = Self::read_record(&file).is_some();
         Some(Self {
-            _file: file,
-            mmap,
+            file,
             valid,
+            disabled: false,
         })
     }
 
+    fn read_record(file: &File) -> Option<u64> {
+        let mut record = [0u8; ACK_WATERMARK_SIZE as usize];
+        read_exact_at(file, &mut record, 0).ok()?;
+        decode_ack_watermark(&record)
+    }
+
     fn recovered_fsn(&self) -> Option<u64> {
-        decode_ack_watermark(&self.mmap)
+        Self::read_record(&self.file)
     }
 
     fn invalidate(&mut self) {
-        self.store_u32(0, 0);
+        // Best-effort: a failed zeroing is safe because the recovery check
+        // that requested this invalidation re-detects the bogus record on
+        // the next recovery too.
+        self.write_at(0, &0u32.to_le_bytes());
         self.valid = false;
     }
 
@@ -1611,29 +1618,23 @@ impl SfaAckWatermark {
         let Ok(fsn) = i64::try_from(fsn) else {
             return;
         };
-        self.store_fsn(fsn);
-        if !self.valid {
-            self.store_u32(4, 0);
-            self.store_u32(0, ACK_WATERMARK_MAGIC);
-            self.valid = true;
+        // FSN first, magic last: the record only becomes decodable once the
+        // FSN bytes are in place, matching the previous mmap store ordering.
+        self.write_at(8, &fsn.to_le_bytes());
+        if !self.valid && !self.disabled {
+            self.write_at(4, &0u32.to_le_bytes());
+            self.write_at(0, &ACK_WATERMARK_MAGIC.to_le_bytes());
+            self.valid = !self.disabled;
         }
     }
 
-    fn store_fsn(&mut self, fsn: i64) {
-        let ptr = unsafe { self.mmap.as_mut_ptr().add(8).cast::<i64>() };
-        debug_assert_eq!((ptr as usize) % std::mem::align_of::<AtomicI64>(), 0);
-        // SAFETY: the mmap covers at least ACK_WATERMARK_SIZE bytes, offset 8
-        // is 8-byte aligned because mmap mappings are page-aligned, and slot
-        // locking gives this process exclusive write access.
-        unsafe { AtomicI64::from_ptr(ptr).store(fsn.to_le(), Ordering::Relaxed) };
-    }
-
-    fn store_u32(&mut self, offset: usize, value: u32) {
-        let ptr = unsafe { self.mmap.as_mut_ptr().add(offset).cast::<u32>() };
-        debug_assert_eq!((ptr as usize) % std::mem::align_of::<AtomicU32>(), 0);
-        // SAFETY: callers pass fixed 4-byte-aligned offsets within the
-        // watermark record, and slot locking gives exclusive write access.
-        unsafe { AtomicU32::from_ptr(ptr).store(value.to_le(), Ordering::Release) };
+    fn write_at(&mut self, offset: u64, bytes: &[u8]) {
+        if self.disabled {
+            return;
+        }
+        if write_all_at(&self.file, bytes, offset).is_err() {
+            self.disabled = true;
+        }
     }
 }
 
@@ -2836,6 +2837,34 @@ mod tests {
             stale.payload_vec_for_fsn(5).as_deref(),
             Some(&b"survivor"[..])
         );
+    }
+
+    #[test]
+    fn ack_watermark_round_trips_through_plain_file_io() {
+        // The watermark is kept via positional file I/O (never mmap'd), so a
+        // failing disk degrades to an Err/no-op instead of a SIGBUS. Pin the
+        // full lifecycle: fresh open, persist, reopen, invalidate, re-persist.
+        let dir = TempDir::new().unwrap();
+
+        let mut watermark = SfaAckWatermark::open(dir.path()).unwrap();
+        assert_eq!(watermark.recovered_fsn(), None);
+        watermark.persist_completed_fsn(42);
+        assert_eq!(watermark.recovered_fsn(), Some(42));
+        drop(watermark);
+
+        let mut reopened = SfaAckWatermark::open(dir.path()).unwrap();
+        assert_eq!(reopened.recovered_fsn(), Some(42));
+        reopened.invalidate();
+        assert_eq!(reopened.recovered_fsn(), None);
+        drop(reopened);
+        assert_eq!(recovered_ack_watermark_fsn(dir.path()), None);
+
+        // A persist after invalidation rewrites the whole record (FSN before
+        // magic, so a torn write never yields a decodable half-record).
+        let mut again = SfaAckWatermark::open(dir.path()).unwrap();
+        again.persist_completed_fsn(7);
+        drop(again);
+        assert_eq!(recovered_ack_watermark_fsn(dir.path()), Some(7));
     }
 
     #[test]
