@@ -351,6 +351,16 @@ required-features = ["sync-sender-qwp-ws", "arrow-ingress"]
 name = "qwp_ws_l1_quotes"
 required-features = ["sync-sender-qwp-ws"]
 
+# One Arc-shared QuestDb pool driving an ingestion thread and a query thread
+# concurrently: per-thread borrows, an AckLevel::Ok watermark, and the
+# WAL-apply lag between "acked" and "queryable". Run with:
+#
+#   cargo run --release --example qwp_ws_shared_pool \
+#       --features sync-sender-qwp-ws,sync-reader-qwp-ws
+[[example]]
+name = "qwp_ws_shared_pool"
+required-features = ["sync-sender-qwp-ws", "sync-reader-qwp-ws"]
+
 [[example]]
 name = "polars"
 required-features = ["polars", "sync-sender-qwp-ws"]
