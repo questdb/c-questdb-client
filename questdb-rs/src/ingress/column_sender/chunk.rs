@@ -22,15 +22,16 @@
  *
  ******************************************************************************/
 
-//! Column-major chunk: one DataFrame's worth of borrowed column buffers
-//! destined for a single QuestDB table.
+//! Column-major chunk: one batch of borrowed column buffers destined for a
+//! single QuestDB table.
 //!
-//! `Chunk<'a>` stores **descriptors** — raw pointers + lengths + an
-//! optional validity bitmap — for each column. No data is copied at
-//! append time. Caller buffers must remain alive from
-//! [`PooledSenderCore::flush`](super::PooledSenderCore::flush) call setup until
-//! the call returns; the lifetime parameter `'a` enforces this on the
-//! safe Rust API.
+//! `Chunk<'a>` stores **descriptors** — raw pointers, lengths, and optional
+//! validity bitmaps — for borrowed columns. No data is copied when columns are
+//! appended.
+//!
+//! For each batch, create the backing buffers first, then create and populate a
+//! `Chunk`, flush it, and let the chunk go out of scope before the backing
+//! buffers.
 //!
 //! At flush time, the [`encoder`](super::encoder) walks the descriptors
 //! and writes wire bytes straight into the connection's reusable write
@@ -604,15 +605,15 @@ pub(crate) struct DesignatedTsDescriptor {
 // Chunk
 // ===========================================================================
 
-/// One DataFrame's worth of borrowed column buffers destined for one
-/// QuestDB table.
+/// A single-batch view over borrowed column buffers for one QuestDB table.
 ///
-/// The lifetime parameter `'a` ties the chunk to every column buffer
-/// passed in through `column_*` / `symbol_dict_*`. Each call validates
-/// inputs and stores a descriptor referencing the caller's buffer; no
-/// data is copied. The caller's buffers must outlive the chunk —
-/// concretely, they must remain alive from each column append through
-/// the next [`PooledSenderCore::flush`](super::PooledSenderCore::flush) call.
+/// The lifetime parameter `'a` is shared by the buffers passed to the borrowed
+/// `column_*` and `symbol_dict_*` methods. Each method stores a descriptor
+/// referencing caller-owned data; no data is copied when the column is
+/// appended.
+///
+/// Create a new `Chunk` for each batch. Create the backing buffers first,
+/// populate and flush the chunk, and then let the chunk go out of scope.
 pub struct Chunk<'a> {
     pub(crate) table: String,
     pub(crate) row_count: Option<usize>,
@@ -653,9 +654,22 @@ impl<'a> Chunk<'a> {
         self.row_count.is_none() && self.designated_ts.is_none()
     }
 
-    /// Reset the chunk for reuse. Drops descriptors but keeps the
-    /// `Vec<ColumnDescriptor>` capacity so the next chunk fills the same
+    /// Reset the chunk. Drops descriptors but keeps the
+    /// `Vec<ColumnDescriptor>` capacity so the next batch fills the same
     /// slots without reallocating the outer Vec.
+    ///
+    /// In safe Rust, this doesn't allow you to reuse the chunk to
+    /// stream unbounded data. The lifetime parameter `'a` is fixed for
+    /// the chunk's whole life, so every buffer ever appended must stay
+    /// alive as long as the chunk — clearing drops the descriptors, but
+    /// the borrow checker still holds the input data borrowed for `'a`.
+    /// To let each batch's buffers be freed as you go, create a fresh
+    /// `Chunk` per batch.
+    ///
+    /// The function is public because callers who erase the lifetime and
+    /// manage buffer validity manually — the flush path, and the FFI
+    /// reuse path (`column_sender_chunk_clear`) — do reuse the same
+    /// `Chunk` and rely on retaining its capacity.
     pub fn clear(&mut self) {
         self.row_count = None;
         self.columns.clear();

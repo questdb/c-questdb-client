@@ -174,9 +174,18 @@ fn main() -> questdb::Result<()> {
     let db = QuestDb::connect(&conf)?;
     let mut sender = db.borrow_sender()?;
 
-    // One chunk reused across flushes — the bench design exists exactly
-    // for this case: per-column `Vec<u8>` capacity is retained across
-    // flush().
+    // A chunk borrows its column buffers for its entire lifetime, so a
+    // single chunk can only be reused across flushes when every buffer it
+    // ever borrows stays alive that whole time. That holds here because the
+    // full dataset is generated up front and kept in memory: each flush
+    // borrows a slice of the same long-lived arrays. `flush()` clears the
+    // chunk in place, retaining its `Vec<ColumnDescriptor>` capacity so each
+    // batch refills the same descriptor slots without reallocating.
+    //
+    // Reuse like this is only feasible when the entire dataset is resident
+    // for the chunk's lifetime. A source that streams data in bounded
+    // batches must instead create a fresh chunk per batch, so each batch's
+    // buffers can be released once its flush returns.
     let mut chunk = Chunk::new(&table_name);
 
     let mut chunk_micros: Vec<u128> = Vec::new();
