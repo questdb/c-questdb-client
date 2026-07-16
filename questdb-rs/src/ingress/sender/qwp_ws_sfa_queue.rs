@@ -954,7 +954,9 @@ impl SfaProducer {
             // still unused. Store-and-forward must keep absorbing appends up
             // to `max_bytes` through exactly that kind of outage, so allocate
             // the replacement segment inline instead.
-            None => self.engine.allocate_segment_inline(&mut state, self.next_fsn)?,
+            None => self
+                .engine
+                .allocate_segment_inline(&mut state, self.next_fsn)?,
         };
 
         let old_active = state.active.replace(Arc::clone(&new_active)).unwrap();
@@ -1251,7 +1253,12 @@ impl SfaEngine {
         let segment = match self.slot_dir.as_deref() {
             Some(slot_dir) => {
                 let path = next_segment_path(slot_dir, &mut state.next_generation)?;
-                SfaSegment::create_new(&path, base_seq, self.segment_size_bytes, unix_time_micros())?
+                SfaSegment::create_new(
+                    &path,
+                    base_seq,
+                    self.segment_size_bytes,
+                    unix_time_micros(),
+                )?
             }
             None => {
                 state.next_generation = state
@@ -1995,10 +2002,19 @@ fn unix_time_micros() -> u64 {
         .unwrap_or(0)
 }
 
-fn segment_payload_capacity(segment_size_bytes: u64) -> usize {
+pub(crate) fn segment_payload_capacity(segment_size_bytes: u64) -> usize {
     segment_size_bytes
         .saturating_sub((HEADER_SIZE + FRAME_HEADER_SIZE) as u64)
         .min(usize::MAX as u64) as usize
+}
+
+/// Largest per-frame payload that still lets two frames share one segment
+/// (`HEADER_SIZE + 2 * (FRAME_HEADER_SIZE + payload) <= segment_size_bytes`).
+/// The publish split valve targets this size so split output amortizes
+/// segment rotation over at least two frames instead of forcing a fresh
+/// segment allocation per near-cap frame.
+pub(crate) fn two_frame_segment_payload_capacity(segment_size_bytes: u64) -> usize {
+    segment_payload_capacity(segment_size_bytes).saturating_sub(FRAME_HEADER_SIZE) / 2
 }
 
 fn first_unresolved_fsn_from_segments(
@@ -2073,6 +2089,27 @@ mod tests {
 
     fn open(dir: &TempDir) -> SfaFrameQueue {
         SfaFrameQueue::open(options(dir)).unwrap()
+    }
+
+    #[test]
+    fn two_frame_payload_capacity_is_maximal_two_frame_packing() {
+        for segment_size in [256u64, 4096, 4 * 1024 * 1024, 4 * 1024 * 1024 + 1] {
+            let cap = two_frame_segment_payload_capacity(segment_size);
+            let two_frames = (HEADER_SIZE + 2 * (FRAME_HEADER_SIZE + cap)) as u64;
+            assert!(
+                two_frames <= segment_size,
+                "two capped frames must fit one {segment_size}-byte segment"
+            );
+            let over = (HEADER_SIZE + 2 * (FRAME_HEADER_SIZE + cap + 1)) as u64;
+            assert!(
+                over > segment_size,
+                "cap must be maximal for a {segment_size}-byte segment"
+            );
+            assert!(
+                cap <= segment_payload_capacity(segment_size),
+                "two-frame cap can never exceed the single-frame cap"
+            );
+        }
     }
 
     fn submit_with_storage_maintenance(queue: &mut SfaFrameQueue, payload: &[u8]) -> QwpReceipt {
@@ -3202,7 +3239,9 @@ mod tests {
         assert_eq!(sfa_file_count(dir.path()), 4);
         assert!(matches!(
             producer.try_submit(b"fiv"),
-            Err(SfaQueueError::Queue(QueueError::StorageSegmentCapFull { .. }))
+            Err(SfaQueueError::Queue(
+                QueueError::StorageSegmentCapFull { .. }
+            ))
         ));
         assert_eq!(queue.payload_vec_for_fsn(2).as_deref(), Some(&b"tri"[..]));
         assert_eq!(queue.payload_vec_for_fsn(3).as_deref(), Some(&b"for"[..]));

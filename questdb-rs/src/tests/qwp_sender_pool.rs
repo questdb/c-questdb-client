@@ -2483,6 +2483,115 @@ fn store_and_forward_flush_splits_oversize_chunk_into_self_sufficient_frames() {
     );
 }
 
+#[test]
+fn store_and_forward_split_valve_engages_at_segment_cap_not_max_buf_size() {
+    // Regression: the split valve compared against max_buf_size (100 MiB
+    // default) while the store-and-forward queue rejects any frame above the
+    // sf_max_bytes-derived segment payload capacity. A flush between the two
+    // caps hard-failed with PayloadExceedsByteCapacity instead of splitting.
+    // max_buf_size is deliberately left at its default so the segment cap is
+    // the binding limit.
+    const SEGMENT: usize = 2048;
+    // Segment payload capacity: SEGMENT minus the 24-byte segment header and
+    // one 8-byte frame header; the split target halves the remainder after a
+    // second frame header so two frames pack per segment.
+    const SPLIT_TARGET: usize = (SEGMENT - 32 - 8) / 2;
+    const ROWS: usize = 512;
+
+    let (server, frames) = MockServer::spawn_acking_capturing(1);
+    let conf = conf_for(
+        server.port(),
+        &format!("sf_max_bytes={SEGMENT};pool_reap=manual;"),
+    );
+    let db = QuestDb::connect(&conf).unwrap();
+
+    let qty: Vec<i64> = (0..ROWS as i64).collect();
+    let ts: Vec<i64> = (0..ROWS as i64)
+        .map(|x| 1_700_000_000_000_000_000 + x)
+        .collect();
+    let mut chunk = Chunk::new("trades");
+    chunk.column_i64("qty", &qty, None).unwrap();
+    chunk.at_nanos(&ts).unwrap();
+
+    let mut sender = db.borrow_sender().unwrap();
+    let fsn = sender
+        .flush_and_get_fsn(&mut chunk)
+        .expect("a flush above the segment cap must split, not hard-fail")
+        .expect("non-empty chunk publishes a frame");
+    sender
+        .wait(AckLevel::Ok, Duration::from_secs(30))
+        .expect("all split frames commit");
+
+    let mut captured = Vec::new();
+    while let Ok(frame) = frames.recv_timeout(Duration::from_millis(500)) {
+        captured.push(frame);
+    }
+    assert!(
+        captured.len() > 1,
+        "flush above the segment cap must split into multiple frames, got {}",
+        captured.len()
+    );
+    assert_eq!(
+        fsn as usize,
+        captured.len() - 1,
+        "returned FSN must be the last split frame boundary"
+    );
+    for (i, frame) in captured.iter().enumerate() {
+        assert!(
+            frame.len() <= SPLIT_TARGET,
+            "frame {i} is {} bytes; split frames must pack two per segment \
+             (<= {SPLIT_TARGET} bytes)",
+            frame.len()
+        );
+    }
+    let total: u64 = captured.iter().map(|f| frame_row_count(f)).sum();
+    assert_eq!(
+        total, ROWS as u64,
+        "split frames must cover every row exactly once"
+    );
+}
+
+#[test]
+fn store_and_forward_irreducible_frame_over_segment_cap_is_batch_too_large() {
+    // At the split floor the hard cap (the segment payload capacity here)
+    // decides: an irreducible single-row frame above it must surface a clean
+    // BatchTooLarge naming the per-frame cap. Before the fix it sailed past
+    // the max_buf_size-only check and died on the queue's internal
+    // PayloadExceedsByteCapacity rejection instead.
+    const SEGMENT: usize = 2048;
+    let server = MockServer::spawn_acking(1);
+    let conf = conf_for(
+        server.port(),
+        &format!("sf_max_bytes={SEGMENT};pool_reap=manual;"),
+    );
+    let db = QuestDb::connect(&conf).unwrap();
+
+    let big = "x".repeat(SEGMENT * 2);
+    let offsets = [0i32, big.len() as i32];
+    let ts = [1_700_000_000_000_000_000i64];
+    let mut chunk = Chunk::new("trades");
+    chunk
+        .column_str("v", &offsets, big.as_bytes(), None)
+        .unwrap();
+    chunk.at_nanos(&ts).unwrap();
+
+    let mut sender = db.borrow_sender().unwrap();
+    let err = sender
+        .flush_and_get_fsn(&mut chunk)
+        .expect_err("an irreducible over-cap row must fail the flush");
+    assert_eq!(err.code(), ErrorCode::BatchTooLarge);
+    assert!(
+        err.msg().contains("per-frame cap"),
+        "size error must name the binding per-frame cap, got: {}",
+        err.msg()
+    );
+    assert_eq!(
+        sender.published_fsn().unwrap(),
+        None,
+        "nothing may be queued for a rejected irreducible frame"
+    );
+}
+
 fn check_store_and_forward_drop_on_return_drops_backend_and_reopens_on_next_borrow(extras: &str) {
     let server = MockServer::spawn(4);
     let conf = conf_for_endpoints(&[server.port()], extras);

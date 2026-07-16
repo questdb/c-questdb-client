@@ -64,7 +64,10 @@ use super::qwp_ws_orphan::{
 use super::qwp_ws_ownership::QwpWsSenderError;
 use super::qwp_ws_publisher::{QwpWsReplayEncoder, qwp_ws_encoded_message_size_error};
 use super::qwp_ws_queue::OutboundFrame;
-use super::qwp_ws_sfa_queue::{SfaMemoryQueueOptions, SfaProducer, SfaProgressView, SfaQueueError};
+use super::qwp_ws_sfa_queue::{
+    SfaMemoryQueueOptions, SfaProducer, SfaProgressView, SfaQueueError, segment_payload_capacity,
+    two_frame_segment_payload_capacity,
+};
 use super::qwp_ws_sfa_slot::{SfaSlotOptions, SfaSlotQueue};
 use super::qwp_ws_sfa_symbol_dict::PersistedSymbolDict;
 
@@ -228,6 +231,16 @@ pub(crate) struct SyncQwpWsHandlerState {
     runner: SyncQwpWsRunner,
     pub(crate) server_max_batch_size: Arc<AtomicUsize>,
     pub(crate) request_durable_ack: bool,
+    /// Hard cap on a single store-and-forward frame's payload: `sf_max_bytes`
+    /// minus the segment and frame headers. The queue rejects anything larger,
+    /// so publishers must size-check and split against THIS bound —
+    /// `max_buf_size` (100 MiB default) sits far above it and never binds
+    /// first.
+    pub(crate) sfa_frame_payload_cap: usize,
+    /// Split target for oversize flushes: the largest payload that still packs
+    /// two frames per segment, so split output amortizes segment rotation
+    /// instead of forcing a fresh segment per near-cap frame.
+    pub(crate) sfa_frame_split_target: usize,
     orphan_pool: Option<OrphanDrainerPool>,
     close_drain_timeout: Duration,
     /// Whether the background driver enabled its symbol-dict catch-up mirror
@@ -3174,6 +3187,8 @@ pub(crate) fn connect_qwp_ws_background_state(
         runner,
         server_max_batch_size,
         request_durable_ack: *qwp_ws.request_durable_ack,
+        sfa_frame_payload_cap: segment_payload_capacity(*qwp_ws.sf_max_bytes),
+        sfa_frame_split_target: two_frame_segment_payload_capacity(*qwp_ws.sf_max_bytes),
         orphan_pool,
         close_drain_timeout: *qwp_ws.close_flush_timeout,
         delta_dict_enabled,

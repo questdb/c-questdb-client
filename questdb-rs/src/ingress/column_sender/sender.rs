@@ -49,7 +49,6 @@ use super::arrow_batch::{self, ArrowColumnOverride, ArrowTsSource};
 use super::chunk::Chunk;
 use super::conn::{ColumnConn, PublishError};
 use super::encoder;
-use super::qwp_frame_size_error;
 
 #[cfg(feature = "arrow-ingress")]
 use arrow::array::RecordBatch;
@@ -97,6 +96,49 @@ fn split_mid(row_count: usize) -> Option<usize> {
     }
     let mid = (row_count / 2) & !7;
     Some(if mid == 0 { 8 } else { mid })
+}
+
+/// Per-frame payload caps for the store-and-forward publish path, derived once
+/// per flush by [`SfaBackend::effective_frame_caps`].
+#[derive(Clone, Copy)]
+struct SfaFrameCaps {
+    /// The binding single-frame limit: the negotiated `max_buf_size` clamped
+    /// to the store-and-forward segment payload capacity. The queue rejects
+    /// any larger frame outright, so the split valve must trip against this
+    /// bound — comparing against `max_buf_size` alone (100 MiB default) left
+    /// it dead below the segment cap, turning splittable flushes into hard
+    /// `PayloadExceedsByteCapacity` failures.
+    hard: usize,
+    /// Split target: at most the two-frames-per-segment payload size, so
+    /// split output amortizes segment rotation instead of emitting one
+    /// near-cap frame per segment. Never exceeds `hard`.
+    soft: usize,
+}
+
+impl SfaFrameCaps {
+    /// Cap for one publish attempt: the split target while the range can
+    /// still split; the hard cap at the 8-row floor, where splitting is no
+    /// longer an option and only the binding limit matters.
+    fn for_range(self, row_count: usize) -> usize {
+        if split_mid(row_count).is_some() {
+            self.soft
+        } else {
+            self.hard
+        }
+    }
+}
+
+/// A store-and-forward frame exceeded `frame_cap` with no way left to split.
+/// Names both contributing limits so the caller adjusts the knob that
+/// actually binds (`sf_max_bytes` when the segment cap is the smaller one).
+fn sfa_frame_size_error(encoded_len: usize, frame_cap: usize) -> crate::Error {
+    error::fmt!(
+        BatchTooLarge,
+        "QWP frame ({} bytes) exceeds the store-and-forward per-frame cap ({} bytes, \
+         the smaller of max_buf_size and the sf_max_bytes segment payload capacity)",
+        encoded_len,
+        frame_cap
+    )
 }
 
 /// Whether a flush also waits for a server completion boundary at the
@@ -1416,7 +1458,9 @@ impl SfaBackend {
             return Ok(None);
         }
 
-        let max_buf_size = self.effective_max_buf_size();
+        // A Buffer is one indivisible publication (no row-range slicing), so
+        // only the hard cap applies — there is no split to soft-target.
+        let frame_cap = self.effective_frame_caps().hard;
         let Self {
             foreground,
             state,
@@ -1425,7 +1469,7 @@ impl SfaBackend {
         } = self;
         match foreground
             .encode_persist_publish(
-                max_buf_size,
+                frame_cap,
                 |payload, symbol_dict, delta_enabled| {
                     buffer.encode_ws_replay_message_with_defer(
                         payload,
@@ -1436,7 +1480,7 @@ impl SfaBackend {
                         delta_enabled,
                     )
                 },
-                |payload| publish_qwp_ws_payload_background(state, payload, max_buf_size),
+                |payload| publish_qwp_ws_payload_background(state, payload, frame_cap),
             )
             .map_err(FlushFailure::NotDelivered)?
         {
@@ -1444,7 +1488,7 @@ impl SfaBackend {
             SfaPublishOutcome::TooLarge {
                 encoded_len,
                 max_buf_size,
-            } => Err(FlushFailure::NotDelivered(qwp_frame_size_error(
+            } => Err(FlushFailure::NotDelivered(sfa_frame_size_error(
                 encoded_len,
                 max_buf_size,
             ))),
@@ -1480,7 +1524,7 @@ impl SfaBackend {
         if let Err(e) = qwp_ws_check_error_background(&self.state) {
             return Err(FlushFailure::NotDelivered(e));
         }
-        let max_buf_size = self.effective_max_buf_size();
+        let caps = self.effective_frame_caps();
         // Whole-chunk fast path; only split when a single frame exceeds the cap.
         // Each split frame commits on its own (never deferred) — the
         // store-and-forward queue is frame-granular and at-least-once, so deferred
@@ -1489,27 +1533,28 @@ impl SfaBackend {
         // frame's FSN; its cumulative ack covers the prefix. (In delta mode the
         // frames are not individually self-sufficient; the driver re-registers the
         // dictionary via a catch-up frame on reconnect.)
-        let boundary = match self.publish_chunk_sfa(chunk, None, max_buf_size)? {
-            SfaPublishOutcome::Published(fsn) => fsn,
-            SfaPublishOutcome::TooLarge {
-                encoded_len,
-                max_buf_size,
-            } => {
-                let err = qwp_frame_size_error(encoded_len, max_buf_size);
-                let row_count = chunk.row_count();
-                match split_mid(row_count) {
-                    Some(mid) => {
-                        self.publish_split_sfa(chunk, 0, mid, max_buf_size)?;
-                        // The prefix is now durably queued (at-least-once); a
-                        // failure on the remainder leaves it enqueued, so the
-                        // chunk must not be reported as safe to blind-retry.
-                        self.publish_split_sfa(chunk, mid, row_count - mid, max_buf_size)
-                            .map_err(deny_retry_after_partial)?
+        let boundary =
+            match self.publish_chunk_sfa(chunk, None, caps.for_range(chunk.row_count()))? {
+                SfaPublishOutcome::Published(fsn) => fsn,
+                SfaPublishOutcome::TooLarge {
+                    encoded_len,
+                    max_buf_size,
+                } => {
+                    let err = sfa_frame_size_error(encoded_len, max_buf_size);
+                    let row_count = chunk.row_count();
+                    match split_mid(row_count) {
+                        Some(mid) => {
+                            self.publish_split_sfa(chunk, 0, mid, caps)?;
+                            // The prefix is now durably queued (at-least-once); a
+                            // failure on the remainder leaves it enqueued, so the
+                            // chunk must not be reported as safe to blind-retry.
+                            self.publish_split_sfa(chunk, mid, row_count - mid, caps)
+                                .map_err(deny_retry_after_partial)?
+                        }
+                        None => return Err(FlushFailure::NotDelivered(err)),
                     }
-                    None => return Err(FlushFailure::NotDelivered(err)),
                 }
-            }
-        };
+            };
         chunk.clear();
         if let WaitForAck::Yes(level) = wait {
             // The frame is in the local queue; a wait failure is delivery-unknown.
@@ -1527,7 +1572,7 @@ impl SfaBackend {
         &mut self,
         chunk: &Chunk<'_>,
         range: Option<(usize, usize)>,
-        max_buf_size: usize,
+        frame_cap: usize,
     ) -> std::result::Result<SfaPublishOutcome, FlushFailure> {
         let view;
         let target = match range {
@@ -1545,7 +1590,7 @@ impl SfaBackend {
         } = self;
         foreground
             .encode_persist_publish(
-                max_buf_size,
+                frame_cap,
                 |payload, symbol_dict, delta_enabled| {
                     if delta_enabled {
                         encoder::encode_chunk_into(payload, target, symbol_dict, scratch, false)
@@ -1553,7 +1598,7 @@ impl SfaBackend {
                         encoder::encode_chunk_replay_into(payload, target, symbol_dict, scratch)
                     }
                 },
-                |encoded| publish_qwp_ws_payload_background(state, encoded, max_buf_size),
+                |encoded| publish_qwp_ws_payload_background(state, encoded, frame_cap),
             )
             .map_err(FlushFailure::NotDelivered)
     }
@@ -1565,20 +1610,24 @@ impl SfaBackend {
         chunk: &Chunk<'_>,
         row_offset: usize,
         row_count: usize,
-        max_buf_size: usize,
+        caps: SfaFrameCaps,
     ) -> std::result::Result<u64, FlushFailure> {
-        match self.publish_chunk_sfa(chunk, Some((row_offset, row_count)), max_buf_size)? {
+        match self.publish_chunk_sfa(
+            chunk,
+            Some((row_offset, row_count)),
+            caps.for_range(row_count),
+        )? {
             SfaPublishOutcome::Published(fsn) => Ok(fsn),
             SfaPublishOutcome::TooLarge {
                 encoded_len,
                 max_buf_size,
             } => match split_mid(row_count) {
                 Some(mid) => {
-                    self.publish_split_sfa(chunk, row_offset, mid, max_buf_size)?;
-                    self.publish_split_sfa(chunk, row_offset + mid, row_count - mid, max_buf_size)
+                    self.publish_split_sfa(chunk, row_offset, mid, caps)?;
+                    self.publish_split_sfa(chunk, row_offset + mid, row_count - mid, caps)
                         .map_err(deny_retry_after_partial)
                 }
-                None => Err(FlushFailure::NotDelivered(qwp_frame_size_error(
+                None => Err(FlushFailure::NotDelivered(sfa_frame_size_error(
                     encoded_len,
                     max_buf_size,
                 ))),
@@ -1626,7 +1675,7 @@ impl SfaBackend {
         if let Err(e) = qwp_ws_check_error_background(&self.state) {
             return Err(FlushFailure::NotDelivered(e));
         }
-        let max_buf_size = self.effective_max_buf_size();
+        let caps = self.effective_frame_caps();
         let spec = ArrowFrameSpec {
             table,
             batch,
@@ -1635,25 +1684,26 @@ impl SfaBackend {
         };
         // Whole-batch fast path; split into self-sufficient frames only when one
         // exceeds the cap (see the rationale on `flush_chunk`).
-        let boundary = match self.publish_arrow_sfa(&spec, None, max_buf_size)? {
-            SfaPublishOutcome::Published(fsn) => fsn,
-            SfaPublishOutcome::TooLarge {
-                encoded_len,
-                max_buf_size,
-            } => {
-                let err = qwp_frame_size_error(encoded_len, max_buf_size);
-                let row_count = batch.num_rows();
-                match split_mid(row_count) {
-                    Some(mid) => {
-                        self.publish_arrow_split_sfa(&spec, 0, mid, max_buf_size)?;
-                        // Prefix is durably queued; see `flush_chunk_boundary`.
-                        self.publish_arrow_split_sfa(&spec, mid, row_count - mid, max_buf_size)
-                            .map_err(deny_retry_after_partial)?
+        let boundary =
+            match self.publish_arrow_sfa(&spec, None, caps.for_range(batch.num_rows()))? {
+                SfaPublishOutcome::Published(fsn) => fsn,
+                SfaPublishOutcome::TooLarge {
+                    encoded_len,
+                    max_buf_size,
+                } => {
+                    let err = sfa_frame_size_error(encoded_len, max_buf_size);
+                    let row_count = batch.num_rows();
+                    match split_mid(row_count) {
+                        Some(mid) => {
+                            self.publish_arrow_split_sfa(&spec, 0, mid, caps)?;
+                            // Prefix is durably queued; see `flush_chunk_boundary`.
+                            self.publish_arrow_split_sfa(&spec, mid, row_count - mid, caps)
+                                .map_err(deny_retry_after_partial)?
+                        }
+                        None => return Err(FlushFailure::NotDelivered(err)),
                     }
-                    None => return Err(FlushFailure::NotDelivered(err)),
                 }
-            }
-        };
+            };
         if let WaitForAck::Yes(level) = wait {
             self.wait_for_boundary(level, boundary, self.sync_timeout)
                 .map_err(FlushFailure::DeliveryUnknown)?;
@@ -1667,7 +1717,7 @@ impl SfaBackend {
         &mut self,
         spec: &ArrowFrameSpec<'_>,
         range: Option<(usize, usize)>,
-        max_buf_size: usize,
+        frame_cap: usize,
     ) -> std::result::Result<SfaPublishOutcome, FlushFailure> {
         let sliced;
         let batch = match range {
@@ -1682,7 +1732,7 @@ impl SfaBackend {
         } = self;
         foreground
             .encode_persist_publish(
-                max_buf_size,
+                frame_cap,
                 |payload, symbol_dict, delta_enabled| {
                     if delta_enabled {
                         arrow_batch::encode_arrow_batch_into(
@@ -1705,7 +1755,7 @@ impl SfaBackend {
                         )
                     }
                 },
-                |payload| publish_qwp_ws_payload_background(state, payload, max_buf_size),
+                |payload| publish_qwp_ws_payload_background(state, payload, frame_cap),
             )
             .map_err(FlushFailure::NotDelivered)
     }
@@ -1718,25 +1768,24 @@ impl SfaBackend {
         spec: &ArrowFrameSpec<'_>,
         row_offset: usize,
         row_count: usize,
-        max_buf_size: usize,
+        caps: SfaFrameCaps,
     ) -> std::result::Result<u64, FlushFailure> {
-        match self.publish_arrow_sfa(spec, Some((row_offset, row_count)), max_buf_size)? {
+        match self.publish_arrow_sfa(
+            spec,
+            Some((row_offset, row_count)),
+            caps.for_range(row_count),
+        )? {
             SfaPublishOutcome::Published(fsn) => Ok(fsn),
             SfaPublishOutcome::TooLarge {
                 encoded_len,
                 max_buf_size,
             } => match split_mid(row_count) {
                 Some(mid) => {
-                    self.publish_arrow_split_sfa(spec, row_offset, mid, max_buf_size)?;
-                    self.publish_arrow_split_sfa(
-                        spec,
-                        row_offset + mid,
-                        row_count - mid,
-                        max_buf_size,
-                    )
-                    .map_err(deny_retry_after_partial)
+                    self.publish_arrow_split_sfa(spec, row_offset, mid, caps)?;
+                    self.publish_arrow_split_sfa(spec, row_offset + mid, row_count - mid, caps)
+                        .map_err(deny_retry_after_partial)
                 }
-                None => Err(FlushFailure::NotDelivered(qwp_frame_size_error(
+                None => Err(FlushFailure::NotDelivered(sfa_frame_size_error(
                     encoded_len,
                     max_buf_size,
                 ))),
@@ -1823,12 +1872,16 @@ impl SfaBackend {
         }
     }
 
-    fn effective_max_buf_size(&self) -> usize {
+    fn effective_frame_caps(&self) -> SfaFrameCaps {
         let server_max = self.state.server_max_batch_size.load(Ordering::Acquire);
-        if server_max == 0 {
+        let max_buf_size = if server_max == 0 {
             self.max_buf_size
         } else {
             self.max_buf_size.min(server_max)
+        };
+        SfaFrameCaps {
+            hard: max_buf_size.min(self.state.sfa_frame_payload_cap),
+            soft: max_buf_size.min(self.state.sfa_frame_split_target),
         }
     }
 }
@@ -1916,6 +1969,23 @@ mod tests {
                 "split point must make progress for count {count}"
             );
         }
+    }
+
+    #[test]
+    fn sfa_frame_caps_use_split_target_only_while_range_can_split() {
+        use super::SfaFrameCaps;
+
+        let caps = SfaFrameCaps {
+            hard: 1000,
+            soft: 400,
+        };
+        // At or below the 8-row split floor there is no split left to aim
+        // for: only the binding (hard) cap matters.
+        assert_eq!(caps.for_range(1), 1000);
+        assert_eq!(caps.for_range(8), 1000);
+        // Splittable ranges aim for the two-frames-per-segment target.
+        assert_eq!(caps.for_range(9), 400);
+        assert_eq!(caps.for_range(10_000), 400);
     }
 
     #[test]
