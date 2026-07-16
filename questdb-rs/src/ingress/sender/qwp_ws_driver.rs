@@ -765,7 +765,8 @@ impl<Q: PublicationLog> QwpWsPublicationStore<Q> {
         {
             return Some(error.clone());
         }
-        self.sender_errors.poll_overlapping(from_fsn, to_fsn, skipped)
+        self.sender_errors
+            .poll_overlapping(from_fsn, to_fsn, skipped)
     }
 
     pub(crate) fn drain_sender_errors(&mut self) -> Vec<QwpWsSenderError> {
