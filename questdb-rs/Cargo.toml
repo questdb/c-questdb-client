@@ -8,7 +8,7 @@ homepage = "https://questdb.com/"
 repository = "https://github.com/questdb/c-questdb-client"
 keywords = ["questdb", "ilp", "client-library"]
 categories = ["database"]
-authors = ["Adam Cimarosti <adam@questdb.io>"]
+authors = ["Vlad Ilyushchenko <vlad@questdb.com>"]
 
 [package.metadata.docs.rs]
 features = ["almost-all-features", "arrow", "polars"]
