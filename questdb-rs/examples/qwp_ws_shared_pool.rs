@@ -27,26 +27,12 @@
 //!
 //! Both threads run against the same table at the same time:
 //!
-//! * **ingest** publishes trades in batches, blocking for an
+//! * **ingest** publishes trades in batches through the column-major
+//!   [`Chunk`](questdb::ingress::column_sender::Chunk) API, blocking for an
 //!   [`AckLevel::Ok`] ack per batch, and publishes the acked row count to
 //!   `Progress`.
 //! * **query** polls the table for rows carrying this run's `run_id` and
 //!   prints how far query visibility trails the acked watermark.
-//!
-//! That gap is the point of the example. An `Ok` ack means the server
-//! accepted the frame, not that the rows are queryable: a WAL table applies
-//! writes asynchronously, so a row counted here was necessarily acked
-//! earlier, and the count converges on the acked total once ingestion stops.
-//! Bind the run marker into the query rather than reading a bare `count()`
-//! so a leftover table cannot fake progress.
-//!
-//! The reported lag is an upper bound. Both threads sample a moving system,
-//! so the printed figure carries the sampling skew between the query's
-//! snapshot and the watermark load (see `query`). Against a local server the
-//! true backlog is often zero — WAL apply keeps up with ingestion, and the
-//! poll simply observes the count tracking the watermark. The reason to poll
-//! is that visibility is not guaranteed at ack time, not that a lag is
-//! guaranteed to be observable.
 //!
 //! Schema (created by this example, dropping any previous run):
 //!     timestamp   TIMESTAMP  (designated)
@@ -74,12 +60,9 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use questdb::QuestDb;
 use questdb::egress::column::ColumnView;
 use questdb::egress::reader::Reader;
-use questdb::ingress::{AckLevel, TimestampNanos};
+use questdb::ingress::AckLevel;
+use questdb::ingress::column_sender::Chunk;
 
-/// `sender_pool_max` / `query_pool_max` are the real pool keys; the
-/// ingestion and query pools grow and cap independently. This example holds
-/// one sender borrow and one reader borrow at a time, so a cap of 2 each
-/// leaves headroom without opening connections it never uses.
 const DEFAULT_CONF: &str = "ws::addr=localhost:9000;sender_pool_max=2;query_pool_max=2;";
 const DEFAULT_TABLE: &str = "trades_shared_pool";
 const DEFAULT_TOTAL_ROWS: usize = 200_000;
@@ -173,8 +156,9 @@ fn main() -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-/// Publishes `total_rows` trades in `BATCH_ROWS` batches, blocking for an
-/// `Ok` ack per batch before advancing the watermark the query thread reads.
+/// Publishes `total_rows` trades in `BATCH_ROWS` batches through the
+/// column-major API, blocking for an `Ok` ack per batch before advancing the
+/// watermark the query thread reads.
 fn ingest(
     db: &QuestDb,
     progress: &Progress,
@@ -183,10 +167,25 @@ fn ingest(
     total_rows: usize,
 ) -> questdb::Result<()> {
     // Borrowed on this thread and used only here: `BorrowedSender` is not
-    // `Send`. The buffer is caller-owned data and is reused across flushes —
-    // `flush_buffer_and_wait` clears it but keeps its capacity.
+    // `Send`.
     let mut sender = db.borrow_sender()?;
-    let mut buffer = sender.new_buffer();
+
+    // A SYMBOL column travels as dictionary codes plus the dictionary itself,
+    // so the strings are encoded once per chunk rather than once per row. Both
+    // dictionaries are tiny, so `i8` codes address every entry.
+    let (sym_dict_offsets, sym_dict_bytes) = build_dict(SYMBOLS.iter().copied());
+    let (run_dict_offsets, run_dict_bytes) = build_dict([run_id]);
+    // `run_id` is constant for the run: one dictionary entry, and every row
+    // points at code 0. This never changes, so the same array serves every
+    // batch, sliced to the batch's length.
+    let run_codes = vec![0i8; BATCH_ROWS];
+
+    // Refilled per batch and reused across batches: `clear` keeps capacity, so
+    // steady-state ingestion allocates nothing here.
+    let mut symbol_codes: Vec<i8> = Vec::with_capacity(BATCH_ROWS);
+    let mut price: Vec<f64> = Vec::with_capacity(BATCH_ROWS);
+    let mut amount: Vec<f64> = Vec::with_capacity(BATCH_ROWS);
+    let mut ts_ns: Vec<i64> = Vec::with_capacity(BATCH_ROWS);
 
     let base_ts = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -196,26 +195,65 @@ fn ingest(
     let mut sent = 0usize;
     while sent < total_rows {
         let end = (sent + BATCH_ROWS).min(total_rows);
+
+        symbol_codes.clear();
+        price.clear();
+        amount.clear();
+        ts_ns.clear();
         for i in sent..end {
-            buffer
-                .table(table)?
-                .symbol("symbol", SYMBOLS[i % SYMBOLS.len()])?
-                .symbol("run_id", run_id)?
-                .column_f64("price", 2615.54 + (i % 1_000) as f64 * 0.01)?
-                .column_f64("amount", 0.00044 + (i % 97) as f64 * 0.00001)?
-                // Monotonic 1 ms ladder, so the run occupies a predictable
-                // window rather than colliding on a single instant.
-                .at(TimestampNanos::new(base_ts + i as i64 * 1_000_000))?;
+            symbol_codes.push((i % SYMBOLS.len()) as i8);
+            price.push(2615.54 + (i % 1_000) as f64 * 0.01);
+            amount.push(0.00044 + (i % 97) as f64 * 0.00001);
+            // Monotonic 1 ms ladder, so the run occupies a predictable
+            // window rather than colliding on a single instant.
+            ts_ns.push(base_ts + i as i64 * 1_000_000);
         }
 
+        // A chunk borrows its column buffers for its whole lifetime, so a
+        // source that generates data batch by batch builds a fresh chunk per
+        // batch: the borrow ends here and the next iteration is free to refill
+        // the same arrays. Reusing one chunk across flushes instead would pin
+        // those borrows for the entire loop.
+        let mut chunk = Chunk::new(table);
+        chunk.symbol_i8(
+            "symbol",
+            &symbol_codes,
+            &sym_dict_offsets,
+            &sym_dict_bytes,
+            None,
+        )?;
+        chunk.symbol_i8(
+            "run_id",
+            &run_codes[..end - sent],
+            &run_dict_offsets,
+            &run_dict_bytes,
+            None,
+        )?;
+        chunk.column_f64("price", &price, None)?;
+        chunk.column_f64("amount", &amount, None)?;
+        chunk.at_nanos(&ts_ns)?;
+
         // Publish, then block until the server acks every frame through this
-        // boundary. Highest throughput would be a bare `flush_buffer`, but
-        // this example wants an acked watermark to compare against.
-        sender.flush_buffer_and_wait(&mut buffer, AckLevel::Ok)?;
+        // boundary. Highest throughput would be a bare `flush`, but this
+        // example wants an acked watermark to compare against.
+        sender.flush_and_wait(&mut chunk, AckLevel::Ok)?;
         sent = end;
         progress.acked_rows.store(sent as u64, Ordering::Release);
     }
     Ok(())
+}
+
+/// Encodes strings into the Arrow-style dictionary layout the symbol columns
+/// take: a byte blob plus `n + 1` offsets, where entry `i` spans
+/// `offsets[i]..offsets[i + 1]`.
+fn build_dict<'a>(strings: impl IntoIterator<Item = &'a str>) -> (Vec<i32>, Vec<u8>) {
+    let mut offsets: Vec<i32> = vec![0];
+    let mut bytes: Vec<u8> = Vec::new();
+    for s in strings {
+        bytes.extend_from_slice(s.as_bytes());
+        offsets.push(bytes.len() as i32);
+    }
+    (offsets, bytes)
 }
 
 /// Polls for this run's rows until ingestion is done and every acked row is
