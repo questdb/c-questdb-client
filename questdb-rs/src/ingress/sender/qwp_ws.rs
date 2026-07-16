@@ -593,14 +593,20 @@ where
         &self,
         from_fsn: u64,
         to_fsn: u64,
+        skipped: &mut Vec<QwpWsSenderError>,
     ) -> crate::Result<Option<QwpWsSenderError>> {
         let mut store = self.lock_shared()?;
-        Ok(store.poll_sender_error_overlapping(from_fsn, to_fsn))
+        Ok(store.poll_sender_error_overlapping(from_fsn, to_fsn, skipped))
     }
 
     fn poll_sender_error(&self) -> crate::Result<Option<QwpWsSenderError>> {
         let mut store = self.lock_shared()?;
         Ok(store.poll_sender_error())
+    }
+
+    fn drain_sender_errors(&self) -> crate::Result<Vec<QwpWsSenderError>> {
+        let mut store = self.lock_shared()?;
+        Ok(store.drain_sender_errors())
     }
 
     fn poll_sender_error_notification(&self) -> crate::Result<Option<QwpWsSenderError>> {
@@ -3580,8 +3586,17 @@ pub(crate) fn qwp_ws_poll_sender_error_in_range_background(
     state: &SyncQwpWsHandlerState,
     from_fsn: u64,
     to_fsn: u64,
+    skipped: &mut Vec<QwpWsSenderError>,
 ) -> crate::Result<Option<QwpWsSenderError>> {
-    state.runner.poll_sender_error_overlapping(from_fsn, to_fsn)
+    state
+        .runner
+        .poll_sender_error_overlapping(from_fsn, to_fsn, skipped)
+}
+
+pub(crate) fn qwp_ws_drain_sender_errors_background(
+    state: &SyncQwpWsHandlerState,
+) -> crate::Result<Vec<QwpWsSenderError>> {
+    state.runner.drain_sender_errors()
 }
 
 pub(crate) fn qwp_ws_published_fsn_manual(

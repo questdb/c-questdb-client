@@ -48,7 +48,7 @@ use std::marker::PhantomData;
 use std::ops::{Deref, DerefMut};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
@@ -297,6 +297,10 @@ struct DbInner {
     /// reservation is rolled back. Paired with `reader_state`.
     #[cfg(feature = "_egress")]
     reader_cv: Condvar,
+    /// Server rejections no lease observed through `wait` before its
+    /// connection was re-leased, returned, or retired. Each one is also
+    /// logged at warn level when detected.
+    unobserved_rejections: AtomicU64,
     shutdown: AtomicBool,
 }
 
@@ -792,6 +796,7 @@ impl QuestDb {
             direct_cv: Condvar::new(),
             #[cfg(feature = "_egress")]
             reader_cv: Condvar::new(),
+            unobserved_rejections: AtomicU64::new(0),
             shutdown: AtomicBool::new(false),
             conn_events: Arc::new(conn_events),
         });
@@ -1040,6 +1045,16 @@ impl QuestDb {
     /// listener is registered.
     pub fn connection_events_delivered(&self) -> u64 {
         self.inner.conn_events.delivered()
+    }
+
+    /// Total server rejections that no lease observed through
+    /// [`BorrowedSender::wait`] before the rejecting connection was
+    /// re-leased, returned, or retired. Each is also logged at warn level.
+    /// The affected frames were not ingested; a non-zero delta means data
+    /// published through a lease that was closed without `wait` was dropped
+    /// by the server.
+    pub fn unobserved_rejections_total(&self) -> u64 {
+        self.inner.unobserved_rejections.load(Ordering::Relaxed)
     }
 
     /// Snapshot per-pool connection counts for diagnostics.
@@ -1660,10 +1675,14 @@ impl<'a> BorrowedSender<'a> {
         self.0.inner_ref().acked_fsn()
     }
 
-    /// Wait up to `timeout` for every frame published on this handle so far to
-    /// reach `ack_level`. Short-circuits when nothing is pending or the
-    /// watermark already covers the latest frame. `AckLevel::Durable` requires
-    /// the pool to have been opened with `request_durable_ack=on`.
+    /// Wait up to `timeout` for every frame published through this lease so
+    /// far to reach `ack_level`. Short-circuits when the lease published
+    /// nothing or the watermark already covers its latest frame. Frames
+    /// published by earlier leases of the same pooled connection are outside
+    /// this wait's scope; a rejection recorded for them is logged and counted
+    /// in [`QuestDb::unobserved_rejections_total`] instead of failing this
+    /// lease. `AckLevel::Durable` requires the pool to have been opened with
+    /// `request_durable_ack=on`.
     ///
     /// `timeout` is a no-progress deadline (it fires only if the ack watermark
     /// fails to advance for that long); `Duration::ZERO` waits indefinitely.
@@ -2406,7 +2425,56 @@ fn return_reader_to_pool(inner: &Arc<DbInner>, reader: Reader, must_close: bool)
 /// Pop a free connection or open a fresh one within `sender_pool_max`; at cap,
 /// wait up to `acquire_timeout_ms` for a return. Reserves the pool slot under
 /// one lock so a concurrent return can't race past the cap.
-fn pick_sender_inner<S>(
+/// Recyclability hooks shared by the store-and-forward and direct sender
+/// pools so `pick_sender_inner` can retire free-list entries that latched
+/// terminal state while parked instead of lending them out.
+trait PoolableSender {
+    fn is_stale(&self) -> bool;
+    fn on_retire(&mut self, inner: &DbInner) -> u64;
+}
+
+impl PoolableSender for PooledSenderCore {
+    fn is_stale(&self) -> bool {
+        self.must_close()
+    }
+
+    fn on_retire(&mut self, inner: &DbInner) -> u64 {
+        drain_sfa_before_drop(inner, self);
+        self.take_unobserved_rejections()
+    }
+}
+
+impl PoolableSender for DirectSenderCore {
+    fn is_stale(&self) -> bool {
+        self.must_close()
+    }
+
+    fn on_retire(&mut self, _inner: &DbInner) -> u64 {
+        0
+    }
+}
+
+fn report_unobserved_rejections(inner: &DbInner, count: u64) {
+    if count > 0 {
+        inner
+            .unobserved_rejections
+            .fetch_add(count, Ordering::Relaxed);
+    }
+}
+
+fn retire_stale_entry<S: PoolableSender>(inner: &Arc<DbInner>, entry: PoolEntry<S>) {
+    let _release = entry.slot_index.is_some().then_some(SenderSlotRelease {
+        inner: inner.as_ref(),
+        slot_index: entry.slot_index,
+        decrement_in_use: false,
+        decrement_closing: true,
+    });
+    let mut sender = entry.sender;
+    report_unobserved_rejections(inner, sender.on_retire(inner));
+    drop(sender);
+}
+
+fn pick_sender_inner<S: PoolableSender>(
     inner: &Arc<DbInner>,
     pool: &Mutex<PoolState<S>>,
     cv: &Condvar,
@@ -2425,6 +2493,15 @@ fn pick_sender_inner<S>(
                 ));
             }
             if let Some(entry) = state.free.pop() {
+                if entry.sender.is_stale() {
+                    if entry.slot_index.is_some() {
+                        state.closing += 1;
+                    }
+                    drop(state);
+                    retire_stale_entry(inner, entry);
+                    state = lock_state(pool);
+                    continue;
+                }
                 state.in_use += 1;
                 drop(state);
                 return Ok(PooledSender {
@@ -2484,9 +2561,11 @@ fn pick_sender_inner<S>(
 }
 
 fn pick_sfa_sender(inner: &Arc<DbInner>) -> Result<PooledSender<PooledSenderCore>> {
-    pick_sender_inner(inner, &inner.state, &inner.cv, true, |slot_index| {
+    let mut picked = pick_sender_inner(inner, &inner.state, &inner.cv, true, |slot_index| {
         connect_sfa_pool(inner, slot_index)
-    })
+    })?;
+    report_unobserved_rejections(inner, picked.sender.rebase_lease_observation());
+    Ok(picked)
 }
 
 fn pick_direct_sender(inner: &Arc<DbInner>) -> Result<PooledSender<DirectSenderCore>> {
@@ -2713,6 +2792,7 @@ fn return_sfa_to_pool(
     mut sender: PooledSenderCore,
     slot_index: Option<usize>,
 ) {
+    report_unobserved_rejections(inner, sender.take_unobserved_rejections());
     let must_close = sender.must_close();
     let release_slot;
     {
@@ -2743,6 +2823,7 @@ fn return_sfa_to_pool(
     // Not recycling: this connection and its background runner are about to be
     // dropped, so drain its queue first (bounded, outside the pool lock).
     drain_sfa_before_drop(inner, &mut sender);
+    report_unobserved_rejections(inner, sender.take_unobserved_rejections());
     drop(sender);
 }
 
@@ -2864,6 +2945,9 @@ fn drain_idle_senders(inner: &DbInner) -> usize {
     // frames (bounded by close_flush_timeout, shared across all of them) before
     // the runners are stopped on drop. Done outside the pool lock.
     drain_sfa_senders_bounded(inner, &mut to_drop);
+    for sender in &mut to_drop {
+        report_unobserved_rejections(inner, sender.take_unobserved_rejections());
+    }
     drop(to_drop);
     dropped
 }
@@ -2892,13 +2976,14 @@ fn drain_idle_readers(inner: &DbInner) -> usize {
 fn reap_idle_senders(inner: &DbInner) -> usize {
     let durable = inner.connector.request_durable_ack();
     let mut dropped = 0;
-    while let Some((sender, slot_index)) = take_reapable_column_sender(inner, durable) {
+    while let Some((mut sender, slot_index)) = take_reapable_column_sender(inner, durable) {
         let _release = slot_index.is_some().then_some(SenderSlotRelease {
             inner,
             slot_index,
             decrement_in_use: false,
             decrement_closing: true,
         });
+        report_unobserved_rejections(inner, sender.take_unobserved_rejections());
         drop(sender);
         dropped += 1;
     }

@@ -432,6 +432,13 @@ uint64_t questdb_db_connection_events_dropped(const questdb_db* db);
 QUESTDB_CLIENT_API
 uint64_t questdb_db_connection_events_delivered(const questdb_db* db);
 
+/** Total server rejections no lease observed through `qwp_sender_wait` (or a
+ *  waited flush) before the rejecting connection was re-leased, returned, or
+ *  retired. Each is also logged at warn level; the affected frames were not
+ *  ingested. `0` for a NULL `db`. */
+QUESTDB_CLIENT_API
+uint64_t questdb_db_unobserved_rejections_total(const questdb_db* db);
+
 /* -------------------------------------------------------------------------
  * Diagnostics: per-pool connection counts
  *
@@ -1539,6 +1546,12 @@ bool qwp_sender_acked_fsn(
     line_sender_error** err_out);
 
 /**
+ * Ack barrier scoped to this borrow: blocks until every frame published
+ * through it reaches `ack_level`. Frames published by earlier borrows of the
+ * same pooled connection are outside its scope; rejections recorded for them
+ * are logged and counted in `questdb_db_unobserved_rejections_total` instead
+ * of failing this borrow.
+ *
  * `ack_level` carries a `qwpws_ack_level_*` constant. The
  * parameter is `uint32_t` rather than `enum qwpws_ack_level` so
  * an out-of-range value returns `line_sender_error_invalid_api_call`

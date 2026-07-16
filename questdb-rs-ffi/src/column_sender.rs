@@ -1400,6 +1400,19 @@ pub unsafe extern "C" fn questdb_db_connection_events_delivered(db: *const quest
     db_ref.0.connection_events_delivered()
 }
 
+/// Total server rejections no lease observed through `qwp_sender_wait` (or a
+/// waited flush) before the rejecting connection was re-leased, returned, or
+/// retired. Each is also logged at warn level; the affected frames were not
+/// ingested. `0` for a NULL `db`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn questdb_db_unobserved_rejections_total(db: *const questdb_db) -> u64 {
+    if db.is_null() {
+        return 0;
+    }
+    let db_ref = unsafe { &*db };
+    db_ref.0.unobserved_rejections_total()
+}
+
 /// Per-pool connection counts, mirroring `questdb::DbgPoolCount`. Diagnostics
 /// only (soak / leak harnesses); the field set is not part of the stable ABI.
 #[repr(C)]
@@ -4763,9 +4776,12 @@ unsafe fn cs_wait_body<T: CsHandle>(
     true
 }
 
-/// Store-and-forward ack barrier: block until every frame published on `sender`
-/// so far reaches `ack_level`. The SFA queue owns delivery, so this is needed
-/// only to *observe* the ack, never for durability.
+/// Store-and-forward ack barrier: block until every frame published through
+/// this borrow of `sender` reaches `ack_level`. The SFA queue owns delivery,
+/// so this is needed only to *observe* the ack, never for durability. Frames
+/// published by earlier borrows of the same pooled connection are outside
+/// this wait's scope; rejections recorded for them are logged and counted in
+/// `questdb_db_unobserved_rejections_total` instead of failing this borrow.
 ///
 /// `timeout_millis` is a no-progress deadline (it fires only if the ack
 /// watermark fails to advance for that long); `0` waits indefinitely.

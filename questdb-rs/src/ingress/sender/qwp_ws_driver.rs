@@ -758,13 +758,18 @@ impl<Q: PublicationLog> QwpWsPublicationStore<Q> {
         &mut self,
         from_fsn: u64,
         to_fsn: u64,
+        skipped: &mut Vec<QwpWsSenderError>,
     ) -> Option<QwpWsSenderError> {
         if let Some(error) = self.terminal_sender_error.as_ref()
             && sender_error_overlaps(error, from_fsn, to_fsn)
         {
             return Some(error.clone());
         }
-        self.sender_errors.poll_overlapping(from_fsn, to_fsn)
+        self.sender_errors.poll_overlapping(from_fsn, to_fsn, skipped)
+    }
+
+    pub(crate) fn drain_sender_errors(&mut self) -> Vec<QwpWsSenderError> {
+        self.sender_errors.drain()
     }
 
     pub(crate) fn last_server_error(&self) -> Option<&QwpServerError> {
@@ -3665,7 +3670,12 @@ impl SenderErrorLog {
         }
     }
 
-    fn poll_overlapping(&mut self, from_fsn: u64, to_fsn: u64) -> Option<QwpWsSenderError> {
+    fn poll_overlapping(
+        &mut self,
+        from_fsn: u64,
+        to_fsn: u64,
+        skipped: &mut Vec<QwpWsSenderError>,
+    ) -> Option<QwpWsSenderError> {
         let mut next_seq = self.poll_next_seq.max(self.first_seq);
         while next_seq < self.next_seq {
             let index = (next_seq - self.first_seq) as usize;
@@ -3687,11 +3697,23 @@ impl SenderErrorLog {
                 self.discard_consumed_prefix();
                 return Some(error);
             }
+            skipped.push(error.clone());
         }
 
         self.poll_next_seq = next_seq;
         self.discard_consumed_prefix();
         None
+    }
+
+    /// Drain every unconsumed entry through the poll cursor, advancing the
+    /// notification cursor in lockstep so the prefix is discarded.
+    fn drain(&mut self) -> Vec<QwpWsSenderError> {
+        let mut drained = Vec::new();
+        while let Some(error) = self.poll() {
+            drained.push(error);
+        }
+        while self.poll_notification().is_some() {}
+        drained
     }
 
     fn discard_consumed_prefix(&mut self) {
@@ -8448,14 +8470,35 @@ mod tests {
         let overlapping = sender_error(1);
         let future = sender_error(3);
 
-        log.push(stale);
+        log.push(stale.clone());
         log.push(overlapping.clone());
         log.push(future.clone());
 
-        assert_eq!(log.poll_overlapping(1, 1), Some(overlapping));
-        assert_eq!(log.poll_overlapping(1, 1), None);
+        let mut skipped = Vec::new();
+        assert_eq!(log.poll_overlapping(1, 1, &mut skipped), Some(overlapping));
+        assert_eq!(skipped, vec![stale]);
+        skipped.clear();
+        assert_eq!(log.poll_overlapping(1, 1, &mut skipped), None);
+        assert!(skipped.is_empty());
         assert_eq!(log.poll(), Some(future));
         assert_eq!(log.poll(), None);
+    }
+
+    #[test]
+    fn sender_error_log_drain_consumes_both_cursors() {
+        let mut log = SenderErrorLog::new(4);
+        let first = sender_error(0);
+        let second = sender_error(1);
+
+        log.push(first.clone());
+        log.push(second.clone());
+        assert_eq!(log.poll(), Some(first));
+
+        assert_eq!(log.drain(), vec![second]);
+        assert_eq!(log.poll(), None);
+        assert_eq!(log.poll_notification(), None);
+        assert!(log.errors.is_empty());
+        assert_eq!(log.dropped_total(), 0);
     }
 
     #[test]

@@ -6924,6 +6924,74 @@ mod conn_event_tests {
     }
 }
 
+#[test]
+fn borrow_recheck_retires_connection_that_latched_terminal_while_parked() {
+    let server = MockServer::spawn_erroring(2, QWP_STATUS_SCHEMA_MISMATCH);
+    let db = QuestDb::connect(&conf_for(
+        server.port(),
+        "pool_reap=manual;sender_pool_max=2;close_flush_timeout_millis=0;",
+    ))
+    .unwrap();
+
+    {
+        let mut sender = db.borrow_sender().unwrap();
+        let mut buffer = one_symbol_buffer(&db, "alpha");
+        sender.flush_buffer(&mut buffer).unwrap();
+    }
+
+    assert!(
+        wait_until(Duration::from_secs(5), || {
+            let sender = db.borrow_sender().unwrap();
+            let fresh = !sender.must_close_for_test();
+            drop(sender);
+            server.accepted() >= 2 && fresh
+        }),
+        "borrow must retire the parked terminal connection and lend a fresh one"
+    );
+    assert!(
+        db.unobserved_rejections_total() >= 1,
+        "the rejection nobody waited for must reach the pool counter"
+    );
+}
+
+#[test]
+fn reborrowed_lease_wait_covers_only_its_own_publications() {
+    let (server, release_acks, frames) = MockServer::spawn_ack_when_released_capturing(1);
+    let db = QuestDb::connect(&conf_for(server.port(), "pool_reap=manual;")).unwrap();
+
+    {
+        let mut sender = db.borrow_sender().unwrap();
+        let mut buffer = one_symbol_buffer(&db, "alpha");
+        sender.flush_buffer(&mut buffer).unwrap();
+    }
+    frames
+        .recv_timeout(Duration::from_secs(5))
+        .expect("the peer must receive the first lease's frame");
+
+    let mut sender = db.borrow_sender().unwrap();
+    let start = Instant::now();
+    sender
+        .wait(AckLevel::Ok, Duration::from_secs(5))
+        .expect("a lease that published nothing has nothing to await");
+    assert!(
+        start.elapsed() < Duration::from_secs(1),
+        "wait must not block on the previous lease's unacked frame"
+    );
+
+    let mut buffer = one_symbol_buffer(&db, "bravo");
+    sender.flush_buffer(&mut buffer).unwrap();
+    let err = sender
+        .wait(AckLevel::Ok, Duration::from_millis(150))
+        .expect_err("the lease's own publication still awaits the withheld ack");
+    assert_eq!(err.code(), ErrorCode::FailoverRetry);
+
+    release_acks.store(true, Ordering::SeqCst);
+    sender
+        .wait(AckLevel::Ok, Duration::from_secs(30))
+        .expect("released acks must complete the lease's own frame");
+    assert_eq!(db.unobserved_rejections_total(), 0);
+}
+
 mod sender_conn_event_tests {
     use super::*;
     use crate::ingress::SenderBuilder;
