@@ -394,7 +394,7 @@ def check_compatibility(errors):
                 "durable ACK edition qualifier",
             ),
         ),
-        ROOT / "include" / "questdb" / "ingress" / "column_sender.h": (
+        ROOT / "include" / "questdb" / "ingress" / "qwp_sender.h": (
             (
                 "Enterprise-only\n * `qwpws_ack_level_durable`",
                 "durable ACK edition qualifier",

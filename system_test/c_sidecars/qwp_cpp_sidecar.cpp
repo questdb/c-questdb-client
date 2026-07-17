@@ -8,7 +8,7 @@
 // (`questdb::ingress::line_sender`, included from line_sender.hpp below) has NO
 // row-major QWP/WebSocket surface -- `line_sender::new_buffer()` deliberately
 // throws for `ws`/`wss` senders, steering WebSocket users to the
-// column-major `column_sender` API, and there is no public way to obtain a
+// column-major `qwp_sender` API, and there is no public way to obtain a
 // row buffer (`new_for_sender`) or the raw sender handle from the wrapper. A
 // C++ user who wants the ROW-MAJOR store-and-forward path therefore drops to
 // the C ABI -- which this sidecar does. The value of the c_client_cpp variant

@@ -627,7 +627,7 @@ line_sender_buffer* line_sender_buffer_new_qwp_with_max_name_len(
  * Construct a QWP/WebSocket `line_sender_buffer` with a fixed 127-byte name
  * length limit. For pooled ingestion, prefer `questdb_db_new_buffer` so the
  * buffer inherits the pool's configured name-length limit (see
- * `column_sender.h`).
+ * `qwp_sender.h`).
  */
 QUESTDB_CLIENT_API
 line_sender_buffer* line_sender_buffer_new_qwp_ws(void);

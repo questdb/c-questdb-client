@@ -38,7 +38,7 @@
 //! socket).
 //!
 //! Pure-Rust binaries are shielded by `std`'s startup `SIG_IGN`, but
-//! the FFI (`questdb-rs-ffi`, exposed as `reader_*`) is a `cdylib`
+//! the FFI (`questdb-rs-ffi`, exposed as `qwp_reader_*`) is a `cdylib`
 //! — that `SIG_IGN` is not installed when the library is loaded into a
 //! C/Python/etc. host. Python keeps `SIGPIPE` at `SIG_DFL`; a plain C
 //! program typically also leaves it default. Either would be killed.

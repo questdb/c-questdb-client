@@ -25,9 +25,15 @@
 /*
  * Unified QWP ingress sender and column-shaped payloads.
  *
- * This header is the authoritative C ABI. It reuses `line_sender_error*` from
- * `line_sender.h` for fallible-call error reporting; all opaque handles
- * are heap-allocated and freed through their dedicated entry points.
+ * This header is the authoritative C ABI for the ingress direction: the
+ * senders, buffers and chunks used to write rows, plus the pool entry points
+ * that lease them out. The pool itself — `questdb_db` and its lifecycle —
+ * lives in `questdb/client.h`, which this header includes, so an
+ * ingress-only consumer includes only this header.
+ *
+ * It reuses `line_sender_error*` from `line_sender.h` for fallible-call error
+ * reporting; all opaque handles are heap-allocated and freed through their
+ * dedicated entry points.
  *
  * Conventions:
  *  - Opaque handles must be non-NULL unless the function documentation
@@ -38,7 +44,7 @@
  *    `line_sender_error*` into `*err_out` on failure, so reusing the slot
  *    across calls without first calling `line_sender_error_free` on the
  *    previous value silently leaks the prior error box.
- *  - `column_sender_chunk` is owned by the caller and not bound to a
+ *  - `qwp_chunk` is owned by the caller and not bound to a
  *    particular sender; chunks can be built on any thread and flushed
  *    through any sender borrowed from the same `questdb_db`. A single
  *    handle (chunk, sender) must not be used from more than one thread at
@@ -59,16 +65,15 @@ extern "C" {
 #include <stddef.h>
 #include <stdbool.h>
 
+#include <questdb/client.h>
 #include <questdb/ingress/line_sender.h>
 
 /* -------------------------------------------------------------------------
  * Opaque handles
+ *
+ * The `questdb_db` pool that leases these handles out is declared in
+ * `questdb/client.h`.
  * ------------------------------------------------------------------------- */
-
-/** Connection pool. Thread-safe for borrow/return/reap operations while the
- *  owning handle remains open. `questdb_db_close` is the final owner release:
- *  do not call it concurrently with other operations on the same `db`. */
-typedef struct questdb_db questdb_db;
 
 /** Borrowed store-and-forward QWP/WS sender. Not thread-safe; belongs to
  *  the borrowing thread until returned via `questdb_db_return_sender`.
@@ -87,18 +92,18 @@ typedef struct qwp_sender qwp_sender;
 /** Borrowed direct (pipelined, non-store-and-forward) column-major QWP/WS
  *  sender from the always-direct pool, independent of `sf_dir`. Not
  *  thread-safe; belongs to the borrowing thread until returned via
- *  `questdb_db_return_direct_column_sender`.
+ *  `questdb_db_return_direct_sender`.
  *
- *  Exposes publish-only `direct_column_sender_flush`, the
- *  `direct_column_sender_commit` boundary, and the Arrow batch variants.
+ *  Exposes publish-only `qwp_direct_sender_flush`, the
+ *  `qwp_direct_sender_commit` boundary, and the Arrow batch variants.
  *  There is no internal failover: on a transient
  *  `line_sender_error_failover_retry` the caller drops the sender, re-borrows
  *  a live one, and re-drives the uncommitted tail from its own source. */
-typedef struct direct_column_sender direct_column_sender;
+typedef struct qwp_direct_sender qwp_direct_sender;
 
 /** One DataFrame's worth of column buffers destined for one QuestDB table.
  *  Owned by the caller. */
-typedef struct column_sender_chunk column_sender_chunk;
+typedef struct qwp_chunk qwp_chunk;
 
 /* -------------------------------------------------------------------------
  * Validity bitmap
@@ -112,76 +117,18 @@ typedef struct column_sender_chunk column_sender_chunk;
  * like "no nulls" (no null bitmap is emitted on the wire).
  * ------------------------------------------------------------------------- */
 
-typedef struct column_sender_validity
+typedef struct qwp_validity
 {
     const uint8_t* bits;
     size_t bit_len;
-} column_sender_validity;
+} qwp_validity;
 
 /* -------------------------------------------------------------------------
- * Pool and sender borrow
+ * Sender borrow and return
+ *
+ * Open the pool with `questdb_db_connect` from `questdb/client.h`, then lease
+ * senders from it through the entry points below.
  * ------------------------------------------------------------------------- */
-
-/**
- * Open a connection pool. This call performs no blocking network I/O. In
- * disk-backed store-and-forward mode it may pre-open parked recovery senders;
- * their initial connect and replay run in the background. Otherwise, the first
- * borrow opens a sender, so auth / TLS / connect errors usually surface from
- * the borrow, not from here. `sender_pool_min` (default 1) is the warm
- * minimum the reaper keeps once connections have been opened.
- *
- * `conf` is a `ws::` / `wss::` connect string. Pool-specific keys (aligned
- * with the Java client's `QuestDBBuilder`):
- *   `sender_pool_min`      (default 1)    warm/min sender connections;
- *   `sender_pool_max`      (default 4)    cap on the ingestion and direct
- *                                         pools, each capped independently;
- *   `query_pool_min`       (default 1)    warm/min reader connections;
- *   `query_pool_max`       (default 4)    cap on the reader pool;
- *   `acquire_timeout_ms`   (default 5000) how long a borrow at cap waits for
- *                                         a return before failing; 0 fails
- *                                         fast;
- *   `idle_timeout_ms`      (default 60000)
- *                                         reap above-minimum idle
- *                                         connections;
- *   `pool_reap`            (`auto`|`manual`, default `auto`)
- *                                         background reaper opt-in.
- *
- * Disk-backed store-and-forward is opt-in: `sf_dir` selects disk-backed queues
- * for the public ingestion pool. `sender_id` names the slot *base* (default
- * "default"); pooled senders mint `<sender_id>-ingest-<index>` slots with
- * stable lowest-free-first indices in `[0, sender_pool_max)`. The
- * `<sender_id>-ingest-*` directories under `sf_dir` belong to the pool
- * namespace; use a unique `sender_id` for each pool sharing an `sf_dir`. At
- * cap, disk-backed ingestion borrows usually
- * fail, but can wait up to `close_flush_timeout` (default 5s) if another
- * sender is currently closing and has not yet released its slot lock. An
- * unsuffixed slot `<sf_dir>/<sender_id>` is not pool-managed; it is treated
- * like any other orphan slot and is drained only when `drain_orphans=on`.
- */
-QUESTDB_CLIENT_API
-questdb_db* questdb_db_connect(
-    const char* conf,
-    size_t conf_len,
-    questdb_error** err_out);
-
-/**
- * Close the pool. Accepts NULL and no-ops.
- *
- * Final owner release: callers must ensure no other thread is concurrently
- * using `db` for borrow/reap/config operations. This invalidates `db` for
- * new borrows and closes idle connections.
- * Outstanding `qwp_sender` handles are independent leases: returning or
- * dropping them after close is safe, but new operations on them fail with
- * `line_sender_error_invalid_api_call`. A handle returned after close is
- * closed, not recycled. Close detaches and joins the connection-event and
- * rejection dispatchers; after it returns no callback can use its
- * `user_data`, including callbacks from an outstanding sender's background
- * runner. Exception: when close is called from a dispatcher thread, that
- * thread is not joined (avoiding a self-join deadlock) and its in-flight
- * callback finishes after close returns.
- */
-QUESTDB_CLIENT_API
-void questdb_db_close(questdb_db* db);
 
 /**
  * Borrow a sender from the store-and-forward ingestion pool. Selection rules:
@@ -220,14 +167,6 @@ qwp_sender* questdb_db_borrow_sender_with_retry(
     questdb_db* db,
     uint64_t budget_ms,
     line_sender_error** err_out);
-
-/**
- * The pool's failover budget (`reconnect_max_duration`, default 300000 ms).
- * Callers tracking an overall failover deadline pass the remaining budget to
- * `questdb_db_borrow_sender_with_retry`. Returns 0 if `db` is NULL.
- */
-QUESTDB_CLIENT_API
-uint64_t questdb_db_reconnect_max_duration_ms(const questdb_db* db);
 
 /**
  * Return a sender to the pool. Accepts NULL `sender` and no-ops.
@@ -290,19 +229,19 @@ void questdb_db_drop_sender(
  * at cap, and otherwise fails with `line_sender_error_invalid_api_call`.
  */
 QUESTDB_CLIENT_API
-direct_column_sender* questdb_db_borrow_direct_column_sender(
+qwp_direct_sender* questdb_db_borrow_direct_sender(
     questdb_db* db,
     line_sender_error** err_out);
 
 /**
- * Like `questdb_db_borrow_direct_column_sender` but retries the connect within
+ * Like `questdb_db_borrow_direct_sender` but retries the connect within
  * `budget_ms` using the pool's reconnect backoff (centered-jittered
  * exponential with a role-reject reset; authentication and protocol-version
  * errors are terminal). `budget_ms == 0` makes a single attempt. Returns NULL
  * on failure and sets `*err_out` if provided.
  */
 QUESTDB_CLIENT_API
-direct_column_sender* questdb_db_borrow_direct_column_sender_with_retry(
+qwp_direct_sender* questdb_db_borrow_direct_sender_with_retry(
     questdb_db* db,
     uint64_t budget_ms,
     line_sender_error** err_out);
@@ -312,11 +251,11 @@ direct_column_sender* questdb_db_borrow_direct_column_sender_with_retry(
  * QWP/WebSocket config string, owning its own connection with no pool — for
  * one-off DataFrame bulk loads without a `questdb_db`. `conf` is a UTF-8
  * string of `conf_len` bytes. Returns NULL on failure and sets `*err_out` if
- * provided. Free the returned handle with `direct_column_sender_free` (there
+ * provided. Free the returned handle with `qwp_direct_sender_free` (there
  * is no pool to return it to).
  */
 QUESTDB_CLIENT_API
-direct_column_sender* direct_column_sender_from_conf(
+qwp_direct_sender* qwp_direct_sender_from_conf(
     const char* conf,
     size_t conf_len,
     line_sender_error** err_out);
@@ -329,10 +268,10 @@ direct_column_sender* direct_column_sender_from_conf(
  * this works for a sender configured either way. `opts` is borrowed, not
  * consumed: the caller retains ownership and must still free it. Returns NULL
  * on failure and sets `*err_out` if provided. Free the returned handle with
- * `direct_column_sender_free` (there is no pool to return it to).
+ * `qwp_direct_sender_free` (there is no pool to return it to).
  */
 QUESTDB_CLIENT_API
-direct_column_sender* direct_column_sender_from_opts(
+qwp_direct_sender* qwp_direct_sender_from_opts(
     const line_sender_opts* opts,
     line_sender_error** err_out);
 
@@ -342,13 +281,13 @@ direct_column_sender* direct_column_sender_from_opts(
  * or if the pool has been closed, it is closed instead of recycled. A sender
  * returned with uncommitted pipelined frames has them committed best-effort.
  *
- * Mutually exclusive with `questdb_db_drop_direct_column_sender` on the same
+ * Mutually exclusive with `questdb_db_drop_direct_sender` on the same
  * `sender`: call exactly one of the two. Calling both (or either twice) is UB.
  */
 QUESTDB_CLIENT_API
-void questdb_db_return_direct_column_sender(
+void questdb_db_return_direct_sender(
     questdb_db* db,
-    direct_column_sender* sender);
+    qwp_direct_sender* sender);
 
 /**
  * Force-drop a borrowed direct sender instead of recycling it. Invalidates
@@ -359,162 +298,30 @@ void questdb_db_return_direct_column_sender(
  * together with its own batch. Uncommitted frames are discarded with the
  * connection — the caller re-drives them from its own source.
  *
- * Mutually exclusive with `questdb_db_return_direct_column_sender` on the same
+ * Mutually exclusive with `questdb_db_return_direct_sender` on the same
  * `sender`: call exactly one of the two. Calling both (or either twice) is UB.
  */
 QUESTDB_CLIENT_API
-void questdb_db_drop_direct_column_sender(
+void questdb_db_drop_direct_sender(
     questdb_db* db,
-    direct_column_sender* sender);
+    qwp_direct_sender* sender);
 
 /**
- * Free a standalone `direct_column_sender_from_conf` handle, committing any
+ * Free a standalone `qwp_direct_sender_from_conf` handle, committing any
  * un-sync'd deferred frames best-effort first (call
- * `direct_column_sender_commit` or a waited flush beforehand for delivery
+ * `qwp_direct_sender_commit` or a waited flush beforehand for delivery
  * certainty). Invalidates `sender`. Accepts NULL and no-ops. For a
- * pool-borrowed handle use `questdb_db_return_direct_column_sender` instead.
+ * pool-borrowed handle use `questdb_db_return_direct_sender` instead.
  */
 QUESTDB_CLIENT_API
-void direct_column_sender_free(
-    direct_column_sender* sender);
+void qwp_direct_sender_free(
+    qwp_direct_sender* sender);
 
 /* Reader-pool entry points (`questdb_db_borrow_reader`,
- * `questdb_db_dbg_reader_*_count`) live in `questdb/egress/reader.h`
- * alongside the `reader` type they wrap. */
-
-/**
- * Manually reap idle connections (closes free-list entries idle longer
- * than `idle_timeout_ms`, never shrinking the sender pools below
- * `sender_pool_min` or the reader pool below `query_pool_min`).
- * Returns the number of connections closed.
- */
-QUESTDB_CLIENT_API
-size_t questdb_db_reap_idle(questdb_db* db);
-
-/* -------------------------------------------------------------------------
- * Connection lifecycle events
- *
- * Open the pool with `questdb_db_connect_with_event_handler` to register one
- * listener per pool. Events are delivered on a dedicated dispatcher thread
- * (never an I/O or producer thread) through a bounded inbox with a
- * drop-oldest overflow policy, so a slow callback cannot stall connects or
- * publishing. Direct and store-and-forward senders share this one source and
- * inbox; concurrent events are delivered in the order they enter that inbox.
- *
- * Registration happens before the pool opens anything, so the listener
- * observes every transition — including the initial `connected` of disk
- * recovery senders pre-opened during connect. There is no post-connect
- * registration.
- * ------------------------------------------------------------------------- */
-
-/* Connection-event types (`questdb_connection_event`, the kind constants,
- * and `questdb_connection_event_cb`) are declared in
- * `questdb/ingress/line_sender.h`, shared with the sender-level
- * `line_sender_opts_connection_event_handler`. */
-
-/** `questdb_db_connect` with a connection lifecycle listener.
- * `inbox_capacity` of 0 selects the default (64). The caller guarantees
- * `user_data` is safe to use from the dispatcher thread until
- * `questdb_db_close` returns. On failure (NULL return) no callback runs
- * after this function returns and `user_data` may be released
- * immediately. */
-QUESTDB_CLIENT_API
-questdb_db* questdb_db_connect_with_event_handler(
-    const char* conf,
-    size_t conf_len,
-    questdb_connection_event_cb callback,
-    void* user_data,
-    size_t inbox_capacity,
-    questdb_error** err_out);
-
-/** Like `questdb_db_connect_with_event_handler`, additionally registering a
- * server-rejection handler. Either callback may be NULL: a NULL
- * `event_callback` disables connection lifecycle events; a NULL
- * `rejection_callback` selects the default of logging every rejection (warn
- * for retriable policies — the frames are replayed, not lost — error for
- * terminal ones), so silence is never the default.
- *
- * The rejection handler receives every server rejection any of the pool's
- * store-and-forward connections records — including rejections for frames
- * whose sender was already returned to the pool — on a dedicated dispatcher
- * thread through a bounded inbox (`rejection_inbox_capacity` of 0 selects
- * the default 64; overflow drops the oldest event, counted by
- * `questdb_db_rejection_events_dropped`). The caller guarantees each
- * `user_data` is safe to use from its dispatcher thread until
- * `questdb_db_close` returns. */
-QUESTDB_CLIENT_API
-questdb_db* questdb_db_connect_with_handlers(
-    const char* conf,
-    size_t conf_len,
-    questdb_connection_event_cb event_callback,
-    void* event_user_data,
-    size_t event_inbox_capacity,
-    line_sender_qwpws_error_cb rejection_callback,
-    void* rejection_user_data,
-    size_t rejection_inbox_capacity,
-    questdb_error** err_out);
-
-/** Total events discarded by the inbox's drop-oldest policy. */
-QUESTDB_CLIENT_API
-uint64_t questdb_db_connection_events_dropped(const questdb_db* db);
-
-/** Total events delivered to the listener. */
-QUESTDB_CLIENT_API
-uint64_t questdb_db_connection_events_delivered(const questdb_db* db);
-
-/** Total server rejections delivered to the rejection handler (or to the
- *  default log handler when none was registered). `0` for a NULL `db`. */
-QUESTDB_CLIENT_API
-uint64_t questdb_db_rejection_events_delivered(const questdb_db* db);
-
-/** Total server rejections discarded by the rejection handler inbox's
- *  drop-oldest policy. Always `0` without a registered handler: the default
- *  log handler has no inbox. `0` for a NULL `db`. */
-QUESTDB_CLIENT_API
-uint64_t questdb_db_rejection_events_dropped(const questdb_db* db);
-
-/* -------------------------------------------------------------------------
- * Diagnostics: per-pool connection counts
- *
- * Soak / leak harnesses sample these and assert every pool drains back to a
- * steady baseline after load and failover episodes (a leaked connection / FD
- * shows up as `in_use` or `free` failing to fall back). Not part of the
- * stable ABI; the field set may change. Mirrors the
- * `questdb_db_dbg_reader_*_count` precedent in `questdb/egress/reader.h`.
- * ------------------------------------------------------------------------- */
-
-/** Connection counts for a single pool. */
-typedef struct questdb_dbg_pool_count
-{
-    /** Idle connections parked on the free list. */
-    size_t free;
-    /** Borrowed connections plus in-flight grow operations. */
-    size_t in_use;
-    /** Disk store-and-forward slots mid-close, awaiting flock release. Always
-     *  0 for the direct and reader pools. */
-    size_t closing;
-} questdb_dbg_pool_count;
-
-/** Connection-count snapshot across all three pools. The ingestion and
- *  direct pools are each capped at `sender_pool_max` and the reader pool at
- *  `query_pool_max`, so `free + in_use` summed across the fields can reach
- *  `2 * sender_pool_max + query_pool_max`. */
-typedef struct questdb_dbg_pool_counts
-{
-    /** Store-and-forward ingestion pool. */
-    questdb_dbg_pool_count ingress;
-    /** Always-direct column-sender pool (DataFrame ingest). */
-    questdb_dbg_pool_count column_direct;
-    /** Reader (egress) pool. */
-    questdb_dbg_pool_count reader;
-} questdb_dbg_pool_counts;
-
-/**
- * Snapshot per-pool connection counts for diagnostics. Returns an all-zero
- * snapshot for a NULL `db`.
- */
-QUESTDB_CLIENT_API
-questdb_dbg_pool_counts questdb_db_dbg_pool_counts(const questdb_db* db);
+ * `questdb_db_dbg_reader_*_count`) live in `questdb/egress/qwp_reader.h`
+ * alongside the `qwp_reader` type they wrap. Pool lifecycle, idle reaping,
+ * connection-lifecycle events and per-pool connection counts live in
+ * `questdb/client.h`. */
 
 /* -------------------------------------------------------------------------
  * Buffer lifecycle and publication
@@ -578,7 +385,7 @@ bool qwp_sender_flush_buffer_and_keep_and_get_fsn(
 
 /**
  * Create an empty chunk for the given table. The chunk is caller-owned
- * and must be freed with `column_sender_chunk_free` or flushed via
+ * and must be freed with `qwp_chunk_free` or flushed via
  * `qwp_sender_flush_chunk` (which clears but does not free it).
  *
  * Name validation timing: this entrypoint takes the table name as a raw
@@ -592,14 +399,14 @@ bool qwp_sender_flush_buffer_and_keep_and_get_fsn(
  * If you already hold a pre-validated `line_sender_table_name` (e.g.
  * because you also flush Arrow batches via
  * `qwp_sender_flush_arrow_batch_at_column`, which requires that type),
- * prefer `column_sender_chunk_new_validated`: it takes the validated
+ * prefer `qwp_chunk_new_validated`: it takes the validated
  * handle directly and reports grammar errors EAGERLY at
  * `line_sender_table_name_init` time — the same type and timing as the
  * Arrow flush entrypoints — so a bad name does not surface at two
  * different points depending on which path you take.
  */
 QUESTDB_CLIENT_API
-column_sender_chunk* column_sender_chunk_new(
+qwp_chunk* qwp_chunk_new(
     const char* table_name,
     size_t table_name_len,
     line_sender_error** err_out);
@@ -608,7 +415,7 @@ column_sender_chunk* column_sender_chunk_new(
  * Create an empty chunk from a pre-validated `line_sender_table_name`.
  *
  * Typed, eager-grammar-validation counterpart to
- * `column_sender_chunk_new`. The name grammar was already checked when
+ * `qwp_chunk_new`. The name grammar was already checked when
  * the `line_sender_table_name` was built (`line_sender_table_name_init`
  * returns false for an illegal name), so this constructor cannot fail on
  * the name and never sets `*err_out`. The 127-byte length cap is still
@@ -618,12 +425,12 @@ column_sender_chunk* column_sender_chunk_new(
  *
  * Use this when you validated the table name once and want to share it
  * between the chunk path and an Arrow flush, instead of being forced to
- * re-pass raw `const char*` bytes through `column_sender_chunk_new`. The
+ * re-pass raw `const char*` bytes through `qwp_chunk_new`. The
  * chunk is caller-owned and freed/flushed exactly like one returned by
- * `column_sender_chunk_new`.
+ * `qwp_chunk_new`.
  */
 QUESTDB_CLIENT_API
-column_sender_chunk* column_sender_chunk_new_validated(
+qwp_chunk* qwp_chunk_new_validated(
     line_sender_table_name table,
     line_sender_error** err_out);
 
@@ -635,7 +442,7 @@ column_sender_chunk* column_sender_chunk_new_validated(
  * already-released. Drop your pointer after the call.
  */
 QUESTDB_CLIENT_API
-void column_sender_chunk_free(column_sender_chunk* chunk);
+void qwp_chunk_free(qwp_chunk* chunk);
 
 /**
  * Clear the chunk's content, keeping retained capacity for reuse.
@@ -645,8 +452,8 @@ void column_sender_chunk_free(column_sender_chunk* chunk);
  * mutating the chunk. A NULL `err_out` is silently ignored.
  */
 QUESTDB_CLIENT_API
-bool column_sender_chunk_clear(
-    column_sender_chunk* chunk,
+bool qwp_chunk_clear(
+    qwp_chunk* chunk,
     line_sender_error** err_out);
 
 /**
@@ -657,8 +464,8 @@ bool column_sender_chunk_clear(
  * ignored.
  */
 QUESTDB_CLIENT_API
-size_t column_sender_chunk_row_count(
-    const column_sender_chunk* chunk,
+size_t qwp_chunk_row_count(
+    const qwp_chunk* chunk,
     line_sender_error** err_out);
 
 /* -------------------------------------------------------------------------
@@ -693,51 +500,51 @@ size_t column_sender_chunk_row_count(
  * ------------------------------------------------------------------------- */
 
 QUESTDB_CLIENT_API
-bool column_sender_chunk_column_i8(
-    column_sender_chunk* chunk,
+bool qwp_chunk_column_i8(
+    qwp_chunk* chunk,
     const char* name, size_t name_len,
     const int8_t* data, size_t row_count,
-    const column_sender_validity* validity,
+    const qwp_validity* validity,
     line_sender_error** err_out);
 
 QUESTDB_CLIENT_API
-bool column_sender_chunk_column_i16(
-    column_sender_chunk* chunk,
+bool qwp_chunk_column_i16(
+    qwp_chunk* chunk,
     const char* name, size_t name_len,
     const int16_t* data, size_t row_count,
-    const column_sender_validity* validity,
+    const qwp_validity* validity,
     line_sender_error** err_out);
 
 QUESTDB_CLIENT_API
-bool column_sender_chunk_column_i32(
-    column_sender_chunk* chunk,
+bool qwp_chunk_column_i32(
+    qwp_chunk* chunk,
     const char* name, size_t name_len,
     const int32_t* data, size_t row_count,
-    const column_sender_validity* validity,
+    const qwp_validity* validity,
     line_sender_error** err_out);
 
 QUESTDB_CLIENT_API
-bool column_sender_chunk_column_i64(
-    column_sender_chunk* chunk,
+bool qwp_chunk_column_i64(
+    qwp_chunk* chunk,
     const char* name, size_t name_len,
     const int64_t* data, size_t row_count,
-    const column_sender_validity* validity,
+    const qwp_validity* validity,
     line_sender_error** err_out);
 
 QUESTDB_CLIENT_API
-bool column_sender_chunk_column_f32(
-    column_sender_chunk* chunk,
+bool qwp_chunk_column_f32(
+    qwp_chunk* chunk,
     const char* name, size_t name_len,
     const float* data, size_t row_count,
-    const column_sender_validity* validity,
+    const qwp_validity* validity,
     line_sender_error** err_out);
 
 QUESTDB_CLIENT_API
-bool column_sender_chunk_column_f64(
-    column_sender_chunk* chunk,
+bool qwp_chunk_column_f64(
+    qwp_chunk* chunk,
     const char* name, size_t name_len,
     const double* data, size_t row_count,
-    const column_sender_validity* validity,
+    const qwp_validity* validity,
     line_sender_error** err_out);
 
 /**
@@ -747,14 +554,14 @@ bool column_sender_chunk_column_f64(
  * Lower-level building block for callers (typically a Python wrapper's
  * PyObject sniff path) that already hold a packed bitmap with no Arrow
  * schema. Arrow-backed bool columns should go through
- * `column_sender_chunk_append_arrow_column`.
+ * `qwp_chunk_append_arrow_column`.
  */
 QUESTDB_CLIENT_API
-bool column_sender_chunk_column_bool(
-    column_sender_chunk* chunk,
+bool qwp_chunk_column_bool(
+    qwp_chunk* chunk,
     const char* name, size_t name_len,
     const uint8_t* data, size_t row_count,
-    const column_sender_validity* validity,
+    const qwp_validity* validity,
     line_sender_error** err_out);
 
 /**
@@ -762,11 +569,11 @@ bool column_sender_chunk_column_bool(
  * group is one UUID (bytes 0..8 lo half LE, 8..16 hi half LE).
  */
 QUESTDB_CLIENT_API
-bool column_sender_chunk_column_uuid(
-    column_sender_chunk* chunk,
+bool qwp_chunk_column_uuid(
+    qwp_chunk* chunk,
     const char* name, size_t name_len,
     const uint8_t* data, size_t row_count,
-    const column_sender_validity* validity,
+    const qwp_validity* validity,
     line_sender_error** err_out);
 
 /**
@@ -774,11 +581,11 @@ bool column_sender_chunk_column_uuid(
  * little-endian 64-bit limbs per row, least-significant limb first.
  */
 QUESTDB_CLIENT_API
-bool column_sender_chunk_column_long256(
-    column_sender_chunk* chunk,
+bool qwp_chunk_column_long256(
+    qwp_chunk* chunk,
     const char* name, size_t name_len,
     const uint8_t* data, size_t row_count,
-    const column_sender_validity* validity,
+    const qwp_validity* validity,
     line_sender_error** err_out);
 
 /**
@@ -786,11 +593,11 @@ bool column_sender_chunk_column_long256(
  * the high byte), encoded little-endian on the wire.
  */
 QUESTDB_CLIENT_API
-bool column_sender_chunk_column_ipv4(
-    column_sender_chunk* chunk,
+bool qwp_chunk_column_ipv4(
+    qwp_chunk* chunk,
     const char* name, size_t name_len,
     const uint32_t* data, size_t row_count,
-    const column_sender_validity* validity,
+    const qwp_validity* validity,
     line_sender_error** err_out);
 
 /* -------------------------------------------------------------------------
@@ -798,47 +605,47 @@ bool column_sender_chunk_column_ipv4(
  * ------------------------------------------------------------------------- */
 
 /**
- * Precision selector for `column_sender_chunk_column_ts`. Passed to the
+ * Precision selector for `qwp_chunk_column_ts`. Passed to the
  * function as `uint32_t` (not the enum type) for ABI stability; an
  * out-of-range value yields a recoverable error.
  */
-typedef enum column_sender_ts_unit
+typedef enum qwp_ts_unit
 {
     /** `TIMESTAMP` — microseconds since the Unix epoch. */
-    column_sender_ts_unit_micros = 0,
+    qwp_ts_unit_micros = 0,
 
     /** `TIMESTAMP_NANOS` — nanoseconds since the Unix epoch. */
-    column_sender_ts_unit_nanos = 1,
-} column_sender_ts_unit;
+    qwp_ts_unit_nanos = 1,
+} qwp_ts_unit;
 
 /**
- * `TIMESTAMP` / `TIMESTAMP_NANOS` column. `unit` is a `column_sender_ts_unit`
+ * `TIMESTAMP` / `TIMESTAMP_NANOS` column. `unit` is a `qwp_ts_unit`
  * value selecting the precision; `data` holds `row_count` Unix-epoch values in
  * that unit.
  */
 QUESTDB_CLIENT_API
-bool column_sender_chunk_column_ts(
-    column_sender_chunk* chunk,
+bool qwp_chunk_column_ts(
+    qwp_chunk* chunk,
     const char* name, size_t name_len,
     const int64_t* data, size_t row_count,
     uint32_t unit,
-    const column_sender_validity* validity,
+    const qwp_validity* validity,
     line_sender_error** err_out);
 
 /** `DATE` column, milliseconds since the Unix epoch. */
 QUESTDB_CLIENT_API
-bool column_sender_chunk_column_date(
-    column_sender_chunk* chunk,
+bool qwp_chunk_column_date(
+    qwp_chunk* chunk,
     const char* name, size_t name_len,
     const int64_t* data, size_t row_count,
-    const column_sender_validity* validity,
+    const qwp_validity* validity,
     line_sender_error** err_out);
 
 /* -------------------------------------------------------------------------
  * Variable-width text (VARCHAR)
  *
  * For callers that already hold an Arrow C Data Interface array, prefer
- * `column_sender_chunk_append_arrow_column` below — it dispatches by
+ * `qwp_chunk_append_arrow_column` below — it dispatches by
  * schema format and handles both UTF-8 (`u`) and LargeUtf8 (`U`) in one
  * call. The per-type entry point here is the lower-level building block,
  * useful when the caller has raw int32 offsets + bytes and no Arrow
@@ -869,31 +676,31 @@ bool column_sender_chunk_column_date(
  * `line_sender_error_server_rejection`.
  */
 QUESTDB_CLIENT_API
-bool column_sender_chunk_column_str(
-    column_sender_chunk* chunk,
+bool qwp_chunk_column_str(
+    qwp_chunk* chunk,
     const char* name, size_t name_len,
     const int32_t* offsets,
     const uint8_t* bytes,
     size_t bytes_len,
     size_t row_count,
-    const column_sender_validity* validity,
+    const qwp_validity* validity,
     line_sender_error** err_out);
 
 /**
  * `BINARY` column. Same Arrow-Binary-shape `offsets` + `bytes` layout as
- * `column_sender_chunk_column_str`; differs only in the wire type
+ * `qwp_chunk_column_str`; differs only in the wire type
  * byte so the server creates a BINARY column. No UTF-8 validation.
  */
 QUESTDB_CLIENT_API
-bool column_sender_chunk_column_binary(
-    column_sender_chunk* chunk,
+bool qwp_chunk_column_binary(
+    qwp_chunk* chunk,
     const char* name,
     size_t name_len,
     const int32_t* offsets,
     const uint8_t* bytes,
     size_t bytes_len,
     size_t row_count,
-    const column_sender_validity* validity,
+    const qwp_validity* validity,
     line_sender_error** err_out);
 
 /* -------------------------------------------------------------------------
@@ -916,12 +723,12 @@ bool column_sender_chunk_column_binary(
  * codes are not inspected.
  *
  * Callers passing an Arrow Dictionary array should prefer
- * `column_sender_chunk_append_arrow_column`, which dispatches on the
+ * `qwp_chunk_append_arrow_column`, which dispatches on the
  * outer schema's index width (`c`/`s`/`i`) automatically. The per-type
  * entries here remain the lower-level building block. These entrypoints
  * take 32-bit `dict_offsets` (Arrow `Utf8` layout); a dictionary whose
  * offsets are 64-bit (Arrow `LargeUtf8`) has no direct entrypoint here —
- * route it through `column_sender_chunk_append_arrow_column`, which
+ * route it through `qwp_chunk_append_arrow_column`, which
  * handles both offset widths.
  *
  * Each dictionary entry must be valid UTF-8 (QuestDB SYMBOLs are UTF-8),
@@ -935,33 +742,33 @@ bool column_sender_chunk_column_binary(
  * ------------------------------------------------------------------------- */
 
 QUESTDB_CLIENT_API
-bool column_sender_chunk_symbol_i8(
-    column_sender_chunk* chunk,
+bool qwp_chunk_symbol_i8(
+    qwp_chunk* chunk,
     const char* name, size_t name_len,
     const int8_t* codes, size_t row_count,
     const int32_t* dict_offsets, size_t dict_offsets_len,
     const uint8_t* dict_bytes, size_t dict_bytes_len,
-    const column_sender_validity* validity,
+    const qwp_validity* validity,
     line_sender_error** err_out);
 
 QUESTDB_CLIENT_API
-bool column_sender_chunk_symbol_i16(
-    column_sender_chunk* chunk,
+bool qwp_chunk_symbol_i16(
+    qwp_chunk* chunk,
     const char* name, size_t name_len,
     const int16_t* codes, size_t row_count,
     const int32_t* dict_offsets, size_t dict_offsets_len,
     const uint8_t* dict_bytes, size_t dict_bytes_len,
-    const column_sender_validity* validity,
+    const qwp_validity* validity,
     line_sender_error** err_out);
 
 QUESTDB_CLIENT_API
-bool column_sender_chunk_symbol_i32(
-    column_sender_chunk* chunk,
+bool qwp_chunk_symbol_i32(
+    qwp_chunk* chunk,
     const char* name, size_t name_len,
     const int32_t* codes, size_t row_count,
     const int32_t* dict_offsets, size_t dict_offsets_len,
     const uint8_t* dict_bytes, size_t dict_bytes_len,
-    const column_sender_validity* validity,
+    const qwp_validity* validity,
     line_sender_error** err_out);
 
 /* -------------------------------------------------------------------------
@@ -1076,19 +883,19 @@ struct ArrowArray
  *
  * Not thread-safe. Bound to the importing thread until freed.
  */
-typedef struct column_sender_arrow_import column_sender_arrow_import;
+typedef struct qwp_arrow_import qwp_arrow_import;
 
 /**
  * `auto`: Dictionary(*, Utf8/LargeUtf8) -> SYMBOL, plain Utf8 -> VARCHAR.
  * `symbol`: force plain Utf8 -> SYMBOL. `not_symbol`: force Dictionary ->
- * VARCHAR. Used by `column_sender_arrow_import_new`.
+ * VARCHAR. Used by `qwp_arrow_import_new`.
  */
-typedef enum column_sender_symbol_mode
+typedef enum qwp_symbol_mode
 {
-    column_sender_symbol_mode_auto = 0,
-    column_sender_symbol_mode_symbol = 1,
-    column_sender_symbol_mode_not_symbol = 2,
-} column_sender_symbol_mode;
+    qwp_symbol_mode_auto = 0,
+    qwp_symbol_mode_symbol = 1,
+    qwp_symbol_mode_not_symbol = 2,
+} qwp_symbol_mode;
 
 /**
  * Import an `ArrowArray` + `ArrowSchema` pair into an opaque handle.
@@ -1102,18 +909,18 @@ typedef enum column_sender_symbol_mode
  * intact. `schema` is borrowed only for the duration of this call.
  *
  * `symbol_mode` selects the SYMBOL-vs-VARCHAR disposition of a string
- * column; it carries a `column_sender_symbol_mode_*` constant and is a
+ * column; it carries a `qwp_symbol_mode_*` constant and is a
  * no-op for non-string columns. The parameter is `uint32_t` rather than
- * `enum column_sender_symbol_mode` so an out-of-range value returns
+ * `enum qwp_symbol_mode` so an out-of-range value returns
  * `line_sender_error_invalid_api_call` instead of being undefined
  * behaviour at the language boundary.
  *
  * Returns NULL on error and writes a `line_sender_error*` to
  * `*err_out`. The returned handle (when non-NULL) MUST be freed with
- * `column_sender_arrow_import_free`.
+ * `qwp_arrow_import_free`.
  */
 QUESTDB_CLIENT_API
-column_sender_arrow_import* column_sender_arrow_import_new(
+qwp_arrow_import* qwp_arrow_import_new(
     struct ArrowArray* array,
     const struct ArrowSchema* schema,
     uint32_t symbol_mode,
@@ -1125,7 +932,7 @@ column_sender_arrow_import* column_sender_arrow_import_new(
  * `name` / `name_len` is the destination QuestDB column name (UTF-8,
  * not NUL-terminated). `row_offset` and `row_count` select a slice
  * within `imported`'s logical length; pass `row_offset = 0` and
- * `row_count = column_sender_arrow_import_len(imported)` for the
+ * `row_count = qwp_arrow_import_len(imported)` for the
  * whole column. `imported` is borrowed; the chunk holds an internal
  * reference to its buffers until `qwp_sender_flush_chunk` returns.
  *
@@ -1134,17 +941,17 @@ column_sender_arrow_import* column_sender_arrow_import_new(
  * unchanged.
  */
 QUESTDB_CLIENT_API
-bool column_sender_chunk_append_arrow_import(
-    column_sender_chunk* chunk,
+bool qwp_chunk_append_arrow_import(
+    qwp_chunk* chunk,
     const char* name,
     size_t name_len,
-    const column_sender_arrow_import* imported,
+    const qwp_arrow_import* imported,
     size_t row_offset,
     size_t row_count,
     line_sender_error** err_out);
 
 /**
- * Free a `column_sender_arrow_import` handle and its underlying
+ * Free a `qwp_arrow_import` handle and its underlying
  * Arrow buffers. Accepts NULL `imported` and no-ops. Invalidates
  * `imported`; do not use it after this call.
  *
@@ -1159,7 +966,7 @@ bool column_sender_chunk_append_arrow_import(
  * not beyond.
  */
 QUESTDB_CLIENT_API
-void column_sender_arrow_import_free(column_sender_arrow_import* imported);
+void qwp_arrow_import_free(qwp_arrow_import* imported);
 
 /**
  * Number of rows in an imported Arrow column. Returns `(size_t)-1`
@@ -1168,12 +975,12 @@ void column_sender_arrow_import_free(column_sender_arrow_import* imported);
  * column.
  */
 QUESTDB_CLIENT_API
-size_t column_sender_arrow_import_len(const column_sender_arrow_import* imported);
+size_t qwp_arrow_import_len(const qwp_arrow_import* imported);
 
 /**
  * Append a slice of one column from an `ArrowArray` + `ArrowSchema`
  * pair directly to `chunk`, without going through
- * `column_sender_arrow_import_new`. Convenience for callers that
+ * `qwp_arrow_import_new`. Convenience for callers that
  * only need to ingest the column once.
  *
  * Ownership: on success, `array->release` is consumed (cleared to
@@ -1189,8 +996,8 @@ size_t column_sender_arrow_import_len(const column_sender_arrow_import* imported
  * offset); `row_offset` further sub-slices within the call.
  */
 QUESTDB_CLIENT_API
-bool column_sender_chunk_append_arrow_column(
-    column_sender_chunk* chunk,
+bool qwp_chunk_append_arrow_column(
+    qwp_chunk* chunk,
     const char* name,
     size_t name_len,
     struct ArrowArray* array,
@@ -1203,7 +1010,7 @@ bool column_sender_chunk_append_arrow_column(
 /* -------------------------------------------------------------------------
  * Generic NumPy column appender
  *
- * Companion to `column_sender_chunk_append_arrow_column` for callers
+ * Companion to `qwp_chunk_append_arrow_column` for callers
  * holding a raw, contiguous, native-endian NumPy buffer. The buffer is
  * walked at flush time, single pass, straight into the connection's
  * outbound frame — no chunk-side scratch arena, no per-column heap copy.
@@ -1251,90 +1058,90 @@ bool column_sender_chunk_append_arrow_column(
  *   - `validity` follows the Arrow LSB-first convention (bit = 1 → valid).
  *   - The chunk's row-count lock applies as elsewhere.
  *   - VARCHAR / SYMBOL / BINARY wire kinds are not reachable from NumPy —
- *     use `column_sender_chunk_append_arrow_column` instead.
+ *     use `qwp_chunk_append_arrow_column` instead.
  * ------------------------------------------------------------------------- */
 
-typedef enum column_sender_numpy_dtype
+typedef enum qwp_numpy_dtype
 {
     /* Signed integers — widened one step up to a sentinel-safe wire so the
        source's full range (including value 0) round-trips faithfully. The
        widened wire's sentinel (i32::MIN / i64::MIN) lies outside the
        source's representable range, so no source value collides with it. */
-    column_sender_numpy_i8 = 0,  /* → INT  (4B/row, widen i8→i32, sentinel-safe)  */
-    column_sender_numpy_i16 = 1, /* → INT  (4B/row, widen i16→i32, sentinel-safe) */
-    column_sender_numpy_i32 = 2, /* → LONG (8B/row, widen i32→i64, sentinel-safe) */
-    column_sender_numpy_i64 = 3, /* → LONG (8B/row, sentinel = i64::MIN)          */
+    qwp_numpy_i8 = 0,  /* → INT  (4B/row, widen i8→i32, sentinel-safe)  */
+    qwp_numpy_i16 = 1, /* → INT  (4B/row, widen i16→i32, sentinel-safe) */
+    qwp_numpy_i32 = 2, /* → LONG (8B/row, widen i32→i64, sentinel-safe) */
+    qwp_numpy_i64 = 3, /* → LONG (8B/row, sentinel = i64::MIN)          */
 
     /* Unsigned integers — widen to the smallest signed wire that holds the
        source range WITHOUT colliding with the null sentinel. BYTE/SHORT
        use value 0 as null, so u8 cannot use either; INT (i32::MIN sentinel)
        is the minimum safe target for u8. */
-    column_sender_numpy_u8 = 4,  /* → INT   (4B/row, widen u8→i32)              */
-    column_sender_numpy_u16 = 5, /* → INT   (4B/row, widen u16→i32)             */
-    column_sender_numpy_u32 = 6, /* → LONG  (8B/row, widen u32→i64)             */
-    column_sender_numpy_u64 = 7, /* → LONG  (8B/row, reject values > i64::MAX)  */
+    qwp_numpy_u8 = 4,  /* → INT   (4B/row, widen u8→i32)              */
+    qwp_numpy_u16 = 5, /* → INT   (4B/row, widen u16→i32)             */
+    qwp_numpy_u32 = 6, /* → LONG  (8B/row, widen u32→i64)             */
+    qwp_numpy_u64 = 7, /* → LONG  (8B/row, reject values > i64::MAX)  */
 
-    column_sender_numpy_f32 = 8, /* → FLOAT  (4B/row, direct)                   */
-    column_sender_numpy_f64 = 9, /* → DOUBLE (8B/row, sentinel = NaN)           */
-    column_sender_numpy_bool = 10, /* → BOOLEAN (bit-packed)                    */
+    qwp_numpy_f32 = 8, /* → FLOAT  (4B/row, direct)                   */
+    qwp_numpy_f64 = 9, /* → DOUBLE (8B/row, sentinel = NaN)           */
+    qwp_numpy_bool = 10, /* → BOOLEAN (bit-packed)                    */
 
     /* Half-precision + time */
-    column_sender_numpy_f16 = 11,
-    column_sender_numpy_datetime64_s = 12,
-    column_sender_numpy_datetime64_ms = 13,
-    column_sender_numpy_datetime64_us = 14,
-    column_sender_numpy_datetime64_ns = 15,
-    column_sender_numpy_timedelta64_s = 16,
-    column_sender_numpy_timedelta64_ms = 17,
-    column_sender_numpy_timedelta64_us = 18,
-    column_sender_numpy_timedelta64_ns = 19,
+    qwp_numpy_f16 = 11,
+    qwp_numpy_datetime64_s = 12,
+    qwp_numpy_datetime64_ms = 13,
+    qwp_numpy_datetime64_us = 14,
+    qwp_numpy_datetime64_ns = 15,
+    qwp_numpy_timedelta64_s = 16,
+    qwp_numpy_timedelta64_ms = 17,
+    qwp_numpy_timedelta64_us = 18,
+    qwp_numpy_timedelta64_ns = 19,
 
     /* Fixed-size bytes */
-    column_sender_numpy_s16 = 20, /* 16B/row → UUID */
-    column_sender_numpy_s32 = 21, /* 32B/row → LONG256 */
+    qwp_numpy_s16 = 20, /* 16B/row → UUID */
+    qwp_numpy_s32 = 21, /* 32B/row → LONG256 */
 
-    /* Decimals (read decimal_scale from column_sender_numpy_extras) */
-    column_sender_numpy_decimal_s8 = 22,  /*  8B i64 mantissa  → DECIMAL64  */
-    column_sender_numpy_decimal_s16 = 23, /* 16B i128 mantissa → DECIMAL128 */
-    column_sender_numpy_decimal_s32 = 24, /* 32B i256 mantissa → DECIMAL256 */
+    /* Decimals (read decimal_scale from qwp_numpy_extras) */
+    qwp_numpy_decimal_s8 = 22,  /*  8B i64 mantissa  → DECIMAL64  */
+    qwp_numpy_decimal_s16 = 23, /* 16B i128 mantissa → DECIMAL128 */
+    qwp_numpy_decimal_s32 = 24, /* 32B i256 mantissa → DECIMAL256 */
 
     /* Metadata-disambiguated narrow ints */
-    column_sender_numpy_u32_ipv4 = 25,
-    column_sender_numpy_u16_char = 26,
+    qwp_numpy_u32_ipv4 = 25,
+    qwp_numpy_u16_char = 26,
 
-    /* Geohash (read geohash_bits from column_sender_numpy_extras) */
-    column_sender_numpy_geohash_i8 = 27,
-    column_sender_numpy_geohash_i16 = 28,
-    column_sender_numpy_geohash_i32 = 29,
-    column_sender_numpy_geohash_i64 = 30,
+    /* Geohash (read geohash_bits from qwp_numpy_extras) */
+    qwp_numpy_geohash_i8 = 27,
+    qwp_numpy_geohash_i16 = 28,
+    qwp_numpy_geohash_i32 = 29,
+    qwp_numpy_geohash_i64 = 30,
 
     /* f64 ndarray: rectangular tensor (read array_ndim + array_shape from
-       column_sender_numpy_extras). All rows share the same shape. */
-    column_sender_numpy_f64_ndarray = 31,
+       qwp_numpy_extras). All rows share the same shape. */
+    qwp_numpy_f64_ndarray = 31,
 
     /* Coarser datetime64 units → TIMESTAMP (microseconds).
        Y / M are proleptic Gregorian, anchored at the start of the
        referenced year / month. W / D / h / m are constant multipliers.
        All reject overflow with InvalidApiCall. */
-    column_sender_numpy_datetime64_m = 32, /* minute × 60_000_000          */
-    column_sender_numpy_datetime64_h = 33, /* hour   × 3_600_000_000       */
-    column_sender_numpy_datetime64_D = 34, /* day    × 86_400_000_000      */
-    column_sender_numpy_datetime64_M = 35, /* month  → start of 1970-01+M  */
-    column_sender_numpy_datetime64_Y = 36, /* year   → start of 1970+Y     */
-    column_sender_numpy_datetime64_W = 37, /* week   × 604_800_000_000     */
+    qwp_numpy_datetime64_m = 32, /* minute × 60_000_000          */
+    qwp_numpy_datetime64_h = 33, /* hour   × 3_600_000_000       */
+    qwp_numpy_datetime64_D = 34, /* day    × 86_400_000_000      */
+    qwp_numpy_datetime64_M = 35, /* month  → start of 1970-01+M  */
+    qwp_numpy_datetime64_Y = 36, /* year   → start of 1970+Y     */
+    qwp_numpy_datetime64_W = 37, /* week   × 604_800_000_000     */
 
     /* Coarser timedelta64 units → LONG (raw i64, no unit normalisation).
        Mirrors the existing s / ms / us / ns dispatch — caller picks the
        unit, server stores the integer as-is. Calendar units (M / Y) have
        no fixed duration and are explicitly rejected. */
-    column_sender_numpy_timedelta64_m = 38, /* minute  → raw i64 */
-    column_sender_numpy_timedelta64_h = 39, /* hour    → raw i64 */
-    column_sender_numpy_timedelta64_D = 40, /* day     → raw i64 */
-    column_sender_numpy_timedelta64_M = 41, /* REJECTED: month length is variable */
-    column_sender_numpy_timedelta64_Y = 42  /* REJECTED: year length is variable  */
-} column_sender_numpy_dtype;
+    qwp_numpy_timedelta64_m = 38, /* minute  → raw i64 */
+    qwp_numpy_timedelta64_h = 39, /* hour    → raw i64 */
+    qwp_numpy_timedelta64_D = 40, /* day     → raw i64 */
+    qwp_numpy_timedelta64_M = 41, /* REJECTED: month length is variable */
+    qwp_numpy_timedelta64_Y = 42  /* REJECTED: year length is variable  */
+} qwp_numpy_dtype;
 
-/* Companion struct for `column_sender_chunk_append_numpy_column` carrying
+/* Companion struct for `qwp_chunk_append_numpy_column` carrying
  * dtype-specific parameters. Pass NULL when the dtype needs none of these
  * (everything except `decimal_*`, `geohash_*`, and `f64_ndarray`).
  *
@@ -1344,7 +1151,7 @@ typedef enum column_sender_numpy_dtype
  *    range negative value is rejected explicitly rather than wrapping.
  *  - geohash_bits: precision in bits. Range 1..=8 / 1..=16 / 1..=32 /
  *    1..=60 for i8 / i16 / i32 / i64 respectively.
- *  - array_ndim / array_shape: for `column_sender_numpy_f64_ndarray`
+ *  - array_ndim / array_shape: for `qwp_numpy_f64_ndarray`
  *    only. `array_ndim` is the per-row tensor rank (1..=32, matching
  *    QuestDB's MAX_ARRAY_DIMS); `array_shape` points at `array_ndim`
  *    consecutive `uint32_t` dim sizes (each >= 1). The pointer is
@@ -1352,21 +1159,21 @@ typedef enum column_sender_numpy_dtype
  *
  * Unused fields are ignored.
  */
-typedef struct column_sender_numpy_extras
+typedef struct qwp_numpy_extras
 {
     int8_t decimal_scale;
     uint8_t geohash_bits;
-    /* For column_sender_numpy_f64_ndarray only. */
+    /* For qwp_numpy_f64_ndarray only. */
     uint8_t array_ndim;          /* 1..=32 */
     const uint32_t* array_shape; /* array_ndim entries, each >= 1 */
-} column_sender_numpy_extras;
+} qwp_numpy_extras;
 
 /**
  * Append one column from a contiguous, native-endian NumPy buffer.
  *
- * `dtype` carries a `column_sender_numpy_*` constant from the enum
+ * `dtype` carries a `qwp_numpy_*` constant from the enum
  * above. The parameter is `uint32_t` rather than `enum
- * column_sender_numpy_dtype` so an out-of-range value returns
+ * qwp_numpy_dtype` so an out-of-range value returns
  * `line_sender_error_invalid_api_call` instead of being undefined
  * behaviour at the language boundary.
  *
@@ -1394,16 +1201,16 @@ typedef struct column_sender_numpy_extras
  * `numpy.ascontiguousarray(arr)` before handing the buffer over.
  */
 QUESTDB_CLIENT_API
-bool column_sender_chunk_append_numpy_column(
-    column_sender_chunk* chunk,
+bool qwp_chunk_append_numpy_column(
+    qwp_chunk* chunk,
     const char* name,
     size_t name_len,
     uint32_t dtype,
     const uint8_t* data,
     size_t data_len_bytes,
     size_t row_count,
-    const column_sender_validity* validity,
-    const column_sender_numpy_extras* extras,
+    const qwp_validity* validity,
+    const qwp_numpy_extras* extras,
     line_sender_error** err_out);
 
 /* -------------------------------------------------------------------------
@@ -1415,16 +1222,16 @@ bool column_sender_chunk_append_numpy_column(
 
 /** Designated timestamp in microseconds (wire type TIMESTAMP, 0x0A). */
 QUESTDB_CLIENT_API
-bool column_sender_chunk_at_micros(
-    column_sender_chunk* chunk,
+bool qwp_chunk_at_micros(
+    qwp_chunk* chunk,
     const int64_t* data,
     size_t row_count,
     line_sender_error** err_out);
 
 /** Designated timestamp in nanoseconds (wire type TIMESTAMP_NANOS, 0x10). */
 QUESTDB_CLIENT_API
-bool column_sender_chunk_at_nanos(
-    column_sender_chunk* chunk,
+bool qwp_chunk_at_nanos(
+    qwp_chunk* chunk,
     const int64_t* data,
     size_t row_count,
     line_sender_error** err_out);
@@ -1432,8 +1239,8 @@ bool column_sender_chunk_at_nanos(
 /** Designated timestamp in milliseconds, widened to micros (wire type
  * TIMESTAMP, 0x0A). */
 QUESTDB_CLIENT_API
-bool column_sender_chunk_at_millis(
-    column_sender_chunk* chunk,
+bool qwp_chunk_at_millis(
+    qwp_chunk* chunk,
     const int64_t* data,
     size_t row_count,
     line_sender_error** err_out);
@@ -1441,8 +1248,8 @@ bool column_sender_chunk_at_millis(
 /** Designated timestamp in seconds, widened to micros (wire type
  * TIMESTAMP, 0x0A). */
 QUESTDB_CLIENT_API
-bool column_sender_chunk_at_seconds(
-    column_sender_chunk* chunk,
+bool qwp_chunk_at_seconds(
+    qwp_chunk* chunk,
     const int64_t* data,
     size_t row_count,
     line_sender_error** err_out);
@@ -1453,22 +1260,22 @@ bool column_sender_chunk_at_seconds(
  * `qwp_sender_flush_arrow_batch_at_now`; server-assigned timestamps
  * generate unique rows on resubmission and so defeat DEDUP UPSERT KEYS.
  * Rejects if a designated timestamp column is already set (and vice
- * versa). Cleared by `column_sender_chunk_clear`. */
+ * versa). Cleared by `qwp_chunk_clear`. */
 QUESTDB_CLIENT_API
-bool column_sender_chunk_at_now(
-    column_sender_chunk* chunk,
+bool qwp_chunk_at_now(
+    qwp_chunk* chunk,
     line_sender_error** err_out);
 
 /** Pin one scalar nanosecond-precision Unix epoch timestamp as every
  * row's designated timestamp, encoded as a repeated constant (wire type
- * TIMESTAMP_NANOS, 0x10). Unlike `column_sender_chunk_at_now` the value
+ * TIMESTAMP_NANOS, 0x10). Unlike `qwp_chunk_at_now` the value
  * is fixed at the caller, so resubmission is idempotent under
  * DEDUP UPSERT KEYS. Rejects negative (pre-epoch) values and any
  * already-set designated timestamp. Cleared by
- * `column_sender_chunk_clear`. */
+ * `qwp_chunk_clear`. */
 QUESTDB_CLIENT_API
-bool column_sender_chunk_at_scalar_nanos(
-    column_sender_chunk* chunk,
+bool qwp_chunk_at_scalar_nanos(
+    qwp_chunk* chunk,
     int64_t nanos,
     line_sender_error** err_out);
 
@@ -1504,7 +1311,7 @@ bool column_sender_chunk_at_scalar_nanos(
 QUESTDB_CLIENT_API
 bool qwp_sender_flush_chunk(
     qwp_sender* sender,
-    column_sender_chunk* chunk,
+    qwp_chunk* chunk,
     line_sender_error** err_out);
 
 /**
@@ -1532,7 +1339,7 @@ bool qwp_sender_flush_chunk(
 QUESTDB_CLIENT_API
 bool qwp_sender_flush_chunk_and_wait(
     qwp_sender* sender,
-    column_sender_chunk* chunk,
+    qwp_chunk* chunk,
     uint32_t ack_level,
     line_sender_error** err_out);
 
@@ -1552,7 +1359,7 @@ bool qwp_sender_flush_chunk_and_wait(
 QUESTDB_CLIENT_API
 bool qwp_sender_flush_chunk_and_get_fsn(
     qwp_sender* sender,
-    column_sender_chunk* chunk,
+    qwp_chunk* chunk,
     line_sender_qwpws_fsn* fsn_out,
     line_sender_error** err_out);
 
@@ -1626,7 +1433,7 @@ bool qwp_sender_wait(
 
 /**
  * Pipeline a deferred frame on a direct connection. Not committed until
- * `direct_column_sender_commit`. On success the chunk is cleared for reuse.
+ * `qwp_direct_sender_commit`. On success the chunk is cleared for reuse.
  *
  * A transient transport failure reports `line_sender_error_failover_retry`;
  * check `line_sender_error_in_doubt` to tell provably-not-delivered (retry
@@ -1634,9 +1441,9 @@ bool qwp_sender_wait(
  * the source instead).
  */
 QUESTDB_CLIENT_API
-bool direct_column_sender_flush(
-    direct_column_sender* sender,
-    column_sender_chunk* chunk,
+bool qwp_direct_sender_flush(
+    qwp_direct_sender* sender,
+    qwp_chunk* chunk,
     line_sender_error** err_out);
 
 /**
@@ -1646,8 +1453,8 @@ bool direct_column_sender_flush(
  * no-progress wait.
  */
 QUESTDB_CLIENT_API
-bool direct_column_sender_commit(
-    direct_column_sender* sender,
+bool qwp_direct_sender_commit(
+    qwp_direct_sender* sender,
     uint32_t ack_level,
     line_sender_error** err_out);
 
@@ -1655,18 +1462,18 @@ bool direct_column_sender_commit(
 
 /**
  * Per-column wire-type hint kind, paired with
- * `column_sender_arrow_override::kind`.
+ * `qwp_arrow_override::kind`.
  */
-typedef enum column_sender_arrow_override_kind
+typedef enum qwp_arrow_override_kind
 {
-    column_sender_arrow_override_symbol = 0,
-    column_sender_arrow_override_ipv4 = 1,
-    column_sender_arrow_override_char = 2,
-    column_sender_arrow_override_geohash = 3,
+    qwp_arrow_override_symbol = 0,
+    qwp_arrow_override_ipv4 = 1,
+    qwp_arrow_override_char = 2,
+    qwp_arrow_override_geohash = 3,
     /** Force the column NOT to be SYMBOL: a Dictionary column is decoded
      *  to VARCHAR on emit; a no-op on plain Utf8 (already VARCHAR). */
-    column_sender_arrow_override_not_symbol = 4,
-} column_sender_arrow_override_kind;
+    qwp_arrow_override_not_symbol = 4,
+} qwp_arrow_override_kind;
 
 /**
  * Per-column wire-type hint passed to
@@ -1676,16 +1483,16 @@ typedef enum column_sender_arrow_override_kind
  * the bytes are borrowed for the duration of the call.
  *
  * `arg` carries the geohash precision (1..=60) when `kind ==
- * column_sender_arrow_override_geohash`, and is ignored for every other
+ * qwp_arrow_override_geohash`, and is ignored for every other
  * kind (pass 0).
  */
-typedef struct column_sender_arrow_override
+typedef struct qwp_arrow_override
 {
     const char* column;
     size_t column_len;
     uint32_t kind;
     uint32_t arg;
-} column_sender_arrow_override;
+} qwp_arrow_override;
 
 /**
  * Encode an Arrow C Data Interface `RecordBatch` (struct-typed
@@ -1700,7 +1507,7 @@ typedef struct column_sender_arrow_override
  * designated timestamp and silently substitute server arrival time,
  * producing wrong partitions/order.
  *
- * Ownership: same contract as `column_sender_chunk_append_arrow_column`
+ * Ownership: same contract as `qwp_chunk_append_arrow_column`
  * — on success `array->release` is consumed (set to NULL); on failure
  * it may also have been consumed. Callers MUST check
  * `array->release != NULL` before invoking it on the failure path.
@@ -1711,15 +1518,15 @@ typedef struct column_sender_arrow_override
  * with `line_sender_error_invalid_api_call` if any override targets
  * an unknown column, duplicates another override, carries invalid
  * UTF-8 in `column`, has an unknown `kind`, or — for
- * `column_sender_arrow_override_geohash` — carries `arg` outside
+ * `qwp_arrow_override_geohash` — carries `arg` outside
  * `1..=60`.
  *
  * Name validation timing: `table` is a `line_sender_table_name`, so the
  * name grammar was validated EAGERLY at `line_sender_table_name_init`
  * time; only the 127-byte length cap is checked here at flush. The chunk
- * path's raw `column_sender_chunk_new` instead defers BOTH checks to
+ * path's raw `qwp_chunk_new` instead defers BOTH checks to
  * flush. To get this same eager/typed behaviour on the chunk path, build
- * the chunk with `column_sender_chunk_new_validated`.
+ * the chunk with `qwp_chunk_new_validated`.
  */
 QUESTDB_CLIENT_API
 bool qwp_sender_flush_arrow_batch_at_now(
@@ -1727,7 +1534,7 @@ bool qwp_sender_flush_arrow_batch_at_now(
     line_sender_table_name table,
     struct ArrowArray* array,
     const struct ArrowSchema* schema,
-    const column_sender_arrow_override* overrides,
+    const qwp_arrow_override* overrides,
     size_t overrides_len,
     line_sender_error** err_out);
 
@@ -1742,7 +1549,7 @@ bool qwp_sender_flush_arrow_batch_at_now_and_get_fsn(
     line_sender_table_name table,
     struct ArrowArray* array,
     const struct ArrowSchema* schema,
-    const column_sender_arrow_override* overrides,
+    const qwp_arrow_override* overrides,
     size_t overrides_len,
     line_sender_qwpws_fsn* fsn_out,
     line_sender_error** err_out);
@@ -1773,7 +1580,7 @@ bool qwp_sender_flush_arrow_batch_at_now_and_wait(
     line_sender_table_name table,
     struct ArrowArray* array,
     const struct ArrowSchema* schema,
-    const column_sender_arrow_override* overrides,
+    const qwp_arrow_override* overrides,
     size_t overrides_len,
     uint32_t ack_level,
     line_sender_error** err_out);
@@ -1791,45 +1598,45 @@ bool qwp_sender_flush_arrow_batch_at_column(
     struct ArrowArray* array,
     const struct ArrowSchema* schema,
     line_sender_column_name ts_column,
-    const column_sender_arrow_override* overrides,
+    const qwp_arrow_override* overrides,
     size_t overrides_len,
     line_sender_error** err_out);
 
 /**
  * `qwp_sender_flush_arrow_batch_at_now` on a direct sender: pipeline the
- * batch as a deferred frame, not committed until `direct_column_sender_commit`.
+ * batch as a deferred frame, not committed until `qwp_direct_sender_commit`.
  * Same Arrow ownership contract: `array->release` is consumed on success and
  * re-exported on a provably-not-delivered failure
  * (`line_sender_error_failover_retry` with `line_sender_error_in_doubt ==
  * false`); callers MUST check `array->release != NULL` on the failure path.
  */
 QUESTDB_CLIENT_API
-bool direct_column_sender_flush_arrow_batch_at_now(
-    direct_column_sender* sender,
+bool qwp_direct_sender_flush_arrow_batch_at_now(
+    qwp_direct_sender* sender,
     line_sender_table_name table,
     struct ArrowArray* array,
     const struct ArrowSchema* schema,
-    const column_sender_arrow_override* overrides,
+    const qwp_arrow_override* overrides,
     size_t overrides_len,
     line_sender_error** err_out);
 
 /**
- * `direct_column_sender_flush_arrow_batch_at_now` with each row's designated
+ * `qwp_direct_sender_flush_arrow_batch_at_now` with each row's designated
  * timestamp sourced from the named `Timestamp(_)` column inside the batch.
  */
 QUESTDB_CLIENT_API
-bool direct_column_sender_flush_arrow_batch_at_column(
-    direct_column_sender* sender,
+bool qwp_direct_sender_flush_arrow_batch_at_column(
+    qwp_direct_sender* sender,
     line_sender_table_name table,
     struct ArrowArray* array,
     const struct ArrowSchema* schema,
     line_sender_column_name ts_column,
-    const column_sender_arrow_override* overrides,
+    const qwp_arrow_override* overrides,
     size_t overrides_len,
     line_sender_error** err_out);
 
 /**
- * `direct_column_sender_flush_arrow_batch_at_now` with one scalar
+ * `qwp_direct_sender_flush_arrow_batch_at_now` with one scalar
  * nanosecond-precision Unix epoch timestamp as every row's designated
  * timestamp, encoded as a repeated constant. Unlike `_at_now` the value is
  * fixed at the caller, so resubmission is idempotent under DEDUP UPSERT
@@ -1837,13 +1644,13 @@ bool direct_column_sender_flush_arrow_batch_at_column(
  * `overrides` contract.
  */
 QUESTDB_CLIENT_API
-bool direct_column_sender_flush_arrow_batch_at_scalar_nanos(
-    direct_column_sender* sender,
+bool qwp_direct_sender_flush_arrow_batch_at_scalar_nanos(
+    qwp_direct_sender* sender,
     line_sender_table_name table,
     struct ArrowArray* array,
     const struct ArrowSchema* schema,
     int64_t at_nanos,
-    const column_sender_arrow_override* overrides,
+    const qwp_arrow_override* overrides,
     size_t overrides_len,
     line_sender_error** err_out);
 
@@ -1859,7 +1666,7 @@ bool qwp_sender_flush_arrow_batch_at_column_and_get_fsn(
     struct ArrowArray* array,
     const struct ArrowSchema* schema,
     line_sender_column_name ts_column,
-    const column_sender_arrow_override* overrides,
+    const qwp_arrow_override* overrides,
     size_t overrides_len,
     line_sender_qwpws_fsn* fsn_out,
     line_sender_error** err_out);
@@ -1878,7 +1685,7 @@ bool qwp_sender_flush_arrow_batch_at_column_and_wait(
     struct ArrowArray* array,
     const struct ArrowSchema* schema,
     line_sender_column_name ts_column,
-    const column_sender_arrow_override* overrides,
+    const qwp_arrow_override* overrides,
     size_t overrides_len,
     uint32_t ack_level,
     line_sender_error** err_out);

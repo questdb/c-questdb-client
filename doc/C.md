@@ -28,9 +28,9 @@ It demonstrates the intended lifecycle:
 
 1. Open one process-wide `questdb_db` using a `ws::` or `wss::` connection
    string.
-2. Borrow a `qwp_sender`, fill a column-major `column_sender_chunk`, publish
+2. Borrow a `qwp_sender`, fill a column-major `qwp_chunk`, publish
    it, and wait for an `OK` acknowledgement.
-3. Return the sender, borrow a `reader` from the same pool, bind and execute a
+3. Return the sender, borrow a `qwp_reader` from the same pool, bind and execute a
    SQL query, and stream result batches.
 4. Close the reader before finally closing the pool.
 
@@ -44,8 +44,8 @@ handle.
 Include both headers when using one pool for ingestion and queries:
 
 ```c
-#include <questdb/ingress/column_sender.h>
-#include <questdb/egress/reader.h>
+#include <questdb/ingress/qwp_sender.h>
+#include <questdb/egress/qwp_reader.h>
 ```
 
 The principal entry points are:
@@ -54,11 +54,11 @@ The principal entry points are:
 | --- | --- |
 | Open/close the pool | `questdb_db_connect`, `questdb_db_close` |
 | Borrow/return an ingestion lease | `questdb_db_borrow_sender`, `questdb_db_return_sender` |
-| Build a columnar batch | `column_sender_chunk_new`, `column_sender_chunk_*` |
+| Build a columnar batch | `qwp_chunk_new`, `qwp_chunk_*` |
 | Publish and observe an acknowledgement | `qwp_sender_flush_chunk`, `qwp_sender_wait` |
-| Borrow/return a query lease | `questdb_db_borrow_reader`, `reader_close` |
-| Prepare, bind, and execute SQL | `reader_prepare`, `reader_query_bind_*`, `reader_query_execute` |
-| Stream results | `reader_cursor_next_batch`, `reader_batch_column_data` |
+| Borrow/return a query lease | `questdb_db_borrow_reader`, `qwp_reader_close` |
+| Prepare, bind, and execute SQL | `qwp_reader_prepare`, `qwp_reader_query_bind_*`, `qwp_reader_query_execute` |
+| Stream results | `qwp_reader_cursor_next_batch`, `qwp_reader_batch_column_data` |
 
 Every fallible call returns a status or nullable handle and optionally writes a
 new `questdb_error`/`line_sender_error`. Check the return value, inspect the
@@ -89,8 +89,9 @@ share QWP's ingestion/query pool.
 
 The committed headers are the authoritative native API reference:
 
-- [`column_sender.h`](../include/questdb/ingress/column_sender.h)
-- [`reader.h`](../include/questdb/egress/reader.h)
+- [`client.h`](../include/questdb/client.h) — `questdb_db`
+- [`qwp_sender.h`](../include/questdb/ingress/qwp_sender.h) — `questdb_db_borrow_sender`
+- [`qwp_reader.h`](../include/questdb/egress/qwp_reader.h) — `questdb_db_borrow_reader`
 - [`line_sender.h`](../include/questdb/ingress/line_sender.h)
 
 For connection-string keys, Enterprise multi-host failover, store-and-forward,

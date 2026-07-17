@@ -31,8 +31,8 @@ short-lived borrow, and RAII returns readers and senders to the pool.
 The essential ownership shape is:
 
 ```cpp
-#include <questdb/ingress/column_sender.hpp>
-#include <questdb/egress/reader.hpp>
+#include <questdb/ingress/qwp_sender.hpp>
+#include <questdb/egress/qwp_reader.hpp>
 
 questdb::pool db{"ws::addr=localhost:9000;"};
 
@@ -89,8 +89,9 @@ connections.
 
 The committed headers are the authoritative native API reference:
 
-- [`column_sender.hpp`](../include/questdb/ingress/column_sender.hpp)
-- [`reader.hpp`](../include/questdb/egress/reader.hpp)
+- [`client.hpp`](../include/questdb/client.hpp) — `questdb::pool`
+- [`qwp_sender.hpp`](../include/questdb/ingress/qwp_sender.hpp) — `pool::borrow_sender()`
+- [`qwp_reader.hpp`](../include/questdb/egress/qwp_reader.hpp) — `pool::borrow_reader()`
 - [`line_sender.hpp`](../include/questdb/ingress/line_sender.hpp)
 
 For connection-string keys, QuestDB Enterprise multi-host failover,

@@ -1,4 +1,4 @@
-#include <questdb/ingress/column_sender.hpp>
+#include <questdb/ingress/qwp_sender.hpp>
 
 void copy_borrowed_sender(questdb::ingress::borrowed_sender& sender)
 {

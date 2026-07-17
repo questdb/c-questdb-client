@@ -1,5 +1,5 @@
-#include <questdb/ingress/column_sender.h>
-#include <questdb/ingress/column_sender.hpp>
+#include <questdb/ingress/qwp_sender.h>
+#include <questdb/ingress/qwp_sender.hpp>
 #include <questdb/ingress/line_sender.hpp>
 
 #include <arrow/array/builder_primitive.h>

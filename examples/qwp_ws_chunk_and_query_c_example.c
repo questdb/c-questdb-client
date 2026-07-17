@@ -12,8 +12,8 @@
 #    define _POSIX_C_SOURCE 200809L
 #endif
 
-#include <questdb/egress/reader.h>
-#include <questdb/ingress/column_sender.h>
+#include <questdb/egress/qwp_reader.h>
+#include <questdb/ingress/qwp_sender.h>
 
 #include <stdbool.h>
 #include <stdint.h>
@@ -49,25 +49,25 @@ static void print_error(const char* operation, const questdb_error* err)
 static bool execute_sql(
     questdb_db* db, line_sender_utf8 sql, questdb_error** err_out)
 {
-    reader* r = questdb_db_borrow_reader(db, err_out);
-    reader_cursor* cursor = NULL;
+    qwp_reader* r = questdb_db_borrow_reader(db, err_out);
+    qwp_reader_cursor* cursor = NULL;
     bool ok = false;
 
     if (!r)
         return false;
 
-    cursor = reader_execute(r, sql, err_out);
+    cursor = qwp_reader_execute(r, sql, err_out);
     if (!cursor)
         goto cleanup;
 
-    while (reader_cursor_next_batch(cursor, err_out) != NULL)
+    while (qwp_reader_cursor_next_batch(cursor, err_out) != NULL)
     {
     }
     ok = *err_out == NULL;
 
 cleanup:
-    reader_cursor_free(cursor);
-    reader_close(r);
+    qwp_reader_cursor_free(cursor);
+    qwp_reader_close(r);
     return ok;
 }
 
@@ -102,7 +102,7 @@ static bool publish_trades(questdb_db* db, questdb_error** err_out)
     for (size_t i = 0; i < ROW_COUNT; ++i)
         timestamps[i] = now + (int64_t)i * 1000;
 
-    column_sender_chunk* chunk = column_sender_chunk_new(
+    qwp_chunk* chunk = qwp_chunk_new(
         "c_shared_pool_trades", sizeof("c_shared_pool_trades") - 1, err_out);
     qwp_sender* sender = NULL;
     bool ok = false;
@@ -110,7 +110,7 @@ static bool publish_trades(questdb_db* db, questdb_error** err_out)
     if (!chunk)
         return false;
 
-    if (!column_sender_chunk_symbol_i8(
+    if (!qwp_chunk_symbol_i8(
             chunk,
             "symbol",
             sizeof("symbol") - 1,
@@ -123,7 +123,7 @@ static bool publish_trades(questdb_db* db, questdb_error** err_out)
             NULL,
             err_out))
         goto cleanup;
-    if (!column_sender_chunk_column_f64(
+    if (!qwp_chunk_column_f64(
             chunk,
             "price",
             sizeof("price") - 1,
@@ -132,7 +132,7 @@ static bool publish_trades(questdb_db* db, questdb_error** err_out)
             NULL,
             err_out))
         goto cleanup;
-    if (!column_sender_chunk_column_f64(
+    if (!qwp_chunk_column_f64(
             chunk,
             "amount",
             sizeof("amount") - 1,
@@ -141,7 +141,7 @@ static bool publish_trades(questdb_db* db, questdb_error** err_out)
             NULL,
             err_out))
         goto cleanup;
-    if (!column_sender_chunk_at_nanos(chunk, timestamps, ROW_COUNT, err_out))
+    if (!qwp_chunk_at_nanos(chunk, timestamps, ROW_COUNT, err_out))
         goto cleanup;
 
     sender = questdb_db_borrow_sender(db, err_out);
@@ -155,40 +155,40 @@ static bool publish_trades(questdb_db* db, questdb_error** err_out)
 
 cleanup:
     questdb_db_return_sender(db, sender);
-    column_sender_chunk_free(chunk);
+    qwp_chunk_free(chunk);
     return ok;
 }
 
 static bool query_count(
     questdb_db* db, int64_t* count_out, questdb_error** err_out)
 {
-    reader* r = questdb_db_borrow_reader(db, err_out);
-    reader_cursor* cursor = NULL;
+    qwp_reader* r = questdb_db_borrow_reader(db, err_out);
+    qwp_reader_cursor* cursor = NULL;
     bool ok = false;
 
     *count_out = 0;
     if (!r)
         return false;
 
-    cursor = reader_execute(
+    cursor = qwp_reader_execute(
         r,
         QDB_UTF8_LITERAL("SELECT count() FROM c_shared_pool_trades"),
         err_out);
     if (!cursor)
         goto cleanup;
 
-    const reader_batch* batch;
-    while ((batch = reader_cursor_next_batch(cursor, err_out)) != NULL)
+    const qwp_reader_batch* batch;
+    while ((batch = qwp_reader_cursor_next_batch(cursor, err_out)) != NULL)
     {
-        if (reader_batch_row_count(batch) == 0)
+        if (qwp_reader_batch_row_count(batch) == 0)
             continue;
 
-        reader_column_data count;
-        if (!reader_batch_column_data(batch, 0, &count, err_out))
+        qwp_reader_column_data count;
+        if (!qwp_reader_batch_column_data(batch, 0, &count, err_out))
             goto cleanup;
 
         bool is_null = false;
-        *count_out = reader_column_data_get_i64(&count, 0, &is_null);
+        *count_out = qwp_reader_column_data_get_i64(&count, 0, &is_null);
         if (is_null)
         {
             fprintf(stderr, "count() unexpectedly returned NULL\n");
@@ -198,8 +198,8 @@ static bool query_count(
     ok = *err_out == NULL;
 
 cleanup:
-    reader_cursor_free(cursor);
-    reader_close(r);
+    qwp_reader_cursor_free(cursor);
+    qwp_reader_close(r);
     return ok;
 }
 
@@ -227,15 +227,15 @@ static bool wait_until_visible(questdb_db* db, questdb_error** err_out)
 
 static bool report_large_trades(questdb_db* db, questdb_error** err_out)
 {
-    reader* r = questdb_db_borrow_reader(db, err_out);
-    reader_query* query = NULL;
-    reader_cursor* cursor = NULL;
+    qwp_reader* r = questdb_db_borrow_reader(db, err_out);
+    qwp_reader_query* query = NULL;
+    qwp_reader_cursor* cursor = NULL;
     bool ok = false;
 
     if (!r)
         return false;
 
-    query = reader_prepare(
+    query = qwp_reader_prepare(
         r,
         QDB_UTF8_LITERAL(
             "SELECT symbol, price, amount FROM c_shared_pool_trades "
@@ -244,27 +244,27 @@ static bool report_large_trades(questdb_db* db, questdb_error** err_out)
     if (!query)
         goto cleanup;
 
-    reader_query_bind_f64(query, 0.005);
-    cursor = reader_query_execute(&query, err_out);
+    qwp_reader_query_bind_f64(query, 0.005);
+    cursor = qwp_reader_query_execute(&query, err_out);
     if (!cursor)
         goto cleanup;
 
     puts("trades with amount > 0.005:");
-    const reader_batch* batch;
-    while ((batch = reader_cursor_next_batch(cursor, err_out)) != NULL)
+    const qwp_reader_batch* batch;
+    while ((batch = qwp_reader_cursor_next_batch(cursor, err_out)) != NULL)
     {
-        reader_column_data symbol;
-        reader_column_data price;
-        reader_column_data amount;
-        reader_symbol_dict dictionary;
+        qwp_reader_column_data symbol;
+        qwp_reader_column_data price;
+        qwp_reader_column_data amount;
+        qwp_reader_symbol_dict dictionary;
 
-        if (!reader_batch_column_data(batch, 0, &symbol, err_out) ||
-            !reader_batch_column_data(batch, 1, &price, err_out) ||
-            !reader_batch_column_data(batch, 2, &amount, err_out) ||
-            !reader_batch_symbol_dict(batch, &dictionary, err_out))
+        if (!qwp_reader_batch_column_data(batch, 0, &symbol, err_out) ||
+            !qwp_reader_batch_column_data(batch, 1, &price, err_out) ||
+            !qwp_reader_batch_column_data(batch, 2, &amount, err_out) ||
+            !qwp_reader_batch_symbol_dict(batch, &dictionary, err_out))
             goto cleanup;
 
-        for (size_t row = 0; row < reader_batch_row_count(batch); ++row)
+        for (size_t row = 0; row < qwp_reader_batch_row_count(batch); ++row)
         {
             const char* symbol_text = NULL;
             size_t symbol_len = 0;
@@ -272,7 +272,7 @@ static bool report_large_trades(questdb_db* db, questdb_error** err_out)
             bool price_null = false;
             bool amount_null = false;
 
-            if (!reader_column_data_get_symbol(
+            if (!qwp_reader_column_data_get_symbol(
                     &symbol,
                     &dictionary,
                     row,
@@ -285,9 +285,9 @@ static bool report_large_trades(questdb_db* db, questdb_error** err_out)
             }
 
             const double price_value =
-                reader_column_data_get_f64(&price, row, &price_null);
+                qwp_reader_column_data_get_f64(&price, row, &price_null);
             const double amount_value =
-                reader_column_data_get_f64(&amount, row, &amount_null);
+                qwp_reader_column_data_get_f64(&amount, row, &amount_null);
             if (!symbol_null && !price_null && !amount_null)
                 printf(
                     "  %.*s price=%.2f amount=%g\n",
@@ -300,9 +300,9 @@ static bool report_large_trades(questdb_db* db, questdb_error** err_out)
     ok = *err_out == NULL;
 
 cleanup:
-    reader_query_free(query);
-    reader_cursor_free(cursor);
-    reader_close(r);
+    qwp_reader_query_free(query);
+    qwp_reader_cursor_free(cursor);
+    qwp_reader_close(r);
     return ok;
 }
 

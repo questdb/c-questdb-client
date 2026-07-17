@@ -41,7 +41,7 @@
 #define DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN
 #include "doctest.h"
 
-#include <questdb/egress/reader.hpp>
+#include <questdb/egress/qwp_reader.hpp>
 #include <questdb/ingress/line_sender.hpp>
 
 #include <atomic>
@@ -227,7 +227,7 @@ TEST_CASE("smoke: select 1::long as v")
     auto& batch = *batch_opt;
     CHECK(batch.row_count() == 1);
     CHECK(batch.column_count() == 1);
-    REQUIRE(batch.column_kind(0) == reader_column_kind_long);
+    REQUIRE(batch.column_kind(0) == qwp_reader_column_kind_long);
     const auto v = batch.column(0).get<int64_t>(0);
     REQUIRE(v.has_value());
     CHECK(*v == 1);
@@ -250,7 +250,7 @@ TEST_CASE("multi-row literal: long_sequence(5)")
         auto& batch = *bo;
         const size_t rows = batch.row_count();
         REQUIRE(batch.column_count() == 1);
-        REQUIRE(batch.column_kind(0) == reader_column_kind_long);
+        REQUIRE(batch.column_kind(0) == qwp_reader_column_kind_long);
         for (size_t r = 0; r < rows; ++r)
         {
             const auto v = batch.column(0).get<int64_t>(r);
@@ -276,8 +276,8 @@ TEST_CASE("multi-column type dispatch: long + double")
     auto& batch = *batch_opt;
     REQUIRE(batch.row_count() == 3);
     REQUIRE(batch.column_count() == 2);
-    REQUIRE(batch.column_kind(0) == reader_column_kind_long);
-    REQUIRE(batch.column_kind(1) == reader_column_kind_double);
+    REQUIRE(batch.column_kind(0) == qwp_reader_column_kind_long);
+    REQUIRE(batch.column_kind(1) == qwp_reader_column_kind_double);
 
     for (size_t r = 0; r < 3; ++r)
     {
@@ -315,8 +315,8 @@ TEST_CASE("bind: i32 + varchar")
     auto& batch = *batch_opt;
     REQUIRE(batch.row_count() == 3);
     REQUIRE(batch.column_count() == 2);
-    REQUIRE(batch.column_kind(0) == reader_column_kind_long);
-    REQUIRE(batch.column_kind(1) == reader_column_kind_varchar);
+    REQUIRE(batch.column_kind(0) == qwp_reader_column_kind_long);
+    REQUIRE(batch.column_kind(1) == qwp_reader_column_kind_varchar);
 
     for (size_t r = 0; r < 3; ++r)
     {
@@ -343,7 +343,7 @@ TEST_CASE("bind: f64 round-trip")
     REQUIRE(batch_opt);
     auto& batch = *batch_opt;
     REQUIRE(batch.row_count() == 1);
-    REQUIRE(batch.column_kind(0) == reader_column_kind_double);
+    REQUIRE(batch.column_kind(0) == qwp_reader_column_kind_double);
     const auto v = batch.column(0).get<double>(0);
     REQUIRE(v.has_value());
     CHECK(*v == doctest::Approx(3.14159));
@@ -372,7 +372,7 @@ TEST_CASE("column_validity: bitmap matches null pattern, empty when no nulls")
     auto& batch = *batch_opt;
         REQUIRE(batch.row_count() == 5);
         REQUIRE(batch.column_count() == 1);
-        REQUIRE(batch.column_kind(0) == reader_column_kind_long);
+        REQUIRE(batch.column_kind(0) == qwp_reader_column_kind_long);
 
         const auto col0 = batch.column(0);
         const uint8_t* vbits = col0.validity();
@@ -445,7 +445,7 @@ TEST_CASE("bind: decimal128 sign-extension round-trip")
     REQUIRE(batch_opt);
     auto& batch = *batch_opt;
     REQUIRE(batch.row_count() == 1);
-    REQUIRE(batch.column_kind(0) == reader_column_kind_decimal128);
+    REQUIRE(batch.column_kind(0) == qwp_reader_column_kind_decimal128);
     const auto d = batch.column(0).get_decimal128(0);
     REQUIRE(d.has_value());
     CHECK(d->low == static_cast<uint64_t>(-1LL));
@@ -566,7 +566,7 @@ TEST_CASE("terminal_kind reaches end after stream completes")
     // SELECT streams terminate with `end` carrying total_rows; `exec_done`
     // is the terminator for non-result statements (DDL/DML), so a SELECT
     // here must always land on `end`.
-    REQUIRE(cur.terminal_kind() == reader_terminal_kind_end);
+    REQUIRE(cur.terminal_kind() == qwp_reader_terminal_kind_end);
     const auto info = cur.terminal_end();
     REQUIRE(info.has_value());
     CHECK(info->total_rows == 2);
@@ -693,12 +693,12 @@ TEST_CASE("ingress sender → egress reader round-trip for primitives")
                 if (batch.row_count() == 1 && batch.column_count() == 1)
                 {
                     const auto k = batch.column_kind(0);
-                    if (k == reader_column_kind_long)
+                    if (k == qwp_reader_column_kind_long)
                     {
                         auto v = batch.column(0).get<int64_t>(0);
                         if (v) n = *v;
                     }
-                    else if (k == reader_column_kind_int)
+                    else if (k == qwp_reader_column_kind_int)
                     {
                         auto v = batch.column(0).get<int32_t>(0);
                         if (v) n = *v;
@@ -785,13 +785,13 @@ bool wait_for_rows(
                 if (batch.row_count() == 1 && batch.column_count() == 1)
                 {
                     const auto k = batch.column_kind(0);
-                    if (k == reader_column_kind_long)
+                    if (k == qwp_reader_column_kind_long)
                     {
                         auto v = batch.column(0).get<int64_t>(0);
                         if (v)
                             n = *v;
                     }
-                    else if (k == reader_column_kind_int)
+                    else if (k == qwp_reader_column_kind_int)
                     {
                         auto v = batch.column(0).get<int32_t>(0);
                         if (v)
@@ -834,9 +834,9 @@ TEST_CASE(
     REQUIRE(batch_opt);
     auto& batch = *batch_opt;
     REQUIRE(batch.row_count() == 5);
-    REQUIRE(batch.column_kind(0) == reader_column_kind_long);
-    REQUIRE(batch.column_kind(1) == reader_column_kind_double);
-    REQUIRE(batch.column_kind(2) == reader_column_kind_varchar);
+    REQUIRE(batch.column_kind(0) == qwp_reader_column_kind_long);
+    REQUIRE(batch.column_kind(1) == qwp_reader_column_kind_double);
+    REQUIRE(batch.column_kind(2) == qwp_reader_column_kind_varchar);
 
     auto col_n = batch.column(0);
     auto col_d = batch.column(1);
@@ -908,7 +908,7 @@ TEST_CASE("live: batch — SYMBOL column codes + dictionary round-trip")
     {
         auto& batch = *batch_opt;
         const size_t rows = batch.row_count();
-        REQUIRE(batch.column_kind(0) == reader_column_kind_symbol);
+        REQUIRE(batch.column_kind(0) == qwp_reader_column_kind_symbol);
 
         auto col = batch.column(0);
         REQUIRE(col.kind() == eg::column_kind::symbol);
@@ -992,7 +992,7 @@ TEST_CASE("live: batch::column — DOUBLE_ARRAY round-trip")
     {
         auto& batch = *batch_opt;
         const size_t rows = batch.row_count();
-        REQUIRE(batch.column_kind(0) == reader_column_kind_double_array);
+        REQUIRE(batch.column_kind(0) == qwp_reader_column_kind_double_array);
 
         auto ac = batch.column(0);
         REQUIRE(ac.is_array());

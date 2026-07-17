@@ -5,10 +5,10 @@
  *
  *  1. Closed-port phase (always runs). Targets 127.0.0.1:1 (the TCPMUX
  *     well-known port that is virtually never bound) and asserts that
- *     `reader_from_conf` reaches the connect path, fails cleanly,
+ *     `qwp_reader_from_conf` reaches the connect path, fails cleanly,
  *     and surfaces a non-NULL error that the FFI can then free. This
  *     exercises symbol resolution, FFI argument marshalling, error
- *     allocation, and `reader_close`'s NULL-idempotent behaviour
+ *     allocation, and `qwp_reader_close`'s NULL-idempotent behaviour
  *     — all without fighting a developer machine that happens to have
  *     a QuestDB broker running on the default port (the case that
  *     broke the previous `WILL_FAIL`-based smoke).
@@ -16,7 +16,7 @@
  *  2. Lifecycle phase (gated on `QDB_LIVE_BROKER_ADDR`). When the env
  *     var is set, drives `_from_conf` → `_query_new` → `_query_execute`
  *     → `_cursor_next_batch` → `_batch_column_data` →
- *     `reader_column_data_get_i64` → `_cursor_free` → `_close`
+ *     `qwp_reader_column_data_get_i64` → `_cursor_free` → `_close`
  *     against a real broker. The whole
  *     point of the C ABI is Cython-consumability; the C++ doctest
  *     suite covers these symbols but doesn't prove they link or
@@ -30,7 +30,7 @@
  * SIGABRT are correctly reported as failures rather than passes.
  */
 
-#include <questdb/egress/reader.h>
+#include <questdb/egress/qwp_reader.h>
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -42,15 +42,15 @@ static int closed_port_phase(void)
         QDB_UTF8_LITERAL("ws::addr=127.0.0.1:1;");
 
     questdb_error* err = NULL;
-    reader* reader = reader_from_conf(conf, &err);
+    qwp_reader* reader = qwp_reader_from_conf(conf, &err);
 
     if (reader != NULL)
     {
         fprintf(
             stderr,
-            "smoke: expected reader_from_conf to fail against a "
+            "smoke: expected qwp_reader_from_conf to fail against a "
             "guaranteed-closed port, but it succeeded\n");
-        reader_close(reader);
+        qwp_reader_close(reader);
         return 1;
     }
 
@@ -58,7 +58,7 @@ static int closed_port_phase(void)
     {
         fprintf(
             stderr,
-            "smoke: reader_from_conf returned NULL but did not set "
+            "smoke: qwp_reader_from_conf returned NULL but did not set "
             "an error — FFI error-propagation contract violated\n");
         return 1;
     }
@@ -77,14 +77,14 @@ static int closed_port_phase(void)
 
     /* Drop the error and confirm the NULL-idempotent close path. */
     questdb_error_free(err);
-    reader_close(NULL);
+    qwp_reader_close(NULL);
     return 0;
 }
 
 /*
  * Reader-only pool phase (always runs). Proves a read-only C consumer can
  * open, fail, and tear down the shared pool using only
- * <questdb/egress/reader.h> and the client-wide `questdb_error` type.
+ * <questdb/egress/qwp_reader.h> and the client-wide `questdb_error` type.
  *
  * Targets the same guaranteed-closed 127.0.0.1:1 port via a `ws::`
  * connect string. The pool is lazy: `questdb_db_connect` opens no
@@ -124,14 +124,14 @@ static int pool_reader_only_phase(void)
      * The connect failure must surface here, on the first borrow, as a
      * `questdb_error*`.
      */
-    reader* reader = questdb_db_borrow_reader(db, &err);
+    qwp_reader* reader = questdb_db_borrow_reader(db, &err);
     if (reader != NULL)
     {
         fprintf(
             stderr,
             "smoke pool: expected questdb_db_borrow_reader to fail against a "
             "guaranteed-closed port, but it succeeded\n");
-        reader_close(reader);
+        qwp_reader_close(reader);
         questdb_db_close(db);
         if (err != NULL)
             questdb_error_free(err);
@@ -179,9 +179,9 @@ static int pool_reader_only_phase(void)
 static int live_lifecycle_phase(const char* addr)
 {
     questdb_error* err = NULL;
-    reader* reader = NULL;
-    reader_query* query = NULL;
-    reader_cursor* cursor = NULL;
+    qwp_reader* reader = NULL;
+    qwp_reader_query* query = NULL;
+    qwp_reader_cursor* cursor = NULL;
     int rc = 1;
 
     /*
@@ -203,22 +203,22 @@ static int live_lifecycle_phase(const char* addr)
     }
     line_sender_utf8 conf = {(size_t)n, conf_buf};
 
-    reader = reader_from_conf(conf, &err);
+    reader = qwp_reader_from_conf(conf, &err);
     if (!reader)
         goto fail;
 
     line_sender_utf8 sql = QDB_UTF8_LITERAL("select 1");
-    query = reader_prepare(reader, sql, &err);
+    query = qwp_reader_prepare(reader, sql, &err);
     if (!query)
         goto fail;
 
-    cursor = reader_query_execute(&query, &err);
+    cursor = qwp_reader_query_execute(&query, &err);
     /* `_query_execute` consumed query — must now be NULL. */
     if (query != NULL)
     {
         fprintf(
             stderr,
-            "smoke live: reader_query_execute did not nullify its "
+            "smoke live: qwp_reader_query_execute did not nullify its "
             "query in-out parameter — ownership contract violated\n");
         goto fail;
     }
@@ -230,14 +230,14 @@ static int live_lifecycle_phase(const char* addr)
      * after consuming the single one-row batch. Verify that we see
      * exactly that row with the expected value, exercising
      * `_batch_row_count`, `_batch_column_count`, `_batch_column_data`,
-     * and `reader_column_data_get_i64` — the four most-used
+     * and `qwp_reader_column_data_get_i64` — the four most-used
      * per-row accessors on the bulk path.
      */
     int batch_count = 0;
     long long captured_value = 0;
     int captured_is_null = -1;
-    const reader_batch* batch;
-    while ((batch = reader_cursor_next_batch(cursor, &err)) != NULL)
+    const qwp_reader_batch* batch;
+    while ((batch = qwp_reader_cursor_next_batch(cursor, &err)) != NULL)
     {
         ++batch_count;
         if (batch_count > 16)
@@ -249,8 +249,8 @@ static int live_lifecycle_phase(const char* addr)
             goto fail;
         }
 
-        const size_t rows = reader_batch_row_count(batch);
-        const size_t cols = reader_batch_column_count(batch);
+        const size_t rows = qwp_reader_batch_row_count(batch);
+        const size_t cols = qwp_reader_batch_column_count(batch);
         if (cols == 0)
         {
             fprintf(
@@ -259,16 +259,16 @@ static int live_lifecycle_phase(const char* addr)
             goto fail;
         }
 
-        reader_column_data d;
-        if (!reader_batch_column_data(batch, 0, &d, &err))
+        qwp_reader_column_data d;
+        if (!qwp_reader_batch_column_data(batch, 0, &d, &err))
             goto fail;
         /*
          * QuestDB returns `select 1` as a LONG (i64). Accept INT too
          * in case a future server emits it as INT — we just need the
          * column-kind discriminant to give us a usable type.
          */
-        if (d.kind != reader_column_kind_long &&
-            d.kind != reader_column_kind_int)
+        if (d.kind != qwp_reader_column_kind_long &&
+            d.kind != qwp_reader_column_kind_int)
         {
             fprintf(
                 stderr,
@@ -282,10 +282,10 @@ static int live_lifecycle_phase(const char* addr)
         {
             bool is_null = false;
             int64_t v = 0;
-            if (d.kind == reader_column_kind_long)
-                v = reader_column_data_get_i64(&d, r, &is_null);
+            if (d.kind == qwp_reader_column_kind_long)
+                v = qwp_reader_column_data_get_i64(&d, r, &is_null);
             else
-                v = (int64_t)reader_column_data_get_i32(&d, r, &is_null);
+                v = (int64_t)qwp_reader_column_data_get_i32(&d, r, &is_null);
             captured_value = (long long)v;
             captured_is_null = is_null ? 1 : 0;
         }
@@ -344,9 +344,9 @@ cleanup:
      */
     if (err != NULL)
         questdb_error_free(err);
-    reader_cursor_free(cursor);
-    reader_query_free(query);
-    reader_close(reader);
+    qwp_reader_cursor_free(cursor);
+    qwp_reader_query_free(query);
+    qwp_reader_close(reader);
     return rc;
 }
 

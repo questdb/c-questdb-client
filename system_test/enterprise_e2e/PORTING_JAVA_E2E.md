@@ -387,12 +387,12 @@ scenarios via cmake-built sidecars). All ported duplicates live in
 - [x] `test_graceful_demotion_mid_stream_sender_survives` → C
 - [x] `test_graceful_demotion_mid_stream_sender_survives` → C++
 - [x] egress happy-path read with `target=replica` → C
-      (`qwp_egress_c_sidecar.c`: the always-compiled `reader_*` C API —
+      (`qwp_egress_c_sidecar.c`: the always-compiled `qwp_reader_*` C API —
       verdict: the C API **does** expose the reader,
-      `include/questdb/egress/reader.h`)
+      `include/questdb/egress/qwp_reader.h`)
 - [x] egress happy-path read with `target=replica` → C++
       (`qwp_egress_cpp_sidecar.cpp`: the genuine `questdb::egress`
-      C++ wrapper classes in `reader.hpp`)
+      C++ wrapper classes in `qwp_reader.hpp`)
 
 C-FFI observability substitutions (same precedent as
 `test_orphan_drainer_bindings.py`; details in the module docstring):
@@ -446,7 +446,7 @@ C-FFI observability substitutions (same precedent as
    FLUSH / AWAIT_ACKED / STATS / CLOSE sufficed); NEW egress sidecars
    added (`qwp_egress_c_sidecar.c`, `qwp_egress_cpp_sidecar.cpp`). The
    shared `libquestdb_client` for native sidecars always includes the
-   `reader_*` symbols without a feature flag, and the build helper resolves
+   `qwp_reader_*` symbols without a feature flag, and the build helper resolves
    the platform library name (`.dylib` on macOS, `.so` elsewhere — fixes
    local C/C++ runs on macOS).
 4. Rust sender multi-flush transaction semantics: **verified ABSENT**

@@ -19,8 +19,8 @@ the paths correctly, mirroring the Rust originals:
      -- from ``test_demotion_mid_stream.py``.
   4. egress happy-path read with ``target=replica``
      -- the always-compiled reader C API
-     (``include/questdb/egress/reader.h``) and the genuine C++ wrapper
-     (``reader.hpp``) driven via ``qwp_egress_c_sidecar`` /
+     (``include/questdb/egress/qwp_reader.h``) and the genuine C++ wrapper
+     (``qwp_reader.hpp``) driven via ``qwp_egress_c_sidecar`` /
      ``qwp_egress_cpp_sidecar``.
 
 FFI observability substitutions (same precedent as

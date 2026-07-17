@@ -668,7 +668,7 @@ impl<'a> Chunk<'a> {
     ///
     /// The function is public because callers who erase the lifetime and
     /// manage buffer validity manually — the flush path, and the FFI
-    /// reuse path (`column_sender_chunk_clear`) — do reuse the same
+    /// reuse path (`qwp_chunk_clear`) — do reuse the same
     /// `Chunk` and rely on retaining its capacity.
     pub fn clear(&mut self) {
         self.row_count = None;
@@ -1559,7 +1559,7 @@ impl<'a> Chunk<'a> {
     /// Validity is read from `arr.nulls()` at flush time; the wire-type
     /// byte is fixed at push time from the classified [`arrow_batch::ColumnKind`].
     ///
-    /// Used by `column_sender_chunk_append_arrow_column` (FFI) after
+    /// Used by `qwp_chunk_append_arrow_column` (FFI) after
     /// the caller's `ArrowArray` / `ArrowSchema` has been imported into
     /// an `arrow::array::ArrayRef` and classified.
     #[cfg(feature = "arrow-ingress")]

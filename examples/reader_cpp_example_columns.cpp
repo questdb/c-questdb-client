@@ -29,7 +29,7 @@
 // view (`fixed_view<T>` / `decimal_view` / `varlen_view` / ...), eliminating
 // the per-kind `switch` users would otherwise need.
 
-#include <questdb/egress/reader.hpp>
+#include <questdb/egress/qwp_reader.hpp>
 #include <cstdio>
 #include <cstring>
 #include <iostream>

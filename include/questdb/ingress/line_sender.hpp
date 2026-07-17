@@ -1231,7 +1231,7 @@ private:
     _backend_kind _backend{_backend_kind::ilp};
 
     friend class line_sender;
-    // Pool-borrowed QWP sender (defined in column_sender.hpp) flushes this
+    // Pool-borrowed QWP sender (defined in qwp_sender.hpp) flushes this
     // buffer through `qwp_sender_flush_buffer`, so it needs the same `_impl`
     // access as `line_sender`.
     friend class borrowed_sender;
@@ -1855,8 +1855,8 @@ public:
      * Returns an ILP buffer for the ILP/TCP and ILP/HTTP transports, and a
      * QWP/UDP buffer for the QWP-over-UDP transport. Throws
      * `invalid_api_call` for QWP-over-WebSocket transports — those senders
-     * publish through the column-major `column_sender` chunk API instead;
-     * see `<questdb/ingress/column_sender.hpp>`.
+     * publish through the column-major `qwp_chunk` API instead;
+     * see `<questdb/ingress/qwp_sender.hpp>`.
      */
     line_sender_buffer new_buffer(size_t init_buf_size = 64 * 1024)
     {
@@ -1870,7 +1870,7 @@ public:
             throw line_sender_error{
                 line_sender_error_code::invalid_api_call,
                 "QWP/WebSocket senders do not produce row-by-row buffers; "
-                "use the column_sender chunk API instead."};
+                "use the qwp_chunk API instead."};
         }
         auto backend = line_sender_buffer::_backend_kind::ilp;
         if (sender_protocol == protocol::udp)

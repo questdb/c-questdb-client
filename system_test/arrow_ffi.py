@@ -1,6 +1,6 @@
 """ctypes bindings for the Apache Arrow C Data Interface exports.
 
-Wraps `reader_cursor_next_arrow_batch` (egress) and
+Wraps `qwp_reader_cursor_next_arrow_batch` (egress) and
 `qwp_sender_flush_arrow_batch_at_now[_at_column]` (ingress) from
 `libquestdb_client`. Layout of `ArrowArray` / `ArrowSchema` mirrors
 the Apache Arrow spec:
@@ -26,7 +26,7 @@ from qwp_egress_reader import (  # type: ignore[attr-defined]
 )
 
 
-# Opaque handles defined in `include/questdb/ingress/column_sender.h`.
+# Opaque handles defined in `include/questdb/ingress/qwp_sender.h`.
 class _QuestdbDb(ctypes.Structure):
     """Opaque `questdb_db*` (connection pool)."""
 
@@ -36,7 +36,7 @@ class _QwpSender(ctypes.Structure):
 
 
 class _DirectColumnSender(ctypes.Structure):
-    """Opaque `direct_column_sender*` (borrowed pipelined connection)."""
+    """Opaque `qwp_direct_sender*` (borrowed pipelined connection)."""
 
 
 class ArrowSenderError(_SenderError):
@@ -156,7 +156,7 @@ def _setsig(name, restype, *argtypes):
 
 
 _next_arrow_batch = _setsig(
-    "reader_cursor_next_arrow_batch",
+    "qwp_reader_cursor_next_arrow_batch",
     ctypes.c_int,
     ctypes.POINTER(_LineReaderCursor),
     ctypes.POINTER(ArrowArray),
@@ -166,7 +166,7 @@ _next_arrow_batch = _setsig(
 
 from questdb_line_sender import c_line_sender_column_name  # noqa: E402
 
-# Conn-pool lifecycle (column_sender.h).
+# Conn-pool lifecycle (qwp_sender.h).
 _db_connect = _setsig(
     "questdb_db_connect",
     ctypes.POINTER(_QuestdbDb),
@@ -197,7 +197,7 @@ _db_borrow_conn_with_retry = _setsig(
 )
 
 _db_borrow_direct_conn_with_retry = _setsig(
-    "questdb_db_borrow_direct_column_sender_with_retry",
+    "questdb_db_borrow_direct_sender_with_retry",
     ctypes.POINTER(_DirectColumnSender),
     ctypes.POINTER(_QuestdbDb),
     ctypes.c_uint64,
@@ -255,7 +255,7 @@ _flush_arrow_batch_at_column = _setsig(
 
 
 # Ack barrier over everything published so far (mirrors
-# `qwp_sender_wait` in `column_sender.h`). Acknowledgement levels:
+# `qwp_sender_wait` in `qwp_sender.h`). Acknowledgement levels:
 #   0 → wait for WAL-commit
 #   1 → wait for object-store durability watermarks
 _column_sender_sync = _setsig(
@@ -269,7 +269,7 @@ _column_sender_sync = _setsig(
 
 
 def next_arrow_batch(cursor_ptr) -> Tuple[int, ArrowArray, ArrowSchema]:
-    """Drive `reader_cursor_next_arrow_batch`. On OK, returns the
+    """Drive `qwp_reader_cursor_next_arrow_batch`. On OK, returns the
     populated structs; the caller becomes responsible for invoking the
     `release` callback inside each struct."""
     arr = ArrowArray()
@@ -362,7 +362,7 @@ def db_borrow_conn_with_retry(db_ptr, budget_ms: int):
 
 
 def db_borrow_direct_conn_with_retry(db_ptr, budget_ms: int):
-    """Borrow a pipelined (Direct) `direct_column_sender*`, retrying the
+    """Borrow a pipelined (Direct) `qwp_direct_sender*`, retrying the
     connect within `budget_ms` (`0` makes a single attempt)."""
     err_ref = ctypes.POINTER(_LineSenderError)()
     conn = _db_borrow_direct_conn_with_retry(db_ptr, budget_ms, ctypes.byref(err_ref))

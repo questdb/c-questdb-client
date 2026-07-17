@@ -162,7 +162,7 @@ def _build_native_sidecar(*, src_name: str, bin_name: str,
     ffi_manifest = client_root / "questdb-rs-ffi" / "Cargo.toml"
     if not ffi_manifest.is_file():
         raise RuntimeError(f"questdb-rs-ffi Cargo.toml not found at {ffi_manifest}")
-    # One shared library for every native sidecar. The `reader_*` egress
+    # One shared library for every native sidecar. The `qwp_reader_*` egress
     # surface is always compiled into the C ABI (on the same footing as the
     # ingress line_sender surface), so no feature flag is needed — the egress
     # and ingress sidecars link against the same artifact.
@@ -222,7 +222,7 @@ def build_cpp_sidecar() -> Path:
 
 
 def build_c_egress_sidecar() -> Path:
-    """Build the C-binding ``qwp_egress_c_sidecar`` (QWP egress ``reader_*``
+    """Build the C-binding ``qwp_egress_c_sidecar`` (QWP egress ``qwp_reader_*``
     C API, always compiled into the shared library)."""
     return _build_native_sidecar(
         src_name="qwp_egress_c_sidecar.c", bin_name="qwp_egress_c_sidecar",
@@ -232,7 +232,7 @@ def build_c_egress_sidecar() -> Path:
 def build_cpp_egress_sidecar() -> Path:
     """Build the C++-binding ``qwp_egress_cpp_sidecar``. Unlike the ingress
     case, the egress C++ wrapper (``questdb::egress::reader`` in
-    ``reader.hpp``) is a genuine C++ surface, so this sidecar drives the
+    ``qwp_reader.hpp``) is a genuine C++ surface, so this sidecar drives the
     public standalone reader directly, matching the Rust sidecar's
     ``Reader::from_conf`` shape."""
     return _build_native_sidecar(
@@ -391,7 +391,7 @@ class CClientRustEgressSidecar(EgressSidecar):
 @dataclass
 class CClientCEgressSidecar(CClientRustEgressSidecar):
     """c-questdb-client **C-binding** egress (read-side) sidecar
-    (``qwp_egress_c_sidecar``): the ``reader_*`` C API driven from a C11
+    (``qwp_egress_c_sidecar``): the ``qwp_reader_*`` C API driven from a C11
     translation unit. Its reduced protocol omits the ``SERVER_INFO zone=``
     token (the Python wrapper defaults it to unset), and ``SHOW_ZONE`` /
     ``QUERY_ROW`` reply ``ERR unsupported``."""

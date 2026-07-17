@@ -1025,7 +1025,7 @@ impl QuestDb {
     /// FFI escape hatch: like [`Self::borrow_direct_column_sender`] but the
     /// returned handle is not lifetime-bound to `&self` (carries an
     /// `Arc<DbInner>` so it can outlive the user-facing `QuestDb` pointer).
-    /// Backs the C ABI's `questdb_db_borrow_direct_column_sender`. Hidden from
+    /// Backs the C ABI's `questdb_db_borrow_direct_sender`. Hidden from
     /// the Rust API; Rust callers should prefer the lifetime-bound
     /// [`Self::borrow_direct_column_sender`].
     #[cfg(feature = "ffi-support")]
@@ -1036,7 +1036,7 @@ impl QuestDb {
 
     /// Like [`borrow_direct_column_sender_owned`] but retries the connect
     /// within `budget` using the reconnect backoff. Backs the C ABI's
-    /// `questdb_db_borrow_direct_column_sender_with_retry`.
+    /// `questdb_db_borrow_direct_sender_with_retry`.
     #[cfg(feature = "ffi-support")]
     pub(crate) fn borrow_direct_column_sender_owned_with_retry(
         &self,
@@ -2123,7 +2123,7 @@ impl Drop for DirectSenderHandle<'_> {
 ///
 /// Holds an `Arc<DbInner>` so the pool's return path outlives the
 /// user-facing `QuestDb` pointer — the C ABI can free its `questdb_db*`
-/// before dropping outstanding `qwp_sender*` or `direct_column_sender*`
+/// before dropping outstanding `qwp_sender*` or `qwp_direct_sender*`
 /// handles. After pool close, returned handles are dropped instead of recycled.
 #[cfg(feature = "ffi-support")]
 pub struct OwnedSender {
@@ -2419,7 +2419,7 @@ impl OwnedReader {
     /// After this call, `Drop` no longer decrements the pool's
     /// `in_use` counter — the caller has assumed responsibility for
     /// either dropping the returned `Reader` into oblivion (e.g.
-    /// `reader_close`'s leak-on-active branch) or routing it
+    /// `qwp_reader_close`'s leak-on-active branch) or routing it
     /// back to the pool via [`ReaderPoolHandle::return_reader`].
     /// Forgetting both permanently burns one pool slot.
     pub fn take(mut self) -> Option<Reader> {
@@ -2461,7 +2461,7 @@ impl ReaderPoolHandle {
 
     /// Release the `in_use` slot that was reserved when this reader
     /// was borrowed, without returning the `Reader` itself. Used by
-    /// the FFI leak-on-active path: when a `reader_close` arrives
+    /// the FFI leak-on-active path: when a `qwp_reader_close` arrives
     /// with a cursor still live, the underlying `Reader` cannot be
     /// extracted (UnsafeCell aliasing with the in-flight `&mut Reader`),
     /// so it leaks — but the pool's borrow accounting must still drop

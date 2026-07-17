@@ -1,4 +1,4 @@
-#include <questdb/egress/reader.h>
+#include <questdb/egress/qwp_reader.h>
 #include <inttypes.h>
 #include <stdio.h>
 #include <string.h>
@@ -55,17 +55,17 @@ int main(int argc, const char* argv[])
     (void)argv;
 
     questdb_error* err = NULL;
-    reader* reader = NULL;
-    reader_cursor* cursor = NULL;
+    qwp_reader* reader = NULL;
+    qwp_reader_cursor* cursor = NULL;
 
     line_sender_utf8 conf = QDB_UTF8_LITERAL("ws::addr=localhost:9000;");
-    reader = reader_from_conf(conf, &err);
+    reader = qwp_reader_from_conf(conf, &err);
     if (!reader)
         goto on_error;
 
     line_sender_utf8 sql = QDB_UTF8_LITERAL(
         "SELECT x AS n, x * 1.5 AS d FROM long_sequence(5)");
-    cursor = reader_execute(reader, sql, &err);
+    cursor = qwp_reader_execute(reader, sql, &err);
     if (!cursor)
         goto on_error;
 
@@ -73,11 +73,11 @@ int main(int argc, const char* argv[])
     {
         struct ArrowArray arr;
         struct ArrowSchema sch;
-        reader_arrow_batch_result rc =
-            reader_cursor_next_arrow_batch(cursor, &arr, &sch, &err);
-        if (rc == reader_arrow_batch_end)
+        qwp_reader_arrow_batch_result rc =
+            qwp_reader_cursor_next_arrow_batch(cursor, &arr, &sch, &err);
+        if (rc == qwp_reader_arrow_batch_end)
             break;
-        if (rc == reader_arrow_batch_error)
+        if (rc == qwp_reader_arrow_batch_error)
             goto on_error;
 
         print_batch(&arr, &sch);
@@ -88,8 +88,8 @@ int main(int argc, const char* argv[])
             sch.release(&sch);
     }
 
-    reader_cursor_free(cursor);
-    reader_close(reader);
+    qwp_reader_cursor_free(cursor);
+    qwp_reader_close(reader);
     return 0;
 
 on_error:;
@@ -97,7 +97,7 @@ on_error:;
     const char* err_msg = questdb_error_msg(err, &err_len);
     fprintf(stderr, "Error: %.*s\n", (int)err_len, err_msg);
     questdb_error_free(err);
-    reader_cursor_free(cursor);
-    reader_close(reader);
+    qwp_reader_cursor_free(cursor);
+    qwp_reader_close(reader);
     return 1;
 }

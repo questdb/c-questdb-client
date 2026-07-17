@@ -111,7 +111,7 @@ def arrow_cursor(fixture, sql: str):
     from test import skip_if_unsupported_qwp_ws_fixture
     conf_utf8 = _utf8(egress_conf(fixture))
     err_ref = ctypes.POINTER(_LineReaderError)()
-    reader = _DLL.reader_from_conf(conf_utf8, ctypes.byref(err_ref))
+    reader = _DLL.qwp_reader_from_conf(conf_utf8, ctypes.byref(err_ref))
     if not reader:
         err = _take_error(err_ref)
         skip_if_unsupported_qwp_ws_fixture(err, fixture)
@@ -119,15 +119,15 @@ def arrow_cursor(fixture, sql: str):
     try:
         sql_utf8 = _utf8(sql)
         err_ref = ctypes.POINTER(_LineReaderError)()
-        cursor = _DLL.reader_execute(reader, sql_utf8, ctypes.byref(err_ref))
+        cursor = _DLL.qwp_reader_execute(reader, sql_utf8, ctypes.byref(err_ref))
         if not cursor:
             raise _take_error(err_ref)
         try:
             yield cursor
         finally:
-            _DLL.reader_cursor_free(cursor)
+            _DLL.qwp_reader_cursor_free(cursor)
     finally:
-        _DLL.reader_close(reader)
+        _DLL.qwp_reader_close(reader)
 
 @contextlib.contextmanager
 def existing_sender(fixture, *, sender_id: Optional[str] = None,

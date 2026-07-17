@@ -1,4 +1,4 @@
-#include <questdb/egress/reader.hpp>
+#include <questdb/egress/qwp_reader.hpp>
 
 #include <arrow/array.h>
 #include <arrow/c/bridge.h>

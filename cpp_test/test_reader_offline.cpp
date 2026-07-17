@@ -30,8 +30,8 @@
 #define DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN
 #include "doctest.h"
 
-#include <questdb/egress/reader.h>
-#include <questdb/egress/reader.hpp>
+#include <questdb/egress/qwp_reader.h>
+#include <questdb/egress/qwp_reader.hpp>
 
 // Pin the client-wide `questdb_error_*` spellings to the discriminants of the
 // released line-sender ABI they extend. A copy-paste slip in an alias is
@@ -105,9 +105,9 @@ TEST_CASE("free / close functions are NULL-idempotent")
     // None of these should crash; a regression that drops the NULL guard
     // would SIGSEGV here and fail the test rather than silently passing.
     questdb_error_free(nullptr);
-    reader_close(nullptr);
-    reader_query_free(nullptr);
-    reader_cursor_free(nullptr);
+    qwp_reader_close(nullptr);
+    qwp_reader_query_free(nullptr);
+    qwp_reader_cursor_free(nullptr);
 }
 
 TEST_CASE("error accessors are NULL-safe (M-13)")
@@ -138,8 +138,8 @@ TEST_CASE("error accessors are NULL-safe (M-13)")
 //   1. "Idempotent on NULL" — the various `_free` / `_close` paths and
 //      the error accessors. Tested above.
 //   2. "Returns a documented sentinel on NULL" — the reader stat getters,
-//      every `reader_server_info_*` accessor, and every
-//      `reader_failover_reset_event_*` accessor. Their guard is a cheap
+//      every `qwp_reader_server_info_*` accessor, and every
+//      `qwp_reader_failover_reset_event_*` accessor. Their guard is a cheap
 //      `is_null()` check; a regression that drops the guard would cause
 //      a SIGSEGV here rather than returning the documented sentinel.
 //
@@ -152,20 +152,20 @@ TEST_CASE("error accessors are NULL-safe (M-13)")
 
 TEST_CASE("reader stat / accessor getters return documented sentinels on NULL")
 {
-    CHECK(reader_bytes_received(nullptr) == 0);
-    CHECK(reader_credit_granted_total(nullptr) == 0);
-    CHECK(reader_read_ns(nullptr) == 0);
-    CHECK(reader_decode_ns(nullptr) == 0);
+    CHECK(qwp_reader_bytes_received(nullptr) == 0);
+    CHECK(qwp_reader_credit_granted_total(nullptr) == 0);
+    CHECK(qwp_reader_read_ns(nullptr) == 0);
+    CHECK(qwp_reader_decode_ns(nullptr) == 0);
 
     // Mutating no-op: must not crash, no observable state change.
-    reader_reset_timing(nullptr);
+    qwp_reader_reset_timing(nullptr);
 
     {
         // _server_version: returns false, populates *err_out when err_out
         // is non-NULL.
         questdb_error* err = nullptr;
         uint8_t version = 0xAB;
-        bool ok = reader_server_version(nullptr, &version, &err);
+        bool ok = qwp_reader_server_version(nullptr, &version, &err);
         CHECK_FALSE(ok);
         REQUIRE(err != nullptr);
         CHECK(questdb_error_get_code(err) ==
@@ -176,50 +176,50 @@ TEST_CASE("reader stat / accessor getters return documented sentinels on NULL")
         // _server_version with err_out itself NULL: must not write
         // through the NULL pointer.
         uint8_t version = 0xAB;
-        bool ok = reader_server_version(nullptr, &version, nullptr);
+        bool ok = qwp_reader_server_version(nullptr, &version, nullptr);
         CHECK_FALSE(ok);
     }
 
-    CHECK(reader_current_server_info(nullptr) == nullptr);
+    CHECK(qwp_reader_current_server_info(nullptr) == nullptr);
 
     {
         const char* host_buf = reinterpret_cast<const char*>(0x1);
         size_t host_len = 999;
-        reader_current_addr_host(nullptr, &host_buf, &host_len);
+        qwp_reader_current_addr_host(nullptr, &host_buf, &host_len);
         CHECK(host_buf == nullptr);
         CHECK(host_len == 0);
     }
 
-    CHECK(reader_current_addr_port(nullptr) == 0);
+    CHECK(qwp_reader_current_addr_port(nullptr) == 0);
 }
 
 TEST_CASE("server_info accessors return documented sentinels on NULL")
 {
-    CHECK(reader_server_info_role(nullptr) ==
-          reader_server_role_other);
-    CHECK(reader_server_info_role_byte(nullptr) == 0xFF);
-    CHECK(reader_server_info_epoch(nullptr) == 0);
-    CHECK(reader_server_info_capabilities(nullptr) == 0);
-    CHECK(reader_server_info_server_wall_ns(nullptr) == 0);
+    CHECK(qwp_reader_server_info_role(nullptr) ==
+          qwp_reader_server_role_other);
+    CHECK(qwp_reader_server_info_role_byte(nullptr) == 0xFF);
+    CHECK(qwp_reader_server_info_epoch(nullptr) == 0);
+    CHECK(qwp_reader_server_info_capabilities(nullptr) == 0);
+    CHECK(qwp_reader_server_info_server_wall_ns(nullptr) == 0);
 
     {
         const char* buf = reinterpret_cast<const char*>(0x1);
         size_t len = 999;
-        reader_server_info_cluster_id(nullptr, &buf, &len);
+        qwp_reader_server_info_cluster_id(nullptr, &buf, &len);
         CHECK(buf == nullptr);
         CHECK(len == 0);
     }
     {
         const char* buf = reinterpret_cast<const char*>(0x1);
         size_t len = 999;
-        reader_server_info_node_id(nullptr, &buf, &len);
+        qwp_reader_server_info_node_id(nullptr, &buf, &len);
         CHECK(buf == nullptr);
         CHECK(len == 0);
     }
     {
         const char* buf = reinterpret_cast<const char*>(0x1);
         size_t len = 999;
-        CHECK_FALSE(reader_server_info_zone_id(nullptr, &buf, &len));
+        CHECK_FALSE(qwp_reader_server_info_zone_id(nullptr, &buf, &len));
         CHECK(buf == nullptr);
         CHECK(len == 0);
     }
@@ -245,41 +245,41 @@ TEST_CASE("failover_event accessors return documented sentinels on NULL")
     {
         const char* buf = reinterpret_cast<const char*>(0x1);
         size_t len = 999;
-        reader_failover_reset_event_failed_host(nullptr, &buf, &len);
+        qwp_reader_failover_reset_event_failed_host(nullptr, &buf, &len);
         CHECK(buf == nullptr);
         CHECK(len == 0);
     }
-    CHECK(reader_failover_reset_event_failed_port(nullptr) == 0);
+    CHECK(qwp_reader_failover_reset_event_failed_port(nullptr) == 0);
 
     {
         const char* buf = reinterpret_cast<const char*>(0x1);
         size_t len = 999;
-        reader_failover_reset_event_new_host(nullptr, &buf, &len);
+        qwp_reader_failover_reset_event_new_host(nullptr, &buf, &len);
         CHECK(buf == nullptr);
         CHECK(len == 0);
     }
-    CHECK(reader_failover_reset_event_new_port(nullptr) == 0);
-    CHECK(reader_failover_reset_event_new_request_id(nullptr) == 0);
-    CHECK(reader_failover_reset_event_attempts(nullptr) == 0);
-    CHECK(reader_failover_reset_event_elapsed_ns(nullptr) == 0);
+    CHECK(qwp_reader_failover_reset_event_new_port(nullptr) == 0);
+    CHECK(qwp_reader_failover_reset_event_new_request_id(nullptr) == 0);
+    CHECK(qwp_reader_failover_reset_event_attempts(nullptr) == 0);
+    CHECK(qwp_reader_failover_reset_event_elapsed_ns(nullptr) == 0);
 
     // _trigger_code mirrors `_error_get_code(NULL)`: same sentinel.
-    CHECK(reader_failover_reset_event_trigger_code(nullptr) ==
+    CHECK(qwp_reader_failover_reset_event_trigger_code(nullptr) ==
           questdb_error_invalid_api_call);
 
     {
         const char* buf = reinterpret_cast<const char*>(0x1);
         size_t len = 999;
-        reader_failover_reset_event_trigger_msg(nullptr, &buf, &len);
+        qwp_reader_failover_reset_event_trigger_msg(nullptr, &buf, &len);
         CHECK(buf == nullptr);
         CHECK(len == 0);
     }
 
-    CHECK(reader_failover_reset_event_server_info(nullptr) == nullptr);
+    CHECK(qwp_reader_failover_reset_event_server_info(nullptr) == nullptr);
 }
 
 // ---------------------------------------------------------------------------
-// `reader_from_conf` rejection paths — exercise the ConfigError surface.
+// `qwp_reader_from_conf` rejection paths — exercise the ConfigError surface.
 // ---------------------------------------------------------------------------
 
 TEST_CASE("from_conf rejects malformed config strings as ConfigError")
@@ -306,7 +306,7 @@ TEST_CASE("from_conf rejects malformed config strings as ConfigError")
         CAPTURE(c.what);
         questdb_error* err = nullptr;
         line_sender_utf8 conf{strlen(c.conf), c.conf};
-        reader* r = reader_from_conf(conf, &err);
+        qwp_reader* r = qwp_reader_from_conf(conf, &err);
         REQUIRE(r == nullptr);
         REQUIRE(err != nullptr);
         CHECK(questdb_error_get_code(err) ==
@@ -330,7 +330,7 @@ TEST_CASE("from_conf surfaces a connect-time error against a closed port")
 {
     questdb_error* err = nullptr;
     line_sender_utf8 conf{strlen(CLOSED_PORT_CONF), CLOSED_PORT_CONF};
-    reader* r = reader_from_conf(conf, &err);
+    qwp_reader* r = qwp_reader_from_conf(conf, &err);
     REQUIRE(r == nullptr);
     REQUIRE(err != nullptr);
 
@@ -350,7 +350,7 @@ TEST_CASE("from_conf surfaces a connect-time error against a closed port")
 }
 
 // ---------------------------------------------------------------------------
-// `reader_from_env` — env var lookup + delegation to from_conf.
+// `qwp_reader_from_env` — env var lookup + delegation to from_conf.
 // ---------------------------------------------------------------------------
 
 TEST_CASE("from_env returns ConfigError when QDB_CLIENT_CONF is unset")
@@ -358,7 +358,7 @@ TEST_CASE("from_env returns ConfigError when QDB_CLIENT_CONF is unset")
     REQUIRE(unset_env("QDB_CLIENT_CONF") == 0);
 
     questdb_error* err = nullptr;
-    reader* r = reader_from_env(&err);
+    qwp_reader* r = qwp_reader_from_env(&err);
     REQUIRE(r == nullptr);
     REQUIRE(err != nullptr);
     CHECK(questdb_error_get_code(err) ==
@@ -376,7 +376,7 @@ TEST_CASE("from_env propagates parser errors when QDB_CLIENT_CONF is malformed")
     REQUIRE(set_env("QDB_CLIENT_CONF", "not_a_valid_config_string") == 0);
 
     questdb_error* err = nullptr;
-    reader* r = reader_from_env(&err);
+    qwp_reader* r = qwp_reader_from_env(&err);
     REQUIRE(r == nullptr);
     REQUIRE(err != nullptr);
     CHECK(questdb_error_get_code(err) ==
@@ -397,7 +397,7 @@ TEST_CASE("from_env distinguishes invalid-UTF-8 env value from unset")
     REQUIRE(setenv("QDB_CLIENT_CONF", "ws::addr=h:1\xC3\x28", 1) == 0);
 
     questdb_error* err = nullptr;
-    reader* r = reader_from_env(&err);
+    qwp_reader* r = qwp_reader_from_env(&err);
     REQUIRE(r == nullptr);
     REQUIRE(err != nullptr);
     // Previously this collapsed to "not set" (ConfigError); the M-10 fix
@@ -415,7 +415,7 @@ TEST_CASE("from_env reaches the connect path when QDB_CLIENT_CONF is parseable")
     REQUIRE(set_env("QDB_CLIENT_CONF", CLOSED_PORT_CONF) == 0);
 
     questdb_error* err = nullptr;
-    reader* r = reader_from_env(&err);
+    qwp_reader* r = qwp_reader_from_env(&err);
     CHECK(r == nullptr);
     REQUIRE(err != nullptr);
     // We don't pin the code — connect-failure shape varies — but it must
@@ -506,7 +506,7 @@ TEST_CASE("questdb_error_msg is stable across repeated reads")
 {
     questdb_error* err = nullptr;
     line_sender_utf8 conf{0, ""};
-    reader* r = reader_from_conf(conf, &err);
+    qwp_reader* r = qwp_reader_from_conf(conf, &err);
     REQUIRE(r == nullptr);
     REQUIRE(err != nullptr);
 
@@ -528,7 +528,7 @@ TEST_CASE("questdb_error_get_code is stable across repeated reads")
 {
     questdb_error* err = nullptr;
     line_sender_utf8 conf{0, ""};
-    reader* r = reader_from_conf(conf, &err);
+    qwp_reader* r = qwp_reader_from_conf(conf, &err);
     REQUIRE(r == nullptr);
     REQUIRE(err != nullptr);
 
@@ -548,7 +548,7 @@ TEST_CASE("from_conf rejects invalid UTF-8 with InvalidUtf8")
     static const unsigned char bad[] = {'q', 'w', 'p', ':', ':', 0x80, 0x00};
     line_sender_utf8 conf{6, reinterpret_cast<const char*>(bad)};
     questdb_error* err = nullptr;
-    reader* r = reader_from_conf(conf, &err);
+    qwp_reader* r = qwp_reader_from_conf(conf, &err);
     REQUIRE(r == nullptr);
     REQUIRE(err != nullptr);
     CHECK(questdb_error_get_code(err) == questdb_error_invalid_utf8);

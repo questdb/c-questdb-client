@@ -1,4 +1,4 @@
-#include <questdb/egress/reader.hpp>
+#include <questdb/egress/qwp_reader.hpp>
 #include <iostream>
 
 using namespace questdb::ingress::literals;

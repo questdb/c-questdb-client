@@ -670,7 +670,7 @@ impl Reader {
     }
 
     /// Borrow the shared diagnostic counters. The FFI clones this at
-    /// `reader_from_conf` time so its stat getters can read the
+    /// `qwp_reader_from_conf` time so its stat getters can read the
     /// counters without touching the `UnsafeCell<Reader>` that holds
     /// this Reader — eliminating the aliasing question of "what
     /// happens when a stat getter synthesises a `&Reader` while a
@@ -3282,7 +3282,7 @@ mod tests {
         assert_eq!(alias.read_ns.load(Ordering::Relaxed), 1_000);
         assert_eq!(alias.decode_ns.load(Ordering::Relaxed), 500);
         // Reset via the inner Reader's API is visible through the
-        // FFI's clone too (the contract of `reader_reset_timing`).
+        // FFI's clone too (the contract of `qwp_reader_reset_timing`).
         alias.read_ns.store(0, Ordering::Relaxed);
         alias.decode_ns.store(0, Ordering::Relaxed);
         assert_eq!(stats.read_ns.load(Ordering::Relaxed), 0);

@@ -31,7 +31,7 @@ option(
     "Build shared library dependencies instead of static."
     OFF)
 
-# The synchronous WebSocket egress reader (`reader_*` C/C++ surface) is
+# The synchronous WebSocket egress reader (`qwp_reader_*` C/C++ surface) is
 # always compiled in, on the same footing as the line senders — it is not
 # gated by any option. This pulls in the `tungstenite` + `zstd` Rust crates
 # as transitive dependencies. (The Rust-side switch still exists as the

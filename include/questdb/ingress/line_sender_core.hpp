@@ -49,7 +49,7 @@ namespace questdb
 // senders and read-side readers — while the sender/error machinery lives in
 // `questdb::ingress`. Declared here so `ingress` classes can befriend
 // `::questdb::pool` and the egress reader can reference it, without its
-// definition (which lives in `column_sender.hpp`).
+// definition (which lives in `qwp_sender.hpp`).
 class pool;
 
 /**

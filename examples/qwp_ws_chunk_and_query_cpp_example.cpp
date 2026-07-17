@@ -18,8 +18,8 @@
 //
 // The example recreates its own `cpp_shared_pool_trades` table on every run.
 
-#include <questdb/egress/reader.hpp>
-#include <questdb/ingress/column_sender.hpp>
+#include <questdb/egress/qwp_reader.hpp>
+#include <questdb/ingress/qwp_sender.hpp>
 
 #include <array>
 #include <chrono>

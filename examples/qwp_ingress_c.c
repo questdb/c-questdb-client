@@ -2,7 +2,7 @@
  * (doc/historical/QWP_DATAFRAME_BENCH_PLAN.md §6 Step 3).
  * Measures the columnar C API end-to-end on the shared S1/S2 schemas:
  *   chunk-build   (floor) — stage all batches into a chunk, no network
- *   flush-chunks  (e2e)   — stage + direct_column_sender_flush per
+ *   flush-chunks  (e2e)   — stage + qwp_direct_sender_flush per
  *                            MAX_BATCH_ROWS batch, commit(ok) checkpoint
  *                            every 64 batches, final commit(ok) (mirrors the
  *                            Rust flush_polars_dataframe checkpoint pipeline)
@@ -15,7 +15,7 @@
 #include <stdlib.h>
 #include <string.h>
 
-#include <questdb/ingress/column_sender.h>
+#include <questdb/ingress/qwp_sender.h>
 
 #include "bench_http_c.h"
 #include "bench_ingest_c.h"
@@ -27,8 +27,8 @@
 /* One parallel sender: its own connection, chunk, scratch and row range.
  * bench_die() exits the whole process on error — acceptable for a bench. */
 typedef struct {
-    direct_column_sender* sender;
-    column_sender_chunk* chunk;
+    qwp_direct_sender* sender;
+    qwp_chunk* chunk;
     const bench_data* d;
     schema_kind kind;
     size_t lo, hi, max_batch_rows;
@@ -100,7 +100,7 @@ int main(void)
     json_obj* headline = json_obj_new();
 
     /* ---- floor: chunk-build (no server) ---- */
-    column_sender_chunk* chunk = column_sender_chunk_new(table, strlen(table), &err);
+    qwp_chunk* chunk = qwp_chunk_new(table, strlen(table), &err);
     if (!chunk) bench_die(PROG, "chunk_new", err);
     stage_scratch floor_scratch = {0};
     for (size_t w = 0; w < warmups; w++)
@@ -141,9 +141,9 @@ int main(void)
         for (size_t k = 0; k < n_senders; k++) {
             dbs[k] = questdb_db_connect(conf, strlen(conf), &err);
             if (!dbs[k]) bench_die(PROG, "connect", err);
-            jobs[k].sender = questdb_db_borrow_direct_column_sender(dbs[k], &err);
+            jobs[k].sender = questdb_db_borrow_direct_sender(dbs[k], &err);
             if (!jobs[k].sender) bench_die(PROG, "borrow sender", err);
-            jobs[k].chunk = column_sender_chunk_new(table, strlen(table), &err);
+            jobs[k].chunk = qwp_chunk_new(table, strlen(table), &err);
             if (!jobs[k].chunk) bench_die(PROG, "chunk_new", err);
             jobs[k].d = &d;
             jobs[k].kind = kind;
@@ -164,9 +164,9 @@ int main(void)
             path_summary(wall, cpu, iterations, rows, columns, 0, "e2e", warmups > 0));
 
         for (size_t k = 0; k < n_senders; k++) {
-            questdb_db_return_direct_column_sender(dbs[k], jobs[k].sender);
+            questdb_db_return_direct_sender(dbs[k], jobs[k].sender);
             questdb_db_close(dbs[k]);
-            column_sender_chunk_free(jobs[k].chunk);
+            qwp_chunk_free(jobs[k].chunk);
             free(jobs[k].scratch.note_off);
         }
         free(jobs);
@@ -177,7 +177,7 @@ int main(void)
     } else {
         fprintf(stderr, "[" PROG "] SKIP_E2E: floor only\n");
     }
-    column_sender_chunk_free(chunk);
+    qwp_chunk_free(chunk);
 
     /* ---- report ---- */
     json_obj* report = json_obj_new();

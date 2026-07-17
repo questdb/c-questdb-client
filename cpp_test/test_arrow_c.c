@@ -4,8 +4,8 @@
  * unit tests under `questdb-rs/src/ingress/qwp_sender/arrow_batch.rs`
  * and the Python system tests under `system_test/`. */
 
-#include <questdb/ingress/column_sender.h>
-#include <questdb/egress/reader.h>
+#include <questdb/ingress/qwp_sender.h>
+#include <questdb/egress/qwp_reader.h>
 #include <questdb/ingress/line_sender.h>
 
 #include "qwp_mock_c.h"
@@ -71,9 +71,9 @@ static line_sender_column_name make_col(const char* name)
 
 TEST(test_tristate_egress_enum_values)
 {
-    CHECK(reader_arrow_batch_ok == 0, "ok = 0");
-    CHECK(reader_arrow_batch_end == 1, "end = 1");
-    CHECK(reader_arrow_batch_error == 2, "error = 2");
+    CHECK(qwp_reader_arrow_batch_ok == 0, "ok = 0");
+    CHECK(qwp_reader_arrow_batch_end == 1, "end = 1");
+    CHECK(qwp_reader_arrow_batch_error == 2, "error = 2");
 }
 
 TEST(test_appended_query_error_codes_have_distinct_values)
@@ -99,9 +99,9 @@ TEST(test_egress_null_cursor_returns_error_tristate)
     struct ArrowArray arr;
     struct ArrowSchema sch;
     questdb_error* err = NULL;
-    reader_arrow_batch_result rc =
-        reader_cursor_next_arrow_batch(NULL, &arr, &sch, &err);
-    CHECK(rc == reader_arrow_batch_error, "NULL cursor → error");
+    qwp_reader_arrow_batch_result rc =
+        qwp_reader_cursor_next_arrow_batch(NULL, &arr, &sch, &err);
+    CHECK(rc == qwp_reader_arrow_batch_error, "NULL cursor → error");
     CHECK(err != NULL, "err_out populated");
     if (err)
         questdb_error_free(err);
@@ -111,9 +111,9 @@ TEST(test_egress_null_out_array_returns_error_tristate)
 {
     struct ArrowSchema sch;
     questdb_error* err = NULL;
-    reader_arrow_batch_result rc =
-        reader_cursor_next_arrow_batch(NULL, NULL, &sch, &err);
-    CHECK(rc == reader_arrow_batch_error, "NULL out_array → error");
+    qwp_reader_arrow_batch_result rc =
+        qwp_reader_cursor_next_arrow_batch(NULL, NULL, &sch, &err);
+    CHECK(rc == qwp_reader_arrow_batch_error, "NULL out_array → error");
     if (err)
         questdb_error_free(err);
 }
@@ -180,7 +180,7 @@ TEST(test_ingress_at_column_null_conn_returns_false)
     }
 }
 
-/* -- Per-column Arrow appender (column_sender_chunk_append_arrow_column) -- */
+/* -- Per-column Arrow appender (qwp_chunk_append_arrow_column) -- */
 
 static void noop_array_release(struct ArrowArray* a)
 {
@@ -199,7 +199,7 @@ TEST(test_chunk_append_arrow_column_null_chunk)
     memset(&arr, 0, sizeof(arr));
     memset(&sch, 0, sizeof(sch));
     line_sender_error* err = NULL;
-    bool ok = column_sender_chunk_append_arrow_column(
+    bool ok = qwp_chunk_append_arrow_column(
         NULL, "v", 1, &arr, &sch, 0, 0, &err);
     CHECK(!ok, "NULL chunk → false");
     CHECK(err != NULL, "err_out populated");
@@ -216,12 +216,12 @@ TEST(test_chunk_append_arrow_column_null_chunk)
 TEST(test_chunk_append_arrow_column_null_array_schema)
 {
     line_sender_error* err = NULL;
-    column_sender_chunk* chunk = column_sender_chunk_new("t", 1, &err);
+    qwp_chunk* chunk = qwp_chunk_new("t", 1, &err);
     CHECK(chunk != NULL, "chunk constructed");
     CHECK(err == NULL, "no err on chunk_new");
     if (!chunk)
         return;
-    bool ok = column_sender_chunk_append_arrow_column(
+    bool ok = qwp_chunk_append_arrow_column(
         chunk, "v", 1, NULL, NULL, 0, 0, &err);
     CHECK(!ok, "NULL array+schema → false");
     CHECK(err != NULL, "err_out populated");
@@ -233,13 +233,13 @@ TEST(test_chunk_append_arrow_column_null_array_schema)
             "NULL array+schema → invalid_api_call");
         line_sender_error_free(err);
     }
-    column_sender_chunk_free(chunk);
+    qwp_chunk_free(chunk);
 }
 
 TEST(test_chunk_append_arrow_column_valid_i64_smoke)
 {
     line_sender_error* err = NULL;
-    column_sender_chunk* chunk = column_sender_chunk_new("t", 1, &err);
+    qwp_chunk* chunk = qwp_chunk_new("t", 1, &err);
     CHECK(chunk != NULL, "chunk constructed");
     if (!chunk)
         return;
@@ -275,20 +275,20 @@ TEST(test_chunk_append_arrow_column_valid_i64_smoke)
     sch.release = noop_schema_release;
     sch.private_data = NULL;
 
-    bool ok = column_sender_chunk_append_arrow_column(
+    bool ok = qwp_chunk_append_arrow_column(
         chunk, "v", 1, &arr, &sch, 0, 1, &err);
     CHECK(ok, "valid i64 append → true");
     CHECK(err == NULL, "no err on success");
     if (err)
         line_sender_error_free(err);
-    CHECK(column_sender_chunk_row_count(chunk, NULL) == 1, "row_count == 1");
-    column_sender_chunk_free(chunk);
+    CHECK(qwp_chunk_row_count(chunk, NULL) == 1, "row_count == 1");
+    qwp_chunk_free(chunk);
 }
 
-static column_sender_chunk* make_chunk_t(void)
+static qwp_chunk* make_chunk_t(void)
 {
     line_sender_error* err = NULL;
-    column_sender_chunk* chunk = column_sender_chunk_new("t", 1, &err);
+    qwp_chunk* chunk = qwp_chunk_new("t", 1, &err);
     if (err)
         line_sender_error_free(err);
     return chunk;
@@ -328,11 +328,11 @@ TEST(test_chunk_append_numpy_column_null_chunk)
 {
     int64_t data[] = {1, 2, 3};
     line_sender_error* err = NULL;
-    bool ok = column_sender_chunk_append_numpy_column(
+    bool ok = qwp_chunk_append_numpy_column(
         NULL,
         "v",
         1,
-        column_sender_numpy_i64,
+        qwp_numpy_i64,
         (const uint8_t*)data,
         sizeof(data),
         3,
@@ -347,17 +347,17 @@ TEST(test_chunk_append_numpy_column_null_chunk)
 
 TEST(test_chunk_append_numpy_column_i64_smoke)
 {
-    column_sender_chunk* chunk = make_chunk_t();
+    qwp_chunk* chunk = make_chunk_t();
     CHECK(chunk != NULL, "chunk constructed");
     if (!chunk)
         return;
     int64_t data[] = {1, 2, 3};
     line_sender_error* err = NULL;
-    bool ok = column_sender_chunk_append_numpy_column(
+    bool ok = qwp_chunk_append_numpy_column(
         chunk,
         "v",
         1,
-        column_sender_numpy_i64,
+        qwp_numpy_i64,
         (const uint8_t*)data,
         sizeof(data),
         3,
@@ -370,23 +370,23 @@ TEST(test_chunk_append_numpy_column_i64_smoke)
         line_sender_error_free(err);
         err = NULL;
     }
-    CHECK(column_sender_chunk_row_count(chunk, NULL) == 3, "row_count == 3");
-    column_sender_chunk_free(chunk);
+    CHECK(qwp_chunk_row_count(chunk, NULL) == 3, "row_count == 3");
+    qwp_chunk_free(chunk);
 }
 
 TEST(test_chunk_append_numpy_column_f64_smoke)
 {
-    column_sender_chunk* chunk = make_chunk_t();
+    qwp_chunk* chunk = make_chunk_t();
     CHECK(chunk != NULL, "chunk constructed");
     if (!chunk)
         return;
     double data[] = {1.0, 2.0, 3.0};
     line_sender_error* err = NULL;
-    bool ok = column_sender_chunk_append_numpy_column(
+    bool ok = qwp_chunk_append_numpy_column(
         chunk,
         "v",
         1,
-        column_sender_numpy_f64,
+        qwp_numpy_f64,
         (const uint8_t*)data,
         sizeof(data),
         3,
@@ -396,40 +396,40 @@ TEST(test_chunk_append_numpy_column_f64_smoke)
     CHECK(ok, "f64 append → true");
     if (err)
         line_sender_error_free(err);
-    CHECK(column_sender_chunk_row_count(chunk, NULL) == 3, "row_count == 3");
-    column_sender_chunk_free(chunk);
+    CHECK(qwp_chunk_row_count(chunk, NULL) == 3, "row_count == 3");
+    qwp_chunk_free(chunk);
 }
 
 TEST(test_chunk_append_numpy_column_bool_smoke)
 {
-    column_sender_chunk* chunk = make_chunk_t();
+    qwp_chunk* chunk = make_chunk_t();
     CHECK(chunk != NULL, "chunk constructed");
     if (!chunk)
         return;
     uint8_t bits[] = {1, 0, 1};
     line_sender_error* err = NULL;
-    bool ok = column_sender_chunk_append_numpy_column(
-        chunk, "v", 1, column_sender_numpy_bool, bits, sizeof(bits), 3, NULL, NULL, &err);
+    bool ok = qwp_chunk_append_numpy_column(
+        chunk, "v", 1, qwp_numpy_bool, bits, sizeof(bits), 3, NULL, NULL, &err);
     CHECK(ok, "bool append → true");
     if (err)
         line_sender_error_free(err);
-    CHECK(column_sender_chunk_row_count(chunk, NULL) == 3, "row_count == 3");
-    column_sender_chunk_free(chunk);
+    CHECK(qwp_chunk_row_count(chunk, NULL) == 3, "row_count == 3");
+    qwp_chunk_free(chunk);
 }
 
 TEST(test_chunk_append_numpy_column_decimal_requires_extras)
 {
-    column_sender_chunk* chunk = make_chunk_t();
+    qwp_chunk* chunk = make_chunk_t();
     CHECK(chunk != NULL, "chunk constructed");
     if (!chunk)
         return;
     int64_t data[] = {1, 2, 3};
     line_sender_error* err = NULL;
-    bool ok = column_sender_chunk_append_numpy_column(
+    bool ok = qwp_chunk_append_numpy_column(
         chunk,
         "v",
         1,
-        column_sender_numpy_decimal_s8,
+        qwp_numpy_decimal_s8,
         (const uint8_t*)data,
         sizeof(data),
         3,
@@ -448,29 +448,29 @@ TEST(test_chunk_append_numpy_column_decimal_requires_extras)
             err_msg_contains(
                 err,
                 "DECIMAL64 column requires non-NULL "
-                "column_sender_numpy_extras"),
+                "qwp_numpy_extras"),
             "msg mentions DECIMAL64 requires non-NULL extras");
         line_sender_error_free(err);
     }
-    column_sender_chunk_free(chunk);
+    qwp_chunk_free(chunk);
 }
 
 TEST(test_chunk_append_numpy_column_decimal_scale_too_high)
 {
-    column_sender_chunk* chunk = make_chunk_t();
+    qwp_chunk* chunk = make_chunk_t();
     CHECK(chunk != NULL, "chunk constructed");
     if (!chunk)
         return;
     int64_t data[] = {1, 2, 3};
-    column_sender_numpy_extras extras;
+    qwp_numpy_extras extras;
     memset(&extras, 0, sizeof(extras));
     extras.decimal_scale = 19; /* cap is 18 for DECIMAL64 */
     line_sender_error* err = NULL;
-    bool ok = column_sender_chunk_append_numpy_column(
+    bool ok = qwp_chunk_append_numpy_column(
         chunk,
         "v",
         1,
-        column_sender_numpy_decimal_s8,
+        qwp_numpy_decimal_s8,
         (const uint8_t*)data,
         sizeof(data),
         3,
@@ -481,25 +481,25 @@ TEST(test_chunk_append_numpy_column_decimal_scale_too_high)
     assert_invalid_api_call(err, "decimal scale 19 → invalid_api_call");
     if (err)
         line_sender_error_free(err);
-    column_sender_chunk_free(chunk);
+    qwp_chunk_free(chunk);
 }
 
 TEST(test_chunk_append_numpy_column_decimal_scale_negative)
 {
-    column_sender_chunk* chunk = make_chunk_t();
+    qwp_chunk* chunk = make_chunk_t();
     CHECK(chunk != NULL, "chunk constructed");
     if (!chunk)
         return;
     int64_t data[] = {1, 2, 3};
-    column_sender_numpy_extras extras;
+    qwp_numpy_extras extras;
     memset(&extras, 0, sizeof(extras));
     extras.decimal_scale = -1;
     line_sender_error* err = NULL;
-    bool ok = column_sender_chunk_append_numpy_column(
+    bool ok = qwp_chunk_append_numpy_column(
         chunk,
         "v",
         1,
-        column_sender_numpy_decimal_s8,
+        qwp_numpy_decimal_s8,
         (const uint8_t*)data,
         sizeof(data),
         3,
@@ -510,22 +510,22 @@ TEST(test_chunk_append_numpy_column_decimal_scale_negative)
     assert_invalid_api_call(err, "decimal scale -1 → invalid_api_call");
     if (err)
         line_sender_error_free(err);
-    column_sender_chunk_free(chunk);
+    qwp_chunk_free(chunk);
 }
 
 TEST(test_chunk_append_numpy_column_geohash_requires_extras)
 {
-    column_sender_chunk* chunk = make_chunk_t();
+    qwp_chunk* chunk = make_chunk_t();
     CHECK(chunk != NULL, "chunk constructed");
     if (!chunk)
         return;
     int8_t data[] = {1, 2, 3};
     line_sender_error* err = NULL;
-    bool ok = column_sender_chunk_append_numpy_column(
+    bool ok = qwp_chunk_append_numpy_column(
         chunk,
         "v",
         1,
-        column_sender_numpy_geohash_i8,
+        qwp_numpy_geohash_i8,
         (const uint8_t*)data,
         sizeof(data),
         3,
@@ -536,25 +536,25 @@ TEST(test_chunk_append_numpy_column_geohash_requires_extras)
     assert_invalid_api_call(err, "geohash w/o extras → invalid_api_call");
     if (err)
         line_sender_error_free(err);
-    column_sender_chunk_free(chunk);
+    qwp_chunk_free(chunk);
 }
 
 TEST(test_chunk_append_numpy_column_geohash_bits_zero)
 {
-    column_sender_chunk* chunk = make_chunk_t();
+    qwp_chunk* chunk = make_chunk_t();
     CHECK(chunk != NULL, "chunk constructed");
     if (!chunk)
         return;
     int8_t data[] = {1, 2, 3};
-    column_sender_numpy_extras extras;
+    qwp_numpy_extras extras;
     memset(&extras, 0, sizeof(extras));
     extras.geohash_bits = 0;
     line_sender_error* err = NULL;
-    bool ok = column_sender_chunk_append_numpy_column(
+    bool ok = qwp_chunk_append_numpy_column(
         chunk,
         "v",
         1,
-        column_sender_numpy_geohash_i8,
+        qwp_numpy_geohash_i8,
         (const uint8_t*)data,
         sizeof(data),
         3,
@@ -565,25 +565,25 @@ TEST(test_chunk_append_numpy_column_geohash_bits_zero)
     assert_invalid_api_call(err, "geohash bits 0 → invalid_api_call");
     if (err)
         line_sender_error_free(err);
-    column_sender_chunk_free(chunk);
+    qwp_chunk_free(chunk);
 }
 
 TEST(test_chunk_append_numpy_column_geohash_bits_too_high)
 {
-    column_sender_chunk* chunk = make_chunk_t();
+    qwp_chunk* chunk = make_chunk_t();
     CHECK(chunk != NULL, "chunk constructed");
     if (!chunk)
         return;
     int8_t data[] = {1, 2, 3};
-    column_sender_numpy_extras extras;
+    qwp_numpy_extras extras;
     memset(&extras, 0, sizeof(extras));
     extras.geohash_bits = 9; /* cap is 8 for i8 */
     line_sender_error* err = NULL;
-    bool ok = column_sender_chunk_append_numpy_column(
+    bool ok = qwp_chunk_append_numpy_column(
         chunk,
         "v",
         1,
-        column_sender_numpy_geohash_i8,
+        qwp_numpy_geohash_i8,
         (const uint8_t*)data,
         sizeof(data),
         3,
@@ -594,22 +594,22 @@ TEST(test_chunk_append_numpy_column_geohash_bits_too_high)
     assert_invalid_api_call(err, "geohash bits 9 → invalid_api_call");
     if (err)
         line_sender_error_free(err);
-    column_sender_chunk_free(chunk);
+    qwp_chunk_free(chunk);
 }
 
 TEST(test_chunk_append_numpy_column_f64_ndarray_requires_extras)
 {
-    column_sender_chunk* chunk = make_chunk_t();
+    qwp_chunk* chunk = make_chunk_t();
     CHECK(chunk != NULL, "chunk constructed");
     if (!chunk)
         return;
     double data[] = {1.0, 2.0, 3.0};
     line_sender_error* err = NULL;
-    bool ok = column_sender_chunk_append_numpy_column(
+    bool ok = qwp_chunk_append_numpy_column(
         chunk,
         "v",
         1,
-        column_sender_numpy_f64_ndarray,
+        qwp_numpy_f64_ndarray,
         (const uint8_t*)data,
         sizeof(data),
         1,
@@ -620,26 +620,26 @@ TEST(test_chunk_append_numpy_column_f64_ndarray_requires_extras)
     assert_invalid_api_call(err, "ndarray w/o extras → invalid_api_call");
     if (err)
         line_sender_error_free(err);
-    column_sender_chunk_free(chunk);
+    qwp_chunk_free(chunk);
 }
 
 TEST(test_chunk_append_numpy_column_f64_ndarray_ndim_zero)
 {
-    column_sender_chunk* chunk = make_chunk_t();
+    qwp_chunk* chunk = make_chunk_t();
     CHECK(chunk != NULL, "chunk constructed");
     if (!chunk)
         return;
     double data[] = {1.0, 2.0, 3.0};
-    column_sender_numpy_extras extras;
+    qwp_numpy_extras extras;
     memset(&extras, 0, sizeof(extras));
     extras.array_ndim = 0;
     extras.array_shape = NULL;
     line_sender_error* err = NULL;
-    bool ok = column_sender_chunk_append_numpy_column(
+    bool ok = qwp_chunk_append_numpy_column(
         chunk,
         "v",
         1,
-        column_sender_numpy_f64_ndarray,
+        qwp_numpy_f64_ndarray,
         (const uint8_t*)data,
         sizeof(data),
         1,
@@ -650,12 +650,12 @@ TEST(test_chunk_append_numpy_column_f64_ndarray_ndim_zero)
     assert_invalid_api_call(err, "ndarray ndim 0 → invalid_api_call");
     if (err)
         line_sender_error_free(err);
-    column_sender_chunk_free(chunk);
+    qwp_chunk_free(chunk);
 }
 
 TEST(test_chunk_append_numpy_column_f64_ndarray_ndim_too_high)
 {
-    column_sender_chunk* chunk = make_chunk_t();
+    qwp_chunk* chunk = make_chunk_t();
     CHECK(chunk != NULL, "chunk constructed");
     if (!chunk)
         return;
@@ -663,16 +663,16 @@ TEST(test_chunk_append_numpy_column_f64_ndarray_ndim_too_high)
     uint32_t shape[33];
     for (int i = 0; i < 33; ++i)
         shape[i] = 1;
-    column_sender_numpy_extras extras;
+    qwp_numpy_extras extras;
     memset(&extras, 0, sizeof(extras));
     extras.array_ndim = 33; /* cap is 32 */
     extras.array_shape = shape;
     line_sender_error* err = NULL;
-    bool ok = column_sender_chunk_append_numpy_column(
+    bool ok = qwp_chunk_append_numpy_column(
         chunk,
         "v",
         1,
-        column_sender_numpy_f64_ndarray,
+        qwp_numpy_f64_ndarray,
         (const uint8_t*)data,
         sizeof(data),
         1,
@@ -683,26 +683,26 @@ TEST(test_chunk_append_numpy_column_f64_ndarray_ndim_too_high)
     assert_invalid_api_call(err, "ndarray ndim 33 → invalid_api_call");
     if (err)
         line_sender_error_free(err);
-    column_sender_chunk_free(chunk);
+    qwp_chunk_free(chunk);
 }
 
 TEST(test_chunk_append_numpy_column_f64_ndarray_null_shape)
 {
-    column_sender_chunk* chunk = make_chunk_t();
+    qwp_chunk* chunk = make_chunk_t();
     CHECK(chunk != NULL, "chunk constructed");
     if (!chunk)
         return;
     double data[] = {1.0, 2.0, 3.0};
-    column_sender_numpy_extras extras;
+    qwp_numpy_extras extras;
     memset(&extras, 0, sizeof(extras));
     extras.array_ndim = 2;
     extras.array_shape = NULL;
     line_sender_error* err = NULL;
-    bool ok = column_sender_chunk_append_numpy_column(
+    bool ok = qwp_chunk_append_numpy_column(
         chunk,
         "v",
         1,
-        column_sender_numpy_f64_ndarray,
+        qwp_numpy_f64_ndarray,
         (const uint8_t*)data,
         sizeof(data),
         1,
@@ -713,27 +713,27 @@ TEST(test_chunk_append_numpy_column_f64_ndarray_null_shape)
     assert_invalid_api_call(err, "ndarray null shape → invalid_api_call");
     if (err)
         line_sender_error_free(err);
-    column_sender_chunk_free(chunk);
+    qwp_chunk_free(chunk);
 }
 
 TEST(test_chunk_append_numpy_column_f64_ndarray_zero_dim)
 {
-    column_sender_chunk* chunk = make_chunk_t();
+    qwp_chunk* chunk = make_chunk_t();
     CHECK(chunk != NULL, "chunk constructed");
     if (!chunk)
         return;
     double data[] = {1.0, 2.0, 3.0};
     uint32_t shape[] = {3, 0};
-    column_sender_numpy_extras extras;
+    qwp_numpy_extras extras;
     memset(&extras, 0, sizeof(extras));
     extras.array_ndim = 2;
     extras.array_shape = shape;
     line_sender_error* err = NULL;
-    bool ok = column_sender_chunk_append_numpy_column(
+    bool ok = qwp_chunk_append_numpy_column(
         chunk,
         "v",
         1,
-        column_sender_numpy_f64_ndarray,
+        qwp_numpy_f64_ndarray,
         (const uint8_t*)data,
         sizeof(data),
         1,
@@ -744,28 +744,28 @@ TEST(test_chunk_append_numpy_column_f64_ndarray_zero_dim)
     assert_invalid_api_call(err, "ndarray zero-dim → invalid_api_call");
     if (err)
         line_sender_error_free(err);
-    column_sender_chunk_free(chunk);
+    qwp_chunk_free(chunk);
 }
 
 TEST(test_chunk_append_numpy_column_f64_ndarray_smoke)
 {
-    column_sender_chunk* chunk = make_chunk_t();
+    qwp_chunk* chunk = make_chunk_t();
     CHECK(chunk != NULL, "chunk constructed");
     if (!chunk)
         return;
     /* Per-row tensor shape [3], row_count = 2 → 6 doubles of source data. */
     double data[6] = {1.0, 2.0, 3.0, 4.0, 5.0, 6.0};
     uint32_t shape[] = {3};
-    column_sender_numpy_extras extras;
+    qwp_numpy_extras extras;
     memset(&extras, 0, sizeof(extras));
     extras.array_ndim = 1;
     extras.array_shape = shape;
     line_sender_error* err = NULL;
-    bool ok = column_sender_chunk_append_numpy_column(
+    bool ok = qwp_chunk_append_numpy_column(
         chunk,
         "v",
         1,
-        column_sender_numpy_f64_ndarray,
+        qwp_numpy_f64_ndarray,
         (const uint8_t*)data,
         sizeof(data),
         2,
@@ -775,24 +775,24 @@ TEST(test_chunk_append_numpy_column_f64_ndarray_smoke)
     CHECK(ok, "ndarray 1-D shape {3} × 2 rows → true");
     if (err)
         line_sender_error_free(err);
-    CHECK(column_sender_chunk_row_count(chunk, NULL) == 2, "row_count == 2");
-    column_sender_chunk_free(chunk);
+    CHECK(qwp_chunk_row_count(chunk, NULL) == 2, "row_count == 2");
+    qwp_chunk_free(chunk);
 }
 
 TEST(test_chunk_append_numpy_column_data_len_too_small)
 {
-    column_sender_chunk* chunk = make_chunk_t();
+    qwp_chunk* chunk = make_chunk_t();
     CHECK(chunk != NULL, "chunk constructed");
     if (!chunk)
         return;
     /* 3 i64 rows need 24 bytes; claim only 16 → must be rejected. */
     int64_t data[] = {1, 2, 3};
     line_sender_error* err = NULL;
-    bool ok = column_sender_chunk_append_numpy_column(
+    bool ok = qwp_chunk_append_numpy_column(
         chunk,
         "v",
         1,
-        column_sender_numpy_i64,
+        qwp_numpy_i64,
         (const uint8_t*)data,
         16,
         3,
@@ -809,13 +809,13 @@ TEST(test_chunk_append_numpy_column_data_len_too_small)
         line_sender_error_free(err);
         err = NULL;
     }
-    CHECK(column_sender_chunk_row_count(chunk, NULL) == 0, "nothing appended");
-    column_sender_chunk_free(chunk);
+    CHECK(qwp_chunk_row_count(chunk, NULL) == 0, "nothing appended");
+    qwp_chunk_free(chunk);
 }
 
 TEST(test_chunk_append_numpy_column_mistagged_dtype_rejected)
 {
-    column_sender_chunk* chunk = make_chunk_t();
+    qwp_chunk* chunk = make_chunk_t();
     CHECK(chunk != NULL, "chunk constructed");
     if (!chunk)
         return;
@@ -823,11 +823,11 @@ TEST(test_chunk_append_numpy_column_mistagged_dtype_rejected)
      * honest data_len_bytes = 3 must stop it before the OOB read. */
     int8_t data[] = {1, 2, 3};
     line_sender_error* err = NULL;
-    bool ok = column_sender_chunk_append_numpy_column(
+    bool ok = qwp_chunk_append_numpy_column(
         chunk,
         "v",
         1,
-        column_sender_numpy_f64,
+        qwp_numpy_f64,
         (const uint8_t*)data,
         sizeof(data),
         3,
@@ -838,23 +838,23 @@ TEST(test_chunk_append_numpy_column_mistagged_dtype_rejected)
     assert_invalid_api_call(err, "mis-tagged dtype → invalid_api_call");
     if (err)
         line_sender_error_free(err);
-    column_sender_chunk_free(chunk);
+    qwp_chunk_free(chunk);
 }
 
 TEST(test_chunk_append_numpy_column_data_len_exact_ok)
 {
-    column_sender_chunk* chunk = make_chunk_t();
+    qwp_chunk* chunk = make_chunk_t();
     CHECK(chunk != NULL, "chunk constructed");
     if (!chunk)
         return;
     /* Exact fit: 3 i64 rows == 24 bytes is accepted (boundary). */
     int64_t data[] = {1, 2, 3};
     line_sender_error* err = NULL;
-    bool ok = column_sender_chunk_append_numpy_column(
+    bool ok = qwp_chunk_append_numpy_column(
         chunk,
         "v",
         1,
-        column_sender_numpy_i64,
+        qwp_numpy_i64,
         (const uint8_t*)data,
         24,
         3,
@@ -864,8 +864,8 @@ TEST(test_chunk_append_numpy_column_data_len_exact_ok)
     CHECK(ok, "exact data_len_bytes → true");
     if (err)
         line_sender_error_free(err);
-    CHECK(column_sender_chunk_row_count(chunk, NULL) == 3, "row_count == 3");
-    column_sender_chunk_free(chunk);
+    CHECK(qwp_chunk_row_count(chunk, NULL) == 3, "row_count == 3");
+    qwp_chunk_free(chunk);
 }
 
 TEST(test_error_codes_survive_ffi_boundary)
@@ -956,7 +956,7 @@ static void expect_arrow_array_rejected(
     struct ArrowArray* arr, struct ArrowSchema* sch, const char* label)
 {
     line_sender_error* err = NULL;
-    column_sender_chunk* chunk = column_sender_chunk_new("t", 1, &err);
+    qwp_chunk* chunk = qwp_chunk_new("t", 1, &err);
     CHECK(chunk != NULL, "chunk constructed");
     if (err)
     {
@@ -971,7 +971,7 @@ static void expect_arrow_array_rejected(
             sch->release(sch);
         return;
     }
-    bool ok = column_sender_chunk_append_arrow_column(
+    bool ok = qwp_chunk_append_arrow_column(
         chunk, "v", 1, arr, sch, 0, 0, &err);
     CHECK(!ok, label);
     CHECK(err != NULL, "err_out populated on malformed array");
@@ -989,7 +989,7 @@ static void expect_arrow_array_rejected(
         arr->release(arr);
     if (sch->release)
         sch->release(sch);
-    column_sender_chunk_free(chunk);
+    qwp_chunk_free(chunk);
 }
 
 TEST(test_chunk_append_arrow_column_malformed_array_rejected)
@@ -1119,17 +1119,17 @@ TEST(test_one_sender_flushes_buffer_and_chunk)
             "buffer published through unified sender");
     }
 
-    column_sender_chunk* chunk = column_sender_chunk_new(
+    qwp_chunk* chunk = qwp_chunk_new(
         "mixed_c_chunk", strlen("mixed_c_chunk"), &err);
     CHECK(chunk != NULL, "chunk constructed");
     if (chunk != NULL)
     {
         int64_t value = 2;
         CHECK(
-            column_sender_chunk_column_i64(
+            qwp_chunk_column_i64(
                 chunk, "value", strlen("value"), &value, 1, NULL, &err),
             "chunk value");
-        CHECK(column_sender_chunk_at_now(chunk, &err), "chunk timestamp");
+        CHECK(qwp_chunk_at_now(chunk, &err), "chunk timestamp");
         CHECK(
             qwp_sender_flush_chunk(sender, chunk, &err),
             "chunk published through the same unified sender");
@@ -1141,7 +1141,7 @@ TEST(test_one_sender_flushes_buffer_and_chunk)
         err = NULL;
     }
     if (chunk != NULL)
-        column_sender_chunk_free(chunk);
+        qwp_chunk_free(chunk);
     if (buffer != NULL)
         line_sender_buffer_free(buffer);
     mock_return_close(mock, db, sender);

@@ -24,15 +24,15 @@
 
 /* Columnar bulk-read example for the QWP egress reader (C).
  *
- * Demonstrates `reader_cursor_next_batch` +
- * `reader_batch_column_data` / `_array_column_data` / `_symbol_dict`.
+ * Demonstrates `qwp_reader_cursor_next_batch` +
+ * `qwp_reader_batch_column_data` / `_array_column_data` / `_symbol_dict`.
  * One FFI call per column rather than one per cell — the path Cython /
  * numpy / pandas bindings should use for zero-copy column construction.
- * Per-cell reads go through the `reader_column_data_get_*` inline
+ * Per-cell reads go through the `qwp_reader_column_data_get_*` inline
  * helpers declared in the same header (alignment-safe `memcpy` under the
  * hood; the compiler lowers each call to a single unaligned MOV). */
 
-#include <questdb/egress/reader.h>
+#include <questdb/egress/qwp_reader.h>
 #include <inttypes.h>
 #include <stdbool.h>
 #include <stdio.h>
@@ -44,21 +44,21 @@ static void print_hex(const uint8_t* p, size_t n)
 }
 
 static int print_scalar_column(
-    const reader_batch* batch, size_t col_idx, questdb_error** err)
+    const qwp_reader_batch* batch, size_t col_idx, questdb_error** err)
 {
-    reader_column_data d = {0};
-    if (!reader_batch_column_data(batch, col_idx, &d, err)) return -1;
+    qwp_reader_column_data d = {0};
+    if (!qwp_reader_batch_column_data(batch, col_idx, &d, err)) return -1;
 
     /* For SYMBOL columns we resolve dict codes per row; fetch the dict
      * snapshot once outside the row loop. */
-    reader_symbol_dict dict = {0};
-    if (d.kind == reader_column_kind_symbol
-        && !reader_batch_symbol_dict(batch, &dict, err))
+    qwp_reader_symbol_dict dict = {0};
+    if (d.kind == qwp_reader_column_kind_symbol
+        && !qwp_reader_batch_symbol_dict(batch, &dict, err))
         return -1;
 
     for (size_t r = 0; r < d.row_count; ++r)
     {
-        if (reader_column_data_is_null(&d, r))
+        if (qwp_reader_column_data_is_null(&d, r))
         {
             printf("NULL\t");
             continue;
@@ -66,81 +66,81 @@ static int print_scalar_column(
         bool is_null;
         switch (d.kind)
         {
-        case reader_column_kind_boolean:
+        case qwp_reader_column_kind_boolean:
             printf("%s\t",
-                   reader_column_data_get_bool(&d, r, &is_null)
+                   qwp_reader_column_data_get_bool(&d, r, &is_null)
                        ? "true" : "false");
             break;
-        case reader_column_kind_byte:
-            printf("%d\t", reader_column_data_get_i8(&d, r, &is_null));
+        case qwp_reader_column_kind_byte:
+            printf("%d\t", qwp_reader_column_data_get_i8(&d, r, &is_null));
             break;
-        case reader_column_kind_short:
-            printf("%d\t", reader_column_data_get_i16(&d, r, &is_null));
+        case qwp_reader_column_kind_short:
+            printf("%d\t", qwp_reader_column_data_get_i16(&d, r, &is_null));
             break;
-        case reader_column_kind_char:
+        case qwp_reader_column_kind_char:
             printf("U+%04X\t",
-                   reader_column_data_get_char(&d, r, &is_null));
+                   qwp_reader_column_data_get_char(&d, r, &is_null));
             break;
-        case reader_column_kind_int:
+        case qwp_reader_column_kind_int:
             printf("%" PRId32 "\t",
-                   reader_column_data_get_i32(&d, r, &is_null));
+                   qwp_reader_column_data_get_i32(&d, r, &is_null));
             break;
-        case reader_column_kind_ipv4:
+        case qwp_reader_column_kind_ipv4:
         {
             const uint32_t v =
-                reader_column_data_get_ipv4(&d, r, &is_null);
+                qwp_reader_column_data_get_ipv4(&d, r, &is_null);
             printf("%u.%u.%u.%u\t",
                    (v >> 24) & 0xFF, (v >> 16) & 0xFF,
                    (v >> 8) & 0xFF, v & 0xFF);
             break;
         }
-        case reader_column_kind_float:
-            printf("%g\t", (double)reader_column_data_get_f32(
+        case qwp_reader_column_kind_float:
+            printf("%g\t", (double)qwp_reader_column_data_get_f32(
                                 &d, r, &is_null));
             break;
-        case reader_column_kind_double:
-            printf("%g\t", reader_column_data_get_f64(&d, r, &is_null));
+        case qwp_reader_column_kind_double:
+            printf("%g\t", qwp_reader_column_data_get_f64(&d, r, &is_null));
             break;
-        case reader_column_kind_long:
-        case reader_column_kind_timestamp:
-        case reader_column_kind_date:
-        case reader_column_kind_timestamp_nanos:
+        case qwp_reader_column_kind_long:
+        case qwp_reader_column_kind_timestamp:
+        case qwp_reader_column_kind_date:
+        case qwp_reader_column_kind_timestamp_nanos:
             printf("%" PRId64 "\t",
-                   reader_column_data_get_i64(&d, r, &is_null));
+                   qwp_reader_column_data_get_i64(&d, r, &is_null));
             break;
-        case reader_column_kind_decimal64:
+        case qwp_reader_column_kind_decimal64:
             printf("%" PRId64 "e%d\t",
-                   reader_column_data_get_decimal64_mantissa(
+                   qwp_reader_column_data_get_decimal64_mantissa(
                        &d, r, &is_null),
                    -(int)d.decimal_scale);
             break;
-        case reader_column_kind_decimal128:
-        case reader_column_kind_decimal256:
-        case reader_column_kind_uuid:
-        case reader_column_kind_long256:
+        case qwp_reader_column_kind_decimal128:
+        case qwp_reader_column_kind_decimal256:
+        case qwp_reader_column_kind_uuid:
+        case qwp_reader_column_kind_long256:
         {
             uint8_t bytes[32];
-            reader_column_data_get_bytes(&d, r, bytes, &is_null);
+            qwp_reader_column_data_get_bytes(&d, r, bytes, &is_null);
             print_hex(bytes, d.value_stride);
-            if (d.kind == reader_column_kind_decimal128
-                || d.kind == reader_column_kind_decimal256)
+            if (d.kind == qwp_reader_column_kind_decimal128
+                || d.kind == qwp_reader_column_kind_decimal256)
                 printf("e%d", -(int)d.decimal_scale);
             printf("\t");
             break;
         }
-        case reader_column_kind_geohash:
+        case qwp_reader_column_kind_geohash:
             printf("%" PRIx64 "/%u\t",
-                   reader_column_data_get_geohash(&d, r, &is_null),
+                   qwp_reader_column_data_get_geohash(&d, r, &is_null),
                    (unsigned)d.geohash_precision_bits);
             break;
-        case reader_column_kind_varchar:
-        case reader_column_kind_binary:
+        case qwp_reader_column_kind_varchar:
+        case qwp_reader_column_kind_binary:
         {
             const uint8_t* buf = NULL;
             size_t len = 0;
-            reader_column_data_get_varlen(
+            qwp_reader_column_data_get_varlen(
                 &d, r, &buf, &len, &is_null);
-            if (d.kind == reader_column_kind_varchar)
+            if (d.kind == qwp_reader_column_kind_varchar)
                 printf("%.*s\t", (int)len, (const char*)buf);
             else
             {
@@ -149,11 +149,11 @@ static int print_scalar_column(
             }
             break;
         }
-        case reader_column_kind_symbol:
+        case qwp_reader_column_kind_symbol:
         {
             const char* sym_buf = NULL;
             size_t sym_len = 0;
-            if (!reader_column_data_get_symbol(
+            if (!qwp_reader_column_data_get_symbol(
                     &d, &dict, r, &sym_buf, &sym_len, &is_null))
             {
                 fprintf(stderr, "symbol code out of dict range\n");
@@ -171,10 +171,10 @@ static int print_scalar_column(
 }
 
 static int print_double_array_column(
-    const reader_batch* batch, size_t col_idx, questdb_error** err)
+    const qwp_reader_batch* batch, size_t col_idx, questdb_error** err)
 {
-    reader_array_data d = {0};
-    if (!reader_batch_array_column_data(batch, col_idx, &d, err))
+    qwp_reader_array_data d = {0};
+    if (!qwp_reader_batch_array_column_data(batch, col_idx, &d, err))
         return -1;
 
     for (size_t r = 0; r < d.row_count; ++r)
@@ -208,27 +208,27 @@ int main(int argc, const char* argv[])
     (void)argv;
 
     questdb_error* err = NULL;
-    reader* reader = NULL;
-    reader_cursor* cursor = NULL;
+    qwp_reader* reader = NULL;
+    qwp_reader_cursor* cursor = NULL;
 
     line_sender_utf8 conf = QDB_UTF8_LITERAL("ws::addr=localhost:9000;");
-    reader = reader_from_conf(conf, &err);
+    reader = qwp_reader_from_conf(conf, &err);
     if (!reader) goto on_error;
 
     line_sender_utf8 sql = QDB_UTF8_LITERAL(
         "SELECT x AS n, x * 1.5 AS d FROM long_sequence(5)");
-    cursor = reader_execute(reader, sql, &err);
+    cursor = qwp_reader_execute(reader, sql, &err);
     if (!cursor) goto on_error;
 
-    const reader_batch* batch;
-    while ((batch = reader_cursor_next_batch(cursor, &err)) != NULL)
+    const qwp_reader_batch* batch;
+    while ((batch = qwp_reader_cursor_next_batch(cursor, &err)) != NULL)
     {
-        const size_t cols = reader_batch_column_count(batch);
+        const size_t cols = qwp_reader_batch_column_count(batch);
         for (size_t c = 0; c < cols; ++c)
         {
             const char* name = NULL;
             size_t name_len = 0;
-            if (!reader_batch_column_name(batch, c, &name, &name_len, &err))
+            if (!qwp_reader_batch_column_name(batch, c, &name, &name_len, &err))
                 goto on_error;
             printf("%.*s\t", (int)name_len, name);
         }
@@ -236,10 +236,10 @@ int main(int argc, const char* argv[])
 
         for (size_t c = 0; c < cols; ++c)
         {
-            reader_column_kind k;
-            if (!reader_batch_column_kind(batch, c, &k, &err))
+            qwp_reader_column_kind k;
+            if (!qwp_reader_batch_column_kind(batch, c, &k, &err))
                 goto on_error;
-            const int prc = (k == reader_column_kind_double_array)
+            const int prc = (k == qwp_reader_column_kind_double_array)
                                 ? print_double_array_column(batch, c, &err)
                                 : print_scalar_column(batch, c, &err);
             if (prc != 0) goto on_error;
@@ -249,8 +249,8 @@ int main(int argc, const char* argv[])
     if (err)
         goto on_error;
 
-    reader_cursor_free(cursor);
-    reader_close(reader);
+    qwp_reader_cursor_free(cursor);
+    qwp_reader_close(reader);
     return 0;
 
 on_error:;
@@ -258,7 +258,7 @@ on_error:;
     const char* err_msg = questdb_error_msg(err, &err_len);
     fprintf(stderr, "Error: %.*s\n", (int)err_len, err_msg);
     questdb_error_free(err);
-    reader_cursor_free(cursor);
-    reader_close(reader);
+    qwp_reader_cursor_free(cursor);
+    qwp_reader_close(reader);
     return 1;
 }

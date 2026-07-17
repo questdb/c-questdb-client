@@ -81,11 +81,16 @@ pool on drop. `Reader::from_conf` runs queries without a pool, yielding native
 columnar batches, Arrow `RecordBatch`es or Polars `DataFrame`s.
 
 The C and C++ APIs expose the pool via
-[`questdb/ingress/column_sender.h`](include/questdb/ingress/column_sender.h)
-(`questdb_db_connect`, `questdb_db_borrow_*`) and the reader via
-[`questdb/egress/reader.h`](include/questdb/egress/reader.h) /
-[`questdb/egress/reader.hpp`](include/questdb/egress/reader.hpp), handing
-data across the Arrow C Data Interface. In Rust, QWP ingestion
+[`questdb/client.h`](include/questdb/client.h) /
+[`questdb/client.hpp`](include/questdb/client.hpp) (`questdb_db_connect`,
+`questdb::pool`), and the leases borrowed from it via
+[`questdb/ingress/qwp_sender.h`](include/questdb/ingress/qwp_sender.h)
+(`questdb_db_borrow_sender`) and
+[`questdb/egress/qwp_reader.h`](include/questdb/egress/qwp_reader.h) /
+[`questdb/egress/qwp_reader.hpp`](include/questdb/egress/qwp_reader.hpp)
+(`questdb_db_borrow_reader`), handing data across the Arrow C Data Interface.
+Each lease header includes the pool header, so a one-direction consumer
+includes only the header for that direction. In Rust, QWP ingestion
 (`sync-sender-qwp-ws`) and queries (`sync-reader-qwp-ws`) are both on by
 default; Arrow and Polars conversions sit behind the `arrow` and `polars`
 features.
@@ -97,14 +102,16 @@ Read the language-specific guides:
 **C**
 * [Getting started with C](doc/C.md)
 * [Shared-pool ingestion and query example](examples/qwp_ws_chunk_and_query_c_example.c)
-* [`.h` header file](include/questdb/ingress/column_sender.h) (ingestion)
-* [`.h` header file](include/questdb/egress/reader.h) (queries)
+* [`.h` header file](include/questdb/client.h) (the pool)
+* [`.h` header file](include/questdb/ingress/qwp_sender.h) (ingestion)
+* [`.h` header file](include/questdb/egress/qwp_reader.h) (queries)
 
 **C++**
 * [Getting started with C++](doc/CPP.md)
 * [Shared-pool ingestion and query example](examples/qwp_ws_chunk_and_query_cpp_example.cpp)
-* [`.hpp` header file](include/questdb/ingress/column_sender.hpp) (ingestion)
-* [`.hpp` header file](include/questdb/egress/reader.hpp) (queries)
+* [`.hpp` header file](include/questdb/client.hpp) (the pool)
+* [`.hpp` header file](include/questdb/ingress/qwp_sender.hpp) (ingestion)
+* [`.hpp` header file](include/questdb/egress/qwp_reader.hpp) (queries)
 
 **Rust**
 * [Getting started with Rust](questdb-rs/README.md)

@@ -1,7 +1,7 @@
 /*
  * Out-of-process QWP egress (read-side) client driven by a line-oriented
  * stdin/stdout protocol, implemented against the c-questdb-client *C++*
- * reader wrapper (`include/questdb/egress/reader.hpp`).
+ * reader wrapper (`include/questdb/egress/qwp_reader.hpp`).
  *
  * Unlike the ingress C++ sidecar (which must fall back to the C ABI because
  * the C++ wrapper has no row-major QWP-WS surface), the egress wrapper is a
@@ -19,7 +19,7 @@
  * dedicated transport, matching the Rust sidecar's `Reader::from_conf`.
  */
 
-#include <questdb/egress/reader.hpp>
+#include <questdb/egress/qwp_reader.hpp>
 
 #include <chrono>
 #include <cstdio>

@@ -24,9 +24,9 @@
 
 //! C ABI for the unified QWP ingress sender and column-shaped payloads.
 //!
-//! The live contract is declared in `include/questdb/ingress/column_sender.h`.
+//! The live contract is declared in `include/questdb/ingress/qwp_sender.h`.
 //! The ABI re-uses `line_sender_error*` for fallible-call error reporting; opaque types
-//! (`questdb_db`, `qwp_sender`, `column_sender_chunk`) are heap-allocated
+//! (`questdb_db`, `qwp_sender`, `qwp_chunk`) are heap-allocated
 //! and freed through their dedicated `_close` / `_free` /
 //! `_return_sender` entry points.
 
@@ -71,7 +71,7 @@ pub struct questdb_db(pub(crate) QuestDb);
 /// is called. Bundles the per-connection schema registry and symbol-dict state
 /// used by all writer modes.
 ///
-/// **Not thread-safe.** A `qwp_sender*` or `direct_column_sender*`
+/// **Not thread-safe.** A `qwp_sender*` or `qwp_direct_sender*`
 /// handle must not be used from more than one thread at a time. The second
 /// tuple field is a CAS-checked latch on every FFI entry (mutation, accessor,
 /// and free); a non-blocking contending caller observes
@@ -95,12 +95,12 @@ pub struct qwp_sender(pub(crate) OwnedSender, pub(crate) AtomicU32);
 
 /// Direct (pipelined, non-store-and-forward) sibling of [`qwp_sender`],
 /// borrowed from the always-direct pool via
-/// `questdb_db_borrow_direct_column_sender`. Same single-threaded /
+/// `questdb_db_borrow_direct_sender`. Same single-threaded /
 /// reentrancy-latch contract as [`qwp_sender`]; it exposes
-/// `direct_column_sender_flush` + `direct_column_sender_flush_and_wait` +
-/// `direct_column_sender_commit` instead of the store-and-forward queue
+/// `qwp_direct_sender_flush` + `qwp_direct_sender_flush_and_wait` +
+/// `qwp_direct_sender_commit` instead of the store-and-forward queue
 /// primitives exposed by [`qwp_sender`].
-pub struct direct_column_sender(OwnedDirectColumnSender, AtomicU32);
+pub struct qwp_direct_sender(OwnedDirectColumnSender, AtomicU32);
 
 /// Shared accessor over the two structurally-identical sender handle
 /// types so the FFI body helpers (`reject_closed_pool_cs`, `arrow_batch_impl`,
@@ -305,10 +305,10 @@ impl CsHandle for qwp_sender {
     }
 }
 
-impl CsHandle for direct_column_sender {
+impl CsHandle for qwp_direct_sender {
     type Owned = OwnedDirectColumnSender;
 
-    const TYPE_NAME: &'static str = "direct_column_sender";
+    const TYPE_NAME: &'static str = "qwp_direct_sender";
     unsafe fn owned_mut<'a>(this: *mut Self) -> &'a mut OwnedDirectColumnSender {
         unsafe { &mut (*this).0 }
     }
@@ -435,7 +435,7 @@ impl CsHandle for direct_column_sender {
 ///
 /// Holds raw pointers into caller buffers (no copy). Per the FFI ABI
 /// doc §2.3, the caller MUST keep every column buffer passed in via
-/// `column_sender_chunk_column_*` / `column_sender_chunk_append_*`
+/// `qwp_chunk_column_*` / `qwp_chunk_append_*`
 /// alive until the next `qwp_sender_flush_chunk` call returns. We hide the
 /// chunk's lifetime by promoting its inner type to `'static`; the lifetime
 /// is enforced by the caller, not the borrow checker.
@@ -444,19 +444,19 @@ impl CsHandle for direct_column_sender {
 /// second tuple field detects in-thread reentrance and defers a free
 /// observed concurrently with an in-flight call until that call exits.
 /// This protects only the concurrent in-flight-call-vs-free race; it
-/// does not make a free idempotent — calling `column_sender_chunk_free`
+/// does not make a free idempotent — calling `qwp_chunk_free`
 /// twice on the same handle is undefined behavior. The same caveat as
 /// [`qwp_sender`] applies: the caller must establish happens-before
 /// between the last column call on `chunk` and
-/// `column_sender_chunk_free(chunk)`.
-pub struct column_sender_chunk(Chunk<'static>, AtomicU32);
+/// `qwp_chunk_free(chunk)`.
+pub struct qwp_chunk(Chunk<'static>, AtomicU32);
 
 /// Imported Arrow column for repeated chunk appends.
 ///
 /// **Not thread-safe.** Python owns this per-plan and uses it from one thread.
 /// The latch rejects concurrent append/free on the FFI surface.
 #[cfg(feature = "arrow")]
-pub struct column_sender_arrow_import(ImportedArrowColumn, AtomicU32);
+pub struct qwp_arrow_import(ImportedArrowColumn, AtomicU32);
 
 const LATCH_IN_USE: u32 = 1 << 0;
 const LATCH_CLOSED: u32 = 1 << 1;
@@ -466,12 +466,12 @@ trait FfiHandle {
     unsafe fn on_deferred_close(handle: *mut Self, latch_prev: u32);
 }
 
-impl FfiHandle for column_sender_chunk {
+impl FfiHandle for qwp_chunk {
     unsafe fn on_deferred_close(_handle: *mut Self, _latch_prev: u32) {}
 }
 
 #[cfg(feature = "arrow")]
-impl FfiHandle for column_sender_arrow_import {
+impl FfiHandle for qwp_arrow_import {
     unsafe fn on_deferred_close(_handle: *mut Self, _latch_prev: u32) {}
 }
 
@@ -483,7 +483,7 @@ impl FfiHandle for qwp_sender {
     }
 }
 
-impl FfiHandle for direct_column_sender {
+impl FfiHandle for qwp_direct_sender {
     unsafe fn on_deferred_close(handle: *mut Self, latch_prev: u32) {
         if latch_prev & LATCH_DROP != 0 {
             unsafe { (*handle).0.get_mut().mark_must_close() };
@@ -616,13 +616,13 @@ unsafe fn reject_null_fsn_out(
 
 #[repr(C)]
 #[derive(Copy, Clone)]
-pub struct column_sender_validity {
+pub struct qwp_validity {
     pub bits: *const u8,
     pub bit_len: size_t,
 }
 
 unsafe fn as_validity<'a>(
-    v: *const column_sender_validity,
+    v: *const qwp_validity,
     err_out: *mut *mut line_sender_error,
 ) -> Option<Option<Validity<'a>>> {
     use questdb::ingress::column_sender::MAX_CHUNK_ROWS;
@@ -637,7 +637,7 @@ unsafe fn as_validity<'a>(
                 Error::new(
                     ErrorCode::InvalidApiCall,
                     format!(
-                        "column_sender_validity bit_len {} exceeds MAX_CHUNK_ROWS ({MAX_CHUNK_ROWS})",
+                        "qwp_validity bit_len {} exceeds MAX_CHUNK_ROWS ({MAX_CHUNK_ROWS})",
                         v.bit_len
                     ),
                 ),
@@ -652,7 +652,7 @@ unsafe fn as_validity<'a>(
                 err_out,
                 Error::new(
                     ErrorCode::InvalidApiCall,
-                    "column_sender_validity has null bits but bit_len != 0".to_string(),
+                    "qwp_validity has null bits but bit_len != 0".to_string(),
                 ),
             );
         }
@@ -993,17 +993,17 @@ pub unsafe extern "C" fn questdb_db_borrow_sender(
 /// Borrow a direct (pipelined, non-store-and-forward) connection from the
 /// always-direct pool. Returns NULL on failure; sets `*err_out` if provided.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn questdb_db_borrow_direct_column_sender(
+pub unsafe extern "C" fn questdb_db_borrow_direct_sender(
     db: *mut questdb_db,
     err_out: *mut *mut line_sender_error,
-) -> *mut direct_column_sender {
+) -> *mut qwp_direct_sender {
     unsafe {
         borrow_cs(
             db,
-            "questdb_db_borrow_direct_column_sender",
+            "questdb_db_borrow_direct_sender",
             err_out,
             questdb::ffi_support::borrow_direct_column_sender_owned,
-            direct_column_sender,
+            qwp_direct_sender,
         )
     }
 }
@@ -1035,19 +1035,19 @@ pub unsafe extern "C" fn questdb_db_borrow_sender_with_retry(
     }
 }
 
-/// Like `questdb_db_borrow_direct_column_sender` but retries the connect
+/// Like `questdb_db_borrow_direct_sender` but retries the connect
 /// within `budget_ms` using the same reconnect backoff. `budget_ms == 0`
 /// makes a single attempt. Returns NULL on failure; sets `*err_out` if provided.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn questdb_db_borrow_direct_column_sender_with_retry(
+pub unsafe extern "C" fn questdb_db_borrow_direct_sender_with_retry(
     db: *mut questdb_db,
     budget_ms: u64,
     err_out: *mut *mut line_sender_error,
-) -> *mut direct_column_sender {
+) -> *mut qwp_direct_sender {
     unsafe {
         borrow_cs(
             db,
-            "questdb_db_borrow_direct_column_sender_with_retry",
+            "questdb_db_borrow_direct_sender_with_retry",
             err_out,
             |q| {
                 questdb::ffi_support::borrow_direct_column_sender_owned_with_retry(
@@ -1055,7 +1055,7 @@ pub unsafe extern "C" fn questdb_db_borrow_direct_column_sender_with_retry(
                     std::time::Duration::from_millis(budget_ms),
                 )
             },
-            direct_column_sender,
+            qwp_direct_sender,
         )
     }
 }
@@ -1063,20 +1063,20 @@ pub unsafe extern "C" fn questdb_db_borrow_direct_column_sender_with_retry(
 /// Build a direct (pipelined, non-store-and-forward) column sender from a
 /// QWP/WebSocket config string, owning its own connection with no pool. `conf`
 /// is a UTF-8 string of `conf_len` bytes. Free the returned handle with
-/// `direct_column_sender_free`; there is no pool to return it to. Returns NULL
+/// `qwp_direct_sender_free`; there is no pool to return it to. Returns NULL
 /// on failure; sets `*err_out` if provided.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn direct_column_sender_from_conf(
+pub unsafe extern "C" fn qwp_direct_sender_from_conf(
     conf: *const c_char,
     conf_len: size_t,
     err_out: *mut *mut line_sender_error,
-) -> *mut direct_column_sender {
+) -> *mut qwp_direct_sender {
     let conf = match unsafe { name_str(conf, conf_len, err_out) } {
         Some(s) => s,
         None => return std::ptr::null_mut(),
     };
     match questdb::ffi_support::direct_column_sender_from_conf(conf) {
-        Ok(owned) => Box::into_raw(Box::new(direct_column_sender(owned, AtomicU32::new(0)))),
+        Ok(owned) => Box::into_raw(Box::new(qwp_direct_sender(owned, AtomicU32::new(0)))),
         Err(err) => {
             unsafe { set_err_out_from_error(err_out, err) };
             std::ptr::null_mut()
@@ -1090,20 +1090,20 @@ pub unsafe extern "C" fn direct_column_sender_from_conf(
 /// the `line_sender_opts_*` builder functions rather than a config string), so
 /// this works for senders built either way. `opts` is borrowed, not consumed:
 /// the caller retains ownership and must still free it. Free the returned
-/// handle with `direct_column_sender_free`. Returns NULL on failure; sets
+/// handle with `qwp_direct_sender_free`. Returns NULL on failure; sets
 /// `*err_out` if provided.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn direct_column_sender_from_opts(
+pub unsafe extern "C" fn qwp_direct_sender_from_opts(
     opts: *const line_sender_opts,
     err_out: *mut *mut line_sender_error,
-) -> *mut direct_column_sender {
+) -> *mut qwp_direct_sender {
     if opts.is_null() {
         unsafe {
             set_err_out_from_error(
                 err_out,
                 Error::new(
                     ErrorCode::InvalidApiCall,
-                    "direct_column_sender_from_opts: opts pointer is NULL".to_string(),
+                    "qwp_direct_sender_from_opts: opts pointer is NULL".to_string(),
                 ),
             );
         }
@@ -1111,7 +1111,7 @@ pub unsafe extern "C" fn direct_column_sender_from_opts(
     }
     let builder = unsafe { &*opts }.builder();
     match questdb::ffi_support::direct_column_sender_from_opts(builder) {
-        Ok(owned) => Box::into_raw(Box::new(direct_column_sender(owned, AtomicU32::new(0)))),
+        Ok(owned) => Box::into_raw(Box::new(qwp_direct_sender(owned, AtomicU32::new(0)))),
         Err(err) => {
             unsafe { set_err_out_from_error(err_out, err) };
             std::ptr::null_mut()
@@ -1158,9 +1158,9 @@ pub unsafe extern "C" fn questdb_db_return_sender(_db: *mut questdb_db, sender: 
 
 /// Direct-handle counterpart of `questdb_db_return_sender`.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn questdb_db_return_direct_column_sender(
+pub unsafe extern "C" fn questdb_db_return_direct_sender(
     _db: *mut questdb_db,
-    sender: *mut direct_column_sender,
+    sender: *mut qwp_direct_sender,
 ) {
     unsafe { return_or_drop_cs(sender, 0) };
 }
@@ -1183,20 +1183,20 @@ pub unsafe extern "C" fn questdb_db_drop_sender(_db: *mut questdb_db, sender: *m
 
 /// Direct-handle counterpart of `questdb_db_drop_sender`.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn questdb_db_drop_direct_column_sender(
+pub unsafe extern "C" fn questdb_db_drop_direct_sender(
     _db: *mut questdb_db,
-    sender: *mut direct_column_sender,
+    sender: *mut qwp_direct_sender,
 ) {
     unsafe { return_or_drop_cs(sender, LATCH_DROP) };
 }
 
-/// Free a standalone `direct_column_sender_from_conf` handle, committing any
-/// un-sync'd deferred frames first (call `direct_column_sender_commit` or a
+/// Free a standalone `qwp_direct_sender_from_conf` handle, committing any
+/// un-sync'd deferred frames first (call `qwp_direct_sender_commit` or a
 /// waited flush beforehand for delivery certainty). Accepts NULL and no-ops.
-/// For a pool-borrowed handle use `questdb_db_return_direct_column_sender`
+/// For a pool-borrowed handle use `questdb_db_return_direct_sender`
 /// instead. A racing in-flight call defers the free to that call's exit path.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn direct_column_sender_free(sender: *mut direct_column_sender) {
+pub unsafe extern "C" fn qwp_direct_sender_free(sender: *mut qwp_direct_sender) {
     unsafe { return_or_drop_cs(sender, 0) };
 }
 
@@ -1580,37 +1580,34 @@ pub struct ArrowSchema {
 /// such as `?`, `.` placement, BOM) **and** the 127-byte length cap are
 /// **deferred to the first flush**, matching the deferred-validation
 /// contract of `Chunk::new` in the Rust API: a malformed name is accepted
-/// by `column_sender_chunk_new` and only surfaces as an error from
+/// by `qwp_chunk_new` and only surfaces as an error from
 /// `qwp_sender_flush_chunk*`.
 ///
 /// If you already hold a pre-validated [`line_sender_table_name`] (for
 /// example because you also flush Arrow batches via
 /// `qwp_sender_flush_arrow_batch_at_column`, which requires that type),
-/// prefer [`column_sender_chunk_new_validated`]: it accepts the validated
+/// prefer [`qwp_chunk_new_validated`]: it accepts the validated
 /// handle directly and reports grammar errors *eagerly* at
 /// `line_sender_table_name_init` time — the same type and timing as the
 /// Arrow flush entrypoints — so the same bad name doesn't surface at two
 /// different points depending on which path you take.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn column_sender_chunk_new(
+pub unsafe extern "C" fn qwp_chunk_new(
     table_name: *const c_char,
     table_name_len: size_t,
     err_out: *mut *mut line_sender_error,
-) -> *mut column_sender_chunk {
+) -> *mut qwp_chunk {
     let table = match unsafe { name_str(table_name, table_name_len, err_out) } {
         Some(s) => s,
         None => return std::ptr::null_mut(),
     };
-    Box::into_raw(Box::new(column_sender_chunk(
-        Chunk::new(table),
-        AtomicU32::new(0),
-    )))
+    Box::into_raw(Box::new(qwp_chunk(Chunk::new(table), AtomicU32::new(0))))
 }
 
 /// Create an empty chunk from a pre-validated [`line_sender_table_name`].
 ///
 /// Typed, eager-grammar-validation counterpart to
-/// [`column_sender_chunk_new`]. The name grammar was already checked when
+/// [`qwp_chunk_new`]. The name grammar was already checked when
 /// the [`line_sender_table_name`] was built (`line_sender_table_name_init`
 /// returns `false` for an illegal name), so this constructor cannot fail
 /// on the name and never writes `*err_out`. The 127-byte length cap is
@@ -1621,21 +1618,21 @@ pub unsafe extern "C" fn column_sender_chunk_new(
 ///
 /// Use this when you already validated the table name once (e.g. to share
 /// it between the chunk path and an Arrow flush) instead of being forced
-/// to re-pass raw `const char*` bytes through [`column_sender_chunk_new`].
+/// to re-pass raw `const char*` bytes through [`qwp_chunk_new`].
 /// `err_out` is accepted for ABI symmetry with the other constructors but
 /// is never set: a [`line_sender_table_name`] is validated by
 /// construction.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn column_sender_chunk_new_validated(
+pub unsafe extern "C" fn qwp_chunk_new_validated(
     table: line_sender_table_name,
     _err_out: *mut *mut line_sender_error,
-) -> *mut column_sender_chunk {
+) -> *mut qwp_chunk {
     // The newtype was grammar-validated at `line_sender_table_name_init`
     // time, so `as_name()` is infallible — there is no name failure path.
     // The 127-byte cap is enforced at flush by `validate_table_name`,
     // exactly as it is for the Arrow flush entrypoints.
     let table = unsafe { table.as_name() };
-    Box::into_raw(Box::new(column_sender_chunk(
+    Box::into_raw(Box::new(qwp_chunk(
         Chunk::new(table.as_ref()),
         AtomicU32::new(0),
     )))
@@ -1644,7 +1641,7 @@ pub unsafe extern "C" fn column_sender_chunk_new_validated(
 /// Free a chunk. Accepts NULL and no-ops. A racing in-flight call defers
 /// the drop to the in-flight call's exit path.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn column_sender_chunk_free(chunk: *mut column_sender_chunk) {
+pub unsafe extern "C" fn qwp_chunk_free(chunk: *mut qwp_chunk) {
     if chunk.is_null() {
         return;
     }
@@ -1659,8 +1656,8 @@ pub unsafe extern "C" fn column_sender_chunk_free(chunk: *mut column_sender_chun
 /// On `false`, `*err_out` carries the reason (NULL `err_out` is silently
 /// ignored).
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn column_sender_chunk_clear(
-    chunk: *mut column_sender_chunk,
+pub unsafe extern "C" fn qwp_chunk_clear(
+    chunk: *mut qwp_chunk,
     err_out: *mut *mut line_sender_error,
 ) -> bool {
     if chunk.is_null() {
@@ -1669,22 +1666,15 @@ pub unsafe extern "C" fn column_sender_chunk_clear(
                 err_out,
                 Error::new(
                     ErrorCode::InvalidApiCall,
-                    "column_sender_chunk_clear: chunk is NULL".to_string(),
+                    "qwp_chunk_clear: chunk is NULL".to_string(),
                 ),
             );
         }
         return false;
     }
     let state: *const AtomicU32 = unsafe { &raw const (*chunk).1 };
-    let guard = unsafe {
-        InUseGuard::acquire(
-            chunk,
-            state,
-            "column_sender_chunk_clear",
-            "column_sender_chunk",
-            err_out,
-        )
-    };
+    let guard =
+        unsafe { InUseGuard::acquire(chunk, state, "qwp_chunk_clear", "qwp_chunk", err_out) };
     if guard.is_none() {
         return false;
     }
@@ -1698,8 +1688,8 @@ pub unsafe extern "C" fn column_sender_chunk_clear(
 /// FFI call on the same handle is currently in flight) and sets
 /// `*err_out`. A NULL `err_out` is silently ignored.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn column_sender_chunk_row_count(
-    chunk: *const column_sender_chunk,
+pub unsafe extern "C" fn qwp_chunk_row_count(
+    chunk: *const qwp_chunk,
     err_out: *mut *mut line_sender_error,
 ) -> size_t {
     if chunk.is_null() {
@@ -1708,7 +1698,7 @@ pub unsafe extern "C" fn column_sender_chunk_row_count(
                 err_out,
                 Error::new(
                     ErrorCode::InvalidApiCall,
-                    "column_sender_chunk_row_count: chunk is NULL".to_string(),
+                    "qwp_chunk_row_count: chunk is NULL".to_string(),
                 ),
             );
         }
@@ -1717,10 +1707,10 @@ pub unsafe extern "C" fn column_sender_chunk_row_count(
     let state: *const AtomicU32 = unsafe { &raw const (*chunk).1 };
     let guard = unsafe {
         InUseGuard::acquire(
-            chunk as *mut column_sender_chunk,
+            chunk as *mut qwp_chunk,
             state,
-            "column_sender_chunk_row_count",
-            "column_sender_chunk",
+            "qwp_chunk_row_count",
+            "qwp_chunk",
             err_out,
         )
     };
@@ -1739,23 +1729,23 @@ pub unsafe extern "C" fn column_sender_chunk_row_count(
 // ===========================================================================
 // Timestamp unit
 //
-// Like ack_level, the `column_sender_chunk_column_ts` unit crosses the ABI as
+// Like ack_level, the `qwp_chunk_column_ts` unit crosses the ABI as
 // a `uint32_t` (named constants below) rather than a `#[repr(C)] enum`, so an
 // out-of-range value is a recoverable `InvalidApiCall` instead of Rust UB.
 // ===========================================================================
 
 /// `unit` value selecting `TIMESTAMP` (microseconds) for
-/// [`column_sender_chunk_column_ts`].
-pub const column_sender_ts_unit_micros: u32 = 0;
+/// [`qwp_chunk_column_ts`].
+pub const qwp_ts_unit_micros: u32 = 0;
 
 /// `unit` value selecting `TIMESTAMP_NANOS` (nanoseconds) for
-/// [`column_sender_chunk_column_ts`].
-pub const column_sender_ts_unit_nanos: u32 = 1;
+/// [`qwp_chunk_column_ts`].
+pub const qwp_ts_unit_nanos: u32 = 1;
 
 fn ts_unit_from_u32(value: u32, err_out: *mut *mut line_sender_error) -> Option<TimestampUnit> {
     match value {
-        v if v == column_sender_ts_unit_micros => Some(TimestampUnit::Micros),
-        v if v == column_sender_ts_unit_nanos => Some(TimestampUnit::Nanos),
+        v if v == qwp_ts_unit_micros => Some(TimestampUnit::Micros),
+        v if v == qwp_ts_unit_nanos => Some(TimestampUnit::Nanos),
         other => {
             unsafe {
                 set_err_out_from_error(
@@ -1775,12 +1765,12 @@ macro_rules! column_fn {
     ($fn_name:ident, $c_ty:ty, $rust_method:ident, $what:literal) => {
         #[unsafe(no_mangle)]
         pub unsafe extern "C" fn $fn_name(
-            chunk: *mut column_sender_chunk,
+            chunk: *mut qwp_chunk,
             name: *const c_char,
             name_len: size_t,
             data: *const $c_ty,
             row_count: size_t,
-            validity: *const column_sender_validity,
+            validity: *const qwp_validity,
             err_out: *mut *mut line_sender_error,
         ) -> bool {
             if chunk.is_null() {
@@ -1791,7 +1781,7 @@ macro_rules! column_fn {
                     chunk,
                     &raw const (*chunk).1,
                     stringify!($fn_name),
-                    "column_sender_chunk",
+                    "qwp_chunk",
                     err_out,
                 )
             } {
@@ -1817,68 +1807,28 @@ macro_rules! column_fn {
     };
 }
 
-column_fn!(
-    column_sender_chunk_column_i8,
-    i8,
-    column_i8,
-    "i8 column data"
-);
-column_fn!(
-    column_sender_chunk_column_i16,
-    i16,
-    column_i16,
-    "i16 column data"
-);
-column_fn!(
-    column_sender_chunk_column_i32,
-    i32,
-    column_i32,
-    "i32 column data"
-);
-column_fn!(
-    column_sender_chunk_column_i64,
-    i64,
-    column_i64,
-    "i64 column data"
-);
-column_fn!(
-    column_sender_chunk_column_f32,
-    f32,
-    column_f32,
-    "f32 column data"
-);
-column_fn!(
-    column_sender_chunk_column_f64,
-    f64,
-    column_f64,
-    "f64 column data"
-);
-column_fn!(
-    column_sender_chunk_column_ipv4,
-    u32,
-    column_ipv4,
-    "ipv4 column data"
-);
-column_fn!(
-    column_sender_chunk_column_date,
-    i64,
-    column_date,
-    "date column data"
-);
+column_fn!(qwp_chunk_column_i8, i8, column_i8, "i8 column data");
+column_fn!(qwp_chunk_column_i16, i16, column_i16, "i16 column data");
+column_fn!(qwp_chunk_column_i32, i32, column_i32, "i32 column data");
+column_fn!(qwp_chunk_column_i64, i64, column_i64, "i64 column data");
+column_fn!(qwp_chunk_column_f32, f32, column_f32, "f32 column data");
+column_fn!(qwp_chunk_column_f64, f64, column_f64, "f64 column data");
+column_fn!(qwp_chunk_column_ipv4, u32, column_ipv4, "ipv4 column data");
+column_fn!(qwp_chunk_column_date, i64, column_date, "date column data");
 
 /// `TIMESTAMP` / `TIMESTAMP_NANOS` column. `unit` selects the precision:
-/// `column_sender_ts_unit_micros` (0) → `TIMESTAMP`,
-/// `column_sender_ts_unit_nanos` (1) → `TIMESTAMP_NANOS`. `data` holds
+/// `qwp_ts_unit_micros` (0) → `TIMESTAMP`,
+/// `qwp_ts_unit_nanos` (1) → `TIMESTAMP_NANOS`. `data` holds
 /// `row_count` Unix-epoch values in the chosen unit.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn column_sender_chunk_column_ts(
-    chunk: *mut column_sender_chunk,
+pub unsafe extern "C" fn qwp_chunk_column_ts(
+    chunk: *mut qwp_chunk,
     name: *const c_char,
     name_len: size_t,
     data: *const i64,
     row_count: size_t,
     unit: u32,
-    validity: *const column_sender_validity,
+    validity: *const qwp_validity,
     err_out: *mut *mut line_sender_error,
 ) -> bool {
     if chunk.is_null() {
@@ -1888,8 +1838,8 @@ pub unsafe extern "C" fn column_sender_chunk_column_ts(
         InUseGuard::acquire(
             chunk,
             &raw const (*chunk).1,
-            "column_sender_chunk_column_ts",
-            "column_sender_chunk",
+            "qwp_chunk_column_ts",
+            "qwp_chunk",
             err_out,
         )
     } {
@@ -1923,13 +1873,13 @@ pub unsafe extern "C" fn column_sender_chunk_column_ts(
 /// `BOOLEAN` column. `data` is an Arrow-style LSB-first packed bitmap;
 /// must be at least `ceil(row_count / 8)` bytes long.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn column_sender_chunk_column_bool(
-    chunk: *mut column_sender_chunk,
+pub unsafe extern "C" fn qwp_chunk_column_bool(
+    chunk: *mut qwp_chunk,
     name: *const c_char,
     name_len: size_t,
     data: *const u8,
     row_count: size_t,
-    validity: *const column_sender_validity,
+    validity: *const qwp_validity,
     err_out: *mut *mut line_sender_error,
 ) -> bool {
     if chunk.is_null() {
@@ -1939,8 +1889,8 @@ pub unsafe extern "C" fn column_sender_chunk_column_bool(
         InUseGuard::acquire(
             chunk,
             &raw const (*chunk).1,
-            "column_sender_chunk_column_bool",
-            "column_sender_chunk",
+            "qwp_chunk_column_bool",
+            "qwp_chunk",
             err_out,
         )
     } {
@@ -2002,12 +1952,12 @@ macro_rules! fixed_width_byte_column_fn {
     ($fn_name:ident, $n:literal, $rust_method:ident, $what:literal) => {
         #[unsafe(no_mangle)]
         pub unsafe extern "C" fn $fn_name(
-            chunk: *mut column_sender_chunk,
+            chunk: *mut qwp_chunk,
             name: *const c_char,
             name_len: size_t,
             data: *const u8,
             row_count: size_t,
-            validity: *const column_sender_validity,
+            validity: *const qwp_validity,
             err_out: *mut *mut line_sender_error,
         ) -> bool {
             if chunk.is_null() {
@@ -2018,7 +1968,7 @@ macro_rules! fixed_width_byte_column_fn {
                     chunk,
                     &raw const (*chunk).1,
                     stringify!($fn_name),
-                    "column_sender_chunk",
+                    "qwp_chunk",
                     err_out,
                 )
             } {
@@ -2081,31 +2031,26 @@ macro_rules! fixed_width_byte_column_fn {
     };
 }
 
-fixed_width_byte_column_fn!(column_sender_chunk_column_uuid, 16, column_uuid, "uuid");
-fixed_width_byte_column_fn!(
-    column_sender_chunk_column_long256,
-    32,
-    column_long256,
-    "long256"
-);
+fixed_width_byte_column_fn!(qwp_chunk_column_uuid, 16, column_uuid, "uuid");
+fixed_width_byte_column_fn!(qwp_chunk_column_long256, 32, column_long256, "long256");
 
 // ===========================================================================
 // VARCHAR (variable-width text)
 // ===========================================================================
 
 /// `BINARY` column. Same `offsets` + `bytes` layout as
-/// `column_sender_chunk_column_str`; wire type byte differs so the
+/// `qwp_chunk_column_str`; wire type byte differs so the
 /// server creates a BINARY column. No UTF-8 validation.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn column_sender_chunk_column_binary(
-    chunk: *mut column_sender_chunk,
+pub unsafe extern "C" fn qwp_chunk_column_binary(
+    chunk: *mut qwp_chunk,
     name: *const c_char,
     name_len: size_t,
     offsets: *const i32,
     bytes: *const u8,
     bytes_len: size_t,
     row_count: size_t,
-    validity: *const column_sender_validity,
+    validity: *const qwp_validity,
     err_out: *mut *mut line_sender_error,
 ) -> bool {
     if chunk.is_null() {
@@ -2115,8 +2060,8 @@ pub unsafe extern "C" fn column_sender_chunk_column_binary(
         InUseGuard::acquire(
             chunk,
             &raw const (*chunk).1,
-            "column_sender_chunk_column_binary",
-            "column_sender_chunk",
+            "qwp_chunk_column_binary",
+            "qwp_chunk",
             err_out,
         )
     } {
@@ -2167,15 +2112,15 @@ pub unsafe extern "C" fn column_sender_chunk_column_binary(
 /// `row_count + 1`, monotonically non-decreasing; `bytes` is the
 /// concatenated UTF-8 buffer.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn column_sender_chunk_column_str(
-    chunk: *mut column_sender_chunk,
+pub unsafe extern "C" fn qwp_chunk_column_str(
+    chunk: *mut qwp_chunk,
     name: *const c_char,
     name_len: size_t,
     offsets: *const i32,
     bytes: *const u8,
     bytes_len: size_t,
     row_count: size_t,
-    validity: *const column_sender_validity,
+    validity: *const qwp_validity,
     err_out: *mut *mut line_sender_error,
 ) -> bool {
     if chunk.is_null() {
@@ -2185,8 +2130,8 @@ pub unsafe extern "C" fn column_sender_chunk_column_str(
         InUseGuard::acquire(
             chunk,
             &raw const (*chunk).1,
-            "column_sender_chunk_column_str",
-            "column_sender_chunk",
+            "qwp_chunk_column_str",
+            "qwp_chunk",
             err_out,
         )
     } {
@@ -2241,7 +2186,7 @@ macro_rules! symbol_fn {
     ($fn_name:ident, $code_ty:ty, $rust_method:ident, $what:literal) => {
         #[unsafe(no_mangle)]
         pub unsafe extern "C" fn $fn_name(
-            chunk: *mut column_sender_chunk,
+            chunk: *mut qwp_chunk,
             name: *const c_char,
             name_len: size_t,
             codes: *const $code_ty,
@@ -2250,7 +2195,7 @@ macro_rules! symbol_fn {
             dict_offsets_len: size_t,
             dict_bytes: *const u8,
             dict_bytes_len: size_t,
-            validity: *const column_sender_validity,
+            validity: *const qwp_validity,
             err_out: *mut *mut line_sender_error,
         ) -> bool {
             if chunk.is_null() {
@@ -2261,7 +2206,7 @@ macro_rules! symbol_fn {
                     chunk,
                     &raw const (*chunk).1,
                     stringify!($fn_name),
-                    "column_sender_chunk",
+                    "qwp_chunk",
                     err_out,
                 )
             } {
@@ -2307,24 +2252,9 @@ macro_rules! symbol_fn {
     };
 }
 
-symbol_fn!(
-    column_sender_chunk_symbol_i8,
-    i8,
-    symbol_i8,
-    "symbol codes (i8)"
-);
-symbol_fn!(
-    column_sender_chunk_symbol_i16,
-    i16,
-    symbol_i16,
-    "symbol codes (i16)"
-);
-symbol_fn!(
-    column_sender_chunk_symbol_i32,
-    i32,
-    symbol_i32,
-    "symbol codes (i32)"
-);
+symbol_fn!(qwp_chunk_symbol_i8, i8, symbol_i8, "symbol codes (i8)");
+symbol_fn!(qwp_chunk_symbol_i16, i16, symbol_i16, "symbol codes (i16)");
+symbol_fn!(qwp_chunk_symbol_i32, i32, symbol_i32, "symbol codes (i32)");
 
 // ===========================================================================
 // Generic Arrow column appender
@@ -2335,7 +2265,7 @@ symbol_fn!(
 ///
 /// Ownership: on success, `array->release` is consumed (set to NULL);
 /// the returned handle owns the underlying buffers and releases them on
-/// `column_sender_arrow_import_free`. On failure, `array->release` may
+/// `qwp_arrow_import_free`. On failure, `array->release` may
 /// also have been consumed if the call reached the Arrow import step
 /// before failing — callers MUST check `array->release != NULL` before
 /// invoking it on the failure path. Early-fail paths (NULL pointer,
@@ -2344,20 +2274,20 @@ symbol_fn!(
 ///
 /// `auto`: Dictionary(*, Utf8/LargeUtf8) -> SYMBOL, plain Utf8 -> VARCHAR.
 /// `symbol`: force plain Utf8 -> SYMBOL. `not_symbol`: force Dictionary ->
-/// VARCHAR. Used by `column_sender_arrow_import_new`.
+/// VARCHAR. Used by `qwp_arrow_import_new`.
 //
-// The C header exposes named constants (`column_sender_symbol_mode_auto = 0`,
+// The C header exposes named constants (`qwp_symbol_mode_auto = 0`,
 // `..._symbol = 1`, `..._not_symbol = 2`) but the FFI takes a `u32` (not a
 // `#[repr(u32)]` enum) so an out-of-range value is a recoverable
 // `InvalidApiCall` error instead of immediate Rust UB at the language boundary.
 #[cfg(feature = "arrow")]
-pub const column_sender_symbol_mode_auto: u32 = 0;
+pub const qwp_symbol_mode_auto: u32 = 0;
 #[cfg(feature = "arrow")]
-pub const column_sender_symbol_mode_symbol: u32 = 1;
+pub const qwp_symbol_mode_symbol: u32 = 1;
 #[cfg(feature = "arrow")]
-pub const column_sender_symbol_mode_not_symbol: u32 = 2;
+pub const qwp_symbol_mode_not_symbol: u32 = 2;
 
-/// Resolve a `column_sender_symbol_mode_*` value into the symbol disposition
+/// Resolve a `qwp_symbol_mode_*` value into the symbol disposition
 /// consumed by the Arrow importer: `Some(None)` = auto, `Some(Some(true))` =
 /// force SYMBOL, `Some(Some(false))` = force VARCHAR. Returns the outer `None`
 /// (after writing `*err_out`) when `value` is out of range.
@@ -2374,7 +2304,7 @@ fn symbol_mode_from_u32(value: u32, err_out: *mut *mut line_sender_error) -> Opt
                     Error::new(
                         ErrorCode::InvalidApiCall,
                         format!(
-                            "column_sender_arrow_import_new: invalid symbol_mode {other} (expected 0, 1, or 2)"
+                            "qwp_arrow_import_new: invalid symbol_mode {other} (expected 0, 1, or 2)"
                         ),
                     ),
                 );
@@ -2386,12 +2316,12 @@ fn symbol_mode_from_u32(value: u32, err_out: *mut *mut line_sender_error) -> Opt
 
 #[cfg(feature = "arrow")]
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn column_sender_arrow_import_new(
+pub unsafe extern "C" fn qwp_arrow_import_new(
     array: *mut ArrowArray,
     schema: *const ArrowSchema,
     symbol_mode: u32,
     err_out: *mut *mut line_sender_error,
-) -> *mut column_sender_arrow_import {
+) -> *mut qwp_arrow_import {
     let symbol = match symbol_mode_from_u32(symbol_mode, err_out) {
         Some(symbol) => symbol,
         None => return std::ptr::null_mut(),
@@ -2403,24 +2333,19 @@ pub unsafe extern "C" fn column_sender_arrow_import_new(
             ffi_array,
             ffi_schema,
             symbol,
-            "column_sender_arrow_import_new",
+            "qwp_arrow_import_new",
             err_out,
         )
     } {
         Some(imported) => imported,
         None => return std::ptr::null_mut(),
     };
-    Box::into_raw(Box::new(column_sender_arrow_import(
-        imported,
-        AtomicU32::new(0),
-    )))
+    Box::into_raw(Box::new(qwp_arrow_import(imported, AtomicU32::new(0))))
 }
 
 #[cfg(feature = "arrow")]
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn column_sender_arrow_import_free(
-    imported: *mut column_sender_arrow_import,
-) {
+pub unsafe extern "C" fn qwp_arrow_import_free(imported: *mut qwp_arrow_import) {
     if imported.is_null() {
         return;
     }
@@ -2435,19 +2360,17 @@ pub unsafe extern "C" fn column_sender_arrow_import_free(
 /// alongside the buffers.
 #[cfg(feature = "arrow")]
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn column_sender_arrow_import_len(
-    imported: *const column_sender_arrow_import,
-) -> size_t {
+pub unsafe extern "C" fn qwp_arrow_import_len(imported: *const qwp_arrow_import) -> size_t {
     if imported.is_null() {
         return usize::MAX;
     }
-    let imported_mut = imported as *mut column_sender_arrow_import;
+    let imported_mut = imported as *mut qwp_arrow_import;
     let guard = unsafe {
         InUseGuard::acquire(
             imported_mut,
             &raw const (*imported_mut).1,
-            "column_sender_arrow_import_len",
-            "column_sender_arrow_import",
+            "qwp_arrow_import_len",
+            "qwp_arrow_import",
             std::ptr::null_mut(),
         )
     };
@@ -2459,11 +2382,11 @@ pub unsafe extern "C" fn column_sender_arrow_import_len(
 
 #[cfg(feature = "arrow")]
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn column_sender_chunk_append_arrow_import(
-    chunk: *mut column_sender_chunk,
+pub unsafe extern "C" fn qwp_chunk_append_arrow_import(
+    chunk: *mut qwp_chunk,
     name: *const c_char,
     name_len: size_t,
-    imported: *const column_sender_arrow_import,
+    imported: *const qwp_arrow_import,
     row_offset: size_t,
     row_count: size_t,
     err_out: *mut *mut line_sender_error,
@@ -2474,13 +2397,13 @@ pub unsafe extern "C" fn column_sender_chunk_append_arrow_import(
     if imported.is_null() {
         return reject_null_arrow_import(err_out);
     }
-    let imported_mut = imported as *mut column_sender_arrow_import;
+    let imported_mut = imported as *mut qwp_arrow_import;
     let _import_guard = match unsafe {
         InUseGuard::acquire(
             imported_mut,
             &raw const (*imported_mut).1,
-            "column_sender_chunk_append_arrow_import",
-            "column_sender_arrow_import",
+            "qwp_chunk_append_arrow_import",
+            "qwp_arrow_import",
             err_out,
         )
     } {
@@ -2491,8 +2414,8 @@ pub unsafe extern "C" fn column_sender_chunk_append_arrow_import(
         InUseGuard::acquire(
             chunk,
             &raw const (*chunk).1,
-            "column_sender_chunk_append_arrow_import",
-            "column_sender_chunk",
+            "qwp_chunk_append_arrow_import",
+            "qwp_chunk",
             err_out,
         )
     } {
@@ -2534,8 +2457,8 @@ pub unsafe extern "C" fn column_sender_chunk_append_arrow_import(
 /// offset); `row_offset` further sub-slices within the call.
 #[cfg(feature = "arrow")]
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn column_sender_chunk_append_arrow_column(
-    chunk: *mut column_sender_chunk,
+pub unsafe extern "C" fn qwp_chunk_append_arrow_column(
+    chunk: *mut qwp_chunk,
     name: *const c_char,
     name_len: size_t,
     array: *mut ArrowArray,
@@ -2551,8 +2474,8 @@ pub unsafe extern "C" fn column_sender_chunk_append_arrow_column(
         InUseGuard::acquire(
             chunk,
             &raw const (*chunk).1,
-            "column_sender_chunk_append_arrow_column",
-            "column_sender_chunk",
+            "qwp_chunk_append_arrow_column",
+            "qwp_chunk",
             err_out,
         )
     } {
@@ -2571,7 +2494,7 @@ pub unsafe extern "C" fn column_sender_chunk_append_arrow_column(
             ffi_schema,
             row_offset,
             row_count,
-            "column_sender_chunk_append_arrow_column",
+            "qwp_chunk_append_arrow_column",
             err_out,
         )
     } {
@@ -2601,7 +2524,7 @@ pub unsafe extern "C" fn column_sender_chunk_append_arrow_column(
 // ===========================================================================
 // NumPy column appender
 //
-// Companion to `column_sender_chunk_append_arrow_column` that takes a
+// Companion to `qwp_chunk_append_arrow_column` that takes a
 // raw contiguous NumPy buffer + a dtype tag. The buffer is borrowed by
 // pointer (not copied) at append time; widening / packing happens at
 // flush. The caller must keep `data` alive until the next flush returns.
@@ -2611,75 +2534,75 @@ pub unsafe extern "C" fn column_sender_chunk_append_arrow_column(
 // ===========================================================================
 
 /// NumPy source dtype tag. Mirrored to the C ABI as a 32-bit enum; the
-/// discriminants and order must match `column_sender_numpy_dtype` in the
+/// discriminants and order must match `qwp_numpy_dtype` in the
 /// C header. The dtype tells the encoder how to walk `data` at flush and
 /// which QWP wire kind to emit; for `decimal_*` and `geohash_*`, the
-/// per-call parameter rides on `column_sender_numpy_extras`.
+/// per-call parameter rides on `qwp_numpy_extras`.
 #[repr(C)]
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub enum column_sender_numpy_dtype {
-    column_sender_numpy_i8 = 0,
-    column_sender_numpy_i16 = 1,
-    column_sender_numpy_i32 = 2,
-    column_sender_numpy_i64 = 3,
-    column_sender_numpy_u8 = 4,
-    column_sender_numpy_u16 = 5,
-    column_sender_numpy_u32 = 6,
-    column_sender_numpy_u64 = 7,
-    column_sender_numpy_f32 = 8,
-    column_sender_numpy_f64 = 9,
-    column_sender_numpy_bool = 10,
+pub enum qwp_numpy_dtype {
+    qwp_numpy_i8 = 0,
+    qwp_numpy_i16 = 1,
+    qwp_numpy_i32 = 2,
+    qwp_numpy_i64 = 3,
+    qwp_numpy_u8 = 4,
+    qwp_numpy_u16 = 5,
+    qwp_numpy_u32 = 6,
+    qwp_numpy_u64 = 7,
+    qwp_numpy_f32 = 8,
+    qwp_numpy_f64 = 9,
+    qwp_numpy_bool = 10,
 
-    column_sender_numpy_f16 = 11,
-    column_sender_numpy_datetime64_s = 12,
-    column_sender_numpy_datetime64_ms = 13,
-    column_sender_numpy_datetime64_us = 14,
-    column_sender_numpy_datetime64_ns = 15,
-    column_sender_numpy_timedelta64_s = 16,
-    column_sender_numpy_timedelta64_ms = 17,
-    column_sender_numpy_timedelta64_us = 18,
-    column_sender_numpy_timedelta64_ns = 19,
+    qwp_numpy_f16 = 11,
+    qwp_numpy_datetime64_s = 12,
+    qwp_numpy_datetime64_ms = 13,
+    qwp_numpy_datetime64_us = 14,
+    qwp_numpy_datetime64_ns = 15,
+    qwp_numpy_timedelta64_s = 16,
+    qwp_numpy_timedelta64_ms = 17,
+    qwp_numpy_timedelta64_us = 18,
+    qwp_numpy_timedelta64_ns = 19,
 
-    column_sender_numpy_s16 = 20,
-    column_sender_numpy_s32 = 21,
+    qwp_numpy_s16 = 20,
+    qwp_numpy_s32 = 21,
 
-    column_sender_numpy_decimal_s8 = 22,
-    column_sender_numpy_decimal_s16 = 23,
-    column_sender_numpy_decimal_s32 = 24,
+    qwp_numpy_decimal_s8 = 22,
+    qwp_numpy_decimal_s16 = 23,
+    qwp_numpy_decimal_s32 = 24,
 
-    column_sender_numpy_u32_ipv4 = 25,
-    column_sender_numpy_u16_char = 26,
+    qwp_numpy_u32_ipv4 = 25,
+    qwp_numpy_u16_char = 26,
 
-    column_sender_numpy_geohash_i8 = 27,
-    column_sender_numpy_geohash_i16 = 28,
-    column_sender_numpy_geohash_i32 = 29,
-    column_sender_numpy_geohash_i64 = 30,
+    qwp_numpy_geohash_i8 = 27,
+    qwp_numpy_geohash_i16 = 28,
+    qwp_numpy_geohash_i32 = 29,
+    qwp_numpy_geohash_i64 = 30,
 
-    column_sender_numpy_f64_ndarray = 31,
+    qwp_numpy_f64_ndarray = 31,
 
-    column_sender_numpy_datetime64_m = 32,
-    column_sender_numpy_datetime64_h = 33,
-    column_sender_numpy_datetime64_D = 34,
-    column_sender_numpy_datetime64_M = 35,
-    column_sender_numpy_datetime64_Y = 36,
-    column_sender_numpy_datetime64_W = 37,
+    qwp_numpy_datetime64_m = 32,
+    qwp_numpy_datetime64_h = 33,
+    qwp_numpy_datetime64_D = 34,
+    qwp_numpy_datetime64_M = 35,
+    qwp_numpy_datetime64_Y = 36,
+    qwp_numpy_datetime64_W = 37,
 
-    column_sender_numpy_timedelta64_m = 38,
-    column_sender_numpy_timedelta64_h = 39,
-    column_sender_numpy_timedelta64_D = 40,
-    column_sender_numpy_timedelta64_M = 41,
-    column_sender_numpy_timedelta64_Y = 42,
+    qwp_numpy_timedelta64_m = 38,
+    qwp_numpy_timedelta64_h = 39,
+    qwp_numpy_timedelta64_D = 40,
+    qwp_numpy_timedelta64_M = 41,
+    qwp_numpy_timedelta64_Y = 42,
 }
 
-/// Companion to [`column_sender_chunk_append_numpy_column`] carrying
+/// Companion to [`qwp_chunk_append_numpy_column`] carrying
 /// dtype-specific parameters. Pass NULL unless the chosen dtype reads
 /// from a field (decimal scale, geohash bits).
 #[repr(C)]
 #[derive(Copy, Clone, Debug)]
-pub struct column_sender_numpy_extras {
+pub struct qwp_numpy_extras {
     pub decimal_scale: i8,
     pub geohash_bits: u8,
-    /// Number of dimensions per row for `column_sender_numpy_f64_ndarray`.
+    /// Number of dimensions per row for `qwp_numpy_f64_ndarray`.
     /// Must be in `1..=MAX_ARRAY_DIMS` (`32`).
     pub array_ndim: u8,
     /// Per-row shape (length = `array_ndim`). Each dim must be >= 1. The
@@ -2688,7 +2611,7 @@ pub struct column_sender_numpy_extras {
 }
 
 unsafe fn validate_decimal_scale(
-    extras: Option<&column_sender_numpy_extras>,
+    extras: Option<&qwp_numpy_extras>,
     max_scale: i8,
     label: &str,
     err_out: *mut *mut line_sender_error,
@@ -2700,7 +2623,7 @@ unsafe fn validate_decimal_scale(
                 Error::new(
                     ErrorCode::InvalidApiCall,
                     format!(
-                        "{label} column requires non-NULL column_sender_numpy_extras with decimal_scale set"
+                        "{label} column requires non-NULL qwp_numpy_extras with decimal_scale set"
                     ),
                 ),
             );
@@ -2736,7 +2659,7 @@ unsafe fn validate_decimal_scale(
 }
 
 unsafe fn validate_geohash_bits(
-    extras: Option<&column_sender_numpy_extras>,
+    extras: Option<&qwp_numpy_extras>,
     max_bits: u8,
     err_out: *mut *mut line_sender_error,
 ) -> Option<u8> {
@@ -2746,7 +2669,8 @@ unsafe fn validate_geohash_bits(
                 err_out,
                 Error::new(
                     ErrorCode::InvalidApiCall,
-                    "GEOHASH iN column requires non-NULL column_sender_numpy_extras with geohash_bits set".to_string(),
+                    "GEOHASH iN column requires non-NULL qwp_numpy_extras with geohash_bits set"
+                        .to_string(),
                 ),
             );
         }
@@ -2781,7 +2705,7 @@ unsafe fn validate_geohash_bits(
 }
 
 unsafe fn validate_f64_ndarray(
-    extras: Option<&column_sender_numpy_extras>,
+    extras: Option<&qwp_numpy_extras>,
     err_out: *mut *mut line_sender_error,
 ) -> Option<(u8, [u32; MAX_ARRAY_DIMS])> {
     let Some(extras) = extras else {
@@ -2790,7 +2714,7 @@ unsafe fn validate_f64_ndarray(
                 err_out,
                 Error::new(
                     ErrorCode::InvalidApiCall,
-                    "f64_ndarray column requires non-NULL column_sender_numpy_extras with array_ndim and array_shape set".to_string(),
+                    "f64_ndarray column requires non-NULL qwp_numpy_extras with array_ndim and array_shape set".to_string(),
                 ),
             );
         }
@@ -2873,139 +2797,91 @@ unsafe fn validate_f64_ndarray(
 
 unsafe fn resolve_numpy_dtype(
     dtype: u32,
-    extras: *const column_sender_numpy_extras,
+    extras: *const qwp_numpy_extras,
     err_out: *mut *mut line_sender_error,
 ) -> Option<NumpyDtype> {
     let extras = unsafe { extras.as_ref() };
     Some(match dtype {
-        d if d == column_sender_numpy_dtype::column_sender_numpy_i8 as u32 => {
-            NumpyDtype::I8WidenToI32
-        }
-        d if d == column_sender_numpy_dtype::column_sender_numpy_i16 as u32 => {
-            NumpyDtype::I16WidenToI32
-        }
-        d if d == column_sender_numpy_dtype::column_sender_numpy_i32 as u32 => {
-            NumpyDtype::I32WidenToI64
-        }
-        d if d == column_sender_numpy_dtype::column_sender_numpy_i64 as u32 => {
-            NumpyDtype::I64Direct
-        }
-        d if d == column_sender_numpy_dtype::column_sender_numpy_u8 as u32 => {
-            NumpyDtype::U8WidenToI32
-        }
-        d if d == column_sender_numpy_dtype::column_sender_numpy_u16 as u32 => {
-            NumpyDtype::U16WidenToI32
-        }
-        d if d == column_sender_numpy_dtype::column_sender_numpy_u32 as u32 => {
-            NumpyDtype::U32WidenToI64
-        }
-        d if d == column_sender_numpy_dtype::column_sender_numpy_u64 as u32 => {
-            NumpyDtype::U64WidenToI64
-        }
-        d if d == column_sender_numpy_dtype::column_sender_numpy_f32 as u32 => {
-            NumpyDtype::F32Direct
-        }
-        d if d == column_sender_numpy_dtype::column_sender_numpy_f64 as u32 => {
-            NumpyDtype::F64Direct
-        }
-        d if d == column_sender_numpy_dtype::column_sender_numpy_bool as u32 => NumpyDtype::Bool,
-        d if d == column_sender_numpy_dtype::column_sender_numpy_f16 as u32 => NumpyDtype::F16Widen,
-        d if d == column_sender_numpy_dtype::column_sender_numpy_datetime64_s as u32 => {
-            NumpyDtype::DatetimeSecToMicros
-        }
-        d if d == column_sender_numpy_dtype::column_sender_numpy_datetime64_ms as u32 => {
-            NumpyDtype::DateI64Direct
-        }
-        d if d == column_sender_numpy_dtype::column_sender_numpy_datetime64_us as u32 => {
+        d if d == qwp_numpy_dtype::qwp_numpy_i8 as u32 => NumpyDtype::I8WidenToI32,
+        d if d == qwp_numpy_dtype::qwp_numpy_i16 as u32 => NumpyDtype::I16WidenToI32,
+        d if d == qwp_numpy_dtype::qwp_numpy_i32 as u32 => NumpyDtype::I32WidenToI64,
+        d if d == qwp_numpy_dtype::qwp_numpy_i64 as u32 => NumpyDtype::I64Direct,
+        d if d == qwp_numpy_dtype::qwp_numpy_u8 as u32 => NumpyDtype::U8WidenToI32,
+        d if d == qwp_numpy_dtype::qwp_numpy_u16 as u32 => NumpyDtype::U16WidenToI32,
+        d if d == qwp_numpy_dtype::qwp_numpy_u32 as u32 => NumpyDtype::U32WidenToI64,
+        d if d == qwp_numpy_dtype::qwp_numpy_u64 as u32 => NumpyDtype::U64WidenToI64,
+        d if d == qwp_numpy_dtype::qwp_numpy_f32 as u32 => NumpyDtype::F32Direct,
+        d if d == qwp_numpy_dtype::qwp_numpy_f64 as u32 => NumpyDtype::F64Direct,
+        d if d == qwp_numpy_dtype::qwp_numpy_bool as u32 => NumpyDtype::Bool,
+        d if d == qwp_numpy_dtype::qwp_numpy_f16 as u32 => NumpyDtype::F16Widen,
+        d if d == qwp_numpy_dtype::qwp_numpy_datetime64_s as u32 => NumpyDtype::DatetimeSecToMicros,
+        d if d == qwp_numpy_dtype::qwp_numpy_datetime64_ms as u32 => NumpyDtype::DateI64Direct,
+        d if d == qwp_numpy_dtype::qwp_numpy_datetime64_us as u32 => {
             NumpyDtype::TimestampMicrosDirect
         }
-        d if d == column_sender_numpy_dtype::column_sender_numpy_datetime64_ns as u32 => {
+        d if d == qwp_numpy_dtype::qwp_numpy_datetime64_ns as u32 => {
             NumpyDtype::TimestampNanosDirect
         }
-        d if d == column_sender_numpy_dtype::column_sender_numpy_timedelta64_s as u32
-            || d == column_sender_numpy_dtype::column_sender_numpy_timedelta64_ms as u32
-            || d == column_sender_numpy_dtype::column_sender_numpy_timedelta64_us as u32
-            || d == column_sender_numpy_dtype::column_sender_numpy_timedelta64_ns as u32 =>
+        d if d == qwp_numpy_dtype::qwp_numpy_timedelta64_s as u32
+            || d == qwp_numpy_dtype::qwp_numpy_timedelta64_ms as u32
+            || d == qwp_numpy_dtype::qwp_numpy_timedelta64_us as u32
+            || d == qwp_numpy_dtype::qwp_numpy_timedelta64_ns as u32 =>
         {
             NumpyDtype::LongDirect
         }
-        d if d == column_sender_numpy_dtype::column_sender_numpy_s16 as u32 => {
-            NumpyDtype::UuidDirect
-        }
-        d if d == column_sender_numpy_dtype::column_sender_numpy_s32 as u32 => {
-            NumpyDtype::Long256Direct
-        }
-        d if d == column_sender_numpy_dtype::column_sender_numpy_decimal_s8 as u32 => {
-            NumpyDtype::Decimal64 {
-                scale: unsafe { validate_decimal_scale(extras, 18, "DECIMAL64", err_out)? },
-            }
-        }
-        d if d == column_sender_numpy_dtype::column_sender_numpy_decimal_s16 as u32 => {
-            NumpyDtype::Decimal128 {
-                scale: unsafe { validate_decimal_scale(extras, 38, "DECIMAL128", err_out)? },
-            }
-        }
-        d if d == column_sender_numpy_dtype::column_sender_numpy_decimal_s32 as u32 => {
-            NumpyDtype::Decimal256 {
-                scale: unsafe { validate_decimal_scale(extras, 76, "DECIMAL256", err_out)? },
-            }
-        }
-        d if d == column_sender_numpy_dtype::column_sender_numpy_u32_ipv4 as u32 => {
-            NumpyDtype::Ipv4Direct
-        }
-        d if d == column_sender_numpy_dtype::column_sender_numpy_u16_char as u32 => {
-            NumpyDtype::CharDirect
-        }
-        d if d == column_sender_numpy_dtype::column_sender_numpy_geohash_i8 as u32 => {
-            NumpyDtype::GeohashI8 {
-                bits: unsafe { validate_geohash_bits(extras, 8, err_out)? },
-            }
-        }
-        d if d == column_sender_numpy_dtype::column_sender_numpy_geohash_i16 as u32 => {
-            NumpyDtype::GeohashI16 {
-                bits: unsafe { validate_geohash_bits(extras, 16, err_out)? },
-            }
-        }
-        d if d == column_sender_numpy_dtype::column_sender_numpy_geohash_i32 as u32 => {
-            NumpyDtype::GeohashI32 {
-                bits: unsafe { validate_geohash_bits(extras, 32, err_out)? },
-            }
-        }
-        d if d == column_sender_numpy_dtype::column_sender_numpy_geohash_i64 as u32 => {
-            NumpyDtype::GeohashI64 {
-                bits: unsafe { validate_geohash_bits(extras, 60, err_out)? },
-            }
-        }
-        d if d == column_sender_numpy_dtype::column_sender_numpy_f64_ndarray as u32 => {
+        d if d == qwp_numpy_dtype::qwp_numpy_s16 as u32 => NumpyDtype::UuidDirect,
+        d if d == qwp_numpy_dtype::qwp_numpy_s32 as u32 => NumpyDtype::Long256Direct,
+        d if d == qwp_numpy_dtype::qwp_numpy_decimal_s8 as u32 => NumpyDtype::Decimal64 {
+            scale: unsafe { validate_decimal_scale(extras, 18, "DECIMAL64", err_out)? },
+        },
+        d if d == qwp_numpy_dtype::qwp_numpy_decimal_s16 as u32 => NumpyDtype::Decimal128 {
+            scale: unsafe { validate_decimal_scale(extras, 38, "DECIMAL128", err_out)? },
+        },
+        d if d == qwp_numpy_dtype::qwp_numpy_decimal_s32 as u32 => NumpyDtype::Decimal256 {
+            scale: unsafe { validate_decimal_scale(extras, 76, "DECIMAL256", err_out)? },
+        },
+        d if d == qwp_numpy_dtype::qwp_numpy_u32_ipv4 as u32 => NumpyDtype::Ipv4Direct,
+        d if d == qwp_numpy_dtype::qwp_numpy_u16_char as u32 => NumpyDtype::CharDirect,
+        d if d == qwp_numpy_dtype::qwp_numpy_geohash_i8 as u32 => NumpyDtype::GeohashI8 {
+            bits: unsafe { validate_geohash_bits(extras, 8, err_out)? },
+        },
+        d if d == qwp_numpy_dtype::qwp_numpy_geohash_i16 as u32 => NumpyDtype::GeohashI16 {
+            bits: unsafe { validate_geohash_bits(extras, 16, err_out)? },
+        },
+        d if d == qwp_numpy_dtype::qwp_numpy_geohash_i32 as u32 => NumpyDtype::GeohashI32 {
+            bits: unsafe { validate_geohash_bits(extras, 32, err_out)? },
+        },
+        d if d == qwp_numpy_dtype::qwp_numpy_geohash_i64 as u32 => NumpyDtype::GeohashI64 {
+            bits: unsafe { validate_geohash_bits(extras, 60, err_out)? },
+        },
+        d if d == qwp_numpy_dtype::qwp_numpy_f64_ndarray as u32 => {
             let (ndim, shape) = unsafe { validate_f64_ndarray(extras, err_out)? };
             NumpyDtype::F64Ndarray { ndim, shape }
         }
-        d if d == column_sender_numpy_dtype::column_sender_numpy_datetime64_m as u32 => {
+        d if d == qwp_numpy_dtype::qwp_numpy_datetime64_m as u32 => {
             NumpyDtype::DatetimeMinuteToMicros
         }
-        d if d == column_sender_numpy_dtype::column_sender_numpy_datetime64_h as u32 => {
+        d if d == qwp_numpy_dtype::qwp_numpy_datetime64_h as u32 => {
             NumpyDtype::DatetimeHourToMicros
         }
-        d if d == column_sender_numpy_dtype::column_sender_numpy_datetime64_D as u32 => {
-            NumpyDtype::DatetimeDayToMicros
-        }
-        d if d == column_sender_numpy_dtype::column_sender_numpy_datetime64_M as u32 => {
+        d if d == qwp_numpy_dtype::qwp_numpy_datetime64_D as u32 => NumpyDtype::DatetimeDayToMicros,
+        d if d == qwp_numpy_dtype::qwp_numpy_datetime64_M as u32 => {
             NumpyDtype::DatetimeMonthToMicros
         }
-        d if d == column_sender_numpy_dtype::column_sender_numpy_datetime64_Y as u32 => {
+        d if d == qwp_numpy_dtype::qwp_numpy_datetime64_Y as u32 => {
             NumpyDtype::DatetimeYearToMicros
         }
-        d if d == column_sender_numpy_dtype::column_sender_numpy_datetime64_W as u32 => {
+        d if d == qwp_numpy_dtype::qwp_numpy_datetime64_W as u32 => {
             NumpyDtype::DatetimeWeekToMicros
         }
-        d if d == column_sender_numpy_dtype::column_sender_numpy_timedelta64_m as u32
-            || d == column_sender_numpy_dtype::column_sender_numpy_timedelta64_h as u32
-            || d == column_sender_numpy_dtype::column_sender_numpy_timedelta64_D as u32 =>
+        d if d == qwp_numpy_dtype::qwp_numpy_timedelta64_m as u32
+            || d == qwp_numpy_dtype::qwp_numpy_timedelta64_h as u32
+            || d == qwp_numpy_dtype::qwp_numpy_timedelta64_D as u32 =>
         {
             NumpyDtype::LongDirect
         }
-        d if d == column_sender_numpy_dtype::column_sender_numpy_timedelta64_M as u32
-            || d == column_sender_numpy_dtype::column_sender_numpy_timedelta64_Y as u32 =>
+        d if d == qwp_numpy_dtype::qwp_numpy_timedelta64_M as u32
+            || d == qwp_numpy_dtype::qwp_numpy_timedelta64_Y as u32 =>
         {
             unsafe {
                 set_err_out_from_error(
@@ -3029,8 +2905,8 @@ unsafe fn resolve_numpy_dtype(
                     Error::new(
                         ErrorCode::InvalidApiCall,
                         format!(
-                            "column_sender_chunk_append_numpy_column: invalid dtype {other} \
-                             (expected a column_sender_numpy_* constant)"
+                            "qwp_chunk_append_numpy_column: invalid dtype {other} \
+                             (expected a qwp_numpy_* constant)"
                         ),
                     ),
                 );
@@ -3083,16 +2959,16 @@ unsafe fn resolve_numpy_dtype(
 /// length check is read out of bounds — undefined behaviour. Call
 /// `numpy.ascontiguousarray(arr)` upstream before handing the buffer over.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn column_sender_chunk_append_numpy_column(
-    chunk: *mut column_sender_chunk,
+pub unsafe extern "C" fn qwp_chunk_append_numpy_column(
+    chunk: *mut qwp_chunk,
     name: *const c_char,
     name_len: size_t,
     dtype: u32,
     data: *const u8,
     data_len_bytes: size_t,
     row_count: size_t,
-    validity: *const column_sender_validity,
-    extras: *const column_sender_numpy_extras,
+    validity: *const qwp_validity,
+    extras: *const qwp_numpy_extras,
     err_out: *mut *mut line_sender_error,
 ) -> bool {
     if chunk.is_null() {
@@ -3102,8 +2978,8 @@ pub unsafe extern "C" fn column_sender_chunk_append_numpy_column(
         InUseGuard::acquire(
             chunk,
             &raw const (*chunk).1,
-            "column_sender_chunk_append_numpy_column",
-            "column_sender_chunk",
+            "qwp_chunk_append_numpy_column",
+            "qwp_chunk",
             err_out,
         )
     } {
@@ -3203,8 +3079,8 @@ pub unsafe extern "C" fn column_sender_chunk_append_numpy_column(
 // ===========================================================================
 
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn column_sender_chunk_at_micros(
-    chunk: *mut column_sender_chunk,
+pub unsafe extern "C" fn qwp_chunk_at_micros(
+    chunk: *mut qwp_chunk,
     data: *const i64,
     row_count: size_t,
     err_out: *mut *mut line_sender_error,
@@ -3216,8 +3092,8 @@ pub unsafe extern "C" fn column_sender_chunk_at_micros(
         InUseGuard::acquire(
             chunk,
             &raw const (*chunk).1,
-            "column_sender_chunk_at_micros",
-            "column_sender_chunk",
+            "qwp_chunk_at_micros",
+            "qwp_chunk",
             err_out,
         )
     } {
@@ -3234,8 +3110,8 @@ pub unsafe extern "C" fn column_sender_chunk_at_micros(
 }
 
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn column_sender_chunk_at_nanos(
-    chunk: *mut column_sender_chunk,
+pub unsafe extern "C" fn qwp_chunk_at_nanos(
+    chunk: *mut qwp_chunk,
     data: *const i64,
     row_count: size_t,
     err_out: *mut *mut line_sender_error,
@@ -3247,8 +3123,8 @@ pub unsafe extern "C" fn column_sender_chunk_at_nanos(
         InUseGuard::acquire(
             chunk,
             &raw const (*chunk).1,
-            "column_sender_chunk_at_nanos",
-            "column_sender_chunk",
+            "qwp_chunk_at_nanos",
+            "qwp_chunk",
             err_out,
         )
     } {
@@ -3265,8 +3141,8 @@ pub unsafe extern "C" fn column_sender_chunk_at_nanos(
 }
 
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn column_sender_chunk_at_millis(
-    chunk: *mut column_sender_chunk,
+pub unsafe extern "C" fn qwp_chunk_at_millis(
+    chunk: *mut qwp_chunk,
     data: *const i64,
     row_count: size_t,
     err_out: *mut *mut line_sender_error,
@@ -3278,8 +3154,8 @@ pub unsafe extern "C" fn column_sender_chunk_at_millis(
         InUseGuard::acquire(
             chunk,
             &raw const (*chunk).1,
-            "column_sender_chunk_at_millis",
-            "column_sender_chunk",
+            "qwp_chunk_at_millis",
+            "qwp_chunk",
             err_out,
         )
     } {
@@ -3296,8 +3172,8 @@ pub unsafe extern "C" fn column_sender_chunk_at_millis(
 }
 
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn column_sender_chunk_at_seconds(
-    chunk: *mut column_sender_chunk,
+pub unsafe extern "C" fn qwp_chunk_at_seconds(
+    chunk: *mut qwp_chunk,
     data: *const i64,
     row_count: size_t,
     err_out: *mut *mut line_sender_error,
@@ -3309,8 +3185,8 @@ pub unsafe extern "C" fn column_sender_chunk_at_seconds(
         InUseGuard::acquire(
             chunk,
             &raw const (*chunk).1,
-            "column_sender_chunk_at_seconds",
-            "column_sender_chunk",
+            "qwp_chunk_at_seconds",
+            "qwp_chunk",
             err_out,
         )
     } {
@@ -3330,16 +3206,16 @@ pub unsafe extern "C" fn column_sender_chunk_at_seconds(
 /// carries no designated timestamp column and the server stamps each row
 /// on arrival. This is an **explicit opt-in** mirroring
 /// `qwp_sender_flush_arrow_batch_at_now` — if your data carries a real
-/// event-time column, pin it with `column_sender_chunk_at_micros` /
+/// event-time column, pin it with `qwp_chunk_at_micros` /
 /// `_at_nanos` instead; server-assigned timestamps generate unique rows
 /// on resubmission and so defeat `DEDUP UPSERT KEYS`.
 ///
 /// Rejects if a designated timestamp column is already set on this chunk
 /// (and the `at_*` setters reject after this call). Cleared by
-/// `column_sender_chunk_clear` like every other chunk property.
+/// `qwp_chunk_clear` like every other chunk property.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn column_sender_chunk_at_now(
-    chunk: *mut column_sender_chunk,
+pub unsafe extern "C" fn qwp_chunk_at_now(
+    chunk: *mut qwp_chunk,
     err_out: *mut *mut line_sender_error,
 ) -> bool {
     if chunk.is_null() {
@@ -3349,8 +3225,8 @@ pub unsafe extern "C" fn column_sender_chunk_at_now(
         InUseGuard::acquire(
             chunk,
             &raw const (*chunk).1,
-            "column_sender_chunk_at_now",
-            "column_sender_chunk",
+            "qwp_chunk_at_now",
+            "qwp_chunk",
             err_out,
         )
     } {
@@ -3364,14 +3240,14 @@ pub unsafe extern "C" fn column_sender_chunk_at_now(
 
 /// Pin one scalar nanosecond-precision Unix epoch timestamp as every
 /// row's designated timestamp, encoded as a repeated constant (wire type
-/// `TIMESTAMP_NANOS`). Unlike `column_sender_chunk_at_now` the value is
+/// `TIMESTAMP_NANOS`). Unlike `qwp_chunk_at_now` the value is
 /// fixed at the caller, so resubmission is idempotent under
 /// `DEDUP UPSERT KEYS`. Rejects negative (pre-epoch) values and any
 /// already-set designated timestamp. Cleared by
-/// `column_sender_chunk_clear` like every other chunk property.
+/// `qwp_chunk_clear` like every other chunk property.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn column_sender_chunk_at_scalar_nanos(
-    chunk: *mut column_sender_chunk,
+pub unsafe extern "C" fn qwp_chunk_at_scalar_nanos(
+    chunk: *mut qwp_chunk,
     nanos: i64,
     err_out: *mut *mut line_sender_error,
 ) -> bool {
@@ -3382,8 +3258,8 @@ pub unsafe extern "C" fn column_sender_chunk_at_scalar_nanos(
         InUseGuard::acquire(
             chunk,
             &raw const (*chunk).1,
-            "column_sender_chunk_at_scalar_nanos",
-            "column_sender_chunk",
+            "qwp_chunk_at_scalar_nanos",
+            "qwp_chunk",
             err_out,
         )
     } {
@@ -3569,7 +3445,7 @@ pub unsafe extern "C" fn qwp_sender_flush_buffer_and_keep_and_get_fsn(
 ///
 /// In direct mode, ready acks are drained non-blocking before the write.
 /// Deferred flushes keep one in-flight slot reserved for the later
-/// `direct_column_sender_commit` frame; if that reserve would be consumed, the
+/// `qwp_direct_sender_commit` frame; if that reserve would be consumed, the
 /// call fails and the caller must sync before flushing more chunks. In SFA mode
 /// frames are non-deferred and `flush` success means local queue acceptance.
 ///
@@ -3585,11 +3461,11 @@ pub unsafe extern "C" fn qwp_sender_flush_buffer_and_keep_and_get_fsn(
 /// `*err_out` to detect this delivery-unknown case before retrying.
 ///
 /// Call `qwp_sender_wait` (store-and-forward) or
-/// `direct_column_sender_commit` (direct) after the last flush to drain all
+/// `qwp_direct_sender_commit` (direct) after the last flush to drain all
 /// remaining in-flight acks.
 unsafe fn cs_flush_body<T: CsHandle>(
     sender: *mut T,
-    chunk: *mut column_sender_chunk,
+    chunk: *mut qwp_chunk,
     fn_name: &str,
     err_out: *mut *mut line_sender_error,
 ) -> bool {
@@ -3618,13 +3494,7 @@ unsafe fn cs_flush_body<T: CsHandle>(
         return reject_null_chunk(err_out);
     }
     let _chunk_guard = match unsafe {
-        InUseGuard::acquire(
-            chunk,
-            &raw const (*chunk).1,
-            fn_name,
-            "column_sender_chunk",
-            err_out,
-        )
+        InUseGuard::acquire(chunk, &raw const (*chunk).1, fn_name, "qwp_chunk", err_out)
     } {
         Some(g) => g,
         None => return false,
@@ -3640,7 +3510,7 @@ unsafe fn cs_flush_body<T: CsHandle>(
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn qwp_sender_flush_chunk(
     sender: *mut qwp_sender,
-    chunk: *mut column_sender_chunk,
+    chunk: *mut qwp_chunk,
     err_out: *mut *mut line_sender_error,
 ) -> bool {
     unsafe { cs_flush_body(sender, chunk, "qwp_sender_flush_chunk", err_out) }
@@ -3648,7 +3518,7 @@ pub unsafe extern "C" fn qwp_sender_flush_chunk(
 
 unsafe fn cs_flush_and_wait_body<T: CsHandle>(
     sender: *mut T,
-    chunk: *mut column_sender_chunk,
+    chunk: *mut qwp_chunk,
     ack_level: u32,
     fn_name: &str,
     err_out: *mut *mut line_sender_error,
@@ -3682,13 +3552,7 @@ unsafe fn cs_flush_and_wait_body<T: CsHandle>(
         return reject_null_chunk(err_out);
     }
     let _chunk_guard = match unsafe {
-        InUseGuard::acquire(
-            chunk,
-            &raw const (*chunk).1,
-            fn_name,
-            "column_sender_chunk",
-            err_out,
-        )
+        InUseGuard::acquire(chunk, &raw const (*chunk).1, fn_name, "qwp_chunk", err_out)
     } {
         Some(g) => g,
         None => return false,
@@ -3706,7 +3570,7 @@ unsafe fn cs_flush_and_wait_body<T: CsHandle>(
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn qwp_sender_flush_chunk_and_wait(
     sender: *mut qwp_sender,
-    chunk: *mut column_sender_chunk,
+    chunk: *mut qwp_chunk,
     ack_level: u32,
     err_out: *mut *mut line_sender_error,
 ) -> bool {
@@ -3727,7 +3591,7 @@ pub unsafe extern "C" fn qwp_sender_flush_chunk_and_wait(
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn qwp_sender_flush_chunk_and_get_fsn(
     sender: *mut qwp_sender,
-    chunk: *mut column_sender_chunk,
+    chunk: *mut qwp_chunk,
     fsn_out: *mut line_sender_qwpws_fsn,
     err_out: *mut *mut line_sender_error,
 ) -> bool {
@@ -3766,13 +3630,7 @@ pub unsafe extern "C" fn qwp_sender_flush_chunk_and_get_fsn(
         return reject_null_chunk(err_out);
     }
     let _chunk_guard = match unsafe {
-        InUseGuard::acquire(
-            chunk,
-            &raw const (*chunk).1,
-            fn_name,
-            "column_sender_chunk",
-            err_out,
-        )
+        InUseGuard::acquire(chunk, &raw const (*chunk).1, fn_name, "qwp_chunk", err_out)
     } {
         Some(g) => g,
         None => return false,
@@ -4018,14 +3876,14 @@ pub unsafe extern "C" fn qwp_sender_acked_fsn(
 }
 
 /// Pipeline a deferred frame on a direct connection. Not committed until
-/// `direct_column_sender_commit` / `direct_column_sender_flush_and_wait`.
+/// `qwp_direct_sender_commit` / `qwp_direct_sender_flush_and_wait`.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn direct_column_sender_flush(
-    sender: *mut direct_column_sender,
-    chunk: *mut column_sender_chunk,
+pub unsafe extern "C" fn qwp_direct_sender_flush(
+    sender: *mut qwp_direct_sender,
+    chunk: *mut qwp_chunk,
     err_out: *mut *mut line_sender_error,
 ) -> bool {
-    unsafe { cs_flush_body(sender, chunk, "direct_column_sender_flush", err_out) }
+    unsafe { cs_flush_body(sender, chunk, "qwp_direct_sender_flush", err_out) }
 }
 
 /// Publish `chunk` as a completion boundary, then **wait** until every frame
@@ -4038,7 +3896,7 @@ pub unsafe extern "C" fn direct_column_sender_flush(
 /// **before** `chunk` is touched.
 ///
 /// Boundary: a successful return acknowledges all prior no-wait flushes plus
-/// this one. An empty `chunk` behaves like `direct_column_sender_commit`.
+/// this one. An empty `chunk` behaves like `qwp_direct_sender_commit`.
 ///
 /// Failure contract: if the call fails before publication, `chunk` is left
 /// untouched and retryable. Once the frame is published `chunk` is cleared even
@@ -4050,9 +3908,9 @@ pub unsafe extern "C" fn direct_column_sender_flush(
 /// Direct-only combined publish+commit. Publishes `chunk` as a non-deferred
 /// commit boundary and waits for `ack_level`.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn direct_column_sender_flush_and_wait(
-    sender: *mut direct_column_sender,
-    chunk: *mut column_sender_chunk,
+pub unsafe extern "C" fn qwp_direct_sender_flush_and_wait(
+    sender: *mut qwp_direct_sender,
+    chunk: *mut qwp_chunk,
     ack_level: u32,
     err_out: *mut *mut line_sender_error,
 ) -> bool {
@@ -4061,7 +3919,7 @@ pub unsafe extern "C" fn direct_column_sender_flush_and_wait(
             sender,
             chunk,
             ack_level,
-            "direct_column_sender_flush_and_wait",
+            "qwp_direct_sender_flush_and_wait",
             err_out,
         )
     }
@@ -4111,7 +3969,7 @@ pub unsafe extern "C" fn qwp_sender_flush_arrow_batch_at_now(
     table: line_sender_table_name,
     array: *mut arrow::ffi::FFI_ArrowArray,
     schema: *const arrow::ffi::FFI_ArrowSchema,
-    overrides: *const column_sender_arrow_override,
+    overrides: *const qwp_arrow_override,
     overrides_len: size_t,
     err_out: *mut *mut line_sender_error,
 ) -> bool {
@@ -4140,7 +3998,7 @@ pub unsafe extern "C" fn qwp_sender_flush_arrow_batch_at_now_and_get_fsn(
     table: line_sender_table_name,
     array: *mut arrow::ffi::FFI_ArrowArray,
     schema: *const arrow::ffi::FFI_ArrowSchema,
-    overrides: *const column_sender_arrow_override,
+    overrides: *const qwp_arrow_override,
     overrides_len: size_t,
     fsn_out: *mut line_sender_qwpws_fsn,
     err_out: *mut *mut line_sender_error,
@@ -4165,7 +4023,7 @@ pub unsafe extern "C" fn qwp_sender_flush_arrow_batch_at_now_and_get_fsn(
 /// `array` as a boundary, then wait for `ack_level`.
 ///
 /// Same ACK-validation preflight and phase-aware re-export contract as
-/// `direct_column_sender_flush_arrow_batch_at_now_and_wait`.
+/// `qwp_direct_sender_flush_arrow_batch_at_now_and_wait`.
 #[cfg(feature = "arrow")]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn qwp_sender_flush_arrow_batch_at_now_and_wait(
@@ -4173,7 +4031,7 @@ pub unsafe extern "C" fn qwp_sender_flush_arrow_batch_at_now_and_wait(
     table: line_sender_table_name,
     array: *mut arrow::ffi::FFI_ArrowArray,
     schema: *const arrow::ffi::FFI_ArrowSchema,
-    overrides: *const column_sender_arrow_override,
+    overrides: *const qwp_arrow_override,
     overrides_len: size_t,
     ack_level: u32,
     err_out: *mut *mut line_sender_error,
@@ -4195,22 +4053,22 @@ pub unsafe extern "C" fn qwp_sender_flush_arrow_batch_at_now_and_wait(
 }
 
 /// Direct-handle publish-only Arrow flush (server-stamped). Pair with
-/// `direct_column_sender_commit`, or use
-/// `direct_column_sender_flush_arrow_batch_at_now_and_wait`.
+/// `qwp_direct_sender_commit`, or use
+/// `qwp_direct_sender_flush_arrow_batch_at_now_and_wait`.
 #[cfg(feature = "arrow")]
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn direct_column_sender_flush_arrow_batch_at_now(
-    sender: *mut direct_column_sender,
+pub unsafe extern "C" fn qwp_direct_sender_flush_arrow_batch_at_now(
+    sender: *mut qwp_direct_sender,
     table: line_sender_table_name,
     array: *mut arrow::ffi::FFI_ArrowArray,
     schema: *const arrow::ffi::FFI_ArrowSchema,
-    overrides: *const column_sender_arrow_override,
+    overrides: *const qwp_arrow_override,
     overrides_len: size_t,
     err_out: *mut *mut line_sender_error,
 ) -> bool {
     unsafe {
         arrow_batch_impl(
-            "direct_column_sender_flush_arrow_batch_at_now",
+            "qwp_direct_sender_flush_arrow_batch_at_now",
             sender,
             table,
             array,
@@ -4236,7 +4094,7 @@ pub unsafe extern "C" fn qwp_sender_flush_arrow_batch_at_column(
     array: *mut arrow::ffi::FFI_ArrowArray,
     schema: *const arrow::ffi::FFI_ArrowSchema,
     ts_column: line_sender_column_name,
-    overrides: *const column_sender_arrow_override,
+    overrides: *const qwp_arrow_override,
     overrides_len: size_t,
     err_out: *mut *mut line_sender_error,
 ) -> bool {
@@ -4265,7 +4123,7 @@ pub unsafe extern "C" fn qwp_sender_flush_arrow_batch_at_column_and_get_fsn(
     array: *mut arrow::ffi::FFI_ArrowArray,
     schema: *const arrow::ffi::FFI_ArrowSchema,
     ts_column: line_sender_column_name,
-    overrides: *const column_sender_arrow_override,
+    overrides: *const qwp_arrow_override,
     overrides_len: size_t,
     fsn_out: *mut line_sender_qwpws_fsn,
     err_out: *mut *mut line_sender_error,
@@ -4298,7 +4156,7 @@ pub unsafe extern "C" fn qwp_sender_flush_arrow_batch_at_column_and_wait(
     array: *mut arrow::ffi::FFI_ArrowArray,
     schema: *const arrow::ffi::FFI_ArrowSchema,
     ts_column: line_sender_column_name,
-    overrides: *const column_sender_arrow_override,
+    overrides: *const qwp_arrow_override,
     overrides_len: size_t,
     ack_level: u32,
     err_out: *mut *mut line_sender_error,
@@ -4320,23 +4178,23 @@ pub unsafe extern "C" fn qwp_sender_flush_arrow_batch_at_column_and_wait(
 }
 
 /// Direct-handle publish-only Arrow flush (column-stamped). Pair with
-/// `direct_column_sender_commit`, or use
-/// `direct_column_sender_flush_arrow_batch_at_column_and_wait`.
+/// `qwp_direct_sender_commit`, or use
+/// `qwp_direct_sender_flush_arrow_batch_at_column_and_wait`.
 #[cfg(feature = "arrow")]
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn direct_column_sender_flush_arrow_batch_at_column(
-    sender: *mut direct_column_sender,
+pub unsafe extern "C" fn qwp_direct_sender_flush_arrow_batch_at_column(
+    sender: *mut qwp_direct_sender,
     table: line_sender_table_name,
     array: *mut arrow::ffi::FFI_ArrowArray,
     schema: *const arrow::ffi::FFI_ArrowSchema,
     ts_column: line_sender_column_name,
-    overrides: *const column_sender_arrow_override,
+    overrides: *const qwp_arrow_override,
     overrides_len: size_t,
     err_out: *mut *mut line_sender_error,
 ) -> bool {
     unsafe {
         arrow_batch_impl(
-            "direct_column_sender_flush_arrow_batch_at_column",
+            "qwp_direct_sender_flush_arrow_batch_at_column",
             sender,
             table,
             array,
@@ -4352,25 +4210,25 @@ pub unsafe extern "C" fn direct_column_sender_flush_arrow_batch_at_column(
 /// Direct-handle publish-only Arrow flush with one scalar
 /// nanosecond-precision Unix epoch timestamp as every row's designated
 /// timestamp, encoded as a repeated constant. Unlike
-/// `direct_column_sender_flush_arrow_batch_at_now` the value is fixed at
+/// `qwp_direct_sender_flush_arrow_batch_at_now` the value is fixed at
 /// the caller, so resubmission is idempotent under `DEDUP UPSERT KEYS`.
 /// Rejects negative (pre-epoch) values. Same ownership and `overrides`
-/// contract as `direct_column_sender_flush_arrow_batch_at_now`.
+/// contract as `qwp_direct_sender_flush_arrow_batch_at_now`.
 #[cfg(feature = "arrow")]
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn direct_column_sender_flush_arrow_batch_at_scalar_nanos(
-    sender: *mut direct_column_sender,
+pub unsafe extern "C" fn qwp_direct_sender_flush_arrow_batch_at_scalar_nanos(
+    sender: *mut qwp_direct_sender,
     table: line_sender_table_name,
     array: *mut arrow::ffi::FFI_ArrowArray,
     schema: *const arrow::ffi::FFI_ArrowSchema,
     at_nanos: i64,
-    overrides: *const column_sender_arrow_override,
+    overrides: *const qwp_arrow_override,
     overrides_len: size_t,
     err_out: *mut *mut line_sender_error,
 ) -> bool {
     unsafe {
         arrow_batch_impl(
-            "direct_column_sender_flush_arrow_batch_at_scalar_nanos",
+            "qwp_direct_sender_flush_arrow_batch_at_scalar_nanos",
             sender,
             table,
             array,
@@ -4405,19 +4263,19 @@ pub unsafe extern "C" fn direct_column_sender_flush_arrow_batch_at_scalar_nanos(
 /// Returns `true` on success, `false` on error (with `*err_out` set).
 #[cfg(feature = "arrow")]
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn direct_column_sender_flush_arrow_batch_at_now_and_wait(
-    sender: *mut direct_column_sender,
+pub unsafe extern "C" fn qwp_direct_sender_flush_arrow_batch_at_now_and_wait(
+    sender: *mut qwp_direct_sender,
     table: line_sender_table_name,
     array: *mut arrow::ffi::FFI_ArrowArray,
     schema: *const arrow::ffi::FFI_ArrowSchema,
-    overrides: *const column_sender_arrow_override,
+    overrides: *const qwp_arrow_override,
     overrides_len: size_t,
     ack_level: u32,
     err_out: *mut *mut line_sender_error,
 ) -> bool {
     unsafe {
         arrow_batch_impl_and_wait(
-            "direct_column_sender_flush_arrow_batch_at_now_and_wait",
+            "qwp_direct_sender_flush_arrow_batch_at_now_and_wait",
             sender,
             table,
             array,
@@ -4437,20 +4295,20 @@ pub unsafe extern "C" fn direct_column_sender_flush_arrow_batch_at_now_and_wait(
 /// contract as `qwp_sender_flush_arrow_batch_at_now_and_wait`.
 #[cfg(feature = "arrow")]
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn direct_column_sender_flush_arrow_batch_at_column_and_wait(
-    sender: *mut direct_column_sender,
+pub unsafe extern "C" fn qwp_direct_sender_flush_arrow_batch_at_column_and_wait(
+    sender: *mut qwp_direct_sender,
     table: line_sender_table_name,
     array: *mut arrow::ffi::FFI_ArrowArray,
     schema: *const arrow::ffi::FFI_ArrowSchema,
     ts_column: line_sender_column_name,
-    overrides: *const column_sender_arrow_override,
+    overrides: *const qwp_arrow_override,
     overrides_len: size_t,
     ack_level: u32,
     err_out: *mut *mut line_sender_error,
 ) -> bool {
     unsafe {
         arrow_batch_impl_and_wait(
-            "direct_column_sender_flush_arrow_batch_at_column_and_wait",
+            "qwp_direct_sender_flush_arrow_batch_at_column_and_wait",
             sender,
             table,
             array,
@@ -4465,16 +4323,16 @@ pub unsafe extern "C" fn direct_column_sender_flush_arrow_batch_at_column_and_wa
 }
 
 /// Per-column wire-type hint kind passed in
-/// [`column_sender_arrow_override::kind`].
+/// [`qwp_arrow_override::kind`].
 #[cfg(feature = "arrow")]
 #[repr(u32)]
 #[allow(non_camel_case_types)]
-pub enum column_sender_arrow_override_kind {
-    column_sender_arrow_override_symbol = 0,
-    column_sender_arrow_override_ipv4 = 1,
-    column_sender_arrow_override_char = 2,
-    column_sender_arrow_override_geohash = 3,
-    column_sender_arrow_override_not_symbol = 4,
+pub enum qwp_arrow_override_kind {
+    qwp_arrow_override_symbol = 0,
+    qwp_arrow_override_ipv4 = 1,
+    qwp_arrow_override_char = 2,
+    qwp_arrow_override_geohash = 3,
+    qwp_arrow_override_not_symbol = 4,
 }
 
 /// Per-column wire-type hint that overrides what the encoder would
@@ -4485,11 +4343,11 @@ pub enum column_sender_arrow_override_kind {
 #[cfg(feature = "arrow")]
 #[repr(C)]
 #[allow(non_camel_case_types)]
-pub struct column_sender_arrow_override {
+pub struct qwp_arrow_override {
     /// UTF-8 column name; not necessarily NUL-terminated.
     pub column: *const c_char,
     pub column_len: size_t,
-    /// One of `column_sender_arrow_override_kind` as `u32`.
+    /// One of `qwp_arrow_override_kind` as `u32`.
     pub kind: u32,
     /// Kind-specific argument:
     /// - `_geohash`: precision bits (1..=60).
@@ -4509,7 +4367,7 @@ const MAX_ARROW_OVERRIDE_COLUMN_NAME_LEN: usize = 65_536;
 #[cfg(feature = "arrow")]
 unsafe fn arrow_overrides_from_c<'a>(
     fn_name: &str,
-    overrides: *const column_sender_arrow_override,
+    overrides: *const qwp_arrow_override,
     overrides_len: size_t,
     err_out: *mut *mut line_sender_error,
 ) -> Option<Vec<ArrowColumnOverride<'a>>> {
@@ -4567,32 +4425,19 @@ unsafe fn arrow_overrides_from_c<'a>(
             }
         };
         let parsed = match ov.kind {
-            x if x
-                == column_sender_arrow_override_kind::column_sender_arrow_override_symbol
-                    as u32 =>
-            {
+            x if x == qwp_arrow_override_kind::qwp_arrow_override_symbol as u32 => {
                 ArrowColumnOverride::Symbol { column }
             }
-            x if x
-                == column_sender_arrow_override_kind::column_sender_arrow_override_not_symbol
-                    as u32 =>
-            {
+            x if x == qwp_arrow_override_kind::qwp_arrow_override_not_symbol as u32 => {
                 ArrowColumnOverride::NotSymbol { column }
             }
-            x if x
-                == column_sender_arrow_override_kind::column_sender_arrow_override_ipv4 as u32 =>
-            {
+            x if x == qwp_arrow_override_kind::qwp_arrow_override_ipv4 as u32 => {
                 ArrowColumnOverride::Ipv4 { column }
             }
-            x if x
-                == column_sender_arrow_override_kind::column_sender_arrow_override_char as u32 =>
-            {
+            x if x == qwp_arrow_override_kind::qwp_arrow_override_char as u32 => {
                 ArrowColumnOverride::Char { column }
             }
-            x if x
-                == column_sender_arrow_override_kind::column_sender_arrow_override_geohash
-                    as u32 =>
-            {
+            x if x == qwp_arrow_override_kind::qwp_arrow_override_geohash as u32 => {
                 if ov.arg == 0 || ov.arg > 60 {
                     crate::arrow_err_to_c_box(
                         err_out,
@@ -4643,7 +4488,7 @@ unsafe fn arrow_batch_impl<T: CsHandle>(
     array: *mut arrow::ffi::FFI_ArrowArray,
     schema: *const arrow::ffi::FFI_ArrowSchema,
     ts: FfiArrowTs,
-    overrides_ptr: *const column_sender_arrow_override,
+    overrides_ptr: *const qwp_arrow_override,
     overrides_len: size_t,
     err_out: *mut *mut line_sender_error,
 ) -> bool {
@@ -4719,7 +4564,7 @@ unsafe fn arrow_batch_impl_and_get_fsn(
     array: *mut arrow::ffi::FFI_ArrowArray,
     schema: *const arrow::ffi::FFI_ArrowSchema,
     ts_column: Option<line_sender_column_name>,
-    overrides_ptr: *const column_sender_arrow_override,
+    overrides_ptr: *const qwp_arrow_override,
     overrides_len: size_t,
     fsn_out: *mut line_sender_qwpws_fsn,
     err_out: *mut *mut line_sender_error,
@@ -4805,7 +4650,7 @@ unsafe fn arrow_batch_impl_and_wait<T: CsHandle>(
     array: *mut arrow::ffi::FFI_ArrowArray,
     schema: *const arrow::ffi::FFI_ArrowSchema,
     ts_column: Option<line_sender_column_name>,
-    overrides_ptr: *const column_sender_arrow_override,
+    overrides_ptr: *const qwp_arrow_override,
     overrides_len: size_t,
     ack_level: u32,
     err_out: *mut *mut line_sender_error,
@@ -5016,20 +4861,12 @@ pub unsafe extern "C" fn qwp_sender_wait(
 /// Direct commit: send the commit boundary for all pipelined frames and block
 /// until they reach `ack_level`. The direct sender's durability checkpoint.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn direct_column_sender_commit(
-    sender: *mut direct_column_sender,
+pub unsafe extern "C" fn qwp_direct_sender_commit(
+    sender: *mut qwp_direct_sender,
     ack_level: u32,
     err_out: *mut *mut line_sender_error,
 ) -> bool {
-    unsafe {
-        cs_wait_body(
-            sender,
-            ack_level,
-            None,
-            "direct_column_sender_commit",
-            err_out,
-        )
-    }
+    unsafe { cs_wait_body(sender, ack_level, None, "qwp_direct_sender_commit", err_out) }
 }
 
 // ===========================================================================
@@ -5042,7 +4879,7 @@ fn reject_null_chunk(err_out: *mut *mut line_sender_error) -> bool {
             err_out,
             Error::new(
                 ErrorCode::InvalidApiCall,
-                "column_sender_chunk pointer is NULL".to_string(),
+                "qwp_chunk pointer is NULL".to_string(),
             ),
         );
     }
@@ -5056,7 +4893,7 @@ fn reject_null_arrow_import(err_out: *mut *mut line_sender_error) -> bool {
             err_out,
             Error::new(
                 ErrorCode::InvalidApiCall,
-                "column_sender_arrow_import pointer is NULL".to_string(),
+                "qwp_arrow_import pointer is NULL".to_string(),
             ),
         );
     }
@@ -5109,7 +4946,7 @@ mod tests {
 
             let mut err_direct: *mut line_sender_error = std::ptr::null_mut();
             let direct = unsafe {
-                questdb_db_borrow_direct_column_sender_with_retry(
+                questdb_db_borrow_direct_sender_with_retry(
                     std::ptr::null_mut(),
                     budget,
                     &mut err_direct,
@@ -5146,8 +4983,7 @@ mod tests {
 
         // Non-zero budget: the retry loop makes a few attempts, then gives up
         // once the budget is spent.
-        let sender =
-            unsafe { questdb_db_borrow_direct_column_sender_with_retry(db, 150, &mut err) };
+        let sender = unsafe { questdb_db_borrow_direct_sender_with_retry(db, 150, &mut err) };
         assert!(sender.is_null(), "borrow against a closed port must fail");
         assert!(!err.is_null(), "a failed borrow must populate err_out");
         unsafe { line_sender_error_free(err) };
@@ -5155,7 +4991,7 @@ mod tests {
         // Zero budget makes a single attempt; still fails, error reported, no
         // leak or panic.
         let mut err0: *mut line_sender_error = std::ptr::null_mut();
-        let conn0 = unsafe { questdb_db_borrow_direct_column_sender_with_retry(db, 0, &mut err0) };
+        let conn0 = unsafe { questdb_db_borrow_direct_sender_with_retry(db, 0, &mut err0) };
         assert!(conn0.is_null());
         assert!(!err0.is_null());
         unsafe { line_sender_error_free(err0) };
@@ -5170,20 +5006,18 @@ mod tests {
         // flush per the documented contract on `Chunk::new`.
         let mut err: *mut line_sender_error = std::ptr::null_mut();
         let table = "x".repeat(128);
-        let chunk = unsafe {
-            column_sender_chunk_new(table.as_ptr() as *const c_char, table.len(), &mut err)
-        };
+        let chunk =
+            unsafe { qwp_chunk_new(table.as_ptr() as *const c_char, table.len(), &mut err) };
         assert!(!chunk.is_null());
         assert!(err.is_null());
-        unsafe { column_sender_chunk_free(chunk) };
+        unsafe { qwp_chunk_free(chunk) };
     }
 
     #[test]
     fn chunk_new_rejects_invalid_utf8() {
         let bad: [u8; 3] = [0xFF, 0xFE, 0xFD];
         let mut err: *mut line_sender_error = std::ptr::null_mut();
-        let chunk =
-            unsafe { column_sender_chunk_new(bad.as_ptr() as *const c_char, bad.len(), &mut err) };
+        let chunk = unsafe { qwp_chunk_new(bad.as_ptr() as *const c_char, bad.len(), &mut err) };
         assert!(chunk.is_null());
         assert!(!err.is_null());
         unsafe { line_sender_error_free(err) };
@@ -5194,74 +5028,72 @@ mod tests {
         let mut err: *mut line_sender_error = std::ptr::null_mut();
 
         // NULL chunk rejects without touching err-free invariants.
-        let ok = unsafe { column_sender_chunk_at_now(std::ptr::null_mut(), &mut err) };
+        let ok = unsafe { qwp_chunk_at_now(std::ptr::null_mut(), &mut err) };
         assert!(!ok);
         assert!(!err.is_null());
         unsafe { line_sender_error_free(err) };
         err = std::ptr::null_mut();
 
         let table = b"trades";
-        let chunk = unsafe {
-            column_sender_chunk_new(table.as_ptr() as *const c_char, table.len(), &mut err)
-        };
+        let chunk =
+            unsafe { qwp_chunk_new(table.as_ptr() as *const c_char, table.len(), &mut err) };
         assert!(!chunk.is_null());
 
-        assert!(unsafe { column_sender_chunk_at_now(chunk, &mut err) });
+        assert!(unsafe { qwp_chunk_at_now(chunk, &mut err) });
         assert!(err.is_null());
 
         // A designated ts column now conflicts with the at_now opt-in.
         let ts = [1i64, 2, 3];
-        let ok = unsafe { column_sender_chunk_at_micros(chunk, ts.as_ptr(), ts.len(), &mut err) };
+        let ok = unsafe { qwp_chunk_at_micros(chunk, ts.as_ptr(), ts.len(), &mut err) };
         assert!(!ok);
         assert!(!err.is_null());
         unsafe { line_sender_error_free(err) };
         err = std::ptr::null_mut();
 
         // clear() resets the opt-in: the ts column is accepted again.
-        assert!(unsafe { column_sender_chunk_clear(chunk, &mut err) });
-        assert!(unsafe { column_sender_chunk_at_micros(chunk, ts.as_ptr(), ts.len(), &mut err) });
+        assert!(unsafe { qwp_chunk_clear(chunk, &mut err) });
+        assert!(unsafe { qwp_chunk_at_micros(chunk, ts.as_ptr(), ts.len(), &mut err) });
         assert!(err.is_null());
 
-        unsafe { column_sender_chunk_free(chunk) };
+        unsafe { qwp_chunk_free(chunk) };
     }
 
     #[test]
     fn chunk_at_scalar_nanos_null_guard_validation_and_conflict() {
         let mut err: *mut line_sender_error = std::ptr::null_mut();
 
-        let ok = unsafe { column_sender_chunk_at_scalar_nanos(std::ptr::null_mut(), 7, &mut err) };
+        let ok = unsafe { qwp_chunk_at_scalar_nanos(std::ptr::null_mut(), 7, &mut err) };
         assert!(!ok);
         assert!(!err.is_null());
         unsafe { line_sender_error_free(err) };
         err = std::ptr::null_mut();
 
         let table = b"trades";
-        let chunk = unsafe {
-            column_sender_chunk_new(table.as_ptr() as *const c_char, table.len(), &mut err)
-        };
+        let chunk =
+            unsafe { qwp_chunk_new(table.as_ptr() as *const c_char, table.len(), &mut err) };
         assert!(!chunk.is_null());
 
-        let ok = unsafe { column_sender_chunk_at_scalar_nanos(chunk, -1, &mut err) };
+        let ok = unsafe { qwp_chunk_at_scalar_nanos(chunk, -1, &mut err) };
         assert!(!ok);
         assert!(!err.is_null());
         unsafe { line_sender_error_free(err) };
         err = std::ptr::null_mut();
 
-        assert!(unsafe { column_sender_chunk_at_scalar_nanos(chunk, 7, &mut err) });
+        assert!(unsafe { qwp_chunk_at_scalar_nanos(chunk, 7, &mut err) });
         assert!(err.is_null());
 
         let ts = [1i64, 2, 3];
-        let ok = unsafe { column_sender_chunk_at_micros(chunk, ts.as_ptr(), ts.len(), &mut err) };
+        let ok = unsafe { qwp_chunk_at_micros(chunk, ts.as_ptr(), ts.len(), &mut err) };
         assert!(!ok);
         assert!(!err.is_null());
         unsafe { line_sender_error_free(err) };
         err = std::ptr::null_mut();
 
-        assert!(unsafe { column_sender_chunk_clear(chunk, &mut err) });
-        assert!(unsafe { column_sender_chunk_at_micros(chunk, ts.as_ptr(), ts.len(), &mut err) });
+        assert!(unsafe { qwp_chunk_clear(chunk, &mut err) });
+        assert!(unsafe { qwp_chunk_at_micros(chunk, ts.as_ptr(), ts.len(), &mut err) });
         assert!(err.is_null());
 
-        unsafe { column_sender_chunk_free(chunk) };
+        unsafe { qwp_chunk_free(chunk) };
     }
 
     #[test]
@@ -5270,7 +5102,7 @@ mod tests {
         // `line_sender_table_name` (e.g. to reuse it across an Arrow flush via
         // `qwp_sender_flush_arrow_batch_at_column`) must be able to feed the
         // SAME validated handle into the chunk path, rather than being forced
-        // to re-pass raw `const char*` bytes to `column_sender_chunk_new`.
+        // to re-pass raw `const char*` bytes to `qwp_chunk_new`.
         let raw = b"trades";
         let mut err: *mut line_sender_error = std::ptr::null_mut();
         let mut table = line_sender_table_name {
@@ -5288,7 +5120,7 @@ mod tests {
         assert!(ok, "valid table name should init");
         assert!(err.is_null());
 
-        let chunk = unsafe { column_sender_chunk_new_validated(table, &mut err) };
+        let chunk = unsafe { qwp_chunk_new_validated(table, &mut err) };
         assert!(
             !chunk.is_null(),
             "validated chunk constructor should succeed"
@@ -5296,11 +5128,11 @@ mod tests {
         assert!(err.is_null());
 
         // The resulting chunk behaves identically to one built via the raw
-        // `column_sender_chunk_new` entrypoint.
+        // `qwp_chunk_new` entrypoint.
         let name = b"price";
         let data: [i64; 3] = [1, 2, 3];
         let appended = unsafe {
-            column_sender_chunk_column_i64(
+            qwp_chunk_column_i64(
                 chunk,
                 name.as_ptr() as *const c_char,
                 name.len(),
@@ -5312,25 +5144,24 @@ mod tests {
         };
         assert!(appended, "column_i64 should succeed on the validated chunk");
         assert_eq!(
-            unsafe { column_sender_chunk_row_count(chunk, std::ptr::null_mut()) },
+            unsafe { qwp_chunk_row_count(chunk, std::ptr::null_mut()) },
             3
         );
-        unsafe { column_sender_chunk_free(chunk) };
+        unsafe { qwp_chunk_free(chunk) };
     }
 
     #[test]
     fn column_i64_round_trip_on_pure_data_path() {
         let table = b"trades";
         let mut err: *mut line_sender_error = std::ptr::null_mut();
-        let chunk = unsafe {
-            column_sender_chunk_new(table.as_ptr() as *const c_char, table.len(), &mut err)
-        };
+        let chunk =
+            unsafe { qwp_chunk_new(table.as_ptr() as *const c_char, table.len(), &mut err) };
         assert!(!chunk.is_null());
 
         let name = b"price";
         let data: [i64; 3] = [1, 2, 3];
         let ok = unsafe {
-            column_sender_chunk_column_i64(
+            qwp_chunk_column_i64(
                 chunk,
                 name.as_ptr() as *const c_char,
                 name.len(),
@@ -5342,25 +5173,24 @@ mod tests {
         };
         assert!(ok, "column_i64 should succeed");
         assert_eq!(
-            unsafe { column_sender_chunk_row_count(chunk, std::ptr::null_mut()) },
+            unsafe { qwp_chunk_row_count(chunk, std::ptr::null_mut()) },
             3
         );
-        unsafe { column_sender_chunk_free(chunk) };
+        unsafe { qwp_chunk_free(chunk) };
     }
 
     #[test]
     fn column_i64_rejects_row_count_mismatch() {
         let table = b"trades";
         let mut err: *mut line_sender_error = std::ptr::null_mut();
-        let chunk = unsafe {
-            column_sender_chunk_new(table.as_ptr() as *const c_char, table.len(), &mut err)
-        };
+        let chunk =
+            unsafe { qwp_chunk_new(table.as_ptr() as *const c_char, table.len(), &mut err) };
         let name_a = b"a";
         let name_b = b"b";
         let data_a: [i64; 3] = [1, 2, 3];
         let data_b: [i64; 2] = [4, 5];
         assert!(unsafe {
-            column_sender_chunk_column_i64(
+            qwp_chunk_column_i64(
                 chunk,
                 name_a.as_ptr() as *const c_char,
                 name_a.len(),
@@ -5371,7 +5201,7 @@ mod tests {
             )
         });
         let ok = unsafe {
-            column_sender_chunk_column_i64(
+            qwp_chunk_column_i64(
                 chunk,
                 name_b.as_ptr() as *const c_char,
                 name_b.len(),
@@ -5384,16 +5214,15 @@ mod tests {
         assert!(!ok);
         assert!(!err.is_null());
         unsafe { line_sender_error_free(err) };
-        unsafe { column_sender_chunk_free(chunk) };
+        unsafe { qwp_chunk_free(chunk) };
     }
 
     #[test]
     fn column_bool_round_trip_on_pure_data_path() {
         let table = b"trades";
         let mut err: *mut line_sender_error = std::ptr::null_mut();
-        let chunk = unsafe {
-            column_sender_chunk_new(table.as_ptr() as *const c_char, table.len(), &mut err)
-        };
+        let chunk =
+            unsafe { qwp_chunk_new(table.as_ptr() as *const c_char, table.len(), &mut err) };
         assert!(!chunk.is_null());
 
         // 5 rows: true, false, true, true, false -> LSB-first bits 0,2,3 set.
@@ -5401,7 +5230,7 @@ mod tests {
         let data: [u8; 1] = [0b0000_1101];
         let row_count: usize = 5;
         let ok = unsafe {
-            column_sender_chunk_column_bool(
+            qwp_chunk_column_bool(
                 chunk,
                 name.as_ptr() as *const c_char,
                 name.len(),
@@ -5414,19 +5243,18 @@ mod tests {
         assert!(ok, "column_bool should succeed");
         assert!(err.is_null());
         assert_eq!(
-            unsafe { column_sender_chunk_row_count(chunk, std::ptr::null_mut()) },
+            unsafe { qwp_chunk_row_count(chunk, std::ptr::null_mut()) },
             row_count
         );
-        unsafe { column_sender_chunk_free(chunk) };
+        unsafe { qwp_chunk_free(chunk) };
     }
 
     #[test]
     fn column_bool_with_validity_nulls() {
         let table = b"trades";
         let mut err: *mut line_sender_error = std::ptr::null_mut();
-        let chunk = unsafe {
-            column_sender_chunk_new(table.as_ptr() as *const c_char, table.len(), &mut err)
-        };
+        let chunk =
+            unsafe { qwp_chunk_new(table.as_ptr() as *const c_char, table.len(), &mut err) };
         assert!(!chunk.is_null());
 
         // 4 rows of bool data, with rows 1 and 3 marked NULL via the
@@ -5435,12 +5263,12 @@ mod tests {
         let data: [u8; 1] = [0b0000_0101];
         let valid_bits: [u8; 1] = [0b0000_0101];
         let row_count: usize = 4;
-        let validity = column_sender_validity {
+        let validity = qwp_validity {
             bits: valid_bits.as_ptr(),
             bit_len: row_count,
         };
         let ok = unsafe {
-            column_sender_chunk_column_bool(
+            qwp_chunk_column_bool(
                 chunk,
                 name.as_ptr() as *const c_char,
                 name.len(),
@@ -5453,24 +5281,23 @@ mod tests {
         assert!(ok, "column_bool with validity should succeed");
         assert!(err.is_null());
         assert_eq!(
-            unsafe { column_sender_chunk_row_count(chunk, std::ptr::null_mut()) },
+            unsafe { qwp_chunk_row_count(chunk, std::ptr::null_mut()) },
             row_count
         );
-        unsafe { column_sender_chunk_free(chunk) };
+        unsafe { qwp_chunk_free(chunk) };
     }
 
     #[test]
     fn column_bool_rejects_row_count_mismatch() {
         let table = b"trades";
         let mut err: *mut line_sender_error = std::ptr::null_mut();
-        let chunk = unsafe {
-            column_sender_chunk_new(table.as_ptr() as *const c_char, table.len(), &mut err)
-        };
+        let chunk =
+            unsafe { qwp_chunk_new(table.as_ptr() as *const c_char, table.len(), &mut err) };
         // Lock the chunk row_count to 3 via an i64 column.
         let name_a = b"a";
         let data_a: [i64; 3] = [1, 2, 3];
         assert!(unsafe {
-            column_sender_chunk_column_i64(
+            qwp_chunk_column_i64(
                 chunk,
                 name_a.as_ptr() as *const c_char,
                 name_a.len(),
@@ -5485,7 +5312,7 @@ mod tests {
         let name_b = b"flag";
         let data_b: [u8; 1] = [0b0000_0001];
         let ok = unsafe {
-            column_sender_chunk_column_bool(
+            qwp_chunk_column_bool(
                 chunk,
                 name_b.as_ptr() as *const c_char,
                 name_b.len(),
@@ -5498,21 +5325,20 @@ mod tests {
         assert!(!ok);
         assert!(!err.is_null());
         unsafe { line_sender_error_free(err) };
-        unsafe { column_sender_chunk_free(chunk) };
+        unsafe { qwp_chunk_free(chunk) };
     }
 
     #[test]
     fn column_bool_rejects_null_data_with_rows() {
         let table = b"trades";
         let mut err: *mut line_sender_error = std::ptr::null_mut();
-        let chunk = unsafe {
-            column_sender_chunk_new(table.as_ptr() as *const c_char, table.len(), &mut err)
-        };
+        let chunk =
+            unsafe { qwp_chunk_new(table.as_ptr() as *const c_char, table.len(), &mut err) };
         // NULL data pointer with non-zero row_count must be rejected by the
         // bounded-slice guard.
         let name = b"flag";
         let ok = unsafe {
-            column_sender_chunk_column_bool(
+            qwp_chunk_column_bool(
                 chunk,
                 name.as_ptr() as *const c_char,
                 name.len(),
@@ -5525,16 +5351,15 @@ mod tests {
         assert!(!ok);
         assert!(!err.is_null());
         unsafe { line_sender_error_free(err) };
-        unsafe { column_sender_chunk_free(chunk) };
+        unsafe { qwp_chunk_free(chunk) };
     }
 
     #[test]
     fn column_binary_round_trip_on_pure_data_path() {
         let table = b"trades";
         let mut err: *mut line_sender_error = std::ptr::null_mut();
-        let chunk = unsafe {
-            column_sender_chunk_new(table.as_ptr() as *const c_char, table.len(), &mut err)
-        };
+        let chunk =
+            unsafe { qwp_chunk_new(table.as_ptr() as *const c_char, table.len(), &mut err) };
         assert!(!chunk.is_null());
 
         // 3 rows: "ab" (2 bytes), "" (empty segment), "xyz" (3 bytes).
@@ -5545,7 +5370,7 @@ mod tests {
         let bytes: [u8; 5] = *b"abxyz";
         let row_count: usize = 3;
         let ok = unsafe {
-            column_sender_chunk_column_binary(
+            qwp_chunk_column_binary(
                 chunk,
                 name.as_ptr() as *const c_char,
                 name.len(),
@@ -5560,24 +5385,23 @@ mod tests {
         assert!(ok, "column_binary should succeed");
         assert!(err.is_null());
         assert_eq!(
-            unsafe { column_sender_chunk_row_count(chunk, std::ptr::null_mut()) },
+            unsafe { qwp_chunk_row_count(chunk, std::ptr::null_mut()) },
             row_count
         );
-        unsafe { column_sender_chunk_free(chunk) };
+        unsafe { qwp_chunk_free(chunk) };
     }
 
     #[test]
     fn column_binary_rejects_row_count_mismatch() {
         let table = b"trades";
         let mut err: *mut line_sender_error = std::ptr::null_mut();
-        let chunk = unsafe {
-            column_sender_chunk_new(table.as_ptr() as *const c_char, table.len(), &mut err)
-        };
+        let chunk =
+            unsafe { qwp_chunk_new(table.as_ptr() as *const c_char, table.len(), &mut err) };
         // Lock the chunk row_count to 3.
         let name_a = b"a";
         let data_a: [i64; 3] = [1, 2, 3];
         assert!(unsafe {
-            column_sender_chunk_column_i64(
+            qwp_chunk_column_i64(
                 chunk,
                 name_a.as_ptr() as *const c_char,
                 name_a.len(),
@@ -5593,7 +5417,7 @@ mod tests {
         let offsets: [i32; 3] = [0, 1, 2];
         let bytes: [u8; 2] = *b"ab";
         let ok = unsafe {
-            column_sender_chunk_column_binary(
+            qwp_chunk_column_binary(
                 chunk,
                 name_b.as_ptr() as *const c_char,
                 name_b.len(),
@@ -5608,22 +5432,21 @@ mod tests {
         assert!(!ok);
         assert!(!err.is_null());
         unsafe { line_sender_error_free(err) };
-        unsafe { column_sender_chunk_free(chunk) };
+        unsafe { qwp_chunk_free(chunk) };
     }
 
     #[test]
     fn column_binary_rejects_offset_out_of_bounds() {
         let table = b"trades";
         let mut err: *mut line_sender_error = std::ptr::null_mut();
-        let chunk = unsafe {
-            column_sender_chunk_new(table.as_ptr() as *const c_char, table.len(), &mut err)
-        };
+        let chunk =
+            unsafe { qwp_chunk_new(table.as_ptr() as *const c_char, table.len(), &mut err) };
         // Last offset (5) exceeds the 2-byte bytes buffer.
         let name = b"payload";
         let offsets: [i32; 2] = [0, 5];
         let bytes: [u8; 2] = *b"ab";
         let ok = unsafe {
-            column_sender_chunk_column_binary(
+            qwp_chunk_column_binary(
                 chunk,
                 name.as_ptr() as *const c_char,
                 name.len(),
@@ -5638,16 +5461,15 @@ mod tests {
         assert!(!ok);
         assert!(!err.is_null());
         unsafe { line_sender_error_free(err) };
-        unsafe { column_sender_chunk_free(chunk) };
+        unsafe { qwp_chunk_free(chunk) };
     }
 
     #[test]
     fn column_str_round_trip_on_pure_data_path() {
         let table = b"trades";
         let mut err: *mut line_sender_error = std::ptr::null_mut();
-        let chunk = unsafe {
-            column_sender_chunk_new(table.as_ptr() as *const c_char, table.len(), &mut err)
-        };
+        let chunk =
+            unsafe { qwp_chunk_new(table.as_ptr() as *const c_char, table.len(), &mut err) };
         assert!(!chunk.is_null());
 
         // 3 rows: "hi" (ascii), "" (empty string), "héllo" (multi-byte:
@@ -5664,7 +5486,7 @@ mod tests {
         let offsets: [i32; 4] = [0, split, split, total];
         let row_count: usize = 3;
         let ok = unsafe {
-            column_sender_chunk_column_str(
+            qwp_chunk_column_str(
                 chunk,
                 name.as_ptr() as *const c_char,
                 name.len(),
@@ -5679,24 +5501,23 @@ mod tests {
         assert!(ok, "column_str should succeed");
         assert!(err.is_null());
         assert_eq!(
-            unsafe { column_sender_chunk_row_count(chunk, std::ptr::null_mut()) },
+            unsafe { qwp_chunk_row_count(chunk, std::ptr::null_mut()) },
             row_count
         );
-        unsafe { column_sender_chunk_free(chunk) };
+        unsafe { qwp_chunk_free(chunk) };
     }
 
     #[test]
     fn column_str_rejects_row_count_mismatch() {
         let table = b"trades";
         let mut err: *mut line_sender_error = std::ptr::null_mut();
-        let chunk = unsafe {
-            column_sender_chunk_new(table.as_ptr() as *const c_char, table.len(), &mut err)
-        };
+        let chunk =
+            unsafe { qwp_chunk_new(table.as_ptr() as *const c_char, table.len(), &mut err) };
         // Lock the chunk row_count to 3.
         let name_a = b"a";
         let data_a: [i64; 3] = [1, 2, 3];
         assert!(unsafe {
-            column_sender_chunk_column_i64(
+            qwp_chunk_column_i64(
                 chunk,
                 name_a.as_ptr() as *const c_char,
                 name_a.len(),
@@ -5712,7 +5533,7 @@ mod tests {
         let offsets: [i32; 3] = [0, 2, 4];
         let bytes: [u8; 4] = *b"abcd";
         let ok = unsafe {
-            column_sender_chunk_column_str(
+            qwp_chunk_column_str(
                 chunk,
                 name_b.as_ptr() as *const c_char,
                 name_b.len(),
@@ -5727,22 +5548,21 @@ mod tests {
         assert!(!ok);
         assert!(!err.is_null());
         unsafe { line_sender_error_free(err) };
-        unsafe { column_sender_chunk_free(chunk) };
+        unsafe { qwp_chunk_free(chunk) };
     }
 
     #[test]
     fn column_str_rejects_offset_out_of_bounds() {
         let table = b"trades";
         let mut err: *mut line_sender_error = std::ptr::null_mut();
-        let chunk = unsafe {
-            column_sender_chunk_new(table.as_ptr() as *const c_char, table.len(), &mut err)
-        };
+        let chunk =
+            unsafe { qwp_chunk_new(table.as_ptr() as *const c_char, table.len(), &mut err) };
         // Last offset (9) exceeds the 4-byte bytes buffer.
         let name = b"text";
         let offsets: [i32; 2] = [0, 9];
         let bytes: [u8; 4] = *b"abcd";
         let ok = unsafe {
-            column_sender_chunk_column_str(
+            qwp_chunk_column_str(
                 chunk,
                 name.as_ptr() as *const c_char,
                 name.len(),
@@ -5757,23 +5577,22 @@ mod tests {
         assert!(!ok);
         assert!(!err.is_null());
         unsafe { line_sender_error_free(err) };
-        unsafe { column_sender_chunk_free(chunk) };
+        unsafe { qwp_chunk_free(chunk) };
     }
 
     #[test]
     fn column_str_rejects_invalid_utf8() {
         let table = b"trades";
         let mut err: *mut line_sender_error = std::ptr::null_mut();
-        let chunk = unsafe {
-            column_sender_chunk_new(table.as_ptr() as *const c_char, table.len(), &mut err)
-        };
+        let chunk =
+            unsafe { qwp_chunk_new(table.as_ptr() as *const c_char, table.len(), &mut err) };
         // 0xFF is not valid UTF-8; varchar validates the referenced bytes
         // while binary does not.
         let name = b"text";
         let offsets: [i32; 2] = [0, 1];
         let bytes: [u8; 1] = [0xFF];
         let ok = unsafe {
-            column_sender_chunk_column_str(
+            qwp_chunk_column_str(
                 chunk,
                 name.as_ptr() as *const c_char,
                 name.len(),
@@ -5788,24 +5607,23 @@ mod tests {
         assert!(!ok);
         assert!(!err.is_null());
         unsafe { line_sender_error_free(err) };
-        unsafe { column_sender_chunk_free(chunk) };
+        unsafe { qwp_chunk_free(chunk) };
     }
 
     #[test]
     fn validity_null_bits_with_nonzero_len_errors() {
         let table = b"trades";
         let mut err: *mut line_sender_error = std::ptr::null_mut();
-        let chunk = unsafe {
-            column_sender_chunk_new(table.as_ptr() as *const c_char, table.len(), &mut err)
-        };
+        let chunk =
+            unsafe { qwp_chunk_new(table.as_ptr() as *const c_char, table.len(), &mut err) };
         let name = b"a";
         let data: [i64; 2] = [1, 2];
-        let v = column_sender_validity {
+        let v = qwp_validity {
             bits: std::ptr::null(),
             bit_len: 2,
         };
         let ok = unsafe {
-            column_sender_chunk_column_i64(
+            qwp_chunk_column_i64(
                 chunk,
                 name.as_ptr() as *const c_char,
                 name.len(),
@@ -5818,7 +5636,7 @@ mod tests {
         assert!(!ok);
         assert!(!err.is_null());
         unsafe { line_sender_error_free(err) };
-        unsafe { column_sender_chunk_free(chunk) };
+        unsafe { qwp_chunk_free(chunk) };
     }
 
     #[cfg(feature = "arrow")]
@@ -5826,9 +5644,8 @@ mod tests {
     fn append_arrow_dictionary_accepts_large_utf8_values() {
         let table = b"trades";
         let mut err: *mut line_sender_error = std::ptr::null_mut();
-        let chunk = unsafe {
-            column_sender_chunk_new(table.as_ptr() as *const c_char, table.len(), &mut err)
-        };
+        let chunk =
+            unsafe { qwp_chunk_new(table.as_ptr() as *const c_char, table.len(), &mut err) };
         assert!(!chunk.is_null());
 
         let index_format = b"i\0";
@@ -5892,7 +5709,7 @@ mod tests {
 
         let name = b"sym";
         let ok = unsafe {
-            column_sender_chunk_append_arrow_column(
+            qwp_chunk_append_arrow_column(
                 chunk,
                 name.as_ptr() as *const c_char,
                 name.len(),
@@ -5906,10 +5723,10 @@ mod tests {
         assert!(ok, "LargeUtf8 dictionary values should be accepted");
         assert!(err.is_null());
         assert_eq!(
-            unsafe { column_sender_chunk_row_count(chunk, std::ptr::null_mut()) },
+            unsafe { qwp_chunk_row_count(chunk, std::ptr::null_mut()) },
             codes.len()
         );
-        unsafe { column_sender_chunk_free(chunk) };
+        unsafe { qwp_chunk_free(chunk) };
     }
 
     #[cfg(feature = "arrow")]
@@ -5917,9 +5734,8 @@ mod tests {
     fn arrow_import_append_twice_after_clear() {
         let table = b"trades";
         let mut err: *mut line_sender_error = std::ptr::null_mut();
-        let chunk = unsafe {
-            column_sender_chunk_new(table.as_ptr() as *const c_char, table.len(), &mut err)
-        };
+        let chunk =
+            unsafe { qwp_chunk_new(table.as_ptr() as *const c_char, table.len(), &mut err) };
         assert!(!chunk.is_null());
 
         let value_format = b"U\0";
@@ -5954,21 +5770,15 @@ mod tests {
             private_data: std::ptr::null_mut(),
         };
 
-        let imported = unsafe {
-            column_sender_arrow_import_new(
-                &mut array,
-                &schema,
-                column_sender_symbol_mode_auto,
-                &mut err,
-            )
-        };
+        let imported =
+            unsafe { qwp_arrow_import_new(&mut array, &schema, qwp_symbol_mode_auto, &mut err) };
         assert!(!imported.is_null());
         assert!(err.is_null());
         assert!(array.release.is_none());
 
         let name = b"sym";
         let ok = unsafe {
-            column_sender_chunk_append_arrow_import(
+            qwp_chunk_append_arrow_import(
                 chunk,
                 name.as_ptr() as *const c_char,
                 name.len(),
@@ -5980,13 +5790,13 @@ mod tests {
         };
         assert!(ok);
         assert_eq!(
-            unsafe { column_sender_chunk_row_count(chunk, std::ptr::null_mut()) },
+            unsafe { qwp_chunk_row_count(chunk, std::ptr::null_mut()) },
             2
         );
 
-        unsafe { column_sender_chunk_clear(chunk, std::ptr::null_mut()) };
+        unsafe { qwp_chunk_clear(chunk, std::ptr::null_mut()) };
         let ok = unsafe {
-            column_sender_chunk_append_arrow_import(
+            qwp_chunk_append_arrow_import(
                 chunk,
                 name.as_ptr() as *const c_char,
                 name.len(),
@@ -5998,13 +5808,13 @@ mod tests {
         };
         assert!(ok);
         assert_eq!(
-            unsafe { column_sender_chunk_row_count(chunk, std::ptr::null_mut()) },
+            unsafe { qwp_chunk_row_count(chunk, std::ptr::null_mut()) },
             2
         );
 
         unsafe {
-            column_sender_arrow_import_free(imported);
-            column_sender_chunk_free(chunk);
+            qwp_arrow_import_free(imported);
+            qwp_chunk_free(chunk);
         }
     }
 
@@ -6044,32 +5854,20 @@ mod tests {
         };
 
         let mut err: *mut line_sender_error = std::ptr::null_mut();
-        let imported = unsafe {
-            column_sender_arrow_import_new(
-                &mut array,
-                &schema,
-                column_sender_symbol_mode_auto,
-                &mut err,
-            )
-        };
+        let imported =
+            unsafe { qwp_arrow_import_new(&mut array, &schema, qwp_symbol_mode_auto, &mut err) };
         assert!(!imported.is_null());
         assert!(err.is_null());
         assert!(array.release.is_none());
 
-        let second = unsafe {
-            column_sender_arrow_import_new(
-                &mut array,
-                &schema,
-                column_sender_symbol_mode_auto,
-                &mut err,
-            )
-        };
+        let second =
+            unsafe { qwp_arrow_import_new(&mut array, &schema, qwp_symbol_mode_auto, &mut err) };
         assert!(second.is_null());
         assert!(!err.is_null());
 
         unsafe {
             line_sender_error_free(err);
-            column_sender_arrow_import_free(imported);
+            qwp_arrow_import_free(imported);
         }
     }
 
@@ -6079,7 +5877,7 @@ mod tests {
         let name = b"a";
         let data: [i64; 1] = [1];
         let ok = unsafe {
-            column_sender_chunk_column_i64(
+            qwp_chunk_column_i64(
                 std::ptr::null_mut(),
                 name.as_ptr() as *const c_char,
                 name.len(),
@@ -6095,11 +5893,11 @@ mod tests {
     }
 
     #[test]
-    fn direct_column_sender_from_conf_rejects_non_ws() {
+    fn qwp_direct_sender_from_conf_rejects_non_ws() {
         let conf = b"tcp::addr=localhost:9009;";
         let mut err: *mut line_sender_error = std::ptr::null_mut();
         let sender = unsafe {
-            direct_column_sender_from_conf(conf.as_ptr() as *const c_char, conf.len(), &mut err)
+            qwp_direct_sender_from_conf(conf.as_ptr() as *const c_char, conf.len(), &mut err)
         };
         assert!(sender.is_null());
         assert!(!err.is_null());
@@ -6107,23 +5905,23 @@ mod tests {
     }
 
     #[test]
-    fn direct_column_sender_from_conf_null_conf_errors() {
+    fn qwp_direct_sender_from_conf_null_conf_errors() {
         let mut err: *mut line_sender_error = std::ptr::null_mut();
-        let sender = unsafe { direct_column_sender_from_conf(std::ptr::null(), 1, &mut err) };
+        let sender = unsafe { qwp_direct_sender_from_conf(std::ptr::null(), 1, &mut err) };
         assert!(sender.is_null());
         assert!(!err.is_null());
         unsafe { line_sender_error_free(err) };
     }
 
     #[test]
-    fn direct_column_sender_free_accepts_null() {
-        unsafe { direct_column_sender_free(std::ptr::null_mut()) };
+    fn qwp_direct_sender_free_accepts_null() {
+        unsafe { qwp_direct_sender_free(std::ptr::null_mut()) };
     }
 
     #[test]
-    fn direct_column_sender_from_opts_null_errors() {
+    fn qwp_direct_sender_from_opts_null_errors() {
         let mut err: *mut line_sender_error = std::ptr::null_mut();
-        let sender = unsafe { direct_column_sender_from_opts(std::ptr::null(), &mut err) };
+        let sender = unsafe { qwp_direct_sender_from_opts(std::ptr::null(), &mut err) };
         assert!(sender.is_null());
         assert!(!err.is_null());
         unsafe { line_sender_error_free(err) };
@@ -6157,17 +5955,17 @@ mod tests {
     fn symbol_mode_constants_map_correctly() {
         let mut err: *mut line_sender_error = std::ptr::null_mut();
         assert_eq!(
-            symbol_mode_from_u32(column_sender_symbol_mode_auto, &mut err),
+            symbol_mode_from_u32(qwp_symbol_mode_auto, &mut err),
             Some(None)
         );
         assert!(err.is_null());
         assert_eq!(
-            symbol_mode_from_u32(column_sender_symbol_mode_symbol, &mut err),
+            symbol_mode_from_u32(qwp_symbol_mode_symbol, &mut err),
             Some(Some(true))
         );
         assert!(err.is_null());
         assert_eq!(
-            symbol_mode_from_u32(column_sender_symbol_mode_not_symbol, &mut err),
+            symbol_mode_from_u32(qwp_symbol_mode_not_symbol, &mut err),
             Some(Some(false))
         );
         assert!(err.is_null());

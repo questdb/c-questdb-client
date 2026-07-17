@@ -1,7 +1,7 @@
 /*
  * Out-of-process QWP egress (read-side) client driven by a line-oriented
  * stdin/stdout protocol, implemented against the c-questdb-client *C* FFI
- * reader binding (`include/questdb/egress/reader.h`, whose symbols are always
+ * reader binding (`include/questdb/egress/qwp_reader.h`, whose symbols are always
  * compiled into the C ABI).
  *
  * Same wire protocol as the Rust `qwp_egress_sidecar`
@@ -28,12 +28,12 @@
  *     future test that needs them should extend this sidecar rather than
  *     silently succeed.
  *
- * The standalone `reader_from_conf` constructor matches the Rust sidecar's
+ * The standalone `qwp_reader_from_conf` constructor matches the Rust sidecar's
  * `Reader::from_conf` and gives each CONNECT command one dedicated transport.
  */
 
 #define _POSIX_C_SOURCE 200809L
-#include <questdb/egress/reader.h>
+#include <questdb/egress/qwp_reader.h>
 
 #include <stdbool.h>
 #include <stddef.h>
@@ -47,7 +47,7 @@
 /* CAP_ZONE bit (questdb-rs/src/egress/wire/capabilities.rs). */
 #define QDB_CAP_ZONE 0x00000001u
 
-static reader* g_reader = NULL;
+static qwp_reader* g_reader = NULL;
 
 /* Newlines in an ERR message would break the line-based protocol; match the
  * other sidecars' substitution: CR -> space, LF -> '|'. */
@@ -94,7 +94,7 @@ static void close_quietly(void)
 {
     if (g_reader)
     {
-        reader_close(g_reader);
+        qwp_reader_close(g_reader);
         g_reader = NULL;
     }
 }
@@ -110,7 +110,7 @@ static void handle_connect(const char* rest)
 {
     /* CONNECT replaces any active reader (tests reuse the sidecar across
      * scenarios), exactly like the Rust/Java sidecars. The bind is EAGER:
-     * reader_from_conf walks the address list with the target/zone filter
+     * qwp_reader_from_conf walks the address list with the target/zone filter
      * applied, so a role mismatch surfaces as ERR here -- same semantics
      * the target-filter scenarios pin on the Rust binding. */
     close_quietly();
@@ -122,7 +122,7 @@ static void handle_connect(const char* rest)
         reply_err_from(err);
         return;
     }
-    reader* r = reader_from_conf(conf, &err);
+    qwp_reader* r = qwp_reader_from_conf(conf, &err);
     if (!r)
     {
         reply_err_from(err);
@@ -148,13 +148,13 @@ static void handle_query(const char* rest)
     }
 
     const double t0 = monotonic_ms();
-    reader_query* query = reader_prepare(g_reader, sql, &err);
+    qwp_reader_query* query = qwp_reader_prepare(g_reader, sql, &err);
     if (!query)
     {
         reply_err_from(err);
         return;
     }
-    reader_cursor* cursor = reader_query_execute(&query, &err);
+    qwp_reader_cursor* cursor = qwp_reader_query_execute(&query, &err);
     /* `query` is now NULL -- `_query_execute` consumed it. */
     if (!cursor)
     {
@@ -163,16 +163,16 @@ static void handle_query(const char* rest)
     }
 
     unsigned long long rows = 0;
-    const reader_batch* batch;
-    while ((batch = reader_cursor_next_batch(cursor, &err)) != NULL)
-        rows += (unsigned long long)reader_batch_row_count(batch);
+    const qwp_reader_batch* batch;
+    while ((batch = qwp_reader_cursor_next_batch(cursor, &err)) != NULL)
+        rows += (unsigned long long)qwp_reader_batch_row_count(batch);
     if (err)
     {
-        reader_cursor_free(cursor);
+        qwp_reader_cursor_free(cursor);
         reply_err_from(err);
         return;
     }
-    reader_cursor_free(cursor);
+    qwp_reader_cursor_free(cursor);
     const double latency_ms = monotonic_ms() - t0;
 
     char payload[64];
@@ -189,7 +189,7 @@ static void handle_server_info(void)
     }
     /* In-memory snapshot from the most recent bind; no SQL round-trip, so
      * this does not itself drive reconnect (mirrors the Rust sidecar). */
-    const reader_server_info* info = reader_current_server_info(g_reader);
+    const qwp_reader_server_info* info = qwp_reader_current_server_info(g_reader);
     if (!info)
     {
         /* Same wire shape as the Rust sidecar's no-snapshot arm, minus the
@@ -197,8 +197,8 @@ static void handle_server_info(void)
         reply_ok("role=-1 cap_zone=0");
         return;
     }
-    const unsigned role = (unsigned)reader_server_info_role_byte(info);
-    const uint32_t caps = reader_server_info_capabilities(info);
+    const unsigned role = (unsigned)qwp_reader_server_info_role_byte(info);
+    const uint32_t caps = qwp_reader_server_info_capabilities(info);
     char payload[64];
     snprintf(payload, sizeof(payload), "role=%u cap_zone=%d",
              role, (caps & QDB_CAP_ZONE) != 0 ? 1 : 0);

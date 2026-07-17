@@ -21,8 +21,8 @@
 
 #include "qwp_mock_server.hpp"
 
-#include <questdb/ingress/column_sender.h>
-#include <questdb/ingress/column_sender.hpp>
+#include <questdb/ingress/qwp_sender.h>
+#include <questdb/ingress/qwp_sender.hpp>
 #include <questdb/ingress/line_sender.hpp>
 
 #include <chrono>
@@ -170,7 +170,7 @@ TEST_CASE("column_chunk flush round-trips through the mock")
 
 TEST_CASE("column_chunk symbol column round-trips through the mock")
 {
-    // Exercises the columnar symbol FFI (column_sender_chunk_symbol_i32) end to
+    // Exercises the columnar symbol FFI (qwp_chunk_symbol_i32) end to
     // end: append a dictionary-encoded SYMBOL column, flush, and confirm the
     // frame reaches the mock. Previously only the row API's .symbol() was covered
     // in C/C++; the column-major symbol appender had no test on the C ABI.
@@ -200,7 +200,7 @@ TEST_CASE("column_chunk symbol column round-trips through the mock")
 TEST_CASE("column_chunk symbol_i8 / symbol_i16 round-trip through the mock")
 {
     // The i32 case is covered above; the narrow-width appenders
-    // (column_sender_chunk_symbol_i8 / _i16) do their own code -> global-id
+    // (qwp_chunk_symbol_i8 / _i16) do their own code -> global-id
     // conversion and range check at the C boundary, so exercise them end to end
     // too. Under the FFI `panic = "abort"` profile a width-specific bug (a bad cast
     // or an out-of-range slot index) would abort the host rather than error.

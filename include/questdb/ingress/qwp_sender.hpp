@@ -31,22 +31,13 @@
 #include <string_view>
 #include <utility>
 
-#include <questdb/ingress/column_sender.h>
+#include <questdb/client.hpp>
+#include <questdb/ingress/qwp_sender.h>
 #include <questdb/ingress/line_sender.hpp>
 
-// NumPy appender (`::column_sender_chunk_append_numpy_column`) is
+// NumPy appender (`::qwp_chunk_append_numpy_column`) is
 // intentionally not wrapped here; it is awkward to use from C++ without
 // a NumPy host. C++ callers needing it can drop to the raw C API.
-
-// Forward declaration so the unified `pool` can hand out query readers via
-// `pool::borrow_reader()`, mirroring the Rust `QuestDb::borrow_reader`. The
-// method is DEFINED out-of-line in `questdb/egress/reader.hpp` so the
-// heavy egress header stays off the sender-only include path; include that
-// header to call it.
-namespace questdb::egress
-{
-class reader;
-}
 
 namespace questdb::ingress
 {
@@ -67,7 +58,7 @@ public:
     {
     }
 
-    const ::column_sender_validity* c_ptr() const noexcept
+    const ::qwp_validity* c_ptr() const noexcept
     {
         return &_impl;
     }
@@ -75,14 +66,14 @@ public:
 private:
     const uint8_t* _bits{nullptr};
     size_t _bit_len{0};
-    ::column_sender_validity _impl{_bits, _bit_len};
+    ::qwp_validity _impl{_bits, _bit_len};
 };
 
 /** Forward decl. */
 class sender_view;
 
 /**
- * RAII wrapper around `::column_sender_chunk*`. Move-only.
+ * RAII wrapper around `::qwp_chunk*`. Move-only.
  *
  * Holds raw-pointer descriptors into caller buffers; the caller MUST
  * keep every column buffer alive from the per-column append call until
@@ -96,7 +87,7 @@ public:
      *
      * Name validation timing: the table name grammar AND the 127-byte
      * length cap are both deferred to flush (mirrors
-     * `::column_sender_chunk_new`). If you already hold a pre-validated
+     * `::qwp_chunk_new`). If you already hold a pre-validated
      * `table_name_view` — e.g. to share it with `flush_arrow_batch`,
      * which requires that type — prefer `from_validated`, which reports
      * grammar errors eagerly at `table_name_view` construction (the same
@@ -105,7 +96,7 @@ public:
     explicit column_chunk(std::string_view table)
     {
         _raw = line_sender_error::wrapped_call(
-            ::column_sender_chunk_new, table.data(), table.size());
+            ::qwp_chunk_new, table.data(), table.size());
     }
 
     /**
@@ -125,7 +116,7 @@ public:
         ::line_sender_table_name table_c{table.size(), table.data()};
         column_chunk chunk;
         chunk._raw = line_sender_error::wrapped_call(
-            ::column_sender_chunk_new_validated, table_c);
+            ::qwp_chunk_new_validated, table_c);
         return chunk;
     }
 
@@ -143,7 +134,7 @@ public:
         if (this != &other)
         {
             if (_raw)
-                ::column_sender_chunk_free(_raw);
+                ::qwp_chunk_free(_raw);
             _raw = other._raw;
             other._raw = nullptr;
         }
@@ -153,11 +144,11 @@ public:
     ~column_chunk() noexcept
     {
         if (_raw)
-            ::column_sender_chunk_free(_raw);
+            ::qwp_chunk_free(_raw);
     }
 
-    ::column_sender_chunk* c_ptr() noexcept { return _raw; }
-    const ::column_sender_chunk* c_ptr() const noexcept { return _raw; }
+    ::qwp_chunk* c_ptr() noexcept { return _raw; }
+    const ::qwp_chunk* c_ptr() const noexcept { return _raw; }
 
     /**
      * Row count locked by the first appended column / designated ts.
@@ -167,7 +158,7 @@ public:
     size_t row_count() const
     {
         ::line_sender_error* c_err{nullptr};
-        size_t r = ::column_sender_chunk_row_count(_raw, &c_err);
+        size_t r = ::qwp_chunk_row_count(_raw, &c_err);
         if (r == static_cast<size_t>(-1))
             throw line_sender_error::from_c(c_err);
         return r;
@@ -180,7 +171,7 @@ public:
      */
     void clear()
     {
-        line_sender_error::wrapped_call(::column_sender_chunk_clear, _raw);
+        line_sender_error::wrapped_call(::qwp_chunk_clear, _raw);
     }
 
     // -- Fixed-width column appenders ---------------------------------
@@ -192,7 +183,7 @@ public:
         const validity_view* validity = nullptr)
     {
         line_sender_error::wrapped_call(
-            ::column_sender_chunk_column_i8,
+            ::qwp_chunk_column_i8,
             _raw,
             name.data(),
             name.size(),
@@ -209,7 +200,7 @@ public:
         const validity_view* validity = nullptr)
     {
         line_sender_error::wrapped_call(
-            ::column_sender_chunk_column_i16,
+            ::qwp_chunk_column_i16,
             _raw,
             name.data(),
             name.size(),
@@ -226,7 +217,7 @@ public:
         const validity_view* validity = nullptr)
     {
         line_sender_error::wrapped_call(
-            ::column_sender_chunk_column_i32,
+            ::qwp_chunk_column_i32,
             _raw,
             name.data(),
             name.size(),
@@ -243,7 +234,7 @@ public:
         const validity_view* validity = nullptr)
     {
         line_sender_error::wrapped_call(
-            ::column_sender_chunk_column_i64,
+            ::qwp_chunk_column_i64,
             _raw,
             name.data(),
             name.size(),
@@ -260,7 +251,7 @@ public:
         const validity_view* validity = nullptr)
     {
         line_sender_error::wrapped_call(
-            ::column_sender_chunk_column_f32,
+            ::qwp_chunk_column_f32,
             _raw,
             name.data(),
             name.size(),
@@ -277,7 +268,7 @@ public:
         const validity_view* validity = nullptr)
     {
         line_sender_error::wrapped_call(
-            ::column_sender_chunk_column_f64,
+            ::qwp_chunk_column_f64,
             _raw,
             name.data(),
             name.size(),
@@ -295,7 +286,7 @@ public:
         const validity_view* validity = nullptr)
     {
         line_sender_error::wrapped_call(
-            ::column_sender_chunk_column_bool,
+            ::qwp_chunk_column_bool,
             _raw,
             name.data(),
             name.size(),
@@ -313,7 +304,7 @@ public:
         const validity_view* validity = nullptr)
     {
         line_sender_error::wrapped_call(
-            ::column_sender_chunk_column_uuid,
+            ::qwp_chunk_column_uuid,
             _raw,
             name.data(),
             name.size(),
@@ -331,7 +322,7 @@ public:
         const validity_view* validity = nullptr)
     {
         line_sender_error::wrapped_call(
-            ::column_sender_chunk_column_long256,
+            ::qwp_chunk_column_long256,
             _raw,
             name.data(),
             name.size(),
@@ -348,7 +339,7 @@ public:
         const validity_view* validity = nullptr)
     {
         line_sender_error::wrapped_call(
-            ::column_sender_chunk_column_ipv4,
+            ::qwp_chunk_column_ipv4,
             _raw,
             name.data(),
             name.size(),
@@ -362,11 +353,11 @@ public:
         std::string_view name,
         const int64_t* data,
         size_t row_count,
-        ::column_sender_ts_unit unit,
+        ::qwp_ts_unit unit,
         const validity_view* validity = nullptr)
     {
         line_sender_error::wrapped_call(
-            ::column_sender_chunk_column_ts,
+            ::qwp_chunk_column_ts,
             _raw,
             name.data(),
             name.size(),
@@ -384,7 +375,7 @@ public:
         const validity_view* validity = nullptr)
     {
         line_sender_error::wrapped_call(
-            ::column_sender_chunk_column_date,
+            ::qwp_chunk_column_date,
             _raw,
             name.data(),
             name.size(),
@@ -407,7 +398,7 @@ public:
         const validity_view* validity = nullptr)
     {
         line_sender_error::wrapped_call(
-            ::column_sender_chunk_column_str,
+            ::qwp_chunk_column_str,
             _raw,
             name.data(),
             name.size(),
@@ -432,7 +423,7 @@ public:
         const validity_view* validity = nullptr)
     {
         line_sender_error::wrapped_call(
-            ::column_sender_chunk_column_binary,
+            ::qwp_chunk_column_binary,
             _raw,
             name.data(),
             name.size(),
@@ -456,7 +447,7 @@ public:
      * entries. Each entry must be valid UTF-8 (validated eagerly here) and
      * every non-null code must be in range (checked here); the borrowed
      * buffers must stay alive and unchanged until the next `flush()` /
-     * `wait()` returns. See `column_sender.h` for the full contract and caps.
+     * `wait()` returns. See `qwp_sender.h` for the full contract and caps.
      */
     column_chunk& symbol_i8(
         std::string_view name,
@@ -469,7 +460,7 @@ public:
         const validity_view* validity = nullptr)
     {
         line_sender_error::wrapped_call(
-            ::column_sender_chunk_symbol_i8,
+            ::qwp_chunk_symbol_i8,
             _raw,
             name.data(),
             name.size(),
@@ -495,7 +486,7 @@ public:
         const validity_view* validity = nullptr)
     {
         line_sender_error::wrapped_call(
-            ::column_sender_chunk_symbol_i16,
+            ::qwp_chunk_symbol_i16,
             _raw,
             name.data(),
             name.size(),
@@ -521,7 +512,7 @@ public:
         const validity_view* validity = nullptr)
     {
         line_sender_error::wrapped_call(
-            ::column_sender_chunk_symbol_i32,
+            ::qwp_chunk_symbol_i32,
             _raw,
             name.data(),
             name.size(),
@@ -541,7 +532,7 @@ public:
         const int64_t* data, size_t row_count)
     {
         line_sender_error::wrapped_call(
-            ::column_sender_chunk_at_micros,
+            ::qwp_chunk_at_micros,
             _raw,
             data,
             row_count);
@@ -552,7 +543,7 @@ public:
         const int64_t* data, size_t row_count)
     {
         line_sender_error::wrapped_call(
-            ::column_sender_chunk_at_nanos,
+            ::qwp_chunk_at_nanos,
             _raw,
             data,
             row_count);
@@ -563,7 +554,7 @@ public:
         const int64_t* data, size_t row_count)
     {
         line_sender_error::wrapped_call(
-            ::column_sender_chunk_at_millis,
+            ::qwp_chunk_at_millis,
             _raw,
             data,
             row_count);
@@ -574,7 +565,7 @@ public:
         const int64_t* data, size_t row_count)
     {
         line_sender_error::wrapped_call(
-            ::column_sender_chunk_at_seconds,
+            ::qwp_chunk_at_seconds,
             _raw,
             data,
             row_count);
@@ -596,7 +587,7 @@ public:
         size_t row_count)
     {
         line_sender_error::wrapped_call(
-            ::column_sender_chunk_append_arrow_column,
+            ::qwp_chunk_append_arrow_column,
             _raw,
             name.data(),
             name.size(),
@@ -624,12 +615,12 @@ private:
     /// freshly-constructed handle.
     column_chunk() = default;
 
-    ::column_sender_chunk* _raw{nullptr};
+    ::qwp_chunk* _raw{nullptr};
 };
 
 #ifdef QUESTDB_CLIENT_ENABLE_ARROW
 /**
- * RAII wrapper around `::column_sender_arrow_import*`. Move-only.
+ * RAII wrapper around `::qwp_arrow_import*`. Move-only.
  *
  * Lets a caller import an `ArrowArray` + `ArrowSchema` pair once and
  * then slice/append it across many chunks (e.g. paginating a large
@@ -640,7 +631,7 @@ private:
  * borrowed only for the duration of the constructor.
  *
  * `symbol_mode` selects the SYMBOL-vs-VARCHAR disposition of a string
- * column (see `column_sender_symbol_mode`); a no-op for non-string columns.
+ * column (see `qwp_symbol_mode`); a no-op for non-string columns.
  *
  * Not thread-safe. Bound to the importing thread until destroyed. MUST
  * outlive every `flush` that referenced it through
@@ -652,11 +643,11 @@ public:
     arrow_import(
         ::ArrowArray& array,
         const ::ArrowSchema& schema,
-        ::column_sender_symbol_mode symbol_mode =
-            ::column_sender_symbol_mode_auto)
+        ::qwp_symbol_mode symbol_mode =
+            ::qwp_symbol_mode_auto)
     {
         _raw = line_sender_error::wrapped_call(
-            ::column_sender_arrow_import_new,
+            ::qwp_arrow_import_new,
             &array,
             &schema,
             symbol_mode);
@@ -676,7 +667,7 @@ public:
         if (this != &other)
         {
             if (_raw)
-                ::column_sender_arrow_import_free(_raw);
+                ::qwp_arrow_import_free(_raw);
             _raw = other._raw;
             other._raw = nullptr;
         }
@@ -686,20 +677,20 @@ public:
     ~arrow_import() noexcept
     {
         if (_raw)
-            ::column_sender_arrow_import_free(_raw);
+            ::qwp_arrow_import_free(_raw);
     }
 
     /** Number of rows in the imported column. */
     size_t len() const noexcept
     {
-        return ::column_sender_arrow_import_len(_raw);
+        return ::qwp_arrow_import_len(_raw);
     }
 
-    ::column_sender_arrow_import* c_ptr() noexcept { return _raw; }
-    const ::column_sender_arrow_import* c_ptr() const noexcept { return _raw; }
+    ::qwp_arrow_import* c_ptr() noexcept { return _raw; }
+    const ::qwp_arrow_import* c_ptr() const noexcept { return _raw; }
 
 private:
-    ::column_sender_arrow_import* _raw{nullptr};
+    ::qwp_arrow_import* _raw{nullptr};
 };
 
 inline column_chunk& column_chunk::append_arrow_import(
@@ -709,7 +700,7 @@ inline column_chunk& column_chunk::append_arrow_import(
     size_t row_count)
 {
     line_sender_error::wrapped_call(
-        ::column_sender_chunk_append_arrow_import,
+        ::qwp_chunk_append_arrow_import,
         _raw,
         name.data(),
         name.size(),
@@ -835,7 +826,7 @@ public:
         table_name_view table,
         ::ArrowArray& array,
         const ::ArrowSchema& schema,
-        const ::column_sender_arrow_override* overrides = nullptr,
+        const ::qwp_arrow_override* overrides = nullptr,
         size_t overrides_len = 0)
     {
         ::line_sender_table_name table_c{table.size(), table.data()};
@@ -871,7 +862,7 @@ public:
         table_name_view table,
         ::ArrowArray& array,
         const ::ArrowSchema& schema,
-        const ::column_sender_arrow_override* overrides,
+        const ::qwp_arrow_override* overrides,
         size_t overrides_len,
         qwpws_ack_level level = qwpws_ack_level::ok)
     {
@@ -894,7 +885,7 @@ public:
         table_name_view table,
         ::ArrowArray& array,
         const ::ArrowSchema& schema,
-        const ::column_sender_arrow_override* overrides = nullptr,
+        const ::qwp_arrow_override* overrides = nullptr,
         size_t overrides_len = 0)
     {
         ::line_sender_table_name table_c{table.size(), table.data()};
@@ -920,7 +911,7 @@ public:
         ::ArrowArray& array,
         const ::ArrowSchema& schema,
         column_name_view ts_column,
-        const ::column_sender_arrow_override* overrides = nullptr,
+        const ::qwp_arrow_override* overrides = nullptr,
         size_t overrides_len = 0)
     {
         ::line_sender_table_name table_c{table.size(), table.data()};
@@ -959,7 +950,7 @@ public:
         ::ArrowArray& array,
         const ::ArrowSchema& schema,
         column_name_view ts_column,
-        const ::column_sender_arrow_override* overrides,
+        const ::qwp_arrow_override* overrides,
         size_t overrides_len,
         qwpws_ack_level level = qwpws_ack_level::ok)
     {
@@ -985,7 +976,7 @@ public:
         ::ArrowArray& array,
         const ::ArrowSchema& schema,
         column_name_view ts_column,
-        const ::column_sender_arrow_override* overrides = nullptr,
+        const ::qwp_arrow_override* overrides = nullptr,
         size_t overrides_len = 0)
     {
         ::line_sender_table_name table_c{table.size(), table.data()};
@@ -1230,7 +1221,7 @@ public:
         table_name_view table,
         ::ArrowArray& array,
         const ::ArrowSchema& schema,
-        const ::column_sender_arrow_override* overrides = nullptr,
+        const ::qwp_arrow_override* overrides = nullptr,
         size_t overrides_len = 0)
     {
         _view.flush_arrow_batch_at_now(
@@ -1257,7 +1248,7 @@ public:
         table_name_view table,
         ::ArrowArray& array,
         const ::ArrowSchema& schema,
-        const ::column_sender_arrow_override* overrides,
+        const ::qwp_arrow_override* overrides,
         size_t overrides_len,
         qwpws_ack_level level = qwpws_ack_level::ok)
     {
@@ -1272,7 +1263,7 @@ public:
         table_name_view table,
         ::ArrowArray& array,
         const ::ArrowSchema& schema,
-        const ::column_sender_arrow_override* overrides = nullptr,
+        const ::qwp_arrow_override* overrides = nullptr,
         size_t overrides_len = 0)
     {
         return _view.flush_arrow_batch_at_now_and_get_fsn(
@@ -1288,7 +1279,7 @@ public:
         ::ArrowArray& array,
         const ::ArrowSchema& schema,
         column_name_view ts_column,
-        const ::column_sender_arrow_override* overrides = nullptr,
+        const ::qwp_arrow_override* overrides = nullptr,
         size_t overrides_len = 0)
     {
         _view.flush_arrow_batch(
@@ -1317,7 +1308,7 @@ public:
         ::ArrowArray& array,
         const ::ArrowSchema& schema,
         column_name_view ts_column,
-        const ::column_sender_arrow_override* overrides,
+        const ::qwp_arrow_override* overrides,
         size_t overrides_len,
         qwpws_ack_level level = qwpws_ack_level::ok)
     {
@@ -1333,7 +1324,7 @@ public:
         ::ArrowArray& array,
         const ::ArrowSchema& schema,
         column_name_view ts_column,
-        const ::column_sender_arrow_override* overrides = nullptr,
+        const ::qwp_arrow_override* overrides = nullptr,
         size_t overrides_len = 0)
     {
         return _view.flush_arrow_batch_and_get_fsn(
@@ -1394,144 +1385,27 @@ private:
 
 namespace questdb
 {
-/**
- * RAII wrapper around `::questdb_db*` — the QWP/WS connection pool.
- *
- * `conf` is a `ws::` / `wss::` connect string; see
- * `column_sender.h` for pool-specific keys (`sender_pool_min`,
- * `sender_pool_max`, `query_pool_min`, `query_pool_max`,
- * `acquire_timeout_ms`, `idle_timeout_ms`, `pool_reap`). With `sf_dir`,
- * `sender_id` is the
- * slot base; pooled senders mint `<sender_id>-ingest-<index>` disk slots.
- * Those `<sender_id>-ingest-*` directories under `sf_dir` belong to the pool namespace;
- * use a unique `sender_id` for each pool sharing an `sf_dir`.
- *
- * Construction performs no blocking network I/O. In disk-backed
- * store-and-forward mode it may pre-open parked recovery senders whose initial
- * connect and replay run in the background; otherwise senders are opened on
- * first borrow.
- *
- * Borrow/return operations are thread-safe while this owner remains alive.
- * Destruction is the final owner release: do not destroy the pool while
- * another thread may still call methods on this object. Borrowed guards that
- * outlive the pool remain safe to destroy; after pool close they are dropped
- * instead of recycled, and new operations on them fail. Destruction also
- * joins the C connection-event dispatcher, so callback `user_data` may be
- * released once it returns.
+/*
+ * Out-of-line definitions of the sender-borrowing `pool` methods (declared in
+ * `questdb/client.hpp`). They need the complete `ingress::borrowed_sender`
+ * type and the `questdb_db_borrow_sender*` C entry points, both of which this
+ * header owns, which is what keeps the pool declaration free of any
+ * dependency on either direction's lease type.
  */
-class pool
+
+inline ingress::borrowed_sender pool::borrow_sender()
 {
-public:
-    explicit pool(std::string_view conf)
-    {
-        _raw = ::questdb::error::wrapped_call(
-            ::questdb_db_connect, conf.data(), conf.size());
-    }
+    auto* raw = ingress::line_sender_error::wrapped_call(
+        ::questdb_db_borrow_sender, _raw);
+    return ingress::borrowed_sender{_raw, raw};
+}
 
-    pool(const pool&) = delete;
-    pool& operator=(const pool&) = delete;
-
-    pool(pool&& other) noexcept
-        : _raw{other._raw}
-    {
-        other._raw = nullptr;
-    }
-
-    pool& operator=(pool&& other) noexcept
-    {
-        if (this != &other)
-        {
-            close();
-            _raw = other._raw;
-            other._raw = nullptr;
-        }
-        return *this;
-    }
-
-    ~pool() noexcept { close(); }
-
-    ::questdb_db* c_ptr() noexcept { return _raw; }
-    const ::questdb_db* c_ptr() const noexcept { return _raw; }
-
-    /** Borrow a store-and-forward sender. At cap, disk-backed slots can wait
-     * up to `close_flush_timeout` (default 5s) while an in-flight close
-     * releases its lock; otherwise throws on cap exhaustion or transport
-     * failure. */
-    ingress::borrowed_sender borrow_sender()
-    {
-        auto* raw = ingress::line_sender_error::wrapped_call(
-            ::questdb_db_borrow_sender, _raw);
-        return ingress::borrowed_sender{_raw, raw};
-    }
-
-    /**
-     * Borrow a store-and-forward sender, retrying the connect within `budget_ms`
-     * using the pool's reconnect backoff. On a transient `failover_retry`,
-     * drop the dead sender then call this with `reconnect_max_duration_ms()` (or
-     * your tracked remaining budget). Throws on a terminal error or budget
-     * exhaustion.
-     */
-    ingress::borrowed_sender borrow_sender_with_retry(
-        uint64_t budget_ms)
-    {
-        auto* raw = ingress::line_sender_error::wrapped_call(
-            ::questdb_db_borrow_sender_with_retry, _raw, budget_ms);
-        return ingress::borrowed_sender{_raw, raw};
-    }
-
-    /**
-     * Borrow a query reader from the pool, mirroring Rust
-     * `QuestDb::borrow_reader`. Readers are pooled on a separate,
-     * independently-capped free list with its own `query_pool_min` /
-     * `query_pool_max` budget; the reader pool is lazy (a
-     * connection opens on first borrow). The returned `reader` is
-     * equivalent to a standalone one and returns itself to the pool on
-     * destruction — unless `reader::drop_on_return()` was called, in which
-     * case it is dropped. If the pool has already been closed by the time the
-     * reader is destroyed, it is closed instead of recycled. Throws
-     * `questdb::error` on cap exhaustion or transport failure.
-     *
-     * DEFINED in `questdb/egress/reader.hpp` (the reader-pool entry
-     * points live alongside the `reader` type, matching the C headers).
-     * Include that header to call this.
-     */
-    ::questdb::egress::reader borrow_reader();
-
-    /** The pool's failover budget (`reconnect_max_duration`) in milliseconds. */
-    uint64_t reconnect_max_duration_ms() const noexcept
-    {
-        return ::questdb_db_reconnect_max_duration_ms(_raw);
-    }
-
-    /** Close idle connections beyond the pool minimums. Returns count
-     *  closed. */
-    size_t reap_idle() noexcept
-    {
-        return ::questdb_db_reap_idle(_raw);
-    }
-
-    /**
-     * Snapshot per-pool connection counts for diagnostics (soak / leak
-     * harnesses assert every pool drains back to a steady baseline after
-     * load and failover). Not part of the stable ABI; the field set may
-     * change.
-     */
-    ::questdb_dbg_pool_counts dbg_pool_counts() const noexcept
-    {
-        return ::questdb_db_dbg_pool_counts(_raw);
-    }
-
-private:
-    void close() noexcept
-    {
-        if (_raw)
-        {
-            ::questdb_db_close(_raw);
-            _raw = nullptr;
-        }
-    }
-
-    ::questdb_db* _raw{nullptr};
-};
+inline ingress::borrowed_sender pool::borrow_sender_with_retry(
+    uint64_t budget_ms)
+{
+    auto* raw = ingress::line_sender_error::wrapped_call(
+        ::questdb_db_borrow_sender_with_retry, _raw, budget_ms);
+    return ingress::borrowed_sender{_raw, raw};
+}
 
 } // namespace questdb

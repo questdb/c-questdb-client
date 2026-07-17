@@ -39,7 +39,7 @@ In all examples below, we will attempt to compile:
 
 ```cpp
 `// main.cpp
-#include <questdb/ingress/column_sender.hpp>
+#include <questdb/ingress/qwp_sender.hpp>
 
 int main()
 {

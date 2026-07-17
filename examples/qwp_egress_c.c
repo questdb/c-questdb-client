@@ -1,8 +1,8 @@
 /* C twin of questdb-rs/examples/qwp_egress_polars.rs. Populates the bench
  * table over QWP/WS (unless SKIP_POPULATE), then measures reading it back:
- *   decode-only  (floor) — drain reader_cursor_next_batch, count rows
+ *   decode-only  (floor) — drain qwp_reader_cursor_next_batch, count rows
  *   materialize  (e2e)   — additionally touch every cell via the
- *                          reader_column_data getters (the C-user analog of
+ *                          qwp_reader_column_data getters (the C-user analog of
  *                          assembling a DataFrame)
  * Reader conf mirrors the Rust example: fresh reader per iteration,
  * "ws::addr={host}:{port};compression=raw;". client="c-columnar".
@@ -15,8 +15,8 @@
 #include <stdlib.h>
 #include <string.h>
 
-#include <questdb/egress/reader.h>
-#include <questdb/ingress/column_sender.h>
+#include <questdb/egress/qwp_reader.h>
+#include <questdb/ingress/qwp_sender.h>
 
 #include "bench_http_c.h"
 #include "bench_ingest_c.h"
@@ -54,18 +54,18 @@ static void populate(const char* host, size_t port, const char* base,
      * never re-states the connection-lifetime symbol dict in replay frames,
      * and it has no internal failover — errors are fatal for the bench
      * (bench_die), which is the intended behavior. */
-    direct_column_sender* sender =
-        questdb_db_borrow_direct_column_sender(db, &err);
+    qwp_direct_sender* sender =
+        questdb_db_borrow_direct_sender(db, &err);
     if (!sender) bench_die(PROG, "borrow sender", err);
-    column_sender_chunk* chunk = column_sender_chunk_new(table, strlen(table), &err);
+    qwp_chunk* chunk = qwp_chunk_new(table, strlen(table), &err);
     if (!chunk) bench_die(PROG, "chunk_new", err);
 
     stage_scratch scratch = {0};
     ingest_pass(sender, chunk, &d, kind, 0, d.rows, POPULATE_BATCH_ROWS, &scratch, PROG);
     free(scratch.note_off);
 
-    column_sender_chunk_free(chunk);
-    questdb_db_return_direct_column_sender(db, sender);
+    qwp_chunk_free(chunk);
+    questdb_db_return_direct_sender(db, sender);
     questdb_db_close(db);
     bench_data_free(&d);
 
@@ -89,45 +89,45 @@ static size_t read_pass(const char* rconf, const char* select, int materialize,
         bench_die(PROG, "conf utf8", err);
     if (!line_sender_utf8_init(&sql_u, strlen(select), select, &err))
         bench_die(PROG, "sql utf8", err);
-    reader* r = reader_from_conf(conf_u, &err);
-    if (!r) bench_die(PROG, "reader_from_conf", err);
-    reader_cursor* cur = reader_execute(r, sql_u, &err);
-    if (!cur) bench_die(PROG, "reader_execute", err);
+    qwp_reader* r = qwp_reader_from_conf(conf_u, &err);
+    if (!r) bench_die(PROG, "qwp_reader_from_conf", err);
+    qwp_reader_cursor* cur = qwp_reader_execute(r, sql_u, &err);
+    if (!cur) bench_die(PROG, "qwp_reader_execute", err);
 
     size_t seen = 0;
     double checksum = 0.0;
-    const reader_batch* batch;
-    while ((batch = reader_cursor_next_batch(cur, &err)) != NULL) {
-        size_t nrows = reader_batch_row_count(batch);
+    const qwp_reader_batch* batch;
+    while ((batch = qwp_reader_cursor_next_batch(cur, &err)) != NULL) {
+        size_t nrows = qwp_reader_batch_row_count(batch);
         if (materialize) {
-            size_t ncols = reader_batch_column_count(batch);
-            reader_symbol_dict dict = {0};
-            if (!reader_batch_symbol_dict(batch, &dict, &err))
+            size_t ncols = qwp_reader_batch_column_count(batch);
+            qwp_reader_symbol_dict dict = {0};
+            if (!qwp_reader_batch_symbol_dict(batch, &dict, &err))
                 bench_die(PROG, "symbol_dict", err);
             for (size_t c = 0; c < ncols; c++) {
-                reader_column_data col = {0};
-                if (!reader_batch_column_data(batch, c, &col, &err))
+                qwp_reader_column_data col = {0};
+                if (!qwp_reader_batch_column_data(batch, c, &col, &err))
                     bench_die(PROG, "column_data", err);
                 for (size_t i = 0; i < nrows; i++) {
                     bool is_null = false;
                     switch (col.kind) {
-                    case reader_column_kind_long:
-                    case reader_column_kind_timestamp:
-                    case reader_column_kind_timestamp_nanos:
-                        checksum += (double)reader_column_data_get_i64(&col, i, &is_null);
+                    case qwp_reader_column_kind_long:
+                    case qwp_reader_column_kind_timestamp:
+                    case qwp_reader_column_kind_timestamp_nanos:
+                        checksum += (double)qwp_reader_column_data_get_i64(&col, i, &is_null);
                         break;
-                    case reader_column_kind_double:
-                        checksum += reader_column_data_get_f64(&col, i, &is_null);
+                    case qwp_reader_column_kind_double:
+                        checksum += qwp_reader_column_data_get_f64(&col, i, &is_null);
                         break;
-                    case reader_column_kind_symbol: {
+                    case qwp_reader_column_kind_symbol: {
                         const char* s = NULL; size_t sl = 0;
-                        reader_column_data_get_symbol(&col, &dict, i, &s, &sl, &is_null);
+                        qwp_reader_column_data_get_symbol(&col, &dict, i, &s, &sl, &is_null);
                         checksum += (double)sl;
                         break;
                     }
-                    case reader_column_kind_varchar: {
+                    case qwp_reader_column_kind_varchar: {
                         const uint8_t* v = NULL; size_t vl = 0;
-                        reader_column_data_get_varlen(&col, i, &v, &vl, &is_null);
+                        qwp_reader_column_data_get_varlen(&col, i, &v, &vl, &is_null);
                         checksum += (double)vl;
                         break;
                     }
@@ -140,8 +140,8 @@ static size_t read_pass(const char* rconf, const char* select, int materialize,
         seen += nrows;
     }
     if (err) bench_die(PROG, "next_batch", err);
-    reader_cursor_free(cur);
-    reader_close(r);
+    qwp_reader_cursor_free(cur);
+    qwp_reader_close(r);
     if (checksum_out) *checksum_out = checksum;
     return seen;
 }

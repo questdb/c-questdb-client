@@ -30,7 +30,7 @@
 //! handles that the normal Rust API
 //! uses. Instead it hands out *owned* (lifetime-free) handles that carry their
 //! own pool reference internally, so a C caller can free its `questdb_db*`
-//! before dropping outstanding `qwp_sender*` / `reader*`
+//! before dropping outstanding `qwp_sender*` / `qwp_reader*`
 //! handles. After the pool is closed those handles still return / drop safely;
 //! new operations on them fail cleanly with `InvalidApiCall`.
 //!
@@ -72,14 +72,14 @@ pub fn borrow_sender_owned_with_retry(db: &QuestDb, budget: Duration) -> Result<
 /// Borrow a **direct** (non-store-and-forward) column-major sender as an
 /// owned, lifetime-free handle. FFI counterpart to
 /// [`QuestDb::borrow_direct_column_sender`]; backs the C ABI's
-/// `questdb_db_borrow_direct_column_sender`.
+/// `questdb_db_borrow_direct_sender`.
 pub fn borrow_direct_column_sender_owned(db: &QuestDb) -> Result<OwnedDirectColumnSender> {
     db.borrow_direct_column_sender_owned()
 }
 
 /// Like [`borrow_direct_column_sender_owned`] but retries the connect within
 /// `budget` using the reconnect backoff. Backs the C ABI's
-/// `questdb_db_borrow_direct_column_sender_with_retry`.
+/// `questdb_db_borrow_direct_sender_with_retry`.
 pub fn borrow_direct_column_sender_owned_with_retry(
     db: &QuestDb,
     budget: Duration,
@@ -89,7 +89,7 @@ pub fn borrow_direct_column_sender_owned_with_retry(
 
 /// Build a **direct** (non-store-and-forward) column-major sender from a
 /// QWP/WebSocket config string, owning its own connection with no pool.
-/// Backs the C ABI's `direct_column_sender_from_conf`.
+/// Backs the C ABI's `qwp_direct_sender_from_conf`.
 pub fn direct_column_sender_from_conf(conf: &str) -> Result<OwnedDirectColumnSender> {
     OwnedDirectColumnSender::from_conf(conf)
 }
@@ -98,7 +98,7 @@ pub fn direct_column_sender_from_conf(conf: &str) -> Result<OwnedDirectColumnSen
 /// [`SenderBuilder`], owning its own connection with no pool — the builder's
 /// full auth/TLS config (including options set programmatically rather than
 /// via a config string) is honoured. Backs the C ABI's
-/// `direct_column_sender_from_opts`.
+/// `qwp_direct_sender_from_opts`.
 pub fn direct_column_sender_from_opts(
     builder: &crate::ingress::SenderBuilder,
 ) -> Result<OwnedDirectColumnSender> {

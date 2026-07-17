@@ -31,7 +31,7 @@
 
 #include "qwp_mock_server.hpp"
 
-#include <questdb/egress/reader.hpp>
+#include <questdb/egress/qwp_reader.hpp>
 
 #include <atomic>
 #include <chrono>
@@ -112,7 +112,7 @@ TEST_CASE("mock: handshake + immediate ResultEnd drives cursor terminus")
     auto cur = reader.execute("select 1"_utf8);
     // Empty result → next_batch() returns false on first call.
     CHECK_FALSE(cur.next_batch());
-    CHECK(cur.terminal_kind() == reader_terminal_kind_end);
+    CHECK(cur.terminal_kind() == qwp_reader_terminal_kind_end);
 
     CHECK(srv.captured_requests().size() == 1);
     CHECK(srv.captured_requests()[0][0] == qm::MSG_QUERY_REQUEST);
@@ -144,7 +144,7 @@ TEST_CASE("mock: column getter — i32 (Int) round-trip")
     REQUIRE(batch_opt);
     auto& batch = *batch_opt;
     REQUIRE(batch.row_count() == 3);
-    REQUIRE(batch.column_kind(0) == reader_column_kind_int);
+    REQUIRE(batch.column_kind(0) == qwp_reader_column_kind_int);
 
     auto v0 = batch.column(0).get<int32_t>(0);
     auto v1 = batch.column(0).get<int32_t>(1);
@@ -474,7 +474,7 @@ TEST_CASE("mock: ExecDone yields terminal_kind == exec_done")
     auto reader = connect_to(srv);
     auto cur = reader.execute("create table x(a int)"_utf8);
     CHECK_FALSE(cur.next_batch());
-    CHECK(cur.terminal_kind() == reader_terminal_kind_exec_done);
+    CHECK(cur.terminal_kind() == qwp_reader_terminal_kind_exec_done);
 }
 
 // ---------------------------------------------------------------------------
@@ -1073,7 +1073,7 @@ TEST_CASE("mock: column::shape + elements<double> round-trip")
     REQUIRE(batch_opt);
     auto& batch = *batch_opt;
     REQUIRE(batch.row_count() == 2);
-    REQUIRE(batch.column_kind(0) == reader_column_kind_double_array);
+    REQUIRE(batch.column_kind(0) == qwp_reader_column_kind_double_array);
 
     auto col = batch.column(0);
     REQUIRE(col.is_array());
@@ -1484,7 +1484,7 @@ TEST_CASE("mock: WebSocket upgrade rejected with 401 surfaces a connect-time err
     const std::string conf = "ws::addr=" + srv.addr() + ";";
     line_sender_utf8 c{conf.size(), conf.c_str()};
     questdb_error* err = nullptr;
-    reader* r = reader_from_conf(c, &err);
+    qwp_reader* r = qwp_reader_from_conf(c, &err);
     REQUIRE(r == nullptr);
     REQUIRE(err != nullptr);
     const auto code = questdb_error_get_code(err);
@@ -1513,7 +1513,7 @@ TEST_CASE("mock: multi-addr walk aggregates per-endpoint 401 rejections")
         "ws::addr=" + srv1.addr() + "," + srv2.addr() + ";";
     line_sender_utf8 c{conf.size(), conf.c_str()};
     questdb_error* err = nullptr;
-    reader* r = reader_from_conf(c, &err);
+    qwp_reader* r = qwp_reader_from_conf(c, &err);
     REQUIRE(r == nullptr);
     REQUIRE(err != nullptr);
     // Either AuthError (both endpoints actually replied 401) or
@@ -1559,7 +1559,7 @@ TEST_CASE("mock: CACHE_RESET mid-stream is consumed without breaking the cursor"
     // the terminal — a regression that mishandled the cache-reset
     // discriminant would either throw or return a phantom batch here.
     CHECK_FALSE(cur.next_batch());
-    CHECK(cur.terminal_kind() == reader_terminal_kind_end);
+    CHECK(cur.terminal_kind() == qwp_reader_terminal_kind_end);
 }
 
 // ---------------------------------------------------------------------------
@@ -1576,14 +1576,14 @@ TEST_CASE("mock: CACHE_RESET mid-stream is consumed without breaking the cursor"
 // before it could reach the FFI.
 namespace
 {
-::reader* raw_handle(questdb::egress::reader& r) noexcept
+::qwp_reader* raw_handle(questdb::egress::reader& r) noexcept
 {
-    struct reader_layout { ::reader* impl; };
+    struct reader_layout { ::qwp_reader* impl; };
     return reinterpret_cast<reader_layout*>(&r)->impl;
 }
-::reader_query* raw_handle(questdb::egress::query& q) noexcept
+::qwp_reader_query* raw_handle(questdb::egress::query& q) noexcept
 {
-    struct query_layout { ::reader_query* impl; };
+    struct query_layout { ::qwp_reader_query* impl; };
     return reinterpret_cast<query_layout*>(&q)->impl;
 }
 } // namespace
@@ -1597,8 +1597,8 @@ TEST_CASE("mock: query_new rejects invalid UTF-8 SQL with InvalidUtf8")
     static const unsigned char bad[] = {'s', 'e', 'l', 'e', 'c', 't', 0xFF};
     line_sender_utf8 sql{7, reinterpret_cast<const char*>(bad)};
     questdb_error* err = nullptr;
-    reader_query* q =
-        reader_prepare(raw_handle(reader), sql, &err);
+    qwp_reader_query* q =
+        qwp_reader_prepare(raw_handle(reader), sql, &err);
     REQUIRE(q == nullptr);
     REQUIRE(err != nullptr);
     CHECK(questdb_error_get_code(err) == questdb_error_invalid_utf8);
@@ -1619,7 +1619,7 @@ TEST_CASE("mock: bind_varchar with invalid UTF-8 surfaces InvalidUtf8 at execute
     auto q = reader.prepare("X"_utf8);
     static const unsigned char bad[] = {0xC3, 0x28};  // invalid 2-byte UTF-8
     line_sender_utf8 v{2, reinterpret_cast<const char*>(bad)};
-    reader_query_bind_varchar(raw_handle(q), v);
+    qwp_reader_query_bind_varchar(raw_handle(q), v);
     // bind_varchar stashes the deferred error; execute() must surface
     // it as InvalidUtf8 without touching the wire.
     bool threw = false;
@@ -1647,7 +1647,7 @@ TEST_CASE("mock: bind_varchar deferred error wins over a later valid bind")
     auto q = reader.prepare("X"_utf8);
     static const unsigned char bad[] = {0xC3, 0x28};
     line_sender_utf8 v_bad{2, reinterpret_cast<const char*>(bad)};
-    reader_query_bind_varchar(raw_handle(q), v_bad);
+    qwp_reader_query_bind_varchar(raw_handle(q), v_bad);
     // A second, valid bind must not overwrite the first error.
     q.bind_i32(7);
     bool threw = false;
@@ -1848,7 +1848,7 @@ TEST_CASE("mock: get_ipv4 round-trips high-bit IPs without sign-flipping")
     auto batch_opt = cur.next_batch();
     REQUIRE(batch_opt);
     auto& batch = *batch_opt;
-    REQUIRE(batch.column_kind(0) == reader_column_kind_ipv4);
+    REQUIRE(batch.column_kind(0) == qwp_reader_column_kind_ipv4);
 
     auto v0 = batch.column(0).get<uint32_t>(0);
     auto v1 = batch.column(0).get<uint32_t>(1);
@@ -1883,7 +1883,7 @@ TEST_CASE("mock: get_i32 rejects an IPV4 column with a type-mismatch error")
     auto batch_opt = cur.next_batch();
     REQUIRE(batch_opt);
     auto& batch = *batch_opt;
-    REQUIRE(batch.column_kind(0) == reader_column_kind_ipv4);
+    REQUIRE(batch.column_kind(0) == qwp_reader_column_kind_ipv4);
 
     bool threw = false;
     questdb::error_code code{};
@@ -2106,9 +2106,9 @@ TEST_CASE("mock: get_i64 round-trips TIMESTAMP / DATE / TIMESTAMP_NANOS")
     REQUIRE(batch_opt);
     auto& batch = *batch_opt;
     REQUIRE(batch.column_count() == 3);
-    CHECK(batch.column_kind(0) == reader_column_kind_timestamp);
-    CHECK(batch.column_kind(1) == reader_column_kind_date);
-    CHECK(batch.column_kind(2) == reader_column_kind_timestamp_nanos);
+    CHECK(batch.column_kind(0) == qwp_reader_column_kind_timestamp);
+    CHECK(batch.column_kind(1) == qwp_reader_column_kind_date);
+    CHECK(batch.column_kind(2) == qwp_reader_column_kind_timestamp_nanos);
 
     auto v0 = batch.column(0).get<int64_t>(0);
     auto v1 = batch.column(1).get<int64_t>(0);
@@ -2235,7 +2235,7 @@ TEST_CASE(
     line_sender_utf8 bad_v{2, reinterpret_cast<const char*>(bad)};
 
     // Bad bind first: stashes deferred_err.
-    reader_query_bind_varchar(raw_handle(q), bad_v);
+    qwp_reader_query_bind_varchar(raw_handle(q), bad_v);
 
     // Subsequent binds: each MUST be a no-op now. Pre-fix, these would
     // push into the upstream builder and shift indices.
@@ -2331,7 +2331,7 @@ TEST_CASE("mock: owning server_info preserves unknown role and outlives reader")
     }
 
     // The reader and its Rust-owned strings are gone. The C++ snapshot keeps
-    // independent storage rather than a dangling reader_server_info pointer.
+    // independent storage rather than a dangling qwp_reader_server_info pointer.
     REQUIRE(captured.has_value());
     CHECK(captured->cluster_id() == "cluster-owned");
     CHECK(captured->node_id() == "node-owned");
@@ -2359,7 +2359,7 @@ TEST_CASE("mock: cursor::terminal_exec_done returns op_type and rows_affected")
     auto reader = connect_to(srv);
     auto cur = reader.execute("update t set x = 1"_utf8);
     CHECK_FALSE(cur.next_batch());
-    REQUIRE(cur.terminal_kind() == reader_terminal_kind_exec_done);
+    REQUIRE(cur.terminal_kind() == qwp_reader_terminal_kind_exec_done);
 
     auto info = cur.terminal_exec_done();
     REQUIRE(info.has_value());
@@ -2475,7 +2475,7 @@ TEST_CASE("mock: C++ wrapper move-assignment — reader / query / cursor")
     {
         // Two independent readers, two live queries. Move-assigning q2
         // over q1 must free q1's impl (releasing reader1's `active`
-        // flag through `reader_query_free`) and transfer q2's impl
+        // flag through `qwp_reader_query_free`) and transfer q2's impl
         // into q1. The successor execute() then runs against reader2.
         qm::Script s1 = {qm::ActionSendServerInfo{}};
         qm::Script s2 = {
@@ -2589,14 +2589,14 @@ TEST_CASE("mock: next_batch is idempotent after the stream terminus")
     auto reader = connect_to(srv);
     auto cur = reader.execute("select 1"_utf8);
     CHECK_FALSE(cur.next_batch());
-    REQUIRE(cur.terminal_kind() == reader_terminal_kind_end);
+    REQUIRE(cur.terminal_kind() == qwp_reader_terminal_kind_end);
 
     // Repeated calls after the terminus must keep returning false and
     // NOT throw. Five iterations is overkill but cheap insurance.
     for (int i = 0; i < 5; ++i)
     {
         CHECK_FALSE(cur.next_batch());
-        CHECK(cur.terminal_kind() == reader_terminal_kind_end);
+        CHECK(cur.terminal_kind() == qwp_reader_terminal_kind_end);
     }
 }
 
@@ -2617,7 +2617,7 @@ TEST_CASE("mock: target=primary against replica-only endpoint surfaces role_mism
     const std::string conf = "ws::addr=" + srv.addr() + ";target=primary;";
     line_sender_utf8 c{conf.size(), conf.c_str()};
     questdb_error* err = nullptr;
-    reader* r = reader_from_conf(c, &err);
+    qwp_reader* r = qwp_reader_from_conf(c, &err);
     REQUIRE(r == nullptr);
     REQUIRE(err != nullptr);
     CHECK(questdb_error_get_code(err) == questdb_error_role_mismatch);
@@ -2872,7 +2872,7 @@ TEST_CASE("mock: SERVER_INFO zone trailer presence must match CAP_ZONE")
 }
 
 // Move-assigning over a reader that still owns a live cursor drives
-// `reader_close` down its defense-in-depth leak branch (the cursor holds a
+// `qwp_reader_close` down its defense-in-depth leak branch (the cursor holds a
 // laundered `&mut Reader`; freeing would dangle). `operator=(reader&&)` is
 // `noexcept` — a throwing move special-member breaks STL containers and is
 // UB across a C frame — so it leaks the old reader (with a stderr
@@ -2904,7 +2904,7 @@ TEST_CASE("mock: reader move-assign over a live cursor leaks safely without thro
     // `cur` still points at the leaked (not freed) original reader, so it
     // drains to its terminal — no use-after-free.
     CHECK_FALSE(cur.next_batch());
-    CHECK(cur.terminal_kind() == reader_terminal_kind_end);
+    CHECK(cur.terminal_kind() == qwp_reader_terminal_kind_end);
 
     // The destination adopted reader_b's handshake.
     CHECK(reader_a.server_version() == 1);
@@ -3008,10 +3008,10 @@ TEST_CASE("mock: reader metadata getters reject while a cursor is live")
 }
 
 // ---------------------------------------------------------------------------
-// FFI ABI smoke for every supported `reader_query_bind_*`.
+// FFI ABI smoke for every supported `qwp_reader_query_bind_*`.
 //
 // Each bind goes through the C ABI (`questdb::egress::query::bind_*` ->
-// `reader_query_bind_*` -> `mutate_query` -> upstream `bind_*`), so
+// `qwp_reader_query_bind_*` -> `mutate_query` -> upstream `bind_*`), so
 // the captured QUERY_REQUEST is a byte-level snapshot of the marshalling.
 // Sentinel values are chosen so a wrong argument order, sign-extension
 // bug, or off-by-one width on any single bind produces a localised diff
@@ -3221,10 +3221,10 @@ TEST_CASE(
 // ---------------------------------------------------------------------------
 // FFI thread-safety contract: Reader migration + concurrent stats reads.
 //
-// `reader_bytes_received` / `_read_ns` / `_decode_ns` /
+// `qwp_reader_bytes_received` / `_read_ns` / `_decode_ns` /
 // `_credit_granted_total` are documented at `questdb-rs-ffi/src/egress.rs`
 // as safe to call from a monitoring thread while another thread is
-// driving a cursor through `reader_query_execute`. The Reader is
+// driving a cursor through `qwp_reader_query_execute`. The Reader is
 // stored in an `UnsafeCell<Reader>` next to a cloned `Arc<ReaderStats>`
 // inside the C-side `reader` struct; the stat getters use
 // `ptr::addr_of!` to reach the Arc field without synthesising an
@@ -3236,7 +3236,7 @@ TEST_CASE(
 //    drives a multi-batch cursor through `next_batch()`.
 //  - The main thread hammers `reader.bytes_received()` /
 //    `read_ns()` / `decode_ns()` / `credit_granted_total()` on the same
-//    `reader*` handle.
+//    `qwp_reader*` handle.
 //
 // Under `QUESTDB_SANITIZE` (ASan + UBSan today; TSan if/when wired in)
 // a regression that routes a stat getter through a non-atomic field, or
@@ -4488,7 +4488,7 @@ TEST_CASE("mock: column::visit dispatches DOUBLE_ARRAY to array_view<double>")
 // Pool integration: `questdb::pool::borrow_reader()`.
 //
 // Mirrors the Rust `QuestDb::borrow_reader` coverage
-// (questdb-rs/src/tests/column_sender_pool.rs::reader_pool). The unified pool
+// (questdb-rs/src/tests/qwp_sender_pool.rs::reader_pool). The unified pool
 // hands out query readers as well as senders; a borrowed reader returns to
 // the pool on destruction unless `drop_on_return()` was called.
 //

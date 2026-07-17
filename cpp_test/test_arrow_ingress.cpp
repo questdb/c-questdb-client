@@ -20,8 +20,8 @@
 
 #include "qwp_mock_server.hpp"
 
-#include <questdb/ingress/column_sender.h>
-#include <questdb/ingress/column_sender.hpp>
+#include <questdb/ingress/qwp_sender.h>
+#include <questdb/ingress/qwp_sender.hpp>
 #include <questdb/ingress/line_sender.hpp>
 
 #include <cstdint>

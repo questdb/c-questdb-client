@@ -594,7 +594,7 @@ bool qwp_sender_flush_buffer(
 
 bool qwp_sender_flush_chunk(
         qwp_sender *sender,
-        column_sender_chunk *chunk,
+        qwp_chunk *chunk,
         line_sender_error **err_out);
 ```
 
@@ -602,7 +602,7 @@ The exact prefix may change during API review, but it must not call the unified
 handle `row_sender` or `column_sender`.
 
 Remove the pooled `row_sender_*` functions and the owned Rust row-sender escape
-hatch. Keep `column_sender_chunk_*` names because those functions manipulate a
+hatch. Keep `qwp_chunk_*` names because those functions manipulate a
 column-shaped payload, not a sender identity.
 
 FFI-owned handles continue to carry `Arc<DbInner>` so they can be released

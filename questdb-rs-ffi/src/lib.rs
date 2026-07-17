@@ -5443,15 +5443,11 @@ mod tests {
         }
     }
 
-    fn fill_column_chunk(
-        chunk: *mut column_sender_chunk,
-        qty: i64,
-        err: &mut *mut line_sender_error,
-    ) {
+    fn fill_column_chunk(chunk: *mut qwp_chunk, qty: i64, err: &mut *mut line_sender_error) {
         unsafe {
             let qtys = [qty];
             let timestamps = [1_700_000_000_000_000_000i64];
-            assert!(column_sender_chunk_column_i64(
+            assert!(qwp_chunk_column_i64(
                 chunk,
                 b"qty".as_ptr() as *const c_char,
                 3,
@@ -5461,7 +5457,7 @@ mod tests {
                 err
             ));
             assert!(err.is_null());
-            assert!(column_sender_chunk_at_nanos(
+            assert!(qwp_chunk_at_nanos(
                 chunk,
                 timestamps.as_ptr(),
                 timestamps.len(),
@@ -5560,8 +5556,7 @@ mod tests {
             assert!(err.is_null());
 
             let table = b"trades";
-            let chunk =
-                column_sender_chunk_new(table.as_ptr() as *const c_char, table.len(), &mut err);
+            let chunk = qwp_chunk_new(table.as_ptr() as *const c_char, table.len(), &mut err);
             assert!(!chunk.is_null());
             assert!(err.is_null());
 
@@ -5575,7 +5570,7 @@ mod tests {
             );
 
             questdb_db_return_sender(ptr::null_mut(), sender);
-            column_sender_chunk_free(chunk);
+            qwp_chunk_free(chunk);
         }
     }
 
@@ -5644,8 +5639,7 @@ mod tests {
             assert!(err.is_null());
 
             let table = b"trades";
-            let chunk =
-                column_sender_chunk_new(table.as_ptr() as *const c_char, table.len(), &mut err);
+            let chunk = qwp_chunk_new(table.as_ptr() as *const c_char, table.len(), &mut err);
             assert!(!chunk.is_null());
             assert!(err.is_null());
 
@@ -5675,7 +5669,7 @@ mod tests {
             assert!(err.is_null());
             assert!(fsn.has_value);
             let first_fsn = fsn.value;
-            assert_eq!(column_sender_chunk_row_count(chunk, &mut err), 0);
+            assert_eq!(qwp_chunk_row_count(chunk, &mut err), 0);
             assert!(err.is_null());
 
             assert!(qwp_sender_published_fsn(sender, &mut fsn, &mut err));
@@ -5688,7 +5682,7 @@ mod tests {
             assert!(!fsn.has_value);
 
             questdb_db_return_sender(ptr::null_mut(), sender);
-            column_sender_chunk_free(chunk);
+            qwp_chunk_free(chunk);
             questdb_db_close(db);
         }
     }
@@ -6137,7 +6131,7 @@ mod tests {
 
             questdb_db_close(db);
 
-            let query = egress::reader_prepare(reader, utf8(b"select 1"), &mut err);
+            let query = egress::qwp_reader_prepare(reader, utf8(b"select 1"), &mut err);
             assert!(query.is_null());
             assert_client_error_contains(
                 &mut err,
@@ -6145,7 +6139,7 @@ mod tests {
                 "QuestDb pool is closed",
             );
 
-            egress::reader_close(reader);
+            egress::qwp_reader_close(reader);
         }
     }
 
