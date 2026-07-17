@@ -48,6 +48,12 @@ import questdb_line_sender as qls
 import qwp_ws_fuzz
 import uuid
 
+# A native fault inside the client library (e.g. the 0xC0000005 access
+# violation seen on Windows CI) otherwise kills the process with no stack;
+# this prints every thread's Python frames, pinpointing the ctypes call.
+import faulthandler
+faulthandler.enable()
+
 # The Arrow ingress/egress/polars suites require pyarrow (and polars).
 # Import them lazily so test.py still loads in environments that don't install
 # those wheels. When the optional deps are missing we simply don't register the
