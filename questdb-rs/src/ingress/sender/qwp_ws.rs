@@ -2717,23 +2717,17 @@ fn qwp_ws_role_reject_zone(err: &crate::Error) -> Option<&str> {
 
 fn qwp_ws_all_endpoints_unreachable_error(
     endpoints: &[QwpWsEndpoint],
-    last_endpoint_idx: Option<usize>,
-    last_error: Option<crate::Error>,
+    last_failure: Option<(usize, crate::Error)>,
 ) -> crate::Error {
-    match (last_endpoint_idx, last_error) {
-        (Some(idx), Some(err)) => error::fmt!(
+    match last_failure {
+        Some((idx, err)) => error::fmt!(
             SocketError,
             "QWP/WebSocket all endpoints unreachable; last endpoint {}:{} failed: {}",
             endpoints[idx].host,
             endpoints[idx].port,
             err
         ),
-        (_, Some(err)) => error::fmt!(
-            SocketError,
-            "QWP/WebSocket all endpoints unreachable; last error: {}",
-            err
-        ),
-        _ => error::fmt!(SocketError, "QWP/WebSocket all endpoints unreachable"),
+        None => error::fmt!(SocketError, "QWP/WebSocket all endpoints unreachable"),
     }
 }
 
@@ -2875,11 +2869,11 @@ pub(crate) fn connect_qwp_ws_endpoint_round<A: QwpWsHealthAccess>(
     if let Some(idx) = previous_idx.take() {
         health.with_tracker(|t| t.record_mid_stream_failure(idx, previous_failure));
     }
-    let mut last_transport_endpoint_idx = None;
     let mut last_role_mismatch = None;
-    let mut last_transport_err = None;
+    let mut last_transport_failure: Option<(usize, crate::Error)> = None;
     let mut role_reject_count = 0usize;
-    let mut latched_typed_error = None;
+    let mut version_reject_count = 0usize;
+    let mut last_version_reject = None;
 
     // Pick + claim under the lock, then drop it for the blocking connect, then
     // re-acquire only to record the outcome. The lock is never held across
@@ -2952,9 +2946,6 @@ pub(crate) fn connect_qwp_ws_endpoint_round<A: QwpWsHealthAccess>(
             }
             Err(err) => {
                 health.with_tracker(|t| t.record_transport_error(idx));
-                if err.code() == crate::ErrorCode::ProtocolVersionError {
-                    latched_typed_error = Some(err.clone());
-                }
                 if let Some(events) = events {
                     events.connect_attempt_failed(
                         &endpoint.host,
@@ -2963,13 +2954,24 @@ pub(crate) fn connect_qwp_ws_endpoint_round<A: QwpWsHealthAccess>(
                         events.next_attempt(),
                     );
                 }
-                last_transport_endpoint_idx = Some(idx);
-                last_transport_err = Some(err);
+                if err.code() == crate::ErrorCode::ProtocolVersionError {
+                    version_reject_count += 1;
+                    last_version_reject = Some(err);
+                } else {
+                    last_transport_failure = Some((idx, err));
+                }
             }
         }
     }
 
-    if let Some(err) = latched_typed_error {
+    // ProtocolVersionError is terminal, so it wins only when every configured
+    // endpoint failed with it in THIS round -- counted against endpoints.len()
+    // because rounds can be partial (a reconnect round skips the endpoint whose
+    // mid-stream failure triggered it). Anything less -- a rolling upgrade
+    // where the rest of the fleet is transiently down -- must stay retryable.
+    if version_reject_count == endpoints.len()
+        && let Some(err) = last_version_reject
+    {
         return Err(err);
     }
     if *qwp_ws.request_durable_ack && role_reject_count == endpoints.len() {
@@ -2988,18 +2990,7 @@ pub(crate) fn connect_qwp_ws_endpoint_round<A: QwpWsHealthAccess>(
     if let Some(err) = last_role_mismatch {
         return Err(err);
     }
-    if let Some(err) = last_transport_err {
-        let err = qwp_ws_all_endpoints_unreachable_error(
-            endpoints,
-            last_transport_endpoint_idx,
-            Some(err),
-        );
-        if let Some(events) = events {
-            events.all_endpoints_unreachable(&err);
-        }
-        return Err(err);
-    }
-    let err = qwp_ws_all_endpoints_unreachable_error(endpoints, last_transport_endpoint_idx, None);
+    let err = qwp_ws_all_endpoints_unreachable_error(endpoints, last_transport_failure);
     if let Some(events) = events {
         events.all_endpoints_unreachable(&err);
     }

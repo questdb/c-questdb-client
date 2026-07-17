@@ -1146,6 +1146,41 @@ fn spawn_role_reject_upgrade_server(
     (port, handle)
 }
 
+/// Accepts upgrades and completes them WITHOUT echoing durable ACK (the
+/// pre-durable-ack server in a rolling upgrade) until `done` flips. Returns
+/// the number of accepted connections.
+fn spawn_no_durable_ack_upgrade_server(done: Arc<AtomicBool>) -> (u16, thread::JoinHandle<usize>) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let port = listener.local_addr().unwrap().port();
+
+    let handle = thread::spawn(move || {
+        let mut attempts = 0usize;
+        while !done.load(Ordering::Acquire) {
+            match listener.accept() {
+                Ok((mut stream, _)) => {
+                    attempts += 1;
+                    stream.set_nonblocking(false).unwrap();
+                    stream
+                        .set_read_timeout(Some(Duration::from_secs(5)))
+                        .unwrap();
+                    stream
+                        .set_write_timeout(Some(Duration::from_secs(5)))
+                        .unwrap();
+                    let _ = upgrade_mock_stream(&mut stream);
+                }
+                Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                    thread::sleep(Duration::from_millis(5));
+                }
+                Err(err) => panic!("no-durable-ack listener failed: {err}"),
+            }
+        }
+        attempts
+    });
+
+    (port, handle)
+}
+
 fn seed_orphan_slot(sf_dir: &Path) {
     let seed_port = spawn_upgrade_only_server();
     let seed_conf = format!(
@@ -3961,6 +3996,80 @@ fn qwp_ws_midstream_failure_reconnects_to_next_endpoint() {
 }
 
 #[test]
+fn qwp_ws_midstream_failure_version_error_on_other_endpoint_stays_retryable() {
+    // Rolling-upgrade regression: the sender is connected to endpoint A
+    // (durable-ack capable) when A dies mid-stream. The reconnect round only
+    // attempts B -- A's attempted-this-round claim is still held from the
+    // round it connected in -- and B is a pre-durable-ack server, so the
+    // round's only recorded error is a ProtocolVersionError. That partial
+    // round must NOT be treated as "the whole fleet is incompatible": the
+    // reconnect stays retryable, the next round retries A, and the replayed
+    // frame lands there.
+    let first_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let first_port = first_listener.local_addr().unwrap().port();
+    let done = Arc::new(AtomicBool::new(false));
+    let (second_port, second_handle) = spawn_no_durable_ack_upgrade_server(Arc::clone(&done));
+    let (frame_tx, frame_rx) = mpsc::channel();
+
+    let first_thread = thread::spawn(move || {
+        // Connection #1: healthy, then dies after the first data frame.
+        let (mut stream, _) = first_listener.accept().unwrap();
+        perform_server_upgrade_durable(&mut stream).unwrap();
+        let (_fin, _op, _payload) = read_frame(&mut stream).unwrap();
+        drop(stream);
+        // Connection #2: the endpoint recovered; the replay must land here.
+        // Delta mode: catch-up frame (wire seq 0) precedes the data frame.
+        let (mut stream, _) = first_listener.accept().unwrap();
+        perform_server_upgrade_durable(&mut stream).unwrap();
+        let (_fin, _op, _catch_up) = read_frame(&mut stream).unwrap();
+        let (_fin, _op, payload) = read_frame(&mut stream).unwrap();
+        write_qwp_ok_response_with_table_entries(
+            &mut stream,
+            FIRST_WIRE_SEQUENCE + 1,
+            &[("trades", 10)],
+        )
+        .unwrap();
+        write_qwp_durable_ack_response(&mut stream, &[("trades", 10)]).unwrap();
+        frame_tx.send(payload).unwrap();
+        thread::sleep(Duration::from_millis(50));
+    });
+
+    let conf = format!(
+        "ws::addr=127.0.0.1:{first_port},127.0.0.1:{second_port};\
+         request_durable_ack=on;\
+         reconnect_initial_backoff_millis=1;\
+         reconnect_max_backoff_millis=1;\
+         reconnect_max_duration_millis=5000;"
+    );
+    let mut sender = SenderBuilder::from_conf(&conf).unwrap().build().unwrap();
+
+    let mut buf = sender.new_buffer();
+    buf.table("trades")
+        .unwrap()
+        .symbol("sym", "ETH-USD")
+        .unwrap()
+        .column_i64("qty", 7)
+        .unwrap()
+        .at_now()
+        .unwrap();
+    // Durable-ack background flush completes on write, not on ack, so it
+    // returns before the mid-stream failure is even detected. The replayed
+    // frame arriving on A's second connection is the recovery signal; the
+    // old latch instead marked the store terminal and never replayed.
+    sender
+        .flush(&mut buf)
+        .expect("mid-stream reconnect must survive a version error on the other endpoint");
+    let replayed = frame_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    assert_eq!(&replayed[0..4], b"QWP1");
+    done.store(true, Ordering::Release);
+    first_thread.join().unwrap();
+    assert!(
+        second_handle.join().unwrap() >= 1,
+        "the reconnect round should have dialed the version-erroring endpoint"
+    );
+}
+
+#[test]
 fn qwp_ws_sync_reconnect_retries_failed_attempt() {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();
@@ -4684,6 +4793,48 @@ fn qwp_ws_sync_initial_retry_durable_ack_all_role_rejects_retry_until_budget() {
     );
     assert_eq!(first_handle.join().unwrap(), 1);
     assert_eq!(second_handle.join().unwrap(), 1);
+}
+
+#[test]
+fn qwp_ws_sync_initial_retry_version_error_does_not_mask_transient_endpoint_failure() {
+    // Rolling-upgrade shape: the first endpoint upgrades but does not enable
+    // durable ACK (ProtocolVersionError, terminal on its own); the second
+    // refuses the connection outright (transient). One endpoint's terminal
+    // error must not win the round while another endpoint is only
+    // transiently down -- the connect must keep retrying until the budget
+    // expires instead of surfacing ProtocolVersionError.
+    let done = Arc::new(AtomicBool::new(false));
+    let (first_port, first_handle) = spawn_no_durable_ack_upgrade_server(Arc::clone(&done));
+    let probe = TcpListener::bind("127.0.0.1:0").unwrap();
+    let second_port = probe.local_addr().unwrap().port();
+    drop(probe);
+
+    let conf = format!(
+        "ws::addr=127.0.0.1:{first_port},127.0.0.1:{second_port};\
+         request_durable_ack=on;\
+         initial_connect_retry=sync;\
+         reconnect_initial_backoff_millis=50;\
+         reconnect_max_backoff_millis=50;\
+         reconnect_max_duration_millis=300;"
+    );
+    let err = SenderBuilder::from_conf(&conf)
+        .unwrap()
+        .build()
+        .unwrap_err();
+    done.store(true, Ordering::Release);
+
+    assert_eq!(err.code(), ErrorCode::SocketError, "got: {}", err.msg());
+    assert!(
+        err.msg()
+            .contains("QWP/WebSocket initial connect retry budget exhausted"),
+        "got: {}",
+        err.msg()
+    );
+    let first_attempts = first_handle.join().unwrap();
+    assert!(
+        first_attempts >= 2,
+        "expected repeated retries against the version-erroring endpoint, got {first_attempts}"
+    );
 }
 
 #[test]
