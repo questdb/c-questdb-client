@@ -1111,6 +1111,7 @@ impl QwpBuffer {
         self.check_op(Op::Flush)
     }
 
+    #[inline(always)]
     fn check_op(&self, op: Op) -> crate::Result<()> {
         self.state.op_state.check(op)
     }
@@ -2804,6 +2805,7 @@ impl QwpWsColumnarBuffer {
         Ok(())
     }
 
+    #[inline(always)]
     fn check_op(&self, op: Op) -> crate::Result<()> {
         self.state.op_state.check(op)
     }

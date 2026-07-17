@@ -75,6 +75,7 @@ impl OpCase {
         }
     }
 
+    #[inline(always)]
     const fn allows(self, op: Op) -> bool {
         self.allowed_ops() & op.bit() != 0
     }
@@ -102,17 +103,24 @@ impl OpState {
         }
     }
 
+    #[inline(always)]
     pub(super) fn check(self, op: Op) -> crate::Result<()> {
         if self.op_case.allows(op) {
             Ok(())
         } else {
-            Err(error::fmt!(
-                InvalidApiCall,
-                "State error: Bad call to `{}`, {}.",
-                op.descr(),
-                self.op_case.next_op_descr()
-            ))
+            Err(self.bad_op_error(op))
         }
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn bad_op_error(self, op: Op) -> crate::Error {
+        error::fmt!(
+            InvalidApiCall,
+            "State error: Bad call to `{}`, {}.",
+            op.descr(),
+            self.op_case.next_op_descr()
+        )
     }
 
     pub(super) const fn can_set_marker(self) -> bool {
