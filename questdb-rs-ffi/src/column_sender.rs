@@ -3846,6 +3846,142 @@ unsafe fn qwp_sender_fsn_watermark(
     }
 }
 
+/// Poll the next server-rejection diagnostic recorded on this borrow's
+/// connection since it was borrowed. On success, `*error_out` is NULL when
+/// no diagnostic is pending, otherwise an owned handle to view via
+/// `line_sender_qwpws_error_get_view` and release via
+/// `line_sender_qwpws_error_free`. The pool's error handler (see
+/// `questdb_db_connect_with_handlers`) independently receives every
+/// rejection at record time.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn qwp_sender_poll_error(
+    sender: *mut qwp_sender,
+    error_out: *mut *mut crate::line_sender_qwpws_error,
+    err_out: *mut *mut line_sender_error,
+) -> bool {
+    let fn_name = "qwp_sender_poll_error";
+    if error_out.is_null() {
+        unsafe {
+            set_err_out_from_error(
+                err_out,
+                Error::new(
+                    ErrorCode::InvalidApiCall,
+                    format!("{fn_name}: error_out pointer is NULL"),
+                ),
+            );
+        }
+        return false;
+    }
+    unsafe {
+        *error_out = std::ptr::null_mut();
+    }
+    if sender.is_null() {
+        unsafe {
+            set_err_out_from_error(
+                err_out,
+                Error::new(
+                    ErrorCode::InvalidApiCall,
+                    format!("{fn_name}: sender pointer is NULL"),
+                ),
+            );
+        }
+        return false;
+    }
+    let _guard = match unsafe {
+        InUseGuard::acquire(
+            sender,
+            qwp_sender::latch(sender),
+            fn_name,
+            "qwp_sender",
+            err_out,
+        )
+    } {
+        Some(g) => g,
+        None => return false,
+    };
+    if unsafe { reject_closed_pool_cs(sender, fn_name, err_out) } {
+        return false;
+    }
+    let core = unsafe { qwp_sender::owned_ref(sender).get() };
+    match core.poll_error() {
+        Ok(Some(error)) => {
+            unsafe {
+                *error_out = Box::into_raw(Box::new(error.into()));
+            }
+            true
+        }
+        Ok(None) => true,
+        Err(err) => {
+            unsafe { set_err_out_from_error(err_out, err) };
+            false
+        }
+    }
+}
+
+/// Diagnostics dropped from this connection's bounded ring
+/// (`error_inbox_capacity`).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn qwp_sender_error_events_dropped(
+    sender: *const qwp_sender,
+    dropped_out: *mut u64,
+    err_out: *mut *mut line_sender_error,
+) -> bool {
+    let fn_name = "qwp_sender_error_events_dropped";
+    if dropped_out.is_null() {
+        unsafe {
+            set_err_out_from_error(
+                err_out,
+                Error::new(
+                    ErrorCode::InvalidApiCall,
+                    format!("{fn_name}: dropped_out pointer is NULL"),
+                ),
+            );
+        }
+        return false;
+    }
+    if sender.is_null() {
+        unsafe {
+            set_err_out_from_error(
+                err_out,
+                Error::new(
+                    ErrorCode::InvalidApiCall,
+                    format!("{fn_name}: sender pointer is NULL"),
+                ),
+            );
+        }
+        return false;
+    }
+    let handle = sender as *mut qwp_sender;
+    let _guard = match unsafe {
+        InUseGuard::acquire(
+            handle,
+            qwp_sender::latch(sender),
+            fn_name,
+            "qwp_sender",
+            err_out,
+        )
+    } {
+        Some(g) => g,
+        None => return false,
+    };
+    if unsafe { reject_closed_pool_cs(sender, fn_name, err_out) } {
+        return false;
+    }
+    let core = unsafe { qwp_sender::owned_ref(sender).get() };
+    match core.error_events_dropped() {
+        Ok(dropped) => {
+            unsafe {
+                *dropped_out = dropped;
+            }
+            true
+        }
+        Err(err) => {
+            unsafe { set_err_out_from_error(err_out, err) };
+            false
+        }
+    }
+}
+
 /// Return the highest QWP/WebSocket frame sequence number published locally
 /// through this store-and-forward QWP sender, or no value if no frame has
 /// been published.

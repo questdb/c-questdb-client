@@ -31,12 +31,14 @@ use std::time::{Duration, Instant};
 
 use crate::ErrorCode;
 use crate::ingress::AckLevel;
+use crate::ingress::QwpWsSenderError;
 use crate::ingress::buffer::{Buffer, QwpWsColumnarBuffer, QwpWsEncodeScratch, SymbolGlobalDict};
 use crate::ingress::sender::qwp_ws::{
     SyncQwpWsHandlerState, publish_qwp_ws_payload_background, qwp_ws_acked_fsn_background,
     qwp_ws_begin_close_background, qwp_ws_check_error_background,
     qwp_ws_drain_to_deadline_background, qwp_ws_is_terminal_background, qwp_ws_ok_fsn_background,
-    qwp_ws_published_fsn_background,
+    qwp_ws_poll_sender_error_background, qwp_ws_poll_sender_error_notification_background,
+    qwp_ws_published_fsn_background, qwp_ws_sender_errors_dropped_background,
 };
 use crate::ingress::sender::qwp_ws_sfa_publisher::{SfaForegroundPublisher, SfaPublishOutcome};
 #[cfg(feature = "arrow-ingress")]
@@ -340,17 +342,32 @@ impl PooledSenderCore {
         })
     }
 
-    /// Scope the ack barrier to the borrowing lease: fast-forward the sync
-    /// boundaries past everything already published so `wait` covers only
-    /// the lease's own publications and short-circuits when it published
-    /// nothing. Rejections are not consumed here — they reach the pool's
-    /// rejection handler when recorded.
+    /// Scope the ack barrier and diagnostic polling to the borrowing
+    /// lease: fast-forward the sync boundaries past everything already
+    /// published so `wait` covers only the lease's own publications (and
+    /// short-circuits when it published nothing), and discard ring entries
+    /// recorded before the borrow — the pool's error handler already
+    /// received them when they were recorded.
     pub(crate) fn rebase_lease_observation(&mut self) {
         let sfa = &mut self.backend;
         if let Ok(published) = qwp_ws_published_fsn_background(&sfa.state) {
             sfa.last_ok_sync_boundary = published;
             sfa.last_durable_sync_boundary = published;
         }
+        while let Ok(Some(_)) = qwp_ws_poll_sender_error_background(&sfa.state) {}
+        while let Ok(Some(_)) = qwp_ws_poll_sender_error_notification_background(&sfa.state) {}
+    }
+
+    /// Poll the next server-rejection diagnostic recorded on this
+    /// connection since the lease was borrowed. The pool's error handler
+    /// independently receives every rejection at record time.
+    pub fn poll_error(&self) -> Result<Option<QwpWsSenderError>> {
+        qwp_ws_poll_sender_error_background(&self.backend.state)
+    }
+
+    /// Diagnostics dropped from the connection's bounded ring.
+    pub fn error_events_dropped(&self) -> Result<u64> {
+        qwp_ws_sender_errors_dropped_background(&self.backend.state)
     }
 
     #[must_use]

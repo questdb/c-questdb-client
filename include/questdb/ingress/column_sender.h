@@ -1579,6 +1579,28 @@ bool qwp_sender_acked_fsn(
     line_sender_qwpws_fsn* fsn_out,
     line_sender_error** err_out);
 
+/** Poll the next server-rejection diagnostic recorded on this borrow's
+ *  connection since it was borrowed. On success `*error_out` is NULL when
+ *  none is pending, otherwise an owned handle: view it via
+ *  `line_sender_qwpws_error_get_view` and release it via
+ *  `line_sender_qwpws_error_free` (both declared in
+ *  `questdb/ingress/line_sender.h`). The pool error handler registered via
+ *  `questdb_db_connect_with_handlers` independently receives every
+ *  rejection at record time. */
+QUESTDB_CLIENT_API
+bool qwp_sender_poll_error(
+    qwp_sender* sender,
+    line_sender_qwpws_error** error_out,
+    line_sender_error** err_out);
+
+/** Diagnostics dropped from this connection's bounded ring
+ *  (`error_inbox_capacity`). */
+QUESTDB_CLIENT_API
+bool qwp_sender_error_events_dropped(
+    const qwp_sender* sender,
+    uint64_t* dropped_out,
+    line_sender_error** err_out);
+
 /**
  * Ack barrier scoped to this borrow: blocks until every frame published
  * through it reaches `ack_level`, short-circuiting when the borrow
