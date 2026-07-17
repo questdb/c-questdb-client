@@ -2756,10 +2756,16 @@ pub(crate) fn establish_connection(
 
     let mut tcp = connect_qwp_ws_tcp(host, port, request_timeout, connect_timeout)?;
 
-    let host_header = if (use_tls && port == "443") || (!use_tls && port == "80") {
-        host.to_string()
+    // RFC 9110: an IPv6 literal in a Host header must be bracketed.
+    let header_host = if host.contains(':') {
+        format!("[{host}]")
     } else {
-        format!("{host}:{port}")
+        host.to_string()
+    };
+    let host_header = if (use_tls && port == "443") || (!use_tls && port == "80") {
+        header_host
+    } else {
+        format!("{header_host}:{port}")
     };
 
     let max_version = *qwp_ws.max_protocol_version;

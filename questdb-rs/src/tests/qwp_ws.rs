@@ -4945,6 +4945,29 @@ fn qwp_ws_from_conf_parses_java_reconnect_keys() {
     let err = SenderBuilder::from_conf(empty_host).unwrap_err();
     assert!(err.msg().contains("empty host"), "got: {}", err.msg());
 
+    let ipv6_multi = "ws::addr=[::1]:9000,[2001:db8::1]:9001, localhost:9002;";
+    SenderBuilder::from_conf(ipv6_multi).unwrap();
+
+    let unbracketed_ipv6 = "ws::addr=::1:9000;";
+    let err = SenderBuilder::from_conf(unbracketed_ipv6).unwrap_err();
+    assert!(err.msg().contains("bracket IPv6"), "got: {}", err.msg());
+
+    let unterminated_bracket = "ws::addr=[::1:9000;";
+    let err = SenderBuilder::from_conf(unterminated_bracket).unwrap_err();
+    assert!(err.msg().contains("missing ']'"), "got: {}", err.msg());
+
+    let bracket_junk = "ws::addr=[::1]9000;";
+    let err = SenderBuilder::from_conf(bracket_junk).unwrap_err();
+    assert!(
+        err.msg().contains("expected ':port' after ']'"),
+        "got: {}",
+        err.msg()
+    );
+
+    let bracket_empty_host = "ws::addr=[]:9000;";
+    let err = SenderBuilder::from_conf(bracket_empty_host).unwrap_err();
+    assert!(err.msg().contains("empty host"), "got: {}", err.msg());
+
     let invalid_port = "ws::addr=localhost:notaport;";
     let err = SenderBuilder::from_conf(invalid_port).unwrap_err();
     assert!(err.msg().contains("invalid port"), "got: {}", err.msg());

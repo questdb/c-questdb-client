@@ -173,6 +173,30 @@ fn qwpws_store_and_forward_config_parses_java_keys() {
 
 #[cfg(feature = "sync-sender-qwp-ws")]
 #[test]
+fn qwpws_addr_accepts_bracketed_ipv6() {
+    let builder = SenderBuilder::from_conf("ws::addr=[::1]:9001;").unwrap();
+    assert_specified_eq(&builder.host, "::1");
+    assert_specified_eq(&builder.port, "9001");
+
+    let defaulted = SenderBuilder::from_conf("ws::addr=[::1];").unwrap();
+    assert_specified_eq(&defaulted.host, "::1");
+    assert_specified_eq(&defaulted.port, Protocol::Ws.default_port());
+
+    let multi = SenderBuilder::from_conf("ws::addr=[::1]:9000,[2001:db8::1]:9001, localhost:9002;")
+        .unwrap();
+    let qwp_ws = multi.qwp_ws.as_ref().unwrap();
+    assert_specified_eq(
+        &qwp_ws.endpoints,
+        vec![
+            conf::QwpWsEndpoint::new("::1".into(), "9000".into()),
+            conf::QwpWsEndpoint::new("2001:db8::1".into(), "9001".into()),
+            conf::QwpWsEndpoint::new("localhost".into(), "9002".into()),
+        ],
+    );
+}
+
+#[cfg(feature = "sync-sender-qwp-ws")]
+#[test]
 fn qwpws_config_accepts_websocket_schemes() {
     let plain = SenderBuilder::from_conf("ws::addr=localhost:9000;").unwrap();
     assert_eq!(plain.protocol, Protocol::Ws);

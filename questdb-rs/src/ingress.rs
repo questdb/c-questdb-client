@@ -770,9 +770,39 @@ fn parse_qwp_ws_endpoints(
                     "invalid QWP/WebSocket addr list: empty entry"
                 ));
             }
-            let (host, port) = match entry.split_once(':') {
-                Some((host, port)) => (host.trim(), port.trim()),
-                None => (entry, default_port),
+            let (host, port) = if let Some(rest) = entry.strip_prefix('[') {
+                let (host, after) = rest.split_once(']').ok_or_else(|| {
+                    error::fmt!(
+                        ConfigError,
+                        "invalid QWP/WebSocket addr entry {:?}: missing ']'",
+                        entry
+                    )
+                })?;
+                let port = match after.strip_prefix(':') {
+                    Some(port) => port.trim(),
+                    None if after.is_empty() => default_port,
+                    None => {
+                        return Err(error::fmt!(
+                            ConfigError,
+                            "invalid QWP/WebSocket addr entry {:?}: \
+                             expected ':port' after ']'",
+                            entry
+                        ));
+                    }
+                };
+                (host.trim(), port)
+            } else if entry.matches(':').count() > 1 {
+                return Err(error::fmt!(
+                    ConfigError,
+                    "invalid QWP/WebSocket addr entry {:?}: bracket IPv6 \
+                     addresses, e.g. [::1]:9000",
+                    entry
+                ));
+            } else {
+                match entry.split_once(':') {
+                    Some((host, port)) => (host.trim(), port.trim()),
+                    None => (entry, default_port),
+                }
             };
             if host.is_empty() {
                 return Err(error::fmt!(
