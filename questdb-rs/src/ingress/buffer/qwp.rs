@@ -2427,6 +2427,11 @@ struct QwpWsTableBuffer {
 #[derive(Clone, Debug)]
 struct QwpWsColumnBuffer {
     name: Vec<u8>,
+    /// Exact bytes of `name` packed little-endian into a `u64` when
+    /// `name.len() <= 8`, else `0` (same convention as
+    /// `QwpWsTableBuffer::packed_table_name`). Used by the
+    /// expected-next-column fast path in `lookup_column`.
+    packed_exact_name: u64,
     lower_name: Vec<u8>,
     packed_lower_ascii_name: u64,
     name_is_ascii: bool,
@@ -3750,8 +3755,34 @@ impl QwpWsTableBuffer {
         self.rebuild_column_lookup();
     }
 
+    /// Resolves `name` to this table's column index.
+    ///
+    /// Fast path: rows virtually always append columns in the same order,
+    /// so the expected next column (`column_access_cursor`, advanced past
+    /// each appended column and reset to 0 when a row starts) is checked
+    /// first with an exact-byte comparison — no ascii scan, no
+    /// lowercasing. Exact equality implies case-insensitive equality, so a
+    /// hit always resolves to the same column the case-insensitive map
+    /// probe would return. Any mismatch (case-variant spelling, sparse /
+    /// reordered rows, a brand-new column) takes the slow path below,
+    /// which stays authoritative — merely slower, never different.
     #[inline(always)]
     fn lookup_column(&mut self, name: &[u8]) -> crate::Result<Option<usize>> {
+        if let Some(column) = self.columns.get(self.column_access_cursor)
+            && names_equal_packed(&column.name, column.packed_exact_name, name)
+        {
+            return Ok(Some(self.column_access_cursor));
+        }
+        self.lookup_column_slow(name)
+    }
+
+    /// Case-insensitive column resolution: a lowercase re-check of the
+    /// cursor column (callers that consistently pass a case-variant
+    /// spelling still get the cursor hit), then the lowercased hash-map
+    /// probe. Kept out of line so the hot append path only inlines the
+    /// exact-byte cursor check.
+    #[inline(never)]
+    fn lookup_column_slow(&mut self, name: &[u8]) -> crate::Result<Option<usize>> {
         let name_is_ascii = name.is_ascii();
         if name_is_ascii
             && self.column_access_cursor < self.columns.len()
@@ -3809,6 +3840,7 @@ impl QwpWsColumnBuffer {
         let name_is_ascii = name.is_ascii();
         Self {
             name: name.to_vec(),
+            packed_exact_name: packed_name(name),
             lower_name: lowercase_name_bytes(name, name_is_ascii),
             packed_lower_ascii_name: if name_is_ascii {
                 packed_lower_ascii_name(name)
@@ -10646,6 +10678,79 @@ mod tests {
             .unwrap()
             .at_now()
             .unwrap();
+
+        let mut row_log_scratch = QwpWsEncodeScratch::new();
+        let mut row_log_dict = SymbolGlobalDict::new();
+        row_log
+            .encode_ws_replay_message(&mut row_log_scratch, &mut row_log_dict, QWP_VERSION_1)
+            .unwrap();
+
+        let mut columnar_scratch = QwpWsEncodeScratch::new();
+        let mut columnar_dict = SymbolGlobalDict::new();
+        columnar
+            .encode_ws_replay_message(&mut columnar_scratch, &mut columnar_dict, QWP_VERSION_1)
+            .unwrap();
+
+        assert_eq!(columnar_scratch.message, row_log_scratch.message);
+    }
+
+    /// Rows that revisit columns out of creation order, or skip some, must
+    /// defeat the expected-next-column cursor and still resolve via the
+    /// fallback map probe to byte-identical output. (Case-variant spellings
+    /// also miss the exact-byte cursor check; their columnar resolution is
+    /// covered by `qwp_ws_columnar_column_identity_is_case_insensitive` —
+    /// they can't appear here because the row-log reference buffer keys
+    /// columns case-sensitively.)
+    #[cfg(feature = "_sender-qwp-ws")]
+    #[test]
+    fn qwp_ws_columnar_reordered_rows_match_row_log_bytes() {
+        let mut row_log = QwpBuffer::new(127);
+        let mut columnar = QwpWsColumnarBuffer::new(127);
+
+        fn rows<B>(
+            table: &mut impl FnMut(&mut B) -> crate::Result<()>,
+            i64_col: &mut impl FnMut(&mut B, &str, i64) -> crate::Result<()>,
+            str_col: &mut impl FnMut(&mut B, &str, &str) -> crate::Result<()>,
+            at: &mut impl FnMut(&mut B, i64) -> crate::Result<()>,
+            buffer: &mut B,
+        ) -> crate::Result<()> {
+            // Row 1 creates a, b, c in order; row 2 walks them backwards
+            // (every append misses the cursor and resyncs it via the map);
+            // row 3 is sparse and out of order (skips a and c).
+            table(buffer)?;
+            i64_col(buffer, "a", 10)?;
+            i64_col(buffer, "b", 11)?;
+            str_col(buffer, "c", "n1")?;
+            at(buffer, 12)?;
+
+            table(buffer)?;
+            str_col(buffer, "c", "n2")?;
+            i64_col(buffer, "b", 21)?;
+            i64_col(buffer, "a", 20)?;
+            at(buffer, 22)?;
+
+            table(buffer)?;
+            i64_col(buffer, "b", 31)?;
+            at(buffer, 32)?;
+            Ok(())
+        }
+
+        rows(
+            &mut |b: &mut QwpBuffer| b.table("audit").map(drop),
+            &mut |b: &mut QwpBuffer, name, v| b.column_i64(name, v).map(drop),
+            &mut |b: &mut QwpBuffer, name, v| b.column_str(name, v).map(drop),
+            &mut |b: &mut QwpBuffer, ts| b.at(TimestampNanos::new(ts)),
+            &mut row_log,
+        )
+        .unwrap();
+        rows(
+            &mut |b: &mut QwpWsColumnarBuffer| b.table("audit").map(drop),
+            &mut |b: &mut QwpWsColumnarBuffer, name, v| b.column_i64(name, v).map(drop),
+            &mut |b: &mut QwpWsColumnarBuffer, name, v| b.column_str(name, v).map(drop),
+            &mut |b: &mut QwpWsColumnarBuffer, ts| b.at(TimestampNanos::new(ts)),
+            &mut columnar,
+        )
+        .unwrap();
 
         let mut row_log_scratch = QwpWsEncodeScratch::new();
         let mut row_log_dict = SymbolGlobalDict::new();
