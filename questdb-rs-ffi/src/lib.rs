@@ -2763,8 +2763,9 @@ pub unsafe extern "C" fn line_sender_opts_password(
     unsafe { upd_opts!(opts, err_out, password, password.as_str()) }
 }
 
-/// Set the Token (Bearer) Authentication parameter for HTTP,
-/// or the ECDSA private key for TCP authentication.
+/// Set the bearer-token authentication parameter for HTTP or QWP/WebSocket,
+/// which requires QuestDB Enterprise, or set the ECDSA private key for TCP
+/// authentication.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn line_sender_opts_token(
     opts: *mut line_sender_opts,
@@ -3707,8 +3708,8 @@ pub const qwpws_ack_level_durable: u32 = 1;
 ///
 /// `timeout_millis` is a no-progress deadline (it fires only if the ack
 /// watermark fails to advance for that long); `0` waits indefinitely.
-/// `qwpws_ack_level_durable` requires the sender to be opened with
-/// `request_durable_ack=on`; otherwise this returns
+/// `qwpws_ack_level_durable` requires QuestDB Enterprise and the sender to be
+/// opened with `request_durable_ack=on`; otherwise this returns
 /// `line_sender_error_invalid_api_call` even when nothing has been published.
 ///
 /// Returns `true` once the boundary is acknowledged. Returns `false` and sets

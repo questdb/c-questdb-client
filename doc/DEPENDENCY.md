@@ -10,14 +10,14 @@ how we tag releases.
 
 We do not ship binaries.
 
-Instead you should rely on a copy of the code sync'ed up
-to the latest annotated tag. You can find the list of tags on
-the [project's GitHub tag page](../tags) or by listing the annotated tags in git
-from a checked out copy of the code.
+Instead, pin a copy of the source to a release tag. Releases use lightweight
+tags. You can find them on the
+[project's GitHub tag page](https://github.com/questdb/c-questdb-client/tags)
+or list them from a checked-out copy of the repository.
 
 ```bash
 # Following a git clone of https://github.com/questdb/c-questdb-client.git
-git tag -n99 --sort=-creatordate
+git tag --sort=-version:refname
 ```
 
 Examples below will use a dummy name of `CHOSEN_RELEASE_TAG` that you will have
@@ -38,16 +38,19 @@ project.
 In all examples below, we will attempt to compile:
 
 ```cpp
-// main.cpp
-#include <questdb/ingress/line_sender.hpp>
+`// main.cpp
+#include <questdb/ingress/column_sender.hpp>
 
 int main()
 {
-    auto sender = questdb::ingress::line_sender::from_conf(
-        "http::addr=localhost:9000;");
+    questdb::pool db{"ws::addr=localhost:9000;"};
     return 0;
-}
+}`
 ```
+
+QWP/WebSocket requires QuestDB 10.0 or newer. The pool constructor performs no
+blocking network I/O; connections are opened when a sender or reader is first
+borrowed.
 
 ## Option 1: CMake & FetchContent integration
 

@@ -2,6 +2,7 @@
 name = "questdb-rs-ffi"
 version = "7.0.0"
 edition = "2024"
+rust-version = "1.91.1"
 publish = false
 
 [lib]

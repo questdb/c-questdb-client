@@ -11,7 +11,7 @@
 //! Both directions run concurrently against one pool, which is the intended
 //! deployment shape: one pool per process, a borrow per unit of work.
 //!
-//! Run against a local QuestDB (9.4.3+):
+//! Run against a local QuestDB (10.0+):
 //!
 //! ```sh
 //! cargo run --release --example qwp_ws_chunk_and_query \

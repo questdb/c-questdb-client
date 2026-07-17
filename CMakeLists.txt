@@ -325,6 +325,9 @@ if (QUESTDB_TESTS_AND_EXAMPLES)
     compile_example(
         reader_c_example_arrow
         examples/reader_c_example_arrow.c)
+    compile_example(
+        qwp_ws_chunk_and_query_c_example
+        examples/qwp_ws_chunk_and_query_c_example.c)
     find_package(Threads REQUIRED)
     compile_example(
         qwp_ws_chunk_and_query_cpp_example

@@ -12,7 +12,7 @@
 // Both directions run concurrently against one pool, which is the intended
 // deployment shape: one pool per process, a borrow per unit of work.
 //
-// Run against a local QuestDB (9.4.3+):
+// Run against a local QuestDB (10.0+):
 //
 //     ./qwp_ws_chunk_and_query_cpp_example
 //
@@ -43,7 +43,7 @@ using namespace std::chrono_literals;
 
 /// Separate caps for the two pools: this process holds at most one sender and
 /// one reader borrow at a time, plus headroom for the main thread's DDL.
-constexpr std::string_view CONF =
+constexpr std::string_view DEFAULT_CONF =
     "ws::addr=localhost:9000;sender_pool_max=2;query_pool_max=2;";
 
 constexpr std::string_view TABLE = "cpp_shared_pool_trades";
@@ -321,14 +321,15 @@ void follow_trades(questdb::pool& db)
 
 } // namespace
 
-int main()
+int main(int argc, const char* argv[])
 {
     try
     {
         // The pool is thread-safe for borrow/return while this owner is alive,
         // and it is declared before the workers: a future's destructor joins
         // its thread, so every borrow is released before the pool is destroyed.
-        questdb::pool db{CONF};
+        const std::string_view conf = argc >= 2 ? argv[1] : DEFAULT_CONF;
+        questdb::pool db{conf};
 
         recreate_table(db);
 

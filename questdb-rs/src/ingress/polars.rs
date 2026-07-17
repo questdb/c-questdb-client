@@ -372,10 +372,12 @@ impl<'a> PolarsIngestOptions<'a> {
     /// Block each checkpoint (and the trailing commit) until the frame reaches
     /// `level`. Defaults to the connect string's level — the same one the
     /// store-and-forward senders use:
-    /// [`AckLevel::Durable`](crate::ingress::AckLevel::Durable) when
+    /// [`AckLevel::Durable`](crate::ingress::AckLevel::Durable) when the
+    /// Enterprise-only durable mode is enabled with
     /// `request_durable_ack=on`, otherwise
     /// [`AckLevel::Ok`](crate::ingress::AckLevel::Ok). Requesting `Durable`
-    /// without `request_durable_ack=on` is rejected with
+    /// requires QuestDB Enterprise and `request_durable_ack=on`; otherwise it
+    /// is rejected with
     /// [`ErrorCode::InvalidApiCall`](crate::ErrorCode::InvalidApiCall).
     #[must_use]
     pub fn ack_level(mut self, level: crate::ingress::AckLevel) -> Self {
@@ -488,13 +490,12 @@ impl crate::db::QuestDb {
     /// unchanged from the underlying driver: the call owns the commit (the
     /// replay boundary), re-driving the uncommitted tail onto a live endpoint
     /// across a transient [`ErrorCode::FailoverRetry`] within the pool's
-    /// [`ReconnectPolicy`] budget, and returns only once the whole `df` is
+    /// configured reconnect budget, and returns only once the whole `df` is
     /// committed. A re-driven tail can produce **duplicate rows** unless the
     /// destination table has `DEDUP UPSERT KEYS` covering them.
     ///
     /// [`TableName`]: crate::ingress::TableName
     /// [`ErrorCode::FailoverRetry`]: crate::ErrorCode::FailoverRetry
-    /// [`ReconnectPolicy`]: crate::ingress::ReconnectPolicy
     pub fn flush_polars_dataframe<'t, T>(
         &self,
         table: T,

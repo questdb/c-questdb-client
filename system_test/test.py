@@ -1858,6 +1858,32 @@ class TestQwpWsSender(QwpWsTestSupport, unittest.TestCase):
             expected_min_id=0,
             expected_max_id=self.ROWS - 1)
 
+    def test_native_shared_pool_examples(self):
+        if QWP_WS_SMOKE_TLS or getattr(QDB_FIXTURE, 'http_auth', False):
+            self.skipTest('native pool examples run once against the plain fixture')
+        fixture_root = getattr(QDB_FIXTURE, '_root_dir', None)
+        if fixture_root is not None and fixture_root.name != 'repo':
+            if QDB_FIXTURE.version < (10, 0, 0):
+                self.skipTest('native shared-pool examples require QuestDB 10.0+')
+
+        project = Project()
+        extension = '.exe' if sys.platform == 'win32' else ''
+        conf = (
+            f'ws::addr={QDB_FIXTURE.host}:{QDB_FIXTURE.http_server_port};'
+            'sender_pool_max=2;query_pool_max=2;')
+
+        for binary_name in (
+                'qwp_ws_chunk_and_query_c_example',
+                'qwp_ws_chunk_and_query_cpp_example'):
+            try:
+                binary = next(
+                    project.build_dir.glob(f'**/{binary_name}{extension}'))
+            except StopIteration:
+                raise RuntimeError(
+                    f'Could not find {binary_name}{extension} '
+                    f'in {project.build_dir}')
+            subprocess.check_call([str(binary), conf], cwd=binary.parent)
+
 
 class TestQwpWsProtocol(QwpWsTestSupport, unittest.TestCase):
     def setUp(self):

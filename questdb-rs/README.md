@@ -1,6 +1,6 @@
 # QuestDB Client Library for Rust
 
-Official Rust client for [QuestDB](https://questdb.io/), an open-source SQL
+Official Rust client for [QuestDB](https://questdb.com/), an open-source SQL
 database designed to process time-series data, faster.
 
 The client library is designed for fast ingestion of data into QuestDB, and
@@ -9,18 +9,23 @@ for querying it back out.
 Its centrepiece is the **QuestDB Wire Protocol (QWP)** over WebSocket:
 QuestDB's native binary columnar protocol, covering both directions. Writes
 are acknowledged per flush and go through [`QuestDb`] — a thread-safe
-connection pool with automatic reconnect and failover — as rows, columns,
-Apache Arrow `RecordBatch`es or Polars `DataFrame`s. Queries stream SQL
-result sets back over the same protocol as columnar batches, `RecordBatch`es
-or `DataFrame`s.
+connection pool with automatic reconnect — as rows, columns, Apache Arrow
+`RecordBatch`es or Polars `DataFrame`s.
+Multi-endpoint failover requires QuestDB Enterprise. Queries stream result
+sets back over the same protocol as columnar batches, `RecordBatch`es or
+`DataFrame`s.
 
 The InfluxDB Line Protocol (ILP) over HTTP or TCP, and QWP over UDP, are
 also supported for ingestion.
 
 [`QuestDb`]: https://docs.rs/questdb-rs/latest/questdb/struct.QuestDb.html
 
-* [QuestDB Database docs](https://questdb.io/docs/)
-* [Docs on InfluxDB Line Protocol](https://questdb.io/docs/reference/api/ilp/overview/)
+* [Rust client guide](https://questdb.com/docs/ingestion/clients/rust/)
+* [Repository compatibility matrix](../doc/COMPATIBILITY.md)
+* [InfluxDB Line Protocol reference](https://questdb.com/docs/reference/api/ilp/overview/)
+
+Version 7.0.0 requires Rust 1.91.1. QWP over WebSocket requires QuestDB 10.0
+or newer.
 
 ## Transports
 
@@ -29,10 +34,11 @@ The transport is selected by the scheme in the configuration string:
 * `ws::addr=...` / `wss::addr=...` (also `ws::` / `wss::`) — QWP over
   WebSocket, in both directions. For ingestion (`QuestDb::connect`): binary
   columnar frames with per-flush acknowledgements, a thread-safe connection
-  pool with automatic reconnect/failover, and row, column, Arrow
-  `RecordBatch` and Polars `DataFrame` input. For queries
+  pool with automatic reconnect, and row, column, Arrow `RecordBatch` and
+  Polars `DataFrame` input. Multi-endpoint failover requires QuestDB
+  Enterprise. For queries
   (`Reader::from_conf` or `QuestDb::borrow_reader`): SQL execution with
-  results streamed back as columnar batches. Requires QuestDB 9.4.3+.
+  results streamed back as columnar batches. Requires QuestDB 10.0+.
 * `http::addr=...` / `https::addr=...` — ILP request-response, errors
   returned to the client, supports authentication and TLS.
 * `tcp::addr=...` / `tcps::addr=...` — ILP streaming, legacy; errors cause
@@ -73,7 +79,7 @@ cargo add questdb-rs
 
 ### QWP: the `QuestDb` connection pool
 
-`QuestDb` is the entry point for QWP/WebSocket (QuestDB 9.4.3+): one
+`QuestDb` is the entry point for QWP/WebSocket (QuestDB 10.0+): one
 thread-safe pool covering both writes and reads. A Polars round trip (with
 the `polars` feature):
 
@@ -107,8 +113,9 @@ The pool's main handles:
   columnar `Chunk`; the same lease also accepts Arrow batches.
 * `db.borrow_reader()` — run SQL and stream the result set back.
 
-Handles return to the pool on drop; the pool reconnects and fails over
-across `addr=host-a:9000,host-b:9000` endpoint lists transparently.
+Handles return to the pool on drop, and the pool reconnects to the configured
+endpoint transparently. With QuestDB Enterprise it also fails over across
+`addr=host-a:9000,host-b:9000` endpoint lists.
 
 A standalone `Reader::from_conf("ws::addr=...")` gives the query side
 without a pool (`sync-reader-qwp-ws` feature), yielding results as native
@@ -146,11 +153,12 @@ fn main() -> Result<()> {
 
 ## Docs
 
-Most of the client documentation is on the
-[`ingress`](https://docs.rs/questdb-rs/7.0.0/questdb/ingress/) module page
-for writing data, and the
-[`egress`](https://docs.rs/questdb-rs/7.0.0/questdb/egress/) module page for
-querying it back.
+Use the [QuestDB Rust client guide](https://questdb.com/docs/ingestion/clients/rust/)
+for task-oriented documentation. The exact API contract is on docs.rs: start
+with [`QuestDb`](https://docs.rs/questdb-rs/latest/questdb/struct.QuestDb.html),
+then see the
+[`ingress`](https://docs.rs/questdb-rs/latest/questdb/ingress/) and
+[`egress`](https://docs.rs/questdb-rs/latest/questdb/egress/) modules.
 
 ## Examples
 
@@ -165,6 +173,7 @@ A selection of usage examples is available in the [examples directory](https://g
 | [`from_env.rs`](https://github.com/questdb/c-questdb-client/blob/7.0.0/questdb-rs/examples/from_env.rs) | Reads config from `QDB_CLIENT_CONF` environment variable. |
 | [`http.rs`](https://github.com/questdb/c-questdb-client/blob/7.0.0/questdb-rs/examples/http.rs) | Uses HTTP transport and demonstrates array ingestion with `ndarray`. |
 | [`protocol_version.rs`](https://github.com/questdb/c-questdb-client/blob/7.0.0/questdb-rs/examples/protocol_version.rs) | Shows protocol version selection and feature differences (e.g. arrays). |
+| [`qwp_ws_chunk_and_query.rs`](https://github.com/questdb/c-questdb-client/blob/7.0.0/questdb-rs/examples/qwp_ws_chunk_and_query.rs) | Shares one `QuestDb` pool between concurrent columnar ingestion and query workers. |
 | [`qwp_ws_l1_quotes.rs`](https://github.com/questdb/c-questdb-client/blob/7.0.0/questdb-rs/examples/qwp_ws_l1_quotes.rs) | Columnar ingestion over QWP/WebSocket via the `QuestDb` connection pool. |
 | [`qwp_egress_read.rs`](https://github.com/questdb/c-questdb-client/blob/7.0.0/questdb-rs/examples/qwp_egress_read.rs) | Runs a SQL query and streams the result set over QWP/WebSocket. |
 | [`polars.rs`](https://github.com/questdb/c-questdb-client/blob/7.0.0/questdb-rs/examples/polars.rs) | Round trip: ingests a Polars `DataFrame` and queries it back as one. |

@@ -1,152 +1,102 @@
-# Considerations
+# Operational considerations
 
-## Threading
+The client supports ILP over TCP/HTTP and QWP over UDP/WebSocket. Their
+delivery, threading, and error contracts differ; choose a transport based on
+the guarantee your application needs.
 
-By design, the sender and buffer objects perform all operations on the current
-thread. The library will not spawn any threads internally.
+## Threading and ownership
 
-By constructing multiple buffers you can design your application to build ILP
-messages on multiple threads whilst handling network connectivity in a separate
-part of your application on a different thread (for example by passing buffers
-that need sending over a concurrent queue and sending flushed buffers back over
-another queue).
+| Object | Concurrent-use contract |
+| --- | --- |
+| `questdb_db` / C++ `questdb::pool` / Rust `QuestDb` | Thread-safe for borrow, return, and reap while the owning pool remains open |
+| Borrowed QWP sender | Single-threaded; keep it on the borrowing thread until it is returned or dropped |
+| Reader, query, cursor, or batch handle | One thread at a time; a reader may move between threads when no operation overlaps |
+| Row sender and buffer | One thread at a time |
+| Column chunk | One thread at a time; referenced column arrays must remain valid until the flush call returns |
 
-Buffer and sender objects don't use any locks, so it's down to you to ensure
-that a single thread owns a buffer or sender at any given point in time.
+Use one long-lived pool per process or service and take short-lived sender or
+reader borrows per unit of work. Do not close the pool while another thread is
+borrowing, returning, reaping, or otherwise using the owner handle. Existing
+borrows become detached leases after close and must still be returned or
+dropped, but cannot start new operations.
 
-## Data Types
+The pool does create internal threads by default:
 
-The ILP protocol has its own set of data types which is smaller
-that the set supported by QuestDB.
-We map these types into QuestDB types and perform conversions
-as necessary wherever possible.
+- each active QWP/WebSocket store-and-forward sender may drive delivery in the
+  background;
+- `pool_reap=auto` runs a reaper for idle pooled connections; and
+- configured connection/rejection callbacks are dispatched outside the
+  caller's critical path.
 
-Strings may be recorded as either the `STRING` type or the `SYMBOL` type.
+Applications that cannot host those threads can select manual QWP progress and
+`pool_reap=manual`, then call the documented drive and reap APIs regularly.
+Manual progress changes when connection failures and server rejections become
+observable, so it must be integrated into the application's event loop.
 
-`SYMBOL`s are strings with which are automatically
-[interned](https://en.wikipedia.org/wiki/String_interning) by the database on a
-per-column basis.
-You should use this type if you expect the string to be re-used over and over.
-This is common for identifiers, etc.
+## Delivery semantics
 
-For one-off strings use `STRING` columns which aren't interned.
+| Transport | What a successful flush means | Server feedback |
+| --- | --- | --- |
+| ILP/HTTP(S) | The HTTP write request succeeded | HTTP status and response body report ingestion errors |
+| ILP/TCP(S) | Bytes were written to the connection | No per-batch acknowledgement; inspect server logs after disconnects |
+| QWP/UDP | Datagrams were handed to the local socket | No acknowledgement; datagrams may be lost, reordered, or partly delivered |
+| QWP/WebSocket | The frame was published to the local store-and-forward queue | FSN progress, `ok` ACK barriers, Enterprise `durable` ACK barriers, and structured rejection events |
 
-For more details see our
-[datatypes](https://questdb.io/docs/reference/sql/datatypes) page.
+For QWP/WebSocket, `flush` is a local publication boundary, not a server
+acknowledgement. Use `flush_and_wait` or `wait` when the caller needs a barrier:
 
-## Data quality considerations
+- `ok` waits until the server accepts every frame published through that
+  sender up to the captured frame-sequence boundary;
+- `durable` requires QuestDB Enterprise, waits for the server's durable
+  watermark, and requires the pool to be configured with
+  `request_durable_ack=on`; and
+- neither ACK guarantees that a WAL table row is immediately query-visible.
+  WAL application remains asynchronous, so read-after-write workflows should
+  poll or otherwise wait for visibility.
 
-When inserting data through the API, you must follow a set of considerations.
+ACK timeouts are no-progress deadlines. Published frames remain owned by the
+store-and-forward queue and may continue through reconnect and replay.
+Transient connection failures and retriable server states are retried;
+terminal schema, parse, security, or protocol rejections make that sender
+unusable and must be handled explicitly.
 
-### Library-validated considerations
+Returning a borrowed QWP sender does not discard already-published frames. For
+in-memory store-and-forward, pool shutdown drains best-effort within
+`close_flush_timeout`; call `wait` before close when delivery must be confirmed,
+or configure `sf_dir` for crash-recoverable disk-backed replay. Never assume
+that destroying an unflushed row buffer or column chunk publishes its contents.
 
-* Strings and symbols must be passed in as valid UTF-8 which
-  need not be nul-terminated.
-* Table names and column names must conform to valid names as accepted by the
-  database (see `isValidTableName` and `isValidColumnName` in the QuestDB java
-  [codebase](https://github.com/questdb/questdb) for details).
-* Each row should contain, *in order*:
-  * table name
-  * at least one of:
-    * symbols, zero or more
-    * columns, zero or more
-  * [designated timestamp](https://questdb.io/docs/concept/designated-timestamp/),
-    optionally
+## Buffering and backpressure
 
-Breaking these rules above will result in a runtime error in the client library.
+Batch rows and flush periodically based on elapsed time and data volume.
+Flushing every row increases overhead, while unbounded buffers increase memory
+use and recovery time.
 
-Errors are reported via:
-* `Result` type in Rust.
-* An "out" pointer in C.
-* An exception in C++.
+For ILP, the buffer length is the exact pending encoded byte length. For
+QWP/UDP it is a size hint rather than an eventual datagram size. QWP/WebSocket
+column and row senders encode frames at publication time and apply their own
+store-and-forward limits.
 
-### Additional considerations
+Pool limits (`sender_pool_max`, `query_pool_max`) bound concurrent connections.
+At capacity, borrow operations wait up to `acquire_timeout_ms` or fail
+immediately when it is zero. Keep borrows short and size these limits against
+both application concurrency and server connection capacity.
 
-Additionally you should also ensure that:
+## Data types and validation
 
-* For a given row, a column name should not be repeated.
-  If it's repeated, only the first value will be kept.
-  This also applies to symbols.
-* Values for a given column should always have the same type.
-  If changing types the whole row will be dropped (unless we can cast).
-* The timestamp column should be written out through the provided
-  `line_sender_buffer_at_*` functions (in C) or or `.at()` method in (C++ and
-  Rust).
-  It is also possible to write out additional timestamps values
-  as columns.
+Names and string values must be valid UTF-8; C APIs take explicit lengths and
+do not require NUL termination. Table and column names must satisfy QuestDB's
+naming rules. Keep a column's type consistent across rows.
 
-The client library will not check any of these types of data issues.
+For ILP row ingestion, symbols must be added before fields and the designated
+timestamp ends a row. Prefer `SYMBOL` for frequently repeated categorical
+values and `STRING`/`VARCHAR` for free-form text. The QWP column APIs support a
+broader native type set, dictionary-encoded symbols, arrays, and Arrow/Polars
+paths; validate equal row counts and keep all borrowed input arrays alive until
+the flush returns.
 
-### Flushing
-
-The API doesn't send any data over the network until you call `flush()`.
-
-You may not see data appear in a timely manner because you’re not calling
-`flush()` often enough.
-
-It's recommended you maintain a maxium buffer size and/or timer to determine how
-often to flush.
-
-Flushing too often may also degrade performance.
-
-To determine the buffer size, call:
-* C: `line_sender_buffer_size(..)`
-* C++: `buffer.size()`
-* Rust: `buffer.len()`
-
-For ILP buffers this is the exact pending byte length. For QWP buffers this is
-a buffered size hint rather than the exact size of any eventual UDP datagram.
-
-*Closing the connection will not auto-flush.*
-
-### Disconnections, Data Errors and troubleshooting
-
-#### ILP/HTTP
-
-When using ILP/HTTP, server errors are reported back to the client from
-`flush` calls.
-
-#### ILP/TCP
-
-When using ILP/TCP, errors which cause disconnects can be found
-in the QuestDB server logs.
-
-When using TCP, failure when flushing data gerally indicates that the network
-connection was dropped.
-
-The ILP over TCP protocol does not send errors back to the client.
-Instead, by design, it will disconnect a client if it encounters any insertion
-errors. This is to avoid errors going unnoticed.
-
-As an example, if a client were to insert a `STRING` value into a `BOOLEAN`
-column, the QuestDB server would disconnect the client.
-
-To determine the root cause of a disconnect, inspect the
-[server logs](https://questdb.io/docs/troubleshooting/log/).
-
-#### QWP/UDP
-
-QWP/UDP is a best-effort datagram transport and provides **no
-acknowledgements**. A successful return from `flush` only means the datagrams
-were handed to the operating system — it is not a confirmation that the
-server received or accepted them. Datagrams may be lost or reordered by the
-network or dropped by the server if its receive buffers fill up.
-
-There are also **no transactional guarantees**. A single `flush` can produce
-multiple datagrams, and each is delivered independently — the server may
-apply some and miss others.
-
-When rows do not appear server-side, inspect the
-[server logs](https://questdb.io/docs/troubleshooting/log/) and confirm that
-`qwp.udp.enabled=true` (and the matching bind address) are set on the
-server. The Rust module docs for `Protocol::Udp` cover the full set of
-configuration parameters and their semantics.
-
-You can inspect the contents of a constructed buffer at any time calling:
-* C: `line_sender_buffer_peek`
-* C++: `buffer.peek()`
-* Rust: `buffer.as_bytes()` (wrap in `std::str::from_utf8(..)` for ILP)
-
-This byte-level inspection is only meaningful for ILP buffers. QWP buffers are
-encoded into UDP datagrams during `flush`, so `peek` / `as_bytes` are not
-useful there — `as_bytes` returns an empty slice for QWP buffers.
+Client-side validation failures are returned as Rust `Result` errors, C error
+out-pointers, or C++ exceptions. Server-side data errors follow the transport
+contracts above. See the [QuestDB data type reference](https://questdb.com/docs/reference/sql/datatypes/)
+and [server logs](https://questdb.com/docs/troubleshooting/log/) when diagnosing
+rejected or disconnected writes.

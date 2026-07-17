@@ -53,7 +53,8 @@ stages:
               JAVA_HOME: $(JAVA_HOME_25_X64)
             displayName: "Unit tests"
           # Build QuestDB master for run_all_tests.py's `--repo ./questdb`.
-          # Drop once QWP/Arrow ships in a release (revert to `--versions`).
+          # Keep source-checkout coverage after QWP ships; add a separate
+          # `--versions` gate for the exact QuestDB 10.0 release artifact.
           - template: templates/clone_questdb.yaml
           - task: Maven@3
             displayName: "Compile QuestDB"
@@ -140,6 +141,33 @@ stages:
             submodules: false
           - script: python3 ci/run_version_matrix.py
             displayName: "questdb-rs: pinned arrow/polars versions"
+      - job: RustMsrvAndDocs
+        displayName: "Rust MSRV and release documentation"
+        pool:
+          vmImage: "ubuntu-latest"
+        timeoutInMinutes: 45
+        steps:
+          - checkout: self
+            fetchDepth: 1
+            lfs: false
+            submodules: false
+          - script: rustup toolchain install 1.91.1 --profile minimal
+            displayName: "Install Rust 1.91.1"
+          - script: |
+              cargo +1.91.1 check --manifest-path questdb-rs/Cargo.toml
+              cargo +1.91.1 check --manifest-path questdb-rs/Cargo.toml \
+                --features almost-all-features,arrow,polars
+              cargo +1.91.1 check \
+                --manifest-path questdb-rs-ffi/Cargo.toml --all-features
+            displayName: "Check advertised features at the MSRV"
+          - script: |
+              cargo +1.91.1 doc --manifest-path questdb-rs/Cargo.toml \
+                --no-deps --features almost-all-features,arrow,polars
+            env:
+              RUSTDOCFLAGS: "-D warnings"
+            displayName: "Build docs.rs feature set with warnings denied"
+          - script: python3 ci/check_docs.py
+            displayName: "Check release documentation"
       - job: FormatAndLinting
         displayName: "cargo fmt and clippy"
         pool:

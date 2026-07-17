@@ -1514,7 +1514,7 @@ bool qwp_sender_flush_chunk(
  * `ack_level`.
  *
  * `ack_level` carries a `qwpws_ack_level_*` constant. It is validated before
- * `chunk` is encoded, so an out-of-range value, or
+ * `chunk` is encoded, so an out-of-range value, or the Enterprise-only
  * `qwpws_ack_level_durable` without `request_durable_ack=on`, returns
  * `line_sender_error_invalid_api_call` and leaves `chunk` untouched.
  *

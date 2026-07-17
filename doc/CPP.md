@@ -1,118 +1,98 @@
-# Getting Started with C++
+# Getting started with C++
 
-## Building and depending on this library
-* To begin with, we suggest first building the library to ensure you have all
-  the tooling and build dependencies set up just right by following the
-  [build instructions](BUILD.md)
-* Then read the guide for including this library as a
-  [dependency from your project](DEPENDENCY.md).
+The C++17 client is a header-only RAII wrapper over the C ABI. Its primary
+entry point is `questdb::pool`, one thread-safe QWP/WebSocket pool for both
+ingestion and queries. QWP over WebSocket requires QuestDB 10.0 or newer; the
+native library is built with Rust 1.91.1.
 
-## Complete Examples
+See the repository [compatibility matrix](COMPATIBILITY.md), then follow the
+[build](BUILD.md) and [dependency](DEPENDENCY.md) instructions.
 
-**Basic Usage**
-- [Basic example in C++](../examples/line_sender_cpp_example.cpp)
+## Build and run the shared-pool example
 
-**Authentication & Security**
-- [With authentication](../examples/line_sender_cpp_example_auth.cpp)
-- [With authentication and TLS](../examples/line_sender_cpp_example_auth_tls.cpp)
-- [Custom certificate authority file](../examples/line_sender_cpp_example_tls_ca.cpp)
+Start QuestDB 10.0+ on `localhost:9000`, then build the examples:
 
-**Configuration**
-- [Load configuration from file](../examples/line_sender_cpp_example_from_conf.cpp)
-- [Load configuration from environment](../examples/line_sender_cpp_example_from_env.cpp)
-
-**HTTP**
-- [Example using HTTP](../examples/line_sender_cpp_example_http.cpp)
-
-**QWP/UDP**
-- [Example using QWP/UDP](../examples/line_sender_cpp_example_udp.cpp)
-- [Batched QWP/UDP ingestion](../examples/line_sender_cpp_example_udp_batch.cpp)
-
-**Array Handling**
-- [Array with byte strides](../examples/line_sender_cpp_example_array_byte_strides.cpp)
-- [Array with element strides](../examples/line_sender_cpp_example_array_elem_strides.cpp)
-- [Array in C-major order](../examples/line_sender_cpp_example_array_c_major.cpp)
-- [Custom array type integration](../examples/line_sender_cpp_example_array_custom.cpp)
-
-**Decimal**
-- [Decimal in binary format](../examples/line_sender_cpp_example_decimal_binary.cpp)
-- [Custom decimal type integration](../examples/line_sender_cpp_example_decimal_custom.cpp)
-
-## Table and column auto-creation
-
-When you send data to a table that does not yet exist, QuestDB creates the table automatically and infers column types from the first row.
-The same applies to brand-new columns added to an existing table: most column types are created on the fly based on the values you send.
-Decimal columns are the main exception.
-
-Because the client cannot infer the desired scale and precision, QuestDB refuses to auto-create decimal columns.
-Define those columns ahead of time with an explicit `create table` (or `alter table add column`) statement before you start sending decimal values.
-
-## API Overview
-
-### Header
-
-* [`.hpp` header file](../include/questdb/ingress/line_sender.hpp)
-
-### Connnecting
-
-```cpp
-#include <questdb/ingress/line_sender.hpp>
-
-...
-
-auto sender = questdb::ingress::line_sender::from_conf(
-    "http::addr=localhost:9000;");
-
+```bash
+cmake -S . -B build \
+  -DCMAKE_BUILD_TYPE=Release \
+  -DQUESTDB_TESTS_AND_EXAMPLES=ON
+cmake --build build --target qwp_ws_chunk_and_query_cpp_example
+./build/qwp_ws_chunk_and_query_cpp_example
 ```
 
-See the main [client libraries](https://questdb.io/docs/reference/clients/overview/)
-documentation for the full config string params, including authentication, tls, etc.
+Multi-configuration generators may place the executable under
+`build/Release/`.
 
-You can also connect programmatically using the `questdb::ingress::opts` object.
+The complete, compiled source is
+[`examples/qwp_ws_chunk_and_query_cpp_example.cpp`](../examples/qwp_ws_chunk_and_query_cpp_example.cpp).
+It shares one pool between ingestion and query workers. Each worker owns its
+short-lived borrow, and RAII returns readers and senders to the pool.
 
-### Building Messages
-
-The `line_sender` object is responsible for connecting to the network and
-sending data.
-
-Use the `line_sender_buffer` type to construct messages (aka rows, aka records,
-aka lines).
-
-To avoid malformed messages, the `line_sender_buffer` object's methods
-must be called in a specific order.
-
-For each row, you need to specify a table name and at least one symbol or
-column. Symbols must be specified before columns.
-
-You can accumulate multiple lines (rows) with a given buffer and a buffer is
-re-usable, but a buffer may only be flushed via the sender after a call to
-`buffer.at(..)` (preferred) or `buffer.at_now()`.
+The essential ownership shape is:
 
 ```cpp
-questdb::ingress::line_sender_buffer buffer;
-buffer
-    .table("trades")
-    .symbol("symbol", "ETH-USD")
-    .column("price", "2615.54"_decimal)
-    .at(timestamp_nanos::now());
+#include <questdb/ingress/column_sender.hpp>
+#include <questdb/egress/reader.hpp>
 
-// To insert more records, call `buffer.table(..)...` again.
+questdb::pool db{"ws::addr=localhost:9000;"};
 
-sender.flush(buffer);
+{
+    auto sender = db.borrow_sender();
+    questdb::ingress::column_chunk chunk{"trades"};
+    // Append columns and a designated timestamp, then publish and wait.
+    sender.flush_and_wait(chunk, questdb::ingress::qwpws_ack_level::ok);
+}
+
+{
+    auto reader = db.borrow_reader();
+    auto cursor = reader.prepare("SELECT * FROM trades WHERE amount > $1")
+                      .bind_f64(0.001)
+                      .execute();
+    while (auto batch = cursor.next_batch()) {
+        // Read typed column views from *batch.
+    }
+}
 ```
 
-Diagram of valid call order of the buffer API.
+The full example contains error handling and valid backing buffers. A
+`column_chunk` borrows its column memory until `flush` returns, so those buffers
+must remain alive and unchanged across the call.
 
-![Sequential Coupling](../api_seq/seq.svg)
+## Threading, acknowledgement, and errors
 
-## Error handling
+- `questdb::pool` is thread-safe for borrow, return, and reap operations while
+  its owner remains alive.
+- `borrowed_sender`, `reader`, query, cursor, and `column_chunk` handles are
+  single-threaded. Give each worker its own borrow.
+- Returning a healthy sender parks it for reuse. A terminal or in-doubt sender
+  must be force-dropped as described by the API contract.
+- An `ok` acknowledgement means that the server accepted the frame. WAL apply
+  and query visibility occur asynchronously.
+- Fallible C++ calls throw `questdb::error`; `.code()` returns the unified
+  client error category and `.what()` returns the diagnostic.
 
-Note that most methods in C++ may throw `questdb::ingress::line_sender_error`
-exceptions. The C++ `line_sender_error` type inherits from `std::runtime_error`
-and you can obtain an error message description by calling `.what()` and an
-error code calling `.code()`.
+See [threading and delivery considerations](CONSIDERATIONS.md) for the complete
+protocol matrix and [authentication and TLS](SECURITY.md) for production
+connections.
 
-## Further Topics
+## More examples
 
-* [Data quality and threading considerations](CONSIDERATIONS.md)
-* [Authentication and TLS encryption](SECURITY.md)
+- [Query with bind variables](../examples/reader_cpp_example_with_binds.cpp)
+- [Read typed columns](../examples/reader_cpp_example_columns.cpp)
+- [Read through Arrow](../examples/reader_cpp_example_arrow.cpp)
+- [Ingest an Arrow batch](../examples/line_sender_cpp_example_arrow.cpp)
+- [Load a connection string](../examples/reader_cpp_example_from_conf.cpp)
+- [ILP authentication](../examples/line_sender_cpp_example_auth.cpp)
+- [ILP authentication with TLS](../examples/line_sender_cpp_example_auth_tls.cpp)
+- [Custom certificate authority](../examples/line_sender_cpp_example_tls_ca.cpp)
+- [QWP/UDP](../examples/line_sender_cpp_example_udp.cpp)
+
+The committed headers are the authoritative native API reference:
+
+- [`column_sender.hpp`](../include/questdb/ingress/column_sender.hpp)
+- [`reader.hpp`](../include/questdb/egress/reader.hpp)
+- [`line_sender.hpp`](../include/questdb/ingress/line_sender.hpp)
+
+For connection-string keys, QuestDB Enterprise multi-host failover,
+store-and-forward, and deployment guidance, use the public
+[C and C++ client guide](https://questdb.com/docs/ingestion/clients/c-and-cpp/).

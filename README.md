@@ -7,10 +7,11 @@ back out.
 The primary protocol is the **QuestDB Wire Protocol (QWP)** over WebSocket,
 QuestDB's native binary columnar format, used for both ingestion and queries.
 QWP traffic runs over a thread-safe connection pool (`QuestDb` in Rust,
-`questdb_db` in C/C++) with per-flush acknowledgements and automatic
-reconnect/failover across endpoints. You send rows, columns, Apache Arrow
-record batches or Polars DataFrames (Rust); SQL results stream back over the
-same pool in the same formats.
+`questdb_db` in C/C++) with per-flush acknowledgements and automatic reconnect.
+Multi-endpoint failover requires QuestDB Enterprise. You send rows, columns,
+Apache Arrow record batches or Polars DataFrames (Rust); SQL results stream
+back over the same pool in the same formats. QWP over WebSocket requires
+QuestDB 10.0 or newer.
 
 QWP also has a best-effort **UDP** transport for low-latency ingestion on
 trusted networks (batching is MTU-bounded).
@@ -23,10 +24,18 @@ trusted networks (batching is MTU-bounded).
   the C API.
 * Python bindings are available separately.
 
+## Compatibility
+
+The Rust and native clients require Rust 1.91.1 to build. The C and C++
+surfaces target C11 and C++17, with CMake 3.15 or newer. See the
+[compatibility matrix](doc/COMPATIBILITY.md) for server, toolchain, platform,
+Arrow, and Polars support.
+
 ## Inserting Data
 
 QWP/WebSocket is the main path, covered below. For cross-language code
-examples, see the [ingestion overview](https://questdb.io/docs/ingestion-overview/).
+and production configuration, see the
+[client documentation](https://questdb.com/docs/ingestion/overview/).
 QuestDB also accepts
 [CSV uploads](https://questdb.io/docs/reference/api/rest/#imp---import-data)
 and [PostgreSQL-wire](https://questdb.io/docs/reference/api/postgres/) inserts.
@@ -50,7 +59,7 @@ for the wire format.
 
 ## Writing and Querying
 
-One pool handle covers both directions (QuestDB 10.0+). In Rust:
+One pool handle covers both directions. In Rust:
 
 ```rust ignore
 let db = QuestDb::connect("ws::addr=localhost:9000;")?;
@@ -87,11 +96,13 @@ Read the language-specific guides:
 
 **C**
 * [Getting started with C](doc/C.md)
+* [Shared-pool ingestion and query example](examples/qwp_ws_chunk_and_query_c_example.c)
 * [`.h` header file](include/questdb/ingress/column_sender.h) (ingestion)
 * [`.h` header file](include/questdb/egress/reader.h) (queries)
 
 **C++**
 * [Getting started with C++](doc/CPP.md)
+* [Shared-pool ingestion and query example](examples/qwp_ws_chunk_and_query_cpp_example.cpp)
 * [`.hpp` header file](include/questdb/ingress/column_sender.hpp) (ingestion)
 * [`.hpp` header file](include/questdb/egress/reader.hpp) (queries)
 
@@ -109,6 +120,7 @@ Read the language-specific guides:
 
 ## Further Topics
 
+* [Documentation index](doc/README.md)
 * [Data quality and threading considerations](doc/CONSIDERATIONS.md)
 * [Authentication and TLS encryption](doc/SECURITY.md)
 * [QWP ingress and egress soak harness](doc/QWP_SOAK_HARNESS.md)

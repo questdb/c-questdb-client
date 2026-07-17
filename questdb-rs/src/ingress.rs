@@ -114,8 +114,11 @@ pub mod column_sender;
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum AckLevel {
+    /// Wait for the server to accept every published frame.
     #[default]
     Ok,
+    /// Wait for durable-ACK coverage. This level requires QuestDB Enterprise
+    /// and the `request_durable_ack=on` connection-string setting.
     Durable,
 }
 
@@ -1517,8 +1520,9 @@ impl SenderBuilder {
         Ok(self)
     }
 
-    /// Set the Token (Bearer) Authentication parameter for HTTP,
-    /// or the ECDSA private key for TCP authentication.
+    /// Set the bearer-token authentication parameter for HTTP or
+    /// QWP/WebSocket, which requires QuestDB Enterprise, or set the ECDSA
+    /// private key for TCP authentication.
     pub fn token(mut self, token: &str) -> Result<Self> {
         #[cfg(feature = "_sender-qwp-udp")]
         self.reject_if_qwp_udp("token")?;
@@ -1714,7 +1718,7 @@ impl SenderBuilder {
 
     #[cfg(feature = "_sender-qwp-ws")]
     /// Register a connection lifecycle listener: one
-    /// [`ConnectionEvent`](crate::ingress::ConnectionEvent) per
+    /// [`ConnectionEvent`] per
     /// connection-state transition of this sender's QWP/WebSocket
     /// connection (initial connect, per-endpoint attempt failures,
     /// disconnect, reconnect/failover, terminal auth rejection).

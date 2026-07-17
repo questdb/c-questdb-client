@@ -1,59 +1,73 @@
-# Connection Security
+# Connection security
 
-You may choose to enable authentication and/or TLS encryption by setting the
-appropriate properties on the `opts` (C and C++) or (`SenderBuilder` in Rust)
-object used for connecting.
+Use an encrypted transport whenever credentials or data cross an untrusted
+network. The configuration string selects both the wire protocol and its
+security properties.
 
-## Authentication
+## Authentication by transport
 
-We support QuestDB's ECDSA P256 SHA256 signing-based authentication.
+| Transport | Authentication | Configuration |
+| --- | --- | --- |
+| ILP/TCP(S) | ECDSA P-256/SHA-256 challenge signing | `username`, `token`, `token_x`, and `token_y` together |
+| ILP/HTTP(S) | HTTP Basic (OSS and Enterprise); bearer token (Enterprise) | `username` plus `password`, or `token` alone |
+| QWP/WebSocket(S) | HTTP Basic (OSS and Enterprise); bearer token (Enterprise) during WebSocket upgrade | `username` plus `password`, or `token` alone |
+| QWP/UDP | None | Authentication settings are rejected |
 
-To create your own keys, follow the QuestDB's
-[authentication documentation](https://questdb.io/docs/reference/api/ilp/authenticate/).
+Follow the [QuestDB Open Source authentication
+guide](https://questdb.com/docs/query/rest-api/#authentication-in-questdb-open-source)
+for HTTP Basic authentication or the [Enterprise RBAC authentication
+guide](https://questdb.com/docs/security/rbac/#authentication)
+for bearer tokens and OIDC. Do not combine the authentication forms for one
+connection, log configuration strings containing secrets, or commit
+credentials to source control. Prefer a secret manager or protected
+environment variable and restrict tokens to the intended environment.
 
-Authentication can be used independently of TLS encryption.
+Authentication does not encrypt traffic. Pair it with `tcps::`, `https::`, or
+`wss::` outside a trusted private network.
 
-## TLS Encryption
+## TLS
 
-As of writing, only QuestDB Enterprise can be configured to support TLS natively.
-If you're using the open source edition, you can still use TLS encryption by setting
-up [HAProxy](http://www.haproxy.org/) or other proxy
-to secure the connection for any public-facing servers.
+The secure schemes are:
 
-TLS can be used independently and provides no authentication itself.
+- `tcps::` for ILP/TCP;
+- `https::` for ILP/HTTP; and
+- `wss::` for QWP/WebSocket.
 
-The `tls_certs` directory of this project contains tests certificates, its
-[README](../tls_certs/README.md) page describes generating your own test certs.
+Certificate verification is enabled by default. `tls_ca` selects the trust
+source supported by the compiled feature set:
 
-A few important technical details on TLS:
-  * The libraries use the `rustls` Rust crate for TLS support.
-  * They also, by default, use the `webpki_roots` Rust crate for root certificate verification
-    which require no OS-specific configuration.
-  * Alternatively, If you want to use your operating system's root certificates,
-    you can do so calling the `tls_os_roots` method when building the "sender" object.
-    The latter is especially desireable in corporate environments where the certificates
-    are managed centrally.
+- `webpki_roots` for the bundled public WebPKI roots;
+- `os_roots` for the operating-system trust store;
+- `webpki_and_os_roots` for both; or
+- `pem_file`, with `tls_roots=/path/to/ca.pem`, for a custom CA bundle.
 
-For API usage:
-* Rust: `SenderBuilder`'s [`auth`](https://docs.rs/questdb-rs/7.0.0/questdb/ingress/struct.SenderBuilder.html#method.auth)
-  and [`tls`](https://docs.rs/questdb-rs/7.0.0/questdb/ingress/struct.SenderBuilder.html#method.tls) methods.
-* C: [examples/line_sender_c_example_auth.c](../examples/line_sender_c_example_auth.c)
-* C++: [examples/line_sender_cpp_example_auth.cpp](../examples/line_sender_cpp_example_auth.cpp)
+For QWP/WebSocket only, `tls_roots` may instead name a JKS or PKCS#12 trust
+store when `tls_roots_password` is supplied. ILP transports accept PEM custom
+roots only.
 
-## QWP/UDP security posture
+The Rust crate exposes trust sources according to its TLS features. The C ABI
+ships the configured Rust TLS implementation; native distributors can disable
+the certificate-verification escape hatch with
+`-DQUESTDB_ENABLE_INSECURE_SKIP_VERIFY=OFF`.
 
-The `udp::` transport carries **no authentication and no TLS**. UDP is
-connectionless, so the server cannot verify client identity at the protocol
-layer, and datagram contents travel unencrypted.
+`tls_verify=unsafe_off` disables certificate and hostname verification. It is
+available only when the `insecure-skip-verify` feature was compiled in and is
+intended for isolated diagnostics, not production. Install the relevant CA
+instead. The certificates under [`tls_certs`](../tls_certs/README.md) are test
+fixtures and must not be deployed as production trust material.
 
-Passing `username`, `password`, `token`, `token_x`, `token_y`, or
-`auth_timeout` to a `udp::` sender is rejected when the setting is applied,
-either while parsing a config string or while calling the corresponding builder
-method. The error names the unsupported setting, for example
-`The "username" setting is not supported for QWP/UDP.` There is no `udps://`
-(TLS) scheme.
+## QWP/UDP posture
 
-QWP/UDP is therefore intended for **trusted private networks only** —
-typically a co-located client and server, or a network segment under your
-administrative control. For public or untrusted networks, use ILP/HTTP with
-authentication and TLS.
+`udp::` provides neither authentication nor TLS and has no `udps::` form. Its
+datagrams are readable and forgeable by any party with network access, and the
+protocol cannot verify delivery. Use it only on a controlled, isolated network
+segment with appropriate host and network access controls. Use authenticated
+`wss::` or `https::` for public or otherwise untrusted paths.
+
+## Examples and API reference
+
+- Rust: [`SenderBuilder`](https://docs.rs/questdb-rs/latest/questdb/ingress/struct.SenderBuilder.html)
+- C: [`line_sender_c_example_auth.c`](../examples/line_sender_c_example_auth.c)
+  and [`line_sender_c_example_auth_tls.c`](../examples/line_sender_c_example_auth_tls.c)
+- C++: [`line_sender_cpp_example_auth.cpp`](../examples/line_sender_cpp_example_auth.cpp)
+  and [`line_sender_cpp_example_auth_tls.cpp`](../examples/line_sender_cpp_example_auth_tls.cpp)

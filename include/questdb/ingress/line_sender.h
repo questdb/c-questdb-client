@@ -1627,8 +1627,9 @@ bool line_sender_opts_password(
     line_sender_error** err_out);
 
 /**
- * Set the Token (Bearer) Authentication parameter for HTTP,
- * or the ECDSA private key for TCP authentication.
+ * Set the bearer-token authentication parameter for HTTP or QWP/WebSocket,
+ * which requires QuestDB Enterprise, or set the ECDSA private key for TCP
+ * authentication.
  */
 QUESTDB_CLIENT_API
 bool line_sender_opts_token(
@@ -2017,8 +2018,8 @@ typedef enum qwpws_ack_level
     /** Wait for the server to accept every published frame. */
     qwpws_ack_level_ok = 0,
 
-    /** Wait for durable-ACK coverage. APIs accepting this level document the
-     * required `request_durable_ack=on` opt-in. */
+    /** Wait for durable-ACK coverage. This level requires QuestDB Enterprise;
+     * APIs accepting it also require the `request_durable_ack=on` opt-in. */
     qwpws_ack_level_durable = 1,
 } qwpws_ack_level;
 
@@ -2029,9 +2030,9 @@ typedef enum qwpws_ack_level
  *
  * `timeout_millis` is a no-progress deadline (it fires only if the ack
  * watermark fails to advance for that long); `0` waits indefinitely.
- * `qwpws_ack_level_durable` requires `request_durable_ack=on`; otherwise this
- * returns `line_sender_error_invalid_api_call` even when nothing has been
- * published.
+ * `qwpws_ack_level_durable` requires QuestDB Enterprise and
+ * `request_durable_ack=on`; otherwise this returns
+ * `line_sender_error_invalid_api_call` even when nothing has been published.
  *
  * Returns `false` and sets `err_out` on the no-progress timeout
  * (`line_sender_error_failover_retry`), a server rejection, a transport

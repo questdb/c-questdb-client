@@ -4032,9 +4032,10 @@ pub unsafe extern "C" fn direct_column_sender_flush(
 /// published before or by this call reaches `ack_level` (see
 /// `qwp_sender_wait` for the level meanings and the no-progress timeout).
 ///
-/// `ack_level` carries a `qwpws_ack_level_*` constant; an out-of-range
-/// value, or `qwpws_ack_level_durable` without `request_durable_ack=on`,
-/// returns `line_sender_error_invalid_api_call` **before** `chunk` is touched.
+/// `ack_level` carries a `qwpws_ack_level_*` constant; an out-of-range value,
+/// or the Enterprise-only `qwpws_ack_level_durable` without
+/// `request_durable_ack=on`, returns `line_sender_error_invalid_api_call`
+/// **before** `chunk` is touched.
 ///
 /// Boundary: a successful return acknowledges all prior no-wait flushes plus
 /// this one. An empty `chunk` behaves like `direct_column_sender_commit`.
@@ -4387,8 +4388,9 @@ pub unsafe extern "C" fn direct_column_sender_flush_arrow_batch_at_scalar_nanos(
 ///
 /// `ack_level` carries a `qwpws_ack_level_*` constant. It is validated
 /// **before** the Arrow C Data Interface import consumes `array->release`, so a
-/// rejected level (out-of-range, or `durable` without `request_durable_ack=on`)
-/// returns `line_sender_error_invalid_api_call` and leaves `array` untouched.
+/// rejected level (out-of-range, or the Enterprise-only `durable` without
+/// `request_durable_ack=on`) returns `line_sender_error_invalid_api_call` and
+/// leaves `array` untouched.
 ///
 /// Ownership differs from the publish-only flush on the failure path. On a
 /// failure that is provably **pre-publication** (validation, encode, size, or a
@@ -4926,9 +4928,9 @@ unsafe fn reexport_record_batch_into(
 /// store-and-forward mode all data frames are already non-deferred, so sync
 /// waits for the local queue boundary published before the call.
 ///
-/// `qwpws_ack_level_ok` waits for every in-flight frame's
-/// WAL-commit ack. `qwpws_ack_level_durable` additionally waits
-/// for the server's object-store durability watermarks.
+/// `qwpws_ack_level_ok` waits for every in-flight frame's WAL-commit ack.
+/// `qwpws_ack_level_durable` requires QuestDB Enterprise and additionally
+/// waits for the server's object-store durability watermarks.
 ///
 /// No-progress timeout: if the server stays connected but never advances the
 /// ack/durable watermark — a back-pressured WAL or stuck commit — the wait

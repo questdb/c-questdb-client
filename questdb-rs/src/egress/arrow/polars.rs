@@ -208,7 +208,7 @@ impl Iterator for CursorPolarsIter<'_, '_> {
 
 /// [`RecordBatch`] → Polars [`DataFrame`] via the Arrow C Data Interface.
 /// Zero-copy for primitive/string/binary; SYMBOL columns become a polars
-/// `Categorical` (see [`dictionary_to_categorical`]).
+/// `Categorical`, using the same dictionary conversion as the cursor APIs.
 /// [`ErrorCode::ArrowExport`] on handoff failure.
 pub fn record_batch_to_dataframe(rb: RecordBatch) -> Result<DataFrame> {
     let schema = rb.schema();

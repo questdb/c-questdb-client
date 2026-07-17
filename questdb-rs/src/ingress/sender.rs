@@ -673,9 +673,10 @@ impl Sender {
     ///
     /// * [`AckLevel::Ok`] waits for the server to accept every published
     ///   frame.
-    /// * [`AckLevel::Durable`] waits for durable-ACK coverage. It requires the
-    ///   sender to be opened with `request_durable_ack=on`; otherwise the call
-    ///   is rejected before checking whether any frame has been published.
+    /// * [`AckLevel::Durable`] waits for durable-ACK coverage. It requires
+    ///   QuestDB Enterprise and a sender opened with
+    ///   `request_durable_ack=on`; otherwise the call is rejected before
+    ///   checking whether any frame has been published.
     ///
     /// `timeout` is a **no-progress** deadline: it fires only if the ack
     /// watermark fails to advance for that long, so a steadily-progressing
