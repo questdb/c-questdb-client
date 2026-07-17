@@ -93,13 +93,14 @@ stages:
           # sets CLIENT_PROFILE, the Maven step produces the SNAPSHOT jar that
           # soak.py picks up via --repo ./questdb.
           - template: templates/clone_questdb.yaml
+          - template: templates/maven_settings.yaml
           - task: Maven@3
             displayName: "Compile QuestDB"
             inputs:
               mavenPOMFile: "questdb/pom.xml"
               javaHomeOption: "Path"
               jdkDirectory: "$(JAVA_HOME)"
-              options: "-DskipTests -Pbuild-web-console$(CLIENT_PROFILE)"
+              options: "-s $(MAVEN_SETTINGS_FILE) -DskipTests -Pbuild-web-console$(CLIENT_PROFILE) $(MAVEN_RUN_OPTS)"
           # Fast fail-fast pre-gate before spending the soak time.
           - script: python3 ci/run_all_tests.py soak-selftest
             displayName: "Harness selftest (pre-gate)"
