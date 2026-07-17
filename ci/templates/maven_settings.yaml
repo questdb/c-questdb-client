@@ -1,11 +1,11 @@
 # Sets two variables for the Maven steps that follow: MAVEN_SETTINGS_FILE, the
-# settings file Maven runs with, and MAVEN_RUN_OPTS, its download-retry
-# options. Those steps pass both on to Maven as `-s $(MAVEN_SETTINGS_FILE)`
-# and $(MAVEN_RUN_OPTS).
+# settings file Maven runs with, and MAVEN_RUN_OPTS, its transport and
+# download-retry options. Those steps pass both on to Maven as
+# `-s $(MAVEN_SETTINGS_FILE)` and $(MAVEN_RUN_OPTS).
 #
 # Runs after templates/clone_questdb.yaml. Both settings files belong to the
 # questdb repository, and that template is what clones it into
-# $(Build.SourcesDirectory)/questdb, so before it has run the files are not on
+# $BUILD_SOURCESDIRECTORY/questdb, so before it has run the files are not on
 # this machine at all.
 #
 # Which of the two to use is decided by asking maven.internal, from the
@@ -17,19 +17,32 @@
 # tested: the hetzner-incus jobs download through the cache, and every other
 # machine uses the plain maven-settings.xml and downloads from Maven Central.
 #
+# The probe bounds the whole request, not just the connect: a cache that
+# accepts a connection and then stalls selects the plain settings file within
+# seconds instead of holding the job to its timeout. Every machine that reaches
+# the cache reaches Maven Central too, so that fallback still builds; the
+# echoed line is the record of which file a run picked.
+#
 # MAVEN_RUN_OPTS makes Maven retry a download that fails instead of giving up
 # at the first failure. The macOS and Windows jobs need this because they
 # download from Maven Central across the public internet, where the occasional
 # failed request is normal:
-#   * maven.resolver.transport=wagon selects the HTTP transport that the three
-#     options below configure.
+#   * maven.resolver.transport=wagon selects the transport that reads the three
+#     retryHandler options below, and that applies the per-server connect and
+#     read timeouts maven-settings-hetzner.xml configures.
+#   * retryHandler.class=default selects the only handler that honours
+#     nonRetryableClasses. Wagon's `standard` handler builds its non-retryable
+#     list from a hardcoded set and never reads the option, so the override
+#     below has no effect without this.
 #   * retryHandler.count is how many attempts a download gets.
-#   * retryHandler.nonRetryableClasses replaces the list of exceptions Maven
-#     refuses to retry. ConnectException is on that list by default, so naming
-#     an exception that never occurs here leaves the list effectively empty,
-#     and a refused connection gets retried too.
-#   * httpconnectionManager.ttlSeconds keeps connections open for reuse, so
-#     downloading many files does not open a fresh connection for each one.
+#   * retryHandler.nonRetryableClasses replaces the list of exceptions the
+#     handler refuses to retry. ConnectException is on that list by default, so
+#     naming an exception that never occurs here leaves the list effectively
+#     empty, and a refused or timed-out connection gets retried too.
+#   * httpconnectionManager.ttlSeconds caps how long a pooled connection may be
+#     reused, at 30s against a default of 300s. Pooling is on either way; the
+#     short cap discards a connection the network may have silently dropped
+#     instead of handing it to the next download.
 #
 # The echo lines run without `set -x`. Azure treats any line containing
 # `##vso[` as a command and takes the text after `]` as the value; tracing the
@@ -37,13 +50,13 @@
 # up inside the variable.
 steps:
   - bash: |
-      SETTINGS_DIR="$(Build.SourcesDirectory)/questdb/ci"
-      if curl -sf --connect-timeout 2 http://maven.internal:8081/ > /dev/null 2>&1; then
+      SETTINGS_DIR="${BUILD_SOURCESDIRECTORY}/questdb/ci"
+      if curl -sf --connect-timeout 2 --max-time 5 http://maven.internal:8081/ > /dev/null 2>&1; then
         echo "Cache at maven.internal answers: downloading through it"
         echo "##vso[task.setvariable variable=MAVEN_SETTINGS_FILE]$SETTINGS_DIR/maven-settings-hetzner.xml"
       else
         echo "Cache at maven.internal is unreachable: downloading from Maven Central"
         echo "##vso[task.setvariable variable=MAVEN_SETTINGS_FILE]$SETTINGS_DIR/maven-settings.xml"
       fi
-      echo "##vso[task.setvariable variable=MAVEN_RUN_OPTS]-Dmaven.resolver.transport=wagon -Dmaven.wagon.httpconnectionManager.ttlSeconds=30 -Dmaven.wagon.http.retryHandler.count=3 -Dmaven.wagon.http.retryHandler.nonRetryableClasses=java.io.NotSerializableException"
+      echo "##vso[task.setvariable variable=MAVEN_RUN_OPTS]-Dmaven.resolver.transport=wagon -Dmaven.wagon.httpconnectionManager.ttlSeconds=30 -Dmaven.wagon.http.retryHandler.class=default -Dmaven.wagon.http.retryHandler.count=3 -Dmaven.wagon.http.retryHandler.nonRetryableClasses=java.io.NotSerializableException"
     displayName: "Choose Maven settings file and retry options"
