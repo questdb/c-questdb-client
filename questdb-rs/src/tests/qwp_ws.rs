@@ -4795,19 +4795,47 @@ fn qwp_ws_sync_initial_retry_durable_ack_all_role_rejects_retry_until_budget() {
     assert_eq!(second_handle.join().unwrap(), 1);
 }
 
+/// Endpoint that accepts the TCP connection and immediately drops it, so the
+/// client's WS upgrade fails with a transient read error. Unlike a closed
+/// port, this fails fast on every platform: Windows keeps retransmitting the
+/// SYN against a refused port for ~1s, which would eat a whole sub-second
+/// retry budget in a single round.
+fn spawn_accept_then_drop_server(done: Arc<AtomicBool>) -> (u16, thread::JoinHandle<usize>) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let port = listener.local_addr().unwrap().port();
+
+    let handle = thread::spawn(move || {
+        let mut attempts = 0usize;
+        while !done.load(Ordering::Acquire) {
+            match listener.accept() {
+                Ok((stream, _)) => {
+                    attempts += 1;
+                    drop(stream);
+                }
+                Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                    thread::sleep(Duration::from_millis(5));
+                }
+                Err(err) => panic!("accept-then-drop listener failed: {err}"),
+            }
+        }
+        attempts
+    });
+
+    (port, handle)
+}
+
 #[test]
 fn qwp_ws_sync_initial_retry_version_error_does_not_mask_transient_endpoint_failure() {
     // Rolling-upgrade shape: the first endpoint upgrades but does not enable
     // durable ACK (ProtocolVersionError, terminal on its own); the second
-    // refuses the connection outright (transient). One endpoint's terminal
-    // error must not win the round while another endpoint is only
-    // transiently down -- the connect must keep retrying until the budget
-    // expires instead of surfacing ProtocolVersionError.
+    // accepts and immediately drops the connection (transient). One
+    // endpoint's terminal error must not win the round while another
+    // endpoint is only transiently down -- the connect must keep retrying
+    // until the budget expires instead of surfacing ProtocolVersionError.
     let done = Arc::new(AtomicBool::new(false));
     let (first_port, first_handle) = spawn_no_durable_ack_upgrade_server(Arc::clone(&done));
-    let probe = TcpListener::bind("127.0.0.1:0").unwrap();
-    let second_port = probe.local_addr().unwrap().port();
-    drop(probe);
+    let (second_port, second_handle) = spawn_accept_then_drop_server(Arc::clone(&done));
 
     let conf = format!(
         "ws::addr=127.0.0.1:{first_port},127.0.0.1:{second_port};\
@@ -4831,6 +4859,7 @@ fn qwp_ws_sync_initial_retry_version_error_does_not_mask_transient_endpoint_fail
         err.msg()
     );
     let first_attempts = first_handle.join().unwrap();
+    let _ = second_handle.join().unwrap();
     assert!(
         first_attempts >= 2,
         "expected repeated retries against the version-erroring endpoint, got {first_attempts}"
