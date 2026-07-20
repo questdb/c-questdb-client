@@ -1136,7 +1136,16 @@ class TestArrowIngressSfa(afc.ArrowFuzzBase):
             ) as conn:
                 self._flush_batch(conn, table, valid1)
                 self._flush_batch(conn, table, rejected)
-                self._flush_batch(conn, table, valid2)
+                # The server's terminal rejection races this flush: it is
+                # accepted when the rejection is still in flight, and fenced
+                # (SERVER_REJECTION) when it already landed. Both are correct;
+                # sync below must surface the terminal either way.
+                try:
+                    self._flush_batch(conn, table, valid2)
+                except ArrowSenderError as early_fence:
+                    self.assertEqual(
+                        early_fence.code, ClientErrorCode.SERVER_REJECTION
+                    )
 
                 with self.assertRaises(ArrowSenderError) as raised:
                     afc.column_sender_sync(conn, 0)
