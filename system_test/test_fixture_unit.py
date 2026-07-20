@@ -273,9 +273,10 @@ class CheckHttpUpTest(unittest.TestCase):
 
 class StartProbeSelectionTest(unittest.TestCase):
     """start() picks its readiness check and timeout from its arguments:
-    the initial start gates on main `/ping` with the generous default,
-    while a bounce restart gates on the min endpoint with the tight cap
-    so a stuck boot fails fast instead of starving the producers."""
+    an initial start waits on main `/ping` with the generous default
+    timeout, while a bounce restart waits on the min-HTTP health endpoint
+    with the tight cap, so a stuck boot fails fast instead of eating into
+    the producers' budgets."""
 
     def _captured_start(self, tmp_dir, **start_kwargs):
         qdb = _make_fixture(tmp_dir)

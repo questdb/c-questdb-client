@@ -346,26 +346,28 @@ class QuestDbFixtureBase:
 
         The readiness probe calls this before each attempt so a crashed
         server fails fast instead of looping until the timeout. The base
-        fixture has no process to inspect; the managed and docker fixtures
-        override it.
+        fixture has no process to inspect; QuestDbFixture overrides this
+        to check the process it launched.
         """
 
     def _check_main_http_up(self):
-        # Probe the main HTTP server's /ping. The initial start gates on
-        # this: query_version() and every test SQL query run against the main
-        # HTTP server, so it must be accepting before start() returns. There
-        # is no QWP ingest at initial-start time, so /ping can't be starved
-        # by the shared-network pool that serves it.
+        # Probe the main HTTP server's /ping. The initial start() waits on
+        # this probe: query_version() and every test SQL query go to the
+        # main HTTP server, so it must be serving requests before start()
+        # returns. The main server shares its worker pool with QWP ingest,
+        # but no ingest runs during initial start, so nothing competes with
+        # /ping for those workers.
         return self._probe_http(
             self.http_server_port, '/ping', lambda status: status == 204)
 
     def _check_min_http_up(self):
-        # Probe the dedicated min-HTTP health endpoint. A bounce restart gates
-        # on this: the min server runs on its own worker pool, so a heavy QWP
-        # ingest load on the shared-network pool (which serves the main HTTP
-        # server) can't starve the readiness check. HealthCheckProcessor
-        # answers any path with 200 "Status: Healthy". The bounce path issues
-        # no SQL after the probe, so main-HTTP readiness isn't required there.
+        # Probe the min HTTP server's health endpoint. A bounce restart
+        # waits on this probe rather than /ping: the min server has its own
+        # worker pool, so it answers even while reconnecting QWP producers
+        # keep the shared worker pool — the one serving the main HTTP
+        # server — fully busy. The min server answers any path with
+        # 200 "Status: Healthy" (HealthCheckProcessor). A bounce restart
+        # issues no SQL, so the main HTTP server need not be ready.
         return self._probe_http(
             self.http_min_port, '/status', lambda status: 200 <= status < 300)
 
@@ -380,12 +382,10 @@ class QuestDbFixtureBase:
             if status_ok(resp.status):
                 return True
         except OSError:
-            # The server isn't accepting yet. A not-yet-ready local process
-            # refuses the connection (urllib.error.URLError); docker
-            # publishes the host port before QuestDB binds, so an early probe
-            # can connect and then be reset (RemoteDisconnected /
-            # ConnectionResetError). URLError and socket.timeout are both
-            # OSError subclasses, so one handler covers every case.
+            # The server isn't ready yet: it either refuses the connection
+            # (urllib.error.URLError) or is too slow to answer within the
+            # 1s timeout (socket.timeout). Both are OSError subclasses, so
+            # one handler covers both.
             pass
         return False
 
@@ -524,10 +524,9 @@ class QuestDbFixture(QuestDbFixtureBase):
         self.line_tcp_port = None
         self.qwp_udp_port = None
         self.pg_port = None
-        # Dedicated min-HTTP health port. The min server runs on its own
-        # worker pool, so the readiness probe can't be starved by QWP
-        # ingest saturating the shared-network pool that serves the main
-        # HTTP server (where /ping lives).
+        # Port of the min HTTP server: a health endpoint with its own
+        # worker pool, used as the readiness probe on bounce restarts
+        # (see _check_min_http_up).
         self.http_min_port = None
 
         self.wrap_tls = wrap_tls
@@ -558,20 +557,18 @@ class QuestDbFixture(QuestDbFixtureBase):
             raise RuntimeError('QuestDB died during startup.')
 
     def start(self, start_timeout_sec=300, probe_min_http=False):
-        # start_timeout_sec bounds the wait for the readiness probe to pass.
-        # The generous default flags only a genuinely stuck boot; the bounce
-        # fuzz thread passes a tighter, drain-budget-aware value so a
-        # pathologically slow restart fails as an infra error rather than
-        # starving the producers' close_drain.
+        # start_timeout_sec bounds the wait for the readiness probe to
+        # pass. The generous default only trips on a genuinely stuck boot.
+        # The fuzz tests' bounce thread passes a tighter value, sized
+        # together with the producers' close_drain() budget, so that a
+        # pathologically slow restart fails here, reported as a server
+        # problem, before the producers exhaust that budget.
         #
-        # probe_min_http selects which server gates readiness. The initial
-        # start probes the main HTTP server (/ping): query_version() and all
-        # test SQL hit it, so it must be accepting before start() returns,
-        # and there is no ingest yet to starve it. A bounce restart sets
-        # probe_min_http=True to gate on the dedicated min-HTTP pool instead,
-        # which reconnecting producers on the shared-network pool can't
-        # starve; that path issues no SQL, so main-HTTP readiness isn't
-        # needed.
+        # probe_min_http selects the readiness probe. The initial start
+        # waits on the main HTTP server's /ping; a bounce restart passes
+        # probe_min_http=True to wait on the min HTTP server's health
+        # endpoint instead. See _check_main_http_up / _check_min_http_up
+        # for why each kind of start targets the server it does.
         if self.http_server_port is None:
             (self.http_server_port, self.line_tcp_port,
              self.pg_port, self.http_min_port) = discover_avail_ports(4)

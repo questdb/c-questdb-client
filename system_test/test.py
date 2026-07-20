@@ -2301,22 +2301,22 @@ class TestQwpWsFuzz(QwpWsTestSupport, unittest.TestCase):
     POLL_INTERVAL_SEC = 0.05
     DRAIN_TIMEOUT_SEC = 120
 
-    # A bounce makes the server unavailable for a whole stop() + start()
-    # cycle. BOUNCE_RESTART_TIMEOUT_SEC caps only the start (restart) leg;
-    # the stop leg is capped separately by the load's bounce_stop_timeout_s.
-    # A leg that overruns its cap raises inside the bounce thread, failing
-    # the run with a correctly-attributed infra error (server too slow to
-    # stop / restart). Keep the restart cap well above a healthy restart
-    # (~6-40s on CI) so only a genuinely stuck boot trips it.
+    # A bounce takes the server down for a whole stop() + start() cycle.
+    # BOUNCE_RESTART_TIMEOUT_SEC caps only the start(); the stop() is
+    # capped separately by FuzzParams.bounce_stop_timeout_s. When either
+    # overruns its cap, the bounce thread raises and the run fails with
+    # an error saying which of the two was too slow. The cap sits well
+    # above a healthy restart (~6-40s on CI) so only a genuinely stuck
+    # boot trips it.
     #
-    # The client-side budgets that must survive a bounce — close_drain and
-    # reconnect — are sized at runtime to exceed the whole stop+restart
-    # down-window (see _producer_loop, and the bounce wind-down in
-    # _run_fuzz). A healthy-but-slow bounce therefore can never strand a
-    # producer mid-drain: only a leg that overruns its own cap (attributed
-    # in the bounce thread) or a real client-side failure trips those
-    # budgets. That keeps a slow bounce from resurfacing as a misleading
-    # client close_drain timeout.
+    # The client-side budgets that must survive a bounce — close_drain()
+    # and reconnect — are computed from these same caps to exceed a full
+    # stop() + start() (see _producer_loop, and the final join on the
+    # bounce thread in _run_fuzz). A slow-but-healthy bounce therefore
+    # never exhausts a producer's budget: those budgets trip only on a
+    # genuine client-side failure, while a too-slow stop or restart fails
+    # in the bounce thread with the server named as the cause, instead of
+    # resurfacing as a misleading client close_drain() timeout.
     BOUNCE_RESTART_TIMEOUT_SEC = 90
 
     def setUp(self):
@@ -2547,13 +2547,15 @@ class TestQwpWsFuzz(QwpWsTestSupport, unittest.TestCase):
                     alter_thread.join(timeout=30)
 
             if bounce_thread is not None:
-                # Once producers_done is set the thread starts no new bounce,
-                # but it finishes any in-flight one first. Size the wind-down
-                # to a whole cycle — stop() (≤ bounce_stop_timeout_s) +
-                # start() (≤ BOUNCE_RESTART_TIMEOUT_SEC), with headroom — so a
-                # healthy-but-slow last bounce completes before verification.
-                # join() returns the instant the thread exits, so this ceiling
-                # is only ever reached by a genuinely stuck lifecycle.
+                # Once producers_done is set the thread starts no new
+                # bounce, but it finishes any in-flight one first. The join
+                # timeout allows a whole cycle — stop()
+                # (≤ bounce_stop_timeout_s) + start()
+                # (≤ BOUNCE_RESTART_TIMEOUT_SEC), plus headroom — so a
+                # slow-but-healthy last bounce completes before
+                # verification. join() returns the instant the thread
+                # exits, so only a genuinely stuck stop() or start() ever
+                # reaches this ceiling.
                 wind_down_sec = (
                     fuzz.bounce_stop_timeout_s
                     + self.BOUNCE_RESTART_TIMEOUT_SEC + 30)
@@ -2562,8 +2564,9 @@ class TestQwpWsFuzz(QwpWsTestSupport, unittest.TestCase):
                 if bounce_thread.is_alive():
                     # A thread still mutating the fixture here would race the
                     # verification queries and teardown on shared _proc/_log
-                    # state. Attribute it as the stuck lifecycle it is rather
-                    # than let it resurface as a downstream query failure.
+                    # state. Record it as what it is — a stuck server stop()
+                    # or start() — rather than let it resurface as a
+                    # downstream query failure.
                     record_failure(
                         f'fuzz bounce: thread still alive '
                         f'{wind_down_sec:.0f}s after producers finished; '
@@ -2600,16 +2603,17 @@ class TestQwpWsFuzz(QwpWsTestSupport, unittest.TestCase):
 
     def _producer_loop(self, sender_id, sf_root, load, fuzz, rnd,
                        tables, next_ts, record_failure):
-        # Reconnect and close_drain share one budget, sized to outlast the
-        # worst-case single-bounce down-window: a full graceful stop()
-        # (bounded by the load's bounce_stop_timeout_s) plus a restart
-        # (bounded by BOUNCE_RESTART_TIMEOUT_SEC), with headroom. A
-        # healthy-but-slow bounce therefore never strands a producer
-        # mid-drain; a stop or restart that overruns its own cap fails in
-        # the bounce thread (correctly attributed), and only a real
-        # client-side failure trips this budget. The two knobs are kept
-        # equal on purpose: a reconnect that gave up earlier than the drain
-        # would fail the drain mid-window even though it had budget left.
+        # Reconnect and close_drain() share one budget, sized to outlast
+        # the longest a single bounce can keep the server down: a full
+        # graceful stop() (bounded by fuzz.bounce_stop_timeout_s) plus a
+        # restart (bounded by BOUNCE_RESTART_TIMEOUT_SEC), plus headroom.
+        # A slow-but-healthy bounce therefore never runs a producer out of
+        # budget mid-drain; a stop or restart that overruns its own cap
+        # fails in the bounce thread with the server named as the cause,
+        # so only a genuine client-side failure trips this budget. The two
+        # knobs are equal on purpose: close_drain() relies on reconnect to
+        # reach the restarted server, so a reconnect that gave up sooner
+        # would fail the drain while it still had budget left.
         client_budget_millis = int(
             (fuzz.bounce_stop_timeout_s + self.BOUNCE_RESTART_TIMEOUT_SEC + 30)
             * 1000)

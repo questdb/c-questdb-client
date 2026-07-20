@@ -1490,19 +1490,21 @@ class BounceThread(threading.Thread):
                 time.sleep(0.02 + self._rnd.next_int(200) / 1000.0)
                 self._log(f'fuzz bounce #{idx}: starting QDB')
                 # Cap the restart wait at restart_timeout_s: a restart that
-                # overruns it is a stuck boot, and failing here gives the
-                # trustworthy, correctly-attributed signal (server too slow
-                # to restart). The producers' reconnect/close_drain budgets
-                # are sized above a full stop()+start() down-window (see
-                # TestQwpWsFuzz._producer_loop), so a restart inside this cap
-                # never strands them — only one that trips the cap does, and
-                # that surfaces here, not as a downstream client timeout.
+                # overruns it is a stuck boot, and raising here names the
+                # real problem — the server was too slow to restart. The
+                # producers' reconnect and close_drain() budgets exceed a
+                # full stop() + start() that stays within these timeouts
+                # (see TestQwpWsFuzz._producer_loop), so a restart under
+                # the cap never runs a producer out of budget; one over
+                # the cap fails the run here, not as a client timeout
+                # downstream with the cause hidden.
                 #
-                # Gate on the min-HTTP pool, not main /ping: the producers
-                # are reconnecting and saturating the shared-network pool
-                # that serves main HTTP, so a main-HTTP probe here would be
-                # starved and time out even on a healthy restart. The
-                # restart issues no SQL, so main-HTTP readiness isn't needed.
+                # probe_min_http=True makes the readiness probe target the
+                # min HTTP server's health endpoint rather than main /ping:
+                # the reconnecting producers can keep the main server's
+                # shared worker pool fully busy, so a /ping probe could
+                # time out even after a successful restart. The restart
+                # issues no SQL, so the main server need not be ready.
                 self._fixture.start(
                     start_timeout_sec=self._restart_timeout_s,
                     probe_min_http=True)
@@ -1510,13 +1512,13 @@ class BounceThread(threading.Thread):
                 self._log(f'fuzz bounce #{idx}: server back up')
             except Exception as e:  # noqa: BLE001 — any lifecycle failure fails the run
                 # A raise here is a real failure, not noise: stop() raises
-                # when the server won't shut down within its timeout, and
-                # start() raises when it won't come back up within
-                # restart_timeout_s. Both bounds are sized so only a stuck
-                # or pathologically slow server trips them, and a server that
-                # slow is exactly what the producers' down-window budget is
-                # sized to outlast — so attributing it here, rather than as a
-                # downstream client timeout, is the correct call.
+                # when the server won't shut down within stop_timeout_s,
+                # and start() raises when it won't come back up within
+                # restart_timeout_s. Both timeouts are generous enough
+                # that only a stuck or pathologically slow server trips
+                # them, and recording the failure here names that server
+                # problem directly instead of letting it surface later as
+                # a client timeout with the cause hidden.
                 self._record_failure(
                     f'fuzz bounce: server lifecycle failed at attempt '
                     f'{self.bounces_performed + 1}: '
@@ -1525,13 +1527,13 @@ class BounceThread(threading.Thread):
                 # has a chance to surface the underlying assertion failure
                 # rather than a query timeout. stop() first: if start()
                 # failed partway it may have left a process behind, and we
-                # must not launch a second one next to it. Reuse the bounded
-                # restart timeout and the min-HTTP probe: producers may still
-                # be reconnecting, so a main-HTTP probe would be starved, and
-                # the bound keeps this recovery from running unbounded. The
-                # failure is already recorded, so even if recovery overruns
-                # the test's bounce wind-down the run still fails with correct
-                # attribution; the wind-down's is_alive check flags a thread
+                # must not launch a second one next to it. The recovery
+                # start() uses restart_timeout_s and the min-HTTP probe for
+                # the same reasons as the normal restart above; the timeout
+                # also keeps recovery from hanging forever. The failure is
+                # already recorded, so the run fails with the right error
+                # even if recovery outlasts the test's final join on this
+                # thread — that join's is_alive check reports a thread
                 # still stuck here.
                 try:
                     self._fixture.stop(wait_timeout_sec=self._stop_timeout_s)
