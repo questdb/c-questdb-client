@@ -1211,6 +1211,18 @@ fn query_error_for_bad_sql() {
         }
         Ok(_) => panic!("expected QUERY_ERROR for bad SQL"),
     }
+    assert!(
+        cur.connection_reusable(),
+        "a server QUERY_ERROR terminates only the request"
+    );
+    drop(cur);
+
+    let mut next = reader
+        .prepare("select 2 as v")
+        .execute()
+        .expect("reader remains reusable after QUERY_ERROR");
+    assert!(next.next_batch().expect("next batch").is_some());
+    assert!(next.next_batch().expect("terminal").is_none());
 }
 
 // ---------------------------------------------------------------------------
@@ -3118,6 +3130,7 @@ fn cancel_then_drop_allows_reuse() {
         .execute()
         .expect("execute 1");
     cur1.cancel().expect("cancel drains to terminal");
+    assert!(cur1.connection_reusable());
     drop(cur1);
 
     // Reader is clean — query 2 should succeed end-to-end.

@@ -1568,6 +1568,15 @@ impl<'r> Cursor<'r> {
         self.terminal.as_ref()
     }
 
+    /// `true` when dropping this cursor now leaves its reader connection
+    /// safe to reuse. A terminal server error ends only this request and
+    /// therefore remains reusable; transport/protocol failures tear the
+    /// connection down and return `false`. An active cursor also returns
+    /// `false`, because dropping it must close the still-streaming transport.
+    pub fn connection_reusable(&self) -> bool {
+        self.done && !self.reader.transport_torn_down()
+    }
+
     /// Pass-through to [`Reader::credit_granted_total`]. Exists so
     /// callers holding the cursor's mutable borrow on the reader can
     /// still observe the connection-level CREDIT-bytes counter.
@@ -2641,10 +2650,10 @@ impl<'r> Cursor<'r> {
             }
         }
 
-        // Restore the default timeouts. If `next_batch` hit a
-        // non-cancelled error, it has already called
-        // `terminate_with_close` and the transport is `None`; nothing
-        // to restore.
+        // Restore the default timeouts on a healthy transport. A server
+        // QUERY_ERROR is terminal only for this request and leaves the
+        // connection reusable; transport/protocol failures have already
+        // called `terminate_with_close`, leaving `transport` as `None`.
         if let Some(t) = self.reader.transport.as_mut() {
             t.set_read_timeout(None);
             t.set_write_timeout(Some(WRITE_TIMEOUT));

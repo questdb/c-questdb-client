@@ -1401,9 +1401,21 @@ QUESTDB_CLIENT_API bool qwp_reader_cursor_terminal_exec_done(
     uint64_t* out_rows_affected);
 
 /**
+ * Return whether freeing this cursor now leaves the originating reader's
+ * connection safe to reuse. True after any terminal received on a healthy
+ * transport, including a server `QUERY_ERROR`; false while the cursor is
+ * active, after transport teardown, or for NULL.
+ */
+QUESTDB_CLIENT_API bool qwp_reader_cursor_connection_reusable(
+    const qwp_reader_cursor* cursor);
+
+/**
  * Send a CANCEL frame and drain the stream until the server's terminal
- * reply. Idempotent once terminal. Returns false and sets `*err_out` on
- * transport failure.
+ * reply. Idempotent once terminal. Returns false and sets `*err_out` if the
+ * drain observes a non-cancellation query error or a transport/protocol
+ * failure. Use `qwp_reader_cursor_connection_reusable` before freeing the
+ * cursor to distinguish a healthy request terminal from a torn-down
+ * connection.
  */
 QUESTDB_CLIENT_API bool qwp_reader_cursor_cancel(
     qwp_reader_cursor* cursor, questdb_error** err_out);
