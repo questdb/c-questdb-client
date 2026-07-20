@@ -138,3 +138,39 @@ partitions accumulate — invisible to fresh-table passes.
 `doc/net_bench/results/srv-covidx-<date>/` in the usual campaign format
 (per-cell JSON + sidecars + findings notes). Workload described generically
 in all committed artifacts.
+
+## Harness usage
+
+Generator: `questdb-rs/examples/qwp_ingress_srvidx.rs` (module
+`bench_srvidx` holds the data contract). Build:
+
+    cargo build --release --example qwp_ingress_srvidx \
+        --features sync-sender-qwp-ws,sync-sender-http
+
+Generator invariants (no server needed): `RUN_MODE=selftest cargo run
+--example qwp_ingress_srvidx --features
+sync-sender-qwp-ws,sync-sender-http`.
+
+One local cell (server already running):
+
+    doc/net_bench/srvidx_local.sh <cov|plain> <senders> <rows> <outdir> [tag]
+
+Env: `QDB_HOST/QDB_PORT` (default 127.0.0.1:9000), `QDB_ROOT` (enables
+table-dir du sampling + Linux write-amplification meta), `MAX_BATCH_ROWS`
+(default 1000 = rows per WAL txn), `ITERATIONS`/`WARMUPS` (defaults 5/2).
+
+Outputs per cell: `<cell>.json` (bench_json contract; headline =
+`applied_rows_per_s`, gates = `row_count_check` + `txn_check`),
+`<cell>.sampler.csv` (1 Hz: writerTxn, sequencerTxn, server RSS KB,
+table-dir KB), `<cell>.meta`.
+
+Per-pass semantics: fresh table (`DROP`+`CREATE`), timed flush across N
+round-robin senders (each 1k-row flush = exactly one WAL txn), then a
+`wal_tables()` drain poll — `srvidx-applied` is flush+drain wall, the
+campaign headline; `srvidx-drain`'s rate is the server's backlog-apply
+throughput. Seed = 42 + pass index, so every box/variant/sender-count
+ingests the identical dataset.
+
+The growth run is the same tool with `ITERATIONS=1 WARMUPS=0
+ROWS=<billions>`: one fresh table, one continuous backfill, the 1 Hz
+sampler CSV carries the whole trajectory (lag, RSS, table size over time).
