@@ -231,7 +231,7 @@ pub(crate) struct SyncQwpWsHandlerState {
     runner: SyncQwpWsRunner,
     pub(crate) server_max_batch_size: Arc<AtomicUsize>,
     pub(crate) request_durable_ack: bool,
-    /// Hard cap on a single store-and-forward frame's payload: `sf_max_bytes`
+    /// Hard cap on a single store-and-forward frame's payload: `sf_max_segment_bytes`
     /// minus the segment and frame headers. The queue rejects anything larger,
     /// so publishers must size-check and split against THIS bound —
     /// `max_buf_size` (100 MiB default) sits far above it and never binds
@@ -1645,7 +1645,7 @@ fn open_configured_qwp_ws_queue(qwp_ws: &QwpWsConfig) -> crate::Result<SfaSlotQu
         return SfaSlotQueue::open(SfaSlotOptions {
             sf_dir: sf_dir.clone(),
             sender_id: qwp_ws.sender_id.to_string(),
-            segment_size_bytes: *qwp_ws.sf_max_bytes,
+            segment_size_bytes: *qwp_ws.sf_max_segment_bytes,
             max_bytes,
             max_in_flight,
         })
@@ -1673,7 +1673,7 @@ fn open_configured_qwp_ws_queue(qwp_ws: &QwpWsConfig) -> crate::Result<SfaSlotQu
     }
 
     SfaSlotQueue::open_memory(SfaMemoryQueueOptions {
-        segment_size_bytes: *qwp_ws.sf_max_bytes,
+        segment_size_bytes: *qwp_ws.sf_max_segment_bytes,
         max_bytes,
         max_in_flight,
     })
@@ -3178,8 +3178,8 @@ pub(crate) fn connect_qwp_ws_background_state(
         runner,
         server_max_batch_size,
         request_durable_ack: *qwp_ws.request_durable_ack,
-        sfa_frame_payload_cap: segment_payload_capacity(*qwp_ws.sf_max_bytes),
-        sfa_frame_split_target: two_frame_segment_payload_capacity(*qwp_ws.sf_max_bytes),
+        sfa_frame_payload_cap: segment_payload_capacity(*qwp_ws.sf_max_segment_bytes),
+        sfa_frame_split_target: two_frame_segment_payload_capacity(*qwp_ws.sf_max_segment_bytes),
         orphan_pool,
         close_drain_timeout: *qwp_ws.close_flush_timeout,
         delta_dict_enabled,

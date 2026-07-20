@@ -442,7 +442,7 @@ mod tests {
         // false and the pool keeps the normal pool cap.
         for key in [
             "sender_id",
-            "sf_max_bytes",
+            "sf_max_segment_bytes",
             "sf_max_total_bytes",
             "sf_durability",
             "sf_append_deadline_millis",

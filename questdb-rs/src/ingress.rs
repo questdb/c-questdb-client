@@ -979,7 +979,7 @@ impl SenderBuilder {
     /// Some QWP/WebSocket configuration keys are accepted only through the
     /// configuration string, primarily for compatibility with Java-style
     /// configuration names and settings without a public Rust builder method.
-    /// These include `in_flight_window`, `sf_dir`, `sender_id`, `sf_max_bytes`,
+    /// These include `in_flight_window`, `sf_dir`, `sender_id`, `sf_max_segment_bytes`,
     /// `sf_max_total_bytes`, `sf_durability`, `sf_append_deadline_millis`,
     /// `auth_timeout_ms`, `close_flush_timeout_millis`, `request_durable_ack`,
     /// `durable_ack_keepalive_interval_millis`, `drain_orphans`,
@@ -1131,7 +1131,7 @@ impl SenderBuilder {
                 #[cfg(feature = "_sender-qwp-ws")]
                 "sender_id" => builder.sender_id(val)?,
                 #[cfg(feature = "_sender-qwp-ws")]
-                "sf_max_bytes" => {
+                "sf_max_segment_bytes" => {
                     builder.store_and_forward_max_bytes(parse_size_conf_value(key, val)?)?
                 }
                 #[cfg(feature = "_sender-qwp-ws")]
@@ -1804,16 +1804,16 @@ impl SenderBuilder {
         if value == 0 {
             return Err(error::fmt!(
                 ConfigError,
-                "\"sf_max_bytes\" must be greater than 0."
+                "\"sf_max_segment_bytes\" must be greater than 0."
             ));
         }
         let Some(qwp_ws) = &mut self.qwp_ws else {
             return Err(error::fmt!(
                 ConfigError,
-                "The \"sf_max_bytes\" setting is only supported for QWP/WebSocket."
+                "The \"sf_max_segment_bytes\" setting is only supported for QWP/WebSocket."
             ));
         };
-        qwp_ws.sf_max_bytes.set_specified("sf_max_bytes", value)?;
+        qwp_ws.sf_max_segment_bytes.set_specified("sf_max_segment_bytes", value)?;
         Ok(self)
     }
 

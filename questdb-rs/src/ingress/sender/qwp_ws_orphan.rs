@@ -163,7 +163,7 @@ impl OrphanDrainerConfig {
             .map_err(|_| "sf_max_total_bytes value is too large for this platform".to_owned())?;
         Ok(SfaQueueOptions {
             slot_dir,
-            segment_size_bytes: *self.qwp_ws.sf_max_bytes,
+            segment_size_bytes: *self.qwp_ws.sf_max_segment_bytes,
             max_bytes,
             max_in_flight: *self.qwp_ws.max_in_flight,
         })
@@ -875,7 +875,7 @@ mod tests {
     #[cfg(feature = "sync-sender-qwp-ws")]
     fn test_config() -> OrphanDrainerConfig {
         let qwp_ws = QwpWsConfig {
-            sf_max_bytes: ConfigSetting::new_default(256),
+            sf_max_segment_bytes: ConfigSetting::new_default(256),
             sf_max_total_bytes: ConfigSetting::new_default(Some(1024)),
             ..QwpWsConfig::default()
         };

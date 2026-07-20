@@ -560,7 +560,7 @@ pub(crate) const INGRESS_ONLY_CONFIG_KEYS: &[&str] = &[
     // QWP-WS store-and-forward
     "sf_dir",
     "sender_id",
-    "sf_max_bytes",
+    "sf_max_segment_bytes",
     "sf_max_total_bytes",
     "sf_durability",
     "sf_append_deadline_millis",

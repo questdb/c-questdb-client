@@ -224,7 +224,7 @@ durable-ack opt-in, etc.). See `doc/CONSIDERATIONS.md` and the
 row-API connect-string reference.
 
 **Not accepted in v1:** `sf_dir` and the other `sf_*` store-and-
-forward keys (`sender_id`, `sf_max_bytes`, `sf_max_total_bytes`,
+forward keys (`sender_id`, `sf_max_segment_bytes`, `sf_max_total_bytes`,
 `sf_durability`, `sf_append_deadline_millis`). Passing any of them to
 `questdb_db_connect` returns `questdb_error_config_error` with a
 message pointing to the row-major `line_sender` API for users who

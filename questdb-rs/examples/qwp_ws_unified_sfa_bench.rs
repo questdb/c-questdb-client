@@ -10,7 +10,7 @@ use questdb::ingress::{AckLevel, ColumnName, TimestampNanos};
 use questdb::{QuestDb, Result};
 
 const DEFAULT_CONF: &str = "ws::addr=127.0.0.1:9000;\
-    sf_max_bytes=1073741824;sender_pool_min=1;sender_pool_max=1;in_flight_window=128;";
+    sf_max_segment_bytes=1073741824;sender_pool_min=1;sender_pool_max=1;in_flight_window=128;";
 const DEFAULT_TABLE: &str = "qwp_ws_unified_sfa_bench";
 const DEFAULT_ROWS: usize = 1_000_000;
 const DEFAULT_BATCH_SIZE: usize = 1_000;

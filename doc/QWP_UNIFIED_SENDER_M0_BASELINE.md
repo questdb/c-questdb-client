@@ -19,7 +19,7 @@ The real-path benchmark used one loopback QuestDB fixture and in-memory SFA:
 
 ```text
 ws::addr=127.0.0.1:<fixture-port>;
-sf_max_bytes=1073741824;
+sf_max_segment_bytes=1073741824;
 pool_size=1;
 pool_max=1;
 in_flight_window=128;
@@ -36,7 +36,7 @@ same-harness/same-machine comparisons, not as a universal absolute count.
 Run one mode with:
 
 ```sh
-QWP_WS_UNIFIED_SFA_BENCH_CONF='ws::addr=127.0.0.1:9000;sf_max_bytes=1073741824;pool_size=1;pool_max=1;in_flight_window=128;' \
+QWP_WS_UNIFIED_SFA_BENCH_CONF='ws::addr=127.0.0.1:9000;sf_max_segment_bytes=1073741824;pool_size=1;pool_max=1;in_flight_window=128;' \
 QWP_WS_UNIFIED_SFA_BENCH_MODE=chunk \
 QWP_WS_UNIFIED_SFA_BENCH_ROWS=1000000 \
 QWP_WS_UNIFIED_SFA_BENCH_BATCH_SIZE=1000 \

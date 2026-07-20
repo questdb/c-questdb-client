@@ -212,7 +212,7 @@ fn public_sfa_conf(
     short_reconnect: bool,
 ) -> String {
     let mut conf = format!(
-        "ws::addr={host}:{port};sf_dir={};sender_id={sender_id};sf_max_bytes=64k;sf_max_total_bytes=128k;max_in_flight=4;",
+        "ws::addr={host}:{port};sf_dir={};sender_id={sender_id};sf_max_segment_bytes=64k;sf_max_total_bytes=128k;max_in_flight=4;",
         sf_dir.display()
     );
     if short_reconnect {

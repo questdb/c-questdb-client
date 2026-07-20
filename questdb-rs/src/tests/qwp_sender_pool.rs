@@ -756,7 +756,7 @@ fn seed_async_qwp_ws_slot(sf_dir: &Path, sender_id: &str, value: i64) {
     let port = unused_local_port();
     let conf = format!(
         "ws::addr=127.0.0.1:{port};initial_connect_retry=async;\
-         sf_dir={};sender_id={sender_id};sf_max_bytes=256;sf_max_total_bytes=1024;\
+         sf_dir={};sender_id={sender_id};sf_max_segment_bytes=256;sf_max_total_bytes=1024;\
          close_flush_timeout_millis=0;",
         sf_dir.display()
     );
@@ -2487,7 +2487,7 @@ fn store_and_forward_flush_splits_oversize_chunk_into_self_sufficient_frames() {
 fn store_and_forward_split_valve_engages_at_segment_cap_not_max_buf_size() {
     // Regression: the split valve compared against max_buf_size (100 MiB
     // default) while the store-and-forward queue rejects any frame above the
-    // sf_max_bytes-derived segment payload capacity. A flush between the two
+    // sf_max_segment_bytes-derived segment payload capacity. A flush between the two
     // caps hard-failed with PayloadExceedsByteCapacity instead of splitting.
     // max_buf_size is deliberately left at its default so the segment cap is
     // the binding limit.
@@ -2501,7 +2501,7 @@ fn store_and_forward_split_valve_engages_at_segment_cap_not_max_buf_size() {
     let (server, frames) = MockServer::spawn_acking_capturing(1);
     let conf = conf_for(
         server.port(),
-        &format!("sf_max_bytes={SEGMENT};pool_reap=manual;"),
+        &format!("sf_max_segment_bytes={SEGMENT};pool_reap=manual;"),
     );
     let db = QuestDb::connect(&conf).unwrap();
 
@@ -2562,7 +2562,7 @@ fn store_and_forward_irreducible_frame_over_segment_cap_is_batch_too_large() {
     let server = MockServer::spawn_acking(1);
     let conf = conf_for(
         server.port(),
-        &format!("sf_max_bytes={SEGMENT};pool_reap=manual;"),
+        &format!("sf_max_segment_bytes={SEGMENT};pool_reap=manual;"),
     );
     let db = QuestDb::connect(&conf).unwrap();
 

@@ -131,12 +131,12 @@ impl SfaFrameCaps {
 
 /// A store-and-forward frame exceeded `frame_cap` with no way left to split.
 /// Names both contributing limits so the caller adjusts the knob that
-/// actually binds (`sf_max_bytes` when the segment cap is the smaller one).
+/// actually binds (`sf_max_segment_bytes` when the segment cap is the smaller one).
 fn sfa_frame_size_error(encoded_len: usize, frame_cap: usize) -> crate::Error {
     error::fmt!(
         BatchTooLarge,
         "QWP frame ({} bytes) exceeds the store-and-forward per-frame cap ({} bytes, \
-         the smaller of max_buf_size and the sf_max_bytes segment payload capacity)",
+         the smaller of max_buf_size and the sf_max_segment_bytes segment payload capacity)",
         encoded_len,
         frame_cap
     )

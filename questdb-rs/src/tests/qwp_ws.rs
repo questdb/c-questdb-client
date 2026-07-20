@@ -1185,7 +1185,7 @@ fn seed_orphan_slot(sf_dir: &Path) {
     let seed_port = spawn_upgrade_only_server();
     let seed_conf = format!(
         "ws::addr=127.0.0.1:{seed_port};qwp_ws_progress=manual;\
-         sf_dir={};sender_id=orphan;sf_max_bytes=256;sf_max_total_bytes=1024;",
+         sf_dir={};sender_id=orphan;sf_max_segment_bytes=256;sf_max_total_bytes=1024;",
         sf_dir.display()
     );
     let mut seed_sender = SenderBuilder::from_conf(&seed_conf)
@@ -2206,7 +2206,7 @@ fn qwp_ws_store_and_forward_rejects_one_segment_total_capacity() {
     let sf_dir = tempfile::TempDir::new().unwrap();
     let conf = format!(
         "ws::addr=127.0.0.1:1;sf_dir={};sender_id=primary;\
-         sf_max_bytes=256;sf_max_total_bytes=256;",
+         sf_max_segment_bytes=256;sf_max_total_bytes=256;",
         sf_dir.path().display()
     );
 
@@ -2232,7 +2232,7 @@ fn qwp_ws_manual_orphan_drainer_replays_sibling_slot() {
     let sf_dir = tempfile::TempDir::new().unwrap();
     let seed_conf = format!(
         "ws::addr=127.0.0.1:{seed_port};qwp_ws_progress=manual;\
-         sf_dir={};sender_id=orphan;sf_max_bytes=256;sf_max_total_bytes=1024;",
+         sf_dir={};sender_id=orphan;sf_max_segment_bytes=256;sf_max_total_bytes=1024;",
         sf_dir.path().display()
     );
     let mut seed_sender = SenderBuilder::from_conf(&seed_conf)
@@ -2257,7 +2257,7 @@ fn qwp_ws_manual_orphan_drainer_replays_sibling_slot() {
     let drain_conf = format!(
         "ws::addr=127.0.0.1:{port};qwp_ws_progress=manual;\
          sf_dir={};sender_id=primary;drain_orphans=on;\
-         max_background_drainers=1;sf_max_bytes=256;sf_max_total_bytes=1024;",
+         max_background_drainers=1;sf_max_segment_bytes=256;sf_max_total_bytes=1024;",
         sf_dir.path().display()
     );
     let mut sender = SenderBuilder::from_conf(&drain_conf)
@@ -2358,7 +2358,7 @@ fn qwp_ws_orphan_drain_heals_a_zero_extended_side_file_and_replays_via_delta() {
     let drain_conf = format!(
         "ws::addr=127.0.0.1:{port};qwp_ws_progress=manual;\
          sf_dir={};sender_id=primary;drain_orphans=on;\
-         max_background_drainers=1;sf_max_bytes=256;sf_max_total_bytes=1024;",
+         max_background_drainers=1;sf_max_segment_bytes=256;sf_max_total_bytes=1024;",
         sf_dir.path().display()
     );
     let mut sender = SenderBuilder::from_conf(&drain_conf)
@@ -2449,7 +2449,7 @@ fn qwp_ws_orphan_drain_falls_back_to_dense_when_recovered_dict_has_a_duplicate_e
     let drain_conf = format!(
         "ws::addr=127.0.0.1:{port};qwp_ws_progress=manual;\
          sf_dir={};sender_id=primary;drain_orphans=on;\
-         max_background_drainers=1;sf_max_bytes=256;sf_max_total_bytes=1024;",
+         max_background_drainers=1;sf_max_segment_bytes=256;sf_max_total_bytes=1024;",
         sf_dir.path().display()
     );
     let mut sender = SenderBuilder::from_conf(&drain_conf)
@@ -2499,7 +2499,7 @@ fn qwp_ws_manual_orphan_drainer_walks_endpoint_list() {
     let drain_conf = format!(
         "ws::addr=127.0.0.1:{bad_port},127.0.0.1:{port};qwp_ws_progress=manual;\
          sf_dir={};sender_id=primary;drain_orphans=on;\
-         max_background_drainers=1;sf_max_bytes=256;sf_max_total_bytes=1024;",
+         max_background_drainers=1;sf_max_segment_bytes=256;sf_max_total_bytes=1024;",
         sf_dir.path().display()
     );
     let mut sender = SenderBuilder::from_conf(&drain_conf)
@@ -2535,7 +2535,7 @@ fn qwp_ws_manual_orphan_drainer_role_reject_tries_next_endpoint() {
     let drain_conf = format!(
         "ws::addr=127.0.0.1:{reject_port},127.0.0.1:{port};qwp_ws_progress=manual;\
          sf_dir={};sender_id=primary;drain_orphans=on;\
-         max_background_drainers=1;sf_max_bytes=256;sf_max_total_bytes=1024;",
+         max_background_drainers=1;sf_max_segment_bytes=256;sf_max_total_bytes=1024;",
         sf_dir.path().display()
     );
     let mut sender = SenderBuilder::from_conf(&drain_conf)
@@ -2571,7 +2571,7 @@ fn qwp_ws_manual_orphan_drainer_terminal_reject_leaves_slot_recoverable() {
     let drain_conf = format!(
         "ws::addr=127.0.0.1:{port};qwp_ws_progress=manual;\
          sf_dir={};sender_id=primary;drain_orphans=on;\
-         max_background_drainers=1;sf_max_bytes=256;sf_max_total_bytes=1024;",
+         max_background_drainers=1;sf_max_segment_bytes=256;sf_max_total_bytes=1024;",
         sf_dir.path().display()
     );
     let mut sender = SenderBuilder::from_conf(&drain_conf)
@@ -2610,7 +2610,7 @@ fn qwp_ws_background_orphan_close_is_bounded_and_leaves_orphan_recoverable() {
     let sf_dir = tempfile::TempDir::new().unwrap();
     let seed_conf = format!(
         "ws::addr=127.0.0.1:{seed_port};qwp_ws_progress=manual;\
-         sf_dir={};sender_id=orphan;sf_max_bytes=256;sf_max_total_bytes=1024;",
+         sf_dir={};sender_id=orphan;sf_max_segment_bytes=256;sf_max_total_bytes=1024;",
         sf_dir.path().display()
     );
     let mut seed_sender = SenderBuilder::from_conf(&seed_conf)
@@ -2637,7 +2637,7 @@ fn qwp_ws_background_orphan_close_is_bounded_and_leaves_orphan_recoverable() {
     let drain_conf = format!(
         "ws::addr=127.0.0.1:{port};\
          sf_dir={};sender_id=primary;drain_orphans=on;\
-         max_background_drainers=1;sf_max_bytes=256;sf_max_total_bytes=1024;",
+         max_background_drainers=1;sf_max_segment_bytes=256;sf_max_total_bytes=1024;",
         sf_dir.path().display()
     );
     let mut sender = SenderBuilder::from_conf(&drain_conf)
@@ -2666,7 +2666,7 @@ fn qwp_ws_background_orphan_close_is_bounded_and_leaves_orphan_recoverable() {
     let (recover_port, recover_rx) = spawn_recovery_mock_server();
     let recover_conf = format!(
         "ws::addr=127.0.0.1:{recover_port};\
-         sf_dir={};sender_id=orphan;sf_max_bytes=256;sf_max_total_bytes=1024;",
+         sf_dir={};sender_id=orphan;sf_max_segment_bytes=256;sf_max_total_bytes=1024;",
         sf_dir.path().display()
     );
     let retry_deadline = Instant::now() + Duration::from_secs(5);

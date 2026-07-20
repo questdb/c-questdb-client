@@ -284,7 +284,7 @@ pub(crate) struct QwpWsConfig {
     pub(crate) close_flush_timeout: ConfigSetting<std::time::Duration>,
     pub(crate) sf_dir: ConfigSetting<Option<PathBuf>>,
     pub(crate) sender_id: ConfigSetting<String>,
-    pub(crate) sf_max_bytes: ConfigSetting<u64>,
+    pub(crate) sf_max_segment_bytes: ConfigSetting<u64>,
     /// Ceiling on the store-and-forward **segment** files (`sf-*.sfa`) a slot may
     /// allocate. It does NOT cover the slot's small side-files (`.symbol-dict`,
     /// `.ack-watermark`, `.lock`). The `.symbol-dict` write-ahead is append-only
@@ -350,7 +350,7 @@ impl Default for QwpWsConfig {
             close_flush_timeout: ConfigSetting::new_default(QWP_WS_DEFAULT_CLOSE_DRAIN_TIMEOUT),
             sf_dir: ConfigSetting::new_default(None),
             sender_id: ConfigSetting::new_default(QWP_WS_DEFAULT_SENDER_ID.to_owned()),
-            sf_max_bytes: ConfigSetting::new_default(QWP_WS_DEFAULT_SF_SEGMENT_BYTES),
+            sf_max_segment_bytes: ConfigSetting::new_default(QWP_WS_DEFAULT_SF_SEGMENT_BYTES),
             sf_max_total_bytes: ConfigSetting::new_default(None),
             sf_durability: ConfigSetting::new_default(SfDurability::Memory),
             sf_append_deadline: ConfigSetting::new_default(std::time::Duration::from_secs(30)),
@@ -385,7 +385,7 @@ impl QwpWsConfig {
         } else {
             QWP_WS_DEFAULT_SF_MEMORY_MAX_TOTAL_BYTES
         };
-        default_max_total_bytes.max(self.sf_max_bytes.saturating_mul(2))
+        default_max_total_bytes.max(self.sf_max_segment_bytes.saturating_mul(2))
     }
 
     /// Closes a documented footgun: `reconnect_max_duration_millis` and the

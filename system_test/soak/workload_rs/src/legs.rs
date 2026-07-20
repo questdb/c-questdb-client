@@ -83,8 +83,8 @@ pub(crate) fn build_conf(cfg: &LegConfig) -> String {
         c.push_str(&format!("sf_dir={};sender_id={};", dir.display(), cfg.leg));
     }
     if let Some(bytes) = cfg.sf_mem_bytes {
-        // In-memory store-and-forward, bounded by `sf_max_bytes`.
-        c.push_str(&format!("sf_max_bytes={bytes};"));
+        // In-memory store-and-forward, bounded by `sf_max_segment_bytes`.
+        c.push_str(&format!("sf_max_segment_bytes={bytes};"));
     }
     c
 }

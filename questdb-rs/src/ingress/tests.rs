@@ -147,7 +147,7 @@ fn qwpws_store_and_forward_config_parses_java_keys() {
         "ws::addr=localhost:9000;\
          sf_dir=/tmp/qdb-rust-sf;\
          sender_id=primary-1;\
-         sf_max_bytes=64mb;\
+         sf_max_segment_bytes=64mb;\
          sf_max_total_bytes=4G;\
          sf_durability=memory;\
          sf_append_deadline_millis=1234;\
@@ -160,7 +160,7 @@ fn qwpws_store_and_forward_config_parses_java_keys() {
     let qwp_ws = builder.qwp_ws.as_ref().unwrap();
     assert_specified_eq(&qwp_ws.sf_dir, Some(PathBuf::from("/tmp/qdb-rust-sf")));
     assert_specified_eq(&qwp_ws.sender_id, "primary-1".to_owned());
-    assert_specified_eq(&qwp_ws.sf_max_bytes, 64 * 1024 * 1024_u64);
+    assert_specified_eq(&qwp_ws.sf_max_segment_bytes, 64 * 1024 * 1024_u64);
     assert_specified_eq(&qwp_ws.sf_max_total_bytes, Some(4 * 1024 * 1024 * 1024_u64));
     assert_specified_eq(&qwp_ws.sf_durability, conf::SfDurability::Memory);
     assert_specified_eq(&qwp_ws.sf_append_deadline, Duration::from_millis(1234));
@@ -212,7 +212,7 @@ fn qwpws_store_and_forward_defaults_match_java() {
     let qwp_ws = builder.qwp_ws.as_ref().unwrap();
 
     assert_defaulted_eq(&qwp_ws.sender_id, "default".to_owned());
-    assert_defaulted_eq(&qwp_ws.sf_max_bytes, 4 * 1024 * 1024_u64);
+    assert_defaulted_eq(&qwp_ws.sf_max_segment_bytes, 4 * 1024 * 1024_u64);
     assert_defaulted_eq(&qwp_ws.sf_max_total_bytes, None);
     assert_defaulted_eq(&qwp_ws.sf_durability, conf::SfDurability::Memory);
     assert_defaulted_eq(&qwp_ws.sf_append_deadline, Duration::from_secs(30));
@@ -398,10 +398,10 @@ fn qwpws_store_and_forward_size_suffixes_match_java_config_surface() {
         ("4g", 4 * 1024 * 1024 * 1024_u64),
         ("1T", 1024_u64 * 1024 * 1024 * 1024),
     ] {
-        let conf = format!("ws::addr=localhost:9000;sf_max_bytes={input};");
+        let conf = format!("ws::addr=localhost:9000;sf_max_segment_bytes={input};");
         let builder = SenderBuilder::from_conf(conf).unwrap();
         let qwp_ws = builder.qwp_ws.as_ref().unwrap();
-        assert_specified_eq(&qwp_ws.sf_max_bytes, expected);
+        assert_specified_eq(&qwp_ws.sf_max_segment_bytes, expected);
     }
 }
 
@@ -444,8 +444,8 @@ fn qwpws_store_and_forward_config_accepts_and_rejects_java_keys() {
         "invalid sender_id [value=bad/id, allowed-chars=[A-Za-z0-9_-]]",
     );
     assert_conf_err(
-        SenderBuilder::from_conf("ws::addr=localhost:9000;sf_max_bytes=64mi;"),
-        "invalid sf_max_bytes [value=64mi]",
+        SenderBuilder::from_conf("ws::addr=localhost:9000;sf_max_segment_bytes=64mi;"),
+        "invalid sf_max_segment_bytes [value=64mi]",
     );
     assert_conf_err(
         SenderBuilder::from_conf("ws::addr=localhost:9000;sf_durability=sync;"),

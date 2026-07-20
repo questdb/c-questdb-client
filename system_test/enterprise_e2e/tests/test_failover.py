@@ -54,7 +54,7 @@ def _connect_string(http_port: int, sf_dir: Optional[Path], *,
                     reconnect_max_ms: int = 60_000,
                     close_flush_timeout_ms: int = 5_000,
                     sender_id: Optional[str] = None,
-                    sf_max_bytes: Optional[int] = None) -> str:
+                    sf_max_segment_bytes: Optional[int] = None) -> str:
     """Row-major QWP/WebSocket connect string.
 
     ``sf_dir`` selects the store-and-forward backend, the distinction the
@@ -69,7 +69,7 @@ def _connect_string(http_port: int, sf_dir: Optional[Path], *,
         if the client itself dies.
 
     ``sender_id`` names the slot under ``sf_dir`` (disk-backed only).
-    ``sf_max_bytes`` caps one SF segment; a small value seals many segments
+    ``sf_max_segment_bytes`` caps one SF segment; a small value seals many segments
     from a modest ingest, exercising multi-segment recovery cheaply.
     """
     parts = [
@@ -85,8 +85,8 @@ def _connect_string(http_port: int, sf_dir: Optional[Path], *,
         parts.append(f"sf_dir={sf_dir}")
     if sender_id is not None:
         parts.append(f"sender_id={sender_id}")
-    if sf_max_bytes is not None:
-        parts.append(f"sf_max_bytes={sf_max_bytes}")
+    if sf_max_segment_bytes is not None:
+        parts.append(f"sf_max_segment_bytes={sf_max_segment_bytes}")
     if request_durable_ack:
         parts.append("request_durable_ack=on")
     return ";".join(parts) + ";"
@@ -264,7 +264,7 @@ def test_sender_kill9_sf_recovery_replays_c_client_rust(
     # rows are published in sub-segment chunks below (one big flush of all
     # 20k rows would be ~320 KiB and be rejected with
     # PayloadExceedsByteCapacity).
-    sf_max_bytes = 64 * 1024
+    sf_max_segment_bytes = 64 * 1024
     chunk_rows = 1_000  # ~16 KiB per publication, comfortably under 64 KiB
 
     p1 = server_factory("p1")
@@ -282,7 +282,7 @@ def test_sender_kill9_sf_recovery_replays_c_client_rust(
     ))
 
     cs = _connect_string(p1_ports.http, sf_dir, sender_id="primary",
-                         sf_max_bytes=sf_max_bytes)
+                         sf_max_segment_bytes=sf_max_segment_bytes)
     c_client_rust_sidecar.connect(cs)
     # Publish in sub-segment chunks: each flush is one QWP publication that
     # must fit in a single segment, and the sequence of them seals multiple
@@ -831,7 +831,7 @@ def test_sender_repeated_sigkill_no_state_corruption_c_client_rust(
     against the same primary and the same ``sf_dir``/``sender_id``; the
     on-disk slot state must stay consistent through every recovery. Catches
     bugs that *accumulate* across cycles -- stale .sfa files, slot-lock
-    release flakes, sealed segments that never trim. ``sf_max_bytes`` forces
+    release flakes, sealed segments that never trim. ``sf_max_segment_bytes`` forces
     frequent rotation so each cycle leaves multiple sealed segments."""
     table = "trades_multi_cycle_c_client_rust"
     cycles = 6
@@ -850,7 +850,7 @@ def test_sender_repeated_sigkill_no_state_corruption_c_client_rust(
         "DEDUP UPSERT KEYS(timestamp, v)"
     ))
 
-    cs = _connect_string(p1_ports.http, sf_dir, sender_id="primary", sf_max_bytes=8192)
+    cs = _connect_string(p1_ports.http, sf_dir, sender_id="primary", sf_max_segment_bytes=8192)
 
     fixture_consumed = False
     for cycle in range(cycles):
@@ -926,7 +926,7 @@ def test_partial_ack_sealed_segment_replay_dedup_collapses_c_client_rust(
         "DEDUP UPSERT KEYS(timestamp, v)"
     ))
 
-    cs = _connect_string(p1_ports.http, sf_dir, sender_id="primary", sf_max_bytes=32768)
+    cs = _connect_string(p1_ports.http, sf_dir, sender_id="primary", sf_max_segment_bytes=32768)
     c_client_rust_sidecar.connect(cs)
     # Many smaller flushes -> many frames -> exercise the
     # multiple-frames-per-segment path that makes partial-ack possible.
@@ -945,7 +945,7 @@ def test_partial_ack_sealed_segment_replay_dedup_collapses_c_client_rust(
     assert pre_kill, (
         "expected at least one un-durably-acked .sfa segment at kill time; "
         "partial-ack recovery path is not under test. If this consistently "
-        "fails, raise sf_max_bytes or reduce the settle time."
+        "fails, raise sf_max_segment_bytes or reduce the settle time."
     )
 
     c_client_rust_sidecar.kill_9()
