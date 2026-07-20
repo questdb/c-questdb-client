@@ -47,8 +47,9 @@ echo "epoch_s,writer_txn,seq_txn,rss_kb,du_kb" > "$SAMPLE_CSV"
         [ -n "$SRV_PID" ] && rss=$(ps -o rss= -p "$SRV_PID" 2>/dev/null | tr -d ' ')
         du_kb=""
         if [ -n "$QDB_ROOT" ]; then
-            dudir=$(find "$QDB_ROOT/db" -maxdepth 1 \( -name "${TABLE}~*" -o -name "$TABLE" \) 2>/dev/null | head -1)
-            [ -n "$dudir" ] && du_kb=$(du -sk "$dudir" 2>/dev/null | cut -f1)
+            # Sum over ALL matching dirs: DROP+CREATE leaves old ~N husks
+            # until purge, and picking one can latch an empty husk.
+            du_kb=$(find "$QDB_ROOT/db" -maxdepth 1 \( -name "${TABLE}~*" -o -name "$TABLE" \) -print0 2>/dev/null | xargs -0 du -sk 2>/dev/null | awk '{s+=$1} END{print s+0}')
         fi
         echo "$(date +%s),$wal,$rss,$du_kb" >> "$SAMPLE_CSV"
         sleep 1
