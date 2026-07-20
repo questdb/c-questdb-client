@@ -391,6 +391,14 @@ pub struct Buffer {
     inner: BufferInner,
 }
 
+// Keep the public buffer movable and shareable across threads. In particular,
+// QWP/WebSocket's lazily maintained size hint must not silently weaken this
+// contract through interior-mutability choices such as `RefCell`.
+const _: fn() = || {
+    fn assert_send_sync<T: Send + Sync>() {}
+    assert_send_sync::<Buffer>();
+};
+
 impl Buffer {
     /// Creates a new ILP buffer with default parameters.
     pub fn new(protocol_version: ProtocolVersion) -> Self {
@@ -526,8 +534,9 @@ impl Buffer {
     ///
     /// For ILP buffers this is the exact serialized byte count. For QWP/UDP
     /// buffers this is the size hint used for flush planning. For QWP/WebSocket
-    /// buffers this is only a local size hint; the sender enforces
-    /// `max_buf_size` against the encoded replay message.
+    /// buffers this is only a local size hint; symbol-ID remapping and replay
+    /// dictionary state can change the eventual frame size. The sender
+    /// enforces `max_buf_size` against the encoded replay message.
     pub fn len(&self) -> usize {
         match &self.inner {
             BufferInner::Ilp(inner) => inner.len(),

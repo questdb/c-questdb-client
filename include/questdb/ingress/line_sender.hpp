@@ -1582,7 +1582,8 @@ public:
      *
      * For ILP this applies to the exact pending byte length.
      * For QWP/UDP this applies to the buffer size hint returned by
-     * `line_sender_buffer::size()`.
+     * `line_sender_buffer::size()`. For QWP/WebSocket it caps the exact
+     * encoded replay frame.
      */
     opts& max_buf_size(size_t max_buf_size)
     {

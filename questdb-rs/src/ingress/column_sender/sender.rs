@@ -379,6 +379,14 @@ impl PooledSenderCore {
         self.backend.drop_on_return = true;
     }
 
+    /// Return the current binding per-frame cap and whether the current
+    /// connection advertised `X-QWP-Max-Batch-Size` (whether or not that value
+    /// is the binding limit). The cap also includes the configured
+    /// `max_buf_size` and store-and-forward segment capacity.
+    pub fn effective_frame_cap(&self) -> (usize, bool) {
+        self.backend.effective_hard_frame_cap()
+    }
+
     /// Non-blocking: `true` once the store-and-forward backend has no
     /// undelivered frames — every published frame has reached the pool's ack
     /// watermark (durable when `durable`, otherwise the OK watermark) — so the
@@ -1894,18 +1902,38 @@ impl SfaBackend {
         }
     }
 
-    fn effective_frame_caps(&self) -> SfaFrameCaps {
+    fn effective_hard_frame_cap(&self) -> (usize, bool) {
         let server_max = self.state.server_max_batch_size.load(Ordering::Acquire);
-        let max_buf_size = if server_max == 0 {
-            self.max_buf_size
-        } else {
-            self.max_buf_size.min(server_max)
-        };
+        effective_hard_frame_cap(
+            self.max_buf_size,
+            server_max,
+            self.state.sfa_frame_payload_cap,
+        )
+    }
+
+    fn effective_frame_caps(&self) -> SfaFrameCaps {
+        let (hard, _) = self.effective_hard_frame_cap();
         SfaFrameCaps {
-            hard: max_buf_size.min(self.state.sfa_frame_payload_cap),
-            soft: max_buf_size.min(self.state.sfa_frame_split_target),
+            hard,
+            soft: hard.min(self.state.sfa_frame_split_target),
         }
     }
+}
+
+fn effective_hard_frame_cap(
+    max_buf_size: usize,
+    server_max_batch_size: usize,
+    sfa_frame_payload_cap: usize,
+) -> (usize, bool) {
+    let configured_cap = if server_max_batch_size == 0 {
+        max_buf_size
+    } else {
+        max_buf_size.min(server_max_batch_size)
+    };
+    (
+        configured_cap.min(sfa_frame_payload_cap),
+        server_max_batch_size != 0,
+    )
 }
 
 /// The store-and-forward `wait` poll loop made no progress toward `boundary`
@@ -1952,7 +1980,14 @@ fn sfa_sync_timeout(
 
 #[cfg(test)]
 mod tests {
-    use super::split_mid;
+    use super::{effective_hard_frame_cap, split_mid};
+
+    #[test]
+    fn effective_hard_cap_reports_whether_the_server_cap_is_known() {
+        assert_eq!(effective_hard_frame_cap(1000, 0, 800), (800, false));
+        assert_eq!(effective_hard_frame_cap(1000, 400, 800), (400, true));
+        assert_eq!(effective_hard_frame_cap(1000, 1200, 800), (800, true));
+    }
 
     #[test]
     fn split_mid_floors_at_eight_rows() {

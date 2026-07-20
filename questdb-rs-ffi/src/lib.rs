@@ -1437,7 +1437,8 @@ pub unsafe extern "C" fn line_sender_buffer_clear(buffer: *mut line_sender_buffe
 /// The current encoded size of the buffered data.
 ///
 /// For ILP buffers this is the exact pending byte length. For QWP buffers this
-/// is a buffered size hint, not the exact size of any eventual UDP datagram.
+/// is a buffered size hint, not the exact size of an eventual UDP datagram or
+/// WebSocket replay frame.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn line_sender_buffer_size(buffer: *const line_sender_buffer) -> size_t {
     unsafe {
@@ -2931,7 +2932,8 @@ pub unsafe extern "C" fn line_sender_opts_tls_roots_password(
 ///
 /// For ILP this applies to the exact pending byte length.
 /// For QWP/UDP this applies to the buffer size hint returned by
-/// `line_sender_buffer_size()`.
+/// `line_sender_buffer_size()`. For QWP/WebSocket it caps the exact encoded
+/// replay frame.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn line_sender_opts_max_buf_size(
     opts: *mut line_sender_opts,

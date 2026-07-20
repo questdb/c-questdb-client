@@ -1364,6 +1364,21 @@ bool qwp_sender_flush_chunk_and_get_fsn(
     line_sender_error** err_out);
 
 /**
+ * Return the current hard QWP payload cap for this borrowed
+ * store-and-forward sender. `*server_cap_known_out` is true when the current
+ * connection advertised `X-QWP-Max-Batch-Size`, whether or not that value is
+ * the binding limit; otherwise the result is bounded only by local
+ * configuration and queue segment capacity. The value can change after
+ * reconnect.
+ */
+QUESTDB_CLIENT_API
+bool qwp_sender_effective_frame_cap(
+    const qwp_sender* sender,
+    size_t* cap_out,
+    bool* server_cap_known_out,
+    line_sender_error** err_out);
+
+/**
  * Return the highest QWP/WebSocket frame sequence number published locally
  * through this borrowed store-and-forward QWP sender, or no value if no
  * frame has been published.

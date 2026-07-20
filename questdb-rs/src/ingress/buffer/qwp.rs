@@ -41,6 +41,8 @@ use std::fmt::Debug;
 #[cfg(feature = "_sender-qwp-ws")]
 use std::hash::BuildHasherDefault;
 use std::hash::{BuildHasher, Hash, Hasher};
+#[cfg(feature = "_sender-qwp-ws")]
+use std::sync::Mutex;
 
 use super::op_state::{Op, OpState};
 use super::{Bookmark, BufferBookmarkMeta, ColumnName, StoredBookmark, TableName};
@@ -2387,6 +2389,7 @@ struct QwpWsSnapshot {
     table_lookup: std::collections::HashMap<Vec<u8>, usize>,
     current_table_idx: Option<usize>,
     state: BufferState,
+    size_hint: QwpWsSizeHint,
 }
 
 #[cfg(feature = "_sender-qwp-ws")]
@@ -2432,7 +2435,127 @@ struct QwpWsColumnBuffer {
     kind: ColumnKind,
     last_written_row: Option<u32>,
     non_null_count: u32,
+    symbol_cells_encoded_len: usize,
+    symbol_dict_encoded_len: usize,
     values: QwpWsColumnValues,
+}
+
+#[cfg(feature = "_sender-qwp-ws")]
+#[derive(Clone, Copy, Debug, Default)]
+struct QwpWsTableSizeHint {
+    encoded_table_len: usize,
+    symbol_dict_count: usize,
+    symbol_dict_bytes: usize,
+    dirty: bool,
+}
+
+#[cfg(feature = "_sender-qwp-ws")]
+impl QwpWsTableSizeHint {
+    fn from_table(table: &QwpWsTableBuffer) -> Self {
+        if table.row_count == 0 {
+            return Self::default();
+        }
+
+        let mut encoded_table_len = qwp_string_byte_len(table.table_name.len())
+            + qwp_varint_size(table.row_count as u64)
+            + qwp_varint_size(table.columns.len() as u64);
+        let mut symbol_dict_count = 0usize;
+        let mut symbol_dict_bytes = 0usize;
+        for column in &table.columns {
+            encoded_table_len += qwp_string_byte_len(column.name.len()) + 1;
+            encoded_table_len += column.estimated_payload_len(table.row_count as usize);
+            if let QwpWsColumnValues::Symbol { dict, .. } = &column.values {
+                symbol_dict_count += dict.len();
+                symbol_dict_bytes += column.symbol_dict_encoded_len;
+            }
+        }
+        Self {
+            encoded_table_len,
+            symbol_dict_count,
+            symbol_dict_bytes,
+            dirty: false,
+        }
+    }
+}
+
+/// Lazily maintained size estimate for a QWP/WebSocket row buffer.
+///
+/// Row construction only dirties the table being edited. A size query then
+/// recomputes that table from per-column O(1) counters and folds the delta into
+/// the buffer total, avoiding walks over buffered rows and unrelated tables.
+#[cfg(feature = "_sender-qwp-ws")]
+#[derive(Clone, Debug, Default)]
+struct QwpWsSizeHint {
+    tables: Vec<QwpWsTableSizeHint>,
+    dirty_tables: Vec<usize>,
+    encoded_tables_len: usize,
+    symbol_dict_count: usize,
+    symbol_dict_bytes: usize,
+    #[cfg(test)]
+    recomputed_tables: usize,
+}
+
+#[cfg(feature = "_sender-qwp-ws")]
+impl QwpWsSizeHint {
+    fn mark_dirty(&mut self, table_idx: usize) {
+        if self.tables.len() <= table_idx {
+            self.tables
+                .resize(table_idx + 1, QwpWsTableSizeHint::default());
+        }
+        if !self.tables[table_idx].dirty {
+            self.tables[table_idx].dirty = true;
+            self.dirty_tables.push(table_idx);
+        }
+    }
+
+    fn truncate(&mut self, table_count: usize) {
+        for old in &self.tables[table_count.min(self.tables.len())..] {
+            self.encoded_tables_len -= old.encoded_table_len;
+            self.symbol_dict_count -= old.symbol_dict_count;
+            self.symbol_dict_bytes -= old.symbol_dict_bytes;
+        }
+        self.tables.truncate(table_count);
+        self.dirty_tables.retain(|idx| *idx < table_count);
+    }
+
+    fn clear_rows(&mut self, table_count: usize) {
+        self.tables.clear();
+        self.tables
+            .resize(table_count, QwpWsTableSizeHint::default());
+        self.dirty_tables.clear();
+        self.encoded_tables_len = 0;
+        self.symbol_dict_count = 0;
+        self.symbol_dict_bytes = 0;
+    }
+
+    fn len(&mut self, tables: &[QwpWsTableBuffer]) -> usize {
+        let dirty_tables = std::mem::take(&mut self.dirty_tables);
+        for table_idx in dirty_tables {
+            if table_idx >= tables.len() || table_idx >= self.tables.len() {
+                continue;
+            }
+            let old = self.tables[table_idx];
+            let new = QwpWsTableSizeHint::from_table(&tables[table_idx]);
+            self.encoded_tables_len -= old.encoded_table_len;
+            self.symbol_dict_count -= old.symbol_dict_count;
+            self.symbol_dict_bytes -= old.symbol_dict_bytes;
+            self.encoded_tables_len += new.encoded_table_len;
+            self.symbol_dict_count += new.symbol_dict_count;
+            self.symbol_dict_bytes += new.symbol_dict_bytes;
+            self.tables[table_idx] = new;
+            #[cfg(test)]
+            {
+                self.recomputed_tables += 1;
+            }
+        }
+
+        QWP_MESSAGE_HEADER_SIZE
+            + 2
+            + self.encoded_tables_len
+            + qwp_varint_size(0)
+            + qwp_varint_size(self.symbol_dict_count as u64)
+            + self.symbol_dict_bytes
+    }
 }
 
 #[cfg(feature = "_sender-qwp-ws")]
@@ -2620,6 +2743,7 @@ pub(crate) struct QwpWsColumnarBuffer {
     table_lookup: std::collections::HashMap<Vec<u8>, usize>,
     current_table_idx: Option<usize>,
     state: BufferState,
+    size_hint: Mutex<QwpWsSizeHint>,
     bookmark_meta: BufferBookmarkMeta,
     bookmark: StoredBookmark<QwpWsMarker>,
     snapshot: Option<QwpWsSnapshot>,
@@ -2629,11 +2753,17 @@ pub(crate) struct QwpWsColumnarBuffer {
 #[cfg(feature = "_sender-qwp-ws")]
 impl Clone for QwpWsColumnarBuffer {
     fn clone(&self) -> Self {
+        let size_hint = self
+            .size_hint
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
         Self {
             tables: self.tables.clone(),
             table_lookup: self.table_lookup.clone(),
             current_table_idx: self.current_table_idx,
             state: self.state,
+            size_hint: Mutex::new(size_hint),
             // Preserve the stored rewind payload so marker-based rewind on the
             // clone matches the source, but assign a fresh origin so explicit
             // bookmarks from the source buffer fail on the clone.
@@ -2653,6 +2783,7 @@ impl QwpWsColumnarBuffer {
             table_lookup: std::collections::HashMap::new(),
             current_table_idx: None,
             state: BufferState::new(),
+            size_hint: Mutex::new(QwpWsSizeHint::default()),
             bookmark_meta: BufferBookmarkMeta::new(),
             bookmark: StoredBookmark::new(),
             snapshot: None,
@@ -2674,30 +2805,46 @@ impl QwpWsColumnarBuffer {
     }
 
     pub(crate) fn len(&self) -> usize {
+        self.size_hint
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .len(&self.tables)
+    }
+
+    #[cfg(test)]
+    fn recompute_len_slow(&self) -> usize {
         let mut total = QWP_MESSAGE_HEADER_SIZE + 2;
         let mut symbol_dict_count = 0usize;
         let mut symbol_dict_bytes = 0usize;
-        for table in self.non_empty_tables() {
+        for table in self.tables.iter().filter(|table| table.row_count > 0) {
             total += qwp_string_byte_len(table.table_name.len());
             total += qwp_varint_size(table.row_count as u64);
             total += qwp_varint_size(table.columns.len() as u64);
             for column in &table.columns {
                 total += qwp_string_byte_len(column.name.len()) + 1;
-                total += column.estimated_payload_len(table.row_count as usize);
-                if let QwpWsColumnValues::Symbol { dict, data, .. } = &column.values {
+                let bitmap = if column.uses_null_bitmap(table.row_count as usize) {
+                    bitmap_bytes(table.row_count as usize)
+                } else {
+                    0
+                };
+                total += 1 + bitmap + column.values.estimated_data_len(table.row_count as usize);
+                if let QwpWsColumnValues::Symbol { dict, .. } = &column.values {
                     symbol_dict_count += dict.len();
                     for entry in dict {
-                        let bytes =
-                            &data[entry.offset as usize..(entry.offset + entry.len) as usize];
-                        symbol_dict_bytes += qwp_string_byte_len(bytes.len());
+                        symbol_dict_bytes += qwp_string_byte_len(entry.len as usize);
                     }
                 }
             }
         }
-        total += qwp_varint_size(0);
-        total += qwp_varint_size(symbol_dict_count as u64);
-        total += symbol_dict_bytes;
-        total
+        total + qwp_varint_size(0) + qwp_varint_size(symbol_dict_count as u64) + symbol_dict_bytes
+    }
+
+    #[cfg(test)]
+    fn size_hint_recomputed_tables(&self) -> usize {
+        self.size_hint
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .recomputed_tables
     }
 
     pub(crate) fn row_count(&self) -> usize {
@@ -2778,6 +2925,10 @@ impl QwpWsColumnarBuffer {
         }
         self.current_table_idx = None;
         self.state = BufferState::new();
+        self.size_hint
+            .get_mut()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clear_rows(self.tables.len());
         self.bookmark.clear();
         self.snapshot = None;
     }
@@ -2788,6 +2939,11 @@ impl QwpWsColumnarBuffer {
             table_lookup: self.table_lookup.clone(),
             current_table_idx: self.current_table_idx,
             state: self.state,
+            size_hint: self
+                .size_hint
+                .get_mut()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clone(),
         });
         Ok(QwpWsMarker)
     }
@@ -2801,6 +2957,7 @@ impl QwpWsColumnarBuffer {
         self.table_lookup = snapshot.table_lookup;
         self.current_table_idx = snapshot.current_table_idx;
         self.state = snapshot.state;
+        self.size_hint = Mutex::new(snapshot.size_hint);
         self.bookmark.clear();
         Ok(())
     }
@@ -2871,6 +3028,10 @@ impl QwpWsColumnarBuffer {
             state: state_before,
             table_mark,
         });
+        self.size_hint
+            .get_mut()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .mark_dirty(idx);
         self.state.op_state.record_table();
         Ok(self)
     }
@@ -3433,6 +3594,10 @@ impl QwpWsColumnarBuffer {
         table.columns[col_idx].last_written_row = Some(row_idx);
         table.in_progress_column_count += 1;
         table.column_access_cursor = col_idx + 1;
+        self.size_hint
+            .get_mut()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .mark_dirty(table_idx);
         Ok(())
     }
 
@@ -3466,6 +3631,10 @@ impl QwpWsColumnarBuffer {
         self.tables[table_idx].row_mark = None;
         self.state.row_count += 1;
         self.state.op_state.finish_row();
+        self.size_hint
+            .get_mut()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .mark_dirty(table_idx);
         Ok(())
     }
 
@@ -3481,6 +3650,15 @@ impl QwpWsColumnarBuffer {
         self.rebuild_table_lookup();
         self.current_table_idx = row_mark.current_table_idx;
         self.state = row_mark.state;
+        let table_count = self.tables.len();
+        let size_hint = self
+            .size_hint
+            .get_mut()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        size_hint.truncate(table_count);
+        if table_idx < table_count {
+            size_hint.mark_dirty(table_idx);
+        }
     }
 
     fn rebuild_table_lookup(&mut self) {
@@ -3488,10 +3666,6 @@ impl QwpWsColumnarBuffer {
         for (idx, table) in self.tables.iter().enumerate() {
             self.table_lookup.insert(table.table_name.clone(), idx);
         }
-    }
-
-    fn non_empty_tables(&self) -> impl Iterator<Item = &QwpWsTableBuffer> {
-        self.tables.iter().filter(|table| table.row_count > 0)
     }
 
     #[allow(private_bounds)]
@@ -3818,6 +3992,8 @@ impl QwpWsColumnBuffer {
             kind,
             last_written_row: None,
             non_null_count: 0,
+            symbol_cells_encoded_len: 0,
+            symbol_dict_encoded_len: 0,
             values: QwpWsColumnValues::new(kind),
         }
     }
@@ -3879,6 +4055,8 @@ impl QwpWsColumnBuffer {
     fn clear_rows(&mut self) {
         self.last_written_row = None;
         self.non_null_count = 0;
+        self.symbol_cells_encoded_len = 0;
+        self.symbol_dict_encoded_len = 0;
         self.values.clear_rows();
     }
 
@@ -3893,7 +4071,24 @@ impl QwpWsColumnBuffer {
         if self.values.rollback_row(row_idx) {
             self.non_null_count -= 1;
         }
+        self.rebuild_symbol_size_hint();
         self.last_written_row = None;
+    }
+
+    fn rebuild_symbol_size_hint(&mut self) {
+        let QwpWsColumnValues::Symbol { cells, dict, .. } = &self.values else {
+            self.symbol_cells_encoded_len = 0;
+            self.symbol_dict_encoded_len = 0;
+            return;
+        };
+        self.symbol_cells_encoded_len = cells
+            .iter()
+            .map(|cell| qwp_varint_size(cell.local_id as u64))
+            .sum();
+        self.symbol_dict_encoded_len = dict
+            .iter()
+            .map(|entry| qwp_string_byte_len(entry.len as usize))
+            .sum();
     }
 
     fn uses_null_bitmap(&self, row_count: usize) -> bool {
@@ -3910,7 +4105,20 @@ impl QwpWsColumnBuffer {
         } else {
             0
         };
-        1 + bitmap + self.values.estimated_data_len(row_count)
+        let data_len = match &self.values {
+            QwpWsColumnValues::Symbol { .. } => self.symbol_cells_encoded_len,
+            QwpWsColumnValues::Decimal { .. } => {
+                1 + (self.non_null_count as usize).saturating_mul(QWP_DECIMAL_MAG_BYTES)
+            }
+            QwpWsColumnValues::Decimal64 { .. } => {
+                1 + (self.non_null_count as usize).saturating_mul(8)
+            }
+            QwpWsColumnValues::Decimal128 { .. } => {
+                1 + (self.non_null_count as usize).saturating_mul(16)
+            }
+            _ => self.values.estimated_data_len(row_count),
+        };
+        1 + bitmap + data_len
     }
 
     fn append_bool(&mut self, row_idx: u32, value: bool) -> crate::Result<()> {
@@ -4039,6 +4247,10 @@ impl QwpWsColumnBuffer {
             is_new,
         });
         self.increment_non_null()?;
+        self.symbol_cells_encoded_len += qwp_varint_size(local_id as u64);
+        if is_new {
+            self.symbol_dict_encoded_len += qwp_string_byte_len(bytes.len());
+        }
         Ok(())
     }
 
@@ -9806,6 +10018,97 @@ mod tests {
             buf.snapshot.is_none(),
             "clearing the rewind point must release the QWP/WS snapshot"
         );
+    }
+
+    #[cfg(feature = "_sender-qwp-ws")]
+    #[test]
+    fn qwp_ws_cached_size_hint_matches_full_recompute_across_state_changes() {
+        let mut buf = QwpWsColumnarBuffer::new(127);
+        assert_eq!(buf.len(), buf.recompute_len_slow());
+
+        for i in 0..140 {
+            let price = if i % 3 == 0 { "NaN" } else { "1.25" };
+            buf.table("trades")
+                .unwrap()
+                .symbol("venue", format!("venue-{i}").as_str())
+                .unwrap()
+                .column_i64("qty", i)
+                .unwrap()
+                .column_dec("price", price)
+                .unwrap()
+                .at_now()
+                .unwrap();
+        }
+        buf.table("quotes")
+            .unwrap()
+            .column_str("note", "first")
+            .unwrap()
+            .at_now()
+            .unwrap();
+        assert_eq!(buf.len(), buf.recompute_len_slow());
+
+        let before_failed_row = buf.len();
+        let err = buf
+            .table("trades")
+            .unwrap()
+            .symbol("venue", "rolled-back")
+            .unwrap()
+            .column_str("qty", "wrong type")
+            .unwrap_err();
+        assert_eq!(err.code(), ErrorCode::InvalidApiCall);
+        assert_eq!(buf.len(), before_failed_row);
+        assert_eq!(buf.len(), buf.recompute_len_slow());
+
+        buf.set_marker().unwrap();
+        buf.table("trades")
+            .unwrap()
+            .symbol("venue", "after-marker")
+            .unwrap()
+            .column_i64("qty", 999)
+            .unwrap()
+            .column_dec("price", "2.50")
+            .unwrap()
+            .at_now()
+            .unwrap();
+        assert_eq!(buf.len(), buf.recompute_len_slow());
+        buf.rewind_to_marker().unwrap();
+        assert_eq!(buf.len(), before_failed_row);
+        assert_eq!(buf.len(), buf.recompute_len_slow());
+
+        let cloned = buf.clone();
+        assert_eq!(cloned.len(), cloned.recompute_len_slow());
+        buf.clear();
+        assert_eq!(buf.len(), buf.recompute_len_slow());
+    }
+
+    #[cfg(feature = "_sender-qwp-ws")]
+    #[test]
+    fn qwp_ws_cached_size_hint_recomputes_only_dirty_tables() {
+        let mut buf = QwpWsColumnarBuffer::new(127);
+        for table in ["a", "b", "c"] {
+            buf.table(table)
+                .unwrap()
+                .column_i64("value", 1)
+                .unwrap()
+                .at_now()
+                .unwrap();
+        }
+
+        let expected = buf.recompute_len_slow();
+        assert_eq!(buf.len(), expected);
+        let recomputed = buf.size_hint_recomputed_tables();
+        assert_eq!(recomputed, 3);
+        assert_eq!(buf.len(), expected);
+        assert_eq!(buf.size_hint_recomputed_tables(), recomputed);
+
+        buf.table("b")
+            .unwrap()
+            .column_i64("value", 2)
+            .unwrap()
+            .at_now()
+            .unwrap();
+        assert_eq!(buf.len(), buf.recompute_len_slow());
+        assert_eq!(buf.size_hint_recomputed_tables(), recomputed + 1);
     }
 
     #[cfg(feature = "_sender-qwp-ws")]

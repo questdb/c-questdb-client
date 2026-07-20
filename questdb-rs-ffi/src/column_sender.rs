@@ -3840,6 +3840,73 @@ pub unsafe extern "C" fn qwp_sender_error_events_dropped(
     }
 }
 
+/// Return the current hard payload cap for this store-and-forward sender and
+/// whether the current connection advertised `X-QWP-Max-Batch-Size` (whether
+/// or not that value is the binding limit). The cap is always bounded by
+/// configured `max_buf_size` and the queue's segment payload capacity, and may
+/// change after reconnect.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn qwp_sender_effective_frame_cap(
+    sender: *const qwp_sender,
+    cap_out: *mut usize,
+    server_cap_known_out: *mut bool,
+    err_out: *mut *mut line_sender_error,
+) -> bool {
+    let fn_name = "qwp_sender_effective_frame_cap";
+    if cap_out.is_null() || server_cap_known_out.is_null() {
+        let output = if cap_out.is_null() {
+            "cap_out"
+        } else {
+            "server_cap_known_out"
+        };
+        unsafe {
+            set_err_out_from_error(
+                err_out,
+                Error::new(
+                    ErrorCode::InvalidApiCall,
+                    format!("{fn_name}: {output} pointer is NULL"),
+                ),
+            );
+        }
+        return false;
+    }
+    if sender.is_null() {
+        unsafe {
+            set_err_out_from_error(
+                err_out,
+                Error::new(
+                    ErrorCode::InvalidApiCall,
+                    format!("{fn_name}: sender pointer is NULL"),
+                ),
+            );
+        }
+        return false;
+    }
+    let handle = sender as *mut qwp_sender;
+    let _guard = match unsafe {
+        InUseGuard::acquire(
+            handle,
+            qwp_sender::latch(sender),
+            fn_name,
+            "qwp_sender",
+            err_out,
+        )
+    } {
+        Some(g) => g,
+        None => return false,
+    };
+    if unsafe { reject_closed_pool_cs(sender, fn_name, err_out) } {
+        return false;
+    }
+    let (cap, server_cap_known) =
+        unsafe { qwp_sender::owned_ref(sender).get() }.effective_frame_cap();
+    unsafe {
+        *cap_out = cap;
+        *server_cap_known_out = server_cap_known;
+    }
+    true
+}
+
 /// Return the highest QWP/WebSocket frame sequence number published locally
 /// through this store-and-forward QWP sender, or no value if no frame has
 /// been published.
@@ -4956,6 +5023,43 @@ mod tests {
             assert!(!err_direct.is_null());
             unsafe { line_sender_error_free(err_direct) };
         }
+    }
+
+    #[test]
+    fn effective_frame_cap_rejects_null_pointers() {
+        let mut cap = 0usize;
+        let mut known = false;
+
+        let mut err: *mut line_sender_error = std::ptr::null_mut();
+        assert!(!unsafe {
+            qwp_sender_effective_frame_cap(std::ptr::null(), &mut cap, &mut known, &mut err)
+        });
+        assert!(!err.is_null());
+        unsafe { line_sender_error_free(err) };
+
+        err = std::ptr::null_mut();
+        assert!(!unsafe {
+            qwp_sender_effective_frame_cap(
+                std::ptr::null(),
+                std::ptr::null_mut(),
+                &mut known,
+                &mut err,
+            )
+        });
+        assert!(!err.is_null());
+        unsafe { line_sender_error_free(err) };
+
+        err = std::ptr::null_mut();
+        assert!(!unsafe {
+            qwp_sender_effective_frame_cap(
+                std::ptr::null(),
+                &mut cap,
+                std::ptr::null_mut(),
+                &mut err,
+            )
+        });
+        assert!(!err.is_null());
+        unsafe { line_sender_error_free(err) };
     }
 
     #[test]

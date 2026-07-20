@@ -72,6 +72,13 @@ private:
 /** Forward decl. */
 class sender_view;
 
+/** Current binding QWP payload cap for a pooled store-and-forward sender. */
+struct frame_cap
+{
+    size_t bytes;
+    bool server_cap_known;
+};
+
 /**
  * RAII wrapper around `::qwp_chunk*`. Move-only.
  *
@@ -768,6 +775,22 @@ public:
             chunk.c_ptr(),
             &fsn);
         return optional_fsn(fsn);
+    }
+
+    /**
+     * Return the current hard frame cap. `server_cap_known` is true when the
+     * current connection advertised `X-QWP-Max-Batch-Size`, whether or not it
+     * is the binding limit.
+     */
+    frame_cap effective_frame_cap() const
+    {
+        frame_cap result{};
+        line_sender_error::wrapped_call(
+            ::qwp_sender_effective_frame_cap,
+            _raw,
+            &result.bytes,
+            &result.server_cap_known);
+        return result;
     }
 
     /**

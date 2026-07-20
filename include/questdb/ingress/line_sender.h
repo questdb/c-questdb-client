@@ -759,7 +759,8 @@ void line_sender_buffer_clear(line_sender_buffer* buffer);
  * The current encoded size of the buffered data.
  *
  * For ILP buffers this is the exact pending byte length. For QWP buffers this
- * is a buffered size hint, not the exact size of any eventual UDP datagram.
+ * is a buffered size hint, not the exact size of an eventual UDP datagram or
+ * WebSocket replay frame.
  */
 QUESTDB_CLIENT_API
 size_t line_sender_buffer_size(const line_sender_buffer* buffer);
@@ -1752,7 +1753,8 @@ bool line_sender_opts_tls_roots_password(
  *
  * For ILP this applies to the exact pending byte length.
  * For QWP/UDP this applies to the buffer size hint returned by
- * `line_sender_buffer_size()`.
+ * `line_sender_buffer_size()`. For QWP/WebSocket it caps the exact encoded
+ * replay frame.
  */
 QUESTDB_CLIENT_API
 bool line_sender_opts_max_buf_size(
