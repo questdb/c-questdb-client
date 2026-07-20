@@ -16,6 +16,7 @@
 //!   RUN_MODE=e2e|selftest    selftest = generator invariants only, no server
 //!   QDB_HOST=127.0.0.1  QDB_PORT=9000  QDB_CONF_EXTRA=
 //!   SEED_BASE=42             pass p uses seed SEED_BASE + p
+//!   DRAIN_DEADLINE_S=900       per-pass WAL drain deadline (raise for growth runs)
 
 use std::error::Error;
 use std::time::{Duration, Instant};
@@ -32,9 +33,6 @@ use bench_srvidx::Variant;
 const DEFAULT_CHECKPOINT_BATCHES: usize = 64;
 /// `Sender::wait` no-progress deadline (not a total-time cap).
 const WAIT_TIMEOUT: Duration = Duration::from_secs(120);
-/// WAL drain deadline per pass. Generous: at rig scale the backlog after a
-/// burst pass can take minutes to apply.
-const DRAIN_DEADLINE: Duration = Duration::from_secs(900);
 
 struct SrvIdxCtx<'a> {
     variant: Variant,
@@ -44,6 +42,9 @@ struct SrvIdxCtx<'a> {
     checkpoint_batches: usize,
     cdf: &'a [f64],
     pool: &'a [String],
+    /// WAL drain deadline per pass. Generous by default: at rig scale the
+    /// backlog after a burst pass can take minutes to apply.
+    drain_deadline: Duration,
 }
 
 /// Append sender `k`'s owned rows with owned-index `j` in `[lo, hi)` —
@@ -157,10 +158,14 @@ fn parse_two_longs(body: &str) -> Option<(i64, i64)> {
 
 /// Poll `wal_tables()` until writerTxn == sequencerTxn for `table`.
 /// Returns (drain_wall_ns, final sequencerTxn).
-fn wait_for_drain(base: &str, table: &str) -> Result<(u64, i64), Box<dyn Error>> {
+fn wait_for_drain(
+    base: &str,
+    table: &str,
+    deadline_cap: Duration,
+) -> Result<(u64, i64), Box<dyn Error>> {
     let sql = format!("SELECT writerTxn, sequencerTxn FROM wal_tables() WHERE name = '{table}'");
     let t0 = Instant::now();
-    let deadline = t0 + DRAIN_DEADLINE;
+    let deadline = t0 + deadline_cap;
     loop {
         let body = exec_sql(base, &sql)?;
         match parse_two_longs(&body) {
@@ -172,7 +177,7 @@ fn wait_for_drain(base: &str, table: &str) -> Result<(u64, i64), Box<dyn Error>>
         }
         if Instant::now() >= deadline {
             return Err(
-                format!("WAL drain deadline ({DRAIN_DEADLINE:?}) exceeded for {table}").into(),
+                format!("WAL drain deadline ({deadline_cap:?}) exceeded for {table}").into(),
             );
         }
         std::thread::sleep(Duration::from_millis(100));
@@ -233,7 +238,7 @@ fn run_pass(
     let (flush_wall, flush_cpu, r) =
         timed(&mut || flush_pass(&mut senders, &mut buffers, ctx, seed));
     r?;
-    let (drain_wall, seq_txn) = wait_for_drain(base, ctx.variant.table())?;
+    let (drain_wall, seq_txn) = wait_for_drain(base, ctx.variant.table(), ctx.drain_deadline)?;
     let count = table_count(base, ctx.variant.table())?;
     Ok(PassResult {
         flush_wall,
@@ -281,6 +286,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         checkpoint_batches,
         cdf: &cdf,
         pool: &pool,
+        drain_deadline: Duration::from_secs(env_usize("DRAIN_DEADLINE_S", 900) as u64),
     };
 
     let base = http_base(&host, port);

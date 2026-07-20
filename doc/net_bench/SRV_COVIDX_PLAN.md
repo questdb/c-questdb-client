@@ -157,7 +157,9 @@ One local cell (server already running):
 
 Env: `QDB_HOST/QDB_PORT` (default 127.0.0.1:9000), `QDB_ROOT` (enables
 table-dir du sampling + Linux write-amplification meta), `MAX_BATCH_ROWS`
-(default 1000 = rows per WAL txn), `ITERATIONS`/`WARMUPS` (defaults 5/2).
+(default 1000 = rows per WAL txn), `ITERATIONS`/`WARMUPS` (defaults 5/2),
+`DRAIN_DEADLINE_S` (default 900; raise for growth runs — a degraded apply
+path can legitimately need longer terminal drains).
 
 Outputs per cell: `<cell>.json` (bench_json contract; headline =
 `applied_rows_per_s`, gates = `row_count_check` + `txn_check`),
@@ -174,3 +176,6 @@ ingests the identical dataset.
 The growth run is the same tool with `ITERATIONS=1 WARMUPS=0
 ROWS=<billions>`: one fresh table, one continuous backfill, the 1 Hz
 sampler CSV carries the whole trajectory (lag, RSS, table size over time).
+
+Server process-CPU sampling (and the per-thread/du-class/seal-log metrics)
+is deferred to the P2 Linux harness.
