@@ -376,6 +376,12 @@ pub struct RowCountCheck {
     pub inflated: bool,
 }
 
+pub struct TxnCheck {
+    pub expected: u64,
+    pub actual: u64,
+    pub ok: bool,
+}
+
 pub struct Report {
     schema: String,
     rows: usize,
@@ -392,6 +398,7 @@ pub struct Report {
     paths: Vec<(String, PathSummary)>,
     headline: Obj,
     pub row_count_check: Option<RowCountCheck>,
+    pub txn_check: Option<TxnCheck>,
     pub real_conf: Option<String>,
     pub http_base: Option<String>,
 }
@@ -419,6 +426,7 @@ impl Report {
             paths: Vec::new(),
             headline: Obj::new(),
             row_count_check: None,
+            txn_check: None,
             real_conf: None,
             http_base: None,
         }
@@ -507,6 +515,23 @@ impl Report {
         self.headline = h;
     }
 
+    /// srv-covidx headline (`qwp_ingress_srvidx.rs`): pairs the flush-ack
+    /// wall with the WAL-applied wall (flush + drain). Applied rows/s is the
+    /// campaign's headline number — the server-side sustained rate.
+    pub fn compute_srvidx_headline(&mut self, batch_rows: usize) {
+        let (Some(flush), Some(applied)) = (self.path("srvidx-flush"), self.path("srvidx-applied"))
+        else {
+            return;
+        };
+        let mut h = Obj::new();
+        h.int("batch_rows", batch_rows as u64);
+        h.float("flush_s", flush.median_s);
+        h.float("applied_s", applied.median_s);
+        h.opt_float("flush_rows_per_s", flush.rows_per_s_median);
+        h.opt_float("applied_rows_per_s", applied.rows_per_s_median);
+        self.headline = h;
+    }
+
     pub fn into_json(self) -> String {
         let mut top = Obj::new();
         top.str("schema", &self.schema);
@@ -538,6 +563,13 @@ impl Report {
             o.bool("ok", rc.ok);
             o.bool("inflated", rc.inflated);
             top.raw("row_count_check", o.to_json(0));
+        }
+        if let Some(tc) = &self.txn_check {
+            let mut o = Obj::new();
+            o.int("expected", tc.expected);
+            o.int("actual", tc.actual);
+            o.bool("ok", tc.ok);
+            top.raw("txn_check", o.to_json(0));
         }
         if let Some(c) = &self.real_conf {
             top.str("real_conf", c);
