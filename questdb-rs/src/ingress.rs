@@ -1813,7 +1813,9 @@ impl SenderBuilder {
                 "The \"sf_max_segment_bytes\" setting is only supported for QWP/WebSocket."
             ));
         };
-        qwp_ws.sf_max_segment_bytes.set_specified("sf_max_segment_bytes", value)?;
+        qwp_ws
+            .sf_max_segment_bytes
+            .set_specified("sf_max_segment_bytes", value)?;
         Ok(self)
     }
 
