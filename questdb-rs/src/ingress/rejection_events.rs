@@ -5,7 +5,9 @@
 //! pool-wide handler, decoupled from the `wait()` ack barrier. With a
 //! user handler the delivery runs on a dedicated dispatcher thread through
 //! a bounded drop-oldest inbox; without one every rejection is logged, so
-//! silence is never the default.
+//! silence is never the default. A terminal diagnostic is published only
+//! after the connection's terminal latch and pollable diagnostics have been
+//! committed, so handler code can immediately observe the terminal state.
 
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -53,6 +55,19 @@ impl RejectionEventSource {
         Self {
             dispatcher: Mutex::new(None),
             fallback: Some(QwpWsErrorHandler::log_default()),
+            fallback_delivered: AtomicU64::new(0),
+            closed_delivered: AtomicU64::new(0),
+            closed_dropped: AtomicU64::new(0),
+        }
+    }
+
+    /// Test-only synchronous delivery for asserting publication ordering at
+    /// the exact call site, without scheduler timing in the assertion.
+    #[cfg(test)]
+    pub(crate) fn inline_for_test(handler: QwpWsErrorHandler) -> Self {
+        Self {
+            dispatcher: Mutex::new(None),
+            fallback: Some(handler),
             fallback_delivered: AtomicU64::new(0),
             closed_delivered: AtomicU64::new(0),
             closed_dropped: AtomicU64::new(0),

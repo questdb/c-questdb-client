@@ -71,7 +71,8 @@ pub struct QwpWsSenderError {
 ///
 /// The callback runs synchronously from sender API calls such as
 /// [`crate::ingress::Sender::flush`]. It must not call back into the same
-/// sender.
+/// sender. For a terminal diagnostic, the sender's terminal state and
+/// pollable diagnostic are committed before the callback is invoked.
 #[derive(Clone)]
 pub struct QwpWsErrorHandler {
     handler: Arc<dyn Fn(&QwpWsSenderError) + Send + Sync>,

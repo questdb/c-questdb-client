@@ -53,8 +53,9 @@ use crate::ingress::sender::has_any_sfa_file as slot_has_sfa_file;
 use crate::ingress::{AckLevel, ProtocolVersion, SenderBuilder, TimestampNanos};
 use crate::tests::qwp_ws::{
     perform_server_upgrade, perform_server_upgrade_durable, read_frame,
-    write_qwp_durable_ack_response, write_qwp_error_response, write_qwp_ok_response,
-    write_qwp_ok_response_with_table_entries, write_server_frame,
+    upgrade_mock_stream_with_max_batch_size, write_qwp_durable_ack_response,
+    write_qwp_error_response, write_qwp_ok_response, write_qwp_ok_response_with_table_entries,
+    write_server_frame,
 };
 use tempfile::TempDir;
 
@@ -64,6 +65,8 @@ const QWP_STATUS_SCHEMA_MISMATCH: u8 = 0x03;
 enum MockMode {
     /// Park the connection after upgrade — used by pool-only tests.
     Park,
+    /// Park after advertising a negotiated server-side frame cap.
+    ParkWithMaxBatchSize(usize),
     /// Read every QWP frame the client sends and reply with an OK ack.
     AckEachFrame,
     /// Reply to every QWP frame with an error ack carrying `status`.
@@ -111,6 +114,10 @@ struct MockServer {
 impl MockServer {
     fn spawn(max_accepts: usize) -> Self {
         Self::spawn_with_mode(max_accepts, MockMode::Park)
+    }
+
+    fn spawn_with_max_batch_size(max_accepts: usize, max_batch_size: usize) -> Self {
+        Self::spawn_with_mode(max_accepts, MockMode::ParkWithMaxBatchSize(max_batch_size))
     }
 
     fn spawn_acking(max_accepts: usize) -> Self {
@@ -289,12 +296,18 @@ fn run_mock_server_accept_loop(
                     // header; every other mode uses the plain upgrade.
                     let upgraded = if matches!(mode, MockMode::AckEachFrameDurable) {
                         perform_server_upgrade_durable(&mut stream).is_ok()
+                    } else if let MockMode::ParkWithMaxBatchSize(max_batch_size) = &mode {
+                        upgrade_mock_stream_with_max_batch_size(&mut stream, Some(*max_batch_size));
+                        true
                     } else {
                         perform_server_upgrade(&mut stream).is_ok()
                     };
                     if upgraded {
                         match mode {
                             MockMode::Park => park_connection(&mut stream, &stop),
+                            MockMode::ParkWithMaxBatchSize(_) => {
+                                park_connection(&mut stream, &stop)
+                            }
                             MockMode::AckEachFrame => ack_each_frame(&mut stream, &stop, capture),
                             MockMode::AckEachFrameDurable => {
                                 ack_each_frame_durable(&mut stream, &stop, capture)
@@ -6781,6 +6794,26 @@ mod conn_event_tests {
         );
         assert_eq!(db.connection_events_dropped(), 0);
         drop(borrowed);
+    }
+
+    #[test]
+    fn sfa_connected_observes_negotiated_server_frame_cap() {
+        let server_cap = 4096;
+        let server = MockServer::spawn_with_max_batch_size(2, server_cap);
+        let conf = conf_for(
+            server.port(),
+            "sender_pool_min=1;sender_pool_max=1;pool_reap=manual;close_flush_timeout_millis=0;",
+        );
+        let (seen, listener) = collecting_listener();
+        let db = QuestDb::connect_with_listener(&conf, listener, 0).unwrap();
+
+        let sender = db.borrow_sender().expect("SFA borrow");
+        wait_for_kinds(&seen, &[ConnectionEventKind::Connected]);
+        assert_eq!(
+            sender.effective_frame_cap_for_test(),
+            (server_cap, true),
+            "Connected must be delivered after the negotiated frame cap is visible"
+        );
     }
 
     #[test]

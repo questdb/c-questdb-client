@@ -2897,9 +2897,6 @@ pub(crate) fn connect_qwp_ws_endpoint_round<A: QwpWsHealthAccess>(
         ) {
             Ok((stream, handshake_result, leftover)) => {
                 health.with_tracker(|t| t.record_success(idx));
-                if let Some(events) = events {
-                    events.connect_succeeded(&endpoint.host, &endpoint.port);
-                }
                 *previous_idx = Some(idx);
                 return Ok(QwpWsConnectRoundSuccess {
                     endpoint_idx: idx,

@@ -608,14 +608,22 @@ impl QwpWsConnector {
         } else {
             self.max_buf_size
         };
-        Ok(RawQwpWsRoundStream {
+        let raw = RawQwpWsRoundStream {
             endpoint_idx: connected.endpoint_idx,
             stream: connected.stream,
             leftover: connected.leftover,
             max_buf_size,
             request_timeout: *self.qwp_ws.request_timeout,
             durable_ack_opt_in: *self.qwp_ws.request_durable_ack,
-        })
+        };
+        if let Some(events) = events
+            && let Some(endpoint) = self.endpoints.get(raw.endpoint_idx)
+        {
+            // Publish success only after the negotiated stream state,
+            // including the server frame cap, has been committed locally.
+            events.connect_succeeded(&endpoint.host, &endpoint.port);
+        }
+        Ok(raw)
     }
 
     pub(crate) fn connect_sfa_background_with_pool_slot(

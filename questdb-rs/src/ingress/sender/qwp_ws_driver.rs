@@ -527,10 +527,21 @@ impl<Q: PublicationLog> QwpWsPublicationStore<Q> {
     }
 
     pub(crate) fn mark_terminal(&mut self, error: Option<Error>) {
-        if self.lifecycle.terminalize() != PublicationState::Terminal {
-            self.terminal_error = error;
-            self.push_event(DriverEvent::Terminal);
+        self.try_mark_terminal(error);
+    }
+
+    fn try_mark_terminal(&mut self, error: Option<Error>) -> bool {
+        if self.lifecycle.load() == PublicationState::Terminal {
+            return false;
         }
+        // Publish all terminal diagnostics before releasing the terminal
+        // lifecycle state. An observer that acquires Terminal can therefore
+        // immediately consume the matching diagnostic.
+        self.terminal_error = error;
+        let previous = self.lifecycle.terminalize();
+        debug_assert_ne!(previous, PublicationState::Terminal);
+        self.push_event(DriverEvent::Terminal);
+        true
     }
 
     pub(crate) fn is_terminal(&self) -> bool {
@@ -605,7 +616,6 @@ impl<Q: PublicationLog> QwpWsPublicationStore<Q> {
     ) -> QwpWsSenderError {
         self.last_server_error = Some(error.clone());
         let sender_error = sender_error_for_qwp_error(&error, wire_seq, fsn, policy);
-        self.push_sender_error(sender_error.clone());
         if self.sender_errors.capacity() != 0 {
             if self.rejected_frames.len() == self.sender_errors.capacity() {
                 self.rejected_frames.pop_front();
@@ -616,6 +626,7 @@ impl<Q: PublicationLog> QwpWsPublicationStore<Q> {
                 error,
             });
         }
+        self.push_sender_error(sender_error.clone());
         sender_error
     }
 
@@ -627,9 +638,33 @@ impl<Q: PublicationLog> QwpWsPublicationStore<Q> {
         policy: QwpWsErrorPolicy,
     ) -> QwpWsSenderError {
         let sender_error = sender_error_for_qwp_error(&error, wire_seq, fsn, policy);
-        self.push_sender_error(sender_error.clone());
         self.last_server_error = Some(error);
+        self.push_sender_error(sender_error.clone());
         sender_error
+    }
+
+    fn record_terminal_sender_error(
+        &mut self,
+        sender_error: QwpWsSenderError,
+        terminal_error: Error,
+        last_server_error: Option<QwpServerError>,
+    ) -> Error {
+        if self.lifecycle.load() == PublicationState::Terminal {
+            return self.terminal_error.clone().unwrap_or(terminal_error);
+        }
+        if let Some(last_server_error) = last_server_error {
+            self.last_server_error = Some(last_server_error);
+        }
+        self.terminal_sender_error = Some(sender_error.clone());
+        self.sender_errors.push(sender_error.clone());
+        let committed = self.try_mark_terminal(Some(terminal_error.clone()));
+        debug_assert!(committed);
+        // User code is the final observer: the local diagnostic rings,
+        // terminal error, lifecycle latch, and driver event all precede it.
+        if let Some(sink) = &self.rejection_sink {
+            sink.publish(sender_error);
+        }
+        terminal_error
     }
 
     fn delivery_status(
@@ -697,13 +732,12 @@ impl<Q: PublicationLog> QwpWsPublicationStore<Q> {
             from_fsn,
             to_fsn,
         };
-        self.terminal_sender_error = Some(sender_error.clone());
-        self.push_sender_error(sender_error.clone());
-        error::fmt!(
+        let terminal_error = error::fmt!(
             ServerRejection,
             "QWP/WebSocket protocol violation: {message}"
         )
-        .with_qwp_ws_rejection(sender_error)
+        .with_qwp_ws_rejection(sender_error.clone());
+        self.record_terminal_sender_error(sender_error, terminal_error, None)
     }
 
     /// Terminal for a well-formed frame the server keeps rejecting without ACK
@@ -730,9 +764,9 @@ impl<Q: PublicationLog> QwpWsPublicationStore<Q> {
             from_fsn,
             to_fsn,
         };
-        self.terminal_sender_error = Some(sender_error.clone());
-        self.push_sender_error(sender_error.clone());
-        error::fmt!(StoreResendRequired, "{reason}").with_qwp_ws_rejection(sender_error)
+        let terminal_error = error::fmt!(StoreResendRequired, "{reason}")
+            .with_qwp_ws_rejection(sender_error.clone());
+        self.record_terminal_sender_error(sender_error, terminal_error, None)
     }
 
     pub(crate) fn poll_sender_error(&mut self) -> Option<QwpWsSenderError> {
@@ -778,10 +812,10 @@ impl<Q: PublicationLog> QwpWsPublicationStore<Q> {
     }
 
     fn push_sender_error(&mut self, error: QwpWsSenderError) {
+        self.sender_errors.push(error.clone());
         if let Some(sink) = &self.rejection_sink {
-            sink.publish(error.clone());
+            sink.publish(error);
         }
-        self.sender_errors.push(error);
     }
 }
 
@@ -882,20 +916,16 @@ impl<T: QwpWsCoreTransport> QwpWsSendCore<T> {
                     return Ok(DriveOutcome::Idle);
                 }
                 if !self.reject_target_can_complete(store, fsn) {
-                    let err = self.reject_gap_protocol_error(store, fsn);
                     store.last_server_error = Some(error.clone());
-                    store.mark_terminal(Some(err));
+                    self.reject_gap_protocol_error(store, fsn);
                     return Ok(DriveOutcome::Terminal);
                 }
 
                 if policy == QwpWsErrorPolicy::Terminal {
-                    let sender_error =
-                        store.record_reject_error(fsn, wire_seq, error.clone(), policy);
-                    store.terminal_sender_error = Some(sender_error.clone());
-                    store.mark_terminal(Some(server_rejection_error(
-                        error.error.clone(),
-                        sender_error,
-                    )));
+                    let sender_error = sender_error_for_qwp_error(&error, wire_seq, fsn, policy);
+                    let terminal_error =
+                        server_rejection_error(error.error.clone(), sender_error.clone());
+                    store.record_terminal_sender_error(sender_error, terminal_error, Some(error));
                     return Ok(DriveOutcome::Terminal);
                 }
 
@@ -921,12 +951,11 @@ impl<T: QwpWsCoreTransport> QwpWsSendCore<T> {
                     // required" under its own category so a file-backed slot's
                     // orphan drainer resends it, instead of mislabeling a
                     // graceful role switch as a wire-protocol violation.
-                    let err = if policy == QwpWsErrorPolicy::RetriableOther {
+                    if policy == QwpWsErrorPolicy::RetriableOther {
                         store.record_role_reject_resend(status, reason)
                     } else {
                         store.record_protocol_violation(None, reason)
                     };
-                    store.mark_terminal(Some(err));
                     return Ok(DriveOutcome::Terminal);
                 }
 
@@ -1036,13 +1065,8 @@ impl<T: QwpWsCoreTransport> QwpWsSendCore<T> {
         let sender_error =
             sender_error_for_qwp_error_span(&error, wire_seq, from_fsn, to_fsn, policy);
         if policy == QwpWsErrorPolicy::Terminal {
-            store.terminal_sender_error = Some(sender_error.clone());
-            store.push_sender_error(sender_error.clone());
-            store.last_server_error = Some(error.clone());
-            store.mark_terminal(Some(server_rejection_error(
-                error.error.clone(),
-                sender_error,
-            )));
+            let terminal_error = server_rejection_error(error.error.clone(), sender_error.clone());
+            store.record_terminal_sender_error(sender_error, terminal_error, Some(error));
             Ok(DriveOutcome::Terminal)
         } else {
             // A Retriable presend reject carries no FSN -- most commonly the server
@@ -1076,21 +1100,20 @@ impl<T: QwpWsCoreTransport> QwpWsSendCore<T> {
                     )
                 };
                 let status = error.status;
-                store.push_sender_error(sender_error);
                 store.last_server_error = Some(error);
+                store.push_sender_error(sender_error);
                 // See `handle_reject`: a role/read-only catch-up reject is
                 // "resend required", not a protocol violation.
-                let err = if policy == QwpWsErrorPolicy::RetriableOther {
+                if policy == QwpWsErrorPolicy::RetriableOther {
                     store.record_role_reject_resend(status, reason)
                 } else {
                     store.record_protocol_violation(None, reason)
                 };
-                store.mark_terminal(Some(err));
                 return Ok(DriveOutcome::Terminal);
             }
             let initial_error = server_rejection_error(error.error.clone(), sender_error.clone());
-            store.push_sender_error(sender_error);
             store.last_server_error = Some(error);
+            store.push_sender_error(sender_error);
             let pace = self.reconnect_pace_for_reject_policy(policy);
             self.pending_reconnect = Some(
                 self.begin_reconnect(
@@ -1649,7 +1672,6 @@ impl<T: QwpWsCoreTransport> QwpWsSendCore<T> {
                     };
                 }
                 if let Some(error) = self.server_close_poison_error(store) {
-                    store.mark_terminal(Some(error.clone()));
                     QwpWsTransportFailureAction::Terminal(error)
                 } else {
                     let pace = self.reconnect_pace_for_strikes(self.poison_tracker.strikes());
@@ -1671,7 +1693,6 @@ impl<T: QwpWsCoreTransport> QwpWsSendCore<T> {
             }
             TransportFailure::ProtocolViolation { close_code, reason } => {
                 let error = store.record_protocol_violation(close_code, reason);
-                store.mark_terminal(Some(error.clone()));
                 QwpWsTransportFailureAction::Terminal(error)
             }
         }
@@ -2913,8 +2934,8 @@ impl BlockingQwpWsTransport {
         server_max_batch_size: Arc<AtomicUsize>,
         connected: QwpWsConnectRoundSuccess,
     ) -> Self {
-        server_max_batch_size.store(connected.server_max_batch_size, Ordering::Relaxed);
-        Self {
+        server_max_batch_size.store(connected.server_max_batch_size, Ordering::Release);
+        let transport = Self {
             endpoints,
             previous_idx: Some(connected.endpoint_idx),
             tracker,
@@ -2930,7 +2951,9 @@ impl BlockingQwpWsTransport {
             send_buf: Vec::with_capacity(16 * 1024),
             pending_wire_sequences: VecDeque::new(),
             last_durable_keepalive_ping: None,
-        }
+        };
+        transport.emit_connect_succeeded();
+        transport
     }
 
     pub(crate) fn negotiated_version(&self) -> u8 {
@@ -2962,12 +2985,23 @@ impl BlockingQwpWsTransport {
         self.stream = connected.stream;
         self.negotiated_version = connected.negotiated_version;
         self.server_max_batch_size
-            .store(connected.server_max_batch_size, Ordering::Relaxed);
+            .store(connected.server_max_batch_size, Ordering::Release);
         self.reader = WsFrameReader::with_initial_input(connected.leftover);
         self.send_buf.clear();
         self.pending_wire_sequences.clear();
         self.last_durable_keepalive_ping = None;
+        self.emit_connect_succeeded();
         Ok(())
+    }
+
+    fn emit_connect_succeeded(&self) {
+        if matches!(self.connect_kind, QwpWsConnectKind::Foreground)
+            && let Some(events) = self.qwp_ws.conn_events.as_deref()
+            && let Some(idx) = self.previous_idx
+            && let Some(endpoint) = self.endpoints.get(idx)
+        {
+            events.connect_succeeded(&endpoint.host, &endpoint.port);
+        }
     }
 
     fn complete_pending_through(&mut self, sequence: u64) {
@@ -3159,7 +3193,7 @@ impl QwpWsCoreTransport for BlockingQwpWsTransport {
     }
 
     fn server_max_batch_size(&self) -> usize {
-        self.server_max_batch_size.load(Ordering::Relaxed)
+        self.server_max_batch_size.load(Ordering::Acquire)
     }
 
     fn negotiated_qwp_version(&self) -> u8 {
@@ -3868,7 +3902,29 @@ mod tests {
     use super::super::qwp_ws_publisher::QwpWsReplayEncoder;
     use super::*;
     use crate::ingress::buffer::{QwpWsColumnarBuffer, QwpWsEncodeScratch, SymbolGlobalDict};
+    use crate::ingress::rejection_events::RejectionEventSource;
     use crate::ingress::{Buffer, QwpWsErrorCategory, QwpWsErrorPolicy, TimestampNanos};
+    use std::sync::atomic::AtomicBool;
+
+    fn terminal_latch_asserting_sink(
+        lifecycle: PublicationLifecycle,
+    ) -> (Arc<RejectionEventSource>, Arc<AtomicBool>) {
+        let callback_ran = Arc::new(AtomicBool::new(false));
+        let callback_ran_in_handler = Arc::clone(&callback_ran);
+        let sink = RejectionEventSource::inline_for_test(crate::ingress::QwpWsErrorHandler::new(
+            move |error| {
+                if error.applied_policy == QwpWsErrorPolicy::Terminal {
+                    assert_eq!(
+                        lifecycle.load(),
+                        PublicationState::Terminal,
+                        "terminal rejection callback ran before the terminal latch"
+                    );
+                    callback_ran_in_handler.store(true, Ordering::Release);
+                }
+            },
+        ));
+        (Arc::new(sink), callback_ran)
+    }
 
     #[test]
     fn catch_up_offset_maps_replay_acks_and_ignores_catch_up_acks() {
@@ -7886,6 +7942,20 @@ mod tests {
     }
 
     #[test]
+    fn first_terminal_error_wins_over_late_structured_diagnostic() {
+        let queue = memory_queue(options(4, 1024, 2));
+        let mut store = QwpWsPublicationStore::new(queue, DEFAULT_EVENT_CAPACITY);
+        store.mark_terminal(Some(Error::new(ErrorCode::SocketError, "first terminal")));
+
+        let returned = store.record_protocol_violation(None, "late violation".to_string());
+
+        assert_eq!(returned.msg(), "first terminal");
+        assert_eq!(store.terminal_error().unwrap().msg(), "first terminal");
+        assert_eq!(store.terminal_sender_error(), None);
+        assert_eq!(store.poll_sender_error(), None);
+    }
+
+    #[test]
     fn close_drain_drives_until_all_published_receipts_resolve() {
         let mut driver = driver(FakeOrderedServer::ack_each_send());
         let first = driver.try_submit(b"first").unwrap();
@@ -8222,6 +8292,8 @@ mod tests {
             FakeSendResult::RejectWire { wire_seq: 2 },
             FakeSendResult::RejectWire { wire_seq: 3 },
         ]));
+        let (sink, callback_ran) = terminal_latch_asserting_sink(driver.store.lifecycle());
+        driver.store.set_rejection_sink(Some(sink));
         let receipt = driver.try_submit(b"payload").unwrap();
 
         let mut outcome = driver.drive_once().unwrap();
@@ -8250,6 +8322,7 @@ mod tests {
             "poison terminal must carry the last server error, got: {:?}",
             terminal_error.message
         );
+        assert!(callback_ran.load(Ordering::Acquire));
     }
 
     #[test]
@@ -8265,6 +8338,8 @@ mod tests {
             FakeSendResult::RejectWireNotWritable { wire_seq: 2 },
             FakeSendResult::RejectWireNotWritable { wire_seq: 3 },
         ]));
+        let (sink, callback_ran) = terminal_latch_asserting_sink(driver.store.lifecycle());
+        driver.store.set_rejection_sink(Some(sink));
         let receipt = driver.try_submit(b"payload").unwrap();
 
         let mut outcome = driver.drive_once().unwrap();
@@ -8292,6 +8367,7 @@ mod tests {
         );
         assert_eq!(terminal_error.applied_policy, QwpWsErrorPolicy::Terminal);
         assert_eq!(terminal_error.status, Some(codec::WS_STATUS_NOT_WRITABLE));
+        assert!(callback_ran.load(Ordering::Acquire));
     }
 
     #[test]
@@ -8430,6 +8506,8 @@ mod tests {
     #[test]
     fn terminal_qwp_server_error_is_pollable_after_terminalization() {
         let mut driver = driver(FakeOrderedServer::no_response());
+        let (sink, callback_ran) = terminal_latch_asserting_sink(driver.store.lifecycle());
+        driver.store.set_rejection_sink(Some(sink));
         let receipt = driver.try_submit(b"payload").unwrap();
         assert!(matches!(
             driver.drive_once().unwrap(),
@@ -8475,11 +8553,14 @@ mod tests {
         assert_eq!(error.from_fsn, 0);
         assert_eq!(error.to_fsn, 0);
         assert_eq!(driver.terminal_sender_error(), Some(&error));
+        assert!(callback_ran.load(Ordering::Acquire));
     }
 
     #[test]
     fn protocol_violation_error_records_unresolved_fsn_span() {
         let mut driver = driver(FakeOrderedServer::no_response());
+        let (sink, callback_ran) = terminal_latch_asserting_sink(driver.store.lifecycle());
+        driver.store.set_rejection_sink(Some(sink));
         driver.try_submit(b"first").unwrap();
         driver.try_submit(b"second").unwrap();
 
@@ -8514,6 +8595,7 @@ mod tests {
                 .unwrap()
                 .contains("bad frame")
         );
+        assert!(callback_ran.load(Ordering::Acquire));
 
         let error = driver.poll_sender_error().unwrap();
         assert_eq!(error.category, QwpWsErrorCategory::ProtocolViolation);
@@ -8700,6 +8782,8 @@ mod tests {
             },
         });
         let mut driver = driver(server);
+        let (sink, callback_ran) = terminal_latch_asserting_sink(driver.store.lifecycle());
+        driver.store.set_rejection_sink(Some(sink));
         let receipt = driver.try_submit(b"payload").unwrap();
 
         assert_eq!(driver.drive_receive_once(), Ok(DriveOutcome::Terminal));
@@ -8716,6 +8800,7 @@ mod tests {
         assert_eq!(terminal_error.message_sequence, Some(7));
         assert_eq!(terminal_error.from_fsn, 0);
         assert_eq!(terminal_error.to_fsn, 0);
+        assert!(callback_ran.load(Ordering::Acquire));
     }
 
     #[test]

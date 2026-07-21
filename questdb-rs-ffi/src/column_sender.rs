@@ -1248,7 +1248,10 @@ pub struct questdb_connection_event {
 }
 
 /// Callback invoked on a dedicated dispatcher thread — never on an I/O
-/// or producer thread — once per connection event. The `event` pointer
+/// or producer thread — once per connection event. Connected, reconnected,
+/// and failed-over events are queued only after negotiated connection state,
+/// including the server-advertised frame cap, is committed; they are not data
+/// delivery or acknowledgement barriers. The `event` pointer
 /// (and every string it references) is valid only for the duration of
 /// the call. The callback must not unwind.
 pub type questdb_connection_event_cb =
@@ -1418,7 +1421,9 @@ pub unsafe extern "C" fn questdb_db_connection_events_delivered(db: *const quest
 /// 64; overflow drops the oldest event, counted by
 /// `questdb_db_rejection_events_dropped`). The caller guarantees each
 /// `user_data` is safe to use from its dispatcher thread until
-/// `questdb_db_close` returns.
+/// `questdb_db_close` returns. A terminal rejection enters the handler inbox
+/// only after the connection's terminal latch and pollable diagnostic have
+/// been committed.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn questdb_db_connect_with_handlers(
     conf: *const c_char,

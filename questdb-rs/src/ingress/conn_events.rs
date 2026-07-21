@@ -7,8 +7,11 @@
 //! a dedicated dispatcher thread through a bounded inbox with a
 //! drop-oldest overflow policy, so a slow listener can never stall
 //! connect, publish, or reconnect paths. Success events fire once per
-//! transition; failure events may be coalesced (dropped) under inbox
-//! pressure — observable via [`ConnectionEventDispatcher::dropped`].
+//! transition and are queued only after negotiated connection state,
+//! including the server-advertised frame cap, is committed. They are not
+//! data-delivery or acknowledgement barriers. Failure events may be
+//! coalesced (dropped) under inbox pressure — observable via
+//! [`ConnectionEventDispatcher::dropped`].
 
 use std::collections::VecDeque;
 use std::panic::{AssertUnwindSafe, catch_unwind};
@@ -24,7 +27,8 @@ pub const DEFAULT_CONNECTION_EVENT_INBOX_CAPACITY: usize = 64;
 #[non_exhaustive]
 pub enum ConnectionEventKind {
     /// The very first successful connect observed by this event source.
-    /// Fired once, before any data has been sent on the connection.
+    /// Fired once, after negotiated state is committed and before any data
+    /// has been sent on the connection.
     Connected,
     /// An active wire connection died. Fired once per detected loss,
     /// before any reconnect attempt.

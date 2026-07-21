@@ -153,6 +153,9 @@ size_t questdb_db_reap_idle(questdb_db* db);
  * drop-oldest overflow policy, so a slow callback cannot stall connects or
  * publishing. Direct and store-and-forward senders share this one source and
  * inbox; concurrent events are delivered in the order they enter that inbox.
+ * Connected, reconnected, and failed-over events enter the inbox only after
+ * negotiated connection state, including the server-advertised frame cap, is
+ * committed. They are not data-delivery or acknowledgement barriers.
  *
  * Registration happens before the pool opens anything, so the listener
  * observes every transition — including the initial `connected` of disk
@@ -194,7 +197,9 @@ questdb_db* questdb_db_connect_with_event_handler(
  * the default 64; overflow drops the oldest event, counted by
  * `questdb_db_rejection_events_dropped`). The caller guarantees each
  * `user_data` is safe to use from its dispatcher thread until
- * `questdb_db_close` returns. */
+ * `questdb_db_close` returns. A terminal rejection enters the handler inbox
+ * only after the connection's terminal latch and pollable diagnostic have
+ * been committed. */
 QUESTDB_CLIENT_API
 questdb_db* questdb_db_connect_with_handlers(
     const char* conf,

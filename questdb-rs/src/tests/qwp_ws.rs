@@ -5181,7 +5181,7 @@ fn qwp_ws_from_conf_parses_java_reconnect_keys() {
 
 // ---------- X-QWP-Max-Batch-Size handling ----------
 
-fn upgrade_mock_stream_with_max_batch_size(
+pub(crate) fn upgrade_mock_stream_with_max_batch_size(
     stream: &mut TcpStream,
     max_batch_size: Option<usize>,
 ) -> Vec<String> {

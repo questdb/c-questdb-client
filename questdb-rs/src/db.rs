@@ -1623,6 +1623,11 @@ impl Debug for DirectSenderHandle<'_> {
 pub struct BorrowedSender<'a>(SenderHandle<'a>);
 
 impl<'a> BorrowedSender<'a> {
+    #[cfg(test)]
+    pub(crate) fn effective_frame_cap_for_test(&self) -> (usize, bool) {
+        self.0.inner_ref().effective_frame_cap()
+    }
+
     /// Create a caller-owned QWP/WebSocket [`Buffer`] using the pool's
     /// configured name limit. The buffer is not tied to this lease and may be
     /// flushed by another sender borrowed from the same pool.

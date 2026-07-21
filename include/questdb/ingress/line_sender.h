@@ -1593,7 +1593,8 @@ bool line_sender_opts_qwpws_progress(
 /**
  * Install a QWP/WebSocket server-diagnostic callback. Passing NULL restores the
  * default C callback, which writes one structured line to stderr per
- * diagnostic.
+ * diagnostic. For a terminal diagnostic, the sender's terminal state and
+ * pollable diagnostic are committed before the callback is invoked.
  */
 QUESTDB_CLIENT_API
 bool line_sender_opts_qwpws_error_handler(
@@ -2255,6 +2256,9 @@ typedef struct questdb_connection_event
 } questdb_connection_event;
 
 /** Callback invoked once per connection event on the dispatcher thread.
+ * Connected, reconnected, and failed-over events are queued only after the
+ * negotiated connection state, including the server-advertised frame cap, is
+ * committed. They are not data-delivery or acknowledgement barriers.
  * The `event` pointer and every string it references are valid only for
  * the duration of the call. Must not unwind. */
 typedef void (*questdb_connection_event_cb)(
