@@ -2799,10 +2799,7 @@ fn cancel_write_failure_does_not_trigger_failover() {
     // so transport errors propagate without reconnecting.
     while let Ok(Some(_)) = cursor.next_batch() {}
 
-    assert!(
-        !cursor.connection_reusable(),
-        "a cancellation path ending in RST must not expose the reader as reusable"
-    );
+    assert!(!cursor.connection_reusable());
 
     drop(cursor);
     assert_eq!(

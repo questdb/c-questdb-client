@@ -2853,11 +2853,8 @@ pub unsafe extern "C" fn qwp_reader_cursor_terminal_exec_done(
     }
 }
 
-/// Return whether freeing this cursor now leaves the originating reader's
-/// connection safe to reuse. This is true after any terminal received on a
-/// healthy transport, including a server `QUERY_ERROR`, and false while the
-/// cursor is active or after the transport was torn down. Returns false for a
-/// NULL handle.
+/// Whether freeing this cursor leaves its reader connection reusable.
+/// Returns false for a NULL handle.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn qwp_reader_cursor_connection_reusable(
     cursor: *const qwp_reader_cursor,
@@ -2865,12 +2862,9 @@ pub unsafe extern "C" fn qwp_reader_cursor_connection_reusable(
     unsafe { !cursor.is_null() && (*cursor).cursor.connection_reusable() }
 }
 
-/// Send a `CANCEL` frame and drain the stream until the server's terminal
-/// reply. Idempotent once the cursor has reached terminal. Returns false and
-/// sets `*err_out` if the drain observes a non-cancellation query error or a
-/// transport/protocol failure. Use `qwp_reader_cursor_connection_reusable`
-/// before freeing the cursor to distinguish a healthy request terminal from
-/// a torn-down connection.
+/// Send `CANCEL` and drain to terminal. On failure, use
+/// `qwp_reader_cursor_connection_reusable` to decide whether the connection
+/// can be reused.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn qwp_reader_cursor_cancel(
     cursor: *mut qwp_reader_cursor,

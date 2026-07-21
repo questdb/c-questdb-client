@@ -1211,10 +1211,7 @@ fn query_error_for_bad_sql() {
         }
         Ok(_) => panic!("expected QUERY_ERROR for bad SQL"),
     }
-    assert!(
-        cur.connection_reusable(),
-        "a server QUERY_ERROR terminates only the request"
-    );
+    assert!(cur.connection_reusable());
     drop(cur);
 
     let mut next = reader
