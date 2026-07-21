@@ -129,6 +129,26 @@ stages:
             env:
               JAVA_HOME: $(JAVA_HOME_25_X64)
             displayName: "Integration tests"
+          - task: ArchiveFiles@2
+            displayName: "Compress QuestDB server log on failure"
+            condition: failed()
+            continueOnError: true
+            inputs:
+              rootFolderOrFile: >-
+                $(Build.SourcesDirectory)/build/questdb/repo/data/log
+              includeRootFolder: false
+              archiveType: zip
+              archiveFile: >-
+                $(Build.ArtifactStagingDirectory)/qdb-log-native-$(imageName).zip
+              quiet: true
+          - task: PublishBuildArtifacts@1
+            displayName: "Publish QuestDB server log on failure"
+            condition: failed()
+            continueOnError: true
+            inputs:
+              pathToPublish: >-
+                $(Build.ArtifactStagingDirectory)/qdb-log-native-$(imageName).zip
+              artifactName: qdb-log-native-$(imageName)
       - job: VersionMatrix
         displayName: "arrow/polars version-range tests (linux)"
         pool:

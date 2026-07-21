@@ -301,6 +301,13 @@ class _BuildModeFuzzResult(unittest.TextTestResult):
         self._note_build_mode(test)
 
     def addError(self, test, err):
+        if isinstance(err[1], TimeoutError):
+            try:
+                QDB_FIXTURE.capture_timeout_diagnostics(test.id())
+            except Exception as diagnostics_error:
+                self.stream.writeln(
+                    f'Failed to capture QuestDB timeout diagnostics: '
+                    f'{diagnostics_error!r}')
         super().addError(test, err)
         self._note_build_mode(test)
 

@@ -306,6 +306,9 @@ class QuestDbFixtureBase:
         """Print the QuestDB log to stderr."""
         sys.stderr.write('questdb log output skipped.\n')
 
+    def capture_timeout_diagnostics(self, test_name):
+        pass
+
     def http_headers(self):
         if not getattr(self, 'http_auth', False):
             return {}
@@ -685,6 +688,40 @@ class QuestDbFixture(QuestDbFixtureBase):
             return False
         return True
 
+    def _request_thread_dump(self):
+        if self._proc is None or self._proc.poll() is not None:
+            return False
+        if sys.platform == 'win32':
+            return self._win_send_console_ctrl('ctrl_break')
+        if hasattr(signal, 'SIGQUIT'):
+            try:
+                self._proc.send_signal(signal.SIGQUIT)
+                return True
+            except OSError:
+                pass
+        return False
+
+    def capture_timeout_diagnostics(self, test_name):
+        sys.stderr.write(
+            f'Capturing QuestDB diagnostics after timeout in {test_name}.\n')
+        req = urllib.request.Request(
+            f'http://127.0.0.1:{self.http_server_port}/ping',
+            headers=self.http_headers(),
+            method='GET')
+        try:
+            with urllib.request.urlopen(req, timeout=1) as resp:
+                sys.stderr.write(
+                    f'QuestDB /ping after timeout: HTTP {resp.status}.\n')
+        except Exception as e:
+            sys.stderr.write(f'QuestDB /ping after timeout failed: {e!r}.\n')
+
+        if self._request_thread_dump():
+            sys.stderr.write(
+                f'Requested a JVM thread dump in `{self._log_path}`.\n')
+            time.sleep(2)
+        else:
+            sys.stderr.write('Could not request a JVM thread dump.\n')
+
     def stop(self, wait_timeout_sec=30):
         if self._tls_proxy:
             self._tls_proxy.stop()
@@ -719,16 +756,7 @@ class QuestDbFixture(QuestDbFixtureBase):
                 # first, so a hung shutdown identifies the blocked thread
                 # instead of vanishing without a trace: SIGQUIT on POSIX,
                 # Ctrl+Break on Windows.
-                dump_requested = False
-                if sys.platform == 'win32':
-                    dump_requested = self._win_send_console_ctrl(
-                        'ctrl_break')
-                elif hasattr(signal, 'SIGQUIT'):
-                    try:
-                        self._proc.send_signal(signal.SIGQUIT)
-                        dump_requested = True
-                    except OSError:
-                        pass
+                dump_requested = self._request_thread_dump()
                 if dump_requested:
                     sys.stderr.write(
                         'Requested a JVM thread dump; it goes to '
