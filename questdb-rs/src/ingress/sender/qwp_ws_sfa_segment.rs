@@ -277,13 +277,18 @@ impl SfaSegment {
         let path = path.as_ref();
         let file = OpenOptions::new().read(true).write(true).open(path)?;
         let size_bytes = file.metadata()?.len();
-        if size_bytes < HEADER_SIZE as u64 {
-            return Err(SfaSegmentError::FileTooShort {
-                size: size_bytes as usize,
-            });
-        }
+        // Scan through plain reads BEFORE the file is ever mapped: recovery
+        // runs right after a power loss, exactly when an unreadable sector is
+        // most likely, and a read fault through a mapping would SIGBUS the
+        // host application instead of returning this scan's `Err`.
+        let scan = scan_segment_metadata_source(&file, size_bytes)?;
+        // Re-reserve the blocks creation reserved: a power loss can persist
+        // the file's size without its extents (and a copied/restored slot may
+        // be sparse), which would re-open the SIGBUS-on-ENOSPC window for the
+        // recovered active segment's mmap'd appends. No-op when the blocks
+        // are already allocated.
+        reserve_segment_blocks(&file, size_bytes)?;
         let mapping = map_file_mut(&file, size_bytes)?;
-        let scan = mapping.with_full_slice(scan_segment_metadata_bytes)?;
         Ok(Self {
             file: Some(file),
             mapping,
@@ -515,6 +520,7 @@ impl SfaSegmentMapping {
         unsafe { slice::from_raw_parts(self.base.add(offset) as *const u8, len) }
     }
 
+    #[cfg(test)]
     fn with_full_slice<R>(&self, f: impl FnOnce(&[u8]) -> R) -> R {
         self.with_slice(0, self.len, f)
     }
@@ -540,29 +546,17 @@ pub(crate) fn scan_file_metadata(
 ) -> Result<SfaSegmentMetadataScan, SfaSegmentError> {
     let file = File::open(path)?;
     let size_bytes = file.metadata()?.len();
-    if size_bytes < HEADER_SIZE as u64 {
-        return Err(SfaSegmentError::FileTooShort {
-            size: usize::try_from(size_bytes).unwrap_or(usize::MAX),
-        });
-    }
-    let len = usize::try_from(size_bytes)
-        .map_err(|_| SfaSegmentError::SizeTooLargeForPlatform { size: size_bytes })?;
-    // SAFETY: this read-only mapping is used only for a synchronous metadata
-    // scan while the SFA slot lock prevents another writer from mutating files
-    // in this slot.
-    let mmap = unsafe {
-        MmapOptions::new()
-            .len(len)
-            .map(&file)
-            .map_err(SfaSegmentError::Io)?
-    };
-    scan_segment_metadata_bytes(&mmap)
+    // Scan through plain reads, never a mapping (see the [`ReadAt`] note): a
+    // post-power-loss unreadable sector must surface as an `Err` the recovery
+    // caller can report, not SIGBUS the host application.
+    scan_segment_metadata_source(&file, size_bytes)
 }
 
-pub(crate) fn scan_segment_metadata_bytes(
-    bytes: &[u8],
+fn scan_segment_metadata_source<S: ReadAt + ?Sized>(
+    source: &S,
+    source_len: u64,
 ) -> Result<SfaSegmentMetadataScan, SfaSegmentError> {
-    let raw = scan_segment_bytes_inner(bytes, |_, _, _, _| Ok(()))?;
+    let raw = scan_segment_source_inner(source, source_len, |_, _, _| Ok(()))?;
     Ok(SfaSegmentMetadataScan {
         header: raw.header,
         frame_count: raw.frame_count,
@@ -573,13 +567,21 @@ pub(crate) fn scan_segment_metadata_bytes(
 }
 
 #[cfg(test)]
+pub(crate) fn scan_segment_metadata_bytes(
+    bytes: &[u8],
+) -> Result<SfaSegmentMetadataScan, SfaSegmentError> {
+    scan_segment_metadata_source(bytes, bytes.len() as u64)
+}
+
+#[cfg(test)]
 pub(crate) fn scan_segment_bytes(bytes: &[u8]) -> Result<SfaSegmentScan, SfaSegmentError> {
     let mut frames = Vec::new();
-    let raw = scan_segment_bytes_inner(bytes, |fsn, offset, _payload_len, payload| {
+    let raw = scan_segment_source_inner(bytes, bytes.len() as u64, |fsn, offset, payload_len| {
+        let start = offset as usize + FRAME_HEADER_SIZE;
         frames.push(SfaFrame {
             fsn,
             offset,
-            payload: payload.to_vec(),
+            payload: bytes[start..start + payload_len].to_vec(),
         });
         Ok(())
     })?;
@@ -600,32 +602,42 @@ struct RawSegmentScan {
     first_empty_payload_fsn: Option<u64>,
 }
 
-fn scan_segment_bytes_inner(
-    bytes: &[u8],
-    mut on_frame: impl FnMut(u64, u64, usize, &[u8]) -> Result<(), SfaSegmentError>,
-) -> Result<RawSegmentScan, SfaSegmentError> {
-    if bytes.len() < HEADER_SIZE {
-        return Err(SfaSegmentError::FileTooShort { size: bytes.len() });
-    }
+/// Bound on the scanner's transient buffer: a frame's CRC is computed by
+/// streaming its payload through this chunk, so scanning never buffers a
+/// whole frame (or file) regardless of segment size.
+const SCAN_CHUNK_BYTES: usize = 64 * 1024;
 
-    let magic = read_u32(bytes, 0);
+fn scan_segment_source_inner<S: ReadAt + ?Sized>(
+    source: &S,
+    source_len: u64,
+    mut on_frame: impl FnMut(u64, u64, usize) -> Result<(), SfaSegmentError>,
+) -> Result<RawSegmentScan, SfaSegmentError> {
+    if source_len < HEADER_SIZE as u64 {
+        return Err(SfaSegmentError::FileTooShort {
+            size: usize::try_from(source_len).unwrap_or(usize::MAX),
+        });
+    }
+    let mut header_buf = [0u8; HEADER_SIZE];
+    read_exact_at(source, &mut header_buf, 0)?;
+
+    let magic = read_u32(&header_buf, 0);
     if magic != FILE_MAGIC {
         return Err(SfaSegmentError::BadMagic { actual: magic });
     }
-    let version = bytes[4];
+    let version = header_buf[4];
     if version != VERSION {
         return Err(SfaSegmentError::UnsupportedVersion { actual: version });
     }
-    let flags = bytes[5];
+    let flags = header_buf[5];
     if flags != 0 {
         return Err(SfaSegmentError::NonZeroFlags { actual: flags });
     }
-    let reserved = u16::from_le_bytes([bytes[6], bytes[7]]);
+    let reserved = u16::from_le_bytes([header_buf[6], header_buf[7]]);
     if reserved != 0 {
         return Err(SfaSegmentError::NonZeroReserved { actual: reserved });
     }
 
-    let base_seq_i64 = read_i64(bytes, 8);
+    let base_seq_i64 = read_i64(&header_buf, 8);
     if base_seq_i64 < 0 {
         return Err(SfaSegmentError::NegativeBaseSeq {
             actual: base_seq_i64,
@@ -633,29 +645,41 @@ fn scan_segment_bytes_inner(
     }
     let header = SfaSegmentHeader {
         base_seq: base_seq_i64 as u64,
-        created_us: read_u64(bytes, 16),
+        created_us: read_u64(&header_buf, 16),
     };
 
+    let mut chunk = vec![0u8; SCAN_CHUNK_BYTES];
     let mut frame_count = 0u64;
     let mut first_empty_payload_fsn = None;
-    let mut pos = HEADER_SIZE;
-    while pos + FRAME_HEADER_SIZE <= bytes.len() {
-        let crc_read = read_u32(bytes, pos);
-        let payload_len_i32 = read_i32(bytes, pos + 4);
+    let mut pos = HEADER_SIZE as u64;
+    while pos + (FRAME_HEADER_SIZE as u64) <= source_len {
+        let mut frame_header = [0u8; FRAME_HEADER_SIZE];
+        read_exact_at(source, &mut frame_header, pos)?;
+        let crc_read = read_u32(&frame_header, 0);
+        let payload_len_i32 = read_i32(&frame_header, 4);
         if payload_len_i32 < 0 {
             break;
         }
 
-        let payload_len = payload_len_i32 as usize;
-        let frame_end = match pos
-            .checked_add(FRAME_HEADER_SIZE)
-            .and_then(|value| value.checked_add(payload_len))
-        {
-            Some(value) if value <= bytes.len() => value,
+        let payload_len = payload_len_i32 as u64;
+        let payload_start = pos + FRAME_HEADER_SIZE as u64;
+        let frame_end = match payload_start.checked_add(payload_len) {
+            Some(value) if value <= source_len => value,
             _ => break,
         };
 
-        let crc_calc = crc32c_update(0, &bytes[pos + 4..frame_end]);
+        // The CRC covers the length field and the payload; stream the payload
+        // through the bounded chunk instead of materialising the frame.
+        let mut crc_calc = crc32c_update(0, &frame_header[4..8]);
+        let mut read_pos = payload_start;
+        while read_pos < frame_end {
+            let n = chunk
+                .len()
+                .min(usize::try_from(frame_end - read_pos).unwrap_or(chunk.len()));
+            read_exact_at(source, &mut chunk[..n], read_pos)?;
+            crc_calc = crc32c_update(crc_calc, &chunk[..n]);
+            read_pos += n as u64;
+        }
         if crc_calc != crc_read {
             break;
         }
@@ -664,11 +688,10 @@ fn scan_segment_bytes_inner(
             .base_seq
             .checked_add(frame_count)
             .ok_or(SfaSegmentError::OffsetOverflow)?;
-        let payload = &bytes[pos + FRAME_HEADER_SIZE..frame_end];
         if payload_len == 0 && first_empty_payload_fsn.is_none() {
             first_empty_payload_fsn = Some(fsn);
         }
-        on_frame(fsn, pos as u64, payload_len, payload)?;
+        on_frame(fsn, pos, payload_len_i32 as usize)?;
         frame_count = frame_count
             .checked_add(1)
             .ok_or(SfaSegmentError::OffsetOverflow)?;
@@ -678,8 +701,8 @@ fn scan_segment_bytes_inner(
     Ok(RawSegmentScan {
         header,
         frame_count,
-        append_offset: pos as u64,
-        torn_tail_bytes: detect_torn_tail(bytes, pos),
+        append_offset: pos,
+        torn_tail_bytes: detect_torn_tail(source, source_len, pos)?,
         first_empty_payload_fsn,
     })
 }
@@ -711,23 +734,114 @@ fn validate_new_segment_args(base_seq: u64, size_bytes: u64) -> Result<(), SfaSe
     validate_base_seq(base_seq)
 }
 
-fn detect_torn_tail(bytes: &[u8], last_good: usize) -> u64 {
-    if last_good >= bytes.len() {
-        return 0;
+fn detect_torn_tail<S: ReadAt + ?Sized>(
+    source: &S,
+    source_len: u64,
+    last_good: u64,
+) -> Result<u64, SfaSegmentError> {
+    if last_good >= source_len {
+        return Ok(0);
     }
-    let probe_len = FRAME_HEADER_SIZE.min(bytes.len() - last_good);
-    if bytes[last_good..last_good + probe_len]
-        .iter()
-        .any(|byte| *byte != 0)
-    {
-        (bytes.len() - last_good) as u64
+    let tail = source_len - last_good;
+    let probe_len = (FRAME_HEADER_SIZE as u64).min(tail) as usize;
+    let mut probe = [0u8; FRAME_HEADER_SIZE];
+    read_exact_at(source, &mut probe[..probe_len], last_good)?;
+    if probe[..probe_len].iter().any(|byte| *byte != 0) {
+        Ok(tail)
     } else {
-        0
+        Ok(0)
     }
 }
 
 fn crc32c_update(seed: u32, bytes: &[u8]) -> u32 {
     crc32c::crc32c_append(seed, bytes)
+}
+
+/// Positional-read abstraction so one scanner implementation serves both
+/// in-memory bytes (tests, fixtures) and a `File` read through plain
+/// syscalls. Recovery deliberately scans files via `read_at` and never
+/// through a mapping: on unstable hardware a power loss can leave a sector
+/// unreadable, and a plain read surfaces that as `Err(EIO)` while an mmap
+/// page fault has no error channel and would SIGBUS the host application.
+pub(crate) trait ReadAt {
+    fn read_at(&self, buf: &mut [u8], offset: u64) -> io::Result<usize>;
+}
+
+impl ReadAt for [u8] {
+    fn read_at(&self, buf: &mut [u8], offset: u64) -> io::Result<usize> {
+        let len = <[u8]>::len(self);
+        let start = usize::try_from(offset).unwrap_or(usize::MAX).min(len);
+        let n = buf.len().min(len - start);
+        buf[..n].copy_from_slice(&self[start..start + n]);
+        Ok(n)
+    }
+}
+
+impl ReadAt for File {
+    fn read_at(&self, buf: &mut [u8], offset: u64) -> io::Result<usize> {
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::FileExt::read_at(self, buf, offset)
+        }
+        #[cfg(windows)]
+        {
+            std::os::windows::fs::FileExt::seek_read(self, buf, offset)
+        }
+    }
+}
+
+pub(crate) fn read_exact_at<S: ReadAt + ?Sized>(
+    source: &S,
+    mut buf: &mut [u8],
+    mut offset: u64,
+) -> io::Result<()> {
+    while !buf.is_empty() {
+        match source.read_at(buf, offset) {
+            Ok(0) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "file shorter than its scanned length",
+                ));
+            }
+            Ok(n) => {
+                buf = &mut buf[n..];
+                offset += n as u64;
+            }
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn write_all_at(file: &File, mut buf: &[u8], mut offset: u64) -> io::Result<()> {
+    while !buf.is_empty() {
+        let written = {
+            #[cfg(unix)]
+            {
+                std::os::unix::fs::FileExt::write_at(file, buf, offset)
+            }
+            #[cfg(windows)]
+            {
+                std::os::windows::fs::FileExt::seek_write(file, buf, offset)
+            }
+        };
+        match written {
+            Ok(0) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::WriteZero,
+                    "positional write made no progress",
+                ));
+            }
+            Ok(n) => {
+                buf = &buf[n..];
+                offset += n as u64;
+            }
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(())
 }
 
 /// Reserve real disk blocks for the segment up front. A plain
@@ -752,8 +866,20 @@ fn reserve_segment_blocks(file: &File, size_bytes: u64) -> Result<(), SfaSegment
 
 #[cfg(target_os = "macos")]
 fn reserve_segment_blocks(file: &File, size_bytes: u64) -> Result<(), SfaSegmentError> {
+    use std::os::unix::fs::MetadataExt;
     use std::os::unix::io::AsRawFd;
-    let len = libc::off_t::try_from(size_bytes).map_err(|_| {
+    // `F_PREALLOCATE` with `F_PEOFPOSMODE` allocates *additional* space past
+    // the physically-allocated end — it is not idempotent like
+    // `posix_fallocate`. Reserve only the shortfall so re-reserving an
+    // already-allocated segment on recovery is a no-op instead of doubling
+    // its disk footprint. (A fresh empty file has zero allocated blocks, so
+    // creation still reserves the full segment.)
+    let allocated = file.metadata().map_err(SfaSegmentError::Io)?.blocks() * 512;
+    let shortfall = size_bytes.saturating_sub(allocated);
+    if shortfall == 0 {
+        return file.set_len(size_bytes).map_err(SfaSegmentError::Io);
+    }
+    let len = libc::off_t::try_from(shortfall).map_err(|_| {
         SfaSegmentError::Io(io::Error::new(
             io::ErrorKind::InvalidInput,
             "segment size exceeds off_t",
@@ -959,6 +1085,91 @@ mod tests {
         assert_eq!(segment.append_offset(), 50);
         assert_eq!(segment.frame_count(), 2);
         assert_eq!(segment.torn_tail_bytes(), 0);
+    }
+
+    #[test]
+    fn file_scan_matches_bytes_scan_on_clean_and_torn_fixtures() {
+        // The recovery path scans files through `read_at` (never a mapping);
+        // it must agree field-for-field with the byte-slice scan the format
+        // fixtures pin down.
+        let dir = TempDir::new().unwrap();
+        for (name, fixture) in [
+            ("clean.sfa", java_two_frame_fixture()),
+            ("torn.sfa", java_two_frame_torn_tail_fixture()),
+        ] {
+            let path = dir.path().join(name);
+            fs::write(&path, &fixture).unwrap();
+            let from_file = scan_file_metadata(&path).unwrap();
+            let from_bytes = scan_segment_metadata_bytes(&fixture).unwrap();
+            assert_eq!(from_file.header, from_bytes.header, "{name}");
+            assert_eq!(from_file.frame_count, from_bytes.frame_count, "{name}");
+            assert_eq!(from_file.append_offset, from_bytes.append_offset, "{name}");
+            assert_eq!(
+                from_file.torn_tail_bytes, from_bytes.torn_tail_bytes,
+                "{name}"
+            );
+            assert_eq!(
+                from_file.first_empty_payload_fsn, from_bytes.first_empty_payload_fsn,
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn file_scan_streams_crc_across_chunks_for_large_payloads() {
+        let dir = TempDir::new().unwrap();
+        let path = initial_segment_path(dir.path());
+        let payload = vec![0xA5u8; SCAN_CHUNK_BYTES + 12_345];
+        let size_bytes = (HEADER_SIZE + FRAME_HEADER_SIZE + payload.len() + 64) as u64;
+        {
+            let mut segment = SfaSegment::create(&path, 7, size_bytes, 1).unwrap();
+            assert!(segment.try_append(&payload).unwrap().is_some());
+        }
+
+        let scan = scan_file_metadata(&path).unwrap();
+        assert_eq!(scan.frame_count, 1);
+        assert_eq!(
+            scan.append_offset,
+            (HEADER_SIZE + FRAME_HEADER_SIZE + payload.len()) as u64
+        );
+        assert_eq!(scan.torn_tail_bytes, 0);
+
+        let reopened = SfaSegment::open_existing(&path).unwrap();
+        assert_eq!(reopened.frame_count(), 1);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn open_existing_reallocates_blocks_for_a_sparse_recovered_segment() {
+        use std::os::unix::fs::MetadataExt;
+
+        // Simulate a slot whose creation-time preallocation did not survive
+        // (power-lost extents, or a sparse copy of the slot dir): valid
+        // frames up front, `set_len`-extended sparse tail.
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("sparse.sfa");
+        let size_bytes: u64 = 1 << 20;
+        fs::write(&path, java_two_frame_fixture()).unwrap();
+        OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_len(size_bytes)
+            .unwrap();
+        assert!(
+            fs::metadata(&path).unwrap().blocks() * 512 < size_bytes,
+            "test setup must produce a sparse file"
+        );
+
+        let segment = SfaSegment::open_existing(&path).unwrap();
+        assert_eq!(segment.frame_count(), 2);
+
+        let allocated = fs::metadata(&path).unwrap().blocks() * 512;
+        assert!(
+            allocated >= size_bytes,
+            "open_existing must re-reserve real blocks so recovered appends \
+             cannot SIGBUS on ENOSPC: {allocated} allocated of {size_bytes}"
+        );
     }
 
     #[test]

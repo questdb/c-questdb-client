@@ -35,11 +35,9 @@ use std::collections::VecDeque;
 use std::fs::{self, File, OpenOptions};
 use std::io;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicI64, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
-
-use memmap2::{MmapMut, MmapOptions};
 
 use crate::error;
 
@@ -47,8 +45,9 @@ use super::qwp_ws_driver::{DriverError, PublicationLog, SendCursor};
 use super::qwp_ws_queue::{OutboundFrame, QueueError, QwpReceipt, QwpReceiptStatus};
 use super::qwp_ws_sfa_segment::{
     FRAME_HEADER_SIZE, HEADER_SIZE, INITIAL_SEGMENT_FILE_NAME, SfaMappedPayload, SfaSegment,
-    SfaSegmentError, scan_file_metadata, spare_segment_path,
+    SfaSegmentError, read_exact_at, scan_file_metadata, spare_segment_path, write_all_at,
 };
+use super::qwp_ws_sfa_symbol_dict::PersistedSymbolDict;
 
 const ACK_WATERMARK_FILE_NAME: &str = ".ack-watermark";
 const ACK_WATERMARK_MAGIC: u32 = 0x3157_4b41; // 'AKW1' in little-endian bytes.
@@ -236,6 +235,14 @@ pub(crate) struct SfaFrameQueue {
     engine: Arc<SfaEngine>,
     producer: Option<SfaProducer>,
     ack_watermark: Option<SfaAckWatermark>,
+    /// Delta symbol-dict mode for this slot: always on in memory mode; in file
+    /// mode on iff the persisted side-file opened (so recovery / orphan-drain can
+    /// rebuild the dictionary). When off, the sender keeps full-dict frames.
+    delta_dict_enabled: bool,
+    /// The slot's persisted symbol dictionary (file mode only). Taken by the
+    /// foreground for write-ahead; its recovered entries seed the producer dict
+    /// and the driver's catch-up mirror. `None` in memory mode / on open failure.
+    persisted_symbol_dict: Option<PersistedSymbolDict>,
 }
 
 #[derive(Debug)]
@@ -282,6 +289,31 @@ impl SfaFrameQueue {
 
         let recovered = recover_segments(&options)?;
         let recovery_diagnostics = recovered.diagnostics;
+        // Open the slot's persisted symbol dictionary aligned with segment
+        // recovery: a fresh slot (no recovered segments) clears any stale side-file
+        // and starts empty; a recovered slot loads it so its delta frames can be
+        // re-registered on the fresh server. Delta encoding is on iff it opened.
+        let persisted_symbol_dict = if recovered.segments.is_some() {
+            // Recovered slot: delta-encode ONLY when an existing, valid side-file
+            // loads. If it is absent / too short / bad-magic (no dictionary that
+            // mirrors the recovered segments), fall back to full-dictionary
+            // (self-sufficient) frames rather than seeding an EMPTY delta
+            // dictionary next to segments that already reference ids [0, K): under
+            // delta a later frame would resolve those stale ids to the wrong
+            // symbols on a fresh server (silent corruption). In dense mode a
+            // surviving dense frame replays self-sufficiently and a surviving
+            // delta frame is rejected loudly by the send loop's torn-dict guard.
+            // A transient I/O error still fails construction loudly (retryable,
+            // data intact) rather than destroying a dictionary it failed to read.
+            PersistedSymbolDict::open_recovered(&options.slot_dir)?
+        } else {
+            // Fresh slot: no stored frames depend on the dictionary, so a side-file
+            // that cannot be opened degrades gracefully to full-dictionary
+            // (self-sufficient) frames.
+            PersistedSymbolDict::remove_orphan(&options.slot_dir);
+            PersistedSymbolDict::open(&options.slot_dir).ok()
+        };
+        let delta_dict_enabled = persisted_symbol_dict.is_some();
         let (active, sealed_segments, next_fsn, next_generation, mut allocated_segment_bytes) =
             match recovered.segments {
                 Some(segments) => (
@@ -373,6 +405,8 @@ impl SfaFrameQueue {
             engine,
             producer,
             ack_watermark: recovered_completion.ack_watermark,
+            delta_dict_enabled,
+            persisted_symbol_dict,
         })
     }
 
@@ -436,6 +470,10 @@ impl SfaFrameQueue {
             engine,
             producer,
             ack_watermark: None,
+            // Memory mode: delta is always safe (in-process reconnect replay), and
+            // there is no side-file to persist.
+            delta_dict_enabled: true,
+            persisted_symbol_dict: None,
         })
     }
 
@@ -448,6 +486,18 @@ impl SfaFrameQueue {
             });
         }
         let recovery_diagnostics = recovered.diagnostics;
+        // Orphan-drain replays this slot's frames on a fresh server, so load its
+        // persisted symbol dictionary to re-register delta frames -- but ONLY when
+        // an existing, valid side-file loads. Absent / bad-magic (no dictionary
+        // that mirrors the segments) falls back to dense: a surviving dense frame
+        // replays self-sufficiently and a surviving delta frame is rejected loudly
+        // by the torn-dict guard, rather than seeding an empty delta dictionary
+        // that would misresolve stale ids. Replay-only has no producer, so the
+        // dictionary is read-only here. A transient I/O error fails this drain
+        // attempt (retryable; the orphan stays recoverable on disk) rather than
+        // truncating the load-bearing side-file.
+        let persisted_symbol_dict = PersistedSymbolDict::open_recovered(&options.slot_dir)?;
+        let delta_dict_enabled = persisted_symbol_dict.is_some();
         let (active, sealed_segments, next_fsn, allocated_segment_bytes) = match recovered.segments
         {
             Some(segments) => (
@@ -491,7 +541,48 @@ impl SfaFrameQueue {
             engine,
             producer: None,
             ack_watermark: recovered_completion.ack_watermark,
+            delta_dict_enabled,
+            persisted_symbol_dict,
         })
+    }
+
+    /// Whether this slot delta-encodes symbol dictionaries (see the field docs).
+    pub(crate) fn is_delta_dict_enabled(&self) -> bool {
+        self.delta_dict_enabled
+    }
+
+    /// The recovered symbol-dict entries (`[len][utf8]...` in id order) used to
+    /// seed the producer dict and the driver mirror on recovery / orphan-drain.
+    /// Empty for a fresh slot or memory mode.
+    pub(crate) fn recovered_symbol_dict_entries(&self) -> &[u8] {
+        self.persisted_symbol_dict
+            .as_ref()
+            .map_or(&[][..], |pd| pd.loaded_entries())
+    }
+
+    /// Number of recovered symbol-dict entries.
+    pub(crate) fn recovered_symbol_dict_count(&self) -> u32 {
+        self.persisted_symbol_dict
+            .as_ref()
+            .map_or(0, |pd| pd.size())
+    }
+
+    /// Takes the persisted symbol dictionary for the foreground producer's
+    /// write-ahead. `None` in memory mode / replay-only / on open failure.
+    ///
+    /// The recovered entry region (up to ~2 GiB) has already been copied out for
+    /// seeding by this point: a take removes the dict from the queue, so any code
+    /// needing the entries must read them via
+    /// [`recovered_symbol_dict_entries`](Self::recovered_symbol_dict_entries) first
+    /// (both recovery paths do — async and sync). The write-ahead handle only needs
+    /// the file / append offset / size, so free that region rather than carry it
+    /// dead for the whole connection lifetime.
+    pub(crate) fn take_persisted_symbol_dict(&mut self) -> Option<PersistedSymbolDict> {
+        let mut pd = self.persisted_symbol_dict.take();
+        if let Some(pd) = pd.as_mut() {
+            pd.clear_loaded_entries();
+        }
+        pd
     }
 
     pub(crate) fn close(&mut self) -> Result<(), SfaQueueError> {
@@ -841,17 +932,30 @@ impl SfaProducer {
                 reason: "producer active segment is not the engine active segment",
             });
         }
-        let Some(mut new_active) = state.hot_spare.take() else {
-            return Err(self.engine.storage_backpressure_error(&state).into());
+        let new_active = match state.hot_spare.take() {
+            Some(mut new_active) => {
+                if let Some(shared) = Arc::get_mut(&mut new_active) {
+                    shared.rebase_empty(self.next_fsn)?;
+                } else {
+                    state.hot_spare = Some(new_active);
+                    return Err(SfaQueueError::CorruptSegments {
+                        reason: "hot spare segment is shared before promotion",
+                    });
+                }
+                new_active
+            }
+            // No prepared spare. The runner's maintenance step is the normal
+            // supplier, but it runs only between `drive_step` iterations — a
+            // runner parked in a blocking socket send (peer zero-window) never
+            // reaches it, and waiting on the backpressure notifier would starve
+            // the appender until `sf_append_deadline` with the byte budget
+            // still unused. Store-and-forward must keep absorbing appends up
+            // to `max_bytes` through exactly that kind of outage, so allocate
+            // the replacement segment inline instead.
+            None => self
+                .engine
+                .allocate_segment_inline(&mut state, self.next_fsn)?,
         };
-        if let Some(shared) = Arc::get_mut(&mut new_active) {
-            shared.rebase_empty(self.next_fsn)?;
-        } else {
-            state.hot_spare = Some(new_active);
-            return Err(SfaQueueError::CorruptSegments {
-                reason: "hot spare segment is shared before promotion",
-            });
-        }
 
         let old_active = state.active.replace(Arc::clone(&new_active)).unwrap();
         state.sealed_segments.push_back(old_active);
@@ -1119,6 +1223,54 @@ impl SfaEngine {
                 max_total_bytes: self.max_bytes as u64,
             }
         }
+    }
+
+    /// Creates a fresh segment on the appender thread when rotation finds no
+    /// prepared hot spare, charging it to the byte budget under the state
+    /// lock. Mirrors the `CreateHotSpare` maintenance step (same path /
+    /// generation / budget bookkeeping); the runner's maintenance remains an
+    /// optimization that pre-warms the spare, not a liveness requirement for
+    /// appends. Fails with the storage backpressure error when creation is
+    /// not allowed or the budget is exhausted, and propagates segment-creation
+    /// I/O errors (the runner's maintenance path treats those as terminal
+    /// storage errors too).
+    fn allocate_segment_inline(
+        &self,
+        state: &mut SfaEngineState,
+        base_seq: u64,
+    ) -> Result<Arc<SfaSharedSegment>, SfaQueueError> {
+        if !self.allow_segment_creation
+            || !can_allocate_segment(
+                state.allocated_segment_bytes,
+                self.segment_size_bytes,
+                self.max_bytes,
+            )
+        {
+            return Err(self.storage_backpressure_error(state).into());
+        }
+        let segment = match self.slot_dir.as_deref() {
+            Some(slot_dir) => {
+                let path = next_segment_path(slot_dir, &mut state.next_generation)?;
+                SfaSegment::create_new(
+                    &path,
+                    base_seq,
+                    self.segment_size_bytes,
+                    unix_time_micros(),
+                )?
+            }
+            None => {
+                state.next_generation = state
+                    .next_generation
+                    .checked_add(1)
+                    .ok_or(QueueError::SequenceOverflow)?;
+                SfaSegment::create_memory(base_seq, self.segment_size_bytes, unix_time_micros())?
+            }
+        };
+        state.allocated_segment_bytes = state
+            .allocated_segment_bytes
+            .checked_add(self.segment_size_bytes)
+            .ok_or(QueueError::SequenceOverflow)?;
+        Ok(Arc::new(SfaSharedSegment::new(segment)))
     }
 
     fn take_one_acked_sealed_segment(
@@ -1400,10 +1552,17 @@ struct RecoveredCompletion {
     ack_watermark: Option<SfaAckWatermark>,
 }
 
+/// The persisted ACK watermark record, kept via plain positional file I/O —
+/// deliberately never mmap'd. The record is a best-effort recovery hint
+/// (recovery falls back to the segments' own completed upper), so a failing
+/// file must degrade to "stop persisting", not SIGBUS the host on a write
+/// fault (ENOSPC into a sparse page, unreadable sector after a power loss).
 struct SfaAckWatermark {
-    _file: File,
-    mmap: MmapMut,
+    file: File,
     valid: bool,
+    /// Latched on the first failed write so a broken file is not re-poked on
+    /// every trim; the in-memory queue state remains authoritative.
+    disabled: bool,
 }
 
 impl std::fmt::Debug for SfaAckWatermark {
@@ -1422,34 +1581,36 @@ impl SfaAckWatermark {
             .write(true)
             .open(path)
             .ok()?;
-        if file.metadata().ok()?.len() < ACK_WATERMARK_SIZE
-            && file.set_len(ACK_WATERMARK_SIZE).is_err()
-        {
-            return None;
+        if file.metadata().ok()?.len() < ACK_WATERMARK_SIZE {
+            // Write real zeroes rather than `set_len`: an explicit write
+            // allocates the record's blocks up front, so a full disk fails
+            // here (where `open` already degrades to `None`) instead of at
+            // some later persist.
+            write_all_at(&file, &[0u8; ACK_WATERMARK_SIZE as usize], 0).ok()?;
         }
-        // SAFETY: the SFA slot lock gives this process exclusive write access
-        // to the slot. The queue reads and writes only the first fixed-size
-        // watermark record.
-        let mmap = unsafe {
-            MmapOptions::new()
-                .len(ACK_WATERMARK_SIZE as usize)
-                .map_mut(&file)
-                .ok()?
-        };
-        let valid = decode_ack_watermark(&mmap).is_some();
+        let valid = Self::read_record(&file).is_some();
         Some(Self {
-            _file: file,
-            mmap,
+            file,
             valid,
+            disabled: false,
         })
     }
 
+    fn read_record(file: &File) -> Option<u64> {
+        let mut record = [0u8; ACK_WATERMARK_SIZE as usize];
+        read_exact_at(file, &mut record, 0).ok()?;
+        decode_ack_watermark(&record)
+    }
+
     fn recovered_fsn(&self) -> Option<u64> {
-        decode_ack_watermark(&self.mmap)
+        Self::read_record(&self.file)
     }
 
     fn invalidate(&mut self) {
-        self.store_u32(0, 0);
+        // Best-effort: a failed zeroing is safe because the recovery check
+        // that requested this invalidation re-detects the bogus record on
+        // the next recovery too.
+        self.write_at(0, &0u32.to_le_bytes());
         self.valid = false;
     }
 
@@ -1457,29 +1618,23 @@ impl SfaAckWatermark {
         let Ok(fsn) = i64::try_from(fsn) else {
             return;
         };
-        self.store_fsn(fsn);
-        if !self.valid {
-            self.store_u32(4, 0);
-            self.store_u32(0, ACK_WATERMARK_MAGIC);
-            self.valid = true;
+        // FSN first, magic last: the record only becomes decodable once the
+        // FSN bytes are in place, matching the previous mmap store ordering.
+        self.write_at(8, &fsn.to_le_bytes());
+        if !self.valid && !self.disabled {
+            self.write_at(4, &0u32.to_le_bytes());
+            self.write_at(0, &ACK_WATERMARK_MAGIC.to_le_bytes());
+            self.valid = !self.disabled;
         }
     }
 
-    fn store_fsn(&mut self, fsn: i64) {
-        let ptr = unsafe { self.mmap.as_mut_ptr().add(8).cast::<i64>() };
-        debug_assert_eq!((ptr as usize) % std::mem::align_of::<AtomicI64>(), 0);
-        // SAFETY: the mmap covers at least ACK_WATERMARK_SIZE bytes, offset 8
-        // is 8-byte aligned because mmap mappings are page-aligned, and slot
-        // locking gives this process exclusive write access.
-        unsafe { AtomicI64::from_ptr(ptr).store(fsn.to_le(), Ordering::Relaxed) };
-    }
-
-    fn store_u32(&mut self, offset: usize, value: u32) {
-        let ptr = unsafe { self.mmap.as_mut_ptr().add(offset).cast::<u32>() };
-        debug_assert_eq!((ptr as usize) % std::mem::align_of::<AtomicU32>(), 0);
-        // SAFETY: callers pass fixed 4-byte-aligned offsets within the
-        // watermark record, and slot locking gives exclusive write access.
-        unsafe { AtomicU32::from_ptr(ptr).store(value.to_le(), Ordering::Release) };
+    fn write_at(&mut self, offset: u64, bytes: &[u8]) {
+        if self.disabled {
+            return;
+        }
+        if write_all_at(&self.file, bytes, offset).is_err() {
+            self.disabled = true;
+        }
     }
 }
 
@@ -1570,6 +1725,10 @@ fn recover_segments(options: &SfaQueueOptions) -> Result<RecoveredState, SfaQueu
 
         let scan = match scan_file_metadata(&path) {
             Ok(scan) => scan,
+            // An IO error means the segment could not be read, not that it is
+            // absent — skipping it would silently drop a committed tail the
+            // between-segments contiguity check cannot detect as missing.
+            Err(err @ SfaSegmentError::Io(_)) => return Err(err.into()),
             Err(err) => {
                 diagnostics.push(SfaRecoveryDiagnostic::SkippedSegment {
                     path: path.clone(),
@@ -1713,6 +1872,11 @@ fn validate_contiguous_segments(segments: &[RecoveredSegment]) -> Result<(), Sfa
     Ok(())
 }
 
+// Accounts for the `sf-*.sfa` segment files only. The slot's small side-files
+// (`.symbol-dict`, `.ack-watermark`, `.lock`) are deliberately excluded: the
+// `.symbol-dict` write-ahead is append-only and bounded by the connection
+// symbol-dictionary cap (`MAX_CONN_SYMBOL_DICT_SIZE`), not by this segment
+// budget. See the `sf_max_total_bytes` config doc.
 fn can_allocate_segment(
     allocated_segment_bytes: u64,
     segment_size_bytes: u64,
@@ -1812,6 +1976,11 @@ fn record_all_sfa_cleanup(
     }
     if !cleanup_failed {
         record_cleanup_remove_file(ack_watermark_path(slot_dir), diagnostics);
+        // The persisted symbol dictionary is slot state too: drop it alongside the
+        // watermark so a fully-drained slot leaves nothing behind. Best-effort --
+        // a leftover is meaningless without segments and is re-created cleanly (or
+        // removed as an orphan) on the next open.
+        PersistedSymbolDict::remove_orphan(slot_dir);
     }
     Ok(())
 }
@@ -1834,10 +2003,19 @@ fn unix_time_micros() -> u64 {
         .unwrap_or(0)
 }
 
-fn segment_payload_capacity(segment_size_bytes: u64) -> usize {
+pub(crate) fn segment_payload_capacity(segment_size_bytes: u64) -> usize {
     segment_size_bytes
         .saturating_sub((HEADER_SIZE + FRAME_HEADER_SIZE) as u64)
         .min(usize::MAX as u64) as usize
+}
+
+/// Largest per-frame payload that still lets two frames share one segment
+/// (`HEADER_SIZE + 2 * (FRAME_HEADER_SIZE + payload) <= segment_size_bytes`).
+/// The publish split valve targets this size so split output amortizes
+/// segment rotation over at least two frames instead of forcing a fresh
+/// segment allocation per near-cap frame.
+pub(crate) fn two_frame_segment_payload_capacity(segment_size_bytes: u64) -> usize {
+    segment_payload_capacity(segment_size_bytes).saturating_sub(FRAME_HEADER_SIZE) / 2
 }
 
 fn first_unresolved_fsn_from_segments(
@@ -1912,6 +2090,27 @@ mod tests {
 
     fn open(dir: &TempDir) -> SfaFrameQueue {
         SfaFrameQueue::open(options(dir)).unwrap()
+    }
+
+    #[test]
+    fn two_frame_payload_capacity_is_maximal_two_frame_packing() {
+        for segment_size in [256u64, 4096, 4 * 1024 * 1024, 4 * 1024 * 1024 + 1] {
+            let cap = two_frame_segment_payload_capacity(segment_size);
+            let two_frames = (HEADER_SIZE + 2 * (FRAME_HEADER_SIZE + cap)) as u64;
+            assert!(
+                two_frames <= segment_size,
+                "two capped frames must fit one {segment_size}-byte segment"
+            );
+            let over = (HEADER_SIZE + 2 * (FRAME_HEADER_SIZE + cap + 1)) as u64;
+            assert!(
+                over > segment_size,
+                "cap must be maximal for a {segment_size}-byte segment"
+            );
+            assert!(
+                cap <= segment_payload_capacity(segment_size),
+                "two-frame cap can never exceed the single-frame cap"
+            );
+        }
     }
 
     fn submit_with_storage_maintenance(queue: &mut SfaFrameQueue, payload: &[u8]) -> QwpReceipt {
@@ -2056,15 +2255,12 @@ mod tests {
         assert_eq!(queue.allocated_segment_bytes(), 48);
         assert!(!queue.hot_spare_installed());
 
-        assert!(matches!(
-            queue.try_submit(b"uvwxyz1234"),
-            Err(SfaQueueError::Queue(
-                QueueError::StorageSpareNotReady { .. }
-            ))
-        ));
-        assert!(queue.maintain_storage().unwrap());
+        // Rotation self-provisions under the freed budget; no maintenance
+        // step is needed for the appender to make progress.
         let third = queue.try_submit(b"uvwxyz1234").unwrap();
         assert_eq!(third.fsn, 2);
+        assert_eq!(queue.allocated_segment_bytes(), 96);
+        assert!(!queue.hot_spare_installed());
     }
 
     #[test]
@@ -2387,6 +2583,21 @@ mod tests {
         assert!(!corrupt_segment_path(&bad_middle_path).exists());
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn recovery_propagates_io_error_instead_of_dropping_segment() {
+        let dir = TempDir::new().unwrap();
+        write_segment_with_one_frame(&initial_segment_path(dir.path()), 0, b"first");
+        let unreadable = spare_segment_path(dir.path(), 7);
+        std::os::unix::fs::symlink("no-such-target.sfa", &unreadable).unwrap();
+
+        let err = SfaFrameQueue::open(options(&dir)).unwrap_err();
+        assert!(matches!(
+            err,
+            SfaQueueError::Segment(SfaSegmentError::Io(_))
+        ));
+    }
+
     #[test]
     fn recovery_records_non_empty_torn_tail_diagnostic() {
         let dir = TempDir::new().unwrap();
@@ -2453,15 +2664,96 @@ mod tests {
     #[test]
     fn close_removes_sfa_files_after_all_published_frames_are_resolved() {
         let dir = TempDir::new().unwrap();
+        let symbol_dict = dir
+            .path()
+            .join(crate::ingress::sender::qwp_ws_sfa_symbol_dict::FILE_NAME);
         let mut queue = open(&dir);
         queue.try_submit(b"first").unwrap();
         queue.complete_through_fsn(0).unwrap();
 
         assert!(ack_watermark_path(dir.path()).exists());
+        // A file-mode slot opens a persisted symbol dictionary alongside its
+        // segments (delta encoding depends on it).
+        assert!(symbol_dict.exists());
         queue.close().unwrap();
 
         assert_eq!(sfa_file_count(dir.path()), 0);
         assert!(!ack_watermark_path(dir.path()).exists());
+        // The side-file is slot state too: a fully-drained close leaves nothing.
+        assert!(!symbol_dict.exists());
+    }
+
+    #[test]
+    fn recovered_slot_without_a_side_file_falls_back_to_dense() {
+        // Regression: a recovered slot whose segments already reference symbol ids
+        // but whose side-file is gone (a dense-fallback session that never wrote
+        // one, or a lost/deleted file) must NOT re-enable delta with an empty
+        // dictionary. Seeding ids from 0 next to segments that reference [0, K)
+        // would let a later delta frame resolve those stale ids to the wrong
+        // symbols on a fresh server (silent corruption). It falls back to dense
+        // (self-sufficient) frames instead, and does not fabricate a side-file.
+        let dir = TempDir::new().unwrap();
+        let symbol_dict = dir
+            .path()
+            .join(crate::ingress::sender::qwp_ws_sfa_symbol_dict::FILE_NAME);
+
+        // A first session leaves an unresolved (recoverable) segment behind.
+        let mut queue = open(&dir);
+        queue.try_submit(b"unresolved-frame").unwrap();
+        assert!(
+            queue.is_delta_dict_enabled(),
+            "a fresh file slot delta-encodes"
+        );
+        drop(queue);
+        assert!(
+            sfa_file_count(dir.path()) > 0,
+            "an unresolved segment survives"
+        );
+
+        // Simulate a slot whose side-file does not mirror its segments.
+        std::fs::remove_file(&symbol_dict).unwrap();
+
+        let recovered = open(&dir);
+        assert!(
+            !recovered.is_delta_dict_enabled(),
+            "a recovered slot with no matching side-file must fall back to dense"
+        );
+        assert!(
+            recovered.recovered_symbol_dict_entries().is_empty(),
+            "dense fallback seeds nothing"
+        );
+        assert!(
+            !symbol_dict.exists(),
+            "recovery must not fabricate an empty side-file next to the segments"
+        );
+    }
+
+    #[test]
+    fn recovered_slot_with_a_bad_magic_side_file_falls_back_to_dense() {
+        // A poisoned / externally-corrupted side-file (bad magic) beside
+        // recoverable segments is treated like an absent one: dense fallback, with
+        // the corrupt file left untouched (never silently rewritten fresh and
+        // re-enabled for delta).
+        let dir = TempDir::new().unwrap();
+        let symbol_dict = dir
+            .path()
+            .join(crate::ingress::sender::qwp_ws_sfa_symbol_dict::FILE_NAME);
+
+        let mut queue = open(&dir);
+        queue.try_submit(b"unresolved-frame").unwrap();
+        drop(queue);
+        std::fs::write(&symbol_dict, b"NOPEnope-poisoned-header").unwrap();
+
+        let recovered = open(&dir);
+        assert!(
+            !recovered.is_delta_dict_enabled(),
+            "a recovered slot with a bad-magic side-file must fall back to dense"
+        );
+        assert_eq!(
+            std::fs::read(&symbol_dict).unwrap(),
+            b"NOPEnope-poisoned-header",
+            "recovery must not rewrite the corrupt side-file"
+        );
     }
 
     #[test]
@@ -2545,6 +2837,34 @@ mod tests {
             stale.payload_vec_for_fsn(5).as_deref(),
             Some(&b"survivor"[..])
         );
+    }
+
+    #[test]
+    fn ack_watermark_round_trips_through_plain_file_io() {
+        // The watermark is kept via positional file I/O (never mmap'd), so a
+        // failing disk degrades to an Err/no-op instead of a SIGBUS. Pin the
+        // full lifecycle: fresh open, persist, reopen, invalidate, re-persist.
+        let dir = TempDir::new().unwrap();
+
+        let mut watermark = SfaAckWatermark::open(dir.path()).unwrap();
+        assert_eq!(watermark.recovered_fsn(), None);
+        watermark.persist_completed_fsn(42);
+        assert_eq!(watermark.recovered_fsn(), Some(42));
+        drop(watermark);
+
+        let mut reopened = SfaAckWatermark::open(dir.path()).unwrap();
+        assert_eq!(reopened.recovered_fsn(), Some(42));
+        reopened.invalidate();
+        assert_eq!(reopened.recovered_fsn(), None);
+        drop(reopened);
+        assert_eq!(recovered_ack_watermark_fsn(dir.path()), None);
+
+        // A persist after invalidation rewrites the whole record (FSN before
+        // magic, so a torn write never yields a decodable half-record).
+        let mut again = SfaAckWatermark::open(dir.path()).unwrap();
+        again.persist_completed_fsn(7);
+        drop(again);
+        assert_eq!(recovered_ack_watermark_fsn(dir.path()), Some(7));
     }
 
     #[test]
@@ -2897,6 +3217,66 @@ mod tests {
     }
 
     #[test]
+    fn rotation_allocates_inline_when_hot_spare_missing() {
+        // Budget for 4 segments; active + hot spare are pre-created. After the
+        // spare is consumed by the first rotation, further rotations must
+        // self-provision segments inline — without any maintenance running
+        // (the runner may be parked in a blocking socket send) — until the
+        // byte budget is exhausted.
+        let mut queue = SfaFrameQueue::open_memory(memory_options(48, 192, 16)).unwrap();
+
+        assert_eq!(queue.try_submit(b"abcdefghij").unwrap().fsn, 0);
+        assert_eq!(queue.try_submit(b"klmnopqrst").unwrap().fsn, 1);
+        assert!(!queue.hot_spare_installed());
+
+        assert_eq!(queue.try_submit(b"uvwxyz1234").unwrap().fsn, 2);
+        assert_eq!(queue.allocated_segment_bytes(), 144);
+        assert_eq!(queue.try_submit(b"5678901234").unwrap().fsn, 3);
+        assert_eq!(queue.allocated_segment_bytes(), 192);
+        assert!(matches!(
+            queue.try_submit(b"abcdefghij"),
+            Err(SfaQueueError::Queue(QueueError::StorageSegmentCapFull {
+                segment_size_bytes: 48,
+                allocated_segment_bytes: 192,
+                max_total_bytes: 192,
+            }))
+        ));
+        assert_eq!(
+            queue.payload_vec_for_fsn(2).as_deref(),
+            Some(&b"uvwxyz1234"[..])
+        );
+        assert_eq!(
+            queue.payload_vec_for_fsn(3).as_deref(),
+            Some(&b"5678901234"[..])
+        );
+    }
+
+    #[test]
+    fn detached_producer_rotation_survives_stalled_runner_maintenance() {
+        let dir = TempDir::new().unwrap();
+        let mut queue = SfaFrameQueue::open(options_with(&dir, 38, 152, 8)).unwrap();
+        let mut producer = queue.take_producer().unwrap();
+
+        assert_eq!(producer.try_submit(b"one").unwrap().fsn, 0);
+        assert_eq!(producer.try_submit(b"two").unwrap().fsn, 1);
+        // No maintenance between submits (runner parked in a blocking send):
+        // the detached producer must provision segment files inline up to the
+        // byte budget, and every stall-window frame stays replayable.
+        assert_eq!(producer.try_submit(b"tri").unwrap().fsn, 2);
+        assert_eq!(sfa_file_count(dir.path()), 3);
+        assert_eq!(producer.try_submit(b"for").unwrap().fsn, 3);
+        assert_eq!(sfa_file_count(dir.path()), 4);
+        assert!(matches!(
+            producer.try_submit(b"fiv"),
+            Err(SfaQueueError::Queue(
+                QueueError::StorageSegmentCapFull { .. }
+            ))
+        ));
+        assert_eq!(queue.payload_vec_for_fsn(2).as_deref(), Some(&b"tri"[..]));
+        assert_eq!(queue.payload_vec_for_fsn(3).as_deref(), Some(&b"for"[..]));
+    }
+
+    #[test]
     fn progress_maintains_missing_hot_spare_when_capacity_allows() {
         let dir = TempDir::new().unwrap();
         let mut queue = SfaFrameQueue::open(options_with(&dir, 38, 114, 4)).unwrap();
@@ -2904,18 +3284,16 @@ mod tests {
         queue.try_submit(b"first").unwrap();
         queue.try_submit(b"second").unwrap();
         assert_eq!(sfa_file_count(dir.path()), 2);
-        assert!(matches!(
-            queue.try_submit(b"third"),
-            Err(SfaQueueError::Queue(QueueError::StorageSpareNotReady {
-                segment_size_bytes: 38,
-                allocated_segment_bytes: 76,
-                max_total_bytes: 114,
-            }))
-        ));
-        assert_eq!(sfa_file_count(dir.path()), 2);
+        assert!(!queue.hot_spare_installed());
 
         assert!(queue.maintain_storage().unwrap());
+        assert!(queue.hot_spare_installed());
+        assert_eq!(sfa_file_count(dir.path()), 3);
+
+        // Rotation prefers the prepared spare: no extra segment is created.
         assert_eq!(queue.try_submit(b"third").unwrap(), QwpReceipt { fsn: 2 });
+        assert_eq!(sfa_file_count(dir.path()), 3);
+        assert!(!queue.hot_spare_installed());
     }
 
     #[test]
@@ -2926,16 +3304,10 @@ mod tests {
 
         assert_eq!(producer.try_submit(b"one").unwrap(), QwpReceipt { fsn: 0 });
         assert_eq!(producer.try_submit(b"two").unwrap(), QwpReceipt { fsn: 1 });
-        assert!(matches!(
-            producer.try_submit(b"tri"),
-            Err(SfaQueueError::Queue(
-                QueueError::StorageSpareNotReady { .. }
-            ))
-        ));
-        assert_eq!(sfa_file_count(dir.path()), 2);
-
-        assert!(queue.maintain_storage().unwrap());
+        // The detached producer self-provisions its rotation segment when no
+        // spare is prepared (no maintenance has run).
         assert_eq!(producer.try_submit(b"tri").unwrap(), QwpReceipt { fsn: 2 });
+        assert_eq!(sfa_file_count(dir.path()), 3);
         assert_eq!(queue.published_fsn(), Some(2));
         assert_eq!(queue.payload_vec_for_fsn(0).as_deref(), Some(&b"one"[..]));
         assert_eq!(queue.payload_vec_for_fsn(1).as_deref(), Some(&b"two"[..]));
@@ -3082,15 +3454,10 @@ mod tests {
                 SfaRecoveryDiagnostic::CleanupFailed { path, .. } if path == &first_path
             )
         }));
-        assert!(matches!(
-            queue.try_submit(b"third"),
-            Err(SfaQueueError::Queue(QueueError::StorageSpareNotReady {
-                allocated_segment_bytes: 38,
-                ..
-            }))
-        ));
-        assert!(queue.maintain_storage().unwrap());
+        // The failed unlink freed logical capacity, so rotation
+        // self-provisions a new segment under the budget.
         assert_eq!(queue.try_submit(b"third").unwrap(), QwpReceipt { fsn: 2 });
+        assert_eq!(queue.allocated_segment_bytes(), 76);
     }
 
     #[test]

@@ -40,8 +40,8 @@
 
 use crate::egress::column_kind::ColumnKind;
 use crate::egress::decoder::MAX_COLUMN_NAME_LENGTH;
-use crate::egress::error::{Result, fmt};
 use crate::egress::wire::varint;
+use crate::error::{Result, fmt};
 
 /// A single column in a result schema.
 ///
@@ -149,8 +149,8 @@ impl Schema {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::egress::error::ErrorCode;
     use crate::egress::wire::varint::encode_u64;
+    use crate::error::ErrorCode;
 
     fn build_inline(cols: &[(&str, ColumnKind)]) -> Vec<u8> {
         let mut out = Vec::new();

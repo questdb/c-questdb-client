@@ -84,9 +84,9 @@ fn make_sender(srv: &QuestDbServer, version: ProtocolVersion) -> Sender {
 /// QWP/WebSocket ingress sender. Used by the IPv4 / BINARY round-trip
 /// tests below: those wire types are QWP-only — the ILP/HTTP `Sender`
 /// has no `column_ipv4` / `column_binary` API at all — so the only
-/// way to exercise their ingress path is via `qwpws::`.
+/// way to exercise their ingress path is via `ws::`.
 fn make_qwp_ws_sender(srv: &QuestDbServer) -> Sender {
-    let conf = format!("qwpws::addr={}:{}", srv.host, srv.http_port);
+    let conf = format!("ws::addr={}:{}", srv.host, srv.http_port);
     Sender::from_conf(&conf).expect("qwp/ws sender")
 }
 
@@ -1198,7 +1198,7 @@ fn query_error_for_bad_sql() {
         Err(e) => {
             // QuestDB returns SQL_ERROR (mapped to ServerParseError or
             // ServerInternalError depending on the failure kind).
-            use questdb::egress::ErrorCode as C;
+            use questdb::ErrorCode as C;
             assert!(
                 matches!(
                     e.code(),
@@ -1211,6 +1211,15 @@ fn query_error_for_bad_sql() {
         }
         Ok(_) => panic!("expected QUERY_ERROR for bad SQL"),
     }
+    assert!(cur.connection_reusable());
+    drop(cur);
+
+    let mut next = reader
+        .prepare("select 2 as v")
+        .execute()
+        .expect("reader remains reusable after QUERY_ERROR");
+    assert!(next.next_batch().expect("next batch").is_some());
+    assert!(next.next_batch().expect("terminal").is_none());
 }
 
 // ---------------------------------------------------------------------------
@@ -1555,7 +1564,7 @@ fn bind_ipv4_rejected_client_side() {
         .bind_ipv4(Ipv4Addr::new(127, 0, 0, 1))
         .execute()
     {
-        Err(e) => assert_eq!(e.code(), questdb::egress::ErrorCode::InvalidBind),
+        Err(e) => assert_eq!(e.code(), questdb::ErrorCode::InvalidBind),
         Ok(_) => panic!("expected client-side rejection"),
     }
 }
@@ -1629,7 +1638,7 @@ fn bind_binary_rejected_client_side() {
         .bind_binary(vec![0xDE, 0xAD])
         .execute()
     {
-        Err(e) => assert_eq!(e.code(), questdb::egress::ErrorCode::InvalidBind),
+        Err(e) => assert_eq!(e.code(), questdb::ErrorCode::InvalidBind),
         Ok(_) => panic!("expected client-side rejection"),
     }
 }
@@ -1732,7 +1741,7 @@ fn bind_null_binary_rejected_client_side() {
     let srv = server();
     let mut reader = make_reader(srv);
     match reader.prepare("select 1").bind_null_binary().execute() {
-        Err(e) => assert_eq!(e.code(), questdb::egress::ErrorCode::InvalidBind),
+        Err(e) => assert_eq!(e.code(), questdb::ErrorCode::InvalidBind),
         Ok(_) => panic!("expected client-side rejection"),
     }
 }
@@ -2347,7 +2356,7 @@ fn target_replica_rejects_standalone() {
     let conf = format!("{};target=replica", srv.qwp_conf());
     match Reader::from_conf(&conf) {
         Err(e) => {
-            assert_eq!(e.code(), questdb::egress::ErrorCode::RoleMismatch);
+            assert_eq!(e.code(), questdb::ErrorCode::RoleMismatch);
             assert!(
                 e.msg().contains("Replica") || e.msg().to_lowercase().contains("replica"),
                 "expected target name in message; got {:?}",
@@ -3075,23 +3084,28 @@ fn dropping_live_cursor_closes_connection() {
 
     // The WS is now closed. A new query must surface a transport
     // error — either when QUERY_REQUEST is written or when the first
-    // frame is read — and must never yield a usable batch.
-    match reader.prepare("select 2 as v").execute() {
-        Err(e) => assert_eq!(
+    // frame is read — and must never yield a usable batch. The error
+    // must also explain the *cause* (a cursor dropped before being
+    // fully read) and the fix, rather than the misleading
+    // "failed mid-query failover" wording.
+    let assert_closed = |e: &questdb::Error| {
+        assert_eq!(
             e.code(),
-            questdb::egress::ErrorCode::SocketError,
+            questdb::ErrorCode::SocketError,
             "expected SocketError after WS close, got {:?}: {}",
             e.code(),
             e.msg()
-        ),
+        );
+        assert!(
+            e.msg().contains("dropped before being fully read"),
+            "error should explain the dropped-cursor cause and the fix; got: {}",
+            e.msg()
+        );
+    };
+    match reader.prepare("select 2 as v").execute() {
+        Err(e) => assert_closed(&e),
         Ok(mut cur2) => match cur2.next_batch() {
-            Err(e) => assert_eq!(
-                e.code(),
-                questdb::egress::ErrorCode::SocketError,
-                "expected SocketError after WS close, got {:?}: {}",
-                e.code(),
-                e.msg()
-            ),
+            Err(e) => assert_closed(&e),
             other => panic!(
                 "next_batch on a closed connection unexpectedly yielded {:?}",
                 other.map(|o| o.map(|_| "Some(batch)"))
@@ -3113,6 +3127,7 @@ fn cancel_then_drop_allows_reuse() {
         .execute()
         .expect("execute 1");
     cur1.cancel().expect("cancel drains to terminal");
+    assert!(cur1.connection_reusable());
     drop(cur1);
 
     // Reader is clean — query 2 should succeed end-to-end.
@@ -3395,10 +3410,7 @@ fn cursor_short_circuits_after_query_error() {
                 cur.next_batch().map(|o| o.is_none()).map_err(|e| e.code())
             });
         assert!(
-            matches!(
-                post_cancel,
-                Ok(true) | Err(questdb::egress::ErrorCode::Cancelled)
-            ),
+            matches!(post_cancel, Ok(true) | Err(questdb::ErrorCode::Cancelled)),
             "next_batch after cancel must return Ok(None) or replay Err(Cancelled), got {post_cancel:?}"
         );
 

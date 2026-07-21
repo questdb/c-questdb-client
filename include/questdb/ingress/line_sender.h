@@ -79,54 +79,210 @@ extern "C" {
 /** An error that occurred when using the line sender. */
 typedef struct line_sender_error line_sender_error;
 
-/** Category of error. */
+/** Category of error.
+ *
+ * Append-only: reordering or inserting in the middle breaks ABI. */
 typedef enum line_sender_error_code
 {
     /** The host, port, or interface was incorrect. */
-    line_sender_error_could_not_resolve_addr,
+    line_sender_error_could_not_resolve_addr = 0,
 
     /** Called methods in the wrong order. E.g. `symbol` after `column`. */
-    line_sender_error_invalid_api_call,
+    line_sender_error_invalid_api_call = 1,
 
     /** A network error connecting or flushing data out. */
-    line_sender_error_socket_error,
+    line_sender_error_socket_error = 2,
 
     /** The string or symbol field is not encoded in valid UTF-8. */
-    line_sender_error_invalid_utf8,
+    line_sender_error_invalid_utf8 = 3,
 
     /** The table name or column name contains bad characters. */
-    line_sender_error_invalid_name,
+    line_sender_error_invalid_name = 4,
 
     /** The supplied timestamp is invalid. */
-    line_sender_error_invalid_timestamp,
+    line_sender_error_invalid_timestamp = 5,
 
     /** Error during the authentication process. */
-    line_sender_error_auth_error,
+    line_sender_error_auth_error = 6,
 
     /** Error during TLS handshake. */
-    line_sender_error_tls_error,
+    line_sender_error_tls_error = 7,
 
     /** The server does not support ILP over HTTP. */
-    line_sender_error_http_not_supported,
+    line_sender_error_http_not_supported = 8,
 
     /** Error sent back from the server during flush. */
-    line_sender_error_server_flush_error,
+    line_sender_error_server_flush_error = 9,
 
     /** Bad configuration. */
-    line_sender_error_config_error,
+    line_sender_error_config_error = 10,
 
     /** There was an error serializing an array. */
-    line_sender_error_array_error,
+    line_sender_error_array_error = 11,
 
     /**  Line sender protocol version error. */
-    line_sender_error_protocol_version_error,
+    line_sender_error_protocol_version_error = 12,
 
     /** The supplied decimal is invalid. */
-    line_sender_error_invalid_decimal,
+    line_sender_error_invalid_decimal = 13,
 
     /** QWP/WebSocket server rejection or terminal protocol violation. */
-    line_sender_error_server_rejection,
+    line_sender_error_server_rejection = 14,
+
+    /** Arrow column whose kind cannot be persisted (e.g.
+     *  `FixedSizeBinary(16)` without `arrow.uuid` extension metadata;
+     *  `ARRAY(LONG, N-D)` is egress-only; nested-list leaf must be
+     *  `Float64`). `arrow` feature only. */
+    line_sender_error_arrow_unsupported_column_kind = 15,
+
+    /** RecordBatch failed client-side structural validation
+     *  (column count, name encoding, C Data Interface contract).
+     *  `arrow` feature only. */
+    line_sender_error_arrow_ingest = 16,
+
+    /** Reconnectable failure on the QWP sender's flush/sync
+     *  path (transport error, EOF, closed connection). The operation
+     *  has not committed: drop the connection with `questdb_db_drop_sender`,
+     *  re-acquire one with `questdb_db_borrow_sender_with_retry` (shared
+     *  reconnect backoff, bounded by `reconnect_max_duration`), and re-drive
+     *  from your source. */
+    line_sender_error_failover_retry = 17,
+
+    /** Every reachable endpoint handshook but none matched the configured
+     *  `target=` role filter (e.g. `target=primary` against an all-replica
+     *  address list). Distinct from `line_sender_error_socket_error`
+     *  ("all endpoints unreachable") so callers can tell "no primary
+     *  elected" from "all down". */
+    line_sender_error_role_mismatch = 18,
+    /** The TCP connect (dial) to the server exceeded the configured
+     *  `connect_timeout`. Distinct from `line_sender_error_socket_error` so a
+     *  caller can tell a timed-out dial apart from a refused / reset
+     *  connection. Produced by the QWP/WebSocket transport. */
+    line_sender_error_connect_timeout = 19,
+
+    /* Query / reader (egress) categories. The error model is unified across
+     * ingest and query: these are emitted by the reader. Appended at 20..34
+     * so the ingress discriminants 0..19 stay frozen. */
+
+    /** HTTP-upgrade or WebSocket handshake failure. */
+    line_sender_error_handshake_error = 20,
+
+    /** Server returned an unsupported QWP version, encoding, or capability. */
+    line_sender_error_unsupported_server = 21,
+
+    /** Wire-format violation: bad magic, truncated frame, unknown
+     *  discriminant, invalid varint, symbol-dict reference miss, etc. */
+    line_sender_error_protocol_error = 22,
+
+    /** Bind parameter index, count, or value rejected client-side (covers
+     *  timestamp / decimal / geohash range failures on the query path too). */
+    line_sender_error_invalid_bind = 23,
+
+    /** Server-reported QWP `SCHEMA_MISMATCH` (status `0x03`). */
+    line_sender_error_server_schema_mismatch = 24,
+
+    /** Server-reported QWP `PARSE_ERROR` (status `0x05`). */
+    line_sender_error_server_parse_error = 25,
+
+    /** Server-reported QWP `INTERNAL_ERROR` (status `0x06`). */
+    line_sender_error_server_internal_error = 26,
+
+    /** Server-reported QWP `SECURITY_ERROR` (status `0x08`). */
+    line_sender_error_server_security_error = 27,
+
+    /** Client-side limit hit (e.g. an array row exceeds the configured cap). */
+    line_sender_error_limit_exceeded = 28,
+
+    /** Server-reported QWP `LIMIT_EXCEEDED` (status `0x0B`). */
+    line_sender_error_server_limit_exceeded = 29,
+
+    /** Query was cancelled (locally or via server `CANCELLED` status `0x0A`). */
+    line_sender_error_cancelled = 30,
+
+    /** Mid-query failover was eligible but a batch had already been delivered
+     *  and no `on_failover_reset` callback was installed; the cursor
+     *  terminated rather than silently double-deliver rows. */
+    line_sender_error_failover_would_duplicate = 31,
+
+    /** Streaming Arrow adapter saw a mid-stream schema change. `arrow`
+     *  feature only. */
+    line_sender_error_schema_drift = 32,
+
+    /** A streaming Arrow adapter was asked for a schema on a stream that
+     *  ended before any batch was produced. `arrow` feature only. */
+    line_sender_error_no_schema = 33,
+
+    /** Arrow C Data Interface export failed. `arrow` feature only. */
+    line_sender_error_arrow_export = 34,
+
+    /** An irreducible QWP/WebSocket unit (the table schema plus a single row
+     *  block) exceeds the negotiated per-batch cap. Chunk publication splits
+     *  oversize inputs into smaller frames automatically, so this only surfaces
+     *  when splitting cannot make a frame fit. Distinct from
+     *  `line_sender_error_invalid_api_call` so callers can recognise it without
+     *  matching on the error message text. */
+    line_sender_error_batch_too_large = 35,
+
+    /** The QWP/WebSocket store-and-forward persisted symbol dictionary is
+     *  unrecoverable (a host/power crash tore the `.symbol-dict` side-file
+     *  relative to the queued frames), so the queued frames cannot be replayed
+     *  and the affected rows must be re-ingested from their source. Terminal.
+     *  Distinct from `line_sender_error_socket_error` (a transient, retryable
+     *  socket drop) so a caller can tell "resend from source" apart from
+     *  "reconnect and retry" by code, without matching on the message text. */
+    line_sender_error_store_resend_required = 36,
 } line_sender_error_code;
+
+/**
+ * Client-wide error object and category.
+ *
+ * These are the neutral spellings used by APIs that span ingest and query.
+ * They alias the released `line_sender_error` ABI so existing line-sender
+ * binaries and source keep working unchanged.
+ */
+typedef line_sender_error questdb_error;
+typedef line_sender_error_code questdb_error_code;
+
+/* Neutral names for the unified error-code constants. The underlying
+ * `line_sender_error_code` enum and its enumerators are retained because they
+ * shipped before the client-wide error vocabulary was introduced. */
+#define questdb_error_could_not_resolve_addr line_sender_error_could_not_resolve_addr
+#define questdb_error_invalid_api_call line_sender_error_invalid_api_call
+#define questdb_error_socket_error line_sender_error_socket_error
+#define questdb_error_invalid_utf8 line_sender_error_invalid_utf8
+#define questdb_error_invalid_name line_sender_error_invalid_name
+#define questdb_error_invalid_timestamp line_sender_error_invalid_timestamp
+#define questdb_error_auth_error line_sender_error_auth_error
+#define questdb_error_tls_error line_sender_error_tls_error
+#define questdb_error_http_not_supported line_sender_error_http_not_supported
+#define questdb_error_server_flush_error line_sender_error_server_flush_error
+#define questdb_error_config_error line_sender_error_config_error
+#define questdb_error_array_error line_sender_error_array_error
+#define questdb_error_protocol_version_error line_sender_error_protocol_version_error
+#define questdb_error_invalid_decimal line_sender_error_invalid_decimal
+#define questdb_error_server_rejection line_sender_error_server_rejection
+#define questdb_error_arrow_unsupported_column_kind line_sender_error_arrow_unsupported_column_kind
+#define questdb_error_arrow_ingest line_sender_error_arrow_ingest
+#define questdb_error_failover_retry line_sender_error_failover_retry
+#define questdb_error_role_mismatch line_sender_error_role_mismatch
+#define questdb_error_connect_timeout line_sender_error_connect_timeout
+#define questdb_error_handshake_error line_sender_error_handshake_error
+#define questdb_error_unsupported_server line_sender_error_unsupported_server
+#define questdb_error_protocol_error line_sender_error_protocol_error
+#define questdb_error_invalid_bind line_sender_error_invalid_bind
+#define questdb_error_server_schema_mismatch line_sender_error_server_schema_mismatch
+#define questdb_error_server_parse_error line_sender_error_server_parse_error
+#define questdb_error_server_internal_error line_sender_error_server_internal_error
+#define questdb_error_server_security_error line_sender_error_server_security_error
+#define questdb_error_limit_exceeded line_sender_error_limit_exceeded
+#define questdb_error_server_limit_exceeded line_sender_error_server_limit_exceeded
+#define questdb_error_cancelled line_sender_error_cancelled
+#define questdb_error_failover_would_duplicate line_sender_error_failover_would_duplicate
+#define questdb_error_schema_drift line_sender_error_schema_drift
+#define questdb_error_no_schema line_sender_error_no_schema
+#define questdb_error_arrow_export line_sender_error_arrow_export
+#define questdb_error_batch_too_large line_sender_error_batch_too_large
+#define questdb_error_store_resend_required line_sender_error_store_resend_required
 
 /** The protocol used to connect with. */
 typedef enum line_sender_protocol
@@ -144,13 +300,13 @@ typedef enum line_sender_protocol
     line_sender_protocol_https,
 
     /** QuestWire Protocol over UDP (IPv4-only). */
-    line_sender_protocol_qwpudp,
+    line_sender_protocol_udp,
 
     /** QuestWire Protocol over WebSocket. */
-    line_sender_protocol_qwpws,
+    line_sender_protocol_ws,
 
     /** QuestWire Protocol over WebSocket Secure (TLS). */
-    line_sender_protocol_qwpwss,
+    line_sender_protocol_wss,
 
     /**
      * Sentinel for a protocol the Rust `Protocol` enum knows about but
@@ -210,7 +366,31 @@ typedef enum line_sender_ca
     line_sender_ca_pem_file,
 } line_sender_ca;
 
-/** Error code categorizing the error. */
+/** Error code categorizing a client-wide error. NULL-safe: a NULL input
+ *  returns `questdb_error_invalid_api_call`. */
+QUESTDB_CLIENT_API
+questdb_error_code questdb_error_get_code(const questdb_error*);
+
+/**
+ * UTF-8 encoded client-wide error message. Never returns NULL. The returned
+ * string is not null-terminated; `len_out` receives its byte length.
+ * NULL-safe on both arguments: a NULL error returns an empty string and writes
+ * zero when `len_out` is non-NULL; a NULL `len_out` is ignored.
+ */
+QUESTDB_CLIENT_API
+const char* questdb_error_msg(const questdb_error*, size_t* len_out);
+
+/** Whether the failed operation may already have delivered its input. A true
+ *  result means replay can duplicate data unless the application has its own
+ *  deduplication guarantee. NULL-safe: a NULL input returns false. */
+QUESTDB_CLIENT_API
+bool questdb_error_in_doubt(const questdb_error*);
+
+/** Clean up a client-wide error. Idempotent on NULL. */
+QUESTDB_CLIENT_API
+void questdb_error_free(questdb_error*);
+
+/** Error code categorizing a line-sender error. */
 QUESTDB_CLIENT_API
 line_sender_error_code line_sender_error_get_code(const line_sender_error*);
 
@@ -221,6 +401,21 @@ line_sender_error_code line_sender_error_get_code(const line_sender_error*);
  */
 QUESTDB_CLIENT_API
 const char* line_sender_error_msg(const line_sender_error*, size_t* len_out);
+
+/**
+ * Whether the failed operation is *delivery-unknown* ("in doubt"): the current
+ * input's bytes may already have reached the server even though the call
+ * returned an error (e.g. a socket write that failed mid-frame, or a
+ * post-publish ACK wait that failed).
+ *
+ * Independent of `line_sender_error_get_code`: a delivery-unknown failure
+ * typically reports `line_sender_error_failover_retry`, yet that code alone
+ * does NOT mean the input is safe to resend. When this returns `true`, only
+ * replay the same input if table-level dedup/upsert keys make duplicate rows
+ * harmless. NULL-safe: passing NULL returns `false`.
+ */
+QUESTDB_CLIENT_API
+bool line_sender_error_in_doubt(const line_sender_error*);
 
 /** Clean up the error. */
 QUESTDB_CLIENT_API
@@ -428,6 +623,23 @@ QUESTDB_CLIENT_API
 line_sender_buffer* line_sender_buffer_new_qwp_with_max_name_len(
     size_t max_name_len);
 
+/**
+ * Construct a QWP/WebSocket `line_sender_buffer` with a fixed 127-byte name
+ * length limit. For pooled ingestion, prefer `questdb_db_new_buffer` so the
+ * buffer inherits the pool's configured name-length limit (see
+ * `qwp_sender.h`).
+ */
+QUESTDB_CLIENT_API
+line_sender_buffer* line_sender_buffer_new_qwp_ws(void);
+
+/**
+ * Construct a QWP/WebSocket columnar `line_sender_buffer` with a max name
+ * length limit.
+ */
+QUESTDB_CLIENT_API
+line_sender_buffer* line_sender_buffer_new_qwp_ws_with_max_name_len(
+    size_t max_name_len);
+
 /** Release the `line_sender_buffer` object. */
 QUESTDB_CLIENT_API
 void line_sender_buffer_free(line_sender_buffer* buffer);
@@ -547,7 +759,8 @@ void line_sender_buffer_clear(line_sender_buffer* buffer);
  * The current encoded size of the buffered data.
  *
  * For ILP buffers this is the exact pending byte length. For QWP buffers this
- * is a buffered size hint, not the exact size of any eventual UDP datagram.
+ * is a buffered size hint, not the exact size of an eventual UDP datagram or
+ * WebSocket replay frame.
  */
 QUESTDB_CLIENT_API
 size_t line_sender_buffer_size(const line_sender_buffer* buffer);
@@ -1214,14 +1427,16 @@ typedef enum line_sender_qwpws_error_category
     LINE_SENDER_QWPWS_ERROR_INTERNAL_ERROR = 2,
     LINE_SENDER_QWPWS_ERROR_SECURITY_ERROR = 3,
     LINE_SENDER_QWPWS_ERROR_WRITE_ERROR = 4,
-    LINE_SENDER_QWPWS_ERROR_PROTOCOL_VIOLATION = 5,
-    LINE_SENDER_QWPWS_ERROR_UNKNOWN = 6,
+    LINE_SENDER_QWPWS_ERROR_NOT_WRITABLE = 5,
+    LINE_SENDER_QWPWS_ERROR_PROTOCOL_VIOLATION = 6,
+    LINE_SENDER_QWPWS_ERROR_UNKNOWN = 7,
 } line_sender_qwpws_error_category;
 
 typedef enum line_sender_qwpws_error_policy
 {
-    LINE_SENDER_QWPWS_ERROR_DROP_AND_CONTINUE = 0,
-    LINE_SENDER_QWPWS_ERROR_HALT = 1,
+    LINE_SENDER_QWPWS_ERROR_RETRIABLE = 0,
+    LINE_SENDER_QWPWS_ERROR_RETRIABLE_OTHER = 1,
+    LINE_SENDER_QWPWS_ERROR_TERMINAL = 2,
 } line_sender_qwpws_error_policy;
 
 typedef struct line_sender_qwpws_error line_sender_qwpws_error;
@@ -1259,8 +1474,8 @@ typedef struct line_sender_opts line_sender_opts;
 /**
  * Create a new `line_sender_opts` instance from the given configuration
  * string. The format of the string is: "tcp::addr=host:port;key=value;...;"
- * Instead of "tcp" you can also specify "tcps", "http", "https", "qwpudp",
- * "qwpws", and "qwpwss".
+ * Instead of "tcp" you can also specify "tcps", "http", "https", "udp",
+ * "ws", and "wss".
  *
  * The accepted keys match one-for-one with the functions on
  * `line_sender_opts`. For example, this is a valid configuration string:
@@ -1333,7 +1548,7 @@ bool line_sender_opts_bind_interface(
  * or dropped when it is not; fragmented UDP is fragile because losing any
  * fragment loses the whole datagram.
  *
- * This setting is only supported for `line_sender_protocol_qwpudp`.
+ * This setting is only supported for `line_sender_protocol_udp`.
  * Returns `false` and sets `err_out` on constraint violation or
  * protocol mismatch.
  */
@@ -1353,7 +1568,7 @@ bool line_sender_opts_max_datagram_size(
  * `multicast_ttl` must be in the 0–255 range (inclusive).
  * Values greater than 255 are treated as an error.
  *
- * This setting is only supported for `line_sender_protocol_qwpudp`.
+ * This setting is only supported for `line_sender_protocol_udp`.
  * Returns `false` and sets `err_out` on constraint violation or
  * protocol mismatch.
  */
@@ -1366,8 +1581,8 @@ bool line_sender_opts_multicast_ttl(
 /**
  * Control whether QWP/WebSocket progress is driven by a background thread or
  * manually by the caller. The default is background progress. This setting is
- * only supported for `line_sender_protocol_qwpws` and
- * `line_sender_protocol_qwpwss`.
+ * only supported for `line_sender_protocol_ws` and
+ * `line_sender_protocol_wss`.
  */
 QUESTDB_CLIENT_API
 bool line_sender_opts_qwpws_progress(
@@ -1378,7 +1593,8 @@ bool line_sender_opts_qwpws_progress(
 /**
  * Install a QWP/WebSocket server-diagnostic callback. Passing NULL restores the
  * default C callback, which writes one structured line to stderr per
- * diagnostic.
+ * diagnostic. For a terminal diagnostic, the sender's terminal state and
+ * pollable diagnostic are committed before the callback is invoked.
  */
 QUESTDB_CLIENT_API
 bool line_sender_opts_qwpws_error_handler(
@@ -1413,8 +1629,9 @@ bool line_sender_opts_password(
     line_sender_error** err_out);
 
 /**
- * Set the Token (Bearer) Authentication parameter for HTTP,
- * or the ECDSA private key for TCP authentication.
+ * Set the bearer-token authentication parameter for HTTP or QWP/WebSocket,
+ * which requires QuestDB Enterprise, or set the ECDSA private key for TCP
+ * authentication.
  */
 QUESTDB_CLIENT_API
 bool line_sender_opts_token(
@@ -1499,7 +1716,7 @@ bool line_sender_opts_tls_ca(
  * This is used to validate the server's certificate during the TLS
  * handshake.
  *
- * On QWP/WebSocket (`qwpwss::`) the same path may instead point at a
+ * On QWP/WebSocket (`wss::`) the same path may instead point at a
  * JKS or PKCS#12 keystore; pair it with
  * `line_sender_opts_tls_roots_password` to unlock it.
  *
@@ -1514,7 +1731,7 @@ bool line_sender_opts_tls_roots(
  * Set the password unlocking the JKS / PKCS#12 keystore named by
  * `line_sender_opts_tls_roots`.
  *
- * QWP/WebSocket only (`qwpwss::`). Calling this on an ILP/TCP or
+ * QWP/WebSocket only (`wss::`). Calling this on an ILP/TCP or
  * ILP/HTTP sender returns an `invalid_api_call` error: those
  * transports read unencrypted PEM via rustls and have no keystore
  * concept.
@@ -1537,7 +1754,8 @@ bool line_sender_opts_tls_roots_password(
  *
  * For ILP this applies to the exact pending byte length.
  * For QWP/UDP this applies to the buffer size hint returned by
- * `line_sender_buffer_size()`.
+ * `line_sender_buffer_size()`. For QWP/WebSocket it caps the exact encoded
+ * replay frame.
  */
 QUESTDB_CLIENT_API
 bool line_sender_opts_max_buf_size(
@@ -1639,7 +1857,7 @@ line_sender* line_sender_build(
  * Create a new line sender instance from the given configuration string.
  * The format of the string is: "tcp::addr=host:port;key=value;...;"
  * Instead of "tcp" you can also specify "tcps", "http", "https",
- * "qwpudp", "qwpws", and "qwpwss".
+ * "udp", "ws", and "wss".
  *
  * The accepted keys match one-for-one with the functions on
  * `line_sender_opts`. For example, this is a valid configuration string:
@@ -1786,8 +2004,8 @@ bool line_sender_qwpws_published_fsn(
     line_sender_error** err_out);
 
 /**
- * Return the highest QWP/WebSocket frame sequence number completed by ACK or
- * drop-and-continue rejection, or no value if no frame has completed.
+ * Return the highest QWP/WebSocket frame sequence number completed by ACK, or
+ * no value if no frame has completed.
  */
 QUESTDB_CLIENT_API
 bool line_sender_qwpws_acked_fsn(
@@ -1796,15 +2014,39 @@ bool line_sender_qwpws_acked_fsn(
     line_sender_error** err_out);
 
 /**
- * Wait until the QWP/WebSocket completion watermark reaches `fsn`.
- * Timeout is a normal successful result with `*reached_out == false`.
+ * Acknowledgement level for QWP/WebSocket wait/sync APIs.
+ */
+typedef enum qwpws_ack_level
+{
+    /** Wait for the server to accept every published frame. */
+    qwpws_ack_level_ok = 0,
+
+    /** Wait for durable-ACK coverage. This level requires QuestDB Enterprise;
+     * APIs accepting it also require the `request_durable_ack=on` opt-in. */
+    qwpws_ack_level_durable = 1,
+} qwpws_ack_level;
+
+/**
+ * Wait until every QWP/WebSocket frame published so far reaches `ack_level`
+ * (a `qwpws_ack_level` value). This is the row-major counterpart
+ * to `qwp_sender_wait`.
+ *
+ * `timeout_millis` is a no-progress deadline (it fires only if the ack
+ * watermark fails to advance for that long); `0` waits indefinitely.
+ * `qwpws_ack_level_durable` requires QuestDB Enterprise and
+ * `request_durable_ack=on`; otherwise this returns
+ * `line_sender_error_invalid_api_call` even when nothing has been published.
+ *
+ * Returns `false` and sets `err_out` on the no-progress timeout
+ * (`line_sender_error_failover_retry`), a server rejection, a transport
+ * failure, or an invalid `ack_level`. With nothing published yet it succeeds
+ * immediately.
  */
 QUESTDB_CLIENT_API
-bool line_sender_qwpws_await_acked_fsn(
+bool line_sender_qwpws_wait(
     line_sender* sender,
-    uint64_t fsn,
+    uint32_t ack_level,
     uint64_t timeout_millis,
-    bool* reached_out,
     line_sender_error** err_out);
 
 /**
@@ -1974,6 +2216,75 @@ int64_t line_sender_now_nanos(void);
 /** Get the current time in microseconds since the Unix epoch (UTC). */
 QUESTDB_CLIENT_API
 int64_t line_sender_now_micros(void);
+
+/* -------------------------------------------------------------------------
+ * Connection lifecycle events (QWP/WebSocket senders and pools)
+ * ------------------------------------------------------------------------- */
+
+/** Connection lifecycle event kinds. */
+#define questdb_connection_event_connected 0u
+#define questdb_connection_event_disconnected 1u
+#define questdb_connection_event_reconnected 2u
+#define questdb_connection_event_failed_over 3u
+#define questdb_connection_event_endpoint_attempt_failed 4u
+#define questdb_connection_event_all_endpoints_unreachable 5u
+#define questdb_connection_event_auth_failed 6u
+
+/** One connection-state transition. String fields are borrowed UTF-8
+ * slices valid only for the duration of the callback; absent strings are
+ * NULL with length 0. */
+typedef struct questdb_connection_event
+{
+    /** One of the `questdb_connection_event_*` kind constants. */
+    uint32_t kind;
+    const char* host;
+    size_t host_len;
+    const char* port;
+    size_t port_len;
+    const char* previous_host;
+    size_t previous_host_len;
+    const char* previous_port;
+    size_t previous_port_len;
+    bool has_attempt;
+    uint64_t attempt_number;
+    bool has_cause;
+    line_sender_error_code cause_code;
+    const char* cause_msg;
+    size_t cause_msg_len;
+    /** Wall-clock time of the event, milliseconds since the Unix epoch. */
+    int64_t timestamp_millis;
+} questdb_connection_event;
+
+/** Callback invoked once per connection event on the dispatcher thread.
+ * Connected, reconnected, and failed-over events are queued only after the
+ * negotiated connection state, including the server-advertised frame cap, is
+ * committed. They are not data-delivery or acknowledgement barriers.
+ * The `event` pointer and every string it references are valid only for
+ * the duration of the call. Must not unwind. */
+typedef void (*questdb_connection_event_cb)(
+    void* user_data,
+    const questdb_connection_event* event);
+
+/** Register a connection lifecycle listener on the sender being built.
+ * Events are delivered on a dedicated dispatcher thread through a bounded
+ * inbox (`inbox_capacity`; 0 = default 64) with a drop-oldest overflow
+ * policy. The caller guarantees `user_data` is safe to use from that
+ * thread. QWP/WebSocket only; at most one listener per builder. */
+QUESTDB_CLIENT_API
+bool line_sender_opts_connection_event_handler(
+    line_sender_opts* opts,
+    questdb_connection_event_cb cb,
+    void* user_data,
+    size_t inbox_capacity,
+    line_sender_error** err_out);
+
+/** Total connection events dropped by the sender listener inbox. */
+QUESTDB_CLIENT_API
+uint64_t line_sender_connection_events_dropped(const line_sender* sender);
+
+/** Total connection events delivered to the sender listener. */
+QUESTDB_CLIENT_API
+uint64_t line_sender_connection_events_delivered(const line_sender* sender);
 
 #ifdef __cplusplus
 }

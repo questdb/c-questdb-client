@@ -29,12 +29,12 @@
 //! from QuestDB. The module bundles the wire codec foundation (frame
 //! header, varint, message kinds, column type codes, errors), the
 //! `RESULT_BATCH` decoder and column views, the symbol dict and
-//! per-query schema, and — when `sync-reader-ws` is enabled — the WebSocket
+//! per-query schema, and — when `sync-reader-qwp-ws` is enabled — the WebSocket
 //! transport and `Reader`/`Cursor`/`BatchView` streaming API.
 
 // Sub-modules.
 //
-// `pub mod` modules (column, column_kind, config, error, reader, wire)
+// `pub mod` modules (column, column_kind, config, reader, wire)
 // are part of the navigable API surface — tests and examples take
 // sub-paths through them (e.g. `egress::column::FixedColumn`,
 // `egress::wire::flags`, `egress::reader::Terminal`).
@@ -44,28 +44,29 @@
 // are surfaced via the top-level `pub use` block below; everything
 // else stays internal and is free to evolve without a breaking
 // change.
+#[cfg(feature = "arrow-egress")]
+pub mod arrow;
 pub(crate) mod auth;
 pub(crate) mod binds;
 pub mod column;
 pub mod column_kind;
 pub mod config;
 pub(crate) mod decoder;
-pub mod error;
 pub(crate) mod gorilla;
 pub(crate) mod query_request;
-#[cfg(feature = "sync-reader-ws")]
+#[cfg(feature = "sync-reader-qwp-ws")]
 pub mod reader;
 pub(crate) mod schema;
 pub(crate) mod server_event;
 pub(crate) mod symbol_dict;
-#[cfg(feature = "sync-reader-ws")]
+#[cfg(feature = "sync-reader-qwp-ws")]
 pub(crate) mod tls;
-#[cfg(feature = "sync-reader-ws")]
+#[cfg(feature = "sync-reader-qwp-ws")]
 pub(crate) mod tracker;
-#[cfg(feature = "sync-reader-ws")]
+#[cfg(feature = "sync-reader-qwp-ws")]
 pub(crate) mod transport;
 pub mod wire;
-#[cfg(feature = "sync-reader-ws")]
+#[cfg(feature = "sync-reader-qwp-ws")]
 pub(crate) mod ws;
 
 // Top-level public surface. Anything not listed here is either
@@ -76,7 +77,7 @@ pub(crate) mod ws;
 pub use crate::ingress::CertificateAuthority;
 pub use binds::{Bind, SimpleNullKind};
 pub use column::{
-    BinaryColumn, ColumnView, Decimal64Column, Decimal128Column, Decimal256Column,
+    BinaryColumn, ColumnView, Decimal64Column, Decimal128Column, Decimal256Column, DecimalColumn,
     DoubleArrayColumn, FixedBytesColumn, FixedColumn, FixedWidth, GeohashColumn, Long256Column,
     LongArrayColumn, SymbolColumn, UuidColumn, Validity, VarcharColumn,
 };
@@ -87,13 +88,12 @@ pub use config::{
     Endpoint, MAX_ADDRS, MAX_COMPRESSION_LEVEL, MAX_FAILOVER_BACKOFF_MAX_MS,
     MAX_FAILOVER_MAX_ATTEMPTS, MIN_COMPRESSION_LEVEL, ReaderConfig, Target, TlsVerify,
 };
-pub use error::{Error, ErrorCode, Result};
-#[cfg(feature = "sync-reader-ws")]
+#[cfg(feature = "sync-reader-qwp-ws")]
 pub use reader::{
-    BatchView, Cursor, FailoverEvent, FailoverPhase, FailoverProgressEvent, Reader, ReaderQuery,
-    ReaderStats, Terminal,
+    BatchView, Cursor, FailoverPhase, FailoverProgressEvent, FailoverResetEvent, Reader,
+    ReaderQuery, ReaderStats, Terminal,
 };
-pub use server_event::{ServerInfo, ServerRole};
+pub use server_event::{ServerInfo, ServerRole, UpgradeReject};
 pub use symbol_dict::{SymbolDict, SymbolEntry};
 
 /// Decoder internals re-exported for the in-crate criterion benchmark
@@ -103,10 +103,44 @@ pub use symbol_dict::{SymbolDict, SymbolEntry};
 /// removed without notice; everything in here moves on the same
 /// stability footing as `pub(crate)`.
 #[doc(hidden)]
-#[cfg(feature = "sync-reader-ws")]
+#[cfg(feature = "sync-reader-qwp-ws")]
 pub mod _bench_internals {
     pub use crate::egress::decoder::{DecodedBatch, ZstdScratch, decode_result_batch};
     pub use crate::egress::schema::Schema;
     pub use crate::egress::symbol_dict::SymbolDict;
     pub use bytes::Bytes;
+
+    /// Assemble an already-decoded [`DecodedBatch`] into an
+    /// `arrow::array::RecordBatch`, mirroring the in-crate
+    /// `Cursor::next_arrow_batch` assembly path (`batch_arrow_schema` +
+    /// `batch_to_record_batch`) so a server-free decode→assemble
+    /// benchmark can isolate the column-build cost on top of the raw
+    /// decode. The egress `schema` and `dict` are the ones
+    /// [`decode_result_batch`] populated for the same payload.
+    #[cfg(feature = "arrow-egress")]
+    pub fn bench_batch_to_record_batch(
+        schema: &Schema,
+        batch: DecodedBatch,
+        dict: &SymbolDict,
+    ) -> crate::error::Result<arrow::array::RecordBatch> {
+        use std::sync::Arc;
+        let arrow_schema = Arc::new(crate::egress::arrow::batch_arrow_schema(schema, &batch)?);
+        crate::egress::arrow::batch_to_record_batch(arrow_schema, schema, batch, dict)
+    }
+
+    /// Full decode→assemble→polars path for the `→ polars DataFrame`
+    /// decoder bench arm: assemble the decoded batch into a
+    /// `RecordBatch` (see [`bench_batch_to_record_batch`]) and hand it
+    /// to polars via the Arrow C Data Interface
+    /// (`record_batch_to_dataframe`). This is the honest
+    /// `decode_plus_assemble`-to-DataFrame microbench with no network.
+    #[cfg(feature = "polars-egress")]
+    pub fn bench_batch_to_polars(
+        schema: &Schema,
+        batch: DecodedBatch,
+        dict: &SymbolDict,
+    ) -> crate::error::Result<polars::frame::DataFrame> {
+        let rb = bench_batch_to_record_batch(schema, batch, dict)?;
+        crate::egress::arrow::polars::record_batch_to_dataframe(rb)
+    }
 }

@@ -1,0 +1,43 @@
+# Soak / stress workload driver. Standalone crate (NOT a member of the
+# questdb-rs / questdb-rs-ffi workspaces) so a heavy soak build never blocks
+# ordinary client development. The leg drivers add a path-dependency on
+# questdb-rs once they land (see src/legs/); the generator (src/gen.rs) is
+# std-only and compiles/tests on its own.
+[package]
+name = "soak-workload"
+version = "0.0.0"
+edition = "2021"
+publish = false
+license = "Apache-2.0"
+
+[[bin]]
+name = "soak-workload"
+path = "src/main.rs"
+
+[lib]
+name = "soak_workload"
+path = "src/lib.rs"
+
+[features]
+# The DataFrame leg pulls polars (heavy); keep it opt-in so the row / column /
+# egress legs build fast. `cargo build --features dataframe` enables it.
+default = []
+dataframe = ["questdb/polars-ingress", "dep:polars"]
+
+[dependencies]
+# The leg drivers drive real ingest/egress through the pool; the generator and
+# journal stay std-only. Base features cover Buffer, Chunk, Arrow, and reader
+# legs; polars is behind the `dataframe` feature.
+questdb = { package = "questdb-rs", path = "../../../questdb-rs", features = ["arrow-ingress", "sync-reader-qwp-ws"] }
+arrow = { version = ">=58, <60", default-features = false }
+# Version range unified with questdb-rs so the shared DataFrame type matches.
+polars = { version = ">=0.52, <0.55", optional = true, default-features = false, features = ["dtype-datetime"] }
+# SIGTERM/SIGINT handling so the orchestrator's graceful stop lets a leg finish
+# its loop and release its pooled sender/reader before exiting (I4 pool drain).
+signal-hook = { version = "0.3", default-features = false }
+
+[profile.release]
+# Soak legs run for an hour; favour steady throughput and debuggable panics
+# over micro-optimisation. Keep overflow checks on: a wrapping bug in the
+# generator would silently desync the oracle.
+overflow-checks = true

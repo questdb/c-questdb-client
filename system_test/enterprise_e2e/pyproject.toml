@@ -27,6 +27,12 @@ markers = [
     "c_client_rust: c-questdb-client Rust binding subset",
     "c_client_c: c-questdb-client C binding subset (no tests yet)",
     "c_client_cpp: c-questdb-client C++ binding subset (no tests yet)",
+    # Randomized fuzz (slower; separate cadence). Deliberately NOT also
+    # tagged `c_client`, so the deterministic `-m c_client` CI selection
+    # skips it -- mirroring the Enterprise harness, where fuzz runs via
+    # `-m fuzz` rather than in the PR pipeline. Run with
+    # `-m "c_client_rust and fuzz"`.
+    "fuzz: randomized fuzz tests (slower; run on a separate cadence)",
 ]
 log_cli = true
 log_cli_level = "INFO"

@@ -24,8 +24,11 @@
 
 use crate::{
     ErrorCode,
-    ingress::{Buffer, Sender, TableName, Timestamp, TimestampMicros, TimestampNanos},
+    ingress::{Buffer, TableName, Timestamp, TimestampMicros, TimestampNanos},
 };
+
+#[cfg(feature = "_sync-sender")]
+use crate::ingress::Sender;
 
 #[cfg(any(feature = "sync-sender-tcp", feature = "sync-sender-http"))]
 use crate::ingress::{DOUBLE_BINARY_FORMAT_TYPE, F64Serializer};
@@ -187,7 +190,7 @@ fn test_array_f64_for_ndarray() -> TestResult {
     assert_eq!(server.recv_q()?, 0);
 
     let array_header2d = &[
-        &[b'='][..],
+        &b"="[..],
         &[ARRAY_BINARY_FORMAT_TYPE],
         &[ArrayColumnTypeTag::Double.into()],
         &[2u8],
@@ -199,7 +202,7 @@ fn test_array_f64_for_ndarray() -> TestResult {
     write_array_data(&array_2d.view(), &mut array_data2d[0..], 32)?;
 
     let array_header3d = &[
-        &[b'='][..],
+        &b"="[..],
         &[ARRAY_BINARY_FORMAT_TYPE],
         &[ArrayColumnTypeTag::Double.into()],
         &[3u8],
@@ -885,7 +888,7 @@ fn test_timestamp_overloads_v2() -> TestResult {
     Ok(())
 }
 
-#[cfg(feature = "chrono_timestamp")]
+#[cfg(feature = "chrono-timestamp")]
 #[test]
 fn test_chrono_timestamp() -> TestResult {
     use chrono::{DateTime, TimeZone, Utc};

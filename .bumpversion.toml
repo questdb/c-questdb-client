@@ -9,19 +9,14 @@ search = "project(c-questdb-client VERSION {current_version})"
 replace = "project(c-questdb-client VERSION {new_version})"
 
 [[tool.bumpversion.files]]
-filename = "doc/SECURITY.md"
-search = "questdb-rs/{current_version}/"
-replace = "questdb-rs/{new_version}/"
-
-[[tool.bumpversion.files]]
 filename = "questdb-rs/Cargo.toml"
 search = "version = \"{current_version}\""
 replace = "version = \"{new_version}\""
 
 [[tool.bumpversion.files]]
-filename = "./questdb-rs/README.md"
-search = "questdb-rs/{current_version}/"
-replace = "questdb-rs/{new_version}/"
+filename = "questdb-rs/README.md"
+search = "Version {current_version} requires Rust"
+replace = "Version {new_version} requires Rust"
 
 [[tool.bumpversion.files]]
 filename = "questdb-rs/README.md"
@@ -32,6 +27,21 @@ replace = "https://github.com/questdb/c-questdb-client/tree/{new_version}/"
 filename = "questdb-rs/README.md"
 search = "https://github.com/questdb/c-questdb-client/blob/{current_version}/questdb-rs/"
 replace = "https://github.com/questdb/c-questdb-client/blob/{new_version}/questdb-rs/"
+
+[[tool.bumpversion.files]]
+filename = "doc/COMPATIBILITY.md"
+search = "for the {current_version} client"
+replace = "for the {new_version} client"
+
+[[tool.bumpversion.files]]
+filename = "doc/RELEASING.md"
+search = "{current_version}"
+replace = "{new_version}"
+
+[[tool.bumpversion.files]]
+filename = "doc/RELEASE_RUNBOOK.md"
+search = "{current_version}"
+replace = "{new_version}"
 
 [[tool.bumpversion.files]]
 filename = "questdb-rs-ffi/Cargo.toml"

@@ -190,7 +190,7 @@ struct IlpBookmarkState {
 /// # }
 /// ```
 ///
-/// Send the buffer to QuestDB using [`sender.flush(&mut buffer)`](Sender::flush).
+/// Send the buffer to QuestDB using [`sender.flush(&mut buffer)`](crate::ingress::Sender::flush).
 ///
 /// # Sequential Coupling
 /// The Buffer API is sequentially coupled:
@@ -278,8 +278,8 @@ impl Buffer {
     /// - Uses the specified protocol version
     /// - Sets maximum name length to **127 characters** (QuestDB server default)
     ///
-    /// This is equivalent to [`Sender::new_buffer`] when using the [`Sender::protocol_version`]
-    /// and [`Sender::max_name_len`] is 127.
+    /// This is equivalent to [`Sender::new_buffer`](crate::ingress::Sender::new_buffer) when using the [`Sender::protocol_version`](crate::ingress::Sender::protocol_version)
+    /// and [`Sender::max_name_len`](crate::ingress::Sender::max_name_len) is 127.
     ///
     /// For custom name lengths, use [`Self::with_max_name_len`]
     pub fn new(protocol_version: ProtocolVersion) -> Self {
@@ -292,8 +292,8 @@ impl Buffer {
     ///   your QuestDB server's `cairo.max.file.name.length` configuration
     /// - `protocol_version`: Protocol version to use
     ///
-    /// This is equivalent to [`Sender::new_buffer`] when using the [`Sender::protocol_version`]
-    /// and [`Sender::max_name_len`].
+    /// This is equivalent to [`Sender::new_buffer`](crate::ingress::Sender::new_buffer) when using the [`Sender::protocol_version`](crate::ingress::Sender::protocol_version)
+    /// and [`Sender::max_name_len`](crate::ingress::Sender::max_name_len).
     ///
     /// For the default max name length limit (127), use [`Self::new`].
     pub fn with_max_name_len(protocol_version: ProtocolVersion, max_name_len: usize) -> Self {
@@ -450,8 +450,8 @@ impl Buffer {
     }
 
     /// Checks if this buffer is ready to be flushed to a sender via one of the
-    /// [`Sender::flush`] functions. An [`Ok`] value indicates that the buffer
-    /// is ready to be flushed via a [`Sender`] while an [`Err`] will contain a
+    /// [`Sender::flush`](crate::ingress::Sender::flush) functions. An [`Ok`] value indicates that the buffer
+    /// is ready to be flushed via a [`Sender`](crate::ingress::Sender) while an [`Err`] will contain a
     /// message indicating why this [`Buffer`] cannot be flushed at the moment.
     #[inline(always)]
     pub fn check_can_flush(&self) -> crate::Result<()> {
@@ -1068,7 +1068,7 @@ impl Buffer {
     /// Note that both `TimestampMicros` and `TimestampNanos` can be constructed
     /// easily from either `std::time::SystemTime` or `chrono::DateTime`.
     ///
-    /// This last option requires the `chrono_timestamp` feature.
+    /// This last option requires the `chrono-timestamp` feature.
     pub fn column_ts<'a, N, T>(&mut self, name: N, value: T) -> crate::Result<&mut Self>
     where
         N: TryInto<ColumnName<'a>>,
@@ -1096,7 +1096,7 @@ impl Buffer {
 
     /// Complete the current row with the designated timestamp. After this call, you can
     /// start recording the next row by calling [Buffer::table] again, or  you can send
-    /// the accumulated batch by calling [Sender::flush] or one of its variants.
+    /// the accumulated batch by calling [Sender::flush](crate::ingress::Sender::flush) or one of its variants.
     ///
     /// ```no_run
     /// # use questdb::Result;
@@ -1182,7 +1182,7 @@ impl Buffer {
     /// In almost all cases, you should prefer the [Buffer::at] function.
     ///
     /// After this call, you can start recording the next row by calling [Buffer::table]
-    /// again, or you can send the accumulated batch by calling [Sender::flush] or one of
+    /// again, or you can send the accumulated batch by calling [Sender::flush](crate::ingress::Sender::flush) or one of
     /// its variants.
     ///
     /// ```no_run

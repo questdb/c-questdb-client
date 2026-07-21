@@ -39,8 +39,8 @@
 //! uncompressed at the head of the column body (16 bytes); they seed the
 //! state and all subsequent values are reconstructed via the bitstream.
 
-use crate::egress::error::Result;
 use crate::egress::wire::bit_reader::BitReader;
+use crate::error::Result;
 
 /// Stateful decoder that consumes a Gorilla bitstream.
 pub struct GorillaDecoder<'a> {

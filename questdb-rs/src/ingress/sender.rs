@@ -23,7 +23,7 @@
  ******************************************************************************/
 
 // `SyncProtocolHandler` is cfg-pruned: with only `sync-sender-qwp-ws`
-// enabled, the enum has just the two `*QwpWs` variants and a number
+// enabled, the enum has just the two `*Ws` variants and a number
 // of `_ =>` fallbacks here become unreachable. Suppress only in that
 // exact configuration so a regression in the multi-handler builds
 // still surfaces.
@@ -37,6 +37,8 @@
 )]
 
 use crate::error::{self, Result};
+#[cfg(feature = "sync-sender-qwp-ws")]
+use crate::ingress::AckLevel;
 #[cfg(feature = "_sync-sender")]
 use crate::ingress::SenderBuilder;
 use crate::ingress::{Buffer, Protocol, ProtocolVersion};
@@ -58,11 +60,20 @@ mod qwp_ws_codec;
 #[cfg(feature = "_sender-qwp-ws")]
 mod qwp_ws_driver;
 
+#[cfg(feature = "sync-sender-qwp-ws")]
+pub(crate) use qwp_ws_driver::{
+    ReconnectPolicy, ReconnectReason, reconnect_backoff_step, reconnect_error_is_terminal,
+};
+
 #[cfg(feature = "_sender-qwp-ws")]
 mod qwp_ws_ownership;
 
 #[cfg(feature = "_sender-qwp-ws")]
 mod qwp_ws_orphan;
+#[cfg(all(test, feature = "_sender-qwp-ws"))]
+pub(crate) use qwp_ws_orphan::has_any_sfa_file;
+#[cfg(feature = "_sender-qwp-ws")]
+pub(crate) use qwp_ws_orphan::is_candidate_orphan;
 
 #[cfg(feature = "_sender-qwp-ws")]
 mod qwp_ws_publisher;
@@ -80,12 +91,21 @@ mod qwp_ws_sfa_queue;
 mod qwp_ws_sfa_slot;
 
 #[cfg(feature = "_sender-qwp-ws")]
+pub(crate) mod qwp_ws_sfa_publisher;
+
+#[cfg(feature = "_sender-qwp-ws")]
+pub(crate) mod qwp_ws_sfa_symbol_dict;
+
+#[cfg(feature = "_sender-qwp-ws")]
+mod qwp_ws_sfa_catchup;
+
+#[cfg(feature = "_sender-qwp-ws")]
 pub(crate) use qwp_ws_ownership::QwpWsRoleReject;
 #[cfg(feature = "_sender-qwp-ws")]
 pub use qwp_ws_ownership::*;
 
 #[cfg(feature = "sync-sender-qwp-ws")]
-mod qwp_ws;
+pub(crate) mod qwp_ws;
 
 #[cfg(feature = "sync-sender-qwp-ws")]
 pub(crate) use qwp_ws::*;
@@ -153,6 +173,8 @@ pub struct Sender {
     max_name_len: usize,
     #[cfg(feature = "_sender-qwp-ws")]
     qwp_ws_error_handler: QwpWsErrorHandler,
+    #[cfg(feature = "_sender-qwp-ws")]
+    conn_events: Option<std::sync::Arc<crate::ingress::conn_events::ConnectionEventSource>>,
 }
 
 impl Debug for Sender {
@@ -162,6 +184,26 @@ impl Debug for Sender {
 }
 
 impl Sender {
+    /// Total connection events discarded by the listener inbox's
+    /// drop-oldest policy. `0` when no listener is registered.
+    #[cfg(feature = "_sender-qwp-ws")]
+    pub fn connection_events_dropped(&self) -> u64 {
+        self.conn_events
+            .as_deref()
+            .map(|events| events.dropped())
+            .unwrap_or(0)
+    }
+
+    /// Total connection events delivered to the listener. `0` when no
+    /// listener is registered.
+    #[cfg(feature = "_sender-qwp-ws")]
+    pub fn connection_events_delivered(&self) -> u64 {
+        self.conn_events
+            .as_deref()
+            .map(|events| events.delivered())
+            .unwrap_or(0)
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         descr: String,
@@ -172,6 +214,9 @@ impl Sender {
         protocol_version: ProtocolVersion,
         max_name_len: usize,
         #[cfg(feature = "_sender-qwp-ws")] qwp_ws_error_handler: QwpWsErrorHandler,
+        #[cfg(feature = "_sender-qwp-ws")] conn_events: Option<
+            std::sync::Arc<crate::ingress::conn_events::ConnectionEventSource>,
+        >,
     ) -> Self {
         Self {
             descr,
@@ -184,6 +229,8 @@ impl Sender {
             max_name_len,
             #[cfg(feature = "_sender-qwp-ws")]
             qwp_ws_error_handler,
+            #[cfg(feature = "_sender-qwp-ws")]
+            conn_events,
         }
     }
 
@@ -192,7 +239,7 @@ impl Sender {
     /// The format of the string is: `"http::addr=host:port;key=value;...;"`.
     ///
     /// Instead of `"http"`, you can also specify `"https"`, `"tcp"`, `"tcps"`,
-    /// and `"qwpudp"`.
+    /// and `"udp"`.
     ///
     /// We recommend HTTP for most cases because it provides more features, like
     /// reporting errors to the client and supporting transaction control. TCP can
@@ -535,7 +582,7 @@ impl Sender {
     /// the default background progress mode, a sender-owned runner sends,
     /// receives ACKs, reconnects, and replays as needed. In manual progress
     /// mode, the caller must use `Sender::drive_once` or
-    /// `Sender::await_acked_fsn` to advance WebSocket progress. Server or
+    /// `Sender::wait` to advance WebSocket progress. Server or
     /// transport failures observed later are reported by subsequent sender
     /// calls.
     ///
@@ -557,6 +604,11 @@ impl Sender {
     /// semantics as [`Sender::flush`]: it returns after the frame is accepted
     /// by the local replay queue, before the server necessarily ACKs it. Empty
     /// buffers return `Ok(None)`.
+    ///
+    /// Use this when you need non-blocking/pipelined progress tracking on this
+    /// sender stream: keep the returned FSN and compare it with
+    /// [`Self::acked_fsn`]. Use [`Self::wait`] instead when you only need a
+    /// blocking barrier for everything published so far.
     #[cfg(feature = "sync-sender-qwp-ws")]
     pub fn flush_and_get_fsn(&mut self, buf: &mut Buffer) -> Result<Option<u64>> {
         let fsn = self.flush_and_keep_and_get_fsn(buf)?;
@@ -566,6 +618,9 @@ impl Sender {
 
     /// Publish the QWP/WebSocket buffer without clearing it and return the
     /// highest published frame sequence number.
+    ///
+    /// The returned FSN has the same local-publication semantics as
+    /// [`Self::flush_and_get_fsn`].
     #[cfg(feature = "sync-sender-qwp-ws")]
     pub fn flush_and_keep_and_get_fsn(&mut self, buf: &Buffer) -> Result<Option<u64>> {
         self.flush_qwp_ws_buffer(buf, false)
@@ -573,6 +628,8 @@ impl Sender {
 
     /// Return the highest frame sequence number published locally by this
     /// QWP/WebSocket sender, or `None` if no frame has been published.
+    ///
+    /// This is a sender-stream watermark, not a process-global receipt.
     #[cfg(feature = "sync-sender-qwp-ws")]
     pub fn published_fsn(&self) -> Result<Option<u64>> {
         match &self.handler {
@@ -589,6 +646,11 @@ impl Sender {
     /// server-side reject-and-continue, or `None` if no frame has completed.
     /// In QWP/WebSocket durable ACK mode, ordinary OK frames only release send
     /// window pressure; this watermark advances after durable ACK coverage.
+    ///
+    /// After [`Self::flush_and_get_fsn`] returns `Some(fsn)`, that publication
+    /// boundary has completed once this method returns a value greater than or
+    /// equal to `fsn`. Use [`Self::wait`] when you need an explicit
+    /// [`AckLevel::Ok`] or [`AckLevel::Durable`] barrier.
     #[cfg(feature = "sync-sender-qwp-ws")]
     pub fn acked_fsn(&self) -> Result<Option<u64>> {
         match &self.handler {
@@ -601,53 +663,131 @@ impl Sender {
         }
     }
 
-    /// Wait until the QWP/WebSocket cumulative completion watermark reaches
-    /// `fsn`.
+    /// Wait until every QWP/WebSocket frame published so far on this sender
+    /// reaches `ack_level`, or until the wait makes no progress for `timeout`.
     ///
-    /// The watermark advances on server ACKs and server-side
-    /// reject-and-continue responses. In QWP/WebSocket durable ACK mode,
-    /// ordinary OK frames only release send window pressure; this waits for
-    /// durable ACK coverage. Returns `Ok(true)` if the watermark is reached
-    /// before `timeout`, and `Ok(false)` on timeout. In manual progress mode
-    /// this method also drives WebSocket progress while waiting.
+    /// This is the row-major counterpart to the column-major
+    /// [`crate::BorrowedSender::wait`]: it takes the cumulative publication
+    /// boundary ([`Self::published_fsn`]) and blocks until the requested
+    /// completion watermark covers it.
+    ///
+    /// * [`AckLevel::Ok`] waits for the server to accept every published
+    ///   frame.
+    /// * [`AckLevel::Durable`] waits for durable-ACK coverage. It requires
+    ///   QuestDB Enterprise and a sender opened with
+    ///   `request_durable_ack=on`; otherwise the call is rejected before
+    ///   checking whether any frame has been published.
+    ///
+    /// `timeout` is a **no-progress** deadline: it fires only if the ack
+    /// watermark fails to advance for that long, so a steadily-progressing
+    /// large batch keeps waiting. `Duration::ZERO` waits indefinitely. On
+    /// expiry it returns an
+    /// [`ErrorCode::FailoverRetry`](crate::ErrorCode::FailoverRetry)
+    /// error and the published frames are retained for replay.
+    ///
+    /// A terminal server rejection of a frame in the pending range, or a
+    /// terminal transport/protocol failure, is returned as an error. Retriable
+    /// server rejections reconnect and replay until the frame is acknowledged or
+    /// the sender is stopped. When nothing has been published yet, a valid wait
+    /// returns immediately. QWP/WebSocket only; other
+    /// protocols return `InvalidApiCall`. In manual progress mode this also
+    /// drives WebSocket progress while waiting.
     #[cfg(feature = "sync-sender-qwp-ws")]
-    pub fn await_acked_fsn(&mut self, fsn: u64, timeout: Duration) -> Result<bool> {
+    pub fn wait(&mut self, ack_level: AckLevel, timeout: Duration) -> Result<()> {
+        let result = self.wait_inner(ack_level, timeout);
+        let drain_result = self.drain_qwp_ws_error_notifications();
+        result.and(drain_result)
+    }
+
+    #[cfg(feature = "sync-sender-qwp-ws")]
+    fn wait_inner(&mut self, ack_level: AckLevel, timeout: Duration) -> Result<()> {
         if !matches!(
             &self.handler,
             SyncProtocolHandler::SyncQwpWs(_) | SyncProtocolHandler::ManualQwpWs(_)
         ) {
             return Err(error::fmt!(
                 InvalidApiCall,
-                "await_acked_fsn is only supported for QWP/WebSocket senders."
+                "wait is only supported for QWP/WebSocket senders."
             ));
         }
 
-        let deadline = Instant::now().checked_add(timeout);
-        loop {
-            if self.acked_fsn()?.is_some_and(|acked| acked >= fsn) {
-                return Ok(true);
+        if ack_level == AckLevel::Durable {
+            let request_durable_ack = match &self.handler {
+                SyncProtocolHandler::SyncQwpWs(state) => state.request_durable_ack,
+                SyncProtocolHandler::ManualQwpWs(state) => state.request_durable_ack,
+                _ => unreachable!("QWP/WebSocket handler was checked above"),
+            };
+            if !request_durable_ack {
+                return Err(error::fmt!(
+                    InvalidApiCall,
+                    "AckLevel::Durable requires the pool to be opened with \
+                     `request_durable_ack=on` in the connect string."
+                ));
             }
-            if qwp_ws_deadline_expired(deadline) {
-                return Ok(false);
+        }
+
+        let Some(boundary) = self.published_fsn()? else {
+            return Ok(());
+        };
+
+        // No-progress deadline: reset whenever the completion watermark
+        // advances, so it only fires when the peer stays alive yet silent.
+        let mut deadline_anchor = Instant::now();
+        let mut last_completed: Option<u64> = None;
+
+        loop {
+            let completed = self.qwp_ws_completed_fsn(ack_level)?;
+            if completed.is_some_and(|fsn| fsn >= boundary) {
+                return Ok(());
+            }
+            if completed != last_completed {
+                last_completed = completed;
+                deadline_anchor = Instant::now();
+            }
+            if !timeout.is_zero() && deadline_anchor.elapsed() >= timeout {
+                return Err(qwp_ws_wait_timeout(ack_level, timeout, boundary, completed));
             }
 
             match &mut self.handler {
                 SyncProtocolHandler::ManualQwpWs(state) => {
                     if !qwp_ws_drive_once(state)? {
-                        qwp_ws_sleep_until(deadline);
+                        qwp_ws_sleep_until(None);
                     }
                 }
-                SyncProtocolHandler::SyncQwpWs(_) => qwp_ws_sleep_until(deadline),
+                SyncProtocolHandler::SyncQwpWs(_) => qwp_ws_sleep_until(None),
                 _ => unreachable!("QWP/WebSocket handler was checked above"),
             }
+        }
+    }
+
+    /// Completion watermark for `ack_level` across both QWP/WebSocket progress
+    /// modes. `Ok` tracks server acceptance; `Durable` tracks durable-ACK
+    /// coverage. Terminal failures surface here as an `Err`.
+    #[cfg(feature = "sync-sender-qwp-ws")]
+    fn qwp_ws_completed_fsn(&self, ack_level: AckLevel) -> Result<Option<u64>> {
+        match (&self.handler, ack_level) {
+            (SyncProtocolHandler::SyncQwpWs(state), AckLevel::Ok) => {
+                qwp_ws_ok_fsn_background(state)
+            }
+            (SyncProtocolHandler::SyncQwpWs(state), AckLevel::Durable) => {
+                qwp_ws_acked_fsn_background(state)
+            }
+            (SyncProtocolHandler::ManualQwpWs(state), AckLevel::Ok) => qwp_ws_ok_fsn_manual(state),
+            (SyncProtocolHandler::ManualQwpWs(state), AckLevel::Durable) => {
+                qwp_ws_acked_fsn_manual(state)
+            }
+            _ => Err(error::fmt!(
+                InvalidApiCall,
+                "wait is only supported for QWP/WebSocket senders."
+            )),
         }
     }
 
     /// Poll the next structured QWP/WebSocket server error observed by this
     /// sender.
     ///
-    /// This reports QWP server non-OK responses and terminal WebSocket
-    /// protocol violations. It remains usable after the sender has halted so
+    /// This reports QWP server non-OK responses and WebSocket protocol
+    /// violations. It remains usable after the sender has halted so
     /// callers can inspect the error that made it terminal.
     #[cfg(feature = "sync-sender-qwp-ws")]
     pub fn poll_qwp_ws_error(&mut self) -> Result<Option<QwpWsSenderError>> {
@@ -742,17 +882,25 @@ impl Sender {
     /// turns.
     #[cfg(feature = "sync-sender-qwp-ws")]
     pub fn drive_once(&mut self) -> Result<bool> {
-        match &mut self.handler {
+        let result = match &mut self.handler {
             SyncProtocolHandler::ManualQwpWs(state) => qwp_ws_drive_once(state),
-            SyncProtocolHandler::SyncQwpWs(_) => Err(error::fmt!(
-                InvalidApiCall,
-                "drive_once is only supported when qwp_ws_progress is manual."
-            )),
-            _ => Err(error::fmt!(
-                InvalidApiCall,
-                "drive_once is only supported for QWP/WebSocket senders."
-            )),
-        }
+            SyncProtocolHandler::SyncQwpWs(_) => {
+                return Err(error::fmt!(
+                    InvalidApiCall,
+                    "drive_once is only supported when qwp_ws_progress is manual."
+                ));
+            }
+            _ => {
+                return Err(error::fmt!(
+                    InvalidApiCall,
+                    "drive_once is only supported for QWP/WebSocket senders."
+                ));
+            }
+        };
+        let drain_result = self.drain_qwp_ws_error_notifications();
+        let progressed = result?;
+        drain_result?;
+        Ok(progressed)
     }
 
     /// Stop accepting new QWP/WebSocket publications and wait for all already
@@ -814,6 +962,38 @@ impl Sender {
         false
     }
 
+    /// Test-only non-blocking view of whether a background QWP/WebSocket
+    /// store-and-forward sender has no undelivered published frames.
+    /// Non-QWP/WebSocket handlers and terminal background handlers report
+    /// `true`. Retained for the standalone sender regression test after the
+    /// pooled row reaper that consumed it was removed.
+    #[cfg(test)]
+    pub(crate) fn sfa_fully_delivered(&self, durable: bool) -> bool {
+        #[cfg(feature = "sync-sender-qwp-ws")]
+        {
+            let SyncProtocolHandler::SyncQwpWs(state) = &self.handler else {
+                return true;
+            };
+            if qwp_ws_is_terminal_background(state) {
+                return true;
+            }
+            let Ok(Some(published)) = qwp_ws_published_fsn_background(state) else {
+                return true;
+            };
+            let watermark = if durable {
+                qwp_ws_acked_fsn_background(state)
+            } else {
+                qwp_ws_ok_fsn_background(state)
+            };
+            matches!(watermark, Ok(Some(w)) if w >= published)
+        }
+        #[cfg(not(feature = "sync-sender-qwp-ws"))]
+        {
+            let _ = durable;
+            true
+        }
+    }
+
     /// Returns the sender's configured transport protocol.
     pub fn protocol(&self) -> Protocol {
         self.protocol
@@ -872,4 +1052,39 @@ fn qwp_ws_sleep_until(deadline: Option<Instant>) {
     if !sleep_for.is_zero() {
         std::thread::sleep(sleep_for);
     }
+}
+
+/// Error for a [`Sender::wait`] that made no ack progress within its
+/// no-progress `timeout`. Classified [`ErrorCode::FailoverRetry`]: the
+/// published frames are retained and the background runner keeps delivering
+/// them, so recover by retrying `wait()` until it returns `Ok` — not by
+/// re-flushing, which would duplicate the rows. Mirrors the column-major
+/// store-and-forward wait.
+#[cfg(feature = "sync-sender-qwp-ws")]
+fn qwp_ws_wait_timeout(
+    ack_level: AckLevel,
+    timeout: Duration,
+    boundary: u64,
+    completed: Option<u64>,
+) -> crate::Error {
+    let level = match ack_level {
+        AckLevel::Ok => "ok",
+        AckLevel::Durable => "durable",
+    };
+    let progress = match completed {
+        Some(fsn) => format!("reached FSN {fsn}"),
+        None => "reached no frame".to_string(),
+    };
+    error::Error::new(
+        error::ErrorCode::FailoverRetry,
+        format!(
+            "QWP/WebSocket wait({level}) timed out after {timeout:?} with no ack \
+             progress (target FSN {boundary}, {progress}); the connection is alive \
+             but the server is not advancing the watermark. The published frames \
+             remain queued and the background runner keeps delivering them: retry \
+             wait() to keep awaiting the ack, or close the pool to drain. Do not \
+             re-flush the same data, which is already accepted and would be \
+             delivered twice."
+        ),
+    )
 }

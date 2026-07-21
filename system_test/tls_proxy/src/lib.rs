@@ -102,7 +102,7 @@ async fn loop_server(
     listen_port_sender: tokio::sync::oneshot::Sender<u16>,
 ) -> anyhow::Result<()> {
     let dest_addr = format!("localhost:{dest_port}");
-    eprintln!("[TLS PROXY] Destination address is {}.", &dest_addr);
+    eprintln!("[TLS PROXY] Destination address is {dest_addr}.");
 
     let config = tls_config();
     let acceptor = TlsAcceptor::from(config);

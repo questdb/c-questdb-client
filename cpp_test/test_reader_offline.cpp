@@ -1,0 +1,560 @@
+/*******************************************************************************
+ *     ___                  _   ____  ____
+ *    / _ \ _   _  ___  ___| |_|  _ \| __ )
+ *   | | | | | | |/ _ \/ __| __| | | |  _ \
+ *   | |_| | |_| |  __/\__ \ |_| |_| | |_) |
+ *    \__\_\\__,_|\___||___/\__|____/|____/
+ *
+ *  Copyright (c) 2014-2019 Appsicle
+ *  Copyright (c) 2019-2025 QuestDB
+ *
+ *  Licensed under the Apache License, Version 2.0 (the "License");
+ *  you may not use this file except in compliance with the License.
+ *  You may obtain a copy of the License at
+ *
+ *  http://www.apache.org/licenses/LICENSE-2.0
+ *
+ ******************************************************************************/
+
+// Broker-independent tests for the reader FFI.
+//
+// Covers the error-handling and configuration surface that does not need a
+// running QuestDB instance: parser rejection paths, connect-failure error
+// codes, the C error accessor functions, the C++ `questdb::error`
+// wrapper, NULL-idempotency of every `_free` / `_close` entry point, and
+// the `from_env` env-var lookup. Complements `test_reader.cpp`, which
+// covers the live-broker round-trip surface and skips entirely without a
+// broker. CI runs both — together they verify symbol resolution, the error
+// path, and the connect path even when no broker is reachable.
+
+#define DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN
+#include "doctest.h"
+
+#include <questdb/egress/qwp_reader.h>
+#include <questdb/egress/qwp_reader.hpp>
+
+// Pin the client-wide `questdb_error_*` spellings to the discriminants of the
+// released line-sender ABI they extend. A copy-paste slip in an alias is
+// otherwise invisible: every surviving runtime comparison is symbolic, so it
+// would tautologically pass.
+// The expected numbers here are themselves cross-checked against the Rust enum
+// + C header by `c_header_line_sender_enum_matches_rust` in questdb-rs-ffi.
+static_assert(questdb_error_could_not_resolve_addr == 0, "client error alias drift");
+static_assert(questdb_error_invalid_api_call == 1, "client error alias drift");
+static_assert(questdb_error_socket_error == 2, "client error alias drift");
+static_assert(questdb_error_invalid_utf8 == 3, "client error alias drift");
+static_assert(questdb_error_auth_error == 6, "client error alias drift");
+static_assert(questdb_error_tls_error == 7, "client error alias drift");
+static_assert(questdb_error_config_error == 10, "client error alias drift");
+static_assert(questdb_error_role_mismatch == 18, "client error alias drift");
+static_assert(questdb_error_connect_timeout == 19, "client error alias drift");
+static_assert(questdb_error_handshake_error == 20, "client error alias drift");
+static_assert(questdb_error_unsupported_server == 21, "client error alias drift");
+static_assert(questdb_error_protocol_error == 22, "client error alias drift");
+static_assert(questdb_error_invalid_bind == 23, "client error alias drift");
+static_assert(questdb_error_server_schema_mismatch == 24, "client error alias drift");
+static_assert(questdb_error_server_parse_error == 25, "client error alias drift");
+static_assert(questdb_error_server_internal_error == 26, "client error alias drift");
+static_assert(questdb_error_server_security_error == 27, "client error alias drift");
+static_assert(questdb_error_limit_exceeded == 28, "client error alias drift");
+static_assert(questdb_error_server_limit_exceeded == 29, "client error alias drift");
+static_assert(questdb_error_cancelled == 30, "client error alias drift");
+static_assert(questdb_error_failover_would_duplicate == 31, "client error alias drift");
+static_assert(questdb_error_schema_drift == 32, "client error alias drift");
+static_assert(questdb_error_no_schema == 33, "client error alias drift");
+static_assert(questdb_error_arrow_export == 34, "client error alias drift");
+
+#include <cstdlib>
+#include <cstring>
+#include <string>
+
+#ifdef _WIN32
+#include <stdlib.h>
+static int set_env(const char* name, const char* value)
+{
+    return _putenv_s(name, value);
+}
+static int unset_env(const char* name) { return _putenv_s(name, ""); }
+#else
+#include <stdlib.h>
+static int set_env(const char* name, const char* value)
+{
+    return setenv(name, value, 1);
+}
+static int unset_env(const char* name) { return unsetenv(name); }
+#endif
+
+using namespace questdb::ingress::literals;
+
+namespace
+{
+
+// Connect target that is virtually never bound on a developer machine —
+// 127.0.0.1:1 is in the system reserved range and rejects connections
+// fast on every supported platform.
+constexpr const char* CLOSED_PORT_CONF = "ws::addr=127.0.0.1:1;";
+
+} // namespace
+
+// ---------------------------------------------------------------------------
+// NULL-idempotent free / close (every documented "idempotent on NULL" path).
+// ---------------------------------------------------------------------------
+
+TEST_CASE("free / close functions are NULL-idempotent")
+{
+    // None of these should crash; a regression that drops the NULL guard
+    // would SIGSEGV here and fail the test rather than silently passing.
+    questdb_error_free(nullptr);
+    qwp_reader_close(nullptr);
+    qwp_reader_query_free(nullptr);
+    qwp_reader_cursor_free(nullptr);
+}
+
+TEST_CASE("error accessors are NULL-safe (M-13)")
+{
+    // _get_code on NULL must not crash — returns a sentinel code.
+    const auto code = questdb_error_get_code(nullptr);
+    CHECK(code == questdb_error_invalid_api_call);
+
+    // _msg on NULL must return a non-NULL empty string and zero out len.
+    size_t len = 999;
+    const char* msg = questdb_error_msg(nullptr, &len);
+    REQUIRE(msg != nullptr);
+    CHECK(len == 0);
+    CHECK(msg[0] == '\0');
+
+    // _msg with a NULL len_out must also be safe (the function's
+    // documented promise is "never returns NULL", and len_out is now
+    // optional).
+    msg = questdb_error_msg(nullptr, nullptr);
+    REQUIRE(msg != nullptr);
+}
+
+// ---------------------------------------------------------------------------
+// NULL-safe accessor regression suite.
+//
+// The library documents two NULL policies on the FFI surface:
+//
+//   1. "Idempotent on NULL" — the various `_free` / `_close` paths and
+//      the error accessors. Tested above.
+//   2. "Returns a documented sentinel on NULL" — the reader stat getters,
+//      every `qwp_reader_server_info_*` accessor, and every
+//      `qwp_reader_failover_reset_event_*` accessor. Their guard is a cheap
+//      `is_null()` check; a regression that drops the guard would cause
+//      a SIGSEGV here rather than returning the documented sentinel.
+//
+// Functions in the third bucket — "NULL is UB" (cursor / query lifecycle
+// ops, the bind family) — are NOT exercised here. Their guard, when
+// present, is `process::abort()`, which can't be observed from a doctest
+// TEST_CASE without subprocess isolation. The C header explicitly
+// forbids NULL on those entry points.
+// ---------------------------------------------------------------------------
+
+TEST_CASE("reader stat / accessor getters return documented sentinels on NULL")
+{
+    CHECK(qwp_reader_bytes_received(nullptr) == 0);
+    CHECK(qwp_reader_credit_granted_total(nullptr) == 0);
+    CHECK(qwp_reader_read_ns(nullptr) == 0);
+    CHECK(qwp_reader_decode_ns(nullptr) == 0);
+
+    // Mutating no-op: must not crash, no observable state change.
+    qwp_reader_reset_timing(nullptr);
+
+    {
+        // _server_version: returns false, populates *err_out when err_out
+        // is non-NULL.
+        questdb_error* err = nullptr;
+        uint8_t version = 0xAB;
+        bool ok = qwp_reader_server_version(nullptr, &version, &err);
+        CHECK_FALSE(ok);
+        REQUIRE(err != nullptr);
+        CHECK(questdb_error_get_code(err) ==
+              questdb_error_invalid_api_call);
+        questdb_error_free(err);
+    }
+    {
+        // _server_version with err_out itself NULL: must not write
+        // through the NULL pointer.
+        uint8_t version = 0xAB;
+        bool ok = qwp_reader_server_version(nullptr, &version, nullptr);
+        CHECK_FALSE(ok);
+    }
+
+    CHECK(qwp_reader_current_server_info(nullptr) == nullptr);
+
+    {
+        const char* host_buf = reinterpret_cast<const char*>(0x1);
+        size_t host_len = 999;
+        qwp_reader_current_addr_host(nullptr, &host_buf, &host_len);
+        CHECK(host_buf == nullptr);
+        CHECK(host_len == 0);
+    }
+
+    CHECK(qwp_reader_current_addr_port(nullptr) == 0);
+}
+
+TEST_CASE("server_info accessors return documented sentinels on NULL")
+{
+    CHECK(qwp_reader_server_info_role(nullptr) ==
+          qwp_reader_server_role_other);
+    CHECK(qwp_reader_server_info_role_byte(nullptr) == 0xFF);
+    CHECK(qwp_reader_server_info_epoch(nullptr) == 0);
+    CHECK(qwp_reader_server_info_capabilities(nullptr) == 0);
+    CHECK(qwp_reader_server_info_server_wall_ns(nullptr) == 0);
+
+    {
+        const char* buf = reinterpret_cast<const char*>(0x1);
+        size_t len = 999;
+        qwp_reader_server_info_cluster_id(nullptr, &buf, &len);
+        CHECK(buf == nullptr);
+        CHECK(len == 0);
+    }
+    {
+        const char* buf = reinterpret_cast<const char*>(0x1);
+        size_t len = 999;
+        qwp_reader_server_info_node_id(nullptr, &buf, &len);
+        CHECK(buf == nullptr);
+        CHECK(len == 0);
+    }
+    {
+        const char* buf = reinterpret_cast<const char*>(0x1);
+        size_t len = 999;
+        CHECK_FALSE(qwp_reader_server_info_zone_id(nullptr, &buf, &len));
+        CHECK(buf == nullptr);
+        CHECK(len == 0);
+    }
+
+    // Callback event views are legitimately empty outside their metadata
+    // phase. Every accessor mirrors the C ABI sentinel and snapshot()
+    // makes absence explicit without throwing through the callback trampoline.
+    const questdb::egress::server_info_view empty{nullptr};
+    CHECK_FALSE(static_cast<bool>(empty));
+    CHECK(empty.role() == questdb::egress::server_role::other);
+    CHECK(empty.role_byte() == 0xFF);
+    CHECK(empty.epoch() == 0);
+    CHECK(empty.capabilities() == 0);
+    CHECK(empty.server_wall_ns() == 0);
+    CHECK(empty.cluster_id().empty());
+    CHECK(empty.node_id().empty());
+    CHECK_FALSE(empty.zone_id().has_value());
+    CHECK_FALSE(empty.snapshot().has_value());
+}
+
+TEST_CASE("failover_event accessors return documented sentinels on NULL")
+{
+    {
+        const char* buf = reinterpret_cast<const char*>(0x1);
+        size_t len = 999;
+        qwp_reader_failover_reset_event_failed_host(nullptr, &buf, &len);
+        CHECK(buf == nullptr);
+        CHECK(len == 0);
+    }
+    CHECK(qwp_reader_failover_reset_event_failed_port(nullptr) == 0);
+
+    {
+        const char* buf = reinterpret_cast<const char*>(0x1);
+        size_t len = 999;
+        qwp_reader_failover_reset_event_new_host(nullptr, &buf, &len);
+        CHECK(buf == nullptr);
+        CHECK(len == 0);
+    }
+    CHECK(qwp_reader_failover_reset_event_new_port(nullptr) == 0);
+    CHECK(qwp_reader_failover_reset_event_new_request_id(nullptr) == 0);
+    CHECK(qwp_reader_failover_reset_event_attempts(nullptr) == 0);
+    CHECK(qwp_reader_failover_reset_event_elapsed_ns(nullptr) == 0);
+
+    // _trigger_code mirrors `_error_get_code(NULL)`: same sentinel.
+    CHECK(qwp_reader_failover_reset_event_trigger_code(nullptr) ==
+          questdb_error_invalid_api_call);
+
+    {
+        const char* buf = reinterpret_cast<const char*>(0x1);
+        size_t len = 999;
+        qwp_reader_failover_reset_event_trigger_msg(nullptr, &buf, &len);
+        CHECK(buf == nullptr);
+        CHECK(len == 0);
+    }
+
+    CHECK(qwp_reader_failover_reset_event_server_info(nullptr) == nullptr);
+}
+
+// ---------------------------------------------------------------------------
+// `qwp_reader_from_conf` rejection paths — exercise the ConfigError surface.
+// ---------------------------------------------------------------------------
+
+TEST_CASE("from_conf rejects malformed config strings as ConfigError")
+{
+    struct case_t
+    {
+        const char* conf;
+        const char* what;
+    };
+    const case_t cases[] = {
+        {"", "empty config"},
+        {"ws::", "missing addr key"},
+        {"unknown_scheme::addr=127.0.0.1:9000;", "unknown scheme"},
+        {"ws::addr=h:1;mystery_key=x;", "unknown parameter"},
+        {"ws::addr=h:1;username=u;password=p;token=t;",
+         "conflicting auth parameters"},
+        {"ws::addr=h:notaport;", "non-numeric port"},
+        {"ws::addr=h:1;compression=xyz;", "invalid compression value"},
+        {"ws::addr=h:1;target=leader;", "invalid target value"},
+    };
+
+    for (const auto& c : cases)
+    {
+        CAPTURE(c.what);
+        questdb_error* err = nullptr;
+        line_sender_utf8 conf{strlen(c.conf), c.conf};
+        qwp_reader* r = qwp_reader_from_conf(conf, &err);
+        REQUIRE(r == nullptr);
+        REQUIRE(err != nullptr);
+        CHECK(questdb_error_get_code(err) ==
+              questdb_error_config_error);
+        size_t msg_len = 0;
+        const char* msg = questdb_error_msg(err, &msg_len);
+        CHECK(msg != nullptr);
+        CHECK(msg_len > 0);
+        questdb_error_free(err);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Connect-failure path — exercises the FFI error allocation + error accessor
+// surface against a guaranteed-closed port. The exact error code may vary
+// across platforms (could_not_resolve_addr / socket_error / handshake_error),
+// so we accept any of the connection-related codes rather than pinning one.
+// ---------------------------------------------------------------------------
+
+TEST_CASE("from_conf surfaces a connect-time error against a closed port")
+{
+    questdb_error* err = nullptr;
+    line_sender_utf8 conf{strlen(CLOSED_PORT_CONF), CLOSED_PORT_CONF};
+    qwp_reader* r = qwp_reader_from_conf(conf, &err);
+    REQUIRE(r == nullptr);
+    REQUIRE(err != nullptr);
+
+    const auto code = questdb_error_get_code(err);
+    const bool is_connect_failure =
+        code == questdb_error_socket_error ||
+        code == questdb_error_could_not_resolve_addr ||
+        code == questdb_error_handshake_error ||
+        code == questdb_error_tls_error;
+    CHECK(is_connect_failure);
+
+    size_t msg_len = 0;
+    const char* msg = questdb_error_msg(err, &msg_len);
+    REQUIRE(msg != nullptr);
+    CHECK(msg_len > 0);
+    questdb_error_free(err);
+}
+
+// ---------------------------------------------------------------------------
+// `qwp_reader_from_env` — env var lookup + delegation to from_conf.
+// ---------------------------------------------------------------------------
+
+TEST_CASE("from_env returns ConfigError when QDB_CLIENT_CONF is unset")
+{
+    REQUIRE(unset_env("QDB_CLIENT_CONF") == 0);
+
+    questdb_error* err = nullptr;
+    qwp_reader* r = qwp_reader_from_env(&err);
+    REQUIRE(r == nullptr);
+    REQUIRE(err != nullptr);
+    CHECK(questdb_error_get_code(err) ==
+          questdb_error_config_error);
+
+    size_t msg_len = 0;
+    const char* msg = questdb_error_msg(err, &msg_len);
+    REQUIRE(msg != nullptr);
+    CHECK(msg_len > 0);
+    questdb_error_free(err);
+}
+
+TEST_CASE("from_env propagates parser errors when QDB_CLIENT_CONF is malformed")
+{
+    REQUIRE(set_env("QDB_CLIENT_CONF", "not_a_valid_config_string") == 0);
+
+    questdb_error* err = nullptr;
+    qwp_reader* r = qwp_reader_from_env(&err);
+    REQUIRE(r == nullptr);
+    REQUIRE(err != nullptr);
+    CHECK(questdb_error_get_code(err) ==
+          questdb_error_config_error);
+    questdb_error_free(err);
+
+    REQUIRE(unset_env("QDB_CLIENT_CONF") == 0);
+}
+
+#ifndef _WIN32
+TEST_CASE("from_env distinguishes invalid-UTF-8 env value from unset")
+{
+    // POSIX setenv accepts arbitrary bytes (it's not utf-8-aware), so we
+    // can plant a stray 0x80 continuation byte directly. Skipped on
+    // Windows because _putenv_s takes a UTF-8 string and won't store
+    // invalid bytes — there's no portable way to reproduce the
+    // VarError::NotUnicode path there.
+    REQUIRE(setenv("QDB_CLIENT_CONF", "ws::addr=h:1\xC3\x28", 1) == 0);
+
+    questdb_error* err = nullptr;
+    qwp_reader* r = qwp_reader_from_env(&err);
+    REQUIRE(r == nullptr);
+    REQUIRE(err != nullptr);
+    // Previously this collapsed to "not set" (ConfigError); the M-10 fix
+    // surfaces the actual cause as InvalidUtf8.
+    CHECK(questdb_error_get_code(err) ==
+          questdb_error_invalid_utf8);
+    questdb_error_free(err);
+
+    REQUIRE(unset_env("QDB_CLIENT_CONF") == 0);
+}
+#endif
+
+TEST_CASE("from_env reaches the connect path when QDB_CLIENT_CONF is parseable")
+{
+    REQUIRE(set_env("QDB_CLIENT_CONF", CLOSED_PORT_CONF) == 0);
+
+    questdb_error* err = nullptr;
+    qwp_reader* r = qwp_reader_from_env(&err);
+    CHECK(r == nullptr);
+    REQUIRE(err != nullptr);
+    // We don't pin the code — connect-failure shape varies — but it must
+    // NOT be ConfigError, since the config parsed successfully.
+    CHECK(questdb_error_get_code(err) !=
+          questdb_error_config_error);
+    questdb_error_free(err);
+
+    REQUIRE(unset_env("QDB_CLIENT_CONF") == 0);
+}
+
+// ---------------------------------------------------------------------------
+// C++ wrapper: `questdb::error` exception type.
+// ---------------------------------------------------------------------------
+
+TEST_CASE("C++ wrapper converts C error to thrown questdb::error")
+{
+    using questdb::error;
+    using questdb::egress::reader;
+
+    bool threw = false;
+    try
+    {
+        reader r{"ws::"_utf8}; // missing addr → ConfigError
+        (void)r;
+    }
+    catch (const error& e)
+    {
+        threw = true;
+        CHECK(e.code() == questdb_error_config_error);
+        CHECK(std::strlen(e.what()) > 0);
+        // Must be catchable as the C++ standard exception base too.
+        const std::exception& base = e;
+        CHECK(std::strlen(base.what()) > 0);
+    }
+    CHECK(threw);
+}
+
+TEST_CASE("C++ wrapper from_env throws ConfigError when var is unset")
+{
+    using questdb::error;
+    using questdb::egress::reader;
+
+    REQUIRE(unset_env("QDB_CLIENT_CONF") == 0);
+
+    bool threw = false;
+    try
+    {
+        auto r = reader::from_env();
+        (void)r;
+    }
+    catch (const error& e)
+    {
+        threw = true;
+        CHECK(e.code() == questdb_error_config_error);
+    }
+    CHECK(threw);
+}
+
+TEST_CASE("C++ wrapper from_env throws connect-time error for closed port")
+{
+    using questdb::error;
+    using questdb::egress::reader;
+
+    REQUIRE(set_env("QDB_CLIENT_CONF", CLOSED_PORT_CONF) == 0);
+
+    bool threw = false;
+    try
+    {
+        auto r = reader::from_env();
+        (void)r;
+    }
+    catch (const error& e)
+    {
+        threw = true;
+        CHECK(e.code() != questdb_error_config_error);
+    }
+    CHECK(threw);
+
+    REQUIRE(unset_env("QDB_CLIENT_CONF") == 0);
+}
+
+// ---------------------------------------------------------------------------
+// Defensive: error accessors against repeated reads.
+// ---------------------------------------------------------------------------
+
+TEST_CASE("questdb_error_msg is stable across repeated reads")
+{
+    questdb_error* err = nullptr;
+    line_sender_utf8 conf{0, ""};
+    qwp_reader* r = qwp_reader_from_conf(conf, &err);
+    REQUIRE(r == nullptr);
+    REQUIRE(err != nullptr);
+
+    size_t len_a = 0;
+    const char* msg_a = questdb_error_msg(err, &len_a);
+    REQUIRE(msg_a != nullptr);
+
+    // Reading the message a second time returns the same pointer and
+    // length — borrowed view, not a fresh allocation.
+    size_t len_b = 0;
+    const char* msg_b = questdb_error_msg(err, &len_b);
+    CHECK(msg_a == msg_b);
+    CHECK(len_a == len_b);
+
+    questdb_error_free(err);
+}
+
+TEST_CASE("questdb_error_get_code is stable across repeated reads")
+{
+    questdb_error* err = nullptr;
+    line_sender_utf8 conf{0, ""};
+    qwp_reader* r = qwp_reader_from_conf(conf, &err);
+    REQUIRE(r == nullptr);
+    REQUIRE(err != nullptr);
+
+    const auto code_a = questdb_error_get_code(err);
+    const auto code_b = questdb_error_get_code(err);
+    CHECK(code_a == code_b);
+
+    questdb_error_free(err);
+}
+
+TEST_CASE("from_conf rejects invalid UTF-8 with InvalidUtf8")
+{
+    // Hand-rolled line_sender_utf8 carrying a stray 0x80 continuation byte
+    // — the C struct has no encapsulation, so a buggy caller can bypass
+    // line_sender_utf8_init. The FFI re-validates and surfaces a clean
+    // InvalidUtf8 error instead of letting upstream walk an invalid &str.
+    static const unsigned char bad[] = {'q', 'w', 'p', ':', ':', 0x80, 0x00};
+    line_sender_utf8 conf{6, reinterpret_cast<const char*>(bad)};
+    questdb_error* err = nullptr;
+    qwp_reader* r = qwp_reader_from_conf(conf, &err);
+    REQUIRE(r == nullptr);
+    REQUIRE(err != nullptr);
+    CHECK(questdb_error_get_code(err) == questdb_error_invalid_utf8);
+    size_t len = 0;
+    const char* msg = questdb_error_msg(err, &len);
+    CHECK(len > 0);
+    CHECK(msg != nullptr);
+    questdb_error_free(err);
+}
