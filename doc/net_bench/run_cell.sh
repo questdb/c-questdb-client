@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Laptop-side single-cell runner (plan §6). Applies the channel, (re)starts the
+# Laptop-side single-cell runner. Applies the channel, (re)starts the
 # server at the requested receive buffer, wraps the bench with sar on both
 # boxes, and syncs results + a channel-metadata sidecar to ./results/<label>/.
 #

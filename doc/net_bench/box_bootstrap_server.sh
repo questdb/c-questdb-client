@@ -17,7 +17,7 @@ export JAVA_HOME=/usr/lib/jvm/java-25-openjdk-arm64
 export PATH="$JAVA_HOME/bin:$PATH"
 java -version
 
-echo "== tmpfs data dir (10g cap — plan §3/§5; tmpfs only consumes what is used)"
+echo "== tmpfs data dir (10g cap; tmpfs only consumes what is used)"
 mkdir -p /mnt/qdbtmp
 mountpoint -q /mnt/qdbtmp || mount -t tmpfs -o size=10g tmpfs /mnt/qdbtmp
 

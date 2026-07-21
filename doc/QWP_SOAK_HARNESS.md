@@ -56,8 +56,7 @@ For a short wiring check, use `--duration 1 --profile quick`. Resource trend
 checks are expected to be inconclusive in a one-minute run because I4 excludes
 the first ten minutes as warmup; a quick pass is not a substitute for the
 full-duration resource-trend run. The unified-sender implementation accepted a
-shorter long-lived observation by explicit owner decision; its exact coverage
-and limitations are recorded in `QWP_UNIFIED_SENDER_M0_BASELINE.md`.
+shorter long-lived observation by explicit owner decision.
 
 `--server HOST:PORT` targets an existing server instead of provisioning two
 processes. In that mode server-restart episodes are no-ops and the control and

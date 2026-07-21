@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Runs ON a box. Shapes THIS box's egress traffic *to the peer only* (plan §4)
+# Runs ON a box. Shapes THIS box's egress traffic *to the peer only*
 # so the SSM management path stays unshaped. Symmetric channel: run with the
 # same arguments on both boxes; pass HALF the target RTT as --delay-ms to each.
 #

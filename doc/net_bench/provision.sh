@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Provision the 2-box QWP network bench rig (plan §3).
+# Provision the 2-box QWP network bench rig.
 # Creates: security group, cluster placement group, IAM role + instance
 # profile (SSM + bucket access), S3 results bucket, 2 tagged instances.
 # Reuses the default VPC — no network resources are created.

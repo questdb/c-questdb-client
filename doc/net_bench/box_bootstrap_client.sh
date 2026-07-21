@@ -19,7 +19,7 @@ if [ ! -x /root/.cargo/bin/cargo ]; then
 fi
 export PATH="/root/.cargo/bin:$PATH"
 
-echo "== uv + python (3.10 — the pinned py client requires >=3.10; plan §10.3)"
+echo "== uv + python (3.10 — the pinned py client requires >=3.10)"
 if [ ! -x /root/.local/bin/uv ]; then
     curl -fsSL https://astral.sh/uv/install.sh | sh
 fi

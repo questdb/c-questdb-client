@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Shared configuration for the QWP network bench rig (see ../QWP_NETWORK_BENCH_PLAN.md).
+# Shared configuration for the QWP network bench rig (see ./README.md).
 # Sourced by the laptop-side scripts. Requires: aws cli v2, jq, and a valid
 # SSO session (`aws sso login` with your SSO profile).
 
