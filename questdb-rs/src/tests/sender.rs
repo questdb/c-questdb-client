@@ -187,7 +187,7 @@ fn test_array_f64_for_ndarray() -> TestResult {
     assert_eq!(server.recv_q()?, 0);
 
     let array_header2d = &[
-        &[b'='][..],
+        &b"="[..],
         &[ARRAY_BINARY_FORMAT_TYPE],
         &[ArrayColumnTypeTag::Double.into()],
         &[2u8],
@@ -199,7 +199,7 @@ fn test_array_f64_for_ndarray() -> TestResult {
     write_array_data(&array_2d.view(), &mut array_data2d[0..], 32)?;
 
     let array_header3d = &[
-        &[b'='][..],
+        &b"="[..],
         &[ARRAY_BINARY_FORMAT_TYPE],
         &[ArrayColumnTypeTag::Double.into()],
         &[3u8],
