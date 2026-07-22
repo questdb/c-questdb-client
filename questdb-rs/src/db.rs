@@ -25,13 +25,19 @@
 //! QWP ingestion connection pool.
 //!
 //! `QuestDb` is a thread-safe pool of store-and-forward producer handles to a
-//! single QuestDB QWP/WebSocket endpoint. The pool is lazy: `connect` performs
-//! no blocking network I/O. In disk-backed store-and-forward mode it may
-//! pre-open parked recovery senders whose initial connect and replay run in the
-//! background. Borrowing [`QuestDb::borrow_sender`] creates a local
-//! store-and-forward producer immediately and lets its background runner connect
-//! later, so callers can buffer while the server is absent. Direct ingestion
-//! senders and readers still open their transport on first borrow.
+//! single QuestDB QWP/WebSocket endpoint. By default (Java parity) `connect`
+//! is eager: it pre-opens the warm minimums (`sender_pool_min`,
+//! `query_pool_min`), honoring `initial_connect_retry` for the ingest
+//! senders (readers always connect fail-fast), so a down server fails the
+//! constructor fast. With `lazy_connect=true` the pool tolerates a down
+//! server at startup: `connect` performs no blocking network I/O,
+//! `query_pool_min` defaults to 0, and borrowing
+//! [`QuestDb::borrow_sender`] creates a local store-and-forward producer
+//! immediately whose background runner connects later, so callers can buffer
+//! while the server is absent. In disk-backed store-and-forward mode either
+//! variant may pre-open parked recovery senders whose initial connect and
+//! replay run in the background. Direct ingestion senders open their
+//! transport on first borrow.
 //! The pools auto-grow up to their configured caps (`sender_pool_max` /
 //! `query_pool_max`) on demand and (under `pool_reap=auto`)
 //! run a background thread that closes above-minimum idle entries after
@@ -256,6 +262,11 @@ struct DbInner {
     /// Warm minimum the reaper preserves in the store-and-forward
     /// ingestion pool.
     sender_pool_min: usize,
+    /// `lazy_connect=true`: tolerate a down server at startup. No warm-minimum
+    /// pre-connect, and ingest borrows force the background initial connect.
+    /// Off by default (Java parity): `connect()` pre-opens the warm minimums
+    /// and borrows honor `initial_connect_retry`.
+    lazy_connect: bool,
     /// Hard cap on the store-and-forward ingestion pool and on the direct
     /// column-sender pool (both are ingestion-side connections).
     sender_pool_max: usize,
@@ -670,13 +681,14 @@ impl QuestDb {
     ///
     /// | Key                  | Default | Meaning                                                          |
     /// |----------------------|---------|------------------------------------------------------------------|
-    /// | `sender_pool_min`    | 1       | Warm minimum of the ingestion pool once opened. |
+    /// | `sender_pool_min`    | 1       | Warm minimum of the ingestion pool, pre-opened at connect unless `lazy_connect=true`. |
     /// | `sender_pool_max`    | 4       | Hard cap on the ingestion pool; the direct column-sender pool used by DataFrame ingestion is capped separately at the same value. |
-    /// | `query_pool_min`     | 1       | Warm minimum of the reader pool once opened. |
+    /// | `query_pool_min`     | 1 (0 when lazy) | Warm minimum of the reader pool, pre-opened at connect unless `lazy_connect=true`. |
     /// | `query_pool_max`     | 4       | Hard cap on the reader pool. |
     /// | `acquire_timeout_ms` | 5000    | How long an at-cap borrow waits for a return before failing; `0` fails immediately. |
     /// | `idle_timeout_ms`    | 60000   | Above-minimum idle connections are closed after this long. |
     /// | `pool_reap`          | `auto`  | `auto` runs a background reaper; `manual` requires `reap_idle`. |
+    /// | `lazy_connect`       | `false` | Tolerate a down server at startup: connect opens nothing, senders buffer and connect in the background, readers connect on first borrow. |
     ///
     /// Key names and defaults match the Java client's `QuestDBBuilder`; the
     /// Java-only lifecycle keys (`max_lifetime_ms`, `housekeeper_interval_ms`,
@@ -696,20 +708,32 @@ impl QuestDb {
     /// (non-SF) connection — used by DataFrame ingestion — see
     /// [`Self::borrow_direct_column_sender`].
     ///
-    /// Pools are **lazy**: `connect` performs no blocking network I/O. In
-    /// disk-backed store-and-forward mode, it may pre-open parked recovery
-    /// senders whose initial connect and replay run in the background. The
-    /// store-and-forward ingestion pool creates a local producer on first borrow
-    /// and starts its initial connect in the background, so the borrower can
-    /// buffer immediately even while the server is absent. An explicit
-    /// `initial_connect_retry` mode changes that for borrows: `off` connects
-    /// synchronously at borrow time and fails fast, `sync` retries within the
-    /// reconnect budget before the borrow returns. The `sync` promoted from
-    /// merely setting a `reconnect_*` key does not apply to pool borrows, and
-    /// recovery pre-opens always connect in the background. Direct senders and
-    /// readers still open their transport on first borrow. `sender_pool_min` /
-    /// `query_pool_min` are the warm minimums the reaper keeps once entries
-    /// have been opened.
+    /// Startup matches the Java client. By default `connect` is **eager**:
+    /// it pre-opens `sender_pool_min` ingest senders — honoring an
+    /// EXPLICITLY set `initial_connect_retry`: `off` (the default) fails
+    /// fast, `sync` retries within the reconnect budget, `async` connects in
+    /// the background — and `query_pool_min` readers, which have no retry
+    /// mode and always connect synchronously, failing fast. The `sync`
+    /// promoted from merely setting a `reconnect_*` key never drives pool
+    /// startup or borrows (a mid-stream failover budget must not become a
+    /// blocking `connect()`), and explicit `sync` conflicts with a positive
+    /// `query_pool_min` — set `query_pool_min=0` or use `lazy_connect=true`.
+    /// Bare `initial_connect_retry=async` is likewise not a non-blocking
+    /// startup while `query_pool_min > 0`; `lazy_connect=true` is. Growth
+    /// borrows beyond the minimum honor the same rules.
+    ///
+    /// With `lazy_connect=true` the pool tolerates a down server at startup:
+    /// `connect` performs no blocking network I/O, `query_pool_min` defaults
+    /// to 0 (readers connect lazily on first use), and every ingest borrow
+    /// creates its local store-and-forward producer immediately and connects
+    /// in the background, so the borrower can buffer while the server is
+    /// absent. An explicit blocking `initial_connect_retry` alongside
+    /// `lazy_connect=true` is rejected as a configuration conflict. In
+    /// disk-backed store-and-forward mode, either variant may pre-open parked
+    /// recovery senders whose initial connect and replay run in the
+    /// background. Direct senders open their transport on first borrow.
+    /// `sender_pool_min` / `query_pool_min` are the warm minimums the reaper
+    /// keeps.
     ///
     /// # Store-and-forward durability
     ///
@@ -833,6 +857,7 @@ impl QuestDb {
             buffer_max_name_len,
             health: Mutex::new(health),
             sender_pool_min: pool_cfg.sender_pool_min,
+            lazy_connect: pool_cfg.lazy_connect,
             sender_pool_max: pool_cfg.sender_pool_max,
             #[cfg(feature = "_egress")]
             query_pool_min: pool_cfg.query_pool_min,
@@ -863,8 +888,6 @@ impl QuestDb {
             conn_events: Arc::new(conn_events),
         });
 
-        preopen_recovery_senders(&inner);
-
         let reaper = match pool_cfg.pool_reap {
             PoolReap::Auto => Some(spawn_reaper(Arc::clone(&inner)).map_err(|err| {
                 inner.shutdown.store(true, Ordering::SeqCst);
@@ -876,7 +899,22 @@ impl QuestDb {
             PoolReap::Manual => None,
         };
 
-        Ok(Self { inner, reaper })
+        let db = Self { inner, reaper };
+        // Prewarm BEFORE recovery pre-open, matching the Java client's order.
+        // Prewarm adopts dirty disk slots itself through the borrow path's
+        // recovery candidates, so its foreground connect genuinely probes the
+        // server; recovery must not run first or its background-connecting
+        // (forced-async) senders would sit in the free list and satisfy the
+        // warm minimum without any connect, silently voiding the eager
+        // fail-fast contract whenever a previous run left queued data behind.
+        // On error the drop of `db` closes whatever was opened.
+        if !db.inner.lazy_connect {
+            prewarm_min_connections(&db)?;
+        }
+        // Recovery pre-open then re-adopts any dirty slots prewarm did not
+        // claim; their initial connect and replay run in the background.
+        preopen_recovery_senders(&db.inner);
+        Ok(db)
     }
 
     /// Create a caller-owned QWP/WebSocket row buffer using this pool's
@@ -905,11 +943,12 @@ impl QuestDb {
     /// return (`acquire_timeout_ms=0` fails fast); failing that, return
     /// `InvalidApiCall`.
     ///
-    /// A borrow that opens a new connection starts it in the background by
-    /// default, so it succeeds even while the server is away. An explicit
-    /// `initial_connect_retry` mode overrides that: `off` connects
-    /// synchronously and fails fast, `sync` retries within the reconnect
-    /// budget before returning; see [`Self::connect`].
+    /// A borrow that opens a new connection honors `initial_connect_retry`:
+    /// `off` (the default) connects synchronously and fails fast, `sync`
+    /// retries within the reconnect budget before returning. Under
+    /// `lazy_connect=true` the connection starts in the background instead,
+    /// so the borrow succeeds even while the server is away; see
+    /// [`Self::connect`].
     pub fn borrow_sender(&self) -> Result<BorrowedSender<'_>> {
         let cs = self.pick_sender()?;
         Ok(BorrowedSender(SenderHandle::new(self, cs)))
@@ -2656,9 +2695,64 @@ fn pick_direct_sender(inner: &Arc<DbInner>) -> Result<PooledSender<DirectSenderC
     )
 }
 
+/// Java-parity eager startup: open ingest senders until the pool holds
+/// `sender_pool_min` and readers until it holds `query_pool_min`, honoring
+/// an explicitly set `initial_connect_retry`. Runs BEFORE recovery pre-open,
+/// so every warm sender performs a real foreground connect — adopting dirty
+/// disk slots (and replaying them) along the way via the borrow path's
+/// recovery candidates. All warm borrows are held at once so each opens a
+/// distinct connection, then returned to the free lists; on the first
+/// failure the already-opened connections are returned and the error
+/// propagates to `connect()`.
+fn prewarm_min_connections(db: &QuestDb) -> Result<()> {
+    let inner = &db.inner;
+    let mut warm = Vec::new();
+    let mut outcome: Result<()> = Ok(());
+    for _ in 0..inner.sender_pool_min {
+        match pick_sfa_sender(inner) {
+            Ok(sender) => warm.push(sender),
+            Err(err) => {
+                outcome = Err(err);
+                break;
+            }
+        }
+    }
+    for picked in warm {
+        return_sfa_to_pool(inner, picked.sender, picked.slot_index);
+    }
+    outcome?;
+    #[cfg(feature = "_egress")]
+    {
+        let mut warm = Vec::new();
+        let mut outcome: Result<()> = Ok(());
+        for _ in 0..inner.query_pool_min {
+            match db.pick_reader() {
+                Ok(reader) => warm.push(reader),
+                Err(err) => {
+                    outcome = Err(err);
+                    break;
+                }
+            }
+        }
+        for reader in warm {
+            return_reader_to_pool(inner, reader, false);
+        }
+        outcome?;
+    }
+    Ok(())
+}
+
 fn connect_sfa_pool(inner: &Arc<DbInner>, slot_index: Option<usize>) -> Result<PooledSenderCore> {
     let recovery_candidates = managed_slot_recovery_candidates(inner);
-    connect_sfa_pool_with_recovery_candidates(inner, slot_index, &recovery_candidates, false)
+    // A lazy pool forces the background initial connect so borrows keep
+    // working while the server is away; a non-lazy pool honors
+    // `initial_connect_retry` as configured.
+    connect_sfa_pool_with_recovery_candidates(
+        inner,
+        slot_index,
+        &recovery_candidates,
+        inner.lazy_connect,
+    )
 }
 
 fn connect_sfa_pool_with_recovery_candidates(
@@ -3116,9 +3210,9 @@ fn reap_idle_direct_senders(inner: &DbInner) -> usize {
 
 #[cfg(feature = "_egress")]
 fn reap_idle_readers(inner: &DbInner) -> usize {
-    // The reader pool is lazy-init (no pre-population at connect);
-    // `query_pool_min` acts purely as the reaper's floor once readers
-    // have been opened.
+    // `query_pool_min` readers are pre-opened at connect by default
+    // (none under lazy_connect, where the pool fills on first borrow);
+    // either way `query_pool_min` is the reaper's floor here.
     let to_drop: Vec<Reader> = {
         let mut state = lock_reader_state(&inner.reader_state);
         let mut to_drop = Vec::new();

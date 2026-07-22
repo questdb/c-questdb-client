@@ -587,6 +587,7 @@ pub(crate) const INGRESS_ONLY_CONFIG_KEYS: &[&str] = &[
     "query_pool_max",
     "acquire_timeout_ms",
     "idle_timeout_ms",
+    "lazy_connect",
     "pool_reap",
 ];
 

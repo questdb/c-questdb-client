@@ -636,13 +636,18 @@ impl QwpWsConnector {
         force_async_initial_connect: bool,
     ) -> Result<sender::qwp_ws::SyncQwpWsHandlerState> {
         let mut qwp_ws = self.qwp_ws.clone();
-        // Recovery pre-opens force the background initial connect so
-        // `QuestDb::connect` stays non-blocking; borrows honor an explicit
-        // `initial_connect_retry` mode and default to background otherwise.
+        // Recovery pre-opens and lazy_connect pools force the background
+        // initial connect; a non-lazy pool honors an EXPLICITLY set
+        // `initial_connect_retry` (default off: connect at borrow / prewarm
+        // and fail fast). The `sync` promoted from `reconnect_*` keys is
+        // demoted back to the default here: that promotion exists to give the
+        // standalone sender's blocking connect a retry budget, and honoring
+        // it in the pool would turn a mid-stream failover knob into a
+        // multi-minute blocking `connect()`.
         if force_async_initial_connect {
             qwp_ws.force_async_initial_connect();
         } else {
-            qwp_ws.default_async_initial_connect();
+            qwp_ws.demote_promoted_initial_connect_retry();
         }
         // The pool's shared sources exist (handlers already attached, or
         // permanently defaulted) before connect-time recovery senders are
@@ -1115,6 +1120,7 @@ impl SenderBuilder {
             "path",
             "acquire_timeout_ms",
             "idle_timeout_ms",
+            "lazy_connect",
             "pool_reap",
             "query_pool_max",
             "query_pool_min",
@@ -2017,11 +2023,12 @@ impl SenderBuilder {
     #[cfg(feature = "_sender-qwp-ws")]
     /// Retry the initial connection using the reconnect policy. Default false.
     ///
-    /// The mode also governs pool borrows ([`crate::QuestDb::borrow_sender`]):
-    /// a borrow that opens a new connection honors an explicit `off`/`sync`
-    /// and defaults to the background initial connect otherwise. An explicit
-    /// call here replaces the `sync` that setting any `reconnect_*` key
-    /// promotes; that promoted mode never applies to pool borrows.
+    /// The mode also governs the pool ([`crate::QuestDb::connect`]): the
+    /// eager warm-minimum pre-open and every pool borrow that opens a new
+    /// connection honor it, defaulting to fail-fast `off`. A `lazy_connect`
+    /// pool always connects in the background and rejects an explicit
+    /// blocking mode. An explicit call here replaces the `sync` that setting
+    /// any `reconnect_*` key promotes.
     pub fn initial_connect_retry(mut self, value: bool) -> Result<Self> {
         let Some(qwp_ws) = &mut self.qwp_ws else {
             return Err(error::fmt!(
@@ -3040,6 +3047,30 @@ where
             "Could not parse {param_name:?} to number: {e:?}"
         )
     })
+}
+
+/// `true` when the ingress parser recognizes `str_value` as an
+/// `initial_connect_retry` mode that blocks or fails fast at startup.
+/// The pool's `lazy_connect` conflict check derives from the parser so the
+/// two cannot drift when a mode is added.
+#[cfg(feature = "_sender-qwp-ws")]
+pub(crate) fn initial_connect_retry_value_is_blocking(str_value: &str) -> bool {
+    matches!(
+        parse_initial_connect_retry_value(str_value),
+        Ok(mode) if mode != conf::QwpWsInitialConnectMode::Async
+    )
+}
+
+/// `true` when the ingress parser recognizes `str_value` as the synchronous
+/// retry mode (`sync` / `on` / `true`). Used by the pool's eager-startup
+/// conflict check; derived from the parser for the same no-drift reason as
+/// [`initial_connect_retry_value_is_blocking`].
+#[cfg(feature = "_sender-qwp-ws")]
+pub(crate) fn initial_connect_retry_value_is_sync(str_value: &str) -> bool {
+    matches!(
+        parse_initial_connect_retry_value(str_value),
+        Ok(conf::QwpWsInitialConnectMode::Sync)
+    )
 }
 
 #[cfg(feature = "_sender-qwp-ws")]

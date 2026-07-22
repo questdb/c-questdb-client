@@ -622,19 +622,35 @@ fn read_then_close(stream: &mut std::net::TcpStream, stop: &AtomicBool, n: usize
 
 fn conf_for(port: u16, extras: &str) -> String {
     format!(
-        "ws::addr=127.0.0.1:{port};auth_timeout=2000;reconnect_max_duration_millis=1000;{extras}"
+        "ws::addr=127.0.0.1:{port};lazy_connect=true;auth_timeout=2000;reconnect_max_duration_millis=1000;{extras}"
     )
 }
 
 /// Build a conf string with a comma-joined endpoint list (`addr=h1,h2,...`),
 /// which enables endpoint rotation / failover in the pool's connect path.
+// `lazy_connect=true`: the pool suite exercises the store-and-forward
+// borrow model (buffer while the server is away, background connects, no
+// warm-minimum pre-connect at construction). Eager-startup behavior has
+// its own tests with explicit non-lazy conf strings.
 fn conf_for_endpoints(ports: &[u16], extras: &str) -> String {
     let addrs = ports
         .iter()
         .map(|p| format!("127.0.0.1:{p}"))
         .collect::<Vec<_>>()
         .join(",");
-    format!("ws::addr={addrs};auth_timeout=2000;reconnect_max_duration_millis=1000;{extras}")
+    format!(
+        "ws::addr={addrs};auth_timeout=2000;reconnect_max_duration_millis=1000;\
+         lazy_connect=true;{extras}"
+    )
+}
+
+fn eager_conf(ports: &[u16], extras: &str) -> String {
+    let addrs = ports
+        .iter()
+        .map(|p| format!("127.0.0.1:{p}"))
+        .collect::<Vec<_>>()
+        .join(",");
+    format!("ws::addr={addrs};auth_timeout=2000;{extras}")
 }
 
 fn append_one_symbol_row<'a>(chunk: &mut Chunk<'a>, symbol: &'a [u8], timestamp: &'a [i64; 1]) {
@@ -768,7 +784,7 @@ fn sorted_slot_names(sf_dir: &Path) -> Vec<String> {
 fn seed_async_qwp_ws_slot(sf_dir: &Path, sender_id: &str, value: i64) {
     let port = unused_local_port();
     let conf = format!(
-        "ws::addr=127.0.0.1:{port};initial_connect_retry=async;\
+        "ws::addr=127.0.0.1:{port};lazy_connect=true;initial_connect_retry=async;\
          sf_dir={};sender_id={sender_id};sf_max_segment_bytes=256;sf_max_total_bytes=1024;\
          close_flush_timeout_millis=0;",
         sf_dir.display()
@@ -855,15 +871,18 @@ fn at_cap_borrow_fails_fast_with_zero_acquire_timeout() {
 }
 
 #[test]
-fn borrow_honors_explicit_initial_connect_retry_off() {
-    let conf = conf_for_endpoints(
+fn eager_borrow_honors_default_initial_connect_retry_off() {
+    // Non-lazy pool, sender_pool_min=0 so connect() itself opens nothing:
+    // the borrow performs the initial connect, honoring the default
+    // fail-fast mode.
+    let conf = eager_conf(
         &[unused_local_port()],
-        "initial_connect_retry=off;sender_pool_max=1;acquire_timeout_ms=0;",
+        "sender_pool_min=0;query_pool_min=0;sender_pool_max=1;acquire_timeout_ms=0;",
     );
     let db = QuestDb::connect(&conf).unwrap();
     let start = std::time::Instant::now();
     db.borrow_sender()
-        .expect_err("initial_connect_retry=off must connect at borrow and fail fast");
+        .expect_err("the default off mode must connect at borrow and fail fast");
     assert!(
         start.elapsed() < std::time::Duration::from_secs(2),
         "off is one connection round, not a retry budget"
@@ -885,9 +904,227 @@ fn borrow_honors_explicit_initial_connect_retry_off() {
 }
 
 #[test]
-fn borrow_honors_explicit_initial_connect_retry_sync() {
+fn eager_connect_prewarms_and_fails_fast_offline() {
+    // Default (non-lazy) startup with the default warm minimum of one
+    // ingest sender: connect() itself performs the initial connect and
+    // fails fast against a dead endpoint, matching the Java client.
+    let conf = eager_conf(&[unused_local_port()], "query_pool_min=0;");
+    let start = std::time::Instant::now();
+    QuestDb::connect(&conf).expect_err("eager connect must fail against a dead endpoint");
+    assert!(
+        start.elapsed() < std::time::Duration::from_secs(2),
+        "default off mode must not consume a retry budget"
+    );
+}
+
+#[test]
+fn eager_connect_prewarms_sender_pool_min_connections() {
+    let server = MockServer::spawn(3);
+    let conf = eager_conf(
+        &[server.port()],
+        "sender_pool_min=2;query_pool_min=0;pool_reap=manual;",
+    );
+    let db = QuestDb::connect(&conf).unwrap();
+    assert_eq!(
+        server.accepted(),
+        2,
+        "connect() must pre-open the warm minimum of ingest senders"
+    );
+    // The prewarmed connections are parked in the free list: a borrow
+    // reuses one instead of opening a third connection.
+    let _sender = db.borrow_sender().expect("borrow pops a prewarmed sender");
+    assert_eq!(server.accepted(), 2);
+}
+
+#[test]
+fn eager_connect_with_async_mode_still_fails_fast_on_reader_prewarm() {
+    // initial_connect_retry is ingress-only: reader pre-opens always connect
+    // synchronously and fail fast. Bare async is therefore not a
+    // non-blocking startup while query_pool_min > 0; lazy_connect is.
+    let conf = eager_conf(
+        &[unused_local_port()],
+        "initial_connect_retry=async;sender_pool_min=0;query_pool_min=1;",
+    );
+    let start = std::time::Instant::now();
+    QuestDb::connect(&conf).expect_err("reader prewarm must fail fast");
+    assert!(
+        start.elapsed() < std::time::Duration::from_secs(2),
+        "reader prewarm has no retry budget"
+    );
+}
+
+#[test]
+fn reconnect_keys_do_not_stall_eager_connect() {
+    // reconnect_* keys promote initial_connect_retry=sync for the standalone
+    // sender. The pool must not let that promotion drive its eager startup:
+    // a mid-stream failover budget (default 300 s) must never become a
+    // blocking connect() stall. Only an explicitly set mode counts.
+    let conf = eager_conf(
+        &[unused_local_port()],
+        "reconnect_max_duration_millis=6000;query_pool_min=0;",
+    );
+    let start = std::time::Instant::now();
+    QuestDb::connect(&conf).expect_err("dead endpoint must fail the eager connect");
+    assert!(
+        start.elapsed() < std::time::Duration::from_secs(2),
+        "promoted sync must not turn connect() into a retry loop"
+    );
+}
+
+#[test]
+fn eager_connect_fails_fast_despite_dirty_recovery_slots() {
+    // Dirty disk slots must not satisfy the eager warm minimum: prewarm runs
+    // before recovery pre-open and adopts the dirty slot with a real
+    // foreground connect, so a dead server fails connect() deterministically
+    // whether or not a previous run left queued data behind.
+    let dir = TempDir::new().unwrap();
+    let dead_port = unused_local_port();
+    let offline = format!(
+        "ws::addr=127.0.0.1:{dead_port};lazy_connect=true;auth_timeout=200;\
+         sf_dir={};sender_id=eagerdirty;sender_pool_min=1;sender_pool_max=1;\
+         pool_reap=manual;close_flush_timeout_millis=0;",
+        dir.path().display()
+    );
+    let db1 = QuestDb::connect(&offline).unwrap();
+    let mut sender1 = db1.borrow_sender().expect("seed the dirty slot");
+    let mut buf = sender1.new_buffer();
+    buf.table("eager_dirty")
+        .unwrap()
+        .column_i64("v", 1)
+        .unwrap()
+        .at_now()
+        .unwrap();
+    sender1.flush_buffer(&mut buf).expect("publish to disk");
+    drop(sender1);
+    db1.close();
+
+    let eager = format!(
+        "ws::addr=127.0.0.1:{dead_port};auth_timeout=200;\
+         sf_dir={};sender_id=eagerdirty;sender_pool_min=1;sender_pool_max=1;\
+         query_pool_min=0;pool_reap=manual;close_flush_timeout_millis=0;",
+        dir.path().display()
+    );
+    let start = std::time::Instant::now();
+    QuestDb::connect(&eager).expect_err("a recovered slot must not stand in for a live connection");
+    assert!(
+        start.elapsed() < std::time::Duration::from_secs(2),
+        "the default off mode fails fast even over a dirty slot"
+    );
+}
+
+#[test]
+fn eager_connect_adopts_dirty_slot_and_replays_on_live_server() {
+    let dir = TempDir::new().unwrap();
+    let dead_port = unused_local_port();
+    let offline = format!(
+        "ws::addr=127.0.0.1:{dead_port};lazy_connect=true;auth_timeout=200;\
+         sf_dir={};sender_id=eagerlive;sender_pool_min=1;sender_pool_max=1;\
+         pool_reap=manual;close_flush_timeout_millis=0;",
+        dir.path().display()
+    );
+    let db1 = QuestDb::connect(&offline).unwrap();
+    let mut sender1 = db1.borrow_sender().expect("seed the dirty slot");
+    let mut buf = sender1.new_buffer();
+    buf.table("eager_live")
+        .unwrap()
+        .column_i64("v", 2)
+        .unwrap()
+        .at_now()
+        .unwrap();
+    sender1.flush_buffer(&mut buf).expect("publish to disk");
+    drop(sender1);
+    db1.close();
+
+    // The eager prewarm adopts the dirty slot in the foreground and replays
+    // its queued frame as part of connect().
     let (server, frames) = MockServer::spawn_acking_capturing(1);
-    let conf = conf_for_endpoints(&[server.port()], "initial_connect_retry=sync;");
+    let eager = format!(
+        "ws::addr=127.0.0.1:{};auth_timeout=2000;\
+         sf_dir={};sender_id=eagerlive;sender_pool_min=1;sender_pool_max=1;\
+         query_pool_min=0;pool_reap=manual;",
+        server.port(),
+        dir.path().display()
+    );
+    let _db2 = QuestDb::connect(&eager).expect("eager adoption against a live server");
+    let replayed = frames
+        .recv_timeout(Duration::from_secs(5))
+        .expect("prewarm replays the adopted slot");
+    assert_eq!(frame_table_name(&replayed), "eager_live");
+    assert_eq!(frame_row_count(&replayed), 1);
+}
+
+#[test]
+fn eager_sync_with_reader_prewarm_is_a_config_conflict() {
+    // Explicit sync retries ingest pre-opens, but readers have no retry
+    // mode; refusing the combination keeps "retry my startup" from being a
+    // half-truth.
+    let err = QuestDb::connect("ws::addr=localhost:9000;initial_connect_retry=sync;")
+        .expect_err("sync with the default reader prewarm must conflict");
+    assert_eq!(err.code(), ErrorCode::ConfigError);
+    assert!(err.msg().contains("query_pool_min"), "{}", err.msg());
+
+    // sync with a lazy read pool is accepted; nothing prewarms here.
+    QuestDb::connect(&format!(
+        "ws::addr=127.0.0.1:{};initial_connect_retry=sync;\
+         sender_pool_min=0;query_pool_min=0;",
+        unused_local_port()
+    ))
+    .expect("sync with query_pool_min=0 must be accepted");
+}
+
+#[test]
+fn lazy_connect_rejects_explicit_blocking_initial_connect() {
+    for mode in ["off", "sync", "on"] {
+        let err = QuestDb::connect(&format!(
+            "ws::addr=localhost:9000;lazy_connect=true;initial_connect_retry={mode};"
+        ))
+        .expect_err("lazy_connect and a blocking initial connect must conflict");
+        assert_eq!(err.code(), ErrorCode::ConfigError);
+        assert!(
+            err.msg().contains("conflicting configuration"),
+            "{}",
+            err.msg()
+        );
+    }
+    // Explicit async is the mode lazy_connect implies; no conflict.
+    QuestDb::connect(&format!(
+        "ws::addr=127.0.0.1:{};lazy_connect=true;initial_connect_retry=async;",
+        unused_local_port()
+    ))
+    .expect("lazy_connect with explicit async must be accepted");
+
+    // An unrecognized mode is an invalid value, not a lazy_connect conflict.
+    let err =
+        QuestDb::connect("ws::addr=localhost:9000;lazy_connect=true;initial_connect_retry=banana;")
+            .expect_err("invalid mode value");
+    assert!(
+        err.msg().contains("invalid initial_connect_retry"),
+        "must report the invalid value, not a conflict: {}",
+        err.msg()
+    );
+}
+
+#[test]
+fn lazy_connect_rejects_positive_query_pool_min() {
+    let err = QuestDb::connect("ws::addr=localhost:9000;lazy_connect=true;query_pool_min=2;")
+        .expect_err("lazy_connect needs a lazy read pool");
+    assert_eq!(err.code(), ErrorCode::ConfigError);
+    assert!(err.msg().contains("query_pool_min"), "{}", err.msg());
+    // Explicit 0 restates the lazy default; accepted.
+    QuestDb::connect(&format!(
+        "ws::addr=127.0.0.1:{};lazy_connect=true;query_pool_min=0;",
+        unused_local_port()
+    ))
+    .expect("query_pool_min=0 is the lazy default");
+}
+
+#[test]
+fn eager_borrow_honors_explicit_initial_connect_retry_sync() {
+    let (server, frames) = MockServer::spawn_acking_capturing(1);
+    let conf = eager_conf(
+        &[server.port()],
+        "initial_connect_retry=sync;sender_pool_min=0;query_pool_min=0;",
+    );
     let db = QuestDb::connect(&conf).unwrap();
     let mut sender = db.borrow_sender().expect("sync initial connect");
     assert_eq!(
@@ -926,17 +1163,17 @@ fn borrow_honors_explicit_initial_connect_retry_sync() {
 }
 
 #[test]
-fn borrow_ignores_reconnect_promoted_sync_and_buffers_offline() {
-    // `conf_for_endpoints` sets `reconnect_max_duration_millis`, which
-    // promotes `initial_connect_retry=sync` for the standalone sender. Pool
-    // borrows must ignore the promoted mode: the background runner already
-    // applies the reconnect budget to its initial connect, and a borrow must
-    // keep working while the server is away.
+fn lazy_borrow_ignores_reconnect_promoted_sync_and_buffers_offline() {
+    // `conf_for_endpoints` sets `reconnect_max_duration_millis` (promoting
+    // `initial_connect_retry=sync` for the standalone sender) and
+    // `lazy_connect=true`. The lazy pool must keep its background initial
+    // connect — the runner already applies the reconnect budget — so both
+    // connect() and the borrow work while the server is away.
     let conf = conf_for_endpoints(&[unused_local_port()], "");
     let db = QuestDb::connect(&conf).unwrap();
     let _sender = db
         .borrow_sender()
-        .expect("default pool borrow buffers while the server is away");
+        .expect("lazy pool borrow buffers while the server is away");
 }
 
 #[test]
@@ -1191,7 +1428,7 @@ fn disk_store_and_forward_duplicate_pool_collides_on_managed_slot() {
     let port = unused_local_port();
     let dir = TempDir::new().unwrap();
     let conf = format!(
-        "ws::addr=127.0.0.1:{port};auth_timeout=200;\
+        "ws::addr=127.0.0.1:{port};lazy_connect=true;auth_timeout=200;\
          sf_dir={};sender_id=shared;sender_pool_min=1;sender_pool_max=2;\
          pool_reap=manual;close_flush_timeout_millis=0;",
         dir.path().display()
@@ -1223,7 +1460,7 @@ fn disk_store_and_forward_duplicate_pool_connect_warn_skips_flocked_slots() {
     let port = unused_local_port();
     let dir = TempDir::new().unwrap();
     let conf = format!(
-        "ws::addr=127.0.0.1:{port};auth_timeout=200;initial_connect_retry=async;\
+        "ws::addr=127.0.0.1:{port};lazy_connect=true;auth_timeout=200;initial_connect_retry=async;\
          sf_dir={};sender_id=dupe;sender_pool_min=1;sender_pool_max=1;\
          pool_reap=manual;close_flush_timeout_millis=0;",
         dir.path().display()
@@ -1274,11 +1511,180 @@ fn disk_store_and_forward_duplicate_pool_connect_warn_skips_flocked_slots() {
 }
 
 #[test]
+fn sync_borrow_adopts_dirty_slot_and_continues_recovered_symbol_dict() {
+    // The eager-connect branch of connect_qwp_ws_background_state seeds its
+    // encoder and send core from a recovered symbol dictionary. Reach it on a
+    // pooled core: pool 1 (lazy, unreachable server) publishes a symbol row
+    // into a disk slot and holds the flock through pool 2's connect, so
+    // recovery pre-open skips the slot and the later borrow — explicit
+    // initial_connect_retry=sync — adopts it through the eager branch. The
+    // replayed frame must register the recovered symbol from zero, and a new
+    // symbol published afterwards must continue above the recovered id.
+    let dir = TempDir::new().unwrap();
+    let dead_port = unused_local_port();
+    let offline_conf = format!(
+        "ws::addr=127.0.0.1:{dead_port};lazy_connect=true;auth_timeout=200;\
+         sf_dir={};sender_id=syncrec;sender_pool_min=1;sender_pool_max=1;\
+         pool_reap=manual;close_flush_timeout_millis=0;",
+        dir.path().display()
+    );
+    let db1 = QuestDb::connect(&offline_conf).unwrap();
+    let mut sender1 = db1
+        .borrow_sender()
+        .expect("first pool owns syncrec-ingest-0");
+    let mut buf = sender1.new_buffer();
+    buf.table("sync_recover")
+        .unwrap()
+        .symbol("symbol", "ETH-USDT")
+        .unwrap()
+        .column_f64("price", 2615.54)
+        .unwrap()
+        .at_now()
+        .unwrap();
+    sender1
+        .flush_buffer(&mut buf)
+        .expect("publish to the disk slot while the server is away");
+
+    let (server, frames) = MockServer::spawn_acking_capturing(1);
+    let live_conf = format!(
+        "ws::addr=127.0.0.1:{};auth_timeout=2000;initial_connect_retry=sync;\
+         sf_dir={};sender_id=syncrec;sender_pool_min=0;query_pool_min=0;\
+         sender_pool_max=1;pool_reap=manual;",
+        server.port(),
+        dir.path().display()
+    );
+    // Pool 1 still holds the slot flock: pool 2's connect-time recovery
+    // skips it and succeeds with nothing pre-opened.
+    let db2 = QuestDb::connect(&live_conf).expect("connect skips the flocked slot");
+    drop(sender1);
+    db1.close();
+
+    let mut sender2 = db2
+        .borrow_sender()
+        .expect("sync borrow adopts the released dirty slot");
+    // The eager branch first re-registers the recovered dictionary through a
+    // dict-only catch-up frame, then replays the queued data frame.
+    let catch_up = frames
+        .recv_timeout(Duration::from_secs(5))
+        .expect("adopting the slot re-registers the recovered dictionary");
+    assert_eq!(
+        read_symbol_prefix(&catch_up),
+        (0, vec![b"ETH-USDT".to_vec()]),
+        "the catch-up frame re-registers the recovered symbol from zero"
+    );
+    let replayed = frames
+        .recv_timeout(Duration::from_secs(5))
+        .expect("adopting the slot replays the unacked frame");
+    assert_eq!(frame_table_name(&replayed), "sync_recover");
+    assert_eq!(
+        read_symbol_prefix(&replayed),
+        (0, vec![b"ETH-USDT".to_vec()]),
+        "the replayed frame carries its original dictionary delta"
+    );
+
+    let mut buf = sender2.new_buffer();
+    buf.table("sync_recover")
+        .unwrap()
+        .symbol("symbol", "BTC-USDT")
+        .unwrap()
+        .column_f64("price", 65432.10)
+        .unwrap()
+        .at_now()
+        .unwrap();
+    sender2
+        .flush_buffer_and_wait(&mut buf, AckLevel::Ok)
+        .expect("publish a new symbol over the adopted slot");
+    let fresh = frames
+        .recv_timeout(Duration::from_secs(5))
+        .expect("server receives the new frame");
+    assert_eq!(
+        read_symbol_prefix(&fresh),
+        (1, vec![b"BTC-USDT".to_vec()]),
+        "the new symbol must continue above the recovered dictionary id"
+    );
+}
+
+#[test]
+fn failed_eager_borrow_on_disk_slot_releases_flock_and_keeps_data() {
+    // A borrow-time adoption of a dirty disk slot opens the flock and
+    // recovered segments BEFORE the eager fail-fast connect. A connect
+    // failure there must release the flock (so the next borrow can retry
+    // rather than colliding on "slot in use") and leave the segments
+    // recoverable by a later pool.
+    let dir = TempDir::new().unwrap();
+    let dead_port = unused_local_port();
+    let offline = format!(
+        "ws::addr=127.0.0.1:{dead_port};lazy_connect=true;auth_timeout=200;\
+         sf_dir={};sender_id=flockrec;sender_pool_min=1;sender_pool_max=1;\
+         pool_reap=manual;close_flush_timeout_millis=0;",
+        dir.path().display()
+    );
+    let db1 = QuestDb::connect(&offline).unwrap();
+    let mut sender1 = db1.borrow_sender().expect("seed the dirty slot");
+    let mut buf = sender1.new_buffer();
+    buf.table("flock_recover")
+        .unwrap()
+        .column_i64("v", 7)
+        .unwrap()
+        .at_now()
+        .unwrap();
+    sender1
+        .flush_buffer(&mut buf)
+        .expect("publish to disk while the server is away");
+
+    // Eager pool over the same slot: connect while the flock is still held
+    // so recovery pre-open skips the dirty slot and the BORROW adopts it.
+    let eager = format!(
+        "ws::addr=127.0.0.1:{dead_port};auth_timeout=200;\
+         sf_dir={};sender_id=flockrec;sender_pool_min=0;query_pool_min=0;\
+         sender_pool_max=1;acquire_timeout_ms=0;pool_reap=manual;\
+         close_flush_timeout_millis=0;",
+        dir.path().display()
+    );
+    let db2 = QuestDb::connect(&eager).expect("connect skips the flocked slot");
+    drop(sender1);
+    db1.close();
+
+    let first = db2
+        .borrow_sender()
+        .expect_err("eager borrow adopts the slot, then fails its connect");
+    assert_ne!(first.code(), ErrorCode::ConfigError, "{}", first.msg());
+    let second = db2
+        .borrow_sender()
+        .expect_err("second borrow retries the connect");
+    assert_ne!(
+        second.code(),
+        ErrorCode::ConfigError,
+        "a failed eager adoption must release the slot flock, not leave \
+         it 'in use': {}",
+        second.msg()
+    );
+    db2.close();
+
+    // The failed adoptions must not have consumed or corrupted the queued
+    // data: a pool against a live server replays it via recovery pre-open.
+    let (server, frames) = MockServer::spawn_acking_capturing(1);
+    let live = format!(
+        "ws::addr=127.0.0.1:{};auth_timeout=2000;\
+         sf_dir={};sender_id=flockrec;sender_pool_min=0;query_pool_min=0;\
+         sender_pool_max=1;pool_reap=manual;",
+        server.port(),
+        dir.path().display()
+    );
+    let _db3 = QuestDb::connect(&live).expect("recovery pre-open replays");
+    let replayed = frames
+        .recv_timeout(Duration::from_secs(5))
+        .expect("the queued frame must survive the failed eager adoptions");
+    assert_eq!(frame_table_name(&replayed), "flock_recover");
+    assert_eq!(frame_row_count(&replayed), 1);
+}
+
+#[test]
 fn disk_store_and_forward_restart_replays_reminted_and_out_of_range_managed_slots() {
     let dir = TempDir::new().unwrap();
     let seed_port = unused_local_port();
     let seed_conf = format!(
-        "ws::addr=127.0.0.1:{seed_port};auth_timeout=200;\
+        "ws::addr=127.0.0.1:{seed_port};lazy_connect=true;auth_timeout=200;\
          reconnect_max_duration_millis=100;sf_dir={};sender_id=replay;\
          sender_pool_min=1;sender_pool_max=2;pool_reap=manual;close_flush_timeout_millis=0;",
         dir.path().display()
@@ -1331,7 +1737,7 @@ fn disk_store_and_forward_restart_same_pool_max_replays_in_range_slots_without_b
     let dir = TempDir::new().unwrap();
     let seed_port = unused_local_port();
     let seed_conf = format!(
-        "ws::addr=127.0.0.1:{seed_port};auth_timeout=200;\
+        "ws::addr=127.0.0.1:{seed_port};lazy_connect=true;auth_timeout=200;\
          reconnect_max_duration_millis=100;sf_dir={};sender_id=samepool;\
          sender_pool_min=1;sender_pool_max=2;pool_reap=manual;close_flush_timeout_millis=0;",
         dir.path().display()
@@ -2040,7 +2446,7 @@ fn mixed_sfa_namespace_survives_endpoint_failover_and_catch_up() {
     let first = MockServer::spawn_ack_then_close(1, 1);
     let (live, frames) = MockServer::spawn_acking_capturing(4);
     let conf = format!(
-        "ws::addr=127.0.0.1:{},127.0.0.1:{};auth_timeout=2000;\
+        "ws::addr=127.0.0.1:{},127.0.0.1:{};lazy_connect=true;auth_timeout=2000;\
          reconnect_max_duration_millis=10000;pool_reap=manual;",
         first.port(),
         live.port()
@@ -2137,7 +2543,7 @@ fn disk_recovery_orphan_drains_mixed_shapes_with_one_dictionary() {
     let dir = TempDir::new().unwrap();
     let seed_port = unused_local_port();
     let seed_conf = format!(
-        "ws::addr=127.0.0.1:{seed_port};auth_timeout=200;\
+        "ws::addr=127.0.0.1:{seed_port};lazy_connect=true;auth_timeout=200;\
          reconnect_max_duration_millis=10000;sf_dir={};sender_id=mixedrec;\
          sender_pool_min=1;sender_pool_max=2;pool_reap=manual;close_flush_timeout_millis=0;",
         dir.path().display()
@@ -2944,7 +3350,7 @@ fn store_and_forward_runner_reconnects_and_replays_after_transport_death() {
     // No `sf_dir` -> in-memory SF; a longer reconnect budget so the runner can
     // rotate to the live endpoint.
     let conf = format!(
-        "ws::addr=127.0.0.1:{},127.0.0.1:{};auth_timeout=2000;\
+        "ws::addr=127.0.0.1:{},127.0.0.1:{};lazy_connect=true;auth_timeout=2000;\
          reconnect_max_duration_millis=10000;pool_reap=manual;",
         dead.port(),
         live.port()
@@ -4276,7 +4682,7 @@ fn buffer_sender_local_build_failure_releases_in_use_slot() {
     let dir = TempDir::new().unwrap();
     let port = unused_local_port();
     let conf = format!(
-        "ws::addr=127.0.0.1:{port};auth_timeout=200;sf_dir={};\
+        "ws::addr=127.0.0.1:{port};lazy_connect=true;auth_timeout=200;sf_dir={};\
          sender_id=buildfail;sender_pool_min=1;sender_pool_max=1;pool_reap=manual;\
          close_flush_timeout_millis=0;",
         dir.path().display()
@@ -6006,7 +6412,11 @@ fn flush_polars_dataframe_single_endpoint_commits_in_one_pass() {
     use polars::prelude::{IntoColumn, NamedFrom, PlSmallStr, Series};
 
     let (server, frames) = MockServer::spawn_acking_capturing(1);
-    let db = QuestDb::connect(&format!("ws::addr=127.0.0.1:{};", server.port())).unwrap();
+    let db = QuestDb::connect(&format!(
+        "ws::addr=127.0.0.1:{};lazy_connect=true;",
+        server.port()
+    ))
+    .unwrap();
 
     let i = Series::new(PlSmallStr::from("i"), &[1i64, 2, 3, 4]).into_column();
     let df = crate::polars_ffi::df_from_columns(vec![i]).unwrap();
@@ -6041,7 +6451,11 @@ fn flush_polars_dataframe_applies_column_overrides() {
     // A Symbol override for a plain Utf8 column must now thread through to every
     // sliced batch and commit cleanly.
     let (server, frames) = MockServer::spawn_acking_capturing(1);
-    let db = QuestDb::connect(&format!("ws::addr=127.0.0.1:{};", server.port())).unwrap();
+    let db = QuestDb::connect(&format!(
+        "ws::addr=127.0.0.1:{};lazy_connect=true;",
+        server.port()
+    ))
+    .unwrap();
 
     let s = Series::new(PlSmallStr::from("s"), &["a", "b", "c", "d"]).into_column();
     let i = Series::new(PlSmallStr::from("i"), &[1i64, 2, 3, 4]).into_column();
@@ -6078,7 +6492,11 @@ fn flush_arrow_batch_at_now_commits_in_one_call() {
     // `Ok` ack, and returns the sender to the pool — all without the caller
     // touching a sender.
     let (server, frames) = MockServer::spawn_acking_capturing(1);
-    let db = QuestDb::connect(&format!("ws::addr=127.0.0.1:{};", server.port())).unwrap();
+    let db = QuestDb::connect(&format!(
+        "ws::addr=127.0.0.1:{};lazy_connect=true;",
+        server.port()
+    ))
+    .unwrap();
 
     let schema = Arc::new(Schema::new(vec![Field::new("i", DataType::Int64, false)]));
     let arr = Arc::new(Int64Array::from(vec![1i64, 2, 3, 4]));
@@ -6113,7 +6531,11 @@ fn flush_arrow_batch_durable_without_opt_in_is_rejected() {
     // caller-named `Durable` level must be rejected up front rather than
     // accepted without durable opt-in.
     let (server, _frames) = MockServer::spawn_acking_capturing(1);
-    let db = QuestDb::connect(&format!("ws::addr=127.0.0.1:{};", server.port())).unwrap();
+    let db = QuestDb::connect(&format!(
+        "ws::addr=127.0.0.1:{};lazy_connect=true;",
+        server.port()
+    ))
+    .unwrap();
 
     let schema = Arc::new(Schema::new(vec![Field::new("i", DataType::Int64, false)]));
     let arr = Arc::new(Int64Array::from(vec![1i64, 2]));
@@ -6136,7 +6558,11 @@ fn flush_arrow_batch_at_column_commits_in_one_call() {
     // The `Some(ts)` arm sources the designated timestamp from the named
     // column and threads through to `flush_arrow_batch_at_column_and_wait`.
     let (server, frames) = MockServer::spawn_acking_capturing(1);
-    let db = QuestDb::connect(&format!("ws::addr=127.0.0.1:{};", server.port())).unwrap();
+    let db = QuestDb::connect(&format!(
+        "ws::addr=127.0.0.1:{};lazy_connect=true;",
+        server.port()
+    ))
+    .unwrap();
 
     let schema = Arc::new(Schema::new(vec![
         Field::new("price", DataType::Float64, false),
@@ -6187,7 +6613,7 @@ mod reader_pool {
     use std::thread;
     use std::time::Duration;
 
-    use super::{conf_for, park_connection, wait_until};
+    use super::{conf_for, eager_conf, park_connection, wait_until};
     use crate::ErrorCode;
     // Front-door import: `QuestDb` is re-exported at the crate root.
     use crate::QuestDb;
@@ -6411,6 +6837,26 @@ mod reader_pool {
         assert_eq!(server.accepted(), 3, "reuse must not open new connections");
     }
 
+    /// Eager (non-lazy) startup pre-opens `query_pool_min` readers at
+    /// `connect()`, and a later borrow reuses one instead of opening a new
+    /// connection.
+    #[test]
+    fn eager_connect_prewarms_query_pool_min_readers() {
+        let server = ReaderMockServer::spawn(4);
+        let db = QuestDb::connect(&eager_conf(
+            &[server.port()],
+            "sender_pool_min=0;query_pool_min=2;pool_reap=manual;",
+        ))
+        .unwrap();
+        assert_eq!(
+            server.accepted(),
+            2,
+            "connect() must pre-open the warm minimum of readers"
+        );
+        let _reader = db.borrow_reader().expect("borrow pops a prewarmed reader");
+        assert_eq!(server.accepted(), 2, "the borrow must reuse a warm reader");
+    }
+
     /// Borrowing past `query_pool_max` with `acquire_timeout_ms=0` fails
     /// fast with an egress `InvalidApiCall` instead of over-committing.
     #[test]
@@ -6418,7 +6864,7 @@ mod reader_pool {
         let server = ReaderMockServer::spawn(8);
         let db = QuestDb::connect(&conf_for(
             server.port(),
-            "query_pool_min=1;query_pool_max=2;acquire_timeout_ms=0;",
+            "query_pool_max=2;acquire_timeout_ms=0;",
         ))
         .unwrap();
 
@@ -6754,7 +7200,7 @@ mod conn_event_tests {
             listener.local_addr().unwrap().port()
         };
         let conf = format!(
-            "ws::addr=127.0.0.1:{port};auth_timeout=2000;\
+            "ws::addr=127.0.0.1:{port};lazy_connect=true;auth_timeout=2000;\
              reconnect_max_duration_millis=200;connect_timeout=100;\
              sender_pool_min=1;sender_pool_max=1;pool_reap=manual;"
         );
@@ -6905,7 +7351,7 @@ mod conn_event_tests {
     fn sfa_unreachable_endpoint_fires_attempt_failed_and_unreachable() {
         let port = unused_local_port();
         let conf = format!(
-            "ws::addr=127.0.0.1:{port};auth_timeout=2000;\
+            "ws::addr=127.0.0.1:{port};lazy_connect=true;auth_timeout=2000;\
              reconnect_max_duration_millis=200;connect_timeout=100;\
              sender_pool_min=1;sender_pool_max=1;pool_reap=manual;close_flush_timeout_millis=0;"
         );
@@ -7218,7 +7664,7 @@ mod sender_conn_event_tests {
         };
         let (seen, listener) = collecting_listener();
         let conf = format!(
-            "ws::addr=127.0.0.1:{port};auth_timeout=2000;\
+            "ws::addr=127.0.0.1:{port};lazy_connect=true;auth_timeout=2000;\
              reconnect_max_duration_millis=200;connect_timeout=100;"
         );
         let err = SenderBuilder::from_conf(conf)

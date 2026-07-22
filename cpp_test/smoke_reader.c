@@ -87,12 +87,18 @@ static int closed_port_phase(void)
  * <questdb/egress/qwp_reader.h> and the client-wide `questdb_error` type.
  *
  * Targets the same guaranteed-closed 127.0.0.1:1 port via a `ws::`
- * connect string. The pool is lazy: `questdb_db_connect` opens no
- * socket, so the connect itself succeeds and the connect failure surfaces
+ * connect string with `lazy_connect=true`, so `questdb_db_connect` opens
+ * no socket, the connect itself succeeds, and the connect failure surfaces
  * on the first `questdb_db_borrow_reader` — reported as a `questdb_error*`.
  * Also exercises the NULL-idempotent `questdb_db_close` path.
  */
-static int pool_reader_only_phase(void)
+/*
+ * Eager-default pool phase (always runs): the inverse of the lazy phase
+ * below. Without `lazy_connect=true`, `questdb_db_connect` pre-opens the
+ * warm minimums and must fail fast against the guaranteed-closed port,
+ * returning NULL with a populated `questdb_error*`.
+ */
+static int pool_eager_connect_fails_phase(void)
 {
     static const char conf[] = "ws::addr=127.0.0.1:1;";
 
@@ -100,9 +106,38 @@ static int pool_reader_only_phase(void)
     struct questdb_db* db =
         questdb_db_connect(conf, strlen(conf), &err);
 
+    if (db != NULL)
+    {
+        fprintf(
+            stderr,
+            "smoke pool: eager questdb_db_connect unexpectedly succeeded "
+            "against a closed port\n");
+        questdb_db_close(db);
+        return 1;
+    }
+    if (err == NULL)
+    {
+        fprintf(
+            stderr,
+            "smoke pool: eager connect failed without populating "
+            "err_out\n");
+        return 1;
+    }
+    questdb_error_free(err);
+    return 0;
+}
+
+static int pool_reader_only_phase(void)
+{
+    static const char conf[] = "ws::addr=127.0.0.1:1;lazy_connect=true;";
+
+    questdb_error* err = NULL;
+    struct questdb_db* db =
+        questdb_db_connect(conf, strlen(conf), &err);
+
     /*
-     * Lazy pool: connect opens nothing, so it succeeds even against a
-     * guaranteed-closed port.
+     * lazy_connect pool: connect opens nothing, so it succeeds even
+     * against a guaranteed-closed port.
      */
     if (db == NULL)
     {
@@ -353,6 +388,10 @@ cleanup:
 int main(void)
 {
     int rc = closed_port_phase();
+    if (rc != 0)
+        return rc;
+
+    rc = pool_eager_connect_fails_phase();
     if (rc != 0)
         return rc;
 

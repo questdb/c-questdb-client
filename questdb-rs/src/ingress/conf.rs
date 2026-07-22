@@ -281,8 +281,9 @@ pub(crate) struct QwpWsConfig {
     /// round, matching Java's startup behavior.
     pub(crate) initial_connect_retry: ConfigSetting<QwpWsInitialConnectMode>,
     /// `true` when `initial_connect_retry` was promoted from a `reconnect_*`
-    /// key rather than chosen by the user; pool borrows ignore the promoted
-    /// mode (see `default_async_initial_connect`).
+    /// key rather than chosen by the user. An explicit builder-setter call
+    /// replaces a promoted mode instead of conflicting with it (see
+    /// `demote_promoted_initial_connect_retry`).
     pub(crate) initial_connect_retry_promoted: bool,
     /// Bounded wait used by Sender::close_drain().
     pub(crate) close_flush_timeout: ConfigSetting<std::time::Duration>,
@@ -433,18 +434,6 @@ impl QwpWsConfig {
         if self.initial_connect_retry_promoted {
             self.initial_connect_retry = ConfigSetting::new_default(QwpWsInitialConnectMode::Off);
             self.initial_connect_retry_promoted = false;
-        }
-    }
-
-    /// Pool-borrow variant of `force_async_initial_connect`: default the
-    /// initial connect to the background runner so a borrow can buffer while
-    /// the server is away, but let a mode the user chose explicitly win. The
-    /// `Sync` promoted from `reconnect_*` keys does not count as explicit —
-    /// the pool's background runner already applies the reconnect budget to
-    /// its initial connect, which is what that promotion exists to ensure.
-    pub(crate) fn default_async_initial_connect(&mut self) {
-        if !self.initial_connect_retry.is_specified() || self.initial_connect_retry_promoted {
-            self.force_async_initial_connect();
         }
     }
 }

@@ -5402,8 +5402,11 @@ mod tests {
         }
 
         fn conf(&self) -> String {
+            // lazy_connect: these tests exercise the store-and-forward borrow
+            // model (buffer locally, background connect), not eager startup.
             format!(
-                "ws::addr=127.0.0.1:{};sender_pool_min=1;sender_pool_max=2;close_flush_timeout_millis=50;",
+                "ws::addr=127.0.0.1:{};sender_pool_min=1;sender_pool_max=2;\
+                 close_flush_timeout_millis=50;lazy_connect=true;",
                 self.port
             )
         }

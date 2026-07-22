@@ -60,7 +60,8 @@ _SRC = "arrow_db"  # column sidecar SEND shape that drives Db::flush_arrow_batch
 
 def _connect_string(http_ports: list[int], *, request_durable_ack: bool = False,
                     reconnect_max_ms: int = 60_000,
-                    close_flush_timeout_ms: int = 5_000) -> str:
+                    close_flush_timeout_ms: int = 5_000,
+                    lazy: bool = True) -> str:
     """Direct Arrow facade connect string (``ws`` schema).
 
     ``request_durable_ack`` defaults off: ``flush_arrow_batch`` then waits for
@@ -82,6 +83,8 @@ def _connect_string(http_ports: list[int], *, request_durable_ack: bool = False,
         "sender_pool_min=1",
         "sender_pool_max=1",
     ]
+    if lazy:
+        parts.append("lazy_connect=true")
     if request_durable_ack:
         parts.append("request_durable_ack=on")
     return ";".join(parts) + ";"
@@ -126,10 +129,10 @@ def test_arrow_db_flush_against_stale_primary_at_first_send_c_client_rust(
     scenario_dir: Path,
 ) -> None:
     """Stale primary: the configured primary is already gone before the FIRST
-    send. ``QuestDb::connect`` is lazy (opens a sender only on first borrow), so
-    the first ``flush_arrow_batch`` is what binds a connection -- it must reach
-    the live successor on the configured address rather than failing on the
-    dead one."""
+    send. The pool is configured with ``lazy_connect=true`` (a sender opens
+    only on first borrow), so the first ``flush_arrow_batch`` is what binds a
+    connection -- it must reach the live successor on the configured address
+    rather than failing on the dead one."""
     table = "trades_arrow_db_stale_c_client_rust"
     row_count = 50
 
@@ -158,6 +161,31 @@ def test_arrow_db_flush_against_stale_primary_at_first_send_c_client_rust(
 
     wait_for_dense_sequence(port=p1_ports.pg, table=table,
                             expected_count=row_count, timeout_s=60.0)
+
+
+@pytest.mark.c_client
+@pytest.mark.c_client_rust
+def test_arrow_db_eager_connect_against_live_primary_c_client_rust(
+    server_factory,
+    c_client_rust_column_sidecar: CClientRustColumnSidecar,
+    scenario_dir: Path,
+) -> None:
+    """The eager default (no ``lazy_connect``): ``connect`` pre-opens the
+    warm sender minimum against the live primary, so the first flush rides an
+    already-established connection. Covers the startup path every C, C++, and
+    Python user now gets by default."""
+    table = "trades_arrow_db_eager_connect_c_client_rust"
+
+    p1 = server_factory("p1")
+    p1_ports = p1.start()
+    c_client_rust_column_sidecar.connect(
+        _connect_string([p1_ports.http], lazy=False))
+
+    c_client_rust_column_sidecar.send(table, count=25, start_index=0, src=_SRC)
+    _flush_with_failover_retry(c_client_rust_column_sidecar)
+
+    wait_for_dense_sequence(port=p1_ports.pg, table=table,
+                            expected_count=25, timeout_s=90.0)
 
 
 @pytest.mark.c_client
@@ -251,8 +279,8 @@ def test_arrow_db_flush_across_inplace_role_switch_c_client_rust(
         time.sleep(0.5)
     assert rejected, "flush_arrow_batch was NOT rejected on the read-only replica"
 
-    # Drop the buffered probe row + reset the pool (CONNECT is lazy, so this
-    # does not open a connection against the replica).
+    # Drop the buffered probe row + reset the pool (lazy_connect is set, so
+    # this does not open a connection against the replica).
     c_client_rust_column_sidecar.connect(_connect_string([p1_ports.http]))
 
     # Promote back to primary IN PLACE.

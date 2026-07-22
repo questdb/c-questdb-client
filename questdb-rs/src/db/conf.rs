@@ -26,8 +26,8 @@
 //!
 //! Extracts pool-specific keys (`sender_pool_min`, `sender_pool_max`,
 //! `query_pool_min`, `query_pool_max`, `acquire_timeout_ms`,
-//! `idle_timeout_ms`, `pool_reap` — names and defaults matching the Java
-//! client's `QuestDBBuilder`), detects explicit disk-backed
+//! `idle_timeout_ms`, `pool_reap`, `lazy_connect` — names and defaults
+//! matching the Java client's `QuestDBBuilder`), detects explicit disk-backed
 //! store-and-forward opt-in (`sf_dir`), enforces a QWP/WebSocket schema, and
 //! produces a sanitized conf string that the underlying
 //! [`crate::ingress::SenderBuilder`] can consume to build connections.
@@ -73,6 +73,12 @@ pub(crate) struct PoolConfig {
     pub(crate) acquire_timeout: Duration,
     pub(crate) idle_timeout: Duration,
     pub(crate) pool_reap: PoolReap,
+    /// `lazy_connect=true` tolerates a down server at startup, matching the
+    /// Java client: no warm-minimum pre-connect, ingest borrows connect in
+    /// the background, and `query_pool_min` defaults to 0. Off by default:
+    /// `connect()` pre-opens the warm minimums and fails fast, honoring
+    /// `initial_connect_retry`.
+    pub(crate) lazy_connect: bool,
 }
 
 impl Default for PoolConfig {
@@ -85,6 +91,7 @@ impl Default for PoolConfig {
             acquire_timeout: DEFAULT_ACQUIRE_TIMEOUT,
             idle_timeout: DEFAULT_IDLE_TIMEOUT,
             pool_reap: PoolReap::Auto,
+            lazy_connect: false,
         }
     }
 }
@@ -124,6 +131,8 @@ pub(crate) fn parse(conf: &str) -> Result<ParsedConf> {
 
     let mut pool = PoolConfig::default();
     let mut sf_dir_specified = false;
+    let mut query_pool_min_specified = false;
+    let mut initial_connect_retry: Option<String> = None;
 
     walk_params(params, |key, value| {
         // `sf_dir` selects disk-backed store-and-forward slots;
@@ -161,6 +170,7 @@ pub(crate) fn parse(conf: &str) -> Result<ParsedConf> {
             }
             "query_pool_min" => {
                 pool.query_pool_min = parse_pool_usize(key, value)?;
+                query_pool_min_specified = true;
             }
             "query_pool_max" => {
                 let value = parse_pool_usize(key, value)?;
@@ -191,6 +201,31 @@ pub(crate) fn parse(conf: &str) -> Result<ParsedConf> {
                     }
                 };
             }
+            "lazy_connect" => {
+                // Java conf strings write true/false; accept on/off too,
+                // case-insensitively, matching initial_connect_retry's
+                // grammar. Deliberately NOT widened into parse_on_off:
+                // request_durable_ack must keep the builder's strict on/off
+                // grammar or the pool would accept values the builder then
+                // rejects.
+                pool.lazy_connect = match value.to_ascii_lowercase().as_str() {
+                    "on" | "true" => true,
+                    "off" | "false" => false,
+                    other => {
+                        return Err(error::fmt!(
+                            ConfigError,
+                            "Invalid value for \"lazy_connect\" (expected \
+                             'true' or 'false'): {:?}",
+                            other
+                        ));
+                    }
+                };
+            }
+            "initial_connect_retry" => {
+                // Parsed by the SenderBuilder; recorded here only for the
+                // lazy_connect conflict check below.
+                initial_connect_retry = Some(value.to_owned());
+            }
             "pool_size" | "pool_max" | "pool_idle_timeout_ms" => {
                 return Err(error::fmt!(
                     ConfigError,
@@ -213,6 +248,63 @@ pub(crate) fn parse(conf: &str) -> Result<ParsedConf> {
         }
         Ok(())
     })?;
+
+    // lazy_connect needs BOTH sides to start non-blocking, matching the Java
+    // client: an explicit knob that forces a blocking / fail-fast startup is
+    // a configuration conflict, rejected with a remedy rather than silently
+    // overridden.
+    if pool.lazy_connect {
+        // Conflict only for modes the ingress parser recognizes as blocking;
+        // an unrecognized value falls through to the SenderBuilder's
+        // invalid-value error instead of a misleading conflict message.
+        // Reusing the parser keeps this check from drifting when a mode is
+        // added there.
+        let blocking_mode = initial_connect_retry
+            .as_deref()
+            .filter(|mode| crate::ingress::initial_connect_retry_value_is_blocking(mode));
+        if let Some(mode) = blocking_mode {
+            return Err(error::fmt!(
+                ConfigError,
+                "conflicting configuration: lazy_connect=true needs a non-blocking \
+                 startup, but initial_connect_retry={} makes the initial connect \
+                 block / fail-fast. Resolve by removing initial_connect_retry \
+                 (lazy_connect implies initial_connect_retry=async) or setting \
+                 initial_connect_retry=async.",
+                mode
+            ));
+        }
+        if query_pool_min_specified && pool.query_pool_min > 0 {
+            return Err(error::fmt!(
+                ConfigError,
+                "conflicting configuration: lazy_connect=true needs query_pool_min=0 \
+                 (the read pool connects lazily on first use and must not fail-fast \
+                 at startup), but query_pool_min={} was set. Resolve by removing \
+                 query_pool_min (lazy_connect defaults it to 0) or setting \
+                 query_pool_min=0.",
+                pool.query_pool_min
+            ));
+        }
+        pool.query_pool_min = 0;
+    } else if pool.query_pool_min > 0
+        && initial_connect_retry
+            .as_deref()
+            .is_some_and(crate::ingress::initial_connect_retry_value_is_sync)
+    {
+        // Same cross-surface consistency rule as the lazy conflicts above:
+        // explicit sync means "retry my startup connects", but readers have
+        // no retry mode, so a reader pre-open would still fail fast and make
+        // the sync promise a half-truth. Refuse the combination with a
+        // remedy instead.
+        return Err(error::fmt!(
+            ConfigError,
+            "conflicting configuration: initial_connect_retry=sync retries the \
+             eager ingest pre-opens, but readers have no retry mode and \
+             query_pool_min={} would still fail fast at startup. Resolve by \
+             setting query_pool_min=0 (readers then connect on first use) or \
+             using lazy_connect=true.",
+            pool.query_pool_min
+        ));
+    }
 
     if pool.sender_pool_min > pool.sender_pool_max {
         return Err(error::fmt!(
