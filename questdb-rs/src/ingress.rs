@@ -86,6 +86,8 @@ pub(crate) mod ndarr;
 
 mod timestamp;
 
+pub(crate) mod gorilla;
+
 mod buffer;
 pub use buffer::*;
 

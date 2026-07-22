@@ -36,6 +36,9 @@ pub(crate) const QWP_VERSION_1: u8 = 1;
 /// `QwpBuffer::encode_ws_message`).
 pub(crate) const QWP_FLAG_DEFER_COMMIT: u8 = 0x01;
 pub(crate) const QWP_FLAG_DELTA_SYMBOL_DICT: u8 = 0x08;
+/// Message-header flag: timestamp columns carry a per-column encoding
+/// discriminator (raw vs Gorilla delta-of-delta).
+pub(crate) const QWP_FLAG_GORILLA: u8 = 0x04;
 pub(crate) const QWP_HEADER_LEN: usize = 12;
 
 // Wire type codes — duplicated from `buffer/qwp.rs`. See the QWP v1 spec

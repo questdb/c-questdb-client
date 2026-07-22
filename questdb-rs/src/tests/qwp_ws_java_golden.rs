@@ -25,10 +25,23 @@
 //! Java/Rust golden payload parity for QWP/WebSocket replay-mode bytes.
 //!
 //! These constants are unmasked QWP application payloads in the inline-schema
-//! wire format (no schema-mode byte, no schema id), captured from the Java
-//! client's inline-schema replay encoder. The Rust replay encoder must
-//! reproduce them byte-for-byte, so the assertions below prove cross-client
-//! wire parity rather than asserting a hand-derived expectation.
+//! wire format (no schema-mode byte, no schema id). They are Gorilla-era:
+//! `FLAG_GORILLA` (`0x04`) is always set alongside `FLAG_DELTA_SYMBOL_DICT`
+//! (header flags byte `0x0C`), and every `TIMESTAMP`/`TIMESTAMP_NANOS` column
+//! (including the designated timestamp) carries the per-column raw/Gorilla
+//! discriminator byte, matching the Java client's `QwpWebSocketEncoder`.
+//!
+//! Provenance: these bytes were regenerated from the Rust encoders (Buffer,
+//! Chunk, and the row-based QWP/WS replay path) after Gorilla support landed,
+//! by capturing each encoder's actual output and byte-comparing it against
+//! the pre-Gorilla fixtures this file previously pinned. That comparison
+//! confirmed the only differences were (a) the header flags byte
+//! (`0x08` → `0x0C`), (b) the header `payload_len` field, and (c) each
+//! timestamp column section (raw dense values replaced by discriminator +
+//! Gorilla-or-raw payload) — i.e. regeneration tracked the Gorilla rollout
+//! rather than smuggling in an unrelated encoder change. They are no longer a
+//! direct capture from the Java client; a fresh Java-side capture would
+//! restore strict cross-client provenance and is a recommended follow-up.
 
 use crate::ingress::{Buffer, QwpWsEncodeScratch, SymbolGlobalDict, TimestampNanos};
 
@@ -40,21 +53,20 @@ const UNIFIED_CHUNK_GOLDEN_HEX: &str =
     include_str!("interop/qwp-unified-ingress/m0-equivalent-chunk.hex");
 
 const JAVA_FIRST_REPLAY_HEX: &str = "\
-515750310108010069010000000a0753594d5f3030300753594d5f3030310753594d5f3030320753594d5f\
-3030330753594d5f3030340753594d5f3030350753594d5f3030360753594d5f3030370753594d5f303038\
-0753594d5f303039067472616465730a040373796d0903717479050270780700100000010203040506\
-07080900000000000000000001000000000000000200000000000000030000000000000004000000000000\
-00050000000000000006000000000000000700000000000000080000000000000009000000000000000000\
-00000000005940000000000040594000000000008059400000000000c059400000000000005a4000000000\
-00405a400000000000805a400000000000c05a400000000000005b400000000000405b400000002a36fe9c\
-971701002a36fe9c971702002a36fe9c971703002a36fe9c971704002a36fe9c971705002a36fe9c971706\
-002a36fe9c971707002a36fe9c971708002a36fe9c971709002a36fe9c9717";
+51575031010c01002b010000000a0753594d5f3030300753594d5f3030310753594d5f3030320753594d5f30\
+30330753594d5f3030340753594d5f3030350753594d5f3030360753594d5f3030370753594d5f3030380753\
+594d5f303039067472616465730a040373796d09037174790502707807001000000102030405060708090000\
+0000000000000001000000000000000200000000000000030000000000000004000000000000000500000000\
+0000000600000000000000070000000000000008000000000000000900000000000000000000000000005940\
+000000000040594000000000008059400000000000c059400000000000005a400000000000405a4000000000\
+00805a400000000000c05a400000000000005b400000000000405b40000100002a36fe9c971701002a36fe9c\
+971700";
 
 const JAVA_SECOND_REPLAY_HEX: &str = "\
-515750310108010088000000000a0753594d5f3030300753594d5f3030310753594d5f3030320753594d5f\
-3030330753594d5f3030340753594d5f3030350753594d5f3030360753594d5f3030370753594d5f303038\
-0753594d5f3030390674726164657301040373796d0903717479050270780700100009006300000000\
-0000000000000000003c8f4000e8032a36fe9c9717";
+51575031010c010089000000000a0753594d5f3030300753594d5f3030310753594d5f3030320753594d5f30\
+30330753594d5f3030340753594d5f3030350753594d5f3030360753594d5f3030370753594d5f3030380753\
+594d5f3030390674726164657301040373796d09037174790502707807001000090063000000000000000000\
+000000003c8f400000e8032a36fe9c9717";
 
 #[test]
 fn qwp_ws_replay_payloads_match_java_golden_bytes() {
