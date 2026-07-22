@@ -108,11 +108,13 @@ else
     --features polars,sync-sender-qwp-ws,sync-sender-http \
     --example $EXAMPLE"
 fi
+BENCH_STATUS=0
 ./ssmx.sh run client "${JAVA_ENV_EXPORT}export PATH=/root/.cargo/bin:\$PATH; \
 cd /opt/qwp-bench/c-questdb-client/questdb-rs && mkdir -p $OUT_BOX && \
-{ time env $BENCH_ENV $BENCH_CMD > $OUT_BOX/$CLIENT_KIND-$DIRECTION.json ; } \
-    2> $OUT_BOX/$CLIENT_KIND-$DIRECTION.log; \
-tail -5 $OUT_BOX/$CLIENT_KIND-$DIRECTION.log" 14400
+{ time env $BENCH_ENV $BENCH_CMD > $OUT_BOX/$CLIENT_KIND-$DIRECTION.json; \
+  bench_status=\$?; } 2> $OUT_BOX/$CLIENT_KIND-$DIRECTION.log; \
+tail -5 $OUT_BOX/$CLIENT_KIND-$DIRECTION.log || true; \
+exit \$bench_status" 14400 || BENCH_STATUS=$?
 
 echo "== stop sar, render text, collect"
 for box in server client; do
@@ -122,6 +124,17 @@ sar -f $OUT_BOX/sar-$box.bin -n DEV > $OUT_BOX/sar-$box-net.txt 2>/dev/null; \
 aws s3 cp --recursive $OUT_BOX s3://$(qnb_bucket)/results/$LABEL/ >/dev/null; echo uploaded"
 done
 aws s3 cp --recursive "s3://$(qnb_bucket)/results/$LABEL/" "$OUT_LOCAL/" >/dev/null
+
+RESULT_FILE="$OUT_LOCAL/$CLIENT_KIND-$DIRECTION.json"
+JSON_STATUS=0
+if [ ! -s "$RESULT_FILE" ]; then
+    JSON_STATUS=1
+else
+    jq -e 'type == "object"' "$RESULT_FILE" >/dev/null 2>&1 || JSON_STATUS=$?
+fi
+if [ "$JSON_STATUS" -ne 0 ]; then
+    echo "ERROR: missing, empty, malformed, or non-object benchmark JSON: $RESULT_FILE" >&2
+fi
 
 echo "== channel measurement + sidecar"
 IPERF_NOTE="not-measured-this-cell"
@@ -146,3 +159,11 @@ jq -n \
 
 echo "== done: $OUT_LOCAL"
 ls -la "$OUT_LOCAL"
+
+if [ "$BENCH_STATUS" -ne 0 ]; then
+    echo "ERROR: benchmark command failed with status $BENCH_STATUS" >&2
+    exit "$BENCH_STATUS"
+fi
+if [ "$JSON_STATUS" -ne 0 ]; then
+    exit "$JSON_STATUS"
+fi
