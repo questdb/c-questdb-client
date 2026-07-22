@@ -1218,8 +1218,8 @@ def change_column_type_to(col_type: str, rnd: Rng) -> str:
     wire only carries LONG and skipped columns become LONG-NULL on the
     server. Narrowing to BYTE/SHORT then causes the server to reject
     every row that omits the column ("integer value null out of range
-    for SHORT"), which the DropAndContinue policy silently swallows on
-    the client. We therefore leave integer columns alone.
+    for SHORT"), which is now a terminal schema rejection on the client.
+    We therefore leave integer columns alone.
     """
     if col_type == 'STRING':
         return 'SYMBOL' if rnd.next_boolean() else 'VARCHAR'

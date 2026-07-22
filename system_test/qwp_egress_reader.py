@@ -39,8 +39,8 @@ from questdb_line_sender import (  # type: ignore[attr-defined]
 
 
 # ---------------------------------------------------------------------------
-# Column-kind discriminants (mirror `line_reader_column_kind` in
-# `include/questdb/egress/line_reader.h`).
+# Column-kind discriminants (mirror `qwp_reader_column_kind` in
+# `include/questdb/egress/qwp_reader.h`).
 # ---------------------------------------------------------------------------
 
 KIND_BOOLEAN = 0x01
@@ -121,7 +121,7 @@ class _LineReaderError(ctypes.Structure):
 # reader and sender share a single ctypes type per C struct (see import above).
 
 
-# `line_reader_column_data` from `line_reader.h:1156`.
+# `qwp_reader_column_data` from `qwp_reader.h:1156`.
 class _LineReaderColumnData(ctypes.Structure):
     _fields_ = [
         ("kind", _c_uint32),
@@ -138,7 +138,7 @@ class _LineReaderColumnData(ctypes.Structure):
     ]
 
 
-# `line_reader_array_data` from `line_reader.h:1208`.
+# `qwp_reader_array_data` from `qwp_reader.h:1208`.
 class _LineReaderArrayData(ctypes.Structure):
     _fields_ = [
         ("kind", _c_uint32),
@@ -153,12 +153,12 @@ class _LineReaderArrayData(ctypes.Structure):
     ]
 
 
-# `line_reader_symbol_entry`.
+# `qwp_reader_symbol_entry`.
 class _LineReaderSymbolEntry(ctypes.Structure):
     _fields_ = [("offset", _c_uint32), ("length", _c_uint32)]
 
 
-# `line_reader_symbol_dict`.
+# `qwp_reader_symbol_dict`.
 class _LineReaderSymbolDict(ctypes.Structure):
     _fields_ = [
         ("entry_count", _c_size_t),
@@ -188,15 +188,15 @@ def _setsig(name: str, restype, *argtypes) -> None:
 
 # Reader lifecycle.
 _setsig(
-    "line_reader_from_conf",
+    "qwp_reader_from_conf",
     ctypes.POINTER(_LineReader),
     _LineSenderUtf8,
     ctypes.POINTER(ctypes.POINTER(_LineReaderError)),
 )
-_setsig("line_reader_close", None, ctypes.POINTER(_LineReader))
+_setsig("qwp_reader_close", None, ctypes.POINTER(_LineReader))
 
 _setsig(
-    "line_reader_execute",
+    "qwp_reader_execute",
     ctypes.POINTER(_LineReaderCursor),
     ctypes.POINTER(_LineReader),
     _LineSenderUtf8,
@@ -204,19 +204,19 @@ _setsig(
 )
 
 # Cursor.
-_setsig("line_reader_cursor_free", None, ctypes.POINTER(_LineReaderCursor))
+_setsig("qwp_reader_cursor_free", None, ctypes.POINTER(_LineReaderCursor))
 _setsig(
-    "line_reader_cursor_next_batch",
+    "qwp_reader_cursor_next_batch",
     ctypes.POINTER(_LineReaderBatch),
     ctypes.POINTER(_LineReaderCursor),
     ctypes.POINTER(ctypes.POINTER(_LineReaderError)),
 )
 
 # Batch introspection.
-_setsig("line_reader_batch_row_count", _c_size_t, ctypes.POINTER(_LineReaderBatch))
-_setsig("line_reader_batch_column_count", _c_size_t, ctypes.POINTER(_LineReaderBatch))
+_setsig("qwp_reader_batch_row_count", _c_size_t, ctypes.POINTER(_LineReaderBatch))
+_setsig("qwp_reader_batch_column_count", _c_size_t, ctypes.POINTER(_LineReaderBatch))
 _setsig(
-    "line_reader_batch_column_kind",
+    "qwp_reader_batch_column_kind",
     _c_bool,
     ctypes.POINTER(_LineReaderBatch),
     _c_size_t,
@@ -224,7 +224,7 @@ _setsig(
     ctypes.POINTER(ctypes.POINTER(_LineReaderError)),
 )
 _setsig(
-    "line_reader_batch_column_name",
+    "qwp_reader_batch_column_name",
     _c_bool,
     ctypes.POINTER(_LineReaderBatch),
     _c_size_t,
@@ -233,7 +233,7 @@ _setsig(
     ctypes.POINTER(ctypes.POINTER(_LineReaderError)),
 )
 _setsig(
-    "line_reader_batch_column_data",
+    "qwp_reader_batch_column_data",
     _c_bool,
     ctypes.POINTER(_LineReaderBatch),
     _c_size_t,
@@ -241,7 +241,7 @@ _setsig(
     ctypes.POINTER(ctypes.POINTER(_LineReaderError)),
 )
 _setsig(
-    "line_reader_batch_array_column_data",
+    "qwp_reader_batch_array_column_data",
     _c_bool,
     ctypes.POINTER(_LineReaderBatch),
     _c_size_t,
@@ -249,7 +249,7 @@ _setsig(
     ctypes.POINTER(ctypes.POINTER(_LineReaderError)),
 )
 _setsig(
-    "line_reader_batch_symbol_dict",
+    "qwp_reader_batch_symbol_dict",
     _c_bool,
     ctypes.POINTER(_LineReaderBatch),
     ctypes.POINTER(_LineReaderSymbolDict),
@@ -257,14 +257,14 @@ _setsig(
 )
 
 # Reader error handling.
-_setsig("line_reader_error_get_code", _c_int32, ctypes.POINTER(_LineReaderError))
+_setsig("questdb_error_get_code", _c_int32, ctypes.POINTER(_LineReaderError))
 _setsig(
-    "line_reader_error_msg",
+    "questdb_error_msg",
     _c_char_p,
     ctypes.POINTER(_LineReaderError),
     ctypes.POINTER(_c_size_t),
 )
-_setsig("line_reader_error_free", None, ctypes.POINTER(_LineReaderError))
+_setsig("questdb_error_free", None, ctypes.POINTER(_LineReaderError))
 
 
 # ---------------------------------------------------------------------------
@@ -275,26 +275,26 @@ class ReaderError(RuntimeError):
     """Raised when an FFI call sets `err_out` or a handle comes back NULL."""
 
     def __init__(self, code: int, message: str) -> None:
-        super().__init__(f"line_reader error (code={code}): {message}")
+        super().__init__(f"reader error (code={code}): {message}")
         self.code = code
         self.message = message
 
 
 def _take_error(err_ptr) -> ReaderError:
-    """Build a ReaderError from a populated `line_reader_error*` and free it.
+    """Build a ReaderError from a populated `questdb_error*` and free it.
 
     `err_ptr` is the pointer variable the FFI wrote into (i.e. an
     instance of `ctypes.POINTER(_LineReaderError)`), not a byref to it.
     """
-    code = int(_DLL.line_reader_error_get_code(err_ptr))
+    code = int(_DLL.questdb_error_get_code(err_ptr))
     msg_len = _c_size_t(0)
-    raw = _DLL.line_reader_error_msg(err_ptr, ctypes.byref(msg_len))
+    raw = _DLL.questdb_error_msg(err_ptr, ctypes.byref(msg_len))
     msg = (
         bytes(ctypes.string_at(raw, msg_len.value)).decode("utf-8", "replace")
         if raw and msg_len.value
         else ""
     )
-    _DLL.line_reader_error_free(err_ptr)
+    _DLL.questdb_error_free(err_ptr)
     return ReaderError(code, msg)
 
 
@@ -814,7 +814,7 @@ class QwpEgressReader:
     def __init__(self, conf: str):
         utf8 = _utf8(conf)
         err_ref = ctypes.POINTER(_LineReaderError)()
-        handle = _DLL.line_reader_from_conf(utf8, ctypes.byref(err_ref))
+        handle = _DLL.qwp_reader_from_conf(utf8, ctypes.byref(err_ref))
         if not handle:
             raise _take_error(err_ref)
         self._handle = handle
@@ -828,7 +828,7 @@ class QwpEgressReader:
 
     def close(self) -> None:
         if not self._closed:
-            _DLL.line_reader_close(self._handle)
+            _DLL.qwp_reader_close(self._handle)
             self._closed = True
 
     def select(self, sql: str) -> Tuple[List[dict], List[list]]:
@@ -844,7 +844,7 @@ class QwpEgressReader:
             raise RuntimeError("reader is closed")
         sql_utf8 = _utf8(sql)
         err_ref = ctypes.POINTER(_LineReaderError)()
-        cursor = _DLL.line_reader_execute(
+        cursor = _DLL.qwp_reader_execute(
             self._handle, sql_utf8, ctypes.byref(err_ref)
         )
         if not cursor:
@@ -852,7 +852,7 @@ class QwpEgressReader:
         try:
             return self._drain_cursor(cursor)
         finally:
-            _DLL.line_reader_cursor_free(cursor)
+            _DLL.qwp_reader_cursor_free(cursor)
 
     def _drain_cursor(self, cursor) -> Tuple[List[dict], List[list]]:
         columns: List[dict] = []
@@ -860,7 +860,7 @@ class QwpEgressReader:
         first_batch = True
         while True:
             err_ref = ctypes.POINTER(_LineReaderError)()
-            batch = _DLL.line_reader_cursor_next_batch(
+            batch = _DLL.qwp_reader_cursor_next_batch(
                 cursor, ctypes.byref(err_ref)
             )
             if not batch:
@@ -868,8 +868,8 @@ class QwpEgressReader:
                 if err_ref:
                     raise _take_error(err_ref)
                 return columns, rows
-            col_count = int(_DLL.line_reader_batch_column_count(batch))
-            row_count = int(_DLL.line_reader_batch_row_count(batch))
+            col_count = int(_DLL.qwp_reader_batch_column_count(batch))
+            row_count = int(_DLL.qwp_reader_batch_row_count(batch))
             # Cache column names on the first batch; QuestDB guarantees they
             # don't change mid-query.
             if first_batch:
@@ -900,7 +900,7 @@ class QwpEgressReader:
             name_ptr = _c_char_p()
             name_len = _c_size_t(0)
             err_ref = ctypes.POINTER(_LineReaderError)()
-            ok = _DLL.line_reader_batch_column_name(
+            ok = _DLL.qwp_reader_batch_column_name(
                 batch,
                 col_idx,
                 ctypes.byref(name_ptr),
@@ -922,14 +922,14 @@ class QwpEgressReader:
     def _snapshot_symbol_dict(self, batch) -> Tuple[bytes, List[Tuple[int, int]]]:
         dict_struct = _LineReaderSymbolDict()
         err_ref = ctypes.POINTER(_LineReaderError)()
-        ok = _DLL.line_reader_batch_symbol_dict(
+        ok = _DLL.qwp_reader_batch_symbol_dict(
             batch, ctypes.byref(dict_struct), ctypes.byref(err_ref)
         )
         if not ok:
             # No SYMBOL columns in the batch is not an error — but the FFI
             # signals it via err_out anyway. Free the error and return empty.
             if err_ref:
-                _DLL.line_reader_error_free(err_ref)
+                _DLL.questdb_error_free(err_ref)
             return b"", []
         heap = _read_bytes(dict_struct.heap, int(dict_struct.heap_len))
         entries: List[Tuple[int, int]] = []
@@ -948,7 +948,7 @@ class QwpEgressReader:
     ) -> Tuple[str, list]:
         kind_out = _c_uint32(0)
         err_ref = ctypes.POINTER(_LineReaderError)()
-        if not _DLL.line_reader_batch_column_kind(
+        if not _DLL.qwp_reader_batch_column_kind(
             batch, col_idx, ctypes.byref(kind_out), ctypes.byref(err_ref)
         ):
             raise _take_error(err_ref)
@@ -956,7 +956,7 @@ class QwpEgressReader:
         if kind in (KIND_DOUBLE_ARRAY, KIND_LONG_ARRAY):
             arr = _LineReaderArrayData()
             err_ref = ctypes.POINTER(_LineReaderError)()
-            if not _DLL.line_reader_batch_array_column_data(
+            if not _DLL.qwp_reader_batch_array_column_data(
                 batch, col_idx, ctypes.byref(arr), ctypes.byref(err_ref)
             ):
                 raise _take_error(err_ref)
@@ -964,7 +964,7 @@ class QwpEgressReader:
             return _decode_array(arr, elem)
         col = _LineReaderColumnData()
         err_ref = ctypes.POINTER(_LineReaderError)()
-        if not _DLL.line_reader_batch_column_data(
+        if not _DLL.qwp_reader_batch_column_data(
             batch, col_idx, ctypes.byref(col), ctypes.byref(err_ref)
         ):
             raise _take_error(err_ref)
@@ -1005,7 +1005,15 @@ _DISPATCH = {
 def query_table_sorted(conf: str, table_name: str) -> Tuple[List[dict], List[list]]:
     """Convenience: open reader, run `SELECT * FROM '<t>' ORDER BY timestamp`,
     close. Returns the same `(columns, rows)` shape `_query_table_sorted` used
-    to return from /exec."""
+    to return from /exec.
+
+    The transient "cached query plan cannot be used because table schema has
+    changed" condition (an async `ALTER COLUMN TYPE` bumping the table's
+    metadata version between a SELECT's compilation and execution) is handled
+    transparently inside the reader itself: `Cursor::next_batch` re-issues the
+    query on the same connection so the server recompiles. It never surfaces
+    here, so no client-side retry is needed.
+    """
     sql = f"SELECT * FROM '{table_name}' ORDER BY timestamp"
     with QwpEgressReader(conf) as r:
         return r.select(sql)

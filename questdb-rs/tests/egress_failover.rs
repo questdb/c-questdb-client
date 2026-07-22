@@ -29,7 +29,7 @@
 //! spins up one or more mocks, points the Reader at the address list,
 //! and verifies the cursor's reconnect/replay behaviour.
 
-#![cfg(feature = "sync-reader-ws")]
+#![cfg(feature = "sync-reader-qwp-ws")]
 
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
@@ -38,8 +38,9 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use questdb::ErrorCode;
 use questdb::egress::{
-    ColumnView, ErrorCode, FailoverEvent, FailoverPhase, FailoverProgressEvent, Reader, ServerRole,
+    ColumnView, FailoverPhase, FailoverProgressEvent, FailoverResetEvent, Reader, ServerRole,
 };
 use tungstenite::handshake::server::{Request, Response};
 use tungstenite::http::HeaderValue;
@@ -114,6 +115,12 @@ enum BatchColumn {
     Long(Vec<i64>),
     /// DOUBLE column named `d`.
     Double(Vec<f64>),
+    /// SYMBOL column named `s`, carried in connection-scoped delta-dict
+    /// mode (`FLAG_DELTA_SYMBOL_DICT`). `dict` is the full delta the
+    /// batch appends starting at conn-id 0 (so each connection rebuilds
+    /// its dict from scratch); `codes` are the per-row ids that index it.
+    #[cfg_attr(not(feature = "arrow"), allow(dead_code))]
+    Symbol { dict: Vec<String>, codes: Vec<u32> },
 }
 
 /// Single-table `RESULT_BATCH` frame carrying one non-null column. The
@@ -124,15 +131,35 @@ fn result_batch_frame(request_id: i64, batch_seq: u64, column: &BatchColumn) -> 
     // Egress wire type codes (`ColumnKind::as_u8`).
     const KIND_LONG: u8 = 0x05;
     const KIND_DOUBLE: u8 = 0x07;
+    const KIND_SYMBOL: u8 = 0x09;
     const NULL_FLAG_NONE: u8 = 0x00;
+    // Frame header flag: SYMBOL columns ride the connection-scoped dict,
+    // so the batch carries the delta-dict section (`flags::DELTA_SYMBOL_DICT`).
+    const FLAG_DELTA_SYMBOL_DICT: u8 = 0x08;
     let (name, kind, row_count) = match column {
         BatchColumn::Long(v) => ("v", KIND_LONG, v.len()),
         BatchColumn::Double(v) => ("d", KIND_DOUBLE, v.len()),
+        BatchColumn::Symbol { codes, .. } => ("s", KIND_SYMBOL, codes.len()),
+    };
+    let flags = match column {
+        BatchColumn::Symbol { .. } => FLAG_DELTA_SYMBOL_DICT,
+        _ => 0,
     };
     let mut payload = Vec::new();
     payload.push(MSG_RESULT_BATCH);
     payload.extend_from_slice(&request_id.to_le_bytes());
     encode_varint_u64(batch_seq, &mut payload);
+    // Delta-dict section rides immediately after `batch_seq` when
+    // FLAG_DELTA_SYMBOL_DICT is set: `delta_start, delta_count, [len+bytes]...`.
+    // Each connection rebuilds its dict from id 0, so delta_start is 0.
+    if let BatchColumn::Symbol { dict, .. } = column {
+        encode_varint_u64(0, &mut payload); // delta_start
+        encode_varint_u64(dict.len() as u64, &mut payload); // delta_count
+        for entry in dict {
+            encode_varint_u64(entry.len() as u64, &mut payload);
+            payload.extend_from_slice(entry.as_bytes());
+        }
+    }
     encode_varint_u64(0, &mut payload); // empty table name
     encode_varint_u64(row_count as u64, &mut payload);
     if batch_seq == 0 {
@@ -153,8 +180,13 @@ fn result_batch_frame(request_id: i64, batch_seq: u64, column: &BatchColumn) -> 
                 payload.extend_from_slice(&v.to_le_bytes());
             }
         }
+        BatchColumn::Symbol { codes, .. } => {
+            for code in codes {
+                encode_varint_u64(*code as u64, &mut payload);
+            }
+        }
     }
-    framed(1, 0, 1, &payload)
+    framed(1, flags, 1, &payload)
 }
 
 /// `QUERY_ERROR` frame: `[0x13, request_id i64 LE, status u8, msg_len u16 LE, msg_bytes...]`.
@@ -237,7 +269,7 @@ enum Action {
     StallUpgrade(Duration),
     /// Send a single WS binary message verbatim. Lets a script deliver
     /// a malformed/corrupt frame and assert the client's decode-error
-    /// path (which is deliberately not failover-eligible).
+    /// failover path.
     SendRaw(Vec<u8>),
     /// Abortive close: set `SO_LINGER=0` on the TCP socket and drop
     /// it, causing the kernel to send a TCP RST instead of a FIN.
@@ -690,21 +722,6 @@ fn drop_at_connect_script() -> Script {
     vec![Action::HardDrop]
 }
 
-/// Sends SERVER_INFO (so `connect_endpoint` succeeds), then drops the
-/// TCP stream **before** reading the client's QUERY_REQUEST. The
-/// client's `write_message(QUERY_REQUEST)` race-fails on this dead
-/// socket — exercises the M3 path where reconnect succeeds but the
-/// immediate replay write fails.
-fn drop_after_server_info_script(role: ServerRole, node_id: &str) -> Script {
-    vec![
-        Action::SendServerInfo {
-            role,
-            node_id: node_id.into(),
-        },
-        Action::HardDrop,
-    ]
-}
-
 fn build_addr_list(servers: &[&MockServer]) -> String {
     servers
         .iter()
@@ -832,6 +849,49 @@ fn happy_path_no_failover() {
     );
 }
 
+// ---------------------------------------------------------------------------
+// connect_timeout: bound the TCP dial (native non-blocking connect + poll),
+// surfacing a distinct, failover-eligible ConnectTimeout on expiry.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn connect_timeout_set_does_not_break_a_reachable_connect() {
+    // A reachable endpoint must still connect normally with connect_timeout
+    // set — the budget bounds only the dial, and the mock accepts instantly.
+    let srv = MockServer::start(vec![happy_script(ServerRole::Standalone, "n1")]);
+    let conf = format!("ws::addr={};connect_timeout=5000", srv.url());
+    let mut reader = Reader::from_conf(&conf).expect("reachable connect within budget");
+    let mut cursor = reader.prepare("select 1").execute().expect("execute");
+    assert!(cursor.next_batch().expect("next").is_none());
+}
+
+#[test]
+fn connect_timeout_fires_against_a_blackhole_endpoint() {
+    // 192.0.2.1 is RFC 5737 TEST-NET-1: globally unrouted, so the SYN is
+    // dropped and the dial blocks until connect_timeout fires (instead of the
+    // OS default, which is tens of seconds). `failover=off` so the single
+    // timed-out dial surfaces immediately rather than retrying the budget.
+    let conf = "ws::addr=192.0.2.1:19009;connect_timeout=300;failover=off";
+    let start = Instant::now();
+    let err = match Reader::from_conf(conf) {
+        Err(e) => e,
+        Ok(_) => panic!("dialing a blackhole endpoint must not succeed"),
+    };
+    let elapsed = start.elapsed();
+    assert_eq!(
+        err.code(),
+        ErrorCode::ConnectTimeout,
+        "expected ConnectTimeout, got {:?}: {}",
+        err.code(),
+        err.msg()
+    );
+    assert!(
+        elapsed < Duration::from_secs(5),
+        "the dial must be bounded by connect_timeout (~300ms), took {:?}",
+        elapsed
+    );
+}
+
 #[test]
 fn cache_reset_mid_stream_does_not_break_cursor() {
     // The server emits CACHE_RESET to invalidate the per-connection
@@ -871,6 +931,182 @@ fn cache_reset_mid_stream_does_not_break_cursor() {
     assert_eq!(cursor.failover_resets(), 0);
 }
 
+// ---------------------------------------------------------------------------
+// Transient stale-cached-plan recovery (server INTERNAL_ERROR, status 0x06).
+//
+// An async `ALTER COLUMN TYPE` can bump a table's metadata version between a
+// query's server-side compilation and its execution; the server then rejects
+// its own cached plan with INTERNAL_ERROR. The reader must absorb this
+// transparently — re-issue on the same healthy connection so the server
+// recompiles — and never surface it to the caller. These pin that contract
+// against the scripted mock so it can't regress into user-visible friction.
+// ---------------------------------------------------------------------------
+
+/// `0x06` INTERNAL_ERROR — the catch-all the server folds every transient
+/// fault into, including the stale-cached-plan condition.
+const STATUS_INTERNAL_ERROR: u8 = 0x06;
+
+/// The exact server message shape (`9.x` QuestDB) for the stale-plan fault.
+fn stale_plan_message() -> String {
+    "cached query plan cannot be used because table schema has changed \
+     [table=weather0, expectedTableId=33, actualTableId=33, \
+     expectedMetadataVersion=61, actualMetadataVersion=62]"
+        .to_string()
+}
+
+#[test]
+fn stale_cached_plan_internal_error_is_transparently_retried() {
+    // One connection: the first query is rejected with the transient
+    // stale-plan INTERNAL_ERROR, the cursor silently re-issues on the SAME
+    // connection (second AwaitQueryRequest), and the recompiled query then
+    // streams a normal batch + RESULT_END. The caller must see only the
+    // successful rows — never the error.
+    let srv = MockServer::start(vec![vec![
+        Action::SendServerInfo {
+            role: ServerRole::Standalone,
+            node_id: "n1".into(),
+        },
+        Action::AwaitQueryRequest,
+        Action::SendQueryError {
+            status: STATUS_INTERNAL_ERROR,
+            message: stale_plan_message(),
+        },
+        // The transparent replay lands here on the same connection.
+        Action::AwaitQueryRequest,
+        Action::SendBatch {
+            batch_seq: 0,
+            column: BatchColumn::Long(vec![1, 2]),
+        },
+        Action::SendResultEnd,
+    ]]);
+    let conf = format!("ws::addr={}", srv.url());
+    let mut reader = Reader::from_conf(&conf).expect("connect");
+    let mut cursor = reader.prepare("select 1").execute().expect("execute");
+
+    {
+        let view = cursor
+            .next_batch()
+            .expect("stale-plan error must be absorbed, not surfaced")
+            .expect("recompiled query must yield its batch");
+        assert_eq!(view.row_count(), 2);
+        let ColumnView::Long(c) = view.column(0).expect("col 0") else {
+            panic!("replayed column should decode as Long");
+        };
+        assert_eq!((c.value(0), c.value(1)), (1, 2));
+    }
+    assert!(
+        cursor.next_batch().expect("terminal").is_none(),
+        "RESULT_END must terminate the cursor cleanly after the silent retry"
+    );
+    // Exactly one transparent retry; no failover/reconnect was involved.
+    assert_eq!(cursor.stale_plan_retries(), 1);
+    assert_eq!(cursor.failover_resets(), 0);
+    // One connection served the whole exchange — the retry stayed in place.
+    assert_eq!(srv.accepts(), 1, "retry must reuse the same connection");
+}
+
+#[test]
+fn non_stale_internal_error_still_surfaces_to_caller() {
+    // A generic INTERNAL_ERROR (same status byte, different message) is NOT
+    // the stale-plan condition and must surface unchanged — swallowing every
+    // 0x06 would hide real server faults.
+    let srv = MockServer::start(vec![vec![
+        Action::SendServerInfo {
+            role: ServerRole::Standalone,
+            node_id: "n1".into(),
+        },
+        Action::AwaitQueryRequest,
+        Action::SendQueryError {
+            status: STATUS_INTERNAL_ERROR,
+            message: "table reader is distressed: out of file handles".to_string(),
+        },
+    ]]);
+    let conf = format!("ws::addr={}", srv.url());
+    let mut reader = Reader::from_conf(&conf).expect("connect");
+    let mut cursor = reader.prepare("select 1").execute().expect("execute");
+
+    let err = match cursor.next_batch() {
+        Err(e) => e,
+        Ok(_) => panic!("a non-stale internal error must surface, not be swallowed"),
+    };
+    assert_eq!(err.code(), ErrorCode::ServerInternalError);
+    assert_eq!(cursor.stale_plan_retries(), 0);
+    assert_eq!(srv.accepts(), 1, "no retry, so no second connection");
+}
+
+#[test]
+fn stale_cached_plan_after_rows_delivered_surfaces() {
+    // The load-bearing `!data_delivered` guard: once a batch has been handed
+    // to the caller, a later stale-plan error CANNOT be replayed (that would
+    // re-stream consumed rows). It must surface instead.
+    let srv = MockServer::start(vec![vec![
+        Action::SendServerInfo {
+            role: ServerRole::Standalone,
+            node_id: "n1".into(),
+        },
+        Action::AwaitQueryRequest,
+        Action::SendBatch {
+            batch_seq: 0,
+            column: BatchColumn::Long(vec![7, 8, 9]),
+        },
+        Action::SendQueryError {
+            status: STATUS_INTERNAL_ERROR,
+            message: stale_plan_message(),
+        },
+    ]]);
+    let conf = format!("ws::addr={}", srv.url());
+    let mut reader = Reader::from_conf(&conf).expect("connect");
+    let mut cursor = reader.prepare("select 1").execute().expect("execute");
+
+    {
+        let view = cursor
+            .next_batch()
+            .expect("first next_batch")
+            .expect("batch present");
+        assert_eq!(view.row_count(), 3);
+    }
+    let err = match cursor.next_batch() {
+        Err(e) => e,
+        Ok(_) => panic!("stale-plan error after delivery must surface, not replay"),
+    };
+    assert_eq!(err.code(), ErrorCode::ServerInternalError);
+    assert_eq!(cursor.stale_plan_retries(), 0);
+}
+
+#[test]
+fn stale_cached_plan_retry_budget_exhausts_and_surfaces() {
+    // A table under relentless schema churn keeps returning the stale-plan
+    // error. The cursor must retry a bounded number of times and then
+    // surface the error rather than loop forever. Script
+    // `MAX_STALE_PLAN_RETRIES + 1` (= 16) error replies; the cursor spends
+    // its 15 retries and surfaces on the 16th.
+    let mut script = vec![Action::SendServerInfo {
+        role: ServerRole::Standalone,
+        node_id: "n1".into(),
+    }];
+    // 16 = MAX_STALE_PLAN_RETRIES (15) + the final un-retried surface.
+    for _ in 0..16 {
+        script.push(Action::AwaitQueryRequest);
+        script.push(Action::SendQueryError {
+            status: STATUS_INTERNAL_ERROR,
+            message: stale_plan_message(),
+        });
+    }
+    let srv = MockServer::start(vec![script]);
+    let conf = format!("ws::addr={}", srv.url());
+    let mut reader = Reader::from_conf(&conf).expect("connect");
+    let mut cursor = reader.prepare("select 1").execute().expect("execute");
+
+    let err = match cursor.next_batch() {
+        Err(e) => e,
+        Ok(_) => panic!("exhausted retry budget must surface the stale-plan error"),
+    };
+    assert_eq!(err.code(), ErrorCode::ServerInternalError);
+    assert_eq!(cursor.stale_plan_retries(), 15);
+    // All retries stayed on the one connection.
+    assert_eq!(srv.accepts(), 1);
+}
+
 #[test]
 fn mid_query_close_triggers_failover() {
     // Server A: closes after QUERY_REQUEST. Server B: completes.
@@ -888,11 +1124,11 @@ fn mid_query_close_triggers_failover() {
         "initial connect lands on A"
     );
 
-    let observed: Arc<Mutex<Vec<FailoverEvent>>> = Arc::new(Mutex::new(Vec::new()));
+    let observed: Arc<Mutex<Vec<FailoverResetEvent>>> = Arc::new(Mutex::new(Vec::new()));
     let observed_clone = Arc::clone(&observed);
     let mut cursor = reader
         .prepare("select 1")
-        .on_failover_reset(move |ev: &FailoverEvent| {
+        .on_failover_reset(move |ev: &FailoverResetEvent| {
             observed_clone.lock().unwrap().push(ev.clone());
         })
         .execute()
@@ -1072,11 +1308,11 @@ fn failover_after_batch_replays_and_rereads_schema() {
     );
 
     let mut reader = Reader::from_conf(&conf).expect("connect to A");
-    let observed: Arc<Mutex<Vec<FailoverEvent>>> = Arc::new(Mutex::new(Vec::new()));
+    let observed: Arc<Mutex<Vec<FailoverResetEvent>>> = Arc::new(Mutex::new(Vec::new()));
     let observed_clone = Arc::clone(&observed);
     let mut cursor = reader
         .prepare("select 1")
-        .on_failover_reset(move |ev: &FailoverEvent| {
+        .on_failover_reset(move |ev: &FailoverResetEvent| {
             observed_clone.lock().unwrap().push(ev.clone());
         })
         .execute()
@@ -1119,6 +1355,159 @@ fn failover_after_batch_replays_and_rereads_schema() {
     assert_eq!(events[0].new_addr.port, srv_b.addr.port());
 }
 
+/// `Cursor::as_arrow_reader` pins the first batch's schema. A transparent
+/// mid-query failover re-reads from `batch_seq 0` on the new node; when that
+/// replay carries the **same** schema the reader must keep yielding batches
+/// (and `schema()` must stay stable), not poison.
+#[cfg(feature = "arrow-egress")]
+#[test]
+fn failover_arrow_reader_same_schema_continues() {
+    let srv_a = MockServer::start(vec![vec![
+        Action::SendServerInfo {
+            role: ServerRole::Standalone,
+            node_id: "a".into(),
+        },
+        Action::AwaitQueryRequest,
+        Action::SendBatch {
+            batch_seq: 0,
+            column: BatchColumn::Long(vec![1, 2]),
+        },
+        Action::HardDrop,
+    ]]);
+    let srv_b = MockServer::start(vec![vec![
+        Action::SendServerInfo {
+            role: ServerRole::Standalone,
+            node_id: "b".into(),
+        },
+        Action::AwaitQueryRequest,
+        Action::SendBatch {
+            batch_seq: 0,
+            column: BatchColumn::Long(vec![3, 4, 5]),
+        },
+        Action::SendResultEnd,
+    ]]);
+    let conf = format!(
+        "ws::addr={};failover_backoff_initial_ms=1;failover_backoff_max_ms=10",
+        build_addr_list(&[&srv_a, &srv_b])
+    );
+
+    let mut reader = Reader::from_conf(&conf).expect("connect to A");
+    // Install a reset callback so the streaming reader opts into transparent
+    // replay (clears the silent-duplicate guard) and a post-failover batch
+    // actually reaches the adapter instead of `FailoverWouldDuplicate`.
+    let mut cursor = reader
+        .prepare("select 1")
+        .on_failover_reset(|_: &FailoverResetEvent| {})
+        .execute()
+        .expect("execute");
+    {
+        let mut arrow_reader = cursor.as_arrow_reader().expect("first batch + schema");
+        let pinned = arrow_reader.schema();
+
+        // Batch 1: A's pre-drop LONG batch.
+        let b1 = arrow_reader
+            .next()
+            .expect("first item")
+            .expect("first batch ok");
+        assert_eq!(b1.num_rows(), 2);
+        assert_eq!(b1.schema(), pinned);
+
+        // Batch 2: A is gone — fail over to B, whose replayed batch 0 has the
+        // SAME schema, so the reader continues instead of poisoning.
+        let b2 = arrow_reader
+            .next()
+            .expect("post-failover item")
+            .expect("post-failover batch ok");
+        assert_eq!(b2.num_rows(), 3);
+        assert_eq!(b2.schema(), pinned);
+        assert_eq!(
+            arrow_reader.schema(),
+            pinned,
+            "RecordBatchReader::schema must stay stable across failover"
+        );
+
+        assert!(
+            arrow_reader.next().is_none(),
+            "B's RESULT_END terminates the reader cleanly"
+        );
+    }
+    assert_eq!(cursor.failover_resets(), 1);
+}
+
+/// Companion to [`failover_arrow_reader_same_schema_continues`]: when the
+/// post-failover replay carries a **different** schema (B serves DOUBLE where
+/// A served LONG), the adapter cannot keep a stable `schema()`, so it must
+/// surface [`ErrorCode::SchemaDrift`] and poison rather than silently adopt
+/// the new node's schema.
+#[cfg(feature = "arrow-egress")]
+#[test]
+fn failover_arrow_reader_schema_drift_poisons() {
+    let srv_a = MockServer::start(vec![vec![
+        Action::SendServerInfo {
+            role: ServerRole::Standalone,
+            node_id: "a".into(),
+        },
+        Action::AwaitQueryRequest,
+        Action::SendBatch {
+            batch_seq: 0,
+            column: BatchColumn::Long(vec![1, 2]),
+        },
+        Action::HardDrop,
+    ]]);
+    let srv_b = MockServer::start(vec![vec![
+        Action::SendServerInfo {
+            role: ServerRole::Standalone,
+            node_id: "b".into(),
+        },
+        Action::AwaitQueryRequest,
+        Action::SendBatch {
+            batch_seq: 0,
+            column: BatchColumn::Double(vec![1.5, 2.5, 3.5]),
+        },
+        Action::SendResultEnd,
+    ]]);
+    let conf = format!(
+        "ws::addr={};failover_backoff_initial_ms=1;failover_backoff_max_ms=10",
+        build_addr_list(&[&srv_a, &srv_b])
+    );
+
+    let mut reader = Reader::from_conf(&conf).expect("connect to A");
+    // Reset callback opts the streaming reader into transparent replay so the
+    // divergent post-failover batch reaches the adapter (rather than
+    // surfacing `FailoverWouldDuplicate`) and exercises the drift check.
+    let mut cursor = reader
+        .prepare("select 1")
+        .on_failover_reset(|_: &FailoverResetEvent| {})
+        .execute()
+        .expect("execute");
+    {
+        let mut arrow_reader = cursor.as_arrow_reader().expect("first batch + schema");
+
+        // Batch 1: A's LONG batch decodes fine against the pinned schema.
+        let b1 = arrow_reader
+            .next()
+            .expect("first item")
+            .expect("first batch ok");
+        assert_eq!(b1.num_rows(), 2);
+
+        // Batch 2: fail over to B, whose DOUBLE schema diverges from the pinned
+        // LONG schema — surfaced as SchemaDrift, not silently swapped in.
+        let err = arrow_reader
+            .next()
+            .expect("post-failover item present")
+            .expect_err("divergent post-failover schema must yield an error");
+        let qerr = questdb::egress::arrow::try_downcast_questdb(&err)
+            .expect("adapter error downcasts to a questdb Error");
+        assert_eq!(qerr.code(), ErrorCode::SchemaDrift);
+
+        assert!(
+            arrow_reader.next().is_none(),
+            "reader is poisoned after drift"
+        );
+    }
+    assert_eq!(cursor.failover_resets(), 1);
+}
+
 /// Regression pin for the reconnect-path schema clear
 /// (`query_schema = None` in `Reader::reconnect_with_failover`): when
 /// the replayed query's *first* frame from the new node is a
@@ -1155,14 +1544,15 @@ fn failover_replay_continuation_before_schema_rejected() {
         Action::SendResultEnd,
     ]]);
     let conf = format!(
-        "ws::addr={};failover_backoff_initial_ms=1;failover_backoff_max_ms=10",
+        "ws::addr={};failover_max_attempts=2;\
+         failover_backoff_initial_ms=1;failover_backoff_max_ms=10",
         build_addr_list(&[&srv_a, &srv_b])
     );
 
     let mut reader = Reader::from_conf(&conf).expect("connect to A");
     let mut cursor = reader
         .prepare("select 1")
-        .on_failover_reset(|_ev: &FailoverEvent| {})
+        .on_failover_reset(|_ev: &FailoverResetEvent| {})
         .execute()
         .expect("execute");
 
@@ -1177,8 +1567,9 @@ fn failover_replay_continuation_before_schema_rejected() {
 
     // A drops; the reconnect-and-replay itself succeeds, but the new
     // node's first frame is `batch_seq=1` with no schema on this
-    // connection — a decode-level ProtocolError (deliberately not
-    // failover-eligible), not a silent decode against A's schema.
+    // connection. Budget is limited to the first replay, so the
+    // failover-eligible decode error from B surfaces as the original
+    // ProtocolError instead of launching a second replay.
     let err = match cursor.next_batch() {
         Ok(_) => panic!("continuation before the schema-bearing batch 0 must be rejected"),
         Err(e) => e,
@@ -1306,11 +1697,11 @@ fn add_credit_failover_post_conditions_are_consistent() {
     let mut reader = Reader::from_conf(&conf).expect("connect to A");
     assert_eq!(reader.current_addr().port, srv_a.addr.port());
 
-    let observed: Arc<Mutex<Vec<FailoverEvent>>> = Arc::new(Mutex::new(Vec::new()));
+    let observed: Arc<Mutex<Vec<FailoverResetEvent>>> = Arc::new(Mutex::new(Vec::new()));
     let observed_clone = Arc::clone(&observed);
     let mut cursor = reader
         .prepare("select 1")
-        .on_failover_reset(move |ev: &FailoverEvent| {
+        .on_failover_reset(move |ev: &FailoverResetEvent| {
             observed_clone.lock().unwrap().push(ev.clone());
         })
         .execute()
@@ -1461,13 +1852,13 @@ fn failover_disabled_surfaces_socket_error() {
 fn attempts_exhausted_surfaces_error() {
     // A is healthy for the initial connect, then drops mid-query. B
     // is broken at connect-time (drops before SERVER_INFO). With
-    // max_attempts=4, the cursor's first failure should burn 4 outer
+    // max_attempts=4, the cursor's first failure should burn 3 outer
     // reconnect attempts, all of which fail.
     //
     // Dial accounting:
     //   - Initial connect: 1 dial to A (success).
-    //   - Mid-stream failure on A. `reconnect_with_failover` runs
-    //     `attempts_total = 4` outer attempts. Each outer attempt
+    //   - Mid-stream failure on A. `reconnect_with_failover` has 3
+    //     reconnect rounds (`max_attempts - 1`). Each outer round
     //     invokes `walk_via_tracker(allow_reset_pass=true)`:
     //       1. pick B (Unknown < TransportError) → fail
     //       2. pick A (TransportError) → fail
@@ -1475,8 +1866,8 @@ fn attempts_exhausted_surfaces_error() {
     //       4. pick A (lowest-index Unknown) → fail
     //       5. pick B → fail
     //     → 4 dials per outer attempt (2 per host).
-    //   - Reconnect total: 4 × 4 = 16 dials, split A=8, B=8.
-    //   - Grand total: 1 + 16 = 17, with A=9, B=8.
+    //   - Reconnect total: 3 × 4 = 12 dials, split A=6, B=6.
+    //   - Grand total: 1 + 12 = 13, with A=7, B=6.
     let srv_a = MockServer::start(vec![
         drop_after_query_script(ServerRole::Standalone, "a"),
         // Subsequent accepts: TCP-level drop so even the connect fails.
@@ -1504,24 +1895,24 @@ fn attempts_exhausted_surfaces_error() {
         "unexpected code: {:?}",
         err.code()
     );
-    // 1 initial to A + 4 outer reconnects × 4 dials each = 17 total.
+    // 1 initial to A + 3 outer reconnects × 4 dials each = 13 total.
     // A bears the initial + half of each reconnect attempt's 4 dials,
-    // so A=9, B=8.
+    // so A=7, B=6.
     let total = srv_a.accepts() + srv_b.accepts();
     assert_eq!(
         total,
-        17,
-        "expected 17 total dial attempts (1 initial + 4 outer reconnects × 4 dials each); \
+        13,
+        "expected 13 total dial attempts (1 initial + 3 outer reconnects × 4 dials each); \
          got A={}, B={}",
         srv_a.accepts(),
         srv_b.accepts()
     );
     assert_eq!(
         srv_a.accepts(),
-        9,
+        7,
         "A receives the initial + 2 dials per outer attempt"
     );
-    assert_eq!(srv_b.accepts(), 8, "B receives 2 dials per outer attempt");
+    assert_eq!(srv_b.accepts(), 6, "B receives 2 dials per outer attempt");
 }
 
 #[test]
@@ -1733,11 +2124,11 @@ fn backoff_bounded_by_jitter_ceiling() {
     // backoff sleep across the schedule MUST NOT exceed the sum of
     // the per-attempt jitter ceilings.
     //
-    // Setup: initial=20ms, max=200ms, max_attempts=3 → 4 outer
-    // attempts; sleeps between attempts use base 20ms, 40ms, 80ms.
+    // Setup: initial=20ms, max=200ms, max_attempts=3 → 2 reconnect
+    // rounds; sleeps use base 20ms, then 40ms.
     // Sum of bases (= upper bound on total sleep under full-jitter)
-    // is 140ms. The walk itself does host_count × 2 dials per outer
-    // attempt × 4 attempts = 16 dials on loopback. Allow 500ms slack
+    // is 60ms. The walk itself does host_count × 2 dials per outer
+    // attempt × 2 attempts = 8 dials on loopback. Allow generous slack
     // for scheduler noise and connect overhead on busy CI runners.
     let srv_a = MockServer::start(vec![
         drop_after_query_script(ServerRole::Standalone, "a"),
@@ -1753,9 +2144,9 @@ fn backoff_bounded_by_jitter_ceiling() {
     let start = Instant::now();
     let _ = cursor.next_batch();
     let elapsed = start.elapsed();
-    // Sum of jitter ceilings (140ms) + scheduler/connect slack (500ms)
+    // Sum of jitter ceilings (60ms) + scheduler/connect slack (580ms)
     // = 640ms upper bound. A regression that disables the cap or
-    // reverts to deterministic backoff (140ms minimum + dials)
+    // reverts to deterministic backoff (60ms minimum + dials)
     // wouldn't trip this, but one that *runs away* (e.g. backoff
     // doubling without saturation) would push elapsed well over 1s.
     assert!(
@@ -1911,14 +2302,14 @@ fn single_endpoint_failover_exhausts_budget() {
     // Dial accounting with `failover_max_attempts=4`:
     //   - Initial connect: 1 dial (success — serves the query, then drops).
     //   - Mid-stream failure on the single host triggers
-    //     `reconnect_with_failover`, which runs
-    //     `attempts_total = max_attempts = 4` outer reconnect attempts.
+    //     `reconnect_with_failover`, which has 3 reconnect rounds
+    //     (`max_attempts - 1`).
     //   - Each outer attempt invokes `walk_via_tracker(allow_reset_pass=true)`:
     //     pick the host → fail → fall-through reset → re-pick the
     //     same host → fail. That's 2 dials per outer attempt against
     //     the single configured endpoint.
-    //   - Reconnect total: 4 × 2 = 8 dials.
-    //   - Grand total: 1 + 8 = 9. The single per-Execute reconnect
+    //   - Reconnect total: 3 × 2 = 6 dials.
+    //   - Grand total: 1 + 6 = 7. The single per-Execute reconnect
     //     walk returns Err on exhaustion; no outer replay-cycle
     //     wrapper rearms it.
     let srv = MockServer::start(vec![
@@ -1947,53 +2338,38 @@ fn single_endpoint_failover_exhausts_budget() {
         "unexpected code: {:?}",
         err.code()
     );
-    // 1 initial + 4 outer reconnect attempts × 2 dials per attempt
-    // (walk + fall-through reset walk on the single host) = 9.
+    // 1 initial + 3 outer reconnect attempts × 2 dials per attempt
+    // (walk + fall-through reset walk on the single host) = 7.
     assert_eq!(
         srv.accepts(),
-        9,
-        "expected exactly 9 dials against the single endpoint \
-         (1 initial + 4 reconnect attempts × 2 dials per attempt); got {}",
+        7,
+        "expected exactly 7 dials against the single endpoint \
+         (1 initial + 3 reconnect attempts × 2 dials per attempt); got {}",
         srv.accepts()
     );
 }
 
 #[test]
-fn write_fail_after_reconnect_terminates_or_recovers_via_outer_loop() {
-    // A: serves the initial query, then drops mid-stream → triggers
-    // failover. B: accepts the WS upgrade and sends SERVER_INFO (so
-    // `connect_endpoint` returns Ok), then drops before the client's
-    // QUERY_REQUEST write lands. Two paths are possible depending on
-    // when the kernel surfaces B's TCP drop to tungstenite's buffered
-    // send:
-    //   (a) `write_message(QUERY_REQUEST)` to B fails synchronously —
-    //       `failover_reconnect_and_replay` tears the transport down
-    //       and surfaces the write error. No in-call retry: the per-
-    //       Execute `failover_max_duration_ms` budget already burned
-    //       once inside `reconnect_with_failover`, and dialing again
-    //       from here would compound it (this matches the Java
-    //       reference client `QwpQueryClient.executeImpl`, which owns
-    //       one deadline per Execute).
-    //   (b) tungstenite buffers the send and reports `Ok` — the
-    //       cursor returns from the first failover (1 reset callback);
-    //       the next `next_batch` reads from B, sees the close, and
-    //       the per-batch failover loop triggers a *second* outer
-    //       failover that lands on A's recovered slot (2nd callback).
-    // Both outcomes are correct: a single in-call write failure no
-    // longer earns a free second budget, but the per-batch loop's
-    // existing failover machinery still recovers from a delayed read
-    // failure.
+fn replay_write_failure_uses_remaining_execute_budget() {
+    // A: serves the initial query, then drops mid-stream. B: accepts the
+    // reconnect and sends SERVER_INFO, but abortively closes before the
+    // replayed QUERY_REQUEST can land. That failed replay write is the
+    // second Execute attempt in Java's model; with `failover_max_attempts=3`,
+    // the cursor still has one failover round left and should recover on
+    // A's second script.
     let srv_a = MockServer::start(vec![
         drop_after_query_script(ServerRole::Standalone, "a"),
-        // If the test takes path (b), the second failover lands here.
         happy_script(ServerRole::Standalone, "a-recovered"),
     ]);
-    let srv_b = MockServer::start(vec![drop_after_server_info_script(
-        ServerRole::Standalone,
-        "b",
-    )]);
+    let srv_b = MockServer::start(vec![vec![
+        Action::SendServerInfo {
+            role: ServerRole::Standalone,
+            node_id: "b".into(),
+        },
+        Action::AbortiveRst,
+    ]]);
     let conf = format!(
-        "ws::addr={};failover_backoff_initial_ms=1;failover_backoff_max_ms=2",
+        "ws::addr={};failover_max_attempts=3;failover_backoff_initial_ms=0;failover_backoff_max_ms=0",
         build_addr_list(&[&srv_a, &srv_b])
     );
     let mut reader = Reader::from_conf(&conf).expect("connect to A");
@@ -2013,46 +2389,43 @@ fn write_fail_after_reconnect_terminates_or_recovers_via_outer_loop() {
         .execute()
         .expect("execute");
 
-    let outcome = match cursor.next_batch() {
-        Ok(None) => Ok(()),
-        Ok(Some(_)) => panic!("unexpected RESULT_BATCH delivery"),
-        Err(e) => Err((e.code(), e.msg().to_string())),
-    };
+    assert!(
+        cursor.next_batch().expect("must recover via A").is_none(),
+        "recovered query should complete without batches"
+    );
     let r = *resets.lock().unwrap();
+    assert_eq!(
+        cursor.failover_resets(),
+        r,
+        "failover reset counter and callback must move together"
+    );
+    assert!(
+        (1..=2).contains(&r),
+        "expected one reset if B's abortive close is observed on replay write, \
+         or two if the write is accepted locally and the reset is observed on \
+         the next read; got {r}"
+    );
     drop(cursor);
-
-    match outcome {
-        Ok(()) => {
-            // Path (b): cursor recovered through the outer loop after
-            // the first failover landed on B and the read tripped.
-            assert_eq!(
-                r, 2,
-                "path (b) (buffered write to B) must produce exactly 2 reset events"
-            );
-            assert_eq!(
-                reader.current_addr().port,
-                srv_a.addr.port(),
-                "recovered cursor must end up bound to A's recovered slot"
-            );
-        }
-        Err((code, msg)) => {
-            // Path (a): synchronous write fail on B; no callback
-            // fired because we never reached the success branch.
-            // Cursor must surface a transport-class error.
-            assert_eq!(r, 0, "path (a) must not fire a reset callback");
-            assert!(
-                matches!(code, ErrorCode::SocketError | ErrorCode::ProtocolError),
-                "path (a) error must be transport-class; got {:?}: {}",
-                code,
-                msg,
-            );
-        }
-    }
+    assert_eq!(
+        reader.current_addr().port,
+        srv_a.addr.port(),
+        "recovered cursor must end up bound to A's recovered slot"
+    );
+    assert_eq!(
+        srv_a.accepts(),
+        2,
+        "A should see the initial query plus the final successful replay"
+    );
+    assert_eq!(
+        srv_b.accepts(),
+        1,
+        "B should consume exactly one failed replay attempt"
+    );
 }
 
 #[test]
 fn failover_event_attempts_is_cumulative_across_rotations() {
-    // `FailoverEvent.attempts` must be the cumulative reconnect count
+    // `FailoverResetEvent.attempts` must be the cumulative reconnect count
     // across every dial inside the single `reconnect_with_failover`
     // walk that landed — not just the index of the dial that finally
     // succeeded. Force the rotation to skip past one dead endpoint
@@ -2098,12 +2471,12 @@ fn backoff_caps_at_max_ms() {
     // Counterpart to `backoff_grows_between_attempts` (which only
     // checks the lower bound). Here we set the cap WAY below the
     // value the doubling would otherwise reach, then verify that
-    // total elapsed is closer to "8 sleeps × cap" than to "8
+    // total elapsed is closer to "9 sleeps × cap" than to "9
     // sleeps in pure doubling".
     //
-    // initial=10, max=20, max_attempts=8 → 8 sleeps:
-    //   - capped:    10 + 20*7 ≈ 150 ms  (plus dial time)
-    //   - uncapped: 10+20+40+80+160+320+640+1280 ≈ 2550 ms
+    // initial=10, max=20, max_attempts=10 → 9 reconnect rounds:
+    //   - capped:    10 + 20*8 ≈ 170 ms  (plus dial time)
+    //   - uncapped: 10+20+40+80+160+320+640+1280+2560 ≈ 5110 ms
     // Anything well below the uncapped figure proves the `.min(max_ms)`
     // is firing.
     let srv_a = MockServer::start(vec![
@@ -2112,7 +2485,7 @@ fn backoff_caps_at_max_ms() {
     ]);
     let srv_b = MockServer::start(vec![drop_at_connect_script()]);
     let conf = format!(
-        "ws::addr={};failover_max_attempts=8;failover_backoff_initial_ms=10;failover_backoff_max_ms=20",
+        "ws::addr={};failover_max_attempts=10;failover_backoff_initial_ms=10;failover_backoff_max_ms=20",
         build_addr_list(&[&srv_a, &srv_b])
     );
     let mut reader = Reader::from_conf(&conf).expect("initial connect");
@@ -2120,9 +2493,9 @@ fn backoff_caps_at_max_ms() {
     let start = Instant::now();
     let _ = cursor.next_batch();
     let elapsed = start.elapsed();
-    // A working cap totals ~150 ms of backoff plus the 8 dial round-
-    // trips; an uncapped run would total ~2.55 s of backoff alone
-    // (10+20+40+80+160+320+640+1280) plus dials. The 2 s threshold
+    // A working cap totals ~170 ms of backoff plus the 9 dial round-
+    // trips; an uncapped run would total ~5.11 s of backoff alone
+    // (10+20+40+80+160+320+640+1280+2560) plus dials. The 2 s threshold
     // sits well below the uncapped *backoff floor* and well above any
     // realistic capped run — including the slack a loaded CI runner
     // can add to each dial. Tightening this threshold has bitten us
@@ -2185,24 +2558,12 @@ fn role_filter_propagates_through_failover() {
 }
 
 #[test]
-fn decode_error_does_not_trigger_failover_and_closes_transport() {
+fn decode_error_triggers_failover_before_rows_are_delivered() {
     // Server A serves the initial query, then sends a malformed frame
     // (well-formed QWP1 header, but a bogus msg_kind in the payload that
-    // `decode_frame` will reject). The cursor MUST surface the decode
-    // error as a hard `ProtocolError` — decode failures are deliberately
-    // not failover-eligible (a wire/state bug isn't fixed by reconnecting,
-    // and silently retrying would mask it from the user).
-    //
-    // Server B is a tripwire: any failover attempt would dial B.
-    //
-    // Additionally, the regression we're guarding against is C1 from
-    // the review: on a decode error, the cursor used to leave the WS
-    // open while the server kept streaming frames for the dead
-    // request_id. A subsequent `Reader::prepare()` on the same Reader
-    // would then read those stale frames and trip the cursor's
-    // request_id check. We assert here that a follow-up query on the
-    // same Reader fails at the transport layer (the WS was torn down)
-    // rather than with a stale-request_id ProtocolError.
+    // `decode_frame` will reject). Before any rows have reached the
+    // caller, that corruption is equivalent to a dying endpoint: failover
+    // should replay the query on B instead of surfacing the decode error.
     let bogus_payload = vec![0xEEu8, 0, 0, 0, 0, 0, 0, 0, 0]; // unknown msg_kind.
     let bogus_frame = framed(1, 0, 0, &bogus_payload);
     let srv_a = MockServer::start(vec![vec![
@@ -2230,66 +2591,157 @@ fn decode_error_does_not_trigger_failover_and_closes_transport() {
         .execute()
         .expect("execute");
 
-    let err = match cursor.next_batch() {
-        Err(e) => e,
-        Ok(_) => panic!("must surface a decode error"),
-    };
+    let batch = cursor
+        .next_batch()
+        .expect("decode error should fail over to B");
     assert_eq!(
-        err.code(),
-        ErrorCode::ProtocolError,
-        "decode error must surface as ProtocolError, got {:?}: {}",
-        err.code(),
-        err.msg()
+        batch.map(|b| b.row_count()),
+        None,
+        "B's happy script returns RESULT_END after the replay"
     );
     assert_eq!(
         cursor.failover_resets(),
-        0,
-        "decode errors must not failover"
+        1,
+        "decode errors before delivery should trigger one replay"
     );
     assert_eq!(
         callback_fires.load(Ordering::SeqCst),
-        0,
-        "on_failover_reset must not fire on decode errors"
+        1,
+        "on_failover_reset must fire for a decode-triggered replay"
     );
     assert_eq!(
         srv_b.accepts(),
-        0,
-        "B must never be dialed on a decode error"
+        1,
+        "B must be dialed after the decode error on A"
     );
-    drop(cursor);
+}
 
-    // C1 regression guard: the WS to A was torn down by the cursor,
-    // so any follow-up `query()` on this Reader must fail at the
-    // transport layer (write/read on a closed WS), NOT with a stale
-    // ProtocolError from leftover RESULT_BATCH frames carrying the
-    // previous cursor's request_id. The server-side worker has by
-    // now seen our Close (or the half-closed TCP) and stopped its
-    // script, so any frames the server might have queued are gone.
-    let result = reader
-        .prepare("select 1")
-        .execute()
-        .and_then(|mut c| c.next_batch().map(|_| ()));
-    match result {
-        Err(e) => {
-            // A torn-down WS surfaces as a transport-flavoured failure
-            // (SocketError on the write or read), or — if tungstenite
-            // happened to flush our QUERY_REQUEST onto the socket
-            // before the close fully landed — a HandshakeError from
-            // the next read. ProtocolError with a request_id mismatch
-            // is the regression we're guarding against; spell that
-            // out so a future change can't pretend "it errored, good
-            // enough."
-            let msg = e.msg();
-            assert!(
-                !(e.code() == ErrorCode::ProtocolError && msg.contains("request_id")),
-                "follow-up query saw stale request_id frames — \
-                 the decode-error path failed to close the WS. err: {:?}: {}",
-                e.code(),
-                msg
-            );
-        }
-        Ok(()) => panic!("follow-up query unexpectedly succeeded — the WS to A should be closed"),
+#[test]
+fn decode_error_after_rows_without_callback_refuses_replay() {
+    // Once rows were yielded to a streaming caller, transparent replay would
+    // redeliver them from batch_seq=0. Decode-triggered failover must obey
+    // the same duplicate guard as socket/read failures.
+    let bogus_payload = vec![0xEEu8, 0, 0, 0, 0, 0, 0, 0, 0]; // unknown msg_kind.
+    let bogus_frame = framed(1, 0, 0, &bogus_payload);
+    let srv_a = MockServer::start(vec![vec![
+        Action::SendServerInfo {
+            role: ServerRole::Standalone,
+            node_id: "a".into(),
+        },
+        Action::AwaitQueryRequest,
+        Action::SendBatch {
+            batch_seq: 0,
+            column: BatchColumn::Long(vec![1, 2]),
+        },
+        Action::SendRaw(bogus_frame),
+    ]]);
+    let srv_b = MockServer::start(vec![happy_script(ServerRole::Standalone, "b")]);
+    let conf = format!(
+        "ws::addr={};failover_backoff_initial_ms=1;failover_backoff_max_ms=2",
+        build_addr_list(&[&srv_a, &srv_b])
+    );
+    let mut reader = Reader::from_conf(&conf).expect("connect to A");
+    let mut cursor = reader.prepare("select 1").execute().expect("execute");
+
+    {
+        let view = cursor
+            .next_batch()
+            .expect("first next_batch")
+            .expect("first batch present");
+        assert_eq!(view.row_count(), 2);
     }
+
+    let err = match cursor.next_batch() {
+        Err(e) => e,
+        Ok(_) => panic!("post-delivery decode failover without a callback must refuse to replay"),
+    };
+    assert_eq!(err.code(), ErrorCode::FailoverWouldDuplicate);
+    assert!(
+        err.msg().contains("Trigger: unknown msg_kind"),
+        "duplicate guard should preserve the decode trigger, got: {}",
+        err.msg()
+    );
+    assert_eq!(cursor.failover_resets(), 0);
+    assert_eq!(
+        srv_b.accepts(),
+        0,
+        "duplicate guard must fire before dialing B"
+    );
+}
+
+#[test]
+fn deterministic_decode_error_does_not_drain_failover_budget() {
+    // M6 regression: a server that *deterministically* re-emits a corrupt /
+    // unknown frame for this query must NOT drag the cursor through a
+    // reconnect -> replay -> re-corrupt loop that drains the entire
+    // per-Execute failover budget (one log line per round). Transient wire
+    // corruption (a truncated frame from a dying endpoint) is cured by a
+    // single reconnect to a fresh connection; a *second* consecutive decode
+    // failure on the replayed query is proof the corruption is deterministic
+    // (server bug, version-mismatched MsgKind, mismatched lengths), so the
+    // cursor must fail fast with the decode error instead of replaying
+    // `failover_max_attempts - 1` times.
+    let bogus_payload = vec![0xEEu8, 0, 0, 0, 0, 0, 0, 0, 0]; // unknown msg_kind.
+    let bogus_frame = framed(1, 0, 0, &bogus_payload);
+    // Both endpoints deterministically corrupt: SERVER_INFO, await the
+    // (replayed) query, emit the identical bogus frame. The mock repeats the
+    // last script once its queue is exhausted, so *every* reconnect lands on
+    // the same corruption no matter how many times the cursor ping-pongs.
+    let corrupt_script = |node: &str| {
+        vec![
+            Action::SendServerInfo {
+                role: ServerRole::Standalone,
+                node_id: node.into(),
+            },
+            Action::AwaitQueryRequest,
+            Action::SendRaw(bogus_frame.clone()),
+        ]
+    };
+    let srv_a = MockServer::start(vec![corrupt_script("a")]);
+    let srv_b = MockServer::start(vec![corrupt_script("b")]);
+    // Large reconnect budget + zero backoff: without a decode-specific cap
+    // the cursor would replay 31 times before the budget drained.
+    let conf = format!(
+        "ws::addr={};failover_max_attempts=32;failover_backoff_initial_ms=0;failover_backoff_max_ms=0",
+        build_addr_list(&[&srv_a, &srv_b])
+    );
+    let mut reader = Reader::from_conf(&conf).expect("connect to A");
+    let mut cursor = reader.prepare("select 1").execute().expect("execute");
+
+    let err = match cursor.next_batch() {
+        Err(e) => e,
+        Ok(_) => panic!("deterministic decode corruption must surface an error"),
+    };
+    // The decode error surfaces — not a budget-exhausted SocketError after
+    // dozens of rounds.
+    assert_eq!(
+        err.code(),
+        ErrorCode::ProtocolError,
+        "deterministic decode corruption should surface the decode error, got {:?}: {}",
+        err.code(),
+        err.msg()
+    );
+    assert!(
+        err.msg().contains("unknown msg_kind"),
+        "expected the decode trigger to surface, got: {}",
+        err.msg()
+    );
+    // Decode-driven replays are capped well below the per-Execute budget
+    // (here 31). One replay rules out a transient blip; further consecutive
+    // decode failures are refused.
+    assert!(
+        cursor.failover_resets() <= 1,
+        "deterministic decode corruption must not drain the failover budget; \
+         got {} replays",
+        cursor.failover_resets()
+    );
+    // Initial connect + at most one decode-driven replay.
+    let total_accepts = srv_a.accepts() + srv_b.accepts();
+    assert!(
+        total_accepts <= 3,
+        "server should be dialed only a couple of times (initial + at most \
+         one replay), got {total_accepts}"
+    );
 }
 
 #[test]
@@ -2346,6 +2798,8 @@ fn cancel_write_failure_does_not_trigger_failover() {
     // fix, `cancelling=true` blocks the failover branch in next_batch
     // so transport errors propagate without reconnecting.
     while let Ok(Some(_)) = cursor.next_batch() {}
+
+    assert!(!cursor.connection_reusable());
 
     drop(cursor);
     assert_eq!(
@@ -2631,6 +3085,18 @@ fn failover_resets_counter_after_success_then_exhaustion() {
         1,
         "callback must have fired exactly once"
     );
+    assert_eq!(
+        srv_a.accepts(),
+        3,
+        "A should see the initial query plus exactly one exhausted reconnect walk; \
+         a reset per-failure budget would dial it more often"
+    );
+    assert_eq!(
+        srv_b.accepts(),
+        3,
+        "B should see the successful first reset plus exactly one exhausted reconnect walk; \
+         a reset per-failure budget would dial it more often"
+    );
 
     // Cursor terminal: follow-up next_batch keeps surfacing the
     // exhaustion error (same code as the first call) rather than
@@ -2646,6 +3112,75 @@ fn failover_resets_counter_after_success_then_exhaustion() {
         err.code(),
         "replayed terminal error code must match the originating error"
     );
+}
+
+#[test]
+fn failover_duration_budget_spans_successful_resets() {
+    // The duration budget is per Execute, matching Java
+    // QwpQueryClient. A successful replay must not reset the deadline:
+    // if the first reconnect consumes the wall-clock budget, a second
+    // mid-query failure in the same cursor must give up immediately
+    // rather than earning a fresh failover window.
+    let srv_a = MockServer::start(vec![
+        drop_after_query_script(ServerRole::Standalone, "a"),
+        // Tripwire: if the deadline is incorrectly recreated for the
+        // second failure, the cursor can reconnect here and finish
+        // cleanly instead of surfacing deadline exhaustion.
+        happy_script(ServerRole::Standalone, "a-recovered"),
+    ]);
+    let srv_b = MockServer::start(vec![vec![
+        Action::Sleep(Duration::from_millis(150)),
+        Action::SendServerInfo {
+            role: ServerRole::Standalone,
+            node_id: "b-slow".into(),
+        },
+        Action::AwaitQueryRequest,
+        Action::HardDrop,
+    ]]);
+    let conf = format!(
+        "ws::addr={};failover_max_attempts=5;\
+         failover_backoff_initial_ms=0;failover_backoff_max_ms=0;\
+         failover_max_duration_ms=100",
+        build_addr_list(&[&srv_a, &srv_b])
+    );
+    let mut reader = Reader::from_conf(&conf).expect("connect to A");
+
+    let resets = Arc::new(AtomicUsize::new(0));
+    let resets_cb = Arc::clone(&resets);
+    let mut cursor = reader
+        .prepare("select 1")
+        .on_failover_reset(move |_| {
+            resets_cb.fetch_add(1, Ordering::SeqCst);
+        })
+        .execute()
+        .expect("execute");
+
+    let err = match cursor.next_batch() {
+        Err(e) => e,
+        Ok(_) => panic!("second failure must exhaust the original deadline"),
+    };
+    assert!(
+        err.msg().contains("failover_max_duration_ms")
+            || err.msg().contains("wall-clock budget exhausted")
+            || matches!(
+                err.code(),
+                ErrorCode::SocketError | ErrorCode::ProtocolError
+            ),
+        "unexpected error: code={:?} msg={}",
+        err.code(),
+        err.msg()
+    );
+    assert_eq!(
+        resets.load(Ordering::SeqCst),
+        1,
+        "only the first reconnect should reset successfully"
+    );
+    assert_eq!(
+        srv_a.accepts(),
+        1,
+        "A's recovered slot must not be dialed after the per-Execute deadline is spent"
+    );
+    assert_eq!(srv_b.accepts(), 1, "B is used only for the first reset");
 }
 
 #[test]
@@ -2669,7 +3204,7 @@ fn cursor_current_addr_tracks_failover_endpoint_switch() {
     //      no further reconnects happened.
     //
     // Without (2), users have to keep their own `Endpoint` shadow
-    // copy via `FailoverEvent.new_addr` instead of asking the cursor
+    // copy via `FailoverResetEvent.new_addr` instead of asking the cursor
     // directly — the whole point of adding `Cursor::current_addr`.
     let srv_a = MockServer::start(vec![drop_after_query_script(ServerRole::Standalone, "a")]);
     let srv_b = MockServer::start(vec![happy_script(ServerRole::Standalone, "b")]);
@@ -2691,7 +3226,7 @@ fn cursor_current_addr_tracks_failover_endpoint_switch() {
 
     let mut cursor = reader
         .prepare("select 1")
-        .on_failover_reset(move |ev: &FailoverEvent| {
+        .on_failover_reset(move |ev: &FailoverResetEvent| {
             // The callback receives the new endpoint via the event.
             // Record it; the test verifies `cursor.current_addr()`
             // matches once the closure returns.
@@ -2714,7 +3249,7 @@ fn cursor_current_addr_tracks_failover_endpoint_switch() {
     assert!(cursor.next_batch().expect("next after failover").is_none());
     assert_eq!(cursor.failover_resets(), 1);
 
-    // (2) In-callback observation: the FailoverEvent should already
+    // (2) In-callback observation: the FailoverResetEvent should already
     // describe B, and `cursor.current_addr` should agree once the
     // call completes — both must reflect the new endpoint.
     let cb_addr = observed_in_cb
@@ -2726,7 +3261,7 @@ fn cursor_current_addr_tracks_failover_endpoint_switch() {
     assert_eq!(
         cb_addr.1,
         srv_b.addr.port(),
-        "FailoverEvent.new_addr passed to the callback must be the failover target B"
+        "FailoverResetEvent.new_addr passed to the callback must be the failover target B"
     );
 
     // (3) Post-drain: the cursor's accessor must agree with what
@@ -2787,7 +3322,7 @@ fn failover_callback_runs_before_replayed_read() {
 
     let mut cursor = reader
         .prepare("select 1")
-        .on_failover_reset(move |_ev: &FailoverEvent| {
+        .on_failover_reset(move |_ev: &FailoverResetEvent| {
             *cb_started_clone.lock().unwrap() = Some(Instant::now());
             std::thread::sleep(parked_for);
         })
@@ -2844,7 +3379,7 @@ fn rotation_wraps_to_index_zero_when_failed_is_last() {
     //     failover budget would exhaust, and the final-endpoint
     //     assertion would fail.
     //
-    // `failover_max_attempts=3` (so `attempts_total=2`) keeps the
+    // `failover_max_attempts=3` (two reconnect rounds) keeps the
     // budget tight: only ONE failover dial is permitted to land,
     // forcing the rotation to be correct on the first try.
     let s0 = MockServer::start(vec![
@@ -2894,7 +3429,7 @@ fn rotation_wraps_to_index_zero_when_failed_is_last() {
     );
 
     // S1 and S2 must NOT have been dialed during failover. With
-    // `attempts_total=2` and a successful first dial, only one
+    // With two reconnect rounds and a successful first dial, only one
     // failover attempt happens and it must hit S0 (the wrap target).
     // If S1 or S2 saw a connect during failover, the rotation
     // produced a different first index. (Initial-walk dials count
@@ -3534,7 +4069,7 @@ fn tracker_fall_through_reset_gives_dead_hosts_a_second_pass() {
     // A: happy initial + drops mid-stream + recovers on the 3rd accept.
     // B: drop_at_connect on accept #1, then recovers.
     //
-    // With `failover_max_attempts=3` (attempts_total=2), the test
+    // With `failover_max_attempts=3` (two reconnect rounds), the test
     // forces the fall-through reset to be the path that recovers.
     let srv_a = MockServer::start(vec![
         drop_after_query_script(ServerRole::Standalone, "a"),
@@ -3587,8 +4122,8 @@ fn tracker_fall_through_reset_gives_dead_hosts_a_second_pass() {
 /// be re-walked indefinitely inside a single outer attempt.
 #[test]
 fn tracker_fall_through_reset_runs_at_most_once_per_outer_attempt() {
-    // 1 host, failover_max_attempts=3 (attempts_total=3 outer
-    // reconnect attempts). Each outer attempt: walk (1 dial) +
+    // 1 host, failover_max_attempts=3 (two reconnect rounds).
+    // Each outer round: walk (1 dial) +
     // fall-through reset walk (1 dial) = 2 dials.
     let srv = MockServer::start(vec![
         drop_after_query_script(ServerRole::Standalone, "x"),
@@ -3606,14 +4141,14 @@ fn tracker_fall_through_reset_runs_at_most_once_per_outer_attempt() {
     drop(cursor);
     drop(reader);
 
-    // attempts_total=3 outer attempts × 2 dials per attempt = 6
-    // reconnect dials. Plus 1 initial = 7. If the fall-through reset
+    // Two reconnect rounds × 2 dials per round = 4
+    // reconnect dials. Plus 1 initial = 5. If the fall-through reset
     // were not bounded to one pass, this would be unbounded (the
     // walk would loop forever resetting and re-walking).
     assert_eq!(
         srv.accepts(),
-        7,
-        "expected 1 initial + 3 outer reconnect attempts × 2 dials/attempt; got {}",
+        5,
+        "expected 1 initial + 2 outer reconnect attempts × 2 dials/attempt; got {}",
         srv.accepts()
     );
 }
@@ -3947,7 +4482,7 @@ fn failover_max_duration_caps_total_wall_clock() {
 
 /// `failover_max_duration_ms=0` is the documented "unbounded"
 /// sentinel — the deadline branch must be entirely inert. With
-/// `max_attempts=1` (one reconnect attempt) and a dead host, the
+/// `max_attempts=2` (one reconnect attempt) and a dead host, the
 /// attempts cap should bound the loop, not the (absent) deadline.
 #[test]
 fn failover_max_duration_zero_means_unbounded() {
@@ -3956,7 +4491,7 @@ fn failover_max_duration_zero_means_unbounded() {
         drop_at_connect_script(),
     ]);
     let conf = format!(
-        "ws::addr={};failover_max_attempts=1;\
+        "ws::addr={};failover_max_attempts=2;\
          failover_backoff_initial_ms=1;failover_backoff_max_ms=2;\
          failover_max_duration_ms=0",
         srv.url()
@@ -4121,7 +4656,7 @@ fn reader_migrates_to_worker_thread_with_concurrent_stats_polling() {
     let reader = Reader::from_conf(&conf).expect("connect");
     // Clone the stats Arc on main BEFORE the Reader migrates, so the
     // monitor thread reads counters via its own Arc handle — exactly
-    // what the FFI does (`line_reader` stashes an `Arc<ReaderStats>`
+    // what the FFI does (`reader` stashes an `Arc<ReaderStats>`
     // clone next to the `UnsafeCell<Reader>` for the same reason).
     let stats = std::sync::Arc::clone(reader.stats());
 
@@ -4418,16 +4953,16 @@ fn progress_callback_gave_up_on_single_endpoint_exhaustion() {
         events
     );
 
-    // Retrying fires once per outer-loop iteration. With
-    // failover_max_attempts=4, attempts_total=4.
+    // Retrying fires once per reconnect round. With
+    // failover_max_attempts=4, three rounds are available.
     let retrying: Vec<_> = events
         .iter()
         .filter(|e| e.phase == FailoverPhase::Retrying)
         .collect();
     assert_eq!(
         retrying.len(),
-        4,
-        "expected exactly 4 Retrying events (attempts_total=4): {:?}",
+        3,
+        "expected exactly 3 Retrying events: {:?}",
         events
     );
     // Attempts must be strictly increasing.
@@ -4441,9 +4976,9 @@ fn progress_callback_gave_up_on_single_endpoint_exhaustion() {
     }
 }
 
-// NOTE: the "progress callback alone unlocks replay after data
-// delivered" branch is covered by the C++ mock-driven test in
-// `cpp_test/test_line_reader_mock.cpp`. The reset-callback flavour of
+// NOTE: the C++ mock-driven test in `cpp_test/test_reader_mock.cpp` pins
+// that a progress callback alone does not authorize replay after data has
+// reached the caller. The reset-callback flavour of
 // replay-after-data — including the schema re-read from the new node's
 // batch 0 — is covered here via `Action::SendBatch` in
 // `failover_after_batch_replays_and_rereads_schema`, and the
@@ -4479,7 +5014,7 @@ fn progress_and_reset_callbacks_both_fire_on_reset() {
                 order_p.lock().unwrap().push("progress.reset");
             }
         })
-        .on_failover_reset(move |_ev: &FailoverEvent| {
+        .on_failover_reset(move |_ev: &FailoverResetEvent| {
             order_r.lock().unwrap().push("reset");
         })
         .execute()
@@ -4554,5 +5089,312 @@ fn progress_callback_disconnected_fires_before_any_dial() {
     assert!(
         disconnected_before_first_retry.load(std::sync::atomic::Ordering::SeqCst),
         "Disconnected must fire before the first Retrying"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// F4 — egress read failover wired into the materialise-whole DataFrame
+//      helpers. `fetch_all_polars` / `fetch_all_arrow` install an internal
+//      reset opt-in and discard their partial accumulation on a mid-query
+//      failover, so replay-from-batch-0 yields a complete, in-order result.
+//      The streaming entry points (`iter_polars`) deliberately keep
+//      surfacing `FailoverWouldDuplicate`.
+// ---------------------------------------------------------------------------
+
+/// Server A: schema-bearing batch 0, then drop mid-stream. Server B:
+/// the full result (its own batch 0 + a continuation + RESULT_END).
+/// Shared by the F4 materialise-whole and streaming scenarios so both
+/// see the identical "data delivered, then connection dies" sequence.
+#[cfg(feature = "polars")]
+fn f4_drop_after_batch_servers() -> (MockServer, MockServer) {
+    let srv_a = MockServer::start(vec![vec![
+        Action::SendServerInfo {
+            role: ServerRole::Standalone,
+            node_id: "a".into(),
+        },
+        Action::AwaitQueryRequest,
+        Action::SendBatch {
+            batch_seq: 0,
+            column: BatchColumn::Long(vec![1, 2]),
+        },
+        Action::HardDrop,
+    ]]);
+    let srv_b = MockServer::start(vec![vec![
+        Action::SendServerInfo {
+            role: ServerRole::Standalone,
+            node_id: "b".into(),
+        },
+        Action::AwaitQueryRequest,
+        Action::SendBatch {
+            batch_seq: 0,
+            column: BatchColumn::Long(vec![10, 20]),
+        },
+        Action::SendBatch {
+            batch_seq: 1,
+            column: BatchColumn::Long(vec![30]),
+        },
+        Action::SendResultEnd,
+    ]]);
+    (srv_a, srv_b)
+}
+
+/// Materialise-whole path: a mid-query failover after the first batch
+/// must replay transparently — the internal reset opt-in clears the
+/// silent-duplicate guard, the partial accumulation from server A is
+/// discarded, and `fetch_all_polars` returns B's complete, in-order
+/// result exactly once (no A rows, no duplicates).
+#[test]
+#[cfg(feature = "polars")]
+fn fetch_all_polars_failover_after_batch_yields_complete_result() {
+    let (srv_a, srv_b) = f4_drop_after_batch_servers();
+    let conf = format!(
+        "ws::addr={};failover_backoff_initial_ms=1;failover_backoff_max_ms=10",
+        build_addr_list(&[&srv_a, &srv_b])
+    );
+
+    let mut reader = Reader::from_conf(&conf).expect("connect to A");
+    // No user callback: the helper installs its own internal reset.
+    let mut cursor = reader.prepare("select 1").execute().expect("execute");
+
+    let df = cursor
+        .fetch_all_polars()
+        .expect("materialise-whole must replay transparently");
+
+    assert_eq!(cursor.failover_resets(), 1, "exactly one reset to server B");
+    assert_eq!(df.height(), 3, "A's partial batch must be discarded");
+    let col = df.select_at_idx(0).unwrap();
+    assert_eq!(col.name().as_str(), "v");
+    let series = col.as_materialized_series();
+    let vals = series.i64().expect("LONG column");
+    assert_eq!(
+        (vals.get(0), vals.get(1), vals.get(2)),
+        (Some(10), Some(20), Some(30)),
+        "result must be B's rows in order, with no carry-over from A"
+    );
+}
+
+/// Same `fetch_all_polars` transparency, but a user-supplied
+/// `on_failover_reset` is already installed: the helper must leave it in
+/// place (not clobber the caller's contract) and still produce the
+/// complete result. The callback fires exactly once.
+#[test]
+#[cfg(feature = "polars")]
+fn fetch_all_polars_preserves_user_reset_callback() {
+    let (srv_a, srv_b) = f4_drop_after_batch_servers();
+    let conf = format!(
+        "ws::addr={};failover_backoff_initial_ms=1;failover_backoff_max_ms=10",
+        build_addr_list(&[&srv_a, &srv_b])
+    );
+
+    let mut reader = Reader::from_conf(&conf).expect("connect to A");
+    let resets = Arc::new(AtomicUsize::new(0));
+    let resets_cb = Arc::clone(&resets);
+    let mut cursor = reader
+        .prepare("select 1")
+        .on_failover_reset(move |_ev: &FailoverResetEvent| {
+            resets_cb.fetch_add(1, Ordering::SeqCst);
+        })
+        .execute()
+        .expect("execute");
+
+    let df = cursor.fetch_all_polars().expect("replay transparently");
+    assert_eq!(df.height(), 3);
+    assert_eq!(
+        resets.load(Ordering::SeqCst),
+        1,
+        "the user-installed reset callback must still fire"
+    );
+}
+
+/// Streaming path: the same drop-after-batch scenario through
+/// `iter_polars` must NOT silently reset — one batch has already left
+/// the iterator, so a mid-query failover surfaces
+/// `FailoverWouldDuplicate` for the consumer to re-issue.
+#[test]
+#[cfg(feature = "polars")]
+fn iter_polars_failover_after_batch_surfaces_would_duplicate() {
+    let (srv_a, srv_b) = f4_drop_after_batch_servers();
+    let conf = format!(
+        "ws::addr={};failover_backoff_initial_ms=1;failover_backoff_max_ms=10",
+        build_addr_list(&[&srv_a, &srv_b])
+    );
+
+    let mut reader = Reader::from_conf(&conf).expect("connect to A");
+    let mut cursor = reader.prepare("select 1").execute().expect("execute");
+
+    let mut iter = cursor.iter_polars().expect("iter_polars");
+
+    // First DataFrame: A's batch 0, before the drop.
+    let first = iter
+        .next()
+        .expect("first item present")
+        .expect("first batch ok");
+    assert_eq!(first.height(), 2);
+
+    // Second pull observes A's drop. A batch already left the iterator
+    // and no replay opt-in is installed on this streaming path, so the
+    // cursor refuses to replay.
+    let err = match iter.next() {
+        Some(Err(e)) => e,
+        other => panic!("streaming failover must surface an error; got {:?}", other),
+    };
+    assert_eq!(err.code(), ErrorCode::FailoverWouldDuplicate);
+
+    drop(iter);
+    assert_eq!(
+        cursor.failover_resets(),
+        0,
+        "the guard must fire before any reconnect on the streaming path"
+    );
+}
+
+/// Materialise-whole Arrow path mirrors the polars one:
+/// `fetch_all_arrow` discards its partial batch vector on the mid-query
+/// failover and returns B's complete batch set, pinned to B's schema.
+#[test]
+#[cfg(feature = "polars")]
+fn fetch_all_arrow_failover_after_batch_yields_complete_result() {
+    let (srv_a, srv_b) = f4_drop_after_batch_servers();
+    let conf = format!(
+        "ws::addr={};failover_backoff_initial_ms=1;failover_backoff_max_ms=10",
+        build_addr_list(&[&srv_a, &srv_b])
+    );
+
+    let mut reader = Reader::from_conf(&conf).expect("connect to A");
+    let mut cursor = reader.prepare("select 1").execute().expect("execute");
+
+    let (_schema, batches) = cursor
+        .fetch_all_arrow()
+        .expect("materialise-whole must replay transparently");
+
+    assert_eq!(cursor.failover_resets(), 1, "exactly one reset to server B");
+    let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+    assert_eq!(
+        total_rows, 3,
+        "A's partial batch must be discarded; only B's rows remain"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Regression: per-cursor SYMBOL cache must be reset on failover replay.
+//
+// The streaming Arrow path threads a persistent `SymbolValuesCache` across
+// batches, keyed only on the connection dict's length. On mid-query
+// failover the connection dict is rebuilt empty against the new node, but
+// the per-cursor cache used to survive. If the new node's dict re-grew to
+// the SAME length, `symbol_array` saw `cache.len == dict.len()` and reused
+// the OLD node's interned strings — pairing the new node's row codes with
+// the dead node's symbol values (silent wrong values, no error).
+// ---------------------------------------------------------------------------
+
+/// Pull every distinct symbol string out of a single-column SYMBOL
+/// `RecordBatch`, in row order. The column is a
+/// `Dictionary<UInt32, Utf8>`; the value at row `i` is
+/// `values[keys[i]]`.
+#[cfg(feature = "arrow")]
+fn symbol_rows(rb: &arrow::array::RecordBatch) -> Vec<String> {
+    use arrow::array::cast::AsArray;
+    use arrow::array::types::UInt32Type;
+    let dict = rb.column(0).as_dictionary::<UInt32Type>();
+    let values = dict.values().as_string::<i32>();
+    dict.keys()
+        .iter()
+        .map(|k| {
+            values
+                .value(k.expect("non-null symbol") as usize)
+                .to_string()
+        })
+        .collect()
+}
+
+/// `&str` view over a `Vec<String>` so the assertions can compare against
+/// `vec!["a", ...]` literals directly.
+#[cfg(feature = "arrow")]
+fn as_str_vec(v: &[String]) -> Vec<&str> {
+    v.iter().map(String::as_str).collect()
+}
+
+/// Node A streams a SYMBOL batch that grows the connection dict to length 3
+/// (`["a","b","c"]`), then drops mid-stream. Node B replays with its own
+/// dict that reaches the *same length 3* but holds different strings
+/// (`["x","y","z"]`). With the per-cursor SYMBOL cache reset on failover,
+/// the replayed batch must read back B's real values; without the reset it
+/// silently surfaced A's cached strings (matching dict length → cache hit).
+#[test]
+#[cfg(feature = "arrow")]
+fn failover_replay_resets_symbol_cache_to_new_node_values() {
+    let srv_a = MockServer::start(vec![vec![
+        Action::SendServerInfo {
+            role: ServerRole::Standalone,
+            node_id: "a".into(),
+        },
+        Action::AwaitQueryRequest,
+        Action::SendBatch {
+            batch_seq: 0,
+            column: BatchColumn::Symbol {
+                dict: vec!["a".into(), "b".into(), "c".into()],
+                codes: vec![0, 1, 2],
+            },
+        },
+        Action::HardDrop,
+    ]]);
+    let srv_b = MockServer::start(vec![vec![
+        Action::SendServerInfo {
+            role: ServerRole::Standalone,
+            node_id: "b".into(),
+        },
+        Action::AwaitQueryRequest,
+        Action::SendBatch {
+            batch_seq: 0,
+            column: BatchColumn::Symbol {
+                // Same length as A's dict (3) so a length-keyed cache hits,
+                // but completely different strings.
+                dict: vec!["x".into(), "y".into(), "z".into()],
+                codes: vec![0, 1, 2],
+            },
+        },
+        Action::SendResultEnd,
+    ]]);
+    let conf = format!(
+        "ws::addr={};failover_backoff_initial_ms=1;failover_backoff_max_ms=10",
+        build_addr_list(&[&srv_a, &srv_b])
+    );
+
+    let mut reader = Reader::from_conf(&conf).expect("connect to A");
+    // A replay-aware callback opts the streaming cursor into replay after a
+    // batch has already been delivered (otherwise the silent-duplicate guard
+    // returns `FailoverWouldDuplicate` before any reconnect).
+    let mut cursor = reader
+        .prepare("select s from t")
+        .on_failover_reset(|_ev: &FailoverResetEvent| {})
+        .execute()
+        .expect("execute");
+
+    // Batch from A: primes the per-cursor SYMBOL values cache with A's dict
+    // (length 3 → strings a/b/c).
+    let a_batch = cursor
+        .next_arrow_batch()
+        .expect("A batch ok")
+        .expect("A batch present");
+    assert_eq!(as_str_vec(&symbol_rows(&a_batch)), vec!["a", "b", "c"]);
+
+    // A drops; the cursor fails over to B and replays. B's dict reaches the
+    // same length 3, so a stale length-keyed cache would resurface A's
+    // strings. The fix resets the cache so B's real values are read.
+    let b_batch = cursor
+        .next_arrow_batch()
+        .expect("B batch after failover ok")
+        .expect("B batch present");
+    assert_eq!(cursor.failover_resets(), 1, "exactly one reset to B");
+    assert_eq!(
+        as_str_vec(&symbol_rows(&b_batch)),
+        vec!["x", "y", "z"],
+        "post-failover SYMBOL values must be the new node's, not the cached \
+         old-node strings paired with the new node's codes"
+    );
+
+    assert!(
+        cursor.next_arrow_batch().expect("terminal").is_none(),
+        "B's RESULT_END must terminate the cursor"
     );
 }

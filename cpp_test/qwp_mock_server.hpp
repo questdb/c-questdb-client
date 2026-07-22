@@ -16,7 +16,7 @@
  *
  ******************************************************************************/
 
-// In-process mock QWP server for the C/C++ line_reader tests. Speaks the
+// In-process mock QWP server for the C/C++ reader tests. Speaks the
 // HTTP-Upgrade + WebSocket + QWP1 binary frame layer well enough to drive
 // the reader through every documented client-visible state without a real
 // QuestDB instance.
@@ -31,6 +31,7 @@
 
 #include <array>
 #include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <cstddef>
 #include <functional>
@@ -65,6 +66,9 @@ inline constexpr uint8_t ROLE_STANDALONE = 0x00;
 inline constexpr uint8_t ROLE_PRIMARY = 0x01;
 inline constexpr uint8_t ROLE_REPLICA = 0x02;
 inline constexpr uint8_t ROLE_PRIMARY_CATCHUP = 0x03;
+
+// SERVER_INFO capability bits.
+inline constexpr uint32_t CAP_ZONE = 0x00000001u;
 
 // ColumnKind wire codes (mirror questdb-rs/src/egress/column_kind.rs).
 inline constexpr uint8_t COL_BOOLEAN = 0x01;
@@ -123,13 +127,18 @@ std::vector<uint8_t> server_info_frame(
     const std::string& node_id,
     uint64_t epoch = 0,
     uint32_t capabilities = 0,
-    int64_t server_wall_ns = 0);
+    int64_t server_wall_ns = 0,
+    const std::optional<std::string>& zone_id = std::nullopt);
 std::vector<uint8_t> result_end_frame(int64_t request_id);
 std::vector<uint8_t> exec_done_frame(
     int64_t request_id, uint8_t op_type = 0, uint64_t rows_affected = 0);
 std::vector<uint8_t> query_error_frame(
     int64_t request_id, uint8_t status_code, const std::string& message);
 std::vector<uint8_t> cache_reset_frame(uint8_t mask);
+// Server-origin QWP ingress OK response payload for a client-sent write frame.
+// This is not wrapped in the QWP1 egress header: ingress ACKs are the raw
+// WebSocket binary payload `[status=0][wire_seq_le][table_count=0]`.
+std::vector<uint8_t> ingress_ok_frame(uint64_t wire_seq = 0);
 
 // Build a single-table RESULT_BATCH frame given:
 //  - request_id, batch_seq
@@ -233,6 +242,7 @@ struct ActionSendServerInfo
     uint64_t epoch = 0;
     uint32_t capabilities = 0;
     int64_t server_wall_ns = 0;
+    std::optional<std::string> zone_id = std::nullopt;
 };
 struct ActionAwaitQueryRequest
 {};
@@ -303,6 +313,14 @@ public:
 
     // Number of TCP connections accepted so far.
     int accepts() const;
+
+    // Block until at least `n` TCP connections have been accepted, or
+    // `timeout` elapses; returns true if the count was reached. Store-and-
+    // forward senders connect on a background thread, so the borrow returns
+    // before the accept lands.
+    bool wait_for_accepts(
+        int n,
+        std::chrono::milliseconds timeout = std::chrono::seconds(5)) const;
 
     // Snapshot of every payload (msg_kind + body) the workers have seen
     // from the client, in arrival order. Each entry is the bare client→

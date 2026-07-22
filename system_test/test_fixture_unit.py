@@ -317,5 +317,30 @@ class StartProbeSelectionTest(unittest.TestCase):
             self.assertEqual(captured['timeout_sec'], 90)
 
 
+class TimeoutDiagnosticsTest(unittest.TestCase):
+
+    @unittest.skipUnless(
+        hasattr(signal, 'SIGQUIT'), 'SIGQUIT is POSIX-only')
+    def test_probes_ping_and_requests_thread_dump(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            qdb = _make_fixture(tmp_dir)
+            qdb.http_server_port = 9000
+            qdb._proc = mock.Mock()
+            qdb._proc.poll.return_value = None
+            stderr = io.StringIO()
+            with contextlib.redirect_stderr(stderr), \
+                    mock.patch.object(
+                        fixture.urllib.request,
+                        'urlopen',
+                        side_effect=TimeoutError('timed out')), \
+                    mock.patch.object(fixture.time, 'sleep'):
+                qdb.capture_timeout_diagnostics('example.test')
+
+            qdb._proc.send_signal.assert_called_once_with(signal.SIGQUIT)
+            messages = stderr.getvalue()
+            self.assertIn('/ping after timeout failed', messages)
+            self.assertIn('Requested a JVM thread dump', messages)
+
+
 if __name__ == '__main__':
     unittest.main()

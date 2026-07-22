@@ -84,9 +84,9 @@ class Protocol(Enum):
     TCPS = (c_line_sender_protocol(1), 'tcps')
     HTTP = (c_line_sender_protocol(2), 'http')
     HTTPS = (c_line_sender_protocol(3), 'https')
-    QWPUDP = (c_line_sender_protocol(4), 'qwpudp')
-    QWPWS = (c_line_sender_protocol(5), 'qwpws')
-    QWPWSS = (c_line_sender_protocol(6), 'qwpwss')
+    QWPUDP = (c_line_sender_protocol(4), 'udp')
+    WS = (c_line_sender_protocol(5), 'ws')
+    WSS = (c_line_sender_protocol(6), 'wss')
 
     @classmethod
     def from_int(cls, value: c_line_sender_protocol):
@@ -139,8 +139,9 @@ class QwpWsErrorCategory(Enum):
     INTERNAL_ERROR = 2
     SECURITY_ERROR = 3
     WRITE_ERROR = 4
-    PROTOCOL_VIOLATION = 5
-    UNKNOWN = 6
+    NOT_WRITABLE = 5
+    PROTOCOL_VIOLATION = 6
+    UNKNOWN = 7
 
     @classmethod
     def from_int(cls, value: int):
@@ -151,15 +152,16 @@ class QwpWsErrorCategory(Enum):
 
 
 class QwpWsErrorPolicy(Enum):
-    DROP_AND_CONTINUE = 0
-    HALT = 1
+    RETRIABLE = 0
+    RETRIABLE_OTHER = 1
+    TERMINAL = 2
 
     @classmethod
     def from_int(cls, value: int):
         for member in cls:
             if member.value == value:
                 return member
-        return cls.HALT
+        return cls.TERMINAL
 
 
 class c_line_sender_opts(ctypes.Structure):
@@ -257,13 +259,12 @@ def _setup_cdll():
 
     set_sig(
         dll.line_sender_error_get_code,
-        c_line_sender_error_p,
         c_int,
-        c_void_p)
+        c_line_sender_error_p)
     set_sig(
         dll.line_sender_error_msg,
-        c_line_sender_error_p,
         c_void_p,
+        c_line_sender_error_p,
         c_size_t_p)
     set_sig(
         dll.line_sender_error_free,
@@ -797,12 +798,11 @@ def _setup_cdll():
         ctypes.POINTER(line_sender_qwpws_fsn),
         c_line_sender_error_p_p)
     set_sig(
-        dll.line_sender_qwpws_await_acked_fsn,
+        dll.line_sender_qwpws_wait,
         c_bool,
         c_line_sender_p,
+        c_uint32,
         c_uint64,
-        c_uint64,
-        ctypes.POINTER(c_bool),
         c_line_sender_error_p_p)
     set_sig(
         dll.line_sender_qwpws_poll_error,
@@ -1439,7 +1439,7 @@ class Sender:
             port: Union[str, int],
             **kwargs):
 
-        if protocol in (Protocol.TCPS, Protocol.HTTPS, Protocol.QWPWSS):
+        if protocol in (Protocol.TCPS, Protocol.HTTPS, Protocol.WSS):
             if host == '127.0.0.1':
                 host = 'localhost'  # for TLS connections we need a hostname
 
@@ -1706,16 +1706,17 @@ class Sender:
             return fsn.value
         return None
 
-    def await_acked_fsn(self, fsn: int, timeout_millis: int) -> bool:
+    def wait(self, ack_level: int = 0, timeout_millis: int = 0) -> None:
+        """Wait until every published QWP/WebSocket frame reaches ``ack_level``
+        (0 = ok, 1 = durable). ``timeout_millis`` is a no-progress deadline
+        (0 = wait indefinitely). Row-major counterpart to the column-major
+        store-and-forward wait."""
         self._check_connected()
-        reached = c_bool(False)
         _error_wrapped_call(
-            _DLL.line_sender_qwpws_await_acked_fsn,
+            _DLL.line_sender_qwpws_wait,
             self._impl,
-            c_uint64(fsn),
-            c_uint64(timeout_millis),
-            ctypes.byref(reached))
-        return bool(reached.value)
+            c_uint32(ack_level),
+            c_uint64(timeout_millis))
 
     def poll_qwp_ws_error(self) -> Optional[QwpWsError]:
         self._check_connected()

@@ -1,86 +1,117 @@
 # c-questdb-client
 **QuestDB - Client Library for Rust, C and C++**
 
-This library makes it easy to insert data into [QuestDB](https://questdb.io/).
+This library inserts data into [QuestDB](https://questdb.io/) and queries it
+back out.
 
-This client library implements the QuestDB's variant of the [InfluxDB Line Protocol](
-https://questdb.io/docs/reference/api/ilp/overview/) (ILP) over HTTP and TCP,
-and the QuestDB Wire Protocol (QWP) over UDP for high-throughput ingestion
-on trusted networks.
+The primary protocol is the **QuestDB Wire Protocol (QWP)** over WebSocket,
+QuestDB's native binary columnar format, used for both ingestion and queries.
+QWP traffic runs over a thread-safe connection pool (`QuestDb` in Rust,
+`questdb_db` in C/C++) with per-flush acknowledgements and automatic reconnect.
+Multi-endpoint failover requires QuestDB Enterprise. You send rows, columns,
+Apache Arrow record batches or Polars DataFrames (Rust); SQL results stream
+back over the same pool in the same formats. QWP over WebSocket requires
+QuestDB 10.0 or newer.
 
-When connecting to QuestDB over HTTP, the library will auto-detect the server's
-latest supported version and use it. Version 1 is compatible with
-the [InfluxDB Database](https://docs.influxdata.com/influxdb/v2/reference/syntax/line-protocol/).
+QWP also has a best-effort **UDP** transport for low-latency ingestion on
+trusted networks (batching is MTU-bounded).
 
-* Implementation is in Rust, with no additional
+* Written in Rust, with no additional
   [run-time or link-time dependencies](doc/BUILD.md#pre-requisites-and-dependencies)
   on the C++ standard library or other libraries.
-* We ship both a static and a dynamic library.
-* The library exposes Rust, C11 and C++17 APIs.
-* The C++ API is a header-only wrapper over the C API.
-* This library also has separate Python bindings.
+* Ships as a static and a dynamic library.
+* Exposes Rust, C11 and C++17 APIs; the C++ API is a header-only wrapper over
+  the C API.
+* Python bindings are available separately.
 
-## Insertion Protocols Overview
+## Compatibility
 
-Inserting data into QuestDB can be done in several ways.
+The Rust and native clients require Rust 1.91.1 to build. The C and C++
+surfaces target C11 and C++17, with CMake 3.15 or newer. See the
+[compatibility matrix](doc/COMPATIBILITY.md) for server, toolchain, platform,
+Arrow, and Polars support.
 
-This library supports three ingestion transports:
+## Inserting Data
 
-* **ILP/HTTP** (default-recommended): request-response, server errors returned
-  to the client, supports authentication and TLS.
-* **ILP/TCP**: streaming, legacy; errors cause disconnect and surface only in
-  server logs.
-* **QWP/UDP**: best-effort datagram transport for high-throughput ingestion on
-  trusted networks; no acknowledgements, no authentication, no TLS.
+QWP/WebSocket is the main path, covered below. For cross-language code
+and production configuration, see the
+[client documentation](https://questdb.com/docs/ingestion/overview/).
+QuestDB also accepts
+[CSV uploads](https://questdb.io/docs/reference/api/rest/#imp---import-data)
+and [PostgreSQL-wire](https://questdb.io/docs/reference/api/postgres/) inserts.
 
-| Protocol | Record Insertion Reporting | Data Insertion Performance |
-| -------- | -------------------------- | -------------------------- |
-| **[ILP/HTTP](https://questdb.io/docs/reference/api/ilp/overview/)** | Transaction-level (on flush) | **Excellent** |
-| [ILP/TCP](https://questdb.io/docs/reference/api/ilp/overview/) | Errors in logs; Disconnect on error | **Best** (tolerates higher-latency networks) |
-| QWP/UDP | None (best-effort, unacknowledged) | **Best** (lowest overhead; datagrams may be dropped) |
-| [CSV Upload via HTTP](https://questdb.io/docs/reference/api/rest/#imp---import-data) | Configurable | Very Good |
-| [PostgreSQL](https://questdb.io/docs/reference/api/postgres/) | Transaction-level | Good |
+<details>
+<summary>Legacy ILP transports (InfluxDB compatibility)</summary>
 
-Server errors are reported back to the client only for ILP/HTTP. ILP/TCP
-surfaces errors via server-side disconnect; QWP/UDP has no error-reporting
-path at all. See the [flush troubleshooting](doc/CONSIDERATIONS.md) docs for
-more details on how to debug ILP/TCP and QWP/UDP.
+For InfluxDB-compatible ingestion the library still supports the legacy **ILP**
+transports: **ILP/HTTP** (request-response; server errors returned to the
+client; auth and TLS) and **ILP/TCP** (streaming; errors cause disconnect and
+surface only in server logs). Over HTTP the protocol version is auto-detected;
+over TCP it defaults to version 1 (InfluxDB-compatible) and can be raised with
+`protocol_version=N`.
 
-For an overview and code examples, see the
-[Ingestion overview page of the developer docs](https://questdb.io/docs/ingestion-overview/). 
+See the [flush troubleshooting](doc/CONSIDERATIONS.md) docs for debugging
+ILP/TCP disconnects, and the
+[ILP protocol reference](https://questdb.io/docs/reference/api/ilp/overview/)
+for the wire format.
 
-To understand the protocol in more depth, consult the
-[protocol reference docs](https://questdb.io/docs/reference/api/ilp/overview/).
+</details>
 
-## Protocol Versions
+## Writing and Querying
 
-The library supports the following ILP protocol versions. These apply to
-ILP/HTTP and ILP/TCP only — QWP/UDP uses its own wire format and is not
-versioned through this mechanism.
+One pool handle covers both directions. In Rust:
 
-* If you use HTTP and `protocol_version=auto` or unset, the library will
-  automatically detect the server's
-  latest supported protocol version and use it (recommended).
-* If you use TCP, you can specify the
-  `protocol_version=N` parameter when constructing the `Sender` object
-  (TCP defaults to `protocol_version=1`).
+```rust ignore
+let db = QuestDb::connect("ws::addr=localhost:9000;")?;
 
-| Version | Description                                                  | Server Compatibility  |
-| ------- | ------------------------------------------------------------ | --------------------- |
-| **1**   | Over HTTP it's compatible with InfluxDB Line Protocol (ILP)  | All QuestDB versions  |
-| **2**   | 64-bit floats sent as binary, adds n-dimensional arrays      | 9.0.0+ (2025-07-11)   |
+// Write: one call streams the whole DataFrame and waits for the ack.
+db.flush_polars_dataframe("trades", &df, &PolarsIngestOptions::new())?;
+
+// Read: borrow a reader from the same pool, run SQL, stream the result.
+let back = db
+    .borrow_reader()?
+    .execute("SELECT * FROM trades WHERE amount > 0.001")?
+    .fetch_all_polars()?;
+```
+
+Besides `flush_polars_dataframe` and `flush_arrow_batch`, the pool hands out
+`borrow_sender()` for both row-built `Buffer` payloads and columnar `Chunk` /
+Arrow payloads, plus `borrow_reader()` for SQL queries. Handles return to the
+pool on drop. `Reader::from_conf` runs queries without a pool, yielding native
+columnar batches, Arrow `RecordBatch`es or Polars `DataFrame`s.
+
+The C and C++ APIs expose the pool via
+[`questdb/client.h`](include/questdb/client.h) /
+[`questdb/client.hpp`](include/questdb/client.hpp) (`questdb_db_connect`,
+`questdb::pool`), and the leases borrowed from it via
+[`questdb/ingress/qwp_sender.h`](include/questdb/ingress/qwp_sender.h)
+(`questdb_db_borrow_sender`) and
+[`questdb/egress/qwp_reader.h`](include/questdb/egress/qwp_reader.h) /
+[`questdb/egress/qwp_reader.hpp`](include/questdb/egress/qwp_reader.hpp)
+(`questdb_db_borrow_reader`), handing data across the Arrow C Data Interface.
+Each lease header includes the pool header, so a one-direction consumer
+includes only the header for that direction. In Rust, QWP ingestion
+(`sync-sender-qwp-ws`) and queries (`sync-reader-qwp-ws`) are both on by
+default; Arrow and Polars conversions sit behind the `arrow` and `polars`
+features.
 
 ## Getting Started
 
-To get started, read the language-specific guides.
+Read the language-specific guides:
 
 **C**
 * [Getting started with C](doc/C.md)
-* [`.h` header file](include/questdb/ingress/line_sender.h)
+* [Shared-pool ingestion and query example](examples/qwp_ws_chunk_and_query_c_example.c)
+* [`.h` header file](include/questdb/client.h) (the pool)
+* [`.h` header file](include/questdb/ingress/qwp_sender.h) (ingestion)
+* [`.h` header file](include/questdb/egress/qwp_reader.h) (queries)
 
 **C++**
 * [Getting started with C++](doc/CPP.md)
-* [`.hpp` header file](include/questdb/ingress/line_sender.hpp)
+* [Shared-pool ingestion and query example](examples/qwp_ws_chunk_and_query_cpp_example.cpp)
+* [`.hpp` header file](include/questdb/client.hpp) (the pool)
+* [`.hpp` header file](include/questdb/ingress/qwp_sender.hpp) (ingestion)
+* [`.hpp` header file](include/questdb/egress/qwp_reader.hpp) (queries)
 
 **Rust**
 * [Getting started with Rust](questdb-rs/README.md)
@@ -96,16 +127,16 @@ To get started, read the language-specific guides.
 
 ## Further Topics
 
+* [Documentation index](doc/README.md)
 * [Data quality and threading considerations](doc/CONSIDERATIONS.md)
 * [Authentication and TLS encryption](doc/SECURITY.md)
+* [QWP ingress and egress soak harness](doc/QWP_SOAK_HARNESS.md)
 
 ## Community
 
-If you need help, have additional questions or want to provide feedback, you
-may find us on our [Community Forum](https://community.questdb.io/).
-
-You can also [sign up to our mailing list](https://questdb.io/contributors/)
-to get notified of new releases.
+Questions or feedback? Reach us on the
+[Community Forum](https://community.questdb.io/). To hear about new releases,
+[sign up to the mailing list](https://questdb.io/contributors/).
 
 ## License
 

@@ -78,3 +78,4 @@ pub(crate) mod crypto;
 pub(crate) mod frame;
 pub(crate) mod handshake;
 pub(crate) mod mask;
+pub(crate) mod nosigpipe;

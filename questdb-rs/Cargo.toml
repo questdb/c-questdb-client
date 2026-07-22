@@ -2,16 +2,17 @@
 name = "questdb-rs"
 version = "7.0.0"
 edition = "2024"
+rust-version = "1.91.1"
 license = "Apache-2.0"
 description = "QuestDB Client Library for Rust"
 homepage = "https://questdb.com/"
 repository = "https://github.com/questdb/c-questdb-client"
 keywords = ["questdb", "ilp", "client-library"]
 categories = ["database"]
-authors = ["Adam Cimarosti <adam@questdb.io>"]
+authors = ["Vlad Ilyushchenko <vlad@questdb.com>"]
 
 [package.metadata.docs.rs]
-features = ["almost-all-features"]
+features = ["almost-all-features", "arrow", "polars"]
 
 [lib]
 name = "questdb"
@@ -64,12 +65,38 @@ p12-keystore = { version = "0.2", optional = true }
 
 zstd = { version = "0.13", optional = true }
 
+# Apache Arrow integration. `ffi` feature enables Arrow C Data Interface
+# export. Pinned to a single major to match DataFusion's current major;
+# bump deliberately per release notes.
+arrow = { version = ">=58, <60", optional = true, default-features = false, features = ["ffi"] }
+# 64-byte aligned allocations for build-pass Arrow buffers (validity,
+# BOOLEAN bit-pack, ARRAY offsets, SYMBOL union dict).
+aligned-vec = { version = "0.6", optional = true }
+# `dtype-datetime` + `timezones` are required for the egress
+# `Series::from_arrow` path: every QuestDB table has a designated
+# TIMESTAMP, which the decoder maps to the tz-aware Arrow
+# `Timestamp(Microsecond, Some("UTC"))`. Without these, materialising a
+# real result set into a polars `DataFrame` (`fetch_all_polars` /
+# `next_polars` / `iter_polars`) fails at runtime on the timestamp
+# column. `dtype-date` covers QuestDB DATE columns symmetrically.
+#
+# Range 0.52–0.54 (in lockstep with polars-arrow): polars renames APIs at
+# every 0.x minor, so the source deliberately uses only the subset stable
+# across this range (`DataFrame::new`, `select_at_idx`, the `Categories`
+# categorical surface) instead of per-release names like `new_with_height` /
+# `get_columns`. CI exercises 0.52, 0.53 and 0.54. `questdb-rs/Cargo.lock` is
+# gitignored, so the `<0.55` ceiling keeps an unrelated build from floating
+# onto an untested polars.
+polars = { version = ">=0.52, <0.55", optional = true, default-features = false, features = ["dtype-categorical", "dtype-datetime", "dtype-date", "timezones"] }
+polars-arrow = { version = ">=0.52, <0.55", optional = true, default-features = false, features = ["compute"] }
+
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.60", features = [
     "Win32_Foundation",
     "Win32_Networking_WinSock",
     "Win32_Storage_FileSystem",
     "Win32_System_IO",
+    "Win32_System_Threading",
 ] }
 
 [build-dependencies]
@@ -79,6 +106,9 @@ slugify = "0.1.0"
 indoc = "2"
 
 [dev-dependencies]
+# Pulled in transitively by `arrow-array`; named explicitly here so unit
+# tests under `ingress::arrow::tests` can build `Float16Array` payloads.
+half = "2"
 socket2 = "0.6.1"
 mio = { version = "1", features = ["os-poll", "net"] }
 chrono = "0.4.31"
@@ -94,14 +124,24 @@ ureq = { version = "3.1.2, <3.2.0", default-features = false }
 criterion = { version = "0.5", default-features = false }
 
 [features]
-default = ["sync-sender", "tls-webpki-certs", "ring-crypto"]
+default = ["sync-sender", "sync-reader", "tls-webpki-certs", "ring-crypto"]
 
-## Sync senders: ILP/TCP + ILP/HTTP + QWP/UDP + QWP/WS
+## Reliable, connection-oriented senders: ILP/TCP + ILP/HTTP + QWP/WS.
+## QWP/UDP is intentionally excluded: it is best-effort (no acks, no auth,
+## no TLS) and must be opted into explicitly via `sync-sender-qwp-udp`.
 sync-sender = [
     "sync-sender-tcp",
     "sync-sender-http",
-    "sync-sender-qwp-udp",
     "sync-sender-qwp-ws",
+]
+
+## QWP/WebSocket egress reader (queries). The read-side counterpart to
+## `sync-sender` and, like it, on by default — querying is first-class,
+## not opt-in. Bundles the WebSocket reader with zstd decompression so
+## results from a compressing server decode out of the box.
+sync-reader = [
+    "sync-reader-qwp-ws",
+    "sync-reader-zstd",
 ]
 
 ## Sync ILP/TCP
@@ -116,11 +156,13 @@ sync-sender-http = [
     "dep:rand",
 ]
 
-## Sync QWP/UDP
+## Sync QWP/UDP — best-effort datagram ingest: no acknowledgements, no
+## authentication, no TLS; datagrams may be dropped. Standalone and opt-in,
+## deliberately NOT pulled in by `sync-sender` or the default build.
 sync-sender-qwp-udp = ["_sync-sender", "_sender-qwp-udp", "dep:socket2"]
 
 ## Sync QWP/WebSocket
-sync-sender-qwp-ws = ["_sync-sender", "_sender-qwp-ws", "dep:rand", "_keystore-roots"]
+sync-sender-qwp-ws = ["_sync-sender", "_sender-qwp-ws", "dep:rand", "dep:socket2", "_keystore-roots"]
 
 ## Allow use OS-provided root TLS certificates
 tls-native-certs = ["dep:rustls-native-certs"]
@@ -152,10 +194,13 @@ insecure-skip-verify = []
 tls-key-log = []
 
 ## Enable code-generation in `build.rs` for additional tests.
-json_tests = ["bigdecimal"]
+json-tests = ["bigdecimal"]
 
 ## Enable methods to create timestamp objects from chrono::DateTime objects.
-chrono_timestamp = ["chrono"]
+chrono-timestamp = ["dep:chrono"]
+
+## Enable n-dimensional array columns from `ndarray::ArrayView` / `Array`.
+ndarray = ["dep:ndarray"]
 
 ## Enable serialization of rust_decimal::Decimal in ILP
 rust_decimal = ["dep:rust_decimal"]
@@ -164,23 +209,53 @@ rust_decimal = ["dep:rust_decimal"]
 bigdecimal = ["dep:bigdecimal"]
 
 ## Sync QWP egress reader over WebSocket (plain `ws://`). Does NOT
-## pull in `compression-zstd`: zstd is opt-in. Without it, the decoder
+## pull in `sync-reader-zstd`: zstd is opt-in. Without it, the decoder
 ## still compiles but rejects `FLAG_ZSTD` batches at runtime with an
 ## `UnsupportedServer` error.
-sync-reader-ws = ["_egress", "_keystore-roots"]
+sync-reader-qwp-ws = ["_egress", "_keystore-roots"]
 
 ## Decompression for `FLAG_ZSTD` `RESULT_BATCH` payloads.
-compression-zstd = ["_egress", "dep:zstd"]
+sync-reader-zstd = ["_egress", "dep:zstd"]
+
+## Apache Arrow integration, split by direction so single-direction builds
+## stay lean; `arrow` is the convenience umbrella over both. Each direction
+## pulls only its own transport (`arrow-ingress` the QWP/WS sender,
+## `arrow-egress` the QWP/WS reader); the shared Arrow deps live in `_arrow`.
+##   arrow-egress : streaming Cursor → RecordBatchReader (read path)
+##   arrow-ingress: RecordBatch → Buffer (write path)
+## See `doc/QUESTDB_ARROW_INTEGRATION_DESIGN.md`.
+## Egress enables `arrow/chrono-tz` because it types every designated
+## timestamp as `Timestamp(_, Some("UTC"))`: without chrono-tz, consumer-side
+## formatting, casts, and temporal kernels fail at runtime on the named zone.
+arrow-egress = ["_arrow", "sync-reader-qwp-ws", "arrow?/chrono-tz"]
+arrow-ingress = ["_arrow", "sync-sender-qwp-ws"]
+arrow = ["arrow-ingress", "arrow-egress"]
+
+## Polars integration, split by direction; `polars` is the umbrella.
+##   polars-egress : Cursor → polars DataFrame
+##   polars-ingress: polars DataFrame → Buffer
+polars-egress = ["_polars", "arrow-egress"]
+polars-ingress = ["_polars", "arrow-ingress"]
+polars = ["polars-ingress", "polars-egress"]
 
 ## Run integration tests against a real QuestDB server launched from the
 ## `questdb/` submodule. Requires JDK 25 + Maven and a built jar at
 ## `../questdb/core/target/questdb-*-SNAPSHOT.jar`.
 live-server-tests = [
-    "sync-reader-ws",
-    "compression-zstd",
+    "sync-reader-qwp-ws",
+    "sync-reader-zstd",
     "sync-sender-http",
     "sync-sender-qwp-ws",
 ]
+
+## FFI escape-hatch surface, consumed only by the `questdb-rs-ffi` C-ABI
+## crate. Exposes the hidden `questdb::ffi_support` module: owned
+## (lifetime-free) pool handles and the entry points that mint them, which
+## C / Python cannot express as Rust lifetimes. NOT for normal Rust users —
+## they get the lifetime-bound `QuestDb::borrow_sender` / `borrow_reader`.
+## Hidden from docs and exempt from
+## semver; do not depend on it from regular Rust code.
+ffi-support = ["sync-sender-qwp-ws"]
 
 # Hidden derived features, used in code to enable-disable code sections. Don't use directly.
 _sender-tcp = []
@@ -190,22 +265,30 @@ _sender-qwp-ws = []
 _sync-sender = []
 _egress = ["dep:bytes"]
 _keystore-roots = ["dep:jks", "dep:p12-keystore"]
+# Shared Arrow / Polars dependency bundles, enabled by both directional
+# features. Don't use directly.
+_arrow = ["dep:arrow", "dep:aligned-vec", "dep:bytes"]
+_polars = ["dep:polars", "dep:polars-arrow"]
 
 ## Enable all cross-compatible features.
 ## The `aws-lc-crypto` and `ring-crypto` features are mutually exclusive,
 ## thus compiling with `--all-features` will not work.
 ## Instead use `--features almost-all-features`.
 ## This is useful for quickly running `cargo test` or `cargo clippy`.
+##
+## Excludes `arrow` / `polars`: those are opt-in. CI runs them separately
+## via `cargo test --features almost-all-features,arrow,polars`.
 almost-all-features = [
     "sync-sender",
-    "sync-reader-ws",
-    "compression-zstd",
+    "sync-sender-qwp-udp",
+    "sync-reader-qwp-ws",
+    "sync-reader-zstd",
     "tls-webpki-certs",
     "tls-native-certs",
     "ring-crypto",
     "insecure-skip-verify",
-    "json_tests",
-    "chrono_timestamp",
+    "json-tests",
+    "chrono-timestamp",
     "ndarray",
     "rust_decimal",
     "bigdecimal",
@@ -213,15 +296,23 @@ almost-all-features = [
 
 [[example]]
 name = "basic"
-required-features = ["chrono_timestamp", "ndarray"]
+required-features = ["sync-sender-tcp", "chrono-timestamp", "ndarray"]
 
 [[example]]
 name = "auth"
-required-features = ["chrono_timestamp"]
+required-features = ["sync-sender-tcp", "chrono-timestamp"]
 
 [[example]]
 name = "auth_tls"
-required-features = ["chrono_timestamp"]
+required-features = ["sync-sender-tcp", "chrono-timestamp"]
+
+[[example]]
+name = "from_conf"
+required-features = ["sync-sender-tcp"]
+
+[[example]]
+name = "from_env"
+required-features = ["_sync-sender"]
 
 [[example]]
 name = "http"
@@ -233,33 +324,88 @@ required-features = ["sync-sender-http", "ndarray", "bigdecimal"]
 
 [[example]]
 name = "qwp_egress_latency"
-required-features = ["sync-reader-ws"]
+required-features = ["sync-reader-qwp-ws"]
 
 [[example]]
 name = "qwp_egress_failover"
-required-features = ["sync-reader-ws"]
+required-features = ["sync-reader-qwp-ws"]
 
 [[example]]
 name = "qwp_egress_read"
-required-features = ["sync-reader-ws", "sync-sender-http"]
+required-features = ["sync-reader-qwp-ws", "sync-sender-http"]
 
 [[example]]
 name = "qwp_egress_read_wide"
-required-features = ["sync-reader-ws", "sync-sender-http"]
+required-features = ["sync-reader-qwp-ws", "sync-sender-http"]
 
 [[example]]
 name = "qwp_egress_hits"
-required-features = ["sync-reader-ws"]
+required-features = ["sync-reader-qwp-ws"]
 
 [[example]]
 name = "qwp_ws_unified_sfa_bench"
+required-features = ["sync-sender-qwp-ws", "arrow-ingress"]
+
+# Synthetic equities L1 quote feed → QuestDB via the column-major
+# sender. End-to-end throughput sanity check against a real server.
+[[example]]
+name = "qwp_ws_l1_quotes"
 required-features = ["sync-sender-qwp-ws"]
+
+# One Arc-shared QuestDb pool behind an ingestion thread that publishes
+# column-major Chunk batches and a query thread that polls the same table.
+# Run with:
+#
+#   cargo run --release --example qwp_ws_chunk_and_query \
+#       --features sync-sender-qwp-ws,sync-reader-qwp-ws
+[[example]]
+name = "qwp_ws_chunk_and_query"
+required-features = ["sync-sender-qwp-ws", "sync-reader-qwp-ws"]
+
+[[example]]
+name = "polars"
+required-features = ["polars", "sync-sender-qwp-ws"]
+
+# Step 3 (doc/historical/QWP_DATAFRAME_BENCH_PLAN.md §6) — Rust Polars ingress parity
+# on the S1 narrow schema. Measures flush_polars_dataframe() e2e + the
+# column-sender encode floor and emits the §3.2 JSON metric contract
+# (client="rust-polars", direction="ingress"). Uses ureq for the DEDUP
+# table create + WAL count gate, hence sync-sender-http. Run with:
+#
+#   cargo run --release --example qwp_ingress_polars \
+#       --features polars,sync-sender-qwp-ws,sync-sender-http
+[[example]]
+name = "qwp_ingress_polars"
+required-features = ["polars", "sync-sender-qwp-ws", "sync-sender-http"]
+
+# Rust row-API ingress bench, the row-major counterpart to qwp_ingress_polars:
+# row-build floor (Buffer append + clear, no network) + row-flush e2e
+# (flush per batch, AckLevel::Ok checkpoint every 64 batches). No polars
+# dependency. Uses ureq for the DEDUP table create + WAL count gate, hence
+# sync-sender-http. Run with:
+#
+#   cargo run --release --example qwp_ingress_row \
+#       --features sync-sender-qwp-ws,sync-sender-http
+[[example]]
+name = "qwp_ingress_row"
+required-features = ["sync-sender-qwp-ws", "sync-sender-http"]
+
+# Step 3 (§6) — Rust Polars egress parity on S1. Reads the table back via
+# fetch_all_polars / iter_polars / next_polars and reports decode vs
+# assemble vs the honest decode_plus_assemble sum, emitting the §3.2 JSON
+# (direction="egress"). Run with:
+#
+#   cargo run --release --example qwp_egress_polars \
+#       --features polars,sync-reader-qwp-ws,sync-sender-http
+[[example]]
+name = "qwp_egress_polars"
+required-features = ["polars", "sync-reader-qwp-ws", "sync-sender-http"]
 
 # Decoder microbenchmark anchoring the perf claims from commits
 # `8ec0a85` (zero-copy decode) and `1163d43` (tighter SYMBOL/VARCHAR
 # decode hot paths). Run with:
 #
-#   cargo bench --features sync-reader-ws --bench decoder
+#   cargo bench --features sync-reader-qwp-ws --bench decoder
 #
 # The default row count (configurable via `QUESTDB_BENCH_ROWS`) is
 # below the per-batch wire cap so the bench iterates fast on CI; set
@@ -268,4 +414,21 @@ required-features = ["sync-sender-qwp-ws"]
 [[bench]]
 name = "decoder"
 harness = false
-required-features = ["sync-reader-ws"]
+required-features = ["sync-reader-qwp-ws"]
+
+# Columnar payload hot-path bench. Anchors the encoder floor in
+# `doc/QWP_UNIFIED_SENDER_M0_BASELINE.md` (memcpy-bound no-null path and
+# referenced-only symbol intern). Run with:
+#
+#   cargo bench --features sync-sender-qwp-ws --bench column_sender
+#   QUESTDB_COLUMN_BENCH_ROWS=10000000 cargo bench --features sync-sender-qwp-ws --bench column_sender
+[[bench]]
+name = "column_sender"
+harness = false
+required-features = ["sync-sender-qwp-ws"]
+
+[profile.dev.package."*"]
+debug = false
+
+[profile.test.package."*"]
+debug = false

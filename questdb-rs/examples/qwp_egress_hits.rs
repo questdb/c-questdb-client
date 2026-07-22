@@ -27,7 +27,7 @@
 //!
 //! Run:
 //! ```text
-//! cargo run --release --features sync-reader-ws \
+//! cargo run --release --features sync-reader-qwp-ws \
 //!     --example qwp_egress_hits
 //! ```
 

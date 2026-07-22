@@ -45,7 +45,7 @@
 //! the four Java scenarios — credit-flow is intentionally out of scope
 //! because it would need full ingestion-credit plumbing in the mock.
 
-#![cfg(feature = "sync-reader-ws")]
+#![cfg(feature = "sync-reader-qwp-ws")]
 
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};

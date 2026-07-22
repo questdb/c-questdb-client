@@ -1309,7 +1309,7 @@ fn binary_qwp_ws_random_fuzz() {
     // value that spans more than one TCP/WS frame at the chosen chunk.
     let row_count = pick_row_count(&mut rng);
     let mut expected: Vec<Vec<u8>> = Vec::with_capacity(row_count);
-    let conf_sender = format!("qwpws::addr={}:{}", srv.host, srv.http_port);
+    let conf_sender = format!("ws::addr={}:{}", srv.host, srv.http_port);
     let mut sender = Sender::from_conf(&conf_sender).expect("qwp/ws sender");
     let mut buf = sender.new_buffer();
     for i in 0..row_count {

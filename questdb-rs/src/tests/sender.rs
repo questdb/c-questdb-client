@@ -24,8 +24,11 @@
 
 use crate::{
     ErrorCode,
-    ingress::{Buffer, Sender, TableName, Timestamp, TimestampMicros, TimestampNanos},
+    ingress::{Buffer, TableName, Timestamp, TimestampMicros, TimestampNanos},
 };
+
+#[cfg(feature = "_sync-sender")]
+use crate::ingress::Sender;
 
 #[cfg(any(feature = "sync-sender-tcp", feature = "sync-sender-http"))]
 use crate::ingress::{DOUBLE_BINARY_FORMAT_TYPE, F64Serializer};
@@ -885,7 +888,7 @@ fn test_timestamp_overloads_v2() -> TestResult {
     Ok(())
 }
 
-#[cfg(feature = "chrono_timestamp")]
+#[cfg(feature = "chrono-timestamp")]
 #[test]
 fn test_chrono_timestamp() -> TestResult {
     use chrono::{DateTime, TimeZone, Utc};

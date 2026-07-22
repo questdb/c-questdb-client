@@ -28,7 +28,7 @@
 //! lazily into a 64-bit window; bits consume from the low end. Reads past
 //! the end surface as `ProtocolError`.
 
-use crate::egress::error::{Result, fmt};
+use crate::error::{Result, fmt};
 
 /// Borrowed bit reader over `&[u8]`. LSB-first within each byte.
 pub struct BitReader<'a> {
@@ -167,7 +167,7 @@ impl<'a> BitReader<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::egress::error::ErrorCode;
+    use crate::error::ErrorCode;
 
     #[test]
     fn single_bits_lsb_first() {

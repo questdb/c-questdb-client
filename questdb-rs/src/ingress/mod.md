@@ -94,17 +94,20 @@ errors and reconnects are absorbed by the driver and do not surface to the
 caller; only server rejections and terminal protocol violations are
 reported.
 
-Server rejections fall into two categories:
+Server rejections are classified as `Retriable`, `RetriableOther`, or
+`Terminal`. Retriable rejections (e.g. write error, internal error, unknown
+future status) reconnect and replay from the local store-and-forward
+watermark. `RetriableOther` is reserved for server states such as
+`NOT_WRITABLE`; it uses the same replay path but immediately rotates away
+from the read-only endpoint when another configured endpoint is available.
+Structured diagnostics are available with
+[`sender.poll_qwp_ws_error()`](Sender::poll_qwp_ws_error), or through a
+callback installed with
+[`SenderBuilder::qwp_ws_error_handler`](SenderBuilder::qwp_ws_error_handler).
 
-- *Drop-and-continue* rejections (e.g. schema mismatch, write error) affect
-  only the rejected frame; the sender continues processing subsequent frames.
-  Retrieve structured diagnostics with
-  [`sender.poll_qwp_ws_error()`](Sender::poll_qwp_ws_error), or install a
-  callback via [`SenderBuilder::qwp_ws_error_handler`](SenderBuilder::qwp_ws_error_handler).
-
-- *Halt* rejections (e.g. parse error, internal error, security error) and
-  terminal WebSocket protocol violations latch the sender into a
-  permanently-unusable state. The next `flush()` call returns
+Terminal rejections (e.g. schema mismatch, parse error, security error) and
+terminal WebSocket protocol violations latch the sender into a
+permanently-unusable state. The next `flush()` call returns
   `ErrorCode::ServerRejection` carrying the structured diagnostic, and
   [`sender.must_close()`](Sender::must_close) returns `true`. The sender
   must be dropped and a new one constructed. The buffer passed to that
@@ -114,17 +117,19 @@ Server rejections fall into two categories:
 `flush()` returns once the frame has been appended to the local publication
 log; the FSN is also available via
 [`flush_and_get_fsn()`](Sender::flush_and_get_fsn). To wait for the server
-to durably acknowledge a specific FSN, call
-[`sender.await_acked_fsn()`](Sender::await_acked_fsn).
+to acknowledge every frame published so far, call
+[`sender.wait()`](Sender::wait) with the desired
+[`AckLevel`](crate::ingress::AckLevel) — the row-major counterpart to the
+column-major store-and-forward `wait`.
 [`sender.published_fsn()`](Sender::published_fsn) and
 [`sender.acked_fsn()`](Sender::acked_fsn) provide non-blocking polls.
 
 In `manual` progress mode no background thread observes the transport.
-Server-side state — including halts — only becomes visible when the user
+Server-side state — including terminal diagnostics — only becomes visible when the user
 calls [`sender.drive_once()`](Sender::drive_once) or any sender method
-that drives the transport (such as `flush` or `await_acked_fsn`). As a
+that drives the transport (such as `flush` or `wait`). As a
 consequence, `must_close()` on an otherwise-idle manual sender does not
-reflect a halt until the next drive.
+reflect a terminal diagnostic until the next drive.
 
 ## HTTP
 
@@ -262,7 +267,7 @@ To select one, use the `tls_ca` config option. These are the supported variants:
   automatically sets `tls_ca=pem_file`.
 
 * `tls_roots_password=<secret>;` unlocks a JKS / PKCS#12 keystore named by
-  `tls_roots`. QWP/WebSocket (`qwpwss::`) **only** — ILP/TCP and ILP/HTTP read
+  `tls_roots`. QWP/WebSocket (`wss::`) **only** — ILP/TCP and ILP/HTTP read
   unencrypted PEM via rustls and reject this key. With the password set, the
   `tls_roots` file is interpreted as a Java KeyStore (auto-detected: JKS magic
   `0xFEEDFEED`, or PKCS#12 ASN.1 SEQUENCE) and its trusted-certificate entries

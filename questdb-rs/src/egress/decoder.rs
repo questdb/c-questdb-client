@@ -53,7 +53,7 @@
 //!   type-specific values
 //! ```
 //!
-//! `FLAG_ZSTD` payloads are decoded via the optional `compression-zstd`
+//! `FLAG_ZSTD` payloads are decoded via the optional `sync-reader-zstd`
 //! crate feature; an unfeatured build rejects them with
 //! `ErrorCode::UnsupportedServer`. Gorilla-encoded timestamps/dates
 //! (per-column discriminator `0x01`) are handled by the
@@ -67,12 +67,12 @@ use crate::egress::column::{
     UuidColumn, Validity, VarcharColumn,
 };
 use crate::egress::column_kind::ColumnKind;
-use crate::egress::error::{Error, Result, fmt};
 use crate::egress::schema::Schema;
 use crate::egress::symbol_dict::SymbolDict;
 use crate::egress::wire::ByteReader;
 use crate::egress::wire::header::flags;
 use crate::egress::wire::msg_kind::MsgKind;
+use crate::error::{Error, Result, fmt};
 use bytes::Bytes;
 
 /// Per-batch caps mirrored from `java-questdb-client` (`QwpConstants.java`
@@ -84,6 +84,15 @@ pub(crate) const MAX_ROWS_PER_BATCH: usize = 1_048_576;
 pub(crate) const MAX_COLUMNS_PER_TABLE: usize = 2048;
 pub(crate) const MAX_COLUMN_NAME_LENGTH: usize = 127;
 pub(crate) const MAX_TABLE_NAME_LENGTH: usize = 127;
+
+/// Ceiling on the *densified* size of one decoded batch. The wire-byte cap
+/// bounds compressed/sparse input, but a null-sparse column costs only its
+/// validity bitmap on the wire while densifying to `row_count * elem_size`:
+/// an all-null batch at the row/column caps can fit under the 64 MiB frame
+/// limit yet inflate to ~16 GiB of zeroed sentinels. Summing the per-column
+/// densified footprint against this budget turns that into a recoverable
+/// `ProtocolError` instead of an OOM abort.
+pub(crate) const MAX_DECODED_BATCH_BYTES: usize = 1024 * 1024 * 1024;
 
 /// Take a zero-copy owned slice of `n` bytes from `parent` starting at the
 /// reader's current position, and advance the reader.
@@ -383,16 +392,16 @@ pub fn decode_result_batch(
     // freshly-owned Bytes wrapping the decompressed Vec.
     let _ = &zstd_scratch;
     let body: Bytes = if flags_byte & flags::ZSTD != 0 {
-        #[cfg(feature = "compression-zstd")]
+        #[cfg(feature = "sync-reader-zstd")]
         {
             zstd_decompress_body(r.remaining(), zstd_scratch)?
         }
-        #[cfg(not(feature = "compression-zstd"))]
+        #[cfg(not(feature = "sync-reader-zstd"))]
         {
             return Err(fmt!(
                 UnsupportedServer,
                 "server sent FLAG_ZSTD batch but client was built without the \
-                 `compression-zstd` feature"
+                 `sync-reader-zstd` feature"
             ));
         }
     } else {
@@ -466,6 +475,7 @@ pub fn decode_result_batch(
     // allocation that scales with column count.
     let mut columns = Vec::with_capacity(col_count);
     let connection_dict_size = dict.len();
+    let mut dense_budget = MAX_DECODED_BATCH_BYTES;
     for (i, col_meta) in schema.columns().iter().enumerate() {
         let kind = col_meta.kind;
         let col = decode_column(
@@ -475,6 +485,7 @@ pub fn decode_result_batch(
             row_count,
             flags_byte,
             connection_dict_size,
+            &mut dense_budget,
         )
         .map_err(|e| {
             Error::new(
@@ -506,6 +517,35 @@ pub fn decode_result_batch(
 // Per-column decode
 // ---------------------------------------------------------------------------
 
+/// Worst-case densified bytes per row for `kind`, used to charge the per-batch
+/// `MAX_DECODED_BATCH_BYTES` budget. This is the `row_count`-proportional part
+/// of the decode (sentinel-filled fixed buffers, symbol code slots, varlen /
+/// array offset slots); the value payloads of varlen and array columns are
+/// already bounded by the wire-byte cap and are not charged here.
+fn dense_row_bytes(kind: ColumnKind) -> usize {
+    match kind {
+        ColumnKind::Boolean | ColumnKind::Byte => 1,
+        ColumnKind::Short | ColumnKind::Char => 2,
+        ColumnKind::Int
+        | ColumnKind::Float
+        | ColumnKind::Symbol
+        | ColumnKind::Varchar
+        | ColumnKind::Binary
+        | ColumnKind::Ipv4 => 4,
+        ColumnKind::Long
+        | ColumnKind::Double
+        | ColumnKind::Timestamp
+        | ColumnKind::TimestampNanos
+        | ColumnKind::Date
+        | ColumnKind::Geohash
+        | ColumnKind::Decimal64
+        | ColumnKind::DoubleArray
+        | ColumnKind::LongArray => 8,
+        ColumnKind::Uuid | ColumnKind::Decimal128 => 16,
+        ColumnKind::Long256 | ColumnKind::Decimal256 => 32,
+    }
+}
+
 fn decode_column(
     r: &mut ByteReader<'_>,
     parent: &Bytes,
@@ -513,7 +553,17 @@ fn decode_column(
     row_count: usize,
     flags_byte: u8,
     connection_dict_size: usize,
+    dense_budget: &mut usize,
 ) -> Result<DecodedColumn> {
+    let cost = row_count.saturating_mul(dense_row_bytes(kind));
+    *dense_budget = dense_budget.checked_sub(cost).ok_or_else(|| {
+        fmt!(
+            ProtocolError,
+            "RESULT_BATCH densified data exceeds the {}-byte per-batch cap; \
+             a null-sparse batch cannot inflate client memory without bound",
+            MAX_DECODED_BATCH_BYTES
+        )
+    })?;
     Ok(match kind {
         ColumnKind::Boolean => DecodedColumn::Boolean(decode_boolean(r, parent, row_count)?),
         ColumnKind::Byte => {
@@ -697,15 +747,17 @@ fn decode_array(r: &mut ByteReader<'_>, parent: &Bytes, row_count: usize) -> Res
                     d
                 )
             })?;
-        }
-        if total > MAX_ARRAY_ELEMENTS_PER_ROW {
-            return Err(fmt!(
-                LimitExceeded,
-                "array row {} has {} elements (max {})",
-                row,
-                total,
-                MAX_ARRAY_ELEMENTS_PER_ROW
-            ));
+            // Bound every prefix product, not just the final one: `[2^31, 0]`
+            // has zero elements but a leading dim that explodes list nesting.
+            if total > MAX_ARRAY_ELEMENTS_PER_ROW {
+                return Err(fmt!(
+                    LimitExceeded,
+                    "array row {} has {} elements (max {})",
+                    row,
+                    total,
+                    MAX_ARRAY_ELEMENTS_PER_ROW
+                ));
+            }
         }
         let byte_count = (total as usize)
             .checked_mul(8)
@@ -773,12 +825,20 @@ fn decode_decimal_wide(
 ) -> Result<(i8, ColumnBuffer)> {
     let validity = decode_validity(r, parent, row_count)?;
     let scale = r.read_u8()? as i8;
-    if !(0..=crate::egress::binds::MAX_DECIMAL_SCALE).contains(&scale) {
+    // Per-width scale bound, matching the server's
+    // `Decimal{64,128,256}.MAX_SCALE` (18 / 38 / 76).
+    let per_width_max: i8 = match width {
+        8 => 18,
+        16 => 38,
+        _ => 76,
+    };
+    if !(0..=per_width_max).contains(&scale) {
         return Err(fmt!(
             ProtocolError,
-            "decimal scale {} outside 0..={}",
+            "DECIMAL{} scale {} outside 0..={}",
+            width * 8,
             scale,
-            crate::egress::binds::MAX_DECIMAL_SCALE
+            per_width_max
         ));
     }
     // DECIMAL64 NULL is `Long.MIN_VALUE` (spec §11.5). DECIMAL128 NULL is
@@ -1448,7 +1508,7 @@ fn decode_decimal64(
 /// Maximum zstd-decompressed `RESULT_BATCH` body size we accept. Matches
 /// the per-batch wire cap from the spec (16 MiB) with a 4x safety margin
 /// so legitimate frames never trip the cap.
-#[cfg(feature = "compression-zstd")]
+#[cfg(feature = "sync-reader-zstd")]
 const MAX_ZSTD_DECOMPRESSED: u64 = 64 * 1024 * 1024;
 
 /// Max recyclable buffers held by [`ZstdBufferPool`]. Two is the
@@ -1457,7 +1517,7 @@ const MAX_ZSTD_DECOMPRESSED: u64 = 64 * 1024 * 1024;
 /// Anything beyond that means the consumer is hoarding `Bytes` clones
 /// — in which case dropping the extra allocations rather than caching
 /// them is the right choice (lets the global allocator reclaim).
-#[cfg(feature = "compression-zstd")]
+#[cfg(feature = "sync-reader-zstd")]
 const ZSTD_POOL_CAPACITY: usize = 2;
 
 /// Per-connection recycle pool of decompressed-body `Vec<u8>`s. Each
@@ -1474,7 +1534,7 @@ const ZSTD_POOL_CAPACITY: usize = 2;
 /// thread-safe pool handle. Lock-uncontended overhead is ~tens of ns
 /// per decompress, negligible against the savings from skipping a
 /// multi-MB allocation.
-#[cfg(feature = "compression-zstd")]
+#[cfg(feature = "sync-reader-zstd")]
 #[derive(Default)]
 struct ZstdBufferPool {
     buffers: std::sync::Mutex<Vec<Vec<u8>>>,
@@ -1484,13 +1544,13 @@ struct ZstdBufferPool {
 /// backing `Vec` is returned to the pool on drop instead of being
 /// freed. `AsRef<[u8]>` exposes the full payload; `Bytes` slicing on
 /// top of this is zero-copy by ref-count.
-#[cfg(feature = "compression-zstd")]
+#[cfg(feature = "sync-reader-zstd")]
 struct PooledZstdBuffer {
     buf: Vec<u8>,
     pool: std::sync::Arc<ZstdBufferPool>,
 }
 
-#[cfg(feature = "compression-zstd")]
+#[cfg(feature = "sync-reader-zstd")]
 impl AsRef<[u8]> for PooledZstdBuffer {
     #[inline]
     fn as_ref(&self) -> &[u8] {
@@ -1498,7 +1558,7 @@ impl AsRef<[u8]> for PooledZstdBuffer {
     }
 }
 
-#[cfg(feature = "compression-zstd")]
+#[cfg(feature = "sync-reader-zstd")]
 impl Drop for PooledZstdBuffer {
     fn drop(&mut self) {
         // Best-effort pool return. A poisoned mutex (would only happen
@@ -1530,12 +1590,12 @@ impl Drop for PooledZstdBuffer {
 /// when the downstream batch (and any column views borrowing into it)
 /// is dropped. Always exists so the decode API doesn't need
 /// feature-gated signatures; the fields inside are only populated when
-/// `compression-zstd` is on.
+/// `sync-reader-zstd` is on.
 #[derive(Default)]
 pub struct ZstdScratch {
-    #[cfg(feature = "compression-zstd")]
+    #[cfg(feature = "sync-reader-zstd")]
     decompressor: Option<zstd::bulk::Decompressor<'static>>,
-    #[cfg(feature = "compression-zstd")]
+    #[cfg(feature = "sync-reader-zstd")]
     pool: std::sync::Arc<ZstdBufferPool>,
 }
 
@@ -1550,7 +1610,7 @@ impl ZstdScratch {
 /// (`ZSTD_c_contentSizeFlag` is on by default in the server encoder);
 /// rejecting "unknown" content size keeps decode-bomb amplification
 /// closed.
-#[cfg(feature = "compression-zstd")]
+#[cfg(feature = "sync-reader-zstd")]
 fn zstd_decompress_body(compressed: &[u8], scratch: &mut ZstdScratch) -> Result<Bytes> {
     let size = match zstd::zstd_safe::get_frame_content_size(compressed) {
         Ok(Some(n)) => n,
@@ -1690,9 +1750,9 @@ fn is_null_at_opt(validity: &Option<Bytes>, row: usize) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::egress::error::ErrorCode;
     use crate::egress::schema::{Schema, SchemaColumn};
     use crate::egress::wire::varint::encode_u64;
+    use crate::error::ErrorCode;
 
     /// Reference implementation kept inline in the test: byte-by-byte
     /// popcount with the same tail-bit masking rule. We assert the
@@ -1755,15 +1815,15 @@ mod tests {
     }
 
     /// FLAG_ZSTD rejection path: when the client was built WITHOUT the
-    /// `compression-zstd` feature, the decoder must surface
+    /// `sync-reader-zstd` feature, the decoder must surface
     /// `ErrorCode::UnsupportedServer` rather than silently mis-
     /// interpret the compressed body as raw wire bytes. The arm is
     /// uncovered in default test runs because `almost-all-features`
     /// turns the feature on; this test only compiles when the
     /// feature is off, so a build configuration `cargo test
-    /// --features sync-reader-ws --no-default-features` (or any CI
-    /// lane that excludes `compression-zstd`) exercises it.
-    #[cfg(not(feature = "compression-zstd"))]
+    /// --features sync-reader-qwp-ws --no-default-features` (or any CI
+    /// lane that excludes `sync-reader-zstd`) exercises it.
+    #[cfg(not(feature = "sync-reader-zstd"))]
     #[test]
     fn zstd_flag_rejected_without_feature() {
         // Minimal RESULT_BATCH prefix the decoder consumes before
@@ -1784,12 +1844,12 @@ mod tests {
             &mut schema,
             &mut ZstdScratch::new(),
         )
-        .expect_err("decoder must reject FLAG_ZSTD when built without compression-zstd");
+        .expect_err("decoder must reject FLAG_ZSTD when built without sync-reader-zstd");
         assert_eq!(err.code(), ErrorCode::UnsupportedServer);
         // Pin the diagnostic so a future error-message refactor can't
         // drop the feature-name hint that an operator needs to act on.
         assert!(
-            err.msg().contains("compression-zstd"),
+            err.msg().contains("sync-reader-zstd"),
             "rejection message should name the missing feature: {}",
             err.msg()
         );
@@ -2731,9 +2791,9 @@ mod tests {
                 &mut ZstdScratch::new(),
             )
             .unwrap_err();
-            assert_eq!(err.code(), crate::egress::ErrorCode::ProtocolError);
+            assert_eq!(err.code(), crate::ErrorCode::ProtocolError);
             assert!(
-                err.msg().contains("decimal scale"),
+                err.msg().contains("scale"),
                 "expected scale error msg, got: {}",
                 err.msg()
             );
@@ -2742,7 +2802,7 @@ mod tests {
 
     #[test]
     fn decode_decimal_rejects_scale_above_max() {
-        // 39 = MAX_DECIMAL_SCALE + 1.
+        // 39 is above DECIMAL64's per-width cap of 18.
         let mut data = vec![0x00u8, 39u8];
         data.extend(std::iter::repeat_n(0u8, 8));
         let (flags_byte, payload) = BatchBuilder::new(1)
@@ -2758,7 +2818,58 @@ mod tests {
             &mut ZstdScratch::new(),
         )
         .unwrap_err();
-        assert_eq!(err.code(), crate::egress::ErrorCode::ProtocolError);
+        assert_eq!(err.code(), crate::ErrorCode::ProtocolError);
+    }
+
+    fn decimal_col_data(scale: u8, width: usize) -> Vec<u8> {
+        let mut data = vec![0x00u8, scale]; // null_flag=0, scale
+        data.extend(std::iter::repeat_n(0u8, width)); // 1 non-null row
+        data
+    }
+
+    fn decode_decimal_one_row(kind: ColumnKind, scale: u8, width: usize) -> Result<()> {
+        let (flags_byte, payload) = BatchBuilder::new(1)
+            .add_column("p", kind, decimal_col_data(scale, width))
+            .build();
+        let mut dict = SymbolDict::new();
+        let mut schema: Option<Schema> = None;
+        decode_result_batch(
+            &payload,
+            flags_byte,
+            &mut dict,
+            &mut schema,
+            &mut ZstdScratch::new(),
+        )
+        .map(|_| ())
+    }
+
+    #[test]
+    fn decode_decimal64_per_width_scale_boundary() {
+        // DECIMAL64 (width 8) caps scale at 18 (server Decimal64.MAX_SCALE).
+        assert!(decode_decimal_one_row(ColumnKind::Decimal64, 18, 8).is_ok());
+        let err = decode_decimal_one_row(ColumnKind::Decimal64, 19, 8).unwrap_err();
+        assert_eq!(err.code(), crate::ErrorCode::ProtocolError);
+        assert!(err.msg().contains("DECIMAL"), "{}", err.msg());
+    }
+
+    #[test]
+    fn decode_decimal128_per_width_scale_boundary() {
+        // DECIMAL128 (width 16) caps scale at 38 (server Decimal128.MAX_SCALE).
+        assert!(decode_decimal_one_row(ColumnKind::Decimal128, 38, 16).is_ok());
+        let err = decode_decimal_one_row(ColumnKind::Decimal128, 39, 16).unwrap_err();
+        assert_eq!(err.code(), crate::ErrorCode::ProtocolError);
+        assert!(err.msg().contains("DECIMAL"), "{}", err.msg());
+    }
+
+    #[test]
+    fn decode_decimal256_per_width_scale_boundary() {
+        // DECIMAL256 (width 32) caps scale at 76 (server Decimal256.MAX_SCALE).
+        // Scales between DECIMAL128's 38 and 76 must be accepted, not rejected.
+        assert!(decode_decimal_one_row(ColumnKind::Decimal256, 39, 32).is_ok());
+        assert!(decode_decimal_one_row(ColumnKind::Decimal256, 76, 32).is_ok());
+        let err = decode_decimal_one_row(ColumnKind::Decimal256, 77, 32).unwrap_err();
+        assert_eq!(err.code(), crate::ErrorCode::ProtocolError);
+        assert!(err.msg().contains("DECIMAL"), "{}", err.msg());
     }
 
     #[test]
@@ -2799,10 +2910,10 @@ mod tests {
             .build();
         let err = decode_result_batch(&p, f, &mut dict, &mut schema, &mut ZstdScratch::new())
             .unwrap_err();
-        assert_eq!(err.code(), crate::egress::ErrorCode::ProtocolError);
+        assert_eq!(err.code(), crate::ErrorCode::ProtocolError);
     }
 
-    #[cfg(feature = "compression-zstd")]
+    #[cfg(feature = "sync-reader-zstd")]
     #[test]
     fn zstd_round_trips_simple_long_batch() {
         // Build a raw RESULT_BATCH, then re-pack the body bytes (after
@@ -2856,7 +2967,7 @@ mod tests {
     /// `Drop for PooledZstdBuffer`, the pool would always be empty
     /// and steady-state throughput would pay one full-body
     /// allocation+memcpy per batch.
-    #[cfg(feature = "compression-zstd")]
+    #[cfg(feature = "sync-reader-zstd")]
     #[test]
     fn zstd_scratch_pool_recycles_buffer_across_batches() {
         fn build_zstd_payload(seed: i64) -> Bytes {
@@ -2971,7 +3082,7 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "compression-zstd")]
+    #[cfg(feature = "sync-reader-zstd")]
     #[test]
     fn zstd_invalid_frame_is_protocol_error() {
         // Build a payload with a valid prefix + bogus zstd body bytes.
@@ -3001,7 +3112,7 @@ mod tests {
 
     /// Splice a custom zstd body onto a 0-row RESULT_BATCH prefix.
     /// Returns the full FLAG_ZSTD payload ready for `decode_result_batch`.
-    #[cfg(feature = "compression-zstd")]
+    #[cfg(feature = "sync-reader-zstd")]
     fn zstd_payload_with_body(body: &[u8]) -> Bytes {
         let (_, raw) = BatchBuilder::new(0).build();
         let prefix_len = {
@@ -3021,7 +3132,7 @@ mod tests {
     /// frame body is a single empty raw "last" block — enough for
     /// `get_frame_content_size` to parse but cheap enough that we
     /// never actually have to decompress 64+ MiB.
-    #[cfg(feature = "compression-zstd")]
+    #[cfg(feature = "sync-reader-zstd")]
     fn forged_fcs_zstd_frame(forged: u64) -> Vec<u8> {
         let mut frame = vec![0x28, 0xB5, 0x2F, 0xFD]; // magic
         // FHD: FCS_flag=3 (8-byte FCS), Single_Segment_flag=1, no
@@ -3039,7 +3150,7 @@ mod tests {
     /// `zstd::stream::write::Encoder` does not write FCS unless the
     /// caller invokes `set_pledged_src_size`, so this exercises the
     /// `Ok(None)` arm of `get_frame_content_size`.
-    #[cfg(feature = "compression-zstd")]
+    #[cfg(feature = "sync-reader-zstd")]
     #[test]
     fn zstd_frame_without_content_size_is_protocol_error() {
         use std::io::Write;
@@ -3080,7 +3191,7 @@ mod tests {
     /// FLAG_ZSTD body whose frame header advertises a content size
     /// just above the 64 MiB cap. The decoder must reject before
     /// allocating any decompression buffer.
-    #[cfg(feature = "compression-zstd")]
+    #[cfg(feature = "sync-reader-zstd")]
     #[test]
     fn zstd_frame_exceeding_cap_is_limit_exceeded() {
         let oversized = MAX_ZSTD_DECOMPRESSED + 1;
@@ -3117,7 +3228,7 @@ mod tests {
     /// `ProtocolError`. Pins coverage of the post-decompress failure
     /// arm so a future refactor that drops zstd's internal check is
     /// still caught by *some* layer.
-    #[cfg(feature = "compression-zstd")]
+    #[cfg(feature = "sync-reader-zstd")]
     #[test]
     fn zstd_frame_with_size_mismatch_is_protocol_error() {
         use std::io::Write;
@@ -3647,6 +3758,29 @@ mod tests {
         assert_eq!(err.code(), ErrorCode::LimitExceeded);
     }
 
+    #[test]
+    fn decode_array_degenerate_prefix_dim_rejected() {
+        // `[2^31, 0]`: zero elements but a leading dim a final-product-only cap
+        // would miss.
+        let mut col = vec![0x00u8, 2]; // null_flag, nDims=2
+        col.extend_from_slice(&(1u32 << 31).to_le_bytes()); // dim0 = 2^31
+        col.extend_from_slice(&0u32.to_le_bytes()); // dim1 = 0
+        let (flags_byte, payload) = BatchBuilder::new(1)
+            .add_column("a", ColumnKind::DoubleArray, col)
+            .build();
+        let mut dict = SymbolDict::new();
+        let mut schema: Option<Schema> = None;
+        let err = decode_result_batch(
+            &payload,
+            flags_byte,
+            &mut dict,
+            &mut schema,
+            &mut ZstdScratch::new(),
+        )
+        .unwrap_err();
+        assert_eq!(err.code(), ErrorCode::LimitExceeded);
+    }
+
     fn varchar_col_no_nulls(values: &[&str]) -> Vec<u8> {
         let mut out = vec![0x00u8]; // null_flag
         let mut total = 0u32;
@@ -3908,6 +4042,23 @@ mod tests {
         assert_eq!(c.value(0), 0xAA);
         assert_eq!(c.value(1), 0xBB);
         assert_eq!(c.value(2), 0xCC);
+    }
+
+    #[test]
+    fn decode_column_rejects_densified_batch_over_budget() {
+        // The budget is charged before any column bytes are read, so an
+        // exhausted budget trips without allocating or touching the reader.
+        let mut r = ByteReader::new(&[]);
+        let parent = Bytes::new();
+        let mut budget = 10usize;
+        let err =
+            decode_column(&mut r, &parent, ColumnKind::Long256, 16, 0, 0, &mut budget).unwrap_err();
+        assert_eq!(err.code(), ErrorCode::ProtocolError);
+        assert!(
+            err.msg().contains("per-batch cap"),
+            "unexpected error: {}",
+            err.msg()
+        );
     }
 
     #[test]
@@ -4485,7 +4636,7 @@ mod tests {
         /// whose product is zero — most naturally a single dim of zero.
         /// The C++ contract test
         /// `mock: non-null empty-data array row exposes data_offsets symmetry`
-        /// in `cpp_test/test_line_reader_mock.cpp` pins this case against
+        /// in `cpp_test/test_reader_mock.cpp` pins this case against
         /// the Rust reader: shape `[2, 0, 3]` decodes to a non-null row
         /// with a zero-length (empty) per-row data slice and
         /// `element_count == 0`.
