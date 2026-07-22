@@ -5,8 +5,10 @@
 #include <stddef.h>
 #include <stdint.h>
 
-uint64_t now_ns(void);         /* CLOCK_MONOTONIC */
-uint64_t process_cpu_ns(void); /* getrusage user+sys */
+/* Monotonic wall time in nanoseconds. */
+uint64_t now_ns(void);
+/* Process user-plus-kernel CPU time in nanoseconds. */
+uint64_t process_cpu_ns(void);
 
 typedef struct json_obj json_obj;
 json_obj* json_obj_new(void);

@@ -28,9 +28,11 @@
 //! [`crate::BorrowedSender`] that flushes row-built [`crate::ingress::Buffer`]
 //! values. The columnar path ingests Pandas/Polars DataFrames without adding
 //! per-row conversion, copies, or dispatch. A [`Chunk`] borrows caller-owned
-//! column buffers until the flush completes, while [`crate::BorrowedSender`]
-//! holds the pooled connection whose reusable outbound buffer owns the encoded
-//! frame.
+//! column buffers through encoding. The encoder always writes into a
+//! caller-provided owned output buffer: the direct path uses the connection's
+//! reusable outbound buffer, while the pooled store-and-forward path uses the
+//! foreground publisher's retained payload buffer, which the queue borrows
+//! while appending the frame.
 //!
 //! The user model is `DataFrame → Table`:
 //!
