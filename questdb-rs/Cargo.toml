@@ -366,11 +366,12 @@ required-features = ["sync-sender-qwp-ws", "sync-reader-qwp-ws"]
 name = "polars"
 required-features = ["polars", "sync-sender-qwp-ws"]
 
-# Step 3 (doc/historical/QWP_DATAFRAME_BENCH_PLAN.md §6) — Rust Polars ingress parity
-# on the S1 narrow schema. Measures flush_polars_dataframe() e2e + the
-# column-sender encode floor and emits the §3.2 JSON metric contract
+# Rust Polars ingress benchmark on the S1 narrow schema. Measures
+# flush_polars_dataframe() e2e + the column-sender encode floor and emits the
+# JSON path summary
 # (client="rust-polars", direction="ingress"). Uses ureq for the DEDUP
-# table create + WAL count gate, hence sync-sender-http. Run with:
+# table create + WAL count gate, hence sync-sender-http. Benchmark usage and
+# comparison workflow are documented in `doc/BENCHMARKS.md`. Run with:
 #
 #   cargo run --release --example qwp_ingress_polars \
 #       --features polars,sync-sender-qwp-ws,sync-sender-http
@@ -382,7 +383,8 @@ required-features = ["polars", "sync-sender-qwp-ws", "sync-sender-http"]
 # row-build floor (Buffer append + clear, no network) + row-flush e2e
 # (flush per batch, AckLevel::Ok checkpoint every 64 batches). No polars
 # dependency. Uses ureq for the DEDUP table create + WAL count gate, hence
-# sync-sender-http. Run with:
+# sync-sender-http. Benchmark usage is documented in `doc/BENCHMARKS.md`. Run
+# with:
 #
 #   cargo run --release --example qwp_ingress_row \
 #       --features sync-sender-qwp-ws,sync-sender-http
@@ -390,10 +392,11 @@ required-features = ["polars", "sync-sender-qwp-ws", "sync-sender-http"]
 name = "qwp_ingress_row"
 required-features = ["sync-sender-qwp-ws", "sync-sender-http"]
 
-# Step 3 (§6) — Rust Polars egress parity on S1. Reads the table back via
-# fetch_all_polars / iter_polars / next_polars and reports decode vs
-# assemble vs the honest decode_plus_assemble sum, emitting the §3.2 JSON
-# (direction="egress"). Run with:
+# Rust Polars egress benchmark on S1. Reads the table back via
+# fetch_all_polars / iter_polars / next_polars and reports decode vs assemble
+# vs the honest decode_plus_assemble sum, emitting the JSON path summary
+# (direction="egress"). Benchmark usage is documented in `doc/BENCHMARKS.md`.
+# Run with:
 #
 #   cargo run --release --example qwp_egress_polars \
 #       --features polars,sync-reader-qwp-ws,sync-sender-http
@@ -403,7 +406,8 @@ required-features = ["polars", "sync-reader-qwp-ws", "sync-sender-http"]
 
 # Decoder microbenchmark anchoring the perf claims from commits
 # `8ec0a85` (zero-copy decode) and `1163d43` (tighter SYMBOL/VARCHAR
-# decode hot paths). Run with:
+# decode hot paths). Criterion benchmark usage is documented in
+# `doc/BENCHMARKS.md`. Run with:
 #
 #   cargo bench --features sync-reader-qwp-ws --bench decoder
 #
@@ -416,8 +420,8 @@ name = "decoder"
 harness = false
 required-features = ["sync-reader-qwp-ws"]
 
-# Columnar payload hot-path bench. Anchors the encoder floor in
-# `doc/QWP_UNIFIED_SENDER_M0_BASELINE.md` (memcpy-bound no-null path and
+# Columnar payload hot-path benchmark. Anchors the in-tree column-sender encoder
+# floor documented in `doc/BENCHMARKS.md` (memcpy-bound no-null path and
 # referenced-only symbol intern). Run with:
 #
 #   cargo bench --features sync-sender-qwp-ws --bench column_sender

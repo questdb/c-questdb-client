@@ -1,15 +1,14 @@
-//! Step 3 (doc/historical/QWP_DATAFRAME_BENCH_PLAN.md §6) — Rust **Polars ingress**
-//! parity for the shared S1 narrow / S2 wide schemas.
+//! Rust **Polars ingress** benchmark for the shared S1 narrow / S2 wide schemas.
 //!
 //! Measures `BorrowedSender::flush_polars_dataframe()` end-to-end on a
 //! `bench_schema::SchemaKind` (the same columns the pandas harness ingests),
 //! and separately the columnar-payload **encode floor**
 //! (`bench_encode_chunk_into`, the same path `benches/column_sender.rs`
 //! reports) on identical data, so the DataFrame→batches overhead is
-//! isolated. Emits the plan §3.2 JSON metric contract with
+//! isolated. Emits the JSON path summary documented in `doc/BENCHMARKS.md` with
 //! `client="rust-polars"`, `direction="ingress"`, matching the field
 //! names the Python harness (`benchmark_pandas_columnar.py`) emits, so a
-//! Step 4 aggregator consumes Python + Rust JSON uniformly.
+//! benchmark aggregator consumes Python + Rust JSON uniformly.
 //!
 //! * **S1 narrow** (5 cols): `ts` TIMESTAMP (designated), `id` LONG,
 //!   `price` DOUBLE, `sym` SYMBOL (Polars Categorical, card 8), `note`
@@ -64,7 +63,7 @@ use bench_schema::{N_WIDE_DOUBLES, N_WIDE_SYMS, SchemaKind};
 
 /// µs spacing for the designated timestamp: QuestDB TIMESTAMP is
 /// µs-resolution, so ns-spaced rows collapse and DEDUP folds them
-/// (plan §3.4). 1 µs apart keeps every row distinct and unique.
+/// before the DEDUP row-count gate. 1 µs apart keeps every row distinct.
 const TS_STEP_NANOS: i64 = 1_000;
 const TS_BASE_NANOS: i64 = 1_704_067_200_000_000_000;
 
@@ -267,7 +266,7 @@ fn build_chunk<'a>(kind: SchemaKind, data: &'a BenchData) -> Result<Chunk<'a>, B
 /// deterministic for a given chunk, so one encode suffices. (For S2 wide a
 /// single fresh-state encode carries the full 5×high-card symbol dict, so
 /// this overstates the warm per-flush bytes — `rows/s` stays the
-/// cross-client metric, see plan §3.2.)
+/// cross-client JSON path summary metric.)
 fn encoded_wire_bytes(kind: SchemaKind, data: &BenchData) -> Result<u64, Box<dyn Error>> {
     let chunk = build_chunk(kind, data)?;
     let mut state = BenchEncoderState::new();
@@ -381,7 +380,7 @@ fn measure_e2e(
 }
 
 // ---------------------------------------------------------------------------
-// HTTP/SQL helpers (DEDUP table + WAL-aware count gate, plan §3.4)
+// HTTP/SQL helpers (DEDUP table + WAL-aware row-count gate)
 // ---------------------------------------------------------------------------
 
 fn http_base(host: &str, port: u16) -> String {
@@ -431,6 +430,13 @@ fn wait_for_count(base: &str, table: &str, expected: u64) -> Result<u64, Box<dyn
 }
 
 // ---------------------------------------------------------------------------
+
+fn row_count_exit_code(check: Option<&bench_json::RowCountCheck>) -> i32 {
+    match check {
+        Some(check) if !check.ok => 2,
+        _ => 0,
+    }
+}
 
 fn main() -> Result<(), Box<dyn Error>> {
     let schema_name = std::env::var("SCHEMA").unwrap_or_else(|_| "s1-narrow".into());
@@ -536,7 +542,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             ),
         );
 
-        // DEDUP gate: count() must equal rows exactly (plan §3.4).
+        // DEDUP row-count gate: count() must equal rows exactly.
         eprintln!("[qwp_ingress_polars] waiting for WAL apply (count() == {rows}) ...");
         let count = wait_for_count(&base, table, rows as u64)?;
         report.row_count_check = Some(bench_json::RowCountCheck {
@@ -558,8 +564,12 @@ fn main() -> Result<(), Box<dyn Error>> {
         eprintln!("[qwp_ingress_polars] SKIP_E2E set — floor only");
     }
 
+    let exit_code = row_count_exit_code(report.row_count_check.as_ref());
     report.compute_ingress_headline();
     println!("{}", report.into_json());
+    if exit_code != 0 {
+        std::process::exit(exit_code);
+    }
     Ok(())
 }
 
@@ -568,4 +578,28 @@ fn env_usize(name: &str, default: usize) -> usize {
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(default)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::row_count_exit_code;
+    use crate::bench_json::RowCountCheck;
+
+    fn check(ok: bool) -> RowCountCheck {
+        RowCountCheck {
+            expected: 10,
+            actual: if ok { 10 } else { 9 },
+            ok,
+            inflated: false,
+        }
+    }
+
+    #[test]
+    fn row_count_exit_code_is_nonzero_only_for_failed_check() {
+        let valid = check(true);
+        let invalid = check(false);
+        assert_eq!(0, row_count_exit_code(None));
+        assert_eq!(0, row_count_exit_code(Some(&valid)));
+        assert_eq!(2, row_count_exit_code(Some(&invalid)));
+    }
 }

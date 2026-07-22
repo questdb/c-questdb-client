@@ -27,8 +27,10 @@
 //! [`Chunk`] and Arrow batches are payload orientations accepted by the same
 //! [`crate::BorrowedSender`] that flushes row-built [`crate::ingress::Buffer`]
 //! values. The columnar path ingests Pandas/Polars DataFrames without adding
-//! per-row conversion, copies, or dispatch. See
-//! `doc/QWP_UNIFIED_SENDER_DESIGN.md` for the architecture.
+//! per-row conversion, copies, or dispatch. A [`Chunk`] borrows caller-owned
+//! column buffers until the flush completes, while [`crate::BorrowedSender`]
+//! holds the pooled connection whose reusable outbound buffer owns the encoded
+//! frame.
 //!
 //! The user model is `DataFrame → Table`:
 //!

@@ -29,7 +29,9 @@
 //! aggregation copy. The no-null hot path for fixed-width columns is a
 //! single `extend_from_slice` (memcpy) straight from the caller's buffer.
 //!
-//! See `doc/QWP_UNIFIED_SENDER_DESIGN.md` for the shared publication design.
+//! `Chunk` borrows caller-owned column buffers through encoding; the encoded
+//! frame is then owned by the connection's reusable outbound buffer, so no
+//! borrowed column data escapes the flush.
 
 use std::slice;
 

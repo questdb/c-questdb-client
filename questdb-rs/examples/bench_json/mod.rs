@@ -1,8 +1,8 @@
-//! Shared JSON metric contract (doc/historical/QWP_DATAFRAME_BENCH_PLAN.md §3.2) for the
-//! Rust Polars ingress/egress examples. Emits the **same** field names as
+//! Shared JSON metric contract documented in `doc/BENCHMARKS.md` for the Rust
+//! Polars ingress/egress examples. Emits the **same** field names as
 //! the Python harness (`py-questdb-client/test/benchmark_pandas_columnar.py`:
 //! `summarize` + `add_rates` + `_path_summary` + the top-level report) so a
-//! Step 4 aggregator consumes Python (`py-pandas`) and Rust (`rust-polars`)
+//! benchmark aggregator consumes Python (`py-pandas`) and Rust (`rust-polars`)
 //! JSON uniformly.
 //!
 //! Kept dependency-light (hand-rolled JSON, no serde) and outside Cargo's
@@ -256,7 +256,7 @@ fn add_rates(obj: &mut Obj, median_s: f64, rows: usize, columns: usize, wire_byt
     obj.opt_float("mib_per_s", mib_per_s);
 }
 
-/// One contract-conformant per-path summary block (plan §3.2):
+/// One contract-conformant JSON path summary block:
 /// `summarize` + rates + `process_cpu` (its own summarize+rates) + `phase`
 /// + `warm` + `wire_bytes`.
 pub struct PathSummary {
@@ -340,7 +340,7 @@ pub struct Env {
 }
 
 impl Env {
-    /// Collect the machine block (plan §3.7). `extra` carries any
+    /// Collect the comparison environment's machine block. `extra` carries any
     /// language-specific library versions (e.g. polars) the example wants
     /// recorded alongside platform + rustc.
     pub fn collect(extra: &[(&str, &str)]) -> Self {
@@ -432,7 +432,7 @@ impl Report {
         self.paths.iter().find(|(n, _)| n == name).map(|(_, s)| s)
     }
 
-    /// Ingress headline (plan §3.6): pair the encode floor with the e2e
+    /// Ingress headline calculation: pair the encode floor with the e2e
     /// `flush_polars_dataframe` and report the e2e (the honest
     /// `populate_plus_encode`-style sum) + the marginal DataFrame
     /// overhead on top of the floor.
@@ -455,7 +455,7 @@ impl Report {
         self.headline = h;
     }
 
-    /// Egress headline (plan §3.6): `decode_plus_assemble` is the
+    /// Egress headline calculation: `decode_plus_assemble` is the
     /// `fetch_all_polars` e2e (decode + assemble); `decode-only` is the
     /// floor; the marginal assemble is the difference. Headline the sum.
     pub fn compute_egress_headline(&mut self) {
@@ -475,7 +475,7 @@ impl Report {
             assemble.rows_per_s_median,
         );
         h.opt_float("decode_plus_assemble_mib_per_s", assemble.mib_per_s);
-        // Cross-language comparand (plan §3.6): the strict analog of the
+        // The headline calculation's cross-language comparand: the strict analog of the
         // Java and C `materialize` headline field, folded in when the
         // caller also measured a `materialize` path.
         if let Some(materialize) = self.path("materialize") {
@@ -549,9 +549,10 @@ impl Report {
     }
 }
 
-/// `commits` block (plan §3.2 / §3.7). Reads `C_QUESTDB_CLIENT_COMMIT`
-/// from the environment if set (the build/run harness can inject it);
-/// otherwise null, since an example binary has no repo access at runtime.
+/// Build the comparison environment's `commits` block. Reads
+/// `C_QUESTDB_CLIENT_COMMIT` from the environment if set (the build/run
+/// harness can inject it); otherwise null, since an example binary has no repo
+/// access at runtime.
 fn commits_block() -> Obj {
     let mut o = Obj::new();
     o.opt_str(

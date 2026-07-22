@@ -1,5 +1,4 @@
-//! Step 3 (doc/historical/QWP_DATAFRAME_BENCH_PLAN.md §6) — Rust **Polars egress**
-//! parity for the shared S1 narrow / S2 wide schemas.
+//! Rust **Polars egress** benchmark for the shared S1 narrow / S2 wide schemas.
 //!
 //! Reads the bench table back over QWP/WS and measures the decode →
 //! DataFrame paths, the mirror of `qwp_ingress_polars.rs`:
@@ -13,9 +12,10 @@
 //!     `DataFrame`s vstacked (vs the full materialise).
 //!
 //! `Cursor::next_polars()` is exercised once for correctness. The honest
-//! headline (plan §3.6) is `decode_plus_assemble` = the `fetch_all_polars`
-//! median; `decode-only` is the floor; the marginal assemble is the
-//! difference. Emits the §3.2 JSON metric contract with
+//! headline calculation documented in `doc/BENCHMARKS.md` uses
+//! `decode_plus_assemble` = the `fetch_all_polars` median; `decode-only` is
+//! the floor; the marginal assemble is the difference. Emits the documented
+//! JSON path summary with
 //! `client="rust-polars"`, `direction="egress"`, matching the Python
 //! egress harness (`benchmark_pandas_egress.py`).
 //!
@@ -457,7 +457,7 @@ fn assert_rows(seen: u64, expected: u64) -> Result<(), Box<dyn Error>> {
 }
 
 // ---------------------------------------------------------------------------
-// Populate (DEDUP table + polars ingress + WAL count gate, plan §3.4)
+// Populate (DEDUP table + polars ingress + WAL-aware DEDUP row-count gate)
 // ---------------------------------------------------------------------------
 
 fn exec_sql(base: &str, sql: &str) -> Result<(), Box<dyn Error>> {
