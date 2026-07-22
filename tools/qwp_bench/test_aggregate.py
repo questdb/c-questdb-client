@@ -521,7 +521,7 @@ class AggregatorTest(unittest.TestCase):
         self.assertIn("macos/arm64", output)
         self.assertIn("floor-commit", output)
         self.assertIn("e2e-commit", output)
-        self.assertIn("boxes differ across inputs", output)
+        self.assertIn("platform classes differ across inputs", output)
         slot = next(iter(groups.values()))
         self.assertEqual(
             {"floor.json", "e2e.json"},
@@ -750,6 +750,198 @@ class AggregatorTest(unittest.TestCase):
         )
         for clients in group.values():
             self.assertEqual(["py-pandas", "rust-polars"], list(clients))
+
+    def test_surrogate_identity_strings_are_rejected(self):
+        scalar = report("encode-floor", schema="\U0001f600", row_check=None)
+        scalar["_source"] = "scalar.json"
+        self.assertEqual(1, len(aggregate.collect([scalar])))
+
+        for field in ("schema", "run_mode", "client"):
+            for index, invalid in enumerate(("\ud800", "\ud83d\ude00")):
+                value = report("encode-floor", row_check=None)
+                value[field] = invalid
+                value["_source"] = f"surrogate-{field}-{index}.json"
+                try:
+                    aggregate.collect([value])
+                except Exception as exc:
+                    with self.subTest(field=field, index=index):
+                        self.assertIsInstance(exc, aggregate.ReportError)
+                        self.assertIn(field, str(exc))
+                else:
+                    self.fail(f"surrogate {field} value was accepted")
+
+        scalar_client = report(
+            "encode-floor", client="\U0001f600", row_check=None
+        )
+        surrogate_client = report(
+            "encode-floor", client="\ud83d\ude00", row_check=None
+        )
+        scalar_client["_source"] = "scalar-client.json"
+        surrogate_client["_source"] = "surrogate-client.json"
+        try:
+            aggregate.collect([scalar_client, surrogate_client])
+        except Exception as exc:
+            self.assertIsInstance(exc, aggregate.ReportError)
+        else:
+            self.fail("scalar and surrogate-pair client identities both survived")
+
+        scalar_groups = aggregate.collect([scalar])
+        scalar_key = next(iter(scalar_groups))
+        surrogate_key = scalar_key._replace(schema="\ud83d\ude00")
+        with self.assertRaisesRegex(aggregate.ReportError, "collision"):
+            aggregate.render_raw(
+                {
+                    scalar_key: scalar_groups[scalar_key],
+                    surrogate_key: scalar_groups[scalar_key],
+                },
+                "text",
+            )
+
+        scalar_client_groups = aggregate.collect([scalar_client])
+        scalar_client_slot = next(iter(scalar_client_groups.values()))
+        role = "columnar CPU floor"
+        scalar_client_slot["grid"][role]["\ud83d\ude00"] = (
+            scalar_client_slot["grid"][role]["\U0001f600"]
+        )
+        with self.assertRaisesRegex(aggregate.ReportError, "collision"):
+            aggregate.render_raw(scalar_client_groups, "text")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = pathlib.Path(tmp) / "surrogate.json"
+            value = report("encode-floor", schema="\ud800", row_check=None)
+            path.write_text(json.dumps(value))
+            result = subprocess.run(
+                [sys.executable, str(HERE / "aggregate.py"), str(path),
+                 "--ingress-bpr", "1"],
+                text=True, capture_output=True, check=False,
+            )
+            self.assertEqual(2, result.returncode, result.stderr)
+            self.assertIn(path.name, result.stderr)
+            self.assertIn("schema", result.stderr)
+            self.assertNotIn("Traceback", result.stderr)
+            self.assertEqual("", result.stdout)
+
+    def test_ingress_row_count_check_must_be_coherent(self):
+        valid = report("row-flush", phase="e2e", row_check=True)
+        valid["_source"] = "valid-row-check.json"
+        self.assertEqual(1, len(aggregate.collect([valid])))
+
+        missing = object()
+        cases = (
+            ("expected", missing),
+            ("actual", missing),
+            ("ok", missing),
+            ("inflated", missing),
+            ("expected", True),
+            ("actual", True),
+            ("expected", 0),
+            ("actual", 0),
+            ("expected", 9_999_999),
+            ("actual", 9_999_999),
+            ("ok", 1),
+            ("inflated", True),
+            ("inflated", 0),
+        )
+        for index, (field, invalid) in enumerate(cases):
+            value = report("row-flush", phase="e2e", row_check=True)
+            if invalid is missing:
+                value["row_count_check"].pop(field)
+            else:
+                value["row_count_check"][field] = invalid
+            value["_source"] = f"row-check-{index}.json"
+            try:
+                aggregate.collect([value])
+            except Exception as exc:
+                with self.subTest(index=index, field=field):
+                    self.assertIsInstance(exc, aggregate.ReportError)
+                    self.assertIn(field, str(exc))
+            else:
+                self.fail(f"invalid row-count {field} was accepted")
+
+        valid_floor = report("encode-floor", row_check=True)
+        valid_floor["_source"] = "valid-floor-check.json"
+        self.assertEqual(1, len(aggregate.collect([valid_floor])))
+
+        invalid_floor = report("encode-floor", row_check=True)
+        invalid_floor["row_count_check"]["actual"] -= 1
+        invalid_floor["_source"] = "invalid-floor-check.json"
+        with self.assertRaisesRegex(
+            aggregate.ReportError, r"invalid-floor-check\.json.*actual"
+        ):
+            aggregate.collect([invalid_floor])
+
+        null_floor = report("encode-floor", row_check=None)
+        null_floor["row_count_check"] = None
+        null_floor["_source"] = "null-floor-check.json"
+        with self.assertRaisesRegex(
+            aggregate.ReportError, r"null-floor-check\.json.*row_count_check"
+        ):
+            aggregate.collect([null_floor])
+
+        exempt_egress = report(
+            "decode-only", direction="egress", row_check=True
+        )
+        exempt_egress["row_count_check"].update(
+            expected=True, actual=0, ok=False, inflated=True
+        )
+        exempt_egress["_source"] = "egress-row-check.json"
+        self.assertEqual(1, len(aggregate.collect([exempt_egress])))
+
+    def test_environment_does_not_claim_physical_box_identity(self):
+        floor = report("encode-floor", row_check=None)
+        floor["machine"] = {
+            "platform": "linux", "arch": "x86_64", "cpu": "Intel Xeon",
+        }
+        floor["_source"] = "intel.json"
+        e2e = report("flush-polars-dataframe", phase="e2e")
+        e2e["machine"] = {
+            "platform": "linux", "arch": "x86_64", "cpu": "AMD EPYC",
+        }
+        e2e["_source"] = "amd.json"
+
+        groups = aggregate.collect([floor, e2e])
+        for fmt in ("md", "text"):
+            output = aggregate.render(groups, fmt)
+            self.assertNotIn("single box", output.lower())
+            self.assertIn("single platform class", output.lower())
+            self.assertIn("physical box unverified", output.lower())
+
+    def test_markdown_user_fields_are_escaped_and_single_line(self):
+        value = report(
+            "encode-floor", schema="s1\\name\n## injected",
+            client="alpha \\ | forged\nnext", run_mode="full|fast\n# mode",
+            row_check=None,
+        )
+        value["commits"]["c_questdb_client"] = "a\\|b\nnext"
+        value["_source"] = "markdown.json"
+        output = aggregate.render(
+            aggregate.collect([value]), "md", ingress_override=1.0
+        )
+
+        self.assertNotIn("\n## injected", output)
+        self.assertNotIn("\n# mode", output)
+        self.assertNotIn("| role | alpha | forged |", output)
+        self.assertIn(r"s1\\name ## injected", output)
+        self.assertIn(r"run_mode=full\|fast # mode", output)
+        self.assertIn(r"| role | alpha \\ \| forged next |", output)
+        self.assertIn(r"c=a\\\|b next", output)
+
+    def test_huge_programmatic_bpr_override_is_report_error(self):
+        for direction, argument, flag in (
+            ("ingress", {"ingress_override": 10 ** 400}, "--ingress-bpr"),
+            ("egress", {"egress_override": 10 ** 400}, "--egress-bpr"),
+        ):
+            key = aggregate.GroupKey(
+                direction, "s1-narrow", 10_000_000, 1, "full"
+            )
+            try:
+                aggregate.bytes_per_row(key, **argument)
+            except Exception as exc:
+                with self.subTest(direction=direction):
+                    self.assertIsInstance(exc, aggregate.ReportError)
+                    self.assertIn(flag, str(exc))
+            else:
+                self.fail(f"huge {direction} B/row override was accepted")
 
 
 if __name__ == "__main__":

@@ -81,6 +81,36 @@ def reject_json_constant(value):
     raise ValueError(f"invalid JSON numeric constant {value}")
 
 
+def reject_surrogate_code_points(source, field, value):
+    if any(0xD800 <= ord(char) <= 0xDFFF for char in value):
+        raise ReportError(
+            f"{source}: {field} must not contain surrogate code points"
+        )
+
+
+def rendered_text(value, fmt):
+    """Keep report-provided text on one output line and Markdown-safe."""
+    result = []
+    replacing_control = False
+    for char in value:
+        code_point = ord(char)
+        is_control = (
+            code_point < 0x20
+            or 0x7F <= code_point <= 0x9F
+            or code_point in (0x2028, 0x2029)
+        )
+        if is_control:
+            if not replacing_control:
+                result.append(" ")
+        else:
+            result.append(char)
+        replacing_control = is_control
+    text = "".join(result)
+    if fmt == "md":
+        text = text.replace("\\", "\\\\").replace("|", "\\|")
+    return text
+
+
 def load_reports(paths):
     reports = []
     for path in paths:
@@ -108,6 +138,8 @@ def comparison_key(report):
         raise ReportError(f"{source}: schema must be a non-empty string")
     if not isinstance(run_mode, str) or not run_mode:
         raise ReportError(f"{source}: run_mode must be a non-empty string")
+    reject_surrogate_code_points(source, "schema", schema)
+    reject_surrogate_code_points(source, "run_mode", run_mode)
     if isinstance(rows, bool) or not isinstance(rows, int) or rows <= 0:
         raise ReportError(f"{source}: rows must be a positive integer")
     senders = 1 if direction == "egress" else report.get("senders", 1)
@@ -120,19 +152,38 @@ def validate_row_count(report, paths):
     if report["direction"] != "ingress":
         return
     source = report.get("_source", "<input>")
-    check = report.get("row_count_check")
-    if check is not None and (
-        not isinstance(check, dict) or check.get("ok") is not True
-    ):
-        raise ReportError(f"{source}: ingress row_count_check.ok must be true")
     has_e2e = any(
         ROLE_OF_PATH[name][1] in INGRESS_E2E_ROLES for name in paths
     )
-    if has_e2e and (
-        not isinstance(check, dict) or check.get("ok") is not True
-    ):
+    if "row_count_check" not in report:
+        if not has_e2e:
+            return
         raise ReportError(
-            f"{source}: ingress e2e report requires row_count_check.ok=true"
+            f"{source}: ingress e2e report requires row_count_check"
+        )
+    check = report["row_count_check"]
+    if not isinstance(check, dict):
+        raise ReportError(f"{source}: ingress row_count_check must be an object")
+    for field in ("expected", "actual"):
+        value = check.get(field)
+        if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+            raise ReportError(
+                f"{source}: ingress row_count_check.{field} must be a "
+                "positive integer"
+            )
+    if check["expected"] != report["rows"]:
+        raise ReportError(
+            f"{source}: ingress row_count_check.expected must equal rows"
+        )
+    if check["actual"] != check["expected"]:
+        raise ReportError(
+            f"{source}: ingress row_count_check.actual must equal expected"
+        )
+    if check.get("ok") is not True:
+        raise ReportError(f"{source}: ingress row_count_check.ok must be true")
+    if check.get("inflated") is not False:
+        raise ReportError(
+            f"{source}: ingress row_count_check.inflated must be false"
         )
 
 
@@ -172,10 +223,13 @@ def validate_summary_metrics(source, path, summary):
             )
 
 
-def coarse_box(machine):
-    """Reduce a machine block to a coarse (os, arch) token for the single-box
-    check; py and rust spell these differently (macOS-26..-arm64 vs macos /
-    aarch64), so we compare families, not exact strings."""
+def platform_class(machine):
+    """Reduce a machine block to a coarse (os, arch) compatibility token.
+
+    Producers spell these differently (macOS-26..-arm64 vs macos/aarch64),
+    so compare families rather than exact strings. This is not physical-machine
+    identity.
+    """
     blob = " ".join(
         str(machine.get(k, "")) for k in ("platform", "arch", "cpu")).lower()
     if "arm64" in blob or "aarch64" in blob:
@@ -209,6 +263,7 @@ def collect(reports):
         client = report.get("client")
         if not isinstance(client, str) or not client:
             raise ReportError(f"{source}: client must be a non-empty string")
+        reject_surrogate_code_points(source, "client", client)
         paths = report.get("paths")
         if not isinstance(paths, dict) or not paths:
             raise ReportError(f"{source}: paths must be a non-empty object")
@@ -231,6 +286,10 @@ def collect(reports):
         commits = report.get("commits", {})
         if not isinstance(commits, dict):
             raise ReportError(f"{source}: commits must be an object")
+        for name in ("c_questdb_client", "py_questdb_client"):
+            value = commits.get(name)
+            if isinstance(value, str):
+                reject_surrogate_code_points(source, f"commits.{name}", value)
 
         slot = groups.setdefault(key, {
             "grid": {}, "clients": [], "env": [], "sources": [],
@@ -242,7 +301,7 @@ def collect(reports):
             "client": client,
             "machine": machine,
             "commits": commits,
-            "box": coarse_box(machine),
+            "platform_class": platform_class(machine),
             "source": source,
         })
         slot["sources"].append(source)
@@ -281,12 +340,17 @@ def bytes_per_row(key, ingress_override=None, egress_override=None):
     override = ingress_override if key.direction == "ingress" else egress_override
     flag = "--ingress-bpr" if key.direction == "ingress" else "--egress-bpr"
     if override is not None:
-        if (
-            isinstance(override, bool)
-            or not isinstance(override, (int, float))
-            or not math.isfinite(override)
-            or override <= 0
+        if isinstance(override, bool) or not isinstance(
+            override, (int, float)
         ):
+            raise ReportError(f"{flag} must be positive")
+        try:
+            finite = math.isfinite(override)
+        except (OverflowError, TypeError, ValueError) as exc:
+            raise ReportError(
+                f"{flag} is outside the supported numeric range"
+            ) from exc
+        if not finite or override <= 0:
             raise ReportError(f"{flag} must be positive")
         return override
     defaults = CANONICAL_BPR.get((key.schema, key.rows))
@@ -300,9 +364,12 @@ def bytes_per_row(key, ingress_override=None, egress_override=None):
 
 def render_group(key, slot, bpr, fmt):
     clients = sorted(slot["clients"], key=client_rank)
+    client_labels = [rendered_text(client, fmt) for client in clients]
+    schema = rendered_text(key.schema, fmt)
+    run_mode = rendered_text(key.run_mode, fmt)
     title = (
-        f"{key.direction.title()} — {key.schema}, {key.rows:,} rows, "
-        f"senders={key.senders}, run_mode={key.run_mode} "
+        f"{key.direction.title()} — {schema}, {key.rows:,} rows, "
+        f"senders={key.senders}, run_mode={run_mode} "
         f"(GiB/s @ {bpr:g} on-wire B/row)"
     )
 
@@ -314,7 +381,7 @@ def render_group(key, slot, bpr, fmt):
     lines = []
     if fmt == "md":
         lines.append(f"### {title}\n")
-        lines.append("| role | " + " | ".join(clients) + " |")
+        lines.append("| role | " + " | ".join(client_labels) + " |")
         lines.append("|" + "---|" * (len(clients) + 1))
         for role in roles:
             cells = [fmt_cell(slot["grid"][role].get(c), bpr) for c in clients]
@@ -323,7 +390,7 @@ def render_group(key, slot, bpr, fmt):
         lines.append(title)
         w = max([len(r) for r in roles] + [4])
         lines.append("  " + "role".ljust(w) + "  "
-                     + "  ".join(c.center(24) for c in clients))
+                     + "  ".join(c.center(24) for c in client_labels))
         for role in roles:
             cells = [fmt_cell(slot["grid"][role].get(c), bpr).center(24)
                      for c in clients]
@@ -334,19 +401,23 @@ def render_group(key, slot, bpr, fmt):
 def render_env(groups, fmt):
     lines = []
     by_client = {}
-    distinct_boxes = set()
+    distinct_platform_classes = set()
     for slot in groups.values():
         for env in slot["env"]:
             by_client.setdefault(env["client"], []).append(env)
-            distinct_boxes.add(env["box"])
-    warn = len(distinct_boxes) > 1
+            distinct_platform_classes.add(env["platform_class"])
+    warn = len(distinct_platform_classes) > 1
 
     head = "## Environment" if fmt == "md" else "Environment"
     lines.append(head)
     for client in sorted(by_client, key=client_rank):
         environments = by_client[client]
-        client_boxes = sorted({env["box"] for env in environments})
-        box_text = ", ".join(f"{os_}/{arch}" for os_, arch in client_boxes)
+        client_platforms = sorted({
+            env["platform_class"] for env in environments
+        })
+        platform_text = ", ".join(
+            f"{os_}/{arch}" for os_, arch in client_platforms
+        )
 
         def commit_text(name):
             values = sorted({
@@ -354,23 +425,28 @@ def render_env(groups, fmt):
                 for env in environments
                 if (value := env["commits"].get(name))
             })
-            return "/".join(values) or "—"
+            return rendered_text("/".join(values) or "—", fmt)
 
         cc = commit_text("c_questdb_client")
         pc = commit_text("py_questdb_client")
+        client_label = rendered_text(client, fmt)
         lines.append(
-            f"- **{client}**: {box_text} · py={pc} · c={cc}"
+            f"- **{client_label}**: {platform_text} · py={pc} · c={cc}"
             if fmt == "md" else
-            f"  {client}: {box_text}  py={pc} c={cc}")
+            f"  {client_label}: {platform_text}  py={pc} c={cc}")
     if warn:
         lines.append(
-            ("> ⚠️ **Boxes differ across inputs** " if fmt == "md" else
-             "  !! boxes differ across inputs ")
-            + f"({sorted(distinct_boxes)}) — comparisons require one box.")
+            ("> ⚠️ **Platform classes differ across inputs** "
+             if fmt == "md" else
+             "  !! platform classes differ across inputs ")
+            + f"({sorted(distinct_platform_classes)}) — physical box "
+            "unverified; comparisons require compatible hardware.")
     else:
         lines.append(
-            ("> ✅ single box " if fmt == "md" else "  single box ")
-            + f"({next(iter(distinct_boxes))}).")
+            ("> ⚠️ **Single platform class** " if fmt == "md" else
+             "  !! single platform class ")
+            + f"({next(iter(distinct_platform_classes))}) — physical box "
+            "unverified.")
     return "\n".join(lines)
 
 
@@ -386,6 +462,15 @@ def raw_group_label(key):
         f"direction={key.direction}|schema={escape(key.schema)}|rows={key.rows}|"
         f"senders={key.senders}|run_mode={escape(key.run_mode)}"
     )
+
+
+def reject_duplicate_json_members(pairs):
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise ReportError("raw JSON member collision after encoding")
+        result[key] = value
+    return result
 
 
 def render_raw(groups, fmt):
@@ -419,7 +504,10 @@ def render_raw(groups, fmt):
             for role in roles
         }
     try:
-        body = json.dumps(raw, indent=2, allow_nan=False)
+        body = json.dumps(raw, indent=2, allow_nan=False, ensure_ascii=True)
+        json.loads(body, object_pairs_hook=reject_duplicate_json_members)
+    except ReportError:
+        raise
     except (OverflowError, ValueError) as exc:
         raise ReportError(f"cannot render raw metrics: {exc}") from exc
     if fmt == "md":
