@@ -548,6 +548,209 @@ class AggregatorTest(unittest.TestCase):
         for forbidden in ("Step 4", "§", "_PLAN", "historical"):
             self.assertNotIn(forbidden, help_text)
 
+    def test_raw_group_identity_is_collision_safe(self):
+        first = report(
+            "encode-floor", schema="x", rows=1, senders=1,
+            run_mode="z|rows=2|senders=2|run_mode=y", row_check=None,
+        )
+        second = report(
+            "encode-floor", schema="x|rows=1|senders=1|run_mode=z",
+            rows=2, senders=2, run_mode="y", row_check=None,
+        )
+        first["paths"]["encode-floor"]["rows_per_s_median"] = 1_000_000.0
+        second["paths"]["encode-floor"]["rows_per_s_median"] = 3_000_000.0
+        first["_source"] = "collision-first.json"
+        second["_source"] = "collision-second.json"
+
+        groups = aggregate.collect([first, second])
+        raw_text = aggregate.render_raw(groups, "text").split("\n", 1)[1]
+        raw = json.loads(raw_text)
+        self.assertEqual(2, len(groups))
+        self.assertEqual({
+            "direction=ingress|schema=x|rows=1|senders=1|"
+            "run_mode=z%7Crows%3D2%7Csenders%3D2%7Crun_mode%3Dy",
+            "direction=ingress|schema=x%7Crows%3D1%7Csenders%3D1%7C"
+            "run_mode%3Dz|rows=2|senders=2|run_mode=y",
+        }, set(raw))
+        self.assertEqual(
+            [1_000_000.0, 3_000_000.0],
+            sorted(
+                group["columnar CPU floor"]["rust-polars"]["rows_per_s"]
+                for group in raw.values()
+            ),
+        )
+
+        delimiter = report(
+            "encode-floor", schema="x|y", rows=3, row_check=None
+        )
+        percent = report(
+            "encode-floor", schema="x%7Cy", rows=3, row_check=None
+        )
+        delimiter["_source"] = "delimiter.json"
+        percent["_source"] = "percent.json"
+        percent_raw = json.loads(
+            aggregate.render_raw(
+                aggregate.collect([delimiter, percent]), "text"
+            ).split("\n", 1)[1]
+        )
+        self.assertEqual({
+            "direction=ingress|schema=x%7Cy|rows=3|senders=1|run_mode=full",
+            "direction=ingress|schema=x%257Cy|rows=3|senders=1|run_mode=full",
+        }, set(percent_raw))
+
+    def test_ingress_e2e_role_requires_row_check_despite_phase(self):
+        e2e_paths = (
+            "real-client", "flush-polars-dataframe", "flush-chunks",
+            "row-flush",
+        )
+        for path in e2e_paths:
+            for phase in ("floor", False, None):
+                value = report(path, phase=phase, row_check=None)
+                if phase is None:
+                    value["paths"][path].pop("phase")
+                value["_source"] = f"{path}-{phase}.json"
+                with self.subTest(path=path, phase=phase), \
+                        self.assertRaisesRegex(
+                            aggregate.ReportError,
+                            rf"{path}-{phase}\.json.*e2e.*row_count_check",
+                        ):
+                    aggregate.collect([value])
+
+        mislabeled_floor = report(
+            "encode-floor", phase="e2e", row_check=None
+        )
+        mislabeled_floor["_source"] = "mislabeled-floor.json"
+        self.assertEqual(1, len(aggregate.collect([mislabeled_floor])))
+
+    def test_numeric_summaries_are_strict_and_cli_errors_are_controlled(self):
+        invalid_metrics = (
+            ("rows_per_s_median", True),
+            ("rows_per_s_median", -1),
+            ("rows_per_s_median", 0),
+            ("rows_per_s_median", None),
+            ("rows_per_s_median", "fast"),
+            ("median_s", float("nan")),
+            ("median_s", -1),
+            ("median_s", 0),
+            ("median_s", None),
+            ("mib_per_s", float("inf")),
+            ("mib_per_s", -1),
+        )
+        for index, (metric, invalid) in enumerate(invalid_metrics):
+            value = report("encode-floor", row_check=None)
+            value["paths"]["encode-floor"][metric] = invalid
+            value["_source"] = f"invalid-{index}.json"
+            with self.subTest(metric=metric, invalid=invalid), \
+                    self.assertRaisesRegex(
+                        aggregate.ReportError,
+                        rf"invalid-{index}\.json.*{metric}",
+                ):
+                aggregate.collect([value])
+
+        for metric in ("rows_per_s_median", "median_s", "mib_per_s"):
+            value = report("encode-floor", row_check=None)
+            value["paths"]["encode-floor"].pop(metric)
+            value["_source"] = f"missing-{metric}.json"
+            with self.subTest(missing=metric), self.assertRaisesRegex(
+                aggregate.ReportError,
+                rf"missing-{metric}\.json.*{metric}",
+            ):
+                aggregate.collect([value])
+
+        null_mib = report("encode-floor", row_check=None)
+        null_mib["_source"] = "null-mib.json"
+        self.assertEqual(1, len(aggregate.collect([null_mib])))
+        zero_mib = report("encode-floor", row_check=None)
+        zero_mib["paths"]["encode-floor"]["mib_per_s"] = 0
+        zero_mib["_source"] = "zero-mib.json"
+        self.assertEqual(1, len(aggregate.collect([zero_mib])))
+
+        def invoke(path):
+            return subprocess.run(
+                [sys.executable, str(HERE / "aggregate.py"), str(path)],
+                text=True, capture_output=True, check=False,
+            )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            values = (
+                ("nan", "rows_per_s_median", float("nan")),
+                ("infinity", "rows_per_s_median", float("inf")),
+                ("boolean", "rows_per_s_median", True),
+                ("oversized", "rows_per_s_median", 10 ** 400),
+                ("raw-median", "median_s", "slow"),
+                ("raw-mib", "mib_per_s", -1),
+            )
+            for name, metric, invalid in values:
+                value = report("encode-floor", row_check=None)
+                value["paths"]["encode-floor"][metric] = invalid
+                path = root / f"{name}.json"
+                path.write_text(json.dumps(value))
+                result = invoke(path)
+                with self.subTest(cli=name):
+                    self.assertEqual(2, result.returncode, result.stderr)
+                    self.assertIn(path.name, result.stderr)
+                    self.assertNotIn("Traceback", result.stderr)
+                    self.assertEqual("", result.stdout)
+                    if name not in ("nan", "infinity"):
+                        self.assertIn("encode-floor", result.stderr)
+                        self.assertIn(metric, result.stderr)
+                    else:
+                        self.assertIn(
+                            "invalid JSON numeric constant", result.stderr
+                        )
+
+            exponent_value = report("encode-floor", row_check=None)
+            exponent_text = json.dumps(exponent_value).replace(
+                '"rows_per_s_median": 2000000.0',
+                '"rows_per_s_median": 1e400',
+                1,
+            )
+            exponent_path = root / "exponent.json"
+            exponent_path.write_text(exponent_text)
+            exponent_result = invoke(exponent_path)
+            self.assertEqual(2, exponent_result.returncode)
+            self.assertIn(exponent_path.name, exponent_result.stderr)
+            self.assertIn("encode-floor", exponent_result.stderr)
+            self.assertIn("rows_per_s_median", exponent_result.stderr)
+            self.assertNotIn("Traceback", exponent_result.stderr)
+            self.assertEqual("", exponent_result.stdout)
+
+        defensive = report("encode-floor", row_check=None)
+        defensive["_source"] = "defensive.json"
+        groups = aggregate.collect([defensive])
+        slot = next(iter(groups.values()))
+        slot["grid"]["columnar CPU floor"]["rust-polars"][
+            "rows_per_s_median"
+        ] = float("nan")
+        with self.assertRaises(aggregate.ReportError):
+            aggregate.render_raw(groups, "text")
+
+    def test_nested_raw_output_is_deterministic(self):
+        values = []
+        for client in ("rust-polars", "py-pandas"):
+            e2e = report(
+                "flush-polars-dataframe", client=client, phase="e2e"
+            )
+            floor = report("encode-floor", client=client, row_check=None)
+            e2e["_source"] = f"{client}-e2e.json"
+            floor["_source"] = f"{client}-floor.json"
+            values.extend((e2e, floor))
+
+        forward = aggregate.render_raw(aggregate.collect(values), "text")
+        reverse = aggregate.render_raw(
+            aggregate.collect(list(reversed(values))), "text"
+        )
+        self.assertEqual(forward, reverse)
+
+        raw = json.loads(forward.split("\n", 1)[1])
+        group = next(iter(raw.values()))
+        self.assertEqual(
+            ["columnar CPU floor", "columnar e2e"], list(group)
+        )
+        for clients in group.values():
+            self.assertEqual(["py-pandas", "rust-polars"], list(clients))
+
 
 if __name__ == "__main__":
     unittest.main()

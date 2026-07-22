@@ -71,8 +71,14 @@ ROLE_ORDER = {
                "-> pandas (lazy/iter)", "Arrow C-stream"],
 }
 
-# Stable client column order; unknown clients append in first-seen order.
+INGRESS_E2E_ROLES = frozenset({"columnar e2e", "row e2e"})
+
+# Stable client column order; unknown clients follow in lexical order.
 CLIENT_ORDER = ["py-pandas", "rust-polars", "java", "go"]
+
+
+def reject_json_constant(value):
+    raise ValueError(f"invalid JSON numeric constant {value}")
 
 
 def load_reports(paths):
@@ -80,7 +86,7 @@ def load_reports(paths):
     for path in paths:
         try:
             with open(path, encoding="utf-8") as handle:
-                value = json.load(handle)
+                value = json.load(handle, parse_constant=reject_json_constant)
         except (OSError, ValueError) as exc:
             raise ReportError(f"cannot load {path}: {exc}") from exc
         if not isinstance(value, dict):
@@ -120,8 +126,7 @@ def validate_row_count(report, paths):
     ):
         raise ReportError(f"{source}: ingress row_count_check.ok must be true")
     has_e2e = any(
-        isinstance(summary, dict) and summary.get("phase") == "e2e"
-        for summary in paths.values()
+        ROLE_OF_PATH[name][1] in INGRESS_E2E_ROLES for name in paths
     )
     if has_e2e and (
         not isinstance(check, dict) or check.get("ok") is not True
@@ -129,6 +134,42 @@ def validate_row_count(report, paths):
         raise ReportError(
             f"{source}: ingress e2e report requires row_count_check.ok=true"
         )
+
+
+def validate_summary_metrics(source, path, summary):
+    for name in ("rows_per_s_median", "median_s", "mib_per_s"):
+        if name not in summary:
+            raise ReportError(
+                f"{source}: path {path!r} requires {name}"
+            )
+        value = summary[name]
+        if value is None:
+            if name == "mib_per_s":
+                continue
+            raise ReportError(
+                f"{source}: path {path!r} {name} must be a finite "
+                "positive number"
+            )
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            sign = "non-negative" if name == "mib_per_s" else "positive"
+            raise ReportError(
+                f"{source}: path {path!r} {name} must be a finite "
+                f"{sign} number"
+            )
+        try:
+            number = float(value)
+        except (OverflowError, ValueError) as exc:
+            raise ReportError(
+                f"{source}: path {path!r} {name} is outside the supported "
+                "numeric range"
+            ) from exc
+        invalid_sign = number < 0 if name == "mib_per_s" else number <= 0
+        if not math.isfinite(number) or invalid_sign:
+            sign = "non-negative" if name == "mib_per_s" else "positive"
+            raise ReportError(
+                f"{source}: path {path!r} {name} must be a finite "
+                f"{sign} number"
+            )
 
 
 def coarse_box(machine):
@@ -182,6 +223,7 @@ def collect(reports):
                 )
             if not isinstance(summary, dict):
                 raise ReportError(f"{source}: path {name!r} must be an object")
+            validate_summary_metrics(source, name, summary)
         validate_row_count(report, paths)
         machine = report.get("machine", {})
         if not isinstance(machine, dict):
@@ -223,7 +265,15 @@ def fmt_cell(summary, bpr):
     rps = summary.get("rows_per_s_median")
     if not isinstance(rps, (int, float)):
         return "—"
-    gibs = rps * bpr / GIB
+    try:
+        rps = float(rps)
+        gibs = (rps / GIB) * bpr
+    except (OverflowError, ValueError) as exc:
+        raise ReportError(
+            "rows_per_s_median is outside the renderable range"
+        ) from exc
+    if not math.isfinite(rps) or not math.isfinite(gibs):
+        raise ReportError("rows_per_s_median is outside the renderable range")
     return f"{rps / 1e6:.1f} M/s · {gibs:.2f} GiB/s"
 
 
@@ -324,6 +374,20 @@ def render_env(groups, fmt):
     return "\n".join(lines)
 
 
+def raw_group_label(key):
+    def escape(value):
+        return (
+            value.replace("%", "%25")
+            .replace("|", "%7C")
+            .replace("=", "%3D")
+        )
+
+    return (
+        f"direction={key.direction}|schema={escape(key.schema)}|rows={key.rows}|"
+        f"senders={key.senders}|run_mode={escape(key.run_mode)}"
+    )
+
+
 def render_raw(groups, fmt):
     raw = {}
     direction_rank = {"ingress": 0, "egress": 1}
@@ -335,22 +399,29 @@ def render_raw(groups, fmt):
         ),
     )
     for key in ordered:
-        label = (
-            f"direction={key.direction}|schema={key.schema}|rows={key.rows}|"
-            f"senders={key.senders}|run_mode={key.run_mode}"
-        )
+        label = raw_group_label(key)
+        if label in raw:
+            raise ReportError(f"raw group label collision: {label}")
+        grid = groups[key]["grid"]
+        roles = [role for role in ROLE_ORDER[key.direction] if role in grid]
+        roles += sorted(role for role in grid if role not in roles)
         raw[label] = {
             role: {
                 client: {
-                    "rows_per_s": summary.get("rows_per_s_median"),
-                    "mib_per_s_native": summary.get("mib_per_s"),
-                    "median_s": summary.get("median_s"),
+                    "rows_per_s": grid[role][client].get(
+                        "rows_per_s_median"
+                    ),
+                    "mib_per_s_native": grid[role][client].get("mib_per_s"),
+                    "median_s": grid[role][client].get("median_s"),
                 }
-                for client, summary in columns.items()
+                for client in sorted(grid[role], key=client_rank)
             }
-            for role, columns in groups[key]["grid"].items()
+            for role in roles
         }
-    body = json.dumps(raw, indent=2)
+    try:
+        body = json.dumps(raw, indent=2, allow_nan=False)
+    except (OverflowError, ValueError) as exc:
+        raise ReportError(f"cannot render raw metrics: {exc}") from exc
     if fmt == "md":
         return f"## Raw\n```json\n{body}\n```"
     return f"Raw\n{body}"
