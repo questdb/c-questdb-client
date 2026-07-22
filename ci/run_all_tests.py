@@ -73,6 +73,7 @@ def run_cpp_tests():
         'test_arrow_egress',
         'test_arrow_ingress',
         'test_column_sender',
+        'qwp_bench_selftest',
     ]
     # Each C++ target may also have a `_cxx20` twin (QUESTDB_TEST_CXX20_VARIANTS);
     # run it too when present so the C++20 header paths are exercised.
@@ -85,6 +86,13 @@ def run_cpp_tests():
         twin = find_binary(build_dir, f'{name}_cxx20', exe_suffix)
         if twin is not None:
             run_cmd(str(twin))
+
+
+def run_qwp_benchmark_tests():
+    """Offline checks for benchmark report handling and cell orchestration."""
+    run_cmd(sys.executable, 'tools/qwp_bench/test_aggregate.py')
+    if platform.system() != 'Windows':
+        run_cmd('bash', 'tools/qwp_bench/net/test_run_cell.sh')
 
 
 def run_integration_tests():
@@ -138,6 +146,8 @@ def main():
             'cargo, cpp, unit, integration, soak-selftest '
             '(or no argument for all).\n')
         sys.exit(2)
+    if mode in ('all', 'unit', 'cpp'):
+        run_qwp_benchmark_tests()
     if mode in ('all', 'unit', 'cargo'):
         run_cargo_tests()
     if mode in ('all', 'unit', 'cpp'):

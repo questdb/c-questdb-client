@@ -1,4 +1,4 @@
-/* glibc hides XSI names (strdup, getrusage) under strict -std=c11
+/* glibc hides getrusage under strict -std=c11
  * (CMAKE_C_EXTENSIONS OFF); macOS headers expose them unconditionally. */
 #if defined(__linux__)
 #define _XOPEN_SOURCE 600
@@ -9,18 +9,59 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#if defined(_WIN32)
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>
+#else
 #include <sys/resource.h>
 #include <time.h>
+#endif
 
 uint64_t now_ns(void)
 {
+#if defined(_WIN32)
+    LARGE_INTEGER frequency;
+    LARGE_INTEGER counter;
+    if (!QueryPerformanceFrequency(&frequency)
+        || !QueryPerformanceCounter(&counter)
+        || frequency.QuadPart <= 0
+        || counter.QuadPart < 0) {
+        return 0;
+    }
+    uint64_t ticks = (uint64_t)counter.QuadPart;
+    uint64_t ticks_per_second = (uint64_t)frequency.QuadPart;
+    return (ticks / ticks_per_second) * 1000000000ULL
+         + ((ticks % ticks_per_second) * 1000000000ULL) / ticks_per_second;
+#else
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
+#endif
 }
 
 uint64_t process_cpu_ns(void)
 {
+#if defined(_WIN32)
+    FILETIME creation_time;
+    FILETIME exit_time;
+    FILETIME kernel_time;
+    FILETIME user_time;
+    if (!GetProcessTimes(
+            GetCurrentProcess(),
+            &creation_time,
+            &exit_time,
+            &kernel_time,
+            &user_time)) {
+        return 0;
+    }
+    uint64_t kernel_100ns = ((uint64_t)kernel_time.dwHighDateTime << 32)
+                          | (uint64_t)kernel_time.dwLowDateTime;
+    uint64_t user_100ns = ((uint64_t)user_time.dwHighDateTime << 32)
+                        | (uint64_t)user_time.dwLowDateTime;
+    return (kernel_100ns + user_100ns) * 100ULL;
+#else
     struct rusage u;
     if (getrusage(RUSAGE_SELF, &u) != 0) return 0;
     uint64_t ns = (uint64_t)u.ru_utime.tv_sec * 1000000000ULL
@@ -28,12 +69,21 @@ uint64_t process_cpu_ns(void)
                 + (uint64_t)u.ru_stime.tv_sec * 1000000000ULL
                 + (uint64_t)u.ru_stime.tv_usec * 1000ULL;
     return ns;
+#endif
 }
 
 /* -------- sorted-key object builder (mirrors bench_json Obj) -------- */
 
 typedef struct { char* key; char* val; } json_entry;
 struct json_obj { json_entry* e; size_t n, cap; };
+
+static char* copy_str(const char* s)
+{
+    size_t n = strlen(s) + 1;
+    char* copy = malloc(n);
+    if (copy) memcpy(copy, s, n);
+    return copy;
+}
 
 json_obj* json_obj_new(void)
 {
@@ -47,7 +97,7 @@ static void put(json_obj* o, const char* k, char* rendered /* owned */)
         o->cap = o->cap ? o->cap * 2 : 16;
         o->e = realloc(o->e, o->cap * sizeof(json_entry));
     }
-    o->e[o->n].key = strdup(k);
+    o->e[o->n].key = copy_str(k);
     o->e[o->n].val = rendered;
     o->n++;
 }
@@ -99,8 +149,8 @@ void json_obj_str(json_obj* o, const char* k, const char* v) { put(o, k, json_es
 void json_obj_int(json_obj* o, const char* k, uint64_t v)
 { char* b = malloc(32); snprintf(b, 32, "%llu", (unsigned long long)v); put(o, k, b); }
 void json_obj_float(json_obj* o, const char* k, double v) { put(o, k, json_f64(v)); }
-void json_obj_bool(json_obj* o, const char* k, int v) { put(o, k, strdup(v ? "true" : "false")); }
-void json_obj_null(json_obj* o, const char* k) { put(o, k, strdup("null")); }
+void json_obj_bool(json_obj* o, const char* k, int v) { put(o, k, copy_str(v ? "true" : "false")); }
+void json_obj_null(json_obj* o, const char* k) { put(o, k, copy_str("null")); }
 
 void json_obj_obj(json_obj* o, const char* k, json_obj* child)
 {
