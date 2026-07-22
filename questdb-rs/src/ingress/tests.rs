@@ -1592,6 +1592,72 @@ fn qwpws_apply_reconnect_implies_initial_retry_is_idempotent() {
 
 #[cfg(feature = "sync-sender-qwp-ws")]
 #[test]
+fn qwpws_promoted_sync_defaults_back_to_async_for_pool_borrows() {
+    // Pool borrows ignore the promoted mode: the background runner already
+    // applies the reconnect budget to its initial connect.
+    let builder =
+        SenderBuilder::from_conf("ws::addr=localhost:9000;reconnect_max_duration_millis=120000;")
+            .unwrap();
+    let mut qwp_ws = builder.qwp_ws.as_ref().unwrap().clone();
+    qwp_ws.default_async_initial_connect();
+    assert_specified_eq(
+        &qwp_ws.initial_connect_retry,
+        conf::QwpWsInitialConnectMode::Async,
+    );
+}
+
+#[cfg(feature = "sync-sender-qwp-ws")]
+#[test]
+fn qwpws_explicit_sync_after_promotion_stays_explicit_for_pool_borrows() {
+    // from_conf promotes Sync from the reconnect key; the explicit builder
+    // call demotes the promoted mode back to a default and re-specifies the
+    // same value. The choice is explicit now, so the pool-borrow defaulting
+    // must keep Sync instead of treating it as promoted and reverting to the
+    // background connect.
+    let builder =
+        SenderBuilder::from_conf("ws::addr=localhost:9000;reconnect_max_duration_millis=120000;")
+            .unwrap()
+            .initial_connect_retry(true)
+            .unwrap();
+    let mut qwp_ws = builder.qwp_ws.as_ref().unwrap().clone();
+    qwp_ws.default_async_initial_connect();
+    assert_specified_eq(
+        &qwp_ws.initial_connect_retry,
+        conf::QwpWsInitialConnectMode::Sync,
+    );
+}
+
+#[cfg(feature = "sync-sender-qwp-ws")]
+#[test]
+fn qwpws_explicit_off_after_promotion_overrides_promoted_sync() {
+    // The promoted Sync is a default in disguise: an explicit Off must
+    // replace it instead of dying in set_specified's conflict arm for a
+    // mode the user never chose, and the build-time promotion re-run must
+    // not resurrect Sync over it.
+    let builder =
+        SenderBuilder::from_conf("ws::addr=localhost:9000;reconnect_max_duration_millis=120000;")
+            .unwrap()
+            .initial_connect_retry(false)
+            .expect("explicit off must override the promoted sync");
+    let mut qwp_ws = builder.qwp_ws.as_ref().unwrap().clone();
+    assert_specified_eq(
+        &qwp_ws.initial_connect_retry,
+        conf::QwpWsInitialConnectMode::Off,
+    );
+    qwp_ws.apply_reconnect_implies_initial_retry();
+    assert_specified_eq(
+        &qwp_ws.initial_connect_retry,
+        conf::QwpWsInitialConnectMode::Off,
+    );
+    qwp_ws.default_async_initial_connect();
+    assert_specified_eq(
+        &qwp_ws.initial_connect_retry,
+        conf::QwpWsInitialConnectMode::Off,
+    );
+}
+
+#[cfg(feature = "sync-sender-qwp-ws")]
+#[test]
 fn qwpws_apply_reconnect_implies_initial_retry_no_op_without_reconnect_keys() {
     // Defaults only: no reconnect_* key was specified, so the promotion
     // is a no-op and `initial_connect_retry` stays `Defaulted(Off)`.

@@ -633,9 +633,17 @@ impl QwpWsConnector {
         extra_orphan_slots: &[PathBuf],
         conn_events: std::sync::Arc<conn_events::ConnectionEventSource>,
         rejection_sink: std::sync::Arc<rejection_events::RejectionEventSource>,
+        force_async_initial_connect: bool,
     ) -> Result<sender::qwp_ws::SyncQwpWsHandlerState> {
         let mut qwp_ws = self.qwp_ws.clone();
-        qwp_ws.force_async_initial_connect();
+        // Recovery pre-opens force the background initial connect so
+        // `QuestDb::connect` stays non-blocking; borrows honor an explicit
+        // `initial_connect_retry` mode and default to background otherwise.
+        if force_async_initial_connect {
+            qwp_ws.force_async_initial_connect();
+        } else {
+            qwp_ws.default_async_initial_connect();
+        }
         // The pool's shared sources exist (handlers already attached, or
         // permanently defaulted) before connect-time recovery senders are
         // pre-opened, so every runner narrates through them from its first
@@ -1999,6 +2007,7 @@ impl SenderBuilder {
                 "The \"initial_connect_retry\" setting is only supported for QWP/WebSocket."
             ));
         };
+        qwp_ws.demote_promoted_initial_connect_retry();
         qwp_ws
             .initial_connect_retry
             .set_specified("initial_connect_retry", mode)?;
@@ -2007,6 +2016,12 @@ impl SenderBuilder {
 
     #[cfg(feature = "_sender-qwp-ws")]
     /// Retry the initial connection using the reconnect policy. Default false.
+    ///
+    /// The mode also governs pool borrows ([`crate::QuestDb::borrow_sender`]):
+    /// a borrow that opens a new connection honors an explicit `off`/`sync`
+    /// and defaults to the background initial connect otherwise. An explicit
+    /// call here replaces the `sync` that setting any `reconnect_*` key
+    /// promotes; that promoted mode never applies to pool borrows.
     pub fn initial_connect_retry(mut self, value: bool) -> Result<Self> {
         let Some(qwp_ws) = &mut self.qwp_ws else {
             return Err(error::fmt!(
@@ -2014,6 +2029,7 @@ impl SenderBuilder {
                 "The \"initial_connect_retry\" setting is only supported for QWP/WebSocket."
             ));
         };
+        qwp_ws.demote_promoted_initial_connect_retry();
         qwp_ws.initial_connect_retry.set_specified(
             "initial_connect_retry",
             if value {

@@ -637,7 +637,7 @@ fn preopen_recovery_sender(
         }
     };
 
-    match connect_sfa_pool_with_recovery_candidates(inner, Some(index), recovery_candidates) {
+    match connect_sfa_pool_with_recovery_candidates(inner, Some(index), recovery_candidates, true) {
         Ok(sender) => {
             let slot_index = slot.slot_index;
             {
@@ -701,7 +701,12 @@ impl QuestDb {
     /// senders whose initial connect and replay run in the background. The
     /// store-and-forward ingestion pool creates a local producer on first borrow
     /// and starts its initial connect in the background, so the borrower can
-    /// buffer immediately even while the server is absent. Direct senders and
+    /// buffer immediately even while the server is absent. An explicit
+    /// `initial_connect_retry` mode changes that for borrows: `off` connects
+    /// synchronously at borrow time and fails fast, `sync` retries within the
+    /// reconnect budget before the borrow returns. The `sync` promoted from
+    /// merely setting a `reconnect_*` key does not apply to pool borrows, and
+    /// recovery pre-opens always connect in the background. Direct senders and
     /// readers still open their transport on first borrow. `sender_pool_min` /
     /// `query_pool_min` are the warm minimums the reaper keeps once entries
     /// have been opened.
@@ -899,6 +904,12 @@ impl QuestDb {
     /// releases its lock; failing that, wait up to `acquire_timeout_ms` for a
     /// return (`acquire_timeout_ms=0` fails fast); failing that, return
     /// `InvalidApiCall`.
+    ///
+    /// A borrow that opens a new connection starts it in the background by
+    /// default, so it succeeds even while the server is away. An explicit
+    /// `initial_connect_retry` mode overrides that: `off` connects
+    /// synchronously and fails fast, `sync` retries within the reconnect
+    /// budget before returning; see [`Self::connect`].
     pub fn borrow_sender(&self) -> Result<BorrowedSender<'_>> {
         let cs = self.pick_sender()?;
         Ok(BorrowedSender(SenderHandle::new(self, cs)))
@@ -2647,13 +2658,14 @@ fn pick_direct_sender(inner: &Arc<DbInner>) -> Result<PooledSender<DirectSenderC
 
 fn connect_sfa_pool(inner: &Arc<DbInner>, slot_index: Option<usize>) -> Result<PooledSenderCore> {
     let recovery_candidates = managed_slot_recovery_candidates(inner);
-    connect_sfa_pool_with_recovery_candidates(inner, slot_index, &recovery_candidates)
+    connect_sfa_pool_with_recovery_candidates(inner, slot_index, &recovery_candidates, false)
 }
 
 fn connect_sfa_pool_with_recovery_candidates(
     inner: &Arc<DbInner>,
     slot_index: Option<usize>,
     recovery_candidates: &[PathBuf],
+    force_async_initial_connect: bool,
 ) -> Result<PooledSenderCore> {
     let sender_id = slot_index.map(|index| managed_slot_id(&inner.slot_base_id, index));
     let state = inner
@@ -2664,6 +2676,7 @@ fn connect_sfa_pool_with_recovery_candidates(
             recovery_candidates,
             Arc::clone(&inner.conn_events),
             Arc::clone(&inner.rejections),
+            force_async_initial_connect,
         )
         .map_err(|err| {
             crate::Error::new(

@@ -855,6 +855,91 @@ fn at_cap_borrow_fails_fast_with_zero_acquire_timeout() {
 }
 
 #[test]
+fn borrow_honors_explicit_initial_connect_retry_off() {
+    let conf = conf_for_endpoints(
+        &[unused_local_port()],
+        "initial_connect_retry=off;sender_pool_max=1;acquire_timeout_ms=0;",
+    );
+    let db = QuestDb::connect(&conf).unwrap();
+    let start = std::time::Instant::now();
+    db.borrow_sender()
+        .expect_err("initial_connect_retry=off must connect at borrow and fail fast");
+    assert!(
+        start.elapsed() < std::time::Duration::from_secs(2),
+        "off is one connection round, not a retry budget"
+    );
+
+    // The failed eager connect must roll back its pool slot: with
+    // sender_pool_max=1 and fail-fast acquisition, a leaked slot would turn
+    // the second borrow into a pool-exhausted InvalidApiCall instead of
+    // another connect failure.
+    let second = db
+        .borrow_sender()
+        .expect_err("second borrow retries the connect");
+    assert_ne!(
+        second.code(),
+        ErrorCode::InvalidApiCall,
+        "a failed sync borrow must not leak its pool slot: {}",
+        second.msg()
+    );
+}
+
+#[test]
+fn borrow_honors_explicit_initial_connect_retry_sync() {
+    let (server, frames) = MockServer::spawn_acking_capturing(1);
+    let conf = conf_for_endpoints(&[server.port()], "initial_connect_retry=sync;");
+    let db = QuestDb::connect(&conf).unwrap();
+    let mut sender = db.borrow_sender().expect("sync initial connect");
+    assert_eq!(
+        server.accepted(),
+        1,
+        "sync mode must have connected before the borrow returned"
+    );
+
+    // The sync mode routes the pooled core through the eager-connect branch
+    // of connect_qwp_ws_background_state, previously reachable only by the
+    // standalone sender. Prove data (including a symbol, so the delta-dict
+    // wiring of that branch is exercised) flows end to end on it.
+    let mut buf = sender.new_buffer();
+    buf.table("sync_trades")
+        .unwrap()
+        .symbol("symbol", "ETH-USDT")
+        .unwrap()
+        .column_f64("price", 2615.54)
+        .unwrap()
+        .at(TimestampNanos::now())
+        .unwrap();
+    sender
+        .flush_buffer_and_wait(&mut buf, AckLevel::Ok)
+        .expect("flush over the sync-connected pooled core");
+    let payload = frames
+        .recv_timeout(Duration::from_secs(5))
+        .expect("server must receive the frame");
+    assert_eq!(frame_table_name(&payload), "sync_trades");
+    assert_eq!(frame_row_count(&payload), 1);
+    assert_eq!(
+        read_symbol_prefix(&payload),
+        (0, vec![b"ETH-USDT".to_vec()]),
+        "the eager-connect branch must seed the delta dict from zero and \
+         register the symbol exactly once"
+    );
+}
+
+#[test]
+fn borrow_ignores_reconnect_promoted_sync_and_buffers_offline() {
+    // `conf_for_endpoints` sets `reconnect_max_duration_millis`, which
+    // promotes `initial_connect_retry=sync` for the standalone sender. Pool
+    // borrows must ignore the promoted mode: the background runner already
+    // applies the reconnect budget to its initial connect, and a borrow must
+    // keep working while the server is away.
+    let conf = conf_for_endpoints(&[unused_local_port()], "");
+    let db = QuestDb::connect(&conf).unwrap();
+    let _sender = db
+        .borrow_sender()
+        .expect("default pool borrow buffers while the server is away");
+}
+
+#[test]
 fn disk_store_and_forward_ingress_pool_uses_distinct_slots_up_to_pool_max() {
     let server = MockServer::spawn(4);
     let dir = TempDir::new().unwrap();
