@@ -1,75 +1,74 @@
 #!/usr/bin/env python3
-"""Step 4 parity-table aggregator (historical/QWP_DATAFRAME_BENCH_PLAN.md §7).
+"""The QWP benchmark aggregator combines JSON reports into comparison tables.
 
-Consumes the §3.2 JSON metric contract emitted by every bench path -- Python
-(``py-questdb-client``: ``benchmark_pandas_columnar.py`` ingress,
-``benchmark_pandas_egress.py`` egress) and Rust (``c-questdb-client``:
-``examples/qwp_ingress_polars.rs`` / ``qwp_egress_polars.rs`` via
-``examples/bench_json``) -- and renders one ``rows/s`` + ``GiB/s`` parity table
-per direction, lining the clients up side by side.
-
-Two contract facts this normalizes (verified against real 10M S1 output):
-
-* **Path names differ per client.** The same role carries different names:
-  ingress CPU floor is ``columnar-populate`` (py) vs ``encode-floor`` (rust);
-  the polars egress assemble is ``to-polars`` (py) vs ``fetch-all-polars``
-  (rust). ``ROLE_OF_PATH`` maps every known path name onto a canonical role.
-
-* **Egress byte basis differs.** py-egress records the *decoded Arrow* nbytes
-  (~480 MB for 10M S1) as its wire proxy; rust-egress and all ingress paths
-  record the *on-wire QWP* payload (~371 MB egress / ~450 MB ingress). Native
-  ``mib_per_s`` is therefore NOT comparable across clients. We instead derive
-  GiB/s from the basis-independent ``rows_per_s`` times a single canonical
-  on-wire bytes/row per direction (``--ingress-bpr`` / ``--egress-bpr``), which
-  reproduces the on-wire MiB/s the parity comment uses for both clients.
+Reports are partitioned by direction, schema, row count, sender count, and run
+mode so results from different workloads never overwrite each other. See
+``doc/BENCHMARKS.md`` for the report contract and benchmark methodology.
 
 Usage:
-    bench_parity_aggregate.py FILE [FILE ...] [--glob 'dir/*.json']
-                              [--format md|text] [--ingress-bpr 45.0]
-                              [--egress-bpr 37.1283602] [--raw]
+    tools/qwp_bench/aggregate.py FILE [FILE ...] [--glob 'dir/*.json']
+                                 [--format md|text] [--ingress-bpr BPR]
+                                 [--egress-bpr BPR] [--raw]
 """
 
 import argparse
 import glob as globmod
 import json
-import sys
+import math
+from typing import NamedTuple
 
 GIB = 1024.0 ** 3
-MIB = 1024.0 ** 2
 
-# Canonical on-wire QWP bytes/row for S1-narrow (10M): ingress 450,000,140 B,
-# egress 371,283,602 B. Identical for both clients, so GiB/s derived from
-# rows/s x bpr is apples-to-apples. Overridable for other schemas.
-DEFAULT_BPR = {"ingress": 45.0, "egress": 37.1283602}
+
+class ReportError(ValueError):
+    pass
+
+
+class GroupKey(NamedTuple):
+    direction: str
+    schema: str
+    rows: int
+    senders: int
+    run_mode: str
+
+
+CANONICAL_BPR = {
+    ("s1-narrow", 10_000_000): {"ingress": 45.0, "egress": 37.1283602},
+    ("s2-wide", 10_000_000): {"ingress": 100.335059, "egress": 92.4641382},
+}
 
 # Path name -> (direction, canonical role). Every emitter's path names live
 # here; add a row when a new path is introduced.
 ROLE_OF_PATH = {
-    # --- ingress ---
-    "columnar-populate":      ("ingress", "CPU floor"),
-    "encode-floor":           ("ingress", "CPU floor"),
-    "real-client":            ("ingress", "e2e DataFrame->wire"),
-    "flush-polars-dataframe": ("ingress", "e2e DataFrame->wire"),
-    # --- egress ---
-    "decode-only":            ("egress", "decode floor"),
-    "to-polars":              ("egress", "-> polars"),
-    "fetch-all-polars":       ("egress", "-> polars"),
-    "iter-polars":            ("egress", "-> polars (lazy/iter)"),
-    "iter-pandas":            ("egress", "-> pandas (lazy/iter)"),
-    "to-pandas":              ("egress", "-> pandas (numpy)"),
-    "to-pandas-arrow":        ("egress", "-> pandas (Arrow)"),
-    "to-pandas-nullable":     ("egress", "-> pandas (nullable)"),
-    "arrow-c-stream":         ("egress", "Arrow C-stream"),
+    "columnar-populate": ("ingress", "columnar CPU floor"),
+    "encode-floor": ("ingress", "columnar CPU floor"),
+    "chunk-build": ("ingress", "C chunk-build floor"),
+    "row-build": ("ingress", "row-build floor"),
+    "real-client": ("ingress", "columnar e2e"),
+    "flush-polars-dataframe": ("ingress", "columnar e2e"),
+    "flush-chunks": ("ingress", "columnar e2e"),
+    "row-flush": ("ingress", "row e2e"),
+    "decode-only": ("egress", "decode floor"),
+    "materialize": ("egress", "materialize"),
+    "to-arrow": ("egress", "-> Arrow"),
+    "to-polars": ("egress", "-> polars"),
+    "fetch-all-polars": ("egress", "-> polars"),
+    "iter-polars": ("egress", "-> polars (lazy/iter)"),
+    "iter-pandas": ("egress", "-> pandas (lazy/iter)"),
+    "to-pandas": ("egress", "-> pandas (numpy)"),
+    "to-pandas-arrow": ("egress", "-> pandas (Arrow)"),
+    "to-pandas-nullable": ("egress", "-> pandas (nullable)"),
+    "arrow-c-stream": ("egress", "Arrow C-stream"),
 }
 
 # Render order of roles within each direction.
 ROLE_ORDER = {
-    "ingress": ["CPU floor", "e2e DataFrame->wire"],
-    "egress": [
-        "decode floor", "-> polars", "-> polars (lazy/iter)",
-        "-> pandas (numpy)", "-> pandas (Arrow)", "-> pandas (nullable)",
-        "-> pandas (lazy/iter)", "Arrow C-stream",
-    ],
+    "ingress": ["columnar CPU floor", "C chunk-build floor",
+                "row-build floor", "columnar e2e", "row e2e"],
+    "egress": ["decode floor", "materialize", "-> Arrow", "-> polars",
+               "-> polars (lazy/iter)", "-> pandas (numpy)",
+               "-> pandas (Arrow)", "-> pandas (nullable)",
+               "-> pandas (lazy/iter)", "Arrow C-stream"],
 }
 
 # Stable client column order; unknown clients append in first-seen order.
@@ -78,16 +77,58 @@ CLIENT_ORDER = ["py-pandas", "rust-polars", "java", "go"]
 
 def load_reports(paths):
     reports = []
-    for p in paths:
+    for path in paths:
         try:
-            with open(p) as fh:
-                d = json.load(fh)
+            with open(path, encoding="utf-8") as handle:
+                value = json.load(handle)
         except (OSError, ValueError) as exc:
-            print(f"warning: skipping {p}: {exc}", file=sys.stderr)
-            continue
-        d["_source"] = p
-        reports.append(d)
+            raise ReportError(f"cannot load {path}: {exc}") from exc
+        if not isinstance(value, dict):
+            raise ReportError(f"{path}: top-level JSON must be an object")
+        value["_source"] = path
+        reports.append(value)
     return reports
+
+
+def comparison_key(report):
+    source = report.get("_source", "<input>")
+    direction = report.get("direction")
+    if direction not in ("ingress", "egress"):
+        raise ReportError(f"{source}: direction must be ingress or egress")
+    schema = report.get("schema")
+    run_mode = report.get("run_mode")
+    rows = report.get("rows")
+    if not isinstance(schema, str) or not schema:
+        raise ReportError(f"{source}: schema must be a non-empty string")
+    if not isinstance(run_mode, str) or not run_mode:
+        raise ReportError(f"{source}: run_mode must be a non-empty string")
+    if isinstance(rows, bool) or not isinstance(rows, int) or rows <= 0:
+        raise ReportError(f"{source}: rows must be a positive integer")
+    senders = 1 if direction == "egress" else report.get("senders", 1)
+    if isinstance(senders, bool) or not isinstance(senders, int) or senders <= 0:
+        raise ReportError(f"{source}: senders must be a positive integer")
+    return GroupKey(direction, schema, rows, senders, run_mode)
+
+
+def validate_row_count(report, paths):
+    if report["direction"] != "ingress":
+        return
+    source = report.get("_source", "<input>")
+    check = report.get("row_count_check")
+    if check is not None and (
+        not isinstance(check, dict) or check.get("ok") is not True
+    ):
+        raise ReportError(f"{source}: ingress row_count_check.ok must be true")
+    has_e2e = any(
+        isinstance(summary, dict) and summary.get("phase") == "e2e"
+        for summary in paths.values()
+    )
+    if has_e2e and (
+        not isinstance(check, dict) or check.get("ok") is not True
+    ):
+        raise ReportError(
+            f"{source}: ingress e2e report requires row_count_check.ok=true"
+        )
 
 
 def coarse_box(machine):
@@ -119,36 +160,61 @@ def client_rank(client):
 
 
 def collect(reports):
-    """Build {direction: {role: {client: path_summary}}} plus per-direction
-    metadata (clients, rows, schema, env per client, sources, skipped paths)."""
-    by_dir = {}
-    for d in reports:
-        direction = d.get("direction")
-        client = d.get("client", "?")
-        slot = by_dir.setdefault(direction, {
-            "grid": {}, "clients": [], "rows": set(), "schema": set(),
-            "env": {}, "sources": [], "skipped": [], "wire_bytes": {},
+    """Collect reports into five-dimensional comparison groups."""
+    groups = {}
+    for report in reports:
+        key = comparison_key(report)
+        source = report.get("_source", "<input>")
+        client = report.get("client")
+        if not isinstance(client, str) or not client:
+            raise ReportError(f"{source}: client must be a non-empty string")
+        paths = report.get("paths")
+        if not isinstance(paths, dict) or not paths:
+            raise ReportError(f"{source}: paths must be a non-empty object")
+        for name, summary in paths.items():
+            mapped = ROLE_OF_PATH.get(name)
+            if mapped is None:
+                raise ReportError(f"{source}: unknown path {name!r}")
+            if mapped[0] != key.direction:
+                raise ReportError(
+                    f"{source}: path {name!r} is for {mapped[0]} direction, "
+                    f"not {key.direction}"
+                )
+            if not isinstance(summary, dict):
+                raise ReportError(f"{source}: path {name!r} must be an object")
+        validate_row_count(report, paths)
+        machine = report.get("machine", {})
+        if not isinstance(machine, dict):
+            raise ReportError(f"{source}: machine must be an object")
+        commits = report.get("commits", {})
+        if not isinstance(commits, dict):
+            raise ReportError(f"{source}: commits must be an object")
+
+        slot = groups.setdefault(key, {
+            "grid": {}, "clients": [], "env": [], "sources": [],
+            "cell_sources": {},
         })
         if client not in slot["clients"]:
             slot["clients"].append(client)
-        slot["rows"].add(d.get("rows"))
-        slot["schema"].add(d.get("schema"))
-        slot["env"][client] = {
-            "machine": d.get("machine", {}), "commits": d.get("commits", {}),
-            "box": coarse_box(d.get("machine", {})),
-        }
-        slot["wire_bytes"][client] = d.get("wire_bytes")
-        slot["sources"].append(d["_source"])
-        slot.setdefault("client_sources", {}).setdefault(
-            client, []).append(d["_source"])
-        for name, summary in d.get("paths", {}).items():
-            mapped = ROLE_OF_PATH.get(name)
-            if mapped is None or mapped[0] != direction:
-                slot["skipped"].append(f"{client}:{name}")
-                continue
-            role = mapped[1]
+        slot["env"].append({
+            "client": client,
+            "machine": machine,
+            "commits": commits,
+            "box": coarse_box(machine),
+            "source": source,
+        })
+        slot["sources"].append(source)
+        for name, summary in paths.items():
+            role = ROLE_OF_PATH[name][1]
+            role_sources = slot["cell_sources"].setdefault(role, {})
+            if client in role_sources:
+                raise ReportError(
+                    f"duplicate {key.direction} {role!r}/{client!r} cell in "
+                    f"{role_sources[client]} and {source}"
+                )
+            role_sources[client] = source
             slot["grid"].setdefault(role, {})[client] = summary
-    return by_dir
+    return groups
 
 
 def fmt_cell(summary, bpr):
@@ -161,15 +227,38 @@ def fmt_cell(summary, bpr):
     return f"{rps / 1e6:.1f} M/s · {gibs:.2f} GiB/s"
 
 
-def render_direction(direction, slot, bpr, fmt):
-    clients = sorted(slot["clients"], key=client_rank)
-    rows = sorted(r for r in slot["rows"] if r is not None)
-    schema = sorted(s for s in slot["schema"] if s)
-    rowstr = "/".join(f"{r:,}" for r in rows) if rows else "?"
-    title = (f"{direction.title()} — {', '.join(schema) or '?'}, "
-             f"{rowstr} rows  (GiB/s @ {bpr:g} on-wire B/row)")
+def bytes_per_row(key, ingress_override=None, egress_override=None):
+    override = ingress_override if key.direction == "ingress" else egress_override
+    flag = "--ingress-bpr" if key.direction == "ingress" else "--egress-bpr"
+    if override is not None:
+        if (
+            isinstance(override, bool)
+            or not isinstance(override, (int, float))
+            or not math.isfinite(override)
+            or override <= 0
+        ):
+            raise ReportError(f"{flag} must be positive")
+        return override
+    defaults = CANONICAL_BPR.get((key.schema, key.rows))
+    if defaults is None:
+        raise ReportError(
+            f"{key.schema}/{key.rows} {key.direction} has no canonical B/row; "
+            f"pass {flag} explicitly"
+        )
+    return defaults[key.direction]
 
-    roles = [r for r in ROLE_ORDER.get(direction, []) if r in slot["grid"]]
+
+def render_group(key, slot, bpr, fmt):
+    clients = sorted(slot["clients"], key=client_rank)
+    title = (
+        f"{key.direction.title()} — {key.schema}, {key.rows:,} rows, "
+        f"senders={key.senders}, run_mode={key.run_mode} "
+        f"(GiB/s @ {bpr:g} on-wire B/row)"
+    )
+
+    roles = [
+        role for role in ROLE_ORDER[key.direction] if role in slot["grid"]
+    ]
     roles += [r for r in slot["grid"] if r not in roles]
 
     lines = []
@@ -192,116 +281,138 @@ def render_direction(direction, slot, bpr, fmt):
     return "\n".join(lines)
 
 
-def render_env(by_dir, fmt):
+def render_env(groups, fmt):
     lines = []
-    boxes, commits, sources = {}, {}, []
-    for slot in by_dir.values():
-        sources += slot["sources"]
-        for client, env in slot["env"].items():
-            boxes[client] = env["box"]
-            pc = env["commits"]
-            commits[client] = {k: pc.get(k) for k in (
-                "py_questdb_client", "c_questdb_client")}
-    distinct_boxes = set(boxes.values())
+    by_client = {}
+    distinct_boxes = set()
+    for slot in groups.values():
+        for env in slot["env"]:
+            by_client.setdefault(env["client"], []).append(env)
+            distinct_boxes.add(env["box"])
     warn = len(distinct_boxes) > 1
-
-    dupes = []
-    for direction, slot in by_dir.items():
-        for client, srcs in slot.get("client_sources", {}).items():
-            if len(srcs) > 1:
-                dupes.append(f"{direction}/{client}: {len(srcs)} files "
-                             "(paths merged, last wins per path)")
 
     head = "## Environment" if fmt == "md" else "Environment"
     lines.append(head)
-    for client in sorted(boxes, key=client_rank):
-        os_, arch = boxes[client]
-        c = commits[client]
-        cc = c.get("c_questdb_client") or "—"
-        pc = c.get("py_questdb_client") or "—"
+    for client in sorted(by_client, key=client_rank):
+        environments = by_client[client]
+        client_boxes = sorted({env["box"] for env in environments})
+        box_text = ", ".join(f"{os_}/{arch}" for os_, arch in client_boxes)
+
+        def commit_text(name):
+            values = sorted({
+                str(value)[:12]
+                for env in environments
+                if (value := env["commits"].get(name))
+            })
+            return "/".join(values) or "—"
+
+        cc = commit_text("c_questdb_client")
+        pc = commit_text("py_questdb_client")
         lines.append(
-            f"- **{client}**: {os_}/{arch} · py={pc[:12]} · c={cc[:12]}"
+            f"- **{client}**: {box_text} · py={pc} · c={cc}"
             if fmt == "md" else
-            f"  {client}: {os_}/{arch}  py={pc[:12]} c={cc[:12]}")
+            f"  {client}: {box_text}  py={pc} c={cc}")
     if warn:
         lines.append(
             ("> ⚠️ **Boxes differ across inputs** " if fmt == "md" else
              "  !! boxes differ across inputs ")
-            + f"({sorted(distinct_boxes)}) — parity requires single-box, "
-            "single-stream (plan §3.7/§7).")
+            + f"({sorted(distinct_boxes)}) — comparisons require one box.")
     else:
         lines.append(
             ("> ✅ single box " if fmt == "md" else "  single box ")
             + f"({next(iter(distinct_boxes))}).")
-    for dup in dupes:
-        lines.append(("> ⚠️ duplicate inputs " if fmt == "md"
-                      else "  !! duplicate inputs ") + dup)
     return "\n".join(lines)
 
 
-def main():
-    ap = argparse.ArgumentParser(description="Step 4 QWP DataFrame parity-table aggregator")
+def render_raw(groups, fmt):
+    raw = {}
+    direction_rank = {"ingress": 0, "egress": 1}
+    ordered = sorted(
+        groups,
+        key=lambda key: (
+            direction_rank[key.direction], key.schema, key.rows,
+            key.senders, key.run_mode,
+        ),
+    )
+    for key in ordered:
+        label = (
+            f"direction={key.direction}|schema={key.schema}|rows={key.rows}|"
+            f"senders={key.senders}|run_mode={key.run_mode}"
+        )
+        raw[label] = {
+            role: {
+                client: {
+                    "rows_per_s": summary.get("rows_per_s_median"),
+                    "mib_per_s_native": summary.get("mib_per_s"),
+                    "median_s": summary.get("median_s"),
+                }
+                for client, summary in columns.items()
+            }
+            for role, columns in groups[key]["grid"].items()
+        }
+    body = json.dumps(raw, indent=2)
+    if fmt == "md":
+        return f"## Raw\n```json\n{body}\n```"
+    return f"Raw\n{body}"
+
+
+def render(groups, fmt, ingress_override=None, egress_override=None, raw=False):
+    blocks = [
+        "# QWP benchmark comparison" if fmt == "md"
+        else "QWP benchmark comparison"
+    ]
+    direction_rank = {"ingress": 0, "egress": 1}
+    ordered = sorted(
+        groups,
+        key=lambda key: (
+            direction_rank[key.direction], key.schema, key.rows,
+            key.senders, key.run_mode,
+        ),
+    )
+    for key in ordered:
+        bpr = bytes_per_row(key, ingress_override, egress_override)
+        blocks.append(render_group(key, groups[key], bpr, fmt))
+    blocks.append(render_env(groups, fmt))
+    if raw:
+        blocks.append(render_raw(groups, fmt))
+    return "\n\n".join(blocks)
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(
+        prog="tools/qwp_bench/aggregate.py",
+        description=(
+            "QWP benchmark aggregator; see doc/BENCHMARKS.md for the report "
+            "contract"
+        ),
+    )
     ap.add_argument("files", nargs="*", help="contract JSON files")
     ap.add_argument("--glob", action="append", default=[],
                     help="glob pattern(s) for contract JSON (repeatable)")
     ap.add_argument("--format", choices=["md", "text"], default="md")
-    ap.add_argument("--ingress-bpr", type=float, default=DEFAULT_BPR["ingress"],
+    ap.add_argument("--ingress-bpr", type=float, default=None,
                     help="canonical on-wire bytes/row for ingress GiB/s")
-    ap.add_argument("--egress-bpr", type=float, default=DEFAULT_BPR["egress"],
+    ap.add_argument("--egress-bpr", type=float, default=None,
                     help="canonical on-wire bytes/row for egress GiB/s")
     ap.add_argument("--raw", action="store_true",
                     help="also dump each path's native rows/s + mib_per_s")
-    args = ap.parse_args()
+    args = ap.parse_args(argv)
 
     paths = list(args.files)
-    for g in args.glob:
-        paths += sorted(globmod.glob(g))
+    for pattern in args.glob:
+        paths += sorted(globmod.glob(pattern))
     if not paths:
         ap.error("no input files (pass paths and/or --glob)")
 
-    reports = load_reports(paths)
-    if not reports:
-        ap.error("no valid contract JSON loaded")
-    by_dir = collect(reports)
-    bpr = {"ingress": args.ingress_bpr, "egress": args.egress_bpr}
-
-    blocks = []
-    title = "# QWP DataFrame parity table" if args.format == "md" \
-        else "QWP DataFrame parity table"
-    blocks.append(title)
-    for direction in ("ingress", "egress"):
-        if direction in by_dir:
-            blocks.append(render_direction(
-                direction, by_dir[direction], bpr[direction], args.format))
-    blocks.append(render_env(by_dir, args.format))
-
-    # Footnotes.
-    skipped = sorted({s for slot in by_dir.values() for s in slot["skipped"]})
-    notes = [
-        "GiB/s = rows/s × canonical on-wire bytes/row (basis-independent); "
-        "native per-file `mib_per_s` is NOT cross-client comparable on egress "
-        "(py records decoded-Arrow nbytes, rust records on-wire).",
-    ]
-    if skipped:
-        notes.append("Paths not in the parity roles (shown for completeness): "
-                     + ", ".join(skipped) + ".")
-    nb = "\n".join((f"> {n}" if args.format == "md" else f"  note: {n}")
-                   for n in notes)
-    blocks.append(("## Notes\n" if args.format == "md" else "Notes\n") + nb)
-
-    if args.raw:
-        raw = {d: {role: {c: {
-            "rows_per_s": s.get("rows_per_s_median"),
-            "mib_per_s_native": s.get("mib_per_s"),
-            "median_s": s.get("median_s"),
-        } for c, s in cols.items()}
-            for role, cols in slot["grid"].items()}
-            for d, slot in by_dir.items()}
-        blocks.append(("## Raw\n```json\n" if args.format == "md" else "Raw\n")
-                      + json.dumps(raw, indent=2)
-                      + ("\n```" if args.format == "md" else ""))
-
-    print("\n\n".join(blocks))
+    try:
+        reports = load_reports(paths)
+        groups = collect(reports)
+        output = render(
+            groups, args.format, args.ingress_bpr, args.egress_bpr, args.raw
+        )
+    except ReportError as exc:
+        ap.error(str(exc))
+    print(output)
 
 
 if __name__ == "__main__":
