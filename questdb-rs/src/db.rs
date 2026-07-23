@@ -262,11 +262,6 @@ struct DbInner {
     /// Warm minimum the reaper preserves in the store-and-forward
     /// ingestion pool.
     sender_pool_min: usize,
-    /// `lazy_connect=true`: tolerate a down server at startup. No warm-minimum
-    /// pre-connect, and ingest borrows force the background initial connect.
-    /// Off by default (Java parity): `connect()` pre-opens the warm minimums
-    /// and borrows honor `initial_connect_retry`.
-    lazy_connect: bool,
     /// Hard cap on the store-and-forward ingestion pool and on the direct
     /// column-sender pool (both are ingestion-side connections).
     sender_pool_max: usize,
@@ -709,18 +704,16 @@ impl QuestDb {
     /// [`Self::borrow_direct_column_sender`].
     ///
     /// Startup matches the Java client. By default `connect` is **eager**:
-    /// it pre-opens `sender_pool_min` ingest senders — honoring an
-    /// EXPLICITLY set `initial_connect_retry`: `off` (the default) fails
+    /// it pre-opens `sender_pool_min` ingest senders — honoring only an
+    /// explicitly set `initial_connect_retry`: `off` (the default) fails
     /// fast, `sync` retries within the reconnect budget, `async` connects in
     /// the background — and `query_pool_min` readers, which have no retry
-    /// mode and always connect synchronously, failing fast. The `sync`
-    /// promoted from merely setting a `reconnect_*` key never drives pool
-    /// startup or borrows (a mid-stream failover budget must not become a
-    /// blocking `connect()`), and explicit `sync` conflicts with a positive
-    /// `query_pool_min` — set `query_pool_min=0` or use `lazy_connect=true`.
-    /// Bare `initial_connect_retry=async` is likewise not a non-blocking
-    /// startup while `query_pool_min > 0`; `lazy_connect=true` is. Growth
-    /// borrows beyond the minimum honor the same rules.
+    /// mode and always connect synchronously, failing fast; `sync` governs
+    /// only the ingest side. Reconnect-to-sync promotion applies only to
+    /// standalone [`SenderBuilder::build`]; pools honor only an explicitly
+    /// set mode. Bare `initial_connect_retry=async` is likewise not a
+    /// non-blocking startup while `query_pool_min > 0`; `lazy_connect=true`
+    /// is. Growth borrows beyond the minimum honor the same rules.
     ///
     /// With `lazy_connect=true` the pool tolerates a down server at startup:
     /// `connect` performs no blocking network I/O, `query_pool_min` defaults
@@ -832,7 +825,12 @@ impl QuestDb {
         let sf_disk = parsed.sf_disk;
         let pool_cfg = parsed.pool;
 
-        let builder = SenderBuilder::from_conf(conf)?;
+        let mut builder = SenderBuilder::from_conf(conf)?;
+        if pool_cfg.lazy_connect {
+            // Java's lazy_connect injects an async initial connect into the
+            // ingest config once; every pooled sender then inherits it.
+            builder.force_async_initial_connect();
+        }
         let buffer_max_name_len = builder.configured_max_name_len();
         let connector = builder.build_qwp_ws_connector()?;
         let health = QwpWsHostHealthTracker::new(connector.endpoint_count());
@@ -857,7 +855,6 @@ impl QuestDb {
             buffer_max_name_len,
             health: Mutex::new(health),
             sender_pool_min: pool_cfg.sender_pool_min,
-            lazy_connect: pool_cfg.lazy_connect,
             sender_pool_max: pool_cfg.sender_pool_max,
             #[cfg(feature = "_egress")]
             query_pool_min: pool_cfg.query_pool_min,
@@ -908,7 +905,7 @@ impl QuestDb {
         // warm minimum without any connect, silently voiding the eager
         // fail-fast contract whenever a previous run left queued data behind.
         // On error the drop of `db` closes whatever was opened.
-        if !db.inner.lazy_connect {
+        if !pool_cfg.lazy_connect {
             prewarm_min_connections(&db)?;
         }
         // Recovery pre-open then re-adopts any dirty slots prewarm did not
@@ -2744,15 +2741,8 @@ fn prewarm_min_connections(db: &QuestDb) -> Result<()> {
 
 fn connect_sfa_pool(inner: &Arc<DbInner>, slot_index: Option<usize>) -> Result<PooledSenderCore> {
     let recovery_candidates = managed_slot_recovery_candidates(inner);
-    // A lazy pool forces the background initial connect so borrows keep
-    // working while the server is away; a non-lazy pool honors
-    // `initial_connect_retry` as configured.
-    connect_sfa_pool_with_recovery_candidates(
-        inner,
-        slot_index,
-        &recovery_candidates,
-        inner.lazy_connect,
-    )
+    // The connector already carries the pool's resolved initial-connect mode.
+    connect_sfa_pool_with_recovery_candidates(inner, slot_index, &recovery_candidates, false)
 }
 
 fn connect_sfa_pool_with_recovery_candidates(

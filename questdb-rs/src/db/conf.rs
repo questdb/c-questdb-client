@@ -285,25 +285,6 @@ pub(crate) fn parse(conf: &str) -> Result<ParsedConf> {
             ));
         }
         pool.query_pool_min = 0;
-    } else if pool.query_pool_min > 0
-        && initial_connect_retry
-            .as_deref()
-            .is_some_and(crate::ingress::initial_connect_retry_value_is_sync)
-    {
-        // Same cross-surface consistency rule as the lazy conflicts above:
-        // explicit sync means "retry my startup connects", but readers have
-        // no retry mode, so a reader pre-open would still fail fast and make
-        // the sync promise a half-truth. Refuse the combination with a
-        // remedy instead.
-        return Err(error::fmt!(
-            ConfigError,
-            "conflicting configuration: initial_connect_retry=sync retries the \
-             eager ingest pre-opens, but readers have no retry mode and \
-             query_pool_min={} would still fail fast at startup. Resolve by \
-             setting query_pool_min=0 (readers then connect on first use) or \
-             using lazy_connect=true.",
-            pool.query_pool_min
-        ));
     }
 
     if pool.sender_pool_min > pool.sender_pool_max {

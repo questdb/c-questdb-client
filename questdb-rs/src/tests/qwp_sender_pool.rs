@@ -1054,22 +1054,22 @@ fn eager_connect_adopts_dirty_slot_and_replays_on_live_server() {
 }
 
 #[test]
-fn eager_sync_with_reader_prewarm_is_a_config_conflict() {
-    // Explicit sync retries ingest pre-opens, but readers have no retry
-    // mode; refusing the combination keeps "retry my startup" from being a
-    // half-truth.
-    let err = QuestDb::connect("ws::addr=localhost:9000;initial_connect_retry=sync;")
-        .expect_err("sync with the default reader prewarm must conflict");
-    assert_eq!(err.code(), ErrorCode::ConfigError);
-    assert!(err.msg().contains("query_pool_min"), "{}", err.msg());
-
-    // sync with a lazy read pool is accepted; nothing prewarms here.
-    QuestDb::connect(&format!(
-        "ws::addr=127.0.0.1:{};initial_connect_retry=sync;\
-         sender_pool_min=0;query_pool_min=0;",
-        unused_local_port()
-    ))
-    .expect("sync with query_pool_min=0 must be accepted");
+fn eager_connect_with_sync_mode_still_fails_fast_on_reader_prewarm() {
+    // Java permits this combination: sync governs ingest only, while readers
+    // always connect fail-fast. Skip ingest prewarm so the down reader is the
+    // observed failure; the long reconnect budget must not delay it.
+    let conf = eager_conf(
+        &[unused_local_port()],
+        "initial_connect_retry=sync;reconnect_max_duration_millis=6000;\
+         sender_pool_min=0;query_pool_min=1;",
+    );
+    let start = std::time::Instant::now();
+    let err = QuestDb::connect(&conf).expect_err("reader prewarm must fail fast");
+    assert_ne!(err.code(), ErrorCode::ConfigError, "{}", err.msg());
+    assert!(
+        start.elapsed() < std::time::Duration::from_secs(2),
+        "reader prewarm has no retry budget"
+    );
 }
 
 #[test]

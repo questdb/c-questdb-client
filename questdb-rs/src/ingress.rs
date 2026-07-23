@@ -636,18 +636,11 @@ impl QwpWsConnector {
         force_async_initial_connect: bool,
     ) -> Result<sender::qwp_ws::SyncQwpWsHandlerState> {
         let mut qwp_ws = self.qwp_ws.clone();
-        // Recovery pre-opens and lazy_connect pools force the background
-        // initial connect; a non-lazy pool honors an EXPLICITLY set
-        // `initial_connect_retry` (default off: connect at borrow / prewarm
-        // and fail fast). The `sync` promoted from `reconnect_*` keys is
-        // demoted back to the default here: that promotion exists to give the
-        // standalone sender's blocking connect a retry budget, and honoring
-        // it in the pool would turn a mid-stream failover knob into a
-        // multi-minute blocking `connect()`.
+        // Reconnect-to-sync promotion applies only to standalone
+        // `SenderBuilder::build()`; pools honor only an explicitly set mode.
+        // Recovery pre-opens still override that mode for this one connect.
         if force_async_initial_connect {
             qwp_ws.force_async_initial_connect();
-        } else {
-            qwp_ws.demote_promoted_initial_connect_retry();
         }
         // The pool's shared sources exist (handlers already attached, or
         // permanently defaulted) before connect-time recovery senders are
@@ -1368,11 +1361,6 @@ impl SenderBuilder {
             };
         }
 
-        #[cfg(feature = "_sender-qwp-ws")]
-        if let Some(qwp_ws) = builder.qwp_ws.as_mut() {
-            qwp_ws.apply_reconnect_implies_initial_retry();
-        }
-
         Ok(builder)
     }
 
@@ -2013,7 +2001,6 @@ impl SenderBuilder {
                 "The \"initial_connect_retry\" setting is only supported for QWP/WebSocket."
             ));
         };
-        qwp_ws.demote_promoted_initial_connect_retry();
         qwp_ws
             .initial_connect_retry
             .set_specified("initial_connect_retry", mode)?;
@@ -2027,8 +2014,8 @@ impl SenderBuilder {
     /// eager warm-minimum pre-open and every pool borrow that opens a new
     /// connection honor it, defaulting to fail-fast `off`. A `lazy_connect`
     /// pool always connects in the background and rejects an explicit
-    /// blocking mode. An explicit call here replaces the `sync` that setting
-    /// any `reconnect_*` key promotes.
+    /// blocking mode. Reconnect-to-sync promotion applies only to standalone
+    /// [`SenderBuilder::build`]; pools honor only an explicitly set mode.
     pub fn initial_connect_retry(mut self, value: bool) -> Result<Self> {
         let Some(qwp_ws) = &mut self.qwp_ws else {
             return Err(error::fmt!(
@@ -2036,7 +2023,6 @@ impl SenderBuilder {
                 "The \"initial_connect_retry\" setting is only supported for QWP/WebSocket."
             ));
         };
-        qwp_ws.demote_promoted_initial_connect_retry();
         qwp_ws.initial_connect_retry.set_specified(
             "initial_connect_retry",
             if value {
@@ -2776,12 +2762,14 @@ impl SenderBuilder {
                         "QWP/WebSocket configuration is missing."
                     ));
                 };
-                // Builder API callers reach build() without going through
-                // from_conf, so apply the reconnect-implies-initial-retry
-                // auto-on here too. Cheap clone; a no-op when the caller
-                // already specified initial_connect_retry.
+                // Resolve reconnect-implies-initial-retry only for this
+                // standalone build. The builder retains the user's explicit
+                // choice (or lack of one), so pool connector builds never see
+                // this effective mode.
+                let actual_initial_connect_retry = qwp_ws.resolve_initial_connect_retry();
                 let mut qwp_ws = qwp_ws.clone();
-                qwp_ws.apply_reconnect_implies_initial_retry();
+                qwp_ws.initial_connect_retry =
+                    ConfigSetting::Specified(actual_initial_connect_retry);
                 let qwp_ws = &qwp_ws;
                 reject_unsupported_qwp_ws_sf_config(qwp_ws)?;
                 let basic_auth = qwp_ws_auth_header(&auth)?;
@@ -2889,7 +2877,7 @@ impl SenderBuilder {
     /// Resolve the QWP/WebSocket connect ingredients used by
     /// [`Self::build_qwp_ws_connector`]: validate the protocol / buffer / TLS
     /// settings, build the TLS config and auth header, and clone the
-    /// (reconnect-promoted, SF-vetted) `QwpWsConfig`.
+    /// SF-vetted `QwpWsConfig`.
     #[cfg(feature = "sync-sender-qwp-ws")]
     fn resolve_qwp_ws_ingredients(
         &self,
@@ -2952,8 +2940,7 @@ impl SenderBuilder {
 
         let auth = self.build_auth()?;
         let auth_header = qwp_ws_auth_header(&auth)?;
-        let mut qwp_ws = qwp_ws.clone();
-        qwp_ws.apply_reconnect_implies_initial_retry();
+        let qwp_ws = qwp_ws.clone();
         reject_unsupported_qwp_ws_sf_config(&qwp_ws)?;
         if *qwp_ws.progress == QwpWsProgress::Manual
             && *qwp_ws.initial_connect_retry == conf::QwpWsInitialConnectMode::Async
@@ -2966,6 +2953,14 @@ impl SenderBuilder {
 
         let use_tls = matches!(self.protocol, Protocol::Wss);
         Ok((use_tls, tls_settings, qwp_ws, auth_header))
+    }
+
+    /// Force the pool connector's baked-in initial connect mode to background.
+    #[cfg(feature = "sync-sender-qwp-ws")]
+    pub(crate) fn force_async_initial_connect(&mut self) {
+        if let Some(qwp_ws) = self.qwp_ws.as_mut() {
+            qwp_ws.force_async_initial_connect();
+        }
     }
 
     /// Build a reusable [`QwpWsConnector`] capturing the full configured
@@ -3058,18 +3053,6 @@ pub(crate) fn initial_connect_retry_value_is_blocking(str_value: &str) -> bool {
     matches!(
         parse_initial_connect_retry_value(str_value),
         Ok(mode) if mode != conf::QwpWsInitialConnectMode::Async
-    )
-}
-
-/// `true` when the ingress parser recognizes `str_value` as the synchronous
-/// retry mode (`sync` / `on` / `true`). Used by the pool's eager-startup
-/// conflict check; derived from the parser for the same no-drift reason as
-/// [`initial_connect_retry_value_is_blocking`].
-#[cfg(feature = "_sender-qwp-ws")]
-pub(crate) fn initial_connect_retry_value_is_sync(str_value: &str) -> bool {
-    matches!(
-        parse_initial_connect_retry_value(str_value),
-        Ok(conf::QwpWsInitialConnectMode::Sync)
     )
 }
 

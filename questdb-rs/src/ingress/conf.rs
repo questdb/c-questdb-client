@@ -280,11 +280,6 @@ pub(crate) struct QwpWsConfig {
     /// Initial-connect retry mode. Default is fail-fast after one endpoint
     /// round, matching Java's startup behavior.
     pub(crate) initial_connect_retry: ConfigSetting<QwpWsInitialConnectMode>,
-    /// `true` when `initial_connect_retry` was promoted from a `reconnect_*`
-    /// key rather than chosen by the user. An explicit builder-setter call
-    /// replaces a promoted mode instead of conflicting with it (see
-    /// `demote_promoted_initial_connect_retry`).
-    pub(crate) initial_connect_retry_promoted: bool,
     /// Bounded wait used by Sender::close_drain().
     pub(crate) close_flush_timeout: ConfigSetting<std::time::Duration>,
     pub(crate) sf_dir: ConfigSetting<Option<PathBuf>>,
@@ -352,7 +347,6 @@ impl Default for QwpWsConfig {
             ),
             reconnect_max_backoff: ConfigSetting::new_default(std::time::Duration::from_secs(5)),
             initial_connect_retry: ConfigSetting::new_default(QwpWsInitialConnectMode::Off),
-            initial_connect_retry_promoted: false,
             close_flush_timeout: ConfigSetting::new_default(QWP_WS_DEFAULT_CLOSE_DRAIN_TIMEOUT),
             sf_dir: ConfigSetting::new_default(None),
             sender_id: ConfigSetting::new_default(QWP_WS_DEFAULT_SENDER_ID.to_owned()),
@@ -401,20 +395,20 @@ impl QwpWsConfig {
     /// a longer reconnect budget expecting it to also bound the first
     /// connect silently gets no retry at all.
     ///
-    /// Promote `initial_connect_retry` to `Sync` whenever the user
-    /// explicitly set any `reconnect_*` key and did not explicitly choose
-    /// an `initial_connect_retry` mode themselves. Explicit
-    /// `initial_connect_retry=off` is preserved.
-    pub(crate) fn apply_reconnect_implies_initial_retry(&mut self) {
+    /// Resolve the standalone sender's effective initial-connect mode.
+    /// Explicit `initial_connect_retry` wins; otherwise any explicitly set
+    /// `reconnect_*` key implies `Sync`, and the remaining default is `Off`.
+    pub(crate) fn resolve_initial_connect_retry(&self) -> QwpWsInitialConnectMode {
         if self.initial_connect_retry.is_specified() {
-            return;
+            return *self.initial_connect_retry;
         }
         let any_reconnect_specified = self.reconnect_max_duration.is_specified()
             || self.reconnect_initial_backoff.is_specified()
             || self.reconnect_max_backoff.is_specified();
         if any_reconnect_specified {
-            self.initial_connect_retry = ConfigSetting::Specified(QwpWsInitialConnectMode::Sync);
-            self.initial_connect_retry_promoted = true;
+            QwpWsInitialConnectMode::Sync
+        } else {
+            QwpWsInitialConnectMode::Off
         }
     }
 
@@ -422,19 +416,6 @@ impl QwpWsConfig {
     /// server is reachable; the background runner owns the initial connect.
     pub(crate) fn force_async_initial_connect(&mut self) {
         self.initial_connect_retry = ConfigSetting::Specified(QwpWsInitialConnectMode::Async);
-        self.initial_connect_retry_promoted = false;
-    }
-
-    /// A promoted `initial_connect_retry` is a default in disguise: before an
-    /// explicit setter call, demote it back to `Defaulted` so `set_specified`
-    /// accepts the caller's value whatever it is — including `Off`, which
-    /// would otherwise hit the already-specified conflict arm for a mode the
-    /// user never chose. A no-op unless the current mode was promoted.
-    pub(crate) fn demote_promoted_initial_connect_retry(&mut self) {
-        if self.initial_connect_retry_promoted {
-            self.initial_connect_retry = ConfigSetting::new_default(QwpWsInitialConnectMode::Off);
-            self.initial_connect_retry_promoted = false;
-        }
     }
 }
 
