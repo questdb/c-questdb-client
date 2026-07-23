@@ -936,6 +936,7 @@ fn eager_connect_prewarms_sender_pool_min_connections() {
     assert_eq!(server.accepted(), 2);
 }
 
+#[cfg(feature = "sync-reader-qwp-ws")]
 #[test]
 fn eager_connect_with_async_mode_still_fails_fast_on_reader_prewarm() {
     // initial_connect_retry is ingress-only: reader pre-opens always connect
@@ -1053,6 +1054,7 @@ fn eager_connect_adopts_dirty_slot_and_replays_on_live_server() {
     assert_eq!(frame_row_count(&replayed), 1);
 }
 
+#[cfg(feature = "sync-reader-qwp-ws")]
 #[test]
 fn eager_connect_with_sync_mode_still_fails_fast_on_reader_prewarm() {
     // Java permits this combination: sync governs ingest only, while readers
