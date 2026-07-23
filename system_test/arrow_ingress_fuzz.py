@@ -1362,7 +1362,6 @@ class TestArrowIngressSfa(afc.ArrowFuzzBase):
             nonlocal rows_produced
             extras = self._sfa_extras(sender_id, sf_dir)
             extras.update({
-                "initial_connect_retry": "sync",
                 "reconnect_max_duration_millis": "120000",
                 "reconnect_max_backoff_millis": "250",
                 "close_flush_timeout_millis": "120000",

@@ -650,7 +650,10 @@ fn eager_conf(ports: &[u16], extras: &str) -> String {
         .map(|p| format!("127.0.0.1:{p}"))
         .collect::<Vec<_>>()
         .join(",");
-    format!("ws::addr={addrs};auth_timeout=2000;{extras}")
+    // The fail-fast tests below measure the application-level retry policy,
+    // not the platform's default TCP dial timeout. Bound both stages so a
+    // closed port remains deterministic on Windows as well as Unix.
+    format!("ws::addr={addrs};auth_timeout=1000;connect_timeout=500;{extras}")
 }
 
 fn append_one_symbol_row<'a>(chunk: &mut Chunk<'a>, symbol: &'a [u8], timestamp: &'a [i64; 1]) {
@@ -982,6 +985,7 @@ fn eager_connect_fails_fast_despite_dirty_recovery_slots() {
     let dead_port = unused_local_port();
     let offline = format!(
         "ws::addr=127.0.0.1:{dead_port};lazy_connect=true;auth_timeout=200;\
+         connect_timeout=500;\
          sf_dir={};sender_id=eagerdirty;sender_pool_min=1;sender_pool_max=1;\
          pool_reap=manual;close_flush_timeout_millis=0;",
         dir.path().display()
@@ -1000,7 +1004,7 @@ fn eager_connect_fails_fast_despite_dirty_recovery_slots() {
     db1.close();
 
     let eager = format!(
-        "ws::addr=127.0.0.1:{dead_port};auth_timeout=200;\
+        "ws::addr=127.0.0.1:{dead_port};auth_timeout=200;connect_timeout=500;\
          sf_dir={};sender_id=eagerdirty;sender_pool_min=1;sender_pool_max=1;\
          query_pool_min=0;pool_reap=manual;close_flush_timeout_millis=0;",
         dir.path().display()
