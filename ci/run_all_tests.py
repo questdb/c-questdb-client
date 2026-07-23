@@ -73,6 +73,7 @@ def run_cpp_tests():
         'test_arrow_egress',
         'test_arrow_ingress',
         'test_column_sender',
+        'qwp_bench_selftest',
     ]
     # Each C++ target may also have a `_cxx20` twin (QUESTDB_TEST_CXX20_VARIANTS);
     # run it too when present so the C++20 header paths are exercised.

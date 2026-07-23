@@ -7,8 +7,9 @@
 //!
 //! Reuses the shared `bench_schema` value generators and `bench_json`
 //! report helpers from `qwp_ingress_polars.rs` so the row-API path puts
-//! byte-identical schema data on the wire and emits the same §3.2 JSON
-//! contract shape (`client="rust-row"`, `direction="ingress"`).
+//! byte-identical schema data on the wire and emits the same JSON path
+//! summary documented in `doc/BENCHMARKS.md` (`client="rust-row"`,
+//! `direction="ingress"`).
 //!
 //! * **`row-build`** (floor, no network): appends each batch to a
 //!   standalone [`questdb::ingress::Buffer`] built via
@@ -52,7 +53,7 @@
 //!     `count()` gate, no `row_count_check` in the JSON report, and
 //!     `paths` contains only `row-build`. Always exits `0`. This is what
 //!     makes `RUN_MODE=floor` safe to run with no server listening at all
-//!     — see `prof-session-runbook.md`.
+//!     — see the floor-only instructions in `doc/BENCHMARKS.md`.
 //!
 //! **Auto-flush knob finding**: unlike the Java client (whose row `Sender`
 //! auto-flushes by default and needs `auto_flush=off` in the connect string

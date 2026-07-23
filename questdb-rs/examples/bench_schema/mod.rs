@@ -1,5 +1,5 @@
-//! Shared scenario definitions for the QWP DataFrame benchmark examples
-//! (doc/historical/QWP_DATAFRAME_BENCH_PLAN.md §3.1 / §8). Both
+//! Shared scenario definitions for the QWP DataFrame benchmark examples. The
+//! cross-client schema contract is documented in `doc/BENCHMARKS.md`. Both
 //! `qwp_ingress_polars` and
 //! `qwp_egress_polars` build their data from these helpers so the Rust
 //! `rust-polars` numbers compare against the Python `py-pandas` harness
@@ -21,7 +21,7 @@
 ///
 /// * `S1Narrow` — 5 columns (the headline; matches Go/Rust `qwp-egress-read`).
 /// * `S2Wide` — 15 columns: S1 plus 5 DOUBLE + 5 high-cardinality SYMBOL,
-///   matching the Go `qwp-egress-read-wide` anchor (plan §8).
+///   matching the Go `qwp-egress-read-wide` anchor.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum SchemaKind {
     S1Narrow,
@@ -109,7 +109,7 @@ impl SchemaKind {
 
 // ---------------------------------------------------------------------------
 // Deterministic value generators (mirror the Python make_s1_narrow /
-// make_s2_wide field-for-field; see plan §3.1 / §8).
+// make_s2_wide field-for-field for cross-client comparison).
 // ---------------------------------------------------------------------------
 
 /// Number of distinct VARCHAR `note` templates (low cardinality so the cost

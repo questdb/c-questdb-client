@@ -71,6 +71,12 @@ option(QUESTDB_QWP_BENCH
     "Build the C QWP bench examples (qwp_ingress_c/qwp_egress_c need libcurl)"
     OFF)
 
+set(QWP_BENCH_SELFTEST_SOURCES
+    examples/bench_schema_c.c
+    examples/bench_json_c.c
+    examples/bench_ingest_c.c
+    examples/qwp_bench_selftest.c)
+
 # Build static and dynamic lib written in Rust by invoking `cargo`.
 # Imports `questdb_client` target.
 add_subdirectory(corrosion)
@@ -467,6 +473,10 @@ if (QUESTDB_TESTS_AND_EXAMPLES)
         cpp_test/qwp_mock_server.cpp
         cpp_test/test_column_sender.cpp)
 
+    compile_test(
+        qwp_bench_selftest
+        ${QWP_BENCH_SELFTEST_SOURCES})
+
     # System testing Python3 script.
     # This will download the latest QuestDB instance from Github,
     # thus will also require a Java 11 installation to run the tests.
@@ -490,12 +500,11 @@ if (QUESTDB_TESTS_AND_EXAMPLES)
 endif()
 
 if(QUESTDB_QWP_BENCH)
-    compile_example(
-        qwp_bench_selftest
-        examples/bench_schema_c.c
-        examples/bench_json_c.c
-        examples/bench_ingest_c.c
-        examples/qwp_bench_selftest.c)
+    if(NOT TARGET qwp_bench_selftest)
+        compile_example(
+            qwp_bench_selftest
+            ${QWP_BENCH_SELFTEST_SOURCES})
+    endif()
 
     find_package(CURL REQUIRED)
     find_package(Threads REQUIRED)
@@ -516,4 +525,8 @@ if(QUESTDB_QWP_BENCH)
         examples/bench_ingest_c.c
         examples/qwp_egress_c.c)
     target_link_libraries(qwp_egress_c CURL::libcurl)
+endif()
+
+if(TARGET qwp_bench_selftest AND MSVC)
+    target_compile_definitions(qwp_bench_selftest PRIVATE _CRT_SECURE_NO_WARNINGS)
 endif()
