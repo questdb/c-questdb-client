@@ -282,6 +282,12 @@ struct DbInner {
     /// Managed ingestion slot range excluded from orphan scans so sibling
     /// senders do not adopt each other's live pool slots.
     managed_slot_exclusion: Option<QwpWsManagedSlotExclusion>,
+    /// Same-base managed slots left outside this pool's live index range by a
+    /// larger previous run. Snapshotted once before the pool is published and
+    /// reused by every sender build, so borrow-triggered growth never rescans
+    /// `sf_dir`. The pool namespace is exclusive: a same-base slot created
+    /// after connect is recovered by the next pool instance.
+    out_of_range_recovery_candidates: Vec<PathBuf>,
     idle_timeout: Duration,
     /// Pool-wide connection lifecycle event source (dispatcher + attempt
     /// counter + success-classification state). Fixed at connect — with a
@@ -535,24 +541,6 @@ fn parse_managed_slot_id(base: &str, name: &str) -> Option<usize> {
     managed_slot_exclusion(base, usize::MAX).parse_index(name)
 }
 
-fn managed_slot_recovery_candidates(inner: &DbInner) -> Vec<PathBuf> {
-    if !inner.sf_disk {
-        return Vec::new();
-    }
-    let Some(sf_dir) = inner.connector.sf_dir() else {
-        return Vec::new();
-    };
-    managed_slot_recovery_candidates_from(sf_dir, &inner.slot_base_id, inner.sender_pool_max)
-}
-
-fn managed_slot_recovery_candidates_from(
-    sf_dir: &Path,
-    base: &str,
-    pool_max: usize,
-) -> Vec<PathBuf> {
-    managed_slot_recovery_scan_from(sf_dir, base, pool_max).out_of_range
-}
-
 fn managed_slot_recovery_scan_from(
     sf_dir: &Path,
     base: &str,
@@ -585,9 +573,8 @@ fn managed_slot_recovery_scan_from(
                 path: slot_path,
             });
         } else {
-            // This scan runs for every managed sender build, so the warning may
-            // repeat for the same directory until one drainer drains it. A
-            // DbInner-level dedupe set is a follow-up, not part of this fix.
+            // The pool-lifetime snapshot emits this warning once per candidate
+            // instead of repeating it on every borrow-triggered sender build.
             log::warn!(
                 "adopting out-of-range store-and-forward slot `{}`; \
                  `<sender_id>-ingest-*` directories under \
@@ -608,18 +595,20 @@ fn managed_slot_recovery_scan_from(
 /// Recovery senders count toward the ingestion pool total like ordinary parked
 /// senders. They are reaped only after their queues are delivered and idle past
 /// the timeout, and drain on pool close via `drain_sfa_senders_bounded`. Each
-/// pre-opened sender also enrolls out-of-range managed slots in its
-/// orphan-drainer set, so those slots may begin replay at connect as well.
-fn preopen_recovery_senders(inner: &Arc<DbInner>) {
-    if !inner.sf_disk {
-        return;
-    }
-    let Some(sf_dir) = inner.connector.sf_dir() else {
-        return;
-    };
-    let scan = managed_slot_recovery_scan_from(sf_dir, &inner.slot_base_id, inner.sender_pool_max);
-    for candidate in scan.in_range {
-        preopen_recovery_sender(inner, candidate.index, &candidate.path, &scan.out_of_range);
+/// pre-opened sender also enrolls the pool's snapshotted out-of-range managed
+/// slots in its orphan-drainer set, so those slots may begin replay at connect
+/// as well.
+fn preopen_recovery_senders(
+    inner: &Arc<DbInner>,
+    in_range_candidates: &[ManagedSlotRecoveryCandidate],
+) {
+    for candidate in in_range_candidates {
+        preopen_recovery_sender(
+            inner,
+            candidate.index,
+            &candidate.path,
+            &inner.out_of_range_recovery_candidates,
+        );
     }
 }
 
@@ -843,6 +832,25 @@ impl QuestDb {
         } else {
             None
         };
+        // Snapshot managed recovery before any sender is built. In-range
+        // entries are retained locally for connect-time pre-open; out-of-range
+        // entries live on DbInner and are reused by prewarm and later growth.
+        // This matches Java SenderPool's cached out-of-range worklist and keeps
+        // the borrow path free of top-level sf_dir scans.
+        let recovery_scan = if sf_disk {
+            connector
+                .sf_dir()
+                .map(|sf_dir| {
+                    managed_slot_recovery_scan_from(sf_dir, &slot_base_id, pool_cfg.sender_pool_max)
+                })
+                .unwrap_or_default()
+        } else {
+            ManagedSlotRecoveryScan::default()
+        };
+        let ManagedSlotRecoveryScan {
+            in_range: in_range_recovery_candidates,
+            out_of_range: out_of_range_recovery_candidates,
+        } = recovery_scan;
 
         // Start empty; connect-time recovery may pre-open dirty disk-SF slots
         // after `inner` exists, otherwise the pools open on first borrow.
@@ -864,6 +872,7 @@ impl QuestDb {
             sf_disk,
             slot_base_id,
             managed_slot_exclusion,
+            out_of_range_recovery_candidates,
             idle_timeout: pool_cfg.idle_timeout,
             state: Mutex::new(if sf_disk {
                 PoolState::with_disk_slots(pool_cfg.sender_pool_max)
@@ -898,19 +907,20 @@ impl QuestDb {
 
         let db = Self { inner, reaper };
         // Prewarm BEFORE recovery pre-open, matching the Java client's order.
-        // Prewarm adopts dirty disk slots itself through the borrow path's
-        // recovery candidates, so its foreground connect genuinely probes the
-        // server; recovery must not run first or its background-connecting
-        // (forced-async) senders would sit in the free list and satisfy the
-        // warm minimum without any connect, silently voiding the eager
-        // fail-fast contract whenever a previous run left queued data behind.
-        // On error the drop of `db` closes whatever was opened.
+        // Prewarm adopts each dirty in-range slot through its deterministic
+        // managed id and enrolls the snapshotted out-of-range candidates, so
+        // its foreground connect genuinely probes the server; recovery must
+        // not run first or its background-connecting (forced-async) senders
+        // would sit in the free list and satisfy the warm minimum without any
+        // connect, silently voiding the eager fail-fast contract whenever a
+        // previous run left queued data behind. On error the drop of `db`
+        // closes whatever was opened.
         if !pool_cfg.lazy_connect {
             prewarm_min_connections(&db)?;
         }
         // Recovery pre-open then re-adopts any dirty slots prewarm did not
         // claim; their initial connect and replay run in the background.
-        preopen_recovery_senders(&db.inner);
+        preopen_recovery_senders(&db.inner, &in_range_recovery_candidates);
         Ok(db)
     }
 
@@ -2740,9 +2750,13 @@ fn prewarm_min_connections(db: &QuestDb) -> Result<()> {
 }
 
 fn connect_sfa_pool(inner: &Arc<DbInner>, slot_index: Option<usize>) -> Result<PooledSenderCore> {
-    let recovery_candidates = managed_slot_recovery_candidates(inner);
     // The connector already carries the pool's resolved initial-connect mode.
-    connect_sfa_pool_with_recovery_candidates(inner, slot_index, &recovery_candidates, false)
+    connect_sfa_pool_with_recovery_candidates(
+        inner,
+        slot_index,
+        &inner.out_of_range_recovery_candidates,
+        false,
+    )
 }
 
 fn connect_sfa_pool_with_recovery_candidates(
@@ -3276,7 +3290,7 @@ mod tests {
 
     use tempfile::TempDir;
 
-    use super::{SlotReservations, managed_slot_recovery_candidates_from};
+    use super::{SlotReservations, managed_slot_recovery_scan_from};
 
     fn dirty_slot(root: &std::path::Path, name: &str) {
         let slot = root.join(name);
@@ -3293,7 +3307,7 @@ mod tests {
         dirty_slot(temp.path(), &format!("default-{}-2", "col"));
         dirty_slot(temp.path(), &format!("default-{}-2", "row"));
 
-        let mut actual = managed_slot_recovery_candidates_from(temp.path(), "default", 2);
+        let mut actual = managed_slot_recovery_scan_from(temp.path(), "default", 2).out_of_range;
         actual.sort();
 
         assert_eq!(actual, vec![temp.path().join("default-ingest-2")]);

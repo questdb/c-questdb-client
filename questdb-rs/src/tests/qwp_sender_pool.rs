@@ -1739,6 +1739,85 @@ fn disk_store_and_forward_restart_replays_reminted_and_out_of_range_managed_slot
 }
 
 #[test]
+fn disk_store_and_forward_growth_uses_connect_time_recovery_snapshot() {
+    let dir = TempDir::new().unwrap();
+    let seed_port = unused_local_port();
+    let seed_conf = format!(
+        "ws::addr=127.0.0.1:{seed_port};lazy_connect=true;auth_timeout=200;\
+         reconnect_max_duration_millis=100;sf_dir={};sender_id=snapshot;\
+         sender_pool_min=0;query_pool_min=0;sender_pool_max=3;pool_reap=manual;\
+         close_flush_timeout_millis=0;",
+        dir.path().display()
+    );
+    {
+        let db = QuestDb::connect(&seed_conf).unwrap();
+        let _s0 = db.borrow_sender().expect("reserve seed slot 0");
+        let mut s1 = db.borrow_sender().expect("seed snapshot slot 1");
+        let mut s2 = db.borrow_sender().expect("seed late slot 2");
+
+        let snapshot_value = [101_i64];
+        let snapshot_ts = [101_i64];
+        let mut snapshot_chunk = one_i64_row("snapshot_candidate", &snapshot_value, &snapshot_ts);
+        s1.flush(&mut snapshot_chunk)
+            .expect("append snapshot candidate");
+
+        let late_value = [202_i64];
+        let late_ts = [202_i64];
+        let mut late_chunk = one_i64_row("late_candidate", &late_value, &late_ts);
+        s2.flush(&mut late_chunk).expect("append late candidate");
+    }
+
+    let snapshot_slot = dir.path().join("snapshot-ingest-1");
+    let late_slot = dir.path().join("snapshot-ingest-2");
+    let hidden_late_slot = dir.path().join("snapshot-late-hidden");
+    assert!(slot_has_sfa_file(&snapshot_slot));
+    assert!(slot_has_sfa_file(&late_slot));
+    fs::rename(&late_slot, &hidden_late_slot).expect("hide late slot before connect snapshot");
+
+    let (server, frames) = MockServer::spawn_acking_capturing(4);
+    let replay_conf = format!(
+        "ws::addr=127.0.0.1:{};lazy_connect=true;auth_timeout=2000;\
+         sf_dir={};sender_id=snapshot;sender_pool_min=0;query_pool_min=0;\
+         sender_pool_max=1;pool_reap=manual;max_background_drainers=1;\
+         close_flush_timeout_millis=0;",
+        server.port(),
+        dir.path().display()
+    );
+    let db = QuestDb::connect(&replay_conf).expect("snapshot recovery candidates");
+
+    // This valid out-of-range slot appears only after construction. The first
+    // borrow must reuse the connect-time candidate list rather than rescan
+    // sf_dir and silently expand the pool's recovery snapshot.
+    fs::rename(&hidden_late_slot, &late_slot).expect("publish late candidate after snapshot");
+    let _sender = db
+        .borrow_sender()
+        .expect("first borrow starts snapshotted recovery");
+
+    let replayed = frames
+        .recv_timeout(Duration::from_secs(5))
+        .expect("snapshotted candidate must replay");
+    assert_eq!(frame_table_name(&replayed), "snapshot_candidate");
+    assert!(
+        wait_until(Duration::from_secs(5), || !slot_has_sfa_file(
+            &snapshot_slot
+        )),
+        "the snapshotted candidate must drain completely"
+    );
+    match frames.recv_timeout(Duration::from_secs(5)) {
+        Err(mpsc::RecvTimeoutError::Timeout) => {}
+        Ok(frame) => panic!(
+            "borrow-time growth rescanned sf_dir and replayed late table `{}`",
+            frame_table_name(&frame)
+        ),
+        Err(err) => panic!("capture channel closed while checking snapshot boundary: {err}"),
+    }
+    assert!(
+        slot_has_sfa_file(&late_slot),
+        "a candidate published after construction must wait for the next pool snapshot"
+    );
+}
+
+#[test]
 fn disk_store_and_forward_restart_same_pool_max_replays_in_range_slots_without_borrow() {
     let dir = TempDir::new().unwrap();
     let seed_port = unused_local_port();
