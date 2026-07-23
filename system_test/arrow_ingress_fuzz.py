@@ -901,6 +901,7 @@ class TestArrowIngressSfa(afc.ArrowFuzzBase):
         return {
             "sender_id": sender_id,
             "sf_dir": sf_dir,
+            "lazy_connect": "true",
             "sender_pool_min": "1",
             "sender_pool_max": "1",
             "pool_reap": "manual",
@@ -1361,7 +1362,6 @@ class TestArrowIngressSfa(afc.ArrowFuzzBase):
             nonlocal rows_produced
             extras = self._sfa_extras(sender_id, sf_dir)
             extras.update({
-                "initial_connect_retry": "sync",
                 "reconnect_max_duration_millis": "120000",
                 "reconnect_max_backoff_millis": "250",
                 "close_flush_timeout_millis": "120000",
@@ -1562,16 +1562,19 @@ class TestColumnSenderBorrowWithRetry(unittest.TestCase):
             db_close,
             db_borrow_direct_conn_with_retry,
         )
-        # Bind then close to get a definitely-closed local port. The pool is
-        # lazy, so the connect only happens on borrow; a closed port refuses
+        # Bind then close to get a definitely-closed local port. The pool
+        # uses lazy_connect, so the connect only happens on borrow; a closed
+        # port refuses
         # immediately, so the Direct retry shim must exhaust its budget and
         # raise across the FFI boundary instead of hanging or crashing.
         probe = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         probe.bind(("127.0.0.1", 0))
         dead_port = probe.getsockname()[1]
         probe.close()
-        conf = f"ws::addr=127.0.0.1:{dead_port};".encode("utf-8")
-        db = db_connect(conf)  # lazy: opens no socket, so it succeeds
+        conf = (
+            f"ws::addr=127.0.0.1:{dead_port};lazy_connect=true;"
+            .encode("utf-8"))
+        db = db_connect(conf)  # lazy_connect: opens no socket, so it succeeds
         try:
             # Non-zero budget exercises the retry loop (attempts + backoff).
             with self.assertRaises(ArrowSenderError):

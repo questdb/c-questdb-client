@@ -505,8 +505,11 @@ fn main() -> Result<(), Box<dyn Error>> {
             df.schema()
         );
 
-        let conf =
-            format!("ws::addr={host}:{port};sender_pool_min=1;sender_pool_max=1;pool_reap=manual;");
+        let conf = format!(
+            // ingestion-only: skip the eager reader pre-open
+            "ws::addr={host}:{port};sender_pool_min=1;sender_pool_max=1;\
+             pool_reap=manual;query_pool_min=0;"
+        );
         let dbs: Vec<QuestDb> = (0..senders_n)
             .map(|_| QuestDb::connect(&conf))
             .collect::<Result<_, _>>()?;

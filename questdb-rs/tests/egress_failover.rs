@@ -2116,47 +2116,6 @@ fn initial_connect_walks_all_endpoints() {
 }
 
 #[test]
-fn backoff_bounded_by_jitter_ceiling() {
-    // Egress backoff uses **full-jitter** `[0, base)` per
-    // failover.md §3.1, so each individual sleep is drawn uniformly
-    // and there is no per-run lower bound that survives a single
-    // CI invocation. What we CAN assert is the upper bound: total
-    // backoff sleep across the schedule MUST NOT exceed the sum of
-    // the per-attempt jitter ceilings.
-    //
-    // Setup: initial=20ms, max=200ms, max_attempts=3 → 2 reconnect
-    // rounds; sleeps use base 20ms, then 40ms.
-    // Sum of bases (= upper bound on total sleep under full-jitter)
-    // is 60ms. The walk itself does host_count × 2 dials per outer
-    // attempt × 2 attempts = 8 dials on loopback. Allow generous slack
-    // for scheduler noise and connect overhead on busy CI runners.
-    let srv_a = MockServer::start(vec![
-        drop_after_query_script(ServerRole::Standalone, "a"),
-        drop_at_connect_script(),
-    ]);
-    let srv_b = MockServer::start(vec![drop_at_connect_script()]);
-    let conf = format!(
-        "ws::addr={};failover_max_attempts=3;failover_backoff_initial_ms=20;failover_backoff_max_ms=200",
-        build_addr_list(&[&srv_a, &srv_b])
-    );
-    let mut reader = Reader::from_conf(&conf).expect("connect");
-    let mut cursor = reader.prepare("select 1").execute().expect("execute");
-    let start = Instant::now();
-    let _ = cursor.next_batch();
-    let elapsed = start.elapsed();
-    // Sum of jitter ceilings (60ms) + scheduler/connect slack (580ms)
-    // = 640ms upper bound. A regression that disables the cap or
-    // reverts to deterministic backoff (60ms minimum + dials)
-    // wouldn't trip this, but one that *runs away* (e.g. backoff
-    // doubling without saturation) would push elapsed well over 1s.
-    assert!(
-        elapsed < Duration::from_millis(640),
-        "elapsed {:?} exceeds the full-jitter ceiling — backoff schedule has run away",
-        elapsed
-    );
-}
-
-#[test]
 fn cancelling_cursor_does_not_failover_on_drop() {
     // Cursor: connects to A, executes the query, calls cancel(), then
     // drains. While the drain is waiting, A drops the socket. The
@@ -2463,49 +2422,6 @@ fn failover_event_attempts_is_cumulative_across_rotations() {
         attempts[0] >= 2,
         "expected cumulative attempts >= 2 (rotation skipped past dead B); got {}",
         attempts[0],
-    );
-}
-
-#[test]
-fn backoff_caps_at_max_ms() {
-    // Counterpart to `backoff_grows_between_attempts` (which only
-    // checks the lower bound). Here we set the cap WAY below the
-    // value the doubling would otherwise reach, then verify that
-    // total elapsed is closer to "9 sleeps × cap" than to "9
-    // sleeps in pure doubling".
-    //
-    // initial=10, max=20, max_attempts=10 → 9 reconnect rounds:
-    //   - capped:    10 + 20*8 ≈ 170 ms  (plus dial time)
-    //   - uncapped: 10+20+40+80+160+320+640+1280+2560 ≈ 5110 ms
-    // Anything well below the uncapped figure proves the `.min(max_ms)`
-    // is firing.
-    let srv_a = MockServer::start(vec![
-        drop_after_query_script(ServerRole::Standalone, "a"),
-        drop_at_connect_script(),
-    ]);
-    let srv_b = MockServer::start(vec![drop_at_connect_script()]);
-    let conf = format!(
-        "ws::addr={};failover_max_attempts=10;failover_backoff_initial_ms=10;failover_backoff_max_ms=20",
-        build_addr_list(&[&srv_a, &srv_b])
-    );
-    let mut reader = Reader::from_conf(&conf).expect("initial connect");
-    let mut cursor = reader.prepare("select 1").execute().expect("execute");
-    let start = Instant::now();
-    let _ = cursor.next_batch();
-    let elapsed = start.elapsed();
-    // A working cap totals ~170 ms of backoff plus the 9 dial round-
-    // trips; an uncapped run would total ~5.11 s of backoff alone
-    // (10+20+40+80+160+320+640+1280+2560) plus dials. The 2 s threshold
-    // sits well below the uncapped *backoff floor* and well above any
-    // realistic capped run — including the slack a loaded CI runner
-    // can add to each dial. Tightening this threshold has bitten us
-    // before on busy CI hosts (a previous 800 ms cap regressed at
-    // 841 ms with the cap correctly applied), so prefer wide head-
-    // room over narrow precision here.
-    assert!(
-        elapsed < Duration::from_millis(2000),
-        "elapsed {:?} suggests the backoff cap is not being applied",
-        elapsed
     );
 }
 

@@ -1368,6 +1368,12 @@ impl FailoverBudget {
         }
     }
 
+    fn advance_backoff(&mut self, max_backoff_ms: u64) {
+        if self.next_backoff_ms > 0 {
+            self.next_backoff_ms = self.next_backoff_ms.saturating_mul(2).min(max_backoff_ms);
+        }
+    }
+
     fn before_reconnect_round(
         &mut self,
         cfg: &ReaderConfig,
@@ -1392,12 +1398,7 @@ impl FailoverBudget {
             None => Duration::from_millis(jittered_ms),
         };
         std::thread::sleep(sleep_dur);
-        if self.next_backoff_ms > 0 {
-            self.next_backoff_ms = self
-                .next_backoff_ms
-                .saturating_mul(2)
-                .min(cfg.failover_backoff_max_ms);
-        }
+        self.advance_backoff(cfg.failover_backoff_max_ms);
         self.reconnect_rounds_remaining = self.reconnect_rounds_remaining.saturating_sub(1);
         Ok(())
     }
@@ -3507,6 +3508,33 @@ mod tests {
                 code
             );
         }
+    }
+
+    /// Pin the exponential base schedule without measuring wall-clock
+    /// time. Socket setup and scheduler delays are unrelated to the
+    /// configured backoff, so elapsed-time integration assertions can
+    /// fail even when this progression is correct.
+    #[test]
+    fn failover_budget_backoff_base_grows_and_caps() {
+        let mut budget = FailoverBudget {
+            reconnect_rounds_remaining: 9,
+            next_backoff_ms: 10,
+            deadline: None,
+        };
+        let observed: [u64; 9] = std::array::from_fn(|_| {
+            let base = budget.next_backoff_ms;
+            budget.advance_backoff(20);
+            base
+        });
+        assert_eq!(observed, [10, 20, 20, 20, 20, 20, 20, 20, 20]);
+
+        let mut disabled = FailoverBudget {
+            reconnect_rounds_remaining: 1,
+            next_backoff_ms: 0,
+            deadline: None,
+        };
+        disabled.advance_backoff(20);
+        assert_eq!(disabled.next_backoff_ms, 0);
     }
 
     /// `base = 0` MUST return 0 without touching the splitmix state.

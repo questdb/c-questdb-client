@@ -3135,9 +3135,11 @@ pub(crate) fn connect_qwp_ws_background_state(
         // replayed and the I/O thread re-registers the whole dictionary via a
         // catch-up frame on reconnect); file mode iff the persisted side-file
         // opened (its recovered entries seed the encoder dict + driver mirror so
-        // ids continue above them). This branch runs only for the standalone
-        // ingress sender -- the pooled core forces async connect -- so the
-        // encoder is live here.
+        // ids continue above them). This branch runs for the standalone
+        // ingress sender and for pool borrows whose initial connect is not
+        // forced async — any non-lazy pool, including the default Off mode;
+        // the encoder is live only for the standalone sender and stays
+        // dormant for the pooled core.
         // Encoder and mirror enable together to stay in lockstep.
         let delta_dict_enabled = parts.delta_dict_enabled;
         parts.encoder.set_delta_dict_enabled(delta_dict_enabled);

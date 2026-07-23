@@ -58,7 +58,7 @@ std::unique_ptr<qm::MockServer> spawn_acking_mock(int slot_count)
 std::string conf_for(const std::string& addr, const std::string& extras = {})
 {
     return "ws::addr=" + addr +
-           ";sender_pool_min=1;pool_reap=manual;close_flush_timeout_millis=0;" +
+           ";lazy_connect=true;sender_pool_min=1;pool_reap=manual;close_flush_timeout_millis=0;" +
            extras;
 }
 

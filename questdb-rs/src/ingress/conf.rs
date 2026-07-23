@@ -395,19 +395,20 @@ impl QwpWsConfig {
     /// a longer reconnect budget expecting it to also bound the first
     /// connect silently gets no retry at all.
     ///
-    /// Promote `initial_connect_retry` to `Sync` whenever the user
-    /// explicitly set any `reconnect_*` key and did not explicitly choose
-    /// an `initial_connect_retry` mode themselves. Explicit
-    /// `initial_connect_retry=off` is preserved.
-    pub(crate) fn apply_reconnect_implies_initial_retry(&mut self) {
+    /// Resolve the standalone sender's effective initial-connect mode.
+    /// Explicit `initial_connect_retry` wins; otherwise any explicitly set
+    /// `reconnect_*` key implies `Sync`, and the remaining default is `Off`.
+    pub(crate) fn resolve_initial_connect_retry(&self) -> QwpWsInitialConnectMode {
         if self.initial_connect_retry.is_specified() {
-            return;
+            return *self.initial_connect_retry;
         }
         let any_reconnect_specified = self.reconnect_max_duration.is_specified()
             || self.reconnect_initial_backoff.is_specified()
             || self.reconnect_max_backoff.is_specified();
         if any_reconnect_specified {
-            self.initial_connect_retry = ConfigSetting::Specified(QwpWsInitialConnectMode::Sync);
+            QwpWsInitialConnectMode::Sync
+        } else {
+            QwpWsInitialConnectMode::Off
         }
     }
 
