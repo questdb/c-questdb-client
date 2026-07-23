@@ -27,6 +27,9 @@
 import sys
 
 sys.dont_write_bytecode = True
+
+sys.modules.setdefault('test', sys.modules[__name__])
+
 import os
 import pathlib
 import math
@@ -35,6 +38,7 @@ import argparse
 import unittest
 import itertools
 import inspect
+import random
 import numpy as np
 import time
 import tempfile
@@ -43,6 +47,63 @@ import threading
 import questdb_line_sender as qls
 import qwp_ws_fuzz
 import uuid
+
+# A native fault inside the client library (e.g. the 0xC0000005 access
+# violation seen on Windows CI) otherwise kills the process with no stack;
+# this prints every thread's Python frames, pinpointing the ctypes call.
+import faulthandler
+faulthandler.enable()
+
+# The Arrow ingress/egress/polars suites require pyarrow (and polars).
+# Import them lazily so test.py still loads in environments that don't install
+# those wheels. When the optional deps are missing we simply don't register the
+# Arrow TestCases, so a full-suite run skips them instead of crashing at import
+# time. CI jobs that run the TestArrow* cases install pyarrow/polars.
+try:
+    from arrow_egress_fuzz import (
+        TestArrowEgressPerKind,
+        TestArrowEgressEmpty,
+        TestArrowEgressFuzz,
+    )
+    from arrow_ingress_fuzz import (
+        TestArrowIngressPerKind,
+        TestArrowIngressDesignatedTs,
+        TestArrowIngressErrors,
+        TestArrowIngressExtraTypes,
+        TestArrowIngressUnsupportedTypes,
+        TestArrowIngressMultiBatch,
+        TestArrowIngressSfa,
+        TestArrowIngressFuzz,
+        TestColumnSenderBorrowWithRetry,
+    )
+    from arrow_round_trip_fuzz import (
+        TestArrowRoundTripPerKind,
+        TestArrowRoundTripFuzz,
+    )
+    from arrow_polars_fuzz import (
+        TestArrowPolarsRoundTripPerKind,
+        TestArrowPolarsFuzz,
+    )
+    from arrow_polars_per_dtype import (
+        TestArrowPolarsPerDtype,
+    )
+    from arrow_alignment_fuzz import TestArrowAlignment
+    from test_arrow_fuzz_common_unit import (
+        TestKindRegistryCompleteness,
+        TestCompareSemantics,
+        TestRngDeterminism,
+        TestBuildRecordBatch,
+        TestSlicedRecordBatchOffsets,
+        TestEdgeCorpora,
+    )
+    ARROW_TESTS_AVAILABLE = True
+except ImportError as _arrow_import_err:
+    # pyarrow/polars not installed: skip registering the Arrow suites.
+    ARROW_TESTS_AVAILABLE = False
+    print(
+        f'Skipping Arrow test suites (optional deps missing): '
+        f'{_arrow_import_err}',
+        file=sys.stderr)
 from fixture import (
     Project,
     QuestDbFixtureBase,
@@ -60,6 +121,21 @@ from decimal import Decimal
 QDB_FIXTURE: QuestDbFixtureBase = None
 TLS_PROXY_FIXTURE: TlsProxyFixture = None
 BUILD_MODE = None
+# Per-test API/CONF/ENV fuzzing. `run_with_fixtures` seeds this once (random,
+# or from QDB_BUILD_MODE_SEED) and prints it so any failure is reproducible.
+# The matrix used to run the whole functional suite 3× — once per BuildMode —
+# at the latest protocol; instead we now run each test once and pick its build
+# mode pseudo-randomly from (seed, test-id), collapsing that 3× into 1×.
+BUILD_MODE_SEED = None
+# True only while the SUITE_MATRIX run uses the per-test fuzzer (set in
+# `_run_selected_tests`). Gates the build-mode override + API-only deferral in
+# `_BuildModeFuzzResult` so the other suites (which pin BuildMode.CONF) are
+# untouched.
+_BUILD_MODE_FUZZ_ACTIVE = False
+# The exact skipTest reason every API-only test/helper raises. The fuzzer keys
+# on it to detect an API-only test that drew CONF/ENV and defer it to a single
+# forced-API retry pass — so no API-only coverage is ever lost to the dice.
+_API_ONLY_SKIP_REASON = 'BuildMode.API-only test'
 QWP_WS_SMOKE_TLS = False
 
 SUITE_MATRIX = 'matrix'
@@ -69,10 +145,6 @@ SUITE_QWP_WS_RESTART = 'qwp_ws_restart'
 SUITE_QWP_WS_FUZZ = 'qwp_ws_fuzz'
 QWP_WS_STATUS_SCHEMA_MISMATCH = 0x03
 
-# The first QuestDB version that supports array types.
-FIRST_ARRAYS_RELEASE = (8, 3, 3)
-DECIMAL_RELEASE = (9, 2, 0)
-QWP_MIN_RELEASE = (9, 4, 3)
 QWP_DECIMAL256_POSITIVE_OVERFLOW = Decimal(
     "57896044618658097711785492504343953926634992332820282019728792003956564819968")
 QWP_DECIMAL256_SIGNED_RESCALE_OVERFLOW_BASE = Decimal(
@@ -84,6 +156,40 @@ def retry_check_table(*args, **kwargs):
 
 def sql_query(query: str):
     return QDB_FIXTURE.http_sql_query(query)
+
+
+_QWP_WS_UNSUPPORTED_MARKERS = (
+    'unsupported protocol',
+    'unknown protocol',
+    'unknown scheme',
+    'missing endpoint',
+    'endpoint not found',
+    # Ingest (Sender → ws://) error phrasing
+    'websocket upgrade failed: http status 404',
+    'websocket upgrade failed: http status 405',
+    'websocket upgrade failed: http status 501',
+    # Egress (Reader → ws://) error phrasing
+    'websocket handshake failed with http 404',
+    'websocket handshake failed with http 405',
+    'websocket handshake failed with http 501',
+)
+
+
+def is_unsupported_qwp_ws_fixture_error(error) -> bool:
+    msg = str(error).lower()
+    return any(m in msg for m in _QWP_WS_UNSUPPORTED_MARKERS)
+
+
+def skip_if_unsupported_qwp_ws_fixture(error, fixture) -> None:
+    if not is_unsupported_qwp_ws_fixture_error(error):
+        return
+    root_dir = getattr(fixture, '_root_dir', None)
+    is_repo_master = root_dir is not None and root_dir.name == 'repo'
+    if is_repo_master:
+        return
+    raise unittest.SkipTest(
+        f'QWP/WebSocket is not supported by this QuestDB fixture: {error}'
+    ) from error
 
 
 class _ParsedUnittestProgram(unittest.TestProgram):
@@ -118,7 +224,7 @@ def _suite_kind(test):
         return SUITE_QWP_WS_PROTOCOL
     if class_name == 'TestQwpWsRestart':
         return SUITE_QWP_WS_RESTART
-    if class_name == 'TestQwpWsFuzz':
+    if class_name == 'TestQwpWsFuzz' or class_name.startswith('TestArrow'):
         return SUITE_QWP_WS_FUZZ
     return SUITE_MATRIX
 
@@ -129,6 +235,81 @@ def _select_tests(suite_kind):
         if _suite_kind(test) == suite_kind:
             suite.addTest(test)
     return suite
+
+
+def _is_latest_protocol() -> bool:
+    """True when the active fixture is pinned to the newest protocol version —
+    the only slice where API/ENV add coverage over CONF, so the only slice the
+    build-mode fuzzer randomizes. Older/auto versions stay on CONF, exactly as
+    the old cartesian product did."""
+    latest = sorted(list(qls.ProtocolVersion))[-1]
+    return QDB_FIXTURE.protocol_version == latest
+
+
+def _select_build_mode_for(test):
+    """Pick the BuildMode for a single matrix test. Deterministic in
+    (seed, test-id), so the printed seed reproduces every choice and the
+    selection is independent of execution order. Non-latest/auto protocol
+    versions are pinned to CONF to mirror the pre-fuzz matrix."""
+    if not _is_latest_protocol():
+        return qls.BuildMode.CONF
+    rng = random.Random(f'{BUILD_MODE_SEED}:{test.id()}')
+    return rng.choice(list(qls.BuildMode))
+
+
+class _BuildModeFuzzResult(unittest.TextTestResult):
+    """TextTestResult that, while the matrix fuzzer is active, assigns each
+    test a pseudo-random BuildMode before it runs and re-queues API-only tests
+    that drew CONF/ENV for a single forced-API retry pass (so the dice never
+    drop their coverage). Fully inert when `_BUILD_MODE_FUZZ_ACTIVE` is False,
+    so the CONF-pinned QWP/WS suites behave exactly as before."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.deferred_api_tests = []
+        self._chosen_mode = None
+
+    def startTest(self, test):
+        if _BUILD_MODE_FUZZ_ACTIVE:
+            global BUILD_MODE
+            BUILD_MODE = _select_build_mode_for(test)
+            self._chosen_mode = BUILD_MODE
+            if self.showAll:
+                self.stream.write(f'[build_mode={BUILD_MODE.name}] ')
+        super().startTest(test)
+
+    def addSkip(self, test, reason):
+        super().addSkip(test, reason)
+        # An API-only test that drew CONF/ENV at the latest protocol skipped
+        # only because of the dice — defer it for one forced-API run so its
+        # coverage survives. At non-latest protocols API-only tests are meant
+        # to skip (only CONF runs there), so don't defer.
+        if (_BUILD_MODE_FUZZ_ACTIVE
+                and reason == _API_ONLY_SKIP_REASON
+                and self._chosen_mode is not qls.BuildMode.API
+                and _is_latest_protocol()):
+            self.deferred_api_tests.append(test)
+
+    def _note_build_mode(self, test):
+        if _BUILD_MODE_FUZZ_ACTIVE and self._chosen_mode is not None:
+            self.stream.writeln(
+                f'    >>> failed under build_mode={self._chosen_mode.name}; '
+                f'reproduce with QDB_BUILD_MODE_SEED={BUILD_MODE_SEED}')
+
+    def addFailure(self, test, err):
+        super().addFailure(test, err)
+        self._note_build_mode(test)
+
+    def addError(self, test, err):
+        if isinstance(err[1], TimeoutError):
+            try:
+                QDB_FIXTURE.capture_timeout_diagnostics(test.id())
+            except Exception as diagnostics_error:
+                self.stream.writeln(
+                    f'Failed to capture QuestDB timeout diagnostics: '
+                    f'{diagnostics_error!r}')
+        super().addError(test, err)
+        self._note_build_mode(test)
 
 
 def _run_selected_tests(suite_kind):
@@ -150,8 +331,31 @@ def _run_selected_tests(suite_kind):
         runner_args['tb_locals'] = getattr(program, 'tb_locals', False)
     if 'durations' in runner_params:
         runner_args['durations'] = getattr(program, 'durations', None)
-    runner = unittest.TextTestRunner(**runner_args)
-    return runner.run(suite).wasSuccessful()
+    runner_args['resultclass'] = _BuildModeFuzzResult
+
+    # The per-test BuildMode fuzzer runs only for the functional matrix suite
+    # (the other suites pin BuildMode.CONF) and only once a seed exists.
+    global _BUILD_MODE_FUZZ_ACTIVE, BUILD_MODE
+    _BUILD_MODE_FUZZ_ACTIVE = (suite_kind == SUITE_MATRIX and BUILD_MODE_SEED is not None)
+    try:
+        runner = unittest.TextTestRunner(**runner_args)
+        result = runner.run(suite)
+        ok = result.wasSuccessful()
+        deferred = getattr(result, 'deferred_api_tests', [])
+        if deferred:
+            # Single forced-API retry pass for the API-only tests the fuzzer
+            # happened to assign CONF/ENV. No fuzzing here — BuildMode.API is
+            # pinned so they actually run instead of self-skipping.
+            _BUILD_MODE_FUZZ_ACTIVE = False
+            BUILD_MODE = qls.BuildMode.API
+            sys.stderr.write(
+                f'>>>> Re-running {len(deferred)} API-only test(s) under '
+                f'BuildMode.API (the fuzzer had assigned them CONF/ENV)\n')
+            retry_runner = unittest.TextTestRunner(**runner_args)
+            ok = retry_runner.run(unittest.TestSuite(deferred)).wasSuccessful() and ok
+        return ok
+    finally:
+        _BUILD_MODE_FUZZ_ACTIVE = False
 
 
 def _read_exact(sock, byte_count, pending=b''):
@@ -363,14 +567,7 @@ class TestSender(unittest.TestCase):
         if QDB_FIXTURE.protocol_version is None:
             if not QDB_FIXTURE.http:
                 return qls.ProtocolVersion.V1
-
-            if QDB_FIXTURE.version >= FIRST_ARRAYS_RELEASE:
-                return qls.ProtocolVersion.V2
-
-            if QDB_FIXTURE.version >= DECIMAL_RELEASE:
-                return qls.ProtocolVersion.V3
-
-            return qls.ProtocolVersion.V1
+            return qls.ProtocolVersion.V2
 
         return QDB_FIXTURE.protocol_version
 
@@ -791,8 +988,6 @@ class TestSender(unittest.TestCase):
         self.assertEqual(scrubbed_dataset, exp_dataset)
 
     def test_decimal_column(self):
-        if QDB_FIXTURE.version < DECIMAL_RELEASE:
-            self.skipTest('No decimal support in this version of QuestDB.')
         if self.expected_protocol_version < qls.ProtocolVersion.V3:
             self.skipTest('communicating over old protocol which does not support decimals')
 
@@ -829,8 +1024,6 @@ class TestSender(unittest.TestCase):
         self.assertEqual(scrubbed_dataset, exp_dataset)
 
     def test_decimal_invalid_characters(self):
-        if QDB_FIXTURE.version < DECIMAL_RELEASE:
-            self.skipTest('No decimal support in this version of QuestDB.')
         if self.expected_protocol_version < qls.ProtocolVersion.V3:
             self.skipTest('communicating over old protocol which does not support decimals')
 
@@ -841,20 +1034,6 @@ class TestSender(unittest.TestCase):
                     (sender
                     .table(table_name)
                     .column_dec_str('dec', "12.34abc")
-                    .at_now())
-
-    def test_decimal_not_available(self):
-        if QDB_FIXTURE.version >= DECIMAL_RELEASE or QDB_FIXTURE.version >= (9, 1, 1): # remove the second condition when 9.2.0 is released
-            self.skipTest('Decimal support is available in this version of QuestDB.')
-        if self.expected_protocol_version >= qls.ProtocolVersion.V3:
-            self.skipTest('communicating over new protocol which supports decimals')
-        table_name = uuid.uuid4().hex
-        with self.assertRaisesRegex(qls.SenderError, r'Bad call to'):
-            with self._mk_linesender() as sender:
-                with self.assertRaisesRegex(qls.SenderError, r'.*does not support the decimal datatype*'):
-                    (sender
-                    .table(table_name)
-                    .column('dec', Decimal("12.34"))
                     .at_now())
 
     def test_f64_arr_column(self):
@@ -1113,9 +1292,6 @@ class TestSender(unittest.TestCase):
         self.assertEqual(scrubbed_dataset, exp_dataset)
 
     def test_c_example(self):
-        if QDB_FIXTURE.version < DECIMAL_RELEASE:
-            self.skipTest('No decimal support in this version of QuestDB.')
-
         suffix = '_auth' if QDB_FIXTURE.auth else ''
         suffix += '_http' if QDB_FIXTURE.http else ''
         self._test_example(
@@ -1123,9 +1299,6 @@ class TestSender(unittest.TestCase):
             f'c_trades{suffix}')
 
     def test_cpp_example(self):
-        if QDB_FIXTURE.version < DECIMAL_RELEASE:
-            self.skipTest('No decimal support in this version of QuestDB.')
-
         suffix = '_auth' if QDB_FIXTURE.auth else ''
         suffix += '_http' if QDB_FIXTURE.http else ''
         self._test_example(
@@ -1133,18 +1306,12 @@ class TestSender(unittest.TestCase):
             f'cpp_trades{suffix}')
 
     def test_c_tls_example(self):
-        if QDB_FIXTURE.version < DECIMAL_RELEASE:
-            self.skipTest('No decimal support in this version of QuestDB.')
-
         self._test_example(
             'line_sender_c_example_tls_ca',
             'c_trades_tls_ca',
             tls=True)
 
     def test_cpp_tls_example(self):
-        if QDB_FIXTURE.version < DECIMAL_RELEASE:
-            self.skipTest('No decimal support in this version of QuestDB.')
-
         self._test_example(
             'line_sender_cpp_example_tls_ca',
             'cpp_trades_tls_ca',
@@ -1448,14 +1615,6 @@ class QwpWsTestSupport:
     TS_STEP_US = 1_000
 
     @staticmethod
-    def _require_qwp_ws_protocol():
-        if QDB_FIXTURE.version < QWP_MIN_RELEASE:
-            raise unittest.SkipTest(
-                f'Server version {".".join(map(str, QDB_FIXTURE.version))} does not '
-                'support the QWP protocol version we can test. Minimum version we need: '
-                f'(QuestDB >= {".".join(map(str, QWP_MIN_RELEASE))})')
-
-    @staticmethod
     def _create_qwp_ws_table(table_name):
         sql_query(
             f'CREATE TABLE "{table_name}" '
@@ -1468,7 +1627,7 @@ class QwpWsTestSupport:
             sender_id,
             sf_dir,
             port=None,
-            scheme='qwpws',
+            scheme='ws',
             host=None,
             endpoints=None,
             **settings):
@@ -1487,21 +1646,6 @@ class QwpWsTestSupport:
             conf.append(f'{key}={value};')
         return ''.join(conf)
 
-    @staticmethod
-    def _is_unsupported_qwp_ws_fixture_error(error):
-        message = str(error).lower()
-        unsupported_markers = (
-            'unsupported protocol',
-            'unknown protocol',
-            'unknown scheme',
-            'missing endpoint',
-            'endpoint not found',
-            'websocket upgrade failed: http status 404',
-            'websocket upgrade failed: http status 405',
-            'websocket upgrade failed: http status 501',
-        )
-        return any(marker in message for marker in unsupported_markers)
-
     def _connect_sender(self, conf):
         sender = None
         try:
@@ -1511,12 +1655,7 @@ class QwpWsTestSupport:
         except qls.SenderError as e:
             if sender is not None:
                 sender.close(False)
-            root_dir = getattr(QDB_FIXTURE, '_root_dir', None)
-            if (
-                    root_dir is not None and
-                    root_dir.name != 'repo' and
-                    self._is_unsupported_qwp_ws_fixture_error(e)):
-                self.skipTest(f'QWP/WebSocket is not supported by this QuestDB fixture: {e}')
+            skip_if_unsupported_qwp_ws_fixture(e, QDB_FIXTURE)
             raise
         return sender
 
@@ -1623,7 +1762,6 @@ class TestQwpWsSender(QwpWsTestSupport, unittest.TestCase):
                 f'select * from long_sequence(1) -- <<<<<<<<< END PYTHON UNIT TEST: {test_name}')
 
     def _require_smoke_fixture(self):
-        self._require_qwp_ws_protocol()
         if not isinstance(QDB_FIXTURE, QuestDbFixture):
             self.skipTest('QWP/WebSocket smoke tests require a managed QuestDB fixture')
         if QDB_FIXTURE.auth:
@@ -1644,7 +1782,7 @@ class TestQwpWsSender(QwpWsTestSupport, unittest.TestCase):
             include_auth=True,
             password=None,
             auth_timeout_ms=None):
-        scheme = 'qwpws'
+        scheme = 'ws'
         host = QDB_FIXTURE.host
         port = QDB_FIXTURE.http_server_port
         settings = {
@@ -1654,7 +1792,7 @@ class TestQwpWsSender(QwpWsTestSupport, unittest.TestCase):
         if auth_timeout_ms is not None:
             settings['auth_timeout_ms'] = auth_timeout_ms
         if QWP_WS_SMOKE_TLS:
-            scheme = 'qwpwss'
+            scheme = 'wss'
             host = 'localhost'
             port = TLS_PROXY_FIXTURE.listen_port
             settings['tls_roots'] = str(Project().tls_certs_dir / 'server_rootCA.pem')
@@ -1682,13 +1820,7 @@ class TestQwpWsSender(QwpWsTestSupport, unittest.TestCase):
             with self.assertRaises(qls.SenderError) as ctx:
                 sender.connect()
             native_error = ctx.exception.__cause__ or ctx.exception
-            root_dir = getattr(QDB_FIXTURE, '_root_dir', None)
-            if (
-                    root_dir is not None and
-                    root_dir.name != 'repo' and
-                    self._is_unsupported_qwp_ws_fixture_error(native_error)):
-                self.skipTest(
-                    f'QWP/WebSocket is not supported by this QuestDB fixture: {native_error}')
+            skip_if_unsupported_qwp_ws_fixture(native_error, QDB_FIXTURE)
             self.assertRegex(
                 str(native_error),
                 r'(?i)(401|403|unauthor|forbidden|authentication)')
@@ -1739,6 +1871,32 @@ class TestQwpWsSender(QwpWsTestSupport, unittest.TestCase):
             expected_min_id=0,
             expected_max_id=self.ROWS - 1)
 
+    def test_native_shared_pool_examples(self):
+        if QWP_WS_SMOKE_TLS or getattr(QDB_FIXTURE, 'http_auth', False):
+            self.skipTest('native pool examples run once against the plain fixture')
+        fixture_root = getattr(QDB_FIXTURE, '_root_dir', None)
+        if fixture_root is not None and fixture_root.name != 'repo':
+            if QDB_FIXTURE.version < (10, 0, 0):
+                self.skipTest('native shared-pool examples require QuestDB 10.0+')
+
+        project = Project()
+        extension = '.exe' if sys.platform == 'win32' else ''
+        conf = (
+            f'ws::addr={QDB_FIXTURE.host}:{QDB_FIXTURE.http_server_port};'
+            'sender_pool_max=2;query_pool_max=2;')
+
+        for binary_name in (
+                'qwp_ws_chunk_and_query_c_example',
+                'qwp_ws_chunk_and_query_cpp_example'):
+            try:
+                binary = next(
+                    project.build_dir.glob(f'**/{binary_name}{extension}'))
+            except StopIteration:
+                raise RuntimeError(
+                    f'Could not find {binary_name}{extension} '
+                    f'in {project.build_dir}')
+            subprocess.check_call([str(binary), conf], cwd=binary.parent)
+
 
 class TestQwpWsProtocol(QwpWsTestSupport, unittest.TestCase):
     def setUp(self):
@@ -1754,7 +1912,6 @@ class TestQwpWsProtocol(QwpWsTestSupport, unittest.TestCase):
                 f'select * from long_sequence(1) -- <<<<<<<<< END PYTHON UNIT TEST: {test_name}')
 
     def _require_protocol_fixture(self):
-        self._require_qwp_ws_protocol()
         if not isinstance(QDB_FIXTURE, QuestDbFixture):
             self.skipTest('QWP/WebSocket protocol tests require a managed QuestDB fixture')
         if QDB_FIXTURE.auth:
@@ -1795,7 +1952,7 @@ class TestQwpWsProtocol(QwpWsTestSupport, unittest.TestCase):
                 self._write_row(sender, table_name, 0)
                 fsn = sender.flush_and_get_fsn()
                 self.assertEqual(fsn, 0)
-                self.assertTrue(sender.await_acked_fsn(fsn, 30000))
+                sender.wait(0)  # AckLevel::Ok
                 self.assertEqual(sender.acked_fsn(), fsn)
                 sender.close_drain()
             finally:
@@ -1844,7 +2001,7 @@ class TestQwpWsProtocol(QwpWsTestSupport, unittest.TestCase):
                 third_fsn = sender.flush_and_get_fsn()
                 self.assertEqual(third_fsn, 2)
 
-                self.assertTrue(sender.await_acked_fsn(third_fsn, 30000))
+                sender.wait(0)  # AckLevel::Ok
                 sender.close_drain()
             finally:
                 sender.close(False)
@@ -1866,7 +2023,7 @@ class TestQwpWsProtocol(QwpWsTestSupport, unittest.TestCase):
                 ['r3', None, 'three'],
             ])
 
-    def test_write_rejection_drops_and_sender_continues(self):
+    def test_schema_rejection_terminalizes_and_preserves_store(self):
         table_name = 'qwp_ws_reject_' + uuid.uuid4().hex[:8]
         sql_query(
             f'CREATE TABLE "{table_name}" '
@@ -1899,34 +2056,25 @@ class TestQwpWsProtocol(QwpWsTestSupport, unittest.TestCase):
                 final_fsn = sender.flush_and_get_fsn()
 
                 self.assertEqual((first_fsn, rejected_fsn, final_fsn), (0, 1, 2))
-                self.assertTrue(sender.await_acked_fsn(final_fsn, 30000))
-                diagnostic = self._retry_poll_qwp_ws_error(sender)
+                with self.assertRaises(qls.SenderError) as ctx:
+                    sender.wait(0)  # AckLevel::Ok
+                diagnostic = ctx.exception.qwp_ws_error
+                if diagnostic is None:
+                    diagnostic = self._retry_poll_qwp_ws_error(sender)
                 self.assertEqual(diagnostic.category, qls.QwpWsErrorCategory.SCHEMA_MISMATCH)
-                self.assertEqual(diagnostic.applied_policy, qls.QwpWsErrorPolicy.DROP_AND_CONTINUE)
+                self.assertEqual(diagnostic.applied_policy, qls.QwpWsErrorPolicy.TERMINAL)
                 self.assertEqual(diagnostic.status, QWP_WS_STATUS_SCHEMA_MISMATCH)
                 self.assertEqual(diagnostic.from_fsn, rejected_fsn)
                 self.assertEqual(diagnostic.to_fsn, rejected_fsn)
-                self.assertIsNone(sender.poll_qwp_ws_error())
+                self.assertIsNotNone(sender.poll_qwp_ws_error())
                 self.assertEqual(sender.qwp_ws_errors_dropped(), 0)
-                sender.close_drain()
             finally:
                 sender.close(False)
 
-            self.assertEqual(
+            self.assertGreater(
                 self._sfa_file_count(sf_dir, sender_id),
                 0,
-                'close-drained rejection sender left SFA frame files behind')
-
-        resp = self._retry_query_rows(
-            f"select id, px from '{table_name}' order by id",
-            2,
-            timeout_sec=30)
-        self.assertEqual(
-            resp['dataset'],
-            [
-                [0, 10.5],
-                [2, 20.5],
-            ])
+                'terminal rejection should preserve SFA frame files')
 
 
 class TestQwpWsRestart(QwpWsTestSupport, unittest.TestCase):
@@ -1949,17 +2097,8 @@ class TestQwpWsRestart(QwpWsTestSupport, unittest.TestCase):
                 f'select * from long_sequence(1) -- <<<<<<<<< END PYTHON UNIT TEST: {test_name}')
 
     def _require_restart_fixture(self):
-        self._require_qwp_ws_protocol()
         if not isinstance(QDB_FIXTURE, QuestDbFixture):
             self.skipTest('QWP/WebSocket restart tests require a managed QuestDB fixture')
-        root_dir = getattr(QDB_FIXTURE, '_root_dir', None)
-        # QWP/WebSocket restart coverage currently requires a repo-built
-        # QuestDB because the fixed release matrix still uses 9.2.0, which
-        # does not expose the QWP/WebSocket endpoint. After QWP/WebSocket
-        # server support is released, replace this repo-only guard with a
-        # capability or version gate so release fixtures run these tests too.
-        if root_dir is not None and root_dir.name != 'repo':
-            self.skipTest('QWP/WebSocket restart tests require a QuestDB repo fixture')
         if QDB_FIXTURE.auth:
             self.skipTest('QWP/WebSocket restart tests run without auth')
         if getattr(QDB_FIXTURE, 'http_auth', False):
@@ -2055,11 +2194,12 @@ class TestQwpWsRestart(QwpWsTestSupport, unittest.TestCase):
             expected_min_id=0,
             expected_max_id=self.ROWS_PER_PHASE * 2 - 1)
 
-    def test_reconnect_gives_up_after_cap(self):
-        table_name = 'qwp_ws_cap_' + uuid.uuid4().hex[:8]
+    def test_sf_sender_survives_outage_past_reconnect_cap(self):
+        table_name = 'qwp_ws_outage_' + uuid.uuid4().hex[:8]
         self._create_qwp_ws_table(table_name)
         sender_id = 's1-' + uuid.uuid4().hex[:12]
         observed_error = None
+        row_count = 1
 
         with tempfile.TemporaryDirectory(prefix='qwp-ws-s1-') as sf_dir:
             sender = self._connect_sender(self._sender_conf(
@@ -2068,7 +2208,7 @@ class TestQwpWsRestart(QwpWsTestSupport, unittest.TestCase):
                 reconnect_max_duration_millis=500,
                 reconnect_initial_backoff_millis=10,
                 reconnect_max_backoff_millis=50,
-                close_flush_timeout_millis=0))
+                close_flush_timeout_millis=120000))
             server_stopped = False
             try:
                 self._write_row(sender, table_name, 0)
@@ -2082,22 +2222,26 @@ class TestQwpWsRestart(QwpWsTestSupport, unittest.TestCase):
 
                 QDB_FIXTURE.stop()
                 server_stopped = True
-                deadline = time.monotonic() + 5
+                deadline = time.monotonic() + 3
                 while time.monotonic() < deadline:
                     try:
-                        self._write_row(sender, table_name, 1)
+                        self._write_row(sender, table_name, row_count)
                         sender.flush()
+                        row_count += 1
                     except qls.SenderError as e:
                         observed_error = e
                         break
                     time.sleep(0.05)
 
-                self.assertIsNotNone(
+                self.assertIsNone(
                     observed_error,
-                    'sender did not surface reconnect-cap failure within 5 seconds')
-                self.assertRegex(
-                    str(observed_error),
-                    r'(?i)(reconnect|connect|terminal|refused)')
+                    'store-and-forward sender must not give up after the '
+                    'reconnect cap mid-stream (Invariant B), but surfaced: '
+                    + str(observed_error))
+
+                QDB_FIXTURE.start()
+                server_stopped = False
+                sender.close_drain()
             finally:
                 sender.close(False)
                 if server_stopped:
@@ -2105,10 +2249,10 @@ class TestQwpWsRestart(QwpWsTestSupport, unittest.TestCase):
 
         self._retry_assert_aggregates(
             table_name,
-            expected_count=1,
-            expected_distinct_id=1,
+            expected_count=row_count,
+            expected_distinct_id=row_count,
             expected_min_id=0,
-            expected_max_id=0)
+            expected_max_id=row_count - 1)
 
     def test_new_sender_recovers_from_sf_dir(self):
         table_name = 'qwp_ws_recover_' + uuid.uuid4().hex[:8]
@@ -2321,13 +2465,7 @@ class TestQwpWsFuzz(QwpWsTestSupport, unittest.TestCase):
                 f'select * from long_sequence(1) -- <<<<<<<<< END PYTHON UNIT TEST: {self.id()}')
 
     def _require_fuzz_fixture(self):
-        self._require_qwp_ws_protocol()
         if isinstance(QDB_FIXTURE, QuestDbFixture):
-            # Same repo-only gate as TestQwpWsRestart: the release-matrix server
-            # builds on the fixed version list do not expose QWP/WebSocket.
-            root_dir = getattr(QDB_FIXTURE, '_root_dir', None)
-            if root_dir is not None and root_dir.name != 'repo':
-                self.skipTest('QWP/WebSocket fuzz tests require a QuestDB repo fixture')
             if QDB_FIXTURE.http:
                 self.skipTest('QWP/WebSocket fuzz tests run outside the HTTP ILP matrix')
         elif not isinstance(QDB_FIXTURE, QuestDbExternalFixture):
@@ -2376,7 +2514,7 @@ class TestQwpWsFuzz(QwpWsTestSupport, unittest.TestCase):
         # format_actual_cell can hex-encode.
         import qwp_egress_reader
         # The reader's connect-string scheme is `ws::` (egress side), distinct
-        # from the sender's `qwpws::` (ingress side) — both hit the HTTP port.
+        # from the sender's `ws::` (ingress side) — both hit the HTTP port.
         conf = f'ws::addr={QDB_FIXTURE.host}:{QDB_FIXTURE.http_server_port};'
         return qwp_egress_reader.query_table_sorted(conf, table_name)
 
@@ -2566,10 +2704,14 @@ class TestQwpWsFuzz(QwpWsTestSupport, unittest.TestCase):
 
     def _producer_loop(self, sender_id, sf_root, load, fuzz, rnd,
                        tables, next_ts, record_failure):
+        # A post-restart SFA replay storm can starve the server's accept loop
+        # for ~1.5 min, so bounce variants need a wider drain budget; kept
+        # equal so the reconnect sub-budget never trips first.
+        budget_millis = 240000 if fuzz.max_bounces > 0 else 120000
         # `reconnect_max_duration_millis` is the explicit knob; the
         # library auto-promotes `initial_connect_retry` to `sync` when
         # any `reconnect_*` key is set, so a producer that races a
-        # bounce reuses the same 120s budget on its very first connect
+        # bounce reuses the same budget on its very first connect
         # instead of getting one shot.
         conf = self._sender_conf(
             sender_id,
@@ -2580,7 +2722,7 @@ class TestQwpWsFuzz(QwpWsTestSupport, unittest.TestCase):
             # an upgrade-response read error. `sync` makes the constructor
             # wait through the bounce up to reconnect_max_duration_millis.
             initial_connect_retry='sync',
-            reconnect_max_duration_millis=120000,
+            reconnect_max_duration_millis=budget_millis,
             # The bounce tests restart the server faster than the reconnect
             # backoff cap can track, so the client keeps backing off and
             # misses the brief windows the server is up between restarts —
@@ -2589,10 +2731,7 @@ class TestQwpWsFuzz(QwpWsTestSupport, unittest.TestCase):
             # the non-bounce tests, which never reconnect, so the backoff
             # never engages.)
             reconnect_max_backoff_millis=250,
-            # 2 min on close_drain — bounce-test variants need a long
-            # enough budget for SFA to replay queued frames into a
-            # freshly-restarted server.
-            close_flush_timeout_millis=120000)
+            close_flush_timeout_millis=budget_millis)
         try:
             sender = self._connect_sender(conf)
         except Exception as e:  # noqa: BLE001
@@ -3130,7 +3269,7 @@ class TestQwpUdpSender(unittest.TestCase):
         QDB_FIXTURE.http_sql_query(
             f'select * from long_sequence(1) -- <<<<<<<<< END PYTHON UNIT TEST: {test_name}')
 
-    def _mk_qwpudp_sender(self, **kwargs):
+    def _mk_udp_sender(self, **kwargs):
         return qls.Sender(
             BUILD_MODE,
             qls.Protocol.QWPUDP,
@@ -3153,10 +3292,8 @@ class TestQwpUdpSender(unittest.TestCase):
         return f'{base}.{remaining_ns:09d}Z'
 
     def _require_qwp_udp_system_test(self):
-        # TODO: Remove this repo-only gate once QWP/UDP receiver support is
-        # available in released QuestDB builds.
         if not getattr(QDB_FIXTURE, 'qwp_udp', False):
-            self.skipTest('QWP/UDP system test requires repo-backed QWP receiver support')
+            self.skipTest('QWP/UDP system test requires a fixture with the QWP/UDP receiver enabled')
         if QDB_FIXTURE.http:
             self.skipTest('QWP/UDP test only runs in the non-HTTP pass')
         if QDB_FIXTURE.auth:
@@ -3209,7 +3346,7 @@ class TestQwpUdpSender(unittest.TestCase):
     def test_c_example_qwp_udp(self):
         table_name = 'c_qwp_ex_' + uuid.uuid4().hex[:8]
         self._test_qwp_udp_example(
-            'line_sender_c_example_qwpudp',
+            'line_sender_c_example_udp',
             table_name,
             [[
                 'srv-api',
@@ -3246,7 +3383,7 @@ class TestQwpUdpSender(unittest.TestCase):
     def test_cpp_example_qwp_udp(self):
         table_name = 'cpp_qwp_ex_' + uuid.uuid4().hex[:8]
         self._test_qwp_udp_example(
-            'line_sender_cpp_example_qwpudp',
+            'line_sender_cpp_example_udp',
             table_name,
             [[
                 'srv-api',
@@ -3283,7 +3420,7 @@ class TestQwpUdpSender(unittest.TestCase):
     def test_c_batch_example_qwp_udp(self):
         table_name = 'c_qwp_bt_' + uuid.uuid4().hex[:8]
         self._test_qwp_udp_example(
-            'line_sender_c_example_qwpudp_batch',
+            'line_sender_c_example_udp_batch',
             table_name,
             [
                 ['srv-a', True, 1, 20.5, 'batch-a'],
@@ -3293,7 +3430,7 @@ class TestQwpUdpSender(unittest.TestCase):
     def test_cpp_batch_example_qwp_udp(self):
         table_name = 'cpp_qwp_bt_' + uuid.uuid4().hex[:8]
         self._test_qwp_udp_example(
-            'line_sender_cpp_example_qwpudp_batch',
+            'line_sender_cpp_example_udp_batch',
             table_name,
             [
                 ['srv-a', True, 1, 20.5, 'batch-a'],
@@ -3304,7 +3441,7 @@ class TestQwpUdpSender(unittest.TestCase):
         self._require_qwp_udp_system_test()
 
         table_name = 'qwp_udp_' + uuid.uuid4().hex
-        with self._mk_qwpudp_sender() as sender:
+        with self._mk_udp_sender() as sender:
             self.assertEqual(sender.protocol, qls.Protocol.QWPUDP)
             for i in range(3):
                 (sender
@@ -3338,9 +3475,6 @@ class TestQwpUdpSender(unittest.TestCase):
 
     def test_f64_array_columns_round_trip_over_qwp_udp(self):
         self._require_qwp_udp_system_test()
-        if QDB_FIXTURE.version < FIRST_ARRAYS_RELEASE:
-            self.skipTest('No array support in this version of QuestDB.')
-
         table_name = 'qwp_arr_' + uuid.uuid4().hex[:8]
         array1 = np.array(
             [
@@ -3352,7 +3486,7 @@ class TestQwpUdpSender(unittest.TestCase):
         array2 = array1.T
         array3 = array1[::-1, ::-1]
 
-        with self._mk_qwpudp_sender() as sender:
+        with self._mk_udp_sender() as sender:
             (sender
              .table(table_name)
              .column_f64_arr('f64_arr1', array1)
@@ -3376,9 +3510,6 @@ class TestQwpUdpSender(unittest.TestCase):
 
     def test_decimal_columns_round_trip_over_qwp_udp(self):
         self._require_qwp_udp_system_test()
-        if QDB_FIXTURE.version < DECIMAL_RELEASE:
-            self.skipTest('No decimal support in this version of QuestDB.')
-
         table_name = 'qwp_dec_' + uuid.uuid4().hex[:8]
         sql_query(
             f"CREATE TABLE '{table_name}' ("
@@ -3396,7 +3527,7 @@ class TestQwpUdpSender(unittest.TestCase):
         ]
         base_ts = 1_700_000_000_000_000
 
-        with self._mk_qwpudp_sender() as sender:
+        with self._mk_udp_sender() as sender:
             for idx, dec in enumerate(decimals):
                 (sender
                  .table(table_name)
@@ -3419,11 +3550,8 @@ class TestQwpUdpSender(unittest.TestCase):
 
     def test_decimal_signed_overflow_is_rejected_over_qwp_udp(self):
         self._require_qwp_udp_system_test()
-        if QDB_FIXTURE.version < DECIMAL_RELEASE:
-            self.skipTest('No decimal support in this version of QuestDB.')
-
         table_name = 'qwp_dec_over_' + uuid.uuid4().hex[:8]
-        with self._mk_qwpudp_sender() as sender:
+        with self._mk_udp_sender() as sender:
             (sender
              .table(table_name)
              .column('d', QWP_DECIMAL256_POSITIVE_OVERFLOW)
@@ -3433,11 +3561,8 @@ class TestQwpUdpSender(unittest.TestCase):
 
     def test_decimal_signed_rescale_overflow_is_rejected_over_qwp_udp(self):
         self._require_qwp_udp_system_test()
-        if QDB_FIXTURE.version < DECIMAL_RELEASE:
-            self.skipTest('No decimal support in this version of QuestDB.')
-
         table_name = 'qwp_dec_scale_' + uuid.uuid4().hex[:8]
-        with self._mk_qwpudp_sender() as sender:
+        with self._mk_udp_sender() as sender:
             (sender
              .table(table_name)
              .column('d', Decimal('0.1'))
@@ -3455,7 +3580,7 @@ class TestQwpUdpSender(unittest.TestCase):
         first_ts_us = 1_700_000_000_000_000
         third_ts_us = 1_700_000_000_100_000
         table_name = 'qwp_udp_at_now_' + uuid.uuid4().hex
-        with self._mk_qwpudp_sender() as sender:
+        with self._mk_udp_sender() as sender:
             (sender
              .table(table_name)
              .symbol('host', 'exp-a')
@@ -3504,7 +3629,7 @@ class TestQwpUdpSender(unittest.TestCase):
 
         row_ts_us = 1_700_000_000_200_000
         table_name = 'qwp_udp_keep_' + uuid.uuid4().hex
-        with self._mk_qwpudp_sender() as sender:
+        with self._mk_udp_sender() as sender:
             (sender
              .table(table_name)
              .symbol('host', 'dup-host')
@@ -3533,7 +3658,7 @@ class TestQwpUdpSender(unittest.TestCase):
         self._require_qwp_udp_system_test()
 
         table_name = 'q' + uuid.uuid4().hex[:8]
-        with self._mk_qwpudp_sender(max_datagram_size=58) as sender:
+        with self._mk_udp_sender(max_datagram_size=58) as sender:
             (sender
              .table(table_name)
              .symbol('sym', 'ETH-USD')
@@ -3568,7 +3693,7 @@ class TestQwpUdpSender(unittest.TestCase):
 
         trades_table = 'qwp_tr_' + uuid.uuid4().hex[:8]
         quotes_table = 'qwp_qt_' + uuid.uuid4().hex[:8]
-        with self._mk_qwpudp_sender() as sender:
+        with self._mk_udp_sender() as sender:
             (sender
              .table(trades_table)
              .symbol('sym', 'ETH-USD')
@@ -3602,7 +3727,7 @@ class TestQwpUdpSender(unittest.TestCase):
         self._require_qwp_udp_system_test()
 
         table_name = 'qwp_schema_' + uuid.uuid4().hex[:8]
-        with self._mk_qwpudp_sender() as sender:
+        with self._mk_udp_sender() as sender:
             (sender
              .table(table_name)
              .symbol('host', 'r1')
@@ -3641,7 +3766,7 @@ class TestQwpUdpSender(unittest.TestCase):
         self._require_qwp_udp_system_test()
 
         table_name = 'qwp_bool_' + uuid.uuid4().hex[:8]
-        with self._mk_qwpudp_sender() as sender:
+        with self._mk_udp_sender() as sender:
             (sender
              .table(table_name)
              .symbol('host', 'r1')
@@ -3678,7 +3803,7 @@ class TestQwpUdpSender(unittest.TestCase):
         self._require_qwp_udp_system_test()
 
         table_name = 'qwp_num_' + uuid.uuid4().hex[:8]
-        with self._mk_qwpudp_sender() as sender:
+        with self._mk_udp_sender() as sender:
             (sender
              .table(table_name)
              .symbol('host', 'r1')
@@ -3724,7 +3849,7 @@ class TestQwpUdpSender(unittest.TestCase):
 
         table_name = 'qwp_sts_' + uuid.uuid4().hex[:8]
         event_ts_us = 123_456
-        with self._mk_qwpudp_sender() as sender:
+        with self._mk_udp_sender() as sender:
             (sender
              .table(table_name)
              .symbol('host', 'r1')
@@ -3761,7 +3886,7 @@ class TestQwpUdpSender(unittest.TestCase):
 
         table_name = 'qwp_nts_' + uuid.uuid4().hex[:8]
         event_ts_ns = 123_456_789
-        with self._mk_qwpudp_sender() as sender:
+        with self._mk_udp_sender() as sender:
             (sender
              .table(table_name)
              .symbol('host', 'r1')
@@ -3806,7 +3931,7 @@ class TestQwpUdpSender(unittest.TestCase):
                     timestamp TIMESTAMP
                 ) TIMESTAMP(timestamp) PARTITION BY DAY;''')
 
-        with self._mk_qwpudp_sender() as sender:
+        with self._mk_udp_sender() as sender:
             (sender
              .table(table_name)
              .symbol('host', 'r1')
@@ -3839,7 +3964,7 @@ class TestQwpUdpSender(unittest.TestCase):
                     timestamp TIMESTAMP
                 ) TIMESTAMP(timestamp) PARTITION BY DAY;''')
 
-        with self._mk_qwpudp_sender() as sender:
+        with self._mk_udp_sender() as sender:
             (sender
              .table(table_name)
              .symbol('host', 'r1')
@@ -3864,7 +3989,7 @@ class TestQwpUdpSender(unittest.TestCase):
 
         table_name = 'qwp_dtns_' + uuid.uuid4().hex[:8]
         row_ts_ns = 1_700_000_000_000_000_123
-        with self._mk_qwpudp_sender() as sender:
+        with self._mk_udp_sender() as sender:
             (sender
              .table(table_name)
              .symbol('host', 'nano-row')
@@ -3896,7 +4021,7 @@ class TestQwpUdpSender(unittest.TestCase):
                     timestamp TIMESTAMP_NS
                 ) TIMESTAMP(timestamp) PARTITION BY DAY;''')
 
-        with self._mk_qwpudp_sender() as sender:
+        with self._mk_udp_sender() as sender:
             (sender
              .table(table_name)
              .symbol('host', 'micro-row')
@@ -3928,7 +4053,7 @@ class TestQwpUdpSender(unittest.TestCase):
                     timestamp TIMESTAMP
                 ) TIMESTAMP(timestamp) PARTITION BY DAY;''')
 
-        with self._mk_qwpudp_sender() as sender:
+        with self._mk_udp_sender() as sender:
             (sender
              .table(table_name)
              .symbol('host', 'nano-row')
@@ -3952,7 +4077,7 @@ class TestQwpUdpSender(unittest.TestCase):
         self._require_qwp_udp_system_test()
 
         table_name = 'qwp_utf8_' + uuid.uuid4().hex[:8]
-        with self._mk_qwpudp_sender() as sender:
+        with self._mk_udp_sender() as sender:
             (sender
              .table(table_name)
              .symbol('host', 'r1')
@@ -3994,7 +4119,7 @@ class TestQwpUdpSender(unittest.TestCase):
 
         table_name = 'qwp_txn_' + uuid.uuid4().hex[:8]
         with self.assertRaisesRegex(qls.SenderError, r'Transactional flushes are not supported for QWP/UDP'):
-            with self._mk_qwpudp_sender() as sender:
+            with self._mk_udp_sender() as sender:
                 (sender
                  .table(table_name)
                  .symbol('host', 'txn-host')
@@ -4006,7 +4131,7 @@ class TestQwpUdpSender(unittest.TestCase):
         self._require_qwp_udp_system_test()
 
         table_name = 'qwp_mk_' + uuid.uuid4().hex[:8]
-        with self._mk_qwpudp_sender() as sender:
+        with self._mk_udp_sender() as sender:
             (sender
              .table(table_name)
              .symbol('host', 'keep-a')
@@ -4047,7 +4172,7 @@ class TestQwpUdpSender(unittest.TestCase):
         with self.assertRaisesRegex(
                 qls.SenderError,
                 r'QWP/UDP designated timestamp changes type within a batched table'):
-            with self._mk_qwpudp_sender() as sender:
+            with self._mk_udp_sender() as sender:
                 (sender
                  .table(table_name)
                  .symbol('host', 'micros-row')
@@ -4065,7 +4190,7 @@ class TestQwpUdpSender(unittest.TestCase):
 
         table_name = 'qwp_cts_' + uuid.uuid4().hex[:8]
         with self.assertRaisesRegex(qls.SenderError, r'QWP/UDP column "event_ts" changes type within a batched table'):
-            with self._mk_qwpudp_sender() as sender:
+            with self._mk_udp_sender() as sender:
                 (sender
                  .table(table_name)
                  .symbol('host', 'micros-row')
@@ -4198,7 +4323,20 @@ def run_with_fixtures(args):
     global BUILD_MODE
     global QWP_WS_SMOKE_TLS
 
+    global BUILD_MODE_SEED
+
     latest_protocol = sorted(list(qls.ProtocolVersion))[-1]
+
+    # Seed the per-test API/CONF/ENV fuzzer once per process. Default random;
+    # override via QDB_BUILD_MODE_SEED to reproduce a specific run's choices.
+    if BUILD_MODE_SEED is None:
+        _env_seed = os.environ.get('QDB_BUILD_MODE_SEED')
+        BUILD_MODE_SEED = int(_env_seed) if _env_seed not in (None, '') \
+            else random.randrange(1 << 63)
+        sys.stderr.write(
+            f'>>>> build_mode fuzz seed = {BUILD_MODE_SEED} '
+            f'(API/CONF/ENV picked per-test at the latest protocol; '
+            f're-run with QDB_BUILD_MODE_SEED={BUILD_MODE_SEED} to reproduce)\n')
     run_matrix_suite = _select_tests(SUITE_MATRIX).countTestCases() > 0
     run_qwp_ws_smoke_suite = _select_tests(SUITE_QWP_WS_SMOKE).countTestCases() > 0
     run_qwp_ws_protocol_suite = _select_tests(SUITE_QWP_WS_PROTOCOL).countTestCases() > 0
@@ -4211,26 +4349,28 @@ def run_with_fixtures(args):
                 QDB_FIXTURE = QuestDbFixture(
                     questdb_dir,
                     auth=auth,
-                    qwp_udp=bool(getattr(args, 'repo', None)))
+                    qwp_udp=True)
                 TLS_PROXY_FIXTURE = None
                 try:
                     sys.stderr.write(f'>>>> STARTING {questdb_dir} [auth={auth}] <<<<\n')
                     QDB_FIXTURE.start()
-                    for http, protocol_version, build_mode in itertools.product(
+                    for http, protocol_version in itertools.product(
                             (False, True),  # http
-                            [None] + list(qls.ProtocolVersion),  # None is for `auto`
-                            list(qls.BuildMode)):
-                        if (build_mode in (qls.BuildMode.API, qls.BuildMode.ENV)) and (protocol_version != latest_protocol):
-                            continue
+                            [None] + list(qls.ProtocolVersion)):  # None is `auto`
                         if http and auth:
                             continue
                         if auth and (protocol_version != latest_protocol):
                             continue
                         sys.stderr.write(
-                            f'>>>> Running tests [auth={auth}, http={http}, build_mode={build_mode}, protocol_version={protocol_version}]\n')
-                        # Read the version _after_ a first start so it can rely
-                        # on the live one from the `select build` query.
-                        BUILD_MODE = build_mode
+                            f'>>>> Running tests [auth={auth}, http={http}, '
+                            f'protocol_version={protocol_version}, '
+                            f'build_mode=fuzzed(seed={BUILD_MODE_SEED})]\n')
+                        # BuildMode is now chosen per-test by the fuzzer in
+                        # `_BuildModeFuzzResult`, collapsing the old 3×
+                        # API/CONF/ENV sweep at the latest protocol into one
+                        # pass. This assignment is only a fallback for when the
+                        # fuzzer is inactive.
+                        BUILD_MODE = qls.BuildMode.CONF
                         QDB_FIXTURE.http = http
                         QDB_FIXTURE.protocol_version = protocol_version
                         port_to_proxy = QDB_FIXTURE.http_server_port \

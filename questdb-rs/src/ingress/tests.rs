@@ -82,11 +82,11 @@ fn tcps_simple() {
 
 #[cfg(feature = "sync-sender-qwp-udp")]
 #[test]
-fn qwpudp_simple() {
-    let builder = SenderBuilder::from_conf("qwpudp::addr=127.0.0.1;").unwrap();
-    assert_eq!(builder.protocol, Protocol::QwpUdp);
+fn udp_simple() {
+    let builder = SenderBuilder::from_conf("udp::addr=127.0.0.1;").unwrap();
+    assert_eq!(builder.protocol, Protocol::Udp);
     assert_specified_eq(&builder.host, "127.0.0.1");
-    assert_specified_eq(&builder.port, Protocol::QwpUdp.default_port());
+    assert_specified_eq(&builder.port, Protocol::Udp.default_port());
     assert!(!builder.protocol.tls_enabled());
     let qwp_udp = builder.qwp_udp.as_ref().unwrap();
     assert_defaulted_eq(&qwp_udp.max_datagram_size, 1400usize);
@@ -95,12 +95,12 @@ fn qwpudp_simple() {
 
 #[cfg(feature = "sync-sender-qwp-udp")]
 #[test]
-fn qwpudp_custom_config() {
+fn udp_custom_config() {
     let builder = SenderBuilder::from_conf(
-        "qwpudp::addr=239.1.2.3:19002;bind_interface=192.168.1.10;max_datagram_size=1200;multicast_ttl=7;",
+        "udp::addr=239.1.2.3:19002;bind_interface=192.168.1.10;max_datagram_size=1200;multicast_ttl=7;",
     )
     .unwrap();
-    assert_eq!(builder.protocol, Protocol::QwpUdp);
+    assert_eq!(builder.protocol, Protocol::Udp);
     assert_specified_eq(&builder.host, "239.1.2.3");
     assert_specified_eq(&builder.port, "19002");
     assert_specified_eq(&builder.net_interface, Some("192.168.1.10".to_string()));
@@ -111,17 +111,17 @@ fn qwpudp_custom_config() {
 
 #[cfg(feature = "sync-sender-qwp-udp")]
 #[test]
-fn qwpudp_sender_reports_transport_protocol() {
-    let sender = SenderBuilder::new(Protocol::QwpUdp, "127.0.0.1", 9007)
+fn udp_sender_reports_transport_protocol() {
+    let sender = SenderBuilder::new(Protocol::Udp, "127.0.0.1", 9007)
         .build()
         .unwrap();
-    assert_eq!(sender.protocol(), Protocol::QwpUdp);
+    assert_eq!(sender.protocol(), Protocol::Udp);
 }
 
 #[cfg(all(feature = "sync-sender-qwp-ws", feature = "sync-sender-qwp-udp"))]
 #[test]
 fn qwpws_error_polling_rejects_non_websocket_sender() {
-    let mut sender = SenderBuilder::new(Protocol::QwpUdp, "127.0.0.1", 9007)
+    let mut sender = SenderBuilder::new(Protocol::Udp, "127.0.0.1", 9007)
         .build()
         .unwrap();
 
@@ -144,63 +144,109 @@ fn qwpws_error_polling_rejects_non_websocket_sender() {
 #[test]
 fn qwpws_store_and_forward_config_parses_java_keys() {
     let builder = SenderBuilder::from_conf(
-        "qwpws::addr=localhost:9000;\
+        "ws::addr=localhost:9000;\
          sf_dir=/tmp/qdb-rust-sf;\
          sender_id=primary-1;\
-         sf_max_bytes=64mb;\
+         sf_max_segment_bytes=64mb;\
          sf_max_total_bytes=4G;\
          sf_durability=memory;\
          sf_append_deadline_millis=1234;\
+         poison_min_escalation_window_millis=600;\
          auth_timeout_ms=750;",
     )
     .unwrap();
 
-    assert_eq!(builder.protocol, Protocol::QwpWs);
+    assert_eq!(builder.protocol, Protocol::Ws);
     let qwp_ws = builder.qwp_ws.as_ref().unwrap();
     assert_specified_eq(&qwp_ws.sf_dir, Some(PathBuf::from("/tmp/qdb-rust-sf")));
     assert_specified_eq(&qwp_ws.sender_id, "primary-1".to_owned());
-    assert_specified_eq(&qwp_ws.sf_max_bytes, 64 * 1024 * 1024_u64);
+    assert_specified_eq(&qwp_ws.sf_max_segment_bytes, 64 * 1024 * 1024_u64);
     assert_specified_eq(&qwp_ws.sf_max_total_bytes, Some(4 * 1024 * 1024 * 1024_u64));
     assert_specified_eq(&qwp_ws.sf_durability, conf::SfDurability::Memory);
     assert_specified_eq(&qwp_ws.sf_append_deadline, Duration::from_millis(1234));
+    assert_specified_eq(
+        &qwp_ws.poison_min_escalation_window,
+        Duration::from_millis(600),
+    );
     assert_specified_eq(&qwp_ws.auth_timeout, Duration::from_millis(750));
 }
 
 #[cfg(feature = "sync-sender-qwp-ws")]
 #[test]
-fn qwpws_config_accepts_spec_websocket_aliases() {
+fn qwpws_addr_accepts_bracketed_ipv6() {
+    let builder = SenderBuilder::from_conf("ws::addr=[::1]:9001;").unwrap();
+    assert_specified_eq(&builder.host, "::1");
+    assert_specified_eq(&builder.port, "9001");
+
+    let defaulted = SenderBuilder::from_conf("ws::addr=[::1];").unwrap();
+    assert_specified_eq(&defaulted.host, "::1");
+    assert_specified_eq(&defaulted.port, Protocol::Ws.default_port());
+
+    let multi = SenderBuilder::from_conf("ws::addr=[::1]:9000,[2001:db8::1]:9001, localhost:9002;")
+        .unwrap();
+    let qwp_ws = multi.qwp_ws.as_ref().unwrap();
+    assert_specified_eq(
+        &qwp_ws.endpoints,
+        vec![
+            conf::QwpWsEndpoint::new("::1".into(), "9000".into()),
+            conf::QwpWsEndpoint::new("2001:db8::1".into(), "9001".into()),
+            conf::QwpWsEndpoint::new("localhost".into(), "9002".into()),
+        ],
+    );
+}
+
+#[cfg(feature = "sync-sender-qwp-ws")]
+#[test]
+fn qwpws_config_accepts_websocket_schemes() {
     let plain = SenderBuilder::from_conf("ws::addr=localhost:9000;").unwrap();
-    assert_eq!(plain.protocol, Protocol::QwpWs);
+    assert_eq!(plain.protocol, Protocol::Ws);
 
     let tls = SenderBuilder::from_conf("wss::addr=localhost:9000;").unwrap();
-    assert_eq!(tls.protocol, Protocol::QwpWss);
+    assert_eq!(tls.protocol, Protocol::Wss);
 }
 
 #[cfg(feature = "sync-sender-qwp-ws")]
 #[test]
 fn qwpws_store_and_forward_defaults_match_java() {
-    let builder = SenderBuilder::from_conf("qwpws::addr=localhost:9000;").unwrap();
+    let builder = SenderBuilder::from_conf("ws::addr=localhost:9000;").unwrap();
     let qwp_ws = builder.qwp_ws.as_ref().unwrap();
 
     assert_defaulted_eq(&qwp_ws.sender_id, "default".to_owned());
-    assert_defaulted_eq(&qwp_ws.sf_max_bytes, 4 * 1024 * 1024_u64);
+    assert_defaulted_eq(&qwp_ws.sf_max_segment_bytes, 4 * 1024 * 1024_u64);
     assert_defaulted_eq(&qwp_ws.sf_max_total_bytes, None);
     assert_defaulted_eq(&qwp_ws.sf_durability, conf::SfDurability::Memory);
     assert_defaulted_eq(&qwp_ws.sf_append_deadline, Duration::from_secs(30));
     assert_defaulted_eq(&qwp_ws.auth_timeout, Duration::from_secs(15));
     assert_defaulted_eq(&qwp_ws.progress, QwpWsProgress::Background);
+    assert_defaulted_eq(
+        &qwp_ws.poison_min_escalation_window,
+        Duration::from_millis(5000),
+    );
+}
+
+#[cfg(feature = "sync-sender-qwp-ws")]
+#[test]
+fn qwpws_poison_min_escalation_window_accepts_zero() {
+    let builder =
+        SenderBuilder::from_conf("ws::addr=localhost:9000;poison_min_escalation_window_millis=0;")
+            .unwrap();
+    let qwp_ws = builder.qwp_ws.as_ref().unwrap();
+    assert_specified_eq(
+        &qwp_ws.poison_min_escalation_window,
+        Duration::from_millis(0),
+    );
 }
 
 #[cfg(feature = "sync-sender-qwp-ws")]
 #[test]
 fn qwpws_progress_config_parses_manual_and_background() {
     let builder =
-        SenderBuilder::from_conf("qwpws::addr=localhost:9000;qwp_ws_progress=manual;").unwrap();
+        SenderBuilder::from_conf("ws::addr=localhost:9000;qwp_ws_progress=manual;").unwrap();
     let qwp_ws = builder.qwp_ws.as_ref().unwrap();
     assert_specified_eq(&qwp_ws.progress, QwpWsProgress::Manual);
 
     let builder =
-        SenderBuilder::from_conf("qwpws::addr=localhost:9000;qwp_ws_progress=background;").unwrap();
+        SenderBuilder::from_conf("ws::addr=localhost:9000;qwp_ws_progress=background;").unwrap();
     let qwp_ws = builder.qwp_ws.as_ref().unwrap();
     assert_specified_eq(&qwp_ws.progress, QwpWsProgress::Background);
 }
@@ -208,21 +254,20 @@ fn qwpws_progress_config_parses_manual_and_background() {
 #[cfg(feature = "sync-sender-qwp-ws")]
 #[test]
 fn qwpws_config_accepts_java_in_flight_window_alias() {
-    let builder =
-        SenderBuilder::from_conf("qwpws::addr=localhost:9000;in_flight_window=7;").unwrap();
+    let builder = SenderBuilder::from_conf("ws::addr=localhost:9000;in_flight_window=7;").unwrap();
     let qwp_ws = builder.qwp_ws.as_ref().unwrap();
     assert_specified_eq(&qwp_ws.max_in_flight, 7usize);
 
     assert_conf_err(
-        SenderBuilder::from_conf("qwpws::addr=localhost:9000;in_flight_window=1;"),
+        SenderBuilder::from_conf("ws::addr=localhost:9000;in_flight_window=1;"),
         "WebSocket transport requires async mode (in_flight_window > 1)",
     );
     assert_conf_err(
-        SenderBuilder::from_conf("qwpws::addr=localhost:9000;in_flight_window=-1;"),
+        SenderBuilder::from_conf("ws::addr=localhost:9000;in_flight_window=-1;"),
         "in-flight window size must be positive[size=-1]",
     );
 
-    let builder = SenderBuilder::from_conf("qwpws::addr=localhost:9000;max_in_flight=1;").unwrap();
+    let builder = SenderBuilder::from_conf("ws::addr=localhost:9000;max_in_flight=1;").unwrap();
     let qwp_ws = builder.qwp_ws.as_ref().unwrap();
     assert_specified_eq(&qwp_ws.max_in_flight, 1usize);
 }
@@ -234,6 +279,7 @@ fn qwpws_config_accepts_java_in_flight_window_alias() {
 /// branch — this list pins the behavior with a regression test so a
 /// future tightening of the catch-all can't break cross-role
 /// portability of a shared connect string.
+#[cfg(feature = "sync-sender-http")]
 const EGRESS_ONLY_CONFIG_KEYS: &[&str] = &[
     // Egress-only protocol / decoder knobs
     "path",
@@ -335,7 +381,7 @@ fn qwpws_config_silently_accepts_reserved_on_error_policy_keys() {
         "on_write_error",
     ] {
         for val in ["halt", "drop", "auto", "anything", ""] {
-            let conf = format!("qwpws::addr=localhost:9000;{key}={val};");
+            let conf = format!("ws::addr=localhost:9000;{key}={val};");
             SenderBuilder::from_conf(&conf)
                 .unwrap_or_else(|e| panic!("expected {key}={val:?} to parse, got {}", e.msg()));
         }
@@ -352,74 +398,70 @@ fn qwpws_store_and_forward_size_suffixes_match_java_config_surface() {
         ("4g", 4 * 1024 * 1024 * 1024_u64),
         ("1T", 1024_u64 * 1024 * 1024 * 1024),
     ] {
-        let conf = format!("qwpws::addr=localhost:9000;sf_max_bytes={input};");
+        let conf = format!("ws::addr=localhost:9000;sf_max_segment_bytes={input};");
         let builder = SenderBuilder::from_conf(conf).unwrap();
         let qwp_ws = builder.qwp_ws.as_ref().unwrap();
-        assert_specified_eq(&qwp_ws.sf_max_bytes, expected);
+        assert_specified_eq(&qwp_ws.sf_max_segment_bytes, expected);
     }
 }
 
 #[cfg(feature = "sync-sender-qwp-ws")]
 #[test]
 fn qwpws_store_and_forward_config_accepts_and_rejects_java_keys() {
-    SenderBuilder::from_conf("qwpws::addr=localhost:9000;request_durable_ack=off;").unwrap();
-    SenderBuilder::from_conf("qwpws::addr=localhost:9000;request_durable_ack=on;").unwrap();
+    SenderBuilder::from_conf("ws::addr=localhost:9000;request_durable_ack=off;").unwrap();
+    SenderBuilder::from_conf("ws::addr=localhost:9000;request_durable_ack=on;").unwrap();
     SenderBuilder::from_conf(
-        "qwpws::addr=localhost:9000;request_durable_ack=off;durable_ack_keepalive_interval_millis=5000;",
+        "ws::addr=localhost:9000;request_durable_ack=off;durable_ack_keepalive_interval_millis=5000;",
     )
     .unwrap();
     SenderBuilder::from_conf(
-        "qwpws::addr=localhost:9000;request_durable_ack=on;durable_ack_keepalive_interval_millis=5000;",
+        "ws::addr=localhost:9000;request_durable_ack=on;durable_ack_keepalive_interval_millis=5000;",
     )
     .unwrap();
-    SenderBuilder::from_conf(
-        "qwpws::addr=localhost:9000;durable_ack_keepalive_interval_millis=5000;",
-    )
-    .unwrap();
-    SenderBuilder::from_conf("qwpws::addr=localhost:9000;durable_ack_keepalive_interval_millis=0;")
+    SenderBuilder::from_conf("ws::addr=localhost:9000;durable_ack_keepalive_interval_millis=5000;")
         .unwrap();
+    SenderBuilder::from_conf("ws::addr=localhost:9000;durable_ack_keepalive_interval_millis=0;")
+        .unwrap();
+    SenderBuilder::from_conf("ws::addr=localhost:9000;durable_ack_keepalive_interval_millis=-1;")
+        .unwrap();
+    SenderBuilder::from_conf("ws::addr=localhost:9000;drain_orphans=off;").unwrap();
+    SenderBuilder::from_conf("ws::addr=localhost:9000;drain_orphans=false;").unwrap();
     SenderBuilder::from_conf(
-        "qwpws::addr=localhost:9000;durable_ack_keepalive_interval_millis=-1;",
+        "ws::addr=localhost:9000;drain_orphans=false;max_background_drainers=2;",
     )
     .unwrap();
-    SenderBuilder::from_conf("qwpws::addr=localhost:9000;drain_orphans=off;").unwrap();
-    SenderBuilder::from_conf("qwpws::addr=localhost:9000;drain_orphans=false;").unwrap();
-    SenderBuilder::from_conf(
-        "qwpws::addr=localhost:9000;drain_orphans=false;max_background_drainers=2;",
-    )
-    .unwrap();
-    SenderBuilder::from_conf("qwpws::addr=localhost:9000;max_background_drainers=0;").unwrap();
-    SenderBuilder::from_conf("qwpws::addr=localhost:9000;max_background_drainers=2;").unwrap();
-    SenderBuilder::from_conf("qwpws::addr=localhost:9000;auth_timeout_ms=1;").unwrap();
-    let builder = SenderBuilder::new(Protocol::QwpWs, "localhost", 9000)
+    SenderBuilder::from_conf("ws::addr=localhost:9000;max_background_drainers=0;").unwrap();
+    SenderBuilder::from_conf("ws::addr=localhost:9000;max_background_drainers=2;").unwrap();
+    SenderBuilder::from_conf("ws::addr=localhost:9000;auth_timeout_ms=1;").unwrap();
+    let builder = SenderBuilder::new(Protocol::Ws, "localhost", 9000)
         .auth_timeout(Duration::from_millis(750))
         .unwrap();
     let qwp_ws = builder.qwp_ws.as_ref().unwrap();
     assert_specified_eq(&qwp_ws.auth_timeout, Duration::from_millis(750));
 
     assert_conf_err(
-        SenderBuilder::from_conf("qwpws::addr=localhost:9000;sender_id=bad/id;"),
+        SenderBuilder::from_conf("ws::addr=localhost:9000;sender_id=bad/id;"),
         "invalid sender_id [value=bad/id, allowed-chars=[A-Za-z0-9_-]]",
     );
     assert_conf_err(
-        SenderBuilder::from_conf("qwpws::addr=localhost:9000;sf_max_bytes=64mi;"),
-        "invalid sf_max_bytes [value=64mi]",
+        SenderBuilder::from_conf("ws::addr=localhost:9000;sf_max_segment_bytes=64mi;"),
+        "invalid sf_max_segment_bytes [value=64mi]",
     );
     assert_conf_err(
-        SenderBuilder::from_conf("qwpws::addr=localhost:9000;sf_durability=sync;"),
+        SenderBuilder::from_conf("ws::addr=localhost:9000;sf_durability=sync;"),
         "invalid sf_durability [value=sync, allowed-values=[memory, flush, append]]",
     );
     assert_conf_err(
-        SenderBuilder::from_conf("qwpws::addr=localhost:9000;qwp_ws_progress=sync;"),
+        SenderBuilder::from_conf("ws::addr=localhost:9000;qwp_ws_progress=sync;"),
         "invalid qwp_ws_progress [value=sync, allowed-values=[background, manual]]",
     );
-    SenderBuilder::from_conf("qwpws::addr=localhost:9000;sf_append_deadline_millis=1234;").unwrap();
+    SenderBuilder::from_conf("ws::addr=localhost:9000;sf_append_deadline_millis=1234;").unwrap();
     assert_conf_err(
-        SenderBuilder::from_conf("qwpws::addr=localhost:9000;sf_append_deadline_millis=0;"),
+        SenderBuilder::from_conf("ws::addr=localhost:9000;sf_append_deadline_millis=0;"),
         "\"sf_append_deadline_millis\" must be greater than 0.",
     );
     for (input, expected) in [(-42, 0), (-1, 0), (0, 0), (5000, 5000), (120000, 120000)] {
-        let conf = format!("qwpws::addr=localhost:9000;close_flush_timeout_millis={input};");
+        let conf = format!("ws::addr=localhost:9000;close_flush_timeout_millis={input};");
         let builder = SenderBuilder::from_conf(conf).unwrap();
         let qwp_ws = builder.qwp_ws.as_ref().unwrap();
         assert_specified_eq(
@@ -428,34 +470,34 @@ fn qwpws_store_and_forward_config_accepts_and_rejects_java_keys() {
         );
     }
     assert_conf_err(
-        SenderBuilder::from_conf("qwpws::addr=localhost:9000;request_durable_ack=maybe;"),
+        SenderBuilder::from_conf("ws::addr=localhost:9000;request_durable_ack=maybe;"),
         "invalid request_durable_ack [value=maybe, allowed-values=[on, off]]",
     );
     assert_conf_err(
-        SenderBuilder::from_conf("qwpws::addr=localhost:9000;drain_orphans=maybe;"),
+        SenderBuilder::from_conf("ws::addr=localhost:9000;drain_orphans=maybe;"),
         "invalid drain_orphans [value=maybe, allowed-values=[on, off, true, false]]",
     );
     assert_conf_err(
-        SenderBuilder::from_conf("qwpws::addr=localhost:9000;max_background_drainers=-1;"),
+        SenderBuilder::from_conf("ws::addr=localhost:9000;max_background_drainers=-1;"),
         "max_background_drainers must be >= 0: -1",
     );
     assert_conf_err(
-        SenderBuilder::from_conf("qwpws::addr=localhost:9000;auth_timeout_ms=0;"),
+        SenderBuilder::from_conf("ws::addr=localhost:9000;auth_timeout_ms=0;"),
         "auth_timeout_ms must be > 0: 0",
     );
     assert_conf_err(
-        SenderBuilder::from_conf("qwpws::addr=localhost:9000;auth_timeout_ms=-1;"),
+        SenderBuilder::from_conf("ws::addr=localhost:9000;auth_timeout_ms=-1;"),
         "auth_timeout_ms must be > 0: -1",
     );
-    SenderBuilder::from_conf("qwpws::addr=localhost:9000;drain_orphans=on;").unwrap();
+    SenderBuilder::from_conf("ws::addr=localhost:9000;drain_orphans=on;").unwrap();
     SenderBuilder::from_conf(
-        "qwpws::addr=localhost:9000;drain_orphans=true;max_background_drainers=0;",
+        "ws::addr=localhost:9000;drain_orphans=true;max_background_drainers=0;",
     )
     .unwrap();
-    SenderBuilder::from_conf("qwpws::addr=localhost:9000;error_inbox_capacity=64;").unwrap();
-    SenderBuilder::from_conf("qwpws::addr=localhost:9000;error_inbox_capacity=16;").unwrap();
+    SenderBuilder::from_conf("ws::addr=localhost:9000;error_inbox_capacity=64;").unwrap();
+    SenderBuilder::from_conf("ws::addr=localhost:9000;error_inbox_capacity=16;").unwrap();
     assert_conf_err(
-        SenderBuilder::from_conf("qwpws::addr=localhost:9000;error_inbox_capacity=15;"),
+        SenderBuilder::from_conf("ws::addr=localhost:9000;error_inbox_capacity=15;"),
         "error_inbox_capacity must be >= 16: 15",
     );
 }
@@ -466,13 +508,13 @@ fn qwpws_rejects_unknown_config_key_but_tolerates_egress_keys() {
     // Per the connect-string spec, a genuinely unknown key on a QWP/WebSocket
     // connect string is rejected (typo / unsupported-option safety net).
     assert_conf_err(
-        SenderBuilder::from_conf("qwpws::addr=localhost:9000;totally_bogus_key=1;"),
+        SenderBuilder::from_conf("ws::addr=localhost:9000;totally_bogus_key=1;"),
         "Unknown config key \"totally_bogus_key\"",
     );
     // Egress query-client keys are tolerated so a single ws:: connect string can
     // drive both the ingress sender and the QwpQueryClient.
     SenderBuilder::from_conf(
-        "qwpws::addr=localhost:9000;target=primary;compression=zstd;failover=on;zone=eu-1;max_batch_rows=1000;",
+        "ws::addr=localhost:9000;target=primary;compression=zstd;failover=on;zone=eu-1;max_batch_rows=1000;",
     )
     .unwrap();
 }
@@ -522,19 +564,25 @@ fn qwpws_store_and_forward_config_is_websocket_only() {
         SenderBuilder::from_conf("tcp::addr=localhost:9009;max_background_drainers=2;"),
         "The \"max_background_drainers\" setting is only supported for QWP/WebSocket.",
     );
+    assert_conf_err(
+        SenderBuilder::from_conf(
+            "tcp::addr=localhost:9009;poison_min_escalation_window_millis=5000;",
+        ),
+        "The \"poison_min_escalation_window_millis\" setting is only supported for QWP/WebSocket.",
+    );
 }
 
 #[cfg(feature = "sync-sender-qwp-ws")]
 #[test]
 fn qwpws_store_and_forward_reserved_durability_fails_before_connect() {
     assert_conf_err(
-        SenderBuilder::from_conf("qwpws::addr=127.0.0.1:1;sf_durability=flush;")
+        SenderBuilder::from_conf("ws::addr=127.0.0.1:1;sf_durability=flush;")
             .unwrap()
             .build(),
         "sf_durability=flush is not yet supported (deferred follow-up; use sf_durability=memory)",
     );
     assert_conf_err(
-        SenderBuilder::from_conf("qwpws::addr=127.0.0.1:1;sf_durability=append;")
+        SenderBuilder::from_conf("ws::addr=127.0.0.1:1;sf_durability=append;")
             .unwrap()
             .build(),
         "sf_durability=append is not yet supported (deferred follow-up; use sf_durability=memory)",
@@ -599,23 +647,23 @@ fn uppercase_scheme_accepted_https() {
 
 #[cfg(feature = "sync-sender-qwp-udp")]
 #[test]
-fn uppercase_scheme_accepted_qwpudp() {
-    let builder = SenderBuilder::from_conf("QWPUDP::addr=localhost:9009;").unwrap();
-    assert_eq!(builder.protocol, Protocol::QwpUdp);
+fn uppercase_scheme_accepted_udp() {
+    let builder = SenderBuilder::from_conf("UDP::addr=localhost:9009;").unwrap();
+    assert_eq!(builder.protocol, Protocol::Udp);
 }
 
 #[cfg(feature = "sync-sender-qwp-ws")]
 #[test]
-fn uppercase_scheme_accepted_qwpws() {
-    let builder = SenderBuilder::from_conf("QWPWS::addr=localhost:9000;").unwrap();
-    assert_eq!(builder.protocol, Protocol::QwpWs);
+fn uppercase_scheme_accepted_ws() {
+    let builder = SenderBuilder::from_conf("WS::addr=localhost:9000;").unwrap();
+    assert_eq!(builder.protocol, Protocol::Ws);
 }
 
 #[cfg(feature = "sync-sender-qwp-ws")]
 #[test]
-fn uppercase_qwpws_preserves_multi_addr() {
-    let builder = SenderBuilder::from_conf("QWPWS::addr=h1:9001,h2:9002,h3:9003;").unwrap();
-    assert_eq!(builder.protocol, Protocol::QwpWs);
+fn uppercase_ws_preserves_multi_addr() {
+    let builder = SenderBuilder::from_conf("WS::addr=h1:9001,h2:9002,h3:9003;").unwrap();
+    assert_eq!(builder.protocol, Protocol::Ws);
     let endpoints: &Vec<conf::QwpWsEndpoint> = &builder.qwp_ws.as_ref().unwrap().endpoints;
     assert_eq!(endpoints.len(), 3);
     assert_eq!(endpoints[0].host, "h1");
@@ -628,9 +676,9 @@ fn uppercase_qwpws_preserves_multi_addr() {
 
 #[cfg(feature = "sync-sender-qwp-ws")]
 #[test]
-fn mixed_case_qwpws_preserves_multi_addr() {
-    let builder = SenderBuilder::from_conf("QwpWs::addr=h1:9001,h2:9002;").unwrap();
-    assert_eq!(builder.protocol, Protocol::QwpWs);
+fn mixed_case_ws_preserves_multi_addr() {
+    let builder = SenderBuilder::from_conf("Ws::addr=h1:9001,h2:9002;").unwrap();
+    assert_eq!(builder.protocol, Protocol::Ws);
     let endpoints: &Vec<conf::QwpWsEndpoint> = &builder.qwp_ws.as_ref().unwrap().endpoints;
     assert_eq!(endpoints.len(), 2);
 }
@@ -797,9 +845,9 @@ fn cant_use_ecdsa_auth_with_http_ex_tcp_support() {
 
 #[cfg(feature = "sync-sender-qwp-udp")]
 #[test]
-fn qwpudp_protocol_version_unsupported() {
+fn udp_protocol_version_unsupported() {
     for version in ["1", "2", "3"] {
-        let conf = format!("qwpudp::addr=localhost;protocol_version={version};");
+        let conf = format!("udp::addr=localhost;protocol_version={version};");
         assert_conf_err(
             SenderBuilder::from_conf(&conf),
             "The \"protocol_version\" setting is not supported for QWP/UDP.",
@@ -812,7 +860,7 @@ fn qwpudp_protocol_version_unsupported() {
         ProtocolVersion::V3,
     ] {
         assert_conf_err(
-            SenderBuilder::new(Protocol::QwpUdp, "localhost", 9007).protocol_version(version),
+            SenderBuilder::new(Protocol::Udp, "localhost", 9007).protocol_version(version),
             "The \"protocol_version\" setting is not supported for QWP/UDP.",
         );
     }
@@ -820,9 +868,9 @@ fn qwpudp_protocol_version_unsupported() {
 
 #[cfg(feature = "sync-sender-qwp-udp")]
 #[test]
-fn qwpudp_max_datagram_size_requires_qwp_udp() {
+fn udp_max_datagram_size_requires_qwp_udp() {
     assert_conf_err(
-        SenderBuilder::new(Protocol::QwpUdp, "localhost", 9007).max_datagram_size(0),
+        SenderBuilder::new(Protocol::Udp, "localhost", 9007).max_datagram_size(0),
         "\"max_datagram_size\" must be greater than 0.",
     );
 
@@ -835,8 +883,8 @@ fn qwpudp_max_datagram_size_requires_qwp_udp() {
 
 #[cfg(feature = "sync-sender-qwp-udp")]
 #[test]
-fn qwpudp_max_datagram_size_accepts_udp_limit_and_rejects_above_it() {
-    let builder = SenderBuilder::new(Protocol::QwpUdp, "localhost", 9007)
+fn udp_max_datagram_size_accepts_udp_limit_and_rejects_above_it() {
+    let builder = SenderBuilder::new(Protocol::Udp, "localhost", 9007)
         .max_datagram_size(65507)
         .unwrap();
     let Some(qwp_udp) = builder.qwp_udp.as_ref() else {
@@ -845,16 +893,16 @@ fn qwpudp_max_datagram_size_accepts_udp_limit_and_rejects_above_it() {
     assert_specified_eq(&qwp_udp.max_datagram_size, 65507usize);
 
     assert_conf_err(
-        SenderBuilder::new(Protocol::QwpUdp, "localhost", 9007).max_datagram_size(65508),
+        SenderBuilder::new(Protocol::Udp, "localhost", 9007).max_datagram_size(65508),
         "\"max_datagram_size\" must not exceed 65507 (UDP/IPv4 limit).",
     );
 }
 
 #[cfg(feature = "sync-sender-qwp-udp")]
 #[test]
-fn qwpudp_multicast_ttl_requires_qwp_udp() {
+fn udp_multicast_ttl_requires_qwp_udp() {
     assert_conf_err(
-        SenderBuilder::new(Protocol::QwpUdp, "localhost", 9007).multicast_ttl(256),
+        SenderBuilder::new(Protocol::Udp, "localhost", 9007).multicast_ttl(256),
         "\"multicast_ttl\" must be between 0 and 255.",
     );
 
@@ -867,86 +915,86 @@ fn qwpudp_multicast_ttl_requires_qwp_udp() {
 
 #[cfg(feature = "sync-sender-qwp-udp")]
 #[test]
-fn qwpudp_config_string_rejects_invalid_datagram_size_and_multicast_ttl() {
+fn udp_config_string_rejects_invalid_datagram_size_and_multicast_ttl() {
     assert_conf_err(
-        SenderBuilder::from_conf("qwpudp::addr=localhost;max_datagram_size=0;"),
+        SenderBuilder::from_conf("udp::addr=localhost;max_datagram_size=0;"),
         "\"max_datagram_size\" must be greater than 0.",
     );
     assert_conf_err(
-        SenderBuilder::from_conf("qwpudp::addr=localhost;max_datagram_size=65508;"),
+        SenderBuilder::from_conf("udp::addr=localhost;max_datagram_size=65508;"),
         "\"max_datagram_size\" must not exceed 65507 (UDP/IPv4 limit).",
     );
     assert_conf_err(
-        SenderBuilder::from_conf("qwpudp::addr=localhost;multicast_ttl=256;"),
+        SenderBuilder::from_conf("udp::addr=localhost;multicast_ttl=256;"),
         "\"multicast_ttl\" must be between 0 and 255.",
     );
 }
 
 #[cfg(feature = "sync-sender-qwp-udp")]
 #[test]
-fn qwpudp_bind_interface_is_supported_via_builder_api() {
-    let builder = SenderBuilder::new(Protocol::QwpUdp, "239.1.2.3", 9007)
+fn udp_bind_interface_is_supported_via_builder_api() {
+    let builder = SenderBuilder::new(Protocol::Udp, "239.1.2.3", 9007)
         .bind_interface("192.168.1.10")
         .unwrap();
-    assert_eq!(builder.protocol, Protocol::QwpUdp);
+    assert_eq!(builder.protocol, Protocol::Udp);
     assert_specified_eq(&builder.net_interface, Some("192.168.1.10".to_string()));
 }
 
 #[cfg(feature = "sync-sender-qwp-udp")]
 #[test]
-fn qwpudp_auth_settings_are_rejected_at_config_time() {
+fn udp_auth_settings_are_rejected_at_config_time() {
     // Config string: from_conf itself must fail.
     assert_conf_err(
-        SenderBuilder::from_conf("qwpudp::addr=localhost;username=user123;"),
+        SenderBuilder::from_conf("udp::addr=localhost;username=user123;"),
         "The \"username\" setting is not supported for QWP/UDP.",
     );
     assert_conf_err(
-        SenderBuilder::from_conf("qwpudp::addr=localhost;password=pass321;"),
+        SenderBuilder::from_conf("udp::addr=localhost;password=pass321;"),
         "The \"password\" setting is not supported for QWP/UDP.",
     );
     assert_conf_err(
-        SenderBuilder::from_conf("qwpudp::addr=localhost;token=token123;"),
+        SenderBuilder::from_conf("udp::addr=localhost;token=token123;"),
         "The \"token\" setting is not supported for QWP/UDP.",
     );
 
     #[cfg(feature = "sync-sender-tcp")]
     {
         assert_conf_err(
-            SenderBuilder::from_conf("qwpudp::addr=localhost;token_x=pub_key1;"),
+            SenderBuilder::from_conf("udp::addr=localhost;token_x=pub_key1;"),
             "The \"token_x\" setting is not supported for QWP/UDP.",
         );
         assert_conf_err(
-            SenderBuilder::from_conf("qwpudp::addr=localhost;token_y=pub_key2;"),
+            SenderBuilder::from_conf("udp::addr=localhost;token_y=pub_key2;"),
             "The \"token_y\" setting is not supported for QWP/UDP.",
         );
     }
 
     // Builder API: setter must fail.
     assert_conf_err(
-        SenderBuilder::new(Protocol::QwpUdp, "localhost", 9007).username("user123"),
+        SenderBuilder::new(Protocol::Udp, "localhost", 9007).username("user123"),
         "The \"username\" setting is not supported for QWP/UDP.",
     );
     assert_conf_err(
-        SenderBuilder::new(Protocol::QwpUdp, "localhost", 9007).password("pass321"),
+        SenderBuilder::new(Protocol::Udp, "localhost", 9007).password("pass321"),
         "The \"password\" setting is not supported for QWP/UDP.",
     );
     assert_conf_err(
-        SenderBuilder::new(Protocol::QwpUdp, "localhost", 9007).token("token123"),
+        SenderBuilder::new(Protocol::Udp, "localhost", 9007).token("token123"),
         "The \"token\" setting is not supported for QWP/UDP.",
     );
 }
 
 #[cfg(feature = "sync-sender-qwp-udp")]
 #[test]
-fn qwpudp_auth_timeout_is_rejected_at_config_time() {
+fn udp_auth_timeout_is_rejected_at_config_time() {
     // Config string: from_conf itself must fail.
     assert_conf_err(
-        SenderBuilder::from_conf("qwpudp::addr=localhost;auth_timeout=100;"),
+        SenderBuilder::from_conf("udp::addr=localhost;auth_timeout=100;"),
         "The \"auth_timeout\" setting is not supported for QWP/UDP.",
     );
     // Builder API: setter must fail.
     assert_conf_err(
-        SenderBuilder::new(Protocol::QwpUdp, "localhost", 9007)
+        SenderBuilder::new(Protocol::Udp, "localhost", 9007)
             .auth_timeout(Duration::from_millis(100)),
         "The \"auth_timeout\" setting is not supported for QWP/UDP.",
     );
@@ -1153,7 +1201,7 @@ fn tcps_tls_roots_file_with_password() {
     assert_conf_err(
         builder_or_err,
         "\"tls_roots_password\" is only supported for QWP/WebSocket \
-         (qwpws / qwpwss). ILP/TCP and ILP/HTTP transports read unencrypted \
+         (ws / wss). ILP/TCP and ILP/HTTP transports read unencrypted \
          PEM via rustls.",
     );
 }
@@ -1172,7 +1220,7 @@ fn qwpwss_tls_roots_password_accepted() {
     let mut file = std::fs::File::create(&path).unwrap();
     file.write_all(b"placeholder").unwrap();
     let builder = SenderBuilder::from_conf(format!(
-        "qwpwss::addr=localhost;tls_roots={};tls_roots_password=secret;",
+        "wss::addr=localhost;tls_roots={};tls_roots_password=secret;",
         path.to_str().unwrap()
     ))
     .unwrap();
@@ -1185,7 +1233,7 @@ fn qwpwss_tls_roots_password_without_path_rejected() {
     // Java enforces the same pairing: setting the password without
     // pointing at the file makes the password name nothing.
     let builder_or_err =
-        SenderBuilder::from_conf("qwpwss::addr=localhost;tls_roots_password=secret;").unwrap();
+        SenderBuilder::from_conf("wss::addr=localhost;tls_roots_password=secret;").unwrap();
     let err = builder_or_err.build().unwrap_err();
     assert!(
         err.msg().contains("tls_roots_password") && err.msg().contains("tls_roots"),
@@ -1351,7 +1399,7 @@ fn auto_flush_interval_unsupported() {
 #[cfg(feature = "sync-sender-qwp-ws")]
 #[test]
 fn qwpws_defaults_leave_initial_connect_retry_off() {
-    let builder = SenderBuilder::from_conf("qwpws::addr=localhost:9000;").unwrap();
+    let builder = SenderBuilder::from_conf("ws::addr=localhost:9000;").unwrap();
     let qwp_ws = builder.qwp_ws.as_ref().unwrap();
     assert_defaulted_eq(
         &qwp_ws.initial_connect_retry,
@@ -1361,11 +1409,35 @@ fn qwpws_defaults_leave_initial_connect_retry_off() {
 
 #[cfg(feature = "sync-sender-qwp-ws")]
 #[test]
+fn qwpws_connect_timeout_defaults_to_unset() {
+    let builder = SenderBuilder::from_conf("ws::addr=localhost:9000;").unwrap();
+    let qwp_ws = builder.qwp_ws.as_ref().unwrap();
+    // Default: OS-default dial (no client-imposed connect timeout).
+    assert_defaulted_eq(&qwp_ws.connect_timeout, None);
+}
+
+#[cfg(feature = "sync-sender-qwp-ws")]
+#[test]
+fn qwpws_connect_timeout_parses() {
+    let builder = SenderBuilder::from_conf("ws::addr=localhost:9000;connect_timeout=250;").unwrap();
+    let qwp_ws = builder.qwp_ws.as_ref().unwrap();
+    assert_specified_eq(&qwp_ws.connect_timeout, Some(Duration::from_millis(250)));
+}
+
+#[cfg(feature = "sync-sender-qwp-ws")]
+#[test]
+fn qwpws_connect_timeout_zero_rejected() {
+    let err = SenderBuilder::from_conf("ws::addr=localhost:9000;connect_timeout=0;").unwrap_err();
+    assert_eq!(err.code(), crate::ErrorCode::ConfigError);
+    assert!(err.msg().contains("connect_timeout"), "msg: {}", err.msg());
+}
+
+#[cfg(feature = "sync-sender-qwp-ws")]
+#[test]
 fn qwpws_reconnect_max_duration_implies_initial_connect_retry_sync() {
-    let builder = SenderBuilder::from_conf(
-        "qwpws::addr=localhost:9000;reconnect_max_duration_millis=120000;",
-    )
-    .unwrap();
+    let builder =
+        SenderBuilder::from_conf("ws::addr=localhost:9000;reconnect_max_duration_millis=120000;")
+            .unwrap();
     let qwp_ws = builder.qwp_ws.as_ref().unwrap();
     assert_specified_eq(
         &qwp_ws.initial_connect_retry,
@@ -1377,10 +1449,9 @@ fn qwpws_reconnect_max_duration_implies_initial_connect_retry_sync() {
 #[cfg(feature = "sync-sender-qwp-ws")]
 #[test]
 fn qwpws_reconnect_initial_backoff_implies_initial_connect_retry_sync() {
-    let builder = SenderBuilder::from_conf(
-        "qwpws::addr=localhost:9000;reconnect_initial_backoff_millis=250;",
-    )
-    .unwrap();
+    let builder =
+        SenderBuilder::from_conf("ws::addr=localhost:9000;reconnect_initial_backoff_millis=250;")
+            .unwrap();
     let qwp_ws = builder.qwp_ws.as_ref().unwrap();
     assert_specified_eq(
         &qwp_ws.initial_connect_retry,
@@ -1392,7 +1463,7 @@ fn qwpws_reconnect_initial_backoff_implies_initial_connect_retry_sync() {
 #[test]
 fn qwpws_reconnect_max_backoff_implies_initial_connect_retry_sync() {
     let builder =
-        SenderBuilder::from_conf("qwpws::addr=localhost:9000;reconnect_max_backoff_millis=10000;")
+        SenderBuilder::from_conf("ws::addr=localhost:9000;reconnect_max_backoff_millis=10000;")
             .unwrap();
     let qwp_ws = builder.qwp_ws.as_ref().unwrap();
     assert_specified_eq(
@@ -1407,7 +1478,7 @@ fn qwpws_explicit_initial_connect_retry_off_is_preserved() {
     // Belt-and-suspenders: even when the user sets a reconnect budget,
     // an explicit initial_connect_retry=off override must win.
     let builder = SenderBuilder::from_conf(
-        "qwpws::addr=localhost:9000;reconnect_max_duration_millis=120000;initial_connect_retry=off;",
+        "ws::addr=localhost:9000;reconnect_max_duration_millis=120000;initial_connect_retry=off;",
     )
     .unwrap();
     let qwp_ws = builder.qwp_ws.as_ref().unwrap();
@@ -1421,7 +1492,7 @@ fn qwpws_explicit_initial_connect_retry_off_is_preserved() {
 #[test]
 fn qwpws_explicit_initial_connect_retry_async_is_preserved() {
     let builder = SenderBuilder::from_conf(
-        "qwpws::addr=localhost:9000;reconnect_max_duration_millis=120000;initial_connect_retry=async;",
+        "ws::addr=localhost:9000;reconnect_max_duration_millis=120000;initial_connect_retry=async;",
     )
     .unwrap();
     let qwp_ws = builder.qwp_ws.as_ref().unwrap();
@@ -1439,7 +1510,7 @@ fn qwpws_explicit_off_before_reconnect_key_is_preserved() {
     // runs after the parse loop, so the explicit `off` must still win
     // regardless of where it appeared in the conf string.
     let builder = SenderBuilder::from_conf(
-        "qwpws::addr=localhost:9000;initial_connect_retry=off;reconnect_max_duration_millis=120000;",
+        "ws::addr=localhost:9000;initial_connect_retry=off;reconnect_max_duration_millis=120000;",
     )
     .unwrap();
     let qwp_ws = builder.qwp_ws.as_ref().unwrap();
@@ -1455,7 +1526,7 @@ fn qwpws_multiple_reconnect_keys_promote_once() {
     // Setting all three reconnect_* keys at once still resolves to a
     // single `Sync` promotion -- no interaction between the keys.
     let builder = SenderBuilder::from_conf(
-        "qwpws::addr=localhost:9000;\
+        "ws::addr=localhost:9000;\
          reconnect_max_duration_millis=120000;\
          reconnect_initial_backoff_millis=250;\
          reconnect_max_backoff_millis=10000;",
@@ -1482,7 +1553,7 @@ fn qwpws_reconnect_implies_initial_retry_via_builder_api() {
     // `build()`'s local QwpWsConfig clone directly, but the helper that
     // implements the invariant is `pub(crate)`, so exercise it on the
     // same `QwpWsConfig` the builder would feed in.
-    let builder = SenderBuilder::new(Protocol::QwpWs, "localhost", 9000)
+    let builder = SenderBuilder::new(Protocol::Ws, "localhost", 9000)
         .reconnect_max_duration(Duration::from_secs(120))
         .unwrap();
     let mut qwp_ws = builder.qwp_ws.as_ref().unwrap().clone();
@@ -1504,10 +1575,9 @@ fn qwpws_apply_reconnect_implies_initial_retry_is_idempotent() {
     // `from_conf` already runs the promotion at parse time; `build()`
     // then runs it again on a clone. The second run must be a no-op
     // when the first has already settled the value.
-    let builder = SenderBuilder::from_conf(
-        "qwpws::addr=localhost:9000;reconnect_max_duration_millis=120000;",
-    )
-    .unwrap();
+    let builder =
+        SenderBuilder::from_conf("ws::addr=localhost:9000;reconnect_max_duration_millis=120000;")
+            .unwrap();
     let mut qwp_ws = builder.qwp_ws.as_ref().unwrap().clone();
     assert_specified_eq(
         &qwp_ws.initial_connect_retry,

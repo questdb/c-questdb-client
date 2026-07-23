@@ -59,18 +59,27 @@
 //! Run:
 //!
 //! ```text
-//! cargo bench --features sync-reader-ws --bench decoder
-//! QUESTDB_BENCH_ROWS=1000000 cargo bench --features sync-reader-ws --bench decoder
+//! cargo bench --features sync-reader-qwp-ws --bench decoder
+//! QUESTDB_BENCH_ROWS=1000000 cargo bench --features sync-reader-qwp-ws --bench decoder
 //! ```
 
 use std::time::Duration;
 
 use criterion::{Criterion, Throughput, black_box, criterion_group, criterion_main};
 
+// Used only inside the `#[cfg(feature = "arrow")]` workload blocks below; the
+// `polars` umbrella enables `arrow-egress` but not the `arrow` umbrella, so the
+// import must carry the same `arrow` + `polars` gate as its use sites.
+#[cfg(all(feature = "arrow", feature = "polars"))]
+use questdb::egress::_bench_internals::bench_batch_to_polars;
+#[cfg(feature = "arrow")]
+use questdb::egress::_bench_internals::bench_batch_to_record_batch;
 use questdb::egress::_bench_internals::{
     Bytes, Schema, SymbolDict, ZstdScratch, decode_result_batch,
 };
 use questdb::egress::ColumnKind;
+#[cfg(all(feature = "arrow", feature = "polars"))]
+use questdb::egress::arrow::polars::record_batch_to_dataframe;
 
 // ---------------------------------------------------------------------------
 // Wire-format helpers. Replicate the minimum of what the decoder's tests
@@ -109,7 +118,7 @@ fn boolean_body(row_count: usize) -> Vec<u8> {
     for row in 0..row_count {
         // Mix some pattern so the bit reader doesn't get a constant
         // input. Every 3rd row is `true`.
-        if row % 3 == 0 {
+        if row.is_multiple_of(3) {
             out[1 + (row >> 3)] |= 1 << (row & 7);
         }
     }
@@ -318,6 +327,13 @@ fn build_workload(row_count: usize) -> Bytes {
         cols.len()
     );
 
+    serialize_batch(&cols, row_count)
+}
+
+/// Serialise a column set into a single `RESULT_BATCH` payload (the
+/// post-FrameHeader bytes `decode_result_batch` consumes). Shared by
+/// the 15-column wide workload and the S1 narrow workload.
+fn serialize_batch(cols: &[ColSpec], row_count: usize) -> Bytes {
     let mut out = Vec::new();
     // Frame prefix: msg_kind + request_id + batch_seq.
     out.push(MSG_KIND_RESULT_BATCH);
@@ -330,18 +346,100 @@ fn build_workload(row_count: usize) -> Bytes {
     varint_u64(cols.len() as u64, &mut out);
 
     // Columns inline: per-column (name, kind). No schema-mode byte, no schema id.
-    for c in &cols {
+    for c in cols {
         varint_u64(c.name.len() as u64, &mut out);
         out.extend_from_slice(c.name.as_bytes());
         out.push(c.kind.as_u8());
     }
 
     // Per-column bodies, in declaration order.
-    for c in &cols {
+    for c in cols {
         out.extend_from_slice(&c.body);
     }
 
     Bytes::from(out)
+}
+
+/// Synthesise the **S1 narrow** `RESULT_BATCH` payload (plan §3.1): the
+/// 5-column headline schema the cross-client parity table reads back —
+/// `ts` TIMESTAMP, `id` LONG, `price` DOUBLE, `sym` SYMBOL (card 8),
+/// `note` VARCHAR (~16 bytes). This is the workload behind the
+/// `→ polars DataFrame` decoder arm: it matches the S1 examples and,
+/// unlike the wide 15-col workload, sticks to the dtypes the crate's
+/// minimal polars feature set (`dtype-categorical` only — no `dtype-i16`
+/// / `dtype-i8`) can build a `Series` from.
+#[cfg(feature = "arrow")]
+fn build_s1_workload(row_count: usize) -> Bytes {
+    let cols: Vec<ColSpec> = vec![
+        ColSpec {
+            name: "ts",
+            kind: ColumnKind::Timestamp,
+            body: fixed_le_bytes(row_count, |i| {
+                let base: i64 = 1_700_000_000_000_000;
+                // 1 µs spacing — mirrors the S1 monotonic-unique ts.
+                (base + (i as i64)).to_le_bytes()
+            }),
+        },
+        ColSpec {
+            name: "id",
+            kind: ColumnKind::Long,
+            body: fixed_le_bytes(row_count, |i| (i as i64).to_le_bytes()),
+        },
+        ColSpec {
+            name: "price",
+            kind: ColumnKind::Double,
+            body: fixed_le_bytes(row_count, |i| ((i as f64) * 0.25).to_le_bytes()),
+        },
+        ColSpec {
+            name: "sym",
+            kind: ColumnKind::Symbol,
+            // Cardinality 8 to match the S1 SYMBOL column.
+            body: symbol_body(row_count, 8, 1),
+        },
+        ColSpec {
+            name: "note",
+            kind: ColumnKind::Varchar,
+            body: varchar_body(row_count),
+        },
+    ];
+    serialize_batch(&cols, row_count)
+}
+
+/// Add a `decode` arm and a `decode + batch_to_record_batch` arm for a
+/// single-column payload. `convert(col)` = `_to_arrow` − `_decode` isolates
+/// that column's convert.rs cost (align / symbol / varchar / construction).
+#[cfg(feature = "arrow")]
+fn add_col_arrow_probes(
+    group: &mut criterion::BenchmarkGroup<'_, criterion::measurement::WallTime>,
+    label: &str,
+    payload: &Bytes,
+    row_count: usize,
+) {
+    group.bench_function(format!("s1_col_{label}_{row_count}_rows_decode"), |b| {
+        b.iter(|| {
+            let mut dict = SymbolDict::new();
+            let mut reg: Option<Schema> = None;
+            let mut scratch = ZstdScratch::new();
+            let batch =
+                decode_result_batch(black_box(payload), 0, &mut dict, &mut reg, &mut scratch)
+                    .expect("decode");
+            black_box(batch);
+        });
+    });
+    group.bench_function(format!("s1_col_{label}_{row_count}_rows_to_arrow"), |b| {
+        b.iter(|| {
+            let mut dict = SymbolDict::new();
+            let mut reg: Option<Schema> = None;
+            let mut scratch = ZstdScratch::new();
+            let batch =
+                decode_result_batch(black_box(payload), 0, &mut dict, &mut reg, &mut scratch)
+                    .expect("decode");
+            let schema = reg.as_ref().expect("schema populated by decode");
+            let rb = bench_batch_to_record_batch(schema, batch, &dict)
+                .expect("decoded batch must assemble into an arrow RecordBatch");
+            black_box(rb);
+        });
+    });
 }
 
 // ---------------------------------------------------------------------------
@@ -392,6 +490,192 @@ fn bench_decoder(c: &mut Criterion) {
             });
         },
     );
+
+    // Decode→assemble arms (plan §6 / §3.6) on the **S1 narrow** schema (the
+    // shape the cross-client parity table reads back; the wide 15-col workload
+    // above carries Int16/Int8 columns the crate's minimal polars feature set
+    // can't build a Series from). Three nested floors so subtraction isolates
+    // each stage:
+    //   * `_decode`     — wire bytes → `DecodedBatch` (raw decode floor).
+    //   * `_to_arrow`   — `+ batch_to_record_batch` (DecodedBatch → Arrow,
+    //                     i.e. `convert.rs` column build). `_to_arrow − _decode`
+    //                     is the Arrow assemble cost.
+    //   * `_to_polars`  — `+ record_batch_to_dataframe` (Arrow → polars via the
+    //                     C Data Interface). `_to_polars − _to_arrow` is the
+    //                     polars FFI / `Series::from_arrow` cost.
+    // `_decode` and `_to_arrow` need only `arrow` (stable toolchain); `_to_polars`
+    // needs `polars`.
+    #[cfg(feature = "arrow")]
+    {
+        let s1_payload = build_s1_workload(row_count);
+        {
+            let mut dict = SymbolDict::new();
+            let mut reg: Option<Schema> = None;
+            let mut scratch = ZstdScratch::new();
+            let batch = decode_result_batch(&s1_payload, 0, &mut dict, &mut reg, &mut scratch)
+                .expect("synthesised S1 workload must decode cleanly");
+            assert_eq!(batch.row_count, row_count, "S1 row count round-trip");
+            assert_eq!(batch.columns.len(), 5, "S1 column count round-trip");
+            let schema = reg.as_ref().expect("schema populated by decode");
+            let rb = bench_batch_to_record_batch(schema, batch, &dict)
+                .expect("S1 batch must assemble into an arrow RecordBatch");
+            assert_eq!(rb.num_rows(), row_count, "S1 arrow row round-trip");
+            assert_eq!(rb.num_columns(), 5, "S1 arrow column round-trip");
+            #[cfg(feature = "polars")]
+            {
+                // `bench_batch_to_record_batch` consumed the first decode; the
+                // polars pre-flight re-decodes the same payload.
+                let mut dict = SymbolDict::new();
+                let mut reg: Option<Schema> = None;
+                let mut scratch = ZstdScratch::new();
+                let batch = decode_result_batch(&s1_payload, 0, &mut dict, &mut reg, &mut scratch)
+                    .expect("synthesised S1 workload must decode cleanly");
+                let schema = reg.as_ref().expect("schema populated by decode");
+                let df = bench_batch_to_polars(schema, batch, &dict)
+                    .expect("S1 batch must assemble into a polars DataFrame");
+                assert_eq!(df.height(), row_count, "S1 polars height round-trip");
+                assert_eq!(df.width(), 5, "S1 polars width round-trip");
+            }
+        }
+        group.bench_function(format!("s1_5col_{}_rows_decode", row_count), |b| {
+            b.iter(|| {
+                let mut dict = SymbolDict::new();
+                let mut reg: Option<Schema> = None;
+                let mut scratch = ZstdScratch::new();
+                let batch = decode_result_batch(
+                    black_box(&s1_payload),
+                    0,
+                    &mut dict,
+                    &mut reg,
+                    &mut scratch,
+                )
+                .expect("decode");
+                black_box(batch);
+            });
+        });
+        group.bench_function(format!("s1_5col_{}_rows_to_arrow", row_count), |b| {
+            b.iter(|| {
+                let mut dict = SymbolDict::new();
+                let mut reg: Option<Schema> = None;
+                let mut scratch = ZstdScratch::new();
+                let batch = decode_result_batch(
+                    black_box(&s1_payload),
+                    0,
+                    &mut dict,
+                    &mut reg,
+                    &mut scratch,
+                )
+                .expect("decode");
+                let schema = reg.as_ref().expect("schema populated by decode");
+                let rb = bench_batch_to_record_batch(schema, batch, &dict)
+                    .expect("decoded batch must assemble into an arrow RecordBatch");
+                black_box(rb);
+            });
+        });
+        add_col_arrow_probes(
+            &mut group,
+            "id",
+            &serialize_batch(
+                &[ColSpec {
+                    name: "id",
+                    kind: ColumnKind::Long,
+                    body: fixed_le_bytes(row_count, |i| (i as i64).to_le_bytes()),
+                }],
+                row_count,
+            ),
+            row_count,
+        );
+        add_col_arrow_probes(
+            &mut group,
+            "sym",
+            &serialize_batch(
+                &[ColSpec {
+                    name: "sym",
+                    kind: ColumnKind::Symbol,
+                    body: symbol_body(row_count, 8, 1),
+                }],
+                row_count,
+            ),
+            row_count,
+        );
+        add_col_arrow_probes(
+            &mut group,
+            "note",
+            &serialize_batch(
+                &[ColSpec {
+                    name: "note",
+                    kind: ColumnKind::Varchar,
+                    body: varchar_body(row_count),
+                }],
+                row_count,
+            ),
+            row_count,
+        );
+        #[cfg(feature = "polars")]
+        group.bench_function(format!("s1_5col_{}_rows_to_polars", row_count), |b| {
+            b.iter(|| {
+                let mut dict = SymbolDict::new();
+                let mut reg: Option<Schema> = None;
+                let mut scratch = ZstdScratch::new();
+                let batch = decode_result_batch(
+                    black_box(&s1_payload),
+                    0,
+                    &mut dict,
+                    &mut reg,
+                    &mut scratch,
+                )
+                .expect("decode");
+                let schema = reg.as_ref().expect("schema populated by decode");
+                let df = bench_batch_to_polars(schema, batch, &dict)
+                    .expect("decoded batch must assemble into a polars DataFrame");
+                black_box(df);
+            });
+        });
+        // Per-column probe of `record_batch_to_dataframe` (decode/convert once,
+        // outside the loop): `col_id` is the zero-copy baseline; `col_sym/col_note`
+        // minus it isolate the Dictionary→Categorical / Utf8→Utf8View costs.
+        #[cfg(feature = "polars")]
+        {
+            let rb = {
+                let mut dict = SymbolDict::new();
+                let mut reg: Option<Schema> = None;
+                let mut scratch = ZstdScratch::new();
+                let batch = decode_result_batch(&s1_payload, 0, &mut dict, &mut reg, &mut scratch)
+                    .expect("decode");
+                let schema = reg.as_ref().expect("schema populated by decode");
+                bench_batch_to_record_batch(schema, batch, &dict)
+                    .expect("S1 batch must assemble into an arrow RecordBatch")
+            };
+            group.bench_function(
+                format!("s1_5col_{}_rows_to_polars_col_id", row_count),
+                |b| {
+                    b.iter(|| {
+                        let sub = rb.project(&[1]).expect("project");
+                        black_box(record_batch_to_dataframe(sub).expect("to df"));
+                    });
+                },
+            );
+            group.bench_function(
+                format!("s1_5col_{}_rows_to_polars_col_sym", row_count),
+                |b| {
+                    b.iter(|| {
+                        let sub = rb.project(&[3]).expect("project");
+                        black_box(record_batch_to_dataframe(sub).expect("to df"));
+                    });
+                },
+            );
+            group.bench_function(
+                format!("s1_5col_{}_rows_to_polars_col_note", row_count),
+                |b| {
+                    b.iter(|| {
+                        let sub = rb.project(&[4]).expect("project");
+                        black_box(record_batch_to_dataframe(sub).expect("to df"));
+                    });
+                },
+            );
+        }
+    }
+
     group.finish();
 }
 

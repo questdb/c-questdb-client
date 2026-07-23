@@ -6,7 +6,7 @@
 //!
 //! Run with:
 //!     cargo run --release --example qwp_egress_latency \
-//!         --features sync-reader-ws -- [SQL]
+//!         --features sync-reader-qwp-ws -- [SQL]
 //!
 //! The default SQL is `SELECT 1`, matching the Java benchmark's default.
 //! Warmup: 5 iterations x 2s. Measurement: 10 iterations x 2s. Single thread.

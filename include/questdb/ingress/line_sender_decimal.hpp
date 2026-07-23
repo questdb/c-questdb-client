@@ -60,9 +60,22 @@ public:
     {
     }
 
+    template <
+        typename CharPtr,
+        std::enable_if_t<
+            std::is_pointer_v<std::remove_reference_t<CharPtr>> &&
+                std::is_convertible_v<
+                    std::remove_reference_t<CharPtr>,
+                    const char*>,
+            int> = 0>
+    explicit decimal_str_view(CharPtr&& buf)
+        : decimal_str_view{buf, std::char_traits<char>::length(buf)}
+    {
+    }
+
     template <size_t N>
     decimal_str_view(const char (&buf)[N])
-        : decimal_str_view{buf, N}
+        : decimal_str_view{buf, N - 1}
     {
     }
 

@@ -22,13 +22,25 @@
  *
  ******************************************************************************/
 
-#![doc = include_str!("ingress/mod.md")]
+#![cfg_attr(feature = "_sync-sender", doc = include_str!("ingress/mod.md"))]
+#![cfg_attr(
+    not(feature = "_sync-sender"),
+    doc = "Shared data types used by the egress reader. Enable a `sync-sender-*` \
+           feature to expose the sender APIs and their full module documentation."
+)]
 
+#[cfg(feature = "_sender-qwp-ws")]
+pub(crate) use self::conf::QwpWsManagedSlotExclusion;
 pub use self::ndarr::{ArrayElement, NdArrayView};
 pub use self::timestamp::*;
-use crate::error::{self, Result, fmt};
+use crate::error::Result;
+#[cfg(feature = "_sync-sender")]
+use crate::error::{self, fmt};
+#[cfg(feature = "_sync-sender")]
 use crate::ingress::conf::ConfigSetting;
+#[cfg(feature = "_sync-sender")]
 use core::time::Duration;
+#[cfg(feature = "_sync-sender")]
 use std::collections::HashMap;
 #[cfg(feature = "_sender-qwp-ws")]
 use std::collections::HashSet;
@@ -36,10 +48,16 @@ use std::collections::HashSet;
 use std::fmt::Write;
 use std::fmt::{Debug, Display, Formatter};
 
+#[cfg(feature = "_sync-sender")]
 use std::ops::Deref;
+#[cfg(feature = "_sender-qwp-ws")]
+use std::path::Path;
+#[cfg(feature = "_sync-sender")]
 use std::path::PathBuf;
+#[cfg(feature = "_sync-sender")]
 use std::str::FromStr;
 
+#[cfg(feature = "_sync-sender")]
 mod tls;
 
 #[cfg(all(feature = "_sender-tcp", feature = "aws-lc-crypto"))]
@@ -51,7 +69,18 @@ use ring::{
     signature::{ECDSA_P256_SHA256_FIXED_SIGNING, EcdsaKeyPair},
 };
 
+#[cfg(feature = "_sync-sender")]
 mod conf;
+
+#[cfg(feature = "_sender-qwp-ws")]
+pub mod conn_events;
+#[cfg(feature = "_sender-qwp-ws")]
+pub use conn_events::{
+    ConnectionEvent, ConnectionEventDispatcher, ConnectionEventKind, ConnectionListener,
+};
+
+#[cfg(feature = "_sender-qwp-ws")]
+pub(crate) mod rejection_events;
 
 pub(crate) mod ndarr;
 
@@ -60,13 +89,55 @@ mod timestamp;
 mod buffer;
 pub use buffer::*;
 
-mod sender;
+#[cfg(feature = "_sync-sender")]
+pub(crate) mod sender;
 #[cfg(feature = "_sender-qwp-ws")]
 pub(crate) use sender::QwpWsRoleReject;
+#[cfg(feature = "polars-ingress")]
+pub(crate) use sender::ReconnectPolicy;
+#[cfg(feature = "sync-sender-qwp-ws")]
+pub(crate) use sender::ReconnectReason;
+#[cfg(feature = "_sync-sender")]
 pub use sender::*;
+#[cfg(feature = "sync-sender-qwp-ws")]
+pub(crate) use sender::{reconnect_backoff_step, reconnect_error_is_terminal};
 
 mod decimal;
 pub use decimal::DecimalView;
+
+#[cfg(feature = "sync-sender-qwp-ws")]
+pub mod column_sender;
+
+/// Acknowledgement level shared by the column-major and row-major QWP/WebSocket
+/// senders' `wait` / `sync` APIs.
+#[cfg(feature = "sync-sender-qwp-ws")]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum AckLevel {
+    /// Wait for the server to accept every published frame.
+    #[default]
+    Ok,
+    /// Wait for durable-ACK coverage. This level requires QuestDB Enterprise
+    /// and the `request_durable_ack=on` connection-string setting.
+    Durable,
+}
+
+/// Precision of a timestamp column, selecting the QWP wire type used by
+/// [`Chunk::column_ts`](crate::ingress::column_sender::Chunk::column_ts):
+/// [`TimestampUnit::Micros`] maps to `TIMESTAMP` and [`TimestampUnit::Nanos`]
+/// to `TIMESTAMP_NANOS`. Column values are Unix-epoch integers in the chosen
+/// unit.
+#[cfg(feature = "sync-sender-qwp-ws")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TimestampUnit {
+    /// Microseconds since the Unix epoch (QWP wire type `TIMESTAMP`).
+    Micros,
+    /// Nanoseconds since the Unix epoch (QWP wire type `TIMESTAMP_NANOS`).
+    Nanos,
+}
+
+#[cfg(feature = "polars-ingress")]
+pub mod polars;
 
 const MAX_NAME_LEN_DEFAULT: usize = 127;
 
@@ -74,6 +145,13 @@ const MAX_NAME_LEN_DEFAULT: usize = 127;
 pub const MAX_ARRAY_DIMS: usize = 32;
 pub const MAX_ARRAY_BUFFER_SIZE: usize = 512 * 1024 * 1024; // 512MiB
 pub const MAX_ARRAY_DIM_LEN: usize = 0x0FFF_FFFF; // 1 << 28 - 1
+
+/// Maximum element count of a single ndarray row payload (`prod(shape)`).
+/// Bounds the per-row reservation (`leaf_count * 8` bytes) well below
+/// `isize::MAX` so allocator-OOM cannot abort the host under
+/// `panic = "abort"`. Enforced on both the FFI and pure-Rust entry
+/// points to keep the contract uniform across API surfaces.
+pub const MAX_NDARRAY_LEAF_ELEMS: usize = 1 << 24;
 
 pub(crate) const ARRAY_BINARY_FORMAT_TYPE: u8 = 14;
 pub(crate) const DOUBLE_BINARY_FORMAT_TYPE: u8 = 16;
@@ -159,26 +237,31 @@ pub enum CertificateAuthority {
 /// // Assuming the service name is registered.
 /// let service: Port = "qdb_ilp".into();  // or with a String too.
 /// ```
+#[cfg(feature = "_sync-sender")]
 pub struct Port(String);
 
+#[cfg(feature = "_sync-sender")]
 impl From<String> for Port {
     fn from(s: String) -> Self {
         Port(s)
     }
 }
 
+#[cfg(feature = "_sync-sender")]
 impl From<&str> for Port {
     fn from(s: &str) -> Self {
         Port(s.to_owned())
     }
 }
 
+#[cfg(feature = "_sync-sender")]
 impl From<u16> for Port {
     fn from(p: u16) -> Self {
         Port(p.to_string())
     }
 }
 
+#[cfg(feature = "_sync-sender")]
 fn validate_auto_flush_params(params: &HashMap<String, String>) -> Result<()> {
     if let Some(auto_flush) = params.get("auto_flush")
         && auto_flush.as_str() != "off"
@@ -209,6 +292,7 @@ fn validate_auto_flush_params(params: &HashMap<String, String>) -> Result<()> {
 /// ILP/HTTP, QWP/UDP, and QWP/WS, and is expected to grow).
 #[derive(PartialEq, Debug, Clone, Copy)]
 #[non_exhaustive]
+#[cfg(feature = "_sync-sender")]
 pub enum Protocol {
     #[cfg(feature = "_sender-tcp")]
     /// ILP over TCP (streaming).
@@ -229,39 +313,41 @@ pub enum Protocol {
 
     #[cfg(feature = "_sender-qwp-udp")]
     /// Quest Wire Protocol over UDP datagrams (IPv4-only).
-    QwpUdp,
+    Udp,
 
     #[cfg(feature = "_sender-qwp-ws")]
     /// Quest Wire Protocol over WebSocket (RFC 6455).
-    QwpWs,
+    Ws,
 
     #[cfg(feature = "_sender-qwp-ws")]
     /// Quest Wire Protocol over WebSocket Secure (TLS).
-    QwpWss,
+    Wss,
 }
 
+#[cfg(feature = "_sync-sender")]
 impl Display for Protocol {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::result::Result<(), std::fmt::Error> {
         f.write_str(self.schema())
     }
 }
 
+#[cfg(feature = "_sync-sender")]
 impl Protocol {
     fn default_port(&self) -> &str {
-        match self {
+        match *self {
             #[cfg(feature = "_sender-tcp")]
             Protocol::Tcp | Protocol::Tcps => "9009",
             #[cfg(feature = "_sender-http")]
             Protocol::Http | Protocol::Https => "9000",
             #[cfg(feature = "_sender-qwp-udp")]
-            Protocol::QwpUdp => "9007",
+            Protocol::Udp => "9007",
             #[cfg(feature = "_sender-qwp-ws")]
-            Protocol::QwpWs | Protocol::QwpWss => "9000",
+            Protocol::Ws | Protocol::Wss => "9000",
         }
     }
 
     fn tls_enabled(&self) -> bool {
-        match self {
+        match *self {
             #[cfg(feature = "_sender-tcp")]
             Protocol::Tcp => false,
             #[cfg(feature = "_sender-tcp")]
@@ -271,11 +357,11 @@ impl Protocol {
             #[cfg(feature = "_sender-http")]
             Protocol::Https => true,
             #[cfg(feature = "_sender-qwp-udp")]
-            Protocol::QwpUdp => false,
+            Protocol::Udp => false,
             #[cfg(feature = "_sender-qwp-ws")]
-            Protocol::QwpWs => false,
+            Protocol::Ws => false,
             #[cfg(feature = "_sender-qwp-ws")]
-            Protocol::QwpWss => true,
+            Protocol::Wss => true,
         }
     }
 
@@ -286,9 +372,9 @@ impl Protocol {
             #[cfg(feature = "_sender-http")]
             Protocol::Http | Protocol::Https => false,
             #[cfg(feature = "_sender-qwp-udp")]
-            Protocol::QwpUdp => false,
+            Protocol::Udp => false,
             #[cfg(feature = "_sender-qwp-ws")]
-            Protocol::QwpWs | Protocol::QwpWss => false,
+            Protocol::Ws | Protocol::Wss => false,
         }
     }
 
@@ -299,20 +385,20 @@ impl Protocol {
             Protocol::Tcp | Protocol::Tcps => false,
             Protocol::Http | Protocol::Https => true,
             #[cfg(feature = "_sender-qwp-udp")]
-            Protocol::QwpUdp => false,
+            Protocol::Udp => false,
             #[cfg(feature = "_sender-qwp-ws")]
-            Protocol::QwpWs | Protocol::QwpWss => false,
+            Protocol::Ws | Protocol::Wss => false,
         }
     }
 
     #[cfg(feature = "_sender-qwp-udp")]
     fn is_qwp_udp(&self) -> bool {
-        matches!(self, Protocol::QwpUdp)
+        matches!(self, Protocol::Udp)
     }
 
     #[cfg(feature = "_sender-qwp-ws")]
     fn is_qwp_ws(&self) -> bool {
-        matches!(self, Protocol::QwpWs | Protocol::QwpWss)
+        matches!(self, Protocol::Ws | Protocol::Wss)
     }
 
     /// True if the protocol authenticates via HTTP-style headers
@@ -332,7 +418,7 @@ impl Protocol {
     }
 
     fn schema(&self) -> &str {
-        match self {
+        match *self {
             #[cfg(feature = "_sender-tcp")]
             Protocol::Tcp => "tcp",
             #[cfg(feature = "_sender-tcp")]
@@ -342,11 +428,11 @@ impl Protocol {
             #[cfg(feature = "_sender-http")]
             Protocol::Https => "https",
             #[cfg(feature = "_sender-qwp-udp")]
-            Protocol::QwpUdp => "qwpudp",
+            Protocol::Udp => "udp",
             #[cfg(feature = "_sender-qwp-ws")]
-            Protocol::QwpWs => "qwpws",
+            Protocol::Ws => "ws",
             #[cfg(feature = "_sender-qwp-ws")]
-            Protocol::QwpWss => "qwpwss",
+            Protocol::Wss => "wss",
         }
     }
 
@@ -368,16 +454,20 @@ impl Protocol {
             return Ok(Protocol::Https);
         }
         #[cfg(feature = "_sender-qwp-udp")]
-        if schema.eq_ignore_ascii_case("qwpudp") {
-            return Ok(Protocol::QwpUdp);
+        if schema.eq_ignore_ascii_case("udp") {
+            return Ok(Protocol::Udp);
+        }
+        #[cfg(feature = "_sender-qwp-udp")]
+        if schema.eq_ignore_ascii_case("udps") {
+            return Err(error::fmt!(ConfigError, "TLS is not supported for UDP."));
         }
         #[cfg(feature = "_sender-qwp-ws")]
-        if schema.eq_ignore_ascii_case("qwpws") || schema.eq_ignore_ascii_case("ws") {
-            return Ok(Protocol::QwpWs);
+        if schema.eq_ignore_ascii_case("ws") {
+            return Ok(Protocol::Ws);
         }
         #[cfg(feature = "_sender-qwp-ws")]
-        if schema.eq_ignore_ascii_case("qwpwss") || schema.eq_ignore_ascii_case("wss") {
-            return Ok(Protocol::QwpWss);
+        if schema.eq_ignore_ascii_case("wss") {
+            return Ok(Protocol::Wss);
         }
         Err(error::fmt!(ConfigError, "Unsupported protocol: {}", schema))
     }
@@ -389,12 +479,227 @@ pub(crate) struct QwpWsAddrScan {
     pub(crate) sanitized_conf: String,
 }
 
+/// Resolved, reusable ingredients for opening QWP/WebSocket connections to a
+/// rotating set of endpoints. Built once by
+/// [`SenderBuilder::build_qwp_ws_connector`] and held by the ingestion pool,
+/// which drives it through a
+/// shared [`sender::qwp_ws::QwpWsHostHealthTracker`] so every borrow lands on
+/// a live, writable endpoint (skipping unhealthy / role-rejecting ones)
+/// without re-parsing the connect string.
+#[cfg(feature = "sync-sender-qwp-ws")]
+pub(crate) struct QwpWsConnector {
+    host: String,
+    port: String,
+    endpoints: std::sync::Arc<[conf::QwpWsEndpoint]>,
+    use_tls: bool,
+    tls_settings: Option<tls::TlsSettings>,
+    qwp_ws: conf::QwpWsConfig,
+    auth_header: Option<String>,
+    max_buf_size: usize,
+}
+
+#[cfg(feature = "sync-sender-qwp-ws")]
+impl QwpWsConnector {
+    /// Number of configured endpoints — the pool sizes its shared health
+    /// tracker to this.
+    pub(crate) fn endpoint_count(&self) -> usize {
+        self.endpoints.len()
+    }
+
+    /// Endpoint at `idx`, for event narration. `None` when out of range.
+    pub(crate) fn endpoint(&self, idx: usize) -> Option<&conf::QwpWsEndpoint> {
+        self.endpoints.get(idx)
+    }
+
+    pub(crate) fn max_buf_size(&self) -> usize {
+        self.max_buf_size
+    }
+
+    pub(crate) fn request_durable_ack(&self) -> bool {
+        *self.qwp_ws.request_durable_ack
+    }
+
+    pub(crate) fn sender_id(&self) -> &str {
+        self.qwp_ws.sender_id.as_str()
+    }
+
+    pub(crate) fn sf_dir(&self) -> Option<&Path> {
+        self.qwp_ws.sf_dir.as_deref()
+    }
+
+    /// Per-call request timeout parsed from the connect string. The direct
+    /// column backend arms this as the socket read/write timeout; the
+    /// store-and-forward backend uses it as the no-progress deadline in its
+    /// `sync` poll loop so a silent-but-alive peer cannot block the caller
+    /// forever.
+    pub(crate) fn request_timeout(&self) -> Duration {
+        *self.qwp_ws.request_timeout
+    }
+
+    /// Bound on how long the store-and-forward ingestion pool waits for a
+    /// connection's background runner to deliver its queued frames before the
+    /// connection is dropped (pool close / shutdown return). `Duration::ZERO`
+    /// disables the wait. Parsed from `close_flush_timeout_millis`.
+    pub(crate) fn close_flush_timeout(&self) -> Duration {
+        *self.qwp_ws.close_flush_timeout
+    }
+
+    /// Reconnect backoff budget parsed from the connect string's
+    /// `reconnect_*` keys. Only the retry-capable borrow paths consume it
+    /// (the polars `reborrow_with_retry` and the FFI owned `*_with_retry`
+    /// entry points); keep it compiled (so the `ReconnectPolicy` re-export it
+    /// returns stays live) but quiet the dead-code lint when neither is built.
+    #[cfg(feature = "sync-sender-qwp-ws")]
+    #[cfg_attr(
+        not(any(
+            feature = "polars-ingress",
+            feature = "polars-egress",
+            feature = "ffi-support"
+        )),
+        allow(dead_code)
+    )]
+    pub(crate) fn reconnect_policy(&self) -> sender::ReconnectPolicy {
+        sender::ReconnectPolicy::bounded(
+            *self.qwp_ws.reconnect_max_duration,
+            *self.qwp_ws.reconnect_initial_backoff,
+            *self.qwp_ws.reconnect_max_backoff,
+        )
+    }
+
+    /// Pool path: drive the connect round against the *shared* health tracker
+    /// behind `health`, locking it only per tracker operation. The health lock
+    /// is **never** held across
+    /// the blocking TCP/TLS/WS-upgrade handshake, so concurrent cold-start
+    /// borrows no longer serialize end-to-end and dead-sender returns that
+    /// need the same lock are not stalled behind one slow / black-holed
+    /// connect.
+    pub(crate) fn connect_round_pooled(
+        &self,
+        health: &std::sync::Mutex<sender::qwp_ws::QwpWsHostHealthTracker>,
+        events: Option<&conn_events::ConnectionEventSource>,
+    ) -> Result<RawQwpWsRoundStream> {
+        self.connect_round_with(sender::qwp_ws::LockedQwpWsHealth::new(health), events)
+    }
+
+    fn connect_round_with<A: sender::qwp_ws::QwpWsHealthAccess>(
+        &self,
+        health: A,
+        events: Option<&conn_events::ConnectionEventSource>,
+    ) -> Result<RawQwpWsRoundStream> {
+        let mut previous_idx = None;
+        let connected = sender::qwp_ws::connect_qwp_ws_endpoint_round(
+            &self.endpoints,
+            health,
+            &mut previous_idx,
+            None,
+            self.use_tls,
+            self.tls_settings.clone(),
+            sender::qwp_ws::QwpWsConnectKind::Foreground,
+            &self.qwp_ws,
+            self.auth_header.as_deref(),
+            events,
+        )?;
+        // The per-frame cap is the negotiated one: the configured
+        // max_buf_size clamped to the server's advertised
+        // X-QWP-Max-Batch-Size (0 = not advertised), matching the row
+        // sender's effective_qwp_ws_max_buf_size.
+        let max_buf_size = if connected.server_max_batch_size > 0 {
+            self.max_buf_size.min(connected.server_max_batch_size)
+        } else {
+            self.max_buf_size
+        };
+        let raw = RawQwpWsRoundStream {
+            endpoint_idx: connected.endpoint_idx,
+            stream: connected.stream,
+            leftover: connected.leftover,
+            max_buf_size,
+            request_timeout: *self.qwp_ws.request_timeout,
+            durable_ack_opt_in: *self.qwp_ws.request_durable_ack,
+        };
+        if let Some(events) = events
+            && let Some(endpoint) = self.endpoints.get(raw.endpoint_idx)
+        {
+            // Publish success only after the negotiated stream state,
+            // including the server frame cap, has been committed locally.
+            events.connect_succeeded(&endpoint.host, &endpoint.port);
+        }
+        Ok(raw)
+    }
+
+    pub(crate) fn connect_sfa_background_with_pool_slot(
+        &self,
+        sender_id: Option<&str>,
+        managed_exclusions: &[conf::QwpWsManagedSlotExclusion],
+        extra_orphan_slots: &[PathBuf],
+        conn_events: std::sync::Arc<conn_events::ConnectionEventSource>,
+        rejection_sink: std::sync::Arc<rejection_events::RejectionEventSource>,
+    ) -> Result<sender::qwp_ws::SyncQwpWsHandlerState> {
+        let mut qwp_ws = self.qwp_ws.clone();
+        qwp_ws.force_async_initial_connect();
+        // The pool's shared sources exist (handlers already attached, or
+        // permanently defaulted) before connect-time recovery senders are
+        // pre-opened, so every runner narrates through them from its first
+        // connect.
+        qwp_ws.conn_events = Some(conn_events);
+        qwp_ws.rejection_sink = Some(rejection_sink);
+        configure_qwp_ws_pool_slot(
+            &mut qwp_ws,
+            sender_id,
+            managed_exclusions,
+            extra_orphan_slots,
+        )?;
+        sender::qwp_ws::connect_qwp_ws_background_state(
+            self.host.as_str(),
+            self.port.as_str(),
+            self.use_tls,
+            self.tls_settings.clone(),
+            &qwp_ws,
+            self.auth_header.clone(),
+        )
+    }
+}
+
+#[cfg(feature = "sync-sender-qwp-ws")]
+fn configure_qwp_ws_pool_slot(
+    qwp_ws: &mut conf::QwpWsConfig,
+    sender_id: Option<&str>,
+    managed_exclusions: &[conf::QwpWsManagedSlotExclusion],
+    extra_orphan_slots: &[PathBuf],
+) -> Result<()> {
+    if let Some(sender_id) = sender_id {
+        if !conf::is_valid_qwp_ws_sender_id(sender_id) {
+            return Err(error::fmt!(
+                ConfigError,
+                "invalid pool-managed sender_id [value={sender_id}, allowed-chars=[A-Za-z0-9_-]]"
+            ));
+        }
+        qwp_ws.sender_id = ConfigSetting::new_specified(sender_id.to_owned());
+    }
+    qwp_ws.orphan_exclude_managed_slots = managed_exclusions.to_vec();
+    qwp_ws.orphan_extra_slots = extra_orphan_slots.to_vec();
+    qwp_ws.pool_managed_slot = sender_id.is_some();
+    Ok(())
+}
+
+/// One connection opened by `QwpWsConnector::connect_round_pooled`, tagged with the
+/// endpoint index it landed on so the pool can mark that endpoint unhealthy if
+/// the connection later dies.
+#[cfg(feature = "sync-sender-qwp-ws")]
+pub(crate) struct RawQwpWsRoundStream {
+    pub(crate) endpoint_idx: usize,
+    pub(crate) stream: sender::qwp_ws::WsStream,
+    pub(crate) leftover: Vec<u8>,
+    pub(crate) max_buf_size: usize,
+    pub(crate) request_timeout: Duration,
+    pub(crate) durable_ack_opt_in: bool,
+}
+
 /// Pre-scan a raw connect string for repeated `addr=...` params. Returns the
 /// full list of addr values and a sanitized conf with duplicate `addr=` params
 /// removed (the first one is kept so the downstream `questdb_confstr` parser
 /// still sees a value).
 ///
-/// Triggered when the schema is one of `qwpws`, `qwpwss`, `ws`, or `wss`; for
+/// Triggered when the schema is one of `ws` or `wss`; for
 /// any other schema (or a malformed conf), returns `None` and the caller
 /// should fall back to the standard `params.get("addr")` flow.
 #[cfg(any(feature = "_sender-qwp-ws", feature = "_egress"))]
@@ -402,11 +707,7 @@ pub(crate) fn scan_qwp_ws_addr_params(conf: &str) -> Result<Option<QwpWsAddrScan
     let Some((service, params)) = conf.split_once("::") else {
         return Ok(None);
     };
-    if !service.eq_ignore_ascii_case("qwpws")
-        && !service.eq_ignore_ascii_case("qwpwss")
-        && !service.eq_ignore_ascii_case("ws")
-        && !service.eq_ignore_ascii_case("wss")
-    {
+    if !service.eq_ignore_ascii_case("ws") && !service.eq_ignore_ascii_case("wss") {
         return Ok(None);
     }
 
@@ -480,9 +781,39 @@ fn parse_qwp_ws_endpoints(
                     "invalid QWP/WebSocket addr list: empty entry"
                 ));
             }
-            let (host, port) = match entry.split_once(':') {
-                Some((host, port)) => (host.trim(), port.trim()),
-                None => (entry, default_port),
+            let (host, port) = if let Some(rest) = entry.strip_prefix('[') {
+                let (host, after) = rest.split_once(']').ok_or_else(|| {
+                    error::fmt!(
+                        ConfigError,
+                        "invalid QWP/WebSocket addr entry {:?}: missing ']'",
+                        entry
+                    )
+                })?;
+                let port = match after.strip_prefix(':') {
+                    Some(port) => port.trim(),
+                    None if after.is_empty() => default_port,
+                    None => {
+                        return Err(error::fmt!(
+                            ConfigError,
+                            "invalid QWP/WebSocket addr entry {:?}: \
+                             expected ':port' after ']'",
+                            entry
+                        ));
+                    }
+                };
+                (host.trim(), port)
+            } else if entry.matches(':').count() > 1 {
+                return Err(error::fmt!(
+                    ConfigError,
+                    "invalid QWP/WebSocket addr entry {:?}: bracket IPv6 \
+                     addresses, e.g. [::1]:9000",
+                    entry
+                ));
+            } else {
+                match entry.split_once(':') {
+                    Some((host, port)) => (host.trim(), port.trim()),
+                    None => (entry, default_port),
+                }
             };
             if host.is_empty() {
                 return Err(error::fmt!(
@@ -582,6 +913,7 @@ fn parse_qwp_ws_endpoints(
 /// # }
 /// ```
 #[derive(Debug, Clone)]
+#[cfg(feature = "_sync-sender")]
 pub struct SenderBuilder {
     protocol: Protocol,
     host: ConfigSetting<String>,
@@ -628,14 +960,15 @@ pub struct SenderBuilder {
     qwp_ws_error_handler: QwpWsErrorHandler,
 }
 
+#[cfg(feature = "_sync-sender")]
 impl SenderBuilder {
     /// Create a new `SenderBuilder` instance from the configuration string.
     ///
     /// The format of the string is: `"http::addr=host:port;key=value;...;"`.
     ///
     /// Instead of `"http"`, you can also specify `"https"`, `"tcp"`, `"tcps"`,
-    /// `"qwpudp"`, `"qwpws"`, `"qwpwss"`, and the QWP/WebSocket aliases
-    /// `"ws"` / `"wss"` when the corresponding sender features are enabled.
+    /// `"udp"`, and the QWP/WebSocket schemes `"ws"` / `"wss"` when the
+    /// corresponding sender features are enabled.
     ///
     /// We recommend HTTP for most cases because it provides more features, like
     /// reporting errors to the client and supporting transaction control. TCP can
@@ -654,7 +987,7 @@ impl SenderBuilder {
     /// Some QWP/WebSocket configuration keys are accepted only through the
     /// configuration string, primarily for compatibility with Java-style
     /// configuration names and settings without a public Rust builder method.
-    /// These include `in_flight_window`, `sf_dir`, `sender_id`, `sf_max_bytes`,
+    /// These include `in_flight_window`, `sf_dir`, `sender_id`, `sf_max_segment_bytes`,
     /// `sf_max_total_bytes`, `sf_durability`, `sf_append_deadline_millis`,
     /// `auth_timeout_ms`, `close_flush_timeout_millis`, `request_durable_ack`,
     /// `durable_ack_keepalive_interval_millis`, `drain_orphans`,
@@ -738,11 +1071,14 @@ impl SenderBuilder {
 
         // Connect-string keys valid on a `ws::` / `wss::` string that are not
         // matched by an arm below: `addr` (consumed before this loop), the
-        // auto-flush keys (validated by `validate_auto_flush_params`), and the
+        // auto-flush keys (validated by `validate_auto_flush_params`), the
         // egress query-client keys (a single connect string drives both the
-        // sender and the `QwpQueryClient`). Any other key on a QWP/WebSocket
-        // connect string is rejected as unknown. Keys added to either direction
-        // MUST be reflected here or a shared connect string breaks.
+        // sender and the `QwpQueryClient`), and the ingestion-pool keys
+        // (`pool_*`, consumed by `QuestDb::connect` before it opens each
+        // per-slot `SenderBuilder::from_conf` connection). Any other key on a
+        // QWP/WebSocket connect string is rejected as unknown. Keys added to
+        // any of these directions MUST be reflected here or a shared connect
+        // string breaks.
         #[cfg(feature = "_sender-qwp-ws")]
         const QWP_WS_PORTABLE_CONFIG_KEYS: &[&str] = &[
             "addr",
@@ -769,6 +1105,13 @@ impl SenderBuilder {
             "on_server_error",
             "on_write_error",
             "path",
+            "acquire_timeout_ms",
+            "idle_timeout_ms",
+            "pool_reap",
+            "query_pool_max",
+            "query_pool_min",
+            "sender_pool_max",
+            "sender_pool_min",
             "target",
             "zone",
         ];
@@ -796,7 +1139,7 @@ impl SenderBuilder {
                 #[cfg(feature = "_sender-qwp-ws")]
                 "sender_id" => builder.sender_id(val)?,
                 #[cfg(feature = "_sender-qwp-ws")]
-                "sf_max_bytes" => {
+                "sf_max_segment_bytes" => {
                     builder.store_and_forward_max_bytes(parse_size_conf_value(key, val)?)?
                 }
                 #[cfg(feature = "_sender-qwp-ws")]
@@ -828,6 +1171,8 @@ impl SenderBuilder {
                 #[cfg(feature = "_sender-qwp-ws")]
                 "auth_timeout_ms" => builder.qwp_ws_auth_timeout_millis(val)?,
                 #[cfg(feature = "_sender-qwp-ws")]
+                "connect_timeout" => builder.qwp_ws_connect_timeout_millis(val)?,
+                #[cfg(feature = "_sender-qwp-ws")]
                 "close_flush_timeout_millis" => builder.close_flush_timeout_millis(val)?,
                 #[cfg(feature = "_sender-qwp-ws")]
                 "request_durable_ack" => builder.request_durable_ack(val)?,
@@ -841,6 +1186,14 @@ impl SenderBuilder {
                 "max_background_drainers" => builder.max_background_drainers(val)?,
                 #[cfg(feature = "_sender-qwp-ws")]
                 "error_inbox_capacity" => builder.error_inbox_capacity(val)?,
+                #[cfg(feature = "_sender-qwp-ws")]
+                "max_frame_rejections" => {
+                    builder.max_frame_rejections(parse_conf_value(key, val)?)?
+                }
+                #[cfg(feature = "_sender-qwp-ws")]
+                "poison_min_escalation_window_millis" => builder.poison_min_escalation_window(
+                    Duration::from_millis(parse_conf_value(key, val)?),
+                )?,
                 "protocol_version" => match val {
                     "1" => builder.protocol_version(ProtocolVersion::V1)?,
                     "2" => builder.protocol_version(ProtocolVersion::V2)?,
@@ -963,7 +1316,7 @@ impl SenderBuilder {
                         return Err(error::fmt!(
                             ConfigError,
                             "\"tls_roots_password\" is only supported for QWP/WebSocket \
-                             (qwpws / qwpwss). ILP/TCP and ILP/HTTP transports read \
+                             (ws / wss). ILP/TCP and ILP/HTTP transports read \
                              unencrypted PEM via rustls."
                         ));
                     }
@@ -1175,8 +1528,9 @@ impl SenderBuilder {
         Ok(self)
     }
 
-    /// Set the Token (Bearer) Authentication parameter for HTTP,
-    /// or the ECDSA private key for TCP authentication.
+    /// Set the bearer-token authentication parameter for HTTP or
+    /// QWP/WebSocket, which requires QuestDB Enterprise, or set the ECDSA
+    /// private key for TCP authentication.
     pub fn token(mut self, token: &str) -> Result<Self> {
         #[cfg(feature = "_sender-qwp-udp")]
         self.reject_if_qwp_udp("token")?;
@@ -1371,6 +1725,38 @@ impl SenderBuilder {
     }
 
     #[cfg(feature = "_sender-qwp-ws")]
+    /// Register a connection lifecycle listener: one
+    /// [`ConnectionEvent`] per
+    /// connection-state transition of this sender's QWP/WebSocket
+    /// connection (initial connect, per-endpoint attempt failures,
+    /// disconnect, reconnect/failover, terminal auth rejection).
+    /// Delivered on a dedicated dispatcher thread through a bounded inbox
+    /// (`inbox_capacity`; `0` selects the default of 64) with a
+    /// drop-oldest overflow policy. At most one listener per sender.
+    pub fn connection_listener(
+        mut self,
+        listener: crate::ingress::ConnectionListener,
+        inbox_capacity: usize,
+    ) -> Result<Self> {
+        let Some(qwp_ws) = &mut self.qwp_ws else {
+            return Err(error::fmt!(
+                ConfigError,
+                "The \"connection_listener\" setting is only supported for QWP/WebSocket."
+            ));
+        };
+        if qwp_ws.conn_events.is_some() {
+            return Err(error::fmt!(
+                ConfigError,
+                "A connection listener is already registered on this builder."
+            ));
+        }
+        qwp_ws.conn_events = Some(std::sync::Arc::new(
+            conn_events::ConnectionEventSource::new(listener, inbox_capacity),
+        ));
+        Ok(self)
+    }
+
+    #[cfg(feature = "_sender-qwp-ws")]
     /// Control whether QWP/WebSocket progress is driven by a background thread
     /// or manually by the caller. The default is [`QwpWsProgress::Background`],
     /// matching the Java sender.
@@ -1426,16 +1812,18 @@ impl SenderBuilder {
         if value == 0 {
             return Err(error::fmt!(
                 ConfigError,
-                "\"sf_max_bytes\" must be greater than 0."
+                "\"sf_max_segment_bytes\" must be greater than 0."
             ));
         }
         let Some(qwp_ws) = &mut self.qwp_ws else {
             return Err(error::fmt!(
                 ConfigError,
-                "The \"sf_max_bytes\" setting is only supported for QWP/WebSocket."
+                "The \"sf_max_segment_bytes\" setting is only supported for QWP/WebSocket."
             ));
         };
-        qwp_ws.sf_max_bytes.set_specified("sf_max_bytes", value)?;
+        qwp_ws
+            .sf_max_segment_bytes
+            .set_specified("sf_max_segment_bytes", value)?;
         Ok(self)
     }
 
@@ -1505,6 +1893,46 @@ impl SenderBuilder {
         qwp_ws
             .reconnect_max_duration
             .set_specified("reconnect_max_duration_millis", value)?;
+        Ok(self)
+    }
+
+    #[cfg(feature = "_sender-qwp-ws")]
+    /// Maximum repeated same-head-FSN rejects or server close frames tolerated
+    /// without ACK progress before the sender treats the frame as poison.
+    /// Default 4, matching the Java QWP/WebSocket sender.
+    pub fn max_frame_rejections(mut self, value: usize) -> Result<Self> {
+        if value == 0 {
+            return Err(error::fmt!(
+                ConfigError,
+                "\"max_frame_rejections\" must be greater than 0."
+            ));
+        }
+        let Some(qwp_ws) = &mut self.qwp_ws else {
+            return Err(error::fmt!(
+                ConfigError,
+                "The \"max_frame_rejections\" setting is only supported for QWP/WebSocket."
+            ));
+        };
+        qwp_ws
+            .max_frame_rejections
+            .set_specified("max_frame_rejections", value)?;
+        Ok(self)
+    }
+
+    #[cfg(feature = "_sender-qwp-ws")]
+    /// Minimum dwell before repeated same-head-FSN rejects or server close
+    /// frames can escalate to a poison-frame protocol violation. Default 5s.
+    /// Set to zero to escalate immediately at `max_frame_rejections`.
+    pub fn poison_min_escalation_window(mut self, value: Duration) -> Result<Self> {
+        let Some(qwp_ws) = &mut self.qwp_ws else {
+            return Err(error::fmt!(
+                ConfigError,
+                "The \"poison_min_escalation_window_millis\" setting is only supported for QWP/WebSocket."
+            ));
+        };
+        qwp_ws
+            .poison_min_escalation_window
+            .set_specified("poison_min_escalation_window_millis", value)?;
         Ok(self)
     }
 
@@ -1616,6 +2044,29 @@ impl SenderBuilder {
         qwp_ws
             .auth_timeout
             .set_specified("auth_timeout_ms", Duration::from_millis(millis as u64))?;
+        Ok(self)
+    }
+
+    #[cfg(feature = "_sender-qwp-ws")]
+    fn qwp_ws_connect_timeout_millis(mut self, value: &str) -> Result<Self> {
+        let Some(qwp_ws) = &mut self.qwp_ws else {
+            return Err(error::fmt!(
+                ConfigError,
+                "The \"connect_timeout\" setting is only supported for QWP/WebSocket."
+            ));
+        };
+        let millis: i64 = parse_conf_value("connect_timeout", value)?;
+        if millis <= 0 {
+            return Err(error::fmt!(
+                ConfigError,
+                "connect_timeout must be > 0: {}",
+                millis
+            ));
+        }
+        qwp_ws.connect_timeout.set_specified(
+            "connect_timeout",
+            Some(Duration::from_millis(millis as u64)),
+        )?;
         Ok(self)
     }
 
@@ -1819,7 +2270,7 @@ impl SenderBuilder {
     /// Set the path to a custom root certificate `.pem` file.
     /// This is used to validate the server's certificate during the TLS handshake.
     ///
-    /// On QWP/WebSocket (`qwpws::` / `qwpwss::`) the same path key
+    /// On QWP/WebSocket (`ws::` / `wss::`) the same path key
     /// also accepts a JKS or PKCS#12 keystore — see
     /// [`tls_roots_password`](SenderBuilder::tls_roots_password) for
     /// the unlock password.
@@ -1857,7 +2308,7 @@ impl SenderBuilder {
             return Err(error::fmt!(
                 ConfigError,
                 "\"tls_roots_password\" is only supported for QWP/WebSocket \
-                 (qwpws / qwpwss). ILP/TCP and ILP/HTTP transports read \
+                 (ws / wss). ILP/TCP and ILP/HTTP transports read \
                  unencrypted PEM via rustls."
             ));
         }
@@ -1922,6 +2373,10 @@ impl SenderBuilder {
         }
         self.max_name_len.set_specified("max_name_len", value)?;
         Ok(self)
+    }
+
+    pub(crate) fn configured_max_name_len(&self) -> usize {
+        *self.max_name_len
     }
 
     #[cfg(feature = "sync-sender-http")]
@@ -2270,7 +2725,7 @@ impl SenderBuilder {
                 })
             }
             #[cfg(feature = "sync-sender-qwp-udp")]
-            Protocol::QwpUdp => {
+            Protocol::Udp => {
                 let Some(qwp_udp) = self.qwp_udp.as_ref() else {
                     return Err(error::fmt!(
                         ConfigError,
@@ -2285,7 +2740,7 @@ impl SenderBuilder {
                 )?
             }
             #[cfg(feature = "sync-sender-qwp-ws")]
-            Protocol::QwpWs | Protocol::QwpWss => {
+            Protocol::Ws | Protocol::Wss => {
                 if self.net_interface.is_some() {
                     return Err(error::fmt!(
                         InvalidApiCall,
@@ -2317,7 +2772,7 @@ impl SenderBuilder {
                     SyncProtocolHandler::ManualQwpWs(Box::new(open_manual_qwp_ws(
                         self.host.as_str(),
                         self.port.as_str(),
-                        matches!(self.protocol, Protocol::QwpWss),
+                        matches!(self.protocol, Protocol::Wss),
                         tls_settings,
                         qwp_ws,
                         basic_auth,
@@ -2326,7 +2781,7 @@ impl SenderBuilder {
                     connect_qwp_ws(
                         self.host.as_str(),
                         self.port.as_str(),
-                        matches!(self.protocol, Protocol::QwpWss),
+                        matches!(self.protocol, Protocol::Wss),
                         tls_settings,
                         qwp_ws,
                         basic_auth,
@@ -2372,9 +2827,9 @@ impl SenderBuilder {
                     }
                 }
                 #[cfg(feature = "sync-sender-qwp-udp")]
-                Protocol::QwpUdp => ProtocolVersion::V1,
+                Protocol::Udp => ProtocolVersion::V1,
                 #[cfg(feature = "sync-sender-qwp-ws")]
-                Protocol::QwpWs | Protocol::QwpWss => ProtocolVersion::V1,
+                Protocol::Ws | Protocol::Wss => ProtocolVersion::V1,
             },
         };
 
@@ -2399,9 +2854,122 @@ impl SenderBuilder {
             max_name_len,
             #[cfg(feature = "_sender-qwp-ws")]
             self.qwp_ws_error_handler.clone(),
+            #[cfg(feature = "_sender-qwp-ws")]
+            self.qwp_ws
+                .as_ref()
+                .and_then(|qwp_ws| qwp_ws.conn_events.clone()),
         );
 
         Ok(sender)
+    }
+
+    /// Resolve the QWP/WebSocket connect ingredients used by
+    /// [`Self::build_qwp_ws_connector`]: validate the protocol / buffer / TLS
+    /// settings, build the TLS config and auth header, and clone the
+    /// (reconnect-promoted, SF-vetted) `QwpWsConfig`.
+    #[cfg(feature = "sync-sender-qwp-ws")]
+    fn resolve_qwp_ws_ingredients(
+        &self,
+    ) -> Result<(
+        bool,
+        Option<tls::TlsSettings>,
+        conf::QwpWsConfig,
+        Option<String>,
+    )> {
+        if self.init_buf_size.is_specified() && *self.init_buf_size > *self.max_buf_size {
+            return Err(error::fmt!(
+                ConfigError,
+                "init_buf_size ({}) cannot exceed max_buf_size ({})",
+                *self.init_buf_size,
+                *self.max_buf_size
+            ));
+        }
+
+        if !matches!(self.protocol, Protocol::Ws | Protocol::Wss) {
+            return Err(error::fmt!(
+                ConfigError,
+                "Column-sender requires a QWP/WebSocket connect string \
+                 (got protocol {:?})",
+                self.protocol
+            ));
+        }
+        if self.net_interface.is_some() {
+            return Err(error::fmt!(
+                InvalidApiCall,
+                "net_interface is not supported for QWP over WebSocket."
+            ));
+        }
+        let Some(qwp_ws) = self.qwp_ws.as_ref() else {
+            return Err(error::fmt!(
+                ConfigError,
+                "QWP/WebSocket configuration is missing."
+            ));
+        };
+
+        #[cfg(feature = "insecure-skip-verify")]
+        let tls_verify = *self.tls_verify;
+        let tls_roots_password = self.tls_roots_password.deref().as_deref();
+
+        if tls_roots_password.is_some() && self.tls_roots.deref().is_none() {
+            return Err(error::fmt!(
+                ConfigError,
+                "\"tls_roots_password\" requires \"tls_roots\" \
+                 (the password unlocks the keystore at that path)"
+            ));
+        }
+
+        let tls_settings = tls::TlsSettings::build(
+            self.protocol.tls_enabled(),
+            #[cfg(feature = "insecure-skip-verify")]
+            tls_verify,
+            *self.tls_ca,
+            self.tls_roots.deref().as_deref(),
+            tls_roots_password,
+        )?;
+
+        let auth = self.build_auth()?;
+        let auth_header = qwp_ws_auth_header(&auth)?;
+        let mut qwp_ws = qwp_ws.clone();
+        qwp_ws.apply_reconnect_implies_initial_retry();
+        reject_unsupported_qwp_ws_sf_config(&qwp_ws)?;
+        if *qwp_ws.progress == QwpWsProgress::Manual
+            && *qwp_ws.initial_connect_retry == conf::QwpWsInitialConnectMode::Async
+        {
+            return Err(error::fmt!(
+                ConfigError,
+                "initial_connect_retry=async requires QWP/WebSocket background progress; use qwp_ws_progress=background or initial_connect_retry=sync"
+            ));
+        }
+
+        let use_tls = matches!(self.protocol, Protocol::Wss);
+        Ok((use_tls, tls_settings, qwp_ws, auth_header))
+    }
+
+    /// Build a reusable [`QwpWsConnector`] capturing the full configured
+    /// endpoint list — the pooled QWP ingress path's entry point into the
+    /// network. The pool drives it through a shared health tracker so each
+    /// connect rotates across endpoints, skips unhealthy ones, and follows
+    /// the writable primary on a role reject; the resulting `WsStream` does
+    /// its own synchronous frame I/O and does not use the standalone
+    /// [`Sender`]'s replay encoder or transaction ownership.
+    #[cfg(feature = "sync-sender-qwp-ws")]
+    pub(crate) fn build_qwp_ws_connector(&self) -> Result<QwpWsConnector> {
+        let (use_tls, tls_settings, qwp_ws, auth_header) = self.resolve_qwp_ws_ingredients()?;
+        let endpoints = sender::qwp_ws::qwp_ws_configured_endpoints(
+            self.host.as_str(),
+            self.port.as_str(),
+            &qwp_ws,
+        );
+        Ok(QwpWsConnector {
+            host: self.host.to_string(),
+            port: self.port.to_string(),
+            endpoints,
+            use_tls,
+            tls_settings,
+            qwp_ws,
+            auth_header,
+            max_buf_size: *self.max_buf_size,
+        })
     }
 
     #[cfg(any(feature = "_sender-tcp", feature = "_sender-qwp-udp"))]
@@ -2430,6 +2998,7 @@ impl SenderBuilder {
 
 /// When parsing from config, we exclude certain characters.
 /// Here we repeat the same validation logic for consistency.
+#[cfg(feature = "_sync-sender")]
 fn validate_value<T: AsRef<str>>(value: T) -> Result<T> {
     let str_ref = value.as_ref();
     for (p, c) in str_ref.chars().enumerate() {
@@ -2443,6 +3012,7 @@ fn validate_value<T: AsRef<str>>(value: T) -> Result<T> {
     Ok(value)
 }
 
+#[cfg(feature = "_sync-sender")]
 fn parse_conf_value<T>(param_name: &str, str_value: &str) -> Result<T>
 where
     T: FromStr,
@@ -2698,5 +3268,5 @@ impl Debug for DebugBytes<'_> {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "_sync-sender"))]
 mod tests;

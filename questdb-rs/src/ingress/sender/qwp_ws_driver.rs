@@ -49,16 +49,17 @@ use crate::{Error, ErrorCode};
 
 #[cfg(feature = "sync-sender-qwp-ws")]
 use super::qwp_ws::{
-    QwpWsConnectRoundSuccess, QwpWsHostHealthTracker, WsFrameRead, WsFrameReader, WsStream,
-    connect_qwp_ws_endpoint_round, qwp_ws_configured_endpoints, write_binary_frame,
+    QwpWsConnectKind, QwpWsConnectRoundSuccess, QwpWsHostHealthTracker, WsFrameRead, WsFrameReader,
+    WsStream, connect_qwp_ws_endpoint_round, qwp_ws_configured_endpoints, write_binary_frame,
     write_ping_frame,
 };
-#[cfg(feature = "sync-sender-qwp-ws")]
-use super::qwp_ws_codec::WS_OPCODE_BINARY;
 use super::qwp_ws_codec::{self as codec, PipelinedResponse};
 use super::qwp_ws_ownership::{QwpWsErrorCategory, QwpWsErrorPolicy, QwpWsSenderError};
 use super::qwp_ws_queue::{
     OutboundFrame, OutboundFrameView, QueueError, QwpReceipt, QwpReceiptStatus, SentFrame,
+};
+use super::qwp_ws_sfa_catchup::{
+    CatchUpEntryTooLarge, CatchUpStreamError, SentDictMirror, frame_delta_start,
 };
 #[cfg(test)]
 use super::qwp_ws_sfa_queue::SfaMemoryQueueOptions;
@@ -66,8 +67,11 @@ use super::qwp_ws_sfa_queue::{
     SfaCleanupFailure, SfaFrameQueue, SfaProducer, SfaProgressView, SfaSendCursor,
     SfaStorageFinish, SfaStorageResult, SfaStorageStep,
 };
+#[cfg(feature = "sync-sender-qwp-ws")]
+use crate::ws::frame::OPCODE_BINARY;
 
 pub(crate) const DEFAULT_EVENT_CAPACITY: usize = 1024;
+pub(crate) const DEFAULT_MAX_FRAME_REJECTIONS: usize = 4;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct ReconnectPolicy {
@@ -110,6 +114,49 @@ impl ReconnectPolicy {
     }
 }
 
+#[derive(Debug, Default, Clone, Copy)]
+struct PoisonFrameTracker {
+    fsn: Option<u64>,
+    completed_fsn: Option<u64>,
+    rejection_count: usize,
+    first_strike_at: Option<Instant>,
+}
+
+impl PoisonFrameTracker {
+    fn clear(&mut self) {
+        *self = Self::default();
+    }
+
+    fn record_failure(
+        &mut self,
+        fsn: u64,
+        completed_fsn: Option<u64>,
+        limit: usize,
+        min_escalation_window: Duration,
+        now: Instant,
+    ) -> bool {
+        if self.fsn == Some(fsn) && self.completed_fsn == completed_fsn {
+            self.rejection_count = self.rejection_count.saturating_add(1);
+        } else {
+            self.fsn = Some(fsn);
+            self.completed_fsn = completed_fsn;
+            self.rejection_count = 1;
+            self.first_strike_at = Some(now);
+        }
+        if self.rejection_count < limit {
+            return false;
+        }
+        min_escalation_window.is_zero()
+            || self.first_strike_at.is_some_and(|first_strike_at| {
+                now.saturating_duration_since(first_strike_at) >= min_escalation_window
+            })
+    }
+
+    fn strikes(&self) -> usize {
+        self.rejection_count
+    }
+}
+
 #[cfg(test)]
 #[derive(Debug)]
 pub(crate) struct QwpWsCoreTestHarness<Q, T> {
@@ -124,9 +171,23 @@ pub(crate) struct QwpWsCoreTestHarness<Q, T> {
 pub(crate) struct QwpWsSendCore<T> {
     transport: T,
     send_cursor: SendCursor,
+    /// I/O-thread-local mirror of every symbol dictionary entry sent on this
+    /// connection, used to re-register the whole dictionary via catch-up frame(s)
+    /// on reconnect. Inert (disabled) unless the store enables delta mode via
+    /// [`Self::enable_delta_dict`]; disabled keeps every frame self-sufficient.
+    dict_mirror: SentDictMirror,
+    /// Set on a successful reconnect when delta mode is active: the next send
+    /// iteration emits the full-dictionary catch-up frame(s) before replaying the
+    /// queued delta frames, so the fresh server can resolve them. Cleared once
+    /// emitted.
+    catch_up_pending: bool,
     durable_ack: Option<DurableAckTracker>,
     reconnect_policy: ReconnectPolicy,
     pending_reconnect: Option<QwpWsReconnectState>,
+    poison_tracker: PoisonFrameTracker,
+    max_frame_rejections: usize,
+    poison_min_escalation_window: Duration,
+    sends_on_connection: u64,
 }
 
 #[derive(Debug)]
@@ -154,6 +215,7 @@ pub(crate) enum QwpWsHotSendProgress {
 pub(crate) struct QwpWsHotResponseProgress {
     pub(crate) outcome: DriveOutcome,
     pub(crate) events: Vec<DriverEvent>,
+    pub(crate) ok_fsn: Option<u64>,
 }
 
 impl QwpWsHotResponseProgress {
@@ -161,12 +223,22 @@ impl QwpWsHotResponseProgress {
         Self {
             outcome: DriveOutcome::Idle,
             events: Vec::new(),
+            ok_fsn: None,
         }
     }
 
     fn from_optional_event(outcome: DriveOutcome, event: Option<DriverEvent>) -> Self {
         let events = event.into_iter().collect();
-        Self { outcome, events }
+        Self {
+            outcome,
+            events,
+            ok_fsn: None,
+        }
+    }
+
+    fn with_ok_fsn(mut self, fsn: u64) -> Self {
+        self.ok_fsn = Some(fsn);
+        self
     }
 }
 
@@ -175,6 +247,7 @@ pub(crate) enum QwpWsTransportFailureAction {
     Reconnect {
         reason: ReconnectReason,
         initial_error: Error,
+        pace: Duration,
     },
     Terminal(Error),
 }
@@ -194,6 +267,7 @@ pub(crate) struct QwpWsReconnectState {
     started: Instant,
     deadline: Option<Instant>,
     backoff: Duration,
+    pace_first_attempt: Option<Duration>,
     last_error: Error,
     attempts: usize,
 }
@@ -213,13 +287,28 @@ impl QwpWsReconnectState {
             started,
             deadline: started.checked_add(policy.max_duration),
             backoff: policy.initial_backoff,
+            pace_first_attempt: None,
             last_error: initial_error,
             attempts: 0,
         }
     }
 
+    pub(crate) fn with_pace(mut self, pace: Duration) -> Self {
+        if !pace.is_zero() {
+            self.deadline = self
+                .deadline
+                .and_then(|deadline| deadline.checked_add(pace));
+            self.pace_first_attempt = Some(pace);
+        }
+        self
+    }
+
     pub(crate) fn deadline(&self) -> Option<Instant> {
         self.deadline
+    }
+
+    pub(crate) fn initial_backoff(&self) -> Duration {
+        self.policy.initial_backoff
     }
 
     fn deadline_expired(&self) -> bool {
@@ -233,6 +322,14 @@ impl QwpWsReconnectState {
             self.started,
             Some(self.last_error.clone()),
         )
+    }
+
+    pub(crate) fn next_after_retryable_terminal(&self, err: Error) -> Self {
+        Self::new(self.policy, self.context, self.reason, err)
+    }
+
+    pub(crate) fn take_first_attempt_pace(&mut self) -> Option<Duration> {
+        self.pace_first_attempt.take()
     }
 
     fn record_retryable_error(&mut self, err: Error) -> Duration {
@@ -340,6 +437,7 @@ pub(crate) struct QwpWsPublicationStore<Q = SfaFrameQueue> {
     last_server_error: Option<QwpServerError>,
     rejected_frames: VecDeque<QwpRejectedFrame>,
     sender_errors: SenderErrorLog,
+    rejection_sink: Option<Arc<crate::ingress::rejection_events::RejectionEventSource>>,
     counters: QwpWsCounters,
 }
 
@@ -354,8 +452,16 @@ impl<Q: PublicationLog> QwpWsPublicationStore<Q> {
             last_server_error: None,
             rejected_frames: VecDeque::new(),
             sender_errors: SenderErrorLog::new(event_capacity),
+            rejection_sink: None,
             counters: QwpWsCounters::default(),
         }
+    }
+
+    pub(crate) fn set_rejection_sink(
+        &mut self,
+        sink: Option<Arc<crate::ingress::rejection_events::RejectionEventSource>>,
+    ) {
+        self.rejection_sink = sink;
     }
 
     pub(crate) fn counters(&self) -> QwpWsCounters {
@@ -421,10 +527,21 @@ impl<Q: PublicationLog> QwpWsPublicationStore<Q> {
     }
 
     pub(crate) fn mark_terminal(&mut self, error: Option<Error>) {
-        if self.lifecycle.terminalize() != PublicationState::Terminal {
-            self.terminal_error = error;
-            self.push_event(DriverEvent::Terminal);
+        self.try_mark_terminal(error);
+    }
+
+    fn try_mark_terminal(&mut self, error: Option<Error>) -> bool {
+        if self.lifecycle.load() == PublicationState::Terminal {
+            return false;
         }
+        // Publish all terminal diagnostics before releasing the terminal
+        // lifecycle state. An observer that acquires Terminal can therefore
+        // immediately consume the matching diagnostic.
+        self.terminal_error = error;
+        let previous = self.lifecycle.terminalize();
+        debug_assert_ne!(previous, PublicationState::Terminal);
+        self.push_event(DriverEvent::Terminal);
+        true
     }
 
     pub(crate) fn is_terminal(&self) -> bool {
@@ -496,20 +613,21 @@ impl<Q: PublicationLog> QwpWsPublicationStore<Q> {
         wire_seq: u64,
         error: QwpServerError,
         policy: QwpWsErrorPolicy,
-    ) {
+    ) -> QwpWsSenderError {
         self.last_server_error = Some(error.clone());
-        self.push_sender_error(sender_error_for_qwp_error(&error, wire_seq, fsn, policy));
-        if self.sender_errors.capacity() == 0 {
-            return;
+        let sender_error = sender_error_for_qwp_error(&error, wire_seq, fsn, policy);
+        if self.sender_errors.capacity() != 0 {
+            if self.rejected_frames.len() == self.sender_errors.capacity() {
+                self.rejected_frames.pop_front();
+            }
+            self.rejected_frames.push_back(QwpRejectedFrame {
+                fsn,
+                wire_seq,
+                error,
+            });
         }
-        if self.rejected_frames.len() == self.sender_errors.capacity() {
-            self.rejected_frames.pop_front();
-        }
-        self.rejected_frames.push_back(QwpRejectedFrame {
-            fsn,
-            wire_seq,
-            error,
-        });
+        self.push_sender_error(sender_error.clone());
+        sender_error
     }
 
     fn record_reject_error(
@@ -518,9 +636,35 @@ impl<Q: PublicationLog> QwpWsPublicationStore<Q> {
         wire_seq: u64,
         error: QwpServerError,
         policy: QwpWsErrorPolicy,
-    ) {
-        self.push_sender_error(sender_error_for_qwp_error(&error, wire_seq, fsn, policy));
+    ) -> QwpWsSenderError {
+        let sender_error = sender_error_for_qwp_error(&error, wire_seq, fsn, policy);
         self.last_server_error = Some(error);
+        self.push_sender_error(sender_error.clone());
+        sender_error
+    }
+
+    fn record_terminal_sender_error(
+        &mut self,
+        sender_error: QwpWsSenderError,
+        terminal_error: Error,
+        last_server_error: Option<QwpServerError>,
+    ) -> Error {
+        if self.lifecycle.load() == PublicationState::Terminal {
+            return self.terminal_error.clone().unwrap_or(terminal_error);
+        }
+        if let Some(last_server_error) = last_server_error {
+            self.last_server_error = Some(last_server_error);
+        }
+        self.terminal_sender_error = Some(sender_error.clone());
+        self.sender_errors.push(sender_error.clone());
+        let committed = self.try_mark_terminal(Some(terminal_error.clone()));
+        debug_assert!(committed);
+        // User code is the final observer: the local diagnostic rings,
+        // terminal error, lifecycle latch, and driver event all precede it.
+        if let Some(sink) = &self.rejection_sink {
+            sink.publish(sender_error);
+        }
+        terminal_error
     }
 
     fn delivery_status(
@@ -581,20 +725,48 @@ impl<Q: PublicationLog> QwpWsPublicationStore<Q> {
         };
         let sender_error = QwpWsSenderError {
             category: QwpWsErrorCategory::ProtocolViolation,
-            applied_policy: QwpWsErrorPolicy::Halt,
+            applied_policy: QwpWsErrorPolicy::Terminal,
             status: None,
             message: Some(message.clone()),
             message_sequence: None,
             from_fsn,
             to_fsn,
         };
-        self.terminal_sender_error = Some(sender_error.clone());
-        self.push_sender_error(sender_error.clone());
-        error::fmt!(
+        let terminal_error = error::fmt!(
             ServerRejection,
             "QWP/WebSocket protocol violation: {message}"
         )
-        .with_qwp_ws_rejection(sender_error)
+        .with_qwp_ws_rejection(sender_error.clone());
+        self.record_terminal_sender_error(sender_error, terminal_error, None)
+    }
+
+    /// Terminal for a well-formed frame the server keeps rejecting without ACK
+    /// progress because of its role/writability state — a read-only replica
+    /// after an in-place primary→replica switch — not because the frame is
+    /// malformed. Unlike [`Self::record_protocol_violation`] this is NOT a
+    /// protocol violation: it is recorded under the reject's own category
+    /// (`NotWritable`) and surfaced as `StoreResendRequired`, so a file-backed
+    /// slot's orphan drainer (or a fresh sender) resends the affected data
+    /// rather than mislabeling a graceful role switch as a wire-protocol
+    /// violation.
+    pub(crate) fn record_role_reject_resend(&mut self, status: u8, reason: String) -> Error {
+        let from_fsn = self
+            .queue
+            .completed_fsn()
+            .map_or(0, |fsn| fsn.saturating_add(1));
+        let to_fsn = self.queue.published_fsn().unwrap_or(from_fsn).max(from_fsn);
+        let sender_error = QwpWsSenderError {
+            category: server_error_category(status),
+            applied_policy: QwpWsErrorPolicy::Terminal,
+            status: Some(status),
+            message: Some(reason.clone()),
+            message_sequence: None,
+            from_fsn,
+            to_fsn,
+        };
+        let terminal_error = error::fmt!(StoreResendRequired, "{reason}")
+            .with_qwp_ws_rejection(sender_error.clone());
+        self.record_terminal_sender_error(sender_error, terminal_error, None)
     }
 
     pub(crate) fn poll_sender_error(&mut self) -> Option<QwpWsSenderError> {
@@ -640,7 +812,10 @@ impl<Q: PublicationLog> QwpWsPublicationStore<Q> {
     }
 
     fn push_sender_error(&mut self, error: QwpWsSenderError) {
-        self.sender_errors.push(error);
+        self.sender_errors.push(error.clone());
+        if let Some(sink) = &self.rejection_sink {
+            sink.publish(error);
+        }
     }
 }
 
@@ -659,12 +834,36 @@ impl<T: QwpWsCoreTransport> QwpWsSendCore<T> {
         reconnect_policy: ReconnectPolicy,
         durable_ack: bool,
     ) -> Self {
+        Self::new_with_durable_ack_and_rejection_limit(
+            transport,
+            max_in_flight,
+            reconnect_policy,
+            durable_ack,
+            DEFAULT_MAX_FRAME_REJECTIONS,
+            Duration::ZERO,
+        )
+    }
+
+    pub(crate) fn new_with_durable_ack_and_rejection_limit(
+        transport: T,
+        max_in_flight: usize,
+        reconnect_policy: ReconnectPolicy,
+        durable_ack: bool,
+        max_frame_rejections: usize,
+        poison_min_escalation_window: Duration,
+    ) -> Self {
         Self {
             transport,
             send_cursor: SendCursor::new(max_in_flight),
+            dict_mirror: SentDictMirror::new(false),
+            catch_up_pending: false,
             durable_ack: durable_ack.then(DurableAckTracker::new),
             reconnect_policy,
             pending_reconnect: None,
+            poison_tracker: PoisonFrameTracker::default(),
+            max_frame_rejections,
+            poison_min_escalation_window,
+            sends_on_connection: 0,
         }
     }
 
@@ -672,6 +871,7 @@ impl<T: QwpWsCoreTransport> QwpWsSendCore<T> {
         &mut self,
         store: &mut QwpWsPublicationStore<Q>,
         response: TransportResponse,
+        defer_reconnect: bool,
     ) -> Result<DriveOutcome, DriverError> {
         match response {
             TransportResponse::Ack { wire_seq } => {
@@ -700,47 +900,80 @@ impl<T: QwpWsCoreTransport> QwpWsSendCore<T> {
             TransportResponse::Reject { wire_seq, error } => {
                 store.counters.total_server_errors += 1;
                 let policy = server_error_policy(error.status);
-                let Some((fsn, effect_wire_seq)) =
+                let Some((fsn, _effect_wire_seq)) =
                     self.send_cursor.reject_fsn_for_wire_seq(wire_seq)?
                 else {
-                    return Ok(self.record_presend_reject(store, wire_seq, error, policy));
+                    return self.record_presend_reject(
+                        store,
+                        wire_seq,
+                        error,
+                        policy,
+                        defer_reconnect,
+                    );
                 };
-                if policy == QwpWsErrorPolicy::Halt {
-                    let sender_error = sender_error_for_qwp_error(&error, wire_seq, fsn, policy);
-                    store.terminal_sender_error = Some(sender_error.clone());
-                    store.push_sender_error(sender_error.clone());
-                    store.last_server_error = Some(error.clone());
-                    store.mark_terminal(Some(server_rejection_error(
-                        error.error.clone(),
-                        sender_error,
-                    )));
-                    return Ok(DriveOutcome::Terminal);
-                }
                 if self.reject_target_already_accounted(store, fsn) {
                     store.record_reject_error(fsn, wire_seq, error, policy);
                     return Ok(DriveOutcome::Idle);
                 }
                 if !self.reject_target_can_complete(store, fsn) {
-                    let err = self.reject_gap_protocol_error(store, fsn);
                     store.last_server_error = Some(error.clone());
-                    store.mark_terminal(Some(err));
+                    self.reject_gap_protocol_error(store, fsn);
                     return Ok(DriveOutcome::Terminal);
                 }
-                if self.durable_ack.is_some() {
-                    return self.apply_durable_reject(
-                        store,
-                        wire_seq,
-                        effect_wire_seq,
-                        fsn,
-                        error,
-                        policy,
-                    );
+
+                if policy == QwpWsErrorPolicy::Terminal {
+                    let sender_error = sender_error_for_qwp_error(&error, wire_seq, fsn, policy);
+                    let terminal_error =
+                        server_rejection_error(error.error.clone(), sender_error.clone());
+                    store.record_terminal_sender_error(sender_error, terminal_error, Some(error));
+                    return Ok(DriveOutcome::Terminal);
                 }
 
-                self.complete_through(store, fsn, wire_seq)?;
-                store.record_rejected_frame(fsn, wire_seq, error, policy);
+                if self.rejected_head_is_poison(store, fsn) {
+                    let strikes = self.poison_tracker.strikes();
+                    let reason = if error.message.is_empty() {
+                        format!(
+                            "QWP/WebSocket frame fsn {fsn} was rejected {strikes} times without ACK progress"
+                        )
+                    } else {
+                        format!(
+                            "QWP/WebSocket frame fsn {fsn} was rejected {} times without ACK \
+                             progress; last server error: {}",
+                            strikes, error.message
+                        )
+                    };
+                    let status = error.status;
+                    store.last_server_error = Some(error);
+                    // A read-only/role reject (RetriableOther, e.g. a replica
+                    // after an in-place role switch) is not a protocol
+                    // violation: the frame is well-formed, the server just will
+                    // not take it while read-only. Terminalize it as "resend
+                    // required" under its own category so a file-backed slot's
+                    // orphan drainer resends it, instead of mislabeling a
+                    // graceful role switch as a wire-protocol violation.
+                    if policy == QwpWsErrorPolicy::RetriableOther {
+                        store.record_role_reject_resend(status, reason)
+                    } else {
+                        store.record_protocol_violation(None, reason)
+                    };
+                    return Ok(DriveOutcome::Terminal);
+                }
+
+                let error_for_reconnect = error.error.clone();
+                let reconnect_reason = reconnect_reason_for_policy(policy);
+                let pace = self.reconnect_pace_for_reject_policy(policy);
+                let sender_error = store.record_rejected_frame(fsn, wire_seq, error, policy);
                 store.push_event(DriverEvent::Rejected { fsn, wire_seq });
-                Ok(DriveOutcome::Rejected { fsn, wire_seq })
+                let initial_error = server_rejection_error(error_for_reconnect, sender_error);
+                self.pending_reconnect = Some(
+                    self.begin_reconnect(
+                        "QWP/WebSocket reconnect after server rejection",
+                        reconnect_reason,
+                        initial_error,
+                    )
+                    .with_pace(pace),
+                );
+                self.continue_or_defer_reconnect(store, defer_reconnect)
             }
         }
     }
@@ -794,13 +1027,32 @@ impl<T: QwpWsCoreTransport> QwpWsSendCore<T> {
         )
     }
 
+    fn rejected_head_is_poison<Q: PublicationLog>(
+        &mut self,
+        store: &QwpWsPublicationStore<Q>,
+        fsn: u64,
+    ) -> bool {
+        if store.queue.oldest_unresolved_fsn() != Some(fsn) {
+            return false;
+        }
+        let now = Instant::now();
+        self.poison_tracker.record_failure(
+            fsn,
+            store.queue.completed_fsn(),
+            self.max_frame_rejections,
+            self.poison_min_escalation_window,
+            now,
+        )
+    }
+
     fn record_presend_reject<Q: PublicationLog>(
-        &self,
+        &mut self,
         store: &mut QwpWsPublicationStore<Q>,
         wire_seq: u64,
         error: QwpServerError,
         policy: QwpWsErrorPolicy,
-    ) -> DriveOutcome {
+        defer_reconnect: bool,
+    ) -> Result<DriveOutcome, DriverError> {
         let from_fsn = store
             .queue
             .completed_fsn()
@@ -812,20 +1064,84 @@ impl<T: QwpWsCoreTransport> QwpWsSendCore<T> {
             .max(from_fsn);
         let sender_error =
             sender_error_for_qwp_error_span(&error, wire_seq, from_fsn, to_fsn, policy);
-        if policy == QwpWsErrorPolicy::Halt {
-            store.terminal_sender_error = Some(sender_error.clone());
-            store.push_sender_error(sender_error.clone());
-            store.last_server_error = Some(error.clone());
-            store.mark_terminal(Some(server_rejection_error(
-                error.error.clone(),
-                sender_error,
-            )));
-            DriveOutcome::Terminal
+        if policy == QwpWsErrorPolicy::Terminal {
+            let terminal_error = server_rejection_error(error.error.clone(), sender_error.clone());
+            store.record_terminal_sender_error(sender_error, terminal_error, Some(error));
+            Ok(DriveOutcome::Terminal)
         } else {
-            store.push_sender_error(sender_error);
+            // A Retriable presend reject carries no FSN -- most commonly the server
+            // rejecting the table-less symbol-dictionary catch-up frame a reconnect
+            // emits before replaying the queued frames (e.g. a read-only replica
+            // after an in-place role switch). It still has to be bounded: the
+            // transport reconnect itself succeeds (the server accepts the
+            // connection, it just rejects the catch-up), so the reconnect retry
+            // budget -- which only counts failed dials -- never trips, and without
+            // escalation a server that persistently rejects the catch-up would
+            // reconnect-loop forever, masking a permanent failure as a hang until
+            // the caller's own deadline. Attribute it to the oldest unresolved
+            // frame (the one the catch-up exists to unblock) and run it through the
+            // same poison tracker as a real-frame reject, so repeated no-progress
+            // rejects escalate to a loud terminal ("resend required") after
+            // max_frame_rejections while a transient/role reject still failovers.
+            if let Some(oldest) = store.queue.oldest_unresolved_fsn()
+                && self.rejected_head_is_poison(store, oldest)
+            {
+                let strikes = self.poison_tracker.strikes();
+                let reason = if error.message.is_empty() {
+                    format!(
+                        "QWP/WebSocket symbol-dictionary catch-up before fsn {oldest} was \
+                         rejected {strikes} times without progress"
+                    )
+                } else {
+                    format!(
+                        "QWP/WebSocket symbol-dictionary catch-up before fsn {oldest} was \
+                         rejected {} times without progress; last server error: {}",
+                        strikes, error.message
+                    )
+                };
+                let status = error.status;
+                store.last_server_error = Some(error);
+                store.push_sender_error(sender_error);
+                // See `handle_reject`: a role/read-only catch-up reject is
+                // "resend required", not a protocol violation.
+                if policy == QwpWsErrorPolicy::RetriableOther {
+                    store.record_role_reject_resend(status, reason)
+                } else {
+                    store.record_protocol_violation(None, reason)
+                };
+                return Ok(DriveOutcome::Terminal);
+            }
+            let initial_error = server_rejection_error(error.error.clone(), sender_error.clone());
             store.last_server_error = Some(error);
-            DriveOutcome::Idle
+            store.push_sender_error(sender_error);
+            let pace = self.reconnect_pace_for_reject_policy(policy);
+            self.pending_reconnect = Some(
+                self.begin_reconnect(
+                    "QWP/WebSocket reconnect after server rejection",
+                    reconnect_reason_for_policy(policy),
+                    initial_error,
+                )
+                .with_pace(pace),
+            );
+            self.continue_or_defer_reconnect(store, defer_reconnect)
         }
+    }
+
+    fn reconnect_pace_for_reject_policy(&self, policy: QwpWsErrorPolicy) -> Duration {
+        if policy == QwpWsErrorPolicy::Retriable {
+            self.reconnect_pace_for_strikes(self.poison_tracker.strikes().max(1))
+        } else {
+            Duration::ZERO
+        }
+    }
+
+    fn reconnect_pace_for_strikes(&self, strikes: usize) -> Duration {
+        let dose = pace_dose(
+            self.reconnect_policy.initial_backoff,
+            self.reconnect_policy.max_backoff,
+            strikes,
+        );
+        pace_jitter_duration(dose)
     }
 
     fn complete_ack_through<Q: PublicationLog>(
@@ -872,24 +1188,6 @@ impl<T: QwpWsCoreTransport> QwpWsSendCore<T> {
         self.complete_ready_durable(store)
     }
 
-    fn apply_durable_reject<Q: PublicationLog>(
-        &mut self,
-        store: &mut QwpWsPublicationStore<Q>,
-        wire_seq: u64,
-        effect_wire_seq: u64,
-        fsn: u64,
-        error: QwpServerError,
-        policy: QwpWsErrorPolicy,
-    ) -> Result<DriveOutcome, DriverError> {
-        self.send_cursor.ack_through(fsn);
-        let tracker = self.durable_ack.as_mut().expect("durable ACK mode");
-        tracker.enqueue_rejected(effect_wire_seq, fsn);
-        self.complete_ready_durable(store)?;
-        store.record_rejected_frame(fsn, wire_seq, error, policy);
-        store.push_event(DriverEvent::Rejected { fsn, wire_seq });
-        Ok(DriveOutcome::Rejected { fsn, wire_seq })
-    }
-
     fn complete_ready_durable<Q: PublicationLog>(
         &mut self,
         store: &mut QwpWsPublicationStore<Q>,
@@ -900,16 +1198,8 @@ impl<T: QwpWsCoreTransport> QwpWsSendCore<T> {
             .as_mut()
             .and_then(DurableAckTracker::pop_ready)
         {
-            match resolved {
-                DurableResolvedFrame::Ok(completion) => {
-                    self.complete_through(store, completion.fsn, completion.wire_seq)?;
-                    highest_resolved_wire_seq = Some(completion.wire_seq);
-                }
-                DurableResolvedFrame::Rejected { wire_seq, fsn } => {
-                    self.complete_through(store, fsn, wire_seq)?;
-                    highest_resolved_wire_seq = Some(wire_seq);
-                }
-            }
+            self.complete_through(store, resolved.fsn, resolved.wire_seq)?;
+            highest_resolved_wire_seq = Some(resolved.wire_seq);
         }
         Ok(
             highest_resolved_wire_seq.map_or(DriveOutcome::Idle, |wire_seq| DriveOutcome::Acked {
@@ -930,6 +1220,7 @@ impl<T: QwpWsCoreTransport> QwpWsSendCore<T> {
             .map_err(DriverError::from)?;
         self.send_cursor.ack_through(fsn);
         if advanced {
+            self.poison_tracker.clear();
             store.record_completed_through_event(fsn, wire_seq);
         }
         Ok(DriveOutcome::Acked { wire_seq })
@@ -947,8 +1238,214 @@ impl<T: QwpWsCoreTransport> QwpWsSendCore<T> {
         outbound: OutboundFrame,
     ) -> (SentFrame, Result<TransportSendResult, TransportFailure>) {
         let frame = outbound.sent_frame();
-        let result = outbound.with_view(|view| self.transport.send_frame(view));
+        self.sends_on_connection = self.sends_on_connection.saturating_add(1);
+        // Split borrows so the mirror can capture the payload alongside the
+        // transport. `accumulate` is a no-op in full-dict mode.
+        let transport = &mut self.transport;
+        let dict_mirror = &mut self.dict_mirror;
+        let result = outbound.with_view(|view| {
+            let payload = view.payload;
+            let sent = transport.send_frame(view);
+            if sent.is_ok() {
+                // The frame's delta is on the wire; mirror the symbols it
+                // introduced so a later reconnect can re-register them.
+                dict_mirror.accumulate(payload);
+            }
+            sent
+        });
         (frame, result)
+    }
+
+    /// Torn-dictionary guard, checked just before a store-and-forward frame is
+    /// sent. A replayed delta frame whose base (`delta_start`) exceeds the symbols
+    /// the mirror has re-registered on this connection references dictionary
+    /// entries a host/power crash tore away from the side-file (and that no
+    /// surviving earlier frame carries): the frame is unrecoverable, so fail
+    /// loudly rather than send the server a frame it cannot decode. `Ok(())` for
+    /// non-dict frames and self-sufficient (base-0) frames.
+    pub(crate) fn guard_dict_not_torn(&self, payload: &[u8]) -> Result<(), Error> {
+        let Some(delta_start) = frame_delta_start(payload) else {
+            return Ok(()); // not a delta-dict frame -> nothing to re-register
+        };
+        if !self.dict_mirror.is_enabled() {
+            // Full-dict (dense) mode: every legitimate frame re-ships its whole
+            // dictionary from id 0 and is self-sufficient (`delta_start == 0`). A
+            // base above 0 with the mirror disabled means either the foreground
+            // encoder emitted delta while the driver mirror stayed dense (a lockstep
+            // wiring bug) or a delta-encoded slot was reopened with delta disabled
+            // (e.g. its side-file could not be opened) -- in both cases no catch-up
+            // will re-register ids [0, delta_start), so replaying the frame would
+            // corrupt the server dictionary. Fail loud rather than send it.
+            if delta_start > 0 {
+                return Err(error::fmt!(
+                    StoreResendRequired,
+                    "QWP/WebSocket store-and-forward: a stored frame bases at symbol \
+                     id {} but delta symbol-dictionary mode is disabled on this \
+                     connection, so the dictionary it depends on cannot be \
+                     re-registered; the affected data must be resent",
+                    delta_start
+                ));
+            }
+            return Ok(());
+        }
+        // Mirror enabled. Two legitimate sources emit a frame whose `delta_start` is
+        // `<= registered` -- an overlap the server tolerates idempotently, exactly as
+        // the reconnect catch-up + replay of already-registered ids relies on: a
+        // replayed already-sent frame, and a mid-connection DENSE fallback
+        // (`delta_start = 0`, self-sufficient) produced after a failed side-file
+        // rollback dropped delta encoding on the foreground while this mirror -- which
+        // the foreground cannot reach across the I/O-thread boundary -- stayed enabled
+        // (see `SfaColumnBackend::rollback_frame` / `QwpWsReplayEncoder::rollback_frame`).
+        // Both are safe *iff* the overlapping bytes match the mirror; a *differing*
+        // redefinition of a held id is the torn case rejected by `conflicts_with`
+        // below, and `accumulate` folds only the non-overlapping suffix so the mirror
+        // stays in lockstep. A `delta_start` ABOVE the mirror is an unrecoverable gap.
+        let registered = u64::from(self.dict_mirror.count());
+        if delta_start > registered {
+            return Err(error::fmt!(
+                StoreResendRequired,
+                "QWP/WebSocket store-and-forward symbol dictionary is torn: a stored \
+                 frame references symbol id {} but only {} dictionary entries were \
+                 recovered (a host crash lost entries the frame depends on); the \
+                 affected data must be resent",
+                delta_start,
+                registered
+            ));
+        }
+        // Overlap without a gap: the frame re-registers ids the mirror already
+        // holds. That is a benign replay only if the symbols MATCH. The foreground
+        // dict is append-only, so a *differing* redefinition of an already-mirrored
+        // id can only mean the recovered history and the queued frames disagree (a
+        // host crash that tore the side-file so its recovered entries desynced from
+        // a later frame that reused those ids). `accumulate` would keep the stale
+        // mapping (it drops fully-overlapping regions), so the reconnect catch-up
+        // would re-register the wrong symbol and mis-decode later delta-less
+        // references -- silent corruption. Reject it as torn instead.
+        if self.dict_mirror.conflicts_with(payload) {
+            return Err(error::fmt!(
+                StoreResendRequired,
+                "QWP/WebSocket store-and-forward symbol dictionary is torn: a stored \
+                 frame redefines an already-registered symbol id to a different \
+                 symbol (the recovered dictionary disagrees with the queued frames, \
+                 most often a host crash that tore the side-file); the affected data \
+                 must be resent"
+            ));
+        }
+        Ok(())
+    }
+
+    /// Enables delta symbol-dict mode on this connection's send loop and seeds
+    /// the catch-up mirror from a recovered persisted dictionary (`seed_entries`
+    /// = the concatenated `[len][utf8]` region in id order, `seed_count`
+    /// entries). Called once at construction by the store when the slot's mode
+    /// supports delta (memory always; file iff the persisted dict opened). Pass
+    /// `(&[], 0)` to enable without a recovered dictionary (fresh memory-mode).
+    ///
+    /// A non-empty seed means this is a file-mode recovery / orphan-drain: the
+    /// queued frames are mid-stream deltas that reference a dictionary the fresh
+    /// server has never seen, so arm the catch-up to re-register it before the
+    /// first replay — exactly as [`Self::finish_reconnect_success`] does on a
+    /// reconnect. Without this, the initial connect replays a `delta_start > 0`
+    /// frame against an empty server dictionary (undecodable / silent
+    /// corruption). Redundant-but-safe when nothing was acked (seed count 0
+    /// stays disarmed; a seed covering already-registered ids reproduces the
+    /// tested reconnect-with-nothing-acked overlap case).
+    pub(crate) fn enable_delta_dict(&mut self, seed_entries: &[u8], seed_count: u32) {
+        self.dict_mirror = SentDictMirror::new(true);
+        self.dict_mirror.seed(seed_entries, seed_count);
+        self.catch_up_pending = !self.dict_mirror.is_empty();
+    }
+
+    /// Sends the full-dictionary catch-up frame(s) on the freshly reconnected
+    /// transport — split so none exceeds the server's batch cap — and returns how
+    /// many were sent (they consume wire seqs `[0, n)`). The caller then calls
+    /// [`SendCursor::begin_catch_up`] so the queued replay frames map onto
+    /// `fsn_at_zero`. Only invoked when the mirror is enabled and non-empty.
+    fn emit_dict_catch_up(&mut self) -> Result<u64, DictCatchUpError> {
+        let cap = self.transport.server_max_batch_size();
+        let version = self.transport.negotiated_qwp_version();
+        // Stream the catch-up frame(s): build, send, drop each before the next, so
+        // only one frame is resident rather than a second copy of the whole
+        // dictionary -- even on a flapping connection that repeats the catch-up on
+        // every reconnect.
+        let transport = &mut self.transport;
+        let mut wire_seq = 0u64;
+        self.dict_mirror
+            .for_each_catch_up_frame(cap, version, |frame_bytes| {
+                // A catch-up frame carries no FSN; the transport only reads
+                // `payload` and correlates acks by `wire_seq`, so seqs [0, n) keep
+                // the FIFO ack stream aligned (their acks resolve to no real FSN --
+                // see `SendCursor::ack_fsn_for_wire_seq`).
+                let view = OutboundFrameView {
+                    fsn: 0,
+                    wire_seq,
+                    payload: frame_bytes,
+                };
+                wire_seq += 1;
+                transport.send_frame(view).map(|_| ())
+            })
+            .map_err(|e| match e {
+                CatchUpStreamError::EntryTooLarge(e) => DictCatchUpError::EntryTooLarge(e),
+                CatchUpStreamError::FrameBuildFailed => DictCatchUpError::FrameBuildFailed,
+                CatchUpStreamError::Emit(failure) => DictCatchUpError::Transport(failure),
+            })
+    }
+
+    /// If a reconnect armed the symbol-dict catch-up, emit the catch-up frame(s)
+    /// and set up the cursor; otherwise a no-op. Shared by the manual send path
+    /// ([`Self::drive_send_available`]) and the background runner's send loop, so
+    /// both re-register the whole dictionary before replaying delta frames. A
+    /// transport drop means reconnect again; an oversized entry is terminal.
+    pub(crate) fn drive_catch_up(&mut self) -> Result<(), CatchUpDriveError> {
+        if !self.catch_up_pending {
+            return Ok(());
+        }
+        self.catch_up_pending = false;
+        match self.emit_dict_catch_up() {
+            Ok(catch_up_frames) => {
+                self.send_cursor.begin_catch_up(catch_up_frames);
+                Ok(())
+            }
+            Err(DictCatchUpError::Transport(failure)) => Err(CatchUpDriveError::Transport(failure)),
+            Err(DictCatchUpError::EntryTooLarge(e)) => {
+                // Decided entirely client-side from the server's advertised batch
+                // cap -- nothing was sent back -- so this is `BatchTooLarge` (the
+                // same code the foreground uses for a frame that overflows the cap
+                // in publish_chunk_sfa / publish_arrow_sfa), not `ServerFlushError`
+                // ("error sent back from the server").
+                //
+                // The foreground marks this terminal (the caller learns at once to
+                // resend / investigate), whereas an orphan drainer maps the same
+                // condition to RetryLater. The asymmetry is intentional and does not
+                // abandon data: `mark_terminal` only records the error -- it never
+                // deletes the slot's segments or side-file -- so a disk slot's queued
+                // frames stay on disk and a later orphan drain / borrow re-attempts
+                // them, giving a failover to a larger-cap endpoint another chance. (A
+                // single symbol larger than a server's batch cap -- caps are MBs,
+                // symbols tiny -- is essentially unreachable in practice.)
+                Err(CatchUpDriveError::Terminal(error::fmt!(
+                    BatchTooLarge,
+                    "QWP/WebSocket symbol dictionary entry ({} bytes) exceeds the server \
+                 batch cap ({} bytes) during reconnect catch-up; cannot re-register \
+                 the dictionary -- resend required",
+                    e.entry_bytes,
+                    e.budget
+                )))
+            }
+            Err(DictCatchUpError::FrameBuildFailed) => {
+                // Building a catch-up frame failed (allocation, or a payload beyond
+                // the QWP u32 length field). Like EntryTooLarge this only records the
+                // error -- it never deletes the slot's segments or side-file -- so a
+                // disk slot's queued frames stay on disk for a later orphan drain /
+                // borrow to retry; no recoverable data is abandoned.
+                Err(CatchUpDriveError::Terminal(error::fmt!(
+                    SocketError,
+                    "QWP/WebSocket reconnect catch-up could not build a symbol-dictionary \
+                     frame (allocation failed or payload too large); queued data is \
+                     preserved for a later retry"
+                )))
+            }
+        }
     }
 
     pub(crate) fn finish_send_result<Q: PublicationLog>(
@@ -964,7 +1461,7 @@ impl<T: QwpWsCoreTransport> QwpWsSendCore<T> {
             }
             QwpWsHotSendProgress::Response { frame, response } => {
                 store.record_sent_event(frame);
-                self.apply_response(store, response)
+                self.apply_response(store, response, false)
                     .map(QwpWsSendProgress::Outcome)
             }
             QwpWsHotSendProgress::TransportFailure { frame, failure } => {
@@ -1008,7 +1505,15 @@ impl<T: QwpWsCoreTransport> QwpWsSendCore<T> {
         store: &mut QwpWsPublicationStore<Q>,
         response: TransportResponse,
     ) -> Result<DriveOutcome, DriverError> {
-        self.apply_response(store, response)
+        self.apply_response(store, response, false)
+    }
+
+    pub(crate) fn finish_response_defer_reconnect<Q: PublicationLog>(
+        &mut self,
+        store: &mut QwpWsPublicationStore<Q>,
+        response: TransportResponse,
+    ) -> Result<DriveOutcome, DriverError> {
+        self.apply_response(store, response, true)
     }
 
     pub(crate) fn finish_ack_response_sfa(
@@ -1023,6 +1528,9 @@ impl<T: QwpWsCoreTransport> QwpWsSendCore<T> {
             .complete_through_fsn(fsn)
             .map_err(DriverError::from)?;
         self.send_cursor.ack_through(fsn);
+        if advanced {
+            self.poison_tracker.clear();
+        }
         let event = advanced.then_some(DriverEvent::CompletedThrough {
             fsn,
             wire_seq: ack_wire_seq,
@@ -1032,7 +1540,8 @@ impl<T: QwpWsCoreTransport> QwpWsSendCore<T> {
                 wire_seq: ack_wire_seq,
             },
             event,
-        ))
+        )
+        .with_ok_fsn(fsn))
     }
 
     pub(crate) fn finish_durable_ok_response_sfa(
@@ -1054,7 +1563,7 @@ impl<T: QwpWsCoreTransport> QwpWsSendCore<T> {
             .is_some_and(|tracker| tracker.pending_wire_seq_for_fsn(fsn).is_some())
         {
             self.send_cursor.ack_through(fsn);
-            return Ok(QwpWsHotResponseProgress::idle());
+            return Ok(QwpWsHotResponseProgress::idle().with_ok_fsn(fsn));
         }
         if progress
             .completed_fsn()
@@ -1066,13 +1575,14 @@ impl<T: QwpWsCoreTransport> QwpWsSendCore<T> {
                     wire_seq: ack_wire_seq,
                 },
                 events: Vec::new(),
+                ok_fsn: Some(fsn),
             });
         }
 
         self.send_cursor.ack_through(fsn);
         let tracker = self.durable_ack.as_mut().expect("durable ACK mode");
         tracker.enqueue_ok(ack_wire_seq, fsn, table_seq_txns);
-        self.complete_ready_durable_sfa(progress)
+        Ok(self.complete_ready_durable_sfa(progress)?.with_ok_fsn(fsn))
     }
 
     pub(crate) fn finish_durable_ack_response_sfa(
@@ -1098,24 +1608,25 @@ impl<T: QwpWsCoreTransport> QwpWsSendCore<T> {
             .as_mut()
             .and_then(DurableAckTracker::pop_ready)
         {
-            let (wire_seq, fsn) = match resolved {
-                DurableResolvedFrame::Ok(completion) => (completion.wire_seq, completion.fsn),
-                DurableResolvedFrame::Rejected { wire_seq, fsn } => (wire_seq, fsn),
-            };
             let advanced = progress
-                .complete_through_fsn(fsn)
+                .complete_through_fsn(resolved.fsn)
                 .map_err(DriverError::from)?;
-            self.send_cursor.ack_through(fsn);
+            self.send_cursor.ack_through(resolved.fsn);
             if advanced {
-                events.push(DriverEvent::CompletedThrough { fsn, wire_seq });
+                self.poison_tracker.clear();
+                events.push(DriverEvent::CompletedThrough {
+                    fsn: resolved.fsn,
+                    wire_seq: resolved.wire_seq,
+                });
             }
-            highest_resolved_wire_seq = Some(wire_seq);
+            highest_resolved_wire_seq = Some(resolved.wire_seq);
         }
         Ok(QwpWsHotResponseProgress {
             outcome: highest_resolved_wire_seq.map_or(DriveOutcome::Idle, |wire_seq| {
                 DriveOutcome::Acked { wire_seq }
             }),
             events,
+            ok_fsn: None,
         })
     }
 
@@ -1150,10 +1661,31 @@ impl<T: QwpWsCoreTransport> QwpWsSendCore<T> {
             TransportFailure::Disconnect(initial_error) => QwpWsTransportFailureAction::Reconnect {
                 reason: ReconnectReason::Disconnect,
                 initial_error,
+                pace: Duration::ZERO,
             },
+            TransportFailure::ServerClose(initial_error) => {
+                if self.sends_on_connection == 0 {
+                    return QwpWsTransportFailureAction::Reconnect {
+                        reason: ReconnectReason::Disconnect,
+                        initial_error,
+                        pace: Duration::ZERO,
+                    };
+                }
+                if let Some(error) = self.server_close_poison_error(store) {
+                    QwpWsTransportFailureAction::Terminal(error)
+                } else {
+                    let pace = self.reconnect_pace_for_strikes(self.poison_tracker.strikes());
+                    QwpWsTransportFailureAction::Reconnect {
+                        reason: ReconnectReason::Disconnect,
+                        initial_error,
+                        pace,
+                    }
+                }
+            }
             TransportFailure::Retryable(initial_error) => QwpWsTransportFailureAction::Reconnect {
                 reason: ReconnectReason::RetryableFailure,
                 initial_error,
+                pace: Duration::ZERO,
             },
             TransportFailure::Terminal(error) => {
                 store.mark_terminal(Some(error.clone()));
@@ -1161,10 +1693,33 @@ impl<T: QwpWsCoreTransport> QwpWsSendCore<T> {
             }
             TransportFailure::ProtocolViolation { close_code, reason } => {
                 let error = store.record_protocol_violation(close_code, reason);
-                store.mark_terminal(Some(error.clone()));
                 QwpWsTransportFailureAction::Terminal(error)
             }
         }
+    }
+
+    fn server_close_poison_error<Q: PublicationLog>(
+        &mut self,
+        store: &mut QwpWsPublicationStore<Q>,
+    ) -> Option<Error> {
+        let fsn = store.queue.oldest_unresolved_fsn()?;
+        let now = Instant::now();
+        if self.poison_tracker.record_failure(
+            fsn,
+            store.queue.completed_fsn(),
+            self.max_frame_rejections,
+            self.poison_min_escalation_window,
+            now,
+        ) {
+            let strikes = self.poison_tracker.strikes();
+            return Some(store.record_protocol_violation(
+                None,
+                format!(
+                    "QWP/WebSocket frame fsn {fsn} was closed {strikes} times without ACK progress"
+                ),
+            ));
+        }
+        None
     }
 
     pub(crate) fn restart_connection(
@@ -1181,6 +1736,14 @@ impl<T: QwpWsCoreTransport> QwpWsSendCore<T> {
         initial_error: Error,
     ) -> QwpWsReconnectState {
         QwpWsReconnectState::new(self.reconnect_policy, context, reason, initial_error)
+    }
+
+    pub(crate) fn has_pending_reconnect(&self) -> bool {
+        self.pending_reconnect.is_some()
+    }
+
+    pub(crate) fn take_pending_reconnect(&mut self) -> Option<QwpWsReconnectState> {
+        self.pending_reconnect.take()
     }
 
     pub(crate) fn reconnect_once(
@@ -1217,6 +1780,7 @@ impl<T: QwpWsCoreTransport> QwpWsSendCore<T> {
         reason: ReconnectReason,
     ) -> DriveOutcome {
         self.pending_reconnect = None;
+        self.sends_on_connection = 0;
         self.send_cursor.restart(&store.queue);
         if self.durable_ack.is_some() {
             store.clear_unresolved_rejected_frames();
@@ -1224,9 +1788,32 @@ impl<T: QwpWsCoreTransport> QwpWsSendCore<T> {
         if let Some(tracker) = self.durable_ack.as_mut() {
             tracker.reset();
         }
+        // Delta mode: the fresh server's dictionary is empty. Arm the catch-up so
+        // the next send iteration re-registers the whole dictionary before the
+        // queued delta frames (which reference ids above 0) replay.
+        self.catch_up_pending = self.dict_mirror.is_enabled() && !self.dict_mirror.is_empty();
         store.counters.total_reconnects_succeeded += 1;
         store.push_event(DriverEvent::Reconnected { reason });
         DriveOutcome::Reconnected { reason }
+    }
+
+    fn continue_or_defer_reconnect<Q: PublicationLog>(
+        &mut self,
+        store: &mut QwpWsPublicationStore<Q>,
+        defer_reconnect: bool,
+    ) -> Result<DriveOutcome, DriverError> {
+        if defer_reconnect {
+            let deadline = self
+                .pending_reconnect
+                .as_ref()
+                .and_then(QwpWsReconnectState::deadline);
+            Ok(DriveOutcome::ReconnectDelay {
+                sleep_for: Duration::ZERO,
+                deadline,
+            })
+        } else {
+            self.continue_reconnect(store)
+        }
     }
 
     fn continue_reconnect<Q: PublicationLog>(
@@ -1236,6 +1823,14 @@ impl<T: QwpWsCoreTransport> QwpWsSendCore<T> {
         let Some(mut reconnect) = self.pending_reconnect.take() else {
             return Ok(DriveOutcome::Idle);
         };
+        if let Some(sleep_for) = reconnect.take_first_attempt_pace() {
+            let deadline = reconnect.deadline();
+            self.pending_reconnect = Some(reconnect);
+            return Ok(DriveOutcome::ReconnectDelay {
+                sleep_for,
+                deadline,
+            });
+        }
         // Mirrors the background runner's pre-attempt bump in
         // reconnect_with_policy so manual-mode drivers expose the same
         // cumulative counter.
@@ -1253,8 +1848,24 @@ impl<T: QwpWsCoreTransport> QwpWsSendCore<T> {
                 })
             }
             QwpWsReconnectStep::Terminal(error) => {
-                store.mark_terminal(Some(error));
-                Ok(DriveOutcome::Terminal)
+                if reconnect_error_is_terminal(&error) {
+                    store.mark_terminal(Some(error));
+                    Ok(DriveOutcome::Terminal)
+                } else {
+                    let sleep_for = reconnect.policy.initial_backoff();
+                    let next = QwpWsReconnectState::new(
+                        reconnect.policy,
+                        reconnect.context,
+                        reconnect.reason,
+                        error,
+                    );
+                    let deadline = next.deadline();
+                    self.pending_reconnect = Some(next);
+                    Ok(DriveOutcome::ReconnectDelay {
+                        sleep_for,
+                        deadline,
+                    })
+                }
             }
         }
     }
@@ -1496,10 +2107,24 @@ impl<T: QwpWsCoreTransport> QwpWsSendCore<T> {
         &mut self,
         store: &mut QwpWsPublicationStore<Q>,
     ) -> Result<Option<DriveOutcome>, DriverError> {
+        match self.drive_catch_up() {
+            Ok(()) => {}
+            Err(CatchUpDriveError::Transport(failure)) => {
+                return Ok(Some(self.apply_transport_failure(store, failure)?));
+            }
+            Err(CatchUpDriveError::Terminal(err)) => {
+                store.mark_terminal(Some(err));
+                return Ok(Some(DriveOutcome::Terminal));
+            }
+        }
         let progress = store.progress_view();
         let Some(outbound) = self.next_outbound_sfa_frame(&progress)? else {
             return Ok(None);
         };
+        if let Err(err) = outbound.with_view(|view| self.guard_dict_not_torn(view.payload)) {
+            store.mark_terminal(Some(err));
+            return Ok(Some(DriveOutcome::Terminal));
+        }
 
         let (frame, send_result) = self.send_frame(outbound);
         let send_result = match send_result {
@@ -1525,9 +2150,12 @@ impl<T: QwpWsCoreTransport> QwpWsSendCore<T> {
             QwpWsTransportFailureAction::Reconnect {
                 reason,
                 initial_error,
+                pace,
             } => {
-                self.pending_reconnect =
-                    Some(self.begin_reconnect("QWP/WebSocket reconnect", reason, initial_error));
+                self.pending_reconnect = Some(
+                    self.begin_reconnect("QWP/WebSocket reconnect", reason, initial_error)
+                        .with_pace(pace),
+                );
                 self.continue_reconnect(store)
             }
             QwpWsTransportFailureAction::Terminal(error) => {
@@ -1586,6 +2214,26 @@ impl<Q: PublicationLog, T: QwpWsCoreTransport> QwpWsCoreTestHarness<Q, T> {
                 max_in_flight,
                 reconnect_policy,
                 durable_ack,
+            ),
+        }
+    }
+
+    pub(crate) fn from_queue_with_rejection_limit_and_window(
+        queue: Q,
+        transport: T,
+        max_frame_rejections: usize,
+        poison_min_escalation_window: Duration,
+    ) -> Self {
+        let max_in_flight = queue.max_in_flight();
+        Self {
+            store: QwpWsPublicationStore::new(queue, DEFAULT_EVENT_CAPACITY),
+            send_core: QwpWsSendCore::new_with_durable_ack_and_rejection_limit(
+                transport,
+                max_in_flight,
+                ReconnectPolicy::no_backoff(Duration::MAX),
+                false,
+                max_frame_rejections,
+                poison_min_escalation_window,
             ),
         }
     }
@@ -1841,9 +2489,15 @@ pub(super) fn reconnect_attempt_error(err: DriverError) -> Result<Error, DriverE
 }
 
 pub(crate) fn reconnect_error_is_terminal(err: &Error) -> bool {
+    if is_qwp_ws_role_reject_error(err) {
+        return false;
+    }
     matches!(
         err.code(),
-        ErrorCode::AuthError | ErrorCode::ProtocolVersionError
+        ErrorCode::AuthError
+            | ErrorCode::ConfigError
+            | ErrorCode::ProtocolVersionError
+            | ErrorCode::StoreResendRequired
     )
 }
 
@@ -1857,6 +2511,32 @@ fn reconnect_deadline_expired(deadline: Option<Instant>) -> bool {
 
 fn double_duration(duration: Duration) -> Duration {
     duration.checked_mul(2).unwrap_or(Duration::MAX)
+}
+
+fn pace_dose(initial_backoff: Duration, max_backoff: Duration, strikes: usize) -> Duration {
+    if initial_backoff.is_zero() {
+        return Duration::ZERO;
+    }
+    let shift = strikes.max(1).saturating_sub(1).min(6) as u32;
+    initial_backoff
+        .checked_mul(1u32 << shift)
+        .unwrap_or(Duration::MAX)
+        .min(max_backoff)
+}
+
+#[cfg(feature = "sync-sender-qwp-ws")]
+fn pace_jitter_duration(dose: Duration) -> Duration {
+    let dose_nanos = dose.as_nanos().min(u128::from(u64::MAX)) as u64;
+    if dose_nanos == 0 {
+        return dose;
+    }
+    let extra = rand::rng().random_range(0..dose_nanos);
+    Duration::from_nanos(dose_nanos.saturating_add(extra))
+}
+
+#[cfg(not(feature = "sync-sender-qwp-ws"))]
+fn pace_jitter_duration(dose: Duration) -> Duration {
+    dose
 }
 
 #[cfg(feature = "sync-sender-qwp-ws")]
@@ -1889,6 +2569,28 @@ pub(super) fn reconnect_sleep_duration(
     } else {
         centered_jitter_duration(backoff)
     }
+}
+
+/// One reconnect backoff step for the column-sender re-borrow loop, matching the
+/// row runner's discipline: returns the delay to sleep before the next attempt
+/// (role-reject → fixed `initial_backoff`; else centered-jittered `backoff`) and
+/// the updated `backoff` state (role-reject resets to `initial_backoff`; else
+/// doubles, capped at `max_backoff`).
+#[cfg(feature = "sync-sender-qwp-ws")]
+pub(crate) fn reconnect_backoff_step(
+    err: &Error,
+    initial_backoff: Duration,
+    max_backoff: Duration,
+    backoff: Duration,
+) -> (Duration, Duration) {
+    let role_reject = is_qwp_ws_role_reject_error(err);
+    let sleep_for = reconnect_sleep_duration(role_reject, initial_backoff, backoff);
+    let next_backoff = if role_reject {
+        initial_backoff
+    } else {
+        double_duration(backoff).min(max_backoff)
+    };
+    (sleep_for, next_backoff)
 }
 
 pub(super) fn retry_budget_exhausted_error(
@@ -1968,6 +2670,12 @@ pub(crate) struct SendCursor {
     fsn_at_zero: Option<u64>,
     next_fsn: Option<u64>,
     next_wire_seq: u64,
+    /// Number of out-of-band symbol-dict catch-up frames prepended on the
+    /// current connection. They occupy wire seqs `[0, catch_up_offset)`; real
+    /// replay frames start at `catch_up_offset` and map to `fsn_at_zero` onward.
+    /// 0 whenever no catch-up was sent (always, in full-dict mode), so the
+    /// mapping is unchanged there. Reset by [`Self::restart`].
+    catch_up_offset: u64,
     last_sent_wire_seq: Option<u64>,
     in_flight: VecDeque<SentFrame>,
     sfa_cursor: Option<SfaSendCursor>,
@@ -1980,6 +2688,7 @@ impl SendCursor {
             fsn_at_zero: None,
             next_fsn: None,
             next_wire_seq: 0,
+            catch_up_offset: 0,
             last_sent_wire_seq: None,
             in_flight: VecDeque::new(),
             sfa_cursor: None,
@@ -2049,8 +2758,11 @@ impl SendCursor {
             return Ok(None);
         };
         let effect_wire_seq = wire_seq.min(last_sent_wire_seq);
+        let Some(real_delta) = effect_wire_seq.checked_sub(self.catch_up_offset) else {
+            return Ok(None); // a catch-up frame; no real FSN to resolve
+        };
         let fsn = fsn_at_zero
-            .checked_add(effect_wire_seq)
+            .checked_add(real_delta)
             .ok_or(DriverError::Queue(QueueError::SequenceOverflow))?;
         Ok(Some((fsn, effect_wire_seq)))
     }
@@ -2063,8 +2775,14 @@ impl SendCursor {
             return Ok(None);
         };
         let ack_wire_seq = wire_seq.min(last_sent_wire_seq);
+        // Catch-up frames occupy wire seqs [0, catch_up_offset); their acks map to
+        // no real FSN (a harmless no-op — nothing to complete). Real replay frames
+        // start at catch_up_offset and map onto fsn_at_zero.
+        let Some(real_delta) = ack_wire_seq.checked_sub(self.catch_up_offset) else {
+            return Ok(None);
+        };
         let fsn = fsn_at_zero
-            .checked_add(ack_wire_seq)
+            .checked_add(real_delta)
             .ok_or(DriverError::Queue(QueueError::SequenceOverflow))?;
         Ok(Some((fsn, ack_wire_seq)))
     }
@@ -2084,8 +2802,19 @@ impl SendCursor {
         self.fsn_at_zero = log.oldest_unresolved_fsn();
         self.next_fsn = self.fsn_at_zero;
         self.next_wire_seq = 0;
+        self.catch_up_offset = 0;
         self.last_sent_wire_seq = None;
         self.sfa_cursor = None;
+    }
+
+    /// Records that `catch_up_frames` out-of-band symbol-dict catch-up frames
+    /// were sent on the fresh connection ahead of the queued replay frames. The
+    /// wire seqs they occupy (`[0, catch_up_frames)`) map to no real FSN, and the
+    /// first replay frame lands at `fsn_at_zero`. Must be called immediately
+    /// after [`Self::restart`], before any real frame is sent.
+    fn begin_catch_up(&mut self, catch_up_frames: u64) {
+        self.catch_up_offset = catch_up_frames;
+        self.next_wire_seq = catch_up_frames;
     }
 
     fn wire_seq_for_fsn(&self, fsn: u64) -> Option<u64> {
@@ -2116,6 +2845,19 @@ pub(crate) trait QwpWsCoreTransport {
     fn restart_connection(&mut self, _reason: ReconnectReason) -> Result<(), DriverError> {
         Ok(())
     }
+
+    /// The server's advertised max batch size in bytes, or 0 when the server
+    /// advertised no cap. Used to split symbol-dict catch-up frames on reconnect
+    /// so no single frame exceeds it. Defaults to uncapped for test transports.
+    fn server_max_batch_size(&self) -> usize {
+        0
+    }
+
+    /// The negotiated QWP protocol version, written into catch-up frame headers.
+    /// Defaults to v1 (the only version) for test transports.
+    fn negotiated_qwp_version(&self) -> u8 {
+        1
+    }
 }
 
 #[cfg(feature = "sync-sender-qwp-ws")]
@@ -2125,6 +2867,7 @@ pub(crate) struct BlockingQwpWsTransport {
     tracker: QwpWsHostHealthTracker,
     use_tls: bool,
     tls_settings: Option<TlsSettings>,
+    connect_kind: QwpWsConnectKind,
     qwp_ws: QwpWsConfig,
     auth_header: Option<String>,
     negotiated_version: u8,
@@ -2138,11 +2881,13 @@ pub(crate) struct BlockingQwpWsTransport {
 
 #[cfg(feature = "sync-sender-qwp-ws")]
 impl BlockingQwpWsTransport {
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn connect(
         host: impl Into<String>,
         port: impl Into<String>,
         use_tls: bool,
         tls_settings: Option<TlsSettings>,
+        connect_kind: QwpWsConnectKind,
         qwp_ws: QwpWsConfig,
         auth_header: Option<String>,
         server_max_batch_size: Arc<AtomicUsize>,
@@ -2156,16 +2901,20 @@ impl BlockingQwpWsTransport {
             &endpoints,
             &mut tracker,
             &mut previous_idx,
+            None,
             use_tls,
             tls_settings.clone(),
+            connect_kind,
             &qwp_ws,
             auth_header.as_deref(),
+            qwp_ws.conn_events.as_deref(),
         )?;
         Ok(Self::from_connected(
             endpoints,
             tracker,
             use_tls,
             tls_settings,
+            connect_kind,
             qwp_ws,
             auth_header,
             server_max_batch_size,
@@ -2179,18 +2928,20 @@ impl BlockingQwpWsTransport {
         tracker: QwpWsHostHealthTracker,
         use_tls: bool,
         tls_settings: Option<TlsSettings>,
+        connect_kind: QwpWsConnectKind,
         qwp_ws: QwpWsConfig,
         auth_header: Option<String>,
         server_max_batch_size: Arc<AtomicUsize>,
         connected: QwpWsConnectRoundSuccess,
     ) -> Self {
-        server_max_batch_size.store(connected.server_max_batch_size, Ordering::Relaxed);
-        Self {
+        server_max_batch_size.store(connected.server_max_batch_size, Ordering::Release);
+        let transport = Self {
             endpoints,
             previous_idx: Some(connected.endpoint_idx),
             tracker,
             use_tls,
             tls_settings,
+            connect_kind,
             qwp_ws,
             auth_header,
             negotiated_version: connected.negotiated_version,
@@ -2200,34 +2951,57 @@ impl BlockingQwpWsTransport {
             send_buf: Vec::with_capacity(16 * 1024),
             pending_wire_sequences: VecDeque::new(),
             last_durable_keepalive_ping: None,
-        }
+        };
+        transport.emit_connect_succeeded();
+        transport
     }
 
     pub(crate) fn negotiated_version(&self) -> u8 {
         self.negotiated_version
     }
 
-    fn reconnect(&mut self) -> Result<(), DriverError> {
+    fn reconnect(&mut self, reason: ReconnectReason) -> Result<(), DriverError> {
+        if matches!(self.connect_kind, QwpWsConnectKind::Foreground)
+            && let Some(events) = self.qwp_ws.conn_events.as_deref()
+            && let Some(idx) = self.previous_idx
+            && let Some(endpoint) = self.endpoints.get(idx)
+        {
+            events.disconnected(&endpoint.host, &endpoint.port);
+        }
         let connected = connect_qwp_ws_endpoint_round(
             &self.endpoints,
             &mut self.tracker,
             &mut self.previous_idx,
+            Some(reason),
             self.use_tls,
             self.tls_settings.clone(),
+            self.connect_kind,
             &self.qwp_ws,
             self.auth_header.as_deref(),
+            self.qwp_ws.conn_events.as_deref(),
         )
         .map_err(DriverError::Transport)?;
         self.previous_idx = Some(connected.endpoint_idx);
         self.stream = connected.stream;
         self.negotiated_version = connected.negotiated_version;
         self.server_max_batch_size
-            .store(connected.server_max_batch_size, Ordering::Relaxed);
+            .store(connected.server_max_batch_size, Ordering::Release);
         self.reader = WsFrameReader::with_initial_input(connected.leftover);
         self.send_buf.clear();
         self.pending_wire_sequences.clear();
         self.last_durable_keepalive_ping = None;
+        self.emit_connect_succeeded();
         Ok(())
+    }
+
+    fn emit_connect_succeeded(&self) {
+        if matches!(self.connect_kind, QwpWsConnectKind::Foreground)
+            && let Some(events) = self.qwp_ws.conn_events.as_deref()
+            && let Some(idx) = self.previous_idx
+            && let Some(endpoint) = self.endpoints.get(idx)
+        {
+            events.connect_succeeded(&endpoint.host, &endpoint.port);
+        }
     }
 
     fn complete_pending_through(&mut self, sequence: u64) {
@@ -2301,16 +3075,11 @@ impl QwpWsCoreTransport for BlockingQwpWsTransport {
             .reader
             .try_read_one(&mut self.stream, &mut self.send_buf)
             .map_err(|err| match err {
-                super::qwp_ws::WsMessageError::Close(close) => {
-                    if let Some(close_code) = close.code
-                        && super::qwp_ws::is_terminal_ws_close_code(close_code)
-                    {
-                        return TransportFailure::ProtocolViolation {
-                            close_code: Some(close_code),
-                            reason: close.reason,
-                        };
-                    }
+                super::qwp_ws::WsMessageError::Close(close) if close.is_orderly() => {
                     TransportFailure::Disconnect(close.into_error())
+                }
+                super::qwp_ws::WsMessageError::Close(close) => {
+                    TransportFailure::ServerClose(close.into_error())
                 }
                 super::qwp_ws::WsMessageError::ProtocolViolation(reason) => {
                     TransportFailure::ProtocolViolation {
@@ -2333,7 +3102,7 @@ impl QwpWsCoreTransport for BlockingQwpWsTransport {
                 WsFrameRead::Message { .. } => unreachable!(),
             });
         };
-        if opcode != WS_OPCODE_BINARY {
+        if opcode != OPCODE_BINARY {
             self.reader.clear_message();
             return Err(TransportFailure::ProtocolViolation {
                 close_code: None,
@@ -2419,9 +3188,39 @@ impl QwpWsCoreTransport for BlockingQwpWsTransport {
         Ok(TransportSendResult::NoResponse)
     }
 
-    fn restart_connection(&mut self, _reason: ReconnectReason) -> Result<(), DriverError> {
-        self.reconnect()
+    fn restart_connection(&mut self, reason: ReconnectReason) -> Result<(), DriverError> {
+        self.reconnect(reason)
     }
+
+    fn server_max_batch_size(&self) -> usize {
+        self.server_max_batch_size.load(Ordering::Acquire)
+    }
+
+    fn negotiated_qwp_version(&self) -> u8 {
+        self.negotiated_version
+    }
+}
+
+/// Failure emitting the reconnect symbol-dict catch-up (see
+/// [`QwpWsSendCore::emit_dict_catch_up`]).
+enum DictCatchUpError {
+    /// The transport dropped while sending a catch-up frame; recover by
+    /// reconnecting again.
+    Transport(TransportFailure),
+    /// A single dictionary entry does not fit the server's batch cap, so the
+    /// dictionary cannot be re-registered on the fresh server; terminal.
+    EntryTooLarge(CatchUpEntryTooLarge),
+    /// A catch-up frame could not be built (allocation failed, or its payload
+    /// would overflow the QWP u32 length field). Nothing was sent; the queued
+    /// data stays persisted for a later drain / borrow to retry.
+    FrameBuildFailed,
+}
+
+/// Outcome of [`QwpWsSendCore::drive_catch_up`] that the caller must act on: a
+/// transport drop (reconnect again) or a terminal error (fail the sender).
+pub(crate) enum CatchUpDriveError {
+    Transport(TransportFailure),
+    Terminal(Error),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -2472,19 +3271,29 @@ fn server_error_category(status: u8) -> QwpWsErrorCategory {
         codec::WS_STATUS_INTERNAL_ERROR => QwpWsErrorCategory::InternalError,
         codec::WS_STATUS_SECURITY_ERROR => QwpWsErrorCategory::SecurityError,
         codec::WS_STATUS_WRITE_ERROR => QwpWsErrorCategory::WriteError,
+        codec::WS_STATUS_NOT_WRITABLE => QwpWsErrorCategory::NotWritable,
         _ => QwpWsErrorCategory::Unknown,
     }
 }
 
 fn server_error_policy(status: u8) -> QwpWsErrorPolicy {
     match status {
-        codec::WS_STATUS_SCHEMA_MISMATCH | codec::WS_STATUS_WRITE_ERROR => {
-            QwpWsErrorPolicy::DropAndContinue
+        codec::WS_STATUS_WRITE_ERROR | codec::WS_STATUS_INTERNAL_ERROR => {
+            QwpWsErrorPolicy::Retriable
         }
-        codec::WS_STATUS_PARSE_ERROR
-        | codec::WS_STATUS_INTERNAL_ERROR
-        | codec::WS_STATUS_SECURITY_ERROR => QwpWsErrorPolicy::Halt,
-        _ => QwpWsErrorPolicy::Halt,
+        codec::WS_STATUS_NOT_WRITABLE => QwpWsErrorPolicy::RetriableOther,
+        codec::WS_STATUS_SCHEMA_MISMATCH
+        | codec::WS_STATUS_PARSE_ERROR
+        | codec::WS_STATUS_SECURITY_ERROR => QwpWsErrorPolicy::Terminal,
+        _ => QwpWsErrorPolicy::Retriable,
+    }
+}
+
+fn reconnect_reason_for_policy(policy: QwpWsErrorPolicy) -> ReconnectReason {
+    match policy {
+        QwpWsErrorPolicy::Retriable => ReconnectReason::RetryableFailure,
+        QwpWsErrorPolicy::RetriableOther => ReconnectReason::NotWritable,
+        QwpWsErrorPolicy::Terminal => ReconnectReason::RetryableFailure,
     }
 }
 
@@ -2599,6 +3408,7 @@ fn sleep_until_drive_deadline(deadline: Option<Instant>) {
 pub(crate) enum ReconnectReason {
     Disconnect,
     RetryableFailure,
+    NotWritable,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2641,6 +3451,7 @@ pub(crate) enum TransportSendResult {
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) enum TransportFailure {
     Disconnect(Error),
+    ServerClose(Error),
     Retryable(Error),
     Terminal(Error),
     ProtocolViolation {
@@ -2714,22 +3525,12 @@ enum PendingDurableFrame {
         fsn: u64,
         table_seq_txns: Vec<TableSeqTxn>,
     },
-    Rejected {
-        wire_seq: u64,
-        fsn: u64,
-    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct DurableCompletion {
     wire_seq: u64,
     fsn: u64,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum DurableResolvedFrame {
-    Ok(DurableCompletion),
-    Rejected { wire_seq: u64, fsn: u64 },
 }
 
 impl DurableAckTracker {
@@ -2755,11 +3556,6 @@ impl DurableAckTracker {
             fsn,
             table_seq_txns,
         });
-    }
-
-    fn enqueue_rejected(&mut self, wire_seq: u64, fsn: u64) {
-        self.pending
-            .push_back(PendingDurableFrame::Rejected { wire_seq, fsn });
     }
 
     fn apply_ack(&mut self, table_seq_txns: Vec<TableSeqTxn>) {
@@ -2789,34 +3585,19 @@ impl DurableAckTracker {
             if next_fsn >= end_before_fsn {
                 return true;
             }
-            match entry {
-                PendingDurableFrame::Ok { fsn, .. } => {
-                    if *fsn < next_fsn {
-                        continue;
-                    }
-                    next_fsn = match fsn.checked_add(1) {
-                        Some(next_fsn) => next_fsn,
-                        None => return false,
-                    };
-                }
-                PendingDurableFrame::Rejected { fsn, .. } => {
-                    if *fsn < next_fsn {
-                        continue;
-                    }
-                    if *fsn != next_fsn {
-                        return false;
-                    }
-                    next_fsn = match next_fsn.checked_add(1) {
-                        Some(next_fsn) => next_fsn,
-                        None => return false,
-                    };
-                }
+            let PendingDurableFrame::Ok { fsn, .. } = entry;
+            if *fsn < next_fsn {
+                continue;
+            }
+            next_fsn = match fsn.checked_add(1) {
+                Some(next_fsn) => next_fsn,
+                None => return false,
             }
         }
         next_fsn >= end_before_fsn
     }
 
-    fn pop_ready(&mut self) -> Option<DurableResolvedFrame> {
+    fn pop_ready(&mut self) -> Option<DurableCompletion> {
         if !self
             .pending
             .front()
@@ -2826,13 +3607,7 @@ impl DurableAckTracker {
         }
         match self.pending.pop_front().unwrap() {
             PendingDurableFrame::Ok { wire_seq, fsn, .. } => {
-                Some(DurableResolvedFrame::Ok(DurableCompletion {
-                    wire_seq,
-                    fsn,
-                }))
-            }
-            PendingDurableFrame::Rejected { wire_seq, fsn } => {
-                Some(DurableResolvedFrame::Rejected { wire_seq, fsn })
+                Some(DurableCompletion { wire_seq, fsn })
             }
         }
     }
@@ -2846,20 +3621,18 @@ impl PendingDurableFrame {
                     .get(&entry.table)
                     .is_some_and(|watermark| *watermark >= entry.seq_txn)
             }),
-            PendingDurableFrame::Rejected { .. } => true,
         }
     }
 
     fn fsn(&self) -> u64 {
         match self {
-            PendingDurableFrame::Ok { fsn, .. } | PendingDurableFrame::Rejected { fsn, .. } => *fsn,
+            PendingDurableFrame::Ok { fsn, .. } => *fsn,
         }
     }
 
     fn wire_seq(&self) -> u64 {
         match self {
-            PendingDurableFrame::Ok { wire_seq, .. }
-            | PendingDurableFrame::Rejected { wire_seq, .. } => *wire_seq,
+            PendingDurableFrame::Ok { wire_seq, .. } => *wire_seq,
         }
     }
 }
@@ -2942,6 +3715,10 @@ impl SenderErrorLog {
     }
 }
 
+fn sender_error_overlaps(error: &QwpWsSenderError, from_fsn: u64, to_fsn: u64) -> bool {
+    error.from_fsn <= to_fsn && error.to_fsn >= from_fsn
+}
+
 impl DriverEventRing {
     fn new(capacity: usize) -> Self {
         Self {
@@ -2979,6 +3756,10 @@ pub(crate) struct FakeOrderedServer {
     poll_responses: VecDeque<TransportResponse>,
     default_send_result: FakeSendResult,
     sent_frames: Vec<SentFrame>,
+    sent_payloads: Vec<Vec<u8>>,
+    /// Advertised max batch size in bytes (0 = uncapped), used to drive the
+    /// reconnect symbol-dict catch-up frame splitting.
+    server_max_batch_size: usize,
 }
 
 #[cfg(test)]
@@ -3005,12 +3786,26 @@ impl FakeOrderedServer {
         &self.sent_frames
     }
 
+    pub(crate) fn sent_payloads(&self) -> &[Vec<u8>] {
+        &self.sent_payloads
+    }
+
+    /// Advertise a server batch cap (bytes) so the reconnect catch-up splits its
+    /// symbol-dictionary re-registration across multiple frames (or fails when a
+    /// single entry cannot fit).
+    pub(crate) fn with_batch_cap(mut self, cap: usize) -> Self {
+        self.server_max_batch_size = cap;
+        self
+    }
+
     fn with_default(default_send_result: FakeSendResult) -> Self {
         Self {
             send_results: VecDeque::new(),
             poll_responses: VecDeque::new(),
             default_send_result,
             sent_frames: Vec::new(),
+            sent_payloads: Vec::new(),
+            server_max_batch_size: 0,
         }
     }
 }
@@ -3028,6 +3823,7 @@ impl QwpWsCoreTransport for FakeOrderedServer {
         &mut self,
         frame: OutboundFrameView<'_>,
     ) -> Result<TransportSendResult, TransportFailure> {
+        self.sent_payloads.push(frame.payload.to_vec());
         let frame = frame.sent_frame();
         let wire_seq = frame.wire_seq;
         self.sent_frames.push(frame);
@@ -3047,9 +3843,19 @@ impl QwpWsCoreTransport for FakeOrderedServer {
                 TransportSendResult::Response(TransportResponse::Reject {
                     wire_seq,
                     error: QwpServerError {
-                        status: codec::WS_STATUS_SCHEMA_MISMATCH,
-                        message: "fake schema mismatch".to_string(),
-                        error: Error::new(ErrorCode::InvalidApiCall, "fake schema mismatch"),
+                        status: codec::WS_STATUS_WRITE_ERROR,
+                        message: "fake write error".to_string(),
+                        error: Error::new(ErrorCode::ServerFlushError, "fake write error"),
+                    },
+                })
+            }
+            FakeSendResult::RejectWireNotWritable { wire_seq } => {
+                TransportSendResult::Response(TransportResponse::Reject {
+                    wire_seq,
+                    error: QwpServerError {
+                        status: codec::WS_STATUS_NOT_WRITABLE,
+                        message: "replica is read-only".to_string(),
+                        error: Error::new(ErrorCode::ServerFlushError, "replica is read-only"),
                     },
                 })
             }
@@ -3064,6 +3870,10 @@ impl QwpWsCoreTransport for FakeOrderedServer {
             ),
         })
     }
+
+    fn server_max_batch_size(&self) -> usize {
+        self.server_max_batch_size
+    }
 }
 
 #[cfg(test)]
@@ -3071,8 +3881,17 @@ impl QwpWsCoreTransport for FakeOrderedServer {
 pub(crate) enum FakeSendResult {
     NoResponse,
     AckSent,
-    AckWire { wire_seq: u64 },
-    RejectWire { wire_seq: u64 },
+    AckWire {
+        wire_seq: u64,
+    },
+    RejectWire {
+        wire_seq: u64,
+    },
+    /// A read-only / role reject (`WS_STATUS_NOT_WRITABLE`) — e.g. a replica
+    /// after an in-place primary→replica switch.
+    RejectWireNotWritable {
+        wire_seq: u64,
+    },
     Disconnect,
     RetryableFailure,
     TerminalFailure,
@@ -3083,7 +3902,571 @@ mod tests {
     use super::super::qwp_ws_publisher::QwpWsReplayEncoder;
     use super::*;
     use crate::ingress::buffer::{QwpWsColumnarBuffer, QwpWsEncodeScratch, SymbolGlobalDict};
+    use crate::ingress::rejection_events::RejectionEventSource;
     use crate::ingress::{Buffer, QwpWsErrorCategory, QwpWsErrorPolicy, TimestampNanos};
+    use std::sync::atomic::AtomicBool;
+
+    fn terminal_latch_asserting_sink(
+        lifecycle: PublicationLifecycle,
+    ) -> (Arc<RejectionEventSource>, Arc<AtomicBool>) {
+        let callback_ran = Arc::new(AtomicBool::new(false));
+        let callback_ran_in_handler = Arc::clone(&callback_ran);
+        let sink = RejectionEventSource::inline_for_test(crate::ingress::QwpWsErrorHandler::new(
+            move |error| {
+                if error.applied_policy == QwpWsErrorPolicy::Terminal {
+                    assert_eq!(
+                        lifecycle.load(),
+                        PublicationState::Terminal,
+                        "terminal rejection callback ran before the terminal latch"
+                    );
+                    callback_ran_in_handler.store(true, Ordering::Release);
+                }
+            },
+        ));
+        (Arc::new(sink), callback_ran)
+    }
+
+    #[test]
+    fn catch_up_offset_maps_replay_acks_and_ignores_catch_up_acks() {
+        let mut cursor = SendCursor::new(100);
+        // Simulate a reconnect that rewound to oldest-unresolved FSN 5, then a
+        // 3-frame dictionary catch-up sent ahead of the replay frames.
+        cursor.fsn_at_zero = Some(5);
+        cursor.next_fsn = Some(5);
+        cursor.begin_catch_up(3);
+        assert_eq!(
+            cursor.next_wire_seq, 3,
+            "replay resumes past the catch-up frames"
+        );
+
+        // Two replay frames follow the catch-up: fsn 5 @ wire 3, fsn 6 @ wire 4.
+        cursor
+            .commit_sent(SentFrame {
+                fsn: 5,
+                wire_seq: 3,
+                payload_len: 0,
+            })
+            .unwrap();
+        cursor
+            .commit_sent(SentFrame {
+                fsn: 6,
+                wire_seq: 4,
+                payload_len: 0,
+            })
+            .unwrap();
+
+        // Acks for the catch-up frames (wire 0..3) resolve to no real FSN.
+        assert_eq!(cursor.ack_fsn_for_wire_seq(0).unwrap(), None);
+        assert_eq!(cursor.ack_fsn_for_wire_seq(2).unwrap(), None);
+        // Acks for the replay frames map back onto their FSNs.
+        assert_eq!(cursor.ack_fsn_for_wire_seq(3).unwrap(), Some((5, 3)));
+        assert_eq!(cursor.ack_fsn_for_wire_seq(4).unwrap(), Some((6, 4)));
+        // The reject path shares the mapping.
+        assert_eq!(cursor.reject_fsn_for_wire_seq(1).unwrap(), None);
+        assert_eq!(cursor.reject_fsn_for_wire_seq(4).unwrap(), Some((6, 4)));
+    }
+
+    #[test]
+    fn no_catch_up_leaves_wire_mapping_unchanged() {
+        // catch_up_offset stays 0 (full-dict mode / no reconnect catch-up), so the
+        // mapping is the plain fsn_at_zero + wire_seq it always was.
+        let mut cursor = SendCursor::new(100);
+        cursor.fsn_at_zero = Some(10);
+        cursor.next_fsn = Some(10);
+        cursor
+            .commit_sent(SentFrame {
+                fsn: 10,
+                wire_seq: 0,
+                payload_len: 0,
+            })
+            .unwrap();
+        cursor
+            .commit_sent(SentFrame {
+                fsn: 11,
+                wire_seq: 1,
+                payload_len: 0,
+            })
+            .unwrap();
+        assert_eq!(cursor.ack_fsn_for_wire_seq(0).unwrap(), Some((10, 0)));
+        assert_eq!(cursor.ack_fsn_for_wire_seq(1).unwrap(), Some((11, 1)));
+    }
+
+    fn write_frame_varint(out: &mut Vec<u8>, mut value: u64) {
+        while value > 0x7F {
+            out.push(((value & 0x7F) as u8) | 0x80);
+            value >>= 7;
+        }
+        out.push(value as u8);
+    }
+
+    fn read_frame_varint(buf: &[u8], mut pos: usize) -> (u64, usize) {
+        let mut value = 0u64;
+        let mut shift = 0;
+        loop {
+            let b = buf[pos];
+            pos += 1;
+            value |= u64::from(b & 0x7F) << shift;
+            if b & 0x80 == 0 {
+                return (value, pos);
+            }
+            shift += 7;
+        }
+    }
+
+    /// A valid QWP frame: 12-byte header (DELTA flag) + `[delta_start][count]` +
+    /// `[len][utf8]` symbols + a filler byte standing in for the table block the
+    /// dictionary mirror ignores.
+    fn make_delta_frame(delta_start: u64, symbols: &[&[u8]]) -> Vec<u8> {
+        let mut payload = Vec::new();
+        write_frame_varint(&mut payload, delta_start);
+        write_frame_varint(&mut payload, symbols.len() as u64);
+        for s in symbols {
+            write_frame_varint(&mut payload, s.len() as u64);
+            payload.extend_from_slice(s);
+        }
+        payload.push(0xAB); // stand-in for the table block
+        let mut frame = Vec::new();
+        frame.extend_from_slice(b"QWP1");
+        frame.push(1); // version
+        frame.push(0x08); // FLAG_DELTA_SYMBOL_DICT
+        frame.extend_from_slice(&1u16.to_le_bytes()); // table_count
+        frame.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+        frame.extend_from_slice(&payload);
+        frame
+    }
+
+    /// Asserts `frame` is a table-less full-dictionary catch-up frame carrying
+    /// exactly `expected` symbols starting at id 0.
+    fn assert_catch_up_frame(frame: &[u8], expected: &[&[u8]]) {
+        assert_eq!(&frame[0..4], b"QWP1", "catch-up frame magic");
+        assert_eq!(
+            frame[5] & 0x08,
+            0x08,
+            "catch-up frame carries the delta flag"
+        );
+        assert_eq!(
+            u16::from_le_bytes([frame[6], frame[7]]),
+            0,
+            "catch-up frame is table-less"
+        );
+        let (delta_start, p) = read_frame_varint(frame, 12);
+        assert_eq!(delta_start, 0, "catch-up re-registers from id 0");
+        let (count, mut p) = read_frame_varint(frame, p);
+        assert_eq!(count as usize, expected.len(), "catch-up entry count");
+        for exp in expected {
+            let (len, after) = read_frame_varint(frame, p);
+            let end = after + len as usize;
+            assert_eq!(&frame[after..end], *exp, "catch-up entry bytes");
+            p = end;
+        }
+        assert_eq!(p, frame.len(), "no trailing bytes after the dictionary");
+    }
+
+    #[test]
+    fn reconnect_emits_full_dict_catch_up_before_replay() {
+        let frame = make_delta_frame(0, &[b"AAPL", b"GOOG"]);
+
+        let mut driver = driver(FakeOrderedServer::no_response());
+        driver.send_core.enable_delta_dict(&[], 0);
+
+        // Send the frame: the I/O-thread mirror accumulates AAPL, GOOG.
+        driver.try_submit(&frame).unwrap();
+        driver.drive_send_once().unwrap();
+        assert_eq!(driver.send_core.dict_mirror.count(), 2);
+        assert_eq!(driver.send_core.transport.sent_payloads().len(), 1);
+
+        // The frame is unacked (NoResponse), so it stays queued for replay.
+        // Simulate a successful reconnect: restart the cursor and arm the catch-up.
+        let outcome = driver
+            .send_core
+            .finish_reconnect_success(&mut driver.store, ReconnectReason::Disconnect);
+        assert!(matches!(outcome, DriveOutcome::Reconnected { .. }));
+        assert!(driver.send_core.catch_up_pending);
+
+        // The next send re-registers the whole dictionary, then replays the frame.
+        driver.drive_send_once().unwrap();
+        assert!(!driver.send_core.catch_up_pending, "catch-up consumed");
+
+        let payloads = driver.send_core.transport.sent_payloads();
+        // [0] = original send, [1] = catch-up (table-less full dict), [2] = replay.
+        assert_eq!(payloads.len(), 3, "catch-up frame + replay emitted");
+        assert_catch_up_frame(&payloads[1], &[b"AAPL", b"GOOG"]);
+        assert_eq!(payloads[2], frame, "the original frame replays verbatim");
+    }
+
+    #[test]
+    fn recovery_seed_emits_catch_up_on_first_connect_before_replay() {
+        // Regression: a file-mode slot recovered / orphan-drained with a
+        // non-empty persisted dictionary (ids 0,1 = a,b) seeds the mirror, and
+        // its queued frames are mid-stream deltas (delta_start > 0). On the
+        // FIRST connect to a fresh server -- with NO reconnect -- the whole
+        // dictionary must be re-registered via a catch-up frame before the
+        // mid-stream frame replays, or the server cannot resolve ids
+        // [0, delta_start). The catch-up used to be armed only on reconnect, so
+        // this path replayed a delta_start > 0 frame against an empty server
+        // dictionary (undecodable / silent corruption).
+        let mut driver = driver(FakeOrderedServer::no_response());
+        driver.send_core.enable_delta_dict(&[1, b'a', 1, b'b'], 2);
+        // Enabling with a non-empty (recovered) seed arms the catch-up up front,
+        // without waiting for a reconnect.
+        assert!(
+            driver.send_core.catch_up_pending,
+            "a recovered seed must arm the first-connect catch-up"
+        );
+
+        // A queued mid-stream frame: base id 2, introduces id 2 = "c".
+        let frame = make_delta_frame(2, &[b"c"]);
+        driver.try_submit(&frame).unwrap();
+        driver.drive_send_once().unwrap();
+        assert!(
+            !driver.send_core.catch_up_pending,
+            "catch-up consumed on the first send"
+        );
+
+        let payloads = driver.send_core.transport.sent_payloads();
+        // [0] = catch-up (table-less, re-registers a,b from id 0), [1] = replay.
+        assert_eq!(payloads.len(), 2, "catch-up frame precedes the replay");
+        assert_catch_up_frame(&payloads[0], &[b"a", b"b"]);
+        assert_eq!(payloads[1], frame, "the stored frame replays verbatim");
+    }
+
+    #[test]
+    fn torn_dict_guard_rejects_a_conflicting_symbol_redefinition() {
+        let mut driver = driver(FakeOrderedServer::no_response());
+        // Torn recovery: the side-file recovered only id0 = a, but an earlier queued
+        // frame re-registers id1 = b, extending the mirror to [a, b].
+        driver.send_core.enable_delta_dict(&[1, b'a'], 1);
+        driver
+            .send_core
+            .dict_mirror
+            .accumulate(&make_delta_frame(1, &[b"b"]));
+        assert_eq!(driver.send_core.dict_mirror.count(), 2);
+
+        // Re-registering id1 = b (the same symbol) is a benign replay -> allowed.
+        let same = make_delta_frame(1, &[b"b"]);
+        assert!(driver.send_core.guard_dict_not_torn(&same).is_ok());
+
+        // But a fresh frame redefining id1 = c to a DIFFERENT symbol -- which the
+        // append-only foreground only did because it was seeded with the short
+        // recovered count -- means the recovered dictionary disagrees with the
+        // queue. `accumulate` would drop it (fully overlapping) and keep the stale
+        // b, so the reconnect catch-up would mis-register id1; reject it as torn.
+        let conflicting = make_delta_frame(1, &[b"c"]);
+        let err = driver
+            .send_core
+            .guard_dict_not_torn(&conflicting)
+            .unwrap_err();
+        assert_eq!(err.code(), ErrorCode::StoreResendRequired);
+    }
+
+    #[test]
+    fn torn_dict_guard_rejects_a_frame_referencing_lost_symbols() {
+        let mut driver = driver(FakeOrderedServer::no_response());
+        // A recovered dictionary of two symbols (ids 0, 1).
+        driver.send_core.enable_delta_dict(&[1, b'a', 1, b'b'], 2);
+
+        // A frame whose base is within the re-registered dictionary is fine...
+        let ok = make_delta_frame(2, &[b"c"]);
+        assert!(driver.send_core.guard_dict_not_torn(&ok).is_ok());
+        // ...but a base beyond it references entries a host crash tore away (and
+        // that no surviving earlier frame carries): unrecoverable, so fail loudly.
+        let torn = make_delta_frame(5, &[b"z"]);
+        let err = driver.send_core.guard_dict_not_torn(&torn).unwrap_err();
+        assert_eq!(err.code(), ErrorCode::StoreResendRequired);
+        assert!(
+            err.msg().contains("dictionary is torn"),
+            "msg: {}",
+            err.msg()
+        );
+    }
+
+    #[test]
+    fn torn_dict_guard_in_full_dict_mode_passes_dense_frames_but_rejects_stray_deltas() {
+        // Full-dict (dense) mode: the driver mirror is disabled. A real dense frame
+        // always bases at id 0 (it re-ships its whole dictionary), so it passes.
+        let driver = driver(FakeOrderedServer::no_response());
+        let dense = make_delta_frame(0, &[b"z"]);
+        assert!(driver.send_core.guard_dict_not_torn(&dense).is_ok());
+        // But a frame basing above 0 with the mirror disabled is a lockstep
+        // violation (or a delta slot reopened with delta disabled): no catch-up will
+        // register ids [0, base), so it is rejected loudly rather than replayed into
+        // a corrupt server dictionary.
+        let stray = make_delta_frame(9, &[b"z"]);
+        let err = driver.send_core.guard_dict_not_torn(&stray).unwrap_err();
+        assert_eq!(err.code(), ErrorCode::StoreResendRequired);
+        assert!(
+            err.msg()
+                .contains("delta symbol-dictionary mode is disabled"),
+            "msg: {}",
+            err.msg()
+        );
+    }
+
+    #[test]
+    fn torn_dict_guard_accepts_a_dense_frame_while_the_mirror_is_enabled() {
+        // Mid-connection dense fallback: when a failed side-file rollback forces the
+        // foreground to drop delta encoding (`SfaColumnBackend::rollback_frame` /
+        // `QwpWsReplayEncoder::rollback_frame` set `delta_dict_enabled = false`), it
+        // starts emitting DENSE frames (`delta_start = 0`, re-shipping the whole
+        // dictionary from id 0). The driver mirror -- which the foreground cannot
+        // reach across the I/O-thread boundary -- stays enabled with the count it
+        // reached in delta mode. Such a dense frame re-registers ids [0, K) the mirror
+        // already holds as [0, M<=K): the guard must ACCEPT it (the server tolerates
+        // the idempotent overlap exactly as it does the reconnect catch-up + replay of
+        // already-registered ids), and `accumulate` must fold only the [M, K) suffix
+        // so the mirror stays in lockstep. A dense frame that DISAGREES on an
+        // already-held id, however, is still the torn case and must be rejected.
+        {
+            let mut driver = driver(FakeOrderedServer::no_response());
+            // The connection sent two symbols in delta mode: mirror = [a, b], count 2.
+            driver.send_core.enable_delta_dict(&[1, b'a', 1, b'b'], 2);
+            assert_eq!(driver.send_core.dict_mirror.count(), 2);
+
+            // Post-fallback dense frame: re-ships [a, b] and adds c, based at id 0.
+            let dense = make_delta_frame(0, &[b"a", b"b", b"c"]);
+            assert!(
+                driver.send_core.guard_dict_not_torn(&dense).is_ok(),
+                "a self-sufficient dense frame re-shipping the mirrored prefix is safe"
+            );
+            // Accumulating it folds only the new suffix [c]; the mirror stays consistent.
+            driver.send_core.dict_mirror.accumulate(&dense);
+            assert_eq!(
+                driver.send_core.dict_mirror.count(),
+                3,
+                "accumulate folds only the [M, K) suffix, keeping the mirror in lockstep"
+            );
+        }
+
+        // A dense frame that redefines an already-held id (id1: b -> X) disagrees with
+        // the mirror: the torn-dict guard must still reject it, even at delta_start 0.
+        {
+            let mut driver = driver(FakeOrderedServer::no_response());
+            driver.send_core.enable_delta_dict(&[1, b'a', 1, b'b'], 2);
+            let conflicting = make_delta_frame(0, &[b"a", b"X", b"c"]);
+            let err = driver
+                .send_core
+                .guard_dict_not_torn(&conflicting)
+                .unwrap_err();
+            assert_eq!(err.code(), ErrorCode::StoreResendRequired);
+        }
+    }
+
+    #[test]
+    fn reconnect_error_is_terminal_treats_store_resend_required_as_terminal() {
+        // The torn-dict guard (above) and the corrupt-recovered-dict seed both
+        // fail with ErrorCode::StoreResendRequired ("resend from source"). The
+        // reconnect / failover classifier must treat that as TERMINAL so the
+        // sender's own retry loops (e.g. `reconnect_pick`) stop instead of
+        // re-reading the same unrecoverable on-disk state to their deadline --
+        // while a transient SocketError stays retryable.
+        assert!(
+            reconnect_error_is_terminal(&Error::new(
+                ErrorCode::StoreResendRequired,
+                "the affected data must be resent"
+            )),
+            "StoreResendRequired must be terminal so the reconnect loop stops"
+        );
+        assert!(
+            !reconnect_error_is_terminal(&Error::new(ErrorCode::SocketError, "connection reset")),
+            "a transient SocketError must stay retryable"
+        );
+    }
+
+    #[test]
+    fn reconnect_catch_up_splits_across_frames_when_server_caps_batch() {
+        // Five recovered symbols and a server batch cap too small for a one-frame
+        // re-registration: the driver must split the catch-up across multiple
+        // table-less frames (each within the cap), contiguous and gap-free, before
+        // the queued replay frame. Exercises emit -> multiple send_frame ->
+        // begin_catch_up(n>1) end-to-end (the split is unit-tested in SentDictMirror;
+        // this drives it through the send core).
+        let syms: Vec<Vec<u8>> = (0..5).map(|i| format!("sy{i:02}").into_bytes()).collect();
+        let mut seed = Vec::new();
+        for s in &syms {
+            write_frame_varint(&mut seed, s.len() as u64);
+            seed.extend_from_slice(s);
+        }
+        // Each entry is 5 bytes ([len=4]+4); budget = cap-12-16 = 12 fits two per
+        // frame, so 5 symbols span 3 frames.
+        let cap = 12 + 16 + 12;
+        let mut driver = driver(FakeOrderedServer::no_response().with_batch_cap(cap));
+        driver.send_core.enable_delta_dict(&seed, syms.len() as u32);
+        assert!(driver.send_core.catch_up_pending);
+
+        let replay = make_delta_frame(5, &[b"new"]);
+        driver.try_submit(&replay).unwrap();
+        driver.drive_send_once().unwrap();
+        assert!(!driver.send_core.catch_up_pending, "catch-up consumed");
+
+        let payloads = driver.send_core.transport.sent_payloads();
+        assert!(
+            payloads.len() > 2,
+            "expected a multi-frame catch-up split + replay, got {}",
+            payloads.len()
+        );
+        let (catch_up, replay_sent) = payloads.split_at(payloads.len() - 1);
+        assert!(catch_up.len() >= 2, "catch-up must span multiple frames");
+
+        // Every catch-up frame is within the cap, table-less, delta-flagged, and
+        // together they re-register all five symbols contiguously from id 0.
+        let mut expected_start = 0u64;
+        let mut reassembled: Vec<Vec<u8>> = Vec::new();
+        for f in catch_up {
+            assert!(
+                f.len() <= cap,
+                "catch-up frame ({}) exceeds cap {}",
+                f.len(),
+                cap
+            );
+            assert_eq!(&f[0..4], b"QWP1");
+            assert_eq!(f[5] & 0x08, 0x08, "catch-up carries the delta flag");
+            assert_eq!(
+                u16::from_le_bytes([f[6], f[7]]),
+                0,
+                "catch-up is table-less"
+            );
+            let (start, p) = read_frame_varint(f, 12);
+            assert_eq!(start, expected_start, "catch-up ranges are contiguous");
+            let (count, mut p) = read_frame_varint(f, p);
+            for _ in 0..count {
+                let (len, after) = read_frame_varint(f, p);
+                reassembled.push(f[after..after + len as usize].to_vec());
+                p = after + len as usize;
+            }
+            expected_start += count;
+        }
+        assert_eq!(
+            reassembled, syms,
+            "catch-up re-registers every symbol gap-free"
+        );
+        assert_eq!(
+            replay_sent[0], replay,
+            "the queued frame replays verbatim after the catch-up"
+        );
+    }
+
+    #[test]
+    fn catch_up_entry_exceeding_batch_cap_marks_terminal() {
+        // A single recovered symbol larger than the server's batch cap cannot be
+        // re-registered, so the reconnect catch-up is terminal (resend required)
+        // rather than sending an oversized frame.
+        let big = vec![b'x'; 64];
+        let mut seed = Vec::new();
+        write_frame_varint(&mut seed, big.len() as u64);
+        seed.extend_from_slice(&big);
+        let mut driver = driver(FakeOrderedServer::no_response().with_batch_cap(20));
+        driver.send_core.enable_delta_dict(&seed, 1);
+        assert!(driver.send_core.catch_up_pending);
+
+        let outcome = driver.drive_send_once().unwrap();
+        assert!(matches!(outcome, DriveOutcome::Terminal));
+        let err = driver
+            .store
+            .terminal_error()
+            .expect("terminal error recorded");
+        assert!(
+            err.msg().contains("exceeds the server") && err.msg().contains("batch cap"),
+            "msg: {}",
+            err.msg()
+        );
+        // Decided client-side from the advertised cap (nothing sent back), so it
+        // is BatchTooLarge -- the same code the foreground uses for an oversize
+        // frame -- not ServerFlushError.
+        assert_eq!(err.code(), ErrorCode::BatchTooLarge);
+    }
+
+    #[test]
+    fn drive_marks_terminal_when_a_stored_frame_outruns_the_recovered_dictionary() {
+        // A recovered dictionary of two symbols, but a stored frame bases at id 5
+        // (a host crash tore away ids [2, 5)). The guard, wired into the send loop,
+        // must mark the sender terminal rather than replay an unresolvable frame --
+        // covering the guard end-to-end, not just the predicate.
+        let mut driver = driver(FakeOrderedServer::no_response());
+        driver.send_core.enable_delta_dict(&[1, b'a', 1, b'b'], 2);
+        let torn = make_delta_frame(5, &[b"z"]);
+        driver.try_submit(&torn).unwrap();
+
+        let outcome = driver.drive_send_once().unwrap();
+        assert!(matches!(outcome, DriveOutcome::Terminal));
+        let err = driver
+            .store
+            .terminal_error()
+            .expect("terminal error recorded");
+        assert!(
+            err.msg().contains("dictionary is torn"),
+            "msg: {}",
+            err.msg()
+        );
+    }
+
+    #[test]
+    fn presend_reject_of_the_catch_up_escalates_to_terminal_not_an_infinite_loop() {
+        // A Retriable reject that maps to no FSN -- the table-less symbol-dictionary
+        // catch-up frame a reconnect emits carries no FSN, so its reject lands in
+        // `record_presend_reject`. That path must be bounded by the poison ceiling
+        // like a real-frame reject: a server that accepts the connection but keeps
+        // rejecting the catch-up (e.g. a read-only replica after an in-place role
+        // switch) would otherwise reconnect-loop forever, masking a permanent
+        // failure as a hang. It must escalate to a loud terminal after
+        // max_frame_rejections so the caller learns the queued data needs
+        // resending. (The catch-up wire-seq -> None mapping is covered by
+        // `catch_up_offset_maps_replay_acks_and_ignores_catch_up_acks`.)
+        let mut driver = driver(FakeOrderedServer::no_response());
+        let receipt = driver.try_submit(b"queued-frame").unwrap();
+        assert_eq!(
+            driver.receipt_status(receipt),
+            QwpReceiptStatus::Published { fsn: 0 },
+            "the queued frame the catch-up exists to unblock",
+        );
+
+        // The first rejections still failover (a transient / role reject may
+        // resolve on another endpoint), so they do not terminate...
+        for _ in 0..DEFAULT_MAX_FRAME_REJECTIONS - 1 {
+            let outcome = driver
+                .send_core
+                .record_presend_reject(
+                    &mut driver.store,
+                    0,
+                    write_error("replica rejects writes"),
+                    QwpWsErrorPolicy::Retriable,
+                    true,
+                )
+                .unwrap();
+            assert_ne!(outcome, DriveOutcome::Terminal, "must not terminate early");
+        }
+        // ...but with no ACK progress in between, the next one escalates.
+        let outcome = driver
+            .send_core
+            .record_presend_reject(
+                &mut driver.store,
+                0,
+                write_error("replica rejects writes"),
+                QwpWsErrorPolicy::Retriable,
+                true,
+            )
+            .unwrap();
+        assert_eq!(
+            outcome,
+            DriveOutcome::Terminal,
+            "a persistently-rejected catch-up must escalate, not loop forever",
+        );
+
+        // The queued data is surfaced as terminal (resend required) -- recoverable
+        // and reported, not silently retried into oblivion.
+        assert_eq!(
+            driver.receipt_status(receipt),
+            QwpReceiptStatus::Terminal { fsn: 0 }
+        );
+        let terminal = driver
+            .store
+            .terminal_error()
+            .expect("terminal error recorded");
+        assert!(
+            terminal.msg().contains("catch-up"),
+            "terminal error names the catch-up cause: {}",
+            terminal.msg(),
+        );
+    }
     use std::collections::VecDeque;
     #[cfg(feature = "sync-sender-qwp-ws")]
     use std::fs::File;
@@ -3238,9 +4621,9 @@ mod tests {
 
     fn sender_error(fsn: u64) -> QwpWsSenderError {
         QwpWsSenderError {
-            category: QwpWsErrorCategory::SchemaMismatch,
-            applied_policy: QwpWsErrorPolicy::DropAndContinue,
-            status: Some(codec::WS_STATUS_SCHEMA_MISMATCH),
+            category: QwpWsErrorCategory::WriteError,
+            applied_policy: QwpWsErrorPolicy::Retriable,
+            status: Some(codec::WS_STATUS_WRITE_ERROR),
             message: Some(format!("error {fsn}")),
             message_sequence: Some(fsn),
             from_fsn: fsn,
@@ -3362,6 +4745,22 @@ mod tests {
         }
     }
 
+    fn write_error(message: &str) -> QwpServerError {
+        QwpServerError {
+            status: codec::WS_STATUS_WRITE_ERROR,
+            message: message.to_string(),
+            error: Error::new(ErrorCode::ServerFlushError, message),
+        }
+    }
+
+    fn not_writable_error(message: &str) -> QwpServerError {
+        QwpServerError {
+            status: codec::WS_STATUS_NOT_WRITABLE,
+            message: message.to_string(),
+            error: Error::new(ErrorCode::ServerFlushError, message),
+        }
+    }
+
     fn drain_events<Q: PublicationLog, T: QwpWsCoreTransport>(
         driver: &mut QwpWsCoreTestHarness<Q, T>,
     ) -> Vec<DriverEvent> {
@@ -3381,6 +4780,7 @@ mod tests {
         keepalive_attempts: usize,
         keepalive_pending_args: Vec<bool>,
         restart_attempts: usize,
+        restart_reasons: Vec<ReconnectReason>,
         sent_frames: Vec<SentFrame>,
         sent_payloads: Vec<Vec<u8>>,
     }
@@ -3397,6 +4797,7 @@ mod tests {
                 keepalive_attempts: 0,
                 keepalive_pending_args: Vec::new(),
                 restart_attempts: 0,
+                restart_reasons: Vec::new(),
                 sent_frames: Vec::new(),
                 sent_payloads: Vec::new(),
             }
@@ -3472,8 +4873,9 @@ mod tests {
                 .unwrap_or(Ok(TransportSendResult::NoResponse))
         }
 
-        fn restart_connection(&mut self, _reason: ReconnectReason) -> Result<(), DriverError> {
+        fn restart_connection(&mut self, reason: ReconnectReason) -> Result<(), DriverError> {
             self.restart_attempts += 1;
+            self.restart_reasons.push(reason);
             self.restart_results.pop_front().unwrap_or(Ok(()))
         }
     }
@@ -3762,7 +5164,8 @@ mod tests {
         payload_tx: mpsc::Sender<Vec<u8>>,
     ) {
         let request = read_request_until_blank(stream).unwrap();
-        let accept = codec::compute_accept(&header_value(&request, "Sec-WebSocket-Key"));
+        let accept =
+            crate::ws::crypto::compute_accept(&header_value(&request, "Sec-WebSocket-Key"));
         let response = format!(
             "HTTP/1.1 101 Switching Protocols\r\n\
              Upgrade: websocket\r\n\
@@ -3919,7 +5322,7 @@ mod tests {
         let mut buffer = qwp_buffer("SYM_REAL", 42, 42_000);
         let expected = replay_payload(&buffer);
 
-        let conf = format!("qwpws::addr={host}:{port};");
+        let conf = format!("ws::addr={host}:{port};");
         let mut sender = crate::ingress::Sender::from_conf(&conf).unwrap();
         sender.flush(&mut buffer).unwrap();
         sender.close_drain().unwrap();
@@ -3938,10 +5341,7 @@ mod tests {
         let expected = replay_payload(&buffer);
 
         let ca_path = tls_certs_dir().join("server_rootCA.pem");
-        let conf = format!(
-            "qwpwss::addr={host}:{port};tls_roots={};",
-            ca_path.display()
-        );
+        let conf = format!("wss::addr={host}:{port};tls_roots={};", ca_path.display());
         let mut sender = crate::ingress::Sender::from_conf(&conf).unwrap();
         sender.flush(&mut buffer).unwrap();
         sender.close_drain().unwrap();
@@ -4181,6 +5581,223 @@ mod tests {
         );
     }
 
+    fn paced_policy() -> ReconnectPolicy {
+        ReconnectPolicy::bounded(
+            Duration::from_secs(10),
+            Duration::from_millis(100),
+            Duration::from_secs(1),
+        )
+    }
+
+    fn assert_pace_range(actual: Duration, min: Duration, max: Duration) {
+        assert!(
+            actual >= min && actual < max,
+            "pace {actual:?} outside [{min:?}, {max:?})"
+        );
+    }
+
+    #[test]
+    fn retriable_nack_below_threshold_paces_before_first_reconnect_attempt() {
+        let transport = TestTransport::scripted([Ok(TransportSendResult::Response(
+            TransportResponse::Reject {
+                wire_seq: 0,
+                error: write_error("write failed"),
+            },
+        ))])
+        .with_restart_results([Ok(())]);
+        let mut driver = QwpWsCoreTestHarness::from_queue_with_reconnect_policy(
+            memory_queue(options(8, 1024, 4)),
+            transport,
+            paced_policy(),
+            false,
+        );
+        driver.try_submit(b"payload").unwrap();
+
+        match driver.drive_once().unwrap() {
+            DriveOutcome::ReconnectDelay { sleep_for, .. } => {
+                assert_pace_range(
+                    sleep_for,
+                    Duration::from_millis(100),
+                    Duration::from_millis(200),
+                );
+            }
+            other => panic!("expected paced reconnect delay, got {other:?}"),
+        }
+        assert_eq!(driver.send_core.transport.restart_attempts, 0);
+
+        assert_eq!(
+            driver.drive_once().unwrap(),
+            DriveOutcome::Reconnected {
+                reason: ReconnectReason::RetryableFailure
+            }
+        );
+        assert_eq!(driver.send_core.transport.restart_attempts, 1);
+    }
+
+    #[test]
+    fn second_same_frame_strike_doubles_pace_dose() {
+        let transport = TestTransport::scripted([
+            Ok(TransportSendResult::Response(TransportResponse::Reject {
+                wire_seq: 0,
+                error: write_error("write failed once"),
+            })),
+            Ok(TransportSendResult::Response(TransportResponse::Reject {
+                wire_seq: 0,
+                error: write_error("write failed twice"),
+            })),
+        ])
+        .with_restart_results([Ok(()), Ok(())]);
+        let mut driver = QwpWsCoreTestHarness::from_queue_with_reconnect_policy(
+            memory_queue(options(8, 1024, 4)),
+            transport,
+            paced_policy(),
+            false,
+        );
+        driver.try_submit(b"payload").unwrap();
+
+        match driver.drive_once().unwrap() {
+            DriveOutcome::ReconnectDelay { sleep_for, .. } => {
+                assert_pace_range(
+                    sleep_for,
+                    Duration::from_millis(100),
+                    Duration::from_millis(200),
+                );
+            }
+            other => panic!("expected first paced reconnect delay, got {other:?}"),
+        }
+        assert_eq!(
+            driver.drive_once().unwrap(),
+            DriveOutcome::Reconnected {
+                reason: ReconnectReason::RetryableFailure
+            }
+        );
+        match driver.drive_once().unwrap() {
+            DriveOutcome::ReconnectDelay { sleep_for, .. } => {
+                assert_pace_range(
+                    sleep_for,
+                    Duration::from_millis(200),
+                    Duration::from_millis(400),
+                );
+            }
+            other => panic!("expected second paced reconnect delay, got {other:?}"),
+        }
+        assert_eq!(driver.send_core.transport.restart_attempts, 1);
+    }
+
+    #[test]
+    fn not_writable_reject_reconnects_immediately_without_pace() {
+        let transport = TestTransport::scripted([Ok(TransportSendResult::Response(
+            TransportResponse::Reject {
+                wire_seq: 0,
+                error: not_writable_error("replica access is read-only"),
+            },
+        ))])
+        .with_restart_results([Ok(())]);
+        let mut driver = QwpWsCoreTestHarness::from_queue_with_reconnect_policy(
+            memory_queue(options(8, 1024, 4)),
+            transport,
+            paced_policy(),
+            false,
+        );
+        driver.try_submit(b"payload").unwrap();
+
+        assert_eq!(
+            driver.drive_once().unwrap(),
+            DriveOutcome::Reconnected {
+                reason: ReconnectReason::NotWritable
+            }
+        );
+        assert_eq!(driver.send_core.transport.restart_attempts, 1);
+    }
+
+    #[test]
+    fn presend_reject_paces_with_min_one_strike() {
+        let transport = TestTransport::scripted([]).with_restart_results([Ok(())]);
+        let mut driver = QwpWsCoreTestHarness::from_queue_with_reconnect_policy(
+            memory_queue(options(8, 1024, 4)),
+            transport,
+            paced_policy(),
+            false,
+        );
+        driver.try_submit(b"payload").unwrap();
+
+        match driver
+            .send_core
+            .finish_response(
+                &mut driver.store,
+                TransportResponse::Reject {
+                    wire_seq: 0,
+                    error: write_error("pre-send reject"),
+                },
+            )
+            .unwrap()
+        {
+            DriveOutcome::ReconnectDelay { sleep_for, .. } => {
+                assert_pace_range(
+                    sleep_for,
+                    Duration::from_millis(100),
+                    Duration::from_millis(200),
+                );
+            }
+            other => panic!("expected paced reconnect delay, got {other:?}"),
+        }
+        assert_eq!(driver.send_core.transport.restart_attempts, 0);
+    }
+
+    #[test]
+    fn zero_initial_backoff_keeps_legacy_immediate_reconnect() {
+        let transport = TestTransport::scripted([Ok(TransportSendResult::Response(
+            TransportResponse::Reject {
+                wire_seq: 0,
+                error: write_error("write failed"),
+            },
+        ))])
+        .with_restart_results([Ok(())]);
+        let mut driver = QwpWsCoreTestHarness::from_queue_with_reconnect_policy(
+            memory_queue(options(8, 1024, 4)),
+            transport,
+            ReconnectPolicy::no_backoff(Duration::MAX),
+            false,
+        );
+        driver.try_submit(b"payload").unwrap();
+
+        assert_eq!(
+            driver.drive_once().unwrap(),
+            DriveOutcome::Reconnected {
+                reason: ReconnectReason::RetryableFailure
+            }
+        );
+        assert_eq!(driver.send_core.transport.restart_attempts, 1);
+    }
+
+    #[test]
+    fn server_close_below_threshold_paces_reconnect() {
+        let transport = TestTransport::scripted([Ok(TransportSendResult::NoResponse)])
+            .with_poll_events([Err(TransportFailure::ServerClose(fake_transport_error(
+                "server close",
+            )))])
+            .with_restart_results([Ok(())]);
+        let mut driver = QwpWsCoreTestHarness::from_queue_with_reconnect_policy(
+            memory_queue(options(8, 1024, 4)),
+            transport,
+            paced_policy(),
+            false,
+        );
+        driver.try_submit(b"payload").unwrap();
+
+        match driver.drive_once().unwrap() {
+            DriveOutcome::ReconnectDelay { sleep_for, .. } => {
+                assert_pace_range(
+                    sleep_for,
+                    Duration::from_millis(100),
+                    Duration::from_millis(200),
+                );
+            }
+            other => panic!("expected paced reconnect delay, got {other:?}"),
+        }
+        assert_eq!(driver.send_core.transport.restart_attempts, 0);
+    }
+
     #[test]
     fn role_reject_reconnect_sleep_uses_fixed_initial_backoff() {
         let initial = Duration::from_millis(100);
@@ -4211,6 +5828,86 @@ mod tests {
     }
 
     #[test]
+    fn pace_dose_doubles_per_strike_and_caps_at_max_backoff() {
+        let initial = Duration::from_millis(100);
+        let max = Duration::from_millis(1000);
+
+        assert_eq!(pace_dose(initial, max, 0), Duration::from_millis(100));
+        assert_eq!(pace_dose(initial, max, 1), Duration::from_millis(100));
+        assert_eq!(pace_dose(initial, max, 2), Duration::from_millis(200));
+        assert_eq!(pace_dose(initial, max, 3), Duration::from_millis(400));
+        assert_eq!(pace_dose(initial, max, 4), Duration::from_millis(800));
+        assert_eq!(pace_dose(initial, max, 5), Duration::from_millis(1000));
+        assert_eq!(pace_dose(initial, max, 99), Duration::from_millis(1000));
+        assert_eq!(
+            pace_dose(Duration::ZERO, max, 4),
+            Duration::ZERO,
+            "zero initial backoff preserves legacy immediate reconnects"
+        );
+    }
+
+    #[test]
+    fn pace_jitter_stays_within_one_to_two_dose() {
+        for dose_ms in [1u64, 80, 100, 1_000] {
+            let dose = Duration::from_millis(dose_ms);
+            for _ in 0..10_000 {
+                let d = pace_jitter_duration(dose);
+                assert!(
+                    d >= dose && d < dose + dose,
+                    "paced jitter {d:?} outside [dose, 2*dose) for dose={dose:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn poison_tracker_dwell_holds_escalation_until_window_elapses() {
+        let mut tracker = PoisonFrameTracker::default();
+        let started = Instant::now();
+        let window = Duration::from_secs(5);
+
+        assert!(!tracker.record_failure(7, None, 2, window, started));
+        assert!(!tracker.record_failure(7, None, 2, window, started + Duration::from_secs(1)));
+        assert_eq!(tracker.strikes(), 2);
+        assert!(tracker.record_failure(7, None, 2, window, started + window));
+        assert_eq!(tracker.strikes(), 3);
+    }
+
+    #[test]
+    fn poison_tracker_dwell_restamps_when_suspect_key_changes() {
+        let mut tracker = PoisonFrameTracker::default();
+        let started = Instant::now();
+        let window = Duration::from_secs(5);
+
+        assert!(!tracker.record_failure(7, None, 2, window, started));
+        assert!(!tracker.record_failure(8, None, 2, window, started + Duration::from_secs(10)));
+        assert_eq!(tracker.strikes(), 1);
+        assert!(!tracker.record_failure(8, None, 2, window, started + Duration::from_secs(11)));
+        assert!(tracker.record_failure(8, None, 2, window, started + Duration::from_secs(15)));
+    }
+
+    #[test]
+    fn poison_tracker_window_zero_escalates_exactly_at_threshold() {
+        let mut tracker = PoisonFrameTracker::default();
+        let started = Instant::now();
+
+        assert!(!tracker.record_failure(7, None, 2, Duration::ZERO, started));
+        assert!(tracker.record_failure(7, None, 2, Duration::ZERO, started));
+    }
+
+    #[test]
+    fn poison_tracker_clear_resets_first_strike_timestamp() {
+        let mut tracker = PoisonFrameTracker::default();
+        let started = Instant::now();
+        let window = Duration::from_secs(5);
+
+        assert!(!tracker.record_failure(7, None, 2, window, started));
+        tracker.clear();
+        assert_eq!(tracker.strikes(), 0);
+        assert!(!tracker.record_failure(7, None, 1, window, started + Duration::from_secs(10)));
+    }
+
+    #[test]
     fn reconnect_terminal_classification_keeps_protocol_version_errors_terminal() {
         let durable_ack_mismatch = Error::new(
             ErrorCode::ProtocolVersionError,
@@ -4223,6 +5920,17 @@ mod tests {
         assert!(!reconnect_error_is_terminal(
             &retryable_upgrade_version_error
         ));
+    }
+
+    #[test]
+    fn reconnect_terminal_classification_retries_structured_role_rejects() {
+        let all_role_rejected = Error::new(
+            ErrorCode::ProtocolVersionError,
+            "server did not enable durable ACK; all endpoints rejected by role",
+        )
+        .with_qwp_ws_role_reject(crate::ingress::QwpWsRoleReject::new("REPLICA", None));
+
+        assert!(!reconnect_error_is_terminal(&all_role_rejected));
     }
 
     #[test]
@@ -4295,7 +6003,7 @@ mod tests {
     }
 
     #[test]
-    fn raw_qwp_schema_and_write_errors_reject_and_continue_like_java() {
+    fn raw_qwp_schema_and_write_errors_decode_as_rejections() {
         for (status, expected_code) in [
             (codec::WS_STATUS_SCHEMA_MISMATCH, ErrorCode::InvalidApiCall),
             (codec::WS_STATUS_WRITE_ERROR, ErrorCode::ServerFlushError),
@@ -4668,7 +6376,7 @@ mod tests {
     }
 
     #[test]
-    fn future_durable_reject_wire_sequence_clamps_tracker_to_highest_sent_like_java() {
+    fn future_durable_reject_wire_sequence_reconnects_from_highest_sent_like_java_v2() {
         let mut driver = durable_driver(FakeOrderedServer::no_response());
         let first = driver.try_submit(b"first").unwrap();
         let second = driver.try_submit(b"second").unwrap();
@@ -4688,48 +6396,22 @@ mod tests {
             .transport
             .push_response(TransportResponse::Reject {
                 wire_seq: 99,
-                error: schema_mismatch_error("schema changed"),
+                error: write_error("write failed"),
             });
 
         assert_eq!(
             driver.drive_receive_once().unwrap(),
-            DriveOutcome::Rejected {
-                fsn: 1,
-                wire_seq: 99
+            DriveOutcome::Reconnected {
+                reason: ReconnectReason::RetryableFailure
             }
         );
         assert_eq!(
             driver.receipt_status(first),
-            QwpReceiptStatus::Sent {
-                fsn: 0,
-                wire_seq: 0
-            }
+            QwpReceiptStatus::Published { fsn: 0 }
         );
         assert_eq!(
             driver.receipt_status(second),
-            QwpReceiptStatus::Sent {
-                fsn: 1,
-                wire_seq: 1
-            }
-        );
-
-        driver
-            .send_core
-            .transport
-            .push_response(TransportResponse::DurableAck {
-                table_seq_txns: table_seq_txns(&[("trades", 10)]),
-            });
-        assert_eq!(
-            driver.drive_receive_once().unwrap(),
-            DriveOutcome::Acked { wire_seq: 1 }
-        );
-        assert_eq!(
-            driver.receipt_status(first),
-            QwpReceiptStatus::Completed { fsn: 0 }
-        );
-        assert_eq!(
-            driver.receipt_status(second),
-            QwpReceiptStatus::Completed { fsn: 1 }
+            QwpReceiptStatus::Published { fsn: 1 }
         );
 
         let error = driver.poll_sender_error().unwrap();
@@ -4776,7 +6458,7 @@ mod tests {
             .transport
             .push_response(TransportResponse::Reject {
                 wire_seq: 99,
-                error: schema_mismatch_error("late schema mismatch"),
+                error: write_error("late write failure"),
             });
         assert_eq!(driver.drive_receive_once().unwrap(), DriveOutcome::Progress);
         assert_eq!(
@@ -4785,7 +6467,7 @@ mod tests {
         );
 
         let error = driver.poll_sender_error().unwrap();
-        assert_eq!(error.applied_policy, QwpWsErrorPolicy::DropAndContinue);
+        assert_eq!(error.applied_policy, QwpWsErrorPolicy::Retriable);
         assert_eq!(error.message_sequence, Some(99));
         assert_eq!(error.from_fsn, 0);
         assert_eq!(error.to_fsn, 0);
@@ -4821,7 +6503,7 @@ mod tests {
             .transport
             .push_response(TransportResponse::Reject {
                 wire_seq: 99,
-                error: schema_mismatch_error("late schema mismatch"),
+                error: write_error("late write failure"),
             });
         assert_eq!(driver.drive_receive_once().unwrap(), DriveOutcome::Progress);
         assert_eq!(
@@ -4833,7 +6515,7 @@ mod tests {
         );
 
         let error = driver.poll_sender_error().unwrap();
-        assert_eq!(error.applied_policy, QwpWsErrorPolicy::DropAndContinue);
+        assert_eq!(error.applied_policy, QwpWsErrorPolicy::Retriable);
         assert_eq!(error.message_sequence, Some(99));
         assert_eq!(error.from_fsn, 0);
         assert_eq!(error.to_fsn, 0);
@@ -5202,22 +6884,18 @@ mod tests {
             .transport
             .push_response(TransportResponse::Reject {
                 wire_seq: 1,
-                error: schema_mismatch_error("schema changed"),
+                error: write_error("write failed"),
             });
         assert_eq!(driver.drive_receive_once().unwrap(), DriveOutcome::Progress);
         assert_eq!(
             driver.drive_receive_once().unwrap(),
-            DriveOutcome::Rejected {
-                fsn: 1,
-                wire_seq: 1
+            DriveOutcome::Reconnected {
+                reason: ReconnectReason::RetryableFailure
             }
         );
         assert_eq!(
             driver.receipt_status(second),
-            QwpReceiptStatus::Sent {
-                fsn: 1,
-                wire_seq: 1
-            }
+            QwpReceiptStatus::Published { fsn: 1 }
         );
 
         assert_eq!(
@@ -5290,7 +6968,7 @@ mod tests {
     }
 
     #[test]
-    fn durable_reconnect_clears_unresolved_reject_so_replayed_reject_can_complete() {
+    fn durable_reconnect_clears_unresolved_reject_so_replayed_reject_retries_again() {
         let mut driver = durable_driver(FakeOrderedServer::no_response());
         let first = driver.try_submit(b"first").unwrap();
         let second = driver.try_submit(b"second").unwrap();
@@ -5309,14 +6987,13 @@ mod tests {
             .transport
             .push_response(TransportResponse::Reject {
                 wire_seq: 1,
-                error: schema_mismatch_error("schema changed"),
+                error: write_error("write failed"),
             });
         assert_eq!(driver.drive_receive_once().unwrap(), DriveOutcome::Progress);
         assert_eq!(
             driver.drive_receive_once().unwrap(),
-            DriveOutcome::Rejected {
-                fsn: 1,
-                wire_seq: 1
+            DriveOutcome::Reconnected {
+                reason: ReconnectReason::RetryableFailure
             }
         );
 
@@ -5355,7 +7032,7 @@ mod tests {
             .transport
             .push_response(TransportResponse::Reject {
                 wire_seq: 1,
-                error: schema_mismatch_error("schema changed again"),
+                error: write_error("write failed again"),
             });
 
         assert_eq!(driver.drive_receive_once().unwrap(), DriveOutcome::Progress);
@@ -5365,9 +7042,8 @@ mod tests {
         );
         assert_eq!(
             driver.drive_receive_once().unwrap(),
-            DriveOutcome::Rejected {
-                fsn: 1,
-                wire_seq: 1
+            DriveOutcome::Reconnected {
+                reason: ReconnectReason::RetryableFailure
             }
         );
         assert_eq!(
@@ -5376,13 +7052,13 @@ mod tests {
         );
         assert_eq!(
             driver.receipt_status(second),
-            QwpReceiptStatus::Completed { fsn: 1 }
+            QwpReceiptStatus::Published { fsn: 1 }
         );
-        assert_eq!(driver.acked_fsn(), Some(1));
+        assert_eq!(driver.acked_fsn(), Some(0));
     }
 
     #[test]
-    fn durable_reject_placeholder_waits_for_prior_durable_ok() {
+    fn durable_retryable_reject_preserves_prior_pending_ok_for_replay() {
         let mut driver = durable_driver(FakeOrderedServer::no_response());
         let first = driver.try_submit(b"first").unwrap();
         let second = driver.try_submit(b"second").unwrap();
@@ -5404,92 +7080,33 @@ mod tests {
             .transport
             .push_response(TransportResponse::Reject {
                 wire_seq: 1,
-                error: schema_mismatch_error("schema changed"),
+                error: write_error("write failed"),
             });
 
         assert_eq!(
             driver.drive_receive_once().unwrap(),
-            DriveOutcome::Rejected {
-                fsn: 1,
-                wire_seq: 1
+            DriveOutcome::Reconnected {
+                reason: ReconnectReason::RetryableFailure
             }
         );
-        assert_eq!(
-            driver.receipt_status(first),
-            QwpReceiptStatus::Sent {
-                fsn: 0,
-                wire_seq: 0
-            }
-        );
-        assert_eq!(
-            driver.receipt_status(second),
-            QwpReceiptStatus::Sent {
-                fsn: 1,
-                wire_seq: 1
-            }
-        );
-        assert_eq!(
-            driver.receipt_status(third),
-            QwpReceiptStatus::Sent {
-                fsn: 2,
-                wire_seq: 2
-            }
-        );
+        assert!(driver.receipt_status(first).is_pending());
+        assert!(driver.receipt_status(second).is_pending());
+        assert!(driver.receipt_status(third).is_pending());
         assert_eq!(driver.acked_fsn(), None);
         assert_eq!(
             driver
                 .last_server_error()
                 .map(|err| (err.status, err.message.as_str())),
-            Some((codec::WS_STATUS_SCHEMA_MISMATCH, "schema changed"))
+            Some((codec::WS_STATUS_WRITE_ERROR, "write failed"))
         );
         assert_eq!(
             driver.poll_sender_error().map(|err| err.applied_policy),
-            Some(QwpWsErrorPolicy::DropAndContinue)
-        );
-
-        driver
-            .send_core
-            .transport
-            .push_response(TransportResponse::DurableOk {
-                wire_seq: 2,
-                table_seq_txns: table_seq_txns(&[("quotes", 20)]),
-            });
-        driver
-            .send_core
-            .transport
-            .push_response(TransportResponse::DurableAck {
-                table_seq_txns: table_seq_txns(&[("quotes", 20)]),
-            });
-        assert_eq!(driver.drive_receive_once().unwrap(), DriveOutcome::Progress);
-        assert_eq!(driver.drive_receive_once().unwrap(), DriveOutcome::Progress);
-        assert_eq!(driver.acked_fsn(), None);
-
-        driver
-            .send_core
-            .transport
-            .push_response(TransportResponse::DurableAck {
-                table_seq_txns: table_seq_txns(&[("trades", 10)]),
-            });
-        assert_eq!(
-            driver.drive_receive_once().unwrap(),
-            DriveOutcome::Acked { wire_seq: 2 }
-        );
-        assert_eq!(
-            driver.receipt_status(first),
-            QwpReceiptStatus::Completed { fsn: 0 }
-        );
-        assert_eq!(
-            driver.receipt_status(second),
-            QwpReceiptStatus::Completed { fsn: 1 }
-        );
-        assert_eq!(
-            driver.receipt_status(third),
-            QwpReceiptStatus::Completed { fsn: 2 }
+            Some(QwpWsErrorPolicy::Retriable)
         );
     }
 
     #[test]
-    fn durable_reject_after_cumulative_pending_ok_is_not_a_gap_violation() {
+    fn durable_reject_after_cumulative_pending_ok_reconnects_without_gap_violation() {
         let mut driver = durable_driver(FakeOrderedServer::no_response());
         let first = driver.try_submit(b"first").unwrap();
         let second = driver.try_submit(b"second").unwrap();
@@ -5512,13 +7129,12 @@ mod tests {
             .transport
             .push_response(TransportResponse::Reject {
                 wire_seq: 2,
-                error: schema_mismatch_error("schema changed"),
+                error: write_error("write failed"),
             });
         assert_eq!(
             driver.drive_receive_once().unwrap(),
-            DriveOutcome::Rejected {
-                fsn: 2,
-                wire_seq: 2
+            DriveOutcome::Reconnected {
+                reason: ReconnectReason::RetryableFailure
             }
         );
         assert!(!driver.is_terminal());
@@ -5527,35 +7143,12 @@ mod tests {
         assert!(driver.receipt_status(third).is_pending());
         assert_eq!(
             driver.poll_sender_error().map(|err| err.applied_policy),
-            Some(QwpWsErrorPolicy::DropAndContinue)
-        );
-
-        driver
-            .send_core
-            .transport
-            .push_response(TransportResponse::DurableAck {
-                table_seq_txns: table_seq_txns(&[("trades", 10)]),
-            });
-        assert_eq!(
-            driver.drive_receive_once().unwrap(),
-            DriveOutcome::Acked { wire_seq: 2 }
-        );
-        assert_eq!(
-            driver.receipt_status(first),
-            QwpReceiptStatus::Completed { fsn: 0 }
-        );
-        assert_eq!(
-            driver.receipt_status(second),
-            QwpReceiptStatus::Completed { fsn: 1 }
-        );
-        assert_eq!(
-            driver.receipt_status(third),
-            QwpReceiptStatus::Completed { fsn: 2 }
+            Some(QwpWsErrorPolicy::Retriable)
         );
     }
 
     #[test]
-    fn durable_consecutive_rejected_placeholders_drain_after_prior_ok() {
+    fn durable_consecutive_retryable_rejects_preserve_replay_tail() {
         let mut driver = durable_driver(FakeOrderedServer::no_response());
         let first = driver.try_submit(b"first").unwrap();
         let second = driver.try_submit(b"second").unwrap();
@@ -5578,87 +7171,24 @@ mod tests {
             .transport
             .push_response(TransportResponse::Reject {
                 wire_seq: 1,
-                error: schema_mismatch_error("schema changed"),
-            });
-        driver
-            .send_core
-            .transport
-            .push_response(TransportResponse::Reject {
-                wire_seq: 2,
-                error: schema_mismatch_error("write failed"),
-            });
-        driver
-            .send_core
-            .transport
-            .push_response(TransportResponse::DurableOk {
-                wire_seq: 3,
-                table_seq_txns: table_seq_txns(&[("quotes", 20)]),
+                error: write_error("write failed"),
             });
         assert_eq!(driver.drive_receive_once().unwrap(), DriveOutcome::Progress);
         assert!(matches!(
             driver.drive_receive_once().unwrap(),
-            DriveOutcome::Rejected {
-                fsn: 1,
-                wire_seq: 1
+            DriveOutcome::Reconnected {
+                reason: ReconnectReason::RetryableFailure
             }
         ));
-        assert!(matches!(
-            driver.drive_receive_once().unwrap(),
-            DriveOutcome::Rejected {
-                fsn: 2,
-                wire_seq: 2
-            }
-        ));
-        assert_eq!(driver.drive_receive_once().unwrap(), DriveOutcome::Progress);
-
-        driver
-            .send_core
-            .transport
-            .push_response(TransportResponse::DurableAck {
-                table_seq_txns: table_seq_txns(&[("trades", 10)]),
-            });
-        assert_eq!(
-            driver.drive_receive_once().unwrap(),
-            DriveOutcome::Acked { wire_seq: 2 }
-        );
-        assert_eq!(
-            driver.receipt_status(first),
-            QwpReceiptStatus::Completed { fsn: 0 }
-        );
-        assert_eq!(
-            driver.receipt_status(second),
-            QwpReceiptStatus::Completed { fsn: 1 }
-        );
-        assert_eq!(
-            driver.receipt_status(third),
-            QwpReceiptStatus::Completed { fsn: 2 }
-        );
-        assert_eq!(
-            driver.receipt_status(fourth),
-            QwpReceiptStatus::Sent {
-                fsn: 3,
-                wire_seq: 3
-            }
-        );
-
-        driver
-            .send_core
-            .transport
-            .push_response(TransportResponse::DurableAck {
-                table_seq_txns: table_seq_txns(&[("quotes", 20)]),
-            });
-        assert_eq!(
-            driver.drive_receive_once().unwrap(),
-            DriveOutcome::Acked { wire_seq: 3 }
-        );
-        assert_eq!(
-            driver.receipt_status(fourth),
-            QwpReceiptStatus::Completed { fsn: 3 }
-        );
+        assert!(driver.receipt_status(first).is_pending());
+        assert!(driver.receipt_status(second).is_pending());
+        assert!(driver.receipt_status(third).is_pending());
+        assert!(driver.receipt_status(fourth).is_pending());
+        assert_eq!(driver.acked_fsn(), None);
     }
 
     #[test]
-    fn stale_durable_ok_for_rejected_frame_does_not_reblock_tracker() {
+    fn stale_durable_ok_after_retryable_reject_does_not_complete_before_replay() {
         let mut driver = durable_driver(FakeOrderedServer::no_response());
         let first = driver.try_submit(b"first").unwrap();
         let second = driver.try_submit(b"second").unwrap();
@@ -5670,22 +7200,19 @@ mod tests {
             .transport
             .push_response(TransportResponse::Reject {
                 wire_seq: 0,
-                error: schema_mismatch_error("schema changed"),
+                error: write_error("write failed"),
             });
         assert_eq!(
             driver.drive_receive_once().unwrap(),
-            DriveOutcome::Rejected {
-                fsn: 0,
-                wire_seq: 0
+            DriveOutcome::Reconnected {
+                reason: ReconnectReason::RetryableFailure
             }
         );
-        assert_eq!(
-            driver.receipt_status(first),
-            QwpReceiptStatus::Completed { fsn: 0 }
-        );
+        assert!(driver.receipt_status(first).is_pending());
+        assert!(driver.receipt_status(second).is_pending());
         let first_error = driver.poll_sender_error().unwrap();
         assert_eq!(first_error.message_sequence, Some(0));
-        assert_eq!(first_error.message.as_deref(), Some("schema changed"));
+        assert_eq!(first_error.message.as_deref(), Some("write failed"));
         assert_eq!(
             drain_events(&mut driver),
             vec![
@@ -5699,13 +7226,12 @@ mod tests {
                     fsn: 1,
                     wire_seq: 1,
                 },
-                DriverEvent::CompletedThrough {
-                    fsn: 0,
-                    wire_seq: 0,
-                },
                 DriverEvent::Rejected {
                     fsn: 0,
                     wire_seq: 0,
+                },
+                DriverEvent::Reconnected {
+                    reason: ReconnectReason::RetryableFailure,
                 },
             ]
         );
@@ -5716,6 +7242,31 @@ mod tests {
             .push_response(TransportResponse::DurableOk {
                 wire_seq: 0,
                 table_seq_txns: table_seq_txns(&[("trades", 99)]),
+            });
+        assert_eq!(driver.drive_receive_once().unwrap(), DriveOutcome::Progress);
+        assert!(driver.receipt_status(first).is_pending());
+        assert!(driver.receipt_status(second).is_pending());
+
+        assert!(matches!(
+            driver.drive_send_once().unwrap(),
+            DriveOutcome::Sent(SentFrame { fsn: 0, .. })
+        ));
+        assert!(matches!(
+            driver.drive_send_once().unwrap(),
+            DriveOutcome::Sent(SentFrame { fsn: 1, .. })
+        ));
+        driver
+            .send_core
+            .transport
+            .push_response(TransportResponse::DurableOk {
+                wire_seq: 0,
+                table_seq_txns: table_seq_txns(&[("trades", 10)]),
+            });
+        driver
+            .send_core
+            .transport
+            .push_response(TransportResponse::DurableAck {
+                table_seq_txns: table_seq_txns(&[("trades", 10)]),
             });
         driver
             .send_core
@@ -5730,6 +7281,7 @@ mod tests {
             .push_response(TransportResponse::DurableAck {
                 table_seq_txns: table_seq_txns(&[("quotes", 20)]),
             });
+        assert_eq!(driver.drive_receive_once().unwrap(), DriveOutcome::Progress);
         assert_eq!(
             driver.drive_receive_once().unwrap(),
             DriveOutcome::Acked { wire_seq: 0 }
@@ -5750,7 +7302,7 @@ mod tests {
     }
 
     #[test]
-    fn stale_durable_reject_for_resolved_frame_does_not_reblock_tracker() {
+    fn stale_durable_reject_before_replay_reconnects_without_completion() {
         let mut driver = durable_driver(FakeOrderedServer::no_response());
         let first = driver.try_submit(b"first").unwrap();
         let second = driver.try_submit(b"second").unwrap();
@@ -5762,39 +7314,60 @@ mod tests {
             .transport
             .push_response(TransportResponse::Reject {
                 wire_seq: 0,
-                error: schema_mismatch_error("schema changed"),
+                error: write_error("write failed"),
             });
         assert_eq!(
             driver.drive_receive_once().unwrap(),
-            DriveOutcome::Rejected {
-                fsn: 0,
-                wire_seq: 0
+            DriveOutcome::Reconnected {
+                reason: ReconnectReason::RetryableFailure
             }
         );
-        assert_eq!(
-            driver.receipt_status(first),
-            QwpReceiptStatus::Completed { fsn: 0 }
-        );
+        assert!(driver.receipt_status(first).is_pending());
+        assert!(driver.receipt_status(second).is_pending());
         let first_error = driver.poll_sender_error().unwrap();
         assert_eq!(first_error.message_sequence, Some(0));
-        assert_eq!(first_error.message.as_deref(), Some("schema changed"));
+        assert_eq!(first_error.message.as_deref(), Some("write failed"));
 
         driver
             .send_core
             .transport
             .push_response(TransportResponse::Reject {
                 wire_seq: 0,
-                error: schema_mismatch_error("schema changed again"),
+                error: write_error("write failed again"),
             });
-        assert_eq!(driver.drive_receive_once().unwrap(), DriveOutcome::Progress);
         assert_eq!(
-            driver.receipt_status(first),
-            QwpReceiptStatus::Completed { fsn: 0 }
+            driver.drive_receive_once().unwrap(),
+            DriveOutcome::Reconnected {
+                reason: ReconnectReason::RetryableFailure
+            }
         );
+        assert!(driver.receipt_status(first).is_pending());
+        assert!(driver.receipt_status(second).is_pending());
         let stale_error = driver.poll_sender_error().unwrap();
         assert_eq!(stale_error.message_sequence, Some(0));
-        assert_eq!(stale_error.message.as_deref(), Some("schema changed again"));
+        assert_eq!(stale_error.message.as_deref(), Some("write failed again"));
 
+        assert!(matches!(
+            driver.drive_send_once().unwrap(),
+            DriveOutcome::Sent(SentFrame { fsn: 0, .. })
+        ));
+        assert!(matches!(
+            driver.drive_send_once().unwrap(),
+            DriveOutcome::Sent(SentFrame { fsn: 1, .. })
+        ));
+        driver
+            .send_core
+            .transport
+            .push_response(TransportResponse::DurableOk {
+                wire_seq: 0,
+                table_seq_txns: table_seq_txns(&[("trades", 10)]),
+            });
+        driver
+            .send_core
+            .transport
+            .push_response(TransportResponse::DurableAck {
+                table_seq_txns: table_seq_txns(&[("trades", 10)]),
+            });
         driver
             .send_core
             .transport
@@ -5811,7 +7384,16 @@ mod tests {
         assert_eq!(driver.drive_receive_once().unwrap(), DriveOutcome::Progress);
         assert_eq!(
             driver.drive_receive_once().unwrap(),
+            DriveOutcome::Acked { wire_seq: 0 }
+        );
+        assert_eq!(driver.drive_receive_once().unwrap(), DriveOutcome::Progress);
+        assert_eq!(
+            driver.drive_receive_once().unwrap(),
             DriveOutcome::Acked { wire_seq: 1 }
+        );
+        assert_eq!(
+            driver.receipt_status(first),
+            QwpReceiptStatus::Completed { fsn: 0 }
         );
         assert_eq!(
             driver.receipt_status(second),
@@ -5820,11 +7402,95 @@ mod tests {
     }
 
     #[test]
-    fn raw_qwp_parse_internal_security_and_unknown_errors_are_terminal_like_java() {
+    fn server_error_policy_matches_java_v2_defaults() {
+        for (status, category, policy) in [
+            (
+                codec::WS_STATUS_SCHEMA_MISMATCH,
+                QwpWsErrorCategory::SchemaMismatch,
+                QwpWsErrorPolicy::Terminal,
+            ),
+            (
+                codec::WS_STATUS_PARSE_ERROR,
+                QwpWsErrorCategory::ParseError,
+                QwpWsErrorPolicy::Terminal,
+            ),
+            (
+                codec::WS_STATUS_SECURITY_ERROR,
+                QwpWsErrorCategory::SecurityError,
+                QwpWsErrorPolicy::Terminal,
+            ),
+            (
+                codec::WS_STATUS_WRITE_ERROR,
+                QwpWsErrorCategory::WriteError,
+                QwpWsErrorPolicy::Retriable,
+            ),
+            (
+                codec::WS_STATUS_INTERNAL_ERROR,
+                QwpWsErrorCategory::InternalError,
+                QwpWsErrorPolicy::Retriable,
+            ),
+            (
+                codec::WS_STATUS_NOT_WRITABLE,
+                QwpWsErrorCategory::NotWritable,
+                QwpWsErrorPolicy::RetriableOther,
+            ),
+            (
+                0x7f,
+                QwpWsErrorCategory::Unknown,
+                QwpWsErrorPolicy::Retriable,
+            ),
+        ] {
+            assert_eq!(server_error_category(status), category);
+            assert_eq!(server_error_policy(status), policy);
+        }
+    }
+
+    #[test]
+    fn not_writable_reject_uses_role_reconnect_reason_and_preserves_receipt() {
+        let transport = TestTransport::scripted([Ok(TransportSendResult::Response(
+            TransportResponse::Reject {
+                wire_seq: 0,
+                error: not_writable_error("replica access is read-only"),
+            },
+        ))]);
+        let mut driver =
+            QwpWsCoreTestHarness::from_queue(memory_queue(options(8, 1024, 4)), transport);
+        let receipt = driver.try_submit(b"payload").unwrap();
+
+        assert_eq!(
+            driver.drive_once(),
+            Ok(DriveOutcome::Reconnected {
+                reason: ReconnectReason::NotWritable
+            })
+        );
+        assert_eq!(driver.send_core.transport.restart_attempts, 1);
+        assert_eq!(
+            driver.send_core.transport.restart_reasons,
+            [ReconnectReason::NotWritable]
+        );
+        assert_eq!(
+            driver.receipt_status(receipt),
+            QwpReceiptStatus::Published { fsn: 0 }
+        );
+        assert_eq!(driver.acked_fsn(), None);
+
+        let error = driver.poll_sender_error().unwrap();
+        assert_eq!(error.category, QwpWsErrorCategory::NotWritable);
+        assert_eq!(error.applied_policy, QwpWsErrorPolicy::RetriableOther);
+        assert_eq!(error.status, Some(codec::WS_STATUS_NOT_WRITABLE));
+        assert_eq!(
+            error.message.as_deref(),
+            Some("replica access is read-only")
+        );
+    }
+
+    #[test]
+    fn raw_qwp_error_statuses_decode_with_expected_error_codes() {
         for (status, expected_code) in [
             (codec::WS_STATUS_PARSE_ERROR, ErrorCode::InvalidApiCall),
             (codec::WS_STATUS_INTERNAL_ERROR, ErrorCode::ServerFlushError),
             (codec::WS_STATUS_SECURITY_ERROR, ErrorCode::AuthError),
+            (codec::WS_STATUS_NOT_WRITABLE, ErrorCode::ServerFlushError),
             (0x7f, ErrorCode::ServerFlushError),
         ] {
             let payload = qwp_error_payload(status, 7, "fatal server error");
@@ -5858,7 +7524,7 @@ mod tests {
     }
 
     #[test]
-    fn future_reject_wire_sequence_clamps_to_highest_sent_like_java() {
+    fn future_reject_wire_sequence_reconnects_from_highest_sent_like_java_v2() {
         let mut driver = driver(FakeOrderedServer::scripted([FakeSendResult::RejectWire {
             wire_seq: 99,
         }]));
@@ -5866,19 +7532,18 @@ mod tests {
 
         assert_eq!(
             driver.drive_once(),
-            Ok(DriveOutcome::Rejected {
-                fsn: 0,
-                wire_seq: 99,
+            Ok(DriveOutcome::Reconnected {
+                reason: ReconnectReason::RetryableFailure
             })
         );
         assert_eq!(
             driver.receipt_status(receipt),
-            QwpReceiptStatus::Completed { fsn: 0 }
+            QwpReceiptStatus::Published { fsn: 0 }
         );
-        assert_eq!(driver.acked_fsn(), Some(0));
+        assert_eq!(driver.acked_fsn(), None);
 
         let error = driver.poll_sender_error().unwrap();
-        assert_eq!(error.applied_policy, QwpWsErrorPolicy::DropAndContinue);
+        assert_eq!(error.applied_policy, QwpWsErrorPolicy::Retriable);
         assert_eq!(error.message_sequence, Some(99));
         assert_eq!(error.from_fsn, 0);
         assert_eq!(error.to_fsn, 0);
@@ -5912,7 +7577,7 @@ mod tests {
             .transport
             .push_response(TransportResponse::Reject {
                 wire_seq: 99,
-                error: schema_mismatch_error("late schema mismatch"),
+                error: write_error("late write failure"),
             });
         assert_eq!(driver.drive_receive_once().unwrap(), DriveOutcome::Progress);
 
@@ -5923,7 +7588,7 @@ mod tests {
         assert_eq!(driver.acked_fsn(), Some(0));
 
         let error = driver.poll_sender_error().unwrap();
-        assert_eq!(error.applied_policy, QwpWsErrorPolicy::DropAndContinue);
+        assert_eq!(error.applied_policy, QwpWsErrorPolicy::Retriable);
         assert_eq!(error.message_sequence, Some(99));
         assert_eq!(error.from_fsn, 0);
         assert_eq!(error.to_fsn, 0);
@@ -6197,7 +7862,7 @@ mod tests {
     }
 
     #[test]
-    fn reconnect_policy_exhaustion_terminalizes_current_unresolved_receipts() {
+    fn reconnect_policy_exhaustion_keeps_sf_receipts_replayable() {
         let transport = TestTransport::scripted([Ok(TransportSendResult::Failure(
             TransportFailure::Retryable(fake_transport_error("retryable outage")),
         ))])
@@ -6222,28 +7887,15 @@ mod tests {
             DriveOutcome::ReconnectDelay { .. }
         ));
         std::thread::sleep(Duration::from_millis(20));
-        assert_eq!(driver.drive_once().unwrap(), DriveOutcome::Terminal);
+        assert!(matches!(
+            driver.drive_once().unwrap(),
+            DriveOutcome::ReconnectDelay { .. }
+        ));
         assert_eq!(driver.send_core.transport.restart_attempts, 1);
-        let terminal_msg = driver.terminal_error().unwrap().msg();
-        assert!(
-            terminal_msg.contains("QWP/WebSocket reconnect retry budget exhausted"),
-            "got: {terminal_msg}"
-        );
-        assert!(terminal_msg.contains("attempts=1"), "got: {terminal_msg}");
-        assert!(terminal_msg.contains("elapsed_ms="), "got: {terminal_msg}");
-        assert!(
-            terminal_msg.contains("last_error=reconnect failed once"),
-            "got: {terminal_msg}"
-        );
-        assert_eq!(
-            driver.receipt_status(first),
-            QwpReceiptStatus::Terminal { fsn: 0 }
-        );
-        assert_eq!(
-            driver.receipt_status(second),
-            QwpReceiptStatus::Terminal { fsn: 1 }
-        );
-        assert_eq!(driver.try_submit(b"third"), Err(DriverError::Terminal));
+        assert_eq!(driver.terminal_error(), None);
+        assert!(driver.receipt_status(first).is_pending());
+        assert!(driver.receipt_status(second).is_pending());
+        assert!(driver.try_submit(b"third").is_ok());
     }
 
     #[test]
@@ -6287,6 +7939,20 @@ mod tests {
 
         assert_eq!(lifecycle.load(), PublicationState::Terminal);
         assert!(store.is_terminal());
+    }
+
+    #[test]
+    fn first_terminal_error_wins_over_late_structured_diagnostic() {
+        let queue = memory_queue(options(4, 1024, 2));
+        let mut store = QwpWsPublicationStore::new(queue, DEFAULT_EVENT_CAPACITY);
+        store.mark_terminal(Some(Error::new(ErrorCode::SocketError, "first terminal")));
+
+        let returned = store.record_protocol_violation(None, "late violation".to_string());
+
+        assert_eq!(returned.msg(), "first terminal");
+        assert_eq!(store.terminal_error().unwrap().msg(), "first terminal");
+        assert_eq!(store.terminal_sender_error(), None);
+        assert_eq!(store.poll_sender_error(), None);
     }
 
     #[test]
@@ -6409,7 +8075,7 @@ mod tests {
     }
 
     #[test]
-    fn reject_after_prior_ack_completes_rejected_frame_and_leaves_later_frame_unresolved() {
+    fn retriable_reject_after_prior_ack_reconnects_and_preserves_replay_tail() {
         let mut driver = driver(FakeOrderedServer::scripted([
             FakeSendResult::AckWire { wire_seq: 0 },
             FakeSendResult::RejectWire { wire_seq: 1 },
@@ -6424,9 +8090,8 @@ mod tests {
         );
         assert_eq!(
             driver.drive_once().unwrap(),
-            DriveOutcome::Rejected {
-                fsn: 1,
-                wire_seq: 1
+            DriveOutcome::Reconnected {
+                reason: ReconnectReason::RetryableFailure
             }
         );
 
@@ -6436,13 +8101,13 @@ mod tests {
         );
         assert_eq!(
             driver.receipt_status(second),
-            QwpReceiptStatus::Completed { fsn: 1 }
+            QwpReceiptStatus::Published { fsn: 1 }
         );
         assert_eq!(
             driver
                 .last_server_error()
                 .map(|err| (err.status, err.message.as_str())),
-            Some((codec::WS_STATUS_SCHEMA_MISMATCH, "fake schema mismatch"))
+            Some((codec::WS_STATUS_WRITE_ERROR, "fake write error"))
         );
         assert_eq!(
             driver.receipt_status(third),
@@ -6484,7 +8149,7 @@ mod tests {
     }
 
     #[test]
-    fn rejection_event_agrees_with_completed_receipt_status() {
+    fn retriable_rejection_event_agrees_with_pending_replay_status() {
         let mut driver = driver(FakeOrderedServer::scripted([
             FakeSendResult::AckWire { wire_seq: 0 },
             FakeSendResult::RejectWire { wire_seq: 1 },
@@ -6498,10 +8163,7 @@ mod tests {
             DriveOutcome::Acked { wire_seq: 0 }
         );
         driver.drive_once().unwrap();
-        assert_eq!(
-            driver.delivery_status(second).unwrap(),
-            Some(DeliveryOutcome::Completed)
-        );
+        assert_eq!(driver.delivery_status(second).unwrap(), None);
 
         assert_eq!(
             drain_events(&mut driver),
@@ -6521,13 +8183,12 @@ mod tests {
                     fsn: 1,
                     wire_seq: 1,
                 },
-                DriverEvent::CompletedThrough {
-                    fsn: 1,
-                    wire_seq: 1,
-                },
                 DriverEvent::Rejected {
                     fsn: 1,
                     wire_seq: 1,
+                },
+                DriverEvent::Reconnected {
+                    reason: ReconnectReason::RetryableFailure,
                 },
             ]
         );
@@ -6537,7 +8198,7 @@ mod tests {
         );
         assert_eq!(
             driver.receipt_status(second),
-            QwpReceiptStatus::Completed { fsn: 1 }
+            QwpReceiptStatus::Published { fsn: 1 }
         );
         assert_eq!(
             driver.receipt_status(third),
@@ -6546,7 +8207,7 @@ mod tests {
     }
 
     #[test]
-    fn ack_after_ordered_reject_completes_later_receipt() {
+    fn retriable_reject_replays_from_rejected_frame_before_later_receipt() {
         let mut driver = driver(FakeOrderedServer::scripted([
             FakeSendResult::AckWire { wire_seq: 0 },
             FakeSendResult::RejectWire { wire_seq: 1 },
@@ -6562,14 +8223,13 @@ mod tests {
         );
         assert_eq!(
             driver.drive_once().unwrap(),
-            DriveOutcome::Rejected {
-                fsn: 1,
-                wire_seq: 1
+            DriveOutcome::Reconnected {
+                reason: ReconnectReason::RetryableFailure
             }
         );
         assert_eq!(
             driver.drive_once().unwrap(),
-            DriveOutcome::Acked { wire_seq: 2 }
+            DriveOutcome::Acked { wire_seq: 0 }
         );
 
         assert_eq!(
@@ -6582,12 +8242,12 @@ mod tests {
         );
         assert_eq!(
             driver.receipt_status(third),
-            QwpReceiptStatus::Completed { fsn: 2 }
+            QwpReceiptStatus::Published { fsn: 2 }
         );
     }
 
     #[test]
-    fn wait_reports_completed_receipt_after_reject_and_continue() {
+    fn wait_keeps_receipt_pending_after_retriable_reject_until_replay_ack() {
         let mut driver = driver(FakeOrderedServer::scripted([FakeSendResult::RejectWire {
             wire_seq: 0,
         }]));
@@ -6595,39 +8255,222 @@ mod tests {
 
         driver.drive_once().unwrap();
 
-        assert_eq!(
-            driver.delivery_status(receipt).unwrap(),
-            Some(DeliveryOutcome::Completed)
-        );
+        assert_eq!(driver.delivery_status(receipt).unwrap(), None);
         assert_eq!(
             driver.receipt_status(receipt),
-            QwpReceiptStatus::Completed { fsn: 0 }
+            QwpReceiptStatus::Published { fsn: 0 }
         );
     }
 
     #[test]
-    fn reject_and_continue_server_error_is_pollable() {
+    fn retriable_server_error_is_pollable() {
         let mut driver = driver(FakeOrderedServer::scripted([FakeSendResult::RejectWire {
             wire_seq: 0,
         }]));
         let receipt = driver.try_submit(b"payload").unwrap();
 
         driver.drive_once().unwrap();
-        assert_eq!(
-            driver.delivery_status(receipt).unwrap(),
-            Some(DeliveryOutcome::Completed)
-        );
+        assert_eq!(driver.delivery_status(receipt).unwrap(), None);
 
         let error = driver.poll_sender_error().unwrap();
-        assert_eq!(error.category, QwpWsErrorCategory::SchemaMismatch);
-        assert_eq!(error.applied_policy, QwpWsErrorPolicy::DropAndContinue);
-        assert_eq!(error.status, Some(codec::WS_STATUS_SCHEMA_MISMATCH));
-        assert_eq!(error.message.as_deref(), Some("fake schema mismatch"));
+        assert_eq!(error.category, QwpWsErrorCategory::WriteError);
+        assert_eq!(error.applied_policy, QwpWsErrorPolicy::Retriable);
+        assert_eq!(error.status, Some(codec::WS_STATUS_WRITE_ERROR));
+        assert_eq!(error.message.as_deref(), Some("fake write error"));
         assert_eq!(error.message_sequence, Some(0));
         assert_eq!(error.from_fsn, 0);
         assert_eq!(error.to_fsn, 0);
         assert_eq!(driver.terminal_sender_error(), None);
         assert_eq!(driver.poll_sender_error(), None);
+    }
+
+    #[test]
+    fn retriable_reject_poison_terminal_carries_last_server_error() {
+        let mut driver = driver(FakeOrderedServer::scripted([
+            FakeSendResult::RejectWire { wire_seq: 0 },
+            FakeSendResult::RejectWire { wire_seq: 1 },
+            FakeSendResult::RejectWire { wire_seq: 2 },
+            FakeSendResult::RejectWire { wire_seq: 3 },
+        ]));
+        let (sink, callback_ran) = terminal_latch_asserting_sink(driver.store.lifecycle());
+        driver.store.set_rejection_sink(Some(sink));
+        let receipt = driver.try_submit(b"payload").unwrap();
+
+        let mut outcome = driver.drive_once().unwrap();
+        for _ in 0..8 {
+            if outcome == DriveOutcome::Terminal {
+                break;
+            }
+            outcome = driver.drive_once().unwrap();
+        }
+        assert_eq!(outcome, DriveOutcome::Terminal);
+        assert_eq!(
+            driver.receipt_status(receipt),
+            QwpReceiptStatus::Terminal { fsn: 0 }
+        );
+
+        let terminal_error = driver.terminal_sender_error().unwrap();
+        assert_eq!(
+            terminal_error.category,
+            QwpWsErrorCategory::ProtocolViolation
+        );
+        assert!(
+            terminal_error.message.as_deref().is_some_and(|message| {
+                message.contains("was rejected 4 times without ACK progress")
+                    && message.contains("fake write error")
+            }),
+            "poison terminal must carry the last server error, got: {:?}",
+            terminal_error.message
+        );
+        assert!(callback_ran.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn role_reject_poison_terminal_is_resend_required_not_protocol_violation() {
+        // A read-only / role reject (NOT_WRITABLE, e.g. a replica after an
+        // in-place role switch) that persists past the poison budget must
+        // terminalize under the NotWritable category as "resend required" - NOT
+        // as a ProtocolViolation. A graceful role switch is not a wire-protocol
+        // violation, and the queued data stays recoverable for a resend.
+        let mut driver = driver(FakeOrderedServer::scripted([
+            FakeSendResult::RejectWireNotWritable { wire_seq: 0 },
+            FakeSendResult::RejectWireNotWritable { wire_seq: 1 },
+            FakeSendResult::RejectWireNotWritable { wire_seq: 2 },
+            FakeSendResult::RejectWireNotWritable { wire_seq: 3 },
+        ]));
+        let (sink, callback_ran) = terminal_latch_asserting_sink(driver.store.lifecycle());
+        driver.store.set_rejection_sink(Some(sink));
+        let receipt = driver.try_submit(b"payload").unwrap();
+
+        let mut outcome = driver.drive_once().unwrap();
+        for _ in 0..8 {
+            if outcome == DriveOutcome::Terminal {
+                break;
+            }
+            outcome = driver.drive_once().unwrap();
+        }
+        assert_eq!(outcome, DriveOutcome::Terminal);
+        assert_eq!(
+            driver.receipt_status(receipt),
+            QwpReceiptStatus::Terminal { fsn: 0 }
+        );
+
+        let terminal_error = driver.terminal_sender_error().unwrap();
+        assert_eq!(
+            terminal_error.category,
+            QwpWsErrorCategory::NotWritable,
+            "role reject must terminalize under its own category, not ProtocolViolation"
+        );
+        assert_ne!(
+            terminal_error.category,
+            QwpWsErrorCategory::ProtocolViolation
+        );
+        assert_eq!(terminal_error.applied_policy, QwpWsErrorPolicy::Terminal);
+        assert_eq!(terminal_error.status, Some(codec::WS_STATUS_NOT_WRITABLE));
+        assert!(callback_ran.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn poison_dwell_driver_holds_terminal_until_window_elapses() {
+        let mut driver = QwpWsCoreTestHarness::from_queue_with_rejection_limit_and_window(
+            memory_queue(options(8, 1024, 4)),
+            FakeOrderedServer::scripted([
+                FakeSendResult::RejectWire { wire_seq: 0 },
+                FakeSendResult::RejectWire { wire_seq: 1 },
+                FakeSendResult::RejectWire { wire_seq: 2 },
+            ]),
+            2,
+            Duration::from_millis(200),
+        );
+        let receipt = driver.try_submit(b"payload").unwrap();
+
+        assert_eq!(
+            driver.drive_once().unwrap(),
+            DriveOutcome::Reconnected {
+                reason: ReconnectReason::RetryableFailure
+            }
+        );
+        assert_eq!(
+            driver.drive_once().unwrap(),
+            DriveOutcome::Reconnected {
+                reason: ReconnectReason::RetryableFailure
+            }
+        );
+        assert_eq!(
+            driver.receipt_status(receipt),
+            QwpReceiptStatus::Published { fsn: 0 }
+        );
+
+        std::thread::sleep(Duration::from_millis(250));
+        assert_eq!(driver.drive_once().unwrap(), DriveOutcome::Terminal);
+        assert_eq!(
+            driver.receipt_status(receipt),
+            QwpReceiptStatus::Terminal { fsn: 0 }
+        );
+
+        let terminal_error = driver.terminal_sender_error().unwrap();
+        assert!(
+            terminal_error.message.as_deref().is_some_and(|message| {
+                message.contains("was rejected 3 times without ACK progress")
+                    && message.contains("fake write error")
+            }),
+            "poison terminal must report actual strike count, got: {:?}",
+            terminal_error.message
+        );
+    }
+
+    #[test]
+    fn server_close_before_any_send_does_not_strike() {
+        let mut driver = QwpWsCoreTestHarness::from_queue_with_rejection_limit_and_window(
+            memory_queue(options(8, 1024, 4)),
+            FakeOrderedServer::no_response(),
+            1,
+            Duration::ZERO,
+        );
+        driver.try_submit(b"payload").unwrap();
+
+        match driver.send_core.transport_failure_action(
+            &mut driver.store,
+            TransportFailure::ServerClose(fake_transport_error("server close")),
+        ) {
+            QwpWsTransportFailureAction::Reconnect { reason, .. } => {
+                assert_eq!(reason, ReconnectReason::Disconnect);
+            }
+            other => panic!("expected reconnect, got {other:?}"),
+        }
+        assert_eq!(driver.send_core.poison_tracker.strikes(), 0);
+        assert!(!driver.is_terminal());
+    }
+
+    #[test]
+    fn server_close_after_send_still_strikes() {
+        let mut driver = QwpWsCoreTestHarness::from_queue_with_rejection_limit_and_window(
+            memory_queue(options(8, 1024, 4)),
+            FakeOrderedServer::no_response(),
+            1,
+            Duration::ZERO,
+        );
+        driver.try_submit(b"payload").unwrap();
+
+        assert!(matches!(
+            driver.drive_send_once().unwrap(),
+            DriveOutcome::Sent(_)
+        ));
+        match driver.send_core.transport_failure_action(
+            &mut driver.store,
+            TransportFailure::ServerClose(fake_transport_error("server close")),
+        ) {
+            QwpWsTransportFailureAction::Terminal(err) => {
+                assert!(
+                    err.msg()
+                        .contains("was closed 1 times without ACK progress"),
+                    "unexpected terminal error: {}",
+                    err.msg()
+                );
+            }
+            other => panic!("expected terminal, got {other:?}"),
+        }
+        assert!(driver.is_terminal());
     }
 
     #[test]
@@ -6663,6 +8506,8 @@ mod tests {
     #[test]
     fn terminal_qwp_server_error_is_pollable_after_terminalization() {
         let mut driver = driver(FakeOrderedServer::no_response());
+        let (sink, callback_ran) = terminal_latch_asserting_sink(driver.store.lifecycle());
+        driver.store.set_rejection_sink(Some(sink));
         let receipt = driver.try_submit(b"payload").unwrap();
         assert!(matches!(
             driver.drive_once().unwrap(),
@@ -6688,7 +8533,7 @@ mod tests {
 
         let terminal_error = driver.terminal_sender_error().unwrap();
         assert_eq!(terminal_error.category, QwpWsErrorCategory::ParseError);
-        assert_eq!(terminal_error.applied_policy, QwpWsErrorPolicy::Halt);
+        assert_eq!(terminal_error.applied_policy, QwpWsErrorPolicy::Terminal);
         assert_eq!(terminal_error.status, Some(codec::WS_STATUS_PARSE_ERROR));
         assert_eq!(terminal_error.message.as_deref(), Some("bad payload"));
         assert_eq!(terminal_error.message_sequence, Some(0));
@@ -6701,18 +8546,21 @@ mod tests {
 
         let error = driver.poll_sender_error().unwrap();
         assert_eq!(error.category, QwpWsErrorCategory::ParseError);
-        assert_eq!(error.applied_policy, QwpWsErrorPolicy::Halt);
+        assert_eq!(error.applied_policy, QwpWsErrorPolicy::Terminal);
         assert_eq!(error.status, Some(codec::WS_STATUS_PARSE_ERROR));
         assert_eq!(error.message.as_deref(), Some("bad payload"));
         assert_eq!(error.message_sequence, Some(0));
         assert_eq!(error.from_fsn, 0);
         assert_eq!(error.to_fsn, 0);
         assert_eq!(driver.terminal_sender_error(), Some(&error));
+        assert!(callback_ran.load(Ordering::Acquire));
     }
 
     #[test]
     fn protocol_violation_error_records_unresolved_fsn_span() {
         let mut driver = driver(FakeOrderedServer::no_response());
+        let (sink, callback_ran) = terminal_latch_asserting_sink(driver.store.lifecycle());
+        driver.store.set_rejection_sink(Some(sink));
         driver.try_submit(b"first").unwrap();
         driver.try_submit(b"second").unwrap();
 
@@ -6735,7 +8583,7 @@ mod tests {
             terminal_error.category,
             QwpWsErrorCategory::ProtocolViolation
         );
-        assert_eq!(terminal_error.applied_policy, QwpWsErrorPolicy::Halt);
+        assert_eq!(terminal_error.applied_policy, QwpWsErrorPolicy::Terminal);
         assert_eq!(terminal_error.status, None);
         assert_eq!(terminal_error.message_sequence, None);
         assert_eq!(terminal_error.from_fsn, 0);
@@ -6747,10 +8595,11 @@ mod tests {
                 .unwrap()
                 .contains("bad frame")
         );
+        assert!(callback_ran.load(Ordering::Acquire));
 
         let error = driver.poll_sender_error().unwrap();
         assert_eq!(error.category, QwpWsErrorCategory::ProtocolViolation);
-        assert_eq!(error.applied_policy, QwpWsErrorPolicy::Halt);
+        assert_eq!(error.applied_policy, QwpWsErrorPolicy::Terminal);
         assert_eq!(error.status, None);
         assert_eq!(error.message_sequence, None);
         assert_eq!(error.from_fsn, 0);
@@ -6772,16 +8621,20 @@ mod tests {
 
         assert!(matches!(
             driver.drive_once().unwrap(),
-            DriveOutcome::Rejected { fsn: 0, .. }
+            DriveOutcome::Reconnected {
+                reason: ReconnectReason::RetryableFailure
+            }
         ));
         assert!(matches!(
             driver.drive_once().unwrap(),
-            DriveOutcome::Rejected { fsn: 1, .. }
+            DriveOutcome::Reconnected {
+                reason: ReconnectReason::RetryableFailure
+            }
         ));
 
         assert_eq!(driver.sender_errors_dropped_total(), 1);
         let error = driver.poll_sender_error().unwrap();
-        assert_eq!(error.from_fsn, 1);
+        assert_eq!(error.from_fsn, 0);
         assert_eq!(driver.poll_sender_error(), None);
     }
 
@@ -6855,7 +8708,7 @@ mod tests {
     }
 
     #[test]
-    fn drive_receive_once_reports_presend_drop_reject_without_ack_advance_like_java() {
+    fn drive_receive_once_terminalizes_presend_schema_reject_without_ack_advance() {
         let mut server = FakeOrderedServer::no_response();
         server.push_response(FakeServerResponse::Reject {
             wire_seq: 42,
@@ -6864,7 +8717,41 @@ mod tests {
         let mut driver = driver(server);
         let receipt = driver.try_submit(b"payload").unwrap();
 
-        assert_eq!(driver.drive_receive_once(), Ok(DriveOutcome::Progress));
+        assert_eq!(driver.drive_receive_once(), Ok(DriveOutcome::Terminal));
+
+        assert_eq!(
+            driver.receipt_status(receipt),
+            QwpReceiptStatus::Terminal { fsn: 0 }
+        );
+        assert_eq!(driver.acked_fsn(), None);
+        assert!(driver.terminal_sender_error().is_some());
+
+        let error = driver.poll_sender_error().unwrap();
+        assert_eq!(error.category, QwpWsErrorCategory::SchemaMismatch);
+        assert_eq!(error.applied_policy, QwpWsErrorPolicy::Terminal);
+        assert_eq!(error.status, Some(codec::WS_STATUS_SCHEMA_MISMATCH));
+        assert_eq!(error.message.as_deref(), Some("pre-send schema mismatch"));
+        assert_eq!(error.message_sequence, Some(42));
+        assert_eq!(error.from_fsn, 0);
+        assert_eq!(error.to_fsn, 0);
+    }
+
+    #[test]
+    fn drive_receive_once_reconnects_presend_retryable_reject_without_ack_advance() {
+        let mut server = FakeOrderedServer::no_response();
+        server.push_response(FakeServerResponse::Reject {
+            wire_seq: 42,
+            error: write_error("pre-send write failure"),
+        });
+        let mut driver = driver(server);
+        let receipt = driver.try_submit(b"payload").unwrap();
+
+        assert_eq!(
+            driver.drive_receive_once(),
+            Ok(DriveOutcome::Reconnected {
+                reason: ReconnectReason::RetryableFailure
+            })
+        );
 
         assert_eq!(
             driver.receipt_status(receipt),
@@ -6874,17 +8761,17 @@ mod tests {
         assert_eq!(driver.terminal_sender_error(), None);
 
         let error = driver.poll_sender_error().unwrap();
-        assert_eq!(error.category, QwpWsErrorCategory::SchemaMismatch);
-        assert_eq!(error.applied_policy, QwpWsErrorPolicy::DropAndContinue);
-        assert_eq!(error.status, Some(codec::WS_STATUS_SCHEMA_MISMATCH));
-        assert_eq!(error.message.as_deref(), Some("pre-send schema mismatch"));
+        assert_eq!(error.category, QwpWsErrorCategory::WriteError);
+        assert_eq!(error.applied_policy, QwpWsErrorPolicy::Retriable);
+        assert_eq!(error.status, Some(codec::WS_STATUS_WRITE_ERROR));
+        assert_eq!(error.message.as_deref(), Some("pre-send write failure"));
         assert_eq!(error.message_sequence, Some(42));
         assert_eq!(error.from_fsn, 0);
         assert_eq!(error.to_fsn, 0);
     }
 
     #[test]
-    fn drive_receive_once_terminalizes_presend_halt_reject_without_ack_advance_like_java() {
+    fn drive_receive_once_terminalizes_presend_terminal_reject_without_ack_advance_like_java() {
         let mut server = FakeOrderedServer::no_response();
         server.push_response(FakeServerResponse::Reject {
             wire_seq: 7,
@@ -6895,6 +8782,8 @@ mod tests {
             },
         });
         let mut driver = driver(server);
+        let (sink, callback_ran) = terminal_latch_asserting_sink(driver.store.lifecycle());
+        driver.store.set_rejection_sink(Some(sink));
         let receipt = driver.try_submit(b"payload").unwrap();
 
         assert_eq!(driver.drive_receive_once(), Ok(DriveOutcome::Terminal));
@@ -6907,10 +8796,11 @@ mod tests {
 
         let terminal_error = driver.terminal_sender_error().unwrap();
         assert_eq!(terminal_error.category, QwpWsErrorCategory::ParseError);
-        assert_eq!(terminal_error.applied_policy, QwpWsErrorPolicy::Halt);
+        assert_eq!(terminal_error.applied_policy, QwpWsErrorPolicy::Terminal);
         assert_eq!(terminal_error.message_sequence, Some(7));
         assert_eq!(terminal_error.from_fsn, 0);
         assert_eq!(terminal_error.to_fsn, 0);
+        assert!(callback_ran.load(Ordering::Acquire));
     }
 
     #[test]

@@ -42,7 +42,7 @@ use std::io::{BufRead, BufReader, Write};
 use std::process;
 use std::time::Duration;
 
-use questdb::ingress::{Buffer, Sender, TimestampMicros};
+use questdb::ingress::{AckLevel, Buffer, Sender, TimestampMicros};
 
 fn main() {
     let stdin = std::io::stdin();
@@ -94,6 +94,7 @@ fn main() {
 struct State {
     sender: Option<Sender>,
     buf: Option<Buffer>,
+    request_durable_ack: bool,
 }
 
 impl State {
@@ -106,6 +107,7 @@ impl State {
             let _ = s.close_drain();
         }
         self.buf = None;
+        self.request_durable_ack = false;
     }
 }
 
@@ -123,6 +125,7 @@ fn handle(line: &str, state: &mut State, out: &mut impl Write) -> Result<(), Str
             state.close_quietly();
             let sender = Sender::from_conf(rest).map_err(|e| e.to_string())?;
             let buf = sender.new_buffer();
+            state.request_durable_ack = request_durable_ack_enabled(rest);
             state.sender = Some(sender);
             state.buf = Some(buf);
             reply_ok(out, "")
@@ -188,37 +191,60 @@ fn handle(line: &str, state: &mut State, out: &mut impl Write) -> Result<(), Str
             if parts.len() < 2 {
                 return Err("usage: AWAIT_ACKED <fsn> <timeout_ms>".into());
             }
-            let fsn: u64 = parts[0].parse().map_err(|_| "invalid fsn".to_string())?;
+            // `fsn` is retained for wire-protocol compatibility; the AckLevel
+            // `wait` API waits for the full published boundary (no token).
+            let _fsn: u64 = parts[0].parse().map_err(|_| "invalid fsn".to_string())?;
             let timeout_ms: u64 = parts[1]
                 .parse()
                 .map_err(|_| "invalid timeout_ms".to_string())?;
-            let reached = sender
-                .await_acked_fsn(fsn, Duration::from_millis(timeout_ms))
-                .map_err(|e| e.to_string())?;
-            reply_ok(out, if reached { "true" } else { "false" })
+            let ack_level = if state.request_durable_ack {
+                AckLevel::Durable
+            } else {
+                AckLevel::Ok
+            };
+            match sender.wait(ack_level, Duration::from_millis(timeout_ms)) {
+                Ok(()) => reply_ok(out, "true"),
+                Err(e)
+                    if e.code() == questdb::ErrorCode::FailoverRetry
+                        && e.msg().contains("timed out") =>
+                {
+                    reply_ok(out, "false")
+                }
+                Err(e) => Err(e.to_string()),
+            }
         }
         "STATS" => {
             let sender = state
                 .sender
                 .as_ref()
                 .ok_or_else(|| "no sender".to_string())?;
-            // `acked_fsn` returns None until the first ACK lands; emit
-            // -1 to match the Python parser's default and the Java
-            // sidecar's "no-frame-yet" convention.
+            // Best-effort, never replies ERR: STATS is a diagnostic verb the
+            // harness calls *after* write errors (e.g. a write to a node that
+            // went read-only on a role switch) to read counters. The sender's
+            // accessors can surface its last wire error as Err in that state;
+            // the Java sidecar's STATS always returns its counters regardless,
+            // so mirror that and fall back to the -1/0 sentinels the Python
+            // parser already expects rather than failing the whole STATS.
+            // `acked_fsn` also returns None until the first ACK lands -> -1.
             let acked = sender
                 .acked_fsn()
-                .map_err(|e| e.to_string())?
+                .ok()
+                .flatten()
                 .map(|n| n as i64)
                 .unwrap_or(-1);
-            let totals = sender.qwp_ws_totals().map_err(|e| e.to_string())?;
-            let payload = format!(
-                "acked={acked} sent={} acks={} reconnAttempts={} reconnSucc={} serverErrors={}",
-                totals.frames_sent,
-                totals.acks,
-                totals.reconnect_attempts,
-                totals.reconnects_succeeded,
-                totals.server_errors,
-            );
+            let payload = match sender.qwp_ws_totals() {
+                Ok(t) => format!(
+                    "acked={acked} sent={} acks={} reconnAttempts={} reconnSucc={} serverErrors={}",
+                    t.frames_sent,
+                    t.acks,
+                    t.reconnect_attempts,
+                    t.reconnects_succeeded,
+                    t.server_errors,
+                ),
+                Err(_) => format!(
+                    "acked={acked} sent=0 acks=0 reconnAttempts=0 reconnSucc=0 serverErrors=0"
+                ),
+            };
             reply_ok(out, &payload)
         }
         "CLOSE" => {
@@ -240,6 +266,16 @@ fn handle(line: &str, state: &mut State, out: &mut impl Write) -> Result<(), Str
         }
         _ => Err(format!("unknown verb: {verb}")),
     }
+}
+
+fn request_durable_ack_enabled(conf: &str) -> bool {
+    conf.split(';').any(|part| {
+        let Some((key, value)) = part.split_once('=') else {
+            return false;
+        };
+        key.trim().eq_ignore_ascii_case("request_durable_ack")
+            && matches!(value.trim().to_ascii_lowercase().as_str(), "on" | "true")
+    })
 }
 
 fn reply_ok(out: &mut impl Write, payload: &str) -> Result<(), String> {

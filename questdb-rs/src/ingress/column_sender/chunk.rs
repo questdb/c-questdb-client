@@ -1,0 +1,2002 @@
+/*******************************************************************************
+ *     ___                  _   ____  ____
+ *    / _ \ _   _  ___  ___| |_|  _ \| __ )
+ *   | | | | | | |/ _ \/ __| __| | | |  _ \
+ *   | |_| | |_| |  __/\__ \ |_| |_| | |_) |
+ *    \__\_\\__,_|\___||___/\__|____/|____/
+ *
+ *  Copyright (c) 2014-2019 Appsicle
+ *  Copyright (c) 2019-2025 QuestDB
+ *
+ *  Licensed under the Apache License, Version 2.0 (the "License");
+ *  you may not use this file except in compliance with the License.
+ *  You may obtain a copy of the License at
+ *
+ *  http://www.apache.org/licenses/LICENSE-2.0
+ *
+ *  Unless required by applicable law or agreed to in writing, software
+ *  distributed under the License is distributed on an "AS IS" BASIS,
+ *  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ *  See the License for the specific language governing permissions and
+ *  limitations under the License.
+ *
+ ******************************************************************************/
+
+//! Column-major chunk: one batch of borrowed column buffers destined for a
+//! single QuestDB table.
+//!
+//! `Chunk<'a>` stores **descriptors** — raw pointers, lengths, and optional
+//! validity bitmaps — for borrowed columns. No data is copied when columns are
+//! appended.
+//!
+//! For each batch, create the backing buffers first, then create and populate a
+//! `Chunk`, flush it, and let the chunk go out of scope before the backing
+//! buffers.
+//!
+//! At flush time, the [`encoder`](super::encoder) walks the descriptors
+//! and writes wire bytes straight into the connection's reusable write
+//! buffer. The no-null hot path is a single `memcpy` per column from the
+//! caller's buffer into that buffer.
+
+use std::fmt::{self, Debug, Formatter};
+use std::marker::PhantomData;
+use std::slice;
+
+use crate::ingress::TimestampUnit;
+use crate::{Result, error};
+
+#[cfg(feature = "arrow-ingress")]
+use super::arrow_batch;
+use super::numpy_wire;
+use super::validity::{Validity, check_row_count};
+use super::wire::{
+    QWP_TYPE_BINARY, QWP_TYPE_BOOLEAN, QWP_TYPE_BYTE, QWP_TYPE_DATE, QWP_TYPE_DOUBLE,
+    QWP_TYPE_FLOAT, QWP_TYPE_INT, QWP_TYPE_IPV4, QWP_TYPE_LONG, QWP_TYPE_LONG256, QWP_TYPE_SHORT,
+    QWP_TYPE_SYMBOL, QWP_TYPE_TIMESTAMP, QWP_TYPE_TIMESTAMP_NANOS, QWP_TYPE_UUID, QWP_TYPE_VARCHAR,
+    validate_column_name,
+};
+
+// ===========================================================================
+// Descriptors
+// ===========================================================================
+
+#[cfg(feature = "arrow-ingress")]
+pub struct ImportedArrowColumn {
+    field: arrow::datatypes::Field,
+    array: arrow::array::ArrayRef,
+    kind: arrow_batch::ColumnKind,
+}
+
+#[cfg(feature = "arrow-ingress")]
+impl ImportedArrowColumn {
+    /// Import an Arrow column from the Arrow C Data Interface.
+    ///
+    /// # Safety
+    ///
+    /// The caller must ensure that `array` and `schema` are valid
+    /// `FFI_ArrowArray` / `FFI_ArrowSchema` structures as produced by
+    /// the Arrow C Data Interface. The caller's `array.release` is
+    /// consumed unconditionally: cleared to `None` on every return,
+    /// success or error. The caller MUST NOT invoke the original
+    /// release after this call. `schema` is borrowed and remains owned
+    /// by the caller.
+    pub unsafe fn import_from_ffi(
+        array: &mut arrow::ffi::FFI_ArrowArray,
+        schema: &arrow::ffi::FFI_ArrowSchema,
+        symbol: Option<bool>,
+    ) -> Result<Self> {
+        use arrow::array::make_array;
+
+        let imported_array = unsafe { std::ptr::read(array) };
+        array.release = None;
+
+        let mut field = arrow::datatypes::Field::try_from(schema)
+            .map_err(|err| error::fmt!(ArrowIngest, "schema conversion failed: {}", err))?;
+        if let Some(want_symbol) = symbol {
+            let mut metadata = field.metadata().clone();
+            metadata.insert(
+                crate::arrow_metadata::SYMBOL.to_string(),
+                if want_symbol { "true" } else { "false" }.to_string(),
+            );
+            field = field.with_metadata(metadata);
+        }
+        let array_data = unsafe { arrow::ffi::from_ffi(imported_array, schema) }
+            .map_err(|err| error::fmt!(ArrowIngest, "from_ffi failed: {}", err))?;
+        // Structural validation only (buffer sizes) — the O(data) `validate_full`
+        // offset/UTF-8/null-count scan is deliberately skipped. The encoder reads
+        // every varlen cell through bounds-checked accessors (no unchecked offset
+        // deref, no `from_utf8_unchecked`) and reconciles the declared
+        // `null_count` against the live validity bitmap while emitting, so a
+        // malformed producer array — including one whose `null_count` disagrees
+        // with its bitmap — surfaces as an `ArrowIngest` error at emit time,
+        // never an OOB read on the `panic = "abort"` FFI.
+        array_data
+            .validate()
+            .map_err(|err| error::fmt!(ArrowIngest, "Arrow array validation failed: {}", err))?;
+
+        let array = make_array(array_data);
+        let kind = arrow_batch::classify(&field, array.as_ref())?;
+        Ok(Self { field, array, kind })
+    }
+
+    pub fn len(&self) -> usize {
+        self.array.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.array.is_empty()
+    }
+
+    pub fn field(&self) -> &arrow::datatypes::Field {
+        &self.field
+    }
+
+    fn slice(&self, row_offset: usize, row_count: usize) -> Result<arrow::array::ArrayRef> {
+        let array_len = self.array.len();
+        let slice_end = row_offset.checked_add(row_count).ok_or_else(|| {
+            error::fmt!(
+                InvalidApiCall,
+                "row_offset {} + row_count {} overflows",
+                row_offset,
+                row_count
+            )
+        })?;
+        if slice_end > array_len {
+            return Err(error::fmt!(
+                InvalidApiCall,
+                "slice [{}, {}) out of range for array length {}",
+                row_offset,
+                slice_end,
+                array_len
+            ));
+        }
+        Ok(if row_offset == 0 && row_count == array_len {
+            self.array.clone()
+        } else {
+            self.array.slice(row_offset, row_count)
+        })
+    }
+}
+
+/// Validity bitmap descriptor (raw-ptr form, matching `Validity<'a>`).
+/// `non_null_count` is pre-computed at column-append time because several
+/// encoder paths (e.g. VARCHAR's dense offset table) size their output
+/// from it.
+#[derive(Clone, Copy)]
+pub(crate) struct ValidityDescriptor {
+    pub(crate) bits: *const u8,
+    pub(crate) bit_len: usize,
+    pub(crate) non_null_count: usize,
+}
+
+impl ValidityDescriptor {
+    fn from_validity(v: &Validity<'_>) -> Self {
+        Self {
+            bits: v.bits.as_ptr(),
+            bit_len: v.bit_len,
+            non_null_count: v.non_null_count(),
+        }
+    }
+
+    /// SAFETY: caller's buffer must still be alive (Chunk's `'a` lifetime
+    /// guarantees this on the safe path; the FFI is responsible on the
+    /// unsafe path).
+    #[inline]
+    pub(crate) unsafe fn is_valid(&self, idx: usize) -> bool {
+        debug_assert!(idx < self.bit_len);
+        let byte = unsafe { *self.bits.add(idx / 8) };
+        (byte >> (idx % 8)) & 1 == 1
+    }
+
+    /// Length in bytes of the underlying Arrow bitmap.
+    #[inline]
+    pub(crate) fn byte_len(&self) -> usize {
+        self.bit_len.div_ceil(8)
+    }
+
+    /// `true` iff at least one row is null. Mirrors the row API's
+    /// `uses_null_bitmap`: an all-valid validity is encoded densely with
+    /// `null_flag = 0` and no bitmap, matching the Java client and the
+    /// Arrow bulk path. `bit_len` equals the column row count (enforced by
+    /// `check_row_count`).
+    #[inline]
+    pub(crate) fn has_nulls(&self) -> bool {
+        self.non_null_count < self.bit_len
+    }
+
+    /// Slice to rows `[row_offset, row_offset + row_count)`. `row_offset` must
+    /// be a multiple of 8 so the bitmap pointer stays byte-addressable.
+    /// `non_null_count` is recomputed for the sub-range because the VARCHAR
+    /// dense-offset path sizes its output from it.
+    ///
+    /// SAFETY: the source bitmap must cover `row_offset + row_count` bits and
+    /// still be alive.
+    unsafe fn slice_rows(&self, row_offset: usize, row_count: usize) -> Self {
+        debug_assert_eq!(row_offset % 8, 0);
+        debug_assert!(row_offset + row_count <= self.bit_len);
+        let bits = unsafe { self.bits.add(row_offset / 8) };
+        let mut non_null_count = 0usize;
+        for i in 0..row_count {
+            let byte = unsafe { *bits.add(i / 8) };
+            non_null_count += ((byte >> (i % 8)) & 1) as usize;
+        }
+        Self {
+            bits,
+            bit_len: row_count,
+            non_null_count,
+        }
+    }
+}
+
+/// Per-column kind dispatch. Each variant carries the raw pointer(s) the
+/// encoder dereferences at flush time.
+pub(crate) enum ColumnKind {
+    // ---- Sentinel-null fixed width (no bitmap; 0x00 null_flag) ----
+    Byte {
+        data: *const i8,
+    },
+    Short {
+        data: *const i16,
+    },
+    Int {
+        data: *const i32,
+    },
+    Long {
+        data: *const i64,
+    },
+    Float {
+        data: *const f32,
+    },
+    Double {
+        data: *const f64,
+    },
+    // Bool: Arrow LSB-first bitmap input. row_count is the Chunk's row count.
+    Bool {
+        bits: *const u8,
+    },
+
+    // ---- Bitmap-style fixed width (sparse null encoding) ----
+    Ipv4 {
+        data: *const u32,
+    },
+    TsNanos {
+        data: *const i64,
+    },
+    TsMicros {
+        data: *const i64,
+    },
+    DateMillis {
+        data: *const i64,
+    },
+    Uuid {
+        data: *const [u8; 16],
+    },
+    Long256 {
+        data: *const [u8; 32],
+    },
+
+    // ---- Variable-width text (VARCHAR) ----
+    Varchar {
+        offsets: *const i32,
+        /// row_count + 1
+        offsets_len: usize,
+        bytes: *const u8,
+        bytes_len: usize,
+    },
+
+    // ---- Variable-width text from Arrow LargeUtf8 (i64 offsets) ----
+    //
+    // The wire format is identical to `Varchar`; we narrow each i64
+    // offset to u32 on the fly inside the encoder, with an
+    // overflow check (QWP's offset table is uint32 LE on the wire).
+    VarcharLarge {
+        offsets: *const i64,
+        /// row_count + 1
+        offsets_len: usize,
+        bytes: *const u8,
+        bytes_len: usize,
+    },
+
+    // ---- Variable-width bytes (BINARY) ----
+    //
+    // Same offsets + bytes layout as `Varchar`; differs only in the
+    // wire type byte (`QWP_TYPE_BINARY`) so the server creates a
+    // BINARY column. UTF-8 validation is not performed.
+    Binary {
+        offsets: *const i32,
+        /// row_count + 1
+        offsets_len: usize,
+        bytes: *const u8,
+        bytes_len: usize,
+    },
+
+    // ---- Symbol (dictionary-encoded) ----
+    Symbol {
+        codes: SymbolCodesPtr,
+        dict_offsets: SymbolOffsetsPtr,
+        /// dict cardinality + 1
+        dict_offsets_len: usize,
+        dict_bytes: *const u8,
+        dict_bytes_len: usize,
+    },
+
+    /// Arrow array + classified Arrow-side kind. Encoded at flush via
+    /// [`arrow_batch::write_arrow_column_body`]. The Arrow `ArrayRef`
+    /// holds the buffers via Arc; the enclosing
+    /// [`ColumnDescriptor::validity`] is always `None` for this
+    /// variant (validity lives inside the array's `NullBuffer`).
+    #[cfg(feature = "arrow-ingress")]
+    ArrowDeferred {
+        arrow_kind: arrow_batch::ColumnKind,
+        arr: arrow::array::ArrayRef,
+    },
+
+    /// Raw numpy buffer + dtype tag, encoded at flush via
+    /// [`numpy_wire::emit_into_wire`]. `data` is caller-owned: lifetime
+    /// must extend through the next flush / sync call. Validity (if
+    /// any) lives in the enclosing [`ColumnDescriptor`].
+    ///
+    /// `src_stride` is the source element size in bytes
+    /// (`NumpyDtype::source_elem_size`), captured at construction. It is
+    /// how far `data` advances per row, which for the widening / ndarray
+    /// dtypes differs from the *wire* width (`bytes_per_row`); slicing
+    /// must use the source stride so the split tail reads the right rows
+    /// (and stays in bounds).
+    NumpyDeferred {
+        dtype: numpy_wire::NumpyDtype,
+        data: *const u8,
+        src_stride: usize,
+        row_count: usize,
+    },
+}
+
+#[derive(Clone, Copy)]
+pub(crate) enum SymbolCodesPtr {
+    I8(*const i8),
+    I16(*const i16),
+    I32(*const i32),
+}
+
+impl SymbolCodesPtr {
+    /// Read the dict-index for row `i`, sign-extended to `i64` so the
+    /// encoder can range-check uniformly. SAFETY: caller's `codes`
+    /// buffer must still be alive.
+    #[inline]
+    pub(crate) unsafe fn read_i64(&self, i: usize) -> i64 {
+        unsafe {
+            match self {
+                SymbolCodesPtr::I8(p) => *p.add(i) as i64,
+                SymbolCodesPtr::I16(p) => *p.add(i) as i64,
+                SymbolCodesPtr::I32(p) => *p.add(i) as i64,
+            }
+        }
+    }
+
+    /// SAFETY: `n` must be within the codes buffer the variant points at.
+    #[inline]
+    unsafe fn offset_rows(self, n: usize) -> Self {
+        unsafe {
+            match self {
+                SymbolCodesPtr::I8(p) => SymbolCodesPtr::I8(p.add(n)),
+                SymbolCodesPtr::I16(p) => SymbolCodesPtr::I16(p.add(n)),
+                SymbolCodesPtr::I32(p) => SymbolCodesPtr::I32(p.add(n)),
+            }
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+pub(crate) enum SymbolOffsetsPtr {
+    I32(*const i32),
+    I64(*const i64),
+}
+
+impl SymbolOffsetsPtr {
+    /// Read the dict byte offset for entry `i`, widened to `i64` so the
+    /// encoder can consume Arrow UTF-8 and LargeUtf8 dictionaries uniformly.
+    /// SAFETY: caller's offsets buffer must still be alive.
+    #[inline]
+    pub(crate) unsafe fn read_i64(&self, i: usize) -> i64 {
+        unsafe {
+            match self {
+                SymbolOffsetsPtr::I32(p) => *p.add(i) as i64,
+                SymbolOffsetsPtr::I64(p) => *p.add(i),
+            }
+        }
+    }
+}
+
+impl ColumnKind {
+    /// Build a kind that views rows `[row_offset, row_offset + row_count)` of
+    /// `self`. Zero-copy: every variant advances its pointer(s) / Arrow array
+    /// rather than copying data. `row_offset` must be a multiple of 8 (bit-
+    /// packed `Bool` and validity bitmaps are only byte-addressable).
+    ///
+    /// SAFETY: the source buffers must cover `row_offset + row_count` rows and
+    /// still be alive.
+    unsafe fn slice_rows(&self, row_offset: usize, row_count: usize) -> Self {
+        debug_assert_eq!(row_offset % 8, 0);
+        unsafe {
+            match self {
+                ColumnKind::Byte { data } => ColumnKind::Byte {
+                    data: data.add(row_offset),
+                },
+                ColumnKind::Short { data } => ColumnKind::Short {
+                    data: data.add(row_offset),
+                },
+                ColumnKind::Int { data } => ColumnKind::Int {
+                    data: data.add(row_offset),
+                },
+                ColumnKind::Long { data } => ColumnKind::Long {
+                    data: data.add(row_offset),
+                },
+                ColumnKind::Float { data } => ColumnKind::Float {
+                    data: data.add(row_offset),
+                },
+                ColumnKind::Double { data } => ColumnKind::Double {
+                    data: data.add(row_offset),
+                },
+                ColumnKind::Bool { bits } => ColumnKind::Bool {
+                    bits: bits.add(row_offset / 8),
+                },
+                ColumnKind::Ipv4 { data } => ColumnKind::Ipv4 {
+                    data: data.add(row_offset),
+                },
+                ColumnKind::TsNanos { data } => ColumnKind::TsNanos {
+                    data: data.add(row_offset),
+                },
+                ColumnKind::TsMicros { data } => ColumnKind::TsMicros {
+                    data: data.add(row_offset),
+                },
+                ColumnKind::DateMillis { data } => ColumnKind::DateMillis {
+                    data: data.add(row_offset),
+                },
+                ColumnKind::Uuid { data } => ColumnKind::Uuid {
+                    data: data.add(row_offset),
+                },
+                ColumnKind::Long256 { data } => ColumnKind::Long256 {
+                    data: data.add(row_offset),
+                },
+                // Offsets are absolute into `bytes`, so a sub-range of the
+                // offset table still indexes the full (unsliced) byte buffer.
+                ColumnKind::Varchar {
+                    offsets,
+                    offsets_len: _,
+                    bytes,
+                    bytes_len,
+                } => ColumnKind::Varchar {
+                    offsets: offsets.add(row_offset),
+                    offsets_len: row_count + 1,
+                    bytes: *bytes,
+                    bytes_len: *bytes_len,
+                },
+                ColumnKind::VarcharLarge {
+                    offsets,
+                    offsets_len: _,
+                    bytes,
+                    bytes_len,
+                } => ColumnKind::VarcharLarge {
+                    offsets: offsets.add(row_offset),
+                    offsets_len: row_count + 1,
+                    bytes: *bytes,
+                    bytes_len: *bytes_len,
+                },
+                ColumnKind::Binary {
+                    offsets,
+                    offsets_len: _,
+                    bytes,
+                    bytes_len,
+                } => ColumnKind::Binary {
+                    offsets: offsets.add(row_offset),
+                    offsets_len: row_count + 1,
+                    bytes: *bytes,
+                    bytes_len: *bytes_len,
+                },
+                // Per-row `codes` shift; the dictionary spans all rows and is
+                // shared verbatim across slices.
+                ColumnKind::Symbol {
+                    codes,
+                    dict_offsets,
+                    dict_offsets_len,
+                    dict_bytes,
+                    dict_bytes_len,
+                } => ColumnKind::Symbol {
+                    codes: codes.offset_rows(row_offset),
+                    dict_offsets: *dict_offsets,
+                    dict_offsets_len: *dict_offsets_len,
+                    dict_bytes: *dict_bytes,
+                    dict_bytes_len: *dict_bytes_len,
+                },
+                #[cfg(feature = "arrow-ingress")]
+                ColumnKind::ArrowDeferred { arrow_kind, arr } => ColumnKind::ArrowDeferred {
+                    arrow_kind: *arrow_kind,
+                    arr: arr.slice(row_offset, row_count),
+                },
+                ColumnKind::NumpyDeferred {
+                    dtype,
+                    data,
+                    src_stride,
+                    row_count: _,
+                } => ColumnKind::NumpyDeferred {
+                    dtype: *dtype,
+                    // Advance by the *source* element stride, not the wire
+                    // width: the two differ for the widening / ndarray dtypes,
+                    // and `data` points into the caller's numpy buffer (sized
+                    // `row_count * src_stride`). Using the wire width here
+                    // over-advances and reads past the buffer / wrong rows.
+                    data: data.add(row_offset * src_stride),
+                    src_stride: *src_stride,
+                    row_count,
+                },
+            }
+        }
+    }
+}
+
+impl DesignatedTsDescriptor {
+    /// SAFETY: a column source buffer must cover `row_offset` rows and still
+    /// be alive.
+    unsafe fn slice_rows(&self, row_offset: usize) -> Self {
+        Self {
+            unit: self.unit,
+            data: match self.data {
+                DesignatedTsData::Column(ptr) => {
+                    DesignatedTsData::Column(unsafe { ptr.add(row_offset) })
+                }
+                DesignatedTsData::Scalar(value) => DesignatedTsData::Scalar(value),
+            },
+        }
+    }
+}
+
+/// One column slot in a [`Chunk`]. `name` is owned (the chunk holds it
+/// for diagnostics + signature emission); everything else is borrowed.
+pub(crate) struct ColumnDescriptor {
+    pub(crate) name: String,
+    pub(crate) wire_type: u8,
+    pub(crate) kind: ColumnKind,
+    pub(crate) validity: Option<ValidityDescriptor>,
+}
+
+/// Precision of a designated timestamp column. Each variant pairs a QWP
+/// wire type with the multiplier needed to reach microseconds, so an
+/// illegal (wire type, scale) combination cannot be constructed.
+#[derive(Clone, Copy)]
+pub(crate) enum DesignatedTsUnit {
+    Micros,
+    Nanos,
+    Millis,
+    Seconds,
+}
+
+impl DesignatedTsUnit {
+    pub(crate) fn wire_type(&self) -> u8 {
+        match self {
+            DesignatedTsUnit::Nanos => QWP_TYPE_TIMESTAMP_NANOS,
+            _ => QWP_TYPE_TIMESTAMP,
+        }
+    }
+
+    pub(crate) fn scale(&self) -> i64 {
+        match self {
+            DesignatedTsUnit::Millis => 1_000,
+            DesignatedTsUnit::Seconds => 1_000_000,
+            _ => 1,
+        }
+    }
+}
+
+/// Designated timestamp source: a borrowed per-row column, or one scalar
+/// shared by every row (encoded as a repeated constant on the wire).
+#[derive(Clone, Copy)]
+pub(crate) enum DesignatedTsData {
+    Column(*const i64),
+    Scalar(i64),
+}
+
+/// Designated timestamp descriptor. Required exactly once per chunk
+/// before flush. Designated timestamps are non-null by spec.
+pub(crate) struct DesignatedTsDescriptor {
+    pub(crate) unit: DesignatedTsUnit,
+    pub(crate) data: DesignatedTsData,
+}
+
+// ===========================================================================
+// Chunk
+// ===========================================================================
+
+/// A single-batch view over borrowed column buffers for one QuestDB table.
+///
+/// The lifetime parameter `'a` is shared by the buffers passed to the borrowed
+/// `column_*` and `symbol_dict_*` methods. Each method stores a descriptor
+/// referencing caller-owned data; no data is copied when the column is
+/// appended.
+///
+/// Create a new `Chunk` for each batch. Create the backing buffers first,
+/// populate and flush the chunk, and then let the chunk go out of scope.
+pub struct Chunk<'a> {
+    pub(crate) table: String,
+    pub(crate) row_count: Option<usize>,
+    pub(crate) columns: Vec<ColumnDescriptor>,
+    pub(crate) designated_ts: Option<DesignatedTsDescriptor>,
+    pub(crate) server_now: bool,
+    _marker: PhantomData<&'a ()>,
+}
+
+impl<'a> Chunk<'a> {
+    /// Create a chunk for `table`. The table name is validated at flush
+    /// time against the QWP/Java client length cap (127 bytes UTF-8).
+    pub fn new(table: impl Into<String>) -> Self {
+        Self {
+            table: table.into(),
+            row_count: None,
+            columns: Vec::new(),
+            designated_ts: None,
+            server_now: false,
+            _marker: PhantomData,
+        }
+    }
+
+    /// Table name this chunk targets. Validated at flush time.
+    pub fn table(&self) -> &str {
+        &self.table
+    }
+
+    /// Row count locked by the first appended column (or designated
+    /// timestamp). `0` when neither has been set.
+    pub fn row_count(&self) -> usize {
+        self.row_count.unwrap_or(0)
+    }
+
+    /// `true` when the chunk has no appended columns and no designated
+    /// timestamp. Equivalent to "row count has not yet been locked".
+    pub fn is_empty(&self) -> bool {
+        self.row_count.is_none() && self.designated_ts.is_none()
+    }
+
+    /// Reset the chunk. Drops descriptors but keeps the
+    /// `Vec<ColumnDescriptor>` capacity so the next batch fills the same
+    /// slots without reallocating the outer Vec.
+    ///
+    /// In safe Rust, this doesn't allow you to reuse the chunk to
+    /// stream unbounded data. The lifetime parameter `'a` is fixed for
+    /// the chunk's whole life, so every buffer ever appended must stay
+    /// alive as long as the chunk — clearing drops the descriptors, but
+    /// the borrow checker still holds the input data borrowed for `'a`.
+    /// To let each batch's buffers be freed as you go, create a fresh
+    /// `Chunk` per batch.
+    ///
+    /// The function is public because callers who erase the lifetime and
+    /// manage buffer validity manually — the flush path, and the FFI
+    /// reuse path (`qwp_chunk_clear`) — do reuse the same
+    /// `Chunk` and rely on retaining its capacity.
+    pub fn clear(&mut self) {
+        self.row_count = None;
+        self.columns.clear();
+        self.designated_ts = None;
+        self.server_now = false;
+    }
+
+    /// Build a chunk viewing rows `[row_offset, row_offset + row_count)` of
+    /// `self`, used to split an oversize chunk into cap-sized frames. Column
+    /// data is re-pointed (zero-copy); the table name and column names are
+    /// cloned. `row_offset` must be a multiple of 8.
+    ///
+    /// SAFETY: the caller's column buffers must still be alive (the same
+    /// invariant `flush` relies on) and cover `row_offset + row_count` rows.
+    pub(crate) unsafe fn slice_rows(&self, row_offset: usize, row_count: usize) -> Chunk<'a> {
+        let columns = self
+            .columns
+            .iter()
+            .map(|col| ColumnDescriptor {
+                name: col.name.clone(),
+                wire_type: col.wire_type,
+                kind: unsafe { col.kind.slice_rows(row_offset, row_count) },
+                validity: col
+                    .validity
+                    .as_ref()
+                    .map(|v| unsafe { v.slice_rows(row_offset, row_count) }),
+            })
+            .collect();
+        Chunk {
+            table: self.table.clone(),
+            row_count: Some(row_count),
+            columns,
+            designated_ts: self
+                .designated_ts
+                .as_ref()
+                .map(|ts| unsafe { ts.slice_rows(row_offset) }),
+            server_now: self.server_now,
+            _marker: PhantomData,
+        }
+    }
+
+    // -------------------------------------------------------------------
+    // Numeric & fixed-width columns
+    // -------------------------------------------------------------------
+
+    /// Append an `i8` column (QWP wire type `BYTE`). `validity` may
+    /// carry per-row null bits (Arrow shape: bit = 1 means VALID).
+    ///
+    /// QWP `BYTE` has no NULL representation on the wire: null rows are
+    /// written as `0`. Use a wider column (`column_i32` / `column_i64`) if
+    /// you need to distinguish null from `0` downstream.
+    pub fn column_i8(
+        &mut self,
+        name: &str,
+        data: &'a [i8],
+        validity: Option<&Validity<'a>>,
+    ) -> Result<&mut Self> {
+        let row_count = check_row_count(self.row_count, data.len(), validity)?;
+        self.push_column(
+            name,
+            QWP_TYPE_BYTE,
+            ColumnKind::Byte {
+                data: data.as_ptr(),
+            },
+            validity,
+            row_count,
+        )
+    }
+
+    /// Append an `i16` column (QWP wire type `SHORT`). `validity` may
+    /// carry per-row null bits.
+    ///
+    /// QWP `SHORT` has no NULL representation on the wire: null rows are
+    /// written as `0`. Use a wider column (`column_i32` / `column_i64`) if
+    /// you need to distinguish null from `0` downstream.
+    pub fn column_i16(
+        &mut self,
+        name: &str,
+        data: &'a [i16],
+        validity: Option<&Validity<'a>>,
+    ) -> Result<&mut Self> {
+        let row_count = check_row_count(self.row_count, data.len(), validity)?;
+        self.push_column(
+            name,
+            QWP_TYPE_SHORT,
+            ColumnKind::Short {
+                data: data.as_ptr(),
+            },
+            validity,
+            row_count,
+        )
+    }
+
+    /// Append an `i32` column (QWP wire type `INT`).
+    pub fn column_i32(
+        &mut self,
+        name: &str,
+        data: &'a [i32],
+        validity: Option<&Validity<'a>>,
+    ) -> Result<&mut Self> {
+        let row_count = check_row_count(self.row_count, data.len(), validity)?;
+        self.push_column(
+            name,
+            QWP_TYPE_INT,
+            ColumnKind::Int {
+                data: data.as_ptr(),
+            },
+            validity,
+            row_count,
+        )
+    }
+
+    /// Append an `i64` column (QWP wire type `LONG`).
+    pub fn column_i64(
+        &mut self,
+        name: &str,
+        data: &'a [i64],
+        validity: Option<&Validity<'a>>,
+    ) -> Result<&mut Self> {
+        let row_count = check_row_count(self.row_count, data.len(), validity)?;
+        self.push_column(
+            name,
+            QWP_TYPE_LONG,
+            ColumnKind::Long {
+                data: data.as_ptr(),
+            },
+            validity,
+            row_count,
+        )
+    }
+
+    /// Append an `f32` column (QWP wire type `FLOAT`).
+    pub fn column_f32(
+        &mut self,
+        name: &str,
+        data: &'a [f32],
+        validity: Option<&Validity<'a>>,
+    ) -> Result<&mut Self> {
+        let row_count = check_row_count(self.row_count, data.len(), validity)?;
+        self.push_column(
+            name,
+            QWP_TYPE_FLOAT,
+            ColumnKind::Float {
+                data: data.as_ptr(),
+            },
+            validity,
+            row_count,
+        )
+    }
+
+    /// Append an `f64` column (QWP wire type `DOUBLE`).
+    pub fn column_f64(
+        &mut self,
+        name: &str,
+        data: &'a [f64],
+        validity: Option<&Validity<'a>>,
+    ) -> Result<&mut Self> {
+        let row_count = check_row_count(self.row_count, data.len(), validity)?;
+        self.push_column(
+            name,
+            QWP_TYPE_DOUBLE,
+            ColumnKind::Double {
+                data: data.as_ptr(),
+            },
+            validity,
+            row_count,
+        )
+    }
+
+    /// Append a boolean column (QWP wire type `BOOLEAN`).
+    ///
+    /// `data` is an LSB-first bit-packed slice: bit `i` is row `i`'s
+    /// value (1 = true, 0 = false). At least `ceil(row_count / 8)`
+    /// bytes are required; the slice may be longer.
+    ///
+    /// QWP `BOOLEAN` has no NULL representation on the wire: when
+    /// `validity` is supplied, null rows are coerced to `false`. Pass
+    /// `None` if your data has no nulls, or use a wider numeric column
+    /// if you need to distinguish null from `false` downstream.
+    pub fn column_bool(
+        &mut self,
+        name: &str,
+        data: &'a [u8],
+        row_count: usize,
+        validity: Option<&Validity<'a>>,
+    ) -> Result<&mut Self> {
+        let bytes_required = row_count.div_ceil(8);
+        if data.len() < bytes_required {
+            return Err(error::fmt!(
+                InvalidApiCall,
+                "Boolean column data too short: {} bytes for {} rows (need at least {})",
+                data.len(),
+                row_count,
+                bytes_required
+            ));
+        }
+        let row_count = check_row_count(self.row_count, row_count, validity)?;
+        self.push_column(
+            name,
+            QWP_TYPE_BOOLEAN,
+            ColumnKind::Bool {
+                bits: data.as_ptr(),
+            },
+            validity,
+            row_count,
+        )
+    }
+
+    // -------------------------------------------------------------------
+    // Bitmap-style fixed-width columns
+    // -------------------------------------------------------------------
+
+    /// Append a UUID column (QWP wire type `UUID`). Each row is 16 bytes
+    /// in QuestDB wire order — the low 64 bits little-endian followed by
+    /// the high 64 bits little-endian. This matches the row API and the
+    /// bytes produced by Arrow egress; it is NOT canonical RFC-4122
+    /// big-endian, so callers holding big-endian UUIDs must reorder first.
+    pub fn column_uuid(
+        &mut self,
+        name: &str,
+        data: &'a [[u8; 16]],
+        validity: Option<&Validity<'a>>,
+    ) -> Result<&mut Self> {
+        let row_count = check_row_count(self.row_count, data.len(), validity)?;
+        self.push_column(
+            name,
+            QWP_TYPE_UUID,
+            ColumnKind::Uuid {
+                data: data.as_ptr(),
+            },
+            validity,
+            row_count,
+        )
+    }
+
+    /// Append a LONG256 column (QWP wire type `LONG256`). Each row is 32
+    /// bytes: the 256-bit value as little-endian limbs, low limb first.
+    /// This matches the row API and the bytes produced by Arrow egress.
+    pub fn column_long256(
+        &mut self,
+        name: &str,
+        data: &'a [[u8; 32]],
+        validity: Option<&Validity<'a>>,
+    ) -> Result<&mut Self> {
+        let row_count = check_row_count(self.row_count, data.len(), validity)?;
+        self.push_column(
+            name,
+            QWP_TYPE_LONG256,
+            ColumnKind::Long256 {
+                data: data.as_ptr(),
+            },
+            validity,
+            row_count,
+        )
+    }
+
+    /// Append an IPv4 column (QWP wire type `IPV4`). Each row is the
+    /// 32-bit address in host byte order.
+    pub fn column_ipv4(
+        &mut self,
+        name: &str,
+        data: &'a [u32],
+        validity: Option<&Validity<'a>>,
+    ) -> Result<&mut Self> {
+        let row_count = check_row_count(self.row_count, data.len(), validity)?;
+        self.push_column(
+            name,
+            QWP_TYPE_IPV4,
+            ColumnKind::Ipv4 {
+                data: data.as_ptr(),
+            },
+            validity,
+            row_count,
+        )
+    }
+
+    /// Append a timestamp column. `unit` selects the QWP wire type
+    /// ([`TimestampUnit::Micros`] → `TIMESTAMP`, [`TimestampUnit::Nanos`] →
+    /// `TIMESTAMP_NANOS`); `data` holds Unix-epoch values in that unit.
+    pub fn column_ts(
+        &mut self,
+        name: &str,
+        data: &'a [i64],
+        unit: TimestampUnit,
+        validity: Option<&Validity<'a>>,
+    ) -> Result<&mut Self> {
+        let row_count = check_row_count(self.row_count, data.len(), validity)?;
+        let (wire_type, kind) = match unit {
+            TimestampUnit::Nanos => (
+                QWP_TYPE_TIMESTAMP_NANOS,
+                ColumnKind::TsNanos {
+                    data: data.as_ptr(),
+                },
+            ),
+            TimestampUnit::Micros => (
+                QWP_TYPE_TIMESTAMP,
+                ColumnKind::TsMicros {
+                    data: data.as_ptr(),
+                },
+            ),
+        };
+        self.push_column(name, wire_type, kind, validity, row_count)
+    }
+
+    /// Append a `DATE` column (QWP wire type `DATE`). Values are Unix epoch
+    /// milliseconds (QuestDB `DATE` has no other precision).
+    pub fn column_date(
+        &mut self,
+        name: &str,
+        data: &'a [i64],
+        validity: Option<&Validity<'a>>,
+    ) -> Result<&mut Self> {
+        let row_count = check_row_count(self.row_count, data.len(), validity)?;
+        self.push_column(
+            name,
+            QWP_TYPE_DATE,
+            ColumnKind::DateMillis {
+                data: data.as_ptr(),
+            },
+            validity,
+            row_count,
+        )
+    }
+
+    // -------------------------------------------------------------------
+    // VARCHAR
+    // -------------------------------------------------------------------
+
+    /// Append a VARCHAR column from Arrow Utf8 layout (QWP wire type
+    /// `VARCHAR`). `offsets` is `i32` with `row_count + 1` entries
+    /// (monotonic, non-negative, last ≤ `bytes.len()`); `bytes` is the
+    /// concatenated UTF-8 buffer.
+    pub fn column_str(
+        &mut self,
+        name: &str,
+        offsets: &'a [i32],
+        bytes: &'a [u8],
+        validity: Option<&Validity<'a>>,
+    ) -> Result<&mut Self> {
+        if offsets.is_empty() {
+            return Err(error::fmt!(
+                InvalidApiCall,
+                "VARCHAR offsets must have at least one entry (row_count + 1)"
+            ));
+        }
+        let row_count = offsets.len() - 1;
+        let row_count = check_row_count(self.row_count, row_count, validity)?;
+        validate_varchar_offsets(offsets, bytes.len())?;
+        validate_varchar_utf8_cells(bytes, offsets)?;
+        self.push_column(
+            name,
+            QWP_TYPE_VARCHAR,
+            ColumnKind::Varchar {
+                offsets: offsets.as_ptr(),
+                offsets_len: offsets.len(),
+                bytes: bytes.as_ptr(),
+                bytes_len: bytes.len(),
+            },
+            validity,
+            row_count,
+        )
+    }
+
+    /// Same wire output as [`Self::column_str`], but accepts Arrow
+    /// LargeUtf8 input where offsets are `int64` instead of `int32`. The
+    /// encoder narrows each offset to `u32` at encode time with an
+    /// overflow check (QWP's offset table is uint32 LE on the wire), so
+    /// no caller-side copy / narrowing is needed.
+    ///
+    /// Errors if any offset is negative, decreasing, exceeds the bytes
+    /// buffer length, or — at encode time — exceeds `u32::MAX`.
+    pub fn column_str_large(
+        &mut self,
+        name: &str,
+        offsets: &'a [i64],
+        bytes: &'a [u8],
+        validity: Option<&Validity<'a>>,
+    ) -> Result<&mut Self> {
+        if offsets.is_empty() {
+            return Err(error::fmt!(
+                InvalidApiCall,
+                "LargeVARCHAR offsets must have at least one entry (row_count + 1)"
+            ));
+        }
+        let row_count = offsets.len() - 1;
+        let row_count = check_row_count(self.row_count, row_count, validity)?;
+        validate_varchar_offsets_i64(offsets, bytes.len())?;
+        validate_varchar_utf8_cells(bytes, offsets)?;
+        self.push_column(
+            name,
+            QWP_TYPE_VARCHAR,
+            ColumnKind::VarcharLarge {
+                offsets: offsets.as_ptr(),
+                offsets_len: offsets.len(),
+                bytes: bytes.as_ptr(),
+                bytes_len: bytes.len(),
+            },
+            validity,
+            row_count,
+        )
+    }
+
+    /// Append a BINARY column. Same offsets + bytes layout as
+    /// [`Self::column_str`]; the encoder writes the column with wire type
+    /// `QWP_TYPE_BINARY` instead of `QWP_TYPE_VARCHAR`. No UTF-8
+    /// validation is performed.
+    pub fn column_binary(
+        &mut self,
+        name: &str,
+        offsets: &'a [i32],
+        bytes: &'a [u8],
+        validity: Option<&Validity<'a>>,
+    ) -> Result<&mut Self> {
+        if offsets.is_empty() {
+            return Err(error::fmt!(
+                InvalidApiCall,
+                "BINARY offsets must have at least one entry (row_count + 1)"
+            ));
+        }
+        let row_count = offsets.len() - 1;
+        let row_count = check_row_count(self.row_count, row_count, validity)?;
+        validate_varchar_offsets(offsets, bytes.len())?;
+        self.push_column(
+            name,
+            QWP_TYPE_BINARY,
+            ColumnKind::Binary {
+                offsets: offsets.as_ptr(),
+                offsets_len: offsets.len(),
+                bytes: bytes.as_ptr(),
+                bytes_len: bytes.len(),
+            },
+            validity,
+            row_count,
+        )
+    }
+
+    // -------------------------------------------------------------------
+    // Symbol
+    // -------------------------------------------------------------------
+
+    /// Append a SYMBOL column whose per-row codes are `i8` indices into
+    /// a dictionary defined by (`dict_offsets`, `dict_bytes`) in Arrow
+    /// Utf8 layout. Wire type is `SYMBOL`; the encoder interns each
+    /// referenced dictionary entry against the connection-scoped
+    /// `SymbolGlobalDict` at flush time.
+    ///
+    /// Validated eagerly at append (like the row `symbol` API): `dict_offsets`
+    /// must be monotonic, non-negative, and end at `≤ dict_bytes.len()`; each
+    /// dictionary entry must be valid UTF-8 (QuestDB SYMBOLs are UTF-8); and
+    /// every non-null `codes[i]` must be in `0..dict_len` (`dict_len =
+    /// dict_offsets.len() - 1`). A per-entry `1 MiB` cap is enforced at flush.
+    pub fn symbol_i8(
+        &mut self,
+        name: &str,
+        codes: &'a [i8],
+        dict_offsets: &'a [i32],
+        dict_bytes: &'a [u8],
+        validity: Option<&Validity<'a>>,
+    ) -> Result<&mut Self> {
+        self.push_symbol(
+            name,
+            SymbolCodesPtr::I8(codes.as_ptr()),
+            codes.len(),
+            SymbolOffsetsPtr::I32(dict_offsets.as_ptr()),
+            dict_offsets.len(),
+            dict_bytes,
+            validity,
+        )
+    }
+
+    /// Same as [`symbol_i8`](Self::symbol_i8) but with `i16` codes.
+    pub fn symbol_i16(
+        &mut self,
+        name: &str,
+        codes: &'a [i16],
+        dict_offsets: &'a [i32],
+        dict_bytes: &'a [u8],
+        validity: Option<&Validity<'a>>,
+    ) -> Result<&mut Self> {
+        self.push_symbol(
+            name,
+            SymbolCodesPtr::I16(codes.as_ptr()),
+            codes.len(),
+            SymbolOffsetsPtr::I32(dict_offsets.as_ptr()),
+            dict_offsets.len(),
+            dict_bytes,
+            validity,
+        )
+    }
+
+    /// Same as [`symbol_i8`](Self::symbol_i8) but with `i32` codes.
+    pub fn symbol_i32(
+        &mut self,
+        name: &str,
+        codes: &'a [i32],
+        dict_offsets: &'a [i32],
+        dict_bytes: &'a [u8],
+        validity: Option<&Validity<'a>>,
+    ) -> Result<&mut Self> {
+        self.push_symbol(
+            name,
+            SymbolCodesPtr::I32(codes.as_ptr()),
+            codes.len(),
+            SymbolOffsetsPtr::I32(dict_offsets.as_ptr()),
+            dict_offsets.len(),
+            dict_bytes,
+            validity,
+        )
+    }
+
+    /// Same as [`symbol_i8`](Self::symbol_i8) but the dictionary
+    /// uses Arrow LargeUtf8 layout (`i64` offsets).
+    pub fn symbol_large_i8(
+        &mut self,
+        name: &str,
+        codes: &'a [i8],
+        dict_offsets: &'a [i64],
+        dict_bytes: &'a [u8],
+        validity: Option<&Validity<'a>>,
+    ) -> Result<&mut Self> {
+        self.push_symbol(
+            name,
+            SymbolCodesPtr::I8(codes.as_ptr()),
+            codes.len(),
+            SymbolOffsetsPtr::I64(dict_offsets.as_ptr()),
+            dict_offsets.len(),
+            dict_bytes,
+            validity,
+        )
+    }
+
+    /// Same as [`symbol_i16`](Self::symbol_i16) but the dictionary
+    /// uses Arrow LargeUtf8 layout (`i64` offsets).
+    pub fn symbol_large_i16(
+        &mut self,
+        name: &str,
+        codes: &'a [i16],
+        dict_offsets: &'a [i64],
+        dict_bytes: &'a [u8],
+        validity: Option<&Validity<'a>>,
+    ) -> Result<&mut Self> {
+        self.push_symbol(
+            name,
+            SymbolCodesPtr::I16(codes.as_ptr()),
+            codes.len(),
+            SymbolOffsetsPtr::I64(dict_offsets.as_ptr()),
+            dict_offsets.len(),
+            dict_bytes,
+            validity,
+        )
+    }
+
+    /// Same as [`symbol_i32`](Self::symbol_i32) but the dictionary
+    /// uses Arrow LargeUtf8 layout (`i64` offsets).
+    pub fn symbol_large_i32(
+        &mut self,
+        name: &str,
+        codes: &'a [i32],
+        dict_offsets: &'a [i64],
+        dict_bytes: &'a [u8],
+        validity: Option<&Validity<'a>>,
+    ) -> Result<&mut Self> {
+        self.push_symbol(
+            name,
+            SymbolCodesPtr::I32(codes.as_ptr()),
+            codes.len(),
+            SymbolOffsetsPtr::I64(dict_offsets.as_ptr()),
+            dict_offsets.len(),
+            dict_bytes,
+            validity,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn push_symbol(
+        &mut self,
+        name: &str,
+        codes: SymbolCodesPtr,
+        codes_len: usize,
+        dict_offsets: SymbolOffsetsPtr,
+        dict_offsets_len: usize,
+        dict_bytes: &'a [u8],
+        validity: Option<&Validity<'a>>,
+    ) -> Result<&mut Self> {
+        let row_count = check_row_count(self.row_count, codes_len, validity)?;
+        if dict_offsets_len == 0 {
+            return Err(error::fmt!(
+                InvalidApiCall,
+                "symbol dict offsets must have at least one entry (dict_len + 1)"
+            ));
+        }
+        let dict_len = dict_offsets_len - 1;
+        if dict_len > super::MAX_SYMBOL_DICT_ENTRIES {
+            return Err(error::fmt!(
+                InvalidApiCall,
+                "symbol dict has {dict_len} entries, exceeding the per-column maximum of {}",
+                super::MAX_SYMBOL_DICT_ENTRIES
+            ));
+        }
+        // Validate the dictionary offsets, then that each dictionary entry is
+        // valid UTF-8 — the same eager checks `column_str` / `column_str_large`
+        // run for VARCHAR (`validate_varchar_utf8_cells`). QuestDB SYMBOLs are
+        // UTF-8, and the row `symbol` API enforces it via its `&str` value; a
+        // non-UTF-8 symbol accepted here would be interned, written ahead to the
+        // SFA side-file, and locally ACKed, then rejected by the server on send,
+        // stranding the dependent queued frame (the same "writer-accepted =>
+        // server-acceptable" invariant the per-symbol length cap enforces). Reject
+        // it at this single ingestion choke point instead. The offset check runs
+        // first so the UTF-8 cell walk indexes only in-bounds slices.
+        match dict_offsets {
+            SymbolOffsetsPtr::I32(p) => {
+                let offsets = unsafe { slice::from_raw_parts(p, dict_offsets_len) };
+                validate_varchar_offsets(offsets, dict_bytes.len())?;
+                validate_varchar_utf8_cells(dict_bytes, offsets)?;
+            }
+            SymbolOffsetsPtr::I64(p) => {
+                let offsets = unsafe { slice::from_raw_parts(p, dict_offsets_len) };
+                validate_varchar_offsets_i64(offsets, dict_bytes.len())?;
+                validate_varchar_utf8_cells(dict_bytes, offsets)?;
+            }
+        }
+
+        // Range-check codes for non-null rows. The encoder relies on
+        // every non-null code being a valid dict index, so we surface
+        // the failure here at append time.
+        let bounds_check = match codes {
+            SymbolCodesPtr::I8(p) => unsafe { range_check_codes(p, codes_len, dict_len, validity) },
+            SymbolCodesPtr::I16(p) => unsafe {
+                range_check_codes(p, codes_len, dict_len, validity)
+            },
+            SymbolCodesPtr::I32(p) => unsafe {
+                range_check_codes(p, codes_len, dict_len, validity)
+            },
+        };
+        bounds_check?;
+
+        self.push_column(
+            name,
+            QWP_TYPE_SYMBOL,
+            ColumnKind::Symbol {
+                codes,
+                dict_offsets,
+                dict_offsets_len,
+                dict_bytes: dict_bytes.as_ptr(),
+                dict_bytes_len: dict_bytes.len(),
+            },
+            validity,
+            row_count,
+        )
+    }
+
+    // -------------------------------------------------------------------
+    // Numpy deferred (raw caller-owned buffer + dtype tag, encoded
+    // single-pass at flush via numpy_wire::emit_into_wire)
+    // -------------------------------------------------------------------
+
+    /// Append a column whose source layout is described by a
+    /// [`NumpyDtype`]. The data buffer must be contiguous and
+    /// native-endian; the caller retains ownership and must keep it
+    /// alive until the next flush / sync. Widening, packing, and
+    /// per-row conversion happen single-pass during encode — the chunk
+    /// allocates nothing per numpy column.
+    ///
+    /// # Safety
+    ///
+    /// `data` must be either NULL with `row_count == 0`, or point to
+    /// at least `row_count * sizeof(<dtype src element>)` valid,
+    /// contiguous, native-endian bytes (one byte per row for
+    /// [`NumpyDtype::Bool`]). The caller's buffer must remain alive
+    /// until this chunk's next flush / sync returns.
+    ///
+    /// [`NumpyDtype`]: super::NumpyDtype
+    /// [`NumpyDtype::Bool`]: super::NumpyDtype::Bool
+    pub unsafe fn push_numpy_deferred(
+        &mut self,
+        name: &str,
+        dtype: numpy_wire::NumpyDtype,
+        data: *const u8,
+        row_count: usize,
+        validity: Option<&Validity<'a>>,
+    ) -> Result<&mut Self> {
+        if data.is_null() && row_count != 0 {
+            return Err(error::fmt!(
+                InvalidApiCall,
+                "push_numpy_deferred: data pointer is NULL with row_count = {}",
+                row_count
+            ));
+        }
+        dtype.validate()?;
+        // Captured once here (in this fallible path) so the infallible
+        // `slice_rows` can advance `data` by the source stride without
+        // re-running the fallible ndarray size math.
+        let src_stride = dtype.source_elem_size()?;
+        let row_count = check_row_count(self.row_count, row_count, validity)?;
+        let wire_type = dtype.wire_type();
+        self.push_column(
+            name,
+            wire_type,
+            ColumnKind::NumpyDeferred {
+                dtype,
+                data,
+                src_stride,
+                row_count,
+            },
+            validity,
+            row_count,
+        )
+    }
+
+    // -------------------------------------------------------------------
+    // Designated timestamp
+    // -------------------------------------------------------------------
+
+    /// Pin the chunk's designated timestamp from a microsecond-precision
+    /// Unix epoch column (QWP wire type `TIMESTAMP`). Required before
+    /// flushing a non-empty chunk; rejects if a designated timestamp has
+    /// already been set on this chunk.
+    pub fn at_micros(&mut self, data: &'a [i64]) -> Result<&mut Self> {
+        self.set_designated_ts(DesignatedTsUnit::Micros, data)
+    }
+
+    /// Same as [`at_micros`](Self::at_micros)
+    /// but for a nanosecond-precision Unix epoch column (QWP wire type
+    /// `TIMESTAMP_NANOS`).
+    pub fn at_nanos(&mut self, data: &'a [i64]) -> Result<&mut Self> {
+        self.set_designated_ts(DesignatedTsUnit::Nanos, data)
+    }
+
+    /// Millisecond-precision Unix epoch column, widened to micros on encode.
+    pub fn at_millis(&mut self, data: &'a [i64]) -> Result<&mut Self> {
+        self.set_designated_ts(DesignatedTsUnit::Millis, data)
+    }
+
+    /// Second-precision Unix epoch column, widened to micros on encode.
+    pub fn at_seconds(&mut self, data: &'a [i64]) -> Result<&mut Self> {
+        self.set_designated_ts(DesignatedTsUnit::Seconds, data)
+    }
+
+    /// Opt the chunk into server-assigned timestamps: the frame carries
+    /// no designated timestamp column and the server stamps each row on
+    /// arrival. Mirrors the arrow-batch `flush_arrow_batch_at_now` entry
+    /// point — an **explicit opt-in**, since server-assigned timestamps
+    /// generate unique rows on resubmission and so defeat `DEDUP UPSERT
+    /// KEYS`. Rejects if a designated timestamp column has already been
+    /// set on this chunk (and vice versa). Does not lock the row count;
+    /// the first appended column does.
+    pub fn at_now(&mut self) -> Result<&mut Self> {
+        if self.designated_ts.is_some() {
+            return Err(error::fmt!(
+                InvalidApiCall,
+                "designated timestamp already set on this chunk"
+            ));
+        }
+        self.server_now = true;
+        Ok(self)
+    }
+
+    /// Pin one scalar nanosecond-precision Unix epoch timestamp as the
+    /// designated timestamp of every row, encoded as a repeated constant
+    /// (wire type `TIMESTAMP_NANOS`). Unlike server stamping the value is
+    /// fixed at the caller, so resubmission is idempotent under
+    /// `DEDUP UPSERT KEYS`. Rejects negative (pre-epoch) values and any
+    /// already-set designated timestamp. Does not lock the row count;
+    /// the first appended column does.
+    pub fn at_scalar_nanos(&mut self, nanos: i64) -> Result<&mut Self> {
+        if self.designated_ts.is_some() {
+            return Err(error::fmt!(
+                InvalidApiCall,
+                "designated timestamp already set on this chunk"
+            ));
+        }
+        if self.server_now {
+            return Err(error::fmt!(
+                InvalidApiCall,
+                "scalar designated timestamp conflicts with at_now \
+                 (server-assigned timestamps) already set on this chunk"
+            ));
+        }
+        if nanos < 0 {
+            return Err(error::fmt!(
+                InvalidTimestamp,
+                "scalar designated timestamp is negative ({})",
+                nanos
+            ));
+        }
+        self.designated_ts = Some(DesignatedTsDescriptor {
+            unit: DesignatedTsUnit::Nanos,
+            data: DesignatedTsData::Scalar(nanos),
+        });
+        Ok(self)
+    }
+
+    fn set_designated_ts(&mut self, unit: DesignatedTsUnit, data: &'a [i64]) -> Result<&mut Self> {
+        if self.designated_ts.is_some() {
+            return Err(error::fmt!(
+                InvalidApiCall,
+                "designated timestamp already set on this chunk"
+            ));
+        }
+        if self.server_now {
+            return Err(error::fmt!(
+                InvalidApiCall,
+                "designated timestamp column conflicts with at_now \
+                 (server-assigned timestamps) already set on this chunk"
+            ));
+        }
+        let row_count = check_row_count(self.row_count, data.len(), None)?;
+        self.designated_ts = Some(DesignatedTsDescriptor {
+            unit,
+            data: DesignatedTsData::Column(data.as_ptr()),
+        });
+        self.row_count = Some(row_count);
+        Ok(self)
+    }
+
+    // -------------------------------------------------------------------
+    // Internal
+    // -------------------------------------------------------------------
+
+    fn push_column(
+        &mut self,
+        name: &str,
+        wire_type: u8,
+        kind: ColumnKind,
+        validity: Option<&Validity<'_>>,
+        row_count: usize,
+    ) -> Result<&mut Self> {
+        validate_column_name(name)?;
+        self.guard_unique_name(name)?;
+        let validity = validity.map(ValidityDescriptor::from_validity);
+        self.columns.push(ColumnDescriptor {
+            name: name.to_owned(),
+            wire_type,
+            kind,
+            validity,
+        });
+        self.row_count = Some(row_count);
+        Ok(self)
+    }
+
+    /// Append an Arrow column to the chunk. The column's QWP wire type
+    /// is derived from `field` (Arrow datatype + extension metadata)
+    /// via the same classifier used by [`PooledSenderCore::flush_arrow_batch_at_column`].
+    /// `arr.len()` participates in the chunk's row-count lock; validity
+    /// is read from `arr.nulls()` at flush time.
+    ///
+    /// `field.name()` is ignored — the caller's `name` argument is the
+    /// authoritative column name (it must match the destination table's
+    /// schema, regardless of how the upstream Arrow producer named the
+    /// column).
+    ///
+    /// [`PooledSenderCore::flush_arrow_batch_at_column`]: super::PooledSenderCore::flush_arrow_batch_at_column
+    #[cfg(feature = "arrow-ingress")]
+    pub fn push_arrow_column(
+        &mut self,
+        name: &str,
+        field: &arrow::datatypes::Field,
+        arr: arrow::array::ArrayRef,
+    ) -> Result<&mut Self> {
+        if field.data_type() != arr.data_type() {
+            return Err(error::fmt!(
+                InvalidApiCall,
+                "column {:?}: field data type {:?} does not match array data type {:?}",
+                name,
+                field.data_type(),
+                arr.data_type()
+            ));
+        }
+        let kind = arrow_batch::classify(field, arr.as_ref())?;
+        self.push_arrow_deferred(name, kind, arr)
+    }
+
+    #[cfg(feature = "arrow-ingress")]
+    pub fn push_imported_arrow_slice(
+        &mut self,
+        name: &str,
+        imported: &ImportedArrowColumn,
+        row_offset: usize,
+        row_count: usize,
+    ) -> Result<&mut Self> {
+        let arr = imported.slice(row_offset, row_count)?;
+        self.push_arrow_deferred(name, imported.kind, arr)
+    }
+
+    /// Append an Arrow column to the chunk. `arr.len()` participates in
+    /// the chunk's row-count lock just like row-by-row column appends.
+    /// Validity is read from `arr.nulls()` at flush time; the wire-type
+    /// byte is fixed at push time from the classified [`arrow_batch::ColumnKind`].
+    ///
+    /// Used by `qwp_chunk_append_arrow_column` (FFI) after
+    /// the caller's `ArrowArray` / `ArrowSchema` has been imported into
+    /// an `arrow::array::ArrayRef` and classified.
+    #[cfg(feature = "arrow-ingress")]
+    pub(crate) fn push_arrow_deferred(
+        &mut self,
+        name: &str,
+        arrow_kind: arrow_batch::ColumnKind,
+        arr: arrow::array::ArrayRef,
+    ) -> Result<&mut Self> {
+        validate_column_name(name)?;
+        self.guard_unique_name(name)?;
+        let row_count = check_row_count(self.row_count, arr.len(), None)?;
+        let has_nulls = arr.null_count() > 0;
+        let wire_type = arrow_batch::wire_type_byte(arrow_kind, has_nulls);
+        self.columns.push(ColumnDescriptor {
+            name: name.to_owned(),
+            wire_type,
+            kind: ColumnKind::ArrowDeferred { arrow_kind, arr },
+            validity: None,
+        });
+        self.row_count = Some(row_count);
+        Ok(self)
+    }
+
+    fn guard_unique_name(&self, name: &str) -> Result<()> {
+        if self.columns.iter().any(|c| c.name == name) {
+            return Err(error::fmt!(
+                InvalidApiCall,
+                "duplicate column name in chunk: {:?}",
+                name
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Validate that the span `[offsets[0], offsets[last])` of `bytes` is UTF-8
+/// and that every interior offset lands on a char boundary. The encoder
+/// slices each cell by `offsets`, so a span that is valid as a whole but
+/// whose offsets split a multi-byte character would emit per-cell-invalid
+/// VARCHAR; reject that here at append time.
+fn validate_varchar_utf8_cells<O>(bytes: &[u8], offsets: &[O]) -> Result<()>
+where
+    O: Copy + Into<i64>,
+{
+    let base: i64 = offsets[0].into();
+    let end: i64 = offsets[offsets.len() - 1].into();
+    let span = std::str::from_utf8(&bytes[base as usize..end as usize])
+        .map_err(|e| error::fmt!(InvalidApiCall, "VARCHAR bytes are not valid UTF-8: {}", e))?;
+    for o in offsets.get(1..offsets.len() - 1).unwrap_or(&[]) {
+        let off: i64 = (*o).into();
+        if !span.is_char_boundary((off - base) as usize) {
+            return Err(error::fmt!(
+                InvalidApiCall,
+                "VARCHAR offset {} splits a multi-byte UTF-8 character",
+                off
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_varchar_offsets(offsets: &[i32], bytes_len: usize) -> Result<()> {
+    let mut prev = offsets[0];
+    if prev < 0 {
+        return Err(error::fmt!(
+            InvalidApiCall,
+            "VARCHAR offsets must be non-negative (offsets[0] = {})",
+            prev
+        ));
+    }
+    for (i, &off) in offsets.iter().enumerate().skip(1) {
+        if off < prev {
+            return Err(error::fmt!(
+                InvalidApiCall,
+                "VARCHAR offsets must be non-decreasing (offsets[{}] = {} < offsets[{}] = {})",
+                i,
+                off,
+                i - 1,
+                prev
+            ));
+        }
+        prev = off;
+    }
+    if (prev as usize) > bytes_len {
+        return Err(error::fmt!(
+            InvalidApiCall,
+            "VARCHAR offsets exceed bytes buffer: last offset = {}, bytes_len = {}",
+            prev,
+            bytes_len
+        ));
+    }
+    Ok(())
+}
+
+fn validate_varchar_offsets_i64(offsets: &[i64], bytes_len: usize) -> Result<()> {
+    let first = offsets[0];
+    if first < 0 {
+        return Err(error::fmt!(
+            InvalidApiCall,
+            "LargeVARCHAR offsets must be non-negative (offsets[0] = {})",
+            first
+        ));
+    }
+    let mut prev = first;
+    for (i, &off) in offsets.iter().enumerate().skip(1) {
+        if off < prev {
+            return Err(error::fmt!(
+                InvalidApiCall,
+                "LargeVARCHAR offsets must be non-decreasing (offsets[{}] = {} < offsets[{}] = {})",
+                i,
+                off,
+                i - 1,
+                prev
+            ));
+        }
+        prev = off;
+    }
+    let last = prev;
+    if (last as u64) > bytes_len as u64 {
+        return Err(error::fmt!(
+            InvalidApiCall,
+            "LargeVARCHAR offsets exceed bytes buffer: last offset = {}, bytes_len = {}",
+            last,
+            bytes_len
+        ));
+    }
+    // QWP's wire offset table is uint32 LE. The encoder narrows
+    // `(off - first)` to u32 per row, so the *span* must fit u32::MAX,
+    // not the absolute last offset. A slice taken from the tail of a
+    // multi-GiB LargeUtf8 array remains valid as long as the span is
+    // bounded.
+    let span = last - first;
+    if span > u32::MAX as i64 {
+        return Err(error::fmt!(
+            InvalidApiCall,
+            "LargeVARCHAR slice span exceeds QWP uint32 limit: \
+             last - first = {} - {} = {} > {} (u32::MAX)",
+            last,
+            first,
+            span,
+            u32::MAX
+        ));
+    }
+    Ok(())
+}
+
+/// SAFETY: `p` must point to `codes_len` valid `T`s. `validity` (if any)
+/// must have `bit_len == codes_len` and a bitmap of at least
+/// `ceil(codes_len / 8)` bytes — both enforced by `check_row_count` and
+/// `Validity::from_bitmap` before this is called.
+unsafe fn range_check_codes<T>(
+    p: *const T,
+    codes_len: usize,
+    dict_len: usize,
+    validity: Option<&Validity<'_>>,
+) -> Result<()>
+where
+    T: Copy + Into<i64>,
+{
+    for i in 0..codes_len {
+        if validity.is_some_and(|v| !v.is_valid(i)) {
+            continue;
+        }
+        let code = unsafe { (*p.add(i)).into() };
+        if code < 0 || (code as usize) >= dict_len {
+            return Err(error::fmt!(
+                InvalidApiCall,
+                "symbol code out of range: row {} -> {} (dict_len = {})",
+                i,
+                code,
+                dict_len
+            ));
+        }
+    }
+    Ok(())
+}
+
+impl Debug for Chunk<'_> {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Chunk")
+            .field("table", &self.table)
+            .field("row_count", &self.row_count())
+            .field("columns", &self.columns.len())
+            .field("has_designated_ts", &self.designated_ts.is_some())
+            .field("server_now", &self.server_now)
+            .finish()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn locks_row_count_on_first_column() {
+        let mut chunk = Chunk::new("t");
+        let a = [1i64, 2, 3];
+        chunk.column_i64("a", &a, None).unwrap();
+        assert_eq!(chunk.row_count(), 3);
+        let b = [4i64, 5];
+        let err = chunk.column_i64("b", &b, None).unwrap_err();
+        assert_eq!(err.code(), crate::ErrorCode::InvalidApiCall);
+        assert!(err.msg().contains("row_count"));
+    }
+
+    /// The chunk (column-major) append path must reject exactly the column
+    /// names that the row/arrow API's [`ColumnName::new`] rejects — same
+    /// grammar, no drift. The arrow flush path already validates field
+    /// names via `ColumnName::new`; the chunk path must match it.
+    #[test]
+    fn column_name_validation_matches_canonical_validator() {
+        use crate::ingress::ColumnName;
+        for name in [
+            "ok_col", "a_b", // accepted by ColumnName::new
+            "bad?col", "a.b", "a,b", "a/b", "a-b", "", // rejected
+        ] {
+            let canonical_rejects = ColumnName::new(name).is_err();
+            let mut chunk = Chunk::new("t");
+            let data = [1i64];
+            let chunk_rejects = chunk.column_i64(name, &data, None).is_err();
+            assert_eq!(
+                chunk_rejects, canonical_rejects,
+                "column name {name:?}: chunk path and ColumnName::new disagree \
+                 (chunk_rejects={chunk_rejects}, canonical_rejects={canonical_rejects})"
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_duplicate_column_name() {
+        let mut chunk = Chunk::new("t");
+        let a1 = [1i64];
+        chunk.column_i64("a", &a1, None).unwrap();
+        let a2 = [2i64];
+        let err = chunk.column_i64("a", &a2, None).unwrap_err();
+        assert_eq!(err.code(), crate::ErrorCode::InvalidApiCall);
+        assert!(err.msg().contains("duplicate"));
+    }
+
+    #[test]
+    fn rejects_invalid_validity_length() {
+        let mut chunk = Chunk::new("t");
+        let bits = [0xFFu8];
+        let v = Validity::from_bitmap(&bits, 8).unwrap();
+        let data = [1i64, 2, 3];
+        let err = chunk.column_i64("a", &data, Some(&v)).unwrap_err();
+        assert_eq!(err.code(), crate::ErrorCode::InvalidApiCall);
+        assert!(err.msg().contains("Validity bitmap"));
+    }
+
+    #[test]
+    fn designated_ts_sets_row_count() {
+        let mut chunk = Chunk::new("t");
+        let ts = [1i64, 2, 3];
+        chunk.at_micros(&ts).unwrap();
+        assert_eq!(chunk.row_count(), 3);
+        let ts2 = [4i64, 5, 6];
+        let err = chunk.at_nanos(&ts2).unwrap_err();
+        assert!(err.msg().contains("designated"));
+    }
+
+    #[test]
+    fn clear_resets_columns_but_keeps_table() {
+        let mut chunk = Chunk::new("t");
+        let a = [1i64];
+        let ts = [10i64];
+        chunk.column_i64("a", &a, None).unwrap();
+        chunk.at_nanos(&ts).unwrap();
+        chunk.clear();
+        assert_eq!(chunk.row_count(), 0);
+        assert!(chunk.is_empty());
+        assert_eq!(chunk.table(), "t");
+    }
+
+    #[test]
+    fn varchar_rejects_negative_offset() {
+        let mut chunk = Chunk::new("t");
+        let offsets = [-1i32, 1, 2];
+        let err = chunk.column_str("v", &offsets, b"ab", None).unwrap_err();
+        assert_eq!(err.code(), crate::ErrorCode::InvalidApiCall);
+        assert!(err.msg().contains("non-negative"));
+    }
+
+    #[test]
+    fn varchar_rejects_non_monotonic_offsets() {
+        let mut chunk = Chunk::new("t");
+        let offsets = [0i32, 5, 3];
+        let err = chunk.column_str("v", &offsets, b"abcde", None).unwrap_err();
+        assert_eq!(err.code(), crate::ErrorCode::InvalidApiCall);
+        assert!(err.msg().contains("non-decreasing"));
+    }
+
+    #[test]
+    fn varchar_rejects_invalid_utf8() {
+        let mut chunk = Chunk::new("t");
+        let offsets = [0i32, 2];
+        let err = chunk
+            .column_str("v", &offsets, &[0xff, 0xfe], None)
+            .unwrap_err();
+        assert_eq!(err.code(), crate::ErrorCode::InvalidApiCall);
+        assert!(err.msg().contains("UTF-8"));
+    }
+
+    #[test]
+    fn varchar_rejects_offset_splitting_multibyte_char() {
+        let mut chunk = Chunk::new("t");
+        // "é" is two bytes (0xC3 0xA9): the whole span is valid UTF-8, but
+        // splitting it at offset 1 yields two individually-invalid cells.
+        let offsets = [0i32, 1, 2];
+        let err = chunk
+            .column_str("v", &offsets, &[0xC3, 0xA9], None)
+            .unwrap_err();
+        assert_eq!(err.code(), crate::ErrorCode::InvalidApiCall);
+        assert!(err.msg().contains("splits a multi-byte"));
+    }
+
+    #[test]
+    fn varchar_accepts_char_aligned_multibyte_offsets() {
+        let mut chunk = Chunk::new("t");
+        // "a" then "é": every offset lands on a char boundary, so both cells
+        // are independently valid UTF-8.
+        chunk
+            .column_str("v", &[0i32, 1, 3], &[0x61, 0xC3, 0xA9], None)
+            .unwrap();
+        assert_eq!(chunk.row_count(), 2);
+    }
+
+    #[test]
+    fn symbol_rejects_out_of_range_code() {
+        let mut chunk = Chunk::new("t");
+        let codes = [0i32, 99];
+        let dict_offsets = [0i32, 5];
+        let err = chunk
+            .symbol_i32("sym", &codes, &dict_offsets, b"alpha", None)
+            .unwrap_err();
+        assert_eq!(err.code(), crate::ErrorCode::InvalidApiCall);
+        assert!(err.msg().contains("out of range"));
+    }
+
+    #[test]
+    fn symbol_rejects_invalid_utf8_dict_bytes() {
+        // A SYMBOL dictionary entry that is not valid UTF-8 must be rejected at
+        // append (as `column_str` does for VARCHAR), not silently interned,
+        // persisted to the SFA side-file, and locally ACKed, then rejected by the
+        // server on send -- which would strand the dependent queued frame.
+        let mut chunk = Chunk::new("t");
+        let codes = [0i32];
+        let dict_offsets = [0i32, 2];
+        let err = chunk
+            .symbol_i32("sym", &codes, &dict_offsets, &[0xff, 0xfe], None)
+            .unwrap_err();
+        assert_eq!(err.code(), crate::ErrorCode::InvalidApiCall);
+        assert!(err.msg().contains("UTF-8"));
+    }
+
+    #[test]
+    fn symbol_accepts_valid_multibyte_utf8_dict_bytes() {
+        // "a" then "é" (0xC3 0xA9): both dictionary entries are valid UTF-8 on
+        // char boundaries, so the column is accepted.
+        let mut chunk = Chunk::new("t");
+        let codes = [0i32, 1];
+        let dict_offsets = [0i32, 1, 3];
+        chunk
+            .symbol_i32("sym", &codes, &dict_offsets, &[0x61, 0xC3, 0xA9], None)
+            .expect("valid UTF-8 dictionary is accepted");
+        assert_eq!(chunk.row_count(), 2);
+    }
+
+    #[test]
+    fn symbol_skips_null_codes() {
+        let mut chunk = Chunk::new("t");
+        let codes = [0i32, 99];
+        let dict_offsets = [0i32, 5];
+        let bits = [0b0000_0001];
+        let v = Validity::from_bitmap(&bits, 2).unwrap();
+        chunk
+            .symbol_i32("sym", &codes, &dict_offsets, b"alpha", Some(&v))
+            .expect("null row's bogus code is ignored");
+    }
+
+    /// Regression: splitting a numpy chunk must advance the source pointer by
+    /// the *source* element stride, not the wire width. The two differ for the
+    /// widening / ndarray dtypes, so using the wire width over-advances and the
+    /// split tail would read past the buffer (OOB read) or the wrong rows
+    /// (silent wire corruption).
+    #[test]
+    fn numpy_split_advances_by_source_stride_not_wire_width() {
+        use numpy_wire::NumpyDtype;
+
+        // All widening, so the source stride is strictly smaller than the wire
+        // width — the combination that used to over-advance on a split.
+        let cases = [
+            NumpyDtype::I8WidenToI32,
+            NumpyDtype::U8WidenToI32,
+            NumpyDtype::I16WidenToI32,
+            NumpyDtype::I32WidenToI64,
+        ];
+        for (i, dtype) in cases.into_iter().enumerate() {
+            let expected_stride = dtype.source_elem_size().unwrap();
+            let wire = dtype.bytes_per_row();
+            assert!(
+                expected_stride < wire,
+                "case {i}: expected a widening dtype"
+            );
+            // Oversize so the (buggy) wire-stride advance also lands in bounds,
+            // giving a clean assertion instead of forming an OOB pointer.
+            let buf = vec![0u8; 16 * wire];
+            let mut chunk = Chunk::new("t");
+            unsafe {
+                chunk
+                    .push_numpy_deferred("a", dtype, buf.as_ptr(), 16, None)
+                    .unwrap();
+            }
+            // `row_offset` must be a multiple of 8; split off the tail 8 rows.
+            let sliced = unsafe { chunk.slice_rows(8, 8) };
+            match &sliced.columns[0].kind {
+                ColumnKind::NumpyDeferred {
+                    data, src_stride, ..
+                } => {
+                    assert_eq!(
+                        *src_stride, expected_stride,
+                        "case {i}: stored source stride is wrong"
+                    );
+                    let want = unsafe { buf.as_ptr().add(8 * expected_stride) };
+                    let buggy = unsafe { buf.as_ptr().add(8 * wire) };
+                    assert_eq!(
+                        *data, want,
+                        "case {i}: pointer not advanced by the source stride"
+                    );
+                    assert_ne!(
+                        *data, buggy,
+                        "case {i}: pointer advanced by the wire width (the bug)"
+                    );
+                }
+                _ => panic!("case {i}: expected a NumpyDeferred column"),
+            }
+        }
+    }
+}

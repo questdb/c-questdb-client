@@ -22,10 +22,13 @@ You are a senior QuestDB engineer performing a blocking code review. The QuestDB
   - Failure modes: connection dropping mid-flush, partial write, TLS handshake failure, auth rejection.
   - FFI callers: what happens when the caller passes NULL, an unaligned pointer, a freed handle, a buffer length lying about its actual size?
 - **Check what's missing**, not just what's there. Missing tests, missing error handling, missing edge cases, missing documentation for public API changes, C header out of sync with Rust impl.
+- **Treat public API ergonomics and cross-surface consistency as correctness, not polish.** This library is consumed from Rust, C, C++, and Python; an inconsistent, surprising, or footgun-prone public API leads users into data loss, silent misuse, and crashes just as surely as a logic bug. Every public/exported symbol the PR adds or changes must (a) express each shared concept — table/column names, timestamps, row/batch limits, ack levels, column-type overrides, buffer/handle ownership — the *same way* every sibling surface already does, and (b) make the easy path the safe path. An ergonomic inconsistency that can cause data loss or silent misuse is a blocking finding, not a Minor nit.
 - **Verify every claim.** If the PR title says "fix", verify the bug actually existed and the fix is correct. If it says "improve performance", look for benchmarks or reason about the algorithmic change. If it says "simplify", verify the new code is actually simpler and doesn't drop behavior. Treat the PR description as an unverified hypothesis.
 - **Read the full context of changed files** when the diff alone is ambiguous. Use Read/Grep/Glob to inspect surrounding code, callers, and related tests.
 - **Assess reachability before reporting.** For every potential bug, trace the actual callers and inputs. If a problem requires physically impossible conditions (buffer larger than `usize::MAX`, NUL-byte injection through an API that already rejects it, panics behind validation guards), it is not a real finding — drop it. Focus on bugs that real workloads can trigger, not theoretical edge cases.
 - **`debug_assert!` and `assert!` are valid guards for invariants** that indicate library-internal bugs. Do NOT flag them as insufficient — they are the preferred mechanism for conditions that should never occur given the FFI contracts. Only flag an `assert!`/`debug_assert!` if the condition can plausibly be triggered by callers honoring the documented contract.
+- **Store-and-forward must be outage-tolerant.** Any PR touching QWP/WebSocket store-and-forward, background drainers, orphan drainers, reconnect, close-drain, SFA slots, or sender-error classification must preserve this invariant: server downtime, transient connect failures, replica/read-only role rejects, retry-budget exhaustion, and close/join time budgets must not permanently abandon recoverable queued data. Time budgets may bound a caller wait or background-thread join only if the queued frames/slot remain persisted and recoverable by a later sender/drainer. Retryable failures should record diagnostics (for example `.last_error` or an error inbox), not write `.failed`, delete SFA files, or mark the slot permanently dead. Only proven local unrecoverability, such as corrupt SFA segments, may poison an orphan slot.
+- **Graceful role switch is not a protocol violation.** Enterprise primary-to-replica or replica-to-primary switch can happen without a process restart and with existing client connections still open. A write to an old primary after it becomes read-only must be handled as an expected server-side rejection / role-state transition according to the surface's documented contract, not as a WebSocket protocol violation, panic, drainer exit, or unrecoverable SFA failure. Reviews must look for tests that exercise in-place `/lifecycle/switch` with an already-open connection, not only kill/restart failover.
 
 ## Review level
 
@@ -35,8 +38,8 @@ The level controls how much of the review below actually runs. Lower levels keep
 
 | Level | What runs |
 |-------|-----------|
-| **0 (default)** | Steps 1, 2, 4. Skip Step 2.5. Skip Step 3 — no agent spawn; review the diff inline in the main loop, using Read/Grep on demand to resolve ambiguities. Skip Step 3b — verify each finding inline as you write it. Single-pass review covering correctness, FFI safety, panics, tests, and coding standards on the diff itself. |
-| **1** | Adds Step 2.5a (semantic delta only — skip 2.5b/2.5c/2.5d). In Step 3, launch only Agent 1 (correctness), Agent 2 (Rust safety), and Agent 7 (tests) in parallel. Skip all other agents. Skip Step 3b — verify findings inline as you draft the report. |
+| **0 (default)** | Steps 1, 2, 4. Skip Step 2.5. Skip Step 3 — no agent spawn; review the diff inline in the main loop, using Read/Grep on demand to resolve ambiguities. Skip Step 3b — verify each finding inline as you write it. Single-pass review covering correctness, FFI safety, panics, tests, public API ergonomics & cross-surface consistency, and coding standards on the diff itself. |
+| **1** | Adds Step 2.5a (semantic delta only — skip 2.5b/2.5c/2.5d). In Step 3, launch only Agent 1 (correctness), Agent 2 (Rust safety), Agent 7 (tests), and Agent 8 (public API ergonomics & cross-surface consistency) in parallel. Skip all other agents. Skip Step 3b — verify findings inline as you draft the report. |
 | **2** | Full Step 2.5, but in 2.5b restrict the callsite inventory to `pub`/`pub(crate)` Rust symbols plus every `#[no_mangle]`/`extern "C"` export. In Step 3, launch Agents 1-8. Skip Agent 9 (cross-context) and Agent 10 (adversarial fresh-context). Step 3b uses a single batched verification agent for all findings instead of one per finding. |
 | **3** | Every step below as written, all 10 agents, per-finding verification. The full mission-critical pass. |
 
@@ -198,7 +201,15 @@ State which panic mode applies in the agent's first sentence. Every panic-relate
 
 Cross-reference 2.5d: every cross-context exposure should have a test that exercises the changed symbol from that context. Missing tests for cross-context callsites is a high-priority finding.
 
-**Agent 8 — Code quality & API design:** Public API ergonomics and consistency, backward compatibility of C/C++ headers, naming conventions, dead code, documentation for public items (`///` docs on public Rust, Doxygen-style comments on C/C++ headers), `clippy` and `cargo fmt` compliance.
+**Agent 8 — Public API ergonomics & cross-surface consistency:** API ergonomics is mission-critical here, not cosmetic: an awkward or inconsistent public API leads users into data loss, silent misuse, and crashes. Review every public Rust item, `extern "C"` export, C header declaration, C++ wrapper method, and Python binding the PR adds or changes, against the surfaces that already exist. Use the **API ergonomics & cross-surface consistency** checklist below as your spec. Concretely:
+
+- **Consistency first.** For each shared concept the change touches (table/column names, designated timestamp, row/batch limit, ack level, column-type overrides, buffer/handle ownership), confirm it is expressed the *same way* across every sibling method/sink/transport: same parameter type, name, order, validation timing (eager-fallible vs lazy), and ownership. A new entry point that takes `TableName` where its sibling takes `&str`/`impl Into<String>`, validates lazily where the sibling validates eagerly, or omits a control (timestamp column, overrides, ack level) the sibling exposes, is a finding.
+- **Easy path = safe path.** Flag any API where the natural call is the unsafe one — e.g. a method that silently leaves rows uncommitted/unacked unless the user remembers a separate `sync`/`commit`/`close`, while a sibling commits implicitly. Silent semantic divergence between similarly-shaped methods (commit vs defer, idempotent vs not, replays vs not, clears buffer on error vs leaves it dirty) that the type system does not surface is the highest-severity ergonomic defect — graded by data-loss blast radius, never Minor.
+- **Accept what callers hold; cut positional noise.** Prefer `impl TryInto<TableName>` / `impl Into<String>` so `&str` just works; replace always-passed sentinels (`&[]`, `None`, `0`) and double-wrapped knobs (`Option<NonZeroUsize>`) with defaulted methods or an options/builder type — consistent with the rest of the crate.
+- **Evolvability & docs.** Public enums/structs that may grow should be `#[non_exhaustive]`; any commit/flush/ordering/ownership/lifetime contract the signature cannot encode must be documented on the item with a cross-reference to siblings that differ.
+- **Cross-language parity.** For FFI/header/wrapper/binding changes, verify parameter order, ownership/free responsibility, naming, nullability, and error-reporting style match across Rust, C, C++, and Python; an idiom present in one language must have the documented equivalent (or a stated, intentional omission) in the others.
+
+Also cover the mechanical hygiene that used to live here: backward-compatible C/C++ headers (breaking changes must be intentional and called out in the PR body), `///` docs on public Rust and Doxygen-style comments on C/C++ headers, no dead code or unused imports, and `clippy`/`cargo fmt` cleanliness.
 
 **Agent 9 — Cross-context caller impact:** Walk the callsite inventory from 2.5b. For every callsite, fetch the surrounding code (the calling function plus its callers up two levels) and answer:
 
@@ -242,6 +253,7 @@ For each finding in the draft report:
 8. **For unsafe soundness claims**: verify whether the safety invariants are actually violated. Check preconditions established by callers and documented in the `// SAFETY:` comment.
 9. **For performance claims**: check whether the cost is measurable on a realistic workload. Downgrade to a nit if the saving is negligible relative to the surrounding I/O. Exception: an allocation on the per-row buffer-write path is always worth flagging, even a single one.
 10. **For cross-context findings (Agent 9)**: re-read the callsite in full, including its callers up two levels, and confirm the broken behavior is reachable from production code paths or test paths users will exercise. Cross-context findings are high-value but also the easiest to overstate — verify carefully.
+11. **For API ergonomics / consistency findings (Agent 8)**: name and read the specific peer surface the finding is measured against — the sibling method, the other sink/transport, or the C/C++/Python binding of the same concept — and quote both shapes side by side. An ergonomic complaint with no concrete peer surface to compare against, or one that contradicts an established crate-wide convention, is bikeshedding: drop it or downgrade to Minor. Then grade by user impact, not by appearance: a divergence that can cause data loss, unacked/uncommitted rows, or silent misuse is Critical/Moderate; a pure style/naming difference with no safety impact is Minor.
 
 **Classify each finding** as:
 - **CONFIRMED in-diff** — the bug is real and inside the diff
@@ -300,6 +312,12 @@ Anything that aborts the Rust side aborts the host process. The first check is t
 - Thread-safety of types passed across `Send` boundaries
 - For every changed symbol, check whether it is now reachable from a thread or context (per 2.5d) where the previous concurrency assumptions don't hold
 
+### QWP store-and-forward, failover, and role switch
+- **Drainers do not give up recoverable data.** For background and orphan drainers, verify every exit condition: explicit stop, queue drained, unrecoverable local corruption, retry-budget exhaustion, close-drain timeout, join timeout, connect failure, server reject, role reject, and poisoned locks. Any exit caused by server downtime, retry budget, or time budget must leave queued frames persisted and future-drainable; it must not mark `.failed`, delete SFA files, or convert a transient outage into permanent data loss.
+- **Timeouts bound waits, not durability.** A close/drain/join timeout may return control to the caller, but the persisted SFA state must remain recoverable. Check that tests assert both sides: the call is bounded and the slot/frame can later be replayed.
+- **In-place role changes are first-class.** A node can become a read-only replica while an existing QWP connection remains open. Verify read-only/role-reject responses are classified as server/role outcomes under the public contract, not as WebSocket protocol violations, panics, or unrecoverable SFA poison.
+- **Graceful switch tests are required for relevant changes.** If a PR touches QWP role detection, server-error classification, reconnect, store-and-forward replay, close drain, background progress, or Enterprise harness integration, require coverage for `/lifecycle/switch` primary-to-replica and back without process restart, with at least one already-open client connection.
+
 ### Performance
 - Performance regressions: changes that make hot paths slower
 - Unnecessary allocations in buffer building, column writes, or flushing paths
@@ -316,8 +334,26 @@ Anything that aborts the Rust side aborts the host process. The first check is t
 - Buffer memory freed correctly
 - No leaks through FFI boundary (callee returns ownership and caller frees, or vice versa — documented and consistent)
 
+### API ergonomics & cross-surface consistency
+
+Mission-critical for a client library: a confusing or inconsistent public API causes data loss, silent misuse, and crashes, so ergonomic and consistency defects are graded by user impact — not automatically filed under Minor. Review every public Rust item, `extern "C"` export, C header declaration, C++ wrapper method, and Python binding the PR adds or changes against the surfaces that already exist.
+
+**Consistency across surfaces (the dominant concern):**
+- **Same concept, same shape.** A concept that already exists elsewhere — table name, column name, designated timestamp, row/batch limit, ack level, column-type override, buffer/handle ownership — must be expressed identically across every method, sink, and transport that touches it: same parameter type, same name, same argument order, same validation timing (eager-fallible vs lazy-at-use), same ownership/borrowing. Flag a new method that takes `TableName` where a sibling takes `impl Into<String>`/`&str` (or vice-versa), validates lazily where a sibling validates eagerly, or names/orders a shared parameter differently.
+- **Capability parity across sinks/transports.** If one ingestion path (row buffer, Arrow, Polars, HTTP, TCP/QWP) exposes a control (designated-timestamp column, per-column overrides, batching/row limit, ack level, transactional flush), the peers must expose the equivalent or the PR must state why not. A capability that exists only because of which entry point the user happened to pick is a finding.
+- **Naming and verb parity.** The same operation uses the same verb everywhere (`flush_*`, `column_*`, `at*`, `*_new`). A new `write_arrow` beside an existing `flush_arrow_batch`, or `set_table` beside `table`, is an inconsistency. C/C++/Python symbol names must mirror the Rust names per the existing convention.
+- **Cross-language parity.** For changed FFI/header/wrapper/binding symbols: parameter order, ownership/free responsibility, error-reporting style, and nullability must match across Rust, C, C++, and Python. An idiom available in one language must have the documented equivalent (or an intentional, stated omission) in the others.
+
+**Ergonomics (the easy path must be the safe path):**
+- **No hidden mandatory second call.** If correctness requires the user to remember a follow-up call (`sync`/`commit`/`flush`/`close`) to avoid uncommitted/unacked/lost rows, and a sibling API does it implicitly, the asymmetry is a footgun — rank it by data-loss blast radius, not as a nit.
+- **Silent semantic divergence is the worst defect.** Two similarly named/shaped entry points that differ in a behavior the type system does not surface (one commits, one defers; one is idempotent, one is not; one auto-reconnects/replays, one does not; one clears the buffer on error, one leaves it dirty) are a trap. Require the difference be made visible in the name or type, or documented loudly at *both* sites with a cross-reference. Never file these as Minor.
+- **Accept the types callers already hold.** Prefer `impl TryInto<TableName>` / `impl Into<String>` so `&str` works without `TableName::new(x)?` ceremony at every callsite — matching whatever the rest of the crate already accepts for that concept.
+- **Positional noise and clunky knobs.** Sentinel arguments the common call must always pass (`&[]`, `None`, `0`) are a smell; prefer a defaulted method or an options/builder type. Double-wrapped knobs like `Option<NonZeroUsize>` are awkward at the callsite — check whether a plain value with a documented default reads better.
+- **Evolvability.** Public enums/structs that may gain variants/fields should be `#[non_exhaustive]`; options/builder types should accept new optional knobs without breaking existing callers. A new public enum that is not `#[non_exhaustive]` but plausibly will grow is a finding.
+- **Errors over panics, consistently.** Fallible construction/validation returns the crate's standard error type with an actionable message; it must not panic on caller-supplied input, and must not introduce a second, inconsistent error idiom.
+- **Document the contract the signature can't encode.** Any commit/flush/ordering/ownership/lifetime semantic not expressible in the type must be documented on the public item, cross-referencing any sibling that behaves differently.
+
 ### Code quality
-- Public API is consistent and ergonomic
 - Backward-compatible changes to C/C++ headers (or breaking changes are intentional and called out in the PR body)
 - Naming conventions consistent with existing codebase
 - No dead code or unused imports
@@ -328,6 +364,8 @@ Anything that aborts the Rust side aborts the host process. The first check is t
 - **Coverage gaps:** For every new or changed code path, verify a corresponding test exists. If not, flag it explicitly as "missing test for X".
 - **Cross-context coverage:** For every entry in the cross-context exposure list (2.5d), verify a test exercises the changed symbol from that context. Missing cross-context tests are high-priority findings.
 - **Error path coverage:** Are failure cases, partial writes, connection drops, TLS failures, auth failures, and edge conditions tested — not just the happy path?
+- **SFA outage coverage:** For QWP store-and-forward changes, tests must prove retryable server outage, connect failure, timeout, and role-reject paths keep queued data recoverable instead of poisoning or silently deleting it.
+- **Graceful role-switch coverage:** For QWP reconnect/error-classification changes, tests must include Enterprise in-place primary/replica switch with no process restart and an already-open connection; kill/restart failover alone is not sufficient.
 - **NULL/edge-case tests:** Are NULL inputs, empty buffers, zero-length strings, max-length symbols, and boundary values tested?
 - **FFI tests:** Are C/C++ API changes covered by tests in `cpp_test/`?
 - **Integration tests:** Are protocol-level changes covered by system tests in `system_test/`?

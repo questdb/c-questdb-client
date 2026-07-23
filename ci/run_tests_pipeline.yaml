@@ -31,48 +31,163 @@ stages:
               imageName: "ubuntu-latest"
               poolName: "Azure Pipelines"
               toolchain: "nightly"
-            mac:
-              imageName: "macos-latest"
-              poolName: "Azure Pipelines"
-            windows-msvc-2022:
-              imageName: "windows-2022"
-              poolName: "Azure Pipelines"
-            windows-msvc-2025:
-              imageName: "windows-2025"
-              poolName: "Azure Pipelines"
         pool:
           name: $(poolName)
           vmImage: $(imageName)
-        timeoutInMinutes: 60
+        timeoutInMinutes: 90
         steps:
           - checkout: self
             fetchDepth: 1
             lfs: false
             submodules: false
           - template: templates/compile.yaml
+            parameters:
+              cxx20Variants: true
           - script: |
               cd questdb-rs
-              cargo build --examples --features almost-all-features
+              cargo build --examples --features almost-all-features,arrow,polars
+            condition: and(succeeded(), eq(variables['Agent.OS'], 'Linux'))
             displayName: "Build Rust examples"
-          ############################# temp for test begin #####################
-          #- script: |
-          #    git clone --depth 1 https://github.com/questdb/questdb.git ./questdb
-          #  displayName: git clone questdb
-          #- task: Maven@3
-          #  displayName: "Compile QuestDB"
-          #  inputs:
-          #    mavenPOMFile: "questdb/pom.xml"
-          #    jdkVersionOption: "1.17"
-          #    options: "-DskipTests -Pbuild-web-console"
-          ############################# temp for test end #####################
-          - script: python3 ci/run_all_tests.py
+          - script: python3 ci/run_all_tests.py unit
             env:
-              JAVA_HOME: $(JAVA_HOME_17_X64)
-            displayName: "Tests"
+              JAVA_HOME: $(JAVA_HOME_25_X64)
+            displayName: "Unit tests"
+          # Build QuestDB master for run_all_tests.py's `--repo ./questdb`.
+          # Keep source-checkout coverage after QWP ships; add a separate
+          # `--versions` gate for the exact QuestDB 10.0 release artifact.
+          - template: templates/clone_questdb.yaml
+          - task: Maven@3
+            displayName: "Compile QuestDB"
+            inputs:
+              mavenPOMFile: "questdb/pom.xml"
+              javaHomeOption: "Path"
+              jdkDirectory: "$(JAVA_HOME_25_X64)"
+              options: "-DskipTests -Pbuild-web-console$(CLIENT_PROFILE)"
+          - script: python3 ci/run_all_tests.py integration
+            env:
+              JAVA_HOME: $(JAVA_HOME_25_X64)
+            displayName: "Integration tests"
           # - task: PublishBuildArtifacts@1
           #   inputs:
           #     pathToPublish: ./build
           #   displayName: "Publish build directory"
+      # mac/windows: run cargo vs native (build + C++ + integration) as two
+      # parallel jobs to cut the slow legs' wall-clock. linux stays in RunOn.
+      - job: RustTests
+        displayName: "cargo tests (mac/windows)"
+        strategy:
+          matrix:
+            mac:
+              imageName: "macos-latest"
+            windows-msvc-2022:
+              imageName: "windows-2022"
+            windows-msvc-2025:
+              imageName: "windows-2025"
+        pool:
+          vmImage: $(imageName)
+        timeoutInMinutes: 90
+        steps:
+          - checkout: self
+            fetchDepth: 1
+            lfs: false
+            submodules: false
+          - script: python3 ci/run_all_tests.py cargo
+            displayName: "cargo tests"
+      - job: NativeTests
+        displayName: "build + C++ + integration (mac/windows)"
+        strategy:
+          matrix:
+            mac:
+              imageName: "macos-latest"
+            windows-msvc-2022:
+              imageName: "windows-2022"
+            windows-msvc-2025:
+              imageName: "windows-2025"
+        pool:
+          vmImage: $(imageName)
+        timeoutInMinutes: 90
+        steps:
+          - checkout: self
+            fetchDepth: 1
+            lfs: false
+            submodules: false
+          - template: templates/compile.yaml
+            parameters:
+              cxx20Variants: true
+          - script: python3 ci/run_all_tests.py cpp
+            displayName: "C++ tests"
+          # Build QuestDB master for run_all_tests.py's `--repo ./questdb`.
+          - template: templates/clone_questdb.yaml
+          - task: Maven@3
+            displayName: "Compile QuestDB"
+            inputs:
+              mavenPOMFile: "questdb/pom.xml"
+              javaHomeOption: "Path"
+              jdkDirectory: "$(JAVA_HOME_25_X64)"
+              options: "-DskipTests -Pbuild-web-console$(CLIENT_PROFILE)"
+          - script: python3 ci/run_all_tests.py integration
+            env:
+              JAVA_HOME: $(JAVA_HOME_25_X64)
+            displayName: "Integration tests"
+          - task: ArchiveFiles@2
+            displayName: "Compress QuestDB server log on failure"
+            condition: failed()
+            continueOnError: true
+            inputs:
+              rootFolderOrFile: >-
+                $(Build.SourcesDirectory)/build/questdb/repo/data/log
+              includeRootFolder: false
+              archiveType: zip
+              archiveFile: >-
+                $(Build.ArtifactStagingDirectory)/qdb-log-native-$(imageName).zip
+              quiet: true
+          - task: PublishBuildArtifacts@1
+            displayName: "Publish QuestDB server log on failure"
+            condition: failed()
+            continueOnError: true
+            inputs:
+              pathToPublish: >-
+                $(Build.ArtifactStagingDirectory)/qdb-log-native-$(imageName).zip
+              artifactName: qdb-log-native-$(imageName)
+      - job: VersionMatrix
+        displayName: "arrow/polars version-range tests (linux)"
+        pool:
+          vmImage: "ubuntu-latest"
+        timeoutInMinutes: 90
+        steps:
+          - checkout: self
+            fetchDepth: 1
+            lfs: false
+            submodules: false
+          - script: python3 ci/run_version_matrix.py
+            displayName: "questdb-rs: pinned arrow/polars versions"
+      - job: RustMsrvAndDocs
+        displayName: "Rust MSRV and release documentation"
+        pool:
+          vmImage: "ubuntu-latest"
+        timeoutInMinutes: 45
+        steps:
+          - checkout: self
+            fetchDepth: 1
+            lfs: false
+            submodules: false
+          - script: rustup toolchain install 1.91.1 --profile minimal
+            displayName: "Install Rust 1.91.1"
+          - script: |
+              cargo +1.91.1 check --manifest-path questdb-rs/Cargo.toml
+              cargo +1.91.1 check --manifest-path questdb-rs/Cargo.toml \
+                --features almost-all-features,arrow,polars
+              cargo +1.91.1 check \
+                --manifest-path questdb-rs-ffi/Cargo.toml --all-features
+            displayName: "Check advertised features at the MSRV"
+          - script: |
+              cargo +1.91.1 doc --manifest-path questdb-rs/Cargo.toml \
+                --no-deps --features almost-all-features,arrow,polars
+            env:
+              RUSTDOCFLAGS: "-D warnings"
+            displayName: "Build docs.rs feature set with warnings denied"
+          - script: python3 ci/check_docs.py
+            displayName: "Check release documentation"
       - job: FormatAndLinting
         displayName: "cargo fmt and clippy"
         pool:
@@ -159,9 +274,9 @@ stages:
       # has enough headroom. Pool image is built from
       # questdb/azure-ci-runners' roles/incus/files/provision.sh, which
       # provides openjdk-17-jdk, openjdk-25-jdk, maven, build-essential,
-      # zip, curl, gh, and rustup; only cmake and python3-numpy are
-      # apt-installed per job. imageName='hetzner-incus' tells
-      # compile.yaml to skip its pip step.
+      # zip, curl, gh, and rustup. This job installs cmake and python3-pip,
+      # then uses pip for numpy>=2 before compile.yaml installs the standard
+      # Python dependencies, including pyarrow/polars, for non-macOS builds.
       - job: TestVsQuestDBMaster
         displayName: "Vs QuestDB master"
         pool:
@@ -313,6 +428,9 @@ stages:
           - script: |
               python3 system_test/test.py run --repo ./questdb TestQwpWsFuzz -v
             displayName: "TestQwpWsFuzz"
+          - script: |
+              python3 system_test/test.py run --repo ./questdb TestArrowEgressFuzz TestArrowEgressPerKind TestArrowEgressEmpty TestArrowIngressFuzz TestArrowIngressPerKind TestArrowIngressDesignatedTs TestArrowIngressErrors TestArrowIngressMultiBatch TestArrowIngressExtraTypes TestArrowIngressUnsupportedTypes TestArrowIngressSfa TestArrowRoundTripFuzz TestArrowRoundTripPerKind TestArrowAlignment TestArrowPolarsFuzz TestArrowPolarsRoundTripPerKind TestArrowPolarsPerDtype -v
+            displayName: "TestArrowWsFuzz"
           # Mirrors ci/run_fuzz_pipeline.yaml: on failure, archive and
           # publish the QuestDB server log so PR reviewers don't have to
           # repro locally. Path comes from system_test/fixture.py:_log_path.
@@ -338,10 +456,9 @@ stages:
       # job in ci/run_fuzz_pipeline.yaml. Pool image is built from
       # questdb/azure-ci-runners' roles/incus/files/provision.sh, which
       # provides openjdk-17-jdk, openjdk-25-jdk, maven, build-essential,
-      # zip, curl, gh, and rustup; only cmake and python3-numpy are
-      # apt-installed per job. imageName='hetzner-incus' tells
-      # compile.yaml to skip its pip step (PEP 668 / EXTERNALLY-MANAGED
-      # on Ubuntu 24.04+).
+      # zip, curl, gh, and rustup. The job installs cmake/python3-numpy/
+      # python3-pip plus pyarrow/polars explicitly so the Arrow system tests
+      # are available on the self-hosted image.
       - job: TestQwpWsFuzzLinux
         displayName: "QWP/WS fuzz suite (linux/hetzner-incus)"
         pool:
@@ -360,7 +477,8 @@ stages:
           - bash: |
               set -eux
               sudo apt-get update
-              sudo apt-get install -y --no-install-recommends cmake python3-numpy
+              sudo apt-get install -y --no-install-recommends cmake python3-numpy python3-pip
+              sudo python3 -m pip install --break-system-packages pyarrow polars
               JAVA_PATH_17="/usr/lib/jvm/java-17-openjdk-amd64"
               JAVA_PATH_25="/usr/lib/jvm/java-25-openjdk-amd64"
               for p in "$JAVA_PATH_17" "$JAVA_PATH_25"; do
@@ -411,6 +529,9 @@ stages:
           - script: |
               python3 system_test/test.py run --repo ./questdb TestQwpWsFuzz -v
             displayName: "TestQwpWsFuzz"
+          - script: |
+              python3 system_test/test.py run --repo ./questdb TestArrowEgressFuzz TestArrowEgressPerKind TestArrowEgressEmpty TestArrowIngressFuzz TestArrowIngressPerKind TestArrowIngressDesignatedTs TestArrowIngressErrors TestArrowIngressMultiBatch TestArrowIngressExtraTypes TestArrowIngressUnsupportedTypes TestArrowIngressSfa TestArrowRoundTripFuzz TestArrowRoundTripPerKind TestArrowAlignment TestArrowPolarsFuzz TestArrowPolarsRoundTripPerKind TestArrowPolarsPerDtype -v
+            displayName: "TestArrowWsFuzz"
           - task: ArchiveFiles@2
             displayName: "Compress QuestDB server log on failure"
             condition: failed()
@@ -439,7 +560,9 @@ stages:
         displayName: "QWP egress live-server suite"
         pool:
           vmImage: "ubuntu-latest"
-        timeoutInMinutes: 30
+        timeoutInMinutes: 60
+        variables:
+          imageName: ubuntu-latest
         steps:
           - checkout: self
             fetchDepth: 1
