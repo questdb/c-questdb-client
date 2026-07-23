@@ -258,9 +258,12 @@ _setsig(
 
 # Reader error handling.
 _setsig("questdb_error_get_code", _c_int32, ctypes.POINTER(_LineReaderError))
+# restype is a raw void pointer, not c_char_p: the message is a borrowed,
+# non-NUL-terminated slice with its length in the out-param. A c_char_p
+# restype would make ctypes scan for a NUL and read past the slice's end.
 _setsig(
     "questdb_error_msg",
-    _c_char_p,
+    _c_void_p,
     ctypes.POINTER(_LineReaderError),
     ctypes.POINTER(_c_size_t),
 )
@@ -290,7 +293,7 @@ def _take_error(err_ptr) -> ReaderError:
     msg_len = _c_size_t(0)
     raw = _DLL.questdb_error_msg(err_ptr, ctypes.byref(msg_len))
     msg = (
-        bytes(ctypes.string_at(raw, msg_len.value)).decode("utf-8", "replace")
+        ctypes.string_at(raw, msg_len.value).decode("utf-8", "replace")
         if raw and msg_len.value
         else ""
     )
@@ -909,11 +912,17 @@ class QwpEgressReader:
             )
             if not ok:
                 raise _take_error(err_ref)
+            # The FFI hands back a borrowed, non-NUL-terminated slice with its
+            # length in `name_len`. Read the pointer's address via a void_p
+            # cast (no dereference) and copy exactly `name_len` bytes.
+            # `name_ptr.value` would instead scan for a NUL terminator and walk
+            # off the end of the slice into unmapped memory.
+            name_addr = ctypes.cast(name_ptr, ctypes.c_void_p).value
             name = (
                 ctypes.string_at(name_ptr, name_len.value).decode(
                     "utf-8", "replace"
                 )
-                if name_ptr.value and name_len.value
+                if name_addr and name_len.value
                 else ""
             )
             cols.append({"name": name, "type": ""})  # type filled in after decode
