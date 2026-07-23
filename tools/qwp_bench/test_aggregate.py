@@ -6,6 +6,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 HERE = pathlib.Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
@@ -240,6 +241,129 @@ class AggregatorTest(unittest.TestCase):
             with_override = invoke(custom, "--ingress-bpr", "12.5")
             self.assertEqual(0, with_override.returncode, with_override.stderr)
 
+    def test_cli_bpr_override_rejects_multiple_workload_shapes(self):
+        def invoke(*args):
+            return subprocess.run(
+                [sys.executable, str(HERE / "aggregate.py"), *map(str, args)],
+                text=True, capture_output=True, check=False,
+            )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            cases = (
+                (
+                    "canonical-and-noncanonical",
+                    "--ingress-bpr",
+                    report("encode-floor", row_check=None),
+                    report(
+                        "encode-floor", rows=1_000, row_check=None
+                    ),
+                ),
+                (
+                    "mixed-ingress-schema",
+                    "--ingress-bpr",
+                    report("encode-floor", row_check=None),
+                    report(
+                        "encode-floor", schema="s2-wide", row_check=None
+                    ),
+                ),
+                (
+                    "mixed-egress-schema",
+                    "--egress-bpr",
+                    report(
+                        "decode-only", direction="egress", row_check=None
+                    ),
+                    report(
+                        "decode-only", direction="egress",
+                        schema="s2-wide", row_check=None,
+                    ),
+                ),
+            )
+            for name, flag, first, second in cases:
+                first_path = root / f"{name}-first.json"
+                second_path = root / f"{name}-second.json"
+                first_path.write_text(json.dumps(first))
+                second_path.write_text(json.dumps(second))
+                result = invoke(
+                    first_path, second_path, flag, "12.5"
+                )
+                with self.subTest(name=name):
+                    self.assertEqual(2, result.returncode, result.stderr)
+                    self.assertIn(flag, result.stderr)
+                    self.assertIn("schema", result.stderr)
+                    self.assertIn("rows", result.stderr)
+                    self.assertIn("separate invocations", result.stderr)
+                    self.assertNotIn("Traceback", result.stderr)
+                    self.assertEqual("", result.stdout)
+
+            same_shape_first = root / "same-shape-first.json"
+            same_shape_second = root / "same-shape-second.json"
+            same_shape_first.write_text(json.dumps(
+                report("encode-floor", row_check=None)
+            ))
+            same_shape_second.write_text(json.dumps(
+                report(
+                    "encode-floor", senders=2, run_mode="floor",
+                    row_check=None,
+                )
+            ))
+            allowed = invoke(
+                same_shape_first, same_shape_second,
+                "--ingress-bpr", "12.5",
+            )
+            self.assertEqual(0, allowed.returncode, allowed.stderr)
+
+    def test_cli_rejects_duplicate_json_members_at_any_depth(self):
+        def invoke(path):
+            return subprocess.run(
+                [sys.executable, str(HERE / "aggregate.py"), str(path)],
+                text=True, capture_output=True, check=False,
+            )
+
+        value = report("encode-floor", row_check=None)
+        encoded = json.dumps(value)
+        summary = json.dumps(value["paths"]["encode-floor"])
+        cases = (
+            (
+                "top-level-identity",
+                '"direction": "ingress"',
+                '"direction": "ingress", "direction": "ingress"',
+                "direction",
+            ),
+            (
+                "nested-path",
+                f'"encode-floor": {summary}',
+                (
+                    f'"encode-floor": {summary}, '
+                    f'"encode-floor": {summary}'
+                ),
+                "encode-floor",
+            ),
+            (
+                "nested-metric",
+                '"rows_per_s_median": 2000000.0',
+                (
+                    '"rows_per_s_median": 2000000.0, '
+                    '"rows_per_s_median": 2000000.0'
+                ),
+                "rows_per_s_median",
+            ),
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            for name, needle, replacement, member in cases:
+                self.assertIn(needle, encoded)
+                path = root / f"{name}.json"
+                path.write_text(encoded.replace(needle, replacement, 1))
+                result = invoke(path)
+                with self.subTest(name=name):
+                    self.assertEqual(2, result.returncode, result.stderr)
+                    self.assertIn(path.name, result.stderr)
+                    self.assertIn("duplicate JSON member", result.stderr)
+                    self.assertIn(member, result.stderr)
+                    self.assertNotIn("Traceback", result.stderr)
+                    self.assertEqual("", result.stdout)
+
     def test_partition_separates_ingress_and_egress(self):
         ingress = report("encode-floor", row_check=None)
         egress = report("decode-only", direction="egress", row_check=None)
@@ -408,10 +532,14 @@ class AggregatorTest(unittest.TestCase):
             value["_source"] = f"order-{index}.json"
             values.append(value)
 
-        output = aggregate.render(
-            aggregate.collect(values), "md", ingress_override=1.0,
-            egress_override=1.0, raw=True,
-        )
+        canonical = {
+            (schema, rows): {"ingress": 1.0, "egress": 1.0}
+            for _, schema, rows, _, _ in specs
+        }
+        with mock.patch.dict(aggregate.CANONICAL_BPR, canonical):
+            output = aggregate.render(
+                aggregate.collect(values), "md", raw=True,
+            )
         headings = [
             line[4:]
             for line in output.splitlines()

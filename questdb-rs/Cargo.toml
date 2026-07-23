@@ -366,9 +366,9 @@ required-features = ["sync-sender-qwp-ws", "sync-reader-qwp-ws"]
 name = "polars"
 required-features = ["polars", "sync-sender-qwp-ws"]
 
-# Rust Polars ingress benchmark on the S1 narrow schema. Measures
-# flush_polars_dataframe() e2e + the column-sender encode floor and emits the
-# JSON path summary
+# Rust Polars ingress benchmark using the shared S1 narrow / S2 wide schemas.
+# Measures flush_polars_dataframe() e2e + the column-sender encode floor and
+# emits the JSON path summary
 # (client="rust-polars", direction="ingress"). Uses ureq for the DEDUP
 # table create + WAL count gate, hence sync-sender-http. Benchmark usage and
 # comparison workflow are documented in `doc/BENCHMARKS.md`. Run with:
@@ -392,7 +392,8 @@ required-features = ["polars", "sync-sender-qwp-ws", "sync-sender-http"]
 name = "qwp_ingress_row"
 required-features = ["sync-sender-qwp-ws", "sync-sender-http"]
 
-# Rust Polars egress benchmark on S1. Reads the table back via
+# Rust Polars egress benchmark using the shared S1 narrow / S2 wide schemas.
+# Reads the table back via
 # fetch_all_polars / iter_polars / next_polars and reports decode vs assemble
 # vs the honest decode_plus_assemble sum, emitting the JSON path summary
 # (direction="egress"). Benchmark usage is documented in `doc/BENCHMARKS.md`.

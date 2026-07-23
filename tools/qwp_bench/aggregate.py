@@ -116,7 +116,11 @@ def load_reports(paths):
     for path in paths:
         try:
             with open(path, encoding="utf-8") as handle:
-                value = json.load(handle, parse_constant=reject_json_constant)
+                value = json.load(
+                    handle,
+                    parse_constant=reject_json_constant,
+                    object_pairs_hook=reject_duplicate_json_members,
+                )
         except (OSError, ValueError) as exc:
             raise ReportError(f"cannot load {path}: {exc}") from exc
         if not isinstance(value, dict):
@@ -468,7 +472,7 @@ def reject_duplicate_json_members(pairs):
     result = {}
     for key, value in pairs:
         if key in result:
-            raise ReportError("raw JSON member collision after encoding")
+            raise ReportError(f"duplicate JSON member collision for {key!r}")
         result[key] = value
     return result
 
@@ -516,6 +520,23 @@ def render_raw(groups, fmt):
 
 
 def render(groups, fmt, ingress_override=None, egress_override=None, raw=False):
+    for direction, override, flag in (
+        ("ingress", ingress_override, "--ingress-bpr"),
+        ("egress", egress_override, "--egress-bpr"),
+    ):
+        if override is None:
+            continue
+        shapes = {
+            (key.schema, key.rows)
+            for key in groups
+            if key.direction == direction
+        }
+        if len(shapes) > 1:
+            raise ReportError(
+                f"{flag} cannot cover multiple (schema, rows) workloads; "
+                "use separate invocations for each workload"
+            )
+
     blocks = [
         "# QWP benchmark comparison" if fmt == "md"
         else "QWP benchmark comparison"

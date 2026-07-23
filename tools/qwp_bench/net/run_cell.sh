@@ -116,14 +116,25 @@ cd /opt/qwp-bench/c-questdb-client/questdb-rs && mkdir -p $OUT_BOX && \
 tail -5 $OUT_BOX/$CLIENT_KIND-$DIRECTION.log || true; \
 exit \$bench_status" 14400 || BENCH_STATUS=$?
 
+POST_STATUS=0
+record_post_failure() {
+    local failed_status=$1
+    if [ "$POST_STATUS" -eq 0 ]; then
+        POST_STATUS=$failed_status
+    fi
+    return 0
+}
+
 echo "== stop sar, render text, collect"
 for box in server client; do
     ./ssmx.sh run "$box" "pkill -f 'sar -o' 2>/dev/null; sleep 1; \
 sar -f $OUT_BOX/sar-$box.bin -u > $OUT_BOX/sar-$box-cpu.txt 2>/dev/null; \
 sar -f $OUT_BOX/sar-$box.bin -n DEV > $OUT_BOX/sar-$box-net.txt 2>/dev/null; \
-aws s3 cp --recursive $OUT_BOX s3://$(qnb_bucket)/results/$LABEL/ >/dev/null; echo uploaded"
+aws s3 cp --recursive $OUT_BOX s3://$(qnb_bucket)/results/$LABEL/ >/dev/null; echo uploaded" \
+        || record_post_failure "$?"
 done
-aws s3 cp --recursive "s3://$(qnb_bucket)/results/$LABEL/" "$OUT_LOCAL/" >/dev/null
+aws s3 cp --recursive "s3://$(qnb_bucket)/results/$LABEL/" "$OUT_LOCAL/" >/dev/null \
+    || record_post_failure "$?"
 
 RESULT_FILE="$OUT_LOCAL/$CLIENT_KIND-$DIRECTION.json"
 JSON_STATUS=0
@@ -155,10 +166,10 @@ jq -n \
       commits: {c_questdb_client: $cc, py_questdb_client: $py},
       monitor: ["sar-client-cpu.txt","sar-client-net.txt",
                 "sar-server-cpu.txt","sar-server-net.txt"]}' \
-    > "$OUT_LOCAL/cell.json"
+    > "$OUT_LOCAL/cell.json" || record_post_failure "$?"
 
 echo "== done: $OUT_LOCAL"
-ls -la "$OUT_LOCAL"
+ls -la "$OUT_LOCAL" || record_post_failure "$?"
 
 if [ "$BENCH_STATUS" -ne 0 ]; then
     echo "ERROR: benchmark command failed with status $BENCH_STATUS" >&2
@@ -166,4 +177,8 @@ if [ "$BENCH_STATUS" -ne 0 ]; then
 fi
 if [ "$JSON_STATUS" -ne 0 ]; then
     exit "$JSON_STATUS"
+fi
+if [ "$POST_STATUS" -ne 0 ]; then
+    echo "ERROR: post-processing failed with status $POST_STATUS" >&2
+    exit "$POST_STATUS"
 fi

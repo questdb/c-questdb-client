@@ -62,12 +62,18 @@ if [ "${1:-}" = run ] && [ "${2:-}" = client ]; then
             ;;
     esac
 fi
+if [ "${1:-}" = run ] \
+        && [[ "${3:-}" == *"sar -f"* ]] \
+        && [ "${MOCK_CLEANUP_FAIL_BOX:-}" = "${2:-}" ]; then
+    exit "${MOCK_CLEANUP_STATUS:-31}"
+fi
 exit 0
 EOF
 
     cat > "$LAST_CASE_DIR/bin/aws" <<'EOF'
 #!/usr/bin/env bash
 set -u
+printf 'aws %s\n' "$*" >> "$QNB_TEST_TRACE"
 if [ "${1:-}" = s3 ] && [ "${2:-}" = cp ] \
         && [ "${3:-}" = --recursive ] \
         && [[ "${4:-}" == s3://* ]] \
@@ -82,6 +88,7 @@ if [ "${1:-}" = s3 ] && [ "${2:-}" = cp ] \
         missing) ;;
         *) echo "unknown MOCK_JSON_KIND=$MOCK_JSON_KIND" >&2; exit 80 ;;
     esac
+    exit "${MOCK_S3_STATUS:-0}"
 fi
 exit 0
 EOF
@@ -89,6 +96,7 @@ EOF
     cat > "$LAST_CASE_DIR/bin/jq" <<'EOF'
 #!/usr/bin/env bash
 set -u
+printf 'jq %s\n' "$*" >> "$QNB_TEST_TRACE"
 if [ "${1:-}" = "-e" ]; then
     python3 - "$3" <<'PY'
 import json
@@ -101,14 +109,28 @@ PY
     exit "$status"
 fi
 if [ "${1:-}" = "-n" ]; then
+    if [ "${MOCK_SIDECAR_STATUS:-0}" -ne 0 ]; then
+        exit "$MOCK_SIDECAR_STATUS"
+    fi
     printf '{}\n'
     exit 0
 fi
 exit 2
 EOF
 
+    cat > "$LAST_CASE_DIR/bin/ls" <<'EOF'
+#!/usr/bin/env bash
+set -u
+printf 'ls %s\n' "$*" >> "$QNB_TEST_TRACE"
+/bin/ls "$@"
+native_status=$?
+[ "$native_status" -eq 0 ] || exit "$native_status"
+exit "${MOCK_LIST_STATUS:-0}"
+EOF
+
     chmod +x "$LAST_CASE_DIR/run_cell.sh" "$LAST_CASE_DIR/ssmx.sh" \
-        "$LAST_CASE_DIR/bin/aws" "$LAST_CASE_DIR/bin/jq"
+        "$LAST_CASE_DIR/bin/aws" "$LAST_CASE_DIR/bin/jq" \
+        "$LAST_CASE_DIR/bin/ls"
     : > "$LAST_CASE_DIR/trace"
 }
 
@@ -126,6 +148,11 @@ run_cell_case() {
     MOCK_RESULT_FILE="$LAST_RESULT_FILE" \
     MOCK_BENCH_STATUS=$bench_status \
     MOCK_JSON_KIND=$json_kind \
+    MOCK_CLEANUP_FAIL_BOX="${MOCK_CLEANUP_FAIL_BOX:-}" \
+    MOCK_CLEANUP_STATUS="${MOCK_CLEANUP_STATUS:-31}" \
+    MOCK_S3_STATUS="${MOCK_S3_STATUS:-0}" \
+    MOCK_SIDECAR_STATUS="${MOCK_SIDECAR_STATUS:-0}" \
+    MOCK_LIST_STATUS="${MOCK_LIST_STATUS:-0}" \
     QNB_TEST_TRACE="$LAST_CASE_DIR/trace" \
     PATH="$LAST_CASE_DIR/bin:${PATH:-/usr/bin:/bin}" \
         "$LAST_CASE_DIR/run_cell.sh" \
@@ -187,12 +214,53 @@ assert_failed_bench_diagnostics() {
     assert_output_contains "$case_name" "cell.json"
 }
 
+assert_post_processing_reached_end() {
+    case_name=$1
+    assert_trace_contains "$case_name" \
+        "run server pkill -f 'sar -o'"
+    assert_trace_contains "$case_name" \
+        "run client pkill -f 'sar -o'"
+    assert_trace_contains "$case_name" \
+        "aws s3 cp --recursive s3://test-bucket/results/$LAST_LABEL/ results/$LAST_LABEL/"
+    assert_trace_contains "$case_name" "jq -n"
+    assert_trace_contains "$case_name" "ls -la results/$LAST_LABEL"
+}
+
 run_cell_case valid-rust-ingress 0 object rust ingress
 assert_status "valid Rust ingress" 0
 
 run_cell_case failed-rust-ingress 23 object rust ingress
 assert_status "failed Rust ingress" 23
 assert_failed_bench_diagnostics "failed Rust ingress"
+
+MOCK_CLEANUP_FAIL_BOX=server MOCK_CLEANUP_STATUS=31 \
+    run_cell_case failed-cleanup 0 object rust ingress
+assert_status "failed cleanup" 31
+assert_post_processing_reached_end "failed cleanup"
+
+MOCK_S3_STATUS=32 run_cell_case failed-s3-download 0 object rust ingress
+assert_status "failed S3 download" 32
+assert_post_processing_reached_end "failed S3 download"
+
+MOCK_SIDECAR_STATUS=33 run_cell_case failed-sidecar 0 object rust ingress
+assert_status "failed sidecar" 33
+assert_post_processing_reached_end "failed sidecar"
+
+MOCK_LIST_STATUS=34 run_cell_case failed-listing 0 object rust ingress
+assert_status "failed listing" 34
+assert_post_processing_reached_end "failed listing"
+
+MOCK_CLEANUP_FAIL_BOX=server MOCK_CLEANUP_STATUS=31 \
+MOCK_S3_STATUS=32 MOCK_SIDECAR_STATUS=33 MOCK_LIST_STATUS=34 \
+    run_cell_case json-before-post-failure 0 malformed rust ingress
+assert_status "JSON failure before post-processing failure" 1
+assert_post_processing_reached_end "JSON failure before post-processing failure"
+
+MOCK_CLEANUP_FAIL_BOX=server MOCK_CLEANUP_STATUS=31 \
+MOCK_S3_STATUS=32 MOCK_SIDECAR_STATUS=33 MOCK_LIST_STATUS=34 \
+    run_cell_case bench-before-all-later-failures 23 malformed rust ingress
+assert_status "benchmark failure before all later failures" 23
+assert_post_processing_reached_end "benchmark failure before all later failures"
 
 run_cell_case missing-result 0 missing rust ingress
 assert_nonzero_status "missing result"
