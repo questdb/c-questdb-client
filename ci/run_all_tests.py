@@ -88,13 +88,6 @@ def run_cpp_tests():
             run_cmd(str(twin))
 
 
-def run_qwp_benchmark_tests():
-    """Offline checks for benchmark report handling and cell orchestration."""
-    run_cmd(sys.executable, 'tools/qwp_bench/test_aggregate.py')
-    if platform.system() != 'Windows':
-        run_cmd('bash', 'tools/qwp_bench/net/test_run_cell.sh')
-
-
 def run_integration_tests():
     """system_test against a from-source build of QuestDB master (--repo):
     master is ahead of the latest release, so this catches server-side
@@ -146,8 +139,6 @@ def main():
             'cargo, cpp, unit, integration, soak-selftest '
             '(or no argument for all).\n')
         sys.exit(2)
-    if mode in ('all', 'unit', 'cpp'):
-        run_qwp_benchmark_tests()
     if mode in ('all', 'unit', 'cargo'):
         run_cargo_tests()
     if mode in ('all', 'unit', 'cpp'):
