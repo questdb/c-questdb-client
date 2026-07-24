@@ -77,6 +77,8 @@ import datetime
 import os
 import random
 import secrets
+import signal
+import subprocess
 import threading
 import time
 import urllib.error
@@ -1307,6 +1309,145 @@ def is_transient_network_error(exc: BaseException) -> bool:
     )
 
 
+ISOLATED_SUITE_TIMEOUT_EXIT_CODE = 124
+
+
+def _default_supervisor_log(message: str) -> None:
+    sys.stderr.write(f'{message}\n')
+    sys.stderr.flush()
+
+
+def _wait_bounded(proc, timeout_sec: float) -> bool:
+    """Wait at most ``timeout_sec`` for ``proc`` to be reaped."""
+    try:
+        proc.wait(timeout=timeout_sec)
+        return True
+    except subprocess.TimeoutExpired:
+        return False
+
+
+def _terminate_isolated_process_tree(
+        proc,
+        *,
+        wait_timeout_sec: float,
+        log=_default_supervisor_log) -> bool:
+    """Force-stop an isolated child and its descendants without blocking.
+
+    POSIX children are launched in a private session, so signalling their
+    process group reaches the Python runner, QuestDB JVM and helper processes.
+    Windows has no stdlib Job Object API; ``taskkill /T /F`` supplies the same
+    process-tree operation. Every reap remains bounded even if the OS cannot
+    finish terminating a process stuck in kernel I/O.
+    """
+    if wait_timeout_sec <= 0:
+        raise ValueError('wait_timeout_sec must be positive')
+
+    if sys.platform == 'win32':
+        try:
+            taskkill = subprocess.Popen(
+                ['taskkill', '/PID', str(proc.pid), '/T', '/F'])
+            if not _wait_bounded(taskkill, wait_timeout_sec):
+                taskkill.kill()
+                if not _wait_bounded(taskkill, wait_timeout_sec):
+                    log(
+                        f'fuzz supervisor: taskkill for pid {proc.pid} '
+                        f'could not be reaped within {wait_timeout_sec:g}s')
+        except OSError as e:
+            log(
+                f'fuzz supervisor: could not run taskkill for pid '
+                f'{proc.pid}: {e!r}')
+
+        if _wait_bounded(proc, wait_timeout_sec):
+            return True
+        try:
+            proc.kill()
+        except OSError as e:
+            log(
+                f'fuzz supervisor: direct kill of pid {proc.pid} '
+                f'failed: {e!r}')
+        if _wait_bounded(proc, wait_timeout_sec):
+            return True
+    else:
+        try:
+            os.killpg(proc.pid, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+        except OSError as e:
+            log(
+                f'fuzz supervisor: SIGTERM of process group {proc.pid} '
+                f'failed: {e!r}')
+
+        # Give normal termination a short chance, but always follow with a
+        # group SIGKILL: the Python group leader can exit before a stuck JVM.
+        _wait_bounded(proc, wait_timeout_sec)
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        except OSError as e:
+            log(
+                f'fuzz supervisor: SIGKILL of process group {proc.pid} '
+                f'failed: {e!r}')
+        if _wait_bounded(proc, wait_timeout_sec):
+            return True
+
+    log(
+        f'fuzz supervisor: pid {proc.pid} was not reaped within the bounded '
+        f'termination window; abandoning the isolated process tree')
+    return False
+
+
+def run_isolated_suite(
+        command,
+        *,
+        timeout_sec: float,
+        terminate_timeout_sec: float = 10,
+        env=None,
+        log=_default_supervisor_log) -> int:
+    """Run a test suite in an OS-isolated process tree with a hard deadline."""
+    if timeout_sec <= 0:
+        raise ValueError('timeout_sec must be positive')
+
+    command = list(command)
+    popen_args = {'env': env}
+    if sys.platform == 'win32':
+        popen_args['creationflags'] = subprocess.CREATE_NEW_PROCESS_GROUP
+    else:
+        popen_args['start_new_session'] = True
+
+    log(
+        f'fuzz supervisor: starting isolated suite with a '
+        f'{timeout_sec:g}s deadline: {command!r}')
+    proc = subprocess.Popen(command, **popen_args)
+    try:
+        return_code = proc.wait(timeout=timeout_sec)
+        # A fatal child path may use os._exit() to avoid racing fixture
+        # cleanup. On POSIX its JVM remains addressable through the private
+        # process group even after the Python group leader exits, so sweep the
+        # group before reporting the failure.
+        if return_code != 0 and sys.platform != 'win32':
+            _terminate_isolated_process_tree(
+                proc,
+                wait_timeout_sec=terminate_timeout_sec,
+                log=log)
+        return return_code
+    except subprocess.TimeoutExpired:
+        log(
+            f'fuzz supervisor: suite exceeded its {timeout_sec:g}s deadline; '
+            f'terminating process tree rooted at pid {proc.pid}')
+        _terminate_isolated_process_tree(
+            proc,
+            wait_timeout_sec=terminate_timeout_sec,
+            log=log)
+        return ISOLATED_SUITE_TIMEOUT_EXIT_CODE
+    except BaseException:
+        _terminate_isolated_process_tree(
+            proc,
+            wait_timeout_sec=terminate_timeout_sec,
+            log=log)
+        raise
+
+
 class AlterThread(threading.Thread):
     """Background thread that races `ALTER TABLE ... ALTER COLUMN TYPE`
     statements against the producers.
@@ -1545,6 +1686,29 @@ class BounceThread(threading.Thread):
         return self._min_interval_s + self._rnd.next_int(span_ms) / 1000.0
 
 
+def _abort_unrecoverable_lifecycle() -> None:
+    """Kill the isolated fuzz process tree without racing cleanup hooks."""
+    if os.environ.get('QWP_WS_FUZZ_ISOLATED_CHILD') == '1':
+        if sys.platform == 'win32':
+            try:
+                killer = subprocess.Popen(
+                    ['taskkill', '/PID', str(os.getpid()), '/T', '/F'],
+                    creationflags=subprocess.CREATE_NO_WINDOW)
+                # Success kills this process before wait() returns. If the
+                # helper fails or stalls, the suite supervisor remains the
+                # final deadline and os._exit() below avoids fixture cleanup.
+                _wait_bounded(killer, 10)
+            except OSError:
+                pass
+        else:
+            try:
+                os.killpg(os.getpgrp(), signal.SIGKILL)
+            except OSError:
+                pass
+
+    os._exit(1)
+
+
 def finish_bounce_thread(
         *,
         bounce_thread: BounceThread,
@@ -1553,43 +1717,68 @@ def finish_bounce_thread(
         stop_timeout_sec: float,
         restart_timeout_sec: float,
         record_failure,
-        log) -> None:
+        log,
+        abort_process=None) -> None:
     """Join ``bounce_thread`` and recover a failed lifecycle synchronously.
 
-    The timed join is diagnostic only. This function never returns while the
-    thread is alive, and it performs recovery only after the join has handed
-    exclusive fixture ownership back to the calling thread.
+    The fuzz suite runs in an isolated process tree. If the bounded join
+    expires, Python cannot safely cancel the lifecycle thread or return while
+    it still owns fixture state, so the child exits immediately and lets its
+    supervisor terminate the entire tree.
     """
-    try:
-        bounce_thread.join(timeout=wind_down_sec)
-        if bounce_thread.is_alive():
+    if abort_process is None:
+        abort_process = _abort_unrecoverable_lifecycle
+
+    bounce_thread.join(timeout=wind_down_sec)
+    if bounce_thread.is_alive():
+        try:
             record_failure(
                 f'fuzz bounce: thread still alive '
                 f'{wind_down_sec:.0f}s after producers finished; '
-                f'server lifecycle is stuck')
-    finally:
-        # Even if the timed join or failure reporting is interrupted, do not
-        # let verification or teardown race lifecycle work on _proc/_log.
-        if bounce_thread.is_alive():
-            bounce_thread.join()
+                f'server lifecycle is stuck; aborting isolated fuzz process')
+        finally:
+            abort_process()
+        raise RuntimeError('abort_process returned unexpectedly')
 
-        if bounce_thread.lifecycle_error is not None:
-            # start() can fail after assigning _proc and opening _log. Stop
-            # first so recovery never launches a second process beside it.
+    lifecycle_error = bounce_thread.lifecycle_error
+    if lifecycle_error is not None:
+        if not getattr(lifecycle_error, 'fixture_reusable', True):
             try:
-                fixture.stop(wait_timeout_sec=stop_timeout_sec)
-            except Exception as e:  # noqa: BLE001 — recovery is best-effort
                 log(
-                    f'fuzz bounce: synchronous recovery stop failed: '
-                    f'{type(e).__name__}: {e}')
-            try:
-                fixture.start(
-                    start_timeout_sec=restart_timeout_sec,
-                    probe_min_http=True)
-            except Exception as e:  # noqa: BLE001 — original failure wins
+                    f'fuzz bounce: lifecycle lost fixture ownership: '
+                    f'{type(lifecycle_error).__name__}: {lifecycle_error}; '
+                    f'aborting isolated fuzz process')
+            finally:
+                abort_process()
+            raise RuntimeError('abort_process returned unexpectedly')
+
+        # start() can fail after assigning _proc and opening _log. Stop first
+        # so recovery never launches a second process beside it. If stop()
+        # cannot prove the old process was reaped, abort the isolated child.
+        try:
+            fixture.stop(wait_timeout_sec=stop_timeout_sec)
+        except Exception as e:  # noqa: BLE001 — recovery is best-effort
+            if getattr(e, 'fixture_reusable', False):
                 log(
-                    f'fuzz bounce: synchronous recovery start failed: '
-                    f'{type(e).__name__}: {e}')
+                    f'fuzz bounce: synchronous recovery stop required '
+                    f'force-kill: {type(e).__name__}: {e}')
+            else:
+                try:
+                    log(
+                        f'fuzz bounce: synchronous recovery stop failed: '
+                        f'{type(e).__name__}: {e}; '
+                        f'aborting isolated fuzz process')
+                finally:
+                    abort_process()
+                raise RuntimeError('abort_process returned unexpectedly')
+        try:
+            fixture.start(
+                start_timeout_sec=restart_timeout_sec,
+                probe_min_http=True)
+        except Exception as e:  # noqa: BLE001 — original failure wins
+            log(
+                f'fuzz bounce: synchronous recovery start failed: '
+                f'{type(e).__name__}: {e}')
 
 
 # ---------------------------------------------------------------------------

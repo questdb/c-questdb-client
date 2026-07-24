@@ -25,10 +25,11 @@ def find_binary(build_dir, name, exe_suffix):
 
 
 def run_python_fixture_tests():
-    """Pure-Python QuestDB fixture lifecycle and readiness tests."""
-    run_cmd(
-        sys.executable, '-m', 'unittest', 'discover',
-        '-s', 'system_test', '-p', 'test_fixture_unit.py')
+    """Pure-Python QuestDB fixture and fuzz-lifecycle tests."""
+    for pattern in ('test_fixture_unit.py', 'test_qwp_ws_fuzz_unit.py'):
+        run_cmd(
+            sys.executable, '-m', 'unittest', 'discover',
+            '-s', 'system_test', '-p', pattern)
 
 
 def run_python_ctypes_tests():

@@ -143,6 +143,11 @@ SUITE_QWP_WS_SMOKE = 'qwp_ws_smoke'
 SUITE_QWP_WS_PROTOCOL = 'qwp_ws_protocol'
 SUITE_QWP_WS_RESTART = 'qwp_ws_restart'
 SUITE_QWP_WS_FUZZ = 'qwp_ws_fuzz'
+# Healthy cross-platform runs take about 4-11 minutes. Thirty minutes leaves
+# substantial slow-run margin while staying well below the 90-minute CI job.
+QWP_WS_FUZZ_SUITE_TIMEOUT_SEC = 30 * 60
+QWP_WS_FUZZ_TERMINATE_TIMEOUT_SEC = 10
+BOUNCE_LIFECYCLE_HEADROOM_SEC = 60
 QWP_WS_STATUS_SCHEMA_MISMATCH = 0x03
 
 QWP_DECIMAL256_POSITIVE_OVERFLOW = Decimal(
@@ -2454,7 +2459,7 @@ class TestQwpWsFuzz(QwpWsTestSupport, unittest.TestCase):
     #
     # Bounces intentionally continue while producers are in close_drain():
     # reconnecting and replaying through repeated restarts is part of this
-    # test. close_drain() has one overall drain deadline (240s with the
+    # test. close_drain() has one overall drain deadline (270s with the
     # default caps), and the configured three-bounce and ten-short-bounce
     # campaigns are expected to finish well inside it. If a campaign prevents
     # the drain from completing for that whole deadline, the timeout is the
@@ -2701,10 +2706,12 @@ class TestQwpWsFuzz(QwpWsTestSupport, unittest.TestCase):
                         # bounce, but it finishes any in-flight one first. The
                         # diagnostic timeout allows a whole cycle — stop()
                         # (≤ bounce_stop_timeout_s) + start()
-                        # (≤ BOUNCE_RESTART_TIMEOUT_SEC), plus headroom.
+                        # (≤ BOUNCE_RESTART_TIMEOUT_SEC), plus headroom for
+                        # Windows control helpers, diagnostics and force-reap.
                         wind_down_sec = (
                             fuzz.bounce_stop_timeout_s
-                            + self.BOUNCE_RESTART_TIMEOUT_SEC + 30)
+                            + self.BOUNCE_RESTART_TIMEOUT_SEC
+                            + BOUNCE_LIFECYCLE_HEADROOM_SEC)
                         stop_event.set()
                         qwp_ws_fuzz.finish_bounce_thread(
                             bounce_thread=bounce_thread,
@@ -2748,7 +2755,7 @@ class TestQwpWsFuzz(QwpWsTestSupport, unittest.TestCase):
 
     def _producer_loop(self, sender_id, sf_root, load, fuzz, rnd,
                        tables, next_ts, record_failure):
-        # Reconnect and close_drain() use the same budget (240s with the
+        # Reconnect and close_drain() use the same budget (270s with the
         # default bounce caps). close_drain() applies it once to the entire
         # drain interval, including repeated bounces deliberately scheduled
         # while it waits; the deadline is not renewed per bounce. The formula
@@ -2762,7 +2769,9 @@ class TestQwpWsFuzz(QwpWsTestSupport, unittest.TestCase):
         # up while close_drain() still has time left. Non-bounce variants never
         # reconnect, so they keep the tighter default budget.
         client_budget_millis = int(
-            (fuzz.bounce_stop_timeout_s + self.BOUNCE_RESTART_TIMEOUT_SEC + 30)
+            (fuzz.bounce_stop_timeout_s
+             + self.BOUNCE_RESTART_TIMEOUT_SEC
+             + BOUNCE_LIFECYCLE_HEADROOM_SEC)
             * 1000) if fuzz.max_bounces > 0 else 120000
         conf = self._sender_conf(
             sender_id,
@@ -3298,7 +3307,7 @@ class TestQwpWsFuzz(QwpWsTestSupport, unittest.TestCase):
         # Many short bounces so the chaos thread gets multiple chances
         # to land mid-flush. Each bounce is ~3-5s of process restart, so
         # the full campaign takes ~30-60s including the producers' SFA replay,
-        # well inside close_drain()'s overall 240s liveness deadline.
+        # well inside close_drain()'s overall 270s liveness deadline.
         load = qwp_ws_fuzz.LoadParams(
             100, 10 if not self._is_windows() else 6, 5, 5, 400)
         fuzz = qwp_ws_fuzz.FuzzParams(
@@ -4295,6 +4304,11 @@ def parse_args():
         help=('Test against existing jar from a ' +
               '`mvn install -DskipTests -P build-web-console`' +
               '-ed questdb repo such as `~/questdb/repos/questdb/`'))
+    version_g.add_argument(
+        '--qwp-ws-fuzz-child-dir',
+        type=str,
+        metavar='PREPARED_QUESTDB_DIR',
+        help=argparse.SUPPRESS)
     list_p = sub_p.add_parser('list', help='List latest -n releases.')
     list_p.set_defaults(command='list')
     list_p.add_argument('-n', type=int, default=30, help='number of releases')
@@ -4328,6 +4342,13 @@ def iter_versions(args):
     Returns a generator of prepared questdb directories.
     Ensure that the DB is stopped after each use.
     """
+    fuzz_child_dir = getattr(args, 'qwp_ws_fuzz_child_dir', None)
+    if fuzz_child_dir:
+        # The supervisor has already installed/copied this QuestDB version.
+        # Reuse it directly so process isolation adds no server setup work.
+        yield pathlib.Path(fuzz_child_dir).resolve()
+        return
+
     if getattr(args, 'repo', None):
         # A specific repo path was provided.
         repo = pathlib.Path(args.repo)
@@ -4354,6 +4375,41 @@ def iter_versions(args):
     for version, download_url in versions.items():
         questdb_dir = install_questdb(version, download_url)
         yield questdb_dir
+
+
+def _qwp_ws_fuzz_timeout_sec() -> float:
+    raw = os.environ.get(
+        'QWP_WS_FUZZ_SUITE_TIMEOUT_SEC',
+        str(QWP_WS_FUZZ_SUITE_TIMEOUT_SEC))
+    try:
+        timeout_sec = float(raw)
+    except ValueError as e:
+        raise ValueError(
+            f'Invalid QWP_WS_FUZZ_SUITE_TIMEOUT_SEC={raw!r}') from e
+    if not math.isfinite(timeout_sec) or timeout_sec <= 0:
+        raise ValueError(
+            'QWP_WS_FUZZ_SUITE_TIMEOUT_SEC must be finite and positive')
+    return timeout_sec
+
+
+def _run_qwp_ws_fuzz_in_subprocess(questdb_dir) -> int:
+    """Run the shared QWP/Arrow fuzz fixture in a supervised process tree."""
+    command = [
+        sys.executable,
+        str(pathlib.Path(__file__).resolve()),
+        'run',
+        '--qwp-ws-fuzz-child-dir',
+        str(pathlib.Path(questdb_dir).resolve()),
+        *sys.argv[1:],
+    ]
+    env = os.environ.copy()
+    env['QDB_BUILD_MODE_SEED'] = str(BUILD_MODE_SEED)
+    env['QWP_WS_FUZZ_ISOLATED_CHILD'] = '1'
+    return qwp_ws_fuzz.run_isolated_suite(
+        command,
+        timeout_sec=_qwp_ws_fuzz_timeout_sec(),
+        terminate_timeout_sec=QWP_WS_FUZZ_TERMINATE_TIMEOUT_SEC,
+        env=env)
 
 
 def _stop_and_maybe_wipe(fixture):
@@ -4393,11 +4449,24 @@ def run_with_fixtures(args):
             f'>>>> build_mode fuzz seed = {BUILD_MODE_SEED} '
             f'(API/CONF/ENV picked per-test at the latest protocol; '
             f're-run with QDB_BUILD_MODE_SEED={BUILD_MODE_SEED} to reproduce)\n')
-    run_matrix_suite = _select_tests(SUITE_MATRIX).countTestCases() > 0
-    run_qwp_ws_smoke_suite = _select_tests(SUITE_QWP_WS_SMOKE).countTestCases() > 0
-    run_qwp_ws_protocol_suite = _select_tests(SUITE_QWP_WS_PROTOCOL).countTestCases() > 0
-    run_qwp_ws_restart_suite = _select_tests(SUITE_QWP_WS_RESTART).countTestCases() > 0
-    run_qwp_ws_fuzz_suite = _select_tests(SUITE_QWP_WS_FUZZ).countTestCases() > 0
+    fuzz_child = bool(getattr(args, 'qwp_ws_fuzz_child_dir', None))
+    # The child receives the caller's original unittest selection but runs
+    # only the fuzz fixture group. The parent runs every other selected group
+    # and delegates this one exactly once per prepared QuestDB version.
+    run_matrix_suite = (
+        not fuzz_child
+        and _select_tests(SUITE_MATRIX).countTestCases() > 0)
+    run_qwp_ws_smoke_suite = (
+        not fuzz_child
+        and _select_tests(SUITE_QWP_WS_SMOKE).countTestCases() > 0)
+    run_qwp_ws_protocol_suite = (
+        not fuzz_child
+        and _select_tests(SUITE_QWP_WS_PROTOCOL).countTestCases() > 0)
+    run_qwp_ws_restart_suite = (
+        not fuzz_child
+        and _select_tests(SUITE_QWP_WS_RESTART).countTestCases() > 0)
+    run_qwp_ws_fuzz_suite = (
+        _select_tests(SUITE_QWP_WS_FUZZ).countTestCases() > 0)
 
     for questdb_dir in iter_versions(args):
         if run_matrix_suite:
@@ -4515,6 +4584,17 @@ def run_with_fixtures(args):
                 _stop_and_maybe_wipe(QDB_FIXTURE)
 
         if run_qwp_ws_fuzz_suite:
+            if not fuzz_child:
+                fuzz_exit_code = _run_qwp_ws_fuzz_in_subprocess(questdb_dir)
+                if fuzz_exit_code != 0:
+                    sys.stderr.write(
+                        f'Isolated QWP/WS fuzz suite failed with exit code '
+                        f'{fuzz_exit_code}.\n')
+                    sys.stderr.flush()
+                    raise SystemExit(
+                        fuzz_exit_code if fuzz_exit_code > 0 else 1)
+                continue
+
             QDB_FIXTURE = QuestDbFixture(
                 questdb_dir,
                 auth=False,

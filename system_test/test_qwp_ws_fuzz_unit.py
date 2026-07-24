@@ -37,9 +37,11 @@ Run with::
 import sys
 sys.dont_write_bytecode = True
 
+import subprocess
 import threading
 import unittest
 import urllib.error
+from unittest import mock
 
 import qwp_ws_fuzz
 
@@ -295,56 +297,174 @@ class BounceThreadLifecycleOwnershipTest(unittest.TestCase):
         self.assertEqual(failure_counter[0], 0)
         self.assertEqual(failures, [])
 
-    def test_diagnostic_timeout_still_joins_before_recovery(self):
+    def test_diagnostic_timeout_aborts_isolated_process(self):
         events = []
 
         class SlowThread:
             lifecycle_error = TimeoutError('restart timed out')
 
-            def __init__(self):
-                self.alive = True
-
-            def join(self, timeout=None):
+            @staticmethod
+            def join(timeout=None):
                 events.append(('join', timeout))
-                if timeout is None:
-                    self.alive = False
 
-            def is_alive(self):
-                return self.alive
+            @staticmethod
+            def is_alive():
+                return True
 
-        thread = SlowThread()
+        class ProcessAborted(Exception):
+            pass
+
+        def abort_process():
+            events.append(('abort',))
+            raise ProcessAborted
+
+        failures = []
+        with self.assertRaises(ProcessAborted):
+            qwp_ws_fuzz.finish_bounce_thread(
+                bounce_thread=SlowThread(),
+                fixture=None,
+                wind_down_sec=240,
+                stop_timeout_sec=120,
+                restart_timeout_sec=90,
+                record_failure=failures.append,
+                log=lambda msg: self.fail(msg),
+                abort_process=abort_process)
+
+        self.assertEqual(events, [('join', 240), ('abort',)])
+        self.assertEqual(len(failures), 1)
+        self.assertIn('thread still alive 240s', failures[0])
+        self.assertIn('aborting isolated fuzz process', failures[0])
+
+    def test_failed_recovery_stop_aborts_instead_of_restarting(self):
+        events = []
+
+        class FinishedThread:
+            lifecycle_error = TimeoutError('restart timed out')
+
+            @staticmethod
+            def join(timeout=None):
+                events.append(('join', timeout))
+
+            @staticmethod
+            def is_alive():
+                return False
 
         class Fixture:
-            def stop(self, wait_timeout_sec):
-                self.assert_thread_joined()
+            @staticmethod
+            def stop(wait_timeout_sec):
                 events.append(('stop', wait_timeout_sec))
+                raise TimeoutError('process was not reaped')
 
-            def start(self, start_timeout_sec, probe_min_http):
-                self.assert_thread_joined()
+            @staticmethod
+            def start(start_timeout_sec, probe_min_http):
                 events.append(
                     ('start', start_timeout_sec, probe_min_http))
 
-            @staticmethod
-            def assert_thread_joined():
-                if thread.is_alive():
-                    raise AssertionError('recovery raced the lifecycle thread')
+        class ProcessAborted(Exception):
+            pass
 
-        failures = []
-        qwp_ws_fuzz.finish_bounce_thread(
-            bounce_thread=thread,
-            fixture=Fixture(),
-            wind_down_sec=240,
-            stop_timeout_sec=120,
-            restart_timeout_sec=90,
-            record_failure=failures.append,
-            log=lambda msg: self.fail(msg))
+        def abort_process():
+            events.append(('abort',))
+            raise ProcessAborted
+
+        logs = []
+        with self.assertRaises(ProcessAborted):
+            qwp_ws_fuzz.finish_bounce_thread(
+                bounce_thread=FinishedThread(),
+                fixture=Fixture(),
+                wind_down_sec=240,
+                stop_timeout_sec=120,
+                restart_timeout_sec=90,
+                record_failure=lambda msg: self.fail(msg),
+                log=logs.append,
+                abort_process=abort_process)
 
         self.assertEqual(
-            events,
-            [('join', 240), ('join', None), ('stop', 120),
-             ('start', 90, True)])
-        self.assertEqual(len(failures), 1)
-        self.assertIn('thread still alive 240s', failures[0])
+            events, [('join', 240), ('stop', 120), ('abort',)])
+        self.assertEqual(len(logs), 1)
+        self.assertIn('aborting isolated fuzz process', logs[0])
+
+
+class IsolatedSuiteSupervisorTest(unittest.TestCase):
+
+    @mock.patch.object(qwp_ws_fuzz.subprocess, 'Popen')
+    def test_success_returns_child_exit_code(self, popen):
+        child = popen.return_value
+        child.wait.return_value = 0
+
+        result = qwp_ws_fuzz.run_isolated_suite(
+            ['python', 'test.py'],
+            timeout_sec=1800,
+            env={'SENTINEL': '1'},
+            log=lambda _msg: None)
+
+        self.assertEqual(result, 0)
+        child.wait.assert_called_once_with(timeout=1800)
+        self.assertEqual(popen.call_args.kwargs['env'], {'SENTINEL': '1'})
+        if sys.platform == 'win32':
+            self.assertEqual(
+                popen.call_args.kwargs['creationflags'],
+                subprocess.CREATE_NEW_PROCESS_GROUP)
+        else:
+            self.assertTrue(popen.call_args.kwargs['start_new_session'])
+
+    @mock.patch.object(qwp_ws_fuzz, '_terminate_isolated_process_tree')
+    @mock.patch.object(qwp_ws_fuzz.subprocess, 'Popen')
+    def test_timeout_kills_tree_and_returns_timeout_code(
+            self, popen, terminate_tree):
+        child = popen.return_value
+        child.pid = 1234
+        child.wait.side_effect = subprocess.TimeoutExpired(
+            ['python', 'test.py'], 1800)
+        logs = []
+
+        result = qwp_ws_fuzz.run_isolated_suite(
+            ['python', 'test.py'],
+            timeout_sec=1800,
+            terminate_timeout_sec=7,
+            log=logs.append)
+
+        self.assertEqual(
+            result, qwp_ws_fuzz.ISOLATED_SUITE_TIMEOUT_EXIT_CODE)
+        terminate_tree.assert_called_once_with(
+            child, wait_timeout_sec=7, log=logs.append)
+        self.assertTrue(any('exceeded its 1800s deadline' in m for m in logs))
+
+    def test_tree_termination_never_uses_unbounded_wait(self):
+        class NeverReapedProcess:
+            pid = 1234
+
+            def __init__(self):
+                self.wait_timeouts = []
+
+            def wait(self, timeout=None):
+                self.wait_timeouts.append(timeout)
+                raise subprocess.TimeoutExpired('child', timeout)
+
+            @staticmethod
+            def kill():
+                pass
+
+        child = NeverReapedProcess()
+        logs = []
+        if sys.platform == 'win32':
+            taskkill = NeverReapedProcess()
+            with mock.patch.object(
+                    qwp_ws_fuzz.subprocess,
+                    'Popen',
+                    return_value=taskkill):
+                reaped = qwp_ws_fuzz._terminate_isolated_process_tree(
+                    child, wait_timeout_sec=3, log=logs.append)
+            self.assertTrue(all(t == 3 for t in taskkill.wait_timeouts))
+        else:
+            with mock.patch.object(qwp_ws_fuzz.os, 'killpg'):
+                reaped = qwp_ws_fuzz._terminate_isolated_process_tree(
+                    child, wait_timeout_sec=3, log=logs.append)
+
+        self.assertFalse(reaped)
+        self.assertTrue(child.wait_timeouts)
+        self.assertNotIn(None, child.wait_timeouts)
+        self.assertIn('was not reaped', logs[-1])
 
 
 if __name__ == '__main__':

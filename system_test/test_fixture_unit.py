@@ -34,6 +34,8 @@ hung in graceful shutdown):
   says so on stderr, and then raises `QuestDbStopTimeout` so a server
   that won't shut down within its timeout fails the test instead of
   being silently absorbed;
+* the post-kill reap has its own deadline and leaves the fixture owned when
+  the OS cannot reap the process, rather than waiting forever or restarting;
 * a clean shutdown stays quiet and does not raise;
 * `print_log()` reads the log as bytes so a force-kill that truncates
   it mid-character can't crash the dump;
@@ -131,6 +133,48 @@ class StopEscalationTest(unittest.TestCase):
                 if proc.poll() is None:
                     proc.kill()
                     proc.wait()
+
+    def test_post_kill_reap_is_bounded_and_preserves_ownership(self):
+        class NeverReapedProcess:
+            pid = 4242
+
+            def __init__(self):
+                self.wait_timeouts = []
+                self.killed = False
+
+            @staticmethod
+            def terminate():
+                pass
+
+            def wait(self, timeout=None):
+                self.wait_timeouts.append(timeout)
+                raise subprocess.TimeoutExpired('fake QuestDB', timeout)
+
+            def kill(self):
+                self.killed = True
+
+            @staticmethod
+            def poll():
+                return None
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            qdb = _make_fixture(tmp_dir)
+            proc = NeverReapedProcess()
+            qdb._proc = proc
+            qdb._request_thread_dump = lambda: False
+            qdb._win_send_console_ctrl = lambda _event: True
+
+            with self.assertRaises(fixture.QuestDbReapTimeout) as raised:
+                qdb.stop(
+                    wait_timeout_sec=0.01,
+                    force_kill_wait_timeout_sec=0.02)
+
+            self.assertFalse(raised.exception.fixture_reusable)
+            self.assertTrue(proc.killed)
+            self.assertEqual(proc.wait_timeouts, [0.01, 0.02])
+            self.assertIs(
+                qdb._proc, proc,
+                'an unreaped process must retain fixture ownership')
 
     def test_quick_shutdown_stays_quiet(self):
         with tempfile.TemporaryDirectory() as tmp_dir:

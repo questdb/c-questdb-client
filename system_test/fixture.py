@@ -63,6 +63,11 @@ HTTP_AUTH = dict(
 CA_PATH = (pathlib.Path(__file__).parent.parent /
            'tls_certs' / 'server_rootCA.pem')
 
+# Force-kill is asynchronous on every supported platform. Keep the final reap
+# bounded too: a process stuck in uninterruptible kernel I/O can survive the
+# signal indefinitely, and an unbounded wait would consume the CI job timeout.
+FORCE_KILL_WAIT_TIMEOUT_SEC = 10
+
 # Posts a console control event to the QuestDB JVM on Windows. Run as
 # `python -c <this> <pid> <ctrl_c|ctrl_break>` in a separate process: a
 # control event can only be sent from inside the target's console —
@@ -298,7 +303,20 @@ class QuestDbStopTimeout(RuntimeError):
     """QuestDB did not shut down within the graceful timeout and had to
     be force-killed. Raised by ``stop()`` so the test fails instead of
     silently absorbing a server that refuses to stop."""
-    pass
+
+    # stop() raises this only after the process was reaped and fixture state
+    # was cleared, so a lifecycle owner may safely attempt recovery start().
+    fixture_reusable = True
+
+
+class QuestDbReapTimeout(QuestDbStopTimeout):
+    """QuestDB remained unreaped after force-kill.
+
+    The fixture still owns ``_proc`` and must not be restarted or shared with
+    another lifecycle owner after this error.
+    """
+
+    fixture_reusable = False
 
 
 class QuestDbFixtureBase:
@@ -779,7 +797,10 @@ class QuestDbFixture(QuestDbFixtureBase):
         else:
             sys.stderr.write('Could not request a JVM thread dump.\n')
 
-    def stop(self, wait_timeout_sec=30):
+    def stop(
+            self,
+            wait_timeout_sec=30,
+            force_kill_wait_timeout_sec=FORCE_KILL_WAIT_TIMEOUT_SEC):
         if self._tls_proxy:
             self._tls_proxy.stop()
         # A graceful shutdown that overruns `wait_timeout_sec` is treated
@@ -825,7 +846,15 @@ class QuestDbFixture(QuestDbFixtureBase):
                     except subprocess.TimeoutExpired:
                         pass
                 self._proc.kill()
-                self._proc.wait()
+                try:
+                    self._proc.wait(timeout=force_kill_wait_timeout_sec)
+                except subprocess.TimeoutExpired as e:
+                    # Keep _proc populated: ownership was not recovered, so a
+                    # caller must not start another server on the same fixture.
+                    raise QuestDbReapTimeout(
+                        f'QuestDB (pid {kill_pid}) remained alive '
+                        f'{force_kill_wait_timeout_sec}s after force-kill; '
+                        'the fixture is unsafe to reuse.') from e
             self._proc = None
         if self._log:
             self._log.close()
