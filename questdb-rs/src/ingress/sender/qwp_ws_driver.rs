@@ -200,13 +200,16 @@ pub(crate) enum QwpWsSendProgress {
 pub(crate) enum QwpWsHotSendProgress {
     NoResponse {
         frame: SentFrame,
+        replayed: bool,
     },
     Response {
         frame: SentFrame,
+        replayed: bool,
         response: TransportResponse,
     },
     TransportFailure {
         frame: SentFrame,
+        replayed: bool,
         failure: TransportFailure,
     },
 }
@@ -409,6 +412,7 @@ impl PublicationLifecycle {
 #[derive(Debug, Default, Clone, Copy)]
 pub(crate) struct QwpWsCounters {
     pub total_frames_sent: u64,
+    pub total_frames_replayed: u64,
     pub total_acks: u64,
     pub total_reconnect_attempts: u64,
     pub total_reconnects_succeeded: u64,
@@ -419,6 +423,7 @@ impl From<QwpWsCounters> for super::qwp_ws_ownership::QwpWsTotals {
     fn from(counters: QwpWsCounters) -> Self {
         Self {
             frames_sent: counters.total_frames_sent,
+            frames_replayed: counters.total_frames_replayed,
             acks: counters.total_acks,
             reconnect_attempts: counters.total_reconnect_attempts,
             reconnects_succeeded: counters.total_reconnects_succeeded,
@@ -504,13 +509,16 @@ impl<Q: PublicationLog> QwpWsPublicationStore<Q> {
         send_cursor: &mut SendCursor,
         frame: SentFrame,
     ) -> Result<(), DriverError> {
-        send_cursor.commit_sent(frame)?;
-        self.record_sent_event(frame);
+        let replayed = send_cursor.commit_sent(frame)?;
+        self.record_sent_event(frame, replayed);
         Ok(())
     }
 
-    pub(crate) fn record_sent_event(&mut self, frame: SentFrame) {
+    pub(crate) fn record_sent_event(&mut self, frame: SentFrame, replayed: bool) {
         self.counters.total_frames_sent += 1;
+        if replayed {
+            self.counters.total_frames_replayed += 1;
+        }
         self.push_event(DriverEvent::Sent {
             fsn: frame.fsn,
             wire_seq: frame.wire_seq,
@@ -1455,17 +1463,25 @@ impl<T: QwpWsCoreTransport> QwpWsSendCore<T> {
         send_result: TransportSendResult,
     ) -> Result<QwpWsSendProgress, DriverError> {
         match self.finish_send_result_hot(frame, send_result)? {
-            QwpWsHotSendProgress::NoResponse { frame } => {
-                store.record_sent_event(frame);
+            QwpWsHotSendProgress::NoResponse { frame, replayed } => {
+                store.record_sent_event(frame, replayed);
                 Ok(QwpWsSendProgress::Outcome(DriveOutcome::Sent(frame)))
             }
-            QwpWsHotSendProgress::Response { frame, response } => {
-                store.record_sent_event(frame);
+            QwpWsHotSendProgress::Response {
+                frame,
+                replayed,
+                response,
+            } => {
+                store.record_sent_event(frame, replayed);
                 self.apply_response(store, response, false)
                     .map(QwpWsSendProgress::Outcome)
             }
-            QwpWsHotSendProgress::TransportFailure { frame, failure } => {
-                store.record_sent_event(frame);
+            QwpWsHotSendProgress::TransportFailure {
+                frame,
+                replayed,
+                failure,
+            } => {
+                store.record_sent_event(frame, replayed);
                 Ok(QwpWsSendProgress::TransportFailure(failure))
             }
         }
@@ -1476,15 +1492,21 @@ impl<T: QwpWsCoreTransport> QwpWsSendCore<T> {
         frame: SentFrame,
         send_result: TransportSendResult,
     ) -> Result<QwpWsHotSendProgress, DriverError> {
-        self.send_cursor.commit_sent(frame)?;
+        let replayed = self.send_cursor.commit_sent(frame)?;
         match send_result {
-            TransportSendResult::NoResponse => Ok(QwpWsHotSendProgress::NoResponse { frame }),
-            TransportSendResult::Response(response) => {
-                Ok(QwpWsHotSendProgress::Response { frame, response })
+            TransportSendResult::NoResponse => {
+                Ok(QwpWsHotSendProgress::NoResponse { frame, replayed })
             }
-            TransportSendResult::Failure(failure) => {
-                Ok(QwpWsHotSendProgress::TransportFailure { frame, failure })
-            }
+            TransportSendResult::Response(response) => Ok(QwpWsHotSendProgress::Response {
+                frame,
+                replayed,
+                response,
+            }),
+            TransportSendResult::Failure(failure) => Ok(QwpWsHotSendProgress::TransportFailure {
+                frame,
+                replayed,
+                failure,
+            }),
         }
     }
 
@@ -2669,6 +2691,10 @@ pub(crate) struct SendCursor {
     max_in_flight: usize,
     fsn_at_zero: Option<u64>,
     next_fsn: Option<u64>,
+    /// Inclusive publication boundary captured at the last successful
+    /// reconnect. Frames through this FSN are replayed; frames published after
+    /// the reconnect are ordinary sends. `None` on the initial connection.
+    replay_target_fsn: Option<u64>,
     next_wire_seq: u64,
     /// Number of out-of-band symbol-dict catch-up frames prepended on the
     /// current connection. They occupy wire seqs `[0, catch_up_offset)`; real
@@ -2687,6 +2713,7 @@ impl SendCursor {
             max_in_flight,
             fsn_at_zero: None,
             next_fsn: None,
+            replay_target_fsn: None,
             next_wire_seq: 0,
             catch_up_offset: 0,
             last_sent_wire_seq: None,
@@ -2722,7 +2749,9 @@ impl SendCursor {
         Ok(Some((fsn, self.next_wire_seq)))
     }
 
-    fn commit_sent(&mut self, frame: SentFrame) -> Result<(), DriverError> {
+    /// Commits a successfully handed-off frame and reports whether it belongs
+    /// to the replay window armed by [`Self::restart`].
+    fn commit_sent(&mut self, frame: SentFrame) -> Result<bool, DriverError> {
         if self.in_flight.len() >= self.max_in_flight {
             return Err(DriverError::Queue(QueueError::MaxInFlightReached {
                 max_in_flight: self.max_in_flight,
@@ -2734,6 +2763,9 @@ impl SendCursor {
                 wire_seq: frame.wire_seq,
             }));
         }
+        let replayed = self
+            .replay_target_fsn
+            .is_some_and(|target_fsn| frame.fsn <= target_fsn);
 
         self.next_fsn = Some(
             frame
@@ -2747,7 +2779,13 @@ impl SendCursor {
             .ok_or(DriverError::Queue(QueueError::SequenceOverflow))?;
         self.last_sent_wire_seq = Some(frame.wire_seq);
         self.in_flight.push_back(frame);
-        Ok(())
+        if self
+            .replay_target_fsn
+            .is_some_and(|target_fsn| frame.fsn >= target_fsn)
+        {
+            self.replay_target_fsn = None;
+        }
+        Ok(replayed)
     }
 
     fn reject_fsn_for_wire_seq(&self, wire_seq: u64) -> Result<Option<(u64, u64)>, DriverError> {
@@ -2801,6 +2839,12 @@ impl SendCursor {
         self.in_flight.clear();
         self.fsn_at_zero = log.oldest_unresolved_fsn();
         self.next_fsn = self.fsn_at_zero;
+        self.replay_target_fsn = match (self.fsn_at_zero, log.published_fsn()) {
+            (Some(oldest_unresolved), Some(published)) if oldest_unresolved <= published => {
+                Some(published)
+            }
+            _ => None,
+        };
         self.next_wire_seq = 0;
         self.catch_up_offset = 0;
         self.last_sent_wire_seq = None;
@@ -4128,6 +4172,68 @@ mod tests {
         assert_eq!(payloads.len(), 2, "catch-up frame precedes the replay");
         assert_catch_up_frame(&payloads[0], &[b"a", b"b"]);
         assert_eq!(payloads[1], frame, "the stored frame replays verbatim");
+
+        let counters = driver.counters();
+        assert_eq!(counters.total_frames_sent, 1);
+        assert_eq!(
+            counters.total_frames_replayed, 0,
+            "initial recovery sends are not post-reconnect replays"
+        );
+    }
+
+    #[test]
+    fn replay_totals_use_the_reconnect_time_publication_boundary() {
+        let mut driver = driver(FakeOrderedServer::no_response());
+
+        // Frame 0 is sent on the initial connection. Frame 1 is published but
+        // still unsent when the reconnect succeeds. Both are inside the
+        // reconnect-time publication snapshot, but only their post-reconnect
+        // sends count as replay.
+        driver.try_submit(b"sent-before-reconnect").unwrap();
+        driver.drive_send_once().unwrap();
+        driver.try_submit(b"published-before-reconnect").unwrap();
+
+        let counters = driver.counters();
+        assert_eq!(counters.total_frames_sent, 1);
+        assert_eq!(counters.total_frames_replayed, 0);
+
+        assert_eq!(
+            driver
+                .send_core
+                .finish_reconnect_success(&mut driver.store, ReconnectReason::Disconnect),
+            DriveOutcome::Reconnected {
+                reason: ReconnectReason::Disconnect
+            }
+        );
+        driver.drive_send_once().unwrap();
+        driver.drive_send_once().unwrap();
+
+        // Frame 2 is published after the reconnect snapshot. Its first send is
+        // not replay even though older frames on this connection were.
+        driver.try_submit(b"published-after-reconnect").unwrap();
+        driver.drive_send_once().unwrap();
+
+        let counters = driver.counters();
+        assert_eq!(counters.total_frames_sent, 4);
+        assert_eq!(counters.total_frames_replayed, 2);
+
+        // With no ACKs, the next reconnect snapshots all three frames. Sending
+        // them again is three more actual replay attempts.
+        assert_eq!(
+            driver
+                .send_core
+                .finish_reconnect_success(&mut driver.store, ReconnectReason::Disconnect),
+            DriveOutcome::Reconnected {
+                reason: ReconnectReason::Disconnect
+            }
+        );
+        driver.drive_send_once().unwrap();
+        driver.drive_send_once().unwrap();
+        driver.drive_send_once().unwrap();
+
+        let counters = driver.counters();
+        assert_eq!(counters.total_frames_sent, 7);
+        assert_eq!(counters.total_frames_replayed, 5);
     }
 
     #[test]

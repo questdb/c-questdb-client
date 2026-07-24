@@ -27,7 +27,8 @@
 //   EXIT                                 -> (no reply, exits 0)
 //
 // STATS exposes only the real `acked` (line_sender_qwpws_acked_fsn); the
-// sent/acks/reconn*/serverErrors counters have no FFI wrapper, so they are
+// sent/replayed/startupSent/acks/reconn*/serverErrors counters have no FFI
+// wrapper, so they are
 // zeroed -- the same fallback the Rust sidecar uses.
 
 // line_sender.hpp pulls in the C ABI (the ::line_sender_* functions we use) and
@@ -267,7 +268,8 @@ void handle_stats()
     }
     std::ostringstream oss;
     oss << "acked=" << acked
-        << " sent=0 acks=0 reconnAttempts=0 reconnSucc=0 serverErrors=0";
+        << " sent=0 replayed=0 startupSent=0 acks=0"
+           " reconnAttempts=0 reconnSucc=0 serverErrors=0";
     reply_ok(oss.str());
 }
 
