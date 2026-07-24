@@ -2446,21 +2446,21 @@ class TestQwpWsFuzz(QwpWsTestSupport, unittest.TestCase):
     DRAIN_TIMEOUT_SEC = 120
 
     # A bounce takes the server down for a whole stop() + start() cycle.
-    # BOUNCE_RESTART_TIMEOUT_SEC caps only the start(); the stop() is
-    # capped separately by FuzzParams.bounce_stop_timeout_s. When either
-    # overruns its cap, the bounce thread raises and the run fails with
-    # an error saying which of the two was too slow. The cap sits well
-    # above a healthy restart (~6-40s on CI) so only a genuinely stuck
-    # boot trips it.
+    # BOUNCE_RESTART_TIMEOUT_SEC caps only start(); stop() is capped
+    # separately by FuzzParams.bounce_stop_timeout_s. The 90s start cap is
+    # well above an observed healthy restart (~6-40s on CI). These per-call
+    # caps are defensive failure ceilings, not allowances to multiply by the
+    # number of bounces.
     #
-    # The client-side budgets that must survive a bounce — close_drain()
-    # and reconnect — are computed from these same caps to exceed a full
-    # stop() + start() (see _producer_loop, and the final join on the
-    # bounce thread in _run_fuzz). A slow-but-healthy bounce therefore
-    # never exhausts a producer's budget: those budgets trip only on a
-    # genuine client-side failure, while a too-slow stop or restart fails
-    # in the bounce thread with the server named as the cause, instead of
-    # resurfacing as a misleading client close_drain() timeout.
+    # Bounces intentionally continue while producers are in close_drain():
+    # reconnecting and replaying through repeated restarts is part of this
+    # test. close_drain() has one overall drain deadline (240s with the
+    # default caps), and the configured three-bounce and ten-short-bounce
+    # campaigns are expected to finish well inside it. If a campaign prevents
+    # the drain from completing for that whole deadline, the timeout is the
+    # intended liveness failure even when every stop() and start() stayed
+    # within its own cap. An individual over-cap lifecycle call instead fails
+    # in the bounce thread with the server named as the cause.
     BOUNCE_RESTART_TIMEOUT_SEC = 90
 
     def setUp(self):
@@ -2675,6 +2675,11 @@ class TestQwpWsFuzz(QwpWsTestSupport, unittest.TestCase):
                     bounce_thread.start()
                     bounce_thread_started = True
 
+                # _producer_loop returns only after close_drain(). Keep the
+                # bounce thread active through that call on purpose: draining
+                # across repeated restarts exercises reconnect and SFA replay.
+                # producers_done means all producer threads have returned, not
+                # merely that they have finished publishing.
                 for thread in producer_threads:
                     thread.join()
             finally:
@@ -2743,21 +2748,19 @@ class TestQwpWsFuzz(QwpWsTestSupport, unittest.TestCase):
 
     def _producer_loop(self, sender_id, sf_root, load, fuzz, rnd,
                        tables, next_ts, record_failure):
-        # Reconnect and close_drain() share one budget, sized to outlast
-        # the longest a single bounce can keep the server unreachable: a full
-        # graceful stop() (bounded by fuzz.bounce_stop_timeout_s) plus a
-        # restart (bounded by BOUNCE_RESTART_TIMEOUT_SEC), plus headroom. The
-        # restart cap is generous partly because a post-restart SFA replay
-        # storm can starve the freshly-booted server's accept loop for up to
-        # ~1.5 min, leaving it up but not yet accepting connections.
-        # A slow-but-healthy bounce therefore never runs a producer out of
-        # budget mid-drain; a stop or restart that overruns its own cap
-        # fails in the bounce thread with the server named as the cause,
-        # so only a genuine client-side failure trips this budget. The two
-        # knobs are equal on purpose: close_drain() relies on reconnect to
-        # reach the restarted server, so a reconnect that gave up sooner
-        # would fail the drain while it still had budget left. Non-bounce
-        # variants never reconnect, so they keep the tighter default budget.
+        # Reconnect and close_drain() use the same budget (240s with the
+        # default bounce caps). close_drain() applies it once to the entire
+        # drain interval, including repeated bounces deliberately scheduled
+        # while it waits; the deadline is not renewed per bounce. The formula
+        # fits one stop() + start() at their defensive caps plus headroom and
+        # sits above the expected duration of each complete bounce campaign.
+        # A campaign that prevents the drain from completing by this deadline
+        # is supposed to fail the liveness test even if no lifecycle call hit its
+        # own cap.
+        #
+        # Keep the reconnect and drain values equal so reconnect cannot give
+        # up while close_drain() still has time left. Non-bounce variants never
+        # reconnect, so they keep the tighter default budget.
         client_budget_millis = int(
             (fuzz.bounce_stop_timeout_s + self.BOUNCE_RESTART_TIMEOUT_SEC + 30)
             * 1000) if fuzz.max_bounces > 0 else 120000
@@ -3293,8 +3296,9 @@ class TestQwpWsFuzz(QwpWsTestSupport, unittest.TestCase):
 
     def test_n_bounce_sweep(self):
         # Many short bounces so the chaos thread gets multiple chances
-        # to land mid-flush. Each bounce is ~3-5s of process restart so
-        # the test takes ~30-60s including the producers' SFA replay.
+        # to land mid-flush. Each bounce is ~3-5s of process restart, so
+        # the full campaign takes ~30-60s including the producers' SFA replay,
+        # well inside close_drain()'s overall 240s liveness deadline.
         load = qwp_ws_fuzz.LoadParams(
             100, 10 if not self._is_windows() else 6, 5, 5, 400)
         fuzz = qwp_ws_fuzz.FuzzParams(

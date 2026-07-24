@@ -1412,7 +1412,13 @@ class AlterThread(threading.Thread):
 
 class BounceThread(threading.Thread):
     """Background thread that bounces the QuestDB fixture at random
-    intervals while producers are mid-batch.
+    intervals while producer threads are publishing or draining previously
+    published frames.
+
+    ``writers_done`` means every producer thread has returned, including from
+    ``close_drain()``. A producer entering ``close_drain()`` deliberately does
+    not stop new bounces: draining through repeated restarts exercises QWP
+    reconnect and store-and-forward replay.
 
     Stops when:
 
