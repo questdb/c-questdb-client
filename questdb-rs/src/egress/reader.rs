@@ -3537,6 +3537,49 @@ mod tests {
         assert_eq!(disabled.next_backoff_ms, 0);
     }
 
+    /// Exercise the production call path without using elapsed time as
+    /// an oracle. The configured bases keep the real sleeps at 0–1 ms;
+    /// scheduler oversleep can delay the test but cannot change its
+    /// state assertions.
+    #[test]
+    fn before_reconnect_round_applies_configured_backoff_cap() {
+        let cfg = ReaderConfig::from_conf(concat!(
+            "ws::addr=localhost:9000;",
+            "failover_max_attempts=4;",
+            "failover_backoff_initial_ms=1;",
+            "failover_backoff_max_ms=2"
+        ))
+        .unwrap();
+        let mut budget = FailoverBudget::new(&cfg);
+        let mut rng = FailoverRng { state: 0 };
+
+        let observed: [u64; 3] = std::array::from_fn(|_| {
+            budget.before_reconnect_round(&cfg, &mut rng).unwrap();
+            budget.next_backoff_ms
+        });
+        assert_eq!(observed, [2, 2, 2]);
+        assert_eq!(budget.reconnect_rounds_remaining, 0);
+        assert_eq!(
+            budget.before_reconnect_round(&cfg, &mut rng),
+            Err(FailoverBudgetStop::AttemptsExhausted)
+        );
+
+        let disabled_cfg = ReaderConfig::from_conf(concat!(
+            "ws::addr=localhost:9000;",
+            "failover_max_attempts=2;",
+            "failover_backoff_initial_ms=0;",
+            "failover_backoff_max_ms=2"
+        ))
+        .unwrap();
+        let mut disabled = FailoverBudget::new(&disabled_cfg);
+        let mut disabled_rng = FailoverRng { state: 0 };
+        disabled
+            .before_reconnect_round(&disabled_cfg, &mut disabled_rng)
+            .unwrap();
+        assert_eq!(disabled.next_backoff_ms, 0);
+        assert_eq!(disabled.reconnect_rounds_remaining, 0);
+    }
+
     /// `base = 0` MUST return 0 without touching the splitmix state.
     /// A backoff of zero is the documented "sleep is a no-op" sentinel
     /// and the caller passes it whenever `failover_backoff_initial_ms`
