@@ -2656,64 +2656,66 @@ class TestQwpWsFuzz(QwpWsTestSupport, unittest.TestCase):
                 alter_thread.start()
 
             bounce_thread = None
-            if fuzz.max_bounces > 0:
-                bounce_thread = qwp_ws_fuzz.BounceThread(
-                    fixture=QDB_FIXTURE,
-                    rnd=self._master_rng.child(),
-                    max_bounces=fuzz.max_bounces,
-                    min_interval_s=fuzz.min_bounce_interval_s,
-                    max_interval_s=fuzz.max_bounce_interval_s,
-                    stop_timeout_s=fuzz.bounce_stop_timeout_s,
-                    restart_timeout_s=self.BOUNCE_RESTART_TIMEOUT_SEC,
-                    writers_done=producers_done,
-                    stop_event=stop_event,
-                    record_failure=record_failure,
-                    failure_counter=failure_counter,
-                    log=self._log)
-                bounce_thread.start()
-
+            bounce_thread_started = False
             try:
+                if fuzz.max_bounces > 0:
+                    bounce_thread = qwp_ws_fuzz.BounceThread(
+                        fixture=QDB_FIXTURE,
+                        rnd=self._master_rng.child(),
+                        max_bounces=fuzz.max_bounces,
+                        min_interval_s=fuzz.min_bounce_interval_s,
+                        max_interval_s=fuzz.max_bounce_interval_s,
+                        stop_timeout_s=fuzz.bounce_stop_timeout_s,
+                        restart_timeout_s=self.BOUNCE_RESTART_TIMEOUT_SEC,
+                        writers_done=producers_done,
+                        stop_event=stop_event,
+                        record_failure=record_failure,
+                        failure_counter=failure_counter,
+                        log=self._log)
+                    bounce_thread.start()
+                    bounce_thread_started = True
+
                 for thread in producer_threads:
                     thread.join()
             finally:
                 producers_done.set()
+                try:
+                    if alter_thread is not None:
+                        alter_thread.join(timeout=30)
+                        if alter_thread.is_alive():
+                            stop_event.set()
+                            alter_thread.join(timeout=30)
+                finally:
+                    # ident covers interruption after the native thread
+                    # launched but before Thread.start() returned to set our
+                    # local flag; an unstarted thread cannot be joined.
+                    if (bounce_thread is not None
+                            and (bounce_thread_started
+                                 or bounce_thread.ident is not None)):
+                        # Once producers_done is set the thread starts no new
+                        # bounce, but it finishes any in-flight one first. The
+                        # diagnostic timeout allows a whole cycle — stop()
+                        # (≤ bounce_stop_timeout_s) + start()
+                        # (≤ BOUNCE_RESTART_TIMEOUT_SEC), plus headroom.
+                        wind_down_sec = (
+                            fuzz.bounce_stop_timeout_s
+                            + self.BOUNCE_RESTART_TIMEOUT_SEC + 30)
+                        stop_event.set()
+                        qwp_ws_fuzz.finish_bounce_thread(
+                            bounce_thread=bounce_thread,
+                            fixture=QDB_FIXTURE,
+                            wind_down_sec=wind_down_sec,
+                            stop_timeout_sec=fuzz.bounce_stop_timeout_s,
+                            restart_timeout_sec=(
+                                self.BOUNCE_RESTART_TIMEOUT_SEC),
+                            record_failure=record_failure,
+                            log=self._log)
 
-            if alter_thread is not None:
-                alter_thread.join(timeout=30)
-                if alter_thread.is_alive():
-                    stop_event.set()
-                    alter_thread.join(timeout=30)
-
-            if bounce_thread is not None:
-                # Once producers_done is set the thread starts no new
-                # bounce, but it finishes any in-flight one first. The join
-                # timeout allows a whole cycle — stop()
-                # (≤ bounce_stop_timeout_s) + start()
-                # (≤ BOUNCE_RESTART_TIMEOUT_SEC), plus headroom — so a
-                # slow-but-healthy last bounce completes before
-                # verification. join() returns the instant the thread
-                # exits, so only a genuinely stuck stop() or start() ever
-                # reaches this ceiling.
-                wind_down_sec = (
-                    fuzz.bounce_stop_timeout_s
-                    + self.BOUNCE_RESTART_TIMEOUT_SEC + 30)
-                stop_event.set()
-                bounce_thread.join(timeout=wind_down_sec)
-                if bounce_thread.is_alive():
-                    # A thread still mutating the fixture here would race the
-                    # verification queries and teardown on shared _proc/_log
-                    # state. Record it as what it is — a stuck server stop()
-                    # or start() — rather than let it resurface as a
-                    # downstream query failure.
-                    record_failure(
-                        f'fuzz bounce: thread still alive '
-                        f'{wind_down_sec:.0f}s after producers finished; '
-                        f'server lifecycle is stuck')
-                if bounce_thread.bounces_performed > 0:
-                    self._log(
-                        f'fuzz bounce summary: '
-                        f'{bounce_thread.bounces_performed}'
-                        f'/{fuzz.max_bounces} performed')
+                        if bounce_thread.bounces_performed > 0:
+                            self._log(
+                                f'fuzz bounce summary: '
+                                f'{bounce_thread.bounces_performed}'
+                                f'/{fuzz.max_bounces} performed')
 
         self.assertEqual(
             failure_counter[0], 0,
