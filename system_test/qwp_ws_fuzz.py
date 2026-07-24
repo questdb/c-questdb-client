@@ -1412,22 +1412,29 @@ class AlterThread(threading.Thread):
 
 class BounceThread(threading.Thread):
     """Background thread that bounces the QuestDB fixture at random
-    intervals while producers are mid-batch.
+    intervals while producer threads are publishing or draining previously
+    published frames.
+
+    ``writers_done`` means every producer thread has returned, including from
+    ``close_drain()``. A producer entering ``close_drain()`` deliberately does
+    not stop new bounces: draining through repeated restarts exercises QWP
+    reconnect and store-and-forward replay.
 
     Stops when:
 
     * the bounce budget is exhausted (``bounces_performed >= max_bounces``);
     * the producers signal completion via ``writers_done.set()``;
     * ``stop_event`` is set; or
-    * a previous bounce raised, in which case ``failure_counter`` gets
-      bumped and the thread tries one defensive ``stop()`` + ``start()``
-      before exiting so the rest of the test still has a server to talk
-      to (and no half-started instance is left behind).
+    * a bounce raised — e.g. the server overran ``stop_timeout_s`` on the
+      way down or ``restart_timeout_s`` on the way back up — in which case
+      ``failure_counter`` gets bumped and the thread exits. The caller must
+      join the thread before recovering the fixture synchronously.
 
-    Each bounce is atomic from the caller's perspective: once the loop
-    enters a bounce cycle it completes ``stop()`` + ``start()`` before
-    re-checking the exit conditions. That guarantees we never leave the
-    server down at the end of the run.
+    A successful bounce is atomic from the caller's perspective: once the
+    loop enters a bounce cycle it completes ``stop()`` + ``start()`` before
+    re-checking the exit conditions. A failed bounce may leave a partially
+    started process behind, so the caller must not reuse the fixture until
+    this thread has exited and recovery has completed.
     """
 
     def __init__(
@@ -1439,6 +1446,7 @@ class BounceThread(threading.Thread):
             min_interval_s: float,
             max_interval_s: float,
             stop_timeout_s: float,
+            restart_timeout_s: float,
             writers_done: threading.Event,
             stop_event: threading.Event,
             record_failure,
@@ -1452,12 +1460,14 @@ class BounceThread(threading.Thread):
         self._min_interval_s = min_interval_s
         self._max_interval_s = max(max_interval_s, min_interval_s)
         self._stop_timeout_s = stop_timeout_s
+        self._restart_timeout_s = restart_timeout_s
         self._writers_done = writers_done
         self._stop_event = stop_event
         self._record_failure = record_failure
         self._failure_counter = failure_counter
         self._log = log
         self.bounces_performed = 0
+        self.lifecycle_error = None
 
     def run(self):
         while (
@@ -1486,37 +1496,100 @@ class BounceThread(threading.Thread):
                 # before start() rebinds them.
                 time.sleep(0.02 + self._rnd.next_int(200) / 1000.0)
                 self._log(f'fuzz bounce #{idx}: starting QDB')
-                self._fixture.start()
+                # Cap the restart wait at restart_timeout_s: a restart that
+                # overruns it is a stuck boot, and raising here names the
+                # real problem — the server was too slow to restart. The
+                # producers' reconnect and close_drain() budgets exceed a
+                # full stop() + start() that stays within these timeouts
+                # (see TestQwpWsFuzz._producer_loop), so a restart under
+                # the cap never runs a producer out of budget; one over
+                # the cap fails the run here, not as a client timeout
+                # downstream with the cause hidden.
+                #
+                # probe_min_http=True makes the readiness probe target the
+                # min HTTP server's health endpoint rather than main /ping:
+                # the reconnecting producers can keep the main server's
+                # shared worker pool fully busy, so a /ping probe could
+                # time out even after a successful restart. The restart
+                # issues no SQL, so the main server need not be ready.
+                self._fixture.start(
+                    start_timeout_sec=self._restart_timeout_s,
+                    probe_min_http=True)
                 self.bounces_performed += 1
                 self._log(f'fuzz bounce #{idx}: server back up')
             except Exception as e:  # noqa: BLE001 — any lifecycle failure fails the run
                 # A raise here is a real failure, not noise: stop() raises
-                # when the server won't shut down within its timeout, and
-                # start() raises when it won't come back up. Either way we
-                # record it so the end-of-run assertion fails.
+                # when the server won't shut down within stop_timeout_s,
+                # and start() raises when it won't come back up within
+                # restart_timeout_s. Both timeouts are generous enough
+                # that only a stuck or pathologically slow server trips
+                # them, and recording the failure here names that server
+                # problem directly instead of letting it surface later as
+                # a client timeout with the cause hidden.
+                #
+                # Do not recover here. A failed start() can leave _proc and
+                # _log populated, and a defensive stop() + start() would add
+                # another full lifecycle cycle after the caller's join budget.
+                # Record the error and hand fixture ownership back to the
+                # caller, which joins this thread before recovering.
+                self.lifecycle_error = e
                 self._record_failure(
-                    f'fuzz bounce: unexpected failure at attempt '
+                    f'fuzz bounce: server lifecycle failed at attempt '
                     f'{self.bounces_performed + 1}: '
                     f'{type(e).__name__}: {e}')
-                # One defensive recovery attempt so the rest of the test
-                # has a chance to surface the underlying assertion failure
-                # rather than a query timeout. stop() first: if start()
-                # failed partway it may have left a process behind, and we
-                # must not launch a second one next to it.
-                try:
-                    self._fixture.stop(wait_timeout_sec=self._stop_timeout_s)
-                except Exception:
-                    pass
-                try:
-                    self._fixture.start()
-                except Exception:
-                    pass
                 return
 
     def _pick_interval(self) -> float:
         span_ms = max(1, int(
             (self._max_interval_s - self._min_interval_s) * 1000))
         return self._min_interval_s + self._rnd.next_int(span_ms) / 1000.0
+
+
+def finish_bounce_thread(
+        *,
+        bounce_thread: BounceThread,
+        fixture,
+        wind_down_sec: float,
+        stop_timeout_sec: float,
+        restart_timeout_sec: float,
+        record_failure,
+        log) -> None:
+    """Join ``bounce_thread`` and recover a failed lifecycle synchronously.
+
+    The timed join is diagnostic only. This function never returns while the
+    thread is alive, and it performs recovery only after the join has handed
+    exclusive fixture ownership back to the calling thread.
+    """
+    try:
+        bounce_thread.join(timeout=wind_down_sec)
+        if bounce_thread.is_alive():
+            record_failure(
+                f'fuzz bounce: thread still alive '
+                f'{wind_down_sec:.0f}s after producers finished; '
+                f'server lifecycle is stuck')
+    finally:
+        # Even if the timed join or failure reporting is interrupted, do not
+        # let verification or teardown race lifecycle work on _proc/_log.
+        if bounce_thread.is_alive():
+            bounce_thread.join()
+
+        if bounce_thread.lifecycle_error is not None:
+            # start() can fail after assigning _proc and opening _log. Stop
+            # first so recovery never launches a second process beside it.
+            try:
+                fixture.stop(wait_timeout_sec=stop_timeout_sec)
+            except Exception as e:  # noqa: BLE001 — recovery is best-effort
+                log(
+                    f'fuzz bounce: synchronous recovery stop failed: '
+                    f'{type(e).__name__}: {e}')
+            try:
+                fixture.start(
+                    start_timeout_sec=restart_timeout_sec,
+                    probe_min_http=True)
+            except Exception as e:  # noqa: BLE001 — original failure wins
+                log(
+                    f'fuzz bounce: synchronous recovery start failed: '
+                    f'{type(e).__name__}: {e}')
 
 
 # ---------------------------------------------------------------------------

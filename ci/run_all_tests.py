@@ -24,6 +24,20 @@ def find_binary(build_dir, name, exe_suffix):
     return next(iter(build_dir.glob(f'**/{name}{exe_suffix}')), None)
 
 
+def run_python_fixture_tests():
+    """Pure-Python QuestDB fixture lifecycle and readiness tests."""
+    run_cmd(
+        sys.executable, '-m', 'unittest', 'discover',
+        '-s', 'system_test', '-p', 'test_fixture_unit.py')
+
+
+def run_python_ctypes_tests():
+    """Python ctypes tests that require the CMake-built client library."""
+    run_cmd(
+        sys.executable, '-m', 'unittest', 'discover',
+        '-s', 'system_test', '-p', 'test_qwp_egress_reader_unit.py')
+
+
 def run_cargo_tests():
     """The questdb-rs / questdb-rs-ffi cargo test matrix. Pure Rust: needs no
     CMake build and no running QuestDB."""
@@ -138,6 +152,12 @@ def main():
             'cargo, cpp, unit, integration, soak-selftest '
             '(or no argument for all).\n')
         sys.exit(2)
+    if mode in ('all', 'unit'):
+        run_python_fixture_tests()
+    # macOS/Windows CI split native tests into `cpp` mode, so include the
+    # ctypes regression suite there as well as in the combined unit modes.
+    if mode in ('all', 'unit', 'cpp'):
+        run_python_ctypes_tests()
     if mode in ('all', 'unit', 'cargo'):
         run_cargo_tests()
     if mode in ('all', 'unit', 'cpp'):

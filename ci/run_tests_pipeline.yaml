@@ -115,7 +115,7 @@ stages:
             parameters:
               cxx20Variants: true
           - script: python3 ci/run_all_tests.py cpp
-            displayName: "C++ tests"
+            displayName: "C/C++ and Python ctypes tests"
           # Build QuestDB master for run_all_tests.py's `--repo ./questdb`.
           - template: templates/clone_questdb.yaml
           - task: Maven@3

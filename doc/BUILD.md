@@ -83,8 +83,8 @@ cd ../questdb-rs-ffi
 cargo test --all-features
 ```
 
-The CI-equivalent Rust and native unit suite can be invoked from the repository
-root after configuring the CMake build shown above:
+The CI-equivalent Rust, native, and Python fixture/ctypes unit suite can be
+invoked from the repository root after building with CMake as shown above:
 
 ```bash
 python3 ci/run_all_tests.py unit
