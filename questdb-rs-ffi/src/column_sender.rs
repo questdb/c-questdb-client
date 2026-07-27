@@ -94,9 +94,10 @@ pub struct questdb_db(pub(crate) QuestDb);
 pub struct qwp_sender(pub(crate) OwnedSender, pub(crate) AtomicU32);
 
 /// Direct (pipelined, non-store-and-forward) sibling of [`qwp_sender`],
-/// borrowed from the always-direct pool via
-/// `questdb_db_borrow_direct_sender`. Same single-threaded /
-/// reentrancy-latch contract as [`qwp_sender`]; it exposes
+/// either borrowed from the always-direct pool via
+/// `questdb_db_borrow_direct_sender` or opened standalone via
+/// `qwp_direct_sender_from_conf` / `qwp_direct_sender_from_opts`. Same
+/// single-threaded / reentrancy-latch contract as [`qwp_sender`]; it exposes
 /// `qwp_direct_sender_flush` + `qwp_direct_sender_flush_and_wait` +
 /// `qwp_direct_sender_commit` instead of the store-and-forward queue
 /// primitives exposed by [`qwp_sender`].
@@ -1065,9 +1066,11 @@ pub unsafe extern "C" fn questdb_db_borrow_direct_sender_with_retry(
 
 /// Build a direct (pipelined, non-store-and-forward) column sender from a
 /// QWP/WebSocket config string, owning its own connection with no pool. `conf`
-/// is a UTF-8 string of `conf_len` bytes. Free the returned handle with
-/// `qwp_direct_sender_free`; there is no pool to return it to. Returns NULL
-/// on failure; sets `*err_out` if provided.
+/// is a UTF-8 string of `conf_len` bytes. On normal completion free the
+/// returned handle with `qwp_direct_sender_free`; there is no pool to return
+/// it to. To discard uncommitted frames after a failure, call
+/// `questdb_db_drop_direct_sender(NULL, sender)` instead. Returns NULL on
+/// failure; sets `*err_out` if provided.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn qwp_direct_sender_from_conf(
     conf: *const c_char,
@@ -1092,9 +1095,11 @@ pub unsafe extern "C" fn qwp_direct_sender_from_conf(
 /// opts carry the full auth/TLS configuration (including options set through
 /// the `line_sender_opts_*` builder functions rather than a config string), so
 /// this works for senders built either way. `opts` is borrowed, not consumed:
-/// the caller retains ownership and must still free it. Free the returned
-/// handle with `qwp_direct_sender_free`. Returns NULL on failure; sets
-/// `*err_out` if provided.
+/// the caller retains ownership and must still free it. On normal completion
+/// free the returned handle with `qwp_direct_sender_free`. To discard
+/// uncommitted frames after a failure, call
+/// `questdb_db_drop_direct_sender(NULL, sender)` instead. Returns NULL on
+/// failure; sets `*err_out` if provided.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn qwp_direct_sender_from_opts(
     opts: *const line_sender_opts,
@@ -1159,7 +1164,9 @@ pub unsafe extern "C" fn questdb_db_return_sender(_db: *mut questdb_db, sender: 
     unsafe { return_or_drop_cs(sender, 0) };
 }
 
-/// Direct-handle counterpart of `questdb_db_return_sender`.
+/// Return a pool-borrowed direct sender. Standalone handles must instead use
+/// `qwp_direct_sender_free`, or `questdb_db_drop_direct_sender(NULL, sender)`
+/// to discard uncommitted frames after a failure.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn questdb_db_return_direct_sender(
     _db: *mut questdb_db,
@@ -1184,7 +1191,13 @@ pub unsafe extern "C" fn questdb_db_drop_sender(_db: *mut questdb_db, sender: *m
     unsafe { return_or_drop_cs(sender, LATCH_DROP) };
 }
 
-/// Direct-handle counterpart of `questdb_db_drop_sender`.
+/// Force-drop a direct sender, closing its connection instead of recycling it
+/// or committing its uncommitted frames. The sender may be pool-borrowed or
+/// standalone. `_db` is ignored and may be NULL because the sender retains its
+/// own backing information. Pass the originating db for a pool-borrowed
+/// handle and NULL for a standalone handle. For a pool-borrowed handle this is
+/// mutually exclusive with `questdb_db_return_direct_sender`; for a standalone
+/// handle it is mutually exclusive with `qwp_direct_sender_free`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn questdb_db_drop_direct_sender(
     _db: *mut questdb_db,
@@ -1193,11 +1206,14 @@ pub unsafe extern "C" fn questdb_db_drop_direct_sender(
     unsafe { return_or_drop_cs(sender, LATCH_DROP) };
 }
 
-/// Free a standalone `qwp_direct_sender_from_conf` handle, committing any
-/// un-sync'd deferred frames first (call `qwp_direct_sender_commit` or a
-/// waited flush beforehand for delivery certainty). Accepts NULL and no-ops.
-/// For a pool-borrowed handle use `questdb_db_return_direct_sender`
-/// instead. A racing in-flight call defers the free to that call's exit path.
+/// Free a standalone `qwp_direct_sender_from_conf` /
+/// `qwp_direct_sender_from_opts` handle, committing any un-sync'd deferred
+/// frames first (call `qwp_direct_sender_commit` or a waited flush beforehand
+/// for delivery certainty). Accepts NULL and no-ops. For a pool-borrowed
+/// handle use `questdb_db_return_direct_sender` instead. To discard a
+/// standalone handle's uncommitted frames, use
+/// `questdb_db_drop_direct_sender(NULL, sender)` instead. A racing in-flight
+/// call defers the free to that call's exit path.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn qwp_direct_sender_free(sender: *mut qwp_direct_sender) {
     unsafe { return_or_drop_cs(sender, 0) };
@@ -6029,6 +6045,13 @@ mod tests {
     #[test]
     fn qwp_direct_sender_free_accepts_null() {
         unsafe { qwp_direct_sender_free(std::ptr::null_mut()) };
+    }
+
+    #[test]
+    fn questdb_db_drop_direct_sender_accepts_null_db_and_sender() {
+        unsafe {
+            questdb_db_drop_direct_sender(std::ptr::null_mut(), std::ptr::null_mut());
+        }
     }
 
     #[test]

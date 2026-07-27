@@ -89,16 +89,17 @@ extern "C" {
  *  store-and-forward queue owns delivery. */
 typedef struct qwp_sender qwp_sender;
 
-/** Borrowed direct (pipelined, non-store-and-forward) column-major QWP/WS
- *  sender from the always-direct pool, independent of `sf_dir`. Not
- *  thread-safe; belongs to the borrowing thread until returned via
- *  `questdb_db_return_direct_sender`.
+/** Direct (pipelined, non-store-and-forward) column-major QWP/WS sender.
+ *  Either borrowed from the always-direct pool, independent of `sf_dir`, or
+ *  opened standalone by `qwp_direct_sender_from_conf` /
+ *  `qwp_direct_sender_from_opts`. Not thread-safe; belongs to the calling
+ *  thread until released through the matching return, drop, or free function.
  *
  *  Exposes publish-only `qwp_direct_sender_flush`, the
  *  `qwp_direct_sender_commit` boundary, and the Arrow batch variants.
  *  There is no internal failover: on a transient
- *  `line_sender_error_failover_retry` the caller drops the sender, re-borrows
- *  a live one, and re-drives the uncommitted tail from its own source. */
+ *  `line_sender_error_failover_retry` the caller drops the sender, obtains a
+ *  new one, and re-drives the uncommitted tail from its own source. */
 typedef struct qwp_direct_sender qwp_direct_sender;
 
 /** One DataFrame's worth of column buffers destined for one QuestDB table.
@@ -251,8 +252,10 @@ qwp_direct_sender* questdb_db_borrow_direct_sender_with_retry(
  * QWP/WebSocket config string, owning its own connection with no pool — for
  * one-off DataFrame bulk loads without a `questdb_db`. `conf` is a UTF-8
  * string of `conf_len` bytes. Returns NULL on failure and sets `*err_out` if
- * provided. Free the returned handle with `qwp_direct_sender_free` (there
- * is no pool to return it to).
+ * provided. On normal completion free the returned handle with
+ * `qwp_direct_sender_free` (there is no pool to return it to). To discard
+ * uncommitted frames after a failure, call
+ * `questdb_db_drop_direct_sender(NULL, sender)` instead.
  */
 QUESTDB_CLIENT_API
 qwp_direct_sender* qwp_direct_sender_from_conf(
@@ -267,8 +270,10 @@ qwp_direct_sender* qwp_direct_sender_from_conf(
  * the `line_sender_opts_*` builder functions rather than a config string — so
  * this works for a sender configured either way. `opts` is borrowed, not
  * consumed: the caller retains ownership and must still free it. Returns NULL
- * on failure and sets `*err_out` if provided. Free the returned handle with
- * `qwp_direct_sender_free` (there is no pool to return it to).
+ * on failure and sets `*err_out` if provided. On normal completion free the
+ * returned handle with `qwp_direct_sender_free` (there is no pool to return it
+ * to). To discard uncommitted frames after a failure, call
+ * `questdb_db_drop_direct_sender(NULL, sender)` instead.
  */
 QUESTDB_CLIENT_API
 qwp_direct_sender* qwp_direct_sender_from_opts(
@@ -280,6 +285,11 @@ qwp_direct_sender* qwp_direct_sender_from_opts(
  * Invalidates the `sender` pointer. If the sender has latched terminal state,
  * or if the pool has been closed, it is closed instead of recycled. A sender
  * returned with uncommitted pipelined frames has them committed best-effort.
+ * This function accepts only handles borrowed through
+ * `questdb_db_borrow_direct_sender` /
+ * `questdb_db_borrow_direct_sender_with_retry`. For a standalone handle use
+ * `qwp_direct_sender_free`, or `questdb_db_drop_direct_sender(NULL, sender)` to
+ * discard uncommitted frames after a failure.
  *
  * Mutually exclusive with `questdb_db_drop_direct_sender` on the same
  * `sender`: call exactly one of the two. Calling both (or either twice) is UB.
@@ -290,16 +300,27 @@ void questdb_db_return_direct_sender(
     qwp_direct_sender* sender);
 
 /**
- * Force-drop a borrowed direct sender instead of recycling it. Invalidates
- * `sender`. Accepts NULL and no-ops.
+ * Force-drop a direct sender, closing its connection instead of recycling it
+ * or committing its uncommitted frames. `sender` may be either borrowed from a
+ * pool or returned by `qwp_direct_sender_from_conf` /
+ * `qwp_direct_sender_from_opts`.
+ *
+ * `db` is ignored and may be NULL: `sender` retains the backing information
+ * needed to release itself. Pass the originating `db` for a borrowed handle.
+ * For a standalone handle, pass NULL for `db`.
+ *
+ * Invalidates `sender`. Accepts NULL `sender` and no-ops.
  *
  * Use this after a failure that may have left in-doubt or uncommitted frames
  * on the connection; otherwise a later borrower could commit those frames
  * together with its own batch. Uncommitted frames are discarded with the
- * connection — the caller re-drives them from its own source.
+ * connection — the caller re-drives them from its own source. A pooled sender
+ * is closed instead of recycled; a standalone sender is closed outright.
  *
- * Mutually exclusive with `questdb_db_return_direct_sender` on the same
- * `sender`: call exactly one of the two. Calling both (or either twice) is UB.
+ * For a pool-borrowed handle this is mutually exclusive with
+ * `questdb_db_return_direct_sender`; for a standalone handle it is mutually
+ * exclusive with `qwp_direct_sender_free`. Call exactly one matching release
+ * function. Calling more than one (or any release function twice) is UB.
  */
 QUESTDB_CLIENT_API
 void questdb_db_drop_direct_sender(
@@ -307,11 +328,15 @@ void questdb_db_drop_direct_sender(
     qwp_direct_sender* sender);
 
 /**
- * Free a standalone `qwp_direct_sender_from_conf` handle, committing any
- * un-sync'd deferred frames best-effort first (call
- * `qwp_direct_sender_commit` or a waited flush beforehand for delivery
- * certainty). Invalidates `sender`. Accepts NULL and no-ops. For a
- * pool-borrowed handle use `questdb_db_return_direct_sender` instead.
+ * Free a standalone `qwp_direct_sender_from_conf` /
+ * `qwp_direct_sender_from_opts` handle, committing any un-sync'd deferred
+ * frames best-effort first (call `qwp_direct_sender_commit` or a waited flush
+ * beforehand for delivery certainty). Invalidates `sender`. Accepts NULL and
+ * no-ops. For a pool-borrowed handle use
+ * `questdb_db_return_direct_sender` instead. To discard a standalone handle's
+ * uncommitted frames after a failure, use
+ * `questdb_db_drop_direct_sender(NULL, sender)` instead; calling both release
+ * functions (or either twice) is UB.
  */
 QUESTDB_CLIENT_API
 void qwp_direct_sender_free(
