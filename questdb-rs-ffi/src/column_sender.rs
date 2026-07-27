@@ -855,10 +855,13 @@ unsafe fn typed_bytes_slice<'a>(
 // Pool
 // ===========================================================================
 
-/// Open a connection pool. The pool is lazy: this call parses and validates
-/// the connect string but opens no connections; the first borrow opens one,
-/// so server/auth/TLS errors surface from the borrow, not from here. `conf`
-/// is a UTF-8 string of `conf_len` bytes.
+/// Open a connection pool. By default this connects eagerly: it pre-opens
+/// the warm minimums (`sender_pool_min` senders, `query_pool_min` readers),
+/// honoring `initial_connect_retry` for the senders (readers always connect
+/// fail-fast), so server/auth/TLS errors surface from this call. With
+/// `lazy_connect=true` it opens no connections; senders buffer locally and
+/// connect in the background, readers connect on first borrow, and errors
+/// surface there instead. `conf` is a UTF-8 string of `conf_len` bytes.
 ///
 /// Returns NULL on failure. When `err_out != NULL`, the error is placed
 /// in `*err_out` and ownership transfers to the caller (release with
@@ -5079,7 +5082,8 @@ mod tests {
             listener.local_addr().expect("local_addr").port()
         };
         let conf = format!(
-            "ws::addr=127.0.0.1:{port};auth_timeout=2000;reconnect_max_duration_millis=1000;"
+            "ws::addr=127.0.0.1:{port};auth_timeout=2000;reconnect_max_duration_millis=1000;\
+             lazy_connect=true;"
         );
         let mut err: *mut line_sender_error = std::ptr::null_mut();
         let db =

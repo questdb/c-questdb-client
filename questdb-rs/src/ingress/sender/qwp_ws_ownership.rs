@@ -154,6 +154,11 @@ pub struct QwpWsTotals {
     /// Frames handed to the transport for writing, regardless of whether the
     /// server has acknowledged them.
     pub frames_sent: u64,
+    /// Frames handed to the transport while catching up through the
+    /// publication boundary captured at a successful reconnect. Initial
+    /// publication, including recovered store-and-forward frames sent on the
+    /// first connection, is not counted as replay.
+    pub frames_replayed: u64,
     /// Server responses interpreted as ACKs: ordinary OK, DurableOk, and
     /// stand-alone DurableAck position notifications.
     pub acks: u64,

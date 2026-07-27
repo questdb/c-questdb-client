@@ -4492,9 +4492,10 @@ TEST_CASE("mock: column::visit dispatches DOUBLE_ARRAY to array_view<double>")
 // hands out query readers as well as senders; a borrowed reader returns to
 // the pool on destruction unless `drop_on_return()` was called.
 //
-// The pool is lazy: construction opens no connections (mirroring the Rust
-// `reader_pool_*` tests, which assert `server.accepted() == 0` right after
-// `connect`), so reader borrows consume scripts from index 0. The reader
+// The pool sets `lazy_connect=true` so construction opens no connections
+// (mirroring the Rust `reader_pool_*` tests, which assert
+// `server.accepted() == 0` right after `connect`) and reader borrows consume
+// scripts from index 0. The reader
 // connection sends SERVER_INFO at connect, then parks on the query request
 // that never arrives.
 // ---------------------------------------------------------------------------
@@ -4511,7 +4512,8 @@ qm::Script reader_park_script(uint8_t role = qm::ROLE_PRIMARY)
 
 std::string pool_conf(const std::string& addr)
 {
-    return "ws::addr=" + addr + ";sender_pool_min=1;pool_reap=manual;";
+    return "ws::addr=" + addr +
+           ";lazy_connect=true;sender_pool_min=1;pool_reap=manual;";
 }
 } // namespace
 

@@ -3832,6 +3832,10 @@ fn qwp_ws_reconnects_and_replays_in_all_progress_modes() {
         let frame2 = rx.recv_timeout(Duration::from_secs(5)).unwrap();
         assert_eq!(&frame1[0..4], b"QWP1");
         assert_eq!(frame1, frame2, "mode={}", progress.name());
+
+        let totals = sender.qwp_ws_totals().unwrap();
+        assert_eq!(totals.frames_sent, 2, "mode={}", progress.name());
+        assert_eq!(totals.frames_replayed, 1, "mode={}", progress.name());
     }
 }
 
