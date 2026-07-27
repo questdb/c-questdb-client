@@ -44,6 +44,18 @@
 #     short cap discards a connection the network may have silently dropped
 #     instead of handing it to the next download.
 #
+# The retryHandler retries fire back-to-back within about a second, so they
+# only cover a failure that is over the moment it happens: one dropped
+# connection, one bad response. A network or DNS outage that lasts longer
+# swallows every attempt (the JVM even caches a failed hostname lookup for 10
+# seconds, so immediate retries re-fail without touching the network — that is
+# how a scheduled fuzz run on a hosted macOS agent failed despite these
+# options). The Maven compile steps therefore also set
+# retryCountOnTaskFailure: 2, which makes Azure rerun the whole task on
+# failure. A rerun keeps everything already in the local repository and spends
+# minutes recompiling the modules built so far before it reaches the download
+# that failed, so it retries on a timescale that outlasts such an outage.
+#
 # The echo lines run without `set -x`. Azure treats any line containing
 # `##vso[` as a command and takes the text after `]` as the value; tracing the
 # echo would print the closing quote that bash adds, and that quote would end

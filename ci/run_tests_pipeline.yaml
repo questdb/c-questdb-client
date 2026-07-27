@@ -58,6 +58,7 @@ stages:
           - template: templates/clone_questdb.yaml
           - task: Maven@3
             displayName: "Compile QuestDB"
+            retryCountOnTaskFailure: 2
             inputs:
               mavenPOMFile: "questdb/pom.xml"
               javaHomeOption: "Path"
@@ -120,6 +121,7 @@ stages:
           - template: templates/clone_questdb.yaml
           - task: Maven@3
             displayName: "Compile QuestDB"
+            retryCountOnTaskFailure: 2
             inputs:
               mavenPOMFile: "questdb/pom.xml"
               javaHomeOption: "Path"
@@ -345,6 +347,7 @@ stages:
           - template: templates/maven_settings.yaml
           - task: Maven@3
             displayName: "Compile QuestDB"
+            retryCountOnTaskFailure: 2
             inputs:
               mavenPOMFile: "questdb/pom.xml"
               javaHomeOption: "Path"
@@ -420,6 +423,7 @@ stages:
           - template: templates/maven_settings.yaml
           - task: Maven@3
             displayName: "Compile QuestDB"
+            retryCountOnTaskFailure: 2
             inputs:
               mavenPOMFile: "questdb/pom.xml"
               javaHomeOption: "Path"
@@ -521,6 +525,7 @@ stages:
           - template: templates/maven_settings.yaml
           - task: Maven@3
             displayName: "Compile QuestDB"
+            retryCountOnTaskFailure: 2
             inputs:
               mavenPOMFile: "questdb/pom.xml"
               javaHomeOption: "Path"
@@ -581,6 +586,7 @@ stages:
             displayName: "Install JDK 25 (required by QuestDB master)"
           - task: Maven@3
             displayName: "Compile QuestDB"
+            retryCountOnTaskFailure: 2
             inputs:
               mavenPOMFile: "questdb/pom.xml"
               jdkVersionOption: "default"
