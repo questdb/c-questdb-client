@@ -40,41 +40,24 @@ extern "C" {
 
 /////////// Thread safety.
 //
-// All four handles must be accessed by only one thread at a time. Beyond
-// that, the four handle types have different thread-mobility rules:
+// All four handles must be accessed by only one thread at a time. They may
+// be migrated between threads, but the caller MUST establish a happens-before
+// edge on every transfer. A pthread mutex hand-off, a thread spawn/join, or a
+// `std::atomic` with release/acquire on the handle pointer are all sufficient.
+// Concurrent operations from two threads are always undefined behaviour —
+// only sequential migration is supported.
 //
-//   `qwp_reader`         — may be migrated between threads (no concurrent
-//                           access). The caller MUST establish a
-//                           happens-before edge on every transfer — the
-//                           reader's internal state is non-atomic and the
-//                           library does not insert a fence for you. A
-//                           pthread mutex hand-off, a thread spawn/join,
-//                           or a `std::atomic` with release/acquire on
-//                           the handle pointer are all sufficient. The
-//                           library does maintain an internal AtomicBool
-//                           that guards the reader-vs-query/cursor
-//                           lifecycle and pairs Release with Acquire on
-//                           every lifecycle event, but that pairing is an
-//                           implementation detail — it cannot publish the
-//                           reader's state on the very first migration
-//                           after `_from_conf` / `_from_env` (no
-//                           lifecycle event has happened yet). Concurrent
-//                           operations from two threads are always
-//                           undefined behaviour — only sequential
-//                           migration is supported.
+//   `qwp_reader`         — thread-mobile under the rule above. The reader's
+//                           internal state is non-atomic and the library does
+//                           not insert a general publication fence for you.
 //
-//   `qwp_reader_query`   — MUST stay on the thread that created it.
-//   `qwp_reader_cursor`     The query/cursor wraps an internal failover
-//                           callback closure that is `!Send` (it can
-//                           legitimately capture `!Send` user state in a
-//                           future revision), so handing the handle to
-//                           another thread — even with a happens-before
-//                           edge and no concurrent access — is undefined
-//                           behaviour.
+//   `qwp_reader_query`   — thread-mobile under the rule above. Any installed
+//   `qwp_reader_cursor`     failover callback runs on the thread that drives
+//                           the current cursor operation. Its `user_data`
+//                           must therefore remain valid and be safe to use on
+//                           every destination thread.
 //
-//   `questdb_error`   — has no thread affinity. May be created on one
-//                           thread and freed/inspected on another, but
-//                           must not be used from two threads at once.
+//   `questdb_error`      — thread-mobile under the rule above.
 //
 // Borrowed pointers returned by this API — `qwp_reader_server_info*`,
 // `qwp_reader_failover_reset_event*`, host byte slices, varchar/binary/symbol
@@ -486,11 +469,14 @@ typedef struct qwp_reader_failover_reset_event qwp_reader_failover_reset_event;
  *    accumulator, set a flag, signal a condition variable — and do
  *    any heavy work outside the cursor's drive thread.
  *
- * The callback may freely touch `event` and `user_data`; both are
- * owned by the caller's logic, not by the in-flight cursor.
+ * The callback may freely touch `event` and `user_data`; both are owned by
+ * the caller's logic, not by the in-flight cursor. If the query/cursor is
+ * handed to another thread, the caller MUST also ensure that `user_data` is
+ * valid and safe to access on that destination thread.
  *
- * The callback runs on the thread driving the in-flight cursor
- * operation.
+ * The callback runs on the thread driving the in-flight cursor operation.
+ * If the query/cursor is handed to another thread, the caller MUST ensure
+ * that `user_data` remains valid and is safe to access there.
  */
 typedef void (*qwp_reader_failover_reset_callback)(
     const qwp_reader_failover_reset_event* event,
@@ -613,8 +599,9 @@ typedef struct qwp_reader_failover_progress_event qwp_reader_failover_progress_e
  *    accumulator, set a flag, signal a condition variable — and do
  *    any heavy work outside the cursor's drive thread.
  *
- * The callback runs on the thread driving the in-flight cursor
- * operation.
+ * The callback runs on the thread driving the in-flight cursor operation.
+ * If the query/cursor is handed to another thread, the caller MUST ensure
+ * that `user_data` remains valid and is safe to access there.
  */
 typedef void (*qwp_reader_failover_progress_callback)(
     const qwp_reader_failover_progress_event* event,
@@ -1050,7 +1037,8 @@ QUESTDB_CLIENT_API void qwp_reader_query_on_failover_progress(
 
 /*
  * Opaque cursor handle. Borrows from the originating `qwp_reader` for its
- * entire lifetime — the reader MUST outlive the cursor. Single-threaded.
+ * entire lifetime — the reader MUST outlive the cursor. Thread-mobile but
+ * single-threaded: follow the synchronized hand-off contract above.
  *
  * The `qwp_reader_cursor` type is forward-declared near the top of this
  * header.

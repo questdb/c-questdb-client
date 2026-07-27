@@ -379,6 +379,47 @@ pub struct qwp_reader {
     ownership: ReaderOwnership,
 }
 
+/// Raw reader backpointer carried by a query/cursor across an externally
+/// synchronized thread hand-off.
+///
+/// SAFETY: the C contract requires the originating reader to outlive every
+/// query/cursor and prohibits concurrent access. The caller's happens-before
+/// edge publishes both the pointee and the handle state before migration.
+/// Keeping this unsafe assertion on the pointer field, rather than the whole
+/// FFI handle, lets compile-time `Send` assertions catch future non-Send
+/// fields added to either handle.
+#[derive(Clone, Copy)]
+struct ReaderBackptr(*mut qwp_reader);
+
+unsafe impl Send for ReaderBackptr {}
+
+impl ReaderBackptr {
+    fn as_ptr(&self) -> *mut qwp_reader {
+        self.0
+    }
+
+    fn is_null(&self) -> bool {
+        self.0.is_null()
+    }
+}
+
+/// Opaque callback context supplied by C. The library never dereferences it;
+/// it only round-trips the bit pattern to the callback on the cursor's current
+/// drive thread.
+///
+/// SAFETY: installing a callback and migrating the query/cursor promises that
+/// the caller-provided context is valid on the destination thread. This is the
+/// C equivalent of the Rust callback's `Send` bound.
+struct CallbackUserData(*mut c_void);
+
+unsafe impl Send for CallbackUserData {}
+
+impl CallbackUserData {
+    fn as_ptr(&self) -> *mut c_void {
+        self.0
+    }
+}
+
 /// How a [`qwp_reader`] is owned, and what to do with it on close.
 ///
 /// `must_close` lives inside the `Pooled` arm because it is only
@@ -1263,12 +1304,12 @@ pub unsafe extern "C" fn qwp_reader_query_on_failover_reset(
     user_data: *mut c_void,
 ) {
     unsafe {
+        let user_data = CallbackUserData(user_data);
         // Wrap the C function pointer + user_data in a Rust closure that
         // matches the `FnMut(&FailoverResetEvent) + 'r` signature `ReaderQuery`
-        // expects. The trait bound has no `Send` requirement; the cursor
-        // is single-threaded and the trampoline runs on the same thread
-        // that drives `next_batch`. The C caller owns `user_data` and is
-        // responsible for its lifetime — see the header docs.
+        // expects. The cursor is thread-mobile but single-threaded: the
+        // trampoline runs on whichever thread drives `next_batch`. The C
+        // caller owns `user_data` and must keep it valid across any hand-off.
         let trampoline = move |event: &FailoverResetEvent| {
             if let Some(c_cb) = callback {
                 let opaque =
@@ -1283,7 +1324,7 @@ pub unsafe extern "C" fn qwp_reader_query_on_failover_reset(
                 // users get the unwind-into-C protection from the wrapper's
                 // noexcept trampoline.
                 let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    c_cb(opaque, user_data)
+                    c_cb(opaque, user_data.as_ptr())
                 }));
                 if result.is_err() {
                     std::process::abort();
@@ -1638,12 +1679,13 @@ pub unsafe extern "C" fn qwp_reader_query_on_failover_progress(
     user_data: *mut c_void,
 ) {
     unsafe {
+        let user_data = CallbackUserData(user_data);
         let trampoline = move |event: &FailoverProgressEvent| {
             if let Some(c_cb) = callback {
                 let opaque = event as *const FailoverProgressEvent
                     as *const qwp_reader_failover_progress_event;
                 let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    c_cb(opaque, user_data)
+                    c_cb(opaque, user_data.as_ptr())
                 }));
                 if result.is_err() {
                     std::process::abort();
@@ -1672,7 +1714,7 @@ pub struct qwp_reader_query {
     /// flag on `_query_free` or `_query_execute` failure. Always non-NULL
     /// for a valid query (the C contract requires the reader to outlive
     /// the query).
-    reader: *mut qwp_reader,
+    reader: ReaderBackptr,
     /// First fatal error detected by an FFI-level bind/builder method
     /// that has no `err_out` slot of its own (currently only
     /// `_bind_varchar`'s UTF-8 re-validation). `_query_execute` checks
@@ -1800,7 +1842,7 @@ pub unsafe extern "C" fn qwp_reader_prepare(
             let q_static: ReaderQuery<'static> = std::mem::transmute(q);
             Box::into_raw(Box::new(qwp_reader_query {
                 inner: ManuallyDrop::new(q_static),
-                reader,
+                reader: ReaderBackptr(reader),
                 deferred_err: None,
             }))
         }));
@@ -1826,7 +1868,7 @@ pub unsafe extern "C" fn qwp_reader_query_free(query: *mut qwp_reader_query) {
         // Release the reader's active flag so a new query/cursor can be
         // started.
         if !boxed.reader.is_null() {
-            (*boxed.reader)
+            (*boxed.reader.as_ptr())
                 .cursor_active
                 .store(false, Ordering::Release);
         }
@@ -1888,7 +1930,9 @@ pub unsafe extern "C" fn qwp_reader_query_execute(
         if let Some(e) = boxed.deferred_err.take() {
             drop(q);
             if !reader.is_null() {
-                (*reader).cursor_active.store(false, Ordering::Release);
+                (*reader.as_ptr())
+                    .cursor_active
+                    .store(false, Ordering::Release);
             }
             write_err_box(err_out, e);
             return ptr::null_mut();
@@ -1927,7 +1971,9 @@ pub unsafe extern "C" fn qwp_reader_query_execute(
                 Err(e) => {
                     // Query gone, no cursor produced — release the active flag.
                     if !reader.is_null() {
-                        (*reader).cursor_active.store(false, Ordering::Release);
+                        (*reader.as_ptr())
+                            .cursor_active
+                            .store(false, Ordering::Release);
                     }
                     write_err_box(err_out, e);
                     ptr::null_mut()
@@ -2000,7 +2046,7 @@ pub unsafe extern "C" fn qwp_reader_execute(
                         current_batch: None,
                         #[cfg(feature = "arrow")]
                         arrow_schema_pin: None,
-                        reader,
+                        reader: ReaderBackptr(reader),
                     }))
                 }
                 Err(e) => {
@@ -2416,8 +2462,19 @@ pub struct qwp_reader_cursor {
     arrow_schema_pin: Option<arrow::datatypes::SchemaRef>,
     /// Backpointer to the originating reader, used to clear its `active`
     /// flag on `_cursor_free`. Always non-NULL for a valid cursor.
-    reader: *mut qwp_reader,
+    reader: ReaderBackptr,
 }
+
+// Pin the FFI mobility contract. These handles may be transferred across
+// threads under external synchronization; this does not permit concurrent
+// access. Keeping this assertion here makes any future non-Send field a
+// compile error instead of a silent contract regression.
+const _: fn() = || {
+    fn assert_send<T: Send>() {}
+    assert_send::<qwp_reader>();
+    assert_send::<qwp_reader_query>();
+    assert_send::<qwp_reader_cursor>();
+};
 
 impl qwp_reader_cursor {
     /// Drop any in-flight `BatchView` and yield exclusive access to the
@@ -2485,7 +2542,7 @@ pub unsafe extern "C" fn qwp_reader_cursor_free(cursor: *mut qwp_reader_cursor) 
         // Release the reader's active flag so a new query/cursor can be
         // started.
         if !boxed.reader.is_null() {
-            (*boxed.reader)
+            (*boxed.reader.as_ptr())
                 .cursor_active
                 .store(false, Ordering::Release);
         }

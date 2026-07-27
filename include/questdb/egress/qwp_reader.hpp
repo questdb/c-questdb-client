@@ -50,15 +50,14 @@ namespace questdb::egress
 // `std::move` lets you transfer ownership, but the destination thread inherits
 // the same per-handle access rules:
 //
-//   `reader`               — may be moved between threads (no concurrent
-//                            access). Insert a happens-before edge on
-//                            transfer; the underlying C handle uses non-
-//                            atomic state with no automatic visibility.
-//   `query` / `cursor`     — MUST stay on the thread that created them.
-//                            Even with external synchronisation, moving
-//                            either across threads is undefined behaviour
-//                            (their internal failover-callback closure is
-//                            `!Send`).
+//   `reader` / `query` /   — may be moved between threads (no concurrent
+//   `cursor`                 access). Insert a happens-before edge on every
+//                            transfer; the underlying handles use non-atomic
+//                            state with no general publication fence.
+//                            Failover callbacks run, and their captured state
+//                            may eventually be destroyed, on the thread that
+//                            drives or destroys the migrated handle. Captures
+//                            must be safe for that hand-off.
 // The wrappers cannot statically enforce these rules; they document the
 // same contract the C API does.
 // ---------------------------------------------------------------------------
@@ -1133,7 +1132,8 @@ public:
      * not leave any visible side effect outside the callback itself.
      *
      * The callback runs on the thread driving the in-flight cursor
-     * operation.
+     * operation. If the query/cursor is moved to another thread, its
+     * captures must be safe to access and eventually destroy there.
      */
     query& on_failover_reset(failover_reset_callback cb)
     {
@@ -1176,7 +1176,10 @@ public:
      * Reentrancy contract is identical to `on_failover_reset`: the
      * callback MUST NOT touch the originating reader / query / cursor,
      * MUST NOT block, and any thrown exception is swallowed (an
-     * unwind across the C boundary would be undefined behaviour).
+     * unwind across the C boundary would be undefined behaviour). The
+     * callback runs on the cursor's drive thread; after a cross-thread
+     * move, its captures must be safe to access and eventually destroy
+     * on the destination thread.
      */
     query& on_failover_progress(failover_progress_callback cb)
     {
