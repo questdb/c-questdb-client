@@ -97,10 +97,16 @@ def bail(code, what):
 
 
 # The posted event reaches every process on the console, this helper
-# included. A handler that claims each event keeps the default handler
-# (ExitProcess) from killing the helper before it can report success.
-# Merely ignoring would not do: SetConsoleCtrlHandler(NULL, TRUE)
-# covers Ctrl+C only, not Ctrl+Break.
+# included, so it must not terminate the helper before it reports
+# success. Two layers cover the two events this helper posts:
+#   * claim_all returns True for every event and is the only cover for
+#     Ctrl+Break (the ignore-Ctrl+C flag below suppresses Ctrl+C alone).
+#     Its protection is best-effort: the OS runs it on an injected
+#     handler thread that can lose the race against the default handler.
+#   * Ctrl+C -- the common graceful-shutdown path that must be reliable
+#     -- is instead covered by the ignore-Ctrl+C flag set after
+#     AttachConsole below. That is deterministic: the OS never terminates
+#     the process for Ctrl+C, with no handler-thread race in play.
 handler_t = ctypes.WINFUNCTYPE(ctypes.wintypes.BOOL, ctypes.wintypes.DWORD)
 claim_all = handler_t(lambda _event: True)
 if not kernel32.SetConsoleCtrlHandler(claim_all, True):
@@ -108,6 +114,12 @@ if not kernel32.SetConsoleCtrlHandler(claim_all, True):
 kernel32.FreeConsole()  # Failure is fine: it means we had no console.
 if not kernel32.AttachConsole(pid):
     bail(3, 'AttachConsole')
+# Ignore Ctrl+C in this helper so its own copy of a posted CTRL_C_EVENT
+# cannot terminate it with STATUS_CONTROL_C_EXIT (0xC000013A), which the
+# caller would read as a spurious "Failed to post ctrl_c". The flag is a
+# per-process attribute the JVM does not share, so the JVM -- launched
+# with Ctrl+C enabled -- still receives the event and shuts down.
+kernel32.SetConsoleCtrlHandler(None, True)
 # Process group 0 == everyone on this console, which is exactly the JVM
 # (and this helper): the JVM was launched with CREATE_NO_WINDOW, so its
 # console hosts nothing else. Group 0 rather than the JVM's pid because
@@ -117,19 +129,14 @@ if not kernel32.AttachConsole(pid):
 if not kernel32.GenerateConsoleCtrlEvent(event, 0):
     bail(4, 'GenerateConsoleCtrlEvent')
 # GenerateConsoleCtrlEvent only queues the event; the OS delivers it to
-# each process on the console — the JVM and this helper — asynchronously,
-# on its own injected handler thread. Exiting immediately after the call
-# returns is a race on both ends:
-#   * Our own copy of the event may arrive after we have started tearing
-#     down, before claim_all runs, so the default handler terminates this
-#     process with STATUS_CONTROL_C_EXIT (0xC000013A). The caller then
-#     reads a non-zero exit code and reports a spurious delivery failure.
-#   * Detaching from the JVM's console (which exiting does) can race the
-#     JVM's own handler thread picking the event up, so the shutdown /
-#     thread-dump request is never seen.
-# Sleeping holds the console attachment open and, because the sleep frees
-# the GIL, lets the injected thread run claim_all and return True so this
-# process survives its own event and exits 0. The caller's 15s subprocess
+# each process on the console — the JVM and this helper — asynchronously.
+# Sleeping holds the console attachment open so the JVM's handler thread
+# picks the event up before the helper exits and detaches; exiting at once
+# could race that pickup, dropping the shutdown / thread-dump request. The
+# helper's own survival no longer rides on this sleep: the ignore-Ctrl+C
+# flag covers the Ctrl+C path deterministically, and claim_all is the
+# best-effort cover for the rarer Ctrl+Break path (whose injected handler
+# thread the sleep still gives room to run). The caller's 15s subprocess
 # timeout bounds the wait.
 time.sleep(3)
 '''
