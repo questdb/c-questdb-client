@@ -44,6 +44,7 @@ import urllib.error
 import concurrent.futures
 import threading
 import base64
+import ctypes
 from pprint import pformat
 
 AUTH_TXT = """admin ec-p-256-sha256 fLKYEaoEb9lrn3nkwLDA-M_xnuFOdSt9y0Z7_vWSHLU Dt5tbS1dEDMSYfym3fgMv0B99szno-dFc1rYF9t0aac
@@ -731,11 +732,25 @@ class QuestDbFixture(QuestDbFixtureBase):
         # the target console — so CREATE_NO_WINDOW gives the JVM a fresh,
         # windowless console of its own, where stop() can post Ctrl+C (via
         # _win_send_console_ctrl) and hit nothing else. CREATE_NEW_PROCESS_GROUP
-        # is deliberately absent: it would start the child with the
-        # ignore-Ctrl+C flag set, which the JVM never clears, making it deaf
-        # to the shutdown request.
+        # is deliberately absent from the JVM's own flags: it sets the
+        # ignore-Ctrl+C flag, which would make the JVM deaf to the shutdown
+        # request. That flag is inherited, though, so avoiding it here is not
+        # enough on its own -- see the clearing step below.
         creationflags = (
             subprocess.CREATE_NO_WINDOW if sys.platform == 'win32' else 0)
+        if sys.platform == 'win32':
+            # The fuzz supervisor spawns this test process under
+            # CREATE_NEW_PROCESS_GROUP (qwp_ws_fuzz.run_isolated_suite) so it
+            # can hard-kill the whole tree on its deadline. That flag disables
+            # CTRL_C_EVENT for every process in the group, and a child inherits
+            # the flag at creation. Left in place, the JVM spawned below ignores
+            # the Ctrl+C that stop() posts for graceful shutdown -- while still
+            # answering Ctrl+Break with a thread dump, since the flag suppresses
+            # Ctrl+C alone. Clear it on this process so the JVM inherits Ctrl+C
+            # enabled. A no-op on a direct run where no ancestor set the flag;
+            # tree-kill is unaffected (the supervisor terminates via taskkill,
+            # and Ctrl+Break is never disabled by this flag).
+            ctypes.windll.kernel32.SetConsoleCtrlHandler(None, False)
         try:
             self._proc = subprocess.Popen(
                 launch_args,

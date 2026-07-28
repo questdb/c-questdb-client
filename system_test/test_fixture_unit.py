@@ -403,6 +403,70 @@ class StartProbeSelectionTest(unittest.TestCase):
             self.assertEqual(captured['timeout_sec'], 90)
 
 
+class WindowsCtrlCInheritanceTest(unittest.TestCase):
+    """On Windows the fuzz supervisor runs this process under
+    CREATE_NEW_PROCESS_GROUP, whose inherited ignore-Ctrl+C flag would make
+    the JVM deaf to the graceful-shutdown Ctrl+C stop() posts. start() must
+    clear that flag before spawning the JVM, so the JVM inherits Ctrl+C
+    enabled, and must do so before the launch (a later clear cannot change
+    the flag the child already inherited)."""
+
+    def test_start_clears_ignore_ctrl_c_before_launching_jvm(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            qdb = _make_fixture(tmp_dir)
+            qdb._version_queried = True  # skip the post-start HTTP version query
+            calls = []
+            fake_ctypes = mock.MagicMock()
+            fake_ctypes.windll.kernel32.SetConsoleCtrlHandler.side_effect = (
+                lambda *a: calls.append(('SetConsoleCtrlHandler', a)))
+
+            def fake_popen(*_a, **_k):
+                calls.append(('Popen', None))
+                return _FakeProc(alive=True)
+
+            with contextlib.redirect_stderr(io.StringIO()), \
+                    mock.patch.object(fixture.sys, 'platform', 'win32'), \
+                    mock.patch.object(fixture.subprocess, 'CREATE_NO_WINDOW',
+                                      0x08000000, create=True), \
+                    mock.patch.object(fixture, 'ctypes', fake_ctypes), \
+                    mock.patch.object(fixture, 'retry', lambda *a, **k: True), \
+                    mock.patch.object(fixture, '_find_java', return_value='java'), \
+                    mock.patch.object(fixture.subprocess, 'Popen', fake_popen), \
+                    mock.patch.object(fixture.atexit, 'register'):
+                qdb.start()
+            if qdb._log:
+                qdb._log.close()
+
+            names = [c[0] for c in calls]
+            self.assertIn('SetConsoleCtrlHandler', names)
+            self.assertIn('Popen', names)
+            self.assertLess(
+                names.index('SetConsoleCtrlHandler'), names.index('Popen'),
+                'ignore-Ctrl+C must be cleared before the JVM is spawned')
+            sc_args = next(
+                c[1] for c in calls if c[0] == 'SetConsoleCtrlHandler')
+            self.assertEqual(sc_args, (None, False))
+
+    def test_start_leaves_ctrl_c_handler_alone_off_windows(self):
+        # On POSIX the flag does not exist; start() must not touch it.
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            qdb = _make_fixture(tmp_dir)
+            qdb._version_queried = True
+            fake_ctypes = mock.MagicMock()
+            with contextlib.redirect_stderr(io.StringIO()), \
+                    mock.patch.object(fixture.sys, 'platform', 'linux'), \
+                    mock.patch.object(fixture, 'ctypes', fake_ctypes), \
+                    mock.patch.object(fixture, 'retry', lambda *a, **k: True), \
+                    mock.patch.object(fixture, '_find_java', return_value='java'), \
+                    mock.patch.object(fixture.subprocess, 'Popen',
+                                      return_value=_FakeProc(alive=True)), \
+                    mock.patch.object(fixture.atexit, 'register'):
+                qdb.start()
+            if qdb._log:
+                qdb._log.close()
+            fake_ctypes.windll.kernel32.SetConsoleCtrlHandler.assert_not_called()
+
+
 class TimeoutDiagnosticsTest(unittest.TestCase):
 
     @unittest.skipUnless(
