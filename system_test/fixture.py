@@ -78,6 +78,7 @@ _WIN_CONSOLE_CTRL_HELPER = r'''
 import ctypes
 import ctypes.wintypes
 import sys
+import time
 
 CTRL_C_EVENT = 0
 CTRL_BREAK_EVENT = 1
@@ -114,6 +115,22 @@ if not kernel32.AttachConsole(pid):
 # without delivering anything.
 if not kernel32.GenerateConsoleCtrlEvent(event, 0):
     bail(4, 'GenerateConsoleCtrlEvent')
+# GenerateConsoleCtrlEvent only queues the event; the OS delivers it to
+# each process on the console — the JVM and this helper — asynchronously,
+# on its own injected handler thread. Exiting immediately after the call
+# returns is a race on both ends:
+#   * Our own copy of the event may arrive after we have started tearing
+#     down, before claim_all runs, so the default handler terminates this
+#     process with STATUS_CONTROL_C_EXIT (0xC000013A). The caller then
+#     reads a non-zero exit code and reports a spurious delivery failure.
+#   * Detaching from the JVM's console (which exiting does) can race the
+#     JVM's own handler thread picking the event up, so the shutdown /
+#     thread-dump request is never seen.
+# Sleeping holds the console attachment open and, because the sleep frees
+# the GIL, lets the injected thread run claim_all and return True so this
+# process survives its own event and exits 0. The caller's 15s subprocess
+# timeout bounds the wait.
+time.sleep(3)
 '''
 
 
