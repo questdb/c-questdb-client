@@ -205,6 +205,48 @@ class PrintLogTest(unittest.TestCase):
             self.assertIn('BAD BYTES', dumped)
 
 
+class PrintLogTailTest(unittest.TestCase):
+
+    def test_handles_truncated_utf8_without_crashing(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            qdb = _make_fixture(tmp_dir)
+            qdb._log_path.parent.mkdir(parents=True)
+            qdb._log_path.write_bytes(b'GOOD LINE\n\xff\xfe BAD BYTES\n')
+            stderr = io.StringIO()
+            with contextlib.redirect_stderr(stderr):
+                qdb.print_log_tail()  # must not raise
+            dumped = stderr.getvalue()
+            self.assertIn('GOOD LINE', dumped)
+            self.assertIn('BAD BYTES', dumped)
+            self.assertIn('full log', dumped)
+
+    def test_caps_at_max_bytes_and_keeps_the_shutdown_marker(self):
+        # The shutdown lines the diagnostic exists to surface are the last
+        # thing written; a log larger than the cap must still show them
+        # while dropping the older head.
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            qdb = _make_fixture(tmp_dir)
+            qdb._log_path.parent.mkdir(parents=True)
+            head = b'OLD HEAD LINE\n' + (b'x' * 4096)
+            qdb._log_path.write_bytes(head + b'\nSIGTERM received\n')
+            stderr = io.StringIO()
+            with contextlib.redirect_stderr(stderr):
+                qdb.print_log_tail(max_bytes=1024)
+            dumped = stderr.getvalue()
+            self.assertIn('SIGTERM received', dumped)
+            self.assertNotIn('OLD HEAD LINE', dumped)
+            self.assertIn('last 1024 bytes', dumped)
+
+    def test_missing_log_reports_without_crashing(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            qdb = _make_fixture(tmp_dir)
+            # _log_path's parent (data/log) does not exist yet.
+            stderr = io.StringIO()
+            with contextlib.redirect_stderr(stderr):
+                qdb.print_log_tail()  # must not raise
+            self.assertIn('Could not read QuestDB log', stderr.getvalue())
+
+
 # Stand-ins for the probe tests: no real JVM or HTTP server is launched.
 class _FakeProc:
     """Minimal subprocess stand-in: poll() reports liveness."""

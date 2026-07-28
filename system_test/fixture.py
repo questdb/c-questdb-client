@@ -602,6 +602,40 @@ class QuestDbFixture(QuestDbFixtureBase):
         sys.stderr.write(textwrap.indent(log, '    '))
         sys.stderr.write('\n\n')
 
+    def print_log_tail(self, max_bytes=32768):
+        """Write the tail of the QuestDB log to stderr.
+
+        Called on a stop() timeout, where the log is the only record of
+        why graceful shutdown never completed. ServerMain's shutdown hook
+        prints `SIGTERM received` to stdout the moment the JVM starts
+        running shutdown hooks, and `QuestDB is shutdown.` once close()
+        returns; both are redirected into this log. Their presence at the
+        tail tells apart the two failure modes: neither line means the
+        JVM never received the console Ctrl+C (a delivery problem);
+        `SIGTERM received` without the matching `QuestDB is shutdown.`
+        means the hook fired but close() stalled (a server problem). The
+        tail suffices because those lines are the last thing written; the
+        log accumulates across bounce restarts, so dumping it whole would
+        bury the shutdown in prior-test output. Bytes with replacement
+        decoding: a force-kill can truncate the log mid-character.
+        """
+        try:
+            with open(self._log_path, 'rb') as log_file:
+                log_file.seek(0, os.SEEK_END)
+                size = log_file.tell()
+                head_skipped = max(0, size - max_bytes)
+                log_file.seek(head_skipped)
+                tail = log_file.read().decode('utf-8', errors='replace')
+        except OSError as e:
+            sys.stderr.write(
+                f'Could not read QuestDB log `{self._log_path}`: {e!r}.\n')
+            return
+        span = 'full log' if head_skipped == 0 else f'last {max_bytes} bytes'
+        sys.stderr.write(
+            f'QuestDB log tail ({span}) from `{self._log_path}`:\n')
+        sys.stderr.write(textwrap.indent(tail, '    '))
+        sys.stderr.write('\n\n')
+
     def _assert_server_alive(self):
         if self._proc.poll() is not None:
             raise RuntimeError('QuestDB died during startup.')
@@ -877,7 +911,12 @@ class QuestDbFixture(QuestDbFixtureBase):
             self._log.close()
             self._log = None
         if shutdown_timed_out:
-            # Cleanup is done (process reaped, log closed); now fail.
+            # Cleanup is done (process reaped, log closed). Surface the log
+            # tail before failing: on the hosted Windows runners the JVM does
+            # not shut down on the injected console Ctrl+C, and the tail is
+            # what shows whether its shutdown hook ever ran. See
+            # print_log_tail for how `SIGTERM received` reads.
+            self.print_log_tail()
             raise QuestDbStopTimeout(
                 f'QuestDB (pid {kill_pid}) did not shut down gracefully '
                 f'within {wait_timeout_sec}s and had to be force-killed. '
