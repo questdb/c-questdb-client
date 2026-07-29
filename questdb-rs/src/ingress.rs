@@ -999,6 +999,10 @@ impl SenderBuilder {
     /// `durable_ack_keepalive_interval_millis`, `drain_orphans`,
     /// `max_background_drainers`, and `error_inbox_capacity`.
     ///
+    /// `in_flight_window` and `max_in_flight` are deprecated no-ops: they are
+    /// still parsed and validated, but no longer bound anything. See
+    /// [`SenderBuilder::max_in_flight`].
+    ///
     /// You can also load the configuration from an environment variable. See
     /// [`SenderBuilder::from_env`].
     ///
@@ -1135,9 +1139,13 @@ impl SenderBuilder {
                 "max_datagram_size" => builder.max_datagram_size(parse_conf_value(key, val)?)?,
                 #[cfg(feature = "_sender-qwp-udp")]
                 "multicast_ttl" => builder.multicast_ttl(parse_conf_value(key, val)?)?,
+                // Both keys are deprecated no-ops: parsed and validated for
+                // backwards compatibility, but the value no longer bounds
+                // anything. See `SenderBuilder::max_in_flight`.
                 #[cfg(feature = "_sender-qwp-ws")]
                 "in_flight_window" => builder.in_flight_window(parse_conf_value(key, val)?)?,
                 #[cfg(feature = "_sender-qwp-ws")]
+                #[allow(deprecated)]
                 "max_in_flight" => builder.max_in_flight(parse_conf_value(key, val)?)?,
                 #[cfg(feature = "_sender-qwp-ws")]
                 "qwp_ws_progress" => builder.qwp_ws_progress(parse_qwp_ws_progress_value(val)?)?,
@@ -1665,18 +1673,32 @@ impl SenderBuilder {
     }
 
     #[cfg(feature = "_sender-qwp-ws")]
-    /// Maximum number of unacknowledged messages a pipelined QWP/WebSocket
-    /// sender keeps in flight at once. The default is 128, matching the spec's
-    /// `Max in-flight batches` limit.
+    /// **Deprecated: this setting no longer has any effect.**
     ///
-    /// The window provides backpressure: once it's full, subsequent
-    /// `flush` calls may wait until the server acknowledges an earlier message.
-    /// Smaller windows reduce client memory and bound the impact of a
-    /// stuck server; larger windows increase throughput on high-RTT links.
+    /// It used to cap the number of unacknowledged frames the QWP/WebSocket
+    /// sender kept in flight, both when admitting a publish and on the wire.
+    /// The cap is gone: the I/O thread now streams at full speed and
+    /// backpressure comes solely from the store-and-forward segment ring's
+    /// byte budget (`sf_max_total_bytes`) and the append deadline
+    /// (`sf_append_deadline_millis`) — the same model the Java and Go clients
+    /// use, neither of which has ever had a frame-count window.
+    ///
+    /// The value is still parsed and validated so existing code and connect
+    /// strings keep working; it is simply ignored. The method will be removed
+    /// in a future release.
+    #[deprecated(
+        since = "7.1.0",
+        note = "no longer has any effect; backpressure is governed by sf_max_total_bytes \
+                and sf_append_deadline_millis. This method will be removed in a future release."
+    )]
     pub fn max_in_flight(self, value: usize) -> Result<Self> {
         self.set_qwp_ws_max_in_flight("max_in_flight", value)
     }
 
+    /// Java-compatible spelling of [`SenderBuilder::max_in_flight`], accepted
+    /// only through the configuration string. Like it, this is a deprecated
+    /// no-op: the value is validated (`> 1`, matching the historical Java
+    /// semantics where `1` meant synchronous mode) and then ignored.
     #[cfg(feature = "_sender-qwp-ws")]
     fn in_flight_window(mut self, value: i32) -> Result<Self> {
         let Some(qwp_ws) = &mut self.qwp_ws else {

@@ -51,7 +51,6 @@ const QWP_STATUS_PARSE_ERROR: u8 = 0x05;
 const QWP_STATUS_WRITE_ERROR: u8 = 0x09;
 const QWP_WS_PUBLIC_BENCH_DEFAULT_ROWS: usize = 20_000_000;
 const QWP_WS_PUBLIC_BENCH_DEFAULT_BATCH_SIZE: usize = 1000;
-const QWP_WS_PUBLIC_BENCH_DEFAULT_IN_FLIGHT: usize = 128;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ProgressCase {
@@ -724,6 +723,27 @@ fn spawn_stalled_after_first_frame_server() -> (u16, mpsc::Receiver<Vec<u8>>, mp
     });
 
     (port, frame_rx, release_tx)
+}
+
+/// Accepts one connection and reads QWP frames forever without ever acking,
+/// forwarding each payload. Lets a test observe how many frames the client is
+/// willing to put on the wire with zero ack progress.
+fn spawn_silent_never_acking_server() -> (u16, mpsc::Receiver<Vec<u8>>) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let (frame_tx, frame_rx) = mpsc::channel();
+
+    thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        perform_server_upgrade(&mut stream).unwrap();
+        while let Ok((_fin, _opcode, payload)) = read_frame(&mut stream) {
+            if frame_tx.send(payload).is_err() {
+                break;
+            }
+        }
+    });
+
+    (port, frame_rx)
 }
 
 fn spawn_delayed_durable_ack_server() -> (
@@ -1581,14 +1601,52 @@ fn qwp_ws_terminal_reject_terminalizes_in_all_progress_modes() {
     }
 }
 
+/// `max_in_flight` is a deprecated no-op, and this pins that at runtime rather
+/// than at the parser: with `max_in_flight=1` the old code put exactly one
+/// frame on the wire and waited for its ack. The window is gone, so many
+/// frames must reach a server that never acks at all.
+#[test]
+fn qwp_ws_max_in_flight_no_longer_bounds_the_wire() {
+    const FRAMES: usize = 8;
+
+    let (port, frames) = spawn_silent_never_acking_server();
+    let conf = format!("ws::addr=127.0.0.1:{port};max_in_flight=1;");
+    let mut sender = SenderBuilder::from_conf(conf).unwrap().build().unwrap();
+
+    for qty in 0..FRAMES as i64 {
+        let mut buf = sender.new_buffer();
+        buf.table("trades")
+            .unwrap()
+            .column_i64("qty", qty)
+            .unwrap()
+            .at_now()
+            .unwrap();
+        sender.flush(&mut buf).unwrap();
+    }
+
+    for i in 0..FRAMES {
+        let payload = frames
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap_or_else(|_| {
+                panic!("only {i} of {FRAMES} frames reached the server without any ack")
+            });
+        assert_eq!(&payload[0..4], b"QWP1");
+    }
+}
+
 #[test]
 fn qwp_ws_backpressure_timeout_matches_in_all_progress_modes() {
     for progress in [ProgressCase::Background, ProgressCase::Manual] {
         let (port, frame_rx, release_tx) = spawn_stalled_after_first_frame_server();
+        // The frame-count window is gone (`max_in_flight` is a deprecated
+        // no-op), so backpressure now comes solely from the segment ring's
+        // byte budget: two 512-byte segments, neither of which can be trimmed
+        // while the server sits on the first frame without acking it.
         let conf = format!(
             "ws::addr=127.0.0.1:{port};\
              qwp_ws_progress={};\
-             max_in_flight=1;\
+             sf_max_segment_bytes=512;\
+             sf_max_total_bytes=1024;\
              sf_append_deadline_millis=20;",
             progress.name()
         );
@@ -1612,23 +1670,38 @@ fn qwp_ws_backpressure_timeout_matches_in_all_progress_modes() {
             b"QWP1"
         );
 
-        let mut second = sender.new_buffer();
-        second
-            .table("trades")
-            .unwrap()
-            .column_i64("qty", 2)
-            .unwrap()
-            .at_now()
-            .unwrap();
-        let err = sender.flush(&mut second).unwrap_err();
+        // Keep publishing until the ring's byte budget is exhausted. Nothing
+        // can be trimmed while the server withholds its ack, so this always
+        // terminates well inside the loop bound.
+        let mut backpressured = None;
+        for _ in 0..64 {
+            let mut next = sender.new_buffer();
+            next.table("trades")
+                .unwrap()
+                .column_i64("qty", 2)
+                .unwrap()
+                .at_now()
+                .unwrap();
+            if let Err(err) = sender.flush(&mut next) {
+                assert!(!next.is_empty(), "mode={}", progress.name());
+                backpressured = Some(err);
+                break;
+            }
+        }
+        let err = backpressured.unwrap_or_else(|| {
+            panic!(
+                "the full segment ring must reject a flush, mode={}",
+                progress.name()
+            )
+        });
         assert_eq!(err.code(), ErrorCode::SocketError);
-        assert_eq!(
-            err.msg(),
-            "QWP/WebSocket flush timed out waiting for local queue capacity",
-            "mode={}",
-            progress.name()
+        assert!(
+            err.msg()
+                .starts_with("QWP/WebSocket Store-and-Forward append timed out"),
+            "mode={}, got: {}",
+            progress.name(),
+            err.msg()
         );
-        assert!(!second.is_empty(), "mode={}", progress.name());
         let _ = release_tx.send(());
     }
 }
@@ -1900,18 +1973,13 @@ fn qwp_ws_public_sender_batch_throughput_benchmark() {
         "QWP_WS_PUBLIC_BENCH_BATCH_SIZE",
         QWP_WS_PUBLIC_BENCH_DEFAULT_BATCH_SIZE,
     );
-    let in_flight = qwp_ws_public_bench_env_usize(
-        "QWP_WS_PUBLIC_BENCH_IN_FLIGHT",
-        QWP_WS_PUBLIC_BENCH_DEFAULT_IN_FLIGHT,
-    );
     let workload = QwpWsPublicBenchWorkload::from_env();
     let prevalidated_names = qwp_ws_public_bench_env_bool("QWP_WS_PUBLIC_BENCH_PREVALIDATED_NAMES");
     assert!(rows > 0);
     assert!(batch_size > 0);
-    assert!(in_flight > 1);
 
     let (port, server) = spawn_ack_each_frame_server();
-    let conf = format!("ws::addr=127.0.0.1:{port};in_flight_window={in_flight};");
+    let conf = format!("ws::addr=127.0.0.1:{port};");
     let mut sender = SenderBuilder::from_conf(conf).unwrap().build().unwrap();
     let mut buffer = sender.new_buffer();
 
@@ -1963,12 +2031,11 @@ fn qwp_ws_public_sender_batch_throughput_benchmark() {
     assert_eq!(binary_frames, expected_frames);
 
     eprintln!(
-        "qwp_ws_public_sender_batch_throughput workload={} prevalidated_names={} rows={} batch_size={} in_flight_window={} frames={} total_ms={} build_ms={} flush_ms={} close_ms={} rows_per_sec={:.2}",
+        "qwp_ws_public_sender_batch_throughput workload={} prevalidated_names={} rows={} batch_size={} frames={} total_ms={} build_ms={} flush_ms={} close_ms={} rows_per_sec={:.2}",
         workload.as_str(),
         prevalidated_names,
         rows,
         batch_size,
-        in_flight,
         binary_frames,
         elapsed.as_millis(),
         build_elapsed.as_millis(),
@@ -1977,22 +2044,20 @@ fn qwp_ws_public_sender_batch_throughput_benchmark() {
         rows as f64 / elapsed.as_secs_f64()
     );
     eprintln!(
-        "qwp_ws_public_sender_batch_build workload={} prevalidated_names={} rows={} batch_size={} in_flight_window={} elapsed_ms={} rows_per_sec={:.2}",
+        "qwp_ws_public_sender_batch_build workload={} prevalidated_names={} rows={} batch_size={} elapsed_ms={} rows_per_sec={:.2}",
         workload.as_str(),
         prevalidated_names,
         rows,
         batch_size,
-        in_flight,
         build_elapsed.as_millis(),
         rows as f64 / build_elapsed.as_secs_f64()
     );
     eprintln!(
-        "qwp_ws_public_sender_batch_flush workload={} prevalidated_names={} rows={} batch_size={} in_flight_window={} elapsed_ms={} rows_per_sec={:.2}",
+        "qwp_ws_public_sender_batch_flush workload={} prevalidated_names={} rows={} batch_size={} elapsed_ms={} rows_per_sec={:.2}",
         workload.as_str(),
         prevalidated_names,
         rows,
         batch_size,
-        in_flight,
         flush_elapsed.as_millis(),
         rows as f64 / flush_elapsed.as_secs_f64()
     );
@@ -2039,8 +2104,6 @@ fn qwp_ws_manual_sender_can_pipeline_before_waiting() {
     });
 
     let mut sender = SenderBuilder::new(Protocol::Ws, "127.0.0.1", port)
-        .max_in_flight(2)
-        .unwrap()
         .qwp_ws_progress(QwpWsProgress::Manual)
         .unwrap()
         .build()
@@ -3714,8 +3777,6 @@ fn qwp_ws_high_level_flushes_pipeline_before_ack() {
     });
 
     let mut sender = SenderBuilder::new(Protocol::Ws, "127.0.0.1", port)
-        .max_in_flight(2)
-        .unwrap()
         .build()
         .unwrap();
 

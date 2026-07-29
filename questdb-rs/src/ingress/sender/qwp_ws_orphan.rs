@@ -54,6 +54,7 @@ use super::qwp_ws_driver::{
     QwpWsPublicationStore, QwpWsSendCore, ReconnectPolicy,
 };
 #[cfg(feature = "sync-sender-qwp-ws")]
+use super::qwp_ws_queue::UNBOUNDED_IN_FLIGHT;
 use super::qwp_ws_sfa_queue::{SfaQueueError, SfaQueueOptions};
 #[cfg(feature = "sync-sender-qwp-ws")]
 use super::qwp_ws_sfa_slot::SfaSlotQueue;
@@ -165,7 +166,8 @@ impl OrphanDrainerConfig {
             slot_dir,
             segment_size_bytes: *self.qwp_ws.sf_max_segment_bytes,
             max_bytes,
-            max_in_flight: *self.qwp_ws.max_in_flight,
+            // Deprecated no-op; see `UNBOUNDED_IN_FLIGHT`.
+            max_in_flight: UNBOUNDED_IN_FLIGHT,
         })
     }
 }

@@ -2172,7 +2172,8 @@ fn pooled_buffer_append_timeout_rolls_back_symbols_and_keeps_input() {
     let (server, release_acks, frames) = MockServer::spawn_ack_when_released_capturing(1);
     let db = QuestDb::connect(&conf_for(
         server.port(),
-        "pool_reap=manual;max_in_flight=1;sf_append_deadline_millis=25;",
+        "pool_reap=manual;sf_max_segment_bytes=512;sf_max_total_bytes=1024;\
+         sf_append_deadline_millis=25;",
     ))
     .unwrap();
     let mut sender = db.borrow_sender().unwrap();
@@ -2192,6 +2193,29 @@ fn pooled_buffer_append_timeout_rolls_back_symbols_and_keeps_input() {
         (0, vec![b"alpha".to_vec()])
     );
 
+    // Backpressure is the ring's byte budget now that `max_in_flight` is a
+    // deprecated no-op. Fill it with the already-registered "alpha" so the
+    // rollback assertion below still isolates "bravo".
+    let mut ring_full = false;
+    for _ in 0..64 {
+        let mut filler = db.new_buffer();
+        filler
+            .table("trades")
+            .unwrap()
+            .symbol("sym", "alpha")
+            .unwrap()
+            .at_now()
+            .unwrap();
+        if sender.flush_buffer(&mut filler).is_err() {
+            ring_full = true;
+            break;
+        }
+    }
+    assert!(
+        ring_full,
+        "the segment ring must fill while the server withholds acks"
+    );
+
     let mut failed = db.new_buffer();
     failed
         .table("trades")
@@ -2205,8 +2229,9 @@ fn pooled_buffer_append_timeout_rolls_back_symbols_and_keeps_input() {
         .expect_err("the full local queue must reject before append");
     assert_eq!(err.code(), ErrorCode::SocketError);
     assert!(
+        err.msg().contains("Store-and-Forward append timed out"),
+        "msg: {}",
         err.msg()
-            .contains("timed out waiting for local queue capacity")
     );
     assert!(!failed.is_empty(), "failed local append must retain input");
 
@@ -2223,7 +2248,11 @@ fn pooled_buffer_append_timeout_rolls_back_symbols_and_keeps_input() {
         .unwrap();
     sender.flush_buffer(&mut third).unwrap();
     sender.wait(AckLevel::Ok, Duration::from_secs(30)).unwrap();
-    let third_payload = frames.recv_timeout(Duration::from_secs(5)).unwrap();
+    // Drain the ring-filling frames; "gamma" is the last one on the wire.
+    let mut third_payload = frames.recv_timeout(Duration::from_secs(5)).unwrap();
+    while let Ok(next) = frames.recv_timeout(Duration::from_millis(250)) {
+        third_payload = next;
+    }
     assert_eq!(
         read_symbol_prefix(&third_payload),
         (1, vec![b"gamma".to_vec()]),
@@ -2460,7 +2489,8 @@ fn mixed_sfa_queue_pressure_rolls_back_the_failing_encoder_namespace() {
     let (server, release_acks, frames) = MockServer::spawn_ack_when_released_capturing(1);
     let db = QuestDb::connect(&conf_for(
         server.port(),
-        "pool_reap=manual;max_in_flight=2;sf_append_deadline_millis=25;",
+        "pool_reap=manual;sf_max_segment_bytes=512;sf_max_total_bytes=1024;\
+         sf_append_deadline_millis=25;",
     ))
     .unwrap();
     let mut sender = db.borrow_sender().unwrap();
@@ -2483,21 +2513,43 @@ fn mixed_sfa_queue_pressure_rolls_back_the_failing_encoder_namespace() {
     let second_fsn = sender.flush_and_get_fsn(&mut second).unwrap().unwrap();
     assert!(second_fsn > first_fsn);
 
+    // `max_in_flight` is a deprecated no-op, so the ring backs up on its byte
+    // budget. Fill it with the already-registered "alpha", which consumes no
+    // dictionary ids -- the id-reuse assertions below depend on "charlie"
+    // being the only symbol that fails to publish.
+    let mut last_published_fsn = second_fsn;
+    let mut ring_full = false;
+    for _ in 0..64 {
+        let mut filler = one_symbol_buffer(&db, "alpha");
+        match sender.flush_buffer_and_get_fsn(&mut filler) {
+            Ok(Some(fsn)) => last_published_fsn = fsn,
+            Ok(None) => {}
+            Err(_) => {
+                ring_full = true;
+                break;
+            }
+        }
+    }
+    assert!(
+        ring_full,
+        "the segment ring must fill while the server withholds acks"
+    );
+
     let failed_batch = symbol_arrow_batch(vec!["charlie"]);
     let overrides = [ArrowColumnOverride::Symbol { column: "sym" }];
     let err = sender
         .flush_arrow_batch_at_now_and_get_fsn("trades", &failed_batch, &overrides)
-        .expect_err("the third mixed frame must time out behind max_in_flight=2");
+        .expect_err("a mixed frame into a full segment ring must time out");
     assert_eq!(err.code(), ErrorCode::SocketError);
     assert!(
+        err.msg().contains("Store-and-Forward append timed out"),
+        "msg: {}",
         err.msg()
-            .contains("timed out waiting for local queue capacity")
     );
-    assert_eq!(sender.published_fsn().unwrap(), Some(second_fsn));
+    assert_eq!(sender.published_fsn().unwrap(), Some(last_published_fsn));
 
     release_acks.store(true, Ordering::SeqCst);
     sender.wait(AckLevel::Ok, Duration::from_secs(30)).unwrap();
-    let second_payload = frames.recv_timeout(Duration::from_secs(5)).unwrap();
 
     let mut after_failure = one_symbol_buffer(&db, "delta");
     let final_fsn = sender
@@ -2505,20 +2557,25 @@ fn mixed_sfa_queue_pressure_rolls_back_the_failing_encoder_namespace() {
         .unwrap()
         .unwrap();
     sender.wait(AckLevel::Ok, Duration::from_secs(30)).unwrap();
-    let final_payload = frames.recv_timeout(Duration::from_secs(5)).unwrap();
     assert!(final_fsn > second_fsn);
+
+    // The ring fillers reuse "alpha", so they carry no new dictionary entries;
+    // keep only the frames that introduce one.
+    let mut dict_frames = Vec::new();
+    while let Ok(payload) = frames.recv_timeout(Duration::from_millis(250)) {
+        let prefix = parse_delta_dict_prefix(&payload);
+        if !prefix.1.is_empty() {
+            dict_frames.push(prefix);
+        }
+    }
 
     assert_eq!(
         parse_delta_dict_prefix(&first_payload),
         (0, vec![b"alpha".to_vec()])
     );
     assert_eq!(
-        parse_delta_dict_prefix(&second_payload),
-        (1, vec![b"bravo".to_vec()])
-    );
-    assert_eq!(
-        parse_delta_dict_prefix(&final_payload),
-        (2, vec![b"delta".to_vec()]),
+        dict_frames,
+        vec![(1, vec![b"bravo".to_vec()]), (2, vec![b"delta".to_vec()]),],
         "the rejected Arrow frame must free charlie's id for the next Buffer"
     );
 }
@@ -3230,16 +3287,35 @@ fn check_store_and_forward_append_timeout_rolls_back_symbols_and_keeps_chunk(ext
         (0, vec![b"alpha".to_vec()])
     );
 
+    // The frame-count window is gone (`max_in_flight` is a deprecated no-op),
+    // so the ring backs up on its byte budget instead. Fill it with the
+    // already-registered "alpha" so no symbol ids are consumed on the way --
+    // the rollback assertion below depends on "bravo" being the only symbol
+    // that ever fails to publish.
+    let mut ring_full = false;
+    for filler_ts in 0..64_i64 {
+        let ts = [10_000 + filler_ts];
+        let mut filler = Chunk::new("trades");
+        append_one_symbol_row(&mut filler, b"alpha", &ts);
+        if sender.flush(&mut filler).is_err() {
+            ring_full = true;
+            break;
+        }
+    }
+    assert!(
+        ring_full,
+        "the segment ring must fill while the server withholds acks"
+    );
+
     let ts2 = [2_i64];
     let mut failed = Chunk::new("trades");
     append_one_symbol_row(&mut failed, b"bravo", &ts2);
     let err = sender
         .flush(&mut failed)
-        .expect_err("second publish should time out behind max_in_flight=1");
+        .expect_err("publish into a full segment ring must time out");
     assert_eq!(err.code(), ErrorCode::SocketError);
     assert!(
-        err.msg()
-            .contains("timed out waiting for local queue capacity"),
+        err.msg().contains("Store-and-Forward append timed out"),
         "msg: {}",
         err.msg()
     );
@@ -3256,7 +3332,13 @@ fn check_store_and_forward_append_timeout_rolls_back_symbols_and_keeps_chunk(ext
     append_one_symbol_row(&mut third, b"gamma", &ts3);
     sender.flush(&mut third).unwrap();
     sender.wait(AckLevel::Ok, Duration::from_secs(30)).unwrap();
-    let third_payload = frames.recv_timeout(Duration::from_secs(5)).unwrap();
+    // The ring-filling flushes above put their own frames on the wire; the
+    // "gamma" frame is the last one, since every earlier publish has been
+    // acked by the `wait` above.
+    let mut third_payload = frames.recv_timeout(Duration::from_secs(5)).unwrap();
+    while let Ok(next) = frames.recv_timeout(Duration::from_millis(250)) {
+        third_payload = next;
+    }
     // Both storage modes delta-encode: the rolled-back "bravo" must leave no
     // residue, so the third frame resumes from the watermark and ships only
     // "gamma" at delta_start == 1 (bravo's would-be slot), not id 2. In file mode
@@ -3531,13 +3613,15 @@ fn store_and_forward_append_timeout_rolls_back_symbols_and_keeps_chunk_disk() {
     let dir = TempDir::new().unwrap();
     check_store_and_forward_append_timeout_rolls_back_symbols_and_keeps_chunk(&sf_disk_extras(
         &dir,
-        "pool_reap=manual;max_in_flight=1;sf_append_deadline_millis=25;",
+        "pool_reap=manual;sf_max_segment_bytes=512;sf_max_total_bytes=1024;\
+         sf_append_deadline_millis=25;",
     ));
 }
 #[test]
 fn store_and_forward_append_timeout_rolls_back_symbols_and_keeps_chunk_memory() {
     check_store_and_forward_append_timeout_rolls_back_symbols_and_keeps_chunk(
-        "pool_reap=manual;max_in_flight=1;sf_append_deadline_millis=25;",
+        "pool_reap=manual;sf_max_segment_bytes=512;sf_max_total_bytes=1024;\
+         sf_append_deadline_millis=25;",
     );
 }
 

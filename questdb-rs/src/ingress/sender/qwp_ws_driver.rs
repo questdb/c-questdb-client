@@ -2703,8 +2703,75 @@ pub(crate) struct SendCursor {
     /// mapping is unchanged there. Reset by [`Self::restart`].
     catch_up_offset: u64,
     last_sent_wire_seq: Option<u64>,
-    in_flight: VecDeque<SentFrame>,
+    /// The sent-but-unacked frames, as an anchor plus a count rather than one
+    /// entry per frame.
+    ///
+    /// [`Self::commit_sent`] only accepts the frame matching `next_fsn` /
+    /// `next_wire_seq` and advances both by one, so the run is always
+    /// contiguous in both sequences and the anchor describes it completely.
+    /// A per-frame `VecDeque` used to be equivalent and bounded by
+    /// `max_in_flight`; with the window gone the run is bounded only by the
+    /// segment ring's byte budget, which would make it millions of entries of
+    /// derivable state that `sf_max_total_bytes` does not account for. This
+    /// matches the Java client, whose send loop also tracks acked frames by
+    /// FSN arithmetic and keeps no per-frame heap.
+    in_flight: InFlightRun,
     sfa_cursor: Option<SfaSendCursor>,
+}
+
+/// A contiguous run of sent-but-unacked frames. `len == 0` means empty and
+/// leaves the anchor fields meaningless.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct InFlightRun {
+    front_fsn: u64,
+    front_wire_seq: u64,
+    len: usize,
+}
+
+impl InFlightRun {
+    fn len(&self) -> usize {
+        self.len
+    }
+
+    fn clear(&mut self) {
+        self.len = 0;
+    }
+
+    /// Append the frame that [`SendCursor::commit_sent`] has just validated as
+    /// the next in both sequences.
+    fn push(&mut self, frame: &SentFrame) {
+        if self.len == 0 {
+            self.front_fsn = frame.fsn;
+            self.front_wire_seq = frame.wire_seq;
+        }
+        self.len += 1;
+    }
+
+    /// Drop every frame through `acked_fsn`, advancing the anchor by as many
+    /// places as were dropped. The FSN run is contiguous, so the count is
+    /// arithmetic rather than a walk.
+    fn ack_through(&mut self, acked_fsn: u64) {
+        if self.len == 0 || acked_fsn < self.front_fsn {
+            return;
+        }
+        let dropped = (acked_fsn - self.front_fsn + 1).min(self.len as u64);
+        self.front_fsn += dropped;
+        self.front_wire_seq += dropped;
+        self.len -= dropped as usize;
+    }
+
+    /// The wire sequence carrying `fsn`, or `None` when that FSN is not in the
+    /// run.
+    fn wire_seq_for_fsn(&self, fsn: u64) -> Option<u64> {
+        if self.len == 0 {
+            return None;
+        }
+        let offset = fsn.checked_sub(self.front_fsn)?;
+        if offset >= self.len as u64 {
+            return None;
+        }
+        Some(self.front_wire_seq + offset)
+    }
 }
 
 impl SendCursor {
@@ -2717,7 +2784,7 @@ impl SendCursor {
             next_wire_seq: 0,
             catch_up_offset: 0,
             last_sent_wire_seq: None,
-            in_flight: VecDeque::new(),
+            in_flight: InFlightRun::default(),
             sfa_cursor: None,
         }
     }
@@ -2778,7 +2845,7 @@ impl SendCursor {
             .checked_add(1)
             .ok_or(DriverError::Queue(QueueError::SequenceOverflow))?;
         self.last_sent_wire_seq = Some(frame.wire_seq);
-        self.in_flight.push_back(frame);
+        self.in_flight.push(&frame);
         if self
             .replay_target_fsn
             .is_some_and(|target_fsn| frame.fsn >= target_fsn)
@@ -2826,13 +2893,7 @@ impl SendCursor {
     }
 
     fn ack_through(&mut self, acked_fsn: u64) {
-        while self
-            .in_flight
-            .front()
-            .is_some_and(|frame| frame.fsn <= acked_fsn)
-        {
-            self.in_flight.pop_front();
-        }
+        self.in_flight.ack_through(acked_fsn);
     }
 
     fn restart<Q: PublicationLog>(&mut self, log: &Q) {
@@ -2862,10 +2923,7 @@ impl SendCursor {
     }
 
     fn wire_seq_for_fsn(&self, fsn: u64) -> Option<u64> {
-        self.in_flight
-            .iter()
-            .find(|frame| frame.fsn == fsn)
-            .map(|frame| frame.wire_seq)
+        self.in_flight.wire_seq_for_fsn(fsn)
     }
 }
 
@@ -5577,6 +5635,66 @@ mod tests {
         );
     }
 
+    fn sent(fsn: u64, wire_seq: u64) -> SentFrame {
+        SentFrame {
+            fsn,
+            wire_seq,
+            payload_len: 1,
+        }
+    }
+
+    /// The anchor-plus-count run must behave exactly like the per-frame deque
+    /// it replaced: same membership, same wire-seq mapping, same drop
+    /// semantics -- including the acks that land outside the run entirely.
+    #[test]
+    fn in_flight_run_tracks_a_contiguous_window_without_per_frame_state() {
+        let mut run = InFlightRun::default();
+        assert_eq!(run.len(), 0);
+        assert_eq!(run.wire_seq_for_fsn(0), None);
+
+        // A run anchored away from zero: fsn 10..=12 on wire seqs 4..=6.
+        for (fsn, wire_seq) in [(10, 4), (11, 5), (12, 6)] {
+            run.push(&sent(fsn, wire_seq));
+        }
+        assert_eq!(run.len(), 3);
+        assert_eq!(run.wire_seq_for_fsn(10), Some(4));
+        assert_eq!(run.wire_seq_for_fsn(12), Some(6));
+        assert_eq!(run.wire_seq_for_fsn(9), None, "below the run");
+        assert_eq!(run.wire_seq_for_fsn(13), None, "past the run");
+
+        // An ack below the front frees nothing.
+        run.ack_through(9);
+        assert_eq!(run.len(), 3);
+        assert_eq!(run.wire_seq_for_fsn(10), Some(4));
+
+        // A partial ack advances the anchor in both sequences.
+        run.ack_through(11);
+        assert_eq!(run.len(), 1);
+        assert_eq!(run.wire_seq_for_fsn(11), None, "acked frames leave the run");
+        assert_eq!(run.wire_seq_for_fsn(12), Some(6));
+
+        // An ack past the tail drains it without underflowing the count.
+        run.ack_through(99);
+        assert_eq!(run.len(), 0);
+        assert_eq!(run.wire_seq_for_fsn(12), None);
+
+        // Draining fully then re-pushing re-anchors rather than resuming.
+        run.push(&sent(40, 7));
+        assert_eq!(run.len(), 1);
+        assert_eq!(run.wire_seq_for_fsn(40), Some(7));
+        assert_eq!(run.wire_seq_for_fsn(13), None);
+
+        // `clear` (reconnect) drops the run whatever the anchor was.
+        run.clear();
+        assert_eq!(run.len(), 0);
+        assert_eq!(run.wire_seq_for_fsn(40), None);
+    }
+
+    /// The in-flight window is no longer reachable from configuration:
+    /// `max_in_flight` / `in_flight_window` are deprecated no-ops and every
+    /// production path now passes `UNBOUNDED_IN_FLIGHT`. This test constructs
+    /// the queue directly with a small window, so it keeps pinning the
+    /// mechanism while it remains in the code.
     #[test]
     fn drive_once_sends_until_max_in_flight() {
         let mut driver =

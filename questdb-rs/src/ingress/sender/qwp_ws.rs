@@ -63,7 +63,7 @@ use super::qwp_ws_orphan::{
 };
 use super::qwp_ws_ownership::QwpWsSenderError;
 use super::qwp_ws_publisher::{QwpWsReplayEncoder, qwp_ws_encoded_message_size_error};
-use super::qwp_ws_queue::{OutboundFrame, SentFrame};
+use super::qwp_ws_queue::{OutboundFrame, SentFrame, UNBOUNDED_IN_FLIGHT};
 use super::qwp_ws_sfa_queue::{
     SfaMemoryQueueOptions, SfaProducer, SfaProgressView, SfaQueueError, segment_payload_capacity,
     two_frame_segment_payload_capacity,
@@ -1642,7 +1642,10 @@ fn open_configured_qwp_ws_queue(qwp_ws: &QwpWsConfig) -> crate::Result<SfaSlotQu
     }
 
     let max_bytes = usize_from_config("sf_max_total_bytes", qwp_ws.sf_max_total_bytes())?;
-    let max_in_flight = *qwp_ws.max_in_flight;
+    // `max_in_flight` / `in_flight_window` are deprecated no-ops: the configured
+    // value is parsed and validated but no longer bounds anything. See
+    // `UNBOUNDED_IN_FLIGHT`.
+    let max_in_flight = UNBOUNDED_IN_FLIGHT;
 
     if let Some(sf_dir) = qwp_ws.sf_dir.as_ref() {
         return SfaSlotQueue::open(SfaSlotOptions {

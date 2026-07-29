@@ -251,6 +251,11 @@ fn qwpws_progress_config_parses_manual_and_background() {
     assert_specified_eq(&qwp_ws.progress, QwpWsProgress::Background);
 }
 
+/// Both keys are deprecated no-ops, but they must keep parsing and validating
+/// exactly as before so existing connect strings neither error nor change
+/// behavior. What the value no longer does — bound the publish admission or
+/// the wire window — is covered by the backpressure tests, which now provoke
+/// a stall through the segment ring's byte budget instead.
 #[cfg(feature = "sync-sender-qwp-ws")]
 #[test]
 fn qwpws_config_accepts_java_in_flight_window_alias() {
