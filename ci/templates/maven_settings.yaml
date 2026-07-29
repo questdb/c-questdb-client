@@ -52,9 +52,12 @@
 # how a scheduled fuzz run on a hosted macOS agent failed despite these
 # options). The Maven compile steps therefore also set
 # retryCountOnTaskFailure: 2, which makes Azure rerun the whole task on
-# failure. A rerun keeps everything already in the local repository and spends
-# minutes recompiling the modules built so far before it reaches the download
-# that failed, so it retries on a timescale that outlasts such an outage.
+# failure. A rerun keeps everything already in the local repository, so a
+# download that failed deep in the build is re-reached only after minutes of
+# recompiling the modules built so far — far more likely to outlast such an
+# outage than a back-to-back retry. A download that fails during the initial
+# dependency resolution is re-reached sooner, so the rerun helps most once the
+# build has made progress.
 #
 # The echo lines run without `set -x`. Azure treats any line containing
 # `##vso[` as a command and takes the text after `]` as the value; tracing the
