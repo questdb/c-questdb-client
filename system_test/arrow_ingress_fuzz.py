@@ -1426,7 +1426,6 @@ class TestArrowIngressSfa(afc.ArrowFuzzBase):
                  + self.BOUNCE_RESTART_TIMEOUT_S
                  + self.BOUNCE_LIFECYCLE_HEADROOM_S) * 1000)
             extras.update({
-                "initial_connect_retry": "sync",
                 "reconnect_max_duration_millis": str(client_budget_millis),
                 "reconnect_max_backoff_millis": "250",
                 "close_flush_timeout_millis": str(client_budget_millis),
