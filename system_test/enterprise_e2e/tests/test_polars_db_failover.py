@@ -87,6 +87,7 @@ def _connect_string(http_ports: list[int], *, request_durable_ack: bool = False,
         f"close_flush_timeout_millis={close_flush_timeout_ms}",
         "sender_pool_min=1",
         "sender_pool_max=1",
+        "lazy_connect=true",
     ]
     if request_durable_ack:
         parts.append("request_durable_ack=on")
@@ -102,9 +103,9 @@ def test_polars_db_flush_against_stale_primary_at_first_send_c_client_rust(
     scenario_dir: Path,
 ) -> None:
     """Stale primary: the configured primary is already gone before the FIRST
-    send. ``QuestDb::connect`` is lazy, so the first ``flush_polars_dataframe``
-    binds a connection -- a single call must reach the live successor (the
-    DataFrame path re-drives internally)."""
+    send. The pool is configured with ``lazy_connect=true``, so the first
+    ``flush_polars_dataframe`` binds a connection -- a single call must reach
+    the live successor (the DataFrame path re-drives internally)."""
     table = "trades_polars_db_stale_c_client_rust"
     row_count = 50
 
@@ -224,7 +225,8 @@ def test_polars_db_flush_across_inplace_role_switch_c_client_rust(
         LOG.info("flush_polars_dataframe rejected on read-only replica (expected): %s", exc)
     assert rejected, "flush_polars_dataframe was NOT rejected on the read-only replica"
 
-    # Drop the buffered probe row + reset the pool (CONNECT is lazy).
+    # Drop the buffered probe row + reset the pool (lazy_connect is set,
+    # so this does not open a connection against the replica).
     c_client_rust_column_sidecar.connect(cs)
 
     # Promote back to primary IN PLACE.

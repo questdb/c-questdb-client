@@ -71,10 +71,15 @@ namespace questdb
  * Those `<sender_id>-ingest-*` directories under `sf_dir` belong to the pool namespace;
  * use a unique `sender_id` for each pool sharing an `sf_dir`.
  *
- * Construction performs no blocking network I/O. In disk-backed
- * store-and-forward mode it may pre-open parked recovery senders whose initial
- * connect and replay run in the background; otherwise senders are opened on
- * first borrow.
+ * Construction connects eagerly by default: it pre-opens the warm minimums
+ * (`sender_pool_min` senders, `query_pool_min` readers), honoring
+ * `initial_connect_retry` for the senders (readers always connect
+ * fail-fast), so connect errors throw from the constructor.
+ * With `lazy_connect=true` it performs no blocking network I/O: senders
+ * buffer locally and connect in the background, and readers connect on
+ * first borrow. In disk-backed store-and-forward mode either variant may
+ * pre-open parked recovery senders whose initial connect and replay run in
+ * the background.
  *
  * Borrow/return operations are thread-safe while this owner remains alive.
  * Destruction is the final owner release: do not destroy the pool while
@@ -143,8 +148,9 @@ public:
      * Borrow a query reader from the pool, mirroring Rust
      * `QuestDb::borrow_reader`. Readers are pooled on a separate,
      * independently-capped free list with its own `query_pool_min` /
-     * `query_pool_max` budget; the reader pool is lazy (a
-     * connection opens on first borrow). The returned `reader` is
+     * `query_pool_max` budget; `query_pool_min` readers are pre-opened at
+     * construction (none under `lazy_connect=true`, where a connection
+     * opens on first borrow). The returned `reader` is
      * equivalent to a standalone one and returns itself to the pool on
      * destruction — unless `reader::drop_on_return()` was called, in which
      * case it is dropped. If the pool has already been closed by the time the

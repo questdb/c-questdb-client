@@ -25,13 +25,19 @@
 //! QWP ingestion connection pool.
 //!
 //! `QuestDb` is a thread-safe pool of store-and-forward producer handles to a
-//! single QuestDB QWP/WebSocket endpoint. The pool is lazy: `connect` performs
-//! no blocking network I/O. In disk-backed store-and-forward mode it may
-//! pre-open parked recovery senders whose initial connect and replay run in the
-//! background. Borrowing [`QuestDb::borrow_sender`] creates a local
-//! store-and-forward producer immediately and lets its background runner connect
-//! later, so callers can buffer while the server is absent. Direct ingestion
-//! senders and readers still open their transport on first borrow.
+//! single QuestDB QWP/WebSocket endpoint. By default (Java parity) `connect`
+//! is eager: it pre-opens the warm minimums (`sender_pool_min`,
+//! `query_pool_min`), honoring `initial_connect_retry` for the ingest
+//! senders (readers always connect fail-fast), so a down server fails the
+//! constructor fast. With `lazy_connect=true` the pool tolerates a down
+//! server at startup: `connect` performs no blocking network I/O,
+//! `query_pool_min` defaults to 0, and borrowing
+//! [`QuestDb::borrow_sender`] creates a local store-and-forward producer
+//! immediately whose background runner connects later, so callers can buffer
+//! while the server is absent. In disk-backed store-and-forward mode either
+//! variant may pre-open parked recovery senders whose initial connect and
+//! replay run in the background. Direct ingestion senders open their
+//! transport on first borrow.
 //! The pools auto-grow up to their configured caps (`sender_pool_max` /
 //! `query_pool_max`) on demand and (under `pool_reap=auto`)
 //! run a background thread that closes above-minimum idle entries after
@@ -276,6 +282,12 @@ struct DbInner {
     /// Managed ingestion slot range excluded from orphan scans so sibling
     /// senders do not adopt each other's live pool slots.
     managed_slot_exclusion: Option<QwpWsManagedSlotExclusion>,
+    /// Same-base managed slots left outside this pool's live index range by a
+    /// larger previous run. Snapshotted once before the pool is published and
+    /// reused by every sender build, so borrow-triggered growth never rescans
+    /// `sf_dir`. The pool namespace is exclusive: a same-base slot created
+    /// after connect is recovered by the next pool instance.
+    out_of_range_recovery_candidates: Vec<PathBuf>,
     idle_timeout: Duration,
     /// Pool-wide connection lifecycle event source (dispatcher + attempt
     /// counter + success-classification state). Fixed at connect — with a
@@ -529,24 +541,6 @@ fn parse_managed_slot_id(base: &str, name: &str) -> Option<usize> {
     managed_slot_exclusion(base, usize::MAX).parse_index(name)
 }
 
-fn managed_slot_recovery_candidates(inner: &DbInner) -> Vec<PathBuf> {
-    if !inner.sf_disk {
-        return Vec::new();
-    }
-    let Some(sf_dir) = inner.connector.sf_dir() else {
-        return Vec::new();
-    };
-    managed_slot_recovery_candidates_from(sf_dir, &inner.slot_base_id, inner.sender_pool_max)
-}
-
-fn managed_slot_recovery_candidates_from(
-    sf_dir: &Path,
-    base: &str,
-    pool_max: usize,
-) -> Vec<PathBuf> {
-    managed_slot_recovery_scan_from(sf_dir, base, pool_max).out_of_range
-}
-
 fn managed_slot_recovery_scan_from(
     sf_dir: &Path,
     base: &str,
@@ -579,9 +573,8 @@ fn managed_slot_recovery_scan_from(
                 path: slot_path,
             });
         } else {
-            // This scan runs for every managed sender build, so the warning may
-            // repeat for the same directory until one drainer drains it. A
-            // DbInner-level dedupe set is a follow-up, not part of this fix.
+            // The pool-lifetime snapshot emits this warning once per candidate
+            // instead of repeating it on every borrow-triggered sender build.
             log::warn!(
                 "adopting out-of-range store-and-forward slot `{}`; \
                  `<sender_id>-ingest-*` directories under \
@@ -602,18 +595,20 @@ fn managed_slot_recovery_scan_from(
 /// Recovery senders count toward the ingestion pool total like ordinary parked
 /// senders. They are reaped only after their queues are delivered and idle past
 /// the timeout, and drain on pool close via `drain_sfa_senders_bounded`. Each
-/// pre-opened sender also enrolls out-of-range managed slots in its
-/// orphan-drainer set, so those slots may begin replay at connect as well.
-fn preopen_recovery_senders(inner: &Arc<DbInner>) {
-    if !inner.sf_disk {
-        return;
-    }
-    let Some(sf_dir) = inner.connector.sf_dir() else {
-        return;
-    };
-    let scan = managed_slot_recovery_scan_from(sf_dir, &inner.slot_base_id, inner.sender_pool_max);
-    for candidate in scan.in_range {
-        preopen_recovery_sender(inner, candidate.index, &candidate.path, &scan.out_of_range);
+/// pre-opened sender also enrolls the pool's snapshotted out-of-range managed
+/// slots in its orphan-drainer set, so those slots may begin replay at connect
+/// as well.
+fn preopen_recovery_senders(
+    inner: &Arc<DbInner>,
+    in_range_candidates: &[ManagedSlotRecoveryCandidate],
+) {
+    for candidate in in_range_candidates {
+        preopen_recovery_sender(
+            inner,
+            candidate.index,
+            &candidate.path,
+            &inner.out_of_range_recovery_candidates,
+        );
     }
 }
 
@@ -637,7 +632,7 @@ fn preopen_recovery_sender(
         }
     };
 
-    match connect_sfa_pool_with_recovery_candidates(inner, Some(index), recovery_candidates) {
+    match connect_sfa_pool_with_recovery_candidates(inner, Some(index), recovery_candidates, true) {
         Ok(sender) => {
             let slot_index = slot.slot_index;
             {
@@ -670,13 +665,14 @@ impl QuestDb {
     ///
     /// | Key                  | Default | Meaning                                                          |
     /// |----------------------|---------|------------------------------------------------------------------|
-    /// | `sender_pool_min`    | 1       | Warm minimum of the ingestion pool once opened. |
+    /// | `sender_pool_min`    | 1       | Warm minimum of the ingestion pool, pre-opened at connect unless `lazy_connect=true`. |
     /// | `sender_pool_max`    | 4       | Hard cap on the ingestion pool; the direct column-sender pool used by DataFrame ingestion is capped separately at the same value. |
-    /// | `query_pool_min`     | 1       | Warm minimum of the reader pool once opened. |
+    /// | `query_pool_min`     | 1 (0 when lazy) | Warm minimum of the reader pool, pre-opened at connect unless `lazy_connect=true`. |
     /// | `query_pool_max`     | 4       | Hard cap on the reader pool. |
     /// | `acquire_timeout_ms` | 5000    | How long an at-cap borrow waits for a return before failing; `0` fails immediately. |
     /// | `idle_timeout_ms`    | 60000   | Above-minimum idle connections are closed after this long. |
     /// | `pool_reap`          | `auto`  | `auto` runs a background reaper; `manual` requires `reap_idle`. |
+    /// | `lazy_connect`       | `false` | Tolerate a down server at startup: connect opens nothing, senders buffer and connect in the background, readers connect on first borrow. |
     ///
     /// Key names and defaults match the Java client's `QuestDBBuilder`; the
     /// Java-only lifecycle keys (`max_lifetime_ms`, `housekeeper_interval_ms`,
@@ -696,15 +692,30 @@ impl QuestDb {
     /// (non-SF) connection — used by DataFrame ingestion — see
     /// [`Self::borrow_direct_column_sender`].
     ///
-    /// Pools are **lazy**: `connect` performs no blocking network I/O. In
-    /// disk-backed store-and-forward mode, it may pre-open parked recovery
-    /// senders whose initial connect and replay run in the background. The
-    /// store-and-forward ingestion pool creates a local producer on first borrow
-    /// and starts its initial connect in the background, so the borrower can
-    /// buffer immediately even while the server is absent. Direct senders and
-    /// readers still open their transport on first borrow. `sender_pool_min` /
-    /// `query_pool_min` are the warm minimums the reaper keeps once entries
-    /// have been opened.
+    /// Startup matches the Java client. By default `connect` is **eager**:
+    /// it pre-opens `sender_pool_min` ingest senders — honoring only an
+    /// explicitly set `initial_connect_retry`: `off` (the default) fails
+    /// fast, `sync` retries within the reconnect budget, `async` connects in
+    /// the background — and `query_pool_min` readers, which have no retry
+    /// mode and always connect synchronously, failing fast; `sync` governs
+    /// only the ingest side. Reconnect-to-sync promotion applies only to
+    /// standalone [`SenderBuilder::build`]; pools honor only an explicitly
+    /// set mode. Bare `initial_connect_retry=async` is likewise not a
+    /// non-blocking startup while `query_pool_min > 0`; `lazy_connect=true`
+    /// is. Growth borrows beyond the minimum honor the same rules.
+    ///
+    /// With `lazy_connect=true` the pool tolerates a down server at startup:
+    /// `connect` performs no blocking network I/O, `query_pool_min` defaults
+    /// to 0 (readers connect lazily on first use), and every ingest borrow
+    /// creates its local store-and-forward producer immediately and connects
+    /// in the background, so the borrower can buffer while the server is
+    /// absent. An explicit blocking `initial_connect_retry` alongside
+    /// `lazy_connect=true` is rejected as a configuration conflict. In
+    /// disk-backed store-and-forward mode, either variant may pre-open parked
+    /// recovery senders whose initial connect and replay run in the
+    /// background. Direct senders open their transport on first borrow.
+    /// `sender_pool_min` / `query_pool_min` are the warm minimums the reaper
+    /// keeps.
     ///
     /// # Store-and-forward durability
     ///
@@ -803,7 +814,12 @@ impl QuestDb {
         let sf_disk = parsed.sf_disk;
         let pool_cfg = parsed.pool;
 
-        let builder = SenderBuilder::from_conf(conf)?;
+        let mut builder = SenderBuilder::from_conf(conf)?;
+        if pool_cfg.lazy_connect {
+            // Java's lazy_connect injects an async initial connect into the
+            // ingest config once; every pooled sender then inherits it.
+            builder.force_async_initial_connect();
+        }
         let buffer_max_name_len = builder.configured_max_name_len();
         let connector = builder.build_qwp_ws_connector()?;
         let health = QwpWsHostHealthTracker::new(connector.endpoint_count());
@@ -816,6 +832,25 @@ impl QuestDb {
         } else {
             None
         };
+        // Snapshot managed recovery before any sender is built. In-range
+        // entries are retained locally for connect-time pre-open; out-of-range
+        // entries live on DbInner and are reused by prewarm and later growth.
+        // This matches Java SenderPool's cached out-of-range worklist and keeps
+        // the borrow path free of top-level sf_dir scans.
+        let recovery_scan = if sf_disk {
+            connector
+                .sf_dir()
+                .map(|sf_dir| {
+                    managed_slot_recovery_scan_from(sf_dir, &slot_base_id, pool_cfg.sender_pool_max)
+                })
+                .unwrap_or_default()
+        } else {
+            ManagedSlotRecoveryScan::default()
+        };
+        let ManagedSlotRecoveryScan {
+            in_range: in_range_recovery_candidates,
+            out_of_range: out_of_range_recovery_candidates,
+        } = recovery_scan;
 
         // Start empty; connect-time recovery may pre-open dirty disk-SF slots
         // after `inner` exists, otherwise the pools open on first borrow.
@@ -837,6 +872,7 @@ impl QuestDb {
             sf_disk,
             slot_base_id,
             managed_slot_exclusion,
+            out_of_range_recovery_candidates,
             idle_timeout: pool_cfg.idle_timeout,
             state: Mutex::new(if sf_disk {
                 PoolState::with_disk_slots(pool_cfg.sender_pool_max)
@@ -858,8 +894,6 @@ impl QuestDb {
             conn_events: Arc::new(conn_events),
         });
 
-        preopen_recovery_senders(&inner);
-
         let reaper = match pool_cfg.pool_reap {
             PoolReap::Auto => Some(spawn_reaper(Arc::clone(&inner)).map_err(|err| {
                 inner.shutdown.store(true, Ordering::SeqCst);
@@ -871,7 +905,23 @@ impl QuestDb {
             PoolReap::Manual => None,
         };
 
-        Ok(Self { inner, reaper })
+        let db = Self { inner, reaper };
+        // Prewarm BEFORE recovery pre-open, matching the Java client's order.
+        // Prewarm adopts each dirty in-range slot through its deterministic
+        // managed id and enrolls the snapshotted out-of-range candidates, so
+        // its foreground connect genuinely probes the server; recovery must
+        // not run first or its background-connecting (forced-async) senders
+        // would sit in the free list and satisfy the warm minimum without any
+        // connect, silently voiding the eager fail-fast contract whenever a
+        // previous run left queued data behind. On error the drop of `db`
+        // closes whatever was opened.
+        if !pool_cfg.lazy_connect {
+            prewarm_min_connections(&db)?;
+        }
+        // Recovery pre-open then re-adopts any dirty slots prewarm did not
+        // claim; their initial connect and replay run in the background.
+        preopen_recovery_senders(&db.inner, &in_range_recovery_candidates);
+        Ok(db)
     }
 
     /// Create a caller-owned QWP/WebSocket row buffer using this pool's
@@ -899,6 +949,13 @@ impl QuestDb {
     /// releases its lock; failing that, wait up to `acquire_timeout_ms` for a
     /// return (`acquire_timeout_ms=0` fails fast); failing that, return
     /// `InvalidApiCall`.
+    ///
+    /// A borrow that opens a new connection honors `initial_connect_retry`:
+    /// `off` (the default) connects synchronously and fails fast, `sync`
+    /// retries within the reconnect budget before returning. Under
+    /// `lazy_connect=true` the connection starts in the background instead,
+    /// so the borrow succeeds even while the server is away; see
+    /// [`Self::connect`].
     pub fn borrow_sender(&self) -> Result<BorrowedSender<'_>> {
         let cs = self.pick_sender()?;
         Ok(BorrowedSender(SenderHandle::new(self, cs)))
@@ -2645,15 +2702,68 @@ fn pick_direct_sender(inner: &Arc<DbInner>) -> Result<PooledSender<DirectSenderC
     )
 }
 
+/// Java-parity eager startup: open ingest senders until the pool holds
+/// `sender_pool_min` and readers until it holds `query_pool_min`, honoring
+/// an explicitly set `initial_connect_retry`. Runs BEFORE recovery pre-open,
+/// so every warm sender performs a real foreground connect — adopting dirty
+/// disk slots (and replaying them) along the way via the borrow path's
+/// recovery candidates. All warm borrows are held at once so each opens a
+/// distinct connection, then returned to the free lists; on the first
+/// failure the already-opened connections are returned and the error
+/// propagates to `connect()`.
+fn prewarm_min_connections(db: &QuestDb) -> Result<()> {
+    let inner = &db.inner;
+    let mut warm = Vec::new();
+    let mut outcome: Result<()> = Ok(());
+    for _ in 0..inner.sender_pool_min {
+        match pick_sfa_sender(inner) {
+            Ok(sender) => warm.push(sender),
+            Err(err) => {
+                outcome = Err(err);
+                break;
+            }
+        }
+    }
+    for picked in warm {
+        return_sfa_to_pool(inner, picked.sender, picked.slot_index);
+    }
+    outcome?;
+    #[cfg(feature = "_egress")]
+    {
+        let mut warm = Vec::new();
+        let mut outcome: Result<()> = Ok(());
+        for _ in 0..inner.query_pool_min {
+            match db.pick_reader() {
+                Ok(reader) => warm.push(reader),
+                Err(err) => {
+                    outcome = Err(err);
+                    break;
+                }
+            }
+        }
+        for reader in warm {
+            return_reader_to_pool(inner, reader, false);
+        }
+        outcome?;
+    }
+    Ok(())
+}
+
 fn connect_sfa_pool(inner: &Arc<DbInner>, slot_index: Option<usize>) -> Result<PooledSenderCore> {
-    let recovery_candidates = managed_slot_recovery_candidates(inner);
-    connect_sfa_pool_with_recovery_candidates(inner, slot_index, &recovery_candidates)
+    // The connector already carries the pool's resolved initial-connect mode.
+    connect_sfa_pool_with_recovery_candidates(
+        inner,
+        slot_index,
+        &inner.out_of_range_recovery_candidates,
+        false,
+    )
 }
 
 fn connect_sfa_pool_with_recovery_candidates(
     inner: &Arc<DbInner>,
     slot_index: Option<usize>,
     recovery_candidates: &[PathBuf],
+    force_async_initial_connect: bool,
 ) -> Result<PooledSenderCore> {
     let sender_id = slot_index.map(|index| managed_slot_id(&inner.slot_base_id, index));
     let state = inner
@@ -2664,6 +2774,7 @@ fn connect_sfa_pool_with_recovery_candidates(
             recovery_candidates,
             Arc::clone(&inner.conn_events),
             Arc::clone(&inner.rejections),
+            force_async_initial_connect,
         )
         .map_err(|err| {
             crate::Error::new(
@@ -3103,9 +3214,9 @@ fn reap_idle_direct_senders(inner: &DbInner) -> usize {
 
 #[cfg(feature = "_egress")]
 fn reap_idle_readers(inner: &DbInner) -> usize {
-    // The reader pool is lazy-init (no pre-population at connect);
-    // `query_pool_min` acts purely as the reaper's floor once readers
-    // have been opened.
+    // `query_pool_min` readers are pre-opened at connect by default
+    // (none under lazy_connect, where the pool fills on first borrow);
+    // either way `query_pool_min` is the reaper's floor here.
     let to_drop: Vec<Reader> = {
         let mut state = lock_reader_state(&inner.reader_state);
         let mut to_drop = Vec::new();
@@ -3179,7 +3290,7 @@ mod tests {
 
     use tempfile::TempDir;
 
-    use super::{SlotReservations, managed_slot_recovery_candidates_from};
+    use super::{SlotReservations, managed_slot_recovery_scan_from};
 
     fn dirty_slot(root: &std::path::Path, name: &str) {
         let slot = root.join(name);
@@ -3196,7 +3307,7 @@ mod tests {
         dirty_slot(temp.path(), &format!("default-{}-2", "col"));
         dirty_slot(temp.path(), &format!("default-{}-2", "row"));
 
-        let mut actual = managed_slot_recovery_candidates_from(temp.path(), "default", 2);
+        let mut actual = managed_slot_recovery_scan_from(temp.path(), "default", 2).out_of_range;
         actual.sort();
 
         assert_eq!(actual, vec![temp.path().join("default-ingest-2")]);

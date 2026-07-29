@@ -67,19 +67,29 @@ typedef struct questdb_db questdb_db;
  * ------------------------------------------------------------------------- */
 
 /**
- * Open a connection pool. This call performs no blocking network I/O. In
- * disk-backed store-and-forward mode it may pre-open parked recovery senders;
- * their initial connect and replay run in the background. Otherwise, the first
- * borrow opens a sender, so auth / TLS / connect errors usually surface from
- * the borrow, not from here. `sender_pool_min` (default 1) is the warm
- * minimum the reaper keeps once connections have been opened.
+ * Open a connection pool. By default this connects eagerly: it pre-opens the
+ * warm minimums (`sender_pool_min` senders, `query_pool_min` readers),
+ * honoring `initial_connect_retry` for the senders (readers always connect
+ * fail-fast), so auth / TLS / connect errors surface from this call.
+ * With `lazy_connect=true` it performs no blocking network
+ * I/O: senders buffer locally and connect in the background, readers
+ * (`query_pool_min` defaults to 0) connect on first borrow, and errors
+ * surface there instead. In disk-backed store-and-forward mode either
+ * variant may pre-open parked recovery senders; their initial connect and
+ * replay run in the background. `sender_pool_min` (default 1) is the warm
+ * minimum the reaper keeps.
  *
  * `conf` is a `ws::` / `wss::` connect string. Pool-specific keys (aligned
  * with the Java client's `QuestDBBuilder`):
- *   `sender_pool_min`      (default 1)    warm/min sender connections;
+ *   `sender_pool_min`      (default 1)    warm/min sender connections,
+ *                                         pre-opened at connect unless
+ *                                         `lazy_connect=true`;
  *   `sender_pool_max`      (default 4)    cap on the ingestion and direct
  *                                         pools, each capped independently;
- *   `query_pool_min`       (default 1)    warm/min reader connections;
+ *   `query_pool_min`       (default 1; 0 when lazy)
+ *                                         warm/min reader connections,
+ *                                         pre-opened at connect unless
+ *                                         `lazy_connect=true`;
  *   `query_pool_max`       (default 4)    cap on the reader pool;
  *   `acquire_timeout_ms`   (default 5000) how long a borrow at cap waits for
  *                                         a return before failing; 0 fails
@@ -88,7 +98,13 @@ typedef struct questdb_db questdb_db;
  *                                         reap above-minimum idle
  *                                         connections;
  *   `pool_reap`            (`auto`|`manual`, default `auto`)
- *                                         background reaper opt-in.
+ *                                         background reaper opt-in;
+ *   `lazy_connect`         (default false)
+ *                                         tolerate a down server at startup:
+ *                                         connect opens nothing, senders
+ *                                         buffer and connect in the
+ *                                         background, readers connect on
+ *                                         first borrow.
  *
  * Disk-backed store-and-forward is opt-in: `sf_dir` selects disk-backed queues
  * for the public ingestion pool. `sender_id` names the slot *base* (default

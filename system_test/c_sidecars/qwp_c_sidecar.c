@@ -24,10 +24,10 @@
  *
  * STATS note: the C FFI exposes the durable-ack watermark
  * (line_sender_qwpws_acked_fsn) but NOT the qwp_ws_totals counters
- * (sent/acks/reconnAttempts/reconnSucc/serverErrors). We emit the real
- * `acked` and zero the rest -- the same fallback shape the Rust sidecar
- * uses when totals are unavailable (qwp_sidecar.rs:236-238). The
- * binding-variant tests do not rely on the zeroed fields.
+ * (sent/replayed/startupSent/acks/reconnAttempts/reconnSucc/serverErrors).
+ * We emit the real `acked` and zero the rest -- the same fallback shape the
+ * Rust sidecar uses when totals are unavailable. The binding-variant tests do
+ * not rely on the zeroed fields.
  */
 
 #define _POSIX_C_SOURCE 200809L
@@ -265,9 +265,10 @@ static void handle_stats(void)
         reply_err("no sender");
         return;
     }
-    /* Only the durable-ack watermark is exported by the C FFI; the
-     * sent / acks / reconnect / serverErrors counters have no FFI wrapper.
-     * Emit the real acked and zero the rest, like the Rust sidecar fallback. */
+    /* Only the durable-ack watermark is exported by the C FFI; the sent /
+     * replayed / startupSent / acks / reconnect / serverErrors counters have
+     * no FFI wrapper. Emit the real acked and zero the rest, like the Rust
+     * sidecar fallback. */
     line_sender_error* err = NULL;
     line_sender_qwpws_fsn fsn = {false, 0};
     long long acked = -1;
@@ -284,7 +285,8 @@ static void handle_stats(void)
     snprintf(
         payload,
         sizeof(payload),
-        "acked=%lld sent=0 acks=0 reconnAttempts=0 reconnSucc=0 serverErrors=0",
+        "acked=%lld sent=0 replayed=0 startupSent=0 acks=0 "
+        "reconnAttempts=0 reconnSucc=0 serverErrors=0",
         acked);
     reply_ok(payload);
 }

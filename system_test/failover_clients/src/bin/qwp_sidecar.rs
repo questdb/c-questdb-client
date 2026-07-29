@@ -23,6 +23,7 @@
 //!   FLUSH                                     -> OK <fsn> | ERR <msg>
 //!   AWAIT_ACKED <fsn> <timeout_ms>            -> OK true|false | ERR <msg>
 //!   STATS                                     -> OK acked=N sent=N acks=N
+//!                                                replayed=N startupSent=N
 //!                                                reconnAttempts=N reconnSucc=N
 //!                                                serverErrors=N
 //!   CLOSE                                     -> OK | ERR <msg>
@@ -32,17 +33,18 @@
 //! loop keeps reading; only an internal fault (poisoned stdout, etc.)
 //! exits with status 4.
 //!
-//! STATS coverage: emits the same six fields the Java sidecar reports
-//! (`acked`, `sent`, `acks`, `reconnAttempts`, `reconnSucc`, `serverErrors`).
-//! `acked` comes from `Sender::acked_fsn`; the rest come from
-//! `Sender::qwp_ws_totals` and are bumped at the same QWP/WebSocket
-//! event sites as their Java counterparts.
+//! STATS coverage: emits the same eight fields the Java sidecar reports
+//! (`acked`, `sent`, `replayed`, `startupSent`, `acks`, `reconnAttempts`,
+//! `reconnSucc`, `serverErrors`). `acked` comes from `Sender::acked_fsn`;
+//! `startupSent` is sidecar phase state; the rest come from
+//! `Sender::qwp_ws_totals` and are bumped at the same QWP/WebSocket event sites
+//! as their Java counterparts.
 
 use std::io::{BufRead, BufReader, Write};
 use std::process;
 use std::time::Duration;
 
-use questdb::ingress::{AckLevel, Buffer, Sender, TimestampMicros};
+use questdb::ingress::{AckLevel, Buffer, QwpWsTotals, Sender, TimestampMicros};
 
 fn main() {
     let stdin = std::io::stdin();
@@ -95,6 +97,7 @@ struct State {
     sender: Option<Sender>,
     buf: Option<Buffer>,
     request_durable_ack: bool,
+    producer_published: bool,
 }
 
 impl State {
@@ -108,6 +111,7 @@ impl State {
         }
         self.buf = None;
         self.request_durable_ack = false;
+        self.producer_published = false;
     }
 }
 
@@ -180,6 +184,9 @@ fn handle(line: &str, state: &mut State, out: &mut impl Write) -> Result<(), Str
                 // so -1 is the closest equivalent sentinel.
                 .map(|n| n as i64)
                 .unwrap_or(-1);
+            // Match Java's phase marker: only a successful producer FLUSH ends
+            // the startup-recovery observation window.
+            state.producer_published = true;
             reply_ok(out, &fsn.to_string())
         }
         "AWAIT_ACKED" => {
@@ -232,22 +239,12 @@ fn handle(line: &str, state: &mut State, out: &mut impl Write) -> Result<(), Str
                 .flatten()
                 .map(|n| n as i64)
                 .unwrap_or(-1);
-            let payload = match sender.qwp_ws_totals() {
-                Ok(t) => format!(
-                    "acked={acked} sent={} acks={} reconnAttempts={} reconnSucc={} serverErrors={}",
-                    t.frames_sent,
-                    t.acks,
-                    t.reconnect_attempts,
-                    t.reconnects_succeeded,
-                    t.server_errors,
-                ),
-                Err(_) => format!(
-                    "acked={acked} sent=0 acks=0 reconnAttempts=0 reconnSucc=0 serverErrors=0"
-                ),
-            };
+            let totals = sender.qwp_ws_totals().ok();
+            let payload = stats_payload(acked, totals.as_ref(), state.producer_published);
             reply_ok(out, &payload)
         }
         "CLOSE" => {
+            state.producer_published = false;
             if let Some(mut s) = state.sender.take() {
                 // close_drain is the Rust analogue of Java's
                 // Sender.close(): flush, wait for ACKs up to the
@@ -265,6 +262,26 @@ fn handle(line: &str, state: &mut State, out: &mut impl Write) -> Result<(), Str
             process::exit(0);
         }
         _ => Err(format!("unknown verb: {verb}")),
+    }
+}
+
+fn stats_payload(acked: i64, totals: Option<&QwpWsTotals>, producer_published: bool) -> String {
+    match totals {
+        Some(t) => {
+            let startup_sent = if producer_published { 0 } else { t.frames_sent };
+            format!(
+                "acked={acked} sent={} replayed={} startupSent={startup_sent} acks={} reconnAttempts={} reconnSucc={} serverErrors={}",
+                t.frames_sent,
+                t.frames_replayed,
+                t.acks,
+                t.reconnect_attempts,
+                t.reconnects_succeeded,
+                t.server_errors,
+            )
+        }
+        None => format!(
+            "acked={acked} sent=0 replayed=0 startupSent=0 acks=0 reconnAttempts=0 reconnSucc=0 serverErrors=0"
+        ),
     }
 }
 
@@ -292,4 +309,33 @@ fn sanitize(s: &str) -> String {
     // Newlines in an ERR message would break the line-based protocol.
     // Match the Java sidecar's substitution: CR → space, LF → '|'.
     s.replace('\r', " ").replace('\n', "|")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn stats_payload_matches_the_eight_field_enterprise_contract() {
+        let mut totals = QwpWsTotals::default();
+        totals.frames_sent = 7;
+        totals.frames_replayed = 3;
+        totals.acks = 5;
+        totals.reconnect_attempts = 2;
+        totals.reconnects_succeeded = 1;
+        totals.server_errors = 4;
+
+        assert_eq!(
+            stats_payload(6, Some(&totals), false),
+            "acked=6 sent=7 replayed=3 startupSent=7 acks=5 reconnAttempts=2 reconnSucc=1 serverErrors=4"
+        );
+        assert_eq!(
+            stats_payload(6, Some(&totals), true),
+            "acked=6 sent=7 replayed=3 startupSent=0 acks=5 reconnAttempts=2 reconnSucc=1 serverErrors=4"
+        );
+        assert_eq!(
+            stats_payload(-1, None, false),
+            "acked=-1 sent=0 replayed=0 startupSent=0 acks=0 reconnAttempts=0 reconnSucc=0 serverErrors=0"
+        );
+    }
 }

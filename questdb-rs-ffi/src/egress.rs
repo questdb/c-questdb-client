@@ -3549,10 +3549,11 @@ use crate::column_sender::questdb_db;
 /// Reader connections are pooled separately from writer connections
 /// with their own `query_pool_min` / `query_pool_max` budget
 /// (senders use `sender_pool_min` / `sender_pool_max`; both pools
-/// share `acquire_timeout_ms` and `idle_timeout_ms`). The reader pool is lazy: a
-/// connection is opened on first borrow, not at `questdb_db_connect`
-/// time, so callers that never use egress don't pay any handshake
-/// cost.
+/// share `acquire_timeout_ms` and `idle_timeout_ms`). `query_pool_min`
+/// readers are pre-opened at `questdb_db_connect` time by default; with
+/// `lazy_connect=true` the reader pool is lazy (`query_pool_min` defaults
+/// to 0, a connection opens on first borrow), so callers that never use
+/// egress pay no handshake cost.
 ///
 /// The returned `qwp_reader*` is equivalent to one constructed via
 /// `qwp_reader_from_conf`: cursor lifecycle, stat getters, and

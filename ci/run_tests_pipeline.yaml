@@ -342,13 +342,14 @@ stages:
             displayName: "Resolve Rust toolchain"
           - template: templates/compile.yaml
           - template: templates/clone_questdb.yaml
+          - template: templates/maven_settings.yaml
           - task: Maven@3
             displayName: "Compile QuestDB"
             inputs:
               mavenPOMFile: "questdb/pom.xml"
               javaHomeOption: "Path"
               jdkDirectory: "$(JAVA_HOME)"
-              options: "-DskipTests -Pbuild-web-console$(CLIENT_PROFILE)"
+              options: "-s $(MAVEN_SETTINGS_FILE) -DskipTests -Pbuild-web-console$(CLIENT_PROFILE) $(MAVEN_RUN_OPTS)"
           - script: |
               python3 system_test/test.py run --repo ./questdb -v
             displayName: "integration test"
@@ -416,13 +417,14 @@ stages:
               echo "##vso[task.setvariable variable=JAVA_HOME]$JDK_HOME"
             displayName: "Resolve JDK 25"
           - template: templates/clone_questdb.yaml
+          - template: templates/maven_settings.yaml
           - task: Maven@3
             displayName: "Compile QuestDB"
             inputs:
               mavenPOMFile: "questdb/pom.xml"
               javaHomeOption: "Path"
               jdkDirectory: "$(JAVA_HOME)"
-              options: "-DskipTests -Pbuild-web-console$(CLIENT_PROFILE)"
+              options: "-s $(MAVEN_SETTINGS_FILE) -DskipTests -Pbuild-web-console$(CLIENT_PROFILE) $(MAVEN_RUN_OPTS)"
           - script: |
               python3 system_test/test.py run --repo ./questdb TestQwpWsFuzz -v
             displayName: "TestQwpWsFuzz"
@@ -516,13 +518,14 @@ stages:
             displayName: "Resolve Rust toolchain"
           - template: templates/compile.yaml
           - template: templates/clone_questdb.yaml
+          - template: templates/maven_settings.yaml
           - task: Maven@3
             displayName: "Compile QuestDB"
             inputs:
               mavenPOMFile: "questdb/pom.xml"
               javaHomeOption: "Path"
               jdkDirectory: "$(JAVA_HOME)"
-              options: "-DskipTests -Pbuild-web-console$(CLIENT_PROFILE)"
+              options: "-s $(MAVEN_SETTINGS_FILE) -DskipTests -Pbuild-web-console$(CLIENT_PROFILE) $(MAVEN_RUN_OPTS)"
           - script: |
               python3 system_test/test.py run --repo ./questdb TestQwpWsFuzz -v
             displayName: "TestQwpWsFuzz"
@@ -567,6 +570,7 @@ stages:
             submodules: false
           - template: templates/compile.yaml
           - template: templates/clone_questdb.yaml
+          - template: templates/maven_settings.yaml
           - script: |
               set -euo pipefail
               JDK_URL="https://api.adoptium.net/v3/binary/latest/25/ga/linux/x64/jdk/hotspot/normal/eclipse"
@@ -580,7 +584,7 @@ stages:
             inputs:
               mavenPOMFile: "questdb/pom.xml"
               jdkVersionOption: "default"
-              options: "-DskipTests -Pbuild-web-console$(CLIENT_PROFILE)"
+              options: "-s $(MAVEN_SETTINGS_FILE) -DskipTests -Pbuild-web-console$(CLIENT_PROFILE) $(MAVEN_RUN_OPTS)"
           - script: |
               set -euxo pipefail
               cd questdb-rs

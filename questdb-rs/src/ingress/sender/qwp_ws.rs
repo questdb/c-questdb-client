@@ -63,7 +63,7 @@ use super::qwp_ws_orphan::{
 };
 use super::qwp_ws_ownership::QwpWsSenderError;
 use super::qwp_ws_publisher::{QwpWsReplayEncoder, qwp_ws_encoded_message_size_error};
-use super::qwp_ws_queue::OutboundFrame;
+use super::qwp_ws_queue::{OutboundFrame, SentFrame};
 use super::qwp_ws_sfa_queue::{
     SfaMemoryQueueOptions, SfaProducer, SfaProgressView, SfaQueueError, segment_payload_capacity,
     two_frame_segment_payload_capacity,
@@ -337,6 +337,7 @@ struct QwpWsPendingConnect {
 
 #[derive(Debug, Clone, Copy)]
 enum RunnerColdEffect {
+    Sent { frame: SentFrame, replayed: bool },
     Event(DriverEvent),
     CompletedThrough { fsn: u64, wire_seq: u64 },
 }
@@ -1020,12 +1021,9 @@ where
         let (frame, send_result) = self.send_core.send_frame(outbound);
         match send_result {
             Ok(send_result) => match self.send_core.finish_send_result_hot(frame, send_result) {
-                Ok(QwpWsHotSendProgress::NoResponse { frame }) => {
+                Ok(QwpWsHotSendProgress::NoResponse { frame, replayed }) => {
                     self.cold_effects
-                        .push_back(RunnerColdEffect::Event(DriverEvent::Sent {
-                            fsn: frame.fsn,
-                            wire_seq: frame.wire_seq,
-                        }));
+                        .push_back(RunnerColdEffect::Sent { frame, replayed });
                     if self.flush_cold_effects(shared) == RunnerStep::Stop {
                         return RunnerStep::Stop;
                     }
@@ -1033,20 +1031,22 @@ where
                     self.backpressure.notify_all();
                     step
                 }
-                Ok(QwpWsHotSendProgress::Response { frame, response }) => {
+                Ok(QwpWsHotSendProgress::Response {
+                    frame,
+                    replayed,
+                    response,
+                }) => {
                     self.cold_effects
-                        .push_back(RunnerColdEffect::Event(DriverEvent::Sent {
-                            fsn: frame.fsn,
-                            wire_seq: frame.wire_seq,
-                        }));
+                        .push_back(RunnerColdEffect::Sent { frame, replayed });
                     self.finish_response(shared, stop, response)
                 }
-                Ok(QwpWsHotSendProgress::TransportFailure { frame, failure }) => {
+                Ok(QwpWsHotSendProgress::TransportFailure {
+                    frame,
+                    replayed,
+                    failure,
+                }) => {
                     self.cold_effects
-                        .push_back(RunnerColdEffect::Event(DriverEvent::Sent {
-                            fsn: frame.fsn,
-                            wire_seq: frame.wire_seq,
-                        }));
+                        .push_back(RunnerColdEffect::Sent { frame, replayed });
                     if self.flush_cold_effects(shared) == RunnerStep::Stop {
                         return RunnerStep::Stop;
                     }
@@ -1484,6 +1484,9 @@ where
     {
         while let Some(effect) = self.cold_effects.pop_front() {
             match effect {
+                RunnerColdEffect::Sent { frame, replayed } => {
+                    store.record_sent_event(frame, replayed);
+                }
                 RunnerColdEffect::Event(event) => store.record_driver_event(event),
                 RunnerColdEffect::CompletedThrough { fsn, wire_seq } => {
                     store.record_completed_through_event(fsn, wire_seq);
@@ -3135,9 +3138,11 @@ pub(crate) fn connect_qwp_ws_background_state(
         // replayed and the I/O thread re-registers the whole dictionary via a
         // catch-up frame on reconnect); file mode iff the persisted side-file
         // opened (its recovered entries seed the encoder dict + driver mirror so
-        // ids continue above them). This branch runs only for the standalone
-        // ingress sender -- the pooled core forces async connect -- so the
-        // encoder is live here.
+        // ids continue above them). This branch runs for the standalone
+        // ingress sender and for pool borrows whose initial connect is not
+        // forced async — any non-lazy pool, including the default Off mode;
+        // the encoder is live only for the standalone sender and stays
+        // dormant for the pooled core.
         // Encoder and mirror enable together to stay in lockstep.
         let delta_dict_enabled = parts.delta_dict_enabled;
         parts.encoder.set_delta_dict_enabled(delta_dict_enabled);
@@ -5366,6 +5371,17 @@ mod tests {
         reconnect_started_rx
             .recv_timeout(Duration::from_secs(5))
             .unwrap();
+
+        // The sent event is flushed before reconnect I/O starts. Pin the
+        // background-runner counter path while reconnect is deliberately
+        // blocked so no replay can race this assertion.
+        {
+            let store = runner.lock_shared().unwrap();
+            let counters = store.counters();
+            assert_eq!(counters.total_frames_sent, 1);
+            assert_eq!(counters.total_frames_replayed, 0);
+        }
+
         release_reconnect_tx.send(()).unwrap();
 
         let events = {
