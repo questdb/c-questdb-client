@@ -2263,6 +2263,8 @@ mod tests {
         assert!(!queue.hot_spare_installed());
     }
 
+    /// Production non-durable queues use `UNBOUNDED_IN_FLIGHT`; this direct
+    /// queue test pins the count gate retained for durable-ACK backlog admission.
     #[test]
     fn memory_queue_backpressures_at_max_in_flight_before_capacity() {
         let mut queue = SfaFrameQueue::open_memory(memory_options(128, 256, 2)).unwrap();

@@ -2963,6 +2963,53 @@ pub(crate) trait QwpWsCoreTransport {
 }
 
 #[cfg(feature = "sync-sender-qwp-ws")]
+/// Contiguous sent-but-unacknowledged wire sequences without per-frame heap.
+#[derive(Debug, Default)]
+struct PendingWireSequenceRun {
+    front: u64,
+    len: u64,
+}
+
+#[cfg(feature = "sync-sender-qwp-ws")]
+impl PendingWireSequenceRun {
+    fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    fn clear(&mut self) {
+        self.len = 0;
+    }
+
+    fn push(&mut self, wire_seq: u64) {
+        if self.len == 0 {
+            self.front = wire_seq;
+        } else {
+            debug_assert_eq!(self.front.checked_add(self.len), Some(wire_seq));
+        }
+        self.len = self
+            .len
+            .checked_add(1)
+            .expect("pending wire-sequence count overflow");
+    }
+
+    fn complete_through(&mut self, wire_seq: u64) {
+        if self.len == 0 || wire_seq < self.front {
+            return;
+        }
+        let dropped = wire_seq
+            .saturating_sub(self.front)
+            .saturating_add(1)
+            .min(self.len);
+        self.len -= dropped;
+        if self.len == 0 {
+            self.front = 0;
+        } else {
+            self.front += dropped;
+        }
+    }
+}
+
+#[cfg(feature = "sync-sender-qwp-ws")]
 pub(crate) struct BlockingQwpWsTransport {
     endpoints: Arc<[QwpWsEndpoint]>,
     previous_idx: Option<usize>,
@@ -2977,7 +3024,7 @@ pub(crate) struct BlockingQwpWsTransport {
     stream: WsStream,
     reader: WsFrameReader,
     send_buf: Vec<u8>,
-    pending_wire_sequences: VecDeque<u64>,
+    pending_wire_sequences: PendingWireSequenceRun,
     last_durable_keepalive_ping: Option<Instant>,
 }
 
@@ -3051,7 +3098,7 @@ impl BlockingQwpWsTransport {
             stream: connected.stream,
             reader: WsFrameReader::with_initial_input(connected.leftover),
             send_buf: Vec::with_capacity(16 * 1024),
-            pending_wire_sequences: VecDeque::new(),
+            pending_wire_sequences: PendingWireSequenceRun::default(),
             last_durable_keepalive_ping: None,
         };
         transport.emit_connect_succeeded();
@@ -3107,12 +3154,7 @@ impl BlockingQwpWsTransport {
     }
 
     fn complete_pending_through(&mut self, sequence: u64) {
-        while let Some(wire_seq) = self.pending_wire_sequences.front() {
-            if *wire_seq > sequence {
-                break;
-            }
-            self.pending_wire_sequences.pop_front();
-        }
+        self.pending_wire_sequences.complete_through(sequence);
     }
 }
 
@@ -3286,7 +3328,7 @@ impl QwpWsCoreTransport for BlockingQwpWsTransport {
                 io
             ))
         })?;
-        self.pending_wire_sequences.push_back(frame.wire_seq);
+        self.pending_wire_sequences.push(frame.wire_seq);
         Ok(TransportSendResult::NoResponse)
     }
 
@@ -5705,6 +5747,35 @@ mod tests {
         run.clear();
         assert_eq!(run.len(), 0);
         assert_eq!(run.wire_seq_for_fsn(40), None);
+    }
+
+    #[cfg(feature = "sync-sender-qwp-ws")]
+    #[test]
+    fn pending_wire_sequence_run_tracks_cumulative_acks() {
+        let mut run = PendingWireSequenceRun::default();
+        assert!(run.is_empty());
+
+        for wire_seq in 4..=6 {
+            run.push(wire_seq);
+        }
+        assert_eq!((run.front, run.len), (4, 3));
+
+        run.complete_through(3);
+        assert_eq!((run.front, run.len), (4, 3));
+
+        run.complete_through(5);
+        assert_eq!((run.front, run.len), (6, 1));
+
+        run.complete_through(99);
+        assert!(run.is_empty());
+
+        run.push(u64::MAX);
+        run.complete_through(u64::MAX);
+        assert!(run.is_empty());
+
+        run.push(0);
+        run.clear();
+        assert!(run.is_empty());
     }
 
     #[test]

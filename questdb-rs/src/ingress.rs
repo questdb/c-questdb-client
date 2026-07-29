@@ -1684,10 +1684,10 @@ impl SenderBuilder {
     /// admission bound on published frames awaiting durable completion. That
     /// bound caps the per-frame table/sequence metadata held between an
     /// ordinary OK and its durable watermark. Without durable ACKs, the value
-    /// is ignored and backpressure comes from `sf_max_total_bytes` plus
-    /// `sf_append_deadline_millis`.
+    /// is ignored; use `sf_max_total_bytes` to bound store-and-forward
+    /// allocation.
     #[deprecated(
-        since = "7.1.0",
+        since = "7.0.0",
         note = "no longer controls wire pipelining; in durable-ACK mode it only bounds \
                 the unresolved store-and-forward backlog"
     )]

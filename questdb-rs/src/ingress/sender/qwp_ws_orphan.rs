@@ -55,6 +55,7 @@ use super::qwp_ws_driver::{
 };
 #[cfg(feature = "sync-sender-qwp-ws")]
 use super::qwp_ws_queue::UNBOUNDED_IN_FLIGHT;
+#[cfg(feature = "sync-sender-qwp-ws")]
 use super::qwp_ws_sfa_queue::{SfaQueueError, SfaQueueOptions};
 #[cfg(feature = "sync-sender-qwp-ws")]
 use super::qwp_ws_sfa_slot::SfaSlotQueue;
