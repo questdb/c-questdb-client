@@ -78,8 +78,8 @@ const MAX_INBOUND_FRAME_BYTES: u64 = 256 * 1024 * 1024;
 /// ring), so this is the only bound on both `pending_acks` growth against a
 /// peer that withholds acks and the frame count left delivery-unknown if the
 /// socket dies. `has_sync_commit_slot` reserves the last slot for a deferred
-/// publish's commit frame. 128 was taken as a QWP protocol limit, but that is
-/// unverified: no other QuestDB client implements a frame-count window.
+/// publish's commit frame. The historical QWP spec listed 128, but the server
+/// neither negotiates nor enforces a frame-count window.
 const MAX_IN_FLIGHT: u32 = 128;
 
 /// Best-effort write budget for the Close frame on Drop. Short enough
