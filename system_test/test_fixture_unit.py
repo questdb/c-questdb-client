@@ -52,6 +52,7 @@ import sys
 sys.dont_write_bytecode = True
 
 import contextlib
+import http.client
 import io
 import pathlib
 import signal
@@ -157,17 +158,28 @@ class StopEscalationTest(unittest.TestCase):
             def poll():
                 return None
 
+        class FakeLog:
+            def __init__(self):
+                self.closed = False
+
+            def close(self):
+                self.closed = True
+
         with tempfile.TemporaryDirectory() as tmp_dir:
             qdb = _make_fixture(tmp_dir)
             proc = NeverReapedProcess()
             qdb._proc = proc
+            fake_log = FakeLog()
+            qdb._log = fake_log
             qdb._request_thread_dump = lambda: False
             qdb._win_send_console_ctrl = lambda _event: True
 
-            with self.assertRaises(fixture.QuestDbReapTimeout) as raised:
-                qdb.stop(
-                    wait_timeout_sec=0.01,
-                    force_kill_wait_timeout_sec=0.02)
+            stderr = io.StringIO()
+            with contextlib.redirect_stderr(stderr):
+                with self.assertRaises(fixture.QuestDbReapTimeout) as raised:
+                    qdb.stop(
+                        wait_timeout_sec=0.01,
+                        force_kill_wait_timeout_sec=0.02)
 
             self.assertFalse(raised.exception.fixture_reusable)
             self.assertTrue(proc.killed)
@@ -175,6 +187,11 @@ class StopEscalationTest(unittest.TestCase):
             self.assertIs(
                 qdb._proc, proc,
                 'an unreaped process must retain fixture ownership')
+            # The process is unreaped, but its log handle must not leak: it is
+            # closed even on this path, which skips the normal close.
+            self.assertTrue(fake_log.closed,
+                            'the log handle must be closed on reap timeout')
+            self.assertIsNone(qdb._log)
 
     def test_quick_shutdown_stays_quiet(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
@@ -260,10 +277,17 @@ class _FakeProc:
 
 
 class _FakeResponse:
-    """Minimal urlopen() result: the probe only reads .status."""
+    """Minimal urlopen() result: the probe reads .status inside a `with`,
+    so this models the real HTTPResponse's context-manager protocol too."""
 
     def __init__(self, status):
         self.status = status
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
 
 
 class ProbeHttpTest(unittest.TestCase):
@@ -302,6 +326,18 @@ class ProbeHttpTest(unittest.TestCase):
             qdb = self._probe_fixture(tmp_dir)
             with mock.patch('urllib.request.urlopen',
                             side_effect=ConnectionRefusedError()):
+                self.assertFalse(
+                    qdb._probe_http(9000, '/ping', lambda s: s == 204))
+
+    def test_malformed_response_returns_false(self):
+        # A half-started server can answer with a malformed HTTP status line,
+        # raising http.client.BadStatusLine — an HTTPException, not an
+        # OSError. The probe reports not-up rather than letting it propagate
+        # and abort the retry loop.
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            qdb = self._probe_fixture(tmp_dir)
+            with mock.patch('urllib.request.urlopen',
+                            side_effect=http.client.BadStatusLine('x')):
                 self.assertFalse(
                     qdb._probe_http(9000, '/ping', lambda s: s == 204))
 

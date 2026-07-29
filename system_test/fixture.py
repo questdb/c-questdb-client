@@ -41,6 +41,7 @@ import textwrap
 import urllib.request
 import urllib.parse
 import urllib.error
+import http.client
 import concurrent.futures
 import threading
 import base64
@@ -345,6 +346,11 @@ class QuestDbReapTimeout(QuestDbStopTimeout):
 
 
 class QuestDbFixtureBase:
+    # Server-launching subclasses discover the real port at start(); the base
+    # default keeps _check_min_http_up()'s attribute read valid on fixtures
+    # that never launch a min-HTTP server (e.g. QuestDbExternalFixture).
+    http_min_port = None
+
     def print_log(self):
         """Print the QuestDB log to stderr."""
         sys.stderr.write('questdb log output skipped.\n')
@@ -411,8 +417,8 @@ class QuestDbFixtureBase:
         # waits on this probe rather than /ping: the min server has its own
         # worker pool, so it answers even while reconnecting QWP producers
         # keep the shared worker pool — the one serving the main HTTP
-        # server — fully busy. The min server answers any path with
-        # 200 "Status: Healthy" (HealthCheckProcessor). A bounce restart
+        # server — fully busy. This probes /status and treats any 2xx as
+        # healthy (the min server's HealthCheckProcessor). A bounce restart
         # issues no SQL, so the main HTTP server need not be ready.
         return self._probe_http(
             self.http_min_port, '/status', lambda status: 200 <= status < 300)
@@ -424,14 +430,15 @@ class QuestDbFixtureBase:
             headers=self.http_headers(),
             method='GET')
         try:
-            resp = urllib.request.urlopen(req, timeout=1)
-            if status_ok(resp.status):
-                return True
-        except OSError:
-            # The server isn't ready yet: it either refuses the connection
-            # (urllib.error.URLError) or is too slow to answer within the
-            # 1s timeout (socket.timeout). Both are OSError subclasses, so
-            # one handler covers both.
+            with urllib.request.urlopen(req, timeout=1) as resp:
+                if status_ok(resp.status):
+                    return True
+        except (OSError, http.client.HTTPException):
+            # The server isn't ready yet: it refuses the connection
+            # (urllib.error.URLError), is too slow to answer within the 1s
+            # timeout (socket.timeout) — both OSError subclasses — or, mid-boot,
+            # sends a malformed HTTP response (http.client.BadStatusLine, an
+            # HTTPException). All of these mean "not up yet".
             pass
         return False
 
@@ -924,6 +931,15 @@ class QuestDbFixture(QuestDbFixtureBase):
                 except subprocess.TimeoutExpired as e:
                     # Keep _proc populated: ownership was not recovered, so a
                     # caller must not start another server on the same fixture.
+                    # The process is unkillable rather than reaped, so close the
+                    # log handle here (the later close is skipped by the raise)
+                    # and dump its tail — this is the least-diagnosable stop
+                    # failure and earns the same log dump a graceful-shutdown
+                    # timeout gets.
+                    if self._log:
+                        self._log.close()
+                        self._log = None
+                    self.print_log_tail()
                     raise QuestDbReapTimeout(
                         f'QuestDB (pid {kill_pid}) remained alive '
                         f'{force_kill_wait_timeout_sec}s after force-kill; '
