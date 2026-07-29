@@ -903,6 +903,10 @@ class TestArrowIngressSfa(afc.ArrowFuzzBase):
     # server still trips the larger budget and fails the run.
     BOUNCE_STOP_TIMEOUT_S = 120.0
     BOUNCE_RESTART_TIMEOUT_S = 90.0
+    # Extra slack over one stop()+start() so the producer's reconnect/drain
+    # budget clears the worst legal down-window. Mirrors TestQwpWsFuzz's
+    # BOUNCE_LIFECYCLE_HEADROOM_SEC.
+    BOUNCE_LIFECYCLE_HEADROOM_S = 60.0
 
     def _sfa_extras(self, sender_id: str, sf_dir: str) -> Dict[str, str]:
         return {
@@ -1184,7 +1188,11 @@ class TestArrowIngressSfa(afc.ArrowFuzzBase):
                     )
 
                 with self.assertRaises(ArrowSenderError) as raised:
-                    afc.column_sender_sync(conn, 0)
+                    # Finite no-progress deadline: the server is up and issues
+                    # a terminal rejection here, so a healthy run never trips
+                    # it; it only stops a hung server from blocking forever.
+                    afc.column_sender_sync(
+                        conn, 0, afc._SYNC_ON_EXIT_TIMEOUT_MS)
                 err = raised.exception
                 self.assertEqual(err.code, ClientErrorCode.SERVER_REJECTION)
                 diagnostic = err.qwp_ws_error
@@ -1333,7 +1341,11 @@ class TestArrowIngressSfa(afc.ArrowFuzzBase):
                 sync_on_exit=False,
                 **recover_extras,
             ) as conn:
-                afc.column_sender_sync(conn, 0)
+                # Finite no-progress deadline: the server is already back up
+                # (restarted above), so the recovery drain never trips it on a
+                # healthy run; it only bounds a hung server.
+                afc.column_sender_sync(
+                    conn, 0, afc._SYNC_ON_EXIT_TIMEOUT_MS)
 
             self.assertEqual(
                 afc.sfa_file_count(sf_dir, sender_id),
@@ -1402,11 +1414,21 @@ class TestArrowIngressSfa(afc.ArrowFuzzBase):
         def producer(sf_dir: str) -> None:
             nonlocal rows_produced
             extras = self._sfa_extras(sender_id, sf_dir)
+            # The producer keeps reconnecting and draining across a whole
+            # bounce: one stop() (<= BOUNCE_STOP_TIMEOUT_S) + start()
+            # (<= BOUNCE_RESTART_TIMEOUT_S), plus headroom. A budget below that
+            # window lets a slow-but-legal bounce exhaust the reconnect and fail
+            # the test as a producer error, hiding the real cause (a slow
+            # server). Same sizing as TestQwpWsFuzz's client budget.
+            client_budget_millis = int(
+                (self.BOUNCE_STOP_TIMEOUT_S
+                 + self.BOUNCE_RESTART_TIMEOUT_S
+                 + self.BOUNCE_LIFECYCLE_HEADROOM_S) * 1000)
             extras.update({
                 "initial_connect_retry": "sync",
-                "reconnect_max_duration_millis": "120000",
+                "reconnect_max_duration_millis": str(client_budget_millis),
                 "reconnect_max_backoff_millis": "250",
-                "close_flush_timeout_millis": "120000",
+                "close_flush_timeout_millis": str(client_budget_millis),
             })
             try:
                 with afc.borrowed_sender(
@@ -1422,7 +1444,7 @@ class TestArrowIngressSfa(afc.ArrowFuzzBase):
                         with progress_lock:
                             rows_produced = next_id
                         time.sleep(0.005)
-                    afc.column_sender_sync(conn, 0)
+                    afc.column_sender_sync(conn, 0, client_budget_millis)
             except BaseException as exc:
                 producer_errors.append(exc)
 

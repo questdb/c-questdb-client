@@ -25,7 +25,11 @@ def find_binary(build_dir, name, exe_suffix):
 
 
 def run_python_fixture_tests():
-    """Pure-Python QuestDB fixture and fuzz-lifecycle tests."""
+    """QuestDB fixture and fuzz-lifecycle unit tests (no server needed).
+
+    The fuzz-lifecycle suite imports ``questdb_line_sender``, which loads the
+    built client library at import, so a prior CMake build is required.
+    """
     for pattern in ('test_fixture_unit.py', 'test_qwp_ws_fuzz_unit.py'):
         run_cmd(
             sys.executable, '-m', 'unittest', 'discover',
@@ -153,10 +157,13 @@ def main():
             'cargo, cpp, unit, integration, soak-selftest '
             '(or no argument for all).\n')
         sys.exit(2)
-    if mode in ('all', 'unit'):
+    # macOS/Windows CI split native tests into `cpp` mode and never run the
+    # combined `unit` mode. Gate both Python suites on `cpp` so they run on the
+    # mac/Windows agents too: both load the built client library at import
+    # (which `cpp` builds first), and the fuzz-supervisor suite has Windows-only
+    # branches that must execute on a real Windows agent.
+    if mode in ('all', 'unit', 'cpp'):
         run_python_fixture_tests()
-    # macOS/Windows CI split native tests into `cpp` mode, so include the
-    # ctypes regression suite there as well as in the combined unit modes.
     if mode in ('all', 'unit', 'cpp'):
         run_python_ctypes_tests()
     if mode in ('all', 'unit', 'cargo'):
