@@ -190,7 +190,10 @@ class BorrowedUtf8RegressionTest(unittest.TestCase):
         # length, potentially crashing this test process.
         self.assertIs(qer._DLL.questdb_error_msg.restype, ctypes.c_void_p)
 
-        name_ptr = ctypes.c_char_p()
+        # The name out-param is a c_void_p, matching the qwp_reader_batch_
+        # column_name binding; the NULL batch forces an early error return, so
+        # it is never written.
+        name_ptr = ctypes.c_void_p()
         name_len = ctypes.c_size_t(0)
         err_ref = ctypes.POINTER(qer._LineReaderError)()
         null_batch = ctypes.POINTER(qer._LineReaderBatch)()

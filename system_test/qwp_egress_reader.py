@@ -228,7 +228,7 @@ _setsig(
     _c_bool,
     ctypes.POINTER(_LineReaderBatch),
     _c_size_t,
-    ctypes.POINTER(_c_char_p),
+    ctypes.POINTER(_c_void_p),
     ctypes.POINTER(_c_size_t),
     ctypes.POINTER(ctypes.POINTER(_LineReaderError)),
 )
@@ -900,7 +900,7 @@ class QwpEgressReader:
     def _collect_column_names(self, batch, col_count: int) -> List[dict]:
         cols: List[dict] = []
         for col_idx in range(col_count):
-            name_ptr = _c_char_p()
+            name_ptr = _c_void_p()
             name_len = _c_size_t(0)
             err_ref = ctypes.POINTER(_LineReaderError)()
             ok = _DLL.qwp_reader_batch_column_name(
@@ -913,11 +913,12 @@ class QwpEgressReader:
             if not ok:
                 raise _take_error(err_ref)
             # The FFI hands back a borrowed, non-NUL-terminated slice with its
-            # length in `name_len`. Read the pointer's address via a void_p
-            # cast (no dereference) and copy exactly `name_len` bytes.
-            # `name_ptr.value` would instead scan for a NUL terminator and walk
-            # off the end of the slice into unmapped memory.
-            name_addr = ctypes.cast(name_ptr, ctypes.c_void_p).value
+            # length in `name_len`. `name_ptr` is a c_void_p, so `.value` is the
+            # raw integer address (None when NULL) — no dereference. Copy exactly
+            # `name_len` bytes; a c_char_p `.value` here would instead scan for a
+            # NUL terminator and walk off the end of the slice into unmapped
+            # memory.
+            name_addr = name_ptr.value
             name = (
                 ctypes.string_at(name_ptr, name_len.value).decode(
                     "utf-8", "replace"
