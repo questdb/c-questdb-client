@@ -3675,9 +3675,26 @@ impl DurableAckTracker {
     }
 
     fn pending_wire_seq_for_fsn(&self, fsn: u64) -> Option<u64> {
+        let front = self.pending.front()?;
+        let back = self.pending.back()?;
+        if fsn < front.fsn() || fsn > back.fsn() {
+            return None;
+        }
+
+        // Ordinary OKs arrive in wire order, so pending FSNs form an ordered
+        // run. Most servers ACK each frame, making the run contiguous: index
+        // that case arithmetically. Cumulative OKs may leave gaps, so fall back
+        // to binary search rather than walking every durable-waiting frame.
+        let offset = usize::try_from(fsn - front.fsn()).ok()?;
+        if let Some(entry) = self.pending.get(offset)
+            && entry.fsn() == fsn
+        {
+            return Some(entry.wire_seq());
+        }
         self.pending
-            .iter()
-            .find(|entry| entry.fsn() == fsn)
+            .binary_search_by_key(&fsn, PendingDurableFrame::fsn)
+            .ok()
+            .and_then(|index| self.pending.get(index))
             .map(PendingDurableFrame::wire_seq)
     }
 
@@ -5690,10 +5707,26 @@ mod tests {
         assert_eq!(run.wire_seq_for_fsn(40), None);
     }
 
-    /// The in-flight window is no longer reachable from configuration:
-    /// `max_in_flight` / `in_flight_window` are deprecated no-ops and every
-    /// production path now passes `UNBOUNDED_IN_FLIGHT`. This test constructs
-    /// the queue directly with a small window, so it keeps pinning the
+    #[test]
+    fn durable_pending_lookup_handles_contiguous_and_cumulative_gaps() {
+        let mut tracker = DurableAckTracker::new();
+        tracker.enqueue_ok(40, 100, Vec::new());
+        tracker.enqueue_ok(41, 101, Vec::new());
+        tracker.enqueue_ok(43, 103, Vec::new());
+
+        assert_eq!(tracker.pending_wire_seq_for_fsn(100), Some(40));
+        assert_eq!(tracker.pending_wire_seq_for_fsn(101), Some(41));
+        assert_eq!(tracker.pending_wire_seq_for_fsn(102), None);
+        assert_eq!(tracker.pending_wire_seq_for_fsn(103), Some(43));
+        assert_eq!(tracker.pending_wire_seq_for_fsn(99), None);
+        assert_eq!(tracker.pending_wire_seq_for_fsn(104), None);
+    }
+
+    /// The wire-side in-flight window is no longer reachable from
+    /// configuration: every production send cursor uses
+    /// `UNBOUNDED_IN_FLIGHT`. Durable-ACK queues may still use the configured
+    /// value as an admission-only backlog bound. This test constructs the
+    /// queue directly with a small window, so it keeps pinning the old coupled
     /// mechanism while it remains in the code.
     #[test]
     fn drive_once_sends_until_max_in_flight() {

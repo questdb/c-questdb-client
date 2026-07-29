@@ -166,8 +166,15 @@ impl OrphanDrainerConfig {
             slot_dir,
             segment_size_bytes: *self.qwp_ws.sf_max_segment_bytes,
             max_bytes,
-            // Deprecated no-op; see `UNBOUNDED_IN_FLIGHT`.
-            max_in_flight: UNBOUNDED_IN_FLIGHT,
+            // Durable replay retains one table/seqTxn vector per ordinary OK
+            // until durable coverage arrives, so keep the historical count
+            // bound on unresolved publications. Non-durable replay needs no
+            // per-frame ACK metadata and remains byte-budget-only.
+            max_in_flight: if *self.qwp_ws.request_durable_ack {
+                *self.qwp_ws.max_in_flight
+            } else {
+                UNBOUNDED_IN_FLIGHT
+            },
         })
     }
 }
@@ -463,7 +470,9 @@ impl OrphanDrainer {
         if orphan_stop_requested(stop) {
             return OrphanOpenOutcome::Stopped;
         }
-        let max_in_flight = queue.max_in_flight();
+        // The queue's count is an admission bound for durable metadata, not a
+        // wire window.
+        let max_in_flight = UNBOUNDED_IN_FLIGHT;
         // A delta-encoded slot's stored frames are not self-sufficient, so before
         // replaying them to the fresh server the drainer must re-register the whole
         // dictionary via a catch-up frame -- exactly as the foreground does on

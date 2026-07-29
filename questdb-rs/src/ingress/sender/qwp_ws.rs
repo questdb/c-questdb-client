@@ -1642,10 +1642,17 @@ fn open_configured_qwp_ws_queue(qwp_ws: &QwpWsConfig) -> crate::Result<SfaSlotQu
     }
 
     let max_bytes = usize_from_config("sf_max_total_bytes", qwp_ws.sf_max_total_bytes())?;
-    // `max_in_flight` / `in_flight_window` are deprecated no-ops: the configured
-    // value is parsed and validated but no longer bounds anything. See
-    // `UNBOUNDED_IN_FLIGHT`.
-    let max_in_flight = UNBOUNDED_IN_FLIGHT;
+    // The wire window is gone, but durable-ACK mode still needs a count bound
+    // on published-but-not-durably-completed frames: each ordinary OK retains
+    // per-frame table/seqTxn metadata until a durable watermark covers it.
+    // Preserve the historical setting as that admission bound. Without durable
+    // ACKs, ordinary OKs complete frames directly and the segment byte budget
+    // is the only producer bound.
+    let max_in_flight = if *qwp_ws.request_durable_ack {
+        *qwp_ws.max_in_flight
+    } else {
+        UNBOUNDED_IN_FLIGHT
+    };
 
     if let Some(sf_dir) = qwp_ws.sf_dir.as_ref() {
         return SfaSlotQueue::open(SfaSlotOptions {
@@ -3105,7 +3112,9 @@ pub(crate) fn connect_qwp_ws_background_state(
             tls_settings,
             qwp_ws,
             auth_header,
-            queue.max_in_flight(),
+            // Queue admission may retain a durable-backlog count cap; it must
+            // not restore the removed wire-side window.
+            UNBOUNDED_IN_FLIGHT,
             *qwp_ws.request_durable_ack,
             Arc::clone(&server_max_batch_size),
             delta_dict_enabled,
@@ -3301,7 +3310,9 @@ fn open_qwp_ws_parts(
         Arc::clone(&server_max_batch_size),
     )?;
     let negotiated_version = transport.negotiated_version();
-    let max_in_flight = queue.max_in_flight();
+    // Queue admission may retain a durable-backlog count cap; it must not
+    // restore the removed wire-side window.
+    let max_in_flight = UNBOUNDED_IN_FLIGHT;
     // Extract the slot's delta-dict state before the queue moves into the store:
     // whether delta is on, the recovered entries (to seed the producer dict + the
     // driver mirror), and the side-file handle (for the foreground's write-ahead).
@@ -3899,7 +3910,7 @@ mod tests {
         DriverError, DriverEvent, FakeOrderedServer, ReconnectReason, TableSeqTxn,
         TransportFailure, TransportPoll, TransportResponse, TransportSendResult,
     };
-    use super::super::qwp_ws_queue::{OutboundFrameView, SentFrame};
+    use super::super::qwp_ws_queue::{OutboundFrameView, QueueError, SentFrame};
     use super::super::qwp_ws_sfa_queue::{SfaFrameQueue, SfaMemoryQueueOptions, SfaQueueOptions};
     use super::*;
     use std::sync::{Arc, mpsc};
@@ -3912,6 +3923,30 @@ mod tests {
             max_in_flight,
         })
         .unwrap()
+    }
+
+    #[test]
+    fn durable_ack_publish_admission_stays_count_bounded() {
+        let builder = crate::ingress::SenderBuilder::from_conf(
+            "ws::addr=localhost:9000;\
+             request_durable_ack=on;\
+             max_in_flight=3;\
+             sf_max_segment_bytes=4096;\
+             sf_max_total_bytes=8192;",
+        )
+        .unwrap();
+        let qwp_ws = builder.qwp_ws.as_ref().unwrap();
+        let mut queue = open_configured_qwp_ws_queue(qwp_ws).unwrap();
+
+        for _ in 0..3 {
+            queue.try_publish(b"frame").unwrap();
+        }
+        assert!(matches!(
+            queue.try_publish(b"one-too-many"),
+            Err(DriverError::Queue(QueueError::MaxInFlightReached {
+                max_in_flight: 3
+            }))
+        ));
     }
 
     #[test]

@@ -28,21 +28,19 @@
 
 use super::qwp_ws_sfa_segment::SfaMappedPayload;
 
-/// The in-flight frame count the sender runs with now that `max_in_flight` /
-/// `in_flight_window` are deprecated no-ops.
+/// The wire-side in-flight frame count used now that `max_in_flight` /
+/// `in_flight_window` no longer throttle pipelining.
 ///
-/// Both the producer admission gate ([`SfaFrameQueue::validate_submit`]) and
-/// the wire window ([`SendCursor::peek_next_frame_from_oldest`]) compare
-/// against this, so neither ever trips: the I/O thread streams at full speed
-/// and backpressure comes solely from the segment ring's byte budget
-/// (`sf_max_total_bytes`) and the append deadline
-/// (`sf_append_deadline_millis`). This matches the Java and Go clients, which
-/// have no frame-count window at all.
+/// Every production [`SendCursor::peek_next_frame_from_oldest`] compares
+/// against this, so the I/O thread streams at full speed. Producer admission
+/// also uses it in ordinary-ACK mode, where no per-frame ACK metadata survives
+/// an OK and the segment ring's byte budget is sufficient. Durable-ACK mode
+/// instead retains the historical configured count as an admission-only bound:
+/// each ordinary OK owns table/seqTxn metadata until durable coverage arrives.
 ///
 /// The plumbing stays in place for one release so the mechanism can be
 /// restored or removed wholesale without reshaping the queue/driver API.
 ///
-/// [`SfaFrameQueue::validate_submit`]: super::qwp_ws_sfa_queue::SfaFrameQueue
 /// [`SendCursor::peek_next_frame_from_oldest`]: super::qwp_ws_driver::SendCursor
 pub(crate) const UNBOUNDED_IN_FLIGHT: usize = usize::MAX;
 

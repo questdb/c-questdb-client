@@ -266,8 +266,10 @@ pub(crate) struct QwpWsConfig {
     pub(crate) max_protocol_version: ConfigSetting<u32>,
     pub(crate) request_durable_ack: ConfigSetting<bool>,
     pub(crate) durable_ack_keepalive_interval: ConfigSetting<std::time::Duration>,
-    /// Maximum number of unacknowledged messages in flight on a single
-    /// pipelined async sender. Matches the spec's per-connection cap.
+    /// Deprecated as a wire-window setting. The I/O thread no longer consults
+    /// it, but durable-ACK store-and-forward queues retain it as the maximum
+    /// number of published frames awaiting durable completion so their
+    /// per-frame table/seqTxn metadata stays count-bounded.
     pub(crate) max_in_flight: ConfigSetting<usize>,
     /// Per-outage wall-clock budget for the reconnect loop.
     pub(crate) reconnect_max_duration: ConfigSetting<std::time::Duration>,

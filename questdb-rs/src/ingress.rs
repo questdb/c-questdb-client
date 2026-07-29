@@ -999,9 +999,10 @@ impl SenderBuilder {
     /// `durable_ack_keepalive_interval_millis`, `drain_orphans`,
     /// `max_background_drainers`, and `error_inbox_capacity`.
     ///
-    /// `in_flight_window` and `max_in_flight` are deprecated no-ops: they are
-    /// still parsed and validated, but no longer bound anything. See
-    /// [`SenderBuilder::max_in_flight`].
+    /// `in_flight_window` and `max_in_flight` are deprecated as wire-window
+    /// controls. They no longer bound the wire send cursor, but in durable-ACK
+    /// mode the value remains an admission bound on frames awaiting durable
+    /// completion. See [`SenderBuilder::max_in_flight`].
     ///
     /// You can also load the configuration from an environment variable. See
     /// [`SenderBuilder::from_env`].
@@ -1139,9 +1140,9 @@ impl SenderBuilder {
                 "max_datagram_size" => builder.max_datagram_size(parse_conf_value(key, val)?)?,
                 #[cfg(feature = "_sender-qwp-udp")]
                 "multicast_ttl" => builder.multicast_ttl(parse_conf_value(key, val)?)?,
-                // Both keys are deprecated no-ops: parsed and validated for
-                // backwards compatibility, but the value no longer bounds
-                // anything. See `SenderBuilder::max_in_flight`.
+                // Both keys are deprecated as wire-window controls. They remain
+                // aliases for the durable-ACK unresolved-frame admission bound.
+                // See `SenderBuilder::max_in_flight`.
                 #[cfg(feature = "_sender-qwp-ws")]
                 "in_flight_window" => builder.in_flight_window(parse_conf_value(key, val)?)?,
                 #[cfg(feature = "_sender-qwp-ws")]
@@ -1673,32 +1674,32 @@ impl SenderBuilder {
     }
 
     #[cfg(feature = "_sender-qwp-ws")]
-    /// **Deprecated: this setting no longer has any effect.**
+    /// **Deprecated: this setting no longer controls wire pipelining.**
     ///
     /// It used to cap the number of unacknowledged frames the QWP/WebSocket
     /// sender kept in flight, both when admitting a publish and on the wire.
-    /// The cap is gone: the I/O thread now streams at full speed and
-    /// backpressure comes solely from the store-and-forward segment ring's
-    /// byte budget (`sf_max_total_bytes`) and the append deadline
-    /// (`sf_append_deadline_millis`) — the same model the Java and Go clients
-    /// use, neither of which has ever had a frame-count window.
+    /// The wire-side cap is gone: the I/O thread now streams at full speed.
     ///
-    /// The value is still parsed and validated so existing code and connect
-    /// strings keep working; it is simply ignored. The method will be removed
-    /// in a future release.
+    /// With `request_durable_ack=on`, the value is retained only as a local
+    /// admission bound on published frames awaiting durable completion. That
+    /// bound caps the per-frame table/sequence metadata held between an
+    /// ordinary OK and its durable watermark. Without durable ACKs, the value
+    /// is ignored and backpressure comes from `sf_max_total_bytes` plus
+    /// `sf_append_deadline_millis`.
     #[deprecated(
         since = "7.1.0",
-        note = "no longer has any effect; backpressure is governed by sf_max_total_bytes \
-                and sf_append_deadline_millis. This method will be removed in a future release."
+        note = "no longer controls wire pipelining; in durable-ACK mode it only bounds \
+                the unresolved store-and-forward backlog"
     )]
     pub fn max_in_flight(self, value: usize) -> Result<Self> {
         self.set_qwp_ws_max_in_flight("max_in_flight", value)
     }
 
     /// Java-compatible spelling of [`SenderBuilder::max_in_flight`], accepted
-    /// only through the configuration string. Like it, this is a deprecated
-    /// no-op: the value is validated (`> 1`, matching the historical Java
-    /// semantics where `1` meant synchronous mode) and then ignored.
+    /// only through the configuration string. Like it, this is deprecated as a
+    /// wire-window control. The value is validated (`> 1`, matching the
+    /// historical Java semantics where `1` meant synchronous mode) and is used
+    /// only as the durable-ACK unresolved-frame admission bound.
     #[cfg(feature = "_sender-qwp-ws")]
     fn in_flight_window(mut self, value: i32) -> Result<Self> {
         let Some(qwp_ws) = &mut self.qwp_ws else {

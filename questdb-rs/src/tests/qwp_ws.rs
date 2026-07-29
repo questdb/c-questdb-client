@@ -1601,10 +1601,10 @@ fn qwp_ws_terminal_reject_terminalizes_in_all_progress_modes() {
     }
 }
 
-/// `max_in_flight` is a deprecated no-op, and this pins that at runtime rather
-/// than at the parser: with `max_in_flight=1` the old code put exactly one
-/// frame on the wire and waited for its ack. The window is gone, so many
-/// frames must reach a server that never acks at all.
+/// `max_in_flight` no longer controls the wire window, and this pins that at
+/// runtime rather than at the parser: with `max_in_flight=1` the old code put
+/// exactly one frame on the wire and waited for its ack. The wire window is
+/// gone, so many frames must reach a server that never acks at all.
 #[test]
 fn qwp_ws_max_in_flight_no_longer_bounds_the_wire() {
     const FRAMES: usize = 8;
@@ -1638,10 +1638,10 @@ fn qwp_ws_max_in_flight_no_longer_bounds_the_wire() {
 fn qwp_ws_backpressure_timeout_matches_in_all_progress_modes() {
     for progress in [ProgressCase::Background, ProgressCase::Manual] {
         let (port, frame_rx, release_tx) = spawn_stalled_after_first_frame_server();
-        // The frame-count window is gone (`max_in_flight` is a deprecated
-        // no-op), so backpressure now comes solely from the segment ring's
-        // byte budget: two 512-byte segments, neither of which can be trimmed
-        // while the server sits on the first frame without acking it.
+        // In ordinary-ACK mode the frame-count window is gone, so backpressure
+        // comes solely from the segment ring's byte budget: two 512-byte
+        // segments, neither of which can be trimmed while the server sits on
+        // the first frame without acking it.
         let conf = format!(
             "ws::addr=127.0.0.1:{port};\
              qwp_ws_progress={};\

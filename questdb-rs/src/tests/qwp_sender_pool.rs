@@ -2193,9 +2193,10 @@ fn pooled_buffer_append_timeout_rolls_back_symbols_and_keeps_input() {
         (0, vec![b"alpha".to_vec()])
     );
 
-    // Backpressure is the ring's byte budget now that `max_in_flight` is a
-    // deprecated no-op. Fill it with the already-registered "alpha" so the
-    // rollback assertion below still isolates "bravo".
+    // In ordinary-ACK mode backpressure is the ring's byte budget now that
+    // `max_in_flight` no longer controls the wire. Fill it with the
+    // already-registered "alpha" so the rollback assertion below still
+    // isolates "bravo".
     let mut ring_full = false;
     for _ in 0..64 {
         let mut filler = db.new_buffer();
@@ -2513,10 +2514,10 @@ fn mixed_sfa_queue_pressure_rolls_back_the_failing_encoder_namespace() {
     let second_fsn = sender.flush_and_get_fsn(&mut second).unwrap().unwrap();
     assert!(second_fsn > first_fsn);
 
-    // `max_in_flight` is a deprecated no-op, so the ring backs up on its byte
-    // budget. Fill it with the already-registered "alpha", which consumes no
-    // dictionary ids -- the id-reuse assertions below depend on "charlie"
-    // being the only symbol that fails to publish.
+    // In ordinary-ACK mode `max_in_flight` no longer bounds admission, so the
+    // ring backs up on its byte budget. Fill it with the already-registered
+    // "alpha", which consumes no dictionary ids -- the id-reuse assertions
+    // below depend on "charlie" being the only symbol that fails to publish.
     let mut last_published_fsn = second_fsn;
     let mut ring_full = false;
     for _ in 0..64 {
@@ -3287,8 +3288,8 @@ fn check_store_and_forward_append_timeout_rolls_back_symbols_and_keeps_chunk(ext
         (0, vec![b"alpha".to_vec()])
     );
 
-    // The frame-count window is gone (`max_in_flight` is a deprecated no-op),
-    // so the ring backs up on its byte budget instead. Fill it with the
+    // In ordinary-ACK mode the frame-count window is gone, so the ring backs
+    // up on its byte budget instead. Fill it with the
     // already-registered "alpha" so no symbol ids are consumed on the way --
     // the rollback assertion below depends on "bravo" being the only symbol
     // that ever fails to publish.
