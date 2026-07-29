@@ -1,12 +1,19 @@
 from __future__ import annotations
 
+import contextlib
+import io
 import math
+import sys
+import types
 import unittest
 import uuid
+from unittest import mock
 
 import pyarrow as pa
 
 import arrow_fuzz_common as afc
+import arrow_ingress_fuzz as aif
+import fixture
 
 
 def _norm_cell(v):
@@ -251,6 +258,141 @@ class TestEdgeCorpora(unittest.TestCase):
             any(ord(c) > 0x7F for s in afc.EDGE_STRINGS for c in s),
             "expected at least one non-ASCII edge string",
         )
+
+
+class _RecordingFixture:
+    """Stand-in fixture that records start() calls and never launches a JVM."""
+
+    def __init__(self, proc, raise_on_start=False):
+        self._proc = proc
+        self.start_calls = []
+        self._raise_on_start = raise_on_start
+
+    def start(self, **kwargs):
+        self.start_calls.append(kwargs)
+        if self._raise_on_start:
+            raise RuntimeError("simulated restart failure")
+
+
+class _FakeProc:
+    """Minimal Popen stand-in: poll() reports None while alive, an exit code
+    once dead."""
+
+    def __init__(self, exit_code):
+        self._exit_code = exit_code
+
+    def poll(self):
+        return self._exit_code
+
+
+class _FakeArrowSelf:
+    """The subset of an ArrowFuzzBase instance that _ensure_fixture_running
+    reads: the fixture, a suite label, and id() for the log line."""
+
+    SUITE_LABEL = "arrow_recovery_test"
+
+    def __init__(self, fixture_obj):
+        self._fixture = fixture_obj
+
+    def id(self):
+        return "SharedFixtureRecoveryTest.fake"
+
+
+class SharedFixtureRecoveryTest(unittest.TestCase):
+    """The SFA suite's shared-server recovery helpers, driven without a live
+    server. Both restore the managed fixture after a bounce leaves it stopped;
+    a regression in either would let the shared server stay down and fail every
+    following SFA test. Integration exercises only their success path."""
+
+    def _make_sfa(self, fixture_obj):
+        # A real TestArrowIngressSfa built without setUp: _restart_if_down reads
+        # only self._fixture plus the class attributes (SUITE_LABEL,
+        # BOUNCE_RESTART_TIMEOUT_S), so the class lookup supplies the rest.
+        sfa = aif.TestArrowIngressSfa.__new__(aif.TestArrowIngressSfa)
+        sfa._fixture = fixture_obj
+        return sfa
+
+    def test_restart_if_down_skips_when_process_alive(self):
+        fx = _RecordingFixture(proc=object())  # _proc is not None
+        self._make_sfa(fx)._restart_if_down(probe_min_http=True)
+        self.assertEqual(fx.start_calls, [],
+                         "a live server must not be restarted")
+
+    def test_restart_if_down_starts_when_process_gone(self):
+        fx = _RecordingFixture(proc=None)
+        self._make_sfa(fx)._restart_if_down(probe_min_http=True)
+        self.assertEqual(len(fx.start_calls), 1)
+        self.assertEqual(
+            fx.start_calls[0],
+            {"start_timeout_sec": aif.TestArrowIngressSfa.BOUNCE_RESTART_TIMEOUT_S,
+             "probe_min_http": True})
+
+    def test_restart_if_down_passes_probe_flag_through(self):
+        fx = _RecordingFixture(proc=None)
+        self._make_sfa(fx)._restart_if_down(probe_min_http=False)
+        self.assertIs(fx.start_calls[0]["probe_min_http"], False)
+
+    def test_restart_if_down_swallows_start_failure(self):
+        # Called from a finally, it must log a failed recovery start rather
+        # than raise and mask the exception already propagating.
+        fx = _RecordingFixture(proc=None, raise_on_start=True)
+        stderr = io.StringIO()
+        with contextlib.redirect_stderr(stderr):
+            self._make_sfa(fx)._restart_if_down(probe_min_http=True)
+        self.assertEqual(len(fx.start_calls), 1)
+        self.assertIn("recovery restart failed", stderr.getvalue())
+
+    @contextlib.contextmanager
+    def _test_module_exposing_questdbfixture(self):
+        # _ensure_fixture_running does `from test import QuestDbFixture`; inject
+        # a stand-in `test` module carrying the real class so the isinstance
+        # gate sees it without importing the heavyweight test.py.
+        fake = types.ModuleType("test")
+        fake.QuestDbFixture = fixture.QuestDbFixture
+        with mock.patch.dict(sys.modules, {"test": fake}):
+            yield
+
+    def _make_managed_fixture(self, proc, events):
+        f = fixture.QuestDbFixture.__new__(fixture.QuestDbFixture)
+        f._proc = proc
+        f.start = lambda: events.append("start")
+        f.stop = lambda: events.append("stop")
+        return f
+
+    def test_ensure_running_ignores_non_managed_fixture(self):
+        # An external fixture is not a QuestDbFixture: it has no start()/stop()
+        # to call, so a no-op is the only non-crashing outcome.
+        fake_self = _FakeArrowSelf(object())
+        with self._test_module_exposing_questdbfixture():
+            afc.ArrowFuzzBase._ensure_fixture_running(fake_self)
+
+    def test_ensure_running_skips_when_server_alive(self):
+        events = []
+        fx = self._make_managed_fixture(_FakeProc(exit_code=None), events)
+        fake_self = _FakeArrowSelf(fx)
+        with self._test_module_exposing_questdbfixture():
+            afc.ArrowFuzzBase._ensure_fixture_running(fake_self)
+        self.assertEqual(events, [], "a live server must be left untouched")
+
+    def test_ensure_running_reaps_then_restarts_dead_server(self):
+        events = []
+        fx = self._make_managed_fixture(_FakeProc(exit_code=0), events)
+        fake_self = _FakeArrowSelf(fx)
+        with contextlib.redirect_stderr(io.StringIO()), \
+                self._test_module_exposing_questdbfixture():
+            afc.ArrowFuzzBase._ensure_fixture_running(fake_self)
+        # A process that died without stop() clearing _proc must be reaped
+        # before start(), which overwrites _proc unconditionally.
+        self.assertEqual(events, ["stop", "start"])
+
+    def test_ensure_running_restarts_without_reap_when_proc_cleared(self):
+        events = []
+        fx = self._make_managed_fixture(None, events)  # _proc already cleared
+        fake_self = _FakeArrowSelf(fx)
+        with contextlib.redirect_stderr(io.StringIO()), \
+                self._test_module_exposing_questdbfixture():
+            afc.ArrowFuzzBase._ensure_fixture_running(fake_self)
+        self.assertEqual(events, ["start"], "no process to reap: restart only")
 
 
 if __name__ == "__main__":

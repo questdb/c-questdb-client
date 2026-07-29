@@ -95,6 +95,7 @@ try:
         TestBuildRecordBatch,
         TestSlicedRecordBatchOffsets,
         TestEdgeCorpora,
+        SharedFixtureRecoveryTest,
     )
     ARROW_TESTS_AVAILABLE = True
 except ImportError as _arrow_import_err:
