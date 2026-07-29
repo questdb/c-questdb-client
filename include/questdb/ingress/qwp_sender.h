@@ -285,7 +285,7 @@ qwp_direct_sender* qwp_direct_sender_from_opts(
  * Invalidates the `sender` pointer. If the sender has latched terminal state,
  * or if the pool has been closed, it is closed instead of recycled. A sender
  * returned with uncommitted pipelined frames has them committed best-effort.
- * This function accepts only handles borrowed through
+ * This function is intended only for handles borrowed through
  * `questdb_db_borrow_direct_sender` /
  * `questdb_db_borrow_direct_sender_with_retry`. For a standalone handle use
  * `qwp_direct_sender_free`, or `questdb_db_drop_direct_sender(NULL, sender)` to
@@ -312,10 +312,11 @@ void questdb_db_return_direct_sender(
  * Invalidates `sender`. Accepts NULL `sender` and no-ops.
  *
  * Use this after a failure that may have left in-doubt or uncommitted frames
- * on the connection; otherwise a later borrower could commit those frames
- * together with its own batch. Uncommitted frames are discarded with the
- * connection — the caller re-drives them from its own source. A pooled sender
- * is closed instead of recycled; a standalone sender is closed outright.
+ * on the connection; for a pooled sender this stops a later borrower from
+ * committing those frames together with its own batch. Uncommitted frames are
+ * discarded with the connection — the caller re-drives them from its own
+ * source. A pooled sender is closed instead of recycled; a standalone sender
+ * is closed outright.
  *
  * For a pool-borrowed handle this is mutually exclusive with
  * `questdb_db_return_direct_sender`; for a standalone handle it is mutually
