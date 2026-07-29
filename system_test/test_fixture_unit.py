@@ -24,8 +24,8 @@
 
 """Unit-level regression tests for the `fixture` QuestDB lifecycle.
 
-These do not launch QuestDB — they drive `QuestDbFixture` with stand-in
-child processes. They pin down how `stop()` reacts when a server refuses
+These do not launch QuestDB — they drive `QuestDbFixture` with fake
+server processes. They pin down how `stop()` reacts when a server refuses
 to shut down (originally seen in a qwp_ws_fuzz CI failure on 2026-06-10,
 `test_all_mixed_with_bounce` seed=0x8f7a0293542c4692, where the server
 hung in graceful shutdown):
@@ -71,7 +71,7 @@ def _make_fixture(tmp_dir: str) -> fixture.QuestDbFixture:
     return fixture.QuestDbFixture(root_dir)
 
 
-# A stand-in for a JVM whose graceful shutdown hangs: ignores SIGTERM,
+# A fake server process whose graceful shutdown hangs: ignores SIGTERM,
 # answers SIGQUIT with a fake thread dump on stdout (which the fixture
 # wires to the server log file), and never exits on its own.
 _HUNG_JVM_SCRIPT = """
@@ -103,13 +103,14 @@ class StopEscalationTest(unittest.TestCase):
                 stderr=subprocess.STDOUT)
             proc = qdb._proc
             try:
-                # Wait until the child has installed its signal handlers
-                # (it prints READY after doing so), else terminate() may
-                # land before SIGTERM is ignored and no escalation runs.
+                # Wait until the fake server process has installed its
+                # signal handlers (it prints READY after doing so), else
+                # terminate() may land before SIGTERM is ignored and no
+                # escalation runs.
                 deadline = time.monotonic() + 10
                 while b'READY' not in qdb._log_path.read_bytes():
                     if time.monotonic() > deadline:
-                        self.fail('stand-in process never became ready')
+                        self.fail('fake server process never became ready')
                     time.sleep(0.02)
 
                 stderr = io.StringIO()
@@ -123,13 +124,14 @@ class StopEscalationTest(unittest.TestCase):
                 # Cleanup must still have happened before the raise.
                 self.assertIsNone(qdb._proc)
                 self.assertIsNone(qdb._log)
-                self.assertIsNotNone(proc.poll(), 'child must be dead')
+                self.assertIsNotNone(
+                    proc.poll(), 'fake server process must be dead')
                 messages = stderr.getvalue()
                 self.assertIn('escalating to SIGKILL', messages)
                 self.assertIn('thread dump', messages)
                 log = qdb._log_path.read_bytes()
                 self.assertIn(b'FAKE THREAD DUMP', log,
-                              'SIGQUIT must reach the child')
+                              'SIGQUIT must reach the fake server process')
             finally:
                 if proc.poll() is None:
                     proc.kill()
@@ -196,8 +198,20 @@ class StopEscalationTest(unittest.TestCase):
     def test_quick_shutdown_stays_quiet(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
             qdb = _make_fixture(tmp_dir)
+            # On Windows, stop() shuts the fake server process down by sending
+            # it Ctrl+C, and Ctrl+C reaches every process sharing a console.
+            # CREATE_NO_WINDOW gives it a console of its own, as start() does
+            # for the real server, so only the fake gets the Ctrl+C. Sharing
+            # this test's console would let the Ctrl+C kill the test process
+            # too. Off Windows the flag is 0 and stop() uses SIGTERM. DEVNULL
+            # keeps the fake's Ctrl+C traceback out of the test log.
+            creationflags = (
+                subprocess.CREATE_NO_WINDOW if sys.platform == 'win32' else 0)
             qdb._proc = subprocess.Popen(
-                [sys.executable, '-c', 'import time; time.sleep(60)'])
+                [sys.executable, '-c', 'import time; time.sleep(60)'],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                creationflags=creationflags)
             stderr = io.StringIO()
             with contextlib.redirect_stderr(stderr):
                 qdb.stop(wait_timeout_sec=10)  # must not raise
@@ -264,9 +278,10 @@ class PrintLogTailTest(unittest.TestCase):
             self.assertIn('Could not read QuestDB log', stderr.getvalue())
 
 
-# Stand-ins for the probe tests: no real JVM or HTTP server is launched.
+# A fake server process and a fake HTTP response for the probe tests:
+# no real JVM or HTTP server is launched.
 class _FakeProc:
-    """Minimal subprocess stand-in: poll() reports liveness."""
+    """Minimal fake subprocess: poll() reports liveness."""
 
     def __init__(self, alive=True):
         self._alive = alive
