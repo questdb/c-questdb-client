@@ -58,14 +58,12 @@ pub(crate) struct SfaQueueOptions {
     pub(crate) slot_dir: PathBuf,
     pub(crate) segment_size_bytes: u64,
     pub(crate) max_bytes: usize,
-    pub(crate) max_in_flight: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct SfaMemoryQueueOptions {
     pub(crate) segment_size_bytes: u64,
     pub(crate) max_bytes: usize,
-    pub(crate) max_in_flight: usize,
 }
 
 #[derive(Debug)]
@@ -264,7 +262,6 @@ struct SfaEngine {
     slot_dir: Option<PathBuf>,
     max_bytes: usize,
     segment_size_bytes: u64,
-    max_in_flight: usize,
     allow_segment_creation: bool,
     state: Mutex<SfaEngineState>,
     published_upper: AtomicU64,
@@ -379,7 +376,6 @@ impl SfaFrameQueue {
             slot_dir: Some(options.slot_dir),
             max_bytes: options.max_bytes,
             segment_size_bytes: options.segment_size_bytes,
-            max_in_flight: options.max_in_flight,
             allow_segment_creation: true,
             state: Mutex::new(SfaEngineState {
                 active: Some(Arc::clone(&active)),
@@ -444,7 +440,6 @@ impl SfaFrameQueue {
             slot_dir: None,
             max_bytes: options.max_bytes,
             segment_size_bytes: options.segment_size_bytes,
-            max_in_flight: options.max_in_flight,
             allow_segment_creation: true,
             state: Mutex::new(SfaEngineState {
                 active: Some(Arc::clone(&active)),
@@ -522,7 +517,6 @@ impl SfaFrameQueue {
             slot_dir: Some(options.slot_dir),
             max_bytes: options.max_bytes,
             segment_size_bytes: options.segment_size_bytes,
-            max_in_flight: options.max_in_flight,
             allow_segment_creation: false,
             state: Mutex::new(SfaEngineState {
                 active,
@@ -689,10 +683,6 @@ impl SfaFrameQueue {
 
     pub(crate) fn completed_fsn(&self) -> Option<u64> {
         self.engine.completed_fsn()
-    }
-
-    pub(crate) fn max_in_flight(&self) -> usize {
-        self.engine.max_in_flight()
     }
 
     pub(crate) fn recovery_diagnostics(&self) -> Vec<SfaRecoveryDiagnostic> {
@@ -996,13 +986,6 @@ impl SfaEngine {
         if payload.is_empty() {
             return Err(QueueError::EmptyPayload);
         }
-        let completed = self.completed_upper.load(Ordering::Acquire);
-        let published = self.published_upper.load(Ordering::Acquire);
-        if published.saturating_sub(completed) >= self.max_in_flight as u64 {
-            return Err(QueueError::MaxInFlightReached {
-                max_in_flight: self.max_in_flight,
-            });
-        }
         let segment_payload_capacity = self.segment_payload_capacity();
         if payload.len() > segment_payload_capacity {
             return Err(QueueError::PayloadExceedsByteCapacity {
@@ -1191,10 +1174,6 @@ impl SfaEngine {
 
     fn completed_fsn(&self) -> Option<u64> {
         self.completed_upper.load(Ordering::Acquire).checked_sub(1)
-    }
-
-    fn max_in_flight(&self) -> usize {
-        self.max_in_flight
     }
 
     fn recovery_diagnostics(&self) -> Vec<SfaRecoveryDiagnostic> {
@@ -1460,10 +1439,6 @@ impl PublicationLog for SfaFrameQueue {
 
     fn completed_fsn(&self) -> Option<u64> {
         SfaFrameQueue::completed_fsn(self)
-    }
-
-    fn max_in_flight(&self) -> usize {
-        SfaFrameQueue::max_in_flight(self)
     }
 
     fn take_storage_maintenance_step(
@@ -1816,7 +1791,7 @@ fn recover_segments(options: &SfaQueueOptions) -> Result<RecoveredState, SfaQueu
 }
 
 fn validate_options(options: &SfaQueueOptions) -> Result<(), SfaQueueError> {
-    if options.max_bytes == 0 || options.max_in_flight == 0 {
+    if options.max_bytes == 0 {
         return Err(QueueError::InvalidCapacity.into());
     }
     if options.segment_size_bytes < (HEADER_SIZE + FRAME_HEADER_SIZE + 1) as u64 {
@@ -1829,7 +1804,7 @@ fn validate_options(options: &SfaQueueOptions) -> Result<(), SfaQueueError> {
 }
 
 fn validate_memory_options(options: &SfaMemoryQueueOptions) -> Result<(), SfaQueueError> {
-    if options.max_bytes == 0 || options.max_in_flight == 0 {
+    if options.max_bytes == 0 {
         return Err(QueueError::InvalidCapacity.into());
     }
     if options.segment_size_bytes < (HEADER_SIZE + FRAME_HEADER_SIZE + 1) as u64 {
@@ -2059,32 +2034,21 @@ mod tests {
         include_str!("../../tests/interop/qwp-ws-sfa/java-two-frame.sfa.hex");
 
     fn options(dir: &TempDir) -> SfaQueueOptions {
-        options_with(dir, 256, 1024, 4)
+        options_with(dir, 256, 1024)
     }
 
-    fn options_with(
-        dir: &TempDir,
-        segment_size_bytes: u64,
-        max_bytes: usize,
-        max_in_flight: usize,
-    ) -> SfaQueueOptions {
+    fn options_with(dir: &TempDir, segment_size_bytes: u64, max_bytes: usize) -> SfaQueueOptions {
         SfaQueueOptions {
             slot_dir: dir.path().to_path_buf(),
             segment_size_bytes,
             max_bytes,
-            max_in_flight,
         }
     }
 
-    fn memory_options(
-        segment_size_bytes: u64,
-        max_bytes: usize,
-        max_in_flight: usize,
-    ) -> SfaMemoryQueueOptions {
+    fn memory_options(segment_size_bytes: u64, max_bytes: usize) -> SfaMemoryQueueOptions {
         SfaMemoryQueueOptions {
             segment_size_bytes,
             max_bytes,
-            max_in_flight,
         }
     }
 
@@ -2126,7 +2090,7 @@ mod tests {
     }
 
     fn memory_queue() -> SfaFrameQueue {
-        SfaFrameQueue::open_memory(memory_options(48, 144, 4)).unwrap()
+        SfaFrameQueue::open_memory(memory_options(48, 144)).unwrap()
     }
 
     fn pending_payload_vec(payload: SfaMappedPayload) -> Vec<u8> {
@@ -2216,22 +2180,22 @@ mod tests {
     #[test]
     fn memory_queue_rejects_capacity_without_hot_spare_room() {
         assert!(matches!(
-            SfaFrameQueue::open_memory(memory_options(48, 48, 4)),
+            SfaFrameQueue::open_memory(memory_options(48, 48)),
             Err(SfaQueueError::Queue(QueueError::InvalidCapacity))
         ));
         assert!(matches!(
-            SfaFrameQueue::open_memory(memory_options(48, 95, 4)),
+            SfaFrameQueue::open_memory(memory_options(48, 95)),
             Err(SfaQueueError::Queue(QueueError::InvalidCapacity))
         ));
 
-        let queue = SfaFrameQueue::open_memory(memory_options(48, 96, 4)).unwrap();
+        let queue = SfaFrameQueue::open_memory(memory_options(48, 96)).unwrap();
         assert!(queue.hot_spare_installed());
         assert_eq!(queue.allocated_segment_bytes(), 96);
     }
 
     #[test]
     fn memory_queue_rotates_and_trims_without_filesystem_cleanup() {
-        let mut queue = SfaFrameQueue::open_memory(memory_options(48, 96, 8)).unwrap();
+        let mut queue = SfaFrameQueue::open_memory(memory_options(48, 96)).unwrap();
 
         let first = queue.try_submit(b"abcdefghij").unwrap();
         let second = queue.try_submit(b"klmnopqrst").unwrap();
@@ -2261,25 +2225,6 @@ mod tests {
         assert_eq!(third.fsn, 2);
         assert_eq!(queue.allocated_segment_bytes(), 96);
         assert!(!queue.hot_spare_installed());
-    }
-
-    /// Production non-durable queues use `UNBOUNDED_IN_FLIGHT`; this direct
-    /// queue test pins the count gate retained for durable-ACK backlog admission.
-    #[test]
-    fn memory_queue_backpressures_at_max_in_flight_before_capacity() {
-        let mut queue = SfaFrameQueue::open_memory(memory_options(128, 256, 2)).unwrap();
-
-        queue.try_submit(b"first").unwrap();
-        queue.try_submit(b"second").unwrap();
-
-        assert!(matches!(
-            queue.try_submit(b"third"),
-            Err(SfaQueueError::Queue(QueueError::MaxInFlightReached {
-                max_in_flight: 2
-            }))
-        ));
-        queue.complete_through_fsn(0).unwrap();
-        assert_eq!(queue.try_submit(b"third").unwrap().fsn, 2);
     }
 
     #[test]
@@ -2481,7 +2426,7 @@ mod tests {
         )
         .unwrap();
 
-        let queue = SfaFrameQueue::open(options_with(&dir, 256, 1024, 4)).unwrap();
+        let queue = SfaFrameQueue::open(options_with(&dir, 256, 1024)).unwrap();
 
         assert_eq!(queue.len(), 2);
         assert_eq!(queue.payload_vec_for_fsn(42).as_deref(), Some(&b"one"[..]));
@@ -2962,7 +2907,6 @@ mod tests {
             slot_dir,
             segment_size_bytes: 256,
             max_bytes: 1024,
-            max_in_flight: 4,
         })
         .unwrap();
         let server = FakeOrderedServer::ack_each_send();
@@ -3022,7 +2966,7 @@ mod tests {
     #[test]
     fn send_cursor_advances_between_segments_without_repositioning() {
         let dir = TempDir::new().unwrap();
-        let mut queue = SfaFrameQueue::open(options_with(&dir, 38, 38 * 8, 4)).unwrap();
+        let mut queue = SfaFrameQueue::open(options_with(&dir, 38, 38 * 8)).unwrap();
         submit_with_storage_maintenance(&mut queue, b"one");
         submit_with_storage_maintenance(&mut queue, b"two");
         submit_with_storage_maintenance(&mut queue, b"tri");
@@ -3042,7 +2986,7 @@ mod tests {
 
     #[test]
     fn send_cursor_repositions_after_delayed_rotation() {
-        let mut queue = SfaFrameQueue::open_memory(memory_options(38, 38 * 8, 4)).unwrap();
+        let mut queue = SfaFrameQueue::open_memory(memory_options(38, 38 * 8)).unwrap();
         submit_with_storage_maintenance(&mut queue, b"one");
         let mut send_cursor = None;
 
@@ -3061,7 +3005,7 @@ mod tests {
         use crate::alloc_counter;
 
         let dir = TempDir::new().unwrap();
-        let mut queue = SfaFrameQueue::open(options_with(&dir, 4096, 8192, 8)).unwrap();
+        let mut queue = SfaFrameQueue::open(options_with(&dir, 4096, 8192)).unwrap();
         let mut producer = queue.take_producer().unwrap();
         for _ in 0..4 {
             producer.try_submit(b"steady-state").unwrap();
@@ -3085,7 +3029,7 @@ mod tests {
     fn sfa_memory_tiny_frame_publish_zero_alloc_after_warmup() {
         use crate::alloc_counter;
 
-        let mut queue = SfaFrameQueue::open_memory(memory_options(4096, 8192, 8)).unwrap();
+        let mut queue = SfaFrameQueue::open_memory(memory_options(4096, 8192)).unwrap();
         let mut producer = queue.take_producer().unwrap();
         for _ in 0..4 {
             producer.try_submit(b"steady-state").unwrap();
@@ -3109,7 +3053,7 @@ mod tests {
     fn sfa_send_cursor_after_rotation_zero_alloc_after_warmup() {
         use crate::alloc_counter;
 
-        let mut queue = SfaFrameQueue::open_memory(memory_options(38, 38 * 8, 8)).unwrap();
+        let mut queue = SfaFrameQueue::open_memory(memory_options(38, 38 * 8)).unwrap();
         submit_with_storage_maintenance(&mut queue, b"one");
         submit_with_storage_maintenance(&mut queue, b"two");
         submit_with_storage_maintenance(&mut queue, b"tri");
@@ -3149,7 +3093,7 @@ mod tests {
     fn rotation_after_generation_zero_uses_generation_one() {
         let dir = TempDir::new().unwrap();
         {
-            let mut queue = SfaFrameQueue::open(options_with(&dir, 38, 1024, 4)).unwrap();
+            let mut queue = SfaFrameQueue::open(options_with(&dir, 38, 1024)).unwrap();
             assert_eq!(queue.try_submit(b"first").unwrap(), QwpReceipt { fsn: 0 });
             assert_eq!(queue.try_submit(b"second").unwrap(), QwpReceipt { fsn: 1 });
         }
@@ -3163,7 +3107,7 @@ mod tests {
         assert_eq!(second_scan.header.base_seq, 1);
         assert_eq!(second_scan.frames[0].payload, b"second");
 
-        let recovered = SfaFrameQueue::open(options_with(&dir, 38, 1024, 4)).unwrap();
+        let recovered = SfaFrameQueue::open(options_with(&dir, 38, 1024)).unwrap();
         assert_eq!(
             recovered.payload_vec_for_fsn(0).as_deref(),
             Some(&b"first"[..])
@@ -3179,20 +3123,20 @@ mod tests {
     fn fresh_disk_queue_rejects_capacity_without_hot_spare_room() {
         let one_segment_dir = TempDir::new().unwrap();
         assert!(matches!(
-            SfaFrameQueue::open(options_with(&one_segment_dir, 48, 48, 4)),
+            SfaFrameQueue::open(options_with(&one_segment_dir, 48, 48)),
             Err(SfaQueueError::Queue(QueueError::InvalidCapacity))
         ));
         assert_eq!(sfa_file_count(one_segment_dir.path()), 0);
 
         let undersized_dir = TempDir::new().unwrap();
         assert!(matches!(
-            SfaFrameQueue::open(options_with(&undersized_dir, 48, 95, 4)),
+            SfaFrameQueue::open(options_with(&undersized_dir, 48, 95)),
             Err(SfaQueueError::Queue(QueueError::InvalidCapacity))
         ));
         assert_eq!(sfa_file_count(undersized_dir.path()), 0);
 
         let publishable_dir = TempDir::new().unwrap();
-        let queue = SfaFrameQueue::open(options_with(&publishable_dir, 48, 96, 4)).unwrap();
+        let queue = SfaFrameQueue::open(options_with(&publishable_dir, 48, 96)).unwrap();
         assert!(queue.hot_spare_installed());
         assert_eq!(queue.allocated_segment_bytes(), 96);
         assert_eq!(sfa_file_count(publishable_dir.path()), 2);
@@ -3201,7 +3145,7 @@ mod tests {
     #[test]
     fn rotation_uses_prepared_hot_spare_and_respects_segment_cap() {
         let dir = TempDir::new().unwrap();
-        let mut queue = SfaFrameQueue::open(options_with(&dir, 38, 76, 4)).unwrap();
+        let mut queue = SfaFrameQueue::open(options_with(&dir, 38, 76)).unwrap();
 
         assert_eq!(sfa_file_count(dir.path()), 2);
         assert_eq!(queue.try_submit(b"first").unwrap(), QwpReceipt { fsn: 0 });
@@ -3225,7 +3169,7 @@ mod tests {
         // self-provision segments inline — without any maintenance running
         // (the runner may be parked in a blocking socket send) — until the
         // byte budget is exhausted.
-        let mut queue = SfaFrameQueue::open_memory(memory_options(48, 192, 16)).unwrap();
+        let mut queue = SfaFrameQueue::open_memory(memory_options(48, 192)).unwrap();
 
         assert_eq!(queue.try_submit(b"abcdefghij").unwrap().fsn, 0);
         assert_eq!(queue.try_submit(b"klmnopqrst").unwrap().fsn, 1);
@@ -3256,7 +3200,7 @@ mod tests {
     #[test]
     fn detached_producer_rotation_survives_stalled_runner_maintenance() {
         let dir = TempDir::new().unwrap();
-        let mut queue = SfaFrameQueue::open(options_with(&dir, 38, 152, 8)).unwrap();
+        let mut queue = SfaFrameQueue::open(options_with(&dir, 38, 152)).unwrap();
         let mut producer = queue.take_producer().unwrap();
 
         assert_eq!(producer.try_submit(b"one").unwrap().fsn, 0);
@@ -3281,7 +3225,7 @@ mod tests {
     #[test]
     fn progress_maintains_missing_hot_spare_when_capacity_allows() {
         let dir = TempDir::new().unwrap();
-        let mut queue = SfaFrameQueue::open(options_with(&dir, 38, 114, 4)).unwrap();
+        let mut queue = SfaFrameQueue::open(options_with(&dir, 38, 114)).unwrap();
 
         queue.try_submit(b"first").unwrap();
         queue.try_submit(b"second").unwrap();
@@ -3301,7 +3245,7 @@ mod tests {
     #[test]
     fn detached_producer_rotates_replays_and_trims_runner_owned_segments() {
         let dir = TempDir::new().unwrap();
-        let mut queue = SfaFrameQueue::open(options_with(&dir, 38, 114, 4)).unwrap();
+        let mut queue = SfaFrameQueue::open(options_with(&dir, 38, 114)).unwrap();
         let mut producer = queue.take_producer().unwrap();
 
         assert_eq!(producer.try_submit(b"one").unwrap(), QwpReceipt { fsn: 0 });
@@ -3325,7 +3269,7 @@ mod tests {
     #[test]
     fn active_segment_published_offset_is_the_payload_visibility_barrier() {
         let dir = TempDir::new().unwrap();
-        let queue = SfaFrameQueue::open(options_with(&dir, 256, 512, 4)).unwrap();
+        let queue = SfaFrameQueue::open(options_with(&dir, 256, 512)).unwrap();
         let active = queue.engine.segments_snapshot().active.unwrap();
 
         let appended = active
@@ -3343,7 +3287,7 @@ mod tests {
     #[test]
     fn abandoned_hot_spare_after_close_does_not_change_capacity_or_leak_file() {
         let dir = TempDir::new().unwrap();
-        let mut queue = SfaFrameQueue::open(options_with(&dir, 38, 114, 4)).unwrap();
+        let mut queue = SfaFrameQueue::open(options_with(&dir, 38, 114)).unwrap();
         queue.try_submit(b"first").unwrap();
         queue.try_submit(b"second").unwrap();
         assert_eq!(sfa_file_count(dir.path()), 2);
@@ -3369,7 +3313,7 @@ mod tests {
     #[test]
     fn abandoned_hot_spare_after_lifecycle_change_does_not_change_capacity_or_leak_file() {
         let dir = TempDir::new().unwrap();
-        let mut queue = SfaFrameQueue::open(options_with(&dir, 38, 114, 4)).unwrap();
+        let mut queue = SfaFrameQueue::open(options_with(&dir, 38, 114)).unwrap();
         queue.try_submit(b"first").unwrap();
         queue.try_submit(b"second").unwrap();
 
@@ -3397,7 +3341,7 @@ mod tests {
         second.try_append(b"second").unwrap();
         drop(second);
 
-        let mut queue = SfaFrameQueue::open(options_with(&dir, 38, 38, 4)).unwrap();
+        let mut queue = SfaFrameQueue::open(options_with(&dir, 38, 38)).unwrap();
 
         assert_eq!(queue.len(), 2);
         assert_eq!(queue.payload_vec_for_fsn(0).as_deref(), Some(&b"first"[..]));
@@ -3420,7 +3364,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let first_path = spare_segment_path(dir.path(), 0);
         let second_path = spare_segment_path(dir.path(), 1);
-        let mut queue = SfaFrameQueue::open(options_with(&dir, 38, 1024, 4)).unwrap();
+        let mut queue = SfaFrameQueue::open(options_with(&dir, 38, 1024)).unwrap();
         queue.try_submit(b"first").unwrap();
         queue.try_submit(b"second").unwrap();
 
@@ -3439,7 +3383,7 @@ mod tests {
 
         let dir = TempDir::new().unwrap();
         let first_path = spare_segment_path(dir.path(), 0);
-        let mut queue = SfaFrameQueue::open(options_with(&dir, 38, 76, 4)).unwrap();
+        let mut queue = SfaFrameQueue::open(options_with(&dir, 38, 76)).unwrap();
         queue.try_submit(b"first").unwrap();
         queue.try_submit(b"second").unwrap();
         queue.complete_through_fsn(1).unwrap();

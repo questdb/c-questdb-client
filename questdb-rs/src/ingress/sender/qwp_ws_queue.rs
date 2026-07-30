@@ -28,22 +28,6 @@
 
 use super::qwp_ws_sfa_segment::SfaMappedPayload;
 
-/// The wire-side in-flight frame count used now that `max_in_flight` /
-/// `in_flight_window` no longer throttle pipelining.
-///
-/// Every production [`SendCursor::peek_next_frame_from_oldest`] compares
-/// against this, so the I/O thread streams at full speed. Producer admission
-/// also uses it in ordinary-ACK mode, where no per-frame ACK metadata survives
-/// an OK and the segment ring's byte budget is sufficient. Durable-ACK mode
-/// instead retains the historical configured count as an admission-only bound:
-/// each ordinary OK owns table/seqTxn metadata until durable coverage arrives.
-///
-/// The plumbing stays in place for one release so the mechanism can be
-/// restored or removed wholesale without reshaping the queue/driver API.
-///
-/// [`SendCursor::peek_next_frame_from_oldest`]: super::qwp_ws_driver::SendCursor
-pub(crate) const UNBOUNDED_IN_FLIGHT: usize = usize::MAX;
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct QwpReceipt {
     pub(crate) fsn: u64,
@@ -143,9 +127,6 @@ pub(crate) enum QueueError {
         segment_size_bytes: u64,
         allocated_segment_bytes: u64,
         max_total_bytes: u64,
-    },
-    MaxInFlightReached {
-        max_in_flight: usize,
     },
     NoUnsentFrame,
     ProtocolAckWithoutConnection,

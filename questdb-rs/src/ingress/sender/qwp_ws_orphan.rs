@@ -54,8 +54,6 @@ use super::qwp_ws_driver::{
     QwpWsPublicationStore, QwpWsSendCore, ReconnectPolicy,
 };
 #[cfg(feature = "sync-sender-qwp-ws")]
-use super::qwp_ws_queue::UNBOUNDED_IN_FLIGHT;
-#[cfg(feature = "sync-sender-qwp-ws")]
 use super::qwp_ws_sfa_queue::{SfaQueueError, SfaQueueOptions};
 #[cfg(feature = "sync-sender-qwp-ws")]
 use super::qwp_ws_sfa_slot::SfaSlotQueue;
@@ -167,8 +165,6 @@ impl OrphanDrainerConfig {
             slot_dir,
             segment_size_bytes: *self.qwp_ws.sf_max_segment_bytes,
             max_bytes,
-            // Replay-only queues never admit publications.
-            max_in_flight: UNBOUNDED_IN_FLIGHT,
         })
     }
 }
@@ -464,8 +460,6 @@ impl OrphanDrainer {
         if orphan_stop_requested(stop) {
             return OrphanOpenOutcome::Stopped;
         }
-        // Match Java: orphan replay has no frame-count window.
-        let max_in_flight = UNBOUNDED_IN_FLIGHT;
         // A delta-encoded slot's stored frames are not self-sufficient, so before
         // replaying them to the fresh server the drainer must re-register the whole
         // dictionary via a catch-up frame -- exactly as the foreground does on
@@ -510,7 +504,6 @@ impl OrphanDrainer {
         let store = QwpWsPublicationStore::new(queue, DEFAULT_EVENT_CAPACITY);
         let mut send_core = QwpWsSendCore::new_with_durable_ack_and_rejection_limit(
             transport,
-            max_in_flight,
             ReconnectPolicy::bounded(
                 *config.qwp_ws.reconnect_max_duration,
                 *config.qwp_ws.reconnect_initial_backoff,
@@ -888,21 +881,6 @@ mod tests {
 
     #[cfg(feature = "sync-sender-qwp-ws")]
     #[test]
-    fn orphan_replay_does_not_apply_configured_frame_count_limit() {
-        let qwp_ws = QwpWsConfig {
-            request_durable_ack: ConfigSetting::new_default(true),
-            max_in_flight: ConfigSetting::new_default(1),
-            ..QwpWsConfig::default()
-        };
-        let config = OrphanDrainerConfig::new("127.0.0.1", "1", false, None, &qwp_ws, None);
-
-        let options = config.queue_options(PathBuf::from("orphan")).unwrap();
-
-        assert_eq!(options.max_in_flight, UNBOUNDED_IN_FLIGHT);
-    }
-
-    #[cfg(feature = "sync-sender-qwp-ws")]
-    #[test]
     fn background_pool_close_allows_graceful_finish_before_stop() {
         let stop = Arc::new(AtomicBool::new(false));
         let observed_stop = Arc::new(AtomicBool::new(true));
@@ -995,7 +973,6 @@ mod tests {
             sender_id: sender_id.to_owned(),
             segment_size_bytes: 256,
             max_bytes: 1024,
-            max_in_flight: 4,
         }
     }
 

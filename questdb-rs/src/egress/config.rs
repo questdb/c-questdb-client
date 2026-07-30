@@ -551,10 +551,7 @@ pub(crate) const INGRESS_ONLY_CONFIG_KEYS: &[&str] = &[
     // Generic auth timeout (Duration in millis; distinct from the
     // shared `auth_timeout_ms` which is QWP-WS-specific on ingress).
     "auth_timeout",
-    // QWP-WS pacing / in-flight
-    // Deprecated wire-window controls (no-op without durable ACK); kept for compatibility.
-    "in_flight_window",
-    "max_in_flight",
+    // QWP-WS pacing
     "qwp_ws_progress",
     "max_frame_rejections",
     "poison_min_escalation_window_millis",

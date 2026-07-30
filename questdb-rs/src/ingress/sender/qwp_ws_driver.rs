@@ -481,10 +481,6 @@ impl<Q: PublicationLog> QwpWsPublicationStore<Q> {
         self.lifecycle.clone()
     }
 
-    pub(crate) fn max_in_flight(&self) -> usize {
-        self.queue.max_in_flight()
-    }
-
     pub(crate) fn try_submit(&mut self, payload: &[u8]) -> Result<QwpReceipt, DriverError> {
         match self.lifecycle.load() {
             PublicationState::Open => {}
@@ -828,23 +824,17 @@ impl<Q: PublicationLog> QwpWsPublicationStore<Q> {
 }
 
 impl<T: QwpWsCoreTransport> QwpWsSendCore<T> {
-    pub(crate) fn new(
-        transport: T,
-        max_in_flight: usize,
-        reconnect_policy: ReconnectPolicy,
-    ) -> Self {
-        Self::new_with_durable_ack(transport, max_in_flight, reconnect_policy, false)
+    pub(crate) fn new(transport: T, reconnect_policy: ReconnectPolicy) -> Self {
+        Self::new_with_durable_ack(transport, reconnect_policy, false)
     }
 
     pub(crate) fn new_with_durable_ack(
         transport: T,
-        max_in_flight: usize,
         reconnect_policy: ReconnectPolicy,
         durable_ack: bool,
     ) -> Self {
         Self::new_with_durable_ack_and_rejection_limit(
             transport,
-            max_in_flight,
             reconnect_policy,
             durable_ack,
             DEFAULT_MAX_FRAME_REJECTIONS,
@@ -854,7 +844,6 @@ impl<T: QwpWsCoreTransport> QwpWsSendCore<T> {
 
     pub(crate) fn new_with_durable_ack_and_rejection_limit(
         transport: T,
-        max_in_flight: usize,
         reconnect_policy: ReconnectPolicy,
         durable_ack: bool,
         max_frame_rejections: usize,
@@ -862,7 +851,7 @@ impl<T: QwpWsCoreTransport> QwpWsSendCore<T> {
     ) -> Self {
         Self {
             transport,
-            send_cursor: SendCursor::new(max_in_flight),
+            send_cursor: SendCursor::new(),
             dict_mirror: SentDictMirror::new(false),
             catch_up_pending: false,
             durable_ack: durable_ack.then(DurableAckTracker::new),
@@ -2196,14 +2185,9 @@ impl QwpWsCoreTestHarness<SfaFrameQueue, FakeOrderedServer> {
         server: FakeOrderedServer,
     ) -> Result<Self, DriverError> {
         let queue = SfaFrameQueue::open_memory(options)?;
-        let max_in_flight = queue.max_in_flight();
         Ok(Self {
             store: QwpWsPublicationStore::new(queue, DEFAULT_EVENT_CAPACITY),
-            send_core: QwpWsSendCore::new(
-                server,
-                max_in_flight,
-                ReconnectPolicy::no_backoff(Duration::MAX),
-            ),
+            send_core: QwpWsSendCore::new(server, ReconnectPolicy::no_backoff(Duration::MAX)),
         })
     }
 }
@@ -2211,14 +2195,9 @@ impl QwpWsCoreTestHarness<SfaFrameQueue, FakeOrderedServer> {
 #[cfg(test)]
 impl<Q: PublicationLog, T: QwpWsCoreTransport> QwpWsCoreTestHarness<Q, T> {
     pub(crate) fn from_queue(queue: Q, transport: T) -> Self {
-        let max_in_flight = queue.max_in_flight();
         Self {
             store: QwpWsPublicationStore::new(queue, DEFAULT_EVENT_CAPACITY),
-            send_core: QwpWsSendCore::new(
-                transport,
-                max_in_flight,
-                ReconnectPolicy::no_backoff(Duration::MAX),
-            ),
+            send_core: QwpWsSendCore::new(transport, ReconnectPolicy::no_backoff(Duration::MAX)),
         }
     }
 
@@ -2228,12 +2207,10 @@ impl<Q: PublicationLog, T: QwpWsCoreTransport> QwpWsCoreTestHarness<Q, T> {
         reconnect_policy: ReconnectPolicy,
         durable_ack: bool,
     ) -> Self {
-        let max_in_flight = queue.max_in_flight();
         Self {
             store: QwpWsPublicationStore::new(queue, DEFAULT_EVENT_CAPACITY),
             send_core: QwpWsSendCore::new_with_durable_ack(
                 transport,
-                max_in_flight,
                 reconnect_policy,
                 durable_ack,
             ),
@@ -2246,12 +2223,10 @@ impl<Q: PublicationLog, T: QwpWsCoreTransport> QwpWsCoreTestHarness<Q, T> {
         max_frame_rejections: usize,
         poison_min_escalation_window: Duration,
     ) -> Self {
-        let max_in_flight = queue.max_in_flight();
         Self {
             store: QwpWsPublicationStore::new(queue, DEFAULT_EVENT_CAPACITY),
             send_core: QwpWsSendCore::new_with_durable_ack_and_rejection_limit(
                 transport,
-                max_in_flight,
                 ReconnectPolicy::no_backoff(Duration::MAX),
                 false,
                 max_frame_rejections,
@@ -2265,24 +2240,17 @@ impl<Q: PublicationLog, T: QwpWsCoreTransport> QwpWsCoreTestHarness<Q, T> {
         transport: T,
         event_capacity: usize,
     ) -> Self {
-        let max_in_flight = queue.max_in_flight();
         Self {
             store: QwpWsPublicationStore::new(queue, event_capacity),
-            send_core: QwpWsSendCore::new(
-                transport,
-                max_in_flight,
-                ReconnectPolicy::no_backoff(Duration::MAX),
-            ),
+            send_core: QwpWsSendCore::new(transport, ReconnectPolicy::no_backoff(Duration::MAX)),
         }
     }
 
     fn from_queue_with_durable_ack(queue: Q, transport: T) -> Self {
-        let max_in_flight = queue.max_in_flight();
         Self {
             store: QwpWsPublicationStore::new(queue, DEFAULT_EVENT_CAPACITY),
             send_core: QwpWsSendCore::new_with_durable_ack(
                 transport,
-                max_in_flight,
                 ReconnectPolicy::no_backoff(Duration::MAX),
                 true,
             ),
@@ -2312,7 +2280,6 @@ impl<Q: PublicationLog, T: QwpWsCoreTransport> QwpWsCoreTestHarness<Q, T> {
                 Err(DriverError::Queue(
                     QueueError::FrameCapacityFull { .. }
                     | QueueError::ByteCapacityFull { .. }
-                    | QueueError::MaxInFlightReached { .. }
                     | QueueError::StorageSpareNotReady { .. }
                     | QueueError::StorageSegmentCapFull { .. },
                 )) if drive_steps < max_drive_steps => {
@@ -2322,7 +2289,6 @@ impl<Q: PublicationLog, T: QwpWsCoreTransport> QwpWsCoreTestHarness<Q, T> {
                 Err(DriverError::Queue(
                     err @ (QueueError::FrameCapacityFull { .. }
                     | QueueError::ByteCapacityFull { .. }
-                    | QueueError::MaxInFlightReached { .. }
                     | QueueError::StorageSpareNotReady { .. }
                     | QueueError::StorageSegmentCapFull { .. }),
                 )) => {
@@ -2683,12 +2649,10 @@ pub(crate) trait PublicationLog {
     fn receipt_status(&self, receipt: QwpReceipt) -> QwpReceiptStatus;
     fn published_fsn(&self) -> Option<u64>;
     fn completed_fsn(&self) -> Option<u64>;
-    fn max_in_flight(&self) -> usize;
 }
 
 #[derive(Debug)]
 pub(crate) struct SendCursor {
-    max_in_flight: usize,
     fsn_at_zero: Option<u64>,
     next_fsn: Option<u64>,
     /// Inclusive publication boundary captured at the last successful
@@ -2709,12 +2673,11 @@ pub(crate) struct SendCursor {
     /// [`Self::commit_sent`] only accepts the frame matching `next_fsn` /
     /// `next_wire_seq` and advances both by one, so the run is always
     /// contiguous in both sequences and the anchor describes it completely.
-    /// A per-frame `VecDeque` used to be equivalent and bounded by
-    /// `max_in_flight`; with the window gone the run is bounded only by the
-    /// segment ring's byte budget, which would make it millions of entries of
-    /// derivable state that `sf_max_total_bytes` does not account for. This
-    /// matches the Java client, whose send loop also tracks acked frames by
-    /// FSN arithmetic and keeps no per-frame heap.
+    /// The run is bounded only by the segment ring's byte budget, so a
+    /// per-frame `VecDeque` would reach millions of entries of derivable state
+    /// that `sf_max_total_bytes` does not account for. The anchor-plus-count
+    /// form is O(1) regardless. This matches the Java client, whose send loop
+    /// also tracks acked frames by FSN arithmetic and keeps no per-frame heap.
     in_flight: InFlightRun,
     sfa_cursor: Option<SfaSendCursor>,
 }
@@ -2775,9 +2738,8 @@ impl InFlightRun {
 }
 
 impl SendCursor {
-    fn new(max_in_flight: usize) -> Self {
+    fn new() -> Self {
         Self {
-            max_in_flight,
             fsn_at_zero: None,
             next_fsn: None,
             replay_target_fsn: None,
@@ -2797,10 +2759,6 @@ impl SendCursor {
         &mut self,
         oldest_unresolved_fsn: Option<u64>,
     ) -> Result<Option<(u64, u64)>, DriverError> {
-        if self.in_flight.len() >= self.max_in_flight {
-            return Ok(None);
-        }
-
         let fsn = match self.next_fsn {
             Some(fsn) => fsn,
             None => {
@@ -2819,11 +2777,6 @@ impl SendCursor {
     /// Commits a successfully handed-off frame and reports whether it belongs
     /// to the replay window armed by [`Self::restart`].
     fn commit_sent(&mut self, frame: SentFrame) -> Result<bool, DriverError> {
-        if self.in_flight.len() >= self.max_in_flight {
-            return Err(DriverError::Queue(QueueError::MaxInFlightReached {
-                max_in_flight: self.max_in_flight,
-            }));
-        }
         if self.next_fsn != Some(frame.fsn) || self.next_wire_seq != frame.wire_seq {
             return Err(DriverError::Queue(QueueError::OutboundFrameUnavailable {
                 fsn: frame.fsn,
@@ -3522,7 +3475,6 @@ fn driver_backpressure_queue(err: &DriverError) -> Option<QueueError> {
         DriverError::Queue(
             err @ (QueueError::FrameCapacityFull { .. }
             | QueueError::ByteCapacityFull { .. }
-            | QueueError::MaxInFlightReached { .. }
             | QueueError::StorageSpareNotReady { .. }
             | QueueError::StorageSegmentCapFull { .. }),
         ) => Some(*err),
@@ -4089,7 +4041,7 @@ mod tests {
 
     #[test]
     fn catch_up_offset_maps_replay_acks_and_ignores_catch_up_acks() {
-        let mut cursor = SendCursor::new(100);
+        let mut cursor = SendCursor::new();
         // Simulate a reconnect that rewound to oldest-unresolved FSN 5, then a
         // 3-frame dictionary catch-up sent ahead of the replay frames.
         cursor.fsn_at_zero = Some(5);
@@ -4131,7 +4083,7 @@ mod tests {
     fn no_catch_up_leaves_wire_mapping_unchanged() {
         // catch_up_offset stays 0 (full-dict mode / no reconnect catch-up), so the
         // mapping is the plain fsn_at_zero + wire_seq it always was.
-        let mut cursor = SendCursor::new(100);
+        let mut cursor = SendCursor::new();
         cursor.fsn_at_zero = Some(10);
         cursor.next_fsn = Some(10);
         cursor
@@ -4752,15 +4704,10 @@ mod tests {
         }
     }
 
-    fn options(
-        _max_frames: usize,
-        max_bytes: usize,
-        max_in_flight: usize,
-    ) -> SfaMemoryQueueOptions {
+    fn options(_max_frames: usize, max_bytes: usize) -> SfaMemoryQueueOptions {
         SfaMemoryQueueOptions {
             segment_size_bytes: 256,
             max_bytes,
-            max_in_flight,
         }
     }
 
@@ -4771,7 +4718,7 @@ mod tests {
     type FakeDriver = QwpWsCoreTestHarness<SfaFrameQueue, FakeOrderedServer>;
 
     fn driver(server: FakeOrderedServer) -> FakeDriver {
-        QwpWsCoreTestHarness::new(options(8, 1024, 4), server).unwrap()
+        QwpWsCoreTestHarness::new(options(8, 1024), server).unwrap()
     }
 
     #[derive(Debug)]
@@ -4824,7 +4771,7 @@ mod tests {
     }
 
     fn durable_driver(server: FakeOrderedServer) -> FakeDriver {
-        QwpWsCoreTestHarness::from_queue_with_durable_ack(memory_queue(options(8, 1024, 4)), server)
+        QwpWsCoreTestHarness::from_queue_with_durable_ack(memory_queue(options(8, 1024)), server)
     }
 
     fn durable_driver_with_options(
@@ -4836,7 +4783,7 @@ mod tests {
 
     fn driver_with_event_capacity(server: FakeOrderedServer, event_capacity: usize) -> FakeDriver {
         QwpWsCoreTestHarness::from_queue_with_event_capacity(
-            memory_queue(options(8, 1024, 4)),
+            memory_queue(options(8, 1024)),
             server,
             event_capacity,
         )
@@ -5108,7 +5055,7 @@ mod tests {
         let buffer = qwp_buffer("SYM_001", 7, 1_000);
         let expected = replay_payload(&buffer);
         let driver = QwpWsCoreTestHarness::from_queue(
-            memory_queue(options(8, 4096, 4)),
+            memory_queue(options(8, 4096)),
             TestTransport::scripted([Ok(TransportSendResult::NoResponse)]),
         );
         let mut driver = driver;
@@ -5133,7 +5080,7 @@ mod tests {
     fn publisher_rejects_empty_buffer_without_publication() {
         let buffer = Buffer::qwp_ws_with_max_name_len(127);
         let driver = QwpWsCoreTestHarness::from_queue(
-            memory_queue(options(8, 4096, 4)),
+            memory_queue(options(8, 4096)),
             TestTransport::scripted([]),
         );
         let mut driver = driver;
@@ -5151,39 +5098,6 @@ mod tests {
         assert!(driver.send_core.transport.sent_payloads.is_empty());
     }
 
-    #[test]
-    fn publisher_failed_queue_publication_does_not_consume_fsn() {
-        let first = qwp_buffer("SYM_001", 1, 1_000);
-        let second = qwp_buffer("SYM_002", 2, 2_000);
-        let third = qwp_buffer("SYM_003", 3, 3_000);
-        let driver = QwpWsCoreTestHarness::from_queue(
-            memory_queue(options(1, 4096, 1)),
-            TestTransport::scripted([Ok(TransportSendResult::Response(TransportResponse::Ack {
-                wire_seq: 0,
-            }))]),
-        );
-        let mut driver = driver;
-        let mut encoder = QwpWsReplayEncoder::new(1);
-
-        let first_receipt =
-            publish_qwp(&mut driver, &mut encoder, first.as_qwp_ws().unwrap()).unwrap();
-        let err = publish_qwp(&mut driver, &mut encoder, second.as_qwp_ws().unwrap()).unwrap_err();
-        assert!(matches!(
-            err,
-            PublishTestError::Driver(DriverError::Queue(QueueError::MaxInFlightReached {
-                max_in_flight: 1
-            }))
-        ));
-        assert_eq!(
-            wait_for_delivery(&mut driver, first_receipt, Duration::from_secs(5)).unwrap(),
-            DeliveryOutcome::Completed
-        );
-
-        let third_receipt =
-            publish_qwp(&mut driver, &mut encoder, third.as_qwp_ws().unwrap()).unwrap();
-        assert_eq!(third_receipt, QwpReceipt { fsn: 1 });
-    }
-
     /// Run with:
     /// `cargo test --features sync-sender-qwp-ws --lib publisher_memory_sfa_zero_alloc_after_warmup -- --ignored --test-threads=1`
     #[test]
@@ -5192,7 +5106,7 @@ mod tests {
         use crate::alloc_counter;
 
         let buffer = qwp_buffer("SYM_001", 7, 1_000);
-        let queue = memory_queue(options(8, 4096, 4));
+        let queue = memory_queue(options(8, 4096));
         let driver = QwpWsCoreTestHarness::from_queue(queue, FakeOrderedServer::ack_each_send());
         let mut driver = driver;
         let mut encoder = QwpWsReplayEncoder::new(1);
@@ -5225,7 +5139,7 @@ mod tests {
         let rows = qwp_ws_columnar_bench_rows();
         let batches = rows.div_ceil(QWP_WS_COLUMNAR_BENCH_BATCH_SIZE);
         let mut buffer = Buffer::qwp_ws_with_max_name_len(127);
-        let queue = memory_queue(options(8, 1 << 20, 4));
+        let queue = memory_queue(options(8, 1 << 20));
         let driver = QwpWsCoreTestHarness::from_queue(queue, FakeOrderedServer::ack_each_send());
         let mut driver = driver;
         let mut encoder = QwpWsReplayEncoder::new(1);
@@ -5466,7 +5380,7 @@ mod tests {
             "should not poll",
         )))]);
         let mut driver =
-            QwpWsCoreTestHarness::from_queue(memory_queue(options(8, 1024, 2)), transport);
+            QwpWsCoreTestHarness::from_queue(memory_queue(options(8, 1024)), transport);
         let first = driver.try_submit(b"first").unwrap();
         let second = driver.try_submit(b"second").unwrap();
 
@@ -5525,7 +5439,7 @@ mod tests {
                 wire_seq: 0,
             }))]);
         let mut driver =
-            QwpWsCoreTestHarness::from_queue(memory_queue(options(8, 1024, 2)), transport);
+            QwpWsCoreTestHarness::from_queue(memory_queue(options(8, 1024)), transport);
         let receipt = driver.try_submit(b"payload").unwrap();
 
         assert_eq!(
@@ -5614,73 +5528,97 @@ mod tests {
 
     #[test]
     fn blocking_submit_drives_until_local_capacity_frees() {
-        let mut driver =
-            QwpWsCoreTestHarness::new(options(1, 1024, 1), FakeOrderedServer::ack_each_send())
-                .unwrap();
-        let first = driver.try_submit(b"first").unwrap();
+        // Byte-budget backpressure that frees on ACK: two 10-byte frames fill
+        // the two-segment budget, and the acking server lets driving complete
+        // and trim an earlier frame's segment, so the blocked third submit
+        // proceeds and reuses the next sequential FSN.
+        let mut driver = QwpWsCoreTestHarness::new(
+            SfaMemoryQueueOptions {
+                segment_size_bytes: 48,
+                max_bytes: 96,
+            },
+            FakeOrderedServer::ack_each_send(),
+        )
+        .unwrap();
+        let first = driver.try_submit(b"aaaaaaaaaa").unwrap();
+        driver.try_submit(b"bbbbbbbbbb").unwrap();
 
-        let second = driver.submit_with_drive_limit(b"second", 1).unwrap();
+        let third = driver.submit_with_drive_limit(b"cccccccccc", 16).unwrap();
 
         assert_eq!(
             driver.receipt_status(first),
             QwpReceiptStatus::Completed { fsn: 0 }
         );
-        assert_eq!(
-            driver.receipt_status(second),
-            QwpReceiptStatus::Published { fsn: 1 }
-        );
-        assert_eq!(driver.send_core.transport.sent_frames().len(), 1);
+        assert_eq!(third, QwpReceipt { fsn: 2 });
     }
 
     #[test]
     fn blocking_submit_times_out_when_capacity_does_not_free() {
-        let mut driver =
-            QwpWsCoreTestHarness::new(options(1, 1024, 1), FakeOrderedServer::no_response())
-                .unwrap();
-        driver.try_submit(b"first").unwrap();
+        // Byte-budget backpressure: two 10-byte frames fill the two-segment
+        // budget, and the never-responding server never completes them, so a
+        // third blocking submit exhausts its drive budget and times out.
+        let mut driver = QwpWsCoreTestHarness::new(
+            SfaMemoryQueueOptions {
+                segment_size_bytes: 48,
+                max_bytes: 96,
+            },
+            FakeOrderedServer::no_response(),
+        )
+        .unwrap();
+        driver.try_submit(b"aaaaaaaaaa").unwrap();
+        driver.try_submit(b"bbbbbbbbbb").unwrap();
 
-        assert_eq!(
-            driver.submit_with_drive_limit(b"second", 1),
+        assert!(matches!(
+            driver.submit_with_drive_limit(b"cccccccccc", 1),
             Err(DriverError::SubmitTimedOut {
-                backpressure: Some(QueueError::MaxInFlightReached { max_in_flight: 1 })
+                backpressure: Some(QueueError::StorageSegmentCapFull { .. })
             })
-        );
+        ));
     }
 
     #[test]
     fn blocking_submit_deadline_continues_past_fixed_step_budget() {
-        let queue = memory_queue(options(1, 1024, 1));
+        // The deadline-based blocking submit keeps driving past the fixed
+        // per-call step budget until a delayed ACK completes an earlier frame,
+        // trims its segment, and frees byte capacity for the blocked submit.
+        let queue = memory_queue(SfaMemoryQueueOptions {
+            segment_size_bytes: 48,
+            max_bytes: 96,
+        });
         let mut driver = QwpWsCoreTestHarness::from_queue(queue, DelayedPollAckServer::new(20));
-        let first = driver.try_submit(b"first").unwrap();
+        let first = driver.try_submit(b"aaaaaaaaaa").unwrap();
+        driver.try_submit(b"bbbbbbbbbb").unwrap();
 
-        let second = driver
-            .submit_with_drive_deadline(b"second", Duration::from_secs(2))
+        let third = driver
+            .submit_with_drive_deadline(b"cccccccccc", Duration::from_secs(2))
             .unwrap();
 
         assert_eq!(
             driver.receipt_status(first),
             QwpReceiptStatus::Completed { fsn: 0 }
         );
-        assert_eq!(
-            driver.receipt_status(second),
-            QwpReceiptStatus::Published { fsn: 1 }
-        );
-        assert_eq!(driver.send_core.transport.sent_frames.len(), 1);
+        assert_eq!(third, QwpReceipt { fsn: 2 });
     }
 
     #[test]
     fn blocking_submit_deadline_can_expire_before_driving() {
-        let mut driver =
-            QwpWsCoreTestHarness::new(options(1, 1024, 1), FakeOrderedServer::no_response())
-                .unwrap();
-        driver.try_submit(b"first").unwrap();
+        let mut driver = QwpWsCoreTestHarness::new(
+            SfaMemoryQueueOptions {
+                segment_size_bytes: 48,
+                max_bytes: 96,
+            },
+            FakeOrderedServer::no_response(),
+        )
+        .unwrap();
+        driver.try_submit(b"aaaaaaaaaa").unwrap();
+        driver.try_submit(b"bbbbbbbbbb").unwrap();
 
-        assert_eq!(
-            driver.submit_with_drive_deadline(b"second", Duration::ZERO),
+        assert!(matches!(
+            driver.submit_with_drive_deadline(b"cccccccccc", Duration::ZERO),
             Err(DriverError::SubmitTimedOut {
-                backpressure: Some(QueueError::MaxInFlightReached { max_in_flight: 1 })
+                backpressure: Some(QueueError::StorageSegmentCapFull { .. })
             })
-        );
+        ));
         assert!(driver.send_core.transport.sent_frames().is_empty());
     }
 
@@ -5793,35 +5731,24 @@ mod tests {
         assert_eq!(tracker.pending_wire_seq_for_fsn(104), None);
     }
 
-    /// The wire-side in-flight window is no longer reachable from
-    /// configuration: every production send cursor uses
-    /// `UNBOUNDED_IN_FLIGHT`. Durable-ACK queues may still use the configured
-    /// value as an admission-only backlog bound. This test constructs the
-    /// queue directly with a small window, so it keeps pinning the old coupled
-    /// mechanism while it remains in the code.
+    /// The wire cursor streams every buffered frame without an in-flight cap:
+    /// three publications all reach the transport before the queue idles.
     #[test]
-    fn drive_once_sends_until_max_in_flight() {
+    fn drive_once_streams_without_in_flight_cap() {
         let mut driver =
-            QwpWsCoreTestHarness::new(options(8, 1024, 2), FakeOrderedServer::no_response())
-                .unwrap();
+            QwpWsCoreTestHarness::new(options(8, 4096), FakeOrderedServer::no_response()).unwrap();
         driver.try_submit(b"a").unwrap();
         driver.try_submit(b"b").unwrap();
-        assert!(matches!(
-            driver.try_submit(b"c"),
-            Err(DriverError::Queue(QueueError::MaxInFlightReached {
-                max_in_flight: 2
-            }))
-        ));
+        driver.try_submit(b"c").unwrap();
 
-        assert!(matches!(
-            driver.drive_once().unwrap(),
-            DriveOutcome::Sent(_)
-        ));
-        assert!(matches!(
-            driver.drive_once().unwrap(),
-            DriveOutcome::Sent(_)
-        ));
+        for _ in 0..3 {
+            assert!(matches!(
+                driver.drive_once().unwrap(),
+                DriveOutcome::Sent(_)
+            ));
+        }
         assert_eq!(driver.drive_once().unwrap(), DriveOutcome::Idle);
+        assert_eq!(driver.send_core.transport.sent_frames().len(), 3);
     }
 
     #[test]
@@ -5865,7 +5792,7 @@ mod tests {
             Ok(()),
         ]);
         let mut driver = QwpWsCoreTestHarness::from_queue_with_reconnect_policy(
-            memory_queue(options(8, 1024, 4)),
+            memory_queue(options(8, 1024)),
             transport,
             ReconnectPolicy::no_backoff(Duration::from_secs(1)),
             false,
@@ -5934,7 +5861,7 @@ mod tests {
         ))])
         .with_restart_results([Ok(())]);
         let mut driver = QwpWsCoreTestHarness::from_queue_with_reconnect_policy(
-            memory_queue(options(8, 1024, 4)),
+            memory_queue(options(8, 1024)),
             transport,
             paced_policy(),
             false,
@@ -5976,7 +5903,7 @@ mod tests {
         ])
         .with_restart_results([Ok(()), Ok(())]);
         let mut driver = QwpWsCoreTestHarness::from_queue_with_reconnect_policy(
-            memory_queue(options(8, 1024, 4)),
+            memory_queue(options(8, 1024)),
             transport,
             paced_policy(),
             false,
@@ -6022,7 +5949,7 @@ mod tests {
         ))])
         .with_restart_results([Ok(())]);
         let mut driver = QwpWsCoreTestHarness::from_queue_with_reconnect_policy(
-            memory_queue(options(8, 1024, 4)),
+            memory_queue(options(8, 1024)),
             transport,
             paced_policy(),
             false,
@@ -6042,7 +5969,7 @@ mod tests {
     fn presend_reject_paces_with_min_one_strike() {
         let transport = TestTransport::scripted([]).with_restart_results([Ok(())]);
         let mut driver = QwpWsCoreTestHarness::from_queue_with_reconnect_policy(
-            memory_queue(options(8, 1024, 4)),
+            memory_queue(options(8, 1024)),
             transport,
             paced_policy(),
             false,
@@ -6082,7 +6009,7 @@ mod tests {
         ))])
         .with_restart_results([Ok(())]);
         let mut driver = QwpWsCoreTestHarness::from_queue_with_reconnect_policy(
-            memory_queue(options(8, 1024, 4)),
+            memory_queue(options(8, 1024)),
             transport,
             ReconnectPolicy::no_backoff(Duration::MAX),
             false,
@@ -6106,7 +6033,7 @@ mod tests {
             )))])
             .with_restart_results([Ok(())]);
         let mut driver = QwpWsCoreTestHarness::from_queue_with_reconnect_policy(
-            memory_queue(options(8, 1024, 4)),
+            memory_queue(options(8, 1024)),
             transport,
             paced_policy(),
             false,
@@ -6267,7 +6194,7 @@ mod tests {
             fake_transport_error("write failed"),
         ))]);
         let mut driver =
-            QwpWsCoreTestHarness::from_queue(memory_queue(options(8, 1024, 4)), transport);
+            QwpWsCoreTestHarness::from_queue(memory_queue(options(8, 1024)), transport);
         let receipt = driver.try_submit(b"payload").unwrap();
 
         assert_eq!(
@@ -6302,7 +6229,7 @@ mod tests {
                 "poll failed",
             )))]);
         let mut driver =
-            QwpWsCoreTestHarness::from_queue(memory_queue(options(8, 1024, 4)), transport);
+            QwpWsCoreTestHarness::from_queue(memory_queue(options(8, 1024)), transport);
         let receipt = driver.try_submit(b"payload").unwrap();
 
         assert_eq!(
@@ -6432,7 +6359,7 @@ mod tests {
             ])
             .with_keepalive_results([Ok(false), Ok(true)]);
         let mut driver = QwpWsCoreTestHarness::from_queue_with_durable_ack(
-            memory_queue(options(8, 1024, 4)),
+            memory_queue(options(8, 1024)),
             transport,
         );
         let receipt = driver.try_submit(b"payload").unwrap();
@@ -6473,7 +6400,7 @@ mod tests {
             )))])
             .with_restart_results([Ok(())]);
         let mut driver = QwpWsCoreTestHarness::from_queue_with_durable_ack(
-            memory_queue(options(8, 1024, 4)),
+            memory_queue(options(8, 1024)),
             transport,
         );
         driver.try_submit(b"payload").unwrap();
@@ -6506,7 +6433,7 @@ mod tests {
                 "terminal keepalive failure",
             )))]);
         let mut driver = QwpWsCoreTestHarness::from_queue_with_durable_ack(
-            memory_queue(options(8, 1024, 4)),
+            memory_queue(options(8, 1024)),
             transport,
         );
         driver.try_submit(b"payload").unwrap();
@@ -6532,7 +6459,7 @@ mod tests {
             ])
             .with_keepalive_results([Ok(true)]);
         let mut driver = QwpWsCoreTestHarness::from_queue_with_durable_ack(
-            memory_queue(options(8, 1024, 4)),
+            memory_queue(options(8, 1024)),
             transport,
         );
         let receipt = driver.try_submit(b"payload").unwrap();
@@ -6568,7 +6495,7 @@ mod tests {
             ])
             .with_keepalive_results([Ok(true)]);
         let mut driver = QwpWsCoreTestHarness::from_queue_with_durable_ack(
-            memory_queue(options(8, 1024, 4)),
+            memory_queue(options(8, 1024)),
             transport,
         );
         let receipt = driver.try_submit(b"payload").unwrap();
@@ -6591,7 +6518,7 @@ mod tests {
             wire_seq: 0,
             table_seq_txns: table_seq_txns(&[("trades", 10)]),
         });
-        let mut driver = durable_driver_with_options(options(4, 1024, 2), server);
+        let mut driver = durable_driver_with_options(options(4, 1024), server);
         let first = driver.try_submit(b"first").unwrap();
         let second = driver.try_submit(b"second").unwrap();
 
@@ -7782,7 +7709,7 @@ mod tests {
             },
         ))]);
         let mut driver =
-            QwpWsCoreTestHarness::from_queue(memory_queue(options(8, 1024, 4)), transport);
+            QwpWsCoreTestHarness::from_queue(memory_queue(options(8, 1024)), transport);
         let receipt = driver.try_submit(b"payload").unwrap();
 
         assert_eq!(
@@ -8198,7 +8125,7 @@ mod tests {
             "reconnect failed once",
         )))]);
         let mut driver = QwpWsCoreTestHarness::from_queue_with_reconnect_policy(
-            memory_queue(options(8, 1024, 4)),
+            memory_queue(options(8, 1024)),
             transport,
             ReconnectPolicy::bounded(
                 Duration::from_millis(1),
@@ -8259,7 +8186,7 @@ mod tests {
 
     #[test]
     fn lifecycle_terminalizes_when_store_terminalizes() {
-        let queue = memory_queue(options(4, 1024, 2));
+        let queue = memory_queue(options(4, 1024));
         let mut store = QwpWsPublicationStore::new(queue, DEFAULT_EVENT_CAPACITY);
         let lifecycle = store.lifecycle();
 
@@ -8271,7 +8198,7 @@ mod tests {
 
     #[test]
     fn first_terminal_error_wins_over_late_structured_diagnostic() {
-        let queue = memory_queue(options(4, 1024, 2));
+        let queue = memory_queue(options(4, 1024));
         let mut store = QwpWsPublicationStore::new(queue, DEFAULT_EVENT_CAPACITY);
         store.mark_terminal(Some(Error::new(ErrorCode::SocketError, "first terminal")));
 
@@ -8701,7 +8628,7 @@ mod tests {
     #[test]
     fn poison_dwell_driver_holds_terminal_until_window_elapses() {
         let mut driver = QwpWsCoreTestHarness::from_queue_with_rejection_limit_and_window(
-            memory_queue(options(8, 1024, 4)),
+            memory_queue(options(8, 1024)),
             FakeOrderedServer::scripted([
                 FakeSendResult::RejectWire { wire_seq: 0 },
                 FakeSendResult::RejectWire { wire_seq: 1 },
@@ -8750,7 +8677,7 @@ mod tests {
     #[test]
     fn server_close_before_any_send_does_not_strike() {
         let mut driver = QwpWsCoreTestHarness::from_queue_with_rejection_limit_and_window(
-            memory_queue(options(8, 1024, 4)),
+            memory_queue(options(8, 1024)),
             FakeOrderedServer::no_response(),
             1,
             Duration::ZERO,
@@ -8773,7 +8700,7 @@ mod tests {
     #[test]
     fn server_close_after_send_still_strikes() {
         let mut driver = QwpWsCoreTestHarness::from_queue_with_rejection_limit_and_window(
-            memory_queue(options(8, 1024, 4)),
+            memory_queue(options(8, 1024)),
             FakeOrderedServer::no_response(),
             1,
             Duration::ZERO,

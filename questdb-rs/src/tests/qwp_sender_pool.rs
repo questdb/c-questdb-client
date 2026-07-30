@@ -2193,10 +2193,9 @@ fn pooled_buffer_append_timeout_rolls_back_symbols_and_keeps_input() {
         (0, vec![b"alpha".to_vec()])
     );
 
-    // In ordinary-ACK mode backpressure is the ring's byte budget now that
-    // `max_in_flight` no longer controls the wire. Fill it with the
-    // already-registered "alpha" so the rollback assertion below still
-    // isolates "bravo".
+    // In ordinary-ACK mode the ring's byte budget is the only backpressure.
+    // Fill it with the already-registered "alpha" so the rollback assertion
+    // below still isolates "bravo".
     let mut ring_full = false;
     for _ in 0..64 {
         let mut filler = db.new_buffer();
@@ -2514,8 +2513,8 @@ fn mixed_sfa_queue_pressure_rolls_back_the_failing_encoder_namespace() {
     let second_fsn = sender.flush_and_get_fsn(&mut second).unwrap().unwrap();
     assert!(second_fsn > first_fsn);
 
-    // In ordinary-ACK mode `max_in_flight` no longer bounds admission, so the
-    // ring backs up on its byte budget. Fill it with the already-registered
+    // In ordinary-ACK mode admission is bounded only by the ring's byte budget,
+    // so the ring backs up when full. Fill it with the already-registered
     // "alpha", which consumes no dictionary ids -- the id-reuse assertions
     // below depend on "charlie" being the only symbol that fails to publish.
     let mut last_published_fsn = second_fsn;

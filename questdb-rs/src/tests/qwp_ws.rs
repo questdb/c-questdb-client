@@ -1780,16 +1780,15 @@ fn qwp_ws_terminal_reject_terminalizes_in_all_progress_modes() {
     }
 }
 
-/// `max_in_flight` no longer controls the wire window, and this pins that at
-/// runtime rather than at the parser: with `max_in_flight=1` the old code put
-/// exactly one frame on the wire and waited for its ack. The wire window is
-/// gone, so many frames must reach a server that never acks at all.
+/// The QWP/WebSocket wire has no frame-count cap: the client streams every
+/// buffered frame to a server that never acks a single one, bounded only by
+/// the store-and-forward byte budget.
 #[test]
-fn qwp_ws_max_in_flight_no_longer_bounds_the_wire() {
+fn qwp_ws_wire_has_no_frame_count_cap() {
     const FRAMES: usize = 8;
 
     let (port, frames) = spawn_silent_never_acking_server();
-    let conf = format!("ws::addr=127.0.0.1:{port};max_in_flight=1;");
+    let conf = format!("ws::addr=127.0.0.1:{port};");
     let mut sender = SenderBuilder::from_conf(conf).unwrap().build().unwrap();
 
     for qty in 0..FRAMES as i64 {
@@ -2098,7 +2097,6 @@ fn sender_sfa_fully_delivered_tracks_ok_and_durable_watermarks() {
 
 #[test]
 fn qwp_ws_deep_durable_backlog_fills_byte_ring_replays_and_recovers() {
-    const MAX_IN_FLIGHT: usize = 1024;
     const MIN_DEEP_BACKLOG: usize = 64;
 
     let DurableBacklogServer {
@@ -2114,7 +2112,6 @@ fn qwp_ws_deep_durable_backlog_fills_byte_ring_replays_and_recovers() {
     let conf = format!(
         "ws::addr=127.0.0.1:{port};\
          request_durable_ack=on;\
-         max_in_flight={MAX_IN_FLIGHT};\
          sf_max_segment_bytes=512;\
          sf_max_total_bytes=8192;\
          sf_append_deadline_millis=100;\
@@ -2157,10 +2154,6 @@ fn qwp_ws_deep_durable_backlog_fills_byte_ring_replays_and_recovers() {
     assert!(
         published >= MIN_DEEP_BACKLOG,
         "byte ring held only {published} frames; test did not build a deep backlog"
-    );
-    assert!(
-        published < MAX_IN_FLIGHT,
-        "count admission fired before the byte budget [published={published}]"
     );
 
     assert!(
@@ -5441,7 +5434,6 @@ fn qwp_ws_from_conf_parses_java_reconnect_keys() {
     // Just exercises the parser surface: every new key is accepted. Building
     // would also work but isn't necessary for parser coverage.
     let conf = "ws::addr=localhost:9000;\
-                max_in_flight=64;\
                 reconnect_max_duration_millis=20000;\
                 reconnect_initial_backoff_millis=200;\
                 reconnect_max_backoff_millis=2000;\

@@ -993,16 +993,11 @@ impl SenderBuilder {
     /// Some QWP/WebSocket configuration keys are accepted only through the
     /// configuration string, primarily for compatibility with Java-style
     /// configuration names and settings without a public Rust builder method.
-    /// These include `in_flight_window`, `sf_dir`, `sender_id`, `sf_max_segment_bytes`,
+    /// These include `sf_dir`, `sender_id`, `sf_max_segment_bytes`,
     /// `sf_max_total_bytes`, `sf_durability`, `sf_append_deadline_millis`,
     /// `auth_timeout_ms`, `close_flush_timeout_millis`, `request_durable_ack`,
     /// `durable_ack_keepalive_interval_millis`, `drain_orphans`,
     /// `max_background_drainers`, and `error_inbox_capacity`.
-    ///
-    /// `in_flight_window` and `max_in_flight` are deprecated as wire-window
-    /// controls. They no longer bound the wire send cursor, but in durable-ACK
-    /// mode the value remains an admission bound on frames awaiting durable
-    /// completion. See [`SenderBuilder::max_in_flight`].
     ///
     /// You can also load the configuration from an environment variable. See
     /// [`SenderBuilder::from_env`].
@@ -1140,14 +1135,6 @@ impl SenderBuilder {
                 "max_datagram_size" => builder.max_datagram_size(parse_conf_value(key, val)?)?,
                 #[cfg(feature = "_sender-qwp-udp")]
                 "multicast_ttl" => builder.multicast_ttl(parse_conf_value(key, val)?)?,
-                // Both keys are deprecated as wire-window controls. They remain
-                // aliases for the durable-ACK unresolved-frame admission bound.
-                // See `SenderBuilder::max_in_flight`.
-                #[cfg(feature = "_sender-qwp-ws")]
-                "in_flight_window" => builder.in_flight_window(parse_conf_value(key, val)?)?,
-                #[cfg(feature = "_sender-qwp-ws")]
-                #[allow(deprecated)]
-                "max_in_flight" => builder.max_in_flight(parse_conf_value(key, val)?)?,
                 #[cfg(feature = "_sender-qwp-ws")]
                 "qwp_ws_progress" => builder.qwp_ws_progress(parse_qwp_ws_progress_value(val)?)?,
                 #[cfg(feature = "_sender-qwp-ws")]
@@ -1670,82 +1657,6 @@ impl SenderBuilder {
         qwp_udp
             .multicast_ttl
             .set_specified("multicast_ttl", value)?;
-        Ok(self)
-    }
-
-    #[cfg(feature = "_sender-qwp-ws")]
-    /// **Deprecated: this setting no longer controls wire pipelining.**
-    ///
-    /// It used to cap the number of unacknowledged frames the QWP/WebSocket
-    /// sender kept in flight, both when admitting a publish and on the wire.
-    /// The wire-side cap is gone: the I/O thread now streams at full speed.
-    ///
-    /// With `request_durable_ack=on`, the value is retained only as a local
-    /// admission bound on published frames awaiting durable completion. That
-    /// bound caps the per-frame table/sequence metadata held between an
-    /// ordinary OK and its durable watermark. Without durable ACKs, the value
-    /// is ignored; use `sf_max_total_bytes` to bound store-and-forward
-    /// allocation.
-    #[deprecated(
-        since = "7.0.0",
-        note = "no longer controls wire pipelining; in durable-ACK mode it only bounds \
-                the unresolved store-and-forward backlog"
-    )]
-    pub fn max_in_flight(self, value: usize) -> Result<Self> {
-        self.set_qwp_ws_max_in_flight("max_in_flight", value)
-    }
-
-    /// Java-compatible spelling of [`SenderBuilder::max_in_flight`], accepted
-    /// only through the configuration string. Like it, this is deprecated as a
-    /// wire-window control. The value is validated (`> 1`, matching the
-    /// historical Java semantics where `1` meant synchronous mode) and is used
-    /// only as the durable-ACK unresolved-frame admission bound.
-    #[cfg(feature = "_sender-qwp-ws")]
-    fn in_flight_window(mut self, value: i32) -> Result<Self> {
-        let Some(qwp_ws) = &mut self.qwp_ws else {
-            return Err(error::fmt!(
-                ConfigError,
-                "The \"in_flight_window\" setting is only supported for QWP/WebSocket."
-            ));
-        };
-        if value < 1 {
-            return Err(error::fmt!(
-                ConfigError,
-                "in-flight window size must be positive[size={value}]"
-            ));
-        }
-        if value == 1 {
-            return Err(error::fmt!(
-                ConfigError,
-                "WebSocket transport requires async mode (in_flight_window > 1)"
-            ));
-        }
-        let value = value as usize;
-        qwp_ws
-            .max_in_flight
-            .set_specified("in_flight_window", value)?;
-        Ok(self)
-    }
-
-    #[cfg(feature = "_sender-qwp-ws")]
-    fn set_qwp_ws_max_in_flight(
-        mut self,
-        setting_name: &'static str,
-        value: usize,
-    ) -> Result<Self> {
-        if value == 0 {
-            return Err(error::fmt!(
-                ConfigError,
-                "\"{setting_name}\" must be greater than 0."
-            ));
-        }
-        let Some(qwp_ws) = &mut self.qwp_ws else {
-            return Err(error::fmt!(
-                ConfigError,
-                "The \"{setting_name}\" setting is only supported for QWP/WebSocket."
-            ));
-        };
-        qwp_ws.max_in_flight.set_specified(setting_name, value)?;
         Ok(self)
     }
 
