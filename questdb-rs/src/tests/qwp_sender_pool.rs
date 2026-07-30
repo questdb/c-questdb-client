@@ -2992,6 +2992,104 @@ fn direct_flush_split_floor_marks_must_close_to_discard_uncommitted_prefix() {
     );
 }
 
+/// A standalone direct sender built with `OwnedDirectColumnSender::from_conf`
+/// (the backing of the FFI `qwp_direct_sender_from_conf` /
+/// `qwp_direct_sender_from_opts` handles) owns its connection outright with no
+/// pool. On a plain drop — the path `qwp_direct_sender_free` and
+/// `questdb_db_return_direct_sender` take (`return_or_drop_cs(sender, 0)`) — it
+/// best-effort commits any un-sync'd deferred frames before closing, so the
+/// deferred tail reaches the server with a commit boundary. Exercises the
+/// `DirectBacking::Standalone` arm of `OwnedDirectColumnSender::drop` and
+/// `commit_in_flight_on_drop`.
+#[cfg(feature = "ffi-support")]
+#[test]
+fn standalone_direct_sender_free_commits_in_flight_on_drop() {
+    const FLAG_DEFER_COMMIT: u8 = 0x01;
+    let (server, frames) = MockServer::spawn_acking_capturing(1);
+    let conf = conf_for(server.port(), "");
+    let mut sender =
+        crate::db::OwnedDirectColumnSender::from_conf(&conf).expect("standalone connect");
+
+    let qty = [1_i64];
+    let ts = [1_i64];
+    let mut c1 = Chunk::new("trades");
+    c1.column_i64("qty", &qty, None).unwrap();
+    c1.at_nanos(&ts).unwrap();
+    sender.get_mut().flush(&mut c1).unwrap(); // committed inline
+
+    let mut c2 = Chunk::new("trades");
+    c2.column_i64("qty", &qty, None).unwrap();
+    c2.at_nanos(&ts).unwrap();
+    sender.get_mut().flush(&mut c2).unwrap(); // deferred: published, uncommitted
+    assert!(
+        sender.get().in_flight() > 0,
+        "deferred flush must leave an uncommitted in-flight frame"
+    );
+
+    drop(sender); // free path: must_close stays unset -> best-effort commit of the tail
+
+    let mut captured = Vec::new();
+    while let Ok(frame) = frames.recv_timeout(Duration::from_millis(500)) {
+        captured.push(frame);
+    }
+    let last = captured.last().expect("server must have received frames");
+    assert_eq!(
+        last[5] & FLAG_DEFER_COMMIT,
+        0,
+        "free-drop must close the deferred tail with a commit boundary, not discard it"
+    );
+}
+
+/// Force-drop counterpart: `questdb_db_drop_direct_sender(NULL, sender)` on a
+/// standalone handle (`return_or_drop_cs(sender, LATCH_DROP)`) sets
+/// `must_close` before the box is dropped, so `commit_in_flight_on_drop`
+/// short-circuits and the connection closes outright with its un-sync'd
+/// deferred frames discarded — never committed, so in-doubt data cannot reach
+/// the table. The `NULL` `db` is irrelevant: the standalone backing lives in
+/// the sender itself.
+#[cfg(feature = "ffi-support")]
+#[test]
+fn standalone_direct_sender_force_drop_discards_in_flight() {
+    const FLAG_DEFER_COMMIT: u8 = 0x01;
+    let (server, frames) = MockServer::spawn_acking_capturing(1);
+    let conf = conf_for(server.port(), "");
+    let mut sender =
+        crate::db::OwnedDirectColumnSender::from_conf(&conf).expect("standalone connect");
+
+    let qty = [1_i64];
+    let ts = [1_i64];
+    let mut c1 = Chunk::new("trades");
+    c1.column_i64("qty", &qty, None).unwrap();
+    c1.at_nanos(&ts).unwrap();
+    sender.get_mut().flush(&mut c1).unwrap(); // committed inline
+
+    let mut c2 = Chunk::new("trades");
+    c2.column_i64("qty", &qty, None).unwrap();
+    c2.at_nanos(&ts).unwrap();
+    sender.get_mut().flush(&mut c2).unwrap(); // deferred: published, uncommitted
+    assert!(
+        sender.get().in_flight() > 0,
+        "deferred flush must be in-flight"
+    );
+
+    // `questdb_db_drop_direct_sender` sets must_close before dropping the
+    // box (via `on_deferred_close`); replicate that to drive the discard arm.
+    sender.mark_must_close();
+    drop(sender);
+
+    let mut captured = Vec::new();
+    while let Ok(frame) = frames.recv_timeout(Duration::from_millis(500)) {
+        captured.push(frame);
+    }
+    let last = captured.last().expect("server must have received frames");
+    assert_ne!(
+        last[5] & FLAG_DEFER_COMMIT,
+        0,
+        "force-drop must leave the deferred tail uncommitted (discarded), \
+         not send a commit boundary"
+    );
+}
+
 #[test]
 fn store_and_forward_flush_splits_oversize_chunk_into_self_sufficient_frames() {
     // The store-and-forward backend also splits an oversize chunk, but into
