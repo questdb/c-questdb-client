@@ -470,9 +470,7 @@ typedef struct qwp_reader_failover_reset_event qwp_reader_failover_reset_event;
  *    any heavy work outside the cursor's drive thread.
  *
  * The callback may freely touch `event` and `user_data`; both are owned by
- * the caller's logic, not by the in-flight cursor. If the query/cursor is
- * handed to another thread, the caller MUST also ensure that `user_data` is
- * valid and safe to access on that destination thread.
+ * the caller's logic, not by the in-flight cursor.
  *
  * The callback runs on the thread driving the in-flight cursor operation.
  * If the query/cursor is handed to another thread, the caller MUST ensure
