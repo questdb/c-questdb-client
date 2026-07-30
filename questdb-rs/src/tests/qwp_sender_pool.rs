@@ -83,6 +83,15 @@ enum MockMode {
     /// EOF and surfaces a transient (`FailoverRetry`) failure.
     #[cfg(feature = "arrow-ingress")]
     AckThenClose(usize),
+    /// Model QuestDB's deferred-commit ack contract (questdb#7144): a frame
+    /// carrying FLAG_DEFER_COMMIT leaves rows uncommitted, so the cumulative-ack
+    /// watermark must NOT advance over it; only a non-deferred (committing)
+    /// frame is acked, and its cumulative ack covers the whole group.
+    ///
+    /// The FIRST connection additionally dies after reading `kill_after` frames,
+    /// modelling a peer that drops mid-deferred-group. Later connections ack
+    /// normally so the client can replay. The `Arc` counts connections.
+    DeferAwareAckKillingFirstConn(Arc<AtomicUsize>, usize),
     /// Read (consume) the first `n` binary frames — so the client's writes
     /// provably succeed — then close **without** acking. Models a peer that
     /// ingests a published frame and then dies before acknowledging it: the
@@ -331,6 +340,19 @@ fn run_mock_server_accept_loop(
                             }
                             #[cfg(feature = "arrow-ingress")]
                             MockMode::AckThenClose(n) => ack_then_close(&mut stream, &stop, n),
+                            MockMode::DeferAwareAckKillingFirstConn(conns, kill_after) => {
+                                let conn_index = conns.fetch_add(1, Ordering::SeqCst);
+                                defer_aware_ack(
+                                    &mut stream,
+                                    &stop,
+                                    capture,
+                                    if conn_index == 0 {
+                                        Some(kill_after)
+                                    } else {
+                                        None
+                                    },
+                                )
+                            }
                             MockMode::ReadThenClose(n) => read_then_close(&mut stream, &stop, n),
                         }
                     }
@@ -589,6 +611,59 @@ fn ack_then_close(stream: &mut std::net::TcpStream, stop: &AtomicBool, n: usize)
         }
     }
     // Returning drops the stream: the client's next read sees EOF.
+}
+
+/// Ack like QuestDB does once deferred commits are in play: a frame carrying
+/// FLAG_DEFER_COMMIT leaves its rows uncommitted, so no cumulative OK ack may
+/// cover it; only a committing frame is acked, and that ack covers the group.
+/// With `kill_after = Some(n)`, close the socket after reading `n` frames —
+/// a peer that dies mid-group.
+fn defer_aware_ack(
+    stream: &mut std::net::TcpStream,
+    stop: &AtomicBool,
+    capture: Option<mpsc::Sender<Vec<u8>>>,
+    kill_after: Option<usize>,
+) {
+    const FLAG_DEFER_COMMIT: u8 = 0x01;
+    const QWP_FLAGS_OFFSET: usize = 5;
+    let _ = stream.set_read_timeout(Some(Duration::from_millis(50)));
+    let mut frame_index: u64 = 0;
+    let mut read = 0usize;
+    loop {
+        if stop.load(Ordering::SeqCst) {
+            break;
+        }
+        if kill_after.is_some_and(|n| read >= n) {
+            break; // returning drops the stream: the client's next read sees EOF
+        }
+        match read_frame(stream) {
+            Ok((_fin, opcode, payload)) => {
+                if opcode == 0x8 {
+                    break;
+                }
+                if opcode != 0x2 {
+                    continue;
+                }
+                read += 1;
+                let deferred = payload.len() > QWP_FLAGS_OFFSET
+                    && (payload[QWP_FLAGS_OFFSET] & FLAG_DEFER_COMMIT) != 0;
+                if let Some(tx) = capture.as_ref() {
+                    let _ = tx.send(payload);
+                }
+                if !deferred && write_qwp_ok_response(stream, frame_index).is_err() {
+                    break;
+                }
+                frame_index += 1;
+            }
+            Err(e)
+                if e.kind() == std::io::ErrorKind::WouldBlock
+                    || e.kind() == std::io::ErrorKind::TimedOut =>
+            {
+                continue;
+            }
+            Err(_) => break,
+        }
+    }
 }
 
 /// Read (consume) the first `n` binary frames the client sends — so its
@@ -3148,6 +3223,95 @@ fn standalone_direct_sender_force_drop_discards_in_flight() {
         0,
         "force-drop must leave the deferred tail uncommitted (discarded), \
          not send a commit boundary"
+    );
+}
+
+#[test]
+fn store_and_forward_replays_the_whole_group_when_the_peer_dies_mid_deferred_group() {
+    // The safety property behind committing a split chunk only at its last
+    // frame: a peer death mid-group must lose nothing.
+    //
+    // Every frame but the last carries FLAG_DEFER_COMMIT. A server that models
+    // QuestDB's deferred-commit ack contract (questdb#7144) never acks those
+    // frames -- while their rows sit uncommitted it refuses to advance the
+    // cumulative-ack watermark over them. So when the peer dies mid-group the
+    // client has no ack covering any of it, nothing is trimmed from the replay
+    // queue, and the whole group is re-sent on the next connection.
+    //
+    // This is the test the old "never defer on store-and-forward" comment was
+    // written in the absence of: it names the hazard (trimmed after ack, before
+    // commit) and shows the clamp closes it.
+    const CAP: usize = 2048;
+    const ROWS: usize = 512;
+    const KILL_AFTER: usize = 2; // die partway through the deferred prefix
+
+    let (tx, frames) = mpsc::channel();
+    let conns = Arc::new(AtomicUsize::new(0));
+    let server = MockServer::spawn_with_mode_capture(
+        2,
+        MockMode::DeferAwareAckKillingFirstConn(Arc::clone(&conns), KILL_AFTER),
+        Some(tx),
+    );
+
+    let dir = TempDir::new().unwrap();
+    let conf = conf_for_endpoints(
+        &[server.port()],
+        &format!(
+            "max_buf_size={CAP};sf_dir={};pool_reap=manual;",
+            dir.path().display()
+        ),
+    );
+    let db = QuestDb::connect(&conf).unwrap();
+
+    let qty: Vec<i64> = (0..ROWS as i64).collect();
+    let ts: Vec<i64> = (0..ROWS as i64)
+        .map(|x| 1_700_000_000_000_000_000 + x)
+        .collect();
+    let mut chunk = Chunk::new("trades");
+    chunk.column_i64("qty", &qty, None).unwrap();
+    chunk.at_nanos(&ts).unwrap();
+
+    let mut sender = db.borrow_sender().unwrap();
+    sender
+        .flush(&mut chunk)
+        .expect("oversize chunk splits and queues");
+
+    // The first peer dies mid-group; the pool reconnects and replays. The wait
+    // only succeeds once a committing frame is acked on the new connection.
+    sender
+        .wait(AckLevel::Ok, Duration::from_secs(30))
+        .expect("group replays and commits after the peer death");
+
+    let mut captured = Vec::new();
+    while let Ok(frame) = frames.recv_timeout(Duration::from_millis(500)) {
+        captured.push(frame);
+    }
+
+    assert_eq!(
+        server.accepted(),
+        2,
+        "the peer death must have driven a reconnect"
+    );
+
+    // Nothing was acked before the death, so the whole group -- including the
+    // frames the dead peer already received -- must appear again.
+    let total_rows: u64 = captured.iter().map(|f| frame_row_count(f)).sum();
+    assert!(
+        total_rows > ROWS as u64,
+        "frames received before the peer death must be replayed, not trimmed: \
+         saw {total_rows} rows across {} frames for a {ROWS}-row chunk",
+        captured.len()
+    );
+
+    // And the replay is complete: the frames after the reconnect cover every row.
+    let replayed: u64 = captured
+        .iter()
+        .skip(KILL_AFTER)
+        .map(|f| frame_row_count(f))
+        .sum();
+    assert_eq!(
+        replayed, ROWS as u64,
+        "the replayed group must cover every row exactly once"
     );
 }
 
