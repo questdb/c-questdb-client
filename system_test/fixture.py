@@ -41,9 +41,11 @@ import textwrap
 import urllib.request
 import urllib.parse
 import urllib.error
+import http.client
 import concurrent.futures
 import threading
 import base64
+import ctypes
 from pprint import pformat
 
 AUTH_TXT = """admin ec-p-256-sha256 fLKYEaoEb9lrn3nkwLDA-M_xnuFOdSt9y0Z7_vWSHLU Dt5tbS1dEDMSYfym3fgMv0B99szno-dFc1rYF9t0aac
@@ -63,6 +65,11 @@ HTTP_AUTH = dict(
 CA_PATH = (pathlib.Path(__file__).parent.parent /
            'tls_certs' / 'server_rootCA.pem')
 
+# Force-kill is asynchronous on every supported platform. Keep the final reap
+# bounded too: a process stuck in uninterruptible kernel I/O can survive the
+# signal indefinitely, and an unbounded wait would consume the CI job timeout.
+FORCE_KILL_WAIT_TIMEOUT_SEC = 10
+
 # Posts a console control event to the QuestDB JVM on Windows. Run as
 # `python -c <this> <pid> <ctrl_c|ctrl_break>` in a separate process: a
 # control event can only be sent from inside the target's console —
@@ -73,6 +80,7 @@ _WIN_CONSOLE_CTRL_HELPER = r'''
 import ctypes
 import ctypes.wintypes
 import sys
+import time
 
 CTRL_C_EVENT = 0
 CTRL_BREAK_EVENT = 1
@@ -90,10 +98,16 @@ def bail(code, what):
 
 
 # The posted event reaches every process on the console, this helper
-# included. A handler that claims each event keeps the default handler
-# (ExitProcess) from killing the helper before it can report success.
-# Merely ignoring would not do: SetConsoleCtrlHandler(NULL, TRUE)
-# covers Ctrl+C only, not Ctrl+Break.
+# included, so it must not terminate the helper before it reports
+# success. Two layers cover the two events this helper posts:
+#   * claim_all returns True for every event and is the only cover for
+#     Ctrl+Break (the ignore-Ctrl+C flag below suppresses Ctrl+C alone).
+#     Its protection is best-effort: the OS runs it on an injected
+#     handler thread that can lose the race against the default handler.
+#   * Ctrl+C -- the common graceful-shutdown path that must be reliable
+#     -- is instead covered by the ignore-Ctrl+C flag set after
+#     AttachConsole below. That is deterministic: the OS never terminates
+#     the process for Ctrl+C, with no handler-thread race in play.
 handler_t = ctypes.WINFUNCTYPE(ctypes.wintypes.BOOL, ctypes.wintypes.DWORD)
 claim_all = handler_t(lambda _event: True)
 if not kernel32.SetConsoleCtrlHandler(claim_all, True):
@@ -101,6 +115,12 @@ if not kernel32.SetConsoleCtrlHandler(claim_all, True):
 kernel32.FreeConsole()  # Failure is fine: it means we had no console.
 if not kernel32.AttachConsole(pid):
     bail(3, 'AttachConsole')
+# Ignore Ctrl+C in this helper so its own copy of a posted CTRL_C_EVENT
+# cannot terminate it with STATUS_CONTROL_C_EXIT (0xC000013A), which the
+# caller would read as a spurious "Failed to post ctrl_c". The flag is a
+# per-process attribute the JVM does not share, so the JVM -- launched
+# with Ctrl+C enabled -- still receives the event and shuts down.
+kernel32.SetConsoleCtrlHandler(None, True)
 # Process group 0 == everyone on this console, which is exactly the JVM
 # (and this helper): the JVM was launched with CREATE_NO_WINDOW, so its
 # console hosts nothing else. Group 0 rather than the JVM's pid because
@@ -109,6 +129,17 @@ if not kernel32.AttachConsole(pid):
 # without delivering anything.
 if not kernel32.GenerateConsoleCtrlEvent(event, 0):
     bail(4, 'GenerateConsoleCtrlEvent')
+# GenerateConsoleCtrlEvent only queues the event; the OS delivers it to
+# each process on the console — the JVM and this helper — asynchronously.
+# Sleeping holds the console attachment open so the JVM's handler thread
+# picks the event up before the helper exits and detaches; exiting at once
+# could race that pickup, dropping the shutdown / thread-dump request. The
+# helper's own survival no longer rides on this sleep: the ignore-Ctrl+C
+# flag covers the Ctrl+C path deterministically, and claim_all is the
+# best-effort cover for the rarer Ctrl+Break path (whose injected handler
+# thread the sleep still gives room to run). The caller's 15s subprocess
+# timeout bounds the wait.
+time.sleep(3)
 '''
 
 
@@ -298,10 +329,28 @@ class QuestDbStopTimeout(RuntimeError):
     """QuestDB did not shut down within the graceful timeout and had to
     be force-killed. Raised by ``stop()`` so the test fails instead of
     silently absorbing a server that refuses to stop."""
-    pass
+
+    # stop() raises this only after the process was reaped and fixture state
+    # was cleared, so a lifecycle owner may safely attempt recovery start().
+    fixture_reusable = True
+
+
+class QuestDbReapTimeout(QuestDbStopTimeout):
+    """QuestDB remained unreaped after force-kill.
+
+    The fixture still owns ``_proc`` and must not be restarted or shared with
+    another lifecycle owner after this error.
+    """
+
+    fixture_reusable = False
 
 
 class QuestDbFixtureBase:
+    # Server-launching subclasses discover the real port at start(); the base
+    # default keeps _check_min_http_up()'s attribute read valid on fixtures
+    # that never launch a min-HTTP server (e.g. QuestDbExternalFixture).
+    http_min_port = None
+
     def print_log(self):
         """Print the QuestDB log to stderr."""
         sys.stderr.write('questdb log output skipped.\n')
@@ -343,6 +392,55 @@ class QuestDbFixtureBase:
         if 'error' in data:
             raise QueryError(data['error'])
         return data
+
+    def _assert_server_alive(self):
+        """Raise if the server died during startup.
+
+        The readiness probe calls this before each attempt so a crashed
+        server fails fast instead of looping until the timeout. The base
+        fixture has no process to inspect; QuestDbFixture overrides this
+        to check the process it launched.
+        """
+
+    def _check_main_http_up(self):
+        # Probe the main HTTP server's /ping. The initial start() waits on
+        # this probe: query_version() and every test SQL query go to the
+        # main HTTP server, so it must be serving requests before start()
+        # returns. The main server shares its worker pool with QWP ingest,
+        # but no ingest runs during initial start, so nothing competes with
+        # /ping for those workers.
+        return self._probe_http(
+            self.http_server_port, '/ping', lambda status: status == 204)
+
+    def _check_min_http_up(self):
+        # Probe the min HTTP server's health endpoint. A bounce restart
+        # waits on this probe rather than /ping: the min server has its own
+        # worker pool, so it answers even while reconnecting QWP producers
+        # keep the shared worker pool — the one serving the main HTTP
+        # server — fully busy. This probes /status and treats any 2xx as
+        # healthy (the min server's HealthCheckProcessor). A bounce restart
+        # issues no SQL, so the main HTTP server need not be ready.
+        return self._probe_http(
+            self.http_min_port, '/status', lambda status: 200 <= status < 300)
+
+    def _probe_http(self, port, path, status_ok):
+        self._assert_server_alive()
+        req = urllib.request.Request(
+            f'http://{self.host}:{port}{path}',
+            headers=self.http_headers(),
+            method='GET')
+        try:
+            with urllib.request.urlopen(req, timeout=1) as resp:
+                if status_ok(resp.status):
+                    return True
+        except (OSError, http.client.HTTPException):
+            # The server isn't ready yet: it refuses the connection
+            # (urllib.error.URLError), is too slow to answer within the 1s
+            # timeout (socket.timeout) — both OSError subclasses — or, mid-boot,
+            # sends a malformed HTTP response (http.client.BadStatusLine, an
+            # HTTPException). All of these mean "not up yet".
+            pass
+        return False
 
     def query_version(self):
         # `/ping` can answer before the SQL engine can serve `select
@@ -491,6 +589,10 @@ class QuestDbFixture(QuestDbFixtureBase):
         self.line_tcp_port = None
         self.qwp_udp_port = None
         self.pg_port = None
+        # Port of the min HTTP server: a health endpoint with its own
+        # worker pool, used as the readiness probe on bounce restarts
+        # (see _check_min_http_up).
+        self.http_min_port = None
 
         self.wrap_tls = wrap_tls
         self._tls_proxy = None
@@ -515,10 +617,60 @@ class QuestDbFixture(QuestDbFixtureBase):
         sys.stderr.write(textwrap.indent(log, '    '))
         sys.stderr.write('\n\n')
 
-    def start(self):
+    def print_log_tail(self, max_bytes=32768):
+        """Write the tail of the QuestDB log to stderr.
+
+        Called on a stop() timeout, where the log is the only record of
+        why graceful shutdown never completed. ServerMain's shutdown hook
+        prints `SIGTERM received` to stdout the moment the JVM starts
+        running shutdown hooks, and `QuestDB is shutdown.` once close()
+        returns; both are redirected into this log. Their presence at the
+        tail tells apart the two failure modes: neither line means the
+        JVM never received the console Ctrl+C (a delivery problem);
+        `SIGTERM received` without the matching `QuestDB is shutdown.`
+        means the hook fired but close() stalled (a server problem). The
+        tail suffices because those lines are the last thing written; the
+        log accumulates across bounce restarts, so dumping it whole would
+        bury the shutdown in prior-test output. Bytes with replacement
+        decoding: a force-kill can truncate the log mid-character.
+        """
+        try:
+            with open(self._log_path, 'rb') as log_file:
+                log_file.seek(0, os.SEEK_END)
+                size = log_file.tell()
+                head_skipped = max(0, size - max_bytes)
+                log_file.seek(head_skipped)
+                tail = log_file.read().decode('utf-8', errors='replace')
+        except OSError as e:
+            sys.stderr.write(
+                f'Could not read QuestDB log `{self._log_path}`: {e!r}.\n')
+            return
+        span = 'full log' if head_skipped == 0 else f'last {max_bytes} bytes'
+        sys.stderr.write(
+            f'QuestDB log tail ({span}) from `{self._log_path}`:\n')
+        sys.stderr.write(textwrap.indent(tail, '    '))
+        sys.stderr.write('\n\n')
+
+    def _assert_server_alive(self):
+        if self._proc.poll() is not None:
+            raise RuntimeError('QuestDB died during startup.')
+
+    def start(self, start_timeout_sec=300, probe_min_http=False):
+        # start_timeout_sec bounds the wait for the readiness probe to
+        # pass. The generous default only trips on a genuinely stuck boot.
+        # The fuzz tests' bounce thread passes a tighter value, sized
+        # together with the producers' close_drain() budget, so that a
+        # pathologically slow restart fails here, reported as a server
+        # problem, before the producers exhaust that budget.
+        #
+        # probe_min_http selects the readiness probe. The initial start
+        # waits on the main HTTP server's /ping; a bounce restart passes
+        # probe_min_http=True to wait on the min HTTP server's health
+        # endpoint instead. See _check_main_http_up / _check_min_http_up
+        # for why each kind of start targets the server it does.
         if self.http_server_port is None:
-            ports = discover_avail_ports(3)
-            self.http_server_port, self.line_tcp_port, self.pg_port = ports
+            (self.http_server_port, self.line_tcp_port,
+             self.pg_port, self.http_min_port) = discover_avail_ports(4)
         if self.qwp_udp and self.qwp_udp_port is None:
             self.qwp_udp_port = discover_avail_udp_port()
         auth_config = 'line.tcp.auth.db.path=conf/auth.txt' if self.auth else ''
@@ -539,7 +691,9 @@ class QuestDbFixture(QuestDbFixtureBase):
                 http.bind.to=0.0.0.0:{self.http_server_port}
                 line.tcp.net.bind.to=0.0.0.0:{self.line_tcp_port}
                 pg.net.bind.to=0.0.0.0:{self.pg_port}
-                http.min.enabled=false
+                http.min.enabled=true
+                http.min.net.bind.to=0.0.0.0:{self.http_min_port}
+                http.min.worker.count=1
                 line.udp.enabled=false
                 qwp.udp.enabled={qwp_udp_enabled}
                 {qwp_udp_bind}
@@ -592,11 +746,25 @@ class QuestDbFixture(QuestDbFixtureBase):
         # the target console — so CREATE_NO_WINDOW gives the JVM a fresh,
         # windowless console of its own, where stop() can post Ctrl+C (via
         # _win_send_console_ctrl) and hit nothing else. CREATE_NEW_PROCESS_GROUP
-        # is deliberately absent: it would start the child with the
-        # ignore-Ctrl+C flag set, which the JVM never clears, making it deaf
-        # to the shutdown request.
+        # is deliberately absent from the JVM's own flags: it sets the
+        # ignore-Ctrl+C flag, which would make the JVM deaf to the shutdown
+        # request. That flag is inherited, though, so avoiding it here is not
+        # enough on its own -- see the clearing step below.
         creationflags = (
             subprocess.CREATE_NO_WINDOW if sys.platform == 'win32' else 0)
+        if sys.platform == 'win32':
+            # The fuzz supervisor spawns this test process under
+            # CREATE_NEW_PROCESS_GROUP (qwp_ws_fuzz.run_isolated_suite) so it
+            # can hard-kill the whole tree on its deadline. That flag disables
+            # CTRL_C_EVENT for every process in the group, and a child inherits
+            # the flag at creation. Left in place, the JVM spawned below ignores
+            # the Ctrl+C that stop() posts for graceful shutdown -- while still
+            # answering Ctrl+Break with a thread dump, since the flag suppresses
+            # Ctrl+C alone. Clear it on this process so the JVM inherits Ctrl+C
+            # enabled. A no-op on a direct run where no ancestor set the flag;
+            # tree-kill is unaffected (the supervisor terminates via taskkill,
+            # and Ctrl+Break is never disabled by this flag).
+            ctypes.windll.kernel32.SetConsoleCtrlHandler(None, False)
         try:
             self._proc = subprocess.Popen(
                 launch_args,
@@ -607,28 +775,15 @@ class QuestDbFixture(QuestDbFixtureBase):
                 stderr=subprocess.STDOUT,
                 creationflags=creationflags)
 
-            def check_http_up():
-                if self._proc.poll() is not None:
-                    raise RuntimeError('QuestDB died during startup.')
-                req = urllib.request.Request(
-                    f'http://127.0.0.1:{self.http_server_port}/ping',
-                    headers=self.http_headers(),
-                    method='GET')
-                try:
-                    resp = urllib.request.urlopen(req, timeout=1)
-                    if resp.status == 204:
-                        return True
-                except socket.timeout:
-                    pass
-                except urllib.error.URLError:
-                    pass
-                return False
-
             sys.stderr.write('Waiting until HTTP service is up.\n')
+            check_up = (
+                self._check_min_http_up if probe_min_http
+                else self._check_main_http_up)
             retry(
-                check_http_up,
-                timeout_sec=300,
-                msg='Timed out waiting for HTTP service to come up.')
+                check_up,
+                timeout_sec=start_timeout_sec,
+                msg=f'Timed out waiting for HTTP service to come up '
+                    f'within {start_timeout_sec}s.')
         except:
             sys.stderr.write(f'QuestDB log at `{self._log_path}`:\n')
             self.print_log()
@@ -643,8 +798,8 @@ class QuestDbFixture(QuestDbFixtureBase):
         # doesn't change across restarts, and a bounce restart must stay
         # clear of SQL — right after it the reconnecting fuzz producers
         # can keep the network workers busy past the 5s query timeout,
-        # failing the bounce even though /ping already vouched for
-        # liveness.
+        # failing the bounce even though the min-HTTP health endpoint
+        # already vouched for liveness.
         if not self._version_queried:
             self.version = self.query_version()
             self._version_queried = True
@@ -722,7 +877,10 @@ class QuestDbFixture(QuestDbFixtureBase):
         else:
             sys.stderr.write('Could not request a JVM thread dump.\n')
 
-    def stop(self, wait_timeout_sec=30):
+    def stop(
+            self,
+            wait_timeout_sec=30,
+            force_kill_wait_timeout_sec=FORCE_KILL_WAIT_TIMEOUT_SEC):
         if self._tls_proxy:
             self._tls_proxy.stop()
         # A graceful shutdown that overruns `wait_timeout_sec` is treated
@@ -768,13 +926,35 @@ class QuestDbFixture(QuestDbFixtureBase):
                     except subprocess.TimeoutExpired:
                         pass
                 self._proc.kill()
-                self._proc.wait()
+                try:
+                    self._proc.wait(timeout=force_kill_wait_timeout_sec)
+                except subprocess.TimeoutExpired as e:
+                    # Keep _proc populated: ownership was not recovered, so a
+                    # caller must not start another server on the same fixture.
+                    # The process is unkillable rather than reaped, so close the
+                    # log handle here (the later close is skipped by the raise)
+                    # and dump its tail — this is the least-diagnosable stop
+                    # failure and earns the same log dump a graceful-shutdown
+                    # timeout gets.
+                    if self._log:
+                        self._log.close()
+                        self._log = None
+                    self.print_log_tail()
+                    raise QuestDbReapTimeout(
+                        f'QuestDB (pid {kill_pid}) remained alive '
+                        f'{force_kill_wait_timeout_sec}s after force-kill; '
+                        'the fixture is unsafe to reuse.') from e
             self._proc = None
         if self._log:
             self._log.close()
             self._log = None
         if shutdown_timed_out:
-            # Cleanup is done (process reaped, log closed); now fail.
+            # Cleanup is done (process reaped, log closed). Surface the log
+            # tail before failing: on the hosted Windows runners the JVM does
+            # not shut down on the injected console Ctrl+C, and the tail is
+            # what shows whether its shutdown hook ever ran. See
+            # print_log_tail for how `SIGTERM received` reads.
+            self.print_log_tail()
             raise QuestDbStopTimeout(
                 f'QuestDB (pid {kill_pid}) did not shut down gracefully '
                 f'within {wait_timeout_sec}s and had to be force-killed. '

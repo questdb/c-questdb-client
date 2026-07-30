@@ -95,6 +95,7 @@ try:
         TestBuildRecordBatch,
         TestSlicedRecordBatchOffsets,
         TestEdgeCorpora,
+        SharedFixtureRecoveryTest,
     )
     ARROW_TESTS_AVAILABLE = True
 except ImportError as _arrow_import_err:
@@ -143,6 +144,11 @@ SUITE_QWP_WS_SMOKE = 'qwp_ws_smoke'
 SUITE_QWP_WS_PROTOCOL = 'qwp_ws_protocol'
 SUITE_QWP_WS_RESTART = 'qwp_ws_restart'
 SUITE_QWP_WS_FUZZ = 'qwp_ws_fuzz'
+# Healthy cross-platform runs take about 4-11 minutes. Thirty minutes leaves
+# substantial slow-run margin while staying well below the 90-minute CI job.
+QWP_WS_FUZZ_SUITE_TIMEOUT_SEC = 30 * 60
+QWP_WS_FUZZ_TERMINATE_TIMEOUT_SEC = 10
+BOUNCE_LIFECYCLE_HEADROOM_SEC = 60
 QWP_WS_STATUS_SCHEMA_MISMATCH = 0x03
 
 QWP_DECIMAL256_POSITIVE_OVERFLOW = Decimal(
@@ -2445,6 +2451,24 @@ class TestQwpWsFuzz(QwpWsTestSupport, unittest.TestCase):
     POLL_INTERVAL_SEC = 0.05
     DRAIN_TIMEOUT_SEC = 120
 
+    # A bounce takes the server down for a whole stop() + start() cycle.
+    # BOUNCE_RESTART_TIMEOUT_SEC caps only start(); stop() is capped
+    # separately by FuzzParams.bounce_stop_timeout_s. The 90s start cap is
+    # well above an observed healthy restart (~6-40s on CI). These per-call
+    # caps are defensive failure ceilings, not allowances to multiply by the
+    # number of bounces.
+    #
+    # Bounces intentionally continue while producers are in close_drain():
+    # reconnecting and replaying through repeated restarts is part of this
+    # test. close_drain() has one overall drain deadline (270s with the
+    # default caps), and the configured three-bounce and ten-short-bounce
+    # campaigns are expected to finish well inside it. If a campaign prevents
+    # the drain from completing for that whole deadline, the timeout is the
+    # intended liveness failure even when every stop() and start() stayed
+    # within its own cap. An individual over-cap lifecycle call instead fails
+    # in the bounce thread with the server named as the cause.
+    BOUNCE_RESTART_TIMEOUT_SEC = 90
+
     def setUp(self):
         self._require_fuzz_fixture()
         seed = qwp_ws_fuzz.derive_master_seed()
@@ -2638,45 +2662,73 @@ class TestQwpWsFuzz(QwpWsTestSupport, unittest.TestCase):
                 alter_thread.start()
 
             bounce_thread = None
-            if fuzz.max_bounces > 0:
-                bounce_thread = qwp_ws_fuzz.BounceThread(
-                    fixture=QDB_FIXTURE,
-                    rnd=self._master_rng.child(),
-                    max_bounces=fuzz.max_bounces,
-                    min_interval_s=fuzz.min_bounce_interval_s,
-                    max_interval_s=fuzz.max_bounce_interval_s,
-                    stop_timeout_s=fuzz.bounce_stop_timeout_s,
-                    writers_done=producers_done,
-                    stop_event=stop_event,
-                    record_failure=record_failure,
-                    failure_counter=failure_counter,
-                    log=self._log)
-                bounce_thread.start()
-
+            bounce_thread_started = False
             try:
+                if fuzz.max_bounces > 0:
+                    bounce_thread = qwp_ws_fuzz.BounceThread(
+                        fixture=QDB_FIXTURE,
+                        rnd=self._master_rng.child(),
+                        max_bounces=fuzz.max_bounces,
+                        min_interval_s=fuzz.min_bounce_interval_s,
+                        max_interval_s=fuzz.max_bounce_interval_s,
+                        stop_timeout_s=fuzz.bounce_stop_timeout_s,
+                        restart_timeout_s=self.BOUNCE_RESTART_TIMEOUT_SEC,
+                        writers_done=producers_done,
+                        stop_event=stop_event,
+                        record_failure=record_failure,
+                        failure_counter=failure_counter,
+                        log=self._log)
+                    bounce_thread.start()
+                    bounce_thread_started = True
+
+                # _producer_loop returns only after close_drain(). Keep the
+                # bounce thread active through that call on purpose: draining
+                # across repeated restarts exercises reconnect and SFA replay.
+                # producers_done means all producer threads have returned, not
+                # merely that they have finished publishing.
                 for thread in producer_threads:
                     thread.join()
             finally:
                 producers_done.set()
+                try:
+                    if alter_thread is not None:
+                        alter_thread.join(timeout=30)
+                        if alter_thread.is_alive():
+                            stop_event.set()
+                            alter_thread.join(timeout=30)
+                finally:
+                    # ident covers interruption after the native thread
+                    # launched but before Thread.start() returned to set our
+                    # local flag; an unstarted thread cannot be joined.
+                    if (bounce_thread is not None
+                            and (bounce_thread_started
+                                 or bounce_thread.ident is not None)):
+                        # Once producers_done is set the thread starts no new
+                        # bounce, but it finishes any in-flight one first. The
+                        # diagnostic timeout allows a whole cycle — stop()
+                        # (≤ bounce_stop_timeout_s) + start()
+                        # (≤ BOUNCE_RESTART_TIMEOUT_SEC), plus headroom for
+                        # Windows control helpers, diagnostics and force-reap.
+                        wind_down_sec = (
+                            fuzz.bounce_stop_timeout_s
+                            + self.BOUNCE_RESTART_TIMEOUT_SEC
+                            + BOUNCE_LIFECYCLE_HEADROOM_SEC)
+                        stop_event.set()
+                        qwp_ws_fuzz.finish_bounce_thread(
+                            bounce_thread=bounce_thread,
+                            fixture=QDB_FIXTURE,
+                            wind_down_sec=wind_down_sec,
+                            stop_timeout_sec=fuzz.bounce_stop_timeout_s,
+                            restart_timeout_sec=(
+                                self.BOUNCE_RESTART_TIMEOUT_SEC),
+                            record_failure=record_failure,
+                            log=self._log)
 
-            if alter_thread is not None:
-                alter_thread.join(timeout=30)
-                if alter_thread.is_alive():
-                    stop_event.set()
-                    alter_thread.join(timeout=30)
-
-            if bounce_thread is not None:
-                # Bounces are inherently slower (process restart + HTTP-up
-                # wait), so give the thread a generous wind-down budget.
-                bounce_thread.join(timeout=60)
-                if bounce_thread.is_alive():
-                    stop_event.set()
-                    bounce_thread.join(timeout=60)
-                if bounce_thread.bounces_performed > 0:
-                    self._log(
-                        f'fuzz bounce summary: '
-                        f'{bounce_thread.bounces_performed}'
-                        f'/{fuzz.max_bounces} performed')
+                        if bounce_thread.bounces_performed > 0:
+                            self._log(
+                                f'fuzz bounce summary: '
+                                f'{bounce_thread.bounces_performed}'
+                                f'/{fuzz.max_bounces} performed')
 
         self.assertEqual(
             failure_counter[0], 0,
@@ -2704,15 +2756,24 @@ class TestQwpWsFuzz(QwpWsTestSupport, unittest.TestCase):
 
     def _producer_loop(self, sender_id, sf_root, load, fuzz, rnd,
                        tables, next_ts, record_failure):
-        # A post-restart SFA replay storm can starve the server's accept loop
-        # for ~1.5 min, so bounce variants need a wider drain budget; kept
-        # equal so the reconnect sub-budget never trips first.
-        budget_millis = 240000 if fuzz.max_bounces > 0 else 120000
-        # `reconnect_max_duration_millis` is the explicit knob; the
-        # library auto-promotes `initial_connect_retry` to `sync` when
-        # any `reconnect_*` key is set, so a producer that races a
-        # bounce reuses the same budget on its very first connect
-        # instead of getting one shot.
+        # Reconnect and close_drain() use the same budget (270s with the
+        # default bounce caps). close_drain() applies it once to the entire
+        # drain interval, including repeated bounces deliberately scheduled
+        # while it waits; the deadline is not renewed per bounce. The formula
+        # fits one stop() + start() at their defensive caps plus headroom and
+        # sits above the expected duration of each complete bounce campaign.
+        # A campaign that prevents the drain from completing by this deadline
+        # is supposed to fail the liveness test even if no lifecycle call hit its
+        # own cap.
+        #
+        # Keep the reconnect and drain values equal so reconnect cannot give
+        # up while close_drain() still has time left. Non-bounce variants never
+        # reconnect, so they keep the tighter default budget.
+        client_budget_millis = int(
+            (fuzz.bounce_stop_timeout_s
+             + self.BOUNCE_RESTART_TIMEOUT_SEC
+             + BOUNCE_LIFECYCLE_HEADROOM_SEC)
+            * 1000) if fuzz.max_bounces > 0 else 120000
         conf = self._sender_conf(
             sender_id,
             sf_root,
@@ -2721,8 +2782,12 @@ class TestQwpWsFuzz(QwpWsTestSupport, unittest.TestCase):
             # connect, the producer that races the bounce fails fast with
             # an upgrade-response read error. `sync` makes the constructor
             # wait through the bounce up to reconnect_max_duration_millis.
+            # (The library auto-promotes initial_connect_retry to `sync`
+            # when any reconnect_* key is set, so the racing producer reuses
+            # this same budget on its very first connect instead of getting
+            # one shot.)
             initial_connect_retry='sync',
-            reconnect_max_duration_millis=budget_millis,
+            reconnect_max_duration_millis=client_budget_millis,
             # The bounce tests restart the server faster than the reconnect
             # backoff cap can track, so the client keeps backing off and
             # misses the brief windows the server is up between restarts —
@@ -2731,7 +2796,7 @@ class TestQwpWsFuzz(QwpWsTestSupport, unittest.TestCase):
             # the non-bounce tests, which never reconnect, so the backoff
             # never engages.)
             reconnect_max_backoff_millis=250,
-            close_flush_timeout_millis=budget_millis)
+            close_flush_timeout_millis=client_budget_millis)
         try:
             sender = self._connect_sender(conf)
         except Exception as e:  # noqa: BLE001
@@ -3241,8 +3306,9 @@ class TestQwpWsFuzz(QwpWsTestSupport, unittest.TestCase):
 
     def test_n_bounce_sweep(self):
         # Many short bounces so the chaos thread gets multiple chances
-        # to land mid-flush. Each bounce is ~3-5s of process restart so
-        # the test takes ~30-60s including the producers' SFA replay.
+        # to land mid-flush. Each bounce is ~3-5s of process restart, so
+        # the full campaign takes ~30-60s including the producers' SFA replay,
+        # well inside close_drain()'s overall 270s liveness deadline.
         load = qwp_ws_fuzz.LoadParams(
             100, 10 if not self._is_windows() else 6, 5, 5, 400)
         fuzz = qwp_ws_fuzz.FuzzParams(
@@ -4239,6 +4305,11 @@ def parse_args():
         help=('Test against existing jar from a ' +
               '`mvn install -DskipTests -P build-web-console`' +
               '-ed questdb repo such as `~/questdb/repos/questdb/`'))
+    version_g.add_argument(
+        '--qwp-ws-fuzz-child-dir',
+        type=str,
+        metavar='PREPARED_QUESTDB_DIR',
+        help=argparse.SUPPRESS)
     list_p = sub_p.add_parser('list', help='List latest -n releases.')
     list_p.set_defaults(command='list')
     list_p.add_argument('-n', type=int, default=30, help='number of releases')
@@ -4272,6 +4343,13 @@ def iter_versions(args):
     Returns a generator of prepared questdb directories.
     Ensure that the DB is stopped after each use.
     """
+    fuzz_child_dir = getattr(args, 'qwp_ws_fuzz_child_dir', None)
+    if fuzz_child_dir:
+        # The supervisor has already installed/copied this QuestDB version.
+        # Reuse it directly so process isolation adds no server setup work.
+        yield pathlib.Path(fuzz_child_dir).resolve()
+        return
+
     if getattr(args, 'repo', None):
         # A specific repo path was provided.
         repo = pathlib.Path(args.repo)
@@ -4298,6 +4376,41 @@ def iter_versions(args):
     for version, download_url in versions.items():
         questdb_dir = install_questdb(version, download_url)
         yield questdb_dir
+
+
+def _qwp_ws_fuzz_timeout_sec() -> float:
+    raw = os.environ.get(
+        'QWP_WS_FUZZ_SUITE_TIMEOUT_SEC',
+        str(QWP_WS_FUZZ_SUITE_TIMEOUT_SEC))
+    try:
+        timeout_sec = float(raw)
+    except ValueError as e:
+        raise ValueError(
+            f'Invalid QWP_WS_FUZZ_SUITE_TIMEOUT_SEC={raw!r}') from e
+    if not math.isfinite(timeout_sec) or timeout_sec <= 0:
+        raise ValueError(
+            'QWP_WS_FUZZ_SUITE_TIMEOUT_SEC must be finite and positive')
+    return timeout_sec
+
+
+def _run_qwp_ws_fuzz_in_subprocess(questdb_dir) -> int:
+    """Run the shared QWP/Arrow fuzz fixture in a supervised process tree."""
+    command = [
+        sys.executable,
+        str(pathlib.Path(__file__).resolve()),
+        'run',
+        '--qwp-ws-fuzz-child-dir',
+        str(pathlib.Path(questdb_dir).resolve()),
+        *sys.argv[1:],
+    ]
+    env = os.environ.copy()
+    env['QDB_BUILD_MODE_SEED'] = str(BUILD_MODE_SEED)
+    env['QWP_WS_FUZZ_ISOLATED_CHILD'] = '1'
+    return qwp_ws_fuzz.run_isolated_suite(
+        command,
+        timeout_sec=_qwp_ws_fuzz_timeout_sec(),
+        terminate_timeout_sec=QWP_WS_FUZZ_TERMINATE_TIMEOUT_SEC,
+        env=env)
 
 
 def _stop_and_maybe_wipe(fixture):
@@ -4337,11 +4450,24 @@ def run_with_fixtures(args):
             f'>>>> build_mode fuzz seed = {BUILD_MODE_SEED} '
             f'(API/CONF/ENV picked per-test at the latest protocol; '
             f're-run with QDB_BUILD_MODE_SEED={BUILD_MODE_SEED} to reproduce)\n')
-    run_matrix_suite = _select_tests(SUITE_MATRIX).countTestCases() > 0
-    run_qwp_ws_smoke_suite = _select_tests(SUITE_QWP_WS_SMOKE).countTestCases() > 0
-    run_qwp_ws_protocol_suite = _select_tests(SUITE_QWP_WS_PROTOCOL).countTestCases() > 0
-    run_qwp_ws_restart_suite = _select_tests(SUITE_QWP_WS_RESTART).countTestCases() > 0
-    run_qwp_ws_fuzz_suite = _select_tests(SUITE_QWP_WS_FUZZ).countTestCases() > 0
+    fuzz_child = bool(getattr(args, 'qwp_ws_fuzz_child_dir', None))
+    # The child receives the caller's original unittest selection but runs
+    # only the fuzz fixture group. The parent runs every other selected group
+    # and delegates this one exactly once per prepared QuestDB version.
+    run_matrix_suite = (
+        not fuzz_child
+        and _select_tests(SUITE_MATRIX).countTestCases() > 0)
+    run_qwp_ws_smoke_suite = (
+        not fuzz_child
+        and _select_tests(SUITE_QWP_WS_SMOKE).countTestCases() > 0)
+    run_qwp_ws_protocol_suite = (
+        not fuzz_child
+        and _select_tests(SUITE_QWP_WS_PROTOCOL).countTestCases() > 0)
+    run_qwp_ws_restart_suite = (
+        not fuzz_child
+        and _select_tests(SUITE_QWP_WS_RESTART).countTestCases() > 0)
+    run_qwp_ws_fuzz_suite = (
+        _select_tests(SUITE_QWP_WS_FUZZ).countTestCases() > 0)
 
     for questdb_dir in iter_versions(args):
         if run_matrix_suite:
@@ -4459,6 +4585,17 @@ def run_with_fixtures(args):
                 _stop_and_maybe_wipe(QDB_FIXTURE)
 
         if run_qwp_ws_fuzz_suite:
+            if not fuzz_child:
+                fuzz_exit_code = _run_qwp_ws_fuzz_in_subprocess(questdb_dir)
+                if fuzz_exit_code != 0:
+                    sys.stderr.write(
+                        f'Isolated QWP/WS fuzz suite failed with exit code '
+                        f'{fuzz_exit_code}.\n')
+                    sys.stderr.flush()
+                    raise SystemExit(
+                        fuzz_exit_code if fuzz_exit_code > 0 else 1)
+                continue
+
             QDB_FIXTURE = QuestDbFixture(
                 questdb_dir,
                 auth=False,

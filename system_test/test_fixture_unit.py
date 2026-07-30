@@ -24,8 +24,8 @@
 
 """Unit-level regression tests for the `fixture` QuestDB lifecycle.
 
-These do not launch QuestDB — they drive `QuestDbFixture` with stand-in
-child processes. They pin down how `stop()` reacts when a server refuses
+These do not launch QuestDB — they drive `QuestDbFixture` with fake
+server processes. They pin down how `stop()` reacts when a server refuses
 to shut down (originally seen in a qwp_ws_fuzz CI failure on 2026-06-10,
 `test_all_mixed_with_bounce` seed=0x8f7a0293542c4692, where the server
 hung in graceful shutdown):
@@ -34,9 +34,14 @@ hung in graceful shutdown):
   says so on stderr, and then raises `QuestDbStopTimeout` so a server
   that won't shut down within its timeout fails the test instead of
   being silently absorbed;
+* the post-kill reap has its own deadline and leaves the fixture owned when
+  the OS cannot reap the process, rather than waiting forever or restarting;
 * a clean shutdown stays quiet and does not raise;
 * `print_log()` reads the log as bytes so a force-kill that truncates
-  it mid-character can't crash the dump.
+  it mid-character can't crash the dump;
+* the readiness probe (`_probe_http` and the main/min HTTP checks that
+  `start()` selects between) reports up/down without raising on a
+  not-yet-ready server and fails fast once the process has died.
 
 Run with::
 
@@ -47,6 +52,7 @@ import sys
 sys.dont_write_bytecode = True
 
 import contextlib
+import http.client
 import io
 import pathlib
 import signal
@@ -65,7 +71,7 @@ def _make_fixture(tmp_dir: str) -> fixture.QuestDbFixture:
     return fixture.QuestDbFixture(root_dir)
 
 
-# A stand-in for a JVM whose graceful shutdown hangs: ignores SIGTERM,
+# A fake server process whose graceful shutdown hangs: ignores SIGTERM,
 # answers SIGQUIT with a fake thread dump on stdout (which the fixture
 # wires to the server log file), and never exits on its own.
 _HUNG_JVM_SCRIPT = """
@@ -97,13 +103,14 @@ class StopEscalationTest(unittest.TestCase):
                 stderr=subprocess.STDOUT)
             proc = qdb._proc
             try:
-                # Wait until the child has installed its signal handlers
-                # (it prints READY after doing so), else terminate() may
-                # land before SIGTERM is ignored and no escalation runs.
+                # Wait until the fake server process has installed its
+                # signal handlers (it prints READY after doing so), else
+                # terminate() may land before SIGTERM is ignored and no
+                # escalation runs.
                 deadline = time.monotonic() + 10
                 while b'READY' not in qdb._log_path.read_bytes():
                     if time.monotonic() > deadline:
-                        self.fail('stand-in process never became ready')
+                        self.fail('fake server process never became ready')
                     time.sleep(0.02)
 
                 stderr = io.StringIO()
@@ -117,23 +124,94 @@ class StopEscalationTest(unittest.TestCase):
                 # Cleanup must still have happened before the raise.
                 self.assertIsNone(qdb._proc)
                 self.assertIsNone(qdb._log)
-                self.assertIsNotNone(proc.poll(), 'child must be dead')
+                self.assertIsNotNone(
+                    proc.poll(), 'fake server process must be dead')
                 messages = stderr.getvalue()
                 self.assertIn('escalating to SIGKILL', messages)
                 self.assertIn('thread dump', messages)
                 log = qdb._log_path.read_bytes()
                 self.assertIn(b'FAKE THREAD DUMP', log,
-                              'SIGQUIT must reach the child')
+                              'SIGQUIT must reach the fake server process')
             finally:
                 if proc.poll() is None:
                     proc.kill()
                     proc.wait()
 
+    def test_post_kill_reap_is_bounded_and_preserves_ownership(self):
+        class NeverReapedProcess:
+            pid = 4242
+
+            def __init__(self):
+                self.wait_timeouts = []
+                self.killed = False
+
+            @staticmethod
+            def terminate():
+                pass
+
+            def wait(self, timeout=None):
+                self.wait_timeouts.append(timeout)
+                raise subprocess.TimeoutExpired('fake QuestDB', timeout)
+
+            def kill(self):
+                self.killed = True
+
+            @staticmethod
+            def poll():
+                return None
+
+        class FakeLog:
+            def __init__(self):
+                self.closed = False
+
+            def close(self):
+                self.closed = True
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            qdb = _make_fixture(tmp_dir)
+            proc = NeverReapedProcess()
+            qdb._proc = proc
+            fake_log = FakeLog()
+            qdb._log = fake_log
+            qdb._request_thread_dump = lambda: False
+            qdb._win_send_console_ctrl = lambda _event: True
+
+            stderr = io.StringIO()
+            with contextlib.redirect_stderr(stderr):
+                with self.assertRaises(fixture.QuestDbReapTimeout) as raised:
+                    qdb.stop(
+                        wait_timeout_sec=0.01,
+                        force_kill_wait_timeout_sec=0.02)
+
+            self.assertFalse(raised.exception.fixture_reusable)
+            self.assertTrue(proc.killed)
+            self.assertEqual(proc.wait_timeouts, [0.01, 0.02])
+            self.assertIs(
+                qdb._proc, proc,
+                'an unreaped process must retain fixture ownership')
+            # The process is unreaped, but its log handle must not leak: it is
+            # closed even on this path, which skips the normal close.
+            self.assertTrue(fake_log.closed,
+                            'the log handle must be closed on reap timeout')
+            self.assertIsNone(qdb._log)
+
     def test_quick_shutdown_stays_quiet(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
             qdb = _make_fixture(tmp_dir)
+            # On Windows, stop() shuts the fake server process down by sending
+            # it Ctrl+C, and Ctrl+C reaches every process sharing a console.
+            # CREATE_NO_WINDOW gives it a console of its own, as start() does
+            # for the real server, so only the fake gets the Ctrl+C. Sharing
+            # this test's console would let the Ctrl+C kill the test process
+            # too. Off Windows the flag is 0 and stop() uses SIGTERM. DEVNULL
+            # keeps the fake's Ctrl+C traceback out of the test log.
+            creationflags = (
+                subprocess.CREATE_NO_WINDOW if sys.platform == 'win32' else 0)
             qdb._proc = subprocess.Popen(
-                [sys.executable, '-c', 'import time; time.sleep(60)'])
+                [sys.executable, '-c', 'import time; time.sleep(60)'],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                creationflags=creationflags)
             stderr = io.StringIO()
             with contextlib.redirect_stderr(stderr):
                 qdb.stop(wait_timeout_sec=10)  # must not raise
@@ -156,6 +234,288 @@ class PrintLogTest(unittest.TestCase):
             dumped = stderr.getvalue()
             self.assertIn('GOOD LINE', dumped)
             self.assertIn('BAD BYTES', dumped)
+
+
+class PrintLogTailTest(unittest.TestCase):
+
+    def test_handles_truncated_utf8_without_crashing(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            qdb = _make_fixture(tmp_dir)
+            qdb._log_path.parent.mkdir(parents=True)
+            qdb._log_path.write_bytes(b'GOOD LINE\n\xff\xfe BAD BYTES\n')
+            stderr = io.StringIO()
+            with contextlib.redirect_stderr(stderr):
+                qdb.print_log_tail()  # must not raise
+            dumped = stderr.getvalue()
+            self.assertIn('GOOD LINE', dumped)
+            self.assertIn('BAD BYTES', dumped)
+            self.assertIn('full log', dumped)
+
+    def test_caps_at_max_bytes_and_keeps_the_shutdown_marker(self):
+        # The shutdown lines the diagnostic exists to surface are the last
+        # thing written; a log larger than the cap must still show them
+        # while dropping the older head.
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            qdb = _make_fixture(tmp_dir)
+            qdb._log_path.parent.mkdir(parents=True)
+            head = b'OLD HEAD LINE\n' + (b'x' * 4096)
+            qdb._log_path.write_bytes(head + b'\nSIGTERM received\n')
+            stderr = io.StringIO()
+            with contextlib.redirect_stderr(stderr):
+                qdb.print_log_tail(max_bytes=1024)
+            dumped = stderr.getvalue()
+            self.assertIn('SIGTERM received', dumped)
+            self.assertNotIn('OLD HEAD LINE', dumped)
+            self.assertIn('last 1024 bytes', dumped)
+
+    def test_missing_log_reports_without_crashing(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            qdb = _make_fixture(tmp_dir)
+            # _log_path's parent (data/log) does not exist yet.
+            stderr = io.StringIO()
+            with contextlib.redirect_stderr(stderr):
+                qdb.print_log_tail()  # must not raise
+            self.assertIn('Could not read QuestDB log', stderr.getvalue())
+
+
+# A fake server process and a fake HTTP response for the probe tests:
+# no real JVM or HTTP server is launched.
+class _FakeProc:
+    """Minimal fake subprocess: poll() reports liveness."""
+
+    def __init__(self, alive=True):
+        self._alive = alive
+
+    def poll(self):
+        # Popen.poll(): None while running, the exit code once dead.
+        return None if self._alive else 0
+
+
+class _FakeResponse:
+    """Minimal urlopen() result: the probe reads .status inside a `with`,
+    so this models the real HTTPResponse's context-manager protocol too."""
+
+    def __init__(self, status):
+        self.status = status
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+
+class ProbeHttpTest(unittest.TestCase):
+    """`_probe_http` is the shared readiness primitive: it asserts the
+    server is still alive, issues one GET, and maps the outcome to a
+    bool — never letting a not-yet-ready server's OSError abort the
+    enclosing retry loop."""
+
+    def _probe_fixture(self, tmp_dir, alive=True):
+        qdb = _make_fixture(tmp_dir)
+        qdb.http_server_port = 9000
+        qdb.http_min_port = 9003
+        qdb._proc = _FakeProc(alive=alive)
+        return qdb
+
+    def test_accepted_status_returns_true(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            qdb = self._probe_fixture(tmp_dir)
+            with mock.patch('urllib.request.urlopen',
+                            return_value=_FakeResponse(204)):
+                self.assertTrue(
+                    qdb._probe_http(9000, '/ping', lambda s: s == 204))
+
+    def test_rejected_status_returns_false(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            qdb = self._probe_fixture(tmp_dir)
+            with mock.patch('urllib.request.urlopen',
+                            return_value=_FakeResponse(503)):
+                self.assertFalse(
+                    qdb._probe_http(9000, '/ping', lambda s: s == 204))
+
+    def test_connection_error_returns_false(self):
+        # A not-yet-ready server refuses the connection; the probe reports
+        # not-up rather than letting the OSError propagate and abort retry.
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            qdb = self._probe_fixture(tmp_dir)
+            with mock.patch('urllib.request.urlopen',
+                            side_effect=ConnectionRefusedError()):
+                self.assertFalse(
+                    qdb._probe_http(9000, '/ping', lambda s: s == 204))
+
+    def test_malformed_response_returns_false(self):
+        # A half-started server can answer with a malformed HTTP status line,
+        # raising http.client.BadStatusLine — an HTTPException, not an
+        # OSError. The probe reports not-up rather than letting it propagate
+        # and abort the retry loop.
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            qdb = self._probe_fixture(tmp_dir)
+            with mock.patch('urllib.request.urlopen',
+                            side_effect=http.client.BadStatusLine('x')):
+                self.assertFalse(
+                    qdb._probe_http(9000, '/ping', lambda s: s == 204))
+
+    def test_dead_process_fails_fast_without_probing(self):
+        # _assert_server_alive runs first: a server that died during
+        # startup raises immediately instead of looping until the timeout,
+        # and no HTTP request is attempted.
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            qdb = self._probe_fixture(tmp_dir, alive=False)
+            with mock.patch('urllib.request.urlopen') as urlopen:
+                with self.assertRaises(RuntimeError):
+                    qdb._probe_http(9000, '/ping', lambda s: s == 204)
+                urlopen.assert_not_called()
+
+
+class CheckHttpUpTest(unittest.TestCase):
+    """The two readiness checks must target distinct ports and paths and,
+    crucially, distinct status predicates: main `/ping` answers 204
+    exactly, while the min health endpoint counts any 2xx as healthy."""
+
+    def _capture_probe(self, tmp_dir):
+        qdb = _make_fixture(tmp_dir)
+        qdb.http_server_port = 9000
+        qdb.http_min_port = 9003
+        calls = []
+        qdb._probe_http = (
+            lambda port, path, status_ok:
+            calls.append((port, path, status_ok)) or True)
+        return qdb, calls
+
+    def test_main_probes_ping_requiring_exactly_204(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            qdb, calls = self._capture_probe(tmp_dir)
+            self.assertTrue(qdb._check_main_http_up())
+            (port, path, status_ok), = calls
+            self.assertEqual(port, 9000)
+            self.assertEqual(path, '/ping')
+            self.assertTrue(status_ok(204))
+            self.assertFalse(status_ok(200))
+            self.assertFalse(status_ok(503))
+
+    def test_min_probes_status_accepting_any_2xx(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            qdb, calls = self._capture_probe(tmp_dir)
+            self.assertTrue(qdb._check_min_http_up())
+            (port, path, status_ok), = calls
+            self.assertEqual(port, 9003)
+            self.assertEqual(path, '/status')
+            self.assertTrue(status_ok(200))
+            self.assertTrue(status_ok(204))
+            self.assertTrue(status_ok(299))
+            self.assertFalse(status_ok(300))
+            self.assertFalse(status_ok(404))
+
+
+class StartProbeSelectionTest(unittest.TestCase):
+    """start() picks its readiness check and timeout from its arguments:
+    an initial start waits on main `/ping` with the generous default
+    timeout, while a bounce restart waits on the min-HTTP health endpoint
+    with the tight cap, so a stuck boot fails fast instead of eating into
+    the producers' budgets."""
+
+    def _captured_start(self, tmp_dir, **start_kwargs):
+        qdb = _make_fixture(tmp_dir)
+        # Skip the post-start version query, which would hit real HTTP.
+        qdb._version_queried = True
+        captured = {}
+
+        def fake_retry(predicate, timeout_sec=None, **_):
+            captured['predicate'] = predicate
+            captured['timeout_sec'] = timeout_sec
+            return True
+
+        stderr = io.StringIO()
+        with contextlib.redirect_stderr(stderr), \
+                mock.patch.object(fixture, 'retry', fake_retry), \
+                mock.patch.object(fixture, '_find_java', return_value='java'), \
+                mock.patch.object(fixture.subprocess, 'Popen',
+                                  return_value=_FakeProc(alive=True)), \
+                mock.patch.object(fixture.atexit, 'register'):
+            qdb.start(**start_kwargs)
+        if qdb._log:
+            qdb._log.close()
+        return captured
+
+    def test_initial_start_gates_on_main_http(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            captured = self._captured_start(tmp_dir)
+            self.assertEqual(
+                captured['predicate'].__name__, '_check_main_http_up')
+            self.assertEqual(captured['timeout_sec'], 300)
+
+    def test_bounce_start_gates_on_min_http_with_tight_cap(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            captured = self._captured_start(
+                tmp_dir, start_timeout_sec=90, probe_min_http=True)
+            self.assertEqual(
+                captured['predicate'].__name__, '_check_min_http_up')
+            self.assertEqual(captured['timeout_sec'], 90)
+
+
+class WindowsCtrlCInheritanceTest(unittest.TestCase):
+    """On Windows the fuzz supervisor runs this process under
+    CREATE_NEW_PROCESS_GROUP, whose inherited ignore-Ctrl+C flag would make
+    the JVM deaf to the graceful-shutdown Ctrl+C stop() posts. start() must
+    clear that flag before spawning the JVM, so the JVM inherits Ctrl+C
+    enabled, and must do so before the launch (a later clear cannot change
+    the flag the child already inherited)."""
+
+    def test_start_clears_ignore_ctrl_c_before_launching_jvm(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            qdb = _make_fixture(tmp_dir)
+            qdb._version_queried = True  # skip the post-start HTTP version query
+            calls = []
+            fake_ctypes = mock.MagicMock()
+            fake_ctypes.windll.kernel32.SetConsoleCtrlHandler.side_effect = (
+                lambda *a: calls.append(('SetConsoleCtrlHandler', a)))
+
+            def fake_popen(*_a, **_k):
+                calls.append(('Popen', None))
+                return _FakeProc(alive=True)
+
+            with contextlib.redirect_stderr(io.StringIO()), \
+                    mock.patch.object(fixture.sys, 'platform', 'win32'), \
+                    mock.patch.object(fixture.subprocess, 'CREATE_NO_WINDOW',
+                                      0x08000000, create=True), \
+                    mock.patch.object(fixture, 'ctypes', fake_ctypes), \
+                    mock.patch.object(fixture, 'retry', lambda *a, **k: True), \
+                    mock.patch.object(fixture, '_find_java', return_value='java'), \
+                    mock.patch.object(fixture.subprocess, 'Popen', fake_popen), \
+                    mock.patch.object(fixture.atexit, 'register'):
+                qdb.start()
+            if qdb._log:
+                qdb._log.close()
+
+            names = [c[0] for c in calls]
+            self.assertIn('SetConsoleCtrlHandler', names)
+            self.assertIn('Popen', names)
+            self.assertLess(
+                names.index('SetConsoleCtrlHandler'), names.index('Popen'),
+                'ignore-Ctrl+C must be cleared before the JVM is spawned')
+            sc_args = next(
+                c[1] for c in calls if c[0] == 'SetConsoleCtrlHandler')
+            self.assertEqual(sc_args, (None, False))
+
+    def test_start_leaves_ctrl_c_handler_alone_off_windows(self):
+        # On POSIX the flag does not exist; start() must not touch it.
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            qdb = _make_fixture(tmp_dir)
+            qdb._version_queried = True
+            fake_ctypes = mock.MagicMock()
+            with contextlib.redirect_stderr(io.StringIO()), \
+                    mock.patch.object(fixture.sys, 'platform', 'linux'), \
+                    mock.patch.object(fixture, 'ctypes', fake_ctypes), \
+                    mock.patch.object(fixture, 'retry', lambda *a, **k: True), \
+                    mock.patch.object(fixture, '_find_java', return_value='java'), \
+                    mock.patch.object(fixture.subprocess, 'Popen',
+                                      return_value=_FakeProc(alive=True)), \
+                    mock.patch.object(fixture.atexit, 'register'):
+                qdb.start()
+            if qdb._log:
+                qdb._log.close()
+            fake_ctypes.windll.kernel32.SetConsoleCtrlHandler.assert_not_called()
 
 
 class TimeoutDiagnosticsTest(unittest.TestCase):

@@ -153,11 +153,22 @@ fn http_status(host: &str, port: u16, path: &str) -> u16 {
 
 /// Run a SQL statement via the QuestDB HTTP `/exec` endpoint. Used for
 /// DDL / setup queries; result body is not parsed.
+///
+/// The request is written over a raw `TcpStream` rather than through an
+/// HTTP client library. `/exec` reads the SQL exclusively from the URL
+/// query string, and the fuzz suites generate multi-hundred-KB
+/// `INSERT ... VALUES (...)` statements — far past the 64 KiB total-URI
+/// cap the `http` crate enforces (which puts such URLs out of reach for
+/// any client built on it, ureq included). The server accepts them
+/// because `start_fragmented` raises `http.request.header.buffer.size`
+/// to 4 MiB.
 pub fn http_exec(host: &str, port: u16, sql: &str) -> u16 {
-    let url = format!("http://{}:{}/exec", host, port);
-    match ureq::get(&url).query("query", sql).call() {
-        Ok(resp) => resp.status().as_u16(),
-        Err(ureq::Error::StatusCode(code)) => code,
+    let request = format!(
+        "GET /exec?query={} HTTP/1.1\r\nHost: {host}:{port}\r\nConnection: close\r\n\r\n",
+        percent_encode(sql)
+    );
+    match http_request_status(host, port, request.as_bytes()) {
+        Ok(status) => status,
         Err(e) => {
             eprintln!(
                 "[live-server] http_exec error: {} (sql len={})",
@@ -167,6 +178,147 @@ pub fn http_exec(host: &str, port: u16, sql: &str) -> u16 {
             0
         }
     }
+}
+
+/// Percent-encode `s` as a URL query-parameter value: every byte
+/// outside the RFC 3986 unreserved set (`A-Z a-z 0-9 - . _ ~`) becomes
+/// `%XX`.
+fn percent_encode(s: &str) -> String {
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
+    let mut out = String::with_capacity(s.len() * 3);
+    for &b in s.as_bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
+                out.push(b as char);
+            }
+            _ => {
+                out.push('%');
+                out.push(HEX[(b >> 4) as usize] as char);
+                out.push(HEX[(b & 0x0F) as usize] as char);
+            }
+        }
+    }
+    out
+}
+
+/// Write `request` to `host:port`, read the response until it is
+/// structurally complete, and parse the status code out of the status
+/// line.
+///
+/// QuestDB holds every HTTP connection in keep-alive (it does not act
+/// on `Connection: close`), so end-of-response has to be detected from
+/// the message framing itself: full headers plus a chunked body's
+/// terminal 0-chunk, or `Content-Length` bytes, or no body at all.
+/// Draining the whole body (rather than closing after the status line)
+/// matters under `debug.http.force.send.fragmentation.chunk.size`,
+/// where the server dribbles the response out in tiny writes — closing
+/// early would reset the connection mid-send on every call. Read/write
+/// timeouts keep a misbehaving server from hanging the test silently; a
+/// timeout surfaces as `Err` → status 0 → loud assert in the caller.
+fn http_request_status(host: &str, port: u16, request: &[u8]) -> std::io::Result<u16> {
+    use std::io::{Read, Write};
+    let mut stream = std::net::TcpStream::connect((host, port))?;
+    stream.set_write_timeout(Some(Duration::from_secs(30)))?;
+    stream.set_read_timeout(Some(Duration::from_secs(30)))?;
+    stream.write_all(request)?;
+    let mut response = Vec::with_capacity(4096);
+    let mut chunk = [0u8; 4096];
+    while !http_response_complete(&response) {
+        match stream.read(&mut chunk)? {
+            // EOF: the server closed; parse whatever arrived.
+            0 => break,
+            n => response.extend_from_slice(&chunk[..n]),
+        }
+    }
+    let status_line = response.split(|&b| b == b'\n').next().unwrap_or(&[]);
+    std::str::from_utf8(status_line)
+        .ok()
+        .and_then(|line| line.split_whitespace().nth(1))
+        .and_then(|code| code.parse::<u16>().ok())
+        .ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "malformed HTTP status line: {:?}",
+                    String::from_utf8_lossy(&response[..response.len().min(120)])
+                ),
+            )
+        })
+}
+
+/// True once `buf` holds a structurally complete HTTP response:
+/// terminated headers, plus the full body per the framing the headers
+/// declare (`Transfer-Encoding: chunked` or `Content-Length`; absent
+/// both, headers alone complete the response — QuestDB sends bodyless
+/// responses, e.g. 204, with neither header).
+fn http_response_complete(buf: &[u8]) -> bool {
+    let Some(header_end) = find_subslice(buf, b"\r\n\r\n") else {
+        return false;
+    };
+    let body_start = header_end + 4;
+    let headers = &buf[..body_start];
+    if header_value(headers, "transfer-encoding").is_some_and(|v| v.eq_ignore_ascii_case("chunked"))
+    {
+        return chunked_body_complete(&buf[body_start..]);
+    }
+    if let Some(len) = header_value(headers, "content-length").and_then(|v| v.parse::<usize>().ok())
+    {
+        return buf.len() >= body_start + len;
+    }
+    true
+}
+
+/// True once `body` holds a full chunked-encoding stream: every chunk's
+/// declared size worth of data, through the terminal 0-chunk and its
+/// closing CRLF. Malformed framing counts as complete so the caller
+/// still gets the already-received status code rather than a timeout.
+fn chunked_body_complete(body: &[u8]) -> bool {
+    let mut pos = 0usize;
+    loop {
+        let Some(line_len) = find_subslice(&body[pos..], b"\r\n") else {
+            return false; // size line still incomplete
+        };
+        let size_line = &body[pos..pos + line_len];
+        // Chunk extensions (";...") are permitted by the grammar.
+        let size_hex = size_line
+            .split(|&b| b == b';')
+            .next()
+            .and_then(|s| std::str::from_utf8(s).ok())
+            .map(str::trim)
+            .unwrap_or("");
+        let Ok(size) = usize::from_str_radix(size_hex, 16) else {
+            return true;
+        };
+        pos += line_len + 2;
+        if size == 0 {
+            // Terminal chunk; QuestDB sends no trailers, just CRLF.
+            return body.len() >= pos + 2;
+        }
+        pos += size + 2; // chunk data + CRLF
+        if pos > body.len() {
+            return false;
+        }
+    }
+}
+
+/// Value of the first `name:` header in the raw header block, trimmed.
+/// Header names compare ASCII-case-insensitively.
+fn header_value<'a>(headers: &'a [u8], name: &str) -> Option<&'a str> {
+    headers.split(|&b| b == b'\n').find_map(|line| {
+        let line = std::str::from_utf8(line).ok()?;
+        let (key, value) = line.split_once(':')?;
+        if key.trim().eq_ignore_ascii_case(name) {
+            Some(value.trim())
+        } else {
+            None
+        }
+    })
+}
+
+fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    haystack
+        .windows(needle.len())
+        .position(|window| window == needle)
 }
 
 /// Running QuestDB instance scoped to one process.

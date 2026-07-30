@@ -896,6 +896,17 @@ class TestArrowIngressSfa(afc.ArrowFuzzBase):
     SUITE_LABEL = "arrow_ingress_sfa"
     BOUNCE_COUNT = 2
     BOUNCE_BATCH_ROWS = 5
+    # A bounce stops the server while the producer is mid-load, so graceful
+    # shutdown must first drain the in-flight WAL backlog; that can legitimately
+    # run past the fixture's strict 30s default on a slow CI box. These mirror
+    # the QWP/WS fuzz bounce budgets (see TestQwpWsFuzz). A genuinely stuck
+    # server still trips the larger budget and fails the run.
+    BOUNCE_STOP_TIMEOUT_S = 120.0
+    BOUNCE_RESTART_TIMEOUT_S = 90.0
+    # Extra slack over one stop()+start() so the producer's reconnect/drain
+    # budget clears the worst legal down-window. Mirrors TestQwpWsFuzz's
+    # BOUNCE_LIFECYCLE_HEADROOM_SEC.
+    BOUNCE_LIFECYCLE_HEADROOM_S = 60.0
 
     def _sfa_extras(self, sender_id: str, sf_dir: str) -> Dict[str, str]:
         return {
@@ -962,6 +973,35 @@ class TestArrowIngressSfa(afc.ArrowFuzzBase):
                 arr.release(ctypes.byref(arr))
             if sch.release:
                 sch.release(ctypes.byref(sch))
+
+    def _restart_if_down(self, *, probe_min_http: bool) -> None:
+        """Bring the shared server back up if it is currently stopped.
+
+        stop() clears the fixture's ``_proc`` once the process is reaped,
+        whether it stopped cleanly or overran its graceful-shutdown budget (a
+        reusable ``QuestDbStopTimeout``). Restart from that state so a bounce
+        that failed mid-cycle still hands a live server to the rest of the
+        suite. Called from a ``finally``, so it must not mask the exception
+        that is propagating: a recovery ``start()`` that fails is logged, not
+        raised, and ``setUp`` retries it before the next test.
+
+        ``probe_min_http`` selects the readiness probe: pass ``True`` while
+        producers are still reconnecting (they keep the main worker pool busy),
+        ``False`` when the caller issues SQL against the main server right
+        after the restart and needs it ready.
+        """
+        if getattr(self._fixture, "_proc", None) is not None:
+            return
+        try:
+            self._fixture.start(
+                start_timeout_sec=self.BOUNCE_RESTART_TIMEOUT_S,
+                probe_min_http=probe_min_http)
+        except Exception as e:  # best-effort recovery; the original error wins
+            sys.stderr.write(
+                f"[{self.SUITE_LABEL}] recovery restart failed: "
+                f"{type(e).__name__}: {e}\n"
+            )
+            sys.stderr.flush()
 
     def test_sfa_single_batch_round_trip_and_cleans_slot(self):
         table = self.fresh_table("arrow_sfa_smoke")
@@ -1149,7 +1189,11 @@ class TestArrowIngressSfa(afc.ArrowFuzzBase):
                     )
 
                 with self.assertRaises(ArrowSenderError) as raised:
-                    afc.column_sender_sync(conn, 0)
+                    # Finite no-progress deadline: the server is up and issues
+                    # a terminal rejection here, so a healthy run never trips
+                    # it; it only stops a hung server from blocking forever.
+                    afc.column_sender_sync(
+                        conn, 0, afc._SYNC_ON_EXIT_TIMEOUT_MS)
                 err = raised.exception
                 self.assertEqual(err.code, ClientErrorCode.SERVER_REJECTION)
                 diagnostic = err.qwp_ws_error
@@ -1249,7 +1293,6 @@ class TestArrowIngressSfa(afc.ArrowFuzzBase):
             )
             db = None
             conn = None
-            stopped = False
             try:
                 try:
                     db = afc.db_connect(conf)
@@ -1264,15 +1307,22 @@ class TestArrowIngressSfa(afc.ArrowFuzzBase):
                 self._flush_batch(conn, table, rb)
                 proxy.join()
                 self._fixture.stop()
-                stopped = True
             finally:
                 if db is not None and conn is not None:
                     afc.db_return_conn(db, conn)
                 afc.db_close(db)
                 if proxy.is_alive():
                     proxy.close()
-                if stopped:
-                    self._fixture.start()
+                # The stop() above is the point of the test: quiesce and drop
+                # the server so the new owner recovers the unacked batch. It
+                # clears _proc once the process is reaped (clean stop or a
+                # reusable shutdown-timeout), so restart from that state to run
+                # the recovery assertions and later tests against a live
+                # server. The recovery below issues SQL against the main
+                # server immediately, so wait on its /ping (probe_min_http
+                # =False). A reusable stop-timeout still fails this test loudly
+                # via the propagating exception.
+                self._restart_if_down(probe_min_http=False)
 
             self.assertGreater(
                 afc.sfa_file_count(sf_dir, sender_id),
@@ -1292,7 +1342,11 @@ class TestArrowIngressSfa(afc.ArrowFuzzBase):
                 sync_on_exit=False,
                 **recover_extras,
             ) as conn:
-                afc.column_sender_sync(conn, 0)
+                # Finite no-progress deadline: the server is already back up
+                # (restarted above), so the recovery drain never trips it on a
+                # healthy run; it only bounds a hung server.
+                afc.column_sender_sync(
+                    conn, 0, afc._SYNC_ON_EXIT_TIMEOUT_MS)
 
             self.assertEqual(
                 afc.sfa_file_count(sf_dir, sender_id),
@@ -1361,10 +1415,20 @@ class TestArrowIngressSfa(afc.ArrowFuzzBase):
         def producer(sf_dir: str) -> None:
             nonlocal rows_produced
             extras = self._sfa_extras(sender_id, sf_dir)
+            # The producer keeps reconnecting and draining across a whole
+            # bounce: one stop() (<= BOUNCE_STOP_TIMEOUT_S) + start()
+            # (<= BOUNCE_RESTART_TIMEOUT_S), plus headroom. A budget below that
+            # window lets a slow-but-legal bounce exhaust the reconnect and fail
+            # the test as a producer error, hiding the real cause (a slow
+            # server). Same sizing as TestQwpWsFuzz's client budget.
+            client_budget_millis = int(
+                (self.BOUNCE_STOP_TIMEOUT_S
+                 + self.BOUNCE_RESTART_TIMEOUT_S
+                 + self.BOUNCE_LIFECYCLE_HEADROOM_S) * 1000)
             extras.update({
-                "reconnect_max_duration_millis": "120000",
+                "reconnect_max_duration_millis": str(client_budget_millis),
                 "reconnect_max_backoff_millis": "250",
-                "close_flush_timeout_millis": "120000",
+                "close_flush_timeout_millis": str(client_budget_millis),
             })
             try:
                 with afc.borrowed_sender(
@@ -1380,7 +1444,7 @@ class TestArrowIngressSfa(afc.ArrowFuzzBase):
                         with progress_lock:
                             rows_produced = next_id
                         time.sleep(0.005)
-                    afc.column_sender_sync(conn, 0)
+                    afc.column_sender_sync(conn, 0, client_budget_millis)
             except BaseException as exc:
                 producer_errors.append(exc)
 
@@ -1412,16 +1476,25 @@ class TestArrowIngressSfa(afc.ArrowFuzzBase):
 
                 for bounce_index in range(self.BOUNCE_COUNT):
                     rows_before_stop = current_rows()
-                    stopped = False
                     try:
-                        self._fixture.stop()
-                        stopped = True
+                        self._fixture.stop(
+                            wait_timeout_sec=self.BOUNCE_STOP_TIMEOUT_S)
                         time.sleep(0.05)
-                        self._fixture.start()
-                        stopped = False
+                        self._fixture.start(
+                            start_timeout_sec=self.BOUNCE_RESTART_TIMEOUT_S,
+                            probe_min_http=True)
                     finally:
-                        if stopped:
-                            self._fixture.start()
+                        # stop() clears _proc once the process is reaped — on a
+                        # clean stop and on a reusable shutdown-timeout alike —
+                        # and a start() that then fails leaves it cleared too.
+                        # Whenever the server is down, bring it back up so the
+                        # rest of the suite keeps a live fixture even as a
+                        # bounce failure propagates out of this test. Recovery
+                        # is best-effort: keep the original failure as the
+                        # test's error, and let setUp retry on the next test.
+                        # A non-reusable reap-timeout leaves _proc set and is
+                        # deliberately left alone.
+                        self._restart_if_down(probe_min_http=True)
                     rows_at_restart = current_rows()
                     restart_deadline = time.monotonic() + 10
                     while (

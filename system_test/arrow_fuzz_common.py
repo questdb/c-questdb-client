@@ -234,6 +234,15 @@ def drop_table_safe(fixture, table: str) -> None:
             f"[arrow_fuzz_common] table drop failed for {table!r}: {e!r}\n"
         )
 
+# No-progress deadline for the sync-on-exit ack barrier. qwp_sender_wait(0)
+# waits indefinitely, so a sync against a server that has gone away (e.g. a
+# bounce test that left it down) would block until the fuzz-suite supervisor's
+# deadline instead of the test failing on its own. A finite deadline only ever
+# fires when the ack watermark makes no progress for this long, so a healthy
+# server — where these small batches ack in milliseconds — never trips it.
+_SYNC_ON_EXIT_TIMEOUT_MS = 30_000
+
+
 @contextlib.contextmanager
 def borrowed_sender(fixture, *, sync_on_exit: bool = True, **conf_extras: str):
     """Open a `questdb_db*` pool from the fixture, borrow one
@@ -258,7 +267,7 @@ def borrowed_sender(fixture, *, sync_on_exit: bool = True, **conf_extras: str):
             yield conn
             if sync_on_exit:
                 try:
-                    column_sender_sync(conn, 0)
+                    column_sender_sync(conn, 0, _SYNC_ON_EXIT_TIMEOUT_MS)
                 except SenderError:
                     pass
         finally:
@@ -1369,6 +1378,7 @@ class ArrowFuzzBase(unittest.TestCase):
         except ImportError:
             self.skipTest("pyarrow is required for the Arrow system tests")
         self._fixture = get_live_fixture(self)
+        self._ensure_fixture_running()
         seed = derive_master_seed()
         self._master_rng = Rng(seed)
         self._seed_label = format_seed(seed)
@@ -1378,6 +1388,44 @@ class ArrowFuzzBase(unittest.TestCase):
         sys.stderr.flush()
         self._created_tables: List[str] = []
         self._exit_stack = contextlib.ExitStack()
+
+    def _ensure_fixture_running(self) -> None:
+        """Bring the shared managed server back up if a prior test left it down.
+
+        The SFA tests stop and restart the shared fixture. A bounce whose
+        graceful shutdown overruns its budget is force-killed and raises,
+        which can leave the server stopped; without this, every following
+        test in the shared-fixture suite would run against a dead server —
+        failing outright, or blocking on a store-and-forward sync until the
+        suite deadline. Only a managed ``QuestDbFixture`` can be restarted;
+        an external fixture is left untouched.
+        """
+        from test import QuestDbFixture
+
+        fixture = self._fixture
+        if not isinstance(fixture, QuestDbFixture):
+            return
+        proc = getattr(fixture, "_proc", None)
+        if proc is not None and proc.poll() is None:
+            return
+        sys.stderr.write(
+            f"[{self.SUITE_LABEL}] shared server was left down; "
+            f"restarting it before {self.id()}\n"
+        )
+        sys.stderr.flush()
+        # A process that died without stop() clearing _proc must be reaped
+        # first: start() overwrites _proc unconditionally, so starting over a
+        # stale handle would leak the old process. stop() on an already-dead
+        # process reaps at once and clears _proc.
+        if proc is not None:
+            try:
+                fixture.stop()
+            except Exception as e:  # best-effort; the start() below is what counts
+                sys.stderr.write(
+                    f"[{self.SUITE_LABEL}] recovery stop() reported "
+                    f"{type(e).__name__}: {e}\n"
+                )
+        fixture.start()
 
     def tearDown(self) -> None:
         self._exit_stack.close()
