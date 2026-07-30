@@ -62,6 +62,31 @@ std::string conf_for(const std::string& addr, const std::string& extras = {})
            extras;
 }
 
+void check_db_config_error(
+    const std::string& conf,
+    const std::string& expected_message)
+{
+    questdb_error* err = nullptr;
+    questdb_db* db = questdb_db_connect(conf.c_str(), conf.size(), &err);
+    if (db != nullptr)
+    {
+        questdb_db_close(db);
+    }
+    REQUIRE(db == nullptr);
+    REQUIRE(err != nullptr);
+    std::unique_ptr<questdb_error, decltype(&questdb_error_free)> owned_err{
+        err,
+        &questdb_error_free};
+
+    CHECK(questdb_error_get_code(err) == questdb_error_config_error);
+    size_t message_len = 0;
+    const char* message = questdb_error_msg(err, &message_len);
+    REQUIRE(message != nullptr);
+    CHECK(
+        std::string{message, message_len}.find(expected_message) !=
+        std::string::npos);
+}
+
 } // namespace
 
 TEST_CASE("column_chunk is move-constructible and move-assignable")
@@ -106,6 +131,19 @@ TEST_CASE("column_chunk fluent chaining returns the same chunk")
 TEST_CASE("pool construction throws on invalid connect string")
 {
     CHECK_THROWS_AS(questdb::pool{"http::not-a-qwp-string;"}, questdb::error);
+}
+
+TEST_CASE("periodic durability config errors cross the C API as ConfigError")
+{
+    check_db_config_error(
+        "ws::addr=127.0.0.1:1;lazy_connect=true;"
+        "sf_dir=unused-periodic-config-test;sf_durability=periodic;"
+        "sf_sync_interval_millis=0;",
+        "sf_sync_interval_millis is out of range: 0");
+    check_db_config_error(
+        "ws::addr=127.0.0.1:1;lazy_connect=true;"
+        "sf_sync_interval_millis=5000;",
+        "sf_sync_interval_millis requires sf_durability=periodic");
 }
 
 TEST_CASE("borrowed_sender returns conn to pool on destructor")

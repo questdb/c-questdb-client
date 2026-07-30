@@ -648,6 +648,15 @@ where
     }
 
     fn check_error(&self) -> crate::Result<()> {
+        if let Some(producer) = self.producer.as_ref() {
+            producer
+                .check_durability()
+                .map_err(DriverError::from)
+                .map_err(driver_error_to_error_without_state)?;
+        } else {
+            let store = self.lock_shared()?;
+            check_store_error(&store)?;
+        }
         if self.lifecycle.is_terminal() {
             let store = self.lock_shared()?;
             return Err(driver_error_to_error_from_store(
@@ -760,12 +769,27 @@ where
             let backpressure_generation = self.backpressure.generation();
             {
                 let mut store = self.lock_shared()?;
-                check_store_error(&store)?;
+                // A periodic-checkpoint failure is recoverable: the runner
+                // keeps retrying it, and close_queue() performs its own
+                // covering sync before tearing down an undrained queue. Do
+                // not let the public durability latch prevent close from
+                // reaching either recovery path.
+                check_store_terminal_error(&store)?;
                 if store.all_published_receipts_resolved() {
-                    store
-                        .close_queue()
-                        .map_err(driver_error_to_error_without_state)?;
-                    return Ok(());
+                    // A periodic checkpoint performs mmap/file sync off the
+                    // publication-store lock. Its batch owns segment mappings,
+                    // so wait for finish_storage_maintenance() to retire it
+                    // before close tears down mappings, unlinks files, or
+                    // releases the slot lock.
+                    if !store
+                        .periodic_sync_in_flight()
+                        .map_err(driver_error_to_error_without_state)?
+                    {
+                        store
+                            .close_queue()
+                            .map_err(driver_error_to_error_without_state)?;
+                        return Ok(());
+                    }
                 }
             }
 
@@ -1678,6 +1702,15 @@ fn step_from_drive_outcome(outcome: DriveOutcome) -> RunnerStep {
 }
 
 fn check_store_error<Q: PublicationLog>(store: &QwpWsPublicationStore<Q>) -> crate::Result<()> {
+    store
+        .check_durability()
+        .map_err(driver_error_to_error_without_state)?;
+    check_store_terminal_error(store)
+}
+
+fn check_store_terminal_error<Q: PublicationLog>(
+    store: &QwpWsPublicationStore<Q>,
+) -> crate::Result<()> {
     if let Some(err) = store.terminal_error() {
         return Err(err.clone());
     }
@@ -1773,16 +1806,20 @@ fn wait_for_runner_exit(thread: &thread::JoinHandle<()>, timeout: Duration) -> b
 }
 
 fn open_configured_qwp_ws_queue(qwp_ws: &QwpWsConfig) -> crate::Result<SfaSlotQueue> {
-    if *qwp_ws.sf_durability != SfDurability::Memory {
+    if matches!(
+        *qwp_ws.sf_durability,
+        SfDurability::Flush | SfDurability::Append
+    ) {
         let durability = qwp_ws.sf_durability.as_conf_value();
         return Err(error::fmt!(
             ConfigError,
-            "sf_durability={durability} is not yet supported (deferred follow-up; use sf_durability=memory)"
+            "sf_durability={durability} is not yet supported (use sf_durability=memory or periodic)"
         ));
     }
 
     let max_bytes = usize_from_config("sf_max_total_bytes", qwp_ws.sf_max_total_bytes())?;
     let max_in_flight = *qwp_ws.max_in_flight;
+    let periodic_sync_interval = qwp_ws.periodic_sync_interval();
 
     if let Some(sf_dir) = qwp_ws.sf_dir.as_ref() {
         return SfaSlotQueue::open(SfaSlotOptions {
@@ -1791,6 +1828,7 @@ fn open_configured_qwp_ws_queue(qwp_ws: &QwpWsConfig) -> crate::Result<SfaSlotQu
             segment_size_bytes: *qwp_ws.sf_max_segment_bytes,
             max_bytes,
             max_in_flight,
+            periodic_sync_interval,
         })
         .map_err(|err| match err {
             SfaQueueError::SlotInUse { slot_dir, holder } => crate::Error::new(
@@ -1815,6 +1853,12 @@ fn open_configured_qwp_ws_queue(qwp_ws: &QwpWsConfig) -> crate::Result<SfaSlotQu
         });
     }
 
+    if periodic_sync_interval.is_some() {
+        return Err(error::fmt!(
+            ConfigError,
+            "sf_durability=periodic requires sf_dir"
+        ));
+    }
     SfaSlotQueue::open_memory(SfaMemoryQueueOptions {
         segment_size_bytes: *qwp_ws.sf_max_segment_bytes,
         max_bytes,
@@ -3989,6 +4033,10 @@ fn sleep_before_manual_reconnect(
 }
 
 fn check_manual_driver_error(state: &ManualQwpWsHandlerState) -> crate::Result<()> {
+    state
+        .store
+        .check_durability()
+        .map_err(driver_error_to_error_without_state)?;
     if let Some(err) = state.store.terminal_error() {
         return Err(err.clone());
     }
@@ -5023,6 +5071,7 @@ mod tests {
             segment_size_bytes: 4096,
             max_bytes: 8192,
             max_in_flight: 1,
+            periodic_sync_interval: None,
         };
         let queue = SfaSlotQueue::open(slot_options.clone()).unwrap();
         let (send_started_tx, send_started_rx) = mpsc::channel();
@@ -5079,6 +5128,7 @@ mod tests {
             segment_size_bytes: 4096,
             max_bytes: 8192,
             max_in_flight: 1,
+            periodic_sync_interval: None,
         })
         .unwrap();
         let driver = QwpWsCoreTestHarness::from_queue(queue, FakeOrderedServer::no_response());
@@ -5117,6 +5167,7 @@ mod tests {
             segment_size_bytes: 4096,
             max_bytes: 8192,
             max_in_flight: 1,
+            periodic_sync_interval: None,
         })
         .unwrap();
         let (send_started_tx, send_started_rx) = mpsc::channel();
@@ -5173,6 +5224,7 @@ mod tests {
             segment_size_bytes: 4096,
             max_bytes: 8192,
             max_in_flight: 1,
+            periodic_sync_interval: None,
         })
         .unwrap();
         let ack_ready = Arc::new(AtomicBool::new(false));
@@ -5229,6 +5281,7 @@ mod tests {
             segment_size_bytes: 4096,
             max_bytes: 8192,
             max_in_flight: 1,
+            periodic_sync_interval: None,
         })
         .unwrap();
         let ack_ready = Arc::new(AtomicBool::new(false));
@@ -5292,6 +5345,7 @@ mod tests {
             segment_size_bytes: 4096,
             max_bytes: 8192,
             max_in_flight: 1,
+            periodic_sync_interval: None,
         })
         .unwrap();
         let mut driver = QwpWsCoreTestHarness::from_queue(queue, FakeOrderedServer::no_response());
@@ -5317,6 +5371,7 @@ mod tests {
             segment_size_bytes: 4096,
             max_bytes: 8192,
             max_in_flight: 1,
+            periodic_sync_interval: None,
         })
         .unwrap();
         let driver = QwpWsCoreTestHarness::from_queue(queue, FakeOrderedServer::no_response());

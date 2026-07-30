@@ -995,8 +995,9 @@ impl SenderBuilder {
     /// configuration string, primarily for compatibility with Java-style
     /// configuration names and settings without a public Rust builder method.
     /// These include `in_flight_window`, `sf_dir`, `sender_id`, `sf_max_segment_bytes`,
-    /// `sf_max_total_bytes`, `sf_durability`, `sf_append_deadline_millis`,
-    /// `auth_timeout_ms`, `close_flush_timeout_millis`, `request_durable_ack`,
+    /// `sf_max_total_bytes`, `sf_durability`, `sf_sync_interval_millis`,
+    /// `sf_append_deadline_millis`, `auth_timeout_ms`, `close_flush_timeout_millis`,
+    /// `request_durable_ack`,
     /// `durable_ack_keepalive_interval_millis`, `drain_orphans`,
     /// `max_background_drainers`, and `error_inbox_capacity`.
     ///
@@ -1158,6 +1159,8 @@ impl SenderBuilder {
                 "sf_durability" => {
                     builder.store_and_forward_durability(parse_sf_durability_value(val)?)?
                 }
+                #[cfg(feature = "_sender-qwp-ws")]
+                "sf_sync_interval_millis" => builder.store_and_forward_sync_interval_millis(val)?,
                 #[cfg(feature = "_sender-qwp-ws")]
                 "sf_append_deadline_millis" => builder.store_and_forward_append_deadline(
                     Duration::from_millis(parse_conf_value(key, val)?),
@@ -1861,6 +1864,28 @@ impl SenderBuilder {
         qwp_ws
             .sf_durability
             .set_specified("sf_durability", durability)?;
+        Ok(self)
+    }
+
+    #[cfg(feature = "_sender-qwp-ws")]
+    fn store_and_forward_sync_interval_millis(mut self, value: &str) -> Result<Self> {
+        let Some(qwp_ws) = &mut self.qwp_ws else {
+            return Err(error::fmt!(
+                ConfigError,
+                "The \"sf_sync_interval_millis\" setting is only supported for QWP/WebSocket."
+            ));
+        };
+        let millis: i64 = parse_conf_value("sf_sync_interval_millis", value)?;
+        if millis <= 0 || millis > i64::MAX / 1_000_000 {
+            return Err(error::fmt!(
+                ConfigError,
+                "sf_sync_interval_millis is out of range: {millis}"
+            ));
+        }
+        qwp_ws.sf_sync_interval.set_specified(
+            "sf_sync_interval_millis",
+            Some(Duration::from_millis(millis as u64)),
+        )?;
         Ok(self)
     }
 
@@ -3140,6 +3165,9 @@ fn parse_sf_durability_value(str_value: &str) -> Result<conf::SfDurability> {
     if str_value.eq_ignore_ascii_case("memory") {
         return Ok(conf::SfDurability::Memory);
     }
+    if str_value.eq_ignore_ascii_case("periodic") {
+        return Ok(conf::SfDurability::Periodic);
+    }
     if str_value.eq_ignore_ascii_case("flush") {
         return Ok(conf::SfDurability::Flush);
     }
@@ -3148,7 +3176,7 @@ fn parse_sf_durability_value(str_value: &str) -> Result<conf::SfDurability> {
     }
     Err(error::fmt!(
         ConfigError,
-        "invalid sf_durability [value={str_value}, allowed-values=[memory, flush, append]]"
+        "invalid sf_durability [value={str_value}, allowed-values=[memory, periodic, flush, append]]"
     ))
 }
 
@@ -3168,11 +3196,28 @@ fn parse_qwp_ws_progress_value(str_value: &str) -> Result<QwpWsProgress> {
 
 #[cfg(feature = "_sender-qwp-ws")]
 fn reject_unsupported_qwp_ws_sf_config(qwp_ws: &conf::QwpWsConfig) -> Result<()> {
-    if *qwp_ws.sf_durability != conf::SfDurability::Memory {
+    if matches!(
+        *qwp_ws.sf_durability,
+        conf::SfDurability::Flush | conf::SfDurability::Append
+    ) {
         let durability = qwp_ws.sf_durability.as_conf_value();
         return Err(error::fmt!(
             ConfigError,
-            "sf_durability={durability} is not yet supported (deferred follow-up; use sf_durability=memory)"
+            "sf_durability={durability} is not yet supported (use sf_durability=memory or periodic)"
+        ));
+    }
+    if *qwp_ws.sf_durability == conf::SfDurability::Periodic && qwp_ws.sf_dir.is_none() {
+        return Err(error::fmt!(
+            ConfigError,
+            "sf_durability=periodic requires sf_dir"
+        ));
+    }
+    if qwp_ws.sf_sync_interval.is_specified()
+        && *qwp_ws.sf_durability != conf::SfDurability::Periodic
+    {
+        return Err(error::fmt!(
+            ConfigError,
+            "sf_sync_interval_millis requires sf_durability=periodic"
         ));
     }
 

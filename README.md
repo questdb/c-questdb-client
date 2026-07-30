@@ -95,6 +95,27 @@ includes only the header for that direction. In Rust, QWP ingestion
 default; Arrow and Polars conversions sit behind the `arrow` and `polars`
 features.
 
+### Store-and-forward durability
+
+Set `sf_dir` to retain the QWP/WebSocket publication log across reconnects and
+producer-process restarts. The default `sf_durability=memory` relies on the OS
+page cache and does not protect against host power loss. For background disk
+checkpoints, use periodic durability:
+
+```text
+ws::addr=localhost:9000;sf_dir=/var/lib/my-app/questdb-sf;sender_id=orders;sf_durability=periodic;sf_sync_interval_millis=5000;
+```
+
+`sf_sync_interval_millis` defaults to `5000` in periodic mode. It is a target
+cadence, not a maximum loss-window guarantee: client scheduling and storage
+sync latency add to the time between completed checkpoints. Segment rotation
+may briefly apply normal publication backpressure while the current segment
+is checkpointed.
+
+Periodic durability covers the client's local store-and-forward files.
+`request_durable_ack=on` is an independent QuestDB Enterprise server-side
+durability barrier; configure both when end-to-end durability is required.
+
 ## Getting Started
 
 Read the language-specific guides:

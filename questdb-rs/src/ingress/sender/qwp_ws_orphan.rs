@@ -166,6 +166,7 @@ impl OrphanDrainerConfig {
             segment_size_bytes: *self.qwp_ws.sf_max_segment_bytes,
             max_bytes,
             max_in_flight: *self.qwp_ws.max_in_flight,
+            periodic_sync_interval: self.qwp_ws.periodic_sync_interval(),
         })
     }
 }
@@ -1002,6 +1003,7 @@ mod tests {
             segment_size_bytes: 256,
             max_bytes: 1024,
             max_in_flight: 1,
+            periodic_sync_interval: None,
         };
         let stop = Arc::new(AtomicBool::new(false));
         let (entered_tx, entered_rx) = std::sync::mpsc::channel();
@@ -1069,6 +1071,7 @@ mod tests {
             segment_size_bytes: 256,
             max_bytes: 1024,
             max_in_flight: 4,
+            periodic_sync_interval: None,
         }
     }
 

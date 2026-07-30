@@ -34,6 +34,10 @@ use std::path::{Path, PathBuf};
 use std::ptr;
 use std::slice;
 use std::sync::Arc;
+#[cfg(unix)]
+use std::sync::OnceLock;
+#[cfg(unix)]
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use memmap2::{MmapMut, MmapOptions};
 
@@ -43,6 +47,35 @@ pub(crate) const MANIFEST_REQUIRED_FLAG: u8 = 1;
 pub(crate) const HEADER_SIZE: usize = 24;
 pub(crate) const FRAME_HEADER_SIZE: usize = 8;
 pub(crate) const INITIAL_SEGMENT_FILE_NAME: &str = "sf-initial.sfa";
+
+#[cfg(unix)]
+static MLOCK_REFUSAL_WARNED: AtomicBool = AtomicBool::new(false);
+
+#[cfg(test)]
+thread_local! {
+    static SYNC_FAILURE_COUNTDOWN: std::cell::Cell<Option<usize>> =
+        const { std::cell::Cell::new(None) };
+}
+
+#[cfg(test)]
+pub(crate) fn fail_sync_after_for_test(successful_calls: usize) {
+    SYNC_FAILURE_COUNTDOWN.with(|countdown| countdown.set(Some(successful_calls)));
+}
+
+#[cfg(test)]
+fn should_fail_sync_for_test() -> bool {
+    SYNC_FAILURE_COUNTDOWN.with(|countdown| match countdown.get() {
+        Some(0) => {
+            countdown.set(None);
+            true
+        }
+        Some(remaining) => {
+            countdown.set(Some(remaining - 1));
+            false
+        }
+        None => false,
+    })
+}
 
 // Keep the payloads in these errors: recovery reports them through Debug today,
 // and tests pattern-match specific corruption details.
@@ -162,15 +195,17 @@ struct SfaSegmentMapping {
     // future field gains one it must be declared *above* `_mmap` so munmap
     // runs last.
     //
-    // `_mmap` is owned solely to keep the OS mapping alive (its Drop calls
-    // munmap). All byte access goes through `base`; we deliberately never
-    // re-borrow `MmapMut` after construction. Re-borrowing would synthesise a
-    // transient `&MmapMut` / `&mut MmapMut` covering the full mapping, which
-    // is aliasing UB once this struct is shared via Arc — even when the byte
-    // ranges touched by concurrent callers are disjoint.
+    // `_mmap` is owned to keep the OS mapping alive (its Drop calls munmap)
+    // and to issue metadata-only flush operations. All byte access goes
+    // through `base`; we deliberately never dereference `MmapMut` after
+    // construction. Dereferencing it would synthesise a transient slice
+    // covering the mapping, which is aliasing UB once this struct is shared
+    // via Arc — even when concurrent callers touch disjoint byte ranges.
     _mmap: MmapMut,
     base: *mut u8,
     len: usize,
+    #[cfg(test)]
+    redirty_passes: std::sync::atomic::AtomicU64,
 }
 
 // SAFETY: `MmapMut` is itself `Send + Sync`. Concurrent access through `base`
@@ -396,6 +431,70 @@ impl SfaSegment {
         Ok(())
     }
 
+    pub(crate) fn sync_published_range(
+        &self,
+        durable_offset: u64,
+        published_offset: u64,
+    ) -> Result<(), SfaSegmentError> {
+        let Some(file) = self.file.as_ref() else {
+            return Ok(());
+        };
+        if published_offset <= durable_offset {
+            return Ok(());
+        }
+        let published = usize::try_from(published_offset).map_err(|_| {
+            SfaSegmentError::SizeTooLargeForPlatform {
+                size: published_offset,
+            }
+        })?;
+        if published > self.mapping.len {
+            return Err(SfaSegmentError::OffsetOverflow);
+        }
+
+        let page_size = system_page_size();
+        let durable = usize::try_from(durable_offset).map_err(|_| {
+            SfaSegmentError::SizeTooLargeForPlatform {
+                size: durable_offset,
+            }
+        })?;
+        let lock_offset = durable - durable % page_size;
+        let lock_len = published - lock_offset;
+        #[cfg(unix)]
+        let locked = {
+            let addr = unsafe { self.mapping.base.add(lock_offset) };
+            let locked = unsafe { libc::mlock(addr.cast::<libc::c_void>(), lock_len) } == 0;
+            if !locked && !MLOCK_REFUSAL_WARNED.swap(true, Ordering::AcqRel) {
+                log::warn!(
+                    "mlock refused for SF barrier range in {} (degrading to re-dirty-only retry protection); raise RLIMIT_MEMLOCK or grant CAP_IPC_LOCK to close the post-failure reclaim window",
+                    self.path
+                        .as_deref()
+                        .map_or_else(|| "<memory>".to_string(), |path| path.display().to_string())
+                );
+            }
+            locked
+        };
+
+        let result = self.mapping.flush_range(0, published).and_then(|()| {
+            #[cfg(test)]
+            if should_fail_sync_for_test() {
+                return Err(SfaSegmentError::Io(io::Error::other(
+                    "injected periodic SF sync failure",
+                )));
+            }
+            file.sync_data().map_err(SfaSegmentError::Io)
+        });
+        if result.is_err() {
+            self.mapping
+                .redirty_pages(lock_offset, published, page_size);
+        }
+        #[cfg(unix)]
+        if locked {
+            let addr = unsafe { self.mapping.base.add(lock_offset) };
+            let _ = unsafe { libc::munlock(addr.cast::<libc::c_void>(), lock_len) };
+        }
+        result
+    }
+
     pub(crate) fn sanitize_torn_tail(&mut self) -> Result<(), SfaSegmentError> {
         if self.torn_tail_bytes == 0 {
             return Ok(());
@@ -469,6 +568,13 @@ impl SfaSegment {
 
     pub(crate) fn torn_tail_bytes(&self) -> u64 {
         self.torn_tail_bytes
+    }
+
+    #[cfg(test)]
+    fn redirty_passes(&self) -> u64 {
+        self.mapping
+            .redirty_passes
+            .load(std::sync::atomic::Ordering::Acquire)
     }
 
     pub(crate) fn last_fsn(&self) -> Option<u64> {
@@ -546,6 +652,8 @@ impl SfaSegmentMapping {
             _mmap: mmap,
             base,
             len,
+            #[cfg(test)]
+            redirty_passes: std::sync::atomic::AtomicU64::new(0),
         }
     }
 
@@ -574,6 +682,25 @@ impl SfaSegmentMapping {
         }
     }
 
+    fn redirty_pages(&self, offset: usize, end: usize, page_size: usize) {
+        #[cfg(test)]
+        self.redirty_passes
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        let mut cursor = offset;
+        while cursor < end {
+            // SAFETY: the checkpoint runs after transport use of the captured
+            // published prefix and the producer writes only beyond it. A
+            // same-value volatile store marks the page dirty without changing
+            // any segment byte, so a retry cannot vacuously succeed after a
+            // failed writeback consumed the kernel's error.
+            unsafe {
+                let ptr = self.base.add(cursor);
+                ptr.write_volatile(ptr.read_volatile());
+            }
+            cursor = cursor.saturating_add(page_size);
+        }
+    }
+
     fn flush_range(&self, offset: usize, len: usize) -> Result<(), SfaSegmentError> {
         self._mmap
             .flush_range(offset, len)
@@ -597,6 +724,26 @@ impl SfaSegmentMapping {
     fn with_full_slice<R>(&self, f: impl FnOnce(&[u8]) -> R) -> R {
         self.with_slice(0, self.len, f)
     }
+}
+
+#[cfg(unix)]
+fn system_page_size() -> usize {
+    static PAGE_SIZE: OnceLock<usize> = OnceLock::new();
+    *PAGE_SIZE.get_or_init(|| {
+        let size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+        usize::try_from(size)
+            .ok()
+            .filter(|size| *size > 0)
+            .unwrap_or(4096)
+    })
+}
+
+#[cfg(not(unix))]
+fn system_page_size() -> usize {
+    // Re-dirtying more than once per OS page is harmless. A 4 KiB stride
+    // covers Windows systems whose actual page size is larger without
+    // depending on another platform API.
+    4096
 }
 
 #[cfg(test)]
@@ -1067,6 +1214,34 @@ mod tests {
         chained = crc32c_update(chained, b"456");
         chained = crc32c_update(chained, b"789");
         assert_eq!(chained, 0xe306_9283);
+    }
+
+    #[test]
+    fn failed_published_sync_redirties_before_a_successful_retry() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("periodic.sfa");
+        let mut segment = SfaSegment::create(&path, 0, 4096, 1).unwrap();
+        segment.try_append(b"payload").unwrap().unwrap();
+        let published = segment.append_offset();
+
+        fail_sync_after_for_test(0);
+        let err = segment
+            .sync_published_range(HEADER_SIZE as u64, published)
+            .unwrap_err();
+        assert!(
+            format!("{err:?}").contains("injected periodic SF sync failure"),
+            "{err:?}"
+        );
+        assert_eq!(segment.redirty_passes(), 1);
+
+        segment
+            .sync_published_range(HEADER_SIZE as u64, published)
+            .unwrap();
+        assert_eq!(
+            segment.redirty_passes(),
+            1,
+            "successful retry must not re-dirty again"
+        );
     }
 
     #[test]

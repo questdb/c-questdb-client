@@ -35,9 +35,9 @@ use std::collections::VecDeque;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::error;
 
@@ -51,6 +51,8 @@ use super::qwp_ws_sfa_segment::{
     SfaSegmentError, scan_file_metadata, spare_segment_path,
 };
 use super::qwp_ws_sfa_symbol_dict::PersistedSymbolDict;
+
+const PERIODIC_SYNC_RETRY_MAX: Duration = Duration::from_secs(1);
 
 #[cfg(test)]
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -73,6 +75,9 @@ enum SfaBarrierEvent {
     RotationHeaderSynced,
     RotationManifestUpdated,
     RotationQueueMutated,
+    PeriodicSyncAttempt(u64),
+    PeriodicSyncCompleted,
+    PeriodicSyncFailed,
 }
 
 #[cfg(test)]
@@ -97,6 +102,7 @@ pub(crate) struct SfaQueueOptions {
     pub(crate) segment_size_bytes: u64,
     pub(crate) max_bytes: usize,
     pub(crate) max_in_flight: usize,
+    pub(crate) periodic_sync_interval: Option<Duration>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -118,6 +124,7 @@ pub(crate) enum SfaQueueError {
     CorruptSegments { reason: &'static str },
     Recovery { reason: String },
     SanitizedResidue { path: PathBuf },
+    Durability(SfaDurabilityFailure),
     Closed,
 }
 
@@ -156,6 +163,7 @@ impl From<SfaQueueError> for DriverError {
 #[derive(Debug)]
 pub(crate) enum SfaStorageStep {
     Trim(SfaStorageCleanup),
+    SyncPublished(SfaSyncBatch),
     CreateHotSpare {
         path: Option<PathBuf>,
         base_seq: u64,
@@ -171,6 +179,10 @@ pub(crate) enum SfaStorageResult {
     },
     HotSpareCreated {
         segment: SfaSegment,
+    },
+    PublishedSynced {
+        batch: SfaSyncBatch,
+        failure: Option<SfaDurabilityFailure>,
     },
 }
 
@@ -192,6 +204,28 @@ pub(crate) struct SfaCleanupFailure {
     error: String,
 }
 
+#[derive(Debug, Clone)]
+pub(crate) struct SfaDurabilityFailure {
+    message: Arc<str>,
+}
+
+#[derive(Debug)]
+pub(crate) struct SfaSyncBatch {
+    segments: Vec<Arc<SfaSharedSegment>>,
+}
+
+impl SfaDurabilityFailure {
+    fn new(error: SfaSegmentError) -> Self {
+        Self {
+            message: format!("{error:?}").into(),
+        }
+    }
+
+    fn message(&self) -> &str {
+        &self.message
+    }
+}
+
 impl SfaStorageStep {
     pub(crate) fn changes_queue_before_io(&self) -> bool {
         matches!(self, Self::Trim(_))
@@ -202,6 +236,18 @@ impl SfaStorageStep {
             Self::Trim(cleanup) => Ok(SfaStorageResult::Trimmed {
                 cleanup_failure: cleanup.perform(),
             }),
+            Self::SyncPublished(batch) => {
+                let mut failure = None;
+                for segment in &batch.segments {
+                    #[cfg(test)]
+                    record_sfa_barrier(SfaBarrierEvent::PeriodicSyncAttempt(segment.base_seq()));
+                    if let Err(err) = segment.sync_published() {
+                        failure = Some(SfaDurabilityFailure::new(err));
+                        break;
+                    }
+                }
+                Ok(SfaStorageResult::PublishedSynced { batch, failure })
+            }
             Self::CreateHotSpare {
                 path,
                 base_seq,
@@ -322,9 +368,12 @@ struct SfaEngine {
     segment_size_bytes: u64,
     max_in_flight: usize,
     allow_segment_creation: bool,
+    periodic_sync_interval: Option<Duration>,
     state: Mutex<SfaEngineState>,
     published_upper: AtomicU64,
     completed_upper: AtomicU64,
+    sync_requested: AtomicBool,
+    durability_failed: AtomicBool,
 }
 
 #[derive(Debug)]
@@ -336,12 +385,19 @@ struct SfaEngineState {
     recovery_diagnostics: Vec<SfaRecoveryDiagnostic>,
     manifest: Option<SfManifest>,
     next_generation: u64,
+    first_non_durable_sealed: usize,
+    sync_scratch: Vec<Arc<SfaSharedSegment>>,
+    last_sync_completed: Option<Instant>,
+    next_sync_delay: Duration,
+    durability_failure: Option<SfaDurabilityFailure>,
+    periodic_sync_in_flight: bool,
     closed: bool,
 }
 
 impl SfaFrameQueue {
     pub(crate) fn open(options: SfaQueueOptions) -> Result<Self, SfaQueueError> {
         validate_options(&options)?;
+        let periodic_sync_interval = options.periodic_sync_interval;
         fs::create_dir_all(&options.slot_dir)?;
 
         let RecoveredState {
@@ -446,6 +502,9 @@ impl SfaFrameQueue {
                 .ok_or(QueueError::SequenceOverflow)?;
         }
 
+        if periodic_sync_interval.is_some() && had_recovered_segments {
+            sync_live_segments(&sealed_segments, Some(&active))?;
+        }
         let first_unresolved =
             first_unresolved_fsn_from_segments(&sealed_segments, &active).unwrap_or(next_fsn);
         let recovered_completion = if had_recovered_segments {
@@ -464,6 +523,7 @@ impl SfaFrameQueue {
             segment_size_bytes: options.segment_size_bytes,
             max_in_flight: options.max_in_flight,
             allow_segment_creation: true,
+            periodic_sync_interval,
             state: Mutex::new(SfaEngineState {
                 active: Some(Arc::clone(&active)),
                 sealed_segments,
@@ -472,10 +532,18 @@ impl SfaFrameQueue {
                 recovery_diagnostics,
                 manifest,
                 next_generation,
+                first_non_durable_sealed: 0,
+                sync_scratch: Vec::new(),
+                last_sync_completed: None,
+                next_sync_delay: periodic_sync_interval.unwrap_or(Duration::ZERO),
+                durability_failure: None,
+                periodic_sync_in_flight: false,
                 closed: false,
             }),
             published_upper: AtomicU64::new(next_fsn),
             completed_upper: AtomicU64::new(recovered_completion.completed_upper),
+            sync_requested: AtomicBool::new(periodic_sync_interval.is_some()),
+            durability_failed: AtomicBool::new(false),
         });
         let producer = Some(SfaProducer {
             engine: Arc::clone(&engine),
@@ -530,6 +598,7 @@ impl SfaFrameQueue {
             segment_size_bytes: options.segment_size_bytes,
             max_in_flight: options.max_in_flight,
             allow_segment_creation: true,
+            periodic_sync_interval: None,
             state: Mutex::new(SfaEngineState {
                 active: Some(Arc::clone(&active)),
                 sealed_segments: VecDeque::new(),
@@ -538,10 +607,18 @@ impl SfaFrameQueue {
                 recovery_diagnostics: Vec::new(),
                 manifest: None,
                 next_generation,
+                first_non_durable_sealed: 0,
+                sync_scratch: Vec::new(),
+                last_sync_completed: None,
+                next_sync_delay: Duration::ZERO,
+                durability_failure: None,
+                periodic_sync_in_flight: false,
                 closed: false,
             }),
             published_upper: AtomicU64::new(next_fsn),
             completed_upper: AtomicU64::new(next_fsn),
+            sync_requested: AtomicBool::new(false),
+            durability_failed: AtomicBool::new(false),
         });
         let producer = Some(SfaProducer {
             engine: Arc::clone(&engine),
@@ -564,6 +641,7 @@ impl SfaFrameQueue {
 
     pub(crate) fn open_replay_only(options: SfaQueueOptions) -> Result<Self, SfaQueueError> {
         validate_options(&options)?;
+        let periodic_sync_interval = options.periodic_sync_interval;
         let RecoveredState {
             segments: recovered_segments,
             manifest,
@@ -606,6 +684,9 @@ impl SfaFrameQueue {
             ),
             None => (None, VecDeque::new(), 0, 0),
         };
+        if periodic_sync_interval.is_some() && had_recovered_segments {
+            sync_live_segments(&sealed_segments, active.as_ref())?;
+        }
         let first_unresolved =
             first_unresolved_fsn_from_optional_segments(&sealed_segments, active.as_ref())
                 .unwrap_or(next_fsn);
@@ -621,6 +702,7 @@ impl SfaFrameQueue {
             segment_size_bytes: options.segment_size_bytes,
             max_in_flight: options.max_in_flight,
             allow_segment_creation: false,
+            periodic_sync_interval,
             state: Mutex::new(SfaEngineState {
                 active,
                 sealed_segments,
@@ -629,10 +711,18 @@ impl SfaFrameQueue {
                 recovery_diagnostics,
                 manifest,
                 next_generation: 0,
+                first_non_durable_sealed: 0,
+                sync_scratch: Vec::new(),
+                last_sync_completed: None,
+                next_sync_delay: periodic_sync_interval.unwrap_or(Duration::ZERO),
+                durability_failure: None,
+                periodic_sync_in_flight: false,
                 closed: false,
             }),
             published_upper: AtomicU64::new(next_fsn),
             completed_upper: AtomicU64::new(recovered_completion.completed_upper),
+            sync_requested: AtomicBool::new(periodic_sync_interval.is_some()),
+            durability_failed: AtomicBool::new(false),
         });
 
         Ok(Self {
@@ -789,6 +879,14 @@ impl SfaFrameQueue {
 
     pub(crate) fn completed_fsn(&self) -> Option<u64> {
         self.engine.completed_fsn()
+    }
+
+    pub(crate) fn check_durability(&self) -> Result<(), SfaQueueError> {
+        self.engine.check_durability()
+    }
+
+    pub(crate) fn periodic_sync_in_flight(&self) -> Result<bool, SfaQueueError> {
+        self.engine.periodic_sync_in_flight()
     }
 
     pub(crate) fn max_in_flight(&self) -> usize {
@@ -964,6 +1062,7 @@ impl SfaProgressView {
 
 impl SfaProducer {
     pub(crate) fn try_submit(&mut self, payload: &[u8]) -> Result<QwpReceipt, SfaQueueError> {
+        self.engine.check_durability()?;
         self.engine.validate_submit(payload)?;
         let fsn = self.next_fsn;
         let next_fsn = fsn.checked_add(1).ok_or(QueueError::SequenceOverflow)?;
@@ -989,6 +1088,10 @@ impl SfaProducer {
 
     pub(crate) fn completed_fsn(&self) -> Option<u64> {
         self.engine.completed_fsn()
+    }
+
+    pub(crate) fn check_durability(&self) -> Result<(), SfaQueueError> {
+        self.engine.check_durability()
     }
 
     /// Append `payload` to the active segment and advance `published_upper`
@@ -1037,6 +1140,9 @@ impl SfaProducer {
             return Err(SfaQueueError::CorruptSegments {
                 reason: "producer active segment is not the engine active segment",
             });
+        }
+        if self.engine.request_sync_before_rotation(active) {
+            return Err(self.engine.rotation_backpressure_error(&state).into());
         }
         let previous_active_base = active.base_seq();
         let new_active = match state.hot_spare.take() {
@@ -1117,6 +1223,11 @@ impl SfaEngine {
             return Ok(());
         }
         let fully_drained = self.all_published_frames_resolved();
+        if !fully_drained && self.periodic_sync_interval.is_some() {
+            for segment in state.sealed_segments.iter().chain(state.active.iter()) {
+                segment.sync_published()?;
+            }
+        }
         if fully_drained
             && let Some(slot_dir) = self.slot_dir.as_deref()
             && let Some(final_acked_fsn) = self.completed_fsn()
@@ -1177,6 +1288,40 @@ impl SfaEngine {
             });
         }
         Ok(())
+    }
+
+    fn check_durability(&self) -> Result<(), SfaQueueError> {
+        if !self.durability_failed.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        let state = self.lock_state()?;
+        match state.durability_failure.as_ref() {
+            Some(failure) => Err(SfaQueueError::Durability(failure.clone())),
+            None => Ok(()),
+        }
+    }
+
+    fn periodic_sync_in_flight(&self) -> Result<bool, SfaQueueError> {
+        if self.periodic_sync_interval.is_none() {
+            return Ok(false);
+        }
+        Ok(self.lock_state()?.periodic_sync_in_flight)
+    }
+
+    fn request_sync_before_rotation(&self, active: &SfaSharedSegment) -> bool {
+        if self.periodic_sync_interval.is_some() && !active.is_published_durable() {
+            self.sync_requested.store(true, Ordering::Release);
+            return true;
+        }
+        false
+    }
+
+    fn rotation_backpressure_error(&self, state: &SfaEngineState) -> QueueError {
+        QueueError::StorageSpareNotReady {
+            segment_size_bytes: self.segment_size_bytes,
+            allocated_segment_bytes: state.allocated_segment_bytes,
+            max_total_bytes: self.max_bytes as u64,
+        }
     }
 
     fn complete_through_fsn(&self, acked_fsn: u64) -> Result<(), SfaQueueError> {
@@ -1250,6 +1395,9 @@ impl SfaEngine {
         allow_create: bool,
         ack_watermark: Option<&mut SfaAckWatermark>,
     ) -> Result<Option<SfaStorageStep>, SfaQueueError> {
+        if let Some(step) = self.take_periodic_sync_step()? {
+            return Ok(Some(step));
+        }
         let trim_candidate = {
             let state = self.lock_state()?;
             if state.closed {
@@ -1311,6 +1459,7 @@ impl SfaEngine {
                 record_sfa_barrier(SfaBarrierEvent::TrimManifestUpdated);
             }
             let segment = state.sealed_segments.pop_front().unwrap();
+            state.first_non_durable_sealed = state.first_non_durable_sealed.saturating_sub(1);
             #[cfg(test)]
             if self.slot_dir.is_some() {
                 record_sfa_barrier(SfaBarrierEvent::TrimQueuePopped);
@@ -1390,7 +1539,95 @@ impl SfaEngine {
                     Ok(SfaStorageFinish::cleanup(SfaStorageCleanup::new(segment)))
                 }
             }
+            SfaStorageResult::PublishedSynced { batch, failure } => {
+                self.finish_periodic_sync(batch, failure)
+            }
         }
+    }
+
+    fn take_periodic_sync_step(&self) -> Result<Option<SfaStorageStep>, SfaQueueError> {
+        let Some(_interval) = self.periodic_sync_interval else {
+            return Ok(None);
+        };
+        let now = Instant::now();
+        let requested = self.sync_requested.load(Ordering::Acquire);
+        let mut state = self.lock_state()?;
+        if state.closed || state.periodic_sync_in_flight {
+            return Ok(None);
+        }
+        let before_deadline = state.last_sync_completed.is_some_and(|last_sync| {
+            now.saturating_duration_since(last_sync) < state.next_sync_delay
+        });
+        // A rotation request overrides the normal cadence, but must not turn
+        // a failing device into a busy loop. Once a failure is latched, even
+        // a still-pending request observes the bounded retry delay.
+        if before_deadline && (state.durability_failure.is_some() || !requested) {
+            return Ok(None);
+        }
+
+        while state.first_non_durable_sealed < state.sealed_segments.len()
+            && state.sealed_segments[state.first_non_durable_sealed].is_published_durable()
+        {
+            state.first_non_durable_sealed += 1;
+        }
+        let first = state.first_non_durable_sealed;
+        let mut segments = std::mem::take(&mut state.sync_scratch);
+        segments.clear();
+        segments.extend(state.sealed_segments.iter().skip(first).cloned());
+        segments.extend(state.active.iter().cloned());
+        state.periodic_sync_in_flight = true;
+        Ok(Some(SfaStorageStep::SyncPublished(SfaSyncBatch {
+            segments,
+        })))
+    }
+
+    fn finish_periodic_sync(
+        &self,
+        mut batch: SfaSyncBatch,
+        failure: Option<SfaDurabilityFailure>,
+    ) -> Result<SfaStorageFinish, SfaQueueError> {
+        let interval = self
+            .periodic_sync_interval
+            .ok_or(SfaQueueError::CorruptSegments {
+                reason: "periodic sync result on a non-periodic SFA queue",
+            })?;
+        let mut state = self.lock_state()?;
+        state.periodic_sync_in_flight = false;
+        batch.segments.clear();
+        state.sync_scratch = batch.segments;
+        state.last_sync_completed = Some(Instant::now());
+        if let Some(failure) = failure {
+            let first_failure = state.durability_failure.is_none();
+            if first_failure {
+                log::error!(
+                    "Periodic QWP/WebSocket SF data sync failed: {}",
+                    failure.message()
+                );
+                state.durability_failure = Some(failure);
+            }
+            state.next_sync_delay = interval.min(PERIODIC_SYNC_RETRY_MAX);
+            self.durability_failed.store(true, Ordering::Release);
+            #[cfg(test)]
+            record_sfa_barrier(SfaBarrierEvent::PeriodicSyncFailed);
+            return Ok(SfaStorageFinish::changed());
+        }
+
+        let recovered = state.durability_failure.take().is_some();
+        state.next_sync_delay = interval;
+        if state
+            .active
+            .as_ref()
+            .is_none_or(|active| active.is_published_durable())
+        {
+            self.sync_requested.store(false, Ordering::Release);
+        }
+        self.durability_failed.store(false, Ordering::Release);
+        if recovered {
+            log::info!("Periodic QWP/WebSocket SF data sync recovered");
+        }
+        #[cfg(test)]
+        record_sfa_barrier(SfaBarrierEvent::PeriodicSyncCompleted);
+        Ok(SfaStorageFinish::changed())
     }
 
     fn record_cleanup_failure(&self, failure: SfaCleanupFailure) {
@@ -1564,13 +1801,21 @@ struct SfaSharedSegment {
     segment: SfaSegment,
     published_offset: AtomicU64,
     published_frame_count: AtomicU64,
+    durable_cursor: AtomicU64,
 }
 
 impl SfaSharedSegment {
     fn new(segment: SfaSegment) -> Self {
+        let published_offset = segment.append_offset();
+        let durable_cursor = if segment.path().is_some() {
+            HEADER_SIZE as u64
+        } else {
+            published_offset
+        };
         Self {
-            published_offset: AtomicU64::new(segment.append_offset()),
+            published_offset: AtomicU64::new(published_offset),
             published_frame_count: AtomicU64::new(segment.frame_count()),
+            durable_cursor: AtomicU64::new(durable_cursor),
             segment,
         }
     }
@@ -1597,6 +1842,8 @@ impl SfaSharedSegment {
     fn rebase_empty(&mut self, base_seq: u64) -> Result<(), SfaSegmentError> {
         self.segment.rebase_empty(base_seq)?;
         self.segment.sync_header()?;
+        self.durable_cursor
+            .store(HEADER_SIZE as u64, Ordering::Release);
         self.published_frame_count.store(0, Ordering::Relaxed);
         self.published_offset
             .store(HEADER_SIZE as u64, Ordering::Release);
@@ -1656,6 +1903,34 @@ impl SfaSharedSegment {
     fn size_bytes(&self) -> u64 {
         self.segment.size_bytes()
     }
+
+    fn is_published_durable(&self) -> bool {
+        self.durable_cursor.load(Ordering::Acquire) >= self.published_offset()
+    }
+
+    fn sync_published(&self) -> Result<(), SfaSegmentError> {
+        let published = self.published_offset();
+        let durable = self.durable_cursor.load(Ordering::Acquire);
+        if published <= durable {
+            return Ok(());
+        }
+        self.segment.sync_published_range(durable, published)?;
+        self.durable_cursor.store(published, Ordering::Release);
+        Ok(())
+    }
+}
+
+fn sync_live_segments(
+    sealed_segments: &VecDeque<Arc<SfaSharedSegment>>,
+    active: Option<&Arc<SfaSharedSegment>>,
+) -> Result<(), SfaQueueError> {
+    for segment in sealed_segments {
+        segment.sync_published()?;
+    }
+    if let Some(active) = active {
+        active.sync_published()?;
+    }
+    Ok(())
 }
 
 impl PublicationLog for SfaFrameQueue {
@@ -1669,6 +1944,14 @@ impl PublicationLog for SfaFrameQueue {
 
     fn progress_view(&self) -> SfaProgressView {
         SfaFrameQueue::progress_view(self)
+    }
+
+    fn check_durability(&self) -> Result<(), DriverError> {
+        Ok(SfaFrameQueue::check_durability(self)?)
+    }
+
+    fn periodic_sync_in_flight(&self) -> Result<bool, DriverError> {
+        Ok(SfaFrameQueue::periodic_sync_in_flight(self)?)
     }
 
     fn oldest_unresolved_fsn(&self) -> Option<u64> {
@@ -2601,7 +2884,9 @@ mod tests {
     use super::super::qwp_ws_driver::{
         CloseOutcome, DriveOutcome, DriverEvent, FakeOrderedServer, QwpWsCoreTestHarness,
     };
-    use super::super::qwp_ws_sfa_segment::{initial_segment_path, scan_file, spare_segment_path};
+    use super::super::qwp_ws_sfa_segment::{
+        fail_sync_after_for_test, initial_segment_path, scan_file, spare_segment_path,
+    };
     use super::*;
 
     const JAVA_TWO_FRAME_FIXTURE_HEX: &str =
@@ -2622,7 +2907,35 @@ mod tests {
             segment_size_bytes,
             max_bytes,
             max_in_flight,
+            periodic_sync_interval: None,
         }
+    }
+
+    fn periodic_options_with(
+        dir: &TempDir,
+        segment_size_bytes: u64,
+        max_bytes: usize,
+        max_in_flight: usize,
+    ) -> SfaQueueOptions {
+        let mut options = options_with(dir, segment_size_bytes, max_bytes, max_in_flight);
+        options.periodic_sync_interval = Some(Duration::from_secs(3600));
+        options
+    }
+
+    fn active_is_durable(queue: &SfaFrameQueue) -> bool {
+        queue
+            .engine
+            .with_state(|state| state.active.as_ref().unwrap().is_published_durable())
+    }
+
+    fn reset_live_durability(queue: &SfaFrameQueue) {
+        let state = queue.engine.state.lock().unwrap();
+        for segment in state.sealed_segments.iter().chain(state.active.iter()) {
+            segment
+                .durable_cursor
+                .store(HEADER_SIZE as u64, Ordering::Release);
+        }
+        queue.engine.sync_requested.store(true, Ordering::Release);
     }
 
     fn memory_options(
@@ -2660,6 +2973,180 @@ mod tests {
                 "two-frame cap can never exceed the single-frame cap"
             );
         }
+    }
+
+    #[test]
+    fn periodic_rotation_waits_for_a_requested_predecessor_sync() {
+        let dir = TempDir::new().unwrap();
+        let segment_size = (HEADER_SIZE + 2 * (FRAME_HEADER_SIZE + 16)) as u64;
+        let mut queue = SfaFrameQueue::open(periodic_options_with(
+            &dir,
+            segment_size,
+            3 * segment_size as usize,
+            8,
+        ))
+        .unwrap();
+
+        assert!(queue.maintain_storage().unwrap());
+        assert!(active_is_durable(&queue));
+        queue.try_submit(&[1; 16]).unwrap();
+        queue.try_submit(&[2; 16]).unwrap();
+        assert!(!active_is_durable(&queue));
+        assert!(queue.hot_spare_installed());
+
+        let err = queue.try_submit(&[3; 16]).unwrap_err();
+        assert!(matches!(
+            err,
+            SfaQueueError::Queue(QueueError::StorageSpareNotReady { .. })
+        ));
+        assert_eq!(queue.published_fsn(), Some(1));
+
+        take_sfa_barriers();
+        assert!(queue.maintain_storage().unwrap());
+        assert_eq!(
+            take_sfa_barriers(),
+            vec![
+                SfaBarrierEvent::PeriodicSyncAttempt(0),
+                SfaBarrierEvent::PeriodicSyncCompleted,
+            ]
+        );
+        assert!(active_is_durable(&queue));
+
+        assert_eq!(queue.try_submit(&[3; 16]).unwrap().fsn, 2);
+        assert_eq!(queue.sealed_segment_count(), 1);
+    }
+
+    #[test]
+    fn periodic_failure_latches_without_reserving_an_fsn_and_retry_covers_live_segments() {
+        let dir = TempDir::new().unwrap();
+        let segment_size = (HEADER_SIZE + 2 * (FRAME_HEADER_SIZE + 16)) as u64;
+        let mut queue = SfaFrameQueue::open(periodic_options_with(
+            &dir,
+            segment_size,
+            3 * segment_size as usize,
+            8,
+        ))
+        .unwrap();
+
+        queue.maintain_storage().unwrap();
+        queue.try_submit(&[1; 16]).unwrap();
+        queue.try_submit(&[2; 16]).unwrap();
+        assert!(matches!(
+            queue.try_submit(&[3; 16]).unwrap_err(),
+            SfaQueueError::Queue(QueueError::StorageSpareNotReady { .. })
+        ));
+        queue.maintain_storage().unwrap();
+        queue.try_submit(&[3; 16]).unwrap();
+        reset_live_durability(&queue);
+
+        take_sfa_barriers();
+        fail_sync_after_for_test(0);
+        assert!(queue.maintain_storage().unwrap());
+        assert!(!queue.periodic_sync_in_flight().unwrap());
+        assert_eq!(
+            take_sfa_barriers(),
+            vec![
+                SfaBarrierEvent::PeriodicSyncAttempt(0),
+                SfaBarrierEvent::PeriodicSyncFailed,
+            ],
+            "the pass must stop at its first failed segment"
+        );
+        assert_eq!(
+            queue.engine.with_state(|state| state.next_sync_delay),
+            PERIODIC_SYNC_RETRY_MAX
+        );
+        take_sfa_barriers();
+        queue.maintain_storage().unwrap();
+        assert!(
+            !take_sfa_barriers().iter().any(|event| matches!(
+                event,
+                SfaBarrierEvent::PeriodicSyncAttempt(_)
+                    | SfaBarrierEvent::PeriodicSyncCompleted
+                    | SfaBarrierEvent::PeriodicSyncFailed
+            )),
+            "a pending rotation request must not bypass the failure retry delay"
+        );
+
+        let first = queue.check_durability().unwrap_err();
+        let second = queue.check_durability().unwrap_err();
+        let (SfaQueueError::Durability(first_failure), SfaQueueError::Durability(second_failure)) =
+            (first, second)
+        else {
+            panic!("expected a repeated durability failure");
+        };
+        assert!(Arc::ptr_eq(&first_failure.message, &second_failure.message));
+        let published_before = queue.published_fsn();
+        assert!(matches!(
+            queue.try_submit(&[4; 16]).unwrap_err(),
+            SfaQueueError::Durability(_)
+        ));
+        assert_eq!(
+            queue.published_fsn(),
+            published_before,
+            "a latched append must not reserve an FSN"
+        );
+
+        {
+            let mut state = queue.engine.state.lock().unwrap();
+            state.last_sync_completed =
+                Instant::now().checked_sub(PERIODIC_SYNC_RETRY_MAX + Duration::from_millis(1));
+        }
+        take_sfa_barriers();
+        assert!(queue.maintain_storage().unwrap());
+        assert!(!queue.periodic_sync_in_flight().unwrap());
+        assert_eq!(
+            take_sfa_barriers(),
+            vec![
+                SfaBarrierEvent::PeriodicSyncAttempt(0),
+                SfaBarrierEvent::PeriodicSyncAttempt(2),
+                SfaBarrierEvent::PeriodicSyncCompleted,
+            ]
+        );
+        assert_eq!(
+            queue.engine.with_state(|state| state.next_sync_delay),
+            Duration::from_secs(3600)
+        );
+        queue.check_durability().unwrap();
+        assert_eq!(queue.try_submit(&[4; 16]).unwrap().fsn, 3);
+    }
+
+    #[test]
+    fn periodic_open_synchronously_barriers_a_memory_mode_recovery() {
+        let dir = TempDir::new().unwrap();
+        {
+            let mut queue = SfaFrameQueue::open(options(&dir)).unwrap();
+            queue.try_submit(b"recover me").unwrap();
+            queue.close().unwrap();
+        }
+
+        let queue = SfaFrameQueue::open(periodic_options_with(&dir, 256, 1024, 4)).unwrap();
+        assert_eq!(queue.published_fsn(), Some(0));
+        assert!(
+            active_is_durable(&queue),
+            "periodic open must establish a durable baseline before exposing recovered frames"
+        );
+    }
+
+    #[test]
+    fn periodic_undrained_close_syncs_before_teardown_and_retries_after_failure() {
+        let dir = TempDir::new().unwrap();
+        let mut queue = SfaFrameQueue::open(periodic_options_with(&dir, 256, 1024, 4)).unwrap();
+        queue.try_submit(b"still queued").unwrap();
+
+        fail_sync_after_for_test(0);
+        assert!(queue.close().is_err());
+        assert!(!queue.engine.with_state(|state| state.closed));
+        assert!(queue.engine.with_state(|state| state.active.is_some()));
+
+        queue.close().unwrap();
+        assert!(queue.engine.with_state(|state| state.closed));
+        assert!(
+            fs::read_dir(dir.path())
+                .unwrap()
+                .flatten()
+                .any(|entry| entry.path().extension().is_some_and(|ext| ext == "sfa")),
+            "undrained close must retain the synchronized backlog"
+        );
     }
 
     fn submit_with_storage_maintenance(queue: &mut SfaFrameQueue, payload: &[u8]) -> QwpReceipt {
@@ -3919,6 +4406,7 @@ mod tests {
             segment_size_bytes: 256,
             max_bytes: 1024,
             max_in_flight: 4,
+            periodic_sync_interval: None,
         })
         .unwrap();
         let server = FakeOrderedServer::ack_each_send();

@@ -38,6 +38,7 @@ use std::fs;
 use std::fs::{File, OpenOptions};
 use std::io;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 #[cfg(unix)]
 use std::os::fd::AsRawFd;
@@ -56,6 +57,7 @@ use windows_sys::Win32::System::IO::OVERLAPPED;
 
 use super::qwp_ws_driver::{DriverError, PublicationLog};
 use super::qwp_ws_queue::{QwpReceipt, QwpReceiptStatus};
+use super::qwp_ws_sfa_manifest::sync_directory;
 use super::qwp_ws_sfa_queue::{
     SfaCleanupFailure, SfaFrameQueue, SfaMemoryQueueOptions, SfaProducer, SfaQueueError,
     SfaQueueOptions, SfaStorageFinish, SfaStorageResult, SfaStorageStep,
@@ -74,6 +76,7 @@ pub(crate) struct SfaSlotOptions {
     pub(crate) segment_size_bytes: u64,
     pub(crate) max_bytes: usize,
     pub(crate) max_in_flight: usize,
+    pub(crate) periodic_sync_interval: Option<Duration>,
 }
 
 #[derive(Debug)]
@@ -87,14 +90,19 @@ impl SfaSlotQueue {
         validate_sender_id(&options.sender_id)?;
         validate_sf_dir(&options.sf_dir)?;
         ensure_dir(&options.sf_dir)?;
+        let periodic_sync = options.periodic_sync_interval.is_some();
+        if periodic_sync {
+            sync_parent_directory(&options.sf_dir)?;
+        }
 
         let slot_dir = options.sf_dir.join(&options.sender_id);
-        let lock = SlotLock::acquire(slot_dir.clone())?;
+        let lock = SlotLock::acquire(slot_dir.clone(), periodic_sync)?;
         let queue = SfaFrameQueue::open(SfaQueueOptions {
             slot_dir,
             segment_size_bytes: options.segment_size_bytes,
             max_bytes: options.max_bytes,
             max_in_flight: options.max_in_flight,
+            periodic_sync_interval: options.periodic_sync_interval,
         })?;
 
         Ok(Self {
@@ -111,7 +119,10 @@ impl SfaSlotQueue {
     pub(crate) fn open_replay_only_existing(
         options: SfaQueueOptions,
     ) -> Result<Self, SfaQueueError> {
-        let lock = SlotLock::acquire_existing(options.slot_dir.clone())?;
+        let lock = SlotLock::acquire_existing(
+            options.slot_dir.clone(),
+            options.periodic_sync_interval.is_some(),
+        )?;
         let queue = SfaFrameQueue::open_replay_only(options)?;
         Ok(Self {
             queue,
@@ -121,7 +132,9 @@ impl SfaSlotQueue {
 
     pub(crate) fn close(&mut self) -> Result<(), SfaQueueError> {
         let result = self.queue.close();
-        drop(self.lock.take());
+        if result.is_ok() {
+            drop(self.lock.take());
+        }
         result
     }
 
@@ -163,6 +176,14 @@ impl PublicationLog for SfaSlotQueue {
 
     fn progress_view(&self) -> super::qwp_ws_sfa_queue::SfaProgressView {
         self.queue.progress_view()
+    }
+
+    fn check_durability(&self) -> Result<(), DriverError> {
+        Ok(self.queue.check_durability()?)
+    }
+
+    fn periodic_sync_in_flight(&self) -> Result<bool, DriverError> {
+        Ok(self.queue.periodic_sync_in_flight()?)
     }
 
     fn take_storage_maintenance_step(
@@ -226,13 +247,16 @@ struct SlotLock {
 }
 
 impl SlotLock {
-    fn acquire(slot_dir: PathBuf) -> Result<Self, SfaQueueError> {
+    fn acquire(slot_dir: PathBuf, sync_parent: bool) -> Result<Self, SfaQueueError> {
         validate_slot_dir(&slot_dir)?;
         ensure_dir(&slot_dir)?;
+        if sync_parent {
+            sync_parent_directory(&slot_dir)?;
+        }
         Self::lock_file(slot_dir)
     }
 
-    fn acquire_existing(slot_dir: PathBuf) -> Result<Self, SfaQueueError> {
+    fn acquire_existing(slot_dir: PathBuf, sync_parent: bool) -> Result<Self, SfaQueueError> {
         validate_slot_dir(&slot_dir)?;
         if !slot_dir.is_dir() {
             return Err(io::Error::new(
@@ -240,6 +264,9 @@ impl SlotLock {
                 format!("SFA slot directory does not exist: {}", slot_dir.display()),
             )
             .into());
+        }
+        if sync_parent {
+            sync_parent_directory(&slot_dir)?;
         }
         Self::lock_file(slot_dir)
     }
@@ -304,6 +331,15 @@ fn ensure_dir(path: &Path) -> Result<(), io::Error> {
         Err(err) if err.kind() == io::ErrorKind::AlreadyExists && path.is_dir() => Ok(()),
         Err(err) => Err(err),
     }
+}
+
+fn sync_parent_directory(path: &Path) -> Result<(), io::Error> {
+    let parent = match path.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent,
+        Some(_) => Path::new("."),
+        None => path,
+    };
+    sync_directory(parent)
 }
 
 fn read_lock_holder(pid_path: &Path) -> String {
@@ -389,7 +425,9 @@ fn unlock_lock_file(file: &File) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ingress::sender::qwp_ws_sfa_segment::spare_segment_path;
+    use crate::ingress::sender::qwp_ws_sfa_segment::{
+        fail_sync_after_for_test, spare_segment_path,
+    };
     use tempfile::TempDir;
 
     fn options(sf_dir: &Path, sender_id: &str) -> SfaSlotOptions {
@@ -399,6 +437,7 @@ mod tests {
             segment_size_bytes: 256,
             max_bytes: 1024,
             max_in_flight: 4,
+            periodic_sync_interval: None,
         }
     }
 
@@ -408,6 +447,7 @@ mod tests {
             segment_size_bytes: 256,
             max_bytes: 1024,
             max_in_flight: 4,
+            periodic_sync_interval: None,
         }
     }
 
@@ -471,6 +511,27 @@ mod tests {
             } if slot_dir == sf_dir.join(DEFAULT_SENDER_ID)
                 && holder == "pid=4242"
         ));
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn periodic_close_failure_keeps_the_slot_locked_until_retry_succeeds() {
+        let temp = TempDir::new().unwrap();
+        let sf_dir = temp.path().join("sf-root");
+        let mut slot_options = options(&sf_dir, "periodic");
+        slot_options.periodic_sync_interval = Some(Duration::from_secs(3600));
+        let mut first = SfaSlotQueue::open(slot_options.clone()).unwrap();
+        first.queue.try_submit(b"queued").unwrap();
+
+        fail_sync_after_for_test(0);
+        assert!(first.close().is_err());
+        assert!(matches!(
+            SfaSlotQueue::open(slot_options.clone()).unwrap_err(),
+            SfaQueueError::SlotInUse { .. }
+        ));
+
+        first.close().unwrap();
+        SfaSlotQueue::open(slot_options).unwrap();
     }
 
     #[cfg(any(unix, windows))]

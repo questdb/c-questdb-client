@@ -485,6 +485,14 @@ impl<Q: PublicationLog> QwpWsPublicationStore<Q> {
         self.queue.max_in_flight()
     }
 
+    pub(crate) fn check_durability(&self) -> Result<(), DriverError> {
+        self.queue.check_durability()
+    }
+
+    pub(crate) fn periodic_sync_in_flight(&self) -> Result<bool, DriverError> {
+        self.queue.periodic_sync_in_flight()
+    }
+
     pub(crate) fn try_submit(&mut self, payload: &[u8]) -> Result<QwpReceipt, DriverError> {
         match self.lifecycle.load() {
             PublicationState::Open => {}
@@ -2680,6 +2688,12 @@ pub(crate) trait PublicationLog {
         None
     }
     fn progress_view(&self) -> SfaProgressView;
+    fn check_durability(&self) -> Result<(), DriverError> {
+        Ok(())
+    }
+    fn periodic_sync_in_flight(&self) -> Result<bool, DriverError> {
+        Ok(false)
+    }
     fn take_storage_maintenance_step(
         &mut self,
         _allow_create: bool,

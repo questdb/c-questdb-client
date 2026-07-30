@@ -124,6 +124,21 @@ column-major store-and-forward `wait`.
 [`sender.published_fsn()`](Sender::published_fsn) and
 [`sender.acked_fsn()`](Sender::acked_fsn) provide non-blocking polls.
 
+Configure `sf_dir` to recover the local publication log after reconnects and
+producer-process restarts. The default `sf_durability=memory` mode relies on
+the OS page cache and does not cover host power loss.
+`sf_durability=periodic` checkpoints published mmap data in the background;
+`sf_sync_interval_millis` defaults to `5000` in that mode. The interval is a
+target cadence rather than a hard recovery-window guarantee because runner
+scheduling and storage-sync latency add to it. At a segment boundary,
+publication may receive normal store-and-forward backpressure until a
+checkpoint makes the segment safe to rotate.
+
+Periodic durability protects the local replay log. It is independent of the
+QuestDB Enterprise server-side durable ACK barrier selected by
+`request_durable_ack=on`; configure both when end-to-end durability is
+required.
+
 In `manual` progress mode no background thread observes the transport.
 Server-side state — including terminal diagnostics — only becomes visible when the user
 calls [`sender.drive_once()`](Sender::drive_once) or any sender method
