@@ -2144,16 +2144,8 @@ fn assert_qwp_ws_drop_interrupts_stalled_connect(scheme: &str, tls_options: &str
     let _ = release_tx.send(());
     server.join().unwrap();
 
-    // Windows: shutdown() does not abort a thread blocked in recv, so a
-    // close during the connect phase is bounded by the phase read timeouts
-    // (TLS handshake 5 s, auth 15 s) rather than by the traffic gate.
-    let bound = if cfg!(windows) {
-        Duration::from_secs(25)
-    } else {
-        Duration::from_secs(1)
-    };
     assert!(
-        elapsed < bound,
+        elapsed < Duration::from_secs(1),
         "{scheme} drop did not interrupt the stalled connect phase: {elapsed:?}"
     );
 }
@@ -2993,15 +2985,8 @@ fn qwp_ws_background_orphan_close_interrupts_stalled_connect() {
     let started = Instant::now();
     sender.close_drain().unwrap();
     let elapsed = started.elapsed();
-    // Windows: shutdown() does not abort a blocked recv; the drainer's
-    // stalled upgrade read is bounded by the auth read timeout instead.
-    let bound = if cfg!(windows) {
-        Duration::from_secs(25)
-    } else {
-        Duration::from_secs(5)
-    };
     assert!(
-        elapsed < bound,
+        elapsed < Duration::from_secs(5),
         "background orphan shutdown took {elapsed:?}"
     );
 

@@ -93,6 +93,16 @@ pub(crate) struct TrafficGate {
 #[derive(Default)]
 struct TrafficGateState {
     current: Option<TcpStream>,
+    /// Raw handle of the ORIGINAL socket, not the `current` dup. Winsock
+    /// `shutdown()` does not unblock a `recv()` already in progress on
+    /// another thread, so `shutdown()` first runs `CancelIoEx` — and that
+    /// must target the handle the blocked thread issued its I/O on; a
+    /// `try_clone` (WSADuplicateSocket) handle is not guaranteed to share
+    /// the file object. Only valid while `current` is `Some`: every close
+    /// of the original is mutex-ordered behind `clear()`/re-register, so
+    /// the handle cannot be recycled while the gate still holds it.
+    #[cfg(windows)]
+    original: Option<std::os::windows::io::RawSocket>,
     shut: bool,
 }
 
@@ -115,6 +125,11 @@ impl TrafficGate {
             ));
         }
         state.current = Some(shutdown_handle);
+        #[cfg(windows)]
+        {
+            use std::os::windows::io::AsRawSocket;
+            state.original = Some(stream.as_raw_socket());
+        }
         Ok(TrafficRegistration {
             gate: self,
             armed: true,
@@ -122,10 +137,12 @@ impl TrafficGate {
     }
 
     pub(super) fn clear(&self) {
-        self.state
-            .lock()
-            .unwrap_or_else(|err| err.into_inner())
-            .current = None;
+        let mut state = self.state.lock().unwrap_or_else(|err| err.into_inner());
+        state.current = None;
+        #[cfg(windows)]
+        {
+            state.original = None;
+        }
     }
 
     fn is_shutdown(&self) -> bool {
@@ -136,12 +153,25 @@ impl TrafficGate {
     }
 
     pub(super) fn shutdown(&self) -> std::io::Result<()> {
-        let current = {
-            let mut state = self.state.lock().unwrap_or_else(|err| err.into_inner());
-            state.shut = true;
-            state.current.take()
-        };
-        if let Some(stream) = current {
+        // The syscalls run under the gate mutex on purpose: every close of
+        // the original socket is mutex-ordered behind `clear()`, so while
+        // `current` is `Some` the original handle is still open and
+        // `CancelIoEx` cannot hit a recycled handle. Cold path only.
+        let mut state = self.state.lock().unwrap_or_else(|err| err.into_inner());
+        state.shut = true;
+        #[cfg(windows)]
+        if let Some(original) = state.original.take() {
+            // Winsock shutdown() does not unblock an in-progress recv() on
+            // another thread. Cancel outstanding I/O on the worker's own
+            // handle first, mirroring the Java client's windows/net.c
+            // shutdown(). A failure with ERROR_NOT_FOUND (nothing pending)
+            // is expected and deliberately ignored.
+            use windows_sys::Win32::Foundation::HANDLE;
+            unsafe {
+                windows_sys::Win32::System::IO::CancelIoEx(original as HANDLE, std::ptr::null());
+            }
+        }
+        if let Some(stream) = state.current.take() {
             shutdown_socket(&stream)?;
         }
         Ok(())

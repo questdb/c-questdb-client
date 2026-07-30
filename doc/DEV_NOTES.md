@@ -99,11 +99,13 @@ Differences from Java:
   page pinning and directory fsync, but still calls `FlushViewOfFile` for the
   mapping and `FlushFileBuffers` for the file handle.
 - On Windows, `shutdown()` does not abort a thread blocked in a socket
-  receive (Winsock does not cancel the pending operation). The traffic gate
-  therefore interrupts blocked sends immediately, but a close during the
-  connect phase (WebSocket upgrade or TLS handshake read) is bounded by the
-  phase read timeouts (5–15 s) instead. Java has the same limitation and the
-  same bounded-close backstop.
+  receive, so the traffic gate first calls `CancelIoEx` on the worker's own
+  socket handle — the same workaround as Java's `windows/net.c` shutdown.
+  The gate stores the original raw handle beside its duplicated one because
+  `CancelIoEx` on a `try_clone` duplicate is not guaranteed to cancel I/O
+  issued on the original; the gate mutex orders every socket close behind
+  `clear()`, so the stored handle can never be recycled while the gate holds
+  it.
 - After a failed checkpoint, a rotation request waits
   `min(sf_sync_interval_millis, 1000)` before retrying. Java retries
   immediately. The Rust delay prevents a busy loop on a failing device.
