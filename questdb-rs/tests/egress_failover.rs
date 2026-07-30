@@ -4646,9 +4646,9 @@ fn reader_migrates_to_worker_thread_with_concurrent_stats_polling() {
 }
 
 #[test]
-fn query_and_cursor_migrate_across_threads_with_callback_and_drop() {
+fn query_and_cursor_migrate_across_threads_with_callbacks_and_drop() {
     // A accepts the query and then drops. B serves the replay to terminal,
-    // guaranteeing that the reset callback fires on the cursor's drive
+    // guaranteeing that the reset and progress callbacks fire on the cursor's drive
     // thread.
     let srv_a = MockServer::start(vec![drop_after_query_script(ServerRole::Standalone, "a")]);
     let srv_b = MockServer::start(vec![happy_script(ServerRole::Standalone, "b")]);
@@ -4667,18 +4667,30 @@ fn query_and_cursor_migrate_across_threads_with_callback_and_drop() {
         }
     }
 
-    let callback_on = Arc::new(Mutex::new(None));
-    let dropped_on = Arc::new(Mutex::new(None));
-    let callback_on_cloned = Arc::clone(&callback_on);
-    let probe = DropProbe {
-        dropped_on: Arc::clone(&dropped_on),
+    let reset_callback_on = Arc::new(Mutex::new(None));
+    let reset_dropped_on = Arc::new(Mutex::new(None));
+    let progress_callback_on = Arc::new(Mutex::new(None));
+    let progress_dropped_on = Arc::new(Mutex::new(None));
+    let reset_callback_on_cloned = Arc::clone(&reset_callback_on);
+    let progress_callback_on_cloned = Arc::clone(&progress_callback_on);
+    let reset_probe = DropProbe {
+        dropped_on: Arc::clone(&reset_dropped_on),
     };
-    let query = reader.prepare("select 1").on_failover_reset(move |_ev| {
-        // Keep the drop probe inside the callback allocation. It must be
-        // destroyed with the cursor on the final owner thread.
-        let _probe = &probe;
-        *callback_on_cloned.lock().unwrap() = Some(thread::current().id());
-    });
+    let progress_probe = DropProbe {
+        dropped_on: Arc::clone(&progress_dropped_on),
+    };
+    let query = reader
+        .prepare("select 1")
+        .on_failover_reset(move |_ev| {
+            // Keep the drop probe inside the callback allocation. It must be
+            // destroyed with the cursor on the final owner thread.
+            let _probe = &reset_probe;
+            *reset_callback_on_cloned.lock().unwrap() = Some(thread::current().id());
+        })
+        .on_failover_progress(move |_ev| {
+            let _probe = &progress_probe;
+            *progress_callback_on_cloned.lock().unwrap() = Some(thread::current().id());
+        });
 
     let main_thread = thread::current().id();
     thread::scope(|scope| {
@@ -4695,7 +4707,7 @@ fn query_and_cursor_migrate_across_threads_with_callback_and_drop() {
         assert_ne!(execute_thread, main_thread);
 
         // The cursor then crosses a second synchronized hand-off. The
-        // failover callback and final Cursor/closure drop both occur there.
+        // failover callbacks and final Cursor/closure drops all occur there.
         let drive_thread = scope
             .spawn(move || {
                 let mut cursor = cursor;
@@ -4709,8 +4721,10 @@ fn query_and_cursor_migrate_across_threads_with_callback_and_drop() {
             .join()
             .expect("drive worker panicked");
         assert_ne!(drive_thread, main_thread);
-        assert_eq!(*callback_on.lock().unwrap(), Some(drive_thread));
-        assert_eq!(*dropped_on.lock().unwrap(), Some(drive_thread));
+        assert_eq!(*reset_callback_on.lock().unwrap(), Some(drive_thread));
+        assert_eq!(*reset_dropped_on.lock().unwrap(), Some(drive_thread));
+        assert_eq!(*progress_callback_on.lock().unwrap(), Some(drive_thread));
+        assert_eq!(*progress_dropped_on.lock().unwrap(), Some(drive_thread));
     });
 }
 

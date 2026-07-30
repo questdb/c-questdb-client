@@ -2421,7 +2421,8 @@ fn column_kind_from_c(k: u32) -> Option<ColumnKind> {
 // ---------------------------------------------------------------------------
 
 /// Opaque cursor handle. Borrows from the originating `qwp_reader` for its
-/// entire lifetime — the reader MUST outlive the cursor. Single-threaded.
+/// entire lifetime — the reader MUST outlive the cursor. Thread-mobile but
+/// single-threaded.
 ///
 /// # Self-referential invariant (READ BEFORE EDITING)
 ///

@@ -933,7 +933,8 @@ impl<'r> ReaderQuery<'r> {
     /// the previous closure — only the most recent callback is invoked.
     /// The callback must be [`Send`]: a query/cursor may be handed to
     /// another thread, and the callback then runs and is dropped on that
-    /// destination thread.
+    /// destination thread. This bound is required even if the caller never
+    /// migrates the handle.
     ///
     /// Mirrors the Java client's `onFailoverReset(newNode)` contract.
     ///
@@ -1010,7 +1011,8 @@ impl<'r> ReaderQuery<'r> {
     /// the previous closure — only the most recent callback is invoked.
     /// The callback must be [`Send`]: a query/cursor may be handed to
     /// another thread, and the callback then runs and is dropped on that
-    /// destination thread.
+    /// destination thread. This bound is required even if the caller never
+    /// migrates the handle.
     ///
     /// # Reentrancy
     ///

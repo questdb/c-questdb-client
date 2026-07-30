@@ -58,6 +58,9 @@ namespace questdb::egress
 //                            may eventually be destroyed, on the thread that
 //                            drives or destroys the migrated handle. Captures
 //                            must be safe for that hand-off.
+//   `questdb_error`          — may likewise be transferred between threads,
+//                            but only one thread may access or free it at a
+//                            time.
 // The wrappers cannot statically enforce these rules; they document the
 // same contract the C API does.
 // ---------------------------------------------------------------------------

@@ -3364,7 +3364,7 @@ TEST_CASE(
 }
 
 TEST_CASE(
-    "mock: query and cursor migrate across threads with callback and destruction")
+    "mock: query and cursor migrate across threads with callbacks and destruction")
 {
     qm::Script s_a = {
         qm::ActionSendServerInfo{qm::ROLE_STANDALONE, "c", "a"},
@@ -3386,33 +3386,56 @@ TEST_CASE(
     struct ThreadRecord
     {
         std::mutex mutex;
-        std::optional<std::thread::id> callback_on;
-        std::optional<std::thread::id> destroyed_on;
+        std::optional<std::thread::id> reset_callback_on;
+        std::optional<std::thread::id> reset_destroyed_on;
+        std::optional<std::thread::id> progress_callback_on;
+        std::optional<std::thread::id> progress_destroyed_on;
     };
-    struct CallbackPayload
+    struct ResetCallbackPayload
     {
         std::shared_ptr<ThreadRecord> record;
 
-        ~CallbackPayload()
+        ~ResetCallbackPayload()
         {
             std::lock_guard<std::mutex> guard{record->mutex};
-            record->destroyed_on = std::this_thread::get_id();
+            record->reset_destroyed_on = std::this_thread::get_id();
+        }
+    };
+    struct ProgressCallbackPayload
+    {
+        std::shared_ptr<ThreadRecord> record;
+
+        ~ProgressCallbackPayload()
+        {
+            std::lock_guard<std::mutex> guard{record->mutex};
+            record->progress_destroyed_on = std::this_thread::get_id();
         }
     };
 
     auto record = std::make_shared<ThreadRecord>();
-    auto payload = std::make_shared<CallbackPayload>();
-    payload->record = record;
+    auto reset_payload = std::make_shared<ResetCallbackPayload>();
+    reset_payload->record = record;
+    auto progress_payload = std::make_shared<ProgressCallbackPayload>();
+    progress_payload->record = record;
     auto query = reader.prepare("select 1"_utf8);
     query.on_failover_reset(
-        [payload](const eg::failover_reset_event_view&)
+        [reset_payload](const eg::failover_reset_event_view&)
         {
-            std::lock_guard<std::mutex> guard{payload->record->mutex};
-            payload->record->callback_on = std::this_thread::get_id();
+            std::lock_guard<std::mutex> guard{reset_payload->record->mutex};
+            reset_payload->record->reset_callback_on =
+                std::this_thread::get_id();
         });
-    // The stored callback is now the sole payload owner. Its destruction
+    query.on_failover_progress(
+        [progress_payload](const eg::failover_progress_event_view&)
+        {
+            std::lock_guard<std::mutex> guard{progress_payload->record->mutex};
+            progress_payload->record->progress_callback_on =
+                std::this_thread::get_id();
+        });
+    // The stored callbacks are now the sole payload owners. Their destruction
     // therefore records the thread that finally destroys the cursor.
-    payload.reset();
+    reset_payload.reset();
+    progress_payload.reset();
 
     const auto main_thread = std::this_thread::get_id();
     std::optional<eg::cursor> cursor;
@@ -3460,7 +3483,7 @@ TEST_CASE(
             {
                 drive_error = std::current_exception();
             }
-            // `cursor` and its heap-stored callback are destroyed here.
+            // `cursor` and its heap-stored callbacks are destroyed here.
         });
     drive_worker.join();
     if (drive_error)
@@ -3468,10 +3491,14 @@ TEST_CASE(
     CHECK(drive_thread != main_thread);
 
     std::lock_guard<std::mutex> guard{record->mutex};
-    REQUIRE(record->callback_on.has_value());
-    REQUIRE(record->destroyed_on.has_value());
-    CHECK(*record->callback_on == drive_thread);
-    CHECK(*record->destroyed_on == drive_thread);
+    REQUIRE(record->reset_callback_on.has_value());
+    REQUIRE(record->reset_destroyed_on.has_value());
+    REQUIRE(record->progress_callback_on.has_value());
+    REQUIRE(record->progress_destroyed_on.has_value());
+    CHECK(*record->reset_callback_on == drive_thread);
+    CHECK(*record->reset_destroyed_on == drive_thread);
+    CHECK(*record->progress_callback_on == drive_thread);
+    CHECK(*record->progress_destroyed_on == drive_thread);
 }
 
 // ---------------------------------------------------------------------------
