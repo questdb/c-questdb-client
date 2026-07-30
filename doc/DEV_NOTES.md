@@ -98,6 +98,12 @@ Differences from Java:
 - Periodic checkpoints use best-effort `mlock`/`munlock` on Unix. Windows skips
   page pinning and directory fsync, but still calls `FlushViewOfFile` for the
   mapping and `FlushFileBuffers` for the file handle.
+- On Windows, `shutdown()` does not abort a thread blocked in a socket
+  receive (Winsock does not cancel the pending operation). The traffic gate
+  therefore interrupts blocked sends immediately, but a close during the
+  connect phase (WebSocket upgrade or TLS handshake read) is bounded by the
+  phase read timeouts (5–15 s) instead. Java has the same limitation and the
+  same bounded-close backstop.
 - After a failed checkpoint, a rotation request waits
   `min(sf_sync_interval_millis, 1000)` before retrying. Java retries
   immediately. The Rust delay prevents a busy loop on a failing device.
