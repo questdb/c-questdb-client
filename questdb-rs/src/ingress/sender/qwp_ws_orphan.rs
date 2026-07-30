@@ -167,15 +167,8 @@ impl OrphanDrainerConfig {
             slot_dir,
             segment_size_bytes: *self.qwp_ws.sf_max_segment_bytes,
             max_bytes,
-            // Durable replay retains one table/seqTxn vector per ordinary OK
-            // until durable coverage arrives, so keep the historical count
-            // bound on unresolved publications. Non-durable replay needs no
-            // per-frame ACK metadata and remains byte-budget-only.
-            max_in_flight: if *self.qwp_ws.request_durable_ack {
-                *self.qwp_ws.max_in_flight
-            } else {
-                UNBOUNDED_IN_FLIGHT
-            },
+            // Replay-only queues never admit publications.
+            max_in_flight: UNBOUNDED_IN_FLIGHT,
         })
     }
 }
@@ -471,8 +464,7 @@ impl OrphanDrainer {
         if orphan_stop_requested(stop) {
             return OrphanOpenOutcome::Stopped;
         }
-        // The queue's count is an admission bound for durable metadata, not a
-        // wire window.
+        // Match Java: orphan replay has no frame-count window.
         let max_in_flight = UNBOUNDED_IN_FLIGHT;
         // A delta-encoded slot's stored frames are not self-sufficient, so before
         // replaying them to the fresh server the drainer must re-register the whole
@@ -892,6 +884,21 @@ mod tests {
             ..QwpWsConfig::default()
         };
         OrphanDrainerConfig::new("127.0.0.1", "1", false, None, &qwp_ws, None)
+    }
+
+    #[cfg(feature = "sync-sender-qwp-ws")]
+    #[test]
+    fn orphan_replay_does_not_apply_configured_frame_count_limit() {
+        let qwp_ws = QwpWsConfig {
+            request_durable_ack: ConfigSetting::new_default(true),
+            max_in_flight: ConfigSetting::new_default(1),
+            ..QwpWsConfig::default()
+        };
+        let config = OrphanDrainerConfig::new("127.0.0.1", "1", false, None, &qwp_ws, None);
+
+        let options = config.queue_options(PathBuf::from("orphan")).unwrap();
+
+        assert_eq!(options.max_in_flight, UNBOUNDED_IN_FLIGHT);
     }
 
     #[cfg(feature = "sync-sender-qwp-ws")]
