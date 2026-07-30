@@ -217,7 +217,7 @@ fn chunk_replay_payload() -> Vec<u8> {
     let mut out = Vec::new();
     let mut dict = SymbolGlobalDict::new();
     let mut scratch = EncodeScratch::new();
-    encode_chunk_replay_into(&mut out, &chunk, &mut dict, &mut scratch).unwrap();
+    encode_chunk_replay_into(&mut out, &chunk, &mut dict, &mut scratch, false).unwrap();
     out
 }
 

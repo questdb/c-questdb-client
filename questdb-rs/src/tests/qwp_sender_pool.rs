@@ -2993,11 +2993,22 @@ fn direct_flush_split_floor_marks_must_close_to_discard_uncommitted_prefix() {
 }
 
 #[test]
-fn store_and_forward_flush_splits_oversize_chunk_into_self_sufficient_frames() {
-    // The store-and-forward backend also splits an oversize chunk, but into
-    // independently-committed self-sufficient frames — never deferred ones,
-    // which the frame-granular replay queue could drop on a reconnect that
-    // trims them after their ack but before a commit boundary.
+fn store_and_forward_flush_splits_oversize_chunk_committing_once_at_the_last_frame() {
+    // The store-and-forward backend splits an oversize chunk into frames that
+    // commit ONCE, at the last frame: every earlier frame carries
+    // FLAG_DEFER_COMMIT so the chunk -- which is also the replay unit -- stays
+    // the atomic commit boundary instead of committing once per frame.
+    //
+    // This used to assert the opposite (no frame deferred), on the grounds that
+    // the frame-granular replay queue could drop a deferred frame on a reconnect
+    // that trimmed it after its ack but before a commit. The server closed that
+    // hole in questdb#7144: while FLAG_DEFER_COMMIT rows sit uncommitted it
+    // refuses to advance the cumulative-ack watermark over them, so deferred
+    // frames are never acked, never trimmed, and replay on reconnect.
+    //
+    // NOTE: MockServer acks unconditionally, so the ack assertions below do NOT
+    // exercise that clamp -- they only pin that the closing frame's cumulative
+    // ack still covers the whole group. The clamp itself is server-side.
     const CAP: usize = 2048;
     const ROWS: usize = 512;
     const FLAG_DEFER_COMMIT: u8 = 0x01;
@@ -3059,10 +3070,13 @@ fn store_and_forward_flush_splits_oversize_chunk_into_self_sufficient_frames() {
             "frame {i} is {} bytes, exceeds cap {CAP}",
             frame.len()
         );
+        let is_last = i == captured.len() - 1;
         assert_eq!(
-            frame[5] & FLAG_DEFER_COMMIT,
-            0,
-            "store-and-forward frame {i} must be self-sufficient, not deferred"
+            frame[5] & FLAG_DEFER_COMMIT != 0,
+            !is_last,
+            "frame {i} of {}: every frame but the last must be deferred, so the \
+             chunk commits exactly once at its final frame",
+            captured.len()
         );
     }
     let total: u64 = captured.iter().map(|f| frame_row_count(f)).sum();

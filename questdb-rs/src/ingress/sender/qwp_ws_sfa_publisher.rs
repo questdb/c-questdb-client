@@ -206,7 +206,7 @@ mod tests {
                 if delta_enabled {
                     encoder::encode_chunk_into(payload, chunk, global, scratch, false)
                 } else {
-                    encoder::encode_chunk_replay_into(payload, chunk, global, scratch)
+                    encoder::encode_chunk_replay_into(payload, chunk, global, scratch, false)
                 }
             },
             publish,

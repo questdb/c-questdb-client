@@ -1563,15 +1563,24 @@ impl SfaBackend {
         }
         let caps = self.effective_frame_caps();
         // Whole-chunk fast path; only split when a single frame exceeds the cap.
-        // Each split frame commits on its own (never deferred) — the
-        // store-and-forward queue is frame-granular and at-least-once, so deferred
-        // (uncommitted) frames could be lost on a reconnect that trims them after
-        // their ack but before the commit. The boundary to wait for is the last
-        // frame's FSN; its cumulative ack covers the prefix. (In delta mode the
-        // frames are not individually self-sufficient; the driver re-registers the
-        // dictionary via a catch-up frame on reconnect.)
+        //
+        // A split chunk emits every frame but the last with FLAG_DEFER_COMMIT, so
+        // the whole chunk commits ONCE, at its final frame, instead of once per
+        // frame. The chunk stays the atomic commit boundary, which is also the
+        // store-and-forward replay unit.
+        //
+        // Safe against the reconnect-trim hazard because the server does not
+        // acknowledge deferred frames: while FLAG_DEFER_COMMIT rows sit
+        // uncommitted in its WAL writers it refuses to advance the cumulative-ack
+        // watermark over them (QwpIngressProcessorState.setHighestProcessedSequence,
+        // questdb#7144). Unacknowledged frames are never trimmed, so a reconnect
+        // mid-group replays the whole group -- at-least-once, as intended. The
+        // boundary to wait for is the last frame's FSN; its cumulative ack covers
+        // the prefix. (In delta mode the frames are not individually
+        // self-sufficient; the driver re-registers the dictionary via a catch-up
+        // frame on reconnect.)
         let boundary =
-            match self.publish_chunk_sfa(chunk, None, caps.for_range(chunk.row_count()))? {
+            match self.publish_chunk_sfa(chunk, None, caps.for_range(chunk.row_count()), false)? {
                 SfaPublishOutcome::Published(fsn) => fsn,
                 SfaPublishOutcome::TooLarge {
                     encoded_len,
@@ -1581,11 +1590,11 @@ impl SfaBackend {
                     let row_count = chunk.row_count();
                     match split_mid(row_count) {
                         Some(mid) => {
-                            self.publish_split_sfa(chunk, 0, mid, caps)?;
+                            self.publish_split_sfa(chunk, 0, mid, caps, true)?;
                             // The prefix is now durably queued (at-least-once); a
                             // failure on the remainder leaves it enqueued, so the
                             // chunk must not be reported as safe to blind-retry.
-                            self.publish_split_sfa(chunk, mid, row_count - mid, caps)
+                            self.publish_split_sfa(chunk, mid, row_count - mid, caps, false)
                                 .map_err(deny_retry_after_partial)?
                         }
                         None => return Err(FlushFailure::NotDelivered(err)),
@@ -1610,6 +1619,7 @@ impl SfaBackend {
         chunk: &Chunk<'_>,
         range: Option<(usize, usize)>,
         frame_cap: usize,
+        defer_commit: bool,
     ) -> std::result::Result<SfaPublishOutcome, FlushFailure> {
         let view;
         let target = match range {
@@ -1630,9 +1640,21 @@ impl SfaBackend {
                 frame_cap,
                 |payload, symbol_dict, delta_enabled| {
                     if delta_enabled {
-                        encoder::encode_chunk_into(payload, target, symbol_dict, scratch, false)
+                        encoder::encode_chunk_into(
+                            payload,
+                            target,
+                            symbol_dict,
+                            scratch,
+                            defer_commit,
+                        )
                     } else {
-                        encoder::encode_chunk_replay_into(payload, target, symbol_dict, scratch)
+                        encoder::encode_chunk_replay_into(
+                            payload,
+                            target,
+                            symbol_dict,
+                            scratch,
+                            defer_commit,
+                        )
                     }
                 },
                 |encoded| publish_qwp_ws_payload_background(state, encoded, frame_cap),
@@ -1642,17 +1664,23 @@ impl SfaBackend {
 
     /// Append rows `[row_offset, row_offset + row_count)`, halving the range
     /// whenever a frame is still too large. Returns the last frame's FSN.
+    ///
+    /// `defer_commit` applies to the LAST frame this call emits; every earlier
+    /// frame is deferred unconditionally. So a split chunk commits exactly once,
+    /// at its final frame, however many times the range has to halve.
     fn publish_split_sfa(
         &mut self,
         chunk: &Chunk<'_>,
         row_offset: usize,
         row_count: usize,
         caps: SfaFrameCaps,
+        defer_commit: bool,
     ) -> std::result::Result<u64, FlushFailure> {
         match self.publish_chunk_sfa(
             chunk,
             Some((row_offset, row_count)),
             caps.for_range(row_count),
+            defer_commit,
         )? {
             SfaPublishOutcome::Published(fsn) => Ok(fsn),
             SfaPublishOutcome::TooLarge {
@@ -1660,9 +1688,15 @@ impl SfaBackend {
                 max_buf_size,
             } => match split_mid(row_count) {
                 Some(mid) => {
-                    self.publish_split_sfa(chunk, row_offset, mid, caps)?;
-                    self.publish_split_sfa(chunk, row_offset + mid, row_count - mid, caps)
-                        .map_err(deny_retry_after_partial)
+                    self.publish_split_sfa(chunk, row_offset, mid, caps, true)?;
+                    self.publish_split_sfa(
+                        chunk,
+                        row_offset + mid,
+                        row_count - mid,
+                        caps,
+                        defer_commit,
+                    )
+                    .map_err(deny_retry_after_partial)
                 }
                 None => Err(FlushFailure::NotDelivered(sfa_frame_size_error(
                     encoded_len,
