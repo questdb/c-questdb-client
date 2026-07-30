@@ -49,9 +49,9 @@ use crate::{Error, ErrorCode};
 
 #[cfg(feature = "sync-sender-qwp-ws")]
 use super::qwp_ws::{
-    QwpWsConnectKind, QwpWsConnectRoundSuccess, QwpWsHostHealthTracker, WsFrameRead, WsFrameReader,
-    WsStream, connect_qwp_ws_endpoint_round, qwp_ws_configured_endpoints, write_binary_frame,
-    write_ping_frame,
+    QwpWsConnectKind, QwpWsConnectRoundSuccess, QwpWsHostHealthTracker, TrafficGate, WsFrameRead,
+    WsFrameReader, WsStream, connect_qwp_ws_endpoint_round, qwp_ws_configured_endpoints,
+    write_binary_frame, write_ping_frame,
 };
 use super::qwp_ws_codec::{self as codec, PipelinedResponse};
 use super::qwp_ws_ownership::{QwpWsErrorCategory, QwpWsErrorPolicy, QwpWsSenderError};
@@ -2916,6 +2916,7 @@ pub(crate) struct BlockingQwpWsTransport {
     auth_header: Option<String>,
     negotiated_version: u8,
     server_max_batch_size: Arc<AtomicUsize>,
+    traffic_gate: Option<Arc<TrafficGate>>,
     stream: WsStream,
     reader: WsFrameReader,
     send_buf: Vec<u8>,
@@ -2935,6 +2936,7 @@ impl BlockingQwpWsTransport {
         qwp_ws: QwpWsConfig,
         auth_header: Option<String>,
         server_max_batch_size: Arc<AtomicUsize>,
+        traffic_gate: Option<Arc<TrafficGate>>,
     ) -> crate::Result<Self> {
         let host = host.into();
         let port = port.into();
@@ -2952,6 +2954,7 @@ impl BlockingQwpWsTransport {
             &qwp_ws,
             auth_header.as_deref(),
             qwp_ws.conn_events.as_deref(),
+            traffic_gate.as_deref(),
         )?;
         Ok(Self::from_connected(
             endpoints,
@@ -2962,6 +2965,7 @@ impl BlockingQwpWsTransport {
             qwp_ws,
             auth_header,
             server_max_batch_size,
+            traffic_gate,
             connected,
         ))
     }
@@ -2976,6 +2980,7 @@ impl BlockingQwpWsTransport {
         qwp_ws: QwpWsConfig,
         auth_header: Option<String>,
         server_max_batch_size: Arc<AtomicUsize>,
+        traffic_gate: Option<Arc<TrafficGate>>,
         connected: QwpWsConnectRoundSuccess,
     ) -> Self {
         server_max_batch_size.store(connected.server_max_batch_size, Ordering::Release);
@@ -2990,6 +2995,7 @@ impl BlockingQwpWsTransport {
             auth_header,
             negotiated_version: connected.negotiated_version,
             server_max_batch_size,
+            traffic_gate,
             stream: connected.stream,
             reader: WsFrameReader::with_initial_input(connected.leftover),
             send_buf: Vec::with_capacity(16 * 1024),
@@ -3005,6 +3011,9 @@ impl BlockingQwpWsTransport {
     }
 
     fn reconnect(&mut self, reason: ReconnectReason) -> Result<(), DriverError> {
+        if let Some(gate) = self.traffic_gate.as_deref() {
+            gate.clear();
+        }
         if matches!(self.connect_kind, QwpWsConnectKind::Foreground)
             && let Some(events) = self.qwp_ws.conn_events.as_deref()
             && let Some(idx) = self.previous_idx
@@ -3023,6 +3032,7 @@ impl BlockingQwpWsTransport {
             &self.qwp_ws,
             self.auth_header.as_deref(),
             self.qwp_ws.conn_events.as_deref(),
+            self.traffic_gate.as_deref(),
         )
         .map_err(DriverError::Transport)?;
         self.previous_idx = Some(connected.endpoint_idx);
@@ -3054,6 +3064,15 @@ impl BlockingQwpWsTransport {
                 break;
             }
             self.pending_wire_sequences.pop_front();
+        }
+    }
+}
+
+#[cfg(feature = "sync-sender-qwp-ws")]
+impl Drop for BlockingQwpWsTransport {
+    fn drop(&mut self) {
+        if let Some(gate) = self.traffic_gate.as_deref() {
+            gate.clear();
         }
     }
 }

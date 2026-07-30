@@ -598,6 +598,7 @@ impl QwpWsConnector {
             &self.qwp_ws,
             self.auth_header.as_deref(),
             events,
+            None,
         )?;
         // The per-frame cap is the negotiated one: the configured
         // max_buf_size clamped to the server's advertised

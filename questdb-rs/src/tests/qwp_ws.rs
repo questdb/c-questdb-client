@@ -1889,6 +1889,170 @@ fn qwp_ws_close_flush_timeout_minus_one_skips_close_drain_wait() {
     server.join().unwrap();
 }
 
+#[test]
+fn qwp_ws_drop_interrupts_blocked_background_send() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let (send_started_tx, send_started_rx) = mpsc::channel();
+    let (release_tx, release_rx) = mpsc::channel();
+
+    let server = thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        socket2::SockRef::from(&stream)
+            .set_recv_buffer_size(4096)
+            .unwrap();
+        upgrade_mock_stream(&mut stream);
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+
+        // Observe the first data byte without consuming it, then leave the
+        // receive window full so the client's large frame blocks in write().
+        let mut byte = [0u8; 1];
+        stream.peek(&mut byte).unwrap();
+        send_started_tx.send(()).unwrap();
+        let _ = release_rx.recv_timeout(Duration::from_secs(10));
+    });
+
+    let conf = format!(
+        "ws::addr=127.0.0.1:{port};\
+         close_flush_timeout_millis=-1;\
+         sf_max_segment_bytes=16777216;"
+    );
+    let mut sender = SenderBuilder::from_conf(&conf).unwrap().build().unwrap();
+    let value = "x".repeat(8 * 1024 * 1024);
+    let mut buf = sender.new_buffer();
+    buf.table("trades")
+        .unwrap()
+        .column_str("payload", value.as_str())
+        .unwrap()
+        .at_now()
+        .unwrap();
+    sender.flush(&mut buf).unwrap();
+
+    send_started_rx
+        .recv_timeout(Duration::from_secs(5))
+        .unwrap();
+    thread::sleep(Duration::from_millis(50));
+
+    let started = Instant::now();
+    drop(sender);
+    let elapsed = started.elapsed();
+    let _ = release_tx.send(());
+    server.join().unwrap();
+
+    assert!(
+        elapsed < Duration::from_secs(1),
+        "drop waited for the socket write timeout: {elapsed:?}"
+    );
+}
+
+#[test]
+fn qwp_ws_drop_interrupts_blocked_send_after_reconnect() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let (send_started_tx, send_started_rx) = mpsc::channel();
+    let (release_tx, release_rx) = mpsc::channel();
+
+    let server = thread::spawn(move || {
+        let (mut first, _) = listener.accept().unwrap();
+        upgrade_mock_stream(&mut first);
+        drop(first);
+
+        let (mut second, _) = listener.accept().unwrap();
+        socket2::SockRef::from(&second)
+            .set_recv_buffer_size(4096)
+            .unwrap();
+        upgrade_mock_stream(&mut second);
+        second
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let mut byte = [0u8; 1];
+        second.peek(&mut byte).unwrap();
+        send_started_tx.send(()).unwrap();
+        let _ = release_rx.recv_timeout(Duration::from_secs(10));
+    });
+
+    let conf = format!(
+        "ws::addr=127.0.0.1:{port};\
+         close_flush_timeout_millis=-1;\
+         sf_max_segment_bytes=16777216;"
+    );
+    let mut sender = SenderBuilder::from_conf(&conf).unwrap().build().unwrap();
+    let value = "x".repeat(8 * 1024 * 1024);
+    let mut buf = sender.new_buffer();
+    buf.table("trades")
+        .unwrap()
+        .column_str("payload", value.as_str())
+        .unwrap()
+        .at_now()
+        .unwrap();
+    sender.flush(&mut buf).unwrap();
+
+    send_started_rx
+        .recv_timeout(Duration::from_secs(5))
+        .unwrap();
+    thread::sleep(Duration::from_millis(50));
+
+    let started = Instant::now();
+    drop(sender);
+    let elapsed = started.elapsed();
+    let _ = release_tx.send(());
+    server.join().unwrap();
+
+    assert!(
+        elapsed < Duration::from_secs(1),
+        "drop waited on the replacement socket after reconnect: {elapsed:?}"
+    );
+}
+
+fn assert_qwp_ws_drop_interrupts_stalled_connect(scheme: &str, tls_options: &str) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let (accepted_tx, accepted_rx) = mpsc::channel();
+    let (release_tx, release_rx) = mpsc::channel();
+
+    let server = thread::spawn(move || {
+        let (_stream, _) = listener.accept().unwrap();
+        accepted_tx.send(()).unwrap();
+        let _ = release_rx.recv_timeout(Duration::from_secs(10));
+    });
+
+    let conf = format!(
+        "{scheme}::addr=127.0.0.1:{port};\
+         initial_connect_retry=async;\
+         {tls_options}"
+    );
+    let sender = SenderBuilder::from_conf(&conf).unwrap().build().unwrap();
+    accepted_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    thread::sleep(Duration::from_millis(50));
+
+    let started = Instant::now();
+    drop(sender);
+    let elapsed = started.elapsed();
+    let _ = release_tx.send(());
+    server.join().unwrap();
+
+    assert!(
+        elapsed < Duration::from_secs(1),
+        "{scheme} drop did not interrupt the stalled connect phase: {elapsed:?}"
+    );
+}
+
+#[test]
+fn qwp_ws_drop_interrupts_stalled_websocket_upgrade() {
+    assert_qwp_ws_drop_interrupts_stalled_connect("ws", "");
+}
+
+#[test]
+fn qwp_ws_drop_interrupts_stalled_tls_handshake() {
+    let mut cert = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    cert.pop();
+    cert.push("tls_certs/server_rootCA.pem");
+    let tls_options = format!("tls_roots={};", cert.display());
+    assert_qwp_ws_drop_interrupts_stalled_connect("wss", &tls_options);
+}
+
 /// Run with:
 /// `QWP_WS_PUBLIC_BENCH_ROWS=20000000 cargo test --release --manifest-path questdb-rs/Cargo.toml --features sync-sender-qwp-ws qwp_ws_public_sender_batch_throughput_benchmark --lib -- --ignored --nocapture --test-threads=1`
 #[test]

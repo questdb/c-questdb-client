@@ -454,6 +454,7 @@ impl OrphanDrainer {
             config.qwp_ws.clone(),
             config.auth_header.clone(),
             Arc::new(AtomicUsize::new(0)),
+            None,
         ) {
             Ok(transport) => transport,
             Err(err) => return retry_open_later(err.to_string(), stop),
