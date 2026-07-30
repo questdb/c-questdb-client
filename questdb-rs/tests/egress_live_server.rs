@@ -3267,12 +3267,11 @@ fn cancel_does_not_replenish_credit_window() {
 /// done after a `QUERY_ERROR` terminal. Polling `is_finished()` lets
 /// the test fail with a useful message instead of hanging the CI run.
 ///
-/// `F` is **not** required to be `Send`. `Cursor` is intentionally
-/// `!Send` (the `on_failover_reset` callback can capture non-`Send`
-/// state — see the `_not_send` marker on `Cursor` / `ReaderQuery`) but
-/// the watchdog needs to spawn the operation on a side thread to be
-/// able to time it out. We bridge the two by wrapping `op` in a
-/// newtype that unsafely asserts `Send`.
+/// `Cursor` is `Send`, so the wrapper below is redundant for the current
+/// callers, whose operations capture only a cursor. `F` remains
+/// unconstrained so this watchdog can also time operations that capture
+/// other non-`Send` test state; only such additional state makes the
+/// local `ForceSend` assertion necessary.
 ///
 /// Safety: the only thing the main thread does while the side thread
 /// runs is poll `JoinHandle::is_finished()` and sleep — it never
