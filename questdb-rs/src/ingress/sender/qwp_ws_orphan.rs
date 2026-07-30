@@ -435,7 +435,27 @@ impl OrphanDrainer {
         let mut queue = match SfaSlotQueue::open_replay_only_existing(options) {
             Ok(queue) => queue,
             Err(SfaQueueError::SlotInUse { .. }) => return OrphanOpenOutcome::Locked,
-            Err(err @ SfaQueueError::CorruptSegments { .. }) => {
+            Err(SfaQueueError::SanitizedResidue { .. }) => {
+                let retry_options = match config.queue_options(slot_dir.clone()) {
+                    Ok(options) => options,
+                    Err(err) => return OrphanOpenOutcome::RetryLater(err),
+                };
+                match SfaSlotQueue::open_replay_only_existing(retry_options) {
+                    Ok(queue) => queue,
+                    Err(SfaQueueError::SlotInUse { .. }) => {
+                        return OrphanOpenOutcome::Locked;
+                    }
+                    Err(
+                        err @ (SfaQueueError::SanitizedResidue { .. }
+                        | SfaQueueError::Recovery { .. }
+                        | SfaQueueError::CorruptSegments { .. }),
+                    ) => {
+                        return OrphanOpenOutcome::Unrecoverable(format!("{err:?}"));
+                    }
+                    Err(err) => return OrphanOpenOutcome::RetryLater(format!("{err:?}")),
+                }
+            }
+            Err(err @ (SfaQueueError::Recovery { .. } | SfaQueueError::CorruptSegments { .. })) => {
                 return OrphanOpenOutcome::Unrecoverable(format!("{err:?}"));
             }
             Err(err) => return OrphanOpenOutcome::RetryLater(format!("{err:?}")),
@@ -812,8 +832,12 @@ mod tests {
 
     #[cfg(feature = "sync-sender-qwp-ws")]
     use crate::ingress::conf::{ConfigSetting, QwpWsConfig};
+    #[cfg(all(feature = "sync-sender-qwp-ws", any(unix, windows)))]
+    use crate::ingress::sender::qwp_ws_sfa_manifest::{SfManifest, SfaAckWatermark};
     #[cfg(all(feature = "sync-sender-qwp-ws", unix))]
     use crate::ingress::sender::qwp_ws_sfa_segment::initial_segment_path;
+    #[cfg(all(feature = "sync-sender-qwp-ws", any(unix, windows)))]
+    use crate::ingress::sender::qwp_ws_sfa_segment::{SfaSegment, scan_file, spare_segment_path};
     #[cfg(all(feature = "sync-sender-qwp-ws", any(unix, windows)))]
     use crate::ingress::sender::qwp_ws_sfa_slot::SfaSlotOptions;
     #[cfg(all(feature = "sync-sender-qwp-ws", any(unix, windows)))]
@@ -1135,6 +1159,45 @@ mod tests {
         assert_eq!(scan_orphan_slots(&sf_dir, "primary", &[]), vec![slot_dir]);
     }
 
+    #[cfg(all(feature = "sync-sender-qwp-ws", any(unix, windows)))]
+    #[test]
+    fn manual_drainer_retries_once_after_sanitizing_sealed_residue() {
+        let temp = TempDir::new().unwrap();
+        let slot_dir = temp.path().join("orphan");
+        fs::create_dir(&slot_dir).unwrap();
+        let sealed_path = spare_segment_path(&slot_dir, 0);
+        let active_path = spare_segment_path(&slot_dir, 1);
+        let mut sealed = SfaSegment::create_new_manifested(&sealed_path, 0, 256, 0).unwrap();
+        sealed.try_append(b"orphaned").unwrap();
+        drop(sealed);
+        let append_offset = scan_file(&sealed_path).unwrap().append_offset as usize;
+        let mut bytes = fs::read(&sealed_path).unwrap();
+        bytes[append_offset] = 0xa5;
+        fs::write(&sealed_path, bytes).unwrap();
+        drop(SfaSegment::create_new_manifested(&active_path, 1, 256, 0).unwrap());
+        drop(SfManifest::create(&slot_dir, 0, 1).unwrap());
+        let mut watermark = SfaAckWatermark::open(&slot_dir, false).unwrap();
+        watermark.write(-1).unwrap();
+        watermark.sync_data().unwrap();
+        drop(watermark);
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+        let mut config = test_config();
+        config.port = port.to_string();
+        let mut drainers = ManualOrphanDrainers::new(vec![slot_dir.clone()], 1, config).unwrap();
+
+        assert!(drainers.drive_once());
+
+        assert_eq!(scan_file(&sealed_path).unwrap().torn_tail_bytes, 0);
+        assert!(
+            !has_failed_sentinel(&slot_dir),
+            "the first sanitized-residue incident must be retried, not poisoned"
+        );
+        assert!(slot_dir.join(LAST_ERROR_NAME).exists());
+    }
+
     #[cfg(all(feature = "sync-sender-qwp-ws", unix))]
     #[test]
     fn manual_drainer_marks_recovery_failure_failed_without_network() {
@@ -1150,7 +1213,14 @@ mod tests {
 
         assert!(drainers.drive_once());
         assert!(has_failed_sentinel(&slot_dir));
-        assert!(segment_path.exists());
+        assert!(
+            !segment_path.exists(),
+            "manifest-less corruption must leave the .sfa scan"
+        );
+        assert!(
+            segment_path.with_extension("sfa.corrupt").exists(),
+            "quarantine must preserve the corrupt bytes for diagnosis"
+        );
         assert!(!drainers.drive_once());
     }
 }

@@ -727,8 +727,9 @@ where
         Ok(store.counters())
     }
 
-    fn close_drain(&self, timeout: Duration) -> crate::Result<()> {
+    fn close_drain(&mut self, timeout: Duration) -> crate::Result<()> {
         self.begin_close();
+        self.producer.take();
         if timeout.is_zero() {
             return Ok(());
         }
@@ -750,7 +751,11 @@ where
     /// already-elapsed deadline fails fast, which is what bounds a batched pool
     /// close). `deadline == None` waits indefinitely. Assumes
     /// [`Self::begin_close`] has already run.
-    fn drain_to_deadline(&self, deadline: Option<Instant>) -> crate::Result<()> {
+    fn drain_to_deadline(&mut self, deadline: Option<Instant>) -> crate::Result<()> {
+        // No publication can pass the Closing lifecycle latch. Release the
+        // detached producer's active-segment mapping before queue.close()
+        // starts the ordered unlink protocol.
+        self.producer.take();
         loop {
             let backpressure_generation = self.backpressure.generation();
             {

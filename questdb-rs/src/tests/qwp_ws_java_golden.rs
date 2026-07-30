@@ -30,6 +30,9 @@
 //! reproduce them byte-for-byte, so the assertions below prove cross-client
 //! wire parity rather than asserting a hand-derived expectation.
 
+use crate::ingress::sender::qwp_ws_sfa_manifest::{
+    DUAL_SLOT_FILE_SIZE, SfManifest, SfaAckWatermark, ack_watermark_path, manifest_path,
+};
 use crate::ingress::{Buffer, QwpWsEncodeScratch, SymbolGlobalDict, TimestampNanos};
 
 const SYMBOL_COUNT: usize = 10;
@@ -38,6 +41,12 @@ const UNIFIED_BUFFER_GOLDEN_HEX: &str =
     include_str!("interop/qwp-unified-ingress/m0-equivalent-buffer.hex");
 const UNIFIED_CHUNK_GOLDEN_HEX: &str =
     include_str!("interop/qwp-unified-ingress/m0-equivalent-chunk.hex");
+
+// Captured from Java post-PR #67 after SfManifest.create(..., 10, 20) and
+// AckWatermark.write(42). Generation 1 lives at offset 4096; slot 0 and the
+// unused bytes in slot 1 are zero.
+const JAVA_SF_MANIFEST_RECORD_HEX: &str = "53464d310100000001000000000000000a00000000000000140000000000000000000000000000000000000000000000000000000000000000000000861b7afa";
+const JAVA_ACK_WATERMARK_RECORD_HEX: &str = "414b57310100000001000000000000002a00000000000000000000000000000000000000000000000000000000000000000000000000000000000000ba81507e";
 
 const JAVA_FIRST_REPLAY_HEX: &str = "\
 515750310108010069010000000a0753594d5f3030300753594d5f3030310753594d5f3030320753594d5f\
@@ -62,6 +71,39 @@ fn qwp_ws_replay_payloads_match_java_golden_bytes() {
 
     assert_eq!(first, hex_to_bytes(JAVA_FIRST_REPLAY_HEX));
     assert_eq!(second, hex_to_bytes(JAVA_SECOND_REPLAY_HEX));
+}
+
+#[test]
+fn sf_manifest_and_watermark_match_java_dual_slot_goldens_both_directions() {
+    let expected_manifest = dual_slot_fixture(JAVA_SF_MANIFEST_RECORD_HEX);
+    let expected_watermark = dual_slot_fixture(JAVA_ACK_WATERMARK_RECORD_HEX);
+
+    // Rust writer -> Java-captured bytes.
+    let rust_dir = tempfile::TempDir::new().unwrap();
+    let manifest = SfManifest::create(rust_dir.path(), 10, 20).unwrap();
+    drop(manifest);
+    assert_eq!(
+        std::fs::read(manifest_path(rust_dir.path())).unwrap(),
+        expected_manifest
+    );
+    let mut watermark = SfaAckWatermark::open(rust_dir.path(), false).unwrap();
+    watermark.write(42).unwrap();
+    watermark.sync_data().unwrap();
+    drop(watermark);
+    assert_eq!(
+        std::fs::read(ack_watermark_path(rust_dir.path())).unwrap(),
+        expected_watermark
+    );
+
+    // Java-captured bytes -> Rust reader.
+    let java_dir = tempfile::TempDir::new().unwrap();
+    std::fs::write(manifest_path(java_dir.path()), expected_manifest).unwrap();
+    std::fs::write(ack_watermark_path(java_dir.path()), expected_watermark).unwrap();
+    let manifest = SfManifest::open(java_dir.path()).unwrap().unwrap();
+    assert_eq!(manifest.head_base(), 10);
+    assert_eq!(manifest.active_base(), 20);
+    let mut watermark = SfaAckWatermark::open(java_dir.path(), true).unwrap();
+    assert_eq!(watermark.read().unwrap(), Some(42));
 }
 
 /// Milestone-0 wire freeze for the unified ingress sender. Both payloads encode
@@ -250,4 +292,12 @@ fn bytes_to_hex(bytes: &[u8]) -> String {
         write!(&mut out, "{byte:02x}").unwrap();
     }
     out
+}
+
+fn dual_slot_fixture(record_hex: &str) -> Vec<u8> {
+    let mut bytes = vec![0u8; DUAL_SLOT_FILE_SIZE as usize];
+    let record = hex_to_bytes(record_hex);
+    assert_eq!(record.len(), 64);
+    bytes[4096..4096 + record.len()].copy_from_slice(&record);
+    bytes
 }

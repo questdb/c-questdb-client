@@ -85,6 +85,9 @@ mod qwp_ws_queue;
 mod qwp_ws_sfa_segment;
 
 #[cfg(feature = "_sender-qwp-ws")]
+pub(crate) mod qwp_ws_sfa_manifest;
+
+#[cfg(feature = "_sender-qwp-ws")]
 mod qwp_ws_sfa_queue;
 
 #[cfg(feature = "_sender-qwp-ws")]

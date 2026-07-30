@@ -32,7 +32,7 @@
 //! model after an unclean shutdown.
 
 use std::collections::VecDeque;
-use std::fs::{self, File, OpenOptions};
+use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -43,15 +43,53 @@ use crate::error;
 
 use super::qwp_ws_driver::{DriverError, PublicationLog, SendCursor};
 use super::qwp_ws_queue::{OutboundFrame, QueueError, QwpReceipt, QwpReceiptStatus};
+use super::qwp_ws_sfa_manifest::{
+    SfManifest, SfaAckWatermark, ack_watermark_path, manifest_path, sync_directory,
+};
 use super::qwp_ws_sfa_segment::{
     FRAME_HEADER_SIZE, HEADER_SIZE, INITIAL_SEGMENT_FILE_NAME, SfaMappedPayload, SfaSegment,
-    SfaSegmentError, read_exact_at, scan_file_metadata, spare_segment_path, write_all_at,
+    SfaSegmentError, scan_file_metadata, spare_segment_path,
 };
 use super::qwp_ws_sfa_symbol_dict::PersistedSymbolDict;
 
-const ACK_WATERMARK_FILE_NAME: &str = ".ack-watermark";
-const ACK_WATERMARK_MAGIC: u32 = 0x3157_4b41; // 'AKW1' in little-endian bytes.
-const ACK_WATERMARK_SIZE: u64 = 16;
+#[cfg(test)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum SfaBarrierEvent {
+    CloseWatermarkWritten,
+    CloseWatermarkSynced,
+    CloseDirectorySynced,
+    CloseHandlesReleased,
+    CleanupEnumerationComplete,
+    CleanupManifestCollapsed,
+    CleanupSegmentUnlinked(String),
+    CleanupDirectorySynced,
+    CleanupWatermarkRemoved,
+    CleanupManifestRemoved,
+    TrimWatermarkWritten,
+    TrimWatermarkSynced,
+    TrimDirectorySynced,
+    TrimManifestUpdated,
+    TrimQueuePopped,
+    RotationHeaderSynced,
+    RotationManifestUpdated,
+    RotationQueueMutated,
+}
+
+#[cfg(test)]
+thread_local! {
+    static SFA_BARRIER_EVENTS: std::cell::RefCell<Vec<SfaBarrierEvent>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+#[cfg(test)]
+fn record_sfa_barrier(event: SfaBarrierEvent) {
+    SFA_BARRIER_EVENTS.with(|events| events.borrow_mut().push(event));
+}
+
+#[cfg(test)]
+fn take_sfa_barriers() -> Vec<SfaBarrierEvent> {
+    SFA_BARRIER_EVENTS.with(|events| std::mem::take(&mut *events.borrow_mut()))
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct SfaQueueOptions {
@@ -78,6 +116,8 @@ pub(crate) enum SfaQueueError {
     SlotInUse { slot_dir: PathBuf, holder: String },
     SlotLockUnsupported,
     CorruptSegments { reason: &'static str },
+    Recovery { reason: String },
+    SanitizedResidue { path: PathBuf },
     Closed,
 }
 
@@ -169,7 +209,12 @@ impl SfaStorageStep {
                 created_us,
             } => {
                 let segment = match path {
-                    Some(path) => SfaSegment::create_new(&path, base_seq, size_bytes, created_us)?,
+                    Some(path) => {
+                        let slot_dir = path.parent().ok_or(SfaQueueError::InvalidSfDir)?;
+                        create_manifested_segment(
+                            &path, base_seq, size_bytes, created_us, slot_dir,
+                        )?
+                    }
                     None => SfaSegment::create_memory(base_seq, size_bytes, created_us)?,
                 };
                 Ok(SfaStorageResult::HotSpareCreated { segment })
@@ -220,7 +265,18 @@ impl SfaStorageCleanup {
         drop(self.segment);
         let path = path?;
         match fs::remove_file(&path) {
-            Ok(()) => None,
+            Ok(()) => {
+                let Some(slot_dir) = path.parent() else {
+                    return Some(SfaCleanupFailure {
+                        path,
+                        error: "SFA segment path has no parent directory".to_string(),
+                    });
+                };
+                sync_directory(slot_dir).err().map(|err| SfaCleanupFailure {
+                    path,
+                    error: err.to_string(),
+                })
+            }
             Err(err) if err.kind() == io::ErrorKind::NotFound => None,
             Err(err) => Some(SfaCleanupFailure {
                 path,
@@ -278,6 +334,7 @@ struct SfaEngineState {
     hot_spare: Option<Arc<SfaSharedSegment>>,
     allocated_segment_bytes: u64,
     recovery_diagnostics: Vec<SfaRecoveryDiagnostic>,
+    manifest: Option<SfManifest>,
     next_generation: u64,
     closed: bool,
 }
@@ -287,13 +344,17 @@ impl SfaFrameQueue {
         validate_options(&options)?;
         fs::create_dir_all(&options.slot_dir)?;
 
-        let recovered = recover_segments(&options)?;
-        let recovery_diagnostics = recovered.diagnostics;
+        let RecoveredState {
+            segments: recovered_segments,
+            mut manifest,
+            diagnostics: recovery_diagnostics,
+        } = recover_segments(&options)?;
+        let had_recovered_segments = recovered_segments.is_some();
         // Open the slot's persisted symbol dictionary aligned with segment
         // recovery: a fresh slot (no recovered segments) clears any stale side-file
         // and starts empty; a recovered slot loads it so its delta frames can be
         // re-registered on the fresh server. Delta encoding is on iff it opened.
-        let persisted_symbol_dict = if recovered.segments.is_some() {
+        let persisted_symbol_dict = if had_recovered_segments {
             // Recovered slot: delta-encode ONLY when an existing, valid side-file
             // loads. If it is absent / too short / bad-magic (no dictionary that
             // mirrors the recovered segments), fall back to full-dictionary
@@ -314,8 +375,21 @@ impl SfaFrameQueue {
             PersistedSymbolDict::open(&options.slot_dir).ok()
         };
         let delta_dict_enabled = persisted_symbol_dict.is_some();
+        // A recovered disk chain requires the watermark to pre-exist. For a
+        // fresh slot, create and durably publish the zeroed dual-slot file
+        // before any manifest-required segment can reach disk. A crash in the
+        // opposite order would leave a valid new-format segment whose required
+        // watermark directory entry never became durable.
+        let fresh_ack_watermark = if had_recovered_segments {
+            None
+        } else {
+            let watermark = SfaAckWatermark::open(&options.slot_dir, false)?;
+            watermark.sync_data()?;
+            sync_directory(&options.slot_dir)?;
+            Some(watermark)
+        };
         let (active, sealed_segments, next_fsn, next_generation, mut allocated_segment_bytes) =
-            match recovered.segments {
+            match recovered_segments {
                 Some(segments) => (
                     segments.active,
                     segments.sealed_segments,
@@ -330,13 +404,15 @@ impl SfaFrameQueue {
                     )?;
                     let mut next_generation = scan_next_generation(&options.slot_dir)?;
                     let active_path = next_segment_path(&options.slot_dir, &mut next_generation)?;
+                    let (active, fresh_manifest) = create_fresh_manifested_segment(
+                        &active_path,
+                        options.segment_size_bytes,
+                        unix_time_micros(),
+                        &options.slot_dir,
+                    )?;
+                    manifest = Some(fresh_manifest);
                     (
-                        SfaSegment::create_new(
-                            &active_path,
-                            0,
-                            options.segment_size_bytes,
-                            unix_time_micros(),
-                        )?,
+                        active,
                         VecDeque::new(),
                         0,
                         next_generation,
@@ -358,11 +434,12 @@ impl SfaFrameQueue {
             options.max_bytes,
         ) {
             let path = next_segment_path(&options.slot_dir, &mut next_generation)?;
-            hot_spare = Some(Arc::new(SfaSharedSegment::new(SfaSegment::create_new(
+            hot_spare = Some(Arc::new(SfaSharedSegment::new(create_manifested_segment(
                 &path,
                 next_fsn,
                 options.segment_size_bytes,
                 unix_time_micros(),
+                &options.slot_dir,
             )?)));
             allocated_segment_bytes = allocated_segment_bytes
                 .checked_add(options.segment_size_bytes)
@@ -371,8 +448,14 @@ impl SfaFrameQueue {
 
         let first_unresolved =
             first_unresolved_fsn_from_segments(&sealed_segments, &active).unwrap_or(next_fsn);
-        let recovered_completion =
-            recover_completed_upper(Some(&options.slot_dir), first_unresolved, next_fsn);
+        let recovered_completion = if had_recovered_segments {
+            recover_completed_upper(Some(&options.slot_dir), first_unresolved, next_fsn, true)?
+        } else {
+            RecoveredCompletion {
+                completed_upper: 0,
+                ack_watermark: fresh_ack_watermark,
+            }
+        };
         let active_append_offset = active.published_offset();
         let active_frame_count = active.published_frame_count();
         let engine = Arc::new(SfaEngine {
@@ -387,6 +470,7 @@ impl SfaFrameQueue {
                 hot_spare,
                 allocated_segment_bytes,
                 recovery_diagnostics,
+                manifest,
                 next_generation,
                 closed: false,
             }),
@@ -452,6 +536,7 @@ impl SfaFrameQueue {
                 hot_spare,
                 allocated_segment_bytes,
                 recovery_diagnostics: Vec::new(),
+                manifest: None,
                 next_generation,
                 closed: false,
             }),
@@ -479,13 +564,20 @@ impl SfaFrameQueue {
 
     pub(crate) fn open_replay_only(options: SfaQueueOptions) -> Result<Self, SfaQueueError> {
         validate_options(&options)?;
-        let recovered = recover_segments(&options)?;
-        if recovered.segments.is_none() && recovered.has_skipped_segments() {
+        let RecoveredState {
+            segments: recovered_segments,
+            manifest,
+            diagnostics: recovery_diagnostics,
+        } = recover_segments(&options)?;
+        if recovered_segments.is_none()
+            && recovery_diagnostics.iter().any(|diagnostic| {
+                matches!(diagnostic, SfaRecoveryDiagnostic::SkippedSegment { .. })
+            })
+        {
             return Err(SfaQueueError::CorruptSegments {
                 reason: "replay-only recovery found only skipped SFA segments",
             });
         }
-        let recovery_diagnostics = recovered.diagnostics;
         // Orphan-drain replays this slot's frames on a fresh server, so load its
         // persisted symbol dictionary to re-register delta frames -- but ONLY when
         // an existing, valid side-file loads. Absent / bad-magic (no dictionary
@@ -498,7 +590,8 @@ impl SfaFrameQueue {
         // truncating the load-bearing side-file.
         let persisted_symbol_dict = PersistedSymbolDict::open_recovered(&options.slot_dir)?;
         let delta_dict_enabled = persisted_symbol_dict.is_some();
-        let (active, sealed_segments, next_fsn, allocated_segment_bytes) = match recovered.segments
+        let had_recovered_segments = recovered_segments.is_some();
+        let (active, sealed_segments, next_fsn, allocated_segment_bytes) = match recovered_segments
         {
             Some(segments) => (
                 Some(Arc::new(SfaSharedSegment::new(segments.active))),
@@ -516,8 +609,12 @@ impl SfaFrameQueue {
         let first_unresolved =
             first_unresolved_fsn_from_optional_segments(&sealed_segments, active.as_ref())
                 .unwrap_or(next_fsn);
-        let recovered_completion =
-            recover_completed_upper(Some(&options.slot_dir), first_unresolved, next_fsn);
+        let recovered_completion = recover_completed_upper(
+            Some(&options.slot_dir),
+            first_unresolved,
+            next_fsn,
+            had_recovered_segments,
+        )?;
         let engine = Arc::new(SfaEngine {
             slot_dir: Some(options.slot_dir),
             max_bytes: options.max_bytes,
@@ -530,6 +627,7 @@ impl SfaFrameQueue {
                 hot_spare: None,
                 allocated_segment_bytes,
                 recovery_diagnostics,
+                manifest,
                 next_generation: 0,
                 closed: false,
             }),
@@ -587,8 +685,7 @@ impl SfaFrameQueue {
 
     pub(crate) fn close(&mut self) -> Result<(), SfaQueueError> {
         self.producer.take();
-        self.ack_watermark.take();
-        self.engine.close()
+        self.engine.close(&mut self.ack_watermark)
     }
 
     pub(crate) fn try_submit(&mut self, payload: &[u8]) -> Result<QwpReceipt, SfaQueueError> {
@@ -615,14 +712,16 @@ impl SfaFrameQueue {
         if after > before
             && let Some(ack_watermark) = self.ack_watermark.as_mut()
         {
-            ack_watermark.persist_completed_fsn(acked_fsn);
+            ack_watermark.write(acked_fsn as i64)?;
         }
         Ok(())
     }
 
     pub(crate) fn persist_completed_fsn(&mut self, fsn: u64) {
         if let Some(ack_watermark) = self.ack_watermark.as_mut() {
-            ack_watermark.persist_completed_fsn(fsn);
+            let _ = i64::try_from(fsn)
+                .ok()
+                .and_then(|fsn| ack_watermark.write(fsn).ok());
         }
     }
 
@@ -658,7 +757,8 @@ impl SfaFrameQueue {
         &mut self,
         allow_create: bool,
     ) -> Result<Option<SfaStorageStep>, SfaQueueError> {
-        self.engine.take_storage_maintenance_step(allow_create)
+        self.engine
+            .take_storage_maintenance_step(allow_create, self.ack_watermark.as_mut())
     }
 
     pub(crate) fn finish_storage_maintenance(
@@ -754,6 +854,12 @@ impl SfaProgressView {
 
     pub(crate) fn completed_fsn(&self) -> Option<u64> {
         self.engine.completed_fsn()
+    }
+
+    pub(crate) fn completion_reaches_published(&self, acked_fsn: u64) -> bool {
+        acked_fsn.checked_add(1).is_some_and(|target_upper| {
+            target_upper == self.engine.published_upper.load(Ordering::Acquire)
+        })
     }
 
     pub(crate) fn complete_through_fsn(&self, acked_fsn: u64) -> Result<bool, SfaQueueError> {
@@ -932,15 +1038,20 @@ impl SfaProducer {
                 reason: "producer active segment is not the engine active segment",
             });
         }
+        let previous_active_base = active.base_seq();
         let new_active = match state.hot_spare.take() {
             Some(mut new_active) => {
-                if let Some(shared) = Arc::get_mut(&mut new_active) {
-                    shared.rebase_empty(self.next_fsn)?;
+                let rebase_result = if let Some(shared) = Arc::get_mut(&mut new_active) {
+                    shared.rebase_empty(self.next_fsn)
                 } else {
                     state.hot_spare = Some(new_active);
                     return Err(SfaQueueError::CorruptSegments {
                         reason: "hot spare segment is shared before promotion",
                     });
+                };
+                if let Err(err) = rebase_result {
+                    state.hot_spare = Some(new_active);
+                    return Err(err.into());
                 }
                 new_active
             }
@@ -956,9 +1067,34 @@ impl SfaProducer {
                 .engine
                 .allocate_segment_inline(&mut state, self.next_fsn)?,
         };
+        #[cfg(test)]
+        if state.manifest.is_some() {
+            record_sfa_barrier(SfaBarrierEvent::RotationHeaderSynced);
+        }
 
+        let head_base = state
+            .sealed_segments
+            .front()
+            .map(|segment| segment.base_seq())
+            .unwrap_or(previous_active_base);
+        let manifest_update_error = state
+            .manifest
+            .as_mut()
+            .and_then(|manifest| manifest.update(head_base, self.next_fsn).err());
+        if let Some(err) = manifest_update_error {
+            state.hot_spare = Some(new_active);
+            return Err(err.into());
+        }
+        #[cfg(test)]
+        if state.manifest.is_some() {
+            record_sfa_barrier(SfaBarrierEvent::RotationManifestUpdated);
+        }
         let old_active = state.active.replace(Arc::clone(&new_active)).unwrap();
         state.sealed_segments.push_back(old_active);
+        #[cfg(test)]
+        if state.manifest.is_some() {
+            record_sfa_barrier(SfaBarrierEvent::RotationQueueMutated);
+        }
         drop(state);
 
         self.active = new_active;
@@ -975,15 +1111,45 @@ struct SfaSegmentsSnapshot {
 }
 
 impl SfaEngine {
-    fn close(&self) -> Result<(), SfaQueueError> {
-        let fully_drained = self.all_published_frames_resolved();
+    fn close(&self, ack_watermark: &mut Option<SfaAckWatermark>) -> Result<(), SfaQueueError> {
         let mut state = self.lock_state()?;
         if state.closed {
             return Ok(());
         }
+        let fully_drained = self.all_published_frames_resolved();
+        if fully_drained
+            && let Some(slot_dir) = self.slot_dir.as_deref()
+            && let Some(final_acked_fsn) = self.completed_fsn()
+        {
+            let watermark = ack_watermark
+                .as_mut()
+                .ok_or_else(|| SfaQueueError::Recovery {
+                    reason: "fully drained SFA slot has no ACK watermark".to_string(),
+                })?;
+            let final_acked_fsn =
+                i64::try_from(final_acked_fsn).map_err(|_| QueueError::SequenceOverflow)?;
+            watermark.write(final_acked_fsn)?;
+            #[cfg(test)]
+            record_sfa_barrier(SfaBarrierEvent::CloseWatermarkWritten);
+            watermark.sync_data()?;
+            #[cfg(test)]
+            record_sfa_barrier(SfaBarrierEvent::CloseWatermarkSynced);
+            sync_directory(slot_dir)?;
+            #[cfg(test)]
+            record_sfa_barrier(SfaBarrierEvent::CloseDirectorySynced);
+        }
+
         state.sealed_segments.clear();
         state.hot_spare.take();
         state.active.take();
+        state.manifest.take();
+        // The final covering barrier above is complete. Drop the watermark
+        // handle before unlinking it, matching the segment mapping teardown
+        // and keeping close portable to filesystems that reject deletion of an
+        // open file.
+        ack_watermark.take();
+        #[cfg(test)]
+        record_sfa_barrier(SfaBarrierEvent::CloseHandlesReleased);
         state.closed = true;
 
         if fully_drained && let Some(slot_dir) = self.slot_dir.as_deref() {
@@ -1082,13 +1248,82 @@ impl SfaEngine {
     fn take_storage_maintenance_step(
         &self,
         allow_create: bool,
+        ack_watermark: Option<&mut SfaAckWatermark>,
     ) -> Result<Option<SfaStorageStep>, SfaQueueError> {
+        let trim_candidate = {
+            let state = self.lock_state()?;
+            if state.closed {
+                return Ok(None);
+            }
+            self.trimmable_front(&state)?
+        };
+        if let Some(candidate) = trim_candidate {
+            if let Some(slot_dir) = self.slot_dir.as_deref() {
+                let acked_fsn = self.completed_fsn().ok_or(SfaQueueError::CorruptSegments {
+                    reason: "trimmable segment exists without a completed FSN",
+                })?;
+                let acked_fsn =
+                    i64::try_from(acked_fsn).map_err(|_| QueueError::SequenceOverflow)?;
+                let watermark = ack_watermark.ok_or_else(|| SfaQueueError::Recovery {
+                    reason: "cannot durably trim SFA segments without an ACK watermark".to_string(),
+                })?;
+                watermark.write(acked_fsn)?;
+                #[cfg(test)]
+                record_sfa_barrier(SfaBarrierEvent::TrimWatermarkWritten);
+                watermark.sync_data()?;
+                #[cfg(test)]
+                record_sfa_barrier(SfaBarrierEvent::TrimWatermarkSynced);
+                sync_directory(slot_dir)?;
+                #[cfg(test)]
+                record_sfa_barrier(SfaBarrierEvent::TrimDirectorySynced);
+            }
+
+            let mut state = self.lock_state()?;
+            if state.closed {
+                return Ok(None);
+            }
+            let Some(front) = state.sealed_segments.front() else {
+                return Ok(None);
+            };
+            if !Arc::ptr_eq(front, &candidate) || self.trimmable_front(&state)?.is_none() {
+                return Ok(None);
+            }
+            if self.slot_dir.is_some() {
+                let active_base = state
+                    .active
+                    .as_ref()
+                    .ok_or(SfaQueueError::Closed)?
+                    .base_seq();
+                let new_head_base = state
+                    .sealed_segments
+                    .get(1)
+                    .map(|segment| segment.base_seq())
+                    .unwrap_or(active_base);
+                let manifest = state
+                    .manifest
+                    .as_mut()
+                    .ok_or_else(|| SfaQueueError::Recovery {
+                        reason: "cannot trim a manifested SFA slot without its manifest"
+                            .to_string(),
+                    })?;
+                manifest.update(new_head_base, active_base)?;
+                #[cfg(test)]
+                record_sfa_barrier(SfaBarrierEvent::TrimManifestUpdated);
+            }
+            let segment = state.sealed_segments.pop_front().unwrap();
+            #[cfg(test)]
+            if self.slot_dir.is_some() {
+                record_sfa_barrier(SfaBarrierEvent::TrimQueuePopped);
+            }
+            state.allocated_segment_bytes = state
+                .allocated_segment_bytes
+                .saturating_sub(segment.size_bytes());
+            return Ok(Some(SfaStorageStep::Trim(SfaStorageCleanup::new(segment))));
+        }
+
         let mut state = self.lock_state()?;
         if state.closed {
             return Ok(None);
-        }
-        if let Some(step) = self.take_one_acked_sealed_segment(&mut state)? {
-            return Ok(Some(step));
         }
         if !allow_create || !self.allow_segment_creation || state.hot_spare.is_some() {
             return Ok(None);
@@ -1251,11 +1486,12 @@ impl SfaEngine {
         let segment = match self.slot_dir.as_deref() {
             Some(slot_dir) => {
                 let path = next_segment_path(slot_dir, &mut state.next_generation)?;
-                SfaSegment::create_new(
+                create_manifested_segment(
                     &path,
                     base_seq,
                     self.segment_size_bytes,
                     unix_time_micros(),
+                    slot_dir,
                 )?
             }
             None => {
@@ -1273,10 +1509,10 @@ impl SfaEngine {
         Ok(Arc::new(SfaSharedSegment::new(segment)))
     }
 
-    fn take_one_acked_sealed_segment(
+    fn trimmable_front(
         &self,
-        state: &mut SfaEngineState,
-    ) -> Result<Option<SfaStorageStep>, SfaQueueError> {
+        state: &SfaEngineState,
+    ) -> Result<Option<Arc<SfaSharedSegment>>, SfaQueueError> {
         let Some(acked_fsn) = self.completed_fsn() else {
             return Ok(None);
         };
@@ -1289,11 +1525,7 @@ impl SfaEngine {
         if last_fsn > acked_fsn {
             return Ok(None);
         }
-        let segment = state.sealed_segments.pop_front().unwrap();
-        state.allocated_segment_bytes = state
-            .allocated_segment_bytes
-            .saturating_sub(segment.size_bytes());
-        Ok(Some(SfaStorageStep::Trim(SfaStorageCleanup::new(segment))))
+        Ok(Some(Arc::clone(segment)))
     }
 
     fn all_published_frames_resolved(&self) -> bool {
@@ -1364,6 +1596,7 @@ impl SfaSharedSegment {
 
     fn rebase_empty(&mut self, base_seq: u64) -> Result<(), SfaSegmentError> {
         self.segment.rebase_empty(base_seq)?;
+        self.segment.sync_header()?;
         self.published_frame_count.store(0, Ordering::Relaxed);
         self.published_offset
             .store(HEADER_SIZE as u64, Ordering::Release);
@@ -1509,15 +1742,8 @@ struct RecoveredSegments {
 #[derive(Debug)]
 struct RecoveredState {
     segments: Option<RecoveredSegments>,
+    manifest: Option<SfManifest>,
     diagnostics: Vec<SfaRecoveryDiagnostic>,
-}
-
-impl RecoveredState {
-    fn has_skipped_segments(&self) -> bool {
-        self.diagnostics
-            .iter()
-            .any(|diagnostic| matches!(diagnostic, SfaRecoveryDiagnostic::SkippedSegment { .. }))
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1552,168 +1778,63 @@ struct RecoveredCompletion {
     ack_watermark: Option<SfaAckWatermark>,
 }
 
-/// The persisted ACK watermark record, kept via plain positional file I/O —
-/// deliberately never mmap'd. The record is a best-effort recovery hint
-/// (recovery falls back to the segments' own completed upper), so a failing
-/// file must degrade to "stop persisting", not SIGBUS the host on a write
-/// fault (ENOSPC into a sparse page, unreadable sector after a power loss).
-struct SfaAckWatermark {
-    file: File,
-    valid: bool,
-    /// Latched on the first failed write so a broken file is not re-poked on
-    /// every trim; the in-memory queue state remains authoritative.
-    disabled: bool,
-}
-
-impl std::fmt::Debug for SfaAckWatermark {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("SfaAckWatermark").finish_non_exhaustive()
-    }
-}
-
-impl SfaAckWatermark {
-    fn open(slot_dir: &Path) -> Option<Self> {
-        let path = ack_watermark_path(slot_dir);
-        let file = OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .read(true)
-            .write(true)
-            .open(path)
-            .ok()?;
-        if file.metadata().ok()?.len() < ACK_WATERMARK_SIZE {
-            // Write real zeroes rather than `set_len`: an explicit write
-            // allocates the record's blocks up front, so a full disk fails
-            // here (where `open` already degrades to `None`) instead of at
-            // some later persist.
-            write_all_at(&file, &[0u8; ACK_WATERMARK_SIZE as usize], 0).ok()?;
-        }
-        let valid = Self::read_record(&file).is_some();
-        Some(Self {
-            file,
-            valid,
-            disabled: false,
-        })
-    }
-
-    fn read_record(file: &File) -> Option<u64> {
-        let mut record = [0u8; ACK_WATERMARK_SIZE as usize];
-        read_exact_at(file, &mut record, 0).ok()?;
-        decode_ack_watermark(&record)
-    }
-
-    fn recovered_fsn(&self) -> Option<u64> {
-        Self::read_record(&self.file)
-    }
-
-    fn invalidate(&mut self) {
-        // Best-effort: a failed zeroing is safe because the recovery check
-        // that requested this invalidation re-detects the bogus record on
-        // the next recovery too.
-        self.write_at(0, &0u32.to_le_bytes());
-        self.valid = false;
-    }
-
-    fn persist_completed_fsn(&mut self, fsn: u64) {
-        let Ok(fsn) = i64::try_from(fsn) else {
-            return;
-        };
-        // FSN first, magic last: the record only becomes decodable once the
-        // FSN bytes are in place, matching the previous mmap store ordering.
-        self.write_at(8, &fsn.to_le_bytes());
-        if !self.valid && !self.disabled {
-            self.write_at(4, &0u32.to_le_bytes());
-            self.write_at(0, &ACK_WATERMARK_MAGIC.to_le_bytes());
-            self.valid = !self.disabled;
-        }
-    }
-
-    fn write_at(&mut self, offset: u64, bytes: &[u8]) {
-        if self.disabled {
-            return;
-        }
-        if write_all_at(&self.file, bytes, offset).is_err() {
-            self.disabled = true;
-        }
-    }
-}
-
 fn recover_completed_upper(
     slot_dir: Option<&Path>,
     segment_completed_upper: u64,
     published_upper: u64,
-) -> RecoveredCompletion {
+    require_existing_watermark: bool,
+) -> Result<RecoveredCompletion, SfaQueueError> {
     let Some(slot_dir) = slot_dir else {
-        return RecoveredCompletion {
+        return Ok(RecoveredCompletion {
             completed_upper: segment_completed_upper,
             ack_watermark: None,
-        };
+        });
     };
-    let mut ack_watermark = SfaAckWatermark::open(slot_dir);
-    let completed_upper = if let Some(ack_watermark) = ack_watermark.as_mut() {
-        match ack_watermark.recovered_fsn() {
-            Some(acked_fsn) => match ack_watermark_completed_upper(acked_fsn, published_upper) {
-                Some(upper) => segment_completed_upper.max(upper),
-                None => {
-                    ack_watermark.invalidate();
-                    segment_completed_upper
-                }
-            },
-            None => segment_completed_upper,
-        }
-    } else {
-        segment_completed_upper
+    let mut ack_watermark = SfaAckWatermark::open(slot_dir, require_existing_watermark)?;
+    let completed_upper = match ack_watermark.read()? {
+        Some(acked_fsn) => match ack_watermark_completed_upper(acked_fsn, published_upper) {
+            Some(upper) => segment_completed_upper.max(upper),
+            None => {
+                let segment_floor_fsn = segment_completed_upper
+                    .checked_sub(1)
+                    .and_then(|fsn| i64::try_from(fsn).ok())
+                    .unwrap_or(-1);
+                ack_watermark.write(segment_floor_fsn)?;
+                segment_completed_upper
+            }
+        },
+        None => segment_completed_upper,
     };
-    RecoveredCompletion {
+    Ok(RecoveredCompletion {
         completed_upper,
-        ack_watermark,
-    }
+        ack_watermark: Some(ack_watermark),
+    })
 }
 
-fn decode_ack_watermark(bytes: &[u8]) -> Option<u64> {
-    if bytes.len() < ACK_WATERMARK_SIZE as usize {
-        return None;
+fn ack_watermark_completed_upper(acked_fsn: i64, published_upper: u64) -> Option<u64> {
+    if acked_fsn == -1 {
+        return Some(0);
     }
-    let magic = read_ack_u32(bytes, 0);
-    let reserved = read_ack_u32(bytes, 4);
-    let fsn = read_ack_i64(bytes, 8);
-    if magic != ACK_WATERMARK_MAGIC || reserved != 0 || fsn < 0 {
-        return None;
-    }
-    Some(fsn as u64)
-}
-
-fn ack_watermark_completed_upper(acked_fsn: u64, published_upper: u64) -> Option<u64> {
-    let published_fsn = published_upper.checked_sub(1)?;
-    if acked_fsn > published_fsn {
+    let acked_fsn = u64::try_from(acked_fsn).ok()?;
+    if acked_fsn >= published_upper {
         return None;
     }
     acked_fsn.checked_add(1)
 }
 
-fn read_ack_u32(bytes: &[u8], offset: usize) -> u32 {
-    u32::from_le_bytes(bytes[offset..offset + 4].try_into().unwrap())
-}
-
-fn read_ack_i64(bytes: &[u8], offset: usize) -> i64 {
-    i64::from_le_bytes(bytes[offset..offset + 8].try_into().unwrap())
-}
-
-fn ack_watermark_path(slot_dir: &Path) -> PathBuf {
-    slot_dir.join(ACK_WATERMARK_FILE_NAME)
-}
-
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct RecoveredSegment {
     path: PathBuf,
     base_seq: u64,
     frame_count: u64,
     append_offset: u64,
     torn_tail_bytes: u64,
+    manifest_required: bool,
 }
 
 fn recover_segments(options: &SfaQueueOptions) -> Result<RecoveredState, SfaQueueError> {
-    let mut segments = Vec::new();
+    let mut all = Vec::new();
+    let mut corrupt_paths = Vec::new();
     let mut diagnostics = Vec::new();
 
     for entry in fs::read_dir(&options.slot_dir)? {
@@ -1725,30 +1846,20 @@ fn recover_segments(options: &SfaQueueOptions) -> Result<RecoveredState, SfaQueu
 
         let scan = match scan_file_metadata(&path) {
             Ok(scan) => scan,
-            // An IO error means the segment could not be read, not that it is
-            // absent — skipping it would silently drop a committed tail the
-            // between-segments contiguity check cannot detect as missing.
-            Err(err @ SfaSegmentError::Io(_)) => return Err(err.into()),
+            // Operational failures and unknown versions may describe an intact
+            // load-bearing segment. Excluding one would silently drop frames.
+            Err(err @ (SfaSegmentError::Io(_) | SfaSegmentError::UnsupportedVersion { .. })) => {
+                return Err(err.into());
+            }
             Err(err) => {
                 diagnostics.push(SfaRecoveryDiagnostic::SkippedSegment {
                     path: path.clone(),
                     error: format!("{err:?}"),
                 });
+                corrupt_paths.push(path);
                 continue;
             }
         };
-        if scan.frame_count == 0 {
-            if scan.torn_tail_bytes == 0 {
-                match fs::remove_file(&path) {
-                    Ok(()) => {}
-                    Err(err) if err.kind() == io::ErrorKind::NotFound => {}
-                    Err(err) => return Err(err.into()),
-                }
-            } else {
-                quarantine_segment(&path);
-            }
-            continue;
-        }
         if scan.first_empty_payload_fsn.is_some() {
             return Err(SfaQueueError::CorruptSegments {
                 reason: "empty recovered frame payload",
@@ -1765,44 +1876,188 @@ fn recover_segments(options: &SfaQueueOptions) -> Result<RecoveredState, SfaQueu
             });
         }
 
-        segments.push(RecoveredSegment {
+        all.push(RecoveredSegment {
             path,
             base_seq: scan.header.base_seq,
             frame_count: scan.frame_count,
             append_offset: scan.append_offset,
             torn_tail_bytes: scan.torn_tail_bytes,
+            manifest_required: scan.manifest_required,
         });
     }
 
-    if segments.is_empty() {
+    let mut manifest = SfManifest::open(&options.slot_dir)?;
+    if all.is_empty() {
+        if !corrupt_paths.is_empty() {
+            if manifest.is_some() {
+                return Err(recovery_error(
+                    "every SFA segment is corrupt but the manifest references durable state",
+                ));
+            }
+            quarantine_paths(&corrupt_paths);
+        }
+        if let Some(existing) = manifest.take() {
+            if existing.head_base() != existing.active_base() {
+                return Err(recovery_error(
+                    "SF manifest references durable state but no segment files exist",
+                ));
+            }
+            drop(existing);
+            SfManifest::remove_file(&options.slot_dir)?;
+        }
+        SfaAckWatermark::remove_file(&options.slot_dir)?;
         return Ok(RecoveredState {
             segments: None,
+            manifest: None,
             diagnostics,
         });
     }
 
-    segments.sort_by_key(|segment| segment.base_seq);
-    validate_contiguous_segments(&segments)?;
+    let requires_manifest = all.iter().any(|segment| segment.manifest_required);
+    if manifest.is_none() && requires_manifest {
+        return Err(recovery_error(
+            "new-format SFA segment exists but sf-manifest.bin is missing",
+        ));
+    }
 
-    let mut sealed_segments = VecDeque::new();
+    let mut data: Vec<RecoveredSegment> = all
+        .iter()
+        .filter(|segment| segment.frame_count > 0)
+        .cloned()
+        .collect();
+    data.sort_by_key(|segment| segment.base_seq);
+    let mut chain = Vec::new();
+    let legacy = manifest.is_none();
+    if legacy {
+        if data.is_empty() {
+            let Some(active) = choose_legacy_empty(&all) else {
+                cleanup_recovered_extras(&options.slot_dir, &all, &[], &mut diagnostics);
+                quarantine_paths(&corrupt_paths);
+                SfaAckWatermark::remove_file(&options.slot_dir)?;
+                return Ok(RecoveredState {
+                    segments: None,
+                    manifest: None,
+                    diagnostics,
+                });
+            };
+            chain.push(active.clone());
+        } else {
+            validate_contiguous_segments(&data)?;
+            chain = data;
+        }
+    } else {
+        let existing = manifest.as_ref().unwrap();
+        let head_base = existing.head_base();
+        let active_base = existing.active_base();
+        for segment in data {
+            let end = segment
+                .base_seq
+                .checked_add(segment.frame_count)
+                .ok_or(QueueError::SequenceOverflow)?;
+            if segment.base_seq < head_base {
+                if end > head_base {
+                    return Err(recovery_error(
+                        "segment overlaps committed SFA head boundary",
+                    ));
+                }
+                continue;
+            }
+            if segment.base_seq > active_base {
+                return Err(recovery_error(
+                    "segment exists beyond committed SFA active boundary",
+                ));
+            }
+            chain.push(segment);
+        }
+        if !chain.is_empty() {
+            validate_contiguous_segments(&chain)?;
+            if chain[0].base_seq != head_base {
+                return Err(recovery_error(
+                    "missing expected SFA head segment at the committed boundary",
+                ));
+            }
+        }
+
+        let active = find_manifest_active(&all, active_base);
+        let Some(active) = active else {
+            if chain.is_empty() && head_base == active_base && corrupt_paths.is_empty() {
+                cleanup_recovered_extras(&options.slot_dir, &all, &[], &mut diagnostics);
+                drop(manifest.take());
+                SfManifest::remove_file(&options.slot_dir)?;
+                SfaAckWatermark::remove_file(&options.slot_dir)?;
+                PersistedSymbolDict::remove_orphan(&options.slot_dir);
+                return Ok(RecoveredState {
+                    segments: None,
+                    manifest: None,
+                    diagnostics,
+                });
+            }
+            return Err(recovery_error(
+                "missing expected SFA active segment at the committed boundary",
+            ));
+        };
+        if chain.is_empty() {
+            if head_base != active_base || active.frame_count != 0 || !corrupt_paths.is_empty() {
+                return Err(recovery_error(
+                    "missing SFA chain between committed boundaries",
+                ));
+            }
+            chain.push(active.clone());
+        } else if chain.last().is_none_or(|tail| tail.path != active.path) {
+            let tail = chain.last().unwrap();
+            let chain_end = tail
+                .base_seq
+                .checked_add(tail.frame_count)
+                .ok_or(QueueError::SequenceOverflow)?;
+            if corrupt_paths.is_empty() && active.frame_count == 0 && active.base_seq == chain_end {
+                chain.push(active.clone());
+            } else {
+                return Err(recovery_error(
+                    "missing expected SFA active or tail segment",
+                ));
+            }
+        }
+    }
+
+    let mut opened = Vec::with_capacity(chain.len());
+    for segment in &chain {
+        opened.push(SfaSegment::open_existing(&segment.path)?);
+    }
+    if legacy {
+        sanitize_sealed_residue(&mut opened, false)?;
+        let head_base = opened.first().unwrap().header().base_seq;
+        let active_base = opened.last().unwrap().header().base_seq;
+        manifest = Some(SfManifest::create(
+            &options.slot_dir,
+            head_base,
+            active_base,
+        )?);
+    } else {
+        sanitize_sealed_residue(&mut opened, true)?;
+    }
+    for segment in &mut opened {
+        segment.mark_manifest_required()?;
+    }
+
+    cleanup_recovered_extras(&options.slot_dir, &all, &chain, &mut diagnostics);
+    quarantine_paths(&corrupt_paths);
+    opened.last_mut().unwrap().sanitize_torn_tail()?;
+
+    let active = opened.pop().unwrap();
+    let sealed_segments = VecDeque::from(opened);
     let mut allocated_segment_bytes = 0u64;
-    let active_index = segments.len() - 1;
-    for segment in segments.iter().take(active_index) {
-        let opened = SfaSegment::open_existing(&segment.path)?;
+    for opened in &sealed_segments {
         allocated_segment_bytes = allocated_segment_bytes
             .checked_add(opened.size_bytes())
             .ok_or(QueueError::SequenceOverflow)?;
-        sealed_segments.push_back(opened);
     }
-
-    let active = SfaSegment::open_existing(&segments[active_index].path)?;
     allocated_segment_bytes = allocated_segment_bytes
         .checked_add(active.size_bytes())
         .ok_or(QueueError::SequenceOverflow)?;
     let next_fsn = active
         .last_fsn()
         .and_then(|fsn| fsn.checked_add(1))
-        .ok_or(QueueError::SequenceOverflow)?;
+        .unwrap_or(active.header().base_seq);
     Ok(RecoveredState {
         segments: Some(RecoveredSegments {
             active,
@@ -1811,8 +2066,109 @@ fn recover_segments(options: &SfaQueueOptions) -> Result<RecoveredState, SfaQueu
             next_generation: scan_next_generation(&options.slot_dir)?,
             allocated_segment_bytes,
         }),
+        manifest,
         diagnostics,
     })
+}
+
+fn recovery_error(reason: &'static str) -> SfaQueueError {
+    SfaQueueError::Recovery {
+        reason: reason.to_string(),
+    }
+}
+
+fn choose_legacy_empty(all: &[RecoveredSegment]) -> Option<&RecoveredSegment> {
+    let mut selected = None;
+    for segment in all {
+        if segment.frame_count != 0 || segment.torn_tail_bytes != 0 {
+            continue;
+        }
+        if selected.is_none()
+            || segment
+                .path
+                .file_name()
+                .is_some_and(|name| name == INITIAL_SEGMENT_FILE_NAME)
+        {
+            selected = Some(segment);
+        }
+    }
+    selected
+}
+
+fn find_manifest_active(all: &[RecoveredSegment], active_base: u64) -> Option<&RecoveredSegment> {
+    let mut torn_empty = None;
+    let mut clean_empty = None;
+    for segment in all {
+        if segment.base_seq != active_base {
+            continue;
+        }
+        if segment.frame_count > 0 {
+            return Some(segment);
+        }
+        if segment.torn_tail_bytes > 0 {
+            torn_empty.get_or_insert(segment);
+        } else {
+            clean_empty.get_or_insert(segment);
+        }
+    }
+    torn_empty.or(clean_empty)
+}
+
+fn sanitize_sealed_residue(
+    chain: &mut [SfaSegment],
+    fail_closed_on_sight: bool,
+) -> Result<(), SfaQueueError> {
+    let mut first_torn_path = None;
+    let sealed_len = chain.len().saturating_sub(1);
+    for segment in &mut chain[..sealed_len] {
+        if segment.torn_tail_bytes() == 0 {
+            continue;
+        }
+        let path = segment.path().map(Path::to_path_buf);
+        segment.sanitize_torn_tail()?;
+        if first_torn_path.is_none() {
+            first_torn_path = path;
+        }
+    }
+    if fail_closed_on_sight && let Some(path) = first_torn_path {
+        return Err(SfaQueueError::SanitizedResidue { path });
+    }
+    Ok(())
+}
+
+fn cleanup_recovered_extras(
+    slot_dir: &Path,
+    all: &[RecoveredSegment],
+    chain: &[RecoveredSegment],
+    diagnostics: &mut Vec<SfaRecoveryDiagnostic>,
+) {
+    for segment in all {
+        if chain.iter().any(|retained| retained.path == segment.path) {
+            continue;
+        }
+        if segment.torn_tail_bytes > 0 {
+            quarantine_segment(&segment.path);
+            continue;
+        }
+        if let Err(err) = remove_file_if_exists(&segment.path) {
+            diagnostics.push(SfaRecoveryDiagnostic::CleanupFailed {
+                path: segment.path.clone(),
+                error: err.to_string(),
+            });
+        }
+    }
+    if let Err(err) = sync_directory(slot_dir) {
+        diagnostics.push(SfaRecoveryDiagnostic::CleanupFailed {
+            path: slot_dir.to_path_buf(),
+            error: err.to_string(),
+        });
+    }
+}
+
+fn quarantine_paths(paths: &[PathBuf]) {
+    for path in paths {
+        quarantine_segment(path);
+    }
 }
 
 fn validate_options(options: &SfaQueueOptions) -> Result<(), SfaQueueError> {
@@ -1895,6 +2251,72 @@ fn next_segment_path(slot_dir: &Path, next_generation: &mut u64) -> Result<PathB
     Ok(spare_segment_path(slot_dir, generation))
 }
 
+fn create_manifested_segment(
+    path: &Path,
+    base_seq: u64,
+    size_bytes: u64,
+    created_us: u64,
+    slot_dir: &Path,
+) -> Result<SfaSegment, SfaQueueError> {
+    let segment = SfaSegment::create_new_manifested(path, base_seq, size_bytes, created_us)?;
+    if let Err(err) = segment
+        .sync_header()
+        .map_err(SfaQueueError::from)
+        .and_then(|()| sync_directory(slot_dir).map_err(SfaQueueError::from))
+    {
+        drop(segment);
+        let _ = remove_file_if_exists(path);
+        let _ = sync_directory(slot_dir);
+        return Err(err);
+    }
+    Ok(segment)
+}
+
+fn create_fresh_manifested_segment(
+    path: &Path,
+    size_bytes: u64,
+    created_us: u64,
+    slot_dir: &Path,
+) -> Result<(SfaSegment, SfManifest), SfaQueueError> {
+    // A manifest-required flag is a durable promise that the manifest exists.
+    // Publish a valid unflagged segment first so every fresh-start crash
+    // window is recoverable: legacy before the manifest, manifested after it.
+    let mut segment = SfaSegment::create_new(path, 0, size_bytes, created_us)?;
+    if let Err(err) = segment
+        .sync_header()
+        .map_err(SfaQueueError::from)
+        .and_then(|()| sync_directory(slot_dir).map_err(SfaQueueError::from))
+    {
+        drop(segment);
+        let _ = remove_file_if_exists(path);
+        let _ = sync_directory(slot_dir);
+        return Err(err);
+    }
+    let manifest = match SfManifest::create(slot_dir, 0, 0) {
+        Ok(manifest) => manifest,
+        Err(err) => {
+            drop(segment);
+            let _ = remove_file_if_exists(path);
+            let _ = sync_directory(slot_dir);
+            return Err(err.into());
+        }
+    };
+    if let Err(err) = segment.mark_manifest_required() {
+        drop(segment);
+        // Remove the segment before its manifest. If the unlink fails, the
+        // retained manifest still satisfies a partially-stamped flag and
+        // lets recovery retry safely.
+        let segment_removed = remove_file_if_exists(path).is_ok();
+        drop(manifest);
+        if segment_removed {
+            let _ = SfManifest::remove_file(slot_dir);
+        }
+        let _ = sync_directory(slot_dir);
+        return Err(err.into());
+    }
+    Ok((segment, manifest))
+}
+
 fn scan_next_generation(slot_dir: &Path) -> Result<u64, io::Error> {
     let mut max_generation: Option<u64> = None;
     for entry in fs::read_dir(slot_dir)? {
@@ -1953,46 +2375,173 @@ fn record_all_sfa_cleanup(
     let dir_iter = match fs::read_dir(slot_dir) {
         Ok(iter) => iter,
         Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(()),
-        Err(err) => return Err(err.into()),
+        Err(err) => {
+            diagnostics.push(SfaRecoveryDiagnostic::CleanupFailed {
+                path: slot_dir.to_path_buf(),
+                error: format!("could not enumerate SFA slot: {err}"),
+            });
+            return Ok(());
+        }
     };
-    let mut cleanup_failed = false;
-    for entry in dir_iter {
-        let entry = entry?;
-        let path = entry.path();
+    let entries = dir_iter
+        .map(|entry| {
+            entry.map(|entry| {
+                (
+                    entry.file_name().to_string_lossy().into_owned(),
+                    entry.path(),
+                )
+            })
+        })
+        .collect();
+    record_all_sfa_cleanup_entries(slot_dir, diagnostics, entries)
+}
+
+fn record_all_sfa_cleanup_entries(
+    slot_dir: &Path,
+    diagnostics: &mut Vec<SfaRecoveryDiagnostic>,
+    entries: Vec<io::Result<(String, PathBuf)>>,
+) -> Result<(), SfaQueueError> {
+    let mut files = Vec::new();
+    for entry in entries {
+        let (name, path) = match entry {
+            Ok(entry) => entry,
+            Err(err) => {
+                // Enumeration must finish before the first unlink. The names
+                // collected so far are an unsafe partial view, so discard
+                // them and leave the slot intact for the next recovery.
+                diagnostics.push(SfaRecoveryDiagnostic::CleanupFailed {
+                    path: slot_dir.to_path_buf(),
+                    error: format!("could not fully enumerate SFA slot: {err}"),
+                });
+                return Ok(());
+            }
+        };
         if !is_sfa_file(&path) {
             continue;
         }
-        match fs::remove_file(&path) {
-            Ok(()) => {}
-            Err(err) if err.kind() == io::ErrorKind::NotFound => {}
-            Err(err) => {
-                cleanup_failed = true;
-                diagnostics.push(SfaRecoveryDiagnostic::CleanupFailed {
-                    path,
-                    error: err.to_string(),
-                });
-            }
+        files.push((name, path));
+    }
+    #[cfg(test)]
+    record_sfa_barrier(SfaBarrierEvent::CleanupEnumerationComplete);
+    files.sort_by(|(left_name, _), (right_name, _)| {
+        segment_cleanup_rank(left_name)
+            .cmp(&segment_cleanup_rank(right_name))
+            .then_with(|| left_name.cmp(right_name))
+    });
+
+    let manifest_file = manifest_path(slot_dir);
+    let manifest_existed = match manifest_file.try_exists() {
+        Ok(existed) => existed,
+        Err(err) => {
+            diagnostics.push(SfaRecoveryDiagnostic::CleanupFailed {
+                path: manifest_file,
+                error: format!("could not inspect SF manifest before cleanup: {err}"),
+            });
+            return Ok(());
+        }
+    };
+    let mut manifest = match SfManifest::open(slot_dir) {
+        Ok(manifest) => manifest,
+        Err(err) => {
+            diagnostics.push(SfaRecoveryDiagnostic::CleanupFailed {
+                path: manifest_file,
+                error: format!("could not open SF manifest before cleanup: {err}"),
+            });
+            return Ok(());
+        }
+    };
+    if manifest_existed && manifest.is_none() {
+        // `open` quarantined an invalid manifest. A flagged segment must never
+        // be deleted using an unknown boundary, even on a fully-drained close.
+        diagnostics.push(SfaRecoveryDiagnostic::CleanupFailed {
+            path: manifest_file,
+            error: "SF manifest was invalid; retaining all segment files".to_string(),
+        });
+        return Ok(());
+    }
+    if !files.is_empty()
+        && let Some(manifest) = manifest.as_mut()
+    {
+        let active_base = manifest.active_base();
+        if let Err(err) = manifest.update(active_base, active_base) {
+            diagnostics.push(SfaRecoveryDiagnostic::CleanupFailed {
+                path: manifest_file,
+                error: format!("could not collapse SF manifest before cleanup: {err}"),
+            });
+            return Ok(());
+        }
+        #[cfg(test)]
+        record_sfa_barrier(SfaBarrierEvent::CleanupManifestCollapsed);
+    }
+    drop(manifest);
+
+    for (_name, path) in files {
+        if let Err(err) = remove_file_if_exists(&path) {
+            diagnostics.push(SfaRecoveryDiagnostic::CleanupFailed {
+                path,
+                error: err.to_string(),
+            });
+            return Ok(());
+        }
+        #[cfg(test)]
+        record_sfa_barrier(SfaBarrierEvent::CleanupSegmentUnlinked(_name));
+    }
+    if let Err(err) = sync_directory(slot_dir) {
+        diagnostics.push(SfaRecoveryDiagnostic::CleanupFailed {
+            path: slot_dir.to_path_buf(),
+            error: err.to_string(),
+        });
+        return Ok(());
+    }
+    #[cfg(test)]
+    record_sfa_barrier(SfaBarrierEvent::CleanupDirectorySynced);
+
+    if let Err(err) = SfaAckWatermark::remove_file(slot_dir) {
+        diagnostics.push(SfaRecoveryDiagnostic::CleanupFailed {
+            path: ack_watermark_path(slot_dir),
+            error: err.to_string(),
+        });
+        return Ok(());
+    }
+    #[cfg(test)]
+    record_sfa_barrier(SfaBarrierEvent::CleanupWatermarkRemoved);
+    PersistedSymbolDict::remove_orphan(slot_dir);
+    match SfManifest::remove_file(slot_dir) {
+        Ok(()) => {
+            #[cfg(test)]
+            record_sfa_barrier(SfaBarrierEvent::CleanupManifestRemoved);
+        }
+        Err(err) => {
+            diagnostics.push(SfaRecoveryDiagnostic::CleanupFailed {
+                path: manifest_file,
+                error: err.to_string(),
+            });
         }
     }
-    if !cleanup_failed {
-        record_cleanup_remove_file(ack_watermark_path(slot_dir), diagnostics);
-        // The persisted symbol dictionary is slot state too: drop it alongside the
-        // watermark so a fully-drained slot leaves nothing behind. Best-effort --
-        // a leftover is meaningless without segments and is re-created cleanly (or
-        // removed as an orphan) on the next open.
-        PersistedSymbolDict::remove_orphan(slot_dir);
+    if let Err(err) = sync_directory(slot_dir) {
+        diagnostics.push(SfaRecoveryDiagnostic::CleanupFailed {
+            path: slot_dir.to_path_buf(),
+            error: format!("could not sync SFA slot after side-file cleanup: {err}"),
+        });
     }
     Ok(())
 }
 
-fn record_cleanup_remove_file(path: PathBuf, diagnostics: &mut Vec<SfaRecoveryDiagnostic>) {
-    match fs::remove_file(&path) {
-        Ok(()) => {}
-        Err(err) if err.kind() == io::ErrorKind::NotFound => {}
-        Err(err) => diagnostics.push(SfaRecoveryDiagnostic::CleanupFailed {
-            path,
-            error: err.to_string(),
-        }),
+fn remove_file_if_exists(path: &Path) -> io::Result<()> {
+    match fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(err),
+    }
+}
+
+fn segment_cleanup_rank(name: &str) -> (u8, u64) {
+    if name == INITIAL_SEGMENT_FILE_NAME {
+        return (0, 0);
+    }
+    match segment_generation(name) {
+        Some(generation) => (1, generation),
+        None => (2, 0),
     }
 }
 
@@ -2168,6 +2717,31 @@ mod tests {
     fn write_segment_with_one_frame(path: &Path, base_seq: u64, payload: &[u8]) {
         let mut segment = SfaSegment::create(path, base_seq, 256, 0).unwrap();
         segment.try_append(payload).unwrap();
+        let slot_dir = path.parent().unwrap();
+        if !ack_watermark_path(slot_dir).exists() {
+            write_ack_watermark(slot_dir, -1);
+        }
+    }
+
+    fn write_manifested_segment(path: &Path, base_seq: u64, payload: Option<&[u8]>) {
+        let mut segment = SfaSegment::create_new_manifested(path, base_seq, 256, 0).unwrap();
+        if let Some(payload) = payload {
+            segment.try_append(payload).unwrap();
+        }
+        segment.sync_header().unwrap();
+    }
+
+    fn write_torn_tail_byte(path: &Path) {
+        let append_offset = scan_file(path).unwrap().append_offset as usize;
+        let mut bytes = fs::read(path).unwrap();
+        bytes[append_offset] = 0xa5;
+        fs::write(path, bytes).unwrap();
+    }
+
+    fn create_manifested_slot(dir: &Path, head_base: u64, active_base: u64) {
+        let manifest = SfManifest::create(dir, head_base, active_base).unwrap();
+        drop(manifest);
+        write_ack_watermark(dir, -1);
     }
 
     fn write_bad_magic_segment(path: &Path) {
@@ -2177,20 +2751,28 @@ mod tests {
     }
 
     fn write_ack_watermark(dir: &Path, fsn: i64) {
-        write_ack_watermark_raw(dir, ACK_WATERMARK_MAGIC, 0, fsn);
+        let mut watermark = SfaAckWatermark::open(dir, false).unwrap();
+        watermark.write(fsn).unwrap();
+        watermark.sync_data().unwrap();
     }
 
-    fn write_ack_watermark_raw(dir: &Path, magic: u32, reserved: u32, fsn: i64) {
-        let mut bytes = [0u8; ACK_WATERMARK_SIZE as usize];
+    fn write_ack_watermark_raw(dir: &Path, magic: u32, version: u32, fsn: i64) {
+        let mut bytes = vec![0u8; super::super::qwp_ws_sfa_manifest::DUAL_SLOT_FILE_SIZE as usize];
         bytes[0..4].copy_from_slice(&magic.to_le_bytes());
-        bytes[4..8].copy_from_slice(&reserved.to_le_bytes());
-        bytes[8..16].copy_from_slice(&fsn.to_le_bytes());
+        bytes[4..8].copy_from_slice(&version.to_le_bytes());
+        bytes[8..16].copy_from_slice(&1i64.to_le_bytes());
+        bytes[16..24].copy_from_slice(&fsn.to_le_bytes());
+        let crc = crc32c::crc32c(&bytes[..60]);
+        bytes[60..64].copy_from_slice(&crc.to_le_bytes());
         fs::write(ack_watermark_path(dir), bytes).unwrap();
     }
 
     fn recovered_ack_watermark_fsn(dir: &Path) -> Option<u64> {
-        let bytes = fs::read(ack_watermark_path(dir)).unwrap();
-        decode_ack_watermark(&bytes)
+        let mut watermark = SfaAckWatermark::open(dir, true).unwrap();
+        watermark
+            .read()
+            .unwrap()
+            .and_then(|fsn| u64::try_from(fsn).ok())
     }
 
     #[test]
@@ -2339,7 +2921,8 @@ mod tests {
             queue.payload_vec_for_fsn(1).as_deref(),
             Some(&b"second"[..])
         );
-        assert!(bad_side_path.exists());
+        assert!(!bad_side_path.exists());
+        assert!(corrupt_segment_path(&bad_side_path).exists());
         assert!(matches!(
             queue.recovery_diagnostics().as_slice(),
             [SfaRecoveryDiagnostic::SkippedSegment { path, .. }]
@@ -2378,7 +2961,8 @@ mod tests {
         let err = SfaFrameQueue::open_replay_only(options(&dir)).unwrap_err();
 
         assert!(matches!(err, SfaQueueError::CorruptSegments { .. }));
-        assert!(bad_path.exists());
+        assert!(!bad_path.exists());
+        assert!(corrupt_segment_path(&bad_path).exists());
     }
 
     fn decode_hex_fixture(hex: &str) -> Vec<u8> {
@@ -2409,6 +2993,13 @@ mod tests {
         let generation_zero = spare_segment_path(dir.path(), 0);
         assert!(generation_zero.exists());
         assert!(!initial_segment_path(dir.path()).exists());
+        assert!(manifest_path(dir.path()).exists());
+        assert!(ack_watermark_path(dir.path()).exists());
+        assert!(
+            scan_file_metadata(&generation_zero)
+                .unwrap()
+                .manifest_required
+        );
 
         assert_eq!(queue.try_submit(b"first").unwrap(), QwpReceipt { fsn: 0 });
         assert_eq!(queue.try_submit(b"second").unwrap(), QwpReceipt { fsn: 1 });
@@ -2418,6 +3009,56 @@ mod tests {
         assert_eq!(scan.header.base_seq, 0);
         assert_eq!(scan.frames[0].payload, b"first");
         assert_eq!(scan.frames[1].payload, b"second");
+    }
+
+    #[test]
+    fn fresh_creation_crash_windows_recover_before_and_after_manifest_publication() {
+        // Crash after the initial segment is durable but before the manifest:
+        // legacy recovery creates the manifest and stamps the promise flag.
+        let before_manifest = TempDir::new().unwrap();
+        let before_path = spare_segment_path(before_manifest.path(), 0);
+        let segment = SfaSegment::create_new(&before_path, 0, 256, 0).unwrap();
+        segment.sync_header().unwrap();
+        drop(segment);
+        sync_directory(before_manifest.path()).unwrap();
+        write_ack_watermark(before_manifest.path(), -1);
+
+        drop(open(&before_manifest));
+        assert!(
+            scan_file_metadata(&before_path).unwrap().manifest_required,
+            "legacy recovery must finish the interrupted fresh-slot migration"
+        );
+        assert!(manifest_path(before_manifest.path()).exists());
+
+        // Crash after manifest publication but before flag stamping: the
+        // manifest path accepts the unflagged active and finishes the stamp.
+        let before_flag = TempDir::new().unwrap();
+        let before_flag_path = spare_segment_path(before_flag.path(), 0);
+        let segment = SfaSegment::create_new(&before_flag_path, 0, 256, 0).unwrap();
+        segment.sync_header().unwrap();
+        drop(segment);
+        sync_directory(before_flag.path()).unwrap();
+        drop(SfManifest::create(before_flag.path(), 0, 0).unwrap());
+        write_ack_watermark(before_flag.path(), -1);
+
+        drop(open(&before_flag));
+        assert!(
+            scan_file_metadata(&before_flag_path)
+                .unwrap()
+                .manifest_required,
+            "manifest recovery must finish an interrupted flag stamp"
+        );
+
+        // A manifest whose first segment dirent never reached disk is the
+        // recognized collapsed empty window and starts a new generation.
+        let manifest_only = TempDir::new().unwrap();
+        drop(SfManifest::create(manifest_only.path(), 0, 0).unwrap());
+        write_ack_watermark(manifest_only.path(), -1);
+
+        let queue = open(&manifest_only);
+        assert_eq!(queue.published_fsn(), None);
+        assert_eq!(sfa_file_count(manifest_only.path()), 2);
+        assert!(manifest_path(manifest_only.path()).exists());
     }
 
     #[test]
@@ -2441,6 +3082,7 @@ mod tests {
             decode_hex_fixture(JAVA_TWO_FRAME_FIXTURE_HEX),
         )
         .unwrap();
+        write_ack_watermark(dir.path(), -1);
 
         let queue = open(&dir);
 
@@ -2453,6 +3095,174 @@ mod tests {
             queue.payload_vec_for_fsn(43).as_deref(),
             Some(&b"two-two"[..])
         );
+    }
+
+    #[test]
+    fn legacy_slot_migration_creates_manifest_stamps_flags_and_resets_watermark() {
+        let dir = TempDir::new().unwrap();
+        let initial = initial_segment_path(dir.path());
+        fs::write(&initial, decode_hex_fixture(JAVA_TWO_FRAME_FIXTURE_HEX)).unwrap();
+        // The pre-milestone Rust watermark was a 16-byte, CRC-less record.
+        fs::write(ack_watermark_path(dir.path()), [0u8; 16]).unwrap();
+
+        let queue = open(&dir);
+
+        assert_eq!(queue.oldest_unresolved_fsn(), Some(42));
+        assert_eq!(queue.payload_vec_for_fsn(42).as_deref(), Some(&b"one"[..]));
+        let manifest = SfManifest::open(dir.path()).unwrap().unwrap();
+        assert_eq!(manifest.head_base(), 42);
+        assert_eq!(manifest.active_base(), 42);
+        assert!(
+            scan_file_metadata(&initial).unwrap().manifest_required,
+            "migration must stamp the durable manifest promise"
+        );
+        assert_eq!(
+            fs::metadata(ack_watermark_path(dir.path())).unwrap().len(),
+            super::super::qwp_ws_sfa_manifest::DUAL_SLOT_FILE_SIZE
+        );
+        let mut watermark = SfaAckWatermark::open(dir.path(), true).unwrap();
+        assert_eq!(watermark.read().unwrap(), None);
+    }
+
+    #[test]
+    fn manifested_segments_fail_closed_when_the_manifest_disappears() {
+        let dir = TempDir::new().unwrap();
+        {
+            let mut queue = open(&dir);
+            queue.try_submit(b"unresolved").unwrap();
+        }
+        fs::remove_file(manifest_path(dir.path())).unwrap();
+
+        let err = SfaFrameQueue::open(options(&dir)).unwrap_err();
+        assert!(matches!(
+            err,
+            SfaQueueError::Recovery { reason }
+                if reason.contains("sf-manifest.bin is missing")
+        ));
+    }
+
+    #[test]
+    fn manifested_sealed_torn_tail_is_sanitized_then_fails_once() {
+        let dir = TempDir::new().unwrap();
+        let sealed = spare_segment_path(dir.path(), 0);
+        let active = spare_segment_path(dir.path(), 1);
+        write_manifested_segment(&sealed, 0, Some(b"sealed"));
+        write_torn_tail_byte(&sealed);
+        write_manifested_segment(&active, 1, None);
+        create_manifested_slot(dir.path(), 0, 1);
+
+        let err = SfaFrameQueue::open(options(&dir)).unwrap_err();
+        assert!(matches!(
+            err,
+            SfaQueueError::SanitizedResidue { path } if path == sealed
+        ));
+        assert_eq!(scan_file(&sealed).unwrap().torn_tail_bytes, 0);
+
+        let reopened = open(&dir);
+        assert_eq!(
+            reopened.payload_vec_for_fsn(0).as_deref(),
+            Some(&b"sealed"[..])
+        );
+        assert_eq!(reopened.oldest_unresolved_fsn(), Some(0));
+    }
+
+    #[test]
+    fn manifested_active_torn_tail_is_sanitized_without_the_one_time_failure() {
+        let dir = TempDir::new().unwrap();
+        let active = spare_segment_path(dir.path(), 0);
+        write_manifested_segment(&active, 0, Some(b"active"));
+        write_torn_tail_byte(&active);
+        create_manifested_slot(dir.path(), 0, 0);
+
+        let queue = open(&dir);
+
+        assert_eq!(
+            queue.payload_vec_for_fsn(0).as_deref(),
+            Some(&b"active"[..])
+        );
+        assert_eq!(scan_file(&active).unwrap().torn_tail_bytes, 0);
+    }
+
+    #[test]
+    fn manifest_recovery_rejects_missing_head_straddle_beyond_active_and_missing_active() {
+        // Missing committed head.
+        let missing_head = TempDir::new().unwrap();
+        write_manifested_segment(
+            &spare_segment_path(missing_head.path(), 1),
+            1,
+            Some(b"tail"),
+        );
+        create_manifested_slot(missing_head.path(), 0, 1);
+        assert!(matches!(
+            SfaFrameQueue::open(options(&missing_head)),
+            Err(SfaQueueError::Recovery { reason })
+                if reason.contains("missing expected SFA head")
+        ));
+
+        // A segment starting below the head but ending above it straddles the
+        // only safe residue boundary.
+        let straddle = TempDir::new().unwrap();
+        let straddling_path = spare_segment_path(straddle.path(), 0);
+        let mut straddling =
+            SfaSegment::create_new_manifested(&straddling_path, 0, 256, 0).unwrap();
+        straddling.try_append(b"zero").unwrap();
+        straddling.try_append(b"one").unwrap();
+        drop(straddling);
+        write_manifested_segment(&spare_segment_path(straddle.path(), 2), 2, None);
+        create_manifested_slot(straddle.path(), 1, 2);
+        assert!(matches!(
+            SfaFrameQueue::open(options(&straddle)),
+            Err(SfaQueueError::Recovery { reason })
+                if reason.contains("overlaps committed SFA head")
+        ));
+
+        // Data beyond the committed active boundary cannot be a hot spare.
+        let beyond = TempDir::new().unwrap();
+        write_manifested_segment(&spare_segment_path(beyond.path(), 0), 0, Some(b"active"));
+        write_manifested_segment(&spare_segment_path(beyond.path(), 1), 1, Some(b"future"));
+        create_manifested_slot(beyond.path(), 0, 0);
+        assert!(matches!(
+            SfaFrameQueue::open(options(&beyond)),
+            Err(SfaQueueError::Recovery { reason })
+                if reason.contains("beyond committed SFA active")
+        ));
+
+        // A live chain without the segment named as active is incomplete.
+        let missing_active = TempDir::new().unwrap();
+        write_manifested_segment(
+            &spare_segment_path(missing_active.path(), 0),
+            0,
+            Some(b"head"),
+        );
+        create_manifested_slot(missing_active.path(), 0, 1);
+        assert!(matches!(
+            SfaFrameQueue::open(options(&missing_active)),
+            Err(SfaQueueError::Recovery { reason })
+                if reason.contains("missing expected SFA active")
+        ));
+    }
+
+    #[test]
+    fn collapsed_manifest_accepts_clean_drain_residue_but_not_unknown_corruption() {
+        let clean = TempDir::new().unwrap();
+        let stale = spare_segment_path(clean.path(), 0);
+        write_manifested_segment(&stale, 0, Some(b"acked"));
+        create_manifested_slot(clean.path(), 5, 5);
+
+        let recovered = recover_segments(&options(&clean)).unwrap();
+        assert!(recovered.segments.is_none());
+        assert!(!stale.exists());
+        assert!(!manifest_path(clean.path()).exists());
+
+        let blocked = TempDir::new().unwrap();
+        write_manifested_segment(&spare_segment_path(blocked.path(), 0), 0, Some(b"acked"));
+        write_bad_magic_segment(&spare_segment_path(blocked.path(), 99));
+        create_manifested_slot(blocked.path(), 5, 5);
+        assert!(matches!(
+            recover_segments(&options(&blocked)),
+            Err(SfaQueueError::Recovery { reason })
+                if reason.contains("missing expected SFA active")
+        ));
     }
 
     #[test]
@@ -2478,6 +3288,7 @@ mod tests {
             decode_hex_fixture(JAVA_TWO_FRAME_FIXTURE_HEX),
         )
         .unwrap();
+        write_ack_watermark(dir.path(), -1);
 
         let queue = SfaFrameQueue::open(options_with(&dir, 256, 1024, 4)).unwrap();
 
@@ -2520,6 +3331,7 @@ mod tests {
         let mut initial = SfaSegment::create(&initial_path, 0, 256, 0).unwrap();
         initial.try_append(b"first").unwrap();
         drop(initial);
+        write_ack_watermark(dir.path(), -1);
         write_empty_torn_segment(&spare_path, 99, 256);
 
         let queue = open(&dir);
@@ -2550,8 +3362,8 @@ mod tests {
             queue.payload_vec_for_fsn(1).as_deref(),
             Some(&b"second"[..])
         );
-        assert!(bad_side_path.exists());
-        assert!(!bad_side_corrupt_path.exists());
+        assert!(!bad_side_path.exists());
+        assert!(bad_side_corrupt_path.exists());
         let diagnostics = queue.recovery_diagnostics();
         assert!(matches!(
             diagnostics.as_slice(),
@@ -2610,6 +3422,7 @@ mod tests {
         let mut bytes = fs::read(&initial_path).unwrap();
         bytes[44] ^= 0x01;
         fs::write(&initial_path, bytes).unwrap();
+        write_ack_watermark(dir.path(), -1);
 
         let queue = open(&dir);
 
@@ -2681,6 +3494,133 @@ mod tests {
         assert!(!ack_watermark_path(dir.path()).exists());
         // The side-file is slot state too: a fully-drained close leaves nothing.
         assert!(!symbol_dict.exists());
+    }
+
+    #[test]
+    fn fully_drained_close_follows_the_crash_safe_barrier_sequence() {
+        let dir = TempDir::new().unwrap();
+        let mut queue = SfaFrameQueue::open(options_with(&dir, 38, 152, 8)).unwrap();
+        queue.try_submit(b"one").unwrap();
+        queue.try_submit(b"two").unwrap();
+        queue.try_submit(b"tri").unwrap();
+        queue.complete_through_fsn(2).unwrap();
+        take_sfa_barriers();
+
+        queue.close().unwrap();
+
+        assert_eq!(
+            take_sfa_barriers(),
+            vec![
+                SfaBarrierEvent::CloseWatermarkWritten,
+                SfaBarrierEvent::CloseWatermarkSynced,
+                SfaBarrierEvent::CloseDirectorySynced,
+                SfaBarrierEvent::CloseHandlesReleased,
+                SfaBarrierEvent::CleanupEnumerationComplete,
+                SfaBarrierEvent::CleanupManifestCollapsed,
+                SfaBarrierEvent::CleanupSegmentUnlinked("sf-0000000000000000.sfa".to_string()),
+                SfaBarrierEvent::CleanupSegmentUnlinked("sf-0000000000000001.sfa".to_string()),
+                SfaBarrierEvent::CleanupSegmentUnlinked("sf-0000000000000002.sfa".to_string()),
+                SfaBarrierEvent::CleanupDirectorySynced,
+                SfaBarrierEvent::CleanupWatermarkRemoved,
+                SfaBarrierEvent::CleanupManifestRemoved,
+            ]
+        );
+    }
+
+    #[test]
+    fn partial_cleanup_enumeration_deletes_nothing() {
+        let dir = TempDir::new().unwrap();
+        let first = spare_segment_path(dir.path(), 0);
+        let second = spare_segment_path(dir.path(), 1);
+        fs::write(&first, b"first").unwrap();
+        fs::write(&second, b"second").unwrap();
+        let mut diagnostics = Vec::new();
+
+        record_all_sfa_cleanup_entries(
+            dir.path(),
+            &mut diagnostics,
+            vec![
+                Ok((
+                    first.file_name().unwrap().to_string_lossy().into_owned(),
+                    first.clone(),
+                )),
+                Err(io::Error::other("injected partial enumeration")),
+                Ok((
+                    second.file_name().unwrap().to_string_lossy().into_owned(),
+                    second.clone(),
+                )),
+            ],
+        )
+        .unwrap();
+
+        assert!(first.exists());
+        assert!(second.exists());
+        assert!(diagnostics.iter().any(|diagnostic| matches!(
+            diagnostic,
+            SfaRecoveryDiagnostic::CleanupFailed { error, .. }
+                if error.contains("fully enumerate")
+        )));
+    }
+
+    #[test]
+    fn cleanup_sorts_segments_and_stops_on_the_first_unlink_failure() {
+        let dir = TempDir::new().unwrap();
+        let generation_zero = spare_segment_path(dir.path(), 0);
+        let failing_generation_one = spare_segment_path(dir.path(), 1);
+        let active_generation_two = spare_segment_path(dir.path(), 2);
+        fs::write(&generation_zero, b"acked").unwrap();
+        // remove_file reliably fails on a directory on both Unix and Windows.
+        fs::create_dir(&failing_generation_one).unwrap();
+        fs::write(&active_generation_two, b"active").unwrap();
+        create_manifested_slot(dir.path(), 0, 2);
+        let mut diagnostics = Vec::new();
+        take_sfa_barriers();
+
+        record_all_sfa_cleanup(dir.path(), &mut diagnostics).unwrap();
+
+        assert!(!generation_zero.exists());
+        assert!(failing_generation_one.exists());
+        assert!(
+            active_generation_two.exists(),
+            "ascending stop must preserve the active suffix"
+        );
+        assert!(ack_watermark_path(dir.path()).exists());
+        let manifest = SfManifest::open(dir.path()).unwrap().unwrap();
+        assert_eq!(manifest.head_base(), 2);
+        assert_eq!(manifest.active_base(), 2);
+        assert_eq!(
+            take_sfa_barriers(),
+            vec![
+                SfaBarrierEvent::CleanupEnumerationComplete,
+                SfaBarrierEvent::CleanupManifestCollapsed,
+                SfaBarrierEvent::CleanupSegmentUnlinked("sf-0000000000000000.sfa".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn collapsed_manifest_recovers_after_a_close_crash_mid_unlink() {
+        let dir = TempDir::new().unwrap();
+        let first = spare_segment_path(dir.path(), 0);
+        let second = spare_segment_path(dir.path(), 1);
+        let active = spare_segment_path(dir.path(), 2);
+        write_manifested_segment(&first, 0, Some(b"zero"));
+        write_manifested_segment(&second, 1, Some(b"one"));
+        write_manifested_segment(&active, 2, Some(b"two"));
+        create_manifested_slot(dir.path(), 0, 2);
+        write_ack_watermark(dir.path(), 2);
+
+        let mut manifest = SfManifest::open(dir.path()).unwrap().unwrap();
+        manifest.update(2, 2).unwrap();
+        drop(manifest);
+        fs::remove_file(&first).unwrap();
+
+        let recovered = open(&dir);
+
+        assert_eq!(recovered.completed_fsn(), Some(2));
+        assert_eq!(recovered.oldest_unresolved_fsn(), None);
+        assert!(!second.exists(), "below-head residue should be cleaned");
+        assert!(active.exists());
     }
 
     #[test]
@@ -2781,6 +3721,26 @@ mod tests {
     }
 
     #[test]
+    fn close_with_an_invalid_manifest_retains_every_segment_and_watermark() {
+        let dir = TempDir::new().unwrap();
+        let mut queue = open(&dir);
+        queue.try_submit(b"first").unwrap();
+        queue.complete_through_fsn(0).unwrap();
+        let before = sfa_file_count(dir.path());
+        fs::write(
+            manifest_path(dir.path()),
+            vec![0xa5; super::super::qwp_ws_sfa_manifest::DUAL_SLOT_FILE_SIZE as usize],
+        )
+        .unwrap();
+
+        queue.close().unwrap();
+
+        assert_eq!(sfa_file_count(dir.path()), before);
+        assert!(ack_watermark_path(dir.path()).exists());
+        assert!(PathBuf::from(format!("{}.corrupt", manifest_path(dir.path()).display())).exists());
+    }
+
+    #[test]
     fn ack_watermark_skips_completed_frames_after_restart() {
         let dir = TempDir::new().unwrap();
         let first;
@@ -2846,23 +3806,23 @@ mod tests {
         // full lifecycle: fresh open, persist, reopen, invalidate, re-persist.
         let dir = TempDir::new().unwrap();
 
-        let mut watermark = SfaAckWatermark::open(dir.path()).unwrap();
-        assert_eq!(watermark.recovered_fsn(), None);
-        watermark.persist_completed_fsn(42);
-        assert_eq!(watermark.recovered_fsn(), Some(42));
+        let mut watermark = SfaAckWatermark::open(dir.path(), false).unwrap();
+        assert_eq!(watermark.read().unwrap(), None);
+        watermark.write(42).unwrap();
+        assert_eq!(watermark.read().unwrap(), Some(42));
         drop(watermark);
 
-        let mut reopened = SfaAckWatermark::open(dir.path()).unwrap();
-        assert_eq!(reopened.recovered_fsn(), Some(42));
-        reopened.invalidate();
-        assert_eq!(reopened.recovered_fsn(), None);
+        let mut reopened = SfaAckWatermark::open(dir.path(), true).unwrap();
+        assert_eq!(reopened.read().unwrap(), Some(42));
         drop(reopened);
+        fs::write(ack_watermark_path(dir.path()), [0u8; 16]).unwrap();
+        let mut reset = SfaAckWatermark::open(dir.path(), true).unwrap();
+        assert_eq!(reset.read().unwrap(), None);
+        drop(reset);
         assert_eq!(recovered_ack_watermark_fsn(dir.path()), None);
 
-        // A persist after invalidation rewrites the whole record (FSN before
-        // magic, so a torn write never yields a decodable half-record).
-        let mut again = SfaAckWatermark::open(dir.path()).unwrap();
-        again.persist_completed_fsn(7);
+        let mut again = SfaAckWatermark::open(dir.path(), true).unwrap();
+        again.write(7).unwrap();
         drop(again);
         assert_eq!(recovered_ack_watermark_fsn(dir.path()), Some(7));
     }
@@ -2897,23 +3857,21 @@ mod tests {
     }
 
     #[test]
-    fn ack_watermark_unavailable_is_ignored_for_recovery() {
+    fn ack_watermark_unavailable_fails_recovered_slot_open() {
         let dir = TempDir::new().unwrap();
         write_segment_with_one_frame(&spare_segment_path(dir.path(), 0), 0, b"first");
+        fs::remove_file(ack_watermark_path(dir.path())).unwrap();
         fs::create_dir(ack_watermark_path(dir.path())).unwrap();
 
-        let queue = open(&dir);
-
-        assert_eq!(queue.oldest_unresolved_fsn(), Some(0));
-        assert_eq!(queue.completed_fsn(), None);
-        assert_eq!(queue.payload_vec_for_fsn(0).as_deref(), Some(&b"first"[..]));
+        let err = SfaFrameQueue::open(options(&dir)).unwrap_err();
+        assert!(matches!(err, SfaQueueError::Io(_)), "{err:?}");
     }
 
     #[test]
     fn ack_watermark_invalid_contents_are_ignored_and_repaired() {
         for (name, magic, reserved) in [
-            ("bad magic", 0xdead_beefu32, 0u32),
-            ("bad reserved", ACK_WATERMARK_MAGIC, 7u32),
+            ("bad magic", 0xdead_beefu32, 1u32),
+            ("bad version", 0x3157_4b41, 7u32),
         ] {
             let dir = TempDir::new().unwrap();
             write_segment_with_one_frame(&spare_segment_path(dir.path(), 0), 0, b"first");
@@ -2980,19 +3938,14 @@ mod tests {
     }
 
     #[test]
-    fn missing_ack_watermark_keeps_legacy_recovery() {
+    fn missing_ack_watermark_fails_legacy_recovery() {
         let dir = TempDir::new().unwrap();
         write_segment_with_one_frame(&initial_segment_path(dir.path()), 3, b"legacy");
+        fs::remove_file(ack_watermark_path(dir.path())).unwrap();
         assert!(!ack_watermark_path(dir.path()).exists());
 
-        let queue = open(&dir);
-
-        assert_eq!(queue.oldest_unresolved_fsn(), Some(3));
-        assert_eq!(queue.completed_fsn(), Some(2));
-        assert_eq!(
-            queue.payload_vec_for_fsn(3).as_deref(),
-            Some(&b"legacy"[..])
-        );
+        let err = SfaFrameQueue::open(options(&dir)).unwrap_err();
+        assert!(matches!(err, SfaQueueError::Io(_)), "{err:?}");
     }
 
     #[test]
@@ -3217,6 +4170,50 @@ mod tests {
     }
 
     #[test]
+    fn rotation_syncs_the_promoted_header_before_manifest_and_queue_mutation() {
+        let dir = TempDir::new().unwrap();
+        let mut queue = SfaFrameQueue::open(options_with(&dir, 38, 76, 4)).unwrap();
+        queue.try_submit(b"first").unwrap();
+        take_sfa_barriers();
+
+        queue.try_submit(b"second").unwrap();
+
+        assert_eq!(
+            take_sfa_barriers(),
+            vec![
+                SfaBarrierEvent::RotationHeaderSynced,
+                SfaBarrierEvent::RotationManifestUpdated,
+                SfaBarrierEvent::RotationQueueMutated,
+            ]
+        );
+    }
+
+    #[test]
+    fn trim_covers_the_unlink_with_watermark_and_manifest_barriers_before_pop() {
+        let dir = TempDir::new().unwrap();
+        let mut queue = SfaFrameQueue::open(options_with(&dir, 38, 114, 4)).unwrap();
+        queue.try_submit(b"first").unwrap();
+        queue.try_submit(b"second").unwrap();
+        queue.complete_through_fsn(0).unwrap();
+        take_sfa_barriers();
+
+        let step = queue.take_storage_maintenance_step(false).unwrap().unwrap();
+
+        assert_eq!(
+            take_sfa_barriers(),
+            vec![
+                SfaBarrierEvent::TrimWatermarkWritten,
+                SfaBarrierEvent::TrimWatermarkSynced,
+                SfaBarrierEvent::TrimDirectorySynced,
+                SfaBarrierEvent::TrimManifestUpdated,
+                SfaBarrierEvent::TrimQueuePopped,
+            ]
+        );
+        assert!(matches!(step, SfaStorageStep::Trim(_)));
+        step.perform().unwrap();
+    }
+
+    #[test]
     fn rotation_allocates_inline_when_hot_spare_missing() {
         // Budget for 4 segments; active + hot spare are pre-created. After the
         // spare is consumed by the first rotation, further rotations must
@@ -3394,6 +4391,7 @@ mod tests {
         let mut second = SfaSegment::create(spare_segment_path(dir.path(), 0), 1, 38, 0).unwrap();
         second.try_append(b"second").unwrap();
         drop(second);
+        write_ack_watermark(dir.path(), -1);
 
         let mut queue = SfaFrameQueue::open(options_with(&dir, 38, 38, 4)).unwrap();
 
@@ -3501,6 +4499,7 @@ mod tests {
             decode_hex_fixture(JAVA_TWO_FRAME_FIXTURE_HEX),
         )
         .unwrap();
+        write_ack_watermark(dir.path(), -1);
         let queue = open(&dir);
         let server = FakeOrderedServer::ack_each_send();
         let mut driver = QwpWsCoreTestHarness::from_queue(queue, server);

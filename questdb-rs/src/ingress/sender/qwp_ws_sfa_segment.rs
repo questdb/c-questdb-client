@@ -39,6 +39,7 @@ use memmap2::{MmapMut, MmapOptions};
 
 pub(crate) const FILE_MAGIC: u32 = 0x3130_4653; // 'SF01' in little-endian bytes.
 pub(crate) const VERSION: u8 = 1;
+pub(crate) const MANIFEST_REQUIRED_FLAG: u8 = 1;
 pub(crate) const HEADER_SIZE: usize = 24;
 pub(crate) const FRAME_HEADER_SIZE: usize = 8;
 pub(crate) const INITIAL_SEGMENT_FILE_NAME: &str = "sf-initial.sfa";
@@ -108,6 +109,7 @@ pub(crate) struct SfaFrame {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct SfaSegmentMetadataScan {
     pub(crate) header: SfaSegmentHeader,
+    pub(crate) manifest_required: bool,
     pub(crate) frame_count: u64,
     pub(crate) append_offset: u64,
     pub(crate) torn_tail_bytes: u64,
@@ -139,6 +141,7 @@ pub(crate) struct SfaSegment {
     path: Option<PathBuf>,
     size_bytes: u64,
     header: SfaSegmentHeader,
+    manifest_required: bool,
     append_offset: u64,
     frame_count: u64,
     // Recovery records this on opened segments; queue recovery also reports the
@@ -185,7 +188,16 @@ impl SfaSegment {
         size_bytes: u64,
         created_us: u64,
     ) -> Result<Self, SfaSegmentError> {
-        Self::create_inner(path, base_seq, size_bytes, created_us, false)
+        Self::create_inner(path, base_seq, size_bytes, created_us, false, false)
+    }
+
+    pub(crate) fn create_new_manifested(
+        path: impl AsRef<Path>,
+        base_seq: u64,
+        size_bytes: u64,
+        created_us: u64,
+    ) -> Result<Self, SfaSegmentError> {
+        Self::create_inner(path, base_seq, size_bytes, created_us, true, true)
     }
 
     pub(crate) fn create_new(
@@ -194,7 +206,7 @@ impl SfaSegment {
         size_bytes: u64,
         created_us: u64,
     ) -> Result<Self, SfaSegmentError> {
-        Self::create_inner(path, base_seq, size_bytes, created_us, true)
+        Self::create_inner(path, base_seq, size_bytes, created_us, true, false)
     }
 
     pub(crate) fn create_memory(
@@ -208,7 +220,7 @@ impl SfaSegment {
             base_seq,
             created_us,
         };
-        mapping.copy_from(0, &encode_header(header));
+        mapping.copy_from(0, &encode_header(header, false));
 
         Ok(Self {
             file: None,
@@ -216,6 +228,7 @@ impl SfaSegment {
             path: None,
             size_bytes,
             header,
+            manifest_required: false,
             append_offset: HEADER_SIZE as u64,
             frame_count: 0,
             torn_tail_bytes: 0,
@@ -228,6 +241,7 @@ impl SfaSegment {
         size_bytes: u64,
         created_us: u64,
         create_new: bool,
+        manifest_required: bool,
     ) -> Result<Self, SfaSegmentError> {
         validate_new_segment_args(base_seq, size_bytes)?;
 
@@ -259,7 +273,7 @@ impl SfaSegment {
             base_seq,
             created_us,
         };
-        mapping.copy_from(0, &encode_header(header));
+        mapping.copy_from(0, &encode_header(header, manifest_required));
 
         Ok(Self {
             file: Some(file),
@@ -267,6 +281,7 @@ impl SfaSegment {
             path: Some(path.to_path_buf()),
             size_bytes,
             header,
+            manifest_required,
             append_offset: HEADER_SIZE as u64,
             frame_count: 0,
             torn_tail_bytes: 0,
@@ -295,6 +310,7 @@ impl SfaSegment {
             path: Some(path.to_path_buf()),
             size_bytes,
             header: scan.header,
+            manifest_required: scan.manifest_required,
             append_offset: scan.append_offset,
             frame_count: scan.frame_count,
             torn_tail_bytes: scan.torn_tail_bytes,
@@ -360,6 +376,49 @@ impl SfaSegment {
         Ok(())
     }
 
+    pub(crate) fn mark_manifest_required(&mut self) -> Result<(), SfaSegmentError> {
+        if self.path.is_none() || self.manifest_required {
+            return Ok(());
+        }
+        self.mapping
+            .copy_from(5, std::slice::from_ref(&MANIFEST_REQUIRED_FLAG));
+        self.sync_header()?;
+        self.manifest_required = true;
+        Ok(())
+    }
+
+    pub(crate) fn sync_header(&self) -> Result<(), SfaSegmentError> {
+        let Some(file) = self.file.as_ref() else {
+            return Ok(());
+        };
+        self.mapping.flush_range(0, HEADER_SIZE)?;
+        file.sync_all()?;
+        Ok(())
+    }
+
+    pub(crate) fn sanitize_torn_tail(&mut self) -> Result<(), SfaSegmentError> {
+        if self.torn_tail_bytes == 0 {
+            return Ok(());
+        }
+        let offset = usize::try_from(self.append_offset).map_err(|_| {
+            SfaSegmentError::SizeTooLargeForPlatform {
+                size: self.append_offset,
+            }
+        })?;
+        let len = usize::try_from(self.size_bytes - self.append_offset).map_err(|_| {
+            SfaSegmentError::SizeTooLargeForPlatform {
+                size: self.size_bytes,
+            }
+        })?;
+        self.mapping.zero_range(offset, len);
+        self.mapping.flush_range(offset, len)?;
+        if let Some(file) = self.file.as_ref() {
+            file.sync_data()?;
+        }
+        self.torn_tail_bytes = 0;
+        Ok(())
+    }
+
     pub(crate) fn frame_offset_for_fsn_with_limit(
         &self,
         fsn: u64,
@@ -408,7 +467,6 @@ impl SfaSegment {
         self.frame_count
     }
 
-    #[cfg(test)]
     pub(crate) fn torn_tail_bytes(&self) -> u64 {
         self.torn_tail_bytes
     }
@@ -507,6 +565,21 @@ impl SfaSegmentMapping {
         }
     }
 
+    fn zero_range(&self, offset: usize, len: usize) {
+        assert!(offset.checked_add(len).is_some_and(|end| end <= self.len));
+        // SAFETY: recovery owns the segment exclusively and sanitizes only the
+        // unpublished suffix before exposing the mapping to any reader.
+        unsafe {
+            ptr::write_bytes(self.base.add(offset), 0, len);
+        }
+    }
+
+    fn flush_range(&self, offset: usize, len: usize) -> Result<(), SfaSegmentError> {
+        self._mmap
+            .flush_range(offset, len)
+            .map_err(SfaSegmentError::Io)
+    }
+
     fn with_slice<R>(&self, offset: usize, len: usize, f: impl FnOnce(&[u8]) -> R) -> R {
         f(self.slice(offset, len))
     }
@@ -559,6 +632,7 @@ fn scan_segment_metadata_source<S: ReadAt + ?Sized>(
     let raw = scan_segment_source_inner(source, source_len, |_, _, _| Ok(()))?;
     Ok(SfaSegmentMetadataScan {
         header: raw.header,
+        manifest_required: raw.manifest_required,
         frame_count: raw.frame_count,
         append_offset: raw.append_offset,
         torn_tail_bytes: raw.torn_tail_bytes,
@@ -596,6 +670,7 @@ pub(crate) fn scan_segment_bytes(bytes: &[u8]) -> Result<SfaSegmentScan, SfaSegm
 
 struct RawSegmentScan {
     header: SfaSegmentHeader,
+    manifest_required: bool,
     frame_count: u64,
     append_offset: u64,
     torn_tail_bytes: u64,
@@ -629,9 +704,10 @@ fn scan_segment_source_inner<S: ReadAt + ?Sized>(
         return Err(SfaSegmentError::UnsupportedVersion { actual: version });
     }
     let flags = header_buf[5];
-    if flags != 0 {
+    if flags & !MANIFEST_REQUIRED_FLAG != 0 {
         return Err(SfaSegmentError::NonZeroFlags { actual: flags });
     }
+    let manifest_required = flags & MANIFEST_REQUIRED_FLAG != 0;
     let reserved = u16::from_le_bytes([header_buf[6], header_buf[7]]);
     if reserved != 0 {
         return Err(SfaSegmentError::NonZeroReserved { actual: reserved });
@@ -700,6 +776,7 @@ fn scan_segment_source_inner<S: ReadAt + ?Sized>(
 
     Ok(RawSegmentScan {
         header,
+        manifest_required,
         frame_count,
         append_offset: pos,
         torn_tail_bytes: detect_torn_tail(source, source_len, pos)?,
@@ -707,11 +784,15 @@ fn scan_segment_source_inner<S: ReadAt + ?Sized>(
     })
 }
 
-fn encode_header(header: SfaSegmentHeader) -> [u8; HEADER_SIZE] {
+fn encode_header(header: SfaSegmentHeader, manifest_required: bool) -> [u8; HEADER_SIZE] {
     let mut bytes = [0u8; HEADER_SIZE];
     bytes[..4].copy_from_slice(&FILE_MAGIC.to_le_bytes());
     bytes[4] = VERSION;
-    bytes[5] = 0;
+    bytes[5] = if manifest_required {
+        MANIFEST_REQUIRED_FLAG
+    } else {
+        0
+    };
     bytes[6..8].copy_from_slice(&0u16.to_le_bytes());
     bytes[8..16].copy_from_slice(&header.base_seq.to_le_bytes());
     bytes[16..24].copy_from_slice(&header.created_us.to_le_bytes());
@@ -1225,10 +1306,13 @@ mod tests {
 
     #[test]
     fn clean_zero_tail_is_not_torn_tail() {
-        let mut bytes = Vec::from(encode_header(SfaSegmentHeader {
-            base_seq: 7,
-            created_us: 11,
-        }));
+        let mut bytes = Vec::from(encode_header(
+            SfaSegmentHeader {
+                base_seq: 7,
+                created_us: 11,
+            },
+            false,
+        ));
         bytes.resize(80, 0);
 
         let scan = scan_segment_bytes(&bytes).unwrap();
@@ -1259,11 +1343,19 @@ mod tests {
             Err(SfaSegmentError::UnsupportedVersion { actual: 2 })
         ));
 
+        let mut manifested = java_two_frame_fixture();
+        manifested[5] = MANIFEST_REQUIRED_FLAG;
+        assert!(
+            scan_segment_metadata_bytes(&manifested)
+                .unwrap()
+                .manifest_required
+        );
+
         let mut bad_flags = java_two_frame_fixture();
-        bad_flags[5] = 1;
+        bad_flags[5] = 2;
         assert!(matches!(
             scan_segment_bytes(&bad_flags),
-            Err(SfaSegmentError::NonZeroFlags { actual: 1 })
+            Err(SfaSegmentError::NonZeroFlags { actual: 2 })
         ));
 
         let mut bad_reserved = java_two_frame_fixture();

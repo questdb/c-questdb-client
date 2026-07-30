@@ -1223,6 +1223,12 @@ impl<T: QwpWsCoreTransport> QwpWsSendCore<T> {
         wire_seq: u64,
     ) -> Result<DriveOutcome, DriverError> {
         let progress = store.progress_view();
+        if progress.completion_reaches_published(fsn) {
+            // Publish final completion only after releasing the cursor's
+            // segment owner. A close thread observes completion with Acquire
+            // and may immediately begin the ordered unlink protocol.
+            self.send_cursor.release_sfa_cursor();
+        }
         let advanced = progress
             .complete_through_fsn(fsn)
             .map_err(DriverError::from)?;
@@ -1232,6 +1238,18 @@ impl<T: QwpWsCoreTransport> QwpWsSendCore<T> {
             store.record_completed_through_event(fsn, wire_seq);
         }
         Ok(DriveOutcome::Acked { wire_seq })
+    }
+
+    fn close_publication_queue<Q: PublicationLog>(
+        &mut self,
+        store: &mut QwpWsPublicationStore<Q>,
+    ) -> Result<(), DriverError> {
+        // The queue drops its own segment owners before close-time unlink.
+        // Release the send cursor's independent owner first as well; otherwise
+        // Windows keeps the active segment undeletable even after a complete
+        // drain.
+        self.send_cursor.release_sfa_cursor();
+        store.close_queue()
     }
 
     pub(crate) fn next_outbound_sfa_frame(
@@ -1546,6 +1564,9 @@ impl<T: QwpWsCoreTransport> QwpWsSendCore<T> {
         let Some((fsn, ack_wire_seq)) = self.send_cursor.ack_fsn_for_wire_seq(wire_seq)? else {
             return Ok(QwpWsHotResponseProgress::idle());
         };
+        if progress.completion_reaches_published(fsn) {
+            self.send_cursor.release_sfa_cursor();
+        }
         let advanced = progress
             .complete_through_fsn(fsn)
             .map_err(DriverError::from)?;
@@ -1630,6 +1651,9 @@ impl<T: QwpWsCoreTransport> QwpWsSendCore<T> {
             .as_mut()
             .and_then(DurableAckTracker::pop_ready)
         {
+            if progress.completion_reaches_published(resolved.fsn) {
+                self.send_cursor.release_sfa_cursor();
+            }
             let advanced = progress
                 .complete_through_fsn(resolved.fsn)
                 .map_err(DriverError::from)?;
@@ -1943,7 +1967,7 @@ impl<T: QwpWsCoreTransport> QwpWsSendCore<T> {
             return Ok(CloseOutcome::Terminal);
         }
         if store.all_published_receipts_resolved() {
-            store.close_queue()?;
+            self.close_publication_queue(store)?;
             return Ok(CloseOutcome::Drained);
         }
         match self.drive_once(store)? {
@@ -1963,7 +1987,7 @@ impl<T: QwpWsCoreTransport> QwpWsSendCore<T> {
         if store.is_terminal() {
             Ok(CloseOutcome::Terminal)
         } else if store.all_published_receipts_resolved() {
-            store.close_queue()?;
+            self.close_publication_queue(store)?;
             Ok(CloseOutcome::Drained)
         } else {
             Ok(CloseOutcome::Timeout)
@@ -1980,7 +2004,7 @@ impl<T: QwpWsCoreTransport> QwpWsSendCore<T> {
             return Ok(CloseStepOutcome::Terminal);
         }
         if store.all_published_receipts_resolved() {
-            store.close_queue()?;
+            self.close_publication_queue(store)?;
             return Ok(CloseStepOutcome::Drained);
         }
 
@@ -2002,7 +2026,7 @@ impl<T: QwpWsCoreTransport> QwpWsSendCore<T> {
             return Ok(CloseStepOutcome::Terminal);
         }
         if store.all_published_receipts_resolved() {
-            store.close_queue()?;
+            self.close_publication_queue(store)?;
             return Ok(CloseStepOutcome::Drained);
         }
         if outcome == DriveOutcome::Idle {
@@ -2416,7 +2440,7 @@ impl<Q: PublicationLog, T: QwpWsCoreTransport> QwpWsCoreTestHarness<Q, T> {
                 return Ok(CloseOutcome::Terminal);
             }
             if self.store.all_published_receipts_resolved() {
-                self.store.close_queue()?;
+                self.send_core.close_publication_queue(&mut self.store)?;
                 return Ok(CloseOutcome::Drained);
             }
             if self.drive_once()? == DriveOutcome::Terminal {
@@ -2427,7 +2451,7 @@ impl<Q: PublicationLog, T: QwpWsCoreTransport> QwpWsCoreTestHarness<Q, T> {
         if self.store.is_terminal() {
             Ok(CloseOutcome::Terminal)
         } else if self.store.all_published_receipts_resolved() {
-            self.store.close_queue()?;
+            self.send_core.close_publication_queue(&mut self.store)?;
             Ok(CloseOutcome::Drained)
         } else {
             Ok(CloseOutcome::Timeout)
@@ -2724,6 +2748,10 @@ impl SendCursor {
 
     pub(crate) fn sfa_cursor_mut(&mut self) -> &mut Option<SfaSendCursor> {
         &mut self.sfa_cursor
+    }
+
+    fn release_sfa_cursor(&mut self) {
+        self.sfa_cursor = None;
     }
 
     pub(crate) fn peek_next_frame_from_oldest(
@@ -4052,6 +4080,32 @@ mod tests {
             .unwrap();
         assert_eq!(cursor.ack_fsn_for_wire_seq(0).unwrap(), Some((10, 0)));
         assert_eq!(cursor.ack_fsn_for_wire_seq(1).unwrap(), Some((11, 1)));
+    }
+
+    #[test]
+    fn hot_final_ack_releases_the_sfa_cursor() {
+        let mut queue = SfaFrameQueue::open_memory(SfaMemoryQueueOptions {
+            segment_size_bytes: 128,
+            max_bytes: 256,
+            max_in_flight: 4,
+        })
+        .unwrap();
+        queue.try_submit(b"frame").unwrap();
+        let progress = queue.progress_view();
+        let mut core = QwpWsSendCore::new(
+            FakeOrderedServer::no_response(),
+            4,
+            ReconnectPolicy::no_backoff(Duration::MAX),
+        );
+        let outbound = core.next_outbound_sfa_frame(&progress).unwrap().unwrap();
+        core.send_cursor.commit_sent(outbound.sent_frame()).unwrap();
+        assert!(core.send_cursor.sfa_cursor.is_some());
+
+        let completion = core.finish_ack_response_sfa(&progress, 0).unwrap();
+
+        assert_eq!(completion.outcome, DriveOutcome::Acked { wire_seq: 0 });
+        assert!(core.send_cursor.sfa_cursor.is_none());
+        assert_eq!(progress.completed_fsn(), Some(0));
     }
 
     fn write_frame_varint(out: &mut Vec<u8>, mut value: u64) {
