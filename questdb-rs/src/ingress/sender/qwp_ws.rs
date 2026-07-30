@@ -135,7 +135,7 @@ impl TrafficGate {
             .shut
     }
 
-    fn shutdown(&self) -> std::io::Result<()> {
+    pub(super) fn shutdown(&self) -> std::io::Result<()> {
         let current = {
             let mut state = self.state.lock().unwrap_or_else(|err| err.into_inner());
             state.shut = true;

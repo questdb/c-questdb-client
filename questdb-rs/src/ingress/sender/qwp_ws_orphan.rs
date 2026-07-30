@@ -47,7 +47,7 @@ use crate::ingress::conf::QwpWsManagedSlotExclusion;
 use crate::ingress::tls::TlsSettings;
 
 #[cfg(feature = "sync-sender-qwp-ws")]
-use super::qwp_ws::{QwpWsConnectKind, try_dup_recovered};
+use super::qwp_ws::{QwpWsConnectKind, TrafficGate, try_dup_recovered};
 #[cfg(feature = "sync-sender-qwp-ws")]
 use super::qwp_ws_driver::{
     BlockingQwpWsTransport, CloseStepOutcome, DEFAULT_EVENT_CAPACITY, DriverError, PublicationLog,
@@ -173,7 +173,7 @@ impl OrphanDrainerConfig {
 #[cfg(feature = "sync-sender-qwp-ws")]
 pub(crate) struct OrphanDrainerPool {
     stop: Arc<AtomicBool>,
-    threads: Vec<thread::JoinHandle<()>>,
+    threads: Vec<(thread::JoinHandle<()>, Arc<TrafficGate>)>,
 }
 
 #[cfg(feature = "sync-sender-qwp-ws")]
@@ -194,14 +194,17 @@ impl OrphanDrainerPool {
             let pending = Arc::clone(&pending);
             let stop = Arc::clone(&stop);
             let config = config.clone();
-            threads.push(thread::spawn(move || {
+            let traffic_gate = Arc::new(TrafficGate::default());
+            let worker_gate = Arc::clone(&traffic_gate);
+            let worker = thread::spawn(move || {
                 while !stop.load(Ordering::Acquire) {
                     let Some(slot_dir) = pop_pending_orphan(&pending) else {
                         break;
                     };
-                    drain_orphan_to_completion(slot_dir, &config, &stop);
+                    drain_orphan_to_completion(slot_dir, &config, &stop, &worker_gate);
                 }
-            }));
+            });
+            threads.push((worker, traffic_gate));
         }
         Some(Self { stop, threads })
     }
@@ -215,9 +218,20 @@ impl OrphanDrainerPool {
         self.wait_for_finished_threads(graceful_drain);
         self.stop.store(true, Ordering::Release);
         self.join_finished_threads();
+        for (_, traffic_gate) in &self.threads {
+            if let Err(err) = traffic_gate.shutdown() {
+                log::warn!("could not shut down QWP/WebSocket orphan drainer traffic: {err}");
+            }
+        }
         self.wait_for_finished_threads(stop_grace);
-        // Remaining orphan drainers are best-effort background work. Dropping
-        // their JoinHandles detaches the threads so sender close stays bounded.
+        if !self.threads.is_empty() {
+            log::error!(
+                "{} QWP/WebSocket orphan drainer worker(s) did not stop within {:?}; \
+                 detaching them while their active slot locks remain retained",
+                self.threads.len(),
+                stop_grace
+            );
+        }
         self.threads.clear();
     }
 
@@ -240,11 +254,11 @@ impl OrphanDrainerPool {
 
     fn join_finished_threads(&mut self) {
         let mut running = Vec::with_capacity(self.threads.len());
-        for thread in self.threads.drain(..) {
+        for (thread, traffic_gate) in self.threads.drain(..) {
             if thread.is_finished() {
                 let _ = thread.join();
             } else {
-                running.push(thread);
+                running.push((thread, traffic_gate));
             }
         }
         self.threads = running;
@@ -390,21 +404,23 @@ enum OrphanDriveOutcome {
 #[cfg(feature = "sync-sender-qwp-ws")]
 impl OrphanDrainer {
     fn open(slot_dir: PathBuf, config: &OrphanDrainerConfig) -> OrphanOpenOutcome {
-        Self::open_inner(slot_dir, config, None)
+        Self::open_inner(slot_dir, config, None, None)
     }
 
     fn open_with_stop(
         slot_dir: PathBuf,
         config: &OrphanDrainerConfig,
         stop: &AtomicBool,
+        traffic_gate: &Arc<TrafficGate>,
     ) -> OrphanOpenOutcome {
-        Self::open_inner(slot_dir, config, Some(stop))
+        Self::open_inner(slot_dir, config, Some(stop), Some(traffic_gate))
     }
 
     fn open_inner(
         slot_dir: PathBuf,
         config: &OrphanDrainerConfig,
         stop: Option<&AtomicBool>,
+        traffic_gate: Option<&Arc<TrafficGate>>,
     ) -> OrphanOpenOutcome {
         if orphan_stop_requested(stop) {
             return OrphanOpenOutcome::Stopped;
@@ -454,7 +470,7 @@ impl OrphanDrainer {
             config.qwp_ws.clone(),
             config.auth_header.clone(),
             Arc::new(AtomicUsize::new(0)),
-            None,
+            traffic_gate.cloned(),
         ) {
             Ok(transport) => transport,
             Err(err) => return retry_open_later(err.to_string(), stop),
@@ -673,9 +689,14 @@ fn sleep_before_orphan_reconnect(
 }
 
 #[cfg(feature = "sync-sender-qwp-ws")]
-fn drain_orphan_to_completion(slot_dir: PathBuf, config: &OrphanDrainerConfig, stop: &AtomicBool) {
+fn drain_orphan_to_completion(
+    slot_dir: PathBuf,
+    config: &OrphanDrainerConfig,
+    stop: &AtomicBool,
+    traffic_gate: &Arc<TrafficGate>,
+) {
     let mut drainer = loop {
-        match OrphanDrainer::open_with_stop(slot_dir.clone(), config, stop) {
+        match OrphanDrainer::open_with_stop(slot_dir.clone(), config, stop, traffic_gate) {
             OrphanOpenOutcome::Drainer(drainer) => break drainer,
             OrphanOpenOutcome::AlreadyDrained
             | OrphanOpenOutcome::FailedSentinel
@@ -898,7 +919,7 @@ mod tests {
         });
         let mut pool = OrphanDrainerPool {
             stop,
-            threads: vec![worker],
+            threads: vec![(worker, Arc::new(TrafficGate::default()))],
         };
 
         pool.close_with_timeouts(Duration::from_secs(1), Duration::from_millis(10));
@@ -928,7 +949,7 @@ mod tests {
         entered_rx.recv_timeout(Duration::from_millis(500)).unwrap();
         let mut pool = OrphanDrainerPool {
             stop,
-            threads: vec![worker],
+            threads: vec![(worker, Arc::new(TrafficGate::default()))],
         };
 
         let started = Instant::now();
@@ -945,6 +966,52 @@ mod tests {
             .recv_timeout(Duration::from_millis(500))
             .unwrap();
         release_tx.send(()).unwrap();
+    }
+
+    #[cfg(all(feature = "sync-sender-qwp-ws", any(unix, windows)))]
+    #[test]
+    fn detached_background_worker_retains_slot_until_exit() {
+        let temp = TempDir::new().unwrap();
+        let options = SfaSlotOptions {
+            sf_dir: temp.path().to_path_buf(),
+            sender_id: "orphan".to_owned(),
+            segment_size_bytes: 256,
+            max_bytes: 1024,
+            max_in_flight: 1,
+        };
+        let stop = Arc::new(AtomicBool::new(false));
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let (exited_tx, exited_rx) = std::sync::mpsc::channel();
+        let worker_stop = Arc::clone(&stop);
+        let worker_options = options.clone();
+        let worker = thread::spawn(move || {
+            let queue = SfaSlotQueue::open(worker_options).unwrap();
+            entered_tx.send(()).unwrap();
+            while !worker_stop.load(Ordering::Acquire) {
+                thread::yield_now();
+            }
+            release_rx.recv().unwrap();
+            drop(queue);
+            exited_tx.send(()).unwrap();
+        });
+        entered_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        let mut pool = OrphanDrainerPool {
+            stop,
+            threads: vec![(worker, Arc::new(TrafficGate::default()))],
+        };
+
+        pool.close_with_timeouts(Duration::from_millis(10), Duration::from_millis(10));
+
+        assert!(matches!(
+            SfaSlotQueue::open(options.clone()),
+            Err(SfaQueueError::SlotInUse { .. })
+        ));
+        release_tx.send(()).unwrap();
+        exited_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+
+        let mut reopened = SfaSlotQueue::open(options).unwrap();
+        reopened.close().unwrap();
     }
 
     #[cfg(feature = "sync-sender-qwp-ws")]
