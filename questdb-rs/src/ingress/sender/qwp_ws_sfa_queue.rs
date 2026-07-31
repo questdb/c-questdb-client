@@ -118,12 +118,30 @@ pub(crate) enum SfaQueueError {
     Segment(SfaSegmentError),
     Io(io::Error),
     InvalidSfDir,
-    InvalidSenderId { sender_id: String },
-    SlotInUse { slot_dir: PathBuf, holder: String },
+    InvalidSenderId {
+        sender_id: String,
+    },
+    SlotInUse {
+        slot_dir: PathBuf,
+        holder: String,
+    },
     SlotLockUnsupported,
-    CorruptSegments { reason: &'static str },
-    Recovery { reason: String },
-    SanitizedResidue { path: PathBuf },
+    CorruptSegments {
+        reason: &'static str,
+    },
+    Recovery {
+        reason: String,
+    },
+    /// Recovery durably removed proven-dead bytes beyond the last accounted
+    /// frame. Damage that removes an expected frame fails validation before
+    /// mutation.
+    ///
+    /// Foreground startup reports this once so the attended caller retries;
+    /// orphan recovery retries once internally. This mirrors Java's
+    /// `SfSanitizedResidueException` contract.
+    SanitizedResidue {
+        path: PathBuf,
+    },
     Durability(SfaDurabilityFailure),
     Closed,
 }
@@ -3682,7 +3700,7 @@ mod tests {
     }
 
     #[test]
-    fn manifested_sealed_torn_tail_is_sanitized_then_fails_once() {
+    fn manifested_proven_dead_residue_is_sanitized_then_fails_once() {
         let dir = TempDir::new().unwrap();
         let sealed = spare_segment_path(dir.path(), 0);
         let active = spare_segment_path(dir.path(), 1);

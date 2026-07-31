@@ -437,6 +437,8 @@ impl OrphanDrainer {
             Ok(queue) => queue,
             Err(SfaQueueError::SlotInUse { .. }) => return OrphanOpenOutcome::Locked,
             Err(SfaQueueError::SanitizedResidue { .. }) => {
+                // Retry internally because this path is unattended and must
+                // not quarantine replayable data.
                 let retry_options = match config.queue_options(slot_dir.clone()) {
                     Ok(options) => options,
                     Err(err) => return OrphanOpenOutcome::RetryLater(err),

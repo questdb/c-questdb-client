@@ -1875,6 +1875,13 @@ fn open_configured_qwp_ws_queue(qwp_ws: &QwpWsConfig) -> crate::Result<SfaSlotQu
                     holder
                 ),
             ),
+            // Intentionally propagate once; the next construction revalidates
+            // the healed chain.
+            SfaQueueError::SanitizedResidue { path } => error::fmt!(
+                SocketError,
+                "QWP/WebSocket store-and-forward recovery repaired sealed residue at {}; retry sender construction once. A repeated recovery error requires operator intervention.",
+                path.display()
+            ),
             err => error::fmt!(
                 SocketError,
                 "Could not open QWP/WebSocket Store-and-Forward queue: {:?}",
