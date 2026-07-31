@@ -182,8 +182,8 @@ impl PublicationLog for SfaSlotQueue {
         Ok(self.queue.check_durability()?)
     }
 
-    fn periodic_sync_in_flight(&self) -> Result<bool, DriverError> {
-        Ok(self.queue.periodic_sync_in_flight()?)
+    fn storage_maintenance_in_flight(&self) -> Result<bool, DriverError> {
+        Ok(self.queue.storage_maintenance_in_flight()?)
     }
 
     fn take_storage_maintenance_step(
@@ -201,6 +201,10 @@ impl PublicationLog for SfaSlotQueue {
         Ok(self
             .queue
             .finish_storage_maintenance(result, allow_install)?)
+    }
+
+    fn complete_storage_maintenance(&mut self) -> Result<(), DriverError> {
+        Ok(self.queue.complete_storage_maintenance()?)
     }
 
     fn record_storage_cleanup_failure(

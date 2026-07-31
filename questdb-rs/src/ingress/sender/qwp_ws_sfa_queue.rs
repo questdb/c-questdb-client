@@ -143,6 +143,7 @@ pub(crate) enum SfaQueueError {
         path: PathBuf,
     },
     Durability(SfaDurabilityFailure),
+    StorageMaintenanceInFlight,
     Closed,
 }
 
@@ -408,7 +409,8 @@ struct SfaEngineState {
     last_sync_completed: Option<Instant>,
     next_sync_delay: Duration,
     durability_failure: Option<SfaDurabilityFailure>,
-    periodic_sync_in_flight: bool,
+    // Covers the full off-lock task, including any cleanup returned by finish.
+    storage_maintenance_in_flight: bool,
     closed: bool,
 }
 
@@ -556,7 +558,7 @@ impl SfaFrameQueue {
                 last_sync_completed: None,
                 next_sync_delay: periodic_sync_interval.unwrap_or(Duration::ZERO),
                 durability_failure: None,
-                periodic_sync_in_flight: false,
+                storage_maintenance_in_flight: false,
                 closed: false,
             }),
             published_upper: AtomicU64::new(next_fsn),
@@ -631,7 +633,7 @@ impl SfaFrameQueue {
                 last_sync_completed: None,
                 next_sync_delay: Duration::ZERO,
                 durability_failure: None,
-                periodic_sync_in_flight: false,
+                storage_maintenance_in_flight: false,
                 closed: false,
             }),
             published_upper: AtomicU64::new(next_fsn),
@@ -731,7 +733,7 @@ impl SfaFrameQueue {
                 last_sync_completed: None,
                 next_sync_delay: periodic_sync_interval.unwrap_or(Duration::ZERO),
                 durability_failure: None,
-                periodic_sync_in_flight: false,
+                storage_maintenance_in_flight: false,
                 closed: false,
             }),
             published_upper: AtomicU64::new(next_fsn),
@@ -848,14 +850,27 @@ impl SfaFrameQueue {
             return Ok(false);
         };
         let changed_before_io = step.changes_queue_before_io();
-        let result = step.perform()?;
-        let finish = self.finish_storage_maintenance(result, true)?;
+        let result = match step.perform() {
+            Ok(result) => result,
+            Err(err) => {
+                self.complete_storage_maintenance()?;
+                return Err(err);
+            }
+        };
+        let finish = match self.finish_storage_maintenance(result, true) {
+            Ok(finish) => finish,
+            Err(err) => {
+                self.complete_storage_maintenance()?;
+                return Err(err);
+            }
+        };
         let changed = changed_before_io || finish.did_change();
         if let Some(cleanup) = finish.into_cleanup()
             && let Some(failure) = cleanup.perform()
         {
             self.record_cleanup_failure(failure);
         }
+        self.complete_storage_maintenance()?;
         Ok(changed)
     }
 
@@ -874,6 +889,10 @@ impl SfaFrameQueue {
     ) -> Result<SfaStorageFinish, SfaQueueError> {
         self.engine
             .finish_storage_maintenance(result, allow_install)
+    }
+
+    pub(crate) fn complete_storage_maintenance(&mut self) -> Result<(), SfaQueueError> {
+        self.engine.complete_storage_maintenance()
     }
 
     pub(crate) fn record_cleanup_failure(&mut self, failure: SfaCleanupFailure) {
@@ -901,8 +920,8 @@ impl SfaFrameQueue {
         self.engine.check_durability()
     }
 
-    pub(crate) fn periodic_sync_in_flight(&self) -> Result<bool, SfaQueueError> {
-        self.engine.periodic_sync_in_flight()
+    pub(crate) fn storage_maintenance_in_flight(&self) -> Result<bool, SfaQueueError> {
+        self.engine.storage_maintenance_in_flight()
     }
 
     pub(crate) fn max_in_flight(&self) -> usize {
@@ -1238,6 +1257,9 @@ impl SfaEngine {
         if state.closed {
             return Ok(());
         }
+        if state.storage_maintenance_in_flight {
+            return Err(SfaQueueError::StorageMaintenanceInFlight);
+        }
         let fully_drained = self.all_published_frames_resolved();
         if !fully_drained && self.periodic_sync_interval.is_some() {
             for segment in state.sealed_segments.iter().chain(state.active.iter()) {
@@ -1317,11 +1339,19 @@ impl SfaEngine {
         }
     }
 
-    fn periodic_sync_in_flight(&self) -> Result<bool, SfaQueueError> {
-        if self.periodic_sync_interval.is_none() {
-            return Ok(false);
+    fn storage_maintenance_in_flight(&self) -> Result<bool, SfaQueueError> {
+        Ok(self.lock_state()?.storage_maintenance_in_flight)
+    }
+
+    fn complete_storage_maintenance(&self) -> Result<(), SfaQueueError> {
+        let mut state = self.lock_state()?;
+        if !state.storage_maintenance_in_flight {
+            return Err(SfaQueueError::CorruptSegments {
+                reason: "storage maintenance completed without an in-flight step",
+            });
         }
-        Ok(self.lock_state()?.periodic_sync_in_flight)
+        state.storage_maintenance_in_flight = false;
+        Ok(())
     }
 
     fn request_sync_before_rotation(&self, active: &SfaSharedSegment) -> bool {
@@ -1411,6 +1441,9 @@ impl SfaEngine {
         allow_create: bool,
         ack_watermark: Option<&mut SfaAckWatermark>,
     ) -> Result<Option<SfaStorageStep>, SfaQueueError> {
+        if self.lock_state()?.storage_maintenance_in_flight {
+            return Ok(None);
+        }
         if let Some(step) = self.take_periodic_sync_step()? {
             return Ok(Some(step));
         }
@@ -1483,6 +1516,7 @@ impl SfaEngine {
             state.allocated_segment_bytes = state
                 .allocated_segment_bytes
                 .saturating_sub(segment.size_bytes());
+            state.storage_maintenance_in_flight = true;
             return Ok(Some(SfaStorageStep::Trim(SfaStorageCleanup::new(segment))));
         }
 
@@ -1510,6 +1544,7 @@ impl SfaEngine {
                 None
             }
         };
+        state.storage_maintenance_in_flight = true;
         Ok(Some(SfaStorageStep::CreateHotSpare {
             path,
             base_seq: self.published_upper.load(Ordering::Acquire),
@@ -1568,7 +1603,7 @@ impl SfaEngine {
         let now = Instant::now();
         let requested = self.sync_requested.load(Ordering::Acquire);
         let mut state = self.lock_state()?;
-        if state.closed || state.periodic_sync_in_flight {
+        if state.closed || state.storage_maintenance_in_flight {
             return Ok(None);
         }
         let before_deadline = state.last_sync_completed.is_some_and(|last_sync| {
@@ -1591,7 +1626,7 @@ impl SfaEngine {
         segments.clear();
         segments.extend(state.sealed_segments.iter().skip(first).cloned());
         segments.extend(state.active.iter().cloned());
-        state.periodic_sync_in_flight = true;
+        state.storage_maintenance_in_flight = true;
         Ok(Some(SfaStorageStep::SyncPublished(SfaSyncBatch {
             segments,
         })))
@@ -1608,7 +1643,6 @@ impl SfaEngine {
                 reason: "periodic sync result on a non-periodic SFA queue",
             })?;
         let mut state = self.lock_state()?;
-        state.periodic_sync_in_flight = false;
         batch.segments.clear();
         state.sync_scratch = batch.segments;
         state.last_sync_completed = Some(Instant::now());
@@ -1966,8 +2000,8 @@ impl PublicationLog for SfaFrameQueue {
         Ok(SfaFrameQueue::check_durability(self)?)
     }
 
-    fn periodic_sync_in_flight(&self) -> Result<bool, DriverError> {
-        Ok(SfaFrameQueue::periodic_sync_in_flight(self)?)
+    fn storage_maintenance_in_flight(&self) -> Result<bool, DriverError> {
+        Ok(SfaFrameQueue::storage_maintenance_in_flight(self)?)
     }
 
     fn oldest_unresolved_fsn(&self) -> Option<u64> {
@@ -2018,6 +2052,10 @@ impl PublicationLog for SfaFrameQueue {
             result,
             allow_install,
         )?)
+    }
+
+    fn complete_storage_maintenance(&mut self) -> Result<(), DriverError> {
+        Ok(SfaFrameQueue::complete_storage_maintenance(self)?)
     }
 
     fn record_storage_cleanup_failure(
@@ -3058,7 +3096,7 @@ mod tests {
         take_sfa_barriers();
         fail_sync_after_for_test(0);
         assert!(queue.maintain_storage().unwrap());
-        assert!(!queue.periodic_sync_in_flight().unwrap());
+        assert!(!queue.storage_maintenance_in_flight().unwrap());
         assert_eq!(
             take_sfa_barriers(),
             vec![
@@ -3109,7 +3147,7 @@ mod tests {
         }
         take_sfa_barriers();
         assert!(queue.maintain_storage().unwrap());
-        assert!(!queue.periodic_sync_in_flight().unwrap());
+        assert!(!queue.storage_maintenance_in_flight().unwrap());
         assert_eq!(
             take_sfa_barriers(),
             vec![
@@ -4842,7 +4880,9 @@ mod tests {
             ]
         );
         assert!(matches!(step, SfaStorageStep::Trim(_)));
-        step.perform().unwrap();
+        let result = step.perform().unwrap();
+        queue.finish_storage_maintenance(result, true).unwrap();
+        queue.complete_storage_maintenance().unwrap();
     }
 
     #[test]
@@ -4968,7 +5008,7 @@ mod tests {
     }
 
     #[test]
-    fn abandoned_hot_spare_after_close_does_not_change_capacity_or_leak_file() {
+    fn in_flight_hot_spare_blocks_close_until_abandoned() {
         let dir = TempDir::new().unwrap();
         let mut queue = SfaFrameQueue::open(options_with(&dir, 38, 114, 4)).unwrap();
         queue.try_submit(b"first").unwrap();
@@ -4981,8 +5021,11 @@ mod tests {
         let result = step.perform().unwrap();
         assert_eq!(sfa_file_count(dir.path()), 3);
 
-        queue.close().unwrap();
-        let finish = queue.finish_storage_maintenance(result, true).unwrap();
+        assert!(matches!(
+            queue.close(),
+            Err(SfaQueueError::StorageMaintenanceInFlight)
+        ));
+        let finish = queue.finish_storage_maintenance(result, false).unwrap();
         assert!(!finish.did_change());
         assert_eq!(queue.allocated_segment_bytes(), 76);
 
@@ -4990,7 +5033,57 @@ mod tests {
             .into_cleanup()
             .expect("created spare should be abandoned");
         assert!(cleanup.perform().is_none());
+        queue.complete_storage_maintenance().unwrap();
+        queue.close().unwrap();
         assert_eq!(sfa_file_count(dir.path()), 2);
+    }
+
+    #[test]
+    fn fully_drained_close_waits_for_in_flight_hot_spare_creation() {
+        let dir = TempDir::new().unwrap();
+        let mut queue = SfaFrameQueue::open(options_with(&dir, 38, 114, 4)).unwrap();
+        queue.try_submit(b"first").unwrap();
+        let last = queue.try_submit(b"second").unwrap();
+        queue.complete_through_fsn(last.fsn).unwrap();
+        assert!(queue.maintain_storage().unwrap());
+        assert!(!queue.hot_spare_installed());
+
+        let step = queue.take_storage_maintenance_step(true).unwrap().unwrap();
+        assert!(matches!(step, SfaStorageStep::CreateHotSpare { .. }));
+
+        assert!(matches!(
+            queue.close(),
+            Err(SfaQueueError::StorageMaintenanceInFlight)
+        ));
+
+        let result = step.perform().unwrap();
+        let finish = queue.finish_storage_maintenance(result, false).unwrap();
+        assert!(finish.into_cleanup().unwrap().perform().is_none());
+        queue.complete_storage_maintenance().unwrap();
+        queue.close().unwrap();
+        assert_eq!(sfa_file_count(dir.path()), 0);
+    }
+
+    #[test]
+    fn fully_drained_close_waits_for_in_flight_trim_cleanup() {
+        let dir = TempDir::new().unwrap();
+        let mut queue = SfaFrameQueue::open(options_with(&dir, 38, 114, 4)).unwrap();
+        queue.try_submit(b"first").unwrap();
+        let last = queue.try_submit(b"second").unwrap();
+        queue.complete_through_fsn(last.fsn).unwrap();
+
+        let step = queue.take_storage_maintenance_step(false).unwrap().unwrap();
+        assert!(matches!(step, SfaStorageStep::Trim(_)));
+        assert!(matches!(
+            queue.close(),
+            Err(SfaQueueError::StorageMaintenanceInFlight)
+        ));
+
+        let result = step.perform().unwrap();
+        queue.finish_storage_maintenance(result, false).unwrap();
+        queue.complete_storage_maintenance().unwrap();
+        queue.close().unwrap();
+        assert_eq!(sfa_file_count(dir.path()), 0);
     }
 
     #[test]
@@ -5011,6 +5104,7 @@ mod tests {
             .into_cleanup()
             .expect("created spare should be abandoned");
         assert!(cleanup.perform().is_none());
+        queue.complete_storage_maintenance().unwrap();
         assert_eq!(sfa_file_count(dir.path()), 2);
     }
 

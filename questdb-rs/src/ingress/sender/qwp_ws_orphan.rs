@@ -1150,6 +1150,7 @@ mod tests {
         assert!(matches!(sync_step, SfaStorageStep::SyncPublished(_)));
         let sync_result = sync_step.perform().unwrap();
         PublicationLog::finish_storage_maintenance(&mut adopted, sync_result, false).unwrap();
+        PublicationLog::complete_storage_maintenance(&mut adopted).unwrap();
         adopted.close().unwrap();
     }
 

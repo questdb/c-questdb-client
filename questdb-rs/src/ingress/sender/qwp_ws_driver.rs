@@ -489,8 +489,8 @@ impl<Q: PublicationLog> QwpWsPublicationStore<Q> {
         self.queue.check_durability()
     }
 
-    pub(crate) fn periodic_sync_in_flight(&self) -> Result<bool, DriverError> {
-        self.queue.periodic_sync_in_flight()
+    pub(crate) fn storage_maintenance_in_flight(&self) -> Result<bool, DriverError> {
+        self.queue.storage_maintenance_in_flight()
     }
 
     pub(crate) fn try_submit(&mut self, payload: &[u8]) -> Result<QwpReceipt, DriverError> {
@@ -607,6 +607,10 @@ impl<Q: PublicationLog> QwpWsPublicationStore<Q> {
     ) -> Result<SfaStorageFinish, DriverError> {
         self.queue
             .finish_storage_maintenance(result, self.lifecycle.load() == PublicationState::Open)
+    }
+
+    pub(crate) fn complete_storage_maintenance(&mut self) -> Result<(), DriverError> {
+        self.queue.complete_storage_maintenance()
     }
 
     pub(crate) fn record_storage_cleanup_failure(
@@ -2052,14 +2056,29 @@ impl<T: QwpWsCoreTransport> QwpWsSendCore<T> {
             return Ok(false);
         };
         let changed_before_io = step.changes_queue_before_io();
-        let result = step.perform()?;
-        let finish = store.finish_storage_maintenance(result)?;
+        let result = match step.perform() {
+            Ok(result) => result,
+            Err(err) => {
+                store.complete_storage_maintenance()?;
+                return Err(err.into());
+            }
+        };
+        let finish = match store.finish_storage_maintenance(result) {
+            Ok(finish) => finish,
+            Err(err) => {
+                store.complete_storage_maintenance()?;
+                return Err(err);
+            }
+        };
         let changed = changed_before_io || finish.did_change();
         if let Some(cleanup) = finish.into_cleanup()
             && let Some(failure) = cleanup.perform()
+            && let Err(err) = store.record_storage_cleanup_failure(failure)
         {
-            store.record_storage_cleanup_failure(failure)?;
+            store.complete_storage_maintenance()?;
+            return Err(err);
         }
+        store.complete_storage_maintenance()?;
         Ok(changed)
     }
 
@@ -2691,7 +2710,10 @@ pub(crate) trait PublicationLog {
     fn check_durability(&self) -> Result<(), DriverError> {
         Ok(())
     }
-    fn periodic_sync_in_flight(&self) -> Result<bool, DriverError> {
+    // A task returned by take_storage_maintenance_step() holds this lease
+    // until complete_storage_maintenance() is called after all deferred
+    // cleanup. Close must not tear down the publication log in between.
+    fn storage_maintenance_in_flight(&self) -> Result<bool, DriverError> {
         Ok(false)
     }
     fn take_storage_maintenance_step(
@@ -2706,6 +2728,10 @@ pub(crate) trait PublicationLog {
         _allow_install: bool,
     ) -> Result<SfaStorageFinish, DriverError> {
         Ok(SfaStorageFinish::unchanged())
+    }
+    // Retire the task-wide lease acquired by take_storage_maintenance_step().
+    fn complete_storage_maintenance(&mut self) -> Result<(), DriverError> {
+        Ok(())
     }
     fn record_storage_cleanup_failure(
         &mut self,

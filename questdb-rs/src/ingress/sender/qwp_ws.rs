@@ -806,13 +806,13 @@ where
                 // reaching either recovery path.
                 check_store_terminal_error(&store)?;
                 if store.all_published_receipts_resolved() {
-                    // A periodic checkpoint performs mmap/file sync off the
-                    // publication-store lock. Its batch owns segment mappings,
-                    // so wait for finish_storage_maintenance() to retire it
-                    // before close tears down mappings, unlinks files, or
-                    // releases the slot lock.
+                    // Storage maintenance performs file work off the
+                    // publication-store lock. A task may own segment mappings,
+                    // create a hot-spare file, or unlink a retired segment, so
+                    // wait for the entire task (including deferred cleanup) to
+                    // retire before close tears down the slot.
                     if !store
-                        .periodic_sync_in_flight()
+                        .storage_maintenance_in_flight()
                         .map_err(driver_error_to_error_without_state)?
                     {
                         store
@@ -1431,22 +1431,27 @@ where
                     Ok(store) => store,
                     Err(_) => return self.handle_poisoned_lock(),
                 };
+                if let Err(completion_err) = store.complete_storage_maintenance() {
+                    return self.store_driver_error(&mut store, completion_err);
+                }
                 return self.store_driver_error(&mut store, err.into());
             }
         };
 
-        let (finish, terminal) = {
+        let finish = {
             let mut store = match shared.lock() {
                 Ok(store) => store,
                 Err(_) => return self.handle_poisoned_lock(),
             };
             self.flush_cold_effects_locked(&mut store);
             match store.finish_storage_maintenance(result) {
-                Ok(finish) => {
-                    let terminal = store.is_terminal();
-                    (finish, terminal)
+                Ok(finish) => finish,
+                Err(err) => {
+                    if let Err(completion_err) = store.complete_storage_maintenance() {
+                        return self.store_driver_error(&mut store, completion_err);
+                    }
+                    return self.store_driver_error(&mut store, err);
                 }
-                Err(err) => return self.store_driver_error(&mut store, err),
             }
         };
 
@@ -1454,17 +1459,28 @@ where
         if changed {
             self.backpressure.notify_all();
         }
-        if let Some(cleanup) = finish.into_cleanup()
-            && let Some(failure) = cleanup.perform()
-        {
+        let cleanup_failure = finish.into_cleanup().and_then(|cleanup| cleanup.perform());
+        let terminal = {
             let mut store = match shared.lock() {
                 Ok(store) => store,
                 Err(_) => return self.handle_poisoned_lock(),
             };
-            if let Err(err) = store.record_storage_cleanup_failure(failure) {
+            if let Some(failure) = cleanup_failure
+                && let Err(err) = store.record_storage_cleanup_failure(failure)
+            {
+                if let Err(completion_err) = store.complete_storage_maintenance() {
+                    return self.store_driver_error(&mut store, completion_err);
+                }
                 return self.store_driver_error(&mut store, err);
             }
-        }
+            if let Err(err) = store.complete_storage_maintenance() {
+                return self.store_driver_error(&mut store, err);
+            }
+            store.is_terminal()
+        };
+        // Closing may be waiting solely for the task-wide maintenance lease,
+        // including a successful task that made no queue-visible change.
+        self.backpressure.notify_all();
 
         if terminal {
             RunnerStep::Stop
@@ -5213,7 +5229,7 @@ mod tests {
         );
 
         let mut store = shared.lock().unwrap();
-        assert!(!store.periodic_sync_in_flight().unwrap());
+        assert!(!store.storage_maintenance_in_flight().unwrap());
         assert!(
             store.take_storage_maintenance_step().unwrap().is_none(),
             "the runner must finish the initial periodic sync and arm its configured cadence"
@@ -5248,7 +5264,7 @@ mod tests {
             .unwrap()
             .expect("periodic queue must offer its initial sync step");
         assert!(matches!(sync_step, SfaStorageStep::SyncPublished(_)));
-        assert!(PublicationLog::periodic_sync_in_flight(&queue).unwrap());
+        assert!(PublicationLog::storage_maintenance_in_flight(&queue).unwrap());
 
         let driver = QwpWsCoreTestHarness::from_queue(queue, FakeOrderedServer::no_response());
         let mut runner = SyncQwpWsRunner::start(driver);
@@ -5270,6 +5286,84 @@ mod tests {
             .lock()
             .unwrap()
             .finish_storage_maintenance(sync_result)
+            .unwrap();
+        runner
+            .shared
+            .lock()
+            .unwrap()
+            .complete_storage_maintenance()
+            .unwrap();
+        runner.drain_to_deadline(None).unwrap();
+
+        SfaSlotQueue::open(slot_options).unwrap();
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn threaded_runner_waits_for_in_flight_hot_spare_creation_before_close() {
+        let dir = TempDir::new().unwrap();
+        let slot_options = SfaSlotOptions {
+            sf_dir: dir.path().to_path_buf(),
+            sender_id: "hot-spare-runner".to_string(),
+            segment_size_bytes: 38,
+            max_bytes: 114,
+            max_in_flight: 4,
+            periodic_sync_interval: None,
+        };
+        let mut queue = SfaSlotQueue::open(slot_options.clone()).unwrap();
+        PublicationLog::try_publish(&mut queue, b"first").unwrap();
+        let last = PublicationLog::try_publish(&mut queue, b"second").unwrap();
+        PublicationLog::progress_view(&queue)
+            .complete_through_fsn(last.fsn)
+            .unwrap();
+        PublicationLog::persist_completed_fsn(&mut queue, last.fsn);
+
+        // Retire the sealed segment first so the next maintenance task is the
+        // hot-spare creation involved in the close race.
+        let trim_step = PublicationLog::take_storage_maintenance_step(&mut queue, false)
+            .unwrap()
+            .expect("completed sealed segment must schedule trim");
+        assert!(matches!(trim_step, SfaStorageStep::Trim(_)));
+        let trim_result = trim_step.perform().unwrap();
+        PublicationLog::finish_storage_maintenance(&mut queue, trim_result, false).unwrap();
+        PublicationLog::complete_storage_maintenance(&mut queue).unwrap();
+
+        // Hold the real task after taking it. This is the precise window where
+        // its off-lock file creation used to race a fully drained close.
+        let create_step = PublicationLog::take_storage_maintenance_step(&mut queue, true)
+            .unwrap()
+            .expect("queue without a spare must schedule creation");
+        assert!(matches!(create_step, SfaStorageStep::CreateHotSpare { .. }));
+        assert!(PublicationLog::storage_maintenance_in_flight(&queue).unwrap());
+
+        let driver = QwpWsCoreTestHarness::from_queue(queue, FakeOrderedServer::no_response());
+        let mut runner = SyncQwpWsRunner::start(driver);
+        runner.begin_close();
+
+        let err = runner
+            .drain_to_deadline(Some(Instant::now()))
+            .expect_err("close must wait for the held hot-spare creation");
+        assert!(err.msg().contains("close drain timed out"));
+        assert!(matches!(
+            SfaSlotQueue::open(slot_options.clone()),
+            Err(SfaQueueError::SlotInUse { .. })
+        ));
+
+        let create_result = create_step.perform().unwrap();
+        let cleanup = runner
+            .shared
+            .lock()
+            .unwrap()
+            .finish_storage_maintenance(create_result)
+            .unwrap()
+            .into_cleanup()
+            .expect("closing queue must abandon the created spare");
+        assert!(cleanup.perform().is_none());
+        runner
+            .shared
+            .lock()
+            .unwrap()
+            .complete_storage_maintenance()
             .unwrap();
         runner.drain_to_deadline(None).unwrap();
 
