@@ -1869,6 +1869,8 @@ impl SenderBuilder {
 
     #[cfg(feature = "_sender-qwp-ws")]
     fn store_and_forward_sync_interval_millis(mut self, value: &str) -> Result<Self> {
+        const MAX_MILLIS: i64 = i64::MAX / 1_000_000;
+
         let Some(qwp_ws) = &mut self.qwp_ws else {
             return Err(error::fmt!(
                 ConfigError,
@@ -1876,10 +1878,16 @@ impl SenderBuilder {
             ));
         };
         let millis: i64 = parse_conf_value("sf_sync_interval_millis", value)?;
-        if millis <= 0 || millis > i64::MAX / 1_000_000 {
+        if millis <= 0 {
             return Err(error::fmt!(
                 ConfigError,
-                "sf_sync_interval_millis is out of range: {millis}"
+                "\"sf_sync_interval_millis\" must be greater than 0."
+            ));
+        }
+        if millis > MAX_MILLIS {
+            return Err(error::fmt!(
+                ConfigError,
+                "\"sf_sync_interval_millis\" must be at most {MAX_MILLIS}."
             ));
         }
         qwp_ws.sf_sync_interval.set_specified(

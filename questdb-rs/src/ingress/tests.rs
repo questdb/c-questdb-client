@@ -643,7 +643,7 @@ fn qwpws_periodic_durability_config_matches_java() {
         SenderBuilder::from_conf(
             "ws::addr=127.0.0.1:1;sf_durability=periodic;sf_sync_interval_millis=0;",
         ),
-        "sf_sync_interval_millis is out of range: 0",
+        "\"sf_sync_interval_millis\" must be greater than 0.",
     );
 
     let max_valid = i64::MAX / 1_000_000;
@@ -658,7 +658,7 @@ fn qwpws_periodic_durability_config_matches_java() {
              sf_sync_interval_millis={};",
             max_valid + 1
         )),
-        format!("sf_sync_interval_millis is out of range: {}", max_valid + 1),
+        format!("\"sf_sync_interval_millis\" must be at most {max_valid}."),
     );
 }
 

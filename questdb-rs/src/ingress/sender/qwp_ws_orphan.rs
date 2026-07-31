@@ -712,12 +712,20 @@ fn sleep_before_orphan_reconnect(
 }
 
 #[cfg(feature = "sync-sender-qwp-ws")]
+fn next_orphan_retry_backoff(current: Duration, max: Duration) -> Duration {
+    current.checked_mul(2).unwrap_or(Duration::MAX).min(max)
+}
+
+#[cfg(feature = "sync-sender-qwp-ws")]
 fn drain_orphan_to_completion(
     slot_dir: PathBuf,
     config: &OrphanDrainerConfig,
     stop: &AtomicBool,
     traffic_gate: &Arc<TrafficGate>,
 ) {
+    let initial_backoff = *config.qwp_ws.reconnect_initial_backoff;
+    let max_backoff = *config.qwp_ws.reconnect_max_backoff;
+    let mut retry_backoff = initial_backoff;
     let mut drainer = loop {
         match OrphanDrainer::open_with_stop(slot_dir.clone(), config, stop, traffic_gate) {
             OrphanOpenOutcome::Drainer(drainer) => break drainer,
@@ -727,13 +735,10 @@ fn drain_orphan_to_completion(
             | OrphanOpenOutcome::Stopped => return,
             OrphanOpenOutcome::RetryLater(reason) => {
                 record_last_error_unless_stopped(&slot_dir, &reason, stop);
-                if !sleep_before_orphan_reconnect(
-                    None,
-                    *config.qwp_ws.reconnect_initial_backoff,
-                    Some(stop),
-                ) {
+                if !sleep_before_orphan_reconnect(None, retry_backoff, Some(stop)) {
                     return;
                 }
+                retry_backoff = next_orphan_retry_backoff(retry_backoff, max_backoff);
             }
             OrphanOpenOutcome::Unrecoverable(reason) => {
                 mark_orphan_failed_unless_stopped(&slot_dir, &reason, stop);
@@ -741,6 +746,7 @@ fn drain_orphan_to_completion(
             }
         }
     };
+    retry_backoff = initial_backoff;
     while !stop.load(Ordering::Acquire) {
         match drainer.drive_once_with_stop(stop) {
             OrphanDriveOutcome::Drained => {
@@ -751,17 +757,17 @@ fn drain_orphan_to_completion(
                 if !stop.load(Ordering::Acquire) {
                     drainer.record_last_error(&reason);
                 }
-                if !sleep_before_orphan_reconnect(
-                    None,
-                    *config.qwp_ws.reconnect_initial_backoff,
-                    Some(stop),
-                ) {
+                if !sleep_before_orphan_reconnect(None, retry_backoff, Some(stop)) {
                     return;
                 }
+                retry_backoff = next_orphan_retry_backoff(retry_backoff, max_backoff);
             }
             OrphanDriveOutcome::Stopped => return,
-            OrphanDriveOutcome::Progress => {}
-            OrphanDriveOutcome::Idle => thread::sleep(ORPHAN_IDLE_PARK),
+            OrphanDriveOutcome::Progress => retry_backoff = initial_backoff,
+            OrphanDriveOutcome::Idle => {
+                retry_backoff = initial_backoff;
+                thread::sleep(ORPHAN_IDLE_PARK);
+            }
         }
     }
 }
@@ -1065,6 +1071,21 @@ mod tests {
             "orphan reconnect sleep ignored stop request"
         );
         stopper.join().unwrap();
+    }
+
+    #[cfg(feature = "sync-sender-qwp-ws")]
+    #[test]
+    fn orphan_retry_backoff_doubles_and_caps() {
+        let max = Duration::from_millis(500);
+        let mut backoff = Duration::from_millis(100);
+
+        backoff = next_orphan_retry_backoff(backoff, max);
+        assert_eq!(backoff, Duration::from_millis(200));
+        backoff = next_orphan_retry_backoff(backoff, max);
+        assert_eq!(backoff, Duration::from_millis(400));
+        backoff = next_orphan_retry_backoff(backoff, max);
+        assert_eq!(backoff, max);
+        assert_eq!(next_orphan_retry_backoff(backoff, max), max);
     }
 
     #[cfg(all(feature = "sync-sender-qwp-ws", any(unix, windows)))]

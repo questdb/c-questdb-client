@@ -817,7 +817,8 @@ impl SfaFrameQueue {
         if after > before
             && let Some(ack_watermark) = self.ack_watermark.as_mut()
         {
-            ack_watermark.write(acked_fsn as i64)?;
+            let acked_fsn = i64::try_from(acked_fsn).map_err(|_| QueueError::SequenceOverflow)?;
+            ack_watermark.write(acked_fsn)?;
         }
         Ok(())
     }
@@ -2097,6 +2098,7 @@ fn recover_completed_upper(
                     .and_then(|fsn| i64::try_from(fsn).ok())
                     .unwrap_or(-1);
                 ack_watermark.write(segment_floor_fsn)?;
+                ack_watermark.sync_data()?;
                 segment_completed_upper
             }
         },
