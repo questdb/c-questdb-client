@@ -474,6 +474,10 @@ struct SfaEngineState {
     last_sync_completed: Option<Instant>,
     next_sync_delay: Duration,
     durability_failure: Option<SfaDurabilityFailure>,
+    // Reserves an ordered rotation/trim manifest transaction while its disk
+    // barriers run without the state mutex. Readers continue against the old
+    // topology; competing writers and close defer until commit/rollback.
+    topology_io_in_flight: bool,
     // Covers the full off-lock task, including any cleanup returned by finish.
     storage_maintenance_in_flight: bool,
     closed: bool,
@@ -623,6 +627,7 @@ impl SfaFrameQueue {
                 last_sync_completed: None,
                 next_sync_delay: periodic_sync_interval.unwrap_or(Duration::ZERO),
                 durability_failure: None,
+                topology_io_in_flight: false,
                 storage_maintenance_in_flight: false,
                 closed: false,
             }),
@@ -698,6 +703,7 @@ impl SfaFrameQueue {
                 last_sync_completed: None,
                 next_sync_delay: Duration::ZERO,
                 durability_failure: None,
+                topology_io_in_flight: false,
                 storage_maintenance_in_flight: false,
                 closed: false,
             }),
@@ -798,6 +804,7 @@ impl SfaFrameQueue {
                 last_sync_completed: None,
                 next_sync_delay: periodic_sync_interval.unwrap_or(Duration::ZERO),
                 durability_failure: None,
+                topology_io_in_flight: false,
                 storage_maintenance_in_flight: false,
                 closed: false,
             }),
@@ -1234,69 +1241,182 @@ impl SfaProducer {
             });
         }
 
-        let mut state = self.engine.lock_state()?;
-        let active = state.active.as_ref().ok_or(SfaQueueError::Closed)?;
-        if !Arc::ptr_eq(active, &self.active) {
-            return Err(SfaQueueError::CorruptSegments {
-                reason: "producer active segment is not the engine active segment",
-            });
+        enum Candidate {
+            Existing(Arc<SfaSharedSegment>),
+            Create {
+                path: Option<PathBuf>,
+                created_us: u64,
+            },
         }
-        if self.engine.request_sync_before_rotation(active) {
-            return Err(self.engine.rotation_backpressure_error(&state).into());
-        }
-        let previous_active_base = active.base_seq();
-        let new_active = match state.hot_spare.take() {
-            Some(mut new_active) => {
-                let rebase_result = if let Some(shared) = Arc::get_mut(&mut new_active) {
-                    shared.rebase_empty(self.next_fsn)
-                } else {
-                    state.hot_spare = Some(new_active);
-                    return Err(SfaQueueError::CorruptSegments {
-                        reason: "hot spare segment is shared before promotion",
-                    });
-                };
-                if let Err(err) = rebase_result {
-                    state.hot_spare = Some(new_active);
-                    return Err(err.into());
-                }
-                new_active
+
+        // Reserve the topology transaction and detach its manifest writer.
+        // Until commit, readers keep seeing the previous active and sealed
+        // chain. No filesystem operation below holds the engine-state mutex.
+        let (candidate, mut manifest, old_active, head_base, reserved_new_segment) = {
+            let mut state = self.engine.lock_state()?;
+            let active = state.active.as_ref().ok_or(SfaQueueError::Closed)?;
+            if !Arc::ptr_eq(active, &self.active) {
+                return Err(SfaQueueError::CorruptSegments {
+                    reason: "producer active segment is not the engine active segment",
+                });
             }
-            // No prepared spare. The runner's maintenance step is the normal
-            // supplier, but it runs only between `drive_step` iterations — a
-            // runner parked in a blocking socket send (peer zero-window) never
-            // reaches it, and waiting on the backpressure notifier would starve
-            // the appender until `sf_append_deadline` with the byte budget
-            // still unused. Store-and-forward must keep absorbing appends up
-            // to `max_bytes` through exactly that kind of outage, so allocate
-            // the replacement segment inline instead.
-            None => self
-                .engine
-                .allocate_segment_inline(&mut state, self.next_fsn)?,
+            if state.topology_io_in_flight {
+                return Err(self.engine.rotation_backpressure_error(&state).into());
+            }
+            if self.engine.request_sync_before_rotation(active) {
+                return Err(self.engine.rotation_backpressure_error(&state).into());
+            }
+            if self.engine.slot_dir.is_some() && state.manifest.is_none() {
+                return Err(SfaQueueError::Recovery {
+                    reason: "cannot rotate a manifested SFA slot without its manifest".to_string(),
+                });
+            }
+
+            let old_active = Arc::clone(active);
+            let head_base = state
+                .sealed_segments
+                .front()
+                .map(|segment| segment.base_seq())
+                .unwrap_or_else(|| active.base_seq());
+            let (candidate, reserved_new_segment) = match state.hot_spare.take() {
+                Some(segment) => (Candidate::Existing(segment), false),
+                None => {
+                    // The runner normally prepares the spare. If it is parked
+                    // in socket I/O, reserve budget and create the successor on
+                    // this appender without monopolizing topology readers.
+                    if !self.engine.allow_segment_creation
+                        || !can_allocate_segment(
+                            state.allocated_segment_bytes,
+                            self.engine.segment_size_bytes,
+                            self.engine.max_bytes,
+                        )
+                    {
+                        return Err(self.engine.storage_backpressure_error(&state).into());
+                    }
+                    let path = match self.engine.slot_dir.as_deref() {
+                        Some(slot_dir) => {
+                            Some(next_segment_path(slot_dir, &mut state.next_generation)?)
+                        }
+                        None => {
+                            state.next_generation = state
+                                .next_generation
+                                .checked_add(1)
+                                .ok_or(QueueError::SequenceOverflow)?;
+                            None
+                        }
+                    };
+                    state.allocated_segment_bytes = state
+                        .allocated_segment_bytes
+                        .checked_add(self.engine.segment_size_bytes)
+                        .ok_or(QueueError::SequenceOverflow)?;
+                    (
+                        Candidate::Create {
+                            path,
+                            created_us: unix_time_micros(),
+                        },
+                        true,
+                    )
+                }
+            };
+            let manifest = state.manifest.take();
+            state.topology_io_in_flight = true;
+            (
+                candidate,
+                manifest,
+                old_active,
+                head_base,
+                reserved_new_segment,
+            )
+        };
+
+        let prepared = match candidate {
+            Candidate::Existing(mut segment) => {
+                let result = match Arc::get_mut(&mut segment) {
+                    Some(shared) => shared.rebase_empty(self.next_fsn).map_err(Into::into),
+                    None => Err(SfaQueueError::CorruptSegments {
+                        reason: "hot spare segment is shared before promotion",
+                    }),
+                };
+                match result {
+                    Ok(()) => Ok(segment),
+                    Err(err) => Err((Some(segment), err)),
+                }
+            }
+            Candidate::Create { path, created_us } => {
+                let result = match path.as_deref() {
+                    Some(path) => match path.parent() {
+                        Some(slot_dir) => create_manifested_segment(
+                            path,
+                            self.next_fsn,
+                            self.engine.segment_size_bytes,
+                            created_us,
+                            slot_dir,
+                        ),
+                        None => Err(SfaQueueError::InvalidSfDir),
+                    },
+                    None => SfaSegment::create_memory(
+                        self.next_fsn,
+                        self.engine.segment_size_bytes,
+                        created_us,
+                    )
+                    .map_err(Into::into),
+                };
+                result
+                    .map(|segment| Arc::new(SfaSharedSegment::new(segment)))
+                    .map_err(|err| (None, err))
+            }
+        };
+
+        let new_active = match prepared {
+            Ok(segment) => segment,
+            Err((candidate, err)) => {
+                let mut state = self.engine.lock_state()?;
+                state.manifest = manifest;
+                state.topology_io_in_flight = false;
+                if let Some(candidate) = candidate {
+                    debug_assert!(state.hot_spare.is_none());
+                    state.hot_spare = Some(candidate);
+                } else if reserved_new_segment {
+                    state.allocated_segment_bytes = state
+                        .allocated_segment_bytes
+                        .saturating_sub(self.engine.segment_size_bytes);
+                }
+                return Err(err);
+            }
         };
         #[cfg(test)]
-        if state.manifest.is_some() {
+        if manifest.is_some() {
             record_sfa_barrier(SfaBarrierEvent::RotationHeaderSynced);
         }
 
-        let head_base = state
-            .sealed_segments
-            .front()
-            .map(|segment| segment.base_seq())
-            .unwrap_or(previous_active_base);
-        let manifest_update_error = state
-            .manifest
+        let manifest_update_error = manifest
             .as_mut()
             .and_then(|manifest| manifest.update(head_base, self.next_fsn).err());
+
+        let mut state = self.engine.lock_state()?;
+        state.manifest = manifest;
+        state.topology_io_in_flight = false;
         if let Some(err) = manifest_update_error {
+            debug_assert!(state.hot_spare.is_none());
             state.hot_spare = Some(new_active);
             return Err(err.into());
+        }
+        if state.closed
+            || !state
+                .active
+                .as_ref()
+                .is_some_and(|active| Arc::ptr_eq(active, &old_active))
+        {
+            debug_assert!(state.hot_spare.is_none());
+            state.hot_spare = Some(new_active);
+            return Err(SfaQueueError::Closed);
         }
         #[cfg(test)]
         if state.manifest.is_some() {
             record_sfa_barrier(SfaBarrierEvent::RotationManifestUpdated);
         }
-        let old_active = state.active.replace(Arc::clone(&new_active)).unwrap();
-        state.sealed_segments.push_back(old_active);
+        let replaced = state.active.replace(Arc::clone(&new_active)).unwrap();
+        state.sealed_segments.push_back(replaced);
         #[cfg(test)]
         if state.manifest.is_some() {
             record_sfa_barrier(SfaBarrierEvent::RotationQueueMutated);
@@ -1322,7 +1442,7 @@ impl SfaEngine {
         if state.closed {
             return Ok(());
         }
-        if state.storage_maintenance_in_flight {
+        if state.storage_maintenance_in_flight || state.topology_io_in_flight {
             return Err(SfaQueueError::StorageMaintenanceInFlight);
         }
         let fully_drained = self.all_published_frames_resolved();
@@ -1405,7 +1525,8 @@ impl SfaEngine {
     }
 
     fn storage_maintenance_in_flight(&self) -> Result<bool, SfaQueueError> {
-        Ok(self.lock_state()?.storage_maintenance_in_flight)
+        let state = self.lock_state()?;
+        Ok(state.storage_maintenance_in_flight || state.topology_io_in_flight)
     }
 
     fn complete_storage_maintenance(&self) -> Result<(), SfaQueueError> {
@@ -1506,15 +1627,17 @@ impl SfaEngine {
         allow_create: bool,
         ack_watermark: Option<&mut SfaAckWatermark>,
     ) -> Result<Option<SfaStorageStep>, SfaQueueError> {
-        if self.lock_state()?.storage_maintenance_in_flight {
+        let state = self.lock_state()?;
+        if state.storage_maintenance_in_flight || state.topology_io_in_flight {
             return Ok(None);
         }
+        drop(state);
         if let Some(step) = self.take_periodic_sync_step()? {
             return Ok(Some(step));
         }
         let trim_candidates = {
             let state = self.lock_state()?;
-            if state.closed {
+            if state.closed || state.topology_io_in_flight {
                 return Ok(None);
             }
             self.trimmable_prefix(&state, MAX_TRIMS_PER_STORAGE_STEP)?
@@ -1541,7 +1664,7 @@ impl SfaEngine {
             }
 
             let mut state = self.lock_state()?;
-            if state.closed {
+            if state.closed || state.topology_io_in_flight {
                 return Ok(None);
             }
             if state.sealed_segments.len() < trim_candidates.len()
@@ -1567,14 +1690,32 @@ impl SfaEngine {
                     .get(trim_candidates.len())
                     .map(|segment| segment.base_seq())
                     .unwrap_or(active_base);
-                let manifest = state
-                    .manifest
-                    .as_mut()
-                    .ok_or_else(|| SfaQueueError::Recovery {
-                        reason: "cannot trim a manifested SFA slot without its manifest"
-                            .to_string(),
-                    })?;
-                manifest.update(new_head_base, active_base)?;
+                let mut manifest =
+                    state
+                        .manifest
+                        .take()
+                        .ok_or_else(|| SfaQueueError::Recovery {
+                            reason: "cannot trim a manifested SFA slot without its manifest"
+                                .to_string(),
+                        })?;
+                state.topology_io_in_flight = true;
+                drop(state);
+
+                let update_result = manifest.update(new_head_base, active_base);
+                state = self.lock_state()?;
+                state.manifest = Some(manifest);
+                state.topology_io_in_flight = false;
+                update_result?;
+                if state.closed
+                    || state.sealed_segments.len() < trim_candidates.len()
+                    || !state
+                        .sealed_segments
+                        .iter()
+                        .zip(&trim_candidates)
+                        .all(|(current, candidate)| Arc::ptr_eq(current, candidate))
+                {
+                    return Ok(None);
+                }
                 #[cfg(test)]
                 record_sfa_barrier(SfaBarrierEvent::TrimManifestUpdated);
             }
@@ -1650,6 +1791,7 @@ impl SfaEngine {
                 if allow_install
                     && self.allow_segment_creation
                     && !state.closed
+                    && !state.topology_io_in_flight
                     && state.hot_spare.is_none()
                     && segment.published_frame_count() == 0
                     && segment.size_bytes() == self.segment_size_bytes
@@ -1682,7 +1824,7 @@ impl SfaEngine {
         let now = Instant::now();
         let requested = self.sync_requested.load(Ordering::Acquire);
         let mut state = self.lock_state()?;
-        if state.closed || state.storage_maintenance_in_flight {
+        if state.closed || state.storage_maintenance_in_flight || state.topology_io_in_flight {
             return Ok(None);
         }
         let before_deadline = state.last_sync_completed.is_some_and(|last_sync| {
@@ -1824,55 +1966,6 @@ impl SfaEngine {
                 max_total_bytes: self.max_bytes as u64,
             }
         }
-    }
-
-    /// Creates a fresh segment on the appender thread when rotation finds no
-    /// prepared hot spare, charging it to the byte budget under the state
-    /// lock. Mirrors the `CreateHotSpare` maintenance step (same path /
-    /// generation / budget bookkeeping); the runner's maintenance remains an
-    /// optimization that pre-warms the spare, not a liveness requirement for
-    /// appends. Fails with the storage backpressure error when creation is
-    /// not allowed or the budget is exhausted, and propagates segment-creation
-    /// I/O errors (the runner's maintenance path treats those as terminal
-    /// storage errors too).
-    fn allocate_segment_inline(
-        &self,
-        state: &mut SfaEngineState,
-        base_seq: u64,
-    ) -> Result<Arc<SfaSharedSegment>, SfaQueueError> {
-        if !self.allow_segment_creation
-            || !can_allocate_segment(
-                state.allocated_segment_bytes,
-                self.segment_size_bytes,
-                self.max_bytes,
-            )
-        {
-            return Err(self.storage_backpressure_error(state).into());
-        }
-        let segment = match self.slot_dir.as_deref() {
-            Some(slot_dir) => {
-                let path = next_segment_path(slot_dir, &mut state.next_generation)?;
-                create_manifested_segment(
-                    &path,
-                    base_seq,
-                    self.segment_size_bytes,
-                    unix_time_micros(),
-                    slot_dir,
-                )?
-            }
-            None => {
-                state.next_generation = state
-                    .next_generation
-                    .checked_add(1)
-                    .ok_or(QueueError::SequenceOverflow)?;
-                SfaSegment::create_memory(base_seq, self.segment_size_bytes, unix_time_micros())?
-            }
-        };
-        state.allocated_segment_bytes = state
-            .allocated_segment_bytes
-            .checked_add(self.segment_size_bytes)
-            .ok_or(QueueError::SequenceOverflow)?;
-        Ok(Arc::new(SfaSharedSegment::new(segment)))
     }
 
     fn trimmable_prefix(
@@ -3025,6 +3118,7 @@ fn payload_at_send_cursor(cursor: &SfaSendCursor) -> Option<(SfaMappedPayload, u
 #[cfg(test)]
 mod tests {
     use std::path::Path;
+    use std::sync::{Barrier, mpsc};
 
     use tempfile::TempDir;
 
@@ -4773,6 +4867,263 @@ mod tests {
         submit_with_storage_maintenance(&mut queue, b"two");
 
         assert_eq!(next_cursor_payload_vec(&queue, &mut send_cursor, 1), b"two");
+    }
+
+    #[test]
+    fn rotation_manifest_sync_does_not_block_segment_lookup() {
+        let dir = TempDir::new().unwrap();
+        let mut queue = SfaFrameQueue::open(options_with(&dir, 38, 38 * 4, 4)).unwrap();
+        let mut producer = queue.take_producer().unwrap();
+        producer.try_submit(b"one").unwrap();
+
+        let entered_sync = Arc::new(Barrier::new(2));
+        let release_sync = Arc::new(Barrier::new(2));
+        {
+            let mut state = queue.engine.state.lock().unwrap();
+            let entered_sync = Arc::clone(&entered_sync);
+            let release_sync = Arc::clone(&release_sync);
+            state
+                .manifest
+                .as_mut()
+                .unwrap()
+                .set_before_sync_hook(Arc::new(move || {
+                    entered_sync.wait();
+                    release_sync.wait();
+                    Ok(())
+                }));
+        }
+
+        let rotation = std::thread::spawn(move || producer.try_submit(b"two"));
+        entered_sync.wait();
+
+        let engine = Arc::clone(&queue.engine);
+        let (lookup_done, lookup_result) = mpsc::channel();
+        let lookup = std::thread::spawn(move || {
+            let missed_without_blocking = engine.segment_for_fsn(1).is_none();
+            lookup_done.send(missed_without_blocking).unwrap();
+        });
+        let completed_off_lock = lookup_result
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap_or(false);
+        assert!(queue.storage_maintenance_in_flight().unwrap());
+        assert!(matches!(
+            queue.close(),
+            Err(SfaQueueError::StorageMaintenanceInFlight)
+        ));
+
+        release_sync.wait();
+        rotation.join().unwrap().unwrap();
+        lookup.join().unwrap();
+        assert!(
+            completed_off_lock,
+            "cursor miss blocked behind manifest sync while rotation held engine state"
+        );
+    }
+
+    #[test]
+    fn failed_off_lock_rotation_restores_manifest_spare_and_capacity() {
+        let dir = TempDir::new().unwrap();
+        let mut queue = SfaFrameQueue::open(options_with(&dir, 38, 38 * 3, 4)).unwrap();
+        let mut producer = queue.take_producer().unwrap();
+        producer.try_submit(b"one").unwrap();
+        let allocated_before = queue.allocated_segment_bytes();
+        {
+            let mut state = queue.engine.state.lock().unwrap();
+            state
+                .manifest
+                .as_mut()
+                .unwrap()
+                .set_before_sync_hook(Arc::new(|| {
+                    Err(io::Error::other("injected manifest sync failure"))
+                }));
+        }
+
+        assert!(matches!(
+            producer.try_submit(b"two"),
+            Err(SfaQueueError::Io(_))
+        ));
+        assert!(!queue.storage_maintenance_in_flight().unwrap());
+        assert!(queue.hot_spare_installed());
+        assert_eq!(queue.sealed_segment_count(), 0);
+        assert_eq!(queue.allocated_segment_bytes(), allocated_before);
+
+        queue
+            .engine
+            .state
+            .lock()
+            .unwrap()
+            .manifest
+            .as_mut()
+            .unwrap()
+            .clear_before_sync_hook();
+        assert_eq!(producer.try_submit(b"two").unwrap().fsn, 1);
+        assert_eq!(queue.sealed_segment_count(), 1);
+        assert!(!queue.hot_spare_installed());
+    }
+
+    #[test]
+    fn completed_hot_spare_is_abandoned_during_off_lock_rotation() {
+        let dir = TempDir::new().unwrap();
+        let mut queue = SfaFrameQueue::open(options_with(&dir, 38, 38 * 4, 4)).unwrap();
+        let mut producer = queue.take_producer().unwrap();
+        producer.try_submit(b"one").unwrap();
+        producer.try_submit(b"two").unwrap();
+
+        let spare_step = queue.take_storage_maintenance_step(true).unwrap().unwrap();
+        assert!(matches!(spare_step, SfaStorageStep::CreateHotSpare { .. }));
+        let spare_result = spare_step.perform().unwrap();
+
+        let entered_sync = Arc::new(Barrier::new(2));
+        let release_sync = Arc::new(Barrier::new(2));
+        {
+            let mut state = queue.engine.state.lock().unwrap();
+            let entered_sync = Arc::clone(&entered_sync);
+            let release_sync = Arc::clone(&release_sync);
+            state
+                .manifest
+                .as_mut()
+                .unwrap()
+                .set_before_sync_hook(Arc::new(move || {
+                    entered_sync.wait();
+                    release_sync.wait();
+                    Ok(())
+                }));
+        }
+
+        let rotation = std::thread::spawn(move || producer.try_submit(b"tri"));
+        entered_sync.wait();
+
+        let finish = queue
+            .finish_storage_maintenance(spare_result, true)
+            .unwrap();
+        assert!(!finish.did_change());
+        assert!(finish.into_cleanup().unwrap().perform().is_none());
+        queue.complete_storage_maintenance().unwrap();
+        assert!(queue.storage_maintenance_in_flight().unwrap());
+        assert!(!queue.hot_spare_installed());
+
+        release_sync.wait();
+        assert_eq!(rotation.join().unwrap().unwrap().fsn, 2);
+        assert_eq!(queue.sealed_segment_count(), 2);
+        assert_eq!(queue.allocated_segment_bytes(), 38 * 3);
+        assert_eq!(sfa_file_count(dir.path()), 3);
+    }
+
+    #[test]
+    fn trim_manifest_sync_does_not_block_segment_lookup() {
+        let dir = TempDir::new().unwrap();
+        let mut queue = SfaFrameQueue::open(options_with(&dir, 38, 38 * 4, 4)).unwrap();
+        queue.try_submit(b"one").unwrap();
+        queue.try_submit(b"two").unwrap();
+        queue.complete_through_fsn(0).unwrap();
+        let mut producer = queue.take_producer().unwrap();
+
+        let entered_sync = Arc::new(Barrier::new(2));
+        let release_sync = Arc::new(Barrier::new(2));
+        {
+            let mut state = queue.engine.state.lock().unwrap();
+            let entered_sync = Arc::clone(&entered_sync);
+            let release_sync = Arc::clone(&release_sync);
+            state
+                .manifest
+                .as_mut()
+                .unwrap()
+                .set_before_sync_hook(Arc::new(move || {
+                    entered_sync.wait();
+                    release_sync.wait();
+                    Ok(())
+                }));
+        }
+
+        let engine = Arc::clone(&queue.engine);
+        let trimming = std::thread::spawn(move || {
+            let step = queue.take_storage_maintenance_step(false).unwrap().unwrap();
+            (queue, step)
+        });
+        entered_sync.wait();
+
+        let (lookup_done, lookup_result) = mpsc::channel();
+        let lookup_engine = Arc::clone(&engine);
+        let lookup = std::thread::spawn(move || {
+            let found = lookup_engine.segment_for_fsn(0).is_some();
+            lookup_done.send(found).unwrap();
+        });
+        let completed_off_lock = lookup_result
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap_or(false);
+        assert!(engine.storage_maintenance_in_flight().unwrap());
+        assert!(matches!(
+            producer.try_submit(b"tri"),
+            Err(SfaQueueError::Queue(
+                QueueError::StorageSpareNotReady { .. }
+            ))
+        ));
+
+        release_sync.wait();
+        let (mut queue, step) = trimming.join().unwrap();
+        lookup.join().unwrap();
+        assert!(
+            completed_off_lock,
+            "segment lookup blocked behind manifest sync while trim held engine state"
+        );
+        assert_eq!(queue.sealed_segment_count(), 0);
+        queue
+            .engine
+            .state
+            .lock()
+            .unwrap()
+            .manifest
+            .as_mut()
+            .unwrap()
+            .clear_before_sync_hook();
+        assert_eq!(producer.try_submit(b"tri").unwrap().fsn, 2);
+        let result = step.perform().unwrap();
+        queue.finish_storage_maintenance(result, true).unwrap();
+        queue.complete_storage_maintenance().unwrap();
+    }
+
+    #[test]
+    fn failed_off_lock_trim_restores_manifest_and_keeps_live_prefix() {
+        let dir = TempDir::new().unwrap();
+        let mut queue = SfaFrameQueue::open(options_with(&dir, 38, 38 * 4, 4)).unwrap();
+        queue.try_submit(b"one").unwrap();
+        queue.try_submit(b"two").unwrap();
+        queue.complete_through_fsn(0).unwrap();
+        let allocated_before = queue.allocated_segment_bytes();
+        {
+            let mut state = queue.engine.state.lock().unwrap();
+            state
+                .manifest
+                .as_mut()
+                .unwrap()
+                .set_before_sync_hook(Arc::new(|| {
+                    Err(io::Error::other("injected manifest sync failure"))
+                }));
+        }
+
+        assert!(matches!(
+            queue.take_storage_maintenance_step(false),
+            Err(SfaQueueError::Io(_))
+        ));
+        assert!(!queue.storage_maintenance_in_flight().unwrap());
+        assert_eq!(queue.sealed_segment_count(), 1);
+        assert_eq!(queue.allocated_segment_bytes(), allocated_before);
+        assert!(queue.payload_vec_for_fsn(0).is_some());
+
+        queue
+            .engine
+            .state
+            .lock()
+            .unwrap()
+            .manifest
+            .as_mut()
+            .unwrap()
+            .clear_before_sync_hook();
+        let step = queue.take_storage_maintenance_step(false).unwrap().unwrap();
+        assert_eq!(queue.sealed_segment_count(), 0);
+        let result = step.perform().unwrap();
+        queue.finish_storage_maintenance(result, true).unwrap();
+        queue.complete_storage_maintenance().unwrap();
     }
 
     /// Run with:

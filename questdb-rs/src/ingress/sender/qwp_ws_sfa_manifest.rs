@@ -32,6 +32,8 @@
 use std::fs::{self, File, OpenOptions};
 use std::io;
 use std::path::{Path, PathBuf};
+#[cfg(test)]
+use std::sync::Arc;
 
 use super::qwp_ws_sfa_segment::{read_exact_at, write_all_at};
 
@@ -52,6 +54,19 @@ pub(crate) struct SfManifest {
     generation: u64,
     head_base: u64,
     active_base: u64,
+    #[cfg(test)]
+    before_sync: Option<ManifestSyncHook>,
+}
+
+#[cfg(test)]
+#[derive(Clone)]
+struct ManifestSyncHook(Arc<dyn Fn() -> io::Result<()> + Send + Sync>);
+
+#[cfg(test)]
+impl std::fmt::Debug for ManifestSyncHook {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("ManifestSyncHook")
+    }
 }
 
 #[derive(Debug)]
@@ -84,6 +99,8 @@ impl SfManifest {
                 generation: 0,
                 head_base: 0,
                 active_base: 0,
+                #[cfg(test)]
+                before_sync: None,
             };
             manifest.update(head_base, active_base)?;
             sync_directory(slot_dir)?;
@@ -127,6 +144,8 @@ impl SfManifest {
             generation: record.generation,
             head_base: record.first as u64,
             active_base: record.second as u64,
+            #[cfg(test)]
+            before_sync: None,
         }))
     }
 
@@ -169,6 +188,10 @@ impl SfManifest {
             new_active_base as i64,
         );
         write_record(&self.file, next_generation, &record)?;
+        #[cfg(test)]
+        if let Some(hook) = &self.before_sync {
+            (hook.0)()?;
+        }
         self.file.sync_all()?;
         self.generation = next_generation;
         self.head_base = new_head_base;
@@ -183,6 +206,19 @@ impl SfManifest {
     #[cfg(test)]
     pub(crate) fn generation(&self) -> u64 {
         self.generation
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_before_sync_hook(
+        &mut self,
+        hook: Arc<dyn Fn() -> io::Result<()> + Send + Sync>,
+    ) {
+        self.before_sync = Some(ManifestSyncHook(hook));
+    }
+
+    #[cfg(test)]
+    pub(crate) fn clear_before_sync_hook(&mut self) {
+        self.before_sync = None;
     }
 }
 
