@@ -5139,7 +5139,21 @@ mod tests {
         loop {
             match SfaSlotQueue::open(slot_options.clone()) {
                 Ok(queue) => {
-                    drop(queue);
+                    // The unacked frame must survive the detached worker's
+                    // exit and replay to the next adopter of the slot.
+                    let mut driver =
+                        QwpWsCoreTestHarness::from_queue(queue, FakeOrderedServer::ack_each_send());
+                    assert_eq!(
+                        driver.drive_once().unwrap(),
+                        DriveOutcome::Acked { wire_seq: 0 }
+                    );
+                    assert_eq!(
+                        driver.poll_event(),
+                        Some(DriverEvent::Sent {
+                            fsn: 0,
+                            wire_seq: 0
+                        })
+                    );
                     break;
                 }
                 Err(SfaQueueError::SlotInUse { .. }) if Instant::now() < deadline => {

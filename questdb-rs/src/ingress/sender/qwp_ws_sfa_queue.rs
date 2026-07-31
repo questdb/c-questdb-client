@@ -3620,13 +3620,65 @@ mod tests {
             queue.try_submit(b"unresolved").unwrap();
         }
         fs::remove_file(manifest_path(dir.path())).unwrap();
+        let snapshot = |dir: &Path| -> Vec<std::ffi::OsString> {
+            let mut names: Vec<_> = fs::read_dir(dir)
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name())
+                .collect();
+            names.sort();
+            names
+        };
+        let before = snapshot(dir.path());
 
-        let err = SfaFrameQueue::open(options(&dir)).unwrap_err();
-        assert!(matches!(
-            err,
-            SfaQueueError::Recovery { reason }
-                if reason.contains("sf-manifest.bin is missing")
-        ));
+        // The reject must not mutate the slot: every file survives byte-
+        // for-byte reachable for operator recovery, and a retry fails the
+        // same way instead of drifting toward quarantine.
+        for _ in 0..2 {
+            let err = SfaFrameQueue::open(options(&dir)).unwrap_err();
+            assert!(matches!(
+                err,
+                SfaQueueError::Recovery { reason }
+                    if reason.contains("sf-manifest.bin is missing")
+            ));
+        }
+        assert_eq!(snapshot(dir.path()), before);
+        let retained_payloads: Vec<Vec<u8>> = fs::read_dir(dir.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter(|path| path.extension().is_some_and(|ext| ext == "sfa"))
+            .flat_map(|path| scan_file(&path).unwrap().frames)
+            .map(|frame| frame.payload)
+            .collect();
+        assert_eq!(retained_payloads, [b"unresolved".to_vec()]);
+    }
+
+    #[test]
+    fn partially_stamped_legacy_migration_recovers_and_completes() {
+        // A crash mid-migration leaves the manifest durable with only a
+        // prefix of the chain stamped MANIFEST_REQUIRED. Recovery must take
+        // the manifested path, keep every frame, and finish the stamping.
+        let dir = TempDir::new().unwrap();
+        write_manifested_segment(&spare_segment_path(dir.path(), 0), 0, Some(b"first"));
+        write_segment_with_one_frame(&spare_segment_path(dir.path(), 1), 1, b"second");
+        create_manifested_slot(dir.path(), 0, 1);
+
+        let queue = open(&dir);
+        assert_eq!(queue.oldest_unresolved_fsn(), Some(0));
+        assert_eq!(queue.completed_fsn(), None);
+        assert_eq!(queue.payload_vec_for_fsn(0).as_deref(), Some(&b"first"[..]));
+        assert_eq!(
+            queue.payload_vec_for_fsn(1).as_deref(),
+            Some(&b"second"[..])
+        );
+        drop(queue);
+
+        for generation in [0, 1] {
+            let scan = scan_file_metadata(spare_segment_path(dir.path(), generation)).unwrap();
+            assert!(
+                scan.manifest_required,
+                "sf-{generation:016x}.sfa must be stamped after recovery"
+            );
+        }
     }
 
     #[test]

@@ -426,7 +426,7 @@ fn unlock_lock_file(file: &File) {
 mod tests {
     use super::*;
     use crate::ingress::sender::qwp_ws_sfa_segment::{
-        fail_sync_after_for_test, spare_segment_path,
+        fail_sync_after_for_test, scan_file, spare_segment_path,
     };
     use tempfile::TempDir;
 
@@ -532,6 +532,39 @@ mod tests {
 
         first.close().unwrap();
         SfaSlotQueue::open(slot_options).unwrap();
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn periodic_close_retry_failure_releases_lock_with_data_recoverable() {
+        // The documented terminal path: close fails, the Drop retry fails
+        // too, and field destruction releases the flock. The queued data
+        // must remain on disk and adoptable by the next opener.
+        let temp = TempDir::new().unwrap();
+        let sf_dir = temp.path().join("sf-root");
+        let mut slot_options = options(&sf_dir, "periodic");
+        slot_options.periodic_sync_interval = Some(Duration::from_secs(3600));
+        let mut first = SfaSlotQueue::open(slot_options.clone()).unwrap();
+        first.queue.try_submit(b"queued").unwrap();
+
+        fail_sync_after_for_test(0);
+        assert!(first.close().is_err());
+        fail_sync_after_for_test(0);
+        drop(first);
+
+        let slot_dir = sf_dir.join("periodic");
+        let recovered_payloads: Vec<(u64, Vec<u8>)> = std::fs::read_dir(&slot_dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter(|path| path.extension().is_some_and(|ext| ext == "sfa"))
+            .flat_map(|path| scan_file(&path).unwrap().frames)
+            .map(|frame| (frame.fsn, frame.payload))
+            .collect();
+        assert_eq!(recovered_payloads, [(0, b"queued".to_vec())]);
+
+        let reopened = SfaSlotQueue::open(slot_options).unwrap();
+        assert_eq!(reopened.queue.oldest_unresolved_fsn(), Some(0));
+        assert_eq!(reopened.queue.completed_fsn(), None);
     }
 
     #[cfg(any(unix, windows))]
