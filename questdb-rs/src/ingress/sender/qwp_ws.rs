@@ -4164,7 +4164,9 @@ mod tests {
         TransportFailure, TransportPoll, TransportResponse, TransportSendResult,
     };
     use super::super::qwp_ws_queue::{OutboundFrameView, SentFrame};
-    use super::super::qwp_ws_sfa_queue::{SfaFrameQueue, SfaMemoryQueueOptions, SfaQueueOptions};
+    use super::super::qwp_ws_sfa_queue::{
+        SfaFrameQueue, SfaMemoryQueueOptions, SfaQueueOptions, SfaStorageStep,
+    };
     use super::*;
     use std::sync::{Arc, mpsc};
     use tempfile::TempDir;
@@ -4175,6 +4177,19 @@ mod tests {
             max_bytes,
             max_in_flight,
         })
+        .unwrap()
+    }
+
+    #[cfg(any(unix, windows))]
+    fn periodic_qwp_ws_config(sf_dir: &std::path::Path, sender_id: &str) -> QwpWsConfig {
+        crate::ingress::SenderBuilder::from_conf(format!(
+            "ws::addr=127.0.0.1:1;sf_dir={};sender_id={sender_id};\
+             sf_max_segment_bytes=256;sf_max_total_bytes=1024;\
+             sf_durability=periodic;sf_sync_interval_millis=3600000;",
+            sf_dir.display()
+        ))
+        .unwrap()
+        .qwp_ws
         .unwrap()
     }
 
@@ -5169,6 +5184,96 @@ mod tests {
                 Err(err) => panic!("slot did not become reusable after worker exit: {err:?}"),
             }
         }
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn runner_drives_periodic_sync_from_config() {
+        let dir = TempDir::new().unwrap();
+        let qwp_ws = periodic_qwp_ws_config(dir.path(), "periodic-driver");
+        let queue = open_configured_qwp_ws_queue(&qwp_ws).unwrap();
+        let driver = QwpWsCoreTestHarness::from_queue(queue, FakeOrderedServer::no_response());
+        let (mut store, send_core) = driver.into_parts();
+        store.try_submit(b"periodic").unwrap();
+        let progress = store.progress_view();
+        let lifecycle = store.lifecycle();
+        let shared = Arc::new(Mutex::new(store));
+        let mut core = SyncQwpWsRunnerCore {
+            send_core,
+            progress,
+            cold_effects: VecDeque::new(),
+            backpressure: Arc::new(BackpressureNotifier::new()),
+            ok_completed_upper: Arc::new(AtomicU64::new(0)),
+            lifecycle,
+        };
+
+        assert_eq!(
+            core.drive_step(&shared, &AtomicBool::new(false)),
+            RunnerStep::Continue
+        );
+
+        let mut store = shared.lock().unwrap();
+        assert!(!store.periodic_sync_in_flight().unwrap());
+        assert!(
+            store.take_storage_maintenance_step().unwrap().is_none(),
+            "the runner must finish the initial periodic sync and arm its configured cadence"
+        );
+        store.close_queue().unwrap();
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn threaded_runner_waits_for_in_flight_periodic_sync_before_close() {
+        let dir = TempDir::new().unwrap();
+        let sender_id = "periodic-runner";
+        let qwp_ws = periodic_qwp_ws_config(dir.path(), sender_id);
+        let slot_options = SfaSlotOptions {
+            sf_dir: dir.path().to_path_buf(),
+            sender_id: sender_id.to_owned(),
+            segment_size_bytes: 256,
+            max_bytes: 1024,
+            max_in_flight: *qwp_ws.max_in_flight,
+            periodic_sync_interval: Some(Duration::from_secs(3600)),
+        };
+        let mut queue = open_configured_qwp_ws_queue(&qwp_ws).unwrap();
+        let receipt = PublicationLog::try_publish(&mut queue, b"periodic").unwrap();
+        PublicationLog::progress_view(&queue)
+            .complete_through_fsn(receipt.fsn)
+            .unwrap();
+        PublicationLog::persist_completed_fsn(&mut queue, receipt.fsn);
+
+        // Hold the real sync step instead of racing a filesystem call: taking
+        // it sets the production in-flight flag until finish is reported.
+        let sync_step = PublicationLog::take_storage_maintenance_step(&mut queue, false)
+            .unwrap()
+            .expect("periodic queue must offer its initial sync step");
+        assert!(matches!(sync_step, SfaStorageStep::SyncPublished(_)));
+        assert!(PublicationLog::periodic_sync_in_flight(&queue).unwrap());
+
+        let driver = QwpWsCoreTestHarness::from_queue(queue, FakeOrderedServer::no_response());
+        let mut runner = SyncQwpWsRunner::start(driver);
+        runner.begin_close();
+
+        // An already-expired deadline probes the gate without sleeping.
+        let err = runner
+            .drain_to_deadline(Some(Instant::now()))
+            .expect_err("close must wait for the held periodic sync step");
+        assert!(err.msg().contains("close drain timed out"));
+        assert!(matches!(
+            SfaSlotQueue::open(slot_options.clone()),
+            Err(SfaQueueError::SlotInUse { .. })
+        ));
+
+        let sync_result = sync_step.perform().unwrap();
+        runner
+            .shared
+            .lock()
+            .unwrap()
+            .finish_storage_maintenance(sync_result)
+            .unwrap();
+        runner.drain_to_deadline(None).unwrap();
+
+        SfaSlotQueue::open(slot_options).unwrap();
     }
 
     #[test]

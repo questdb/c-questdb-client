@@ -837,6 +837,8 @@ mod tests {
     use crate::ingress::conf::{ConfigSetting, QwpWsConfig};
     #[cfg(all(feature = "sync-sender-qwp-ws", any(unix, windows)))]
     use crate::ingress::sender::qwp_ws_sfa_manifest::{SfManifest, SfaAckWatermark};
+    #[cfg(all(feature = "sync-sender-qwp-ws", any(unix, windows)))]
+    use crate::ingress::sender::qwp_ws_sfa_queue::SfaStorageStep;
     #[cfg(all(feature = "sync-sender-qwp-ws", unix))]
     use crate::ingress::sender::qwp_ws_sfa_segment::initial_segment_path;
     #[cfg(all(feature = "sync-sender-qwp-ws", any(unix, windows)))]
@@ -1089,6 +1091,45 @@ mod tests {
         assert!(drainers.drive_once());
         assert!(!has_failed_sentinel(&slot_dir));
         assert!(!drainers.drive_once());
+    }
+
+    #[cfg(all(feature = "sync-sender-qwp-ws", any(unix, windows)))]
+    #[test]
+    fn orphan_adoption_inherits_periodic_sync_interval_from_config() {
+        let temp = TempDir::new().unwrap();
+        let sf_dir = temp.path().join("sf-root");
+        let slot_dir = sf_dir.join("orphan");
+        {
+            let mut queue = SfaSlotQueue::open(slot_options(&sf_dir, "orphan")).unwrap();
+            PublicationLog::try_publish(&mut queue, b"orphaned").unwrap();
+            queue.close().unwrap();
+        }
+
+        let builder = crate::ingress::SenderBuilder::from_conf(format!(
+            "ws::addr=127.0.0.1:1;sf_dir={};sender_id=primary;drain_orphans=on;\
+             sf_max_segment_bytes=256;sf_max_total_bytes=1024;\
+             sf_durability=periodic;sf_sync_interval_millis=123;",
+            sf_dir.display()
+        ))
+        .unwrap();
+        let qwp_ws = builder.qwp_ws.as_ref().unwrap();
+        let config = OrphanDrainerConfig::new("127.0.0.1", "1", false, None, qwp_ws, None);
+        let queue_options = config.queue_options(slot_dir).unwrap();
+        assert_eq!(
+            queue_options.periodic_sync_interval,
+            Some(Duration::from_millis(123))
+        );
+
+        // Exercise the same options and replay-only open used by adoption,
+        // without adding a network or timer race to the test.
+        let mut adopted = SfaSlotQueue::open_replay_only_existing(queue_options).unwrap();
+        let sync_step = PublicationLog::take_storage_maintenance_step(&mut adopted, false)
+            .unwrap()
+            .expect("adopted periodic queue must schedule a sync step");
+        assert!(matches!(sync_step, SfaStorageStep::SyncPublished(_)));
+        let sync_result = sync_step.perform().unwrap();
+        PublicationLog::finish_storage_maintenance(&mut adopted, sync_result, false).unwrap();
+        adopted.close().unwrap();
     }
 
     #[cfg(feature = "sync-sender-qwp-ws")]
