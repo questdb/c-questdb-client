@@ -431,15 +431,16 @@ impl SfaFrameQueue {
             PersistedSymbolDict::open(&options.slot_dir).ok()
         };
         let delta_dict_enabled = persisted_symbol_dict.is_some();
-        // A recovered disk chain requires the watermark to pre-exist. For a
-        // fresh slot, create and durably publish the zeroed dual-slot file
-        // before any manifest-required segment can reach disk. A crash in the
-        // opposite order would leave a valid new-format segment whose required
-        // watermark directory entry never became durable.
+        // For a fresh slot, create and durably publish the zeroed dual-slot
+        // watermark before any segment can reach disk. Recovery tolerates a
+        // missing watermark (it recreates the file and seeds from the segment
+        // floor, re-replaying any acked-but-untrimmed frames), so this
+        // ordering is not load-bearing for correctness — it just narrows that
+        // duplicate-replay window after a power loss.
         let fresh_ack_watermark = if had_recovered_segments {
             None
         } else {
-            let watermark = SfaAckWatermark::open(&options.slot_dir, false)?;
+            let watermark = SfaAckWatermark::open(&options.slot_dir)?;
             watermark.sync_data()?;
             sync_directory(&options.slot_dir)?;
             Some(watermark)
@@ -508,7 +509,7 @@ impl SfaFrameQueue {
         let first_unresolved =
             first_unresolved_fsn_from_segments(&sealed_segments, &active).unwrap_or(next_fsn);
         let recovered_completion = if had_recovered_segments {
-            recover_completed_upper(Some(&options.slot_dir), first_unresolved, next_fsn, true)?
+            recover_completed_upper(Some(&options.slot_dir), first_unresolved, next_fsn)?
         } else {
             RecoveredCompletion {
                 completed_upper: 0,
@@ -690,12 +691,8 @@ impl SfaFrameQueue {
         let first_unresolved =
             first_unresolved_fsn_from_optional_segments(&sealed_segments, active.as_ref())
                 .unwrap_or(next_fsn);
-        let recovered_completion = recover_completed_upper(
-            Some(&options.slot_dir),
-            first_unresolved,
-            next_fsn,
-            had_recovered_segments,
-        )?;
+        let recovered_completion =
+            recover_completed_upper(Some(&options.slot_dir), first_unresolved, next_fsn)?;
         let engine = Arc::new(SfaEngine {
             slot_dir: Some(options.slot_dir),
             max_bytes: options.max_bytes,
@@ -2065,7 +2062,6 @@ fn recover_completed_upper(
     slot_dir: Option<&Path>,
     segment_completed_upper: u64,
     published_upper: u64,
-    require_existing_watermark: bool,
 ) -> Result<RecoveredCompletion, SfaQueueError> {
     let Some(slot_dir) = slot_dir else {
         return Ok(RecoveredCompletion {
@@ -2073,7 +2069,7 @@ fn recover_completed_upper(
             ack_watermark: None,
         });
     };
-    let mut ack_watermark = SfaAckWatermark::open(slot_dir, require_existing_watermark)?;
+    let mut ack_watermark = SfaAckWatermark::open(slot_dir)?;
     let completed_upper = match ack_watermark.read()? {
         Some(acked_fsn) => match ack_watermark_completed_upper(acked_fsn, published_upper) {
             Some(upper) => segment_completed_upper.max(upper),
@@ -3238,7 +3234,7 @@ mod tests {
     }
 
     fn write_ack_watermark(dir: &Path, fsn: i64) {
-        let mut watermark = SfaAckWatermark::open(dir, false).unwrap();
+        let mut watermark = SfaAckWatermark::open(dir).unwrap();
         watermark.write(fsn).unwrap();
         watermark.sync_data().unwrap();
     }
@@ -3255,7 +3251,12 @@ mod tests {
     }
 
     fn recovered_ack_watermark_fsn(dir: &Path) -> Option<u64> {
-        let mut watermark = SfaAckWatermark::open(dir, true).unwrap();
+        assert!(
+            ack_watermark_path(dir).exists(),
+            "ACK watermark file should exist at {}",
+            dir.display()
+        );
+        let mut watermark = SfaAckWatermark::open(dir).unwrap();
         watermark
             .read()
             .unwrap()
@@ -3607,7 +3608,7 @@ mod tests {
             fs::metadata(ack_watermark_path(dir.path())).unwrap().len(),
             super::super::qwp_ws_sfa_manifest::DUAL_SLOT_FILE_SIZE
         );
-        let mut watermark = SfaAckWatermark::open(dir.path(), true).unwrap();
+        let mut watermark = SfaAckWatermark::open(dir.path()).unwrap();
         assert_eq!(watermark.read().unwrap(), None);
     }
 
@@ -4293,22 +4294,22 @@ mod tests {
         // full lifecycle: fresh open, persist, reopen, invalidate, re-persist.
         let dir = TempDir::new().unwrap();
 
-        let mut watermark = SfaAckWatermark::open(dir.path(), false).unwrap();
+        let mut watermark = SfaAckWatermark::open(dir.path()).unwrap();
         assert_eq!(watermark.read().unwrap(), None);
         watermark.write(42).unwrap();
         assert_eq!(watermark.read().unwrap(), Some(42));
         drop(watermark);
 
-        let mut reopened = SfaAckWatermark::open(dir.path(), true).unwrap();
+        let mut reopened = SfaAckWatermark::open(dir.path()).unwrap();
         assert_eq!(reopened.read().unwrap(), Some(42));
         drop(reopened);
         fs::write(ack_watermark_path(dir.path()), [0u8; 16]).unwrap();
-        let mut reset = SfaAckWatermark::open(dir.path(), true).unwrap();
+        let mut reset = SfaAckWatermark::open(dir.path()).unwrap();
         assert_eq!(reset.read().unwrap(), None);
         drop(reset);
         assert_eq!(recovered_ack_watermark_fsn(dir.path()), None);
 
-        let mut again = SfaAckWatermark::open(dir.path(), true).unwrap();
+        let mut again = SfaAckWatermark::open(dir.path()).unwrap();
         again.write(7).unwrap();
         drop(again);
         assert_eq!(recovered_ack_watermark_fsn(dir.path()), Some(7));
@@ -4344,7 +4345,12 @@ mod tests {
     }
 
     #[test]
-    fn ack_watermark_unavailable_fails_recovered_slot_open() {
+    fn ack_watermark_unopenable_fails_recovered_slot_open() {
+        // A directory squatting on the watermark path is an operational
+        // failure: the file may be intact behind it, so recovery fails
+        // closed (Java parity) instead of silently replaying acked frames.
+        // A merely MISSING watermark is recreated instead — see
+        // missing_ack_watermark_reseeds_manifested_recovery_from_segments.
         let dir = TempDir::new().unwrap();
         write_segment_with_one_frame(&spare_segment_path(dir.path(), 0), 0, b"first");
         fs::remove_file(ack_watermark_path(dir.path())).unwrap();
@@ -4352,6 +4358,26 @@ mod tests {
 
         let err = SfaFrameQueue::open(options(&dir)).unwrap_err();
         assert!(matches!(err, SfaQueueError::Io(_)), "{err:?}");
+    }
+
+    #[test]
+    fn missing_ack_watermark_reseeds_manifested_recovery_from_segments() {
+        let dir = TempDir::new().unwrap();
+        {
+            let mut queue = open(&dir);
+            queue.try_submit(b"first").unwrap();
+            queue.try_submit(b"second").unwrap();
+            queue.complete_through_fsn(0).unwrap();
+        }
+        fs::remove_file(ack_watermark_path(dir.path())).unwrap();
+
+        // The lost watermark costs at most a re-replay of already-acked
+        // frames; it must not fail the open.
+        let queue = open(&dir);
+        assert_eq!(queue.oldest_unresolved_fsn(), Some(0));
+        assert_eq!(queue.completed_fsn(), None);
+        assert_eq!(queue.payload_vec_for_fsn(0).as_deref(), Some(&b"first"[..]));
+        assert!(ack_watermark_path(dir.path()).exists());
     }
 
     #[test]
@@ -4425,15 +4451,61 @@ mod tests {
         );
     }
 
+    #[cfg(any(unix, windows))]
     #[test]
-    fn missing_ack_watermark_fails_legacy_recovery() {
+    fn missing_ack_watermark_reseeds_replay_only_orphan_open() {
+        use super::super::qwp_ws_sfa_slot::SfaSlotQueue;
+
+        // A missing watermark must not fail the orphan open: the drainer
+        // would otherwise re-enqueue the slot forever, since the condition
+        // is permanent but classified as retryable.
+        let dir = TempDir::new().unwrap();
+        let slot_dir = dir.path().join("orphan");
+        fs::create_dir(&slot_dir).unwrap();
+        write_segment_with_one_frame(&spare_segment_path(&slot_dir, 0), 0, b"first");
+        write_segment_with_one_frame(&spare_segment_path(&slot_dir, 1), 1, b"second");
+        fs::remove_file(ack_watermark_path(&slot_dir)).unwrap();
+
+        let queue = SfaSlotQueue::open_replay_only_existing(SfaQueueOptions {
+            slot_dir,
+            segment_size_bytes: 256,
+            max_bytes: 1024,
+            max_in_flight: 4,
+            periodic_sync_interval: None,
+        })
+        .unwrap();
+        let server = FakeOrderedServer::ack_each_send();
+        let mut driver = QwpWsCoreTestHarness::from_queue(queue, server);
+
+        assert_eq!(
+            driver.drive_once().unwrap(),
+            DriveOutcome::Acked { wire_seq: 0 }
+        );
+        assert_eq!(
+            driver.poll_event(),
+            Some(DriverEvent::Sent {
+                fsn: 0,
+                wire_seq: 0
+            })
+        );
+    }
+
+    #[test]
+    fn missing_ack_watermark_keeps_legacy_recovery() {
         let dir = TempDir::new().unwrap();
         write_segment_with_one_frame(&initial_segment_path(dir.path()), 3, b"legacy");
         fs::remove_file(ack_watermark_path(dir.path())).unwrap();
         assert!(!ack_watermark_path(dir.path()).exists());
 
-        let err = SfaFrameQueue::open(options(&dir)).unwrap_err();
-        assert!(matches!(err, SfaQueueError::Io(_)), "{err:?}");
+        let queue = open(&dir);
+
+        assert_eq!(queue.oldest_unresolved_fsn(), Some(3));
+        assert_eq!(queue.completed_fsn(), Some(2));
+        assert_eq!(
+            queue.payload_vec_for_fsn(3).as_deref(),
+            Some(&b"legacy"[..])
+        );
+        assert!(ack_watermark_path(dir.path()).exists());
     }
 
     #[test]

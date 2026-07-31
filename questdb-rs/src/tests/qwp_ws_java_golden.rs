@@ -86,7 +86,7 @@ fn sf_manifest_and_watermark_match_java_dual_slot_goldens_both_directions() {
         std::fs::read(manifest_path(rust_dir.path())).unwrap(),
         expected_manifest
     );
-    let mut watermark = SfaAckWatermark::open(rust_dir.path(), false).unwrap();
+    let mut watermark = SfaAckWatermark::open(rust_dir.path()).unwrap();
     watermark.write(42).unwrap();
     watermark.sync_data().unwrap();
     drop(watermark);
@@ -102,7 +102,7 @@ fn sf_manifest_and_watermark_match_java_dual_slot_goldens_both_directions() {
     let manifest = SfManifest::open(java_dir.path()).unwrap().unwrap();
     assert_eq!(manifest.head_base(), 10);
     assert_eq!(manifest.active_base(), 20);
-    let mut watermark = SfaAckWatermark::open(java_dir.path(), true).unwrap();
+    let mut watermark = SfaAckWatermark::open(java_dir.path()).unwrap();
     assert_eq!(watermark.read().unwrap(), Some(42));
 }
 

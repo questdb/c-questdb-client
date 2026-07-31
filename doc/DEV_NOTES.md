@@ -66,6 +66,12 @@ update `questdb-rs/src/tests/qwp_ws_java_golden.rs`.
   boundary. The watermark stores the highest acknowledged frame sequence
   number; `-1` means no acknowledgement.
 
+The watermark is a duplicate-suppression hint, not a recovery requirement:
+a missing or wrong-sized file is recreated and recovery seeds from the
+segment floor, re-replaying acked-but-untrimmed frames once (Java parity).
+Only operational failures (the path unopenable, I/O errors) fail recovery
+closed.
+
 Manifested `.sfa` segments set `MANIFEST_REQUIRED` (bit `0x1` at header byte
 5). Recovery rejects a flagged segment without a valid manifest.
 

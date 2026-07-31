@@ -187,23 +187,18 @@ impl SfManifest {
 }
 
 impl SfaAckWatermark {
-    pub(crate) fn open(slot_dir: &Path, require_existing: bool) -> io::Result<Self> {
+    /// Opens the watermark, creating it if absent (Java parity): the
+    /// watermark is a duplicate-suppression hint, so recovery seeds from the
+    /// segment floor and accepts re-replay rather than refusing to open the
+    /// slot. Wrong-sized files, including the legacy 16-byte format, are
+    /// reset for the same reason. Operational failures still propagate.
+    pub(crate) fn open(slot_dir: &Path) -> io::Result<Self> {
         let path = ack_watermark_path(slot_dir);
         let existing_len = match fs::metadata(&path) {
             Ok(metadata) => Some(metadata.len()),
             Err(err) if err.kind() == io::ErrorKind::NotFound => None,
             Err(err) => return Err(err),
         };
-        if require_existing && existing_len.is_none() {
-            return Err(io::Error::new(
-                io::ErrorKind::NotFound,
-                format!(
-                    "recovered SFA slot is missing ACK watermark {}",
-                    path.display()
-                ),
-            ));
-        }
-
         let file = if existing_len == Some(DUAL_SLOT_FILE_SIZE) {
             OpenOptions::new().read(true).write(true).open(&path)?
         } else {
@@ -506,7 +501,7 @@ mod tests {
     fn watermark_resets_legacy_size_and_falls_back_after_a_torn_update() {
         let dir = TempDir::new().unwrap();
         fs::write(ack_watermark_path(dir.path()), [0u8; 16]).unwrap();
-        let mut watermark = SfaAckWatermark::open(dir.path(), true).unwrap();
+        let mut watermark = SfaAckWatermark::open(dir.path()).unwrap();
         assert_eq!(watermark.read().unwrap(), None);
         assert_eq!(
             fs::metadata(ack_watermark_path(dir.path())).unwrap().len(),
@@ -524,14 +519,14 @@ mod tests {
         write_all_at(&file, &[0xa5; 512], 0).unwrap();
         file.sync_all().unwrap();
 
-        let mut reopened = SfaAckWatermark::open(dir.path(), true).unwrap();
+        let mut reopened = SfaAckWatermark::open(dir.path()).unwrap();
         assert_eq!(reopened.read().unwrap(), Some(255));
     }
 
     #[test]
     fn watermark_rewrites_the_inactive_slot_even_for_the_same_fsn() {
         let dir = TempDir::new().unwrap();
-        let mut watermark = SfaAckWatermark::open(dir.path(), false).unwrap();
+        let mut watermark = SfaAckWatermark::open(dir.path()).unwrap();
         watermark.write(42).unwrap();
         watermark.write(42).unwrap();
 

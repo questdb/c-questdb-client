@@ -1179,7 +1179,7 @@ mod tests {
         fs::write(&sealed_path, bytes).unwrap();
         drop(SfaSegment::create_new_manifested(&active_path, 1, 256, 0).unwrap());
         drop(SfManifest::create(&slot_dir, 0, 1).unwrap());
-        let mut watermark = SfaAckWatermark::open(&slot_dir, false).unwrap();
+        let mut watermark = SfaAckWatermark::open(&slot_dir).unwrap();
         watermark.write(-1).unwrap();
         watermark.sync_data().unwrap();
         drop(watermark);
