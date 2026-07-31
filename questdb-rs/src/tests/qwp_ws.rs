@@ -1078,6 +1078,54 @@ fn spawn_manual_orphan_reject_server(status: u8) -> (u16, mpsc::Receiver<Vec<u8>
     (port, rx)
 }
 
+struct TerminalThenDrainOrphanServer {
+    port: u16,
+    terminal_rx: mpsc::Receiver<Vec<u8>>,
+    drained_rx: mpsc::Receiver<Vec<u8>>,
+    handle: thread::JoinHandle<()>,
+}
+
+fn spawn_terminal_then_drain_orphan_server() -> TerminalThenDrainOrphanServer {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let (terminal_tx, terminal_rx) = mpsc::channel();
+    let (drained_tx, drained_rx) = mpsc::channel();
+
+    let server = thread::spawn(move || {
+        let (mut foreground, _) = listener.accept().unwrap();
+        perform_server_upgrade(&mut foreground).unwrap();
+
+        let (mut terminal_orphan, _) = listener.accept().unwrap();
+        perform_server_upgrade(&mut terminal_orphan).unwrap();
+        let (_fin, _opcode, _catch_up) = read_frame(&mut terminal_orphan).unwrap();
+        let (_fin, _opcode, terminal_payload) = read_frame(&mut terminal_orphan).unwrap();
+        write_qwp_error_response(
+            &mut terminal_orphan,
+            QWP_STATUS_PARSE_ERROR,
+            FIRST_WIRE_SEQUENCE + 1,
+            b"bad orphan",
+        )
+        .unwrap();
+        terminal_tx.send(terminal_payload).unwrap();
+
+        let (mut drainable_orphan, _) = listener.accept().unwrap();
+        perform_server_upgrade(&mut drainable_orphan).unwrap();
+        let (_fin, _opcode, _catch_up) = read_frame(&mut drainable_orphan).unwrap();
+        let (_fin, _opcode, drained_payload) = read_frame(&mut drainable_orphan).unwrap();
+        write_qwp_ok_response(&mut drainable_orphan, FIRST_WIRE_SEQUENCE + 1).unwrap();
+        drained_tx.send(drained_payload).unwrap();
+
+        thread::sleep(Duration::from_millis(50));
+    });
+
+    TerminalThenDrainOrphanServer {
+        port,
+        terminal_rx,
+        drained_rx,
+        handle: server,
+    }
+}
+
 fn spawn_stalled_background_orphan_drain_server() -> (u16, mpsc::Receiver<Vec<u8>>, mpsc::Sender<()>)
 {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -2874,6 +2922,83 @@ fn qwp_ws_manual_orphan_drainer_terminal_reject_leaves_slot_recoverable() {
     assert!(!orphan_slot.join(".failed").exists());
     assert!(orphan_slot.join(".last_error").exists());
     assert!(slot_has_sfa_file(&orphan_slot));
+}
+
+#[test]
+fn qwp_ws_background_terminal_orphan_releases_worker_for_next_slot() {
+    let sf_dir = tempfile::TempDir::new().unwrap();
+    seed_orphan_slot_named(sf_dir.path(), "orphan-a");
+    seed_orphan_slot_named(sf_dir.path(), "orphan-b");
+
+    let server = spawn_terminal_then_drain_orphan_server();
+    let drain_conf = format!(
+        "ws::addr=127.0.0.1:{};\
+         sf_dir={};sender_id=primary;drain_orphans=on;\
+         max_background_drainers=1;sf_max_segment_bytes=256;sf_max_total_bytes=1024;",
+        server.port,
+        sf_dir.path().display()
+    );
+    let sender = SenderBuilder::from_conf(&drain_conf)
+        .unwrap()
+        .build()
+        .unwrap();
+
+    assert!(
+        !server
+            .terminal_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("first orphan was not replayed and terminally rejected")
+            .is_empty()
+    );
+    assert!(
+        !server
+            .drained_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("terminal orphan retained the only worker; next slot was never drained")
+            .is_empty()
+    );
+
+    let orphan_a = sf_dir.path().join("orphan-a");
+    let orphan_b = sf_dir.path().join("orphan-b");
+    let drained_deadline = Instant::now() + Duration::from_secs(5);
+    while [&orphan_a, &orphan_b]
+        .into_iter()
+        .filter(|slot| slot_has_sfa_file(slot))
+        .count()
+        != 1
+        && Instant::now() < drained_deadline
+    {
+        thread::sleep(Duration::from_millis(10));
+    }
+    let terminal_slots = [&orphan_a, &orphan_b]
+        .into_iter()
+        .filter(|slot| slot.join(".last_error").exists())
+        .count();
+    assert_eq!(
+        terminal_slots, 1,
+        "exactly one orphan must record the terminal error"
+    );
+    let retained_slots = [&orphan_a, &orphan_b]
+        .into_iter()
+        .filter(|slot| slot_has_sfa_file(slot))
+        .count();
+    assert_eq!(
+        retained_slots, 1,
+        "the terminal slot must retain its data while the next slot fully drains"
+    );
+    assert_eq!(
+        orphan_a.join(".last_error").exists(),
+        slot_has_sfa_file(&orphan_a)
+    );
+    assert_eq!(
+        orphan_b.join(".last_error").exists(),
+        slot_has_sfa_file(&orphan_b)
+    );
+    assert!(!orphan_a.join(".failed").exists());
+    assert!(!orphan_b.join(".failed").exists());
+
+    drop(sender);
+    server.handle.join().unwrap();
 }
 
 #[test]

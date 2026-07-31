@@ -39,6 +39,8 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 #[cfg(feature = "sync-sender-qwp-ws")]
+use crate::ErrorCode;
+#[cfg(feature = "sync-sender-qwp-ws")]
 use crate::ingress::buffer::SymbolGlobalDict;
 #[cfg(feature = "sync-sender-qwp-ws")]
 use crate::ingress::conf::QwpWsConfig;
@@ -360,6 +362,19 @@ impl ManualOrphanDrainers {
                     self.normalize_next_active();
                     return true;
                 }
+                OrphanDriveOutcome::Terminal(reason) => {
+                    let drainer = self.active.remove(index);
+                    drainer.record_last_error(&reason);
+                    self.pending.push_back(drainer.slot_dir.clone());
+                    self.normalize_next_active();
+                    return true;
+                }
+                OrphanDriveOutcome::Unrecoverable(reason) => {
+                    let drainer = self.active.remove(index);
+                    let _ = mark_failed(&drainer.slot_dir, &reason);
+                    self.normalize_next_active();
+                    return true;
+                }
                 OrphanDriveOutcome::Stopped => return true,
             }
         }
@@ -399,7 +414,13 @@ enum OrphanDriveOutcome {
     Progress,
     Drained,
     Stopped,
+    /// A non-terminal drive failure that may make progress on the same store.
     RetryLater(String),
+    /// A sticky store terminal: release this drainer and retry only from a fresh
+    /// adoption/session.
+    Terminal(String),
+    /// Proven-local durable state that cannot succeed on a fresh session.
+    Unrecoverable(String),
 }
 
 #[cfg(feature = "sync-sender-qwp-ws")]
@@ -608,9 +629,7 @@ impl OrphanDrainer {
     fn drive_once(&mut self) -> OrphanDriveOutcome {
         match self.send_core.close_drain_ready_step(&mut self.store) {
             Ok(CloseStepOutcome::Drained) => OrphanDriveOutcome::Drained,
-            Ok(CloseStepOutcome::Terminal) => {
-                OrphanDriveOutcome::RetryLater(self.terminal_message())
-            }
+            Ok(CloseStepOutcome::Terminal) => self.terminal_outcome(),
             Ok(CloseStepOutcome::Waiting {
                 sleep_for,
                 deadline,
@@ -630,9 +649,7 @@ impl OrphanDrainer {
         }
         match self.send_core.close_drain_ready_step(&mut self.store) {
             Ok(CloseStepOutcome::Drained) => OrphanDriveOutcome::Drained,
-            Ok(CloseStepOutcome::Terminal) => {
-                OrphanDriveOutcome::RetryLater(self.terminal_message())
-            }
+            Ok(CloseStepOutcome::Terminal) => self.terminal_outcome(),
             Ok(CloseStepOutcome::Waiting {
                 sleep_for,
                 deadline,
@@ -659,6 +676,15 @@ impl OrphanDrainer {
         let _ = clear_last_error(&self.slot_dir);
     }
 
+    fn terminal_outcome(&self) -> OrphanDriveOutcome {
+        let reason = self.terminal_message();
+        if terminal_error_is_proven_local_unrecoverable(self.store.terminal_error()) {
+            OrphanDriveOutcome::Unrecoverable(reason)
+        } else {
+            OrphanDriveOutcome::Terminal(reason)
+        }
+    }
+
     fn terminal_message(&self) -> String {
         if let Some(err) = self.store.terminal_error() {
             return err.to_string();
@@ -668,6 +694,17 @@ impl OrphanDrainer {
         }
         "orphan drainer reached terminal state".to_owned()
     }
+}
+
+#[cfg(feature = "sync-sender-qwp-ws")]
+fn terminal_error_is_proven_local_unrecoverable(error: Option<&crate::Error>) -> bool {
+    error.is_some_and(|err| {
+        // Bare StoreResendRequired is reserved for a persisted symbol dictionary
+        // that cannot be reconstructed from this slot. The role/writability path
+        // currently uses the same code, but always attaches its structured server
+        // rejection; another session/endpoint may resolve that form.
+        err.code() == ErrorCode::StoreResendRequired && err.qwp_ws_rejection().is_none()
+    })
 }
 
 #[cfg(feature = "sync-sender-qwp-ws")]
@@ -762,6 +799,14 @@ fn drain_orphan_to_completion(
                 }
                 retry_backoff = next_orphan_retry_backoff(retry_backoff, max_backoff);
             }
+            OrphanDriveOutcome::Terminal(reason) => {
+                record_last_error_unless_stopped(&slot_dir, &reason, stop);
+                return;
+            }
+            OrphanDriveOutcome::Unrecoverable(reason) => {
+                mark_orphan_failed_unless_stopped(&slot_dir, &reason, stop);
+                return;
+            }
             OrphanDriveOutcome::Stopped => return,
             OrphanDriveOutcome::Progress => retry_backoff = initial_backoff,
             OrphanDriveOutcome::Idle => {
@@ -851,6 +896,8 @@ mod tests {
     use crate::ingress::sender::qwp_ws_sfa_segment::{SfaSegment, scan_file, spare_segment_path};
     #[cfg(all(feature = "sync-sender-qwp-ws", any(unix, windows)))]
     use crate::ingress::sender::qwp_ws_sfa_slot::SfaSlotOptions;
+    #[cfg(feature = "sync-sender-qwp-ws")]
+    use crate::ingress::{QwpWsErrorCategory, QwpWsErrorPolicy, QwpWsSenderError};
     #[cfg(all(feature = "sync-sender-qwp-ws", any(unix, windows)))]
     use std::net::TcpListener;
 
@@ -1086,6 +1133,26 @@ mod tests {
         backoff = next_orphan_retry_backoff(backoff, max);
         assert_eq!(backoff, max);
         assert_eq!(next_orphan_retry_backoff(backoff, max), max);
+    }
+
+    #[cfg(feature = "sync-sender-qwp-ws")]
+    #[test]
+    fn only_bare_store_resend_terminal_is_proven_local_unrecoverable() {
+        let local = crate::Error::new(ErrorCode::StoreResendRequired, "torn dictionary");
+        assert!(terminal_error_is_proven_local_unrecoverable(Some(&local)));
+
+        let role_rejection = QwpWsSenderError {
+            category: QwpWsErrorCategory::NotWritable,
+            applied_policy: QwpWsErrorPolicy::Terminal,
+            status: Some(super::super::qwp_ws_codec::WS_STATUS_NOT_WRITABLE),
+            message: Some("primary moved".to_owned()),
+            message_sequence: None,
+            from_fsn: 0,
+            to_fsn: 0,
+        };
+        let role = crate::Error::new(ErrorCode::StoreResendRequired, "primary moved")
+            .with_qwp_ws_rejection(role_rejection);
+        assert!(!terminal_error_is_proven_local_unrecoverable(Some(&role)));
     }
 
     #[cfg(all(feature = "sync-sender-qwp-ws", any(unix, windows)))]
