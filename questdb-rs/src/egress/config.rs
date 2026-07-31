@@ -2189,6 +2189,25 @@ mod tests {
     }
 
     #[test]
+    fn egress_rejects_removed_in_flight_keys() {
+        // `in_flight_window` and `max_in_flight` are not configuration keys
+        // anywhere in the client, so the cross-role tolerance above does not
+        // extend to them: the egress reader rejects them as unknown, exactly
+        // like the ingress sender. Keeping them out of
+        // `INGRESS_ONLY_CONFIG_KEYS` is what this test pins down.
+        for key in ["in_flight_window", "max_in_flight"] {
+            let conf = format!("ws::addr=h:1;{key}=8");
+            let err = ReaderConfig::from_conf(&conf).unwrap_err();
+            assert_eq!(err.code(), ErrorCode::ConfigError, "key: {key}");
+            assert!(
+                err.msg().contains(&format!("Unknown config key \"{key}\"")),
+                "key: {key}, msg: {}",
+                err.msg()
+            );
+        }
+    }
+
+    #[test]
     fn egress_accepts_full_ingress_connect_string_unchanged() {
         // End-to-end portability smoke test: a representative
         // ingress-flavoured connect string with multiple ingress-only
