@@ -1189,20 +1189,23 @@ impl<T: QwpWsCoreTransport> QwpWsSendCore<T> {
         &mut self,
         store: &mut QwpWsPublicationStore<Q>,
     ) -> Result<DriveOutcome, DriverError> {
-        let mut highest_resolved_wire_seq = None;
+        // Completion is cumulative, so drain the whole ready run first and
+        // complete through its highest frame in one step: one watermark
+        // advance, one persisted-watermark write, and one CompletedThrough
+        // event however deep the run. A single cumulative durable ACK can
+        // cover the byte ring's entire backlog.
+        let mut last_resolved = None;
         while let Some(resolved) = self
             .durable_ack
             .as_mut()
             .and_then(DurableAckTracker::pop_ready)
         {
-            self.complete_through(store, resolved.fsn, resolved.wire_seq)?;
-            highest_resolved_wire_seq = Some(resolved.wire_seq);
+            last_resolved = Some(resolved);
         }
-        Ok(
-            highest_resolved_wire_seq.map_or(DriveOutcome::Idle, |wire_seq| DriveOutcome::Acked {
-                wire_seq,
-            }),
-        )
+        match last_resolved {
+            Some(resolved) => self.complete_through(store, resolved.fsn, resolved.wire_seq),
+            None => Ok(DriveOutcome::Idle),
+        }
     }
 
     fn complete_through<Q: PublicationLog>(
@@ -1612,33 +1615,39 @@ impl<T: QwpWsCoreTransport> QwpWsSendCore<T> {
         &mut self,
         progress: &SfaProgressView,
     ) -> Result<QwpWsHotResponseProgress, DriverError> {
-        let mut highest_resolved_wire_seq = None;
-        let mut events = Vec::new();
+        // Completion is cumulative, so drain the whole ready run first and
+        // complete through its highest frame in one step: one watermark
+        // advance, one persisted-watermark write, and one CompletedThrough
+        // event however deep the run. A single cumulative durable ACK can
+        // cover the byte ring's entire backlog.
+        let mut last_resolved = None;
         while let Some(resolved) = self
             .durable_ack
             .as_mut()
             .and_then(DurableAckTracker::pop_ready)
         {
-            let advanced = progress
-                .complete_through_fsn(resolved.fsn)
-                .map_err(DriverError::from)?;
-            self.send_cursor.ack_through(resolved.fsn);
-            if advanced {
-                self.poison_tracker.clear();
-                events.push(DriverEvent::CompletedThrough {
-                    fsn: resolved.fsn,
-                    wire_seq: resolved.wire_seq,
-                });
-            }
-            highest_resolved_wire_seq = Some(resolved.wire_seq);
+            last_resolved = Some(resolved);
         }
-        Ok(QwpWsHotResponseProgress {
-            outcome: highest_resolved_wire_seq.map_or(DriveOutcome::Idle, |wire_seq| {
-                DriveOutcome::Acked { wire_seq }
-            }),
-            events,
-            ok_fsn: None,
-        })
+        let Some(resolved) = last_resolved else {
+            return Ok(QwpWsHotResponseProgress::idle());
+        };
+        let advanced = progress
+            .complete_through_fsn(resolved.fsn)
+            .map_err(DriverError::from)?;
+        self.send_cursor.ack_through(resolved.fsn);
+        if advanced {
+            self.poison_tracker.clear();
+        }
+        let event = advanced.then_some(DriverEvent::CompletedThrough {
+            fsn: resolved.fsn,
+            wire_seq: resolved.wire_seq,
+        });
+        Ok(QwpWsHotResponseProgress::from_optional_event(
+            DriveOutcome::Acked {
+                wire_seq: resolved.wire_seq,
+            },
+            event,
+        ))
     }
 
     pub(crate) fn receipt_status<Q: PublicationLog>(
