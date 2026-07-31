@@ -49,6 +49,7 @@ const QWP_STATUS_DURABLE_ACK: u8 = 0x02;
 const QWP_STATUS_SCHEMA_MISMATCH: u8 = 0x03;
 const QWP_STATUS_PARSE_ERROR: u8 = 0x05;
 const QWP_STATUS_WRITE_ERROR: u8 = 0x09;
+const QWP_STATUS_NOT_WRITABLE: u8 = 0x0C;
 const QWP_WS_PUBLIC_BENCH_DEFAULT_ROWS: usize = 20_000_000;
 const QWP_WS_PUBLIC_BENCH_DEFAULT_BATCH_SIZE: usize = 1000;
 const QWP_WS_PUBLIC_BENCH_DEFAULT_IN_FLIGHT: usize = 128;
@@ -1123,6 +1124,54 @@ fn spawn_terminal_then_drain_orphan_server() -> TerminalThenDrainOrphanServer {
         terminal_rx,
         drained_rx,
         handle: server,
+    }
+}
+
+struct RoleTerminalThenDrainOrphanServer {
+    port: u16,
+    rejected_rx: mpsc::Receiver<Vec<u8>>,
+    drained_rx: mpsc::Receiver<Vec<u8>>,
+    handle: thread::JoinHandle<()>,
+}
+
+fn spawn_role_terminal_then_drain_orphan_server() -> RoleTerminalThenDrainOrphanServer {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let (rejected_tx, rejected_rx) = mpsc::channel();
+    let (drained_tx, drained_rx) = mpsc::channel();
+
+    let handle = thread::spawn(move || {
+        let (mut foreground, _) = listener.accept().unwrap();
+        perform_server_upgrade(&mut foreground).unwrap();
+
+        let (mut replica, _) = listener.accept().unwrap();
+        perform_server_upgrade(&mut replica).unwrap();
+        let (_fin, _opcode, _catch_up) = read_frame(&mut replica).unwrap();
+        let (_fin, _opcode, rejected_payload) = read_frame(&mut replica).unwrap();
+        write_qwp_error_response(
+            &mut replica,
+            QWP_STATUS_NOT_WRITABLE,
+            FIRST_WIRE_SEQUENCE + 1,
+            b"replica",
+        )
+        .unwrap();
+        rejected_tx.send(rejected_payload).unwrap();
+
+        let (mut primary, _) = listener.accept().unwrap();
+        perform_server_upgrade(&mut primary).unwrap();
+        let (_fin, _opcode, _catch_up) = read_frame(&mut primary).unwrap();
+        let (_fin, _opcode, drained_payload) = read_frame(&mut primary).unwrap();
+        write_qwp_ok_response(&mut primary, FIRST_WIRE_SEQUENCE + 1).unwrap();
+        drained_tx.send(drained_payload).unwrap();
+
+        thread::sleep(Duration::from_millis(50));
+    });
+
+    RoleTerminalThenDrainOrphanServer {
+        port,
+        rejected_rx,
+        drained_rx,
+        handle,
     }
 }
 
@@ -2996,6 +3045,53 @@ fn qwp_ws_background_terminal_orphan_releases_worker_for_next_slot() {
     );
     assert!(!orphan_a.join(".failed").exists());
     assert!(!orphan_b.join(".failed").exists());
+
+    drop(sender);
+    server.handle.join().unwrap();
+}
+
+#[test]
+fn qwp_ws_background_role_terminal_reopens_and_drains_orphan() {
+    let sf_dir = tempfile::TempDir::new().unwrap();
+    seed_orphan_slot(sf_dir.path());
+
+    let server = spawn_role_terminal_then_drain_orphan_server();
+    let drain_conf = format!(
+        "ws::addr=127.0.0.1:{};\
+         sf_dir={};sender_id=primary;drain_orphans=on;\
+         max_background_drainers=1;max_frame_rejections=1;\
+         poison_min_escalation_window_millis=0;\
+         reconnect_initial_backoff_millis=10;reconnect_max_backoff_millis=20;\
+         sf_max_segment_bytes=256;sf_max_total_bytes=1024;",
+        server.port,
+        sf_dir.path().display()
+    );
+    let sender = SenderBuilder::from_conf(&drain_conf)
+        .unwrap()
+        .build()
+        .unwrap();
+
+    let rejected = server
+        .rejected_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("orphan was not replayed to the replica");
+    let drained = server
+        .drained_rx
+        .recv_timeout(Duration::from_secs(2))
+        .expect("role-terminal orphan was not retried on a fresh session");
+    assert_eq!(
+        rejected, drained,
+        "fresh session must replay the same frame"
+    );
+
+    let orphan_slot = sf_dir.path().join("orphan");
+    let drained_deadline = Instant::now() + Duration::from_secs(5);
+    while slot_has_sfa_file(&orphan_slot) && Instant::now() < drained_deadline {
+        thread::sleep(Duration::from_millis(10));
+    }
+    assert!(!slot_has_sfa_file(&orphan_slot));
+    assert!(!orphan_slot.join(".failed").exists());
+    assert!(!orphan_slot.join(".last_error").exists());
 
     drop(sender);
     server.handle.join().unwrap();

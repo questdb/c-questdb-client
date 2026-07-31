@@ -41,6 +41,8 @@ use std::time::{Duration, Instant};
 #[cfg(feature = "sync-sender-qwp-ws")]
 use crate::ErrorCode;
 #[cfg(feature = "sync-sender-qwp-ws")]
+use crate::ingress::QwpWsErrorCategory;
+#[cfg(feature = "sync-sender-qwp-ws")]
 use crate::ingress::buffer::SymbolGlobalDict;
 #[cfg(feature = "sync-sender-qwp-ws")]
 use crate::ingress::conf::QwpWsConfig;
@@ -362,7 +364,8 @@ impl ManualOrphanDrainers {
                     self.normalize_next_active();
                     return true;
                 }
-                OrphanDriveOutcome::Terminal(reason) => {
+                OrphanDriveOutcome::RetryFreshSession(reason)
+                | OrphanDriveOutcome::Terminal(reason) => {
                     let drainer = self.active.remove(index);
                     drainer.record_last_error(&reason);
                     self.pending.push_back(drainer.slot_dir.clone());
@@ -416,8 +419,10 @@ enum OrphanDriveOutcome {
     Stopped,
     /// A non-terminal drive failure that may make progress on the same store.
     RetryLater(String),
-    /// A sticky store terminal: release this drainer and retry only from a fresh
-    /// adoption/session.
+    /// A role/writability terminal: release the sticky store and retry from a
+    /// fresh adoption/session.
+    RetryFreshSession(String),
+    /// A sticky non-role terminal: release this drainer and defer the slot.
     Terminal(String),
     /// Proven-local durable state that cannot succeed on a fresh session.
     Unrecoverable(String),
@@ -676,10 +681,16 @@ impl OrphanDrainer {
         let _ = clear_last_error(&self.slot_dir);
     }
 
+    fn completed_fsn(&self) -> Option<u64> {
+        self.store.completed_fsn()
+    }
+
     fn terminal_outcome(&self) -> OrphanDriveOutcome {
         let reason = self.terminal_message();
         if terminal_error_is_proven_local_unrecoverable(self.store.terminal_error()) {
             OrphanDriveOutcome::Unrecoverable(reason)
+        } else if terminal_error_requires_fresh_session(self.store.terminal_error()) {
+            OrphanDriveOutcome::RetryFreshSession(reason)
         } else {
             OrphanDriveOutcome::Terminal(reason)
         }
@@ -704,6 +715,16 @@ fn terminal_error_is_proven_local_unrecoverable(error: Option<&crate::Error>) ->
         // currently uses the same code, but always attaches its structured server
         // rejection; another session/endpoint may resolve that form.
         err.code() == ErrorCode::StoreResendRequired && err.qwp_ws_rejection().is_none()
+    })
+}
+
+#[cfg(feature = "sync-sender-qwp-ws")]
+fn terminal_error_requires_fresh_session(error: Option<&crate::Error>) -> bool {
+    error.is_some_and(|err| {
+        err.code() == ErrorCode::StoreResendRequired
+            && err
+                .qwp_ws_rejection()
+                .is_some_and(|rejection| rejection.category == QwpWsErrorCategory::NotWritable)
     })
 }
 
@@ -763,55 +784,84 @@ fn drain_orphan_to_completion(
     let initial_backoff = *config.qwp_ws.reconnect_initial_backoff;
     let max_backoff = *config.qwp_ws.reconnect_max_backoff;
     let mut retry_backoff = initial_backoff;
-    let mut drainer = loop {
-        match OrphanDrainer::open_with_stop(slot_dir.clone(), config, stop, traffic_gate) {
-            OrphanOpenOutcome::Drainer(drainer) => break drainer,
-            OrphanOpenOutcome::AlreadyDrained
-            | OrphanOpenOutcome::FailedSentinel
-            | OrphanOpenOutcome::Locked
-            | OrphanOpenOutcome::Stopped => return,
-            OrphanOpenOutcome::RetryLater(reason) => {
-                record_last_error_unless_stopped(&slot_dir, &reason, stop);
-                if !sleep_before_orphan_reconnect(None, retry_backoff, Some(stop)) {
+    let mut role_retry_backoff = initial_backoff;
+    'fresh_session: loop {
+        let mut drainer = loop {
+            match OrphanDrainer::open_with_stop(slot_dir.clone(), config, stop, traffic_gate) {
+                OrphanOpenOutcome::Drainer(drainer) => break drainer,
+                OrphanOpenOutcome::AlreadyDrained
+                | OrphanOpenOutcome::FailedSentinel
+                | OrphanOpenOutcome::Locked
+                | OrphanOpenOutcome::Stopped => return,
+                OrphanOpenOutcome::RetryLater(reason) => {
+                    record_last_error_unless_stopped(&slot_dir, &reason, stop);
+                    if !sleep_before_orphan_reconnect(None, retry_backoff, Some(stop)) {
+                        return;
+                    }
+                    retry_backoff = next_orphan_retry_backoff(retry_backoff, max_backoff);
+                }
+                OrphanOpenOutcome::Unrecoverable(reason) => {
+                    mark_orphan_failed_unless_stopped(&slot_dir, &reason, stop);
                     return;
                 }
-                retry_backoff = next_orphan_retry_backoff(retry_backoff, max_backoff);
             }
-            OrphanOpenOutcome::Unrecoverable(reason) => {
-                mark_orphan_failed_unless_stopped(&slot_dir, &reason, stop);
-                return;
-            }
-        }
-    };
-    retry_backoff = initial_backoff;
-    while !stop.load(Ordering::Acquire) {
-        match drainer.drive_once_with_stop(stop) {
-            OrphanDriveOutcome::Drained => {
-                drainer.clear_last_error();
-                return;
-            }
-            OrphanDriveOutcome::RetryLater(reason) => {
-                if !stop.load(Ordering::Acquire) {
-                    drainer.record_last_error(&reason);
-                }
-                if !sleep_before_orphan_reconnect(None, retry_backoff, Some(stop)) {
+        };
+        retry_backoff = initial_backoff;
+        let mut completed_fsn = drainer.completed_fsn();
+        while !stop.load(Ordering::Acquire) {
+            match drainer.drive_once_with_stop(stop) {
+                OrphanDriveOutcome::Drained => {
+                    drainer.clear_last_error();
                     return;
                 }
-                retry_backoff = next_orphan_retry_backoff(retry_backoff, max_backoff);
-            }
-            OrphanDriveOutcome::Terminal(reason) => {
-                record_last_error_unless_stopped(&slot_dir, &reason, stop);
-                return;
-            }
-            OrphanDriveOutcome::Unrecoverable(reason) => {
-                mark_orphan_failed_unless_stopped(&slot_dir, &reason, stop);
-                return;
-            }
-            OrphanDriveOutcome::Stopped => return,
-            OrphanDriveOutcome::Progress => retry_backoff = initial_backoff,
-            OrphanDriveOutcome::Idle => {
-                retry_backoff = initial_backoff;
-                thread::sleep(ORPHAN_IDLE_PARK);
+                OrphanDriveOutcome::RetryLater(reason) => {
+                    if !stop.load(Ordering::Acquire) {
+                        drainer.record_last_error(&reason);
+                    }
+                    if !sleep_before_orphan_reconnect(None, retry_backoff, Some(stop)) {
+                        return;
+                    }
+                    retry_backoff = next_orphan_retry_backoff(retry_backoff, max_backoff);
+                }
+                OrphanDriveOutcome::RetryFreshSession(reason) => {
+                    record_last_error_unless_stopped(&slot_dir, &reason, stop);
+                    // Keep the slot lock while backing off, matching the Java
+                    // drainer's ownership model. Drop only immediately before
+                    // reopening because the publication store's terminal latch
+                    // is intentionally sticky.
+                    if !sleep_before_orphan_reconnect(None, role_retry_backoff, Some(stop)) {
+                        return;
+                    }
+                    role_retry_backoff = next_orphan_retry_backoff(role_retry_backoff, max_backoff);
+                    drop(drainer);
+                    continue 'fresh_session;
+                }
+                OrphanDriveOutcome::Terminal(reason) => {
+                    record_last_error_unless_stopped(&slot_dir, &reason, stop);
+                    return;
+                }
+                OrphanDriveOutcome::Unrecoverable(reason) => {
+                    mark_orphan_failed_unless_stopped(&slot_dir, &reason, stop);
+                    return;
+                }
+                OrphanDriveOutcome::Stopped => return,
+                OrphanDriveOutcome::Progress => {
+                    retry_backoff = initial_backoff;
+                    let current_completed_fsn = drainer.completed_fsn();
+                    if current_completed_fsn != completed_fsn {
+                        completed_fsn = current_completed_fsn;
+                        role_retry_backoff = initial_backoff;
+                    }
+                }
+                OrphanDriveOutcome::Idle => {
+                    retry_backoff = initial_backoff;
+                    let current_completed_fsn = drainer.completed_fsn();
+                    if current_completed_fsn != completed_fsn {
+                        completed_fsn = current_completed_fsn;
+                        role_retry_backoff = initial_backoff;
+                    }
+                    thread::sleep(ORPHAN_IDLE_PARK);
+                }
             }
         }
     }
@@ -1137,9 +1187,10 @@ mod tests {
 
     #[cfg(feature = "sync-sender-qwp-ws")]
     #[test]
-    fn only_bare_store_resend_terminal_is_proven_local_unrecoverable() {
+    fn orphan_terminal_classification_separates_local_and_role_failures() {
         let local = crate::Error::new(ErrorCode::StoreResendRequired, "torn dictionary");
         assert!(terminal_error_is_proven_local_unrecoverable(Some(&local)));
+        assert!(!terminal_error_requires_fresh_session(Some(&local)));
 
         let role_rejection = QwpWsSenderError {
             category: QwpWsErrorCategory::NotWritable,
@@ -1153,6 +1204,21 @@ mod tests {
         let role = crate::Error::new(ErrorCode::StoreResendRequired, "primary moved")
             .with_qwp_ws_rejection(role_rejection);
         assert!(!terminal_error_is_proven_local_unrecoverable(Some(&role)));
+        assert!(terminal_error_requires_fresh_session(Some(&role)));
+
+        let parse_rejection = QwpWsSenderError {
+            category: QwpWsErrorCategory::ParseError,
+            applied_policy: QwpWsErrorPolicy::Terminal,
+            status: Some(0x05),
+            message: Some("bad frame".to_owned()),
+            message_sequence: Some(0),
+            from_fsn: 0,
+            to_fsn: 0,
+        };
+        let parse = crate::Error::new(ErrorCode::ServerRejection, "bad frame")
+            .with_qwp_ws_rejection(parse_rejection);
+        assert!(!terminal_error_is_proven_local_unrecoverable(Some(&parse)));
+        assert!(!terminal_error_requires_fresh_session(Some(&parse)));
     }
 
     #[cfg(all(feature = "sync-sender-qwp-ws", any(unix, windows)))]
