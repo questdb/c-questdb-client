@@ -1785,7 +1785,10 @@ fn qwp_ws_terminal_reject_terminalizes_in_all_progress_modes() {
 /// the store-and-forward byte budget.
 #[test]
 fn qwp_ws_wire_has_no_frame_count_cap() {
-    const FRAMES: usize = 8;
+    // Comfortably above the 128 frames the QWP spec once listed as the
+    // per-connection limit, so any frame-count cap up to that size fails
+    // this test rather than passing under it.
+    const FRAMES: usize = 200;
 
     let (port, frames) = spawn_silent_never_acking_server();
     let conf = format!("ws::addr=127.0.0.1:{port};");
