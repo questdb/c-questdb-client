@@ -1001,6 +1001,11 @@ impl SenderBuilder {
     /// `durable_ack_keepalive_interval_millis`, `drain_orphans`,
     /// `max_background_drainers`, and `error_inbox_capacity`.
     ///
+    /// `sf_max_segment_bytes` defaults to 4 MiB. Smaller disk-backed segments
+    /// release acknowledged space more granularly, but rotate more often and
+    /// therefore increase crash-consistency synchronization and file-operation
+    /// overhead.
+    ///
     /// You can also load the configuration from an environment variable. See
     /// [`SenderBuilder::from_env`].
     ///

@@ -53,6 +53,9 @@ use super::qwp_ws_sfa_segment::{
 use super::qwp_ws_sfa_symbol_dict::PersistedSymbolDict;
 
 const PERIODIC_SYNC_RETRY_MAX: Duration = Duration::from_secs(1);
+// Keep a trim turn bounded while amortizing the crash-consistency barriers.
+// Matches Java's SegmentManager quantum.
+const MAX_TRIMS_PER_STORAGE_STEP: usize = 64;
 
 #[cfg(test)]
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -72,6 +75,8 @@ enum SfaBarrierEvent {
     TrimDirectorySynced,
     TrimManifestUpdated,
     TrimQueuePopped,
+    TrimSegmentUnlinked(String),
+    TrimCleanupDirectorySynced,
     RotationHeaderSynced,
     RotationManifestUpdated,
     RotationQueueMutated,
@@ -194,7 +199,7 @@ pub(crate) enum SfaStorageStep {
 #[derive(Debug)]
 pub(crate) enum SfaStorageResult {
     Trimmed {
-        cleanup_failure: Option<SfaCleanupFailure>,
+        cleanup_failures: Vec<SfaCleanupFailure>,
     },
     HotSpareCreated {
         segment: SfaSegment,
@@ -213,8 +218,7 @@ pub(crate) struct SfaStorageFinish {
 
 #[derive(Debug)]
 pub(crate) struct SfaStorageCleanup {
-    segment: Arc<SfaSharedSegment>,
-    path: Option<PathBuf>,
+    segments: Vec<Arc<SfaSharedSegment>>,
 }
 
 #[derive(Debug)]
@@ -253,7 +257,7 @@ impl SfaStorageStep {
     pub(crate) fn perform(self) -> Result<SfaStorageResult, SfaQueueError> {
         match self {
             Self::Trim(cleanup) => Ok(SfaStorageResult::Trimmed {
-                cleanup_failure: cleanup.perform(),
+                cleanup_failures: cleanup.perform_trim(),
             }),
             Self::SyncPublished(batch) => {
                 let mut failure = None;
@@ -321,33 +325,94 @@ impl SfaStorageFinish {
 
 impl SfaStorageCleanup {
     fn new(segment: Arc<SfaSharedSegment>) -> Self {
-        let path = segment.path().map(Path::to_path_buf);
-        Self { segment, path }
+        Self {
+            segments: vec![segment],
+        }
+    }
+
+    fn new_batch(segments: Vec<Arc<SfaSharedSegment>>) -> Self {
+        debug_assert!(!segments.is_empty());
+        Self { segments }
     }
 
     pub(crate) fn perform(self) -> Option<SfaCleanupFailure> {
-        let path = self.path;
-        drop(self.segment);
-        let path = path?;
-        match fs::remove_file(&path) {
-            Ok(()) => {
-                let Some(slot_dir) = path.parent() else {
-                    return Some(SfaCleanupFailure {
-                        path,
-                        error: "SFA segment path has no parent directory".to_string(),
-                    });
-                };
-                sync_directory(slot_dir).err().map(|err| SfaCleanupFailure {
+        self.perform_inner(false).into_iter().next()
+    }
+
+    fn perform_trim(self) -> Vec<SfaCleanupFailure> {
+        self.perform_inner(true)
+    }
+
+    fn perform_inner(self, _record_trim_barriers: bool) -> Vec<SfaCleanupFailure> {
+        let mut failures = Vec::new();
+        let mut slot_dir = None;
+        let mut removed_path = None;
+
+        for segment in self.segments {
+            let path = segment.path().map(Path::to_path_buf);
+            drop(segment);
+            let Some(path) = path else {
+                continue;
+            };
+            let Some(parent) = path.parent() else {
+                failures.push(SfaCleanupFailure {
                     path,
-                    error: err.to_string(),
-                })
+                    error: "SFA segment path has no parent directory".to_string(),
+                });
+                continue;
+            };
+            match slot_dir.as_ref() {
+                Some(slot_dir) => debug_assert_eq!(slot_dir, parent),
+                None => slot_dir = Some(parent.to_path_buf()),
             }
-            Err(err) if err.kind() == io::ErrorKind::NotFound => None,
-            Err(err) => Some(SfaCleanupFailure {
-                path,
-                error: err.to_string(),
-            }),
+            match fs::remove_file(&path) {
+                Ok(()) => {
+                    #[cfg(test)]
+                    if _record_trim_barriers {
+                        record_sfa_barrier(SfaBarrierEvent::TrimSegmentUnlinked(
+                            path.file_name()
+                                .map(|name| name.to_string_lossy().into_owned())
+                                .unwrap_or_else(|| path.display().to_string()),
+                        ));
+                    }
+                    if removed_path.is_none() {
+                        removed_path = Some(path);
+                    }
+                }
+                Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+                Err(err) => {
+                    failures.push(SfaCleanupFailure {
+                        path,
+                        error: err.to_string(),
+                    });
+                }
+            }
         }
+
+        // The manifest already places every trim-batch member below its
+        // durable head. Any failed or crash-restored unlink is therefore
+        // harmless stale residue; one directory barrier covers all removals
+        // that did succeed.
+        if let (Some(slot_dir), Some(path)) = (slot_dir.as_deref(), removed_path.as_ref()) {
+            match sync_directory(slot_dir) {
+                Ok(()) => record_trim_cleanup_directory_sync(_record_trim_barriers),
+                Err(err) => {
+                    failures.push(SfaCleanupFailure {
+                        path: path.clone(),
+                        error: err.to_string(),
+                    });
+                }
+            }
+        }
+
+        failures
+    }
+}
+
+fn record_trim_cleanup_directory_sync(_enabled: bool) {
+    #[cfg(test)]
+    if _enabled {
+        record_sfa_barrier(SfaBarrierEvent::TrimCleanupDirectorySynced);
     }
 }
 
@@ -1447,14 +1512,14 @@ impl SfaEngine {
         if let Some(step) = self.take_periodic_sync_step()? {
             return Ok(Some(step));
         }
-        let trim_candidate = {
+        let trim_candidates = {
             let state = self.lock_state()?;
             if state.closed {
                 return Ok(None);
             }
-            self.trimmable_front(&state)?
+            self.trimmable_prefix(&state, MAX_TRIMS_PER_STORAGE_STEP)?
         };
-        if let Some(candidate) = trim_candidate {
+        if !trim_candidates.is_empty() {
             if let Some(slot_dir) = self.slot_dir.as_deref() {
                 let acked_fsn = self.completed_fsn().ok_or(SfaQueueError::CorruptSegments {
                     reason: "trimmable segment exists without a completed FSN",
@@ -1479,10 +1544,13 @@ impl SfaEngine {
             if state.closed {
                 return Ok(None);
             }
-            let Some(front) = state.sealed_segments.front() else {
-                return Ok(None);
-            };
-            if !Arc::ptr_eq(front, &candidate) || self.trimmable_front(&state)?.is_none() {
+            if state.sealed_segments.len() < trim_candidates.len()
+                || !state
+                    .sealed_segments
+                    .iter()
+                    .zip(&trim_candidates)
+                    .all(|(current, candidate)| Arc::ptr_eq(current, candidate))
+            {
                 return Ok(None);
             }
             if self.slot_dir.is_some() {
@@ -1491,9 +1559,12 @@ impl SfaEngine {
                     .as_ref()
                     .ok_or(SfaQueueError::Closed)?
                     .base_seq();
+                // One durable head advance past the last batch member covers
+                // the whole contiguous prefix. Recovery treats any member
+                // surviving the subsequent unlink loop as stale below head.
                 let new_head_base = state
                     .sealed_segments
-                    .get(1)
+                    .get(trim_candidates.len())
                     .map(|segment| segment.base_seq())
                     .unwrap_or(active_base);
                 let manifest = state
@@ -1507,17 +1578,25 @@ impl SfaEngine {
                 #[cfg(test)]
                 record_sfa_barrier(SfaBarrierEvent::TrimManifestUpdated);
             }
-            let segment = state.sealed_segments.pop_front().unwrap();
-            state.first_non_durable_sealed = state.first_non_durable_sealed.saturating_sub(1);
-            #[cfg(test)]
-            if self.slot_dir.is_some() {
-                record_sfa_barrier(SfaBarrierEvent::TrimQueuePopped);
+            let mut removed_bytes = 0_u64;
+            for candidate in &trim_candidates {
+                let segment = state.sealed_segments.pop_front().unwrap();
+                debug_assert!(Arc::ptr_eq(&segment, candidate));
+                removed_bytes = removed_bytes.saturating_add(segment.size_bytes());
+                #[cfg(test)]
+                if self.slot_dir.is_some() {
+                    record_sfa_barrier(SfaBarrierEvent::TrimQueuePopped);
+                }
             }
-            state.allocated_segment_bytes = state
-                .allocated_segment_bytes
-                .saturating_sub(segment.size_bytes());
+            state.first_non_durable_sealed = state
+                .first_non_durable_sealed
+                .saturating_sub(trim_candidates.len());
+            state.allocated_segment_bytes =
+                state.allocated_segment_bytes.saturating_sub(removed_bytes);
             state.storage_maintenance_in_flight = true;
-            return Ok(Some(SfaStorageStep::Trim(SfaStorageCleanup::new(segment))));
+            return Ok(Some(SfaStorageStep::Trim(SfaStorageCleanup::new_batch(
+                trim_candidates,
+            ))));
         }
 
         let mut state = self.lock_state()?;
@@ -1559,8 +1638,8 @@ impl SfaEngine {
         allow_install: bool,
     ) -> Result<SfaStorageFinish, SfaQueueError> {
         match result {
-            SfaStorageResult::Trimmed { cleanup_failure } => {
-                if let Some(failure) = cleanup_failure {
+            SfaStorageResult::Trimmed { cleanup_failures } => {
+                for failure in cleanup_failures {
                     self.record_cleanup_failure(failure);
                 }
                 Ok(SfaStorageFinish::unchanged())
@@ -1796,23 +1875,37 @@ impl SfaEngine {
         Ok(Arc::new(SfaSharedSegment::new(segment)))
     }
 
-    fn trimmable_front(
+    fn trimmable_prefix(
         &self,
         state: &SfaEngineState,
-    ) -> Result<Option<Arc<SfaSharedSegment>>, SfaQueueError> {
+        max_count: usize,
+    ) -> Result<Vec<Arc<SfaSharedSegment>>, SfaQueueError> {
         let Some(acked_fsn) = self.completed_fsn() else {
-            return Ok(None);
+            return Ok(Vec::new());
         };
-        let Some(segment) = state.sealed_segments.front() else {
-            return Ok(None);
+        let mut segments = state.sealed_segments.iter().take(max_count);
+        let Some(first) = segments.next() else {
+            return Ok(Vec::new());
         };
-        let last_fsn = segment.last_fsn().ok_or(SfaQueueError::CorruptSegments {
+        let first_last_fsn = first.last_fsn().ok_or(SfaQueueError::CorruptSegments {
             reason: "sealed segment has no frames",
         })?;
-        if last_fsn > acked_fsn {
-            return Ok(None);
+        if first_last_fsn > acked_fsn {
+            return Ok(Vec::new());
         }
-        Ok(Some(Arc::clone(segment)))
+
+        let mut trimmable = Vec::with_capacity(max_count.min(state.sealed_segments.len()));
+        trimmable.push(Arc::clone(first));
+        for segment in segments {
+            let last_fsn = segment.last_fsn().ok_or(SfaQueueError::CorruptSegments {
+                reason: "sealed segment has no frames",
+            })?;
+            if last_fsn > acked_fsn {
+                break;
+            }
+            trimmable.push(Arc::clone(segment));
+        }
+        Ok(trimmable)
     }
 
     fn all_published_frames_resolved(&self) -> bool {
@@ -3002,6 +3095,14 @@ mod tests {
             max_bytes,
             max_in_flight,
         }
+    }
+
+    fn file_name(path: &Path) -> String {
+        path.file_name().unwrap().to_string_lossy().into_owned()
+    }
+
+    fn trim_unlinked_event(dir: &Path, generation: u64) -> SfaBarrierEvent {
+        SfaBarrierEvent::TrimSegmentUnlinked(file_name(&spare_segment_path(dir, generation)))
     }
 
     fn open(dir: &TempDir) -> SfaFrameQueue {
@@ -4881,8 +4982,137 @@ mod tests {
         );
         assert!(matches!(step, SfaStorageStep::Trim(_)));
         let result = step.perform().unwrap();
+        assert_eq!(
+            take_sfa_barriers(),
+            vec![
+                trim_unlinked_event(dir.path(), 0),
+                SfaBarrierEvent::TrimCleanupDirectorySynced,
+            ]
+        );
         queue.finish_storage_maintenance(result, true).unwrap();
         queue.complete_storage_maintenance().unwrap();
+    }
+
+    #[test]
+    fn trim_batches_only_the_acked_prefix_under_one_barrier_set() {
+        let dir = TempDir::new().unwrap();
+        let options = options_with(&dir, 38, 38 * 6, 8);
+        let mut queue = SfaFrameQueue::open(options.clone()).unwrap();
+        for payload in [b"one".as_slice(), b"two", b"tri", b"for", b"five"] {
+            queue.try_submit(payload).unwrap();
+        }
+        assert_eq!(queue.sealed_segment_count(), 4);
+        queue.complete_through_fsn(2).unwrap();
+        take_sfa_barriers();
+
+        let step = queue.take_storage_maintenance_step(false).unwrap().unwrap();
+        assert!(matches!(step, SfaStorageStep::Trim(_)));
+        assert_eq!(queue.sealed_segment_count(), 1);
+        assert_eq!(
+            take_sfa_barriers(),
+            vec![
+                SfaBarrierEvent::TrimWatermarkWritten,
+                SfaBarrierEvent::TrimWatermarkSynced,
+                SfaBarrierEvent::TrimDirectorySynced,
+                SfaBarrierEvent::TrimManifestUpdated,
+                SfaBarrierEvent::TrimQueuePopped,
+                SfaBarrierEvent::TrimQueuePopped,
+                SfaBarrierEvent::TrimQueuePopped,
+            ]
+        );
+
+        let result = step.perform().unwrap();
+        assert_eq!(
+            take_sfa_barriers(),
+            vec![
+                trim_unlinked_event(dir.path(), 0),
+                trim_unlinked_event(dir.path(), 1),
+                trim_unlinked_event(dir.path(), 2),
+                SfaBarrierEvent::TrimCleanupDirectorySynced,
+            ]
+        );
+        queue.finish_storage_maintenance(result, true).unwrap();
+        queue.complete_storage_maintenance().unwrap();
+        assert_eq!(sfa_file_count(dir.path()), 2);
+
+        drop(queue);
+        let recovered = SfaFrameQueue::open(options).unwrap();
+        assert_eq!(recovered.completed_fsn(), Some(2));
+        assert_eq!(
+            recovered.payload_vec_for_fsn(3).as_deref(),
+            Some(&b"for"[..])
+        );
+        assert_eq!(
+            recovered.payload_vec_for_fsn(4).as_deref(),
+            Some(&b"five"[..])
+        );
+        assert!(recovered.payload_vec_for_fsn(0).is_none());
+    }
+
+    #[test]
+    fn trim_batch_manifest_commit_recovers_before_unlinks() {
+        let dir = TempDir::new().unwrap();
+        let options = options_with(&dir, 38, 38 * 5, 8);
+        let mut queue = SfaFrameQueue::open(options.clone()).unwrap();
+        for payload in [b"one".as_slice(), b"two", b"tri", b"for"] {
+            queue.try_submit(payload).unwrap();
+        }
+        queue.complete_through_fsn(1).unwrap();
+
+        // Taking the task durably advances the manifest past the two ACKed
+        // segments. Simulate a crash before the task can unlink either file.
+        let step = queue.take_storage_maintenance_step(false).unwrap().unwrap();
+        assert!(matches!(step, SfaStorageStep::Trim(_)));
+        assert_eq!(queue.sealed_segment_count(), 1);
+        assert_eq!(sfa_file_count(dir.path()), 4);
+        drop(step);
+        drop(queue);
+
+        let recovered = SfaFrameQueue::open(options).unwrap();
+        assert_eq!(recovered.completed_fsn(), Some(1));
+        assert!(recovered.payload_vec_for_fsn(0).is_none());
+        assert_eq!(
+            recovered.payload_vec_for_fsn(2).as_deref(),
+            Some(&b"tri"[..])
+        );
+        assert_eq!(
+            recovered.payload_vec_for_fsn(3).as_deref(),
+            Some(&b"for"[..])
+        );
+    }
+
+    #[test]
+    fn trim_batch_is_bounded() {
+        let segment_count = MAX_TRIMS_PER_STORAGE_STEP + 2;
+        let mut queue = SfaFrameQueue::open_memory(memory_options(
+            38,
+            38 * (segment_count + 1),
+            segment_count + 1,
+        ))
+        .unwrap();
+        for _ in 0..segment_count {
+            queue.try_submit(b"x").unwrap();
+        }
+        assert_eq!(queue.sealed_segment_count(), segment_count - 1);
+        queue
+            .complete_through_fsn((segment_count - 1) as u64)
+            .unwrap();
+
+        let step = queue.take_storage_maintenance_step(false).unwrap().unwrap();
+        assert!(matches!(step, SfaStorageStep::Trim(_)));
+        assert_eq!(
+            queue.sealed_segment_count(),
+            segment_count - 1 - MAX_TRIMS_PER_STORAGE_STEP
+        );
+        let result = step.perform().unwrap();
+        queue.finish_storage_maintenance(result, true).unwrap();
+        queue.complete_storage_maintenance().unwrap();
+
+        let step = queue.take_storage_maintenance_step(false).unwrap().unwrap();
+        let result = step.perform().unwrap();
+        queue.finish_storage_maintenance(result, true).unwrap();
+        queue.complete_storage_maintenance().unwrap();
+        assert_eq!(queue.sealed_segment_count(), 0);
     }
 
     #[test]
