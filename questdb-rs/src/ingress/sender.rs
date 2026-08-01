@@ -663,6 +663,36 @@ impl Sender {
         }
     }
 
+    /// Non-blocking completion watermark for `ack_level`: the polling
+    /// counterpart to [`Self::wait`].
+    ///
+    /// * [`AckLevel::Ok`] reports the highest FSN the server has accepted.
+    /// * [`AckLevel::Durable`] reports the highest FSN covered by a durable
+    ///   ACK, and is equivalent to [`Self::acked_fsn`].
+    ///
+    /// In durable-ACK mode the `Ok` watermark advances ahead of `Durable`;
+    /// outside durable-ACK mode the two coincide. `Ok` never lags `Durable`.
+    /// Both advance on server ACK or server-side reject-and-continue, so a
+    /// rejected frame does not leave the watermark stuck behind it.
+    ///
+    /// Prefer this over [`Self::wait`] wherever the caller must not block —
+    /// for instance a thread that owns the socket and drives progress itself,
+    /// where a blocking barrier would stall the very transport it services.
+    /// QWP/WebSocket only; other protocols return `InvalidApiCall`.
+    #[cfg(feature = "sync-sender-qwp-ws")]
+    pub fn completed_fsn(&self, ack_level: AckLevel) -> Result<Option<u64>> {
+        if !matches!(
+            &self.handler,
+            SyncProtocolHandler::SyncQwpWs(_) | SyncProtocolHandler::ManualQwpWs(_)
+        ) {
+            return Err(error::fmt!(
+                InvalidApiCall,
+                "completed_fsn is only supported for QWP/WebSocket senders."
+            ));
+        }
+        self.qwp_ws_completed_fsn(ack_level)
+    }
+
     /// Wait until every QWP/WebSocket frame published so far on this sender
     /// reaches `ack_level`, or until the wait makes no progress for `timeout`.
     ///
