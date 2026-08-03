@@ -386,6 +386,15 @@ public:
     /**
      * Record a symbol value for the given column.
      * Make sure you record all the symbol columns before any other column type.
+     *
+     * When the buffer is flushed over QWP/WebSocket, every distinct symbol
+     * recorded here is interned into the *same* connection-scoped dictionary
+     * the chunk API uses — capped at 1,000,000 entries and 256 MiB of UTF-8
+     * across the whole connection, not per buffer or per flush. Exceeding it
+     * fails the flush with `error_code::symbol_dict_full`; see the
+     * symbol-column preamble in `qwp_sender.h` for the cap and how to reset it.
+     * ILP (TCP/HTTP) flushes carry no such dictionary and are unaffected.
+     *
      * @param name Column name.
      * @param value Column value.
      */

@@ -6320,9 +6320,12 @@ fn store_and_forward_file_mode_arrow_symbol_writes_symbols_ahead_to_side_file() 
         .expect("Arrow SFA symbol flush should publish")
         .expect("non-empty Arrow batch publishes a frame");
 
-    // The Arrow write-ahead persisted both symbols, in ascending id order, each in
-    // its own CRC-committed side-file chunk, exactly as the row (`Chunk`) path does.
-    // Assert format-agnostically (each chunk's entry region carries the `[len]"symbol"` entry)
+    // The Arrow write-ahead persisted both symbols in ascending id order. A batch
+    // is ONE frame, and a frame's new symbols are persisted in a single append, so
+    // both share one CRC-committed side-file chunk -- unlike the row (`Chunk`)
+    // path in `store_and_forward_file_mode_writes_symbols_ahead_to_side_file`,
+    // whose two separate flushes are two frames and therefore two chunks. Assert
+    // format-agnostically (the entry region carries each `[len]"symbol"` entry)
     // that both are present and alpha precedes bravo, rather than hardcoding the
     // framing/CRC bytes. The pool mints a kind-scoped slot per borrowed column
     // sender, so the first one lives under `<sender_id>-ingest-0`, not the bare
