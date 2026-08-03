@@ -5383,20 +5383,24 @@ impl Default for SymbolGlobalDict {
     }
 }
 
-/// Per-connection cap on the QWP/WS global symbol dictionary. Matches
-/// `MAX_CONN_DICT_SIZE` in the egress reader (`egress/symbol_dict.rs`)
-/// and the Java reference client. When the cap is reached the encoder
-/// surfaces an `InvalidApiCall` error and the caller is expected to
-/// reconnect (which resets both sides).
+/// Per-connection cap on the QWP/WS global symbol dictionary a sender ships to
+/// the server. Matches the server's ingress dictionary ceiling
+/// (`MAX_SYMBOL_DICTIONARY_SIZE`) and the Java reference client's
+/// `MAX_SYMBOL_DICTIONARY_SIZE` (both `1_000_000`), so the client refuses a symbol
+/// the server would reject the delta for, rather than only discovering it on the
+/// wire. When the cap is reached the encoder surfaces an `InvalidApiCall` error and
+/// the caller is expected to reconnect (which resets both sides). (The
+/// egress/query-result reader has its own, independent ceiling; see
+/// `egress/symbol_dict.rs`.)
 #[cfg(feature = "_sender-qwp-ws")]
-pub(crate) const MAX_CONN_SYMBOL_DICT_SIZE: usize = 8_388_608;
+pub(crate) const MAX_CONN_SYMBOL_DICT_SIZE: usize = 1_000_000;
 
 /// Per-connection cap on the cumulative UTF-8 heap (in bytes) the QWP/WS global
 /// symbol dictionary holds. Matches `MAX_CONN_DICT_HEAP_BYTES` in the egress
 /// reader (`egress/symbol_dict.rs`) and the Java reference client. The entry
 /// count ([`MAX_CONN_SYMBOL_DICT_SIZE`]) and per-entry length
 /// ([`MAX_PERSISTED_SYMBOL_ENTRY_LEN`]) caps do NOT bound the aggregate heap
-/// (8M entries * 1 MiB ~= 8 TiB), so without this cap a high-cardinality /
+/// (1M entries * 1 MiB ~= 1 TiB), so without this cap a high-cardinality /
 /// large-symbol connection could (a) build a dictionary the server rejects with
 /// no ingestion-side error, and (b) grow the persisted side-file past
 /// `MAX_FILE_LEN` (~2 GiB), which recovery then discards as over-cap -- stranding
@@ -9929,9 +9933,10 @@ mod tests {
     #[cfg(feature = "_sender-qwp-ws")]
     #[test]
     fn symbol_dict_cap_matches_server_ceiling() {
-        // Mirrors the egress reader cap and the Java reference client; a
-        // drift here would silently change the reconnect threshold.
-        assert_eq!(MAX_CONN_SYMBOL_DICT_SIZE, 8 * 1024 * 1024);
+        // Mirrors the server's ingress dictionary ceiling and the Java reference
+        // client (both 1_000_000); a drift here would silently change the reconnect
+        // threshold and let the client ship deltas the server rejects.
+        assert_eq!(MAX_CONN_SYMBOL_DICT_SIZE, 1_000_000);
     }
 
     #[cfg(feature = "_sender-qwp-ws")]

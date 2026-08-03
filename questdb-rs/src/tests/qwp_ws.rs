@@ -2974,10 +2974,11 @@ fn spawn_orphan_capture_first_frame_server() -> (u16, mpsc::Receiver<Vec<u8>>) {
 #[test]
 fn qwp_ws_orphan_drain_heals_a_zero_extended_side_file_and_replays_via_delta() {
     // A host/power crash can zero-extend a delta slot's `.symbol-dict`. With the
-    // per-entry CRC (see `qwp_ws_sfa_symbol_dict`), those trailing zeros cannot
-    // form a valid entry, so `open` heals them at recovery and the recovered
+    // per-chunk CRC (see `qwp_ws_sfa_symbol_dict`), those trailing zeros cannot
+    // form a valid chunk -- their leading entryCount varint decodes to 0, which
+    // `open` rejects -- so `open` heals them at recovery and the recovered
     // dictionary is exactly the real symbols -- never inflated with phantom
-    // `[len=0]` entries (the pre-CRC hazard this test used to exercise). The orphan
+    // entries (the pre-CRC hazard this test used to exercise). The orphan
     // drainer therefore arms delta on the CLEAN recovered dictionary and
     // re-registers the real symbol via a table-less catch-up frame before replaying
     // the DATA frame, and the slot stays recoverable.
@@ -3045,10 +3046,10 @@ fn qwp_ws_orphan_drain_heals_a_zero_extended_side_file_and_replays_via_delta() {
 
 #[test]
 fn qwp_ws_orphan_drain_falls_back_to_dense_when_recovered_dict_has_a_duplicate_entry() {
-    // A recovered `.symbol-dict` can be corrupt in a way the per-entry CRC does NOT
+    // A recovered `.symbol-dict` can be corrupt in a way the per-chunk CRC does NOT
     // catch: a host/power crash that leaves the append-only file with a duplicate
-    // entry (e.g. a torn tail whose bytes re-form an already-present, still-CRC-valid
-    // entry). `open` loads every CRC-valid entry -- so the recovered count is
+    // chunk (e.g. a torn tail whose bytes re-form an already-present, still-CRC-valid
+    // chunk). `open` loads every CRC-valid chunk -- so the recovered count is
     // inflated -- but a well-formed dictionary holds strictly unique symbols, so
     // `SymbolGlobalDict::seed` rejects the duplicate id (`StoreResendRequired`).
     //
@@ -3072,8 +3073,8 @@ fn qwp_ws_orphan_drain_falls_back_to_dense_when_recovered_dict_has_a_duplicate_e
     let sf_dir = tempfile::TempDir::new().unwrap();
     seed_orphan_slot(sf_dir.path());
 
-    // Duplicate the recovered entry region (everything after the 8-byte
-    // `SYD1`+version header) back onto the file. Each copied entry keeps its original
+    // Duplicate the recovered chunk region (everything after the 8-byte
+    // `SYD1`+version header) back onto the file. Each copied chunk keeps its original
     // valid CRC, so `open` accepts them all and reports an inflated count, but the
     // repeat makes `SymbolGlobalDict::seed` fail on the first duplicate id.
     let side_file = sf_dir.path().join("orphan").join(".symbol-dict");

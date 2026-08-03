@@ -3663,10 +3663,10 @@ fn store_and_forward_file_mode_writes_symbols_ahead_to_side_file() {
     append_one_symbol_row(&mut second, b"bravo", &[2_i64]);
     sender.flush(&mut second).unwrap();
 
-    // The write-ahead persisted both symbols, in ascending id order, each in its
-    // own CRC-committed record. Assert format-agnostically (each record's payload
-    // carries the `[len]"symbol"` entry) that both are present and alpha precedes
-    // bravo, rather than hardcoding the framing/CRC bytes. The pool mints a
+    // The write-ahead persisted both symbols, in ascending id order, each frame's
+    // symbol in its own CRC-committed chunk. Assert format-agnostically (each chunk's
+    // entry region carries the `[len]"symbol"` entry) that both are present and alpha
+    // precedes bravo, rather than hardcoding the framing/CRC bytes. The pool mints a
     // managed slot per borrowed sender, so the first one lives under
     // `<sender_id>-ingest-0`, not the bare `sender_id`.
     let side_file = dir.path().join("recov-ingest-0").join(".symbol-dict");
@@ -3753,9 +3753,9 @@ fn store_and_forward_file_mode_recovers_and_replays_queued_frame_after_reopen() 
 fn store_and_forward_file_mode_value_corruption_is_healed_and_segment_kept() {
     // Issue-4 end-to-end: a same-length VALUE corruption in the persisted
     // `.symbol-dict` -- a host/power-crash bit-flip that keeps an entry's length
-    // but changes a symbol byte -- must be caught by the per-entry CRC on
+    // but changes a symbol byte -- must be caught by the per-chunk CRC on
     // recovery and NOT silently recovered as the wrong symbol. The CRC-failed
-    // entry is dropped (healed) at open, so the corrupt symbol never reaches the
+    // chunk is dropped (healed) at open, so the corrupt symbol never reaches the
     // dictionary, and the queued segment stays on disk (recoverable). (A recovered
     // mid-stream delta that DEPENDS on a dropped id then fails loudly at the send
     // loop's torn-dict guard -- `StoreResendRequired` -- covered by the driver- and
@@ -3802,7 +3802,7 @@ fn store_and_forward_file_mode_value_corruption_is_healed_and_segment_kept() {
     let recovered = PersistedSymbolDict::open(&slot_dir).unwrap();
     assert!(
         recovered.read_loaded_symbols().is_empty(),
-        "a CRC-failed record must be dropped on recovery, never recovered as the \
+        "a CRC-failed chunk must be dropped on recovery, never recovered as the \
          corrupted symbol; got {:?}",
         recovered.read_loaded_symbols()
     );
@@ -6321,8 +6321,8 @@ fn store_and_forward_file_mode_arrow_symbol_writes_symbols_ahead_to_side_file() 
         .expect("non-empty Arrow batch publishes a frame");
 
     // The Arrow write-ahead persisted both symbols, in ascending id order, each in
-    // its own CRC-committed record, exactly as the chunk path does. Assert
-    // format-agnostically (each record's payload carries the `[len]"symbol"` entry)
+    // its own CRC-committed side-file chunk, exactly as the row (`Chunk`) path does.
+    // Assert format-agnostically (each chunk's entry region carries the `[len]"symbol"` entry)
     // that both are present and alpha precedes bravo, rather than hardcoding the
     // framing/CRC bytes. The pool mints a kind-scoped slot per borrowed column
     // sender, so the first one lives under `<sender_id>-ingest-0`, not the bare
