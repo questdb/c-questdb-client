@@ -754,12 +754,33 @@ bool qwp_chunk_column_binary(
  *
  * Separately, the connection-scoped symbol dictionary — the distinct
  * symbols actually *referenced* across every column and every chunk sent
- * on one connection — is capped at 1,000,000 entries and 256 MiB of UTF-8,
- * matching the server's ingress ceiling. That cap is reached at
- * `qwp_sender_flush_chunk`, not here, and is not per column: a wide
- * dictionary is free until its entries are referenced. On hitting it the
- * flush returns `false` with `*err_out` set; close and reopen the sender to
- * reset the dictionary.
+ * on one connection — is capped at 1,000,000 entries, matching the server's
+ * ingress ceiling (`MAX_SYMBOL_DICTIONARY_SIZE`), and at 256 MiB of UTF-8.
+ * The byte cap is client-side only — the server bounds the ingress dictionary
+ * by entry count alone; it keeps the writer in step with the egress reader and
+ * with the store-and-forward side-file's size limit. That cap is reached at
+ * `qwp_sender_flush_chunk*` / `qwp_direct_sender_flush`, not here, and is not
+ * per column: a wide dictionary is free until its entries are referenced. On
+ * hitting it the flush returns `false` with `*err_out` set to
+ * `line_sender_error_symbol_dict_full` — a distinct code, so you can branch on
+ * it without matching on the message text. Chunks referencing only
+ * already-interned symbols keep flushing; only a chunk that introduces a
+ * *new* symbol fails.
+ *
+ * Resetting the dictionary means discarding the connection that owns it —
+ * there is no per-sender close, and `questdb_db_return_sender` recycles the
+ * connection *and its dictionary*, so a returned-and-reborrowed sender hits
+ * the cap again on its next new symbol. Instead:
+ *
+ *   - Pooled sender: `questdb_db_drop_sender`, then borrow again. With
+ *     `sf_dir` configured, call `qwp_sender_wait` first — dropping while
+ *     frames are unresolved leaves them (and the dictionary) in the slot,
+ *     and the next borrower re-seeds from the slot's side-file at the same
+ *     size.
+ *   - Pooled direct sender: `questdb_db_drop_direct_sender`, then borrow
+ *     again.
+ *   - Standalone direct sender: `qwp_direct_sender_free`, then re-open with
+ *     `qwp_direct_sender_from_conf` / `qwp_direct_sender_from_opts`.
  *
  * `codes[i]` must be in `0 .. dict_len` for non-null rows; null-row
  * codes are not inspected.

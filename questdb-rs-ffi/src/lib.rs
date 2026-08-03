@@ -391,6 +391,19 @@ pub enum line_sender_error_code {
     /// socket drop) so a caller can tell "resend from source" apart from
     /// "reconnect and retry" by code, without matching on the message text.
     line_sender_error_store_resend_required = 36,
+
+    /// The QWP/WebSocket connection-scoped symbol dictionary is full: interning
+    /// another distinct symbol would exceed its entry-count cap (1,000,000,
+    /// matching the server's ingress ceiling) or its cumulative UTF-8 heap cap
+    /// (256 MiB). The frame is rejected before any byte reaches the wire and the
+    /// buffer is rolled back, so nothing is lost and chunks referencing only
+    /// already-interned symbols keep flushing — but retrying on the same sender
+    /// can never succeed. Retire the connection (`questdb_db_drop_sender`, NOT
+    /// `questdb_db_return_sender`, which recycles the connection and its
+    /// dictionary) and borrow a fresh one. Distinct from
+    /// `line_sender_error_invalid_api_call` so callers can recognise it without
+    /// matching on the message text.
+    line_sender_error_symbol_dict_full = 37,
 }
 
 /// Neutral spelling of the client-wide error category. The released
@@ -481,6 +494,7 @@ impl From<ErrorCode> for line_sender_error_code {
             ErrorCode::StoreResendRequired => {
                 line_sender_error_code::line_sender_error_store_resend_required
             }
+            ErrorCode::SymbolDictFull => line_sender_error_code::line_sender_error_symbol_dict_full,
             _ => line_sender_error_code::line_sender_error_invalid_api_call,
         }
     }
@@ -4924,6 +4938,7 @@ mod tests {
                 line_sender_error_store_resend_required,
                 36,
             ),
+            (E::SymbolDictFull, line_sender_error_symbol_dict_full, 37),
         ]
     }
 

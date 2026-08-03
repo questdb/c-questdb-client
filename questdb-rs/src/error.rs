@@ -226,6 +226,26 @@ pub enum ErrorCode {
     /// the error message text. The sender's own reconnect/failover loops treat it
     /// as terminal (they stop) rather than retrying it to their deadline.
     StoreResendRequired,
+
+    /// The QWP/WebSocket connection-scoped symbol dictionary is full: interning
+    /// another distinct symbol would push it past its entry-count cap
+    /// (1,000,000, matching the server's ingress ceiling) or its cumulative
+    /// UTF-8 heap cap (256 MiB). The dictionary accumulates every distinct
+    /// symbol referenced across every column, chunk, and row-buffer flush on
+    /// one connection, and is only reset by discarding that connection.
+    ///
+    /// The frame is rejected before any byte reaches the wire and the buffer is
+    /// rolled back, so nothing is lost and already-interned symbols keep
+    /// flushing — but retrying on the same sender can never succeed. The caller
+    /// must retire the connection (`Sender` drop / `questdb_db_drop_sender`,
+    /// **not** a pool return, which recycles the connection *and* its
+    /// dictionary) and continue on a fresh one.
+    ///
+    /// Distinct from [`InvalidApiCall`](Self::InvalidApiCall) — a caller
+    /// mistake with no recovery — so callers can recognise a full dictionary
+    /// **by code** and take that specific action, without matching on the error
+    /// message text.
+    SymbolDictFull,
 }
 
 /// An error that occurred when using the QuestDB client library.
@@ -539,6 +559,7 @@ mod tests {
                 ErrorCode::ArrowExport => {}
                 ErrorCode::BatchTooLarge => {}
                 ErrorCode::StoreResendRequired => {}
+                ErrorCode::SymbolDictFull => {}
             }
         }
         let _ = _exhaustive;

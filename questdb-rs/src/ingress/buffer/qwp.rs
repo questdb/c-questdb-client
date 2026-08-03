@@ -5561,9 +5561,13 @@ impl SymbolGlobalDict {
     }
 
     /// Returns `(global_id, is_new)`. Errors with `InvalidApiCall` if the symbol
-    /// exceeds [`MAX_PERSISTED_SYMBOL_ENTRY_LEN`], or interning it would push the
-    /// dictionary past its entry-count cap ([`MAX_CONN_SYMBOL_DICT_SIZE`]) or its
-    /// cumulative heap cap ([`MAX_CONN_SYMBOL_DICT_HEAP_BYTES`]).
+    /// exceeds [`MAX_PERSISTED_SYMBOL_ENTRY_LEN`], and with
+    /// [`SymbolDictFull`](crate::ErrorCode::SymbolDictFull) if interning it would
+    /// push the dictionary past its entry-count cap
+    /// ([`MAX_CONN_SYMBOL_DICT_SIZE`]) or its cumulative heap cap
+    /// ([`MAX_CONN_SYMBOL_DICT_HEAP_BYTES`]) -- a distinct code so callers can
+    /// recognise a full dictionary (retire the connection) without matching on
+    /// the message text.
     pub(crate) fn intern(&mut self, bytes: &[u8]) -> crate::Result<(u64, bool)> {
         // A symbol larger than the persisted side-file's per-entry cap would be
         // interned, used in a frame and ACKed, then rejected as torn by the
@@ -5586,7 +5590,7 @@ impl SymbolGlobalDict {
         }
         if self.entries.len() >= self.cap {
             return Err(crate::error::fmt!(
-                InvalidApiCall,
+                SymbolDictFull,
                 "QWP/WS connection-scoped symbol dictionary reached its \
                  {}-entry cap; drop and reopen the connection to reset \
                  the dictionary",
@@ -5595,11 +5599,12 @@ impl SymbolGlobalDict {
         }
         // Aggregate heap cap: the entry-count and per-entry caps above do NOT
         // bound the total bytes (1M entries * 1 MiB ~= 1 TiB). Enforce the same
-        // 256 MiB connection heap the egress reader / server / Java client use,
-        // at this single ingestion choke point, so an oversized *aggregate* never
-        // gets an id or is written ahead -- otherwise the persisted side-file
-        // could grow past `MAX_FILE_LEN` and be discarded on recovery, stranding
-        // queued frames. `checked_add` is defensive: `bytes.len()` is already
+        // 256 MiB connection heap the egress reader / Java client use -- the
+        // server bounds its ingress dictionary by entry count alone, so this one
+        // is client-side -- at this single ingestion choke point, so an oversized
+        // *aggregate* never gets an id or is written ahead. Otherwise the
+        // persisted side-file could grow past `MAX_FILE_LEN` and be discarded on
+        // recovery, stranding queued frames. `checked_add` is defensive: `bytes.len()` is already
         // <= 1 MiB and `heap_bytes` <= the cap, so it cannot actually overflow.
         let new_heap = self
             .heap_bytes
@@ -5607,7 +5612,7 @@ impl SymbolGlobalDict {
             .filter(|&h| h <= self.heap_cap)
             .ok_or_else(|| {
                 crate::error::fmt!(
-                    InvalidApiCall,
+                    SymbolDictFull,
                     "QWP/WS connection-scoped symbol dictionary reached its \
                      {}-byte heap cap; drop and reopen the connection to reset \
                      the dictionary",
@@ -9636,9 +9641,11 @@ mod tests {
         assert!(dict.intern(b"c").unwrap().1);
         assert_eq!(dict.len(), 3);
 
-        // A fourth distinct symbol is rejected once the cap is reached.
+        // A fourth distinct symbol is rejected once the cap is reached, with a
+        // code distinct from `InvalidApiCall` so a caller can recognise a full
+        // dictionary (retire the connection) without matching on the message.
         let err = dict.intern(b"d").unwrap_err();
-        assert_eq!(err.code(), ErrorCode::InvalidApiCall);
+        assert_eq!(err.code(), ErrorCode::SymbolDictFull);
         assert!(err.msg().contains("cap"), "{}", err.msg());
 
         // An already-interned symbol still resolves at the cap.
@@ -9685,7 +9692,7 @@ mod tests {
         // A distinct symbol that would push the heap past the cap is rejected, and
         // gets no id.
         let err = dict.intern(b"c").unwrap_err();
-        assert_eq!(err.code(), ErrorCode::InvalidApiCall);
+        assert_eq!(err.code(), ErrorCode::SymbolDictFull);
         assert!(err.msg().contains("heap"), "{}", err.msg());
         assert_eq!(dict.len(), 2);
 
@@ -9720,7 +9727,7 @@ mod tests {
 
         // The cap is still enforced against the restored counter.
         let err = dict.intern(b"d").unwrap_err();
-        assert_eq!(err.code(), ErrorCode::InvalidApiCall);
+        assert_eq!(err.code(), ErrorCode::SymbolDictFull);
         assert!(err.msg().contains("heap"), "{}", err.msg());
     }
 

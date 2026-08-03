@@ -231,6 +231,19 @@ typedef enum line_sender_error_code
      *  socket drop) so a caller can tell "resend from source" apart from
      *  "reconnect and retry" by code, without matching on the message text. */
     line_sender_error_store_resend_required = 36,
+
+    /** The QWP/WebSocket connection-scoped symbol dictionary is full: interning
+     *  another distinct symbol would exceed its entry-count cap (1,000,000,
+     *  matching the server's ingress ceiling) or its cumulative UTF-8 heap cap
+     *  (256 MiB). The frame is rejected before any byte reaches the wire and the
+     *  buffer is rolled back, so nothing is lost and chunks referencing only
+     *  already-interned symbols keep flushing — but retrying on the same sender
+     *  can never succeed. Retire the connection (`questdb_db_drop_sender`, NOT
+     *  `questdb_db_return_sender`, which recycles the connection and its
+     *  dictionary) and borrow a fresh one; see the symbol-column preamble in
+     *  `qwp_sender.h`. Distinct from `line_sender_error_invalid_api_call` so
+     *  callers can recognise it without matching on the message text. */
+    line_sender_error_symbol_dict_full = 37,
 } line_sender_error_code;
 
 /**
@@ -283,6 +296,7 @@ typedef line_sender_error_code questdb_error_code;
 #define questdb_error_arrow_export line_sender_error_arrow_export
 #define questdb_error_batch_too_large line_sender_error_batch_too_large
 #define questdb_error_store_resend_required line_sender_error_store_resend_required
+#define questdb_error_symbol_dict_full line_sender_error_symbol_dict_full
 
 /** The protocol used to connect with. */
 typedef enum line_sender_protocol
