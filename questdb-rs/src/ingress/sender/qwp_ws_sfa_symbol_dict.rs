@@ -130,13 +130,11 @@ const CRC_SIZE: usize = 4;
 
 /// Upper bound on a chunk's two header varints (`entryCount` and `entryBytes`):
 /// each is at most 5 bytes for the 32-bit-bounded values this side-file holds
-/// (entry count <= [`MAX_CONN_SYMBOL_DICT_SIZE`], entry bytes <= the connection
+/// (entry count <= `MAX_CONN_SYMBOL_DICT_SIZE`, entry bytes <= the connection
 /// heap cap). [`append_symbols_iter`](PersistedSymbolDict::append_symbols_iter)
 /// reserves this much in front of the entry region so the header can be back-filled
 /// once the region's exact size is known, keeping header, entries and CRC one
 /// contiguous run. Matches the Java client's `MAX_CHUNK_HEADER_SIZE`.
-///
-/// [`MAX_CONN_SYMBOL_DICT_SIZE`]: crate::ingress::buffer::MAX_CONN_SYMBOL_DICT_SIZE
 const MAX_CHUNK_HEADER_LEN: usize = 10;
 
 /// Upper bound on the side-file size accepted at [`open`](PersistedSymbolDict::open) /

@@ -86,12 +86,34 @@ pub use validity::Validity;
 /// constant, so raising it here raises both in lockstep.
 pub const MAX_CHUNK_ROWS: usize = 16 * 1024 * 1024;
 
-/// Per-column ceiling on a categorical / symbol dictionary's distinct-entry
-/// count, mirroring the connection-scoped symbol-dictionary cap. Independent of
-/// [`MAX_CHUNK_ROWS`] (which bounds row counts): a dictionary holds distinct
-/// values, of which there can be far more than a chunk has rows. The FFI
-/// `dict_offsets` length bound is derived from this (`entries + 1`).
-pub const MAX_SYMBOL_DICT_ENTRIES: usize = crate::ingress::buffer::MAX_CONN_SYMBOL_DICT_SIZE;
+/// Per-column ceiling on the distinct-entry count a caller may *declare* for a
+/// categorical / symbol dictionary (`dict_offsets_len - 1`), checked eagerly at
+/// append. The FFI `dict_offsets` length bound is derived from this
+/// (`entries + 1`).
+///
+/// This bounds an **input**, so it is sized by the per-column allocations the
+/// declared length drives — `referenced_scratch` (1 byte per slot) and
+/// `local_to_global` (8 bytes per slot) in `encoder::resolve_symbols` — not by
+/// what the connection ships. Deliberately NOT the connection-scoped cap
+/// (`MAX_CONN_SYMBOL_DICT_SIZE`): the encoder interns only the entries a chunk
+/// actually *references*, so a wide dictionary with few referenced values (a
+/// Pandas `Categorical` reused across chunks is the common case) is legitimate
+/// and costs nothing for its unused entries. Tying this to the connection cap
+/// would reject such a column outright even though it contributes only a handful
+/// of symbols.
+///
+/// The connection-scoped entry-count and heap caps still apply, but downstream at
+/// flush, against referenced entries only, via `SymbolGlobalDict::intern`.
+///
+/// Independent of [`MAX_CHUNK_ROWS`] (which bounds row counts): a dictionary
+/// holds distinct values, of which there can be more than a chunk has rows.
+pub const MAX_SYMBOL_DICT_ENTRIES: usize = 8_388_608;
+
+// Pin the literal: it is a public value that the C header documents
+// (`qwp_sender.h`) and the FFI derives its `dict_offsets` slice bound from, so a
+// change here must be made deliberately and propagated to both. In particular it
+// must NOT be re-derived from `MAX_CONN_SYMBOL_DICT_SIZE` — see the doc above.
+const _: () = assert!(MAX_SYMBOL_DICT_ENTRIES == 8 * 1024 * 1024);
 
 /// Default rows per chunk for DataFrame / Arrow ingestion helpers. Only a
 /// pipelining-granularity knob: the column sender splits any frame that exceeds

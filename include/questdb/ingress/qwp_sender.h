@@ -752,6 +752,15 @@ bool qwp_chunk_column_binary(
  * interned into the connection dictionary, which is where the length cap
  * applies). Either rejection returns `false` with `*err_out` set.
  *
+ * Separately, the connection-scoped symbol dictionary — the distinct
+ * symbols actually *referenced* across every column and every chunk sent
+ * on one connection — is capped at 1,000,000 entries and 256 MiB of UTF-8,
+ * matching the server's ingress ceiling. That cap is reached at
+ * `qwp_sender_flush_chunk`, not here, and is not per column: a wide
+ * dictionary is free until its entries are referenced. On hitting it the
+ * flush returns `false` with `*err_out` set; close and reopen the sender to
+ * reset the dictionary.
+ *
  * `codes[i]` must be in `0 .. dict_len` for non-null rows; null-row
  * codes are not inspected.
  *
