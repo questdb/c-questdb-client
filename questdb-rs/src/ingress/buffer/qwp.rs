@@ -5594,7 +5594,7 @@ impl SymbolGlobalDict {
             ));
         }
         // Aggregate heap cap: the entry-count and per-entry caps above do NOT
-        // bound the total bytes (8M entries * 1 MiB ~= 8 TiB). Enforce the same
+        // bound the total bytes (1M entries * 1 MiB ~= 1 TiB). Enforce the same
         // 256 MiB connection heap the egress reader / server / Java client use,
         // at this single ingestion choke point, so an oversized *aggregate* never
         // gets an id or is written ahead -- otherwise the persisted side-file

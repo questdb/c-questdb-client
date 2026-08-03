@@ -107,6 +107,11 @@ use std::path::Path;
 // side-file reader, the catch-up mirror, and `SymbolGlobalDict::seed` cannot
 // silently diverge. Imported under the local name for the existing call sites.
 use crate::ingress::buffer::decode_qwp_varint as decode_varint;
+// One shared per-entry length cap for ingestion (`SymbolGlobalDict::intern`),
+// recovery validation (`SymbolGlobalDict::seed`), and this side-file's
+// reader/writer, so all three enforce one bound and cannot diverge. Aliased to
+// the local name.
+use crate::ingress::buffer::MAX_PERSISTED_SYMBOL_ENTRY_LEN as MAX_ENTRY_LEN;
 
 /// Filename within the slot directory. Dot-prefixed so directory enumerators
 /// that filter by the `.sfa` suffix (segment recovery, orphan scan, trim) skip
@@ -756,11 +761,22 @@ fn encode_varint(out: &mut [u8], mut value: u64) -> usize {
 }
 
 /// Whether `buf[start .. start + bytes]` holds exactly `count` well-formed
-/// `[len varint][utf8]` entries and is consumed exactly. Mirrors the Java client's
-/// `isConsistentEntryRegion`: the chunk CRC proves the bytes are what was written,
-/// not that the header's `entryCount` agrees with the entries it frames, so without
-/// this a torn write that happened to re-checksum could shift the dense
-/// id->symbol map for every id above it.
+/// `[len varint][utf8]` entries, each within [`MAX_ENTRY_LEN`], and is consumed
+/// exactly. Mirrors the Java client's `isConsistentEntryRegion`: the chunk CRC
+/// proves the bytes are what was written, not that the header's `entryCount`
+/// agrees with the entries it frames, so without this a torn write that happened
+/// to re-checksum could shift the dense id->symbol map for every id above it.
+///
+/// The per-entry cap is checked here rather than left to the caller because this
+/// is the only walk that sees individual entry lengths. Enforcing it makes a
+/// rejected chunk stop the parse (the same treatment a CRC failure gets), so the
+/// intact prefix is kept and `open` truncates the rest -- self-healing. Without
+/// it an over-cap entry parses fine here and is instead rejected downstream by
+/// `SymbolGlobalDict::seed`, which fails the WHOLE recovered region and leaves
+/// the offending bytes on disk for every later open to re-read and re-reject.
+/// `intern` caps ingestion at the same bound, so no legitimate writer -- this
+/// client's or the Java client's, whose dictionary the server bounds identically
+/// -- can produce an entry this rejects.
 fn is_consistent_entry_region(buf: &[u8], start: usize, bytes: usize, count: u64) -> bool {
     let mut p = start;
     let limit = start + bytes;
@@ -768,6 +784,11 @@ fn is_consistent_entry_region(buf: &[u8], start: usize, bytes: usize, count: u64
         let Some((len, after_len)) = decode_varint(buf, p) else {
             return false;
         };
+        // Defence in depth: `intern` rejects oversized symbols before they are
+        // written, so a longer length on disk is corrupt.
+        if len > MAX_ENTRY_LEN {
+            return false;
+        }
         let Some(end) = after_len.checked_add(len as usize) else {
             return false;
         };
@@ -1285,6 +1306,55 @@ mod tests {
             assert_eq!(decoded, v);
             assert_eq!(pos, out.len());
         }
+    }
+
+    #[test]
+    fn over_cap_entry_len_is_rejected_at_open() {
+        // Defence in depth: `intern` caps a symbol at MAX_ENTRY_LEN before it is
+        // written, so a longer length on disk is corrupt and must be stopped at
+        // `open` -- keeping the intact prefix and truncating the rest. Left to
+        // `SymbolGlobalDict::seed` instead, the over-cap entry would fail the WHOLE
+        // recovered region (not just the frames above it) AND stay on disk, so every
+        // later open re-reads and re-rejects it and the slot never drains.
+        //
+        // The chunk below is deliberately self-CONSISTENT -- its region really does
+        // hold the bytes its length claims -- so the CRC, the entry-region walk and
+        // the file-size cap all pass it. Only the per-entry cap rejects it; without
+        // that check this test adopts the entry and fails.
+        let dir = tmp_slot();
+        {
+            let mut d = PersistedSymbolDict::open(dir.path()).unwrap();
+            d.append_symbol(b"good").unwrap(); // chunk 0: well-formed
+        }
+        let good_len = fs::metadata(dir.path().join(FILE_NAME)).unwrap().len();
+        {
+            let over = MAX_ENTRY_LEN + 1;
+            let mut entries = Vec::new();
+            write_varint(&mut entries, over);
+            entries.resize(entries.len() + over as usize, b'x');
+            let mut chunk = Vec::new();
+            write_varint(&mut chunk, 1); // entryCount
+            write_varint(&mut chunk, entries.len() as u64); // entryBytes
+            chunk.extend_from_slice(&entries);
+            let crc = crc32c::crc32c_append(0, &chunk);
+            chunk.extend_from_slice(&crc.to_le_bytes());
+            let mut f = OpenOptions::new()
+                .append(true)
+                .open(dir.path().join(FILE_NAME))
+                .unwrap();
+            f.write_all(&chunk).unwrap();
+        }
+
+        let d = PersistedSymbolDict::open(dir.path()).unwrap();
+        assert_eq!(d.size(), 1, "the over-cap entry is stopped, not adopted");
+        assert_eq!(d.read_loaded_symbols(), vec![b"good".to_vec()]);
+        // Self-healing: the rejected chunk is physically gone, so a later open does
+        // not re-read it and the slot can keep appending.
+        assert_eq!(
+            fs::metadata(dir.path().join(FILE_NAME)).unwrap().len(),
+            good_len,
+            "the over-cap chunk is truncated away, leaving only the good chunk"
+        );
     }
 
     #[test]

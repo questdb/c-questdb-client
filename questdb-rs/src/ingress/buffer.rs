@@ -45,8 +45,8 @@ pub(crate) use self::qwp::QwpBuffer;
 pub(crate) use self::qwp::QwpSendScratch;
 #[cfg(feature = "_sender-qwp-ws")]
 pub(crate) use self::qwp::{
-    QwpWsColumnarBuffer, QwpWsEncodeScratch, SymbolGlobalDict, SymbolGlobalDictMark,
-    decode_qwp_varint,
+    MAX_PERSISTED_SYMBOL_ENTRY_LEN, QwpWsColumnarBuffer, QwpWsEncodeScratch, SymbolGlobalDict,
+    SymbolGlobalDictMark, decode_qwp_varint,
 };
 // `QwpWsSymbolHasher`'s only re-export consumer is the `arrow`-gated
 // `column_sender::arrow_batch`, so it is gated identically: a `_sender-qwp-ws`
