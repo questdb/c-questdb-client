@@ -36,7 +36,10 @@
 #include <atomic>
 #include <chrono>
 #include <cstring>
+#include <exception>
 #include <memory>
+#include <mutex>
+#include <optional>
 #include <string>
 #include <thread>
 #include <type_traits>
@@ -3358,6 +3361,144 @@ TEST_CASE(
     // main entered the loop, the rest of the assertions don't actually
     // prove cross-thread concurrency.
     CHECK(poll_count > 0);
+}
+
+TEST_CASE(
+    "mock: query and cursor migrate across threads with callbacks and destruction")
+{
+    qm::Script s_a = {
+        qm::ActionSendServerInfo{qm::ROLE_STANDALONE, "c", "a"},
+        qm::ActionAwaitQueryRequest{},
+        qm::ActionHardDrop{},
+    };
+    qm::Script s_b = {
+        qm::ActionSendServerInfo{qm::ROLE_STANDALONE, "c", "b"},
+        qm::ActionAwaitQueryRequest{},
+        qm::ActionSendResultEnd{},
+    };
+    qm::MockServer srv_a({s_a});
+    qm::MockServer srv_b({s_b});
+    const std::string conf =
+        "ws::addr=" + srv_a.addr() + "," + srv_b.addr() +
+        ";failover_backoff_initial_ms=1;failover_backoff_max_ms=10";
+    eg::reader reader{questdb::ingress::utf8_view{conf}};
+
+    struct ThreadRecord
+    {
+        std::mutex mutex;
+        std::optional<std::thread::id> reset_callback_on;
+        std::optional<std::thread::id> reset_destroyed_on;
+        std::optional<std::thread::id> progress_callback_on;
+        std::optional<std::thread::id> progress_destroyed_on;
+    };
+    struct ResetCallbackPayload
+    {
+        std::shared_ptr<ThreadRecord> record;
+
+        ~ResetCallbackPayload()
+        {
+            std::lock_guard<std::mutex> guard{record->mutex};
+            record->reset_destroyed_on = std::this_thread::get_id();
+        }
+    };
+    struct ProgressCallbackPayload
+    {
+        std::shared_ptr<ThreadRecord> record;
+
+        ~ProgressCallbackPayload()
+        {
+            std::lock_guard<std::mutex> guard{record->mutex};
+            record->progress_destroyed_on = std::this_thread::get_id();
+        }
+    };
+
+    auto record = std::make_shared<ThreadRecord>();
+    auto reset_payload = std::make_shared<ResetCallbackPayload>();
+    reset_payload->record = record;
+    auto progress_payload = std::make_shared<ProgressCallbackPayload>();
+    progress_payload->record = record;
+    auto query = reader.prepare("select 1"_utf8);
+    query.on_failover_reset(
+        [reset_payload](const eg::failover_reset_event_view&)
+        {
+            std::lock_guard<std::mutex> guard{reset_payload->record->mutex};
+            reset_payload->record->reset_callback_on =
+                std::this_thread::get_id();
+        });
+    query.on_failover_progress(
+        [progress_payload](const eg::failover_progress_event_view&)
+        {
+            std::lock_guard<std::mutex> guard{progress_payload->record->mutex};
+            progress_payload->record->progress_callback_on =
+                std::this_thread::get_id();
+        });
+    // The stored callbacks are now the sole payload owners. Their destruction
+    // therefore records the thread that finally destroys the cursor.
+    reset_payload.reset();
+    progress_payload.reset();
+
+    const auto main_thread = std::this_thread::get_id();
+    std::optional<eg::cursor> cursor;
+    std::thread::id execute_thread;
+    std::exception_ptr execute_error;
+    std::thread execute_worker(
+        [query = std::move(query),
+         &cursor,
+         &execute_thread,
+         &execute_error]() mutable
+        {
+            execute_thread = std::this_thread::get_id();
+            try
+            {
+                cursor.emplace(query.execute());
+            }
+            catch (...)
+            {
+                execute_error = std::current_exception();
+            }
+        });
+    execute_worker.join();
+    if (execute_error)
+        std::rethrow_exception(execute_error);
+    REQUIRE(cursor.has_value());
+    CHECK(execute_thread != main_thread);
+
+    auto migrated_cursor = std::move(*cursor);
+    cursor.reset();
+    std::thread::id drive_thread;
+    std::exception_ptr drive_error;
+    std::thread drive_worker(
+        [cursor = std::move(migrated_cursor),
+         &drive_thread,
+         &drive_error]() mutable
+        {
+            drive_thread = std::this_thread::get_id();
+            try
+            {
+                while (cursor.next_batch())
+                {
+                }
+            }
+            catch (...)
+            {
+                drive_error = std::current_exception();
+            }
+            // `cursor` and its heap-stored callbacks are destroyed here.
+        });
+    drive_worker.join();
+    if (drive_error)
+        std::rethrow_exception(drive_error);
+    CHECK(drive_thread != main_thread);
+
+    std::lock_guard<std::mutex> guard{record->mutex};
+    REQUIRE(record->reset_callback_on.has_value());
+    REQUIRE(record->reset_destroyed_on.has_value());
+    REQUIRE(record->progress_callback_on.has_value());
+    REQUIRE(record->progress_destroyed_on.has_value());
+    CHECK(*record->reset_callback_on == drive_thread);
+    CHECK(*record->reset_destroyed_on == drive_thread);
+    CHECK(*record->progress_callback_on == drive_thread);
+    CHECK(*record->progress_destroyed_on == drive_thread);
 }
 
 // ---------------------------------------------------------------------------

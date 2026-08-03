@@ -36,7 +36,7 @@ class _QwpSender(ctypes.Structure):
 
 
 class _DirectColumnSender(ctypes.Structure):
-    """Opaque `qwp_direct_sender*` (borrowed pipelined connection)."""
+    """Opaque `qwp_direct_sender*` (pipelined connection: pool-borrowed or standalone)."""
 
 
 class ArrowSenderError(_SenderError):
