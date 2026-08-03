@@ -1438,6 +1438,156 @@ mod tests {
     }
 
     #[test]
+    fn a_torn_multi_symbol_chunk_drops_every_entry_it_carries() {
+        // The per-chunk CRC's blast radius is a whole chunk, and a chunk is one
+        // frame's new symbols -- so corrupting the LAST entry of a multi-symbol
+        // chunk drops every entry in it, including the intact ones before it. The
+        // superseded per-entry CRC would have kept those. Every other corruption
+        // test here appends one symbol per chunk, which makes chunk boundaries
+        // coincide with entry boundaries and hides this entirely.
+        //
+        // This is safe -- not merely tolerated -- precisely because chunks and
+        // frame deltas are written one-for-one (`append_symbols*` is called once
+        // per frame with exactly that frame's new symbols). The trusted prefix
+        // therefore always ends on a chunk boundary, which is always some frame's
+        // `delta_start`, so a tear invalidates exactly the frames a per-entry
+        // checksum would have. This test pins both halves: the whole torn chunk
+        // goes, and the chunk before it is kept whole.
+        let dir = tmp_slot();
+        let path = dir.path().join(FILE_NAME);
+        let after_first_chunk;
+        {
+            let mut d = PersistedSymbolDict::open(dir.path()).unwrap();
+            // Frame 1 -> chunk 0, three entries in ONE append.
+            d.append_symbols(&[b"alpha", b"bravo", b"charlie"]).unwrap();
+            after_first_chunk = fs::metadata(&path).unwrap().len();
+            // Frame 2 -> chunk 1, two entries in ONE append.
+            d.append_symbols(&[b"delta", b"echo"]).unwrap();
+            assert_eq!(d.size(), 5);
+        }
+
+        // Flip a byte of "echo" -- the LAST entry of chunk 1 -- so chunk 1's CRC
+        // goes stale while chunk 0 stays intact. Located via its on-wire
+        // `[len=4]"echo"` entry so the search cannot hit a header varint.
+        let mut bytes = fs::read(&path).unwrap();
+        let idx = bytes
+            .windows(5)
+            .position(|w| w == b"\x04echo")
+            .expect("echo entry present");
+        bytes[idx + 1] = b'X'; // same length, different value
+        fs::write(&path, &bytes).unwrap();
+
+        let d = PersistedSymbolDict::open(dir.path()).unwrap();
+        assert_eq!(
+            d.read_loaded_symbols(),
+            vec![b"alpha".to_vec(), b"bravo".to_vec(), b"charlie".to_vec()],
+            "the torn chunk is dropped WHOLE -- `delta` was intact and precedes the \
+             corrupted `echo` in the same chunk, and is still lost; chunk 0 is kept \
+             entire"
+        );
+        assert_eq!(d.size(), 3);
+        assert_eq!(
+            fs::metadata(&path).unwrap().len(),
+            after_first_chunk,
+            "the torn chunk is truncated away, leaving exactly the intact prefix chunk"
+        );
+    }
+
+    #[test]
+    fn a_crc_valid_empty_chunk_stops_the_parse() {
+        // The `entry_count == 0 || entry_bytes == 0` guard earns its place on
+        // exactly one shape: a CRC-valid chunk claiming ZERO entries in a
+        // ZERO-byte region. `is_consistent_entry_region` cannot catch that one --
+        // zero entries really do consume exactly zero bytes, so the walk returns
+        // true -- and without the guard the chunk is silently SKIPPED, the parse
+        // continuing past it to adopt whatever follows as if the dense
+        // id->symbol map were unbroken. That is what this test pins.
+        //
+        // Every other zero-ish shape the walk rejects on its own, so the guard's
+        // two halves are redundant with EACH OTHER here rather than each covering
+        // a distinct case: (count 0, bytes > 0) and (count > 0, bytes 0) both fail
+        // the walk (see `a_chunk_claiming_entries_in_a_zero_byte_region_is_rejected`).
+        // Mutation-checked: deleting the guard entirely fails this test; deleting
+        // either half alone does not.
+        let dir = tmp_slot();
+        let path = dir.path().join(FILE_NAME);
+        {
+            let mut d = PersistedSymbolDict::open(dir.path()).unwrap();
+            d.append_symbol(b"good").unwrap(); // chunk 0: well-formed
+        }
+        let good_len = fs::metadata(&path).unwrap().len();
+
+        // Chunk 1: CRC-valid but empty (entryCount = 0, entryBytes = 0).
+        // Chunk 2: a well-formed entry the parse must NOT reach.
+        {
+            let mut tail = Vec::new();
+            let mut empty = Vec::new();
+            write_varint(&mut empty, 0); // entryCount
+            write_varint(&mut empty, 0); // entryBytes
+            let crc = crc32c::crc32c_append(0, &empty);
+            empty.extend_from_slice(&crc.to_le_bytes());
+            tail.extend_from_slice(&empty);
+
+            let entries: &[u8] = &[4, b'l', b'a', b't', b'e']; // [len=4]"late"
+            let mut late = Vec::new();
+            write_varint(&mut late, 1);
+            write_varint(&mut late, entries.len() as u64);
+            late.extend_from_slice(entries);
+            let crc = crc32c::crc32c_append(0, &late);
+            late.extend_from_slice(&crc.to_le_bytes());
+            tail.extend_from_slice(&late);
+
+            let mut f = OpenOptions::new().append(true).open(&path).unwrap();
+            f.write_all(&tail).unwrap();
+        }
+
+        let d = PersistedSymbolDict::open(dir.path()).unwrap();
+        assert_eq!(
+            d.read_loaded_symbols(),
+            vec![b"good".to_vec()],
+            "the parse must stop AT the empty chunk, not skip it and adopt `late`"
+        );
+        assert_eq!(d.size(), 1);
+        assert_eq!(
+            fs::metadata(&path).unwrap().len(),
+            good_len,
+            "the empty chunk and everything after it is truncated away"
+        );
+    }
+
+    #[test]
+    fn a_chunk_claiming_entries_in_a_zero_byte_region_is_rejected() {
+        // The complementary shape: a non-zero entryCount over a zero-byte region.
+        // The header guard rejects it first, but `is_consistent_entry_region`
+        // would too -- a 0-byte region cannot hold the >=1 entry the header claims
+        // -- so this pins the outcome rather than gating the guard.
+        // Mutation-checked: deleting the guard entirely leaves this test passing.
+        // Kept because a parser for crash-torn input should not depend on that
+        // redundancy holding as the walk evolves.
+        let dir = tmp_slot();
+        let path = dir.path().join(FILE_NAME);
+        {
+            let mut d = PersistedSymbolDict::open(dir.path()).unwrap();
+            d.append_symbol(b"good").unwrap();
+        }
+        let good_len = fs::metadata(&path).unwrap().len();
+        {
+            let mut chunk = Vec::new();
+            write_varint(&mut chunk, 3); // entryCount claims three...
+            write_varint(&mut chunk, 0); // ...in a zero-byte region
+            let crc = crc32c::crc32c_append(0, &chunk);
+            chunk.extend_from_slice(&crc.to_le_bytes());
+            let mut f = OpenOptions::new().append(true).open(&path).unwrap();
+            f.write_all(&chunk).unwrap();
+        }
+
+        let d = PersistedSymbolDict::open(dir.path()).unwrap();
+        assert_eq!(d.read_loaded_symbols(), vec![b"good".to_vec()]);
+        assert_eq!(d.size(), 1);
+        assert_eq!(fs::metadata(&path).unwrap().len(), good_len);
+    }
+
+    #[test]
     fn unknown_version_is_recreated_fresh() {
         // A file with the right magic but an unrecognised version byte (e.g. this
         // client's superseded per-entry v2 file, or a future format) is
