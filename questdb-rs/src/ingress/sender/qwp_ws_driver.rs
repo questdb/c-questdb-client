@@ -1394,6 +1394,14 @@ impl<T: QwpWsCoreTransport> QwpWsSendCore<T> {
         self.catch_up_pending = !self.dict_mirror.is_empty();
     }
 
+    /// Owned variant for recovery paths: moves the fallibly-copied dictionary into
+    /// the mirror so adoption cannot fail on a second full-size allocation.
+    pub(crate) fn enable_delta_dict_owned(&mut self, seed_entries: Vec<u8>, seed_count: u32) {
+        self.dict_mirror = SentDictMirror::new(true);
+        self.dict_mirror.seed_owned(seed_entries, seed_count);
+        self.catch_up_pending = !self.dict_mirror.is_empty();
+    }
+
     /// Sends the full-dictionary catch-up frame(s) on the freshly reconnected
     /// transport — split so none exceeds the server's batch cap — and returns how
     /// many were sent (they consume wire seqs `[0, n)`). The caller then calls

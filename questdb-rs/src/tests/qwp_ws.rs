@@ -37,6 +37,7 @@ use std::time::{Duration, Instant};
 
 use crate::ErrorCode;
 use crate::ingress::sender::has_any_sfa_file as slot_has_sfa_file;
+use crate::ingress::sender::qwp_ws::fail_next_recovered_dict_copy_for_test;
 use crate::ingress::{
     Buffer, ColumnName, Protocol, ProtocolVersion, QwpWsEncodeScratch, QwpWsErrorCategory,
     QwpWsErrorPolicy, QwpWsProgress, SenderBuilder, SymbolGlobalDict, TableName, TimestampNanos,
@@ -1051,6 +1052,31 @@ fn spawn_manual_orphan_drain_server() -> (u16, mpsc::Receiver<Vec<u8>>) {
     (port, rx)
 }
 
+fn spawn_two_frame_orphan_drain_server() -> (u16, mpsc::Receiver<Vec<Vec<u8>>>) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let (tx, rx) = mpsc::channel();
+
+    thread::spawn(move || {
+        let (mut foreground, _) = listener.accept().unwrap();
+        perform_server_upgrade(&mut foreground).unwrap();
+
+        let (mut orphan, _) = listener.accept().unwrap();
+        orphan
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        perform_server_upgrade(&mut orphan).unwrap();
+        let (_fin, _opcode, _catch_up) = read_frame(&mut orphan).unwrap();
+        let (_fin, _opcode, first) = read_frame(&mut orphan).unwrap();
+        write_qwp_ok_response(&mut orphan, FIRST_WIRE_SEQUENCE + 1).unwrap();
+        let (_fin, _opcode, second) = read_frame(&mut orphan).unwrap();
+        write_qwp_ok_response(&mut orphan, FIRST_WIRE_SEQUENCE + 2).unwrap();
+        tx.send(vec![first, second]).unwrap();
+    });
+
+    (port, rx)
+}
+
 fn spawn_manual_orphan_reject_server(status: u8) -> (u16, mpsc::Receiver<Vec<u8>>) {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();
@@ -1387,6 +1413,34 @@ fn seed_orphan_slot_named(sf_dir: &Path, sender_id: &str) {
         .unwrap();
 
     seed_sender.flush(&mut seed_buf).unwrap();
+    drop(seed_sender);
+}
+
+fn seed_two_frame_delta_orphan_slot(sf_dir: &Path) {
+    let seed_port = spawn_upgrade_only_server();
+    let seed_conf = format!(
+        "ws::addr=127.0.0.1:{seed_port};qwp_ws_progress=manual;\
+         sf_dir={};sender_id=orphan;sf_max_segment_bytes=256;sf_max_total_bytes=1024;",
+        sf_dir.display(),
+    );
+    let mut seed_sender = SenderBuilder::from_conf(&seed_conf)
+        .unwrap()
+        .build()
+        .unwrap();
+
+    for (symbol, value) in [("first", 1), ("second", 2)] {
+        let mut seed_buf = seed_sender.new_buffer();
+        seed_buf
+            .table("orphaned")
+            .unwrap()
+            .symbol("src", symbol)
+            .unwrap()
+            .column_i64("value", value)
+            .unwrap()
+            .at_now()
+            .unwrap();
+        seed_sender.flush(&mut seed_buf).unwrap();
+    }
     drop(seed_sender);
 }
 
@@ -2657,6 +2711,60 @@ fn qwp_ws_manual_orphan_drainer_replays_sibling_slot() {
     assert!(!slot_has_sfa_file(&orphan_slot));
     assert!(!sf_dir.path().join("primary").join(".failed").exists());
     assert!(!orphan_slot.join(".failed").exists());
+}
+
+#[test]
+fn qwp_ws_orphan_dict_copy_oom_retries_without_failed_sentinel() {
+    let sf_dir = tempfile::TempDir::new().unwrap();
+    seed_two_frame_delta_orphan_slot(sf_dir.path());
+    let orphan_slot = sf_dir.path().join("orphan");
+
+    let (port, drained_rx) = spawn_two_frame_orphan_drain_server();
+    let drain_conf = format!(
+        "ws::addr=127.0.0.1:{port};qwp_ws_progress=manual;\
+         sf_dir={};sender_id=primary;drain_orphans=on;\
+         max_background_drainers=1;sf_max_segment_bytes=256;sf_max_total_bytes=1024;",
+        sf_dir.path().display()
+    );
+    let mut sender = SenderBuilder::from_conf(&drain_conf)
+        .unwrap()
+        .build()
+        .unwrap();
+
+    fail_next_recovered_dict_copy_for_test();
+    assert!(sender.drive_once().unwrap());
+
+    assert!(
+        !orphan_slot.join(".failed").exists(),
+        "transient dictionary allocation failure must not quarantine the slot"
+    );
+    assert!(orphan_slot.join(".last_error").exists());
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut drained_frames = None;
+    while Instant::now() < deadline {
+        if let Ok(frames) = drained_rx.try_recv() {
+            drained_frames = Some(frames);
+            break;
+        }
+        let _ = sender.drive_once().unwrap();
+        thread::sleep(Duration::from_millis(10));
+    }
+
+    let drained_frames = drained_frames.expect("the retried orphan drain did not complete");
+    assert_eq!(drained_frames.len(), 2);
+    assert_eq!(
+        drained_frames[1][12], 1,
+        "the second persisted frame must depend on recovered dictionary id 0"
+    );
+    assert!(
+        !orphan_slot.join(".failed").exists(),
+        "a retried allocation failure must never write the permanent sentinel"
+    );
+    assert!(
+        !slot_has_sfa_file(&orphan_slot),
+        "the intact delta slot must drain after the allocation failure clears"
+    );
 }
 
 /// Captures the FIRST frame an orphan drainer sends, then acks it at wire seq 0

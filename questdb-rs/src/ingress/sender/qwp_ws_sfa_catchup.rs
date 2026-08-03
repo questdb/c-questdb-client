@@ -148,6 +148,17 @@ impl SentDictMirror {
         self.count = count;
     }
 
+    /// Installs an already-owned recovered entry region without allocating another
+    /// full dictionary copy. Used by cold recovery paths that have completed their
+    /// fallible copy and validation before constructing the send core.
+    pub(crate) fn seed_owned(&mut self, entries: Vec<u8>, count: u32) {
+        if !self.enabled || count == 0 {
+            return;
+        }
+        self.bytes = entries;
+        self.count = count;
+    }
+
     /// Copies the symbol-dictionary delta that a just-sent `frame` carries into
     /// the mirror, so a future reconnect can re-register it. Frames are sent in
     /// FSN order carrying monotonically extending deltas, so only a frame whose

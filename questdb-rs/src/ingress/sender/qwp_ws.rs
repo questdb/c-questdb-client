@@ -78,6 +78,21 @@ type TlsStream = rustls::StreamOwned<rustls::ClientConnection, NoSigpipeTcp>;
 const QWP_WS_TLS_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 const QWP_WS_DEFAULT_BACKGROUND_CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 const QWP_WS_RUNNER_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(30);
+
+#[cfg(test)]
+thread_local! {
+    static FAIL_NEXT_RECOVERED_DICT_COPY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+#[cfg(test)]
+pub(crate) fn fail_next_recovered_dict_copy_for_test() {
+    FAIL_NEXT_RECOVERED_DICT_COPY.with(|fail| fail.set(true));
+}
+
+#[cfg(test)]
+fn should_fail_recovered_dict_copy_for_test() -> bool {
+    FAIL_NEXT_RECOVERED_DICT_COPY.with(|fail| fail.replace(false))
+}
 const QWP_WS_RUNNER_SHUTDOWN_POLL: Duration = Duration::from_millis(1);
 
 /// Cold-path handle used by the runner owner to break blocking socket I/O.
@@ -1060,8 +1075,10 @@ impl SyncQwpWsPendingRunnerCore {
                     // connection's life.
                     let recovered =
                         std::mem::take(&mut self.pending_connect.recovered_dict_entries);
-                    send_core
-                        .enable_delta_dict(&recovered, self.pending_connect.recovered_dict_count);
+                    send_core.enable_delta_dict_owned(
+                        recovered,
+                        self.pending_connect.recovered_dict_count,
+                    );
                 }
                 self.connected = Some(SyncQwpWsRunnerCore {
                     send_core,
@@ -3290,6 +3307,13 @@ pub(crate) fn connect_qwp_ws(
 /// would defeat the fallible `try_reserve`/`MAX_FILE_LEN` guard the side-file
 /// reader already applies.
 pub(super) fn try_dup_recovered(src: &[u8]) -> crate::Result<Vec<u8>> {
+    #[cfg(test)]
+    if should_fail_recovered_dict_copy_for_test() {
+        return Err(error::fmt!(
+            SocketError,
+            "injected recovered symbol dictionary allocation failure"
+        ));
+    }
     let mut v = Vec::new();
     v.try_reserve_exact(src.len()).map_err(|_| {
         error::fmt!(
