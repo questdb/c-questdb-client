@@ -3009,16 +3009,20 @@ fn qwp_ws_background_terminal_orphan_releases_worker_for_next_slot() {
 
     let orphan_a = sf_dir.path().join("orphan-a");
     let orphan_b = sf_dir.path().join("orphan-b");
-    let drained_deadline = Instant::now() + Duration::from_secs(5);
-    while [&orphan_a, &orphan_b]
-        .into_iter()
-        .filter(|slot| slot_has_sfa_file(slot))
-        .count()
-        != 1
-        && Instant::now() < drained_deadline
-    {
-        thread::sleep(Duration::from_millis(10));
-    }
+    // The drained slot loses its data before its own breadcrumb (if any) is
+    // cleared, so gate on both counts rather than on the data alone.
+    wait_until(Duration::from_secs(5), || {
+        [&orphan_a, &orphan_b]
+            .into_iter()
+            .filter(|slot| slot_has_sfa_file(slot))
+            .count()
+            == 1
+            && [&orphan_a, &orphan_b]
+                .into_iter()
+                .filter(|slot| slot.join(".last_error").exists())
+                .count()
+                == 1
+    });
     let terminal_slots = [&orphan_a, &orphan_b]
         .into_iter()
         .filter(|slot| slot.join(".last_error").exists())
@@ -3085,13 +3089,20 @@ fn qwp_ws_background_role_terminal_reopens_and_drains_orphan() {
     );
 
     let orphan_slot = sf_dir.path().join("orphan");
-    let drained_deadline = Instant::now() + Duration::from_secs(5);
-    while slot_has_sfa_file(&orphan_slot) && Instant::now() < drained_deadline {
-        thread::sleep(Duration::from_millis(10));
-    }
+    let last_error = orphan_slot.join(".last_error");
+    // The drain step deletes the segment files and only *then* reports `Drained`,
+    // which is what clears the breadcrumb -- so a fully drained slot is briefly
+    // data-free with a stale `.last_error` still on disk. Wait for both.
+    wait_until(Duration::from_secs(5), || {
+        !slot_has_sfa_file(&orphan_slot) && !last_error.exists()
+    });
     assert!(!slot_has_sfa_file(&orphan_slot));
     assert!(!orphan_slot.join(".failed").exists());
-    assert!(!orphan_slot.join(".last_error").exists());
+    assert!(
+        !last_error.exists(),
+        "stale .last_error after drain: {}",
+        std::fs::read_to_string(&last_error).unwrap_or_default()
+    );
 
     drop(sender);
     server.handle.join().unwrap();
