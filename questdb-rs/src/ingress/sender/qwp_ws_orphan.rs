@@ -579,17 +579,14 @@ impl OrphanDrainer {
         // large dictionary is not held twice across the network wait. This does not
         // alter the on-disk side-file; a failed attempt reopens it on the next scan.
         drop(queue.take_persisted_symbol_dict());
-        let connect_kind = if stop.is_some() {
-            QwpWsConnectKind::BackgroundDrainer
-        } else {
-            QwpWsConnectKind::Foreground
-        };
         let transport = match BlockingQwpWsTransport::connect(
             config.host.clone(),
             config.port.clone(),
             config.use_tls,
             config.tls_settings.clone(),
-            connect_kind,
+            // Orphan connects always use background policy, even when manual
+            // progress executes them cooperatively on the caller thread.
+            QwpWsConnectKind::BackgroundDrainer,
             config.qwp_ws.clone(),
             config.auth_header.clone(),
             Arc::new(AtomicUsize::new(0)),
@@ -1232,6 +1229,15 @@ mod tests {
         }
     }
 
+    #[cfg(all(feature = "sync-sender-qwp-ws", any(unix, windows)))]
+    fn create_queued_orphan(sf_dir: &Path, sender_id: &str) -> PathBuf {
+        let slot_dir = sf_dir.join(sender_id);
+        let mut queue = SfaSlotQueue::open(slot_options(sf_dir, sender_id)).unwrap();
+        PublicationLog::try_publish(&mut queue, b"orphaned frame").unwrap();
+        queue.close().unwrap();
+        slot_dir
+    }
+
     #[cfg(feature = "sync-sender-qwp-ws")]
     #[test]
     fn manual_drainer_consumes_already_drained_slot_without_network() {
@@ -1357,6 +1363,30 @@ mod tests {
         );
         assert!(slot_dir.join(LAST_ERROR_NAME).exists());
         assert_eq!(scan_orphan_slots(&sf_dir, "primary", &[]), vec![slot_dir]);
+    }
+
+    #[cfg(all(feature = "sync-sender-qwp-ws", any(unix, windows)))]
+    #[test]
+    fn manual_drainer_connect_is_invisible_to_foreground_events() {
+        let temp = TempDir::new().unwrap();
+        let sf_dir = temp.path().join("sf-root");
+        let slot_dir = create_queued_orphan(&sf_dir, "orphan");
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+        let source = Arc::new(crate::ingress::conn_events::ConnectionEventSource::disabled());
+        let mut config = test_config();
+        config.port = port.to_string();
+        config.qwp_ws.conn_events = Some(Arc::clone(&source));
+        let mut drainers = ManualOrphanDrainers::new(vec![slot_dir], 1, config).unwrap();
+
+        assert!(drainers.drive_once());
+
+        assert_eq!(
+            source.next_attempt(),
+            1,
+            "manual orphan connects must not consume foreground attempt numbers"
+        );
     }
 
     #[cfg(all(feature = "sync-sender-qwp-ws", any(unix, windows)))]
