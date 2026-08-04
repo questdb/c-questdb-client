@@ -3964,6 +3964,72 @@ fn store_and_forward_file_mode_replays_both_frames_when_the_first_dict_chunk_is_
 }
 
 #[test]
+fn store_and_forward_file_mode_resumes_write_ahead_after_a_symbol_free_session() {
+    // Regression (self-perpetuating dense fallback). A session that queues frames
+    // but interns NO symbol leaves a valid, untorn, EMPTY side-file. Treating that
+    // `size() == 0` as corruption and falling back to dense is unrecoverable: the
+    // producer write-aheads only through the side-file handle the queue hands it,
+    // so dense means the file never grows, so every later open sees an empty file
+    // and re-decides dense -- for the life of the slot, since the side-file is
+    // only removed on a fully-drained close, which is exactly what a slot with
+    // undelivered frames never gets.
+    //
+    // Meanwhile dense re-ships `[0, highest_referenced + 1)` in every frame, so
+    // once that prefix alone exceeds the per-frame cap the flush fails
+    // `BatchTooLarge` on a SINGLE row -- nothing left for the split to halve --
+    // and no new symbol can ever be interned on the slot again.
+    //
+    // `recovered_slot_whose_side_file_is_legitimately_empty_keeps_delta_armed`
+    // pins the queue-level decision; this pins the consequence that matters, that
+    // the next session's symbols really are persisted again.
+    let dir = TempDir::new().unwrap();
+    let side_file = dir.path().join("recov-ingest-0").join(".symbol-dict");
+
+    // Phase 1: one frame with no symbol column, left unresolved (the peer holds
+    // its acks, so the slot is not drained and its side-file is not removed).
+    {
+        let (server, _release, _frames) = MockServer::spawn_ack_when_released_capturing(1);
+        let conf = conf_for_endpoints(
+            &[server.port()],
+            &sf_disk_extras(&dir, "pool_reap=manual;sender_id=recov;"),
+        );
+        let db = QuestDb::connect(&conf).unwrap();
+        let mut sender = db.borrow_sender().unwrap();
+        let mut plain = Chunk::new("trades");
+        plain.column_i64("value", &[1_i64], None).unwrap();
+        plain.at_nanos(&[1_i64]).unwrap();
+        sender.flush(&mut plain).unwrap();
+        drop(sender);
+        drop(db);
+    }
+    assert!(
+        crate::ingress::sender::qwp_ws_sfa_symbol_dict::parse_chunks(&side_file).is_empty(),
+        "a symbol-free session leaves a valid but empty side-file"
+    );
+
+    // Phase 2: reopen the SAME slot and flush a frame that does intern a symbol.
+    // The write-ahead must persist it -- proof the producer still holds the
+    // side-file handle rather than having been demoted to dense.
+    let (server, _release, _frames) = MockServer::spawn_ack_when_released_capturing(1);
+    let conf = conf_for_endpoints(
+        &[server.port()],
+        &sf_disk_extras(&dir, "pool_reap=manual;sender_id=recov;"),
+    );
+    let db = QuestDb::connect(&conf).unwrap();
+    let mut sender = db.borrow_sender().unwrap();
+    let mut symbolic = Chunk::new("trades");
+    append_one_symbol_row(&mut symbolic, b"alpha", &[2_i64]);
+    sender.flush(&mut symbolic).unwrap();
+
+    assert_eq!(
+        crate::ingress::sender::qwp_ws_sfa_symbol_dict::parse_chunks(&side_file),
+        vec![vec![b"alpha".to_vec()]],
+        "the recovered slot must resume write-ahead; an empty side-file here means \
+         it fell back to dense and can never climb out"
+    );
+}
+
+#[test]
 fn store_and_forward_file_mode_value_corruption_is_healed_and_segment_kept() {
     // Issue-4 end-to-end: a same-length VALUE corruption in the persisted
     // `.symbol-dict` -- a host/power-crash bit-flip that keeps an entry's length

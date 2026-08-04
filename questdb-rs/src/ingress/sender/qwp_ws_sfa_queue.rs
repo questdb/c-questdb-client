@@ -4596,6 +4596,60 @@ mod tests {
     }
 
     #[test]
+    fn recovered_slot_whose_side_file_is_legitimately_empty_keeps_delta_armed() {
+        // A session can leave unresolved segments beside a side-file that is a
+        // valid, untorn, EMPTY header: it queued frames but interned no symbol (a
+        // table with no symbol column, or all-null symbol values). `size() == 0`
+        // there means exactly what it says -- an empty dictionary -- and is NOT the
+        // rejected-first-chunk state the two tests below and above deal with.
+        //
+        // Falling back to dense on it is self-perpetuating and unrecoverable. The
+        // producer write-aheads only through the side-file handle the queue hands
+        // it, so dense means the file never grows, so every later open sees an
+        // empty file again and re-decides dense. Meanwhile dense re-ships
+        // `[0, highest_referenced + 1)` in EVERY frame, and once that prefix alone
+        // exceeds the per-frame cap the flush fails `BatchTooLarge` on a SINGLE
+        // row -- nothing left for the split to halve -- so no new symbol can ever
+        // be interned on that slot again.
+        //
+        // Nothing is at risk in this case either way: the recovered segments
+        // reference no symbol ids at all, so there are no stale ids for a later
+        // delta frame to misresolve.
+        let dir = TempDir::new().unwrap();
+        let symbol_dict = dir
+            .path()
+            .join(crate::ingress::sender::qwp_ws_sfa_symbol_dict::FILE_NAME);
+
+        // A first session queues a frame carrying no symbols and leaves it
+        // unresolved. `try_submit` writes a raw payload, so nothing is interned.
+        let mut queue = open(&dir);
+        queue.try_submit(b"unresolved-frame").unwrap();
+        drop(queue);
+        assert!(
+            sfa_file_count(dir.path()) > 0,
+            "an unresolved segment survives"
+        );
+        assert!(
+            crate::ingress::sender::qwp_ws_sfa_symbol_dict::parse_chunks(&symbol_dict).is_empty(),
+            "the side-file must be a valid, untorn, zero-chunk header -- this test \
+             is about an EMPTY dictionary, not a rejected chunk"
+        );
+
+        let mut recovered = open(&dir);
+        assert!(
+            recovered.is_delta_dict_enabled(),
+            "a valid but empty side-file is an empty dictionary, not a corrupt \
+             one: delta must stay armed"
+        );
+        assert_eq!(recovered.recovered_symbol_dict_count(), 0);
+        assert!(
+            recovered.take_persisted_symbol_dict().is_some(),
+            "the producer must get the live side-file handle back, so its \
+             write-ahead resumes and the slot cannot get stuck empty forever"
+        );
+    }
+
+    #[test]
     fn recovered_slot_whose_first_chunk_is_corrupt_keeps_delta_armed() {
         // Regression (data loss + duplication): a side-file with a VALID header
         // whose first chunk fails any reader check parses to zero entries, and
