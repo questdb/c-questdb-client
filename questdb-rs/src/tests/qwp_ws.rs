@@ -2391,12 +2391,32 @@ fn qwp_ws_drop_interrupts_blocked_send_after_reconnect() {
 fn assert_qwp_ws_drop_interrupts_stalled_connect(scheme: &str, tls_options: &str) {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();
-    let (accepted_tx, accepted_rx) = mpsc::channel();
+    let wait_for_client_hello = scheme == "wss";
+    let (connect_stalled_tx, connect_stalled_rx) = mpsc::channel();
     let (release_tx, release_rx) = mpsc::channel();
 
     let server = thread::spawn(move || {
-        let (_stream, _) = listener.accept().unwrap();
-        accepted_tx.send(()).unwrap();
+        let (mut stream, _) = listener.accept().unwrap();
+        if wait_for_client_hello {
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+
+            let mut record_header = [0u8; 5];
+            stream.read_exact(&mut record_header).unwrap();
+            assert_eq!(record_header[0], 0x16, "expected a TLS handshake record");
+
+            let record_len = u16::from_be_bytes([record_header[3], record_header[4]]) as usize;
+            let mut record = vec![0u8; record_len];
+            stream.read_exact(&mut record).unwrap();
+            assert_eq!(record.first(), Some(&0x01), "expected a TLS ClientHello");
+
+            // Give the client time to finish writing the ClientHello and block
+            // waiting for the ServerHello. This delay is outside the measured
+            // sender shutdown interval.
+            thread::sleep(Duration::from_millis(200));
+        }
+        connect_stalled_tx.send(()).unwrap();
         let _ = release_rx.recv_timeout(Duration::from_secs(10));
     });
 
@@ -2406,7 +2426,9 @@ fn assert_qwp_ws_drop_interrupts_stalled_connect(scheme: &str, tls_options: &str
          {tls_options}"
     );
     let sender = SenderBuilder::from_conf(&conf).unwrap().build().unwrap();
-    accepted_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    connect_stalled_rx
+        .recv_timeout(Duration::from_secs(5))
+        .unwrap();
 
     let started = Instant::now();
     drop(sender);
