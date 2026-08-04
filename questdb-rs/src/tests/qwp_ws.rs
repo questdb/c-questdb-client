@@ -48,6 +48,7 @@ use crate::ingress::{
 // qwp-ws sender is built without `sync-sender-http` (e.g. run_all_tests.py).
 #[cfg(feature = "sync-sender-http")]
 use crate::ingress::ProtocolVersion;
+use crate::ws::frame::OPCODE_CLOSE;
 
 pub(crate) const WS_GUID: &str = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
 const FIRST_WIRE_SEQUENCE: u64 = 0;
@@ -1543,26 +1544,30 @@ fn seed_orphan_slot_named_with_symbol(sf_dir: &Path, sender_id: &str, symbol: &s
     drop(seed_sender);
 }
 
-fn seed_two_frame_delta_orphan_slot(sf_dir: &Path) {
+/// Like [`seed_orphan_slot`], but leaves TWO queued frames behind, each interning
+/// a distinct symbol, so the second bases at `delta_start == 1` and is NOT
+/// self-sufficient: it only resolves against a dictionary that already holds the
+/// first frame's symbol. The seed server upgrades but never acks, so both frames
+/// stay unresolved in the slot.
+fn seed_orphan_slot_with_two_delta_frames(sf_dir: &Path) {
     let seed_port = spawn_upgrade_only_server();
     let seed_conf = format!(
         "ws::addr=127.0.0.1:{seed_port};qwp_ws_progress=manual;\
          sf_dir={};sender_id=orphan;sf_max_segment_bytes=256;sf_max_total_bytes=1024;",
-        sf_dir.display(),
+        sf_dir.display()
     );
     let mut seed_sender = SenderBuilder::from_conf(&seed_conf)
         .unwrap()
         .build()
         .unwrap();
-
-    for (symbol, value) in [("first", 1), ("second", 2)] {
+    for symbol in ["alpha", "bravo"] {
         let mut seed_buf = seed_sender.new_buffer();
         seed_buf
             .table("orphaned")
             .unwrap()
             .symbol("src", symbol)
             .unwrap()
-            .column_i64("value", value)
+            .column_i64("value", 42)
             .unwrap()
             .at_now()
             .unwrap();
@@ -1594,6 +1599,49 @@ fn seed_large_orphan_slot(sf_dir: &Path) {
 
     seed_sender.flush(&mut seed_buf).unwrap();
     drop(seed_sender);
+}
+
+/// Accepts the primary foreground sender's connection (upgraded and ignored),
+/// then the orphan drainer's: upgrades it and acks every frame it reads,
+/// forwarding each payload. Unlike [`spawn_orphan_capture_first_frame_server`]
+/// this keeps acking, so a multi-frame slot can drain to completion and a test
+/// can assert on how many frames actually arrived.
+fn spawn_orphan_drain_all_frames_server() -> (u16, mpsc::Receiver<Vec<u8>>) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let (tx, rx) = mpsc::channel();
+
+    thread::spawn(move || {
+        // The primary foreground sender's own connection. Upgrade and ignore.
+        let (mut foreground, _) = listener.accept().unwrap();
+        perform_server_upgrade(&mut foreground).unwrap();
+
+        // The orphan drainer's connection: ack each frame in wire-sequence order
+        // until it closes or the test drops the receiver.
+        let (mut orphan, _) = listener.accept().unwrap();
+        orphan
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        orphan
+            .set_write_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        perform_server_upgrade(&mut orphan).unwrap();
+        let mut wire_seq = FIRST_WIRE_SEQUENCE;
+        while let Ok((_fin, opcode, payload)) = read_frame(&mut orphan) {
+            if opcode == OPCODE_CLOSE {
+                break;
+            }
+            if write_qwp_ok_response(&mut orphan, wire_seq).is_err() {
+                break;
+            }
+            wire_seq += 1;
+            if tx.send(payload).is_err() {
+                break;
+            }
+        }
+    });
+
+    (port, rx)
 }
 
 // ---------- tests ----------
@@ -2865,7 +2913,7 @@ fn qwp_ws_manual_orphan_drainer_replays_sibling_slot() {
 #[test]
 fn qwp_ws_orphan_dict_copy_oom_retries_without_failed_sentinel() {
     let sf_dir = tempfile::TempDir::new().unwrap();
-    seed_two_frame_delta_orphan_slot(sf_dir.path());
+    seed_orphan_slot_with_two_delta_frames(sf_dir.path());
     let orphan_slot = sf_dir.path().join("orphan");
 
     let (port, drained_rx) = spawn_two_frame_orphan_drain_server();
@@ -3132,6 +3180,93 @@ fn qwp_ws_orphan_drain_falls_back_to_dense_when_recovered_dict_has_a_duplicate_e
     assert!(
         !sf_dir.path().join("orphan").join(".failed").exists(),
         "a corrupt recovered dictionary must degrade to dense, not fail the slot"
+    );
+}
+
+#[test]
+fn qwp_ws_orphan_drain_replays_both_frames_when_the_first_dict_chunk_is_corrupt() {
+    // Regression (live-lock + abandoned data). An orphan slot whose `.symbol-dict`
+    // loses its FIRST chunk to a host-crash tear recovers ZERO entries, which
+    // looks like the absent / bad-magic side-file case and invites the same dense
+    // fallback. On the replay-only path that fallback is not merely wasteful, it
+    // strands the slot permanently.
+    //
+    // Dense leaves the drainer's catch-up mirror disabled (`qwp_ws_orphan::open`
+    // seeds it only when the queue reports delta armed), so `guard_dict_not_torn`
+    // rejects the `delta_start == 1` frame terminally -- but only AFTER the
+    // `delta_start == 0` frame ahead of it has replayed. The terminal store error
+    // becomes `OrphanDriveOutcome::RetryLater`, which re-queues the slot WITHOUT
+    // marking it failed; the next open re-parses the same zero entries, re-decides
+    // dense, and re-strands. The slot never drains and never fails, frames 1..N
+    // are never delivered, and the replayed prefix goes out again on every cycle.
+    //
+    // Armed on the empty dictionary the drain bootstraps itself instead: frame 1
+    // passes the guard, `SentDictMirror::accumulate` folds its own delta section
+    // in, and frame 2 resolves against that. Both replay. Nothing here can be
+    // hurt by arming empty -- replay-only has no producer, so there is no writer
+    // that could refill the truncated dictionary with different symbols under the
+    // ids the stored frames reference.
+    //
+    // `replay_only_slot_whose_first_chunk_is_corrupt_keeps_delta_armed` pins the
+    // queue-level state; this is the half that proves the slot actually drains.
+    let sf_dir = tempfile::TempDir::new().unwrap();
+    seed_orphan_slot_with_two_delta_frames(sf_dir.path());
+
+    // A host/power crash tears chunk 0: a same-length value flip, so only its
+    // stored CRC goes stale. The reader stops there and truncates, recovering
+    // nothing -- while the queued frames still reference symbol ids 0 and 1.
+    let side_file = sf_dir.path().join("orphan").join(".symbol-dict");
+    {
+        let mut bytes =
+            std::fs::read(&side_file).expect("seed must have written a delta-mode side-file");
+        let idx = bytes
+            .windows(5)
+            .position(|w| w == b"alpha")
+            .expect("alpha payload present");
+        bytes[idx] = b'X'; // same length ("Xlpha"), different value
+        std::fs::write(&side_file, &bytes).unwrap();
+    }
+
+    let (port, rx) = spawn_orphan_drain_all_frames_server();
+    let drain_conf = format!(
+        "ws::addr=127.0.0.1:{port};qwp_ws_progress=manual;\
+         sf_dir={};sender_id=primary;drain_orphans=on;\
+         max_background_drainers=1;sf_max_segment_bytes=256;sf_max_total_bytes=1024;",
+        sf_dir.path().display()
+    );
+    let mut sender = SenderBuilder::from_conf(&drain_conf)
+        .unwrap()
+        .build()
+        .unwrap();
+
+    // Count replayed DATA frames (table_count >= 1 at bytes 6..8); a table-less
+    // catch-up frame carries table_count == 0. With the dense fallback exactly ONE
+    // arrives and the drainer then spins on the second forever.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut data_frames = 0usize;
+    while Instant::now() < deadline && data_frames < 2 {
+        let _ = sender.drive_once().unwrap();
+        while let Ok(frame) = rx.try_recv() {
+            if frame.len() >= 12
+                && &frame[..4] == b"QWP1"
+                && u16::from_le_bytes([frame[6], frame[7]]) >= 1
+            {
+                data_frames += 1;
+            }
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+
+    assert!(
+        data_frames >= 2,
+        "both queued frames must replay -- got {data_frames}. One means the orphan \
+         slot fell back to dense, terminally rejected its `delta_start == 1` frame, \
+         and was re-queued by `RetryLater` to re-open, re-decide dense and re-strand: \
+         a live-lock that never drains and never fails"
+    );
+    assert!(
+        !sf_dir.path().join("orphan").join(".failed").exists(),
+        "draining a torn-first-chunk slot must keep it recoverable, not fail it"
     );
 }
 

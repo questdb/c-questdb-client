@@ -4724,6 +4724,75 @@ mod tests {
     }
 
     #[test]
+    fn replay_only_slot_whose_first_chunk_is_corrupt_keeps_delta_armed() {
+        // The orphan-drain twin of the test above, pinned separately because the
+        // two branches fail differently and only one of them has a hazard to
+        // weigh. `open_replay_only` builds no producer at all -- the recovered
+        // dictionary is read-only for the whole drain, and `qwp_ws_orphan::open`
+        // drops the side-file handle outright -- so the refill hazard that makes
+        // a zero-entry file worth distrusting in `open` cannot arise here.
+        //
+        // What dense costs is the slot. `is_delta_dict_enabled` is what gates
+        // seeding the drainer's catch-up mirror, so dense leaves it disabled:
+        // the drainer replays the `delta_start == 0` frame, `guard_dict_not_torn`
+        // rejects the `delta_start == K` frame behind it terminally, and
+        // `OrphanDriveOutcome::RetryLater` puts the slot back on the pending
+        // queue -- where the next open re-parses the same zero entries and
+        // re-decides dense. It never drains and never fails: it live-locks,
+        // holding a drainer for the life of the process while the frames behind
+        // the first stay undelivered (and the replayed prefix is re-sent each
+        // cycle). `qwp_ws_orphan_drain_replays_both_frames_when_the_first_dict_
+        // chunk_is_corrupt` pins the drain end to end; this pins the queue-level
+        // state it rests on.
+        let dir = TempDir::new().unwrap();
+        let symbol_dict = dir
+            .path()
+            .join(crate::ingress::sender::qwp_ws_sfa_symbol_dict::FILE_NAME);
+
+        // An abandoned session leaves an unresolved segment plus a real one-chunk
+        // side-file behind: the orphan slot a drainer later picks up.
+        let mut queue = open(&dir);
+        queue.try_submit(b"unresolved-frame").unwrap();
+        drop(queue);
+        {
+            let mut pd = crate::ingress::sender::qwp_ws_sfa_symbol_dict::PersistedSymbolDict::open(
+                dir.path(),
+            )
+            .unwrap();
+            pd.append_symbol(b"alpha").unwrap();
+        }
+
+        // Same-length value flip inside the only chunk: its stored CRC goes
+        // stale, so the parse stops at chunk 0 and recovers nothing.
+        let mut bytes = std::fs::read(&symbol_dict).unwrap();
+        let idx = bytes
+            .windows(5)
+            .position(|w| w == b"alpha")
+            .expect("alpha entry present");
+        bytes[idx] = b'X';
+        std::fs::write(&symbol_dict, &bytes).unwrap();
+
+        let queue = SfaFrameQueue::open_replay_only(options(&dir)).unwrap();
+
+        assert!(
+            queue.producer.is_none(),
+            "replay-only has no producer, so nothing can refill the truncated \
+             dictionary while the drain runs"
+        );
+        assert!(
+            queue.is_delta_dict_enabled(),
+            "a replay-only slot whose side-file parsed to zero entries must keep \
+             delta armed so the drainer's mirror bootstraps from the stored \
+             frames; dense here re-queues the slot forever"
+        );
+        assert!(
+            queue.recovered_symbol_dict_entries().is_empty(),
+            "the rejected chunk seeds nothing -- the mirror arms empty"
+        );
+        assert_eq!(queue.recovered_symbol_dict_count(), 0);
+    }
+
+    #[test]
     fn close_keeps_ack_watermark_when_sfa_cleanup_is_partial() {
         let dir = TempDir::new().unwrap();
         let mut queue = open(&dir);
