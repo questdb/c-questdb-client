@@ -1247,7 +1247,10 @@ mod tests {
             drop(queue);
             exited_tx.send(()).unwrap();
         });
-        entered_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        // Liveness gates only (slot open/teardown do real file I/O, which is
+        // slow on loaded CI runners); the bounded-close behavior under test is
+        // asserted via close_with_timeouts below.
+        entered_rx.recv_timeout(Duration::from_secs(10)).unwrap();
         let mut pool = OrphanDrainerPool {
             stop,
             threads: vec![(worker, Arc::new(TrafficGate::default()))],
@@ -1260,7 +1263,7 @@ mod tests {
             Err(SfaQueueError::SlotInUse { .. })
         ));
         release_tx.send(()).unwrap();
-        exited_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        exited_rx.recv_timeout(Duration::from_secs(10)).unwrap();
 
         let mut reopened = SfaSlotQueue::open(options).unwrap();
         reopened.close().unwrap();
