@@ -607,33 +607,66 @@ mod tests {
     #[cfg(any(unix, windows))]
     #[test]
     fn subprocess_holder_releases_slot_lock_on_exit() {
-        use std::time::Duration;
-
         let temp = TempDir::new().unwrap();
         let sf_dir = temp.path().join("sf-root");
-        let ready_path = temp.path().join("holder-ready");
-        let release_path = temp.path().join("holder-release");
-        let mut holder = slot_lock_helper_command("hold", &sf_dir, DEFAULT_SENDER_ID)
-            .env("QDB_SFA_SLOT_CHILD_READY", &ready_path)
-            .env("QDB_SFA_SLOT_CHILD_RELEASE", &release_path)
-            .spawn()
-            .unwrap();
+        let mut holder = ChildGuard::new(
+            slot_lock_helper_command(&sf_dir, DEFAULT_SENDER_ID)
+                .spawn()
+                .unwrap(),
+        );
+        let holder_pid = holder.id();
+        let holder_stdout = holder.take_stdout().unwrap();
+        let (ready_rx, output_reader) = read_slot_lock_holder_output(holder_stdout);
+        let ready_pid = match ready_rx.recv_timeout(SLOT_LOCK_HELPER_WATCHDOG) {
+            Ok(Ok(pid)) => pid,
+            ready_result => {
+                let termination = holder.terminate_and_wait();
+                let output = if termination.is_ok() {
+                    output_reader.join().unwrap()
+                } else {
+                    "holder output unavailable because termination failed".to_owned()
+                };
+                panic!(
+                    "slot-lock holder did not become ready [result={ready_result:?}, \
+                     termination={termination:?}, output={output:?}]"
+                );
+            }
+        };
+        assert_eq!(ready_pid, holder_pid);
 
-        wait_for_path(&ready_path, Duration::from_secs(5));
+        let err = SfaSlotQueue::open(options(&sf_dir, DEFAULT_SENDER_ID)).unwrap_err();
+        assert!(matches!(
+            err,
+            SfaQueueError::SlotInUse {
+                slot_dir,
+                holder
+            } if slot_dir == sf_dir.join(DEFAULT_SENDER_ID)
+                && holder == format!("pid={holder_pid}")
+        ));
 
-        let mut contender = slot_lock_helper_command("contend", &sf_dir, DEFAULT_SENDER_ID)
-            .env("QDB_SFA_SLOT_CHILD_HOLDER_PID", holder.id().to_string())
-            .spawn()
-            .unwrap();
-        wait_for_child(&mut contender, Duration::from_secs(5));
+        let status = holder.terminate_and_wait().unwrap();
+        assert!(!status.success(), "holder exited before it was terminated");
+        let holder_output = output_reader.join().unwrap();
 
-        fs::write(&release_path, b"release\n").unwrap();
-        wait_for_child(&mut holder, Duration::from_secs(5));
-
-        let mut acquirer = slot_lock_helper_command("acquire", &sf_dir, DEFAULT_SENDER_ID)
-            .spawn()
-            .unwrap();
-        wait_for_child(&mut acquirer, Duration::from_secs(5));
+        let deadline = std::time::Instant::now() + SLOT_LOCK_HELPER_WATCHDOG;
+        let mut acquired = loop {
+            match SfaSlotQueue::open(options(&sf_dir, DEFAULT_SENDER_ID)) {
+                Ok(queue) => break queue,
+                Err(SfaQueueError::SlotInUse { .. }) if std::time::Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Err(err) => panic!(
+                    "slot-lock takeover failed after holder exit \
+                     [error={err:?}, holder-output={holder_output:?}]"
+                ),
+            }
+        };
+        let pid_path = sf_dir.join(DEFAULT_SENDER_ID).join(LOCK_PID_FILE_NAME);
+        assert_eq!(
+            fs::read_to_string(pid_path).unwrap().trim(),
+            std::process::id().to_string()
+        );
+        acquired.close().unwrap();
     }
 
     #[cfg(any(unix, windows))]
@@ -643,47 +676,24 @@ mod tests {
         let Ok(mode) = std::env::var("QDB_SFA_SLOT_CHILD_MODE") else {
             return;
         };
+        assert_eq!(mode, "hold");
         let sf_dir = PathBuf::from(std::env::var_os("QDB_SFA_SLOT_CHILD_SF_DIR").unwrap());
         let sender_id = std::env::var("QDB_SFA_SLOT_CHILD_SENDER_ID").unwrap();
+        ensure_dir(&sf_dir).unwrap();
+        let _lock = SlotLock::acquire(sf_dir.join(sender_id), false).unwrap();
 
-        match mode.as_str() {
-            "hold" => {
-                use std::time::Duration;
-
-                let ready_path =
-                    PathBuf::from(std::env::var_os("QDB_SFA_SLOT_CHILD_READY").unwrap());
-                let release_path =
-                    PathBuf::from(std::env::var_os("QDB_SFA_SLOT_CHILD_RELEASE").unwrap());
-                let _queue = SfaSlotQueue::open(options(&sf_dir, &sender_id)).unwrap();
-                fs::write(&ready_path, b"ready\n").unwrap();
-                wait_for_path(&release_path, Duration::from_secs(30));
-            }
-            "contend" => {
-                let holder_pid = std::env::var("QDB_SFA_SLOT_CHILD_HOLDER_PID").unwrap();
-                let err = SfaSlotQueue::open(options(&sf_dir, &sender_id)).unwrap_err();
-                assert!(matches!(
-                    err,
-                    SfaQueueError::SlotInUse {
-                        slot_dir,
-                        holder
-                    } if slot_dir == sf_dir.join(&sender_id)
-                        && holder == format!("pid={holder_pid}")
-                ));
-            }
-            "acquire" => {
-                let queue = SfaSlotQueue::open(options(&sf_dir, &sender_id)).unwrap();
-                assert_eq!(queue.slot_dir(), Some(sf_dir.join(&sender_id).as_path()));
-            }
-            mode => panic!("unknown slot lock helper mode: {mode}"),
-        }
+        use std::io::{Read, Write};
+        println!("{SLOT_LOCK_HELPER_READY_PREFIX}{}", std::process::id());
+        std::io::stdout().flush().unwrap();
+        let mut release = [0u8; 1];
+        std::io::stdin()
+            .read_exact(&mut release)
+            .expect("slot-lock holder stdin closed before forced termination");
+        panic!("slot-lock holder was released without process termination");
     }
 
     #[cfg(any(unix, windows))]
-    fn slot_lock_helper_command(
-        mode: &str,
-        sf_dir: &Path,
-        sender_id: &str,
-    ) -> std::process::Command {
+    fn slot_lock_helper_command(sf_dir: &Path, sender_id: &str) -> std::process::Command {
         const HELPER_TEST: &str =
             "ingress::sender::qwp_ws_sfa_slot::tests::qwp_ws_sfa_slot_child_process_lock_helper";
 
@@ -693,42 +703,124 @@ mod tests {
             .arg("--exact")
             .arg("--ignored")
             .arg("--nocapture")
-            .env("QDB_SFA_SLOT_CHILD_MODE", mode)
+            .env("QDB_SFA_SLOT_CHILD_MODE", "hold")
             .env("QDB_SFA_SLOT_CHILD_SF_DIR", sf_dir)
-            .env("QDB_SFA_SLOT_CHILD_SENDER_ID", sender_id);
+            .env("QDB_SFA_SLOT_CHILD_SENDER_ID", sender_id)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped());
         command
     }
 
     #[cfg(any(unix, windows))]
-    fn wait_for_path(path: &Path, timeout: std::time::Duration) {
-        use std::thread;
-        use std::time::{Duration, Instant};
+    const SLOT_LOCK_HELPER_READY_PREFIX: &str = "QDB_SFA_SLOT_CHILD_READY:";
+    #[cfg(any(unix, windows))]
+    const SLOT_LOCK_HELPER_WATCHDOG: Duration = Duration::from_secs(120);
 
-        let deadline = Instant::now() + timeout;
-        while Instant::now() < deadline {
-            if path.exists() {
-                return;
+    #[cfg(any(unix, windows))]
+    fn read_slot_lock_holder_output(
+        stdout: std::process::ChildStdout,
+    ) -> (
+        std::sync::mpsc::Receiver<Result<u32, String>>,
+        std::thread::JoinHandle<String>,
+    ) {
+        use std::io::BufRead;
+
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let reader = std::thread::spawn(move || {
+            let mut output = String::new();
+            let mut ready_sent = false;
+            for line in std::io::BufReader::new(stdout).lines() {
+                match line {
+                    Ok(line) => {
+                        output.push_str(&line);
+                        output.push('\n');
+                        if !ready_sent && let Some(index) = line.find(SLOT_LOCK_HELPER_READY_PREFIX)
+                        {
+                            let pid = line[index + SLOT_LOCK_HELPER_READY_PREFIX.len()..]
+                                .trim()
+                                .parse::<u32>()
+                                .map_err(|err| {
+                                    format!("invalid slot-lock holder PID in {line:?}: {err}")
+                                });
+                            let parse_failed = pid.is_err();
+                            let _ = ready_tx.send(pid);
+                            ready_sent = true;
+                            if parse_failed {
+                                break;
+                            }
+                        }
+                    }
+                    Err(err) => {
+                        if !ready_sent {
+                            let _ = ready_tx.send(Err(format!(
+                                "failed to read slot-lock holder output: {err}"
+                            )));
+                            ready_sent = true;
+                        }
+                        break;
+                    }
+                }
             }
-            thread::sleep(Duration::from_millis(10));
-        }
-        panic!("timed out waiting for {}", path.display());
+            if !ready_sent {
+                let _ = ready_tx.send(Err(
+                    "slot-lock holder exited before reporting readiness".to_owned()
+                ));
+            }
+            output
+        });
+        (ready_rx, reader)
     }
 
     #[cfg(any(unix, windows))]
-    fn wait_for_child(child: &mut std::process::Child, timeout: std::time::Duration) {
-        use std::thread;
-        use std::time::{Duration, Instant};
+    struct ChildGuard {
+        child: std::process::Child,
+        reaped: bool,
+    }
 
-        let deadline = Instant::now() + timeout;
-        while Instant::now() < deadline {
-            if let Some(status) = child.try_wait().unwrap() {
-                assert!(status.success(), "child exited with {status}");
+    #[cfg(any(unix, windows))]
+    impl ChildGuard {
+        fn new(child: std::process::Child) -> Self {
+            Self {
+                child,
+                reaped: false,
+            }
+        }
+
+        fn id(&self) -> u32 {
+            self.child.id()
+        }
+
+        fn take_stdout(&mut self) -> Option<std::process::ChildStdout> {
+            self.child.stdout.take()
+        }
+
+        fn terminate_and_wait(&mut self) -> io::Result<std::process::ExitStatus> {
+            if let Some(status) = self.child.try_wait()? {
+                self.reaped = true;
+                return Ok(status);
+            }
+            self.child.kill()?;
+            let status = self.child.wait()?;
+            self.reaped = true;
+            Ok(status)
+        }
+    }
+
+    #[cfg(any(unix, windows))]
+    impl Drop for ChildGuard {
+        fn drop(&mut self) {
+            if self.reaped {
                 return;
             }
-            thread::sleep(Duration::from_millis(10));
+            match self.child.try_wait() {
+                Ok(Some(_)) => {}
+                _ => {
+                    let _ = self.child.kill();
+                }
+            }
+            let _ = self.child.wait();
+            self.reaped = true;
         }
-        let _ = child.kill();
-        panic!("timed out waiting for child process");
     }
 
     #[cfg(not(any(unix, windows)))]
