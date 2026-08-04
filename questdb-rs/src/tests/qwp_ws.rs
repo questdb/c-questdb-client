@@ -40,9 +40,14 @@ use crate::ingress::sender::fail_next_catch_up_allocation_for_test;
 use crate::ingress::sender::has_any_sfa_file as slot_has_sfa_file;
 use crate::ingress::sender::qwp_ws::fail_next_recovered_dict_copy_for_test;
 use crate::ingress::{
-    Buffer, ColumnName, Protocol, ProtocolVersion, QwpWsEncodeScratch, QwpWsErrorCategory,
-    QwpWsErrorPolicy, QwpWsProgress, SenderBuilder, SymbolGlobalDict, TableName, TimestampNanos,
+    Buffer, ColumnName, Protocol, QwpWsEncodeScratch, QwpWsErrorCategory, QwpWsErrorPolicy,
+    QwpWsProgress, SenderBuilder, SymbolGlobalDict, TableName, TimestampNanos,
 };
+// `ProtocolVersion` is only referenced by the HTTP-gated sibling-sender checks
+// below, so gate the import to avoid an unused-import warning when the
+// qwp-ws sender is built without `sync-sender-http` (e.g. run_all_tests.py).
+#[cfg(feature = "sync-sender-http")]
+use crate::ingress::ProtocolVersion;
 
 pub(crate) const WS_GUID: &str = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
 const FIRST_WIRE_SEQUENCE: u64 = 0;

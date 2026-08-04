@@ -2423,6 +2423,8 @@ impl SenderBuilder {
         Ok(self)
     }
 
+    // Only consumed by the QWP/WebSocket-gated pool builder in `db.rs`.
+    #[cfg(feature = "sync-sender-qwp-ws")]
     pub(crate) fn configured_max_name_len(&self) -> usize {
         *self.max_name_len
     }
