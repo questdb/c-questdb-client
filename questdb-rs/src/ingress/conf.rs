@@ -260,9 +260,11 @@ pub(crate) struct QwpWsConfig {
     pub(crate) endpoints: ConfigSetting<Vec<QwpWsEndpoint>>,
     pub(crate) auth_timeout: ConfigSetting<std::time::Duration>,
     /// Per-endpoint TCP connect (dial) budget. `None` (the default) keeps the
-    /// OS-default blocking dial for foreground connects; background orphan
-    /// drainers substitute a finite 15-second fallback. `Some` bounds each
-    /// `TcpStream::connect_timeout` attempt and surfaces
+    /// OS-default blocking dial for caller-thread initial connects; every
+    /// bounded dial -- reconnects, the async initial-connect retry loop, and
+    /// background orphan drainers -- substitutes a finite 15-second fallback
+    /// so bounded shutdown cannot be parked until the OS TCP-connect deadline.
+    /// `Some` bounds each `TcpStream::connect_timeout` attempt and surfaces
     /// [`crate::ErrorCode::ConnectTimeout`] on expiry.
     /// Connect-string key: `connect_timeout` (milliseconds).
     pub(crate) connect_timeout: ConfigSetting<Option<std::time::Duration>>,

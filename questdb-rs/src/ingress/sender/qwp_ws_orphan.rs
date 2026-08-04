@@ -279,11 +279,35 @@ impl Drop for OrphanDrainerPool {
 
 #[cfg(feature = "sync-sender-qwp-ws")]
 pub(crate) struct ManualOrphanDrainers {
-    pending: VecDeque<PathBuf>,
-    active: Vec<OrphanDrainer>,
+    pending: VecDeque<PendingOrphanSlot>,
+    active: Vec<ActiveOrphanDrainer>,
     next_active: usize,
     max_active: usize,
     config: OrphanDrainerConfig,
+}
+
+/// A slot awaiting (re)adoption. `not_before` gates the next connect attempt
+/// so an unreachable endpoint cannot turn the caller's park loop into a
+/// connect storm; `backoff` is the gate applied to the next failure, walking
+/// the same capped-doubling ladder as the background drainer.
+#[cfg(feature = "sync-sender-qwp-ws")]
+struct PendingOrphanSlot {
+    slot_dir: PathBuf,
+    not_before: Option<Instant>,
+    backoff: Duration,
+}
+
+/// An adopted slot. While `gated_until` is in the future the drainer is
+/// retained but not driven: the slot flock stays held through the backoff,
+/// matching the background loop's ownership model. `reopen_when_due` marks a
+/// fresh-session retry -- the sticky store is released only once the gate
+/// expires, immediately before reopening.
+#[cfg(feature = "sync-sender-qwp-ws")]
+struct ActiveOrphanDrainer {
+    drainer: OrphanDrainer,
+    gated_until: Option<Instant>,
+    reopen_when_due: bool,
+    backoff: Duration,
 }
 
 #[cfg(feature = "sync-sender-qwp-ws")]
@@ -296,8 +320,16 @@ impl ManualOrphanDrainers {
         if candidates.is_empty() || max_active == 0 {
             return None;
         }
+        let initial_backoff = *config.qwp_ws.reconnect_initial_backoff;
         Some(Self {
-            pending: VecDeque::from(candidates),
+            pending: candidates
+                .into_iter()
+                .map(|slot_dir| PendingOrphanSlot {
+                    slot_dir,
+                    not_before: None,
+                    backoff: initial_backoff,
+                })
+                .collect(),
             active: Vec::new(),
             next_active: 0,
             max_active,
@@ -305,6 +337,10 @@ impl ManualOrphanDrainers {
         })
     }
 
+    /// Returns `true` only when a unit of work ran (an adoption attempt, a
+    /// drive step, or a slot retiring). All-gated or all-idle returns `false`
+    /// so the `Sender::drive_once` contract lets the caller park instead of
+    /// spinning.
     pub(crate) fn drive_once(&mut self) -> bool {
         if self.active.len() < self.max_active && self.activate_one() {
             return true;
@@ -312,16 +348,41 @@ impl ManualOrphanDrainers {
         self.drive_active_once()
     }
 
+    fn initial_backoff(&self) -> Duration {
+        *self.config.qwp_ws.reconnect_initial_backoff
+    }
+
+    fn max_backoff(&self) -> Duration {
+        *self.config.qwp_ws.reconnect_max_backoff
+    }
+
     fn activate_one(&mut self) -> bool {
-        let Some(slot_dir) = self.pending.pop_front() else {
-            return false;
-        };
-        if has_failed_sentinel(&slot_dir) {
+        let now = Instant::now();
+        for _ in 0..self.pending.len() {
+            let Some(slot) = self.pending.pop_front() else {
+                return false;
+            };
+            if slot.not_before.is_some_and(|not_before| now < not_before) {
+                self.pending.push_back(slot);
+                continue;
+            }
+            return self.open_pending(slot);
+        }
+        false
+    }
+
+    fn open_pending(&mut self, slot: PendingOrphanSlot) -> bool {
+        if has_failed_sentinel(&slot.slot_dir) {
             return true;
         }
-        match OrphanDrainer::open(slot_dir.clone(), &self.config) {
+        match OrphanDrainer::open(slot.slot_dir.clone(), &self.config) {
             OrphanOpenOutcome::Drainer(drainer) => {
-                self.active.push(*drainer);
+                self.active.push(ActiveOrphanDrainer {
+                    drainer: *drainer,
+                    gated_until: None,
+                    reopen_when_due: false,
+                    backoff: self.initial_backoff(),
+                });
                 true
             }
             OrphanOpenOutcome::AlreadyDrained
@@ -329,56 +390,117 @@ impl ManualOrphanDrainers {
             | OrphanOpenOutcome::Locked
             | OrphanOpenOutcome::Stopped => true,
             OrphanOpenOutcome::RetryLater(reason) => {
-                let _ = record_last_error(&slot_dir, &reason);
-                self.pending.push_back(slot_dir);
+                let _ = record_last_error(&slot.slot_dir, &reason);
+                self.requeue(slot.slot_dir, slot.backoff);
                 true
             }
             OrphanOpenOutcome::Unrecoverable(reason) => {
-                let _ = mark_failed(&slot_dir, &reason);
+                let _ = mark_failed(&slot.slot_dir, &reason);
                 true
             }
         }
+    }
+
+    fn requeue(&mut self, slot_dir: PathBuf, backoff: Duration) {
+        self.pending.push_back(PendingOrphanSlot {
+            slot_dir,
+            not_before: Instant::now().checked_add(backoff),
+            backoff: next_orphan_retry_backoff(backoff, self.max_backoff()),
+        });
     }
 
     fn drive_active_once(&mut self) -> bool {
         if self.active.is_empty() {
             return false;
         }
+        let initial_backoff = self.initial_backoff();
+        let max_backoff = self.max_backoff();
         let active_count = self.active.len();
         for _ in 0..active_count {
             let index = self.next_active % self.active.len();
             self.next_active = (index + 1) % self.active.len();
-            match self.active[index].drive_once() {
-                OrphanDriveOutcome::Idle => {}
-                OrphanDriveOutcome::Progress => return true,
+            let now = Instant::now();
+            if let Some(gated_until) = self.active[index].gated_until {
+                if now < gated_until {
+                    continue;
+                }
+                if self.active[index].reopen_when_due {
+                    // Release the sticky store only now, immediately before
+                    // the fresh adoption, so the flock was held through the
+                    // whole backoff.
+                    let entry = self.active.remove(index);
+                    self.pending.push_front(PendingOrphanSlot {
+                        slot_dir: entry.drainer.slot_dir.clone(),
+                        not_before: None,
+                        backoff: entry.backoff,
+                    });
+                    self.normalize_next_active();
+                    return true;
+                }
+                self.active[index].gated_until = None;
+            }
+            match self.active[index].drainer.drive_once(None) {
+                OrphanDriveOutcome::Idle => {
+                    self.active[index].backoff = initial_backoff;
+                }
+                OrphanDriveOutcome::Progress => {
+                    self.active[index].backoff = initial_backoff;
+                    return true;
+                }
+                OrphanDriveOutcome::Waiting {
+                    sleep_for,
+                    deadline,
+                } => {
+                    let until = now.checked_add(sleep_for);
+                    self.active[index].gated_until = match (until, deadline) {
+                        (Some(until), Some(deadline)) => Some(until.min(deadline)),
+                        (Some(until), None) => Some(until),
+                        (None, deadline) => deadline,
+                    };
+                    return true;
+                }
                 OrphanDriveOutcome::Drained => {
-                    let drainer = self.active.remove(index);
-                    drainer.clear_last_error();
+                    let entry = self.active.remove(index);
+                    entry.drainer.clear_last_error();
                     self.normalize_next_active();
                     return true;
                 }
                 OrphanDriveOutcome::RetryLater(reason) => {
-                    let drainer = self.active.remove(index);
-                    drainer.record_last_error(&reason);
-                    self.pending.push_back(drainer.slot_dir.clone());
-                    self.normalize_next_active();
+                    let entry = &mut self.active[index];
+                    entry.drainer.record_last_error(&reason);
+                    entry.gated_until = now.checked_add(entry.backoff);
+                    entry.backoff = next_orphan_retry_backoff(entry.backoff, max_backoff);
+                    entry.reopen_when_due = false;
                     return true;
                 }
-                OrphanDriveOutcome::RetryFreshSession(reason)
-                | OrphanDriveOutcome::Terminal(reason) => {
-                    let drainer = self.active.remove(index);
-                    drainer.record_last_error(&reason);
-                    self.pending.push_back(drainer.slot_dir.clone());
+                OrphanDriveOutcome::RetryFreshSession(reason) => {
+                    let entry = &mut self.active[index];
+                    entry.drainer.record_last_error(&reason);
+                    entry.gated_until = now.checked_add(entry.backoff);
+                    entry.backoff = next_orphan_retry_backoff(entry.backoff, max_backoff);
+                    entry.reopen_when_due = true;
+                    return true;
+                }
+                OrphanDriveOutcome::Terminal(reason) => {
+                    // Sticky non-role terminal: retire the slot for this
+                    // session, leaving it on disk for the next one.
+                    let entry = self.active.remove(index);
+                    entry.drainer.record_last_error(&reason);
                     self.normalize_next_active();
                     return true;
                 }
                 OrphanDriveOutcome::Unrecoverable(reason) => {
-                    let drainer = self.active.remove(index);
-                    let _ = mark_failed(&drainer.slot_dir, &reason);
+                    let entry = self.active.remove(index);
+                    let _ = mark_failed(&entry.drainer.slot_dir, &reason);
                     self.normalize_next_active();
                     return true;
                 }
-                OrphanDriveOutcome::Stopped => return true,
+                OrphanDriveOutcome::Stopped => {
+                    // Unreachable with `stop = None`; retire defensively.
+                    self.active.remove(index);
+                    self.normalize_next_active();
+                    return true;
+                }
             }
         }
         false
@@ -417,6 +539,13 @@ enum OrphanDriveOutcome {
     Progress,
     Drained,
     Stopped,
+    /// The driver wants a pause (reconnect pacing) before its next step. The
+    /// scheduler owns the wait: the background loop sleeps, the manual path
+    /// gates the entry instead of blocking the caller's thread.
+    Waiting {
+        sleep_for: Duration,
+        deadline: Option<Instant>,
+    },
     /// A non-terminal drive failure that may make progress on the same store.
     RetryLater(String),
     /// A role/writability terminal: release the sticky store and retry from a
@@ -627,25 +756,8 @@ impl OrphanDrainer {
         }))
     }
 
-    fn drive_once(&mut self) -> OrphanDriveOutcome {
-        match self.send_core.close_drain_ready_step(&mut self.store) {
-            Ok(CloseStepOutcome::Drained) => OrphanDriveOutcome::Drained,
-            Ok(CloseStepOutcome::Terminal) => self.terminal_outcome(),
-            Ok(CloseStepOutcome::Waiting {
-                sleep_for,
-                deadline,
-            }) => {
-                sleep_before_orphan_reconnect(deadline, sleep_for, None);
-                OrphanDriveOutcome::Progress
-            }
-            Ok(CloseStepOutcome::Progress) => OrphanDriveOutcome::Progress,
-            Ok(CloseStepOutcome::Idle) => OrphanDriveOutcome::Idle,
-            Err(err) => OrphanDriveOutcome::RetryLater(driver_error_message(err)),
-        }
-    }
-
-    fn drive_once_with_stop(&mut self, stop: &AtomicBool) -> OrphanDriveOutcome {
-        if stop.load(Ordering::Acquire) {
+    fn drive_once(&mut self, stop: Option<&AtomicBool>) -> OrphanDriveOutcome {
+        if orphan_stop_requested(stop) {
             return OrphanDriveOutcome::Stopped;
         }
         match self.send_core.close_drain_ready_step(&mut self.store) {
@@ -654,15 +766,10 @@ impl OrphanDrainer {
             Ok(CloseStepOutcome::Waiting {
                 sleep_for,
                 deadline,
-            }) => {
-                if sleep_before_orphan_reconnect(deadline, sleep_for, Some(stop)) {
-                    OrphanDriveOutcome::Progress
-                } else if stop.load(Ordering::Acquire) {
-                    OrphanDriveOutcome::Stopped
-                } else {
-                    OrphanDriveOutcome::Progress
-                }
-            }
+            }) => OrphanDriveOutcome::Waiting {
+                sleep_for,
+                deadline,
+            },
             Ok(CloseStepOutcome::Progress) => OrphanDriveOutcome::Progress,
             Ok(CloseStepOutcome::Idle) => OrphanDriveOutcome::Idle,
             Err(err) => OrphanDriveOutcome::RetryLater(driver_error_message(err)),
@@ -805,10 +912,26 @@ fn drain_orphan_to_completion(
         retry_backoff = initial_backoff;
         let mut completed_fsn = drainer.completed_fsn();
         while !stop.load(Ordering::Acquire) {
-            match drainer.drive_once_with_stop(stop) {
+            match drainer.drive_once(Some(stop)) {
                 OrphanDriveOutcome::Drained => {
                     drainer.clear_last_error();
                     return;
+                }
+                OrphanDriveOutcome::Waiting {
+                    sleep_for,
+                    deadline,
+                } => {
+                    if !sleep_before_orphan_reconnect(deadline, sleep_for, Some(stop))
+                        && stop.load(Ordering::Acquire)
+                    {
+                        return;
+                    }
+                    retry_backoff = initial_backoff;
+                    let current_completed_fsn = drainer.completed_fsn();
+                    if current_completed_fsn != completed_fsn {
+                        completed_fsn = current_completed_fsn;
+                        role_retry_backoff = initial_backoff;
+                    }
                 }
                 OrphanDriveOutcome::RetryLater(reason) => {
                     if !stop.load(Ordering::Acquire) {
@@ -1363,6 +1486,58 @@ mod tests {
         );
         assert!(slot_dir.join(LAST_ERROR_NAME).exists());
         assert_eq!(scan_orphan_slots(&sf_dir, "primary", &[]), vec![slot_dir]);
+    }
+
+    #[cfg(all(feature = "sync-sender-qwp-ws", any(unix, windows)))]
+    #[test]
+    fn manual_drainer_gates_connect_retries_so_caller_can_park() {
+        let temp = TempDir::new().unwrap();
+        let sf_dir = temp.path().join("sf-root");
+        let slot_dir = create_queued_orphan(&sf_dir, "orphan");
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+        let mut config = test_config();
+        config.port = port.to_string();
+        config.qwp_ws.reconnect_initial_backoff =
+            ConfigSetting::new_default(Duration::from_secs(3600));
+        let mut drainers = ManualOrphanDrainers::new(vec![slot_dir.clone()], 1, config).unwrap();
+
+        assert!(
+            drainers.drive_once(),
+            "the first connect attempt is a unit of work"
+        );
+        for _ in 0..8 {
+            assert!(
+                !drainers.drive_once(),
+                "a gated slot must let the caller park instead of connect-storming"
+            );
+        }
+        assert!(!has_failed_sentinel(&slot_dir));
+        assert!(slot_dir.join(LAST_ERROR_NAME).exists());
+    }
+
+    #[cfg(all(feature = "sync-sender-qwp-ws", any(unix, windows)))]
+    #[test]
+    fn manual_drainer_retries_connect_after_backoff_elapses() {
+        let temp = TempDir::new().unwrap();
+        let sf_dir = temp.path().join("sf-root");
+        let slot_dir = create_queued_orphan(&sf_dir, "orphan");
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+        let mut config = test_config();
+        config.port = port.to_string();
+        config.qwp_ws.reconnect_initial_backoff =
+            ConfigSetting::new_default(Duration::from_millis(10));
+        let mut drainers = ManualOrphanDrainers::new(vec![slot_dir], 1, config).unwrap();
+
+        assert!(drainers.drive_once());
+        thread::sleep(Duration::from_millis(50));
+        assert!(
+            drainers.drive_once(),
+            "an expired backoff gate must allow the next connect attempt"
+        );
     }
 
     #[cfg(all(feature = "sync-sender-qwp-ws", any(unix, windows)))]

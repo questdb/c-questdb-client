@@ -76,7 +76,7 @@ use super::qwp_ws_sfa_symbol_dict::PersistedSymbolDict;
 type TlsStream = rustls::StreamOwned<rustls::ClientConnection, NoSigpipeTcp>;
 
 const QWP_WS_TLS_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
-const QWP_WS_DEFAULT_BACKGROUND_CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
+const QWP_WS_DEFAULT_BOUNDED_CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 const QWP_WS_RUNNER_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[cfg(test)]
@@ -277,12 +277,19 @@ fn shutdown_socket(stream: &TcpStream) -> std::io::Result<()> {
 
 /// Which lifecycle owns a shared QWP/WebSocket connect walk.
 ///
-/// The main sender's initial connect and I/O-runner reconnects are foreground
-/// work, even when the runner itself lives on a worker thread. Only orphan-slot
-/// drainers use `BackgroundDrainer`, matching Java's background-connect policy.
+/// `Foreground` is a caller-thread initial connect: the user is synchronously
+/// waiting and no bounded-shutdown deadline depends on the dial returning.
+/// `ForegroundBounded` is foreground work whose dial a bounded wait does
+/// depend on -- I/O-runner reconnects and the async initial-connect retry
+/// loop (both raced by the 30s runner shutdown), and manual-mode reconnects
+/// inside `drive_once`. Only orphan-slot drainers use `BackgroundDrainer`,
+/// matching Java's background-connect policy; a transport stores the kind of
+/// its lifecycle (`Foreground`/`BackgroundDrainer`) and derives the bounded
+/// variant per reconnect via [`Self::for_reconnect`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum QwpWsConnectKind {
     Foreground,
+    ForegroundBounded,
     BackgroundDrainer,
 }
 
@@ -290,15 +297,30 @@ impl QwpWsConnectKind {
     fn is_background(self) -> bool {
         self == Self::BackgroundDrainer
     }
+
+    fn bounded_dial(self) -> bool {
+        self != Self::Foreground
+    }
+
+    pub(crate) fn for_reconnect(self) -> Self {
+        match self {
+            Self::Foreground | Self::ForegroundBounded => Self::ForegroundBounded,
+            Self::BackgroundDrainer => Self::BackgroundDrainer,
+        }
+    }
 }
 
-/// Mirrors Java's `effectiveConnectTimeoutMs`: foreground connects preserve
-/// the configured value verbatim, while an unset background-drainer timeout
-/// receives a finite fallback so shutdown cannot remain parked until the OS
-/// TCP-connect deadline.
-fn effective_connect_timeout(background: bool, configured: Option<Duration>) -> Option<Duration> {
-    if background && configured.is_none() {
-        Some(QWP_WS_DEFAULT_BACKGROUND_CONNECT_TIMEOUT)
+/// Extends Java's `effectiveConnectTimeoutMs`: caller-thread initial connects
+/// preserve the configured value verbatim (`None` keeps the OS-default dial),
+/// while an unset timeout on any bounded dial receives a finite fallback so a
+/// bounded shutdown cannot remain parked until the OS TCP-connect deadline.
+/// Java instead cancels an in-flight dial with `shutdown(2)` on a pre-published
+/// fd (`ConnectCancellation`); that fd does not exist before
+/// `TcpStream::connect` returns, and mid-`SYN_SENT` shutdown wake is
+/// Linux-specific, so bounding the dial is the portable equivalent.
+fn effective_connect_timeout(bounded_dial: bool, configured: Option<Duration>) -> Option<Duration> {
+    if bounded_dial && configured.is_none() {
+        Some(QWP_WS_DEFAULT_BOUNDED_CONNECT_TIMEOUT)
     } else {
         configured
     }
@@ -1046,7 +1068,9 @@ impl QwpWsPendingConnect {
                 None,
                 self.use_tls,
                 self.tls_settings.clone(),
-                QwpWsConnectKind::Foreground,
+                // Runner-owned: the 30s shutdown wait races this dial, so an
+                // unset connect_timeout must not fall back to the OS deadline.
+                QwpWsConnectKind::ForegroundBounded,
                 &self.qwp_ws,
                 self.auth_header.as_deref(),
                 self.qwp_ws.conn_events.as_deref(),
@@ -2725,9 +2749,17 @@ fn connect_qwp_ws_tcp(
     port: &str,
     request_timeout: Duration,
     connect_timeout: Option<Duration>,
+    traffic_gate: Option<&TrafficGate>,
 ) -> crate::Result<NoSigpipeTcp> {
     let addrs = resolve_qwp_ws_addrs(host, port)?;
-    connect_tcp_to_any_addr(host, port, &addrs, request_timeout, connect_timeout)
+    connect_tcp_to_any_addr(
+        host,
+        port,
+        &addrs,
+        request_timeout,
+        connect_timeout,
+        traffic_gate,
+    )
 }
 
 fn connect_tcp_to_any_addr(
@@ -2736,6 +2768,7 @@ fn connect_tcp_to_any_addr(
     addrs: &[SocketAddr],
     request_timeout: Duration,
     connect_timeout: Option<Duration>,
+    traffic_gate: Option<&TrafficGate>,
 ) -> crate::Result<NoSigpipeTcp> {
     let mut failures = Vec::new();
     // Stays true only while *every* attempted address failed specifically with
@@ -2743,6 +2776,15 @@ fn connect_tcp_to_any_addr(
     // rather than burying it under the generic `SocketError`.
     let mut all_timed_out = true;
     for addr in addrs {
+        // A dial in flight cannot be interrupted (the fd only reaches the gate
+        // after connect returns), so the timeout is per address: stop between
+        // addresses once shutdown is requested rather than finishing the walk.
+        if traffic_gate.is_some_and(TrafficGate::is_shutdown) {
+            return Err(error::fmt!(
+                SocketError,
+                "QWP/WebSocket runner is shutting down during connect"
+            ));
+        }
         // `connect_timeout = None` keeps the OS-default blocking dial; `Some`
         // uses the native non-blocking connect + poll + SO_ERROR check that
         // `connect_timeout` implements per platform, bounded per address.
@@ -3074,12 +3116,12 @@ pub(crate) fn establish_connection(
     let auth_timeout = *qwp_ws.auth_timeout;
     let request_timeout = *qwp_ws.request_timeout;
     let connect_timeout =
-        effective_connect_timeout(connect_kind.is_background(), *qwp_ws.connect_timeout);
+        effective_connect_timeout(connect_kind.bounded_dial(), *qwp_ws.connect_timeout);
 
     // Windows safety invariant: while the gate stores tcp's raw socket,
     // traffic_registration must drop before tcp. Keep tcp in this outer scope
     // until every fallible TLS/WebSocket setup step has completed.
-    let mut tcp = connect_qwp_ws_tcp(host, port, request_timeout, connect_timeout)?;
+    let mut tcp = connect_qwp_ws_tcp(host, port, request_timeout, connect_timeout, traffic_gate)?;
     let traffic_registration = traffic_gate
         .map(|gate| gate.register(tcp.tcp()))
         .transpose()
@@ -3193,10 +3235,10 @@ pub(crate) fn connect_qwp_ws_endpoint_round<A: QwpWsHealthAccess>(
     // failures would claim an outage against an endpoint the foreground
     // may be healthily using. Mirrors the Java sender's `if (!background)`
     // guards; health tracking is recorded either way.
-    let events = if matches!(connect_kind, QwpWsConnectKind::Foreground) {
-        events
-    } else {
+    let events = if connect_kind.is_background() {
         None
+    } else {
+        events
     };
     if let Some(idx) = previous_idx.take() {
         health.with_tracker(|t| t.record_mid_stream_failure(idx, previous_failure));
@@ -4503,7 +4545,7 @@ mod tests {
     }
 
     #[test]
-    fn effective_connect_timeout_defaults_only_for_background_drainers() {
+    fn effective_connect_timeout_defaults_only_for_bounded_dials() {
         let explicit = Some(Duration::from_millis(250));
 
         assert_eq!(
@@ -4512,6 +4554,26 @@ mod tests {
         );
         assert_eq!(effective_connect_timeout(true, explicit), explicit);
         assert_eq!(effective_connect_timeout(false, None), None);
+        assert_eq!(effective_connect_timeout(false, explicit), explicit);
+    }
+
+    #[test]
+    fn connect_kind_bounds_reconnects_and_background_dials() {
+        assert!(!QwpWsConnectKind::Foreground.bounded_dial());
+        assert!(QwpWsConnectKind::ForegroundBounded.bounded_dial());
+        assert!(QwpWsConnectKind::BackgroundDrainer.bounded_dial());
+        assert_eq!(
+            QwpWsConnectKind::Foreground.for_reconnect(),
+            QwpWsConnectKind::ForegroundBounded
+        );
+        assert_eq!(
+            QwpWsConnectKind::ForegroundBounded.for_reconnect(),
+            QwpWsConnectKind::ForegroundBounded
+        );
+        assert_eq!(
+            QwpWsConnectKind::BackgroundDrainer.for_reconnect(),
+            QwpWsConnectKind::BackgroundDrainer
+        );
     }
 
     #[test]
@@ -4675,6 +4737,7 @@ mod tests {
             &[bad_v6, good_v4],
             Duration::from_secs(1),
             None,
+            None,
         )
         .unwrap();
 
@@ -4696,6 +4759,7 @@ mod tests {
             &[blackhole],
             Duration::from_secs(1),
             Some(Duration::from_millis(300)),
+            None,
         ) {
             Err(e) => e,
             Ok(_) => panic!("dialing a blackhole endpoint must not succeed"),
@@ -4714,6 +4778,37 @@ mod tests {
     }
 
     #[test]
+    fn connect_tcp_to_any_addr_stops_between_addresses_after_gate_shutdown() {
+        use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
+
+        let gate = TrafficGate::default();
+        gate.shutdown().unwrap();
+        let blackhole = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(192, 0, 2, 1), 19009));
+
+        let start = std::time::Instant::now();
+        let err = match connect_tcp_to_any_addr(
+            "192.0.2.1",
+            "19009",
+            &[blackhole],
+            Duration::from_secs(1),
+            Some(Duration::from_millis(300)),
+            Some(&gate),
+        ) {
+            Err(e) => e,
+            Ok(_) => panic!("a shut gate must stop the dial walk"),
+        };
+        assert!(
+            err.msg().contains("shutting down during connect"),
+            "unexpected error: {}",
+            err.msg()
+        );
+        assert!(
+            start.elapsed() < Duration::from_millis(100),
+            "a shut gate must skip the dial entirely"
+        );
+    }
+
+    #[test]
     fn connect_tcp_sets_post_connect_io_timeout() {
         use std::net::{Ipv4Addr, TcpListener};
 
@@ -4722,7 +4817,8 @@ mod tests {
         let accepted = std::thread::spawn(move || listener.accept().unwrap());
         let io_timeout = Duration::from_millis(250);
 
-        let tcp = connect_qwp_ws_tcp("127.0.0.1", &port.to_string(), io_timeout, None).unwrap();
+        let tcp =
+            connect_qwp_ws_tcp("127.0.0.1", &port.to_string(), io_timeout, None, None).unwrap();
 
         assert_eq!(tcp.tcp().read_timeout().unwrap(), Some(io_timeout));
         assert_eq!(tcp.tcp().write_timeout().unwrap(), Some(io_timeout));

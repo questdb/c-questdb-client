@@ -3134,7 +3134,10 @@ impl BlockingQwpWsTransport {
             Some(reason),
             self.use_tls,
             self.tls_settings.clone(),
-            self.connect_kind,
+            // A reconnect dial is raced by a bounded wait (runner shutdown,
+            // manual drive_once), so an unset connect_timeout gets the finite
+            // fallback instead of the OS-default dial.
+            self.connect_kind.for_reconnect(),
             &self.qwp_ws,
             self.auth_header.as_deref(),
             self.qwp_ws.conn_events.as_deref(),

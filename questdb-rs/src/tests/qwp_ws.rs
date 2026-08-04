@@ -1245,6 +1245,76 @@ fn spawn_role_terminal_then_drain_orphan_server() -> RoleTerminalThenDrainOrphan
     }
 }
 
+struct ReplicaWindowThenPromoteServer {
+    port: u16,
+    promoted: Arc<AtomicBool>,
+    reject_count: Arc<AtomicUsize>,
+    handle: thread::JoinHandle<Vec<Vec<u8>>>,
+}
+
+/// One listener modelling an in-place role switch: every pre-promotion
+/// upgrade is answered `421` + `X-QuestDB-Role: REPLICA`; the first
+/// post-promotion connection completes the upgrade, reads the queued data
+/// frame, and ACKs it. Mirrors the Java `TestWebSocketServer`
+/// `setRejectWithRole("REPLICA")` -> `setRejectWithRole(null)` script.
+fn spawn_replica_window_then_promote_server() -> ReplicaWindowThenPromoteServer {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let promoted = Arc::new(AtomicBool::new(false));
+    let reject_count = Arc::new(AtomicUsize::new(0));
+    let thread_promoted = Arc::clone(&promoted);
+    let thread_reject_count = Arc::clone(&reject_count);
+
+    let handle = thread::spawn(move || {
+        let started = Instant::now();
+        while started.elapsed() < Duration::from_secs(15) {
+            let (mut stream, _) = match listener.accept() {
+                Ok(accepted) => accepted,
+                Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                    thread::sleep(Duration::from_millis(2));
+                    continue;
+                }
+                Err(err) => panic!("replica-window listener failed: {err}"),
+            };
+            stream.set_nonblocking(false).unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            stream
+                .set_write_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            if !thread_promoted.load(Ordering::Acquire) {
+                let _ = read_request_until_blank(&mut stream).unwrap();
+                stream
+                    .write_all(
+                        b"HTTP/1.1 421 Misdirected Request\r\n\
+                          Connection: close\r\n\
+                          Content-Length: 0\r\n\
+                          X-QuestDB-Role: REPLICA\r\n\
+                          \r\n",
+                    )
+                    .unwrap();
+                thread_reject_count.fetch_add(1, Ordering::AcqRel);
+                continue;
+            }
+            perform_server_upgrade(&mut stream).unwrap();
+            let (_fin, _opcode, payload) = read_frame(&mut stream).unwrap();
+            write_qwp_ok_response(&mut stream, FIRST_WIRE_SEQUENCE).unwrap();
+            thread::sleep(Duration::from_millis(100));
+            return vec![payload];
+        }
+        Vec::new()
+    });
+
+    ReplicaWindowThenPromoteServer {
+        port,
+        promoted,
+        reject_count,
+        handle,
+    }
+}
+
 fn spawn_stalled_background_orphan_drain_server() -> (u16, mpsc::Receiver<Vec<u8>>, mpsc::Sender<()>)
 {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -3283,6 +3353,139 @@ fn qwp_ws_background_role_terminal_reopens_and_drains_orphan() {
 
     drop(sender);
     server.handle.join().unwrap();
+}
+
+/// Foreground port of Java's `testCloseBlocksAcrossAllReplicaWindowUntilPromotion`:
+/// `close_drain` must stay pending across an all-replica window (connect-time
+/// 421 role rejects), keep the queued frame, and deliver it exactly once when
+/// the endpoint is promoted in place.
+#[test]
+fn qwp_ws_close_drain_blocks_across_all_replica_window_until_promotion() {
+    let server = spawn_replica_window_then_promote_server();
+    let conf = format!(
+        "ws::addr=127.0.0.1:{};initial_connect_retry=async;\
+         reconnect_initial_backoff_millis=10;reconnect_max_backoff_millis=50;\
+         close_flush_timeout_millis=10000;",
+        server.port
+    );
+    let mut sender = SenderBuilder::from_conf(&conf).unwrap().build().unwrap();
+    let mut buf = sender.new_buffer();
+    buf.table("trades")
+        .unwrap()
+        .column_i64("qty", 7)
+        .unwrap()
+        .at_now()
+        .unwrap();
+    sender.flush(&mut buf).unwrap();
+
+    let closer = thread::spawn(move || sender.close_drain());
+
+    assert!(
+        wait_until(Duration::from_secs(5), || {
+            server.reject_count.load(Ordering::Acquire) >= 2
+        }),
+        "server never produced the all-replica window"
+    );
+    assert!(
+        !closer.is_finished(),
+        "close_drain must stay pending for the whole all-replica window"
+    );
+
+    server.promoted.store(true, Ordering::Release);
+    closer
+        .join()
+        .unwrap()
+        .expect("close_drain must complete cleanly after promotion");
+
+    let delivered = server.handle.join().unwrap();
+    assert_eq!(
+        delivered.len(),
+        1,
+        "the queued frame must be delivered exactly once"
+    );
+    assert_eq!(&delivered[0][0..4], b"QWP1");
+}
+
+/// A session-sticky (non-role) terminal on a manually driven orphan must
+/// retire the slot for the session -- `drive_once` settles to `false` so the
+/// caller can park -- while the undrained data stays recoverable on disk.
+#[test]
+fn qwp_ws_manual_orphan_terminal_retires_slot_and_lets_caller_park() {
+    let sf_dir = tempfile::TempDir::new().unwrap();
+    seed_orphan_slot(sf_dir.path());
+
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let (done_tx, done_rx) = mpsc::channel::<()>();
+    let server = thread::spawn(move || {
+        let (mut foreground, _) = listener.accept().unwrap();
+        perform_server_upgrade(&mut foreground).unwrap();
+
+        let (mut orphan, _) = listener.accept().unwrap();
+        perform_server_upgrade(&mut orphan).unwrap();
+        let (_fin, _opcode, _catch_up) = read_frame(&mut orphan).unwrap();
+        let (_fin, _opcode, payload) = read_frame(&mut orphan).unwrap();
+        write_qwp_error_response(
+            &mut orphan,
+            QWP_STATUS_PARSE_ERROR,
+            FIRST_WIRE_SEQUENCE + 1,
+            b"bad orphan",
+        )
+        .unwrap();
+        let _ = done_rx.recv_timeout(Duration::from_secs(10));
+        payload
+    });
+
+    let conf = format!(
+        "ws::addr=127.0.0.1:{};qwp_ws_progress=manual;\
+         sf_dir={};sender_id=primary;drain_orphans=on;\
+         max_frame_rejections=1;poison_min_escalation_window_millis=0;\
+         reconnect_initial_backoff_millis=10;reconnect_max_backoff_millis=20;\
+         sf_max_segment_bytes=256;sf_max_total_bytes=1024;",
+        port,
+        sf_dir.path().display()
+    );
+    let mut sender = SenderBuilder::from_conf(&conf).unwrap().build().unwrap();
+
+    let orphan_slot = sf_dir.path().join("orphan");
+    let last_error = orphan_slot.join(".last_error");
+    let started = Instant::now();
+    while started.elapsed() < Duration::from_secs(5) && !last_error.exists() {
+        if !sender.drive_once().unwrap() {
+            thread::sleep(Duration::from_millis(1));
+        }
+    }
+    assert!(
+        last_error.exists(),
+        "session-sticky terminal must leave a breadcrumb"
+    );
+
+    let quiesce_started = Instant::now();
+    while sender.drive_once().unwrap() {
+        assert!(
+            quiesce_started.elapsed() < Duration::from_secs(2),
+            "drive_once must stop reporting progress once the orphan is terminal"
+        );
+    }
+    for _ in 0..5 {
+        assert!(
+            !sender.drive_once().unwrap(),
+            "a terminal orphan must let the caller park, not spin"
+        );
+    }
+    assert!(
+        !orphan_slot.join(".failed").exists(),
+        "a session-sticky terminal must not poison the slot"
+    );
+    assert!(
+        slot_has_sfa_file(&orphan_slot),
+        "the undrained frame must stay on disk for the next session"
+    );
+
+    done_tx.send(()).unwrap();
+    let payload = server.join().unwrap();
+    assert!(!payload.is_empty());
+    drop(sender);
 }
 
 #[test]
