@@ -811,9 +811,29 @@ fn is_consistent_entry_region(buf: &[u8], start: usize, bytes: usize, count: u64
 /// Mirrors [`open_existing`](PersistedSymbolDict::open_existing)'s walk and
 /// panics on a malformed file -- callers are asserting on a file a correct
 /// writer produced.
+///
+/// The header is VALIDATED, not merely stepped over. Callers assert
+/// `parse_chunks(..).is_empty()` to mean "a valid, untorn, zero-chunk
+/// dictionary" -- the empty-vs-corrupt distinction the delta-armed recovery
+/// tests exist to pin -- but every file `open_existing` rejects outright
+/// (shorter than the header, bad magic, unknown version) carries no parsable
+/// chunk either and would satisfy a bare `is_empty()` just as well. Rejecting
+/// those here is what makes "no chunks" mean an empty dictionary rather than
+/// only "nothing was parsed".
 #[cfg(test)]
 pub(crate) fn parse_chunks(path: &Path) -> Vec<Vec<Vec<u8>>> {
     let buf = fs::read(path).unwrap();
+    assert!(
+        buf.len() >= HEADER_SIZE as usize,
+        "side-file holds {} bytes, short of the {HEADER_SIZE}-byte header",
+        buf.len()
+    );
+    assert_eq!(
+        u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]),
+        FILE_MAGIC,
+        "side-file magic"
+    );
+    assert_eq!(buf[4], VERSION, "side-file version");
     let mut pos = HEADER_SIZE as usize;
     let mut chunks = Vec::new();
     while pos < buf.len() {
@@ -2320,6 +2340,45 @@ public final class SymbolDictInteropHelper {
                 vec![b"delta".to_vec()],
             ],
             "one chunk per non-empty append, carrying exactly that append's symbols"
+        );
+    }
+
+    #[test]
+    fn parse_chunks_rejects_every_header_open_rejects() {
+        // `parse_chunks(..).is_empty()` is how the recovery tests state "a valid,
+        // untorn, EMPTY dictionary" -- the empty-vs-corrupt distinction the
+        // delta-armed decision turns on. Every header `open_existing` refuses
+        // carries no parsable chunk either, so without a header check here those
+        // assertions would hold on exactly the corruption they claim to rule out.
+        let dir = tmp_slot();
+        let path = dir.path().join(FILE_NAME);
+
+        let mut valid_empty = [0u8; HEADER_SIZE as usize];
+        valid_empty[0..4].copy_from_slice(&FILE_MAGIC.to_le_bytes());
+        valid_empty[4] = VERSION;
+
+        let mut bad_magic = valid_empty;
+        bad_magic[0] ^= 0xFF;
+        let mut bad_version = valid_empty;
+        bad_version[4] = VERSION + 1;
+        for (label, bytes) in [
+            ("truncated header", &valid_empty[..HEADER_SIZE as usize - 1]),
+            ("bad magic", &bad_magic[..]),
+            ("unknown version", &bad_version[..]),
+        ] {
+            fs::write(&path, bytes).unwrap();
+            assert!(
+                std::panic::catch_unwind(|| parse_chunks(&path)).is_err(),
+                "a {label} must not read as an empty dictionary"
+            );
+        }
+
+        // ... while the file a symbol-free session really does leave behind -- a
+        // bare, well-formed header -- still parses, as zero chunks.
+        fs::write(&path, valid_empty).unwrap();
+        assert!(
+            parse_chunks(&path).is_empty(),
+            "a valid header with no chunks appended is an empty dictionary"
         );
     }
 }
