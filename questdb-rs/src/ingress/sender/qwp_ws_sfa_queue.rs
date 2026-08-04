@@ -53,6 +53,7 @@ use super::qwp_ws_sfa_segment::{
 use super::qwp_ws_sfa_symbol_dict::PersistedSymbolDict;
 
 const PERIODIC_SYNC_RETRY_MAX: Duration = Duration::from_secs(1);
+const TRIM_BARRIER_RETRY_DELAY: Duration = Duration::from_secs(1);
 // Keep a trim turn bounded while amortizing the crash-consistency barriers.
 // Matches Java's SegmentManager quantum.
 const MAX_TRIMS_PER_STORAGE_STEP: usize = 64;
@@ -474,6 +475,9 @@ struct SfaEngineState {
     last_sync_completed: Option<Instant>,
     next_sync_delay: Duration,
     durability_failure: Option<SfaDurabilityFailure>,
+    // Optional trim barriers retry without blocking publication or other
+    // storage maintenance.
+    trim_retry_at: Option<Instant>,
     // Reserves an ordered rotation/trim manifest transaction while its disk
     // barriers run without the state mutex. Readers continue against the old
     // topology; competing writers and close defer until commit/rollback.
@@ -627,6 +631,7 @@ impl SfaFrameQueue {
                 last_sync_completed: None,
                 next_sync_delay: periodic_sync_interval.unwrap_or(Duration::ZERO),
                 durability_failure: None,
+                trim_retry_at: None,
                 topology_io_in_flight: false,
                 storage_maintenance_in_flight: false,
                 closed: false,
@@ -703,6 +708,7 @@ impl SfaFrameQueue {
                 last_sync_completed: None,
                 next_sync_delay: Duration::ZERO,
                 durability_failure: None,
+                trim_retry_at: None,
                 topology_io_in_flight: false,
                 storage_maintenance_in_flight: false,
                 closed: false,
@@ -804,6 +810,7 @@ impl SfaFrameQueue {
                 last_sync_completed: None,
                 next_sync_delay: periodic_sync_interval.unwrap_or(Duration::ZERO),
                 durability_failure: None,
+                trim_retry_at: None,
                 topology_io_in_flight: false,
                 storage_maintenance_in_flight: false,
                 closed: false,
@@ -1640,7 +1647,14 @@ impl SfaEngine {
             if state.closed || state.topology_io_in_flight {
                 return Ok(None);
             }
-            self.trimmable_prefix(&state, MAX_TRIMS_PER_STORAGE_STEP)?
+            if state
+                .trim_retry_at
+                .is_some_and(|retry_at| Instant::now() < retry_at)
+            {
+                Vec::new()
+            } else {
+                self.trimmable_prefix(&state, MAX_TRIMS_PER_STORAGE_STEP)?
+            }
         };
         if !trim_candidates.is_empty() {
             if let Some(slot_dir) = self.slot_dir.as_deref() {
@@ -1652,13 +1666,19 @@ impl SfaEngine {
                 let watermark = ack_watermark.ok_or_else(|| SfaQueueError::Recovery {
                     reason: "cannot durably trim SFA segments without an ACK watermark".to_string(),
                 })?;
-                watermark.write(acked_fsn)?;
+                if let Err(err) = watermark.write(acked_fsn) {
+                    return self.defer_trim_barrier_failure(err);
+                }
                 #[cfg(test)]
                 record_sfa_barrier(SfaBarrierEvent::TrimWatermarkWritten);
-                watermark.sync_data()?;
+                if let Err(err) = watermark.sync_data() {
+                    return self.defer_trim_barrier_failure(err);
+                }
                 #[cfg(test)]
                 record_sfa_barrier(SfaBarrierEvent::TrimWatermarkSynced);
-                sync_directory(slot_dir)?;
+                if let Err(err) = sync_directory(slot_dir) {
+                    return self.defer_trim_barrier_failure(err);
+                }
                 #[cfg(test)]
                 record_sfa_barrier(SfaBarrierEvent::TrimDirectorySynced);
             }
@@ -1705,7 +1725,13 @@ impl SfaEngine {
                 state = self.lock_state()?;
                 state.manifest = Some(manifest);
                 state.topology_io_in_flight = false;
-                update_result?;
+                if let Err(err) = update_result {
+                    drop(state);
+                    return self.defer_trim_barrier_failure(err);
+                }
+                if state.trim_retry_at.take().is_some() {
+                    log::info!("QWP/WebSocket SF trim barrier recovered");
+                }
                 if state.closed
                     || state.sealed_segments.len() < trim_candidates.len()
                     || !state
@@ -1899,6 +1925,26 @@ impl SfaEngine {
         #[cfg(test)]
         record_sfa_barrier(SfaBarrierEvent::PeriodicSyncCompleted);
         Ok(SfaStorageFinish::changed())
+    }
+
+    fn defer_trim_barrier_failure(
+        &self,
+        err: io::Error,
+    ) -> Result<Option<SfaStorageStep>, SfaQueueError> {
+        // ErrorKind does not distinguish an internal validation failure from
+        // every filesystem's write/fsync failures. No segment is removed until
+        // the barrier is confirmed, so every barrier error is safe to retry.
+        let now = Instant::now();
+        let mut state = self.lock_state()?;
+        if state.trim_retry_at.is_none() {
+            log::error!(
+                "QWP/WebSocket SF trim barrier failed; retrying in {:?}: {}",
+                TRIM_BARRIER_RETRY_DELAY,
+                err
+            );
+        }
+        state.trim_retry_at = now.checked_add(TRIM_BARRIER_RETRY_DELAY).or(Some(now));
+        Ok(None)
     }
 
     fn record_cleanup_failure(&self, failure: SfaCleanupFailure) {
@@ -5083,7 +5129,7 @@ mod tests {
     }
 
     #[test]
-    fn failed_off_lock_trim_restores_manifest_and_keeps_live_prefix() {
+    fn failed_off_lock_trim_is_deferred_and_keeps_live_prefix() {
         let dir = TempDir::new().unwrap();
         let mut queue = SfaFrameQueue::open(options_with(&dir, 38, 38 * 4, 4)).unwrap();
         queue.try_submit(b"one").unwrap();
@@ -5097,14 +5143,19 @@ mod tests {
                 .as_mut()
                 .unwrap()
                 .set_before_sync_hook(Arc::new(|| {
-                    Err(io::Error::other("injected manifest sync failure"))
+                    Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "injected manifest sync failure",
+                    ))
                 }));
         }
 
-        assert!(matches!(
-            queue.take_storage_maintenance_step(false),
-            Err(SfaQueueError::Io(_))
-        ));
+        assert!(
+            queue
+                .take_storage_maintenance_step(false)
+                .unwrap()
+                .is_none()
+        );
         assert!(!queue.storage_maintenance_in_flight().unwrap());
         assert_eq!(queue.sealed_segment_count(), 1);
         assert_eq!(queue.allocated_segment_bytes(), allocated_before);
@@ -5119,11 +5170,26 @@ mod tests {
             .as_mut()
             .unwrap()
             .clear_before_sync_hook();
+        assert_eq!(queue.try_submit(b"tri").unwrap().fsn, 2);
+
+        // A failed optional trim must neither terminate the sender nor hammer
+        // the same barrier again on every maintenance tick.
+        assert!(
+            queue
+                .take_storage_maintenance_step(false)
+                .unwrap()
+                .is_none()
+        );
+        queue.engine.state.lock().unwrap().trim_retry_at = Some(Instant::now());
         let step = queue.take_storage_maintenance_step(false).unwrap().unwrap();
-        assert_eq!(queue.sealed_segment_count(), 0);
+        assert_eq!(queue.sealed_segment_count(), 1);
         let result = step.perform().unwrap();
         queue.finish_storage_maintenance(result, true).unwrap();
         queue.complete_storage_maintenance().unwrap();
+        assert_eq!(queue.allocated_segment_bytes(), allocated_before);
+        assert!(queue.payload_vec_for_fsn(0).is_none());
+        assert!(queue.payload_vec_for_fsn(1).is_some());
+        assert!(queue.engine.state.lock().unwrap().trim_retry_at.is_none());
     }
 
     /// Run with:
