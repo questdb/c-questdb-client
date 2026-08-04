@@ -5021,43 +5021,126 @@ mod tests {
         // had no guard at all, so a newly appended code compiled fine while a C++
         // or Python caller could not name it. Both are kept in step here.
         //
-        // Neither mirror can hold a WRONG value -- the C++ entries alias the C
-        // enumerators and the Python ones are only read back from the library --
-        // so completeness is the whole risk, and it is exactly what silently
-        // regressed: `symbol_dict_full` reached `line_sender.h`, the C++ header
-        // and the C test, but not the Python mirror.
+        // Compare parsed ENTRY LISTS, not substrings. A `contains` search over the
+        // whole file passes on every shape this exists to catch: an enumerator
+        // commented out (`// symbol_dict_full = ...` still contains the needle), a
+        // constant that drifted out of `class ClientErrorCode` to module scope
+        // (where `ClientErrorCode.X` then raises `AttributeError`), and ghost
+        // entries Rust does not have. Comparing lists pins ORDER and VALUE too, so
+        // the append-only convention is covered in the same shot -- and values do
+        // matter on the Python side: `ClientErrorCode` is a hand-typed table of
+        // literals the system tests compare against `e.code`
+        // (`arrow_polars_per_dtype.py`, `arrow_egress_fuzz.py`), not something read
+        // back from the library.
+        //
+        // Line endings are normalised first: `include_str!` does not normalise, the
+        // repo carries no `.gitattributes`, and CI runs this crate's tests on
+        // Windows -- so on a CRLF checkout an unnormalised needle fails every entry.
+
+        /// The text between `open` and the next `close`, exclusive.
+        fn slice_between<'a>(hay: &'a str, open: &str, close: &str) -> Option<&'a str> {
+            let start = hay.find(open)? + open.len();
+            let len = hay[start..].find(close)?;
+            Some(&hay[start..start + len])
+        }
+
+        /// The indented body of a Python class: everything after the `class` line
+        /// up to (not including) the next statement at column 0.
+        fn python_class_body<'a>(hay: &'a str, header: &str) -> Option<&'a str> {
+            let rest = &hay[hay.find(header)? + header.len()..];
+            let end = rest
+                .match_indices('\n')
+                .find(|(i, _)| rest[i + 1..].starts_with(|c: char| !c.is_whitespace()))
+                .map_or(rest.len(), |(i, _)| i);
+            Some(&rest[..end])
+        }
+
+        /// `NAME = VALUE` entries in file order. Skips blank lines, `comment`
+        /// lines, and anything that is not a bare assignment to an identifier of
+        /// the expected case -- which is what drops the Python docstring and any
+        /// prose that happens to contain ` = `.
+        fn entries(body: &str, comment: &str, upper: bool) -> Vec<(String, String)> {
+            body.lines()
+                .map(str::trim)
+                .filter(|l| !l.is_empty() && !l.starts_with(comment))
+                .filter_map(|l| {
+                    let (name, value) = l.strip_suffix(',').unwrap_or(l).split_once(" = ")?;
+                    let named = !name.is_empty()
+                        && name.chars().all(|c| {
+                            c == '_'
+                                || c.is_ascii_digit()
+                                || if upper {
+                                    c.is_ascii_uppercase()
+                                } else {
+                                    c.is_ascii_lowercase()
+                                }
+                        });
+                    named.then(|| (name.to_string(), value.trim().to_string()))
+                })
+                .collect()
+        }
+
         let cpp = include_str!(concat!(
             env!("CARGO_MANIFEST_DIR"),
             "/../include/questdb/ingress/line_sender_core.hpp"
-        ));
+        ))
+        .replace("\r\n", "\n");
         let py = include_str!(concat!(
             env!("CARGO_MANIFEST_DIR"),
             "/../system_test/arrow_ffi.py"
-        ));
+        ))
+        .replace("\r\n", "\n");
+
+        // Slicing to the declaration is load-bearing, not tidiness: it is what
+        // confines the match to the enum / class a caller actually names. A missing
+        // anchor fails loudly rather than silently widening the search to the file.
+        let cpp_body = slice_between(&cpp, "enum class error_code : int\n{\n", "\n};")
+            .expect("line_sender_core.hpp must declare `enum class error_code : int`");
+        let py_body = python_class_body(&py, "\nclass ClientErrorCode:")
+            .expect("arrow_ffi.py must declare `class ClientErrorCode`");
+
+        let (mut want_cpp, mut want_py) = (Vec::new(), Vec::new());
         for (_code, variant, disc) in c_error_code_abi() {
             let full = format!("{variant:?}");
             let short = full
                 .strip_prefix("line_sender_error_")
                 .expect("every variant carries the ABI prefix");
+            want_cpp.push((short.to_string(), format!("::{full}")));
+            want_py.push((short.to_uppercase(), disc.to_string()));
+        }
 
-            // C++: `<short> = ::<full>,` in `enum class error_code : int`.
-            let cpp_needle = format!("{short} = ::{full},");
+        /// Names what actually drifted before falling back to a full list diff, so
+        /// a single missing or stray entry does not arrive as two 38-element dumps
+        /// the reader has to diff by eye.
+        fn check(actual: &[(String, String)], want: &[(String, String)], what: &str, shape: &str) {
+            let missing: Vec<_> = want.iter().filter(|e| !actual.contains(e)).collect();
+            let unexpected: Vec<_> = actual.iter().filter(|e| !want.contains(e)).collect();
             assert!(
-                cpp.contains(&cpp_needle),
-                "include/questdb/ingress/line_sender_core.hpp is missing \
-                 `{cpp_needle}` -- a code was appended without updating the C++ \
-                 `error_code` enum",
+                missing.is_empty() && unexpected.is_empty(),
+                "{what} has drifted from the Rust enum.\n  \
+                 missing (add these): {missing:?}\n  \
+                 unexpected (remove these): {unexpected:?}\n  \
+                 each code appears exactly once, as {shape}",
             );
-
-            // Python: `<SHORT> = <disc>` in `ClientErrorCode`.
-            let py_needle = format!("{} = {disc}\n", short.to_uppercase());
-            assert!(
-                py.contains(&py_needle),
-                "system_test/arrow_ffi.py is missing `{}` -- a code was appended \
-                 without updating the `ClientErrorCode` mirror",
-                py_needle.trim_end(),
+            assert_eq!(
+                actual, want,
+                "{what} holds every code but out of discriminant order -- the mirror \
+                 is append-only, so a reorder means an edit landed in the wrong place",
             );
         }
+
+        check(
+            &entries(cpp_body, "//", false),
+            &want_cpp,
+            "`enum class error_code` in include/questdb/ingress/line_sender_core.hpp",
+            "`<short> = ::line_sender_error_<short>,`",
+        );
+        check(
+            &entries(py_body, "#", true),
+            &want_py,
+            "`class ClientErrorCode` in system_test/arrow_ffi.py",
+            "`<SHORT> = <discriminant>`, inside the class body",
+        );
     }
 
     fn utf8(bytes: &'static [u8]) -> line_sender_utf8 {
