@@ -745,7 +745,12 @@ bool qwp_chunk_column_binary(
  * only referenced dict entries against the connection-scoped global
  * symbol table, so `dict_offsets_len - 1` (the number of distinct
  * values — e.g. a wide Pandas `Categorical`) may greatly exceed the
- * referenced set without paying the cost for unused entries. The distinct
+ * referenced set: unused entries are never interned, so they cost nothing
+ * on the wire or against the connection dictionary. They are not free
+ * locally, though, and the cost tracks the *declared* length, not the
+ * referenced count — this call validates the whole declared dictionary's
+ * UTF-8, and each flush fills and scans roughly 9 bytes of scratch per
+ * declared entry, so declare no wider than you need. The distinct
  * entry count is capped at 8,388,608 (2^23) per column, rejected at this
  * append call; each entry's UTF-8 is capped at 1 MiB (1 << 20 bytes),
  * rejected at the next `qwp_sender_flush_chunk` (only referenced entries are
@@ -760,7 +765,8 @@ bool qwp_chunk_column_binary(
  * by entry count alone; it keeps the writer in step with the egress reader and
  * with the store-and-forward side-file's size limit. That cap is reached at
  * `qwp_sender_flush_chunk*` / `qwp_direct_sender_flush`, not here, and is not
- * per column: a wide dictionary is free until its entries are referenced. On
+ * per column: a wide dictionary consumes none of this budget until its entries
+ * are actually referenced. On
  * hitting it the flush returns `false` with `*err_out` set to
  * `line_sender_error_symbol_dict_full` — a distinct code, so you can branch on
  * it without matching on the message text. Chunks referencing only

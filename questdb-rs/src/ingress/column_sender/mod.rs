@@ -97,10 +97,21 @@ pub const MAX_CHUNK_ROWS: usize = 16 * 1024 * 1024;
 /// what the connection ships. Deliberately NOT the connection-scoped cap
 /// (`MAX_CONN_SYMBOL_DICT_SIZE`): the encoder interns only the entries a chunk
 /// actually *references*, so a wide dictionary with few referenced values (a
-/// Pandas `Categorical` reused across chunks is the common case) is legitimate
-/// and costs nothing for its unused entries. Tying this to the connection cap
+/// Pandas `Categorical` reused across chunks is the common case) is legitimate —
+/// its unused entries contribute nothing to the connection dictionary, the wire
+/// delta, or the store-and-forward side-file. Tying this to the connection cap
 /// would reject such a column outright even though it contributes only a handful
 /// of symbols.
+///
+/// Unused entries are not *free*, though, and what they cost scales with the
+/// **declared** length rather than the referenced count: `Chunk::push_symbol`
+/// validates every offset and UTF-8-validates the whole `dict_bytes` span on each
+/// append, and `encoder::resolve_symbols` fills and scans both per-slot scratches
+/// (~9 bytes per slot) once per symbol column per chunk — `try_resize_filled`
+/// reuses the pooled capacity but re-fills every slot regardless. At this ceiling
+/// that is ~72 MiB of scratch traffic per column-chunk, so declare a dictionary
+/// no wider than it needs to be. (The Arrow path sizes its scratch by non-null
+/// row count instead, so this applies to the raw `codes` / `dict_offsets` API.)
 ///
 /// The connection-scoped entry-count and heap caps still apply, but downstream at
 /// flush, against referenced entries only, via `SymbolGlobalDict::intern`.
