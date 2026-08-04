@@ -169,24 +169,36 @@ impl SentDictMirror {
     /// before the first connection, on recovery / orphan-drain. No-op when
     /// disabled or given nothing.
     ///
+    /// Returns `false` when the region could not be allocated, in which case the
+    /// mirror is left DISABLED and empty. That degrade is safe for the driver's
+    /// own mirror -- the send loop's torn-dict guard then rejects the recovered
+    /// delta frames (`StoreResendRequired`, resend from source) rather than
+    /// shipping them -- but it is NOT safe for a caller using this type as a
+    /// folding helper over recovered state, which would silently end up with an
+    /// empty dictionary it believes is complete. Hence the `#[must_use]`: the two
+    /// call sites have to state which of the two they are.
+    ///
     /// [`PersistedSymbolDict`]: super::qwp_ws_sfa_symbol_dict::PersistedSymbolDict
-    pub(crate) fn seed(&mut self, entries: &[u8], count: u32) {
-        if !self.enabled || count == 0 {
-            return;
+    #[must_use = "an allocation failure leaves the mirror disabled and empty; a \
+                  caller folding recovered state must fail rather than continue"]
+    pub(crate) fn seed(&mut self, entries: &[u8], count: u32) -> bool {
+        if !self.enabled {
+            return false;
+        }
+        if count == 0 {
+            return true;
         }
         self.bytes.clear();
         // Fallible: a very large recovered dictionary (~2 GiB) must not abort the
-        // host via an infallible copy. On OOM, disable the mirror instead -- the
-        // send loop's torn-dict guard then rejects the recovered delta frames
-        // (`StoreResendRequired`, resend from source), a graceful degrade rather
-        // than a crash.
+        // host via an infallible copy.
         if self.bytes.try_reserve(entries.len()).is_err() {
             self.enabled = false;
             self.count = 0;
-            return;
+            return false;
         }
         self.bytes.extend_from_slice(entries);
         self.count = count;
+        true
     }
 
     /// Installs an already-owned recovered entry region without allocating another
@@ -689,7 +701,7 @@ mod tests {
         let mut m = SentDictMirror::new(true);
         // Seed short: only id 0 = "a" recovered, though the queued frame below
         // re-registers ids 0,1,2.
-        m.seed(&[1, b'a'], 1);
+        assert!(m.seed(&[1, b'a'], 1), "seeding a small region cannot fail");
         assert_eq!(m.count(), 1);
 
         m.accumulate(&make_frame(0, &[b"a", b"b", b"c"], b"table"));
@@ -716,7 +728,7 @@ mod tests {
         // keep B, so the reconnect catch-up would re-register the wrong symbol.
         // `conflicts_with` must flag it so the send loop rejects it as torn.
         let mut m = SentDictMirror::new(true);
-        m.seed(&[1, b'A'], 1); // id0 = A
+        assert!(m.seed(&[1, b'A'], 1), "seeding a small region cannot fail"); // id0 = A
         m.accumulate(&make_frame(1, &[b"B"], b"")); // id1 = B
         assert_eq!(m.count(), 2);
 
@@ -749,7 +761,11 @@ mod tests {
     fn disabled_mirror_is_inert() {
         let mut m = SentDictMirror::new(false);
         m.accumulate(&make_frame(0, &[b"A"], b""));
-        m.seed(&[1, b'z'], 1);
+        assert!(
+            !m.seed(&[1, b'z'], 1),
+            "a disabled mirror reports `false`: it holds nothing, so a caller \
+             folding recovered state must not treat it as seeded"
+        );
         assert_eq!(m.count(), 0);
         assert!(m.build_catch_up_frames(0, 1).unwrap().is_empty());
     }
@@ -758,7 +774,10 @@ mod tests {
     fn seed_from_persisted_then_extend() {
         let mut m = SentDictMirror::new(true);
         // [len=1]['a'][len=1]['b'] == two entries
-        m.seed(&[1, b'a', 1, b'b'], 2);
+        assert!(
+            m.seed(&[1, b'a', 1, b'b'], 2),
+            "seeding a small region cannot fail"
+        );
         assert_eq!(m.count(), 2);
         m.accumulate(&make_frame(2, &[b"c"], b""));
         assert_eq!(m.count(), 3);
@@ -785,7 +804,10 @@ mod tests {
         // slot reconnects.
         let pd = PersistedSymbolDict::open(dir.path()).unwrap();
         let mut mirror = SentDictMirror::new(true);
-        mirror.seed(pd.loaded_entries(), pd.size());
+        assert!(
+            mirror.seed(pd.loaded_entries(), pd.size()),
+            "seeding a small region cannot fail"
+        );
         assert_eq!(mirror.count(), 2);
         // The catch-up frame re-registers the whole recovered dictionary from id 0,
         // so the stored delta frames replay gap-free against a server that never

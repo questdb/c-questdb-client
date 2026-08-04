@@ -389,7 +389,10 @@ mod tests {
         let mut recovered = SfaForegroundPublisher::new(true, Some(reopened));
         recovered.seed(&recovered_entries, recovered_count).unwrap();
         let mut recovered_mirror = SentDictMirror::new(true);
-        recovered_mirror.seed(&recovered_entries, recovered_count);
+        assert!(
+            recovered_mirror.seed(&recovered_entries, recovered_count),
+            "seeding a small region cannot fail"
+        );
         let fourth = one_symbol_chunk(&codes, &offsets, &[4], b"S3");
         let mut fourth_payload = Vec::new();
         publish_chunk(

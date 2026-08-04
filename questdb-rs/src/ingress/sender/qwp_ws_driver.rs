@@ -1405,7 +1405,14 @@ impl<T: QwpWsCoreTransport> QwpWsSendCore<T> {
     /// tested reconnect-with-nothing-acked overlap case).
     pub(crate) fn enable_delta_dict(&mut self, seed_entries: &[u8], seed_count: u32) {
         self.dict_mirror = SentDictMirror::new(true);
-        self.dict_mirror.seed(seed_entries, seed_count);
+        // Deliberately ignored: this is the mirror the DEGRADE was written for. If
+        // the region cannot be allocated, `seed` leaves the mirror disabled, and a
+        // disabled mirror makes `guard_dict_not_torn` reject the recovered delta
+        // frames as resend-required instead of shipping them against a dictionary
+        // that was never registered. That is the graceful outcome here. (The
+        // recovery-side fold in `SfaFrameQueue::rebuild_recovered_dict_from_frames`
+        // is the caller that must NOT ignore it.)
+        let _seeded = self.dict_mirror.seed(seed_entries, seed_count);
         self.catch_up_pending = !self.dict_mirror.is_empty();
     }
 
