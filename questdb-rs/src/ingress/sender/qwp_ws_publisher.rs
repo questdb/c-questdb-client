@@ -87,9 +87,18 @@ impl QwpWsReplayEncoder {
         self.global_dict = SymbolGlobalDict::new();
     }
 
-    /// Appends the symbols `[from_id, next_id)` this frame introduced to the
-    /// persisted side-file. No-op in memory mode (no side-file).
-    fn persist_new_symbols(&mut self, from_id: u64) -> crate::Result<()> {
+    /// Appends the symbols the side-file is still missing -- `[pd.size(),
+    /// next_id)` -- to it. No-op in memory mode (no side-file).
+    ///
+    /// The start id comes from the SIDE-FILE's own tip rather than from the
+    /// producer's id before this frame. The two are normally equal, but not
+    /// after a recovery whose dictionary was rebuilt from the stored frames
+    /// (`SfaFrameQueue::rebuild_recovered_dict_from_frames`): the producer
+    /// resumes at `K'` while the file holds only its intact prefix `K < K'`.
+    /// Anchoring to the producer would write id `K'` at file position `K` and
+    /// permanently break the file's dense `id == position` invariant. See the
+    /// twin note on `SymbolPublishState::persist_new_symbols`.
+    fn persist_new_symbols(&mut self) -> crate::Result<()> {
         let Self {
             global_dict,
             persisted_symbol_dict,
@@ -98,10 +107,10 @@ impl QwpWsReplayEncoder {
         let Some(pd) = persisted_symbol_dict.as_mut() else {
             return Ok(());
         };
-        // Gather the frame's new symbols, then write them ahead in one batched
+        // Gather the missing symbols, then write them ahead in one batched
         // write_all rather than one alloc + one write() syscall per symbol.
         let mut new_symbols: Vec<&[u8]> = Vec::new();
-        for id in from_id..global_dict.next_id() {
+        for id in u64::from(pd.size())..global_dict.next_id() {
             let bytes = global_dict.entry(id).ok_or_else(|| {
                 error::fmt!(
                     SocketError,
@@ -188,7 +197,6 @@ impl QwpWsReplayEncoder {
         max_buf_size: usize,
     ) -> crate::Result<(SymbolGlobalDictMark, Option<PersistedSymbolDictMark>)> {
         let global_dict_mark = self.global_dict.mark();
-        let dict_len_before = self.global_dict.next_id();
         let pd_mark = self.persisted_symbol_dict.as_ref().map(|pd| pd.mark());
         if let Err(err) = self.encode_to_scratch(buffer) {
             self.rollback_frame(global_dict_mark, pd_mark);
@@ -199,7 +207,7 @@ impl QwpWsReplayEncoder {
             self.rollback_frame(global_dict_mark, pd_mark);
             return Err(qwp_ws_encoded_message_size_error(encoded_len, max_buf_size));
         }
-        if let Err(err) = self.persist_new_symbols(dict_len_before) {
+        if let Err(err) = self.persist_new_symbols() {
             self.rollback_frame(global_dict_mark, pd_mark);
             return Err(err);
         }

@@ -80,16 +80,29 @@ impl SymbolPublishState {
         }
     }
 
-    /// Write-ahead the symbols introduced by the current frame. The side-file
+    /// Write-ahead the symbols the side-file is still missing. The side-file
     /// precedes the queue append so every recoverable delta frame has a durable
     /// symbol prefix from which the driver can rebuild its catch-up mirror.
-    fn persist_new_symbols(&mut self, from_id: u64) -> Result<()> {
+    ///
+    /// The start id comes from the SIDE-FILE's own tip, not from the producer's
+    /// id before this frame. The two are normally equal, but they are NOT after
+    /// a recovery whose dictionary was rebuilt from the stored frames
+    /// (`SfaFrameQueue::rebuild_recovered_dict_from_frames`): there the producer
+    /// resumes at `K'` while the file holds only its intact prefix `K < K'`.
+    /// Anchoring to the producer would append id `K'` at file position `K`,
+    /// permanently breaking the file's dense `id == position` invariant -- the
+    /// next recovery then maps every id from `K` up to the wrong symbol. Reading
+    /// the tip off the file instead makes the first write-ahead after such a
+    /// recovery re-persist `[K, K')` too, healing the file, and is a no-op
+    /// (`K == K'`) on every other frame.
+    fn persist_new_symbols(&mut self) -> Result<()> {
         let Self {
             persisted, global, ..
         } = self;
         let Some(persisted) = persisted.as_mut() else {
             return Ok(());
         };
+        let from_id = u64::from(persisted.size());
         let new_symbols = global.entries_from(from_id).ok_or_else(|| {
             error::fmt!(
                 SocketError,
@@ -136,7 +149,6 @@ impl SfaForegroundPublisher {
     ) -> Result<SfaPublishOutcome> {
         self.payload.clear();
         let global_mark = self.symbols.global.mark();
-        let global_len_before = self.symbols.global.next_id();
         let persisted_mark = self.symbols.persisted.as_ref().map(|p| p.mark());
 
         if let Err(err) = encode(
@@ -157,7 +169,7 @@ impl SfaForegroundPublisher {
             });
         }
 
-        if let Err(err) = self.symbols.persist_new_symbols(global_len_before) {
+        if let Err(err) = self.symbols.persist_new_symbols() {
             self.symbols.rollback(global_mark, persisted_mark);
             return Err(err);
         }
@@ -421,5 +433,79 @@ mod tests {
         assert!(foreground.symbols.persisted.is_none());
         assert!(!foreground.symbols.delta_enabled);
         assert_eq!(foreground.symbols.global.next_id(), 0);
+    }
+
+    #[test]
+    fn write_ahead_heals_a_side_file_left_short_by_a_frame_derived_rebuild() {
+        // Regression (permanent slot loss, and wrong symbols on the wire).
+        //
+        // `SfaFrameQueue::rebuild_recovered_dict_from_frames` deliberately hands
+        // the producer MORE ids than the side-file holds: the file's intact prefix
+        // `K`, extended by every id the surviving frames define in their own delta
+        // sections (`K'`). The handle it hands over is still at `K`.
+        //
+        // So the write-ahead must start from the SIDE-FILE's tip, not from the
+        // producer's id before the frame. Starting from the producer appends the
+        // frame's new symbol at file position `K` while its real id is `K'`,
+        // breaking the file's dense `id == position` invariant permanently. The
+        // next recovery then reads that symbol as id `K`, and either
+        // `SymbolGlobalDict::seed` rejects the rebuilt region as a duplicate --
+        // the slot never opens again and its queued frames are stranded -- or, on
+        // the orphan path (which does no rebuild), the catch-up registers a wrong
+        // id->symbol map on the server and rows commit under the wrong symbol.
+        let dir = tempfile::tempdir().unwrap();
+
+        // A crash left the side-file holding id 0 alone; the rebuild recovered id
+        // 1 from a surviving frame's delta section, so the producer resumes at 2.
+        {
+            let mut torn = PersistedSymbolDict::open(dir.path()).unwrap();
+            torn.append_symbol(b"alpha").unwrap();
+        }
+        let short = PersistedSymbolDict::open(dir.path()).unwrap();
+        assert_eq!(short.size(), 1, "the file holds the intact prefix only");
+        let mut foreground = SfaForegroundPublisher::new(true, Some(short));
+        foreground
+            .seed(
+                &[
+                    5, b'a', b'l', b'p', b'h', b'a', 5, b'b', b'r', b'a', b'v', b'o',
+                ],
+                2,
+            )
+            .unwrap();
+        assert_eq!(
+            foreground.symbols.global.next_id(),
+            2,
+            "the producer resumes above every id the surviving frames define"
+        );
+        assert_eq!(
+            foreground.symbols.persisted.as_ref().unwrap().size(),
+            1,
+            "...while the side-file is still one short -- the skew this test exists \
+             for. `rebuild_recovered_dict_from_frames` leaves it on purpose; the \
+             write-ahead below is what closes it."
+        );
+
+        // One frame introducing a third symbol.
+        let mut scratch = encoder::EncodeScratch::new();
+        let codes = [0i32];
+        let offsets = [0i32, 7];
+        let chunk = one_symbol_chunk(&codes, &offsets, &[1], b"charlie");
+        let outcome =
+            publish_chunk(&mut foreground, &mut scratch, &chunk, usize::MAX, |_| Ok(1)).unwrap();
+        assert!(matches!(outcome, SfaPublishOutcome::Published(1)));
+
+        // The write-ahead re-persisted the rebuilt id 1 alongside the new id 2, so
+        // the file is dense again and back in lockstep with the producer.
+        assert_symbol_state(&foreground, &[b"alpha".as_slice(), b"bravo", b"charlie"]);
+        drop(foreground);
+        let reopened = PersistedSymbolDict::open(dir.path()).unwrap();
+        assert_eq!(
+            reopened.read_loaded_symbols(),
+            vec![b"alpha".to_vec(), b"bravo".to_vec(), b"charlie".to_vec()],
+            "entry i must be symbol id i. Anchoring the write-ahead to the producer \
+             instead leaves [alpha, charlie] here, aliasing id 1 onto charlie and \
+             losing bravo"
+        );
+        assert_eq!(reopened.size(), 3);
     }
 }

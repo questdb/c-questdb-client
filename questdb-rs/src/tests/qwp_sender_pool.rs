@@ -4021,7 +4021,7 @@ fn store_and_forward_file_mode_replays_both_frames_when_the_first_dict_chunk_is_
         &sf_disk_extras(&dir, "pool_reap=manual;sender_id=recov;"),
     );
     let db = QuestDb::connect(&conf).unwrap();
-    let _sender = db.borrow_sender().unwrap();
+    let mut sender = db.borrow_sender().unwrap();
 
     // Collect replayed DATA frames (table_count >= 1 at bytes 6..8); a table-less
     // catch-up frame carries table_count == 0. With the dense fallback exactly ONE
@@ -4059,6 +4059,35 @@ fn store_and_forward_file_mode_replays_both_frames_when_the_first_dict_chunk_is_
         (1, vec![b"bravo".to_vec()]),
         "frame 2 is the mid-stream delta the empty recovered dictionary must not \
          strand: it bases at id 1 and ships only its own new symbol"
+    );
+
+    // Phase 3: the rebuild is only half the job. It leaves the producer at id 2
+    // while the side-file (truncated back to its header by the torn chunk) is at
+    // 0, and NOTHING above this line notices -- every assertion so far passes with
+    // `rebuild_recovered_dict_from_frames` deleted outright.
+    //
+    // Flush a symbol the recovered dictionary does not hold, and the skew becomes
+    // visible on disk: the write-ahead must re-persist the frame-derived ids 0 and
+    // 1 alongside the new id 2, because it anchors to the SIDE-FILE's tip. If it
+    // anchored to the producer's id instead, `chuck` (id 2) would land at file
+    // position 0 and the file would read back as a one-entry dictionary mapping id
+    // 0 -> chuck. The next recovery of this slot then either refuses to open it at
+    // all (duplicate entry in the rebuilt region -- queued frames stranded for
+    // good) or, via the orphan drainer, registers that wrong map on the server.
+    let mut third = Chunk::new("trades");
+    append_one_symbol_row(&mut third, b"chuck", &[3_i64]);
+    sender.flush(&mut third).unwrap();
+
+    assert_eq!(
+        crate::ingress::sender::qwp_ws_sfa_symbol_dict::parse_chunks(&side_file),
+        vec![vec![
+            b"alpha".to_vec(),
+            b"bravo".to_vec(),
+            b"chuck".to_vec()
+        ]],
+        "the first write-ahead after a frame-derived rebuild must heal the file: \
+         entry i is symbol id i again. One chunk, because the write-ahead resumes \
+         from the side-file's tip (0) and so carries every id the producer holds"
     );
 }
 

@@ -560,9 +560,16 @@ impl SfaFrameQueue {
             // the surviving frames define in their OWN delta sections, using the
             // same `SentDictMirror` fold the driver applies as those frames go back
             // on the wire. Producer and mirror therefore resume on the same count by
-            // construction, and the next flush's write-ahead re-persists the rebuilt
-            // ids, healing the side-file on disk. (Matches the Java client's
+            // construction. (Matches the Java client's
             // `seedGlobalDictionaryFromPersisted`.)
+            //
+            // That leaves the producer AHEAD of the side-file, which the write-ahead
+            // heals rather than compounds: `persist_new_symbols` (both publishers)
+            // takes its start id from the SIDE-FILE's tip, not from the producer's,
+            // so the first frame after recovery re-persists the frame-derived ids
+            // too. Anchoring it to the producer instead would append id `K'` at file
+            // position `K` and break the file's dense `id == position` invariant for
+            // good -- see the note there.
             PersistedSymbolDict::open_recovered(&options.slot_dir)?
         } else {
             // Fresh slot: no stored frames depend on the dictionary, so a side-file
@@ -972,7 +979,20 @@ impl SfaFrameQueue {
     ///
     /// Cheap on the common path: an untorn side-file already covers every id, so
     /// every frame folds to a no-op overlap and only the (cold, once-per-open) scan
-    /// remains.
+    /// remains. The scan is bounded by `max_in_flight` frames, not by the backlog:
+    /// `SfaEngine::validate_submit` refuses to publish once
+    /// `published - completed >= max_in_flight`.
+    ///
+    /// # The side-file is left SHORT, deliberately
+    ///
+    /// This does not write the rebuilt ids back. On return the producer resumes at
+    /// `K'` while the side-file still holds only its intact prefix `K`, and the
+    /// write-ahead closes the gap on the next frame because
+    /// `persist_new_symbols` anchors to the side-file's tip rather than the
+    /// producer's id. Healing lazily rather than here keeps `open` read-only on the
+    /// dictionary (a crash in the window before the first flush just re-runs this
+    /// rebuild against the same intact prefix) and keeps a write failure out of the
+    /// recovery path.
     fn rebuild_recovered_dict_from_frames(&mut self) -> Result<(), SfaQueueError> {
         let mut mirror = SentDictMirror::new(true);
         if let Some(pd) = self.persisted_symbol_dict.as_ref() {
@@ -4919,7 +4939,7 @@ mod tests {
         bytes[idx] = b'X';
         std::fs::write(&symbol_dict, &bytes).unwrap();
 
-        let recovered = open(&dir);
+        let mut recovered = open(&dir);
         assert!(recovered.is_delta_dict_enabled());
         assert_eq!(
             recovered.recovered_symbol_dict_count(),
@@ -4938,6 +4958,18 @@ mod tests {
              carries, so the producer dict and the driver mirror seed from \
              identical bytes"
         );
+        // The rebuild does NOT write those ids back, so the handle the producer
+        // gets is still short. Pinned because it is the precondition for the whole
+        // write-ahead anchoring rule: `persist_new_symbols` starts from THIS number,
+        // not from the producer's id, and
+        // `write_ahead_heals_a_side_file_left_short_by_a_frame_derived_rebuild`
+        // covers what happens when it does not.
+        assert_eq!(
+            recovered.take_persisted_symbol_dict().unwrap().size(),
+            0,
+            "the side-file keeps only its intact prefix (here: nothing) -- the \
+             producer is 2 ids ahead of it until the next write-ahead heals it"
+        );
     }
 
     #[test]
@@ -4953,12 +4985,22 @@ mod tests {
         // case needs no second implementation. The count stays at the prefix, and
         // the send loop's `guard_dict_not_torn` then rejects the frame loudly
         // ("resend required") exactly as it does today.
+        // TWO frames, so the assertion distinguishes "stopped at the gap" from
+        // "never ran". A lone frame basing at id 3 over an empty side-file recovers
+        // 0 entries either way -- which is what a build with the rebuild deleted
+        // also produces, so it pins nothing. The contiguous frame in front of the
+        // gap makes the two outcomes differ: 1 if the fold ran and then stopped, 0
+        // if it never ran at all.
         use crate::ingress::sender::qwp_ws_sfa_catchup::make_delta_frame;
 
         let dir = TempDir::new().unwrap();
 
-        // The only surviving frame bases at id 3, with an empty side-file behind it.
         let mut queue = open(&dir);
+        // Contiguous with the (empty) prefix: the rebuild must fold this one in.
+        queue
+            .try_submit(&make_delta_frame(0, &[b"alpha".as_slice()], b""))
+            .unwrap();
+        // Bases at id 3, leaving ids 1 and 2 unaccounted for: a genuine gap.
         queue
             .try_submit(&make_delta_frame(3, &[b"delta".as_slice()], b""))
             .unwrap();
@@ -4967,11 +5009,17 @@ mod tests {
         let recovered = open(&dir);
         assert_eq!(
             recovered.recovered_symbol_dict_count(),
-            0,
-            "a frame basing above the recovered prefix is a gap, not an extension: \
-             the rebuild must stop rather than invent ids 0..3"
+            1,
+            "the rebuild must fold the contiguous frame in and then STOP at the gap \
+             -- 0 would mean it never ran, 4 would mean it invented ids 1..3"
         );
-        assert!(recovered.recovered_symbol_dict_entries().is_empty());
+        assert_eq!(
+            recovered.recovered_symbol_dict_entries(),
+            &[5, b'a', b'l', b'p', b'h', b'a'][..],
+            "only the frame below the gap contributes; `delta` lives above ids \
+             nothing can reconstruct, so the send loop's `guard_dict_not_torn` \
+             rejects its frame loudly rather than the rebuild guessing"
+        );
     }
 
     #[test]
