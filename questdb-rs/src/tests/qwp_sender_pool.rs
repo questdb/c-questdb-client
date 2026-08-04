@@ -3869,6 +3869,101 @@ fn store_and_forward_file_mode_recovers_and_replays_queued_frame_after_reopen() 
 }
 
 #[test]
+fn store_and_forward_file_mode_replays_both_frames_when_the_first_dict_chunk_is_corrupt() {
+    // Regression (data loss + duplication). A slot whose `.symbol-dict` loses its
+    // FIRST chunk to a host-crash tear recovers ZERO entries, which looks like the
+    // absent / bad-magic side-file case and invites the same dense fallback. It is
+    // not the same case, and the difference is paid in delivered rows.
+    //
+    // Dense disarms the driver's catch-up mirror (both hang off
+    // `delta_dict_enabled`), and `guard_dict_not_torn` then rejects every
+    // `delta_start > 0` frame outright -- but only AFTER the slot's
+    // `delta_start == 0` frame has replayed and COMMITTED on the server. The caller
+    // gets `StoreResendRequired` / `in_doubt == false` ("re-ingest from source")
+    // sitting on top of that committed prefix, so a compliant resend duplicates the
+    // rows it already delivered.
+    //
+    // Armed on the empty dictionary the queue bootstraps itself instead: frame 1
+    // (`delta_start == 0`) passes the guard, `SentDictMirror::accumulate` folds its
+    // own delta section into the mirror, and frame 2 (`delta_start == 1`) resolves
+    // against that. Both replay. `recovered_slot_whose_first_chunk_is_corrupt_keeps_
+    // delta_armed` pins the queue-level state; this is the half that proves the data
+    // actually arrives.
+    //
+    // Per-chunk framing is what makes the tear reachable from a single flipped byte
+    // -- a chunk is one whole frame's new symbols -- so this case only arises with
+    // this on-disk format.
+    let dir = TempDir::new().unwrap();
+
+    // Phase 1: two frames, each introducing a distinct symbol, so the second bases
+    // at `delta_start == 1`. The peer holds its acks, so both stay in the slot.
+    {
+        let (server, _release, _frames) = MockServer::spawn_ack_when_released_capturing(1);
+        let conf = conf_for_endpoints(
+            &[server.port()],
+            &sf_disk_extras(&dir, "pool_reap=manual;sender_id=recov;"),
+        );
+        let db = QuestDb::connect(&conf).unwrap();
+        let mut sender = db.borrow_sender().unwrap();
+        let mut first = Chunk::new("trades");
+        append_one_symbol_row(&mut first, b"alpha", &[1_i64]);
+        sender.flush(&mut first).unwrap();
+        let mut second = Chunk::new("trades");
+        append_one_symbol_row(&mut second, b"bravo", &[2_i64]);
+        sender.flush(&mut second).unwrap();
+        drop(sender);
+        drop(db);
+    }
+
+    // A host/power crash tears chunk 0: a same-length value flip, so only its stored
+    // CRC goes stale. The reader stops there and truncates, recovering nothing --
+    // while both queued segments still reference symbol ids 0 and 1.
+    let slot_dir = dir.path().join("recov-ingest-0");
+    let side_file = slot_dir.join(".symbol-dict");
+    {
+        let mut bytes =
+            std::fs::read(&side_file).expect("phase 1 must have written a delta-mode side-file");
+        let idx = bytes
+            .windows(5)
+            .position(|w| w == b"alpha")
+            .expect("alpha payload present");
+        bytes[idx] = b'X'; // same length ("Xlpha"), different value
+        std::fs::write(&side_file, &bytes).unwrap();
+    }
+
+    // Phase 2: a fresh acking peer over the SAME slot dir and sender_id.
+    let (live, frames) = MockServer::spawn_acking_capturing(4);
+    let conf = conf_for_endpoints(
+        &[live.port()],
+        &sf_disk_extras(&dir, "pool_reap=manual;sender_id=recov;"),
+    );
+    let db = QuestDb::connect(&conf).unwrap();
+    let _sender = db.borrow_sender().unwrap();
+
+    // Count replayed DATA frames (table_count >= 1 at bytes 6..8); a table-less
+    // catch-up frame carries table_count == 0. With the dense fallback exactly ONE
+    // arrives and the store goes terminal on the second.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut data_frames = 0usize;
+    while Instant::now() < deadline && data_frames < 2 {
+        data_frames += frames
+            .try_iter()
+            .filter(|f| {
+                f.len() >= 12 && &f[..4] == b"QWP1" && u16::from_le_bytes([f[6], f[7]]) >= 1
+            })
+            .count();
+        thread::sleep(Duration::from_millis(50));
+    }
+    assert!(
+        data_frames >= 2,
+        "both queued frames must replay -- got {data_frames}. One means the slot \
+         fell back to dense and stranded the `delta_start == 1` frame behind an \
+         already-committed prefix, so the caller's `StoreResendRequired` would \
+         duplicate the rows frame 1 delivered"
+    );
+}
+
+#[test]
 fn store_and_forward_file_mode_value_corruption_is_healed_and_segment_kept() {
     // Issue-4 end-to-end: a same-length VALUE corruption in the persisted
     // `.symbol-dict` -- a host/power-crash bit-flip that keeps an entry's length
