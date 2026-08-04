@@ -4023,26 +4023,42 @@ fn store_and_forward_file_mode_replays_both_frames_when_the_first_dict_chunk_is_
     let db = QuestDb::connect(&conf).unwrap();
     let _sender = db.borrow_sender().unwrap();
 
-    // Count replayed DATA frames (table_count >= 1 at bytes 6..8); a table-less
+    // Collect replayed DATA frames (table_count >= 1 at bytes 6..8); a table-less
     // catch-up frame carries table_count == 0. With the dense fallback exactly ONE
     // arrives and the store goes terminal on the second.
     let deadline = Instant::now() + Duration::from_secs(10);
-    let mut data_frames = 0usize;
-    while Instant::now() < deadline && data_frames < 2 {
-        data_frames += frames
-            .try_iter()
-            .filter(|f| {
-                f.len() >= 12 && &f[..4] == b"QWP1" && u16::from_le_bytes([f[6], f[7]]) >= 1
-            })
-            .count();
+    let mut data_frames: Vec<Vec<u8>> = Vec::new();
+    while Instant::now() < deadline && data_frames.len() < 2 {
+        data_frames.extend(frames.try_iter().filter(|f| {
+            f.len() >= 12 && &f[..4] == b"QWP1" && u16::from_le_bytes([f[6], f[7]]) >= 1
+        }));
         thread::sleep(Duration::from_millis(50));
     }
-    assert!(
-        data_frames >= 2,
-        "both queued frames must replay -- got {data_frames}. One means the slot \
-         fell back to dense and stranded the `delta_start == 1` frame behind an \
-         already-committed prefix, so the caller's `StoreResendRequired` would \
-         duplicate the rows frame 1 delivered"
+    assert_eq!(
+        data_frames.len(),
+        2,
+        "both queued frames must replay. One means the slot fell back to dense and \
+         stranded the `delta_start == 1` frame behind an already-committed prefix, \
+         so the caller's `StoreResendRequired` would duplicate the rows frame 1 \
+         delivered"
+    );
+
+    // A count alone would not say WHICH frames arrived, and the duplication this
+    // regression causes is precisely a second delivery of frame 1 -- two copies of
+    // the `delta_start == 0` frame satisfy "two data frames" while the frame this
+    // test exists for never left the slot. Pin the two distinct deltas the slot
+    // holds: frame 1 self-sufficient at id 0, and frame 2 basing at id 1 on the
+    // mirror frame 1 bootstrapped -- the resolution the dense fallback breaks.
+    assert_eq!(
+        parse_delta_dict_prefix(&data_frames[0]),
+        (0, vec![b"alpha".to_vec()]),
+        "frame 1 replays its own delta section, seeding the mirror from id 0"
+    );
+    assert_eq!(
+        parse_delta_dict_prefix(&data_frames[1]),
+        (1, vec![b"bravo".to_vec()]),
+        "frame 2 is the mid-stream delta the empty recovered dictionary must not \
+         strand: it bases at id 1 and ships only its own new symbol"
     );
 }
 
