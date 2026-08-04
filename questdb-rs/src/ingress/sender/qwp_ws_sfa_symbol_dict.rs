@@ -452,6 +452,19 @@ impl PersistedSymbolDict {
         self.loaded_entries = Vec::new();
     }
 
+    /// Moves the recovered entry region out, leaving the handle with an empty one
+    /// (as [`clear_loaded_entries`] would). For a caller that wants to OWN the
+    /// region rather than borrow it: a `to_vec` of this region is an infallible
+    /// allocation of up to [`MAX_FILE_LEN`] bytes, and Rust's allocator aborts the
+    /// host process on OOM -- which the whole reader is written to avoid (it
+    /// `try_reserve`s every buffer it builds). Moving costs nothing and cannot
+    /// fail.
+    ///
+    /// [`clear_loaded_entries`]: PersistedSymbolDict::clear_loaded_entries
+    pub(crate) fn take_loaded_entries(&mut self) -> Vec<u8> {
+        std::mem::take(&mut self.loaded_entries)
+    }
+
     /// Materialises the loaded entries as symbol byte strings in ascending-id
     /// order (entry `i` is symbol id `i`). Production recovery seeds directly from
     /// the raw [`loaded_entries`] region (via `SymbolGlobalDict::seed`), so this

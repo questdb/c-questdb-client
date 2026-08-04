@@ -830,7 +830,9 @@ impl SfaFrameQueue {
         // dictionary is read-only. A transient I/O error fails this drain attempt
         // (retryable; the orphan stays recoverable on disk) rather than truncating
         // the load-bearing side-file.
-        let persisted_symbol_dict = PersistedSymbolDict::open_recovered(&options.slot_dir)?;
+        // `mut` so the recovered entry region can be MOVED out below rather than
+        // copied; see the note at that call site.
+        let mut persisted_symbol_dict = PersistedSymbolDict::open_recovered(&options.slot_dir)?;
         let delta_dict_enabled = persisted_symbol_dict.is_some();
         let had_recovered_segments = recovered_segments.is_some();
         let (active, sealed_segments, next_fsn, allocated_segment_bytes) = match recovered_segments
@@ -887,11 +889,19 @@ impl SfaFrameQueue {
             durability_failed: AtomicBool::new(false),
         });
 
+        // MOVE the recovered region out of the handle rather than copying it. A
+        // `to_vec` here would be an infallible allocation of up to `MAX_FILE_LEN`
+        // (~2 GiB for a crafted CRC-valid side-file) on the orphan drainer's
+        // background thread, and Rust's allocator ABORTS the host process on OOM --
+        // exactly what `qwp_ws_orphan`'s `try_dup_recovered` of these same bytes
+        // exists to prevent, and what the reader's own `try_reserve`s uphold. A copy
+        // here would sit upstream of that guard, so the guard could never fire.
+        // Moving also keeps the orphan-open peak at two concurrent copies rather
+        // than three. The handle keeps its `file` / `append_offset` / `size`, which
+        // is all replay-only ever needs from it.
         let (recovered_dict_entries, recovered_dict_count) = persisted_symbol_dict
-            .as_ref()
-            .map_or_else(Default::default, |pd| {
-                (pd.loaded_entries().to_vec(), pd.size())
-            });
+            .as_mut()
+            .map_or_else(Default::default, |pd| (pd.take_loaded_entries(), pd.size()));
         Ok(Self {
             engine,
             producer: None,
