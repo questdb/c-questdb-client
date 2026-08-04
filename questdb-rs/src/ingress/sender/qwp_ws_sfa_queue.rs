@@ -515,7 +515,20 @@ impl SfaFrameQueue {
             // delta frame is rejected loudly by the send loop's torn-dict guard.
             // A transient I/O error still fails construction loudly (retryable,
             // data intact) rather than destroying a dictionary it failed to read.
-            PersistedSymbolDict::open_recovered(&options.slot_dir)?
+            //
+            // A side-file that loads ZERO entries is treated the same way. It is
+            // not a dictionary mirroring the segments: it is a header whose FIRST
+            // chunk the reader rejected (torn varint, zero header, failed CRC,
+            // inconsistent entry region, over-cap entry) -- every one of which
+            // stops the parse there and truncates -- so `open_recovered` hands
+            // back `Some(dict)` with `size() == 0`. Arming delta on it is exactly
+            // the empty-delta-dictionary state this comment forbids, and a chunk
+            // is one whole frame's new symbols, so a single lost page in the first
+            // flush reaches it. Checked here rather than in `open_existing` so a
+            // second crash cannot re-create the state via a now-header-only file.
+            // A legitimately empty dictionary loses nothing by going dense: its
+            // frames reference no symbol ids, so both modes encode identically.
+            PersistedSymbolDict::open_recovered(&options.slot_dir)?.filter(|pd| pd.size() > 0)
         } else {
             // Fresh slot: no stored frames depend on the dictionary, so a side-file
             // that cannot be opened degrades gracefully to full-dictionary
@@ -760,11 +773,15 @@ impl SfaFrameQueue {
         // that mirrors the segments) falls back to dense: a surviving dense frame
         // replays self-sufficiently and a surviving delta frame is rejected loudly
         // by the torn-dict guard, rather than seeding an empty delta dictionary
-        // that would misresolve stale ids. Replay-only has no producer, so the
-        // dictionary is read-only here. A transient I/O error fails this drain
-        // attempt (retryable; the orphan stays recoverable on disk) rather than
-        // truncating the load-bearing side-file.
-        let persisted_symbol_dict = PersistedSymbolDict::open_recovered(&options.slot_dir)?;
+        // that would misresolve stale ids. A side-file that loads ZERO entries --
+        // one whose first chunk the reader rejected -- is the same empty-delta
+        // state and takes the same dense fallback (see `open`'s recovered branch).
+        // Replay-only has no producer, so the dictionary is read-only here. A
+        // transient I/O error fails this drain attempt (retryable; the orphan
+        // stays recoverable on disk) rather than truncating the load-bearing
+        // side-file.
+        let persisted_symbol_dict =
+            PersistedSymbolDict::open_recovered(&options.slot_dir)?.filter(|pd| pd.size() > 0);
         let delta_dict_enabled = persisted_symbol_dict.is_some();
         let had_recovered_segments = recovered_segments.is_some();
         let (active, sealed_segments, next_fsn, allocated_segment_bytes) = match recovered_segments
@@ -4561,6 +4578,62 @@ mod tests {
             b"NOPEnope-poisoned-header",
             "recovery must not rewrite the corrupt side-file"
         );
+    }
+
+    #[test]
+    fn recovered_slot_whose_first_chunk_is_corrupt_falls_back_to_dense() {
+        // Regression (silent corruption): a side-file with a VALID header whose
+        // first chunk fails any reader check parses to zero entries, and
+        // `open_recovered` still returns `Some(dict)` -- `size() == 0`, file
+        // truncated back to its header. Arming delta on that is exactly the
+        // empty-delta-dictionary state the absent / bad-magic paths above exist to
+        // avoid: the segments still reference ids [0, K), and after the producer
+        // refills the truncated file with different symbols a surviving frame can
+        // resolve its ids against the WRONG dictionary on a fresh server.
+        //
+        // Per-chunk framing is what makes this reachable from one flipped byte: a
+        // chunk is one whole frame's new symbols, so a single lost page in the
+        // first flush drops every symbol that frame introduced. Under the
+        // superseded per-entry CRC only a tear in entry 0 could do this.
+        let dir = TempDir::new().unwrap();
+        let symbol_dict = dir
+            .path()
+            .join(crate::ingress::sender::qwp_ws_sfa_symbol_dict::FILE_NAME);
+
+        // A first session leaves an unresolved segment plus a real one-chunk
+        // side-file behind.
+        let mut queue = open(&dir);
+        queue.try_submit(b"unresolved-frame").unwrap();
+        drop(queue);
+        {
+            let mut pd = crate::ingress::sender::qwp_ws_sfa_symbol_dict::PersistedSymbolDict::open(
+                dir.path(),
+            )
+            .unwrap();
+            pd.append_symbol(b"alpha").unwrap();
+        }
+
+        // Same-length value flip inside the only chunk: its stored CRC goes stale,
+        // so the parse stops at chunk 0 and recovers nothing.
+        let mut bytes = std::fs::read(&symbol_dict).unwrap();
+        let idx = bytes
+            .windows(5)
+            .position(|w| w == b"alpha")
+            .expect("alpha entry present");
+        bytes[idx] = b'X';
+        std::fs::write(&symbol_dict, &bytes).unwrap();
+
+        let recovered = open(&dir);
+        assert!(
+            !recovered.is_delta_dict_enabled(),
+            "a recovered slot whose side-file loaded zero entries must fall back \
+             to dense, not arm delta on an empty dictionary"
+        );
+        assert!(
+            recovered.recovered_symbol_dict_entries().is_empty(),
+            "dense fallback seeds nothing"
+        );
+        assert_eq!(recovered.recovered_symbol_dict_count(), 0);
     }
 
     #[test]
