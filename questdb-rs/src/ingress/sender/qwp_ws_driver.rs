@@ -59,7 +59,8 @@ use super::qwp_ws_queue::{
     OutboundFrame, OutboundFrameView, QueueError, QwpReceipt, QwpReceiptStatus, SentFrame,
 };
 use super::qwp_ws_sfa_catchup::{
-    CatchUpEntryTooLarge, CatchUpStreamError, SentDictMirror, frame_delta_start,
+    CatchUpEntryTooLarge, CatchUpFrameBuildError, CatchUpStreamError, SentDictMirror,
+    frame_delta_start,
 };
 #[cfg(test)]
 use super::qwp_ws_sfa_queue::SfaMemoryQueueOptions;
@@ -181,6 +182,9 @@ pub(crate) struct QwpWsSendCore<T> {
     /// queued delta frames, so the fresh server can resolve them. Cleared once
     /// emitted.
     catch_up_pending: bool,
+    /// Consecutive local catch-up failures. Used to pace reconnects when memory
+    /// pressure or an endpoint-specific batch cap prevents frame construction.
+    catch_up_retry_strikes: usize,
     durable_ack: Option<DurableAckTracker>,
     reconnect_policy: ReconnectPolicy,
     pending_reconnect: Option<QwpWsReconnectState>,
@@ -877,6 +881,7 @@ impl<T: QwpWsCoreTransport> QwpWsSendCore<T> {
             send_cursor: SendCursor::new(max_in_flight),
             dict_mirror: SentDictMirror::new(false),
             catch_up_pending: false,
+            catch_up_retry_strikes: 0,
             durable_ack: durable_ack.then(DurableAckTracker::new),
             reconnect_policy,
             pending_reconnect: None,
@@ -1432,7 +1437,7 @@ impl<T: QwpWsCoreTransport> QwpWsSendCore<T> {
             })
             .map_err(|e| match e {
                 CatchUpStreamError::EntryTooLarge(e) => DictCatchUpError::EntryTooLarge(e),
-                CatchUpStreamError::FrameBuildFailed => DictCatchUpError::FrameBuildFailed,
+                CatchUpStreamError::FrameBuild(e) => DictCatchUpError::FrameBuild(e),
                 CatchUpStreamError::Emit(failure) => DictCatchUpError::Transport(failure),
             })
     }
@@ -1441,7 +1446,8 @@ impl<T: QwpWsCoreTransport> QwpWsSendCore<T> {
     /// and set up the cursor; otherwise a no-op. Shared by the manual send path
     /// ([`Self::drive_send_available`]) and the background runner's send loop, so
     /// both re-register the whole dictionary before replaying delta frames. A
-    /// transport drop means reconnect again; an oversized entry is terminal.
+    /// transport drop or retryable local build failure means reconnect again;
+    /// only data that exceeds the protocol's own payload limit is terminal.
     pub(crate) fn drive_catch_up(&mut self) -> Result<(), CatchUpDriveError> {
         if !self.catch_up_pending {
             return Ok(());
@@ -1450,6 +1456,7 @@ impl<T: QwpWsCoreTransport> QwpWsSendCore<T> {
         match self.emit_dict_catch_up() {
             Ok(catch_up_frames) => {
                 self.send_cursor.begin_catch_up(catch_up_frames);
+                self.catch_up_retry_strikes = 0;
                 Ok(())
             }
             Err(DictCatchUpError::Transport(failure)) => Err(CatchUpDriveError::Transport(failure)),
@@ -1460,38 +1467,50 @@ impl<T: QwpWsCoreTransport> QwpWsSendCore<T> {
                 // in publish_chunk_sfa / publish_arrow_sfa), not `ServerFlushError`
                 // ("error sent back from the server").
                 //
-                // The foreground marks this terminal (the caller learns at once to
-                // resend / investigate), whereas an orphan drainer maps the same
-                // condition to RetryLater. The asymmetry is intentional and does not
-                // abandon data: `mark_terminal` only records the error -- it never
-                // deletes the slot's segments or side-file -- so a disk slot's queued
-                // frames stay on disk and a later orphan drain / borrow re-attempts
-                // them, giving a failover to a larger-cap endpoint another chance. (A
-                // single symbol larger than a server's batch cap -- caps are MBs,
-                // symbols tiny -- is essentially unreachable in practice.)
+                // The cap belongs to the current endpoint. Reconnect through the
+                // existing endpoint tracker so failover can select a peer with a
+                // larger cap; keep the durable queue intact meanwhile.
+                let pace = self.next_catch_up_retry_pace();
+                Err(CatchUpDriveError::RetryConnection {
+                    error: error::fmt!(
+                        BatchTooLarge,
+                        "QWP/WebSocket symbol dictionary entry ({} bytes) exceeds the server \
+                         batch cap ({} bytes) during reconnect catch-up; queued data is \
+                         preserved while another connection is tried",
+                        e.entry_bytes,
+                        e.budget
+                    ),
+                    pace,
+                })
+            }
+            Err(DictCatchUpError::FrameBuild(CatchUpFrameBuildError::AllocationFailed)) => {
+                let pace = self.next_catch_up_retry_pace();
+                Err(CatchUpDriveError::RetryConnection {
+                    error: error::fmt!(
+                        SocketError,
+                        "QWP/WebSocket reconnect catch-up could not allocate a \
+                         symbol-dictionary frame; queued data is preserved while a \
+                         fresh connection is tried"
+                    ),
+                    pace,
+                })
+            }
+            Err(DictCatchUpError::FrameBuild(CatchUpFrameBuildError::PayloadTooLarge)) => {
+                // This dictionary cannot fit the protocol's u32 payload-length
+                // field. Reopening the same durable state cannot change that.
                 Err(CatchUpDriveError::Terminal(error::fmt!(
                     BatchTooLarge,
-                    "QWP/WebSocket symbol dictionary entry ({} bytes) exceeds the server \
-                 batch cap ({} bytes) during reconnect catch-up; cannot re-register \
-                 the dictionary -- resend required",
-                    e.entry_bytes,
-                    e.budget
-                )))
-            }
-            Err(DictCatchUpError::FrameBuildFailed) => {
-                // Building a catch-up frame failed (allocation, or a payload beyond
-                // the QWP u32 length field). Like EntryTooLarge this only records the
-                // error -- it never deletes the slot's segments or side-file -- so a
-                // disk slot's queued frames stay on disk for a later orphan drain /
-                // borrow to retry; no recoverable data is abandoned.
-                Err(CatchUpDriveError::Terminal(error::fmt!(
-                    SocketError,
                     "QWP/WebSocket reconnect catch-up could not build a symbol-dictionary \
-                     frame (allocation failed or payload too large); queued data is \
-                     preserved for a later retry"
+                     frame because its payload exceeds the protocol limit; queued data \
+                     is preserved but requires resend"
                 )))
             }
         }
+    }
+
+    fn next_catch_up_retry_pace(&mut self) -> Duration {
+        self.catch_up_retry_strikes = self.catch_up_retry_strikes.saturating_add(1);
+        self.reconnect_pace_for_strikes(self.catch_up_retry_strikes)
     }
 
     pub(crate) fn finish_send_result<Q: PublicationLog>(
@@ -2196,6 +2215,17 @@ impl<T: QwpWsCoreTransport> QwpWsSendCore<T> {
             Err(CatchUpDriveError::Terminal(err)) => {
                 store.mark_terminal(Some(err));
                 return Ok(Some(DriveOutcome::Terminal));
+            }
+            Err(CatchUpDriveError::RetryConnection { error, pace }) => {
+                self.pending_reconnect = Some(
+                    self.begin_reconnect(
+                        "QWP/WebSocket reconnect after catch-up build failure",
+                        ReconnectReason::RetryableFailure,
+                        error,
+                    )
+                    .with_pace(pace),
+                );
+                return Ok(Some(self.continue_reconnect(store)?));
             }
         }
         let progress = store.progress_view();
@@ -3346,19 +3376,20 @@ enum DictCatchUpError {
     /// The transport dropped while sending a catch-up frame; recover by
     /// reconnecting again.
     Transport(TransportFailure),
-    /// A single dictionary entry does not fit the server's batch cap, so the
-    /// dictionary cannot be re-registered on the fresh server; terminal.
+    /// A single dictionary entry does not fit this server's batch cap, so the
+    /// dictionary cannot be re-registered until reconnect/failover.
     EntryTooLarge(CatchUpEntryTooLarge),
-    /// A catch-up frame could not be built (allocation failed, or its payload
-    /// would overflow the QWP u32 length field). Nothing was sent; the queued
-    /// data stays persisted for a later drain / borrow to retry.
-    FrameBuildFailed,
+    /// A catch-up frame could not be built. Nothing was sent and the queued data
+    /// stays persisted.
+    FrameBuild(CatchUpFrameBuildError),
 }
 
 /// Outcome of [`QwpWsSendCore::drive_catch_up`] that the caller must act on: a
-/// transport drop (reconnect again) or a terminal error (fail the sender).
+/// transport drop, a paced reconnect for a local retryable failure, or a
+/// terminal error.
 pub(crate) enum CatchUpDriveError {
     Transport(TransportFailure),
+    RetryConnection { error: Error, pace: Duration },
     Terminal(Error),
 }
 
@@ -4573,10 +4604,10 @@ mod tests {
     }
 
     #[test]
-    fn catch_up_entry_exceeding_batch_cap_marks_terminal() {
-        // A single recovered symbol larger than the server's batch cap cannot be
-        // re-registered, so the reconnect catch-up is terminal (resend required)
-        // rather than sending an oversized frame.
+    fn catch_up_entry_exceeding_batch_cap_reconnects_without_terminalizing() {
+        // A single recovered symbol larger than this endpoint's batch cap cannot
+        // be re-registered here. Preserve the queue and reconnect so endpoint
+        // failover can select a peer with a larger cap.
         let big = vec![b'x'; 64];
         let mut seed = Vec::new();
         write_frame_varint(&mut seed, big.len() as u64);
@@ -4586,20 +4617,29 @@ mod tests {
         assert!(driver.send_core.catch_up_pending);
 
         let outcome = driver.drive_send_once().unwrap();
-        assert!(matches!(outcome, DriveOutcome::Terminal));
-        let err = driver
-            .store
-            .terminal_error()
-            .expect("terminal error recorded");
+        assert!(matches!(
+            outcome,
+            DriveOutcome::Reconnected {
+                reason: ReconnectReason::RetryableFailure
+            }
+        ));
+        assert!(!driver.store.is_terminal());
         assert!(
-            err.msg().contains("exceeds the server") && err.msg().contains("batch cap"),
-            "msg: {}",
-            err.msg()
+            driver.send_core.catch_up_pending,
+            "successful reconnect must re-arm catch-up"
         );
-        // Decided client-side from the advertised cap (nothing sent back), so it
-        // is BatchTooLarge -- the same code the foreground uses for an oversize
-        // frame -- not ServerFlushError.
-        assert_eq!(err.code(), ErrorCode::BatchTooLarge);
+        assert!(
+            driver.send_core.transport.sent_payloads().is_empty(),
+            "oversized catch-up entry must not be sent"
+        );
+        assert_eq!(driver.send_core.catch_up_retry_strikes, 1);
+
+        // Model failover to an uncapped endpoint. The same intact dictionary is
+        // retried, emitted, and clears the retry streak.
+        driver.send_core.transport.server_max_batch_size = 0;
+        driver.drive_send_once().unwrap();
+        assert_eq!(driver.send_core.transport.sent_payloads().len(), 1);
+        assert_eq!(driver.send_core.catch_up_retry_strikes, 0);
     }
 
     #[test]

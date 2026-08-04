@@ -1204,6 +1204,15 @@ where
             Err(CatchUpDriveError::Transport(failure)) => {
                 return self.apply_transport_failure(shared, stop, failure);
             }
+            Err(CatchUpDriveError::RetryConnection { error, pace }) => {
+                return self.reconnect_with_policy(
+                    shared,
+                    stop,
+                    ReconnectReason::RetryableFailure,
+                    error,
+                    pace,
+                );
+            }
             Err(CatchUpDriveError::Terminal(err)) => {
                 // A terminal catch-up failure (the dictionary cannot be
                 // re-registered -- resend required) is a storage/data-integrity

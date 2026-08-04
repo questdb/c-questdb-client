@@ -36,6 +36,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use crate::ErrorCode;
+use crate::ingress::sender::fail_next_catch_up_allocation_for_test;
 use crate::ingress::sender::has_any_sfa_file as slot_has_sfa_file;
 use crate::ingress::sender::qwp_ws::fail_next_recovered_dict_copy_for_test;
 use crate::ingress::{
@@ -1160,6 +1161,49 @@ struct RoleTerminalThenDrainOrphanServer {
     handle: thread::JoinHandle<()>,
 }
 
+struct CatchUpFailureThenDrainOrphanServer {
+    port: u16,
+    retried_rx: mpsc::Receiver<()>,
+    drained_rx: mpsc::Receiver<Vec<u8>>,
+    handle: thread::JoinHandle<()>,
+}
+
+fn spawn_catch_up_failure_then_drain_orphan_server(
+    first_max_batch_size: Option<usize>,
+) -> CatchUpFailureThenDrainOrphanServer {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let (retried_tx, retried_rx) = mpsc::channel();
+    let (drained_tx, drained_rx) = mpsc::channel();
+
+    let handle = thread::spawn(move || {
+        let (mut foreground, _) = listener.accept().unwrap();
+        perform_server_upgrade(&mut foreground).unwrap();
+
+        let (mut failed_orphan, _) = listener.accept().unwrap();
+        upgrade_mock_stream_with_max_batch_size(&mut failed_orphan, first_max_batch_size);
+
+        let (mut retry_orphan, _) = listener.accept().unwrap();
+        retried_tx.send(()).unwrap();
+        drop(failed_orphan);
+        retry_orphan
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        perform_server_upgrade(&mut retry_orphan).unwrap();
+        let (_fin, _opcode, _catch_up) = read_frame(&mut retry_orphan).unwrap();
+        let (_fin, _opcode, drained_payload) = read_frame(&mut retry_orphan).unwrap();
+        write_qwp_ok_response(&mut retry_orphan, FIRST_WIRE_SEQUENCE + 1).unwrap();
+        drained_tx.send(drained_payload).unwrap();
+    });
+
+    CatchUpFailureThenDrainOrphanServer {
+        port,
+        retried_rx,
+        drained_rx,
+        handle,
+    }
+}
+
 fn spawn_role_terminal_then_drain_orphan_server() -> RoleTerminalThenDrainOrphanServer {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();
@@ -1391,6 +1435,10 @@ fn seed_orphan_slot(sf_dir: &Path) {
 }
 
 fn seed_orphan_slot_named(sf_dir: &Path, sender_id: &str) {
+    seed_orphan_slot_named_with_symbol(sf_dir, sender_id, "old");
+}
+
+fn seed_orphan_slot_named_with_symbol(sf_dir: &Path, sender_id: &str, symbol: &str) {
     let seed_port = spawn_upgrade_only_server();
     let seed_conf = format!(
         "ws::addr=127.0.0.1:{seed_port};qwp_ws_progress=manual;\
@@ -1405,7 +1453,7 @@ fn seed_orphan_slot_named(sf_dir: &Path, sender_id: &str) {
     seed_buf
         .table("orphaned")
         .unwrap()
-        .symbol("src", "old")
+        .symbol("src", symbol)
         .unwrap()
         .column_i64("value", 42)
         .unwrap()
@@ -3232,6 +3280,95 @@ fn qwp_ws_background_role_terminal_reopens_and_drains_orphan() {
         "stale .last_error after drain: {}",
         std::fs::read_to_string(&last_error).unwrap_or_default()
     );
+
+    drop(sender);
+    server.handle.join().unwrap();
+}
+
+#[test]
+fn qwp_ws_background_catch_up_allocation_failure_reconnects_and_drains_orphan() {
+    let sf_dir = tempfile::TempDir::new().unwrap();
+    seed_orphan_slot_named_with_symbol(sf_dir.path(), "orphan", "qdb-test-catch-up-allocation");
+
+    let server = spawn_catch_up_failure_then_drain_orphan_server(None);
+    fail_next_catch_up_allocation_for_test();
+    let drain_conf = format!(
+        "ws::addr=127.0.0.1:{};\
+         sf_dir={};sender_id=primary;drain_orphans=on;\
+         max_background_drainers=1;\
+         reconnect_initial_backoff_millis=10;reconnect_max_backoff_millis=20;\
+         sf_max_segment_bytes=256;sf_max_total_bytes=1024;",
+        server.port,
+        sf_dir.path().display()
+    );
+    let sender = SenderBuilder::from_conf(&drain_conf)
+        .unwrap()
+        .build()
+        .unwrap();
+
+    server
+        .retried_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("catch-up allocation failure did not trigger a reconnect");
+    assert!(
+        !server
+            .drained_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("catch-up allocation failure abandoned the orphan slot")
+            .is_empty()
+    );
+
+    let orphan_slot = sf_dir.path().join("orphan");
+    let last_error = orphan_slot.join(".last_error");
+    assert!(wait_until(Duration::from_secs(5), || {
+        !slot_has_sfa_file(&orphan_slot) && !last_error.exists()
+    }));
+    assert!(!orphan_slot.join(".failed").exists());
+
+    drop(sender);
+    server.handle.join().unwrap();
+}
+
+#[test]
+fn qwp_ws_background_catch_up_batch_cap_reconnects_and_drains_orphan() {
+    let sf_dir = tempfile::TempDir::new().unwrap();
+    seed_orphan_slot(sf_dir.path());
+
+    // A 28-byte advertised cap leaves a one-byte catch-up entry budget. The
+    // seeded symbol cannot fit, while the next connection advertises no cap.
+    let server = spawn_catch_up_failure_then_drain_orphan_server(Some(28));
+    let drain_conf = format!(
+        "ws::addr=127.0.0.1:{};\
+         sf_dir={};sender_id=primary;drain_orphans=on;\
+         max_background_drainers=1;\
+         reconnect_initial_backoff_millis=10;reconnect_max_backoff_millis=20;\
+         sf_max_segment_bytes=256;sf_max_total_bytes=1024;",
+        server.port,
+        sf_dir.path().display()
+    );
+    let sender = SenderBuilder::from_conf(&drain_conf)
+        .unwrap()
+        .build()
+        .unwrap();
+
+    server
+        .retried_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("catch-up batch cap did not trigger a reconnect");
+    assert!(
+        !server
+            .drained_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("catch-up BatchTooLarge abandoned the orphan slot")
+            .is_empty()
+    );
+
+    let orphan_slot = sf_dir.path().join("orphan");
+    let last_error = orphan_slot.join(".last_error");
+    assert!(wait_until(Duration::from_secs(5), || {
+        !slot_has_sfa_file(&orphan_slot) && !last_error.exists()
+    }));
+    assert!(!orphan_slot.join(".failed").exists());
 
     drop(sender);
     server.handle.join().unwrap();
