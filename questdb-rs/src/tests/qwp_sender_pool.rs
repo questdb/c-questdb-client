@@ -3683,6 +3683,17 @@ fn store_and_forward_file_mode_writes_symbols_ahead_to_side_file() {
         alpha_pos < bravo_pos,
         "write-ahead must persist both symbols in id order"
     );
+    // Ordering alone stays green if the writer coalesced both frames into one
+    // chunk or split each symbol into its own. Pin the framing itself: two
+    // flushes are two frames, hence exactly two chunks of one symbol each. This
+    // is the end-to-end half of the one-chunk-per-frame invariant that makes the
+    // per-chunk CRC's blast radius safe (see `qwp_ws_sfa_symbol_dict`'s module
+    // docs); `each_append_is_exactly_one_chunk` pins the writer half.
+    assert_eq!(
+        crate::ingress::sender::qwp_ws_sfa_symbol_dict::parse_chunks(&side_file),
+        vec![vec![b"alpha".to_vec()], vec![b"bravo".to_vec()]],
+        "one chunk per frame, each carrying exactly that frame's new symbols"
+    );
 }
 
 #[test]
@@ -6344,6 +6355,16 @@ fn store_and_forward_file_mode_arrow_symbol_writes_symbols_ahead_to_side_file() 
     assert!(
         alpha_pos < bravo_pos,
         "Arrow write-ahead must persist both symbols in id order"
+    );
+    // Pin the framing the comment above claims, which ordering alone cannot: ONE
+    // chunk carrying BOTH symbols, versus the row path's two. This is the shape
+    // that makes the per-chunk CRC's coarser blast radius safe -- the chunk is
+    // exactly this frame's symbol delta, so a tear in it invalidates exactly this
+    // frame (see `qwp_ws_sfa_symbol_dict`'s module docs).
+    assert_eq!(
+        crate::ingress::sender::qwp_ws_sfa_symbol_dict::parse_chunks(&side_file),
+        vec![vec![b"alpha".to_vec(), b"bravo".to_vec()]],
+        "an Arrow batch is one frame, so its new symbols share one chunk"
     );
 }
 

@@ -800,12 +800,60 @@ fn is_consistent_entry_region(buf: &[u8], start: usize, bytes: usize, count: u64
     p == limit
 }
 
+/// Splits a side-file into its chunks, each as the list of symbols it carries,
+/// so a test can assert on chunk *framing* -- how many appends the file holds
+/// and what each one carried -- rather than only on the flat entry list
+/// [`read_loaded_symbols`](PersistedSymbolDict::read_loaded_symbols) returns.
+/// That distinction is what pins the one-chunk-per-frame invariant the
+/// per-chunk blast-radius argument rests on (see the module docs); assertions
+/// over the flat list stay green if the writer coalesces or splits chunks.
+///
+/// Mirrors [`open_existing`](PersistedSymbolDict::open_existing)'s walk and
+/// panics on a malformed file -- callers are asserting on a file a correct
+/// writer produced.
+#[cfg(test)]
+pub(crate) fn parse_chunks(path: &Path) -> Vec<Vec<Vec<u8>>> {
+    let buf = fs::read(path).unwrap();
+    let mut pos = HEADER_SIZE as usize;
+    let mut chunks = Vec::new();
+    while pos < buf.len() {
+        let (entry_count, after_count) = decode_varint(&buf, pos).expect("entryCount varint");
+        let (entry_bytes, entries_start) = decode_varint(&buf, after_count).expect("entryBytes");
+        let chunk_end = entries_start + entry_bytes as usize;
+        let mut entries = Vec::new();
+        let mut p = entries_start;
+        for _ in 0..entry_count {
+            let (len, after_len) = decode_varint(&buf, p).expect("entry length varint");
+            let end = after_len + len as usize;
+            entries.push(buf[after_len..end].to_vec());
+            p = end;
+        }
+        assert_eq!(p, chunk_end, "entry region consumed exactly");
+        chunks.push(entries);
+        pos = chunk_end + CRC_SIZE;
+    }
+    chunks
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn tmp_slot() -> tempfile::TempDir {
         tempfile::tempdir().unwrap()
+    }
+
+    /// Builds a CRC-valid chunk from a raw entry region and an `entryCount` that
+    /// need not agree with it, so a test can pin what the reader does with a
+    /// header no correct writer would emit.
+    fn crafted_chunk(entry_count: u64, entries: &[u8]) -> Vec<u8> {
+        let mut chunk = Vec::new();
+        write_varint(&mut chunk, entry_count);
+        write_varint(&mut chunk, entries.len() as u64);
+        chunk.extend_from_slice(entries);
+        let crc = crc32c::crc32c_append(0, &chunk);
+        chunk.extend_from_slice(&crc.to_le_bytes());
+        chunk
     }
 
     #[test]
@@ -1607,5 +1655,283 @@ mod tests {
         // The header was rewritten to the current version.
         let bytes = fs::read(&path).unwrap();
         assert_eq!(bytes[4], VERSION);
+    }
+
+    #[test]
+    fn open_recovered_rejects_an_unknown_version_without_touching_the_file() {
+        // `unknown_version_is_recreated_fresh` covers `open` (fresh re-create).
+        // The RECOVERED path is the one the format switch makes live: every
+        // pre-existing v2 side-file takes it on the first run after the change,
+        // beside segments that already reference ids [0, K). It must report "no
+        // usable dictionary" so the caller falls back to dense, and -- like the
+        // bad-magic case -- leave the bytes alone rather than rewriting a file
+        // whose contents it could not interpret.
+        let dir = tmp_slot();
+        let path = dir.path().join(FILE_NAME);
+        // Valid magic, superseded per-entry v2 layout, with a v2-shaped body.
+        let mut file = Vec::new();
+        file.extend_from_slice(&FILE_MAGIC.to_le_bytes());
+        file.push(2); // version
+        file.extend_from_slice(&[0, 0, 0]); // reserved
+        let mut entry = Vec::new();
+        write_varint(&mut entry, 5);
+        entry.extend_from_slice(b"alpha");
+        let crc = crc32c::crc32c_append(0, &entry);
+        entry.extend_from_slice(&crc.to_le_bytes());
+        file.extend_from_slice(&entry);
+        fs::write(&path, &file).unwrap();
+
+        assert!(
+            PersistedSymbolDict::open_recovered(dir.path())
+                .unwrap()
+                .is_none(),
+            "an unknown-version file yields no dictionary on the recovered path"
+        );
+        assert_eq!(
+            fs::read(&path).unwrap(),
+            file,
+            "recovery must not rewrite a file it rejected"
+        );
+    }
+
+    #[test]
+    fn a_chunk_whose_entries_leave_trailing_slack_is_rejected() {
+        // `is_consistent_entry_region` requires the region be consumed EXACTLY,
+        // not merely that entryCount entries fit. This is the complementary shape
+        // to `inconsistent_chunk_header_is_rejected_not_misattributed` (which
+        // claims MORE entries than it holds): here entryCount entries consume
+        // FEWER bytes than entryBytes, leaving slack that the walk's `end > limit`
+        // branch never sees. Only the final `p == limit` rejects it.
+        //
+        // Adopting it would be silent id-map corruption, not a cosmetic slip:
+        // `open` copies `buf[entries_start..chunk_end]` into `loaded_entries`
+        // verbatim, slack included, and `SentDictMirror::for_each_catch_up_frame`
+        // walks that region to its END rather than by entry count -- so the slack
+        // parses as phantom entries and shifts every id above it.
+        // Mutation-checked: replacing `p == limit` with `true` fails this test.
+        let dir = tmp_slot();
+        let path = dir.path().join(FILE_NAME);
+        {
+            let mut d = PersistedSymbolDict::open(dir.path()).unwrap();
+            d.append_symbol(b"good").unwrap();
+        }
+        let good_len = fs::metadata(&path).unwrap().len();
+        {
+            // One well-formed entry (`[len=1]'x'`, 2 bytes) in a 5-byte region.
+            let mut f = OpenOptions::new().append(true).open(&path).unwrap();
+            f.write_all(&crafted_chunk(1, &[1, b'x', 0xAA, 0xBB, 0xCC]))
+                .unwrap();
+        }
+
+        let d = PersistedSymbolDict::open(dir.path()).unwrap();
+        assert_eq!(d.read_loaded_symbols(), vec![b"good".to_vec()]);
+        assert_eq!(d.size(), 1);
+        assert_eq!(
+            d.loaded_entries(),
+            &b"\x04good"[..],
+            "no slack byte reaches the recovered entry region"
+        );
+        assert_eq!(
+            fs::metadata(&path).unwrap().len(),
+            good_len,
+            "the slack chunk is truncated away"
+        );
+    }
+
+    #[test]
+    fn a_chunk_whose_entry_bytes_would_overflow_is_rejected_without_panicking() {
+        // A crafted `entryBytes` near u64::MAX is a legal 10-byte LEB128 that
+        // `decode_varint` accepts, so only the two `checked_add`s stand between it
+        // and `&buf[chunk_start..chunk_end]`. Without them the wrapped end slices
+        // backwards and panics -- a process abort driven purely by on-disk state,
+        // since questdb-rs-ffi builds with `panic = "abort"` and release leaves
+        // `overflow-checks` off so the add itself would not trap.
+        //
+        // Both arms are covered: `u64::MAX` overflows `entries_start +
+        // entry_bytes`, while `u64::MAX - entries_start` passes that and overflows
+        // only the later `+ CRC_SIZE`.
+        // Mutation-checked: either `checked_add` -> `wrapping_add` fails this test.
+        let dir = tmp_slot();
+        let path = dir.path().join(FILE_NAME);
+        {
+            let mut d = PersistedSymbolDict::open(dir.path()).unwrap();
+            d.append_symbol(b"good").unwrap();
+        }
+        let good_len = fs::metadata(&path).unwrap().len();
+        // entryCount varint (1 byte) + a 10-byte entryBytes varint.
+        let entries_start = good_len + 1 + 10;
+
+        for entry_bytes in [u64::MAX, u64::MAX - entries_start] {
+            let mut chunk = Vec::new();
+            write_varint(&mut chunk, 1); // entryCount
+            write_varint(&mut chunk, entry_bytes); // absurd entryBytes
+            let crc = crc32c::crc32c_append(0, &chunk);
+            chunk.extend_from_slice(&crc.to_le_bytes());
+            {
+                let mut f = OpenOptions::new().append(true).open(&path).unwrap();
+                f.write_all(&chunk).unwrap();
+            }
+
+            let d = PersistedSymbolDict::open(dir.path()).unwrap();
+            assert_eq!(d.read_loaded_symbols(), vec![b"good".to_vec()]);
+            assert_eq!(d.size(), 1);
+            assert_eq!(
+                fs::metadata(&path).unwrap().len(),
+                good_len,
+                "the overflowing chunk is truncated away, leaving the good prefix"
+            );
+        }
+    }
+
+    #[test]
+    fn a_symbol_of_exactly_the_per_entry_cap_round_trips() {
+        // The reader rejects `len > MAX_ENTRY_LEN`; `intern` accepts a symbol of
+        // exactly that length (`symbol_dict_intern_rejects_symbols_above_the_
+        // persisted_entry_cap` pins "exactly at the cap is accepted"). Only this
+        // test pins the boundary on the READER side --
+        // `over_cap_entry_len_is_rejected_at_open` pins MAX_ENTRY_LEN + 1 as
+        // rejected, so `>` could silently become `>=` with the suite still green.
+        // Writer and reader would then disagree at exactly 1 MiB: a legitimately
+        // written symbol is dropped at recovery, the file truncated there, and
+        // every frame above it stranded at the torn-dict guard.
+        let dir = tmp_slot();
+        let at_cap = vec![b'q'; MAX_ENTRY_LEN as usize];
+        {
+            let mut d = PersistedSymbolDict::open(dir.path()).unwrap();
+            d.append_symbols(&[b"pre".as_slice(), at_cap.as_slice()])
+                .unwrap();
+            assert_eq!(d.size(), 2);
+        }
+
+        let d = PersistedSymbolDict::open(dir.path()).unwrap();
+        assert_eq!(d.size(), 2, "a symbol at exactly the cap survives recovery");
+        assert_eq!(d.read_loaded_symbols(), vec![b"pre".to_vec(), at_cap]);
+    }
+
+    #[test]
+    fn a_chunk_with_multi_byte_header_varints_round_trips() {
+        // The header back-fill right-aligns two varints inside
+        // MAX_CHUNK_HEADER_LEN and writes from `header_start`, so every offset it
+        // computes depends on both varints' widths. Every other writer test in
+        // this module produces a 1+1-byte header (`header_start == 8`), which
+        // makes that arithmetic a constant and leaves `encode_varint`'s
+        // continuation loop unexercised -- yet production crosses into a 2-byte
+        // entryBytes at a mere 128 bytes of entries, i.e. an ordinary flush.
+        //
+        // 200 entries of 100 bytes: entryCount 200 (2-byte varint) and entryBytes
+        // 20_200 (3-byte varint), so header_len == 5.
+        // Mutation-checked: hardcoding `header_start = MAX_CHUNK_HEADER_LEN - 2`
+        // fails this test.
+        let dir = tmp_slot();
+        let path = dir.path().join(FILE_NAME);
+        let symbols: Vec<Vec<u8>> = (0..200u32)
+            .map(|i| {
+                let mut s = format!("sym-{i:03}-").into_bytes();
+                s.resize(100, b'p');
+                s
+            })
+            .collect();
+        {
+            let mut d = PersistedSymbolDict::open(dir.path()).unwrap();
+            let refs: Vec<&[u8]> = symbols.iter().map(|s| s.as_slice()).collect();
+            d.append_symbols(&refs).unwrap();
+            assert_eq!(d.size(), 200);
+        }
+
+        // Pin that this really is the multi-byte-header case, so a later change to
+        // the symbol count or width cannot silently turn it back into 1+1.
+        let bytes = fs::read(&path).unwrap();
+        let (entry_count, after_count) = decode_varint(&bytes, HEADER_SIZE as usize).unwrap();
+        let (entry_bytes, entries_start) = decode_varint(&bytes, after_count).unwrap();
+        assert_eq!(entry_count, 200);
+        assert_eq!(entry_bytes, 200 * 101);
+        assert_eq!(
+            entries_start - HEADER_SIZE as usize,
+            5,
+            "a 2-byte entryCount followed by a 3-byte entryBytes"
+        );
+
+        let d = PersistedSymbolDict::open(dir.path()).unwrap();
+        assert_eq!(d.size(), 200);
+        assert_eq!(d.read_loaded_symbols(), symbols);
+        assert_eq!(parse_chunks(&path).len(), 1, "one append is one chunk");
+    }
+
+    #[test]
+    fn encode_varint_matches_write_varint_across_widths() {
+        // `encode_varint` is the chunk-header back-fill's encoder: it writes into
+        // a fixed buffer and returns the width the back-fill uses as an offset, so
+        // a wrong width silently misplaces the header. `varint_round_trip_across_
+        // widths` exercises `write_varint` (the Vec form the entry region uses),
+        // not this one. Pin the two against each other, and against the decoder,
+        // at every continuation boundary -- including u64::MAX, which is exactly
+        // the 10 bytes MAX_CHUNK_HEADER_LEN reserves.
+        for value in [
+            0u64,
+            1,
+            0x7F,
+            0x80,
+            300,
+            16_383,
+            16_384,
+            2_097_151,
+            2_097_152,
+            u32::MAX as u64,
+            u64::MAX,
+        ] {
+            let mut buf = [0u8; MAX_CHUNK_HEADER_LEN];
+            let len = encode_varint(&mut buf, value);
+
+            let mut expected = Vec::new();
+            write_varint(&mut expected, value);
+            assert_eq!(len, expected.len(), "width differs for {value}");
+            assert_eq!(&buf[..len], &expected[..], "encoding differs for {value}");
+
+            let (decoded, next) = decode_varint(&buf, 0).expect("decodes");
+            assert_eq!(decoded, value);
+            assert_eq!(next, len);
+        }
+    }
+
+    #[test]
+    fn each_append_is_exactly_one_chunk() {
+        // The per-chunk blast-radius argument rests on chunks and frame deltas
+        // being written one-for-one: the producer calls `append_symbols*` once per
+        // frame with exactly that frame's new symbols, so every chunk boundary is
+        // some frame's `delta_start`. Nothing pinned the writer half of that --
+        // regressing to one chunk per symbol, or coalescing two appends into one
+        // chunk, left every test in this module green because they all assert only
+        // the flat, concatenated entry list.
+        //
+        // The empty append is load-bearing too: `open`'s `entry_count == 0` guard
+        // is a hard stop that truncates, so if the writer ever emitted a `[0][0]`
+        // chunk for a frame that interns nothing, every side-file would be
+        // truncated at the second flush of almost any workload.
+        let dir = tmp_slot();
+        let path = dir.path().join(FILE_NAME);
+        {
+            let mut d = PersistedSymbolDict::open(dir.path()).unwrap();
+            d.append_symbols(&[b"alpha".as_slice(), b"bravo".as_slice()])
+                .unwrap();
+            d.append_symbol(b"charlie").unwrap();
+            let len_before_empty = fs::metadata(&path).unwrap().len();
+            d.append_symbols(&[]).unwrap(); // a frame introducing no symbols
+            assert_eq!(
+                fs::metadata(&path).unwrap().len(),
+                len_before_empty,
+                "an empty append must write no chunk at all"
+            );
+            d.append_symbols(&[b"delta".as_slice()]).unwrap();
+        }
+
+        assert_eq!(
+            parse_chunks(&path),
+            vec![
+                vec![b"alpha".to_vec(), b"bravo".to_vec()],
+                vec![b"charlie".to_vec()],
+                vec![b"delta".to_vec()],
+            ],
+            "one chunk per non-empty append, carrying exactly that append's symbols"
+        );
     }
 }
