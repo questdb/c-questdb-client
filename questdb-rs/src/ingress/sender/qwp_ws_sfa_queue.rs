@@ -4973,6 +4973,117 @@ mod tests {
     }
 
     #[test]
+    fn a_second_crash_after_a_frame_rebuilt_recovery_reads_the_dict_in_id_order() {
+        // Regression, second-order, and the one that actually bites: the rebuild
+        // leaves the producer ahead of the side-file, so it is the NEXT write-ahead
+        // that has to close the gap. If that write-ahead anchors to the producer's
+        // id instead of the file's tip, the symbol it appends lands at the file
+        // position of a DIFFERENT id -- and nothing notices until the crash after
+        // that, an ordinary process restart, which is exactly what
+        // store-and-forward promises to survive (the original tear needed a host
+        // crash).
+        //
+        // Walk both crashes end to end through the real publisher. Before the
+        // anchoring fix this read back `[charlie, bravo, charlie]`: id 0 aliased
+        // onto charlie, alpha lost, and a duplicate that makes
+        // `SymbolGlobalDict::seed` refuse to open the slot ever again --
+        // permanently stranding its queued frames.
+        use crate::ingress::sender::qwp_ws_sfa_catchup::make_delta_frame;
+        use crate::ingress::sender::qwp_ws_sfa_publisher::SfaForegroundPublisher;
+        use crate::ingress::sender::qwp_ws_sfa_symbol_dict::PersistedSymbolDict;
+
+        let dir = TempDir::new().unwrap();
+        let symbol_dict = dir
+            .path()
+            .join(crate::ingress::sender::qwp_ws_sfa_symbol_dict::FILE_NAME);
+
+        // Session 1: two delta frames introduce alpha (id 0) and bravo (id 1),
+        // each write-ahead as its own chunk, and are left unresolved.
+        let mut queue = open(&dir);
+        queue
+            .try_submit(&make_delta_frame(0, &[b"alpha".as_slice()], b""))
+            .unwrap();
+        queue
+            .try_submit(&make_delta_frame(1, &[b"bravo".as_slice()], b""))
+            .unwrap();
+        drop(queue);
+        {
+            let mut pd = PersistedSymbolDict::open(dir.path()).unwrap();
+            pd.append_symbol(b"alpha").unwrap();
+            pd.append_symbol(b"bravo").unwrap();
+        }
+
+        // Crash 1 (host/power): a same-length flip tears chunk 0, so the reader
+        // stops there and the side-file contributes NOTHING. Both ids have to come
+        // back from the frames' own delta sections.
+        let mut bytes = std::fs::read(&symbol_dict).unwrap();
+        let idx = bytes
+            .windows(5)
+            .position(|w| w == b"alpha")
+            .expect("alpha entry present");
+        bytes[idx] = b'X';
+        std::fs::write(&symbol_dict, &bytes).unwrap();
+
+        // Session 2: recover and wire the producer exactly as
+        // `PooledSenderCore::new_store_and_forward` does -- take the handle, seed
+        // from the rebuilt entries -- then publish one frame introducing a third
+        // symbol.
+        let mut recovered = open(&dir);
+        assert_eq!(recovered.recovered_symbol_dict_count(), 2);
+        let entries = recovered.recovered_symbol_dict_entries().to_vec();
+        let count = recovered.recovered_symbol_dict_count();
+        let mut foreground =
+            SfaForegroundPublisher::new(true, recovered.take_persisted_symbol_dict());
+        foreground.seed(&entries, count).unwrap();
+        foreground
+            .encode_persist_publish(
+                usize::MAX,
+                |payload, global, _delta| {
+                    global.intern(b"charlie")?;
+                    payload.extend_from_slice(b"frame");
+                    Ok(())
+                },
+                |_| Ok(1),
+            )
+            .unwrap();
+        drop(foreground);
+        drop(recovered);
+
+        // Crash 2 is an ORDINARY restart -- no corruption injected. The side-file
+        // must still map id i to entry i.
+        let reopened = PersistedSymbolDict::open_recovered(dir.path())
+            .unwrap()
+            .expect("the healed side-file must open");
+        assert_eq!(
+            reopened.read_loaded_symbols(),
+            vec![b"alpha".to_vec(), b"bravo".to_vec(), b"charlie".to_vec()],
+            "the side-file must read back in id order after the write-ahead healed \
+             it; anchoring that write-ahead to the producer instead yields \
+             [charlie, bravo, charlie]"
+        );
+        drop(reopened);
+
+        // ...and the slot still opens, with a recovered dictionary a producer can
+        // resume from. Anchored to the producer this is where the duplicate lands
+        // and `SymbolGlobalDict::seed` starts refusing the slot outright.
+        let session_three = open(&dir);
+        assert_eq!(
+            session_three.recovered_symbol_dict_entries(),
+            &[
+                5, b'a', b'l', b'p', b'h', b'a', 5, b'b', b'r', b'a', b'v', b'o', 7, b'c', b'h',
+                b'a', b'r', b'l', b'i', b'e'
+            ][..],
+            "recovered dictionary must be [alpha, bravo, charlie] in id order"
+        );
+        crate::ingress::buffer::SymbolGlobalDict::new()
+            .seed(
+                session_three.recovered_symbol_dict_entries(),
+                session_three.recovered_symbol_dict_count(),
+            )
+            .expect("a healed dictionary seeds cleanly -- no duplicate, no gap");
+    }
+
+    #[test]
     fn recovered_slot_stops_the_rebuild_at_a_genuine_id_gap() {
         // The rebuild must not paper over a real gap. When the surviving frames
         // base ABOVE the side-file's prefix, the ids below their `delta_start` were

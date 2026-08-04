@@ -322,6 +322,60 @@ mod tests {
     }
 
     #[test]
+    fn file_mode_write_ahead_heals_a_side_file_short_of_the_seeded_dictionary() {
+        // The standalone row sender reaches the same frame-rebuilt recovery the
+        // pooled core does -- `connect_qwp_ws_background_state` seeds this encoder
+        // from `SfaFrameQueue::recovered_symbol_dict_entries` (which is the
+        // side-file's prefix EXTENDED by the surviving frames' own delta sections)
+        // and `connect_qwp_ws` then hands it the side-file handle, still at the
+        // shorter prefix. So this path needs the same write-ahead anchoring as
+        // `SymbolPublishState::persist_new_symbols`, and gets its own test because
+        // it is a separate implementation.
+        //
+        // Anchoring to the producer's pre-frame id would append `bravo` (id 1) at
+        // file position 0, aliasing id 0 onto it and losing `alpha` for good.
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let mut seed_file = PersistedSymbolDict::open(dir.path()).unwrap();
+            seed_file.append_symbol(b"alpha").unwrap();
+        }
+        let pd = PersistedSymbolDict::open(dir.path()).unwrap();
+        assert_eq!(pd.size(), 1, "the file holds the intact prefix only");
+
+        let mut encoder = QwpWsReplayEncoder::new(1);
+        encoder.set_delta_dict_enabled(true);
+        // Seeded with TWO ids -- the frame-derived rebuild recovered `bravo` from a
+        // surviving frame -- while the handle above is still at one.
+        encoder
+            .seed_global_dict(
+                &[
+                    5, b'a', b'l', b'p', b'h', b'a', 5, b'b', b'r', b'a', b'v', b'o',
+                ],
+                2,
+            )
+            .unwrap();
+        encoder.set_persisted_symbol_dict(Some(pd));
+
+        encoder
+            .encode_and_publish(&one_symbol_buffer("charlie"), usize::MAX, |_payload| Ok(1))
+            .unwrap();
+
+        let pd = encoder.persisted_symbol_dict.take().expect("handle kept");
+        assert_eq!(
+            pd.size(),
+            3,
+            "the write-ahead must re-persist the rebuilt id 1 alongside the new id 2"
+        );
+        drop(pd);
+        let reopened = PersistedSymbolDict::open(dir.path()).unwrap();
+        assert_eq!(
+            reopened.read_loaded_symbols(),
+            vec![b"alpha".to_vec(), b"bravo".to_vec(), b"charlie".to_vec()],
+            "entry i must be symbol id i"
+        );
+    }
+
+    #[test]
     fn replay_encoder_max_size_accounts_for_connection_global_symbol_prefix() {
         let mut encoder = QwpWsReplayEncoder::new(1);
         for idx in 0..130 {
