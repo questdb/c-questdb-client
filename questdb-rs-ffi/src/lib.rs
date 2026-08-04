@@ -5014,6 +5014,52 @@ mod tests {
         );
     }
 
+    #[test]
+    fn mirrors_of_the_c_error_code_enum_are_complete() {
+        // `c_header_line_sender_enum_matches_rust` guards only `line_sender.h`.
+        // Two more hand-maintained mirrors of the same enum ship alongside it and
+        // had no guard at all, so a newly appended code compiled fine while a C++
+        // or Python caller could not name it. Both are kept in step here.
+        //
+        // Neither mirror can hold a WRONG value -- the C++ entries alias the C
+        // enumerators and the Python ones are only read back from the library --
+        // so completeness is the whole risk, and it is exactly what silently
+        // regressed: `symbol_dict_full` reached `line_sender.h`, the C++ header
+        // and the C test, but not the Python mirror.
+        let cpp = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../include/questdb/ingress/line_sender_core.hpp"
+        ));
+        let py = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../system_test/arrow_ffi.py"
+        ));
+        for (_code, variant, disc) in c_error_code_abi() {
+            let full = format!("{variant:?}");
+            let short = full
+                .strip_prefix("line_sender_error_")
+                .expect("every variant carries the ABI prefix");
+
+            // C++: `<short> = ::<full>,` in `enum class error_code : int`.
+            let cpp_needle = format!("{short} = ::{full},");
+            assert!(
+                cpp.contains(&cpp_needle),
+                "include/questdb/ingress/line_sender_core.hpp is missing \
+                 `{cpp_needle}` -- a code was appended without updating the C++ \
+                 `error_code` enum",
+            );
+
+            // Python: `<SHORT> = <disc>` in `ClientErrorCode`.
+            let py_needle = format!("{} = {disc}\n", short.to_uppercase());
+            assert!(
+                py.contains(&py_needle),
+                "system_test/arrow_ffi.py is missing `{}` -- a code was appended \
+                 without updating the `ClientErrorCode` mirror",
+                py_needle.trim_end(),
+            );
+        }
+    }
+
     fn utf8(bytes: &'static [u8]) -> line_sender_utf8 {
         line_sender_utf8 {
             len: bytes.len(),
