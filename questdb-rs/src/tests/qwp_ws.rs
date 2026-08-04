@@ -2734,11 +2734,21 @@ fn qwp_ws_orphan_dict_copy_oom_retries_without_failed_sentinel() {
     fail_next_recovered_dict_copy_for_test();
     assert!(sender.drive_once().unwrap());
 
+    let last_error = orphan_slot.join(".last_error");
     assert!(
         !orphan_slot.join(".failed").exists(),
         "transient dictionary allocation failure must not quarantine the slot"
     );
-    assert!(orphan_slot.join(".last_error").exists());
+    let retry_reason = std::fs::read_to_string(&last_error)
+        .expect("transient dictionary allocation failure must record its retry reason");
+    assert!(
+        retry_reason.contains("injected recovered symbol dictionary allocation failure"),
+        "unexpected orphan retry reason: {retry_reason}"
+    );
+    assert!(
+        slot_has_sfa_file(&orphan_slot),
+        "a retryable allocation failure must retain the durable slot"
+    );
 
     let deadline = Instant::now() + Duration::from_secs(5);
     let mut drained_frames = None;
@@ -2753,18 +2763,29 @@ fn qwp_ws_orphan_dict_copy_oom_retries_without_failed_sentinel() {
 
     let drained_frames = drained_frames.expect("the retried orphan drain did not complete");
     assert_eq!(drained_frames.len(), 2);
+    let mut delta_pos = 12;
     assert_eq!(
-        drained_frames[1][12], 1,
+        read_varint(&drained_frames[1], &mut delta_pos),
+        1,
         "the second persisted frame must depend on recovered dictionary id 0"
     );
     assert!(
         !orphan_slot.join(".failed").exists(),
         "a retried allocation failure must never write the permanent sentinel"
     );
+
+    let fully_drained = wait_until(Duration::from_secs(5), || {
+        let _ = sender.drive_once().unwrap();
+        !slot_has_sfa_file(&orphan_slot) && !last_error.exists()
+    });
     assert!(
-        !slot_has_sfa_file(&orphan_slot),
-        "the intact delta slot must drain after the allocation failure clears"
+        fully_drained,
+        "the intact delta slot did not drain cleanly after the allocation failure cleared; \
+         has_sfa={}, last_error={}",
+        slot_has_sfa_file(&orphan_slot),
+        std::fs::read_to_string(&last_error).unwrap_or_default()
     );
+    assert!(!orphan_slot.join(".failed").exists());
 }
 
 /// Captures the FIRST frame an orphan drainer sends, then acks it at wire seq 0

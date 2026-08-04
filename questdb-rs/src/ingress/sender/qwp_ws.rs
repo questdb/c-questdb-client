@@ -143,7 +143,11 @@ fn test_socket_is_open(socket: TestRawSocket) -> bool {
 
 #[cfg(all(test, windows))]
 fn test_socket_is_open(socket: TestRawSocket) -> bool {
-    use windows_sys::Win32::Networking::WinSock::{SO_TYPE, SOL_SOCKET, getsockopt};
+    use windows_sys::Win32::Networking::WinSock::{SO_TYPE, SOCKET, SOL_SOCKET, getsockopt};
+
+    let Ok(socket) = SOCKET::try_from(socket) else {
+        return false;
+    };
 
     let mut socket_type = 0i32;
     let mut option_len = std::mem::size_of_val(&socket_type) as i32;
