@@ -400,7 +400,11 @@ pub enum line_sender_error_code {
     /// already-interned symbols keep flushing — but retrying on the same sender
     /// can never succeed. Retire the connection (`questdb_db_drop_sender`, NOT
     /// `questdb_db_return_sender`, which recycles the connection and its
-    /// dictionary) and borrow a fresh one. Distinct from
+    /// dictionary) and borrow a fresh one; with `sf_dir` configured, call
+    /// `qwp_sender_wait` first, since dropping while frames are unresolved
+    /// leaves them and the dictionary in the slot and the next borrower re-seeds
+    /// from that slot's side-file at the same size. See the symbol-column
+    /// preamble in `qwp_sender.h`. Distinct from
     /// `line_sender_error_invalid_api_call` so callers can recognise it without
     /// matching on the message text.
     ///

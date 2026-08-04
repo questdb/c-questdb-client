@@ -245,7 +245,11 @@ pub enum ErrorCode {
     ///   guard before it goes out of scope. Dropping the guard *is* the pool
     ///   return — it recycles the connection **and its dictionary** — and the
     ///   free list is LIFO, so the next borrow hands back that same connection
-    ///   and it fails again on its next new symbol.
+    ///   and it fails again on its next new symbol. With `sf_dir` configured,
+    ///   `wait()` for the queued frames first: dropping while frames are
+    ///   unresolved leaves them **and the dictionary** in the slot, and the next
+    ///   borrower re-seeds from that slot's side-file at the same size — a fresh
+    ///   connection that is already full before it sends anything.
     /// - **Standalone** (`Sender`): drop it and reconnect.
     /// - **C ABI**: `questdb_db_drop_sender`, not `questdb_db_return_sender`.
     ///

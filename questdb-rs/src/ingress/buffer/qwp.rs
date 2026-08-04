@@ -5403,9 +5403,11 @@ impl Default for SymbolGlobalDict {
 /// Reconnecting does NOT clear it, so it is not the remedy: the dictionary
 /// outlives the socket and a reconnect re-registers the whole of it on the fresh
 /// server (see the note on [`SymbolGlobalDict`]). Only discarding the connection
-/// that owns it resets it; [`SymbolDictFull`](crate::ErrorCode::SymbolDictFull)
-/// carries the per-API list of how. (The egress/query-result reader has its own,
-/// independent ceiling; see `egress/symbol_dict.rs`.)
+/// that owns it resets it -- and on the pooled APIs a plain drop is not that,
+/// since the return path recycles the connection and its dictionary. What each
+/// API requires instead is documented on
+/// [`SymbolDictFull`](crate::ErrorCode::SymbolDictFull). (The egress/query-result
+/// reader has its own, independent ceiling; see `egress/symbol_dict.rs`.)
 #[cfg(feature = "_sender-qwp-ws")]
 pub(crate) const MAX_CONN_SYMBOL_DICT_SIZE: usize = 1_000_000;
 
