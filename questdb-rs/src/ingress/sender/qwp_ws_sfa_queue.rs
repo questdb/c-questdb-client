@@ -43,6 +43,7 @@ use crate::error;
 
 use super::qwp_ws_driver::{DriverError, PublicationLog, SendCursor};
 use super::qwp_ws_queue::{OutboundFrame, QueueError, QwpReceipt, QwpReceiptStatus};
+use super::qwp_ws_sfa_catchup::SentDictMirror;
 use super::qwp_ws_sfa_manifest::{
     SfManifest, SfaAckWatermark, ack_watermark_path, manifest_path, sync_directory,
 };
@@ -430,6 +431,20 @@ pub(crate) struct SfaFrameQueue {
     /// foreground for write-ahead; its recovered entries seed the producer dict
     /// and the driver's catch-up mirror. `None` in memory mode / on open failure.
     persisted_symbol_dict: Option<PersistedSymbolDict>,
+    /// The recovered dictionary handed to the producer and the driver mirror:
+    /// the side-file's intact prefix, EXTENDED by every id the surviving frames
+    /// define above it (see
+    /// [`rebuild_recovered_dict_from_frames`](Self::rebuild_recovered_dict_from_frames)).
+    ///
+    /// Owned rather than borrowed from `persisted_symbol_dict` because the
+    /// side-file is only one of the two sources: a host crash can tear off the
+    /// dictionary's newest entries while the frames that introduced those ids
+    /// survive, and those frames carry the missing symbols in their own delta
+    /// sections. Seeding from the short side-file alone would hand the producer's
+    /// next new symbol an id the surviving frames already define.
+    recovered_dict_entries: Vec<u8>,
+    /// Entry count matching [`recovered_dict_entries`](Self::recovered_dict_entries).
+    recovered_dict_count: u32,
 }
 
 #[derive(Debug)]
@@ -532,13 +547,22 @@ impl SfaFrameQueue {
             // `SentDictMirror::accumulate` folds its own delta section in, and the
             // `delta_start == K` frame behind it passes against that. Both replay.
             //
-            // The hazard a zero-entry file does carry is the producer refilling the
-            // truncated file with different symbols at ids surviving frames
-            // reference. For a single crash `SentDictMirror::conflicts_with` catches
-            // it before transmission; going silent needs a SECOND crash. Closing
-            // that window properly means separating "producer write-aheads and
-            // delta-encodes" from "driver arms its mirror", which today are one
-            // flag; trading guaranteed duplication for a narrower window is not it.
+            // The hazard a zero-entry file WOULD carry is the producer refilling the
+            // truncated file with different symbols at ids the surviving frames
+            // reference -- and that one is not a narrow window, it is a certainty:
+            // seeded from the truncated file the producer's `next_id` is 0 while the
+            // replayed frames define ids [0, K), so its very first new symbol takes
+            // an id one of them already owns. `conflicts_with` then terminally fails
+            // the store, AFTER the backlog replayed.
+            //
+            // So the dictionary handed to the producer is not the side-file's
+            // prefix: `rebuild_recovered_dict_from_frames` extends it with every id
+            // the surviving frames define in their OWN delta sections, using the
+            // same `SentDictMirror` fold the driver applies as those frames go back
+            // on the wire. Producer and mirror therefore resume on the same count by
+            // construction, and the next flush's write-ahead re-persists the rebuilt
+            // ids, healing the side-file on disk. (Matches the Java client's
+            // `seedGlobalDictionaryFromPersisted`.)
             PersistedSymbolDict::open_recovered(&options.slot_dir)?
         } else {
             // Fresh slot: no stored frames depend on the dictionary, so a side-file
@@ -673,13 +697,19 @@ impl SfaFrameQueue {
             next_fsn,
         });
 
-        Ok(Self {
+        let mut queue = Self {
             engine,
             producer,
             ack_watermark: recovered_completion.ack_watermark,
             delta_dict_enabled,
             persisted_symbol_dict,
-        })
+            recovered_dict_entries: Vec::new(),
+            recovered_dict_count: 0,
+        };
+        // This slot has a PRODUCER, so the recovered dictionary must cover every id
+        // the surviving frames define -- not just the side-file's intact prefix.
+        queue.rebuild_recovered_dict_from_frames()?;
+        Ok(queue)
     }
 
     pub(crate) fn open_memory(options: SfaMemoryQueueOptions) -> Result<Self, SfaQueueError> {
@@ -758,6 +788,10 @@ impl SfaFrameQueue {
             // there is no side-file to persist.
             delta_dict_enabled: true,
             persisted_symbol_dict: None,
+            // Nothing is recovered in memory mode: the queue starts empty, so the
+            // producer's id space starts at 0 with no surviving frames to collide.
+            recovered_dict_entries: Vec::new(),
+            recovered_dict_count: 0,
         })
     }
 
@@ -853,12 +887,26 @@ impl SfaFrameQueue {
             durability_failed: AtomicBool::new(false),
         });
 
+        let (recovered_dict_entries, recovered_dict_count) = persisted_symbol_dict
+            .as_ref()
+            .map_or_else(Default::default, |pd| {
+                (pd.loaded_entries().to_vec(), pd.size())
+            });
         Ok(Self {
             engine,
             producer: None,
             ack_watermark: recovered_completion.ack_watermark,
             delta_dict_enabled,
             persisted_symbol_dict,
+            // Replay-only: the side-file's prefix verbatim, with NO frame-derived
+            // extension. The extension exists to keep a producer's next id above
+            // the surviving frames' ids, and this path builds no producer -- the
+            // drainer's own mirror still folds each frame's delta in as it replays
+            // (`SentDictMirror::accumulate`), which is what makes the drain work on
+            // a torn dictionary. Scanning every frame up front here would cost a
+            // full extra pass to reach the same mirror state.
+            recovered_dict_entries,
+            recovered_dict_count,
         })
     }
 
@@ -870,17 +918,85 @@ impl SfaFrameQueue {
     /// The recovered symbol-dict entries (`[len][utf8]...` in id order) used to
     /// seed the producer dict and the driver mirror on recovery / orphan-drain.
     /// Empty for a fresh slot or memory mode.
+    ///
+    /// On a slot with a producer this is the side-file's prefix PLUS every id the
+    /// surviving frames define above it; see
+    /// [`rebuild_recovered_dict_from_frames`](Self::rebuild_recovered_dict_from_frames).
     pub(crate) fn recovered_symbol_dict_entries(&self) -> &[u8] {
-        self.persisted_symbol_dict
-            .as_ref()
-            .map_or(&[][..], |pd| pd.loaded_entries())
+        &self.recovered_dict_entries
     }
 
     /// Number of recovered symbol-dict entries.
     pub(crate) fn recovered_symbol_dict_count(&self) -> u32 {
-        self.persisted_symbol_dict
-            .as_ref()
-            .map_or(0, |pd| pd.size())
+        self.recovered_dict_count
+    }
+
+    /// Rebuilds the recovered dictionary from BOTH sources the driver's mirror is
+    /// built from, in the same order, so the producer's next id and the mirror's
+    /// count land on the same number **by construction**:
+    ///
+    /// 1. the side-file's intact prefix (already loaded at `open`), then
+    /// 2. every id the surviving frames define above it, read out of those frames'
+    ///    own delta sections.
+    ///
+    /// Source 2 is not redundant. The side-file is not fsync'd (see
+    /// [`super::qwp_ws_sfa_symbol_dict`]), so a host/power crash can tear off its
+    /// newest entries while the frames that introduced those ids survive — and the
+    /// newest frames, being the least likely to be acked, are exactly the ones that
+    /// replay. Seeded from the short prefix alone the producer's `next_id` sits
+    /// BELOW ids the surviving frames already define, so its first new symbol takes
+    /// an id one of those frames uses for a different string. The driver's mirror
+    /// has meanwhile accumulated the real mapping from the replayed frames, so
+    /// `guard_dict_not_torn`'s `conflicts_with` sees a differing redefinition of a
+    /// held id and terminally fails the store (`StoreResendRequired`) — after the
+    /// backlog already replayed. That is a guaranteed kill on the first new symbol,
+    /// not a rare race.
+    ///
+    /// The fold is done by [`SentDictMirror`] itself over the same frame range the
+    /// driver replays (`[oldest_unresolved_fsn, published_upper)`, the range its
+    /// send cursor walks), so this cannot drift from the live mirror's arithmetic.
+    /// A frame whose `delta_start` is ABOVE the running count is a genuine gap —
+    /// its ids came from frames since acked and trimmed, and nothing can rebuild
+    /// them — so `accumulate` skips it and the count stops there, leaving exactly
+    /// the torn-dictionary case `guard_dict_not_torn` already reports.
+    ///
+    /// Cheap on the common path: an untorn side-file already covers every id, so
+    /// every frame folds to a no-op overlap and only the (cold, once-per-open) scan
+    /// remains.
+    fn rebuild_recovered_dict_from_frames(&mut self) -> Result<(), SfaQueueError> {
+        let mut mirror = SentDictMirror::new(true);
+        if let Some(pd) = self.persisted_symbol_dict.as_ref() {
+            mirror.seed(pd.loaded_entries(), pd.size());
+        } else {
+            // No side-file: nothing was recovered and nothing may be delta-encoded
+            // against it, so there is no id space to align.
+            return Ok(());
+        }
+        if let Some(oldest) = self.oldest_unresolved_fsn() {
+            // `published_fsn()` is the last published FSN; the range the driver's
+            // send cursor walks is inclusive of it.
+            let last = self.published_fsn().unwrap_or(oldest);
+            let mut cursor = None;
+            let mut fsn = oldest;
+            while fsn <= last {
+                let Some(payload) = self.next_cursor_payload_for_fsn(&mut cursor, fsn)? else {
+                    break;
+                };
+                payload.with_bytes(|frame| mirror.accumulate(frame));
+                fsn += 1;
+            }
+        }
+        self.recovered_dict_count = mirror.count();
+        self.recovered_dict_entries = mirror.into_entries();
+        // The side-file's own copy is now redundant -- this rebuild is a superset of
+        // it, and it is the only thing production reads from here on. Freeing it now
+        // rather than at `take_persisted_symbol_dict` keeps the rebuild from adding a
+        // second full dictionary to the connect-time peak; it lowers it, since the
+        // two no longer coexist for the whole of construction.
+        if let Some(pd) = self.persisted_symbol_dict.as_mut() {
+            pd.clear_loaded_entries();
+        }
+        Ok(())
     }
 
     /// Takes the persisted symbol dictionary for the foreground producer's
@@ -891,13 +1007,15 @@ impl SfaFrameQueue {
     /// needing the entries must read them via
     /// [`recovered_symbol_dict_entries`](Self::recovered_symbol_dict_entries) first
     /// (both recovery paths do — async and sync). The write-ahead handle only needs
-    /// the file / append offset / size, so free that region rather than carry it
-    /// dead for the whole connection lifetime.
+    /// the file / append offset / size, so free BOTH that region and this queue's
+    /// rebuilt copy rather than carry them dead for the whole connection lifetime.
     pub(crate) fn take_persisted_symbol_dict(&mut self) -> Option<PersistedSymbolDict> {
         let mut pd = self.persisted_symbol_dict.take();
         if let Some(pd) = pd.as_mut() {
             pd.clear_loaded_entries();
         }
+        // `Vec::new` (not `clear`) so the backing capacity is released.
+        self.recovered_dict_entries = Vec::new();
         pd
     }
 
@@ -4718,9 +4836,132 @@ mod tests {
         );
         assert!(
             recovered.recovered_symbol_dict_entries().is_empty(),
-            "the rejected chunk seeds nothing -- the mirror arms empty"
+            "the rejected chunk seeds nothing, and this slot's lone frame is a RAW \
+             payload carrying no delta section, so the frame-derived rebuild has \
+             nothing to contribute either -- the mirror arms empty. \
+             `recovered_slot_rebuilds_the_dict_from_frames_when_the_side_file_is_torn` \
+             covers the case where the frames DO carry one"
         );
         assert_eq!(recovered.recovered_symbol_dict_count(), 0);
+    }
+
+    #[test]
+    fn recovered_slot_rebuilds_the_dict_from_frames_when_the_side_file_is_torn() {
+        // Regression (guaranteed store kill on the first new symbol). A recovered
+        // slot's producer must resume ABOVE every id the surviving frames define.
+        // The side-file is not fsync'd, so a host crash can tear off its newest
+        // entries while the frames that introduced those ids survive -- and the
+        // newest frames, being the least likely to be acked, are exactly the ones
+        // that replay.
+        //
+        // Seeded from the torn side-file alone the producer's `next_id` would be 0
+        // while the replayed frames define ids 0 and 1. Its first new symbol would
+        // take id 0, the driver's mirror -- which accumulated the real mapping as
+        // those frames went out -- would see a differing redefinition of a held id,
+        // and `guard_dict_not_torn`'s `conflicts_with` would terminally fail the
+        // whole store with `StoreResendRequired`, AFTER the backlog replayed. That
+        // is certain, not a race: any new symbol whose bytes differ from `alpha`
+        // collides at id 0.
+        //
+        // So recovery rebuilds from BOTH sources the mirror is built from, in the
+        // same order: the side-file's intact prefix (here: nothing), then the
+        // frames' own delta sections. Producer and mirror then land on the same
+        // count by construction. Mirrors the Java client's
+        // `seedGlobalDictionaryFromPersisted`.
+        //
+        // The frames must be REAL delta frames: `try_submit`ting raw bytes yields a
+        // payload `parse_delta_section` rejects, which no-ops the whole rebuild.
+        use crate::ingress::sender::qwp_ws_sfa_catchup::make_delta_frame;
+
+        let dir = TempDir::new().unwrap();
+        let symbol_dict = dir
+            .path()
+            .join(crate::ingress::sender::qwp_ws_sfa_symbol_dict::FILE_NAME);
+
+        // A first session queues two delta frames introducing `alpha` (id 0) and
+        // `bravo` (id 1), and write-aheads both into the side-file as one chunk
+        // each -- exactly what the producer does per frame.
+        let mut queue = open(&dir);
+        queue
+            .try_submit(&make_delta_frame(0, &[b"alpha".as_slice()], b""))
+            .unwrap();
+        queue
+            .try_submit(&make_delta_frame(1, &[b"bravo".as_slice()], b""))
+            .unwrap();
+        drop(queue);
+        {
+            let mut pd = crate::ingress::sender::qwp_ws_sfa_symbol_dict::PersistedSymbolDict::open(
+                dir.path(),
+            )
+            .unwrap();
+            pd.append_symbol(b"alpha").unwrap();
+            pd.append_symbol(b"bravo").unwrap();
+        }
+
+        // A host crash tears chunk 0: same-length value flip, so only its stored
+        // CRC goes stale. The reader stops there and truncates, so the side-file
+        // contributes NOTHING -- while both queued frames still reference ids 0/1.
+        let mut bytes = std::fs::read(&symbol_dict).unwrap();
+        let idx = bytes
+            .windows(5)
+            .position(|w| w == b"alpha")
+            .expect("alpha entry present");
+        bytes[idx] = b'X';
+        std::fs::write(&symbol_dict, &bytes).unwrap();
+
+        let recovered = open(&dir);
+        assert!(recovered.is_delta_dict_enabled());
+        assert_eq!(
+            recovered.recovered_symbol_dict_count(),
+            2,
+            "the surviving frames define ids 0 and 1 in their own delta sections, \
+             so recovery must resume the producer at id 2 -- seeding 0 from the \
+             torn side-file alone hands the next new symbol id 0, which the \
+             replayed frames already own"
+        );
+        assert_eq!(
+            recovered.recovered_symbol_dict_entries(),
+            &[
+                5, b'a', b'l', b'p', b'h', b'a', 5, b'b', b'r', b'a', b'v', b'o'
+            ][..],
+            "rebuilt in id order, in the `[len][utf8]` shape a delta section \
+             carries, so the producer dict and the driver mirror seed from \
+             identical bytes"
+        );
+    }
+
+    #[test]
+    fn recovered_slot_stops_the_rebuild_at_a_genuine_id_gap() {
+        // The rebuild must not paper over a real gap. When the surviving frames
+        // base ABOVE the side-file's prefix, the ids below their `delta_start` were
+        // introduced by frames since acked and trimmed away -- they lived only in
+        // the lost dictionary and nothing can reconstruct them. Folding such a
+        // frame in would silently shift every id down and misattribute values.
+        //
+        // `SentDictMirror::accumulate` already skips a frame whose `delta_start`
+        // exceeds the running count, and the rebuild reuses it precisely so this
+        // case needs no second implementation. The count stays at the prefix, and
+        // the send loop's `guard_dict_not_torn` then rejects the frame loudly
+        // ("resend required") exactly as it does today.
+        use crate::ingress::sender::qwp_ws_sfa_catchup::make_delta_frame;
+
+        let dir = TempDir::new().unwrap();
+
+        // The only surviving frame bases at id 3, with an empty side-file behind it.
+        let mut queue = open(&dir);
+        queue
+            .try_submit(&make_delta_frame(3, &[b"delta".as_slice()], b""))
+            .unwrap();
+        drop(queue);
+
+        let recovered = open(&dir);
+        assert_eq!(
+            recovered.recovered_symbol_dict_count(),
+            0,
+            "a frame basing above the recovered prefix is a gap, not an extension: \
+             the rebuild must stop rather than invent ids 0..3"
+        );
+        assert!(recovered.recovered_symbol_dict_entries().is_empty());
     }
 
     #[test]

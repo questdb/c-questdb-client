@@ -144,6 +144,26 @@ impl SentDictMirror {
         self.count == 0
     }
 
+    /// Consumes the mirror, yielding its `[len][utf8]...` entries in id order —
+    /// the same shape a delta section carries.
+    ///
+    /// Exists so recovery can use this type purely as a *folding* helper:
+    /// `SfaFrameQueue::rebuild_recovered_dict_from_frames` seeds a throwaway
+    /// mirror from the side-file's intact prefix, replays the surviving frames'
+    /// delta sections through [`accumulate`](Self::accumulate), and hands the
+    /// result to BOTH the producer dictionary and this mirror's real seed. Using
+    /// the same code for the rebuild and for the live mirror is what makes the
+    /// producer's next id and [`count`](Self::count) agree by construction rather
+    /// than by two implementations happening to match.
+    ///
+    /// By value, not `&[u8]`: the rebuilt region is up to a full connection
+    /// dictionary, and recovery already holds several copies of it (the side-file
+    /// read buffer, the loaded region, the driver seed). Moving the buffer out
+    /// keeps this helper from adding one more.
+    pub(crate) fn into_entries(self) -> Vec<u8> {
+        self.bytes
+    }
+
     /// Seeds the mirror from a recovered [`PersistedSymbolDict`]'s loaded entry
     /// region (`[len][utf8]...` in id order) and its entry count. Called once,
     /// before the first connection, on recovery / orphan-drain. No-op when
@@ -568,30 +588,42 @@ fn write_varint(out: &mut Vec<u8>, mut value: u64) {
     out.push(value as u8);
 }
 
+/// Builds a synthetic delta frame: header + `[delta_start][count]` + entries,
+/// with optional trailing `table_junk` to prove the parser ignores the
+/// (table) bytes past the dict section.
+///
+/// Module-scoped (not buried in this file's `mod tests`) so the store-and-forward
+/// queue's tests can build the same frame shape when they need a payload that
+/// actually carries a dict delta — `try_submit`ting raw bytes produces a frame
+/// [`parse_delta_section`] rejects, which silently no-ops every dictionary
+/// assertion built on it.
+#[cfg(test)]
+pub(crate) fn make_delta_frame(delta_start: u64, entries: &[&[u8]], table_junk: &[u8]) -> Vec<u8> {
+    let mut payload = Vec::new();
+    write_varint(&mut payload, delta_start);
+    write_varint(&mut payload, entries.len() as u64);
+    for e in entries {
+        write_varint(&mut payload, e.len() as u64);
+        payload.extend_from_slice(e);
+    }
+    payload.extend_from_slice(table_junk);
+    let mut frame = Vec::new();
+    frame.extend_from_slice(&QWP_MAGIC);
+    frame.push(1);
+    frame.push(QWP_FLAG_DELTA_SYMBOL_DICT);
+    frame.extend_from_slice(&1u16.to_le_bytes());
+    frame.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+    frame.extend_from_slice(&payload);
+    frame
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// Builds a synthetic delta frame: header + `[delta_start][count]` + entries,
-    /// with optional trailing `table_junk` to prove the parser ignores the
-    /// (table) bytes past the dict section.
+    /// Local alias for the module-level builder these tests were written against.
     fn make_frame(delta_start: u64, entries: &[&[u8]], table_junk: &[u8]) -> Vec<u8> {
-        let mut payload = Vec::new();
-        write_varint(&mut payload, delta_start);
-        write_varint(&mut payload, entries.len() as u64);
-        for e in entries {
-            write_varint(&mut payload, e.len() as u64);
-            payload.extend_from_slice(e);
-        }
-        payload.extend_from_slice(table_junk);
-        let mut frame = Vec::new();
-        frame.extend_from_slice(&QWP_MAGIC);
-        frame.push(1);
-        frame.push(QWP_FLAG_DELTA_SYMBOL_DICT);
-        frame.extend_from_slice(&1u16.to_le_bytes());
-        frame.extend_from_slice(&(payload.len() as u32).to_le_bytes());
-        frame.extend_from_slice(&payload);
-        frame
+        make_delta_frame(delta_start, entries, table_junk)
     }
 
     /// Symbols reconstructed from a mirror's would-be catch-up frames.
