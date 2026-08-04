@@ -638,7 +638,7 @@ impl SfaFrameQueue {
             }),
             published_upper: AtomicU64::new(next_fsn),
             completed_upper: AtomicU64::new(recovered_completion.completed_upper),
-            sync_requested: AtomicBool::new(periodic_sync_interval.is_some()),
+            sync_requested: AtomicBool::new(false),
             durability_failed: AtomicBool::new(false),
         });
         let producer = Some(SfaProducer {
@@ -817,7 +817,7 @@ impl SfaFrameQueue {
             }),
             published_upper: AtomicU64::new(next_fsn),
             completed_upper: AtomicU64::new(recovered_completion.completed_upper),
-            sync_requested: AtomicBool::new(periodic_sync_interval.is_some()),
+            sync_requested: AtomicBool::new(false),
             durability_failed: AtomicBool::new(false),
         });
 
@@ -3309,6 +3309,34 @@ mod tests {
 
         assert_eq!(queue.try_submit(&[3; 16]).unwrap().fsn, 2);
         assert_eq!(queue.sealed_segment_count(), 1);
+    }
+
+    #[test]
+    fn initial_periodic_sync_arms_cadence_when_publish_lands_before_finish() {
+        let dir = TempDir::new().unwrap();
+        let mut queue = SfaFrameQueue::open(periodic_options_with(&dir, 256, 1024, 8)).unwrap();
+
+        queue.try_submit(b"before-sync").unwrap();
+        let step = queue
+            .take_storage_maintenance_step(false)
+            .unwrap()
+            .expect("the first periodic sync is due immediately");
+        assert!(matches!(step, SfaStorageStep::SyncPublished(_)));
+        let result = step.perform().unwrap();
+
+        // The detached foreground producer can publish while the runner is
+        // between the off-lock sync and its finish check.
+        queue.try_submit(b"during-sync").unwrap();
+        queue.finish_storage_maintenance(result, true).unwrap();
+        queue.complete_storage_maintenance().unwrap();
+
+        assert!(
+            queue
+                .take_storage_maintenance_step(false)
+                .unwrap()
+                .is_none(),
+            "the completed first sync must arm the one-hour cadence"
+        );
     }
 
     #[test]
