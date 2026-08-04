@@ -2171,7 +2171,11 @@ impl<T: QwpWsCoreTransport> QwpWsSendCore<T> {
             match self.try_poll_response() {
                 Ok(TransportPoll::Response(response)) => {
                     let response_outcome = self.finish_polled_response(store, response)?;
-                    if response_outcome == DriveOutcome::Terminal {
+                    // ReconnectDelay must stop the drain: a paced reject leaves
+                    // the doomed socket open, and applying a buffered ack from
+                    // it would advance the completed watermark past the
+                    // rejected (still unreplayed) frame.
+                    if drive_outcome_stops_tick(response_outcome) {
                         return Ok(response_outcome);
                     }
                     if response_outcome != DriveOutcome::Idle {
@@ -5963,6 +5967,92 @@ mod tests {
             other => panic!("expected second paced reconnect delay, got {other:?}"),
         }
         assert_eq!(driver.send_core.transport.restart_attempts, 1);
+    }
+
+    #[test]
+    fn paced_reject_stops_receive_drain_before_buffered_ack() {
+        // A paced retriable reject arms the reconnect but leaves the doomed
+        // socket open. The receive drain must stop at the ReconnectDelay: a
+        // buffered ack for the next frame polled off the same socket would
+        // advance the completed watermark past the rejected (still
+        // unreplayed) frame and trim it -- crash-durable data loss.
+        let mut driver = QwpWsCoreTestHarness::from_queue_with_reconnect_policy(
+            memory_queue(options(8, 1024, 4)),
+            FakeOrderedServer::no_response(),
+            paced_policy(),
+            false,
+        );
+        let first = driver.try_submit(b"first").unwrap();
+        let second = driver.try_submit(b"second").unwrap();
+        assert!(matches!(
+            driver.drive_once().unwrap(),
+            DriveOutcome::Sent(_)
+        ));
+        assert!(matches!(
+            driver.drive_once().unwrap(),
+            DriveOutcome::Sent(_)
+        ));
+
+        // Both responses sit buffered on the same socket: the reject for the
+        // first frame, then an ack for the second.
+        driver
+            .send_core
+            .transport
+            .push_response(TransportResponse::Reject {
+                wire_seq: 0,
+                error: write_error("write failed"),
+            });
+        driver
+            .send_core
+            .transport
+            .push_response(TransportResponse::Ack { wire_seq: 1 });
+
+        match driver.drive_once().unwrap() {
+            DriveOutcome::ReconnectDelay { sleep_for, .. } => {
+                assert_pace_range(
+                    sleep_for,
+                    Duration::from_millis(100),
+                    Duration::from_millis(200),
+                );
+            }
+            other => panic!("expected paced reconnect delay, got {other:?}"),
+        }
+        // The drain stopped at the reject: the buffered ack is unread and
+        // nothing is completed.
+        assert_eq!(driver.send_core.transport.poll_responses.len(), 1);
+        assert_eq!(driver.store.completed_fsn(), None);
+        // The reconnect replaces the socket; its unread buffer dies with it.
+        driver.send_core.transport.poll_responses.clear();
+
+        assert_eq!(
+            driver.drive_once().unwrap(),
+            DriveOutcome::Reconnected {
+                reason: ReconnectReason::RetryableFailure
+            }
+        );
+        // The replay rebases at the rejected frame and re-sends both.
+        for expected_fsn in [0, 1] {
+            match driver.drive_once().unwrap() {
+                DriveOutcome::Sent(frame) => assert_eq!(frame.fsn, expected_fsn),
+                other => panic!("expected replay of fsn {expected_fsn}, got {other:?}"),
+            }
+        }
+        driver
+            .send_core
+            .transport
+            .push_response(TransportResponse::Ack { wire_seq: 1 });
+        assert_eq!(
+            driver.drive_once().unwrap(),
+            DriveOutcome::Acked { wire_seq: 1 }
+        );
+        assert_eq!(
+            driver.receipt_status(first),
+            QwpReceiptStatus::Completed { fsn: 0 }
+        );
+        assert_eq!(
+            driver.receipt_status(second),
+            QwpReceiptStatus::Completed { fsn: 1 }
+        );
     }
 
     #[test]
