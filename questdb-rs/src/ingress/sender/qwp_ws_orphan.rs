@@ -646,21 +646,36 @@ impl OrphanDrainer {
             // `delta_start > 0` frame loudly ("resend required") instead of
             // replaying it silently, exactly the dense fallback the queue already
             // takes for an absent / bad-magic side-file.
-            let recovered_dict_intact = SymbolGlobalDict::new()
-                .seed(&entries, recovered_dict_count)
-                .is_ok();
-            if recovered_dict_intact {
-                Some(entries)
-            } else {
-                log::warn!(
-                    "QWP/WebSocket orphan slot {}: persisted symbol dictionary is \
-                     corrupt (duplicate / torn or zero-extended tail); draining with \
-                     full-dictionary (dense) frames -- any stored delta frame that \
-                     depends on the lost dictionary is rejected as resend-required \
-                     rather than replayed against a desynced dictionary.",
-                    slot_dir.display()
-                );
-                None
+            //
+            // Degrading is right HERE and wrong on the foreground paths named
+            // above, which fail construction on the same error. The asymmetry is
+            // deliberate and argued in `SymbolGlobalDict::seed`'s docs: they have
+            // a producer that would mint ids the stored frames already reference,
+            // this path has none. Hard-failing here would surface as
+            // `RetryLater` -- re-queuing the slot forever -- and would abandon
+            // the slot's self-sufficient dense frames, which need no dictionary
+            // at all. See `qwp_ws_orphan_drain_degrades_to_dense_when_the_
+            // recovered_dict_exceeds_the_cap` for the paired half of the
+            // foreground test.
+            //
+            // Report the rejection verbatim rather than asserting a cause: `seed`
+            // fails `SymbolDictFull` on a well-formed side-file that is merely
+            // larger than this client's cap (one written by a higher-capped
+            // client), and calling that "corrupt" sends an operator hunting for
+            // disk damage that is not there.
+            match SymbolGlobalDict::new().seed(&entries, recovered_dict_count) {
+                Ok(()) => Some(entries),
+                Err(err) => {
+                    log::warn!(
+                        "QWP/WebSocket orphan slot {}: persisted symbol dictionary was \
+                         rejected ({err}); draining with full-dictionary (dense) frames \
+                         -- any stored delta frame that depends on that dictionary is \
+                         rejected as resend-required rather than replayed against a \
+                         desynced one.",
+                        slot_dir.display()
+                    );
+                    None
+                }
             }
         } else {
             None

@@ -3479,7 +3479,18 @@ pub(crate) fn connect_qwp_ws_background_state(
         // (`in_doubt == false`, "re-ingest from source") cannot surface only after
         // frames were already committed on the server, which would duplicate them.
         // This mirrors the pre-arm validation the orphan drainer already performs
-        // (`qwp_ws_orphan.rs`).
+        // (`qwp_ws_orphan.rs`) -- but note the two diverge on what they do with a
+        // failure: this one fails construction, the drainer degrades to dense.
+        // That asymmetry is deliberate and argued in `SymbolGlobalDict::seed`'s
+        // docs; the short of it is that this path has a PRODUCER that would
+        // otherwise mint ids the stored frames already reference, while
+        // replay-only has none. `seed` can fail `SymbolDictFull` here as well as
+        // `StoreResendRequired` -- a well-formed side-file written by a
+        // higher-capped client -- and it leaves the dictionary partially seeded
+        // either way, so continuing with it is never an option. Failing now
+        // leaves the slot intact on disk for a client that can hold it
+        // (`store_and_forward_file_mode_recovery_fails_when_the_recovered_dict_
+        // exceeds_the_cap`).
         let mut encoder = QwpWsReplayEncoder::new(1);
         encoder.set_delta_dict_enabled(delta_dict_enabled);
         if delta_dict_enabled {

@@ -5705,6 +5705,48 @@ impl SymbolGlobalDict {
     /// each so the recovered ids (`0..count`) match the stored frames' references.
     /// Called once at connection setup on file-mode recovery / orphan-drain, on a
     /// fresh (empty) dictionary.
+    ///
+    /// # Failure modes
+    ///
+    /// A malformed region fails [`StoreResendRequired`](crate::ErrorCode::StoreResendRequired)
+    /// (truncated / over-long varint, over-cap entry length, buffer overrun,
+    /// duplicate entry). Because it re-interns through [`intern`](Self::intern),
+    /// it can ALSO fail [`SymbolDictFull`](crate::ErrorCode::SymbolDictFull) on a
+    /// region that is perfectly well-formed but holds more entries (or more
+    /// bytes) than this connection's caps: the side-file was written by a client
+    /// whose cap was higher, or it sits exactly on the boundary. Either way the
+    /// dictionary is left PARTIALLY seeded -- entries before the failure keep
+    /// their ids -- so a caller must never continue with it.
+    ///
+    /// # Why the two recovery callers diverge on that failure
+    ///
+    /// Deliberate, and it turns on one question: *is there a producer that will
+    /// mint new ids?*
+    ///
+    /// Foreground recovery (`qwp_ws::connect_qwp_ws` /
+    /// `connect_sfa_background` / the manual handler, and
+    /// `PooledSenderCore::new_store_and_forward`) `?`-propagates it and fails
+    /// construction. It has a producer, and a half-seeded (or empty) dictionary
+    /// would hand the next interned symbol an id the stored frames already use.
+    /// Degrading to dense instead would not even contain that: the driver's
+    /// catch-up mirror is armed off the same flag, so the slot's
+    /// `delta_start == 0` frame would replay and COMMIT before the guard rejected
+    /// the one behind it, turning a clean nothing-has-connected-yet failure into
+    /// `StoreResendRequired` on top of a committed prefix -- which a compliant
+    /// resend duplicates. Failing here happens before the runner is spawned, so
+    /// the slot is left untouched on disk for a client that can hold it.
+    ///
+    /// The orphan drainer (`qwp_ws_orphan::open_inner`) logs and degrades to
+    /// dense instead. It is replay-only: no producer, no write-ahead, and the
+    /// side-file handle is dropped outright, so there is no id to collide with
+    /// and nothing a partial seed could corrupt. Hard-failing there would abandon
+    /// the slot's *self-sufficient* dense frames, which replay perfectly well
+    /// without any dictionary -- and would do so as `RetryLater`, which re-queues
+    /// the slot forever rather than reporting anything. Degrading drains what can
+    /// drain and lets the torn-dict guard reject only the delta frames, loudly.
+    ///
+    /// See `symbol_dict_seed_fills_to_the_cap_and_rejects_the_entry_past_it` for
+    /// the boundary, and the two paired tests named in those call sites.
     pub(crate) fn seed(&mut self, entries: &[u8], count: u32) -> crate::Result<()> {
         let mut pos = 0usize;
         for i in 0..count {
@@ -10001,6 +10043,74 @@ mod tests {
         dict.rollback(mark);
         let (_, after_rollback) = dict.take_arrow_dict_memo(&identity, &pin, 3).unwrap();
         assert_eq!(after_rollback, vec![u64::MAX; 3]);
+    }
+
+    #[cfg(feature = "_sender-qwp-ws")]
+    #[test]
+    fn symbol_dict_seed_fills_to_the_cap_and_rejects_the_entry_past_it() {
+        // `seed` re-interns every recovered entry, so the connection's entry cap
+        // applies to RECOVERY exactly as it does to ingestion -- a fact with no
+        // coverage until now, even though it decides whether a slot can be
+        // reopened at all. A region holding exactly `cap` entries seeds cleanly;
+        // the `cap + 1`-th is refused.
+        //
+        // The code is `SymbolDictFull`, NOT one of `seed`'s `StoreResendRequired`
+        // corruption codes, and the distinction is the point: such a side-file is
+        // perfectly well-formed, just bigger than this client will hold (written
+        // by a higher-capped client, or sitting on the boundary). The two
+        // recovery callers then diverge on it deliberately -- foreground fails
+        // construction, the orphan drainer degrades to dense -- as argued in
+        // `seed`'s docs and pinned by the paired tests it names.
+        //
+        // `symbol_dict_cap_matches_server_ceiling` pins the real cap at
+        // 1_000_000; `with_cap` walks the same boundary without interning a
+        // million symbols.
+        fn region(count: usize) -> Vec<u8> {
+            let mut region = Vec::new();
+            for i in 0..count {
+                let symbol = format!("s{i}");
+                write_qwp_varint(&mut region, symbol.len() as u64);
+                region.extend_from_slice(symbol.as_bytes());
+            }
+            region
+        }
+
+        const CAP: usize = 64;
+
+        // Exactly at the cap: every recovered id is reproduced and ingestion
+        // continues above them.
+        let mut at_cap = SymbolGlobalDict::with_cap(CAP);
+        at_cap.seed(&region(CAP), CAP as u32).unwrap();
+        assert_eq!(at_cap.next_id(), CAP as u64);
+        assert_eq!(at_cap.entry(0), Some(&b"s0"[..]));
+        assert_eq!(at_cap.entry(CAP as u64 - 1), Some(b"s63".as_slice()));
+        // ...and the dictionary is now full, so the first NEW symbol is refused
+        // with the same code (the cap is on the dictionary, not on seeding).
+        assert_eq!(
+            at_cap.intern(b"fresh").unwrap_err().code(),
+            crate::ErrorCode::SymbolDictFull
+        );
+
+        // One past the cap.
+        let mut past_cap = SymbolGlobalDict::with_cap(CAP);
+        let err = past_cap
+            .seed(&region(CAP + 1), (CAP + 1) as u32)
+            .unwrap_err();
+        assert_eq!(
+            err.code(),
+            crate::ErrorCode::SymbolDictFull,
+            "{}",
+            err.msg()
+        );
+        assert!(err.msg().contains("entry cap"), "msg: {}", err.msg());
+        assert_eq!(
+            past_cap.next_id(),
+            CAP as u64,
+            "seed fails PART-WAY, leaving the entries before the cap interned -- \
+             which is why a caller must never continue with the dictionary it \
+             failed on: the next symbol it interned would take an id the stored \
+             frames already reference"
+        );
     }
 
     #[cfg(feature = "_sender-qwp-ws")]

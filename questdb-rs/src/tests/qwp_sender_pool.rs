@@ -3869,6 +3869,89 @@ fn store_and_forward_file_mode_recovers_and_replays_queued_frame_after_reopen() 
 }
 
 #[test]
+fn store_and_forward_file_mode_recovery_fails_when_the_recovered_dict_exceeds_the_cap() {
+    // `SymbolGlobalDict::seed` re-interns every recovered entry, so the
+    // connection's entry cap applies to RECOVERY, not just ingestion: a slot whose
+    // side-file holds more symbols than this client will hold cannot be reopened.
+    // The region is not corrupt -- it is well-formed and was written by a client
+    // whose cap was higher -- so the failure is `SymbolDictFull`, not one of
+    // `seed`'s `StoreResendRequired` corruption codes.
+    //
+    // Foreground recovery must FAIL here rather than degrade to dense, because it
+    // has a producer. `seed` gives up part-way (see
+    // `symbol_dict_seed_fills_to_the_cap_and_rejects_the_entry_past_it`), so
+    // continuing would let the next interned symbol take an id the stored frames
+    // already reference; and degrading would disarm the driver's catch-up mirror,
+    // replaying and COMMITTING the slot's `delta_start == 0` frame before the
+    // guard rejected the next -- `StoreResendRequired` on top of a committed
+    // prefix, which a compliant resend duplicates. Failing at construction happens
+    // before anything connects, so the slot stays intact on disk for a client that
+    // can hold it. `qwp_ws_orphan_drain_degrades_to_dense_when_the_recovered_dict_
+    // exceeds_the_cap` pins the opposite (correct) choice on the replay-only path.
+    let dir = TempDir::new().unwrap();
+
+    // Phase 1: at the full cap, queue two frames interning two distinct symbols
+    // against a peer that never acks, so a 2-entry side-file and its unresolved
+    // segments survive the drop.
+    {
+        let dead = MockServer::spawn_upgrade_then_close(1);
+        let conf = conf_for_endpoints(
+            &[dead.port()],
+            &sf_disk_extras(&dir, "pool_reap=manual;sender_id=capped;"),
+        );
+        let db = QuestDb::connect(&conf).unwrap();
+        let mut sender = db.borrow_sender().unwrap();
+        for (symbol, values) in [
+            (b"alpha".as_slice(), [1_i64]),
+            (b"bravo".as_slice(), [2_i64]),
+        ] {
+            let mut chunk = Chunk::new("trades");
+            append_one_symbol_row(&mut chunk, symbol, &values);
+            sender.flush(&mut chunk).unwrap();
+        }
+        drop(sender);
+        drop(db);
+    }
+
+    let slot_dir = dir.path().join("capped-ingest-0");
+    let side_file = slot_dir.join(".symbol-dict");
+    assert_eq!(
+        crate::ingress::sender::qwp_ws_sfa_symbol_dict::parse_chunks(&side_file),
+        vec![vec![b"alpha".to_vec()], vec![b"bravo".to_vec()]],
+        "phase 1 must leave a well-formed TWO-entry side-file -- this test is \
+         about a dictionary that is too big, not a torn one"
+    );
+    let sfa_files_before = std::fs::read_dir(&slot_dir).unwrap().count();
+
+    // Phase 2: the same slot reopened by a client capped at one entry. Recovery
+    // seeds `alpha` and is refused on `bravo`.
+    let _cap = crate::ingress::TestDictCapGuard::new(1);
+    let live = MockServer::spawn_acking(4);
+    let conf = conf_for_endpoints(
+        &[live.port()],
+        &sf_disk_extras(&dir, "pool_reap=manual;sender_id=capped;"),
+    );
+    let db = QuestDb::connect(&conf).unwrap();
+    let err = db
+        .borrow_sender()
+        .expect_err("a recovered dictionary larger than the cap cannot be seeded");
+    assert_eq!(err.code(), ErrorCode::SymbolDictFull, "{}", err.msg());
+
+    // The whole point of failing at construction: the data is still there. A
+    // client with a big-enough cap can still open this slot and drain it.
+    assert_eq!(
+        crate::ingress::sender::qwp_ws_sfa_symbol_dict::parse_chunks(&side_file),
+        vec![vec![b"alpha".to_vec()], vec![b"bravo".to_vec()]],
+        "a rejected recovery must not truncate the side-file it could not hold"
+    );
+    assert_eq!(
+        std::fs::read_dir(&slot_dir).unwrap().count(),
+        sfa_files_before,
+        "a rejected recovery must leave the queued segments on disk"
+    );
+}
+
+#[test]
 fn store_and_forward_file_mode_replays_both_frames_when_the_first_dict_chunk_is_corrupt() {
     // Regression (data loss + duplication). A slot whose `.symbol-dict` loses its
     // FIRST chunk to a host-crash tear recovers ZERO entries, which looks like the

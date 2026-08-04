@@ -318,6 +318,15 @@ impl PooledSenderCore {
             // Take the recovered entries so the (potentially large) buffer is freed
             // after seeding rather than living dead in `state` -- which the backend
             // holds for its whole life -- for the connection's duration.
+            //
+            // Propagate a seed failure rather than degrading to dense: this is a
+            // producer, so a partially-seeded dictionary (which is what `seed`
+            // leaves behind) would hand the next interned symbol an id the stored
+            // frames already use. The orphan drainer deliberately does the
+            // opposite on the same error; both sides are argued in
+            // `SymbolGlobalDict::seed`'s docs. `SymbolDictFull` reaches the caller
+            // intact here, so a slot recovered by an under-capped client fails
+            // loudly and stays on disk.
             let recovered = std::mem::take(&mut state.recovered_dict_entries);
             foreground.seed(&recovered, state.recovered_dict_count)?;
         }
