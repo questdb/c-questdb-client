@@ -122,9 +122,41 @@ struct TrafficGateState {
 }
 
 // Clears a newly registered socket if TLS or WebSocket setup returns early.
+#[cfg(all(test, unix))]
+type TestRawSocket = std::os::fd::RawFd;
+
+#[cfg(all(test, windows))]
+type TestRawSocket = std::os::windows::io::RawSocket;
+
 struct TrafficRegistration<'a> {
     gate: &'a TrafficGate,
     armed: bool,
+    #[cfg(all(test, any(unix, windows)))]
+    original: TestRawSocket,
+}
+
+#[cfg(all(test, unix))]
+fn test_socket_is_open(socket: TestRawSocket) -> bool {
+    // SAFETY: F_GETFD only inspects the descriptor value and dereferences no pointers.
+    unsafe { libc::fcntl(socket, libc::F_GETFD) != -1 }
+}
+
+#[cfg(all(test, windows))]
+fn test_socket_is_open(socket: TestRawSocket) -> bool {
+    use windows_sys::Win32::Networking::WinSock::{SO_TYPE, SOL_SOCKET, getsockopt};
+
+    let mut socket_type = 0i32;
+    let mut option_len = std::mem::size_of_val(&socket_type) as i32;
+    // SAFETY: the output buffer is a live i32 and option_len describes its exact size.
+    unsafe {
+        getsockopt(
+            socket,
+            SOL_SOCKET,
+            SO_TYPE,
+            (&mut socket_type as *mut i32).cast(),
+            &mut option_len,
+        ) == 0
+    }
 }
 
 impl TrafficGate {
@@ -148,6 +180,16 @@ impl TrafficGate {
         Ok(TrafficRegistration {
             gate: self,
             armed: true,
+            #[cfg(all(test, unix))]
+            original: {
+                use std::os::fd::AsRawFd;
+                stream.as_raw_fd()
+            },
+            #[cfg(all(test, windows))]
+            original: {
+                use std::os::windows::io::AsRawSocket;
+                stream.as_raw_socket()
+            },
         })
     }
 
@@ -202,6 +244,20 @@ impl TrafficRegistration<'_> {
 impl Drop for TrafficRegistration<'_> {
     fn drop(&mut self) {
         if self.armed {
+            #[cfg(all(test, any(unix, windows)))]
+            {
+                let state = self
+                    .gate
+                    .state
+                    .lock()
+                    .unwrap_or_else(|err| err.into_inner());
+                if state.current.is_some() {
+                    assert!(
+                        test_socket_is_open(self.original),
+                        "traffic gate registration outlived its original socket"
+                    );
+                }
+            }
             self.gate.clear();
         }
     }
@@ -3007,6 +3063,9 @@ pub(crate) fn establish_connection(
     let connect_timeout =
         effective_connect_timeout(connect_kind.is_background(), *qwp_ws.connect_timeout);
 
+    // Windows safety invariant: while the gate stores tcp's raw socket,
+    // traffic_registration must drop before tcp. Keep tcp in this outer scope
+    // until every fallible TLS/WebSocket setup step has completed.
     let mut tcp = connect_qwp_ws_tcp(host, port, request_timeout, connect_timeout)?;
     let traffic_registration = traffic_gate
         .map(|gate| gate.register(tcp.tcp()))
@@ -3053,28 +3112,16 @@ pub(crate) fn establish_connection(
             .set_write_timeout(Some(QWP_WS_TLS_HANDSHAKE_TIMEOUT))
             .ok();
         complete_qwp_ws_tls_handshake(&mut conn, &mut tcp, QWP_WS_TLS_HANDSHAKE_TIMEOUT)?;
-        let mut tls_stream = rustls::StreamOwned::new(conn, tcp);
-        tls_stream
-            .get_ref()
-            .tcp()
-            .set_read_timeout(Some(request_timeout))
-            .ok();
-        tls_stream
-            .get_ref()
-            .tcp()
-            .set_write_timeout(Some(request_timeout))
-            .ok();
+        tcp.tcp().set_read_timeout(Some(request_timeout)).ok();
+        tcp.tcp().set_write_timeout(Some(request_timeout)).ok();
         // The shared `upgrade()` does both the request write and the
         // response read in one call. Switch SO_RCVTIMEO to `auth_timeout`
         // first: the write happens immediately (doesn't depend on
         // read_timeout), and the response read is what auth_timeout bounds.
-        tls_stream
-            .get_ref()
-            .tcp()
-            .set_read_timeout(Some(auth_timeout))
-            .ok();
+        tcp.tcp().set_read_timeout(Some(auth_timeout)).ok();
         let extras =
             codec::qwp_extra_headers(auth_header, max_version, client_id, request_durable_ack);
+        let mut tls_stream = rustls::Stream::new(&mut conn, &mut tcp);
         let handshake =
             crate::ws::handshake::upgrade(&mut tls_stream, &host_header, codec::WS_PATH, &extras)
                 .map_err(codec::handshake_error_to_ingress)?;
@@ -3085,17 +3132,16 @@ pub(crate) fn establish_connection(
         )?;
         let leftover = handshake.leftover;
         (
-            WsStream::Tls(Box::new(tls_stream)),
+            WsStream::Tls(Box::new(rustls::StreamOwned::new(conn, tcp))),
             handshake_result,
             leftover,
         )
     } else {
-        let mut plain_stream = tcp;
-        plain_stream.tcp().set_read_timeout(Some(auth_timeout)).ok();
+        tcp.tcp().set_read_timeout(Some(auth_timeout)).ok();
         let extras =
             codec::qwp_extra_headers(auth_header, max_version, client_id, request_durable_ack);
         let handshake =
-            crate::ws::handshake::upgrade(&mut plain_stream, &host_header, codec::WS_PATH, &extras)
+            crate::ws::handshake::upgrade(&mut tcp, &host_header, codec::WS_PATH, &extras)
                 .map_err(codec::handshake_error_to_ingress)?;
         let handshake_result = codec::validate_qwp_handshake_headers(
             &handshake.headers,
@@ -3103,7 +3149,7 @@ pub(crate) fn establish_connection(
             request_durable_ack,
         )?;
         let leftover = handshake.leftover;
-        (WsStream::Plain(plain_stream), handshake_result, leftover)
+        (WsStream::Plain(tcp), handshake_result, leftover)
     };
 
     stream
@@ -4482,6 +4528,122 @@ mod tests {
         };
         assert_eq!(err.kind(), ErrorKind::Interrupted);
         assert_eq!(peer.read(&mut byte).unwrap(), 0);
+    }
+
+    fn reject_websocket_upgrade(stream: &mut (impl Read + Write)) {
+        let mut request = Vec::new();
+        let mut chunk = [0u8; 256];
+        while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+            let read = stream.read(&mut chunk).unwrap();
+            assert!(read > 0, "client closed before sending the upgrade request");
+            request.extend_from_slice(&chunk[..read]);
+        }
+        stream
+            .write_all(
+                b"HTTP/1.1 101 Switching Protocols\r\n\
+                  Upgrade: websocket\r\n\
+                  Connection: Upgrade\r\n\
+                  Sec-WebSocket-Accept: invalid\r\n\
+                  \r\n",
+            )
+            .unwrap();
+        stream.flush().unwrap();
+    }
+
+    fn test_tls_server_config() -> Arc<rustls::ServerConfig> {
+        use rustls_pki_types::pem::PemObject;
+        use rustls_pki_types::{CertificateDer, PrivateKeyDer};
+        use std::fs::File;
+
+        let mut certs_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        certs_dir.pop();
+        certs_dir.push("tls_certs");
+        let cert_file = File::open(certs_dir.join("server.crt")).unwrap();
+        let key_file = File::open(certs_dir.join("server.key")).unwrap();
+        let certs = CertificateDer::pem_reader_iter(cert_file)
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        let key = PrivateKeyDer::from_pem_reader(key_file).unwrap();
+        Arc::new(
+            rustls::ServerConfig::builder()
+                .with_no_client_auth()
+                .with_single_cert(certs, key)
+                .unwrap(),
+        )
+    }
+
+    #[test]
+    fn failed_upgrade_clears_traffic_gate_before_original_socket_closes() {
+        use std::net::{Ipv4Addr, TcpListener};
+
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = std::thread::spawn(move || {
+            let (mut peer, _) = listener.accept().unwrap();
+            peer.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+            reject_websocket_upgrade(&mut peer);
+        });
+
+        let qwp_ws =
+            crate::ingress::SenderBuilder::from_conf(format!("ws::addr=127.0.0.1:{port};"))
+                .unwrap()
+                .qwp_ws
+                .unwrap();
+        let gate = TrafficGate::default();
+        let result = establish_connection(
+            "127.0.0.1",
+            &port.to_string(),
+            false,
+            None,
+            QwpWsConnectKind::Foreground,
+            &qwp_ws,
+            None,
+            Some(&gate),
+        );
+
+        assert!(result.is_err());
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn failed_tls_upgrade_clears_traffic_gate_before_original_socket_closes() {
+        use std::net::{Ipv4Addr, TcpListener};
+
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server_config = test_tls_server_config();
+        let server = std::thread::spawn(move || {
+            let (mut peer, _) = listener.accept().unwrap();
+            peer.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+            let mut conn = rustls::ServerConnection::new(server_config).unwrap();
+            let mut tls_stream = rustls::Stream::new(&mut conn, &mut peer);
+            reject_websocket_upgrade(&mut tls_stream);
+        });
+
+        let mut root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        root.pop();
+        root.push("tls_certs/server_rootCA.pem");
+        let builder = crate::ingress::SenderBuilder::from_conf(format!(
+            "wss::addr=localhost:{port};tls_roots={};",
+            root.display()
+        ))
+        .unwrap();
+        let (use_tls, tls_settings, qwp_ws, auth_header) =
+            builder.resolve_qwp_ws_ingredients().unwrap();
+        let gate = TrafficGate::default();
+        let result = establish_connection(
+            "localhost",
+            &port.to_string(),
+            use_tls,
+            tls_settings,
+            QwpWsConnectKind::Foreground,
+            &qwp_ws,
+            auth_header.as_deref(),
+            Some(&gate),
+        );
+
+        assert!(result.is_err());
+        server.join().unwrap();
     }
 
     #[test]
