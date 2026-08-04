@@ -5331,7 +5331,15 @@ const QWP_FLAG_DEFER_COMMIT: u8 = 0x01;
 /// The dictionary is owned by the sender and lives for the duration of the
 /// WebSocket connection. New symbols added during a flush are recorded in the
 /// per-message delta section so the server can rebuild the same global
-/// dictionary; on reconnect both sides reset.
+/// dictionary.
+///
+/// A reconnect does **not** reset either side. This dictionary belongs to the
+/// sender, not to the socket, and nothing on the reconnect path clears it:
+/// `finish_reconnect_success` instead arms the catch-up that re-registers the
+/// whole of it on the fresh server (from the I/O thread's `SentDictMirror`, see
+/// `super::super::sender::qwp_ws_sfa_catchup`), and in dense mode every frame
+/// re-ships the dictionary anyway. Only discarding the owning connection resets
+/// it.
 ///
 /// Capped at [`MAX_CONN_SYMBOL_DICT_SIZE`] to mirror the server's
 /// connection-scoped dictionary ceiling and the Java reference client.
@@ -5388,10 +5396,16 @@ impl Default for SymbolGlobalDict {
 /// (`MAX_SYMBOL_DICTIONARY_SIZE`) and the Java reference client's
 /// `MAX_SYMBOL_DICTIONARY_SIZE` (both `1_000_000`), so the client refuses a symbol
 /// the server would reject the delta for, rather than only discovering it on the
-/// wire. When the cap is reached the encoder surfaces an `InvalidApiCall` error and
-/// the caller is expected to reconnect (which resets both sides). (The
-/// egress/query-result reader has its own, independent ceiling; see
-/// `egress/symbol_dict.rs`.)
+/// wire. When the cap is reached [`intern`](SymbolGlobalDict::intern) returns
+/// [`SymbolDictFull`](crate::ErrorCode::SymbolDictFull) -- a distinct code so a
+/// caller can recognise a full dictionary without matching on the message text.
+///
+/// Reconnecting does NOT clear it, so it is not the remedy: the dictionary
+/// outlives the socket and a reconnect re-registers the whole of it on the fresh
+/// server (see the note on [`SymbolGlobalDict`]). Only discarding the connection
+/// that owns it resets it; [`SymbolDictFull`](crate::ErrorCode::SymbolDictFull)
+/// carries the per-API list of how. (The egress/query-result reader has its own,
+/// independent ceiling; see `egress/symbol_dict.rs`.)
 #[cfg(feature = "_sender-qwp-ws")]
 pub(crate) const MAX_CONN_SYMBOL_DICT_SIZE: usize = 1_000_000;
 
