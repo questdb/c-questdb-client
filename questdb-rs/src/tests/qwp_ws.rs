@@ -1154,7 +1154,7 @@ fn spawn_terminal_then_drain_orphan_server() -> TerminalThenDrainOrphanServer {
     }
 }
 
-struct RoleTerminalThenDrainOrphanServer {
+struct RoleRejectThenDrainOrphanServer {
     port: u16,
     rejected_rx: mpsc::Receiver<Vec<u8>>,
     drained_rx: mpsc::Receiver<Vec<u8>>,
@@ -1204,7 +1204,11 @@ fn spawn_catch_up_failure_then_drain_orphan_server(
     }
 }
 
-fn spawn_role_terminal_then_drain_orphan_server() -> RoleTerminalThenDrainOrphanServer {
+/// One listener modelling a mid-drain role switch: the orphan drainer's first
+/// wire session reaches a replica that accepts the upgrade and the catch-up
+/// but answers the data frame with NOT_WRITABLE; the recycled connection
+/// reaches the promoted primary, which ACKs the replayed frame.
+fn spawn_role_reject_then_drain_orphan_server() -> RoleRejectThenDrainOrphanServer {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();
     let (rejected_tx, rejected_rx) = mpsc::channel();
@@ -1237,7 +1241,7 @@ fn spawn_role_terminal_then_drain_orphan_server() -> RoleTerminalThenDrainOrphan
         thread::sleep(Duration::from_millis(50));
     });
 
-    RoleTerminalThenDrainOrphanServer {
+    RoleRejectThenDrainOrphanServer {
         port,
         rejected_rx,
         drained_rx,
@@ -3302,16 +3306,15 @@ fn qwp_ws_background_terminal_orphan_releases_worker_for_next_slot() {
 }
 
 #[test]
-fn qwp_ws_background_role_terminal_reopens_and_drains_orphan() {
+fn qwp_ws_background_role_reject_recycles_wire_and_drains_orphan() {
     let sf_dir = tempfile::TempDir::new().unwrap();
     seed_orphan_slot(sf_dir.path());
 
-    let server = spawn_role_terminal_then_drain_orphan_server();
+    let server = spawn_role_reject_then_drain_orphan_server();
     let drain_conf = format!(
         "ws::addr=127.0.0.1:{};\
          sf_dir={};sender_id=primary;drain_orphans=on;\
-         max_background_drainers=1;max_frame_rejections=1;\
-         poison_min_escalation_window_millis=0;\
+         max_background_drainers=1;\
          reconnect_initial_backoff_millis=10;reconnect_max_backoff_millis=20;\
          sf_max_segment_bytes=256;sf_max_total_bytes=1024;",
         server.port,
@@ -3329,10 +3332,10 @@ fn qwp_ws_background_role_terminal_reopens_and_drains_orphan() {
     let drained = server
         .drained_rx
         .recv_timeout(Duration::from_secs(2))
-        .expect("role-terminal orphan was not retried on a fresh session");
+        .expect("role-rejected orphan was not retried on a recycled connection");
     assert_eq!(
         rejected, drained,
-        "fresh session must replay the same frame"
+        "the recycled connection must replay the same frame"
     );
 
     let orphan_slot = sf_dir.path().join("orphan");

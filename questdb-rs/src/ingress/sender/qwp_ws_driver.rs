@@ -191,6 +191,16 @@ pub(crate) struct QwpWsSendCore<T> {
     poison_tracker: PoisonFrameTracker,
     max_frame_rejections: usize,
     poison_min_escalation_window: Duration,
+    /// Consecutive role/writability (`RetriableOther`) recycles with no
+    /// completed-watermark progress in between, paired with the watermark
+    /// observed at the last such recycle. Role rejects are strike-exempt and
+    /// never terminal (a node-state verdict says nothing about the bytes), so
+    /// this counter is the only thing bounding an all-replica window: the
+    /// first zero-progress recycle stays immediate (a genuine failover must
+    /// rotate endpoints without delay), consecutive ones pace with the capped
+    /// doubling dose. Mirrors the Java client's `failExemptPaced`.
+    zero_progress_role_recycles: usize,
+    completed_at_last_role_recycle: Option<u64>,
     sends_on_connection: u64,
 }
 
@@ -764,35 +774,6 @@ impl<Q: PublicationLog> QwpWsPublicationStore<Q> {
         self.record_terminal_sender_error(sender_error, terminal_error, None)
     }
 
-    /// Terminal for a well-formed frame the server keeps rejecting without ACK
-    /// progress because of its role/writability state — a read-only replica
-    /// after an in-place primary→replica switch — not because the frame is
-    /// malformed. Unlike [`Self::record_protocol_violation`] this is NOT a
-    /// protocol violation: it is recorded under the reject's own category
-    /// (`NotWritable`) and surfaced as `StoreResendRequired`, so a file-backed
-    /// slot's orphan drainer (or a fresh sender) resends the affected data
-    /// rather than mislabeling a graceful role switch as a wire-protocol
-    /// violation.
-    pub(crate) fn record_role_reject_resend(&mut self, status: u8, reason: String) -> Error {
-        let from_fsn = self
-            .queue
-            .completed_fsn()
-            .map_or(0, |fsn| fsn.saturating_add(1));
-        let to_fsn = self.queue.published_fsn().unwrap_or(from_fsn).max(from_fsn);
-        let sender_error = QwpWsSenderError {
-            category: server_error_category(status),
-            applied_policy: QwpWsErrorPolicy::Terminal,
-            status: Some(status),
-            message: Some(reason.clone()),
-            message_sequence: None,
-            from_fsn,
-            to_fsn,
-        };
-        let terminal_error = error::fmt!(StoreResendRequired, "{reason}")
-            .with_qwp_ws_rejection(sender_error.clone());
-        self.record_terminal_sender_error(sender_error, terminal_error, None)
-    }
-
     pub(crate) fn poll_sender_error(&mut self) -> Option<QwpWsSenderError> {
         self.sender_errors.poll()
     }
@@ -888,6 +869,8 @@ impl<T: QwpWsCoreTransport> QwpWsSendCore<T> {
             poison_tracker: PoisonFrameTracker::default(),
             max_frame_rejections,
             poison_min_escalation_window,
+            zero_progress_role_recycles: 0,
+            completed_at_last_role_recycle: None,
             sends_on_connection: 0,
         }
     }
@@ -954,7 +937,18 @@ impl<T: QwpWsCoreTransport> QwpWsSendCore<T> {
                     return Ok(DriveOutcome::Terminal);
                 }
 
-                if self.rejected_head_is_poison(store, fsn) {
+                // A read-only/role reject (RetriableOther, e.g. a replica
+                // after an in-place role switch) is a node-state verdict, not
+                // a frame verdict: the frame is well-formed, the node just
+                // cannot serve writes right now. It never counts a poison
+                // strike and never terminalizes -- a transient all-replica
+                // window must not escalate to a producer-fatal terminal. It
+                // recycles below instead, bounded in rate by the zero-progress
+                // pace so a persistent window churns at the backoff cap
+                // rather than at handshake RTT rate.
+                if policy != QwpWsErrorPolicy::RetriableOther
+                    && self.rejected_head_is_poison(store, fsn)
+                {
                     let strikes = self.poison_tracker.strikes();
                     let reason = if error.message.is_empty() {
                         format!(
@@ -967,26 +961,14 @@ impl<T: QwpWsCoreTransport> QwpWsSendCore<T> {
                             strikes, error.message
                         )
                     };
-                    let status = error.status;
                     store.last_server_error = Some(error);
-                    // A read-only/role reject (RetriableOther, e.g. a replica
-                    // after an in-place role switch) is not a protocol
-                    // violation: the frame is well-formed, the server just will
-                    // not take it while read-only. Terminalize it as "resend
-                    // required" under its own category so a file-backed slot's
-                    // orphan drainer resends it, instead of mislabeling a
-                    // graceful role switch as a wire-protocol violation.
-                    if policy == QwpWsErrorPolicy::RetriableOther {
-                        store.record_role_reject_resend(status, reason)
-                    } else {
-                        store.record_protocol_violation(None, reason)
-                    };
+                    store.record_protocol_violation(None, reason);
                     return Ok(DriveOutcome::Terminal);
                 }
 
                 let error_for_reconnect = error.error.clone();
                 let reconnect_reason = reconnect_reason_for_policy(policy);
-                let pace = self.reconnect_pace_for_reject_policy(policy);
+                let pace = self.reconnect_pace_for_reject_policy(store, policy);
                 let sender_error = store.record_rejected_frame(fsn, wire_seq, error, policy);
                 store.push_event(DriverEvent::Rejected { fsn, wire_seq });
                 let initial_error = server_rejection_error(error_for_reconnect, sender_error);
@@ -1096,9 +1078,8 @@ impl<T: QwpWsCoreTransport> QwpWsSendCore<T> {
         } else {
             // A Retriable presend reject carries no FSN -- most commonly the server
             // rejecting the table-less symbol-dictionary catch-up frame a reconnect
-            // emits before replaying the queued frames (e.g. a read-only replica
-            // after an in-place role switch). It still has to be bounded: the
-            // transport reconnect itself succeeds (the server accepts the
+            // emits before replaying the queued frames. It still has to be bounded:
+            // the transport reconnect itself succeeds (the server accepts the
             // connection, it just rejects the catch-up), so the reconnect retry
             // budget -- which only counts failed dials -- never trips, and without
             // escalation a server that persistently rejects the catch-up would
@@ -1106,9 +1087,13 @@ impl<T: QwpWsCoreTransport> QwpWsSendCore<T> {
             // the caller's own deadline. Attribute it to the oldest unresolved
             // frame (the one the catch-up exists to unblock) and run it through the
             // same poison tracker as a real-frame reject, so repeated no-progress
-            // rejects escalate to a loud terminal ("resend required") after
-            // max_frame_rejections while a transient/role reject still failovers.
-            if let Some(oldest) = store.queue.oldest_unresolved_fsn()
+            // rejects escalate to a loud terminal after max_frame_rejections.
+            // A RetriableOther (role/read-only) presend reject is exempt, exactly
+            // like the post-send path above: a node-state verdict says nothing
+            // about the queued bytes, so it never strikes and never terminalizes
+            // -- the zero-progress pace below bounds its recycle rate instead.
+            if policy != QwpWsErrorPolicy::RetriableOther
+                && let Some(oldest) = store.queue.oldest_unresolved_fsn()
                 && self.rejected_head_is_poison(store, oldest)
             {
                 let strikes = self.poison_tracker.strikes();
@@ -1124,22 +1109,15 @@ impl<T: QwpWsCoreTransport> QwpWsSendCore<T> {
                         strikes, error.message
                     )
                 };
-                let status = error.status;
                 store.last_server_error = Some(error);
                 store.push_sender_error(sender_error);
-                // See `handle_reject`: a role/read-only catch-up reject is
-                // "resend required", not a protocol violation.
-                if policy == QwpWsErrorPolicy::RetriableOther {
-                    store.record_role_reject_resend(status, reason)
-                } else {
-                    store.record_protocol_violation(None, reason)
-                };
+                store.record_protocol_violation(None, reason);
                 return Ok(DriveOutcome::Terminal);
             }
             let initial_error = server_rejection_error(error.error.clone(), sender_error.clone());
             store.last_server_error = Some(error);
             store.push_sender_error(sender_error);
-            let pace = self.reconnect_pace_for_reject_policy(policy);
+            let pace = self.reconnect_pace_for_reject_policy(store, policy);
             self.pending_reconnect = Some(
                 self.begin_reconnect(
                     "QWP/WebSocket reconnect after server rejection",
@@ -1152,11 +1130,43 @@ impl<T: QwpWsCoreTransport> QwpWsSendCore<T> {
         }
     }
 
-    fn reconnect_pace_for_reject_policy(&self, policy: QwpWsErrorPolicy) -> Duration {
-        if policy == QwpWsErrorPolicy::Retriable {
-            self.reconnect_pace_for_strikes(self.poison_tracker.strikes().max(1))
-        } else {
+    fn reconnect_pace_for_reject_policy<Q: PublicationLog>(
+        &mut self,
+        store: &QwpWsPublicationStore<Q>,
+        policy: QwpWsErrorPolicy,
+    ) -> Duration {
+        match policy {
+            QwpWsErrorPolicy::Retriable => {
+                self.reconnect_pace_for_strikes(self.poison_tracker.strikes().max(1))
+            }
+            QwpWsErrorPolicy::RetriableOther => self.role_recycle_pace(store),
+            QwpWsErrorPolicy::Terminal => Duration::ZERO,
+        }
+    }
+
+    /// Pace for a strike-exempt role/writability recycle (`RetriableOther`,
+    /// i.e. NOT_WRITABLE). The first recycle after any completed-watermark
+    /// progress is immediate so a genuine failover rotates endpoints without
+    /// delay; consecutive recycles with no progress in between escalate
+    /// through the same capped doubling dose as poison pacing, so an
+    /// all-replica window churns at the backoff cap instead of wire speed.
+    /// The reset signal is the completed watermark alone -- "connected" or
+    /// "frames sent" is not progress, only an acknowledged frame is.
+    fn role_recycle_pace<Q: PublicationLog>(
+        &mut self,
+        store: &QwpWsPublicationStore<Q>,
+    ) -> Duration {
+        let completed = store.queue.completed_fsn();
+        if completed != self.completed_at_last_role_recycle {
+            self.zero_progress_role_recycles = 0;
+            self.completed_at_last_role_recycle = completed;
+        }
+        let level = self.zero_progress_role_recycles;
+        self.zero_progress_role_recycles = level.saturating_add(1);
+        if level == 0 {
             Duration::ZERO
+        } else {
+            self.reconnect_pace_for_strikes(level)
         }
     }
 
@@ -4675,11 +4685,12 @@ mod tests {
         // catch-up frame a reconnect emits carries no FSN, so its reject lands in
         // `record_presend_reject`. That path must be bounded by the poison ceiling
         // like a real-frame reject: a server that accepts the connection but keeps
-        // rejecting the catch-up (e.g. a read-only replica after an in-place role
-        // switch) would otherwise reconnect-loop forever, masking a permanent
-        // failure as a hang. It must escalate to a loud terminal after
+        // rejecting the catch-up would otherwise reconnect-loop forever, masking a
+        // permanent failure as a hang. It must escalate to a loud terminal after
         // max_frame_rejections so the caller learns the queued data needs
-        // resending. (The catch-up wire-seq -> None mapping is covered by
+        // resending. (Role/NOT_WRITABLE catch-up rejects are strike-exempt and
+        // never terminal; only Retriable statuses walk this ceiling. The catch-up
+        // wire-seq -> None mapping is covered by
         // `catch_up_offset_maps_replay_acks_and_ignores_catch_up_acks`.)
         let mut driver = driver(FakeOrderedServer::no_response());
         let receipt = driver.try_submit(b"queued-frame").unwrap();
@@ -5955,14 +5966,23 @@ mod tests {
     }
 
     #[test]
-    fn not_writable_reject_reconnects_immediately_without_pace() {
-        let transport = TestTransport::scripted([Ok(TransportSendResult::Response(
-            TransportResponse::Reject {
+    fn not_writable_first_recycle_immediate_then_zero_progress_recycles_escalate() {
+        // The first role recycle is immediate: a genuine failover must rotate
+        // endpoints without delay. Consecutive recycles with no completed-
+        // watermark progress in between pace with the doubling, capped dose so
+        // an all-replica window cannot churn reconnects at wire speed.
+        let not_writable_reject = || {
+            Ok(TransportSendResult::Response(TransportResponse::Reject {
                 wire_seq: 0,
                 error: not_writable_error("replica access is read-only"),
-            },
-        ))])
-        .with_restart_results([Ok(())]);
+            }))
+        };
+        let transport = TestTransport::scripted([
+            not_writable_reject(),
+            not_writable_reject(),
+            not_writable_reject(),
+        ])
+        .with_restart_results([Ok(()), Ok(())]);
         let mut driver = QwpWsCoreTestHarness::from_queue_with_reconnect_policy(
             memory_queue(options(8, 1024, 4)),
             transport,
@@ -5978,6 +5998,99 @@ mod tests {
             }
         );
         assert_eq!(driver.send_core.transport.restart_attempts, 1);
+
+        match driver.drive_once().unwrap() {
+            DriveOutcome::ReconnectDelay { sleep_for, .. } => {
+                assert_pace_range(
+                    sleep_for,
+                    Duration::from_millis(100),
+                    Duration::from_millis(200),
+                );
+            }
+            other => panic!("expected first zero-progress pace, got {other:?}"),
+        }
+        assert_eq!(
+            driver.drive_once().unwrap(),
+            DriveOutcome::Reconnected {
+                reason: ReconnectReason::NotWritable
+            }
+        );
+        match driver.drive_once().unwrap() {
+            DriveOutcome::ReconnectDelay { sleep_for, .. } => {
+                assert_pace_range(
+                    sleep_for,
+                    Duration::from_millis(200),
+                    Duration::from_millis(400),
+                );
+            }
+            other => panic!("expected doubled zero-progress pace, got {other:?}"),
+        }
+        assert_eq!(driver.send_core.transport.restart_attempts, 2);
+    }
+
+    #[test]
+    fn ack_progress_resets_not_writable_recycle_pace() {
+        // Only completed-watermark progress resets the zero-progress ladder --
+        // reconnecting or resending is not progress. After a genuine ACK the
+        // next role recycle is immediate again.
+        let transport = TestTransport::scripted([
+            Ok(TransportSendResult::Response(TransportResponse::Reject {
+                wire_seq: 0,
+                error: not_writable_error("replica access is read-only"),
+            })),
+            Ok(TransportSendResult::Response(TransportResponse::Ack {
+                wire_seq: 0,
+            })),
+            Ok(TransportSendResult::Response(TransportResponse::Reject {
+                wire_seq: 1,
+                error: not_writable_error("replica access is read-only"),
+            })),
+            Ok(TransportSendResult::Response(TransportResponse::Reject {
+                wire_seq: 0,
+                error: not_writable_error("replica access is read-only"),
+            })),
+        ])
+        .with_restart_results([Ok(()), Ok(()), Ok(())]);
+        let mut driver = QwpWsCoreTestHarness::from_queue_with_reconnect_policy(
+            memory_queue(options(8, 1024, 4)),
+            transport,
+            paced_policy(),
+            false,
+        );
+        driver.try_submit(b"first").unwrap();
+
+        assert_eq!(
+            driver.drive_once().unwrap(),
+            DriveOutcome::Reconnected {
+                reason: ReconnectReason::NotWritable
+            }
+        );
+        assert_eq!(
+            driver.drive_once().unwrap(),
+            DriveOutcome::Acked { wire_seq: 0 }
+        );
+        assert_eq!(driver.acked_fsn(), Some(0));
+
+        driver.try_submit(b"second").unwrap();
+        assert_eq!(
+            driver.drive_once().unwrap(),
+            DriveOutcome::Reconnected {
+                reason: ReconnectReason::NotWritable
+            },
+            "the first recycle after ACK progress must be immediate again"
+        );
+        match driver.drive_once().unwrap() {
+            DriveOutcome::ReconnectDelay { sleep_for, .. } => {
+                assert_pace_range(
+                    sleep_for,
+                    Duration::from_millis(100),
+                    Duration::from_millis(200),
+                );
+            }
+            other => {
+                panic!("expected zero-progress pace to restart at the initial dose, got {other:?}")
+            }
+        }
     }
 
     #[test]
@@ -8596,48 +8709,49 @@ mod tests {
     }
 
     #[test]
-    fn role_reject_poison_terminal_is_resend_required_not_protocol_violation() {
+    fn role_reject_never_terminalizes_and_never_strikes() {
         // A read-only / role reject (NOT_WRITABLE, e.g. a replica after an
-        // in-place role switch) that persists past the poison budget must
-        // terminalize under the NotWritable category as "resend required" - NOT
-        // as a ProtocolViolation. A graceful role switch is not a wire-protocol
-        // violation, and the queued data stays recoverable for a resend.
+        // in-place role switch) is a node-state verdict, not a frame verdict:
+        // no matter how often it repeats it must neither count poison strikes
+        // nor latch the store terminal. A transient all-replica window heals
+        // by promotion; the zero-progress pace bounds the recycle rate, so
+        // repeated rejects far past max_frame_rejections keep the queued data
+        // published and replayable.
         let mut driver = driver(FakeOrderedServer::scripted([
             FakeSendResult::RejectWireNotWritable { wire_seq: 0 },
             FakeSendResult::RejectWireNotWritable { wire_seq: 1 },
             FakeSendResult::RejectWireNotWritable { wire_seq: 2 },
             FakeSendResult::RejectWireNotWritable { wire_seq: 3 },
+            FakeSendResult::RejectWireNotWritable { wire_seq: 4 },
+            FakeSendResult::RejectWireNotWritable { wire_seq: 5 },
         ]));
-        let (sink, callback_ran) = terminal_latch_asserting_sink(driver.store.lifecycle());
-        driver.store.set_rejection_sink(Some(sink));
         let receipt = driver.try_submit(b"payload").unwrap();
 
-        let mut outcome = driver.drive_once().unwrap();
-        for _ in 0..8 {
-            if outcome == DriveOutcome::Terminal {
-                break;
-            }
-            outcome = driver.drive_once().unwrap();
+        for _ in 0..12 {
+            let outcome = driver.drive_once().unwrap();
+            assert_ne!(
+                outcome,
+                DriveOutcome::Terminal,
+                "a role reject must never terminalize"
+            );
         }
-        assert_eq!(outcome, DriveOutcome::Terminal);
+        assert!(!driver.is_terminal());
         assert_eq!(
-            driver.receipt_status(receipt),
-            QwpReceiptStatus::Terminal { fsn: 0 }
+            driver.send_core.poison_tracker.strikes(),
+            0,
+            "role rejects are strike-exempt"
         );
-
-        let terminal_error = driver.terminal_sender_error().unwrap();
-        assert_eq!(
-            terminal_error.category,
-            QwpWsErrorCategory::NotWritable,
-            "role reject must terminalize under its own category, not ProtocolViolation"
+        let status = driver.receipt_status(receipt);
+        assert!(
+            matches!(
+                status,
+                QwpReceiptStatus::Published { fsn: 0 } | QwpReceiptStatus::Sent { fsn: 0, .. }
+            ),
+            "the queued frame must stay replayable, got {status:?}"
         );
-        assert_ne!(
-            terminal_error.category,
-            QwpWsErrorCategory::ProtocolViolation
-        );
-        assert_eq!(terminal_error.applied_policy, QwpWsErrorPolicy::Terminal);
-        assert_eq!(terminal_error.status, Some(codec::WS_STATUS_NOT_WRITABLE));
-        assert!(callback_ran.load(Ordering::Acquire));
+        let error = driver.poll_sender_error().unwrap();
+        assert_eq!(error.category, QwpWsErrorCategory::NotWritable);
+        assert_eq!(error.applied_policy, QwpWsErrorPolicy::RetriableOther);
     }
 
     #[test]
