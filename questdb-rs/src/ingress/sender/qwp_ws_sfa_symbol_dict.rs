@@ -837,11 +837,399 @@ pub(crate) fn parse_chunks(path: &Path) -> Vec<Vec<Vec<u8>>> {
 
 #[cfg(test)]
 mod tests {
+    use std::env;
+    use std::path::PathBuf;
+    use std::process::Command;
+
     use super::*;
+
+    /// Bytes written by the Java reference client's `PersistedSymbolDict` (see
+    /// `src/tests/interop/qwp-ws-sfa/README.md` for provenance and how to
+    /// regenerate). Two chunks: `["one"]` then `["two", "three"]` -- a
+    /// single-entry chunk and a multi-entry one, so the fixture pins the framing
+    /// the per-chunk CRC exists for, not just the degenerate one-symbol case.
+    const JAVA_SYMBOL_DICT_FIXTURE_HEX: &str =
+        include_str!("../../tests/interop/qwp-ws-sfa/java-two-chunk.symbol-dict.hex");
+    /// The same Java bytes with one value byte flipped inside chunk 1 (`'t'` of
+    /// `"two"` -> `'u'`): same length, so only that chunk's stored CRC goes stale.
+    const JAVA_SYMBOL_DICT_TORN_FIXTURE_HEX: &str =
+        include_str!("../../tests/interop/qwp-ws-sfa/java-two-chunk-torn-tail.symbol-dict.hex");
+
+    /// Offset of the byte the torn fixture flips, and the offset recovery must
+    /// truncate back to once chunk 1 is rejected (= the end of chunk 0).
+    const TORN_BYTE_OFFSET: usize = 21;
+    const TORN_TRUNCATED_LEN: u64 = 18;
 
     fn tmp_slot() -> tempfile::TempDir {
         tempfile::tempdir().unwrap()
     }
+
+    fn java_symbol_dict_fixture() -> Vec<u8> {
+        decode_hex_fixture(JAVA_SYMBOL_DICT_FIXTURE_HEX)
+    }
+
+    fn java_symbol_dict_torn_fixture() -> Vec<u8> {
+        decode_hex_fixture(JAVA_SYMBOL_DICT_TORN_FIXTURE_HEX)
+    }
+
+    fn decode_hex_fixture(hex: &str) -> Vec<u8> {
+        let mut nibbles = Vec::new();
+        for byte in hex.bytes() {
+            let value = match byte {
+                b'0'..=b'9' => byte - b'0',
+                b'a'..=b'f' => byte - b'a' + 10,
+                b'A'..=b'F' => byte - b'A' + 10,
+                b' ' | b'\n' | b'\r' | b'\t' => continue,
+                other => panic!("invalid hex byte {other:?} in fixture"),
+            };
+            nibbles.push(value);
+        }
+        assert!(nibbles.len().is_multiple_of(2), "odd hex nibble count");
+        nibbles
+            .chunks(2)
+            .map(|pair| (pair[0] << 4) | pair[1])
+            .collect()
+    }
+
+    fn format_hex_fixture(bytes: &[u8]) -> String {
+        let mut output = String::new();
+        for (index, byte) in bytes.iter().enumerate() {
+            if index > 0 && index.is_multiple_of(24) {
+                output.push('\n');
+            }
+            output.push_str(&format!("{byte:02x}"));
+        }
+        output
+    }
+
+    /// Writes the fixture's two chunks through the Rust writer, exactly as a
+    /// producer does: one `append` per frame, carrying that frame's new symbols.
+    fn write_fixture_chunks(dict: &mut PersistedSymbolDict) {
+        dict.append_symbol(b"one").unwrap();
+        dict.append_symbols(&[b"two".as_slice(), b"three".as_slice()])
+            .unwrap();
+    }
+
+    #[test]
+    fn reads_java_symbol_dict_golden_bytes() {
+        // The module docs claim this side-file is "byte-for-byte the layout the
+        // Java reference client's `.symbol-dict` uses". Round-trip tests cannot
+        // check that -- they stay green while both ends of this client drift
+        // together -- so the claim rests on bytes the Java client actually wrote.
+        // Read half: the Rust reader must recover Java's dictionary exactly,
+        // including the chunk boundaries, since a `delta_start` lands on each one.
+        let dir = tmp_slot();
+        let path = dir.path().join(FILE_NAME);
+        fs::write(&path, java_symbol_dict_fixture()).unwrap();
+
+        let dict = PersistedSymbolDict::open_recovered(dir.path())
+            .unwrap()
+            .expect("the Java-written side-file must open, not be rejected");
+
+        assert_eq!(dict.size(), 3);
+        assert_eq!(
+            dict.read_loaded_symbols(),
+            vec![b"one".to_vec(), b"two".to_vec(), b"three".to_vec()]
+        );
+        assert_eq!(
+            parse_chunks(&path),
+            vec![
+                vec![b"one".to_vec()],
+                vec![b"two".to_vec(), b"three".to_vec()],
+            ],
+            "chunk boundaries must survive the read: every recoverable frame's \
+             delta_start falls on one"
+        );
+        // The concatenated entry region is spliced verbatim into a catch-up
+        // frame, so it too must match Java's wire shape.
+        assert_eq!(
+            dict.loaded_entries(),
+            &[
+                3, b'o', b'n', b'e', 3, b't', b'w', b'o', 5, b't', b'h', b'r', b'e', b'e'
+            ][..]
+        );
+    }
+
+    #[test]
+    fn writes_java_compatible_symbol_dict_bytes() {
+        // Write half of the parity claim: the same two appends a Java producer
+        // makes must leave byte-identical bytes on disk -- header, varint
+        // encoding, chunk framing and CRC32C alike. Java truncates its mmap
+        // reserve to the logical length on close, so the lengths are comparable
+        // with no normalization (unlike the `.sfa` fixtures' `createdMicros`).
+        let dir = tmp_slot();
+        {
+            let mut dict = PersistedSymbolDict::open(dir.path()).unwrap();
+            write_fixture_chunks(&mut dict);
+        }
+
+        let bytes = fs::read(dir.path().join(FILE_NAME)).unwrap();
+        assert_eq!(
+            format_hex_fixture(&bytes),
+            format_hex_fixture(&java_symbol_dict_fixture()),
+            "Rust-written side-file diverged from the Java golden bytes"
+        );
+    }
+
+    #[test]
+    fn recovers_the_intact_prefix_of_a_torn_java_symbol_dict() {
+        // Cross-client agreement on the failure path, which is the one that
+        // decides how much data is recoverable: a flipped byte inside Java's
+        // second chunk must cost exactly that chunk. Rust stops at the first
+        // CRC failure, keeps chunk 0, and truncates the torn tail so the next
+        // append overwrites it.
+        let dir = tmp_slot();
+        let path = dir.path().join(FILE_NAME);
+        fs::write(&path, java_symbol_dict_torn_fixture()).unwrap();
+
+        let dict = PersistedSymbolDict::open_recovered(dir.path())
+            .unwrap()
+            .expect("a torn tail is healed, not rejected outright");
+
+        assert_eq!(dict.size(), 1);
+        assert_eq!(dict.read_loaded_symbols(), vec![b"one".to_vec()]);
+        drop(dict);
+        assert_eq!(
+            fs::metadata(&path).unwrap().len(),
+            TORN_TRUNCATED_LEN,
+            "the torn chunk must be truncated away, back to the end of chunk 0"
+        );
+    }
+
+    #[test]
+    #[ignore = "requires QDB_JAVA_CLIENT_CORE or the local Java client checkout"]
+    fn java_and_rust_read_each_others_symbol_dicts() {
+        // Proves the committed fixtures against the Java source, both directions.
+        // Mirrors `qwp_ws_sfa_segment::java_and_rust_read_each_others_segments`.
+        let fixture = JavaSymbolDictFixture::compile();
+
+        // Java writes -> Rust reads, and the bytes are the committed fixture.
+        let java_dir = tmp_slot();
+        fixture.run(&["write", java_dir.path().to_str().unwrap()]);
+        let java_bytes = fs::read(java_dir.path().join(FILE_NAME)).unwrap();
+        assert_eq!(java_bytes, java_symbol_dict_fixture());
+        let dict = PersistedSymbolDict::open_recovered(java_dir.path())
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            dict.read_loaded_symbols(),
+            vec![b"one".to_vec(), b"two".to_vec(), b"three".to_vec()]
+        );
+        drop(dict);
+
+        // Rust writes -> Java reads.
+        let rust_dir = tmp_slot();
+        {
+            let mut dict = PersistedSymbolDict::open(rust_dir.path()).unwrap();
+            write_fixture_chunks(&mut dict);
+        }
+        let report = fixture.run(&["read", rust_dir.path().to_str().unwrap()]);
+        assert_report_contains(&report, "size=3");
+        assert_report_contains(&report, "symbol.0=one");
+        assert_report_contains(&report, "symbol.1=two");
+        assert_report_contains(&report, "symbol.2=three");
+
+        // Torn agreement: Java's own bytes with the fixture's flip must leave
+        // Java recovering the same single-symbol prefix Rust does.
+        let torn_dir = tmp_slot();
+        fixture.run(&["write", torn_dir.path().to_str().unwrap()]);
+        let torn_path = torn_dir.path().join(FILE_NAME);
+        let mut torn = fs::read(&torn_path).unwrap();
+        torn[TORN_BYTE_OFFSET] ^= 0x01;
+        assert_eq!(torn, java_symbol_dict_torn_fixture());
+        fs::write(&torn_path, &torn).unwrap();
+        let report = fixture.run(&["read", torn_dir.path().to_str().unwrap()]);
+        assert_report_contains(&report, "size=1");
+        assert_report_contains(&report, "symbol.0=one");
+    }
+
+    #[test]
+    #[ignore = "prints regenerated Java .symbol-dict fixture hex"]
+    fn print_java_symbol_dict_fixture_hex() {
+        let fixture = JavaSymbolDictFixture::compile();
+        let dir = tmp_slot();
+        fixture.run(&["write", dir.path().to_str().unwrap()]);
+
+        let bytes = fs::read(dir.path().join(FILE_NAME)).unwrap();
+        println!(
+            "java-two-chunk.symbol-dict.hex:\n{}",
+            format_hex_fixture(&bytes)
+        );
+
+        let mut torn = bytes.clone();
+        torn[TORN_BYTE_OFFSET] ^= 0x01;
+        println!(
+            "java-two-chunk-torn-tail.symbol-dict.hex:\n{}",
+            format_hex_fixture(&torn)
+        );
+    }
+
+    fn assert_report_contains(report: &str, expected: &str) {
+        assert!(
+            report.lines().any(|line| line == expected),
+            "missing Java report line {expected:?} in:\n{report}"
+        );
+    }
+
+    struct JavaSymbolDictFixture {
+        _work_dir: tempfile::TempDir,
+        classpath: String,
+    }
+
+    impl JavaSymbolDictFixture {
+        fn compile() -> Self {
+            let core_dir = java_client_core_dir();
+            let work_dir = tmp_slot();
+            let source_path = work_dir.path().join("SymbolDictInteropHelper.java");
+            fs::write(&source_path, JAVA_HELPER_SOURCE).unwrap();
+            let classes_dir = work_dir.path().join("classes");
+            fs::create_dir(&classes_dir).unwrap();
+
+            let classpath = java_client_classpath(&core_dir, work_dir.path());
+            run_command(
+                Command::new("javac")
+                    .arg("-d")
+                    .arg(&classes_dir)
+                    .arg("-cp")
+                    .arg(&classpath)
+                    .arg(&source_path),
+            );
+
+            let separator = if cfg!(windows) { ";" } else { ":" };
+            let classpath = format!("{}{}{}", classes_dir.display(), separator, classpath);
+            Self {
+                _work_dir: work_dir,
+                classpath,
+            }
+        }
+
+        fn run(&self, args: &[&str]) -> String {
+            let mut command = Command::new("java");
+            command.arg("-cp").arg(&self.classpath);
+            command.arg("SymbolDictInteropHelper");
+            command.args(args);
+            run_command(&mut command)
+        }
+    }
+
+    fn java_client_core_dir() -> PathBuf {
+        env::var_os("QDB_JAVA_CLIENT_CORE")
+            .map(PathBuf::from)
+            .expect(
+                "set QDB_JAVA_CLIENT_CORE to the Java client's `core` directory \
+                 (the one holding pom.xml and target/classes)",
+            )
+    }
+
+    fn java_client_classpath(core_dir: &Path, work_dir: &Path) -> String {
+        let target_classes = core_dir.join("target/classes");
+        assert!(
+            target_classes.exists(),
+            "Java client target/classes missing at {}; run mvn -f {}/pom.xml test-compile or set QDB_JAVA_CLIENT_CORE",
+            target_classes.display(),
+            core_dir.display()
+        );
+
+        let separator = if cfg!(windows) { ";" } else { ":" };
+        if let Some(extra) = env::var_os("QDB_JAVA_CLIENT_CLASSPATH") {
+            return format!(
+                "{}{}{}",
+                target_classes.display(),
+                separator,
+                PathBuf::from(extra).display()
+            );
+        }
+
+        let cp_file = work_dir.join("java-client-classpath.txt");
+        run_command(
+            Command::new("mvn")
+                .arg("-q")
+                .arg("-f")
+                .arg(core_dir.join("pom.xml"))
+                .arg("dependency:build-classpath")
+                .arg(format!("-Dmdep.outputFile={}", cp_file.display())),
+        );
+        let dependency_cp = fs::read_to_string(cp_file).unwrap();
+        let dependency_cp = dependency_cp.trim();
+        if dependency_cp.is_empty() {
+            target_classes.display().to_string()
+        } else {
+            format!("{}{}{}", target_classes.display(), separator, dependency_cp)
+        }
+    }
+
+    fn run_command(command: &mut Command) -> String {
+        let output = command.output().unwrap_or_else(|err| {
+            panic!("failed to run command {command:?}: {err}");
+        });
+        if !output.status.success() {
+            panic!(
+                "command failed: {command:?}\nstatus: {}\nstdout:\n{}\nstderr:\n{}",
+                output.status,
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        String::from_utf8(output.stdout).unwrap()
+    }
+
+    /// Writes the two-chunk fixture through the Java client's real
+    /// `PersistedSymbolDict`: `appendSymbol` for the single-entry chunk, then
+    /// `appendSymbols` over a `GlobalSymbolDictionary` range for the multi-entry
+    /// one -- the two append shapes a Java producer actually uses.
+    const JAVA_HELPER_SOURCE: &str = r#"
+import io.questdb.client.cutlass.qwp.client.GlobalSymbolDictionary;
+import io.questdb.client.cutlass.qwp.client.sf.cursor.PersistedSymbolDict;
+import io.questdb.client.std.ObjList;
+
+public final class SymbolDictInteropHelper {
+    public static void main(String[] args) throws Exception {
+        if (args.length != 2) {
+            throw new IllegalArgumentException("usage: SymbolDictInteropHelper <write|read> <slotDir>");
+        }
+        if ("write".equals(args[0])) {
+            write(args[1]);
+        } else if ("read".equals(args[0])) {
+            read(args[1]);
+        } else {
+            throw new IllegalArgumentException("unknown command: " + args[0]);
+        }
+    }
+
+    private static void write(String slotDir) {
+        PersistedSymbolDict dict = PersistedSymbolDict.openClean(slotDir);
+        try {
+            dict.appendSymbol("one");
+            GlobalSymbolDictionary global = new GlobalSymbolDictionary();
+            global.getOrAddSymbol("one");
+            global.getOrAddSymbol("two");
+            global.getOrAddSymbol("three");
+            dict.appendSymbols(global, 1, 2);
+            System.out.println("size=" + dict.size());
+        } finally {
+            dict.close();
+        }
+    }
+
+    private static void read(String slotDir) {
+        PersistedSymbolDict dict = PersistedSymbolDict.open(slotDir);
+        if (dict == null) {
+            System.out.println("dict=null");
+            return;
+        }
+        try {
+            System.out.println("size=" + dict.size());
+            System.out.println("recoveredSize=" + dict.recoveredSize());
+            ObjList<String> symbols = dict.readLoadedSymbols();
+            for (int i = 0, n = symbols.size(); i < n; i++) {
+                System.out.println("symbol." + i + "=" + symbols.getQuick(i));
+            }
+        } finally {
+            dict.close();
+        }
+    }
+}
+"#;
 
     /// Builds a CRC-valid chunk from a raw entry region and an `entryCount` that
     /// need not agree with it, so a test can pin what the reader does with a
