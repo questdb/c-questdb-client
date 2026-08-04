@@ -237,9 +237,17 @@ pub enum ErrorCode {
     /// The frame is rejected before any byte reaches the wire and the buffer is
     /// rolled back, so nothing is lost and already-interned symbols keep
     /// flushing — but retrying on the same sender can never succeed. The caller
-    /// must retire the connection (`Sender` drop / `questdb_db_drop_sender`,
-    /// **not** a pool return, which recycles the connection *and* its
-    /// dictionary) and continue on a fresh one.
+    /// must retire the connection and continue on a fresh one. How to do that
+    /// depends on the API, and on the pooled ones a plain drop is **not** it:
+    ///
+    /// - **Pooled** (`QuestDb::borrow_sender`,
+    ///   `QuestDb::borrow_direct_column_sender`): call `drop_on_return()` on the
+    ///   guard before it goes out of scope. Dropping the guard *is* the pool
+    ///   return — it recycles the connection **and its dictionary** — and the
+    ///   free list is LIFO, so the next borrow hands back that same connection
+    ///   and it fails again on its next new symbol.
+    /// - **Standalone** (`Sender`): drop it and reconnect.
+    /// - **C ABI**: `questdb_db_drop_sender`, not `questdb_db_return_sender`.
     ///
     /// **One exception, and it matters for resends.** A chunk too large for a
     /// single frame is split, and each half is published on its own;

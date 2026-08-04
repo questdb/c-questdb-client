@@ -5592,8 +5592,8 @@ impl SymbolGlobalDict {
             return Err(crate::error::fmt!(
                 SymbolDictFull,
                 "QWP/WS connection-scoped symbol dictionary reached its \
-                 {}-entry cap; drop and reopen the connection to reset \
-                 the dictionary",
+                 {}-entry cap; retire this connection and continue on a fresh \
+                 one (returning it to a pool recycles its dictionary)",
                 self.cap
             ));
         }
@@ -5614,8 +5614,8 @@ impl SymbolGlobalDict {
                 crate::error::fmt!(
                     SymbolDictFull,
                     "QWP/WS connection-scoped symbol dictionary reached its \
-                     {}-byte heap cap; drop and reopen the connection to reset \
-                     the dictionary",
+                     {}-byte heap cap; retire this connection and continue on a \
+                     fresh one (returning it to a pool recycles its dictionary)",
                     self.heap_cap
                 )
             })?;
