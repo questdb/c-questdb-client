@@ -403,6 +403,14 @@ pub enum line_sender_error_code {
     /// dictionary) and borrow a fresh one. Distinct from
     /// `line_sender_error_invalid_api_call` so callers can recognise it without
     /// matching on the message text.
+    ///
+    /// One exception to "nothing is lost", and it matters for resends: a chunk
+    /// too large for a single frame is split and each half published on its own,
+    /// so an earlier half can already be durably queued (store-and-forward is
+    /// at-least-once) when a later half hits the cap. The error is then
+    /// delivery-unknown rather than known-not-delivered — check
+    /// `line_sender_error_in_doubt` before resending, or the rows the committed
+    /// prefix already carried are duplicated.
     line_sender_error_symbol_dict_full = 37,
 }
 

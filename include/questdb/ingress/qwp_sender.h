@@ -767,6 +767,14 @@ bool qwp_chunk_column_binary(
  * already-interned symbols keep flushing; only a chunk that introduces a
  * *new* symbol fails.
  *
+ * The failing chunk is rejected before any byte reaches the wire, with one
+ * exception that matters for resends: a chunk too large for a single frame is
+ * split and each half published on its own, so an earlier half can already be
+ * durably queued (store-and-forward is at-least-once) when a later half hits
+ * the cap. The flush is then delivery-unknown rather than
+ * known-not-delivered — check `line_sender_error_in_doubt` before resending
+ * the chunk, or the rows the committed prefix already carried are duplicated.
+ *
  * Resetting the dictionary means discarding the connection that owns it —
  * there is no per-sender close, and `questdb_db_return_sender` recycles the
  * connection *and its dictionary*, so a returned-and-reborrowed sender hits

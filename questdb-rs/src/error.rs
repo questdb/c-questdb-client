@@ -241,6 +241,15 @@ pub enum ErrorCode {
     /// **not** a pool return, which recycles the connection *and* its
     /// dictionary) and continue on a fresh one.
     ///
+    /// **One exception, and it matters for resends.** A chunk too large for a
+    /// single frame is split, and each half is published on its own;
+    /// store-and-forward is at-least-once, so an earlier half can already be
+    /// durably queued when a later half hits the cap. Nothing is lost then
+    /// either, but the operation is no longer known-not-delivered: it is
+    /// reported as delivery-unknown, so **check [`in_doubt`](Error::in_doubt)
+    /// before resending** — a blind resend of the whole chunk duplicates the
+    /// rows the committed prefix already carried.
+    ///
     /// Distinct from [`InvalidApiCall`](Self::InvalidApiCall) — a caller
     /// mistake with no recovery — so callers can recognise a full dictionary
     /// **by code** and take that specific action, without matching on the error
