@@ -48,6 +48,10 @@ pub(crate) use self::qwp::{
     MAX_PERSISTED_SYMBOL_ENTRY_LEN, QwpWsColumnarBuffer, QwpWsEncodeScratch, SymbolGlobalDict,
     SymbolGlobalDictMark, decode_qwp_varint,
 };
+// Test-only: lets the sender-level suites drive the connection dictionary's
+// cap-rejection path through a real `Sender` (see `TestDictCapGuard`).
+#[cfg(all(test, feature = "_sender-qwp-ws"))]
+pub(crate) use self::qwp::TestDictCapGuard;
 // `QwpWsSymbolHasher`'s only re-export consumer is the `arrow`-gated
 // `column_sender::arrow_batch`, so it is gated identically: a `_sender-qwp-ws`
 // build without `arrow` would otherwise carry an unused import.

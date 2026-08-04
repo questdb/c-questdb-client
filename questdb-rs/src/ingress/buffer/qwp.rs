@@ -5418,10 +5418,54 @@ pub(crate) struct SymbolGlobalDictMark {
     heap_bytes: usize,
 }
 
+#[cfg(all(test, feature = "_sender-qwp-ws"))]
+thread_local! {
+    /// Entry cap applied to every [`SymbolGlobalDict::new`] on this thread; see
+    /// [`TestDictCapGuard`].
+    static TEST_DICT_CAP: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+}
+
+/// Test-only: shrink the connection dictionary's entry cap for every
+/// [`SymbolGlobalDict`] constructed on this thread while the guard lives.
+///
+/// [`with_cap`](SymbolGlobalDict::with_cap) can only reach a dictionary a test
+/// builds itself, so it cannot exercise the cap through a real `Sender` --
+/// every production path builds its dictionary internally via
+/// [`new`](SymbolGlobalDict::new), and reaching the real cap would mean
+/// interning a million symbols. That left every promise the `SymbolDictFull`
+/// docs make about the *flush* path (nothing reaches the wire, the buffer and
+/// side-file roll back, already-interned symbols keep flushing, a pool return
+/// recycles the dictionary) untestable, and so untested.
+///
+/// Thread-local rather than global precisely because the test harness runs
+/// tests in parallel: all three production constructors
+/// (`DirectSenderCore::from_builder`, `Db::pick_replacement_sender`,
+/// `column_sender::sender`'s store-and-forward foreground) run on the borrowing
+/// thread, so the override reaches them without leaking into a concurrent test
+/// that happens to build a sender at the same moment. Restores the previous
+/// value on drop, so guards nest.
+#[cfg(all(test, feature = "_sender-qwp-ws"))]
+pub(crate) struct TestDictCapGuard(Option<usize>);
+
+#[cfg(all(test, feature = "_sender-qwp-ws"))]
+impl TestDictCapGuard {
+    pub(crate) fn new(cap: usize) -> Self {
+        Self(TEST_DICT_CAP.with(|c| c.replace(Some(cap))))
+    }
+}
+
+#[cfg(all(test, feature = "_sender-qwp-ws"))]
+impl Drop for TestDictCapGuard {
+    fn drop(&mut self) {
+        TEST_DICT_CAP.with(|c| c.set(self.0));
+    }
+}
+
 #[cfg(feature = "_sender-qwp-ws")]
 impl SymbolGlobalDict {
     pub(crate) fn new() -> Self {
-        Self {
+        #[allow(unused_mut)]
+        let mut dict = Self {
             map: QwpWsSymbolHashMap::default(),
             entries: Vec::new(),
             next_id: 0,
@@ -5430,7 +5474,15 @@ impl SymbolGlobalDict {
             heap_cap: MAX_CONN_SYMBOL_DICT_HEAP_BYTES,
             #[cfg(feature = "arrow-ingress")]
             arrow_dict_memo: Vec::new(),
+        };
+        // Test-only: let a guard on this thread shrink the cap so the flush-path
+        // rejection can be driven through a real sender. No effect in any
+        // non-test build -- the whole hook compiles out.
+        #[cfg(test)]
+        if let Some(cap) = TEST_DICT_CAP.with(|c| c.get()) {
+            dict.cap = cap;
         }
+        dict
     }
 
     /// Same as [`new`](Self::new) but with a smaller entry cap so the

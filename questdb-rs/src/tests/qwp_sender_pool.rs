@@ -3697,6 +3697,114 @@ fn store_and_forward_file_mode_writes_symbols_ahead_to_side_file() {
 }
 
 #[test]
+fn store_and_forward_symbol_dict_full_rolls_back_and_keeps_flushing() {
+    // Everything `SymbolDictFull`'s docs promise about the FLUSH path was
+    // untested: coverage stopped at `SymbolGlobalDict::intern`, because the cap
+    // is only reachable through a real sender after a million distinct symbols.
+    // `TestDictCapGuard` shrinks it to one for this thread, which makes all four
+    // claims assertable at last -- the code survives the publish stack, the
+    // write-ahead rolls back, nothing is queued for the rejected frame, and
+    // already-interned symbols keep flushing.
+    let _cap = crate::ingress::TestDictCapGuard::new(1);
+    let (server, _release, _frames) = MockServer::spawn_ack_when_released_capturing(1);
+    let dir = TempDir::new().unwrap();
+    let conf = conf_for_endpoints(
+        &[server.port()],
+        &sf_disk_extras(&dir, "pool_reap=manual;sender_id=dictfull;"),
+    );
+    let db = QuestDb::connect(&conf).unwrap();
+    let mut sender = db.borrow_sender().unwrap();
+    let side_file = dir.path().join("dictfull-ingest-0").join(".symbol-dict");
+
+    // Frame 1 interns "alpha" and fills the one-entry dictionary.
+    let mut first = Chunk::new("trades");
+    append_one_symbol_row(&mut first, b"alpha", &[1_i64]);
+    sender.flush(&mut first).unwrap();
+    let after_alpha = std::fs::metadata(&side_file).unwrap().len();
+
+    // Frame 2 introduces a second distinct symbol. The cap rejects it, and the
+    // code must reach the caller intact rather than being remapped on the way out
+    // -- the whole reason the code was appended.
+    let mut second = Chunk::new("trades");
+    append_one_symbol_row(&mut second, b"bravo", &[2_i64]);
+    let err = sender.flush(&mut second).unwrap_err();
+    assert_eq!(err.code(), ErrorCode::SymbolDictFull, "{}", err.msg());
+    assert_eq!(
+        std::fs::metadata(&side_file).unwrap().len(),
+        after_alpha,
+        "the rejected frame's write-ahead must roll back in lockstep -- no \
+         `bravo` chunk may survive on disk"
+    );
+    assert_eq!(
+        crate::ingress::sender::qwp_ws_sfa_symbol_dict::parse_chunks(&side_file),
+        vec![vec![b"alpha".to_vec()]],
+        "the side-file still holds exactly the accepted frame's symbol"
+    );
+
+    // The connection stays usable for symbols already in the dictionary.
+    let mut third = Chunk::new("trades");
+    append_one_symbol_row(&mut third, b"alpha", &[3_i64]);
+    sender
+        .flush(&mut third)
+        .expect("chunks referencing only already-interned symbols keep flushing");
+    assert_eq!(
+        crate::ingress::sender::qwp_ws_sfa_symbol_dict::parse_chunks(&side_file),
+        vec![vec![b"alpha".to_vec()]],
+        "a frame introducing no new symbol writes no chunk"
+    );
+}
+
+#[test]
+fn a_pool_return_recycles_a_full_symbol_dict_but_drop_on_return_resets_it() {
+    // `SymbolDictFull`'s remedy rests on a distinction nothing asserted:
+    // returning a borrowed sender to the pool recycles the connection AND its
+    // dictionary -- so the cap is still full on the next borrow -- while retiring
+    // it with `drop_on_return` (the Rust spelling of `questdb_db_drop_sender`)
+    // yields a fresh one. Getting this backwards is what makes the naive remedy
+    // an unbounded loop, so pin both halves.
+    //
+    // Memory mode (no `sf_dir`) on purpose: with a slot configured, a retired
+    // connection's replacement re-seeds from the side-file and would legitimately
+    // still be full, which is the caveat `qwp_sender.h` documents separately.
+    let _cap = crate::ingress::TestDictCapGuard::new(1);
+    let server = MockServer::spawn_acking(4);
+    let conf = conf_for_endpoints(&[server.port()], "pool_reap=manual;");
+    let db = QuestDb::connect(&conf).unwrap();
+
+    let mut sender = db.borrow_sender().unwrap();
+    let mut first = Chunk::new("trades");
+    append_one_symbol_row(&mut first, b"alpha", &[1_i64]);
+    sender.flush(&mut first).unwrap();
+    let mut second = Chunk::new("trades");
+    append_one_symbol_row(&mut second, b"bravo", &[2_i64]);
+    assert_eq!(
+        sender.flush(&mut second).unwrap_err().code(),
+        ErrorCode::SymbolDictFull
+    );
+    drop(sender); // a plain drop IS the pool return
+
+    let mut recycled = db.borrow_sender().unwrap();
+    let mut retry = Chunk::new("trades");
+    append_one_symbol_row(&mut retry, b"bravo", &[3_i64]);
+    assert_eq!(
+        recycled.flush(&mut retry).unwrap_err().code(),
+        ErrorCode::SymbolDictFull,
+        "a pool return recycles the connection *and its dictionary*, so the \
+         next borrow fails on the same new symbol"
+    );
+
+    recycled.drop_on_return();
+    drop(recycled);
+
+    let mut fresh = db.borrow_sender().unwrap();
+    let mut ok = Chunk::new("trades");
+    append_one_symbol_row(&mut ok, b"bravo", &[4_i64]);
+    fresh
+        .flush(&mut ok)
+        .expect("retiring the connection resets the dictionary");
+}
+
+#[test]
 fn store_and_forward_file_mode_recovers_and_replays_queued_frame_after_reopen() {
     // Recoverability round-trip for the disk-backed unified sender: a symbol frame
     // flushed to a file-mode slot but left unacked must survive the sender/db being
