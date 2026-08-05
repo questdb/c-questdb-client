@@ -3886,8 +3886,10 @@ fn store_and_forward_file_mode_recovery_fails_when_the_recovered_dict_exceeds_th
     // guard rejected the next -- `StoreResendRequired` on top of a committed
     // prefix, which a compliant resend duplicates. Failing at construction happens
     // before anything connects, so the slot stays intact on disk for a client that
-    // can hold it. `qwp_ws_orphan_drain_degrades_to_dense_when_the_recovered_dict_
-    // exceeds_the_cap` pins the opposite (correct) choice on the replay-only path.
+    // can hold it. `qwp_ws_orphan_drain_arms_an_empty_mirror_when_the_recovered_
+    // dict_exceeds_the_cap` pins the opposite (correct) choice on the replay-only
+    // path: discard the rejected entries, arm the mirror empty, and let the drain
+    // bootstrap from the stored frames.
     let dir = TempDir::new().unwrap();
 
     // Phase 1: at the full cap, queue two frames interning two distinct symbols

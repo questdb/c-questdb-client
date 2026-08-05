@@ -5738,14 +5738,26 @@ impl SymbolGlobalDict {
     /// resend duplicates. Failing here happens before the runner is spawned, so
     /// the slot is left untouched on disk for a client that can hold it.
     ///
-    /// The orphan drainer (`qwp_ws_orphan::open_inner`) logs and degrades to
-    /// dense instead. It is replay-only: no producer, no write-ahead, and the
+    /// The orphan drainer (`qwp_ws_orphan::open_inner`) logs, discards the
+    /// rejected entries, and arms the catch-up mirror **empty** -- it does NOT
+    /// degrade to dense. It is replay-only: no producer, no write-ahead, and the
     /// side-file handle is dropped outright, so there is no id to collide with
-    /// and nothing a partial seed could corrupt. Hard-failing there would abandon
-    /// the slot's *self-sufficient* dense frames, which replay perfectly well
-    /// without any dictionary -- and would do so as `RetryLater`, which re-queues
-    /// the slot forever rather than reporting anything. Degrading drains what can
-    /// drain and lets the torn-dict guard reject only the delta frames, loudly.
+    /// and nothing a partial seed could corrupt.
+    ///
+    /// Arming empty is the strictest guard state, not a slackened one: the hazard
+    /// the validation exists for is an *inflated* count, and count 0 admits only a
+    /// `delta_start == 0` frame. `SentDictMirror::accumulate` then folds that
+    /// frame's own delta section in, and the frames behind it resolve against what
+    /// their predecessors registered -- so the drain bootstraps from the stored
+    /// frames and needs nothing from the rejected side-file.
+    ///
+    /// Dense would cost the slot outright. It leaves the mirror *disabled*, so the
+    /// `delta_start == 0` frame replays and COMMITS, the frame behind it is
+    /// terminally rejected, and `StoreResendRequired` is classified proven-local
+    /// unrecoverable (`terminal_error_is_proven_local_unrecoverable`) -- the drain
+    /// writes `.failed` and every later scan skips the slot until an operator
+    /// clears the sentinel. Recoverable frames abandoned over a side-file this
+    /// client merely could not hold.
     ///
     /// See `symbol_dict_seed_fills_to_the_cap_and_rejects_the_entry_past_it` for
     /// the boundary, and the two paired tests named in those call sites.
@@ -10061,8 +10073,9 @@ mod tests {
         // perfectly well-formed, just bigger than this client will hold (written
         // by a higher-capped client, or sitting on the boundary). The two
         // recovery callers then diverge on it deliberately -- foreground fails
-        // construction, the orphan drainer degrades to dense -- as argued in
-        // `seed`'s docs and pinned by the paired tests it names.
+        // construction, the orphan drainer discards the rejected entries and arms
+        // its mirror empty -- as argued in `seed`'s docs and pinned by the paired
+        // tests it names.
         //
         // `symbol_dict_cap_matches_server_ceiling` pins the real cap at
         // 1_000_000; `with_cap` walks the same boundary without interning a

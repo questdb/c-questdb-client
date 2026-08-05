@@ -2084,9 +2084,17 @@ public final class SymbolDictInteropHelper {
         // The RECOVERED path is the one the format switch makes live: every
         // pre-existing v2 side-file takes it on the first run after the change,
         // beside segments that already reference ids [0, K). It must report "no
-        // usable dictionary" so the caller falls back to dense, and -- like the
-        // bad-magic case -- leave the bytes alone rather than rewriting a file
-        // whose contents it could not interpret.
+        // usable dictionary" -- `Ok(None)` -- and, like the bad-magic case, leave
+        // the bytes alone rather than rewriting a file whose contents it could not
+        // interpret.
+        //
+        // What the CALLER then does with that `None` is not this function's
+        // business and is no longer a dense fallback: `SfaFrameQueue::open`
+        // re-creates the file so the producer regains a write-ahead target and
+        // keeps delta armed, rebuilding the ids from the surviving frames
+        // (`rebuild_recovered_dict_from_frames`); `open_replay_only` arms delta
+        // unconditionally and re-creates nothing. This test pins only the
+        // read-side contract: reject the version, touch nothing.
         let dir = tmp_slot();
         let path = dir.path().join(FILE_NAME);
         // Valid magic, superseded per-entry v2 layout, with a v2-shaped body.

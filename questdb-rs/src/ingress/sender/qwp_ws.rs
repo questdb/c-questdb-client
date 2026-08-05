@@ -3480,7 +3480,9 @@ pub(crate) fn connect_qwp_ws_background_state(
         // frames were already committed on the server, which would duplicate them.
         // This mirrors the pre-arm validation the orphan drainer already performs
         // (`qwp_ws_orphan.rs`) -- but note the two diverge on what they do with a
-        // failure: this one fails construction, the drainer degrades to dense.
+        // failure: this one fails construction, the drainer discards the rejected
+        // entries and arms its mirror EMPTY so the drain bootstraps from the
+        // stored frames' own delta sections (neither degrades to dense).
         // That asymmetry is deliberate and argued in `SymbolGlobalDict::seed`'s
         // docs; the short of it is that this path has a PRODUCER that would
         // otherwise mint ids the stored frames already reference, while
