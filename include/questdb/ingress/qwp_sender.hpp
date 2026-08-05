@@ -449,9 +449,23 @@ public:
      * dictionary index (in `0 .. dict_offsets_len - 1`) for non-null rows;
      * `dict_offsets` (length `dict_offsets_len`, Arrow `Utf8` layout) and
      * `dict_bytes` (length `dict_bytes_len`) describe the dictionary. Only
-     * referenced entries are interned into the connection symbol table, so a
-     * wide dictionary (e.g. a Pandas `Categorical`) costs nothing for unused
-     * entries. Each entry must be valid UTF-8 (validated eagerly here) and
+     * referenced entries are interned into the connection symbol table, so
+     * unused entries cost nothing on the wire or against the connection
+     * dictionary. They are not free locally, though, and the cost tracks the
+     * *declared* length rather than the referenced count: this call
+     * UTF-8-validates the whole declared dictionary, and each flush fills and
+     * scans roughly 9 bytes of scratch per declared entry — so declare a
+     * dictionary (e.g. a Pandas `Categorical`) no wider than you need.
+     *
+     * Two separate caps apply. The distinct entry count you may *declare* is
+     * capped at 8,388,608 per column, rejected by this call. The symbols
+     * actually *referenced* across every column and every chunk on one
+     * connection are capped at 1,000,000 entries and 256 MiB of UTF-8; that
+     * cap is reached at `flush()` / `flush_and_wait()`, not here, and fails
+     * them with `error_code::symbol_dict_full`. A wide dictionary consumes
+     * none of that second budget until its entries are referenced.
+     *
+     * Each entry must be valid UTF-8 (validated eagerly here) and
      * every non-null code must be in range (checked here); the borrowed
      * buffers must stay alive and unchanged until the next `flush()` /
      * `wait()` returns. See `qwp_sender.h` for the full contract and caps.
@@ -738,6 +752,13 @@ public:
      * as soon as it is accepted locally. On success `chunk` is cleared; on
      * failure it is left untouched. Call `wait()` to block for the server ack.
      * Throws on error.
+     *
+     * This is where the connection-scoped symbol dictionary is filled, so a
+     * chunk introducing a symbol past its 1,000,000-entry / 256 MiB cap throws
+     * `error_code::symbol_dict_full` here rather than at the `symbol_i*` call
+     * that declared the dictionary. Retrying on the same sender cannot succeed
+     * — only retiring the connection resets it; see the symbol-column preamble
+     * in `qwp_sender.h`.
      */
     void flush(column_chunk& chunk)
     {
@@ -1182,6 +1203,14 @@ public:
      * as soon as it is accepted locally. On success `chunk` is cleared; on
      * failure it is left untouched. Call `wait()` to block for the server ack.
      * Throws on error.
+     *
+     * A chunk introducing a symbol past the connection-scoped dictionary's
+     * 1,000,000-entry / 256 MiB cap throws `error_code::symbol_dict_full` here.
+     * Retrying on this sender cannot succeed: the dictionary belongs to the
+     * connection, and returning the guard to the pool recycles both. Call
+     * `wait()` for the queued frames and then `drop_on_return()` before this
+     * guard is destroyed, so the next borrow gets a fresh connection. See the
+     * symbol-column preamble in `qwp_sender.h`.
      */
     void flush(column_chunk& chunk)
     {
