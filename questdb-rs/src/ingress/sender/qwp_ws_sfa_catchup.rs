@@ -55,6 +55,9 @@
 // silently diverge. Imported under the local name for the existing call sites.
 use crate::ingress::buffer::decode_qwp_varint as decode_varint;
 
+#[cfg(test)]
+use std::sync::atomic::{AtomicBool, Ordering};
+
 const QWP_HEADER_SIZE: usize = 12;
 const QWP_MAGIC: [u8; 4] = *b"QWP1";
 const HEADER_OFFSET_FLAGS: usize = 5;
@@ -65,10 +68,28 @@ const QWP_FLAG_DELTA_SYMBOL_DICT: u8 = 0x08;
 /// bytes each maximum; 16 is a safe round bound.
 const CATCH_UP_VARINT_HEADROOM: usize = 16;
 
+#[cfg(test)]
+const FAIL_CATCH_UP_ALLOCATION_SYMBOL: &[u8] = b"qdb-test-catch-up-allocation";
+#[cfg(test)]
+static FAIL_NEXT_MATCHING_CATCH_UP_ALLOCATION: AtomicBool = AtomicBool::new(false);
+
+#[cfg(test)]
+pub(crate) fn fail_next_catch_up_allocation_for_test() {
+    FAIL_NEXT_MATCHING_CATCH_UP_ALLOCATION.store(true, Ordering::Release);
+}
+
+#[cfg(test)]
+fn should_fail_catch_up_allocation_for_test(entries: &[u8]) -> bool {
+    entries
+        .windows(FAIL_CATCH_UP_ALLOCATION_SYMBOL.len())
+        .any(|window| window == FAIL_CATCH_UP_ALLOCATION_SYMBOL)
+        && FAIL_NEXT_MATCHING_CATCH_UP_ALLOCATION.swap(false, Ordering::AcqRel)
+}
+
 /// A single symbol dictionary entry did not fit a catch-up frame even alone,
 /// because the server's advertised batch cap is smaller than the entry plus
-/// framing overhead. Surfaced as a terminal error: the entry cannot be
-/// re-registered, so replay would dangle a reference.
+/// framing overhead. The entry cannot be re-registered on that endpoint, so the
+/// caller must reconnect/fail over before replaying its references.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct CatchUpEntryTooLarge {
     pub(crate) entry_bytes: usize,
@@ -145,6 +166,17 @@ impl SentDictMirror {
             return;
         }
         self.bytes.extend_from_slice(entries);
+        self.count = count;
+    }
+
+    /// Installs an already-owned recovered entry region without allocating another
+    /// full dictionary copy. Used by cold recovery paths that have completed their
+    /// fallible copy and validation before constructing the send core.
+    pub(crate) fn seed_owned(&mut self, entries: Vec<u8>, count: u32) {
+        if !self.enabled || count == 0 {
+            return;
+        }
+        self.bytes = entries;
         self.count = count;
     }
 
@@ -321,7 +353,7 @@ impl SentDictMirror {
                     &self.bytes[chunk_start_off..entry_start],
                     version,
                 )
-                .ok_or(CatchUpStreamError::FrameBuildFailed)?;
+                .map_err(CatchUpStreamError::FrameBuild)?;
                 emit(&frame).map_err(CatchUpStreamError::Emit)?;
                 emitted += 1;
                 chunk_start_id += chunk_symbols;
@@ -341,7 +373,7 @@ impl SentDictMirror {
                 &self.bytes[chunk_start_off..p],
                 version,
             )
-            .ok_or(CatchUpStreamError::FrameBuildFailed)?;
+            .map_err(CatchUpStreamError::FrameBuild)?;
             emit(&frame).map_err(CatchUpStreamError::Emit)?;
             emitted += 1;
         }
@@ -369,7 +401,7 @@ impl SentDictMirror {
         ) {
             Ok(_) => Ok(frames),
             Err(CatchUpStreamError::EntryTooLarge(e)) => Err(e),
-            Err(CatchUpStreamError::FrameBuildFailed) => {
+            Err(CatchUpStreamError::FrameBuild(_)) => {
                 unreachable!("catch-up frame build cannot fail at test scale")
             }
             Err(CatchUpStreamError::Emit(never)) => match never {},
@@ -378,19 +410,23 @@ impl SentDictMirror {
 }
 
 /// Error from [`SentDictMirror::for_each_catch_up_frame`]: a single dictionary
-/// entry too large for the server's batch cap (terminal — the entry cannot be
-/// re-registered), a catch-up frame that could not be built (allocation failed,
-/// or its payload would overflow the QWP `u32` length field), or a failure
+/// entry too large for the current server's batch cap, a catch-up frame that
+/// could not be built, or a failure
 /// returned by the caller's `emit` (e.g. the transport dropped mid-catch-up,
 /// which recovers by reconnecting again).
 pub(crate) enum CatchUpStreamError<E> {
     EntryTooLarge(CatchUpEntryTooLarge),
-    /// A catch-up frame could not be allocated (fallible `try_reserve` failed) or
-    /// its payload would exceed the QWP `u32` payload-length field. Recoverable:
-    /// nothing was sent, and the queued data stays persisted for a later retry /
-    /// drain.
-    FrameBuildFailed,
+    FrameBuild(CatchUpFrameBuildError),
     Emit(E),
+}
+
+/// Why a catch-up frame could not be built. Allocation failure is transient and
+/// may succeed in a fresh session; exceeding the wire format's `u32` payload
+/// limit is deterministic for the persisted dictionary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CatchUpFrameBuildError {
+    AllocationFailed,
+    PayloadTooLarge,
 }
 
 /// The `delta_start` a `frame` carries, or `None` when the frame has no delta
@@ -447,7 +483,7 @@ fn parse_delta_section(frame: &[u8]) -> Option<DeltaSection<'_>> {
 
 /// Builds one table-less catch-up frame carrying dictionary ids
 /// `[delta_start .. delta_start+delta_count)` whose `[len][utf8]` bytes are
-/// `entries`. Returns `None` when the frame cannot be built:
+/// `entries`. Returns a typed error when the frame cannot be built:
 ///
 /// * the allocation cannot be reserved — fallible `try_reserve` (rather than an
 ///   infallible `Vec::with_capacity`) so a huge recovered dictionary degrades to
@@ -458,25 +494,39 @@ fn parse_delta_section(frame: &[u8]) -> Option<DeltaSection<'_>> {
 ///   [`SentDictMirror::for_each_catch_up_frame`] already keeps the payload under
 ///   `u32::MAX`, so this is defence in depth.
 ///
-/// The caller surfaces `None` as a recoverable `FrameBuildFailed`: nothing is
-/// sent and the queued data stays persisted for a later retry / drain.
+/// The caller can retry allocation failure while keeping payload overflow
+/// terminal. In either case nothing is sent and the queued data stays persisted.
 fn build_catch_up_frame(
     delta_start: u32,
     delta_count: u32,
     entries: &[u8],
     version: u8,
-) -> Option<Vec<u8>> {
+) -> Result<Vec<u8>, CatchUpFrameBuildError> {
+    #[cfg(test)]
+    if should_fail_catch_up_allocation_for_test(entries) {
+        return Err(CatchUpFrameBuildError::AllocationFailed);
+    }
+
     let mut payload = Vec::new();
+    let payload_capacity = CATCH_UP_VARINT_HEADROOM
+        .checked_add(entries.len())
+        .ok_or(CatchUpFrameBuildError::PayloadTooLarge)?;
     payload
-        .try_reserve(CATCH_UP_VARINT_HEADROOM + entries.len())
-        .ok()?;
+        .try_reserve(payload_capacity)
+        .map_err(|_| CatchUpFrameBuildError::AllocationFailed)?;
     write_varint(&mut payload, u64::from(delta_start));
     write_varint(&mut payload, u64::from(delta_count));
     payload.extend_from_slice(entries);
-    let payload_len = u32::try_from(payload.len()).ok()?;
+    let payload_len =
+        u32::try_from(payload.len()).map_err(|_| CatchUpFrameBuildError::PayloadTooLarge)?;
 
     let mut frame = Vec::new();
-    frame.try_reserve(QWP_HEADER_SIZE + payload.len()).ok()?;
+    let frame_capacity = QWP_HEADER_SIZE
+        .checked_add(payload.len())
+        .ok_or(CatchUpFrameBuildError::PayloadTooLarge)?;
+    frame
+        .try_reserve(frame_capacity)
+        .map_err(|_| CatchUpFrameBuildError::AllocationFailed)?;
     frame.extend_from_slice(&QWP_MAGIC);
     frame.push(version);
     // Table-less: DELTA_SYMBOL_DICT only. No DEFER_COMMIT — the catch-up runs on
@@ -486,7 +536,7 @@ fn build_catch_up_frame(
     frame.extend_from_slice(&0u16.to_le_bytes()); // table_count = 0
     frame.extend_from_slice(&payload_len.to_le_bytes());
     frame.extend_from_slice(&payload);
-    Some(frame)
+    Ok(frame)
 }
 
 /// Byte offset in `entries` (a `[len][utf8]...` region) just past the first `n`

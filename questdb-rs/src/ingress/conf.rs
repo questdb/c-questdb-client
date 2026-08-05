@@ -133,6 +133,9 @@ pub(crate) const QWP_WS_DEFAULT_SF_MEMORY_MAX_TOTAL_BYTES: u64 = 128 * 1024 * 10
 #[cfg(feature = "_sender-qwp-ws")]
 pub(crate) const QWP_WS_DEFAULT_SF_DISK_MAX_TOTAL_BYTES: u64 = 10 * 1024 * 1024 * 1024;
 #[cfg(feature = "_sender-qwp-ws")]
+pub(crate) const QWP_WS_DEFAULT_SF_SYNC_INTERVAL: std::time::Duration =
+    std::time::Duration::from_millis(5000);
+#[cfg(feature = "_sender-qwp-ws")]
 pub(crate) const QWP_WS_DEFAULT_MAX_BACKGROUND_DRAINERS: usize = 4;
 #[cfg(feature = "_sender-qwp-ws")]
 pub(crate) const QWP_WS_DEFAULT_CLOSE_DRAIN_TIMEOUT: std::time::Duration =
@@ -153,6 +156,7 @@ pub(crate) enum SfDurability {
     Memory,
     Flush,
     Append,
+    Periodic,
 }
 
 #[cfg(feature = "_sender-qwp-ws")]
@@ -162,6 +166,7 @@ impl SfDurability {
             Self::Memory => "memory",
             Self::Flush => "flush",
             Self::Append => "append",
+            Self::Periodic => "periodic",
         }
     }
 }
@@ -255,9 +260,11 @@ pub(crate) struct QwpWsConfig {
     pub(crate) endpoints: ConfigSetting<Vec<QwpWsEndpoint>>,
     pub(crate) auth_timeout: ConfigSetting<std::time::Duration>,
     /// Per-endpoint TCP connect (dial) budget. `None` (the default) keeps the
-    /// OS-default blocking dial for foreground connects; background orphan
-    /// drainers substitute a finite 15-second fallback. `Some` bounds each
-    /// `TcpStream::connect_timeout` attempt and surfaces
+    /// OS-default blocking dial for caller-thread initial connects; every
+    /// bounded dial -- reconnects, the async initial-connect retry loop, and
+    /// background orphan drainers -- substitutes a finite 15-second fallback
+    /// so bounded shutdown cannot be parked until the OS TCP-connect deadline.
+    /// `Some` bounds each `TcpStream::connect_timeout` attempt and surfaces
     /// [`crate::ErrorCode::ConnectTimeout`] on expiry.
     /// Connect-string key: `connect_timeout` (milliseconds).
     pub(crate) connect_timeout: ConfigSetting<Option<std::time::Duration>>,
@@ -293,6 +300,7 @@ pub(crate) struct QwpWsConfig {
     /// hold a side-file on top of this segment budget until the slot fully drains.
     pub(crate) sf_max_total_bytes: ConfigSetting<Option<u64>>,
     pub(crate) sf_durability: ConfigSetting<SfDurability>,
+    pub(crate) sf_sync_interval: ConfigSetting<Option<std::time::Duration>>,
     pub(crate) sf_append_deadline: ConfigSetting<std::time::Duration>,
     pub(crate) drain_orphans: ConfigSetting<bool>,
     /// Internal pool hook: exact managed slot ranges that orphan scanning must
@@ -353,6 +361,7 @@ impl Default for QwpWsConfig {
             sf_max_segment_bytes: ConfigSetting::new_default(QWP_WS_DEFAULT_SF_SEGMENT_BYTES),
             sf_max_total_bytes: ConfigSetting::new_default(None),
             sf_durability: ConfigSetting::new_default(SfDurability::Memory),
+            sf_sync_interval: ConfigSetting::new_default(None),
             sf_append_deadline: ConfigSetting::new_default(std::time::Duration::from_secs(30)),
             drain_orphans: ConfigSetting::new_default(false),
             orphan_exclude_managed_slots: Vec::new(),
@@ -375,6 +384,15 @@ impl Default for QwpWsConfig {
 
 #[cfg(feature = "_sender-qwp-ws")]
 impl QwpWsConfig {
+    pub(crate) fn periodic_sync_interval(&self) -> Option<std::time::Duration> {
+        (*self.sf_durability == SfDurability::Periodic).then(|| {
+            self.sf_sync_interval
+                .as_ref()
+                .copied()
+                .unwrap_or(QWP_WS_DEFAULT_SF_SYNC_INTERVAL)
+        })
+    }
+
     pub(crate) fn sf_max_total_bytes(&self) -> u64 {
         if let Some(max_total_bytes) = *self.sf_max_total_bytes {
             return max_total_bytes;

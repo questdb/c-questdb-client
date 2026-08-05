@@ -86,7 +86,14 @@ extern "C" {
  *  Exposes publish-only `qwp_sender_flush_chunk`, combined
  *  `qwp_sender_flush_chunk_and_wait`, FSN-returning publish variants, FSN
  *  progress watermarks, and the `qwp_sender_wait` ack barrier; the
- *  store-and-forward queue owns delivery. */
+ *  store-and-forward queue owns delivery.
+ *
+ *  With `sf_dir`, `sf_durability=memory` is the default and uses the OS page
+ *  cache. Use `sf_durability=periodic` to checkpoint the local replay log.
+ *  `sf_sync_interval_millis` defaults to 5000; it is a target, not a maximum
+ *  loss window. `sf_durability=flush` and `sf_durability=append` are not yet
+ *  supported. End-to-end durability also requires
+ *  `request_durable_ack=on` and a durable ACK from QuestDB Enterprise. */
 typedef struct qwp_sender qwp_sender;
 
 /** Direct (pipelined, non-store-and-forward) column-major QWP/WS sender.
