@@ -696,6 +696,10 @@ impl SfaFrameQueue {
         };
         let active_append_offset = active.published_offset();
         let active_frame_count = active.published_frame_count();
+        // Kept for the rebuild's diagnostics below: the engine takes ownership of
+        // `options.slot_dir` on the next line. One clone per slot open, on a path
+        // that already maps segments and scans the backlog.
+        let slot_dir = options.slot_dir.clone();
         let engine = Arc::new(SfaEngine {
             slot_dir: Some(options.slot_dir),
             max_bytes: options.max_bytes,
@@ -745,7 +749,7 @@ impl SfaFrameQueue {
         };
         // This slot has a PRODUCER, so the recovered dictionary must cover every id
         // the surviving frames define -- not just the side-file's intact prefix.
-        queue.rebuild_recovered_dict_from_frames()?;
+        queue.rebuild_recovered_dict_from_frames(&slot_dir)?;
         Ok(queue)
     }
 
@@ -1025,6 +1029,20 @@ impl SfaFrameQueue {
     /// them — so `accumulate` skips it and the count stops there, leaving exactly
     /// the torn-dictionary case `guard_dict_not_torn` already reports.
     ///
+    /// The fold stops on one more condition, and `accumulate` alone will not
+    /// supply it: a frame that *disagrees* with the running mirror about an id it
+    /// already holds. `accumulate` matches on POSITION only, so it would append
+    /// such a frame's suffix on top of a contradicting prefix and yield a region
+    /// with repeated ids — which `SymbolGlobalDict::seed` then rejects wholesale as
+    /// a duplicate entry, failing construction on every later open and blaming a
+    /// side-file that is byte-perfect. So each frame is put to
+    /// [`conflicts_with`](SentDictMirror::conflicts_with) — the same question
+    /// `guard_dict_not_torn` asks before sending — and a disagreement stops the
+    /// fold exactly as a gap does. This needs frames that were written against a
+    /// different dictionary generation than the side-file (a session that ran
+    /// dense because the side-file was unwritable, say); it cannot fire on a
+    /// contiguous `delta_start == tip` extension, which overlaps nothing.
+    ///
     /// Cheap on the common path: an untorn side-file already covers every id, so
     /// every frame folds to a no-op overlap and only the (cold, once-per-open) scan
     /// remains. The scan is bounded by `max_in_flight` frames, not by the backlog:
@@ -1041,7 +1059,7 @@ impl SfaFrameQueue {
     /// dictionary (a crash in the window before the first flush just re-runs this
     /// rebuild against the same intact prefix) and keeps a write failure out of the
     /// recovery path.
-    fn rebuild_recovered_dict_from_frames(&mut self) -> Result<(), SfaQueueError> {
+    fn rebuild_recovered_dict_from_frames(&mut self, slot_dir: &Path) -> Result<(), SfaQueueError> {
         let mut mirror = SentDictMirror::new(true);
         if let Some(pd) = self.persisted_symbol_dict.as_ref() {
             // `seed`'s allocation-failure degrade (disable the mirror, keep going) is
@@ -1075,7 +1093,40 @@ impl SfaFrameQueue {
                 let Some(payload) = self.next_cursor_payload_for_fsn(&mut cursor, fsn)? else {
                     break;
                 };
-                payload.with_bytes(|frame| mirror.accumulate(frame));
+                // `accumulate` compares POSITIONS, never bytes: it folds in any frame
+                // that covers the tip and reaches past it, whatever the overlapping
+                // ids actually say. So a frame that REDEFINES an id the running
+                // mirror already holds would have its suffix appended on top of a
+                // prefix that disagrees with it, and the result is not a dictionary
+                // at all -- ids repeat, and `SymbolGlobalDict::seed` rejects the whole
+                // region as a duplicate entry, failing construction on every later
+                // open with a diagnostic blaming a torn side-file that is in fact
+                // intact. Ask the same question the send loop asks
+                // (`guard_dict_not_torn` -> `conflicts_with`) and stop here instead,
+                // exactly as the `delta_start > count` gap below does: the count
+                // stays at the last frame that agreed, the producer resumes there,
+                // and the disagreeing frame is rejected loudly at send time
+                // ("resend required") rather than silently rebuilt into nonsense.
+                // No-op on the common path -- a contiguous `delta_start == tip`
+                // extension overlaps nothing, so this cannot fire.
+                let folded = payload.with_bytes(|frame| {
+                    if mirror.conflicts_with(frame) {
+                        return false;
+                    }
+                    mirror.accumulate(frame);
+                    true
+                });
+                if !folded {
+                    log::warn!(
+                        "QWP/WebSocket store-and-forward slot {}: stored frame {fsn} \
+                         redefines a symbol id the recovered dictionary already holds; \
+                         rebuilding the dictionary from the frames before it and \
+                         leaving that frame for the send loop to reject as \
+                         resend-required.",
+                        slot_dir.display()
+                    );
+                    break;
+                }
                 fsn += 1;
             }
         }
@@ -5220,6 +5271,87 @@ mod tests {
              nothing can reconstruct, so the send loop's `guard_dict_not_torn` \
              rejects its frame loudly rather than the rebuild guessing"
         );
+    }
+
+    #[test]
+    fn recovered_slot_stops_the_rebuild_at_a_frame_that_disagrees_about_an_id() {
+        // Regression (permanent construction failure, misdiagnosed as disk damage).
+        //
+        // A gap is not the only thing the fold must stop at. `accumulate` matches on
+        // POSITION only -- it folds in any frame covering the tip and reaching past
+        // it, whatever the overlapping ids actually say -- so a frame that
+        // REDEFINES an id the side-file already holds gets its suffix appended on
+        // top of a prefix that contradicts it.
+        //
+        // Here the side-file holds `alpha` at id 0 and the surviving frame declares
+        // id 0 = `zulu`, id 1 = `alpha`. Position-wise the frame overlaps the tip by
+        // one entry and extends by one, so the unguarded fold skips one entry and
+        // appends `alpha` -- yielding `[alpha][alpha]`, count 2. That is not a
+        // dictionary: `SymbolGlobalDict::seed` re-interns every entry and rejects the
+        // repeat with `StoreResendRequired` ("duplicate entry at index 1 (a torn or
+        // zero-extended tail)"). Both recovery callers `?`-propagate that, so
+        // `SenderBuilder::build` / `borrow_sender` fail -- deterministically, on
+        // every retry, forever -- pointing an operator at a side-file that is
+        // byte-perfect.
+        //
+        // So the fold asks `conflicts_with`, the same question `guard_dict_not_torn`
+        // asks before sending, and stops exactly as it does at a gap. Construction
+        // then succeeds on the agreeing prefix and the disagreeing frame is rejected
+        // loudly at send time instead.
+        //
+        // Reaching this needs frames written against a different dictionary
+        // generation than the side-file -- a session that ran dense because the
+        // side-file was unwritable. Narrow, but the pre-rebuild code opened such a
+        // slot fine, so without this guard the rebuild is a regression.
+        use crate::ingress::buffer::SymbolGlobalDict;
+        use crate::ingress::sender::qwp_ws_sfa_catchup::make_delta_frame;
+
+        let dir = TempDir::new().unwrap();
+
+        let mut queue = open(&dir);
+        queue
+            .try_submit(&make_delta_frame(
+                0,
+                &[b"zulu".as_slice(), b"alpha".as_slice()],
+                b"",
+            ))
+            .unwrap();
+        drop(queue);
+        {
+            let mut pd = crate::ingress::sender::qwp_ws_sfa_symbol_dict::PersistedSymbolDict::open(
+                dir.path(),
+            )
+            .unwrap();
+            pd.append_symbol(b"alpha").unwrap();
+        }
+
+        let recovered = open(&dir);
+        assert!(recovered.is_delta_dict_enabled());
+        assert_eq!(
+            recovered.recovered_symbol_dict_count(),
+            1,
+            "the fold must stop AT the disagreeing frame, keeping the side-file's \
+             prefix -- 2 means it folded the frame in over a contradicting prefix"
+        );
+        assert_eq!(
+            recovered.recovered_symbol_dict_entries(),
+            &[5, b'a', b'l', b'p', b'h', b'a'][..],
+            "id 0 keeps the side-file's `alpha`; the frame's `zulu` is not adopted \
+             and its `alpha` is not appended as a second id 1"
+        );
+
+        // The payoff: the recovered region is a usable dictionary, so recovery can
+        // actually proceed. Unguarded this is `[alpha][alpha]`/2 and seeding fails.
+        let mut dict = SymbolGlobalDict::new();
+        dict.seed(
+            recovered.recovered_symbol_dict_entries(),
+            recovered.recovered_symbol_dict_count(),
+        )
+        .expect(
+            "the rebuilt region must seed cleanly -- a duplicate here is what fails \
+             construction on every later open",
+        );
+        assert_eq!(dict.next_id(), 1);
     }
 
     #[test]
