@@ -784,16 +784,23 @@ bool qwp_chunk_column_binary(
  * Resetting the dictionary means discarding the connection that owns it —
  * there is no per-sender close, and `questdb_db_return_sender` recycles the
  * connection *and its dictionary*, so a returned-and-reborrowed sender hits
- * the cap again on its next new symbol. Instead:
+ * the cap again on its next new symbol. Discarding the connection is NOT
+ * automatically lossless for frames already flushed on it, so commit or drain
+ * them first. Instead:
  *
- *   - Pooled sender: `questdb_db_drop_sender`, then borrow again. With
- *     `sf_dir` configured, call `qwp_sender_wait` first — dropping while
- *     frames are unresolved leaves them (and the dictionary) in the slot,
- *     and the next borrower re-seeds from the slot's side-file at the same
- *     size.
- *   - Pooled direct sender: `questdb_db_drop_direct_sender`, then borrow
- *     again.
- *   - Standalone direct sender: `qwp_direct_sender_free`, then re-open with
+ *   - Pooled sender: `qwp_sender_wait`, then `questdb_db_drop_sender`, then
+ *     borrow again. Waiting matters with `sf_dir` too, not just without it —
+ *     dropping while frames are unresolved leaves them (and the dictionary) in
+ *     the slot, and the next borrower re-seeds from the slot's side-file at the
+ *     same size, so it is full before it sends anything.
+ *   - Pooled direct sender: `qwp_direct_sender_commit` (or a waited flush)
+ *     FIRST, and check it succeeded, then `questdb_db_drop_direct_sender`, then
+ *     borrow again. This sender's flushes are deferred, and
+ *     `questdb_db_drop_direct_sender` skips the best-effort commit that
+ *     `questdb_db_return_direct_sender` performs, so every frame flushed since
+ *     the last successful commit is discarded with only a log warning.
+ *   - Standalone direct sender: `qwp_direct_sender_commit` first (same reason),
+ *     then `qwp_direct_sender_free`, then re-open with
  *     `qwp_direct_sender_from_conf` / `qwp_direct_sender_from_opts`.
  *
  * `codes[i]` must be in `0 .. dict_len` for non-null rows; null-row

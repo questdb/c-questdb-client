@@ -234,26 +234,44 @@ pub enum ErrorCode {
     /// symbol referenced across every column, chunk, and row-buffer flush on
     /// one connection, and is only reset by discarding that connection.
     ///
-    /// The frame is rejected before any byte reaches the wire and the buffer is
-    /// rolled back, so nothing is lost and already-interned symbols keep
-    /// flushing — but retrying on the same sender can never succeed. The caller
-    /// must retire the connection and continue on a fresh one. How to do that
-    /// depends on the API, and on the pooled ones a plain drop is **not** it:
+    /// The failing frame is rejected before any byte reaches the wire and the
+    /// buffer is rolled back, so *that flush* loses nothing and already-interned
+    /// symbols keep flushing — but retrying on the same sender can never
+    /// succeed. The caller must retire the connection and continue on a fresh
+    /// one. How to do that depends on the API, and on the pooled ones a plain
+    /// drop is **not** it. **Retiring is not automatically lossless for frames
+    /// flushed earlier**: commit or drain them first, as below.
     ///
-    /// - **Pooled** (`QuestDb::borrow_sender`,
-    ///   `QuestDb::borrow_direct_column_sender`): call `drop_on_return()` on the
-    ///   guard before it goes out of scope. Dropping the guard *is* the pool
-    ///   return — it recycles the connection **and its dictionary** — and the
-    ///   free list is LIFO, so the next borrow hands back that same connection
-    ///   and it fails again on its next new symbol. With `sf_dir` configured,
-    ///   `wait()` for the queued frames first: dropping while frames are
-    ///   unresolved leaves them **and the dictionary** in the slot, and the next
-    ///   borrower re-seeds from that slot's side-file at the same size — a fresh
-    ///   connection that is already full before it sends anything.
+    /// - **Pooled row sender** (`QuestDb::borrow_sender`): call
+    ///   `drop_on_return()` on the guard before it goes out of scope. Dropping
+    ///   the guard *is* the pool return — it recycles the connection **and its
+    ///   dictionary** — and the free list is LIFO, so the next borrow hands back
+    ///   that same connection and it fails again on its next new symbol. On the
+    ///   way out the queue is drained best-effort within `close_flush_timeout`;
+    ///   call `wait()` first if those frames must not be lost. With `sf_dir`
+    ///   configured they persist in the slot instead — but so does the
+    ///   dictionary, and the next borrower re-seeds from that slot's side-file
+    ///   at the same size, so it is full before it sends anything. `wait()`
+    ///   first there too, so the slot drains and the next borrower starts clean.
+    /// - **Pooled direct column sender**
+    ///   (`QuestDb::borrow_direct_column_sender`): **commit first, then**
+    ///   `drop_on_return()`. Its `flush` is *deferred* — nothing is committed
+    ///   until [`commit`](crate::db::BorrowedDirectColumnSender::commit) or
+    ///   `flush_and_wait` — and `drop_on_return()` latches the connection
+    ///   terminal, which makes the normal drop **skip** its best-effort commit
+    ///   entirely rather than attempt it. Every frame flushed since the last
+    ///   successful commit is then discarded with only a log warning. Call
+    ///   `commit(..)` (or `flush_and_wait(..)` on the final chunk) and check it
+    ///   succeeded *before* `drop_on_return()`.
     /// - **Standalone** (`Sender`): drop it and reconnect.
-    /// - **C ABI**: `questdb_db_drop_sender`, not `questdb_db_return_sender`.
+    /// - **C ABI**: `questdb_db_drop_sender` for a pooled row sender;
+    ///   `questdb_db_drop_direct_sender` for a pooled direct sender, after
+    ///   `qwp_direct_sender_commit` or a waited flush; `qwp_direct_sender_free`
+    ///   for a standalone one. Never `questdb_db_return_sender` /
+    ///   `questdb_db_return_direct_sender`, which recycle the dictionary.
     ///
-    /// **One exception, and it matters for resends.** A chunk too large for a
+    /// **One exception to "that flush loses nothing", and it matters for
+    /// resends.** A chunk too large for a
     /// single frame is split, and each half is published on its own;
     /// store-and-forward is at-least-once, so an earlier half can already be
     /// durably queued when a later half hits the cap. Nothing is lost then

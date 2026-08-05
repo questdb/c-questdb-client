@@ -235,20 +235,33 @@ typedef enum line_sender_error_code
     /** The QWP/WebSocket connection-scoped symbol dictionary is full: interning
      *  another distinct symbol would exceed its entry-count cap (1,000,000,
      *  matching the server's ingress ceiling) or its cumulative UTF-8 heap cap
-     *  (256 MiB). The frame is rejected before any byte reaches the wire and the
-     *  buffer is rolled back, so nothing is lost and chunks referencing only
-     *  already-interned symbols keep flushing — but retrying on the same sender
-     *  can never succeed. Retire the connection (`questdb_db_drop_sender`, NOT
-     *  `questdb_db_return_sender`, which recycles the connection and its
-     *  dictionary) and borrow a fresh one; with `sf_dir` configured, call
-     *  `qwp_sender_wait` first, since dropping while frames are unresolved
-     *  leaves them and the dictionary in the slot and the next borrower re-seeds
-     *  from that slot's side-file at the same size. See the symbol-column
-     *  preamble in `qwp_sender.h`. Distinct from
+     *  (256 MiB). The failing frame is rejected before any byte reaches the wire
+     *  and the buffer is rolled back, so *that flush* loses nothing and chunks
+     *  referencing only already-interned symbols keep flushing — but retrying on
+     *  the same sender can never succeed. Retire the connection and borrow a
+     *  fresh one; retiring is NOT automatically lossless for frames flushed
+     *  earlier, so commit or drain them first:
+     *
+     *    - Pooled row sender: `qwp_sender_wait`, then `questdb_db_drop_sender` —
+     *      NOT `questdb_db_return_sender`, which recycles the connection and its
+     *      dictionary. With `sf_dir` configured the queued frames persist in the
+     *      slot, but so does the dictionary, and the next borrower re-seeds from
+     *      that slot's side-file at the same size; waiting first drains the slot
+     *      so the next borrower starts clean.
+     *    - Pooled direct sender: `qwp_direct_sender_commit` (or a waited flush)
+     *      and CHECK IT SUCCEEDED, then `questdb_db_drop_direct_sender` — NOT
+     *      `questdb_db_return_direct_sender`. Its flushes are deferred, and
+     *      dropping a sender marked for discard skips the best-effort commit the
+     *      normal return performs, so every frame flushed since the last
+     *      successful commit is discarded.
+     *    - Standalone direct sender: `qwp_direct_sender_commit`, then
+     *      `qwp_direct_sender_free`, then re-open.
+     *
+     *  See the symbol-column preamble in `qwp_sender.h`. Distinct from
      *  `line_sender_error_invalid_api_call` so callers can recognise it without
      *  matching on the message text.
      *
-     *  One exception to "nothing is lost", and it matters for resends: a chunk
+     *  One exception to "that flush loses nothing", and it matters for resends: a chunk
      *  too large for a single frame is split and each half published on its own,
      *  so an earlier half can already be durably queued (store-and-forward is
      *  at-least-once) when a later half hits the cap. The error is then
