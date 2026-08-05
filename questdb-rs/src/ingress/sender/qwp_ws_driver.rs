@@ -2630,6 +2630,16 @@ pub(crate) fn reconnect_error_is_terminal(err: &Error) -> bool {
             | ErrorCode::ConfigError
             | ErrorCode::ProtocolVersionError
             | ErrorCode::StoreResendRequired
+            // A full connection dictionary is a property of durable state, not of
+            // the transport: `SymbolGlobalDict::seed` re-interns every recovered
+            // entry, so a slot whose `.symbol-dict` holds more symbols than this
+            // client's cap fails `PooledSenderCore::new_store_and_forward` the same
+            // way on every attempt. Retrying re-opens the slot, re-runs the
+            // frame-derived dictionary rebuild and re-connects, all to reach the
+            // identical error, until the caller's whole retry budget is spent.
+            // `StoreResendRequired` above is the sibling `seed` raises from the very
+            // same call and is already terminal; this belongs beside it.
+            | ErrorCode::SymbolDictFull
     )
 }
 
@@ -6400,6 +6410,32 @@ mod tests {
         assert!(!reconnect_error_is_terminal(
             &retryable_upgrade_version_error
         ));
+    }
+
+    #[test]
+    fn reconnect_terminal_classification_stops_on_a_full_symbol_dictionary() {
+        // Regression (retry storm on a deterministic failure). `SymbolGlobalDict::
+        // seed` re-interns every recovered entry, so a slot whose side-file holds
+        // more symbols than this client's cap fails `new_store_and_forward` --
+        // and fails it identically on every attempt, because nothing about the
+        // slot or the cap changes in between. Classified retryable, `reconnect_pick`
+        // / `reborrow_with_retry` re-open the slot, re-run the frame-derived
+        // rebuild and re-connect on every backoff step until the budget expires,
+        // then return the same error.
+        //
+        // `StoreResendRequired` is the sibling the SAME `seed` call raises and has
+        // always been terminal; the asymmetry was the bug.
+        let dict_full = Error::new(
+            ErrorCode::SymbolDictFull,
+            "QWP/WS connection-scoped symbol dictionary reached its 1000000-entry cap",
+        );
+        assert!(reconnect_error_is_terminal(&dict_full));
+
+        let torn_dict = Error::new(
+            ErrorCode::StoreResendRequired,
+            "corrupt persisted symbol dictionary: duplicate entry at index 1",
+        );
+        assert!(reconnect_error_is_terminal(&torn_dict));
     }
 
     #[test]
