@@ -615,7 +615,7 @@ impl OrphanDrainer {
         // side-file intact, so retry the whole adoption instead of disabling the
         // mirror next to already-persisted `delta_start > 0` frames.
         let recovered_dict_count = queue.recovered_symbol_dict_count();
-        let recovered_dict_entries = if delta_dict_enabled {
+        let recovered_dict = if delta_dict_enabled {
             let entries = match try_dup_recovered(queue.recovered_symbol_dict_entries()) {
                 Ok(entries) => entries,
                 Err(err) => {
@@ -640,23 +640,34 @@ impl OrphanDrainer {
             // symbols on the fresh server (silent corruption). Validate the
             // recovered region with the exact same check the foreground uses (the
             // shared `SymbolGlobalDict::seed`, so the two paths cannot diverge):
-            // only arm delta if a throwaway seed rebuilds a well-formed
-            // (unique-entry) dictionary. On failure fall back to dense -- leave the
-            // mirror disabled -- so `guard_dict_not_torn` rejects any surviving
-            // `delta_start > 0` frame loudly ("resend required") instead of
-            // replaying it silently, exactly the dense fallback the queue already
-            // takes for an absent / bad-magic side-file.
+            // only seed the mirror FROM THE SIDE-FILE if a throwaway seed rebuilds
+            // a well-formed (unique-entry) dictionary.
             //
-            // Degrading is right HERE and wrong on the foreground paths named
-            // above, which fail construction on the same error. The asymmetry is
-            // deliberate and argued in `SymbolGlobalDict::seed`'s docs: they have
-            // a producer that would mint ids the stored frames already reference,
-            // this path has none. Hard-failing here would surface as
-            // `RetryLater` -- re-queuing the slot forever -- and would abandon
-            // the slot's self-sufficient dense frames, which need no dictionary
-            // at all. See `qwp_ws_orphan_drain_degrades_to_dense_when_the_
-            // recovered_dict_exceeds_the_cap` for the paired half of the
-            // foreground test.
+            // On failure, discard those entries but still arm the mirror EMPTY --
+            // do NOT leave it disabled. The hazard the validation exists for is an
+            // INFLATED count, which slackens `guard_dict_not_torn`'s
+            // `delta_start > mirror.count()` test; an empty mirror is the exact
+            // opposite, the strictest state there is. Only a `delta_start == 0`
+            // frame passes it, `SentDictMirror::accumulate` then folds that frame's
+            // own delta section in, and the frames behind it resolve against what
+            // their predecessors registered. The drain bootstraps itself from the
+            // frames and needs nothing from the rejected side-file.
+            //
+            // Leaving it disabled instead is what `open_replay_only` stopped doing
+            // when it began arming delta unconditionally, and for the same reason:
+            // dense does not merely replay less efficiently here, it LOSES the
+            // slot. With the mirror disabled the `delta_start == 0` frame replays
+            // and commits, the `delta_start > 0` frame behind it is terminally
+            // rejected, and `StoreResendRequired` is classified proven-local
+            // unrecoverable (`terminal_error_is_proven_local_unrecoverable`) -- so
+            // the drain writes `.failed` and every later scan skips the slot until
+            // an operator clears the sentinel. Recoverable frames abandoned for a
+            // side-file this client merely could not hold.
+            //
+            // Replay-only is what makes arming empty safe: no producer, no
+            // write-ahead, and `qwp_ws_orphan::open` drops the side-file handle
+            // outright, so nothing can refill the discarded ids with different
+            // symbols underneath the stored frames.
             //
             // Report the rejection verbatim rather than asserting a cause: `seed`
             // fails `SymbolDictFull` on a well-formed side-file that is merely
@@ -664,17 +675,17 @@ impl OrphanDrainer {
             // client), and calling that "corrupt" sends an operator hunting for
             // disk damage that is not there.
             match SymbolGlobalDict::new().seed(&entries, recovered_dict_count) {
-                Ok(()) => Some(entries),
+                Ok(()) => Some((entries, recovered_dict_count)),
                 Err(err) => {
                     log::warn!(
                         "QWP/WebSocket orphan slot {}: persisted symbol dictionary was \
-                         rejected ({err}); draining with full-dictionary (dense) frames \
-                         -- any stored delta frame that depends on that dictionary is \
-                         rejected as resend-required rather than replayed against a \
-                         desynced one.",
+                         rejected ({err}); draining with the dictionary the stored \
+                         frames carry instead -- a frame that needs an id they cannot \
+                         supply is rejected as resend-required, but the rest still \
+                         drain.",
                         slot_dir.display()
                     );
-                    None
+                    Some((Vec::new(), 0))
                 }
             }
         } else {
@@ -730,7 +741,7 @@ impl OrphanDrainer {
             *config.qwp_ws.max_frame_rejections,
             *config.qwp_ws.poison_min_escalation_window,
         );
-        if let Some(recovered_dict_entries) = recovered_dict_entries {
+        if let Some((recovered_dict_entries, recovered_dict_count)) = recovered_dict {
             send_core.enable_delta_dict_owned(recovered_dict_entries, recovered_dict_count);
         }
         OrphanOpenOutcome::Drainer(Box::new(Self {

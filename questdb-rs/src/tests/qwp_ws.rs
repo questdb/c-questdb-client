@@ -3093,7 +3093,7 @@ fn qwp_ws_orphan_drain_heals_a_zero_extended_side_file_and_replays_via_delta() {
 }
 
 #[test]
-fn qwp_ws_orphan_drain_falls_back_to_dense_when_recovered_dict_has_a_duplicate_entry() {
+fn qwp_ws_orphan_drain_discards_a_duplicate_entry_dict_and_arms_the_mirror_empty() {
     // A recovered `.symbol-dict` can be corrupt in a way the per-chunk CRC does NOT
     // catch: a host/power crash that leaves the append-only file with a duplicate
     // chunk (e.g. a torn tail whose bytes re-form an already-present, still-CRC-valid
@@ -3102,21 +3102,29 @@ fn qwp_ws_orphan_drain_falls_back_to_dense_when_recovered_dict_has_a_duplicate_e
     // `SymbolGlobalDict::seed` rejects the duplicate id (`StoreResendRequired`).
     //
     // The orphan drainer builds no producer `SymbolGlobalDict`, so it must validate
-    // the recovered region itself with a throwaway `SymbolGlobalDict::seed` and arm
-    // the delta catch-up mirror ONLY when that succeeds (see `qwp_ws_orphan::open`).
-    // Seeding the unvalidated `SentDictMirror` verbatim with the inflated count would
-    // slacken the torn-dict guard (`delta_start > mirror.count()`) and let a stored
-    // delta frame replay against a desynced dictionary -- resolving ids to the wrong
-    // symbols on the fresh server (silent corruption). On rejection the drainer must
-    // instead leave the mirror disabled and drain with full-dictionary (dense)
-    // frames, keeping the slot recoverable.
+    // the recovered region itself with a throwaway `SymbolGlobalDict::seed` and
+    // seed the delta catch-up mirror FROM THE SIDE-FILE only when that succeeds
+    // (see `qwp_ws_orphan::open`). Seeding the unvalidated `SentDictMirror`
+    // verbatim with the inflated count would slacken the torn-dict guard
+    // (`delta_start > mirror.count()`) and let a stored delta frame replay against
+    // a desynced dictionary -- resolving ids to the wrong symbols on the fresh
+    // server (silent corruption).
+    //
+    // On rejection the entries are DISCARDED and the mirror is armed EMPTY -- not
+    // left disabled. Count 0 is the strictest guard state, the opposite of the
+    // inflated count this validation exists to keep out, and it lets the drain
+    // bootstrap from the frames' own delta sections instead of abandoning the slot
+    // (see `qwp_ws_orphan_drain_arms_an_empty_mirror_when_the_recovered_dict_
+    // exceeds_the_cap` for what dense costs).
     //
     // This is the inverse of
     // `qwp_ws_orphan_drain_heals_a_zero_extended_side_file_and_replays_via_delta`,
-    // where the CRC heals the tail to a CLEAN dictionary and delta stays armed.
+    // where the CRC heals the tail to a CLEAN dictionary and the mirror is seeded
+    // from the side-file.
     //
     // Observable: the orphan's FIRST sent frame is the DATA frame (`table_count >=
-    // 1`) with no preceding table-less catch-up (`table_count == 0`), and the slot
+    // 1`) with no preceding table-less catch-up (`table_count == 0`) -- which is
+    // exactly what proves the rejected dictionary was not seeded -- and the slot
     // stays recoverable (no `.failed`).
     let sf_dir = tempfile::TempDir::new().unwrap();
     seed_orphan_slot(sf_dir.path());
@@ -3172,48 +3180,53 @@ fn qwp_ws_orphan_drain_falls_back_to_dense_when_recovered_dict_has_a_duplicate_e
     let table_count = u16::from_le_bytes([frame[6], frame[7]]);
     assert!(
         table_count >= 1,
-        "a corrupt (duplicate-entry) recovered dictionary must leave the delta mirror \
-         disabled, so the orphan drains dense and sends the DATA frame first \
+        "a corrupt (duplicate-entry) recovered dictionary must be DISCARDED, so the \
+         mirror arms empty, emits no catch-up, and the DATA frame goes first \
          (table_count >= 1); a table-less catch-up first (table_count == 0) would mean \
-         it wrongly armed delta on the corrupt dictionary. table_count = {table_count}"
+         it wrongly seeded the mirror from the corrupt dictionary. \
+         table_count = {table_count}"
     );
     assert!(
         !sf_dir.path().join("orphan").join(".failed").exists(),
-        "a corrupt recovered dictionary must degrade to dense, not fail the slot"
+        "a corrupt recovered dictionary must leave the slot recoverable, not fail it"
     );
 }
 
 #[test]
-fn qwp_ws_orphan_drain_degrades_to_dense_when_the_recovered_dict_exceeds_the_cap() {
-    // The replay-only half of the asymmetry argued in `SymbolGlobalDict::seed`'s
-    // docs. `seed` re-interns every recovered entry, so a side-file holding more
-    // symbols than this client's cap is refused with `SymbolDictFull` -- a
-    // well-formed dictionary, merely bigger than this client will hold (written by
-    // a higher-capped one), not a corrupt one.
+fn qwp_ws_orphan_drain_arms_an_empty_mirror_when_the_recovered_dict_exceeds_the_cap() {
+    // Regression (abandoned data). The replay-only half of the asymmetry argued in
+    // `SymbolGlobalDict::seed`'s docs. `seed` re-interns every recovered entry, so
+    // a side-file holding more symbols than this client's cap is refused with
+    // `SymbolDictFull` -- a well-formed dictionary, merely bigger than this client
+    // will hold (written by a higher-capped one), not a corrupt one.
     //
     // `store_and_forward_file_mode_recovery_fails_when_the_recovered_dict_exceeds_
-    // the_cap` pins the FOREGROUND response to that exact error: fail
-    // construction, because a producer would otherwise mint ids the stored frames
-    // already reference. Here the drainer must do the opposite and degrade to
-    // dense. It is replay-only -- no producer, no write-ahead, side-file handle
-    // dropped -- so nothing can collide; and hard-failing at open would abandon
-    // the frames that need no dictionary at all before replaying a single one.
-    // The torn-dict guard still rejects the delta ones loudly.
+    // the_cap` pins the FOREGROUND response: fail construction, because a producer
+    // would otherwise mint ids the stored frames already reference. The drainer
+    // must not do that -- it is replay-only, so nothing can collide -- but the
+    // answer is not the dense fallback either.
     //
-    // Observables: the orphan's FIRST sent frame is the DATA frame (`table_count
-    // >= 1`) with no preceding table-less catch-up; then, because this slot's
-    // second frame bases at symbol id 1 -- which dense mode can never
-    // re-register on this client -- the guard's `StoreResendRequired` is a
-    // proven-local terminal, so the drain quarantines the slot (`.failed`, the
-    // worker released) rather than re-queuing it forever, keeping the durable
-    // frames on disk for a higher-capped client once the sentinel is cleared.
+    // Dense LOSES the slot. With the mirror disabled the `delta_start == 0` frame
+    // replays and commits, the `delta_start == 1` frame behind it is terminally
+    // rejected, and `StoreResendRequired` is classified proven-local unrecoverable,
+    // so the drain writes `.failed` and every later scan skips the slot until an
+    // operator clears the sentinel -- recoverable frames abandoned over a side-file
+    // this client merely could not hold.
+    //
+    // So the rejected entries are discarded but the mirror is armed EMPTY. Count 0
+    // is the STRICTEST guard state, not a slackened one (the hazard the validation
+    // exists for is an INFLATED count): only the `delta_start == 0` frame passes,
+    // `accumulate` folds its own delta section in, and frame 2 resolves against
+    // that. Both replay and the slot drains. This is the same bootstrap
+    // `qwp_ws_orphan_drain_replays_both_frames_when_the_first_dict_chunk_is_corrupt`
+    // pins for a torn side-file, reached here through the cap-rejection branch.
     let sf_dir = tempfile::TempDir::new().unwrap();
     // Seeded BEFORE the cap guard: phase 1 is a normally-capped client, and its
     // two symbols are what later overflow the shrunken cap.
     seed_orphan_slot_with_two_delta_frames(sf_dir.path());
 
     let _cap = crate::ingress::TestDictCapGuard::new(1);
-    let (port, rx) = spawn_orphan_capture_first_frame_server();
+    let (port, rx) = spawn_orphan_drain_all_frames_server();
     let drain_conf = format!(
         "ws::addr=127.0.0.1:{port};qwp_ws_progress=manual;\
          sf_dir={};sender_id=primary;drain_orphans=on;\
@@ -3225,56 +3238,47 @@ fn qwp_ws_orphan_drain_degrades_to_dense_when_the_recovered_dict_exceeds_the_cap
         .build()
         .unwrap();
 
-    let mut first_frame = None;
-    for _ in 0..60 {
+    // Collect QWP frames in order. A table-less catch-up carries table_count == 0;
+    // a replayed DATA frame carries >= 1.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut frames: Vec<Vec<u8>> = Vec::new();
+    let mut data_frames = 0usize;
+    while Instant::now() < deadline && data_frames < 2 {
         let _ = sender.drive_once().unwrap();
-        if let Ok(frame) = rx.try_recv() {
-            first_frame = Some(frame);
-            break;
+        while let Ok(frame) = rx.try_recv() {
+            if frame.len() >= 12 && &frame[..4] == b"QWP1" {
+                if u16::from_le_bytes([frame[6], frame[7]]) >= 1 {
+                    data_frames += 1;
+                }
+                frames.push(frame);
+            }
         }
         thread::sleep(Duration::from_millis(10));
     }
 
-    let frame = first_frame.expect(
+    let first = frames.first().expect(
         "the drainer must still connect and replay -- an over-cap recovered \
          dictionary must not abort the drain",
     );
+    let first_table_count = u16::from_le_bytes([first[6], first[7]]);
     assert!(
-        frame.len() >= 12 && &frame[..4] == b"QWP1",
-        "not a QWP frame: {:?}",
-        &frame[..frame.len().min(12)]
-    );
-    let table_count = u16::from_le_bytes([frame[6], frame[7]]);
-    assert!(
-        table_count >= 1,
-        "a recovered dictionary past the cap must leave the delta mirror disabled, \
-         so the orphan drains dense and sends the DATA frame first (table_count >= \
-         1); a table-less catch-up first (table_count == 0) would mean it armed a \
-         mirror it could not seed. table_count = {table_count}"
+        first_table_count >= 1,
+        "the rejected entries must be DISCARDED, so the empty mirror emits no \
+         catch-up and the DATA frame goes first (table_count >= 1). A table-less \
+         catch-up first (table_count == 0) would mean the drain re-registered a \
+         dictionary it had just refused to seed. table_count = {first_table_count}"
     );
 
-    // The self-sufficient prefix replayed; the `delta_start == 1` frame behind it
-    // can never replay dense, so the drain must end in quarantine -- not spin.
-    let orphan_slot = sf_dir.path().join("orphan");
-    let quarantined = wait_until(Duration::from_secs(5), || {
-        let _ = sender.drive_once().unwrap();
-        orphan_slot.join(".failed").exists()
-    });
     assert!(
-        quarantined,
-        "a stored frame basing above id 0 is proven-local unrecoverable in dense \
-         mode, so the drain must retire the slot with the `.failed` sentinel \
-         instead of re-queuing it forever"
-    );
-    let reason = std::fs::read_to_string(orphan_slot.join(".failed")).unwrap();
-    assert!(
-        reason.contains("delta symbol-dictionary mode is disabled"),
-        "the sentinel must carry the resend-required reason verbatim: {reason}"
+        data_frames >= 2,
+        "both queued frames must replay -- got {data_frames}. One means the drain \
+         fell back to dense, terminally rejected its `delta_start == 1` frame, and \
+         abandoned the slot behind a `.failed` sentinel"
     );
     assert!(
-        slot_has_sfa_file(&orphan_slot),
-        "quarantine must retain the durable frames -- a higher-capped client can \
-         still drain them after the sentinel is cleared"
+        !sf_dir.path().join("orphan").join(".failed").exists(),
+        "an over-cap side-file is not proven-local unrecoverable: the frames carry \
+         the dictionary they need, so the slot must drain rather than be quarantined"
     );
 }
 
