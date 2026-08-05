@@ -263,7 +263,14 @@ pub enum ErrorCode {
     ///   successful commit is then discarded with only a log warning. Call
     ///   `commit(..)` (or `flush_and_wait(..)` on the final chunk) and check it
     ///   succeeded *before* `drop_on_return()`.
-    /// - **Standalone** (`Sender`): drop it and reconnect.
+    /// - **Standalone** (`Sender`): call
+    ///   [`close_drain`](crate::ingress::Sender::close_drain) and check it
+    ///   succeeded, then drop and reconnect. Unlike the pooled guards above, a
+    ///   plain drop drains **nothing** here — `SyncProtocolHandler`'s `Drop`
+    ///   shuts down the ILP-over-TCP socket and has no QWP/WebSocket arm at all,
+    ///   so every published-but-unacked frame is discarded with no wait. This is
+    ///   the most lossy of the three flavours on a bare drop, not the least.
+    ///   `close_drain` is bounded by `close_flush_timeout`.
     /// - **C ABI**: `questdb_db_drop_sender` for a pooled row sender;
     ///   `questdb_db_drop_direct_sender` for a pooled direct sender, after
     ///   `qwp_direct_sender_commit` or a waited flush; `qwp_direct_sender_free`
