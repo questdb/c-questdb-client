@@ -594,11 +594,23 @@ impl SfaFrameQueue {
                          dictionary from the stored frames.",
                         options.slot_dir.display()
                     );
-                    // `open` re-creates a fresh header over whatever is there, so the
-                    // producer regains a write-ahead target. If even that fails the
-                    // disk is unusable for this slot: degrade to dense, which is
-                    // where this branch used to land unconditionally.
-                    PersistedSymbolDict::open(&options.slot_dir).ok()
+                    // `open` re-creates a fresh header over whatever is there, so
+                    // the producer regains a write-ahead target. Every error it can
+                    // return here is a *transient* I/O failure -- a proven-corrupt
+                    // file re-creates to `Ok` via `open_fresh`, and only
+                    // stat/open/read/create/write errors surface as `Err` -- so
+                    // propagate it rather than swallowing it to dense with `.ok()`.
+                    // Dense is NOT neutral while delta frames survive: it leaves the
+                    // mirror disabled, so the `delta_start == 0` frame replays and
+                    // COMMITS, the `delta_start > 0` frame behind it is rejected
+                    // `StoreResendRequired` (`in_doubt == false`), and a compliant
+                    // resend duplicates the committed rows -- the exact hazard this
+                    // branch is written to avoid. Failing construction is retryable
+                    // and leaves the slot intact on disk for the next attempt,
+                    // exactly as `open_recovered` does for its own transient errors
+                    // above. (A genuinely unusable disk then fails loudly on every
+                    // retry rather than silently duplicating.)
+                    Some(PersistedSymbolDict::open(&options.slot_dir)?)
                 }
             }
         } else {
