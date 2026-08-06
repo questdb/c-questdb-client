@@ -270,22 +270,28 @@ def _inflight_verdict(leg, steady, quiet, cfg):
         return None
     # The backlog is *expected* to build while a fault is being injected, so the
     # trend skips those windows. The peak does not: a backlog running away
-    # mid-fault is the exact failure this bound is for.
+    # mid-fault is the exact failure this bound is for. If the exclusions leave
+    # too few quiet samples to fit, leave the slope unjudged rather than fall
+    # back to the fault-contaminated samples — that would re-admit the very
+    # windows the exclusion removed and resurrect the flake.
     trend = [(s['t'], s['published_fsn'] - s['acked_fsn'])
              for s in quiet
              if s.get('published_fsn') is not None and s.get('acked_fsn') is not None]
-    if len(trend) < 3:
-        trend = pairs
-    t0 = trend[0][0]
-    xs = [(t - t0) / 60.0 for t, _ in trend]
-    slope = linreg_slope(xs, [v for _, v in trend])
+    if len(trend) >= 3:
+        t0 = trend[0][0]
+        xs = [(t - t0) / 60.0 for t, _ in trend]
+        slope = linreg_slope(xs, [v for _, v in trend])
+    else:
+        slope = None
     inflight = [p[1] for p in pairs]
     peak = max(inflight)
     # Bounded: not trending up (slope small) and never absurdly deep. The cap
     # is generous — the point is catching monotonic growth, not a tight bound.
-    ok = slope <= cfg.inflight_slope_max_per_min and peak <= cfg.inflight_peak_max
+    ok = ((slope is None or slope <= cfg.inflight_slope_max_per_min)
+          and peak <= cfg.inflight_peak_max)
     return Verdict('I4', f'{leg}:inflight', ok, {
-        'slope_per_min': round(slope, 2), 'peak': peak, 'final': inflight[-1],
+        'slope_per_min': None if slope is None else round(slope, 2),
+        'peak': peak, 'final': inflight[-1],
         'limits': {'slope_max': cfg.inflight_slope_max_per_min,
                    'peak_max': cfg.inflight_peak_max},
     })
@@ -296,34 +302,40 @@ def _rss_verdict(leg, warmup, steady, quiet, cfg):
     # themselves — see `sawtooth_floor`. The trend comes from `quiet` (the
     # fault windows dropped); the peak bounds below stay on the whole of
     # `steady`, so memory ballooning *during* a fault still fails.
-    trend = quiet if len(quiet) >= 3 else steady
-    values = [s['rss_bytes'] for s in trend]
-    cycling = max(values) - min(values) >= cfg.rss_sawtooth_min_bytes
-    floor = sawtooth_floor(trend, 'rss_bytes',
-                           cfg.rss_sawtooth_min_bytes) if cycling else None
     slope = None
-    if floor:
-        xs = [(t - floor[0][0]) / 60.0 for t, _ in floor]
-        ys = [v / 1024.0 for _, v in floor]
-        # Floors are a scatter with outliers, so take the median slope; raw
-        # samples are an oscillation, where averaging is the right thing and a
-        # median would just report the ramp.
-        slope = robust_slope(xs, ys)
-        basis = 'sawtooth-floor'
-    elif cycling:
-        # A deep release cycle, but too few complete ones to fit a trend
-        # through — a short window, or one the faults cut up. Fitting the raw
-        # samples here is not a fallback, it *is* the original flake: it would
-        # measure the ramp the window happened to land on. Leave the slope
-        # unjudged and let the growth and peak bounds, which need no trend,
-        # carry this leg.
-        basis = 'insufficient-cycles'
-    else:
-        t0 = trend[0]['t']
-        xs = [(s['t'] - t0) / 60.0 for s in trend]        # minutes
-        ys = [s['rss_bytes'] / 1024.0 for s in trend]     # KiB
-        slope = linreg_slope(xs, ys)
-        basis = 'samples'
+    basis = 'insufficient-quiet'
+    floor = None
+    if len(quiet) >= 3:
+        values = [s['rss_bytes'] for s in quiet]
+        cycling = max(values) - min(values) >= cfg.rss_sawtooth_min_bytes
+        floor = sawtooth_floor(quiet, 'rss_bytes',
+                               cfg.rss_sawtooth_min_bytes) if cycling else None
+        if floor:
+            xs = [(t - floor[0][0]) / 60.0 for t, _ in floor]
+            ys = [v / 1024.0 for _, v in floor]
+            # Floors are a scatter with outliers, so take the median slope; raw
+            # samples are an oscillation, where averaging is the right thing and
+            # a median would just report the ramp.
+            slope = robust_slope(xs, ys)
+            basis = 'sawtooth-floor'
+        elif cycling:
+            # A deep release cycle, but too few complete ones to fit a trend
+            # through — a short window, or one the faults cut up. Fitting the raw
+            # samples here is not a fallback, it *is* the original flake: it
+            # would measure the ramp the window happened to land on. Leave the
+            # slope unjudged and let the growth and peak bounds, which need no
+            # trend, carry this leg.
+            basis = 'insufficient-cycles'
+        else:
+            t0 = quiet[0]['t']
+            xs = [(s['t'] - t0) / 60.0 for s in quiet]        # minutes
+            ys = [s['rss_bytes'] / 1024.0 for s in quiet]     # KiB
+            slope = linreg_slope(xs, ys)
+            basis = 'samples'
+    # else: the exclusions left fewer than three quiet samples. Falling back to
+    # `steady` would re-admit the excluded fault samples and resurrect the
+    # phase/dip flake, so the slope stays unjudged and the growth/peak bounds
+    # below carry the leg.
     warmup_peak = max((s['rss_bytes'] for s in warmup), default=steady[0]['rss_bytes'])
     steady_peak = max(s['rss_bytes'] for s in steady)
     # Peak-over-warmup, not first-to-last-sample: the first steady sample can
@@ -355,21 +367,24 @@ def _fd_verdict(leg, steady, quiet, cfg):
         return Verdict('I4', f'{leg}:fd', True,
                        f'inconclusive: only {len(pts)} fd samples')
     # Trend off the quiet stretches — a restart re-opens every descriptor — but
-    # the peak stays across all of them: fds held open during a fault count.
+    # the peak stays across all of them: fds held open during a fault count. Too
+    # few quiet samples to fit leaves the slope unjudged rather than falling back
+    # to the fault-contaminated samples.
     trend = [(s['t'], s['fd_count']) for s in quiet if s.get('fd_count') is not None]
-    if len(trend) < 3:
-        trend = pts
-    t0 = trend[0][0]
-    xs = [(t - t0) / 60.0 for t, _ in trend]
-    slope = linreg_slope(xs, [f for _, f in trend])
+    if len(trend) >= 3:
+        t0 = trend[0][0]
+        xs = [(t - t0) / 60.0 for t, _ in trend]
+        slope = linreg_slope(xs, [f for _, f in trend])
+    else:
+        slope = None
     fds = [f for _, f in pts]
     baseline = min(fds)
     peak = max(fds)
-    ok = (slope <= cfg.fd_slope_max_per_min
+    ok = ((slope is None or slope <= cfg.fd_slope_max_per_min)
           and peak <= baseline + cfg.fd_tolerance * 8)
     return Verdict('I4', f'{leg}:fd', ok, {
         'baseline': baseline, 'final': fds[-1], 'peak': peak,
-        'slope_per_min': round(slope, 3),
+        'slope_per_min': None if slope is None else round(slope, 3),
         'limits': {'slope_max': cfg.fd_slope_max_per_min,
                    'peak_over_baseline': cfg.fd_tolerance * 8},
     })
@@ -865,6 +880,42 @@ def _selftest():
           'I4 still fails a runaway backlog inside an excluded fault window')
     check(inflight_passed(900_000),
           'I4 tolerates a deep-but-bounded backlog in that same window')
+
+    # When the fault exclusions leave fewer than three quiet samples, the trend
+    # is left unjudged rather than fitted on the excluded fault samples — falling
+    # back to them would resurrect the very phase/dip/ramp flake the exclusion
+    # removed. Growth and peak still guard the leg across every steady sample.
+    ramp = (flat
+            + [sample(300 + i * 3, 30_000_000 + i * 30_000, 20) for i in range(100)])
+    check(not rss_detail(ramp).passed,
+          'I4 a fault-driven rss ramp fails when its window is not excluded')
+    excluded = rss_detail(ramp, spans=[(300, 600)]).detail
+    check(excluded['slope_kib_per_min'] is None
+          and excluded['slope_basis'] == 'insufficient-quiet',
+          'I4 leaves the rss slope unjudged when too few quiet samples survive')
+    check(rss_detail(ramp, spans=[(300, 600)]).passed,
+          'I4 a near-total rss exclusion does not fall back to a raw fit')
+
+    def inflight_detail(rows, spans):
+        return next(v for v in analyze_bounds(rows, cfg, exclude_spans=spans)
+                    if v.name.endswith(':inflight'))
+    rising = [burst(i * 3, 100 + i * 20, 90) for i in range(100)]
+    check(not inflight_detail(rising, None).passed,
+          'I4 a rising backlog fails when its window is not excluded')
+    dif = inflight_detail(rising, [(0, 300)])
+    check(dif.detail['slope_per_min'] is None and dif.passed,
+          'I4 leaves the in-flight slope unjudged when too few quiet samples survive')
+
+    fdramp = [sample(i * 3, 30_000_000, 20 + i // 4) for i in range(100)]
+
+    def fd_detail(spans):
+        return next(v for v in analyze_bounds(fdramp, cfg, exclude_spans=spans)
+                    if v.name.endswith(':fd'))
+    check(not fd_detail(None).passed,
+          'I4 a rising fd count fails when its window is not excluded')
+    dfd = fd_detail([(0, 300)])
+    check(dfd.detail['slope_per_min'] is None and dfd.passed,
+          'I4 leaves the fd slope unjudged when too few quiet samples survive')
 
     # I4: an FD leak (monotonic fd growth) fails.
     fdleak = [sample(i, 100_000_000, 20 + i) for i in range(20)]
