@@ -1592,9 +1592,9 @@ impl SenderBuilder {
     /// retriable). Mutually exclusive with [`username`](Self::username) /
     /// [`password`](Self::password) / [`token`](Self::token); ILP/HTTP only.
     ///
-    /// **Use [`Protocol::Https`](crate::ingress::Protocol::Https).** The token is a
+    /// **Use [`Protocol::Https`].** The token is a
     /// bearer credential for QuestDB; over
-    /// [`Protocol::Http`](crate::ingress::Protocol::Http) to a non-loopback host it
+    /// [`Protocol::Http`] to a non-loopback host it
     /// is sent in cleartext and can be captured in transit — plaintext http is
     /// meant only for a loopback server during local development.
     ///
@@ -1650,9 +1650,9 @@ impl SenderBuilder {
     /// exclusive with [`username`](Self::username) / [`password`](Self::password) /
     /// [`token`](Self::token); QWP/WebSocket only.
     ///
-    /// **Use [`Protocol::Wss`](crate::ingress::Protocol::Wss)** (TLS): the
+    /// **Use [`Protocol::Wss`]** (TLS): the
     /// token is a bearer credential, sent in cleartext over plain
-    /// [`Protocol::Ws`](crate::ingress::Protocol::Ws) to a non-loopback host.
+    /// [`Protocol::Ws`] to a non-loopback host.
     #[cfg(feature = "_sender-qwp-ws")]
     pub fn qwp_ws_token_provider<F, E>(mut self, provider: F) -> Result<Self>
     where

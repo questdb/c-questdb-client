@@ -40,8 +40,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 /// the poll request, never displayed.
 ///
 /// **These fields are the raw, untrusted IdP response values** (they are *not*
-/// pre-sanitized). The built-in [`TerminalRenderer`] passes them through
-/// [`strip_control`] / [`safe_target`] at display time; a custom [`Renderer`]
+/// pre-sanitized). The built-in [`TerminalRenderer`] passes them through its
+/// internal text-sanitization and URL-validation helpers at display time; a custom [`Renderer`]
 /// that echoes [`user_code`](Self::user_code) / [`verification_uri`](Self::verification_uri)
 /// to a terminal or DOM MUST sanitize them itself, or it re-opens the ANSI /
 /// bidi / zero-width prompt-spoofing surface.
@@ -81,8 +81,8 @@ impl DeviceCodeChallenge {
 ///
 /// Every method has a no-op default, so a custom renderer overrides only what it
 /// needs. The callbacks receive **untrusted, MITM-tamperable IdP fields**; a
-/// custom renderer that writes them to a terminal must sanitise them itself
-/// (see [`strip_control`]) — echoing them raw re-opens the prompt-spoofing
+/// custom renderer that writes them to a terminal must sanitise them itself;
+/// echoing them raw re-opens the prompt-spoofing
 /// surface the built-in [`TerminalRenderer`] closes.
 pub trait Renderer: Send + Sync {
     /// Show the sign-in prompt at the start of the device flow.
