@@ -47,10 +47,10 @@ const REFRESH_GRANT: &str = "refresh_token";
 // Clamp the token lifetime (access/id-token TTL). An absent or non-positive
 // `expires_in` is non-conformant; fall back to a short lifetime so a token with
 // no stated lifetime is refreshed promptly. A very long (or hostile) lifetime is
-// capped to an hour so a cached token is silently rotated at least that often —
-// but *only* when a refresh token was issued: without one the cap can't rotate
-// anything, it can only force an interactive re-prompt (see
-// `tokenset_from_response` and the module docs on `offline_access`).
+// capped to an hour so a cached token is silently rotated at least that often.
+// A no-refresh JWT can instead use its authoritative `exp`; a no-refresh opaque
+// token still needs this ceiling so a hostile `expires_in` cannot wedge the
+// client indefinitely (see `tokenset_from_response`).
 const DEFAULT_EXPIRES_IN: i64 = 300;
 const MAX_EXPIRES_IN: i64 = 3600;
 
@@ -365,7 +365,9 @@ impl OidcDeviceAuthBuilder {
 /// Acquisition is serialized so concurrent callers don't double-prompt, while a
 /// valid cached token is returned without blocking on another's sign-in.
 ///
-/// Token state is in-memory only and does not survive a process restart.
+/// Token state is in-memory only unless a
+/// [`token_store`](OidcDeviceAuthBuilder::token_store) is configured; with one, a
+/// restarted process can resume from the persisted refresh token.
 ///
 /// # Concurrency
 ///
@@ -925,6 +927,9 @@ impl OidcDeviceAuth {
         // Consecutive transport-level failures (no HTTP status): a persistent run
         // means the endpoint is unreachable, not that authorization is pending.
         let mut transport_failures: u32 = 0;
+        // RFC 8628 permits polling as soon as the device response arrives. Retry
+        // polls wait for the configured interval; the first poll does not.
+        let mut poll_now = true;
 
         loop {
             let now = (self.now)();
@@ -938,8 +943,16 @@ impl OidcDeviceAuth {
                 .with_idp_error(Some("expired_token"), None));
             }
             let remaining = deadline - now;
-            self.renderer.on_waiting(remaining.as_secs_f64());
-            (self.sleep)(remaining.min(Duration::from_secs(interval)));
+            if !poll_now {
+                self.renderer.on_waiting(remaining.as_secs_f64());
+                (self.sleep)(remaining.min(Duration::from_secs(interval)));
+                poll_now = true;
+                // Re-enter through the deadline check before retrying. This also
+                // keeps a sleep clipped to the remaining lifetime from polling an
+                // already-expired device code.
+                continue;
+            }
+            poll_now = false;
 
             let result = match self
                 .http
@@ -1169,13 +1182,10 @@ impl OidcDeviceAuth {
         if expires_in <= 0 {
             expires_in = DEFAULT_EXPIRES_IN;
         }
-        // Cap the believed lifetime only when a refresh token can silently
-        // rotate it — including one carried forward above, so a non-rotating
-        // IdP's long (or hostile) TTL stays bounded. With no refresh token the
-        // cap can't rotate anything — it would only force an interactive
-        // re-prompt (which fails in a headless context) while the token stays
-        // fully valid at the server — so trust the IdP's real TTL there. See the
-        // module docs on `offline_access`.
+        // Cap the believed lifetime when a refresh token can silently rotate it —
+        // including one carried forward above, so a non-rotating IdP's long (or
+        // hostile) TTL stays bounded. A no-refresh JWT is bounded by its own `exp`
+        // below; an opaque token gets the same absolute ceiling separately.
         if refresh_token.is_some() {
             expires_in = expires_in.min(MAX_EXPIRES_IN);
         }
@@ -1193,8 +1203,9 @@ impl OidcDeviceAuth {
         // hostile `expires_in` (which can saturate to a near-infinite lifetime,
         // especially with no refresh token to rotate it) from keeping a dead token
         // cached, and makes groups mode honor the id_token's exp rather than the
-        // access token's `expires_in`. An opaque (non-JWT) token has no exp, so its
-        // lifetime is left as the IdP stated it.
+        // access token's `expires_in`. An opaque (non-JWT) token has no exp; without
+        // a refresh token, cap it explicitly so a hostile `expires_in` cannot keep
+        // a rejected token cached forever.
         let served = if self.config.groups_in_token {
             id_token.as_deref()
         } else {
@@ -1202,6 +1213,8 @@ impl OidcDeviceAuth {
         };
         if let Some(exp) = jwt_exp(served) {
             expires_at = expires_at.min(exp);
+        } else if refresh_token.is_none() {
+            expires_at = expires_at.min(now + MAX_EXPIRES_IN as f64);
         }
         TokenSet {
             access_token,

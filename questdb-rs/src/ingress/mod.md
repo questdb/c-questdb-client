@@ -216,8 +216,8 @@ let mut sender = Sender::from_conf(
 
 For a token that rotates — such as one obtained by interactive OIDC sign-in —
 pass a **token provider** to the builder instead of a fixed `token=` string. The
-sender pulls a freshly refreshed token on every request, so a long-lived sender
-keeps working as the token rotates:
+sender resolves a fresh token once per flush and reuses it for any retry requests
+within that flush, so a long-lived sender keeps working as the token rotates:
 
 ```ignore
 use std::sync::Arc;

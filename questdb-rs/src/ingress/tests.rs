@@ -1776,3 +1776,22 @@ fn qwp_ws_token_provider_stored_in_config() {
         .unwrap();
     assert!(builder.qwp_ws.as_ref().unwrap().token_provider.is_some());
 }
+
+#[cfg(feature = "sync-sender-qwp-ws")]
+#[test]
+fn qwp_ws_connector_rejects_static_auth_added_after_token_provider() {
+    // The pooled connector bypasses SenderBuilder::build, so its shared
+    // validation must independently catch auth assigned after the provider.
+    let builder = SenderBuilder::new(Protocol::Ws, "127.0.0.1", 9000)
+        .qwp_ws_token_provider(|| Ok::<_, crate::Error>("provided".to_string()))
+        .unwrap()
+        .username("u")
+        .unwrap()
+        .password("p")
+        .unwrap();
+    let Err(err) = builder.build_qwp_ws_connector() else {
+        panic!("expected the pooled connector to reject provider plus static auth");
+    };
+    assert_eq!(err.code(), ErrorCode::ConfigError);
+    assert!(err.msg().contains("qwp_ws_token_provider"));
+}

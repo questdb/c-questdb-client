@@ -500,9 +500,8 @@ pub struct ReaderConfig {
     pub zone: Option<String>,
     pub auth: AuthMode,
     /// A rotating Bearer-token source pulled at each (re)connect (e.g. from
-    /// `oidc::OidcDeviceAuth`), overriding [`auth`](Self::auth). Set via
-    /// [`token_provider`](Self::token_provider); programmatic-only (never from a
-    /// conf string).
+    /// `oidc::OidcDeviceAuth`). Mutually exclusive with [`auth`](Self::auth); set
+    /// via [`token_provider`](Self::token_provider) and never from a conf string.
     pub(crate) token_provider: Option<crate::token_provider::TokenProvider>,
     pub tls_verify: TlsVerify,
     pub tls_ca: CertificateAuthority,
@@ -1076,7 +1075,7 @@ impl ReaderConfig {
     /// is sent as the `Authorization: Bearer <token>` handshake header; a token
     /// with a non-printable-ASCII character (a header-injection vector) is
     /// rejected, and a provider error fails that connection attempt. Use TLS
-    /// (`qwpwss://` / `wss://`) so the bearer credential isn't sent in cleartext.
+    /// (`wss://`) so the bearer credential isn't sent in cleartext.
     ///
     /// ```no_run
     /// # #[cfg(all(feature = "oidc", feature = "sync-reader-qwp-ws"))] {
@@ -1086,7 +1085,7 @@ impl ReaderConfig {
     /// # fn run() -> Result<(), Box<dyn std::error::Error>> {
     /// let auth = Arc::new(OidcDeviceAuth::from_questdb("https://questdb.example.com:9000").build()?);
     /// auth.sign_in()?;
-    /// let cfg = ReaderConfig::from_conf("qwpwss::addr=questdb.example.com:9000;")?
+    /// let cfg = ReaderConfig::from_conf("wss::addr=questdb.example.com:9000;")?
     ///     .token_provider({ let auth = Arc::clone(&auth); move || auth.token() })?;
     /// let reader = Reader::from_config(&cfg)?;
     /// # let _ = reader; Ok(())
@@ -1241,6 +1240,14 @@ impl ReaderConfig {
             reject_crlf("zone", z)?;
         }
         self.auth.validate()?;
+        if self.token_provider.is_some() && !matches!(&self.auth, AuthMode::None) {
+            return Err(fmt!(
+                ConfigError,
+                "\"token_provider\" is mutually exclusive with the static \
+                 username/password and token authentication set via the config \
+                 string."
+            ));
+        }
         // tls_verify=unsafe_off needs the crate feature. Re-checked
         // here so a post-parse mutation of `cfg.tls_verify =
         // TlsVerify::UnsafeOff` is rejected too — the TLS builder
@@ -1666,6 +1673,22 @@ mod tests {
             .token_provider(|| Ok::<_, crate::Error>("tok".to_string()))
             .unwrap_err();
         assert_eq!(err.code(), ErrorCode::ConfigError);
+    }
+
+    #[test]
+    fn validate_rejects_static_auth_added_after_token_provider() {
+        // `auth` is public, so the validate-before-use contract must catch static
+        // auth assigned after the provider setter has already accepted the config.
+        let mut c = ReaderConfig::from_conf("wss::addr=h:1")
+            .unwrap()
+            .token_provider(|| Ok::<_, crate::Error>("tok".to_string()))
+            .unwrap();
+        c.auth = AuthMode::Bearer {
+            token: "static".to_string(),
+        };
+        let err = c.validate().unwrap_err();
+        assert_eq!(err.code(), ErrorCode::ConfigError);
+        assert!(err.msg().contains("token_provider"));
     }
 
     #[test]

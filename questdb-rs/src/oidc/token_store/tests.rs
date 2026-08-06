@@ -53,7 +53,11 @@ fn hash_matches_frozen_cross_language_value() {
     // Pinned to the byte-exact canonical string the Java/Python clients hash, so
     // a drift in the prefix, field order, NUL separation, endpoint canonicalisation
     // or groups encoding — any of which would break cross-language file sharing —
-    // fails here.
+    // fails here. Cross-language fixtures for the same contract:
+    // Python (the null-audience digest below):
+    // https://github.com/questdb/py-questdb-client/blob/b8348d940f1657b2e4bdcfe615a4050d37ecdd1b/test/test_auth.py#L5897-L5904
+    // Java (companion audience/groups vectors):
+    // https://github.com/questdb/java-questdb-client/blob/7a95bb3a29ee1ccecf982378cb9da87a6e3590cd/core/src/test/java/io/questdb/client/test/cutlass/auth/FileTokenStoreTest.java#L516-L539
     let key = TokenStoreKey::from_config("questdb", EP_T, EP_D, "openid", None, false, None);
     assert_eq!(
         key.hash(),

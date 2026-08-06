@@ -1561,7 +1561,7 @@ impl SenderBuilder {
         Ok(self)
     }
 
-    /// Supply a fresh HTTP Bearer token on every request via a callback.
+    /// Supply a fresh HTTP Bearer token for every flush via a callback.
     ///
     /// Unlike [`token`](Self::token), which captures a fixed token once, the
     /// provider is called on each flush, so a long-lived sender keeps working as
@@ -2974,15 +2974,7 @@ impl SenderBuilder {
                     ConfigSetting::Specified(actual_initial_connect_retry);
                 let qwp_ws = &qwp_ws;
                 reject_unsupported_qwp_ws_sf_config(qwp_ws)?;
-                // A rotating token provider overrides static auth at each connect;
-                // reject the ambiguous combination (mirrors http_token_provider).
-                if qwp_ws.token_provider.is_some() && auth.is_some() {
-                    return Err(fmt!(
-                        ConfigError,
-                        "\"qwp_ws_token_provider\" is mutually exclusive with \
-                         username/password and token authentication."
-                    ));
-                }
+                reject_qwp_ws_token_provider_auth_conflict(qwp_ws, &auth)?;
                 let basic_auth = qwp_ws_auth_header(&auth)?;
                 if *qwp_ws.progress == QwpWsProgress::Manual {
                     if *qwp_ws.initial_connect_retry == conf::QwpWsInitialConnectMode::Async {
@@ -3150,6 +3142,7 @@ impl SenderBuilder {
         )?;
 
         let auth = self.build_auth()?;
+        reject_qwp_ws_token_provider_auth_conflict(qwp_ws, &auth)?;
         let auth_header = qwp_ws_auth_header(&auth)?;
         let qwp_ws = qwp_ws.clone();
         reject_unsupported_qwp_ws_sf_config(&qwp_ws)?;
@@ -3406,6 +3399,21 @@ fn reject_unsupported_qwp_ws_sf_config(qwp_ws: &conf::QwpWsConfig) -> Result<()>
         ));
     }
 
+    Ok(())
+}
+
+#[cfg(feature = "_sender-qwp-ws")]
+fn reject_qwp_ws_token_provider_auth_conflict(
+    qwp_ws: &conf::QwpWsConfig,
+    auth: &Option<conf::AuthParams>,
+) -> Result<()> {
+    if qwp_ws.token_provider.is_some() && auth.is_some() {
+        return Err(fmt!(
+            ConfigError,
+            "\"qwp_ws_token_provider\" is mutually exclusive with \
+             username/password and token authentication."
+        ));
+    }
     Ok(())
 }
 

@@ -339,16 +339,11 @@ fn slow_down_via_429_still_increases_interval() {
         .expect("build");
     assert_eq!(auth.token().unwrap(), "AT-sd");
     let durations = slept.lock().unwrap();
-    // Two polls: the sleep before the retry (after the slow_down) must exceed the
-    // first by at least the +5s step, not shrink toward the 1s Retry-After.
-    assert!(
-        durations.len() >= 2,
-        "expected >=2 polls, got {durations:?}"
-    );
-    assert!(
-        durations[1] >= durations[0] + Duration::from_secs(5),
-        "slow_down via 429 must increase the interval, got {durations:?}"
-    );
+    // The first poll is immediate. The only sleep is before the retry and must
+    // use the original 5s interval plus slow_down's mandatory 5s increase,
+    // rather than shrinking toward the 1s Retry-After.
+    assert_eq!(poll.load(Ordering::SeqCst), 2);
+    assert_eq!(durations.as_slice(), &[Duration::from_secs(10)]);
 }
 
 #[test]
@@ -993,15 +988,14 @@ fn offline_auth() -> OidcDeviceAuth {
 }
 
 #[test]
-fn lifetime_cap_applies_only_with_refresh_token() {
+fn lifetime_cap_bounds_refreshable_and_opaque_tokens() {
     // `expires_at` and `issued_at` are stamped from the same `now`, so their
     // difference is exactly the (capped or uncapped) lifetime — no clock race.
     let auth = offline_auth();
     let long: i64 = 24 * 3600; // a 24h IdP TTL, far over the 1h cap
 
-    // No refresh token: trust the IdP's real TTL. Capping can't rotate the token
-    // (there is nothing to refresh with) and would only force a headless-breaking
-    // re-prompt, while the token stays valid at the server for the full 24h.
+    // No refresh token and an opaque access token: cap the believed lifetime so a
+    // hostile or stale `expires_in` cannot wedge the client indefinitely.
     let ts = auth.tokenset_from_response(
         &serde_json::json!({
             "access_token": "AT",
@@ -1011,8 +1005,8 @@ fn lifetime_cap_applies_only_with_refresh_token() {
     );
     assert!(ts.refresh_token.is_none());
     assert!(
-        (ts.expires_at - ts.issued_at - long as f64).abs() < 1.0,
-        "no refresh token: lifetime must not be capped (got {}s)",
+        (ts.expires_at - ts.issued_at - MAX_EXPIRES_IN as f64).abs() < 1.0,
+        "opaque token without refresh: lifetime must be capped (got {}s)",
         ts.expires_at - ts.issued_at
     );
 
