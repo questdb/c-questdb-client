@@ -387,13 +387,19 @@ public:
      * Record a symbol value for the given column.
      * Make sure you record all the symbol columns before any other column type.
      *
-     * When the buffer is flushed over QWP/WebSocket, every distinct symbol
-     * recorded here is interned into the *same* connection-scoped dictionary
-     * the chunk API uses — capped at 1,000,000 entries and 256 MiB of UTF-8
-     * across the whole connection, not per buffer or per flush. Exceeding it
-     * fails the flush with `error_code::symbol_dict_full`; see the
-     * symbol-column preamble in `qwp_sender.h` for the cap and how to reset it.
-     * ILP (TCP/HTTP) flushes carry no such dictionary and are unaffected.
+     * When the buffer is flushed over QWP/WebSocket — whether by a pooled
+     * sender or by `line_sender::flush*` on a `line_sender` opened against a
+     * `ws://` / `wss://` address — every distinct symbol recorded here is
+     * interned into the *same* connection-scoped dictionary the chunk API uses:
+     * capped at 1,000,000 entries and 256 MiB of UTF-8 across the whole
+     * connection, not per buffer or per flush. Exceeding it throws
+     * `error_code::symbol_dict_full`, and the dictionary is only reset by
+     * retiring the connection that owns it. For a standalone `line_sender` that
+     * means `close_drain()` — checked — and only then letting the sender go;
+     * the destructor and `close()` drain nothing, so every published-but-unacked
+     * frame would be discarded with no wait. See the symbol-column preamble in
+     * `qwp_sender.h` for the per-flavour list. ILP (TCP/HTTP) and QWP/UDP
+     * flushes carry no such dictionary and are unaffected.
      *
      * @param name Column name.
      * @param value Column value.

@@ -256,6 +256,15 @@ typedef enum line_sender_error_code
      *      successful commit is discarded.
      *    - Standalone direct sender: `qwp_direct_sender_commit`, then
      *      `qwp_direct_sender_free`, then re-open.
+     *    - Standalone row sender (`line_sender_from_conf` / `_from_env` /
+     *      `line_sender_build` on a
+     *      `ws://` or `wss://` address, flushed with `line_sender_flush*`):
+     *      `line_sender_qwpws_close_drain` and CHECK IT SUCCEEDED, then
+     *      `line_sender_close` and re-open. This is the MOST lossy flavour on a
+     *      bare close, not the least: `line_sender_close` does not flush, and
+     *      nothing drains the QWP/WebSocket queue on the way out, so every
+     *      published-but-unacked frame is discarded with no wait. The drain is
+     *      bounded by `close_flush_timeout`.
      *
      *  See the symbol-column preamble in `qwp_sender.h`. Distinct from
      *  `line_sender_error_invalid_api_call` so callers can recognise it without
@@ -850,14 +859,18 @@ bool line_sender_buffer_table(
  * Record a symbol value for the given column.
  * Make sure you record all the symbol columns before any other column type.
  *
- * When the buffer is flushed over QWP/WebSocket (`qwp_sender_flush_buffer*`),
- * every distinct symbol recorded here is interned into the *same*
- * connection-scoped dictionary the chunk API uses — capped at 1,000,000 entries
- * and 256 MiB of UTF-8 across the whole connection, not per buffer or per
- * flush. Exceeding it fails the flush with
- * `line_sender_error_symbol_dict_full`; see the symbol-column preamble in
- * `qwp_sender.h` for the cap and how to reset it. ILP (TCP/HTTP) flushes carry
- * no such dictionary and are unaffected.
+ * When the buffer is flushed over QWP/WebSocket — `qwp_sender_flush_buffer*` on
+ * a pooled sender, or `line_sender_flush*` on a `line_sender` opened against a
+ * `ws://` / `wss://` address — every distinct symbol recorded here is interned
+ * into the *same* connection-scoped dictionary the chunk API uses: capped at
+ * 1,000,000 entries and 256 MiB of UTF-8 across the whole connection, not per
+ * buffer or per flush. Exceeding it fails the flush with
+ * `line_sender_error_symbol_dict_full`; that code's own documentation lists what
+ * each sender flavour must call to retire the connection — including this one,
+ * whose remedy is `line_sender_qwpws_close_drain` then `line_sender_close`, in
+ * that order, because `line_sender_close` alone drains nothing. See also the
+ * symbol-column preamble in `qwp_sender.h`. ILP (TCP/HTTP) and QWP/UDP flushes
+ * carry no such dictionary and are unaffected.
  *
  * @param[in] buffer Line buffer object.
  * @param[in] name Column name.

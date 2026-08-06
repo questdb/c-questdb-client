@@ -799,9 +799,19 @@ bool qwp_chunk_column_binary(
  *     `questdb_db_drop_direct_sender` skips the best-effort commit that
  *     `questdb_db_return_direct_sender` performs, so every frame flushed since
  *     the last successful commit is discarded with only a log warning.
- *   - Standalone direct sender: `qwp_direct_sender_commit` first (same reason),
- *     then `qwp_direct_sender_free`, then re-open with
+ *   - Standalone direct sender: `qwp_direct_sender_commit` first — not because
+ *     `qwp_direct_sender_free` skips the commit (it does not; it performs the
+ *     same best-effort sync `questdb_db_return_direct_sender` does), but so the
+ *     commit's success is something you checked rather than something you hoped
+ *     for. Then `qwp_direct_sender_free`, then re-open with
  *     `qwp_direct_sender_from_conf` / `qwp_direct_sender_from_opts`.
+ *   - Standalone row sender (a `line_sender` opened on a `ws://` / `wss://`
+ *     address and flushed with `line_sender_flush*`, which shares this same
+ *     connection dictionary): `line_sender_qwpws_close_drain` and check it
+ *     succeeded, then `line_sender_close`, then re-open. Do NOT rely on
+ *     `line_sender_close` alone — it does not flush, and nothing drains the
+ *     QWP/WebSocket queue on the way out, so every published-but-unacked frame
+ *     is discarded with no wait. This is the most lossy flavour on a bare close.
  *
  * `codes[i]` must be in `0 .. dict_len` for non-null rows; null-row
  * codes are not inspected.
