@@ -4822,14 +4822,28 @@ mod tests {
         // Re-creating the file is what gives the producer a write-ahead target
         // again; without it the slot can never persist a dictionary and every later
         // open re-decides the same thing.
+        //
+        // The frames must be REAL delta frames. `try_submit`ting raw bytes yields a
+        // payload `parse_delta_section` rejects, which no-ops the whole rebuild --
+        // so a raw-payload version of this test passes identically whether
+        // `rebuild_recovered_dict_from_frames` runs on this branch or is skipped
+        // outright, and pins only the re-create half of the change.
+        use crate::ingress::sender::qwp_ws_sfa_catchup::make_delta_frame;
+
         let dir = TempDir::new().unwrap();
         let symbol_dict = dir
             .path()
             .join(crate::ingress::sender::qwp_ws_sfa_symbol_dict::FILE_NAME);
 
-        // A first session leaves an unresolved (recoverable) segment behind.
+        // A first session leaves two unresolved (recoverable) delta frames behind,
+        // introducing `alpha` (id 0) and `bravo` (id 1).
         let mut queue = open(&dir);
-        queue.try_submit(b"unresolved-frame").unwrap();
+        queue
+            .try_submit(&make_delta_frame(0, &[b"alpha".as_slice()], b""))
+            .unwrap();
+        queue
+            .try_submit(&make_delta_frame(1, &[b"bravo".as_slice()], b""))
+            .unwrap();
         assert!(
             queue.is_delta_dict_enabled(),
             "a fresh file slot delta-encodes"
@@ -4849,16 +4863,36 @@ mod tests {
             "a missing side-file must not strand the slot's delta frames behind a \
              committed prefix; the dictionary is rebuilt from the frames instead"
         );
-        assert!(
-            recovered.recovered_symbol_dict_entries().is_empty(),
-            "this slot's lone frame is a RAW payload carrying no delta section, so \
-             the rebuild has nothing to contribute -- the mirror arms empty"
+        // The load-bearing half: with no file to read, every recovered id has to
+        // come out of the surviving frames' own delta sections. Skipping the
+        // rebuild on this branch leaves the count at 0, the producer resumes at id
+        // 0, and its first new symbol takes an id both replayed frames already own.
+        assert_eq!(
+            recovered.recovered_symbol_dict_count(),
+            2,
+            "the frames define ids 0 and 1 in their own delta sections, so recovery \
+             must resume the producer at id 2 even though no side-file survived"
         );
-        assert!(
-            recovered.take_persisted_symbol_dict().is_some(),
-            "the producer must get a usable side-file back, or its write-ahead is \
-             dead for the life of the slot"
+        assert_eq!(
+            recovered.recovered_symbol_dict_entries(),
+            &[
+                5, b'a', b'l', b'p', b'h', b'a', 5, b'b', b'r', b'a', b'v', b'o'
+            ][..],
+            "rebuilt in id order, in the `[len][utf8]` shape a delta section \
+             carries, so the producer dict and the driver mirror seed from \
+             identical bytes"
         );
+        let pd = recovered.take_persisted_symbol_dict().expect(
+            "the producer must get a usable side-file back, or its \
+                     write-ahead is dead for the life of the slot",
+        );
+        assert_eq!(
+            pd.size(),
+            0,
+            "the re-created file starts empty -- the producer is 2 ids ahead of it \
+             until `persist_new_symbols` anchors to THIS number and heals it"
+        );
+        drop(pd);
         assert!(
             symbol_dict.exists(),
             "the re-created side-file is what the next write-ahead heals into"
@@ -4879,13 +4913,27 @@ mod tests {
         // frames, and the alternative is a slot that stays dense forever while an
         // unreadable file sits next to it being re-read and re-rejected on every
         // open.
+        //
+        // Bad magic is not a hypothetical: `PersistedSymbolDict::poison` zeroes
+        // these four bytes whenever a rollback truncate fails on a failing disk,
+        // precisely so a later `open` rejects the file. Real delta frames for the
+        // same reason as the absent-file twin above -- raw payloads carry no delta
+        // section, so the rebuild folds nothing and the assertion below cannot
+        // distinguish a working rebuild from a skipped one.
+        use crate::ingress::sender::qwp_ws_sfa_catchup::make_delta_frame;
+
         let dir = TempDir::new().unwrap();
         let symbol_dict = dir
             .path()
             .join(crate::ingress::sender::qwp_ws_sfa_symbol_dict::FILE_NAME);
 
         let mut queue = open(&dir);
-        queue.try_submit(b"unresolved-frame").unwrap();
+        queue
+            .try_submit(&make_delta_frame(0, &[b"alpha".as_slice()], b""))
+            .unwrap();
+        queue
+            .try_submit(&make_delta_frame(1, &[b"bravo".as_slice()], b""))
+            .unwrap();
         drop(queue);
         std::fs::write(&symbol_dict, b"NOPEnope-poisoned-header").unwrap();
 
@@ -4894,6 +4942,19 @@ mod tests {
             recovered.is_delta_dict_enabled(),
             "an unreadable side-file must not strand the slot's delta frames behind \
              a committed prefix"
+        );
+        assert_eq!(
+            recovered.recovered_symbol_dict_count(),
+            2,
+            "the rejected bytes contribute nothing, so both ids must come back from \
+             the surviving frames' own delta sections"
+        );
+        assert_eq!(
+            recovered.recovered_symbol_dict_entries(),
+            &[
+                5, b'a', b'l', b'p', b'h', b'a', 5, b'b', b'r', b'a', b'v', b'o'
+            ][..],
+            "rebuilt in id order, in the `[len][utf8]` shape a delta section carries"
         );
         assert!(
             recovered.take_persisted_symbol_dict().is_some(),
