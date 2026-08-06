@@ -1109,23 +1109,46 @@ impl SfaFrameQueue {
                 // ("resend required") rather than silently rebuilt into nonsense.
                 // No-op on the common path -- a contiguous `delta_start == tip`
                 // extension overlaps nothing, so this cannot fire.
+                // `Disagreed` stops the fold and is recoverable (the frames before
+                // this one still rebuild); `OutOfMemory` must fail construction --
+                // `accumulate` leaves the mirror disabled and empty on that path, so
+                // continuing would hand the producer an id space of 0 against frames
+                // defining [0, K), the same guaranteed collision the `seed` guard
+                // above exists to prevent, reached by an allocation failure instead
+                // of prevented by one.
+                enum Fold {
+                    Ok,
+                    Disagreed,
+                    OutOfMemory,
+                }
                 let folded = payload.with_bytes(|frame| {
                     if mirror.conflicts_with(frame) {
-                        return false;
+                        return Fold::Disagreed;
                     }
-                    mirror.accumulate(frame);
-                    true
+                    if !mirror.accumulate(frame) {
+                        return Fold::OutOfMemory;
+                    }
+                    Fold::Ok
                 });
-                if !folded {
-                    log::warn!(
-                        "QWP/WebSocket store-and-forward slot {}: stored frame {fsn} \
-                         redefines a symbol id the recovered dictionary already holds; \
-                         rebuilding the dictionary from the frames before it and \
-                         leaving that frame for the send loop to reject as \
-                         resend-required.",
-                        slot_dir.display()
-                    );
-                    break;
+                match folded {
+                    Fold::Ok => {}
+                    Fold::Disagreed => {
+                        log::warn!(
+                            "QWP/WebSocket store-and-forward slot {}: stored frame {fsn} \
+                             redefines a symbol id the recovered dictionary already holds; \
+                             rebuilding the dictionary from the frames before it and \
+                             leaving that frame for the send loop to reject as \
+                             resend-required.",
+                            slot_dir.display()
+                        );
+                        break;
+                    }
+                    Fold::OutOfMemory => {
+                        return Err(SfaQueueError::Io(io::Error::other(
+                            "could not allocate the recovered symbol dictionary while \
+                             folding a stored frame into it",
+                        )));
+                    }
                 }
                 fsn += 1;
             }

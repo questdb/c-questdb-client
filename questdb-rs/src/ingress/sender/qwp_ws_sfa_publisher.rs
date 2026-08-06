@@ -291,7 +291,10 @@ mod tests {
         )
         .unwrap();
         assert!(matches!(outcome, SfaPublishOutcome::Published(1)));
-        mirror.accumulate(&first_payload);
+        assert!(
+            mirror.accumulate(&first_payload),
+            "folding a small frame cannot fail"
+        );
         assert_eq!(mirror.count(), 1);
         assert_symbol_state(&foreground, &[b"S0"]);
 
@@ -365,7 +368,10 @@ mod tests {
         .unwrap();
         assert!(matches!(outcome, SfaPublishOutcome::Published(2)));
         assert_eq!(delta_prefix(&third_payload), (1, vec![b"S2".to_vec()]));
-        mirror.accumulate(&third_payload);
+        assert!(
+            mirror.accumulate(&third_payload),
+            "folding a small frame cannot fail"
+        );
         assert_eq!(mirror.count(), 2);
         assert_symbol_state(&foreground, &[b"S0", b"S2"]);
         let catch_up = mirror.build_catch_up_frames(0, 1).unwrap();
@@ -407,7 +413,10 @@ mod tests {
         )
         .unwrap();
         assert_eq!(delta_prefix(&fourth_payload), (2, vec![b"S3".to_vec()]));
-        recovered_mirror.accumulate(&fourth_payload);
+        assert!(
+            recovered_mirror.accumulate(&fourth_payload),
+            "folding a small frame cannot fail"
+        );
         assert_eq!(recovered_mirror.count(), 3);
         let catch_up = recovered_mirror.build_catch_up_frames(0, 1).unwrap();
         assert_eq!(

@@ -1302,7 +1302,17 @@ impl<T: QwpWsCoreTransport> QwpWsSendCore<T> {
             if sent.is_ok() {
                 // The frame's delta is on the wire; mirror the symbols it
                 // introduced so a later reconnect can re-register them.
-                dict_mirror.accumulate(payload);
+                //
+                // Deliberately ignored, exactly as in `enable_delta_dict`: this is
+                // the mirror the DEGRADE was written for. `false` means the suffix
+                // could not be allocated, which leaves the mirror disabled, and a
+                // disabled mirror makes `guard_dict_not_torn` reject the dependent
+                // frames as resend-required instead of shipping them against a
+                // dictionary the reconnect catch-up can no longer rebuild. (The
+                // recovery-side fold in
+                // `SfaFrameQueue::rebuild_recovered_dict_from_frames` is the caller
+                // that must NOT ignore it.)
+                let _mirrored = dict_mirror.accumulate(payload);
             }
             sent
         });
@@ -4428,10 +4438,13 @@ mod tests {
         // Torn recovery: the side-file recovered only id0 = a, but an earlier queued
         // frame re-registers id1 = b, extending the mirror to [a, b].
         driver.send_core.enable_delta_dict(&[1, b'a'], 1);
-        driver
-            .send_core
-            .dict_mirror
-            .accumulate(&make_delta_frame(1, &[b"b"]));
+        assert!(
+            driver
+                .send_core
+                .dict_mirror
+                .accumulate(&make_delta_frame(1, &[b"b"])),
+            "folding a small frame cannot fail"
+        );
         assert_eq!(driver.send_core.dict_mirror.count(), 2);
 
         // Re-registering id1 = b (the same symbol) is a benign replay -> allowed.
@@ -4521,7 +4534,10 @@ mod tests {
                 "a self-sufficient dense frame re-shipping the mirrored prefix is safe"
             );
             // Accumulating it folds only the new suffix [c]; the mirror stays consistent.
-            driver.send_core.dict_mirror.accumulate(&dense);
+            assert!(
+                driver.send_core.dict_mirror.accumulate(&dense),
+                "folding a small frame cannot fail"
+            );
             assert_eq!(
                 driver.send_core.dict_mirror.count(),
                 3,
