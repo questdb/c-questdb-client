@@ -65,6 +65,13 @@ EPISODE_KINDS = [
     'conn_reset', 'stall', 'throttle',
 ]
 
+# How long an episode keeps disturbing the run beyond any explicit duration in
+# its params: a restart has to come back and re-drive its queue, and every kind
+# needs a moment to settle afterwards. `_fault_spans` turns these into the
+# windows the I4 trend fits ignore.
+EPISODE_RESTART_SEC = 60.0
+EPISODE_SETTLE_SEC = 30.0
+
 
 class Episode:
     __slots__ = ('at', 'kind', 'params')
@@ -261,6 +268,9 @@ class SoakRun:
         self.sampler = Sampler()
         self.samples = []
         self.workloads = []
+        # Set when the main loop starts; `_fault_spans` needs it to place the
+        # episode schedule on the same clock as the samples.
+        self._wall_start = None
         self.schedule = EpisodeSchedule(
             opts['seed'], opts['duration_sec'],
             min_gap=opts.get('min_gap', 180), max_gap=opts.get('max_gap', 420),
@@ -501,6 +511,10 @@ class SoakRun:
         next_ep = 0
         reverts = []  # (revert_at, fn)
         start = _time.monotonic()
+        # Wall-clock anchor for the same instant: episodes are scheduled off the
+        # monotonic clock but samples are stamped with wall time, and
+        # `_fault_spans` has to line the two up.
+        self._wall_start = _time.time()
         while True:
             now = _time.monotonic()
             elapsed = now - start
@@ -608,10 +622,29 @@ class SoakRun:
                 row['sf'] = {'disk_bytes': self.sampler.dir_size(w.sf_dir)}
             self.samples.append(row)
 
+    def _fault_spans(self):
+        """Wall-clock windows the I4 trend fits skip: each episode plus a settle
+        margin. A throttle holds ingest down for minutes and a restart empties
+        the process, both of which move the memory and backlog curves with
+        nothing leaking — steady state is what the run looks like between
+        faults, not during them."""
+        if self._wall_start is None:
+            return []
+        start = self._wall_start
+        spans = []
+        for ep in self.schedule.episodes():
+            disturbance = ep.params.get('seconds', 0.0)
+            if ep.kind in ('server_graceful', 'client_kill9', 'client_graceful'):
+                disturbance = max(disturbance, EPISODE_RESTART_SEC)
+            spans.append((start + ep.at,
+                          start + ep.at + disturbance + EPISODE_SETTLE_SEC))
+        return spans
+
     def _reconcile(self, oracle_mod):
         verdicts = []
         # I4 boundedness over all samples.
-        bounds = oracle_mod.analyze_bounds(self.samples)
+        bounds = oracle_mod.analyze_bounds(
+            self.samples, exclude_spans=self._fault_spans())
         if not bounds:
             # No I4 verdicts means no usable RSS samples were collected (no
             # psutil / procfs / ps on the box). Fail loudly instead of letting
