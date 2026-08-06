@@ -1230,11 +1230,43 @@ impl DirectColumnBackend {
                 if e.code() != ErrorCode::SocketError {
                     self.symbol_dict.rollback(dict_mark);
                 }
+                self.latch_if_connection_is_spent(&e);
                 Err(direct_not_delivered(e))
             }
             // Bytes may be on the wire: do not roll back the dict, and report
             // delivery as unknown.
             Err(PublishError::DuringWrite(e)) => Err(direct_delivery_unknown(e)),
+        }
+    }
+
+    /// Latches the connection terminal when `err` reports a condition that belongs
+    /// to the CONNECTION rather than to the call that surfaced it — one no later
+    /// call on this connection can clear.
+    ///
+    /// Today that is only [`SymbolDictFull`](ErrorCode::SymbolDictFull): the
+    /// connection-scoped symbol dictionary is owned by the connection, nothing
+    /// resets it in place (a reconnect re-registers it rather than clearing it),
+    /// and every later flush introducing a new symbol fails identically.
+    ///
+    /// Without the latch, [`reborrow_from_pool`] -- the documented failover
+    /// primitive, and the first thing a caller reaches for after a flush error --
+    /// is a silent no-op: its guard returns early on `in_flight() == 0 &&
+    /// !must_close() && !transport_dead()`, and a dictionary-full connection
+    /// satisfies all three (nothing reached the wire, the buffer rolled back, the
+    /// socket is healthy). The caller then retries into the same wall indefinitely
+    /// with no error escalation. Latched, the reborrow swaps in a fresh connection
+    /// and the pool return retires this one instead of recycling its dictionary to
+    /// the next borrower -- the free list is LIFO, so recycling hands the same full
+    /// connection straight back.
+    ///
+    /// This does not lose data: the failing frame never reached the wire and the
+    /// dictionary was rolled back above, so the caller's deferred frames are still
+    /// committed by the normal return/drop path.
+    ///
+    /// [`reborrow_from_pool`]: crate::db::BorrowedDirectColumnSender::reborrow_from_pool
+    fn latch_if_connection_is_spent(&mut self, err: &crate::Error) {
+        if err.code() == ErrorCode::SymbolDictFull {
+            self.conn.mark_must_close();
         }
     }
 
@@ -1423,6 +1455,7 @@ impl DirectColumnBackend {
                 if e.code() != ErrorCode::SocketError {
                     self.symbol_dict.rollback(dict_mark);
                 }
+                self.latch_if_connection_is_spent(&e);
                 Err(direct_not_delivered(e))
             }
             Err(PublishError::DuringWrite(e)) => Err(direct_delivery_unknown(e)),

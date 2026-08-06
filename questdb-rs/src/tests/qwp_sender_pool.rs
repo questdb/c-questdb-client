@@ -3755,6 +3755,58 @@ fn store_and_forward_symbol_dict_full_rolls_back_and_keeps_flushing() {
 }
 
 #[test]
+fn a_full_symbol_dict_latches_the_direct_connection_so_reborrow_replaces_it() {
+    // Regression (silent ingest stall). `reborrow_from_pool` is the direct
+    // sender's documented failover primitive and the first thing a caller reaches
+    // for after a flush error -- but its guard returns early on
+    // `in_flight() == 0 && !must_close() && !transport_dead()`, and a
+    // dictionary-full connection satisfies all three: nothing reached the wire,
+    // the buffer rolled back, the socket is healthy. Unlatched, the reborrow is a
+    // silent no-op that answers `Ok(())` while handing back the SAME full
+    // connection, so a caller following the documented recovery retries into the
+    // same wall forever with no error escalation and no data loss to show for it.
+    //
+    // `BatchTooLarge`'s split path already latches for exactly this reason; the
+    // asymmetry was the bug.
+    //
+    // Memory mode (no `sf_dir`) on purpose, matching the test below: with a slot
+    // configured the replacement re-seeds from the side-file and would legitimately
+    // still be full.
+    let _cap = crate::ingress::TestDictCapGuard::new(1);
+    let server = MockServer::spawn_acking(8);
+    let conf = conf_for_endpoints(&[server.port()], "pool_reap=manual;");
+    let db = QuestDb::connect(&conf).unwrap();
+
+    let mut sender = db.borrow_direct_column_sender().unwrap();
+    let mut first = Chunk::new("trades");
+    append_one_symbol_row(&mut first, b"alpha", &[1_i64]);
+    sender
+        .flush_and_wait(&mut first, AckLevel::Ok)
+        .expect("the first symbol fits the 1-entry cap");
+
+    let mut second = Chunk::new("trades");
+    append_one_symbol_row(&mut second, b"bravo", &[2_i64]);
+    assert_eq!(
+        sender.flush(&mut second).unwrap_err().code(),
+        ErrorCode::SymbolDictFull,
+        "the second distinct symbol must exhaust the cap"
+    );
+
+    // The whole point: the failover primitive must actually fail over. Unlatched
+    // this returns Ok having done nothing, and the flush below fails identically.
+    sender
+        .reborrow_from_pool()
+        .expect("reborrow must open a fresh connection, not no-op on the full one");
+
+    let mut third = Chunk::new("trades");
+    append_one_symbol_row(&mut third, b"bravo", &[3_i64]);
+    sender.flush_and_wait(&mut third, AckLevel::Ok).expect(
+        "the replacement connection carries an empty dictionary, so the symbol \
+         that exhausted the old one now interns cleanly",
+    );
+}
+
+#[test]
 fn a_pool_return_recycles_a_full_symbol_dict_but_drop_on_return_resets_it() {
     // `SymbolDictFull`'s remedy rests on a distinction nothing asserted:
     // returning a borrowed sender to the pool recycles the connection AND its
