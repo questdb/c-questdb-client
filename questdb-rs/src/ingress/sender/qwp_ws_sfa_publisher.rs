@@ -95,24 +95,59 @@ impl SymbolPublishState {
     /// the tip off the file instead makes the first write-ahead after such a
     /// recovery re-persist `[K, K')` too, healing the file, and is a no-op
     /// (`K == K'`) on every other frame.
-    fn persist_new_symbols(&mut self) -> Result<()> {
+    ///
+    /// # Why the heal is written as its OWN chunk
+    ///
+    /// `frame_base_id` is the producer's id before this frame — not the anchor
+    /// (that is still the file's tip), but the BOUNDARY between "ids earlier
+    /// frames introduced, which the file is missing" and "ids this frame
+    /// introduced". They are written as two separate appends, hence two chunks.
+    ///
+    /// The format's blast-radius argument (see [`super::qwp_ws_sfa_symbol_dict`])
+    /// is that per-chunk CRC costs nothing over per-entry because every
+    /// recoverable frame's `delta_start` falls on a chunk boundary. Writing the
+    /// backfill and this frame's symbols as ONE chunk breaks that: this frame's
+    /// `delta_start == frame_base_id` lands in the chunk's interior, so a tear
+    /// costs `[K, next_id)` — every id back to the file's tip — rather than only
+    /// the ids at or above the tear. Splitting restores the invariant for this
+    /// frame and every frame after it; only the one-time backfill is coarse, and
+    /// it has no `delta_start` of its own to protect (it is the union of ids that
+    /// several already-queued frames introduced, whose boundaries the rebuild
+    /// does not retain).
+    ///
+    /// Empty on the steady state — `frame_base_id == persisted.size()`, so the
+    /// backfill range is empty and `append_symbols_iter` early-returns without
+    /// writing a chunk at all.
+    fn persist_new_symbols(&mut self, frame_base_id: u64) -> Result<()> {
         let Self {
             persisted, global, ..
         } = self;
         let Some(persisted) = persisted.as_mut() else {
             return Ok(());
         };
-        let from_id = u64::from(persisted.size());
-        let new_symbols = global.entries_from(from_id).ok_or_else(|| {
-            error::fmt!(
-                SocketError,
-                "internal: missing symbol id {} for persistence",
-                from_id
-            )
-        })?;
-        persisted
-            .append_symbols_iter(new_symbols)
-            .map_err(|e| error::fmt!(SocketError, "could not persist symbols: {}", e))
+        let file_tip = u64::from(persisted.size());
+        let next_id = global.next_id();
+        // Clamp so a `frame_base_id` outside `[file_tip, next_id]` cannot produce a
+        // reversed range. It should not happen; if it ever does, degrade to the
+        // single-chunk heal rather than mis-slicing.
+        let split = frame_base_id.clamp(file_tip, next_id);
+        for (from, to) in [(file_tip, split), (split, next_id)] {
+            if from >= to {
+                continue;
+            }
+            let entries = global.entries_from(from).ok_or_else(|| {
+                error::fmt!(
+                    SocketError,
+                    "internal: missing symbol id {} for persistence",
+                    from
+                )
+            })?;
+            let take = usize::try_from(to - from).unwrap_or(usize::MAX);
+            persisted
+                .append_symbols_iter(entries.take(take))
+                .map_err(|e| error::fmt!(SocketError, "could not persist symbols: {}", e))?;
+        }
+        Ok(())
     }
 }
 
@@ -149,6 +184,11 @@ impl SfaForegroundPublisher {
     ) -> Result<SfaPublishOutcome> {
         self.payload.clear();
         let global_mark = self.symbols.global.mark();
+        // The producer's id before this frame — i.e. this frame's `delta_start`.
+        // Not the write-ahead anchor (that is the side-file's tip); the boundary
+        // that keeps this frame's symbols in a chunk of their own. See
+        // `SymbolPublishState::persist_new_symbols`.
+        let frame_base_id = self.symbols.global.next_id();
         let persisted_mark = self.symbols.persisted.as_ref().map(|p| p.mark());
 
         if let Err(err) = encode(
@@ -169,7 +209,7 @@ impl SfaForegroundPublisher {
             });
         }
 
-        if let Err(err) = self.symbols.persist_new_symbols() {
+        if let Err(err) = self.symbols.persist_new_symbols(frame_base_id) {
             self.symbols.rollback(global_mark, persisted_mark);
             return Err(err);
         }

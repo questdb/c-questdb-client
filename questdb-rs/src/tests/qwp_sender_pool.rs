@@ -4134,15 +4134,34 @@ fn store_and_forward_file_mode_replays_both_frames_when_the_first_dict_chunk_is_
 
     assert_eq!(
         crate::ingress::sender::qwp_ws_sfa_symbol_dict::parse_chunks(&side_file),
-        vec![vec![
-            b"alpha".to_vec(),
-            b"bravo".to_vec(),
-            b"chuck".to_vec()
-        ]],
+        vec![
+            vec![b"alpha".to_vec(), b"bravo".to_vec()],
+            vec![b"chuck".to_vec()],
+        ],
         "the first write-ahead after a frame-derived rebuild must heal the file: \
-         entry i is symbol id i again. One chunk, because the write-ahead resumes \
-         from the side-file's tip (0) and so carries every id the producer holds"
+         entry i is symbol id i again. TWO chunks, and the split is the point -- \
+         the backfill of frame-derived ids [0, 2) is written separately from this \
+         frame's own id 2, so this frame's `delta_start` (2) still falls on a chunk \
+         boundary. Fused into one chunk, a tear anywhere in it would cost every id \
+         back to the file's tip instead of only the ids at or above the tear, which \
+         is exactly the blast-radius guarantee the per-chunk CRC format is \
+         justified by (see the `qwp_ws_sfa_symbol_dict` module docs)"
     );
+
+    // The framing changed; the dense `id == position` map did not. That is the
+    // property recovery actually reads, so pin it independently of the chunking.
+    let reopened =
+        crate::ingress::sender::qwp_ws_sfa_symbol_dict::PersistedSymbolDict::open_recovered(
+            &slot_dir,
+        )
+        .unwrap()
+        .expect("the healed side-file must reopen");
+    assert_eq!(
+        reopened.read_loaded_symbols(),
+        vec![b"alpha".to_vec(), b"bravo".to_vec(), b"chuck".to_vec()],
+        "entry i is symbol id i, across the chunk boundary"
+    );
+    assert_eq!(reopened.size(), 3);
 }
 
 #[test]

@@ -97,8 +97,9 @@ impl QwpWsReplayEncoder {
     /// resumes at `K'` while the file holds only its intact prefix `K < K'`.
     /// Anchoring to the producer would write id `K'` at file position `K` and
     /// permanently break the file's dense `id == position` invariant. See the
-    /// twin note on `SymbolPublishState::persist_new_symbols`.
-    fn persist_new_symbols(&mut self) -> crate::Result<()> {
+    /// twin note on `SymbolPublishState::persist_new_symbols`, which also argues
+    /// why `frame_base_id` splits the write into two chunks rather than one.
+    fn persist_new_symbols(&mut self, frame_base_id: u64) -> crate::Result<()> {
         let Self {
             global_dict,
             persisted_symbol_dict,
@@ -107,21 +108,33 @@ impl QwpWsReplayEncoder {
         let Some(pd) = persisted_symbol_dict.as_mut() else {
             return Ok(());
         };
-        // Gather the missing symbols, then write them ahead in one batched
-        // write_all rather than one alloc + one write() syscall per symbol.
+        let file_tip = u64::from(pd.size());
+        let next_id = global_dict.next_id();
+        // Backfill first (empty on the steady state), then this frame's own
+        // symbols -- two appends, so this frame's `delta_start` stays on a chunk
+        // boundary. Clamped so a stray `frame_base_id` cannot reverse a range.
+        let split = frame_base_id.clamp(file_tip, next_id);
+        // Gather each run, then write it ahead in one batched write_all rather
+        // than one alloc + one write() syscall per symbol.
         let mut new_symbols: Vec<&[u8]> = Vec::new();
-        for id in u64::from(pd.size())..global_dict.next_id() {
-            let bytes = global_dict.entry(id).ok_or_else(|| {
-                error::fmt!(
-                    SocketError,
-                    "internal: missing symbol id {} for persistence",
-                    id
-                )
-            })?;
-            new_symbols.push(bytes);
+        for (from, to) in [(file_tip, split), (split, next_id)] {
+            if from >= to {
+                continue;
+            }
+            new_symbols.clear();
+            for id in from..to {
+                let bytes = global_dict.entry(id).ok_or_else(|| {
+                    error::fmt!(
+                        SocketError,
+                        "internal: missing symbol id {} for persistence",
+                        id
+                    )
+                })?;
+                new_symbols.push(bytes);
+            }
+            pd.append_symbols(&new_symbols)
+                .map_err(|e| error::fmt!(SocketError, "could not persist symbols: {}", e))?;
         }
-        pd.append_symbols(&new_symbols)
-            .map_err(|e| error::fmt!(SocketError, "could not persist symbols: {}", e))?;
         Ok(())
     }
 
@@ -197,6 +210,9 @@ impl QwpWsReplayEncoder {
         max_buf_size: usize,
     ) -> crate::Result<(SymbolGlobalDictMark, Option<PersistedSymbolDictMark>)> {
         let global_dict_mark = self.global_dict.mark();
+        // This frame's `delta_start`: the boundary that keeps its symbols in a
+        // chunk of their own, distinct from the write-ahead anchor (the file tip).
+        let frame_base_id = self.global_dict.next_id();
         let pd_mark = self.persisted_symbol_dict.as_ref().map(|pd| pd.mark());
         if let Err(err) = self.encode_to_scratch(buffer) {
             self.rollback_frame(global_dict_mark, pd_mark);
@@ -207,7 +223,7 @@ impl QwpWsReplayEncoder {
             self.rollback_frame(global_dict_mark, pd_mark);
             return Err(qwp_ws_encoded_message_size_error(encoded_len, max_buf_size));
         }
-        if let Err(err) = self.persist_new_symbols() {
+        if let Err(err) = self.persist_new_symbols(frame_base_id) {
             self.rollback_frame(global_dict_mark, pd_mark);
             return Err(err);
         }

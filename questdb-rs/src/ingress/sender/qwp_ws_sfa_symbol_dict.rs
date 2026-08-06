@@ -59,12 +59,26 @@
 //! The CRC32C is **per chunk, not per entry** — byte-for-byte the layout the Java
 //! reference client's `.symbol-dict` uses (`PersistedSymbolDict`), so the two
 //! clients stay format-compatible. Per-chunk granularity loses no recoverable
-//! prefix: every recoverable frame's `delta_start` falls on a chunk boundary
-//! (chunks and frame deltas are written one-for-one), so a tear inside a chunk
-//! invalidates exactly the frames a per-entry checksum would have. The same
-//! checksum the SF segment frames use (see [`super::qwp_ws_sfa_segment`]) catches a
-//! torn, zero-page or stale chunk on recovery and stops the parse there, instead of
-//! silently mis-registering a symbol and shifting the dense id->symbol map.
+//! prefix: every recoverable frame's `delta_start` falls on a chunk boundary, so a
+//! tear inside a chunk invalidates exactly the frames a per-entry checksum would
+//! have. The same checksum the SF segment frames use (see
+//! [`super::qwp_ws_sfa_segment`]) catches a torn, zero-page or stale chunk on
+//! recovery and stops the parse there, instead of silently mis-registering a symbol
+//! and shifting the dense id->symbol map.
+//!
+//! One append is **not** always one frame's delta, and the boundary invariant above
+//! is what is actually maintained. After a recovery whose dictionary was rebuilt
+//! from the stored frames
+//! (`SfaFrameQueue::rebuild_recovered_dict_from_frames`), the producer resumes at
+//! `K'` while the file holds only its intact prefix `K < K'`, so the next
+//! write-ahead has a backfill to do. It writes that backfill `[K, K')` as its own
+//! chunk and the current frame's symbols `[K', next_id)` as a second — deliberately
+//! two appends, so the live frame's `delta_start == K'` still lands on a boundary.
+//! Only the one-time backfill chunk is coarse (it is the union of ids several
+//! already-queued frames introduced, whose boundaries the rebuild does not retain),
+//! and it has no `delta_start` of its own to protect. Fusing the two would put a
+//! live frame's base in a chunk interior, so a tear there would cost every id back
+//! to `K` rather than only the ids at or above the tear.
 //!
 //! # Durability / write-ahead ordering
 //!
