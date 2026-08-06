@@ -3823,7 +3823,17 @@ fn a_full_symbol_dict_still_commits_the_direct_sender_deferred_tail_on_drop() {
     // (FLAG_DEFER_COMMIT set) rather than a commit boundary, and this fails.
     const FLAG_DEFER_COMMIT: u8 = 0x01;
     let _cap = crate::ingress::TestDictCapGuard::new(1);
-    let (server, frames) = MockServer::spawn_acking_capturing(8);
+    // Ack-when-released, NOT ack-each-frame: the deferred frame B must stay
+    // in-flight (unacked) until the drop-time commit, which is what a real QWP
+    // server does -- it acks a frame only once it is committed, so a deferred
+    // frame is unacked until a boundary commits it, and `in_flight()` is exactly
+    // the set of uncommitted frames `commit_in_flight_on_drop` must close. The
+    // `spawn_acking_capturing` mock instead acks B the moment it reads it, and
+    // frame C's failed flush drains that premature ack (every `flush` starts with
+    // `try_drain_acks`), racing `in_flight()` to 0 before the assertion below and
+    // the drop -- flaky. Withholding the ack removes the race and models the
+    // server faithfully; we release just before the drop so its commit can ack.
+    let (server, release, frames) = MockServer::spawn_ack_when_released_capturing(8);
     let conf = conf_for_endpoints(&[server.port()], "pool_reap=manual;");
     let db = QuestDb::connect(&conf).unwrap();
 
@@ -3863,6 +3873,12 @@ fn a_full_symbol_dict_still_commits_the_direct_sender_deferred_tail_on_drop() {
         "B is still deferred: the rejected frame C reached no wire and must not \
          have disturbed the in-flight tail"
     );
+
+    // Let the server ack now, so the drop-time commit's `sync` (which waits for
+    // the commit frame's ack) completes promptly rather than blocking on the
+    // request timeout. Nothing on this thread drains acks between here and the
+    // drop, so `in_flight()` stays > 0 for `commit_in_flight_on_drop`'s guard.
+    release.store(true, Ordering::SeqCst);
 
     // A plain drop (NOT drop_on_return) must commit the deferred tail, not discard
     // it -- the connection is spent, but healthy and drainable.
