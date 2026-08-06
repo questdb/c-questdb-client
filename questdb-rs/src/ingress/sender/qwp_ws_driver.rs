@@ -1302,7 +1302,17 @@ impl<T: QwpWsCoreTransport> QwpWsSendCore<T> {
             if sent.is_ok() {
                 // The frame's delta is on the wire; mirror the symbols it
                 // introduced so a later reconnect can re-register them.
-                dict_mirror.accumulate(payload);
+                //
+                // Deliberately ignored, exactly as in `enable_delta_dict`: this is
+                // the mirror the DEGRADE was written for. `false` means the suffix
+                // could not be allocated, which leaves the mirror disabled, and a
+                // disabled mirror makes `guard_dict_not_torn` reject the dependent
+                // frames as resend-required instead of shipping them against a
+                // dictionary the reconnect catch-up can no longer rebuild. (The
+                // recovery-side fold in
+                // `SfaFrameQueue::rebuild_recovered_dict_from_frames` is the caller
+                // that must NOT ignore it.)
+                let _mirrored = dict_mirror.accumulate(payload);
             }
             sent
         });
@@ -1405,7 +1415,14 @@ impl<T: QwpWsCoreTransport> QwpWsSendCore<T> {
     /// tested reconnect-with-nothing-acked overlap case).
     pub(crate) fn enable_delta_dict(&mut self, seed_entries: &[u8], seed_count: u32) {
         self.dict_mirror = SentDictMirror::new(true);
-        self.dict_mirror.seed(seed_entries, seed_count);
+        // Deliberately ignored: this is the mirror the DEGRADE was written for. If
+        // the region cannot be allocated, `seed` leaves the mirror disabled, and a
+        // disabled mirror makes `guard_dict_not_torn` reject the recovered delta
+        // frames as resend-required instead of shipping them against a dictionary
+        // that was never registered. That is the graceful outcome here. (The
+        // recovery-side fold in `SfaFrameQueue::rebuild_recovered_dict_from_frames`
+        // is the caller that must NOT ignore it.)
+        let _seeded = self.dict_mirror.seed(seed_entries, seed_count);
         self.catch_up_pending = !self.dict_mirror.is_empty();
     }
 
@@ -2623,6 +2640,16 @@ pub(crate) fn reconnect_error_is_terminal(err: &Error) -> bool {
             | ErrorCode::ConfigError
             | ErrorCode::ProtocolVersionError
             | ErrorCode::StoreResendRequired
+            // A full connection dictionary is a property of durable state, not of
+            // the transport: `SymbolGlobalDict::seed` re-interns every recovered
+            // entry, so a slot whose `.symbol-dict` holds more symbols than this
+            // client's cap fails `PooledSenderCore::new_store_and_forward` the same
+            // way on every attempt. Retrying re-opens the slot, re-runs the
+            // frame-derived dictionary rebuild and re-connects, all to reach the
+            // identical error, until the caller's whole retry budget is spent.
+            // `StoreResendRequired` above is the sibling `seed` raises from the very
+            // same call and is already terminal; this belongs beside it.
+            | ErrorCode::SymbolDictFull
     )
 }
 
@@ -4411,10 +4438,13 @@ mod tests {
         // Torn recovery: the side-file recovered only id0 = a, but an earlier queued
         // frame re-registers id1 = b, extending the mirror to [a, b].
         driver.send_core.enable_delta_dict(&[1, b'a'], 1);
-        driver
-            .send_core
-            .dict_mirror
-            .accumulate(&make_delta_frame(1, &[b"b"]));
+        assert!(
+            driver
+                .send_core
+                .dict_mirror
+                .accumulate(&make_delta_frame(1, &[b"b"])),
+            "folding a small frame cannot fail"
+        );
         assert_eq!(driver.send_core.dict_mirror.count(), 2);
 
         // Re-registering id1 = b (the same symbol) is a benign replay -> allowed.
@@ -4504,7 +4534,10 @@ mod tests {
                 "a self-sufficient dense frame re-shipping the mirrored prefix is safe"
             );
             // Accumulating it folds only the new suffix [c]; the mirror stays consistent.
-            driver.send_core.dict_mirror.accumulate(&dense);
+            assert!(
+                driver.send_core.dict_mirror.accumulate(&dense),
+                "folding a small frame cannot fail"
+            );
             assert_eq!(
                 driver.send_core.dict_mirror.count(),
                 3,
@@ -6393,6 +6426,32 @@ mod tests {
         assert!(!reconnect_error_is_terminal(
             &retryable_upgrade_version_error
         ));
+    }
+
+    #[test]
+    fn reconnect_terminal_classification_stops_on_a_full_symbol_dictionary() {
+        // Regression (retry storm on a deterministic failure). `SymbolGlobalDict::
+        // seed` re-interns every recovered entry, so a slot whose side-file holds
+        // more symbols than this client's cap fails `new_store_and_forward` --
+        // and fails it identically on every attempt, because nothing about the
+        // slot or the cap changes in between. Classified retryable, `reconnect_pick`
+        // / `reborrow_with_retry` re-open the slot, re-run the frame-derived
+        // rebuild and re-connect on every backoff step until the budget expires,
+        // then return the same error.
+        //
+        // `StoreResendRequired` is the sibling the SAME `seed` call raises and has
+        // always been terminal; the asymmetry was the bug.
+        let dict_full = Error::new(
+            ErrorCode::SymbolDictFull,
+            "QWP/WS connection-scoped symbol dictionary reached its 2000000-entry cap",
+        );
+        assert!(reconnect_error_is_terminal(&dict_full));
+
+        let torn_dict = Error::new(
+            ErrorCode::StoreResendRequired,
+            "corrupt persisted symbol dictionary: duplicate entry at index 1",
+        );
+        assert!(reconnect_error_is_terminal(&torn_dict));
     }
 
     #[test]

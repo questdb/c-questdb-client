@@ -5331,7 +5331,15 @@ const QWP_FLAG_DEFER_COMMIT: u8 = 0x01;
 /// The dictionary is owned by the sender and lives for the duration of the
 /// WebSocket connection. New symbols added during a flush are recorded in the
 /// per-message delta section so the server can rebuild the same global
-/// dictionary; on reconnect both sides reset.
+/// dictionary.
+///
+/// A reconnect does **not** reset either side. This dictionary belongs to the
+/// sender, not to the socket, and nothing on the reconnect path clears it:
+/// `finish_reconnect_success` instead arms the catch-up that re-registers the
+/// whole of it on the fresh server (from the I/O thread's `SentDictMirror`, see
+/// `super::super::sender::qwp_ws_sfa_catchup`), and in dense mode every frame
+/// re-ships the dictionary anyway. Only discarding the owning connection resets
+/// it.
 ///
 /// Capped at [`MAX_CONN_SYMBOL_DICT_SIZE`] to mirror the server's
 /// connection-scoped dictionary ceiling and the Java reference client.
@@ -5383,20 +5391,33 @@ impl Default for SymbolGlobalDict {
     }
 }
 
-/// Per-connection cap on the QWP/WS global symbol dictionary. Matches
-/// `MAX_CONN_DICT_SIZE` in the egress reader (`egress/symbol_dict.rs`)
-/// and the Java reference client. When the cap is reached the encoder
-/// surfaces an `InvalidApiCall` error and the caller is expected to
-/// reconnect (which resets both sides).
+/// Per-connection cap on the QWP/WS global symbol dictionary a sender ships to
+/// the server. Matches the server's ingress dictionary ceiling
+/// (`MAX_SYMBOL_DICTIONARY_SIZE`, `2_000_000`); the Java reference client is being
+/// aligned to the same value in its own change. So the client refuses a symbol
+/// the server would reject the delta for, rather than only discovering it on the
+/// wire. When the cap is reached [`intern`](SymbolGlobalDict::intern) returns
+/// [`SymbolDictFull`](crate::ErrorCode::SymbolDictFull) -- a distinct code so a
+/// caller can recognise a full dictionary without matching on the message text.
+///
+/// Reconnecting does NOT clear it, so it is not the remedy: the dictionary
+/// outlives the socket and a reconnect re-registers the whole of it on the fresh
+/// server (see the note on [`SymbolGlobalDict`]). Only discarding the connection
+/// that owns it resets it -- which a full dictionary now does automatically on
+/// return, so a pooled sender is dropped rather than recycled and the next borrow
+/// gets a fresh one. What each API requires (and how to keep frames flushed
+/// earlier from being lost) is documented on
+/// [`SymbolDictFull`](crate::ErrorCode::SymbolDictFull). (The egress/query-result
+/// reader has its own, independent ceiling; see `egress/symbol_dict.rs`.)
 #[cfg(feature = "_sender-qwp-ws")]
-pub(crate) const MAX_CONN_SYMBOL_DICT_SIZE: usize = 8_388_608;
+pub(crate) const MAX_CONN_SYMBOL_DICT_SIZE: usize = 2_000_000;
 
 /// Per-connection cap on the cumulative UTF-8 heap (in bytes) the QWP/WS global
 /// symbol dictionary holds. Matches `MAX_CONN_DICT_HEAP_BYTES` in the egress
 /// reader (`egress/symbol_dict.rs`) and the Java reference client. The entry
 /// count ([`MAX_CONN_SYMBOL_DICT_SIZE`]) and per-entry length
 /// ([`MAX_PERSISTED_SYMBOL_ENTRY_LEN`]) caps do NOT bound the aggregate heap
-/// (8M entries * 1 MiB ~= 8 TiB), so without this cap a high-cardinality /
+/// (2M entries * 1 MiB ~= 2 TiB), so without this cap a high-cardinality /
 /// large-symbol connection could (a) build a dictionary the server rejects with
 /// no ingestion-side error, and (b) grow the persisted side-file past
 /// `MAX_FILE_LEN` (~2 GiB), which recovery then discards as over-cap -- stranding
@@ -5414,10 +5435,54 @@ pub(crate) struct SymbolGlobalDictMark {
     heap_bytes: usize,
 }
 
+#[cfg(all(test, feature = "_sender-qwp-ws"))]
+thread_local! {
+    /// Entry cap applied to every [`SymbolGlobalDict::new`] on this thread; see
+    /// [`TestDictCapGuard`].
+    static TEST_DICT_CAP: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+}
+
+/// Test-only: shrink the connection dictionary's entry cap for every
+/// [`SymbolGlobalDict`] constructed on this thread while the guard lives.
+///
+/// [`with_cap`](SymbolGlobalDict::with_cap) can only reach a dictionary a test
+/// builds itself, so it cannot exercise the cap through a real `Sender` --
+/// every production path builds its dictionary internally via
+/// [`new`](SymbolGlobalDict::new), and reaching the real cap would mean
+/// interning a million symbols. That left every promise the `SymbolDictFull`
+/// docs make about the *flush* path (nothing reaches the wire, the buffer and
+/// side-file roll back, already-interned symbols keep flushing, a pool return
+/// recycles the dictionary) untestable, and so untested.
+///
+/// Thread-local rather than global precisely because the test harness runs
+/// tests in parallel: all three production constructors
+/// (`DirectSenderCore::from_builder`, `Db::pick_replacement_sender`,
+/// `column_sender::sender`'s store-and-forward foreground) run on the borrowing
+/// thread, so the override reaches them without leaking into a concurrent test
+/// that happens to build a sender at the same moment. Restores the previous
+/// value on drop, so guards nest.
+#[cfg(all(test, feature = "_sender-qwp-ws"))]
+pub(crate) struct TestDictCapGuard(Option<usize>);
+
+#[cfg(all(test, feature = "_sender-qwp-ws"))]
+impl TestDictCapGuard {
+    pub(crate) fn new(cap: usize) -> Self {
+        Self(TEST_DICT_CAP.with(|c| c.replace(Some(cap))))
+    }
+}
+
+#[cfg(all(test, feature = "_sender-qwp-ws"))]
+impl Drop for TestDictCapGuard {
+    fn drop(&mut self) {
+        TEST_DICT_CAP.with(|c| c.set(self.0));
+    }
+}
+
 #[cfg(feature = "_sender-qwp-ws")]
 impl SymbolGlobalDict {
     pub(crate) fn new() -> Self {
-        Self {
+        #[allow(unused_mut)]
+        let mut dict = Self {
             map: QwpWsSymbolHashMap::default(),
             entries: Vec::new(),
             next_id: 0,
@@ -5426,7 +5491,15 @@ impl SymbolGlobalDict {
             heap_cap: MAX_CONN_SYMBOL_DICT_HEAP_BYTES,
             #[cfg(feature = "arrow-ingress")]
             arrow_dict_memo: Vec::new(),
+        };
+        // Test-only: let a guard on this thread shrink the cap so the flush-path
+        // rejection can be driven through a real sender. No effect in any
+        // non-test build -- the whole hook compiles out.
+        #[cfg(test)]
+        if let Some(cap) = TEST_DICT_CAP.with(|c| c.get()) {
+            dict.cap = cap;
         }
+        dict
     }
 
     /// Same as [`new`](Self::new) but with a smaller entry cap so the
@@ -5557,9 +5630,13 @@ impl SymbolGlobalDict {
     }
 
     /// Returns `(global_id, is_new)`. Errors with `InvalidApiCall` if the symbol
-    /// exceeds [`MAX_PERSISTED_SYMBOL_ENTRY_LEN`], or interning it would push the
-    /// dictionary past its entry-count cap ([`MAX_CONN_SYMBOL_DICT_SIZE`]) or its
-    /// cumulative heap cap ([`MAX_CONN_SYMBOL_DICT_HEAP_BYTES`]).
+    /// exceeds [`MAX_PERSISTED_SYMBOL_ENTRY_LEN`], and with
+    /// [`SymbolDictFull`](crate::ErrorCode::SymbolDictFull) if interning it would
+    /// push the dictionary past its entry-count cap
+    /// ([`MAX_CONN_SYMBOL_DICT_SIZE`]) or its cumulative heap cap
+    /// ([`MAX_CONN_SYMBOL_DICT_HEAP_BYTES`]) -- a distinct code so callers can
+    /// recognise a full dictionary (retire the connection) without matching on
+    /// the message text.
     pub(crate) fn intern(&mut self, bytes: &[u8]) -> crate::Result<(u64, bool)> {
         // A symbol larger than the persisted side-file's per-entry cap would be
         // interned, used in a frame and ACKed, then rejected as torn by the
@@ -5582,20 +5659,21 @@ impl SymbolGlobalDict {
         }
         if self.entries.len() >= self.cap {
             return Err(crate::error::fmt!(
-                InvalidApiCall,
+                SymbolDictFull,
                 "QWP/WS connection-scoped symbol dictionary reached its \
-                 {}-entry cap; drop and reopen the connection to reset \
-                 the dictionary",
+                 {}-entry cap; retire this connection and continue on a fresh \
+                 one (returning it to a pool recycles its dictionary)",
                 self.cap
             ));
         }
         // Aggregate heap cap: the entry-count and per-entry caps above do NOT
-        // bound the total bytes (8M entries * 1 MiB ~= 8 TiB). Enforce the same
-        // 256 MiB connection heap the egress reader / server / Java client use,
-        // at this single ingestion choke point, so an oversized *aggregate* never
-        // gets an id or is written ahead -- otherwise the persisted side-file
-        // could grow past `MAX_FILE_LEN` and be discarded on recovery, stranding
-        // queued frames. `checked_add` is defensive: `bytes.len()` is already
+        // bound the total bytes (2M entries * 1 MiB ~= 2 TiB). Enforce the same
+        // 256 MiB connection heap the egress reader / Java client use -- the
+        // server bounds its ingress dictionary by entry count alone, so this one
+        // is client-side -- at this single ingestion choke point, so an oversized
+        // *aggregate* never gets an id or is written ahead. Otherwise the
+        // persisted side-file could grow past `MAX_FILE_LEN` and be discarded on
+        // recovery, stranding queued frames. `checked_add` is defensive: `bytes.len()` is already
         // <= 1 MiB and `heap_bytes` <= the cap, so it cannot actually overflow.
         let new_heap = self
             .heap_bytes
@@ -5603,10 +5681,10 @@ impl SymbolGlobalDict {
             .filter(|&h| h <= self.heap_cap)
             .ok_or_else(|| {
                 crate::error::fmt!(
-                    InvalidApiCall,
+                    SymbolDictFull,
                     "QWP/WS connection-scoped symbol dictionary reached its \
-                     {}-byte heap cap; drop and reopen the connection to reset \
-                     the dictionary",
+                     {}-byte heap cap; retire this connection and continue on a \
+                     fresh one (returning it to a pool recycles its dictionary)",
                     self.heap_cap
                 )
             })?;
@@ -5630,6 +5708,60 @@ impl SymbolGlobalDict {
     /// each so the recovered ids (`0..count`) match the stored frames' references.
     /// Called once at connection setup on file-mode recovery / orphan-drain, on a
     /// fresh (empty) dictionary.
+    ///
+    /// # Failure modes
+    ///
+    /// A malformed region fails [`StoreResendRequired`](crate::ErrorCode::StoreResendRequired)
+    /// (truncated / over-long varint, over-cap entry length, buffer overrun,
+    /// duplicate entry). Because it re-interns through [`intern`](Self::intern),
+    /// it can ALSO fail [`SymbolDictFull`](crate::ErrorCode::SymbolDictFull) on a
+    /// region that is perfectly well-formed but holds more entries (or more
+    /// bytes) than this connection's caps: the side-file was written by a client
+    /// whose cap was higher, or it sits exactly on the boundary. Either way the
+    /// dictionary is left PARTIALLY seeded -- entries before the failure keep
+    /// their ids -- so a caller must never continue with it.
+    ///
+    /// # Why the two recovery callers diverge on that failure
+    ///
+    /// Deliberate, and it turns on one question: *is there a producer that will
+    /// mint new ids?*
+    ///
+    /// Foreground recovery (`qwp_ws::connect_qwp_ws` /
+    /// `connect_sfa_background` / the manual handler, and
+    /// `PooledSenderCore::new_store_and_forward`) `?`-propagates it and fails
+    /// construction. It has a producer, and a half-seeded (or empty) dictionary
+    /// would hand the next interned symbol an id the stored frames already use.
+    /// Degrading to dense instead would not even contain that: the driver's
+    /// catch-up mirror is armed off the same flag, so the slot's
+    /// `delta_start == 0` frame would replay and COMMIT before the guard rejected
+    /// the one behind it, turning a clean nothing-has-connected-yet failure into
+    /// `StoreResendRequired` on top of a committed prefix -- which a compliant
+    /// resend duplicates. Failing here happens before the runner is spawned, so
+    /// the slot is left untouched on disk for a client that can hold it.
+    ///
+    /// The orphan drainer (`qwp_ws_orphan::open_inner`) logs, discards the
+    /// rejected entries, and arms the catch-up mirror **empty** -- it does NOT
+    /// degrade to dense. It is replay-only: no producer, no write-ahead, and the
+    /// side-file handle is dropped outright, so there is no id to collide with
+    /// and nothing a partial seed could corrupt.
+    ///
+    /// Arming empty is the strictest guard state, not a slackened one: the hazard
+    /// the validation exists for is an *inflated* count, and count 0 admits only a
+    /// `delta_start == 0` frame. `SentDictMirror::accumulate` then folds that
+    /// frame's own delta section in, and the frames behind it resolve against what
+    /// their predecessors registered -- so the drain bootstraps from the stored
+    /// frames and needs nothing from the rejected side-file.
+    ///
+    /// Dense would cost the slot outright. It leaves the mirror *disabled*, so the
+    /// `delta_start == 0` frame replays and COMMITS, the frame behind it is
+    /// terminally rejected, and `StoreResendRequired` is classified proven-local
+    /// unrecoverable (`terminal_error_is_proven_local_unrecoverable`) -- the drain
+    /// writes `.failed` and every later scan skips the slot until an operator
+    /// clears the sentinel. Recoverable frames abandoned over a side-file this
+    /// client merely could not hold.
+    ///
+    /// See `symbol_dict_seed_fills_to_the_cap_and_rejects_the_entry_past_it` for
+    /// the boundary, and the two paired tests named in those call sites.
     pub(crate) fn seed(&mut self, entries: &[u8], count: u32) -> crate::Result<()> {
         let mut pos = 0usize;
         for i in 0..count {
@@ -9632,9 +9764,11 @@ mod tests {
         assert!(dict.intern(b"c").unwrap().1);
         assert_eq!(dict.len(), 3);
 
-        // A fourth distinct symbol is rejected once the cap is reached.
+        // A fourth distinct symbol is rejected once the cap is reached, with a
+        // code distinct from `InvalidApiCall` so a caller can recognise a full
+        // dictionary (retire the connection) without matching on the message.
         let err = dict.intern(b"d").unwrap_err();
-        assert_eq!(err.code(), ErrorCode::InvalidApiCall);
+        assert_eq!(err.code(), ErrorCode::SymbolDictFull);
         assert!(err.msg().contains("cap"), "{}", err.msg());
 
         // An already-interned symbol still resolves at the cap.
@@ -9681,7 +9815,7 @@ mod tests {
         // A distinct symbol that would push the heap past the cap is rejected, and
         // gets no id.
         let err = dict.intern(b"c").unwrap_err();
-        assert_eq!(err.code(), ErrorCode::InvalidApiCall);
+        assert_eq!(err.code(), ErrorCode::SymbolDictFull);
         assert!(err.msg().contains("heap"), "{}", err.msg());
         assert_eq!(dict.len(), 2);
 
@@ -9716,7 +9850,7 @@ mod tests {
 
         // The cap is still enforced against the restored counter.
         let err = dict.intern(b"d").unwrap_err();
-        assert_eq!(err.code(), ErrorCode::InvalidApiCall);
+        assert_eq!(err.code(), ErrorCode::SymbolDictFull);
         assert!(err.msg().contains("heap"), "{}", err.msg());
     }
 
@@ -9928,10 +10062,81 @@ mod tests {
 
     #[cfg(feature = "_sender-qwp-ws")]
     #[test]
+    fn symbol_dict_seed_fills_to_the_cap_and_rejects_the_entry_past_it() {
+        // `seed` re-interns every recovered entry, so the connection's entry cap
+        // applies to RECOVERY exactly as it does to ingestion -- a fact with no
+        // coverage until now, even though it decides whether a slot can be
+        // reopened at all. A region holding exactly `cap` entries seeds cleanly;
+        // the `cap + 1`-th is refused.
+        //
+        // The code is `SymbolDictFull`, NOT one of `seed`'s `StoreResendRequired`
+        // corruption codes, and the distinction is the point: such a side-file is
+        // perfectly well-formed, just bigger than this client will hold (written
+        // by a higher-capped client, or sitting on the boundary). The two
+        // recovery callers then diverge on it deliberately -- foreground fails
+        // construction, the orphan drainer discards the rejected entries and arms
+        // its mirror empty -- as argued in `seed`'s docs and pinned by the paired
+        // tests it names.
+        //
+        // `symbol_dict_cap_matches_server_ceiling` pins the real cap at
+        // 2_000_000; `with_cap` walks the same boundary without interning two
+        // million symbols.
+        fn region(count: usize) -> Vec<u8> {
+            let mut region = Vec::new();
+            for i in 0..count {
+                let symbol = format!("s{i}");
+                write_qwp_varint(&mut region, symbol.len() as u64);
+                region.extend_from_slice(symbol.as_bytes());
+            }
+            region
+        }
+
+        const CAP: usize = 64;
+
+        // Exactly at the cap: every recovered id is reproduced and ingestion
+        // continues above them.
+        let mut at_cap = SymbolGlobalDict::with_cap(CAP);
+        at_cap.seed(&region(CAP), CAP as u32).unwrap();
+        assert_eq!(at_cap.next_id(), CAP as u64);
+        assert_eq!(at_cap.entry(0), Some(&b"s0"[..]));
+        assert_eq!(at_cap.entry(CAP as u64 - 1), Some(b"s63".as_slice()));
+        // ...and the dictionary is now full, so the first NEW symbol is refused
+        // with the same code (the cap is on the dictionary, not on seeding).
+        assert_eq!(
+            at_cap.intern(b"fresh").unwrap_err().code(),
+            crate::ErrorCode::SymbolDictFull
+        );
+
+        // One past the cap.
+        let mut past_cap = SymbolGlobalDict::with_cap(CAP);
+        let err = past_cap
+            .seed(&region(CAP + 1), (CAP + 1) as u32)
+            .unwrap_err();
+        assert_eq!(
+            err.code(),
+            crate::ErrorCode::SymbolDictFull,
+            "{}",
+            err.msg()
+        );
+        assert!(err.msg().contains("entry cap"), "msg: {}", err.msg());
+        assert_eq!(
+            past_cap.next_id(),
+            CAP as u64,
+            "seed fails PART-WAY, leaving the entries before the cap interned -- \
+             which is why a caller must never continue with the dictionary it \
+             failed on: the next symbol it interned would take an id the stored \
+             frames already reference"
+        );
+    }
+
+    #[cfg(feature = "_sender-qwp-ws")]
+    #[test]
     fn symbol_dict_cap_matches_server_ceiling() {
-        // Mirrors the egress reader cap and the Java reference client; a
-        // drift here would silently change the reconnect threshold.
-        assert_eq!(MAX_CONN_SYMBOL_DICT_SIZE, 8 * 1024 * 1024);
+        // Mirrors the server's ingress dictionary ceiling (2_000_000; the Java
+        // reference client is being aligned to the same value in its own change);
+        // a drift here would silently change the reconnect threshold and let the
+        // client ship deltas the server rejects.
+        assert_eq!(MAX_CONN_SYMBOL_DICT_SIZE, 2_000_000);
     }
 
     #[cfg(feature = "_sender-qwp-ws")]

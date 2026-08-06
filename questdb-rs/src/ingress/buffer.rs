@@ -45,9 +45,13 @@ pub(crate) use self::qwp::QwpBuffer;
 pub(crate) use self::qwp::QwpSendScratch;
 #[cfg(feature = "_sender-qwp-ws")]
 pub(crate) use self::qwp::{
-    MAX_CONN_SYMBOL_DICT_SIZE, MAX_PERSISTED_SYMBOL_ENTRY_LEN, QwpWsColumnarBuffer,
-    QwpWsEncodeScratch, SymbolGlobalDict, SymbolGlobalDictMark, decode_qwp_varint,
+    MAX_PERSISTED_SYMBOL_ENTRY_LEN, QwpWsColumnarBuffer, QwpWsEncodeScratch, SymbolGlobalDict,
+    SymbolGlobalDictMark, decode_qwp_varint,
 };
+// Test-only: lets the sender-level suites drive the connection dictionary's
+// cap-rejection path through a real `Sender` (see `TestDictCapGuard`).
+#[cfg(all(test, feature = "_sender-qwp-ws"))]
+pub(crate) use self::qwp::TestDictCapGuard;
 // `QwpWsSymbolHasher`'s only re-export consumer is the `arrow`-gated
 // `column_sender::arrow_batch`, so it is gated identically: a `_sender-qwp-ws`
 // build without `arrow` would otherwise carry an unused import.
@@ -752,6 +756,19 @@ impl Buffer {
     /// Adds a symbol column to the current row.
     ///
     /// All symbol columns must be recorded before any non-symbol columns.
+    ///
+    /// When the buffer is flushed over QWP/WebSocket, every distinct symbol
+    /// recorded here is interned into the *same* connection-scoped dictionary
+    /// the column/chunk API uses — capped at 2,000,000 entries and 256 MiB of
+    /// UTF-8 across the whole connection, not per buffer or per flush.
+    /// Exceeding it fails the flush with
+    /// [`SymbolDictFull`](crate::ErrorCode::SymbolDictFull), and the dictionary
+    /// is only reset by retiring the connection that owns it — which a full
+    /// dictionary now does automatically on return, so a pooled sender is dropped
+    /// (not recycled) and the next borrow gets a fresh one. Wait / commit first if
+    /// frames flushed earlier must not be lost; see
+    /// [`SymbolDictFull`](crate::ErrorCode::SymbolDictFull) for the per-API
+    /// list. ILP (TCP/HTTP) flushes carry no such dictionary and are unaffected.
     #[inline(always)]
     pub fn symbol<'a, N, S>(&mut self, name: N, value: S) -> crate::Result<&mut Self>
     where
@@ -776,6 +793,9 @@ impl Buffer {
     }
 
     /// Adds a symbol column if `value` is `Some`; otherwise leaves the row unchanged.
+    ///
+    /// See [`symbol`](Self::symbol) for the QWP/WebSocket connection-scoped
+    /// dictionary cap that applies to every symbol recorded this way.
     pub fn symbol_opt<'a, N, S>(&mut self, name: N, value: Option<S>) -> crate::Result<&mut Self>
     where
         N: AsRef<str> + TryInto<ColumnName<'a>>,

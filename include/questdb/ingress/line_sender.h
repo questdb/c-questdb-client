@@ -231,6 +231,59 @@ typedef enum line_sender_error_code
      *  socket drop) so a caller can tell "resend from source" apart from
      *  "reconnect and retry" by code, without matching on the message text. */
     line_sender_error_store_resend_required = 36,
+
+    /** The QWP/WebSocket connection-scoped symbol dictionary is full: interning
+     *  another distinct symbol would exceed its entry-count cap (2,000,000,
+     *  matching the server's ingress ceiling) or its cumulative UTF-8 heap cap
+     *  (256 MiB). The failing frame is rejected before any byte reaches the wire
+     *  and the buffer is rolled back, so *that flush* loses nothing and chunks
+     *  referencing only already-interned symbols keep flushing — but retrying a
+     *  *new* symbol on the same sender can never succeed. A full dictionary
+     *  RETIRES the connection on return: a pooled sender is dropped rather than
+     *  recycled (the next borrow gets a fresh, empty-dictionary connection, not the
+     *  same full one) and its earlier frames are drained / committed best-effort on
+     *  the way out. So the simplest recovery is to return the sender as usual and
+     *  borrow a fresh one. If those earlier frames must not be lost, drain or commit
+     *  them AND check first:
+     *
+     *    - Pooled row sender: a plain `questdb_db_return_sender` now retires (does
+     *      NOT recycle) a full-dictionary connection and drains its queue
+     *      best-effort within `close_flush_timeout`; the next borrow is fresh. Call
+     *      `qwp_sender_wait` first if the queued frames must not be lost. With
+     *      `sf_dir` configured they persist in the slot, but so does the
+     *      dictionary, and the next borrower re-seeds from that slot's side-file at
+     *      the same size unless the slot drained first, so wait there too.
+     *    - Pooled direct sender: a plain `questdb_db_return_direct_sender` retires
+     *      the connection and commits the deferred tail best-effort. Its flushes are
+     *      deferred, so for a CHECKED guarantee call `qwp_direct_sender_commit` (or
+     *      a waited flush) and confirm it succeeded before the return. Do NOT use
+     *      `questdb_db_drop_direct_sender` on a full dictionary: it force-drops and
+     *      skips the best-effort commit, discarding the tail.
+     *    - Standalone direct sender: `qwp_direct_sender_free` commits the deferred
+     *      tail best-effort; call `qwp_direct_sender_commit` and CHECK IT SUCCEEDED
+     *      first for a guarantee, then `qwp_direct_sender_free`, then re-open.
+     *    - Standalone row sender (`line_sender_from_conf` / `_from_env` /
+     *      `line_sender_build` on a
+     *      `ws://` or `wss://` address, flushed with `line_sender_flush*`):
+     *      `line_sender_qwpws_close_drain` and CHECK IT SUCCEEDED, then
+     *      `line_sender_close` and re-open. This is the MOST lossy flavour on a
+     *      bare close, not the least: `line_sender_close` does not flush, and
+     *      nothing drains the QWP/WebSocket queue on the way out, so every
+     *      published-but-unacked frame is discarded with no wait. The drain is
+     *      bounded by `close_flush_timeout`.
+     *
+     *  See the symbol-column preamble in `qwp_sender.h`. Distinct from
+     *  `line_sender_error_invalid_api_call` so callers can recognise it without
+     *  matching on the message text.
+     *
+     *  One exception to "that flush loses nothing", and it matters for resends: a chunk
+     *  too large for a single frame is split and each half published on its own,
+     *  so an earlier half can already be durably queued (store-and-forward is
+     *  at-least-once) when a later half hits the cap. The error is then
+     *  delivery-unknown rather than known-not-delivered - check
+     *  `line_sender_error_in_doubt` before resending, or the rows the committed
+     *  prefix already carried are duplicated. */
+    line_sender_error_symbol_dict_full = 37,
 } line_sender_error_code;
 
 /**
@@ -283,6 +336,7 @@ typedef line_sender_error_code questdb_error_code;
 #define questdb_error_arrow_export line_sender_error_arrow_export
 #define questdb_error_batch_too_large line_sender_error_batch_too_large
 #define questdb_error_store_resend_required line_sender_error_store_resend_required
+#define questdb_error_symbol_dict_full line_sender_error_symbol_dict_full
 
 /** The protocol used to connect with. */
 typedef enum line_sender_protocol
@@ -810,6 +864,19 @@ bool line_sender_buffer_table(
 /**
  * Record a symbol value for the given column.
  * Make sure you record all the symbol columns before any other column type.
+ *
+ * When the buffer is flushed over QWP/WebSocket — `qwp_sender_flush_buffer*` on
+ * a pooled sender, or `line_sender_flush*` on a `line_sender` opened against a
+ * `ws://` / `wss://` address — every distinct symbol recorded here is interned
+ * into the *same* connection-scoped dictionary the chunk API uses: capped at
+ * 2,000,000 entries and 256 MiB of UTF-8 across the whole connection, not per
+ * buffer or per flush. Exceeding it fails the flush with
+ * `line_sender_error_symbol_dict_full`; that code's own documentation lists what
+ * each sender flavour must call to retire the connection — including this one,
+ * whose remedy is `line_sender_qwpws_close_drain` then `line_sender_close`, in
+ * that order, because `line_sender_close` alone drains nothing. See also the
+ * symbol-column preamble in `qwp_sender.h`. ILP (TCP/HTTP) and QWP/UDP flushes
+ * carry no such dictionary and are unaffected.
  *
  * @param[in] buffer Line buffer object.
  * @param[in] name Column name.

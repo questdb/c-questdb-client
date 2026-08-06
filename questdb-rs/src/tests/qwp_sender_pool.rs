@@ -3663,10 +3663,10 @@ fn store_and_forward_file_mode_writes_symbols_ahead_to_side_file() {
     append_one_symbol_row(&mut second, b"bravo", &[2_i64]);
     sender.flush(&mut second).unwrap();
 
-    // The write-ahead persisted both symbols, in ascending id order, each in its
-    // own CRC-committed record. Assert format-agnostically (each record's payload
-    // carries the `[len]"symbol"` entry) that both are present and alpha precedes
-    // bravo, rather than hardcoding the framing/CRC bytes. The pool mints a
+    // The write-ahead persisted both symbols, in ascending id order, each frame's
+    // symbol in its own CRC-committed chunk. Assert format-agnostically (each chunk's
+    // entry region carries the `[len]"symbol"` entry) that both are present and alpha
+    // precedes bravo, rather than hardcoding the framing/CRC bytes. The pool mints a
     // managed slot per borrowed sender, so the first one lives under
     // `<sender_id>-ingest-0`, not the bare `sender_id`.
     let side_file = dir.path().join("recov-ingest-0").join(".symbol-dict");
@@ -3682,6 +3682,282 @@ fn store_and_forward_file_mode_writes_symbols_ahead_to_side_file() {
     assert!(
         alpha_pos < bravo_pos,
         "write-ahead must persist both symbols in id order"
+    );
+    // Ordering alone stays green if the writer coalesced both frames into one
+    // chunk or split each symbol into its own. Pin the framing itself: two
+    // flushes are two frames, hence exactly two chunks of one symbol each. This
+    // is the end-to-end half of the one-chunk-per-frame invariant that makes the
+    // per-chunk CRC's blast radius safe (see `qwp_ws_sfa_symbol_dict`'s module
+    // docs); `each_append_is_exactly_one_chunk` pins the writer half.
+    assert_eq!(
+        crate::ingress::sender::qwp_ws_sfa_symbol_dict::parse_chunks(&side_file),
+        vec![vec![b"alpha".to_vec()], vec![b"bravo".to_vec()]],
+        "one chunk per frame, each carrying exactly that frame's new symbols"
+    );
+}
+
+#[test]
+fn store_and_forward_symbol_dict_full_rolls_back_and_keeps_flushing() {
+    // Everything `SymbolDictFull`'s docs promise about the FLUSH path was
+    // untested: coverage stopped at `SymbolGlobalDict::intern`, because the cap
+    // is only reachable through a real sender after a million distinct symbols.
+    // `TestDictCapGuard` shrinks it to one for this thread, which makes all four
+    // claims assertable at last -- the code survives the publish stack, the
+    // write-ahead rolls back, nothing is queued for the rejected frame, and
+    // already-interned symbols keep flushing.
+    let _cap = crate::ingress::TestDictCapGuard::new(1);
+    let (server, _release, _frames) = MockServer::spawn_ack_when_released_capturing(1);
+    let dir = TempDir::new().unwrap();
+    let conf = conf_for_endpoints(
+        &[server.port()],
+        &sf_disk_extras(&dir, "pool_reap=manual;sender_id=dictfull;"),
+    );
+    let db = QuestDb::connect(&conf).unwrap();
+    let mut sender = db.borrow_sender().unwrap();
+    let side_file = dir.path().join("dictfull-ingest-0").join(".symbol-dict");
+
+    // Frame 1 interns "alpha" and fills the one-entry dictionary.
+    let mut first = Chunk::new("trades");
+    append_one_symbol_row(&mut first, b"alpha", &[1_i64]);
+    sender.flush(&mut first).unwrap();
+    let after_alpha = std::fs::metadata(&side_file).unwrap().len();
+
+    // Frame 2 introduces a second distinct symbol. The cap rejects it, and the
+    // code must reach the caller intact rather than being remapped on the way out
+    // -- the whole reason the code was appended.
+    let mut second = Chunk::new("trades");
+    append_one_symbol_row(&mut second, b"bravo", &[2_i64]);
+    let err = sender.flush(&mut second).unwrap_err();
+    assert_eq!(err.code(), ErrorCode::SymbolDictFull, "{}", err.msg());
+    assert_eq!(
+        std::fs::metadata(&side_file).unwrap().len(),
+        after_alpha,
+        "the rejected frame's write-ahead must roll back in lockstep -- no \
+         `bravo` chunk may survive on disk"
+    );
+    assert_eq!(
+        crate::ingress::sender::qwp_ws_sfa_symbol_dict::parse_chunks(&side_file),
+        vec![vec![b"alpha".to_vec()]],
+        "the side-file still holds exactly the accepted frame's symbol"
+    );
+
+    // The connection stays usable for symbols already in the dictionary.
+    let mut third = Chunk::new("trades");
+    append_one_symbol_row(&mut third, b"alpha", &[3_i64]);
+    sender
+        .flush(&mut third)
+        .expect("chunks referencing only already-interned symbols keep flushing");
+    assert_eq!(
+        crate::ingress::sender::qwp_ws_sfa_symbol_dict::parse_chunks(&side_file),
+        vec![vec![b"alpha".to_vec()]],
+        "a frame introducing no new symbol writes no chunk"
+    );
+}
+
+#[test]
+fn a_full_symbol_dict_latches_the_direct_connection_so_reborrow_replaces_it() {
+    // Regression (silent ingest stall). `reborrow_from_pool` is the direct
+    // sender's documented failover primitive and the first thing a caller reaches
+    // for after a flush error -- but its guard returns early on
+    // `in_flight() == 0 && !must_close() && !transport_dead()`, and a
+    // dictionary-full connection satisfies all three: nothing reached the wire,
+    // the buffer rolled back, the socket is healthy. Unlatched, the reborrow is a
+    // silent no-op that answers `Ok(())` while handing back the SAME full
+    // connection, so a caller following the documented recovery retries into the
+    // same wall forever with no error escalation and no data loss to show for it.
+    //
+    // `BatchTooLarge`'s split path already latches for exactly this reason; the
+    // asymmetry was the bug.
+    //
+    // Memory mode (no `sf_dir`) on purpose, matching the test below: with a slot
+    // configured the replacement re-seeds from the side-file and would legitimately
+    // still be full.
+    let _cap = crate::ingress::TestDictCapGuard::new(1);
+    let server = MockServer::spawn_acking(8);
+    let conf = conf_for_endpoints(&[server.port()], "pool_reap=manual;");
+    let db = QuestDb::connect(&conf).unwrap();
+
+    let mut sender = db.borrow_direct_column_sender().unwrap();
+    let mut first = Chunk::new("trades");
+    append_one_symbol_row(&mut first, b"alpha", &[1_i64]);
+    sender
+        .flush_and_wait(&mut first, AckLevel::Ok)
+        .expect("the first symbol fits the 1-entry cap");
+
+    let mut second = Chunk::new("trades");
+    append_one_symbol_row(&mut second, b"bravo", &[2_i64]);
+    assert_eq!(
+        sender.flush(&mut second).unwrap_err().code(),
+        ErrorCode::SymbolDictFull,
+        "the second distinct symbol must exhaust the cap"
+    );
+
+    // The whole point: the failover primitive must actually fail over. Unlatched
+    // this returns Ok having done nothing, and the flush below fails identically.
+    sender
+        .reborrow_from_pool()
+        .expect("reborrow must open a fresh connection, not no-op on the full one");
+
+    let mut third = Chunk::new("trades");
+    append_one_symbol_row(&mut third, b"bravo", &[3_i64]);
+    sender.flush_and_wait(&mut third, AckLevel::Ok).expect(
+        "the replacement connection carries an empty dictionary, so the symbol \
+         that exhausted the old one now interns cleanly",
+    );
+}
+
+#[test]
+fn a_full_symbol_dict_still_commits_the_direct_sender_deferred_tail_on_drop() {
+    // Regression (C1: silent data loss). `SymbolDictFull` marks the direct
+    // connection for retirement so `reborrow_from_pool` / the pool return swap it
+    // out (see the test above). It must do so WITHOUT stranding frames the caller
+    // already flushed deferred: those are on the wire, uncommitted, referencing
+    // already-interned symbols, and a symbol-less commit needs no new dictionary
+    // entry. Marking the connection `spent` (not hard `must_close`) keeps it
+    // drainable, so the drop-time best-effort commit still closes the tail with a
+    // commit boundary.
+    //
+    // Mutation check: reverting `latch_if_connection_is_spent` to
+    // `mark_must_close()` makes `commit_in_flight_on_drop` short-circuit on
+    // `must_close`, so the last frame the server sees is the still-deferred `B`
+    // (FLAG_DEFER_COMMIT set) rather than a commit boundary, and this fails.
+    const FLAG_DEFER_COMMIT: u8 = 0x01;
+    let _cap = crate::ingress::TestDictCapGuard::new(1);
+    // Ack-when-released, NOT ack-each-frame: the deferred frame B must stay
+    // in-flight (unacked) until the drop-time commit, which is what a real QWP
+    // server does -- it acks a frame only once it is committed, so a deferred
+    // frame is unacked until a boundary commits it, and `in_flight()` is exactly
+    // the set of uncommitted frames `commit_in_flight_on_drop` must close. The
+    // `spawn_acking_capturing` mock instead acks B the moment it reads it, and
+    // frame C's failed flush drains that premature ack (every `flush` starts with
+    // `try_drain_acks`), racing `in_flight()` to 0 before the assertion below and
+    // the drop -- flaky. Withholding the ack removes the race and models the
+    // server faithfully; we release just before the drop so its commit can ack.
+    let (server, release, frames) = MockServer::spawn_ack_when_released_capturing(8);
+    let conf = conf_for_endpoints(&[server.port()], "pool_reap=manual;");
+    let db = QuestDb::connect(&conf).unwrap();
+
+    let mut sender = db.borrow_direct_column_sender().unwrap();
+
+    // A: first flush is non-deferred and interns `alpha`, filling the 1-entry cap.
+    let mut a = Chunk::new("trades");
+    append_one_symbol_row(&mut a, b"alpha", &[1_i64]);
+    sender.flush(&mut a).unwrap();
+
+    // B: a second flush of the already-interned `alpha` is DEFERRED (published,
+    // uncommitted) -- this is the tail that must survive the dict-full retirement.
+    let mut b = Chunk::new("trades");
+    append_one_symbol_row(&mut b, b"alpha", &[2_i64]);
+    sender.flush(&mut b).unwrap();
+    assert!(
+        sender.in_flight() > 0,
+        "the deferred flush of an already-interned symbol must leave an \
+         uncommitted in-flight frame"
+    );
+
+    // C: introduces a NEW symbol, exhausts the cap, and marks the connection spent.
+    let mut c = Chunk::new("trades");
+    append_one_symbol_row(&mut c, b"bravo", &[3_i64]);
+    assert_eq!(
+        sender.flush(&mut c).unwrap_err().code(),
+        ErrorCode::SymbolDictFull,
+        "the new symbol must exhaust the cap"
+    );
+    assert!(
+        sender.must_close_for_test(),
+        "a full dictionary must retire the connection so a pool return / reborrow \
+         does not recycle it"
+    );
+    assert!(
+        sender.in_flight() > 0,
+        "B is still deferred: the rejected frame C reached no wire and must not \
+         have disturbed the in-flight tail"
+    );
+
+    // Let the server ack now, so the drop-time commit's `sync` (which waits for
+    // the commit frame's ack) completes promptly rather than blocking on the
+    // request timeout. Nothing on this thread drains acks between here and the
+    // drop, so `in_flight()` stays > 0 for `commit_in_flight_on_drop`'s guard.
+    release.store(true, Ordering::SeqCst);
+
+    // A plain drop (NOT drop_on_return) must commit the deferred tail, not discard
+    // it -- the connection is spent, but healthy and drainable.
+    drop(sender);
+
+    let mut captured = Vec::new();
+    while let Ok(frame) = frames.recv_timeout(Duration::from_millis(500)) {
+        captured.push(frame);
+    }
+    let last = captured
+        .last()
+        .expect("the server must have received the tail's commit boundary");
+    assert_eq!(
+        last[5] & FLAG_DEFER_COMMIT,
+        0,
+        "the spent connection must close its deferred tail with a commit boundary \
+         on drop, not leave B uncommitted"
+    );
+}
+
+#[test]
+fn a_full_symbol_dict_retires_the_row_connection_on_a_plain_return() {
+    // Regression (M1: the row / store-and-forward sender looped forever where the
+    // direct sender was fixed not to). A full connection dictionary now RETIRES
+    // the connection on return, consistent with the direct sender:
+    // `SfaBackend::latch_if_connection_is_spent` sets `drop_on_return` on
+    // `SymbolDictFull`, so a plain drop drains the queue and drops the connection
+    // instead of recycling its full dictionary. Before the fix, the LIFO free list
+    // handed the same full connection straight back and the next borrow failed
+    // identically -- an unbounded loop the naive caller could escape only with an
+    // explicit `drop_on_return()`.
+    //
+    // It is a retire-on-return, not a hard close: `drop_on_return` does not gate
+    // the foreground, so already-interned symbols keep flushing until the caller
+    // returns the sender -- the same contract the direct backend's `spent` state
+    // gives, and the same the `store_and_forward_symbol_dict_full_rolls_back_and_
+    // keeps_flushing` test pins.
+    //
+    // Memory mode (no `sf_dir`) on purpose: with a slot configured a retired
+    // connection's replacement re-seeds from the side-file and would legitimately
+    // still be full unless the slot drained first, which is the caveat
+    // `qwp_sender.h` documents separately (wait before returning).
+    //
+    // Mutation check: reverting `latch_if_connection_is_spent` to a no-op recycles
+    // the full connection, so the final flush fails `SymbolDictFull` and this test
+    // fails.
+    let _cap = crate::ingress::TestDictCapGuard::new(1);
+    let server = MockServer::spawn_acking(8);
+    let conf = conf_for_endpoints(&[server.port()], "pool_reap=manual;");
+    let db = QuestDb::connect(&conf).unwrap();
+
+    let mut sender = db.borrow_sender().unwrap();
+    let mut first = Chunk::new("trades");
+    append_one_symbol_row(&mut first, b"alpha", &[1_i64]);
+    sender.flush(&mut first).unwrap();
+    let mut second = Chunk::new("trades");
+    append_one_symbol_row(&mut second, b"bravo", &[2_i64]);
+    assert_eq!(
+        sender.flush(&mut second).unwrap_err().code(),
+        ErrorCode::SymbolDictFull
+    );
+    // The mark retires on return; it does not close the connection out from under
+    // the caller, so an already-interned symbol still flushes.
+    let mut again = Chunk::new("trades");
+    append_one_symbol_row(&mut again, b"alpha", &[3_i64]);
+    sender
+        .flush(&mut again)
+        .expect("a full dictionary keeps flushing already-interned symbols");
+
+    drop(sender); // a plain drop IS the pool return -- and now it retires.
+
+    let mut fresh = db.borrow_sender().unwrap();
+    let mut retry = Chunk::new("trades");
+    append_one_symbol_row(&mut retry, b"bravo", &[4_i64]);
+    fresh.flush(&mut retry).expect(
+        "the full dictionary retired the connection on the plain return, so the \
+         next borrow carries a fresh dictionary and the symbol that exhausted the \
+         old one now interns cleanly -- no unbounded recycle loop, and no need for \
+         an explicit drop_on_return()",
     );
 }
 
@@ -3750,12 +4026,322 @@ fn store_and_forward_file_mode_recovers_and_replays_queued_frame_after_reopen() 
 }
 
 #[test]
+fn store_and_forward_file_mode_recovery_fails_when_the_recovered_dict_exceeds_the_cap() {
+    // `SymbolGlobalDict::seed` re-interns every recovered entry, so the
+    // connection's entry cap applies to RECOVERY, not just ingestion: a slot whose
+    // side-file holds more symbols than this client will hold cannot be reopened.
+    // The region is not corrupt -- it is well-formed and was written by a client
+    // whose cap was higher -- so the failure is `SymbolDictFull`, not one of
+    // `seed`'s `StoreResendRequired` corruption codes.
+    //
+    // Foreground recovery must FAIL here rather than degrade to dense, because it
+    // has a producer. `seed` gives up part-way (see
+    // `symbol_dict_seed_fills_to_the_cap_and_rejects_the_entry_past_it`), so
+    // continuing would let the next interned symbol take an id the stored frames
+    // already reference; and degrading would disarm the driver's catch-up mirror,
+    // replaying and COMMITTING the slot's `delta_start == 0` frame before the
+    // guard rejected the next -- `StoreResendRequired` on top of a committed
+    // prefix, which a compliant resend duplicates. Failing at construction happens
+    // before anything connects, so the slot stays intact on disk for a client that
+    // can hold it. `qwp_ws_orphan_drain_arms_an_empty_mirror_when_the_recovered_
+    // dict_exceeds_the_cap` pins the opposite (correct) choice on the replay-only
+    // path: discard the rejected entries, arm the mirror empty, and let the drain
+    // bootstrap from the stored frames.
+    let dir = TempDir::new().unwrap();
+
+    // Phase 1: at the full cap, queue two frames interning two distinct symbols
+    // against a peer that never acks, so a 2-entry side-file and its unresolved
+    // segments survive the drop.
+    {
+        let dead = MockServer::spawn_upgrade_then_close(1);
+        let conf = conf_for_endpoints(
+            &[dead.port()],
+            &sf_disk_extras(&dir, "pool_reap=manual;sender_id=capped;"),
+        );
+        let db = QuestDb::connect(&conf).unwrap();
+        let mut sender = db.borrow_sender().unwrap();
+        for (symbol, values) in [
+            (b"alpha".as_slice(), [1_i64]),
+            (b"bravo".as_slice(), [2_i64]),
+        ] {
+            let mut chunk = Chunk::new("trades");
+            append_one_symbol_row(&mut chunk, symbol, &values);
+            sender.flush(&mut chunk).unwrap();
+        }
+        drop(sender);
+        drop(db);
+    }
+
+    let slot_dir = dir.path().join("capped-ingest-0");
+    let side_file = slot_dir.join(".symbol-dict");
+    assert_eq!(
+        crate::ingress::sender::qwp_ws_sfa_symbol_dict::parse_chunks(&side_file),
+        vec![vec![b"alpha".to_vec()], vec![b"bravo".to_vec()]],
+        "phase 1 must leave a well-formed TWO-entry side-file -- this test is \
+         about a dictionary that is too big, not a torn one"
+    );
+    let sfa_files_before = std::fs::read_dir(&slot_dir).unwrap().count();
+
+    // Phase 2: the same slot reopened by a client capped at one entry. Recovery
+    // seeds `alpha` and is refused on `bravo`.
+    let _cap = crate::ingress::TestDictCapGuard::new(1);
+    let live = MockServer::spawn_acking(4);
+    let conf = conf_for_endpoints(
+        &[live.port()],
+        &sf_disk_extras(&dir, "pool_reap=manual;sender_id=capped;"),
+    );
+    let db = QuestDb::connect(&conf).unwrap();
+    let err = db
+        .borrow_sender()
+        .expect_err("a recovered dictionary larger than the cap cannot be seeded");
+    assert_eq!(err.code(), ErrorCode::SymbolDictFull, "{}", err.msg());
+
+    // The whole point of failing at construction: the data is still there. A
+    // client with a big-enough cap can still open this slot and drain it.
+    assert_eq!(
+        crate::ingress::sender::qwp_ws_sfa_symbol_dict::parse_chunks(&side_file),
+        vec![vec![b"alpha".to_vec()], vec![b"bravo".to_vec()]],
+        "a rejected recovery must not truncate the side-file it could not hold"
+    );
+    assert_eq!(
+        std::fs::read_dir(&slot_dir).unwrap().count(),
+        sfa_files_before,
+        "a rejected recovery must leave the queued segments on disk"
+    );
+}
+
+#[test]
+fn store_and_forward_file_mode_replays_both_frames_when_the_first_dict_chunk_is_corrupt() {
+    // Regression (data loss + duplication). A slot whose `.symbol-dict` loses its
+    // FIRST chunk to a host-crash tear recovers ZERO entries, which looks like the
+    // absent / bad-magic side-file case and invites the same dense fallback. It is
+    // not the same case, and the difference is paid in delivered rows.
+    //
+    // Dense disarms the driver's catch-up mirror (both hang off
+    // `delta_dict_enabled`), and `guard_dict_not_torn` then rejects every
+    // `delta_start > 0` frame outright -- but only AFTER the slot's
+    // `delta_start == 0` frame has replayed and COMMITTED on the server. The caller
+    // gets `StoreResendRequired` / `in_doubt == false` ("re-ingest from source")
+    // sitting on top of that committed prefix, so a compliant resend duplicates the
+    // rows it already delivered.
+    //
+    // Armed on the empty dictionary the queue bootstraps itself instead: frame 1
+    // (`delta_start == 0`) passes the guard, `SentDictMirror::accumulate` folds its
+    // own delta section into the mirror, and frame 2 (`delta_start == 1`) resolves
+    // against that. Both replay. `recovered_slot_whose_first_chunk_is_corrupt_keeps_
+    // delta_armed` pins the queue-level state; this is the half that proves the data
+    // actually arrives.
+    //
+    // Per-chunk framing is what makes the tear reachable from a single flipped byte
+    // -- a chunk is one whole frame's new symbols -- so this case only arises with
+    // this on-disk format.
+    let dir = TempDir::new().unwrap();
+
+    // Phase 1: two frames, each introducing a distinct symbol, so the second bases
+    // at `delta_start == 1`. The peer holds its acks, so both stay in the slot.
+    {
+        let (server, _release, _frames) = MockServer::spawn_ack_when_released_capturing(1);
+        let conf = conf_for_endpoints(
+            &[server.port()],
+            &sf_disk_extras(&dir, "pool_reap=manual;sender_id=recov;"),
+        );
+        let db = QuestDb::connect(&conf).unwrap();
+        let mut sender = db.borrow_sender().unwrap();
+        let mut first = Chunk::new("trades");
+        append_one_symbol_row(&mut first, b"alpha", &[1_i64]);
+        sender.flush(&mut first).unwrap();
+        let mut second = Chunk::new("trades");
+        append_one_symbol_row(&mut second, b"bravo", &[2_i64]);
+        sender.flush(&mut second).unwrap();
+        drop(sender);
+        drop(db);
+    }
+
+    // A host/power crash tears chunk 0: a same-length value flip, so only its stored
+    // CRC goes stale. The reader stops there and truncates, recovering nothing --
+    // while both queued segments still reference symbol ids 0 and 1.
+    let slot_dir = dir.path().join("recov-ingest-0");
+    let side_file = slot_dir.join(".symbol-dict");
+    {
+        let mut bytes =
+            std::fs::read(&side_file).expect("phase 1 must have written a delta-mode side-file");
+        let idx = bytes
+            .windows(5)
+            .position(|w| w == b"alpha")
+            .expect("alpha payload present");
+        bytes[idx] = b'X'; // same length ("Xlpha"), different value
+        std::fs::write(&side_file, &bytes).unwrap();
+    }
+
+    // Phase 2: a fresh acking peer over the SAME slot dir and sender_id.
+    let (live, frames) = MockServer::spawn_acking_capturing(4);
+    let conf = conf_for_endpoints(
+        &[live.port()],
+        &sf_disk_extras(&dir, "pool_reap=manual;sender_id=recov;"),
+    );
+    let db = QuestDb::connect(&conf).unwrap();
+    let mut sender = db.borrow_sender().unwrap();
+
+    // Collect replayed DATA frames (table_count >= 1 at bytes 6..8); a table-less
+    // catch-up frame carries table_count == 0. With the dense fallback exactly ONE
+    // arrives and the store goes terminal on the second.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut data_frames: Vec<Vec<u8>> = Vec::new();
+    while Instant::now() < deadline && data_frames.len() < 2 {
+        data_frames.extend(frames.try_iter().filter(|f| {
+            f.len() >= 12 && &f[..4] == b"QWP1" && u16::from_le_bytes([f[6], f[7]]) >= 1
+        }));
+        thread::sleep(Duration::from_millis(50));
+    }
+    assert_eq!(
+        data_frames.len(),
+        2,
+        "both queued frames must replay. One means the slot fell back to dense and \
+         stranded the `delta_start == 1` frame behind an already-committed prefix, \
+         so the caller's `StoreResendRequired` would duplicate the rows frame 1 \
+         delivered"
+    );
+
+    // A count alone would not say WHICH frames arrived, and the duplication this
+    // regression causes is precisely a second delivery of frame 1 -- two copies of
+    // the `delta_start == 0` frame satisfy "two data frames" while the frame this
+    // test exists for never left the slot. Pin the two distinct deltas the slot
+    // holds: frame 1 self-sufficient at id 0, and frame 2 basing at id 1 on the
+    // mirror frame 1 bootstrapped -- the resolution the dense fallback breaks.
+    assert_eq!(
+        parse_delta_dict_prefix(&data_frames[0]),
+        (0, vec![b"alpha".to_vec()]),
+        "frame 1 replays its own delta section, seeding the mirror from id 0"
+    );
+    assert_eq!(
+        parse_delta_dict_prefix(&data_frames[1]),
+        (1, vec![b"bravo".to_vec()]),
+        "frame 2 is the mid-stream delta the empty recovered dictionary must not \
+         strand: it bases at id 1 and ships only its own new symbol"
+    );
+
+    // Phase 3: the rebuild is only half the job. It leaves the producer at id 2
+    // while the side-file (truncated back to its header by the torn chunk) is at
+    // 0, and NOTHING above this line notices -- every assertion so far passes with
+    // `rebuild_recovered_dict_from_frames` deleted outright.
+    //
+    // Flush a symbol the recovered dictionary does not hold, and the skew becomes
+    // visible on disk: the write-ahead must re-persist the frame-derived ids 0 and
+    // 1 alongside the new id 2, because it anchors to the SIDE-FILE's tip. If it
+    // anchored to the producer's id instead, `chuck` (id 2) would land at file
+    // position 0 and the file would read back as a one-entry dictionary mapping id
+    // 0 -> chuck. The next recovery of this slot then either refuses to open it at
+    // all (duplicate entry in the rebuilt region -- queued frames stranded for
+    // good) or, via the orphan drainer, registers that wrong map on the server.
+    let mut third = Chunk::new("trades");
+    append_one_symbol_row(&mut third, b"chuck", &[3_i64]);
+    sender.flush(&mut third).unwrap();
+
+    assert_eq!(
+        crate::ingress::sender::qwp_ws_sfa_symbol_dict::parse_chunks(&side_file),
+        vec![
+            vec![b"alpha".to_vec(), b"bravo".to_vec()],
+            vec![b"chuck".to_vec()],
+        ],
+        "the first write-ahead after a frame-derived rebuild must heal the file: \
+         entry i is symbol id i again. TWO chunks, and the split is the point -- \
+         the backfill of frame-derived ids [0, 2) is written separately from this \
+         frame's own id 2, so this frame's `delta_start` (2) still falls on a chunk \
+         boundary. Fused into one chunk, a tear anywhere in it would cost every id \
+         back to the file's tip instead of only the ids at or above the tear, which \
+         is exactly the blast-radius guarantee the per-chunk CRC format is \
+         justified by (see the `qwp_ws_sfa_symbol_dict` module docs)"
+    );
+
+    // The framing changed; the dense `id == position` map did not. That is the
+    // property recovery actually reads, so pin it independently of the chunking.
+    let reopened =
+        crate::ingress::sender::qwp_ws_sfa_symbol_dict::PersistedSymbolDict::open_recovered(
+            &slot_dir,
+        )
+        .unwrap()
+        .expect("the healed side-file must reopen");
+    assert_eq!(
+        reopened.read_loaded_symbols(),
+        vec![b"alpha".to_vec(), b"bravo".to_vec(), b"chuck".to_vec()],
+        "entry i is symbol id i, across the chunk boundary"
+    );
+    assert_eq!(reopened.size(), 3);
+}
+
+#[test]
+fn store_and_forward_file_mode_resumes_write_ahead_after_a_symbol_free_session() {
+    // Regression (self-perpetuating dense fallback). A session that queues frames
+    // but interns NO symbol leaves a valid, untorn, EMPTY side-file. Treating that
+    // `size() == 0` as corruption and falling back to dense is unrecoverable: the
+    // producer write-aheads only through the side-file handle the queue hands it,
+    // so dense means the file never grows, so every later open sees an empty file
+    // and re-decides dense -- for the life of the slot, since the side-file is
+    // only removed on a fully-drained close, which is exactly what a slot with
+    // undelivered frames never gets.
+    //
+    // Meanwhile dense re-ships `[0, highest_referenced + 1)` in every frame, so
+    // once that prefix alone exceeds the per-frame cap the flush fails
+    // `BatchTooLarge` on a SINGLE row -- nothing left for the split to halve --
+    // and no new symbol can ever be interned on the slot again.
+    //
+    // `recovered_slot_whose_side_file_is_legitimately_empty_keeps_delta_armed`
+    // pins the queue-level decision; this pins the consequence that matters, that
+    // the next session's symbols really are persisted again.
+    let dir = TempDir::new().unwrap();
+    let side_file = dir.path().join("recov-ingest-0").join(".symbol-dict");
+
+    // Phase 1: one frame with no symbol column, left unresolved (the peer holds
+    // its acks, so the slot is not drained and its side-file is not removed).
+    {
+        let (server, _release, _frames) = MockServer::spawn_ack_when_released_capturing(1);
+        let conf = conf_for_endpoints(
+            &[server.port()],
+            &sf_disk_extras(&dir, "pool_reap=manual;sender_id=recov;"),
+        );
+        let db = QuestDb::connect(&conf).unwrap();
+        let mut sender = db.borrow_sender().unwrap();
+        let mut plain = Chunk::new("trades");
+        plain.column_i64("value", &[1_i64], None).unwrap();
+        plain.at_nanos(&[1_i64]).unwrap();
+        sender.flush(&mut plain).unwrap();
+        drop(sender);
+        drop(db);
+    }
+    assert!(
+        crate::ingress::sender::qwp_ws_sfa_symbol_dict::parse_chunks(&side_file).is_empty(),
+        "a symbol-free session leaves a valid but empty side-file"
+    );
+
+    // Phase 2: reopen the SAME slot and flush a frame that does intern a symbol.
+    // The write-ahead must persist it -- proof the producer still holds the
+    // side-file handle rather than having been demoted to dense.
+    let (server, _release, _frames) = MockServer::spawn_ack_when_released_capturing(1);
+    let conf = conf_for_endpoints(
+        &[server.port()],
+        &sf_disk_extras(&dir, "pool_reap=manual;sender_id=recov;"),
+    );
+    let db = QuestDb::connect(&conf).unwrap();
+    let mut sender = db.borrow_sender().unwrap();
+    let mut symbolic = Chunk::new("trades");
+    append_one_symbol_row(&mut symbolic, b"alpha", &[2_i64]);
+    sender.flush(&mut symbolic).unwrap();
+
+    assert_eq!(
+        crate::ingress::sender::qwp_ws_sfa_symbol_dict::parse_chunks(&side_file),
+        vec![vec![b"alpha".to_vec()]],
+        "the recovered slot must resume write-ahead; an empty side-file here means \
+         it fell back to dense and can never climb out"
+    );
+}
+
+#[test]
 fn store_and_forward_file_mode_value_corruption_is_healed_and_segment_kept() {
     // Issue-4 end-to-end: a same-length VALUE corruption in the persisted
     // `.symbol-dict` -- a host/power-crash bit-flip that keeps an entry's length
-    // but changes a symbol byte -- must be caught by the per-entry CRC on
+    // but changes a symbol byte -- must be caught by the per-chunk CRC on
     // recovery and NOT silently recovered as the wrong symbol. The CRC-failed
-    // entry is dropped (healed) at open, so the corrupt symbol never reaches the
+    // chunk is dropped (healed) at open, so the corrupt symbol never reaches the
     // dictionary, and the queued segment stays on disk (recoverable). (A recovered
     // mid-stream delta that DEPENDS on a dropped id then fails loudly at the send
     // loop's torn-dict guard -- `StoreResendRequired` -- covered by the driver- and
@@ -3802,7 +4388,7 @@ fn store_and_forward_file_mode_value_corruption_is_healed_and_segment_kept() {
     let recovered = PersistedSymbolDict::open(&slot_dir).unwrap();
     assert!(
         recovered.read_loaded_symbols().is_empty(),
-        "a CRC-failed record must be dropped on recovery, never recovered as the \
+        "a CRC-failed chunk must be dropped on recovery, never recovered as the \
          corrupted symbol; got {:?}",
         recovered.read_loaded_symbols()
     );
@@ -6320,9 +6906,12 @@ fn store_and_forward_file_mode_arrow_symbol_writes_symbols_ahead_to_side_file() 
         .expect("Arrow SFA symbol flush should publish")
         .expect("non-empty Arrow batch publishes a frame");
 
-    // The Arrow write-ahead persisted both symbols, in ascending id order, each in
-    // its own CRC-committed record, exactly as the chunk path does. Assert
-    // format-agnostically (each record's payload carries the `[len]"symbol"` entry)
+    // The Arrow write-ahead persisted both symbols in ascending id order. A batch
+    // is ONE frame, and a frame's new symbols are persisted in a single append, so
+    // both share one CRC-committed side-file chunk -- unlike the row (`Chunk`)
+    // path in `store_and_forward_file_mode_writes_symbols_ahead_to_side_file`,
+    // whose two separate flushes are two frames and therefore two chunks. Assert
+    // format-agnostically (the entry region carries each `[len]"symbol"` entry)
     // that both are present and alpha precedes bravo, rather than hardcoding the
     // framing/CRC bytes. The pool mints a kind-scoped slot per borrowed column
     // sender, so the first one lives under `<sender_id>-ingest-0`, not the bare
@@ -6341,6 +6930,16 @@ fn store_and_forward_file_mode_arrow_symbol_writes_symbols_ahead_to_side_file() 
     assert!(
         alpha_pos < bravo_pos,
         "Arrow write-ahead must persist both symbols in id order"
+    );
+    // Pin the framing the comment above claims, which ordering alone cannot: ONE
+    // chunk carrying BOTH symbols, versus the row path's two. This is the shape
+    // that makes the per-chunk CRC's coarser blast radius safe -- the chunk is
+    // exactly this frame's symbol delta, so a tear in it invalidates exactly this
+    // frame (see `qwp_ws_sfa_symbol_dict`'s module docs).
+    assert_eq!(
+        crate::ingress::sender::qwp_ws_sfa_symbol_dict::parse_chunks(&side_file),
+        vec![vec![b"alpha".to_vec(), b"bravo".to_vec()]],
+        "an Arrow batch is one frame, so its new symbols share one chunk"
     );
 }
 

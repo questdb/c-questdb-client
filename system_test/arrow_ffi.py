@@ -107,8 +107,9 @@ NEXT_ARROW_BATCH_ERROR = 2
 
 
 class ClientErrorCode:
-    """`questdb_error_code` discriminants. Pinned in
-    `questdb-rs-ffi/src/lib.rs::line_sender_error_code_discriminants_are_abi_stable`."""
+    """`questdb_error_code` discriminants. Pinned against the Rust enum by
+    `questdb-rs-ffi/src/lib.rs::mirrors_of_the_c_error_code_enum_are_complete`,
+    which fails if a code is added there without being added here."""
     COULD_NOT_RESOLVE_ADDR = 0
     INVALID_API_CALL = 1
     SOCKET_ERROR = 2
@@ -146,6 +147,7 @@ class ClientErrorCode:
     ARROW_EXPORT = 34
     BATCH_TOO_LARGE = 35
     STORE_RESEND_REQUIRED = 36
+    SYMBOL_DICT_FULL = 37
 
 
 def _setsig(name, restype, *argtypes):

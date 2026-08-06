@@ -100,6 +100,7 @@ enum class error_code : int
     arrow_export = ::line_sender_error_arrow_export,
     batch_too_large = ::line_sender_error_batch_too_large,
     store_resend_required = ::line_sender_error_store_resend_required,
+    symbol_dict_full = ::line_sender_error_symbol_dict_full,
 };
 
 // Bridge equality between the C++ `questdb::error_code` and the released C ABI

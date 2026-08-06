@@ -94,6 +94,20 @@ TEST(test_appended_sender_error_codes_exist)
           "sender error codes distinct");
 }
 
+TEST(test_symbol_dict_full_is_a_distinct_appended_code)
+{
+    /* A full connection symbol dictionary must be recognisable by code, not by
+     * message text -- that is the whole reason it is not invalid_api_call. */
+    CHECK(line_sender_error_symbol_dict_full !=
+              line_sender_error_invalid_api_call,
+          "symbol_dict_full distinct from invalid_api_call");
+    CHECK(line_sender_error_symbol_dict_full >
+              line_sender_error_store_resend_required,
+          "symbol_dict_full appended (not renumbered)");
+    CHECK(questdb_error_symbol_dict_full == line_sender_error_symbol_dict_full,
+          "neutral alias resolves to the same enumerator");
+}
+
 TEST(test_egress_null_cursor_returns_error_tristate)
 {
     struct ArrowArray arr;
@@ -1463,6 +1477,7 @@ int main(void)
     RUN(test_tristate_egress_enum_values);
     RUN(test_appended_query_error_codes_have_distinct_values);
     RUN(test_appended_sender_error_codes_exist);
+    RUN(test_symbol_dict_full_is_a_distinct_appended_code);
     RUN(test_egress_null_cursor_returns_error_tristate);
     RUN(test_egress_null_out_array_returns_error_tristate);
     RUN(test_ingress_null_conn_returns_false);

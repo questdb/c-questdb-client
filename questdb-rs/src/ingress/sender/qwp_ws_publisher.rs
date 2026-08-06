@@ -87,9 +87,19 @@ impl QwpWsReplayEncoder {
         self.global_dict = SymbolGlobalDict::new();
     }
 
-    /// Appends the symbols `[from_id, next_id)` this frame introduced to the
-    /// persisted side-file. No-op in memory mode (no side-file).
-    fn persist_new_symbols(&mut self, from_id: u64) -> crate::Result<()> {
+    /// Appends the symbols the side-file is still missing -- `[pd.size(),
+    /// next_id)` -- to it. No-op in memory mode (no side-file).
+    ///
+    /// The start id comes from the SIDE-FILE's own tip rather than from the
+    /// producer's id before this frame. The two are normally equal, but not
+    /// after a recovery whose dictionary was rebuilt from the stored frames
+    /// (`SfaFrameQueue::rebuild_recovered_dict_from_frames`): the producer
+    /// resumes at `K'` while the file holds only its intact prefix `K < K'`.
+    /// Anchoring to the producer would write id `K'` at file position `K` and
+    /// permanently break the file's dense `id == position` invariant. See the
+    /// twin note on `SymbolPublishState::persist_new_symbols`, which also argues
+    /// why `frame_base_id` splits the write into two chunks rather than one.
+    fn persist_new_symbols(&mut self, frame_base_id: u64) -> crate::Result<()> {
         let Self {
             global_dict,
             persisted_symbol_dict,
@@ -98,21 +108,33 @@ impl QwpWsReplayEncoder {
         let Some(pd) = persisted_symbol_dict.as_mut() else {
             return Ok(());
         };
-        // Gather the frame's new symbols, then write them ahead in one batched
-        // write_all rather than one alloc + one write() syscall per symbol.
+        let file_tip = u64::from(pd.size());
+        let next_id = global_dict.next_id();
+        // Backfill first (empty on the steady state), then this frame's own
+        // symbols -- two appends, so this frame's `delta_start` stays on a chunk
+        // boundary. Clamped so a stray `frame_base_id` cannot reverse a range.
+        let split = frame_base_id.clamp(file_tip, next_id);
+        // Gather each run, then write it ahead in one batched write_all rather
+        // than one alloc + one write() syscall per symbol.
         let mut new_symbols: Vec<&[u8]> = Vec::new();
-        for id in from_id..global_dict.next_id() {
-            let bytes = global_dict.entry(id).ok_or_else(|| {
-                error::fmt!(
-                    SocketError,
-                    "internal: missing symbol id {} for persistence",
-                    id
-                )
-            })?;
-            new_symbols.push(bytes);
+        for (from, to) in [(file_tip, split), (split, next_id)] {
+            if from >= to {
+                continue;
+            }
+            new_symbols.clear();
+            for id in from..to {
+                let bytes = global_dict.entry(id).ok_or_else(|| {
+                    error::fmt!(
+                        SocketError,
+                        "internal: missing symbol id {} for persistence",
+                        id
+                    )
+                })?;
+                new_symbols.push(bytes);
+            }
+            pd.append_symbols(&new_symbols)
+                .map_err(|e| error::fmt!(SocketError, "could not persist symbols: {}", e))?;
         }
-        pd.append_symbols(&new_symbols)
-            .map_err(|e| error::fmt!(SocketError, "could not persist symbols: {}", e))?;
         Ok(())
     }
 
@@ -188,7 +210,9 @@ impl QwpWsReplayEncoder {
         max_buf_size: usize,
     ) -> crate::Result<(SymbolGlobalDictMark, Option<PersistedSymbolDictMark>)> {
         let global_dict_mark = self.global_dict.mark();
-        let dict_len_before = self.global_dict.next_id();
+        // This frame's `delta_start`: the boundary that keeps its symbols in a
+        // chunk of their own, distinct from the write-ahead anchor (the file tip).
+        let frame_base_id = self.global_dict.next_id();
         let pd_mark = self.persisted_symbol_dict.as_ref().map(|pd| pd.mark());
         if let Err(err) = self.encode_to_scratch(buffer) {
             self.rollback_frame(global_dict_mark, pd_mark);
@@ -199,7 +223,7 @@ impl QwpWsReplayEncoder {
             self.rollback_frame(global_dict_mark, pd_mark);
             return Err(qwp_ws_encoded_message_size_error(encoded_len, max_buf_size));
         }
-        if let Err(err) = self.persist_new_symbols(dict_len_before) {
+        if let Err(err) = self.persist_new_symbols(frame_base_id) {
             self.rollback_frame(global_dict_mark, pd_mark);
             return Err(err);
         }
@@ -310,6 +334,60 @@ mod tests {
         assert!(
             !encoder.delta_dict_enabled,
             "dropping the side-file must disable delta so frames go dense"
+        );
+    }
+
+    #[test]
+    fn file_mode_write_ahead_heals_a_side_file_short_of_the_seeded_dictionary() {
+        // The standalone row sender reaches the same frame-rebuilt recovery the
+        // pooled core does -- `connect_qwp_ws_background_state` seeds this encoder
+        // from `SfaFrameQueue::recovered_symbol_dict_entries` (which is the
+        // side-file's prefix EXTENDED by the surviving frames' own delta sections)
+        // and `connect_qwp_ws` then hands it the side-file handle, still at the
+        // shorter prefix. So this path needs the same write-ahead anchoring as
+        // `SymbolPublishState::persist_new_symbols`, and gets its own test because
+        // it is a separate implementation.
+        //
+        // Anchoring to the producer's pre-frame id would append `bravo` (id 1) at
+        // file position 0, aliasing id 0 onto it and losing `alpha` for good.
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let mut seed_file = PersistedSymbolDict::open(dir.path()).unwrap();
+            seed_file.append_symbol(b"alpha").unwrap();
+        }
+        let pd = PersistedSymbolDict::open(dir.path()).unwrap();
+        assert_eq!(pd.size(), 1, "the file holds the intact prefix only");
+
+        let mut encoder = QwpWsReplayEncoder::new(1);
+        encoder.set_delta_dict_enabled(true);
+        // Seeded with TWO ids -- the frame-derived rebuild recovered `bravo` from a
+        // surviving frame -- while the handle above is still at one.
+        encoder
+            .seed_global_dict(
+                &[
+                    5, b'a', b'l', b'p', b'h', b'a', 5, b'b', b'r', b'a', b'v', b'o',
+                ],
+                2,
+            )
+            .unwrap();
+        encoder.set_persisted_symbol_dict(Some(pd));
+
+        encoder
+            .encode_and_publish(&one_symbol_buffer("charlie"), usize::MAX, |_payload| Ok(1))
+            .unwrap();
+
+        let pd = encoder.persisted_symbol_dict.take().expect("handle kept");
+        assert_eq!(
+            pd.size(),
+            3,
+            "the write-ahead must re-persist the rebuilt id 1 alongside the new id 2"
+        );
+        drop(pd);
+        let reopened = PersistedSymbolDict::open(dir.path()).unwrap();
+        assert_eq!(
+            reopened.read_loaded_symbols(),
+            vec![b"alpha".to_vec(), b"bravo".to_vec(), b"charlie".to_vec()],
+            "entry i must be symbol id i"
         );
     }
 

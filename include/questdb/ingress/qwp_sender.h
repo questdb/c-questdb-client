@@ -745,12 +745,78 @@ bool qwp_chunk_column_binary(
  * only referenced dict entries against the connection-scoped global
  * symbol table, so `dict_offsets_len - 1` (the number of distinct
  * values — e.g. a wide Pandas `Categorical`) may greatly exceed the
- * referenced set without paying the cost for unused entries. The distinct
+ * referenced set: unused entries are never interned, so they cost nothing
+ * on the wire or against the connection dictionary. They are not free
+ * locally, though, and the cost tracks the *declared* length, not the
+ * referenced count — this call validates the whole declared dictionary's
+ * UTF-8, and each flush fills and scans roughly 9 bytes of scratch per
+ * declared entry, so declare no wider than you need. The distinct
  * entry count is capped at 8,388,608 (2^23) per column, rejected at this
  * append call; each entry's UTF-8 is capped at 1 MiB (1 << 20 bytes),
  * rejected at the next `qwp_sender_flush_chunk` (only referenced entries are
  * interned into the connection dictionary, which is where the length cap
  * applies). Either rejection returns `false` with `*err_out` set.
+ *
+ * Separately, the connection-scoped symbol dictionary — the distinct
+ * symbols actually *referenced* across every column and every chunk sent
+ * on one connection — is capped at 2,000,000 entries, matching the server's
+ * ingress ceiling (`MAX_SYMBOL_DICTIONARY_SIZE`), and at 256 MiB of UTF-8.
+ * The byte cap is client-side only — the server bounds the ingress dictionary
+ * by entry count alone; it keeps the writer in step with the egress reader and
+ * with the store-and-forward side-file's size limit. That cap is reached at
+ * `qwp_sender_flush_chunk*` / `qwp_direct_sender_flush`, not here, and is not
+ * per column: a wide dictionary consumes none of this budget until its entries
+ * are actually referenced. On
+ * hitting it the flush returns `false` with `*err_out` set to
+ * `line_sender_error_symbol_dict_full` — a distinct code, so you can branch on
+ * it without matching on the message text. Chunks referencing only
+ * already-interned symbols keep flushing; only a chunk that introduces a
+ * *new* symbol fails.
+ *
+ * The failing chunk is rejected before any byte reaches the wire, with one
+ * exception that matters for resends: a chunk too large for a single frame is
+ * split and each half published on its own, so an earlier half can already be
+ * durably queued (store-and-forward is at-least-once) when a later half hits
+ * the cap. The flush is then delivery-unknown rather than
+ * known-not-delivered — check `line_sender_error_in_doubt` before resending
+ * the chunk, or the rows the committed prefix already carried are duplicated.
+ *
+ * Resetting the dictionary means discarding the connection that owns it — there
+ * is no per-sender close. A full dictionary RETIRES the connection on return, so
+ * a plain `questdb_db_return_sender` drops it rather than recycling it (the next
+ * borrow gets a fresh, empty-dictionary connection, not the same full one) and
+ * drains / commits its pending frames best-effort on the way out. So the simplest
+ * recovery is to return the sender as usual and borrow a fresh one. Discarding the
+ * connection is NOT automatically lossless for frames already flushed on it, so if
+ * those must not be lost, drain or commit them AND check first:
+ *
+ *   - Pooled sender: a plain `questdb_db_return_sender` now retires (does NOT
+ *     recycle) a full-dictionary connection and drains its queue best-effort
+ *     within `close_flush_timeout`; the next borrow is fresh. Call
+ *     `qwp_sender_wait` first if the queued frames must not be lost. This matters
+ *     with `sf_dir` too: returning while frames are unresolved leaves them (and
+ *     the dictionary) in the slot, and the next borrower re-seeds from the slot's
+ *     side-file at the same size unless the slot drained first.
+ *   - Pooled direct sender: a plain `questdb_db_return_direct_sender` retires the
+ *     connection and commits the deferred tail best-effort. Its flushes are
+ *     deferred, so for a CHECKED guarantee call `qwp_direct_sender_commit` (or a
+ *     waited flush) and confirm it succeeded before the return. Do NOT use
+ *     `questdb_db_drop_direct_sender` on a full dictionary: it force-drops and
+ *     skips the best-effort commit that the normal return performs, so every frame
+ *     flushed since the last successful commit is discarded with only a log
+ *     warning.
+ *   - Standalone direct sender: `qwp_direct_sender_free` performs the same
+ *     best-effort commit the pooled return does, so the deferred tail is committed
+ *     on the way out; call `qwp_direct_sender_commit` first so the commit's success
+ *     is something you checked rather than hoped for. Then `qwp_direct_sender_free`,
+ *     then re-open with `qwp_direct_sender_from_conf` / `qwp_direct_sender_from_opts`.
+ *   - Standalone row sender (a `line_sender` opened on a `ws://` / `wss://`
+ *     address and flushed with `line_sender_flush*`, which shares this same
+ *     connection dictionary): `line_sender_qwpws_close_drain` and check it
+ *     succeeded, then `line_sender_close`, then re-open. Do NOT rely on
+ *     `line_sender_close` alone — it does not flush, and nothing drains the
+ *     QWP/WebSocket queue on the way out, so every published-but-unacked frame
+ *     is discarded with no wait. This is the most lossy flavour on a bare close.
  *
  * `codes[i]` must be in `0 .. dict_len` for non-null rows; null-row
  * codes are not inspected.
