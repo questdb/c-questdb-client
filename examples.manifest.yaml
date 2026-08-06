@@ -18,36 +18,36 @@
     [Rust client library docs](https://docs.rs/questdb-rs/latest/questdb/)
 
 # QWP/UDP examples
-- name: qwpudp
+- name: udp
   lang: c
-  path: examples/line_sender_c_example_qwpudp.c
+  path: examples/line_sender_c_example_udp.c
   header: |-
     [C client library docs](https://github.com/questdb/c-questdb-client/blob/main/doc/C.md)
   addr:
     host: localhost
     port: 9007
 
-- name: qwpudp
+- name: udp
   lang: cpp
-  path: examples/line_sender_cpp_example_qwpudp.cpp
+  path: examples/line_sender_cpp_example_udp.cpp
   header: |-
     [C++ client library docs](https://github.com/questdb/c-questdb-client/blob/main/doc/CPP.md)
   addr:
     host: localhost
     port: 9007
 
-- name: qwpudp-batch
+- name: udp-batch
   lang: c
-  path: examples/line_sender_c_example_qwpudp_batch.c
+  path: examples/line_sender_c_example_udp_batch.c
   header: |-
     [C client library docs](https://github.com/questdb/c-questdb-client/blob/main/doc/C.md)
   addr:
     host: localhost
     port: 9007
 
-- name: qwpudp-batch
+- name: udp-batch
   lang: cpp
-  path: examples/line_sender_cpp_example_qwpudp_batch.cpp
+  path: examples/line_sender_cpp_example_udp_batch.cpp
   header: |-
     [C++ client library docs](https://github.com/questdb/c-questdb-client/blob/main/doc/CPP.md)
   addr:

@@ -41,6 +41,7 @@ using ssize_t = std::intptr_t;
 #include <arpa/inet.h>
 #include <netinet/in.h>
 #include <sys/socket.h>
+#include <sys/time.h>
 #include <unistd.h>
 #include <netinet/tcp.h>
 #include <cerrno>
@@ -286,8 +287,14 @@ std::vector<uint8_t> server_info_frame(
     const std::string& node_id,
     uint64_t epoch,
     uint32_t capabilities,
-    int64_t server_wall_ns)
+    int64_t server_wall_ns,
+    const std::optional<std::string>& zone_id)
 {
+    const bool has_zone_capability = (capabilities & CAP_ZONE) != 0;
+    if (has_zone_capability != zone_id.has_value())
+        throw std::invalid_argument{
+            "SERVER_INFO zone_id presence must match CAP_ZONE"};
+
     std::vector<uint8_t> p;
     p.push_back(MSG_SERVER_INFO);
     p.push_back(role);
@@ -305,6 +312,13 @@ std::vector<uint8_t> server_info_frame(
     p.push_back(uint8_t(nl));
     p.push_back(uint8_t(nl >> 8));
     p.insert(p.end(), node_id.begin(), node_id.end());
+    if (has_zone_capability)
+    {
+        uint16_t zl = uint16_t(zone_id->size());
+        p.push_back(uint8_t(zl));
+        p.push_back(uint8_t(zl >> 8));
+        p.insert(p.end(), zone_id->begin(), zone_id->end());
+    }
     return framed(1, 0, 0, p);
 }
 
@@ -351,6 +365,18 @@ std::vector<uint8_t> cache_reset_frame(uint8_t mask)
 {
     std::vector<uint8_t> p = {MSG_CACHE_RESET, mask};
     return framed(1, 0, 0, p);
+}
+
+std::vector<uint8_t> ingress_ok_frame(uint64_t wire_seq)
+{
+    std::vector<uint8_t> p;
+    p.reserve(11);
+    p.push_back(0x00);
+    for (int i = 0; i < 8; ++i)
+        p.push_back(uint8_t((wire_seq >> (i * 8)) & 0xFF));
+    p.push_back(0x00);
+    p.push_back(0x00);
+    return p;
 }
 
 std::vector<uint8_t> result_batch_frame(
@@ -682,8 +708,8 @@ bool ws_handshake(socket_t fd, bool reject_401)
         return false;
     }
 
-    // Find Sec-WebSocket-Key (case-insensitive).
     std::string key;
+    int client_max_version = 2;
     {
         size_t p = 0;
         while (p < buf.size())
@@ -693,29 +719,41 @@ bool ws_handshake(socket_t fd, bool reject_401)
                 break;
             std::string line = buf.substr(p, eol - p);
             p = eol + 2;
-            // Lowercase the header name portion before the colon.
             size_t colon = line.find(':');
             if (colon == std::string::npos)
                 continue;
             std::string name = line.substr(0, colon);
             std::transform(name.begin(), name.end(), name.begin(),
                            [](char c) { return char(std::tolower(c)); });
+            std::string value = line.substr(colon + 1);
+            size_t vs = value.find_first_not_of(" \t");
+            size_t ve = value.find_last_not_of(" \t");
+            if (vs == std::string::npos)
+                value.clear();
+            else
+                value = value.substr(vs, ve - vs + 1);
             if (name == "sec-websocket-key")
             {
-                key = line.substr(colon + 1);
-                // Trim whitespace.
-                size_t s = key.find_first_not_of(" \t");
-                size_t e = key.find_last_not_of(" \t");
-                if (s == std::string::npos)
-                    key.clear();
-                else
-                    key = key.substr(s, e - s + 1);
-                break;
+                key = value;
+            }
+            else if (name == "x-qwp-max-version")
+            {
+                try
+                {
+                    client_max_version = std::stoi(value);
+                }
+                catch (...)
+                {
+                }
             }
         }
     }
     if (key.empty())
         return false;
+
+    int negotiated = client_max_version < 2 ? client_max_version : 2;
+    if (negotiated < 1)
+        negotiated = 1;
 
     std::string accept = compute_ws_accept(key);
     std::string resp =
@@ -812,6 +850,33 @@ void graceful_close(socket_t fd)
         sizeof(ws_close),
         QWP_MSG_NOSIGNAL);
     (void)::shutdown(fd, QWP_SHUT_WR);
+    // Windows: closesocket() with data still unread in the recv buffer aborts
+    // the connection with an RST (WSAECONNABORTED / os error 10053 on the
+    // client), discarding the just-sent Close / RESULT_END frames. Drain the
+    // recv side until the client's FIN (recv == 0) or a short timeout so the
+    // final close is orderly on every platform.
+#ifdef _WIN32
+    DWORD drain_timeout_ms = 500;
+    (void)::setsockopt(
+        fd, SOL_SOCKET, SO_RCVTIMEO,
+        reinterpret_cast<const char*>(&drain_timeout_ms),
+        sizeof(drain_timeout_ms));
+#else
+    struct timeval drain_timeout{};
+    drain_timeout.tv_usec = 500000;
+    (void)::setsockopt(
+        fd, SOL_SOCKET, SO_RCVTIMEO, &drain_timeout, sizeof(drain_timeout));
+#endif
+    char drain_buf[512];
+    while (::recv(fd, drain_buf,
+#ifdef _WIN32
+                  int(sizeof(drain_buf)),
+#else
+                  sizeof(drain_buf),
+#endif
+                  0) > 0)
+    {
+    }
     close_socket(fd);
 }
 
@@ -986,7 +1051,8 @@ struct MockServer::Impl
             {
                 auto frame = server_info_frame(
                     a->role, a->cluster_id, a->node_id,
-                    a->epoch, a->capabilities, a->server_wall_ns);
+                    a->epoch, a->capabilities, a->server_wall_ns,
+                    a->zone_id);
                 if (!ws_write_binary(fd, frame))
                 {
                     close_socket(fd);
@@ -1173,6 +1239,19 @@ std::string MockServer::addr() const
 int MockServer::accepts() const
 {
     return _impl->accept_count.load();
+}
+
+bool MockServer::wait_for_accepts(
+    int n, std::chrono::milliseconds timeout) const
+{
+    const auto deadline = std::chrono::steady_clock::now() + timeout;
+    while (_impl->accept_count.load() < n)
+    {
+        if (std::chrono::steady_clock::now() >= deadline)
+            return _impl->accept_count.load() >= n;
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    return true;
 }
 
 std::vector<std::vector<uint8_t>> MockServer::captured_requests() const

@@ -24,11 +24,11 @@
 
 //! Build a `rustls::ClientConfig` for the QWP WebSocket transport.
 //!
-//! Mirrors the ingress sender's TLS-config flow (`crate::ingress::tls`)
-//! but plugs into egress error types so callers see a consistent
-//! `egress::Error` surface. The vocabulary of root sources matches the
-//! ingress `CertificateAuthority` enum, which is re-exported from
-//! `crate::egress` for parity with the connect-string keys.
+//! Mirrors the ingress sender's TLS-config flow (`crate::ingress::tls`) and
+//! reports failures through the crate-wide [`Error`](crate::Error) surface.
+//! The vocabulary of root sources matches the ingress `CertificateAuthority`
+//! enum, which is re-exported from `crate::egress` for parity with the
+//! connect-string keys.
 
 use std::fs::File;
 use std::path::Path;
@@ -41,7 +41,7 @@ use rustls_pki_types::pem::PemObject;
 use crate::egress::config::ReaderConfig;
 #[cfg(feature = "insecure-skip-verify")]
 use crate::egress::config::TlsVerify;
-use crate::egress::error::{Result, fmt};
+use crate::error::{Result, fmt};
 use crate::ingress::CertificateAuthority;
 
 #[cfg(feature = "insecure-skip-verify")]
@@ -265,7 +265,7 @@ pub(crate) fn build_client_config(
 mod tests {
     use super::*;
     use crate::egress::config::ReaderConfig;
-    use crate::egress::error::ErrorCode;
+    use crate::error::ErrorCode;
     use std::io::Write;
 
     fn config_with_roots(path: &str) -> ReaderConfig {

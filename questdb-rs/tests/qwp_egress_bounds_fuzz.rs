@@ -42,7 +42,7 @@
 //! Wire layout mirrored from the encoder side in `benches/decoder.rs` so
 //! the synthesised payload decodes cleanly before the fuzz loop starts.
 
-#![cfg(feature = "sync-reader-ws")]
+#![cfg(feature = "sync-reader-qwp-ws")]
 
 use proptest::prelude::*;
 
@@ -318,9 +318,12 @@ fn write_geohash(out: &mut Vec<u8>, rng: &mut SplitMix64, row_count: usize) {
 
 fn write_decimal(out: &mut Vec<u8>, rng: &mut SplitMix64, row_count: usize, elem_size: usize) {
     let non_null = write_validity(out, rng, row_count);
-    // Decimal scale must be in `0..=MAX_DECIMAL_SCALE` (38 per
-    // `egress::binds::MAX_DECIMAL_SCALE`). Stay well inside.
-    let scale: u8 = (rng.next_u64() % 20) as u8;
+    let max_scale: u64 = match elem_size {
+        8 => 18,
+        16 => 38,
+        _ => 38,
+    };
+    let scale: u8 = (rng.next_u64() % (max_scale + 1)) as u8;
     out.push(scale);
     write_random_bytes(out, rng, non_null * elem_size);
 }

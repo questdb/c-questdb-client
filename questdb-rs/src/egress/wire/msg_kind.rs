@@ -26,7 +26,7 @@
 //!
 //! ABI-stable: variants append-only, never reorder.
 
-use crate::egress::error::{Result, fmt};
+use crate::error::{Result, fmt};
 
 /// Message kind code (uint8). `repr(u8)` keeps wire transcoding trivial.
 ///

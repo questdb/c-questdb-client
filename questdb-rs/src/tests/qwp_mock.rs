@@ -46,7 +46,7 @@ impl QwpUdpMock {
     }
 
     pub fn sender_builder(&self) -> SenderBuilder {
-        SenderBuilder::new(Protocol::QwpUdp, self.host, self.port)
+        SenderBuilder::new(Protocol::Udp, self.host, self.port)
     }
 
     pub fn recv_datagram(&self) -> io::Result<Vec<u8>> {

@@ -37,12 +37,26 @@ pub(crate) use self::ilp::Buffer as IlpBuffer;
 #[allow(unused_imports)]
 pub(crate) use self::ilp::F64Serializer;
 
+#[cfg(all(feature = "_sender-qwp-ws", feature = "arrow-ingress"))]
+pub(crate) use self::qwp::QWP_DECIMAL_MAX_SCALE;
 #[cfg(any(feature = "_sender-qwp-udp", feature = "_sender-qwp-ws"))]
 pub(crate) use self::qwp::QwpBuffer;
 #[cfg(feature = "_sender-qwp-udp")]
 pub(crate) use self::qwp::QwpSendScratch;
 #[cfg(feature = "_sender-qwp-ws")]
-pub(crate) use self::qwp::{QwpWsColumnarBuffer, QwpWsEncodeScratch, SymbolGlobalDict};
+pub(crate) use self::qwp::{
+    MAX_PERSISTED_SYMBOL_ENTRY_LEN, QwpWsColumnarBuffer, QwpWsEncodeScratch, SymbolGlobalDict,
+    SymbolGlobalDictMark, decode_qwp_varint,
+};
+// Test-only: lets the sender-level suites drive the connection dictionary's
+// cap-rejection path through a real `Sender` (see `TestDictCapGuard`).
+#[cfg(all(test, feature = "_sender-qwp-ws"))]
+pub(crate) use self::qwp::TestDictCapGuard;
+// `QwpWsSymbolHasher`'s only re-export consumer is the `arrow`-gated
+// `column_sender::arrow_batch`, so it is gated identically: a `_sender-qwp-ws`
+// build without `arrow` would otherwise carry an unused import.
+#[cfg(feature = "arrow-ingress")]
+pub(crate) use self::qwp::QwpWsSymbolHasher;
 
 static NEXT_BOOKMARK_ORIGIN: AtomicU64 = AtomicU64::new(1);
 
@@ -149,9 +163,9 @@ impl<S: Copy> StoredBookmark<S> {
         }
     }
 
-    pub(super) fn clear_if_matches(&mut self, origin: u64, bookmark: Bookmark) {
+    pub(super) fn clear_if_matches(&mut self, origin: u64, bookmark: Bookmark) -> bool {
         if bookmark.origin() == 0 {
-            return;
+            return false;
         }
         if bookmark.origin() != origin {
             // `clear_bookmark()` is intentionally a no-op in release builds so
@@ -162,11 +176,13 @@ impl<S: Copy> StoredBookmark<S> {
                 origin,
                 "attempted to clear a bookmark from a different buffer"
             );
-            return;
+            return false;
         }
         if self.state.is_some() && self.generation == bookmark.generation() {
             self.state = None;
+            return true;
         }
+        false
     }
 
     pub(super) fn clear(&mut self) {
@@ -379,6 +395,14 @@ pub struct Buffer {
     inner: BufferInner,
 }
 
+// Keep the public buffer movable and shareable across threads. In particular,
+// QWP/WebSocket's lazily maintained size hint must not silently weaken this
+// contract through interior-mutability choices such as `RefCell`.
+const _: fn() = || {
+    fn assert_send_sync<T: Send + Sync>() {}
+    assert_send_sync::<Buffer>();
+};
+
 impl Buffer {
     /// Creates a new ILP buffer with default parameters.
     pub fn new(protocol_version: ProtocolVersion) -> Self {
@@ -413,26 +437,37 @@ impl Buffer {
     }
 
     #[cfg(any(feature = "_sender-qwp-udp", feature = "_sender-qwp-ws"))]
-    /// Creates a new QWP/UDP buffer with default parameters.
     pub fn new_qwp() -> Self {
         Self::qwp_with_max_name_len(127)
     }
 
     #[cfg(any(feature = "_sender-qwp-udp", feature = "_sender-qwp-ws"))]
-    /// Creates a new QWP/UDP buffer with a custom maximum name length.
+    /// Like [`Buffer::new_qwp`] with an explicit maximum name length.
     pub fn qwp_with_max_name_len(max_name_len: usize) -> Self {
         Self {
             inner: BufferInner::Qwp(Box::new(QwpBuffer::new(max_name_len))),
         }
     }
 
+    /// Creates a new QWP/WebSocket columnar buffer with a 127-byte name
+    /// length limit. Accepts the row-by-row `table` / `symbol` /
+    /// `column_*` / `at` API; consumed by [`Sender::flush`].
+    ///
+    /// [`Sender::flush`]: crate::ingress::Sender::flush
     #[cfg(feature = "_sender-qwp-ws")]
-    pub(crate) fn qwp_ws_with_max_name_len(max_name_len: usize) -> Self {
+    pub fn new_qwp_ws() -> Self {
+        Self::qwp_ws_with_max_name_len(127)
+    }
+
+    /// Like [`Buffer::new_qwp_ws`] with an explicit maximum name length.
+    #[cfg(feature = "_sender-qwp-ws")]
+    pub fn qwp_ws_with_max_name_len(max_name_len: usize) -> Self {
         Self {
             inner: BufferInner::QwpWs(Box::new(QwpWsColumnarBuffer::new(max_name_len))),
         }
     }
 
+    #[cfg(feature = "_sync-sender")]
     pub(crate) fn as_ilp(&self) -> Option<&IlpBuffer> {
         match &self.inner {
             BufferInner::Ilp(inner) => Some(inner),
@@ -443,7 +478,10 @@ impl Buffer {
         }
     }
 
-    #[cfg(any(feature = "_sender-qwp-udp", all(test, feature = "_sender-qwp-ws")))]
+    #[cfg(any(
+        feature = "_sender-qwp-udp",
+        all(test, feature = "_sender-qwp-ws", feature = "_sender-http")
+    ))]
     pub(crate) fn as_qwp(&self) -> Option<&QwpBuffer> {
         match &self.inner {
             BufferInner::Ilp(_) => None,
@@ -500,8 +538,9 @@ impl Buffer {
     ///
     /// For ILP buffers this is the exact serialized byte count. For QWP/UDP
     /// buffers this is the size hint used for flush planning. For QWP/WebSocket
-    /// buffers this is only a local size hint; the sender enforces
-    /// `max_buf_size` against the encoded replay message.
+    /// buffers this is only a local size hint; symbol-ID remapping and replay
+    /// dictionary state can change the eventual frame size. The sender
+    /// enforces `max_buf_size` against the encoded replay message.
     pub fn len(&self) -> usize {
         match &self.inner {
             BufferInner::Ilp(inner) => inner.len(),
@@ -674,7 +713,7 @@ impl Buffer {
     }
 
     /// Validates that the buffer is ready to be flushed with
-    /// [`crate::ingress::Sender::flush`] or one of its variants.
+    /// `crate::ingress::Sender::flush` or one of its variants.
     ///
     /// Returns an error when the current API call sequence is incomplete, such
     /// as an unfinished row.
@@ -717,6 +756,19 @@ impl Buffer {
     /// Adds a symbol column to the current row.
     ///
     /// All symbol columns must be recorded before any non-symbol columns.
+    ///
+    /// When the buffer is flushed over QWP/WebSocket, every distinct symbol
+    /// recorded here is interned into the *same* connection-scoped dictionary
+    /// the column/chunk API uses — capped at 2,000,000 entries and 256 MiB of
+    /// UTF-8 across the whole connection, not per buffer or per flush.
+    /// Exceeding it fails the flush with
+    /// [`SymbolDictFull`](crate::ErrorCode::SymbolDictFull), and the dictionary
+    /// is only reset by retiring the connection that owns it — which a full
+    /// dictionary now does automatically on return, so a pooled sender is dropped
+    /// (not recycled) and the next borrow gets a fresh one. Wait / commit first if
+    /// frames flushed earlier must not be lost; see
+    /// [`SymbolDictFull`](crate::ErrorCode::SymbolDictFull) for the per-API
+    /// list. ILP (TCP/HTTP) flushes carry no such dictionary and are unaffected.
     #[inline(always)]
     pub fn symbol<'a, N, S>(&mut self, name: N, value: S) -> crate::Result<&mut Self>
     where
@@ -741,6 +793,9 @@ impl Buffer {
     }
 
     /// Adds a symbol column if `value` is `Some`; otherwise leaves the row unchanged.
+    ///
+    /// See [`symbol`](Self::symbol) for the QWP/WebSocket connection-scoped
+    /// dictionary cap that applies to every symbol recorded this way.
     pub fn symbol_opt<'a, N, S>(&mut self, name: N, value: Option<S>) -> crate::Result<&mut Self>
     where
         N: AsRef<str> + TryInto<ColumnName<'a>>,
@@ -839,7 +894,7 @@ impl Buffer {
         match &mut self.inner {
             BufferInner::Ilp(_) => Err(error::fmt!(
                 InvalidApiCall,
-                "column_i8 requires a QWP transport (qwpws:: or qwpudp::)"
+                "column_i8 requires a QWP transport (ws:: or udp::)"
             )),
             #[cfg(any(feature = "_sender-qwp-udp", feature = "_sender-qwp-ws"))]
             BufferInner::Qwp(inner) => {
@@ -877,7 +932,7 @@ impl Buffer {
         match &mut self.inner {
             BufferInner::Ilp(_) => Err(error::fmt!(
                 InvalidApiCall,
-                "column_i16 requires a QWP transport (qwpws:: or qwpudp::)"
+                "column_i16 requires a QWP transport (ws:: or udp::)"
             )),
             #[cfg(any(feature = "_sender-qwp-udp", feature = "_sender-qwp-ws"))]
             BufferInner::Qwp(inner) => {
@@ -915,7 +970,7 @@ impl Buffer {
         match &mut self.inner {
             BufferInner::Ilp(_) => Err(error::fmt!(
                 InvalidApiCall,
-                "column_i32 requires a QWP transport (qwpws:: or qwpudp::)"
+                "column_i32 requires a QWP transport (ws:: or udp::)"
             )),
             #[cfg(any(feature = "_sender-qwp-udp", feature = "_sender-qwp-ws"))]
             BufferInner::Qwp(inner) => {
@@ -953,7 +1008,7 @@ impl Buffer {
         match &mut self.inner {
             BufferInner::Ilp(_) => Err(error::fmt!(
                 InvalidApiCall,
-                "column_f32 requires a QWP transport (qwpws:: or qwpudp::)"
+                "column_f32 requires a QWP transport (ws:: or udp::)"
             )),
             #[cfg(any(feature = "_sender-qwp-udp", feature = "_sender-qwp-ws"))]
             BufferInner::Qwp(inner) => {
@@ -1123,7 +1178,7 @@ impl Buffer {
                 let _ = value.try_into().map_err(Error::from)?;
                 Err(error::fmt!(
                     InvalidApiCall,
-                    "column_dec64 requires a QWP transport (qwpws:: or qwpudp::)"
+                    "column_dec64 requires a QWP transport (ws:: or udp::)"
                 ))
             }
             #[cfg(any(feature = "_sender-qwp-udp", feature = "_sender-qwp-ws"))]
@@ -1175,7 +1230,7 @@ impl Buffer {
                 let _ = value.try_into().map_err(Error::from)?;
                 Err(error::fmt!(
                     InvalidApiCall,
-                    "column_dec128 requires a QWP transport (qwpws:: or qwpudp::)"
+                    "column_dec128 requires a QWP transport (ws:: or udp::)"
                 ))
             }
             #[cfg(any(feature = "_sender-qwp-udp", feature = "_sender-qwp-ws"))]
@@ -1224,7 +1279,7 @@ impl Buffer {
         match &mut self.inner {
             BufferInner::Ilp(_) => Err(error::fmt!(
                 InvalidApiCall,
-                "column_uuid requires a QWP transport (qwpws:: or qwpudp::)"
+                "column_uuid requires a QWP transport (ws:: or udp::)"
             )),
             #[cfg(any(feature = "_sender-qwp-udp", feature = "_sender-qwp-ws"))]
             BufferInner::Qwp(inner) => {
@@ -1269,7 +1324,7 @@ impl Buffer {
         match &mut self.inner {
             BufferInner::Ilp(_) => Err(error::fmt!(
                 InvalidApiCall,
-                "column_long256 requires a QWP transport (qwpws:: or qwpudp::)"
+                "column_long256 requires a QWP transport (ws:: or udp::)"
             )),
             #[cfg(any(feature = "_sender-qwp-udp", feature = "_sender-qwp-ws"))]
             BufferInner::Qwp(inner) => {
@@ -1322,7 +1377,7 @@ impl Buffer {
         match &mut self.inner {
             BufferInner::Ilp(_) => Err(error::fmt!(
                 InvalidApiCall,
-                "column_ipv4 requires a QWP transport (qwpws:: or qwpudp::)"
+                "column_ipv4 requires a QWP transport (ws:: or udp::)"
             )),
             #[cfg(any(feature = "_sender-qwp-udp", feature = "_sender-qwp-ws"))]
             BufferInner::Qwp(inner) => {
@@ -1364,7 +1419,7 @@ impl Buffer {
         match &mut self.inner {
             BufferInner::Ilp(_) => Err(error::fmt!(
                 InvalidApiCall,
-                "column_date requires a QWP transport (qwpws:: or qwpudp::)"
+                "column_date requires a QWP transport (ws:: or udp::)"
             )),
             #[cfg(any(feature = "_sender-qwp-udp", feature = "_sender-qwp-ws"))]
             BufferInner::Qwp(inner) => {
@@ -1406,7 +1461,7 @@ impl Buffer {
         match &mut self.inner {
             BufferInner::Ilp(_) => Err(error::fmt!(
                 InvalidApiCall,
-                "column_char requires a QWP transport (qwpws:: or qwpudp::)"
+                "column_char requires a QWP transport (ws:: or udp::)"
             )),
             #[cfg(any(feature = "_sender-qwp-udp", feature = "_sender-qwp-ws"))]
             BufferInner::Qwp(inner) => {
@@ -1450,7 +1505,7 @@ impl Buffer {
         match &mut self.inner {
             BufferInner::Ilp(_) => Err(error::fmt!(
                 InvalidApiCall,
-                "column_binary requires a QWP transport (qwpws:: or qwpudp::)"
+                "column_binary requires a QWP transport (ws:: or udp::)"
             )),
             #[cfg(any(feature = "_sender-qwp-udp", feature = "_sender-qwp-ws"))]
             BufferInner::Qwp(inner) => {
@@ -1498,7 +1553,7 @@ impl Buffer {
         match &mut self.inner {
             BufferInner::Ilp(_) => Err(error::fmt!(
                 InvalidApiCall,
-                "column_geohash requires a QWP transport (qwpws:: or qwpudp::)"
+                "column_geohash requires a QWP transport (ws:: or udp::)"
             )),
             #[cfg(any(feature = "_sender-qwp-udp", feature = "_sender-qwp-ws"))]
             BufferInner::Qwp(inner) => {
@@ -1550,7 +1605,7 @@ impl Buffer {
                 if D::type_tag() != 10 {
                     return Err(error::fmt!(
                         InvalidApiCall,
-                        "column_arr with non-f64 element type requires a QWP transport (qwpws:: or qwpudp::)"
+                        "column_arr with non-f64 element type requires a QWP transport (ws:: or udp::)"
                     ));
                 }
                 inner.column_arr(name, view)?;

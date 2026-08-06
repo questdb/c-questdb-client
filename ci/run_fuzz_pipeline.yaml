@@ -67,13 +67,15 @@ stages:
               echo "##vso[task.setvariable variable=JAVA_HOME]$JDK_HOME"
             displayName: "Resolve JDK 25"
           - template: templates/clone_questdb.yaml
+          - template: templates/maven_settings.yaml
           - task: Maven@3
             displayName: "Compile QuestDB"
+            retryCountOnTaskFailure: 2
             inputs:
               mavenPOMFile: "questdb/pom.xml"
               javaHomeOption: "Path"
               jdkDirectory: "$(JAVA_HOME)"
-              options: "-DskipTests -Pbuild-web-console$(CLIENT_PROFILE)"
+              options: "-s $(MAVEN_SETTINGS_FILE) -DskipTests -Pbuild-web-console$(CLIENT_PROFILE) $(MAVEN_RUN_OPTS)"
           - script: |
               python3 system_test/test.py run --repo ./questdb TestQwpWsFuzz -v
             displayName: "TestQwpWsFuzz"
@@ -106,12 +108,9 @@ stages:
       # from questdb/azure-ci-runners' roles/incus/files/provision.sh,
       # which already installs openjdk-17-jdk, openjdk-25-jdk, maven,
       # build-essential, zip, curl, gh, and rustup (system-wide, with
-      # /etc/profile.d/rust.sh sourcing the env). Only cmake and
-      # python3-numpy are missing for this job.
-      # imageName='hetzner-incus' tells compile.yaml to skip its
-      # "Install Python Dependencies" pip step — numpy comes from the
-      # apt step below, and PEP 668 / EXTERNALLY-MANAGED on recent
-      # Ubuntu would otherwise reject pip-into-system-python.
+      # /etc/profile.d/rust.sh sourcing the env). The job installs
+      # cmake/python3-numpy/python3-pip plus pyarrow/polars explicitly below
+      # so scheduled Arrow tests have the same deps as PR-time Linux fuzz.
       - job: TestQwpWsFuzzLinux
         displayName: "QWP/WS fuzz suite (linux/hetzner-incus)"
         pool:
@@ -133,7 +132,8 @@ stages:
           - bash: |
               set -eux
               sudo apt-get update
-              sudo apt-get install -y --no-install-recommends cmake python3-numpy
+              sudo apt-get install -y --no-install-recommends cmake python3-numpy python3-pip
+              sudo python3 -m pip install --break-system-packages pyarrow polars
               # Image-provided JDK paths (see provision.sh's
               # `apt-get install -y openjdk-17-jdk openjdk-25-jdk maven`).
               JAVA_PATH_17="/usr/lib/jvm/java-17-openjdk-amd64"
@@ -182,16 +182,24 @@ stages:
             displayName: "Resolve Rust toolchain"
           - template: templates/compile.yaml
           - template: templates/clone_questdb.yaml
+          - template: templates/maven_settings.yaml
           - task: Maven@3
             displayName: "Compile QuestDB"
+            retryCountOnTaskFailure: 2
             inputs:
               mavenPOMFile: "questdb/pom.xml"
               javaHomeOption: "Path"
               jdkDirectory: "$(JAVA_HOME)"
-              options: "-DskipTests -Pbuild-web-console$(CLIENT_PROFILE)"
+              options: "-s $(MAVEN_SETTINGS_FILE) -DskipTests -Pbuild-web-console$(CLIENT_PROFILE) $(MAVEN_RUN_OPTS)"
           - script: |
               python3 system_test/test.py run --repo ./questdb TestQwpWsFuzz -v
             displayName: "TestQwpWsFuzz"
+          - script: |
+              python3 system_test/test.py run --repo ./questdb TestArrowEgressFuzz TestArrowEgressPerKind TestArrowEgressEmpty TestArrowIngressFuzz TestArrowIngressPerKind TestArrowIngressDesignatedTs TestArrowIngressErrors TestArrowIngressMultiBatch TestArrowIngressExtraTypes TestArrowIngressUnsupportedTypes TestArrowIngressSfa TestArrowRoundTripFuzz TestArrowRoundTripPerKind TestArrowAlignment TestArrowPolarsFuzz TestArrowPolarsRoundTripPerKind TestArrowPolarsPerDtype -v
+            displayName: "TestArrowFuzz"
+          - script: |
+              python3 system_test/_arrow_sfa_fuzz_loop.py 5
+            displayName: "TestArrowSfaFuzzLoop"
           - task: ArchiveFiles@2
             displayName: "Compress QuestDB server log on failure"
             condition: failed()
@@ -244,14 +252,14 @@ stages:
               # invocation per scope so the proptest modules in src/egress/
               # actually run.
               PROPTEST_CASES=10000 cargo test --release \
-                --features sync-reader-ws \
+                --features sync-reader-qwp-ws \
                 --test qwp_egress_bounds_fuzz \
                 --test qwp_egress_fragmentation_fuzz
               PROPTEST_CASES=10000 cargo test --release \
-                --features sync-reader-ws \
+                --features sync-reader-qwp-ws \
                 --lib egress::binds::tests
               PROPTEST_CASES=10000 cargo test --release \
-                --features sync-reader-ws \
+                --features sync-reader-qwp-ws \
                 --lib egress::decoder::tests
             displayName: "Run QWP egress fuzz suite"
 
@@ -269,6 +277,8 @@ stages:
         pool:
           vmImage: "ubuntu-latest"
         timeoutInMinutes: 30
+        variables:
+          imageName: ubuntu-latest
         steps:
           - checkout: self
             fetchDepth: 1
@@ -276,6 +286,7 @@ stages:
             submodules: false
           - template: templates/compile.yaml
           - template: templates/clone_questdb.yaml
+          - template: templates/maven_settings.yaml
           - script: |
               set -euo pipefail
               JDK_URL="https://api.adoptium.net/v3/binary/latest/25/ga/linux/x64/jdk/hotspot/normal/eclipse"
@@ -286,10 +297,11 @@ stages:
             displayName: "Install JDK 25"
           - task: Maven@3
             displayName: "Compile QuestDB"
+            retryCountOnTaskFailure: 2
             inputs:
               mavenPOMFile: "questdb/pom.xml"
               jdkVersionOption: "default"
-              options: "-DskipTests -Pbuild-web-console$(CLIENT_PROFILE)"
+              options: "-s $(MAVEN_SETTINGS_FILE) -DskipTests -Pbuild-web-console$(CLIENT_PROFILE) $(MAVEN_RUN_OPTS)"
           - script: |
               set -euxo pipefail
               cd questdb-rs

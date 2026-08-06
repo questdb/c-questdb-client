@@ -46,9 +46,9 @@ use std::net::{Shutdown, TcpStream};
 
 use bytes::{Bytes, BytesMut};
 
-use crate::egress::ws::nosigpipe::NoSigpipeTcp;
 use crate::ws::frame::{FrameError, FrameHeader, Opcode, encode_client_frame};
 use crate::ws::mask::MaskKeySource;
+use crate::ws::nosigpipe::NoSigpipeTcp;
 
 /// Initial recv buffer capacity. Sized to fit a typical multi-MB QWP
 /// `RESULT_BATCH` in a single `read()` syscall: the batch wire cap is
@@ -133,7 +133,7 @@ impl Write for Stream {
 
 /// Why a `read_binary_frame` call returned without yielding a Binary
 /// payload. Internal-only — the public API surfaces these as
-/// `egress::Error` variants in the transport layer.
+/// crate-wide [`Error`](crate::Error) variants in the transport layer.
 #[derive(Debug)]
 pub(crate) enum WsReadError {
     /// Underlying stream returned an `io::Error` (read failure,

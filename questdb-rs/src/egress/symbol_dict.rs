@@ -42,8 +42,8 @@
 //! `delta_start` MUST equal the dictionary's current length; after a
 //! reset, the next delta MUST start at 0.
 
-use crate::egress::error::{Result, fmt};
 use crate::egress::wire::varint;
+use crate::error::{Result, fmt};
 
 /// Hard cap on the connection-scoped SYMBOL dict's UTF-8 heap size in
 /// bytes. Mirrors `MAX_CONN_DICT_HEAP_BYTES` in the Java reference
@@ -279,8 +279,8 @@ impl SymbolDict {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::egress::error::ErrorCode;
     use crate::egress::wire::varint::encode_u64;
+    use crate::error::ErrorCode;
 
     fn build_delta(start: u64, entries: &[&str]) -> Vec<u8> {
         let mut out = Vec::new();

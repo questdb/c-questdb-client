@@ -140,7 +140,7 @@
 //! - **QWP/WebSocket ingress** — `SenderBuilder::qwp_ws_token_provider` (feature
 //!   `sync-sender-qwp-ws`), pulled at each (re)connect handshake.
 //! - **QWP/WebSocket egress reader** — `ReaderConfig::token_provider` (feature
-//!   `sync-reader-ws`), likewise per (re)connect.
+//!   `sync-reader-qwp-ws`), likewise per (re)connect.
 //! - **SQL over PG-wire** — QuestDB has no Rust driver in this crate, but the
 //!   token works as a PG-wire password: connect with the username `_sso` and
 //!   [`token`](OidcDeviceAuth::token) as the password (requires

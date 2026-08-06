@@ -36,17 +36,28 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use crate::ErrorCode;
+use crate::ingress::sender::fail_next_catch_up_allocation_for_test;
+use crate::ingress::sender::has_any_sfa_file as slot_has_sfa_file;
+use crate::ingress::sender::qwp_ws::fail_next_recovered_dict_copy_for_test;
 use crate::ingress::{
     Buffer, ColumnName, Protocol, QwpWsEncodeScratch, QwpWsErrorCategory, QwpWsErrorPolicy,
     QwpWsProgress, SenderBuilder, SymbolGlobalDict, TableName, TimestampNanos,
 };
+// `ProtocolVersion` is only referenced by the HTTP-gated sibling-sender checks
+// below, so gate the import to avoid an unused-import warning when the
+// qwp-ws sender is built without `sync-sender-http` (e.g. run_all_tests.py).
+#[cfg(feature = "sync-sender-http")]
+use crate::ingress::ProtocolVersion;
+use crate::ws::frame::OPCODE_CLOSE;
 
-const WS_GUID: &str = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
+pub(crate) const WS_GUID: &str = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
 const FIRST_WIRE_SEQUENCE: u64 = 0;
 const QWP_STATUS_OK: u8 = 0x00;
 const QWP_STATUS_DURABLE_ACK: u8 = 0x02;
 const QWP_STATUS_SCHEMA_MISMATCH: u8 = 0x03;
 const QWP_STATUS_PARSE_ERROR: u8 = 0x05;
+const QWP_STATUS_WRITE_ERROR: u8 = 0x09;
+const QWP_STATUS_NOT_WRITABLE: u8 = 0x0C;
 const QWP_WS_PUBLIC_BENCH_DEFAULT_ROWS: usize = 20_000_000;
 const QWP_WS_PUBLIC_BENCH_DEFAULT_BATCH_SIZE: usize = 1000;
 const QWP_WS_PUBLIC_BENCH_DEFAULT_IN_FLIGHT: usize = 128;
@@ -83,7 +94,7 @@ fn build_qwp_ws_sender_from_builder(
 fn build_qwp_ws_sender(progress: ProgressCase, port: u16) -> crate::ingress::Sender {
     build_qwp_ws_sender_from_builder(
         progress,
-        SenderBuilder::new(Protocol::QwpWs, "127.0.0.1", port),
+        SenderBuilder::new(Protocol::Ws, "127.0.0.1", port),
     )
 }
 
@@ -94,7 +105,7 @@ struct MockResult {
     received_frames: Vec<Vec<u8>>,
 }
 
-fn read_request_until_blank<R: Read>(stream: &mut R) -> std::io::Result<Vec<u8>> {
+pub(crate) fn read_request_until_blank<R: Read>(stream: &mut R) -> std::io::Result<Vec<u8>> {
     let mut buf = Vec::new();
     let mut tmp = [0u8; 256];
     loop {
@@ -110,7 +121,7 @@ fn read_request_until_blank<R: Read>(stream: &mut R) -> std::io::Result<Vec<u8>>
     Ok(buf)
 }
 
-fn parse_header(req: &str, name: &str) -> Option<String> {
+pub(crate) fn parse_header(req: &str, name: &str) -> Option<String> {
     for line in req.split("\r\n").skip(1) {
         if let Some((k, v)) = line.split_once(':')
             && k.trim().eq_ignore_ascii_case(name)
@@ -121,7 +132,7 @@ fn parse_header(req: &str, name: &str) -> Option<String> {
     None
 }
 
-fn read_frame(stream: &mut TcpStream) -> std::io::Result<(bool, u8, Vec<u8>)> {
+pub(crate) fn read_frame(stream: &mut TcpStream) -> std::io::Result<(bool, u8, Vec<u8>)> {
     let mut hdr = [0u8; 2];
     stream.read_exact(&mut hdr)?;
     let fin = (hdr[0] & 0x80) != 0;
@@ -155,7 +166,10 @@ fn read_frame(stream: &mut TcpStream) -> std::io::Result<(bool, u8, Vec<u8>)> {
     Ok((fin, opcode, payload))
 }
 
-fn write_server_binary_frame(stream: &mut TcpStream, payload: &[u8]) -> std::io::Result<()> {
+pub(crate) fn write_server_binary_frame(
+    stream: &mut TcpStream,
+    payload: &[u8],
+) -> std::io::Result<()> {
     // FIN | binary, no mask (server→client).
     let mut frame = vec![0x82];
     let plen = payload.len();
@@ -172,7 +186,29 @@ fn write_server_binary_frame(stream: &mut TcpStream, payload: &[u8]) -> std::io:
     stream.write_all(&frame)
 }
 
-fn perform_server_upgrade(stream: &mut TcpStream) -> std::io::Result<Vec<String>> {
+pub(crate) fn perform_server_upgrade(stream: &mut TcpStream) -> std::io::Result<Vec<String>> {
+    perform_server_upgrade_with_version(stream, 1)
+}
+
+/// Like [`perform_server_upgrade`] but advertises `X-QWP-Durable-Ack: enabled`,
+/// which the durable-ACK runner requires before it will request durable
+/// confirmation. Sets the same read/write timeouts as `perform_server_upgrade`.
+pub(crate) fn perform_server_upgrade_durable(
+    stream: &mut TcpStream,
+) -> std::io::Result<Vec<String>> {
+    stream.set_read_timeout(Some(Duration::from_secs(5)))?;
+    stream.set_write_timeout(Some(Duration::from_secs(5)))?;
+    Ok(upgrade_mock_stream_with_durable_ack(stream, true))
+}
+
+/// Like [`perform_server_upgrade`] but advertises an arbitrary
+/// `X-QWP-Version`. The egress reader skips the `SERVER_INFO` read and the
+/// role check when the negotiated version is `0`, which lets a park-only
+/// mock satisfy `Reader::from_conf` without emitting a `SERVER_INFO` frame.
+pub(crate) fn perform_server_upgrade_with_version(
+    stream: &mut TcpStream,
+    version: u8,
+) -> std::io::Result<Vec<String>> {
     stream.set_read_timeout(Some(Duration::from_secs(5)))?;
     stream.set_write_timeout(Some(Duration::from_secs(5)))?;
 
@@ -192,14 +228,45 @@ fn perform_server_upgrade(stream: &mut TcpStream) -> std::io::Result<Vec<String>
          Upgrade: websocket\r\n\
          Connection: Upgrade\r\n\
          Sec-WebSocket-Accept: {accept}\r\n\
-         X-QWP-Version: 1\r\n\
+         X-QWP-Version: {version}\r\n\
          \r\n"
     );
     stream.write_all(response.as_bytes())?;
     Ok(request_lines)
 }
 
-fn write_server_frame(
+/// Write a minimal `SERVER_INFO` frame: the first server→client frame an
+/// egress [`crate::egress::Reader`] consumes after the upgrade when the
+/// negotiated version is `>= 1`. Role is `Standalone` with `capabilities=0`
+/// (no zone trailer), which a `target=any` reader accepts. Emitted as an
+/// unmasked WS binary message. Bytes are written by hand (mirroring
+/// `egress::server_event::decode_server_info` + `egress::wire::header`) so
+/// the helper stays self-contained.
+#[cfg(feature = "sync-reader-qwp-ws")]
+pub(crate) fn write_server_info_frame(stream: &mut TcpStream) -> std::io::Result<()> {
+    // SERVER_INFO payload.
+    let mut payload = Vec::new();
+    payload.push(0x18); // MsgKind::ServerInfo
+    payload.push(0x00); // role = Standalone
+    payload.extend_from_slice(&1u64.to_le_bytes()); // epoch
+    payload.extend_from_slice(&0u32.to_le_bytes()); // capabilities (no CAP_ZONE)
+    payload.extend_from_slice(&0i64.to_le_bytes()); // server_wall_ns
+    payload.extend_from_slice(&0u16.to_le_bytes()); // cluster_id length = 0
+    payload.extend_from_slice(&0u16.to_le_bytes()); // node_id length = 0
+
+    // 12-byte QWP1 frame header wrapping the payload.
+    let mut frame = Vec::with_capacity(12 + payload.len());
+    frame.extend_from_slice(b"QWP1");
+    frame.push(1); // version
+    frame.push(0); // flags
+    frame.extend_from_slice(&0u16.to_le_bytes()); // table_count = 0
+    frame.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+    frame.extend_from_slice(&payload);
+
+    write_server_frame(stream, 0x2, &frame, false)
+}
+
+pub(crate) fn write_server_frame(
     stream: &mut TcpStream,
     opcode: u8,
     payload: &[u8],
@@ -272,7 +339,7 @@ fn write_raw_ws_frame(stream: &mut TcpStream, byte0: u8, payload: &[u8]) -> std:
     stream.write_all(&frame)
 }
 
-fn write_qwp_ok_response(stream: &mut TcpStream, wire_seq: u64) -> std::io::Result<()> {
+pub(crate) fn write_qwp_ok_response(stream: &mut TcpStream, wire_seq: u64) -> std::io::Result<()> {
     let mut ok = Vec::new();
     ok.push(QWP_STATUS_OK);
     ok.extend_from_slice(&wire_seq.to_le_bytes());
@@ -280,7 +347,7 @@ fn write_qwp_ok_response(stream: &mut TcpStream, wire_seq: u64) -> std::io::Resu
     write_server_binary_frame(stream, &ok)
 }
 
-fn write_qwp_ok_response_with_table_entries(
+pub(crate) fn write_qwp_ok_response_with_table_entries(
     stream: &mut TcpStream,
     wire_seq: u64,
     entries: &[(&str, i64)],
@@ -292,7 +359,7 @@ fn write_qwp_ok_response_with_table_entries(
     write_server_binary_frame(stream, &ok)
 }
 
-fn write_qwp_durable_ack_response(
+pub(crate) fn write_qwp_durable_ack_response(
     stream: &mut TcpStream,
     entries: &[(&str, i64)],
 ) -> std::io::Result<()> {
@@ -311,7 +378,7 @@ fn append_table_seq_txns(payload: &mut Vec<u8>, entries: &[(&str, i64)]) {
     }
 }
 
-fn write_qwp_error_response(
+pub(crate) fn write_qwp_error_response(
     stream: &mut TcpStream,
     status: u8,
     wire_seq: u64,
@@ -325,7 +392,7 @@ fn write_qwp_error_response(
     write_server_binary_frame(stream, &err)
 }
 
-fn compute_accept(key_b64: &str) -> String {
+pub(crate) fn compute_accept(key_b64: &str) -> String {
     use base64ct::{Base64, Encoding};
     let combined = format!("{key_b64}{WS_GUID}");
     let digest = sha1(combined.as_bytes());
@@ -407,7 +474,7 @@ fn upgrade_mock_stream_without_upgrade_header(stream: &mut TcpStream) {
 // Mirror of the production SHA-1 used by the sender, reproduced here to
 // validate the upgrade handshake from the server side without poking at
 // internals. ~50 lines is cheaper than another dependency.
-fn sha1(input: &[u8]) -> [u8; 20] {
+pub(crate) fn sha1(input: &[u8]) -> [u8; 20] {
     let (mut h0, mut h1, mut h2, mut h3, mut h4) = (
         0x67452301u32,
         0xEFCDAB89,
@@ -476,18 +543,52 @@ fn spawn_mock_server() -> (u16, mpsc::Receiver<MockResult>) {
         let (mut stream, _) = listener.accept().unwrap();
         let request_lines = perform_server_upgrade(&mut stream).unwrap();
 
+        // Tolerate a client that closes after the handshake without sending a
+        // frame (locally-rejected flush, teardown on drop): a hangup is a clean
+        // end-of-client, not a reason to panic this detached thread.
         let mut received_frames = Vec::new();
-        let (_fin, _opcode, payload) = read_frame(&mut stream).unwrap();
-        received_frames.push(payload);
-
-        // Reply: OK status, sequence=0, table_count=0
-        write_qwp_ok_response(&mut stream, FIRST_WIRE_SEQUENCE).unwrap();
+        if let Ok((_fin, _opcode, payload)) = read_frame(&mut stream) {
+            received_frames.push(payload);
+            let _ = write_qwp_ok_response(&mut stream, FIRST_WIRE_SEQUENCE);
+        }
 
         let _ = tx.send(MockResult {
             request_lines,
             received_frames,
         });
         // Hold the connection open briefly so the client side reads the reply.
+        thread::sleep(Duration::from_millis(50));
+    });
+
+    (port, rx)
+}
+
+/// Like [`spawn_mock_server`] but for a recovered (file-mode) slot: delta mode
+/// re-registers the slot's symbol dictionary with a table-less catch-up frame
+/// (wire seq 0) before the replayed data frame (wire seq 1). Reads past the
+/// catch-up and acks the data frame so `close_drain` can complete; records only
+/// the data frame in `received_frames`.
+fn spawn_recovery_mock_server() -> (u16, mpsc::Receiver<MockResult>) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let (tx, rx) = mpsc::channel();
+
+    thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let request_lines = perform_server_upgrade(&mut stream).unwrap();
+
+        let mut received_frames = Vec::new();
+        if read_frame(&mut stream).is_ok()
+            && let Ok((_fin, _opcode, payload)) = read_frame(&mut stream)
+        {
+            received_frames.push(payload);
+            let _ = write_qwp_ok_response(&mut stream, FIRST_WIRE_SEQUENCE + 1);
+        }
+
+        let _ = tx.send(MockResult {
+            request_lines,
+            received_frames,
+        });
         thread::sleep(Duration::from_millis(50));
     });
 
@@ -504,9 +605,10 @@ fn spawn_one_response_server(response: MockQwpResponse) -> (u16, mpsc::Receiver<
         let request_lines = perform_server_upgrade(&mut stream).unwrap();
 
         let mut received_frames = Vec::new();
-        let (_fin, _opcode, payload) = read_frame(&mut stream).unwrap();
-        received_frames.push(payload);
-        write_mock_qwp_response(&mut stream, response).unwrap();
+        if let Ok((_fin, _opcode, payload)) = read_frame(&mut stream) {
+            received_frames.push(payload);
+            let _ = write_mock_qwp_response(&mut stream, response);
+        }
 
         let _ = tx.send(MockResult {
             request_lines,
@@ -520,9 +622,6 @@ fn spawn_one_response_server(response: MockQwpResponse) -> (u16, mpsc::Receiver<
 
 #[derive(Clone, Copy)]
 enum MockQwpResponse {
-    Ok {
-        wire_seq: u64,
-    },
     Error {
         status: u8,
         wire_seq: u64,
@@ -530,12 +629,17 @@ enum MockQwpResponse {
     },
 }
 
+#[derive(Clone, Copy)]
+enum RecycleServerAction {
+    WriteError,
+    NonOrderlyClose,
+}
+
 fn write_mock_qwp_response(
     stream: &mut TcpStream,
     response: MockQwpResponse,
 ) -> std::io::Result<()> {
     match response {
-        MockQwpResponse::Ok { wire_seq } => write_qwp_ok_response(stream, wire_seq),
         MockQwpResponse::Error {
             status,
             wire_seq,
@@ -544,35 +648,74 @@ fn write_mock_qwp_response(
     }
 }
 
-fn spawn_two_response_server(
-    first_response: MockQwpResponse,
-    second_response: MockQwpResponse,
-) -> (u16, mpsc::Receiver<MockResult>) {
+fn spawn_recycling_server(
+    action: RecycleServerAction,
+    run_for: Duration,
+) -> (u16, thread::JoinHandle<usize>) {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
     let port = listener.local_addr().unwrap().port();
-    let (tx, rx) = mpsc::channel();
 
-    thread::spawn(move || {
-        let (mut stream, _) = listener.accept().unwrap();
-        let request_lines = perform_server_upgrade(&mut stream).unwrap();
-
-        let mut received_frames = Vec::new();
-        let (_fin, _opcode, first) = read_frame(&mut stream).unwrap();
-        received_frames.push(first);
-        write_mock_qwp_response(&mut stream, first_response).unwrap();
-
-        let (_fin, _opcode, second) = read_frame(&mut stream).unwrap();
-        received_frames.push(second);
-        write_mock_qwp_response(&mut stream, second_response).unwrap();
-
-        let _ = tx.send(MockResult {
-            request_lines,
-            received_frames,
-        });
-        thread::sleep(Duration::from_millis(50));
+    let handle = thread::spawn(move || {
+        let deadline = Instant::now() + run_for;
+        let mut connections = 0usize;
+        while Instant::now() < deadline {
+            match listener.accept() {
+                Ok((mut stream, _)) => {
+                    // The listener is non-blocking so the accept loop can honor
+                    // `run_for`. On macOS/BSD and Windows the accepted socket
+                    // inherits that flag (unlike Linux), which makes
+                    // `set_read_timeout` a no-op and turns `read_frame` into an
+                    // immediate `WouldBlock`. Force the stream back to blocking.
+                    stream.set_nonblocking(false).unwrap();
+                    stream
+                        .set_read_timeout(Some(Duration::from_secs(5)))
+                        .unwrap();
+                    stream
+                        .set_write_timeout(Some(Duration::from_secs(5)))
+                        .unwrap();
+                    upgrade_mock_stream(&mut stream);
+                    match read_frame(&mut stream) {
+                        Ok((_fin, 0x2, _payload)) => {
+                            connections += 1;
+                            match action {
+                                RecycleServerAction::WriteError => {
+                                    write_qwp_error_response(
+                                        &mut stream,
+                                        QWP_STATUS_WRITE_ERROR,
+                                        FIRST_WIRE_SEQUENCE,
+                                        b"retry later",
+                                    )
+                                    .unwrap();
+                                }
+                                RecycleServerAction::NonOrderlyClose => {
+                                    write_server_close_frame(&mut stream, 1002, "retry later")
+                                        .unwrap();
+                                }
+                            }
+                        }
+                        Ok((_fin, _opcode, _payload)) => {}
+                        Err(err)
+                            if matches!(
+                                err.kind(),
+                                std::io::ErrorKind::UnexpectedEof
+                                    | std::io::ErrorKind::ConnectionReset
+                                    | std::io::ErrorKind::ConnectionAborted
+                                    | std::io::ErrorKind::BrokenPipe
+                            ) => {}
+                        Err(err) => panic!("recycling server failed to read frame: {err}"),
+                    }
+                }
+                Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                    thread::sleep(Duration::from_millis(5));
+                }
+                Err(err) => panic!("recycling server accept failed: {err}"),
+            }
+        }
+        connections
     });
 
-    (port, rx)
+    (port, handle)
 }
 
 fn spawn_stalled_after_first_frame_server() -> (u16, mpsc::Receiver<Vec<u8>>, mpsc::Sender<()>) {
@@ -590,6 +733,40 @@ fn spawn_stalled_after_first_frame_server() -> (u16, mpsc::Receiver<Vec<u8>>, mp
     });
 
     (port, frame_rx, release_tx)
+}
+
+fn spawn_delayed_durable_ack_server() -> (
+    u16,
+    mpsc::Receiver<Vec<u8>>,
+    mpsc::Sender<()>,
+    mpsc::Sender<()>,
+) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let (frame_tx, frame_rx) = mpsc::channel();
+    let (ok_tx, ok_rx) = mpsc::channel();
+    let (durable_tx, durable_rx) = mpsc::channel();
+
+    thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        perform_server_upgrade_durable(&mut stream).unwrap();
+        let (_fin, _opcode, payload) = read_frame(&mut stream).unwrap();
+        frame_tx.send(payload).unwrap();
+
+        ok_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        write_qwp_ok_response_with_table_entries(
+            &mut stream,
+            FIRST_WIRE_SEQUENCE,
+            &[("trades", 10)],
+        )
+        .unwrap();
+
+        durable_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        write_qwp_durable_ack_response(&mut stream, &[("trades", 10)]).unwrap();
+        thread::sleep(Duration::from_millis(50));
+    });
+
+    (port, frame_rx, ok_tx, durable_tx)
 }
 
 fn spawn_ack_each_frame_server() -> (u16, thread::JoinHandle<usize>) {
@@ -632,6 +809,17 @@ fn spawn_ack_each_frame_server() -> (u16, thread::JoinHandle<usize>) {
     });
 
     (port, handle)
+}
+
+fn wait_until<F: FnMut() -> bool>(timeout: Duration, mut predicate: F) -> bool {
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        if predicate() {
+            return true;
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    predicate()
 }
 
 fn spawn_upgrade_only_server() -> u16 {
@@ -856,14 +1044,285 @@ fn spawn_manual_orphan_drain_server() -> (u16, mpsc::Receiver<Vec<u8>>) {
 
         let (mut orphan, _) = listener.accept().unwrap();
         perform_server_upgrade(&mut orphan).unwrap();
+        // Delta mode: a recovered/orphan-drained slot re-registers its whole
+        // symbol dictionary with a table-less catch-up frame (wire seq 0) before
+        // replaying the queued data frame (wire seq 1). Read past the catch-up
+        // and ack the data frame so the drain completes.
+        let (_fin, _opcode, _catch_up) = read_frame(&mut orphan).unwrap();
         let (_fin, _opcode, payload) = read_frame(&mut orphan).unwrap();
-        write_qwp_ok_response(&mut orphan, FIRST_WIRE_SEQUENCE).unwrap();
+        write_qwp_ok_response(&mut orphan, FIRST_WIRE_SEQUENCE + 1).unwrap();
         tx.send(payload).unwrap();
 
         thread::sleep(Duration::from_millis(50));
     });
 
     (port, rx)
+}
+
+fn spawn_two_frame_orphan_drain_server() -> (u16, mpsc::Receiver<Vec<Vec<u8>>>) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let (tx, rx) = mpsc::channel();
+
+    thread::spawn(move || {
+        let (mut foreground, _) = listener.accept().unwrap();
+        perform_server_upgrade(&mut foreground).unwrap();
+
+        let (mut orphan, _) = listener.accept().unwrap();
+        orphan
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        perform_server_upgrade(&mut orphan).unwrap();
+        let (_fin, _opcode, _catch_up) = read_frame(&mut orphan).unwrap();
+        let (_fin, _opcode, first) = read_frame(&mut orphan).unwrap();
+        write_qwp_ok_response(&mut orphan, FIRST_WIRE_SEQUENCE + 1).unwrap();
+        let (_fin, _opcode, second) = read_frame(&mut orphan).unwrap();
+        write_qwp_ok_response(&mut orphan, FIRST_WIRE_SEQUENCE + 2).unwrap();
+        tx.send(vec![first, second]).unwrap();
+    });
+
+    (port, rx)
+}
+
+fn spawn_manual_orphan_reject_server(status: u8) -> (u16, mpsc::Receiver<Vec<u8>>) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let (tx, rx) = mpsc::channel();
+
+    thread::spawn(move || {
+        let (mut foreground, _) = listener.accept().unwrap();
+        perform_server_upgrade(&mut foreground).unwrap();
+
+        let (mut orphan, _) = listener.accept().unwrap();
+        perform_server_upgrade(&mut orphan).unwrap();
+        // Delta mode: the orphan re-registers its dictionary with a table-less
+        // catch-up frame (wire seq 0) before replaying the queued data frame (wire
+        // seq 1). Read past the catch-up and reject the DATA frame at seq 1, so the
+        // test exercises a rejected replayed data frame -- not the dictionary
+        // re-registration -- and reports back the data frame it was written to check.
+        let (_fin, _opcode, _catch_up) = read_frame(&mut orphan).unwrap();
+        let (_fin, _opcode, payload) = read_frame(&mut orphan).unwrap();
+        write_qwp_error_response(&mut orphan, status, FIRST_WIRE_SEQUENCE + 1, b"bad orphan")
+            .unwrap();
+        tx.send(payload).unwrap();
+
+        thread::sleep(Duration::from_millis(50));
+    });
+
+    (port, rx)
+}
+
+struct TerminalThenDrainOrphanServer {
+    port: u16,
+    terminal_rx: mpsc::Receiver<Vec<u8>>,
+    drained_rx: mpsc::Receiver<Vec<u8>>,
+    handle: thread::JoinHandle<()>,
+}
+
+fn spawn_terminal_then_drain_orphan_server() -> TerminalThenDrainOrphanServer {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let (terminal_tx, terminal_rx) = mpsc::channel();
+    let (drained_tx, drained_rx) = mpsc::channel();
+
+    let server = thread::spawn(move || {
+        let (mut foreground, _) = listener.accept().unwrap();
+        perform_server_upgrade(&mut foreground).unwrap();
+
+        let (mut terminal_orphan, _) = listener.accept().unwrap();
+        perform_server_upgrade(&mut terminal_orphan).unwrap();
+        let (_fin, _opcode, _catch_up) = read_frame(&mut terminal_orphan).unwrap();
+        let (_fin, _opcode, terminal_payload) = read_frame(&mut terminal_orphan).unwrap();
+        write_qwp_error_response(
+            &mut terminal_orphan,
+            QWP_STATUS_PARSE_ERROR,
+            FIRST_WIRE_SEQUENCE + 1,
+            b"bad orphan",
+        )
+        .unwrap();
+        terminal_tx.send(terminal_payload).unwrap();
+
+        let (mut drainable_orphan, _) = listener.accept().unwrap();
+        perform_server_upgrade(&mut drainable_orphan).unwrap();
+        let (_fin, _opcode, _catch_up) = read_frame(&mut drainable_orphan).unwrap();
+        let (_fin, _opcode, drained_payload) = read_frame(&mut drainable_orphan).unwrap();
+        write_qwp_ok_response(&mut drainable_orphan, FIRST_WIRE_SEQUENCE + 1).unwrap();
+        drained_tx.send(drained_payload).unwrap();
+
+        thread::sleep(Duration::from_millis(50));
+    });
+
+    TerminalThenDrainOrphanServer {
+        port,
+        terminal_rx,
+        drained_rx,
+        handle: server,
+    }
+}
+
+struct RoleRejectThenDrainOrphanServer {
+    port: u16,
+    rejected_rx: mpsc::Receiver<Vec<u8>>,
+    drained_rx: mpsc::Receiver<Vec<u8>>,
+    handle: thread::JoinHandle<()>,
+}
+
+struct CatchUpFailureThenDrainOrphanServer {
+    port: u16,
+    retried_rx: mpsc::Receiver<()>,
+    drained_rx: mpsc::Receiver<Vec<u8>>,
+    handle: thread::JoinHandle<()>,
+}
+
+fn spawn_catch_up_failure_then_drain_orphan_server(
+    first_max_batch_size: Option<usize>,
+) -> CatchUpFailureThenDrainOrphanServer {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let (retried_tx, retried_rx) = mpsc::channel();
+    let (drained_tx, drained_rx) = mpsc::channel();
+
+    let handle = thread::spawn(move || {
+        let (mut foreground, _) = listener.accept().unwrap();
+        perform_server_upgrade(&mut foreground).unwrap();
+
+        let (mut failed_orphan, _) = listener.accept().unwrap();
+        upgrade_mock_stream_with_max_batch_size(&mut failed_orphan, first_max_batch_size);
+
+        let (mut retry_orphan, _) = listener.accept().unwrap();
+        retried_tx.send(()).unwrap();
+        drop(failed_orphan);
+        retry_orphan
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        perform_server_upgrade(&mut retry_orphan).unwrap();
+        let (_fin, _opcode, _catch_up) = read_frame(&mut retry_orphan).unwrap();
+        let (_fin, _opcode, drained_payload) = read_frame(&mut retry_orphan).unwrap();
+        write_qwp_ok_response(&mut retry_orphan, FIRST_WIRE_SEQUENCE + 1).unwrap();
+        drained_tx.send(drained_payload).unwrap();
+    });
+
+    CatchUpFailureThenDrainOrphanServer {
+        port,
+        retried_rx,
+        drained_rx,
+        handle,
+    }
+}
+
+/// One listener modelling a mid-drain role switch: the orphan drainer's first
+/// wire session reaches a replica that accepts the upgrade and the catch-up
+/// but answers the data frame with NOT_WRITABLE; the recycled connection
+/// reaches the promoted primary, which ACKs the replayed frame.
+fn spawn_role_reject_then_drain_orphan_server() -> RoleRejectThenDrainOrphanServer {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let (rejected_tx, rejected_rx) = mpsc::channel();
+    let (drained_tx, drained_rx) = mpsc::channel();
+
+    let handle = thread::spawn(move || {
+        let (mut foreground, _) = listener.accept().unwrap();
+        perform_server_upgrade(&mut foreground).unwrap();
+
+        let (mut replica, _) = listener.accept().unwrap();
+        perform_server_upgrade(&mut replica).unwrap();
+        let (_fin, _opcode, _catch_up) = read_frame(&mut replica).unwrap();
+        let (_fin, _opcode, rejected_payload) = read_frame(&mut replica).unwrap();
+        write_qwp_error_response(
+            &mut replica,
+            QWP_STATUS_NOT_WRITABLE,
+            FIRST_WIRE_SEQUENCE + 1,
+            b"replica",
+        )
+        .unwrap();
+        rejected_tx.send(rejected_payload).unwrap();
+
+        let (mut primary, _) = listener.accept().unwrap();
+        perform_server_upgrade(&mut primary).unwrap();
+        let (_fin, _opcode, _catch_up) = read_frame(&mut primary).unwrap();
+        let (_fin, _opcode, drained_payload) = read_frame(&mut primary).unwrap();
+        write_qwp_ok_response(&mut primary, FIRST_WIRE_SEQUENCE + 1).unwrap();
+        drained_tx.send(drained_payload).unwrap();
+
+        thread::sleep(Duration::from_millis(50));
+    });
+
+    RoleRejectThenDrainOrphanServer {
+        port,
+        rejected_rx,
+        drained_rx,
+        handle,
+    }
+}
+
+struct ReplicaWindowThenPromoteServer {
+    port: u16,
+    promoted: Arc<AtomicBool>,
+    reject_count: Arc<AtomicUsize>,
+    handle: thread::JoinHandle<Vec<Vec<u8>>>,
+}
+
+/// One listener modelling an in-place role switch: every pre-promotion
+/// upgrade is answered `421` + `X-QuestDB-Role: REPLICA`; the first
+/// post-promotion connection completes the upgrade, reads the queued data
+/// frame, and ACKs it. Mirrors the Java `TestWebSocketServer`
+/// `setRejectWithRole("REPLICA")` -> `setRejectWithRole(null)` script.
+fn spawn_replica_window_then_promote_server() -> ReplicaWindowThenPromoteServer {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let promoted = Arc::new(AtomicBool::new(false));
+    let reject_count = Arc::new(AtomicUsize::new(0));
+    let thread_promoted = Arc::clone(&promoted);
+    let thread_reject_count = Arc::clone(&reject_count);
+
+    let handle = thread::spawn(move || {
+        let started = Instant::now();
+        while started.elapsed() < Duration::from_secs(15) {
+            let (mut stream, _) = match listener.accept() {
+                Ok(accepted) => accepted,
+                Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                    thread::sleep(Duration::from_millis(2));
+                    continue;
+                }
+                Err(err) => panic!("replica-window listener failed: {err}"),
+            };
+            stream.set_nonblocking(false).unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            stream
+                .set_write_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            if !thread_promoted.load(Ordering::Acquire) {
+                let _ = read_request_until_blank(&mut stream).unwrap();
+                stream
+                    .write_all(
+                        b"HTTP/1.1 421 Misdirected Request\r\n\
+                          Connection: close\r\n\
+                          Content-Length: 0\r\n\
+                          X-QuestDB-Role: REPLICA\r\n\
+                          \r\n",
+                    )
+                    .unwrap();
+                thread_reject_count.fetch_add(1, Ordering::AcqRel);
+                continue;
+            }
+            perform_server_upgrade(&mut stream).unwrap();
+            let (_fin, _opcode, payload) = read_frame(&mut stream).unwrap();
+            write_qwp_ok_response(&mut stream, FIRST_WIRE_SEQUENCE).unwrap();
+            thread::sleep(Duration::from_millis(100));
+            return vec![payload];
+        }
+        Vec::new()
+    });
+
+    ReplicaWindowThenPromoteServer {
+        port,
+        promoted,
+        reject_count,
+        handle,
+    }
 }
 
 fn spawn_stalled_background_orphan_drain_server() -> (u16, mpsc::Receiver<Vec<u8>>, mpsc::Sender<()>)
@@ -888,6 +1347,88 @@ fn spawn_stalled_background_orphan_drain_server() -> (u16, mpsc::Receiver<Vec<u8
     });
 
     (port, rx, release_tx)
+}
+
+fn spawn_stalled_background_orphan_connect_server() -> (u16, mpsc::Receiver<()>, mpsc::Sender<()>) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let (accepted_tx, accepted_rx) = mpsc::channel();
+    let (release_tx, release_rx) = mpsc::channel();
+
+    thread::spawn(move || {
+        let (mut foreground, _) = listener.accept().unwrap();
+        perform_server_upgrade(&mut foreground).unwrap();
+
+        let (_orphan, _) = listener.accept().unwrap();
+        accepted_tx.send(()).unwrap();
+        let _ = release_rx.recv_timeout(Duration::from_secs(10));
+    });
+
+    (port, accepted_rx, release_tx)
+}
+
+fn spawn_stalled_first_background_orphan_connect_server() -> (
+    u16,
+    mpsc::Receiver<TcpListener>,
+    mpsc::Sender<()>,
+    thread::JoinHandle<()>,
+) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let (accepted_tx, accepted_rx) = mpsc::channel();
+    let (release_tx, release_rx) = mpsc::channel();
+
+    let server = thread::spawn(move || {
+        let (mut foreground, _) = listener.accept().unwrap();
+        perform_server_upgrade(&mut foreground).unwrap();
+
+        let (_orphan, _) = listener.accept().unwrap();
+        accepted_tx.send(listener.try_clone().unwrap()).unwrap();
+        let _ = release_rx.recv_timeout(Duration::from_secs(10));
+    });
+
+    (port, accepted_rx, release_tx, server)
+}
+
+fn spawn_blocked_background_orphan_send_server() -> (
+    u16,
+    mpsc::Receiver<()>,
+    mpsc::Sender<()>,
+    thread::JoinHandle<()>,
+) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let (send_started_tx, send_started_rx) = mpsc::channel();
+    let (release_tx, release_rx) = mpsc::channel();
+
+    let server = thread::spawn(move || {
+        let (mut foreground, _) = listener.accept().unwrap();
+        perform_server_upgrade(&mut foreground).unwrap();
+
+        let (mut orphan, _) = listener.accept().unwrap();
+        socket2::SockRef::from(&orphan)
+            .set_recv_buffer_size(4096)
+            .unwrap();
+        perform_server_upgrade(&mut orphan).unwrap();
+        orphan
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+
+        // Wait until the receive window contains data without consuming it.
+        // The queued orphan frame is 8 MiB, so leaving even this small window
+        // full forces the drainer into its blocking write path.
+        let mut peek_buf = [0u8; 4096];
+        loop {
+            if orphan.peek(&mut peek_buf).unwrap() == peek_buf.len() {
+                break;
+            }
+            thread::yield_now();
+        }
+        send_started_tx.send(()).unwrap();
+        let _ = release_rx.recv_timeout(Duration::from_secs(10));
+    });
+
+    (port, send_started_rx, release_tx, server)
 }
 
 fn spawn_role_reject_upgrade_server(
@@ -934,25 +1475,55 @@ fn spawn_role_reject_upgrade_server(
     (port, handle)
 }
 
-fn slot_has_sfa_file(slot_dir: &Path) -> bool {
-    let Ok(entries) = std::fs::read_dir(slot_dir) else {
-        return false;
-    };
-    entries.flatten().any(|entry| {
-        entry
-            .path()
-            .file_name()
-            .and_then(|name| name.to_str())
-            .is_some_and(|name| name.ends_with(".sfa"))
-    })
+/// Accepts upgrades and completes them WITHOUT echoing durable ACK (the
+/// pre-durable-ack server in a rolling upgrade) until `done` flips. Returns
+/// the number of accepted connections.
+fn spawn_no_durable_ack_upgrade_server(done: Arc<AtomicBool>) -> (u16, thread::JoinHandle<usize>) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let port = listener.local_addr().unwrap().port();
+
+    let handle = thread::spawn(move || {
+        let mut attempts = 0usize;
+        while !done.load(Ordering::Acquire) {
+            match listener.accept() {
+                Ok((mut stream, _)) => {
+                    attempts += 1;
+                    stream.set_nonblocking(false).unwrap();
+                    stream
+                        .set_read_timeout(Some(Duration::from_secs(5)))
+                        .unwrap();
+                    stream
+                        .set_write_timeout(Some(Duration::from_secs(5)))
+                        .unwrap();
+                    let _ = upgrade_mock_stream(&mut stream);
+                }
+                Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                    thread::sleep(Duration::from_millis(5));
+                }
+                Err(err) => panic!("no-durable-ack listener failed: {err}"),
+            }
+        }
+        attempts
+    });
+
+    (port, handle)
 }
 
 fn seed_orphan_slot(sf_dir: &Path) {
+    seed_orphan_slot_named(sf_dir, "orphan");
+}
+
+fn seed_orphan_slot_named(sf_dir: &Path, sender_id: &str) {
+    seed_orphan_slot_named_with_symbol(sf_dir, sender_id, "old");
+}
+
+fn seed_orphan_slot_named_with_symbol(sf_dir: &Path, sender_id: &str, symbol: &str) {
     let seed_port = spawn_upgrade_only_server();
     let seed_conf = format!(
-        "qwpws::addr=127.0.0.1:{seed_port};qwp_ws_progress=manual;\
-         sf_dir={};sender_id=orphan;sf_max_bytes=256;sf_max_total_bytes=1024;",
-        sf_dir.display()
+        "ws::addr=127.0.0.1:{seed_port};qwp_ws_progress=manual;\
+         sf_dir={};sender_id={sender_id};sf_max_segment_bytes=256;sf_max_total_bytes=1024;",
+        sf_dir.display(),
     );
     let mut seed_sender = SenderBuilder::from_conf(&seed_conf)
         .unwrap()
@@ -962,7 +1533,7 @@ fn seed_orphan_slot(sf_dir: &Path) {
     seed_buf
         .table("orphaned")
         .unwrap()
-        .symbol("src", "old")
+        .symbol("src", symbol)
         .unwrap()
         .column_i64("value", 42)
         .unwrap()
@@ -973,13 +1544,113 @@ fn seed_orphan_slot(sf_dir: &Path) {
     drop(seed_sender);
 }
 
+/// Like [`seed_orphan_slot`], but leaves TWO queued frames behind, each interning
+/// a distinct symbol, so the second bases at `delta_start == 1` and is NOT
+/// self-sufficient: it only resolves against a dictionary that already holds the
+/// first frame's symbol. The seed server upgrades but never acks, so both frames
+/// stay unresolved in the slot.
+fn seed_orphan_slot_with_two_delta_frames(sf_dir: &Path) {
+    let seed_port = spawn_upgrade_only_server();
+    let seed_conf = format!(
+        "ws::addr=127.0.0.1:{seed_port};qwp_ws_progress=manual;\
+         sf_dir={};sender_id=orphan;sf_max_segment_bytes=256;sf_max_total_bytes=1024;",
+        sf_dir.display()
+    );
+    let mut seed_sender = SenderBuilder::from_conf(&seed_conf)
+        .unwrap()
+        .build()
+        .unwrap();
+    for symbol in ["alpha", "bravo"] {
+        let mut seed_buf = seed_sender.new_buffer();
+        seed_buf
+            .table("orphaned")
+            .unwrap()
+            .symbol("src", symbol)
+            .unwrap()
+            .column_i64("value", 42)
+            .unwrap()
+            .at_now()
+            .unwrap();
+        seed_sender.flush(&mut seed_buf).unwrap();
+    }
+    drop(seed_sender);
+}
+
+fn seed_large_orphan_slot(sf_dir: &Path) {
+    let seed_port = spawn_upgrade_only_server();
+    let seed_conf = format!(
+        "ws::addr=127.0.0.1:{seed_port};qwp_ws_progress=manual;\
+         sf_dir={};sender_id=orphan;sf_max_segment_bytes=16777216;",
+        sf_dir.display()
+    );
+    let mut seed_sender = SenderBuilder::from_conf(&seed_conf)
+        .unwrap()
+        .build()
+        .unwrap();
+    let value = "x".repeat(8 * 1024 * 1024);
+    let mut seed_buf = seed_sender.new_buffer();
+    seed_buf
+        .table("orphaned")
+        .unwrap()
+        .column_str("payload", value.as_str())
+        .unwrap()
+        .at_now()
+        .unwrap();
+
+    seed_sender.flush(&mut seed_buf).unwrap();
+    drop(seed_sender);
+}
+
+/// Accepts the primary foreground sender's connection (upgraded and ignored),
+/// then the orphan drainer's: upgrades it and acks every frame it reads,
+/// forwarding each payload. Unlike [`spawn_orphan_capture_first_frame_server`]
+/// this keeps acking, so a multi-frame slot can drain to completion and a test
+/// can assert on how many frames actually arrived.
+fn spawn_orphan_drain_all_frames_server() -> (u16, mpsc::Receiver<Vec<u8>>) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let (tx, rx) = mpsc::channel();
+
+    thread::spawn(move || {
+        // The primary foreground sender's own connection. Upgrade and ignore.
+        let (mut foreground, _) = listener.accept().unwrap();
+        perform_server_upgrade(&mut foreground).unwrap();
+
+        // The orphan drainer's connection: ack each frame in wire-sequence order
+        // until it closes or the test drops the receiver.
+        let (mut orphan, _) = listener.accept().unwrap();
+        orphan
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        orphan
+            .set_write_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        perform_server_upgrade(&mut orphan).unwrap();
+        let mut wire_seq = FIRST_WIRE_SEQUENCE;
+        while let Ok((_fin, opcode, payload)) = read_frame(&mut orphan) {
+            if opcode == OPCODE_CLOSE {
+                break;
+            }
+            if write_qwp_ok_response(&mut orphan, wire_seq).is_err() {
+                break;
+            }
+            wire_seq += 1;
+            if tx.send(payload).is_err() {
+                break;
+            }
+        }
+    });
+
+    (port, rx)
+}
+
 // ---------- tests ----------
 
 #[test]
 fn qwp_ws_round_trip_minimal_message() {
     let (port, rx) = spawn_mock_server();
 
-    let mut sender = SenderBuilder::new(Protocol::QwpWs, "127.0.0.1", port)
+    let mut sender = SenderBuilder::new(Protocol::Ws, "127.0.0.1", port)
         .build()
         .unwrap();
     let mut buf = sender.new_buffer();
@@ -1038,7 +1709,7 @@ fn qwp_ws_max_buf_size_allows_frame_when_encoded_replay_len_fits_in_all_progress
     for progress in [ProgressCase::Background, ProgressCase::Manual] {
         let max = 1024;
         let (port, rx) = spawn_mock_server();
-        let builder = SenderBuilder::new(Protocol::QwpWs, "127.0.0.1", port)
+        let builder = SenderBuilder::new(Protocol::Ws, "127.0.0.1", port)
             .max_buf_size(max)
             .unwrap();
         let mut sender = match progress {
@@ -1094,7 +1765,7 @@ fn qwp_ws_max_buf_size_rejects_oversized_replay_frame_in_all_progress_modes() {
         let max = encoded_len - 1;
 
         let port = spawn_upgrade_only_server();
-        let builder = SenderBuilder::new(Protocol::QwpWs, "127.0.0.1", port)
+        let builder = SenderBuilder::new(Protocol::Ws, "127.0.0.1", port)
             .max_buf_size(max)
             .unwrap();
         let mut sender = match progress {
@@ -1124,6 +1795,68 @@ fn qwp_ws_max_buf_size_rejects_oversized_replay_frame_in_all_progress_modes() {
     }
 }
 
+fn assert_durable_ack_without_opt_in(err: crate::Error, mode: ProgressCase) {
+    assert_eq!(
+        err.code(),
+        ErrorCode::InvalidApiCall,
+        "mode={}",
+        mode.name()
+    );
+    assert_eq!(
+        err.msg(),
+        "AckLevel::Durable requires the pool to be opened with \
+         `request_durable_ack=on` in the connect string.",
+        "mode={}",
+        mode.name()
+    );
+}
+
+#[test]
+fn qwp_ws_wait_durable_without_opt_in_fails_with_no_published_frames_in_all_progress_modes() {
+    for progress in [ProgressCase::Background, ProgressCase::Manual] {
+        let port = spawn_upgrade_only_server();
+        let mut sender = build_qwp_ws_sender(progress, port);
+
+        let err = sender
+            .wait(crate::ingress::AckLevel::Durable, Duration::from_secs(5))
+            .expect_err("durable wait without opt-in must fail before the empty-stream shortcut");
+        assert_durable_ack_without_opt_in(err, progress);
+        assert_eq!(sender.published_fsn().unwrap(), None);
+    }
+}
+
+#[test]
+fn qwp_ws_wait_durable_without_opt_in_fails_after_ok_ack_in_all_progress_modes() {
+    for progress in [ProgressCase::Background, ProgressCase::Manual] {
+        let (port, rx) = spawn_mock_server();
+        let mut sender = build_qwp_ws_sender(progress, port);
+
+        let mut buf = sender.new_buffer();
+        buf.table("trades")
+            .unwrap()
+            .symbol("sym", "ETH-USD")
+            .unwrap()
+            .column_i64("qty", 7)
+            .unwrap()
+            .at_now()
+            .unwrap();
+
+        let fsn = sender.flush_and_get_fsn(&mut buf).unwrap().unwrap();
+        sender
+            .wait(crate::ingress::AckLevel::Ok, Duration::from_secs(5))
+            .unwrap_or_else(|e| panic!("mode={}: {e}", progress.name()));
+        assert_eq!(sender.acked_fsn().unwrap(), Some(fsn));
+
+        let err = sender
+            .wait(crate::ingress::AckLevel::Durable, Duration::from_secs(5))
+            .expect_err("durable wait without opt-in must fail after OK coverage too");
+        assert_durable_ack_without_opt_in(err, progress);
+
+        let result = rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert_eq!(result.received_frames.len(), 1, "mode={}", progress.name());
+    }
+}
+
 #[test]
 fn qwp_ws_publish_ack_completes_in_all_progress_modes() {
     for progress in [ProgressCase::Background, ProgressCase::Manual] {
@@ -1145,11 +1878,9 @@ fn qwp_ws_publish_ack_completes_in_all_progress_modes() {
         let fsn = sender.flush_and_get_fsn(&mut buf).unwrap().unwrap();
         assert_eq!(fsn, 0, "mode={}", progress.name());
         assert!(buf.is_empty(), "mode={}", progress.name());
-        assert!(
-            sender.await_acked_fsn(fsn, Duration::from_secs(5)).unwrap(),
-            "mode={}",
-            progress.name()
-        );
+        sender
+            .wait(crate::ingress::AckLevel::Ok, Duration::from_secs(5))
+            .unwrap_or_else(|e| panic!("mode={}: {e}", progress.name()));
         assert_eq!(sender.published_fsn().unwrap(), Some(fsn));
         assert_eq!(sender.acked_fsn().unwrap(), Some(fsn));
         assert!(!sender.must_close(), "mode={}", progress.name());
@@ -1161,18 +1892,13 @@ fn qwp_ws_publish_ack_completes_in_all_progress_modes() {
 }
 
 #[test]
-fn qwp_ws_drop_reject_reports_error_and_continues_in_all_progress_modes() {
+fn qwp_ws_schema_reject_terminalizes_in_all_progress_modes() {
     for progress in [ProgressCase::Background, ProgressCase::Manual] {
-        let (port, rx) = spawn_two_response_server(
-            MockQwpResponse::Error {
-                status: QWP_STATUS_SCHEMA_MISMATCH,
-                wire_seq: FIRST_WIRE_SEQUENCE,
-                message: b"bad schema",
-            },
-            MockQwpResponse::Ok {
-                wire_seq: FIRST_WIRE_SEQUENCE + 1,
-            },
-        );
+        let (port, rx) = spawn_one_response_server(MockQwpResponse::Error {
+            status: QWP_STATUS_SCHEMA_MISMATCH,
+            wire_seq: FIRST_WIRE_SEQUENCE,
+            message: b"bad schema",
+        });
         let mut sender = build_qwp_ws_sender(progress, port);
 
         let mut buf = sender.new_buffer();
@@ -1182,49 +1908,48 @@ fn qwp_ws_drop_reject_reports_error_and_continues_in_all_progress_modes() {
             .unwrap()
             .at_now()
             .unwrap();
-        let first_fsn = sender.flush_and_get_fsn(&mut buf).unwrap().unwrap();
+        let fsn = sender.flush_and_get_fsn(&mut buf).unwrap().unwrap();
+        assert_eq!(fsn, 0, "mode={}", progress.name());
 
-        buf.table("trades")
-            .unwrap()
-            .column_i64("qty", 2)
-            .unwrap()
-            .at_now()
-            .unwrap();
-        let second_fsn = sender.flush_and_get_fsn(&mut buf).unwrap().unwrap();
-
-        assert_eq!(first_fsn, 0, "mode={}", progress.name());
-        assert_eq!(second_fsn, 1, "mode={}", progress.name());
+        let err = sender
+            .wait(crate::ingress::AckLevel::Ok, Duration::from_secs(5))
+            .unwrap_err();
+        assert_eq!(err.code(), ErrorCode::ServerRejection);
         assert!(
-            sender
-                .await_acked_fsn(second_fsn, Duration::from_secs(5))
-                .unwrap(),
+            err.msg().contains("bad schema"),
+            "mode={}, got: {}",
+            progress.name(),
+            err.msg()
+        );
+        assert_eq!(
+            err.qwp_ws_rejection().map(|error| error.category),
+            Some(QwpWsErrorCategory::SchemaMismatch),
             "mode={}",
             progress.name()
         );
-        assert_eq!(sender.acked_fsn().unwrap(), Some(second_fsn));
 
         let received = rx.recv_timeout(Duration::from_secs(5)).unwrap();
         assert_eq!(
             received.received_frames.len(),
-            2,
+            1,
             "mode={}",
             progress.name()
         );
 
         let qwp_error = sender.poll_qwp_ws_error().unwrap().unwrap();
         assert_eq!(qwp_error.category, QwpWsErrorCategory::SchemaMismatch);
-        assert_eq!(qwp_error.applied_policy, QwpWsErrorPolicy::DropAndContinue);
+        assert_eq!(qwp_error.applied_policy, QwpWsErrorPolicy::Terminal);
         assert_eq!(qwp_error.status, Some(QWP_STATUS_SCHEMA_MISMATCH));
         assert_eq!(qwp_error.message.as_deref(), Some("bad schema"));
         assert_eq!(qwp_error.message_sequence, Some(FIRST_WIRE_SEQUENCE));
-        assert_eq!(qwp_error.from_fsn, first_fsn);
-        assert_eq!(qwp_error.to_fsn, first_fsn);
+        assert_eq!(qwp_error.from_fsn, fsn);
+        assert_eq!(qwp_error.to_fsn, fsn);
         assert_eq!(sender.poll_qwp_ws_error().unwrap(), None);
     }
 }
 
 #[test]
-fn qwp_ws_halt_reject_terminalizes_in_all_progress_modes() {
+fn qwp_ws_terminal_reject_terminalizes_in_all_progress_modes() {
     for progress in [ProgressCase::Background, ProgressCase::Manual] {
         let (port, rx) = spawn_one_response_server(MockQwpResponse::Error {
             status: QWP_STATUS_PARSE_ERROR,
@@ -1244,7 +1969,7 @@ fn qwp_ws_halt_reject_terminalizes_in_all_progress_modes() {
         assert_eq!(fsn, 0, "mode={}", progress.name());
 
         let err = sender
-            .await_acked_fsn(fsn, Duration::from_secs(5))
+            .wait(crate::ingress::AckLevel::Ok, Duration::from_secs(5))
             .unwrap_err();
         assert_eq!(err.code(), ErrorCode::ServerRejection);
         assert!(
@@ -1265,7 +1990,7 @@ fn qwp_ws_halt_reject_terminalizes_in_all_progress_modes() {
 
         let qwp_error = sender.poll_qwp_ws_error().unwrap().unwrap();
         assert_eq!(qwp_error.category, QwpWsErrorCategory::ParseError);
-        assert_eq!(qwp_error.applied_policy, QwpWsErrorPolicy::Halt);
+        assert_eq!(qwp_error.applied_policy, QwpWsErrorPolicy::Terminal);
         assert_eq!(qwp_error.status, Some(QWP_STATUS_PARSE_ERROR));
         assert_eq!(qwp_error.message.as_deref(), Some("bad column"));
         assert_eq!(qwp_error.message_sequence, Some(FIRST_WIRE_SEQUENCE));
@@ -1298,7 +2023,7 @@ fn qwp_ws_backpressure_timeout_matches_in_all_progress_modes() {
     for progress in [ProgressCase::Background, ProgressCase::Manual] {
         let (port, frame_rx, release_tx) = spawn_stalled_after_first_frame_server();
         let conf = format!(
-            "qwpws::addr=127.0.0.1:{port};\
+            "ws::addr=127.0.0.1:{port};\
              qwp_ws_progress={};\
              max_in_flight=1;\
              sf_append_deadline_millis=20;",
@@ -1357,7 +2082,7 @@ fn qwp_ws_durable_ack_requires_upgrade_echo() {
         request_tx.send(request_lines).unwrap();
     });
 
-    let conf = format!("qwpws::addr=127.0.0.1:{port};request_durable_ack=on;");
+    let conf = format!("ws::addr=127.0.0.1:{port};request_durable_ack=on;");
     let err = SenderBuilder::from_conf(conf).unwrap().build().unwrap_err();
     assert!(
         err.msg().contains("server did not enable durable ACK"),
@@ -1423,7 +2148,7 @@ fn qwp_ws_durable_ack_completion_waits_for_durable_confirmation_in_all_progress_
         });
 
         let conf = format!(
-            "qwpws::addr=127.0.0.1:{port};\
+            "ws::addr=127.0.0.1:{port};\
              qwp_ws_progress={};\
              request_durable_ack=on;\
              durable_ack_keepalive_interval_millis=1;",
@@ -1441,12 +2166,22 @@ fn qwp_ws_durable_ack_completion_waits_for_durable_confirmation_in_all_progress_
             .unwrap();
 
         let fsn = sender.flush_and_get_fsn(&mut buf).unwrap().unwrap();
+        // The durable ack is gated server-side: a bounded wait must time out.
+        let err = sender
+            .wait(crate::ingress::AckLevel::Durable, Duration::from_millis(50))
+            .expect_err("gated durable ack must time out the bounded wait");
+        assert_eq!(
+            err.code(),
+            ErrorCode::FailoverRetry,
+            "mode={}: {}",
+            progress.name(),
+            err.msg()
+        );
         assert!(
-            !sender
-                .await_acked_fsn(fsn, Duration::from_millis(50))
-                .unwrap(),
-            "mode={}",
-            progress.name()
+            err.msg().contains("timed out"),
+            "mode={}: {}",
+            progress.name(),
+            err.msg()
         );
         assert_eq!(
             sender.acked_fsn().unwrap(),
@@ -1456,11 +2191,9 @@ fn qwp_ws_durable_ack_completion_waits_for_durable_confirmation_in_all_progress_
         );
 
         allow_ack_tx.send(()).unwrap();
-        assert!(
-            sender.await_acked_fsn(fsn, Duration::from_secs(5)).unwrap(),
-            "mode={}",
-            progress.name()
-        );
+        sender
+            .wait(crate::ingress::AckLevel::Durable, Duration::from_secs(5))
+            .unwrap_or_else(|e| panic!("mode={}: {e}", progress.name()));
         assert_eq!(ping_rx.recv_timeout(Duration::from_secs(5)).unwrap(), b"");
         assert_eq!(sender.acked_fsn().unwrap(), Some(fsn));
         done_tx.send(()).unwrap();
@@ -1498,6 +2231,57 @@ fn qwp_ws_sender_fsn_watermarks_and_close_drain_work_in_all_progress_modes() {
 }
 
 #[test]
+fn sender_sfa_fully_delivered_tracks_ok_and_durable_watermarks() {
+    let (port, frame_rx, ok_tx, durable_tx) = spawn_delayed_durable_ack_server();
+    let conf = format!("ws::addr=127.0.0.1:{port};request_durable_ack=on;");
+    let mut sender = SenderBuilder::from_conf(conf).unwrap().build().unwrap();
+    assert!(sender.sfa_fully_delivered(false));
+    assert!(sender.sfa_fully_delivered(true));
+
+    let mut buf = sender.new_buffer();
+    buf.table("trades")
+        .unwrap()
+        .column_i64("qty", 7)
+        .unwrap()
+        .at_now()
+        .unwrap();
+    let fsn = sender.flush_and_get_fsn(&mut buf).unwrap().unwrap();
+    assert_eq!(fsn, FIRST_WIRE_SEQUENCE);
+    let payload = frame_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    assert_eq!(&payload[0..4], b"QWP1");
+    assert!(!sender.sfa_fully_delivered(false));
+    assert!(!sender.sfa_fully_delivered(true));
+
+    ok_tx.send(()).unwrap();
+    assert!(
+        wait_until(Duration::from_secs(5), || sender.sfa_fully_delivered(false)),
+        "OK watermark should cover the published frame"
+    );
+    assert!(
+        !sender.sfa_fully_delivered(true),
+        "durable watermark must wait for durable ACK coverage"
+    );
+
+    durable_tx.send(()).unwrap();
+    sender
+        .wait(crate::ingress::AckLevel::Durable, Duration::from_secs(5))
+        .unwrap();
+    assert!(sender.sfa_fully_delivered(false));
+    assert!(sender.sfa_fully_delivered(true));
+
+    #[cfg(feature = "sync-sender-http")]
+    {
+        let http_sender = SenderBuilder::new(Protocol::Http, "127.0.0.1", 1)
+            .protocol_version(ProtocolVersion::V1)
+            .unwrap()
+            .build()
+            .unwrap();
+        assert!(http_sender.sfa_fully_delivered(false));
+        assert!(http_sender.sfa_fully_delivered(true));
+    }
+}
+
+#[test]
 fn qwp_ws_close_flush_timeout_minus_one_skips_close_drain_wait() {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();
@@ -1517,7 +2301,7 @@ fn qwp_ws_close_flush_timeout_minus_one_skips_close_drain_wait() {
         thread::sleep(Duration::from_millis(500));
     });
 
-    let conf = format!("qwpws::addr=127.0.0.1:{port};close_flush_timeout_millis=-1;");
+    let conf = format!("ws::addr=127.0.0.1:{port};close_flush_timeout_millis=-1;");
     let mut sender = SenderBuilder::from_conf(&conf).unwrap().build().unwrap();
     let mut buf = sender.new_buffer();
     buf.table("trades")
@@ -1542,6 +2326,189 @@ fn qwp_ws_close_flush_timeout_minus_one_skips_close_drain_wait() {
     server.join().unwrap();
 }
 
+#[test]
+fn qwp_ws_drop_interrupts_blocked_background_send() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let (send_started_tx, send_started_rx) = mpsc::channel();
+    let (release_tx, release_rx) = mpsc::channel();
+
+    let server = thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        socket2::SockRef::from(&stream)
+            .set_recv_buffer_size(4096)
+            .unwrap();
+        upgrade_mock_stream(&mut stream);
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+
+        // Observe the first data byte without consuming it, then leave the
+        // receive window full so the client's large frame blocks in write().
+        let mut byte = [0u8; 1];
+        stream.peek(&mut byte).unwrap();
+        send_started_tx.send(()).unwrap();
+        let _ = release_rx.recv_timeout(Duration::from_secs(10));
+    });
+
+    let conf = format!(
+        "ws::addr=127.0.0.1:{port};\
+         close_flush_timeout_millis=-1;\
+         sf_max_segment_bytes=16777216;"
+    );
+    let mut sender = SenderBuilder::from_conf(&conf).unwrap().build().unwrap();
+    let value = "x".repeat(8 * 1024 * 1024);
+    let mut buf = sender.new_buffer();
+    buf.table("trades")
+        .unwrap()
+        .column_str("payload", value.as_str())
+        .unwrap()
+        .at_now()
+        .unwrap();
+    sender.flush(&mut buf).unwrap();
+
+    send_started_rx
+        .recv_timeout(Duration::from_secs(5))
+        .unwrap();
+
+    let started = Instant::now();
+    drop(sender);
+    let elapsed = started.elapsed();
+    let _ = release_tx.send(());
+    server.join().unwrap();
+
+    assert!(
+        elapsed < Duration::from_secs(1),
+        "drop waited for the socket write timeout: {elapsed:?}"
+    );
+}
+
+#[test]
+fn qwp_ws_drop_interrupts_blocked_send_after_reconnect() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let (send_started_tx, send_started_rx) = mpsc::channel();
+    let (release_tx, release_rx) = mpsc::channel();
+
+    let server = thread::spawn(move || {
+        let (mut first, _) = listener.accept().unwrap();
+        upgrade_mock_stream(&mut first);
+        drop(first);
+
+        let (mut second, _) = listener.accept().unwrap();
+        socket2::SockRef::from(&second)
+            .set_recv_buffer_size(4096)
+            .unwrap();
+        upgrade_mock_stream(&mut second);
+        second
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let mut byte = [0u8; 1];
+        second.peek(&mut byte).unwrap();
+        send_started_tx.send(()).unwrap();
+        let _ = release_rx.recv_timeout(Duration::from_secs(10));
+    });
+
+    let conf = format!(
+        "ws::addr=127.0.0.1:{port};\
+         close_flush_timeout_millis=-1;\
+         sf_max_segment_bytes=16777216;"
+    );
+    let mut sender = SenderBuilder::from_conf(&conf).unwrap().build().unwrap();
+    let value = "x".repeat(8 * 1024 * 1024);
+    let mut buf = sender.new_buffer();
+    buf.table("trades")
+        .unwrap()
+        .column_str("payload", value.as_str())
+        .unwrap()
+        .at_now()
+        .unwrap();
+    sender.flush(&mut buf).unwrap();
+
+    send_started_rx
+        .recv_timeout(Duration::from_secs(5))
+        .unwrap();
+
+    let started = Instant::now();
+    drop(sender);
+    let elapsed = started.elapsed();
+    let _ = release_tx.send(());
+    server.join().unwrap();
+
+    assert!(
+        elapsed < Duration::from_secs(1),
+        "drop waited on the replacement socket after reconnect: {elapsed:?}"
+    );
+}
+
+fn assert_qwp_ws_drop_interrupts_stalled_connect(scheme: &str, tls_options: &str) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let wait_for_client_hello = scheme == "wss";
+    let (connect_stalled_tx, connect_stalled_rx) = mpsc::channel();
+    let (release_tx, release_rx) = mpsc::channel();
+
+    let server = thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        if wait_for_client_hello {
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+
+            let mut record_header = [0u8; 5];
+            stream.read_exact(&mut record_header).unwrap();
+            assert_eq!(record_header[0], 0x16, "expected a TLS handshake record");
+
+            let record_len = u16::from_be_bytes([record_header[3], record_header[4]]) as usize;
+            let mut record = vec![0u8; record_len];
+            stream.read_exact(&mut record).unwrap();
+            assert_eq!(record.first(), Some(&0x01), "expected a TLS ClientHello");
+
+            // Give the client time to finish writing the ClientHello and block
+            // waiting for the ServerHello. This delay is outside the measured
+            // sender shutdown interval.
+            thread::sleep(Duration::from_millis(200));
+        }
+        connect_stalled_tx.send(()).unwrap();
+        let _ = release_rx.recv_timeout(Duration::from_secs(10));
+    });
+
+    let conf = format!(
+        "{scheme}::addr=127.0.0.1:{port};\
+         initial_connect_retry=async;\
+         {tls_options}"
+    );
+    let sender = SenderBuilder::from_conf(&conf).unwrap().build().unwrap();
+    connect_stalled_rx
+        .recv_timeout(Duration::from_secs(5))
+        .unwrap();
+
+    let started = Instant::now();
+    drop(sender);
+    let elapsed = started.elapsed();
+    let _ = release_tx.send(());
+    server.join().unwrap();
+
+    assert!(
+        elapsed < Duration::from_secs(1),
+        "{scheme} drop did not interrupt the stalled connect phase: {elapsed:?}"
+    );
+}
+
+#[test]
+fn qwp_ws_drop_interrupts_stalled_websocket_upgrade() {
+    assert_qwp_ws_drop_interrupts_stalled_connect("ws", "");
+}
+
+#[test]
+fn qwp_ws_drop_interrupts_stalled_tls_handshake() {
+    let mut cert = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    cert.pop();
+    cert.push("tls_certs/server_rootCA.pem");
+    let tls_options = format!("tls_roots={};", cert.display());
+    assert_qwp_ws_drop_interrupts_stalled_connect("wss", &tls_options);
+}
+
 /// Run with:
 /// `QWP_WS_PUBLIC_BENCH_ROWS=20000000 cargo test --release --manifest-path questdb-rs/Cargo.toml --features sync-sender-qwp-ws qwp_ws_public_sender_batch_throughput_benchmark --lib -- --ignored --nocapture --test-threads=1`
 #[test]
@@ -1564,7 +2531,7 @@ fn qwp_ws_public_sender_batch_throughput_benchmark() {
     assert!(in_flight > 1);
 
     let (port, server) = spawn_ack_each_frame_server();
-    let conf = format!("qwpws::addr=127.0.0.1:{port};in_flight_window={in_flight};");
+    let conf = format!("ws::addr=127.0.0.1:{port};in_flight_window={in_flight};");
     let mut sender = SenderBuilder::from_conf(conf).unwrap().build().unwrap();
     let mut buffer = sender.new_buffer();
 
@@ -1691,7 +2658,7 @@ fn qwp_ws_manual_sender_can_pipeline_before_waiting() {
         thread::sleep(Duration::from_millis(50));
     });
 
-    let mut sender = SenderBuilder::new(Protocol::QwpWs, "127.0.0.1", port)
+    let mut sender = SenderBuilder::new(Protocol::Ws, "127.0.0.1", port)
         .max_in_flight(2)
         .unwrap()
         .qwp_ws_progress(QwpWsProgress::Manual)
@@ -1737,16 +2704,14 @@ fn qwp_ws_manual_sender_can_pipeline_before_waiting() {
     assert_eq!(&frames[0][0..4], b"QWP1");
     assert_eq!(&frames[1][0..4], b"QWP1");
 
-    assert!(
-        sender
-            .await_acked_fsn(second_fsn, Duration::from_secs(5))
-            .unwrap()
-    );
+    sender
+        .wait(crate::ingress::AckLevel::Ok, Duration::from_secs(5))
+        .unwrap();
     assert_eq!(sender.acked_fsn().unwrap(), Some(second_fsn));
 }
 
 #[test]
-fn qwp_ws_manual_sender_advances_ack_watermark_across_rejections() {
+fn qwp_ws_manual_sender_schema_rejection_terminalizes_without_ack_advance() {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();
 
@@ -1774,7 +2739,6 @@ fn qwp_ws_manual_sender_advances_ack_watermark_across_rejections() {
         stream.write_all(response.as_bytes()).unwrap();
 
         let (_fin, _opcode, _first) = read_frame(&mut stream).unwrap();
-        let (_fin, _opcode, _second) = read_frame(&mut stream).unwrap();
         write_qwp_error_response(
             &mut stream,
             QWP_STATUS_SCHEMA_MISMATCH,
@@ -1782,19 +2746,10 @@ fn qwp_ws_manual_sender_advances_ack_watermark_across_rejections() {
             b"first bad",
         )
         .unwrap();
-        write_qwp_error_response(
-            &mut stream,
-            QWP_STATUS_SCHEMA_MISMATCH,
-            FIRST_WIRE_SEQUENCE + 1,
-            b"second bad",
-        )
-        .unwrap();
         thread::sleep(Duration::from_millis(50));
     });
 
-    let mut sender = SenderBuilder::new(Protocol::QwpWs, "127.0.0.1", port)
-        .max_in_flight(2)
-        .unwrap()
+    let mut sender = SenderBuilder::new(Protocol::Ws, "127.0.0.1", port)
         .qwp_ws_progress(QwpWsProgress::Manual)
         .unwrap()
         .build()
@@ -1810,50 +2765,34 @@ fn qwp_ws_manual_sender_advances_ack_watermark_across_rejections() {
         .unwrap();
     let first_fsn = sender.flush_and_get_fsn(&mut first).unwrap().unwrap();
 
-    let mut second = sender.new_buffer();
-    second
-        .table("trades")
-        .unwrap()
-        .column_i64("qty", 2)
-        .unwrap()
-        .at_now()
-        .unwrap();
-    let second_fsn = sender.flush_and_get_fsn(&mut second).unwrap().unwrap();
-
     assert_eq!(first_fsn, 0);
-    assert_eq!(second_fsn, 1);
-    assert!(sender.drive_once().unwrap());
-    assert!(sender.drive_once().unwrap());
-    assert!(
-        sender
-            .await_acked_fsn(second_fsn, Duration::from_secs(5))
-            .unwrap()
+    assert_eq!(sender.acked_fsn().unwrap(), None);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let err = loop {
+        match sender.drive_once() {
+            Ok(_) if Instant::now() < deadline => {
+                assert_eq!(sender.acked_fsn().ok().flatten(), None);
+                thread::sleep(Duration::from_millis(10));
+            }
+            Ok(progressed) => {
+                panic!("schema rejection did not terminalize sender; last progressed={progressed}")
+            }
+            Err(err) => break err,
+        }
+    };
+    assert_eq!(err.code(), ErrorCode::ServerRejection);
+    assert_eq!(
+        err.qwp_ws_rejection().map(|error| error.category),
+        Some(QwpWsErrorCategory::SchemaMismatch)
     );
-    assert_eq!(sender.acked_fsn().unwrap(), Some(second_fsn));
-
     let first_error = sender.poll_qwp_ws_error().unwrap().unwrap();
     assert_eq!(first_error.category, QwpWsErrorCategory::SchemaMismatch);
-    assert_eq!(
-        first_error.applied_policy,
-        QwpWsErrorPolicy::DropAndContinue
-    );
+    assert_eq!(first_error.applied_policy, QwpWsErrorPolicy::Terminal);
     assert_eq!(first_error.status, Some(QWP_STATUS_SCHEMA_MISMATCH));
     assert_eq!(first_error.message.as_deref(), Some("first bad"));
     assert_eq!(first_error.message_sequence, Some(FIRST_WIRE_SEQUENCE));
     assert_eq!(first_error.from_fsn, first_fsn);
     assert_eq!(first_error.to_fsn, first_fsn);
-
-    let second_error = sender.poll_qwp_ws_error().unwrap().unwrap();
-    assert_eq!(second_error.category, QwpWsErrorCategory::SchemaMismatch);
-    assert_eq!(
-        second_error.applied_policy,
-        QwpWsErrorPolicy::DropAndContinue
-    );
-    assert_eq!(second_error.status, Some(QWP_STATUS_SCHEMA_MISMATCH));
-    assert_eq!(second_error.message.as_deref(), Some("second bad"));
-    assert_eq!(second_error.message_sequence, Some(FIRST_WIRE_SEQUENCE + 1));
-    assert_eq!(second_error.from_fsn, second_fsn);
-    assert_eq!(second_error.to_fsn, second_fsn);
     assert_eq!(sender.poll_qwp_ws_error().unwrap(), None);
     assert_eq!(sender.qwp_ws_errors_dropped().unwrap(), 0);
 }
@@ -1863,7 +2802,7 @@ fn qwp_ws_store_and_forward_config_opens_java_slot_layout() {
     let (port, rx) = spawn_mock_server();
     let sf_dir = tempfile::TempDir::new().unwrap();
     let conf = format!(
-        "qwpws::addr=127.0.0.1:{port};sf_dir={};sender_id=primary;",
+        "ws::addr=127.0.0.1:{port};sf_dir={};sender_id=primary;",
         sf_dir.path().display()
     );
 
@@ -1886,8 +2825,8 @@ fn qwp_ws_store_and_forward_config_opens_java_slot_layout() {
 fn qwp_ws_store_and_forward_rejects_one_segment_total_capacity() {
     let sf_dir = tempfile::TempDir::new().unwrap();
     let conf = format!(
-        "qwpws::addr=127.0.0.1:1;sf_dir={};sender_id=primary;\
-         sf_max_bytes=256;sf_max_total_bytes=256;",
+        "ws::addr=127.0.0.1:1;sf_dir={};sender_id=primary;\
+         sf_max_segment_bytes=256;sf_max_total_bytes=256;",
         sf_dir.path().display()
     );
 
@@ -1912,8 +2851,8 @@ fn qwp_ws_manual_orphan_drainer_replays_sibling_slot() {
     let seed_port = spawn_upgrade_only_server();
     let sf_dir = tempfile::TempDir::new().unwrap();
     let seed_conf = format!(
-        "qwpws::addr=127.0.0.1:{seed_port};qwp_ws_progress=manual;\
-         sf_dir={};sender_id=orphan;sf_max_bytes=256;sf_max_total_bytes=1024;",
+        "ws::addr=127.0.0.1:{seed_port};qwp_ws_progress=manual;\
+         sf_dir={};sender_id=orphan;sf_max_segment_bytes=256;sf_max_total_bytes=1024;",
         sf_dir.path().display()
     );
     let mut seed_sender = SenderBuilder::from_conf(&seed_conf)
@@ -1936,9 +2875,9 @@ fn qwp_ws_manual_orphan_drainer_replays_sibling_slot() {
 
     let (port, rx) = spawn_manual_orphan_drain_server();
     let drain_conf = format!(
-        "qwpws::addr=127.0.0.1:{port};qwp_ws_progress=manual;\
+        "ws::addr=127.0.0.1:{port};qwp_ws_progress=manual;\
          sf_dir={};sender_id=primary;drain_orphans=on;\
-         max_background_drainers=1;sf_max_bytes=256;sf_max_total_bytes=1024;",
+         max_background_drainers=1;sf_max_segment_bytes=256;sf_max_total_bytes=1024;",
         sf_dir.path().display()
     );
     let mut sender = SenderBuilder::from_conf(&drain_conf)
@@ -1972,18 +2911,477 @@ fn qwp_ws_manual_orphan_drainer_replays_sibling_slot() {
 }
 
 #[test]
+fn qwp_ws_orphan_dict_copy_oom_retries_without_failed_sentinel() {
+    let sf_dir = tempfile::TempDir::new().unwrap();
+    seed_orphan_slot_with_two_delta_frames(sf_dir.path());
+    let orphan_slot = sf_dir.path().join("orphan");
+
+    let (port, drained_rx) = spawn_two_frame_orphan_drain_server();
+    let drain_conf = format!(
+        "ws::addr=127.0.0.1:{port};qwp_ws_progress=manual;\
+         sf_dir={};sender_id=primary;drain_orphans=on;\
+         max_background_drainers=1;sf_max_segment_bytes=256;sf_max_total_bytes=1024;",
+        sf_dir.path().display()
+    );
+    let mut sender = SenderBuilder::from_conf(&drain_conf)
+        .unwrap()
+        .build()
+        .unwrap();
+
+    fail_next_recovered_dict_copy_for_test();
+    assert!(sender.drive_once().unwrap());
+
+    let last_error = orphan_slot.join(".last_error");
+    assert!(
+        !orphan_slot.join(".failed").exists(),
+        "transient dictionary allocation failure must not quarantine the slot"
+    );
+    let retry_reason = std::fs::read_to_string(&last_error)
+        .expect("transient dictionary allocation failure must record its retry reason");
+    assert!(
+        retry_reason.contains("injected recovered symbol dictionary allocation failure"),
+        "unexpected orphan retry reason: {retry_reason}"
+    );
+    assert!(
+        slot_has_sfa_file(&orphan_slot),
+        "a retryable allocation failure must retain the durable slot"
+    );
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut drained_frames = None;
+    while Instant::now() < deadline {
+        if let Ok(frames) = drained_rx.try_recv() {
+            drained_frames = Some(frames);
+            break;
+        }
+        let _ = sender.drive_once().unwrap();
+        thread::sleep(Duration::from_millis(10));
+    }
+
+    let drained_frames = drained_frames.expect("the retried orphan drain did not complete");
+    assert_eq!(drained_frames.len(), 2);
+    let mut delta_pos = 12;
+    assert_eq!(
+        read_varint(&drained_frames[1], &mut delta_pos),
+        1,
+        "the second persisted frame must depend on recovered dictionary id 0"
+    );
+    assert!(
+        !orphan_slot.join(".failed").exists(),
+        "a retried allocation failure must never write the permanent sentinel"
+    );
+
+    let fully_drained = wait_until(Duration::from_secs(5), || {
+        let _ = sender.drive_once().unwrap();
+        !slot_has_sfa_file(&orphan_slot) && !last_error.exists()
+    });
+    assert!(
+        fully_drained,
+        "the intact delta slot did not drain cleanly after the allocation failure cleared; \
+         has_sfa={}, last_error={}",
+        slot_has_sfa_file(&orphan_slot),
+        std::fs::read_to_string(&last_error).unwrap_or_default()
+    );
+    assert!(!orphan_slot.join(".failed").exists());
+}
+
+/// Captures the FIRST frame an orphan drainer sends, then acks it at wire seq 0
+/// (the dense-fallback case sends the data frame first, with no preceding
+/// table-less catch-up), so a corrupt-dict orphan drain can complete. The first
+/// accepted connection is the primary foreground sender (upgraded and ignored);
+/// the second is the orphan drainer.
+fn spawn_orphan_capture_first_frame_server() -> (u16, mpsc::Receiver<Vec<u8>>) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let (tx, rx) = mpsc::channel();
+
+    thread::spawn(move || {
+        // The primary foreground sender's own connection. Upgrade and ignore.
+        let (mut foreground, _) = listener.accept().unwrap();
+        perform_server_upgrade(&mut foreground).unwrap();
+
+        // The orphan drainer's connection: capture its first frame and ack it.
+        let (mut orphan, _) = listener.accept().unwrap();
+        orphan
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        orphan
+            .set_write_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        perform_server_upgrade(&mut orphan).unwrap();
+        if let Ok((_fin, _op, first)) = read_frame(&mut orphan) {
+            let _ = tx.send(first);
+            let _ = write_qwp_ok_response(&mut orphan, FIRST_WIRE_SEQUENCE);
+        }
+        thread::sleep(Duration::from_millis(50));
+    });
+
+    (port, rx)
+}
+
+#[test]
+fn qwp_ws_orphan_drain_heals_a_zero_extended_side_file_and_replays_via_delta() {
+    // A host/power crash can zero-extend a delta slot's `.symbol-dict`. With the
+    // per-chunk CRC (see `qwp_ws_sfa_symbol_dict`), those trailing zeros cannot
+    // form a valid chunk -- their leading entryCount varint decodes to 0, which
+    // `open` rejects -- so `open` heals them at recovery and the recovered
+    // dictionary is exactly the real symbols -- never inflated with phantom
+    // entries (the pre-CRC hazard this test used to exercise). The orphan
+    // drainer therefore arms delta on the CLEAN recovered dictionary and
+    // re-registers the real symbol via a table-less catch-up frame before replaying
+    // the DATA frame, and the slot stays recoverable.
+    //
+    // Observable: the orphan's FIRST sent frame is the table-less catch-up
+    // (`table_count == 0`) that re-registers the one real recovered symbol. (Before
+    // the CRC, the zero tail inflated the count and the drainer fell back to dense,
+    // sending the DATA frame first with `table_count >= 1`.)
+    let sf_dir = tempfile::TempDir::new().unwrap();
+    seed_orphan_slot(sf_dir.path());
+
+    // Simulate unflushed tail pages read back as zeros: append `[len=0]` entries
+    // to the slot's side-file so the recovered count is inflated past the one
+    // real symbol the seed persisted.
+    let side_file = sf_dir.path().join("orphan").join(".symbol-dict");
+    {
+        let mut f = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&side_file)
+            .expect("seed must have written a delta-mode side-file");
+        f.write_all(&[0u8; 4]).unwrap();
+    }
+
+    let (port, rx) = spawn_orphan_capture_first_frame_server();
+    let drain_conf = format!(
+        "ws::addr=127.0.0.1:{port};qwp_ws_progress=manual;\
+         sf_dir={};sender_id=primary;drain_orphans=on;\
+         max_background_drainers=1;sf_max_segment_bytes=256;sf_max_total_bytes=1024;",
+        sf_dir.path().display()
+    );
+    let mut sender = SenderBuilder::from_conf(&drain_conf)
+        .unwrap()
+        .build()
+        .unwrap();
+
+    let mut first_frame = None;
+    for _ in 0..60 {
+        let _ = sender.drive_once().unwrap();
+        if let Ok(frame) = rx.try_recv() {
+            first_frame = Some(frame);
+            break;
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+
+    let frame = first_frame.expect("orphan drainer sent no frame");
+    assert!(
+        frame.len() >= 12 && &frame[..4] == b"QWP1",
+        "not a QWP frame: {:?}",
+        &frame[..frame.len().min(12)]
+    );
+    let table_count = u16::from_le_bytes([frame[6], frame[7]]);
+    assert_eq!(
+        table_count, 0,
+        "the zero tail is healed at open, so the orphan arms delta on the clean \
+         recovered dictionary and re-registers the real symbol via a table-less \
+         catch-up first (table_count == 0); a DATA frame first (table_count >= 1) \
+         would mean it fell back to dense. table_count = {table_count}"
+    );
+    assert!(
+        !sf_dir.path().join("orphan").join(".failed").exists(),
+        "healing a zero tail must keep the slot recoverable, not fail it"
+    );
+}
+
+#[test]
+fn qwp_ws_orphan_drain_discards_a_duplicate_entry_dict_and_arms_the_mirror_empty() {
+    // A recovered `.symbol-dict` can be corrupt in a way the per-chunk CRC does NOT
+    // catch: a host/power crash that leaves the append-only file with a duplicate
+    // chunk (e.g. a torn tail whose bytes re-form an already-present, still-CRC-valid
+    // chunk). `open` loads every CRC-valid chunk -- so the recovered count is
+    // inflated -- but a well-formed dictionary holds strictly unique symbols, so
+    // `SymbolGlobalDict::seed` rejects the duplicate id (`StoreResendRequired`).
+    //
+    // The orphan drainer builds no producer `SymbolGlobalDict`, so it must validate
+    // the recovered region itself with a throwaway `SymbolGlobalDict::seed` and
+    // seed the delta catch-up mirror FROM THE SIDE-FILE only when that succeeds
+    // (see `qwp_ws_orphan::open`). Seeding the unvalidated `SentDictMirror`
+    // verbatim with the inflated count would slacken the torn-dict guard
+    // (`delta_start > mirror.count()`) and let a stored delta frame replay against
+    // a desynced dictionary -- resolving ids to the wrong symbols on the fresh
+    // server (silent corruption).
+    //
+    // On rejection the entries are DISCARDED and the mirror is armed EMPTY -- not
+    // left disabled. Count 0 is the strictest guard state, the opposite of the
+    // inflated count this validation exists to keep out, and it lets the drain
+    // bootstrap from the frames' own delta sections instead of abandoning the slot
+    // (see `qwp_ws_orphan_drain_arms_an_empty_mirror_when_the_recovered_dict_
+    // exceeds_the_cap` for what dense costs).
+    //
+    // This is the inverse of
+    // `qwp_ws_orphan_drain_heals_a_zero_extended_side_file_and_replays_via_delta`,
+    // where the CRC heals the tail to a CLEAN dictionary and the mirror is seeded
+    // from the side-file.
+    //
+    // Observable: the orphan's FIRST sent frame is the DATA frame (`table_count >=
+    // 1`) with no preceding table-less catch-up (`table_count == 0`) -- which is
+    // exactly what proves the rejected dictionary was not seeded -- and the slot
+    // stays recoverable (no `.failed`).
+    let sf_dir = tempfile::TempDir::new().unwrap();
+    seed_orphan_slot(sf_dir.path());
+
+    // Duplicate the recovered chunk region (everything after the 8-byte
+    // `SYD1`+version header) back onto the file. Each copied chunk keeps its original
+    // valid CRC, so `open` accepts them all and reports an inflated count, but the
+    // repeat makes `SymbolGlobalDict::seed` fail on the first duplicate id.
+    let side_file = sf_dir.path().join("orphan").join(".symbol-dict");
+    {
+        let existing =
+            std::fs::read(&side_file).expect("seed must have written a delta-mode side-file");
+        let entries_region = existing[8..].to_vec();
+        assert!(
+            !entries_region.is_empty(),
+            "seed must have persisted at least one symbol entry to duplicate"
+        );
+        let mut f = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&side_file)
+            .unwrap();
+        f.write_all(&entries_region).unwrap();
+    }
+
+    let (port, rx) = spawn_orphan_capture_first_frame_server();
+    let drain_conf = format!(
+        "ws::addr=127.0.0.1:{port};qwp_ws_progress=manual;\
+         sf_dir={};sender_id=primary;drain_orphans=on;\
+         max_background_drainers=1;sf_max_segment_bytes=256;sf_max_total_bytes=1024;",
+        sf_dir.path().display()
+    );
+    let mut sender = SenderBuilder::from_conf(&drain_conf)
+        .unwrap()
+        .build()
+        .unwrap();
+
+    let mut first_frame = None;
+    for _ in 0..60 {
+        let _ = sender.drive_once().unwrap();
+        if let Ok(frame) = rx.try_recv() {
+            first_frame = Some(frame);
+            break;
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+
+    let frame = first_frame.expect("orphan drainer sent no frame");
+    assert!(
+        frame.len() >= 12 && &frame[..4] == b"QWP1",
+        "not a QWP frame: {:?}",
+        &frame[..frame.len().min(12)]
+    );
+    let table_count = u16::from_le_bytes([frame[6], frame[7]]);
+    assert!(
+        table_count >= 1,
+        "a corrupt (duplicate-entry) recovered dictionary must be DISCARDED, so the \
+         mirror arms empty, emits no catch-up, and the DATA frame goes first \
+         (table_count >= 1); a table-less catch-up first (table_count == 0) would mean \
+         it wrongly seeded the mirror from the corrupt dictionary. \
+         table_count = {table_count}"
+    );
+    assert!(
+        !sf_dir.path().join("orphan").join(".failed").exists(),
+        "a corrupt recovered dictionary must leave the slot recoverable, not fail it"
+    );
+}
+
+#[test]
+fn qwp_ws_orphan_drain_arms_an_empty_mirror_when_the_recovered_dict_exceeds_the_cap() {
+    // Regression (abandoned data). The replay-only half of the asymmetry argued in
+    // `SymbolGlobalDict::seed`'s docs. `seed` re-interns every recovered entry, so
+    // a side-file holding more symbols than this client's cap is refused with
+    // `SymbolDictFull` -- a well-formed dictionary, merely bigger than this client
+    // will hold (written by a higher-capped one), not a corrupt one.
+    //
+    // `store_and_forward_file_mode_recovery_fails_when_the_recovered_dict_exceeds_
+    // the_cap` pins the FOREGROUND response: fail construction, because a producer
+    // would otherwise mint ids the stored frames already reference. The drainer
+    // must not do that -- it is replay-only, so nothing can collide -- but the
+    // answer is not the dense fallback either.
+    //
+    // Dense LOSES the slot. With the mirror disabled the `delta_start == 0` frame
+    // replays and commits, the `delta_start == 1` frame behind it is terminally
+    // rejected, and `StoreResendRequired` is classified proven-local unrecoverable,
+    // so the drain writes `.failed` and every later scan skips the slot until an
+    // operator clears the sentinel -- recoverable frames abandoned over a side-file
+    // this client merely could not hold.
+    //
+    // So the rejected entries are discarded but the mirror is armed EMPTY. Count 0
+    // is the STRICTEST guard state, not a slackened one (the hazard the validation
+    // exists for is an INFLATED count): only the `delta_start == 0` frame passes,
+    // `accumulate` folds its own delta section in, and frame 2 resolves against
+    // that. Both replay and the slot drains. This is the same bootstrap
+    // `qwp_ws_orphan_drain_replays_both_frames_when_the_first_dict_chunk_is_corrupt`
+    // pins for a torn side-file, reached here through the cap-rejection branch.
+    let sf_dir = tempfile::TempDir::new().unwrap();
+    // Seeded BEFORE the cap guard: phase 1 is a normally-capped client, and its
+    // two symbols are what later overflow the shrunken cap.
+    seed_orphan_slot_with_two_delta_frames(sf_dir.path());
+
+    let _cap = crate::ingress::TestDictCapGuard::new(1);
+    let (port, rx) = spawn_orphan_drain_all_frames_server();
+    let drain_conf = format!(
+        "ws::addr=127.0.0.1:{port};qwp_ws_progress=manual;\
+         sf_dir={};sender_id=primary;drain_orphans=on;\
+         max_background_drainers=1;sf_max_segment_bytes=256;sf_max_total_bytes=1024;",
+        sf_dir.path().display()
+    );
+    let mut sender = SenderBuilder::from_conf(&drain_conf)
+        .unwrap()
+        .build()
+        .unwrap();
+
+    // Collect QWP frames in order. A table-less catch-up carries table_count == 0;
+    // a replayed DATA frame carries >= 1.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut frames: Vec<Vec<u8>> = Vec::new();
+    let mut data_frames = 0usize;
+    while Instant::now() < deadline && data_frames < 2 {
+        let _ = sender.drive_once().unwrap();
+        while let Ok(frame) = rx.try_recv() {
+            if frame.len() >= 12 && &frame[..4] == b"QWP1" {
+                if u16::from_le_bytes([frame[6], frame[7]]) >= 1 {
+                    data_frames += 1;
+                }
+                frames.push(frame);
+            }
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+
+    let first = frames.first().expect(
+        "the drainer must still connect and replay -- an over-cap recovered \
+         dictionary must not abort the drain",
+    );
+    let first_table_count = u16::from_le_bytes([first[6], first[7]]);
+    assert!(
+        first_table_count >= 1,
+        "the rejected entries must be DISCARDED, so the empty mirror emits no \
+         catch-up and the DATA frame goes first (table_count >= 1). A table-less \
+         catch-up first (table_count == 0) would mean the drain re-registered a \
+         dictionary it had just refused to seed. table_count = {first_table_count}"
+    );
+
+    assert!(
+        data_frames >= 2,
+        "both queued frames must replay -- got {data_frames}. One means the drain \
+         fell back to dense, terminally rejected its `delta_start == 1` frame, and \
+         abandoned the slot behind a `.failed` sentinel"
+    );
+    assert!(
+        !sf_dir.path().join("orphan").join(".failed").exists(),
+        "an over-cap side-file is not proven-local unrecoverable: the frames carry \
+         the dictionary they need, so the slot must drain rather than be quarantined"
+    );
+}
+
+#[test]
+fn qwp_ws_orphan_drain_replays_both_frames_when_the_first_dict_chunk_is_corrupt() {
+    // Regression (live-lock + abandoned data). An orphan slot whose `.symbol-dict`
+    // loses its FIRST chunk to a host-crash tear recovers ZERO entries, which
+    // looks like the absent / bad-magic side-file case and invites the same dense
+    // fallback. On the replay-only path that fallback is not merely wasteful, it
+    // strands the slot permanently.
+    //
+    // Dense leaves the drainer's catch-up mirror disabled (`qwp_ws_orphan::open`
+    // seeds it only when the queue reports delta armed), so `guard_dict_not_torn`
+    // rejects the `delta_start == 1` frame terminally -- but only AFTER the
+    // `delta_start == 0` frame ahead of it has replayed. The terminal store error
+    // becomes `OrphanDriveOutcome::RetryLater`, which re-queues the slot WITHOUT
+    // marking it failed; the next open re-parses the same zero entries, re-decides
+    // dense, and re-strands. The slot never drains and never fails, frames 1..N
+    // are never delivered, and the replayed prefix goes out again on every cycle.
+    //
+    // Armed on the empty dictionary the drain bootstraps itself instead: frame 1
+    // passes the guard, `SentDictMirror::accumulate` folds its own delta section
+    // in, and frame 2 resolves against that. Both replay. Nothing here can be
+    // hurt by arming empty -- replay-only has no producer, so there is no writer
+    // that could refill the truncated dictionary with different symbols under the
+    // ids the stored frames reference.
+    //
+    // `replay_only_slot_whose_first_chunk_is_corrupt_keeps_delta_armed` pins the
+    // queue-level state; this is the half that proves the slot actually drains.
+    let sf_dir = tempfile::TempDir::new().unwrap();
+    seed_orphan_slot_with_two_delta_frames(sf_dir.path());
+
+    // A host/power crash tears chunk 0: a same-length value flip, so only its
+    // stored CRC goes stale. The reader stops there and truncates, recovering
+    // nothing -- while the queued frames still reference symbol ids 0 and 1.
+    let side_file = sf_dir.path().join("orphan").join(".symbol-dict");
+    {
+        let mut bytes =
+            std::fs::read(&side_file).expect("seed must have written a delta-mode side-file");
+        let idx = bytes
+            .windows(5)
+            .position(|w| w == b"alpha")
+            .expect("alpha payload present");
+        bytes[idx] = b'X'; // same length ("Xlpha"), different value
+        std::fs::write(&side_file, &bytes).unwrap();
+    }
+
+    let (port, rx) = spawn_orphan_drain_all_frames_server();
+    let drain_conf = format!(
+        "ws::addr=127.0.0.1:{port};qwp_ws_progress=manual;\
+         sf_dir={};sender_id=primary;drain_orphans=on;\
+         max_background_drainers=1;sf_max_segment_bytes=256;sf_max_total_bytes=1024;",
+        sf_dir.path().display()
+    );
+    let mut sender = SenderBuilder::from_conf(&drain_conf)
+        .unwrap()
+        .build()
+        .unwrap();
+
+    // Count replayed DATA frames (table_count >= 1 at bytes 6..8); a table-less
+    // catch-up frame carries table_count == 0. With the dense fallback exactly ONE
+    // arrives and the drainer then spins on the second forever.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut data_frames = 0usize;
+    while Instant::now() < deadline && data_frames < 2 {
+        let _ = sender.drive_once().unwrap();
+        while let Ok(frame) = rx.try_recv() {
+            if frame.len() >= 12
+                && &frame[..4] == b"QWP1"
+                && u16::from_le_bytes([frame[6], frame[7]]) >= 1
+            {
+                data_frames += 1;
+            }
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+
+    assert!(
+        data_frames >= 2,
+        "both queued frames must replay -- got {data_frames}. One means the orphan \
+         slot fell back to dense, terminally rejected its `delta_start == 1` frame, \
+         and was re-queued by `RetryLater` to re-open, re-decide dense and re-strand: \
+         a live-lock that never drains and never fails"
+    );
+    assert!(
+        !sf_dir.path().join("orphan").join(".failed").exists(),
+        "draining a torn-first-chunk slot must keep it recoverable, not fail it"
+    );
+}
+
+#[test]
 fn qwp_ws_manual_orphan_drainer_walks_endpoint_list() {
     let sf_dir = tempfile::TempDir::new().unwrap();
     seed_orphan_slot(sf_dir.path());
 
     let bad_listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let bad_port = bad_listener.local_addr().unwrap().port();
-    drop(bad_listener);
     let (port, rx) = spawn_manual_orphan_drain_server();
+    drop(bad_listener);
     let drain_conf = format!(
-        "qwpws::addr=127.0.0.1:{bad_port},127.0.0.1:{port};qwp_ws_progress=manual;\
+        "ws::addr=127.0.0.1:{bad_port},127.0.0.1:{port};qwp_ws_progress=manual;\
          sf_dir={};sender_id=primary;drain_orphans=on;\
-         max_background_drainers=1;sf_max_bytes=256;sf_max_total_bytes=1024;",
+         max_background_drainers=1;sf_max_segment_bytes=256;sf_max_total_bytes=1024;",
         sf_dir.path().display()
     );
     let mut sender = SenderBuilder::from_conf(&drain_conf)
@@ -2017,9 +3415,9 @@ fn qwp_ws_manual_orphan_drainer_role_reject_tries_next_endpoint() {
     let (reject_port, reject_handle) = spawn_role_reject_upgrade_server(2, "REPLICA");
     let (port, rx) = spawn_manual_orphan_drain_server();
     let drain_conf = format!(
-        "qwpws::addr=127.0.0.1:{reject_port},127.0.0.1:{port};qwp_ws_progress=manual;\
+        "ws::addr=127.0.0.1:{reject_port},127.0.0.1:{port};qwp_ws_progress=manual;\
          sf_dir={};sender_id=primary;drain_orphans=on;\
-         max_background_drainers=1;sf_max_bytes=256;sf_max_total_bytes=1024;",
+         max_background_drainers=1;sf_max_segment_bytes=256;sf_max_total_bytes=1024;",
         sf_dir.path().display()
     );
     let mut sender = SenderBuilder::from_conf(&drain_conf)
@@ -2047,12 +3445,410 @@ fn qwp_ws_manual_orphan_drainer_role_reject_tries_next_endpoint() {
 }
 
 #[test]
+fn qwp_ws_manual_orphan_drainer_terminal_reject_leaves_slot_recoverable() {
+    let sf_dir = tempfile::TempDir::new().unwrap();
+    seed_orphan_slot(sf_dir.path());
+
+    let (port, rx) = spawn_manual_orphan_reject_server(QWP_STATUS_PARSE_ERROR);
+    let drain_conf = format!(
+        "ws::addr=127.0.0.1:{port};qwp_ws_progress=manual;\
+         sf_dir={};sender_id=primary;drain_orphans=on;\
+         max_background_drainers=1;sf_max_segment_bytes=256;sf_max_total_bytes=1024;",
+        sf_dir.path().display()
+    );
+    let mut sender = SenderBuilder::from_conf(&drain_conf)
+        .unwrap()
+        .build()
+        .unwrap();
+
+    let orphan_slot = sf_dir.path().join("orphan");
+    let mut orphan_payload = None;
+    for _ in 0..20 {
+        let _ = sender.drive_once().unwrap();
+        if orphan_payload.is_none()
+            && let Ok(payload) = rx.try_recv()
+        {
+            orphan_payload = Some(payload);
+        }
+        if orphan_payload.is_some() && orphan_slot.join(".last_error").exists() {
+            break;
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+
+    assert!(
+        !orphan_payload
+            .expect("orphan payload was not replayed")
+            .is_empty()
+    );
+    assert!(!orphan_slot.join(".failed").exists());
+    assert!(orphan_slot.join(".last_error").exists());
+    assert!(slot_has_sfa_file(&orphan_slot));
+}
+
+#[test]
+fn qwp_ws_background_terminal_orphan_releases_worker_for_next_slot() {
+    let sf_dir = tempfile::TempDir::new().unwrap();
+    seed_orphan_slot_named(sf_dir.path(), "orphan-a");
+    seed_orphan_slot_named(sf_dir.path(), "orphan-b");
+
+    let server = spawn_terminal_then_drain_orphan_server();
+    let drain_conf = format!(
+        "ws::addr=127.0.0.1:{};\
+         sf_dir={};sender_id=primary;drain_orphans=on;\
+         max_background_drainers=1;sf_max_segment_bytes=256;sf_max_total_bytes=1024;",
+        server.port,
+        sf_dir.path().display()
+    );
+    let sender = SenderBuilder::from_conf(&drain_conf)
+        .unwrap()
+        .build()
+        .unwrap();
+
+    assert!(
+        !server
+            .terminal_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("first orphan was not replayed and terminally rejected")
+            .is_empty()
+    );
+    assert!(
+        !server
+            .drained_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("terminal orphan retained the only worker; next slot was never drained")
+            .is_empty()
+    );
+
+    let orphan_a = sf_dir.path().join("orphan-a");
+    let orphan_b = sf_dir.path().join("orphan-b");
+    // The drained slot loses its data before its own breadcrumb (if any) is
+    // cleared, so gate on both counts rather than on the data alone.
+    wait_until(Duration::from_secs(5), || {
+        [&orphan_a, &orphan_b]
+            .into_iter()
+            .filter(|slot| slot_has_sfa_file(slot))
+            .count()
+            == 1
+            && [&orphan_a, &orphan_b]
+                .into_iter()
+                .filter(|slot| slot.join(".last_error").exists())
+                .count()
+                == 1
+    });
+    let terminal_slots = [&orphan_a, &orphan_b]
+        .into_iter()
+        .filter(|slot| slot.join(".last_error").exists())
+        .count();
+    assert_eq!(
+        terminal_slots, 1,
+        "exactly one orphan must record the terminal error"
+    );
+    let retained_slots = [&orphan_a, &orphan_b]
+        .into_iter()
+        .filter(|slot| slot_has_sfa_file(slot))
+        .count();
+    assert_eq!(
+        retained_slots, 1,
+        "the terminal slot must retain its data while the next slot fully drains"
+    );
+    assert_eq!(
+        orphan_a.join(".last_error").exists(),
+        slot_has_sfa_file(&orphan_a)
+    );
+    assert_eq!(
+        orphan_b.join(".last_error").exists(),
+        slot_has_sfa_file(&orphan_b)
+    );
+    assert!(!orphan_a.join(".failed").exists());
+    assert!(!orphan_b.join(".failed").exists());
+
+    drop(sender);
+    server.handle.join().unwrap();
+}
+
+#[test]
+fn qwp_ws_background_role_reject_recycles_wire_and_drains_orphan() {
+    let sf_dir = tempfile::TempDir::new().unwrap();
+    seed_orphan_slot(sf_dir.path());
+
+    let server = spawn_role_reject_then_drain_orphan_server();
+    let drain_conf = format!(
+        "ws::addr=127.0.0.1:{};\
+         sf_dir={};sender_id=primary;drain_orphans=on;\
+         max_background_drainers=1;\
+         reconnect_initial_backoff_millis=10;reconnect_max_backoff_millis=20;\
+         sf_max_segment_bytes=256;sf_max_total_bytes=1024;",
+        server.port,
+        sf_dir.path().display()
+    );
+    let sender = SenderBuilder::from_conf(&drain_conf)
+        .unwrap()
+        .build()
+        .unwrap();
+
+    let rejected = server
+        .rejected_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("orphan was not replayed to the replica");
+    let drained = server
+        .drained_rx
+        .recv_timeout(Duration::from_secs(2))
+        .expect("role-rejected orphan was not retried on a recycled connection");
+    assert_eq!(
+        rejected, drained,
+        "the recycled connection must replay the same frame"
+    );
+
+    let orphan_slot = sf_dir.path().join("orphan");
+    let last_error = orphan_slot.join(".last_error");
+    // The drain step deletes the segment files and only *then* reports `Drained`,
+    // which is what clears the breadcrumb -- so a fully drained slot is briefly
+    // data-free with a stale `.last_error` still on disk. Wait for both.
+    wait_until(Duration::from_secs(5), || {
+        !slot_has_sfa_file(&orphan_slot) && !last_error.exists()
+    });
+    assert!(!slot_has_sfa_file(&orphan_slot));
+    assert!(!orphan_slot.join(".failed").exists());
+    assert!(
+        !last_error.exists(),
+        "stale .last_error after drain: {}",
+        std::fs::read_to_string(&last_error).unwrap_or_default()
+    );
+
+    drop(sender);
+    server.handle.join().unwrap();
+}
+
+/// Foreground port of Java's `testCloseBlocksAcrossAllReplicaWindowUntilPromotion`:
+/// `close_drain` must stay pending across an all-replica window (connect-time
+/// 421 role rejects), keep the queued frame, and deliver it exactly once when
+/// the endpoint is promoted in place.
+#[test]
+fn qwp_ws_close_drain_blocks_across_all_replica_window_until_promotion() {
+    let server = spawn_replica_window_then_promote_server();
+    let conf = format!(
+        "ws::addr=127.0.0.1:{};initial_connect_retry=async;\
+         reconnect_initial_backoff_millis=10;reconnect_max_backoff_millis=50;\
+         close_flush_timeout_millis=10000;",
+        server.port
+    );
+    let mut sender = SenderBuilder::from_conf(&conf).unwrap().build().unwrap();
+    let mut buf = sender.new_buffer();
+    buf.table("trades")
+        .unwrap()
+        .column_i64("qty", 7)
+        .unwrap()
+        .at_now()
+        .unwrap();
+    sender.flush(&mut buf).unwrap();
+
+    let closer = thread::spawn(move || sender.close_drain());
+
+    assert!(
+        wait_until(Duration::from_secs(5), || {
+            server.reject_count.load(Ordering::Acquire) >= 2
+        }),
+        "server never produced the all-replica window"
+    );
+    assert!(
+        !closer.is_finished(),
+        "close_drain must stay pending for the whole all-replica window"
+    );
+
+    server.promoted.store(true, Ordering::Release);
+    closer
+        .join()
+        .unwrap()
+        .expect("close_drain must complete cleanly after promotion");
+
+    let delivered = server.handle.join().unwrap();
+    assert_eq!(
+        delivered.len(),
+        1,
+        "the queued frame must be delivered exactly once"
+    );
+    assert_eq!(&delivered[0][0..4], b"QWP1");
+}
+
+/// A session-sticky (non-role) terminal on a manually driven orphan must
+/// retire the slot for the session -- `drive_once` settles to `false` so the
+/// caller can park -- while the undrained data stays recoverable on disk.
+#[test]
+fn qwp_ws_manual_orphan_terminal_retires_slot_and_lets_caller_park() {
+    let sf_dir = tempfile::TempDir::new().unwrap();
+    seed_orphan_slot(sf_dir.path());
+
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let (done_tx, done_rx) = mpsc::channel::<()>();
+    let server = thread::spawn(move || {
+        let (mut foreground, _) = listener.accept().unwrap();
+        perform_server_upgrade(&mut foreground).unwrap();
+
+        let (mut orphan, _) = listener.accept().unwrap();
+        perform_server_upgrade(&mut orphan).unwrap();
+        let (_fin, _opcode, _catch_up) = read_frame(&mut orphan).unwrap();
+        let (_fin, _opcode, payload) = read_frame(&mut orphan).unwrap();
+        write_qwp_error_response(
+            &mut orphan,
+            QWP_STATUS_PARSE_ERROR,
+            FIRST_WIRE_SEQUENCE + 1,
+            b"bad orphan",
+        )
+        .unwrap();
+        let _ = done_rx.recv_timeout(Duration::from_secs(10));
+        payload
+    });
+
+    let conf = format!(
+        "ws::addr=127.0.0.1:{};qwp_ws_progress=manual;\
+         sf_dir={};sender_id=primary;drain_orphans=on;\
+         max_frame_rejections=1;poison_min_escalation_window_millis=0;\
+         reconnect_initial_backoff_millis=10;reconnect_max_backoff_millis=20;\
+         sf_max_segment_bytes=256;sf_max_total_bytes=1024;",
+        port,
+        sf_dir.path().display()
+    );
+    let mut sender = SenderBuilder::from_conf(&conf).unwrap().build().unwrap();
+
+    let orphan_slot = sf_dir.path().join("orphan");
+    let last_error = orphan_slot.join(".last_error");
+    let started = Instant::now();
+    while started.elapsed() < Duration::from_secs(5) && !last_error.exists() {
+        if !sender.drive_once().unwrap() {
+            thread::sleep(Duration::from_millis(1));
+        }
+    }
+    assert!(
+        last_error.exists(),
+        "session-sticky terminal must leave a breadcrumb"
+    );
+
+    let quiesce_started = Instant::now();
+    while sender.drive_once().unwrap() {
+        assert!(
+            quiesce_started.elapsed() < Duration::from_secs(2),
+            "drive_once must stop reporting progress once the orphan is terminal"
+        );
+    }
+    for _ in 0..5 {
+        assert!(
+            !sender.drive_once().unwrap(),
+            "a terminal orphan must let the caller park, not spin"
+        );
+    }
+    assert!(
+        !orphan_slot.join(".failed").exists(),
+        "a session-sticky terminal must not poison the slot"
+    );
+    assert!(
+        slot_has_sfa_file(&orphan_slot),
+        "the undrained frame must stay on disk for the next session"
+    );
+
+    done_tx.send(()).unwrap();
+    let payload = server.join().unwrap();
+    assert!(!payload.is_empty());
+    drop(sender);
+}
+
+#[test]
+fn qwp_ws_background_catch_up_allocation_failure_reconnects_and_drains_orphan() {
+    let sf_dir = tempfile::TempDir::new().unwrap();
+    seed_orphan_slot_named_with_symbol(sf_dir.path(), "orphan", "qdb-test-catch-up-allocation");
+
+    let server = spawn_catch_up_failure_then_drain_orphan_server(None);
+    fail_next_catch_up_allocation_for_test();
+    let drain_conf = format!(
+        "ws::addr=127.0.0.1:{};\
+         sf_dir={};sender_id=primary;drain_orphans=on;\
+         max_background_drainers=1;\
+         reconnect_initial_backoff_millis=10;reconnect_max_backoff_millis=20;\
+         sf_max_segment_bytes=256;sf_max_total_bytes=1024;",
+        server.port,
+        sf_dir.path().display()
+    );
+    let sender = SenderBuilder::from_conf(&drain_conf)
+        .unwrap()
+        .build()
+        .unwrap();
+
+    server
+        .retried_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("catch-up allocation failure did not trigger a reconnect");
+    assert!(
+        !server
+            .drained_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("catch-up allocation failure abandoned the orphan slot")
+            .is_empty()
+    );
+
+    let orphan_slot = sf_dir.path().join("orphan");
+    let last_error = orphan_slot.join(".last_error");
+    assert!(wait_until(Duration::from_secs(5), || {
+        !slot_has_sfa_file(&orphan_slot) && !last_error.exists()
+    }));
+    assert!(!orphan_slot.join(".failed").exists());
+
+    drop(sender);
+    server.handle.join().unwrap();
+}
+
+#[test]
+fn qwp_ws_background_catch_up_batch_cap_reconnects_and_drains_orphan() {
+    let sf_dir = tempfile::TempDir::new().unwrap();
+    seed_orphan_slot(sf_dir.path());
+
+    // A 28-byte advertised cap leaves a one-byte catch-up entry budget. The
+    // seeded symbol cannot fit, while the next connection advertises no cap.
+    let server = spawn_catch_up_failure_then_drain_orphan_server(Some(28));
+    let drain_conf = format!(
+        "ws::addr=127.0.0.1:{};\
+         sf_dir={};sender_id=primary;drain_orphans=on;\
+         max_background_drainers=1;\
+         reconnect_initial_backoff_millis=10;reconnect_max_backoff_millis=20;\
+         sf_max_segment_bytes=256;sf_max_total_bytes=1024;",
+        server.port,
+        sf_dir.path().display()
+    );
+    let sender = SenderBuilder::from_conf(&drain_conf)
+        .unwrap()
+        .build()
+        .unwrap();
+
+    server
+        .retried_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("catch-up batch cap did not trigger a reconnect");
+    assert!(
+        !server
+            .drained_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("catch-up BatchTooLarge abandoned the orphan slot")
+            .is_empty()
+    );
+
+    let orphan_slot = sf_dir.path().join("orphan");
+    let last_error = orphan_slot.join(".last_error");
+    assert!(wait_until(Duration::from_secs(5), || {
+        !slot_has_sfa_file(&orphan_slot) && !last_error.exists()
+    }));
+    assert!(!orphan_slot.join(".failed").exists());
+
+    drop(sender);
+    server.handle.join().unwrap();
+}
+
+#[test]
 fn qwp_ws_background_orphan_close_is_bounded_and_leaves_orphan_recoverable() {
     let seed_port = spawn_upgrade_only_server();
     let sf_dir = tempfile::TempDir::new().unwrap();
     let seed_conf = format!(
-        "qwpws::addr=127.0.0.1:{seed_port};qwp_ws_progress=manual;\
-         sf_dir={};sender_id=orphan;sf_max_bytes=256;sf_max_total_bytes=1024;",
+        "ws::addr=127.0.0.1:{seed_port};qwp_ws_progress=manual;\
+         sf_dir={};sender_id=orphan;sf_max_segment_bytes=256;sf_max_total_bytes=1024;",
         sf_dir.path().display()
     );
     let mut seed_sender = SenderBuilder::from_conf(&seed_conf)
@@ -2077,9 +3873,9 @@ fn qwp_ws_background_orphan_close_is_bounded_and_leaves_orphan_recoverable() {
 
     let (port, rx, release_stalled_orphan) = spawn_stalled_background_orphan_drain_server();
     let drain_conf = format!(
-        "qwpws::addr=127.0.0.1:{port};\
+        "ws::addr=127.0.0.1:{port};\
          sf_dir={};sender_id=primary;drain_orphans=on;\
-         max_background_drainers=1;sf_max_bytes=256;sf_max_total_bytes=1024;",
+         max_background_drainers=1;sf_max_segment_bytes=256;sf_max_total_bytes=1024;",
         sf_dir.path().display()
     );
     let mut sender = SenderBuilder::from_conf(&drain_conf)
@@ -2102,10 +3898,13 @@ fn qwp_ws_background_orphan_close_is_bounded_and_leaves_orphan_recoverable() {
 
     release_stalled_orphan.send(()).unwrap();
 
-    let (recover_port, recover_rx) = spawn_mock_server();
+    // The recovered slot delta-encodes, so it re-registers its dictionary with a
+    // catch-up frame before replaying the data frame; use a server that expects
+    // both and acks the data frame.
+    let (recover_port, recover_rx) = spawn_recovery_mock_server();
     let recover_conf = format!(
-        "qwpws::addr=127.0.0.1:{recover_port};\
-         sf_dir={};sender_id=orphan;sf_max_bytes=256;sf_max_total_bytes=1024;",
+        "ws::addr=127.0.0.1:{recover_port};\
+         sf_dir={};sender_id=orphan;sf_max_segment_bytes=256;sf_max_total_bytes=1024;",
         sf_dir.path().display()
     );
     let retry_deadline = Instant::now() + Duration::from_secs(5);
@@ -2126,7 +3925,131 @@ fn qwp_ws_background_orphan_close_is_bounded_and_leaves_orphan_recoverable() {
 }
 
 #[test]
-fn qwp_ws_subsequent_message_reemits_replay_dictionary_and_full_schema() {
+fn qwp_ws_background_orphan_close_interrupts_stalled_connect() {
+    let sf_dir = tempfile::TempDir::new().unwrap();
+    seed_orphan_slot(sf_dir.path());
+
+    let (port, orphan_accepted, release_stalled_orphan) =
+        spawn_stalled_background_orphan_connect_server();
+    let drain_conf = format!(
+        "ws::addr=127.0.0.1:{port};\
+         sf_dir={};sender_id=primary;drain_orphans=on;\
+         max_background_drainers=1;sf_max_segment_bytes=256;sf_max_total_bytes=1024;",
+        sf_dir.path().display()
+    );
+    let mut sender = SenderBuilder::from_conf(&drain_conf)
+        .unwrap()
+        .build()
+        .unwrap();
+    orphan_accepted
+        .recv_timeout(Duration::from_secs(5))
+        .unwrap();
+
+    let started = Instant::now();
+    sender.close_drain().unwrap();
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed < Duration::from_secs(5),
+        "background orphan shutdown took {elapsed:?}"
+    );
+
+    let (recover_port, recover_rx) = spawn_recovery_mock_server();
+    let recover_conf = format!(
+        "ws::addr=127.0.0.1:{recover_port};\
+         sf_dir={};sender_id=orphan;sf_max_segment_bytes=256;sf_max_total_bytes=1024;",
+        sf_dir.path().display()
+    );
+    let mut recover_sender = SenderBuilder::from_conf(&recover_conf)
+        .unwrap()
+        .build()
+        .expect("stalled orphan worker retained the slot lock after close");
+    recover_sender.close_drain().unwrap();
+    let recovered = recover_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    assert_eq!(recovered.received_frames.len(), 1);
+
+    release_stalled_orphan.send(()).unwrap();
+}
+
+#[test]
+fn qwp_ws_background_orphan_close_does_not_dial_next_slot() {
+    let sf_dir = tempfile::TempDir::new().unwrap();
+    seed_orphan_slot_named(sf_dir.path(), "orphan-a");
+    seed_orphan_slot_named(sf_dir.path(), "orphan-b");
+
+    let (port, listener_rx, release_stalled_orphan, server) =
+        spawn_stalled_first_background_orphan_connect_server();
+    let drain_conf = format!(
+        "ws::addr=127.0.0.1:{port};\
+         sf_dir={};sender_id=primary;drain_orphans=on;\
+         max_background_drainers=1;sf_max_segment_bytes=256;sf_max_total_bytes=1024;",
+        sf_dir.path().display()
+    );
+    let mut sender = SenderBuilder::from_conf(&drain_conf)
+        .unwrap()
+        .build()
+        .unwrap();
+    let listener = listener_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+
+    sender.close_drain().unwrap();
+
+    listener.set_nonblocking(true).unwrap();
+    assert!(matches!(
+        listener.accept(),
+        Err(err) if err.kind() == std::io::ErrorKind::WouldBlock
+    ));
+    assert!(slot_has_sfa_file(&sf_dir.path().join("orphan-a")));
+    assert!(slot_has_sfa_file(&sf_dir.path().join("orphan-b")));
+
+    release_stalled_orphan.send(()).unwrap();
+    server.join().unwrap();
+}
+
+#[test]
+fn qwp_ws_background_orphan_close_interrupts_blocked_send() {
+    let sf_dir = tempfile::TempDir::new().unwrap();
+    seed_large_orphan_slot(sf_dir.path());
+
+    let (port, send_started, release_stalled_orphan, server) =
+        spawn_blocked_background_orphan_send_server();
+    let drain_conf = format!(
+        "ws::addr=127.0.0.1:{port};close_flush_timeout_millis=-1;\
+         sf_dir={};sender_id=primary;drain_orphans=on;\
+         max_background_drainers=1;sf_max_segment_bytes=16777216;",
+        sf_dir.path().display()
+    );
+    let mut sender = SenderBuilder::from_conf(&drain_conf)
+        .unwrap()
+        .build()
+        .unwrap();
+    send_started.recv_timeout(Duration::from_secs(5)).unwrap();
+
+    let started = Instant::now();
+    sender.close_drain().unwrap();
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed < Duration::from_secs(5),
+        "background orphan shutdown waited for the socket write timeout: {elapsed:?}"
+    );
+
+    let reopen_port = spawn_upgrade_only_server();
+    let reopen_conf = format!(
+        "ws::addr=127.0.0.1:{reopen_port};qwp_ws_progress=manual;\
+         sf_dir={};sender_id=orphan;sf_max_segment_bytes=16777216;",
+        sf_dir.path().display()
+    );
+    let reopened = SenderBuilder::from_conf(&reopen_conf)
+        .unwrap()
+        .build()
+        .expect("blocked orphan worker retained the slot lock after close");
+    drop(reopened);
+    assert!(slot_has_sfa_file(&sf_dir.path().join("orphan")));
+
+    release_stalled_orphan.send(()).unwrap();
+    server.join().unwrap();
+}
+
+#[test]
+fn qwp_ws_subsequent_message_delta_encodes_dictionary_and_reemits_full_schema() {
     // Run two consecutive flushes against a server that processes both. We
     // build a slightly extended mock inline.
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -2167,7 +4090,7 @@ fn qwp_ws_subsequent_message_reemits_replay_dictionary_and_full_schema() {
         thread::sleep(Duration::from_millis(50));
     });
 
-    let mut sender = SenderBuilder::new(Protocol::QwpWs, "127.0.0.1", port)
+    let mut sender = SenderBuilder::new(Protocol::Ws, "127.0.0.1", port)
         .build()
         .unwrap();
     let mut buf = sender.new_buffer();
@@ -2181,9 +4104,9 @@ fn qwp_ws_subsequent_message_reemits_replay_dictionary_and_full_schema() {
         .unwrap();
     sender.flush(&mut buf).unwrap();
 
-    // Second flush reuses the same global symbol. The replay-safe public path
-    // still re-emits the dense dictionary prefix so the frame can stand alone
-    // after Store-and-Forward recovery or reconnect.
+    // Second flush reuses the same global symbol. In delta mode it is already
+    // registered, so the frame carries no new dictionary entries; on reconnect
+    // the driver re-registers the whole dictionary via a catch-up frame instead.
     buf.table("trades")
         .unwrap()
         .symbol("sym", "BTC-USD")
@@ -2199,11 +4122,11 @@ fn qwp_ws_subsequent_message_reemits_replay_dictionary_and_full_schema() {
 
     assert!(second.len() >= 12);
     let payload = &second[12..];
-    // delta_start = 0, delta_count = 1, followed by "BTC-USD".
-    assert_eq!(payload[0], 0x00);
-    assert_eq!(payload[1], 0x01);
-    assert_eq!(payload[2], 0x07);
-    assert_eq!(&payload[3..10], b"BTC-USD");
+    // Delta mode: "BTC-USD" is already registered (id 0), so the second frame
+    // resumes at the watermark (delta_start = 1) and ships no new symbols
+    // (delta_count = 0). The old dense encoder re-shipped the whole dictionary.
+    assert_eq!(payload[0], 0x01, "delta_start = 1");
+    assert_eq!(payload[1], 0x00, "delta_count = 0");
 
     // Replay-safe public QWP/WS frames always carry the full inline schema
     // (sym, qty) on every frame (at_now() carries no timestamp column).
@@ -2251,7 +4174,7 @@ fn qwp_ws_replay_full_schema_used_when_columns_match() {
         thread::sleep(Duration::from_millis(50));
     });
 
-    let mut sender = SenderBuilder::new(Protocol::QwpWs, "127.0.0.1", port)
+    let mut sender = SenderBuilder::new(Protocol::Ws, "127.0.0.1", port)
         .build()
         .unwrap();
 
@@ -2329,7 +4252,7 @@ fn qwp_ws_full_schema_re_emitted_when_columns_change() {
         thread::sleep(Duration::from_millis(50));
     });
 
-    let mut sender = SenderBuilder::new(Protocol::QwpWs, "127.0.0.1", port)
+    let mut sender = SenderBuilder::new(Protocol::Ws, "127.0.0.1", port)
         .build()
         .unwrap();
 
@@ -2442,7 +4365,7 @@ fn qwp_ws_server_error_response_is_surfaced() {
         thread::sleep(Duration::from_millis(50));
     });
 
-    let mut sender = SenderBuilder::new(Protocol::QwpWs, "127.0.0.1", port)
+    let mut sender = SenderBuilder::new(Protocol::Ws, "127.0.0.1", port)
         .qwp_ws_error_handler(move |error| {
             error_tx.send(error.clone()).unwrap();
         })
@@ -2487,12 +4410,12 @@ fn qwp_ws_server_error_response_is_surfaced() {
 
     let callback_error = error_rx.recv_timeout(Duration::from_secs(5)).unwrap();
     assert_eq!(callback_error.category, QwpWsErrorCategory::ParseError);
-    assert_eq!(callback_error.applied_policy, QwpWsErrorPolicy::Halt);
+    assert_eq!(callback_error.applied_policy, QwpWsErrorPolicy::Terminal);
     assert_eq!(callback_error.from_fsn, first_fsn);
 
     let qwp_error = sender.poll_qwp_ws_error().unwrap().unwrap();
     assert_eq!(qwp_error.category, QwpWsErrorCategory::ParseError);
-    assert_eq!(qwp_error.applied_policy, QwpWsErrorPolicy::Halt);
+    assert_eq!(qwp_error.applied_policy, QwpWsErrorPolicy::Terminal);
     assert_eq!(qwp_error.status, Some(QWP_STATUS_PARSE_ERROR));
     assert_eq!(qwp_error.message.as_deref(), Some("bad column"));
     assert_eq!(qwp_error.message_sequence, Some(FIRST_WIRE_SEQUENCE));
@@ -2503,7 +4426,7 @@ fn qwp_ws_server_error_response_is_surfaced() {
 }
 
 #[test]
-fn qwp_ws_schema_rejection_drops_and_sender_continues() {
+fn qwp_ws_schema_rejection_terminalizes_and_notifies_handler() {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();
     let (tx, rx) = mpsc::channel();
@@ -2543,15 +4466,11 @@ fn qwp_ws_schema_rejection_drops_and_sender_continues() {
         )
         .unwrap();
 
-        let (_fin, _opcode, second) = read_frame(&mut stream).unwrap();
-        received_frames.push(second);
-        write_qwp_ok_response(&mut stream, FIRST_WIRE_SEQUENCE + 1).unwrap();
-
         tx.send(received_frames).unwrap();
         thread::sleep(Duration::from_millis(50));
     });
 
-    let mut sender = SenderBuilder::new(Protocol::QwpWs, "127.0.0.1", port)
+    let mut sender = SenderBuilder::new(Protocol::Ws, "127.0.0.1", port)
         .qwp_ws_error_handler(move |error| {
             error_tx.send(error.clone()).unwrap();
         })
@@ -2570,26 +4489,19 @@ fn qwp_ws_schema_rejection_drops_and_sender_continues() {
     assert!(buf.is_empty());
     assert_eq!(first_fsn, 0);
 
-    buf.table("trades")
-        .unwrap()
-        .column_i64("qty", 2)
-        .unwrap()
-        .at_now()
-        .unwrap();
-    let second_fsn = sender.flush_and_get_fsn(&mut buf).unwrap().unwrap();
-    assert!(buf.is_empty());
-    assert_eq!(second_fsn, 1);
-
     let received_frames = rx.recv_timeout(Duration::from_secs(5)).unwrap();
-    assert_eq!(received_frames.len(), 2);
-    assert!(
-        sender
-            .await_acked_fsn(second_fsn, Duration::from_secs(5))
-            .unwrap()
+    assert_eq!(received_frames.len(), 1);
+    let err = sender
+        .wait(crate::ingress::AckLevel::Ok, Duration::from_secs(5))
+        .unwrap_err();
+    assert_eq!(err.code(), ErrorCode::ServerRejection);
+    assert_eq!(
+        err.qwp_ws_rejection().map(|error| error.category),
+        Some(QwpWsErrorCategory::SchemaMismatch)
     );
     let qwp_error = sender.poll_qwp_ws_error().unwrap().unwrap();
     assert_eq!(qwp_error.category, QwpWsErrorCategory::SchemaMismatch);
-    assert_eq!(qwp_error.applied_policy, QwpWsErrorPolicy::DropAndContinue);
+    assert_eq!(qwp_error.applied_policy, QwpWsErrorPolicy::Terminal);
     assert_eq!(qwp_error.status, Some(QWP_STATUS_SCHEMA_MISMATCH));
     assert_eq!(qwp_error.message.as_deref(), Some("bad schema"));
     assert_eq!(qwp_error.message_sequence, Some(FIRST_WIRE_SEQUENCE));
@@ -2598,18 +4510,15 @@ fn qwp_ws_schema_rejection_drops_and_sender_continues() {
     assert_eq!(sender.poll_qwp_ws_error().unwrap(), None);
     assert_eq!(sender.qwp_ws_errors_dropped().unwrap(), 0);
 
-    sender.flush(&mut buf).unwrap();
+    let _ = sender.flush(&mut buf);
     let callback_error = error_rx.recv_timeout(Duration::from_secs(5)).unwrap();
     assert_eq!(callback_error.category, QwpWsErrorCategory::SchemaMismatch);
-    assert_eq!(
-        callback_error.applied_policy,
-        QwpWsErrorPolicy::DropAndContinue
-    );
+    assert_eq!(callback_error.applied_policy, QwpWsErrorPolicy::Terminal);
     assert_eq!(callback_error.from_fsn, first_fsn);
 }
 
 #[test]
-fn qwp_ws_terminal_close_is_pollable_as_protocol_violation() {
+fn qwp_ws_repeated_head_close_poison_is_pollable_as_protocol_violation() {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();
     let (frame_tx, frame_rx) = mpsc::channel();
@@ -2630,7 +4539,11 @@ fn qwp_ws_terminal_close_is_pollable_as_protocol_violation() {
         thread::sleep(Duration::from_millis(50));
     });
 
-    let mut sender = SenderBuilder::new(Protocol::QwpWs, "127.0.0.1", port)
+    let mut sender = SenderBuilder::new(Protocol::Ws, "127.0.0.1", port)
+        .max_frame_rejections(1)
+        .unwrap()
+        .poison_min_escalation_window(Duration::ZERO)
+        .unwrap()
         .build()
         .unwrap();
     let mut buf = sender.new_buffer();
@@ -2656,15 +4569,14 @@ fn qwp_ws_terminal_close_is_pollable_as_protocol_violation() {
         }
         thread::sleep(Duration::from_millis(10));
     }
-    let close_error = observed.expect("expected terminal close diagnostic");
+    let close_error = observed.expect("expected close poison diagnostic");
     assert_eq!(close_error.category, QwpWsErrorCategory::ProtocolViolation);
-    assert_eq!(close_error.applied_policy, QwpWsErrorPolicy::Halt);
+    assert_eq!(close_error.applied_policy, QwpWsErrorPolicy::Terminal);
     assert_eq!(close_error.status, None);
     assert_eq!(close_error.message_sequence, None);
-    assert_eq!(
-        close_error.message.as_deref(),
-        Some("ws-close[1002]: bad frame")
-    );
+    assert!(close_error.message.as_deref().is_some_and(|message| {
+        message.contains("QWP/WebSocket frame fsn 0 was closed 1 times without ACK progress")
+    }));
     assert_eq!(close_error.from_fsn, fsn);
     assert_eq!(close_error.to_fsn, fsn);
     assert_eq!(sender.poll_qwp_ws_error().unwrap(), None);
@@ -2672,8 +4584,8 @@ fn qwp_ws_terminal_close_is_pollable_as_protocol_violation() {
 
     let err = sender.flush(&mut buf).unwrap_err();
     assert!(
-        err.msg().contains("ws-close[1002]: bad frame"),
-        "expected terminal close in empty flush message, got: {}",
+        err.msg().contains("closed 1 times without ACK progress"),
+        "expected close poison in empty flush message, got: {}",
         err.msg()
     );
     assert!(
@@ -2684,13 +4596,13 @@ fn qwp_ws_terminal_close_is_pollable_as_protocol_violation() {
     buf.table("trades").unwrap().column_i64("qty", 2).unwrap();
     let err = sender.flush(&mut buf).unwrap_err();
     assert!(
-        err.msg().contains("ws-close[1002]: bad frame"),
-        "expected terminal close to dominate incomplete-row validation, got: {}",
+        err.msg().contains("closed 1 times without ACK progress"),
+        "expected close poison to dominate incomplete-row validation, got: {}",
         err.msg()
     );
     assert!(
         !err.msg().contains("Bad call to `flush`"),
-        "local buffer validation must not mask terminal close: {}",
+        "local buffer validation must not mask close poison: {}",
         err.msg()
     );
     assert!(
@@ -2701,8 +4613,8 @@ fn qwp_ws_terminal_close_is_pollable_as_protocol_violation() {
     buf.at_now().unwrap();
     let err = sender.flush(&mut buf).unwrap_err();
     assert!(
-        err.msg().contains("ws-close[1002]: bad frame"),
-        "expected terminal close in message, got: {}",
+        err.msg().contains("closed 1 times without ACK progress"),
+        "expected close poison in message, got: {}",
         err.msg()
     );
     assert!(
@@ -2710,6 +4622,116 @@ fn qwp_ws_terminal_close_is_pollable_as_protocol_violation() {
         "terminal async error must not clear a newly prepared buffer"
     );
     assert!(sender.must_close());
+}
+
+#[test]
+fn qwp_ws_orderly_close_reconnects_without_poison_strike() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let (accept_tx, accept_rx) = mpsc::channel();
+
+    thread::spawn(move || {
+        for round in 0..2 {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            stream
+                .set_write_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            upgrade_mock_stream(&mut stream);
+
+            let (_fin, opcode, payload) = read_frame(&mut stream).unwrap();
+            assert_eq!(opcode, 0x2);
+            accept_tx.send((round, payload)).unwrap();
+            if round == 0 {
+                write_server_close_frame(&mut stream, 1000, "role change").unwrap();
+            } else {
+                write_qwp_ok_response(&mut stream, FIRST_WIRE_SEQUENCE).unwrap();
+            }
+            thread::sleep(Duration::from_millis(50));
+        }
+    });
+
+    let mut sender = SenderBuilder::new(Protocol::Ws, "127.0.0.1", port)
+        .max_frame_rejections(1)
+        .unwrap()
+        .poison_min_escalation_window(Duration::ZERO)
+        .unwrap()
+        .build()
+        .unwrap();
+    let mut buf = sender.new_buffer();
+    buf.table("trades")
+        .unwrap()
+        .column_i64("qty", 1)
+        .unwrap()
+        .at_now()
+        .unwrap();
+
+    let fsn = sender.flush_and_get_fsn(&mut buf).unwrap().unwrap();
+    assert_eq!(fsn, 0);
+
+    let first = accept_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    let second = accept_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    assert_eq!(first.0, 0);
+    assert_eq!(second.0, 1);
+    assert_eq!(&first.1[0..4], b"QWP1");
+    assert_eq!(first.1, second.1);
+
+    for _ in 0..100 {
+        if let Some(error) = sender.poll_qwp_ws_error().unwrap() {
+            assert_ne!(error.category, QwpWsErrorCategory::ProtocolViolation);
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+}
+
+fn run_paced_recycle_scenario(action: RecycleServerAction) -> usize {
+    let run_for = Duration::from_millis(900);
+    let (port, handle) = spawn_recycling_server(action, run_for);
+    let mut sender = SenderBuilder::new(Protocol::Ws, "127.0.0.1", port)
+        .max_frame_rejections(1000)
+        .unwrap()
+        .poison_min_escalation_window(Duration::from_secs(60))
+        .unwrap()
+        .reconnect_initial_backoff(Duration::from_millis(150))
+        .unwrap()
+        .reconnect_max_backoff(Duration::from_secs(1))
+        .unwrap()
+        .reconnect_max_duration(Duration::from_secs(5))
+        .unwrap()
+        .build()
+        .unwrap();
+    let mut buf = sender.new_buffer();
+    buf.table("trades")
+        .unwrap()
+        .column_i64("qty", 1)
+        .unwrap()
+        .at_now()
+        .unwrap();
+    sender.flush_and_get_fsn(&mut buf).unwrap().unwrap();
+
+    thread::sleep(run_for);
+    drop(sender);
+    handle.join().unwrap()
+}
+
+#[test]
+fn qwp_ws_nack_recycles_are_paced_against_healthy_server() {
+    let connections = run_paced_recycle_scenario(RecycleServerAction::WriteError);
+    assert!(
+        (2..=8).contains(&connections),
+        "expected paced NACK recycles to make a small number of connections, got {connections}"
+    );
+}
+
+#[test]
+fn qwp_ws_non_orderly_close_recycles_are_paced() {
+    let connections = run_paced_recycle_scenario(RecycleServerAction::NonOrderlyClose);
+    assert!(
+        (2..=8).contains(&connections),
+        "expected paced close recycles to make a small number of connections, got {connections}"
+    );
 }
 
 fn assert_server_protocol_violation<F>(write_bad_response: F, expected_message: &'static str)
@@ -2736,7 +4758,7 @@ where
         thread::sleep(Duration::from_millis(50));
     });
 
-    let mut sender = SenderBuilder::new(Protocol::QwpWs, "127.0.0.1", port)
+    let mut sender = SenderBuilder::new(Protocol::Ws, "127.0.0.1", port)
         .build()
         .unwrap();
     let mut buf = sender.new_buffer();
@@ -2764,7 +4786,7 @@ where
         protocol_error.category,
         QwpWsErrorCategory::ProtocolViolation
     );
-    assert_eq!(protocol_error.applied_policy, QwpWsErrorPolicy::Halt);
+    assert_eq!(protocol_error.applied_policy, QwpWsErrorPolicy::Terminal);
     assert_eq!(protocol_error.status, None);
     assert_eq!(protocol_error.message_sequence, None);
     assert_eq!(protocol_error.message.as_deref(), Some(expected_message));
@@ -2965,7 +4987,7 @@ fn qwp_ws_high_level_flush_returns_before_ack() {
         thread::sleep(Duration::from_millis(50));
     });
 
-    let mut sender = SenderBuilder::new(Protocol::QwpWs, "127.0.0.1", port)
+    let mut sender = SenderBuilder::new(Protocol::Ws, "127.0.0.1", port)
         .build()
         .unwrap();
     let mut buf = sender.new_buffer();
@@ -3007,7 +5029,7 @@ fn qwp_ws_high_level_flush_and_keep_returns_before_ack_and_preserves_buffer() {
         thread::sleep(Duration::from_millis(50));
     });
 
-    let mut sender = SenderBuilder::new(Protocol::QwpWs, "127.0.0.1", port)
+    let mut sender = SenderBuilder::new(Protocol::Ws, "127.0.0.1", port)
         .build()
         .unwrap();
     let mut buf = sender.new_buffer();
@@ -3053,7 +5075,7 @@ fn qwp_ws_high_level_flushes_pipeline_before_ack() {
         thread::sleep(Duration::from_millis(50));
     });
 
-    let mut sender = SenderBuilder::new(Protocol::QwpWs, "127.0.0.1", port)
+    let mut sender = SenderBuilder::new(Protocol::Ws, "127.0.0.1", port)
         .max_in_flight(2)
         .unwrap()
         .build()
@@ -3118,16 +5140,20 @@ fn spawn_dropping_then_recovering_server() -> (u16, std::sync::mpsc::Receiver<Ve
         tx.send(payload).unwrap();
         drop(s1);
 
-        // Second connection: upgrade, read replayed frame, ack it.
+        // Second connection: upgrade, then read the dictionary catch-up frame
+        // (delta mode re-registers the whole dictionary on the fresh connection
+        // via a table-less frame at wire seq 0) followed by the replayed data
+        // frame at wire seq 1, and ack that data frame.
         let (mut s2, _) = listener.accept().unwrap();
         s2.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
         s2.set_write_timeout(Some(Duration::from_secs(5))).unwrap();
         do_upgrade(&mut s2);
+        let (_fin, _op, _catch_up) = read_frame(&mut s2).unwrap();
         let (_fin, _op, payload) = read_frame(&mut s2).unwrap();
         tx.send(payload).unwrap();
         let mut ok = vec![0u8];
-        // First post-reconnect message gets sequence 0 from a fresh counter.
-        ok.extend_from_slice(&FIRST_WIRE_SEQUENCE.to_le_bytes());
+        // The catch-up consumed wire seq 0; ack the data frame at wire seq 1.
+        ok.extend_from_slice(&(FIRST_WIRE_SEQUENCE + 1).to_le_bytes());
         ok.extend_from_slice(&0u16.to_le_bytes());
         write_server_binary_frame(&mut s2, &ok).unwrap();
         thread::sleep(Duration::from_millis(50));
@@ -3140,7 +5166,7 @@ fn spawn_dropping_then_recovering_server() -> (u16, std::sync::mpsc::Receiver<Ve
 fn qwp_ws_reconnects_and_replays_in_all_progress_modes() {
     for progress in [ProgressCase::Background, ProgressCase::Manual] {
         let (port, rx) = spawn_dropping_then_recovering_server();
-        let builder = SenderBuilder::new(Protocol::QwpWs, "127.0.0.1", port)
+        let builder = SenderBuilder::new(Protocol::Ws, "127.0.0.1", port)
             .reconnect_initial_backoff(Duration::from_millis(20))
             .unwrap()
             .reconnect_max_backoff(Duration::from_millis(50))
@@ -3157,12 +5183,10 @@ fn qwp_ws_reconnects_and_replays_in_all_progress_modes() {
             .at_now()
             .unwrap();
 
-        let fsn = sender.flush_and_get_fsn(&mut buf).unwrap().unwrap();
-        assert!(
-            sender.await_acked_fsn(fsn, Duration::from_secs(5)).unwrap(),
-            "mode={}",
-            progress.name()
-        );
+        sender.flush_and_get_fsn(&mut buf).unwrap();
+        sender
+            .wait(crate::ingress::AckLevel::Ok, Duration::from_secs(5))
+            .unwrap_or_else(|e| panic!("mode={}: {e}", progress.name()));
 
         // Both wire dumps should be identical QWP messages — replay re-encodes
         // against fresh state but with the same row, so the bytes match.
@@ -3170,7 +5194,117 @@ fn qwp_ws_reconnects_and_replays_in_all_progress_modes() {
         let frame2 = rx.recv_timeout(Duration::from_secs(5)).unwrap();
         assert_eq!(&frame1[0..4], b"QWP1");
         assert_eq!(frame1, frame2, "mode={}", progress.name());
+
+        let totals = sender.qwp_ws_totals().unwrap();
+        assert_eq!(totals.frames_sent, 2, "mode={}", progress.name());
+        assert_eq!(totals.frames_replayed, 1, "mode={}", progress.name());
     }
+}
+
+/// Parses a table-less symbol-dict catch-up frame into `(delta_start, symbols)`.
+/// Header (12) then `delta_start`, `count`, then each `[len][utf8]` symbol.
+fn catch_up_symbols(frame: &[u8]) -> (u64, Vec<Vec<u8>>) {
+    assert_eq!(&frame[0..4], b"QWP1", "catch-up frame magic");
+    assert_eq!(frame[5] & 0x08, 0x08, "catch-up carries the delta flag");
+    assert_eq!(
+        u16::from_le_bytes([frame[6], frame[7]]),
+        0,
+        "catch-up frame is table-less"
+    );
+    let mut pos = 12usize;
+    let delta_start = read_varint(frame, &mut pos);
+    let count = read_varint(frame, &mut pos);
+    let mut symbols = Vec::new();
+    for _ in 0..count {
+        let len = read_varint(frame, &mut pos) as usize;
+        symbols.push(frame[pos..pos + len].to_vec());
+        pos += len;
+    }
+    (delta_start, symbols)
+}
+
+/// Drops the first connection unacked, then on reconnect forwards the catch-up
+/// frame (wire seq 0) to the test before acking the replayed data frame (seq 1).
+fn spawn_reconnect_forwarding_catch_up_server() -> (u16, mpsc::Receiver<Vec<u8>>) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let (tx, rx) = mpsc::channel();
+
+    thread::spawn(move || {
+        // First connection: read the initial frame, then drop without acking so it
+        // stays queued for replay.
+        let (mut s1, _) = listener.accept().unwrap();
+        s1.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        perform_server_upgrade(&mut s1).unwrap();
+        let _ = read_frame(&mut s1);
+        drop(s1);
+
+        // Reconnect: forward the catch-up frame (wire seq 0), then ack the replayed
+        // data frame (wire seq 1) so the sender's wait completes.
+        let (mut s2, _) = listener.accept().unwrap();
+        s2.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        s2.set_write_timeout(Some(Duration::from_secs(5))).unwrap();
+        perform_server_upgrade(&mut s2).unwrap();
+        let (_fin, _op, catch_up) = read_frame(&mut s2).unwrap();
+        tx.send(catch_up).unwrap();
+        let (_fin, _op, _data) = read_frame(&mut s2).unwrap();
+        write_qwp_ok_response(&mut s2, FIRST_WIRE_SEQUENCE + 1).unwrap();
+        thread::sleep(Duration::from_millis(50));
+    });
+
+    (port, rx)
+}
+
+#[test]
+fn qwp_ws_reconnect_catch_up_re_registers_the_real_multi_symbol_dictionary() {
+    // Guards the encoder<->mirror seam end-to-end: the mirror accumulates the REAL
+    // encoder's delta section on every send and, on reconnect, rebuilds it into the
+    // catch-up frame. A parser/layout mismatch there would pass the synthetic-bytes
+    // unit tests yet corrupt recovery, so assert an integration catch-up carries
+    // exactly the multi-symbol dictionary the real encoder produced, in id order.
+    let (port, rx) = spawn_reconnect_forwarding_catch_up_server();
+    let builder = SenderBuilder::new(Protocol::Ws, "127.0.0.1", port)
+        .reconnect_initial_backoff(Duration::from_millis(20))
+        .unwrap()
+        .reconnect_max_backoff(Duration::from_millis(50))
+        .unwrap();
+    let mut sender = build_qwp_ws_sender_from_builder(ProgressCase::Background, builder);
+
+    // Two rows with distinct symbols -> the encoder interns ETH-USD (id 0) and
+    // BTC-USD (id 1) into the connection dictionary.
+    let mut buf = sender.new_buffer();
+    buf.table("trades")
+        .unwrap()
+        .symbol("sym", "ETH-USD")
+        .unwrap()
+        .column_i64("qty", 7)
+        .unwrap()
+        .at_now()
+        .unwrap();
+    buf.table("trades")
+        .unwrap()
+        .symbol("sym", "BTC-USD")
+        .unwrap()
+        .column_i64("qty", 8)
+        .unwrap()
+        .at_now()
+        .unwrap();
+    sender.flush_and_get_fsn(&mut buf).unwrap();
+    sender
+        .wait(crate::ingress::AckLevel::Ok, Duration::from_secs(5))
+        .unwrap();
+
+    let catch_up = rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    let (delta_start, symbols) = catch_up_symbols(&catch_up);
+    assert_eq!(
+        delta_start, 0,
+        "catch-up re-registers the dictionary from id 0"
+    );
+    assert_eq!(
+        symbols,
+        vec![b"ETH-USD".to_vec(), b"BTC-USD".to_vec()],
+        "catch-up re-registers the real encoder-produced dictionary in id order"
+    );
 }
 
 #[test]
@@ -3193,14 +5327,17 @@ fn qwp_ws_midstream_failure_reconnects_to_next_endpoint() {
     thread::spawn(move || {
         let (mut stream, _) = second_listener.accept().unwrap();
         perform_server_upgrade(&mut stream).unwrap();
+        // Delta mode: the reconnect re-registers the dictionary with a table-less
+        // catch-up frame (wire seq 0) before replaying the data frame (wire seq 1).
+        let (_fin, _op, _catch_up) = read_frame(&mut stream).unwrap();
         let (_fin, _op, payload) = read_frame(&mut stream).unwrap();
         tx.send(payload).unwrap();
-        write_qwp_ok_response(&mut stream, FIRST_WIRE_SEQUENCE).unwrap();
+        write_qwp_ok_response(&mut stream, FIRST_WIRE_SEQUENCE + 1).unwrap();
         thread::sleep(Duration::from_millis(50));
     });
 
     let conf = format!(
-        "qwpws::addr=127.0.0.1:{first_port},127.0.0.1:{second_port};\
+        "ws::addr=127.0.0.1:{first_port},127.0.0.1:{second_port};\
          reconnect_initial_backoff_millis=1;\
          reconnect_max_backoff_millis=1;\
          reconnect_max_duration_millis=5000;"
@@ -3222,6 +5359,80 @@ fn qwp_ws_midstream_failure_reconnects_to_next_endpoint() {
     let frame2 = rx.recv_timeout(Duration::from_secs(5)).unwrap();
     assert_eq!(&frame1[0..4], b"QWP1");
     assert_eq!(frame1, frame2);
+}
+
+#[test]
+fn qwp_ws_midstream_failure_version_error_on_other_endpoint_stays_retryable() {
+    // Rolling-upgrade regression: the sender is connected to endpoint A
+    // (durable-ack capable) when A dies mid-stream. The reconnect round only
+    // attempts B -- A's attempted-this-round claim is still held from the
+    // round it connected in -- and B is a pre-durable-ack server, so the
+    // round's only recorded error is a ProtocolVersionError. That partial
+    // round must NOT be treated as "the whole fleet is incompatible": the
+    // reconnect stays retryable, the next round retries A, and the replayed
+    // frame lands there.
+    let first_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let first_port = first_listener.local_addr().unwrap().port();
+    let done = Arc::new(AtomicBool::new(false));
+    let (second_port, second_handle) = spawn_no_durable_ack_upgrade_server(Arc::clone(&done));
+    let (frame_tx, frame_rx) = mpsc::channel();
+
+    let first_thread = thread::spawn(move || {
+        // Connection #1: healthy, then dies after the first data frame.
+        let (mut stream, _) = first_listener.accept().unwrap();
+        perform_server_upgrade_durable(&mut stream).unwrap();
+        let (_fin, _op, _payload) = read_frame(&mut stream).unwrap();
+        drop(stream);
+        // Connection #2: the endpoint recovered; the replay must land here.
+        // Delta mode: catch-up frame (wire seq 0) precedes the data frame.
+        let (mut stream, _) = first_listener.accept().unwrap();
+        perform_server_upgrade_durable(&mut stream).unwrap();
+        let (_fin, _op, _catch_up) = read_frame(&mut stream).unwrap();
+        let (_fin, _op, payload) = read_frame(&mut stream).unwrap();
+        write_qwp_ok_response_with_table_entries(
+            &mut stream,
+            FIRST_WIRE_SEQUENCE + 1,
+            &[("trades", 10)],
+        )
+        .unwrap();
+        write_qwp_durable_ack_response(&mut stream, &[("trades", 10)]).unwrap();
+        frame_tx.send(payload).unwrap();
+        thread::sleep(Duration::from_millis(50));
+    });
+
+    let conf = format!(
+        "ws::addr=127.0.0.1:{first_port},127.0.0.1:{second_port};\
+         request_durable_ack=on;\
+         reconnect_initial_backoff_millis=1;\
+         reconnect_max_backoff_millis=1;\
+         reconnect_max_duration_millis=5000;"
+    );
+    let mut sender = SenderBuilder::from_conf(&conf).unwrap().build().unwrap();
+
+    let mut buf = sender.new_buffer();
+    buf.table("trades")
+        .unwrap()
+        .symbol("sym", "ETH-USD")
+        .unwrap()
+        .column_i64("qty", 7)
+        .unwrap()
+        .at_now()
+        .unwrap();
+    // Durable-ack background flush completes on write, not on ack, so it
+    // returns before the mid-stream failure is even detected. The replayed
+    // frame arriving on A's second connection is the recovery signal; the
+    // old latch instead marked the store terminal and never replayed.
+    sender
+        .flush(&mut buf)
+        .expect("mid-stream reconnect must survive a version error on the other endpoint");
+    let replayed = frame_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    assert_eq!(&replayed[0..4], b"QWP1");
+    done.store(true, Ordering::Release);
+    first_thread.join().unwrap();
+    assert!(
+        second_handle.join().unwrap() >= 1,
+        "the reconnect round should have dialed the version-erroring endpoint"
+    );
 }
 
 #[test]
@@ -3264,16 +5475,19 @@ fn qwp_ws_sync_reconnect_retries_failed_attempt() {
         s3.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
         s3.set_write_timeout(Some(Duration::from_secs(5))).unwrap();
         do_upgrade(&mut s3);
+        // Delta mode: the reconnect re-registers the dictionary with a table-less
+        // catch-up frame (wire seq 0) before replaying the data frame (wire seq 1).
+        let (_fin, _op, _catch_up) = read_frame(&mut s3).unwrap();
         let (_fin, _op, payload) = read_frame(&mut s3).unwrap();
         payload_tx.send(payload).unwrap();
         let mut ok = vec![0u8];
-        ok.extend_from_slice(&FIRST_WIRE_SEQUENCE.to_le_bytes());
+        ok.extend_from_slice(&(FIRST_WIRE_SEQUENCE + 1).to_le_bytes());
         ok.extend_from_slice(&0u16.to_le_bytes());
         write_server_binary_frame(&mut s3, &ok).unwrap();
         thread::sleep(Duration::from_millis(50));
     });
 
-    let mut sender = SenderBuilder::new(Protocol::QwpWs, "127.0.0.1", port)
+    let mut sender = SenderBuilder::new(Protocol::Ws, "127.0.0.1", port)
         .reconnect_initial_backoff(Duration::from_millis(1))
         .unwrap()
         .reconnect_max_backoff(Duration::from_millis(1))
@@ -3353,7 +5567,7 @@ fn qwp_ws_sync_initial_connect_retry_survives_dropped_upgrade() {
         thread::sleep(Duration::from_millis(50));
     });
 
-    let mut sender = SenderBuilder::new(Protocol::QwpWs, "127.0.0.1", port)
+    let mut sender = SenderBuilder::new(Protocol::Ws, "127.0.0.1", port)
         .initial_connect_retry(true)
         .unwrap()
         .reconnect_initial_backoff(Duration::from_millis(1))
@@ -3389,10 +5603,10 @@ fn qwp_ws_sync_initial_connect_retry_survives_dropped_upgrade() {
 fn qwp_ws_initial_connect_walks_endpoint_list_in_off_mode() {
     let bad_listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let bad_port = bad_listener.local_addr().unwrap().port();
-    drop(bad_listener);
 
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let good_port = listener.local_addr().unwrap().port();
+    drop(bad_listener);
     let (payload_tx, payload_rx) = mpsc::channel();
 
     thread::spawn(move || {
@@ -3404,7 +5618,7 @@ fn qwp_ws_initial_connect_walks_endpoint_list_in_off_mode() {
         thread::sleep(Duration::from_millis(50));
     });
 
-    let conf = format!("qwpws::addr=127.0.0.1:{bad_port},127.0.0.1:{good_port};");
+    let conf = format!("ws::addr=127.0.0.1:{bad_port},127.0.0.1:{good_port};");
     let mut sender = SenderBuilder::from_conf(&conf).unwrap().build().unwrap();
 
     let mut buf = sender.new_buffer();
@@ -3459,7 +5673,7 @@ fn qwp_ws_initial_connect_role_reject_tries_next_endpoint() {
         thread::sleep(Duration::from_millis(50));
     });
 
-    let conf = format!("qwpws::addr=127.0.0.1:{first_port},127.0.0.1:{second_port};");
+    let conf = format!("ws::addr=127.0.0.1:{first_port},127.0.0.1:{second_port};");
     let mut sender = SenderBuilder::from_conf(&conf).unwrap().build().unwrap();
 
     let mut buf = sender.new_buffer();
@@ -3513,7 +5727,7 @@ fn qwp_ws_initial_connect_retryable_status_tries_next_endpoint() {
         thread::sleep(Duration::from_millis(50));
     });
 
-    let conf = format!("qwpws::addr=127.0.0.1:{first_port},127.0.0.1:{second_port};");
+    let conf = format!("ws::addr=127.0.0.1:{first_port},127.0.0.1:{second_port};");
     let mut sender = SenderBuilder::from_conf(&conf).unwrap().build().unwrap();
 
     let mut buf = sender.new_buffer();
@@ -3529,6 +5743,61 @@ fn qwp_ws_initial_connect_retryable_status_tries_next_endpoint() {
 
     let frame = payload_rx.recv_timeout(Duration::from_secs(5)).unwrap();
     assert_eq!(&frame[0..4], b"QWP1");
+}
+
+#[test]
+fn qwp_ws_initial_connect_mixed_role_and_transport_prefers_role_mismatch() {
+    let (role_port, role_handle) = spawn_role_reject_upgrade_server(1, "PRIMARY_CATCHUP");
+    let status_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    status_listener.set_nonblocking(true).unwrap();
+    let status_port = status_listener.local_addr().unwrap().port();
+    let status_handle = thread::spawn(move || {
+        let started = Instant::now();
+        let mut attempts = 0usize;
+        while attempts < 1 && started.elapsed() < Duration::from_secs(5) {
+            match status_listener.accept() {
+                Ok((mut stream, _)) => {
+                    attempts += 1;
+                    stream.set_nonblocking(false).unwrap();
+                    stream
+                        .set_read_timeout(Some(Duration::from_secs(5)))
+                        .unwrap();
+                    stream
+                        .set_write_timeout(Some(Duration::from_secs(5)))
+                        .unwrap();
+                    let _ = read_request_until_blank(&mut stream).unwrap();
+                    stream
+                        .write_all(
+                            b"HTTP/1.1 500 Internal Server Error\r\n\
+                              Connection: close\r\n\
+                              Content-Length: 0\r\n\
+                              \r\n",
+                        )
+                        .unwrap();
+                }
+                Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                    thread::sleep(Duration::from_millis(5));
+                }
+                Err(err) => panic!("status listener failed: {err}"),
+            }
+        }
+        attempts
+    });
+
+    let conf = format!(
+        "ws::addr=127.0.0.1:{role_port},127.0.0.1:{status_port};\
+         initial_connect_retry=off;"
+    );
+    let result = SenderBuilder::from_conf(&conf).unwrap().build();
+
+    assert_eq!(role_handle.join().unwrap(), 1);
+    assert_eq!(status_handle.join().unwrap(), 1);
+
+    let err = result.unwrap_err();
+    assert_eq!(err.code(), ErrorCode::RoleMismatch);
+    assert!(err.msg().contains("role mismatch"), "got: {}", err.msg());
+    assert!(err.msg().contains("PRIMARY_CATCHUP"), "got: {}", err.msg());
+    assert!(!err.msg().contains("HTTP status 500"), "got: {}", err.msg());
 }
 
 #[test]
@@ -3559,7 +5828,7 @@ fn qwp_ws_initial_connect_unsupported_version_tries_next_endpoint() {
         thread::sleep(Duration::from_millis(50));
     });
 
-    let conf = format!("qwpws::addr=127.0.0.1:{first_port},127.0.0.1:{second_port};");
+    let conf = format!("ws::addr=127.0.0.1:{first_port},127.0.0.1:{second_port};");
     let mut sender = SenderBuilder::from_conf(&conf).unwrap().build().unwrap();
 
     let mut buf = sender.new_buffer();
@@ -3632,7 +5901,7 @@ fn qwp_ws_sync_initial_retry_unsupported_version_retries_next_round() {
     };
 
     let conf = format!(
-        "qwpws::addr=127.0.0.1:{first_port},127.0.0.1:{second_port};\
+        "ws::addr=127.0.0.1:{first_port},127.0.0.1:{second_port};\
          initial_connect_retry=sync;\
          reconnect_initial_backoff_millis=1;\
          reconnect_max_backoff_millis=1;\
@@ -3715,7 +5984,7 @@ fn qwp_ws_sync_initial_retry_malformed_101_retries_after_round_exhaustion() {
     };
 
     let conf = format!(
-        "qwpws::addr=127.0.0.1:{first_port},127.0.0.1:{second_port};\
+        "ws::addr=127.0.0.1:{first_port},127.0.0.1:{second_port};\
          initial_connect_retry=sync;\
          reconnect_initial_backoff_millis=1;\
          reconnect_max_backoff_millis=1;\
@@ -3744,7 +6013,7 @@ fn qwp_ws_sync_initial_retry_malformed_101_retries_after_round_exhaustion() {
 }
 
 #[test]
-fn qwp_ws_sync_initial_retry_mixed_role_and_transport_reports_last_failure() {
+fn qwp_ws_sync_initial_retry_mixed_role_and_transport_prefers_role_mismatch() {
     let (role_port, role_handle) = spawn_role_reject_upgrade_server(1, "PRIMARY_CATCHUP");
     let status_listener = TcpListener::bind("127.0.0.1:0").unwrap();
     status_listener.set_nonblocking(true).unwrap();
@@ -3783,7 +6052,7 @@ fn qwp_ws_sync_initial_retry_mixed_role_and_transport_reports_last_failure() {
     });
 
     let conf = format!(
-        "qwpws::addr=127.0.0.1:{role_port},127.0.0.1:{status_port};\
+        "ws::addr=127.0.0.1:{role_port},127.0.0.1:{status_port};\
          initial_connect_retry=sync;\
          reconnect_initial_backoff_millis=10;\
          reconnect_max_backoff_millis=10;\
@@ -3795,21 +6064,16 @@ fn qwp_ws_sync_initial_retry_mixed_role_and_transport_reports_last_failure() {
     assert_eq!(status_handle.join().unwrap(), 1);
 
     let err = result.unwrap_err();
-    assert_eq!(err.code(), ErrorCode::SocketError);
+    assert_eq!(err.code(), ErrorCode::RoleMismatch);
     assert!(
         err.msg()
             .contains("QWP/WebSocket initial connect retry budget exhausted"),
         "got: {}",
         err.msg()
     );
-    assert!(
-        err.msg()
-            .contains("QWP/WebSocket all endpoints unreachable"),
-        "got: {}",
-        err.msg()
-    );
-    assert!(err.msg().contains("HTTP status 500"), "got: {}", err.msg());
-    assert!(!err.msg().contains("role mismatch"), "got: {}", err.msg());
+    assert!(err.msg().contains("role mismatch"), "got: {}", err.msg());
+    assert!(err.msg().contains("PRIMARY_CATCHUP"), "got: {}", err.msg());
+    assert!(!err.msg().contains("HTTP status 500"), "got: {}", err.msg());
 }
 
 #[test]
@@ -3848,7 +6112,7 @@ fn qwp_ws_initial_connect_durable_ack_mismatch_tries_next_endpoint() {
     });
 
     let conf = format!(
-        "qwpws::addr=127.0.0.1:{first_port},127.0.0.1:{second_port};\
+        "ws::addr=127.0.0.1:{first_port},127.0.0.1:{second_port};\
          request_durable_ack=on;"
     );
     let mut sender = SenderBuilder::from_conf(&conf).unwrap().build().unwrap();
@@ -3869,12 +6133,12 @@ fn qwp_ws_initial_connect_durable_ack_mismatch_tries_next_endpoint() {
 }
 
 #[test]
-fn qwp_ws_sync_initial_retry_durable_ack_all_role_rejects_terminalize() {
+fn qwp_ws_sync_initial_retry_durable_ack_all_role_rejects_retry_until_budget() {
     let (first_port, first_handle) = spawn_role_reject_upgrade_server(1, "REPLICA");
     let (second_port, second_handle) = spawn_role_reject_upgrade_server(1, "REPLICA");
 
     let conf = format!(
-        "qwpws::addr=127.0.0.1:{first_port},127.0.0.1:{second_port};\
+        "ws::addr=127.0.0.1:{first_port},127.0.0.1:{second_port};\
          request_durable_ack=on;\
          initial_connect_retry=sync;\
          reconnect_initial_backoff_millis=100;\
@@ -3886,14 +6150,86 @@ fn qwp_ws_sync_initial_retry_durable_ack_all_role_rejects_terminalize() {
         .build()
         .unwrap_err();
 
-    assert_eq!(err.code(), ErrorCode::ProtocolVersionError);
+    assert_eq!(err.code(), ErrorCode::SocketError);
     assert!(
-        err.msg().contains("server did not enable durable ACK"),
+        err.msg()
+            .contains("QWP/WebSocket initial connect retry budget exhausted"),
         "got: {}",
         err.msg()
     );
     assert_eq!(first_handle.join().unwrap(), 1);
     assert_eq!(second_handle.join().unwrap(), 1);
+}
+
+/// Endpoint that accepts the TCP connection and immediately drops it, so the
+/// client's WS upgrade fails with a transient read error. Unlike a closed
+/// port, this fails fast on every platform: Windows keeps retransmitting the
+/// SYN against a refused port for ~1s, which would eat a whole sub-second
+/// retry budget in a single round.
+fn spawn_accept_then_drop_server(done: Arc<AtomicBool>) -> (u16, thread::JoinHandle<usize>) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let port = listener.local_addr().unwrap().port();
+
+    let handle = thread::spawn(move || {
+        let mut attempts = 0usize;
+        while !done.load(Ordering::Acquire) {
+            match listener.accept() {
+                Ok((stream, _)) => {
+                    attempts += 1;
+                    drop(stream);
+                }
+                Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                    thread::sleep(Duration::from_millis(5));
+                }
+                Err(err) => panic!("accept-then-drop listener failed: {err}"),
+            }
+        }
+        attempts
+    });
+
+    (port, handle)
+}
+
+#[test]
+fn qwp_ws_sync_initial_retry_version_error_does_not_mask_transient_endpoint_failure() {
+    // Rolling-upgrade shape: the first endpoint upgrades but does not enable
+    // durable ACK (ProtocolVersionError, terminal on its own); the second
+    // accepts and immediately drops the connection (transient). One
+    // endpoint's terminal error must not win the round while another
+    // endpoint is only transiently down -- the connect must keep retrying
+    // until the budget expires instead of surfacing ProtocolVersionError.
+    let done = Arc::new(AtomicBool::new(false));
+    let (first_port, first_handle) = spawn_no_durable_ack_upgrade_server(Arc::clone(&done));
+    let (second_port, second_handle) = spawn_accept_then_drop_server(Arc::clone(&done));
+
+    let conf = format!(
+        "ws::addr=127.0.0.1:{first_port},127.0.0.1:{second_port};\
+         request_durable_ack=on;\
+         initial_connect_retry=sync;\
+         reconnect_initial_backoff_millis=50;\
+         reconnect_max_backoff_millis=50;\
+         reconnect_max_duration_millis=300;"
+    );
+    let err = SenderBuilder::from_conf(&conf)
+        .unwrap()
+        .build()
+        .unwrap_err();
+    done.store(true, Ordering::Release);
+
+    assert_eq!(err.code(), ErrorCode::SocketError, "got: {}", err.msg());
+    assert!(
+        err.msg()
+            .contains("QWP/WebSocket initial connect retry budget exhausted"),
+        "got: {}",
+        err.msg()
+    );
+    let first_attempts = first_handle.join().unwrap();
+    let _ = second_handle.join().unwrap();
+    assert!(
+        first_attempts >= 2,
+        "expected repeated retries against the version-erroring endpoint, got {first_attempts}"
+    );
 }
 
 #[test]
@@ -3903,7 +6239,7 @@ fn qwp_ws_sync_initial_retry_budget_exhaustion_reports_context() {
     drop(probe);
 
     let conf = format!(
-        "qwpws::addr=127.0.0.1:{port};\
+        "ws::addr=127.0.0.1:{port};\
          initial_connect_retry=sync;\
          reconnect_initial_backoff_millis=10;\
          reconnect_max_backoff_millis=10;\
@@ -4019,7 +6355,7 @@ fn qwp_ws_sync_initial_retry_resets_non_healthy_between_rounds() {
     });
 
     let conf = format!(
-        "qwpws::addr=127.0.0.1:{first_port},127.0.0.1:{second_port};\
+        "ws::addr=127.0.0.1:{first_port},127.0.0.1:{second_port};\
          initial_connect_retry=sync;\
          reconnect_initial_backoff_millis=100;\
          reconnect_max_backoff_millis=100;\
@@ -4062,7 +6398,7 @@ fn qwp_ws_async_initial_connect_background_can_flush() {
         thread::sleep(Duration::from_millis(50));
     });
 
-    let conf = format!("qwpws::addr=127.0.0.1:{port};initial_connect_retry=async;");
+    let conf = format!("ws::addr=127.0.0.1:{port};initial_connect_retry=async;");
     let mut sender = SenderBuilder::from_conf(&conf).unwrap().build().unwrap();
 
     let mut buf = sender.new_buffer();
@@ -4082,7 +6418,7 @@ fn qwp_ws_async_initial_connect_background_can_flush() {
 
 #[test]
 fn qwp_ws_async_initial_connect_rejects_manual_progress() {
-    let conf = "qwpws::addr=127.0.0.1:1;\
+    let conf = "ws::addr=127.0.0.1:1;\
                 initial_connect_retry=async;\
                 qwp_ws_progress=manual;";
     let err = SenderBuilder::from_conf(conf).unwrap().build().unwrap_err();
@@ -4098,7 +6434,7 @@ fn qwp_ws_async_initial_connect_rejects_manual_progress() {
 fn qwp_ws_from_conf_parses_java_reconnect_keys() {
     // Just exercises the parser surface: every new key is accepted. Building
     // would also work but isn't necessary for parser coverage.
-    let conf = "qwpws::addr=localhost:9000;\
+    let conf = "ws::addr=localhost:9000;\
                 max_in_flight=64;\
                 reconnect_max_duration_millis=20000;\
                 reconnect_initial_backoff_millis=200;\
@@ -4109,34 +6445,37 @@ fn qwp_ws_from_conf_parses_java_reconnect_keys() {
                 durable_ack_keepalive_interval_millis=250;";
     SenderBuilder::from_conf(conf).unwrap();
 
-    let disabled_keepalive = "qwpws::addr=localhost:9000;durable_ack_keepalive_interval_millis=0;";
+    let disabled_keepalive = "ws::addr=localhost:9000;durable_ack_keepalive_interval_millis=0;";
     SenderBuilder::from_conf(disabled_keepalive).unwrap();
 
-    let conf_sync = "qwpws::addr=localhost:9000;initial_connect_retry=sync;";
+    let conf_sync = "ws::addr=localhost:9000;initial_connect_retry=sync;";
     SenderBuilder::from_conf(conf_sync).unwrap();
 
-    let conf_false = "qwpws::addr=localhost:9000;initial_connect_retry=false;";
+    let conf_false = "ws::addr=localhost:9000;initial_connect_retry=false;";
     SenderBuilder::from_conf(conf_false).unwrap();
 
-    let conf_multi = "qwpws::addr=localhost:9000, localhost:9001;addr=localhost:9002;";
+    let conf_multi = "ws::addr=localhost:9000, localhost:9001;addr=localhost:9002;";
     SenderBuilder::from_conf(conf_multi).unwrap();
 
-    let zone_ignored = "qwpws::addr=localhost:9000;zone=dc-amsterdam;";
+    let zone_ignored = "ws::addr=localhost:9000;zone=dc-amsterdam;";
     SenderBuilder::from_conf(zone_ignored).unwrap();
 
-    let tcp_zone = "tcp::addr=localhost:9009;zone=dc-amsterdam;";
-    SenderBuilder::from_conf(tcp_zone).unwrap();
+    #[cfg(feature = "sync-sender-tcp")]
+    {
+        let tcp_zone = "tcp::addr=localhost:9009;zone=dc-amsterdam;";
+        SenderBuilder::from_conf(tcp_zone).unwrap();
+    }
 
     // Java Sender ignores unknown keys; this is parser compatibility, not
     // target-selection support.
-    let target_ignored = "qwpws::addr=localhost:9000;target=primary;";
+    let target_ignored = "ws::addr=localhost:9000;target=primary;";
     SenderBuilder::from_conf(target_ignored).unwrap();
 
-    let duplicate = "qwpws::addr=localhost:9000,localhost:9000;";
+    let duplicate = "ws::addr=localhost:9000,localhost:9000;";
     let err = SenderBuilder::from_conf(duplicate).unwrap_err();
     assert!(err.msg().contains("duplicate"), "got: {}", err.msg());
 
-    let duplicate_effective_port = "qwpws::addr=localhost:9000,localhost:09000;";
+    let duplicate_effective_port = "ws::addr=localhost:9000,localhost:09000;";
     let err = SenderBuilder::from_conf(duplicate_effective_port).unwrap_err();
     assert!(
         err.msg().contains("duplicate") && err.msg().contains("localhost:9000"),
@@ -4144,34 +6483,60 @@ fn qwp_ws_from_conf_parses_java_reconnect_keys() {
         err.msg()
     );
 
-    let empty_entry = "qwpws::addr=localhost:9000,,localhost:9001;";
+    let empty_entry = "ws::addr=localhost:9000,,localhost:9001;";
     let err = SenderBuilder::from_conf(empty_entry).unwrap_err();
     assert!(err.msg().contains("empty entry"), "got: {}", err.msg());
 
-    let empty_host = "qwpws::addr=:9000;";
+    let empty_host = "ws::addr=:9000;";
     let err = SenderBuilder::from_conf(empty_host).unwrap_err();
     assert!(err.msg().contains("empty host"), "got: {}", err.msg());
 
-    let invalid_port = "qwpws::addr=localhost:notaport;";
-    let err = SenderBuilder::from_conf(invalid_port).unwrap_err();
-    assert!(err.msg().contains("invalid port"), "got: {}", err.msg());
+    let ipv6_multi = "ws::addr=[::1]:9000,[2001:db8::1]:9001, localhost:9002;";
+    SenderBuilder::from_conf(ipv6_multi).unwrap();
 
-    let zero_port = "qwpws::addr=localhost:0;";
-    let err = SenderBuilder::from_conf(zero_port).unwrap_err();
-    assert!(err.msg().contains("invalid port"), "got: {}", err.msg());
+    let unbracketed_ipv6 = "ws::addr=::1:9000;";
+    let err = SenderBuilder::from_conf(unbracketed_ipv6).unwrap_err();
+    assert!(err.msg().contains("bracket IPv6"), "got: {}", err.msg());
 
-    let repeated_tcp_addr = "tcp::addr=localhost:9009;addr=localhost:9010;";
-    let err = SenderBuilder::from_conf(repeated_tcp_addr).unwrap_err();
+    let unterminated_bracket = "ws::addr=[::1:9000;";
+    let err = SenderBuilder::from_conf(unterminated_bracket).unwrap_err();
+    assert!(err.msg().contains("missing ']'"), "got: {}", err.msg());
+
+    let bracket_junk = "ws::addr=[::1]9000;";
+    let err = SenderBuilder::from_conf(bracket_junk).unwrap_err();
     assert!(
-        err.msg().contains("DuplicateKey") || err.msg().contains("duplicate"),
+        err.msg().contains("expected ':port' after ']'"),
         "got: {}",
         err.msg()
     );
 
-    let conf_async = "qwpws::addr=localhost:9000;initial_connect_retry=async;";
+    let bracket_empty_host = "ws::addr=[]:9000;";
+    let err = SenderBuilder::from_conf(bracket_empty_host).unwrap_err();
+    assert!(err.msg().contains("empty host"), "got: {}", err.msg());
+
+    let invalid_port = "ws::addr=localhost:notaport;";
+    let err = SenderBuilder::from_conf(invalid_port).unwrap_err();
+    assert!(err.msg().contains("invalid port"), "got: {}", err.msg());
+
+    let zero_port = "ws::addr=localhost:0;";
+    let err = SenderBuilder::from_conf(zero_port).unwrap_err();
+    assert!(err.msg().contains("invalid port"), "got: {}", err.msg());
+
+    #[cfg(feature = "sync-sender-tcp")]
+    {
+        let repeated_tcp_addr = "tcp::addr=localhost:9009;addr=localhost:9010;";
+        let err = SenderBuilder::from_conf(repeated_tcp_addr).unwrap_err();
+        assert!(
+            err.msg().contains("DuplicateKey") || err.msg().contains("duplicate"),
+            "got: {}",
+            err.msg()
+        );
+    }
+
+    let conf_async = "ws::addr=localhost:9000;initial_connect_retry=async;";
     SenderBuilder::from_conf(conf_async).unwrap();
 
-    let bad = "qwpws::addr=localhost:9000;initial_connect_retry=maybe;";
+    let bad = "ws::addr=localhost:9000;initial_connect_retry=maybe;";
     let err = SenderBuilder::from_conf(bad).unwrap_err();
     assert!(
         err.msg().contains("initial_connect_retry"),
@@ -4182,7 +6547,7 @@ fn qwp_ws_from_conf_parses_java_reconnect_keys() {
 
 // ---------- X-QWP-Max-Batch-Size handling ----------
 
-fn upgrade_mock_stream_with_max_batch_size(
+pub(crate) fn upgrade_mock_stream_with_max_batch_size(
     stream: &mut TcpStream,
     max_batch_size: Option<usize>,
 ) -> Vec<String> {
@@ -4220,9 +6585,10 @@ fn spawn_max_batch_size_server(max_batch_size: Option<usize>) -> (u16, mpsc::Rec
         let (mut stream, _) = listener.accept().unwrap();
         let request_lines = upgrade_mock_stream_with_max_batch_size(&mut stream, max_batch_size);
         let mut received_frames = Vec::new();
-        let (_fin, _opcode, payload) = read_frame(&mut stream).unwrap();
-        received_frames.push(payload);
-        write_qwp_ok_response(&mut stream, FIRST_WIRE_SEQUENCE).unwrap();
+        if let Ok((_fin, _opcode, payload)) = read_frame(&mut stream) {
+            received_frames.push(payload);
+            let _ = write_qwp_ok_response(&mut stream, FIRST_WIRE_SEQUENCE);
+        }
         let _ = tx.send(MockResult {
             request_lines,
             received_frames,
@@ -4261,7 +6627,7 @@ fn server_max_batch_size_clamps_flush_below_configured_max_in_all_progress_modes
     for progress in [ProgressCase::Background, ProgressCase::Manual] {
         let server_cap: usize = 512;
         let port = spawn_max_batch_size_upgrade_only_server(Some(server_cap));
-        let builder = SenderBuilder::new(Protocol::QwpWs, "127.0.0.1", port)
+        let builder = SenderBuilder::new(Protocol::Ws, "127.0.0.1", port)
             .max_buf_size(100 * 1024 * 1024)
             .unwrap();
         let mut sender = build_qwp_ws_sender_from_builder(progress, builder);
@@ -4302,7 +6668,7 @@ fn server_max_batch_size_allows_flush_when_encoded_fits_in_all_progress_modes() 
     for progress in [ProgressCase::Background, ProgressCase::Manual] {
         let server_cap: usize = 100 * 1024;
         let (port, rx) = spawn_max_batch_size_server(Some(server_cap));
-        let builder = SenderBuilder::new(Protocol::QwpWs, "127.0.0.1", port)
+        let builder = SenderBuilder::new(Protocol::Ws, "127.0.0.1", port)
             .max_buf_size(100 * 1024 * 1024)
             .unwrap();
         let mut sender = build_qwp_ws_sender_from_builder(progress, builder);
@@ -4335,7 +6701,7 @@ fn absent_server_max_batch_size_falls_back_to_configured_max_in_all_progress_mod
     for progress in [ProgressCase::Background, ProgressCase::Manual] {
         let configured_max: usize = 1024;
         let port = spawn_max_batch_size_upgrade_only_server(None);
-        let builder = SenderBuilder::new(Protocol::QwpWs, "127.0.0.1", port)
+        let builder = SenderBuilder::new(Protocol::Ws, "127.0.0.1", port)
             .max_buf_size(configured_max)
             .unwrap();
         let mut sender = build_qwp_ws_sender_from_builder(progress, builder);
@@ -4370,7 +6736,7 @@ fn configured_max_wins_when_smaller_than_server_cap_in_all_progress_modes() {
         let configured_max: usize = 1024;
         let server_cap: usize = 16 * 1024 * 1024;
         let port = spawn_max_batch_size_upgrade_only_server(Some(server_cap));
-        let builder = SenderBuilder::new(Protocol::QwpWs, "127.0.0.1", port)
+        let builder = SenderBuilder::new(Protocol::Ws, "127.0.0.1", port)
             .max_buf_size(configured_max)
             .unwrap();
         let mut sender = build_qwp_ws_sender_from_builder(progress, builder);
@@ -4409,7 +6775,7 @@ fn server_cap_prevents_message_too_big_by_rejecting_locally_in_all_progress_mode
     for progress in [ProgressCase::Background, ProgressCase::Manual] {
         let server_cap: usize = 2048;
         let (port, _rx) = spawn_max_batch_size_server(Some(server_cap));
-        let builder = SenderBuilder::new(Protocol::QwpWs, "127.0.0.1", port)
+        let builder = SenderBuilder::new(Protocol::Ws, "127.0.0.1", port)
             .max_buf_size(100 * 1024 * 1024)
             .unwrap();
         let mut sender = build_qwp_ws_sender_from_builder(progress, builder);
@@ -4459,7 +6825,7 @@ fn server_cap_at_exact_boundary_allows_flush_in_all_progress_modes() {
 
         let server_cap = encoded_len;
         let (port, rx) = spawn_max_batch_size_server(Some(server_cap));
-        let builder = SenderBuilder::new(Protocol::QwpWs, "127.0.0.1", port)
+        let builder = SenderBuilder::new(Protocol::Ws, "127.0.0.1", port)
             .max_buf_size(100 * 1024 * 1024)
             .unwrap();
         let mut sender = build_qwp_ws_sender_from_builder(progress, builder);
@@ -4493,7 +6859,7 @@ fn server_cap_one_byte_below_encoded_len_rejects_flush_in_all_progress_modes() {
 
         let server_cap = encoded_len - 1;
         let port = spawn_max_batch_size_upgrade_only_server(Some(server_cap));
-        let builder = SenderBuilder::new(Protocol::QwpWs, "127.0.0.1", port)
+        let builder = SenderBuilder::new(Protocol::Ws, "127.0.0.1", port)
             .max_buf_size(100 * 1024 * 1024)
             .unwrap();
         let mut sender = build_qwp_ws_sender_from_builder(progress, builder);

@@ -18,6 +18,22 @@ publish = false
 #   - qwp_sidecar        — line-protocol ingress sender driven by the
 #                          questdb-enterprise e2e harness (Rust port of
 #                          com.questdb.e2e.QwpSidecarMain)
+#   - qwp_column_sidecar — same protocol, column-major (ColumnSender) sender;
+#                          SEND src selects the chunk | arrow input shape
+
+[features]
+# Opt-in: the `polars` SEND input shape. Off by default because the polars
+# dependency tree is large; the Enterprise harness builds with it when
+# C_QUESTDB_CLIENT_COLUMN_POLARS is set, to exercise DataFrame ingestion
+# through failover.
+polars = ["questdb-rs/polars", "dep:polars"]
 
 [dependencies]
-questdb-rs = { path = "../../questdb-rs", features = ["sync-reader-ws", "sync-sender-qwp-ws"] }
+questdb-rs = { path = "../../questdb-rs", features = ["sync-reader-qwp-ws", "sync-sender-qwp-ws", "arrow"] }
+# Construct Arrow RecordBatches for qwp_column_sidecar's `SEND ... arrow` path.
+# Same major as questdb-rs's `arrow` dep so the RecordBatch type unifies.
+arrow-array = "58"
+arrow-schema = "58"
+# Optional: build polars DataFrames for the `SEND ... polars` path. Pinned to
+# questdb-rs's polars version so the DataFrame type unifies.
+polars = { version = "=0.52.0", optional = true, default-features = false, features = ["dtype-datetime"] }

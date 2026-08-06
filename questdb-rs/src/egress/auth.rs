@@ -29,7 +29,7 @@
 
 use base64ct::{Base64, Encoding};
 
-use crate::egress::error::{Result, fmt};
+use crate::error::{Result, fmt};
 
 /// Authentication mode for the WebSocket upgrade request.
 ///
@@ -168,7 +168,7 @@ fn reject_control_bytes(s: &str, what: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::egress::error::ErrorCode;
+    use crate::error::ErrorCode;
 
     #[test]
     fn none_when_nothing_set() {

@@ -50,10 +50,10 @@
 //!
 //! ```text
 //! QDB_LIVE_BROKER_AUTH=admin:quest \
-//!   cargo test --features sync-reader-ws --test egress_live_auth -- --nocapture
+//!   cargo test --features sync-reader-qwp-ws --test egress_live_auth -- --nocapture
 //! ```
 
-#![cfg(feature = "sync-reader-ws")]
+#![cfg(feature = "sync-reader-qwp-ws")]
 
 use std::env;
 
@@ -163,7 +163,7 @@ fn live_basic_auth_rejects_wrong_password() {
             // without the `WWW-Authenticate` header that triggers the
             // 401/403 → AuthError mapping); anything in the
             // transport/handshake family disproves "silently accepted."
-            use questdb::egress::ErrorCode;
+            use questdb::ErrorCode;
             assert!(
                 matches!(e.code(), ErrorCode::AuthError | ErrorCode::HandshakeError),
                 "wrong-password rejection should surface as AuthError or HandshakeError; \

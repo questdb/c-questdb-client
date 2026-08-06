@@ -26,7 +26,7 @@
 //!
 //! 7-bit groups, LSB first, high bit (`0x80`) is a continuation flag.
 
-use crate::egress::error::{Error, ErrorCode, Result, fmt};
+use crate::error::{Error, ErrorCode, Result, fmt};
 
 /// Maximum bytes a u64 LEB128 value can occupy: ceil(64 / 7) = 10.
 pub const MAX_VARINT_LEN_U64: usize = 10;

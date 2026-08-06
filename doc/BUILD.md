@@ -1,98 +1,129 @@
-# Build Instructions
+# Build instructions
 
-This page describes how to build this project.
+This page covers building the native C/C++ library and running this
+repository's tests. See [DEPENDENCY.md](DEPENDENCY.md) for adding a tagged
+release to another project and [COMPATIBILITY.md](COMPATIBILITY.md) for the
+supported toolchain and dependency ranges.
 
-Also make sure to read the page on
-[integrating this library into your project](DEPENDENCY.md).
+## Prerequisites
 
-## Pre-requisites and dependencies
+The library build requires:
 
-* Rust 1.61 or newer (get it from [https://rustup.rs/](https://rustup.rs/))
-* A modern C11 or C++17 compiler.
-* CMake 3.15 or newer.
+- Rust 1.91.1 or newer, installed with [rustup](https://rustup.rs/);
+- a C11 compiler and a C++17 compiler; and
+- CMake 3.15 or newer.
 
-The library statically links all its dependencies.
+Rust 1.91.1 is the minimum supported Rust version (MSRV) for both
+`questdb-rs` and `questdb-rs-ffi`, including the Arrow and Polars feature set
+used by docs.rs.
 
-```
-$ ls build/libquestdb_client.*
-build/libquestdb_client.a  build/libquestdb_client.so
-$ ldd build/libquestdb_client.so
-        linux-vdso.so.1 (0x00007ffddd344000)
-        libgcc_s.so.1 => /lib/x86_64-linux-gnu/libgcc_s.so.1 (0x00007fe61d252000)
-        libpthread.so.0 => /lib/x86_64-linux-gnu/libpthread.so.0 (0x00007fe61d22f000)
-        libdl.so.2 => /lib/x86_64-linux-gnu/libdl.so.2 (0x00007fe61d229000)
-        libc.so.6 => /lib/x86_64-linux-gnu/libc.so.6 (0x00007fe61d037000)
-        /lib64/ld-linux-x86-64.so.2 (0x00007fe61d2ee000)
-```
+## Build the library
 
-## Build steps
-
-### Linux / MacOS
-
-Tested compilers are GCC and Clang.
+On Linux and macOS, with GCC or Clang:
 
 ```bash
-$ cmake -S . -B build \
-  -DCMAKE_BUILD_TYPE=Release  # .. or -DCMAKE_BUILD_TYPE=Debug for debugging.
-$ cmake --build build
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+cmake --build build --config Release
 ```
 
-**Note**: Tests and examples are not built by default. To build them add
-`-DQUESTDB_TESTS_AND_EXAMPLES=ON` to the `cmake` command line above.
+On Windows, use a Visual Studio 2022 developer shell or let an IDE configure
+the CMake project, then run the same commands. The project is also exercised
+with current Clang/GCC toolchains in CI.
+
+The default build produces static and shared forms of `questdb_client` in the
+selected build directory. Set `BUILD_SHARED_LIBS=ON` when a downstream CMake
+project should link the shared form by default:
 
 ```bash
-
-### Windows
-
-The project should compile with Visual Studio 2017 and newer. It should
-also work with MinGW-w64.
-
-Building on Windows is usually easier done through an IDE.
-
-### IDEs
-
-Open Visual Studio 2017 or CLion and import as CMake project.
-Visual Studio Code should also work well provided you have the "C/C++",
-"CMake Tools" and "CMake Test Explorer" extensions installed.
-
-## Build outputs
-
-The build will generate both static and dynamic libraries compiled to `./build`
-(or your otherwise selected CMake build directory).
-
-## Running tests
-
-### Unit Tests
-C++ unit tests are compiled by default.
-
-In Linux and MacOS you can run these through `ctest` via the command line.
-
-```bash
-$ (cd build && ctest)
+cmake -S . -B build-shared \
+  -DCMAKE_BUILD_TYPE=Release \
+  -DBUILD_SHARED_LIBS=ON
+cmake --build build-shared --config Release
 ```
 
-On Windows it's usually easier to run tests through your IDE.
+To expose the Arrow C Data Interface, set `QUESTDB_ENABLE_ARROW=ON`. Tests and
+examples enable it automatically.
 
-### System Tests (optional)
-If you also want to run the system tests which test the client
-libraries against a live instance of QuestDB you need to:
+## Build and run tests and examples
 
-* Ensure you have a Java 11 installation pointed to by the `JAVA_HOME`
-  environment variable.
+Tests and examples are not built by default:
 
-* Python3.8 or newer installed and available as `python3` on the `PATH`
-  environment variable.
+```bash
+cmake -S . -B build \
+  -DCMAKE_BUILD_TYPE=Release \
+  -DQUESTDB_TESTS_AND_EXAMPLES=ON
+cmake --build build --config Release
+ctest --test-dir build --output-on-failure -C Release
+```
 
-* Then re-run cmake whilst defining `QUESTDB_SYSTEM_TESTING`:
-  ```bash
-  $ cmake -S . -B build -DQUESTDB_SYSTEM_TESTING=ON
-  $ (cd build && make && ctest)
-  ```
+The examples are build targets but are not CTest tests because most of them
+require a running QuestDB instance. For example, after starting QuestDB 10.0
+or newer locally:
+
+```bash
+cmake --build build --target qwp_ws_chunk_and_query_c_example
+cmake --build build --target qwp_ws_chunk_and_query_cpp_example
+./build/qwp_ws_chunk_and_query_c_example
+./build/qwp_ws_chunk_and_query_cpp_example
+```
+
+Multi-config generators may place executables under `build/Release/`.
+
+## Rust-only tests
+
+Run Cargo from each crate directory; the repository root is not a Cargo
+workspace:
+
+```bash
+cd questdb-rs
+cargo test
+cargo test --features almost-all-features,arrow,polars
+
+cd ../questdb-rs-ffi
+cargo test --all-features
+```
+
+The CI-equivalent Rust and native unit suite can be invoked from the repository
+root after configuring the CMake build shown above:
+
+```bash
+python3 ci/run_all_tests.py unit
+```
+
+## Live-server system tests
+
+The system-test harness requires Python 3.10 or newer. To build the current
+QuestDB server from source it also requires JDK 25, Maven, and a QuestDB source
+checkout at `./questdb`:
+
+```bash
+python3 ci/run_all_tests.py integration
+```
+
+Before QuestDB 10.0 is published, test the compatibility floor against the
+approved, Maven-built 10.0 release-candidate checkout:
+
+```bash
+python3 system_test/test.py run --repo /path/to/questdb-10.0-rc -v
+```
+
+After the server release exists, rerun with its exact release tag:
+
+```bash
+python3 system_test/test.py run --versions <QUESTDB_10_RELEASE_TAG> -v
+```
+
+Do not substitute `10.0` for the placeholder until that exact downloadable
+tag exists.
+
+Some Arrow and Polars system tests additionally require current `numpy`,
+`pyarrow`, `polars`, and `tzdata` Python packages. The CI setup in
+`ci/templates/compile.yaml` is the authoritative dependency list.
 
 ## Cleaning
 
-Delete the `./build` directory.
+Use CMake's clean target, or remove a disposable build directory yourself:
 
 ```bash
-$ rm -fR build  # or your otherwise selected CMake build directory.
+cmake --build build --target clean
 ```

@@ -27,7 +27,6 @@
 //! [`crate::egress::decoder`]; everything else is here.
 
 use crate::egress::decoder::{DecodedBatch, ZstdScratch, decode_result_batch};
-use crate::egress::error::{Result, fmt};
 use crate::egress::schema::Schema;
 use crate::egress::symbol_dict::SymbolDict;
 use crate::egress::wire::ByteReader;
@@ -36,6 +35,7 @@ use crate::egress::wire::capabilities::has_zone;
 use crate::egress::wire::header::FrameHeader;
 use crate::egress::wire::msg_kind::{MsgKind, StatusCode};
 use crate::egress::wire::roles;
+use crate::error::{Result, fmt};
 use bytes::Bytes;
 
 // ---------------------------------------------------------------------------
@@ -111,6 +111,65 @@ pub struct ServerInfo {
     /// on every server that does not advertise `CAP_ZONE` — including
     /// servers whose `capabilities` is hard-zero.
     pub zone_id: Option<String>,
+}
+
+/// Upgrade-time topology rejection carried alongside an [`crate::Error`].
+///
+/// Populated when the server rejects the WebSocket upgrade with HTTP `421`
+/// plus an `X-QuestDB-Role` header (per failover.md §5), or when a
+/// `SERVER_INFO` frame advertises a role that does not match the configured
+/// `target=` filter. The host-health tracker (when present) reads this to
+/// decide whether the host is in `TransientReject` (`PRIMARY_CATCHUP`) or
+/// `TopologyReject` (every other role byte) and to update zone tier from
+/// the optional `X-QuestDB-Zone` / `SERVER_INFO.zone_id`.
+///
+/// `role_byte` is the raw `SERVER_INFO.role` byte from wire-egress.md §11.8
+/// (`0x00`=STANDALONE, `0x01`=PRIMARY, `0x02`=REPLICA, `0x03`=PRIMARY_CATCHUP);
+/// unrecognised values are carried through verbatim so a future role
+/// addition is observable to operators even on an older client build.
+/// `role_name` is the ASCII token actually seen on the wire (uppercased for
+/// the four named roles; the literal header value when the byte is unknown);
+/// it is kept so diagnostics surface what the server *said*, not what the
+/// client decided to call it. `zone` is `Some` only when the server
+/// advertised one (via `SERVER_INFO.zone_id` gated on `CAP_ZONE`, or the
+/// `X-QuestDB-Zone` upgrade header).
+///
+/// `#[non_exhaustive]` so future fields (a structured replay-hint, a
+/// retry-after value, a cluster-ID tag — anything the failover.md spec
+/// might extend `421` reject headers with) can be added without
+/// breaking downstream struct-literal construction or exhaustive
+/// destructuring. Use [`UpgradeReject::new`] to construct from
+/// external code.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct UpgradeReject {
+    pub role_byte: u8,
+    pub role_name: String,
+    pub zone: Option<String>,
+}
+
+impl UpgradeReject {
+    pub fn new(role_byte: u8, role_name: impl Into<String>, zone: Option<String>) -> Self {
+        Self {
+            role_byte,
+            role_name: role_name.into(),
+            zone,
+        }
+    }
+
+    /// True when the server-advertised role is `PRIMARY_CATCHUP` —
+    /// a transient state (promotion in flight) that the tracker should
+    /// classify as recoverable. Every other role byte is topological
+    /// (won't recover without operator intervention or topology change).
+    /// Per failover.md §6: any non-empty `X-QuestDB-Role` value other
+    /// than `PRIMARY_CATCHUP` is conservatively treated as topological,
+    /// including unrecognised tokens.
+    pub fn is_transient(&self) -> bool {
+        self.role_byte == roles::PRIMARY_CATCHUP
+            || self
+                .role_name
+                .eq_ignore_ascii_case(roles::NAME_PRIMARY_CATCHUP)
+    }
 }
 
 /// Single decoded server message.
@@ -359,9 +418,9 @@ fn read_u16_string(r: &mut ByteReader<'_>, field: &str) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::egress::error::ErrorCode;
     use crate::egress::wire::header::{HEADER_LEN, PROTOCOL_VERSION};
     use crate::egress::wire::varint::encode_u64;
+    use crate::error::ErrorCode;
 
     fn header(payload_len: usize) -> FrameHeader {
         FrameHeader {
@@ -808,5 +867,38 @@ mod tests {
     #[test]
     fn header_len_is_12() {
         assert_eq!(HEADER_LEN, 12);
+    }
+
+    #[test]
+    fn upgrade_reject_round_trips() {
+        let r = UpgradeReject::new(
+            roles::PRIMARY_CATCHUP,
+            roles::NAME_PRIMARY_CATCHUP,
+            Some("eu-west-1a".into()),
+        );
+        assert_eq!(r.role_byte, roles::PRIMARY_CATCHUP);
+        assert_eq!(r.zone.as_deref(), Some("eu-west-1a"));
+        assert!(r.is_transient());
+    }
+
+    #[test]
+    fn upgrade_reject_topological_for_non_catchup_roles() {
+        // STANDALONE / PRIMARY / REPLICA / unknown all classify as
+        // topological (won't recover without topology change).
+        for (byte, name) in [
+            (roles::STANDALONE, roles::NAME_STANDALONE),
+            (roles::PRIMARY, roles::NAME_PRIMARY),
+            (roles::REPLICA, roles::NAME_REPLICA),
+            (0x99, "FUTURE_ROLE"),
+        ] {
+            let r = UpgradeReject::new(byte, name, None);
+            assert!(!r.is_transient(), "role {} should be topological", name);
+        }
+    }
+
+    #[test]
+    fn upgrade_reject_is_transient_case_insensitive() {
+        let r = UpgradeReject::new(0x99, "primary_catchup", None);
+        assert!(r.is_transient(), "case-insensitive match per spec §5");
     }
 }

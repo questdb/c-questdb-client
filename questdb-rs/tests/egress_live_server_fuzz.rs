@@ -31,7 +31,8 @@
 //!   2. Generates per-row random values in Rust (seeded SplitMix64) so
 //!      the expected hash for every `(row, col)` cell is known before
 //!      the query runs.
-//!   3. Inserts those values as a single multi-row `INSERT VALUES`.
+//!   3. Inserts those values as bounded multi-row `INSERT VALUES`
+//!      statements.
 //!   4. SELECTs them back via the egress reader and asserts per-cell
 //!      hash equality.
 //!
@@ -100,15 +101,9 @@ use common::QuestDbServer;
 /// all stressed at the chunk boundary.
 fn start_fragmented(chunk: u32) -> QuestDbServer {
     let chunk_s = chunk.to_string();
-    // INSERT ... VALUES (...) for up to 500 rows * 16 wide columns can
-    // produce > 1 MB of SQL. The HTTP /exec endpoint reads the SQL from
-    // the URL query string, which the server caps via
-    // http.request.header.buffer.size (default ~64 KB). Bump it so the
-    // worst-case fuzz roll never overflows the URL parser.
     QuestDbServer::start_with_config(&[
         ("debug.http.force.recv.fragmentation.chunk.size", &chunk_s),
         ("debug.http.force.send.fragmentation.chunk.size", &chunk_s),
-        ("http.request.header.buffer.size", "4194304"),
     ])
 }
 
@@ -818,6 +813,47 @@ fn build_generators() -> Vec<Box<dyn ColumnGenerator>> {
 // Misc helpers.
 // ---------------------------------------------------------------------------
 
+// QuestDB's /exec endpoint accepts SQL in a URL query parameter. Since
+// http 1.5.0, PathAndQuery rejects values longer than u16::MAX - 1
+// (hyperium/http#855). Percent-encoding can expand each SQL byte to three
+// bytes, so a 20 KiB raw statement stays below both that limit and
+// QuestDB's default ~64 KiB request-header buffer:
+//   len("/exec?query=") + 3 * 20 KiB = 61,452 bytes.
+const MAX_HTTP_EXEC_SQL_BYTES: usize = 20 * 1024;
+
+fn build_insert_statements(table: &str, values_clauses: &[String]) -> Vec<String> {
+    assert!(!values_clauses.is_empty(), "insert needs at least one row");
+
+    let prefix = format!("insert into \"{table}\" values ");
+    let mut statements = Vec::new();
+    let mut current = String::with_capacity(MAX_HTTP_EXEC_SQL_BYTES);
+    current.push_str(&prefix);
+
+    for clause in values_clauses {
+        let has_rows = current.len() > prefix.len();
+        let separator_len = usize::from(has_rows);
+        if has_rows && current.len() + separator_len + clause.len() > MAX_HTTP_EXEC_SQL_BYTES {
+            statements.push(current);
+            current = String::with_capacity(MAX_HTTP_EXEC_SQL_BYTES);
+            current.push_str(&prefix);
+        }
+
+        if current.len() > prefix.len() {
+            current.push(',');
+        }
+        assert!(
+            current.len() + clause.len() <= MAX_HTTP_EXEC_SQL_BYTES,
+            "single fuzz row is too large for HTTP /exec (row bytes={}, limit={})",
+            clause.len(),
+            MAX_HTTP_EXEC_SQL_BYTES
+        );
+        current.push_str(clause);
+    }
+
+    statements.push(current);
+    statements
+}
+
 /// Build a printable-ASCII string of `len` bytes, avoiding the
 /// single-quote character (so we don't have to escape inside
 /// `CAST('...' AS VARCHAR)`). Mirrors Java's `randomAsciiString`.
@@ -922,12 +958,17 @@ fn run_one_case(
         }
         values_clauses.push(format!("({})", row_lits.join(",")));
     }
-    let insert = format!(
-        "insert into \"{table}\" values {}",
-        values_clauses.join(",")
-    );
-    let status = srv.http_exec(&insert);
-    assert!((200..400).contains(&status), "insert http={status}");
+    for (batch, insert) in build_insert_statements(&table, &values_clauses)
+        .into_iter()
+        .enumerate()
+    {
+        let status = srv.http_exec(&insert);
+        assert!(
+            (200..400).contains(&status),
+            "insert batch={batch} http={status} sql_bytes={}",
+            insert.len()
+        );
+    }
 
     // Wait for WAL to apply.
     wait_for_rows(srv, &table, row_count);
@@ -1009,6 +1050,31 @@ fn run_one_case(
     // Drop the table so the next iteration starts clean (and the
     // shared singleton's tempdir doesn't grow unbounded across runs).
     let _ = srv.http_exec(&format!("drop table \"{table}\""));
+}
+
+#[test]
+fn insert_batches_fit_http_uri_limit_without_losing_rows() {
+    let rows: Vec<String> = (0..200)
+        .map(|i| format!("({i},'{}')", ";/?:@&=+$,#%".repeat(32)))
+        .collect();
+    let statements = build_insert_statements("uri_budget", &rows);
+
+    assert!(statements.len() > 1, "fixture must exercise batching");
+    for statement in &statements {
+        let worst_case_encoded_len = "/exec?query=".len() + 3 * statement.len();
+        assert!(
+            worst_case_encoded_len < u16::MAX as usize,
+            "encoded URI can exceed http::Uri limit: {worst_case_encoded_len}"
+        );
+    }
+
+    let prefix = "insert into \"uri_budget\" values ";
+    let rebuilt_rows = statements
+        .iter()
+        .map(|statement| statement.strip_prefix(prefix).unwrap())
+        .collect::<Vec<_>>()
+        .join(",");
+    assert_eq!(rebuilt_rows, rows.join(","));
 }
 
 // ---------------------------------------------------------------------------
@@ -1309,7 +1375,7 @@ fn binary_qwp_ws_random_fuzz() {
     // value that spans more than one TCP/WS frame at the chosen chunk.
     let row_count = pick_row_count(&mut rng);
     let mut expected: Vec<Vec<u8>> = Vec::with_capacity(row_count);
-    let conf_sender = format!("qwpws::addr={}:{}", srv.host, srv.http_port);
+    let conf_sender = format!("ws::addr={}:{}", srv.host, srv.http_port);
     let mut sender = Sender::from_conf(&conf_sender).expect("qwp/ws sender");
     let mut buf = sender.new_buffer();
     for i in 0..row_count {

@@ -34,20 +34,25 @@
 //! initial_credit: varint   bytes; 0 = unbounded
 //! bind_count:     varint
 //! binds:          per egress::binds
+//! query_flags:    varint   optional trailer; omitted when 0
 //! ```
 
 use std::net::Ipv4Addr;
 
 use crate::egress::binds::{Bind, SimpleNullKind, check_bindable, encode_bind};
-use crate::egress::error::{Result, fmt};
 use crate::egress::wire::msg_kind::MsgKind;
 use crate::egress::wire::varint;
+use crate::error::{Result, fmt};
 
 /// Per-spec hard limit on SQL text length (1 MiB UTF-8 bytes).
 pub const MAX_SQL_BYTES: usize = 1024 * 1024;
 
 /// Per-spec hard limit on bind-parameter count.
 pub const MAX_BINDS: usize = 1024;
+
+/// `query_flags` bit: reset the connection SYMBOL dict before this query
+/// (query-scoped dict). Only honoured by servers advertising `CAP_QUERY_FLAGS`.
+pub const QUERY_FLAG_RESET_DICT: u64 = 0x01;
 
 /// A complete, validated `QUERY_REQUEST` ready for serialization.
 #[derive(Debug, Clone)]
@@ -56,6 +61,7 @@ pub struct QueryRequest {
     sql: String,
     initial_credit: u64,
     binds: Vec<Bind>,
+    query_flags: u64,
 }
 
 /// Byte offset of the 8-byte little-endian `request_id` field inside
@@ -81,6 +87,7 @@ impl QueryRequest {
             sql: sql.into(),
             initial_credit: 0,
             binds: Vec::new(),
+            query_flags: 0,
         }
     }
 
@@ -103,6 +110,9 @@ impl QueryRequest {
         for bind in &self.binds {
             encode_bind(bind, out)?;
         }
+        if self.query_flags != 0 {
+            varint::encode_u64(self.query_flags, out);
+        }
         Ok(())
     }
 }
@@ -118,6 +128,7 @@ pub struct QueryRequestBuilder {
     sql: String,
     initial_credit: u64,
     binds: Vec<Bind>,
+    query_flags: u64,
 }
 
 impl QueryRequestBuilder {
@@ -130,6 +141,13 @@ impl QueryRequestBuilder {
     /// Set the initial byte-credit window (`0` = unbounded). Default `0`.
     pub fn initial_credit(mut self, credit: u64) -> Self {
         self.initial_credit = credit;
+        self
+    }
+
+    /// Set the `query_flags` trailer (`0` = omit it). See
+    /// [`QUERY_FLAG_RESET_DICT`]. Default `0`.
+    pub fn query_flags(mut self, flags: u64) -> Self {
+        self.query_flags = flags;
         self
     }
 
@@ -251,6 +269,7 @@ impl QueryRequestBuilder {
             sql: self.sql,
             initial_credit: self.initial_credit,
             binds: self.binds,
+            query_flags: self.query_flags,
         })
     }
 }
@@ -258,7 +277,7 @@ impl QueryRequestBuilder {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::egress::error::ErrorCode;
+    use crate::error::ErrorCode;
 
     /// Locks the `REQUEST_ID_OFFSET` constant to the actual byte
     /// position the encoder emits. If `encode` ever shifts the
@@ -350,6 +369,30 @@ mod tests {
         // After 0x10 + 8-byte rid + varint(1) + 'X' = 11 bytes, then varint(0x4000)
         // varint(0x4000) = 0x80 0x80 0x01
         assert_eq!(&buf[11..14], &[0x80, 0x80, 0x01]);
+    }
+
+    #[test]
+    fn query_flags_trailer() {
+        // Default 0 -> no trailer (byte-identical to the bindless baseline).
+        let mut baseline = Vec::new();
+        QueryRequest::builder("X")
+            .build()
+            .unwrap()
+            .encode(&mut baseline)
+            .unwrap();
+
+        // Non-zero query_flags -> varint trailer appended after the binds.
+        let mut with_flag = Vec::new();
+        QueryRequest::builder("X")
+            .query_flags(QUERY_FLAG_RESET_DICT)
+            .build()
+            .unwrap()
+            .encode(&mut with_flag)
+            .unwrap();
+
+        assert_eq!(with_flag.len(), baseline.len() + 1);
+        assert_eq!(&with_flag[..baseline.len()], &baseline[..]);
+        assert_eq!(*with_flag.last().unwrap(), QUERY_FLAG_RESET_DICT as u8);
     }
 
     #[test]

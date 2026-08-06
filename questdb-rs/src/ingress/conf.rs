@@ -133,6 +133,9 @@ pub(crate) const QWP_WS_DEFAULT_SF_MEMORY_MAX_TOTAL_BYTES: u64 = 128 * 1024 * 10
 #[cfg(feature = "_sender-qwp-ws")]
 pub(crate) const QWP_WS_DEFAULT_SF_DISK_MAX_TOTAL_BYTES: u64 = 10 * 1024 * 1024 * 1024;
 #[cfg(feature = "_sender-qwp-ws")]
+pub(crate) const QWP_WS_DEFAULT_SF_SYNC_INTERVAL: std::time::Duration =
+    std::time::Duration::from_millis(5000);
+#[cfg(feature = "_sender-qwp-ws")]
 pub(crate) const QWP_WS_DEFAULT_MAX_BACKGROUND_DRAINERS: usize = 4;
 #[cfg(feature = "_sender-qwp-ws")]
 pub(crate) const QWP_WS_DEFAULT_CLOSE_DRAIN_TIMEOUT: std::time::Duration =
@@ -141,6 +144,11 @@ pub(crate) const QWP_WS_DEFAULT_CLOSE_DRAIN_TIMEOUT: std::time::Duration =
 pub(crate) const QWP_WS_DEFAULT_ERROR_INBOX_CAPACITY: usize = 256;
 #[cfg(feature = "_sender-qwp-ws")]
 pub(crate) const QWP_WS_MIN_ERROR_INBOX_CAPACITY: usize = 16;
+#[cfg(feature = "_sender-qwp-ws")]
+pub(crate) const QWP_WS_DEFAULT_MAX_FRAME_REJECTIONS: usize = 4;
+#[cfg(feature = "_sender-qwp-ws")]
+pub(crate) const QWP_WS_DEFAULT_POISON_MIN_ESCALATION_WINDOW: std::time::Duration =
+    std::time::Duration::from_millis(5000);
 
 #[cfg(feature = "_sender-qwp-ws")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -148,6 +156,7 @@ pub(crate) enum SfDurability {
     Memory,
     Flush,
     Append,
+    Periodic,
 }
 
 #[cfg(feature = "_sender-qwp-ws")]
@@ -157,6 +166,7 @@ impl SfDurability {
             Self::Memory => "memory",
             Self::Flush => "flush",
             Self::Append => "append",
+            Self::Periodic => "periodic",
         }
     }
 }
@@ -167,6 +177,59 @@ pub(crate) fn is_valid_qwp_ws_sender_id(sender_id: &str) -> bool {
         && sender_id
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-')
+}
+
+#[cfg(feature = "_sender-qwp-ws")]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct QwpWsManagedSlotExclusion {
+    /// Canonical pool-minted slot prefix, including the trailing separator
+    /// before the decimal index, for example `default-ingest-`.
+    pub(crate) prefix: String,
+    /// Exclude only indices in `[0, slot_count)`. Out-of-range same-prefix
+    /// slots remain drainable so shrinking a pool cannot strand old data.
+    pub(crate) slot_count: usize,
+}
+
+#[cfg(feature = "_sender-qwp-ws")]
+impl QwpWsManagedSlotExclusion {
+    pub(crate) fn new(prefix: String, slot_count: usize) -> Self {
+        Self { prefix, slot_count }
+    }
+
+    pub(crate) fn slot_name(&self, index: usize) -> String {
+        format!("{}{}", self.prefix, index)
+    }
+
+    pub(crate) fn parse_index(&self, name: &str) -> Option<usize> {
+        name.starts_with(&self.prefix)
+            .then(|| parse_canonical_slot_index(name, self.prefix.len()))
+            .flatten()
+    }
+
+    pub(crate) fn matches(&self, name: &str) -> bool {
+        self.parse_index(name)
+            .is_some_and(|index| index < self.slot_count)
+    }
+}
+
+#[cfg(feature = "_sender-qwp-ws")]
+fn parse_canonical_slot_index(name: &str, from: usize) -> Option<usize> {
+    let suffix = name.get(from..)?;
+    if suffix.is_empty() {
+        return None;
+    }
+    if suffix.len() > 1 && suffix.starts_with('0') {
+        return None;
+    }
+    let mut acc = 0usize;
+    for byte in suffix.bytes() {
+        if !byte.is_ascii_digit() {
+            return None;
+        }
+        acc = acc.checked_mul(10)?;
+        acc = acc.checked_add((byte - b'0') as usize)?;
+    }
+    Some(acc)
 }
 
 #[cfg(feature = "_sender-qwp-ws")]
@@ -196,6 +259,15 @@ pub(crate) enum QwpWsInitialConnectMode {
 pub(crate) struct QwpWsConfig {
     pub(crate) endpoints: ConfigSetting<Vec<QwpWsEndpoint>>,
     pub(crate) auth_timeout: ConfigSetting<std::time::Duration>,
+    /// Per-endpoint TCP connect (dial) budget. `None` (the default) keeps the
+    /// OS-default blocking dial for caller-thread initial connects; every
+    /// bounded dial -- reconnects, the async initial-connect retry loop, and
+    /// background orphan drainers -- substitutes a finite 15-second fallback
+    /// so bounded shutdown cannot be parked until the OS TCP-connect deadline.
+    /// `Some` bounds each `TcpStream::connect_timeout` attempt and surfaces
+    /// [`crate::ErrorCode::ConnectTimeout`] on expiry.
+    /// Connect-string key: `connect_timeout` (milliseconds).
+    pub(crate) connect_timeout: ConfigSetting<Option<std::time::Duration>>,
     pub(crate) request_timeout: ConfigSetting<std::time::Duration>,
     pub(crate) client_id: ConfigSetting<Option<String>>,
     pub(crate) max_protocol_version: ConfigSetting<u32>,
@@ -219,11 +291,30 @@ pub(crate) struct QwpWsConfig {
     pub(crate) close_flush_timeout: ConfigSetting<std::time::Duration>,
     pub(crate) sf_dir: ConfigSetting<Option<PathBuf>>,
     pub(crate) sender_id: ConfigSetting<String>,
-    pub(crate) sf_max_bytes: ConfigSetting<u64>,
+    pub(crate) sf_max_segment_bytes: ConfigSetting<u64>,
+    /// Ceiling on the store-and-forward **segment** files (`sf-*.sfa`) a slot may
+    /// allocate. It does NOT cover the slot's small side-files (`.symbol-dict`,
+    /// `.ack-watermark`, `.lock`). The `.symbol-dict` write-ahead is append-only
+    /// and bounded by the connection symbol-dictionary cap
+    /// (`MAX_CONN_SYMBOL_DICT_SIZE`), so a very-high-cardinality connection can
+    /// hold a side-file on top of this segment budget until the slot fully drains.
     pub(crate) sf_max_total_bytes: ConfigSetting<Option<u64>>,
     pub(crate) sf_durability: ConfigSetting<SfDurability>,
+    pub(crate) sf_sync_interval: ConfigSetting<Option<std::time::Duration>>,
     pub(crate) sf_append_deadline: ConfigSetting<std::time::Duration>,
     pub(crate) drain_orphans: ConfigSetting<bool>,
+    /// Internal pool hook: exact managed slot ranges that orphan scanning must
+    /// skip because this pool can recreate and recover them itself.
+    pub(crate) orphan_exclude_managed_slots: Vec<QwpWsManagedSlotExclusion>,
+    /// Internal pool hook: explicit managed slot directories owned by this pool
+    /// that should be tried by this sender's drainer regardless of the user's
+    /// general orphan-drain setting. These are candidates only; replay-only open
+    /// checks the publication log before doing any delivery work.
+    pub(crate) orphan_extra_slots: Vec<PathBuf>,
+    /// Internal pool hook: this QWP config opens a pool-minted slot, so a slot
+    /// flock collision is a deterministic producer-id conflict rather than a
+    /// retryable transport condition.
+    pub(crate) pool_managed_slot: bool,
     pub(crate) max_background_drainers: ConfigSetting<usize>,
     pub(crate) error_inbox_capacity: ConfigSetting<usize>,
     pub(crate) progress: ConfigSetting<QwpWsProgress>,
@@ -232,6 +323,20 @@ pub(crate) struct QwpWsConfig {
     /// [`SenderBuilder::qwp_ws_token_provider`](crate::ingress::SenderBuilder::qwp_ws_token_provider);
     /// programmatic-only (never from a conf string).
     pub(crate) token_provider: Option<crate::token_provider::TokenProvider>,
+    pub(crate) max_frame_rejections: ConfigSetting<usize>,
+    pub(crate) poison_min_escalation_window: ConfigSetting<std::time::Duration>,
+    /// Optional connection lifecycle event source. Standalone senders set it
+    /// through `SenderBuilder::connection_listener`; pooled store-and-forward
+    /// senders receive the pool's shared source before their config is
+    /// cloned into the runner. Carried in the config so blocking transports
+    /// and store-and-forward runners can narrate foreground connects.
+    pub(crate) conn_events: Option<std::sync::Arc<super::conn_events::ConnectionEventSource>>,
+    /// Optional pool-wide rejection event sink. Set by the pool before the
+    /// config is cloned into each store-and-forward runner; the runner
+    /// publishes every recorded server rejection through it. `None` for
+    /// standalone senders, whose handler is pulled at API-call boundaries.
+    pub(crate) rejection_sink:
+        Option<std::sync::Arc<super::rejection_events::RejectionEventSource>>,
 }
 
 #[cfg(feature = "_sender-qwp-ws")]
@@ -240,6 +345,7 @@ impl Default for QwpWsConfig {
         Self {
             endpoints: ConfigSetting::new_default(Vec::new()),
             auth_timeout: ConfigSetting::new_default(std::time::Duration::from_secs(15)),
+            connect_timeout: ConfigSetting::new_default(None),
             request_timeout: ConfigSetting::new_default(std::time::Duration::from_secs(30)),
             client_id: ConfigSetting::new_default(None),
             max_protocol_version: ConfigSetting::new_default(1),
@@ -257,23 +363,42 @@ impl Default for QwpWsConfig {
             close_flush_timeout: ConfigSetting::new_default(QWP_WS_DEFAULT_CLOSE_DRAIN_TIMEOUT),
             sf_dir: ConfigSetting::new_default(None),
             sender_id: ConfigSetting::new_default(QWP_WS_DEFAULT_SENDER_ID.to_owned()),
-            sf_max_bytes: ConfigSetting::new_default(QWP_WS_DEFAULT_SF_SEGMENT_BYTES),
+            sf_max_segment_bytes: ConfigSetting::new_default(QWP_WS_DEFAULT_SF_SEGMENT_BYTES),
             sf_max_total_bytes: ConfigSetting::new_default(None),
             sf_durability: ConfigSetting::new_default(SfDurability::Memory),
+            sf_sync_interval: ConfigSetting::new_default(None),
             sf_append_deadline: ConfigSetting::new_default(std::time::Duration::from_secs(30)),
             drain_orphans: ConfigSetting::new_default(false),
+            orphan_exclude_managed_slots: Vec::new(),
+            orphan_extra_slots: Vec::new(),
+            pool_managed_slot: false,
             max_background_drainers: ConfigSetting::new_default(
                 QWP_WS_DEFAULT_MAX_BACKGROUND_DRAINERS,
             ),
             error_inbox_capacity: ConfigSetting::new_default(QWP_WS_DEFAULT_ERROR_INBOX_CAPACITY),
             progress: ConfigSetting::new_default(QwpWsProgress::Background),
             token_provider: None,
+            max_frame_rejections: ConfigSetting::new_default(QWP_WS_DEFAULT_MAX_FRAME_REJECTIONS),
+            poison_min_escalation_window: ConfigSetting::new_default(
+                QWP_WS_DEFAULT_POISON_MIN_ESCALATION_WINDOW,
+            ),
+            conn_events: None,
+            rejection_sink: None,
         }
     }
 }
 
 #[cfg(feature = "_sender-qwp-ws")]
 impl QwpWsConfig {
+    pub(crate) fn periodic_sync_interval(&self) -> Option<std::time::Duration> {
+        (*self.sf_durability == SfDurability::Periodic).then(|| {
+            self.sf_sync_interval
+                .as_ref()
+                .copied()
+                .unwrap_or(QWP_WS_DEFAULT_SF_SYNC_INTERVAL)
+        })
+    }
+
     pub(crate) fn sf_max_total_bytes(&self) -> u64 {
         if let Some(max_total_bytes) = *self.sf_max_total_bytes {
             return max_total_bytes;
@@ -284,7 +409,7 @@ impl QwpWsConfig {
         } else {
             QWP_WS_DEFAULT_SF_MEMORY_MAX_TOTAL_BYTES
         };
-        default_max_total_bytes.max(self.sf_max_bytes.saturating_mul(2))
+        default_max_total_bytes.max(self.sf_max_segment_bytes.saturating_mul(2))
     }
 
     /// Closes a documented footgun: `reconnect_max_duration_millis` and the
@@ -294,20 +419,27 @@ impl QwpWsConfig {
     /// a longer reconnect budget expecting it to also bound the first
     /// connect silently gets no retry at all.
     ///
-    /// Promote `initial_connect_retry` to `Sync` whenever the user
-    /// explicitly set any `reconnect_*` key and did not explicitly choose
-    /// an `initial_connect_retry` mode themselves. Explicit
-    /// `initial_connect_retry=off` is preserved.
-    pub(crate) fn apply_reconnect_implies_initial_retry(&mut self) {
+    /// Resolve the standalone sender's effective initial-connect mode.
+    /// Explicit `initial_connect_retry` wins; otherwise any explicitly set
+    /// `reconnect_*` key implies `Sync`, and the remaining default is `Off`.
+    pub(crate) fn resolve_initial_connect_retry(&self) -> QwpWsInitialConnectMode {
         if self.initial_connect_retry.is_specified() {
-            return;
+            return *self.initial_connect_retry;
         }
         let any_reconnect_specified = self.reconnect_max_duration.is_specified()
             || self.reconnect_initial_backoff.is_specified()
             || self.reconnect_max_backoff.is_specified();
         if any_reconnect_specified {
-            self.initial_connect_retry = ConfigSetting::Specified(QwpWsInitialConnectMode::Sync);
+            QwpWsInitialConnectMode::Sync
+        } else {
+            QwpWsInitialConnectMode::Off
         }
+    }
+
+    /// Store-and-forward pool borrows must create a producer handle even when no
+    /// server is reachable; the background runner owns the initial connect.
+    pub(crate) fn force_async_initial_connect(&mut self) {
+        self.initial_connect_retry = ConfigSetting::Specified(QwpWsInitialConnectMode::Async);
     }
 }
 

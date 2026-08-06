@@ -13,7 +13,7 @@
 //!
 //! Run:
 //!     cargo run --release --example qwp_egress_read \
-//!         --features sync-reader-ws,sync-sender-http
+//!         --features sync-reader-qwp-ws,sync-sender-http
 //!
 //! Env tuning:
 //!     ROW_COUNT=10000000  (default 10M)
@@ -180,9 +180,9 @@ fn ingest_rows(host: &str, port: u16, row_count: u64) {
             .unwrap()
             .at(TimestampMicros::new(i as i64 * 10_000))
             .unwrap();
-        if i % flush_every == 0 {
+        if i.is_multiple_of(flush_every) {
             sender.flush(&mut buf).expect("flush");
-            if i % 1_000_000 == 0 {
+            if i.is_multiple_of(1_000_000) {
                 println!(
                     "  {i}/{row_count} rows ({} ms)",
                     start.elapsed().as_millis()

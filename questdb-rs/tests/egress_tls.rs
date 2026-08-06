@@ -32,7 +32,7 @@
 //! stream — exercising the full `wss://` connect path the way a
 //! real broker would.
 
-#![cfg(feature = "sync-reader-ws")]
+#![cfg(feature = "sync-reader-qwp-ws")]
 
 use std::io::Read;
 use std::net::{SocketAddr, TcpListener, TcpStream};
@@ -41,7 +41,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
 
-use questdb::egress::{ErrorCode, Reader, ServerRole};
+use questdb::ErrorCode;
+use questdb::egress::{Reader, ServerRole};
 use rustls::ServerConfig;
 use rustls::server::ServerConnection;
 use rustls_pki_types::pem::PemObject;

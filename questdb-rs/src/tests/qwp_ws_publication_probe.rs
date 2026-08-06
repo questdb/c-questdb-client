@@ -73,7 +73,7 @@ fn qwp_ws_public_manual_sender_submit_waits_and_row_is_queryable() -> TestResult
     let _cleanup = TableCleanup::new(config.clone(), table.clone());
 
     let conf = format!(
-        "qwpws::addr={}:{};max_in_flight=4;",
+        "ws::addr={}:{};max_in_flight=4;",
         config.host, config.qwp_ws_port
     );
     let mut sender = SenderBuilder::from_conf(conf)?
@@ -82,9 +82,9 @@ fn qwp_ws_public_manual_sender_submit_waits_and_row_is_queryable() -> TestResult
     let mut buffer = sender.new_buffer();
     write_row(&mut buffer, &table, "SYM_PUBLIC_MANUAL", 33, 333.5, 33)?;
 
-    let fsn = sender.flush_and_get_fsn(&mut buffer)?.unwrap();
+    sender.flush_and_get_fsn(&mut buffer)?;
     assert!(buffer.is_empty());
-    assert!(sender.await_acked_fsn(fsn, Duration::from_secs(10))?);
+    sender.wait(crate::ingress::AckLevel::Ok, Duration::from_secs(10))?;
 
     let count = wait_for_count(&config, &table, 1, Duration::from_secs(10))?;
     assert_eq!(count, 1);
@@ -212,7 +212,7 @@ fn public_sfa_conf(
     short_reconnect: bool,
 ) -> String {
     let mut conf = format!(
-        "qwpws::addr={host}:{port};sf_dir={};sender_id={sender_id};sf_max_bytes=64k;sf_max_total_bytes=128k;max_in_flight=4;",
+        "ws::addr={host}:{port};sf_dir={};sender_id={sender_id};sf_max_segment_bytes=64k;sf_max_total_bytes=128k;max_in_flight=4;",
         sf_dir.display()
     );
     if short_reconnect {
