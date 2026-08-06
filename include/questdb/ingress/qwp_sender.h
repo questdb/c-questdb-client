@@ -781,30 +781,35 @@ bool qwp_chunk_column_binary(
  * known-not-delivered — check `line_sender_error_in_doubt` before resending
  * the chunk, or the rows the committed prefix already carried are duplicated.
  *
- * Resetting the dictionary means discarding the connection that owns it —
- * there is no per-sender close, and `questdb_db_return_sender` recycles the
- * connection *and its dictionary*, so a returned-and-reborrowed sender hits
- * the cap again on its next new symbol. Discarding the connection is NOT
- * automatically lossless for frames already flushed on it, so commit or drain
- * them first. Instead:
+ * Resetting the dictionary means discarding the connection that owns it — there
+ * is no per-sender close. A full dictionary RETIRES the connection on return, so
+ * a plain `questdb_db_return_sender` drops it rather than recycling it (the next
+ * borrow gets a fresh, empty-dictionary connection, not the same full one) and
+ * drains / commits its pending frames best-effort on the way out. So the simplest
+ * recovery is to return the sender as usual and borrow a fresh one. Discarding the
+ * connection is NOT automatically lossless for frames already flushed on it, so if
+ * those must not be lost, drain or commit them AND check first:
  *
- *   - Pooled sender: `qwp_sender_wait`, then `questdb_db_drop_sender`, then
- *     borrow again. Waiting matters with `sf_dir` too, not just without it —
- *     dropping while frames are unresolved leaves them (and the dictionary) in
- *     the slot, and the next borrower re-seeds from the slot's side-file at the
- *     same size, so it is full before it sends anything.
- *   - Pooled direct sender: `qwp_direct_sender_commit` (or a waited flush)
- *     FIRST, and check it succeeded, then `questdb_db_drop_direct_sender`, then
- *     borrow again. This sender's flushes are deferred, and
- *     `questdb_db_drop_direct_sender` skips the best-effort commit that
- *     `questdb_db_return_direct_sender` performs, so every frame flushed since
- *     the last successful commit is discarded with only a log warning.
- *   - Standalone direct sender: `qwp_direct_sender_commit` first — not because
- *     `qwp_direct_sender_free` skips the commit (it does not; it performs the
- *     same best-effort sync `questdb_db_return_direct_sender` does), but so the
- *     commit's success is something you checked rather than something you hoped
- *     for. Then `qwp_direct_sender_free`, then re-open with
- *     `qwp_direct_sender_from_conf` / `qwp_direct_sender_from_opts`.
+ *   - Pooled sender: a plain `questdb_db_return_sender` now retires (does NOT
+ *     recycle) a full-dictionary connection and drains its queue best-effort
+ *     within `close_flush_timeout`; the next borrow is fresh. Call
+ *     `qwp_sender_wait` first if the queued frames must not be lost. This matters
+ *     with `sf_dir` too: returning while frames are unresolved leaves them (and
+ *     the dictionary) in the slot, and the next borrower re-seeds from the slot's
+ *     side-file at the same size unless the slot drained first.
+ *   - Pooled direct sender: a plain `questdb_db_return_direct_sender` retires the
+ *     connection and commits the deferred tail best-effort. Its flushes are
+ *     deferred, so for a CHECKED guarantee call `qwp_direct_sender_commit` (or a
+ *     waited flush) and confirm it succeeded before the return. Do NOT use
+ *     `questdb_db_drop_direct_sender` on a full dictionary: it force-drops and
+ *     skips the best-effort commit that the normal return performs, so every frame
+ *     flushed since the last successful commit is discarded with only a log
+ *     warning.
+ *   - Standalone direct sender: `qwp_direct_sender_free` performs the same
+ *     best-effort commit the pooled return does, so the deferred tail is committed
+ *     on the way out; call `qwp_direct_sender_commit` first so the commit's success
+ *     is something you checked rather than hoped for. Then `qwp_direct_sender_free`,
+ *     then re-open with `qwp_direct_sender_from_conf` / `qwp_direct_sender_from_opts`.
  *   - Standalone row sender (a `line_sender` opened on a `ws://` / `wss://`
  *     address and flushed with `line_sender_flush*`, which shares this same
  *     connection dictionary): `line_sender_qwpws_close_drain` and check it

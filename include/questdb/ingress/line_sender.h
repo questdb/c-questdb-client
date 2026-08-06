@@ -237,25 +237,31 @@ typedef enum line_sender_error_code
      *  matching the server's ingress ceiling) or its cumulative UTF-8 heap cap
      *  (256 MiB). The failing frame is rejected before any byte reaches the wire
      *  and the buffer is rolled back, so *that flush* loses nothing and chunks
-     *  referencing only already-interned symbols keep flushing — but retrying on
-     *  the same sender can never succeed. Retire the connection and borrow a
-     *  fresh one; retiring is NOT automatically lossless for frames flushed
-     *  earlier, so commit or drain them first:
+     *  referencing only already-interned symbols keep flushing — but retrying a
+     *  *new* symbol on the same sender can never succeed. A full dictionary
+     *  RETIRES the connection on return: a pooled sender is dropped rather than
+     *  recycled (the next borrow gets a fresh, empty-dictionary connection, not the
+     *  same full one) and its earlier frames are drained / committed best-effort on
+     *  the way out. So the simplest recovery is to return the sender as usual and
+     *  borrow a fresh one. If those earlier frames must not be lost, drain or commit
+     *  them AND check first:
      *
-     *    - Pooled row sender: `qwp_sender_wait`, then `questdb_db_drop_sender` —
-     *      NOT `questdb_db_return_sender`, which recycles the connection and its
-     *      dictionary. With `sf_dir` configured the queued frames persist in the
-     *      slot, but so does the dictionary, and the next borrower re-seeds from
-     *      that slot's side-file at the same size; waiting first drains the slot
-     *      so the next borrower starts clean.
-     *    - Pooled direct sender: `qwp_direct_sender_commit` (or a waited flush)
-     *      and CHECK IT SUCCEEDED, then `questdb_db_drop_direct_sender` — NOT
-     *      `questdb_db_return_direct_sender`. Its flushes are deferred, and
-     *      dropping a sender marked for discard skips the best-effort commit the
-     *      normal return performs, so every frame flushed since the last
-     *      successful commit is discarded.
-     *    - Standalone direct sender: `qwp_direct_sender_commit`, then
-     *      `qwp_direct_sender_free`, then re-open.
+     *    - Pooled row sender: a plain `questdb_db_return_sender` now retires (does
+     *      NOT recycle) a full-dictionary connection and drains its queue
+     *      best-effort within `close_flush_timeout`; the next borrow is fresh. Call
+     *      `qwp_sender_wait` first if the queued frames must not be lost. With
+     *      `sf_dir` configured they persist in the slot, but so does the
+     *      dictionary, and the next borrower re-seeds from that slot's side-file at
+     *      the same size unless the slot drained first, so wait there too.
+     *    - Pooled direct sender: a plain `questdb_db_return_direct_sender` retires
+     *      the connection and commits the deferred tail best-effort. Its flushes are
+     *      deferred, so for a CHECKED guarantee call `qwp_direct_sender_commit` (or
+     *      a waited flush) and confirm it succeeded before the return. Do NOT use
+     *      `questdb_db_drop_direct_sender` on a full dictionary: it force-drops and
+     *      skips the best-effort commit, discarding the tail.
+     *    - Standalone direct sender: `qwp_direct_sender_free` commits the deferred
+     *      tail best-effort; call `qwp_direct_sender_commit` and CHECK IT SUCCEEDED
+     *      first for a guarantee, then `qwp_direct_sender_free`, then re-open.
      *    - Standalone row sender (`line_sender_from_conf` / `_from_env` /
      *      `line_sender_build` on a
      *      `ws://` or `wss://` address, flushed with `line_sender_flush*`):

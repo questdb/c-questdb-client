@@ -3807,19 +3807,110 @@ fn a_full_symbol_dict_latches_the_direct_connection_so_reborrow_replaces_it() {
 }
 
 #[test]
-fn a_pool_return_recycles_a_full_symbol_dict_but_drop_on_return_resets_it() {
-    // `SymbolDictFull`'s remedy rests on a distinction nothing asserted:
-    // returning a borrowed sender to the pool recycles the connection AND its
-    // dictionary -- so the cap is still full on the next borrow -- while retiring
-    // it with `drop_on_return` (the Rust spelling of `questdb_db_drop_sender`)
-    // yields a fresh one. Getting this backwards is what makes the naive remedy
-    // an unbounded loop, so pin both halves.
+fn a_full_symbol_dict_still_commits_the_direct_sender_deferred_tail_on_drop() {
+    // Regression (C1: silent data loss). `SymbolDictFull` marks the direct
+    // connection for retirement so `reborrow_from_pool` / the pool return swap it
+    // out (see the test above). It must do so WITHOUT stranding frames the caller
+    // already flushed deferred: those are on the wire, uncommitted, referencing
+    // already-interned symbols, and a symbol-less commit needs no new dictionary
+    // entry. Marking the connection `spent` (not hard `must_close`) keeps it
+    // drainable, so the drop-time best-effort commit still closes the tail with a
+    // commit boundary.
     //
-    // Memory mode (no `sf_dir`) on purpose: with a slot configured, a retired
-    // connection's replacement re-seeds from the side-file and would legitimately
-    // still be full, which is the caveat `qwp_sender.h` documents separately.
+    // Mutation check: reverting `latch_if_connection_is_spent` to
+    // `mark_must_close()` makes `commit_in_flight_on_drop` short-circuit on
+    // `must_close`, so the last frame the server sees is the still-deferred `B`
+    // (FLAG_DEFER_COMMIT set) rather than a commit boundary, and this fails.
+    const FLAG_DEFER_COMMIT: u8 = 0x01;
     let _cap = crate::ingress::TestDictCapGuard::new(1);
-    let server = MockServer::spawn_acking(4);
+    let (server, frames) = MockServer::spawn_acking_capturing(8);
+    let conf = conf_for_endpoints(&[server.port()], "pool_reap=manual;");
+    let db = QuestDb::connect(&conf).unwrap();
+
+    let mut sender = db.borrow_direct_column_sender().unwrap();
+
+    // A: first flush is non-deferred and interns `alpha`, filling the 1-entry cap.
+    let mut a = Chunk::new("trades");
+    append_one_symbol_row(&mut a, b"alpha", &[1_i64]);
+    sender.flush(&mut a).unwrap();
+
+    // B: a second flush of the already-interned `alpha` is DEFERRED (published,
+    // uncommitted) -- this is the tail that must survive the dict-full retirement.
+    let mut b = Chunk::new("trades");
+    append_one_symbol_row(&mut b, b"alpha", &[2_i64]);
+    sender.flush(&mut b).unwrap();
+    assert!(
+        sender.in_flight() > 0,
+        "the deferred flush of an already-interned symbol must leave an \
+         uncommitted in-flight frame"
+    );
+
+    // C: introduces a NEW symbol, exhausts the cap, and marks the connection spent.
+    let mut c = Chunk::new("trades");
+    append_one_symbol_row(&mut c, b"bravo", &[3_i64]);
+    assert_eq!(
+        sender.flush(&mut c).unwrap_err().code(),
+        ErrorCode::SymbolDictFull,
+        "the new symbol must exhaust the cap"
+    );
+    assert!(
+        sender.must_close_for_test(),
+        "a full dictionary must retire the connection so a pool return / reborrow \
+         does not recycle it"
+    );
+    assert!(
+        sender.in_flight() > 0,
+        "B is still deferred: the rejected frame C reached no wire and must not \
+         have disturbed the in-flight tail"
+    );
+
+    // A plain drop (NOT drop_on_return) must commit the deferred tail, not discard
+    // it -- the connection is spent, but healthy and drainable.
+    drop(sender);
+
+    let mut captured = Vec::new();
+    while let Ok(frame) = frames.recv_timeout(Duration::from_millis(500)) {
+        captured.push(frame);
+    }
+    let last = captured
+        .last()
+        .expect("the server must have received the tail's commit boundary");
+    assert_eq!(
+        last[5] & FLAG_DEFER_COMMIT,
+        0,
+        "the spent connection must close its deferred tail with a commit boundary \
+         on drop, not leave B uncommitted"
+    );
+}
+
+#[test]
+fn a_full_symbol_dict_retires_the_row_connection_on_a_plain_return() {
+    // Regression (M1: the row / store-and-forward sender looped forever where the
+    // direct sender was fixed not to). A full connection dictionary now RETIRES
+    // the connection on return, consistent with the direct sender:
+    // `SfaBackend::latch_if_connection_is_spent` sets `drop_on_return` on
+    // `SymbolDictFull`, so a plain drop drains the queue and drops the connection
+    // instead of recycling its full dictionary. Before the fix, the LIFO free list
+    // handed the same full connection straight back and the next borrow failed
+    // identically -- an unbounded loop the naive caller could escape only with an
+    // explicit `drop_on_return()`.
+    //
+    // It is a retire-on-return, not a hard close: `drop_on_return` does not gate
+    // the foreground, so already-interned symbols keep flushing until the caller
+    // returns the sender -- the same contract the direct backend's `spent` state
+    // gives, and the same the `store_and_forward_symbol_dict_full_rolls_back_and_
+    // keeps_flushing` test pins.
+    //
+    // Memory mode (no `sf_dir`) on purpose: with a slot configured a retired
+    // connection's replacement re-seeds from the side-file and would legitimately
+    // still be full unless the slot drained first, which is the caveat
+    // `qwp_sender.h` documents separately (wait before returning).
+    //
+    // Mutation check: reverting `latch_if_connection_is_spent` to a no-op recycles
+    // the full connection, so the final flush fails `SymbolDictFull` and this test
+    // fails.
+    let _cap = crate::ingress::TestDictCapGuard::new(1);
+    let server = MockServer::spawn_acking(8);
     let conf = conf_for_endpoints(&[server.port()], "pool_reap=manual;");
     let db = QuestDb::connect(&conf).unwrap();
 
@@ -3833,27 +3924,25 @@ fn a_pool_return_recycles_a_full_symbol_dict_but_drop_on_return_resets_it() {
         sender.flush(&mut second).unwrap_err().code(),
         ErrorCode::SymbolDictFull
     );
-    drop(sender); // a plain drop IS the pool return
+    // The mark retires on return; it does not close the connection out from under
+    // the caller, so an already-interned symbol still flushes.
+    let mut again = Chunk::new("trades");
+    append_one_symbol_row(&mut again, b"alpha", &[3_i64]);
+    sender
+        .flush(&mut again)
+        .expect("a full dictionary keeps flushing already-interned symbols");
 
-    let mut recycled = db.borrow_sender().unwrap();
-    let mut retry = Chunk::new("trades");
-    append_one_symbol_row(&mut retry, b"bravo", &[3_i64]);
-    assert_eq!(
-        recycled.flush(&mut retry).unwrap_err().code(),
-        ErrorCode::SymbolDictFull,
-        "a pool return recycles the connection *and its dictionary*, so the \
-         next borrow fails on the same new symbol"
-    );
-
-    recycled.drop_on_return();
-    drop(recycled);
+    drop(sender); // a plain drop IS the pool return -- and now it retires.
 
     let mut fresh = db.borrow_sender().unwrap();
-    let mut ok = Chunk::new("trades");
-    append_one_symbol_row(&mut ok, b"bravo", &[4_i64]);
-    fresh
-        .flush(&mut ok)
-        .expect("retiring the connection resets the dictionary");
+    let mut retry = Chunk::new("trades");
+    append_one_symbol_row(&mut retry, b"bravo", &[4_i64]);
+    fresh.flush(&mut retry).expect(
+        "the full dictionary retired the connection on the plain return, so the \
+         next borrow carries a fresh dictionary and the symbol that exhausted the \
+         old one now interns cleanly -- no unbounded recycle loop, and no need for \
+         an explicit drop_on_return()",
+    );
 }
 
 #[test]

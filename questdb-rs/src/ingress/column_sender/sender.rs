@@ -878,6 +878,14 @@ impl DirectSenderCore {
         self.backend.conn.transport_dead()
     }
 
+    /// `true` when a best-effort commit of the already-published deferred frames
+    /// can still succeed (transport alive, not hard-latched). A dictionary-full
+    /// (`spent`) connection stays drainable, so the drop-time commit preserves
+    /// its tail; see [`ColumnConn::can_drain_in_flight`].
+    pub(crate) fn can_drain_in_flight(&self) -> bool {
+        self.backend.conn.can_drain_in_flight()
+    }
+
     pub(crate) fn endpoint_idx(&self) -> usize {
         self.backend.conn.endpoint_idx()
     }
@@ -1239,7 +1247,7 @@ impl DirectColumnBackend {
         }
     }
 
-    /// Latches the connection terminal when `err` reports a condition that belongs
+    /// Marks the connection **spent** when `err` reports a condition that belongs
     /// to the CONNECTION rather than to the call that surfaced it — one no later
     /// call on this connection can clear.
     ///
@@ -1248,25 +1256,31 @@ impl DirectColumnBackend {
     /// resets it in place (a reconnect re-registers it rather than clearing it),
     /// and every later flush introducing a new symbol fails identically.
     ///
-    /// Without the latch, [`reborrow_from_pool`] -- the documented failover
+    /// Without the mark, [`reborrow_from_pool`] -- the documented failover
     /// primitive, and the first thing a caller reaches for after a flush error --
     /// is a silent no-op: its guard returns early on `in_flight() == 0 &&
     /// !must_close() && !transport_dead()`, and a dictionary-full connection
     /// satisfies all three (nothing reached the wire, the buffer rolled back, the
     /// socket is healthy). The caller then retries into the same wall indefinitely
-    /// with no error escalation. Latched, the reborrow swaps in a fresh connection
-    /// and the pool return retires this one instead of recycling its dictionary to
-    /// the next borrower -- the free list is LIFO, so recycling hands the same full
-    /// connection straight back.
+    /// with no error escalation. Marked spent, the reborrow swaps in a fresh
+    /// connection and the pool return retires this one instead of recycling its
+    /// dictionary to the next borrower -- the free list is LIFO, so recycling
+    /// hands the same full connection straight back.
     ///
-    /// This does not lose data: the failing frame never reached the wire and the
-    /// dictionary was rolled back above, so the caller's deferred frames are still
-    /// committed by the normal return/drop path.
+    /// [`mark_spent`](ColumnConn::mark_spent), NOT `mark_must_close`: the failing
+    /// frame never reached the wire and its dictionary mark was rolled back above,
+    /// but frames the caller flushed *earlier* (deferred, uncommitted) are still on
+    /// the wire and must not be stranded. `spent` retires the connection like
+    /// `must_close` yet leaves [`can_drain_in_flight`](ColumnConn::can_drain_in_flight)
+    /// `true`, so an explicit `commit()` — and the best-effort commit on plain
+    /// drop — still flush that tail (a symbol-less commit interns nothing, so the
+    /// full dictionary does not block it). Hard-latching would refuse both and
+    /// discard the tail; see the `SymbolDictFull` remedy docs.
     ///
     /// [`reborrow_from_pool`]: crate::db::BorrowedDirectColumnSender::reborrow_from_pool
     fn latch_if_connection_is_spent(&mut self, err: &crate::Error) {
         if err.code() == ErrorCode::SymbolDictFull {
-            self.conn.mark_must_close();
+            self.conn.mark_spent();
         }
     }
 
@@ -1521,6 +1535,33 @@ impl SfaBackend {
         Ok(())
     }
 
+    /// Marks the connection for retirement (`drop_on_return`) when `err` reports
+    /// [`SymbolDictFull`](ErrorCode::SymbolDictFull) — a full connection-scoped
+    /// symbol dictionary that no later flush can clear. The store-and-forward
+    /// analogue of the direct backend's
+    /// [`latch_if_connection_is_spent`](DirectColumnBackend::latch_if_connection_is_spent),
+    /// and it exists for the same reason: without it a naive pool return / drop
+    /// *recycles* the full connection, and the LIFO free list hands that same full
+    /// connection straight back to the next borrow, which fails identically —
+    /// an unbounded loop with no data to show for it. Latched, the pool return
+    /// retires it instead, and `return_sfa_to_pool` DRAINS the queue
+    /// (`drain_sfa_before_drop`, bounded by `close_flush_timeout`) before dropping,
+    /// so no queued frame is lost.
+    ///
+    /// `drop_on_return` does not gate the foreground publish path (which only
+    /// checks `qwp_ws_check_error_background`), so chunks referencing only
+    /// already-interned symbols keep flushing until the caller retires the
+    /// connection — matching the direct backend and the documented contract. With
+    /// `sf_dir`, `wait()` for the slot to drain before the return: a drop that
+    /// leaves the slot unresolved persists the dictionary too, and the next
+    /// borrower re-seeds from the side-file at the same size (see the
+    /// `SymbolDictFull` remedy docs).
+    fn latch_if_connection_is_spent(&mut self, err: &crate::Error) {
+        if err.code() == ErrorCode::SymbolDictFull {
+            self.drop_on_return = true;
+        }
+    }
+
     fn publish_buffer(
         &mut self,
         buffer: &QwpWsColumnarBuffer,
@@ -1540,14 +1581,14 @@ impl SfaBackend {
         // A Buffer is one indivisible publication (no row-range slicing), so
         // only the hard cap applies — there is no split to soft-target.
         let frame_cap = self.effective_frame_caps().hard;
-        let Self {
-            foreground,
-            state,
-            buffer_scratch,
-            ..
-        } = self;
-        match foreground
-            .encode_persist_publish(
+        let result = {
+            let Self {
+                foreground,
+                state,
+                buffer_scratch,
+                ..
+            } = self;
+            foreground.encode_persist_publish(
                 frame_cap,
                 |payload, symbol_dict, delta_enabled| {
                     buffer.encode_ws_replay_message_with_defer(
@@ -1561,8 +1602,11 @@ impl SfaBackend {
                 },
                 |payload| publish_qwp_ws_payload_background(state, payload, frame_cap),
             )
-            .map_err(FlushFailure::NotDelivered)?
-        {
+        };
+        if let Err(err) = &result {
+            self.latch_if_connection_is_spent(err);
+        }
+        match result.map_err(FlushFailure::NotDelivered)? {
             SfaPublishOutcome::Published(fsn) => Ok(Some(fsn)),
             SfaPublishOutcome::TooLarge {
                 encoded_len,
@@ -1661,14 +1705,14 @@ impl SfaBackend {
                 &view
             }
         };
-        let Self {
-            state,
-            foreground,
-            scratch,
-            ..
-        } = self;
-        foreground
-            .encode_persist_publish(
+        let result = {
+            let Self {
+                state,
+                foreground,
+                scratch,
+                ..
+            } = self;
+            foreground.encode_persist_publish(
                 frame_cap,
                 |payload, symbol_dict, delta_enabled| {
                     if delta_enabled {
@@ -1679,7 +1723,11 @@ impl SfaBackend {
                 },
                 |encoded| publish_qwp_ws_payload_background(state, encoded, frame_cap),
             )
-            .map_err(FlushFailure::NotDelivered)
+        };
+        if let Err(err) = &result {
+            self.latch_if_connection_is_spent(err);
+        }
+        result.map_err(FlushFailure::NotDelivered)
     }
 
     /// Append rows `[row_offset, row_offset + row_count)`, halving the range
@@ -1806,11 +1854,11 @@ impl SfaBackend {
                 &sliced
             }
         };
-        let Self {
-            state, foreground, ..
-        } = self;
-        foreground
-            .encode_persist_publish(
+        let result = {
+            let Self {
+                state, foreground, ..
+            } = self;
+            foreground.encode_persist_publish(
                 frame_cap,
                 |payload, symbol_dict, delta_enabled| {
                     if delta_enabled {
@@ -1836,7 +1884,11 @@ impl SfaBackend {
                 },
                 |payload| publish_qwp_ws_payload_background(state, payload, frame_cap),
             )
-            .map_err(FlushFailure::NotDelivered)
+        };
+        if let Err(err) = &result {
+            self.latch_if_connection_is_spent(err);
+        }
+        result.map_err(FlushFailure::NotDelivered)
     }
 
     /// Arrow counterpart of [`Self::publish_split_sfa`]. Returns the last

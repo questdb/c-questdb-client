@@ -763,9 +763,10 @@ impl Buffer {
     /// UTF-8 across the whole connection, not per buffer or per flush.
     /// Exceeding it fails the flush with
     /// [`SymbolDictFull`](crate::ErrorCode::SymbolDictFull), and the dictionary
-    /// is only reset by retiring the connection that owns it — for a pooled
-    /// sender that means `drop_on_return()`, not a plain drop, which recycles
-    /// the dictionary along with the connection; see
+    /// is only reset by retiring the connection that owns it — which a full
+    /// dictionary now does automatically on return, so a pooled sender is dropped
+    /// (not recycled) and the next borrow gets a fresh one. Wait / commit first if
+    /// frames flushed earlier must not be lost; see
     /// [`SymbolDictFull`](crate::ErrorCode::SymbolDictFull) for the per-API
     /// list. ILP (TCP/HTTP) flushes carry no such dictionary and are unaffected.
     #[inline(always)]

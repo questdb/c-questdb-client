@@ -236,33 +236,39 @@ pub enum ErrorCode {
     ///
     /// The failing frame is rejected before any byte reaches the wire and the
     /// buffer is rolled back, so *that flush* loses nothing and already-interned
-    /// symbols keep flushing — but retrying on the same sender can never
-    /// succeed. The caller must retire the connection and continue on a fresh
-    /// one. How to do that depends on the API, and on the pooled ones a plain
-    /// drop is **not** it. **Retiring is not automatically lossless for frames
-    /// flushed earlier**: commit or drain them first, as below.
+    /// symbols keep flushing — but retrying a *new* symbol on the same sender can
+    /// never succeed. A full dictionary therefore **retires the connection on
+    /// return**: a pooled sender is dropped rather than recycled (so the next
+    /// borrow gets a fresh, empty-dictionary connection, not the same full one),
+    /// and the frames flushed *earlier* on it are drained / committed best-effort
+    /// on the way out. So the simplest recovery is to return or drop the sender as
+    /// usual and continue on a fresh borrow. If those earlier frames must not be
+    /// lost, drain or commit them *and check* first, as below.
     ///
-    /// - **Pooled row sender** (`QuestDb::borrow_sender`): call
-    ///   `drop_on_return()` on the guard before it goes out of scope. Dropping
-    ///   the guard *is* the pool return — it recycles the connection **and its
-    ///   dictionary** — and the free list is LIFO, so the next borrow hands back
-    ///   that same connection and it fails again on its next new symbol. On the
-    ///   way out the queue is drained best-effort within `close_flush_timeout`;
-    ///   call `wait()` first if those frames must not be lost. With `sf_dir`
-    ///   configured they persist in the slot instead — but so does the
-    ///   dictionary, and the next borrower re-seeds from that slot's side-file
-    ///   at the same size, so it is full before it sends anything. `wait()`
-    ///   first there too, so the slot drains and the next borrower starts clean.
+    /// - **Pooled row sender** (`QuestDb::borrow_sender`): a full dictionary marks
+    ///   the connection for retirement, so a plain drop (which *is* the pool
+    ///   return) drains the queue best-effort within `close_flush_timeout` and
+    ///   drops the connection instead of recycling it — the next borrow gets a
+    ///   fresh one. (Nothing extra to call: an explicit `drop_on_return()` does the
+    ///   same and is redundant here.) `wait()` first if the queued frames must not
+    ///   be lost. With `sf_dir` configured they persist in the slot, but so does
+    ///   the dictionary, and the next borrower re-seeds from that slot's side-file
+    ///   at the same size unless the slot drained first — so `wait()` there too, so
+    ///   the slot drains and the next borrower starts clean.
     /// - **Pooled direct column sender**
-    ///   (`QuestDb::borrow_direct_column_sender`): **commit first, then**
-    ///   `drop_on_return()`. Its `flush` is *deferred* — nothing is committed
-    ///   until [`commit`](crate::db::BorrowedDirectColumnSender::commit) or
-    ///   `flush_and_wait` — and `drop_on_return()` latches the connection
-    ///   terminal, which makes the normal drop **skip** its best-effort commit
-    ///   entirely rather than attempt it. Every frame flushed since the last
-    ///   successful commit is then discarded with only a log warning. Call
-    ///   `commit(..)` (or `flush_and_wait(..)` on the final chunk) and check it
-    ///   succeeded *before* `drop_on_return()`.
+    ///   (`QuestDb::borrow_direct_column_sender`): a full dictionary marks the
+    ///   connection **spent** — retired on return, but its transport is healthy and
+    ///   still drainable — so a plain drop commits the deferred tail best-effort
+    ///   *and* retires the connection. Its `flush` is *deferred* (nothing is
+    ///   committed until [`commit`](crate::db::BorrowedDirectColumnSender::commit)
+    ///   or `flush_and_wait`), so for a *checked* guarantee call `commit(..)` (or
+    ///   `flush_and_wait(..)` on the final chunk) and confirm it succeeded before
+    ///   the drop — `commit` still goes through on a spent connection. Do **not**
+    ///   reach for `drop_on_return()` on a full dictionary: it hard-latches the
+    ///   connection, which makes the drop **skip** the best-effort commit and
+    ///   discard the tail. `reborrow_from_pool()` likewise discards the in-flight
+    ///   tail (its failover contract), so `commit`/`wait()` before it if that tail
+    ///   matters.
     /// - **Standalone** (`Sender`): call
     ///   [`close_drain`](crate::ingress::Sender::close_drain) and check it
     ///   succeeded, then drop and reconnect. Unlike the pooled guards above, a
@@ -271,11 +277,13 @@ pub enum ErrorCode {
     ///   so every published-but-unacked frame is discarded with no wait. This is
     ///   the most lossy of the three flavours on a bare drop, not the least.
     ///   `close_drain` is bounded by `close_flush_timeout`.
-    /// - **C ABI**: `questdb_db_drop_sender` for a pooled row sender;
-    ///   `questdb_db_drop_direct_sender` for a pooled direct sender, after
-    ///   `qwp_direct_sender_commit` or a waited flush; `qwp_direct_sender_free`
-    ///   for a standalone one. Never `questdb_db_return_sender` /
-    ///   `questdb_db_return_direct_sender`, which recycle the dictionary.
+    /// - **C ABI**: a plain `questdb_db_return_sender` /
+    ///   `questdb_db_return_direct_sender` now retires (does not recycle) a
+    ///   full-dictionary connection and drains / commits its pending frames
+    ///   best-effort — call `qwp_sender_wait` / `qwp_direct_sender_commit` first
+    ///   for a checked guarantee. `questdb_db_drop_direct_sender` force-drops and
+    ///   **skips** the direct sender's tail commit, so on a full dictionary prefer
+    ///   the plain return unless you mean to discard the tail.
     ///
     /// **One exception to "that flush loses nothing", and it matters for
     /// resends.** A chunk too large for a

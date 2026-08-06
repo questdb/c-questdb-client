@@ -1206,11 +1206,13 @@ public:
      *
      * A chunk introducing a symbol past the connection-scoped dictionary's
      * 1,000,000-entry / 256 MiB cap throws `error_code::symbol_dict_full` here.
-     * Retrying on this sender cannot succeed: the dictionary belongs to the
-     * connection, and returning the guard to the pool recycles both. Call
-     * `wait()` for the queued frames and then `drop_on_return()` before this
-     * guard is destroyed, so the next borrow gets a fresh connection. See the
-     * symbol-column preamble in `qwp_sender.h`.
+     * Retrying a new symbol on this sender cannot succeed: the dictionary belongs
+     * to the connection. A full dictionary retires the connection on return, so
+     * simply letting this guard be destroyed drops it (not recycled) and drains
+     * its queue best-effort — the next borrow gets a fresh connection. Call
+     * `wait()` first if the queued frames must not be lost (`drop_on_return()` is
+     * no longer required for a full dictionary). See the symbol-column preamble in
+     * `qwp_sender.h`.
      */
     void flush(column_chunk& chunk)
     {

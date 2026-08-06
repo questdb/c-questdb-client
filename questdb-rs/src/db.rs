@@ -2881,6 +2881,14 @@ fn connect_conn_pool(inner: &Arc<DbInner>) -> Result<ColumnConn> {
 /// the durability ACK instead of silently downgrading to `Ok`. On failure the
 /// connection is latched `must_close` so the next borrower can't commit these
 /// frames under a foreign table.
+///
+/// Gated on [`can_drain_in_flight`](DirectSenderCore::can_drain_in_flight), not
+/// `!must_close()`: a connection retired for a **full symbol dictionary**
+/// (`SymbolDictFull`) is `spent` but its transport is healthy, so its deferred
+/// tail — frames the caller already flushed, referencing already-interned
+/// symbols — is committed here rather than discarded. A symbol-less commit
+/// interns nothing, so the full dictionary does not block it. Only a hard latch
+/// (transport death, or a prior failed commit) skips the attempt.
 fn commit_in_flight_on_drop(request_durable_ack: bool, sender: &mut DirectSenderCore) {
     if sender.in_flight() == 0 {
         return;
@@ -2890,7 +2898,7 @@ fn commit_in_flight_on_drop(request_durable_ack: bool, sender: &mut DirectSender
     } else {
         AckLevel::Ok
     };
-    let committed = !sender.must_close() && !sender.transport_dead() && sender.sync(ack).is_ok();
+    let committed = sender.can_drain_in_flight() && sender.sync(ack).is_ok();
     if !committed {
         log::warn!(
             "direct sender dropped with un-sync'd deferred frame(s) that could \
