@@ -6443,7 +6443,7 @@ mod tests {
         // always been terminal; the asymmetry was the bug.
         let dict_full = Error::new(
             ErrorCode::SymbolDictFull,
-            "QWP/WS connection-scoped symbol dictionary reached its 1000000-entry cap",
+            "QWP/WS connection-scoped symbol dictionary reached its 2000000-entry cap",
         );
         assert!(reconnect_error_is_terminal(&dict_full));
 

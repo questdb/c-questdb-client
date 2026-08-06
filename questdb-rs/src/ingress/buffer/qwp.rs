@@ -5393,8 +5393,8 @@ impl Default for SymbolGlobalDict {
 
 /// Per-connection cap on the QWP/WS global symbol dictionary a sender ships to
 /// the server. Matches the server's ingress dictionary ceiling
-/// (`MAX_SYMBOL_DICTIONARY_SIZE`) and the Java reference client's
-/// `MAX_SYMBOL_DICTIONARY_SIZE` (both `1_000_000`), so the client refuses a symbol
+/// (`MAX_SYMBOL_DICTIONARY_SIZE`, `2_000_000`); the Java reference client is being
+/// aligned to the same value in its own change. So the client refuses a symbol
 /// the server would reject the delta for, rather than only discovering it on the
 /// wire. When the cap is reached [`intern`](SymbolGlobalDict::intern) returns
 /// [`SymbolDictFull`](crate::ErrorCode::SymbolDictFull) -- a distinct code so a
@@ -5403,20 +5403,21 @@ impl Default for SymbolGlobalDict {
 /// Reconnecting does NOT clear it, so it is not the remedy: the dictionary
 /// outlives the socket and a reconnect re-registers the whole of it on the fresh
 /// server (see the note on [`SymbolGlobalDict`]). Only discarding the connection
-/// that owns it resets it -- and on the pooled APIs a plain drop is not that,
-/// since the return path recycles the connection and its dictionary. What each
-/// API requires instead is documented on
+/// that owns it resets it -- which a full dictionary now does automatically on
+/// return, so a pooled sender is dropped rather than recycled and the next borrow
+/// gets a fresh one. What each API requires (and how to keep frames flushed
+/// earlier from being lost) is documented on
 /// [`SymbolDictFull`](crate::ErrorCode::SymbolDictFull). (The egress/query-result
 /// reader has its own, independent ceiling; see `egress/symbol_dict.rs`.)
 #[cfg(feature = "_sender-qwp-ws")]
-pub(crate) const MAX_CONN_SYMBOL_DICT_SIZE: usize = 1_000_000;
+pub(crate) const MAX_CONN_SYMBOL_DICT_SIZE: usize = 2_000_000;
 
 /// Per-connection cap on the cumulative UTF-8 heap (in bytes) the QWP/WS global
 /// symbol dictionary holds. Matches `MAX_CONN_DICT_HEAP_BYTES` in the egress
 /// reader (`egress/symbol_dict.rs`) and the Java reference client. The entry
 /// count ([`MAX_CONN_SYMBOL_DICT_SIZE`]) and per-entry length
 /// ([`MAX_PERSISTED_SYMBOL_ENTRY_LEN`]) caps do NOT bound the aggregate heap
-/// (1M entries * 1 MiB ~= 1 TiB), so without this cap a high-cardinality /
+/// (2M entries * 1 MiB ~= 2 TiB), so without this cap a high-cardinality /
 /// large-symbol connection could (a) build a dictionary the server rejects with
 /// no ingestion-side error, and (b) grow the persisted side-file past
 /// `MAX_FILE_LEN` (~2 GiB), which recovery then discards as over-cap -- stranding
@@ -5666,7 +5667,7 @@ impl SymbolGlobalDict {
             ));
         }
         // Aggregate heap cap: the entry-count and per-entry caps above do NOT
-        // bound the total bytes (1M entries * 1 MiB ~= 1 TiB). Enforce the same
+        // bound the total bytes (2M entries * 1 MiB ~= 2 TiB). Enforce the same
         // 256 MiB connection heap the egress reader / Java client use -- the
         // server bounds its ingress dictionary by entry count alone, so this one
         // is client-side -- at this single ingestion choke point, so an oversized
@@ -10078,7 +10079,7 @@ mod tests {
         // tests it names.
         //
         // `symbol_dict_cap_matches_server_ceiling` pins the real cap at
-        // 1_000_000; `with_cap` walks the same boundary without interning a
+        // 2_000_000; `with_cap` walks the same boundary without interning two
         // million symbols.
         fn region(count: usize) -> Vec<u8> {
             let mut region = Vec::new();
@@ -10131,10 +10132,11 @@ mod tests {
     #[cfg(feature = "_sender-qwp-ws")]
     #[test]
     fn symbol_dict_cap_matches_server_ceiling() {
-        // Mirrors the server's ingress dictionary ceiling and the Java reference
-        // client (both 1_000_000); a drift here would silently change the reconnect
-        // threshold and let the client ship deltas the server rejects.
-        assert_eq!(MAX_CONN_SYMBOL_DICT_SIZE, 1_000_000);
+        // Mirrors the server's ingress dictionary ceiling (2_000_000; the Java
+        // reference client is being aligned to the same value in its own change);
+        // a drift here would silently change the reconnect threshold and let the
+        // client ship deltas the server rejects.
+        assert_eq!(MAX_CONN_SYMBOL_DICT_SIZE, 2_000_000);
     }
 
     #[cfg(feature = "_sender-qwp-ws")]

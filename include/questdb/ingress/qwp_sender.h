@@ -759,7 +759,7 @@ bool qwp_chunk_column_binary(
  *
  * Separately, the connection-scoped symbol dictionary — the distinct
  * symbols actually *referenced* across every column and every chunk sent
- * on one connection — is capped at 1,000,000 entries, matching the server's
+ * on one connection — is capped at 2,000,000 entries, matching the server's
  * ingress ceiling (`MAX_SYMBOL_DICTIONARY_SIZE`), and at 256 MiB of UTF-8.
  * The byte cap is client-side only — the server bounds the ingress dictionary
  * by entry count alone; it keeps the writer in step with the egress reader and

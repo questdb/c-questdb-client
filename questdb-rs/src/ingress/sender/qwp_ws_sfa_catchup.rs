@@ -336,7 +336,7 @@ impl SentDictMirror {
         }
         self.bytes.extend_from_slice(suffix);
         // `frame_end` is bounded by the connection dict cap
-        // (`MAX_CONN_SYMBOL_DICT_SIZE`, 1M) so it always fits `u32`; the
+        // (`MAX_CONN_SYMBOL_DICT_SIZE`, 2M) so it always fits `u32`; the
         // truncating cast is only reachable via a ~4 GB single frame, which the
         // frame-size caps preclude. Assert in debug so a future cap change that
         // breaks the invariant is caught in tests rather than silently wrapping the

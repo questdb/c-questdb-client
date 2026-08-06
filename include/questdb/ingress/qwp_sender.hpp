@@ -460,7 +460,7 @@ public:
      * Two separate caps apply. The distinct entry count you may *declare* is
      * capped at 8,388,608 per column, rejected by this call. The symbols
      * actually *referenced* across every column and every chunk on one
-     * connection are capped at 1,000,000 entries and 256 MiB of UTF-8; that
+     * connection are capped at 2,000,000 entries and 256 MiB of UTF-8; that
      * cap is reached at `flush()` / `flush_and_wait()`, not here, and fails
      * them with `error_code::symbol_dict_full`. A wide dictionary consumes
      * none of that second budget until its entries are referenced.
@@ -754,7 +754,7 @@ public:
      * Throws on error.
      *
      * This is where the connection-scoped symbol dictionary is filled, so a
-     * chunk introducing a symbol past its 1,000,000-entry / 256 MiB cap throws
+     * chunk introducing a symbol past its 2,000,000-entry / 256 MiB cap throws
      * `error_code::symbol_dict_full` here rather than at the `symbol_i*` call
      * that declared the dictionary. Retrying on the same sender cannot succeed
      * — only retiring the connection resets it; see the symbol-column preamble
@@ -1205,7 +1205,7 @@ public:
      * Throws on error.
      *
      * A chunk introducing a symbol past the connection-scoped dictionary's
-     * 1,000,000-entry / 256 MiB cap throws `error_code::symbol_dict_full` here.
+     * 2,000,000-entry / 256 MiB cap throws `error_code::symbol_dict_full` here.
      * Retrying a new symbol on this sender cannot succeed: the dictionary belongs
      * to the connection. A full dictionary retires the connection on return, so
      * simply letting this guard be destroyed drops it (not recycled) and drains

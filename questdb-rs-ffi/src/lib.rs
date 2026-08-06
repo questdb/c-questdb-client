@@ -393,7 +393,7 @@ pub enum line_sender_error_code {
     line_sender_error_store_resend_required = 36,
 
     /// The QWP/WebSocket connection-scoped symbol dictionary is full: interning
-    /// another distinct symbol would exceed its entry-count cap (1,000,000,
+    /// another distinct symbol would exceed its entry-count cap (2,000,000,
     /// matching the server's ingress ceiling) or its cumulative UTF-8 heap cap
     /// (256 MiB). The failing frame is rejected before any byte reaches the wire
     /// and the buffer is rolled back, so *that flush* loses nothing and chunks

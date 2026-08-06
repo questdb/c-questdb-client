@@ -229,7 +229,7 @@ pub enum ErrorCode {
 
     /// The QWP/WebSocket connection-scoped symbol dictionary is full: interning
     /// another distinct symbol would push it past its entry-count cap
-    /// (1,000,000, matching the server's ingress ceiling) or its cumulative
+    /// (2,000,000, matching the server's ingress ceiling) or its cumulative
     /// UTF-8 heap cap (256 MiB). The dictionary accumulates every distinct
     /// symbol referenced across every column, chunk, and row-buffer flush on
     /// one connection, and is only reset by discarding that connection.

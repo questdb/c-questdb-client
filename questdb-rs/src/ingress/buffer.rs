@@ -759,7 +759,7 @@ impl Buffer {
     ///
     /// When the buffer is flushed over QWP/WebSocket, every distinct symbol
     /// recorded here is interned into the *same* connection-scoped dictionary
-    /// the column/chunk API uses — capped at 1,000,000 entries and 256 MiB of
+    /// the column/chunk API uses — capped at 2,000,000 entries and 256 MiB of
     /// UTF-8 across the whole connection, not per buffer or per flush.
     /// Exceeding it fails the flush with
     /// [`SymbolDictFull`](crate::ErrorCode::SymbolDictFull), and the dictionary

@@ -391,7 +391,7 @@ public:
      * sender or by `line_sender::flush*` on a `line_sender` opened against a
      * `ws://` / `wss://` address — every distinct symbol recorded here is
      * interned into the *same* connection-scoped dictionary the chunk API uses:
-     * capped at 1,000,000 entries and 256 MiB of UTF-8 across the whole
+     * capped at 2,000,000 entries and 256 MiB of UTF-8 across the whole
      * connection, not per buffer or per flush. Exceeding it throws
      * `error_code::symbol_dict_full`, and the dictionary is only reset by
      * retiring the connection that owns it. For a standalone `line_sender` that
