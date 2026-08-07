@@ -634,6 +634,12 @@ impl OidcDeviceAuth {
         *self.lock_tokens() = Some(fresh.clone());
         // Persist the fresh sign-in (a new refresh token) for the next restart.
         self.persist_fresh(&fresh);
+        // Commit the authorized token to memory and persistence before invoking
+        // cosmetic user code. If a custom renderer panics and its caller catches
+        // the panic, the completed sign-in must not be lost or repeated.
+        let identity = identity_from_tokens(&fresh);
+        self.renderer
+            .on_success(identity.as_deref(), fresh.remaining_secs(now_epoch()));
         Ok(fresh)
     }
 
@@ -941,14 +947,7 @@ impl OidcDeviceAuth {
         {
             maybe_open_browser(&target);
         }
-        let tokens = self.poll_for_token(&resp)?;
-
-        // Rendering the success message is purely cosmetic and must never abort an
-        // authorized sign-in.
-        let identity = identity_from_tokens(&tokens);
-        self.renderer
-            .on_success(identity.as_deref(), tokens.remaining_secs(now_epoch()));
-        Ok(tokens)
+        self.poll_for_token(&resp)
     }
 
     fn request_device_code(&self) -> Result<DeviceResponse> {

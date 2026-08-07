@@ -1437,6 +1437,61 @@ fn expire_persisted(dir: &Path, key: &TokenStoreKey) {
 }
 
 #[test]
+fn success_renderer_panic_keeps_token_cached_and_persisted() {
+    struct PanicOnSuccess;
+
+    impl Renderer for PanicOnSuccess {
+        fn on_success(&self, _identity: Option<&str>, _expires_in_secs: f64) {
+            panic!("injected renderer panic");
+        }
+    }
+
+    let device_calls = Arc::new(AtomicUsize::new(0));
+    let mock = persistence_mock(Arc::clone(&device_calls), || {
+        r#"{"access_token":"AT-refreshed","expires_in":300}"#.to_string()
+    });
+    let dir = TempDir::new().unwrap();
+    let key = key_for(&mock);
+    let auth = OidcDeviceAuth::builder()
+        .client_id("questdb")
+        .device_authorization_endpoint(mock.url("/device"))
+        .token_endpoint(mock.url("/token"))
+        .scope("openid")
+        .interactive(true)
+        .open_browser(false)
+        .sleep_hook(no_sleep())
+        .renderer(PanicOnSuccess)
+        .token_store(FileTokenStore::at(dir.path()))
+        .build()
+        .unwrap();
+
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| auth.token()));
+    assert!(
+        result.is_err(),
+        "the custom renderer should still propagate its panic"
+    );
+    assert_eq!(
+        auth.token_set().unwrap().access_token.as_deref(),
+        Some("AT-initial"),
+        "the authorized token was lost from memory"
+    );
+    assert_eq!(
+        FileTokenStore::at(dir.path())
+            .load(&key)
+            .unwrap()
+            .unwrap()
+            .access_token(),
+        Some("AT-initial"),
+        "the authorized token was not persisted before the callback"
+    );
+
+    // The acquisition lock is poisoned by the renderer panic, but the cache fast
+    // path must still return the completed sign-in without another device flow.
+    assert_eq!(auth.token().unwrap(), "AT-initial");
+    assert_eq!(device_calls.load(Ordering::SeqCst), 1);
+}
+
+#[test]
 fn restart_resumes_from_persisted_token_without_reprompt() {
     let device_calls = Arc::new(AtomicUsize::new(0));
     let mock = persistence_mock(Arc::clone(&device_calls), || {
