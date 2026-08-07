@@ -698,10 +698,10 @@ impl TokenStore for FileTokenStore {
 // ---------------------------------------------------------------------------
 
 /// Canonicalise an endpoint URL for the cross-language store-key hash:
-/// `scheme://host:port/path` with scheme and host lower-cased, the port always
-/// explicit (443/80 default), an IPv6 host bracketed, and a trailing slash
-/// stripped from the path. For the common case (no trailing slash) this is
-/// byte-for-byte unchanged.
+/// `scheme://host:port/path?query` with scheme and host lower-cased, the port
+/// always explicit (443/80 default), and an IPv6 host bracketed. The complete
+/// path and query are retained because both are routing-significant parts of an
+/// OAuth endpoint's identity.
 fn canonical_endpoint(url: &str) -> String {
     let Ok(uri) = url.parse::<ureq::http::Uri>() else {
         return url.to_string();
@@ -719,11 +719,16 @@ fn canonical_endpoint(url: &str) -> String {
         _ => None,
     };
     let port = uri.port_u16().or(default_port);
-    // Strip a trailing slash so `.../token` and `.../token/` are ONE identity.
-    let path = uri.path().trim_end_matches('/');
+    // Preserve the byte-exact request target. In particular, `/token` and
+    // `/token/` can be different resources, and OAuth explicitly permits a token
+    // endpoint to carry a routing-significant query component.
+    let path_and_query = uri
+        .path_and_query()
+        .map(|value| value.as_str())
+        .unwrap_or_else(|| uri.path());
     match port {
-        Some(port) => format!("{scheme}://{host}:{port}{path}"),
-        None => format!("{scheme}://{host}{path}"),
+        Some(port) => format!("{scheme}://{host}:{port}{path_and_query}"),
+        None => format!("{scheme}://{host}{path_and_query}"),
     }
 }
 

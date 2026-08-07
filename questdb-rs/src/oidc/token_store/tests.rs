@@ -80,14 +80,19 @@ fn hash_matches_frozen_cross_language_value() {
 
 #[test]
 fn canonical_endpoint_normalizes() {
-    // Default port made explicit; scheme/host lower-cased; trailing slash stripped.
+    // Default port made explicit and scheme/host lower-cased, while the complete
+    // routing-significant path and query stay byte-exact.
     assert_eq!(
         canonical_endpoint("https://idp.example.com/token"),
         "https://idp.example.com:443/token"
     );
     assert_eq!(
         canonical_endpoint("https://IDP.Example.COM:443/token/"),
-        "https://idp.example.com:443/token"
+        "https://idp.example.com:443/token/"
+    );
+    assert_eq!(
+        canonical_endpoint("https://IDP.Example.COM/token?tenant=A%2FB&mode=strict"),
+        "https://idp.example.com:443/token?tenant=A%2FB&mode=strict"
     );
     assert_eq!(
         canonical_endpoint("http://localhost:9000/dev"),
@@ -98,6 +103,50 @@ fn canonical_endpoint_normalizes() {
         canonical_endpoint("https://[::1]:8443/t"),
         "https://[::1]:8443/t"
     );
+}
+
+#[test]
+fn endpoint_path_and_query_isolate_store_entries() {
+    let key = |token_endpoint: &str, device_endpoint: &str| {
+        TokenStoreKey::from_config(
+            "questdb",
+            token_endpoint,
+            device_endpoint,
+            "openid",
+            None,
+            false,
+            None,
+        )
+    };
+
+    let tenant_a = key(
+        "https://idp.example.com/token?tenant=A",
+        "https://idp.example.com/device",
+    );
+    let tenant_b = key(
+        "https://idp.example.com/token?tenant=B",
+        "https://idp.example.com/device",
+    );
+    let device_tenant_b = key(
+        "https://idp.example.com/token?tenant=A",
+        "https://idp.example.com/device?tenant=B",
+    );
+    let trailing_slash = key(
+        "https://idp.example.com/token/",
+        "https://idp.example.com/device",
+    );
+
+    assert_ne!(tenant_a.hash(), tenant_b.hash());
+    assert_ne!(tenant_a.hash(), device_tenant_b.hash());
+    assert_ne!(tenant_a.hash(), trailing_slash.hash());
+
+    let dir = TempDir::new().unwrap();
+    let store = FileTokenStore::at(dir.path());
+    store.save(&tenant_a, &test_token()).unwrap();
+    assert!(store.load(&tenant_a).unwrap().is_some());
+    assert!(store.load(&tenant_b).unwrap().is_none());
+    assert!(store.load(&device_tenant_b).unwrap().is_none());
+    assert!(store.load(&trailing_slash).unwrap().is_none());
 }
 
 #[test]
