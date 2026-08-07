@@ -399,7 +399,7 @@ fn in_lock_serialises_concurrent_holders() {
     t1.join().unwrap();
     t2.join().unwrap();
     // The 3s acquire budget comfortably covers the 150ms hold, so the loser waits
-    // for the winner rather than degrading — the two critical sections never overlap.
+    // for the winner and the two critical sections never overlap.
     assert!(
         !overlap.load(Ordering::SeqCst),
         "lock did not serialise the two holders"
@@ -407,11 +407,38 @@ fn in_lock_serialises_concurrent_holders() {
 }
 
 #[test]
-fn stale_lock_is_stolen() {
+fn in_lock_never_runs_action_after_acquire_timeout() {
     let dir = TempDir::new().unwrap();
     let key = test_key();
-    let store = FileTokenStore::at(dir.path())
-        .with_lock_timings(Duration::from_millis(500), Duration::from_secs(300));
+    let store =
+        FileTokenStore::at(dir.path()).with_lock_timings(Duration::ZERO, Duration::from_secs(600));
+    let lock = store.lock_file(&key);
+    let _peer = create_lock_file(&lock).unwrap();
+
+    let ran = Arc::new(AtomicBool::new(false));
+    let r = Arc::clone(&ran);
+    let err = store
+        .in_lock(&key, &mut || {
+            r.store(true, Ordering::SeqCst);
+            Ok(())
+        })
+        .unwrap_err();
+
+    assert!(!ran.load(Ordering::SeqCst), "action ran without the lock");
+    assert_eq!(
+        err.downcast_ref::<std::io::Error>()
+            .map(std::io::Error::kind),
+        Some(std::io::ErrorKind::WouldBlock)
+    );
+    assert!(lock.exists(), "contender removed the peer's live lock");
+}
+
+#[test]
+fn stale_lock_is_reported_but_never_stolen() {
+    let dir = TempDir::new().unwrap();
+    let key = test_key();
+    let store =
+        FileTokenStore::at(dir.path()).with_lock_timings(Duration::ZERO, Duration::from_secs(300));
     // Plant a lock and backdate its mtime well past the staleness window.
     let lock = store.lock_file(&key);
     std::fs::write(&lock, b"crashed-holder").unwrap();
@@ -419,16 +446,43 @@ fn stale_lock_is_stolen() {
     f.set_modified(SystemTime::now() - Duration::from_secs(400))
         .unwrap();
     drop(f);
-    // in_lock steals the abandoned lock and runs the action within the budget.
+
     let ran = Arc::new(AtomicBool::new(false));
     let r = Arc::clone(&ran);
-    store
+    let err = store
         .in_lock(&key, &mut || {
             r.store(true, Ordering::SeqCst);
             Ok(())
         })
-        .unwrap();
-    assert!(ran.load(Ordering::SeqCst), "did not steal the stale lock");
+        .unwrap_err();
+
+    assert!(!ran.load(Ordering::SeqCst), "action ran without the lock");
+    assert!(
+        err.to_string().contains("appears stale"),
+        "unexpected error: {err}"
+    );
+    assert!(
+        lock.exists(),
+        "automatic stale recovery removed an unowned lock"
+    );
+}
+
+#[test]
+fn in_lock_releases_during_unwind() {
+    let dir = TempDir::new().unwrap();
+    let store = FileTokenStore::at(dir.path());
+    let key = test_key();
+    let lock = store.lock_file(&key);
+
+    let unwind = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _ = store.in_lock(&key, &mut || -> TokenStoreResult<()> {
+            panic!("test panic inside token-store action")
+        });
+    }));
+
+    assert!(unwind.is_err());
+    assert!(!lock.exists(), "unwinding left the owned lock behind");
+    store.in_lock(&key, &mut || Ok(())).unwrap();
 }
 
 #[test]

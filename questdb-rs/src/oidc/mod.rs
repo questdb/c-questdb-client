@@ -129,6 +129,10 @@
 //! refresh token to disk in plaintext**, so persistence is opt-in; for at-rest
 //! encryption, implement [`TokenStore`] over an OS keychain or a secrets manager.
 //! A persisted file is treated as untrusted input on load (see [`FileTokenStore`]).
+//! A refresh is never attempted without owning the store's cross-process lock:
+//! contention returns a retryable network-class error, and an apparently stale
+//! lock is left in place for an operator to remove only after verifying that its
+//! holder is gone. This avoids reusing a rotating refresh token concurrently.
 //!
 //! # Using the token beyond ILP/HTTP
 //!

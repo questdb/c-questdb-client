@@ -1504,6 +1504,77 @@ fn refresh_survives_persisted_entry_without_refresh_token() {
 }
 
 #[test]
+fn coordinated_refresh_never_falls_back_without_the_store_lock() {
+    struct LockUnavailableStore;
+
+    impl TokenStore for LockUnavailableStore {
+        fn load(&self, _key: &TokenStoreKey) -> TokenStoreResult<Option<PersistedToken>> {
+            Ok(None)
+        }
+
+        fn save(&self, _key: &TokenStoreKey, _token: &PersistedToken) -> TokenStoreResult<()> {
+            Ok(())
+        }
+
+        fn clear(&self, _key: &TokenStoreKey) -> TokenStoreResult<()> {
+            Ok(())
+        }
+
+        fn in_lock(
+            &self,
+            _key: &TokenStoreKey,
+            _action: &mut dyn FnMut() -> TokenStoreResult<()>,
+        ) -> TokenStoreResult<()> {
+            Err(Box::new(std::io::Error::new(
+                std::io::ErrorKind::WouldBlock,
+                "peer holds the refresh lock",
+            )))
+        }
+    }
+
+    let token_calls = Arc::new(AtomicUsize::new(0));
+    let mock = {
+        let token_calls = Arc::clone(&token_calls);
+        MockServer::start(move |method, path, _body| {
+            if (method, path) == ("POST", "/token") {
+                token_calls.fetch_add(1, Ordering::SeqCst);
+            }
+            (500, r#"{"error":"must_not_be_called"}"#.to_string())
+        })
+    };
+    let auth = OidcDeviceAuth::builder()
+        .client_id("questdb")
+        .device_authorization_endpoint(mock.url("/device"))
+        .token_endpoint(mock.url("/token"))
+        .scope("openid")
+        .interactive(true)
+        .open_browser(false)
+        .sleep_hook(no_sleep())
+        .token_store(LockUnavailableStore)
+        .build()
+        .unwrap();
+    *auth.tokens.lock().unwrap() = Some(TokenSet {
+        access_token: Some("AT-expired".to_string()),
+        id_token: None,
+        refresh_token: Some("RT-1".to_string()),
+        expires_at: 1.0,
+        token_type: "Bearer".to_string(),
+        scope: Some("openid".to_string()),
+        sub: None,
+        issued_at: 0.0,
+    });
+
+    let err = auth.token().unwrap_err();
+    assert_eq!(err.kind(), OidcErrorKind::Network);
+    assert!(err.message().contains("cross-process OIDC refresh lock"));
+    assert_eq!(
+        token_calls.load(Ordering::SeqCst),
+        0,
+        "refresh ran after coordination failed"
+    );
+}
+
+#[test]
 fn transient_store_load_error_is_retried_not_latched() {
     // M2: FileTokenStore reports a missing/corrupt/oversized file as Ok(None); the
     // only case it surfaces as Err is a genuine (transient) I/O error. A transient

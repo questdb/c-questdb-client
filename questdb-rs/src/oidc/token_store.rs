@@ -74,27 +74,28 @@ const CANONICAL_PREFIX: &str = "questdb-oidc-token-v1";
 /// 1 MiB is ample while refusing to read an unbounded (hostile) file into memory.
 const MAX_FILE_BYTES: u64 = 1 << 20;
 
-/// How long to spin trying to acquire the per-identity lock file before giving up
-/// and running without it (degrading to the atomic-replace integrity layer).
+/// How long to spin trying to acquire the per-identity lock file before returning
+/// a retryable error. A refresh must never run without the lock: rotating refresh
+/// tokens can be invalidated when two processes submit the same parent token.
 const DEFAULT_LOCK_ACQUIRE_BUDGET: Duration = Duration::from_secs(3);
-/// A configured acquire budget above this is clamped down. The lock is only ever
-/// held for a bounded refresh/save (well under a minute in practice), so spinning
-/// longer to acquire it is pointless — and an unclamped near-`Duration::MAX` budget
-/// would overflow `Instant::now() + budget`.
+/// A configured acquire budget above this is clamped down so a bad configuration
+/// cannot block indefinitely or overflow `Instant::now() + budget`.
 const MAX_LOCK_ACQUIRE_BUDGET: Duration = Duration::from_secs(300);
 const LOCK_POLL_SLICE: Duration = Duration::from_millis(50);
 
-/// A lock older than this is treated as abandoned (a crashed holder) and stolen.
-/// Must dominate the worst-case time a live holder can hold it: up to ~4×HTTP
-/// timeout (capped 120s) for the refresh I/O plus a generous connection-stall
-/// allowance. 10 minutes clears that with headroom.
+/// A lock older than this is reported as stale in the acquisition error. Stale
+/// locks are deliberately not stolen automatically: there is no portable atomic
+/// "remove this path only if it is still this inode" operation, so a check then
+/// rename/unlink can displace a newly acquired live lock.
 const DEFAULT_LOCK_STALE: Duration = Duration::from_secs(600);
-/// A configured staleness window below this is rejected — see [`FileTokenStore::with_lock_timings`].
+/// A configured staleness window below this is clamped up — see
+/// [`FileTokenStore::with_lock_timings`].
 const MIN_LOCK_STALE: Duration = Duration::from_secs(300);
 
-/// The result of a [`TokenStore`] operation. Persistence is best-effort: the
-/// [`OidcDeviceAuth`](crate::oidc::OidcDeviceAuth) treats an `Err` as non-fatal,
-/// warning and continuing with the in-memory token.
+/// The result of a [`TokenStore`] operation. Load/save/clear persistence is
+/// best-effort. Failure to acquire a refresh-coordination lock is different: it
+/// is surfaced as a retryable token-acquisition error so the refresh never runs
+/// concurrently with another process.
 pub type TokenStoreResult<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
 // ---------------------------------------------------------------------------
@@ -308,8 +309,10 @@ impl TokenStoreKey {
 /// implementation need not be thread-safe against concurrent calls from one
 /// instance; it does, however, share its backing storage with other processes
 /// (and other language clients), so it must keep a concurrent reader from
-/// observing a half-written entry. A store reports failure by returning `Err`;
-/// `OidcDeviceAuth` treats persistence as best-effort and a failure as non-fatal.
+/// observing a half-written entry. A store reports failure by returning `Err`.
+/// Load/save/clear failures are best-effort and non-fatal; a coordination failure
+/// during refresh is retryable and aborts that attempt rather than running it
+/// without mutual exclusion.
 ///
 /// **Security — [`load`](Self::load) MUST re-verify identity.** `OidcDeviceAuth`
 /// does not re-check the returned token against `key`; it trusts `load` to only
@@ -338,10 +341,12 @@ pub trait TokenStore: Send + Sync {
     /// The default runs `action` with no locking, which is correct for a single
     /// process or a non-rotating refresh token; [`FileTokenStore`] overrides it
     /// with a lock-file protocol. **Most stores should NOT override this.**
-    /// `action` MUST be invoked exactly once, synchronously, on the calling
-    /// thread, with the lock held for the whole call; an implementation that
-    /// cannot acquire the lock should run `action` anyway (degrade) rather than
-    /// fail a sign-in.
+    ///
+    /// An override that provides cross-process coordination must either invoke
+    /// `action` exactly once, synchronously, with the lock held for the whole
+    /// call, or return `Err` without invoking it. It must never claim
+    /// cross-process coordination and then run the action without ownership:
+    /// doing so can reuse and revoke a rotating refresh token.
     fn in_lock(
         &self,
         key: &TokenStoreKey,
@@ -373,8 +378,11 @@ pub trait TokenStore: Send + Sync {
 /// process or language — sees the whole old or whole new file, never a torn
 /// credential. [`in_lock`](TokenStore::in_lock) serialises the
 /// read-refresh-write of a token refresh across processes with an
-/// `O_CREAT|O_EXCL` lock file, stealing a stale lock left by a crashed holder and
-/// degrading to running without the lock rather than stall a sign-in.
+/// `O_CREAT|O_EXCL` lock file. It never runs the action without owning that lock
+/// and never automatically steals a stale pathname: either operation could let
+/// two processes submit the same rotating refresh token. A stale lock is reported
+/// as a retryable error and must be removed only after the operator has verified
+/// that no holder is still active.
 #[derive(Debug, Clone)]
 pub struct FileTokenStore {
     directory: PathBuf,
@@ -415,12 +423,11 @@ impl FileTokenStore {
         Ok(Self::at(home.join(".questdb").join("oidc-tokens")))
     }
 
-    /// Override the cross-process lock timings. `stale` must exceed 5 minutes (it
-    /// must dominate the worst-case time a live holder can hold the lock, so a
-    /// tighter window could steal a live lock). A tighter `stale` is clamped up to
-    /// the 5-minute floor; `acquire_budget` is clamped down to 5 minutes (spinning
-    /// longer than that to acquire a briefly-held lock is pointless, and an
-    /// unclamped value would overflow the deadline arithmetic).
+    /// Override the cross-process lock timings. `stale` controls when a lock is
+    /// identified as abandoned in the acquisition error; it never causes an
+    /// automatic unlink/rename. A tighter value is clamped up to the 5-minute
+    /// floor. `acquire_budget` is clamped down to 5 minutes (an unclamped value
+    /// would overflow the deadline arithmetic).
     pub fn with_lock_timings(mut self, acquire_budget: Duration, stale: Duration) -> Self {
         self.lock_acquire_budget = acquire_budget.min(MAX_LOCK_ACQUIRE_BUDGET);
         self.lock_stale = stale.max(MIN_LOCK_STALE);
@@ -563,23 +570,31 @@ impl FileTokenStore {
 
     // -- lock-file protocol -------------------------------------------------
 
-    fn acquire_lock(&self, lock: &Path) -> Option<File> {
+    fn acquire_lock(&self, lock: &Path) -> TokenStoreResult<File> {
         // `lock_acquire_budget` is clamped in `with_lock_timings`, so this add
         // cannot overflow.
         let deadline = Instant::now() + self.lock_acquire_budget;
         loop {
             match create_lock_file(lock) {
-                Ok(file) => return Some(file),
+                Ok(file) => return Ok(file),
                 Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-                    if self.is_stale(lock) {
-                        steal_stale_lock(lock, self.lock_stale);
-                    }
                     if Instant::now() >= deadline {
-                        return None; // give up; run without the lock
+                        let detail = if self.is_stale(lock) {
+                            "the lock appears stale; verify that no holder is active, then remove it manually"
+                        } else {
+                            "another process still holds the lock"
+                        };
+                        return Err(Box::new(std::io::Error::new(
+                            std::io::ErrorKind::WouldBlock,
+                            format!(
+                                "could not acquire the OIDC token-store lock {lock:?} within {:?}: {detail}",
+                                self.lock_acquire_budget
+                            ),
+                        )));
                     }
                     std::thread::sleep(LOCK_POLL_SLICE);
                 }
-                Err(_) => return None, // unexpected IO; degrade to no lock
+                Err(e) => return Err(Box::new(e)),
             }
         }
     }
@@ -588,7 +603,7 @@ impl FileTokenStore {
         // lstat (symlink_metadata): judge a symlink by its OWN mtime; for a
         // regular-file lock (what we create) lstat == stat.
         let Ok(meta) = fs::symlink_metadata(lock) else {
-            return false; // can't determine age → don't steal
+            return false; // can't determine age → report ordinary contention
         };
         let Ok(mtime) = meta.modified() else {
             return false;
@@ -668,20 +683,13 @@ impl TokenStore for FileTokenStore {
         action: &mut dyn FnMut() -> TokenStoreResult<()>,
     ) -> TokenStoreResult<()> {
         let lock = self.lock_file(key);
-        // Prepare the directory and acquire; on any failure, run without the lock
-        // (the atomic write still keeps every reader consistent).
-        let held = if self.ensure_directory().is_ok() {
-            self.acquire_lock(&lock)
-        } else {
-            None
-        };
-        let result = action();
-        if let Some(file) = &held {
-            // Release only if we still own the lock file; a leftover lock goes
-            // stale and the next acquirer steals it.
-            release_lock(&lock, file);
-        }
-        result
+        self.ensure_directory()?;
+        let file = self.acquire_lock(&lock)?;
+        // RAII makes the lock unwind-safe. `release_lock` checks filesystem
+        // identity where the platform exposes it, avoiding removal of a
+        // successor already installed at the pathname.
+        let _held = HeldLock { lock, file };
+        action()
     }
 }
 
@@ -788,9 +796,9 @@ fn temp_path(dir: &Path, hash: &str) -> PathBuf {
 
 fn create_lock_file(lock: &Path) -> std::io::Result<File> {
     // The create_new (O_CREAT|O_EXCL) IS the acquisition; write the holder bytes
-    // through this same handle so a concurrent steal can't truncate a peer's
-    // fresh lock. Holder bytes are debug-only (staleness is judged by mtime). The
-    // handle is returned so the release can verify it still owns the lock file.
+    // through this same handle. Holder bytes are diagnostic-only (staleness is
+    // judged by mtime). The handle is returned so release can verify that the path
+    // still names the exact file we acquired.
     let mut opts = OpenOptions::new();
     opts.write(true).create_new(true);
     #[cfg(unix)]
@@ -803,15 +811,27 @@ fn create_lock_file(lock: &Path) -> std::io::Result<File> {
     Ok(f)
 }
 
+/// Owns one successfully acquired lock for exactly the lifetime of the critical
+/// section. In particular, unwinding through a user-provided `in_lock` action
+/// still runs the ownership-checked release.
+struct HeldLock {
+    lock: PathBuf,
+    file: File,
+}
+
+impl Drop for HeldLock {
+    fn drop(&mut self) {
+        release_lock(&self.lock, &self.file);
+    }
+}
+
 /// Release a held lock by unlinking it — but only when the path still resolves to
-/// the exact file we created. A peer that stole a stale lock and recreated it holds
-/// a *different* inode; unlinking by path alone would delete the peer's live lock
-/// and let a third process enter the critical section concurrently. Comparing
-/// `(dev, ino)` of our open handle against the current path closes that window.
-///
-/// On non-unix targets there is no portable inode identity, so fall back to a
-/// best-effort unlink; the stale-steal protocol still recovers from an erroneously
-/// deleted successor lock.
+/// the exact file we created. Another language client or operator may have removed
+/// and recreated the pathname while this action was running; unlinking by path
+/// alone would then delete the successor's live lock and admit a second holder.
+/// Comparing filesystem identity avoids deleting a successor already present
+/// when release begins. This implementation never replaces a held lock itself;
+/// that is also why stale locks are reported instead of stolen automatically.
 #[cfg(unix)]
 fn release_lock(lock: &Path, held: &File) {
     use std::os::unix::fs::MetadataExt;
@@ -825,43 +845,44 @@ fn release_lock(lock: &Path, held: &File) {
     }
 }
 
-#[cfg(not(unix))]
-fn release_lock(lock: &Path, _held: &File) {
-    let _ = fs::remove_file(lock);
+#[cfg(windows)]
+fn release_lock(lock: &Path, held: &File) {
+    let at_path = File::open(lock).ok();
+    if at_path.as_ref().is_some_and(|at_path| {
+        windows_file_identity(held)
+            .zip(windows_file_identity(at_path))
+            .is_some_and(|(ours, current)| ours == current)
+    }) {
+        let _ = fs::remove_file(lock);
+    }
 }
 
-fn steal_stale_lock(lock: &Path, lock_stale: Duration) {
-    // Break a stale lock ATOMICALLY: rename it aside to a private path (only one
-    // racer can rename a given file away). Re-judge staleness on the moved-aside
-    // file; if a peer recreated a fresh lock in the gap we moved a live lock by
-    // mistake — restore it. A single break is the common outcome and a live lock
-    // is never blindly deleted; integrity is guarded by the atomic write
-    // regardless.
-    let private = lock.with_extension(format!(
-        "stale.{}.{}",
-        std::process::id(),
-        thread_id_stamp()
-    ));
-    if fs::rename(lock, &private).is_err() {
-        return; // lost the steal race; the lock is already gone — retry create
-    }
-    let stale = match fs::symlink_metadata(&private).and_then(|m| m.modified()) {
-        Ok(mtime) => SystemTime::now()
-            .duration_since(mtime)
-            .map(|e| e > lock_stale)
-            .unwrap_or(false),
-        Err(_) => false,
+#[cfg(windows)]
+fn windows_file_identity(file: &File) -> Option<(u32, u64)> {
+    use std::mem::MaybeUninit;
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Storage::FileSystem::{
+        BY_HANDLE_FILE_INFORMATION, GetFileInformationByHandle,
     };
-    if stale {
-        // Genuinely abandoned: drop it so the next create wins.
-        let _ = fs::remove_file(&private);
-    } else {
-        // A still-live lock we moved by mistake (a peer recreated it in the gap):
-        // put it back. If the slot was retaken meanwhile, drop our redundant copy.
-        if fs::rename(&private, lock).is_err() {
-            let _ = fs::remove_file(&private);
-        }
+
+    let mut info = MaybeUninit::<BY_HANDLE_FILE_INFORMATION>::uninit();
+    // SAFETY: `file` keeps the OS handle valid for the call, and `info` points to
+    // writable storage of the exact structure the Windows API initialises.
+    let ok = unsafe { GetFileInformationByHandle(file.as_raw_handle(), info.as_mut_ptr()) };
+    if ok == 0 {
+        return None;
     }
+    // SAFETY: a non-zero return means Windows initialised the whole structure.
+    let info = unsafe { info.assume_init() };
+    let index = (u64::from(info.nFileIndexHigh) << 32) | u64::from(info.nFileIndexLow);
+    Some((info.dwVolumeSerialNumber, index))
+}
+
+#[cfg(not(any(unix, windows)))]
+fn release_lock(_lock: &Path, _held: &File) {
+    // The crate's supported desktop/server targets are Unix and Windows. On an
+    // unknown std target, leaking the lock is safer than path-only deletion,
+    // which could remove a successor's lock and admit concurrent refreshes.
 }
 
 fn holder_bytes() -> String {
@@ -870,13 +891,6 @@ fn holder_bytes() -> String {
         .map(|d| d.as_nanos())
         .unwrap_or(0);
     format!("{}@{} {nanos}", std::process::id(), hostname())
-}
-
-fn thread_id_stamp() -> String {
-    // A per-acquisition stamp for the private steal path; the exact value doesn't
-    // matter, only that concurrent stealers pick different paths.
-    static COUNTER: AtomicU64 = AtomicU64::new(0);
-    COUNTER.fetch_add(1, Ordering::Relaxed).to_string()
 }
 
 /// Sweep any leftover `<hash>*.tmp` files for one identity (a plaintext token an

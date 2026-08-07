@@ -264,8 +264,10 @@ impl OidcDeviceAuthBuilder {
     /// The bundled [`FileTokenStore`](crate::oidc::FileTokenStore) writes a
     /// plaintext file protected by permissions; **it persists a long-lived refresh
     /// token to disk** — see the [`oidc::token_store`](crate::oidc) security notes.
-    /// Persistence is best-effort: a store failure warns and is otherwise ignored,
-    /// never failing an in-memory sign-in.
+    /// Load/save/clear persistence is best-effort: a failure warns and is otherwise
+    /// ignored, never failing an in-memory sign-in. A failure to acquire a
+    /// cross-process refresh lock is surfaced as retryable instead — refreshing
+    /// without ownership could revoke a rotating refresh-token family.
     pub fn token_store(mut self, store: impl TokenStore + 'static) -> Self {
         self.token_store = Some(Arc::new(store));
         self
@@ -726,12 +728,32 @@ impl OidcDeviceAuth {
             out = Some(self.refresh_under_lock(store.as_ref(), key, &existing));
             Ok(())
         });
-        if let Err(e) = lock_res {
-            warn_persistence("lock", &*e);
+        match out {
+            Some(result) => {
+                // A custom store may report a bookkeeping/release error after it
+                // ran the action. The refresh result is still authoritative.
+                if let Err(e) = lock_res {
+                    warn_persistence("lock", &*e);
+                }
+                result
+            }
+            None => {
+                // Never fall back to an unlocked refresh. Two processes can submit
+                // the same rotating parent token, which reuse-detecting IdPs may
+                // answer by revoking the whole token family.
+                let message = match lock_res {
+                    Err(e) => {
+                        warn_persistence("lock", &*e);
+                        format!(
+                            "Could not acquire the cross-process OIDC refresh lock: {e}. Retry later."
+                        )
+                    }
+                    Ok(()) => "The token store returned without running the coordinated refresh action. Retry later."
+                        .to_string(),
+                };
+                Err(OidcError::network(message))
+            }
         }
-        // The action ran exactly once per the in_lock contract; use its result.
-        // A misbehaving custom store that skipped it degrades to a plain refresh.
-        out.unwrap_or_else(|| self.refresh(&existing))
     }
 
     /// Runs inside the store's cross-process lock: re-read the store (a peer may
