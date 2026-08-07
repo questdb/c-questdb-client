@@ -92,10 +92,10 @@ const DEFAULT_LOCK_STALE: Duration = Duration::from_secs(600);
 /// [`FileTokenStore::with_lock_timings`].
 const MIN_LOCK_STALE: Duration = Duration::from_secs(300);
 
-/// The result of a [`TokenStore`] operation. Load/save/clear persistence is
-/// best-effort. Failure to acquire a refresh-coordination lock is different: it
-/// is surfaced as a retryable token-acquisition error so the refresh never runs
-/// concurrently with another process.
+/// The result of a [`TokenStore`] operation. Lazy-load and fresh-sign-in
+/// persistence is best-effort. Coordination and pre-refresh load/clear failures
+/// are surfaced as retryable token-acquisition errors so a refresh never runs
+/// concurrently or reuses an ambiguously rotated parent.
 pub type TokenStoreResult<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
 // ---------------------------------------------------------------------------
@@ -310,9 +310,10 @@ impl TokenStoreKey {
 /// instance; it does, however, share its backing storage with other processes
 /// (and other language clients), so it must keep a concurrent reader from
 /// observing a half-written entry. A store reports failure by returning `Err`.
-/// Load/save/clear failures are best-effort and non-fatal; a coordination failure
-/// during refresh is retryable and aborts that attempt rather than running it
-/// without mutual exclusion.
+/// Lazy-load and fresh-sign-in persistence failures are best-effort. During a
+/// coordinated refresh, load/clear failures are retryable and abort the attempt:
+/// the client must not submit a refresh token it cannot first make unavailable to
+/// peers.
 ///
 /// **Security — [`load`](Self::load) MUST re-verify identity.** `OidcDeviceAuth`
 /// does not re-check the returned token against `key`; it trusts `load` to only
@@ -330,8 +331,9 @@ pub trait TokenStore: Send + Sync {
     /// Persist (atomically replace) the token for this identity.
     fn save(&self, key: &TokenStoreKey, token: &PersistedToken) -> TokenStoreResult<()>;
 
-    /// Remove any persisted entry for this identity. A no-op when nothing is
-    /// stored.
+    /// Durably remove any persisted entry for this identity. A no-op when nothing
+    /// is stored. After this returns successfully, a later [`load`](Self::load)
+    /// must not return the removed refresh-token parent.
     fn clear(&self, key: &TokenStoreKey) -> TokenStoreResult<()>;
 
     /// Run `action` while holding a cross-process lock scoped to `key`, so a
@@ -661,19 +663,22 @@ impl TokenStore for FileTokenStore {
             let _ = fs::remove_file(&tmp); // clean up the temp on failure
         }
         write_result?;
-        fsync_directory(&self.directory); // best-effort: persist the rename
+        let _ = fsync_directory(&self.directory); // best-effort: persist the rename
         Ok(())
     }
 
     fn clear(&self, key: &TokenStoreKey) -> TokenStoreResult<()> {
-        match fs::remove_file(self.token_file(key)) {
-            Ok(()) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        let removed = match fs::remove_file(self.token_file(key)) {
+            Ok(()) => true,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
             Err(e) => return Err(Box::new(e)),
-        }
+        };
         // Sweep any orphaned sibling temp files holding a now-forgotten credential
         // (a hard crash between the temp write and the rename). Best-effort.
         sweep_orphan_temps(&self.directory, &key.hash());
+        if removed {
+            fsync_directory(&self.directory)?; // make the refresh-parent tombstone durable
+        }
         Ok(())
     }
 
@@ -1039,14 +1044,14 @@ fn restrict_to_owner(_dir: &Path) {
 }
 
 #[cfg(unix)]
-fn fsync_directory(dir: &Path) {
-    if let Ok(f) = File::open(dir) {
-        let _ = f.sync_all();
-    }
+fn fsync_directory(dir: &Path) -> std::io::Result<()> {
+    File::open(dir)?.sync_all()
 }
 
 #[cfg(not(unix))]
-fn fsync_directory(_dir: &Path) {}
+fn fsync_directory(_dir: &Path) -> std::io::Result<()> {
+    Ok(())
+}
 
 #[cfg(not(unix))]
 fn warn_no_posix_perms_once() {

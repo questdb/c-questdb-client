@@ -51,8 +51,9 @@ pub enum OidcErrorKind {
     /// cannot be discovered, or a required argument is missing).
     Config,
 
-    /// A network-level failure while talking to QuestDB or the IdP. The refresh
-    /// token (if any) is still valid, so the caller may retry later.
+    /// A retryable network or refresh-coordination failure. After an ambiguous
+    /// refresh response, the parent token is discarded and a later retry may
+    /// require a fresh interactive sign-in.
     Network,
 
     /// The OAuth 2.0 device authorization grant failed; the IdP

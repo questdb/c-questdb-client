@@ -1298,6 +1298,88 @@ fn auth_with_store(mock: &MockServer, dir: &Path) -> OidcDeviceAuth {
         .expect("build auth with store")
 }
 
+/// An in-memory store whose save path can fail after the refresh parent has been
+/// cleared. The independent mutex models the store's cross-process lock.
+#[derive(Clone, Default)]
+struct FailingSaveStore {
+    token: Arc<std::sync::Mutex<Option<PersistedToken>>>,
+    coordination: Arc<std::sync::Mutex<()>>,
+    fail_save: Arc<AtomicBool>,
+    operations: Arc<std::sync::Mutex<Vec<&'static str>>>,
+}
+
+impl FailingSaveStore {
+    fn seed(&self, token: PersistedToken) {
+        *self.token.lock().unwrap() = Some(token);
+    }
+
+    fn token(&self) -> Option<PersistedToken> {
+        self.token.lock().unwrap().clone()
+    }
+}
+
+impl TokenStore for FailingSaveStore {
+    fn load(&self, _key: &TokenStoreKey) -> TokenStoreResult<Option<PersistedToken>> {
+        self.operations.lock().unwrap().push("load");
+        Ok(self.token())
+    }
+
+    fn save(&self, _key: &TokenStoreKey, token: &PersistedToken) -> TokenStoreResult<()> {
+        self.operations.lock().unwrap().push("save");
+        if self.fail_save.load(Ordering::SeqCst) {
+            return Err(Box::new(std::io::Error::other("injected save failure")));
+        }
+        *self.token.lock().unwrap() = Some(token.clone());
+        Ok(())
+    }
+
+    fn clear(&self, _key: &TokenStoreKey) -> TokenStoreResult<()> {
+        self.operations.lock().unwrap().push("clear");
+        *self.token.lock().unwrap() = None;
+        Ok(())
+    }
+
+    fn in_lock(
+        &self,
+        _key: &TokenStoreKey,
+        action: &mut dyn FnMut() -> TokenStoreResult<()>,
+    ) -> TokenStoreResult<()> {
+        let _guard = self.coordination.lock().unwrap();
+        action()
+    }
+}
+
+fn auth_with_failing_store(
+    mock: &MockServer,
+    store: FailingSaveStore,
+    interactive: bool,
+) -> OidcDeviceAuth {
+    OidcDeviceAuth::builder()
+        .client_id("questdb")
+        .device_authorization_endpoint(mock.url("/device"))
+        .token_endpoint(mock.url("/token"))
+        .scope("openid")
+        .interactive(interactive)
+        .open_browser(false)
+        .sleep_hook(no_sleep())
+        .token_store(store)
+        .build()
+        .expect("build auth with test store")
+}
+
+fn expired_tokens(refresh_token: &str) -> TokenSet {
+    TokenSet {
+        access_token: Some("AT-expired".to_string()),
+        id_token: None,
+        refresh_token: Some(refresh_token.to_string()),
+        expires_at: 1.0,
+        token_type: "Bearer".to_string(),
+        scope: Some("openid".to_string()),
+        sub: None,
+        issued_at: 0.0,
+    }
+}
+
 /// The store key matching `auth_with_store`'s config, for inspecting the file.
 fn key_for(mock: &MockServer) -> TokenStoreKey {
     TokenStoreKey::from_config(
@@ -1389,7 +1471,7 @@ fn restart_resumes_from_persisted_token_without_reprompt() {
 }
 
 #[test]
-fn persist_skips_write_when_refresh_token_unchanged() {
+fn persist_restores_non_rotating_refresh_token_after_consuming_parent() {
     // Non-rotating IdP: the refresh response carries no new refresh_token.
     let device_calls = Arc::new(AtomicUsize::new(0));
     let mock = persistence_mock(Arc::clone(&device_calls), || {
@@ -1411,13 +1493,13 @@ fn persist_skips_write_when_refresh_token_unchanged() {
     let auth2 = auth_with_store(&mock, dir.path());
     assert_eq!(auth2.token().unwrap(), "AT-refreshed");
 
-    // The refresh token did not rotate, so the file was NOT rewritten — it still
-    // holds the (expired) access token, unchanged.
+    // Even though the refresh token did not rotate, it was removed before the
+    // network call and must be restored with the refreshed access token.
     let after = reader.load(&key).unwrap().unwrap();
     assert_eq!(
         after.access_token(),
-        Some("AT-initial"),
-        "a non-rotating refresh must not rewrite the file"
+        Some("AT-refreshed"),
+        "the consumed parent must be restored after a non-rotating refresh"
     );
     assert_eq!(after.refresh_token(), Some("RT-1"));
 }
@@ -1576,18 +1658,34 @@ fn tampered_persisted_token_is_rejected_on_load() {
 }
 
 #[test]
-fn refresh_survives_persisted_entry_without_refresh_token() {
-    // Regression: a persisted entry (untrusted input) can carry a served token but
-    // NO refresh token. When it is re-read inside the coordinated-refresh lock
-    // while the in-memory token still holds a refresh token (so `rt_matches`), the
-    // stale, refresh-token-less peer must NOT become the refresh source — doing so
-    // used to panic in `refresh()` via `.expect("refresh() called without a
-    // refresh token")`, unwinding out of the caller's `token()`/`flush()`. It must
-    // instead refresh with the known-good in-memory token, with no re-prompt.
+fn refresh_refuses_in_memory_fallback_when_persisted_entry_has_no_refresh_token() {
+    // A refresh-token-less peer entry means the in-memory parent is no longer
+    // authoritative. Reusing it could trigger rotating-token reuse detection.
     let device_calls = Arc::new(AtomicUsize::new(0));
-    let mock = persistence_mock(Arc::clone(&device_calls), || {
-        r#"{"access_token":"AT-refreshed","expires_in":300}"#.to_string()
-    });
+    let refresh_calls = Arc::new(AtomicUsize::new(0));
+    let mock = {
+        let device_calls = Arc::clone(&device_calls);
+        let refresh_calls = Arc::clone(&refresh_calls);
+        MockServer::start(move |method, path, body| match (method, path) {
+            ("POST", "/device") => {
+                device_calls.fetch_add(1, Ordering::SeqCst);
+                (200, device_response())
+            }
+            ("POST", "/token") if body.contains("grant_type=refresh_token") => {
+                refresh_calls.fetch_add(1, Ordering::SeqCst);
+                (
+                    200,
+                    r#"{"access_token":"AT-refreshed","expires_in":300}"#.to_string(),
+                )
+            }
+            ("POST", "/token") => (
+                200,
+                r#"{"access_token":"AT-initial","refresh_token":"RT-1","expires_in":300}"#
+                    .to_string(),
+            ),
+            _ => (404, "{}".to_string()),
+        })
+    };
     let dir = TempDir::new().unwrap();
     let key = key_for(&mock);
 
@@ -1612,14 +1710,114 @@ fn refresh_survives_persisted_entry_without_refresh_token() {
     // obtain_tokens enters the coordinated refresh and re-reads the swapped file.
     auth.tokens.lock().unwrap().as_mut().unwrap().expires_at = 1.0;
 
-    // Must NOT panic: the refresh-token-less peer is ignored, the in-memory RT-1 is
-    // used to refresh, and the refreshed token is returned without a re-prompt.
-    assert_eq!(auth.token().unwrap(), "AT-refreshed");
+    let err = auth.token().unwrap_err();
+    assert_eq!(err.kind(), OidcErrorKind::Network);
+    assert!(err.message().contains("has no refresh token"));
+    assert_eq!(refresh_calls.load(Ordering::SeqCst), 0);
     assert_eq!(
         device_calls.load(Ordering::SeqCst),
         1,
-        "must silently refresh with the in-memory token, not re-prompt"
+        "a fail-closed refresh must not re-prompt in the same call"
     );
+    assert_eq!(auth.token_set().unwrap().refresh_token, None);
+}
+
+#[test]
+fn failed_rotated_child_save_leaves_no_reusable_parent() {
+    let refresh_calls = Arc::new(AtomicUsize::new(0));
+    let mock = {
+        let refresh_calls = Arc::clone(&refresh_calls);
+        MockServer::start(move |method, path, body| {
+            if (method, path) == ("POST", "/token") && body.contains("grant_type=refresh_token") {
+                refresh_calls.fetch_add(1, Ordering::SeqCst);
+                return (
+                    200,
+                    r#"{"access_token":"AT-2","refresh_token":"RT-2","expires_in":300}"#
+                        .to_string(),
+                );
+            }
+            (404, "{}".to_string())
+        })
+    };
+    let store = FailingSaveStore::default();
+    store.seed(PersistedToken::new(
+        Some("AT-expired".to_string()),
+        None,
+        Some("RT-1".to_string()),
+        1.0,
+        300.0,
+    ));
+    store.fail_save.store(true, Ordering::SeqCst);
+
+    let auth = auth_with_failing_store(&mock, store.clone(), false);
+    assert_eq!(auth.token().unwrap(), "AT-2");
+    assert_eq!(
+        auth.token_set().unwrap().refresh_token.as_deref(),
+        Some("RT-2")
+    );
+    assert!(
+        store.token().is_none(),
+        "a failed child save must not leave the submitted parent in the store"
+    );
+    assert_eq!(
+        *store.operations.lock().unwrap(),
+        ["load", "load", "clear", "save"],
+        "the parent must be cleared before the refresh result is saved"
+    );
+
+    // Model a peer that loaded RT-1 before the first process consumed it. The
+    // missing store entry proves that its in-memory copy is no longer safe.
+    let stale_peer = auth_with_failing_store(&mock, store.clone(), false);
+    *stale_peer.tokens.lock().unwrap() = Some(expired_tokens("RT-1"));
+    *stale_peer.store_state.lock().unwrap() = StoreState {
+        load_attempted: true,
+        last_persisted_refresh: Some("RT-1".to_string()),
+    };
+    let err = stale_peer.token().unwrap_err();
+    assert_eq!(err.kind(), OidcErrorKind::Network);
+    assert!(err.message().contains("removed by another refresh attempt"));
+    assert_eq!(
+        refresh_calls.load(Ordering::SeqCst),
+        1,
+        "the stale peer replayed a refresh-token parent"
+    );
+    assert_eq!(stale_peer.token_set().unwrap().refresh_token, None);
+}
+
+#[test]
+fn lost_refresh_response_consumes_parent_before_retry() {
+    let refresh_calls = Arc::new(AtomicUsize::new(0));
+    let mock = {
+        let refresh_calls = Arc::clone(&refresh_calls);
+        MockServer::start(move |method, path, body| {
+            if (method, path) == ("POST", "/token") && body.contains("grant_type=refresh_token") {
+                refresh_calls.fetch_add(1, Ordering::SeqCst);
+                return (503, r#"{"error":"temporarily_unavailable"}"#.to_string());
+            }
+            (404, "{}".to_string())
+        })
+    };
+    let store = FailingSaveStore::default();
+    store.seed(PersistedToken::new(
+        Some("AT-expired".to_string()),
+        None,
+        Some("RT-1".to_string()),
+        1.0,
+        300.0,
+    ));
+    let auth = auth_with_failing_store(&mock, store.clone(), false);
+
+    let err = auth.token().unwrap_err();
+    assert_eq!(err.kind(), OidcErrorKind::Network);
+    assert!(store.token().is_none());
+    assert_eq!(auth.token_set().unwrap().refresh_token, None);
+    assert_eq!(refresh_calls.load(Ordering::SeqCst), 1);
+
+    // A transport/server failure can happen after the IdP consumed RT-1. A later
+    // call must require a new sign-in rather than submitting RT-1 again.
+    let err = auth.token().unwrap_err();
+    assert_eq!(err.kind(), OidcErrorKind::InteractionRequired);
+    assert_eq!(refresh_calls.load(Ordering::SeqCst), 1);
 }
 
 #[test]

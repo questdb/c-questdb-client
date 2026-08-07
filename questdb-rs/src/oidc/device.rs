@@ -90,9 +90,9 @@ type NowFn = Arc<dyn Fn() -> Instant + Send + Sync>;
 struct StoreState {
     /// Whether the one-shot lazy load from the store has run.
     load_attempted: bool,
-    /// The refresh token known to be in the store, so a non-rotating refresh can
-    /// skip rewriting the file on the hot path and a replacement sign-in without
-    /// a refresh token can remove the obsolete persisted credential.
+    /// The refresh token last known to be in the store. If it later disappears,
+    /// a peer may have consumed it; the matching in-memory copy must not be used.
+    /// It also avoids redundant writes outside the coordinated-refresh path.
     last_persisted_refresh: Option<String>,
 }
 
@@ -266,10 +266,11 @@ impl OidcDeviceAuthBuilder {
     /// The bundled [`FileTokenStore`](crate::oidc::FileTokenStore) writes a
     /// plaintext file protected by permissions; **it persists a long-lived refresh
     /// token to disk** — see the [`oidc::token_store`](crate::oidc) security notes.
-    /// Load/save/clear persistence is best-effort: a failure warns and is otherwise
-    /// ignored, never failing an in-memory sign-in. A failure to acquire a
-    /// cross-process refresh lock is surfaced as retryable instead — refreshing
-    /// without ownership could revoke a rotating refresh-token family.
+    /// Lazy loads and persistence after a fresh sign-in are best-effort. During a
+    /// coordinated refresh, however, re-reading and removing the persisted parent
+    /// must succeed before it is submitted: otherwise a process could reuse a
+    /// rotating refresh token and revoke the whole token family. Those failures,
+    /// like a failure to acquire the cross-process lock, are surfaced as retryable.
     pub fn token_store(mut self, store: impl TokenStore + 'static) -> Self {
         self.token_store = Some(Arc::new(store));
         self
@@ -554,6 +555,12 @@ impl OidcDeviceAuth {
         self.tokens.lock().unwrap_or_else(|e| e.into_inner())
     }
 
+    fn discard_cached_refresh(&self) {
+        if let Some(cached) = self.lock_tokens().as_mut() {
+            cached.refresh_token = None;
+        }
+    }
+
     fn cached_if_valid(&self) -> Option<TokenSet> {
         let guard = self.lock_tokens();
         let tokens = guard.as_ref()?;
@@ -607,8 +614,9 @@ impl OidcDeviceAuth {
                 // IdPs don't re-issue the id_token on refresh. Fall through to
                 // a fresh sign-in.
                 Ok(_) => {}
-                // Transient failure: the refresh token is still valid, so
-                // propagate rather than re-prompt needlessly.
+                // A retryable transport or persistence failure must not trigger
+                // an unexpected prompt in the same call. The coordinated path
+                // may already have discarded an ambiguously consumed parent.
                 Err(e) if e.kind() == crate::oidc::error::OidcErrorKind::Network => {
                     return Err(e);
                 }
@@ -783,39 +791,74 @@ impl OidcDeviceAuth {
 
     /// Runs inside the store's cross-process lock: re-read the store (a peer may
     /// have refreshed since our load), adopt a fresher valid token and skip the
-    /// network, else refresh with the freshest refresh token and persist on
-    /// rotation.
+    /// network, else consume the freshest persisted refresh token before using it.
+    /// Removing the parent first is a durable tombstone: if the IdP rotates it but
+    /// the response or replacement save is lost, no process can replay the parent.
     fn refresh_under_lock(
         &self,
         store: &dyn TokenStore,
         key: &TokenStoreKey,
         existing: &TokenSet,
     ) -> Result<TokenSet> {
-        let mut current = existing.clone();
-        // Only re-read when our in-memory refresh token still matches what we last
-        // persisted; if they differ a previous save failed and the in-memory token
-        // is newer, so keep it rather than regress to the stale on-disk one.
-        let rt_matches = existing.refresh_token == self.lock_store_state().last_persisted_refresh;
-        if rt_matches
-            && let Ok(Some(persisted)) = store.load(key)
-            && let Some(peer) = self.tokenset_from_persisted(&persisted)
-        {
+        let last_persisted = self.lock_store_state().last_persisted_refresh.clone();
+        let persisted = store.load(key).map_err(|e| {
+            OidcError::network(format!(
+                "Could not re-read the OIDC token store before refresh: {e}. Refusing to reuse a possibly rotated refresh token; retry later."
+            ))
+        })?;
+
+        let (current, current_is_persisted) = if let Some(persisted) = persisted {
+            let peer = self.tokenset_from_persisted(&persisted).ok_or_else(|| {
+                self.discard_cached_refresh();
+                self.lock_store_state().last_persisted_refresh = None;
+                OidcError::network(
+                    "The persisted OIDC token became invalid before refresh. Refusing to reuse a possibly rotated in-memory refresh token; retry or sign in again.",
+                )
+            })?;
             if peer.is_valid(now_epoch(), DEFAULT_SKEW_SECONDS) && self.has_required_token(&peer) {
                 // A peer already refreshed; skip the network.
                 self.lock_store_state().last_persisted_refresh = peer.refresh_token.clone();
                 return Ok(peer);
             }
-            // Adopted but stale: refresh with its (possibly rotated) token — but
-            // only when it actually carries one. A persisted entry is untrusted
-            // input and can hold a served token yet no refresh token; adopting
-            // that as the refresh source would leave `current` with nothing to
-            // send. Keep `existing` in that case (the obtain_tokens gate
-            // guarantees it has a refresh token), so we refresh with the
-            // known-good in-memory token rather than a refresh-token-less peer.
-            if peer.refresh_token.is_some() {
-                current = peer;
+            if peer.refresh_token.is_none() {
+                self.discard_cached_refresh();
+                self.lock_store_state().last_persisted_refresh = None;
+                return Err(OidcError::network(
+                    "The persisted OIDC token has no refresh token. Refusing to fall back to a possibly rotated in-memory refresh token; sign in again.",
+                ));
             }
+            (peer, true)
+        } else {
+            // Absence is meaningful when this instance previously observed the
+            // parent on disk: a peer may have consumed it and failed before saving
+            // its child. Never replay our stale in-memory copy in that case. When
+            // the in-memory token differs (or no parent was known on disk), it is
+            // an unpersisted child from this process and remains the freshest copy.
+            if last_persisted.is_some() && existing.refresh_token == last_persisted {
+                self.discard_cached_refresh();
+                self.lock_store_state().last_persisted_refresh = None;
+                return Err(OidcError::network(
+                    "The persisted OIDC refresh token was removed by another refresh attempt. Refusing to reuse its possibly rotated in-memory copy; retry or sign in again.",
+                ));
+            }
+            (existing.clone(), false)
+        };
+
+        if current_is_persisted {
+            if let Err(e) = store.clear(key) {
+                self.discard_cached_refresh();
+                self.lock_store_state().last_persisted_refresh = None;
+                return Err(OidcError::network(format!(
+                    "Could not consume the persisted OIDC refresh token before use: {e}. Refusing to risk refresh-token reuse; retry later."
+                )));
+            }
+            self.lock_store_state().last_persisted_refresh = None;
         }
+
+        // Once submitted, a transport failure can mean the IdP consumed the
+        // parent and its response was lost. Remove every cached copy before the
+        // request so a later call cannot retry an ambiguous parent.
+        self.discard_cached_refresh();
         let refreshed = self.refresh(&current)?;
         if self.has_required_token(&refreshed) {
             self.persist_if_changed(store, key, &refreshed);
