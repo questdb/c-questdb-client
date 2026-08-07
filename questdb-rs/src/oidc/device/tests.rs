@@ -640,6 +640,31 @@ fn settings_endpoint_sibling_tenant_path_rejected() {
     );
 }
 
+#[test]
+fn settings_endpoint_semicolon_tenant_path_rejected() {
+    for suffix in [";tenant=evil", "%3Btenant=evil"] {
+        let settings = settings_advertising(
+            &format!("https://idp.example.com/realms/prod{suffix}/token"),
+            &format!("https://idp.example.com/realms/prod{suffix}/device"),
+        );
+        let mock = MockServer::start(move |method, path, _body| match (method, path) {
+            ("GET", "/settings") => (200, settings.clone()),
+            _ => (404, "{}".to_string()),
+        });
+        let err = OidcDeviceAuth::from_questdb(mock.url(""))
+            .issuer("https://idp.example.com/realms/prod")
+            .allow_insecure_transport(true)
+            .build()
+            .unwrap_err();
+        assert_eq!(err.kind(), OidcErrorKind::Config);
+        assert!(
+            err.message().contains("different tenant"),
+            "expected {suffix:?} path-pin rejection, got: {}",
+            err.message()
+        );
+    }
+}
+
 // -- IdP .well-known discovery + plaintext-channel guard ---------------------
 
 /// A `/settings` response advertising only the client id (no endpoints), so the

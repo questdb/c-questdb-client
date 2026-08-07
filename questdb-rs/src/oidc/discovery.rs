@@ -219,8 +219,8 @@ pub(crate) fn validate_endpoint_origins(
 /// True if `endpoint`'s path is the issuer's path or a sub-path of it.
 ///
 /// Segment-aware, so `/realms/prod` does not match `/realms/production`. A root
-/// issuer (no path) constrains the origin only and matches any path. Compared on
-/// fully percent-decoded, matrix-param-stripped segments; a `.` / `..` /
+/// issuer (no path) constrains the origin only and matches any unambiguous path.
+/// Compared on complete, fully percent-decoded segments; a `.` / `..` / semicolon /
 /// still-encoded / non-ASCII / control segment is rejected outright, so a
 /// tampered `/settings` can't redirect credentials to a different tenant on a
 /// path-based multi-tenant IdP (e.g. Keycloak `https://host/realms/{realm}`).
@@ -228,37 +228,29 @@ pub(crate) fn endpoint_path_under_issuer(endpoint: &str, issuer: &str) -> bool {
     let Ok(issuer_uri) = issuer.parse::<Uri>() else {
         return false;
     };
-    let base = issuer_uri.path().trim_end_matches('/');
-    if base.is_empty() {
-        return true;
-    }
-    let base_segs: Vec<String> = decode_path_segments(base)
-        .iter()
-        .map(|s| strip_matrix_params(s))
-        .collect();
     let Ok(ep_uri) = endpoint.parse::<Uri>() else {
         return false;
     };
-    // Validate + normalize each endpoint segment. The fail-closed checks run on
-    // the decoded, *un-trimmed* segment: trimming first (as `strip_matrix_params`
-    // does) would silently drop a trailing whitespace-class byte, so a
+    let base = issuer_uri.path().trim_end_matches('/');
+    let base_segs = decode_path_segments(base);
+    let ep_segs = decode_path_segments(ep_uri.path());
+    // Validate complete decoded issuer and endpoint segments. Trimming would
+    // silently drop a trailing whitespace-class byte, so a
     // percent-encoded space / tab / newline (`prod%20`, `%09`, `%0a`) would
     // decode to `prod␠`, trim back to `prod`, and match issuer segment `prod`
     // even though a server that routes `prod␠` as a distinct tenant would send
     // the request to a different realm — defeating this very pin.
-    let mut ep_segs: Vec<String> = Vec::new();
-    for raw in decode_path_segments(ep_uri.path()) {
-        // `;`-matrix strip only; no trim, so the checks below see every byte.
-        let seg = raw.split(';').next().unwrap_or("");
+    for seg in base_segs.iter().chain(&ep_segs) {
         // A `.` / `..` (the server normalizes it away, so a naive prefix test
         // passes yet the real path differs), a residual `%` (did not fully
         // decode — a server may decode it further to a dot-segment), a non-ASCII
-        // segment (a homoglyph dot could NFKC-fold to a real `..`), a control
-        // char, or leading/trailing whitespace (ambiguous — a server may or may
-        // not trim it, so `prod ` vs `prod` is exactly the tenant confusion this
-        // pin must prevent) all fail closed.
+        // segment (a homoglyph dot could NFKC-fold to a real `..`), a semicolon
+        // (servers disagree whether its suffix is path data or a removable matrix
+        // parameter), a control char, or leading/trailing whitespace (also
+        // ambiguously normalized) all fail closed.
         if seg == "."
             || seg == ".."
+            || seg.contains(';')
             || seg.contains('%')
             || !seg.is_ascii()
             || has_control_char(seg)
@@ -266,7 +258,9 @@ pub(crate) fn endpoint_path_under_issuer(endpoint: &str, issuer: &str) -> bool {
         {
             return false;
         }
-        ep_segs.push(seg.to_string());
+    }
+    if base.is_empty() {
+        return true;
     }
     ep_segs.len() >= base_segs.len() && ep_segs[..base_segs.len()] == base_segs[..]
 }
@@ -315,12 +309,6 @@ fn hex_val(b: u8) -> Option<u8> {
         b'A'..=b'F' => Some(b - b'A' + 10),
         _ => None,
     }
-}
-
-/// Reduce a decoded path segment the way a server normalizes it before
-/// dot-segment removal: drop a `;` matrix-parameter suffix and trim whitespace.
-fn strip_matrix_params(segment: &str) -> String {
-    segment.split(';').next().unwrap_or("").trim().to_string()
 }
 
 fn has_control_char(segment: &str) -> bool {
@@ -779,6 +767,28 @@ mod tests {
         assert!(!endpoint_path_under_issuer(
             "https://host/realms/%20prod/token",
             "https://host/realms/prod"
+        ));
+    }
+
+    #[test]
+    fn issuer_path_pin_rejects_semicolon_variant_tenant() {
+        // A semicolon suffix is not universally a removable matrix parameter.
+        // The URL used for the request remains unchanged, so a server or proxy
+        // may route either spelling to a tenant distinct from `prod`.
+        for endpoint in [
+            "https://host/realms/prod;tenant=evil/token",
+            "https://host/realms/prod%3Btenant=evil/token",
+        ] {
+            assert!(
+                !endpoint_path_under_issuer(endpoint, "https://host/realms/prod"),
+                "endpoint {endpoint} must not pass the issuer-path pin"
+            );
+        }
+        // Apply the ambiguity rule to the trusted side too instead of silently
+        // normalizing two semicolon-bearing segments into a match.
+        assert!(!endpoint_path_under_issuer(
+            "https://host/realms/prod;tenant=evil/token",
+            "https://host/realms/prod;tenant=evil"
         ));
     }
 
