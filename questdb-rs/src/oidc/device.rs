@@ -90,8 +90,9 @@ type NowFn = Arc<dyn Fn() -> Instant + Send + Sync>;
 struct StoreState {
     /// Whether the one-shot lazy load from the store has run.
     load_attempted: bool,
-    /// The refresh token last written to the store, so a non-rotating refresh
-    /// can skip rewriting the file on the hot path.
+    /// The refresh token known to be in the store, so a non-rotating refresh can
+    /// skip rewriting the file on the hot path and a replacement sign-in without
+    /// a refresh token can remove the obsolete persisted credential.
     last_persisted_refresh: Option<String>,
 }
 
@@ -793,13 +794,15 @@ impl OidcDeviceAuth {
         }
         let refreshed = self.refresh(&current)?;
         if self.has_required_token(&refreshed) {
-            self.save_if_rotated(store, key, &refreshed);
+            self.persist_if_changed(store, key, &refreshed);
         }
         Ok(refreshed)
     }
 
-    /// Persist a fresh interactive sign-in (a new refresh token), wrapping the
-    /// save in the store's lock so it serialises against a concurrent clear.
+    /// Persist a fresh interactive sign-in (a new refresh token), or remove the
+    /// superseded persisted credential when the IdP issues no refresh token.
+    /// Wrap the change in the store's lock so it serialises against a concurrent
+    /// save or clear.
     fn persist_fresh(&self, tokens: &TokenSet) {
         let (Some(store), Some(key)) = (self.token_store.as_ref(), self.store_key.as_ref()) else {
             return;
@@ -807,7 +810,7 @@ impl OidcDeviceAuth {
         let store = Arc::clone(store);
         let tokens = tokens.clone();
         let outcome = store.in_lock(key, &mut || {
-            self.save_if_rotated(store.as_ref(), key, &tokens);
+            self.persist_if_changed(store.as_ref(), key, &tokens);
             Ok(())
         });
         if let Err(e) = outcome {
@@ -815,17 +818,25 @@ impl OidcDeviceAuth {
         }
     }
 
-    /// Save to the store only when the refresh token is new or rotated; skip when
-    /// unchanged (the on-disk entry is still valid) so the hot refresh path
-    /// doesn't rewrite the file. Must be called with the store lock held.
-    fn save_if_rotated(&self, store: &dyn TokenStore, key: &TokenStoreKey, tokens: &TokenSet) {
+    /// Save when the refresh token is new or rotated; skip when unchanged so the
+    /// hot refresh path does not rewrite the file. If a replacement interactive
+    /// sign-in has no refresh token, clear the credential it superseded so a
+    /// restart cannot retry a refresh token the IdP already rejected. Must be
+    /// called with the store lock held.
+    fn persist_if_changed(&self, store: &dyn TokenStore, key: &TokenStoreKey, tokens: &TokenSet) {
         let rt = tokens.refresh_token.clone();
         if rt == self.lock_store_state().last_persisted_refresh {
             return; // not rotated; nothing to write
         }
-        // With no refresh token there's nothing worth persisting (a restart
-        // couldn't resume from it anyway).
+        // With no replacement refresh token there is nothing worth saving, but a
+        // previously persisted one is now obsolete and must not survive restart.
         if rt.is_none() {
+            match store.clear(key) {
+                Ok(()) => {
+                    self.lock_store_state().last_persisted_refresh = None;
+                }
+                Err(e) => warn_persistence("clear", &*e),
+            }
             return;
         }
         match store.save(key, &snapshot(tokens)) {

@@ -1406,6 +1406,80 @@ fn persist_rewrites_when_refresh_token_rotates() {
 }
 
 #[test]
+fn replacement_without_refresh_token_clears_rejected_persisted_token() {
+    let device_calls = Arc::new(AtomicUsize::new(0));
+    let device_token_calls = Arc::new(AtomicUsize::new(0));
+    let refresh_calls = Arc::new(AtomicUsize::new(0));
+    let mock = {
+        let device_calls = Arc::clone(&device_calls);
+        let device_token_calls = Arc::clone(&device_token_calls);
+        let refresh_calls = Arc::clone(&refresh_calls);
+        MockServer::start(move |method, path, body| match (method, path) {
+            ("POST", "/device") => {
+                device_calls.fetch_add(1, Ordering::SeqCst);
+                (200, device_response())
+            }
+            ("POST", "/token") if body.contains("grant_type=refresh_token") => {
+                let attempt = refresh_calls.fetch_add(1, Ordering::SeqCst);
+                if attempt == 0 {
+                    // The first process learns that the persisted token is no
+                    // longer usable and falls back to a replacement device flow.
+                    (400, r#"{"error":"invalid_grant"}"#.to_string())
+                } else {
+                    // If the rejected token survives on disk, the restarted
+                    // process stops here with a retryable error instead of
+                    // reaching its device flow.
+                    (503, r#"{"error":"temporarily_unavailable"}"#.to_string())
+                }
+            }
+            ("POST", "/token") => {
+                let attempt = device_token_calls.fetch_add(1, Ordering::SeqCst);
+                if attempt == 0 {
+                    (
+                        200,
+                        r#"{"access_token":"AT-initial","refresh_token":"RT-rejected","expires_in":300}"#
+                            .to_string(),
+                    )
+                } else {
+                    // The replacement and post-restart flows deliberately issue
+                    // no refresh token.
+                    (
+                        200,
+                        format!(r#"{{"access_token":"AT-device-{attempt}","expires_in":300}}"#),
+                    )
+                }
+            }
+            _ => (404, "{}".to_string()),
+        })
+    };
+    let dir = TempDir::new().unwrap();
+    let reader = FileTokenStore::at(dir.path());
+    let key = key_for(&mock);
+
+    let auth = auth_with_store(&mock, dir.path());
+    assert_eq!(auth.token().unwrap(), "AT-initial");
+    expire_persisted(dir.path(), &key);
+    auth.tokens.lock().unwrap().as_mut().unwrap().expires_at = 1.0;
+
+    // The rejected refresh falls back to a successful device flow without a
+    // replacement refresh token. That flow supersedes the persisted credential.
+    assert_eq!(auth.token().unwrap(), "AT-device-1");
+    assert!(
+        reader.load(&key).unwrap().is_none(),
+        "the rejected persisted refresh token survived its replacement sign-in"
+    );
+    drop(auth);
+
+    // A new process must start a device flow instead of retrying RT-rejected. The
+    // mock's second refresh response is transient, so this unwrap also proves a
+    // stale retry cannot block the fallback.
+    let restarted = auth_with_store(&mock, dir.path());
+    assert_eq!(restarted.token().unwrap(), "AT-device-2");
+    assert_eq!(refresh_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(device_calls.load(Ordering::SeqCst), 3);
+}
+
+#[test]
 fn clear_deletes_the_persisted_entry() {
     let device_calls = Arc::new(AtomicUsize::new(0));
     let mock = persistence_mock(Arc::clone(&device_calls), || {
