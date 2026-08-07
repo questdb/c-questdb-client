@@ -575,6 +575,39 @@ struct BackpressureNotifier {
 const DEFAULT_APPEND_DEADLINE: Duration = Duration::from_secs(30);
 const BACKPRESSURE_PARK: Duration = Duration::from_micros(50);
 
+/// Run a background publication worker behind an unwind boundary. Provider
+/// callbacks have their own narrower guard so they can be retried; this is the
+/// last-resort invariant guard for any other panic in an unwind-enabled build.
+/// A vanished worker must never leave the publication lifecycle open or a
+/// backpressured publisher asleep indefinitely.
+fn run_qwp_ws_worker_guarded<Q, F>(
+    shared: &Arc<Mutex<QwpWsPublicationStore<Q>>>,
+    backpressure: &BackpressureNotifier,
+    worker: F,
+) where
+    Q: PublicationLog,
+    F: FnOnce(),
+{
+    if std::panic::catch_unwind(std::panic::AssertUnwindSafe(worker)).is_ok() {
+        return;
+    }
+
+    let mut store = match shared.lock() {
+        Ok(store) => store,
+        // A panic while the worker held the publication lock poisons it. The
+        // guard is still valid after unwind and must be used to close the
+        // lifecycle before any producer can publish another frame.
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    store.mark_terminal(Some(error::fmt!(
+        SocketError,
+        "QWP/WebSocket background worker panicked and stopped"
+    )));
+    drop(store);
+    backpressure.notify_all();
+    log::error!("QWP/WebSocket background worker panicked; publication was terminalized");
+}
+
 impl<Q> SyncQwpWsRunner<Q>
 where
     Q: PublicationLog + Send + 'static,
@@ -626,21 +659,23 @@ where
         let thread_stop = Arc::clone(&stop);
         let thread_lifecycle = lifecycle.clone();
         let thread = thread::spawn(move || {
-            let mut core = SyncQwpWsRunnerCore {
-                send_core,
-                progress,
-                cold_effects: VecDeque::new(),
-                backpressure: thread_backpressure,
-                ok_completed_upper: thread_ok_completed_upper,
-                lifecycle: thread_lifecycle,
-            };
-            while !thread_stop.load(Ordering::Acquire) {
-                match core.drive_step(&thread_shared, &thread_stop) {
-                    RunnerStep::Idle => thread::sleep(Duration::from_micros(50)),
-                    RunnerStep::Continue => {}
-                    RunnerStep::Stop => break,
+            run_qwp_ws_worker_guarded(&thread_shared, &thread_backpressure, || {
+                let mut core = SyncQwpWsRunnerCore {
+                    send_core,
+                    progress,
+                    cold_effects: VecDeque::new(),
+                    backpressure: Arc::clone(&thread_backpressure),
+                    ok_completed_upper: thread_ok_completed_upper,
+                    lifecycle: thread_lifecycle,
                 };
-            }
+                while !thread_stop.load(Ordering::Acquire) {
+                    match core.drive_step(&thread_shared, &thread_stop) {
+                        RunnerStep::Idle => thread::sleep(Duration::from_micros(50)),
+                        RunnerStep::Continue => {}
+                        RunnerStep::Stop => break,
+                    };
+                }
+            });
         });
 
         Self {
@@ -680,21 +715,23 @@ where
         let thread_stop = Arc::clone(&stop);
         let thread_lifecycle = lifecycle.clone();
         let thread = thread::spawn(move || {
-            let mut core = SyncQwpWsPendingRunnerCore {
-                connected: None,
-                pending_connect,
-                progress,
-                backpressure: thread_backpressure,
-                ok_completed_upper: thread_ok_completed_upper,
-                lifecycle: thread_lifecycle,
-            };
-            while !thread_stop.load(Ordering::Acquire) {
-                match core.drive_step(&thread_shared, &thread_stop) {
-                    RunnerStep::Idle => thread::sleep(Duration::from_micros(50)),
-                    RunnerStep::Continue => {}
-                    RunnerStep::Stop => break,
+            run_qwp_ws_worker_guarded(&thread_shared, &thread_backpressure, || {
+                let mut core = SyncQwpWsPendingRunnerCore {
+                    connected: None,
+                    pending_connect,
+                    progress,
+                    backpressure: Arc::clone(&thread_backpressure),
+                    ok_completed_upper: thread_ok_completed_upper,
+                    lifecycle: thread_lifecycle,
                 };
-            }
+                while !thread_stop.load(Ordering::Acquire) {
+                    match core.drive_step(&thread_shared, &thread_stop) {
+                        RunnerStep::Idle => thread::sleep(Duration::from_micros(50)),
+                        RunnerStep::Continue => {}
+                        RunnerStep::Stop => break,
+                    };
+                }
+            });
         });
 
         Self {
@@ -5342,6 +5379,34 @@ mod tests {
     }
 
     #[derive(Debug)]
+    struct PanicAfterSendTransport {
+        sent: mpsc::Sender<()>,
+        trigger_panic: mpsc::Receiver<()>,
+        frame_sent: bool,
+    }
+
+    impl QwpWsCoreTransport for PanicAfterSendTransport {
+        fn try_poll_response(&mut self) -> Result<TransportPoll, TransportFailure> {
+            if self.frame_sent {
+                self.trigger_panic
+                    .recv_timeout(Duration::from_secs(5))
+                    .unwrap();
+                panic!("synthetic worker panic");
+            }
+            Ok(TransportPoll::Idle)
+        }
+
+        fn send_frame(
+            &mut self,
+            _frame: OutboundFrameView<'_>,
+        ) -> Result<TransportSendResult, TransportFailure> {
+            self.frame_sent = true;
+            self.sent.send(()).unwrap();
+            Ok(TransportSendResult::NoResponse)
+        }
+    }
+
+    #[derive(Debug)]
     struct AckWhenReadyTransport {
         ack_ready: Arc<AtomicBool>,
         sent_frames: Vec<SentFrame>,
@@ -5447,6 +5512,55 @@ mod tests {
         });
 
         release_send_tx.send(()).unwrap();
+        drop(runner);
+    }
+
+    #[test]
+    fn threaded_runner_panic_terminalizes_and_wakes_backpressured_publisher() {
+        let (sent_tx, sent_rx) = mpsc::channel();
+        let (panic_tx, panic_rx) = mpsc::channel();
+        let queue = memory_queue(1024, 1);
+        let transport = PanicAfterSendTransport {
+            sent: sent_tx,
+            trigger_panic: panic_rx,
+            frame_sent: false,
+        };
+        let driver = QwpWsCoreTestHarness::from_queue(queue, transport);
+        let mut runner =
+            SyncQwpWsRunner::start_driver_with_append_deadline(driver, Duration::from_secs(5));
+
+        runner.publish_replay_payload(b"first").unwrap();
+        sent_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+
+        std::thread::scope(|scope| {
+            let (published_tx, published_rx) = mpsc::channel();
+            let runner = &mut runner;
+            let publish_thread = scope.spawn(move || {
+                let result = runner.publish_replay_payload(b"second");
+                let _ = published_tx.send(result.map(|_| ()));
+            });
+
+            assert!(
+                published_rx
+                    .recv_timeout(Duration::from_millis(50))
+                    .is_err(),
+                "second publication should be waiting for queue capacity"
+            );
+            panic_tx.send(()).unwrap();
+            let err = published_rx
+                .recv_timeout(Duration::from_secs(5))
+                .unwrap()
+                .unwrap_err();
+            assert_eq!(err.code(), crate::ErrorCode::SocketError);
+            assert!(
+                err.msg().contains("background worker panicked"),
+                "got: {}",
+                err.msg()
+            );
+            publish_thread.join().unwrap();
+        });
+
+        assert!(runner.lifecycle_is_terminal());
         drop(runner);
     }
 

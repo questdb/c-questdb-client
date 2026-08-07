@@ -1650,7 +1650,10 @@ impl SenderBuilder {
     /// the reconnect loop because the callback may recover on its next invocation;
     /// already accepted store-and-forward frames remain queued. A server rejection
     /// of a successfully acquired token is a separate terminal authentication
-    /// error. Mutually exclusive with [`username`](Self::username) /
+    /// error. In unwind-enabled builds, a callback panic is contained and treated
+    /// as a retryable provider failure; a process built with `panic = "abort"`
+    /// cannot contain panics, so providers must not rely on this as their normal
+    /// error path. Mutually exclusive with [`username`](Self::username) /
     /// [`password`](Self::password) / [`token`](Self::token); QWP/WebSocket only.
     ///
     /// **Use [`Protocol::Wss`]** (TLS): the

@@ -62,7 +62,15 @@ impl TokenProvider {
     /// refresh attempt failed. Server authentication rejections remain separate
     /// terminal `AuthError`s because they occur after this method succeeds.
     pub(crate) fn bearer_header(&self) -> crate::Result<String> {
-        let token = (self.0)().map_err(classify_provider_error)?;
+        let provided = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| (self.0)()))
+            .map_err(|_| {
+                crate::error::fmt!(
+                    SocketError,
+                    "The token provider panicked while acquiring a Bearer token; \
+                     it will be polled again on the next connection attempt."
+                )
+            })?;
+        let token = provided.map_err(classify_provider_error)?;
         if !crate::is_printable_ascii_token(&token) {
             return Err(crate::error::fmt!(
                 SocketError,
@@ -148,5 +156,27 @@ mod tests {
             blank.bearer_header().unwrap_err().code(),
             ErrorCode::SocketError
         );
+    }
+
+    #[test]
+    fn provider_panic_is_retryable_and_provider_is_polled_again() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let provider = TokenProvider::new({
+            let calls = Arc::clone(&calls);
+            move || {
+                if calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                    panic!("synthetic provider panic");
+                }
+                Ok::<_, crate::Error>("recovered-token".to_string())
+            }
+        });
+
+        let err = provider.bearer_header().unwrap_err();
+        assert_eq!(err.code(), crate::ErrorCode::SocketError);
+        assert!(err.msg().contains("token provider panicked"));
+        assert_eq!(provider.bearer_header().unwrap(), "Bearer recovered-token");
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
     }
 }

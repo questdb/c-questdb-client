@@ -1077,6 +1077,8 @@ impl ReaderConfig {
     /// rejected, and a provider error fails that connection attempt. Provider
     /// acquisition failures are retryable because the callback may recover on its
     /// next invocation; a server rejection of an acquired token remains terminal.
+    /// In unwind-enabled builds, a callback panic is contained and treated as a
+    /// retryable provider failure; `panic = "abort"` builds cannot contain panics.
     /// Use TLS (`wss://`) so the bearer credential isn't sent in cleartext.
     ///
     /// ```no_run
