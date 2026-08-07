@@ -25,7 +25,7 @@
 //! The OAuth 2.0 device authorization grant (RFC 8628) token manager.
 
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, TryLockError};
 use std::time::{Duration, Instant};
 
 use serde_json::Value;
@@ -247,9 +247,11 @@ impl OidcDeviceAuthBuilder {
 
     /// Use a custom [`Renderer`] for the device-code prompt (default:
     /// [`TerminalRenderer`]). Its callbacks run while the acquisition lock is held,
-    /// so they must not re-enter this instance's [`token`](OidcDeviceAuth::token) /
-    /// [`sign_in`](OidcDeviceAuth::sign_in) / [`clear`](OidcDeviceAuth::clear), or
-    /// they deadlock.
+    /// so they must not re-enter this instance's [`sign_in`](OidcDeviceAuth::sign_in)
+    /// or [`clear`](OidcDeviceAuth::clear), or they deadlock. A re-entrant
+    /// [`token`](OidcDeviceAuth::token) call fails with
+    /// [`InteractionRequired`](crate::oidc::OidcErrorKind::InteractionRequired)
+    /// instead of waiting for the prompt to finish.
     pub fn renderer(mut self, renderer: impl Renderer + 'static) -> Self {
         self.renderer = Some(Box::new(renderer));
         self
@@ -359,16 +361,15 @@ impl OidcDeviceAuthBuilder {
     }
 }
 
-/// Acquires and silently refreshes an OIDC token via the device authorization
-/// grant (RFC 8628).
+/// Acquires and silently refreshes an OIDC token obtained through the device
+/// authorization grant (RFC 8628).
 ///
-/// Most users call [`token`](Self::token) (or build a sender with a token
-/// provider). The first call runs the interactive device flow; later calls
-/// return the cached token. Once it nears expiry it is refreshed silently when
-/// the IdP issued a refresh token (request the `offline_access` scope — see the
-/// [module docs](crate::oidc)), otherwise a fresh interactive sign-in is run.
-/// Acquisition is serialized so concurrent callers don't double-prompt, while a
-/// valid cached token is returned without blocking on another's sign-in.
+/// Call [`sign_in`](Self::sign_in) explicitly to run the interactive device flow.
+/// [`token`](Self::token) never prompts: it returns a valid cached or persisted
+/// token, silently refreshes one when possible, and otherwise returns
+/// [`InteractionRequired`](crate::oidc::OidcErrorKind::InteractionRequired).
+/// This keeps transport callbacks from unexpectedly starting interactive work
+/// during a flush or background reconnect.
 ///
 /// Token state is in-memory only unless a
 /// [`token_store`](OidcDeviceAuthBuilder::token_store) is configured; with one, a
@@ -376,15 +377,13 @@ impl OidcDeviceAuthBuilder {
 ///
 /// # Concurrency
 ///
-/// The acquisition lock is held for a whole interactive sign-in: a caller with a
-/// *valid* cached token never blocks, but one whose token is missing/expired
-/// waits behind the signer. When sharing an instance across threads (e.g. a
-/// long-lived sender), call [`sign_in`](Self::sign_in) once up front. A custom
-/// [`Renderer`]'s callbacks (and the `sleep` hook) run while this lock is held.
-/// They must not re-enter the same instance — directly via
-/// [`token`](Self::token) / [`sign_in`](Self::sign_in) / [`clear`](Self::clear),
-/// or indirectly by flushing a sender whose token provider calls back into it —
-/// because the lock is not re-entrant and the call would deadlock.
+/// The acquisition lock is held for a whole interactive sign-in. A caller with a
+/// valid cached token remains lock-free; a [`token`](Self::token) call with no
+/// valid token fails with `InteractionRequired` rather than waiting behind an
+/// in-progress sign-in. A custom [`Renderer`]'s callbacks (and the `sleep` hook)
+/// run while this lock is held. They must not re-enter [`sign_in`](Self::sign_in)
+/// or [`clear`](Self::clear) on the same instance because that lock is not
+/// re-entrant. Re-entrant `token()` calls fail instead of deadlocking.
 pub struct OidcDeviceAuth {
     config: OidcConfig,
     http: HttpClient,
@@ -439,11 +438,20 @@ impl OidcDeviceAuth {
         &self.config
     }
 
-    /// Return a valid token for QuestDB, acquiring or refreshing as needed.
+    /// Return a valid token for QuestDB without starting an interactive prompt.
     ///
     /// Returns the `id_token` when the server expects groups encoded in the
     /// token (`acl.oidc.groups.encoded.in.token=true`), else the `access_token`
-    /// — mirroring QuestDB's own selection.
+    /// — mirroring QuestDB's own selection. This may load persisted state or
+    /// perform a silent refresh. If no usable cached/persisted token or refresh
+    /// token is available, it returns
+    /// [`InteractionRequired`](crate::oidc::OidcErrorKind::InteractionRequired);
+    /// call [`sign_in`](Self::sign_in) explicitly on a suitable UI thread.
+    ///
+    /// If another acquisition is already in progress and no valid cached token
+    /// is available, this returns `InteractionRequired` immediately rather than
+    /// waiting behind a potentially long-running interactive sign-in. This makes
+    /// it safe to use as a synchronous or background transport token provider.
     pub fn token(&self) -> Result<String> {
         // HTTP providers call this once per flush. On the overwhelmingly common
         // cache hit, clone only the credential being returned rather than every
@@ -451,7 +459,7 @@ impl OidcDeviceAuth {
         if let Some(token) = self.cached_selected_if_valid() {
             return token;
         }
-        let tokens = self.obtain_tokens()?;
+        let tokens = self.obtain_tokens(false)?;
         self.select(&tokens)
     }
 
@@ -465,25 +473,53 @@ impl OidcDeviceAuth {
     /// Call this once up front when sharing the instance across threads, so the
     /// interactive prompt runs on the main thread rather than on a busy worker.
     pub fn sign_in(&self) -> Result<()> {
-        self.obtain_tokens().map(|_| ())
+        self.obtain_tokens(true).map(|_| ())
     }
 
-    /// Forget the cached token, forcing a fresh sign-in next time. Resets the
-    /// local cache (and any persisted [`TokenStore`] entry) only — it does not
-    /// revoke the token at the IdP.
+    /// Best-effort form of [`try_clear`](Self::try_clear).
+    ///
+    /// This always forgets the in-memory token. A persisted-store deletion
+    /// failure is logged because this compatibility method cannot report it;
+    /// use [`try_clear`](Self::try_clear) when the caller must know whether the
+    /// persisted credential was actually deleted.
     pub fn clear(&self) {
+        if let Err(error) = self.try_clear() {
+            log::warn!("questdb oidc: {error}");
+        }
+    }
+
+    /// Forget the cached token and delete any persisted [`TokenStore`] entry.
+    ///
+    /// The in-memory token is cleared even if persistence deletion fails. On
+    /// success, an explicit [`sign_in`](Self::sign_in) is required before a new
+    /// token can be served. On failure, this returns a
+    /// [`Network`](crate::oidc::OidcErrorKind::Network) error because the token
+    /// may still be usable by a new auth instance or after process restart.
+    ///
+    /// This only deletes local client credentials; it does **not** revoke access,
+    /// ID, or refresh tokens at the identity provider.
+    pub fn try_clear(&self) -> Result<()> {
         let _acq = self.lock_acquire();
         *self.lock_tokens() = None;
         self.lock_store_state().last_persisted_refresh = None;
+        let mut clear_error = None;
         if let (Some(store), Some(key)) = (self.token_store.as_ref(), self.store_key.as_ref()) {
             // Delete under the per-identity lock so it serialises against a peer's
             // in-flight save (which writes under the same lock).
             let outcome = store.in_lock(key, &mut || store.clear(key));
             if let Err(e) = outcome {
-                warn_persistence("clear", &*e);
+                clear_error = Some(OidcError::network(format!(
+                    "Failed to delete persisted OIDC credentials: {e}"
+                )));
             }
-            // Don't reload the file we just deleted on the next call.
+            // Don't reload the credential into this auth after clear was
+            // requested, even when deletion failed. A new auth/restart may still
+            // observe it, which is why that failure is returned to the caller.
             self.lock_store_state().load_attempted = true;
+        }
+        match clear_error {
+            Some(error) => Err(error),
+            None => Ok(()),
         }
     }
 
@@ -584,14 +620,29 @@ impl OidcDeviceAuth {
         }
     }
 
-    fn obtain_tokens(&self) -> Result<TokenSet> {
+    fn obtain_tokens(&self, allow_interaction: bool) -> Result<TokenSet> {
         // Fast path: a valid cached token never blocks behind another sign-in.
         if let Some(tokens) = self.cached_if_valid() {
             return Ok(tokens);
         }
         // Slow path: serialize acquisition so concurrent callers don't overlap
-        // refreshes or double-prompt.
-        let _acq = self.lock_acquire();
+        // refreshes or double-prompt. A transport-facing token lookup must not
+        // queue behind an explicit device flow, whose lifetime can be 30 minutes.
+        let _acq = if allow_interaction {
+            self.lock_acquire()
+        } else {
+            match self.acquire.try_lock() {
+                Ok(guard) => guard,
+                Err(TryLockError::Poisoned(error)) => error.into_inner(),
+                Err(TryLockError::WouldBlock) => {
+                    return Err(OidcError::interaction_required(
+                        "No usable OIDC token is currently available and another token \
+                         acquisition is already in progress. Retry after it finishes or call \
+                         sign_in() explicitly before starting the transport.",
+                    ));
+                }
+            }
+        };
         // Seed the cache from the persisted store once, so a restart resumes from
         // a saved refresh token instead of re-prompting (a no-op without a store).
         self.maybe_load_from_store();
@@ -630,6 +681,12 @@ impl OidcDeviceAuth {
         // also covers a cached token that had no refresh token to begin with
         // (which skips the block above entirely).
         *self.lock_tokens() = None;
+        if !allow_interaction {
+            return Err(OidcError::interaction_required(
+                "No usable cached or refreshable OIDC token is available. Call sign_in() \
+                 explicitly before starting the transport.",
+            ));
+        }
         let fresh = self.run_device_flow()?;
         *self.lock_tokens() = Some(fresh.clone());
         // Persist the fresh sign-in (a new refresh token) for the next restart.
@@ -943,7 +1000,7 @@ impl OidcDeviceAuth {
         let resp = self.request_device_code()?;
         self.renderer.on_prompt(&resp.challenge);
         if self.open_browser
-            && let Some(target) = resp.challenge.safe_target()
+            && let Some(target) = resp.challenge.browser_target()
         {
             maybe_open_browser(&target);
         }

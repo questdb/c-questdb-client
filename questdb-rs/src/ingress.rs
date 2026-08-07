@@ -1566,8 +1566,8 @@ impl SenderBuilder {
     /// Unlike [`token`](Self::token), which captures a fixed token once, the
     /// provider is called on each flush, so a long-lived sender keeps working as
     /// the token silently refreshes / rotates. Pass
-    /// [`OidcDeviceAuth::token`](crate::oidc::OidcDeviceAuth::token) here for
-    /// interactive OIDC sign-in:
+    /// [`OidcDeviceAuth::token`](crate::oidc::OidcDeviceAuth::token) here after an
+    /// explicit sign-in:
     ///
     /// ```no_run
     /// # #[cfg(feature = "oidc")] {
@@ -1600,18 +1600,12 @@ impl SenderBuilder {
     ///
     /// The provider runs **synchronously on the flush path**, so it must not
     /// block indefinitely. [`OidcDeviceAuth::token`](crate::oidc::OidcDeviceAuth::token)
-    /// returns the cached token without blocking once signed in, but will run an
-    /// interactive re-prompt if the token expires with no refresh token
-    /// available — for unattended senders, request the `offline_access` scope so
-    /// it refreshes silently instead (see the [`oidc`](crate::oidc) module docs).
-    ///
-    /// Note that this re-prompt runs a full device flow *inside*
-    /// [`flush`](Sender::flush): an ordinary flush can then block until the user
-    /// authorizes or the device code expires (up to ~30 min), rather than being
-    /// bounded by the sender's request timeout. Call
-    /// [`OidcDeviceAuth::sign_in`](crate::oidc::OidcDeviceAuth::sign_in) up front
-    /// so the prompt happens before flushing, and prefer `offline_access` so an
-    /// expiry is handled by a silent refresh instead of a re-prompt.
+    /// returns a cached token or performs a silent refresh, but never starts an
+    /// interactive device flow. If no usable cached/persisted token or refresh
+    /// token is available, the flush fails with `InteractionRequired`. Call
+    /// [`OidcDeviceAuth::sign_in`](crate::oidc::OidcDeviceAuth::sign_in) on a
+    /// suitable UI thread before flushing, and request the `offline_access` scope
+    /// so unattended senders can refresh without another explicit sign-in.
     #[cfg(feature = "_sender-http")]
     pub fn http_token_provider<F, E>(mut self, provider: F) -> Result<Self>
     where
@@ -1655,6 +1649,9 @@ impl SenderBuilder {
     /// cannot contain panics, so providers must not rely on this as their normal
     /// error path. Mutually exclusive with [`username`](Self::username) /
     /// [`password`](Self::password) / [`token`](Self::token); QWP/WebSocket only.
+    /// `OidcDeviceAuth::token` never launches an interactive device flow from a
+    /// connect or reconnect thread; it returns `InteractionRequired` if explicit
+    /// sign-in is needed.
     ///
     /// **Use [`Protocol::Wss`]** (TLS): the
     /// token is a bearer credential, sent in cleartext over plain
@@ -1682,6 +1679,36 @@ impl SenderBuilder {
         self.qwp_ws.as_mut().unwrap().token_provider =
             Some(crate::token_provider::TokenProvider::new(provider));
         Ok(self)
+    }
+
+    /// Supply a rotating Bearer-token provider for either ILP/HTTP(S) or
+    /// QWP/WebSocket. This protocol-neutral counterpart of
+    /// [`http_token_provider`](Self::http_token_provider) and
+    /// [`qwp_ws_token_provider`](Self::qwp_ws_token_provider) is useful to
+    /// language bindings that attach one shared authentication object without
+    /// reimplementing protocol dispatch.
+    ///
+    /// TCP and QWP/UDP do not support Bearer authentication and are rejected.
+    #[cfg(all(feature = "_sender-http", feature = "_sender-qwp-ws"))]
+    pub fn bearer_token_provider<F, E>(self, provider: F) -> Result<Self>
+    where
+        F: Fn() -> std::result::Result<String, E> + Send + Sync + 'static,
+        E: Into<crate::Error>,
+    {
+        match self.protocol {
+            Protocol::Http | Protocol::Https => self.http_token_provider(provider),
+            Protocol::Ws | Protocol::Wss => self.qwp_ws_token_provider(provider),
+            #[cfg(feature = "_sender-tcp")]
+            Protocol::Tcp | Protocol::Tcps => Err(fmt!(
+                ConfigError,
+                "Bearer token providers are supported only for ILP/HTTP(S) and QWP/WebSocket."
+            )),
+            #[cfg(feature = "_sender-qwp-udp")]
+            Protocol::Udp => Err(fmt!(
+                ConfigError,
+                "Bearer token providers are supported only for ILP/HTTP(S) and QWP/WebSocket."
+            )),
+        }
     }
 
     /// Set the ECDSA public key X for TCP authentication.

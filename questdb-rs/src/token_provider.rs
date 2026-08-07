@@ -50,6 +50,14 @@ impl TokenProvider {
         TokenProvider(Arc::new(move || provider().map_err(Into::into)))
     }
 
+    /// Pull the raw token without transport classification. Used when one
+    /// provider instance is shared across independently configured sender and
+    /// reader connection factories; each transport applies its own validation
+    /// and retry classification when it formats the Bearer header.
+    pub(crate) fn provide(&self) -> crate::Result<String> {
+        (self.0)()
+    }
+
     /// Pull a token and format it as a validated `Authorization: Bearer` value.
     ///
     /// A control / non-ASCII byte (a decoded CR/LF is a header-injection vector)
@@ -62,7 +70,7 @@ impl TokenProvider {
     /// refresh attempt failed. Server authentication rejections remain separate
     /// terminal `AuthError`s because they occur after this method succeeds.
     pub(crate) fn bearer_header(&self) -> crate::Result<String> {
-        let provided = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| (self.0)()))
+        let provided = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.provide()))
             .map_err(|_| {
                 crate::error::fmt!(
                     SocketError,
@@ -94,7 +102,8 @@ fn classify_provider_error(e: crate::Error) -> crate::Error {
     if e.code() == crate::ErrorCode::SocketError {
         e
     } else {
-        crate::error::fmt!(SocketError, "Token provider failed: {}", e.msg())
+        let msg = format!("Token provider failed: {}", e.msg());
+        e.reclassified(crate::ErrorCode::SocketError, msg)
     }
 }
 
@@ -155,6 +164,21 @@ mod tests {
         assert_eq!(
             blank.bearer_header().unwrap_err().code(),
             ErrorCode::SocketError
+        );
+    }
+
+    #[cfg(feature = "_oidc")]
+    #[test]
+    fn retry_classification_preserves_oidc_detail() {
+        let provider = TokenProvider::new(|| {
+            Err::<String, _>(crate::oidc::OidcError::interaction_required("sign in"))
+        });
+
+        let err = provider.bearer_header().unwrap_err();
+        assert_eq!(err.code(), crate::ErrorCode::SocketError);
+        assert_eq!(
+            err.oidc_error().map(crate::oidc::OidcError::kind),
+            Some(crate::oidc::OidcErrorKind::InteractionRequired)
         );
     }
 

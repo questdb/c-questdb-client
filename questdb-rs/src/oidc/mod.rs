@@ -74,8 +74,11 @@
 //!
 //! A cached token is refreshed **silently only when the IdP issued a refresh
 //! token**. Most IdPs issue one only when the `offline_access` scope is
-//! requested; the default scope is just `openid`, so without it an expired token
-//! is re-acquired by a *fresh interactive sign-in* rather than a silent refresh.
+//! requested; the default scope is just `openid`. Without a refresh token,
+//! [`token`](OidcDeviceAuth::token) returns
+//! [`InteractionRequired`](OidcErrorKind::InteractionRequired) after expiry;
+//! call [`sign_in`](OidcDeviceAuth::sign_in) explicitly on a suitable UI thread
+//! to run a fresh device flow.
 //! To get silent refresh, include `offline_access` in the scope — via QuestDB's
 //! `acl.oidc.scope` setting, or [`scope`](OidcDeviceAuthBuilder::scope):
 //!
@@ -96,10 +99,10 @@
 //! token, a JWT is bounded by its own signed `exp` claim and the IdP's reported
 //! lifetime, with no arbitrary one-hour ceiling. An opaque token has no signed
 //! expiry the client can verify, so its believed lifetime is capped at one hour
-//! even without a refresh token. Because a token provider is pulled on the flush
-//! path, an interactive re-prompt after either expiry bound is reached can surface
-//! during a [`Sender::flush`](crate::ingress::Sender::flush); request
-//! `offline_access` (above) for unattended, long-running senders.
+//! even without a refresh token. Token-provider callbacks never start a device
+//! flow: after either expiry bound, the transport operation receives
+//! `InteractionRequired` instead of displaying a prompt or waiting for user
+//! input. Request `offline_access` (above) for unattended, long-running clients.
 //!
 //! # Persisting the token across restarts
 //!
@@ -139,7 +142,8 @@
 //! The same auto-refreshed token wires into QuestDB's other transports. Each is a
 //! *provider* callback pulled fresh at connect time, so a long-lived client keeps
 //! working as the token rotates — pass `move || auth.token()` (with an
-//! [`Arc<OidcDeviceAuth>`](std::sync::Arc)):
+//! [`Arc<OidcDeviceAuth>`](std::sync::Arc)). Call `auth.sign_in()` before starting
+//! the transport; provider calls can refresh silently but never prompt:
 //!
 //! - **QWP/WebSocket ingress** — `SenderBuilder::qwp_ws_token_provider` (feature
 //!   `sync-sender-qwp-ws`), pulled at each (re)connect handshake.
@@ -152,14 +156,17 @@
 //!   validates the token at **authentication** time, not per query — an open
 //!   connection survives token expiry, so only *new* connections need a fresh
 //!   token. Pull [`token`](OidcDeviceAuth::token) in your pool's connection
-//!   factory so each new connection gets a freshly-refreshed one:
+//!   factory so each new connection gets a freshly-refreshed one. If there is no
+//!   cached or refreshable credential, `token()` returns `InteractionRequired`
+//!   rather than prompting from the connection factory:
 //!
 //! ```no_run
 //! # use questdb::oidc::OidcDeviceAuth;
 //! # fn main() -> questdb::Result<()> {
 //! # let auth = OidcDeviceAuth::from_questdb("https://questdb.example.com:9000").build()?;
+//! auth.sign_in()?;
 //! // `<postgres-client>::connect` with user "_sso" and this token as the password:
-//! let password = auth.token()?; // freshly refreshed each call
+//! let password = auth.token()?; // cached or silently refreshed; never prompts
 //! # let _ = password;
 //! # Ok(())
 //! # }
@@ -195,7 +202,7 @@ mod token_store;
 pub use device::{OidcDeviceAuth, OidcDeviceAuthBuilder};
 pub use discovery::OidcConfig;
 pub use error::{OidcError, OidcErrorKind};
-pub use render::{DeviceCodeChallenge, Renderer, TerminalRenderer};
+pub use render::{DeviceCodeChallenge, Renderer, TerminalRenderer, sanitize_display_text};
 pub use token::TokenSet;
 pub use token_store::{
     FileTokenStore, PersistedToken, TOKEN_STORE_DIR_ENV, TokenStore, TokenStoreKey,

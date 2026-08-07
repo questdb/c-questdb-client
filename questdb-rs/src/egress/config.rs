@@ -1079,6 +1079,9 @@ impl ReaderConfig {
     /// next invocation; a server rejection of an acquired token remains terminal.
     /// In unwind-enabled builds, a callback panic is contained and treated as a
     /// retryable provider failure; `panic = "abort"` builds cannot contain panics.
+    /// `OidcDeviceAuth::token` may load or silently refresh a credential, but
+    /// never launches an interactive device flow on the connect/reconnect thread;
+    /// it returns `InteractionRequired` when explicit sign-in is needed.
     /// Use TLS (`wss://`) so the bearer credential isn't sent in cleartext.
     ///
     /// ```no_run
@@ -1323,11 +1326,13 @@ impl ReaderConfig {
         // produced by the handshake after header construction succeeds.
         if let Some(provider) = &self.token_provider {
             let header = provider.bearer_header().map_err(|e| {
-                if e.code() == crate::ErrorCode::SocketError {
-                    fmt!(SocketError, "{}", e.msg())
+                let code = if e.code() == crate::ErrorCode::SocketError {
+                    crate::ErrorCode::SocketError
                 } else {
-                    fmt!(AuthError, "{}", e.msg())
-                }
+                    crate::ErrorCode::AuthError
+                };
+                let msg = e.msg().to_owned();
+                e.reclassified(code, msg)
             })?;
             headers.push(("Authorization", header));
         } else if let Some(v) = self.auth.header_value() {
@@ -1767,6 +1772,24 @@ mod tests {
             .unwrap();
         let err = c.upgrade_headers().unwrap_err();
         assert_eq!(err.code(), ErrorCode::SocketError);
+    }
+
+    #[cfg(feature = "_oidc")]
+    #[test]
+    fn upgrade_header_classification_preserves_oidc_detail() {
+        let c = ReaderConfig::from_conf("wss::addr=h:1")
+            .unwrap()
+            .token_provider(|| {
+                Err::<String, _>(crate::oidc::OidcError::interaction_required("sign in"))
+            })
+            .unwrap();
+
+        let err = c.upgrade_headers().unwrap_err();
+        assert_eq!(err.code(), ErrorCode::SocketError);
+        assert_eq!(
+            err.oidc_error().map(crate::oidc::OidcError::kind),
+            Some(crate::oidc::OidcErrorKind::InteractionRequired)
+        );
     }
 
     #[test]

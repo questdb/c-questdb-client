@@ -41,8 +41,8 @@ use libc::{c_char, c_void, size_t};
 
 use questdb::egress::{
     BatchView, ColumnKind, ColumnView, Cursor, FailoverPhase, FailoverProgressEvent,
-    FailoverResetEvent, Reader, ReaderQuery, ReaderStats, ServerInfo, ServerRole, SimpleNullKind,
-    SymbolEntry, Terminal, Validity,
+    FailoverResetEvent, Reader, ReaderConfig, ReaderQuery, ReaderStats, ServerInfo, ServerRole,
+    SimpleNullKind, SymbolEntry, Terminal, Validity,
 };
 use questdb::{Error, ErrorCode};
 
@@ -129,6 +129,16 @@ fn wrap_pooled_reader(
             handle: pool,
             must_close: AtomicBool::new(false),
         },
+    }))
+}
+
+fn wrap_standalone_reader(reader: Reader) -> *mut qwp_reader {
+    let stats = Arc::clone(reader.stats());
+    Box::into_raw(Box::new(qwp_reader {
+        reader_cell: UnsafeCell::new(reader),
+        cursor_active: AtomicBool::new(false),
+        stats,
+        ownership: ReaderOwnership::Standalone,
     }))
 }
 
@@ -476,18 +486,45 @@ pub unsafe extern "C" fn qwp_reader_from_conf(
         };
         let reader_result = Reader::from_conf(conf);
         let reader = reader_bubble!(err_out, reader_result, ptr::null_mut());
-        let stats = Arc::clone(reader.stats());
-        Box::into_raw(Box::new(qwp_reader {
-            reader_cell: UnsafeCell::new(reader),
-            cursor_active: AtomicBool::new(false),
-            stats,
-            ownership: ReaderOwnership::Standalone,
-        }))
+        wrap_standalone_reader(reader)
     }));
     match result {
         Ok(p) => p,
         Err(_) => std::process::abort(),
     }
+}
+
+/// Construct a reader from a QuestDB config string and use `auth` as its
+/// rotating, non-prompting Bearer-token provider. The auth handle may be freed
+/// after this call returns; the reader retains shared ownership of the OIDC
+/// state. Explicit sign-in must happen before a token that cannot be silently
+/// refreshed is needed.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn qwp_reader_from_conf_with_oidc(
+    config: line_sender_utf8,
+    auth: *const crate::oidc::questdb_oidc_auth,
+    err_out: *mut *mut questdb_error,
+) -> *mut qwp_reader {
+    panic_guard(|| unsafe {
+        let conf = match validated_utf8(&config) {
+            Ok(s) => s,
+            Err(err) => {
+                write_err_box(err_out, err);
+                return ptr::null_mut();
+            }
+        };
+        let Some(auth) = crate::oidc::clone_auth(auth, err_out) else {
+            return ptr::null_mut();
+        };
+        let config = reader_bubble!(err_out, ReaderConfig::from_conf(conf), ptr::null_mut());
+        let config = reader_bubble!(
+            err_out,
+            config.token_provider(move || auth.token()),
+            ptr::null_mut()
+        );
+        let reader = reader_bubble!(err_out, Reader::from_config(&config), ptr::null_mut());
+        wrap_standalone_reader(reader)
+    })
 }
 
 /// Construct a reader from the configuration stored in the
@@ -525,13 +562,7 @@ pub unsafe extern "C" fn qwp_reader_from_env(err_out: *mut *mut questdb_error) -
         };
         let reader_result = Reader::from_conf(&conf);
         let reader = reader_bubble!(err_out, reader_result, ptr::null_mut());
-        let stats = Arc::clone(reader.stats());
-        Box::into_raw(Box::new(qwp_reader {
-            reader_cell: UnsafeCell::new(reader),
-            cursor_active: AtomicBool::new(false),
-            stats,
-            ownership: ReaderOwnership::Standalone,
-        }))
+        wrap_standalone_reader(reader)
     }));
     match result {
         Ok(p) => p,

@@ -31,8 +31,8 @@
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::path::Path;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Barrier};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
@@ -204,6 +204,11 @@ fn explicit_auth(mock: &MockServer, groups_in_token: bool) -> OidcDeviceAuth {
         .expect("build auth")
 }
 
+fn sign_in_and_token(auth: &OidcDeviceAuth) -> Result<String> {
+    auth.sign_in()?;
+    auth.token()
+}
+
 fn device_response() -> String {
     serde_json::json!({
         "device_code": "DEV-CODE-123",
@@ -214,6 +219,106 @@ fn device_response() -> String {
         "interval": 5
     })
     .to_string()
+}
+
+#[test]
+fn token_requires_explicit_sign_in_without_starting_device_flow() {
+    let device_calls = Arc::new(AtomicUsize::new(0));
+    let mock = {
+        let device_calls = Arc::clone(&device_calls);
+        MockServer::start(move |method, path, _body| match (method, path) {
+            ("POST", "/device") => {
+                device_calls.fetch_add(1, Ordering::SeqCst);
+                (200, device_response())
+            }
+            ("POST", "/token") => (
+                200,
+                r#"{"access_token":"AT-explicit","expires_in":300}"#.to_string(),
+            ),
+            _ => (404, "{}".to_string()),
+        })
+    };
+    let auth = explicit_auth(&mock, false);
+
+    let err = auth.token().unwrap_err();
+    assert_eq!(err.kind(), OidcErrorKind::InteractionRequired);
+    assert_eq!(
+        device_calls.load(Ordering::SeqCst),
+        0,
+        "token() unexpectedly started the interactive device flow"
+    );
+
+    auth.sign_in().unwrap();
+    assert_eq!(device_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(auth.token().unwrap(), "AT-explicit");
+}
+
+#[test]
+fn token_does_not_wait_behind_interactive_sign_in() {
+    struct BlockingPrompt {
+        entered: Arc<Barrier>,
+        release: Arc<Barrier>,
+    }
+
+    impl Renderer for BlockingPrompt {
+        fn on_prompt(&self, _challenge: &DeviceCodeChallenge) {
+            self.entered.wait();
+            self.release.wait();
+        }
+    }
+
+    let mock = MockServer::start(|method, path, _body| match (method, path) {
+        ("POST", "/device") => (200, device_response()),
+        ("POST", "/token") => (
+            200,
+            r#"{"access_token":"AT-after-prompt","expires_in":300}"#.to_string(),
+        ),
+        _ => (404, "{}".to_string()),
+    });
+    let entered = Arc::new(Barrier::new(2));
+    let release = Arc::new(Barrier::new(2));
+    let auth = Arc::new(
+        OidcDeviceAuth::builder()
+            .client_id("questdb")
+            .device_authorization_endpoint(mock.url("/device"))
+            .token_endpoint(mock.url("/token"))
+            .interactive(true)
+            .open_browser(false)
+            .sleep_hook(no_sleep())
+            .renderer(BlockingPrompt {
+                entered: Arc::clone(&entered),
+                release: Arc::clone(&release),
+            })
+            .build()
+            .unwrap(),
+    );
+
+    let signer = {
+        let auth = Arc::clone(&auth);
+        std::thread::spawn(move || auth.sign_in())
+    };
+    entered.wait();
+
+    let (result_tx, result_rx) = std::sync::mpsc::channel();
+    let token_caller = {
+        let auth = Arc::clone(&auth);
+        std::thread::spawn(move || {
+            let result = auth.token().map_err(|error| error.kind());
+            result_tx.send(result).unwrap();
+        })
+    };
+    let token_result = result_rx.recv_timeout(Duration::from_secs(1));
+
+    // Always unblock the signer before asserting, so a regression fails rather
+    // than leaving a permanently hung test process.
+    release.wait();
+    signer.join().unwrap().unwrap();
+    token_caller.join().unwrap();
+
+    assert_eq!(
+        token_result.expect("token() blocked behind the interactive sign-in"),
+        Err(OidcErrorKind::InteractionRequired)
+    );
 }
 
 #[test]
@@ -239,7 +344,7 @@ fn happy_path_returns_access_token() {
         })
     };
     let auth = explicit_auth(&mock, false);
-    assert_eq!(auth.token().unwrap(), "AT-999");
+    assert_eq!(sign_in_and_token(&auth).unwrap(), "AT-999");
     assert!(poll.load(Ordering::SeqCst) >= 3);
     // Cached: a second call does not poll again.
     let before = poll.load(Ordering::SeqCst);
@@ -258,7 +363,7 @@ fn groups_mode_selects_id_token() {
         _ => (404, "{}".to_string()),
     });
     let auth = explicit_auth(&mock, true);
-    assert_eq!(auth.token().unwrap(), "ID-TOKEN-abc");
+    assert_eq!(sign_in_and_token(&auth).unwrap(), "ID-TOKEN-abc");
 }
 
 #[test]
@@ -273,7 +378,7 @@ fn groups_mode_missing_id_token_errors() {
         _ => (404, "{}".to_string()),
     });
     let auth = explicit_auth(&mock, true);
-    let err = auth.token().unwrap_err();
+    let err = auth.sign_in().unwrap_err();
     assert_eq!(err.kind(), OidcErrorKind::DeviceFlow);
 }
 
@@ -298,7 +403,7 @@ fn slow_down_then_success() {
         })
     };
     let auth = explicit_auth(&mock, false);
-    assert_eq!(auth.token().unwrap(), "AT-slow");
+    assert_eq!(sign_in_and_token(&auth).unwrap(), "AT-slow");
 }
 
 #[test]
@@ -337,7 +442,7 @@ fn slow_down_via_429_still_increases_interval() {
         }))
         .build()
         .expect("build");
-    assert_eq!(auth.token().unwrap(), "AT-sd");
+    assert_eq!(sign_in_and_token(&auth).unwrap(), "AT-sd");
     let durations = slept.lock().unwrap();
     // The first poll is immediate. The only sleep is before the retry and must
     // use the original 5s interval plus slow_down's mandatory 5s increase,
@@ -368,7 +473,7 @@ fn access_denied_is_device_flow_error() {
         _ => (404, "{}".to_string()),
     });
     let auth = explicit_auth(&mock, false);
-    let err = auth.token().unwrap_err();
+    let err = auth.sign_in().unwrap_err();
     assert_eq!(err.kind(), OidcErrorKind::DeviceFlow);
     assert_eq!(err.idp_error(), Some("access_denied"));
     assert_eq!(err.idp_error_description(), Some("user declined"));
@@ -387,7 +492,7 @@ fn empty_error_description_keeps_error_code() {
         _ => (404, "{}".to_string()),
     });
     let auth = explicit_auth(&mock, false);
-    let err = auth.token().unwrap_err();
+    let err = auth.sign_in().unwrap_err();
     assert_eq!(err.kind(), OidcErrorKind::DeviceFlow);
     assert_eq!(err.idp_error(), Some("access_denied"));
     // The empty description is normalized to absent, not surfaced as Some("").
@@ -414,7 +519,7 @@ fn control_chars_in_token_are_rejected() {
         _ => (404, "{}".to_string()),
     });
     let auth = explicit_auth(&mock, false);
-    let err = auth.token().unwrap_err();
+    let err = auth.sign_in().unwrap_err();
     assert_eq!(err.kind(), OidcErrorKind::DeviceFlow);
 }
 
@@ -447,7 +552,7 @@ fn silent_refresh_without_reprompt() {
         })
     };
     let auth = explicit_auth(&mock, false);
-    assert_eq!(auth.token().unwrap(), "AT-initial");
+    assert_eq!(sign_in_and_token(&auth).unwrap(), "AT-initial");
     assert_eq!(device_calls.load(Ordering::SeqCst), 1);
 
     // Force the cached token to look expired, so the next call must refresh.
@@ -495,7 +600,7 @@ fn non_interactive_context_refuses() {
         .sleep_hook(no_sleep())
         .build()
         .unwrap();
-    let err = auth.token().unwrap_err();
+    let err = auth.sign_in().unwrap_err();
     assert_eq!(err.kind(), OidcErrorKind::InteractionRequired);
 }
 
@@ -547,7 +652,7 @@ fn discovery_from_questdb_settings() {
         .build()
         .expect("discovery build");
     assert_eq!(auth.config().client_id, "discovered-client");
-    assert_eq!(auth.token().unwrap(), "AT-discovered");
+    assert_eq!(sign_in_and_token(&auth).unwrap(), "AT-discovered");
 }
 
 #[test]
@@ -888,7 +993,7 @@ fn allow_insecure_does_not_relax_idp_endpoints() {
         .sleep_hook(no_sleep())
         .build()
         .expect("build succeeds; scheme is enforced at flow time");
-    let err = auth.token().unwrap_err();
+    let err = auth.sign_in().unwrap_err();
     assert_eq!(err.kind(), OidcErrorKind::Config);
     // Pin the cause to the transport-security check on the IdP endpoint.
     assert!(
@@ -927,7 +1032,7 @@ fn refresh_transient_error_preserves_token_no_reprompt() {
         })
     };
     let auth = explicit_auth(&mock, false);
-    assert_eq!(auth.token().unwrap(), "AT-initial");
+    assert_eq!(sign_in_and_token(&auth).unwrap(), "AT-initial");
     // Force the cached token to look expired so the next call must refresh.
     auth.tokens.lock().unwrap().as_mut().unwrap().expires_at = 1.0;
     let err = auth.token().unwrap_err();
@@ -936,9 +1041,10 @@ fn refresh_transient_error_preserves_token_no_reprompt() {
 }
 
 #[test]
-fn refresh_rejected_falls_back_to_device_flow() {
-    // A 4xx (revoked / expired refresh token) is terminal: fall through to a
-    // fresh interactive sign-in rather than propagating the error.
+fn refresh_rejected_requires_explicit_device_flow() {
+    // A 4xx (revoked / expired refresh token) is terminal. A token-provider call
+    // must report that interaction is required without starting a device flow;
+    // only the subsequent explicit sign_in() may prompt.
     let device_calls = Arc::new(AtomicUsize::new(0));
     let mock = {
         let device_calls = Arc::clone(&device_calls);
@@ -966,16 +1072,21 @@ fn refresh_rejected_falls_back_to_device_flow() {
         })
     };
     let auth = explicit_auth(&mock, false);
-    assert_eq!(auth.token().unwrap(), "AT-1");
+    assert_eq!(sign_in_and_token(&auth).unwrap(), "AT-1");
     auth.tokens.lock().unwrap().as_mut().unwrap().expires_at = 1.0;
+    let err = auth.token().unwrap_err();
+    assert_eq!(err.kind(), OidcErrorKind::InteractionRequired);
+    assert_eq!(device_calls.load(Ordering::SeqCst), 1);
+    auth.sign_in().unwrap();
     assert_eq!(auth.token().unwrap(), "AT-2");
     assert_eq!(device_calls.load(Ordering::SeqCst), 2);
 }
 
 #[test]
-fn groups_mode_refresh_without_id_token_reprompts() {
+fn groups_mode_refresh_without_id_token_requires_explicit_sign_in() {
     // In groups mode a refresh that returns 200 but omits the id_token does not
-    // satisfy the requirement; fall through to a fresh sign-in.
+    // satisfy the requirement. The provider reports InteractionRequired without
+    // prompting, and a later explicit sign_in() starts the fresh device flow.
     let device_calls = Arc::new(AtomicUsize::new(0));
     let mock = {
         let device_calls = Arc::clone(&device_calls);
@@ -1003,9 +1114,12 @@ fn groups_mode_refresh_without_id_token_reprompts() {
         })
     };
     let auth = explicit_auth(&mock, true);
-    assert_eq!(auth.token().unwrap(), "ID-1");
+    assert_eq!(sign_in_and_token(&auth).unwrap(), "ID-1");
     auth.tokens.lock().unwrap().as_mut().unwrap().expires_at = 1.0;
-    // Refresh yields no id_token, so a fresh device flow must run.
+    let err = auth.token().unwrap_err();
+    assert_eq!(err.kind(), OidcErrorKind::InteractionRequired);
+    assert_eq!(device_calls.load(Ordering::SeqCst), 1);
+    auth.sign_in().unwrap();
     assert_eq!(auth.token().unwrap(), "ID-1");
     assert_eq!(device_calls.load(Ordering::SeqCst), 2);
 }
@@ -1109,7 +1223,7 @@ fn expired_token_error_returns_timeout() {
         _ => (404, "{}".to_string()),
     });
     let auth = explicit_auth(&mock, false);
-    let err = auth.token().unwrap_err();
+    let err = auth.sign_in().unwrap_err();
     assert_eq!(err.kind(), OidcErrorKind::Timeout);
     assert_eq!(err.idp_error(), Some("expired_token"));
 }
@@ -1143,7 +1257,7 @@ fn deadline_expiry_returns_timeout() {
         }))
         .build()
         .expect("build");
-    let err = auth.token().unwrap_err();
+    let err = auth.sign_in().unwrap_err();
     assert_eq!(err.kind(), OidcErrorKind::Timeout);
     assert!(err.message().contains("expired"), "got: {}", err.message());
 }
@@ -1161,7 +1275,7 @@ fn transport_failure_surfaces_network_error_not_timeout() {
         _ => (404, "{}".to_string()),
     });
     let auth = explicit_auth(&mock, false);
-    let err = auth.token().unwrap_err();
+    let err = auth.sign_in().unwrap_err();
     assert_eq!(err.kind(), OidcErrorKind::Network);
     assert!(
         err.message().contains("unreachable"),
@@ -1180,7 +1294,7 @@ fn poll_redirect_is_terminal() {
         _ => (404, "{}".to_string()),
     });
     let auth = explicit_auth(&mock, false);
-    let err = auth.token().unwrap_err();
+    let err = auth.sign_in().unwrap_err();
     assert_eq!(err.kind(), OidcErrorKind::DeviceFlow);
     assert_eq!(err.status(), Some(302));
 }
@@ -1195,7 +1309,7 @@ fn poll_non_json_body_is_terminal_rejection() {
         _ => (404, "{}".to_string()),
     });
     let auth = explicit_auth(&mock, false);
-    let err = auth.token().unwrap_err();
+    let err = auth.sign_in().unwrap_err();
     assert_eq!(err.kind(), OidcErrorKind::DeviceFlow);
     assert_eq!(err.status(), Some(403));
 }
@@ -1210,7 +1324,7 @@ fn device_endpoint_rejection_errors() {
         _ => (404, "{}".to_string()),
     });
     let auth = explicit_auth(&mock, false);
-    let err = auth.token().unwrap_err();
+    let err = auth.sign_in().unwrap_err();
     assert_eq!(err.kind(), OidcErrorKind::DeviceFlow);
     assert_eq!(err.idp_error(), Some("invalid_client"));
     assert_eq!(err.status(), Some(400));
@@ -1229,7 +1343,7 @@ fn device_endpoint_missing_required_field_errors() {
         _ => (404, "{}".to_string()),
     });
     let auth = explicit_auth(&mock, false);
-    let err = auth.token().unwrap_err();
+    let err = auth.sign_in().unwrap_err();
     assert_eq!(err.kind(), OidcErrorKind::DeviceFlow);
     assert_eq!(err.status(), Some(200));
 }
@@ -1294,16 +1408,20 @@ fn stale_token_cleared_when_no_refresh_and_device_flow_fails() {
         })
     };
     let auth = explicit_auth(&mock, false);
-    assert_eq!(auth.token().unwrap(), "AT-1");
+    assert_eq!(sign_in_and_token(&auth).unwrap(), "AT-1");
     assert!(auth.token_set().is_some());
     // Force expiry; the cached token has no refresh token.
     auth.tokens.lock().unwrap().as_mut().unwrap().expires_at = 1.0;
     let err = auth.token().unwrap_err();
-    assert_eq!(err.kind(), OidcErrorKind::DeviceFlow);
+    assert_eq!(err.kind(), OidcErrorKind::InteractionRequired);
+    assert_eq!(device_calls.load(Ordering::SeqCst), 1);
     assert!(
         auth.token_set().is_none(),
-        "stale expired token left cached after a failed sign-in"
+        "stale expired token left cached after a non-interactive lookup"
     );
+    let err = auth.sign_in().unwrap_err();
+    assert_eq!(err.kind(), OidcErrorKind::DeviceFlow);
+    assert!(auth.token_set().is_none());
 }
 
 // -- token store persistence (Layer 1 + Layer 2) -----------------------------
@@ -1330,6 +1448,7 @@ struct FailingSaveStore {
     token: Arc<std::sync::Mutex<Option<PersistedToken>>>,
     coordination: Arc<std::sync::Mutex<()>>,
     fail_save: Arc<AtomicBool>,
+    fail_clear: Arc<AtomicBool>,
     operations: Arc<std::sync::Mutex<Vec<&'static str>>>,
 }
 
@@ -1360,6 +1479,9 @@ impl TokenStore for FailingSaveStore {
 
     fn clear(&self, _key: &TokenStoreKey) -> TokenStoreResult<()> {
         self.operations.lock().unwrap().push("clear");
+        if self.fail_clear.load(Ordering::SeqCst) {
+            return Err(Box::new(std::io::Error::other("injected clear failure")));
+        }
         *self.token.lock().unwrap() = None;
         Ok(())
     }
@@ -1490,7 +1612,7 @@ fn success_renderer_panic_keeps_token_cached_and_persisted() {
         .build()
         .unwrap();
 
-    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| auth.token()));
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| auth.sign_in()));
     assert!(
         result.is_err(),
         "the custom renderer should still propagate its panic"
@@ -1527,7 +1649,7 @@ fn restart_resumes_from_persisted_token_without_reprompt() {
 
     // First run: sign in, persisting the token (one device prompt).
     let auth_a = auth_with_store(&mock, dir.path());
-    assert_eq!(auth_a.token().unwrap(), "AT-initial");
+    assert_eq!(sign_in_and_token(&auth_a).unwrap(), "AT-initial");
     assert_eq!(device_calls.load(Ordering::SeqCst), 1);
     drop(auth_a); // simulate a process restart
 
@@ -1562,7 +1684,7 @@ fn persist_restores_non_rotating_refresh_token_after_consuming_parent() {
     let key = key_for(&mock);
 
     let auth = auth_with_store(&mock, dir.path());
-    assert_eq!(auth.token().unwrap(), "AT-initial");
+    assert_eq!(sign_in_and_token(&auth).unwrap(), "AT-initial");
     let before = reader.load(&key).unwrap().unwrap();
     assert_eq!(before.access_token(), Some("AT-initial"));
     assert_eq!(before.refresh_token(), Some("RT-1"));
@@ -1596,7 +1718,7 @@ fn persist_rewrites_when_refresh_token_rotates() {
     let key = key_for(&mock);
 
     let auth = auth_with_store(&mock, dir.path());
-    assert_eq!(auth.token().unwrap(), "AT-initial");
+    assert_eq!(sign_in_and_token(&auth).unwrap(), "AT-initial");
     drop(auth);
 
     // Expire the on-disk access token, then a fresh instance silently refreshes
@@ -1664,12 +1786,16 @@ fn replacement_without_refresh_token_clears_rejected_persisted_token() {
     let key = key_for(&mock);
 
     let auth = auth_with_store(&mock, dir.path());
-    assert_eq!(auth.token().unwrap(), "AT-initial");
+    assert_eq!(sign_in_and_token(&auth).unwrap(), "AT-initial");
     expire_persisted(dir.path(), &key);
     auth.tokens.lock().unwrap().as_mut().unwrap().expires_at = 1.0;
 
-    // The rejected refresh falls back to a successful device flow without a
-    // replacement refresh token. That flow supersedes the persisted credential.
+    // The provider consumes the rejected refresh parent but never starts a
+    // replacement prompt. Only explicit sign_in() runs the new device flow.
+    let err = auth.token().unwrap_err();
+    assert_eq!(err.kind(), OidcErrorKind::InteractionRequired);
+    assert_eq!(device_calls.load(Ordering::SeqCst), 1);
+    auth.sign_in().unwrap();
     assert_eq!(auth.token().unwrap(), "AT-device-1");
     assert!(
         reader.load(&key).unwrap().is_none(),
@@ -1677,10 +1803,12 @@ fn replacement_without_refresh_token_clears_rejected_persisted_token() {
     );
     drop(auth);
 
-    // A new process must start a device flow instead of retrying RT-rejected. The
-    // mock's second refresh response is transient, so this unwrap also proves a
-    // stale retry cannot block the fallback.
+    // A new process has no credential to load and must ask for explicit sign-in,
+    // rather than starting a prompt from token().
     let restarted = auth_with_store(&mock, dir.path());
+    let err = restarted.token().unwrap_err();
+    assert_eq!(err.kind(), OidcErrorKind::InteractionRequired);
+    restarted.sign_in().unwrap();
     assert_eq!(restarted.token().unwrap(), "AT-device-2");
     assert_eq!(refresh_calls.load(Ordering::SeqCst), 1);
     assert_eq!(device_calls.load(Ordering::SeqCst), 3);
@@ -1697,13 +1825,42 @@ fn clear_deletes_the_persisted_entry() {
     let key = key_for(&mock);
 
     let auth = auth_with_store(&mock, dir.path());
-    auth.token().unwrap();
+    sign_in_and_token(&auth).unwrap();
     assert!(reader.load(&key).unwrap().is_some());
 
     auth.clear();
     assert!(
         reader.load(&key).unwrap().is_none(),
         "clear() must delete the persisted entry"
+    );
+}
+
+#[test]
+fn try_clear_reports_persisted_deletion_failure() {
+    let mock = MockServer::start(|_, _, _| (404, "{}".to_string()));
+    let store = FailingSaveStore::default();
+    store.seed(PersistedToken::new(
+        Some("AT-persisted".to_string()),
+        None,
+        Some("RT-persisted".to_string()),
+        now_epoch() + 300.0,
+        300.0,
+    ));
+    store.fail_clear.store(true, Ordering::SeqCst);
+    let auth = auth_with_failing_store(&mock, store.clone(), false);
+    *auth.tokens.lock().unwrap() = Some(expired_tokens("RT-in-memory"));
+
+    let err = auth.try_clear().unwrap_err();
+    assert_eq!(err.kind(), OidcErrorKind::Network);
+    assert!(err.message().contains("injected clear failure"));
+    assert!(auth.token_set().is_none(), "in-memory token was retained");
+    assert!(
+        store.token().is_some(),
+        "failing test store unexpectedly deleted the persisted token"
+    );
+    assert!(
+        auth.store_state.lock().unwrap().load_attempted,
+        "the same auth may reload a credential after clear was requested"
     );
 }
 
@@ -1731,8 +1888,12 @@ fn tampered_persisted_token_is_rejected_on_load() {
     writer.save(&key, &tampered).unwrap();
 
     let auth = auth_with_store(&mock, dir.path());
-    // The tampered served token is dropped, the entry rejected wholesale, so a
-    // fresh device flow runs and yields the clean initial token.
+    // The tampered served token is dropped and the entry rejected wholesale,
+    // but token() must not turn that into a hidden prompt.
+    let err = auth.token().unwrap_err();
+    assert_eq!(err.kind(), OidcErrorKind::InteractionRequired);
+    assert_eq!(device_calls.load(Ordering::SeqCst), 0);
+    auth.sign_in().unwrap();
     assert_eq!(auth.token().unwrap(), "AT-initial");
     assert_eq!(device_calls.load(Ordering::SeqCst), 1);
 }
@@ -1771,7 +1932,7 @@ fn refresh_refuses_in_memory_fallback_when_persisted_entry_has_no_refresh_token(
 
     // Sign in: in-memory + disk hold RT-1, so last_persisted_refresh == RT-1.
     let auth = auth_with_store(&mock, dir.path());
-    assert_eq!(auth.token().unwrap(), "AT-initial");
+    assert_eq!(sign_in_and_token(&auth).unwrap(), "AT-initial");
     assert_eq!(device_calls.load(Ordering::SeqCst), 1);
 
     // A peer process / corruption overwrites the file for this identity with a

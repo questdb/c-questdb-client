@@ -188,6 +188,19 @@ qwp_reader* qwp_reader_from_conf(
     questdb_error** err_out);
 
 /**
+ * Construct a reader whose WebSocket handshake uses `auth` as a rotating
+ * Bearer-token provider. The reader retains shared ownership of the auth state,
+ * so the caller may free its auth handle after this call returns. Provider
+ * calls may load or silently refresh a token but never start an interactive
+ * device flow; call questdb_oidc_auth_sign_in before opening the reader.
+ */
+QUESTDB_CLIENT_API
+qwp_reader* qwp_reader_from_conf_with_oidc(
+    line_sender_utf8 config,
+    const questdb_oidc_auth* auth,
+    questdb_error** err_out);
+
+/**
  * Construct a reader from the configuration stored in the
  * `QDB_CLIENT_CONF` environment variable. The variable's value follows
  * the same format as `qwp_reader_from_conf`.

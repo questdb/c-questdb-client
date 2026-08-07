@@ -28,8 +28,8 @@
 //! the verification URL) are **untrusted** — a MITM'd or hostile IdP could embed
 //! ANSI escapes, bidi overrides or zero-width characters to spoof the prompt or
 //! hide the real sign-in URL. Everything shown here is passed through
-//! [`strip_control`] first, and any URL made clickable / opened in a browser is
-//! additionally vetted by [`safe_target`].
+//! [`sanitize_display_text`] first, and any URL made clickable / opened in a
+//! browser is additionally vetted by [`safe_target`].
 
 use std::io::Write;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -53,12 +53,19 @@ pub struct DeviceCodeChallenge {
 }
 
 impl DeviceCodeChallenge {
-    /// The short code the user types on the verification page.
+    /// The raw, untrusted short code returned by the IdP.
+    ///
+    /// Do not render this value directly. Use
+    /// [`display_user_code`](Self::display_user_code) for terminal or UI text.
     pub fn user_code(&self) -> &str {
         &self.user_code
     }
 
-    /// The URL the user opens to authorize the device.
+    /// The raw, untrusted verification URL returned by the IdP.
+    ///
+    /// Use [`display_verification_uri`](Self::display_verification_uri) for
+    /// display and [`browser_target`](Self::browser_target) for a URL that may
+    /// be made clickable or opened.
     pub fn verification_uri(&self) -> &str {
         &self.verification_uri
     }
@@ -69,9 +76,40 @@ impl DeviceCodeChallenge {
         self.verification_uri_complete.as_deref()
     }
 
+    /// The user code rendered as inert, single-line ASCII display text.
+    ///
+    /// Control, bidi, and zero-width characters are removed. Every remaining
+    /// non-ASCII character is escaped visibly so a homoglyph cannot masquerade
+    /// as an ordinary code character.
+    pub fn display_user_code(&self) -> String {
+        ascii_visible(&strip_control(&self.user_code))
+    }
+
+    /// The verification URL rendered as inert, single-line ASCII text.
+    ///
+    /// This value is safe to print, but it is not a browser target. Use
+    /// [`browser_target`](Self::browser_target) before making a URL clickable
+    /// or opening it.
+    pub fn display_verification_uri(&self) -> String {
+        display_url(&self.verification_uri)
+    }
+
+    /// The pre-filled verification URL rendered as inert, single-line ASCII
+    /// text, when the IdP supplied one.
+    pub fn display_verification_uri_complete(&self) -> Option<String> {
+        self.verification_uri_complete
+            .as_deref()
+            .map(display_url)
+            .filter(|value| !value.is_empty())
+    }
+
     /// The single vetted `http(s)` target to open in a browser / make clickable:
     /// the pre-filled URL when safe, else the plain verification URL.
-    pub(crate) fn safe_target(&self) -> Option<String> {
+    ///
+    /// The returned URL is control-stripped and has no userinfo; its host is
+    /// non-empty ASCII. It remains separate from the display accessors so UI
+    /// code cannot accidentally open a merely printable, untrusted value.
+    pub fn browser_target(&self) -> Option<String> {
         safe_target(self.verification_uri_complete.as_deref())
             .or_else(|| safe_target(Some(&self.verification_uri)))
     }
@@ -131,14 +169,11 @@ impl TerminalRenderer {
 
 impl Renderer for TerminalRenderer {
     fn on_prompt(&self, challenge: &DeviceCodeChallenge) {
-        let uri = display_url(&challenge.verification_uri);
-        let code = strip_control(&challenge.user_code);
+        let uri = challenge.display_verification_uri();
+        let code = challenge.display_user_code();
         let mut msg = format!("🔐 Sign in to QuestDB\n   Open {uri}  and enter code:  {code}\n");
-        if let Some(complete) = &challenge.verification_uri_complete {
-            let complete = display_url(complete);
-            if !complete.is_empty() {
-                msg.push_str(&format!("   (or open directly: {complete})\n"));
-            }
+        if let Some(complete) = challenge.display_verification_uri_complete() {
+            msg.push_str(&format!("   (or open directly: {complete})\n"));
         }
         self.write(&msg);
     }
@@ -274,16 +309,16 @@ fn is_format_or_bidi(ch: char) -> bool {
     )
 }
 
-/// Strip control / format characters from an untrusted string before display.
+/// Convert untrusted text to inert, single-line display text.
 ///
-/// The verification URL, user code and IdP error strings are untrusted: raw ANSI
-/// escapes or bidi / zero-width / line-separator characters could spoof the
-/// prompt or hide the real sign-in URL. C0/C1 controls and DEL are dropped
-/// (covers ANSI, tab, newline, CR), a curated set of invisible format / bidi
-/// characters is dropped, and every non-ASCII-space whitespace (NBSP, line /
-/// paragraph separators, ...) is folded to a plain space so it can't hide
-/// trailing text or inject a line break. This sanitizer never fails.
-pub(crate) fn strip_control(text: &str) -> String {
+/// C0/C1 controls and DEL (including ANSI, tabs, and line breaks), bidi
+/// controls, zero-width characters, and other invisible formatting are
+/// removed. Non-ASCII whitespace is folded to an ordinary space. This is
+/// suitable for human-readable labels and messages; URLs and short
+/// authentication codes need the stricter display accessors on
+/// [`DeviceCodeChallenge`] so confusable non-ASCII characters are also made
+/// visible. This sanitizer never fails.
+pub fn sanitize_display_text(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     for ch in text.chars() {
         // is_control() covers C0 (incl. tab/newline/CR), DEL and C1.
@@ -300,6 +335,12 @@ pub(crate) fn strip_control(text: &str) -> String {
         }
     }
     out
+}
+
+// Internal name retained for the error-rendering helpers below, where the
+// operation is specifically control stripping rather than a public API choice.
+pub(crate) fn strip_control(text: &str) -> String {
+    sanitize_display_text(text)
 }
 
 /// [`strip_control`], but bounded to `max_chars` visible characters (with a
@@ -433,6 +474,29 @@ mod tests {
         let shown = display_url("https://exa\u{0430}mple.com"); // Cyrillic 'а'
         assert!(!shown.contains('\u{0430}'));
         assert!(shown.contains("\\u{0430}"));
+    }
+
+    #[test]
+    fn challenge_exposes_safe_display_text_and_separate_browser_target() {
+        let challenge = DeviceCodeChallenge {
+            user_code: "AB\x1b[31m\u{202e}\u{0430}".into(),
+            verification_uri: "https://exa\u{0430}mple.com/\nactivate".into(),
+            verification_uri_complete: Some("https://idp.example.com/activate?code=ABCD\n".into()),
+        };
+
+        assert_eq!(challenge.display_user_code(), "AB[31m\\u{0430}");
+        assert_eq!(
+            challenge.display_verification_uri(),
+            "https://exa\\u{0430}mple.com/activate"
+        );
+        assert_eq!(
+            challenge.display_verification_uri_complete().as_deref(),
+            Some("https://idp.example.com/activate?code=ABCD")
+        );
+        assert_eq!(
+            challenge.browser_target().as_deref(),
+            Some("https://idp.example.com/activate?code=ABCD")
+        );
     }
 
     #[test]

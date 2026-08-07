@@ -167,7 +167,7 @@ public:
         ::line_sender_error* c_err{nullptr};
         size_t r = ::qwp_chunk_row_count(_raw, &c_err);
         if (r == static_cast<size_t>(-1))
-            throw line_sender_error::from_c(c_err);
+            line_sender_error::throw_from_c(c_err);
         return r;
     }
 
@@ -1121,7 +1121,7 @@ public:
         ::line_sender_error* c_err{nullptr};
         auto* raw = ::questdb_db_new_buffer(_db, &c_err);
         if (!raw)
-            throw line_sender_error::from_c(c_err);
+            line_sender_error::throw_from_c(c_err);
         try
         {
             line_sender_error::wrapped_call(

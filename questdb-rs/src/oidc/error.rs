@@ -63,9 +63,10 @@ pub enum OidcErrorKind {
     /// The user did not authorize the device in time (the code expired).
     Timeout,
 
-    /// Interactive sign-in is required, but the process is not interactive
-    /// (e.g. no TTY, a CI job). Use a QuestDB service-account REST token or the
-    /// OAuth 2.0 client-credentials grant there instead.
+    /// No usable cached or silently refreshable token is available, so the
+    /// caller must invoke `OidcDeviceAuth::sign_in()` explicitly. Also returned
+    /// when an interactive sign-in was requested from a non-interactive process
+    /// (e.g. no TTY or a CI job).
     InteractionRequired,
 }
 
@@ -198,7 +199,9 @@ impl OidcError {
     }
 
     /// A parsed `Retry-After` (delta-seconds), when present.
-    pub(crate) fn retry_after_secs(&self) -> Option<u64> {
+    /// The parsed `Retry-After` delta-seconds value carried by a rate-limit or
+    /// transient IdP response, when present.
+    pub fn retry_after_secs(&self) -> Option<u64> {
         self.retry_after
     }
 }
@@ -233,7 +236,8 @@ impl From<OidcError> for Error {
             | OidcErrorKind::Timeout
             | OidcErrorKind::InteractionRequired => ErrorCode::AuthError,
         };
-        Error::new(code, err.to_string())
+        let message = err.to_string();
+        Error::new(code, message).with_oidc_error(err)
     }
 }
 
@@ -253,7 +257,24 @@ mod tests {
         for (oidc_err, expected) in cases {
             let err: Error = oidc_err.into();
             assert_eq!(err.code(), expected);
+            assert!(err.oidc_error().is_some());
         }
+    }
+
+    #[test]
+    fn conversion_preserves_structured_details() {
+        let oidc = OidcError::device_flow("Device flow failed")
+            .with_idp_error(Some("access_denied"), Some("user declined"))
+            .with_status(Some(403))
+            .with_retry_after(Some(7));
+        let err: Error = oidc.clone().into();
+        let preserved = err.oidc_error().unwrap();
+        assert_eq!(preserved, &oidc);
+        assert_eq!(preserved.kind(), OidcErrorKind::DeviceFlow);
+        assert_eq!(preserved.idp_error(), Some("access_denied"));
+        assert_eq!(preserved.idp_error_description(), Some("user declined"));
+        assert_eq!(preserved.status(), Some(403));
+        assert_eq!(preserved.retry_after_secs(), Some(7));
     }
 
     #[test]

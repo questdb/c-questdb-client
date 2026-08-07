@@ -100,6 +100,7 @@ mod ndarr;
 use ndarr::StrideArrayView;
 
 mod egress;
+mod oidc;
 
 pub mod column_sender;
 pub use column_sender::*;
@@ -866,7 +867,7 @@ fn describe_buf(buf: &[u8]) -> String {
 }
 
 #[cold]
-unsafe fn set_err_out_from_error(err_out: *mut *mut line_sender_error, err: Error) {
+pub(crate) unsafe fn set_err_out_from_error(err_out: *mut *mut line_sender_error, err: Error) {
     let qwp_ws_error = err.qwp_ws_rejection().cloned();
     unsafe { set_err_out_from_error_with_qwpws(err_out, err, qwp_ws_error) };
 }

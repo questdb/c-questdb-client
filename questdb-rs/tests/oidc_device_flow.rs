@@ -417,6 +417,7 @@ fn oidc_token_flows_through_sender() {
             .build()
             .expect("build auth"),
     );
+    auth.sign_in().expect("explicit OIDC sign-in");
 
     let mut sender = sender_with_provider(&mock, {
         let auth = Arc::clone(&auth);

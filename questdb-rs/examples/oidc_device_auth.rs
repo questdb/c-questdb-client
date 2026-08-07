@@ -46,9 +46,10 @@ fn main() -> Result<()> {
 
     let auth = Arc::new(builder.build()?);
 
-    // Sign in once up front (prompts on first use, then caches; refreshes
-    // silently if the IdP issued a refresh token — request the `offline_access`
-    // scope for that, otherwise an expired token triggers a fresh prompt).
+    // Sign in once up front (prompts here, then caches). Provider calls below
+    // refresh silently if the IdP issued a refresh token — request the
+    // `offline_access` scope for that. Without one, an expired token makes the
+    // transport return InteractionRequired; it never prompts from flush().
     auth.sign_in()?;
 
     // Parse host:port out of the QuestDB URL for the sender.

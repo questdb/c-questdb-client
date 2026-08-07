@@ -3125,13 +3125,13 @@ fn qwp_ws_all_endpoints_unreachable_error(
     last_failure: Option<(usize, crate::Error)>,
 ) -> crate::Error {
     match last_failure {
-        Some((idx, err)) => error::fmt!(
-            SocketError,
-            "QWP/WebSocket all endpoints unreachable; last endpoint {}:{} failed: {}",
-            endpoints[idx].host,
-            endpoints[idx].port,
-            err
-        ),
+        Some((idx, err)) => {
+            let msg = format!(
+                "QWP/WebSocket all endpoints unreachable; last endpoint {}:{} failed: {}",
+                endpoints[idx].host, endpoints[idx].port, err
+            );
+            err.reclassified(crate::ErrorCode::SocketError, msg)
+        }
         None => error::fmt!(SocketError, "QWP/WebSocket all endpoints unreachable"),
     }
 }
@@ -4382,6 +4382,21 @@ mod tests {
             max_in_flight,
         })
         .unwrap()
+    }
+
+    #[cfg(feature = "_oidc")]
+    #[test]
+    fn endpoint_aggregation_preserves_oidc_detail() {
+        let endpoints = [QwpWsEndpoint::new("localhost".into(), "9000".into())];
+        let original = crate::Error::from(crate::oidc::OidcError::interaction_required("sign in"));
+
+        let err = qwp_ws_all_endpoints_unreachable_error(&endpoints, Some((0, original)));
+        assert_eq!(err.code(), crate::ErrorCode::SocketError);
+        assert!(err.msg().contains("localhost:9000"));
+        assert_eq!(
+            err.oidc_error().map(crate::oidc::OidcError::kind),
+            Some(crate::oidc::OidcErrorKind::InteractionRequired)
+        );
     }
 
     #[cfg(any(unix, windows))]

@@ -60,7 +60,7 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 #[cfg(feature = "_egress")]
-use crate::egress::Reader;
+use crate::egress::{Reader, ReaderConfig};
 use crate::ingress::conn_events;
 use crate::ingress::rejection_events;
 use crate::ingress::sender::is_candidate_orphan;
@@ -237,12 +237,11 @@ pub struct QuestDb {
 }
 
 struct DbInner {
-    /// Original connect string. Kept verbatim so the reader pool
-    /// (`Reader::from_conf`) can spin up a new connection with the same
-    /// settings. The sender pools connect through pre-parsed builders so they
-    /// can override only the managed disk-SF slot id.
+    /// Reusable reader configuration. Kept as a resolved config rather than the
+    /// original connect string so programmatic state such as a rotating token
+    /// provider is inherited by every pooled reader connection.
     #[cfg(feature = "_egress")]
-    conf: String,
+    reader_config: ReaderConfig,
     /// Resolved, reusable QWP/WebSocket connect ingredients (endpoint list,
     /// TLS, auth, config). Every sender connection — first-borrow open,
     /// auto-grow, and failover re-borrow — opens through this connector so it rotates
@@ -786,6 +785,48 @@ impl QuestDb {
     /// producer-side abort logic belongs with the terminal error raised by
     /// the sender calls themselves.
     pub fn connect_with_handlers(conf: &str, handlers: ConnectHandlers) -> Result<Self> {
+        Self::connect_with_handlers_and_provider(conf, handlers, None)
+    }
+
+    /// [`Self::connect`] with one rotating Bearer-token provider shared by all
+    /// ingestion and query connections created by the pool. The callback is
+    /// pulled on every sender/reader connect and reconnect.
+    ///
+    /// Call an interactive provider once on the main thread before constructing
+    /// an eager pool. Otherwise initial sender/reader prewarming may invoke it
+    /// from connection setup, and lazy/background senders may invoke it from a
+    /// worker thread.
+    pub fn connect_with_token_provider<F, E>(conf: &str, provider: F) -> Result<Self>
+    where
+        F: Fn() -> std::result::Result<String, E> + Send + Sync + 'static,
+        E: Into<crate::Error>,
+    {
+        Self::connect_with_handlers_and_token_provider(conf, ConnectHandlers::default(), provider)
+    }
+
+    /// [`Self::connect_with_handlers`] with one rotating Bearer-token provider
+    /// shared by the sender and reader pools.
+    pub fn connect_with_handlers_and_token_provider<F, E>(
+        conf: &str,
+        handlers: ConnectHandlers,
+        provider: F,
+    ) -> Result<Self>
+    where
+        F: Fn() -> std::result::Result<String, E> + Send + Sync + 'static,
+        E: Into<crate::Error>,
+    {
+        Self::connect_with_handlers_and_provider(
+            conf,
+            handlers,
+            Some(crate::token_provider::TokenProvider::new(provider)),
+        )
+    }
+
+    fn connect_with_handlers_and_provider(
+        conf: &str,
+        handlers: ConnectHandlers,
+        token_provider: Option<crate::token_provider::TokenProvider>,
+    ) -> Result<Self> {
         let conn_events = match handlers.connection_listener {
             Some(listener) => conn_events::ConnectionEventSource::new(
                 listener,
@@ -800,13 +841,14 @@ impl QuestDb {
             ),
             None => rejection_events::RejectionEventSource::logging_default(),
         };
-        Self::connect_impl(conf, conn_events, rejections)
+        Self::connect_impl(conf, conn_events, rejections, token_provider)
     }
 
     fn connect_impl(
         conf: &str,
         conn_events: conn_events::ConnectionEventSource,
         rejections: rejection_events::RejectionEventSource,
+        token_provider: Option<crate::token_provider::TokenProvider>,
     ) -> Result<Self> {
         let parsed = conf::parse(conf)?;
         // The public ingestion pool is always store-and-forward: in-memory
@@ -815,6 +857,17 @@ impl QuestDb {
         let pool_cfg = parsed.pool;
 
         let mut builder = SenderBuilder::from_conf(conf)?;
+        #[cfg(feature = "_egress")]
+        let mut reader_config = ReaderConfig::from_conf(conf)?;
+        if let Some(provider) = token_provider {
+            let sender_provider = provider.clone();
+            builder = builder.qwp_ws_token_provider(move || sender_provider.provide())?;
+            #[cfg(feature = "_egress")]
+            {
+                let reader_provider = provider;
+                reader_config = reader_config.token_provider(move || reader_provider.provide())?;
+            }
+        }
         if pool_cfg.lazy_connect {
             // Java's lazy_connect injects an async initial connect into the
             // ingest config once; every pooled sender then inherits it.
@@ -858,7 +911,7 @@ impl QuestDb {
 
         let inner = Arc::new(DbInner {
             #[cfg(feature = "_egress")]
-            conf: conf.to_owned(),
+            reader_config,
             connector,
             buffer_max_name_len,
             health: Mutex::new(health),
@@ -1391,7 +1444,7 @@ impl QuestDb {
                 armed: true,
             }
         };
-        let reader = Reader::from_conf(&self.inner.conf)?;
+        let reader = Reader::from_config(&self.inner.reader_config)?;
         slot.commit();
         Ok(reader)
     }
@@ -2777,10 +2830,9 @@ fn connect_sfa_pool_with_recovery_candidates(
             force_async_initial_connect,
         )
         .map_err(|err| {
-            crate::Error::new(
-                err.code(),
-                format!("Failed to open store-and-forward sender: {}", err.msg()),
-            )
+            let code = err.code();
+            let msg = format!("Failed to open store-and-forward sender: {}", err.msg());
+            err.reclassified(code, msg)
         })?;
     PooledSenderCore::new_store_and_forward(
         state,
