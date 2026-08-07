@@ -5530,11 +5530,24 @@ mod tests {
         drop(runner);
     }
 
+    // Two 10-byte frames fill this two-segment byte budget. Using byte capacity
+    // keeps the panic/backpressure regression independent of the legacy
+    // max_in_flight window.
+    fn panic_backpressured_queue() -> SfaSlotQueue {
+        let qwp_ws = crate::ingress::SenderBuilder::from_conf(
+            "ws::addr=127.0.0.1:1;sf_max_segment_bytes=48;sf_max_total_bytes=96;",
+        )
+        .unwrap()
+        .qwp_ws
+        .unwrap();
+        open_configured_qwp_ws_queue(&qwp_ws).unwrap()
+    }
+
     #[test]
     fn threaded_runner_panic_terminalizes_and_wakes_backpressured_publisher() {
         let (sent_tx, sent_rx) = mpsc::channel();
         let (panic_tx, panic_rx) = mpsc::channel();
-        let queue = memory_queue(1024, 1);
+        let queue = panic_backpressured_queue();
         let transport = PanicAfterSendTransport {
             sent: sent_tx,
             trigger_panic: panic_rx,
@@ -5544,14 +5557,15 @@ mod tests {
         let mut runner =
             SyncQwpWsRunner::start_driver_with_append_deadline(driver, Duration::from_secs(5));
 
-        runner.publish_replay_payload(b"first").unwrap();
+        runner.publish_replay_payload(b"aaaaaaaaaa").unwrap();
         sent_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        runner.publish_replay_payload(b"bbbbbbbbbb").unwrap();
 
         std::thread::scope(|scope| {
             let (published_tx, published_rx) = mpsc::channel();
             let runner = &mut runner;
             let publish_thread = scope.spawn(move || {
-                let result = runner.publish_replay_payload(b"second");
+                let result = runner.publish_replay_payload(b"cccccccccc");
                 let _ = published_tx.send(result.map(|_| ()));
             });
 
