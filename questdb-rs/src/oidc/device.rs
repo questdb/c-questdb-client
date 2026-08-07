@@ -444,6 +444,12 @@ impl OidcDeviceAuth {
     /// token (`acl.oidc.groups.encoded.in.token=true`), else the `access_token`
     /// — mirroring QuestDB's own selection.
     pub fn token(&self) -> Result<String> {
+        // HTTP providers call this once per flush. On the overwhelmingly common
+        // cache hit, clone only the credential being returned rather than every
+        // secret and metadata field in TokenSet.
+        if let Some(token) = self.cached_selected_if_valid() {
+            return token;
+        }
         let tokens = self.obtain_tokens()?;
         self.select(&tokens)
     }
@@ -532,6 +538,10 @@ impl OidcDeviceAuth {
         }
     }
 
+    fn is_usable(&self, tokens: &TokenSet) -> bool {
+        tokens.is_valid(now_epoch(), DEFAULT_SKEW_SECONDS) && self.has_required_token(tokens)
+    }
+
     // Recover from a poisoned lock rather than propagate the panic: the guarded
     // data (`()` and `Option<TokenSet>`) is always consistent, and a panic in a
     // user-supplied renderer / sleep hook while `acquire` is held must not brick
@@ -547,8 +557,21 @@ impl OidcDeviceAuth {
     fn cached_if_valid(&self) -> Option<TokenSet> {
         let guard = self.lock_tokens();
         let tokens = guard.as_ref()?;
-        if tokens.is_valid(now_epoch(), DEFAULT_SKEW_SECONDS) && self.has_required_token(tokens) {
+        if self.is_usable(tokens) {
             Some(tokens.clone())
+        } else {
+            None
+        }
+    }
+
+    /// The token-specific cache fast path. Keep the guard while selecting so the
+    /// returned string is a consistent owned snapshot, but clone only the served
+    /// credential rather than the whole [`TokenSet`].
+    fn cached_selected_if_valid(&self) -> Option<Result<String>> {
+        let guard = self.lock_tokens();
+        let tokens = guard.as_ref()?;
+        if self.is_usable(tokens) {
+            Some(self.select(tokens))
         } else {
             None
         }

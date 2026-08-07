@@ -1212,6 +1212,38 @@ fn device_endpoint_missing_required_field_errors() {
 // -- token-cache hygiene -----------------------------------------------------
 
 #[test]
+fn cached_token_fast_path_selects_only_required_credential() {
+    for (groups_in_token, expected) in [(false, "AT-cached"), (true, "ID-cached")] {
+        let auth = OidcDeviceAuth::builder()
+            .client_id("questdb")
+            .device_authorization_endpoint("https://idp.example.com/device")
+            .token_endpoint("https://idp.example.com/token")
+            .groups_in_token(groups_in_token)
+            .interactive(false)
+            .build()
+            .unwrap();
+        let now = now_epoch();
+        *auth.tokens.lock().unwrap() = Some(TokenSet {
+            access_token: Some("AT-cached".to_string()),
+            id_token: Some("ID-cached".to_string()),
+            refresh_token: Some("RT-cached".to_string()),
+            expires_at: now + 300.0,
+            token_type: "Bearer".to_string(),
+            scope: Some("openid".to_string()),
+            sub: Some("subject".to_string()),
+            issued_at: now,
+        });
+
+        assert_eq!(auth.token().unwrap(), expected);
+        // The explicit snapshot API still returns the complete token state.
+        let snapshot = auth.token_set().unwrap();
+        assert_eq!(snapshot.access_token.as_deref(), Some("AT-cached"));
+        assert_eq!(snapshot.id_token.as_deref(), Some("ID-cached"));
+        assert_eq!(snapshot.refresh_token.as_deref(), Some("RT-cached"));
+    }
+}
+
+#[test]
 fn stale_token_cleared_when_no_refresh_and_device_flow_fails() {
     // A cached token with NO refresh token, forced expired: obtain_tokens must
     // clear it before the interactive flow, so a failing device flow leaves no
