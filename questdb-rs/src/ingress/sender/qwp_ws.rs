@@ -3246,11 +3246,10 @@ pub(crate) fn connect_qwp_ws_endpoint_round<A: QwpWsHealthAccess>(
 
     // A token provider (e.g. OIDC) is pulled fresh on every (re)connect round,
     // overriding the static basic/token header, so a long-lived sender keeps a
-    // valid Bearer as the token rotates. `bearer_header` classifies the failure:
-    // a transient SocketError stays retryable so the reconnect loop tries again
-    // as the token's silent refresh recovers, while any other failure surfaces as
-    // a terminal AuthError that aborts the reconnect (`reconnect_error_is_terminal`)
-    // instead of looping on a permanent error.
+    // valid Bearer as the token rotates. Provider acquisition/validation failures
+    // are retryable SocketErrors: the next invocation may recover, and accepted
+    // store-and-forward frames must remain drainable. Server authentication
+    // rejections happen later in the handshake and remain terminal AuthErrors.
     let provided_header = match qwp_ws.token_provider.as_ref() {
         Some(provider) => Some(provider.bearer_header()?),
         None => None,

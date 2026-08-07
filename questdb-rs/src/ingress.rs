@@ -1646,9 +1646,12 @@ impl SenderBuilder {
     /// keeps working as the token silently refreshes / rotates. The returned token
     /// is sent as the `Authorization: Bearer <token>` handshake header; a token
     /// with a non-printable-ASCII character (a header-injection vector) is
-    /// rejected. A provider error fails that connection attempt. Mutually
-    /// exclusive with [`username`](Self::username) / [`password`](Self::password) /
-    /// [`token`](Self::token); QWP/WebSocket only.
+    /// rejected. A provider error fails that connection attempt and is retried by
+    /// the reconnect loop because the callback may recover on its next invocation;
+    /// already accepted store-and-forward frames remain queued. A server rejection
+    /// of a successfully acquired token is a separate terminal authentication
+    /// error. Mutually exclusive with [`username`](Self::username) /
+    /// [`password`](Self::password) / [`token`](Self::token); QWP/WebSocket only.
     ///
     /// **Use [`Protocol::Wss`]** (TLS): the
     /// token is a bearer credential, sent in cleartext over plain

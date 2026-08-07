@@ -4581,6 +4581,25 @@ mod tests {
     }
 
     #[test]
+    fn reconnect_retries_provider_failures_but_terminalizes_server_auth_rejection() {
+        let provider = crate::token_provider::TokenProvider::new(|| {
+            Err::<String, _>(Error::new(ErrorCode::ConfigError, "refresh unavailable"))
+        });
+        let provider_error = provider.bearer_header().unwrap_err();
+        assert_eq!(provider_error.code(), ErrorCode::SocketError);
+        assert!(
+            !reconnect_error_is_terminal(&provider_error),
+            "a callback can recover on its next invocation, so its failure must not poison SFA data"
+        );
+
+        let server_rejection = Error::new(ErrorCode::AuthError, "server rejected Bearer token");
+        assert!(
+            reconnect_error_is_terminal(&server_rejection),
+            "a completed handshake authentication rejection remains terminal"
+        );
+    }
+
+    #[test]
     fn reconnect_catch_up_splits_across_frames_when_server_caps_batch() {
         // Five recovered symbols and a server batch cap too small for a one-frame
         // re-registration: the driver must split the catch-up across multiple

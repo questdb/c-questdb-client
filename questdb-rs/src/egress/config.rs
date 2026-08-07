@@ -1074,8 +1074,10 @@ impl ReaderConfig {
     /// reader keeps working as the token silently refreshes / rotates. The token
     /// is sent as the `Authorization: Bearer <token>` handshake header; a token
     /// with a non-printable-ASCII character (a header-injection vector) is
-    /// rejected, and a provider error fails that connection attempt. Use TLS
-    /// (`wss://`) so the bearer credential isn't sent in cleartext.
+    /// rejected, and a provider error fails that connection attempt. Provider
+    /// acquisition failures are retryable because the callback may recover on its
+    /// next invocation; a server rejection of an acquired token remains terminal.
+    /// Use TLS (`wss://`) so the bearer credential isn't sent in cleartext.
     ///
     /// ```no_run
     /// # #[cfg(all(feature = "oidc", feature = "sync-reader-qwp-ws"))] {
@@ -1312,11 +1314,11 @@ impl ReaderConfig {
         }
         // A rotating token provider (e.g. OIDC), pulled fresh here on every
         // (re)connect, overrides any static basic/token auth. `bearer_header`
-        // already classifies a provider failure (transient SocketError vs
-        // terminal AuthError); preserve that code across the crate→egress error
-        // boundary so the reader's failover retries a transient OIDC refresh blip
-        // (SocketError is failover-eligible) on the next reconnect instead of
-        // being killed by it, while a permanent failure still aborts.
+        // classifies every provider acquisition/validation failure as retryable:
+        // the callback can recover on its next invocation. Preserve that code
+        // across the crate→egress error boundary so failover polls it again.
+        // Server authentication rejection remains a separate terminal AuthError
+        // produced by the handshake after header construction succeeds.
         if let Some(provider) = &self.token_provider {
             let header = provider.bearer_header().map_err(|e| {
                 if e.code() == crate::ErrorCode::SocketError {
@@ -1723,11 +1725,11 @@ mod tests {
             .token_provider(|| Ok::<_, crate::Error>("bad\r\ntoken".to_string()))
             .unwrap();
         let err = c.upgrade_headers().unwrap_err();
-        assert_eq!(err.code(), ErrorCode::AuthError);
+        assert_eq!(err.code(), ErrorCode::SocketError);
     }
 
     #[test]
-    fn token_provider_error_propagates() {
+    fn token_provider_error_is_retryable() {
         let c = ReaderConfig::from_conf("wss::addr=h:1")
             .unwrap()
             .token_provider(|| {
@@ -1735,7 +1737,7 @@ mod tests {
             })
             .unwrap();
         let err = c.upgrade_headers().unwrap_err();
-        assert_eq!(err.code(), ErrorCode::AuthError);
+        assert_eq!(err.code(), ErrorCode::SocketError);
     }
 
     #[test]
@@ -1753,7 +1755,8 @@ mod tests {
         let err = c.upgrade_headers().unwrap_err();
         assert_eq!(err.code(), ErrorCode::SocketError);
 
-        // A permanent provider error stays terminal (AuthError aborts the reconnect).
+        // A non-socket provider error is still acquisition-local: the callback can
+        // recover on a later invocation, so failover must poll it again too.
         let c = ReaderConfig::from_conf("wss::addr=h:1")
             .unwrap()
             .token_provider(|| {
@@ -1761,7 +1764,7 @@ mod tests {
             })
             .unwrap();
         let err = c.upgrade_headers().unwrap_err();
-        assert_eq!(err.code(), ErrorCode::AuthError);
+        assert_eq!(err.code(), ErrorCode::SocketError);
     }
 
     #[test]
