@@ -340,23 +340,20 @@ pub trait TokenStore: Send + Sync {
     /// refresh by another process sharing this identity is observed rather than
     /// raced, and return its result.
     ///
-    /// The default runs `action` with no locking, which is correct for a single
-    /// process or a non-rotating refresh token; [`FileTokenStore`] overrides it
-    /// with a lock-file protocol. **Most stores should NOT override this.**
+    /// Every store must provide real coordination for all processes sharing its
+    /// backing state. The implementation must either invoke `action` exactly
+    /// once, synchronously, with the lock held for the whole call, or return
+    /// `Err` without invoking it. Running the action without ownership can reuse
+    /// and revoke a rotating refresh-token family.
     ///
-    /// An override that provides cross-process coordination must either invoke
-    /// `action` exactly once, synchronously, with the lock held for the whole
-    /// call, or return `Err` without invoking it. It must never claim
-    /// cross-process coordination and then run the action without ownership:
-    /// doing so can reuse and revoke a rotating refresh token.
+    /// A store used by only one process may coordinate with an in-process mutex,
+    /// but that limitation belongs in the store's own explicit contract; there
+    /// is deliberately no unlocked default.
     fn in_lock(
         &self,
         key: &TokenStoreKey,
         action: &mut dyn FnMut() -> TokenStoreResult<()>,
-    ) -> TokenStoreResult<()> {
-        let _ = key;
-        action()
-    }
+    ) -> TokenStoreResult<()>;
 }
 
 // ---------------------------------------------------------------------------

@@ -1994,6 +1994,13 @@ fn transient_store_load_error_is_retried_not_latched() {
         fn clear(&self, key: &TokenStoreKey) -> TokenStoreResult<()> {
             self.inner.clear(key)
         }
+        fn in_lock(
+            &self,
+            key: &TokenStoreKey,
+            action: &mut dyn FnMut() -> TokenStoreResult<()>,
+        ) -> TokenStoreResult<()> {
+            self.inner.in_lock(key, action)
+        }
     }
 
     let mock = MockServer::start(|_, _, _| (404, "{}".to_string()));
