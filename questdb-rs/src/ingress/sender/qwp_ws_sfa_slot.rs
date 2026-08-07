@@ -38,6 +38,7 @@ use std::fs;
 use std::fs::{File, OpenOptions};
 use std::io;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 #[cfg(unix)]
 use std::os::fd::AsRawFd;
@@ -56,6 +57,7 @@ use windows_sys::Win32::System::IO::OVERLAPPED;
 
 use super::qwp_ws_driver::{DriverError, PublicationLog};
 use super::qwp_ws_queue::{QwpReceipt, QwpReceiptStatus};
+use super::qwp_ws_sfa_manifest::sync_directory;
 use super::qwp_ws_sfa_queue::{
     SfaCleanupFailure, SfaFrameQueue, SfaMemoryQueueOptions, SfaProducer, SfaQueueError,
     SfaQueueOptions, SfaStorageFinish, SfaStorageResult, SfaStorageStep,
@@ -73,6 +75,7 @@ pub(crate) struct SfaSlotOptions {
     pub(crate) sender_id: String,
     pub(crate) segment_size_bytes: u64,
     pub(crate) max_bytes: usize,
+    pub(crate) periodic_sync_interval: Option<Duration>,
 }
 
 #[derive(Debug)]
@@ -86,13 +89,18 @@ impl SfaSlotQueue {
         validate_sender_id(&options.sender_id)?;
         validate_sf_dir(&options.sf_dir)?;
         ensure_dir(&options.sf_dir)?;
+        let periodic_sync = options.periodic_sync_interval.is_some();
+        if periodic_sync {
+            sync_parent_directory(&options.sf_dir)?;
+        }
 
         let slot_dir = options.sf_dir.join(&options.sender_id);
-        let lock = SlotLock::acquire(slot_dir.clone())?;
+        let lock = SlotLock::acquire(slot_dir.clone(), periodic_sync)?;
         let queue = SfaFrameQueue::open(SfaQueueOptions {
             slot_dir,
             segment_size_bytes: options.segment_size_bytes,
             max_bytes: options.max_bytes,
+            periodic_sync_interval: options.periodic_sync_interval,
         })?;
 
         Ok(Self {
@@ -109,7 +117,10 @@ impl SfaSlotQueue {
     pub(crate) fn open_replay_only_existing(
         options: SfaQueueOptions,
     ) -> Result<Self, SfaQueueError> {
-        let lock = SlotLock::acquire_existing(options.slot_dir.clone())?;
+        let lock = SlotLock::acquire_existing(
+            options.slot_dir.clone(),
+            options.periodic_sync_interval.is_some(),
+        )?;
         let queue = SfaFrameQueue::open_replay_only(options)?;
         Ok(Self {
             queue,
@@ -119,7 +130,9 @@ impl SfaSlotQueue {
 
     pub(crate) fn close(&mut self) -> Result<(), SfaQueueError> {
         let result = self.queue.close();
-        drop(self.lock.take());
+        if result.is_ok() {
+            drop(self.lock.take());
+        }
         result
     }
 
@@ -163,6 +176,14 @@ impl PublicationLog for SfaSlotQueue {
         self.queue.progress_view()
     }
 
+    fn check_durability(&self) -> Result<(), DriverError> {
+        Ok(self.queue.check_durability()?)
+    }
+
+    fn storage_maintenance_in_flight(&self) -> Result<bool, DriverError> {
+        Ok(self.queue.storage_maintenance_in_flight()?)
+    }
+
     fn take_storage_maintenance_step(
         &mut self,
         allow_create: bool,
@@ -178,6 +199,10 @@ impl PublicationLog for SfaSlotQueue {
         Ok(self
             .queue
             .finish_storage_maintenance(result, allow_install)?)
+    }
+
+    fn complete_storage_maintenance(&mut self) -> Result<(), DriverError> {
+        Ok(self.queue.complete_storage_maintenance()?)
     }
 
     fn record_storage_cleanup_failure(
@@ -220,13 +245,16 @@ struct SlotLock {
 }
 
 impl SlotLock {
-    fn acquire(slot_dir: PathBuf) -> Result<Self, SfaQueueError> {
+    fn acquire(slot_dir: PathBuf, sync_parent: bool) -> Result<Self, SfaQueueError> {
         validate_slot_dir(&slot_dir)?;
         ensure_dir(&slot_dir)?;
+        if sync_parent {
+            sync_parent_directory(&slot_dir)?;
+        }
         Self::lock_file(slot_dir)
     }
 
-    fn acquire_existing(slot_dir: PathBuf) -> Result<Self, SfaQueueError> {
+    fn acquire_existing(slot_dir: PathBuf, sync_parent: bool) -> Result<Self, SfaQueueError> {
         validate_slot_dir(&slot_dir)?;
         if !slot_dir.is_dir() {
             return Err(io::Error::new(
@@ -234,6 +262,9 @@ impl SlotLock {
                 format!("SFA slot directory does not exist: {}", slot_dir.display()),
             )
             .into());
+        }
+        if sync_parent {
+            sync_parent_directory(&slot_dir)?;
         }
         Self::lock_file(slot_dir)
     }
@@ -298,6 +329,15 @@ fn ensure_dir(path: &Path) -> Result<(), io::Error> {
         Err(err) if err.kind() == io::ErrorKind::AlreadyExists && path.is_dir() => Ok(()),
         Err(err) => Err(err),
     }
+}
+
+fn sync_parent_directory(path: &Path) -> Result<(), io::Error> {
+    let parent = match path.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent,
+        Some(_) => Path::new("."),
+        None => path,
+    };
+    sync_directory(parent)
 }
 
 fn read_lock_holder(pid_path: &Path) -> String {
@@ -383,7 +423,9 @@ fn unlock_lock_file(file: &File) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ingress::sender::qwp_ws_sfa_segment::spare_segment_path;
+    use crate::ingress::sender::qwp_ws_sfa_segment::{
+        fail_sync_after_for_test, scan_file, spare_segment_path,
+    };
     use tempfile::TempDir;
 
     fn options(sf_dir: &Path, sender_id: &str) -> SfaSlotOptions {
@@ -392,6 +434,7 @@ mod tests {
             sender_id: sender_id.to_owned(),
             segment_size_bytes: 256,
             max_bytes: 1024,
+            periodic_sync_interval: None,
         }
     }
 
@@ -400,6 +443,7 @@ mod tests {
             slot_dir,
             segment_size_bytes: 256,
             max_bytes: 1024,
+            periodic_sync_interval: None,
         }
     }
 
@@ -467,6 +511,60 @@ mod tests {
 
     #[cfg(any(unix, windows))]
     #[test]
+    fn periodic_close_failure_keeps_the_slot_locked_until_retry_succeeds() {
+        let temp = TempDir::new().unwrap();
+        let sf_dir = temp.path().join("sf-root");
+        let mut slot_options = options(&sf_dir, "periodic");
+        slot_options.periodic_sync_interval = Some(Duration::from_secs(3600));
+        let mut first = SfaSlotQueue::open(slot_options.clone()).unwrap();
+        first.queue.try_submit(b"queued").unwrap();
+
+        fail_sync_after_for_test(0);
+        assert!(first.close().is_err());
+        assert!(matches!(
+            SfaSlotQueue::open(slot_options.clone()).unwrap_err(),
+            SfaQueueError::SlotInUse { .. }
+        ));
+
+        first.close().unwrap();
+        SfaSlotQueue::open(slot_options).unwrap();
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn periodic_close_retry_failure_releases_lock_with_data_recoverable() {
+        // The documented terminal path: close fails, the Drop retry fails
+        // too, and field destruction releases the flock. The queued data
+        // must remain on disk and adoptable by the next opener.
+        let temp = TempDir::new().unwrap();
+        let sf_dir = temp.path().join("sf-root");
+        let mut slot_options = options(&sf_dir, "periodic");
+        slot_options.periodic_sync_interval = Some(Duration::from_secs(3600));
+        let mut first = SfaSlotQueue::open(slot_options.clone()).unwrap();
+        first.queue.try_submit(b"queued").unwrap();
+
+        fail_sync_after_for_test(0);
+        assert!(first.close().is_err());
+        fail_sync_after_for_test(0);
+        drop(first);
+
+        let slot_dir = sf_dir.join("periodic");
+        let recovered_payloads: Vec<(u64, Vec<u8>)> = std::fs::read_dir(&slot_dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter(|path| path.extension().is_some_and(|ext| ext == "sfa"))
+            .flat_map(|path| scan_file(&path).unwrap().frames)
+            .map(|frame| (frame.fsn, frame.payload))
+            .collect();
+        assert_eq!(recovered_payloads, [(0, b"queued".to_vec())]);
+
+        let reopened = SfaSlotQueue::open(slot_options).unwrap();
+        assert_eq!(reopened.queue.oldest_unresolved_fsn(), Some(0));
+        assert_eq!(reopened.queue.completed_fsn(), None);
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
     fn distinct_sender_ids_are_independent_slots() {
         let temp = TempDir::new().unwrap();
         let sf_dir = temp.path().join("sf-root");
@@ -501,33 +599,66 @@ mod tests {
     #[cfg(any(unix, windows))]
     #[test]
     fn subprocess_holder_releases_slot_lock_on_exit() {
-        use std::time::Duration;
-
         let temp = TempDir::new().unwrap();
         let sf_dir = temp.path().join("sf-root");
-        let ready_path = temp.path().join("holder-ready");
-        let release_path = temp.path().join("holder-release");
-        let mut holder = slot_lock_helper_command("hold", &sf_dir, DEFAULT_SENDER_ID)
-            .env("QDB_SFA_SLOT_CHILD_READY", &ready_path)
-            .env("QDB_SFA_SLOT_CHILD_RELEASE", &release_path)
-            .spawn()
-            .unwrap();
+        let mut holder = ChildGuard::new(
+            slot_lock_helper_command(&sf_dir, DEFAULT_SENDER_ID)
+                .spawn()
+                .unwrap(),
+        );
+        let holder_pid = holder.id();
+        let holder_stdout = holder.take_stdout().unwrap();
+        let (ready_rx, output_reader) = read_slot_lock_holder_output(holder_stdout);
+        let ready_pid = match ready_rx.recv_timeout(SLOT_LOCK_HELPER_WATCHDOG) {
+            Ok(Ok(pid)) => pid,
+            ready_result => {
+                let termination = holder.terminate_and_wait();
+                let output = if termination.is_ok() {
+                    output_reader.join().unwrap()
+                } else {
+                    "holder output unavailable because termination failed".to_owned()
+                };
+                panic!(
+                    "slot-lock holder did not become ready [result={ready_result:?}, \
+                     termination={termination:?}, output={output:?}]"
+                );
+            }
+        };
+        assert_eq!(ready_pid, holder_pid);
 
-        wait_for_path(&ready_path, Duration::from_secs(5));
+        let err = SfaSlotQueue::open(options(&sf_dir, DEFAULT_SENDER_ID)).unwrap_err();
+        assert!(matches!(
+            err,
+            SfaQueueError::SlotInUse {
+                slot_dir,
+                holder
+            } if slot_dir == sf_dir.join(DEFAULT_SENDER_ID)
+                && holder == format!("pid={holder_pid}")
+        ));
 
-        let mut contender = slot_lock_helper_command("contend", &sf_dir, DEFAULT_SENDER_ID)
-            .env("QDB_SFA_SLOT_CHILD_HOLDER_PID", holder.id().to_string())
-            .spawn()
-            .unwrap();
-        wait_for_child(&mut contender, Duration::from_secs(5));
+        let status = holder.terminate_and_wait().unwrap();
+        assert!(!status.success(), "holder exited before it was terminated");
+        let holder_output = output_reader.join().unwrap();
 
-        fs::write(&release_path, b"release\n").unwrap();
-        wait_for_child(&mut holder, Duration::from_secs(5));
-
-        let mut acquirer = slot_lock_helper_command("acquire", &sf_dir, DEFAULT_SENDER_ID)
-            .spawn()
-            .unwrap();
-        wait_for_child(&mut acquirer, Duration::from_secs(5));
+        let deadline = std::time::Instant::now() + SLOT_LOCK_HELPER_WATCHDOG;
+        let mut acquired = loop {
+            match SfaSlotQueue::open(options(&sf_dir, DEFAULT_SENDER_ID)) {
+                Ok(queue) => break queue,
+                Err(SfaQueueError::SlotInUse { .. }) if std::time::Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Err(err) => panic!(
+                    "slot-lock takeover failed after holder exit \
+                     [error={err:?}, holder-output={holder_output:?}]"
+                ),
+            }
+        };
+        let pid_path = sf_dir.join(DEFAULT_SENDER_ID).join(LOCK_PID_FILE_NAME);
+        assert_eq!(
+            fs::read_to_string(pid_path).unwrap().trim(),
+            std::process::id().to_string()
+        );
+        acquired.close().unwrap();
     }
 
     #[cfg(any(unix, windows))]
@@ -537,47 +668,24 @@ mod tests {
         let Ok(mode) = std::env::var("QDB_SFA_SLOT_CHILD_MODE") else {
             return;
         };
+        assert_eq!(mode, "hold");
         let sf_dir = PathBuf::from(std::env::var_os("QDB_SFA_SLOT_CHILD_SF_DIR").unwrap());
         let sender_id = std::env::var("QDB_SFA_SLOT_CHILD_SENDER_ID").unwrap();
+        ensure_dir(&sf_dir).unwrap();
+        let _lock = SlotLock::acquire(sf_dir.join(sender_id), false).unwrap();
 
-        match mode.as_str() {
-            "hold" => {
-                use std::time::Duration;
-
-                let ready_path =
-                    PathBuf::from(std::env::var_os("QDB_SFA_SLOT_CHILD_READY").unwrap());
-                let release_path =
-                    PathBuf::from(std::env::var_os("QDB_SFA_SLOT_CHILD_RELEASE").unwrap());
-                let _queue = SfaSlotQueue::open(options(&sf_dir, &sender_id)).unwrap();
-                fs::write(&ready_path, b"ready\n").unwrap();
-                wait_for_path(&release_path, Duration::from_secs(30));
-            }
-            "contend" => {
-                let holder_pid = std::env::var("QDB_SFA_SLOT_CHILD_HOLDER_PID").unwrap();
-                let err = SfaSlotQueue::open(options(&sf_dir, &sender_id)).unwrap_err();
-                assert!(matches!(
-                    err,
-                    SfaQueueError::SlotInUse {
-                        slot_dir,
-                        holder
-                    } if slot_dir == sf_dir.join(&sender_id)
-                        && holder == format!("pid={holder_pid}")
-                ));
-            }
-            "acquire" => {
-                let queue = SfaSlotQueue::open(options(&sf_dir, &sender_id)).unwrap();
-                assert_eq!(queue.slot_dir(), Some(sf_dir.join(&sender_id).as_path()));
-            }
-            mode => panic!("unknown slot lock helper mode: {mode}"),
-        }
+        use std::io::{Read, Write};
+        println!("{SLOT_LOCK_HELPER_READY_PREFIX}{}", std::process::id());
+        std::io::stdout().flush().unwrap();
+        let mut release = [0u8; 1];
+        std::io::stdin()
+            .read_exact(&mut release)
+            .expect("slot-lock holder stdin closed before forced termination");
+        panic!("slot-lock holder was released without process termination");
     }
 
     #[cfg(any(unix, windows))]
-    fn slot_lock_helper_command(
-        mode: &str,
-        sf_dir: &Path,
-        sender_id: &str,
-    ) -> std::process::Command {
+    fn slot_lock_helper_command(sf_dir: &Path, sender_id: &str) -> std::process::Command {
         const HELPER_TEST: &str =
             "ingress::sender::qwp_ws_sfa_slot::tests::qwp_ws_sfa_slot_child_process_lock_helper";
 
@@ -587,42 +695,124 @@ mod tests {
             .arg("--exact")
             .arg("--ignored")
             .arg("--nocapture")
-            .env("QDB_SFA_SLOT_CHILD_MODE", mode)
+            .env("QDB_SFA_SLOT_CHILD_MODE", "hold")
             .env("QDB_SFA_SLOT_CHILD_SF_DIR", sf_dir)
-            .env("QDB_SFA_SLOT_CHILD_SENDER_ID", sender_id);
+            .env("QDB_SFA_SLOT_CHILD_SENDER_ID", sender_id)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped());
         command
     }
 
     #[cfg(any(unix, windows))]
-    fn wait_for_path(path: &Path, timeout: std::time::Duration) {
-        use std::thread;
-        use std::time::{Duration, Instant};
+    const SLOT_LOCK_HELPER_READY_PREFIX: &str = "QDB_SFA_SLOT_CHILD_READY:";
+    #[cfg(any(unix, windows))]
+    const SLOT_LOCK_HELPER_WATCHDOG: Duration = Duration::from_secs(120);
 
-        let deadline = Instant::now() + timeout;
-        while Instant::now() < deadline {
-            if path.exists() {
-                return;
+    #[cfg(any(unix, windows))]
+    fn read_slot_lock_holder_output(
+        stdout: std::process::ChildStdout,
+    ) -> (
+        std::sync::mpsc::Receiver<Result<u32, String>>,
+        std::thread::JoinHandle<String>,
+    ) {
+        use std::io::BufRead;
+
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let reader = std::thread::spawn(move || {
+            let mut output = String::new();
+            let mut ready_sent = false;
+            for line in std::io::BufReader::new(stdout).lines() {
+                match line {
+                    Ok(line) => {
+                        output.push_str(&line);
+                        output.push('\n');
+                        if !ready_sent && let Some(index) = line.find(SLOT_LOCK_HELPER_READY_PREFIX)
+                        {
+                            let pid = line[index + SLOT_LOCK_HELPER_READY_PREFIX.len()..]
+                                .trim()
+                                .parse::<u32>()
+                                .map_err(|err| {
+                                    format!("invalid slot-lock holder PID in {line:?}: {err}")
+                                });
+                            let parse_failed = pid.is_err();
+                            let _ = ready_tx.send(pid);
+                            ready_sent = true;
+                            if parse_failed {
+                                break;
+                            }
+                        }
+                    }
+                    Err(err) => {
+                        if !ready_sent {
+                            let _ = ready_tx.send(Err(format!(
+                                "failed to read slot-lock holder output: {err}"
+                            )));
+                            ready_sent = true;
+                        }
+                        break;
+                    }
+                }
             }
-            thread::sleep(Duration::from_millis(10));
-        }
-        panic!("timed out waiting for {}", path.display());
+            if !ready_sent {
+                let _ = ready_tx.send(Err(
+                    "slot-lock holder exited before reporting readiness".to_owned()
+                ));
+            }
+            output
+        });
+        (ready_rx, reader)
     }
 
     #[cfg(any(unix, windows))]
-    fn wait_for_child(child: &mut std::process::Child, timeout: std::time::Duration) {
-        use std::thread;
-        use std::time::{Duration, Instant};
+    struct ChildGuard {
+        child: std::process::Child,
+        reaped: bool,
+    }
 
-        let deadline = Instant::now() + timeout;
-        while Instant::now() < deadline {
-            if let Some(status) = child.try_wait().unwrap() {
-                assert!(status.success(), "child exited with {status}");
+    #[cfg(any(unix, windows))]
+    impl ChildGuard {
+        fn new(child: std::process::Child) -> Self {
+            Self {
+                child,
+                reaped: false,
+            }
+        }
+
+        fn id(&self) -> u32 {
+            self.child.id()
+        }
+
+        fn take_stdout(&mut self) -> Option<std::process::ChildStdout> {
+            self.child.stdout.take()
+        }
+
+        fn terminate_and_wait(&mut self) -> io::Result<std::process::ExitStatus> {
+            if let Some(status) = self.child.try_wait()? {
+                self.reaped = true;
+                return Ok(status);
+            }
+            self.child.kill()?;
+            let status = self.child.wait()?;
+            self.reaped = true;
+            Ok(status)
+        }
+    }
+
+    #[cfg(any(unix, windows))]
+    impl Drop for ChildGuard {
+        fn drop(&mut self) {
+            if self.reaped {
                 return;
             }
-            thread::sleep(Duration::from_millis(10));
+            match self.child.try_wait() {
+                Ok(Some(_)) => {}
+                _ => {
+                    let _ = self.child.kill();
+                }
+            }
+            let _ = self.child.wait();
+            self.reaped = true;
         }
-        let _ = child.kill();
-        panic!("timed out waiting for child process");
     }
 
     #[cfg(not(any(unix, windows)))]

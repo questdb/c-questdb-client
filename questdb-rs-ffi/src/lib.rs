@@ -391,6 +391,59 @@ pub enum line_sender_error_code {
     /// socket drop) so a caller can tell "resend from source" apart from
     /// "reconnect and retry" by code, without matching on the message text.
     line_sender_error_store_resend_required = 36,
+
+    /// The QWP/WebSocket connection-scoped symbol dictionary is full: interning
+    /// another distinct symbol would exceed its entry-count cap (2,000,000,
+    /// matching the server's ingress ceiling) or its cumulative UTF-8 heap cap
+    /// (256 MiB). The failing frame is rejected before any byte reaches the wire
+    /// and the buffer is rolled back, so *that flush* loses nothing and chunks
+    /// referencing only already-interned symbols keep flushing — but retrying a
+    /// *new* symbol on the same sender can never succeed. A full dictionary
+    /// RETIRES the connection on return: a pooled sender is dropped rather than
+    /// recycled (the next borrow gets a fresh, empty-dictionary connection, not the
+    /// same full one), and the frames flushed earlier on it are drained / committed
+    /// best-effort on the way out. So the simplest recovery is to return the sender
+    /// as usual and borrow a fresh one. If those earlier frames must not be lost,
+    /// drain or commit them AND check first:
+    ///
+    /// - Pooled row sender: a plain `questdb_db_return_sender` now retires (does
+    ///   NOT recycle) a full-dictionary connection and drains its queue best-effort
+    ///   within `close_flush_timeout`; the next borrow is fresh. Call
+    ///   `qwp_sender_wait` first if the queued frames must not be lost. With
+    ///   `sf_dir` configured they persist in the slot, but so does the dictionary,
+    ///   and the next borrower re-seeds from that slot's side-file at the same size
+    ///   unless the slot drained first, so wait there too.
+    /// - Pooled direct sender: a plain `questdb_db_return_direct_sender` retires
+    ///   the connection and commits the deferred tail best-effort. Its flushes are
+    ///   deferred, so for a CHECKED guarantee call `qwp_direct_sender_commit` (or a
+    ///   waited flush) and confirm it succeeded before the return. Do NOT use
+    ///   `questdb_db_drop_direct_sender` on a full dictionary: it force-drops and
+    ///   skips the best-effort commit, discarding the tail.
+    /// - Standalone direct sender: `qwp_direct_sender_free` commits the deferred
+    ///   tail best-effort on the way out; call `qwp_direct_sender_commit` and CHECK
+    ///   IT SUCCEEDED first for a guarantee, then `qwp_direct_sender_free` and
+    ///   re-open.
+    /// - Standalone row sender (`line_sender_from_conf` / `_from_env` /
+    ///   `line_sender_build` on a `ws://` or `wss://` address, flushed with
+    ///   `line_sender_flush*`):
+    ///   `line_sender_qwpws_close_drain` and CHECK IT SUCCEEDED, then
+    ///   `line_sender_close` and re-open. This is the MOST lossy flavour on a bare
+    ///   close, not the least: `line_sender_close` does not flush, and nothing
+    ///   drains the QWP/WebSocket queue on the way out, so every
+    ///   published-but-unacked frame is discarded with no wait.
+    ///
+    /// See the symbol-column preamble in `qwp_sender.h`. Distinct from
+    /// `line_sender_error_invalid_api_call` so callers can recognise it without
+    /// matching on the message text.
+    ///
+    /// One exception to "that flush loses nothing", and it matters for resends: a chunk
+    /// too large for a single frame is split and each half published on its own,
+    /// so an earlier half can already be durably queued (store-and-forward is
+    /// at-least-once) when a later half hits the cap. The error is then
+    /// delivery-unknown rather than known-not-delivered — check
+    /// `line_sender_error_in_doubt` before resending, or the rows the committed
+    /// prefix already carried are duplicated.
+    line_sender_error_symbol_dict_full = 37,
 }
 
 /// Neutral spelling of the client-wide error category. The released
@@ -481,6 +534,7 @@ impl From<ErrorCode> for line_sender_error_code {
             ErrorCode::StoreResendRequired => {
                 line_sender_error_code::line_sender_error_store_resend_required
             }
+            ErrorCode::SymbolDictFull => line_sender_error_code::line_sender_error_symbol_dict_full,
             _ => line_sender_error_code::line_sender_error_invalid_api_call,
         }
     }
@@ -4924,6 +4978,7 @@ mod tests {
                 line_sender_error_store_resend_required,
                 36,
             ),
+            (E::SymbolDictFull, line_sender_error_symbol_dict_full, 37),
         ]
     }
 
@@ -4988,6 +5043,135 @@ mod tests {
             "C header declares {header_variants} error-code entries but Rust has {} \
              — a variant was added on one side only",
             c_error_code_abi().len(),
+        );
+    }
+
+    #[test]
+    fn mirrors_of_the_c_error_code_enum_are_complete() {
+        // `c_header_line_sender_enum_matches_rust` guards only `line_sender.h`.
+        // Two more hand-maintained mirrors of the same enum ship alongside it and
+        // had no guard at all, so a newly appended code compiled fine while a C++
+        // or Python caller could not name it. Both are kept in step here.
+        //
+        // Compare parsed ENTRY LISTS, not substrings. A `contains` search over the
+        // whole file passes on every shape this exists to catch: an enumerator
+        // commented out (`// symbol_dict_full = ...` still contains the needle), a
+        // constant that drifted out of `class ClientErrorCode` to module scope
+        // (where `ClientErrorCode.X` then raises `AttributeError`), and ghost
+        // entries Rust does not have. Comparing lists pins ORDER and VALUE too, so
+        // the append-only convention is covered in the same shot -- and values do
+        // matter on the Python side: `ClientErrorCode` is a hand-typed table of
+        // literals the system tests compare against `e.code`
+        // (`arrow_polars_per_dtype.py`, `arrow_egress_fuzz.py`), not something read
+        // back from the library.
+        //
+        // Line endings are normalised first: `include_str!` does not normalise, the
+        // repo carries no `.gitattributes`, and CI runs this crate's tests on
+        // Windows -- so on a CRLF checkout an unnormalised needle fails every entry.
+
+        /// The text between `open` and the next `close`, exclusive.
+        fn slice_between<'a>(hay: &'a str, open: &str, close: &str) -> Option<&'a str> {
+            let start = hay.find(open)? + open.len();
+            let len = hay[start..].find(close)?;
+            Some(&hay[start..start + len])
+        }
+
+        /// The indented body of a Python class: everything after the `class` line
+        /// up to (not including) the next statement at column 0.
+        fn python_class_body<'a>(hay: &'a str, header: &str) -> Option<&'a str> {
+            let rest = &hay[hay.find(header)? + header.len()..];
+            let end = rest
+                .match_indices('\n')
+                .find(|(i, _)| rest[i + 1..].starts_with(|c: char| !c.is_whitespace()))
+                .map_or(rest.len(), |(i, _)| i);
+            Some(&rest[..end])
+        }
+
+        /// `NAME = VALUE` entries in file order. Skips blank lines, `comment`
+        /// lines, and anything that is not a bare assignment to an identifier of
+        /// the expected case -- which is what drops the Python docstring and any
+        /// prose that happens to contain ` = `.
+        fn entries(body: &str, comment: &str, upper: bool) -> Vec<(String, String)> {
+            body.lines()
+                .map(str::trim)
+                .filter(|l| !l.is_empty() && !l.starts_with(comment))
+                .filter_map(|l| {
+                    let (name, value) = l.strip_suffix(',').unwrap_or(l).split_once(" = ")?;
+                    let named = !name.is_empty()
+                        && name.chars().all(|c| {
+                            c == '_'
+                                || c.is_ascii_digit()
+                                || if upper {
+                                    c.is_ascii_uppercase()
+                                } else {
+                                    c.is_ascii_lowercase()
+                                }
+                        });
+                    named.then(|| (name.to_string(), value.trim().to_string()))
+                })
+                .collect()
+        }
+
+        let cpp = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../include/questdb/ingress/line_sender_core.hpp"
+        ))
+        .replace("\r\n", "\n");
+        let py = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../system_test/arrow_ffi.py"
+        ))
+        .replace("\r\n", "\n");
+
+        // Slicing to the declaration is load-bearing, not tidiness: it is what
+        // confines the match to the enum / class a caller actually names. A missing
+        // anchor fails loudly rather than silently widening the search to the file.
+        let cpp_body = slice_between(&cpp, "enum class error_code : int\n{\n", "\n};")
+            .expect("line_sender_core.hpp must declare `enum class error_code : int`");
+        let py_body = python_class_body(&py, "\nclass ClientErrorCode:")
+            .expect("arrow_ffi.py must declare `class ClientErrorCode`");
+
+        let (mut want_cpp, mut want_py) = (Vec::new(), Vec::new());
+        for (_code, variant, disc) in c_error_code_abi() {
+            let full = format!("{variant:?}");
+            let short = full
+                .strip_prefix("line_sender_error_")
+                .expect("every variant carries the ABI prefix");
+            want_cpp.push((short.to_string(), format!("::{full}")));
+            want_py.push((short.to_uppercase(), disc.to_string()));
+        }
+
+        /// Names what actually drifted before falling back to a full list diff, so
+        /// a single missing or stray entry does not arrive as two 38-element dumps
+        /// the reader has to diff by eye.
+        fn check(actual: &[(String, String)], want: &[(String, String)], what: &str, shape: &str) {
+            let missing: Vec<_> = want.iter().filter(|e| !actual.contains(e)).collect();
+            let unexpected: Vec<_> = actual.iter().filter(|e| !want.contains(e)).collect();
+            assert!(
+                missing.is_empty() && unexpected.is_empty(),
+                "{what} has drifted from the Rust enum.\n  \
+                 missing (add these): {missing:?}\n  \
+                 unexpected (remove these): {unexpected:?}\n  \
+                 each code appears exactly once, as {shape}",
+            );
+            assert_eq!(
+                actual, want,
+                "{what} holds every code but out of discriminant order -- the mirror \
+                 is append-only, so a reorder means an edit landed in the wrong place",
+            );
+        }
+
+        check(
+            &entries(cpp_body, "//", false),
+            &want_cpp,
+            "`enum class error_code` in include/questdb/ingress/line_sender_core.hpp",
+            "`<short> = ::line_sender_error_<short>,`",
+        );
+        check(
+            &entries(py_body, "#", true),
+            &want_py,
+            "`class ClientErrorCode` in system_test/arrow_ffi.py",
+            "`<SHORT> = <discriminant>`, inside the class body",
         );
     }
 

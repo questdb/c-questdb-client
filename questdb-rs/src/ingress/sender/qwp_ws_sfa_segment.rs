@@ -34,14 +34,48 @@ use std::path::{Path, PathBuf};
 use std::ptr;
 use std::slice;
 use std::sync::Arc;
+#[cfg(unix)]
+use std::sync::OnceLock;
+#[cfg(unix)]
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use memmap2::{MmapMut, MmapOptions};
 
 pub(crate) const FILE_MAGIC: u32 = 0x3130_4653; // 'SF01' in little-endian bytes.
 pub(crate) const VERSION: u8 = 1;
+pub(crate) const MANIFEST_REQUIRED_FLAG: u8 = 1;
 pub(crate) const HEADER_SIZE: usize = 24;
 pub(crate) const FRAME_HEADER_SIZE: usize = 8;
 pub(crate) const INITIAL_SEGMENT_FILE_NAME: &str = "sf-initial.sfa";
+
+#[cfg(unix)]
+static MLOCK_REFUSAL_WARNED: AtomicBool = AtomicBool::new(false);
+
+#[cfg(test)]
+thread_local! {
+    static SYNC_FAILURE_COUNTDOWN: std::cell::Cell<Option<usize>> =
+        const { std::cell::Cell::new(None) };
+}
+
+#[cfg(test)]
+pub(crate) fn fail_sync_after_for_test(successful_calls: usize) {
+    SYNC_FAILURE_COUNTDOWN.with(|countdown| countdown.set(Some(successful_calls)));
+}
+
+#[cfg(test)]
+fn should_fail_sync_for_test() -> bool {
+    SYNC_FAILURE_COUNTDOWN.with(|countdown| match countdown.get() {
+        Some(0) => {
+            countdown.set(None);
+            true
+        }
+        Some(remaining) => {
+            countdown.set(Some(remaining - 1));
+            false
+        }
+        None => false,
+    })
+}
 
 // Keep the payloads in these errors: recovery reports them through Debug today,
 // and tests pattern-match specific corruption details.
@@ -108,6 +142,7 @@ pub(crate) struct SfaFrame {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct SfaSegmentMetadataScan {
     pub(crate) header: SfaSegmentHeader,
+    pub(crate) manifest_required: bool,
     pub(crate) frame_count: u64,
     pub(crate) append_offset: u64,
     pub(crate) torn_tail_bytes: u64,
@@ -139,6 +174,7 @@ pub(crate) struct SfaSegment {
     path: Option<PathBuf>,
     size_bytes: u64,
     header: SfaSegmentHeader,
+    manifest_required: bool,
     append_offset: u64,
     frame_count: u64,
     // Recovery records this on opened segments; queue recovery also reports the
@@ -159,15 +195,17 @@ struct SfaSegmentMapping {
     // future field gains one it must be declared *above* `_mmap` so munmap
     // runs last.
     //
-    // `_mmap` is owned solely to keep the OS mapping alive (its Drop calls
-    // munmap). All byte access goes through `base`; we deliberately never
-    // re-borrow `MmapMut` after construction. Re-borrowing would synthesise a
-    // transient `&MmapMut` / `&mut MmapMut` covering the full mapping, which
-    // is aliasing UB once this struct is shared via Arc — even when the byte
-    // ranges touched by concurrent callers are disjoint.
+    // `_mmap` is owned to keep the OS mapping alive (its Drop calls munmap)
+    // and to issue metadata-only flush operations. All byte access goes
+    // through `base`; we deliberately never dereference `MmapMut` after
+    // construction. Dereferencing it would synthesise a transient slice
+    // covering the mapping, which is aliasing UB once this struct is shared
+    // via Arc — even when concurrent callers touch disjoint byte ranges.
     _mmap: MmapMut,
     base: *mut u8,
     len: usize,
+    #[cfg(test)]
+    redirty_passes: std::sync::atomic::AtomicU64,
 }
 
 // SAFETY: `MmapMut` is itself `Send + Sync`. Concurrent access through `base`
@@ -185,7 +223,16 @@ impl SfaSegment {
         size_bytes: u64,
         created_us: u64,
     ) -> Result<Self, SfaSegmentError> {
-        Self::create_inner(path, base_seq, size_bytes, created_us, false)
+        Self::create_inner(path, base_seq, size_bytes, created_us, false, false)
+    }
+
+    pub(crate) fn create_new_manifested(
+        path: impl AsRef<Path>,
+        base_seq: u64,
+        size_bytes: u64,
+        created_us: u64,
+    ) -> Result<Self, SfaSegmentError> {
+        Self::create_inner(path, base_seq, size_bytes, created_us, true, true)
     }
 
     pub(crate) fn create_new(
@@ -194,7 +241,7 @@ impl SfaSegment {
         size_bytes: u64,
         created_us: u64,
     ) -> Result<Self, SfaSegmentError> {
-        Self::create_inner(path, base_seq, size_bytes, created_us, true)
+        Self::create_inner(path, base_seq, size_bytes, created_us, true, false)
     }
 
     pub(crate) fn create_memory(
@@ -208,7 +255,7 @@ impl SfaSegment {
             base_seq,
             created_us,
         };
-        mapping.copy_from(0, &encode_header(header));
+        mapping.copy_from(0, &encode_header(header, false));
 
         Ok(Self {
             file: None,
@@ -216,6 +263,7 @@ impl SfaSegment {
             path: None,
             size_bytes,
             header,
+            manifest_required: false,
             append_offset: HEADER_SIZE as u64,
             frame_count: 0,
             torn_tail_bytes: 0,
@@ -228,6 +276,7 @@ impl SfaSegment {
         size_bytes: u64,
         created_us: u64,
         create_new: bool,
+        manifest_required: bool,
     ) -> Result<Self, SfaSegmentError> {
         validate_new_segment_args(base_seq, size_bytes)?;
 
@@ -259,7 +308,7 @@ impl SfaSegment {
             base_seq,
             created_us,
         };
-        mapping.copy_from(0, &encode_header(header));
+        mapping.copy_from(0, &encode_header(header, manifest_required));
 
         Ok(Self {
             file: Some(file),
@@ -267,6 +316,7 @@ impl SfaSegment {
             path: Some(path.to_path_buf()),
             size_bytes,
             header,
+            manifest_required,
             append_offset: HEADER_SIZE as u64,
             frame_count: 0,
             torn_tail_bytes: 0,
@@ -295,6 +345,7 @@ impl SfaSegment {
             path: Some(path.to_path_buf()),
             size_bytes,
             header: scan.header,
+            manifest_required: scan.manifest_required,
             append_offset: scan.append_offset,
             frame_count: scan.frame_count,
             torn_tail_bytes: scan.torn_tail_bytes,
@@ -360,6 +411,113 @@ impl SfaSegment {
         Ok(())
     }
 
+    pub(crate) fn mark_manifest_required(&mut self) -> Result<(), SfaSegmentError> {
+        if self.path.is_none() || self.manifest_required {
+            return Ok(());
+        }
+        self.mapping
+            .copy_from(5, std::slice::from_ref(&MANIFEST_REQUIRED_FLAG));
+        self.sync_header()?;
+        self.manifest_required = true;
+        Ok(())
+    }
+
+    pub(crate) fn sync_header(&self) -> Result<(), SfaSegmentError> {
+        let Some(file) = self.file.as_ref() else {
+            return Ok(());
+        };
+        self.mapping.flush_range(0, HEADER_SIZE)?;
+        file.sync_all()?;
+        Ok(())
+    }
+
+    pub(crate) fn sync_published_range(
+        &self,
+        durable_offset: u64,
+        published_offset: u64,
+    ) -> Result<(), SfaSegmentError> {
+        let Some(file) = self.file.as_ref() else {
+            return Ok(());
+        };
+        if published_offset <= durable_offset {
+            return Ok(());
+        }
+        let published = usize::try_from(published_offset).map_err(|_| {
+            SfaSegmentError::SizeTooLargeForPlatform {
+                size: published_offset,
+            }
+        })?;
+        if published > self.mapping.len {
+            return Err(SfaSegmentError::OffsetOverflow);
+        }
+
+        let page_size = system_page_size();
+        let durable = usize::try_from(durable_offset).map_err(|_| {
+            SfaSegmentError::SizeTooLargeForPlatform {
+                size: durable_offset,
+            }
+        })?;
+        let lock_offset = durable - durable % page_size;
+        let lock_len = published - lock_offset;
+        #[cfg(unix)]
+        let locked = {
+            let addr = unsafe { self.mapping.base.add(lock_offset) };
+            let locked = unsafe { libc::mlock(addr.cast::<libc::c_void>(), lock_len) } == 0;
+            if !locked && !MLOCK_REFUSAL_WARNED.swap(true, Ordering::AcqRel) {
+                log::warn!(
+                    "mlock refused for SF barrier range in {} (degrading to re-dirty-only retry protection); raise RLIMIT_MEMLOCK or grant CAP_IPC_LOCK to close the post-failure reclaim window",
+                    self.path
+                        .as_deref()
+                        .map_or_else(|| "<memory>".to_string(), |path| path.display().to_string())
+                );
+            }
+            locked
+        };
+
+        let result = self.mapping.flush_range(0, published).and_then(|()| {
+            #[cfg(test)]
+            if should_fail_sync_for_test() {
+                return Err(SfaSegmentError::Io(io::Error::other(
+                    "injected periodic SF sync failure",
+                )));
+            }
+            file.sync_data().map_err(SfaSegmentError::Io)
+        });
+        if result.is_err() {
+            self.mapping
+                .redirty_pages(lock_offset, published, page_size);
+        }
+        #[cfg(unix)]
+        if locked {
+            let addr = unsafe { self.mapping.base.add(lock_offset) };
+            let _ = unsafe { libc::munlock(addr.cast::<libc::c_void>(), lock_len) };
+        }
+        result
+    }
+
+    pub(crate) fn sanitize_torn_tail(&mut self) -> Result<(), SfaSegmentError> {
+        if self.torn_tail_bytes == 0 {
+            return Ok(());
+        }
+        let offset = usize::try_from(self.append_offset).map_err(|_| {
+            SfaSegmentError::SizeTooLargeForPlatform {
+                size: self.append_offset,
+            }
+        })?;
+        let len = usize::try_from(self.size_bytes - self.append_offset).map_err(|_| {
+            SfaSegmentError::SizeTooLargeForPlatform {
+                size: self.size_bytes,
+            }
+        })?;
+        self.mapping.zero_range(offset, len);
+        self.mapping.flush_range(offset, len)?;
+        if let Some(file) = self.file.as_ref() {
+            file.sync_data()?;
+        }
+        self.torn_tail_bytes = 0;
+        Ok(())
+    }
+
     pub(crate) fn frame_offset_for_fsn_with_limit(
         &self,
         fsn: u64,
@@ -408,9 +566,15 @@ impl SfaSegment {
         self.frame_count
     }
 
-    #[cfg(test)]
     pub(crate) fn torn_tail_bytes(&self) -> u64 {
         self.torn_tail_bytes
+    }
+
+    #[cfg(test)]
+    fn redirty_passes(&self) -> u64 {
+        self.mapping
+            .redirty_passes
+            .load(std::sync::atomic::Ordering::Acquire)
     }
 
     pub(crate) fn last_fsn(&self) -> Option<u64> {
@@ -488,6 +652,8 @@ impl SfaSegmentMapping {
             _mmap: mmap,
             base,
             len,
+            #[cfg(test)]
+            redirty_passes: std::sync::atomic::AtomicU64::new(0),
         }
     }
 
@@ -507,6 +673,40 @@ impl SfaSegmentMapping {
         }
     }
 
+    fn zero_range(&self, offset: usize, len: usize) {
+        assert!(offset.checked_add(len).is_some_and(|end| end <= self.len));
+        // SAFETY: recovery owns the segment exclusively and sanitizes only the
+        // unpublished suffix before exposing the mapping to any reader.
+        unsafe {
+            ptr::write_bytes(self.base.add(offset), 0, len);
+        }
+    }
+
+    fn redirty_pages(&self, offset: usize, end: usize, page_size: usize) {
+        #[cfg(test)]
+        self.redirty_passes
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        let mut cursor = offset;
+        while cursor < end {
+            // SAFETY: the checkpoint runs after transport use of the captured
+            // published prefix and the producer writes only beyond it. A
+            // same-value volatile store marks the page dirty without changing
+            // any segment byte, so a retry cannot vacuously succeed after a
+            // failed writeback consumed the kernel's error.
+            unsafe {
+                let ptr = self.base.add(cursor);
+                ptr.write_volatile(ptr.read_volatile());
+            }
+            cursor = cursor.saturating_add(page_size);
+        }
+    }
+
+    fn flush_range(&self, offset: usize, len: usize) -> Result<(), SfaSegmentError> {
+        self._mmap
+            .flush_range(offset, len)
+            .map_err(SfaSegmentError::Io)
+    }
+
     fn with_slice<R>(&self, offset: usize, len: usize, f: impl FnOnce(&[u8]) -> R) -> R {
         f(self.slice(offset, len))
     }
@@ -524,6 +724,26 @@ impl SfaSegmentMapping {
     fn with_full_slice<R>(&self, f: impl FnOnce(&[u8]) -> R) -> R {
         self.with_slice(0, self.len, f)
     }
+}
+
+#[cfg(unix)]
+fn system_page_size() -> usize {
+    static PAGE_SIZE: OnceLock<usize> = OnceLock::new();
+    *PAGE_SIZE.get_or_init(|| {
+        let size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+        usize::try_from(size)
+            .ok()
+            .filter(|size| *size > 0)
+            .unwrap_or(4096)
+    })
+}
+
+#[cfg(not(unix))]
+fn system_page_size() -> usize {
+    // Re-dirtying more than once per OS page is harmless. A 4 KiB stride
+    // covers Windows systems whose actual page size is larger without
+    // depending on another platform API.
+    4096
 }
 
 #[cfg(test)]
@@ -559,6 +779,7 @@ fn scan_segment_metadata_source<S: ReadAt + ?Sized>(
     let raw = scan_segment_source_inner(source, source_len, |_, _, _| Ok(()))?;
     Ok(SfaSegmentMetadataScan {
         header: raw.header,
+        manifest_required: raw.manifest_required,
         frame_count: raw.frame_count,
         append_offset: raw.append_offset,
         torn_tail_bytes: raw.torn_tail_bytes,
@@ -596,6 +817,7 @@ pub(crate) fn scan_segment_bytes(bytes: &[u8]) -> Result<SfaSegmentScan, SfaSegm
 
 struct RawSegmentScan {
     header: SfaSegmentHeader,
+    manifest_required: bool,
     frame_count: u64,
     append_offset: u64,
     torn_tail_bytes: u64,
@@ -629,9 +851,10 @@ fn scan_segment_source_inner<S: ReadAt + ?Sized>(
         return Err(SfaSegmentError::UnsupportedVersion { actual: version });
     }
     let flags = header_buf[5];
-    if flags != 0 {
+    if flags & !MANIFEST_REQUIRED_FLAG != 0 {
         return Err(SfaSegmentError::NonZeroFlags { actual: flags });
     }
+    let manifest_required = flags & MANIFEST_REQUIRED_FLAG != 0;
     let reserved = u16::from_le_bytes([header_buf[6], header_buf[7]]);
     if reserved != 0 {
         return Err(SfaSegmentError::NonZeroReserved { actual: reserved });
@@ -700,6 +923,7 @@ fn scan_segment_source_inner<S: ReadAt + ?Sized>(
 
     Ok(RawSegmentScan {
         header,
+        manifest_required,
         frame_count,
         append_offset: pos,
         torn_tail_bytes: detect_torn_tail(source, source_len, pos)?,
@@ -707,11 +931,15 @@ fn scan_segment_source_inner<S: ReadAt + ?Sized>(
     })
 }
 
-fn encode_header(header: SfaSegmentHeader) -> [u8; HEADER_SIZE] {
+fn encode_header(header: SfaSegmentHeader, manifest_required: bool) -> [u8; HEADER_SIZE] {
     let mut bytes = [0u8; HEADER_SIZE];
     bytes[..4].copy_from_slice(&FILE_MAGIC.to_le_bytes());
     bytes[4] = VERSION;
-    bytes[5] = 0;
+    bytes[5] = if manifest_required {
+        MANIFEST_REQUIRED_FLAG
+    } else {
+        0
+    };
     bytes[6..8].copy_from_slice(&0u16.to_le_bytes());
     bytes[8..16].copy_from_slice(&header.base_seq.to_le_bytes());
     bytes[16..24].copy_from_slice(&header.created_us.to_le_bytes());
@@ -989,6 +1217,34 @@ mod tests {
     }
 
     #[test]
+    fn failed_published_sync_redirties_before_a_successful_retry() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("periodic.sfa");
+        let mut segment = SfaSegment::create(&path, 0, 4096, 1).unwrap();
+        segment.try_append(b"payload").unwrap().unwrap();
+        let published = segment.append_offset();
+
+        fail_sync_after_for_test(0);
+        let err = segment
+            .sync_published_range(HEADER_SIZE as u64, published)
+            .unwrap_err();
+        assert!(
+            format!("{err:?}").contains("injected periodic SF sync failure"),
+            "{err:?}"
+        );
+        assert_eq!(segment.redirty_passes(), 1);
+
+        segment
+            .sync_published_range(HEADER_SIZE as u64, published)
+            .unwrap();
+        assert_eq!(
+            segment.redirty_passes(),
+            1,
+            "successful retry must not re-dirty again"
+        );
+    }
+
+    #[test]
     fn scans_java_segment_header_and_frames_from_golden_bytes() {
         let fixture = java_two_frame_fixture();
         let scan = scan_segment_bytes(&fixture).unwrap();
@@ -1225,10 +1481,13 @@ mod tests {
 
     #[test]
     fn clean_zero_tail_is_not_torn_tail() {
-        let mut bytes = Vec::from(encode_header(SfaSegmentHeader {
-            base_seq: 7,
-            created_us: 11,
-        }));
+        let mut bytes = Vec::from(encode_header(
+            SfaSegmentHeader {
+                base_seq: 7,
+                created_us: 11,
+            },
+            false,
+        ));
         bytes.resize(80, 0);
 
         let scan = scan_segment_bytes(&bytes).unwrap();
@@ -1259,11 +1518,19 @@ mod tests {
             Err(SfaSegmentError::UnsupportedVersion { actual: 2 })
         ));
 
+        let mut manifested = java_two_frame_fixture();
+        manifested[5] = MANIFEST_REQUIRED_FLAG;
+        assert!(
+            scan_segment_metadata_bytes(&manifested)
+                .unwrap()
+                .manifest_required
+        );
+
         let mut bad_flags = java_two_frame_fixture();
-        bad_flags[5] = 1;
+        bad_flags[5] = 2;
         assert!(matches!(
             scan_segment_bytes(&bad_flags),
-            Err(SfaSegmentError::NonZeroFlags { actual: 1 })
+            Err(SfaSegmentError::NonZeroFlags { actual: 2 })
         ));
 
         let mut bad_reserved = java_two_frame_fixture();

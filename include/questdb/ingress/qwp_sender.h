@@ -86,19 +86,27 @@ extern "C" {
  *  Exposes publish-only `qwp_sender_flush_chunk`, combined
  *  `qwp_sender_flush_chunk_and_wait`, FSN-returning publish variants, FSN
  *  progress watermarks, and the `qwp_sender_wait` ack barrier; the
- *  store-and-forward queue owns delivery. */
+ *  store-and-forward queue owns delivery.
+ *
+ *  With `sf_dir`, `sf_durability=memory` is the default and uses the OS page
+ *  cache. Use `sf_durability=periodic` to checkpoint the local replay log.
+ *  `sf_sync_interval_millis` defaults to 5000; it is a target, not a maximum
+ *  loss window. `sf_durability=flush` and `sf_durability=append` are not yet
+ *  supported. End-to-end durability also requires
+ *  `request_durable_ack=on` and a durable ACK from QuestDB Enterprise. */
 typedef struct qwp_sender qwp_sender;
 
-/** Borrowed direct (pipelined, non-store-and-forward) column-major QWP/WS
- *  sender from the always-direct pool, independent of `sf_dir`. Not
- *  thread-safe; belongs to the borrowing thread until returned via
- *  `questdb_db_return_direct_sender`.
+/** Direct (pipelined, non-store-and-forward) column-major QWP/WS sender.
+ *  Either borrowed from the always-direct pool, independent of `sf_dir`, or
+ *  opened standalone by `qwp_direct_sender_from_conf` /
+ *  `qwp_direct_sender_from_opts`. Not thread-safe; belongs to the calling
+ *  thread until released through the matching return, drop, or free function.
  *
  *  Exposes publish-only `qwp_direct_sender_flush`, the
  *  `qwp_direct_sender_commit` boundary, and the Arrow batch variants.
  *  There is no internal failover: on a transient
- *  `line_sender_error_failover_retry` the caller drops the sender, re-borrows
- *  a live one, and re-drives the uncommitted tail from its own source. */
+ *  `line_sender_error_failover_retry` the caller drops the sender, obtains a
+ *  new one, and re-drives the uncommitted tail from its own source. */
 typedef struct qwp_direct_sender qwp_direct_sender;
 
 /** One DataFrame's worth of column buffers destined for one QuestDB table.
@@ -251,8 +259,10 @@ qwp_direct_sender* questdb_db_borrow_direct_sender_with_retry(
  * QWP/WebSocket config string, owning its own connection with no pool — for
  * one-off DataFrame bulk loads without a `questdb_db`. `conf` is a UTF-8
  * string of `conf_len` bytes. Returns NULL on failure and sets `*err_out` if
- * provided. Free the returned handle with `qwp_direct_sender_free` (there
- * is no pool to return it to).
+ * provided. On normal completion free the returned handle with
+ * `qwp_direct_sender_free` (there is no pool to return it to). To discard
+ * uncommitted frames after a failure, call
+ * `questdb_db_drop_direct_sender(NULL, sender)` instead.
  */
 QUESTDB_CLIENT_API
 qwp_direct_sender* qwp_direct_sender_from_conf(
@@ -267,8 +277,10 @@ qwp_direct_sender* qwp_direct_sender_from_conf(
  * the `line_sender_opts_*` builder functions rather than a config string — so
  * this works for a sender configured either way. `opts` is borrowed, not
  * consumed: the caller retains ownership and must still free it. Returns NULL
- * on failure and sets `*err_out` if provided. Free the returned handle with
- * `qwp_direct_sender_free` (there is no pool to return it to).
+ * on failure and sets `*err_out` if provided. On normal completion free the
+ * returned handle with `qwp_direct_sender_free` (there is no pool to return it
+ * to). To discard uncommitted frames after a failure, call
+ * `questdb_db_drop_direct_sender(NULL, sender)` instead.
  */
 QUESTDB_CLIENT_API
 qwp_direct_sender* qwp_direct_sender_from_opts(
@@ -280,6 +292,11 @@ qwp_direct_sender* qwp_direct_sender_from_opts(
  * Invalidates the `sender` pointer. If the sender has latched terminal state,
  * or if the pool has been closed, it is closed instead of recycled. A sender
  * returned with uncommitted pipelined frames has them committed best-effort.
+ * This function is intended only for handles borrowed through
+ * `questdb_db_borrow_direct_sender` /
+ * `questdb_db_borrow_direct_sender_with_retry`. For a standalone handle use
+ * `qwp_direct_sender_free`, or `questdb_db_drop_direct_sender(NULL, sender)` to
+ * discard uncommitted frames after a failure.
  *
  * Mutually exclusive with `questdb_db_drop_direct_sender` on the same
  * `sender`: call exactly one of the two. Calling both (or either twice) is UB.
@@ -290,16 +307,28 @@ void questdb_db_return_direct_sender(
     qwp_direct_sender* sender);
 
 /**
- * Force-drop a borrowed direct sender instead of recycling it. Invalidates
- * `sender`. Accepts NULL and no-ops.
+ * Force-drop a direct sender, closing its connection instead of recycling it
+ * or committing its uncommitted frames. `sender` may be either borrowed from a
+ * pool or returned by `qwp_direct_sender_from_conf` /
+ * `qwp_direct_sender_from_opts`.
+ *
+ * `db` is ignored and may be NULL: `sender` retains the backing information
+ * needed to release itself. Pass the originating `db` for a borrowed handle.
+ * For a standalone handle, pass NULL for `db`.
+ *
+ * Invalidates `sender`. Accepts NULL `sender` and no-ops.
  *
  * Use this after a failure that may have left in-doubt or uncommitted frames
- * on the connection; otherwise a later borrower could commit those frames
- * together with its own batch. Uncommitted frames are discarded with the
- * connection — the caller re-drives them from its own source.
+ * on the connection; for a pooled sender this stops a later borrower from
+ * committing those frames together with its own batch. Uncommitted frames are
+ * discarded with the connection — the caller re-drives them from its own
+ * source. A pooled sender is closed instead of recycled; a standalone sender
+ * is closed outright.
  *
- * Mutually exclusive with `questdb_db_return_direct_sender` on the same
- * `sender`: call exactly one of the two. Calling both (or either twice) is UB.
+ * For a pool-borrowed handle this is mutually exclusive with
+ * `questdb_db_return_direct_sender`; for a standalone handle it is mutually
+ * exclusive with `qwp_direct_sender_free`. Call exactly one matching release
+ * function. Calling more than one (or any release function twice) is UB.
  */
 QUESTDB_CLIENT_API
 void questdb_db_drop_direct_sender(
@@ -307,11 +336,15 @@ void questdb_db_drop_direct_sender(
     qwp_direct_sender* sender);
 
 /**
- * Free a standalone `qwp_direct_sender_from_conf` handle, committing any
- * un-sync'd deferred frames best-effort first (call
- * `qwp_direct_sender_commit` or a waited flush beforehand for delivery
- * certainty). Invalidates `sender`. Accepts NULL and no-ops. For a
- * pool-borrowed handle use `questdb_db_return_direct_sender` instead.
+ * Free a standalone `qwp_direct_sender_from_conf` /
+ * `qwp_direct_sender_from_opts` handle, committing any un-sync'd deferred
+ * frames best-effort first (call `qwp_direct_sender_commit` or a waited flush
+ * beforehand for delivery certainty). Invalidates `sender`. Accepts NULL and
+ * no-ops. For a pool-borrowed handle use
+ * `questdb_db_return_direct_sender` instead. To discard a standalone handle's
+ * uncommitted frames after a failure, use
+ * `questdb_db_drop_direct_sender(NULL, sender)` instead; calling both release
+ * functions (or either twice) is UB.
  */
 QUESTDB_CLIENT_API
 void qwp_direct_sender_free(
@@ -712,12 +745,78 @@ bool qwp_chunk_column_binary(
  * only referenced dict entries against the connection-scoped global
  * symbol table, so `dict_offsets_len - 1` (the number of distinct
  * values — e.g. a wide Pandas `Categorical`) may greatly exceed the
- * referenced set without paying the cost for unused entries. The distinct
+ * referenced set: unused entries are never interned, so they cost nothing
+ * on the wire or against the connection dictionary. They are not free
+ * locally, though, and the cost tracks the *declared* length, not the
+ * referenced count — this call validates the whole declared dictionary's
+ * UTF-8, and each flush fills and scans roughly 9 bytes of scratch per
+ * declared entry, so declare no wider than you need. The distinct
  * entry count is capped at 8,388,608 (2^23) per column, rejected at this
  * append call; each entry's UTF-8 is capped at 1 MiB (1 << 20 bytes),
  * rejected at the next `qwp_sender_flush_chunk` (only referenced entries are
  * interned into the connection dictionary, which is where the length cap
  * applies). Either rejection returns `false` with `*err_out` set.
+ *
+ * Separately, the connection-scoped symbol dictionary — the distinct
+ * symbols actually *referenced* across every column and every chunk sent
+ * on one connection — is capped at 2,000,000 entries, matching the server's
+ * ingress ceiling (`MAX_SYMBOL_DICTIONARY_SIZE`), and at 256 MiB of UTF-8.
+ * The byte cap is client-side only — the server bounds the ingress dictionary
+ * by entry count alone; it keeps the writer in step with the egress reader and
+ * with the store-and-forward side-file's size limit. That cap is reached at
+ * `qwp_sender_flush_chunk*` / `qwp_direct_sender_flush`, not here, and is not
+ * per column: a wide dictionary consumes none of this budget until its entries
+ * are actually referenced. On
+ * hitting it the flush returns `false` with `*err_out` set to
+ * `line_sender_error_symbol_dict_full` — a distinct code, so you can branch on
+ * it without matching on the message text. Chunks referencing only
+ * already-interned symbols keep flushing; only a chunk that introduces a
+ * *new* symbol fails.
+ *
+ * The failing chunk is rejected before any byte reaches the wire, with one
+ * exception that matters for resends: a chunk too large for a single frame is
+ * split and each half published on its own, so an earlier half can already be
+ * durably queued (store-and-forward is at-least-once) when a later half hits
+ * the cap. The flush is then delivery-unknown rather than
+ * known-not-delivered — check `line_sender_error_in_doubt` before resending
+ * the chunk, or the rows the committed prefix already carried are duplicated.
+ *
+ * Resetting the dictionary means discarding the connection that owns it — there
+ * is no per-sender close. A full dictionary RETIRES the connection on return, so
+ * a plain `questdb_db_return_sender` drops it rather than recycling it (the next
+ * borrow gets a fresh, empty-dictionary connection, not the same full one) and
+ * drains / commits its pending frames best-effort on the way out. So the simplest
+ * recovery is to return the sender as usual and borrow a fresh one. Discarding the
+ * connection is NOT automatically lossless for frames already flushed on it, so if
+ * those must not be lost, drain or commit them AND check first:
+ *
+ *   - Pooled sender: a plain `questdb_db_return_sender` now retires (does NOT
+ *     recycle) a full-dictionary connection and drains its queue best-effort
+ *     within `close_flush_timeout`; the next borrow is fresh. Call
+ *     `qwp_sender_wait` first if the queued frames must not be lost. This matters
+ *     with `sf_dir` too: returning while frames are unresolved leaves them (and
+ *     the dictionary) in the slot, and the next borrower re-seeds from the slot's
+ *     side-file at the same size unless the slot drained first.
+ *   - Pooled direct sender: a plain `questdb_db_return_direct_sender` retires the
+ *     connection and commits the deferred tail best-effort. Its flushes are
+ *     deferred, so for a CHECKED guarantee call `qwp_direct_sender_commit` (or a
+ *     waited flush) and confirm it succeeded before the return. Do NOT use
+ *     `questdb_db_drop_direct_sender` on a full dictionary: it force-drops and
+ *     skips the best-effort commit that the normal return performs, so every frame
+ *     flushed since the last successful commit is discarded with only a log
+ *     warning.
+ *   - Standalone direct sender: `qwp_direct_sender_free` performs the same
+ *     best-effort commit the pooled return does, so the deferred tail is committed
+ *     on the way out; call `qwp_direct_sender_commit` first so the commit's success
+ *     is something you checked rather than hoped for. Then `qwp_direct_sender_free`,
+ *     then re-open with `qwp_direct_sender_from_conf` / `qwp_direct_sender_from_opts`.
+ *   - Standalone row sender (a `line_sender` opened on a `ws://` / `wss://`
+ *     address and flushed with `line_sender_flush*`, which shares this same
+ *     connection dictionary): `line_sender_qwpws_close_drain` and check it
+ *     succeeded, then `line_sender_close`, then re-open. Do NOT rely on
+ *     `line_sender_close` alone — it does not flush, and nothing drains the
+ *     QWP/WebSocket queue on the way out, so every published-but-unacked frame
+ *     is discarded with no wait. This is the most lossy flavour on a bare close.
  *
  * `codes[i]` must be in `0 .. dict_len` for non-null rows; null-row
  * codes are not inspected.

@@ -203,23 +203,18 @@ const _: fn() = || {
     assert_send_sync::<HostHealthTracker>();
 };
 
-// Two blanket impls of the same trait force method-resolution ambiguity
-// iff the target type IS `Send`; the call thus compiles only when the
-// type is `!Send`.
+// Query and cursor handles may be migrated between threads, provided the
+// caller establishes a happens-before edge and never accesses a handle
+// concurrently. Keep this assertion next to Reader's stronger Send + Sync
+// assertion so a future non-Send field cannot silently narrow that contract.
 const _: fn() = || {
-    trait AmbiguousIfSend<A> {
-        fn _disambiguate() {}
-    }
-    impl<T: ?Sized> AmbiguousIfSend<()> for T {}
-    impl<T: ?Sized + Send> AmbiguousIfSend<u8> for T {}
-    fn assert_not_send<T: ?Sized>() {
-        let _: fn() = <T as AmbiguousIfSend<_>>::_disambiguate;
-    }
-    assert_not_send::<crate::egress::Cursor<'_>>();
+    fn assert_send<T: Send>() {}
+    assert_send::<crate::egress::ReaderQuery<'_>>();
+    assert_send::<crate::egress::Cursor<'_>>();
     #[cfg(feature = "arrow-egress")]
-    assert_not_send::<crate::egress::arrow::CursorRecordBatchReader<'_, '_>>();
+    assert_send::<crate::egress::arrow::CursorRecordBatchReader<'_, '_>>();
     #[cfg(feature = "polars-egress")]
-    assert_not_send::<crate::egress::arrow::polars::CursorPolarsIter<'_, '_>>();
+    assert_send::<crate::egress::arrow::polars::CursorPolarsIter<'_, '_>>();
 };
 
 impl Reader {
@@ -707,7 +702,6 @@ impl Reader {
             reset_symbol_dict: false,
             on_failover_reset: None,
             on_failover_progress: None,
-            _not_send: std::marker::PhantomData,
         }
     }
 
@@ -778,7 +772,7 @@ pub struct FailoverResetEvent {
 }
 
 /// Boxed user callback type for failover-reset notifications.
-type FailoverResetCallback<'r> = Box<dyn FnMut(&FailoverResetEvent) + 'r>;
+type FailoverResetCallback<'r> = Box<dyn FnMut(&FailoverResetEvent) + Send + 'r>;
 
 /// Phase discriminant on [`FailoverProgressEvent`].
 ///
@@ -864,17 +858,15 @@ pub struct FailoverProgressEvent {
 }
 
 /// Boxed user callback type for failover-progress notifications.
-type FailoverProgressCallback<'r> = Box<dyn FnMut(&FailoverProgressEvent) + 'r>;
+type FailoverProgressCallback<'r> = Box<dyn FnMut(&FailoverProgressEvent) + Send + 'r>;
 
 /// Borrows a `Reader` exclusively while the query is being constructed and
 /// (eventually) the cursor is live.
 ///
-/// `ReaderQuery` is unconditionally `!Send`. The failover-reset callback
-/// can capture non-`Send` state (the C FFI trampoline captures
-/// `*mut c_void` `user_data`), so allowing the type to migrate threads
-/// based on whether a callback is currently installed would be a leaky
-/// abstraction. The `_not_send` marker pins the choice regardless of
-/// callback presence.
+/// `ReaderQuery` is [`Send`], but not safe for concurrent access. It may be
+/// moved to another thread after an explicit happens-before hand-off. Any
+/// installed failover callback must therefore also be [`Send`]; it runs on
+/// whichever thread subsequently drives the cursor.
 #[must_use = "ReaderQuery does nothing until you call .execute(); dropping it discards \
               the prepared SQL and any binds without sending a QUERY_REQUEST"]
 pub struct ReaderQuery<'r> {
@@ -891,8 +883,6 @@ pub struct ReaderQuery<'r> {
     /// failover lifecycle — see [`FailoverProgressEvent`] /
     /// [`FailoverPhase`].
     on_failover_progress: Option<FailoverProgressCallback<'r>>,
-    /// Pin `!Send` regardless of whether the callback is installed.
-    _not_send: std::marker::PhantomData<*const ()>,
 }
 
 macro_rules! bind_method {
@@ -941,6 +931,10 @@ impl<'r> ReaderQuery<'r> {
     ///
     /// Calling this method twice on the same `ReaderQuery` **replaces**
     /// the previous closure — only the most recent callback is invoked.
+    /// The callback must be [`Send`]: a query/cursor may be handed to
+    /// another thread, and the callback then runs and is dropped on that
+    /// destination thread. This bound is required even if the caller never
+    /// migrates the handle.
     ///
     /// Mirrors the Java client's `onFailoverReset(newNode)` contract.
     ///
@@ -994,7 +988,7 @@ impl<'r> ReaderQuery<'r> {
     /// ```
     pub fn on_failover_reset<F>(mut self, callback: F) -> Self
     where
-        F: FnMut(&FailoverResetEvent) + 'r,
+        F: FnMut(&FailoverResetEvent) + Send + 'r,
     {
         self.on_failover_reset = Some(Box::new(callback));
         self
@@ -1015,6 +1009,10 @@ impl<'r> ReaderQuery<'r> {
     ///
     /// Calling this method twice on the same `ReaderQuery` **replaces**
     /// the previous closure — only the most recent callback is invoked.
+    /// The callback must be [`Send`]: a query/cursor may be handed to
+    /// another thread, and the callback then runs and is dropped on that
+    /// destination thread. This bound is required even if the caller never
+    /// migrates the handle.
     ///
     /// # Reentrancy
     ///
@@ -1031,7 +1029,7 @@ impl<'r> ReaderQuery<'r> {
     ///   grant, and cancel waits until the callback returns.
     pub fn on_failover_progress<F>(mut self, callback: F) -> Self
     where
-        F: FnMut(&FailoverProgressEvent) + 'r,
+        F: FnMut(&FailoverProgressEvent) + Send + 'r,
     {
         self.on_failover_progress = Some(Box::new(callback));
         self
@@ -1231,7 +1229,6 @@ impl<'r> ReaderQuery<'r> {
             symbol_registry: None,
             #[cfg(feature = "polars-egress")]
             symbol_delta_modes: Vec::new(),
-            _not_send: std::marker::PhantomData,
         })
     }
 }
@@ -1424,12 +1421,9 @@ pub enum Terminal {
 /// terminal frame arrives (which is then accessible via [`Cursor::terminal`]).
 /// `cancel` sends a `CANCEL` frame and drains until the server's terminal.
 ///
-/// `Cursor` is unconditionally `!Send`. The failover-reset callback can
-/// capture non-`Send` state (the C FFI trampoline captures
-/// `*mut c_void` `user_data`); pinning `!Send` regardless of whether a
-/// callback is currently installed avoids a leaky abstraction whereby
-/// a Cursor that happens not to have a callback would be `Send` and
-/// then suddenly stop being so when one is installed.
+/// `Cursor` is [`Send`], but not safe for concurrent access. It may be moved
+/// to another thread after an explicit happens-before hand-off. Failover
+/// callbacks run on whichever thread drives the cursor.
 #[must_use = "Cursor must be drained via next_batch() or cancelled via cancel(); \
               dropping mid-stream sends a best-effort CANCEL and closes the WebSocket, \
               tearing down the connection for the next query on this Reader"]
@@ -1544,8 +1538,6 @@ pub struct Cursor<'r> {
     /// `DecodedBatch` before it is assembled.
     #[cfg(feature = "polars-egress")]
     symbol_delta_modes: Vec<bool>,
-    /// Pin `!Send` regardless of whether the callback is installed.
-    _not_send: std::marker::PhantomData<*const ()>,
 }
 
 /// Borrow-free outcome of `next_batch_inner`. The wrapper in

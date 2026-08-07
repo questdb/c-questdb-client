@@ -561,6 +561,7 @@ pub(crate) const INGRESS_ONLY_CONFIG_KEYS: &[&str] = &[
     "sf_max_segment_bytes",
     "sf_max_total_bytes",
     "sf_durability",
+    "sf_sync_interval_millis",
     "sf_append_deadline_millis",
     // QWP-WS reconnect / connect retry
     "reconnect_max_duration_millis",

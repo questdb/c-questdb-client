@@ -141,6 +141,20 @@ pub(crate) struct ColumnConn {
     /// pool-driven `mark_must_close` (un-sync'd pending frames) leaves the
     /// endpoint healthy.
     transport_dead: bool,
+    /// Sticky: the connection is logically **spent** but its transport is
+    /// healthy — today only a full connection-scoped symbol dictionary
+    /// ([`SymbolDictFull`](crate::ErrorCode::SymbolDictFull)), which no later
+    /// call can clear. It must be retired on return (like `must_close`, and
+    /// [`must_close`](Self::must_close) reports it as such so the pool drops it
+    /// and `reborrow_from_pool` swaps it out), but unlike a transport death the
+    /// already-published deferred frames can and should still be committed:
+    /// the [`publish_qwp`](Self::publish_qwp) / [`sync_all_acks`](Self::sync_all_acks)
+    /// guards read the raw `must_close` field, not this one, so a symbol-less
+    /// commit of the in-flight tail still goes through, and
+    /// [`can_drain_in_flight`](Self::can_drain_in_flight) stays `true`. Interning
+    /// a genuinely new symbol still fails `SymbolDictFull` at the dictionary, so
+    /// leaving publishes open costs nothing.
+    spent: bool,
     /// Index into the pool's configured endpoint list this connection was
     /// opened against. The pool marks this endpoint unhealthy in its shared
     /// health tracker when the connection dies, so subsequent borrows rotate
@@ -173,6 +187,7 @@ impl ColumnConn {
             pending_durable_targets: HashMap::new(),
             must_close: false,
             transport_dead: false,
+            spent: false,
             endpoint_idx: raw.endpoint_idx,
             max_buf_size: raw.max_buf_size,
             request_timeout: raw.request_timeout,
@@ -199,6 +214,7 @@ impl ColumnConn {
             pending_durable_targets: HashMap::new(),
             must_close: false,
             transport_dead: false,
+            spent: false,
             endpoint_idx: 0,
             max_buf_size: 1 << 20,
             request_timeout: Duration::from_secs(30),
@@ -211,14 +227,37 @@ impl ColumnConn {
         self.pending_durable_targets.len()
     }
 
+    /// `true` when the connection must be retired on return rather than
+    /// recycled — either hard-latched (`must_close`, e.g. a transport death or a
+    /// pool-driven discard) or logically [`spent`](Self::mark_spent) (a full
+    /// symbol dictionary). Both make `reborrow_from_pool` swap it out and the
+    /// pool drop it; they differ only in whether the in-flight tail may still be
+    /// committed first (see [`can_drain_in_flight`](Self::can_drain_in_flight)).
     pub(crate) fn must_close(&self) -> bool {
-        self.must_close
+        self.must_close || self.spent
     }
 
     /// `true` when `must_close` was latched by a transport-level failure (the
     /// pool then marks this connection's endpoint unhealthy).
     pub(crate) fn transport_dead(&self) -> bool {
         self.transport_dead
+    }
+
+    /// `true` when a best-effort commit of the already-published deferred frames
+    /// can still succeed: the transport is alive and the connection was not
+    /// hard-latched. A [`spent`](Self::mark_spent) (dictionary-full) connection
+    /// stays drainable — that is the whole point of the distinct state — so the
+    /// drop-time commit (`commit_in_flight_on_drop`) and an explicit `commit()`
+    /// both preserve the tail instead of discarding it.
+    pub(crate) fn can_drain_in_flight(&self) -> bool {
+        !self.must_close && !self.transport_dead
+    }
+
+    /// Mark the connection logically spent (dictionary full) so the pool retires
+    /// it on return, without hard-latching it: the in-flight tail can still be
+    /// committed. See the `spent` field.
+    pub(crate) fn mark_spent(&mut self) {
+        self.spent = true;
     }
 
     /// Index of the pool endpoint this connection was opened against.

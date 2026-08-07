@@ -96,6 +96,7 @@ stages:
           - template: templates/maven_settings.yaml
           - task: Maven@3
             displayName: "Compile QuestDB"
+            retryCountOnTaskFailure: 2
             inputs:
               mavenPOMFile: "questdb/pom.xml"
               javaHomeOption: "Path"

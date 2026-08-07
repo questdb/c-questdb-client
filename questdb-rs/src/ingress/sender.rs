@@ -85,6 +85,9 @@ mod qwp_ws_queue;
 mod qwp_ws_sfa_segment;
 
 #[cfg(feature = "_sender-qwp-ws")]
+pub(crate) mod qwp_ws_sfa_manifest;
+
+#[cfg(feature = "_sender-qwp-ws")]
 mod qwp_ws_sfa_queue;
 
 #[cfg(feature = "_sender-qwp-ws")]
@@ -98,6 +101,9 @@ pub(crate) mod qwp_ws_sfa_symbol_dict;
 
 #[cfg(feature = "_sender-qwp-ws")]
 mod qwp_ws_sfa_catchup;
+
+#[cfg(all(test, feature = "_sender-qwp-ws"))]
+pub(crate) use qwp_ws_sfa_catchup::fail_next_catch_up_allocation_for_test;
 
 #[cfg(feature = "_sender-qwp-ws")]
 pub(crate) use qwp_ws_ownership::QwpWsRoleReject;
@@ -967,31 +973,23 @@ impl Sender {
     /// Non-QWP/WebSocket handlers and terminal background handlers report
     /// `true`. Retained for the standalone sender regression test after the
     /// pooled row reaper that consumed it was removed.
-    #[cfg(test)]
+    #[cfg(all(test, feature = "sync-sender-qwp-ws"))]
     pub(crate) fn sfa_fully_delivered(&self, durable: bool) -> bool {
-        #[cfg(feature = "sync-sender-qwp-ws")]
-        {
-            let SyncProtocolHandler::SyncQwpWs(state) = &self.handler else {
-                return true;
-            };
-            if qwp_ws_is_terminal_background(state) {
-                return true;
-            }
-            let Ok(Some(published)) = qwp_ws_published_fsn_background(state) else {
-                return true;
-            };
-            let watermark = if durable {
-                qwp_ws_acked_fsn_background(state)
-            } else {
-                qwp_ws_ok_fsn_background(state)
-            };
-            matches!(watermark, Ok(Some(w)) if w >= published)
+        let SyncProtocolHandler::SyncQwpWs(state) = &self.handler else {
+            return true;
+        };
+        if qwp_ws_is_terminal_background(state) {
+            return true;
         }
-        #[cfg(not(feature = "sync-sender-qwp-ws"))]
-        {
-            let _ = durable;
-            true
-        }
+        let Ok(Some(published)) = qwp_ws_published_fsn_background(state) else {
+            return true;
+        };
+        let watermark = if durable {
+            qwp_ws_acked_fsn_background(state)
+        } else {
+            qwp_ws_ok_fsn_background(state)
+        };
+        matches!(watermark, Ok(Some(w)) if w >= published)
     }
 
     /// Returns the sender's configured transport protocol.

@@ -39,6 +39,8 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 #[cfg(feature = "sync-sender-qwp-ws")]
+use crate::ErrorCode;
+#[cfg(feature = "sync-sender-qwp-ws")]
 use crate::ingress::buffer::SymbolGlobalDict;
 #[cfg(feature = "sync-sender-qwp-ws")]
 use crate::ingress::conf::QwpWsConfig;
@@ -47,7 +49,7 @@ use crate::ingress::conf::QwpWsManagedSlotExclusion;
 use crate::ingress::tls::TlsSettings;
 
 #[cfg(feature = "sync-sender-qwp-ws")]
-use super::qwp_ws::{QwpWsConnectKind, try_dup_recovered};
+use super::qwp_ws::{QwpWsConnectKind, TrafficGate, try_dup_recovered};
 #[cfg(feature = "sync-sender-qwp-ws")]
 use super::qwp_ws_driver::{
     BlockingQwpWsTransport, CloseStepOutcome, DEFAULT_EVENT_CAPACITY, DriverError, PublicationLog,
@@ -165,6 +167,7 @@ impl OrphanDrainerConfig {
             slot_dir,
             segment_size_bytes: *self.qwp_ws.sf_max_segment_bytes,
             max_bytes,
+            periodic_sync_interval: self.qwp_ws.periodic_sync_interval(),
         })
     }
 }
@@ -172,7 +175,7 @@ impl OrphanDrainerConfig {
 #[cfg(feature = "sync-sender-qwp-ws")]
 pub(crate) struct OrphanDrainerPool {
     stop: Arc<AtomicBool>,
-    threads: Vec<thread::JoinHandle<()>>,
+    threads: Vec<(thread::JoinHandle<()>, Arc<TrafficGate>)>,
 }
 
 #[cfg(feature = "sync-sender-qwp-ws")]
@@ -193,14 +196,17 @@ impl OrphanDrainerPool {
             let pending = Arc::clone(&pending);
             let stop = Arc::clone(&stop);
             let config = config.clone();
-            threads.push(thread::spawn(move || {
+            let traffic_gate = Arc::new(TrafficGate::default());
+            let worker_gate = Arc::clone(&traffic_gate);
+            let worker = thread::spawn(move || {
                 while !stop.load(Ordering::Acquire) {
                     let Some(slot_dir) = pop_pending_orphan(&pending) else {
                         break;
                     };
-                    drain_orphan_to_completion(slot_dir, &config, &stop);
+                    drain_orphan_to_completion(slot_dir, &config, &stop, &worker_gate);
                 }
-            }));
+            });
+            threads.push((worker, traffic_gate));
         }
         Some(Self { stop, threads })
     }
@@ -214,9 +220,20 @@ impl OrphanDrainerPool {
         self.wait_for_finished_threads(graceful_drain);
         self.stop.store(true, Ordering::Release);
         self.join_finished_threads();
+        for (_, traffic_gate) in &self.threads {
+            if let Err(err) = traffic_gate.shutdown() {
+                log::warn!("could not shut down QWP/WebSocket orphan drainer traffic: {err}");
+            }
+        }
         self.wait_for_finished_threads(stop_grace);
-        // Remaining orphan drainers are best-effort background work. Dropping
-        // their JoinHandles detaches the threads so sender close stays bounded.
+        if !self.threads.is_empty() {
+            log::error!(
+                "{} QWP/WebSocket orphan drainer worker(s) did not stop within {:?}; \
+                 detaching them while their active slot locks remain retained",
+                self.threads.len(),
+                stop_grace
+            );
+        }
         self.threads.clear();
     }
 
@@ -239,11 +256,11 @@ impl OrphanDrainerPool {
 
     fn join_finished_threads(&mut self) {
         let mut running = Vec::with_capacity(self.threads.len());
-        for thread in self.threads.drain(..) {
+        for (thread, traffic_gate) in self.threads.drain(..) {
             if thread.is_finished() {
                 let _ = thread.join();
             } else {
-                running.push(thread);
+                running.push((thread, traffic_gate));
             }
         }
         self.threads = running;
@@ -259,11 +276,32 @@ impl Drop for OrphanDrainerPool {
 
 #[cfg(feature = "sync-sender-qwp-ws")]
 pub(crate) struct ManualOrphanDrainers {
-    pending: VecDeque<PathBuf>,
-    active: Vec<OrphanDrainer>,
+    pending: VecDeque<PendingOrphanSlot>,
+    active: Vec<ActiveOrphanDrainer>,
     next_active: usize,
     max_active: usize,
     config: OrphanDrainerConfig,
+}
+
+/// A slot awaiting (re)adoption. `not_before` gates the next connect attempt
+/// so an unreachable endpoint cannot turn the caller's park loop into a
+/// connect storm; `backoff` is the gate applied to the next failure, walking
+/// the same capped-doubling ladder as the background drainer.
+#[cfg(feature = "sync-sender-qwp-ws")]
+struct PendingOrphanSlot {
+    slot_dir: PathBuf,
+    not_before: Option<Instant>,
+    backoff: Duration,
+}
+
+/// An adopted slot. While `gated_until` is in the future the drainer is
+/// retained but not driven: the slot flock stays held through the backoff,
+/// matching the background loop's ownership model.
+#[cfg(feature = "sync-sender-qwp-ws")]
+struct ActiveOrphanDrainer {
+    drainer: OrphanDrainer,
+    gated_until: Option<Instant>,
+    backoff: Duration,
 }
 
 #[cfg(feature = "sync-sender-qwp-ws")]
@@ -276,8 +314,16 @@ impl ManualOrphanDrainers {
         if candidates.is_empty() || max_active == 0 {
             return None;
         }
+        let initial_backoff = *config.qwp_ws.reconnect_initial_backoff;
         Some(Self {
-            pending: VecDeque::from(candidates),
+            pending: candidates
+                .into_iter()
+                .map(|slot_dir| PendingOrphanSlot {
+                    slot_dir,
+                    not_before: None,
+                    backoff: initial_backoff,
+                })
+                .collect(),
             active: Vec::new(),
             next_active: 0,
             max_active,
@@ -285,6 +331,10 @@ impl ManualOrphanDrainers {
         })
     }
 
+    /// Returns `true` only when a unit of work ran (an adoption attempt, a
+    /// drive step, or a slot retiring). All-gated or all-idle returns `false`
+    /// so the `Sender::drive_once` contract lets the caller park instead of
+    /// spinning.
     pub(crate) fn drive_once(&mut self) -> bool {
         if self.active.len() < self.max_active && self.activate_one() {
             return true;
@@ -292,16 +342,40 @@ impl ManualOrphanDrainers {
         self.drive_active_once()
     }
 
+    fn initial_backoff(&self) -> Duration {
+        *self.config.qwp_ws.reconnect_initial_backoff
+    }
+
+    fn max_backoff(&self) -> Duration {
+        *self.config.qwp_ws.reconnect_max_backoff
+    }
+
     fn activate_one(&mut self) -> bool {
-        let Some(slot_dir) = self.pending.pop_front() else {
-            return false;
-        };
-        if has_failed_sentinel(&slot_dir) {
+        let now = Instant::now();
+        for _ in 0..self.pending.len() {
+            let Some(slot) = self.pending.pop_front() else {
+                return false;
+            };
+            if slot.not_before.is_some_and(|not_before| now < not_before) {
+                self.pending.push_back(slot);
+                continue;
+            }
+            return self.open_pending(slot);
+        }
+        false
+    }
+
+    fn open_pending(&mut self, slot: PendingOrphanSlot) -> bool {
+        if has_failed_sentinel(&slot.slot_dir) {
             return true;
         }
-        match OrphanDrainer::open(slot_dir.clone(), &self.config) {
+        match OrphanDrainer::open(slot.slot_dir.clone(), &self.config) {
             OrphanOpenOutcome::Drainer(drainer) => {
-                self.active.push(*drainer);
+                self.active.push(ActiveOrphanDrainer {
+                    drainer: *drainer,
+                    gated_until: None,
+                    backoff: self.initial_backoff(),
+                });
                 true
             }
             OrphanOpenOutcome::AlreadyDrained
@@ -309,42 +383,95 @@ impl ManualOrphanDrainers {
             | OrphanOpenOutcome::Locked
             | OrphanOpenOutcome::Stopped => true,
             OrphanOpenOutcome::RetryLater(reason) => {
-                let _ = record_last_error(&slot_dir, &reason);
-                self.pending.push_back(slot_dir);
+                let _ = record_last_error(&slot.slot_dir, &reason);
+                self.requeue(slot.slot_dir, slot.backoff);
                 true
             }
             OrphanOpenOutcome::Unrecoverable(reason) => {
-                let _ = mark_failed(&slot_dir, &reason);
+                let _ = mark_failed(&slot.slot_dir, &reason);
                 true
             }
         }
+    }
+
+    fn requeue(&mut self, slot_dir: PathBuf, backoff: Duration) {
+        self.pending.push_back(PendingOrphanSlot {
+            slot_dir,
+            not_before: Instant::now().checked_add(backoff),
+            backoff: next_orphan_retry_backoff(backoff, self.max_backoff()),
+        });
     }
 
     fn drive_active_once(&mut self) -> bool {
         if self.active.is_empty() {
             return false;
         }
+        let initial_backoff = self.initial_backoff();
+        let max_backoff = self.max_backoff();
         let active_count = self.active.len();
         for _ in 0..active_count {
             let index = self.next_active % self.active.len();
             self.next_active = (index + 1) % self.active.len();
-            match self.active[index].drive_once() {
-                OrphanDriveOutcome::Idle => {}
-                OrphanDriveOutcome::Progress => return true,
+            let now = Instant::now();
+            if let Some(gated_until) = self.active[index].gated_until {
+                if now < gated_until {
+                    continue;
+                }
+                self.active[index].gated_until = None;
+            }
+            match self.active[index].drainer.drive_once(None) {
+                OrphanDriveOutcome::Idle => {
+                    self.active[index].backoff = initial_backoff;
+                }
+                OrphanDriveOutcome::Progress => {
+                    self.active[index].backoff = initial_backoff;
+                    return true;
+                }
+                OrphanDriveOutcome::Waiting {
+                    sleep_for,
+                    deadline,
+                } => {
+                    let until = now.checked_add(sleep_for);
+                    self.active[index].gated_until = match (until, deadline) {
+                        (Some(until), Some(deadline)) => Some(until.min(deadline)),
+                        (Some(until), None) => Some(until),
+                        (None, deadline) => deadline,
+                    };
+                    return true;
+                }
                 OrphanDriveOutcome::Drained => {
-                    let drainer = self.active.remove(index);
-                    drainer.clear_last_error();
+                    let entry = self.active.remove(index);
+                    entry.drainer.clear_last_error();
                     self.normalize_next_active();
                     return true;
                 }
                 OrphanDriveOutcome::RetryLater(reason) => {
-                    let drainer = self.active.remove(index);
-                    drainer.record_last_error(&reason);
-                    self.pending.push_back(drainer.slot_dir.clone());
+                    let entry = &mut self.active[index];
+                    entry.drainer.record_last_error(&reason);
+                    entry.gated_until = now.checked_add(entry.backoff);
+                    entry.backoff = next_orphan_retry_backoff(entry.backoff, max_backoff);
+                    return true;
+                }
+                OrphanDriveOutcome::Terminal(reason) => {
+                    // Sticky terminal: retire the slot for this session,
+                    // leaving it on disk for the next one.
+                    let entry = self.active.remove(index);
+                    entry.drainer.record_last_error(&reason);
                     self.normalize_next_active();
                     return true;
                 }
-                OrphanDriveOutcome::Stopped => return true,
+                OrphanDriveOutcome::Unrecoverable(reason) => {
+                    let entry = self.active.remove(index);
+                    let _ = mark_failed(&entry.drainer.slot_dir, &reason);
+                    self.normalize_next_active();
+                    return true;
+                }
+                OrphanDriveOutcome::Stopped => {
+                    // Unreachable with `stop = None`; retire defensively.
+                    self.active.remove(index);
+                    self.normalize_next_active();
+                    return true;
+                }
             }
         }
         false
@@ -383,27 +510,41 @@ enum OrphanDriveOutcome {
     Progress,
     Drained,
     Stopped,
+    /// The driver wants a pause (reconnect pacing) before its next step. The
+    /// scheduler owns the wait: the background loop sleeps, the manual path
+    /// gates the entry instead of blocking the caller's thread.
+    Waiting {
+        sleep_for: Duration,
+        deadline: Option<Instant>,
+    },
+    /// A non-terminal drive failure that may make progress on the same store.
     RetryLater(String),
+    /// A sticky terminal: release this drainer and defer the slot.
+    Terminal(String),
+    /// Proven-local durable state that cannot succeed on a fresh session.
+    Unrecoverable(String),
 }
 
 #[cfg(feature = "sync-sender-qwp-ws")]
 impl OrphanDrainer {
     fn open(slot_dir: PathBuf, config: &OrphanDrainerConfig) -> OrphanOpenOutcome {
-        Self::open_inner(slot_dir, config, None)
+        Self::open_inner(slot_dir, config, None, None)
     }
 
     fn open_with_stop(
         slot_dir: PathBuf,
         config: &OrphanDrainerConfig,
         stop: &AtomicBool,
+        traffic_gate: &Arc<TrafficGate>,
     ) -> OrphanOpenOutcome {
-        Self::open_inner(slot_dir, config, Some(stop))
+        Self::open_inner(slot_dir, config, Some(stop), Some(traffic_gate))
     }
 
     fn open_inner(
         slot_dir: PathBuf,
         config: &OrphanDrainerConfig,
         stop: Option<&AtomicBool>,
+        traffic_gate: Option<&Arc<TrafficGate>>,
     ) -> OrphanOpenOutcome {
         if orphan_stop_requested(stop) {
             return OrphanOpenOutcome::Stopped;
@@ -418,7 +559,29 @@ impl OrphanDrainer {
         let mut queue = match SfaSlotQueue::open_replay_only_existing(options) {
             Ok(queue) => queue,
             Err(SfaQueueError::SlotInUse { .. }) => return OrphanOpenOutcome::Locked,
-            Err(err @ SfaQueueError::CorruptSegments { .. }) => {
+            Err(SfaQueueError::SanitizedResidue { .. }) => {
+                // Retry internally because this path is unattended and must
+                // not quarantine replayable data.
+                let retry_options = match config.queue_options(slot_dir.clone()) {
+                    Ok(options) => options,
+                    Err(err) => return OrphanOpenOutcome::RetryLater(err),
+                };
+                match SfaSlotQueue::open_replay_only_existing(retry_options) {
+                    Ok(queue) => queue,
+                    Err(SfaQueueError::SlotInUse { .. }) => {
+                        return OrphanOpenOutcome::Locked;
+                    }
+                    Err(
+                        err @ (SfaQueueError::SanitizedResidue { .. }
+                        | SfaQueueError::Recovery { .. }
+                        | SfaQueueError::CorruptSegments { .. }),
+                    ) => {
+                        return OrphanOpenOutcome::Unrecoverable(format!("{err:?}"));
+                    }
+                    Err(err) => return OrphanOpenOutcome::RetryLater(format!("{err:?}")),
+                }
+            }
+            Err(err @ (SfaQueueError::Recovery { .. } | SfaQueueError::CorruptSegments { .. })) => {
                 return OrphanOpenOutcome::Unrecoverable(format!("{err:?}"));
             }
             Err(err) => return OrphanOpenOutcome::RetryLater(format!("{err:?}")),
@@ -437,22 +600,119 @@ impl OrphanDrainer {
             let _ = clear_last_error(&slot_dir);
             return OrphanOpenOutcome::AlreadyDrained;
         }
-        // Threaded orphan drainers carry a stop flag; manual-progress drainers
-        // do not. Only the threaded/background form gets the finite fallback.
-        let connect_kind = if stop.is_some() {
-            QwpWsConnectKind::BackgroundDrainer
+        // A delta-encoded slot's stored frames are not self-sufficient, so before
+        // replaying them to the fresh server the drainer must re-register the whole
+        // dictionary via a catch-up frame -- exactly as the foreground does on
+        // reconnect. Seed the mirror from the slot's persisted side-file (read-only
+        // here: draining only replays stored frames, so there is no write-ahead).
+        // A dense (memory-mode) slot reports delta disabled and needs none of this.
+        let delta_dict_enabled = queue.is_delta_dict_enabled();
+        // Adoption is transactional: a delta slot is replayable only after its
+        // recovered dictionary has been copied, validated, and installed in the
+        // catch-up mirror. Allocation failure is transient and leaves the durable
+        // side-file intact, so retry the whole adoption instead of disabling the
+        // mirror next to already-persisted `delta_start > 0` frames.
+        let recovered_dict_count = queue.recovered_symbol_dict_count();
+        let recovered_dict = if delta_dict_enabled {
+            let entries = match try_dup_recovered(queue.recovered_symbol_dict_entries()) {
+                Ok(entries) => entries,
+                Err(err) => {
+                    let reason = format!("recovered symbol dictionary allocation failed: {err}");
+                    log::warn!(
+                        "QWP/WebSocket orphan slot {}: {reason}; retrying adoption later",
+                        slot_dir.display()
+                    );
+                    return retry_open_later(reason, stop);
+                }
+            };
+            // The orphan replay path builds no producer `SymbolGlobalDict`, so --
+            // unlike the foreground recovery paths (`new_store_and_forward` /
+            // `QwpWsReplayEncoder::seed_global_dict`, which seed one and propagate
+            // its error) -- it would otherwise arm the mirror without ever running
+            // `SymbolGlobalDict::seed`'s duplicate/torn-tail rejection. A host/power
+            // crash can zero-extend the persisted side-file into a run of empty
+            // `[len=0]` entries that inflate `recovered_dict_count`; seeding the
+            // driver mirror with that inflated count slackens the torn-dict guard
+            // (`delta_start > mirror.count()`) and lets a stored delta frame replay
+            // against a desynced dictionary -- resolving ids to the wrong / empty
+            // symbols on the fresh server (silent corruption). Validate the
+            // recovered region with the exact same check the foreground uses (the
+            // shared `SymbolGlobalDict::seed`, so the two paths cannot diverge):
+            // only seed the mirror FROM THE SIDE-FILE if a throwaway seed rebuilds
+            // a well-formed (unique-entry) dictionary.
+            //
+            // On failure, discard those entries but still arm the mirror EMPTY --
+            // do NOT leave it disabled. The hazard the validation exists for is an
+            // INFLATED count, which slackens `guard_dict_not_torn`'s
+            // `delta_start > mirror.count()` test; an empty mirror is the exact
+            // opposite, the strictest state there is. Only a `delta_start == 0`
+            // frame passes it, `SentDictMirror::accumulate` then folds that frame's
+            // own delta section in, and the frames behind it resolve against what
+            // their predecessors registered. The drain bootstraps itself from the
+            // frames and needs nothing from the rejected side-file.
+            //
+            // Leaving it disabled instead is what `open_replay_only` stopped doing
+            // when it began arming delta unconditionally, and for the same reason:
+            // dense does not merely replay less efficiently here, it LOSES the
+            // slot. With the mirror disabled the `delta_start == 0` frame replays
+            // and commits, the `delta_start > 0` frame behind it is terminally
+            // rejected, and `StoreResendRequired` is classified proven-local
+            // unrecoverable (`terminal_error_is_proven_local_unrecoverable`) -- so
+            // the drain writes `.failed` and every later scan skips the slot until
+            // an operator clears the sentinel. Recoverable frames abandoned for a
+            // side-file this client merely could not hold.
+            //
+            // Replay-only is what makes arming empty safe: no producer, no
+            // write-ahead, and `qwp_ws_orphan::open` drops the side-file handle
+            // outright, so nothing can refill the discarded ids with different
+            // symbols underneath the stored frames.
+            //
+            // Report the rejection verbatim rather than asserting a cause: `seed`
+            // fails `SymbolDictFull` on a well-formed side-file that is merely
+            // larger than this client's cap (one written by a higher-capped
+            // client), and calling that "corrupt" sends an operator hunting for
+            // disk damage that is not there.
+            match SymbolGlobalDict::new().seed(&entries, recovered_dict_count) {
+                Ok(()) => Some((entries, recovered_dict_count)),
+                Err(err) => {
+                    log::warn!(
+                        "QWP/WebSocket orphan slot {}: persisted symbol dictionary was \
+                         rejected ({err}); draining with the dictionary the stored \
+                         frames carry instead -- a frame that needs an id they cannot \
+                         supply is rejected as resend-required, but the rest still \
+                         drain.",
+                        slot_dir.display()
+                    );
+                    Some((Vec::new(), 0))
+                }
+            }
         } else {
-            QwpWsConnectKind::Foreground
+            None
         };
+
+        // Do not open a network session until all fallible local adoption setup has
+        // succeeded. A retryable allocation failure then consumes no connection and
+        // the next attempt starts from the same intact slot.
+        if orphan_stop_requested(stop) {
+            return OrphanOpenOutcome::Stopped;
+        }
+        // The copied entries now own everything replay needs. Release the side-file's
+        // loaded region and descriptor before a potentially blocking connect so a
+        // large dictionary is not held twice across the network wait. This does not
+        // alter the on-disk side-file; a failed attempt reopens it on the next scan.
+        drop(queue.take_persisted_symbol_dict());
         let transport = match BlockingQwpWsTransport::connect(
             config.host.clone(),
             config.port.clone(),
             config.use_tls,
             config.tls_settings.clone(),
-            connect_kind,
+            // Orphan connects always use background policy, even when manual
+            // progress executes them cooperatively on the caller thread.
+            QwpWsConnectKind::BackgroundDrainer,
             config.qwp_ws.clone(),
             config.auth_header.clone(),
             Arc::new(AtomicUsize::new(0)),
+            traffic_gate.cloned(),
         ) {
             Ok(transport) => transport,
             Err(err) => return retry_open_later(err.to_string(), stop),
@@ -460,47 +720,6 @@ impl OrphanDrainer {
         if orphan_stop_requested(stop) {
             return OrphanOpenOutcome::Stopped;
         }
-        // A delta-encoded slot's stored frames are not self-sufficient, so before
-        // replaying them to the fresh server the drainer must re-register the whole
-        // dictionary via a catch-up frame -- exactly as the foreground does on
-        // reconnect. Seed the mirror from the slot's persisted side-file (read-only
-        // here: draining only replays stored frames, so there is no write-ahead and
-        // the side-file handle stays with the queue). A dense (memory-mode) slot
-        // reports delta disabled and needs none of this.
-        let delta_dict_enabled = queue.is_delta_dict_enabled();
-        // Fallible copy: a large recovered dictionary (up to ~2 GiB for a crafted
-        // CRC-valid side-file) must not abort the drainer via an infallible `to_vec`;
-        // the foreground guards the same copy with `try_dup_recovered`. On OOM, degrade
-        // to dense (leave the mirror disabled) -- the same fallback the corrupt-dict
-        // branch below takes -- so the drainer still replays the slot's frames instead
-        // of crashing.
-        let recovered_dict_entries = if delta_dict_enabled {
-            match try_dup_recovered(queue.recovered_symbol_dict_entries()) {
-                Ok(entries) => Some(entries),
-                Err(err) => {
-                    log::warn!(
-                        "QWP/WebSocket orphan slot {}: recovered symbol dictionary is \
-                         too large to allocate ({err}); draining with full-dictionary \
-                         (dense) frames.",
-                        slot_dir.display()
-                    );
-                    None
-                }
-            }
-        } else {
-            None
-        };
-        let recovered_dict_count = queue.recovered_symbol_dict_count();
-        // The orphan drainer is replay-only: it seeds the catch-up mirror from the
-        // recovered dictionary (copied out above) and never write-aheads, so it does
-        // not need the side-file handle. Drop it now -- freeing the recovered entry
-        // region (up to ~2 GiB) and closing the fd -- rather than carrying it dead for
-        // the whole drain. This mirrors the foreground recovery paths, which
-        // `take_persisted_symbol_dict` once the entries have been copied out for
-        // seeding; here the taken handle is simply dropped (no write-ahead). Must
-        // follow the `recovered_symbol_dict_{entries,count}` reads above, since a take
-        // clears the region they borrow.
-        let _ = queue.take_persisted_symbol_dict();
         let store = QwpWsPublicationStore::new(queue, DEFAULT_EVENT_CAPACITY);
         let mut send_core = QwpWsSendCore::new_with_durable_ack_and_rejection_limit(
             transport,
@@ -519,41 +738,8 @@ impl OrphanDrainer {
             *config.qwp_ws.max_frame_rejections,
             *config.qwp_ws.poison_min_escalation_window,
         );
-        if let Some(recovered_dict_entries) = recovered_dict_entries {
-            // The orphan replay path builds no producer `SymbolGlobalDict`, so --
-            // unlike the foreground recovery paths (`new_store_and_forward` /
-            // `QwpWsReplayEncoder::seed_global_dict`, which seed one and propagate
-            // its error) -- it would otherwise arm the mirror without ever running
-            // `SymbolGlobalDict::seed`'s duplicate/torn-tail rejection. A host/power
-            // crash can zero-extend the persisted side-file into a run of empty
-            // `[len=0]` entries that inflate `recovered_dict_count`; seeding the
-            // driver mirror with that inflated count slackens the torn-dict guard
-            // (`delta_start > mirror.count()`) and lets a stored delta frame replay
-            // against a desynced dictionary -- resolving ids to the wrong / empty
-            // symbols on the fresh server (silent corruption). Validate the
-            // recovered region with the exact same check the foreground uses (the
-            // shared `SymbolGlobalDict::seed`, so the two paths cannot diverge):
-            // only arm delta if a throwaway seed rebuilds a well-formed
-            // (unique-entry) dictionary. On failure fall back to dense -- leave the
-            // mirror disabled -- so `guard_dict_not_torn` rejects any surviving
-            // `delta_start > 0` frame loudly ("resend required") instead of
-            // replaying it silently, exactly the dense fallback the queue already
-            // takes for an absent / bad-magic side-file.
-            let recovered_dict_intact = SymbolGlobalDict::new()
-                .seed(&recovered_dict_entries, recovered_dict_count)
-                .is_ok();
-            if recovered_dict_intact {
-                send_core.enable_delta_dict(&recovered_dict_entries, recovered_dict_count);
-            } else {
-                log::warn!(
-                    "QWP/WebSocket orphan slot {}: persisted symbol dictionary is \
-                     corrupt (duplicate / torn or zero-extended tail); draining with \
-                     full-dictionary (dense) frames -- any stored delta frame that \
-                     depends on the lost dictionary is rejected as resend-required \
-                     rather than replayed against a desynced dictionary.",
-                    slot_dir.display()
-                );
-            }
+        if let Some((recovered_dict_entries, recovered_dict_count)) = recovered_dict {
+            send_core.enable_delta_dict_owned(recovered_dict_entries, recovered_dict_count);
         }
         OrphanOpenOutcome::Drainer(Box::new(Self {
             slot_dir,
@@ -562,46 +748,20 @@ impl OrphanDrainer {
         }))
     }
 
-    fn drive_once(&mut self) -> OrphanDriveOutcome {
-        match self.send_core.close_drain_ready_step(&mut self.store) {
-            Ok(CloseStepOutcome::Drained) => OrphanDriveOutcome::Drained,
-            Ok(CloseStepOutcome::Terminal) => {
-                OrphanDriveOutcome::RetryLater(self.terminal_message())
-            }
-            Ok(CloseStepOutcome::Waiting {
-                sleep_for,
-                deadline,
-            }) => {
-                sleep_before_orphan_reconnect(deadline, sleep_for, None);
-                OrphanDriveOutcome::Progress
-            }
-            Ok(CloseStepOutcome::Progress) => OrphanDriveOutcome::Progress,
-            Ok(CloseStepOutcome::Idle) => OrphanDriveOutcome::Idle,
-            Err(err) => OrphanDriveOutcome::RetryLater(driver_error_message(err)),
-        }
-    }
-
-    fn drive_once_with_stop(&mut self, stop: &AtomicBool) -> OrphanDriveOutcome {
-        if stop.load(Ordering::Acquire) {
+    fn drive_once(&mut self, stop: Option<&AtomicBool>) -> OrphanDriveOutcome {
+        if orphan_stop_requested(stop) {
             return OrphanDriveOutcome::Stopped;
         }
         match self.send_core.close_drain_ready_step(&mut self.store) {
             Ok(CloseStepOutcome::Drained) => OrphanDriveOutcome::Drained,
-            Ok(CloseStepOutcome::Terminal) => {
-                OrphanDriveOutcome::RetryLater(self.terminal_message())
-            }
+            Ok(CloseStepOutcome::Terminal) => self.terminal_outcome(),
             Ok(CloseStepOutcome::Waiting {
                 sleep_for,
                 deadline,
-            }) => {
-                if sleep_before_orphan_reconnect(deadline, sleep_for, Some(stop)) {
-                    OrphanDriveOutcome::Progress
-                } else if stop.load(Ordering::Acquire) {
-                    OrphanDriveOutcome::Stopped
-                } else {
-                    OrphanDriveOutcome::Progress
-                }
-            }
+            }) => OrphanDriveOutcome::Waiting {
+                sleep_for,
+                deadline,
+            },
             Ok(CloseStepOutcome::Progress) => OrphanDriveOutcome::Progress,
             Ok(CloseStepOutcome::Idle) => OrphanDriveOutcome::Idle,
             Err(err) => OrphanDriveOutcome::RetryLater(driver_error_message(err)),
@@ -616,6 +776,15 @@ impl OrphanDrainer {
         let _ = clear_last_error(&self.slot_dir);
     }
 
+    fn terminal_outcome(&self) -> OrphanDriveOutcome {
+        let reason = self.terminal_message();
+        if terminal_error_is_proven_local_unrecoverable(self.store.terminal_error()) {
+            OrphanDriveOutcome::Unrecoverable(reason)
+        } else {
+            OrphanDriveOutcome::Terminal(reason)
+        }
+    }
+
     fn terminal_message(&self) -> String {
         if let Some(err) = self.store.terminal_error() {
             return err.to_string();
@@ -625,6 +794,17 @@ impl OrphanDrainer {
         }
         "orphan drainer reached terminal state".to_owned()
     }
+}
+
+#[cfg(feature = "sync-sender-qwp-ws")]
+fn terminal_error_is_proven_local_unrecoverable(error: Option<&crate::Error>) -> bool {
+    error.is_some_and(|err| {
+        // StoreResendRequired is only produced for proven-local durable state
+        // (a torn / unreconstructable symbol dictionary): no fresh session or
+        // other endpoint can replay it. Role/writability rejects never
+        // terminalize -- they recycle in place inside the send core.
+        err.code() == ErrorCode::StoreResendRequired
+    })
 }
 
 #[cfg(feature = "sync-sender-qwp-ws")]
@@ -669,9 +849,22 @@ fn sleep_before_orphan_reconnect(
 }
 
 #[cfg(feature = "sync-sender-qwp-ws")]
-fn drain_orphan_to_completion(slot_dir: PathBuf, config: &OrphanDrainerConfig, stop: &AtomicBool) {
+fn next_orphan_retry_backoff(current: Duration, max: Duration) -> Duration {
+    current.checked_mul(2).unwrap_or(Duration::MAX).min(max)
+}
+
+#[cfg(feature = "sync-sender-qwp-ws")]
+fn drain_orphan_to_completion(
+    slot_dir: PathBuf,
+    config: &OrphanDrainerConfig,
+    stop: &AtomicBool,
+    traffic_gate: &Arc<TrafficGate>,
+) {
+    let initial_backoff = *config.qwp_ws.reconnect_initial_backoff;
+    let max_backoff = *config.qwp_ws.reconnect_max_backoff;
+    let mut retry_backoff = initial_backoff;
     let mut drainer = loop {
-        match OrphanDrainer::open_with_stop(slot_dir.clone(), config, stop) {
+        match OrphanDrainer::open_with_stop(slot_dir.clone(), config, stop, traffic_gate) {
             OrphanOpenOutcome::Drainer(drainer) => break drainer,
             OrphanOpenOutcome::AlreadyDrained
             | OrphanOpenOutcome::FailedSentinel
@@ -679,13 +872,10 @@ fn drain_orphan_to_completion(slot_dir: PathBuf, config: &OrphanDrainerConfig, s
             | OrphanOpenOutcome::Stopped => return,
             OrphanOpenOutcome::RetryLater(reason) => {
                 record_last_error_unless_stopped(&slot_dir, &reason, stop);
-                if !sleep_before_orphan_reconnect(
-                    None,
-                    *config.qwp_ws.reconnect_initial_backoff,
-                    Some(stop),
-                ) {
+                if !sleep_before_orphan_reconnect(None, retry_backoff, Some(stop)) {
                     return;
                 }
+                retry_backoff = next_orphan_retry_backoff(retry_backoff, max_backoff);
             }
             OrphanOpenOutcome::Unrecoverable(reason) => {
                 mark_orphan_failed_unless_stopped(&slot_dir, &reason, stop);
@@ -693,27 +883,49 @@ fn drain_orphan_to_completion(slot_dir: PathBuf, config: &OrphanDrainerConfig, s
             }
         }
     };
+    retry_backoff = initial_backoff;
     while !stop.load(Ordering::Acquire) {
-        match drainer.drive_once_with_stop(stop) {
+        match drainer.drive_once(Some(stop)) {
             OrphanDriveOutcome::Drained => {
                 drainer.clear_last_error();
                 return;
+            }
+            OrphanDriveOutcome::Waiting {
+                sleep_for,
+                deadline,
+            } => {
+                if !sleep_before_orphan_reconnect(deadline, sleep_for, Some(stop))
+                    && stop.load(Ordering::Acquire)
+                {
+                    return;
+                }
+                retry_backoff = initial_backoff;
             }
             OrphanDriveOutcome::RetryLater(reason) => {
                 if !stop.load(Ordering::Acquire) {
                     drainer.record_last_error(&reason);
                 }
-                if !sleep_before_orphan_reconnect(
-                    None,
-                    *config.qwp_ws.reconnect_initial_backoff,
-                    Some(stop),
-                ) {
+                if !sleep_before_orphan_reconnect(None, retry_backoff, Some(stop)) {
                     return;
                 }
+                retry_backoff = next_orphan_retry_backoff(retry_backoff, max_backoff);
+            }
+            OrphanDriveOutcome::Terminal(reason) => {
+                record_last_error_unless_stopped(&slot_dir, &reason, stop);
+                return;
+            }
+            OrphanDriveOutcome::Unrecoverable(reason) => {
+                mark_orphan_failed_unless_stopped(&slot_dir, &reason, stop);
+                return;
             }
             OrphanDriveOutcome::Stopped => return,
-            OrphanDriveOutcome::Progress => {}
-            OrphanDriveOutcome::Idle => thread::sleep(ORPHAN_IDLE_PARK),
+            OrphanDriveOutcome::Progress => {
+                retry_backoff = initial_backoff;
+            }
+            OrphanDriveOutcome::Idle => {
+                retry_backoff = initial_backoff;
+                thread::sleep(ORPHAN_IDLE_PARK);
+            }
         }
     }
 }
@@ -787,10 +999,18 @@ mod tests {
 
     #[cfg(feature = "sync-sender-qwp-ws")]
     use crate::ingress::conf::{ConfigSetting, QwpWsConfig};
+    #[cfg(all(feature = "sync-sender-qwp-ws", any(unix, windows)))]
+    use crate::ingress::sender::qwp_ws_sfa_manifest::{SfManifest, SfaAckWatermark};
+    #[cfg(all(feature = "sync-sender-qwp-ws", any(unix, windows)))]
+    use crate::ingress::sender::qwp_ws_sfa_queue::SfaStorageStep;
     #[cfg(all(feature = "sync-sender-qwp-ws", unix))]
     use crate::ingress::sender::qwp_ws_sfa_segment::initial_segment_path;
     #[cfg(all(feature = "sync-sender-qwp-ws", any(unix, windows)))]
+    use crate::ingress::sender::qwp_ws_sfa_segment::{SfaSegment, scan_file, spare_segment_path};
+    #[cfg(all(feature = "sync-sender-qwp-ws", any(unix, windows)))]
     use crate::ingress::sender::qwp_ws_sfa_slot::SfaSlotOptions;
+    #[cfg(feature = "sync-sender-qwp-ws")]
+    use crate::ingress::{QwpWsErrorCategory, QwpWsErrorPolicy, QwpWsSenderError};
     #[cfg(all(feature = "sync-sender-qwp-ws", any(unix, windows)))]
     use std::net::TcpListener;
 
@@ -894,7 +1114,7 @@ mod tests {
         });
         let mut pool = OrphanDrainerPool {
             stop,
-            threads: vec![worker],
+            threads: vec![(worker, Arc::new(TrafficGate::default()))],
         };
 
         pool.close_with_timeouts(Duration::from_secs(1), Duration::from_millis(10));
@@ -924,7 +1144,7 @@ mod tests {
         entered_rx.recv_timeout(Duration::from_millis(500)).unwrap();
         let mut pool = OrphanDrainerPool {
             stop,
-            threads: vec![worker],
+            threads: vec![(worker, Arc::new(TrafficGate::default()))],
         };
 
         let started = Instant::now();
@@ -941,6 +1161,55 @@ mod tests {
             .recv_timeout(Duration::from_millis(500))
             .unwrap();
         release_tx.send(()).unwrap();
+    }
+
+    #[cfg(all(feature = "sync-sender-qwp-ws", any(unix, windows)))]
+    #[test]
+    fn detached_background_worker_retains_slot_until_exit() {
+        let temp = TempDir::new().unwrap();
+        let options = SfaSlotOptions {
+            sf_dir: temp.path().to_path_buf(),
+            sender_id: "orphan".to_owned(),
+            segment_size_bytes: 256,
+            max_bytes: 1024,
+            periodic_sync_interval: None,
+        };
+        let stop = Arc::new(AtomicBool::new(false));
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let (exited_tx, exited_rx) = std::sync::mpsc::channel();
+        let worker_stop = Arc::clone(&stop);
+        let worker_options = options.clone();
+        let worker = thread::spawn(move || {
+            let queue = SfaSlotQueue::open(worker_options).unwrap();
+            entered_tx.send(()).unwrap();
+            while !worker_stop.load(Ordering::Acquire) {
+                thread::yield_now();
+            }
+            release_rx.recv().unwrap();
+            drop(queue);
+            exited_tx.send(()).unwrap();
+        });
+        // Liveness gates only (slot open/teardown do real file I/O, which is
+        // slow on loaded CI runners); the bounded-close behavior under test is
+        // asserted via close_with_timeouts below.
+        entered_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+        let mut pool = OrphanDrainerPool {
+            stop,
+            threads: vec![(worker, Arc::new(TrafficGate::default()))],
+        };
+
+        pool.close_with_timeouts(Duration::from_millis(10), Duration::from_millis(10));
+
+        assert!(matches!(
+            SfaSlotQueue::open(options.clone()),
+            Err(SfaQueueError::SlotInUse { .. })
+        ));
+        release_tx.send(()).unwrap();
+        exited_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+
+        let mut reopened = SfaSlotQueue::open(options).unwrap();
+        reopened.close().unwrap();
     }
 
     #[cfg(feature = "sync-sender-qwp-ws")]
@@ -966,6 +1235,42 @@ mod tests {
         stopper.join().unwrap();
     }
 
+    #[cfg(feature = "sync-sender-qwp-ws")]
+    #[test]
+    fn orphan_retry_backoff_doubles_and_caps() {
+        let max = Duration::from_millis(500);
+        let mut backoff = Duration::from_millis(100);
+
+        backoff = next_orphan_retry_backoff(backoff, max);
+        assert_eq!(backoff, Duration::from_millis(200));
+        backoff = next_orphan_retry_backoff(backoff, max);
+        assert_eq!(backoff, Duration::from_millis(400));
+        backoff = next_orphan_retry_backoff(backoff, max);
+        assert_eq!(backoff, max);
+        assert_eq!(next_orphan_retry_backoff(backoff, max), max);
+    }
+
+    #[cfg(feature = "sync-sender-qwp-ws")]
+    #[test]
+    fn orphan_terminal_classification_marks_only_local_resend_required_unrecoverable() {
+        let local = crate::Error::new(ErrorCode::StoreResendRequired, "torn dictionary");
+        assert!(terminal_error_is_proven_local_unrecoverable(Some(&local)));
+
+        let parse_rejection = QwpWsSenderError {
+            category: QwpWsErrorCategory::ParseError,
+            applied_policy: QwpWsErrorPolicy::Terminal,
+            status: Some(0x05),
+            message: Some("bad frame".to_owned()),
+            message_sequence: Some(0),
+            from_fsn: 0,
+            to_fsn: 0,
+        };
+        let parse = crate::Error::new(ErrorCode::ServerRejection, "bad frame")
+            .with_qwp_ws_rejection(parse_rejection);
+        assert!(!terminal_error_is_proven_local_unrecoverable(Some(&parse)));
+        assert!(!terminal_error_is_proven_local_unrecoverable(None));
+    }
+
     #[cfg(all(feature = "sync-sender-qwp-ws", any(unix, windows)))]
     fn slot_options(sf_dir: &Path, sender_id: &str) -> SfaSlotOptions {
         SfaSlotOptions {
@@ -973,7 +1278,17 @@ mod tests {
             sender_id: sender_id.to_owned(),
             segment_size_bytes: 256,
             max_bytes: 1024,
+            periodic_sync_interval: None,
         }
+    }
+
+    #[cfg(all(feature = "sync-sender-qwp-ws", any(unix, windows)))]
+    fn create_queued_orphan(sf_dir: &Path, sender_id: &str) -> PathBuf {
+        let slot_dir = sf_dir.join(sender_id);
+        let mut queue = SfaSlotQueue::open(slot_options(sf_dir, sender_id)).unwrap();
+        PublicationLog::try_publish(&mut queue, b"orphaned frame").unwrap();
+        queue.close().unwrap();
+        slot_dir
     }
 
     #[cfg(feature = "sync-sender-qwp-ws")]
@@ -988,6 +1303,46 @@ mod tests {
         assert!(drainers.drive_once());
         assert!(!has_failed_sentinel(&slot_dir));
         assert!(!drainers.drive_once());
+    }
+
+    #[cfg(all(feature = "sync-sender-qwp-ws", any(unix, windows)))]
+    #[test]
+    fn orphan_adoption_inherits_periodic_sync_interval_from_config() {
+        let temp = TempDir::new().unwrap();
+        let sf_dir = temp.path().join("sf-root");
+        let slot_dir = sf_dir.join("orphan");
+        {
+            let mut queue = SfaSlotQueue::open(slot_options(&sf_dir, "orphan")).unwrap();
+            PublicationLog::try_publish(&mut queue, b"orphaned").unwrap();
+            queue.close().unwrap();
+        }
+
+        let builder = crate::ingress::SenderBuilder::from_conf(format!(
+            "ws::addr=127.0.0.1:1;sf_dir={};sender_id=primary;drain_orphans=on;\
+             sf_max_segment_bytes=256;sf_max_total_bytes=1024;\
+             sf_durability=periodic;sf_sync_interval_millis=123;",
+            sf_dir.display()
+        ))
+        .unwrap();
+        let qwp_ws = builder.qwp_ws.as_ref().unwrap();
+        let config = OrphanDrainerConfig::new("127.0.0.1", "1", false, None, qwp_ws, None);
+        let queue_options = config.queue_options(slot_dir).unwrap();
+        assert_eq!(
+            queue_options.periodic_sync_interval,
+            Some(Duration::from_millis(123))
+        );
+
+        // Exercise the same options and replay-only open used by adoption,
+        // without adding a network or timer race to the test.
+        let mut adopted = SfaSlotQueue::open_replay_only_existing(queue_options).unwrap();
+        let sync_step = PublicationLog::take_storage_maintenance_step(&mut adopted, false)
+            .unwrap()
+            .expect("adopted periodic queue must schedule a sync step");
+        assert!(matches!(sync_step, SfaStorageStep::SyncPublished(_)));
+        let sync_result = sync_step.perform().unwrap();
+        PublicationLog::finish_storage_maintenance(&mut adopted, sync_result, false).unwrap();
+        PublicationLog::complete_storage_maintenance(&mut adopted).unwrap();
+        adopted.close().unwrap();
     }
 
     #[cfg(feature = "sync-sender-qwp-ws")]
@@ -1063,6 +1418,121 @@ mod tests {
         assert_eq!(scan_orphan_slots(&sf_dir, "primary", &[]), vec![slot_dir]);
     }
 
+    #[cfg(all(feature = "sync-sender-qwp-ws", any(unix, windows)))]
+    #[test]
+    fn manual_drainer_gates_connect_retries_so_caller_can_park() {
+        let temp = TempDir::new().unwrap();
+        let sf_dir = temp.path().join("sf-root");
+        let slot_dir = create_queued_orphan(&sf_dir, "orphan");
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+        let mut config = test_config();
+        config.port = port.to_string();
+        config.qwp_ws.reconnect_initial_backoff =
+            ConfigSetting::new_default(Duration::from_secs(3600));
+        let mut drainers = ManualOrphanDrainers::new(vec![slot_dir.clone()], 1, config).unwrap();
+
+        assert!(
+            drainers.drive_once(),
+            "the first connect attempt is a unit of work"
+        );
+        for _ in 0..8 {
+            assert!(
+                !drainers.drive_once(),
+                "a gated slot must let the caller park instead of connect-storming"
+            );
+        }
+        assert!(!has_failed_sentinel(&slot_dir));
+        assert!(slot_dir.join(LAST_ERROR_NAME).exists());
+    }
+
+    #[cfg(all(feature = "sync-sender-qwp-ws", any(unix, windows)))]
+    #[test]
+    fn manual_drainer_retries_connect_after_backoff_elapses() {
+        let temp = TempDir::new().unwrap();
+        let sf_dir = temp.path().join("sf-root");
+        let slot_dir = create_queued_orphan(&sf_dir, "orphan");
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+        let mut config = test_config();
+        config.port = port.to_string();
+        config.qwp_ws.reconnect_initial_backoff =
+            ConfigSetting::new_default(Duration::from_millis(10));
+        let mut drainers = ManualOrphanDrainers::new(vec![slot_dir], 1, config).unwrap();
+
+        assert!(drainers.drive_once());
+        thread::sleep(Duration::from_millis(50));
+        assert!(
+            drainers.drive_once(),
+            "an expired backoff gate must allow the next connect attempt"
+        );
+    }
+
+    #[cfg(all(feature = "sync-sender-qwp-ws", any(unix, windows)))]
+    #[test]
+    fn manual_drainer_connect_is_invisible_to_foreground_events() {
+        let temp = TempDir::new().unwrap();
+        let sf_dir = temp.path().join("sf-root");
+        let slot_dir = create_queued_orphan(&sf_dir, "orphan");
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+        let source = Arc::new(crate::ingress::conn_events::ConnectionEventSource::disabled());
+        let mut config = test_config();
+        config.port = port.to_string();
+        config.qwp_ws.conn_events = Some(Arc::clone(&source));
+        let mut drainers = ManualOrphanDrainers::new(vec![slot_dir], 1, config).unwrap();
+
+        assert!(drainers.drive_once());
+
+        assert_eq!(
+            source.next_attempt(),
+            1,
+            "manual orphan connects must not consume foreground attempt numbers"
+        );
+    }
+
+    #[cfg(all(feature = "sync-sender-qwp-ws", any(unix, windows)))]
+    #[test]
+    fn manual_drainer_retries_once_after_sanitizing_sealed_residue() {
+        let temp = TempDir::new().unwrap();
+        let slot_dir = temp.path().join("orphan");
+        fs::create_dir(&slot_dir).unwrap();
+        let sealed_path = spare_segment_path(&slot_dir, 0);
+        let active_path = spare_segment_path(&slot_dir, 1);
+        let mut sealed = SfaSegment::create_new_manifested(&sealed_path, 0, 256, 0).unwrap();
+        sealed.try_append(b"orphaned").unwrap();
+        drop(sealed);
+        let append_offset = scan_file(&sealed_path).unwrap().append_offset as usize;
+        let mut bytes = fs::read(&sealed_path).unwrap();
+        bytes[append_offset] = 0xa5;
+        fs::write(&sealed_path, bytes).unwrap();
+        drop(SfaSegment::create_new_manifested(&active_path, 1, 256, 0).unwrap());
+        drop(SfManifest::create(&slot_dir, 0, 1).unwrap());
+        let mut watermark = SfaAckWatermark::open(&slot_dir).unwrap();
+        watermark.write(-1).unwrap();
+        watermark.sync_data().unwrap();
+        drop(watermark);
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+        let mut config = test_config();
+        config.port = port.to_string();
+        let mut drainers = ManualOrphanDrainers::new(vec![slot_dir.clone()], 1, config).unwrap();
+
+        assert!(drainers.drive_once());
+
+        assert_eq!(scan_file(&sealed_path).unwrap().torn_tail_bytes, 0);
+        assert!(
+            !has_failed_sentinel(&slot_dir),
+            "the first sanitized-residue incident must be retried, not poisoned"
+        );
+        assert!(slot_dir.join(LAST_ERROR_NAME).exists());
+    }
+
     #[cfg(all(feature = "sync-sender-qwp-ws", unix))]
     #[test]
     fn manual_drainer_marks_recovery_failure_failed_without_network() {
@@ -1078,7 +1548,14 @@ mod tests {
 
         assert!(drainers.drive_once());
         assert!(has_failed_sentinel(&slot_dir));
-        assert!(segment_path.exists());
+        assert!(
+            !segment_path.exists(),
+            "manifest-less corruption must leave the .sfa scan"
+        );
+        assert!(
+            segment_path.with_extension("sfa.corrupt").exists(),
+            "quarantine must preserve the corrupt bytes for diagnosis"
+        );
         assert!(!drainers.drive_once());
     }
 }

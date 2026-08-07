@@ -226,6 +226,80 @@ pub enum ErrorCode {
     /// the error message text. The sender's own reconnect/failover loops treat it
     /// as terminal (they stop) rather than retrying it to their deadline.
     StoreResendRequired,
+
+    /// The QWP/WebSocket connection-scoped symbol dictionary is full: interning
+    /// another distinct symbol would push it past its entry-count cap
+    /// (2,000,000, matching the server's ingress ceiling) or its cumulative
+    /// UTF-8 heap cap (256 MiB). The dictionary accumulates every distinct
+    /// symbol referenced across every column, chunk, and row-buffer flush on
+    /// one connection, and is only reset by discarding that connection.
+    ///
+    /// The failing frame is rejected before any byte reaches the wire and the
+    /// buffer is rolled back, so *that flush* loses nothing and already-interned
+    /// symbols keep flushing — but retrying a *new* symbol on the same sender can
+    /// never succeed. A full dictionary therefore **retires the connection on
+    /// return**: a pooled sender is dropped rather than recycled (so the next
+    /// borrow gets a fresh, empty-dictionary connection, not the same full one),
+    /// and the frames flushed *earlier* on it are drained / committed best-effort
+    /// on the way out. So the simplest recovery is to return or drop the sender as
+    /// usual and continue on a fresh borrow. If those earlier frames must not be
+    /// lost, drain or commit them *and check* first, as below.
+    ///
+    /// - **Pooled row sender** (`QuestDb::borrow_sender`): a full dictionary marks
+    ///   the connection for retirement, so a plain drop (which *is* the pool
+    ///   return) drains the queue best-effort within `close_flush_timeout` and
+    ///   drops the connection instead of recycling it — the next borrow gets a
+    ///   fresh one. (Nothing extra to call: an explicit `drop_on_return()` does the
+    ///   same and is redundant here.) `wait()` first if the queued frames must not
+    ///   be lost. With `sf_dir` configured they persist in the slot, but so does
+    ///   the dictionary, and the next borrower re-seeds from that slot's side-file
+    ///   at the same size unless the slot drained first — so `wait()` there too, so
+    ///   the slot drains and the next borrower starts clean.
+    /// - **Pooled direct column sender**
+    ///   (`QuestDb::borrow_direct_column_sender`): a full dictionary marks the
+    ///   connection **spent** — retired on return, but its transport is healthy and
+    ///   still drainable — so a plain drop commits the deferred tail best-effort
+    ///   *and* retires the connection. Its `flush` is *deferred* (nothing is
+    ///   committed until [`commit`](crate::db::BorrowedDirectColumnSender::commit)
+    ///   or `flush_and_wait`), so for a *checked* guarantee call `commit(..)` (or
+    ///   `flush_and_wait(..)` on the final chunk) and confirm it succeeded before
+    ///   the drop — `commit` still goes through on a spent connection. Do **not**
+    ///   reach for `drop_on_return()` on a full dictionary: it hard-latches the
+    ///   connection, which makes the drop **skip** the best-effort commit and
+    ///   discard the tail. `reborrow_from_pool()` likewise discards the in-flight
+    ///   tail (its failover contract), so `commit`/`wait()` before it if that tail
+    ///   matters.
+    /// - **Standalone** (`Sender`): call
+    ///   [`close_drain`](crate::ingress::Sender::close_drain) and check it
+    ///   succeeded, then drop and reconnect. Unlike the pooled guards above, a
+    ///   plain drop drains **nothing** here — `SyncProtocolHandler`'s `Drop`
+    ///   shuts down the ILP-over-TCP socket and has no QWP/WebSocket arm at all,
+    ///   so every published-but-unacked frame is discarded with no wait. This is
+    ///   the most lossy of the three flavours on a bare drop, not the least.
+    ///   `close_drain` is bounded by `close_flush_timeout`.
+    /// - **C ABI**: a plain `questdb_db_return_sender` /
+    ///   `questdb_db_return_direct_sender` now retires (does not recycle) a
+    ///   full-dictionary connection and drains / commits its pending frames
+    ///   best-effort — call `qwp_sender_wait` / `qwp_direct_sender_commit` first
+    ///   for a checked guarantee. `questdb_db_drop_direct_sender` force-drops and
+    ///   **skips** the direct sender's tail commit, so on a full dictionary prefer
+    ///   the plain return unless you mean to discard the tail.
+    ///
+    /// **One exception to "that flush loses nothing", and it matters for
+    /// resends.** A chunk too large for a
+    /// single frame is split, and each half is published on its own;
+    /// store-and-forward is at-least-once, so an earlier half can already be
+    /// durably queued when a later half hits the cap. Nothing is lost then
+    /// either, but the operation is no longer known-not-delivered: it is
+    /// reported as delivery-unknown, so **check [`in_doubt`](Error::in_doubt)
+    /// before resending** — a blind resend of the whole chunk duplicates the
+    /// rows the committed prefix already carried.
+    ///
+    /// Distinct from [`InvalidApiCall`](Self::InvalidApiCall) — a caller
+    /// mistake with no recovery — so callers can recognise a full dictionary
+    /// **by code** and take that specific action, without matching on the error
+    /// message text.
+    SymbolDictFull,
 }
 
 /// An error that occurred when using the QuestDB client library.
@@ -539,6 +613,7 @@ mod tests {
                 ErrorCode::ArrowExport => {}
                 ErrorCode::BatchTooLarge => {}
                 ErrorCode::StoreResendRequired => {}
+                ErrorCode::SymbolDictFull => {}
             }
         }
         let _ = _exhaustive;

@@ -380,6 +380,10 @@ def check_compatibility(errors):
                 "Enterprise-only `qwpws_ack_level_durable`",
                 "durable ACK edition qualifier",
             ),
+            (
+                "NULL for a standalone handle",
+                "standalone direct-sender force-drop contract",
+            ),
         ),
         ROOT / "include" / "questdb" / "ingress" / "line_sender.h": (
             (
@@ -398,6 +402,10 @@ def check_compatibility(errors):
             (
                 "Enterprise-only\n * `qwpws_ack_level_durable`",
                 "durable ACK edition qualifier",
+            ),
+            (
+                "For a standalone handle, pass NULL for `db`.",
+                "standalone direct-sender force-drop contract",
             ),
         ),
     }
