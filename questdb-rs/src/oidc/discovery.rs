@@ -460,16 +460,20 @@ pub(crate) fn resolve_config(http: &HttpClient, params: &DiscoveryParams) -> Res
         }
     }
 
-    let client_id = params
-        .client_id
-        .clone()
-        .or_else(|| str_setting(cfg.get(K_CLIENT_ID)))
-        .ok_or_else(|| {
+    let client_id = match params.client_id.clone() {
+        Some(client_id) if client_id.is_empty() => {
+            return Err(OidcError::config(
+                "OIDC client_id must not be empty; pass the IdP's registered client id.",
+            ));
+        }
+        Some(client_id) => client_id,
+        None => str_setting(cfg.get(K_CLIENT_ID)).ok_or_else(|| {
             OidcError::config(format!(
                 "Missing OIDC client_id. QuestDB did not advertise {K_CLIENT_ID:?} \
                  via /settings; pass client_id(...) explicitly."
             ))
-        })?;
+        })?,
+    };
 
     let scope = params
         .scope

@@ -2787,6 +2787,24 @@ impl SenderBuilder {
         }
     }
 
+    /// Whether this builder has protocol-appropriate dynamic authentication.
+    /// Static authentication is returned separately by [`Self::build_auth`].
+    fn has_token_provider_auth(&self) -> bool {
+        match self.protocol {
+            #[cfg(feature = "_sender-http")]
+            Protocol::Http | Protocol::Https => self.http_token_provider.is_some(),
+            #[cfg(feature = "_sender-qwp-ws")]
+            Protocol::Ws | Protocol::Wss => self
+                .qwp_ws
+                .as_ref()
+                .is_some_and(|qwp_ws| qwp_ws.token_provider.is_some()),
+            #[cfg(feature = "_sender-tcp")]
+            Protocol::Tcp | Protocol::Tcps => false,
+            #[cfg(feature = "_sender-qwp-udp")]
+            Protocol::Udp => false,
+        }
+    }
+
     #[cfg(feature = "_sync-sender")]
     /// Build the sender.
     ///
@@ -3047,7 +3065,7 @@ impl SenderBuilder {
             },
         };
 
-        if auth.is_some() {
+        if auth.is_some() || self.has_token_provider_auth() {
             descr.push_str("auth=on]");
         } else {
             descr.push_str("auth=off]");

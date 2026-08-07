@@ -500,6 +500,19 @@ fn non_interactive_context_refuses() {
 }
 
 #[test]
+fn explicit_empty_client_id_is_rejected_during_build() {
+    let err = OidcDeviceAuth::builder()
+        .client_id("")
+        .device_authorization_endpoint("https://idp.example.com/device")
+        .token_endpoint("https://idp.example.com/token")
+        .build()
+        .unwrap_err();
+
+    assert_eq!(err.kind(), OidcErrorKind::Config);
+    assert!(err.message().contains("client_id must not be empty"));
+}
+
+#[test]
 fn discovery_from_questdb_settings() {
     // One mock plays both QuestDB (/settings) and the IdP (/device, /token).
     let mock = MockServer::start(|method, path, _body| match (method, path) {

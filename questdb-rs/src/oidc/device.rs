@@ -153,7 +153,8 @@ impl OidcDeviceAuthBuilder {
         }
     }
 
-    /// Override the discovered OAuth client id (required when not discovered).
+    /// Override the discovered OAuth client id. The explicit value must be
+    /// non-empty; a client id is required when none is discovered.
     pub fn client_id(mut self, client_id: impl Into<String>) -> Self {
         self.client_id = Some(client_id.into());
         self

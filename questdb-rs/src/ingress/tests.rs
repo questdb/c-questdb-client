@@ -1775,6 +1775,7 @@ fn qwp_ws_token_provider_stored_in_config() {
         .qwp_ws_token_provider(|| Ok::<_, crate::Error>("tok".to_string()))
         .unwrap();
     assert!(builder.qwp_ws.as_ref().unwrap().token_provider.is_some());
+    assert!(builder.has_token_provider_auth());
 }
 
 #[cfg(feature = "sync-sender-qwp-ws")]

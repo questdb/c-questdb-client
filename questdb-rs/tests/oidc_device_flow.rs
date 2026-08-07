@@ -234,6 +234,21 @@ fn provider_token_reaches_wire_and_rotates() {
 }
 
 #[test]
+fn provider_authenticated_sender_debug_reports_auth_on() {
+    let mock = MockServer::start(|_method, _path, _body| (204, String::new()));
+    let sender = sender_with_provider(&mock, || {
+        Ok::<_, questdb::Error>("dynamic-token".to_string())
+    })
+    .expect("build sender");
+
+    let debug = format!("{sender:?}");
+    assert!(
+        debug.contains("auth=on"),
+        "provider-authenticated sender was misreported: {debug}"
+    );
+}
+
+#[test]
 fn provider_error_fails_flush() {
     let mock = MockServer::start(|_m, path, _b| match path {
         "/write" => (204, String::new()),
