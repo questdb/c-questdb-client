@@ -398,6 +398,253 @@ impl Transport for TlsTransport {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::net::{SocketAddr, TcpListener, TcpStream};
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::{Mutex, OnceLock};
+    use std::thread::{self, JoinHandle};
+
+    use rustls::server::ServerConnection;
+    use rustls::{ServerConfig, StreamOwned};
+    use rustls_pki_types::{CertificateDer, PrivateKeyDer};
+
+    fn tls_certs_dir() -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../tls_certs")
+    }
+
+    fn root_ca_path() -> PathBuf {
+        tls_certs_dir().join("server_rootCA.pem")
+    }
+
+    fn tls_server_config() -> Arc<ServerConfig> {
+        static CONFIG: OnceLock<Arc<ServerConfig>> = OnceLock::new();
+        CONFIG
+            .get_or_init(|| {
+                let cert_chain: Vec<CertificateDer<'static>> =
+                    CertificateDer::pem_file_iter(tls_certs_dir().join("server.crt"))
+                        .expect("open OIDC TLS test certificate")
+                        .collect::<std::result::Result<_, _>>()
+                        .expect("parse OIDC TLS test certificate");
+                let key = PrivateKeyDer::from_pem_file(tls_certs_dir().join("server.key"))
+                    .expect("load OIDC TLS test private key");
+                Arc::new(
+                    ServerConfig::builder()
+                        .with_no_client_auth()
+                        .with_single_cert(cert_chain, key)
+                        .expect("build OIDC TLS test server config"),
+                )
+            })
+            .clone()
+    }
+
+    /// A one-request HTTPS endpoint using the repository's localhost test
+    /// certificate. It is intentionally separate from the plaintext device-flow
+    /// mock: these tests must execute the production OIDC TLS connector.
+    struct TlsJsonServer {
+        addr: SocketAddr,
+        url_host: &'static str,
+        requests: Arc<Mutex<Vec<String>>>,
+        accepts: Arc<AtomicUsize>,
+        shutdown: Arc<AtomicBool>,
+        handle: Option<JoinHandle<()>>,
+    }
+
+    impl TlsJsonServer {
+        fn start(bind: &str, url_host: &'static str) -> Self {
+            let listener = TcpListener::bind(bind).expect("bind OIDC TLS test server");
+            let addr = listener.local_addr().expect("OIDC TLS test server address");
+            listener
+                .set_nonblocking(true)
+                .expect("set OIDC TLS listener nonblocking");
+            let requests = Arc::new(Mutex::new(Vec::new()));
+            let accepts = Arc::new(AtomicUsize::new(0));
+            let shutdown = Arc::new(AtomicBool::new(false));
+            let handle = {
+                let requests = Arc::clone(&requests);
+                let accepts = Arc::clone(&accepts);
+                let shutdown = Arc::clone(&shutdown);
+                thread::spawn(move || {
+                    while !shutdown.load(Ordering::Relaxed) {
+                        match listener.accept() {
+                            Ok((stream, _)) => {
+                                accepts.fetch_add(1, Ordering::SeqCst);
+                                serve_tls_json(stream, tls_server_config(), &requests);
+                                break;
+                            }
+                            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                                thread::sleep(Duration::from_millis(1));
+                            }
+                            Err(_) => break,
+                        }
+                    }
+                })
+            };
+            TlsJsonServer {
+                addr,
+                url_host,
+                requests,
+                accepts,
+                shutdown,
+                handle: Some(handle),
+            }
+        }
+
+        fn localhost() -> Self {
+            // Bind via the same hostname the client resolves so dual-stack hosts
+            // do not connect to ::1 while the fixture listens on 127.0.0.1.
+            Self::start("localhost:0", "localhost")
+        }
+
+        fn hostname_mismatch() -> Self {
+            // The leaf certificate contains only DNS:localhost, never this IP.
+            Self::start("127.0.0.1:0", "127.0.0.1")
+        }
+
+        fn url(&self, path: &str) -> String {
+            format!("https://{}:{}{path}", self.url_host, self.addr.port())
+        }
+
+        fn request_bodies(&self) -> Vec<String> {
+            self.requests.lock().unwrap().clone()
+        }
+
+        fn accepts(&self) -> usize {
+            self.accepts.load(Ordering::SeqCst)
+        }
+    }
+
+    impl Drop for TlsJsonServer {
+        fn drop(&mut self) {
+            self.shutdown.store(true, Ordering::Relaxed);
+            // Wake a listener that has not accepted the test request because the
+            // client failed before dialing.
+            let _ = TcpStream::connect(self.addr);
+            if let Some(handle) = self.handle.take() {
+                let _ = handle.join();
+            }
+        }
+    }
+
+    fn serve_tls_json(tcp: TcpStream, config: Arc<ServerConfig>, requests: &Mutex<Vec<String>>) {
+        tcp.set_nonblocking(false).ok();
+        tcp.set_read_timeout(Some(Duration::from_secs(5))).ok();
+        tcp.set_write_timeout(Some(Duration::from_secs(5))).ok();
+        let Ok(conn) = ServerConnection::new(config) else {
+            return;
+        };
+        let mut stream = StreamOwned::new(conn, tcp);
+        let mut bytes = Vec::new();
+        let mut chunk = [0u8; 4096];
+        let headers_end = loop {
+            match stream.read(&mut chunk) {
+                Ok(0) | Err(_) => return,
+                Ok(n) => {
+                    bytes.extend_from_slice(&chunk[..n]);
+                    if let Some(pos) = bytes.windows(4).position(|w| w == b"\r\n\r\n") {
+                        break pos + 4;
+                    }
+                    if bytes.len() > 64 * 1024 {
+                        return;
+                    }
+                }
+            }
+        };
+        let headers = String::from_utf8_lossy(&bytes[..headers_end]);
+        let content_length = headers
+            .lines()
+            .find_map(|line| {
+                let (name, value) = line.split_once(':')?;
+                if name.eq_ignore_ascii_case("content-length") {
+                    value.trim().parse::<usize>().ok()
+                } else {
+                    None
+                }
+            })
+            .unwrap_or(0);
+        while bytes.len() - headers_end < content_length {
+            match stream.read(&mut chunk) {
+                Ok(0) | Err(_) => return,
+                Ok(n) => bytes.extend_from_slice(&chunk[..n]),
+            }
+        }
+        requests.lock().unwrap().push(
+            String::from_utf8_lossy(&bytes[headers_end..headers_end + content_length]).into_owned(),
+        );
+
+        let body = r#"{"access_token":"AT-tls","expires_in":300}"#;
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        let _ = stream.write_all(response.as_bytes());
+        let _ = stream.flush();
+    }
+
+    fn assert_tls_network_error(err: OidcError) {
+        assert_eq!(err.kind(), crate::oidc::error::OidcErrorKind::Network);
+        let message = err.message().to_ascii_lowercase();
+        assert!(
+            message.contains("tls")
+                || message.contains("certificate")
+                || message.contains("issuer"),
+            "expected a TLS verification failure, got: {}",
+            err.message()
+        );
+    }
+
+    #[test]
+    fn https_post_form_succeeds_with_custom_ca() {
+        let server = TlsJsonServer::localhost();
+        let client = HttpClient::new(Some(&root_ca_path()), Duration::from_secs(5)).unwrap();
+        let result = client
+            .post_form(
+                &server.url("/token"),
+                &[("grant_type", "refresh_token"), ("client_id", "questdb")],
+                false,
+            )
+            .unwrap();
+
+        assert_eq!(result.status, 200);
+        assert_eq!(
+            result.body.get("access_token").and_then(|v| v.as_str()),
+            Some("AT-tls")
+        );
+        assert_eq!(server.accepts(), 1);
+        let requests = server.request_bodies();
+        assert_eq!(requests.len(), 1);
+        assert!(requests[0].contains("grant_type=refresh_token"));
+        assert!(requests[0].contains("client_id=questdb"));
+    }
+
+    #[test]
+    fn https_rejects_unknown_ca() {
+        let server = TlsJsonServer::localhost();
+        let client = HttpClient::new(None, Duration::from_secs(5)).unwrap();
+        let err = match client.post_form(&server.url("/token"), &[("client_id", "questdb")], false)
+        {
+            Err(err) => err,
+            Ok(_) => panic!("an unknown CA must fail verification"),
+        };
+
+        assert_tls_network_error(err);
+        assert_eq!(server.accepts(), 1);
+        assert!(server.request_bodies().is_empty());
+    }
+
+    #[test]
+    fn https_rejects_hostname_mismatch() {
+        let server = TlsJsonServer::hostname_mismatch();
+        let client = HttpClient::new(Some(&root_ca_path()), Duration::from_secs(5)).unwrap();
+        let err = match client.post_form(&server.url("/token"), &[("client_id", "questdb")], false)
+        {
+            Err(err) => err,
+            Ok(_) => panic!("a hostname mismatch must fail verification"),
+        };
+
+        assert_tls_network_error(err);
+        assert_eq!(server.accepts(), 1);
+        assert!(server.request_bodies().is_empty());
+    }
 
     #[test]
     fn https_always_allowed() {
