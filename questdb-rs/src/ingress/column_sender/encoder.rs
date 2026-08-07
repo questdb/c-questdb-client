@@ -24,12 +24,17 @@
 
 //! Columnar QWP/WebSocket frame encoder.
 //!
-//! Writes the QWP frame body for a `Chunk` directly into the connection's
-//! reusable outbound buffer — no allocation per flush, no per-column
-//! aggregation copy. The no-null hot path for fixed-width columns is a
-//! single `extend_from_slice` (memcpy) straight from the caller's buffer.
+//! Writes the QWP frame body for a `Chunk` directly into a caller-provided
+//! owned output buffer, with no per-column aggregation copy. The direct path
+//! supplies the connection's reusable outbound buffer; the pooled
+//! store-and-forward path supplies the foreground publisher's retained payload
+//! buffer, which the queue borrows while appending the frame. The no-null hot
+//! path for fixed-width columns is a single `extend_from_slice` (memcpy)
+//! straight from the caller's buffer.
 //!
-//! See `doc/QWP_UNIFIED_SENDER_DESIGN.md` for the shared publication design.
+//! `Chunk` borrows caller-owned column buffers through encoding; the encoded
+//! frame bytes are owned by the supplied output buffer, so no borrowed column
+//! data escapes encoding.
 
 use std::slice;
 

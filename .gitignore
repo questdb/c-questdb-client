@@ -15,3 +15,5 @@ profile.out
 __pycache__/
 corrosion/test/cpp2rust/cpp2rust/rust/rust_dependency/Cargo.lock
 corrosion/test/rustflags/rustflags/rust/some_dependency/Cargo.lock
+/doc/net_bench/results/
+/tools/qwp_bench/net/results/

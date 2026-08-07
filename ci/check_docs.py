@@ -19,6 +19,7 @@ ACTIVE_DOCS = (
     ROOT / "README.md",
     ROOT / "questdb-rs" / "README.md",
     ROOT / "doc" / "README.md",
+    ROOT / "doc" / "BENCHMARKS.md",
     ROOT / "doc" / "BUILD.md",
     ROOT / "doc" / "C.md",
     ROOT / "doc" / "CPP.md",
@@ -28,6 +29,7 @@ ACTIVE_DOCS = (
     ROOT / "doc" / "RELEASING.md",
     ROOT / "doc" / "RELEASE_RUNBOOK.md",
     ROOT / "doc" / "SECURITY.md",
+    ROOT / "tools" / "qwp_bench" / "net" / "README.md",
 )
 
 LINK_RE = re.compile(r"!?(?:\[[^]]*\])\(([^)]+)\)")

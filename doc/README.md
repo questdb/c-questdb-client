@@ -20,6 +20,7 @@ to the source, headers, and executable examples in this repository.
 - [Routine release checklist](RELEASING.md)
 - [Full release runbook](RELEASE_RUNBOOK.md)
 - [Development notes](DEV_NOTES.md)
+- [QWP benchmark suite](BENCHMARKS.md)
 - [QWP soak harness](QWP_SOAK_HARNESS.md)
 
 These files describe repository maintenance, validation, performance work, or

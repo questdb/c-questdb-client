@@ -7,8 +7,7 @@
  * Reader conf mirrors the Rust example: fresh reader per iteration,
  * "ws::addr={host}:{port};compression=raw;". client="c-columnar".
  *
- * Shares env parsing, error exit and the stage/flush/checkpoint pass with
- * qwp_ingress_c.c via bench_ingest_c.{h,c} (Task 4). */
+ * Shared ingest helpers live in bench_ingest_c.{h,c}. */
 #include <inttypes.h>
 #include <stdbool.h>
 #include <stdio.h>

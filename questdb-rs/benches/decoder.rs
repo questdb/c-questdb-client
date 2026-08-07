@@ -360,7 +360,7 @@ fn serialize_batch(cols: &[ColSpec], row_count: usize) -> Bytes {
     Bytes::from(out)
 }
 
-/// Synthesise the **S1 narrow** `RESULT_BATCH` payload (plan §3.1): the
+/// Synthesise the **S1 narrow workload** `RESULT_BATCH` payload: the
 /// 5-column headline schema the cross-client parity table reads back —
 /// `ts` TIMESTAMP, `id` LONG, `price` DOUBLE, `sym` SYMBOL (card 8),
 /// `note` VARCHAR (~16 bytes). This is the workload behind the
@@ -491,7 +491,7 @@ fn bench_decoder(c: &mut Criterion) {
         },
     );
 
-    // Decode→assemble arms (plan §6 / §3.6) on the **S1 narrow** schema (the
+    // Decode-to-assemble comparison on the **S1 narrow** schema (the
     // shape the cross-client parity table reads back; the wide 15-col workload
     // above carries Int16/Int8 columns the crate's minimal polars feature set
     // can't build a Series from). Three nested floors so subtraction isolates

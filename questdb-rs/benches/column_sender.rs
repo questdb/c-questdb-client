@@ -24,10 +24,9 @@
 
 //! Column-major sender hot-path bench (`questdb-rs/benches/column_sender.rs`).
 //!
-//! Anchors the encoder floor tracked in
-//! `doc/QWP_UNIFIED_SENDER_M0_BASELINE.md`. Each bench reports
-//! throughput in rows/s and bytes/s so a regression shows up as either
-//! a row-rate or bandwidth drop.
+//! Anchors the in-tree column-sender encoder floor documented in
+//! `doc/BENCHMARKS.md`. Each bench reports throughput in rows/s and bytes/s so
+//! a regression shows up as either a row-rate or bandwidth drop.
 //!
 //! Three families:
 //!
@@ -41,8 +40,9 @@
 //! 2. **Symbol bulk-intern** — compares the column path
 //!    ([`Chunk::symbol_i32`] + flush-time interning) with a
 //!    naive per-row HashMap lookup that mirrors what the row API pays
-//!    on the same cardinality, to anchor the WS-4 plan claim ("10M
-//!    rows × 1000-card drops from 10M probes to 1000").
+//!    on the same cardinality, demonstrating the reduction from per-row
+//!    dictionary lookups to one lookup per referenced symbol (10M rows at
+//!    cardinality 1000 reduce 10M probes to 1000).
 //!
 //! 3. **Encode-only end-to-end** — populate a 10M-row chunk with a
 //!    representative column mix, then time

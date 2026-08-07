@@ -1,5 +1,6 @@
-/* C twin of questdb-rs/examples/qwp_ingress_polars.rs
- * (doc/historical/QWP_DATAFRAME_BENCH_PLAN.md §6 Step 3).
+/* C twin of questdb-rs/examples/qwp_ingress_polars.rs.
+ * C columnar ingress benchmark; schemas, paths, and report fields are
+ * documented in doc/BENCHMARKS.md.
  * Measures the columnar C API end-to-end on the shared S1/S2 schemas:
  *   chunk-build   (floor) — stage all batches into a chunk, no network
  *   flush-chunks  (e2e)   — stage + qwp_direct_sender_flush per
