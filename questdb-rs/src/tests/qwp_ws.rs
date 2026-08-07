@@ -60,7 +60,6 @@ const QWP_STATUS_WRITE_ERROR: u8 = 0x09;
 const QWP_STATUS_NOT_WRITABLE: u8 = 0x0C;
 const QWP_WS_PUBLIC_BENCH_DEFAULT_ROWS: usize = 20_000_000;
 const QWP_WS_PUBLIC_BENCH_DEFAULT_BATCH_SIZE: usize = 1000;
-const QWP_WS_PUBLIC_BENCH_DEFAULT_IN_FLIGHT: usize = 128;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ProgressCase {
@@ -735,6 +734,27 @@ fn spawn_stalled_after_first_frame_server() -> (u16, mpsc::Receiver<Vec<u8>>, mp
     (port, frame_rx, release_tx)
 }
 
+/// Accepts one connection and reads QWP frames forever without ever acking,
+/// forwarding each payload. Lets a test observe how many frames the client is
+/// willing to put on the wire with zero ack progress.
+fn spawn_silent_never_acking_server() -> (u16, mpsc::Receiver<Vec<u8>>) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let (frame_tx, frame_rx) = mpsc::channel();
+
+    thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        perform_server_upgrade(&mut stream).unwrap();
+        while let Ok((_fin, _opcode, payload)) = read_frame(&mut stream) {
+            if frame_tx.send(payload).is_err() {
+                break;
+            }
+        }
+    });
+
+    (port, frame_rx)
+}
+
 fn spawn_delayed_durable_ack_server() -> (
     u16,
     mpsc::Receiver<Vec<u8>>,
@@ -767,6 +787,185 @@ fn spawn_delayed_durable_ack_server() -> (
     });
 
     (port, frame_rx, ok_tx, durable_tx)
+}
+
+struct DurableBacklogServer {
+    port: u16,
+    initial_ok_count: Arc<AtomicUsize>,
+    disconnect_tx: mpsc::Sender<usize>,
+    replayed_rx: mpsc::Receiver<usize>,
+    release_durable_tx: mpsc::Sender<()>,
+    resumed_rx: mpsc::Receiver<()>,
+    done_tx: mpsc::Sender<()>,
+    handle: thread::JoinHandle<()>,
+}
+
+fn qwp_frame_has_tables(payload: &[u8]) -> bool {
+    assert!(
+        payload.len() >= 8,
+        "short QWP frame: {} bytes",
+        payload.len()
+    );
+    assert_eq!(&payload[0..4], b"QWP1");
+    u16::from_le_bytes([payload[6], payload[7]]) != 0
+}
+
+/// Ordinary-OKs every data frame without advancing the durable watermark.
+/// Once told how many frames filled the ring, drops the connection, verifies
+/// that every unresolved frame is replayed, and releases one cumulative
+/// durable ACK. It then accepts and durably ACKs one fresh publication so the
+/// test can prove that segment trimming restored producer capacity.
+fn spawn_durable_backlog_reconnect_server() -> DurableBacklogServer {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let initial_ok_count = Arc::new(AtomicUsize::new(0));
+    let server_initial_ok_count = Arc::clone(&initial_ok_count);
+    let (disconnect_tx, disconnect_rx) = mpsc::channel();
+    let (replayed_tx, replayed_rx) = mpsc::channel();
+    let (release_durable_tx, release_durable_rx) = mpsc::channel();
+    let (resumed_tx, resumed_rx) = mpsc::channel();
+    let (done_tx, done_rx) = mpsc::channel();
+
+    let handle = thread::spawn(move || {
+        let (mut initial, _) = listener.accept().unwrap();
+        perform_server_upgrade_durable(&mut initial).unwrap();
+        initial
+            .set_read_timeout(Some(Duration::from_millis(100)))
+            .unwrap();
+
+        let mut initial_frames = 0usize;
+        let mut wire_seq = FIRST_WIRE_SEQUENCE;
+        let expected_replay = loop {
+            match disconnect_rx.try_recv() {
+                Ok(expected_replay) => break expected_replay,
+                Err(mpsc::TryRecvError::Empty) => {}
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    panic!("durable backlog test dropped the disconnect signal")
+                }
+            }
+
+            match read_frame(&mut initial) {
+                Ok((_fin, 0x2, payload)) => {
+                    let response_wire_seq = wire_seq;
+                    wire_seq += 1;
+                    if !qwp_frame_has_tables(&payload) {
+                        continue;
+                    }
+                    initial_frames += 1;
+                    write_qwp_ok_response_with_table_entries(
+                        &mut initial,
+                        response_wire_seq,
+                        &[("trades", initial_frames as i64)],
+                    )
+                    .unwrap();
+                    server_initial_ok_count.store(initial_frames, Ordering::Release);
+                }
+                Ok((_fin, 0x9, payload)) => {
+                    write_server_frame(&mut initial, 0xA, &payload, false).unwrap();
+                }
+                Ok((_fin, 0x8, _payload)) => {
+                    panic!("client closed before the durable backlog was released")
+                }
+                Ok((_fin, _opcode, _payload)) => {}
+                Err(err)
+                    if matches!(
+                        err.kind(),
+                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                    ) => {}
+                Err(err) => panic!("initial durable backlog connection failed: {err}"),
+            }
+        };
+        assert_eq!(
+            initial_frames, expected_replay,
+            "every published frame must receive an ordinary OK before reconnect"
+        );
+        drop(initial);
+
+        let (mut replay, _) = listener.accept().unwrap();
+        perform_server_upgrade_durable(&mut replay).unwrap();
+
+        let mut replayed = 0usize;
+        let mut wire_seq = FIRST_WIRE_SEQUENCE;
+        while replayed < expected_replay {
+            match read_frame(&mut replay) {
+                Ok((_fin, 0x2, payload)) => {
+                    let response_wire_seq = wire_seq;
+                    wire_seq += 1;
+                    // A non-empty symbol dictionary would be re-registered in
+                    // a table-less catch-up frame. It consumes a wire sequence
+                    // but is not one of the unresolved publications.
+                    if !qwp_frame_has_tables(&payload) {
+                        continue;
+                    }
+                    replayed += 1;
+                    write_qwp_ok_response_with_table_entries(
+                        &mut replay,
+                        response_wire_seq,
+                        &[("trades", replayed as i64)],
+                    )
+                    .unwrap();
+                }
+                Ok((_fin, 0x9, payload)) => {
+                    write_server_frame(&mut replay, 0xA, &payload, false).unwrap();
+                }
+                Ok((_fin, 0x8, _payload)) => {
+                    panic!("client closed before replaying the durable backlog")
+                }
+                Ok((_fin, _opcode, _payload)) => {}
+                Err(err) => panic!("durable backlog replay failed: {err}"),
+            }
+        }
+        replayed_tx.send(replayed).unwrap();
+
+        release_durable_rx
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap();
+        write_qwp_durable_ack_response(&mut replay, &[("trades", replayed as i64)]).unwrap();
+
+        loop {
+            match read_frame(&mut replay) {
+                Ok((_fin, 0x2, payload)) => {
+                    let response_wire_seq = wire_seq;
+                    wire_seq += 1;
+                    if !qwp_frame_has_tables(&payload) {
+                        continue;
+                    }
+                    let resumed_txn = replayed as i64 + 1;
+                    write_qwp_ok_response_with_table_entries(
+                        &mut replay,
+                        response_wire_seq,
+                        &[("trades", resumed_txn)],
+                    )
+                    .unwrap();
+                    write_qwp_durable_ack_response(&mut replay, &[("trades", resumed_txn)])
+                        .unwrap();
+                    resumed_tx.send(()).unwrap();
+                    break;
+                }
+                Ok((_fin, 0x9, payload)) => {
+                    write_server_frame(&mut replay, 0xA, &payload, false).unwrap();
+                }
+                Ok((_fin, 0x8, _payload)) => {
+                    panic!("client closed before producer capacity recovered")
+                }
+                Ok((_fin, _opcode, _payload)) => {}
+                Err(err) => panic!("post-durable publication failed: {err}"),
+            }
+        }
+
+        done_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    });
+
+    DurableBacklogServer {
+        port,
+        initial_ok_count,
+        disconnect_tx,
+        replayed_rx,
+        release_durable_tx,
+        resumed_rx,
+        done_tx,
+        handle,
+    }
 }
 
 fn spawn_ack_each_frame_server() -> (u16, thread::JoinHandle<usize>) {
@@ -2018,14 +2217,54 @@ fn qwp_ws_terminal_reject_terminalizes_in_all_progress_modes() {
     }
 }
 
+/// The QWP/WebSocket wire has no frame-count cap: the client streams every
+/// buffered frame to a server that never acks a single one, bounded only by
+/// the store-and-forward byte budget.
+#[test]
+fn qwp_ws_wire_has_no_frame_count_cap() {
+    // Comfortably above the 128 frames the QWP spec once listed as the
+    // per-connection limit, so any frame-count cap up to that size fails
+    // this test rather than passing under it.
+    const FRAMES: usize = 200;
+
+    let (port, frames) = spawn_silent_never_acking_server();
+    let conf = format!("ws::addr=127.0.0.1:{port};");
+    let mut sender = SenderBuilder::from_conf(conf).unwrap().build().unwrap();
+
+    for qty in 0..FRAMES as i64 {
+        let mut buf = sender.new_buffer();
+        buf.table("trades")
+            .unwrap()
+            .column_i64("qty", qty)
+            .unwrap()
+            .at_now()
+            .unwrap();
+        sender.flush(&mut buf).unwrap();
+    }
+
+    for i in 0..FRAMES {
+        let payload = frames
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap_or_else(|_| {
+                panic!("only {i} of {FRAMES} frames reached the server without any ack")
+            });
+        assert_eq!(&payload[0..4], b"QWP1");
+    }
+}
+
 #[test]
 fn qwp_ws_backpressure_timeout_matches_in_all_progress_modes() {
     for progress in [ProgressCase::Background, ProgressCase::Manual] {
         let (port, frame_rx, release_tx) = spawn_stalled_after_first_frame_server();
+        // In ordinary-ACK mode the frame-count window is gone, so backpressure
+        // comes solely from the segment ring's byte budget: two 512-byte
+        // segments, neither of which can be trimmed while the server sits on
+        // the first frame without acking it.
         let conf = format!(
             "ws::addr=127.0.0.1:{port};\
              qwp_ws_progress={};\
-             max_in_flight=1;\
+             sf_max_segment_bytes=512;\
+             sf_max_total_bytes=1024;\
              sf_append_deadline_millis=20;",
             progress.name()
         );
@@ -2049,23 +2288,38 @@ fn qwp_ws_backpressure_timeout_matches_in_all_progress_modes() {
             b"QWP1"
         );
 
-        let mut second = sender.new_buffer();
-        second
-            .table("trades")
-            .unwrap()
-            .column_i64("qty", 2)
-            .unwrap()
-            .at_now()
-            .unwrap();
-        let err = sender.flush(&mut second).unwrap_err();
+        // Keep publishing until the ring's byte budget is exhausted. Nothing
+        // can be trimmed while the server withholds its ack, so this always
+        // terminates well inside the loop bound.
+        let mut backpressured = None;
+        for _ in 0..64 {
+            let mut next = sender.new_buffer();
+            next.table("trades")
+                .unwrap()
+                .column_i64("qty", 2)
+                .unwrap()
+                .at_now()
+                .unwrap();
+            if let Err(err) = sender.flush(&mut next) {
+                assert!(!next.is_empty(), "mode={}", progress.name());
+                backpressured = Some(err);
+                break;
+            }
+        }
+        let err = backpressured.unwrap_or_else(|| {
+            panic!(
+                "the full segment ring must reject a flush, mode={}",
+                progress.name()
+            )
+        });
         assert_eq!(err.code(), ErrorCode::SocketError);
-        assert_eq!(
-            err.msg(),
-            "QWP/WebSocket flush timed out waiting for local queue capacity",
-            "mode={}",
-            progress.name()
+        assert!(
+            err.msg()
+                .starts_with("QWP/WebSocket Store-and-Forward append timed out"),
+            "mode={}, got: {}",
+            progress.name(),
+            err.msg()
         );
-        assert!(!second.is_empty(), "mode={}", progress.name());
         let _ = release_tx.send(());
     }
 }
@@ -2279,6 +2533,128 @@ fn sender_sfa_fully_delivered_tracks_ok_and_durable_watermarks() {
         assert!(http_sender.sfa_fully_delivered(false));
         assert!(http_sender.sfa_fully_delivered(true));
     }
+}
+
+#[test]
+fn qwp_ws_deep_durable_backlog_fills_byte_ring_replays_and_recovers() {
+    const MIN_DEEP_BACKLOG: usize = 64;
+
+    let DurableBacklogServer {
+        port,
+        initial_ok_count,
+        disconnect_tx,
+        replayed_rx,
+        release_durable_tx,
+        resumed_rx,
+        done_tx,
+        handle,
+    } = spawn_durable_backlog_reconnect_server();
+    let conf = format!(
+        "ws::addr=127.0.0.1:{port};\
+         request_durable_ack=on;\
+         sf_max_segment_bytes=512;\
+         sf_max_total_bytes=8192;\
+         sf_append_deadline_millis=100;\
+         durable_ack_keepalive_interval_millis=10;\
+         reconnect_initial_backoff_millis=1;\
+         reconnect_max_backoff_millis=1;\
+         reconnect_max_duration_millis=5000;"
+    );
+    let mut sender = SenderBuilder::from_conf(conf).unwrap().build().unwrap();
+
+    let mut published = 0usize;
+    let mut last_fsn = None;
+    let (mut blocked, backpressure) = loop {
+        let mut next = sender.new_buffer();
+        next.table("trades")
+            .unwrap()
+            .column_i64("qty", published as i64)
+            .unwrap()
+            .at_now()
+            .unwrap();
+        match sender.flush_and_get_fsn(&mut next) {
+            Ok(Some(fsn)) => {
+                published += 1;
+                last_fsn = Some(fsn);
+            }
+            Ok(None) => panic!("non-empty durable frame did not publish an FSN"),
+            Err(err) => break (next, err),
+        }
+    };
+
+    assert!(!blocked.is_empty());
+    assert_eq!(backpressure.code(), ErrorCode::SocketError);
+    assert!(
+        backpressure
+            .msg()
+            .contains("timed out waiting for ACK-driven segment trim"),
+        "expected byte-ring backpressure, got: {}",
+        backpressure.msg()
+    );
+    assert!(
+        published >= MIN_DEEP_BACKLOG,
+        "byte ring held only {published} frames; test did not build a deep backlog"
+    );
+
+    assert!(
+        wait_until(Duration::from_secs(5), || {
+            initial_ok_count.load(Ordering::Acquire) == published
+        }),
+        "server ordinary-OKed only {} of {published} frames",
+        initial_ok_count.load(Ordering::Acquire)
+    );
+    assert!(
+        wait_until(Duration::from_secs(5), || sender.sfa_fully_delivered(false)),
+        "ordinary OK watermark did not cover the deep backlog"
+    );
+    assert!(
+        !sender.sfa_fully_delivered(true),
+        "durable watermark advanced while durable ACKs were withheld"
+    );
+    assert_eq!(sender.acked_fsn().unwrap(), None);
+
+    disconnect_tx.send(published).unwrap();
+    let replayed = replayed_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    assert_eq!(replayed, published);
+    assert!(
+        wait_until(Duration::from_secs(5), || sender.sfa_fully_delivered(false)),
+        "ordinary OK watermark did not recover after replay"
+    );
+    assert!(!sender.sfa_fully_delivered(true));
+    assert!(
+        wait_until(Duration::from_secs(5), || {
+            let totals = sender.qwp_ws_totals().unwrap();
+            totals.reconnects_succeeded >= 1 && totals.frames_replayed >= published as u64
+        }),
+        "reconnect/replay counters did not cover the deep backlog: {:?}",
+        sender.qwp_ws_totals().unwrap()
+    );
+    let totals = sender.qwp_ws_totals().unwrap();
+    assert_eq!(totals.reconnects_succeeded, 1);
+    assert_eq!(totals.frames_replayed, published as u64);
+
+    release_durable_tx.send(()).unwrap();
+    sender
+        .wait(crate::ingress::AckLevel::Durable, Duration::from_secs(5))
+        .unwrap();
+    let last_fsn = last_fsn.unwrap();
+    assert_eq!(sender.acked_fsn().unwrap(), Some(last_fsn));
+    assert!(sender.sfa_fully_delivered(true));
+
+    let resumed_fsn = sender
+        .flush_and_get_fsn(&mut blocked)
+        .unwrap()
+        .expect("the blocked frame must publish after durable segment trim");
+    assert_eq!(resumed_fsn, last_fsn + 1);
+    sender
+        .wait(crate::ingress::AckLevel::Durable, Duration::from_secs(5))
+        .unwrap();
+    resumed_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    assert_eq!(sender.acked_fsn().unwrap(), Some(resumed_fsn));
+
+    done_tx.send(()).unwrap();
+    drop(sender);
+    handle.join().unwrap();
 }
 
 #[test]
@@ -2520,18 +2896,13 @@ fn qwp_ws_public_sender_batch_throughput_benchmark() {
         "QWP_WS_PUBLIC_BENCH_BATCH_SIZE",
         QWP_WS_PUBLIC_BENCH_DEFAULT_BATCH_SIZE,
     );
-    let in_flight = qwp_ws_public_bench_env_usize(
-        "QWP_WS_PUBLIC_BENCH_IN_FLIGHT",
-        QWP_WS_PUBLIC_BENCH_DEFAULT_IN_FLIGHT,
-    );
     let workload = QwpWsPublicBenchWorkload::from_env();
     let prevalidated_names = qwp_ws_public_bench_env_bool("QWP_WS_PUBLIC_BENCH_PREVALIDATED_NAMES");
     assert!(rows > 0);
     assert!(batch_size > 0);
-    assert!(in_flight > 1);
 
     let (port, server) = spawn_ack_each_frame_server();
-    let conf = format!("ws::addr=127.0.0.1:{port};in_flight_window={in_flight};");
+    let conf = format!("ws::addr=127.0.0.1:{port};");
     let mut sender = SenderBuilder::from_conf(conf).unwrap().build().unwrap();
     let mut buffer = sender.new_buffer();
 
@@ -2583,12 +2954,11 @@ fn qwp_ws_public_sender_batch_throughput_benchmark() {
     assert_eq!(binary_frames, expected_frames);
 
     eprintln!(
-        "qwp_ws_public_sender_batch_throughput workload={} prevalidated_names={} rows={} batch_size={} in_flight_window={} frames={} total_ms={} build_ms={} flush_ms={} close_ms={} rows_per_sec={:.2}",
+        "qwp_ws_public_sender_batch_throughput workload={} prevalidated_names={} rows={} batch_size={} frames={} total_ms={} build_ms={} flush_ms={} close_ms={} rows_per_sec={:.2}",
         workload.as_str(),
         prevalidated_names,
         rows,
         batch_size,
-        in_flight,
         binary_frames,
         elapsed.as_millis(),
         build_elapsed.as_millis(),
@@ -2597,22 +2967,20 @@ fn qwp_ws_public_sender_batch_throughput_benchmark() {
         rows as f64 / elapsed.as_secs_f64()
     );
     eprintln!(
-        "qwp_ws_public_sender_batch_build workload={} prevalidated_names={} rows={} batch_size={} in_flight_window={} elapsed_ms={} rows_per_sec={:.2}",
+        "qwp_ws_public_sender_batch_build workload={} prevalidated_names={} rows={} batch_size={} elapsed_ms={} rows_per_sec={:.2}",
         workload.as_str(),
         prevalidated_names,
         rows,
         batch_size,
-        in_flight,
         build_elapsed.as_millis(),
         rows as f64 / build_elapsed.as_secs_f64()
     );
     eprintln!(
-        "qwp_ws_public_sender_batch_flush workload={} prevalidated_names={} rows={} batch_size={} in_flight_window={} elapsed_ms={} rows_per_sec={:.2}",
+        "qwp_ws_public_sender_batch_flush workload={} prevalidated_names={} rows={} batch_size={} elapsed_ms={} rows_per_sec={:.2}",
         workload.as_str(),
         prevalidated_names,
         rows,
         batch_size,
-        in_flight,
         flush_elapsed.as_millis(),
         rows as f64 / flush_elapsed.as_secs_f64()
     );
@@ -2659,8 +3027,6 @@ fn qwp_ws_manual_sender_can_pipeline_before_waiting() {
     });
 
     let mut sender = SenderBuilder::new(Protocol::Ws, "127.0.0.1", port)
-        .max_in_flight(2)
-        .unwrap()
         .qwp_ws_progress(QwpWsProgress::Manual)
         .unwrap()
         .build()
@@ -5076,8 +5442,6 @@ fn qwp_ws_high_level_flushes_pipeline_before_ack() {
     });
 
     let mut sender = SenderBuilder::new(Protocol::Ws, "127.0.0.1", port)
-        .max_in_flight(2)
-        .unwrap()
         .build()
         .unwrap();
 
@@ -6435,7 +6799,6 @@ fn qwp_ws_from_conf_parses_java_reconnect_keys() {
     // Just exercises the parser surface: every new key is accepted. Building
     // would also work but isn't necessary for parser coverage.
     let conf = "ws::addr=localhost:9000;\
-                max_in_flight=64;\
                 reconnect_max_duration_millis=20000;\
                 reconnect_initial_backoff_millis=200;\
                 reconnect_max_backoff_millis=2000;\

@@ -650,8 +650,8 @@ impl Sender {
 
     /// Return the highest frame sequence number completed by server ACK or
     /// server-side reject-and-continue, or `None` if no frame has completed.
-    /// In QWP/WebSocket durable ACK mode, ordinary OK frames only release send
-    /// window pressure; this watermark advances after durable ACK coverage.
+    /// In QWP/WebSocket durable ACK mode, ordinary OK frames do not advance
+    /// this watermark; it advances once durable ACKs cover the frame.
     ///
     /// After [`Self::flush_and_get_fsn`] returns `Some(fsn)`, that publication
     /// boundary has completed once this method returns a value greater than or

@@ -543,7 +543,6 @@ struct QwpWsPendingConnect {
     qwp_ws: QwpWsConfig,
     auth_header: Option<String>,
     reconnect_policy: ReconnectPolicy,
-    max_in_flight: usize,
     durable_ack: bool,
     server_max_batch_size: Arc<AtomicUsize>,
     traffic_gate: Arc<TrafficGate>,
@@ -1014,7 +1013,6 @@ impl QwpWsPendingConnect {
         tls_settings: Option<TlsSettings>,
         qwp_ws: &QwpWsConfig,
         auth_header: Option<String>,
-        max_in_flight: usize,
         durable_ack: bool,
         server_max_batch_size: Arc<AtomicUsize>,
         traffic_gate: Arc<TrafficGate>,
@@ -1034,7 +1032,6 @@ impl QwpWsPendingConnect {
                 *qwp_ws.reconnect_initial_backoff,
                 *qwp_ws.reconnect_max_backoff,
             ),
-            max_in_flight,
             durable_ack,
             server_max_batch_size,
             traffic_gate,
@@ -1141,7 +1138,6 @@ impl SyncQwpWsPendingRunnerCore {
             Ok(Some(transport)) => {
                 let mut send_core = QwpWsSendCore::new_with_durable_ack_and_rejection_limit(
                     transport,
-                    self.pending_connect.max_in_flight,
                     self.pending_connect.reconnect_policy,
                     self.pending_connect.durable_ack,
                     *self.pending_connect.qwp_ws.max_frame_rejections,
@@ -1974,7 +1970,6 @@ fn open_configured_qwp_ws_queue(qwp_ws: &QwpWsConfig) -> crate::Result<SfaSlotQu
     }
 
     let max_bytes = usize_from_config("sf_max_total_bytes", qwp_ws.sf_max_total_bytes())?;
-    let max_in_flight = *qwp_ws.max_in_flight;
     let periodic_sync_interval = qwp_ws.periodic_sync_interval();
 
     if let Some(sf_dir) = qwp_ws.sf_dir.as_ref() {
@@ -1983,7 +1978,6 @@ fn open_configured_qwp_ws_queue(qwp_ws: &QwpWsConfig) -> crate::Result<SfaSlotQu
             sender_id: qwp_ws.sender_id.to_string(),
             segment_size_bytes: *qwp_ws.sf_max_segment_bytes,
             max_bytes,
-            max_in_flight,
             periodic_sync_interval,
         })
         .map_err(|err| match err {
@@ -2025,7 +2019,6 @@ fn open_configured_qwp_ws_queue(qwp_ws: &QwpWsConfig) -> crate::Result<SfaSlotQu
     SfaSlotQueue::open_memory(SfaMemoryQueueOptions {
         segment_size_bytes: *qwp_ws.sf_max_segment_bytes,
         max_bytes,
-        max_in_flight,
     })
     .map_err(|err| {
         error::fmt!(
@@ -3505,7 +3498,6 @@ pub(crate) fn connect_qwp_ws_background_state(
             tls_settings,
             qwp_ws,
             auth_header,
-            queue.max_in_flight(),
             *qwp_ws.request_durable_ack,
             Arc::clone(&server_max_batch_size),
             Arc::clone(&traffic_gate),
@@ -3707,7 +3699,6 @@ fn open_qwp_ws_parts(
         traffic_gate,
     )?;
     let negotiated_version = transport.negotiated_version();
-    let max_in_flight = queue.max_in_flight();
     // Extract the slot's delta-dict state before the queue moves into the store:
     // whether delta is on, the recovered entries (to seed the producer dict + the
     // driver mirror), and the side-file handle (for the foreground's write-ahead).
@@ -3723,7 +3714,6 @@ fn open_qwp_ws_parts(
     store.set_rejection_sink(qwp_ws.rejection_sink.clone());
     let send_core = QwpWsSendCore::new_with_durable_ack_and_rejection_limit(
         transport,
-        max_in_flight,
         ReconnectPolicy::bounded(
             *qwp_ws.reconnect_max_duration,
             *qwp_ws.reconnect_initial_backoff,
@@ -4277,7 +4267,6 @@ fn driver_error_backpressure_queue(err: &DriverError) -> Option<super::qwp_ws_qu
         DriverError::Queue(
             err @ (QueueError::FrameCapacityFull { .. }
             | QueueError::ByteCapacityFull { .. }
-            | QueueError::MaxInFlightReached { .. }
             | QueueError::StorageSpareNotReady { .. }
             | QueueError::StorageSegmentCapFull { .. }),
         ) => Some(*err),
@@ -4325,11 +4314,10 @@ mod tests {
     use std::sync::{Arc, mpsc};
     use tempfile::TempDir;
 
-    fn memory_queue(max_bytes: usize, max_in_flight: usize) -> SfaFrameQueue {
+    fn memory_queue(max_bytes: usize) -> SfaFrameQueue {
         SfaFrameQueue::open_memory(SfaMemoryQueueOptions {
             segment_size_bytes: 256,
             max_bytes,
-            max_in_flight,
         })
         .unwrap()
     }
@@ -5398,7 +5386,7 @@ mod tests {
     fn threaded_runner_accepts_publication_while_transport_send_is_blocked() {
         let (send_started_tx, send_started_rx) = mpsc::channel();
         let (release_send_tx, release_send_rx) = mpsc::channel();
-        let queue = memory_queue(1024, 2);
+        let queue = memory_queue(1024);
         let transport = BlockingFirstSendTransport {
             send_started: send_started_tx,
             release_send: release_send_rx,
@@ -5446,7 +5434,6 @@ mod tests {
             sender_id: "blocked-runner".to_string(),
             segment_size_bytes: 4096,
             max_bytes: 8192,
-            max_in_flight: 1,
             periodic_sync_interval: None,
         };
         let queue = SfaSlotQueue::open(slot_options.clone()).unwrap();
@@ -5556,7 +5543,6 @@ mod tests {
             sender_id: sender_id.to_owned(),
             segment_size_bytes: 256,
             max_bytes: 1024,
-            max_in_flight: *qwp_ws.max_in_flight,
             periodic_sync_interval: Some(Duration::from_secs(3600)),
         };
         let mut queue = open_configured_qwp_ws_queue(&qwp_ws).unwrap();
@@ -5615,7 +5601,6 @@ mod tests {
             sender_id: "hot-spare-runner".to_string(),
             segment_size_bytes: 38,
             max_bytes: 114,
-            max_in_flight: 4,
             periodic_sync_interval: None,
         };
         let mut queue = SfaSlotQueue::open(slot_options.clone()).unwrap();
@@ -5685,7 +5670,6 @@ mod tests {
             slot_dir: dir.path().to_path_buf(),
             segment_size_bytes: 4096,
             max_bytes: 8192,
-            max_in_flight: 1,
             periodic_sync_interval: None,
         })
         .unwrap();
@@ -5724,7 +5708,6 @@ mod tests {
             slot_dir: dir.path().to_path_buf(),
             segment_size_bytes: 4096,
             max_bytes: 8192,
-            max_in_flight: 1,
             periodic_sync_interval: None,
         })
         .unwrap();
@@ -5781,7 +5764,6 @@ mod tests {
             slot_dir: dir.path().to_path_buf(),
             segment_size_bytes: 4096,
             max_bytes: 8192,
-            max_in_flight: 1,
             periodic_sync_interval: None,
         })
         .unwrap();
@@ -5838,7 +5820,6 @@ mod tests {
             slot_dir: dir.path().to_path_buf(),
             segment_size_bytes: 4096,
             max_bytes: 8192,
-            max_in_flight: 1,
             periodic_sync_interval: None,
         })
         .unwrap();
@@ -5902,7 +5883,6 @@ mod tests {
             slot_dir: dir.path().to_path_buf(),
             segment_size_bytes: 4096,
             max_bytes: 8192,
-            max_in_flight: 1,
             periodic_sync_interval: None,
         })
         .unwrap();
@@ -5928,7 +5908,6 @@ mod tests {
             slot_dir: dir.path().to_path_buf(),
             segment_size_bytes: 4096,
             max_bytes: 8192,
-            max_in_flight: 1,
             periodic_sync_interval: None,
         })
         .unwrap();
@@ -6007,7 +5986,7 @@ mod tests {
         let (send_started_tx, send_started_rx) = mpsc::channel();
         let (reconnect_started_tx, reconnect_started_rx) = mpsc::channel();
         let (release_reconnect_tx, release_reconnect_rx) = mpsc::channel();
-        let queue = memory_queue(1024, 2);
+        let queue = memory_queue(1024);
         let transport = BlockingReconnectTransport {
             send_started: send_started_tx,
             reconnect_started: reconnect_started_tx,
@@ -6085,30 +6064,41 @@ mod tests {
         }
     }
 
+    // Two 10-byte frames fill the two-segment byte budget; a third publish then
+    // backpressures until acks trim an earlier frame's segment.
+    fn byte_backpressured_queue() -> SfaFrameQueue {
+        SfaFrameQueue::open_memory(SfaMemoryQueueOptions {
+            segment_size_bytes: 48,
+            max_bytes: 96,
+        })
+        .unwrap()
+    }
+
     #[test]
     fn threaded_runner_waits_for_ack_when_sfa_publication_is_backpressured() {
         let (sent_tx, sent_rx) = mpsc::channel();
         let (ack_tx, ack_rx) = mpsc::channel();
         let (_terminal_tx, terminal_rx) = mpsc::channel();
-        let queue = memory_queue(1024, 1);
         let transport = SignalResponseTransport {
             sent_frame: sent_tx,
             ack: ack_rx,
             terminal: terminal_rx,
             sent_frames: Vec::new(),
         };
-        let driver = QwpWsCoreTestHarness::from_queue(queue, transport);
+        let driver = QwpWsCoreTestHarness::from_queue(byte_backpressured_queue(), transport);
         let mut runner =
             SyncQwpWsRunner::start_driver_with_append_deadline(driver, Duration::from_secs(5));
 
-        runner.publish_replay_payload(b"first").unwrap();
+        runner.publish_replay_payload(b"aaaaaaaaaa").unwrap();
         assert_eq!(sent_rx.recv_timeout(Duration::from_secs(5)).unwrap().fsn, 0);
+        runner.publish_replay_payload(b"bbbbbbbbbb").unwrap();
+        assert_eq!(sent_rx.recv_timeout(Duration::from_secs(5)).unwrap().fsn, 1);
 
         std::thread::scope(|scope| {
             let (published_tx, published_rx) = mpsc::channel();
             let runner = &mut runner;
             let publish_thread = scope.spawn(move || {
-                let result = runner.publish_replay_payload(b"second");
+                let result = runner.publish_replay_payload(b"cccccccccc");
                 let _ = published_tx.send(result.map(|_| ()));
             });
 
@@ -6131,25 +6121,26 @@ mod tests {
         let (sent_tx, sent_rx) = mpsc::channel();
         let (_ack_tx, ack_rx) = mpsc::channel();
         let (_terminal_tx, terminal_rx) = mpsc::channel();
-        let queue = memory_queue(1024, 1);
         let transport = SignalResponseTransport {
             sent_frame: sent_tx,
             ack: ack_rx,
             terminal: terminal_rx,
             sent_frames: Vec::new(),
         };
-        let driver = QwpWsCoreTestHarness::from_queue(queue, transport);
+        let driver = QwpWsCoreTestHarness::from_queue(byte_backpressured_queue(), transport);
         let mut runner =
             SyncQwpWsRunner::start_driver_with_append_deadline(driver, Duration::from_millis(20));
 
-        runner.publish_replay_payload(b"first").unwrap();
+        runner.publish_replay_payload(b"aaaaaaaaaa").unwrap();
         assert_eq!(sent_rx.recv_timeout(Duration::from_secs(5)).unwrap().fsn, 0);
+        runner.publish_replay_payload(b"bbbbbbbbbb").unwrap();
+        assert_eq!(sent_rx.recv_timeout(Duration::from_secs(5)).unwrap().fsn, 1);
 
-        let err = runner.publish_replay_payload(b"second").unwrap_err();
+        let err = runner.publish_replay_payload(b"cccccccccc").unwrap_err();
         assert_eq!(err.code(), crate::ErrorCode::SocketError);
         assert!(
             err.msg()
-                .contains("timed out waiting for local queue capacity"),
+                .contains("timed out waiting for ACK-driven segment trim"),
             "got: {}",
             err.msg()
         );
@@ -6160,25 +6151,26 @@ mod tests {
         let (sent_tx, sent_rx) = mpsc::channel();
         let (_ack_tx, ack_rx) = mpsc::channel();
         let (terminal_tx, terminal_rx) = mpsc::channel();
-        let queue = memory_queue(1024, 1);
         let transport = SignalResponseTransport {
             sent_frame: sent_tx,
             ack: ack_rx,
             terminal: terminal_rx,
             sent_frames: Vec::new(),
         };
-        let driver = QwpWsCoreTestHarness::from_queue(queue, transport);
+        let driver = QwpWsCoreTestHarness::from_queue(byte_backpressured_queue(), transport);
         let mut runner =
             SyncQwpWsRunner::start_driver_with_append_deadline(driver, Duration::from_secs(5));
 
-        runner.publish_replay_payload(b"first").unwrap();
+        runner.publish_replay_payload(b"aaaaaaaaaa").unwrap();
         assert_eq!(sent_rx.recv_timeout(Duration::from_secs(5)).unwrap().fsn, 0);
+        runner.publish_replay_payload(b"bbbbbbbbbb").unwrap();
+        assert_eq!(sent_rx.recv_timeout(Duration::from_secs(5)).unwrap().fsn, 1);
 
         std::thread::scope(|scope| {
             let (published_tx, published_rx) = mpsc::channel();
             let runner = &mut runner;
             let publish_thread = scope.spawn(move || {
-                let result = runner.publish_replay_payload(b"second");
+                let result = runner.publish_replay_payload(b"cccccccccc");
                 let _ = published_tx.send(result.map(|_| ()));
             });
 
@@ -6243,7 +6235,7 @@ mod tests {
     fn threaded_runner_records_immediate_transport_failure_as_sent() {
         let (reconnect_started_tx, reconnect_started_rx) = mpsc::channel();
         let (release_reconnect_tx, release_reconnect_rx) = mpsc::channel();
-        let queue = memory_queue(1024, 2);
+        let queue = memory_queue(1024);
         let transport = ImmediateFailureReconnectTransport {
             reconnect_started: reconnect_started_tx,
             release_reconnect: release_reconnect_rx,
