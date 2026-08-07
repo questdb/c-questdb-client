@@ -93,13 +93,13 @@
 //! Independently, **when a refresh token is available** a cached token's believed
 //! lifetime is capped at one hour, so it is silently rotated at least that often
 //! even if the IdP issued a very long-lived (or hostile) token. Without a refresh
-//! token the cap is not applied: shortening the client's *belief* about expiry
-//! can't shorten the token's real validity at the server, so it would only force
-//! a needless interactive re-prompt. Because a token provider is pulled on the
-//! flush path, a re-prompt — when the token *genuinely* expires and no refresh
-//! token is available to rotate it silently — can still surface during a
-//! [`Sender::flush`](crate::ingress::Sender::flush); request `offline_access`
-//! (above) for unattended, long-running senders.
+//! token, a JWT is bounded by its own signed `exp` claim and the IdP's reported
+//! lifetime, with no arbitrary one-hour ceiling. An opaque token has no signed
+//! expiry the client can verify, so its believed lifetime is capped at one hour
+//! even without a refresh token. Because a token provider is pulled on the flush
+//! path, an interactive re-prompt after either expiry bound is reached can surface
+//! during a [`Sender::flush`](crate::ingress::Sender::flush); request
+//! `offline_access` (above) for unattended, long-running senders.
 //!
 //! # Persisting the token across restarts
 //!
