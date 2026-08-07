@@ -384,6 +384,21 @@ fn clear_removes_file_and_is_idempotent() {
     store.clear(&key).unwrap(); // no-op on an already-absent file
 }
 
+#[test]
+fn clear_removes_orphan_temp_without_a_token_file() {
+    let dir = TempDir::new().unwrap();
+    let store = FileTokenStore::at(dir.path());
+    let key = test_key();
+    let orphan = temp_path(dir.path(), &key.hash());
+    std::fs::write(&orphan, b"orphaned refresh credential").unwrap();
+    assert!(!store.token_file(&key).exists());
+
+    // This is the path where only the orphan deletion changes the directory;
+    // clear must detect it so the subsequent directory fsync is not skipped.
+    store.clear(&key).unwrap();
+    assert!(!orphan.exists());
+}
+
 // -- cross-process lock (Layer 2) -------------------------------------------
 
 #[test]

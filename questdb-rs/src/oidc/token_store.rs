@@ -675,8 +675,8 @@ impl TokenStore for FileTokenStore {
         };
         // Sweep any orphaned sibling temp files holding a now-forgotten credential
         // (a hard crash between the temp write and the rename). Best-effort.
-        sweep_orphan_temps(&self.directory, &key.hash());
-        if removed {
+        let removed_orphans = sweep_orphan_temps(&self.directory, &key.hash());
+        if removed || removed_orphans {
             fsync_directory(&self.directory)?; // make the refresh-parent tombstone durable
         }
         Ok(())
@@ -904,18 +904,21 @@ fn holder_bytes() -> String {
 }
 
 /// Sweep any leftover `<hash>*.tmp` files for one identity (a plaintext token an
-/// aborted `save` left behind). Best-effort.
-fn sweep_orphan_temps(dir: &Path, hash: &str) {
+/// aborted `save` left behind). Best-effort. Returns whether at least one
+/// directory entry was removed, so the caller can durably sync that deletion.
+fn sweep_orphan_temps(dir: &Path, hash: &str) -> bool {
     let Ok(entries) = fs::read_dir(dir) else {
-        return;
+        return false;
     };
+    let mut removed = false;
     for entry in entries.flatten() {
         let name = entry.file_name();
         let name = name.to_string_lossy();
         if name.starts_with(hash) && name.ends_with(".tmp") {
-            let _ = fs::remove_file(entry.path());
+            removed |= fs::remove_file(entry.path()).is_ok();
         }
     }
+    removed
 }
 
 /// Open a file for reading only if it is a regular file within the size bound;
