@@ -340,14 +340,9 @@ impl Reader {
             // message ("HTTP error: 401") with no way to tell which
             // endpoint refused.
             let endpoint = &cfg.addrs[idx];
-            let mut annotated = Error::new(e.code(), format!("endpoint {}: {}", endpoint, e.msg()));
-            if let Some(r) = e.upgrade_reject() {
-                annotated = annotated.with_upgrade_reject(r.clone());
-            }
-            if let Some(info) = e.server_info() {
-                annotated = annotated.with_server_info(info.clone());
-            }
-            annotated
+            let code = e.code();
+            let msg = format!("endpoint {}: {}", endpoint, e.msg());
+            e.reclassified(code, msg)
         })?;
         let server_info = if transport.server_version() >= 1 {
             Some(read_server_info_frame(

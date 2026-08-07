@@ -1,0 +1,210 @@
+/*******************************************************************************
+ *     ___                  _   ____  ____
+ *    / _ \ _   _  ___  ___| |_|  _ \| __ )
+ *   | | | | | | |/ _ \/ __| __| | | |  _ \
+ *   | |_| | |_| |  __/\__ \ |_| |_| | |_) |
+ *    \__\_\\__,_|\___||___/\__|____/|____/
+ *
+ *  Copyright (c) 2014-2019 Appsicle
+ *  Copyright (c) 2019-2025 QuestDB
+ *
+ *  Licensed under the Apache License, Version 2.0 (the "License");
+ *  you may not use this file except in compliance with the License.
+ *  You may obtain a copy of the License at
+ *
+ *  http://www.apache.org/licenses/LICENSE-2.0
+ *
+ *  Unless required by applicable law or agreed to in writing, software
+ *  distributed under the License is distributed on an "AS IS" BASIS,
+ *  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ *  See the License for the specific language governing permissions and
+ *  limitations under the License.
+ *
+ ******************************************************************************/
+
+//! Interactive OIDC sign-in for QuestDB Enterprise via the OAuth 2.0 Device
+//! Authorization Grant ([RFC 8628](https://www.rfc-editor.org/rfc/rfc8628)).
+//!
+//! [`OidcDeviceAuth`] signs a user in interactively without needing a local
+//! browser on the machine running the client: it prints a short code and a
+//! verification URL (and opens it in a browser when one is available), the user
+//! authorizes on any device, and the client — which only ever makes outbound
+//! calls to the identity provider (IdP) — receives the token. This works from
+//! headless or remote environments (containers, remote notebook kernels, CI
+//! jobs).
+//!
+//! The acquired token is presented to QuestDB as an HTTP
+//! `Authorization: Bearer <token>` header. The flow runs entirely client-side;
+//! QuestDB is never in the token-acquisition path.
+//!
+//! # Example
+//!
+//! ```no_run
+//! use std::sync::Arc;
+//! use questdb::oidc::OidcDeviceAuth;
+//! use questdb::ingress::{Protocol, SenderBuilder};
+//!
+//! # fn main() -> questdb::Result<()> {
+//! // Discover the client id, scope and endpoints from the QuestDB server's
+//! // /settings. When the server doesn't advertise its device-authorization
+//! // endpoint, pin the IdP out-of-band with `.issuer(...)`.
+//! let auth = Arc::new(
+//!     OidcDeviceAuth::from_questdb("https://questdb.example.com:9000")
+//!         .issuer("https://idp.example.com")
+//!         .build()?,
+//! );
+//! auth.sign_in()?; // prompts on first use, then caches (and refreshes silently
+//!                  // if the IdP issued a refresh token — see below)
+//!
+//! // Pass a token provider (not a fixed string): the sender pulls a freshly
+//! // refreshed token on each request, so a long-lived sender keeps working as
+//! // the token rotates.
+//! let mut sender = SenderBuilder::new(Protocol::Https, "questdb.example.com", 9000)
+//!     .http_token_provider({
+//!         let auth = Arc::clone(&auth);
+//!         move || auth.token()
+//!     })?
+//!     .build()?;
+//! # let _ = &mut sender;
+//! # Ok(())
+//! # }
+//! ```
+//!
+//! # Token lifetime and refresh
+//!
+//! A cached token is refreshed **silently only when the IdP issued a refresh
+//! token**. Most IdPs issue one only when the `offline_access` scope is
+//! requested; the default scope is just `openid`. Without a refresh token,
+//! [`token`](OidcDeviceAuth::token) returns
+//! [`InteractionRequired`](OidcErrorKind::InteractionRequired) after expiry;
+//! call [`sign_in`](OidcDeviceAuth::sign_in) explicitly on a suitable UI thread
+//! to run a fresh device flow.
+//! To get silent refresh, include `offline_access` in the scope — via QuestDB's
+//! `acl.oidc.scope` setting, or [`scope`](OidcDeviceAuthBuilder::scope):
+//!
+//! ```no_run
+//! # use questdb::oidc::OidcDeviceAuth;
+//! # fn main() -> questdb::Result<()> {
+//! let auth = OidcDeviceAuth::from_questdb("https://questdb.example.com:9000")
+//!     .scope("openid offline_access")
+//!     .build()?;
+//! # let _ = auth;
+//! # Ok(())
+//! # }
+//! ```
+//!
+//! Independently, **when a refresh token is available** a cached token's believed
+//! lifetime is capped at one hour, so it is silently rotated at least that often
+//! even if the IdP issued a very long-lived (or hostile) token. Without a refresh
+//! token, a JWT is bounded by its own signed `exp` claim and the IdP's reported
+//! lifetime, with no arbitrary one-hour ceiling. An opaque token has no signed
+//! expiry the client can verify, so its believed lifetime is capped at one hour
+//! even without a refresh token. Token-provider callbacks never start a device
+//! flow: after either expiry bound, the transport operation receives
+//! `InteractionRequired` instead of displaying a prompt or waiting for user
+//! input. Request `offline_access` (above) for unattended, long-running clients.
+//!
+//! # Persisting the token across restarts
+//!
+//! Token state is in-memory only by default, so a restarted process re-runs the
+//! interactive device flow. Pass a [`TokenStore`] to persist it — the restarted
+//! process then resumes from the saved refresh token (one silent token-endpoint
+//! round-trip) instead of re-prompting, and [`token`](OidcDeviceAuth::token) even
+//! works as the first call:
+//!
+//! ```no_run
+//! # use questdb::oidc::{OidcDeviceAuth, FileTokenStore};
+//! # fn main() -> questdb::Result<()> {
+//! let store = FileTokenStore::at_default_location()
+//!     .map_err(|e| questdb::Error::new(questdb::ErrorCode::ConfigError, e.to_string()))?;
+//! let auth = OidcDeviceAuth::from_questdb("https://questdb.example.com:9000")
+//!     .issuer("https://idp.example.com")
+//!     .token_store(store)
+//!     .build()?;
+//! # let _ = auth;
+//! # Ok(())
+//! # }
+//! ```
+//!
+//! The bundled [`FileTokenStore`] writes one plaintext JSON file per identity
+//! (under `~/.questdb/oidc-tokens/`, or `$QUESTDB_CLIENT_OIDC_TOKEN_STORE_DIR`),
+//! protected by file permissions (`0600`/`0700`). **This writes a long-lived
+//! refresh token to disk in plaintext**, so persistence is opt-in; for at-rest
+//! encryption, implement [`TokenStore`] over an OS keychain or a secrets manager.
+//! A persisted file is treated as untrusted input on load (see [`FileTokenStore`]).
+//! A refresh is never attempted without owning the store's cross-process lock:
+//! contention returns a retryable network-class error, and an apparently stale
+//! lock is left in place for an operator to remove only after verifying that its
+//! holder is gone. This avoids reusing a rotating refresh token concurrently.
+//!
+//! # Using the token beyond ILP/HTTP
+//!
+//! The same auto-refreshed token wires into QuestDB's other transports. Each is a
+//! *provider* callback pulled fresh at connect time, so a long-lived client keeps
+//! working as the token rotates — pass `move || auth.token()` (with an
+//! [`Arc<OidcDeviceAuth>`](std::sync::Arc)). Call `auth.sign_in()` before starting
+//! the transport; provider calls can refresh silently but never prompt:
+//!
+//! - **QWP/WebSocket ingress** — `SenderBuilder::qwp_ws_token_provider` (feature
+//!   `sync-sender-qwp-ws`), pulled at each (re)connect handshake.
+//! - **QWP/WebSocket egress reader** — `ReaderConfig::token_provider` (feature
+//!   `sync-reader-qwp-ws`), likewise per (re)connect.
+//! - **SQL over PG-wire** — QuestDB has no Rust driver in this crate, but the
+//!   token works as a PG-wire password: connect with the username `_sso` and
+//!   [`token`](OidcDeviceAuth::token) as the password (requires
+//!   `acl.oidc.pg.token.as.password.enabled=true` on the server). QuestDB
+//!   validates the token at **authentication** time, not per query — an open
+//!   connection survives token expiry, so only *new* connections need a fresh
+//!   token. Pull [`token`](OidcDeviceAuth::token) in your pool's connection
+//!   factory so each new connection gets a freshly-refreshed one. If there is no
+//!   cached or refreshable credential, `token()` returns `InteractionRequired`
+//!   rather than prompting from the connection factory:
+//!
+//! ```no_run
+//! # use questdb::oidc::OidcDeviceAuth;
+//! # fn main() -> questdb::Result<()> {
+//! # let auth = OidcDeviceAuth::from_questdb("https://questdb.example.com:9000").build()?;
+//! auth.sign_in()?;
+//! // `<postgres-client>::connect` with user "_sso" and this token as the password:
+//! let password = auth.token()?; // cached or silently refreshed; never prompts
+//! # let _ = password;
+//! # Ok(())
+//! # }
+//! ```
+//!
+//! For a plain `Authorization: Bearer` header (raw HTTP, or your own tooling), use
+//! [`authorization_header_value`](OidcDeviceAuth::authorization_header_value).
+//!
+//! # Security
+//!
+//! The IdP device-authorization and token endpoints must use `https` (a
+//! loopback endpoint may use `http`, since the request never leaves the host),
+//! so the device code and refresh token are never sent in cleartext.
+//! [`OidcDeviceAuthBuilder::allow_insecure_transport`] relaxes only the QuestDB
+//! `/settings` link (for local development against an `http` server); it never
+//! relaxes the IdP endpoints.
+//!
+//! [`from_questdb`](OidcDeviceAuth::from_questdb) takes the IdP endpoints from
+//! the server's unauthenticated `/settings`, so it trusts that server to
+//! designate where you sign in. Passing [`issuer`](OidcDeviceAuthBuilder::issuer)
+//! hardens this: the endpoints are then pinned to the issuer's origin (and, when
+//! the issuer has a path, an endpoint advertised by `/settings` must also be
+//! under that path), and an endpoint outside it is rejected.
+
+mod device;
+mod discovery;
+mod error;
+mod http;
+mod render;
+mod token;
+mod token_store;
+
+pub use device::{OidcDeviceAuth, OidcDeviceAuthBuilder};
+pub use discovery::OidcConfig;
+pub use error::{OidcError, OidcErrorKind};
+pub use render::{DeviceCodeChallenge, Renderer, TerminalRenderer, sanitize_display_text};
+pub use token::TokenSet;
+pub use token_store::{
+    FileTokenStore, PersistedToken, TOKEN_STORE_DIR_ENV, TokenStore, TokenStoreKey,
+    TokenStoreResult,
+};

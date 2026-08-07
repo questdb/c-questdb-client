@@ -61,6 +61,23 @@ extern "C" {
  *  owning handle remains open. `questdb_db_close` is the final owner release:
  *  do not call it concurrently with other operations on the same `db`. */
 typedef struct questdb_db questdb_db;
+typedef struct questdb_oidc_auth questdb_oidc_auth;
+
+/** Extensible options for `questdb_db_connect_ex`. Initialize with
+ *  `questdb_db_connect_options_init(&options, sizeof options)`, then override
+ *  the needed fields. `struct_size` records the caller's allocation size; do
+ *  not modify it after initialization. */
+typedef struct questdb_db_connect_options
+{
+    size_t struct_size;
+    const questdb_oidc_auth* oidc_auth;
+    questdb_connection_event_cb event_callback;
+    void* event_user_data;
+    size_t event_inbox_capacity;
+    line_sender_qwpws_error_cb rejection_callback;
+    void* rejection_user_data;
+    size_t rejection_inbox_capacity;
+} questdb_db_connect_options;
 
 /* -------------------------------------------------------------------------
  * Pool lifecycle
@@ -122,6 +139,27 @@ QUESTDB_CLIENT_API
 questdb_db* questdb_db_connect(
     const char* conf,
     size_t conf_len,
+    questdb_error** err_out);
+
+QUESTDB_CLIENT_API
+void questdb_db_connect_options_init(
+    questdb_db_connect_options* options,
+    size_t options_size);
+
+/**
+ * Open a pool with optional callbacks and a shared OIDC token provider.
+ * `options` may be NULL. When `oidc_auth` is set, the pool retains shared
+ * ownership and pulls a fresh token for every sender/reader connect or
+ * reconnect; the caller may free its auth handle after this call returns.
+ * Provider calls may load or silently refresh a token but never start an
+ * interactive device flow. Call questdb_oidc_auth_sign_in before opening the
+ * pool; otherwise token acquisition reports InteractionRequired.
+ */
+QUESTDB_CLIENT_API
+questdb_db* questdb_db_connect_ex(
+    const char* conf,
+    size_t conf_len,
+    const questdb_db_connect_options* options,
     questdb_error** err_out);
 
 /**

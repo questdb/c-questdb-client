@@ -1,0 +1,341 @@
+/*******************************************************************************
+ *     ___                  _   ____  ____
+ *    / _ \ _   _  ___  ___| |_|  _ \| __ )
+ *   | | | | | | |/ _ \/ __| __| | | |  _ \
+ *   | |_| | |_| |  __/\__ \ |_| |_| | |_) |
+ *    \__\_\\__,_|\___||___/\__|____/|____/
+ *
+ *  Copyright (c) 2014-2019 Appsicle
+ *  Copyright (c) 2019-2025 QuestDB
+ *
+ *  Licensed under the Apache License, Version 2.0 (the "License");
+ ******************************************************************************/
+
+#pragma once
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+#include <stdbool.h>
+#include <stddef.h>
+#include <stdint.h>
+
+#include <questdb/ingress/line_sender.h>
+
+/** Reusable device-flow builder, shared authentication state, and owned token. */
+typedef struct questdb_oidc_builder questdb_oidc_builder;
+typedef struct questdb_oidc_auth questdb_oidc_auth;
+typedef struct questdb_oidc_token questdb_oidc_token;
+
+typedef enum questdb_oidc_event_kind
+{
+    QUESTDB_OIDC_EVENT_PROMPT = 0,
+    QUESTDB_OIDC_EVENT_WAITING = 1,
+    QUESTDB_OIDC_EVENT_SUCCESS = 2,
+    QUESTDB_OIDC_EVENT_FAILURE = 3,
+} questdb_oidc_event_kind;
+
+/**
+ * Borrowed renderer event. Its strings are valid only during the callback.
+ *
+ * All textual fields are display-safe, inert, single-line text: terminal
+ * controls, bidi/zero-width characters, and other invisible formatting are
+ * removed. Non-ASCII characters in the display-only prompt code/URLs are
+ * visibly escaped. `verification_uri` and `verification_uri_complete` are for
+ * display only.
+ * `browser_target`, when non-NULL, is the sole URL vetted for opening or making
+ * clickable (HTTP(S), no userinfo, non-empty ASCII host).
+ */
+typedef struct questdb_oidc_event
+{
+    size_t struct_size;
+    questdb_oidc_event_kind kind;
+    const char* user_code;
+    size_t user_code_len;
+    const char* verification_uri;
+    size_t verification_uri_len;
+    const char* verification_uri_complete;
+    size_t verification_uri_complete_len;
+    const char* identity;
+    size_t identity_len;
+    const char* message;
+    size_t message_len;
+    double seconds_left;
+    double expires_in_seconds;
+    const char* browser_target;
+    size_t browser_target_len;
+} questdb_oidc_event;
+
+/**
+ * May run on any thread that acquires or refreshes a token and must not
+ * unwind. Invocations of one installed handler are serialized across every
+ * auth object built from that builder, so its `user_data` is never entered
+ * concurrently by OIDC events.
+ *
+ * While the callback is running, `sign_in`, `token`, and `clear` calls on an
+ * auth object sharing this handler fail with `questdb_error_invalid_api_call`;
+ * token acquisition through an attached sender, reader, or pool is likewise
+ * rejected through that transport's provider-error path. Return from the
+ * callback before starting another auth operation.
+ */
+typedef void (*questdb_oidc_event_cb)(
+    void* user_data,
+    const questdb_oidc_event* event);
+/** May run on whichever thread releases the final builder/auth/transport ref. */
+typedef void (*questdb_oidc_user_data_release_cb)(void* user_data);
+
+/** Explicit configuration; set client id and both OAuth endpoints before build. */
+QUESTDB_CLIENT_API
+questdb_oidc_builder* questdb_oidc_builder_new(void);
+
+/** Discover OIDC settings from the QuestDB server's `/settings` endpoint. */
+QUESTDB_CLIENT_API
+questdb_oidc_builder* questdb_oidc_builder_from_questdb(
+    const char* url,
+    size_t url_len,
+    questdb_error** err_out);
+
+QUESTDB_CLIENT_API
+void questdb_oidc_builder_free(questdb_oidc_builder* builder);
+
+#define QUESTDB_OIDC_STRING_BUILDER_FN(name)                                  \
+    QUESTDB_CLIENT_API bool name(                                              \
+        questdb_oidc_builder* builder,                                         \
+        const char* value,                                                     \
+        size_t value_len,                                                      \
+        questdb_error** err_out)
+
+QUESTDB_OIDC_STRING_BUILDER_FN(questdb_oidc_builder_client_id);
+QUESTDB_OIDC_STRING_BUILDER_FN(questdb_oidc_builder_scope);
+QUESTDB_OIDC_STRING_BUILDER_FN(questdb_oidc_builder_audience);
+QUESTDB_OIDC_STRING_BUILDER_FN(questdb_oidc_builder_issuer);
+QUESTDB_OIDC_STRING_BUILDER_FN(questdb_oidc_builder_token_endpoint);
+QUESTDB_OIDC_STRING_BUILDER_FN(
+    questdb_oidc_builder_device_authorization_endpoint);
+
+#undef QUESTDB_OIDC_STRING_BUILDER_FN
+
+QUESTDB_CLIENT_API
+bool questdb_oidc_builder_groups_in_token(
+    questdb_oidc_builder* builder,
+    bool enabled,
+    questdb_error** err_out);
+QUESTDB_CLIENT_API
+bool questdb_oidc_builder_allow_insecure_transport(
+    questdb_oidc_builder* builder,
+    bool enabled,
+    questdb_error** err_out);
+QUESTDB_CLIENT_API
+bool questdb_oidc_builder_open_browser(
+    questdb_oidc_builder* builder,
+    bool enabled,
+    questdb_error** err_out);
+QUESTDB_CLIENT_API
+bool questdb_oidc_builder_interactive(
+    questdb_oidc_builder* builder,
+    bool enabled,
+    questdb_error** err_out);
+QUESTDB_CLIENT_API
+bool questdb_oidc_builder_default_interval_seconds(
+    questdb_oidc_builder* builder,
+    uint64_t seconds,
+    questdb_error** err_out);
+QUESTDB_CLIENT_API
+bool questdb_oidc_builder_timeout_ms(
+    questdb_oidc_builder* builder,
+    uint64_t timeout_ms,
+    questdb_error** err_out);
+QUESTDB_CLIENT_API
+bool questdb_oidc_builder_ca_bundle(
+    questdb_oidc_builder* builder,
+    const char* path,
+    size_t path_len,
+    questdb_error** err_out);
+
+/**
+ * Explicitly enable plaintext file persistence in `directory`.
+ *
+ * The store writes access, ID, and long-lived refresh tokens as unencrypted
+ * JSON. On Unix, the library creates token files with mode `0600` and store
+ * directories with mode `0700`; on other platforms protection depends on the
+ * directory's default ACL. The caller must ensure that the directory is
+ * accessible only to the intended account and accept the at-rest exposure.
+ * Without this call, credentials remain in memory only.
+ */
+QUESTDB_CLIENT_API
+bool questdb_oidc_builder_file_token_store(
+    questdb_oidc_builder* builder,
+    const char* directory,
+    size_t directory_len,
+    questdb_error** err_out);
+
+/**
+ * Explicitly enable plaintext file persistence at
+ * `$QUESTDB_CLIENT_OIDC_TOKEN_STORE_DIR`, or `${HOME}/.questdb/oidc-tokens/`
+ * when the environment variable is unset.
+ *
+ * The store writes access, ID, and long-lived refresh tokens as unencrypted
+ * JSON. On Unix, the library creates token files with mode `0600` and store
+ * directories with mode `0700`; on other platforms protection depends on the
+ * directory's default ACL. Use this only when that at-rest security tradeoff is
+ * acceptable. Without this call, credentials remain in memory only.
+ */
+QUESTDB_CLIENT_API
+bool questdb_oidc_builder_default_file_token_store(
+    questdb_oidc_builder* builder,
+    questdb_error** err_out);
+
+/**
+ * Install a renderer callback. On success ownership of `user_data` transfers
+ * to the builder and `release` runs exactly once after the builder and all
+ * auth handles and attached transports built from it have released their last
+ * reference. Final release has no thread-affinity guarantee.
+ */
+QUESTDB_CLIENT_API
+bool questdb_oidc_builder_event_handler(
+    questdb_oidc_builder* builder,
+    questdb_oidc_event_cb callback,
+    void* user_data,
+    questdb_oidc_user_data_release_cb release,
+    questdb_error** err_out);
+
+/** The builder is reusable; each call creates an independent auth state. */
+QUESTDB_CLIENT_API
+questdb_oidc_auth* questdb_oidc_builder_build(
+    const questdb_oidc_builder* builder,
+    questdb_error** err_out);
+
+QUESTDB_CLIENT_API
+questdb_oidc_auth* questdb_oidc_auth_clone(
+    const questdb_oidc_auth* auth,
+    questdb_error** err_out);
+QUESTDB_CLIENT_API
+void questdb_oidc_auth_free(questdb_oidc_auth* auth);
+
+/**
+ * Run the interactive device flow when no cached or silently refreshable token
+ * is available. This is the only auth operation that may display a prompt and
+ * wait for user authorization; call it on a suitable UI thread before starting
+ * attached transports.
+ */
+QUESTDB_CLIENT_API
+bool questdb_oidc_auth_sign_in(
+    const questdb_oidc_auth* auth,
+    questdb_error** err_out);
+
+/**
+ * Return an owned copy of a cached, persisted, or silently refreshed token.
+ * Never starts an interactive device flow. Returns an OIDC
+ * QUESTDB_OIDC_ERROR_INTERACTION_REQUIRED error when explicit sign-in is needed,
+ * including when another sign-in is in progress and no valid token is cached.
+ */
+QUESTDB_CLIENT_API
+questdb_oidc_token* questdb_oidc_auth_token(
+    const questdb_oidc_auth* auth,
+    questdb_error** err_out);
+
+/**
+ * Clear the in-memory credential and delete its persisted local entry, if any.
+ * The in-memory credential is always cleared. Returns false with an OIDC error
+ * when persisted deletion fails, because the credential may remain usable by a
+ * new auth object or after process restart. This does not revoke any token at
+ * the identity provider.
+ */
+QUESTDB_CLIENT_API
+bool questdb_oidc_auth_clear(
+    const questdb_oidc_auth* auth,
+    questdb_error** err_out);
+
+/** Token bytes borrow from `token`; they are not NUL-terminated. */
+QUESTDB_CLIENT_API
+const char* questdb_oidc_token_data(const questdb_oidc_token* token);
+QUESTDB_CLIENT_API
+size_t questdb_oidc_token_len(const questdb_oidc_token* token);
+/** Frees and zeroizes the owned token allocation. */
+QUESTDB_CLIENT_API
+void questdb_oidc_token_free(questdb_oidc_token* token);
+
+/**
+ * Resolved configuration view. Strings borrow from the auth handle.
+ * Zero-initialize the struct and set `struct_size = sizeof(view)` before
+ * calling `questdb_oidc_auth_get_config`. On success `struct_size` is replaced
+ * with the prefix written by the library; fields beyond that prefix remain at
+ * their zero defaults when using an older library.
+ */
+typedef struct questdb_oidc_config_view
+{
+    size_t struct_size;
+    bool groups_in_token;
+    const char* client_id;
+    size_t client_id_len;
+    const char* token_endpoint;
+    size_t token_endpoint_len;
+    const char* device_authorization_endpoint;
+    size_t device_authorization_endpoint_len;
+    const char* scope;
+    size_t scope_len;
+    const char* audience;
+    size_t audience_len;
+    const char* issuer;
+    size_t issuer_len;
+} questdb_oidc_config_view;
+
+QUESTDB_CLIENT_API
+bool questdb_oidc_auth_get_config(
+    const questdb_oidc_auth* auth,
+    questdb_oidc_config_view* out);
+
+typedef enum questdb_oidc_error_kind
+{
+    QUESTDB_OIDC_ERROR_CONFIG = 0,
+    QUESTDB_OIDC_ERROR_NETWORK = 1,
+    QUESTDB_OIDC_ERROR_DEVICE_FLOW = 2,
+    QUESTDB_OIDC_ERROR_TIMEOUT = 3,
+    QUESTDB_OIDC_ERROR_INTERACTION_REQUIRED = 4,
+    QUESTDB_OIDC_ERROR_UNKNOWN = 255,
+} questdb_oidc_error_kind;
+
+/**
+ * Structured OIDC details borrowed from a live `questdb_error`. Zero-initialize
+ * the struct and set `struct_size = sizeof(view)` before calling
+ * `questdb_error_oidc_get_view`. On success `struct_size` is replaced with the
+ * prefix written by the library.
+ */
+typedef struct questdb_oidc_error_view
+{
+    size_t struct_size;
+    questdb_oidc_error_kind kind;
+    const char* idp_error;
+    size_t idp_error_len;
+    const char* idp_error_description;
+    size_t idp_error_description_len;
+    bool has_status;
+    uint16_t status;
+    bool has_retry_after;
+    uint64_t retry_after_seconds;
+} questdb_oidc_error_view;
+
+/** Returns false for a non-OIDC error or an undersized output view. */
+QUESTDB_CLIENT_API
+bool questdb_error_oidc_get_view(
+    const questdb_error* error,
+    questdb_oidc_error_view* out);
+
+/**
+ * Attach rotating OIDC Bearer authentication to HTTP(S) or QWP/WS opts.
+ * Token lookup may use persistence or silent refresh but never starts an
+ * interactive device flow from flush/connect/reconnect. Call
+ * questdb_oidc_auth_sign_in before starting the sender; if another explicit
+ * sign-in later becomes necessary, the transport reports
+ * QUESTDB_OIDC_ERROR_INTERACTION_REQUIRED.
+ */
+QUESTDB_CLIENT_API
+bool line_sender_opts_oidc_auth(
+    line_sender_opts* opts,
+    const questdb_oidc_auth* auth,
+    questdb_error** err_out);
+
+#ifdef __cplusplus
+}
+#endif

@@ -214,6 +214,17 @@ bigdecimal = ["dep:bigdecimal"]
 ## `UnsupportedServer` error.
 sync-reader-qwp-ws = ["_egress", "_keystore-roots"]
 
+## Interactive OIDC sign-in via the OAuth 2.0 Device Authorization
+## Grant (RFC 8628). Provides the `oidc::OidcDeviceAuth` helper, which
+## acquires and silently refreshes a Bearer token to present to QuestDB
+## Enterprise. Pulls in `sync-sender-http`: the token is designed to be
+## wired into an ILP/HTTP sender via `http_token_provider`, and the
+## `ingress` module needs at least one sender to compile. Like the HTTP
+## sender, it needs a TLS root source (`tls-webpki-certs` or
+## `tls-native-certs`) and a crypto provider (`ring-crypto` or
+## `aws-lc-crypto`) — both are in the default set.
+oidc = ["_oidc", "sync-sender-http"]
+
 ## Decompression for `FLAG_ZSTD` `RESULT_BATCH` payloads.
 sync-reader-zstd = ["_egress", "dep:zstd"]
 
@@ -265,6 +276,7 @@ _sender-qwp-ws = []
 _sync-sender = []
 _egress = ["dep:bytes"]
 _keystore-roots = ["dep:jks", "dep:p12-keystore"]
+_oidc = []
 # Shared Arrow / Polars dependency bundles, enabled by both directional
 # features. Don't use directly.
 _arrow = ["dep:arrow", "dep:aligned-vec", "dep:bytes"]
@@ -283,6 +295,7 @@ almost-all-features = [
     "sync-sender-qwp-udp",
     "sync-reader-qwp-ws",
     "sync-reader-zstd",
+    "oidc",
     "tls-webpki-certs",
     "tls-native-certs",
     "ring-crypto",
@@ -351,6 +364,10 @@ required-features = ["sync-sender-qwp-ws", "arrow-ingress"]
 [[example]]
 name = "qwp_ws_l1_quotes"
 required-features = ["sync-sender-qwp-ws"]
+
+[[example]]
+name = "oidc_device_auth"
+required-features = ["oidc", "sync-sender-http"]
 
 # One Arc-shared QuestDb pool behind an ingestion thread that publishes
 # column-major Chunk batches and a query thread that polls the same table.

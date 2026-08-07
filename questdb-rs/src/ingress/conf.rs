@@ -315,6 +315,11 @@ pub(crate) struct QwpWsConfig {
     pub(crate) max_background_drainers: ConfigSetting<usize>,
     pub(crate) error_inbox_capacity: ConfigSetting<usize>,
     pub(crate) progress: ConfigSetting<QwpWsProgress>,
+    /// A rotating Bearer-token source pulled at each (re)connect (e.g. from
+    /// `oidc::OidcDeviceAuth`), overriding any static basic/token auth. Set via
+    /// [`SenderBuilder::qwp_ws_token_provider`](crate::ingress::SenderBuilder::qwp_ws_token_provider);
+    /// programmatic-only (never from a conf string).
+    pub(crate) token_provider: Option<crate::token_provider::TokenProvider>,
     pub(crate) max_frame_rejections: ConfigSetting<usize>,
     pub(crate) poison_min_escalation_window: ConfigSetting<std::time::Duration>,
     /// Optional connection lifecycle event source. Standalone senders set it
@@ -368,6 +373,7 @@ impl Default for QwpWsConfig {
             ),
             error_inbox_capacity: ConfigSetting::new_default(QWP_WS_DEFAULT_ERROR_INBOX_CAPACITY),
             progress: ConfigSetting::new_default(QwpWsProgress::Background),
+            token_provider: None,
             max_frame_rejections: ConfigSetting::new_default(QWP_WS_DEFAULT_MAX_FRAME_REJECTIONS),
             poison_min_escalation_window: ConfigSetting::new_default(
                 QWP_WS_DEFAULT_POISON_MIN_ESCALATION_WINDOW,
@@ -466,6 +472,25 @@ impl TokenAuthParams {
             ));
         }
         Ok(format!("Bearer {}", self.token))
+    }
+}
+
+/// A caller-supplied source of a fresh HTTP Bearer token, pulled on each
+/// request. Enables a long-lived sender to keep working as the token rotates
+/// (e.g. from [`oidc::OidcDeviceAuth`](crate::oidc::OidcDeviceAuth)). Mirrors the
+/// callback newtype used for QWP/WebSocket error handling.
+#[cfg(feature = "_sender-http")]
+pub(crate) type HttpTokenProviderFn =
+    std::sync::Arc<dyn Fn() -> crate::Result<String> + Send + Sync>;
+
+#[cfg(feature = "_sender-http")]
+#[derive(Clone)]
+pub(crate) struct HttpTokenProvider(pub(crate) HttpTokenProviderFn);
+
+#[cfg(feature = "_sender-http")]
+impl std::fmt::Debug for HttpTokenProvider {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("HttpTokenProvider { .. }")
     }
 }
 
