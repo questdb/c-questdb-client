@@ -61,7 +61,10 @@ extern "C" {
  *  owning handle remains open. `questdb_db_close` is the final owner release:
  *  do not call it concurrently with other operations on the same `db`. */
 typedef struct questdb_db questdb_db;
+#ifndef QUESTDB_OIDC_AUTH_DEFINED
+#    define QUESTDB_OIDC_AUTH_DEFINED
 typedef struct questdb_oidc_auth questdb_oidc_auth;
+#endif
 
 /** Extensible options for `questdb_db_connect_ex`. Initialize with
  *  `questdb_db_connect_options_init(&options, sizeof options)`, then override

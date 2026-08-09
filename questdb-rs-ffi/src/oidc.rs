@@ -416,6 +416,8 @@ fn empty_event(kind: questdb_oidc_event_kind) -> questdb_oidc_event {
     }
 }
 
+/// Return a borrowed pointer-plus-length span. Non-NULL data is not
+/// NUL-terminated and callers must use the returned length.
 fn str_or_null(value: Option<&str>) -> (*const c_char, size_t) {
     value.map_or((ptr::null(), 0), |value| {
         (value.as_ptr() as *const c_char, value.len())
@@ -869,7 +871,7 @@ pub unsafe extern "C" fn questdb_oidc_token_data(
     token: *const questdb_oidc_token,
 ) -> *const c_char {
     if token.is_null() {
-        return c"".as_ptr();
+        return ptr::null();
     }
     unsafe { (*token).value.as_ptr() as *const c_char }
 }
@@ -1187,6 +1189,13 @@ mod tests {
             );
         }
         builder
+    }
+
+    #[test]
+    fn null_token_is_an_empty_null_span() {
+        let token = ptr::null();
+        assert!(unsafe { questdb_oidc_token_data(token) }.is_null());
+        assert_eq!(unsafe { questdb_oidc_token_len(token) }, 0);
     }
 
     unsafe extern "C" fn ignore_event(_user_data: *mut c_void, _event: *const questdb_oidc_event) {}

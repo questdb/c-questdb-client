@@ -13,19 +13,22 @@
 
 #pragma once
 
-#ifdef __cplusplus
-extern "C" {
-#endif
-
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
+
+#ifdef __cplusplus
+extern "C" {
+#endif
 
 #include <questdb/ingress/line_sender.h>
 
 /** Reusable device-flow builder, shared authentication state, and owned token. */
 typedef struct questdb_oidc_builder questdb_oidc_builder;
+#ifndef QUESTDB_OIDC_AUTH_DEFINED
+#    define QUESTDB_OIDC_AUTH_DEFINED
 typedef struct questdb_oidc_auth questdb_oidc_auth;
+#endif
 typedef struct questdb_oidc_token questdb_oidc_token;
 
 typedef enum questdb_oidc_event_kind
@@ -38,6 +41,8 @@ typedef enum questdb_oidc_event_kind
 
 /**
  * Borrowed renderer event. Its strings are valid only during the callback.
+ * Each string is a pointer-plus-length byte span and is not NUL-terminated;
+ * always use the corresponding `_len` field.
  *
  * All textual fields are display-safe, inert, single-line text: terminal
  * controls, bidi/zero-width characters, and other invisible formatting are
@@ -247,7 +252,9 @@ bool questdb_oidc_auth_clear(
     const questdb_oidc_auth* auth,
     questdb_error** err_out);
 
-/** Token bytes borrow from `token`; they are not NUL-terminated. */
+/** Token bytes borrow from `token`; they are not NUL-terminated and must be
+ *  read using `questdb_oidc_token_len`. A NULL token returns NULL data and a
+ *  zero length. */
 QUESTDB_CLIENT_API
 const char* questdb_oidc_token_data(const questdb_oidc_token* token);
 QUESTDB_CLIENT_API
@@ -258,6 +265,8 @@ void questdb_oidc_token_free(questdb_oidc_token* token);
 
 /**
  * Resolved configuration view. Strings borrow from the auth handle.
+ * Each string is a pointer-plus-length byte span and is not NUL-terminated;
+ * always use the corresponding `_len` field.
  * Zero-initialize the struct and set `struct_size = sizeof(view)` before
  * calling `questdb_oidc_auth_get_config`. On success `struct_size` is replaced
  * with the prefix written by the library; fields beyond that prefix remain at

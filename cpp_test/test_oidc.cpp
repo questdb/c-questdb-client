@@ -110,9 +110,17 @@ TEST_CASE("OIDC C++ wrappers preserve ownership and structured errors")
     CHECK(config.client_id == std::string_view{"questdb-cpp"});
     CHECK(config.scope == std::string_view{"openid profile"});
 
+    auto moved_auth = std::move(auth);
+    CHECK_THROWS_AS(questdb::oidc::device_auth{auth}, questdb::oidc::error);
+    CHECK_THROWS_AS(auth.sign_in(), questdb::oidc::error);
+    CHECK_THROWS_AS(auth.access_token(), questdb::oidc::error);
+    CHECK_THROWS_AS(auth.clear(), questdb::oidc::error);
+    CHECK_THROWS_AS(auth.config(), questdb::oidc::error);
+    CHECK_THROWS_AS(copied_auth = auth, questdb::oidc::error);
+
     auto sender_options =
         questdb::ingress::opts::from_conf("https::addr=127.0.0.1:1;");
-    sender_options.oidc_auth(auth);
+    sender_options.oidc_auth(moved_auth);
 
     // A failure raised by an auth state attached to a normal sender must pass
     // through line_sender_error's conversion without being sliced to the

@@ -645,6 +645,7 @@ fn run_qwp_ws_worker_guarded<Q, F>(
         SocketError,
         "QWP/WebSocket background worker panicked and stopped"
     )));
+    shared.clear_poison();
     drop(store);
     backpressure.notify_all();
     log::error!("QWP/WebSocket background worker panicked; publication was terminalized");
@@ -5643,6 +5644,12 @@ mod tests {
         });
 
         assert!(runner.lifecycle_is_terminal());
+        let terminal_error = runner.published_fsn().unwrap_err();
+        assert!(
+            terminal_error.msg().contains("background worker panicked"),
+            "got: {}",
+            terminal_error.msg()
+        );
         drop(runner);
     }
 

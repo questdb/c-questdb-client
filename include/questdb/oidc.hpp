@@ -174,7 +174,7 @@ class device_auth
 {
 public:
     device_auth(const device_auth& other)
-        : _raw{detail::wrapped_call(::questdb_oidc_auth_clone, other._raw)}
+        : _raw{detail::wrapped_call(::questdb_oidc_auth_clone, other.raw())}
     {
     }
     device_auth& operator=(const device_auth& other)
@@ -182,7 +182,7 @@ public:
         if (this != &other)
         {
             auto* replacement =
-                detail::wrapped_call(::questdb_oidc_auth_clone, other._raw);
+                detail::wrapped_call(::questdb_oidc_auth_clone, other.raw());
             ::questdb_oidc_auth_free(_raw);
             _raw = replacement;
         }
@@ -210,7 +210,7 @@ public:
      */
     void sign_in() const
     {
-        detail::wrapped_call(::questdb_oidc_auth_sign_in, _raw);
+        detail::wrapped_call(::questdb_oidc_auth_sign_in, raw());
     }
     /**
      * Return a cached, persisted, or silently refreshed token. Never prompts;
@@ -218,7 +218,7 @@ public:
      */
     token access_token() const
     {
-        return token{detail::wrapped_call(::questdb_oidc_auth_token, _raw)};
+        return token{detail::wrapped_call(::questdb_oidc_auth_token, raw())};
     }
 
     /**
@@ -228,14 +228,14 @@ public:
      */
     void clear() const
     {
-        detail::wrapped_call(::questdb_oidc_auth_clear, _raw);
+        detail::wrapped_call(::questdb_oidc_auth_clear, raw());
     }
 
-    config_view config() const & noexcept
+    config_view config() const&
     {
         ::questdb_oidc_config_view raw{};
         raw.struct_size = sizeof raw;
-        ::questdb_oidc_auth_get_config(_raw, &raw);
+        ::questdb_oidc_auth_get_config(this->raw(), &raw);
         return {
             view(raw.client_id, raw.client_id_len),
             view(raw.token_endpoint, raw.token_endpoint_len),
@@ -255,6 +255,21 @@ public:
 
 private:
     explicit device_auth(::questdb_oidc_auth* raw) noexcept : _raw{raw} {}
+    const ::questdb_oidc_auth* raw() const
+    {
+        if (!_raw)
+        {
+            throw error{
+                ::questdb::error_code::invalid_api_call,
+                "Cannot use an empty or moved-from OIDC device_auth.",
+                error_kind::unknown,
+                {},
+                {},
+                std::nullopt,
+                std::nullopt};
+        }
+        return _raw;
+    }
     static std::string_view view(const char* data, size_t size) noexcept
     {
         return data ? std::string_view{data, size} : std::string_view{};

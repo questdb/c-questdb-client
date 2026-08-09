@@ -258,16 +258,17 @@ inline bool error::has_oidc_detail(const ::questdb_error* c_err) noexcept
     size_t message_len{0};
     const char* message{::questdb_error_msg(owned_err.get(), &message_len)};
 
+    const auto copy = [](const char* data, size_t size) {
+        return data ? std::string{data, size} : std::string{};
+    };
+
     ::questdb_oidc_error_view view{};
     view.struct_size = sizeof view;
     if (!::questdb_error_oidc_get_view(owned_err.get(), &view))
     {
-        throw error{code, std::string{message, message_len}};
+        throw error{code, copy(message, message_len)};
     }
 
-    const auto copy = [](const char* data, size_t size) {
-        return data ? std::string{data, size} : std::string{};
-    };
     throw ::questdb::oidc::error{
         code,
         copy(message, message_len),
