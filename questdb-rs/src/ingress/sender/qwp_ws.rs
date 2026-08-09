@@ -108,14 +108,17 @@ pub(crate) struct TrafficGate {
 #[derive(Default)]
 struct TrafficGateState {
     current: Option<TcpStream>,
-    /// Raw handle of the ORIGINAL socket, not the `current` dup. Winsock
-    /// `shutdown()` does not unblock a `recv()` already in progress on
-    /// another thread, so `shutdown()` first runs `CancelIoEx` — and that
-    /// must target the handle the blocked thread issued its I/O on; a
-    /// `try_clone` (WSADuplicateSocket) handle is not guaranteed to share
-    /// the file object. Only valid while `current` is `Some`: every close
-    /// of the original is mutex-ordered behind `clear()`/re-register, so
-    /// the handle cannot be recycled while the gate still holds it.
+    /// True only while the runner is performing TLS/WebSocket setup. During
+    /// this phase it cannot be doing store-and-forward file I/O, so Windows
+    /// may safely cancel any synchronous operation on the runner thread.
+    setup_in_progress: bool,
+    /// Raw handle of the ORIGINAL socket, not the `current` dup. On Windows,
+    /// `shutdown()` alone is not sufficient to interrupt every pending I/O
+    /// operation, so `shutdown()` also runs `CancelIoEx` on the handle that
+    /// issued it. A `try_clone` (WSADuplicateSocket) handle is not guaranteed
+    /// to share the file object. Only valid while `current` is `Some`: every
+    /// close of the original is mutex-ordered behind `clear()`/re-register,
+    /// so the handle cannot be recycled while the gate still holds it.
     #[cfg(windows)]
     original: Option<std::os::windows::io::RawSocket>,
     shut: bool,
@@ -176,6 +179,7 @@ impl TrafficGate {
             ));
         }
         state.current = Some(shutdown_handle);
+        state.setup_in_progress = true;
         #[cfg(windows)]
         {
             use std::os::windows::io::AsRawSocket;
@@ -200,6 +204,7 @@ impl TrafficGate {
     pub(super) fn clear(&self) {
         let mut state = self.state.lock().unwrap_or_else(|err| err.into_inner());
         state.current = None;
+        state.setup_in_progress = false;
         #[cfg(windows)]
         {
             state.original = None;
@@ -214,12 +219,17 @@ impl TrafficGate {
     }
 
     pub(super) fn shutdown(&self) -> std::io::Result<()> {
+        self.shutdown_with_setup_state().1
+    }
+
+    fn shutdown_with_setup_state(&self) -> (bool, std::io::Result<()>) {
         // The syscalls run under the gate mutex on purpose: every close of
         // the original socket is mutex-ordered behind `clear()`, so while
         // `current` is `Some` the original handle is still open and
         // `CancelIoEx` cannot hit a recycled handle. Cold path only.
         let mut state = self.state.lock().unwrap_or_else(|err| err.into_inner());
         state.shut = true;
+        let setup_in_progress = std::mem::take(&mut state.setup_in_progress);
         #[cfg(windows)]
         if let Some(original) = state.original.take() {
             // Winsock shutdown() does not unblock an in-progress recv() on
@@ -232,15 +242,21 @@ impl TrafficGate {
                 windows_sys::Win32::System::IO::CancelIoEx(original as HANDLE, std::ptr::null());
             }
         }
-        if let Some(stream) = state.current.take() {
-            shutdown_socket(&stream)?;
-        }
-        Ok(())
+        let result = state
+            .current
+            .take()
+            .map_or(Ok(()), |stream| shutdown_socket(&stream));
+        (setup_in_progress, result)
     }
 }
 
 impl TrafficRegistration<'_> {
     fn keep(mut self) {
+        self.gate
+            .state
+            .lock()
+            .unwrap_or_else(|err| err.into_inner())
+            .setup_in_progress = false;
         self.armed = false;
     }
 }
@@ -272,6 +288,32 @@ fn shutdown_socket(stream: &TcpStream) -> std::io::Result<()> {
         Ok(()) => Ok(()),
         Err(err) if err.kind() == ErrorKind::NotConnected => Ok(()),
         Err(err) => Err(err),
+    }
+}
+
+/// Cancel a blocking synchronous socket operation owned by the runner.
+///
+/// `CancelIoEx` covers pending overlapped I/O on the socket handle, while the
+/// standard library's blocking `recv`/`send` calls require cancellation by
+/// thread handle. `ERROR_NOT_FOUND` is the expected race when the runner is
+/// between operations or has already exited.
+#[cfg(windows)]
+fn cancel_synchronous_worker_io(thread: &thread::JoinHandle<()>) -> std::io::Result<()> {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Foundation::{ERROR_NOT_FOUND, HANDLE};
+
+    let result = unsafe {
+        windows_sys::Win32::System::IO::CancelSynchronousIo(thread.as_raw_handle() as HANDLE)
+    };
+    if result != 0 {
+        return Ok(());
+    }
+
+    let error = std::io::Error::last_os_error();
+    if error.raw_os_error() == Some(ERROR_NOT_FOUND as i32) {
+        Ok(())
+    } else {
+        Err(error)
     }
 }
 
@@ -1967,10 +2009,21 @@ fn sleep_before_runner_reconnect(
 impl<Q> Drop for SyncQwpWsRunner<Q> {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::Release);
-        if let Err(err) = self.traffic_gate.shutdown() {
+        let thread = self.thread.take();
+        let (setup_in_progress, shutdown_result) = self.traffic_gate.shutdown_with_setup_state();
+        #[cfg(not(windows))]
+        let _ = setup_in_progress;
+        if let Err(err) = shutdown_result {
             log::warn!("could not shut down QWP/WebSocket runner traffic: {err}");
         }
-        if let Some(thread) = self.thread.take() {
+        #[cfg(windows)]
+        if setup_in_progress
+            && let Some(thread) = thread.as_ref()
+            && let Err(err) = cancel_synchronous_worker_io(thread)
+        {
+            log::warn!("could not cancel QWP/WebSocket runner I/O: {err}");
+        }
+        if let Some(thread) = thread {
             if wait_for_runner_exit(&thread, self.shutdown_timeout) {
                 if thread.join().is_err() {
                     log::error!("QWP/WebSocket runner thread panicked during shutdown");

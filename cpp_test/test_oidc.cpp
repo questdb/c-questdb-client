@@ -1,51 +1,61 @@
+#define DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN
+#include "doctest.h"
+
 #include <questdb/client.hpp>
 #include <questdb/egress/qwp_reader.hpp>
 #include <questdb/ingress/line_sender.hpp>
 
-#include <cassert>
 #include <cstdint>
 #include <string_view>
 #include <type_traits>
+#include <utility>
 
-using oidc_token_view_member =
-    std::string_view (questdb::oidc::token::*)() const & noexcept;
-using oidc_config_member =
-    questdb::oidc::config_view (questdb::oidc::device_auth::*)() const & noexcept;
-using oidc_c_ptr_member =
-    const questdb_oidc_auth* (questdb::oidc::device_auth::*)() const & noexcept;
+template <typename T, typename = void>
+struct has_oidc_token_view : std::false_type
+{
+};
 
-[[maybe_unused]] constexpr auto oidc_token_view =
-    static_cast<oidc_token_view_member>(&questdb::oidc::token::view);
-[[maybe_unused]] constexpr auto oidc_config =
-    static_cast<oidc_config_member>(&questdb::oidc::device_auth::config);
-[[maybe_unused]] constexpr auto oidc_c_ptr =
-    static_cast<oidc_c_ptr_member>(&questdb::oidc::device_auth::c_ptr);
+template <typename T>
+struct has_oidc_token_view<T, std::void_t<decltype(std::declval<T>().view())>>
+    : std::true_type
+{
+};
 
-static_assert(std::is_invocable_v<
-              decltype(oidc_token_view),
-              const questdb::oidc::token&>);
-static_assert(!std::is_invocable_v<
-              decltype(oidc_token_view),
-              questdb::oidc::token&&>);
-static_assert(std::is_invocable_v<
-              decltype(oidc_config),
-              const questdb::oidc::device_auth&>);
-static_assert(!std::is_invocable_v<
-              decltype(oidc_config),
-              questdb::oidc::device_auth&&>);
-static_assert(std::is_invocable_v<
-              decltype(oidc_c_ptr),
-              const questdb::oidc::device_auth&>);
-static_assert(!std::is_invocable_v<
-              decltype(oidc_c_ptr),
-              questdb::oidc::device_auth&&>);
+template <typename T, typename = void>
+struct has_oidc_config : std::false_type
+{
+};
+
+template <typename T>
+struct has_oidc_config<T, std::void_t<decltype(std::declval<T>().config())>>
+    : std::true_type
+{
+};
+
+template <typename T, typename = void>
+struct has_oidc_c_ptr : std::false_type
+{
+};
+
+template <typename T>
+struct has_oidc_c_ptr<T, std::void_t<decltype(std::declval<T>().c_ptr())>>
+    : std::true_type
+{
+};
+
+static_assert(has_oidc_token_view<const questdb::oidc::token&>::value);
+static_assert(!has_oidc_token_view<questdb::oidc::token&&>::value);
+static_assert(has_oidc_config<const questdb::oidc::device_auth&>::value);
+static_assert(!has_oidc_config<questdb::oidc::device_auth&&>::value);
+static_assert(has_oidc_c_ptr<const questdb::oidc::device_auth&>::value);
+static_assert(!has_oidc_c_ptr<questdb::oidc::device_auth&&>::value);
 
 static_assert(!std::is_copy_constructible_v<questdb::oidc::event_view>);
 static_assert(!std::is_copy_assignable_v<questdb::oidc::event_view>);
 static_assert(!std::is_move_constructible_v<questdb::oidc::event_view>);
 static_assert(!std::is_move_assignable_v<questdb::oidc::event_view>);
 
-int main()
+TEST_CASE("OIDC C++ wrappers preserve ownership and structured errors")
 {
     bool empty_handler_rejected = false;
     try
@@ -55,9 +65,9 @@ int main()
     catch (const questdb::error& error)
     {
         empty_handler_rejected = true;
-        assert(error.code() == questdb::error_code::invalid_api_call);
+        CHECK(error.code() == questdb::error_code::invalid_api_call);
     }
-    assert(empty_handler_rejected);
+    CHECK(empty_handler_rejected);
 
     bool saw_structured_error = false;
     try
@@ -67,10 +77,10 @@ int main()
     catch (const questdb::oidc::error& error)
     {
         saw_structured_error = true;
-        assert(error.kind() == questdb::oidc::error_kind::config);
-        assert(error.code() == questdb::error_code::config_error);
+        CHECK(error.kind() == questdb::oidc::error_kind::config);
+        CHECK(error.code() == questdb::error_code::config_error);
     }
-    assert(saw_structured_error);
+    CHECK(saw_structured_error);
 
     // The client-wide wrapper must also retain the dynamic OIDC type. Reader
     // and pool operations use this path rather than the OIDC builder helper.
@@ -84,10 +94,10 @@ int main()
     catch (const questdb::oidc::error& error)
     {
         generic_wrapper_saw_structured_error = true;
-        assert(error.kind() == questdb::oidc::error_kind::config);
+        CHECK(error.kind() == questdb::oidc::error_kind::config);
     }
     ::questdb_oidc_builder_free(raw_builder);
-    assert(generic_wrapper_saw_structured_error);
+    CHECK(generic_wrapper_saw_structured_error);
 
     auto builder = questdb::oidc::builder{};
     builder.client_id("questdb-cpp")
@@ -97,19 +107,19 @@ int main()
     auto auth = builder.build();
     auto copied_auth = auth;
     const auto config = copied_auth.config();
-    assert(config.client_id == std::string_view{"questdb-cpp"});
-    assert(config.scope == std::string_view{"openid profile"});
+    CHECK(config.client_id == std::string_view{"questdb-cpp"});
+    CHECK(config.scope == std::string_view{"openid profile"});
 
-    auto sender_options = questdb::ingress::opts::from_conf(
-        "https::addr=127.0.0.1:1;");
+    auto sender_options =
+        questdb::ingress::opts::from_conf("https::addr=127.0.0.1:1;");
     sender_options.oidc_auth(auth);
 
     // A failure raised by an auth state attached to a normal sender must pass
     // through line_sender_error's conversion without being sliced to the
     // generic sender exception.
     // Even an auth configured to permit interactive sign-in must never start a
-    // prompt from a sender operation. The unreachable loopback IdP would yield a
-    // network error if flush accidentally attempted the device flow.
+    // prompt from a sender operation. The unreachable loopback IdP would yield
+    // a network error if flush accidentally attempted the device flow.
     auto attached_builder = questdb::oidc::builder{};
     attached_builder.client_id("questdb-cpp")
         .scope("openid")
@@ -117,8 +127,8 @@ int main()
         .device_authorization_endpoint("http://127.0.0.1:1/device")
         .interactive(true);
     auto attached_auth = attached_builder.build();
-    auto attached_options = questdb::ingress::opts::from_conf(
-        "http::addr=127.0.0.1:1;");
+    auto attached_options =
+        questdb::ingress::opts::from_conf("http::addr=127.0.0.1:1;");
     attached_options.protocol_version(questdb::ingress::protocol_version::v1)
         .oidc_auth(attached_auth);
     questdb::ingress::line_sender attached_sender{attached_options};
@@ -133,15 +143,11 @@ int main()
     catch (const questdb::oidc::error& error)
     {
         attached_sender_saw_structured_error = true;
-        assert(
-            error.kind() ==
-            questdb::oidc::error_kind::interaction_required);
+        CHECK(error.kind() == questdb::oidc::error_kind::interaction_required);
     }
-    assert(attached_sender_saw_structured_error);
+    CHECK(attached_sender_saw_structured_error);
 
     // Lazy construction performs no network I/O, but exercises ownership and
     // the shared sender/reader provider configuration in the pool FFI.
-    questdb::pool pool{
-        "ws::addr=127.0.0.1:1;lazy_connect=true;", copied_auth};
-    return 0;
+    questdb::pool pool{"ws::addr=127.0.0.1:1;lazy_connect=true;", copied_auth};
 }
