@@ -4452,6 +4452,27 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "_oidc")]
+    #[test]
+    fn retry_budget_exhaustion_preserves_oidc_detail() {
+        let original = crate::Error::from(crate::oidc::OidcError::interaction_required("sign in"))
+            .reclassified(crate::ErrorCode::SocketError, "token provider failed");
+
+        let err = retry_budget_exhausted_error(
+            "QWP/WebSocket initial connect",
+            3,
+            Instant::now(),
+            Some(original),
+        );
+
+        assert_eq!(err.code(), crate::ErrorCode::SocketError);
+        assert!(err.msg().contains("retry budget exhausted"));
+        assert_eq!(
+            err.oidc_error().map(crate::oidc::OidcError::kind),
+            Some(crate::oidc::OidcErrorKind::InteractionRequired)
+        );
+    }
+
     #[cfg(any(unix, windows))]
     fn periodic_qwp_ws_config(sf_dir: &std::path::Path, sender_id: &str) -> QwpWsConfig {
         crate::ingress::SenderBuilder::from_conf(format!(

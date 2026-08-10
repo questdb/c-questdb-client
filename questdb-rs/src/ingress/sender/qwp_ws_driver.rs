@@ -2727,32 +2727,20 @@ pub(super) fn retry_budget_exhausted_error(
     last_error: Option<Error>,
 ) -> Error {
     let elapsed_ms = started.elapsed().as_millis();
-    let code = last_error
-        .as_ref()
-        .map_or(ErrorCode::SocketError, |err| err.code());
     let last_error_msg = last_error
         .as_ref()
         .map_or_else(|| "none".to_string(), |err| err.msg().to_string());
-    let qwp_ws_rejection = last_error
-        .as_ref()
-        .and_then(|err| err.qwp_ws_rejection().cloned());
-    let qwp_ws_role_reject = last_error
-        .as_ref()
-        .and_then(|err| err.qwp_ws_role_reject().cloned());
-
-    let mut err = Error::new(
-        code,
-        format!(
-            "{context} retry budget exhausted [attempts={attempts}, elapsed_ms={elapsed_ms}, last_error={last_error_msg}]"
-        ),
+    let msg = format!(
+        "{context} retry budget exhausted [attempts={attempts}, elapsed_ms={elapsed_ms}, last_error={last_error_msg}]"
     );
-    if let Some(rejection) = qwp_ws_rejection {
-        err = err.with_qwp_ws_rejection(rejection);
+
+    match last_error {
+        Some(err) => {
+            let code = err.code();
+            err.reclassified(code, msg)
+        }
+        None => Error::new(ErrorCode::SocketError, msg),
     }
-    if let Some(role_reject) = qwp_ws_role_reject {
-        err = err.with_qwp_ws_role_reject(role_reject);
-    }
-    err
 }
 
 pub(crate) trait PublicationLog {
