@@ -34,6 +34,7 @@ use std::ptr;
 use std::slice;
 use std::str;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use libc::{c_char, c_void, size_t};
@@ -200,7 +201,7 @@ impl SharedOidcAuth {
         if self
             .event_handler
             .as_deref()
-            .is_some_and(CEventHandler::is_active_on_current_thread)
+            .is_some_and(CEventHandler::is_active)
         {
             return Err(Error::new(
                 ErrorCode::InvalidApiCall,
@@ -278,41 +279,33 @@ struct CEventHandler {
     /// One handler is shared by every auth built from a reusable builder.
     /// Serialize those sibling auths before entering caller-owned state.
     callback_gate: std::sync::Mutex<()>,
+    /// Callback reentry can arrive from a different thread, so this state must
+    /// be shared with every auth that uses the handler rather than thread-local.
+    active: AtomicBool,
 }
 
-thread_local! {
-    /// Stack rather than a boolean so a callback may safely use a completely
-    /// independent auth/handler on the same thread.
-    static ACTIVE_EVENT_HANDLERS: std::cell::RefCell<Vec<usize>> = const {
-        std::cell::RefCell::new(Vec::new())
-    };
+struct ActiveEventHandler<'a> {
+    handler: &'a CEventHandler,
 }
 
-struct ActiveEventHandler {
-    id: usize,
-}
-
-impl ActiveEventHandler {
-    fn enter(handler: &CEventHandler) -> Self {
-        let id = handler as *const CEventHandler as usize;
-        ACTIVE_EVENT_HANDLERS.with(|active| active.borrow_mut().push(id));
-        Self { id }
+impl<'a> ActiveEventHandler<'a> {
+    fn enter(handler: &'a CEventHandler) -> Self {
+        let was_active = handler.active.swap(true, Ordering::AcqRel);
+        debug_assert!(!was_active, "callback gate must serialize handler entry");
+        Self { handler }
     }
 }
 
-impl Drop for ActiveEventHandler {
+impl Drop for ActiveEventHandler<'_> {
     fn drop(&mut self) {
-        ACTIVE_EVENT_HANDLERS.with(|active| {
-            let popped = active.borrow_mut().pop();
-            debug_assert_eq!(popped, Some(self.id));
-        });
+        let was_active = self.handler.active.swap(false, Ordering::AcqRel);
+        debug_assert!(was_active, "active callback guard must be balanced");
     }
 }
 
 impl CEventHandler {
-    fn is_active_on_current_thread(&self) -> bool {
-        let id = self as *const CEventHandler as usize;
-        ACTIVE_EVENT_HANDLERS.with(|active| active.borrow().contains(&id))
+    fn is_active(&self) -> bool {
+        self.active.load(Ordering::Acquire)
     }
 }
 
@@ -755,6 +748,7 @@ pub unsafe extern "C" fn questdb_oidc_builder_event_handler(
         user_data: user_data as usize,
         release,
         callback_gate: std::sync::Mutex::new(()),
+        active: AtomicBool::new(false),
     }));
     true
 }
@@ -1343,11 +1337,7 @@ mod tests {
         unsafe { crate::questdb_error_free(error) };
     }
 
-    unsafe extern "C" fn attempt_reentrant_auth_calls(
-        user_data: *mut c_void,
-        _event: *const questdb_oidc_event,
-    ) {
-        let state = unsafe { &*(user_data as *const Arc<ReentrantCallState>) };
+    unsafe fn perform_reentrant_auth_calls(state: &ReentrantCallState) {
         let auth = state.auth.load(Ordering::SeqCst);
 
         let mut error = ptr::null_mut();
@@ -1362,6 +1352,25 @@ mod tests {
         error = ptr::null_mut();
         let cleared = unsafe { questdb_oidc_auth_clear(auth, &mut error) };
         unsafe { record_reentrant_result(state, cleared, error) };
+    }
+
+    unsafe extern "C" fn attempt_reentrant_auth_calls(
+        user_data: *mut c_void,
+        _event: *const questdb_oidc_event,
+    ) {
+        let state = unsafe { &*(user_data as *const Arc<ReentrantCallState>) };
+        unsafe { perform_reentrant_auth_calls(state) };
+    }
+
+    unsafe extern "C" fn attempt_cross_thread_reentrant_auth_calls(
+        user_data: *mut c_void,
+        _event: *const questdb_oidc_event,
+    ) {
+        let state = unsafe { &*(user_data as *const Arc<ReentrantCallState>) };
+        let state = Arc::clone(state);
+        std::thread::spawn(move || unsafe { perform_reentrant_auth_calls(&state) })
+            .join()
+            .unwrap();
     }
 
     unsafe extern "C" fn release_reentrant_state(user_data: *mut c_void) {
@@ -1572,6 +1581,7 @@ mod tests {
             user_data: user_data as usize,
             release: Some(release_serialized_callback),
             callback_gate: std::sync::Mutex::new(()),
+            active: AtomicBool::new(false),
         });
         let start = Arc::new(std::sync::Barrier::new(THREADS + 1));
         let threads: Vec<_> = (0..THREADS)
@@ -1623,6 +1633,39 @@ mod tests {
 
             // Enter through the same renderer used by the auth. All three
             // calls must fail before attempting to acquire the core mutex.
+            CEventRenderer(handler).on_waiting(30.0);
+
+            assert_eq!(state.rejected.load(Ordering::SeqCst), 3);
+            assert_eq!(state.unexpected.load(Ordering::SeqCst), 0);
+            questdb_oidc_auth_free(auth);
+            questdb_oidc_builder_free(builder);
+        }
+    }
+
+    #[test]
+    fn auth_operations_from_another_thread_during_event_callback_are_rejected() {
+        unsafe {
+            let builder = explicit_builder();
+            let mut error = ptr::null_mut();
+            assert!(questdb_oidc_builder_interactive(builder, false, &mut error));
+            let state = Arc::new(ReentrantCallState::default());
+            let user_data = Box::into_raw(Box::new(Arc::clone(&state))) as *mut c_void;
+            assert!(questdb_oidc_builder_event_handler(
+                builder,
+                Some(attempt_cross_thread_reentrant_auth_calls),
+                user_data,
+                Some(release_reentrant_state),
+                &mut error,
+            ));
+            let handler = Arc::clone((*builder).config.renderer.as_ref().unwrap());
+            let auth = questdb_oidc_builder_build(builder, &mut error);
+            assert!(!auth.is_null());
+            assert!(error.is_null());
+            state.auth.store(auth, Ordering::SeqCst);
+
+            // The callback waits for another thread that tries all three auth
+            // operations. They must fail before trying the core mutex held by
+            // a real interactive flow.
             CEventRenderer(handler).on_waiting(30.0);
 
             assert_eq!(state.rejected.load(Ordering::SeqCst), 3);
@@ -1784,6 +1827,7 @@ mod tests {
             user_data: user_data as usize,
             release: Some(release_events),
             callback_gate: std::sync::Mutex::new(()),
+            active: AtomicBool::new(false),
         }));
 
         renderer.on_success(Some("alice\x1b[31m\u{202e}"), 300.0);

@@ -102,6 +102,11 @@ const QUESTDB_DB_CONNECT_OPTIONS_V1_SIZE: usize =
     std::mem::offset_of!(questdb_db_connect_options, rejection_inbox_capacity)
         + std::mem::size_of::<size_t>();
 
+/// Upper bound for caller-selected connection-event and rejection inboxes.
+/// The FFI crate aborts on allocation failure, so capacities from C must be
+/// validated before they reach `VecDeque::with_capacity` in the core client.
+const MAX_DB_CALLBACK_INBOX_CAPACITY: usize = 65_536;
+
 unsafe fn connect_options_field<T: Copy>(
     options: *const questdb_db_connect_options,
     struct_size: usize,
@@ -1058,6 +1063,17 @@ pub unsafe extern "C" fn questdb_db_connect_ex(
             )
         };
 
+        let Some(handlers) = connect_handlers_from_c(
+            event_callback,
+            event_user_data,
+            event_inbox_capacity,
+            rejection_callback,
+            rejection_user_data,
+            rejection_inbox_capacity,
+            err_out,
+        ) else {
+            return std::ptr::null_mut();
+        };
         let auth = if oidc_auth.is_null() {
             None
         } else {
@@ -1066,17 +1082,7 @@ pub unsafe extern "C" fn questdb_db_connect_ex(
                 None => return std::ptr::null_mut(),
             }
         };
-        (
-            connect_handlers_from_c(
-                event_callback,
-                event_user_data,
-                event_inbox_capacity,
-                rejection_callback,
-                rejection_user_data,
-                rejection_inbox_capacity,
-            ),
-            auth,
-        )
+        (handlers, auth)
     };
 
     let result = match auth {
@@ -1578,11 +1584,11 @@ pub(crate) fn connection_listener_from_c(
 /// endpoint, terminal auth rejection) and for transport deaths observed
 /// when a connection is returned.
 ///
-/// Delivery is via a bounded inbox (`inbox_capacity`; `0` = default 64)
-/// drained by a dedicated dispatcher thread: a slow callback cannot
-/// stall connects or publishing, and on overflow the oldest undelivered
-/// event is dropped. Direct and store-and-forward senders share one source
-/// and inbox.
+/// Delivery is via a bounded inbox (`inbox_capacity`; `0` = default 64,
+/// maximum 65,536) drained by a dedicated dispatcher thread: a slow callback
+/// cannot stall connects or publishing, and on overflow the oldest
+/// undelivered event is dropped. Direct and store-and-forward senders share
+/// one source and inbox.
 ///
 /// The handler is registered before the pool opens anything, so it observes
 /// every transition — including the initial `connected` of disk recovery
@@ -1605,6 +1611,9 @@ pub unsafe extern "C" fn questdb_db_connect_with_event_handler(
         Some(s) => s,
         None => return std::ptr::null_mut(),
     };
+    if !validate_callback_inbox_capacity("inbox_capacity", inbox_capacity, err_out) {
+        return std::ptr::null_mut();
+    }
     let listener = connection_listener_from_c(callback, user_data);
     match QuestDb::connect_with_listener(conf, listener, inbox_capacity) {
         Ok(db) => Box::into_raw(Box::new(questdb_db(db))),
@@ -1637,6 +1646,29 @@ pub unsafe extern "C" fn questdb_db_connection_events_delivered(db: *const quest
     db_ref.0.connection_events_delivered()
 }
 
+fn validate_callback_inbox_capacity(
+    field: &str,
+    capacity: size_t,
+    err_out: *mut *mut questdb_error,
+) -> bool {
+    if capacity <= MAX_DB_CALLBACK_INBOX_CAPACITY {
+        return true;
+    }
+    unsafe {
+        set_err_out_from_error(
+            err_out,
+            Error::new(
+                ErrorCode::InvalidApiCall,
+                format!(
+                    "{field} is {capacity}, maximum callback inbox capacity is \
+                     {MAX_DB_CALLBACK_INBOX_CAPACITY}"
+                ),
+            ),
+        )
+    };
+    false
+}
+
 fn connect_handlers_from_c(
     event_callback: Option<questdb_connection_event_cb>,
     event_user_data: *mut c_void,
@@ -1644,7 +1676,23 @@ fn connect_handlers_from_c(
     rejection_callback: line_sender_qwpws_error_cb,
     rejection_user_data: *mut c_void,
     rejection_inbox_capacity: size_t,
-) -> questdb::ConnectHandlers {
+    err_out: *mut *mut questdb_error,
+) -> Option<questdb::ConnectHandlers> {
+    if event_callback.is_some()
+        && !validate_callback_inbox_capacity("event_inbox_capacity", event_inbox_capacity, err_out)
+    {
+        return None;
+    }
+    if rejection_callback.is_some()
+        && !validate_callback_inbox_capacity(
+            "rejection_inbox_capacity",
+            rejection_inbox_capacity,
+            err_out,
+        )
+    {
+        return None;
+    }
+
     let mut handlers = questdb::ConnectHandlers::default();
     if let Some(cb) = event_callback {
         handlers.connection_listener = Some(connection_listener_from_c(cb, event_user_data));
@@ -1660,7 +1708,7 @@ fn connect_handlers_from_c(
         ));
         handlers.error_inbox_capacity = rejection_inbox_capacity;
     }
-    handlers
+    Some(handlers)
 }
 
 /// Like `questdb_db_connect_with_event_handler`, additionally registering a
@@ -1674,7 +1722,7 @@ fn connect_handlers_from_c(
 /// store-and-forward connections records — including rejections for frames
 /// whose sender was already returned to the pool — on a dedicated dispatcher
 /// thread through a bounded inbox (`rejection_inbox_capacity`; `0` = default
-/// 64; overflow drops the oldest event, counted by
+/// 64, maximum 65,536; overflow drops the oldest event, counted by
 /// `questdb_db_rejection_events_dropped`). The caller guarantees each
 /// `user_data` is safe to use from its dispatcher thread until
 /// `questdb_db_close` returns. A terminal rejection enters the handler inbox
@@ -1696,14 +1744,17 @@ pub unsafe extern "C" fn questdb_db_connect_with_handlers(
         Some(s) => s,
         None => return std::ptr::null_mut(),
     };
-    let handlers = connect_handlers_from_c(
+    let Some(handlers) = connect_handlers_from_c(
         event_callback,
         event_user_data,
         event_inbox_capacity,
         rejection_callback,
         rejection_user_data,
         rejection_inbox_capacity,
-    );
+        err_out,
+    ) else {
+        return std::ptr::null_mut();
+    };
     match QuestDb::connect_with_handlers(conf, handlers) {
         Ok(db) => Box::into_raw(Box::new(questdb_db(db))),
         Err(err) => {
@@ -5253,6 +5304,35 @@ mod tests {
         future_tail: [u64; 2],
     }
 
+    unsafe extern "C" fn ignore_connection_event(
+        _user_data: *mut c_void,
+        _event: *const questdb_connection_event,
+    ) {
+    }
+
+    unsafe extern "C" fn ignore_rejection(
+        _user_data: *mut c_void,
+        _error: *const crate::line_sender_qwpws_error_view,
+    ) {
+    }
+
+    unsafe fn assert_capacity_error(error: *mut questdb_error, field: &str) {
+        assert!(!error.is_null());
+        assert_eq!(
+            unsafe { crate::questdb_error_get_code(error) } as u32,
+            line_sender_error_code::line_sender_error_invalid_api_call as u32
+        );
+        let mut len = 0;
+        let message = unsafe { crate::questdb_error_msg(error, &mut len) };
+        let message = unsafe { slice::from_raw_parts(message as *const u8, len) };
+        let message = String::from_utf8_lossy(message);
+        assert!(
+            message.contains(field) && message.contains("maximum callback inbox capacity"),
+            "unexpected capacity error: {message}"
+        );
+        unsafe { crate::questdb_error_free(error) };
+    }
+
     // Most behaviour is already covered by the questdb-rs lib tests; this
     // module's tests focus on the FFI surface — pointer handling, NULL
     // guards, lifetime of error objects, etc.
@@ -5357,6 +5437,76 @@ mod tests {
         assert!(db.is_null());
         assert!(!err.is_null());
         unsafe { line_sender_error_free(err) };
+    }
+
+    #[test]
+    fn pool_connect_apis_reject_oversized_callback_inboxes() {
+        let conf = b"ws::addr=127.0.0.1:1;lazy_connect=true;";
+        let oversized = MAX_DB_CALLBACK_INBOX_CAPACITY + 1;
+
+        let mut options = questdb_db_connect_options {
+            event_callback: Some(ignore_connection_event),
+            event_inbox_capacity: oversized,
+            ..Default::default()
+        };
+        let mut error = std::ptr::null_mut();
+        let db = unsafe {
+            questdb_db_connect_ex(
+                conf.as_ptr() as *const c_char,
+                conf.len(),
+                &options,
+                &mut error,
+            )
+        };
+        assert!(db.is_null());
+        unsafe { assert_capacity_error(error, "event_inbox_capacity") };
+
+        options.event_callback = None;
+        options.event_inbox_capacity = 0;
+        options.rejection_callback = Some(ignore_rejection);
+        options.rejection_inbox_capacity = oversized;
+        error = std::ptr::null_mut();
+        let db = unsafe {
+            questdb_db_connect_ex(
+                conf.as_ptr() as *const c_char,
+                conf.len(),
+                &options,
+                &mut error,
+            )
+        };
+        assert!(db.is_null());
+        unsafe { assert_capacity_error(error, "rejection_inbox_capacity") };
+
+        error = std::ptr::null_mut();
+        let db = unsafe {
+            questdb_db_connect_with_event_handler(
+                conf.as_ptr() as *const c_char,
+                conf.len(),
+                ignore_connection_event,
+                std::ptr::null_mut(),
+                oversized,
+                &mut error,
+            )
+        };
+        assert!(db.is_null());
+        unsafe { assert_capacity_error(error, "inbox_capacity") };
+
+        error = std::ptr::null_mut();
+        let db = unsafe {
+            questdb_db_connect_with_handlers(
+                conf.as_ptr() as *const c_char,
+                conf.len(),
+                None,
+                std::ptr::null_mut(),
+                0,
+                Some(ignore_rejection),
+                std::ptr::null_mut(),
+                oversized,
+                &mut error,
+            )
+        };
+        assert!(db.is_null());
+        unsafe { assert_capacity_error(error, "rejection_inbox_capacity") };
     }
 
     #[test]
