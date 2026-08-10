@@ -1673,6 +1673,65 @@ fn restart_resumes_from_persisted_token_without_reprompt() {
 }
 
 #[test]
+fn refresh_only_persisted_entry_silently_refreshes_in_both_token_modes() {
+    for (groups_in_token, expected) in [(false, "AT-refreshed"), (true, "ID-refreshed")] {
+        let device_calls = Arc::new(AtomicUsize::new(0));
+        let refresh_calls = Arc::new(AtomicUsize::new(0));
+        let mock = {
+            let device_calls = Arc::clone(&device_calls);
+            let refresh_calls = Arc::clone(&refresh_calls);
+            MockServer::start(move |method, path, body| match (method, path) {
+                ("POST", "/device") => {
+                    device_calls.fetch_add(1, Ordering::SeqCst);
+                    (200, device_response())
+                }
+                ("POST", "/token") if body.contains("grant_type=refresh_token") => {
+                    refresh_calls.fetch_add(1, Ordering::SeqCst);
+                    (
+                        200,
+                        r#"{"access_token":"AT-refreshed","id_token":"ID-refreshed","expires_in":300}"#
+                            .to_string(),
+                    )
+                }
+                _ => (404, "{}".to_string()),
+            })
+        };
+        let store = FailingSaveStore::default();
+        store.seed(PersistedToken::new(
+            None,
+            None,
+            Some("RT-only".to_string()),
+            0.0,
+            0.0,
+        ));
+        let auth = OidcDeviceAuth::builder()
+            .client_id("questdb")
+            .device_authorization_endpoint(mock.url("/device"))
+            .token_endpoint(mock.url("/token"))
+            .scope("openid")
+            .groups_in_token(groups_in_token)
+            .interactive(false)
+            .open_browser(false)
+            .sleep_hook(no_sleep())
+            .token_store(store.clone())
+            .build()
+            .expect("build auth with refresh-only store");
+
+        assert_eq!(auth.token().unwrap(), expected);
+        assert_eq!(refresh_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            device_calls.load(Ordering::SeqCst),
+            0,
+            "refresh-only persisted state unexpectedly started a device flow"
+        );
+        let persisted = store.token().expect("refreshed state was not persisted");
+        assert_eq!(persisted.access_token(), Some("AT-refreshed"));
+        assert_eq!(persisted.id_token(), Some("ID-refreshed"));
+        assert_eq!(persisted.refresh_token(), Some("RT-only"));
+    }
+}
+
+#[test]
 fn persist_restores_non_rotating_refresh_token_after_consuming_parent() {
     // Non-rotating IdP: the refresh response carries no new refresh_token.
     let device_calls = Arc::new(AtomicUsize::new(0));

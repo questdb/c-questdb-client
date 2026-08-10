@@ -346,9 +346,73 @@ pub trait TokenStore: Send + Sync {
     /// `Err` without invoking it. Running the action without ownership can reuse
     /// and revoke a rotating refresh-token family.
     ///
-    /// A store used by only one process may coordinate with an in-process mutex,
-    /// but that limitation belongs in the store's own explicit contract; there
-    /// is deliberately no unlocked default.
+    /// `action` re-enters this store through [`load`](Self::load),
+    /// [`save`](Self::save), or [`clear`](Self::clear). The coordination lock
+    /// therefore **must be independent of every mutex or transaction guard those
+    /// methods acquire**. Do not hold the store's data-state mutex while invoking
+    /// `action`: a non-reentrant mutex would self-deadlock.
+    ///
+    /// A store used by only one process may coordinate with a separate
+    /// in-process mutex, as below, but that limitation belongs in the store's own
+    /// explicit contract; there is deliberately no unlocked default.
+    ///
+    /// ```
+    /// use std::collections::HashMap;
+    /// use std::sync::Mutex;
+    /// use questdb::oidc::{PersistedToken, TokenStore, TokenStoreKey, TokenStoreResult};
+    ///
+    /// #[derive(Default)]
+    /// struct SingleProcessStore {
+    ///     entries: Mutex<HashMap<String, PersistedToken>>,
+    ///     // Deliberately separate from `entries`: the action calls back into
+    ///     // load/save/clear, which lock `entries` themselves.
+    ///     refresh_coordination: Mutex<()>,
+    /// }
+    ///
+    /// impl TokenStore for SingleProcessStore {
+    ///     fn load(&self, key: &TokenStoreKey)
+    ///         -> TokenStoreResult<Option<PersistedToken>>
+    ///     {
+    ///         Ok(self.entries.lock().unwrap().get(&key.hash()).cloned())
+    ///     }
+    ///
+    ///     fn save(&self, key: &TokenStoreKey, token: &PersistedToken)
+    ///         -> TokenStoreResult<()>
+    ///     {
+    ///         self.entries.lock().unwrap().insert(key.hash(), token.clone());
+    ///         Ok(())
+    ///     }
+    ///
+    ///     fn clear(&self, key: &TokenStoreKey) -> TokenStoreResult<()> {
+    ///         self.entries.lock().unwrap().remove(&key.hash());
+    ///         Ok(())
+    ///     }
+    ///
+    ///     fn in_lock(
+    ///         &self,
+    ///         _key: &TokenStoreKey,
+    ///         action: &mut dyn FnMut() -> TokenStoreResult<()>,
+    ///     ) -> TokenStoreResult<()> {
+    ///         let _coordination = self.refresh_coordination.lock().unwrap();
+    ///         action()
+    ///     }
+    /// }
+    ///
+    /// let store = SingleProcessStore::default();
+    /// let key = TokenStoreKey::from_config(
+    ///     "questdb",
+    ///     "https://idp.example.com/token",
+    ///     "https://idp.example.com/device",
+    ///     "openid",
+    ///     None,
+    ///     false,
+    ///     None,
+    /// );
+    /// store.in_lock(&key, &mut || {
+    ///     let _current = store.load(&key)?;
+    ///     store.clear(&key)
+    /// }).unwrap();
+    /// ```
     fn in_lock(
         &self,
         key: &TokenStoreKey,

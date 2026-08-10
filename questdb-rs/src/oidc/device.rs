@@ -744,14 +744,14 @@ impl OidcDeviceAuth {
         Some(tokens)
     }
 
-    /// Build a usable [`TokenSet`] from a persisted entry, treating the file as
-    /// untrusted: both wire-bindable tokens go through the same control/non-ASCII
-    /// gate as the network path, and the expiry is bounded by the served token's
-    /// own JWT `exp` (its real, server-checked expiry) — or, for an opaque
-    /// (non-JWT) token, capped to at most one hour from now — so a tampered
-    /// far-future expiry can't keep a stale token alive, while a legitimately
-    /// long-lived token (e.g. a no-refresh entry written by another QuestDB
-    /// language client) is not needlessly re-prompted after an hour.
+    /// Build a [`TokenSet`] from a persisted entry, treating the file as
+    /// untrusted. A directly servable token goes through the same
+    /// control/non-ASCII gate as the network path, and its expiry is bounded by
+    /// its own JWT `exp` (its real, server-checked expiry) — or, for an opaque
+    /// token, capped to at most one hour from now. An entry with no required
+    /// access/ID token may still carry a safe refresh token written by another
+    /// client; retain it in an intentionally expired set so the caller performs
+    /// a coordinated silent refresh rather than prompting again.
     fn tokenset_from_persisted(&self, p: &PersistedToken) -> Option<TokenSet> {
         let access_token = p
             .access_token()
@@ -763,16 +763,24 @@ impl OidcDeviceAuth {
             .map(String::from);
         let refresh_token = p
             .refresh_token()
-            .filter(|s| !s.is_empty())
+            .filter(|s| is_safe_token_str(s))
             .map(String::from);
-        let served = if self.config.groups_in_token {
-            &id_token
+        let (persisted_served, served) = if self.config.groups_in_token {
+            (p.id_token(), &id_token)
         } else {
-            &access_token
+            (p.access_token(), &access_token)
         };
-        // A blank / control / non-ASCII / absent served token is unusable: reject
-        // the whole entry rather than serve a tampered credential.
-        served.as_ref()?;
+
+        // A present but blank / control / non-ASCII served token is tampered and
+        // invalidates the entry. A genuinely absent served token is recoverable
+        // only when a safe refresh token remains.
+        if persisted_served.is_some() && served.is_none() {
+            return None;
+        }
+        if served.is_none() && refresh_token.is_none() {
+            return None;
+        }
+
         let now = now_epoch();
         let max_life = MAX_EXPIRES_IN as f64;
         let ttl = p.token_ttl().clamp(0.0, max_life);
@@ -785,11 +793,19 @@ impl OidcDeviceAuth {
         // needs the file-write access that would expose the refresh token anyway.
         // An opaque (non-JWT) token has no self-describing expiry, so fall back to
         // the untrusted-file cap and never trust a far-future on-disk expiry.
-        let expires_at = match jwt_exp(served.as_deref()) {
-            Some(exp) => p.expires_at().min(exp),
-            None => p.expires_at().min(now + max_life),
+        let expires_at = match served.as_deref() {
+            Some(served) => match jwt_exp(Some(served)) {
+                Some(exp) => p.expires_at().min(exp),
+                None => p.expires_at().min(now + max_life),
+            },
+            // Never treat refresh-only persisted state as currently servable.
+            None => 0.0,
         };
-        let issued_at = expires_at - ttl;
+        let issued_at = if expires_at > 0.0 {
+            expires_at - ttl
+        } else {
+            0.0
+        };
         let claims = decode_jwt_claims(id_token.as_deref())
             .or_else(|| decode_jwt_claims(access_token.as_deref()));
         let sub = claims
