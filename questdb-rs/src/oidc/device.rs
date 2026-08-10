@@ -953,7 +953,37 @@ impl OidcDeviceAuth {
         // parent and its response was lost. Remove every cached copy before the
         // request so a later call cannot retry an ambiguous parent.
         self.discard_cached_refresh();
-        let refreshed = self.refresh(&current)?;
+        let refreshed = match self.refresh(&current) {
+            Ok(refreshed) => refreshed,
+            Err(e) => {
+                // A *transient* refresh failure carrying a clean HTTP status
+                // (408 / 429 / 5xx: `refresh` returns these as a `Network` error
+                // with the status attached) means the IdP — or an intermediary —
+                // answered without rotating the parent, so the refresh token is
+                // provably still valid. Restore it (in memory, and back on disk
+                // if we consumed the persisted copy above) so a later retry —
+                // this process, a peer, or a restart — resumes the silent refresh
+                // instead of forcing an interactive re-sign-in a headless client
+                // cannot perform. This matches the no-store path, which keeps the
+                // token on a transient failure.
+                //
+                // Everything else stays discarded: a `Network` error with NO
+                // status is an ambiguous post-send transport failure (the IdP may
+                // have consumed and rotated the parent with its response lost, so
+                // a reuse-detecting IdP must never be sent it twice), and a
+                // terminal rejection (a non-`Network` kind, e.g. `invalid_grant`)
+                // means the parent is dead and must not be replayed.
+                let transient =
+                    e.kind() == crate::oidc::error::OidcErrorKind::Network && e.status().is_some();
+                if transient {
+                    *self.lock_tokens() = Some(current.clone());
+                    if current_is_persisted {
+                        self.persist_if_changed(store, key, &current);
+                    }
+                }
+                return Err(e);
+            }
+        };
         if self.has_required_token(&refreshed) {
             self.persist_if_changed(store, key, &refreshed);
         }

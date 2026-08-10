@@ -2452,7 +2452,12 @@ fn lost_refresh_response_consumes_parent_before_retry() {
         MockServer::start(move |method, path, body| {
             if (method, path) == ("POST", "/token") && body.contains("grant_type=refresh_token") {
                 refresh_calls.fetch_add(1, Ordering::SeqCst);
-                return (503, r#"{"error":"temporarily_unavailable"}"#.to_string());
+                // 0 == drop the connection: an ambiguous post-send transport
+                // failure with NO HTTP status. The IdP may have consumed and
+                // rotated RT-1 before the response was lost, so the parent must
+                // stay discarded (a clean HTTP status is handled the opposite
+                // way — see `transient_status_refresh_preserves_persisted_parent`).
+                return (0, String::new());
             }
             (404, "{}".to_string())
         })
@@ -2473,11 +2478,79 @@ fn lost_refresh_response_consumes_parent_before_retry() {
     assert_eq!(auth.token_set().unwrap().refresh_token, None);
     assert_eq!(refresh_calls.load(Ordering::SeqCst), 1);
 
-    // A transport/server failure can happen after the IdP consumed RT-1. A later
-    // call must require a new sign-in rather than submitting RT-1 again.
+    // A transport failure with no status can happen after the IdP consumed RT-1.
+    // A later call must require a new sign-in rather than submitting RT-1 again.
     let err = auth.token().unwrap_err();
     assert_eq!(err.kind(), OidcErrorKind::InteractionRequired);
     assert_eq!(refresh_calls.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn transient_status_refresh_preserves_persisted_parent() {
+    // A clean transient HTTP status (503) means the IdP answered WITHOUT
+    // consuming the refresh token, so a store-backed refresh must keep RT-1 (on
+    // disk and in memory) and retry — never brick an unattended client by
+    // forcing an interactive re-sign-in it cannot perform. Mirrors the no-store
+    // path (`refresh_transient_error_preserves_token_no_reprompt`). Regression
+    // test for a transient IdP hiccup permanently destroying a still-valid
+    // persisted refresh token.
+    let refresh_calls = Arc::new(AtomicUsize::new(0));
+    let mock = {
+        let refresh_calls = Arc::clone(&refresh_calls);
+        MockServer::start(move |method, path, body| {
+            if (method, path) == ("POST", "/token") && body.contains("grant_type=refresh_token") {
+                // First poll: transient 503 (non-consuming). Second: success,
+                // rotating RT-1 -> RT-2.
+                if refresh_calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                    return (503, r#"{"error":"temporarily_unavailable"}"#.to_string());
+                }
+                return (
+                    200,
+                    r#"{"access_token":"AT-2","refresh_token":"RT-2","expires_in":300}"#
+                        .to_string(),
+                );
+            }
+            (404, "{}".to_string())
+        })
+    };
+    let store = FailingSaveStore::default();
+    store.seed(PersistedToken::new(
+        Some("AT-expired".to_string()),
+        None,
+        Some("RT-1".to_string()),
+        1.0,
+        300.0,
+    ));
+    let auth = auth_with_failing_store(&mock, store.clone(), false);
+
+    // The transient 503 surfaces a Network error, but the still-valid refresh
+    // token is retained on disk and in memory rather than consumed.
+    let err = auth.token().unwrap_err();
+    assert_eq!(err.kind(), OidcErrorKind::Network);
+    assert_eq!(err.status(), Some(503));
+    assert_eq!(
+        store
+            .token()
+            .and_then(|t| t.refresh_token().map(str::to_string)),
+        Some("RT-1".to_string()),
+        "a transient 503 must not consume the persisted refresh token"
+    );
+    assert_eq!(
+        auth.token_set().and_then(|t| t.refresh_token),
+        Some("RT-1".to_string()),
+        "the in-memory refresh token must survive a transient 503"
+    );
+
+    // A later call retries the refresh (never InteractionRequired) and recovers,
+    // rotating RT-1 -> RT-2.
+    assert_eq!(auth.token().unwrap(), "AT-2");
+    assert_eq!(refresh_calls.load(Ordering::SeqCst), 2);
+    assert_eq!(
+        store
+            .token()
+            .and_then(|t| t.refresh_token().map(str::to_string)),
+        Some("RT-2".to_string()),
+    );
 }
 
 #[test]
