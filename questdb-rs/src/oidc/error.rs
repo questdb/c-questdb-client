@@ -90,6 +90,11 @@ pub struct OidcError {
     status: Option<u16>,
     /// A parsed `Retry-After` (delta-seconds) from a transient response, when present.
     retry_after: Option<u64>,
+    /// True when this network failure proves the request was never transmitted
+    /// (a pre-send connect / DNS / TLS-handshake failure), so a refresh token
+    /// carried in it was not consumed by the IdP and is safe to retry. Left
+    /// `false` for any failure that may have reached the IdP.
+    request_unsent: bool,
 }
 
 impl OidcError {
@@ -107,6 +112,7 @@ impl OidcError {
             error_description: None,
             status: None,
             retry_after: None,
+            request_unsent: false,
         }
     }
 
@@ -160,6 +166,13 @@ impl OidcError {
         self
     }
 
+    /// Mark this network failure as one where the request was provably never
+    /// transmitted (see [`request_unsent`](Self::request_unsent)).
+    pub(crate) fn with_request_unsent(mut self, request_unsent: bool) -> Self {
+        self.request_unsent = request_unsent;
+        self
+    }
+
     /// The category of this error.
     ///
     /// Match on the returned [`OidcErrorKind`] to branch on the failure — e.g.
@@ -202,6 +215,15 @@ impl OidcError {
     /// transient IdP response, when present.
     pub fn retry_after_secs(&self) -> Option<u64> {
         self.retry_after
+    }
+
+    /// True when this failure proves the underlying HTTP request never left the
+    /// client — a pre-send connect / DNS / TLS-handshake failure — so a refresh
+    /// token carried in that request was not consumed by the IdP and may be
+    /// safely retried. Any failure that might have transmitted the request
+    /// (including a status-less mid-flight drop) leaves this `false`.
+    pub(crate) fn request_unsent(&self) -> bool {
+        self.request_unsent
     }
 }
 

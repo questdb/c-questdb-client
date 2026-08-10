@@ -666,8 +666,9 @@ impl OidcDeviceAuth {
                 // a fresh sign-in.
                 Ok(_) => {}
                 // A retryable transport or persistence failure must not trigger
-                // an unexpected prompt in the same call. The coordinated path
-                // may already have discarded an ambiguously consumed parent.
+                // an unexpected prompt in the same call. Either refresh path
+                // (stored or in-memory) may already have discarded an ambiguously
+                // consumed parent, leaving the next call to re-prompt.
                 Err(e) if e.kind() == crate::oidc::error::OidcErrorKind::Network => {
                     return Err(e);
                 }
@@ -846,7 +847,7 @@ impl OidcDeviceAuth {
     /// means "fall through to an interactive sign-in").
     fn try_refresh_coordinated(&self, existing: &TokenSet) -> Result<TokenSet> {
         let (Some(store), Some(key)) = (self.token_store.as_ref(), self.store_key.as_ref()) else {
-            return self.refresh(existing); // no store: a plain refresh
+            return self.refresh_no_store(existing); // no store: memory-only coordination
         };
         let store = Arc::clone(store);
         let existing = existing.clone();
@@ -879,6 +880,26 @@ impl OidcDeviceAuth {
                         .to_string(),
                 };
                 Err(OidcError::network(message))
+            }
+        }
+    }
+
+    /// A silent refresh with no persistent store: mirror
+    /// [`refresh_under_lock`](Self::refresh_under_lock)'s in-memory safety without
+    /// the cross-process lock or disk I/O. Drop the cached refresh token before
+    /// the request so an ambiguous transport failure cannot resubmit a
+    /// possibly-rotated parent to a reuse-detecting IdP, then restore it only when
+    /// the failure proves the IdP never consumed it (a clean transient status, or
+    /// a request that provably never left the client).
+    fn refresh_no_store(&self, existing: &TokenSet) -> Result<TokenSet> {
+        self.discard_cached_refresh();
+        match self.refresh(existing) {
+            Ok(refreshed) => Ok(refreshed),
+            Err(e) => {
+                if refresh_preserves_token(&e) {
+                    *self.lock_tokens() = Some(existing.clone());
+                }
+                Err(e)
             }
         }
     }
@@ -956,26 +977,25 @@ impl OidcDeviceAuth {
         let refreshed = match self.refresh(&current) {
             Ok(refreshed) => refreshed,
             Err(e) => {
-                // A *transient* refresh failure carrying a clean HTTP status
-                // (408 / 429 / 5xx: `refresh` returns these as a `Network` error
-                // with the status attached) means the IdP — or an intermediary —
-                // answered without rotating the parent, so the refresh token is
-                // provably still valid. Restore it (in memory, and back on disk
-                // if we consumed the persisted copy above) so a later retry —
-                // this process, a peer, or a restart — resumes the silent refresh
-                // instead of forcing an interactive re-sign-in a headless client
-                // cannot perform. This matches the no-store path, which keeps the
-                // token on a transient failure.
+                // Restore the refresh token only when the failure proves the IdP
+                // never consumed it (see `refresh_preserves_token`): a clean
+                // transient HTTP status (408 / 429 / 5xx — the IdP answered
+                // without rotating), or a request that provably never left the
+                // client (a pre-send connect / DNS / TLS failure). Restore it in
+                // memory, and back on disk if we consumed the persisted copy
+                // above, so a later retry — this process, a peer, or a restart —
+                // resumes the silent refresh instead of forcing an interactive
+                // re-sign-in a headless client cannot perform. The no-store path
+                // (`refresh_no_store`) makes the identical choice.
                 //
-                // Everything else stays discarded: a `Network` error with NO
-                // status is an ambiguous post-send transport failure (the IdP may
-                // have consumed and rotated the parent with its response lost, so
-                // a reuse-detecting IdP must never be sent it twice), and a
-                // terminal rejection (a non-`Network` kind, e.g. `invalid_grant`)
-                // means the parent is dead and must not be replayed.
-                let transient =
-                    e.kind() == crate::oidc::error::OidcErrorKind::Network && e.status().is_some();
-                if transient {
+                // Everything else stays discarded: a status-less failure that may
+                // have transmitted the request is an ambiguous post-send transport
+                // failure (the IdP may have consumed and rotated the parent with
+                // its response lost, so a reuse-detecting IdP must never be sent it
+                // twice), and a terminal rejection (a non-`Network` kind, e.g.
+                // `invalid_grant`) means the parent is dead and must not be
+                // replayed.
+                if refresh_preserves_token(&e) {
                     *self.lock_tokens() = Some(current.clone());
                     if current_is_persisted {
                         self.persist_if_changed(store, key, &current);
@@ -1481,6 +1501,19 @@ fn snapshot(tokens: &TokenSet) -> PersistedToken {
 /// Never logs a token value — a store's error carries only paths / I/O kinds.
 fn warn_persistence(op: &str, err: &(dyn std::error::Error + Send + Sync)) {
     log::warn!("questdb oidc: token store {op} failed: {err}");
+}
+
+/// True when a failed [`refresh`](OidcDeviceAuth::refresh) proves the refresh
+/// token was NOT consumed by the IdP, so keeping it for a later retry cannot
+/// trigger rotating-refresh-token reuse detection. Two cases qualify: a clean
+/// transient HTTP status (the IdP answered without rotating the parent), or a
+/// request that provably never reached the IdP (a pre-send connect / DNS / TLS
+/// failure, flagged via [`OidcError::request_unsent`]). A status-less failure
+/// that may have transmitted the request is ambiguous — the parent may have been
+/// consumed and its response lost — and does not qualify.
+fn refresh_preserves_token(e: &OidcError) -> bool {
+    e.kind() == crate::oidc::error::OidcErrorKind::Network
+        && (e.status().is_some() || e.request_unsent())
 }
 
 fn clamp_interval(interval: i64) -> u64 {

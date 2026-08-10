@@ -231,6 +231,35 @@ fn sign_in_and_token(auth: &OidcDeviceAuth) -> Result<String> {
     auth.token()
 }
 
+/// Reserve a loopback port with no listener, so connects to it are refused
+/// (ECONNREFUSED) — modelling a pre-send transport failure where the request
+/// never leaves the client. Loopback `http` is allowed without insecure
+/// transport, so this needs no extra opt-in.
+fn dead_loopback_addr() -> SocketAddr {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let addr = listener.local_addr().unwrap();
+    drop(listener);
+    addr
+}
+
+/// A no-store auth whose token endpoint points at a closed loopback port, so a
+/// refresh POST fails pre-send (connection refused): the request never reaches
+/// the IdP, proving a refresh token carried in it was not consumed.
+fn auth_with_dead_token_endpoint() -> OidcDeviceAuth {
+    let addr = dead_loopback_addr();
+    OidcDeviceAuth::builder()
+        .client_id("questdb")
+        .device_authorization_endpoint(format!("http://{addr}/device"))
+        .token_endpoint(format!("http://{addr}/token"))
+        .scope("openid")
+        .interactive(true)
+        .open_browser(false)
+        .timeout(Duration::from_secs(5))
+        .sleep_hook(no_sleep())
+        .build()
+        .expect("build auth")
+}
+
 fn device_response() -> String {
     serde_json::json!({
         "device_code": "DEV-CODE-123",
@@ -2597,6 +2626,116 @@ fn lost_refresh_response_consumes_parent_before_retry() {
     let err = auth.token().unwrap_err();
     assert_eq!(err.kind(), OidcErrorKind::InteractionRequired);
     assert_eq!(refresh_calls.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn refresh_ambiguous_transport_failure_discards_in_memory_parent() {
+    // Default (no-store) path: a status-less transport failure that may have
+    // reached the IdP is ambiguous — the parent may have been consumed and
+    // rotated with its response lost. Resubmitting it to a reuse-detecting IdP
+    // would revoke the whole token family, so the in-memory parent must be
+    // discarded and the next call must require a fresh sign-in rather than replay
+    // RT-1. This makes the default path match the store path's
+    // `lost_refresh_response_consumes_parent_before_retry`.
+    let refresh_calls = Arc::new(AtomicUsize::new(0));
+    let mock = {
+        let refresh_calls = Arc::clone(&refresh_calls);
+        MockServer::start(move |method, path, body| {
+            if (method, path) == ("POST", "/token") && body.contains("grant_type=refresh_token") {
+                refresh_calls.fetch_add(1, Ordering::SeqCst);
+                return (0, String::new()); // drop after reading: post-send, no status
+            }
+            (404, "{}".to_string())
+        })
+    };
+    let auth = explicit_auth(&mock, false);
+    *auth.tokens.lock().unwrap() = Some(expired_tokens("RT-1"));
+
+    let err = auth.token().unwrap_err();
+    assert_eq!(err.kind(), OidcErrorKind::Network);
+    assert_eq!(
+        auth.token_set().unwrap().refresh_token,
+        None,
+        "an ambiguous post-send failure must discard the in-memory refresh token"
+    );
+    assert_eq!(refresh_calls.load(Ordering::SeqCst), 1);
+
+    // The next call must re-sign-in, never resubmit the possibly-consumed RT-1.
+    let err = auth.token().unwrap_err();
+    assert_eq!(err.kind(), OidcErrorKind::InteractionRequired);
+    assert_eq!(refresh_calls.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn refresh_pre_send_failure_keeps_in_memory_parent() {
+    // Default (no-store) path: a pre-send connection failure proves the IdP never
+    // received the refresh request, so the still-valid refresh token must be
+    // retained and retried — a transient IdP outage must not wedge an unattended
+    // client into an interactive re-sign-in. The outage-tolerance half of the
+    // store/no-store consistency fix (discarding uniformly would terminalize a
+    // long-lived transport on a momentary connect blip).
+    let auth = auth_with_dead_token_endpoint();
+    *auth.tokens.lock().unwrap() = Some(expired_tokens("RT-1"));
+
+    let err = auth.token().unwrap_err();
+    assert_eq!(err.kind(), OidcErrorKind::Network);
+    assert_eq!(
+        auth.token_set().unwrap().refresh_token.as_deref(),
+        Some("RT-1"),
+        "a pre-send connect failure must keep the refresh token for a later retry"
+    );
+
+    // A later call keeps retrying with RT-1 rather than giving up.
+    let err = auth.token().unwrap_err();
+    assert_eq!(err.kind(), OidcErrorKind::Network);
+    assert_eq!(
+        auth.token_set().unwrap().refresh_token.as_deref(),
+        Some("RT-1")
+    );
+}
+
+#[test]
+fn refresh_pre_send_failure_keeps_persisted_parent() {
+    // Store path: a pre-send connection failure proves the refresh token was not
+    // consumed, so it must be restored on disk and in memory (not tombstoned) and
+    // remain replayable by this process, a peer, or a restart. Together with
+    // `lost_refresh_response_consumes_parent_before_retry` this pins that only a
+    // genuinely ambiguous post-send failure consumes the persisted parent.
+    let addr = dead_loopback_addr();
+    let store = FailingSaveStore::default();
+    store.seed(PersistedToken::new(
+        Some("AT-expired".to_string()),
+        None,
+        Some("RT-1".to_string()),
+        1.0,
+        300.0,
+    ));
+    let auth = OidcDeviceAuth::builder()
+        .client_id("questdb")
+        .device_authorization_endpoint(format!("http://{addr}/device"))
+        .token_endpoint(format!("http://{addr}/token"))
+        .scope("openid")
+        .interactive(true)
+        .open_browser(false)
+        .timeout(Duration::from_secs(5))
+        .sleep_hook(no_sleep())
+        .token_store(store.clone())
+        .build()
+        .expect("build auth with store");
+
+    let err = auth.token().unwrap_err();
+    assert_eq!(err.kind(), OidcErrorKind::Network);
+    assert_eq!(
+        store
+            .token()
+            .and_then(|t| t.refresh_token().map(str::to_string)),
+        Some("RT-1".to_string()),
+        "a pre-send connect failure must not consume the persisted refresh token"
+    );
+    assert_eq!(
+        auth.token_set().and_then(|t| t.refresh_token).as_deref(),
+        Some("RT-1")
+    );
 }
 
 #[test]

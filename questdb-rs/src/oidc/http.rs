@@ -155,7 +155,15 @@ impl HttpClient {
             .post(url)
             .header("Accept", "application/json")
             .send_form(form.iter().copied())
-            .map_err(|e| OidcError::network(format!("Failed to reach {url}: {e}")))?;
+            .map_err(|e| {
+                // Record whether the request provably never left the client, so a
+                // refresh caller can safely keep a refresh token that the IdP
+                // cannot have seen (vs. an ambiguous mid-flight drop, where the
+                // parent may have been consumed and rotated).
+                let unsent = request_provably_unsent(&e);
+                OidcError::network(format!("Failed to reach {url}: {e}"))
+                    .with_request_unsent(unsent)
+            })?;
         let status = response.status().as_u16();
         let retry_after = parse_retry_after(response.headers());
         let body = read_body(url, response)?;
@@ -180,6 +188,45 @@ impl HttpClient {
                 Err(err.with_status(Some(status)).with_retry_after(retry_after))
             }
         }
+    }
+}
+
+/// True when a `ureq` send failure proves the HTTP request was never
+/// transmitted, so a refresh token carried in it was not consumed by the IdP and
+/// is safe to reuse. Only unambiguous pre-send failures qualify — DNS
+/// resolution, TCP connect, TLS handshake, or proxy-tunnel setup — plus a
+/// resolve/connect-phase timeout. Every other failure (an I/O error at an
+/// unknown or post-connect phase, a send/receive-phase or global timeout, a
+/// protocol or decode error) may have reached the IdP and is treated as
+/// ambiguous.
+///
+/// `ureq` maps most connect failures to [`ureq::Error::Io`] and carries the
+/// [`io::ErrorKind`](std::io::ErrorKind) as the reason (`ConnectionFailed` is a
+/// last resort), so the `Io` arm inspects the kind: only kinds that mean "no
+/// connection was ever established" qualify — a reset / broken pipe / EOF may
+/// have occurred after the request bytes were written. `ureq::Error` and
+/// `ureq::Timeout` are `#[non_exhaustive]`, so any future variant falls through
+/// to the fail-safe `false` (treat as possibly-sent).
+fn request_provably_unsent(err: &ureq::Error) -> bool {
+    use std::io::ErrorKind;
+    use ureq::Error;
+    match err {
+        Error::HostNotFound
+        | Error::ConnectionFailed
+        | Error::ConnectProxyFailed(_)
+        | Error::TlsRequired
+        | Error::Tls(_) => true,
+        Error::Io(e) => matches!(
+            e.kind(),
+            ErrorKind::ConnectionRefused
+                | ErrorKind::NetworkUnreachable
+                | ErrorKind::HostUnreachable
+                | ErrorKind::AddrNotAvailable
+        ),
+        Error::Timeout(reason) => {
+            matches!(reason, ureq::Timeout::Resolve | ureq::Timeout::Connect)
+        }
+        _ => false,
     }
 }
 
@@ -733,5 +780,54 @@ mod tests {
         );
         // Absent header.
         assert_eq!(parse_retry_after(&HeaderMap::new()), None);
+    }
+
+    #[test]
+    fn request_provably_unsent_classifies_pre_send_failures() {
+        use ureq::Error;
+        // Pre-send: the request never left the client, so a refresh token carried
+        // in it was not consumed by the IdP — safe to keep and retry.
+        assert!(request_provably_unsent(&Error::HostNotFound));
+        assert!(request_provably_unsent(&Error::ConnectionFailed));
+        assert!(request_provably_unsent(&Error::ConnectProxyFailed(
+            "x".into()
+        )));
+        assert!(request_provably_unsent(&Error::TlsRequired));
+        assert!(request_provably_unsent(&Error::Tls("handshake")));
+        assert!(request_provably_unsent(&Error::Timeout(
+            ureq::Timeout::Resolve
+        )));
+        assert!(request_provably_unsent(&Error::Timeout(
+            ureq::Timeout::Connect
+        )));
+        // ureq surfaces a refused/unreachable connect as `Io` with the kind as
+        // the reason: those never established a connection, so the request is
+        // provably unsent.
+        for kind in [
+            std::io::ErrorKind::ConnectionRefused,
+            std::io::ErrorKind::NetworkUnreachable,
+            std::io::ErrorKind::HostUnreachable,
+            std::io::ErrorKind::AddrNotAvailable,
+        ] {
+            assert!(
+                request_provably_unsent(&Error::Io(std::io::Error::new(kind, "no connection"))),
+                "{kind:?} should be pre-send"
+            );
+        }
+        // Ambiguous — the request may have reached the IdP, so it is NOT provably
+        // unsent and the parent must be treated as possibly-consumed. A reset or
+        // EOF can happen after the request bytes were written.
+        assert!(!request_provably_unsent(&Error::Timeout(
+            ureq::Timeout::Global
+        )));
+        assert!(!request_provably_unsent(&Error::Io(std::io::Error::new(
+            std::io::ErrorKind::ConnectionReset,
+            "reset mid-flight",
+        ))));
+        assert!(!request_provably_unsent(&Error::Io(std::io::Error::new(
+            std::io::ErrorKind::UnexpectedEof,
+            "eof reading response",
+        ))));
+        assert!(!request_provably_unsent(&Error::StatusCode(500)));
     }
 }
