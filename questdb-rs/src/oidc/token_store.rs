@@ -54,6 +54,7 @@
 //! protocols) is a **frozen cross-language contract** shared with the QuestDB
 //! Java and Python clients, so a file written by one can be read by another.
 
+use std::cell::RefCell;
 use std::fmt;
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
@@ -439,13 +440,15 @@ pub trait TokenStore: Send + Sync {
 /// [`save`](FileTokenStore::save) writes a sibling temp file then atomically
 /// renames it over the target, so a crash or an overlapping reader — in any
 /// process or language — sees the whole old or whole new file, never a torn
-/// credential. [`in_lock`](TokenStore::in_lock) serialises the
-/// read-refresh-write of a token refresh across processes with an
-/// `O_CREAT|O_EXCL` lock file. It never runs the action without owning that lock
-/// and never automatically steals a stale pathname: either operation could let
-/// two processes submit the same rotating refresh token. A stale lock is reported
-/// as a retryable error and must be removed only after the operator has verified
-/// that no holder is still active.
+/// credential. Every save participates in the same per-identity lock used by
+/// [`in_lock`](TokenStore::in_lock), including re-entrant saves made by its
+/// action. A successful save removes crash-orphaned plaintext temps only after
+/// their age exceeds the configured staleness window. The lock uses an
+/// `O_CREAT|O_EXCL` file and never runs an action without owning it or
+/// automatically steals a stale pathname: either operation could let two
+/// processes submit the same rotating refresh token. A stale lock is reported as
+/// a retryable error and must be removed only after the operator has verified that
+/// no holder is still active.
 #[derive(Debug, Clone)]
 pub struct FileTokenStore {
     directory: PathBuf,
@@ -487,10 +490,11 @@ impl FileTokenStore {
     }
 
     /// Override the cross-process lock timings. `stale` controls when a lock is
-    /// identified as abandoned in the acquisition error; it never causes an
-    /// automatic unlink/rename. A tighter value is clamped up to the 5-minute
-    /// floor. `acquire_budget` is clamped down to 5 minutes (an unclamped value
-    /// would overflow the deadline arithmetic).
+    /// identified as abandoned in the acquisition error and when a crash-orphaned
+    /// token temp file becomes eligible for cleanup. It never causes a lock to be
+    /// automatically unlinked or renamed. A tighter value is clamped up to the
+    /// 5-minute floor. `acquire_budget` is clamped down to 5 minutes (an unclamped
+    /// value would overflow the deadline arithmetic).
     pub fn with_lock_timings(mut self, acquire_budget: Duration, stale: Duration) -> Self {
         self.lock_acquire_budget = acquire_budget.min(MAX_LOCK_ACQUIRE_BUDGET);
         self.lock_stale = stale.max(MIN_LOCK_STALE);
@@ -663,8 +667,8 @@ impl FileTokenStore {
     }
 
     fn is_stale(&self, lock: &Path) -> bool {
-        // lstat (symlink_metadata): judge a symlink by its OWN mtime; for a
-        // regular-file lock (what we create) lstat == stat.
+        // lstat (symlink_metadata): judge a symlink by its OWN mtime; for the
+        // regular lock/temp files we create, lstat == stat.
         let Ok(meta) = fs::symlink_metadata(lock) else {
             return false; // can't determine age → report ordinary contention
         };
@@ -677,6 +681,96 @@ impl FileTokenStore {
             Ok(elapsed) => elapsed > self.lock_stale,
             Err(_) => false,
         }
+    }
+
+    /// Run under this identity's filesystem lock. `TokenStore::in_lock` actions
+    /// synchronously re-enter `save` and `clear`, so ownership is tracked for the
+    /// current thread to avoid trying to acquire our own non-reentrant lock.
+    fn with_lock<T>(
+        &self,
+        key: &TokenStoreKey,
+        action: impl FnOnce() -> TokenStoreResult<T>,
+    ) -> TokenStoreResult<T> {
+        let lock = self.lock_file(key);
+        if current_thread_holds(&lock) {
+            return action();
+        }
+        self.ensure_directory()?;
+        let file = self.acquire_lock(&lock)?;
+        // Drop the thread marker before releasing the filesystem lock. Both are
+        // RAII guards, so unwinding through user code preserves that order too.
+        let _held = HeldLock {
+            lock: lock.clone(),
+            file,
+        };
+        let _scope = HeldLockScope::enter(lock);
+        action()
+    }
+
+    /// Remove only crash-orphaned temps old enough to be unambiguously stale.
+    /// The caller must hold this identity's coordination lock so a cooperating
+    /// save cannot still be writing any candidate.
+    fn sweep_stale_orphan_temps(&self, key: &TokenStoreKey) -> bool {
+        debug_assert!(current_thread_holds(&self.lock_file(key)));
+        let hash = key.hash();
+        let Ok(entries) = fs::read_dir(&self.directory) else {
+            return false;
+        };
+        let mut removed = false;
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if name.starts_with(&hash) && name.ends_with(".tmp") && self.is_stale(&entry.path()) {
+                removed |= fs::remove_file(entry.path()).is_ok();
+            }
+        }
+        removed
+    }
+
+    fn save_under_lock(&self, key: &TokenStoreKey, content: &[u8]) -> TokenStoreResult<()> {
+        debug_assert!(current_thread_holds(&self.lock_file(key)));
+        let target = self.token_file(key);
+        let tmp = temp_path(&self.directory, &key.hash());
+        // create_new + 0600 (POSIX): no world-readable window before the rename.
+        let mut opts = OpenOptions::new();
+        opts.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.mode(0o600);
+        }
+        let write_result = (|| -> std::io::Result<()> {
+            let mut f = opts.open(&tmp)?;
+            f.write_all(content)?;
+            f.flush()?;
+            f.sync_all()?; // force to disk before the rename
+            fs::rename(&tmp, &target)?; // atomic on POSIX and Windows
+            Ok(())
+        })();
+        if write_result.is_err() {
+            let _ = fs::remove_file(&tmp); // clean up the temp on failure
+        }
+        write_result?;
+        // A successful save is a recovery point for plaintext temps left by a
+        // crashed predecessor. Fresh temps are retained until their age proves
+        // they are not from a live cross-language writer.
+        self.sweep_stale_orphan_temps(key);
+        let _ = fsync_directory(&self.directory); // best-effort: persist changes
+        Ok(())
+    }
+
+    fn clear_under_lock(&self, key: &TokenStoreKey) -> TokenStoreResult<()> {
+        debug_assert!(current_thread_holds(&self.lock_file(key)));
+        let removed = match fs::remove_file(self.token_file(key)) {
+            Ok(()) => true,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
+            Err(e) => return Err(Box::new(e)),
+        };
+        let removed_orphans = self.sweep_stale_orphan_temps(key);
+        if removed || removed_orphans {
+            fsync_directory(&self.directory)?; // make the refresh-parent tombstone durable
+        }
+        Ok(())
     }
 }
 
@@ -710,46 +804,11 @@ impl TokenStore for FileTokenStore {
                 ),
             )));
         }
-        self.ensure_directory()?;
-        let target = self.token_file(key);
-        let tmp = temp_path(&self.directory, &key.hash());
-        // create_new + 0600 (POSIX): no world-readable window before the rename.
-        let mut opts = OpenOptions::new();
-        opts.write(true).create_new(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            opts.mode(0o600);
-        }
-        let write_result = (|| -> std::io::Result<()> {
-            let mut f = opts.open(&tmp)?;
-            f.write_all(&content)?;
-            f.flush()?;
-            f.sync_all()?; // force to disk before the rename
-            fs::rename(&tmp, &target)?; // atomic on POSIX and Windows
-            Ok(())
-        })();
-        if write_result.is_err() {
-            let _ = fs::remove_file(&tmp); // clean up the temp on failure
-        }
-        write_result?;
-        let _ = fsync_directory(&self.directory); // best-effort: persist the rename
-        Ok(())
+        self.with_lock(key, || self.save_under_lock(key, &content))
     }
 
     fn clear(&self, key: &TokenStoreKey) -> TokenStoreResult<()> {
-        let removed = match fs::remove_file(self.token_file(key)) {
-            Ok(()) => true,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
-            Err(e) => return Err(Box::new(e)),
-        };
-        // Sweep any orphaned sibling temp files holding a now-forgotten credential
-        // (a hard crash between the temp write and the rename). Best-effort.
-        let removed_orphans = sweep_orphan_temps(&self.directory, &key.hash());
-        if removed || removed_orphans {
-            fsync_directory(&self.directory)?; // make the refresh-parent tombstone durable
-        }
-        Ok(())
+        self.with_lock(key, || self.clear_under_lock(key))
     }
 
     fn in_lock(
@@ -757,14 +816,7 @@ impl TokenStore for FileTokenStore {
         key: &TokenStoreKey,
         action: &mut dyn FnMut() -> TokenStoreResult<()>,
     ) -> TokenStoreResult<()> {
-        let lock = self.lock_file(key);
-        self.ensure_directory()?;
-        let file = self.acquire_lock(&lock)?;
-        // RAII makes the lock unwind-safe. `release_lock` checks filesystem
-        // identity where the platform exposes it, avoiding removal of a
-        // successor already installed at the pathname.
-        let _held = HeldLock { lock, file };
-        action()
+        self.with_lock(key, action)
     }
 }
 
@@ -905,6 +957,46 @@ impl Drop for HeldLock {
     }
 }
 
+std::thread_local! {
+    /// Filesystem locks owned by this thread. `in_lock` actions are synchronous,
+    /// so this is a precise re-entrancy proof rather than a process-wide guess
+    /// based on the mere presence of a lock pathname.
+    static HELD_LOCKS: RefCell<Vec<PathBuf>> = const { RefCell::new(Vec::new()) };
+}
+
+fn current_thread_holds(lock: &Path) -> bool {
+    HELD_LOCKS.with(|held| held.borrow().iter().any(|candidate| candidate == lock))
+}
+
+/// Marks the dynamic scope in which this thread owns a filesystem lock.
+struct HeldLockScope {
+    lock: PathBuf,
+}
+
+impl HeldLockScope {
+    fn enter(lock: PathBuf) -> Self {
+        HELD_LOCKS.with(|held| {
+            let mut held = held.borrow_mut();
+            debug_assert!(!held.contains(&lock));
+            held.push(lock.clone());
+        });
+        Self { lock }
+    }
+}
+
+impl Drop for HeldLockScope {
+    fn drop(&mut self) {
+        HELD_LOCKS.with(|held| {
+            let mut held = held.borrow_mut();
+            let position = held
+                .iter()
+                .rposition(|candidate| candidate == &self.lock)
+                .expect("held OIDC token-store lock marker disappeared");
+            held.remove(position);
+        });
+    }
+}
+
 /// Release a held lock by unlinking it — but only when the path still resolves to
 /// the exact file we created. Another language client or operator may have removed
 /// and recreated the pathname while this action was running; unlinking by path
@@ -971,24 +1063,6 @@ fn holder_bytes() -> String {
         .map(|d| d.as_nanos())
         .unwrap_or(0);
     format!("{}@{} {nanos}", std::process::id(), hostname())
-}
-
-/// Sweep any leftover `<hash>*.tmp` files for one identity (a plaintext token an
-/// aborted `save` left behind). Best-effort. Returns whether at least one
-/// directory entry was removed, so the caller can durably sync that deletion.
-fn sweep_orphan_temps(dir: &Path, hash: &str) -> bool {
-    let Ok(entries) = fs::read_dir(dir) else {
-        return false;
-    };
-    let mut removed = false;
-    for entry in entries.flatten() {
-        let name = entry.file_name();
-        let name = name.to_string_lossy();
-        if name.starts_with(hash) && name.ends_with(".tmp") {
-            removed |= fs::remove_file(entry.path()).is_ok();
-        }
-    }
-    removed
 }
 
 /// Open a file for reading only if it is a regular file within the size bound;

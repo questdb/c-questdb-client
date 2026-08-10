@@ -411,18 +411,45 @@ fn clear_removes_file_and_is_idempotent() {
 }
 
 #[test]
-fn clear_removes_orphan_temp_without_a_token_file() {
+fn clear_removes_stale_orphan_temp_without_a_token_file() {
     let dir = TempDir::new().unwrap();
     let store = FileTokenStore::at(dir.path());
     let key = test_key();
     let orphan = temp_path(dir.path(), &key.hash());
     std::fs::write(&orphan, b"orphaned refresh credential").unwrap();
+    let file = OpenOptions::new().write(true).open(&orphan).unwrap();
+    file.set_modified(SystemTime::now() - DEFAULT_LOCK_STALE - Duration::from_secs(1))
+        .unwrap();
+    drop(file);
     assert!(!store.token_file(&key).exists());
 
     // This is the path where only the orphan deletion changes the directory;
     // clear must detect it so the subsequent directory fsync is not skipped.
     store.clear(&key).unwrap();
     assert!(!orphan.exists());
+}
+
+#[test]
+fn save_sweeps_only_proven_stale_orphan_temps() {
+    let dir = TempDir::new().unwrap();
+    let store = FileTokenStore::at(dir.path());
+    let key = test_key();
+    let stale = temp_path(dir.path(), &key.hash());
+    let fresh = temp_path(dir.path(), &key.hash());
+    std::fs::write(&stale, b"stale refresh credential").unwrap();
+    std::fs::write(&fresh, b"possibly live refresh credential").unwrap();
+    let file = OpenOptions::new().write(true).open(&stale).unwrap();
+    file.set_modified(SystemTime::now() - DEFAULT_LOCK_STALE - Duration::from_secs(1))
+        .unwrap();
+    drop(file);
+
+    store.save(&key, &test_token()).unwrap();
+
+    assert!(!stale.exists(), "stale plaintext temp was not recovered");
+    assert!(
+        fresh.exists(),
+        "save removed a temp that was not proven stale"
+    );
 }
 
 // -- cross-process lock (Layer 2) -------------------------------------------
@@ -443,6 +470,49 @@ fn in_lock_runs_action_and_releases() {
     assert!(ran.load(Ordering::SeqCst));
     // The lock file is released (deleted) after in_lock returns.
     assert!(!store.lock_file(&key).exists(), "lock not released");
+}
+
+#[test]
+fn save_reuses_a_lock_already_held_by_the_current_action() {
+    let dir = TempDir::new().unwrap();
+    let store =
+        FileTokenStore::at(dir.path()).with_lock_timings(Duration::ZERO, DEFAULT_LOCK_STALE);
+    let key = test_key();
+
+    store
+        .in_lock(&key, &mut || store.save(&key, &test_token()))
+        .unwrap();
+
+    assert!(store.load(&key).unwrap().is_some());
+    assert!(!store.lock_file(&key).exists(), "lock was not released");
+}
+
+#[test]
+fn standalone_save_never_bypasses_a_peer_lock() {
+    let dir = TempDir::new().unwrap();
+    let store =
+        FileTokenStore::at(dir.path()).with_lock_timings(Duration::ZERO, DEFAULT_LOCK_STALE);
+    let key = test_key();
+    let lock = store.lock_file(&key);
+    let _peer = create_lock_file(&lock).unwrap();
+    let stale = temp_path(dir.path(), &key.hash());
+    std::fs::write(&stale, b"stale refresh credential").unwrap();
+    let file = OpenOptions::new().write(true).open(&stale).unwrap();
+    file.set_modified(SystemTime::now() - DEFAULT_LOCK_STALE - Duration::from_secs(1))
+        .unwrap();
+    drop(file);
+
+    let error = store.save(&key, &test_token()).unwrap_err();
+
+    assert_eq!(
+        error
+            .downcast_ref::<std::io::Error>()
+            .map(std::io::Error::kind),
+        Some(std::io::ErrorKind::WouldBlock)
+    );
+    assert!(!store.token_file(&key).exists());
+    assert!(stale.exists(), "save swept a temp without owning the lock");
+    assert!(lock.exists(), "save removed the peer's live lock");
 }
 
 #[test]
