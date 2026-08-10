@@ -34,7 +34,7 @@ use crate::oidc::discovery::{
     DiscoveryParams, OidcConfig, resolve_config, validate_endpoint_origins,
 };
 use crate::oidc::error::{MAX_IDP_FIELD_CHARS, OidcError, Result};
-use crate::oidc::http::HttpClient;
+use crate::oidc::http::{HttpClient, is_transient_http_status};
 use crate::oidc::render::{
     DeviceCodeChallenge, Renderer, TerminalRenderer, maybe_open_browser, strip_control_capped,
 };
@@ -1078,13 +1078,24 @@ impl OidcDeviceAuth {
         }
 
         let error = body.get("error").and_then(Value::as_str);
+        let error_description = body.get("error_description").and_then(Value::as_str);
+        if is_transient_http_status(result.status) {
+            return Err(OidcError::network(format!(
+                "The device-authorization request hit a transient IdP error \
+                     (HTTP {}); retry sign-in later.",
+                result.status
+            ))
+            .with_idp_error(error, error_description)
+            .with_status(Some(result.status))
+            .with_retry_after(result.retry_after));
+        }
         Err(OidcError::device_flow(format!(
             "The IdP rejected the device-authorization request (HTTP {}). Ensure \
              the OIDC client {:?} has the device grant enabled and is registered \
              as a public client.",
             result.status, self.config.client_id
         ))
-        .with_idp_error(error, body.get("error_description").and_then(Value::as_str))
+        .with_idp_error(error, error_description)
         .with_status(Some(result.status)))
     }
 
@@ -1135,7 +1146,9 @@ impl OidcDeviceAuth {
                     // A non-JSON, non-transient status is a terminal rejection (a
                     // WAF/proxy error page); a conformant poll reply is JSON, so
                     // it can never be authorization_pending / slow_down.
-                    if is_terminal_status(e.status()) {
+                    if e.status()
+                        .is_some_and(|status| !is_transient_http_status(status))
+                    {
                         self.renderer.on_failure(
                             "Sign-in failed: the identity provider rejected the request.",
                         );
@@ -1162,14 +1175,14 @@ impl OidcDeviceAuth {
                             )));
                         }
                     } else {
-                        // An HTTP status came back (a non-JSON 5xx/429 error page):
-                        // the endpoint IS reachable, so reset the consecutive-
-                        // transport-failure counter, mirroring the Ok branch. A
-                        // reachable-but-erroring poll must not count toward the
-                        // "unreachable on N consecutive polls" abort.
+                        // An HTTP status came back (a non-JSON transient error
+                        // page): the endpoint IS reachable, so reset the
+                        // consecutive-transport-failure counter, mirroring the Ok
+                        // branch. A reachable-but-erroring poll must not count
+                        // toward the "unreachable on N consecutive polls" abort.
                         transport_failures = 0;
                     }
-                    // Transient (dropped connection / 5xx / 429): keep polling.
+                    // Transient (dropped connection / 408 / 429 / 5xx): keep polling.
                     if e.status() == Some(429) || e.retry_after_secs().is_some() {
                         interval = backoff(interval, e.retry_after_secs(), false);
                     }
@@ -1197,10 +1210,10 @@ impl OidcDeviceAuth {
                 return Err(self.missing_required_token_error());
             }
 
-            // A 5xx/429 with a JSON body is transient (server error or
-            // rate-limit): keep polling. Honor Retry-After; apply the +5s
-            // slow-down step only to a 429 with no header.
-            if status >= 500 || status == 429 {
+            // A 408/429/5xx with a JSON body is transient (request timeout,
+            // rate-limit, or server error): keep polling. Honor Retry-After;
+            // apply the +5s slow-down step only to a 429 with no header.
+            if is_transient_http_status(status) {
                 if status == 429 || retry_after.is_some() {
                     // A `slow_down` bundled into a 429 (rather than the conformant
                     // HTTP 400) still MUST increase the interval — enforce it here,
@@ -1278,21 +1291,12 @@ impl OidcDeviceAuth {
         if let Some(audience) = &self.config.audience {
             form.push(("audience", audience.as_str()));
         }
-        let result = match self
+        // Preserve the complete structured error from the HTTP layer. In
+        // particular, a non-JSON transient response carries status and
+        // Retry-After metadata that callers use to schedule a later retry.
+        let result = self
             .http
-            .post_form(&self.config.token_endpoint, &form, false)
-        {
-            Ok(result) => result,
-            Err(e) => {
-                // A transient 5xx/429 (even non-JSON) keeps the refresh token
-                // usable → surface as a network error so the caller retries; a
-                // genuine 4xx rejection propagates to a fresh sign-in.
-                if is_transient_status(e.status()) {
-                    return Err(OidcError::network(e.to_string()).with_status(e.status()));
-                }
-                return Err(e);
-            }
-        };
+            .post_form(&self.config.token_endpoint, &form, false)?;
 
         if result.status == 200 {
             // Carry the prior refresh token forward (a non-rotating IdP omits it
@@ -1300,13 +1304,17 @@ impl OidcDeviceAuth {
             // `tokenset_from_response`.
             return Ok(self.tokenset_from_response(&result.body, Some(refresh_token)));
         }
-        if is_transient_status(Some(result.status)) {
+        if is_transient_http_status(result.status) {
+            let error = result.body.get("error").and_then(Value::as_str);
+            let error_description = result.body.get("error_description").and_then(Value::as_str);
             return Err(OidcError::network(format!(
                 "Token refresh hit a transient IdP error (HTTP {}); the refresh \
-                 token is still valid — retry later.",
+                     token is still valid — retry later.",
                 result.status
             ))
-            .with_status(Some(result.status)));
+            .with_idp_error(error, error_description)
+            .with_status(Some(result.status))
+            .with_retry_after(result.retry_after));
         }
         let error = result.body.get("error").and_then(Value::as_str);
         // Length-cap the untrusted "error" code before interpolating it.
@@ -1449,14 +1457,6 @@ fn backoff(interval: u64, retry_after: Option<u64>, at_least_increment: bool) ->
         target = target.max(interval + 5);
     }
     target.clamp(MIN_POLL_INTERVAL, MAX_POLL_INTERVAL)
-}
-
-fn is_terminal_status(status: Option<u16>) -> bool {
-    matches!(status, Some(s) if s < 500 && s != 429)
-}
-
-fn is_transient_status(status: Option<u16>) -> bool {
-    matches!(status, Some(s) if s >= 500 || s == 429)
 }
 
 /// A `/settings`/response value as a non-empty string.

@@ -70,6 +70,12 @@ pub(crate) struct PostResult {
     pub(crate) retry_after: Option<u64>,
 }
 
+/// HTTP statuses that indicate a retryable timeout, rate limit, or server-side
+/// failure rather than rejected credentials or invalid configuration.
+pub(crate) fn is_transient_http_status(status: u16) -> bool {
+    status == 408 || status == 429 || status >= 500
+}
+
 /// A reusable HTTPS client for the OIDC flow.
 pub(crate) struct HttpClient {
     agent: ureq::Agent,
@@ -112,18 +118,20 @@ impl HttpClient {
             .call()
             .map_err(|e| OidcError::network(format!("Failed to reach {url}: {e}")))?;
         let status = response.status().as_u16();
+        let retry_after = parse_retry_after(response.headers());
         let body = read_body(url, response)?;
         if !(200..300).contains(&status) {
             let snippet = body_snippet(&body);
             let msg = format!("HTTP {status} from {url}: {snippet}");
-            // A 5xx / 429 is a transient server / rate-limit issue; anything else
-            // (a wrong URL, OIDC not advertised, an auth gate) is a configuration
-            // problem.
-            return Err(if status >= 500 || status == 429 {
+            // A 408 / 429 / 5xx is a transient timeout, rate-limit, or server
+            // issue; anything else (a wrong URL, OIDC not advertised, an auth
+            // gate) is a configuration problem.
+            return Err(if is_transient_http_status(status) {
                 OidcError::network(msg).with_status(Some(status))
             } else {
                 OidcError::config(msg).with_status(Some(status))
-            });
+            }
+            .with_retry_after(retry_after));
         }
         serde_json::from_slice(&body).map_err(|e| {
             OidcError::config(format!("Invalid JSON from {url}: {e}")).with_status(Some(status))
@@ -160,11 +168,11 @@ impl HttpClient {
             Err(_) => {
                 let snippet = body_snippet(&body);
                 let msg = format!("HTTP {status} from {url}: {snippet}");
-                // Non-JSON body: a transient 5xx/429 (a proxy/WAF error page)
-                // stays retryable; anything else is a terminal rejection. Either
-                // way carry the status + Retry-After so the poll loop / refresh
-                // can classify and back off correctly.
-                let err = if status >= 500 || status == 429 {
+                // Non-JSON body: a transient 408/429/5xx (a timeout or proxy/WAF
+                // error page) stays retryable; anything else is a terminal
+                // rejection. Either way carry the status + Retry-After so the
+                // poll loop / refresh can classify and back off correctly.
+                let err = if is_transient_http_status(status) {
                     OidcError::network(msg)
                 } else {
                     OidcError::device_flow(msg)
@@ -684,6 +692,16 @@ mod tests {
         assert!(is_loopback("[::1]"));
         assert!(!is_loopback("example.com"));
         assert!(!is_loopback("10.0.0.1"));
+    }
+
+    #[test]
+    fn transient_http_statuses_include_request_timeout() {
+        for status in [408, 429, 500, 503, 599] {
+            assert!(is_transient_http_status(status), "HTTP {status}");
+        }
+        for status in [200, 302, 400, 401, 403, 404] {
+            assert!(!is_transient_http_status(status), "HTTP {status}");
+        }
     }
 
     #[test]

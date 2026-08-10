@@ -452,6 +452,55 @@ fn slow_down_via_429_still_increases_interval() {
 }
 
 #[test]
+fn poll_retries_json_and_non_json_http_408() {
+    for transient_body in [
+        r#"{"error":"request_timeout"}"#,
+        "<html>upstream timed out</html>",
+    ] {
+        let polls = Arc::new(AtomicUsize::new(0));
+        let mock = {
+            let polls = Arc::clone(&polls);
+            let transient_body = transient_body.to_string();
+            MockServer::start_with_retry_after(7, move |method, path, _body| match (method, path) {
+                ("POST", "/device") => (200, device_response()),
+                ("POST", "/token") => {
+                    if polls.fetch_add(1, Ordering::SeqCst) == 0 {
+                        (408, transient_body.clone())
+                    } else {
+                        (
+                            200,
+                            r#"{"access_token":"AT-after-408","expires_in":300}"#.to_string(),
+                        )
+                    }
+                }
+                _ => (404, "{}".to_string()),
+            })
+        };
+        let sleeps = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sleep_log = Arc::clone(&sleeps);
+        let auth = OidcDeviceAuth::builder()
+            .client_id("questdb")
+            .device_authorization_endpoint(mock.url("/device"))
+            .token_endpoint(mock.url("/token"))
+            .interactive(true)
+            .open_browser(false)
+            .sleep_hook(Arc::new(move |duration| {
+                sleep_log.lock().unwrap().push(duration)
+            }))
+            .build()
+            .expect("build");
+
+        assert_eq!(sign_in_and_token(&auth).unwrap(), "AT-after-408");
+        assert_eq!(polls.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            sleeps.lock().unwrap().as_slice(),
+            &[Duration::from_secs(7)],
+            "HTTP 408 did not honor Retry-After before polling again"
+        );
+    }
+}
+
+#[test]
 fn device_code_lifetime_is_floored() {
     // A hostile/buggy tiny expires_in is raised to the minimum so the flow isn't
     // aborted after a single poll; a huge one is capped; a sane one is unchanged.
@@ -1041,6 +1090,77 @@ fn refresh_transient_error_preserves_token_no_reprompt() {
 }
 
 #[test]
+fn refresh_transient_responses_preserve_structured_metadata() {
+    let cases = [
+        (
+            408,
+            r#"{"error":"temporarily_unavailable","error_description":"request timed out"}"#,
+            Some("temporarily_unavailable"),
+            Some("request timed out"),
+        ),
+        (408, "<html>request timed out</html>", None, None),
+        (
+            503,
+            r#"{"error":"temporarily_unavailable","error_description":"service overloaded"}"#,
+            Some("temporarily_unavailable"),
+            Some("service overloaded"),
+        ),
+        (503, "<html>service unavailable</html>", None, None),
+    ];
+
+    for (status, response_body, expected_error, expected_description) in cases {
+        let device_calls = Arc::new(AtomicUsize::new(0));
+        let refresh_calls = Arc::new(AtomicUsize::new(0));
+        let mock = {
+            let device_calls = Arc::clone(&device_calls);
+            let refresh_calls = Arc::clone(&refresh_calls);
+            let response_body = response_body.to_string();
+            MockServer::start_with_retry_after(11, move |method, path, body| match (method, path) {
+                ("POST", "/device") => {
+                    device_calls.fetch_add(1, Ordering::SeqCst);
+                    (200, device_response())
+                }
+                ("POST", "/token") if body.contains("grant_type=refresh_token") => {
+                    refresh_calls.fetch_add(1, Ordering::SeqCst);
+                    (status, response_body.clone())
+                }
+                ("POST", "/token") => (
+                    200,
+                    r#"{"access_token":"AT-initial","refresh_token":"RT-1","expires_in":300}"#
+                        .to_string(),
+                ),
+                _ => (404, "{}".to_string()),
+            })
+        };
+        let auth = explicit_auth(&mock, false);
+        assert_eq!(sign_in_and_token(&auth).unwrap(), "AT-initial");
+        auth.tokens.lock().unwrap().as_mut().unwrap().expires_at = 1.0;
+
+        let err = auth.token().unwrap_err();
+        assert_eq!(err.kind(), OidcErrorKind::Network);
+        assert_eq!(err.status(), Some(status));
+        assert_eq!(err.retry_after_secs(), Some(11));
+        assert_eq!(err.idp_error(), expected_error);
+        assert_eq!(err.idp_error_description(), expected_description);
+        assert_eq!(refresh_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            device_calls.load(Ordering::SeqCst),
+            1,
+            "a transient refresh response started another device flow"
+        );
+
+        // The crate-wide error retained by Rust transports and exposed through
+        // the C error view must carry the same OIDC details.
+        let public_error: crate::Error = err.into();
+        let preserved = public_error.oidc_error().unwrap();
+        assert_eq!(preserved.status(), Some(status));
+        assert_eq!(preserved.retry_after_secs(), Some(11));
+        assert_eq!(preserved.idp_error(), expected_error);
+        assert_eq!(preserved.idp_error_description(), expected_description);
+    }
+}
+
+#[test]
 fn refresh_rejected_requires_explicit_device_flow() {
     // A 4xx (revoked / expired refresh token) is terminal. A token-provider call
     // must report that interaction is required without starting a device flow;
@@ -1315,6 +1435,31 @@ fn poll_non_json_body_is_terminal_rejection() {
 }
 
 // -- request_device_code error paths -----------------------------------------
+
+#[test]
+fn device_request_http_408_is_retryable_with_json_or_non_json_body() {
+    for (body, expected_error) in [
+        (
+            r#"{"error":"temporarily_unavailable","error_description":"request timed out"}"#,
+            Some("temporarily_unavailable"),
+        ),
+        ("<html>request timed out</html>", None),
+    ] {
+        let response_body = body.to_string();
+        let mock = MockServer::start_with_retry_after(13, move |method, path, _body| {
+            match (method, path) {
+                ("POST", "/device") => (408, response_body.clone()),
+                _ => (404, "{}".to_string()),
+            }
+        });
+        let auth = explicit_auth(&mock, false);
+        let err = auth.sign_in().unwrap_err();
+        assert_eq!(err.kind(), OidcErrorKind::Network);
+        assert_eq!(err.status(), Some(408));
+        assert_eq!(err.retry_after_secs(), Some(13));
+        assert_eq!(err.idp_error(), expected_error);
+    }
+}
 
 #[test]
 fn device_endpoint_rejection_errors() {

@@ -86,9 +86,9 @@ pub struct OidcError {
     error: Option<String>,
     /// The raw `error_description` from an untrusted IdP response (control-stripped).
     error_description: Option<String>,
-    /// The HTTP status behind a non-JSON response, when applicable.
+    /// The HTTP status associated with the IdP response, when available.
     status: Option<u16>,
-    /// A parsed `Retry-After` (delta-seconds) off a 429/503 response, when present.
+    /// A parsed `Retry-After` (delta-seconds) from a transient response, when present.
     retry_after: Option<u64>,
 }
 
@@ -193,12 +193,11 @@ impl OidcError {
         self.error_description.as_deref()
     }
 
-    /// The HTTP status behind a non-JSON response, when applicable.
+    /// The HTTP status associated with the IdP response, when available.
     pub fn status(&self) -> Option<u16> {
         self.status
     }
 
-    /// A parsed `Retry-After` (delta-seconds), when present.
     /// The parsed `Retry-After` delta-seconds value carried by a rate-limit or
     /// transient IdP response, when present.
     pub fn retry_after_secs(&self) -> Option<u64> {
