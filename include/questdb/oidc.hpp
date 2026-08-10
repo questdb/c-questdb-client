@@ -24,6 +24,11 @@
 #include <string_view>
 #include <utility>
 
+namespace questdb
+{
+class pool;
+}
+
 namespace questdb::oidc
 {
 
@@ -277,6 +282,7 @@ private:
 
     ::questdb_oidc_auth* _raw;
     friend class builder;
+    friend class ::questdb::pool;
 };
 
 class builder

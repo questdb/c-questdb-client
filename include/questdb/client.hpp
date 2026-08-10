@@ -108,7 +108,7 @@ public:
     {
         ::questdb_db_connect_options options;
         ::questdb_db_connect_options_init(&options, sizeof options);
-        options.oidc_auth = auth.c_ptr();
+        options.oidc_auth = auth.raw();
         _raw = ::questdb::oidc::detail::wrapped_call(
             ::questdb_db_connect_ex,
             conf.data(),

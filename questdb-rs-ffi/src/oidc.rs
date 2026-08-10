@@ -270,6 +270,9 @@ pub struct questdb_oidc_event {
 
 pub type questdb_oidc_event_cb =
     Option<unsafe extern "C" fn(user_data: *mut c_void, event: *const questdb_oidc_event)>;
+/// Releases callback state after its final owner is dropped. It may run on any
+/// thread and must return normally without unwinding or performing a non-local
+/// jump (for example, C `longjmp`) across the Rust FFI frame.
 pub type questdb_oidc_user_data_release_cb = Option<unsafe extern "C" fn(user_data: *mut c_void)>;
 
 struct CEventHandler {
@@ -312,6 +315,8 @@ impl CEventHandler {
 impl Drop for CEventHandler {
     fn drop(&mut self) {
         if let Some(release) = self.release {
+            // SAFETY: registration transfers ownership of `user_data` and
+            // requires `release` to return normally across this FFI boundary.
             unsafe { release(self.user_data as *mut c_void) };
         }
     }
@@ -721,7 +726,8 @@ pub unsafe extern "C" fn questdb_oidc_builder_default_file_token_store(
 /// callback may run on any token-acquisition thread, is serialized with its
 /// sibling invocations, and must not unwind. Auth reentry from the callback is
 /// rejected before reaching the core acquisition mutex. Final `release` has no
-/// thread-affinity guarantee.
+/// thread-affinity guarantee and must return normally without unwinding or
+/// performing a non-local jump across the Rust FFI frame.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn questdb_oidc_builder_event_handler(
     builder: *mut questdb_oidc_builder,

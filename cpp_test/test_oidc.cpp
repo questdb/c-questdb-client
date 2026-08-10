@@ -117,6 +117,10 @@ TEST_CASE("OIDC C++ wrappers preserve ownership and structured errors")
     CHECK_THROWS_AS(auth.clear(), questdb::oidc::error);
     CHECK_THROWS_AS(auth.config(), questdb::oidc::error);
     CHECK_THROWS_AS(copied_auth = auth, questdb::oidc::error);
+    CHECK_THROWS_AS(
+        (questdb::pool{
+            "ws::addr=127.0.0.1:1;lazy_connect=true;", auth}),
+        questdb::oidc::error);
 
     auto sender_options =
         questdb::ingress::opts::from_conf("https::addr=127.0.0.1:1;");
