@@ -8594,6 +8594,61 @@ mod tests {
     }
 
     #[test]
+    fn reconnect_provider_failure_keeps_sf_frames_replayable() {
+        // A token-provider failure on reconnect is not terminal (the callback can
+        // recover next round), so queued SFA frames must stay persisted and
+        // replayable — never terminalized or dropped. This drives the *actual*
+        // error a provider failure yields (a reclassified SocketError carrying the
+        // original diagnostic) through the reconnect path directly, closing the
+        // gap between `reconnect_retries_provider_failures_...` (classification
+        // only) and `reconnect_policy_exhaustion_keeps_sf_receipts_replayable`
+        // (transport failure only).
+        let provider_error = crate::token_provider::TokenProvider::new(|| {
+            Err::<String, _>(Error::new(ErrorCode::AuthError, "token refresh failed"))
+        })
+        .bearer_header()
+        .unwrap_err();
+        // Sanity: an acquisition failure is retryable, never a terminal AuthError.
+        assert_eq!(provider_error.code(), ErrorCode::SocketError);
+        assert!(!reconnect_error_is_terminal(&provider_error));
+
+        let transport = TestTransport::scripted([Ok(TransportSendResult::Failure(
+            TransportFailure::Retryable(fake_transport_error("outage")),
+        ))])
+        .with_restart_results([Err(DriverError::Transport(provider_error))]);
+        let mut driver = QwpWsCoreTestHarness::from_queue_with_reconnect_policy(
+            memory_queue(options(8, 1024)),
+            transport,
+            ReconnectPolicy::bounded(
+                Duration::from_millis(1),
+                Duration::from_millis(10),
+                Duration::from_millis(10),
+            ),
+            false,
+        );
+        let first = driver.try_submit(b"first").unwrap();
+        let second = driver.try_submit(b"second").unwrap();
+
+        assert!(matches!(
+            driver.drive_once().unwrap(),
+            DriveOutcome::ReconnectDelay { .. }
+        ));
+        std::thread::sleep(Duration::from_millis(20));
+        assert!(matches!(
+            driver.drive_once().unwrap(),
+            DriveOutcome::ReconnectDelay { .. }
+        ));
+
+        // The provider failure did not terminalize the store or drop receipts, and
+        // the queue still accepts frames.
+        assert_eq!(driver.send_core.transport.restart_attempts, 1);
+        assert_eq!(driver.terminal_error(), None);
+        assert!(driver.receipt_status(first).is_pending());
+        assert!(driver.receipt_status(second).is_pending());
+        assert!(driver.try_submit(b"third").is_ok());
+    }
+
+    #[test]
     fn terminal_event_is_emitted_once_on_transition() {
         let mut driver = driver(FakeOrderedServer::scripted([
             FakeSendResult::TerminalFailure,

@@ -272,6 +272,65 @@ fn provider_error_fails_flush() {
 }
 
 #[test]
+fn provider_error_leaves_buffer_intact_for_retry() {
+    // A provider failure fails the flush WITHOUT clearing the buffer, so the exact
+    // same rows re-flush once the provider recovers. Guards the "buffer is left
+    // intact for a retry" contract that `provider_error_fails_flush` only states
+    // in a comment (the resolve happens before the buffer is cleared, at
+    // ingress/sender.rs).
+    let mock = MockServer::start(|_m, path, _b| match path {
+        "/write" => (204, String::new()),
+        _ => (404, "{}".to_string()),
+    });
+    let fail = Arc::new(AtomicBool::new(true));
+    let mut sender = sender_with_provider(&mock, {
+        let fail = Arc::clone(&fail);
+        move || {
+            if fail.load(Ordering::SeqCst) {
+                Err(questdb::Error::new(
+                    questdb::ErrorCode::AuthError,
+                    "token source unavailable",
+                ))
+            } else {
+                Ok::<_, questdb::Error>("recovered-token".to_string())
+            }
+        }
+    })
+    .expect("build sender");
+
+    let mut buffer = sender.new_buffer();
+    buffer
+        .table("trades")
+        .unwrap()
+        .symbol("symbol", "ETH-USD")
+        .unwrap()
+        .column_f64("price", 2615.54)
+        .unwrap()
+        .at(TimestampNanos::now())
+        .unwrap();
+    let len_before = buffer.len();
+    assert!(len_before > 0);
+
+    // Provider fails: retryable SocketError, buffer untouched, nothing on the wire.
+    let err = sender.flush(&mut buffer).unwrap_err();
+    assert_eq!(err.code(), questdb::ErrorCode::SocketError);
+    assert_eq!(
+        buffer.len(),
+        len_before,
+        "a failed-provider flush must not clear or truncate the buffer"
+    );
+    assert!(mock.write_auth_headers().is_empty(), "no request was sent");
+
+    // Provider recovers: the SAME buffer's rows reach the wire and it clears.
+    fail.store(false, Ordering::SeqCst);
+    sender.flush(&mut buffer).expect("retry after recovery");
+    assert!(buffer.is_empty(), "a successful flush clears the buffer");
+    let headers = mock.write_auth_headers();
+    assert_eq!(headers.len(), 1);
+    assert_eq!(headers[0].as_deref(), Some("Bearer recovered-token"));
+}
+
+#[test]
 fn provider_resolved_once_per_flush_across_retries() {
     // The first /write attempt returns a retryable 503; the sender retries
     // internally. The token provider must be pulled once per flush (before the
