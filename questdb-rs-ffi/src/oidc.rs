@@ -1211,6 +1211,93 @@ mod tests {
         assert_eq!(unsafe { questdb_oidc_token_len(token) }, 0);
     }
 
+    #[test]
+    fn null_pointer_arguments_are_rejected_not_dereferenced() {
+        // This crate is `panic = "abort"`, so these NULL guards are the only thing
+        // between a NULL handle (a caller bug or a use-after-free) and a
+        // host-process abort. Each entry point must return its failure sentinel
+        // (and set err_out where it has one) rather than dereferencing NULL.
+        use crate::questdb_error_free;
+
+        // Free functions treat NULL as a harmless no-op: reaching the end of the
+        // test without aborting is the assertion.
+        unsafe {
+            questdb_oidc_builder_free(ptr::null_mut());
+            questdb_oidc_auth_free(ptr::null_mut());
+            questdb_oidc_token_free(ptr::null_mut());
+        }
+
+        // Entry points that report via err_out: NULL handle -> sentinel + error.
+        unsafe {
+            let mut error = ptr::null_mut();
+            assert!(questdb_oidc_builder_build(ptr::null(), &mut error).is_null());
+            assert!(!error.is_null());
+            questdb_error_free(error);
+
+            let mut error = ptr::null_mut();
+            assert!(questdb_oidc_auth_clone(ptr::null(), &mut error).is_null());
+            assert!(!error.is_null());
+            questdb_error_free(error);
+
+            let mut error = ptr::null_mut();
+            assert!(!questdb_oidc_auth_sign_in(ptr::null(), &mut error));
+            assert!(!error.is_null());
+            questdb_error_free(error);
+
+            let mut error = ptr::null_mut();
+            assert!(questdb_oidc_auth_token(ptr::null(), &mut error).is_null());
+            assert!(!error.is_null());
+            questdb_error_free(error);
+
+            let mut error = ptr::null_mut();
+            assert!(!questdb_oidc_auth_clear(ptr::null(), &mut error));
+            assert!(!error.is_null());
+            questdb_error_free(error);
+
+            // A string setter with a NULL builder.
+            let mut error = ptr::null_mut();
+            let value = "x";
+            assert!(!questdb_oidc_builder_client_id(
+                ptr::null_mut(),
+                value.as_ptr() as *const c_char,
+                value.len(),
+                &mut error,
+            ));
+            assert!(!error.is_null());
+            questdb_error_free(error);
+
+            // A NULL string pointer with a non-zero length.
+            let mut error = ptr::null_mut();
+            assert!(questdb_oidc_builder_from_questdb(ptr::null(), 5, &mut error).is_null());
+            assert!(!error.is_null());
+            questdb_error_free(error);
+
+            // Callback registration with a NULL builder.
+            let mut error = ptr::null_mut();
+            assert!(!questdb_oidc_builder_event_handler(
+                ptr::null_mut(),
+                None,
+                ptr::null_mut(),
+                None,
+                &mut error,
+            ));
+            assert!(!error.is_null());
+            questdb_error_free(error);
+        }
+
+        // Out-param queries (no err_out): a NULL handle returns false, and the
+        // handle is checked before the output pointer is touched.
+        unsafe {
+            let mut config = std::mem::zeroed::<questdb_oidc_config_view>();
+            config.struct_size = std::mem::size_of::<questdb_oidc_config_view>();
+            assert!(!questdb_oidc_auth_get_config(ptr::null(), &mut config));
+
+            let mut view = std::mem::zeroed::<questdb_oidc_error_view>();
+            view.struct_size = std::mem::size_of::<questdb_oidc_error_view>();
+            assert!(!questdb_error_oidc_get_view(ptr::null(), &mut view));
+        }
+    }
+
     unsafe extern "C" fn ignore_event(_user_data: *mut c_void, _event: *const questdb_oidc_event) {}
 
     struct FailingClearStore;

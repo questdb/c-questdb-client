@@ -2148,6 +2148,58 @@ fn qwp_ws_schema_reject_terminalizes_in_all_progress_modes() {
 }
 
 #[test]
+fn qwp_ws_token_provider_reaches_upgrade_handshake() {
+    // The rotating Bearer provider is pulled at connect and its token reaches the
+    // WS upgrade as `Authorization: Bearer <tok>` — the ingress-side counterpart of
+    // the HTTP (`provider_token_reaches_wire_and_rotates`) and reader
+    // (`token_provider_pulled_fresh_each_header_resolution`) coverage. Per-connect
+    // resolution is what makes a rotating token rotate across reconnects.
+    let provider_calls = Arc::new(AtomicUsize::new(0));
+    let (port, rx) = spawn_one_response_server(MockQwpResponse::Error {
+        status: QWP_STATUS_SCHEMA_MISMATCH,
+        wire_seq: FIRST_WIRE_SEQUENCE,
+        message: b"n/a",
+    });
+    let builder = SenderBuilder::new(Protocol::Ws, "127.0.0.1", port)
+        .qwp_ws_token_provider({
+            let provider_calls = Arc::clone(&provider_calls);
+            move || {
+                provider_calls.fetch_add(1, Ordering::SeqCst);
+                Ok::<_, crate::Error>("rotating-tok".to_string())
+            }
+        })
+        .unwrap();
+    // Background progress: the drainer connects on its own after the flush.
+    let mut sender = build_qwp_ws_sender_from_builder(ProgressCase::Background, builder);
+
+    let mut buf = sender.new_buffer();
+    buf.table("trades")
+        .unwrap()
+        .column_i64("qty", 1)
+        .unwrap()
+        .at_now()
+        .unwrap();
+    let _ = sender.flush_and_get_fsn(&mut buf);
+
+    let result = rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    let auth = result
+        .request_lines
+        .iter()
+        .find_map(|line| {
+            let (k, v) = line.split_once(':')?;
+            k.trim()
+                .eq_ignore_ascii_case("authorization")
+                .then(|| v.trim().to_string())
+        })
+        .expect("the WS upgrade must carry an Authorization header");
+    assert_eq!(auth, "Bearer rotating-tok");
+    assert!(
+        provider_calls.load(Ordering::SeqCst) >= 1,
+        "the token provider must be pulled at connect"
+    );
+}
+
+#[test]
 fn qwp_ws_terminal_reject_terminalizes_in_all_progress_modes() {
     for progress in [ProgressCase::Background, ProgressCase::Manual] {
         let (port, rx) = spawn_one_response_server(MockQwpResponse::Error {

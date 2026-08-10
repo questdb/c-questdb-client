@@ -57,7 +57,7 @@ impl MockServer {
     where
         H: Fn(&str, &str, &str) -> (u16, String) + Send + Sync + 'static,
     {
-        Self::start_inner(None, handler)
+        Self::start_inner(None, None, handler)
     }
 
     /// Like [`start`], but stamps a `Retry-After: <secs>` header on every response.
@@ -67,10 +67,20 @@ impl MockServer {
     where
         H: Fn(&str, &str, &str) -> (u16, String) + Send + Sync + 'static,
     {
-        Self::start_inner(Some(secs), handler)
+        Self::start_inner(Some(secs), None, handler)
     }
 
-    fn start_inner<H>(retry_after: Option<u64>, handler: H) -> Self
+    /// Like [`start`], but stamps a `Location: <target>` header on every 3xx
+    /// response, so the redirect-follow defense (the client must NOT follow a
+    /// 30x to another host) can be exercised end-to-end.
+    fn start_redirecting<H>(location: impl Into<String>, handler: H) -> Self
+    where
+        H: Fn(&str, &str, &str) -> (u16, String) + Send + Sync + 'static,
+    {
+        Self::start_inner(None, Some(location.into()), handler)
+    }
+
+    fn start_inner<H>(retry_after: Option<u64>, location: Option<String>, handler: H) -> Self
     where
         H: Fn(&str, &str, &str) -> (u16, String) + Send + Sync + 'static,
     {
@@ -84,7 +94,9 @@ impl MockServer {
             std::thread::spawn(move || {
                 while !shutdown.load(Ordering::Relaxed) {
                     match listener.accept() {
-                        Ok((stream, _)) => handle_conn(stream, &*handler, retry_after),
+                        Ok((stream, _)) => {
+                            handle_conn(stream, &*handler, retry_after, location.as_deref())
+                        }
                         Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                             std::thread::sleep(Duration::from_millis(1));
                         }
@@ -114,8 +126,12 @@ impl Drop for MockServer {
     }
 }
 
-fn handle_conn<H>(mut stream: TcpStream, handler: &H, retry_after: Option<u64>)
-where
+fn handle_conn<H>(
+    mut stream: TcpStream,
+    handler: &H,
+    retry_after: Option<u64>,
+    location: Option<&str>,
+) where
     H: Fn(&str, &str, &str) -> (u16, String),
 {
     stream.set_nonblocking(false).ok();
@@ -170,8 +186,14 @@ where
         Some(secs) => format!("Retry-After: {secs}\r\n"),
         None => String::new(),
     };
+    // Emit a Location only on a 3xx, so a redirect-follow defense test can point
+    // the token endpoint's 30x at a sink and prove the client never chases it.
+    let location_header = match location {
+        Some(loc) if (300..400).contains(&status) => format!("Location: {loc}\r\n"),
+        _ => String::new(),
+    };
     let response = format!(
-        "HTTP/1.1 {status} MOCK\r\nContent-Type: application/json\r\n{retry_after_header}Content-Length: {}\r\nConnection: close\r\n\r\n{}",
+        "HTTP/1.1 {status} MOCK\r\nContent-Type: application/json\r\n{retry_after_header}{location_header}Content-Length: {}\r\nConnection: close\r\n\r\n{}",
         json.len(),
         json
     );
@@ -509,6 +531,19 @@ fn device_code_lifetime_is_floored() {
     assert_eq!(clamp_lifetime(None), DEFAULT_DEVICE_CODE_LIFETIME);
     assert_eq!(clamp_lifetime(Some(600)), 600);
     assert_eq!(clamp_lifetime(Some(100_000)), MAX_DEVICE_CODE_LIFETIME);
+}
+
+#[test]
+fn poll_interval_is_floored_and_capped() {
+    // A hostile/buggy interval is floored to MIN_POLL_INTERVAL so a 0 or negative
+    // value can't drive a tight poll-flood against the IdP, and capped at
+    // MAX_POLL_INTERVAL; a sane value is unchanged.
+    assert_eq!(clamp_interval(-5), MIN_POLL_INTERVAL);
+    assert_eq!(clamp_interval(0), MIN_POLL_INTERVAL);
+    assert_eq!(clamp_interval(1), MIN_POLL_INTERVAL);
+    assert_eq!(clamp_interval(MIN_POLL_INTERVAL as i64), MIN_POLL_INTERVAL);
+    assert_eq!(clamp_interval(30), 30);
+    assert_eq!(clamp_interval(100_000), MAX_POLL_INTERVAL);
 }
 
 #[test]
@@ -1486,6 +1521,43 @@ fn poll_redirect_is_terminal() {
 }
 
 #[test]
+fn poll_does_not_follow_redirect_to_another_host() {
+    // A 30x from the token endpoint must NOT be followed. Only the original URL is
+    // vetted; following a redirect could resend the device_code / refresh_token
+    // (POSTed in the request body) to another origin, even downgrading to
+    // plaintext. `HttpClient` sets max_redirects(0), so the 30x is returned as-is
+    // and the sink is never contacted. Without that defense the client would chase
+    // the Location and accept the sink's response as a token.
+    let sink_hits = Arc::new(AtomicUsize::new(0));
+    let sink = {
+        let sink_hits = Arc::clone(&sink_hits);
+        MockServer::start(move |_method, _path, _body| {
+            sink_hits.fetch_add(1, Ordering::SeqCst);
+            (
+                200,
+                r#"{"access_token":"STOLEN","expires_in":300}"#.to_string(),
+            )
+        })
+    };
+    let sink_url = sink.url("/steal");
+    let mock =
+        MockServer::start_redirecting(sink_url, |method, path, _body| match (method, path) {
+            ("POST", "/device") => (200, device_response()),
+            ("POST", "/token") => (302, "{}".to_string()),
+            _ => (404, "{}".to_string()),
+        });
+    let auth = explicit_auth(&mock, false);
+    let err = auth.sign_in().unwrap_err();
+    assert_eq!(err.kind(), OidcErrorKind::DeviceFlow);
+    assert_eq!(err.status(), Some(302));
+    assert_eq!(
+        sink_hits.load(Ordering::SeqCst),
+        0,
+        "the redirect target must never be contacted — credentials must not be resent"
+    );
+}
+
+#[test]
 fn poll_non_json_body_is_terminal_rejection() {
     // A non-JSON 4xx (a WAF / proxy error page) at the token endpoint is a
     // terminal rejection — a conformant poll reply is always JSON.
@@ -2234,6 +2306,48 @@ fn tampered_persisted_token_is_rejected_on_load() {
     auth.sign_in().unwrap();
     assert_eq!(auth.token().unwrap(), "AT-initial");
     assert_eq!(device_calls.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn tampered_persisted_refresh_token_is_dropped_on_load() {
+    // A persisted refresh_token carrying a CR/LF is dropped by is_safe_token_str on
+    // load, just like the served token, so it is never submitted to the token
+    // endpoint. With an expired access token and no usable refresh token, token()
+    // reports InteractionRequired instead of refreshing with the tampered value.
+    let refresh_calls = Arc::new(AtomicUsize::new(0));
+    let mock = {
+        let refresh_calls = Arc::clone(&refresh_calls);
+        MockServer::start(move |method, path, body| match (method, path) {
+            ("POST", "/token") if body.contains("grant_type=refresh_token") => {
+                refresh_calls.fetch_add(1, Ordering::SeqCst);
+                (
+                    200,
+                    r#"{"access_token":"AT-refreshed","expires_in":300}"#.to_string(),
+                )
+            }
+            _ => (404, "{}".to_string()),
+        })
+    };
+    let dir = TempDir::new().unwrap();
+    let writer = FileTokenStore::at(dir.path());
+    let key = key_for(&mock);
+    let tampered = PersistedToken::new(
+        Some("AT-expired".to_string()),
+        None,
+        Some("RT-1\r\nInjected: header".to_string()), // control chars in the refresh token
+        1.0,                                          // expired access token
+        300.0,
+    );
+    writer.save(&key, &tampered).unwrap();
+
+    let auth = auth_with_store(&mock, dir.path());
+    let err = auth.token().unwrap_err();
+    assert_eq!(err.kind(), OidcErrorKind::InteractionRequired);
+    assert_eq!(
+        refresh_calls.load(Ordering::SeqCst),
+        0,
+        "a tampered refresh token must never be submitted to the token endpoint"
+    );
 }
 
 #[test]

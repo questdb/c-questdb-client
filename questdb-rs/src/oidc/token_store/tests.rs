@@ -302,6 +302,33 @@ fn corrupt_wrong_version_and_non_object_ignored() {
     }
 }
 
+#[test]
+fn garbage_millis_field_reads_back_as_expired() {
+    let dir = TempDir::new().unwrap();
+    let store = FileTokenStore::at(dir.path());
+    let key = test_key();
+    // Start from a valid entry so the identity fingerprint still matches, then
+    // corrupt only the numeric millis fields with non-numeric junk (a hand-edited
+    // or hostile file). `millis_to_seconds` maps them to 0.0, so the entry loads
+    // but reads back as expired and is never served as a live token.
+    store.save(&key, &test_token()).unwrap();
+    let path = store.token_file(&key);
+    let mut obj: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    obj["expires_at_millis"] = serde_json::Value::from("garbage");
+    obj["token_ttl_millis"] = serde_json::Value::from("nope");
+    std::fs::write(&path, serde_json::to_vec(&obj).unwrap()).unwrap();
+
+    let loaded = store.load(&key).unwrap().unwrap();
+    assert_eq!(loaded.access_token(), Some("AT-1"));
+    assert_eq!(
+        loaded.expires_at(),
+        0.0,
+        "a non-numeric expires_at_millis must read as expired"
+    );
+    assert_eq!(loaded.token_ttl(), 0.0);
+}
+
 // -- atomicity + permissions ------------------------------------------------
 
 #[test]
@@ -348,6 +375,46 @@ fn refuses_a_symlinked_store_directory() {
     let store = FileTokenStore::at(&link);
     // save must refuse to operate through the symlinked leaf (a redirect risk).
     assert!(store.save(&test_key(), &test_token()).is_err());
+}
+
+#[cfg(unix)]
+#[test]
+fn non_regular_token_file_is_ignored_not_hung() {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+    let dir = TempDir::new().unwrap();
+    let store = FileTokenStore::at(dir.path());
+    let key = test_key();
+    let path = store.token_file(&key);
+    let c_path = CString::new(path.as_os_str().as_bytes()).unwrap();
+    // A FIFO swapped in at the token path: open(O_RDONLY) WITHOUT O_NONBLOCK would
+    // block forever waiting for a writer. `open_regular_bounded` opens with
+    // O_NONBLOCK and rejects a non-regular file, so this is treated as absent
+    // rather than hanging the caller's thread.
+    assert_eq!(
+        unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) },
+        0,
+        "mkfifo failed"
+    );
+    assert!(store.load(&key).unwrap().is_none());
+}
+
+#[cfg(unix)]
+#[test]
+fn preexisting_loose_permissions_directory_is_retightened() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = TempDir::new().unwrap();
+    // A pre-existing, world-accessible store directory...
+    std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o777)).unwrap();
+    let store = FileTokenStore::at(dir.path());
+    store.save(&test_key(), &test_token()).unwrap();
+    // ...is re-asserted to owner-only (0700) by ensure_directory, so a token file
+    // is never left under a group/world-readable directory.
+    let mode = std::fs::metadata(dir.path()).unwrap().permissions().mode() & 0o777;
+    assert_eq!(
+        mode, 0o700,
+        "a pre-existing loose-perms dir must be tightened"
+    );
 }
 
 #[test]
