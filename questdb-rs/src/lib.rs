@@ -35,10 +35,14 @@ mod gai;
 #[cfg(any(feature = "_sender-qwp-ws", feature = "_egress"))]
 mod ws;
 
-// A caller-supplied rotating Bearer-token provider for the QWP/WS ingress
-// sender and the egress reader (the ILP/HTTP sender has its own in
-// `ingress::sender::http`). Lets an OIDC token be refreshed at each (re)connect.
-#[cfg(any(feature = "_sender-qwp-ws", feature = "_egress"))]
+// A caller-supplied rotating Bearer-token provider shared by the ILP/HTTP
+// sender, the QWP/WS ingress sender, and the egress reader. Lets an OIDC token
+// be refreshed at each (re)connect (or, for HTTP, resolved fresh each flush).
+#[cfg(any(
+    feature = "_sender-http",
+    feature = "_sender-qwp-ws",
+    feature = "_egress"
+))]
 mod token_provider;
 
 // JKS / PKCS#12 trust-store loader for `tls_roots_password`. Pulled
