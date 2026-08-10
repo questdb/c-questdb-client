@@ -218,12 +218,15 @@ public:
         detail::wrapped_call(::questdb_oidc_auth_sign_in, raw());
     }
     /**
-     * Return a cached, persisted, or silently refreshed token. Never prompts;
-     * throws oidc::error with interaction_required when sign_in() is needed.
+     * Return a cached, persisted, or silently refreshed QuestDB bearer token.
+     * This is the access token by default, or the ID token when
+     * `groups_in_token` is enabled. Never prompts; throws oidc::error with
+     * interaction_required when sign_in() is needed.
      */
-    token access_token() const
+    ::questdb::oidc::token token() const
     {
-        return token{detail::wrapped_call(::questdb_oidc_auth_token, raw())};
+        return ::questdb::oidc::token{
+            detail::wrapped_call(::questdb_oidc_auth_token, raw())};
     }
 
     /**

@@ -236,7 +236,9 @@ bool questdb_oidc_auth_sign_in(
 
 /**
  * Return an owned copy of a cached, persisted, or silently refreshed token.
- * Never starts an interactive device flow. Returns an OIDC
+ * Returns the access token by default, or the ID token when the auth
+ * configuration has `groups_in_token` enabled. Never starts an interactive
+ * device flow. Returns an OIDC
  * QUESTDB_OIDC_ERROR_INTERACTION_REQUIRED error when explicit sign-in is needed,
  * including when another sign-in is in progress and no valid token is cached.
  */

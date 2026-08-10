@@ -43,12 +43,41 @@ struct has_oidc_c_ptr<T, std::void_t<decltype(std::declval<T>().c_ptr())>>
 {
 };
 
+template <typename T, typename = void>
+struct has_oidc_auth_token : std::false_type
+{
+};
+
+template <typename T>
+struct has_oidc_auth_token<T, std::void_t<decltype(std::declval<T>().token())>>
+    : std::true_type
+{
+};
+
+template <typename T, typename = void>
+struct has_oidc_access_token : std::false_type
+{
+};
+
+template <typename T>
+struct has_oidc_access_token<
+    T,
+    std::void_t<decltype(std::declval<T>().access_token())>> : std::true_type
+{
+};
+
 static_assert(has_oidc_token_view<const questdb::oidc::token&>::value);
 static_assert(!has_oidc_token_view<questdb::oidc::token&&>::value);
 static_assert(has_oidc_config<const questdb::oidc::device_auth&>::value);
 static_assert(!has_oidc_config<questdb::oidc::device_auth&&>::value);
 static_assert(has_oidc_c_ptr<const questdb::oidc::device_auth&>::value);
 static_assert(!has_oidc_c_ptr<questdb::oidc::device_auth&&>::value);
+static_assert(has_oidc_auth_token<const questdb::oidc::device_auth&>::value);
+static_assert(!has_oidc_access_token<const questdb::oidc::device_auth&>::value);
+static_assert(
+    std::is_same_v<
+        decltype(std::declval<const questdb::oidc::device_auth&>().token()),
+        questdb::oidc::token>);
 
 static_assert(!std::is_copy_constructible_v<questdb::oidc::event_view>);
 static_assert(!std::is_copy_assignable_v<questdb::oidc::event_view>);
@@ -103,17 +132,19 @@ TEST_CASE("OIDC C++ wrappers preserve ownership and structured errors")
     builder.client_id("questdb-cpp")
         .scope("openid profile")
         .token_endpoint("https://idp.example/token")
-        .device_authorization_endpoint("https://idp.example/device");
+        .device_authorization_endpoint("https://idp.example/device")
+        .groups_in_token(true);
     auto auth = builder.build();
     auto copied_auth = auth;
     const auto config = copied_auth.config();
     CHECK(config.client_id == std::string_view{"questdb-cpp"});
     CHECK(config.scope == std::string_view{"openid profile"});
+    CHECK(config.groups_in_token);
 
     auto moved_auth = std::move(auth);
     CHECK_THROWS_AS(questdb::oidc::device_auth{auth}, questdb::oidc::error);
     CHECK_THROWS_AS(auth.sign_in(), questdb::oidc::error);
-    CHECK_THROWS_AS(auth.access_token(), questdb::oidc::error);
+    CHECK_THROWS_AS(auth.token(), questdb::oidc::error);
     CHECK_THROWS_AS(auth.clear(), questdb::oidc::error);
     CHECK_THROWS_AS(auth.config(), questdb::oidc::error);
     CHECK_THROWS_AS(copied_auth = auth, questdb::oidc::error);
