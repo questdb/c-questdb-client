@@ -1301,8 +1301,11 @@ impl OidcDeviceAuth {
             ("grant_type", REFRESH_GRANT),
             ("refresh_token", refresh_token),
             ("client_id", self.config.client_id.as_str()),
-            ("scope", self.config.scope.as_str()),
         ];
+        // Deliberately omit `scope`. RFC 6749 section 6 defines omission as
+        // requesting the scope of the original grant; sending the configured
+        // scope here could exceed a narrower scope actually granted by the IdP
+        // and make an otherwise valid refresh token fail with `invalid_scope`.
         if let Some(audience) = &self.config.audience {
             form.push(("audience", audience.as_str()));
         }

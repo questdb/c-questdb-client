@@ -32,7 +32,7 @@ use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Barrier};
+use std::sync::{Arc, Barrier, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
@@ -620,6 +620,72 @@ fn silent_refresh_without_reprompt() {
             .refresh_token
             .as_deref(),
         Some("RT-1")
+    );
+}
+
+#[test]
+fn refresh_request_omits_scope_when_grant_is_narrower() {
+    let refresh_body = Arc::new(Mutex::new(None));
+    let mock = {
+        let refresh_body = Arc::clone(&refresh_body);
+        MockServer::start(move |method, path, body| {
+            match (method, path) {
+            ("POST", "/device") => (200, device_response()),
+            ("POST", "/token") if body.contains("grant_type=refresh_token") => {
+                *refresh_body.lock().unwrap() = Some(body.to_string());
+                (
+                    200,
+                    r#"{"access_token":"AT-refreshed","expires_in":300}"#.to_string(),
+                )
+            }
+            ("POST", "/token") => (
+                200,
+                r#"{"access_token":"AT-initial","refresh_token":"RT-1","expires_in":300,"scope":"openid offline_access"}"#
+                    .to_string(),
+            ),
+            _ => (404, "{}".to_string()),
+        }
+        })
+    };
+    let auth = OidcDeviceAuth::builder()
+        .client_id("questdb")
+        .device_authorization_endpoint(mock.url("/device"))
+        .token_endpoint(mock.url("/token"))
+        .scope("openid profile offline_access")
+        .interactive(true)
+        .open_browser(false)
+        .timeout(Duration::from_secs(5))
+        .sleep_hook(no_sleep())
+        .build()
+        .expect("build auth");
+
+    assert_eq!(sign_in_and_token(&auth).unwrap(), "AT-initial");
+    assert_eq!(
+        auth.tokens
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .scope
+            .as_deref(),
+        Some("openid offline_access"),
+        "the IdP's narrower granted scope must be recorded"
+    );
+    auth.tokens.lock().unwrap().as_mut().unwrap().expires_at = 1.0;
+    assert_eq!(auth.token().unwrap(), "AT-refreshed");
+
+    let body = refresh_body
+        .lock()
+        .unwrap()
+        .clone()
+        .expect("refresh request was captured");
+    let fields: Vec<&str> = body.split('&').collect();
+    assert!(fields.contains(&"grant_type=refresh_token"));
+    assert!(fields.contains(&"refresh_token=RT-1"));
+    assert!(fields.contains(&"client_id=questdb"));
+    assert!(
+        !fields.iter().any(|field| field.starts_with("scope=")),
+        "refresh request must omit scope and reuse the original grant; body={body}"
     );
 }
 
