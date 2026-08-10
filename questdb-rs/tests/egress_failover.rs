@@ -2793,6 +2793,86 @@ fn initial_connect_bails_immediately_on_auth_error() {
 }
 
 #[test]
+fn initial_provider_failure_does_not_dial_any_endpoint() {
+    let srv_a = MockServer::start(vec![happy_script(ServerRole::Standalone, "a")]);
+    let srv_b = MockServer::start(vec![happy_script(ServerRole::Standalone, "b")]);
+    let provider_calls = Arc::new(AtomicUsize::new(0));
+    let conf = format!("ws::addr={}", build_addr_list(&[&srv_a, &srv_b]));
+    let cfg = questdb::egress::ReaderConfig::from_conf(&conf)
+        .unwrap()
+        .token_provider({
+            let provider_calls = Arc::clone(&provider_calls);
+            move || {
+                provider_calls.fetch_add(1, Ordering::SeqCst);
+                Err::<String, _>(questdb::Error::new(
+                    ErrorCode::SocketError,
+                    "provider unavailable",
+                ))
+            }
+        })
+        .unwrap();
+
+    let err = match Reader::from_config(&cfg) {
+        Err(err) => err,
+        Ok(_) => panic!("provider failure must abort the initial endpoint walk"),
+    };
+
+    assert_eq!(err.code(), ErrorCode::SocketError);
+    assert!(err.msg().contains("provider unavailable"));
+    assert_eq!(provider_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(srv_a.accepts(), 0, "provider failure must precede A's dial");
+    assert_eq!(srv_b.accepts(), 0, "provider failure must precede B's dial");
+}
+
+#[test]
+fn reconnect_provider_failure_is_resolved_once_per_walk_without_dials() {
+    let srv_a = MockServer::start(vec![drop_after_query_script(ServerRole::Standalone, "a")]);
+    let srv_b = MockServer::start(vec![happy_script(ServerRole::Standalone, "b")]);
+    let provider_calls = Arc::new(AtomicUsize::new(0));
+    let conf = format!(
+        "ws::addr={};failover_max_attempts=3;\
+         failover_backoff_initial_ms=0;failover_backoff_max_ms=0",
+        build_addr_list(&[&srv_a, &srv_b])
+    );
+    let cfg = questdb::egress::ReaderConfig::from_conf(&conf)
+        .unwrap()
+        .token_provider({
+            let provider_calls = Arc::clone(&provider_calls);
+            move || {
+                let call = provider_calls.fetch_add(1, Ordering::SeqCst);
+                if call == 0 {
+                    Ok("initial-token".to_string())
+                } else {
+                    Err(questdb::Error::new(
+                        ErrorCode::SocketError,
+                        "provider unavailable",
+                    ))
+                }
+            }
+        })
+        .unwrap();
+    let mut reader = Reader::from_config(&cfg).expect("initial provider call succeeds");
+    let mut cursor = reader.prepare("select 1").execute().expect("execute");
+
+    match cursor.next_batch() {
+        Err(_) => {}
+        Ok(_) => panic!("reconnect provider failures must exhaust the retry budget"),
+    }
+
+    assert_eq!(
+        provider_calls.load(Ordering::SeqCst),
+        3,
+        "one initial acquisition plus one for each of two reconnect walks"
+    );
+    assert_eq!(srv_a.accepts(), 1, "only the initial connection reaches A");
+    assert_eq!(
+        srv_b.accepts(),
+        0,
+        "failed reconnect acquisitions must not create sockets to B"
+    );
+}
+
+#[test]
 fn initial_connect_auth_terminal_regardless_of_position_in_addr_list() {
     // Counterpart pinning: the bail-on-AuthError invariant holds even
     // when a healthy endpoint precedes the auth-rejecting one in the

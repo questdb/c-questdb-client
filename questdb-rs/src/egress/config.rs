@@ -499,9 +499,10 @@ pub struct ReaderConfig {
     /// follow the master across zones. Failover.md §1.1 / §2.
     pub zone: Option<String>,
     pub auth: AuthMode,
-    /// A rotating Bearer-token source pulled at each (re)connect (e.g. from
-    /// `oidc::OidcDeviceAuth`). Mutually exclusive with [`auth`](Self::auth); set
-    /// via [`token_provider`](Self::token_provider) and never from a conf string.
+    /// A rotating Bearer-token source pulled once per initial/reconnect endpoint
+    /// walk (e.g. from `oidc::OidcDeviceAuth`). Mutually exclusive with
+    /// [`auth`](Self::auth); set via [`token_provider`](Self::token_provider) and
+    /// never from a conf string.
     pub(crate) token_provider: Option<crate::token_provider::TokenProvider>,
     pub tls_verify: TlsVerify,
     pub tls_ca: CertificateAuthority,
@@ -1068,11 +1069,13 @@ impl ReaderConfig {
     /// silent override, mirroring
     /// [`SenderBuilder::qwp_ws_token_provider`](crate::ingress::SenderBuilder::qwp_ws_token_provider).
     ///
-    /// The provider is called at each connect and reconnect, so a long-lived
-    /// reader keeps working as the token silently refreshes / rotates. The token
-    /// is sent as the `Authorization: Bearer <token>` handshake header; a token
-    /// with a non-printable-ASCII character (a header-injection vector) is
-    /// rejected, and a provider error fails that connection attempt. Provider
+    /// The provider is called once before each initial-connect or reconnect
+    /// endpoint walk, so a long-lived reader keeps working as the token silently
+    /// refreshes / rotates. The acquired token is reused for every endpoint tried
+    /// within that walk; a later reconnect round pulls a fresh one. The token is
+    /// sent as the `Authorization: Bearer <token>` handshake header; a token with
+    /// a non-printable-ASCII character (a header-injection vector) is rejected,
+    /// and a provider error fails that walk before DNS or TCP work. Provider
     /// acquisition failures are retryable because the callback may recover on its
     /// next invocation; a server rejection of an acquired token remains terminal.
     /// In unwind-enabled builds, a callback panic is contained and treated as a
@@ -1315,8 +1318,8 @@ impl ReaderConfig {
         if self.max_batch_rows > 0 {
             headers.push(("X-QWP-Max-Batch-Rows", self.max_batch_rows.to_string()));
         }
-        // A rotating token provider (e.g. OIDC), pulled fresh here on every
-        // (re)connect, overrides any static basic/token auth. `bearer_header`
+        // A rotating token provider (e.g. OIDC), pulled fresh here once per
+        // endpoint walk, overrides any static basic/token auth. `bearer_header`
         // classifies every provider acquisition/validation failure as retryable:
         // the callback can recover on its next invocation. Preserve that code
         // across the crate→egress error boundary so failover polls it again.
@@ -1699,9 +1702,10 @@ mod tests {
     }
 
     #[test]
-    fn token_provider_pulled_fresh_each_connect() {
-        // Without static auth the provider is accepted and pulled fresh on each
-        // (re)connect, so a rotated token reaches the handshake.
+    fn token_provider_pulled_fresh_each_header_resolution() {
+        // Without static auth the provider is accepted and pulled fresh for each
+        // endpoint walk's header resolution, so a rotated token reaches the next
+        // reconnect walk.
         let counter = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let c = ReaderConfig::from_conf("wss::addr=h:1")
             .unwrap()
@@ -1716,7 +1720,7 @@ mod tests {
         let h = c.upgrade_headers().unwrap();
         let auth = h.iter().find(|(n, _)| *n == "Authorization").unwrap();
         assert_eq!(auth.1, "Bearer tok-0");
-        // Re-invoked on the next (re)connect.
+        // Re-invoked for the next endpoint walk.
         let h = c.upgrade_headers().unwrap();
         let auth = h.iter().find(|(n, _)| *n == "Authorization").unwrap();
         assert_eq!(auth.1, "Bearer tok-1");

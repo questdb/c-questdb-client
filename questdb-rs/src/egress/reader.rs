@@ -332,8 +332,12 @@ impl Reader {
     /// error carrying the observed role + zone via `UpgradeReject` is
     /// surfaced so the tracker can classify identically to a `421`
     /// upgrade reject.
-    fn connect_endpoint(cfg: &ReaderConfig, idx: usize) -> Result<TransportSession> {
-        let mut transport = WsTransport::connect_to(cfg, idx).map_err(|e| {
+    fn connect_endpoint(
+        cfg: &ReaderConfig,
+        idx: usize,
+        upgrade_headers: &[(&'static str, String)],
+    ) -> Result<TransportSession> {
+        let mut transport = WsTransport::connect_to(cfg, idx, upgrade_headers).map_err(|e| {
             // Prepend the endpoint so a connect/handshake/auth failure
             // names the host it came from. Without this, aggregated
             // multi-endpoint diagnostics surface only the tungstenite
@@ -3093,6 +3097,13 @@ fn walk_via_tracker(
     // reset per failover.md §11.9.2). The fall-through pass below is
     // what re-evaluates stale classifications.
     tracker.begin_round(false);
+    // Resolve the fallible token provider once for this whole endpoint walk,
+    // before DNS or TCP work. A successful token is cluster-wide and can be
+    // reused across endpoints in the walk; a failed provider must not create
+    // and immediately discard one socket per endpoint (or twice per endpoint
+    // when the reconnect fall-through pass runs). The next outer reconnect
+    // round calls this function again and therefore polls the provider afresh.
+    let upgrade_headers = cfg.upgrade_headers()?;
     let mut last_role_mismatch: Option<Error> = None;
     let mut last_transport_err: Option<Error> = None;
     let mut retried_after_reset = false;
@@ -3114,7 +3125,7 @@ fn walk_via_tracker(
             }
         };
         dials = dials.saturating_add(1);
-        match Reader::connect_endpoint(cfg.as_ref(), idx) {
+        match Reader::connect_endpoint(cfg.as_ref(), idx, &upgrade_headers) {
             Ok(session) => {
                 // Update zone tier from `SERVER_INFO.zone_id` when the
                 // server advertised one (gated by `CAP_ZONE`). `record_zone`
