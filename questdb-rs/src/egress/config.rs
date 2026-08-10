@@ -1301,7 +1301,11 @@ impl ReaderConfig {
     /// Build the negotiation headers as `(name, value)` pairs in the order
     /// the Java reference client emits them. Authorization is appended last
     /// when an auth mode is set.
-    pub fn upgrade_headers(&self) -> Result<Vec<(&'static str, String)>> {
+    ///
+    /// Crate-internal: this is the reader's handshake-header builder (resolving a
+    /// rotating token provider, hence fallible), not part of the public
+    /// `ReaderConfig` surface — callers use [`Reader::from_config`](crate::egress::Reader::from_config).
+    pub(crate) fn upgrade_headers(&self) -> Result<Vec<(&'static str, String)>> {
         let mut headers = Vec::with_capacity(8);
         headers.push(("X-QWP-Max-Version", self.max_version.to_string()));
         if let Some(id) = &self.client_id {
