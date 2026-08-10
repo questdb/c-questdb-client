@@ -142,6 +142,7 @@ typedef struct questdb_db_connect_options
  * sender is currently closing and has not yet released its slot lock. An
  * unsuffixed slot `<sf_dir>/<sender_id>` is not pool-managed; it is treated
  * like any other orphan slot and is drained only when `drain_orphans=on`.
+ * `conf_len` must not exceed `QUESTDB_CONFIG_MAX_BYTES`.
  */
 QUESTDB_CLIENT_API
 questdb_db* questdb_db_connect(
@@ -162,6 +163,7 @@ void questdb_db_connect_options_init(
  * Provider calls may load or silently refresh a token but never start an
  * interactive device flow. Call questdb_oidc_auth_sign_in before opening the
  * pool; otherwise token acquisition reports InteractionRequired.
+ * `conf_len` must not exceed `QUESTDB_CONFIG_MAX_BYTES`.
  */
 QUESTDB_CLIENT_API
 questdb_db* questdb_db_connect_ex(
@@ -231,6 +233,7 @@ size_t questdb_db_reap_idle(questdb_db* db);
  * `line_sender_opts_connection_event_handler`. */
 
 /** `questdb_db_connect` with a connection lifecycle listener.
+ * `conf_len` must not exceed `QUESTDB_CONFIG_MAX_BYTES`.
  * `inbox_capacity` of 0 selects the default (64) and must not exceed
  * `QUESTDB_DB_MAX_CALLBACK_INBOX_CAPACITY`. The caller guarantees
  * `user_data` is safe to use from the dispatcher thread until
@@ -247,7 +250,8 @@ questdb_db* questdb_db_connect_with_event_handler(
     questdb_error** err_out);
 
 /** Like `questdb_db_connect_with_event_handler`, additionally registering a
- * server-rejection handler. Either callback may be NULL: a NULL
+ * server-rejection handler. `conf_len` must not exceed
+ * `QUESTDB_CONFIG_MAX_BYTES`. Either callback may be NULL: a NULL
  * `event_callback` disables connection lifecycle events; a NULL
  * `rejection_callback` selects the default of logging every rejection (warn
  * for retriable policies — the frames are replayed, not lost — error for

@@ -321,13 +321,13 @@ fn cancel_synchronous_worker_io(thread: &thread::JoinHandle<()>) -> std::io::Res
 ///
 /// `Foreground` is a caller-thread initial connect: the user is synchronously
 /// waiting and no bounded-shutdown deadline depends on the dial returning.
-/// `ForegroundBounded` is foreground work whose dial a bounded wait does
-/// depend on -- I/O-runner reconnects and the async initial-connect retry
-/// loop (both raced by the 30s runner shutdown), and manual-mode reconnects
-/// inside `drive_once`. Only orphan-slot drainers use `BackgroundDrainer`,
-/// matching Java's background-connect policy; a transport stores the kind of
-/// its lifecycle (`Foreground`/`BackgroundDrainer`) and derives the bounded
-/// variant per reconnect via [`Self::for_reconnect`].
+/// `ForegroundBounded` is foreground work whose connection setup a bounded
+/// wait depends on -- I/O-runner reconnects and the async initial-connect
+/// retry loop (both raced by the 30s runner shutdown), and manual-mode
+/// reconnects inside `drive_once`. Only orphan-slot drainers use
+/// `BackgroundDrainer`, matching Java's background-connect policy; a transport
+/// stores the kind of its lifecycle (`Foreground`/`BackgroundDrainer`) and
+/// derives the bounded variant per reconnect via [`Self::for_reconnect`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum QwpWsConnectKind {
     Foreground,
@@ -3342,7 +3342,18 @@ pub(crate) fn connect_qwp_ws_endpoint_round<A: QwpWsHealthAccess>(
     // store-and-forward frames must remain drainable. Server authentication
     // rejections happen later in the handshake and remain terminal AuthErrors.
     let provided_header = match qwp_ws.token_provider.as_ref() {
-        Some(provider) => Some(provider.bearer_header()?),
+        Some(provider) => Some(if connect_kind.bounded_dial() {
+            match traffic_gate {
+                // Arbitrary synchronous providers cannot be cancelled. Isolate
+                // runner-owned acquisition so shutdown can abandon the result
+                // and release the publication store / slot lock immediately.
+                // The provider thread retains only its closure until it returns.
+                Some(gate) => provider.bearer_header_isolated_until(|| gate.is_shutdown())?,
+                None => provider.bearer_header()?,
+            }
+        } else {
+            provider.bearer_header()?
+        }),
         None => None,
     };
     let auth_header = provided_header.as_deref().or(auth_header);
@@ -4464,6 +4475,65 @@ mod tests {
         .unwrap()
         .qwp_ws
         .unwrap()
+    }
+
+    #[cfg(any(unix, windows))]
+    struct BlockedProviderControl {
+        started: mpsc::Receiver<()>,
+        release: mpsc::Sender<()>,
+        finished: mpsc::Receiver<()>,
+    }
+
+    #[cfg(any(unix, windows))]
+    impl BlockedProviderControl {
+        fn wait_until_started(&self) {
+            self.started
+                .recv_timeout(Duration::from_secs(5))
+                .expect("token provider did not start");
+        }
+
+        fn release_and_wait(self) {
+            self.release.send(()).unwrap();
+            self.finished
+                .recv_timeout(Duration::from_secs(5))
+                .expect("token provider did not finish after release");
+        }
+    }
+
+    #[cfg(any(unix, windows))]
+    fn qwp_ws_config_with_blocked_provider(
+        sf_dir: &std::path::Path,
+        sender_id: &str,
+    ) -> (QwpWsConfig, BlockedProviderControl) {
+        let (started_tx, started_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let (finished_tx, finished_rx) = mpsc::channel();
+        let release_rx = Mutex::new(release_rx);
+        let qwp_ws = crate::ingress::SenderBuilder::from_conf(format!(
+            "ws::addr=127.0.0.1:1;sf_dir={};sender_id={sender_id};\
+             sf_max_segment_bytes=4096;sf_max_total_bytes=8192;\
+             initial_connect_retry=async;",
+            sf_dir.display()
+        ))
+        .unwrap()
+        .qwp_ws_token_provider(move || {
+            let _ = started_tx.send(());
+            release_rx.lock().unwrap().recv().unwrap();
+            let _ = finished_tx.send(());
+            Ok::<_, crate::Error>("eventual-token".to_string())
+        })
+        .unwrap()
+        .qwp_ws
+        .unwrap();
+
+        (
+            qwp_ws,
+            BlockedProviderControl {
+                started: started_rx,
+                release: release_tx,
+                finished: finished_rx,
+            },
+        )
     }
 
     #[test]
@@ -5724,6 +5794,127 @@ mod tests {
                 Err(err) => panic!("slot did not become reusable after worker exit: {err:?}"),
             }
         }
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn async_initial_connect_shutdown_releases_slot_while_provider_is_blocked() {
+        let dir = TempDir::new().unwrap();
+        let (qwp_ws, provider) =
+            qwp_ws_config_with_blocked_provider(dir.path(), "blocked-initial-provider");
+        let queue = open_configured_qwp_ws_queue(&qwp_ws).unwrap();
+        let max_in_flight = queue.max_in_flight();
+        let traffic_gate = Arc::new(TrafficGate::default());
+        let pending_connect = QwpWsPendingConnect::new(
+            "127.0.0.1",
+            "1",
+            false,
+            None,
+            &qwp_ws,
+            None,
+            max_in_flight,
+            *qwp_ws.request_durable_ack,
+            Arc::new(AtomicUsize::new(0)),
+            Arc::clone(&traffic_gate),
+            false,
+            Vec::new(),
+            0,
+        );
+        let mut runner = SyncQwpWsRunner::start_pending_connect(
+            queue,
+            pending_connect,
+            Duration::from_secs(1),
+            *qwp_ws.error_inbox_capacity,
+            None,
+        );
+        runner.shutdown_timeout = Duration::from_millis(100);
+        provider.wait_until_started();
+
+        let started = Instant::now();
+        drop(runner);
+        let drop_elapsed = started.elapsed();
+        let reopened = open_configured_qwp_ws_queue(&qwp_ws);
+        provider.release_and_wait();
+
+        assert!(
+            drop_elapsed < Duration::from_secs(1),
+            "runner shutdown waited for the blocked token provider: {drop_elapsed:?}"
+        );
+        drop(reopened.unwrap_or_else(|err| {
+            panic!("blocked initial-connect provider retained the SFA slot after shutdown: {err}")
+        }));
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn reconnect_shutdown_releases_slot_while_provider_is_blocked() {
+        use std::net::{Ipv4Addr, TcpListener};
+
+        let dir = TempDir::new().unwrap();
+        let (qwp_ws, provider) =
+            qwp_ws_config_with_blocked_provider(dir.path(), "blocked-reconnect-provider");
+        let queue = open_configured_qwp_ws_queue(&qwp_ws).unwrap();
+
+        // Seed the transport with an already-connected socket, then close its
+        // peer. The first publication drives the real blocking transport into
+        // its reconnect path, where token acquisition deliberately blocks.
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .unwrap();
+        client
+            .set_write_timeout(Some(Duration::from_secs(1)))
+            .unwrap();
+        let (peer, _) = listener.accept().unwrap();
+        drop(peer);
+
+        let traffic_gate = Arc::new(TrafficGate::default());
+        let endpoints = qwp_ws_configured_endpoints("127.0.0.1", &port.to_string(), &qwp_ws);
+        let transport = BlockingQwpWsTransport::from_connected(
+            Arc::clone(&endpoints),
+            QwpWsHostHealthTracker::new(endpoints.len()),
+            false,
+            None,
+            QwpWsConnectKind::Foreground,
+            qwp_ws.clone(),
+            None,
+            Arc::new(AtomicUsize::new(0)),
+            Some(Arc::clone(&traffic_gate)),
+            QwpWsConnectRoundSuccess {
+                endpoint_idx: 0,
+                stream: WsStream::Plain(NoSigpipeTcp::new(client).unwrap()),
+                negotiated_version: 1,
+                server_max_batch_size: 0,
+                leftover: Vec::new(),
+            },
+        );
+        let driver = QwpWsCoreTestHarness::from_queue(queue, transport);
+        let (store, send_core) = driver.into_parts();
+        let mut runner = SyncQwpWsRunner::start_with_append_deadline(
+            store,
+            send_core,
+            Duration::from_secs(1),
+            traffic_gate,
+        );
+        runner.shutdown_timeout = Duration::from_millis(100);
+        runner.publish_replay_payload(b"blocked reconnect").unwrap();
+        provider.wait_until_started();
+
+        let started = Instant::now();
+        drop(runner);
+        let drop_elapsed = started.elapsed();
+        let reopened = open_configured_qwp_ws_queue(&qwp_ws);
+        provider.release_and_wait();
+
+        assert!(
+            drop_elapsed < Duration::from_secs(1),
+            "runner shutdown waited for the blocked reconnect provider: {drop_elapsed:?}"
+        );
+        drop(reopened.unwrap_or_else(|err| {
+            panic!("blocked reconnect provider retained the SFA slot after shutdown: {err}")
+        }));
     }
 
     #[cfg(any(unix, windows))]

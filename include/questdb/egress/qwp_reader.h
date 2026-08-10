@@ -177,6 +177,7 @@ typedef struct qwp_reader_query qwp_reader_query;
  * `line_sender_utf8` carrying invalid bytes (i.e. one not built via
  * `line_sender_utf8_init`) surfaces as `questdb_error_invalid_utf8`
  * instead of triggering undefined behaviour.
+ * The config string must not exceed `QUESTDB_CONFIG_MAX_BYTES` bytes.
  *
  * @param[in] config UTF-8 config string.
  * @param[out] err_out Set on error.
@@ -193,6 +194,7 @@ qwp_reader* qwp_reader_from_conf(
  * so the caller may free its auth handle after this call returns. Provider
  * calls may load or silently refresh a token but never start an interactive
  * device flow; call questdb_oidc_auth_sign_in before opening the reader.
+ * The config string must not exceed `QUESTDB_CONFIG_MAX_BYTES` bytes.
  */
 QUESTDB_CLIENT_API
 qwp_reader* qwp_reader_from_conf_with_oidc(

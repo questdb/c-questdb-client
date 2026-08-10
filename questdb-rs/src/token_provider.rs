@@ -30,6 +30,13 @@
 //! long-lived client keeps working as the OIDC token silently rotates.
 
 use std::sync::Arc;
+#[cfg(feature = "_sender-qwp-ws")]
+use std::sync::mpsc::{self, RecvTimeoutError};
+#[cfg(feature = "_sender-qwp-ws")]
+use std::time::Duration;
+
+#[cfg(feature = "_sender-qwp-ws")]
+const ISOLATED_PROVIDER_POLL: Duration = Duration::from_millis(5);
 
 /// The boxed provider closure. Returns a fresh token (the raw token, *not* the
 /// `Bearer` header) or an error that fails the connection attempt.
@@ -89,6 +96,61 @@ impl TokenProvider {
         }
         Ok(format!("Bearer {token}"))
     }
+
+    /// Run acquisition on an isolated thread while the caller waits
+    /// cancellation-aware for its result.
+    ///
+    /// A synchronous caller-supplied closure cannot be forcibly cancelled.
+    /// Once `cancelled` becomes true this method abandons the result receiver;
+    /// the provider invocation may finish later, but it retains only this
+    /// provider clone rather than the transport runner or its durable queue.
+    #[cfg(feature = "_sender-qwp-ws")]
+    pub(crate) fn bearer_header_isolated_until(
+        &self,
+        cancelled: impl Fn() -> bool,
+    ) -> crate::Result<String> {
+        if cancelled() {
+            return Err(provider_shutdown_error());
+        }
+
+        let provider = self.clone();
+        let (result_tx, result_rx) = mpsc::sync_channel(1);
+        std::thread::Builder::new()
+            .name("questdb-token-provider".to_string())
+            .spawn(move || {
+                let _ = result_tx.send(provider.bearer_header());
+            })
+            .map_err(|err| {
+                crate::error::fmt!(
+                    SocketError,
+                    "Could not start the isolated token-provider worker: {err}"
+                )
+            })?;
+
+        loop {
+            match result_rx.recv_timeout(ISOLATED_PROVIDER_POLL) {
+                Ok(result) => return result,
+                Err(RecvTimeoutError::Timeout) if cancelled() => {
+                    return Err(provider_shutdown_error());
+                }
+                Err(RecvTimeoutError::Timeout) => {}
+                Err(RecvTimeoutError::Disconnected) => {
+                    return Err(crate::error::fmt!(
+                        SocketError,
+                        "The isolated token-provider worker stopped without returning a token"
+                    ));
+                }
+            }
+        }
+    }
+}
+
+#[cfg(feature = "_sender-qwp-ws")]
+fn provider_shutdown_error() -> crate::Error {
+    crate::error::fmt!(
+        SocketError,
+        "Token-provider acquisition was abandoned because the transport is shutting down"
+    )
 }
 
 /// Classify a token-provider acquisition error separately from a server

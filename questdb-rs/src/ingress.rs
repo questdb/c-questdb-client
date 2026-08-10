@@ -1647,8 +1647,12 @@ impl SenderBuilder {
     /// error. In unwind-enabled builds, a callback panic is contained and treated
     /// as a retryable provider failure; a process built with `panic = "abort"`
     /// cannot contain panics, so providers must not rely on this as their normal
-    /// error path. Mutually exclusive with [`username`](Self::username) /
-    /// [`password`](Self::password) / [`token`](Self::token); QWP/WebSocket only.
+    /// error path. Runner-owned acquisition is isolated so sender shutdown can
+    /// release its store-and-forward slot even if the callback blocks; in that
+    /// case the in-flight callback may outlive the sender until it returns and
+    /// must own everything it accesses. Mutually exclusive with
+    /// [`username`](Self::username) / [`password`](Self::password) /
+    /// [`token`](Self::token); QWP/WebSocket only.
     /// `OidcDeviceAuth::token` never launches an interactive device flow from a
     /// connect or reconnect thread; it returns `InteractionRequired` if explicit
     /// sign-in is needed.

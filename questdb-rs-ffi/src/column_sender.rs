@@ -812,6 +812,18 @@ unsafe fn name_str<'a>(
     }
 }
 
+unsafe fn config_str<'a>(
+    config: *const c_char,
+    config_len: size_t,
+    err_out: *mut *mut line_sender_error,
+) -> Option<&'a str> {
+    if let Err(err) = crate::validate_config_len(config_len) {
+        unsafe { set_err_out_from_error(err_out, err) };
+        return None;
+    }
+    unsafe { name_str(config, config_len, err_out) }
+}
+
 /// Per-column varlen payload cap (~2 GiB). Bounded by `i32::MAX` to
 /// match the i32 offset encoding used by varchar/binary/dict-bytes.
 pub(crate) const MAX_VARLEN_PAYLOAD_BYTES: usize = i32::MAX as usize;
@@ -918,7 +930,8 @@ unsafe fn typed_bytes_slice<'a>(
 /// fail-fast), so server/auth/TLS errors surface from this call. With
 /// `lazy_connect=true` it opens no connections; senders buffer locally and
 /// connect in the background, readers connect on first borrow, and errors
-/// surface there instead. `conf` is a UTF-8 string of `conf_len` bytes.
+/// surface there instead. `conf` is a UTF-8 string of `conf_len` bytes and
+/// must not exceed [`crate::MAX_CONFIG_BYTES`].
 ///
 /// Returns NULL on failure. When `err_out != NULL`, the error is placed
 /// in `*err_out` and ownership transfers to the caller (release with
@@ -929,7 +942,7 @@ pub unsafe extern "C" fn questdb_db_connect(
     conf_len: size_t,
     err_out: *mut *mut questdb_error,
 ) -> *mut questdb_db {
-    let conf = match unsafe { name_str(conf, conf_len, err_out) } {
+    let conf = match unsafe { config_str(conf, conf_len, err_out) } {
         Some(s) => s,
         None => return std::ptr::null_mut(),
     };
@@ -972,6 +985,7 @@ pub unsafe extern "C" fn questdb_db_connect_options_init(
 /// token provider. A NULL `options` pointer is equivalent to
 /// [`questdb_db_connect`]. The pool retains shared ownership of `oidc_auth`, so
 /// its caller-owned handle may be released as soon as this function returns.
+/// `conf_len` must not exceed [`crate::MAX_CONFIG_BYTES`].
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn questdb_db_connect_ex(
     conf: *const c_char,
@@ -979,7 +993,7 @@ pub unsafe extern "C" fn questdb_db_connect_ex(
     options: *const questdb_db_connect_options,
     err_out: *mut *mut questdb_error,
 ) -> *mut questdb_db {
-    let conf = match unsafe { name_str(conf, conf_len, err_out) } {
+    let conf = match unsafe { config_str(conf, conf_len, err_out) } {
         Some(s) => s,
         None => return std::ptr::null_mut(),
     };
@@ -1283,7 +1297,8 @@ pub unsafe extern "C" fn questdb_db_borrow_direct_sender_with_retry(
 
 /// Build a direct (pipelined, non-store-and-forward) column sender from a
 /// QWP/WebSocket config string, owning its own connection with no pool. `conf`
-/// is a UTF-8 string of `conf_len` bytes. On normal completion free the
+/// is a UTF-8 string of `conf_len` bytes and must not exceed
+/// [`crate::MAX_CONFIG_BYTES`]. On normal completion free the
 /// returned handle with `qwp_direct_sender_free`; there is no pool to return
 /// it to. To discard uncommitted frames after a failure, call
 /// `questdb_db_drop_direct_sender(NULL, sender)` instead. Returns NULL on
@@ -1294,7 +1309,7 @@ pub unsafe extern "C" fn qwp_direct_sender_from_conf(
     conf_len: size_t,
     err_out: *mut *mut line_sender_error,
 ) -> *mut qwp_direct_sender {
-    let conf = match unsafe { name_str(conf, conf_len, err_out) } {
+    let conf = match unsafe { config_str(conf, conf_len, err_out) } {
         Some(s) => s,
         None => return std::ptr::null_mut(),
     };
@@ -1607,7 +1622,7 @@ pub unsafe extern "C" fn questdb_db_connect_with_event_handler(
     inbox_capacity: size_t,
     err_out: *mut *mut questdb_error,
 ) -> *mut questdb_db {
-    let conf = match unsafe { name_str(conf, conf_len, err_out) } {
+    let conf = match unsafe { config_str(conf, conf_len, err_out) } {
         Some(s) => s,
         None => return std::ptr::null_mut(),
     };
@@ -1740,7 +1755,7 @@ pub unsafe extern "C" fn questdb_db_connect_with_handlers(
     rejection_inbox_capacity: size_t,
     err_out: *mut *mut questdb_error,
 ) -> *mut questdb_db {
-    let conf = match unsafe { name_str(conf, conf_len, err_out) } {
+    let conf = match unsafe { config_str(conf, conf_len, err_out) } {
         Some(s) => s,
         None => return std::ptr::null_mut(),
     };
@@ -5333,6 +5348,23 @@ mod tests {
         unsafe { crate::questdb_error_free(error) };
     }
 
+    unsafe fn assert_config_size_error(error: *mut questdb_error) {
+        assert!(!error.is_null());
+        assert_eq!(
+            unsafe { crate::questdb_error_get_code(error) } as u32,
+            line_sender_error_code::line_sender_error_invalid_api_call as u32
+        );
+        let mut len = 0;
+        let message = unsafe { crate::questdb_error_msg(error, &mut len) };
+        let message = unsafe { slice::from_raw_parts(message as *const u8, len) };
+        let message = String::from_utf8_lossy(message);
+        assert!(
+            message.contains("maximum is 1048576 bytes"),
+            "unexpected config-size error: {message}"
+        );
+        unsafe { crate::questdb_error_free(error) };
+    }
+
     // Most behaviour is already covered by the questdb-rs lib tests; this
     // module's tests focus on the FFI surface — pointer handling, NULL
     // guards, lifetime of error objects, etc.
@@ -5355,6 +5387,58 @@ mod tests {
         assert!(db.is_null());
         assert!(!err.is_null());
         unsafe { line_sender_error_free(err) };
+    }
+
+    #[test]
+    fn raw_config_apis_reject_oversized_inputs_before_reading_them() {
+        let config = std::ptr::NonNull::<c_char>::dangling().as_ptr();
+        let config_len = crate::MAX_CONFIG_BYTES + 1;
+
+        let mut error = std::ptr::null_mut();
+        let db = unsafe { questdb_db_connect(config, config_len, &mut error) };
+        assert!(db.is_null());
+        unsafe { assert_config_size_error(error) };
+
+        error = std::ptr::null_mut();
+        let db = unsafe { questdb_db_connect_ex(config, config_len, std::ptr::null(), &mut error) };
+        assert!(db.is_null());
+        unsafe { assert_config_size_error(error) };
+
+        error = std::ptr::null_mut();
+        let sender = unsafe { qwp_direct_sender_from_conf(config, config_len, &mut error) };
+        assert!(sender.is_null());
+        unsafe { assert_config_size_error(error) };
+
+        error = std::ptr::null_mut();
+        let db = unsafe {
+            questdb_db_connect_with_event_handler(
+                config,
+                config_len,
+                ignore_connection_event,
+                std::ptr::null_mut(),
+                0,
+                &mut error,
+            )
+        };
+        assert!(db.is_null());
+        unsafe { assert_config_size_error(error) };
+
+        error = std::ptr::null_mut();
+        let db = unsafe {
+            questdb_db_connect_with_handlers(
+                config,
+                config_len,
+                None,
+                std::ptr::null_mut(),
+                0,
+                None,
+                std::ptr::null_mut(),
+                0,
+                &mut error,
+            )
+        };
+        assert!(db.is_null());
+        unsafe { assert_config_size_error(error) };
     }
 
     #[test]
