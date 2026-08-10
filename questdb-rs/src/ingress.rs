@@ -963,7 +963,7 @@ pub struct SenderBuilder {
     /// Per-request Bearer-token source for ILP/HTTP; mutually exclusive with
     /// `username`/`password`/`token`. See [`SenderBuilder::http_token_provider`].
     #[cfg(feature = "_sender-http")]
-    http_token_provider: Option<conf::HttpTokenProvider>,
+    http_token_provider: Option<crate::token_provider::TokenProvider>,
 
     #[cfg(feature = "_sender-qwp-udp")]
     qwp_udp: Option<conf::QwpUdpConfig>,
@@ -1584,9 +1584,16 @@ impl SenderBuilder {
     ///
     /// The returned token is sent as `Authorization: Bearer <token>`; a token
     /// with a non-printable-ASCII character (a header-injection vector) is
-    /// rejected at flush time. A provider error fails that flush (and is
-    /// retriable). Mutually exclusive with [`username`](Self::username) /
-    /// [`password`](Self::password) / [`token`](Self::token); ILP/HTTP only.
+    /// rejected at flush time. A provider acquisition or validation failure fails
+    /// that flush as a retryable [`SocketError`](crate::ErrorCode::SocketError) —
+    /// the same classification the QWP/WebSocket sender and reader apply — because
+    /// the callback may recover on the next flush; the buffer is left intact for a
+    /// retry. In unwind-enabled builds a callback panic is contained and treated
+    /// as such a retryable failure (a `panic = "abort"` build cannot contain
+    /// panics). A server rejection of a successfully acquired token is a separate
+    /// terminal authentication error. Mutually exclusive with
+    /// [`username`](Self::username) / [`password`](Self::password) /
+    /// [`token`](Self::token); ILP/HTTP only.
     ///
     /// **Use [`Protocol::Https`].** The token is a
     /// bearer credential for QuestDB; over
@@ -1598,7 +1605,8 @@ impl SenderBuilder {
     /// block indefinitely. [`OidcDeviceAuth::token`](crate::oidc::OidcDeviceAuth::token)
     /// returns a cached token or performs a silent refresh, but never starts an
     /// interactive device flow. If no usable cached/persisted token or refresh
-    /// token is available, the flush fails with `InteractionRequired`. Call
+    /// token is available, the flush fails as the retryable `SocketError` above,
+    /// with the OIDC `InteractionRequired` kind preserved for inspection. Call
     /// [`OidcDeviceAuth::sign_in`](crate::oidc::OidcDeviceAuth::sign_in) on a
     /// suitable UI thread before flushing, and request the `offline_access` scope
     /// so unattended senders can refresh without another explicit sign-in.
@@ -1622,9 +1630,7 @@ impl SenderBuilder {
                  username/password and token authentication."
             ));
         }
-        self.http_token_provider = Some(conf::HttpTokenProvider(std::sync::Arc::new(move || {
-            provider().map_err(Into::into)
-        })));
+        self.http_token_provider = Some(crate::token_provider::TokenProvider::new(provider));
         Ok(self)
     }
 
@@ -2898,7 +2904,7 @@ impl SenderBuilder {
                         ));
                     }
                     None => match self.http_token_provider {
-                        Some(ref provider) => HttpAuth::Provider(provider.0.clone()),
+                        Some(ref provider) => HttpAuth::Provider(provider.clone()),
                         None => HttpAuth::None,
                     },
                 };

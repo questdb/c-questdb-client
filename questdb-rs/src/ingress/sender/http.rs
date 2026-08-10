@@ -67,7 +67,7 @@ pub(crate) struct SyncHttpHandlerState {
 pub(crate) enum HttpAuth {
     None,
     Static(String),
-    Provider(crate::ingress::conf::HttpTokenProviderFn),
+    Provider(crate::token_provider::TokenProvider),
 }
 
 #[cfg(feature = "sync-sender-http")]
@@ -80,22 +80,14 @@ impl HttpAuth {
         match self {
             HttpAuth::None => Ok(None),
             HttpAuth::Static(value) => Ok(Some(Cow::Borrowed(value.as_str()))),
-            HttpAuth::Provider(provider) => {
-                let token = provider()?;
-                // The token goes verbatim into an `Authorization: Bearer` header;
-                // a control / non-ASCII byte (a decoded CR/LF is a header-injection
-                // vector) or a blank value must never reach the wire (the shared
-                // gate also trims, so an all-whitespace token is rejected).
-                if !crate::is_printable_ascii_token(&token) {
-                    return Err(fmt!(
-                        AuthError,
-                        "The HTTP token provider returned an empty token or one \
-                         containing a non-printable-ASCII character; refusing to \
-                         send it as a Bearer header."
-                    ));
-                }
-                Ok(Some(Cow::Owned(format!("Bearer {token}"))))
-            }
+            // Pull, validate, and classify through the shared `TokenProvider`
+            // gate — the same path the QWP/WebSocket sender and reader use — so a
+            // provider acquisition failure, a blank / non-printable-ASCII token (a
+            // decoded CR/LF is a header-injection vector), and a caller-closure
+            // panic (in unwind builds) all surface as one retryable `SocketError`
+            // here too, never a terminal `AuthError`. A server rejection of a
+            // successfully acquired token remains a separate terminal auth error.
+            HttpAuth::Provider(provider) => Ok(Some(Cow::Owned(provider.bearer_header()?))),
         }
     }
 }
@@ -637,10 +629,14 @@ mod tests {
     fn resolve_rejects_blank_provider_token() {
         // A blank / all-whitespace provider token is refused (matching safe_token),
         // never reaching the wire as "Bearer   ".
-        let blank = HttpAuth::Provider(std::sync::Arc::new(|| Ok("   ".to_string())));
+        let blank = HttpAuth::Provider(crate::token_provider::TokenProvider::new(|| {
+            Ok::<_, crate::Error>("   ".to_string())
+        }));
         assert!(blank.resolve().is_err());
         // A normal token resolves to a Bearer header.
-        let ok = HttpAuth::Provider(std::sync::Arc::new(|| Ok("tok".to_string())));
+        let ok = HttpAuth::Provider(crate::token_provider::TokenProvider::new(|| {
+            Ok::<_, crate::Error>("tok".to_string())
+        }));
         assert_eq!(ok.resolve().unwrap().as_deref(), Some("Bearer tok"));
     }
 }

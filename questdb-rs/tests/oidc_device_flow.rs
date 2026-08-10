@@ -263,7 +263,10 @@ fn provider_error_fails_flush() {
     .expect("build sender");
 
     let err = send_one_row(&mut sender).unwrap_err();
-    assert_eq!(err.code(), questdb::ErrorCode::AuthError);
+    // A provider acquisition failure is retryable and reclassified to SocketError
+    // — the same classification the QWP/WebSocket sender and reader apply — never
+    // a terminal AuthError. The buffer is left intact for a retry.
+    assert_eq!(err.code(), questdb::ErrorCode::SocketError);
     // The provider failed before any request was sent.
     assert!(mock.write_auth_headers().is_empty());
 }
@@ -326,7 +329,9 @@ fn provider_control_char_token_rejected() {
     .expect("build sender");
 
     let err = send_one_row(&mut sender).unwrap_err();
-    assert_eq!(err.code(), questdb::ErrorCode::AuthError);
+    // A control-char token is rejected as a retryable SocketError (matching the
+    // QWP/WebSocket sender and reader), never sent as a Bearer header.
+    assert_eq!(err.code(), questdb::ErrorCode::SocketError);
     assert!(mock.write_auth_headers().is_empty());
 }
 
