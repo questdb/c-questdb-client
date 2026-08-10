@@ -707,7 +707,9 @@ impl OidcDeviceAuth {
     }
 
     /// Seed the in-memory cache from the persisted store, once, at the top of the
-    /// acquire critical section.
+    /// acquire critical section. The read shares the store's per-identity lock
+    /// with refresh so it cannot mistake a consumed parent awaiting replacement
+    /// for a stable absence and permanently latch that temporary tombstone.
     fn maybe_load_from_store(&self) {
         let (Some(store), Some(key)) = (self.token_store.as_ref(), self.store_key.as_ref()) else {
             return;
@@ -715,20 +717,33 @@ impl OidcDeviceAuth {
         if self.lock_store_state().load_attempted {
             return;
         }
-        match store.load(key) {
-            Ok(persisted) => {
-                // A successful load is final: record it so a valid — or absent —
-                // entry isn't re-read on every later call. A missing / corrupt /
-                // oversized file is reported as `Ok(None)`, so it lands here too.
+
+        let mut loaded = None;
+        let lock_result = store.in_lock(key, &mut || {
+            loaded = Some(store.load(key)?);
+            Ok(())
+        });
+        match loaded {
+            Some(persisted) => {
+                // The locked read completed, so even an absent entry is stable
+                // with respect to a peer refresh. A custom store may report a
+                // bookkeeping/release error after running the action; the read is
+                // still authoritative in that case.
+                if let Err(e) = lock_result {
+                    warn_persistence("lock", &*e);
+                }
                 self.lock_store_state().load_attempted = true;
                 self.adopt(persisted);
             }
-            // A genuine I/O error (EMFILE, an NFS / permission blip) is the only
-            // case a store surfaces as `Err`, and it is transient: leave
-            // `load_attempted` unset so the next call retries, rather than
-            // permanently falling back to a fresh interactive sign-in despite a
-            // usable on-disk token.
-            Err(e) => warn_persistence("load", &*e),
+            None => match lock_result {
+                // A genuine I/O error (EMFILE, an NFS / permission blip), lock
+                // failure, or acquire timeout is transient: leave
+                // `load_attempted` unset so the next call retries.
+                Err(e) => warn_persistence("load", &*e),
+                Ok(()) => log::warn!(
+                    "questdb oidc: token store returned without running the locked load action; the next call will retry"
+                ),
+            },
         }
     }
 

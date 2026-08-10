@@ -1641,6 +1641,74 @@ impl TokenStore for FailingSaveStore {
     }
 }
 
+/// An in-memory store that exposes whether a peer attempted the locked lazy
+/// load while another auth instance holds the coordination lock across refresh.
+#[derive(Clone, Default)]
+struct TombstoneRaceStore {
+    token: Arc<std::sync::Mutex<Option<PersistedToken>>>,
+    coordination: Arc<std::sync::Mutex<()>>,
+    progress: Arc<(std::sync::Mutex<TombstoneRaceProgress>, std::sync::Condvar)>,
+}
+
+#[derive(Default)]
+struct TombstoneRaceProgress {
+    lock_attempts: usize,
+    loads: usize,
+}
+
+impl TombstoneRaceStore {
+    fn seed(&self, token: PersistedToken) {
+        *self.token.lock().unwrap() = Some(token);
+    }
+
+    fn token(&self) -> Option<PersistedToken> {
+        self.token.lock().unwrap().clone()
+    }
+
+    fn wait_for_peer_load_or_lock_attempt(&self) -> (bool, usize, usize) {
+        let (progress, changed) = &*self.progress;
+        let (progress, timeout) = changed
+            .wait_timeout_while(
+                progress.lock().unwrap(),
+                Duration::from_secs(5),
+                |progress| progress.lock_attempts < 3 && progress.loads < 3,
+            )
+            .unwrap();
+        (!timeout.timed_out(), progress.lock_attempts, progress.loads)
+    }
+}
+
+impl TokenStore for TombstoneRaceStore {
+    fn load(&self, _key: &TokenStoreKey) -> TokenStoreResult<Option<PersistedToken>> {
+        let (progress, changed) = &*self.progress;
+        progress.lock().unwrap().loads += 1;
+        changed.notify_all();
+        Ok(self.token())
+    }
+
+    fn save(&self, _key: &TokenStoreKey, token: &PersistedToken) -> TokenStoreResult<()> {
+        *self.token.lock().unwrap() = Some(token.clone());
+        Ok(())
+    }
+
+    fn clear(&self, _key: &TokenStoreKey) -> TokenStoreResult<()> {
+        *self.token.lock().unwrap() = None;
+        Ok(())
+    }
+
+    fn in_lock(
+        &self,
+        _key: &TokenStoreKey,
+        action: &mut dyn FnMut() -> TokenStoreResult<()>,
+    ) -> TokenStoreResult<()> {
+        let (progress, changed) = &*self.progress;
+        progress.lock().unwrap().lock_attempts += 1;
+        changed.notify_all();
+        let _guard = self.coordination.lock().unwrap();
+        action()
+    }
+}
+
 fn auth_with_failing_store(
     mock: &MockServer,
     store: FailingSaveStore,
@@ -2227,6 +2295,87 @@ fn failed_rotated_child_save_leaves_no_reusable_parent() {
         "the stale peer replayed a refresh-token parent"
     );
     assert_eq!(stale_peer.token_set().unwrap().refresh_token, None);
+}
+
+#[test]
+fn lazy_load_waits_out_peer_refresh_tombstone() {
+    let refresh_calls = Arc::new(AtomicUsize::new(0));
+    let refresh_entered = Arc::new(Barrier::new(2));
+    let release_refresh = Arc::new(Barrier::new(2));
+    let mock = {
+        let refresh_calls = Arc::clone(&refresh_calls);
+        let refresh_entered = Arc::clone(&refresh_entered);
+        let release_refresh = Arc::clone(&release_refresh);
+        MockServer::start(move |method, path, body| {
+            if (method, path) == ("POST", "/token") && body.contains("grant_type=refresh_token") {
+                refresh_calls.fetch_add(1, Ordering::SeqCst);
+                // refresh_under_lock has consumed RT-1 but still holds the
+                // coordination lock. Keep the child unsaved until the peer has
+                // attempted its one-shot lazy load.
+                refresh_entered.wait();
+                release_refresh.wait();
+                return (
+                    200,
+                    r#"{"access_token":"AT-2","refresh_token":"RT-2","expires_in":300}"#
+                        .to_string(),
+                );
+            }
+            (404, "{}".to_string())
+        })
+    };
+    let store = TombstoneRaceStore::default();
+    store.seed(PersistedToken::new(
+        Some("AT-expired".to_string()),
+        None,
+        Some("RT-1".to_string()),
+        1.0,
+        300.0,
+    ));
+    let build_auth = || {
+        OidcDeviceAuth::builder()
+            .client_id("questdb")
+            .device_authorization_endpoint(mock.url("/device"))
+            .token_endpoint(mock.url("/token"))
+            .scope("openid")
+            .interactive(false)
+            .open_browser(false)
+            .sleep_hook(no_sleep())
+            .token_store(store.clone())
+            .build()
+            .unwrap()
+    };
+
+    let refreshing = build_auth();
+    let refresh_thread = std::thread::spawn(move || refreshing.token());
+    refresh_entered.wait();
+    let parent_consumed = store.token().is_none();
+
+    let peer = build_auth();
+    let peer_thread = std::thread::spawn(move || peer.token());
+    // With an unlocked lazy load, the peer reaches a third load here, observes
+    // None, and permanently latches the tombstone. With the fix, its third lock
+    // attempt blocks until RT-2 is saved.
+    let (peer_attempted, lock_attempts, loads) = store.wait_for_peer_load_or_lock_attempt();
+    release_refresh.wait();
+
+    let refreshed = refresh_thread.join().unwrap();
+    let peer_token = peer_thread.join().unwrap();
+    assert!(
+        parent_consumed,
+        "refresh parent was not consumed before the token request"
+    );
+    assert!(
+        peer_attempted,
+        "peer never attempted to load during the refresh tombstone window: locks={lock_attempts}, loads={loads}"
+    );
+    assert_eq!(refreshed.unwrap(), "AT-2");
+    assert_eq!(
+        peer_token.unwrap(),
+        "AT-2",
+        "peer permanently cached the temporary refresh tombstone"
+    );
+    assert_eq!(refresh_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(store.token().unwrap().refresh_token(), Some("RT-2"));
 }
 
 #[test]
