@@ -253,25 +253,20 @@ fn qwpws_progress_config_parses_manual_and_background() {
     assert_specified_eq(&qwp_ws.progress, QwpWsProgress::Background);
 }
 
+/// `in_flight_window` and `max_in_flight` were removed. They are no longer
+/// configuration keys, so the QWP/WebSocket parser rejects them as unknown --
+/// matching the Java client, which also rejects `in_flight_window`.
 #[cfg(feature = "sync-sender-qwp-ws")]
 #[test]
-fn qwpws_config_accepts_java_in_flight_window_alias() {
-    let builder = SenderBuilder::from_conf("ws::addr=localhost:9000;in_flight_window=7;").unwrap();
-    let qwp_ws = builder.qwp_ws.as_ref().unwrap();
-    assert_specified_eq(&qwp_ws.max_in_flight, 7usize);
-
+fn qwpws_config_rejects_removed_in_flight_keys() {
     assert_conf_err(
-        SenderBuilder::from_conf("ws::addr=localhost:9000;in_flight_window=1;"),
-        "WebSocket transport requires async mode (in_flight_window > 1)",
+        SenderBuilder::from_conf("ws::addr=localhost:9000;in_flight_window=7;"),
+        "Unknown config key \"in_flight_window\"",
     );
     assert_conf_err(
-        SenderBuilder::from_conf("ws::addr=localhost:9000;in_flight_window=-1;"),
-        "in-flight window size must be positive[size=-1]",
+        SenderBuilder::from_conf("ws::addr=localhost:9000;max_in_flight=3;"),
+        "Unknown config key \"max_in_flight\"",
     );
-
-    let builder = SenderBuilder::from_conf("ws::addr=localhost:9000;max_in_flight=1;").unwrap();
-    let qwp_ws = builder.qwp_ws.as_ref().unwrap();
-    assert_specified_eq(&qwp_ws.max_in_flight, 1usize);
 }
 
 /// Connect-string keys that the Rust egress reader

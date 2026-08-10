@@ -167,7 +167,6 @@ impl OrphanDrainerConfig {
             slot_dir,
             segment_size_bytes: *self.qwp_ws.sf_max_segment_bytes,
             max_bytes,
-            max_in_flight: *self.qwp_ws.max_in_flight,
             periodic_sync_interval: self.qwp_ws.periodic_sync_interval(),
         })
     }
@@ -601,7 +600,6 @@ impl OrphanDrainer {
             let _ = clear_last_error(&slot_dir);
             return OrphanOpenOutcome::AlreadyDrained;
         }
-        let max_in_flight = queue.max_in_flight();
         // A delta-encoded slot's stored frames are not self-sufficient, so before
         // replaying them to the fresh server the drainer must re-register the whole
         // dictionary via a catch-up frame -- exactly as the foreground does on
@@ -725,7 +723,6 @@ impl OrphanDrainer {
         let store = QwpWsPublicationStore::new(queue, DEFAULT_EVENT_CAPACITY);
         let mut send_core = QwpWsSendCore::new_with_durable_ack_and_rejection_limit(
             transport,
-            max_in_flight,
             ReconnectPolicy::bounded(
                 *config.qwp_ws.reconnect_max_duration,
                 *config.qwp_ws.reconnect_initial_backoff,
@@ -1175,7 +1172,6 @@ mod tests {
             sender_id: "orphan".to_owned(),
             segment_size_bytes: 256,
             max_bytes: 1024,
-            max_in_flight: 1,
             periodic_sync_interval: None,
         };
         let stop = Arc::new(AtomicBool::new(false));
@@ -1282,7 +1278,6 @@ mod tests {
             sender_id: sender_id.to_owned(),
             segment_size_bytes: 256,
             max_bytes: 1024,
-            max_in_flight: 4,
             periodic_sync_interval: None,
         }
     }

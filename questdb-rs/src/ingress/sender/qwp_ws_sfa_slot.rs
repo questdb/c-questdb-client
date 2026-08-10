@@ -75,7 +75,6 @@ pub(crate) struct SfaSlotOptions {
     pub(crate) sender_id: String,
     pub(crate) segment_size_bytes: u64,
     pub(crate) max_bytes: usize,
-    pub(crate) max_in_flight: usize,
     pub(crate) periodic_sync_interval: Option<Duration>,
 }
 
@@ -101,7 +100,6 @@ impl SfaSlotQueue {
             slot_dir,
             segment_size_bytes: options.segment_size_bytes,
             max_bytes: options.max_bytes,
-            max_in_flight: options.max_in_flight,
             periodic_sync_interval: options.periodic_sync_interval,
         })?;
 
@@ -237,10 +235,6 @@ impl PublicationLog for SfaSlotQueue {
 
     fn completed_fsn(&self) -> Option<u64> {
         self.queue.completed_fsn()
-    }
-
-    fn max_in_flight(&self) -> usize {
-        self.queue.max_in_flight()
     }
 }
 
@@ -440,7 +434,6 @@ mod tests {
             sender_id: sender_id.to_owned(),
             segment_size_bytes: 256,
             max_bytes: 1024,
-            max_in_flight: 4,
             periodic_sync_interval: None,
         }
     }
@@ -450,7 +443,6 @@ mod tests {
             slot_dir,
             segment_size_bytes: 256,
             max_bytes: 1024,
-            max_in_flight: 4,
             periodic_sync_interval: None,
         }
     }

@@ -73,7 +73,13 @@ const QWP_STATUS_WRITE_ERROR: u8 = 0x09;
 /// but small enough to refuse obviously bogus declared lengths early.
 const MAX_INBOUND_FRAME_BYTES: u64 = 256 * 1024 * 1024;
 
-/// QWP spec §Protocol limits: max in-flight batches per connection.
+/// Cap on published-but-unacked frames. `ColumnConn` has no queue and no
+/// replay (unlike the store-and-forward path, which is bounded by its segment
+/// ring), so this is the only bound on both `pending_acks` growth against a
+/// peer that withholds acks and the frame count left delivery-unknown if the
+/// socket dies. `has_sync_commit_slot` reserves the last slot for a deferred
+/// publish's commit frame. The historical QWP spec listed 128, but the server
+/// neither negotiates nor enforces a frame-count window.
 const MAX_IN_FLIGHT: u32 = 128;
 
 /// Best-effort write budget for the Close frame on Drop. Short enough

@@ -131,11 +131,11 @@ pub(crate) struct SentDictMirror {
     /// Without it [`conflicts_with`](Self::conflicts_with) walked the whole
     /// mirror from byte 0 *twice per frame*, which made the recovery fold in
     /// `SfaFrameQueue::rebuild_recovered_dict_from_frames` O(frames x
-    /// dictionary): at the default `max_in_flight` of 128 over a 1M-entry
-    /// dictionary that is ~256M varint decodes on the connecting thread, and the
-    /// `delta_start >= tip` short-circuit does NOT fire on the common path (an
-    /// untorn side-file covers every id, so every surviving frame bases below the
-    /// tip). `Cell` because the guard reads through `&self` on the send path.
+    /// dictionary). A byte-ring-sized backlog over a large dictionary can make
+    /// that prohibitive on the connecting thread, and the `delta_start >= tip`
+    /// short-circuit does NOT fire on the common path (an untorn side-file covers
+    /// every id, so every surviving frame bases below the tip). `Cell` because the
+    /// guard reads through `&self` on the send path.
     seek_hint: std::cell::Cell<(usize, usize)>,
 }
 

@@ -1002,7 +1002,7 @@ impl SenderBuilder {
     /// Some QWP/WebSocket configuration keys are accepted only through the
     /// configuration string, primarily for compatibility with Java-style
     /// configuration names and settings without a public Rust builder method.
-    /// These include `in_flight_window`, `sf_dir`, `sender_id`, `sf_max_segment_bytes`,
+    /// These include `sf_dir`, `sender_id`, `sf_max_segment_bytes`,
     /// `sf_max_total_bytes`, `sf_durability`, `sf_sync_interval_millis`,
     /// `sf_append_deadline_millis`, `auth_timeout_ms`, `close_flush_timeout_millis`,
     /// `request_durable_ack`,
@@ -1150,10 +1150,6 @@ impl SenderBuilder {
                 "max_datagram_size" => builder.max_datagram_size(parse_conf_value(key, val)?)?,
                 #[cfg(feature = "_sender-qwp-udp")]
                 "multicast_ttl" => builder.multicast_ttl(parse_conf_value(key, val)?)?,
-                #[cfg(feature = "_sender-qwp-ws")]
-                "in_flight_window" => builder.in_flight_window(parse_conf_value(key, val)?)?,
-                #[cfg(feature = "_sender-qwp-ws")]
-                "max_in_flight" => builder.max_in_flight(parse_conf_value(key, val)?)?,
                 #[cfg(feature = "_sender-qwp-ws")]
                 "qwp_ws_progress" => builder.qwp_ws_progress(parse_qwp_ws_progress_value(val)?)?,
                 #[cfg(feature = "_sender-qwp-ws")]
@@ -1835,68 +1831,6 @@ impl SenderBuilder {
         qwp_udp
             .multicast_ttl
             .set_specified("multicast_ttl", value)?;
-        Ok(self)
-    }
-
-    #[cfg(feature = "_sender-qwp-ws")]
-    /// Maximum number of unacknowledged messages a pipelined QWP/WebSocket
-    /// sender keeps in flight at once. The default is 128, matching the spec's
-    /// `Max in-flight batches` limit.
-    ///
-    /// The window provides backpressure: once it's full, subsequent
-    /// `flush` calls may wait until the server acknowledges an earlier message.
-    /// Smaller windows reduce client memory and bound the impact of a
-    /// stuck server; larger windows increase throughput on high-RTT links.
-    pub fn max_in_flight(self, value: usize) -> Result<Self> {
-        self.set_qwp_ws_max_in_flight("max_in_flight", value)
-    }
-
-    #[cfg(feature = "_sender-qwp-ws")]
-    fn in_flight_window(mut self, value: i32) -> Result<Self> {
-        let Some(qwp_ws) = &mut self.qwp_ws else {
-            return Err(error::fmt!(
-                ConfigError,
-                "The \"in_flight_window\" setting is only supported for QWP/WebSocket."
-            ));
-        };
-        if value < 1 {
-            return Err(error::fmt!(
-                ConfigError,
-                "in-flight window size must be positive[size={value}]"
-            ));
-        }
-        if value == 1 {
-            return Err(error::fmt!(
-                ConfigError,
-                "WebSocket transport requires async mode (in_flight_window > 1)"
-            ));
-        }
-        let value = value as usize;
-        qwp_ws
-            .max_in_flight
-            .set_specified("in_flight_window", value)?;
-        Ok(self)
-    }
-
-    #[cfg(feature = "_sender-qwp-ws")]
-    fn set_qwp_ws_max_in_flight(
-        mut self,
-        setting_name: &'static str,
-        value: usize,
-    ) -> Result<Self> {
-        if value == 0 {
-            return Err(error::fmt!(
-                ConfigError,
-                "\"{setting_name}\" must be greater than 0."
-            ));
-        }
-        let Some(qwp_ws) = &mut self.qwp_ws else {
-            return Err(error::fmt!(
-                ConfigError,
-                "The \"{setting_name}\" setting is only supported for QWP/WebSocket."
-            ));
-        };
-        qwp_ws.max_in_flight.set_specified(setting_name, value)?;
         Ok(self)
     }
 

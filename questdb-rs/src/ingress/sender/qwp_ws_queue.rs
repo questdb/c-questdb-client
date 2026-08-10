@@ -128,9 +128,6 @@ pub(crate) enum QueueError {
         allocated_segment_bytes: u64,
         max_total_bytes: u64,
     },
-    MaxInFlightReached {
-        max_in_flight: usize,
-    },
     NoUnsentFrame,
     ProtocolAckWithoutConnection,
     ProtocolAckBeyondSent {
