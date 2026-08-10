@@ -3428,7 +3428,27 @@ fn check_store_and_forward_append_timeout_rolls_back_symbols_and_keeps_chunk(ext
     let ts3 = [3_i64];
     let mut third = Chunk::new("trades");
     append_one_symbol_row(&mut third, b"gamma", &ts3);
-    sender.flush(&mut third).unwrap();
+    // The ACK watermark can advance before the disk-backed queue finishes
+    // unlinking its retired segment. Keep the deliberately tiny per-append
+    // deadline used to provoke the failure above, but give asynchronous
+    // storage maintenance a bounded window to make the capacity reusable.
+    let trim_deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        match sender.flush(&mut third) {
+            Ok(()) => break,
+            Err(err)
+                if err.code() == ErrorCode::SocketError
+                    && err.msg().contains("Store-and-Forward append timed out")
+                    && Instant::now() < trim_deadline =>
+            {
+                assert!(
+                    !third.is_empty(),
+                    "a capacity timeout while waiting for trim must keep the chunk retryable"
+                );
+            }
+            Err(err) => panic!("append did not recover after ACK-driven segment trim: {err}"),
+        }
+    }
     sender.wait(AckLevel::Ok, Duration::from_secs(30)).unwrap();
     // The ring-filling flushes above put their own frames on the wire; the
     // "gamma" frame is the last one, since every earlier publish has been
