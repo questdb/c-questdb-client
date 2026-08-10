@@ -168,13 +168,20 @@ TEST_CASE("OIDC C++ wrappers preserve ownership and structured errors")
 
     auto unsupported_sender_options =
         questdb::ingress::opts::from_conf("tcp::addr=127.0.0.1:1;");
-    CHECK_THROWS_AS(
-        unsupported_sender_options.oidc_auth(moved_auth),
-        questdb::ingress::line_sender_error);
+    try
+    {
+        unsupported_sender_options.oidc_auth(moved_auth);
+        FAIL("unsupported sender OIDC attachment must throw");
+    }
+    catch (const questdb::ingress::line_sender_error& error)
+    {
+        CHECK_FALSE(error.oidc_diagnostic().has_value());
+    }
 
-    // A failure raised by an auth state attached to a normal sender must pass
-    // through line_sender_error's conversion without being sliced to the
-    // generic sender exception.
+    // A failure raised by an auth state attached to a normal sender remains in
+    // the sender exception hierarchy while retaining the structured OIDC
+    // diagnostic. Existing applications that catch only line_sender_error must
+    // not miss refresh or InteractionRequired failures.
     // Even an auth configured to permit interactive sign-in must never start a
     // prompt from a sender operation. The unreachable loopback IdP would yield
     // a network error if flush accidentally attempted the device flow.
@@ -198,10 +205,14 @@ TEST_CASE("OIDC C++ wrappers preserve ownership and structured errors")
     {
         attached_sender.flush(buffer);
     }
-    catch (const questdb::oidc::error& error)
+    catch (const questdb::ingress::line_sender_error& error)
     {
         attached_sender_saw_structured_error = true;
-        CHECK(error.kind() == questdb::oidc::error_kind::interaction_required);
+        REQUIRE(error.oidc_diagnostic().has_value());
+        CHECK(
+            error.oidc_diagnostic()->kind() ==
+            questdb::oidc::error_kind::interaction_required);
+        CHECK(error.oidc_diagnostic()->code() == error.code());
     }
     CHECK(attached_sender_saw_structured_error);
 

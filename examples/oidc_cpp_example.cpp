@@ -30,6 +30,14 @@ int main()
         questdb::ingress::line_sender sender{options};
         return 0;
     }
+    catch (const questdb::ingress::line_sender_error& error)
+    {
+        if (const auto& oidc = error.oidc_diagnostic())
+            std::cerr << "Sender OIDC failure: " << oidc->what() << '\n';
+        else
+            std::cerr << "Sender failure: " << error.what() << '\n';
+        return 1;
+    }
     catch (const questdb::oidc::error& error)
     {
         std::cerr << "OIDC failure: " << error.what() << '\n';
