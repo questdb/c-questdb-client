@@ -5790,7 +5790,6 @@ mod tests {
         let (qwp_ws, provider) =
             qwp_ws_config_with_blocked_provider(dir.path(), "blocked-initial-provider");
         let queue = open_configured_qwp_ws_queue(&qwp_ws).unwrap();
-        let max_in_flight = queue.max_in_flight();
         let traffic_gate = Arc::new(TrafficGate::default());
         let pending_connect = QwpWsPendingConnect::new(
             "127.0.0.1",
@@ -5799,7 +5798,6 @@ mod tests {
             None,
             &qwp_ws,
             None,
-            max_in_flight,
             *qwp_ws.request_durable_ack,
             Arc::new(AtomicUsize::new(0)),
             Arc::clone(&traffic_gate),
