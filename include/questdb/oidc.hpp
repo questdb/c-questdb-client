@@ -29,6 +29,16 @@ namespace questdb
 class pool;
 }
 
+namespace questdb::ingress
+{
+class opts;
+}
+
+namespace questdb::egress
+{
+class reader;
+}
+
 namespace questdb::oidc
 {
 
@@ -286,6 +296,8 @@ private:
     ::questdb_oidc_auth* _raw;
     friend class builder;
     friend class ::questdb::pool;
+    friend class ::questdb::ingress::opts;
+    friend class ::questdb::egress::reader;
 };
 
 class builder

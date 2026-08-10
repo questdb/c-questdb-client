@@ -1505,11 +1505,13 @@ public:
      * shared ownership, so `auth` does not need to outlive these options.
      * Provider calls may silently refresh but never prompt from flush/connect;
      * call auth.sign_in() explicitly before starting the sender.
+     * @throws questdb::oidc::error if `auth` is empty or moved from.
+     * @throws line_sender_error if the sender configuration cannot use OIDC.
      */
     opts& oidc_auth(const ::questdb::oidc::device_auth& auth)
     {
-        ::questdb::oidc::detail::wrapped_call(
-            ::line_sender_opts_oidc_auth, _impl, auth.c_ptr());
+        line_sender_error::wrapped_call(
+            ::line_sender_opts_oidc_auth, _impl, auth.raw());
         return *this;
     }
 

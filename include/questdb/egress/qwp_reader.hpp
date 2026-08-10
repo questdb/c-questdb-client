@@ -648,6 +648,9 @@ public:
      * Open a reader with a rotating OIDC Bearer-token provider. The reader
      * retains the auth state internally. Provider calls may silently refresh
      * but never prompt; call auth.sign_in() first.
+     * @throws questdb::oidc::error if `auth` is empty or moved from, or token
+     *         acquisition returns a structured OIDC failure.
+     * @throws questdb::error on configuration or connection failure.
      */
     reader(
         ::questdb::ingress::utf8_view config,
@@ -655,7 +658,7 @@ public:
         : _impl{::questdb::oidc::detail::wrapped_call(
               ::qwp_reader_from_conf_with_oidc,
               to_c_utf8(config),
-              auth.c_ptr())}
+              auth.raw())}
     {
     }
 

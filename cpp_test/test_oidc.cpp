@@ -153,9 +153,24 @@ TEST_CASE("OIDC C++ wrappers preserve ownership and structured errors")
             "ws::addr=127.0.0.1:1;lazy_connect=true;", auth}),
         questdb::oidc::error);
 
+    auto moved_from_sender_options =
+        questdb::ingress::opts::from_conf("https::addr=127.0.0.1:1;");
+    CHECK_THROWS_AS(
+        moved_from_sender_options.oidc_auth(auth),
+        questdb::oidc::error);
+    CHECK_THROWS_AS(
+        (questdb::egress::reader{"ws::addr=127.0.0.1:1;", auth}),
+        questdb::oidc::error);
+
     auto sender_options =
         questdb::ingress::opts::from_conf("https::addr=127.0.0.1:1;");
     sender_options.oidc_auth(moved_auth);
+
+    auto unsupported_sender_options =
+        questdb::ingress::opts::from_conf("tcp::addr=127.0.0.1:1;");
+    CHECK_THROWS_AS(
+        unsupported_sender_options.oidc_auth(moved_auth),
+        questdb::ingress::line_sender_error);
 
     // A failure raised by an auth state attached to a normal sender must pass
     // through line_sender_error's conversion without being sliced to the
