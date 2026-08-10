@@ -142,6 +142,39 @@ fn settings_channel_is_plaintext(questdb_url: &str) -> bool {
     !is_loopback_host(host)
 }
 
+/// The plaintext-`/settings` tamper guard: over a MITM-tamperable (non-loopback
+/// plaintext http) channel, reject settings-sourced values that downstream
+/// validation cannot protect.
+///
+/// - Credential ENDPOINTS from `/settings` are excused only by an out-of-band
+///   issuer pin, which [`validate_endpoint_origins`] and the issuer-origin/path
+///   pin then enforce; without it they must be caller-explicit (or https).
+/// - `client_id` / `scope` / `audience` / `groups` are never validated against
+///   the issuer, so an issuer pin does **not** protect them — over a plaintext
+///   channel they must be caller-explicit (or https).
+///
+/// Returns `Ok` for an https/loopback channel, or when nothing unprotected is
+/// settings-sourced.
+fn plaintext_settings_guard(
+    plaintext: bool,
+    issuer_pinned: bool,
+    endpoint_from_settings: bool,
+    non_endpoint_from_settings: bool,
+) -> Result<()> {
+    let endpoint_unprotected = endpoint_from_settings && !issuer_pinned;
+    if plaintext && (endpoint_unprotected || non_endpoint_from_settings) {
+        return Err(OidcError::config(
+            "QuestDB was reached over plaintext http, so its /settings response can \
+             be tampered in transit. Pin the identity provider out-of-band with \
+             issuer(\"https://your-idp\") to protect the advertised credential \
+             endpoints, and pass any client id / scope / audience / groups flag you \
+             rely on explicitly — an issuer pin does not cover those. Alternatively \
+             connect to QuestDB over https.",
+        ));
+    }
+    Ok(())
+}
+
 fn is_loopback_host(host: &str) -> bool {
     if host.eq_ignore_ascii_case("localhost") {
         return true;
@@ -497,33 +530,27 @@ pub(crate) fn resolve_config(http: &HttpClient, params: &DiscoveryParams) -> Res
     let token_from_settings = token_endpoint.is_some() && !explicit_token;
     let device_from_settings = device_endpoint.is_some() && !explicit_device;
 
-    // Over a plaintext /settings channel a tampered response can poison ANY field
-    // it supplies — not just the credential endpoints (which redirect the device
-    // code / refresh token to an attacker), but the client_id, scope, audience or
-    // groups flag (wrong client registration, mis-scoped / mis-audienced tokens).
-    // So fire on any settings-sourced value, and demand an out-of-band issuer pin.
-    let settings_used = token_from_settings
-        || device_from_settings
-        || (params.client_id.is_none() && str_setting(cfg.get(K_CLIENT_ID)).is_some())
+    // Over a plaintext (non-loopback) /settings channel a MITM can tamper any
+    // advertised field. Split by what downstream validation can still protect: the
+    // endpoint-origin pin below validates settings-sourced ENDPOINTS against an
+    // out-of-band issuer, so an issuer pin excuses those; it never validates
+    // client_id / scope / audience / groups, so an issuer pin does NOT protect them
+    // — they must be caller-explicit (or the channel https).
+    let endpoint_from_settings = token_from_settings || device_from_settings;
+    let non_endpoint_from_settings = (params.client_id.is_none()
+        && str_setting(cfg.get(K_CLIENT_ID)).is_some())
         || (params.scope.as_deref().unwrap_or("").is_empty()
             && str_setting(cfg.get(K_SCOPE)).is_some())
         || (params.audience.as_deref().unwrap_or("").is_empty()
             && str_setting(cfg.get(K_AUDIENCE)).is_some())
         || (params.groups_in_token.is_none() && cfg.get(K_GROUPS_IN_TOKEN).is_some());
-    if let Some(url) = params.questdb_url.as_deref()
-        && settings_used
-        && issuer.is_none()
-        && settings_channel_is_plaintext(url)
-    {
-        return Err(OidcError::config(
-            "QuestDB was reached over plaintext http, so its /settings response — \
-                 and the OIDC configuration it advertises (endpoints, client id, \
-                 scope, audience, groups) — can be tampered in transit: to redirect \
-                 the device-code and refresh-token requests to an attacker, or to \
-                 force a wrong client registration. Pin the identity provider \
-                 out-of-band with issuer(\"https://your-idp\"), pass the values \
-                 explicitly, or connect to QuestDB over https.",
-        ));
+    if let Some(url) = params.questdb_url.as_deref() {
+        plaintext_settings_guard(
+            settings_channel_is_plaintext(url),
+            issuer.is_some(),
+            endpoint_from_settings,
+            non_endpoint_from_settings,
+        )?;
     }
 
     // Vet the issuer authority before it is used to build the discovery URL.
@@ -861,5 +888,23 @@ mod tests {
         assert!(!settings_channel_is_plaintext("http://localhost:9000"));
         assert!(!settings_channel_is_plaintext("http://127.0.0.1:9000"));
         assert!(!settings_channel_is_plaintext("http://[::1]:9000"));
+    }
+
+    #[test]
+    fn plaintext_settings_guard_scopes_issuer_pin_to_endpoints() {
+        // args: (plaintext, issuer_pinned, endpoint_from_settings, non_endpoint_from_settings)
+        // https / loopback (not plaintext): never fires, whatever is settings-sourced.
+        assert!(plaintext_settings_guard(false, false, true, true).is_ok());
+        // Plaintext + only endpoints from settings: needs an out-of-band issuer pin...
+        assert!(plaintext_settings_guard(true, false, true, false).is_err());
+        // ...which the endpoint-origin pin then enforces, so a pin excuses endpoints.
+        assert!(plaintext_settings_guard(true, true, true, false).is_ok());
+        // Plaintext + a non-endpoint field from settings: an issuer pin does NOT
+        // cover client_id/scope/audience/groups, so it must still fire even pinned.
+        assert!(plaintext_settings_guard(true, true, false, true).is_err());
+        assert!(plaintext_settings_guard(true, false, false, true).is_err());
+        // Plaintext but nothing (unprotected) settings-sourced: fine.
+        assert!(plaintext_settings_guard(true, false, false, false).is_ok());
+        assert!(plaintext_settings_guard(true, true, false, false).is_ok());
     }
 }
