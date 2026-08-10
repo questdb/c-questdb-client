@@ -278,6 +278,7 @@ pub type questdb_oidc_user_data_release_cb = Option<unsafe extern "C" fn(user_da
 struct CEventHandler {
     callback: unsafe extern "C" fn(*mut c_void, *const questdb_oidc_event),
     user_data: usize,
+    /// May be absent only for a null, stateless `user_data` registration.
     release: questdb_oidc_user_data_release_cb,
     /// One handler is shared by every auth built from a reusable builder.
     /// Serialize those sibling auths before entering caller-owned state.
@@ -720,12 +721,14 @@ pub unsafe extern "C" fn questdb_oidc_builder_default_file_token_store(
     true
 }
 
-/// Install a renderer callback. `user_data` ownership transfers to the builder
-/// and is released exactly once through `release` after the builder and every
-/// auth object/transport built from it have dropped their last reference. The
-/// callback may run on any token-acquisition thread, is serialized with its
-/// sibling invocations, and must not unwind. Auth reentry from the callback is
-/// rejected before reaching the core acquisition mutex. Final `release` has no
+/// Install a renderer callback. Non-null `user_data` requires a non-null
+/// `release`; on success ownership transfers to the builder and is released
+/// exactly once after the builder and every auth object/transport built from it
+/// have dropped their last reference. On failure ownership remains with the
+/// caller. Null `user_data` with no release is a stateless callback. The callback
+/// may run on any token-acquisition thread, is serialized with its sibling
+/// invocations, and must not unwind. Auth reentry from the callback is rejected
+/// before reaching the core acquisition mutex. Final `release` has no
 /// thread-affinity guarantee and must return normally without unwinding or
 /// performing a non-local jump across the Rust FFI frame.
 #[unsafe(no_mangle)]
@@ -749,6 +752,16 @@ pub unsafe extern "C" fn questdb_oidc_builder_event_handler(
         };
         return false;
     };
+    if !user_data.is_null() && release.is_none() {
+        unsafe {
+            set_input_error(
+                err_out,
+                ErrorCode::InvalidApiCall,
+                "OIDC event user_data is non-NULL but its release callback is NULL",
+            )
+        };
+        return false;
+    }
     builder.config.renderer = Some(Arc::new(CEventHandler {
         callback,
         user_data: user_data as usize,
@@ -1511,15 +1524,6 @@ mod tests {
 
     #[test]
     fn attached_reader_failure_retains_structured_oidc_details() {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let address = listener.local_addr().unwrap();
-        let server = std::thread::spawn(move || {
-            // The reader connects before constructing its upgrade headers. The
-            // provider then fails locally and drops this socket without sending
-            // a request or starting an interactive device flow.
-            let _ = listener.accept().unwrap();
-        });
-
         unsafe {
             let builder = explicit_builder();
             let mut error = ptr::null_mut();
@@ -1528,7 +1532,9 @@ mod tests {
             assert!(!auth.is_null());
             assert!(error.is_null());
 
-            let conf = format!("ws::addr={address};failover=off;");
+            // Provider acquisition happens before DNS/TCP, so a closed address
+            // is enough: the structured OIDC error must surface without a dial.
+            let conf = "ws::addr=127.0.0.1:1;failover=off;";
             let config = crate::line_sender_utf8 {
                 len: conf.len(),
                 buf: conf.as_ptr() as *const c_char,
@@ -1549,7 +1555,6 @@ mod tests {
             questdb_oidc_auth_free(auth);
             questdb_oidc_builder_free(builder);
         }
-        server.join().unwrap();
     }
 
     #[test]
@@ -1572,6 +1577,88 @@ mod tests {
             assert_eq!(releases.load(Ordering::SeqCst), 0);
             questdb_oidc_auth_free(auth);
             assert_eq!(releases.load(Ordering::SeqCst), 1);
+        }
+    }
+
+    #[test]
+    fn event_handler_requires_release_for_non_null_user_data() {
+        unsafe {
+            let releases = Arc::new(AtomicUsize::new(0));
+            let builder = explicit_builder();
+            let mut error = ptr::null_mut();
+
+            // Stateless callbacks remain supported (and are used by the C
+            // example): there is no owned state to release.
+            assert!(questdb_oidc_builder_event_handler(
+                builder,
+                Some(ignore_event),
+                ptr::null_mut(),
+                None,
+                &mut error,
+            ));
+            assert!(error.is_null());
+
+            // Install an owned handler so the rejected replacement also proves
+            // that a failed registration does not disturb existing ownership.
+            let owned = Box::into_raw(Box::new(Arc::clone(&releases))) as *mut c_void;
+            assert!(questdb_oidc_builder_event_handler(
+                builder,
+                Some(ignore_event),
+                owned,
+                Some(release_counter),
+                &mut error,
+            ));
+            assert_eq!(releases.load(Ordering::SeqCst), 0);
+
+            let rejected = Box::into_raw(Box::new(17_u8)) as *mut c_void;
+            assert!(!questdb_oidc_builder_event_handler(
+                builder,
+                Some(ignore_event),
+                rejected,
+                None,
+                &mut error,
+            ));
+            assert!(!error.is_null());
+            assert_eq!(
+                crate::questdb_error_get_code(error) as i32,
+                crate::line_sender_error_code::line_sender_error_invalid_api_call as i32
+            );
+            crate::questdb_error_free(error);
+
+            // Registration failed, so ownership of `rejected` stayed here.
+            drop(Box::from_raw(rejected as *mut u8));
+            assert_eq!(releases.load(Ordering::SeqCst), 0);
+            questdb_oidc_builder_free(builder);
+            assert_eq!(
+                releases.load(Ordering::SeqCst),
+                1,
+                "the previously installed state remains owned and is released once"
+            );
+        }
+    }
+
+    #[test]
+    fn replacing_event_handlers_releases_every_transferred_state_once() {
+        unsafe {
+            let releases = Arc::new(AtomicUsize::new(0));
+            let builder = explicit_builder();
+            let mut error = ptr::null_mut();
+
+            for replaced in 0..3 {
+                let user_data = Box::into_raw(Box::new(Arc::clone(&releases))) as *mut c_void;
+                assert!(questdb_oidc_builder_event_handler(
+                    builder,
+                    Some(ignore_event),
+                    user_data,
+                    Some(release_counter),
+                    &mut error,
+                ));
+                assert!(error.is_null());
+                assert_eq!(releases.load(Ordering::SeqCst), replaced);
+            }
+
+            questdb_oidc_builder_free(builder);
+            assert_eq!(releases.load(Ordering::SeqCst), 3);
         }
     }
 

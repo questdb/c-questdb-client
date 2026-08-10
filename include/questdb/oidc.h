@@ -196,11 +196,14 @@ bool questdb_oidc_builder_default_file_token_store(
     questdb_error** err_out);
 
 /**
- * Install a renderer callback. On success ownership of `user_data` transfers
- * to the builder and `release` runs exactly once after the builder and all
- * auth handles and attached transports built from it have released their last
- * reference. Final release has no thread-affinity guarantee and must return
- * normally without throwing, unwinding, or performing a non-local jump.
+ * Install a renderer callback. If `user_data` is non-NULL, `release` must also
+ * be non-NULL. On success ownership of `user_data` transfers to the builder
+ * and `release` runs exactly once after the builder and all auth handles and
+ * attached transports built from it have released their last reference. On
+ * failure ownership remains with the caller. A stateless callback may pass
+ * both `user_data` and `release` as NULL. Final release has no thread-affinity
+ * guarantee and must return normally without throwing, unwinding, or
+ * performing a non-local jump.
  */
 QUESTDB_CLIENT_API
 bool questdb_oidc_builder_event_handler(
