@@ -255,6 +255,32 @@ fn oversized_file_ignored() {
 }
 
 #[test]
+fn oversized_save_is_rejected_without_replacing_existing_token() {
+    let dir = TempDir::new().unwrap();
+    let store = FileTokenStore::at(dir.path());
+    let key = test_key();
+    let existing = test_token();
+    store.save(&key, &existing).unwrap();
+
+    let oversized = PersistedToken::new(
+        Some("x".repeat(MAX_FILE_BYTES as usize)),
+        None,
+        Some("RT-2".to_string()),
+        1_700_000_300.0,
+        300.0,
+    );
+    let error = store.save(&key, &oversized).unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("exceeding the 1048576-byte limit"),
+        "unexpected error: {error}"
+    );
+
+    assert_eq!(store.load(&key).unwrap(), Some(existing));
+}
+
+#[test]
 fn corrupt_wrong_version_and_non_object_ignored() {
     let dir = TempDir::new().unwrap();
     let store = FileTokenStore::at(dir.path());

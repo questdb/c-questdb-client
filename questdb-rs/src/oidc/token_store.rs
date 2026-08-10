@@ -71,7 +71,7 @@ const SCHEMA_VERSION: i64 = 1;
 const CANONICAL_PREFIX: &str = "questdb-oidc-token-v1";
 
 /// Cap on a token-store file. An id token with many group claims is a few KiB;
-/// 1 MiB is ample while refusing to read an unbounded (hostile) file into memory.
+/// 1 MiB is ample while refusing to persist or read an oversized file.
 const MAX_FILE_BYTES: u64 = 1 << 20;
 
 /// How long to spin trying to acquire the per-identity lock file before returning
@@ -701,6 +701,15 @@ impl TokenStore for FileTokenStore {
 
     fn save(&self, key: &TokenStoreKey, token: &PersistedToken) -> TokenStoreResult<()> {
         let content = self.serialize(key, token);
+        if content.len() as u64 > MAX_FILE_BYTES {
+            return Err(Box::new(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "serialized OIDC token-store entry is {} bytes, exceeding the {MAX_FILE_BYTES}-byte limit",
+                    content.len()
+                ),
+            )));
+        }
         self.ensure_directory()?;
         let target = self.token_file(key);
         let tmp = temp_path(&self.directory, &key.hash());
