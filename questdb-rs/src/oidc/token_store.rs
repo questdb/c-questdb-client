@@ -644,7 +644,10 @@ impl FileTokenStore {
         loop {
             match create_lock_file(lock) {
                 Ok(file) => return Ok(file),
-                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                Err(e)
+                    if e.kind() == std::io::ErrorKind::AlreadyExists
+                        || is_transient_create_contention(&e) =>
+                {
                     if Instant::now() >= deadline {
                         let detail = if self.is_stale(lock) {
                             "the lock appears stale; verify that no holder is active, then remove it manually"
@@ -941,6 +944,27 @@ fn create_lock_file(lock: &Path) -> std::io::Result<File> {
     let mut f = opts.open(lock)?;
     let _ = f.write_all(holder_bytes().as_bytes());
     Ok(f)
+}
+
+/// A failed `create_new` acquisition that reflects momentary contention rather than
+/// a settled "someone else holds it" (`AlreadyExists`), so the contender must keep
+/// polling until the deadline instead of surfacing the error.
+///
+/// On Windows a lock file that its departing holder has just unlinked lingers in a
+/// "delete pending" state until the holder's last open handle closes. During that
+/// window a concurrent `create_new` on the same path fails with `ERROR_ACCESS_DENIED`
+/// (`PermissionDenied`) instead of `AlreadyExists`, and the name frees up a moment
+/// later once the release completes. On Unix an unlink takes effect immediately and a
+/// `create_new` `PermissionDenied` always signals a genuine directory-permission
+/// problem, so it is surfaced rather than retried.
+#[cfg(windows)]
+fn is_transient_create_contention(e: &std::io::Error) -> bool {
+    e.kind() == std::io::ErrorKind::PermissionDenied
+}
+
+#[cfg(not(windows))]
+fn is_transient_create_contention(_e: &std::io::Error) -> bool {
+    false
 }
 
 /// Owns one successfully acquired lock for exactly the lifetime of the critical
