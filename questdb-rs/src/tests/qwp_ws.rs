@@ -2893,8 +2893,10 @@ fn qwp_ws_drop_interrupts_blocked_background_send() {
             .set_recv_buffer_size(4096)
             .unwrap();
         upgrade_mock_stream(&mut stream);
+        // Generous: the client's first byte can lag by seconds on a loaded CI
+        // runner even though it is milliseconds locally.
         stream
-            .set_read_timeout(Some(Duration::from_secs(5)))
+            .set_read_timeout(Some(Duration::from_secs(30)))
             .unwrap();
 
         // Observe the first data byte without consuming it, then leave the
@@ -2921,8 +2923,11 @@ fn qwp_ws_drop_interrupts_blocked_background_send() {
         .unwrap();
     sender.flush(&mut buf).unwrap();
 
+    // Only synchronises setup: wait for the blocked 8 MiB send to reach the
+    // server. Keep it generous so a slow-but-correct send on a loaded CI runner is
+    // never mistaken for the drop failing to interrupt the write.
     send_started_rx
-        .recv_timeout(Duration::from_secs(5))
+        .recv_timeout(Duration::from_secs(30))
         .unwrap();
 
     let started = Instant::now();
@@ -2954,8 +2959,11 @@ fn qwp_ws_drop_interrupts_blocked_send_after_reconnect() {
             .set_recv_buffer_size(4096)
             .unwrap();
         upgrade_mock_stream(&mut second);
+        // Generous: the byte only arrives after the client detects the dropped
+        // first connection, reconnects, and re-upgrades — a dance that can take
+        // seconds on a loaded CI runner even though it is milliseconds locally.
         second
-            .set_read_timeout(Some(Duration::from_secs(5)))
+            .set_read_timeout(Some(Duration::from_secs(30)))
             .unwrap();
         let mut byte = [0u8; 1];
         second.peek(&mut byte).unwrap();
@@ -2979,8 +2987,12 @@ fn qwp_ws_drop_interrupts_blocked_send_after_reconnect() {
         .unwrap();
     sender.flush(&mut buf).unwrap();
 
+    // Wait for the reconnect-and-send setup to reach the server. This only
+    // synchronises the setup; the behaviour under test is measured below. Keep it
+    // generous so a slow-but-correct reconnect on a loaded CI runner cannot be
+    // mistaken for the drop failing to interrupt the send.
     send_started_rx
-        .recv_timeout(Duration::from_secs(5))
+        .recv_timeout(Duration::from_secs(30))
         .unwrap();
 
     let started = Instant::now();
