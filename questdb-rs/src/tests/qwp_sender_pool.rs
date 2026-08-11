@@ -3428,7 +3428,31 @@ fn check_store_and_forward_append_timeout_rolls_back_symbols_and_keeps_chunk(ext
     let ts3 = [3_i64];
     let mut third = Chunk::new("trades");
     append_one_symbol_row(&mut third, b"gamma", &ts3);
-    sender.flush(&mut third).unwrap();
+    // `wait(Ok)` confirms server acceptance, not completion of asynchronous
+    // storage maintenance. In file mode the acknowledged segment still needs
+    // its watermark/manifest barriers and trim before byte capacity is
+    // reusable. Retry only that expected backpressure timeout; every failed
+    // attempt must preserve and roll back "gamma" just like "bravo" above.
+    let trim_deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        match sender.flush(&mut third) {
+            Ok(()) => break,
+            Err(err)
+                if err.code() == ErrorCode::SocketError
+                    && err.msg().contains("Store-and-Forward append timed out") =>
+            {
+                assert!(
+                    !third.is_empty(),
+                    "timed-out SFA retry must keep the chunk retryable"
+                );
+                assert!(
+                    Instant::now() < trim_deadline,
+                    "ACKed SFA segments were not trimmed within 30 seconds"
+                );
+            }
+            Err(err) => panic!("unexpected flush failure after ACK release: {err}"),
+        }
+    }
     sender.wait(AckLevel::Ok, Duration::from_secs(30)).unwrap();
     // The ring-filling flushes above put their own frames on the wire; the
     // "gamma" frame is the last one, since every earlier publish has been
