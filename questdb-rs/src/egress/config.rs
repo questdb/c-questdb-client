@@ -1330,15 +1330,7 @@ impl ReaderConfig {
         // Server authentication rejection remains a separate terminal AuthError
         // produced by the handshake after header construction succeeds.
         if let Some(provider) = &self.token_provider {
-            let header = provider.bearer_header().map_err(|e| {
-                let code = if e.code() == crate::ErrorCode::SocketError {
-                    crate::ErrorCode::SocketError
-                } else {
-                    crate::ErrorCode::AuthError
-                };
-                let msg = e.msg().to_owned();
-                e.reclassified(code, msg)
-            })?;
+            let header = provider.bearer_header()?;
             headers.push(("Authorization", header));
         } else if let Some(v) = self.auth.header_value() {
             headers.push(("Authorization", v));
