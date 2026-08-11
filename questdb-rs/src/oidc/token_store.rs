@@ -447,8 +447,36 @@ pub trait TokenStore: Send + Sync {
 /// `O_CREAT|O_EXCL` file and never runs an action without owning it or
 /// automatically steals a stale pathname: either operation could let two
 /// processes submit the same rotating refresh token. A stale lock is reported as
-/// a retryable error and must be removed only after the operator has verified that
-/// no holder is still active.
+/// a retryable error rather than being reclaimed automatically.
+///
+/// # Recovering an abandoned lock
+///
+/// If a lock holder is killed, aborts, or loses power, its lock can remain after
+/// the process is gone. The exact path is
+/// `<store-directory>/<TokenStoreKey::hash()>.lock`; at the default location that
+/// is `${HOME}/.questdb/oidc-tokens/<hash>.lock`, or
+/// `$QUESTDB_CLIENT_OIDC_TOKEN_STORE_DIR/<hash>.lock` when the environment
+/// override is set. [`FileTokenStore::at`] uses its supplied directory. A lock
+/// acquisition error also prints the exact path that blocked it.
+///
+/// When available, the lock contents identify its creator as
+/// `<pid>@<hostname> <creation-time-in-Unix-epoch-nanoseconds>`. Before removing
+/// a lock reported as stale, inspect those contents and verify on the named host
+/// that the PID no longer identifies the original process. If the PID still
+/// exists, compare its executable and start time with the lock's timestamp or
+/// modification time to account for PID reuse; treat a matching client process as
+/// a live holder and do not remove the lock. If the hostname is unavailable or
+/// the store directory is shared across hosts or language clients, verify every
+/// candidate host and ensure that no Rust, Java, or Python client using the same
+/// identity is still inside a token-store operation.
+///
+/// Only after establishing that the holder is gone should an operator remove that
+/// one `.lock` file; do not remove the sibling `.json` token file. If the holder
+/// cannot be ruled out, leave the lock in place. Never automate recovery with a
+/// bare unlink or check-then-rename: it can displace a live successor and allow
+/// concurrent reuse of a rotating refresh token. Any automatic recovery protocol
+/// must be race-safe and coordinated with the Java and Python clients that share
+/// this on-disk contract.
 #[derive(Debug, Clone)]
 pub struct FileTokenStore {
     directory: PathBuf,
