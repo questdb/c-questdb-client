@@ -826,8 +826,10 @@ fn at_cap_borrow_waits_for_a_return_within_acquire_timeout() {
     let held = db.borrow_sender().expect("first borrow fills the cap");
 
     let db2 = std::sync::Arc::clone(&db);
+    // Taken on this thread, before the spawn: a slow spawn may then only
+    // inflate the measured wait, never shrink it under the 100ms floor.
+    let start = std::time::Instant::now();
     let waiter = std::thread::spawn(move || {
-        let start = std::time::Instant::now();
         let borrowed = db2.borrow_sender();
         (start.elapsed(), borrowed.is_ok())
     });
@@ -5285,15 +5287,37 @@ fn manual_reap_closes_idle_buffer_senders() {
     drop(b2);
     assert_eq!(db.free_count(), 2);
 
-    // Reap before the idle timeout — nothing closed.
-    assert_eq!(db.reap_idle(), 0);
-    assert_eq!(db.free_count(), 2);
-
     // Past the timeout: reap the excess sender while preserving `sender_pool_min=1`.
+    // (The pre-timeout "reap closes nothing" half is covered deterministically
+    // by `manual_reap_ignores_senders_below_idle_timeout`.)
     thread::sleep(Duration::from_millis(120));
     let closed = db.reap_idle();
     assert_eq!(closed, 1, "the excess idle Buffer sender must be reaped");
     assert_eq!(db.free_count(), 1, "the warm minimum must remain");
+    drop(db);
+}
+
+/// Pre-timeout half of the manual-reap contract, kept separate so it stays
+/// deterministic: with the default 60s idle timeout nothing can age out
+/// mid-test, so `reap_idle` must close nothing no matter how slowly the test
+/// is scheduled. The post-timeout halves live in `manual_reap_closes_*`.
+#[test]
+fn manual_reap_ignores_senders_below_idle_timeout() {
+    let server = MockServer::spawn_acking(8);
+    let db = QuestDb::connect(&conf_for(
+        server.port(),
+        "sender_pool_min=1;sender_pool_max=3;pool_reap=manual;",
+    ))
+    .unwrap();
+
+    let b1 = db.borrow_sender().expect("b1");
+    let b2 = db.borrow_sender().expect("b2 (grow)");
+    drop(b1);
+    drop(b2);
+    assert_eq!(db.free_count(), 2);
+
+    assert_eq!(db.reap_idle(), 0);
+    assert_eq!(db.free_count(), 2);
     drop(db);
 }
 
@@ -5627,12 +5651,9 @@ fn manual_reap_closes_excess_idle_connections() {
     drop(b3);
     assert_eq!(db.free_count(), 3);
 
-    // Reap before the idle timeout — nothing should be closed.
-    let immediate = db.reap_idle();
-    assert_eq!(immediate, 0);
-    assert_eq!(db.free_count(), 3);
-
     // Wait past the idle timeout, then reap. Must keep `pool_size` warm.
+    // (Pre-timeout behavior is covered by
+    // `manual_reap_ignores_senders_below_idle_timeout`.)
     thread::sleep(Duration::from_millis(120));
     let closed = db.reap_idle();
     assert_eq!(closed, 2, "should reap the two excess-over-pool_size slots");
@@ -7939,12 +7960,9 @@ mod reader_pool {
         drop(b2);
         assert_eq!(db.reader_free_count(), 2);
 
-        // Reap before the idle timeout — nothing closed.
-        let _ = db.reap_idle();
-        assert_eq!(db.reader_free_count(), 2);
-
         // Past the timeout: with `query_pool_min=0` there is no warm floor,
-        // so every idle reader is drained.
+        // so every idle reader is drained. (Pre-timeout behavior is covered
+        // by `manual_reap_ignores_readers_below_idle_timeout`.)
         thread::sleep(Duration::from_millis(120));
         let _ = db.reap_idle();
         assert_eq!(
@@ -7952,6 +7970,29 @@ mod reader_pool {
             0,
             "idle readers past the timeout must be reaped"
         );
+        drop(db);
+    }
+
+    /// Pre-timeout half of the reader manual-reap contract; see
+    /// `manual_reap_ignores_senders_below_idle_timeout` for why it is kept
+    /// separate (default 60s idle timeout keeps it deterministic).
+    #[test]
+    fn manual_reap_ignores_readers_below_idle_timeout() {
+        let server = ReaderMockServer::spawn(8);
+        let db = QuestDb::connect(&conf_for(
+            server.port(),
+            "query_pool_min=0;query_pool_max=3;pool_reap=manual;",
+        ))
+        .unwrap();
+
+        let b1 = db.borrow_reader().expect("b1");
+        let b2 = db.borrow_reader().expect("b2 (grow)");
+        drop(b1);
+        drop(b2);
+        assert_eq!(db.reader_free_count(), 2);
+
+        assert_eq!(db.reap_idle(), 0);
+        assert_eq!(db.reader_free_count(), 2);
         drop(db);
     }
 

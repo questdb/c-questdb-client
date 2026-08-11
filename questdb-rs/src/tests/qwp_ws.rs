@@ -650,15 +650,23 @@ fn write_mock_qwp_response(
 fn spawn_recycling_server(
     action: RecycleServerAction,
     run_for: Duration,
-) -> (u16, thread::JoinHandle<usize>) {
+) -> (u16, thread::JoinHandle<usize>, Arc<AtomicUsize>) {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     listener.set_nonblocking(true).unwrap();
     let port = listener.local_addr().unwrap().port();
 
+    let connection_count = Arc::new(AtomicUsize::new(0));
+    let shared_count = Arc::clone(&connection_count);
     let handle = thread::spawn(move || {
         let deadline = Instant::now() + run_for;
+        // A stalled client may not manage its second connection inside
+        // `run_for`; keep serving (bounded) until it does, so the callers'
+        // non-vacuity lower bound cannot flip on a slow machine. A longer
+        // quiet window only lowers the connection rate, so the pacing upper
+        // bound stays in the safe direction.
+        let hard_deadline = Instant::now() + Duration::from_secs(10);
         let mut connections = 0usize;
-        while Instant::now() < deadline {
+        while Instant::now() < deadline || (connections < 2 && Instant::now() < hard_deadline) {
             match listener.accept() {
                 Ok((mut stream, _)) => {
                     // The listener is non-blocking so the accept loop can honor
@@ -677,6 +685,7 @@ fn spawn_recycling_server(
                     match read_frame(&mut stream) {
                         Ok((_fin, 0x2, _payload)) => {
                             connections += 1;
+                            shared_count.store(connections, Ordering::Release);
                             match action {
                                 RecycleServerAction::WriteError => {
                                     write_qwp_error_response(
@@ -714,7 +723,7 @@ fn spawn_recycling_server(
         connections
     });
 
-    (port, handle)
+    (port, handle, connection_count)
 }
 
 fn spawn_stalled_after_first_frame_server() -> (u16, mpsc::Receiver<Vec<u8>>, mpsc::Sender<()>) {
@@ -783,7 +792,15 @@ fn spawn_delayed_durable_ack_server() -> (
 
         durable_rx.recv_timeout(Duration::from_secs(5)).unwrap();
         write_qwp_durable_ack_response(&mut stream, &[("trades", 10)]).unwrap();
-        thread::sleep(Duration::from_millis(50));
+        // Hold the socket open until the client has consumed the durable ack
+        // and closed: dropping after a fixed sleep can turn into an RST that
+        // discards the still-buffered ack on a slow client (keepalive pings
+        // land after our last read). The read timeout bounds the hold.
+        stream
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .unwrap();
+        let mut sink = [0u8; 256];
+        while matches!(stream.read(&mut sink), Ok(n) if n > 0) {}
     });
 
     (port, frame_rx, ok_tx, durable_tx)
@@ -1028,7 +1045,14 @@ fn spawn_upgrade_only_server() -> u16 {
     thread::spawn(move || {
         let (mut stream, _) = listener.accept().unwrap();
         perform_server_upgrade(&mut stream).unwrap();
-        thread::sleep(Duration::from_millis(50));
+        // Never respond, but stay alive until the client closes: dying after
+        // a fixed sleep turns a slow client's later flush/close into an
+        // RST-surfacing path instead of the silent-server path under test.
+        stream
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .unwrap();
+        let mut sink = [0u8; 256];
+        while matches!(stream.read(&mut sink), Ok(n) if n > 0) {}
     });
 
     port
@@ -2665,7 +2689,13 @@ fn qwp_ws_close_flush_timeout_minus_one_skips_close_drain_wait() {
         upgrade_mock_stream(&mut stream);
         let (_fin, _opcode, payload) = read_frame(&mut stream).unwrap();
         frame_tx.send(payload).unwrap();
-        thread::sleep(Duration::from_millis(500));
+        // Stay silent but alive until the client closes, so a fast
+        // `close_drain` is provably "skipped the wait" and not "server went
+        // away". If close regresses into waiting for the un-acked frame, the
+        // 5s read timeout above ends the hold and unblocks it via EOF, which
+        // the elapsed assertion below then catches.
+        let mut sink = [0u8; 256];
+        while matches!(stream.read(&mut sink), Ok(n) if n > 0) {}
     });
 
     let conf = format!("ws::addr=127.0.0.1:{port};close_flush_timeout_millis=-1;");
@@ -2685,8 +2715,11 @@ fn qwp_ws_close_flush_timeout_minus_one_skips_close_drain_wait() {
 
     let started = Instant::now();
     sender.close_drain().unwrap();
+    // 2s is far above any scheduler stall but well below the ~5s a close that
+    // regressed into waiting for the un-acked frame would take (see the
+    // server hold above).
     assert!(
-        started.elapsed() < Duration::from_millis(250),
+        started.elapsed() < Duration::from_secs(2),
         "close_drain waited despite close_flush_timeout_millis=-1"
     );
     drop(sender);
@@ -5004,7 +5037,7 @@ fn qwp_ws_orderly_close_reconnects_without_poison_strike() {
 
 fn run_paced_recycle_scenario(action: RecycleServerAction) -> usize {
     let run_for = Duration::from_millis(900);
-    let (port, handle) = spawn_recycling_server(action, run_for);
+    let (port, handle, connection_count) = spawn_recycling_server(action, run_for);
     let mut sender = SenderBuilder::new(Protocol::Ws, "127.0.0.1", port)
         .max_frame_rejections(1000)
         .unwrap()
@@ -5028,6 +5061,13 @@ fn run_paced_recycle_scenario(action: RecycleServerAction) -> usize {
     sender.flush_and_get_fsn(&mut buf).unwrap().unwrap();
 
     thread::sleep(run_for);
+    // Keep the sender alive until the reconnect that makes the callers'
+    // lower bound meaningful has happened; bounded by the server's own 10s
+    // hard deadline, after which the count assert fails loudly.
+    let wait_deadline = Instant::now() + Duration::from_secs(10);
+    while connection_count.load(Ordering::Acquire) < 2 && Instant::now() < wait_deadline {
+        thread::sleep(Duration::from_millis(10));
+    }
     drop(sender);
     handle.join().unwrap()
 }
@@ -6917,7 +6957,13 @@ fn spawn_max_batch_size_upgrade_only_server(max_batch_size: Option<usize>) -> u1
     thread::spawn(move || {
         let (mut stream, _) = listener.accept().unwrap();
         upgrade_mock_stream_with_max_batch_size(&mut stream, max_batch_size);
-        thread::sleep(Duration::from_millis(200));
+        // Silent but alive until the client closes; see
+        // `spawn_upgrade_only_server`.
+        stream
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .unwrap();
+        let mut sink = [0u8; 256];
+        while matches!(stream.read(&mut sink), Ok(n) if n > 0) {}
     });
     port
 }

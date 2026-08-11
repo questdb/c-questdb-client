@@ -9205,6 +9205,10 @@ mod tests {
 
     #[test]
     fn poison_dwell_driver_holds_terminal_until_window_elapses() {
+        // The 2s window buys stall headroom: the pre-sleep asserts require
+        // the window not to elapse before the second drive, and a scheduler
+        // stall of that size between adjacent statements does not happen. A
+        // shorter window flaked on loaded CI machines.
         let mut driver = QwpWsCoreTestHarness::from_queue_with_rejection_limit_and_window(
             memory_queue(options(8, 1024)),
             FakeOrderedServer::scripted([
@@ -9213,7 +9217,7 @@ mod tests {
                 FakeSendResult::RejectWire { wire_seq: 2 },
             ]),
             2,
-            Duration::from_millis(200),
+            Duration::from_secs(2),
         );
         let receipt = driver.try_submit(b"payload").unwrap();
 
@@ -9234,7 +9238,7 @@ mod tests {
             QwpReceiptStatus::Published { fsn: 0 }
         );
 
-        std::thread::sleep(Duration::from_millis(250));
+        std::thread::sleep(Duration::from_millis(2300));
         assert_eq!(driver.drive_once().unwrap(), DriveOutcome::Terminal);
         assert_eq!(
             driver.receipt_status(receipt),
