@@ -60,6 +60,9 @@ class pool;
  * The released `questdb::ingress::line_sender_error_code` remains an alias of
  * this type.
  */
+// clang-format off: the Rust test `mirrors_of_the_c_error_code_enum_are_complete`
+// parses this enum expecting exactly one `<short> = ::line_sender_error_<short>,`
+// per line; reflowing a long entry across two lines breaks the mirror check.
 enum class error_code : int
 {
     could_not_resolve_addr = ::line_sender_error_could_not_resolve_addr,
@@ -77,8 +80,7 @@ enum class error_code : int
     protocol_version_error = ::line_sender_error_protocol_version_error,
     invalid_decimal = ::line_sender_error_invalid_decimal,
     server_rejection = ::line_sender_error_server_rejection,
-    arrow_unsupported_column_kind =
-        ::line_sender_error_arrow_unsupported_column_kind,
+    arrow_unsupported_column_kind = ::line_sender_error_arrow_unsupported_column_kind,
     arrow_ingest = ::line_sender_error_arrow_ingest,
     failover_retry = ::line_sender_error_failover_retry,
     role_mismatch = ::line_sender_error_role_mismatch,
@@ -103,6 +105,7 @@ enum class error_code : int
     store_resend_required = ::line_sender_error_store_resend_required,
     symbol_dict_full = ::line_sender_error_symbol_dict_full,
 };
+// clang-format on
 
 // Bridge equality between the C++ `questdb::error_code` and the released C ABI
 // enum `::line_sender_error_code` (identical `int` values), so existing
