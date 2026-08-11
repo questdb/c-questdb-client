@@ -25,41 +25,41 @@
 #include <stdexcept>
 
 #ifdef _WIN32
-#include <winsock2.h>
-#include <ws2tcpip.h>
-#pragma comment(lib, "Ws2_32.lib")
+#    include <winsock2.h>
+#    include <ws2tcpip.h>
+#    pragma comment(lib, "Ws2_32.lib")
 using socket_t = SOCKET;
 using ssize_t = std::intptr_t;
-#define INVALID_SOCKET_VALUE INVALID_SOCKET
-#define close_socket(s) closesocket(s)
+#    define INVALID_SOCKET_VALUE INVALID_SOCKET
+#    define close_socket(s) closesocket(s)
 // Winsock spells the shutdown constants differently.
-#define QWP_SHUT_RDWR SD_BOTH
-#define QWP_SHUT_WR   SD_SEND
+#    define QWP_SHUT_RDWR SD_BOTH
+#    define QWP_SHUT_WR SD_SEND
 // Windows TCP has no SIGPIPE; closed-peer writes return WSAECONNRESET.
-#define QWP_MSG_NOSIGNAL 0
+#    define QWP_MSG_NOSIGNAL 0
 #else
-#include <arpa/inet.h>
-#include <netinet/in.h>
-#include <sys/socket.h>
-#include <sys/time.h>
-#include <unistd.h>
-#include <netinet/tcp.h>
-#include <cerrno>
+#    include <arpa/inet.h>
+#    include <netinet/in.h>
+#    include <sys/socket.h>
+#    include <sys/time.h>
+#    include <unistd.h>
+#    include <netinet/tcp.h>
+#    include <cerrno>
 using socket_t = int;
-#define INVALID_SOCKET_VALUE (-1)
-#define close_socket(s) ::close(s)
-#define QWP_SHUT_RDWR SHUT_RDWR
-#define QWP_SHUT_WR   SHUT_WR
+#    define INVALID_SOCKET_VALUE (-1)
+#    define close_socket(s) ::close(s)
+#    define QWP_SHUT_RDWR SHUT_RDWR
+#    define QWP_SHUT_WR SHUT_WR
 // Suppress SIGPIPE on closed-peer writes. Linux exposes the flag per
 // `send()` call (`MSG_NOSIGNAL`); macOS/BSD exposes it as a per-socket
 // option (`SO_NOSIGPIPE` set via `setsockopt`). Define both portably so
 // the mock server can refuse to take down the test process when a
 // client closes the connection mid-frame.
-#ifdef MSG_NOSIGNAL
-#define QWP_MSG_NOSIGNAL MSG_NOSIGNAL
-#else
-#define QWP_MSG_NOSIGNAL 0
-#endif
+#    ifdef MSG_NOSIGNAL
+#        define QWP_MSG_NOSIGNAL MSG_NOSIGNAL
+#    else
+#        define QWP_MSG_NOSIGNAL 0
+#    endif
 #endif
 
 namespace
@@ -73,8 +73,7 @@ inline void set_no_sigpipe([[maybe_unused]] socket_t fd)
 {
 #if defined(SO_NOSIGPIPE)
     int one = 1;
-    (void)::setsockopt(
-        fd, SOL_SOCKET, SO_NOSIGPIPE, &one, sizeof(one));
+    (void)::setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &one, sizeof(one));
 #endif
 }
 } // namespace
@@ -98,7 +97,10 @@ struct Sha1State
     size_t buf_len;
 };
 
-inline uint32_t rotl(uint32_t x, int n) { return (x << n) | (x >> (32 - n)); }
+inline uint32_t rotl(uint32_t x, int n)
+{
+    return (x << n) | (x >> (32 - n));
+}
 
 void sha1_init(Sha1State& s)
 {
@@ -116,7 +118,8 @@ void sha1_compress(Sha1State& s, const uint8_t* block)
     uint32_t w[80];
     for (int i = 0; i < 16; ++i)
     {
-        w[i] = (uint32_t(block[i * 4]) << 24) | (uint32_t(block[i * 4 + 1]) << 16) |
+        w[i] = (uint32_t(block[i * 4]) << 24) |
+               (uint32_t(block[i * 4 + 1]) << 16) |
                (uint32_t(block[i * 4 + 2]) << 8) | uint32_t(block[i * 4 + 3]);
     }
     for (int i = 16; i < 80; ++i)
@@ -259,7 +262,9 @@ void encode_varint_u64(uint64_t v, std::vector<uint8_t>& out)
 }
 
 std::vector<uint8_t> framed(
-    uint8_t version, uint8_t flags, uint16_t table_count,
+    uint8_t version,
+    uint8_t flags,
+    uint16_t table_count,
     const std::vector<uint8_t>& payload)
 {
     std::vector<uint8_t> out;
@@ -329,7 +334,8 @@ std::vector<uint8_t> result_end_frame(int64_t request_id)
     for (int i = 0; i < 8; ++i)
         p.push_back(uint8_t(request_id >> (i * 8)));
     encode_varint_u64(0, p); // final_seq
-    encode_varint_u64(0, p); // total_rows (not asserted by client beyond plumbing)
+    encode_varint_u64(
+        0, p); // total_rows (not asserted by client beyond plumbing)
     return framed(1, 0, 0, p);
 }
 
@@ -380,8 +386,10 @@ std::vector<uint8_t> ingress_ok_frame(uint64_t wire_seq)
 }
 
 std::vector<uint8_t> result_batch_frame(
-    int64_t request_id, uint64_t batch_seq,
-    size_t row_count, const std::vector<ColumnSpec>& columns)
+    int64_t request_id,
+    uint64_t batch_seq,
+    size_t row_count,
+    const std::vector<ColumnSpec>& columns)
 {
     std::vector<uint8_t> p;
     p.push_back(MSG_RESULT_BATCH);
@@ -417,8 +425,10 @@ std::vector<uint8_t> result_batch_frame(
 }
 
 std::vector<uint8_t> result_batch_frame_with_dict(
-    int64_t request_id, uint64_t batch_seq,
-    size_t row_count, const std::vector<ColumnSpec>& columns,
+    int64_t request_id,
+    uint64_t batch_seq,
+    size_t row_count,
+    const std::vector<ColumnSpec>& columns,
     uint64_t dict_delta_start,
     const std::vector<std::string>& dict_entries)
 {
@@ -486,13 +496,15 @@ std::vector<uint8_t> fixed_column_bytes_nullable(
 {
     assert(is_null.size() == row_count);
     std::vector<uint8_t> out;
-    bool any_null = std::any_of(is_null.begin(), is_null.end(),
-                                [](bool b) { return b; });
+    bool any_null =
+        std::any_of(is_null.begin(), is_null.end(), [](bool b) { return b; });
     if (!any_null)
     {
         out.push_back(0x00);
-        out.insert(out.end(), packed_non_null_values.begin(),
-                   packed_non_null_values.end());
+        out.insert(
+            out.end(),
+            packed_non_null_values.begin(),
+            packed_non_null_values.end());
         return out;
     }
     out.push_back(0x01); // null_flag = validity present
@@ -502,8 +514,10 @@ std::vector<uint8_t> fixed_column_bytes_nullable(
         if (is_null[i])
             bitmap[i >> 3] |= uint8_t(1u << (i & 7));
     out.insert(out.end(), bitmap.begin(), bitmap.end());
-    out.insert(out.end(), packed_non_null_values.begin(),
-               packed_non_null_values.end());
+    out.insert(
+        out.end(),
+        packed_non_null_values.begin(),
+        packed_non_null_values.end());
     (void)elem_size;
     return out;
 }
@@ -517,8 +531,7 @@ std::vector<uint8_t> varlen_column_bytes(
     // raw data. Note: the egress decoder expects offsets *immediately
     // after* the null_flag, no varint length prefix.
     uint32_t off = 0;
-    auto push_u32 = [&](uint32_t v)
-    {
+    auto push_u32 = [&](uint32_t v) {
         out.push_back(uint8_t(v));
         out.push_back(uint8_t(v >> 8));
         out.push_back(uint8_t(v >> 16));
@@ -562,8 +575,8 @@ std::vector<uint8_t> decimal256_column_bytes(
     const std::vector<std::array<uint8_t, 32>>& values, int8_t scale)
 {
     std::vector<uint8_t> out;
-    out.push_back(0x00);                  // validity: no nulls
-    out.push_back(uint8_t(scale));        // 1B scale (decode_decimal_wide reads u8)
+    out.push_back(0x00);           // validity: no nulls
+    out.push_back(uint8_t(scale)); // 1B scale (decode_decimal_wide reads u8)
     for (const auto& v : values)
         out.insert(out.end(), v.begin(), v.end());
     return out;
@@ -575,8 +588,8 @@ std::vector<uint8_t> geohash_column_bytes(
     uint8_t precision_bits)
 {
     std::vector<uint8_t> out;
-    bool any_null = std::any_of(is_null.begin(), is_null.end(),
-                                [](bool b) { return b; });
+    bool any_null =
+        std::any_of(is_null.begin(), is_null.end(), [](bool b) { return b; });
     if (!any_null)
     {
         out.push_back(0x00);
@@ -592,8 +605,10 @@ std::vector<uint8_t> geohash_column_bytes(
         out.insert(out.end(), bitmap.begin(), bitmap.end());
     }
     encode_varint_u64(uint64_t(precision_bits), out);
-    out.insert(out.end(), packed_non_null_values.begin(),
-               packed_non_null_values.end());
+    out.insert(
+        out.end(),
+        packed_non_null_values.begin(),
+        packed_non_null_values.end());
     return out;
 }
 
@@ -601,8 +616,10 @@ std::vector<uint8_t> array_column_bytes(
     const std::vector<std::optional<ArrayRow>>& rows)
 {
     std::vector<uint8_t> out;
-    bool any_null = std::any_of(rows.begin(), rows.end(),
-                                [](const std::optional<ArrayRow>& r) { return !r.has_value(); });
+    bool any_null = std::any_of(
+        rows.begin(), rows.end(), [](const std::optional<ArrayRow>& r) {
+            return !r.has_value();
+        });
     if (!any_null)
     {
         out.push_back(0x00);
@@ -645,13 +662,15 @@ bool send_all(socket_t fd, const uint8_t* data, size_t len)
 {
     while (len > 0)
     {
-        ssize_t n = ::send(fd, reinterpret_cast<const char*>(data),
+        ssize_t n = ::send(
+            fd,
+            reinterpret_cast<const char*>(data),
 #ifdef _WIN32
-                           int(len),
+            int(len),
 #else
-                           len,
+            len,
 #endif
-                           QWP_MSG_NOSIGNAL);
+            QWP_MSG_NOSIGNAL);
         if (n <= 0)
             return false;
         data += n;
@@ -664,13 +683,15 @@ bool recv_all(socket_t fd, uint8_t* data, size_t len)
 {
     while (len > 0)
     {
-        ssize_t n = ::recv(fd, reinterpret_cast<char*>(data),
+        ssize_t n = ::recv(
+            fd,
+            reinterpret_cast<char*>(data),
 #ifdef _WIN32
-                           int(len),
+            int(len),
 #else
-                           len,
+            len,
 #endif
-                           0);
+            0);
         if (n <= 0)
             return false;
         data += n;
@@ -692,8 +713,7 @@ bool ws_handshake(socket_t fd, bool reject_401)
         if (n <= 0)
             return false;
         buf.push_back(b);
-        if (buf.size() >= 4 &&
-            buf.compare(buf.size() - 4, 4, "\r\n\r\n") == 0)
+        if (buf.size() >= 4 && buf.compare(buf.size() - 4, 4, "\r\n\r\n") == 0)
             break;
         if (buf.size() > 8192)
             return false;
@@ -723,8 +743,9 @@ bool ws_handshake(socket_t fd, bool reject_401)
             if (colon == std::string::npos)
                 continue;
             std::string name = line.substr(0, colon);
-            std::transform(name.begin(), name.end(), name.begin(),
-                           [](char c) { return char(std::tolower(c)); });
+            std::transform(name.begin(), name.end(), name.begin(), [](char c) {
+                return char(std::tolower(c));
+            });
             std::string value = line.substr(colon + 1);
             size_t vs = value.find_first_not_of(" \t");
             size_t ve = value.find_last_not_of(" \t");
@@ -763,8 +784,8 @@ bool ws_handshake(socket_t fd, bool reject_401)
         "X-QWP-Version: 1\r\n"
         "Sec-WebSocket-Accept: " +
         accept + "\r\n\r\n";
-    return send_all(fd, reinterpret_cast<const uint8_t*>(resp.data()),
-                    resp.size());
+    return send_all(
+        fd, reinterpret_cast<const uint8_t*>(resp.data()), resp.size());
 }
 
 // Read a single WebSocket frame from `fd`. Returns:
@@ -858,7 +879,9 @@ void graceful_close(socket_t fd)
 #ifdef _WIN32
     DWORD drain_timeout_ms = 500;
     (void)::setsockopt(
-        fd, SOL_SOCKET, SO_RCVTIMEO,
+        fd,
+        SOL_SOCKET,
+        SO_RCVTIMEO,
         reinterpret_cast<const char*>(&drain_timeout_ms),
         sizeof(drain_timeout_ms));
 #else
@@ -868,13 +891,15 @@ void graceful_close(socket_t fd)
         fd, SOL_SOCKET, SO_RCVTIMEO, &drain_timeout, sizeof(drain_timeout));
 #endif
     char drain_buf[512];
-    while (::recv(fd, drain_buf,
+    while (::recv(
+               fd,
+               drain_buf,
 #ifdef _WIN32
-                  int(sizeof(drain_buf)),
+               int(sizeof(drain_buf)),
 #else
-                  sizeof(drain_buf),
+               sizeof(drain_buf),
 #endif
-                  0) > 0)
+               0) > 0)
     {
     }
     close_socket(fd);
@@ -912,7 +937,8 @@ bool ws_write_binary(socket_t fd, const std::vector<uint8_t>& payload)
 // the request_id from a QUERY_REQUEST (offset 1, i64 LE) when the
 // expected kind is QUERY_REQUEST; -1 otherwise. Returns -1 on error.
 int64_t read_until_kind(
-    socket_t fd, uint8_t expected_kind,
+    socket_t fd,
+    uint8_t expected_kind,
     std::vector<std::vector<uint8_t>>& out_captured,
     std::mutex& out_captured_mtx)
 {
@@ -973,14 +999,15 @@ struct MockServer::Impl
     static void wsa_init()
     {
         static std::once_flag once;
-        std::call_once(once, []
-        {
+        std::call_once(once, [] {
             WSADATA wsa;
             WSAStartup(MAKEWORD(2, 2), &wsa);
         });
     }
 #else
-    static void wsa_init() {}
+    static void wsa_init()
+    {
+    }
 #endif
 
     void run_listener()
@@ -1035,10 +1062,10 @@ struct MockServer::Impl
 
         int64_t last_request_id = 0;
 #ifdef _MSC_VER
-#pragma warning(push)
+#    pragma warning(push)
 // MSVC C4456 fires spuriously on `auto* a = std::get_if<>(...)` in
 // successive `else if` branches even though each branch has its own scope.
-#pragma warning(disable : 4456)
+#    pragma warning(disable : 4456)
 #endif
         for (const auto& action : script)
         {
@@ -1050,8 +1077,12 @@ struct MockServer::Impl
             else if (auto* a = std::get_if<ActionSendServerInfo>(&action))
             {
                 auto frame = server_info_frame(
-                    a->role, a->cluster_id, a->node_id,
-                    a->epoch, a->capabilities, a->server_wall_ns,
+                    a->role,
+                    a->cluster_id,
+                    a->node_id,
+                    a->epoch,
+                    a->capabilities,
+                    a->server_wall_ns,
                     a->zone_id);
                 if (!ws_write_binary(fd, frame))
                 {
@@ -1061,8 +1092,8 @@ struct MockServer::Impl
             }
             else if (std::holds_alternative<ActionAwaitQueryRequest>(action))
             {
-                int64_t rid =
-                    read_until_kind(fd, MSG_QUERY_REQUEST, captured, captured_mtx);
+                int64_t rid = read_until_kind(
+                    fd, MSG_QUERY_REQUEST, captured, captured_mtx);
                 if (rid < 0)
                 {
                     close_socket(fd);
@@ -1072,8 +1103,8 @@ struct MockServer::Impl
             }
             else if (auto* a = std::get_if<ActionAwaitClientFrame>(&action))
             {
-                int64_t rc =
-                    read_until_kind(fd, a->expected_msg_kind, captured, captured_mtx);
+                int64_t rc = read_until_kind(
+                    fd, a->expected_msg_kind, captured, captured_mtx);
                 if (rc < 0)
                 {
                     close_socket(fd);
@@ -1131,7 +1162,7 @@ struct MockServer::Impl
             }
         }
 #ifdef _MSC_VER
-#pragma warning(pop)
+#    pragma warning(pop)
 #endif
 
         // End of script: graceful close (WS Close frame, then TCP
@@ -1156,8 +1187,12 @@ MockServer::MockServer(std::vector<Script> scripts)
         throw std::runtime_error("socket() failed");
 
     int one = 1;
-    ::setsockopt(_impl->listen_fd, SOL_SOCKET, SO_REUSEADDR,
-                 reinterpret_cast<const char*>(&one), sizeof(one));
+    ::setsockopt(
+        _impl->listen_fd,
+        SOL_SOCKET,
+        SO_REUSEADDR,
+        reinterpret_cast<const char*>(&one),
+        sizeof(one));
 
     sockaddr_in addr{};
     addr.sin_family = AF_INET;

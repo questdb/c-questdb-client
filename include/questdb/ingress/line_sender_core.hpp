@@ -77,7 +77,8 @@ enum class error_code : int
     protocol_version_error = ::line_sender_error_protocol_version_error,
     invalid_decimal = ::line_sender_error_invalid_decimal,
     server_rejection = ::line_sender_error_server_rejection,
-    arrow_unsupported_column_kind = ::line_sender_error_arrow_unsupported_column_kind,
+    arrow_unsupported_column_kind =
+        ::line_sender_error_arrow_unsupported_column_kind,
     arrow_ingest = ::line_sender_error_arrow_ingest,
     failover_retry = ::line_sender_error_failover_retry,
     role_mismatch = ::line_sender_error_role_mismatch,
@@ -165,7 +166,8 @@ public:
     {
         ::questdb_error* c_err{nullptr};
         auto result = f(std::forward<Args>(args)..., &c_err);
-        if (c_err) throw from_c(c_err);
+        if (c_err)
+            throw from_c(c_err);
         return result;
     }
 
@@ -261,13 +263,10 @@ inline qwp_ws_error qwp_ws_error_from_view(
     const ::line_sender_qwpws_error_view& view)
 {
     return qwp_ws_error{
-        static_cast<qwp_ws_error_category>(
-            static_cast<int>(view.category)),
-        static_cast<qwp_ws_error_policy>(
-            static_cast<int>(view.applied_policy)),
-        view.has_status
-            ? std::optional<uint8_t>{view.status}
-            : std::optional<uint8_t>{},
+        static_cast<qwp_ws_error_category>(static_cast<int>(view.category)),
+        static_cast<qwp_ws_error_policy>(static_cast<int>(view.applied_policy)),
+        view.has_status ? std::optional<uint8_t>{view.status}
+                        : std::optional<uint8_t>{},
         std::string{
             view.message ? view.message : "",
             view.message ? view.message_len : 0},
@@ -362,10 +361,9 @@ public:
 private:
     inline static line_sender_error from_c(::line_sender_error* c_err)
     {
-        const std::unique_ptr<
-            ::line_sender_error,
-            decltype(&::line_sender_error_free)>
-            owned_err{c_err, ::line_sender_error_free};
+        const std::
+            unique_ptr<::line_sender_error, decltype(&::line_sender_error_free)>
+                owned_err{c_err, ::line_sender_error_free};
         line_sender_error_code code = static_cast<line_sender_error_code>(
             static_cast<int>(::line_sender_error_get_code(owned_err.get())));
         size_t c_len{0};

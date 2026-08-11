@@ -116,35 +116,35 @@ extern "C" {
  */
 typedef enum qwp_reader_column_kind
 {
-    qwp_reader_column_kind_boolean         = 0x01,
-    qwp_reader_column_kind_byte            = 0x02,
-    qwp_reader_column_kind_short           = 0x03,
-    qwp_reader_column_kind_int             = 0x04,
-    qwp_reader_column_kind_long            = 0x05,
-    qwp_reader_column_kind_float           = 0x06,
-    qwp_reader_column_kind_double          = 0x07,
-    qwp_reader_column_kind_symbol          = 0x09,
-    qwp_reader_column_kind_timestamp       = 0x0A,
-    qwp_reader_column_kind_date            = 0x0B,
-    qwp_reader_column_kind_uuid            = 0x0C,
-    qwp_reader_column_kind_long256         = 0x0D,
-    qwp_reader_column_kind_geohash         = 0x0E,
-    qwp_reader_column_kind_varchar         = 0x0F,
+    qwp_reader_column_kind_boolean = 0x01,
+    qwp_reader_column_kind_byte = 0x02,
+    qwp_reader_column_kind_short = 0x03,
+    qwp_reader_column_kind_int = 0x04,
+    qwp_reader_column_kind_long = 0x05,
+    qwp_reader_column_kind_float = 0x06,
+    qwp_reader_column_kind_double = 0x07,
+    qwp_reader_column_kind_symbol = 0x09,
+    qwp_reader_column_kind_timestamp = 0x0A,
+    qwp_reader_column_kind_date = 0x0B,
+    qwp_reader_column_kind_uuid = 0x0C,
+    qwp_reader_column_kind_long256 = 0x0D,
+    qwp_reader_column_kind_geohash = 0x0E,
+    qwp_reader_column_kind_varchar = 0x0F,
     qwp_reader_column_kind_timestamp_nanos = 0x10,
-    qwp_reader_column_kind_double_array    = 0x11,
-    qwp_reader_column_kind_long_array      = 0x12,
-    qwp_reader_column_kind_decimal64       = 0x13,
-    qwp_reader_column_kind_decimal128      = 0x14,
-    qwp_reader_column_kind_decimal256      = 0x15,
-    qwp_reader_column_kind_char            = 0x16,
-    qwp_reader_column_kind_binary          = 0x17,
-    qwp_reader_column_kind_ipv4            = 0x18,
+    qwp_reader_column_kind_double_array = 0x11,
+    qwp_reader_column_kind_long_array = 0x12,
+    qwp_reader_column_kind_decimal64 = 0x13,
+    qwp_reader_column_kind_decimal128 = 0x14,
+    qwp_reader_column_kind_decimal256 = 0x15,
+    qwp_reader_column_kind_char = 0x16,
+    qwp_reader_column_kind_binary = 0x17,
+    qwp_reader_column_kind_ipv4 = 0x18,
     /** Sentinel for column kinds the running FFI build doesn't
      *  recognise. Emitted when the upstream Rust crate adds a new
      *  `ColumnKind` variant the C ABI hasn't been recompiled against
      *  yet. Treat as opaque: skip / log / surface to ops rather than
      *  route on it. */
-    qwp_reader_column_kind_unknown         = 0xFF,
+    qwp_reader_column_kind_unknown = 0xFF,
 } qwp_reader_column_kind;
 
 /////////// Reader.
@@ -168,10 +168,10 @@ typedef struct qwp_reader_query qwp_reader_query;
 /**
  * Construct a reader from a QuestDB config string.
  *
- * The config string follows the same format as the Rust `ReaderConfig::from_conf`
- * API (e.g. `"ws::addr=localhost:9000;"`). On success returns a non-NULL handle
- * that must be released with `qwp_reader_close`. On failure returns NULL and
- * sets `*err_out`.
+ * The config string follows the same format as the Rust
+ * `ReaderConfig::from_conf` API (e.g. `"ws::addr=localhost:9000;"`). On success
+ * returns a non-NULL handle that must be released with `qwp_reader_close`. On
+ * failure returns NULL and sets `*err_out`.
  *
  * The `config` payload is re-validated as UTF-8 on entry; a hand-rolled
  * `line_sender_utf8` carrying invalid bytes (i.e. one not built via
@@ -184,8 +184,7 @@ typedef struct qwp_reader_query qwp_reader_query;
  */
 QUESTDB_CLIENT_API
 qwp_reader* qwp_reader_from_conf(
-    line_sender_utf8 config,
-    questdb_error** err_out);
+    line_sender_utf8 config, questdb_error** err_out);
 
 /**
  * Construct a reader from the configuration stored in the
@@ -206,8 +205,7 @@ qwp_reader* qwp_reader_from_conf(
  * @return Reader handle or NULL.
  */
 QUESTDB_CLIENT_API
-qwp_reader* qwp_reader_from_env(
-    questdb_error** err_out);
+qwp_reader* qwp_reader_from_env(questdb_error** err_out);
 
 /**
  * Close the reader and release all associated resources. Idempotent on NULL.
@@ -261,9 +259,7 @@ void qwp_reader_drop_on_return(qwp_reader* reader);
  * was called first, or if the pool has been closed).
  */
 QUESTDB_CLIENT_API
-qwp_reader* questdb_db_borrow_reader(
-    questdb_db* db,
-    questdb_error** err_out);
+qwp_reader* questdb_db_borrow_reader(questdb_db* db, questdb_error** err_out);
 
 /** Snapshot of idle reader count. Diagnostics / test-only; not part of
  *  the supported API surface. */
@@ -296,8 +292,7 @@ uint8_t qwp_reader_has_active_query(const qwp_reader* reader);
 QUESTDB_CLIENT_API uint64_t qwp_reader_bytes_received(const qwp_reader*);
 
 /** Cumulative CREDIT bytes granted to the server across this reader. */
-QUESTDB_CLIENT_API uint64_t
-qwp_reader_credit_granted_total(const qwp_reader*);
+QUESTDB_CLIENT_API uint64_t qwp_reader_credit_granted_total(const qwp_reader*);
 
 /** Cumulative wall-clock nanoseconds spent in `read` calls (saturating). */
 QUESTDB_CLIENT_API uint64_t qwp_reader_read_ns(const qwp_reader*);
@@ -320,9 +315,7 @@ QUESTDB_CLIENT_API void qwp_reader_reset_timing(qwp_reader*);
  */
 QUESTDB_CLIENT_API
 bool qwp_reader_server_version(
-    const qwp_reader* reader,
-    uint8_t* out_version,
-    questdb_error** err_out);
+    const qwp_reader* reader, uint8_t* out_version, questdb_error** err_out);
 
 /**
  * Borrow the current endpoint host as a UTF-8 byte slice. The pointer is
@@ -334,9 +327,7 @@ bool qwp_reader_server_version(
  */
 QUESTDB_CLIENT_API
 void qwp_reader_current_addr_host(
-    const qwp_reader* reader,
-    const char** out_buf,
-    size_t* out_len);
+    const qwp_reader* reader, const char** out_buf, size_t* out_len);
 
 /**
  * Port of the endpoint the reader is currently connected to.
@@ -361,13 +352,13 @@ typedef struct qwp_reader_server_info qwp_reader_server_info;
 /** Cluster role advertised by `SERVER_INFO`. */
 typedef enum qwp_reader_server_role
 {
-    qwp_reader_server_role_standalone       = 0,
-    qwp_reader_server_role_primary          = 1,
-    qwp_reader_server_role_replica          = 2,
-    qwp_reader_server_role_primary_catchup  = 3,
+    qwp_reader_server_role_standalone = 0,
+    qwp_reader_server_role_primary = 1,
+    qwp_reader_server_role_replica = 2,
+    qwp_reader_server_role_primary_catchup = 3,
     /** Forward-compat: a server role this client doesn't recognise. The
      *  raw byte is available via `qwp_reader_server_info_role_byte`. */
-    qwp_reader_server_role_other            = 0xFF,
+    qwp_reader_server_role_other = 0xFF,
 } qwp_reader_server_role;
 
 /**
@@ -380,7 +371,8 @@ typedef enum qwp_reader_server_role
  * connection metadata).
  */
 QUESTDB_CLIENT_API
-const qwp_reader_server_info* qwp_reader_current_server_info(const qwp_reader* reader);
+const qwp_reader_server_info* qwp_reader_current_server_info(
+    const qwp_reader* reader);
 
 /** Cluster role advertised by `SERVER_INFO`. */
 QUESTDB_CLIENT_API qwp_reader_server_role
@@ -477,46 +469,53 @@ typedef struct qwp_reader_failover_reset_event qwp_reader_failover_reset_event;
  * that `user_data` remains valid and is safe to access there.
  */
 typedef void (*qwp_reader_failover_reset_callback)(
-    const qwp_reader_failover_reset_event* event,
-    void* user_data);
+    const qwp_reader_failover_reset_event* event, void* user_data);
 
 /** Host of the previously-connected endpoint that failed. UTF-8 byte slice
  *  borrowed for the duration of the callback. */
 QUESTDB_CLIENT_API void qwp_reader_failover_reset_event_failed_host(
-    const qwp_reader_failover_reset_event*, const char** out_buf, size_t* out_len);
+    const qwp_reader_failover_reset_event*,
+    const char** out_buf,
+    size_t* out_len);
 /** Port of the previously-connected endpoint that failed. */
-QUESTDB_CLIENT_API uint16_t
-qwp_reader_failover_reset_event_failed_port(const qwp_reader_failover_reset_event*);
+QUESTDB_CLIENT_API uint16_t qwp_reader_failover_reset_event_failed_port(
+    const qwp_reader_failover_reset_event*);
 /** Host of the new endpoint the cursor is reconnecting to. UTF-8 byte slice
  *  borrowed for the duration of the callback. */
 QUESTDB_CLIENT_API void qwp_reader_failover_reset_event_new_host(
-    const qwp_reader_failover_reset_event*, const char** out_buf, size_t* out_len);
+    const qwp_reader_failover_reset_event*,
+    const char** out_buf,
+    size_t* out_len);
 /** Port of the new endpoint the cursor is reconnecting to. */
-QUESTDB_CLIENT_API uint16_t
-qwp_reader_failover_reset_event_new_port(const qwp_reader_failover_reset_event*);
+QUESTDB_CLIENT_API uint16_t qwp_reader_failover_reset_event_new_port(
+    const qwp_reader_failover_reset_event*);
 /** Request_id reissued on the new connection (the original request_id is
  *  invalidated by the failover; the cursor's request_id is updated). */
-QUESTDB_CLIENT_API int64_t
-qwp_reader_failover_reset_event_new_request_id(const qwp_reader_failover_reset_event*);
+QUESTDB_CLIENT_API int64_t qwp_reader_failover_reset_event_new_request_id(
+    const qwp_reader_failover_reset_event*);
 /** Number of reconnect attempts that preceded this success (1 on the first
  *  retry, etc.). */
-QUESTDB_CLIENT_API uint32_t
-qwp_reader_failover_reset_event_attempts(const qwp_reader_failover_reset_event*);
+QUESTDB_CLIENT_API uint32_t qwp_reader_failover_reset_event_attempts(
+    const qwp_reader_failover_reset_event*);
 /** Wall-clock nanoseconds spent reconnecting — sleep + dial + handshake +
  *  `SERVER_INFO` read. Saturating. */
-QUESTDB_CLIENT_API uint64_t
-qwp_reader_failover_reset_event_elapsed_ns(const qwp_reader_failover_reset_event*);
+QUESTDB_CLIENT_API uint64_t qwp_reader_failover_reset_event_elapsed_ns(
+    const qwp_reader_failover_reset_event*);
 /** Error code that triggered the failover (cause-of-death of the previous
  *  connection). */
 QUESTDB_CLIENT_API questdb_error_code
-qwp_reader_failover_reset_event_trigger_code(const qwp_reader_failover_reset_event*);
+qwp_reader_failover_reset_event_trigger_code(
+    const qwp_reader_failover_reset_event*);
 /** Trigger error message (UTF-8). Borrowed for the duration of the call. */
 QUESTDB_CLIENT_API void qwp_reader_failover_reset_event_trigger_msg(
-    const qwp_reader_failover_reset_event*, const char** out_buf, size_t* out_len);
+    const qwp_reader_failover_reset_event*,
+    const char** out_buf,
+    size_t* out_len);
 /** `SERVER_INFO` for the new endpoint; NULL only if the server omitted
  *  it. */
 QUESTDB_CLIENT_API const qwp_reader_server_info*
-qwp_reader_failover_reset_event_server_info(const qwp_reader_failover_reset_event*);
+qwp_reader_failover_reset_event_server_info(
+    const qwp_reader_failover_reset_event*);
 
 /////////// Failover progress callback.
 
@@ -565,7 +564,8 @@ typedef enum qwp_reader_failover_phase
  * passed to your callback is valid only for the duration of that
  * callback invocation.
  */
-typedef struct qwp_reader_failover_progress_event qwp_reader_failover_progress_event;
+typedef struct qwp_reader_failover_progress_event
+    qwp_reader_failover_progress_event;
 
 /**
  * User callback fired at every phase of a mid-query failover
@@ -602,8 +602,7 @@ typedef struct qwp_reader_failover_progress_event qwp_reader_failover_progress_e
  * that `user_data` remains valid and is safe to access there.
  */
 typedef void (*qwp_reader_failover_progress_callback)(
-    const qwp_reader_failover_progress_event* event,
-    void* user_data);
+    const qwp_reader_failover_progress_event* event, void* user_data);
 
 /** Phase of this event. NULL-safe: returns
  *  `qwp_reader_failover_phase_disconnected` for a NULL handle. */
@@ -639,8 +638,7 @@ QUESTDB_CLIENT_API uint16_t qwp_reader_failover_progress_event_new_port(
  *  id to `*out_request_id` on Reset; returns `false` and writes `0` in
  *  every other phase. */
 QUESTDB_CLIENT_API bool qwp_reader_failover_progress_event_new_request_id(
-    const qwp_reader_failover_progress_event*,
-    int64_t* out_request_id);
+    const qwp_reader_failover_progress_event*, int64_t* out_request_id);
 
 /** 1-based attempt counter:
  *  - `0` on Disconnected (no attempt yet).
@@ -683,8 +681,7 @@ qwp_reader_failover_progress_event_server_info(
  *  code matches what the cursor's next `_next_batch` / `_add_credit`
  *  call will surface. */
 QUESTDB_CLIENT_API bool qwp_reader_failover_progress_event_final_error_code(
-    const qwp_reader_failover_progress_event*,
-    questdb_error_code* out_code);
+    const qwp_reader_failover_progress_event*, questdb_error_code* out_code);
 
 /** Final error message (GaveUp phase only). Returns `true` and writes
  *  the borrowed UTF-8 message on GaveUp; returns `false` and writes
@@ -722,9 +719,7 @@ QUESTDB_CLIENT_API bool qwp_reader_failover_progress_event_final_error_msg(
  */
 QUESTDB_CLIENT_API
 qwp_reader_query* qwp_reader_prepare(
-    qwp_reader* reader,
-    line_sender_utf8 sql,
-    questdb_error** err_out);
+    qwp_reader* reader, line_sender_utf8 sql, questdb_error** err_out);
 
 /**
  * Free a query without executing it. Idempotent on NULL.
@@ -752,8 +747,7 @@ void qwp_reader_query_free(qwp_reader_query* query);
  */
 QUESTDB_CLIENT_API
 qwp_reader_cursor* qwp_reader_query_execute(
-    qwp_reader_query** query_inout,
-    questdb_error** err_out);
+    qwp_reader_query** query_inout, questdb_error** err_out);
 
 /**
  * Convenience: prepare + execute in one call, for SQL with no binds.
@@ -769,9 +763,7 @@ qwp_reader_cursor* qwp_reader_query_execute(
  */
 QUESTDB_CLIENT_API
 qwp_reader_cursor* qwp_reader_execute(
-    qwp_reader* reader,
-    line_sender_utf8 sql,
-    questdb_error** err_out);
+    qwp_reader* reader, line_sender_utf8 sql, questdb_error** err_out);
 
 /* Bind parameters. All `qwp_reader_query_bind_*` functions append a bind
  * to the query in declaration order, matching the SQL placeholders
@@ -793,29 +785,27 @@ QUESTDB_CLIENT_API void qwp_reader_query_bind_bool(qwp_reader_query*, bool v);
 QUESTDB_CLIENT_API void qwp_reader_query_bind_i8(qwp_reader_query*, int8_t v);
 
 /** Bind a SHORT (signed 16-bit) positional parameter. */
-QUESTDB_CLIENT_API void qwp_reader_query_bind_i16(
-    qwp_reader_query*, int16_t v);
+QUESTDB_CLIENT_API void qwp_reader_query_bind_i16(qwp_reader_query*, int16_t v);
 
 /** Bind an INT (signed 32-bit) positional parameter. */
-QUESTDB_CLIENT_API void qwp_reader_query_bind_i32(
-    qwp_reader_query*, int32_t v);
+QUESTDB_CLIENT_API void qwp_reader_query_bind_i32(qwp_reader_query*, int32_t v);
 
 /** Bind a LONG (signed 64-bit) positional parameter. */
-QUESTDB_CLIENT_API void qwp_reader_query_bind_i64(
-    qwp_reader_query*, int64_t v);
+QUESTDB_CLIENT_API void qwp_reader_query_bind_i64(qwp_reader_query*, int64_t v);
 
 /** Bind a FLOAT (32-bit IEEE-754) positional parameter. */
 QUESTDB_CLIENT_API void qwp_reader_query_bind_f32(qwp_reader_query*, float v);
 
 /** Bind a DOUBLE (64-bit IEEE-754) positional parameter. */
-QUESTDB_CLIENT_API void qwp_reader_query_bind_f64(
-    qwp_reader_query*, double v);
+QUESTDB_CLIENT_API void qwp_reader_query_bind_f64(qwp_reader_query*, double v);
 
-/** Bind a TIMESTAMP positional parameter as microseconds since the Unix epoch. */
+/** Bind a TIMESTAMP positional parameter as microseconds since the Unix epoch.
+ */
 QUESTDB_CLIENT_API void qwp_reader_query_bind_timestamp_micros(
     qwp_reader_query*, int64_t v);
 
-/** Bind a TIMESTAMP_NANOS positional parameter as nanoseconds since the Unix epoch. */
+/** Bind a TIMESTAMP_NANOS positional parameter as nanoseconds since the Unix
+ * epoch. */
 QUESTDB_CLIENT_API void qwp_reader_query_bind_timestamp_nanos(
     qwp_reader_query*, int64_t v);
 
@@ -910,10 +900,7 @@ QUESTDB_CLIENT_API void qwp_reader_query_bind_ipv4(
  * and corrupts negative values.
  */
 QUESTDB_CLIENT_API void qwp_reader_query_bind_decimal128(
-    qwp_reader_query*,
-    uint64_t mantissa_lo,
-    int64_t mantissa_hi,
-    int8_t scale);
+    qwp_reader_query*, uint64_t mantissa_lo, int64_t mantissa_hi, int8_t scale);
 
 /** Bind a DECIMAL256 mantissa as 32 little-endian raw bytes plus column scale.
  *  `value` MUST be non-NULL and point to at least 32 readable bytes. A NULL
@@ -1097,8 +1084,7 @@ typedef struct qwp_reader_batch qwp_reader_batch;
  */
 QUESTDB_CLIENT_API
 const qwp_reader_batch* qwp_reader_cursor_next_batch(
-    qwp_reader_cursor* cursor,
-    questdb_error** err_out);
+    qwp_reader_cursor* cursor, questdb_error** err_out);
 
 /** Rows in the batch. Returns 0 on a NULL handle. */
 QUESTDB_CLIENT_API
@@ -1360,8 +1346,8 @@ qwp_reader_cursor_current_server_info(const qwp_reader_cursor* cursor);
 /** Discriminant of the cursor's terminal frame. */
 typedef enum qwp_reader_terminal_kind
 {
-    qwp_reader_terminal_kind_none      = 0,
-    qwp_reader_terminal_kind_end       = 1,
+    qwp_reader_terminal_kind_none = 0,
+    qwp_reader_terminal_kind_end = 1,
     qwp_reader_terminal_kind_exec_done = 2,
 } qwp_reader_terminal_kind;
 
@@ -1730,12 +1716,12 @@ static inline bool qwp_reader_column_data_get_symbol(
  * block in `qwp_sender.h`, with arrow.h, nanoarrow, polars-arrow,
  * and any other header that ships the same definitions.
  * https://arrow.apache.org/docs/format/CDataInterface.html */
-#ifndef ARROW_C_DATA_INTERFACE
-#    define ARROW_C_DATA_INTERFACE
+#    ifndef ARROW_C_DATA_INTERFACE
+#        define ARROW_C_DATA_INTERFACE
 
-#    define ARROW_FLAG_DICTIONARY_ORDERED 1
-#    define ARROW_FLAG_NULLABLE 2
-#    define ARROW_FLAG_MAP_KEYS_SORTED 4
+#        define ARROW_FLAG_DICTIONARY_ORDERED 1
+#        define ARROW_FLAG_NULLABLE 2
+#        define ARROW_FLAG_MAP_KEYS_SORTED 4
 
 struct ArrowSchema
 {
@@ -1764,8 +1750,7 @@ struct ArrowArray
     void* private_data;
 };
 
-#endif /* ARROW_C_DATA_INTERFACE */
-
+#    endif /* ARROW_C_DATA_INTERFACE */
 
 /**
  * Tri-state return for `qwp_reader_cursor_next_arrow_batch`.
