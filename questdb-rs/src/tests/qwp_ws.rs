@@ -4661,7 +4661,11 @@ fn qwp_ws_server_error_response_is_surfaced() {
             b"bad column",
         )
         .unwrap();
-        thread::sleep(Duration::from_millis(50));
+        // Hold the socket open until the client closes it, so a late second
+        // flush cannot race a server-side teardown (the 5s read timeout
+        // above bounds the wait).
+        let mut sink = [0u8; 256];
+        while matches!(stream.read(&mut sink), Ok(n) if n > 0) {}
     });
 
     let mut sender = SenderBuilder::new(Protocol::Ws, "127.0.0.1", port)
@@ -4683,7 +4687,20 @@ fn qwp_ws_server_error_response_is_surfaced() {
     assert!(buf.is_empty());
     assert_eq!(first_fsn, 0);
 
-    thread::sleep(Duration::from_millis(100));
+    // Bounded pump instead of a sleep: the runner thread ingests the error
+    // response and terminalizes the publication in the background, but on a
+    // slow machine a fixed sleep can lose that race and the second flush
+    // then observes a healthy connection. `qwp_ws_terminal_error` probes the
+    // terminal diagnostic without consuming it, so the polls below leave
+    // every later assertion (handler callback, `poll_qwp_ws_error`) intact.
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while sender.qwp_ws_terminal_error().unwrap().is_none() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "server rejection was not applied within 5s"
+        );
+        thread::sleep(Duration::from_millis(1));
+    }
 
     buf.table("trades")
         .unwrap()
