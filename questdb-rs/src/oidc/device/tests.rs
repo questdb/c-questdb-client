@@ -2878,7 +2878,72 @@ fn coordinated_refresh_never_falls_back_without_the_store_lock() {
 }
 
 #[test]
-fn transient_store_load_error_is_retried_not_latched() {
+fn first_use_store_lock_failure_is_retryable_and_never_prompts() {
+    struct LockedStore;
+
+    impl TokenStore for LockedStore {
+        fn load(&self, _key: &TokenStoreKey) -> TokenStoreResult<Option<PersistedToken>> {
+            Ok(None)
+        }
+
+        fn save(&self, _key: &TokenStoreKey, _token: &PersistedToken) -> TokenStoreResult<()> {
+            Ok(())
+        }
+
+        fn clear(&self, _key: &TokenStoreKey) -> TokenStoreResult<()> {
+            Ok(())
+        }
+
+        fn in_lock(
+            &self,
+            _key: &TokenStoreKey,
+            _action: &mut dyn FnMut() -> TokenStoreResult<()>,
+        ) -> TokenStoreResult<()> {
+            Err(Box::new(std::io::Error::new(
+                std::io::ErrorKind::WouldBlock,
+                "peer holds the token-store lock",
+            )))
+        }
+    }
+
+    let device_calls = Arc::new(AtomicUsize::new(0));
+    let mock = {
+        let device_calls = Arc::clone(&device_calls);
+        MockServer::start(move |method, path, _body| {
+            if (method, path) == ("POST", "/device") {
+                device_calls.fetch_add(1, Ordering::SeqCst);
+            }
+            (500, r#"{"error":"must_not_be_called"}"#.to_string())
+        })
+    };
+    let auth = OidcDeviceAuth::builder()
+        .client_id("questdb")
+        .device_authorization_endpoint(mock.url("/device"))
+        .token_endpoint(mock.url("/token"))
+        .scope("openid")
+        .interactive(true)
+        .open_browser(false)
+        .sleep_hook(no_sleep())
+        .token_store(LockedStore)
+        .build()
+        .unwrap();
+
+    for err in [auth.token().unwrap_err(), auth.sign_in().unwrap_err()] {
+        assert_eq!(err.kind(), OidcErrorKind::Network);
+        assert!(
+            err.message()
+                .contains("Could not load the OIDC token store")
+        );
+    }
+    assert_eq!(
+        device_calls.load(Ordering::SeqCst),
+        0,
+        "store contention started a needless device flow"
+    );
+}
+
+#[test]
+fn transient_store_load_error_is_retryable_and_retried() {
     // M2: FileTokenStore reports a missing/corrupt/oversized file as Ok(None); the
     // only case it surfaces as Err is a genuine (transient) I/O error. A transient
     // failure on the first load must NOT permanently disable persistence — a later
@@ -2942,18 +3007,20 @@ fn transient_store_load_error_is_retried_not_latched() {
         .build()
         .unwrap();
 
-    // First attempt hits the transient error and adopts nothing.
-    auth.maybe_load_from_store();
+    // The public first-use path surfaces the transient load failure as retryable
+    // rather than claiming that an interactive sign-in is required.
+    let err = auth.token().unwrap_err();
+    assert_eq!(err.kind(), OidcErrorKind::Network);
+    assert!(err.message().contains("transient EMFILE"));
     assert!(
         auth.token_set().is_none(),
         "nothing should be adopted after a transient load error"
     );
     // The error was not latched, so a second attempt retries and resumes.
-    auth.maybe_load_from_store();
+    assert_eq!(auth.token().unwrap(), "AT");
     assert_eq!(
         auth.token_set().unwrap().refresh_token.as_deref(),
-        Some("RT-1"),
-        "a transient load error must be retried, not permanently disable persistence"
+        Some("RT-1")
     );
 }
 

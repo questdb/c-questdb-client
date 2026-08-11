@@ -268,11 +268,12 @@ impl OidcDeviceAuthBuilder {
     /// The bundled [`FileTokenStore`](crate::oidc::FileTokenStore) writes a
     /// plaintext file protected by permissions; **it persists a long-lived refresh
     /// token to disk** — see the [`oidc::token_store`](crate::oidc) security notes.
-    /// Lazy loads and persistence after a fresh sign-in are best-effort. During a
-    /// coordinated refresh, however, re-reading and removing the persisted parent
-    /// must succeed before it is submitted: otherwise a process could reuse a
-    /// rotating refresh token and revoke the whole token family. Those failures,
-    /// like a failure to acquire the cross-process lock, are surfaced as retryable.
+    /// Persistence after a fresh sign-in is best-effort. A lazy-load failure is
+    /// surfaced as retryable when there is no in-memory fallback. During a
+    /// coordinated refresh, re-reading and removing the persisted parent must
+    /// succeed before it is submitted: otherwise a process could reuse a rotating
+    /// refresh token and revoke the whole token family. Those failures, like a
+    /// failure to acquire the cross-process lock, are also surfaced as retryable.
     pub fn token_store(mut self, store: impl TokenStore + 'static) -> Self {
         self.token_store = Some(Arc::new(store));
         self
@@ -645,7 +646,7 @@ impl OidcDeviceAuth {
         };
         // Seed the cache from the persisted store once, so a restart resumes from
         // a saved refresh token instead of re-prompting (a no-op without a store).
-        self.maybe_load_from_store();
+        let load_result = self.maybe_load_from_store();
         if let Some(tokens) = self.cached_if_valid() {
             return Ok(tokens);
         }
@@ -653,6 +654,17 @@ impl OidcDeviceAuth {
         // Try a silent refresh with any cached refresh token — coordinated across
         // processes by the store's per-identity lock when one is configured.
         let existing = self.lock_tokens().clone();
+        // A failed locked read is transient, not proof that no persisted
+        // credential exists. With no in-memory fallback, surface it as retryable
+        // instead of misclassifying it as InteractionRequired or starting a new
+        // device flow. Leave load_attempted unset so the next call retries.
+        if existing
+            .as_ref()
+            .and_then(|tokens| tokens.refresh_token.as_ref())
+            .is_none()
+        {
+            load_result?;
+        }
         if let Some(tokens) = &existing
             && tokens.refresh_token.is_some()
         {
@@ -711,12 +723,12 @@ impl OidcDeviceAuth {
     /// acquire critical section. The read shares the store's per-identity lock
     /// with refresh so it cannot mistake a consumed parent awaiting replacement
     /// for a stable absence and permanently latch that temporary tombstone.
-    fn maybe_load_from_store(&self) {
+    fn maybe_load_from_store(&self) -> Result<()> {
         let (Some(store), Some(key)) = (self.token_store.as_ref(), self.store_key.as_ref()) else {
-            return;
+            return Ok(());
         };
         if self.lock_store_state().load_attempted {
-            return;
+            return Ok(());
         }
 
         let mut loaded = None;
@@ -735,16 +747,26 @@ impl OidcDeviceAuth {
                 }
                 self.lock_store_state().load_attempted = true;
                 self.adopt(persisted);
+                Ok(())
             }
-            None => match lock_result {
+            None => {
                 // A genuine I/O error (EMFILE, an NFS / permission blip), lock
                 // failure, or acquire timeout is transient: leave
                 // `load_attempted` unset so the next call retries.
-                Err(e) => warn_persistence("load", &*e),
-                Ok(()) => log::warn!(
-                    "questdb oidc: token store returned without running the locked load action; the next call will retry"
-                ),
-            },
+                let message = match lock_result {
+                    Err(e) => {
+                        warn_persistence("load", &*e);
+                        format!(
+                            "Could not load the OIDC token store under its cross-process lock: {e}. Retry later."
+                        )
+                    }
+                    Ok(()) => {
+                        "The token store returned without running the locked load action. Retry later."
+                            .to_string()
+                    }
+                };
+                Err(OidcError::network(message))
+            }
         }
     }
 
