@@ -5802,34 +5802,38 @@ mod tests {
         transport
             .restart_connection(ReconnectReason::Disconnect)
             .unwrap();
-        let mut server_streams = server.join().unwrap();
+        let _server_streams = server.join().unwrap();
 
-        let (read_started_tx, read_started_rx) = mpsc::channel();
-        let (read_result_tx, read_result_rx) = mpsc::channel();
-        let reader = thread::spawn(move || {
-            read_started_tx.send(()).unwrap();
-            let mut byte = [0u8; 1];
-            read_result_tx
-                .send(transport.stream.read(&mut byte))
-                .unwrap();
-        });
-        read_started_rx
-            .recv_timeout(Duration::from_secs(5))
+        // A short read timeout plus a retry loop instead of one indefinitely
+        // blocking read: on Windows the gate's CancelIoEx only cancels a recv
+        // already in flight, and Winsock shutdown() does not wake one entered
+        // afterwards, so a single read can straddle the shutdown and miss
+        // both wake-ups. Retrying sidesteps the race: once the gate has shut
+        // the replacement socket down, the next read attempt fails
+        // immediately. A missing reconnect registration still fails the test,
+        // because the gate never touches this socket and every attempt times
+        // out until the deadline.
+        transport
+            .stream
+            .set_timeouts(Some(Duration::from_millis(100)), None)
             .unwrap();
+        let reader = thread::spawn(move || {
+            let deadline = std::time::Instant::now() + Duration::from_secs(10);
+            let mut byte = [0u8; 1];
+            loop {
+                match transport.stream.read(&mut byte) {
+                    Err(err)
+                        if matches!(
+                            err.kind(),
+                            std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+                        ) && std::time::Instant::now() < deadline => {}
+                    result => return result,
+                }
+            }
+        });
         traffic_gate.shutdown().unwrap();
 
-        let result = match read_result_rx.recv_timeout(Duration::from_secs(2)) {
-            Ok(result) => result,
-            Err(err) => {
-                // A missing reconnect registration leaves the replacement read
-                // untouched. Close its peer so the failed test can still join.
-                server_streams.pop();
-                reader.join().unwrap();
-                panic!("replacement socket read was not interrupted: {err}");
-            }
-        };
-        reader.join().unwrap();
-        match result {
+        match reader.join().unwrap() {
             Ok(0) => {}
             Err(err)
                 if matches!(
@@ -5840,7 +5844,11 @@ mod tests {
                         | std::io::ErrorKind::NotConnected
                         | std::io::ErrorKind::BrokenPipe
                 ) => {}
-            result => panic!("unexpected replacement socket read result: {result:?}"),
+            // CancelIoEx interrupts an in-flight recv as WSAEINTR (10004) and
+            // a recv issued after Winsock shutdown() fails with WSAESHUTDOWN
+            // (10058); neither maps to a stable `ErrorKind`.
+            Err(err) if matches!(err.raw_os_error(), Some(10004) | Some(10058)) => {}
+            result => panic!("replacement socket read was not interrupted: {result:?}"),
         }
     }
 
