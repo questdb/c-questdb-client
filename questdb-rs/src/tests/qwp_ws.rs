@@ -685,22 +685,30 @@ fn spawn_recycling_server(
                     match read_frame(&mut stream) {
                         Ok((_fin, 0x2, _payload)) => {
                             connections += 1;
-                            shared_count.store(connections, Ordering::Release);
+                            // The client may tear down at any moment once the
+                            // caller has seen enough connections, so a failed
+                            // response write is a legitimate outcome here,
+                            // like the reset/EOF kinds tolerated on the read
+                            // side below.
                             match action {
                                 RecycleServerAction::WriteError => {
-                                    write_qwp_error_response(
+                                    let _ = write_qwp_error_response(
                                         &mut stream,
                                         QWP_STATUS_WRITE_ERROR,
                                         FIRST_WIRE_SEQUENCE,
                                         b"retry later",
-                                    )
-                                    .unwrap();
+                                    );
                                 }
                                 RecycleServerAction::NonOrderlyClose => {
-                                    write_server_close_frame(&mut stream, 1002, "retry later")
-                                        .unwrap();
+                                    let _ =
+                                        write_server_close_frame(&mut stream, 1002, "retry later");
                                 }
                             }
+                            // Published only after the response write: the
+                            // caller drops the sender once it observes the
+                            // count, and publishing earlier would let that
+                            // teardown race the write above.
+                            shared_count.store(connections, Ordering::Release);
                         }
                         Ok((_fin, _opcode, _payload)) => {}
                         Err(err)
