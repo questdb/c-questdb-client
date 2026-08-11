@@ -2359,7 +2359,6 @@ fn qwp_ws_durable_ack_completion_waits_for_durable_confirmation_in_all_progress_
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
         let (allow_ack_tx, allow_ack_rx) = mpsc::channel();
-        let (ping_tx, ping_rx) = mpsc::channel();
         let (done_tx, done_rx) = mpsc::channel();
 
         let server = thread::spawn(move || {
@@ -2388,15 +2387,9 @@ fn qwp_ws_durable_ack_completion_waits_for_durable_confirmation_in_all_progress_
             .unwrap();
 
             allow_ack_rx.recv_timeout(Duration::from_secs(5)).unwrap();
-            loop {
-                let (_, opcode, payload) = read_frame(&mut stream).unwrap();
-                if opcode == 0x9 {
-                    write_server_frame(&mut stream, 0xA, &payload, false).unwrap();
-                    write_qwp_durable_ack_response(&mut stream, &[("trades", 10)]).unwrap();
-                    ping_tx.send(payload).unwrap();
-                    break;
-                }
-            }
+            // Keep this test about durable completion. Keepalive scheduling is
+            // covered independently by the transport driver tests.
+            write_qwp_durable_ack_response(&mut stream, &[("trades", 10)]).unwrap();
 
             let _ = done_rx.recv_timeout(Duration::from_secs(5));
         });
@@ -2404,8 +2397,7 @@ fn qwp_ws_durable_ack_completion_waits_for_durable_confirmation_in_all_progress_
         let conf = format!(
             "ws::addr=127.0.0.1:{port};\
              qwp_ws_progress={};\
-             request_durable_ack=on;\
-             durable_ack_keepalive_interval_millis=1;",
+             request_durable_ack=on;",
             progress.name()
         );
         let mut sender = SenderBuilder::from_conf(conf).unwrap().build().unwrap();
@@ -2448,7 +2440,6 @@ fn qwp_ws_durable_ack_completion_waits_for_durable_confirmation_in_all_progress_
         sender
             .wait(crate::ingress::AckLevel::Durable, Duration::from_secs(5))
             .unwrap_or_else(|e| panic!("mode={}: {e}", progress.name()));
-        assert_eq!(ping_rx.recv_timeout(Duration::from_secs(5)).unwrap(), b"");
         assert_eq!(sender.acked_fsn().unwrap(), Some(fsn));
         done_tx.send(()).unwrap();
         server.join().unwrap();
@@ -2756,64 +2747,6 @@ fn qwp_ws_drop_interrupts_blocked_background_send() {
     assert!(
         elapsed < Duration::from_secs(1),
         "drop waited for the socket write timeout: {elapsed:?}"
-    );
-}
-
-#[test]
-fn qwp_ws_drop_interrupts_blocked_send_after_reconnect() {
-    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    let port = listener.local_addr().unwrap().port();
-    let (send_started_tx, send_started_rx) = mpsc::channel();
-    let (release_tx, release_rx) = mpsc::channel();
-
-    let server = thread::spawn(move || {
-        let (mut first, _) = listener.accept().unwrap();
-        upgrade_mock_stream(&mut first);
-        drop(first);
-
-        let (mut second, _) = listener.accept().unwrap();
-        socket2::SockRef::from(&second)
-            .set_recv_buffer_size(4096)
-            .unwrap();
-        upgrade_mock_stream(&mut second);
-        second
-            .set_read_timeout(Some(Duration::from_secs(5)))
-            .unwrap();
-        let mut byte = [0u8; 1];
-        second.peek(&mut byte).unwrap();
-        send_started_tx.send(()).unwrap();
-        let _ = release_rx.recv_timeout(Duration::from_secs(10));
-    });
-
-    let conf = format!(
-        "ws::addr=127.0.0.1:{port};\
-         close_flush_timeout_millis=-1;\
-         sf_max_segment_bytes=16777216;"
-    );
-    let mut sender = SenderBuilder::from_conf(&conf).unwrap().build().unwrap();
-    let value = "x".repeat(8 * 1024 * 1024);
-    let mut buf = sender.new_buffer();
-    buf.table("trades")
-        .unwrap()
-        .column_str("payload", value.as_str())
-        .unwrap()
-        .at_now()
-        .unwrap();
-    sender.flush(&mut buf).unwrap();
-
-    send_started_rx
-        .recv_timeout(Duration::from_secs(5))
-        .unwrap();
-
-    let started = Instant::now();
-    drop(sender);
-    let elapsed = started.elapsed();
-    let _ = release_tx.send(());
-    server.join().unwrap();
-
-    assert!(
-        elapsed < Duration::from_secs(1),
-        "drop waited on the replacement socket after reconnect: {elapsed:?}"
     );
 }
 

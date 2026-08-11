@@ -5460,9 +5460,11 @@ mod tests {
     }
 
     #[cfg(feature = "sync-sender-qwp-ws")]
-    fn read_client_frame<S: Read>(stream: &mut S) -> std::io::Result<Vec<u8>> {
+    fn read_client_frame<S: Read>(stream: &mut S) -> std::io::Result<(u8, Vec<u8>)> {
         let mut hdr = [0u8; 2];
         stream.read_exact(&mut hdr)?;
+        let opcode = hdr[0] & 0x0f;
+        assert_ne!(hdr[1] & 0x80, 0, "client WebSocket frame must be masked");
         let len_short = hdr[1] & 0x7f;
         let payload_len = match len_short {
             126 => {
@@ -5484,7 +5486,7 @@ mod tests {
         for (index, byte) in payload.iter_mut().enumerate() {
             *byte ^= mask[index & 3];
         }
-        Ok(payload)
+        Ok((opcode, payload))
     }
 
     #[cfg(feature = "sync-sender-qwp-ws")]
@@ -5514,26 +5516,71 @@ mod tests {
     }
 
     #[cfg(feature = "sync-sender-qwp-ws")]
-    fn serve_qwp_ws_connection<S: Read + Write>(
-        stream: &mut S,
-        frames: usize,
-        payload_tx: mpsc::Sender<Vec<u8>>,
-    ) {
+    fn upgrade_qwp_ws_test_connection<S: Read + Write>(stream: &mut S, durable_ack: bool) {
         let request = read_request_until_blank(stream).unwrap();
         let accept =
             crate::ws::crypto::compute_accept(&header_value(&request, "Sec-WebSocket-Key"));
+        if durable_ack {
+            assert_eq!(header_value(&request, "X-QWP-Request-Durable-Ack"), "true");
+        }
+        let durable_ack_header = if durable_ack {
+            "X-QWP-Durable-Ack: enabled\r\n"
+        } else {
+            ""
+        };
         let response = format!(
             "HTTP/1.1 101 Switching Protocols\r\n\
              Upgrade: websocket\r\n\
              Connection: Upgrade\r\n\
              Sec-WebSocket-Accept: {accept}\r\n\
              X-QWP-Version: 1\r\n\
+             {durable_ack_header}\
              \r\n"
         );
         stream.write_all(response.as_bytes()).unwrap();
+    }
+
+    #[cfg(feature = "sync-sender-qwp-ws")]
+    fn connect_blocking_test_transport(
+        port: u16,
+        durable_ack: bool,
+        traffic_gate: Option<Arc<TrafficGate>>,
+    ) -> BlockingQwpWsTransport {
+        let durable_ack_conf = if durable_ack {
+            "request_durable_ack=on;durable_ack_keepalive_interval_millis=60000;"
+        } else {
+            ""
+        };
+        let builder = crate::ingress::SenderBuilder::from_conf(format!(
+            "ws::addr=127.0.0.1:{port};{durable_ack_conf}"
+        ))
+        .unwrap();
+        let qwp_ws = builder.qwp_ws.unwrap();
+        BlockingQwpWsTransport::connect(
+            "127.0.0.1",
+            port.to_string(),
+            false,
+            None,
+            QwpWsConnectKind::Foreground,
+            qwp_ws,
+            None,
+            Arc::new(AtomicUsize::new(0)),
+            traffic_gate,
+        )
+        .unwrap()
+    }
+
+    #[cfg(feature = "sync-sender-qwp-ws")]
+    fn serve_qwp_ws_connection<S: Read + Write>(
+        stream: &mut S,
+        frames: usize,
+        payload_tx: mpsc::Sender<Vec<u8>>,
+    ) {
+        upgrade_qwp_ws_test_connection(stream, false);
 
         for wire_seq in 0..frames {
-            let payload = read_client_frame(stream).unwrap();
+            let (opcode, payload) = read_client_frame(stream).unwrap();
+            assert_eq!(opcode, OPCODE_BINARY);
             payload_tx.send(payload).unwrap();
             write_ok_response(stream, wire_seq as u64).unwrap();
         }
@@ -5706,6 +5753,95 @@ mod tests {
             payload_rx.recv_timeout(Duration::from_secs(5)).unwrap(),
             expected
         );
+    }
+
+    #[cfg(feature = "sync-sender-qwp-ws")]
+    #[test]
+    fn blocking_transport_emits_durable_keepalive_ping() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            upgrade_qwp_ws_test_connection(&mut stream, true);
+            read_client_frame(&mut stream).unwrap()
+        });
+
+        let mut transport = connect_blocking_test_transport(port, true, None);
+        assert!(transport.send_durable_ack_keepalive_if_due(true).unwrap());
+        assert!(!transport.send_durable_ack_keepalive_if_due(true).unwrap());
+
+        let (opcode, payload) = server.join().unwrap();
+        assert_eq!(opcode, crate::ws::frame::OPCODE_PING);
+        assert!(payload.is_empty());
+    }
+
+    #[cfg(feature = "sync-sender-qwp-ws")]
+    #[test]
+    fn blocking_transport_reconnect_registers_replacement_with_traffic_gate() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = thread::spawn(move || {
+            let mut streams = Vec::new();
+            for _ in 0..2 {
+                let (mut stream, _) = listener.accept().unwrap();
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(5)))
+                    .unwrap();
+                upgrade_qwp_ws_test_connection(&mut stream, false);
+                streams.push(stream);
+            }
+            streams
+        });
+
+        let traffic_gate = Arc::new(TrafficGate::default());
+        let mut transport =
+            connect_blocking_test_transport(port, false, Some(Arc::clone(&traffic_gate)));
+        transport
+            .restart_connection(ReconnectReason::Disconnect)
+            .unwrap();
+        let mut server_streams = server.join().unwrap();
+
+        let (read_started_tx, read_started_rx) = mpsc::channel();
+        let (read_result_tx, read_result_rx) = mpsc::channel();
+        let reader = thread::spawn(move || {
+            read_started_tx.send(()).unwrap();
+            let mut byte = [0u8; 1];
+            read_result_tx
+                .send(transport.stream.read(&mut byte))
+                .unwrap();
+        });
+        read_started_rx
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap();
+        traffic_gate.shutdown().unwrap();
+
+        let result = match read_result_rx.recv_timeout(Duration::from_secs(2)) {
+            Ok(result) => result,
+            Err(err) => {
+                // A missing reconnect registration leaves the replacement read
+                // untouched. Close its peer so the failed test can still join.
+                server_streams.pop();
+                reader.join().unwrap();
+                panic!("replacement socket read was not interrupted: {err}");
+            }
+        };
+        reader.join().unwrap();
+        match result {
+            Ok(0) => {}
+            Err(err)
+                if matches!(
+                    err.kind(),
+                    std::io::ErrorKind::Interrupted
+                        | std::io::ErrorKind::ConnectionAborted
+                        | std::io::ErrorKind::ConnectionReset
+                        | std::io::ErrorKind::NotConnected
+                        | std::io::ErrorKind::BrokenPipe
+                ) => {}
+            result => panic!("unexpected replacement socket read result: {result:?}"),
+        }
     }
 
     #[test]
