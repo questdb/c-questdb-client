@@ -3034,6 +3034,15 @@ fn assert_qwp_ws_drop_interrupts_stalled_connect(scheme: &str, tls_options: &str
             // waiting for the ServerHello. This delay is outside the measured
             // sender shutdown interval.
             thread::sleep(Duration::from_millis(200));
+        } else {
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let request = read_request_until_blank(&mut stream).unwrap();
+            assert!(
+                request.windows(4).any(|window| window == b"\r\n\r\n"),
+                "expected a complete WebSocket upgrade request"
+            );
         }
         connect_stalled_tx.send(()).unwrap();
         let _ = release_rx.recv_timeout(Duration::from_secs(10));
