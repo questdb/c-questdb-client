@@ -253,10 +253,11 @@ pub(crate) fn validate_endpoint_origins(
 ///
 /// Segment-aware, so `/realms/prod` does not match `/realms/production`. A root
 /// issuer (no path) constrains the origin only and matches any unambiguous path.
-/// Compared on complete, once-percent-decoded segments; a `.` / `..` / semicolon /
-/// still-encoded / non-ASCII / control segment is rejected outright, so a
-/// tampered `/settings` can't redirect credentials to a different tenant on a
-/// path-based multi-tenant IdP (e.g. Keycloak `https://host/realms/{realm}`).
+/// Compared on complete, once-percent-decoded segments; an encoded separator or a
+/// `.` / `..` / semicolon / still-encoded / non-ASCII / control segment is rejected
+/// outright, so a tampered `/settings` can't redirect credentials to a different
+/// tenant on a path-based multi-tenant IdP (e.g. Keycloak
+/// `https://host/realms/{realm}`).
 pub(crate) fn endpoint_path_under_issuer(endpoint: &str, issuer: &str) -> bool {
     let Ok(issuer_uri) = issuer.parse::<Uri>() else {
         return false;
@@ -265,8 +266,12 @@ pub(crate) fn endpoint_path_under_issuer(endpoint: &str, issuer: &str) -> bool {
         return false;
     };
     let base = issuer_uri.path().trim_end_matches('/');
-    let base_segs = decode_path_segments(base);
-    let ep_segs = decode_path_segments(ep_uri.path());
+    let Some(base_segs) = decode_path_segments(base) else {
+        return false;
+    };
+    let Some(ep_segs) = decode_path_segments(ep_uri.path()) else {
+        return false;
+    };
     // Validate complete decoded issuer and endpoint segments. Trimming would
     // silently drop a trailing whitespace-class byte, so a
     // percent-encoded space / tab / newline (`prod%20`, `%09`, `%0a`) would
@@ -300,16 +305,32 @@ pub(crate) fn endpoint_path_under_issuer(endpoint: &str, issuer: &str) -> bool {
 
 /// Percent-decode a path exactly once and split into `/` segments.
 ///
+/// An encoded slash or backslash fails closed before decoding: `Uri::path()`
+/// preserves it in the request target, so treating it as a separator here would
+/// validate a different path from the one sent on the wire.
 /// Decoding more than once can make the pin see a different path from a server
 /// that decodes the request target once. Any remaining `%` is rejected by the
 /// caller instead of being interpreted as another round of encoding.
 /// Backslash is treated as a separator (some proxies fold `\` to `/`).
-fn decode_path_segments(path: &str) -> Vec<String> {
-    percent_decode(path)
-        .replace('\\', "/")
-        .split('/')
-        .map(|s| s.to_string())
-        .collect()
+fn decode_path_segments(path: &str) -> Option<Vec<String>> {
+    if path.split('/').any(has_encoded_path_separator) {
+        return None;
+    }
+    Some(
+        percent_decode(path)
+            .replace('\\', "/")
+            .split('/')
+            .map(|s| s.to_string())
+            .collect(),
+    )
+}
+
+fn has_encoded_path_separator(raw_segment: &str) -> bool {
+    raw_segment.as_bytes().windows(3).any(|window| {
+        window[0] == b'%'
+            && ((window[1] == b'2' && matches!(window[2], b'f' | b'F'))
+                || (window[1] == b'5' && matches!(window[2], b'c' | b'C')))
+    })
 }
 
 fn percent_decode(s: &str) -> String {
@@ -780,6 +801,20 @@ mod tests {
             "https://host/realms/prod%252ftoken",
             "https://host/realms/prod"
         ));
+    }
+
+    #[test]
+    fn issuer_path_pin_rejects_single_encoded_separator() {
+        // `Uri::path()` preserves encoded separators in the request target, so
+        // the pin must not decode them into boundaries that are absent on wire.
+        for enc in ["%2f", "%2F", "%5c", "%5C"] {
+            let endpoint =
+                format!("https://host/realms/prod{enc}evil/protocol/openid-connect/token");
+            assert!(
+                !endpoint_path_under_issuer(&endpoint, "https://host/realms/prod"),
+                "endpoint {endpoint} must not pass the issuer-path pin"
+            );
+        }
     }
 
     #[test]
