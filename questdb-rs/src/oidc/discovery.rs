@@ -253,7 +253,7 @@ pub(crate) fn validate_endpoint_origins(
 ///
 /// Segment-aware, so `/realms/prod` does not match `/realms/production`. A root
 /// issuer (no path) constrains the origin only and matches any unambiguous path.
-/// Compared on complete, fully percent-decoded segments; a `.` / `..` / semicolon /
+/// Compared on complete, once-percent-decoded segments; a `.` / `..` / semicolon /
 /// still-encoded / non-ASCII / control segment is rejected outright, so a
 /// tampered `/settings` can't redirect credentials to a different tenant on a
 /// path-based multi-tenant IdP (e.g. Keycloak `https://host/realms/{realm}`).
@@ -298,18 +298,14 @@ pub(crate) fn endpoint_path_under_issuer(endpoint: &str, issuer: &str) -> bool {
     ep_segs.len() >= base_segs.len() && ep_segs[..base_segs.len()] == base_segs[..]
 }
 
-/// Percent-decode a path (repeatedly, bounded) and split into `/` segments.
+/// Percent-decode a path exactly once and split into `/` segments.
+///
+/// Decoding more than once can make the pin see a different path from a server
+/// that decodes the request target once. Any remaining `%` is rejected by the
+/// caller instead of being interpreted as another round of encoding.
 /// Backslash is treated as a separator (some proxies fold `\` to `/`).
 fn decode_path_segments(path: &str) -> Vec<String> {
-    let mut decoded = path.to_string();
-    for _ in 0..10 {
-        let next = percent_decode(&decoded);
-        if next == decoded {
-            break;
-        }
-        decoded = next;
-    }
-    decoded
+    percent_decode(path)
         .replace('\\', "/")
         .split('/')
         .map(|s| s.to_string())
@@ -771,6 +767,17 @@ mod tests {
         // Percent-encoded traversal decodes and is caught too.
         assert!(!endpoint_path_under_issuer(
             "https://host/realms/prod/%2e%2e/attacker/token",
+            "https://host/realms/prod"
+        ));
+    }
+
+    #[test]
+    fn issuer_path_pin_rejects_double_encoded_separator() {
+        // Decode exactly once, as the server does. The resulting residual
+        // `%2f` must fail closed instead of being decoded again and treated as
+        // a separator under the pinned issuer path.
+        assert!(!endpoint_path_under_issuer(
+            "https://host/realms/prod%252ftoken",
             "https://host/realms/prod"
         ));
     }
