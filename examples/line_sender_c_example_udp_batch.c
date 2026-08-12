@@ -113,12 +113,11 @@ static bool displayed_help(int argc, const char* argv[])
             fprintf(
                 stderr,
                 "    HOST: QWP/UDP host (defaults to \"localhost\").\n");
+            fprintf(stderr, "    PORT: QWP/UDP port (defaults to \"9007\").\n");
             fprintf(
                 stderr,
-                "    PORT: QWP/UDP port (defaults to \"9007\").\n");
-            fprintf(
-                stderr,
-                "    TABLE: Target table (defaults to \"c_udp_batch_example\").\n");
+                "    TABLE: Target table (defaults to "
+                "\"c_udp_batch_example\").\n");
             return true;
         }
     }

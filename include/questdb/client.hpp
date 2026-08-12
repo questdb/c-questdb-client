@@ -69,8 +69,8 @@ namespace questdb
  * `query_pool_max`, `acquire_timeout_ms`, `idle_timeout_ms`, `pool_reap`).
  * With `sf_dir`, `sender_id` is the
  * slot base; pooled senders mint `<sender_id>-ingest-<index>` disk slots.
- * Those `<sender_id>-ingest-*` directories under `sf_dir` belong to the pool namespace;
- * use a unique `sender_id` for each pool sharing an `sf_dir`.
+ * Those `<sender_id>-ingest-*` directories under `sf_dir` belong to the pool
+ * namespace; use a unique `sender_id` for each pool sharing an `sf_dir`.
  *
  * Construction connects eagerly by default: it pre-opens the warm minimums
  * (`sender_pool_min` senders, `query_pool_min` readers), honoring
@@ -110,10 +110,7 @@ public:
         ::questdb_db_connect_options_init(&options, sizeof options);
         options.oidc_auth = auth.raw();
         _raw = ::questdb::oidc::detail::wrapped_call(
-            ::questdb_db_connect_ex,
-            conf.data(),
-            conf.size(),
-            &options);
+            ::questdb_db_connect_ex, conf.data(), conf.size(), &options);
     }
 
     pool(const pool&) = delete;
@@ -136,10 +133,19 @@ public:
         return *this;
     }
 
-    ~pool() noexcept { close(); }
+    ~pool() noexcept
+    {
+        close();
+    }
 
-    ::questdb_db* c_ptr() noexcept { return _raw; }
-    const ::questdb_db* c_ptr() const noexcept { return _raw; }
+    ::questdb_db* c_ptr() noexcept
+    {
+        return _raw;
+    }
+    const ::questdb_db* c_ptr() const noexcept
+    {
+        return _raw;
+    }
 
     /** Borrow a store-and-forward sender. At cap, disk-backed slots can wait
      * up to `close_flush_timeout` (default 5s) while an in-flight close
@@ -151,11 +157,11 @@ public:
     ingress::borrowed_sender borrow_sender();
 
     /**
-     * Borrow a store-and-forward sender, retrying the connect within `budget_ms`
-     * using the pool's reconnect backoff. On a transient `failover_retry`,
-     * drop the dead sender then call this with `reconnect_max_duration_ms()` (or
-     * your tracked remaining budget). Throws on a terminal error or budget
-     * exhaustion.
+     * Borrow a store-and-forward sender, retrying the connect within
+     * `budget_ms` using the pool's reconnect backoff. On a transient
+     * `failover_retry`, drop the dead sender then call this with
+     * `reconnect_max_duration_ms()` (or your tracked remaining budget). Throws
+     * on a terminal error or budget exhaustion.
      *
      * DEFINED in `questdb/ingress/qwp_sender.hpp`, alongside the
      * `borrowed_sender` type it returns. Include that header to call this.
@@ -175,12 +181,13 @@ public:
      * reader is destroyed, it is closed instead of recycled. Throws
      * `questdb::error` on cap exhaustion or transport failure.
      *
-     * DEFINED in `questdb/egress/qwp_reader.hpp`, alongside the `reader` type it
-     * returns. Include that header to call this.
+     * DEFINED in `questdb/egress/qwp_reader.hpp`, alongside the `reader` type
+     * it returns. Include that header to call this.
      */
     ::questdb::egress::reader borrow_reader();
 
-    /** The pool's failover budget (`reconnect_max_duration`) in milliseconds. */
+    /** The pool's failover budget (`reconnect_max_duration`) in milliseconds.
+     */
     uint64_t reconnect_max_duration_ms() const noexcept
     {
         return ::questdb_db_reconnect_max_duration_ms(_raw);

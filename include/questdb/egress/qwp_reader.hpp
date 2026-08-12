@@ -38,7 +38,7 @@
 #include <utility>
 
 #include "../ingress/line_sender_core.hpp" // utf8_view
-#include "../client.hpp" // questdb::pool (borrow_reader)
+#include "../client.hpp"                   // questdb::pool (borrow_reader)
 
 namespace questdb::egress
 {
@@ -72,29 +72,29 @@ namespace questdb::egress
  */
 enum class column_kind : int
 {
-    boolean         = ::qwp_reader_column_kind_boolean,
-    byte            = ::qwp_reader_column_kind_byte,
-    short_          = ::qwp_reader_column_kind_short,
-    int_            = ::qwp_reader_column_kind_int,
-    long_           = ::qwp_reader_column_kind_long,
-    float_          = ::qwp_reader_column_kind_float,
-    double_         = ::qwp_reader_column_kind_double,
-    symbol          = ::qwp_reader_column_kind_symbol,
-    timestamp       = ::qwp_reader_column_kind_timestamp,
-    date            = ::qwp_reader_column_kind_date,
-    uuid            = ::qwp_reader_column_kind_uuid,
-    long256         = ::qwp_reader_column_kind_long256,
-    geohash         = ::qwp_reader_column_kind_geohash,
-    varchar         = ::qwp_reader_column_kind_varchar,
+    boolean = ::qwp_reader_column_kind_boolean,
+    byte = ::qwp_reader_column_kind_byte,
+    short_ = ::qwp_reader_column_kind_short,
+    int_ = ::qwp_reader_column_kind_int,
+    long_ = ::qwp_reader_column_kind_long,
+    float_ = ::qwp_reader_column_kind_float,
+    double_ = ::qwp_reader_column_kind_double,
+    symbol = ::qwp_reader_column_kind_symbol,
+    timestamp = ::qwp_reader_column_kind_timestamp,
+    date = ::qwp_reader_column_kind_date,
+    uuid = ::qwp_reader_column_kind_uuid,
+    long256 = ::qwp_reader_column_kind_long256,
+    geohash = ::qwp_reader_column_kind_geohash,
+    varchar = ::qwp_reader_column_kind_varchar,
     timestamp_nanos = ::qwp_reader_column_kind_timestamp_nanos,
-    double_array    = ::qwp_reader_column_kind_double_array,
-    long_array      = ::qwp_reader_column_kind_long_array,
-    decimal64       = ::qwp_reader_column_kind_decimal64,
-    decimal128      = ::qwp_reader_column_kind_decimal128,
-    decimal256      = ::qwp_reader_column_kind_decimal256,
-    char_           = ::qwp_reader_column_kind_char,
-    binary          = ::qwp_reader_column_kind_binary,
-    ipv4            = ::qwp_reader_column_kind_ipv4,
+    double_array = ::qwp_reader_column_kind_double_array,
+    long_array = ::qwp_reader_column_kind_long_array,
+    decimal64 = ::qwp_reader_column_kind_decimal64,
+    decimal128 = ::qwp_reader_column_kind_decimal128,
+    decimal256 = ::qwp_reader_column_kind_decimal256,
+    char_ = ::qwp_reader_column_kind_char,
+    binary = ::qwp_reader_column_kind_binary,
+    ipv4 = ::qwp_reader_column_kind_ipv4,
 };
 
 /**
@@ -102,11 +102,11 @@ enum class column_kind : int
  */
 enum class server_role : int
 {
-    standalone       = ::qwp_reader_server_role_standalone,
-    primary          = ::qwp_reader_server_role_primary,
-    replica          = ::qwp_reader_server_role_replica,
-    primary_catchup  = ::qwp_reader_server_role_primary_catchup,
-    other            = ::qwp_reader_server_role_other,
+    standalone = ::qwp_reader_server_role_standalone,
+    primary = ::qwp_reader_server_role_primary,
+    replica = ::qwp_reader_server_role_replica,
+    primary_catchup = ::qwp_reader_server_role_primary_catchup,
+    other = ::qwp_reader_server_role_other,
 };
 
 /**
@@ -114,8 +114,8 @@ enum class server_role : int
  */
 enum class terminal_kind : int
 {
-    none      = ::qwp_reader_terminal_kind_none,
-    end       = ::qwp_reader_terminal_kind_end,
+    none = ::qwp_reader_terminal_kind_none,
+    end = ::qwp_reader_terminal_kind_end,
     exec_done = ::qwp_reader_terminal_kind_exec_done,
 };
 
@@ -128,31 +128,55 @@ enum class terminal_kind : int
 // alongside the unified `questdb::error_code`; see line_sender_core.hpp.)
 
 inline bool operator==(column_kind l, ::qwp_reader_column_kind r) noexcept
-{ return static_cast<int>(l) == static_cast<int>(r); }
+{
+    return static_cast<int>(l) == static_cast<int>(r);
+}
 inline bool operator==(::qwp_reader_column_kind l, column_kind r) noexcept
-{ return r == l; }
+{
+    return r == l;
+}
 inline bool operator!=(column_kind l, ::qwp_reader_column_kind r) noexcept
-{ return !(l == r); }
+{
+    return !(l == r);
+}
 inline bool operator!=(::qwp_reader_column_kind l, column_kind r) noexcept
-{ return !(l == r); }
+{
+    return !(l == r);
+}
 
 inline bool operator==(server_role l, ::qwp_reader_server_role r) noexcept
-{ return static_cast<int>(l) == static_cast<int>(r); }
+{
+    return static_cast<int>(l) == static_cast<int>(r);
+}
 inline bool operator==(::qwp_reader_server_role l, server_role r) noexcept
-{ return r == l; }
+{
+    return r == l;
+}
 inline bool operator!=(server_role l, ::qwp_reader_server_role r) noexcept
-{ return !(l == r); }
+{
+    return !(l == r);
+}
 inline bool operator!=(::qwp_reader_server_role l, server_role r) noexcept
-{ return !(l == r); }
+{
+    return !(l == r);
+}
 
 inline bool operator==(terminal_kind l, ::qwp_reader_terminal_kind r) noexcept
-{ return static_cast<int>(l) == static_cast<int>(r); }
+{
+    return static_cast<int>(l) == static_cast<int>(r);
+}
 inline bool operator==(::qwp_reader_terminal_kind l, terminal_kind r) noexcept
-{ return r == l; }
+{
+    return r == l;
+}
 inline bool operator!=(terminal_kind l, ::qwp_reader_terminal_kind r) noexcept
-{ return !(l == r); }
+{
+    return !(l == r);
+}
 inline bool operator!=(::qwp_reader_terminal_kind l, terminal_kind r) noexcept
-{ return !(l == r); }
+{
+    return !(l == r);
+}
 
 /**
  * Optional value for nullable cells. Returned by the typed getters on
@@ -250,28 +274,61 @@ struct terminal_exec_done_info
 /**
  * Owning snapshot of an endpoint's `SERVER_INFO` handshake metadata.
  *
- * Unlike the C ABI's borrowed `qwp_reader_server_info*`, every string is copied,
- * so this value may safely outlive the reader/cursor and may be retained
- * across query execution or failover. An unrecognised role remains
+ * Unlike the C ABI's borrowed `qwp_reader_server_info*`, every string is
+ * copied, so this value may safely outlive the reader/cursor and may be
+ * retained across query execution or failover. An unrecognised role remains
  * `server_role::other` while `role_byte()` preserves its original wire byte.
  */
 class server_info
 {
 public:
-    server_role role() const noexcept { return _role; }
-    uint8_t role_byte() const noexcept { return _role_byte; }
-    uint64_t epoch() const noexcept { return _epoch; }
-    uint32_t capabilities() const noexcept { return _capabilities; }
-    int64_t server_wall_ns() const noexcept { return _server_wall_ns; }
+    server_role role() const noexcept
+    {
+        return _role;
+    }
+    uint8_t role_byte() const noexcept
+    {
+        return _role_byte;
+    }
+    uint64_t epoch() const noexcept
+    {
+        return _epoch;
+    }
+    uint32_t capabilities() const noexcept
+    {
+        return _capabilities;
+    }
+    int64_t server_wall_ns() const noexcept
+    {
+        return _server_wall_ns;
+    }
 
     // Lvalue access is zero-copy; chained access on a temporary transfers an
     // owning value instead of returning a reference into a destroyed object.
-    const std::string& cluster_id() const & noexcept { return _cluster_id; }
-    std::string cluster_id() && noexcept { return std::move(_cluster_id); }
-    const std::string& node_id() const & noexcept { return _node_id; }
-    std::string node_id() && noexcept { return std::move(_node_id); }
-    const nullable<std::string>& zone_id() const & noexcept { return _zone_id; }
-    nullable<std::string> zone_id() && noexcept { return std::move(_zone_id); }
+    const std::string& cluster_id() const& noexcept
+    {
+        return _cluster_id;
+    }
+    std::string cluster_id() && noexcept
+    {
+        return std::move(_cluster_id);
+    }
+    const std::string& node_id() const& noexcept
+    {
+        return _node_id;
+    }
+    std::string node_id() && noexcept
+    {
+        return std::move(_node_id);
+    }
+    const nullable<std::string>& zone_id() const& noexcept
+    {
+        return _zone_id;
+    }
+    nullable<std::string> zone_id() && noexcept
+    {
+        return std::move(_zone_id);
+    }
 
 private:
     server_info(
@@ -317,10 +374,15 @@ class server_info_view
 {
 public:
     explicit server_info_view(const ::qwp_reader_server_info* impl) noexcept
-        : _impl{impl} {}
+        : _impl{impl}
+    {
+    }
 
     /** True if a `SERVER_INFO` is available. */
-    explicit operator bool() const noexcept { return _impl != nullptr; }
+    explicit operator bool() const noexcept
+    {
+        return _impl != nullptr;
+    }
 
     server_role role() const noexcept
     {
@@ -376,8 +438,7 @@ public:
         if (!_impl)
             return std::nullopt;
 
-        const auto copy = [](std::string_view value)
-        {
+        const auto copy = [](std::string_view value) {
             return value.empty() ? std::string{} : std::string{value};
         };
         nullable<std::string> zone;
@@ -405,12 +466,16 @@ private:
 class failover_reset_event_view
 {
 public:
-    explicit failover_reset_event_view(const ::qwp_reader_failover_reset_event* impl) noexcept
-        : _impl{impl} {}
+    explicit failover_reset_event_view(
+        const ::qwp_reader_failover_reset_event* impl) noexcept
+        : _impl{impl}
+    {
+    }
 
     // Non-copyable: `_impl` is borrowed, valid only during the callback.
     failover_reset_event_view(const failover_reset_event_view&) = delete;
-    failover_reset_event_view& operator=(const failover_reset_event_view&) = delete;
+    failover_reset_event_view& operator=(const failover_reset_event_view&) =
+        delete;
     failover_reset_event_view(failover_reset_event_view&&) = delete;
     failover_reset_event_view& operator=(failover_reset_event_view&&) = delete;
 
@@ -471,7 +536,8 @@ private:
 };
 
 /** User callback type for failover-reset notifications. */
-using failover_reset_callback = std::function<void(const failover_reset_event_view&)>;
+using failover_reset_callback =
+    std::function<void(const failover_reset_event_view&)>;
 
 /**
  * Lifecycle phase of a failover-progress event. Numeric values match
@@ -481,12 +547,9 @@ enum class failover_phase : int
 {
     disconnected =
         ::qwp_reader_failover_phase::qwp_reader_failover_phase_disconnected,
-    retrying =
-        ::qwp_reader_failover_phase::qwp_reader_failover_phase_retrying,
-    reset =
-        ::qwp_reader_failover_phase::qwp_reader_failover_phase_reset,
-    gave_up =
-        ::qwp_reader_failover_phase::qwp_reader_failover_phase_gave_up,
+    retrying = ::qwp_reader_failover_phase::qwp_reader_failover_phase_retrying,
+    reset = ::qwp_reader_failover_phase::qwp_reader_failover_phase_reset,
+    gave_up = ::qwp_reader_failover_phase::qwp_reader_failover_phase_gave_up,
 };
 
 /**
@@ -502,15 +565,17 @@ class failover_progress_event_view
 public:
     explicit failover_progress_event_view(
         const ::qwp_reader_failover_progress_event* impl) noexcept
-        : _impl{impl} {}
+        : _impl{impl}
+    {
+    }
 
     // Non-copyable: `_impl` is borrowed, valid only during the callback.
     failover_progress_event_view(const failover_progress_event_view&) = delete;
     failover_progress_event_view& operator=(
         const failover_progress_event_view&) = delete;
     failover_progress_event_view(failover_progress_event_view&&) = delete;
-    failover_progress_event_view& operator=(
-        failover_progress_event_view&&) = delete;
+    failover_progress_event_view& operator=(failover_progress_event_view&&) =
+        delete;
 
     failover_phase phase() const noexcept
     {
@@ -602,8 +667,7 @@ public:
     {
         const char* buf = nullptr;
         size_t len = 0;
-        ::qwp_reader_failover_progress_event_final_error_msg(
-            _impl, &buf, &len);
+        ::qwp_reader_failover_progress_event_final_error_msg(_impl, &buf, &len);
         return {buf, len};
     }
 
@@ -656,9 +720,7 @@ public:
         ::questdb::ingress::utf8_view config,
         const ::questdb::oidc::device_auth& auth)
         : _impl{::questdb::oidc::detail::wrapped_call(
-              ::qwp_reader_from_conf_with_oidc,
-              to_c_utf8(config),
-              auth.raw())}
+              ::qwp_reader_from_conf_with_oidc, to_c_utf8(config), auth.raw())}
     {
     }
 
@@ -672,14 +734,14 @@ public:
      */
     static reader from_env()
     {
-        return reader{
-            ::questdb::error::wrapped_call(::qwp_reader_from_env)};
+        return reader{::questdb::error::wrapped_call(::qwp_reader_from_env)};
     }
 
     reader(const reader&) = delete;
     reader& operator=(const reader&) = delete;
 
-    reader(reader&& other) noexcept : _impl{other._impl}
+    reader(reader&& other) noexcept
+        : _impl{other._impl}
     {
         other._impl = nullptr;
     }
@@ -711,7 +773,10 @@ public:
         return *this;
     }
 
-    ~reader() noexcept { ::qwp_reader_close(_impl); }
+    ~reader() noexcept
+    {
+        ::qwp_reader_close(_impl);
+    }
 
     /**
      * Execute a SQL statement with no binds and return a streaming cursor.
@@ -787,8 +852,7 @@ public:
         ensure_impl();
         ensure_connection_metadata_access("server_version");
         uint8_t v = 0;
-        ::questdb::error::wrapped_call(
-            ::qwp_reader_server_version, _impl, &v);
+        ::questdb::error::wrapped_call(::qwp_reader_server_version, _impl, &v);
         return v;
     }
 
@@ -801,8 +865,8 @@ public:
     {
         ensure_impl();
         ensure_connection_metadata_access("server_info");
-        auto info = server_info_view{
-            ::qwp_reader_current_server_info(_impl)}.snapshot();
+        auto info = server_info_view{::qwp_reader_current_server_info(_impl)}
+                        .snapshot();
         if (!info)
             throw ::questdb::error{
                 error_code::invalid_api_call,
@@ -835,7 +899,10 @@ public:
     }
 
 private:
-    explicit reader(::qwp_reader* impl) noexcept : _impl{impl} {}
+    explicit reader(::qwp_reader* impl) noexcept
+        : _impl{impl}
+    {
+    }
 
     /// Borrow a pooled reader from a `questdb_db` pool. Backs
     /// `questdb::pool::borrow_reader`. The returned reader is
@@ -869,7 +936,8 @@ private:
                 error_code::invalid_api_call,
                 std::string{"reader::"} + accessor +
                     "() called while a query or cursor produced by this "
-                    "reader is still live; use cursor::" + accessor + "()"};
+                    "reader is still live; use cursor::" +
+                    accessor + "()"};
     }
 
     ::qwp_reader* _impl;
@@ -910,7 +978,10 @@ public:
         return *this;
     }
 
-    ~query() noexcept { ::qwp_reader_query_free(_impl); }
+    ~query() noexcept
+    {
+        ::qwp_reader_query_free(_impl);
+    }
 
     query& bind_bool(bool v)
     {
@@ -994,10 +1065,12 @@ public:
      * `(mantissa_lo = UINT64_MAX, mantissa_hi = -1)` — always cast the
      * high limb through `int64_t` so the sign extends correctly.
      */
-    query& bind_decimal128(uint64_t mantissa_lo, int64_t mantissa_hi, int8_t scale)
+    query& bind_decimal128(
+        uint64_t mantissa_lo, int64_t mantissa_hi, int8_t scale)
     {
         ensure_impl();
-        ::qwp_reader_query_bind_decimal128(_impl, mantissa_lo, mantissa_hi, scale);
+        ::qwp_reader_query_bind_decimal128(
+            _impl, mantissa_lo, mantissa_hi, scale);
         return *this;
     }
     query& bind_decimal256(const std::array<uint8_t, 32>& bytes, int8_t scale)
@@ -1076,8 +1149,7 @@ public:
     query& bind_null(column_kind kind)
     {
         ensure_impl();
-        ::qwp_reader_query_bind_null(
-            _impl, static_cast<uint32_t>(kind));
+        ::qwp_reader_query_bind_null(_impl, static_cast<uint32_t>(kind));
         return *this;
     }
     query& bind_null_varchar()
@@ -1175,9 +1247,7 @@ public:
         auto new_callback =
             std::make_unique<failover_reset_callback>(std::move(cb));
         ::qwp_reader_query_on_failover_reset(
-            _impl,
-            &query::trampoline,
-            new_callback.get());
+            _impl, &query::trampoline, new_callback.get());
         _callback = std::move(new_callback);
         return *this;
     }
@@ -1208,9 +1278,7 @@ public:
         auto new_callback =
             std::make_unique<failover_progress_callback>(std::move(cb));
         ::qwp_reader_query_on_failover_progress(
-            _impl,
-            &query::progress_trampoline,
-            new_callback.get());
+            _impl, &query::progress_trampoline, new_callback.get());
         _progress_callback = std::move(new_callback);
         return *this;
     }
@@ -1222,7 +1290,10 @@ public:
     cursor execute();
 
 private:
-    explicit query(::qwp_reader_query* impl) noexcept : _impl{impl} {}
+    explicit query(::qwp_reader_query* impl) noexcept
+        : _impl{impl}
+    {
+    }
 
     /// Throw `questdb::error{invalid_api_call}` if `_impl` is null.
     /// A null `_impl` means the query has been moved from or already
@@ -1392,9 +1463,7 @@ inline T load_unaligned(const void* base, size_t row) noexcept
 {
     T value;
     std::memcpy(
-        &value,
-        static_cast<const uint8_t*>(base) + row * sizeof(T),
-        sizeof(T));
+        &value, static_cast<const uint8_t*>(base) + row * sizeof(T), sizeof(T));
     return value;
 }
 } // namespace detail
@@ -2515,7 +2584,10 @@ public:
         return *this;
     }
 
-    ~cursor() noexcept { ::qwp_reader_cursor_free(_impl); }
+    ~cursor() noexcept
+    {
+        ::qwp_reader_cursor_free(_impl);
+    }
 
     /**
      * Advance to the next batch.
@@ -2562,12 +2634,17 @@ public:
         ::ArrowArray array;
         ::ArrowSchema schema;
 
-        arrow_batch() noexcept : array{}, schema{} {}
+        arrow_batch() noexcept
+            : array{}
+            , schema{}
+        {
+        }
         arrow_batch(const arrow_batch&) = delete;
         arrow_batch& operator=(const arrow_batch&) = delete;
 
         arrow_batch(arrow_batch&& other) noexcept
-            : array(other.array), schema(other.schema)
+            : array(other.array)
+            , schema(other.schema)
         {
             // Zero the source so its destructor skips release() and so
             // any post-move access (`other.array.length`, `.buffers[0]`,
@@ -2590,7 +2667,10 @@ public:
             return *this;
         }
 
-        ~arrow_batch() noexcept { release_in_place(); }
+        ~arrow_batch() noexcept
+        {
+            release_in_place();
+        }
 
     private:
         void release_in_place() noexcept
@@ -2633,13 +2713,13 @@ public:
             _impl, &out.array, &out.schema, &c_err);
         switch (rc)
         {
-            case ::qwp_reader_arrow_batch_ok:
-                return out;
-            case ::qwp_reader_arrow_batch_end:
-                return std::nullopt;
-            case ::qwp_reader_arrow_batch_error:
-            default:
-                ::questdb::error::throw_from_c(c_err);
+        case ::qwp_reader_arrow_batch_ok:
+            return out;
+        case ::qwp_reader_arrow_batch_end:
+            return std::nullopt;
+        case ::qwp_reader_arrow_batch_error:
+        default:
+            ::questdb::error::throw_from_c(c_err);
         }
     }
 #endif /* QUESTDB_CLIENT_ENABLE_ARROW */
@@ -2705,8 +2785,9 @@ public:
     egress::server_info server_info() const
     {
         ensure_impl();
-        auto info = server_info_view{
-            ::qwp_reader_cursor_current_server_info(_impl)}.snapshot();
+        auto info =
+            server_info_view{::qwp_reader_cursor_current_server_info(_impl)}
+                .snapshot();
         if (!info)
             throw ::questdb::error{
                 error_code::invalid_api_call,
@@ -2769,7 +2850,10 @@ public:
     }
 
 private:
-    explicit cursor(::qwp_reader_cursor* impl) noexcept : _impl{impl} {}
+    explicit cursor(::qwp_reader_cursor* impl) noexcept
+        : _impl{impl}
+    {
+    }
 
     /// Throw `questdb::error{invalid_api_call}` if `_impl` is null.
     /// A null `_impl` means the cursor has been moved from or already
@@ -2820,7 +2904,8 @@ inline cursor query::execute()
     // NULL on return — so a subsequent `~query()` calling `_query_free`
     // is a NULL no-op without us having to clear `_impl` explicitly here.
     auto* c = ::qwp_reader_query_execute(&_impl, &c_err);
-    if (!c) ::questdb::error::throw_from_c(c_err);
+    if (!c)
+        ::questdb::error::throw_from_c(c_err);
     cursor result{c};
     result._failover_callback = std::move(cb);
     result._failover_progress_callback = std::move(pcb);

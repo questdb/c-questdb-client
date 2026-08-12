@@ -6,17 +6,17 @@ int main()
 {
     try
     {
-        auto auth = questdb::oidc::builder::from_questdb(
-                        "https://questdb.example.com:9000")
-                        .event_handler([](const questdb::oidc::event_view& event) {
-                            if (event.kind() == questdb::oidc::event_kind::prompt)
-                                // Display fields are sanitized. Use
-                                // event.browser_target() for a clickable URL.
-                                std::cerr << "Open " << event.verification_uri()
-                                          << " and enter " << event.user_code()
-                                          << '\n';
-                        })
-                        .build();
+        auto auth =
+            questdb::oidc::builder::from_questdb(
+                "https://questdb.example.com:9000")
+                .event_handler([](const questdb::oidc::event_view& event) {
+                    if (event.kind() == questdb::oidc::event_kind::prompt)
+                        // Display fields are sanitized. Use
+                        // event.browser_target() for a clickable URL.
+                        std::cerr << "Open " << event.verification_uri()
+                                  << " and enter " << event.user_code() << '\n';
+                })
+                .build();
 
         // Credentials stay in memory. File persistence is an explicit opt-in
         // that stores tokens as unencrypted JSON; see questdb/oidc.hpp.

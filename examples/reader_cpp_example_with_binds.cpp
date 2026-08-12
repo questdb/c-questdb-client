@@ -32,9 +32,15 @@ int main()
                 auto scaled = col_scaled.get<int64_t>(r);
                 auto label = col_label.varchar(r);
                 std::cout << "scaled=";
-                if (scaled) std::cout << *scaled; else std::cout << "NULL";
+                if (scaled)
+                    std::cout << *scaled;
+                else
+                    std::cout << "NULL";
                 std::cout << " label=";
-                if (label) std::cout << *label; else std::cout << "NULL";
+                if (label)
+                    std::cout << *label;
+                else
+                    std::cout << "NULL";
                 std::cout << "\n";
             }
         }

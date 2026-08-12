@@ -30,7 +30,8 @@
  * borrowed from it through the direction-specific headers:
  *
  *   - `questdb/ingress/qwp_sender.h` — borrow senders to write rows.
- *   - `questdb/egress/qwp_reader.h`         — borrow readers to run SQL queries.
+ *   - `questdb/egress/qwp_reader.h`         — borrow readers to run SQL
+ * queries.
  *
  * Either of those includes this header, so a consumer that needs only one
  * direction includes only that header. Include this one directly to hold or
@@ -146,14 +147,11 @@ typedef struct questdb_db_connect_options
  */
 QUESTDB_CLIENT_API
 questdb_db* questdb_db_connect(
-    const char* conf,
-    size_t conf_len,
-    questdb_error** err_out);
+    const char* conf, size_t conf_len, questdb_error** err_out);
 
 QUESTDB_CLIENT_API
 void questdb_db_connect_options_init(
-    questdb_db_connect_options* options,
-    size_t options_size);
+    questdb_db_connect_options* options, size_t options_size);
 
 /**
  * Open a pool with optional callbacks and a shared OIDC token provider.

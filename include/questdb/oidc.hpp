@@ -86,7 +86,10 @@ public:
     {
         return view(_event->message, _event->message_len);
     }
-    double seconds_left() const noexcept { return _event->seconds_left; }
+    double seconds_left() const noexcept
+    {
+        return _event->seconds_left;
+    }
     double expires_in_seconds() const noexcept
     {
         return _event->expires_in_seconds;
@@ -95,9 +98,9 @@ public:
     std::string_view browser_target() const noexcept
     {
         constexpr size_t required_size =
-            offsetof(::questdb_oidc_event, browser_target_len) +
-            sizeof(size_t);
-        if (_event->struct_size < required_size) return {};
+            offsetof(::questdb_oidc_event, browser_target_len) + sizeof(size_t);
+        if (_event->struct_size < required_size)
+            return {};
         return view(_event->browser_target, _event->browser_target_len);
     }
 
@@ -128,7 +131,8 @@ auto wrapped_call(F&& function, Args&&... args)
 {
     ::questdb_error* raw_error = nullptr;
     auto result = function(std::forward<Args>(args)..., &raw_error);
-    if (raw_error) throw_error(raw_error);
+    if (raw_error)
+        throw_error(raw_error);
     return result;
 }
 } // namespace detail
@@ -139,7 +143,8 @@ public:
     token(const token&) = delete;
     token& operator=(const token&) = delete;
 
-    token(token&& other) noexcept : _raw{other._raw}
+    token(token&& other) noexcept
+        : _raw{other._raw}
     {
         other._raw = nullptr;
     }
@@ -153,19 +158,24 @@ public:
         }
         return *this;
     }
-    ~token() noexcept { ::questdb_oidc_token_free(_raw); }
+    ~token() noexcept
+    {
+        ::questdb_oidc_token_free(_raw);
+    }
 
     /** Borrowed bytes; valid only while this token object remains alive. */
-    std::string_view view() const & noexcept
+    std::string_view view() const& noexcept
     {
         return {
-            ::questdb_oidc_token_data(_raw),
-            ::questdb_oidc_token_len(_raw)};
+            ::questdb_oidc_token_data(_raw), ::questdb_oidc_token_len(_raw)};
     }
-    std::string_view view() const && = delete;
+    std::string_view view() const&& = delete;
 
 private:
-    explicit token(::questdb_oidc_token* raw) noexcept : _raw{raw} {}
+    explicit token(::questdb_oidc_token* raw) noexcept
+        : _raw{raw}
+    {
+    }
     ::questdb_oidc_token* _raw;
     friend class device_auth;
 };
@@ -203,7 +213,8 @@ public:
         }
         return *this;
     }
-    device_auth(device_auth&& other) noexcept : _raw{other._raw}
+    device_auth(device_auth&& other) noexcept
+        : _raw{other._raw}
     {
         other._raw = nullptr;
     }
@@ -217,7 +228,10 @@ public:
         }
         return *this;
     }
-    ~device_auth() noexcept { ::questdb_oidc_auth_free(_raw); }
+    ~device_auth() noexcept
+    {
+        ::questdb_oidc_auth_free(_raw);
+    }
 
     /**
      * Run the interactive device flow if needed. This is the only operation
@@ -265,14 +279,20 @@ public:
             view(raw.issuer, raw.issuer_len),
             raw.groups_in_token};
     }
-    config_view config() const && = delete;
+    config_view config() const&& = delete;
 
     /** Borrowed FFI handle; valid only while this device_auth remains alive. */
-    const ::questdb_oidc_auth* c_ptr() const & noexcept { return _raw; }
-    const ::questdb_oidc_auth* c_ptr() const && = delete;
+    const ::questdb_oidc_auth* c_ptr() const& noexcept
+    {
+        return _raw;
+    }
+    const ::questdb_oidc_auth* c_ptr() const&& = delete;
 
 private:
-    explicit device_auth(::questdb_oidc_auth* raw) noexcept : _raw{raw} {}
+    explicit device_auth(::questdb_oidc_auth* raw) noexcept
+        : _raw{raw}
+    {
+    }
     const ::questdb_oidc_auth* raw() const
     {
         if (!_raw)
@@ -303,7 +323,10 @@ private:
 class builder
 {
 public:
-    builder() : _raw{::questdb_oidc_builder_new()} {}
+    builder()
+        : _raw{::questdb_oidc_builder_new()}
+    {
+    }
 
     static builder from_questdb(std::string_view url)
     {
@@ -313,7 +336,8 @@ public:
 
     builder(const builder&) = delete;
     builder& operator=(const builder&) = delete;
-    builder(builder&& other) noexcept : _raw{other._raw}
+    builder(builder&& other) noexcept
+        : _raw{other._raw}
     {
         other._raw = nullptr;
     }
@@ -327,14 +351,16 @@ public:
         }
         return *this;
     }
-    ~builder() noexcept { ::questdb_oidc_builder_free(_raw); }
+    ~builder() noexcept
+    {
+        ::questdb_oidc_builder_free(_raw);
+    }
 
-#define QUESTDB_OIDC_CPP_STRING_SETTER(method, c_function)                    \
-    builder& method(std::string_view value)                                   \
+#define QUESTDB_OIDC_CPP_STRING_SETTER(method, c_function)                     \
+    builder& method(std::string_view value)                                    \
     {                                                                          \
-        detail::wrapped_call(                                                   \
-            c_function, _raw, value.data(), value.size());                     \
-        return *this;                                                           \
+        detail::wrapped_call(c_function, _raw, value.data(), value.size());    \
+        return *this;                                                          \
     }
 
     QUESTDB_OIDC_CPP_STRING_SETTER(client_id, ::questdb_oidc_builder_client_id)
@@ -366,11 +392,11 @@ public:
         return *this;
     }
 
-#define QUESTDB_OIDC_CPP_BOOL_SETTER(method, c_function)                      \
+#define QUESTDB_OIDC_CPP_BOOL_SETTER(method, c_function)                       \
     builder& method(bool enabled)                                              \
     {                                                                          \
         detail::wrapped_call(c_function, _raw, enabled);                       \
-        return *this;                                                           \
+        return *this;                                                          \
     }
 
     QUESTDB_OIDC_CPP_BOOL_SETTER(
@@ -448,16 +474,18 @@ public:
     }
 
 private:
-    explicit builder(::questdb_oidc_builder* raw) noexcept : _raw{raw} {}
+    explicit builder(::questdb_oidc_builder* raw) noexcept
+        : _raw{raw}
+    {
+    }
 
     static void event_trampoline(
-        void* user_data,
-        const ::questdb_oidc_event* event) noexcept
+        void* user_data, const ::questdb_oidc_event* event) noexcept
     {
         try
         {
-            auto* handler = static_cast<
-                std::function<void(const event_view&)>*>(user_data);
+            auto* handler =
+                static_cast<std::function<void(const event_view&)>*>(user_data);
             if (handler && *handler && event)
             {
                 const event_view view{event};

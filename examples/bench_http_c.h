@@ -8,4 +8,5 @@ int http_exec_sql(const char* base, const char* sql);
 
 /* Poll `SELECT count() FROM {table}` every 500 ms until count >= expected or
  * 300 s elapse. Returns the last observed count (-1 if never parsed). */
-long long wait_for_count(const char* base, const char* table, long long expected);
+long long wait_for_count(
+    const char* base, const char* table, long long expected);

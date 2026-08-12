@@ -3,7 +3,8 @@
 #include <stdio.h>
 #include <string.h>
 
-static void print_batch(const struct ArrowArray* arr, const struct ArrowSchema* sch)
+static void print_batch(
+    const struct ArrowArray* arr, const struct ArrowSchema* sch)
 {
     for (int64_t c = 0; c < sch->n_children; ++c)
     {
@@ -63,8 +64,8 @@ int main(int argc, const char* argv[])
     if (!reader)
         goto on_error;
 
-    line_sender_utf8 sql = QDB_UTF8_LITERAL(
-        "SELECT x AS n, x * 1.5 AS d FROM long_sequence(5)");
+    line_sender_utf8 sql =
+        QDB_UTF8_LITERAL("SELECT x AS n, x * 1.5 AS d FROM long_sequence(5)");
     cursor = qwp_reader_execute(reader, sql, &err);
     if (!cursor)
         goto on_error;

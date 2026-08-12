@@ -63,10 +63,12 @@ fail:
     {
         size_t message_len = 0;
         const char* message = questdb_error_msg(error, &message_len);
-        fprintf(stderr, "OIDC example failed: %.*s\n", (int)message_len, message);
+        fprintf(
+            stderr, "OIDC example failed: %.*s\n", (int)message_len, message);
         questdb_oidc_error_view details = {0};
         details.struct_size = sizeof details;
-        if (questdb_error_oidc_get_view(error, &details) && details.has_retry_after)
+        if (questdb_error_oidc_get_view(error, &details) &&
+            details.has_retry_after)
             fprintf(
                 stderr,
                 "Identity provider requested a retry after %llu seconds\n",
