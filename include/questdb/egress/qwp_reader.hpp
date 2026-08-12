@@ -715,6 +715,10 @@ public:
      * @throws questdb::oidc::error if `auth` is empty or moved from, or token
      *         acquisition returns a structured OIDC failure.
      * @throws questdb::error on configuration or connection failure.
+     * @note Unlike the ingest sender (which throws `line_sender_error` with the
+     *       OIDC detail on `oidc_diagnostic()`), the reader throws
+     *       `questdb::oidc::error` directly. Catch `const questdb::error&` to
+     *       handle both. See `questdb::oidc::error` for the cross-surface model.
      */
     reader(
         ::questdb::ingress::utf8_view config,

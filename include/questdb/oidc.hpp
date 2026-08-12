@@ -195,6 +195,18 @@ struct config_view
     bool groups_in_token;
 };
 
+/**
+ * Interactive OIDC device-flow sign-in handle.
+ *
+ * `sign_in()`, `token()`, and `clear()` throw `questdb::oidc::error` on failure.
+ * Note that when this same auth state is attached to an ingest sender via
+ * `opts::oidc_auth`, a later token-acquisition failure surfaces from `flush()`
+ * as a `questdb::ingress::line_sender_error` (with the OIDC detail on its
+ * `oidc_diagnostic()` member), **not** as a `questdb::oidc::error` — so an
+ * `oidc::error` handler written for this API does not transfer to a sender.
+ * Catch the common base `const questdb::error&` to handle both. See
+ * `questdb::oidc::error` for the full cross-surface exception model.
+ */
 class device_auth
 {
 public:
@@ -236,6 +248,8 @@ public:
     /**
      * Run the interactive device flow if needed. This is the only operation
      * that may invoke prompt callbacks and wait for user authorization.
+     * @throws questdb::oidc::error on sign-in failure (see the class note for
+     *         how OIDC failures surface across the sender/reader/device APIs).
      */
     void sign_in() const
     {

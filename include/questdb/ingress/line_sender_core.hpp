@@ -202,7 +202,30 @@ enum class error_kind : int
     unknown = QUESTDB_OIDC_ERROR_UNKNOWN,
 };
 
-/** QuestDB error with the structured OAuth response retained. */
+/**
+ * A QuestDB error carrying the structured OAuth/OIDC response detail
+ * (`kind()`, `idp_error()`, `idp_error_description()`, `status()`,
+ * `retry_after_seconds()`).
+ *
+ * **Which exception type an OIDC failure throws depends on the surface that
+ * raised it.** `questdb::oidc::error` and `questdb::ingress::line_sender_error`
+ * are *sibling* types under `questdb::error`, so a handler for one does not
+ * catch the other:
+ * - **Device API** (`questdb::oidc::device_auth::sign_in`/`token`/`clear`)
+ *   throws `questdb::oidc::error` directly.
+ * - **Query reader** (`questdb::egress::reader{config, auth}` and reader calls)
+ *   throws `questdb::oidc::error` (or a base `questdb::error`).
+ * - **Ingest sender** (`opts::oidc_auth` + `flush()` and other sender calls)
+ *   throws `questdb::ingress::line_sender_error`, **not** this type — reach the
+ *   OIDC detail through its `oidc_diagnostic()` member. This deliberately keeps
+ *   existing sender catch blocks working.
+ *
+ * To handle every surface uniformly, catch the common base
+ * `const questdb::error&`. A `catch (const questdb::oidc::error&)` placed around
+ * a sender `flush()` will **never** match (flush throws `line_sender_error`);
+ * likewise a `catch (const line_sender_error&)` around a device-API or reader
+ * call will miss `questdb::oidc::error`.
+ */
 class error : public ::questdb::error
 {
 public:
@@ -444,7 +467,10 @@ enum class ca
  * structured server or protocol error that halted the sender.
  * When an attached OIDC provider fails, `.oidc_diagnostic()` returns the
  * structured OAuth detail while the thrown exception remains a
- * `line_sender_error`, preserving existing sender catch blocks.
+ * `line_sender_error`, preserving existing sender catch blocks. Note the query
+ * reader and the `questdb::oidc::device_auth` API instead throw
+ * `questdb::oidc::error` directly; see `questdb::oidc::error` for the full
+ * cross-surface exception model.
  */
 class line_sender_error : public ::questdb::error
 {
