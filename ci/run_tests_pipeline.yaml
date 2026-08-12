@@ -198,7 +198,12 @@ stages:
         steps:
           - checkout: self
           - script: |
-              apt install clang-format
+              set -e
+              # Pinned so local runs (`pipx install clang-format==21.1.8`)
+              # and CI agree byte-for-byte; comment reflow differs between
+              # clang-format major versions.
+              pipx install clang-format==21.1.8
+              clang-format --version | grep -F 21.1.8
               rustup component add clippy
               rustup component add rustfmt
             displayName: "Install clang-format, clippy and rustfmt"

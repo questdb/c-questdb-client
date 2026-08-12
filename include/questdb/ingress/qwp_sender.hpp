@@ -122,8 +122,8 @@ public:
     {
         ::line_sender_table_name table_c{table.size(), table.data()};
         column_chunk chunk;
-        chunk._raw = line_sender_error::wrapped_call(
-            ::qwp_chunk_new_validated, table_c);
+        chunk._raw =
+            line_sender_error::wrapped_call(::qwp_chunk_new_validated, table_c);
         return chunk;
     }
 
@@ -154,8 +154,14 @@ public:
             ::qwp_chunk_free(_raw);
     }
 
-    ::qwp_chunk* c_ptr() noexcept { return _raw; }
-    const ::qwp_chunk* c_ptr() const noexcept { return _raw; }
+    ::qwp_chunk* c_ptr() noexcept
+    {
+        return _raw;
+    }
+    const ::qwp_chunk* c_ptr() const noexcept
+    {
+        return _raw;
+    }
 
     /**
      * Row count locked by the first appended column / designated ts.
@@ -303,7 +309,8 @@ public:
         return *this;
     }
 
-    /** UUID column: 16 bytes per row — low half LE in bytes 0..8, high half LE in bytes 8..16. */
+    /** UUID column: 16 bytes per row — low half LE in bytes 0..8, high half LE
+     * in bytes 8..16. */
     column_chunk& column_uuid(
         std::string_view name,
         const uint8_t* data,
@@ -549,47 +556,31 @@ public:
 
     // -- Designated timestamp -----------------------------------------
 
-    column_chunk& at_micros(
-        const int64_t* data, size_t row_count)
+    column_chunk& at_micros(const int64_t* data, size_t row_count)
     {
         line_sender_error::wrapped_call(
-            ::qwp_chunk_at_micros,
-            _raw,
-            data,
-            row_count);
+            ::qwp_chunk_at_micros, _raw, data, row_count);
         return *this;
     }
 
-    column_chunk& at_nanos(
-        const int64_t* data, size_t row_count)
+    column_chunk& at_nanos(const int64_t* data, size_t row_count)
     {
         line_sender_error::wrapped_call(
-            ::qwp_chunk_at_nanos,
-            _raw,
-            data,
-            row_count);
+            ::qwp_chunk_at_nanos, _raw, data, row_count);
         return *this;
     }
 
-    column_chunk& at_millis(
-        const int64_t* data, size_t row_count)
+    column_chunk& at_millis(const int64_t* data, size_t row_count)
     {
         line_sender_error::wrapped_call(
-            ::qwp_chunk_at_millis,
-            _raw,
-            data,
-            row_count);
+            ::qwp_chunk_at_millis, _raw, data, row_count);
         return *this;
     }
 
-    column_chunk& at_seconds(
-        const int64_t* data, size_t row_count)
+    column_chunk& at_seconds(const int64_t* data, size_t row_count)
     {
         line_sender_error::wrapped_call(
-            ::qwp_chunk_at_seconds,
-            _raw,
-            data,
-            row_count);
+            ::qwp_chunk_at_seconds, _raw, data, row_count);
         return *this;
     }
 
@@ -664,14 +655,10 @@ public:
     arrow_import(
         ::ArrowArray& array,
         const ::ArrowSchema& schema,
-        ::qwp_symbol_mode symbol_mode =
-            ::qwp_symbol_mode_auto)
+        ::qwp_symbol_mode symbol_mode = ::qwp_symbol_mode_auto)
     {
         _raw = line_sender_error::wrapped_call(
-            ::qwp_arrow_import_new,
-            &array,
-            &schema,
-            symbol_mode);
+            ::qwp_arrow_import_new, &array, &schema, symbol_mode);
     }
 
     arrow_import(const arrow_import&) = delete;
@@ -707,8 +694,14 @@ public:
         return ::qwp_arrow_import_len(_raw);
     }
 
-    ::qwp_arrow_import* c_ptr() noexcept { return _raw; }
-    const ::qwp_arrow_import* c_ptr() const noexcept { return _raw; }
+    ::qwp_arrow_import* c_ptr() noexcept
+    {
+        return _raw;
+    }
+    const ::qwp_arrow_import* c_ptr() const noexcept
+    {
+        return _raw;
+    }
 
 private:
     ::qwp_arrow_import* _raw{nullptr};
@@ -767,13 +760,13 @@ public:
     }
 
     /**
-     * Publish `chunk` as a completion boundary, then wait until it and all prior
-     * frames published through this sender reach `level`. Uses the pool-wide
-     * `request_timeout` as the wait's no-progress deadline. Throws on error.
+     * Publish `chunk` as a completion boundary, then wait until it and all
+     * prior frames published through this sender reach `level`. Uses the
+     * pool-wide `request_timeout` as the wait's no-progress deadline. Throws on
+     * error.
      */
     void flush_and_wait(
-        column_chunk& chunk,
-        qwpws_ack_level level = qwpws_ack_level::ok)
+        column_chunk& chunk, qwpws_ack_level level = qwpws_ack_level::ok)
     {
         line_sender_error::wrapped_call(
             ::qwp_sender_flush_chunk_and_wait,
@@ -791,10 +784,7 @@ public:
     {
         ::line_sender_qwpws_fsn fsn{};
         line_sender_error::wrapped_call(
-            ::qwp_sender_flush_chunk_and_get_fsn,
-            _raw,
-            chunk.c_ptr(),
-            &fsn);
+            ::qwp_sender_flush_chunk_and_get_fsn, _raw, chunk.c_ptr(), &fsn);
         return optional_fsn(fsn);
     }
 
@@ -821,8 +811,7 @@ public:
     std::optional<uint64_t> published_fsn() const
     {
         ::line_sender_qwpws_fsn fsn{};
-        line_sender_error::wrapped_call(
-            ::qwp_sender_published_fsn, _raw, &fsn);
+        line_sender_error::wrapped_call(::qwp_sender_published_fsn, _raw, &fsn);
         return optional_fsn(fsn);
     }
 
@@ -833,8 +822,7 @@ public:
     std::optional<uint64_t> acked_fsn() const
     {
         ::line_sender_qwpws_fsn fsn{};
-        line_sender_error::wrapped_call(
-            ::qwp_sender_acked_fsn, _raw, &fsn);
+        line_sender_error::wrapped_call(::qwp_sender_acked_fsn, _raw, &fsn);
         return optional_fsn(fsn);
     }
 
@@ -864,7 +852,8 @@ public:
     /**
      * Publish-only Arrow flush (server-stamped) into the queue. Pair with
      * `wait()`. Ownership: on success `array.release` is consumed; on failure
-     * it may also have been consumed — check before invoking. `schema` borrowed.
+     * it may also have been consumed — check before invoking. `schema`
+     * borrowed.
      */
     void flush_arrow_batch_at_now(
         table_name_view table,
@@ -1043,8 +1032,14 @@ public:
 private:
     friend class borrowed_sender;
 
-    ::qwp_sender* c_ptr() noexcept { return _raw; }
-    const ::qwp_sender* c_ptr() const noexcept { return _raw; }
+    ::qwp_sender* c_ptr() noexcept
+    {
+        return _raw;
+    }
+    const ::qwp_sender* c_ptr() const noexcept
+    {
+        return _raw;
+    }
 
     static std::optional<uint64_t> optional_fsn(
         const ::line_sender_qwpws_fsn& fsn)
@@ -1107,7 +1102,10 @@ public:
         return *this;
     }
 
-    ~borrowed_sender() noexcept { release(); }
+    ~borrowed_sender() noexcept
+    {
+        release();
+    }
 
     /** `true` if this guard currently owns a borrowed sender. */
     explicit operator bool() const noexcept
@@ -1150,8 +1148,7 @@ public:
 
     /** Publish and clear a Buffer, then wait for `level`. */
     void flush_and_wait(
-        line_sender_buffer& buffer,
-        qwpws_ack_level level = qwpws_ack_level::ok)
+        line_sender_buffer& buffer, qwpws_ack_level level = qwpws_ack_level::ok)
     {
         buffer.may_init();
         line_sender_error::wrapped_call(
@@ -1206,13 +1203,13 @@ public:
      *
      * A chunk introducing a symbol past the connection-scoped dictionary's
      * 2,000,000-entry / 256 MiB cap throws `error_code::symbol_dict_full` here.
-     * Retrying a new symbol on this sender cannot succeed: the dictionary belongs
-     * to the connection. A full dictionary retires the connection on return, so
-     * simply letting this guard be destroyed drops it (not recycled) and drains
-     * its queue best-effort — the next borrow gets a fresh connection. Call
-     * `wait()` first if the queued frames must not be lost (`drop_on_return()` is
-     * no longer required for a full dictionary). See the symbol-column preamble in
-     * `qwp_sender.h`.
+     * Retrying a new symbol on this sender cannot succeed: the dictionary
+     * belongs to the connection. A full dictionary retires the connection on
+     * return, so simply letting this guard be destroyed drops it (not recycled)
+     * and drains its queue best-effort — the next borrow gets a fresh
+     * connection. Call `wait()` first if the queued frames must not be lost
+     * (`drop_on_return()` is no longer required for a full dictionary). See the
+     * symbol-column preamble in `qwp_sender.h`.
      */
     void flush(column_chunk& chunk)
     {
@@ -1220,12 +1217,11 @@ public:
     }
 
     /**
-     * Publish `chunk` as a completion boundary, then wait until it and all prior
-     * frames published through this sender reach `level`.
+     * Publish `chunk` as a completion boundary, then wait until it and all
+     * prior frames published through this sender reach `level`.
      */
     void flush_and_wait(
-        column_chunk& chunk,
-        qwpws_ack_level level = qwpws_ack_level::ok)
+        column_chunk& chunk, qwpws_ack_level level = qwpws_ack_level::ok)
     {
         _view.flush_and_wait(chunk, level);
     }
@@ -1394,17 +1390,20 @@ public:
 #endif
 
     /**
-     * Force this borrowed sender to be closed instead of recycled when the guard
-     * is destroyed.
+     * Force this borrowed sender to be closed instead of recycled when the
+     * guard is destroyed.
      *
-     * Use normal destruction for healthy senders: the return path already closes
-     * senders that have latched terminal state, or whose pool has been closed.
-     * Call this after abandoning work or handling an error where the next
-     * borrower must not inherit this backend. If queued store-and-forward
+     * Use normal destruction for healthy senders: the return path already
+     * closes senders that have latched terminal state, or whose pool has been
+     * closed. Call this after abandoning work or handling an error where the
+     * next borrower must not inherit this backend. If queued store-and-forward
      * frames must not be lost, call `wait()` first or configure `sf_dir` for
      * replay.
      */
-    void drop_on_return() noexcept { _force_drop = true; }
+    void drop_on_return() noexcept
+    {
+        _force_drop = true;
+    }
 
 private:
     friend class ::questdb::pool;

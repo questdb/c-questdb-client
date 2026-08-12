@@ -151,30 +151,28 @@ typedef struct qwp_validity
  *
  * In store-and-forward mode, each borrowed sender owns its own
  * `<sender_id>-ingest-<index>` slot, so concurrent borrows are allowed up to
- * `sender_pool_max`. Returning a sender parks that same slot for reuse; dropping a
- * non-recycled sender releases its slot index after the slot lock is closed.
+ * `sender_pool_max`. Returning a sender parks that same slot for reuse;
+ * dropping a non-recycled sender releases its slot index after the slot lock is
+ * closed.
  *
  * The returned sender is bound to the calling thread until returned.
  */
 QUESTDB_CLIENT_API
 qwp_sender* questdb_db_borrow_sender(
-    questdb_db* db,
-    line_sender_error** err_out);
+    questdb_db* db, line_sender_error** err_out);
 
 /**
  * Like `questdb_db_borrow_sender` but retries the connect within `budget_ms`
  * using the pool's reconnect backoff (centered-jittered exponential with
  * a role-reject reset; authentication and protocol-version errors are
  * terminal). On a transient `line_sender_error_failover_retry`, drop the dead
- * sender with `questdb_db_drop_sender` then call this to fail over with the same
- * budget and backoff. `budget_ms == 0` makes a single attempt.
- * Returns NULL on failure and sets `*err_out` if provided.
+ * sender with `questdb_db_drop_sender` then call this to fail over with the
+ * same budget and backoff. `budget_ms == 0` makes a single attempt. Returns
+ * NULL on failure and sets `*err_out` if provided.
  */
 QUESTDB_CLIENT_API
 qwp_sender* questdb_db_borrow_sender_with_retry(
-    questdb_db* db,
-    uint64_t budget_ms,
-    line_sender_error** err_out);
+    questdb_db* db, uint64_t budget_ms, line_sender_error** err_out);
 
 /**
  * Return a sender to the pool. Accepts NULL `sender` and no-ops.
@@ -199,14 +197,12 @@ qwp_sender* questdb_db_borrow_sender_with_retry(
  * call exactly one of the two. Calling both (or either twice) is UB.
  */
 QUESTDB_CLIENT_API
-void questdb_db_return_sender(
-    questdb_db* db,
-    qwp_sender* sender);
+void questdb_db_return_sender(questdb_db* db, qwp_sender* sender);
 
 /**
- * Force-drop a borrowed sender instead of recycling it. Marks the sender terminal
- * before the usual pool-return path runs.
- * Invalidates `sender`. Accepts NULL `sender` and no-ops.
+ * Force-drop a borrowed sender instead of recycling it. Marks the sender
+ * terminal before the usual pool-return path runs. Invalidates `sender`.
+ * Accepts NULL `sender` and no-ops.
  *
  * Use normal return for healthy senders: the return path already closes senders
  * that have latched terminal state, or whose pool has been closed.
@@ -226,9 +222,7 @@ void questdb_db_return_sender(
  * call exactly one of the two. Calling both (or either twice) is UB.
  */
 QUESTDB_CLIENT_API
-void questdb_db_drop_sender(
-    questdb_db* db,
-    qwp_sender* sender);
+void questdb_db_drop_sender(questdb_db* db, qwp_sender* sender);
 
 /**
  * Borrow a direct (pipelined, non-store-and-forward) column-major sender from
@@ -238,8 +232,7 @@ void questdb_db_drop_sender(
  */
 QUESTDB_CLIENT_API
 qwp_direct_sender* questdb_db_borrow_direct_sender(
-    questdb_db* db,
-    line_sender_error** err_out);
+    questdb_db* db, line_sender_error** err_out);
 
 /**
  * Like `questdb_db_borrow_direct_sender` but retries the connect within
@@ -250,9 +243,7 @@ qwp_direct_sender* questdb_db_borrow_direct_sender(
  */
 QUESTDB_CLIENT_API
 qwp_direct_sender* questdb_db_borrow_direct_sender_with_retry(
-    questdb_db* db,
-    uint64_t budget_ms,
-    line_sender_error** err_out);
+    questdb_db* db, uint64_t budget_ms, line_sender_error** err_out);
 
 /**
  * Build a direct (pipelined, non-store-and-forward) column-major sender from a
@@ -266,9 +257,7 @@ qwp_direct_sender* questdb_db_borrow_direct_sender_with_retry(
  */
 QUESTDB_CLIENT_API
 qwp_direct_sender* qwp_direct_sender_from_conf(
-    const char* conf,
-    size_t conf_len,
-    line_sender_error** err_out);
+    const char* conf, size_t conf_len, line_sender_error** err_out);
 
 /**
  * Build a direct (pipelined, non-store-and-forward) column-major sender from a
@@ -284,8 +273,7 @@ qwp_direct_sender* qwp_direct_sender_from_conf(
  */
 QUESTDB_CLIENT_API
 qwp_direct_sender* qwp_direct_sender_from_opts(
-    const line_sender_opts* opts,
-    line_sender_error** err_out);
+    const line_sender_opts* opts, line_sender_error** err_out);
 
 /**
  * Return a direct sender to the pool. Accepts NULL `sender` and no-ops.
@@ -302,9 +290,7 @@ qwp_direct_sender* qwp_direct_sender_from_opts(
  * `sender`: call exactly one of the two. Calling both (or either twice) is UB.
  */
 QUESTDB_CLIENT_API
-void questdb_db_return_direct_sender(
-    questdb_db* db,
-    qwp_direct_sender* sender);
+void questdb_db_return_direct_sender(questdb_db* db, qwp_direct_sender* sender);
 
 /**
  * Force-drop a direct sender, closing its connection instead of recycling it
@@ -331,9 +317,7 @@ void questdb_db_return_direct_sender(
  * function. Calling more than one (or any release function twice) is UB.
  */
 QUESTDB_CLIENT_API
-void questdb_db_drop_direct_sender(
-    questdb_db* db,
-    qwp_direct_sender* sender);
+void questdb_db_drop_direct_sender(questdb_db* db, qwp_direct_sender* sender);
 
 /**
  * Free a standalone `qwp_direct_sender_from_conf` /
@@ -347,8 +331,7 @@ void questdb_db_drop_direct_sender(
  * functions (or either twice) is UB.
  */
 QUESTDB_CLIENT_API
-void qwp_direct_sender_free(
-    qwp_direct_sender* sender);
+void qwp_direct_sender_free(qwp_direct_sender* sender);
 
 /* Reader-pool entry points (`questdb_db_borrow_reader`,
  * `questdb_db_dbg_reader_*_count`) live in `questdb/egress/qwp_reader.h`
@@ -367,8 +350,7 @@ void qwp_direct_sender_free(
  */
 QUESTDB_CLIENT_API
 line_sender_buffer* questdb_db_new_buffer(
-    const questdb_db* db,
-    line_sender_error** err_out);
+    const questdb_db* db, line_sender_error** err_out);
 
 /** Return the configured name limit used by `questdb_db_new_buffer`. */
 QUESTDB_CLIENT_API
@@ -440,9 +422,7 @@ bool qwp_sender_flush_buffer_and_keep_and_get_fsn(
  */
 QUESTDB_CLIENT_API
 qwp_chunk* qwp_chunk_new(
-    const char* table_name,
-    size_t table_name_len,
-    line_sender_error** err_out);
+    const char* table_name, size_t table_name_len, line_sender_error** err_out);
 
 /**
  * Create an empty chunk from a pre-validated `line_sender_table_name`.
@@ -464,8 +444,7 @@ qwp_chunk* qwp_chunk_new(
  */
 QUESTDB_CLIENT_API
 qwp_chunk* qwp_chunk_new_validated(
-    line_sender_table_name table,
-    line_sender_error** err_out);
+    line_sender_table_name table, line_sender_error** err_out);
 
 /**
  * Discard the chunk and release its allocations. Accepts NULL (no-op).
@@ -485,9 +464,7 @@ void qwp_chunk_free(qwp_chunk* chunk);
  * mutating the chunk. A NULL `err_out` is silently ignored.
  */
 QUESTDB_CLIENT_API
-bool qwp_chunk_clear(
-    qwp_chunk* chunk,
-    line_sender_error** err_out);
+bool qwp_chunk_clear(qwp_chunk* chunk, line_sender_error** err_out);
 
 /**
  * Current row count of the chunk; 0 if no column has been appended.
@@ -497,9 +474,7 @@ bool qwp_chunk_clear(
  * ignored.
  */
 QUESTDB_CLIENT_API
-size_t qwp_chunk_row_count(
-    const qwp_chunk* chunk,
-    line_sender_error** err_out);
+size_t qwp_chunk_row_count(const qwp_chunk* chunk, line_sender_error** err_out);
 
 /* -------------------------------------------------------------------------
  * Numeric / fixed-width column appends
@@ -535,48 +510,60 @@ size_t qwp_chunk_row_count(
 QUESTDB_CLIENT_API
 bool qwp_chunk_column_i8(
     qwp_chunk* chunk,
-    const char* name, size_t name_len,
-    const int8_t* data, size_t row_count,
+    const char* name,
+    size_t name_len,
+    const int8_t* data,
+    size_t row_count,
     const qwp_validity* validity,
     line_sender_error** err_out);
 
 QUESTDB_CLIENT_API
 bool qwp_chunk_column_i16(
     qwp_chunk* chunk,
-    const char* name, size_t name_len,
-    const int16_t* data, size_t row_count,
+    const char* name,
+    size_t name_len,
+    const int16_t* data,
+    size_t row_count,
     const qwp_validity* validity,
     line_sender_error** err_out);
 
 QUESTDB_CLIENT_API
 bool qwp_chunk_column_i32(
     qwp_chunk* chunk,
-    const char* name, size_t name_len,
-    const int32_t* data, size_t row_count,
+    const char* name,
+    size_t name_len,
+    const int32_t* data,
+    size_t row_count,
     const qwp_validity* validity,
     line_sender_error** err_out);
 
 QUESTDB_CLIENT_API
 bool qwp_chunk_column_i64(
     qwp_chunk* chunk,
-    const char* name, size_t name_len,
-    const int64_t* data, size_t row_count,
+    const char* name,
+    size_t name_len,
+    const int64_t* data,
+    size_t row_count,
     const qwp_validity* validity,
     line_sender_error** err_out);
 
 QUESTDB_CLIENT_API
 bool qwp_chunk_column_f32(
     qwp_chunk* chunk,
-    const char* name, size_t name_len,
-    const float* data, size_t row_count,
+    const char* name,
+    size_t name_len,
+    const float* data,
+    size_t row_count,
     const qwp_validity* validity,
     line_sender_error** err_out);
 
 QUESTDB_CLIENT_API
 bool qwp_chunk_column_f64(
     qwp_chunk* chunk,
-    const char* name, size_t name_len,
-    const double* data, size_t row_count,
+    const char* name,
+    size_t name_len,
+    const double* data,
+    size_t row_count,
     const qwp_validity* validity,
     line_sender_error** err_out);
 
@@ -592,8 +579,10 @@ bool qwp_chunk_column_f64(
 QUESTDB_CLIENT_API
 bool qwp_chunk_column_bool(
     qwp_chunk* chunk,
-    const char* name, size_t name_len,
-    const uint8_t* data, size_t row_count,
+    const char* name,
+    size_t name_len,
+    const uint8_t* data,
+    size_t row_count,
     const qwp_validity* validity,
     line_sender_error** err_out);
 
@@ -604,8 +593,10 @@ bool qwp_chunk_column_bool(
 QUESTDB_CLIENT_API
 bool qwp_chunk_column_uuid(
     qwp_chunk* chunk,
-    const char* name, size_t name_len,
-    const uint8_t* data, size_t row_count,
+    const char* name,
+    size_t name_len,
+    const uint8_t* data,
+    size_t row_count,
     const qwp_validity* validity,
     line_sender_error** err_out);
 
@@ -616,8 +607,10 @@ bool qwp_chunk_column_uuid(
 QUESTDB_CLIENT_API
 bool qwp_chunk_column_long256(
     qwp_chunk* chunk,
-    const char* name, size_t name_len,
-    const uint8_t* data, size_t row_count,
+    const char* name,
+    size_t name_len,
+    const uint8_t* data,
+    size_t row_count,
     const qwp_validity* validity,
     line_sender_error** err_out);
 
@@ -628,8 +621,10 @@ bool qwp_chunk_column_long256(
 QUESTDB_CLIENT_API
 bool qwp_chunk_column_ipv4(
     qwp_chunk* chunk,
-    const char* name, size_t name_len,
-    const uint32_t* data, size_t row_count,
+    const char* name,
+    size_t name_len,
+    const uint32_t* data,
+    size_t row_count,
     const qwp_validity* validity,
     line_sender_error** err_out);
 
@@ -659,8 +654,10 @@ typedef enum qwp_ts_unit
 QUESTDB_CLIENT_API
 bool qwp_chunk_column_ts(
     qwp_chunk* chunk,
-    const char* name, size_t name_len,
-    const int64_t* data, size_t row_count,
+    const char* name,
+    size_t name_len,
+    const int64_t* data,
+    size_t row_count,
     uint32_t unit,
     const qwp_validity* validity,
     line_sender_error** err_out);
@@ -669,8 +666,10 @@ bool qwp_chunk_column_ts(
 QUESTDB_CLIENT_API
 bool qwp_chunk_column_date(
     qwp_chunk* chunk,
-    const char* name, size_t name_len,
-    const int64_t* data, size_t row_count,
+    const char* name,
+    size_t name_len,
+    const int64_t* data,
+    size_t row_count,
     const qwp_validity* validity,
     line_sender_error** err_out);
 
@@ -711,7 +710,8 @@ bool qwp_chunk_column_date(
 QUESTDB_CLIENT_API
 bool qwp_chunk_column_str(
     qwp_chunk* chunk,
-    const char* name, size_t name_len,
+    const char* name,
+    size_t name_len,
     const int32_t* offsets,
     const uint8_t* bytes,
     size_t bytes_len,
@@ -782,41 +782,44 @@ bool qwp_chunk_column_binary(
  * the chunk, or the rows the committed prefix already carried are duplicated.
  *
  * Resetting the dictionary means discarding the connection that owns it — there
- * is no per-sender close. A full dictionary RETIRES the connection on return, so
- * a plain `questdb_db_return_sender` drops it rather than recycling it (the next
- * borrow gets a fresh, empty-dictionary connection, not the same full one) and
- * drains / commits its pending frames best-effort on the way out. So the simplest
- * recovery is to return the sender as usual and borrow a fresh one. Discarding the
- * connection is NOT automatically lossless for frames already flushed on it, so if
- * those must not be lost, drain or commit them AND check first:
+ * is no per-sender close. A full dictionary RETIRES the connection on return,
+ * so a plain `questdb_db_return_sender` drops it rather than recycling it (the
+ * next borrow gets a fresh, empty-dictionary connection, not the same full one)
+ * and drains / commits its pending frames best-effort on the way out. So the
+ * simplest recovery is to return the sender as usual and borrow a fresh one.
+ * Discarding the connection is NOT automatically lossless for frames already
+ * flushed on it, so if those must not be lost, drain or commit them AND check
+ * first:
  *
  *   - Pooled sender: a plain `questdb_db_return_sender` now retires (does NOT
  *     recycle) a full-dictionary connection and drains its queue best-effort
  *     within `close_flush_timeout`; the next borrow is fresh. Call
- *     `qwp_sender_wait` first if the queued frames must not be lost. This matters
- *     with `sf_dir` too: returning while frames are unresolved leaves them (and
- *     the dictionary) in the slot, and the next borrower re-seeds from the slot's
- *     side-file at the same size unless the slot drained first.
- *   - Pooled direct sender: a plain `questdb_db_return_direct_sender` retires the
- *     connection and commits the deferred tail best-effort. Its flushes are
- *     deferred, so for a CHECKED guarantee call `qwp_direct_sender_commit` (or a
- *     waited flush) and confirm it succeeded before the return. Do NOT use
+ *     `qwp_sender_wait` first if the queued frames must not be lost. This
+ * matters with `sf_dir` too: returning while frames are unresolved leaves them
+ * (and the dictionary) in the slot, and the next borrower re-seeds from the
+ * slot's side-file at the same size unless the slot drained first.
+ *   - Pooled direct sender: a plain `questdb_db_return_direct_sender` retires
+ * the connection and commits the deferred tail best-effort. Its flushes are
+ *     deferred, so for a CHECKED guarantee call `qwp_direct_sender_commit` (or
+ * a waited flush) and confirm it succeeded before the return. Do NOT use
  *     `questdb_db_drop_direct_sender` on a full dictionary: it force-drops and
- *     skips the best-effort commit that the normal return performs, so every frame
- *     flushed since the last successful commit is discarded with only a log
+ *     skips the best-effort commit that the normal return performs, so every
+ * frame flushed since the last successful commit is discarded with only a log
  *     warning.
  *   - Standalone direct sender: `qwp_direct_sender_free` performs the same
- *     best-effort commit the pooled return does, so the deferred tail is committed
- *     on the way out; call `qwp_direct_sender_commit` first so the commit's success
- *     is something you checked rather than hoped for. Then `qwp_direct_sender_free`,
- *     then re-open with `qwp_direct_sender_from_conf` / `qwp_direct_sender_from_opts`.
+ *     best-effort commit the pooled return does, so the deferred tail is
+ * committed on the way out; call `qwp_direct_sender_commit` first so the
+ * commit's success is something you checked rather than hoped for. Then
+ * `qwp_direct_sender_free`, then re-open with `qwp_direct_sender_from_conf` /
+ * `qwp_direct_sender_from_opts`.
  *   - Standalone row sender (a `line_sender` opened on a `ws://` / `wss://`
  *     address and flushed with `line_sender_flush*`, which shares this same
  *     connection dictionary): `line_sender_qwpws_close_drain` and check it
  *     succeeded, then `line_sender_close`, then re-open. Do NOT rely on
  *     `line_sender_close` alone — it does not flush, and nothing drains the
  *     QWP/WebSocket queue on the way out, so every published-but-unacked frame
- *     is discarded with no wait. This is the most lossy flavour on a bare close.
+ *     is discarded with no wait. This is the most lossy flavour on a bare
+ * close.
  *
  * `codes[i]` must be in `0 .. dict_len` for non-null rows; null-row
  * codes are not inspected.
@@ -843,30 +846,42 @@ bool qwp_chunk_column_binary(
 QUESTDB_CLIENT_API
 bool qwp_chunk_symbol_i8(
     qwp_chunk* chunk,
-    const char* name, size_t name_len,
-    const int8_t* codes, size_t row_count,
-    const int32_t* dict_offsets, size_t dict_offsets_len,
-    const uint8_t* dict_bytes, size_t dict_bytes_len,
+    const char* name,
+    size_t name_len,
+    const int8_t* codes,
+    size_t row_count,
+    const int32_t* dict_offsets,
+    size_t dict_offsets_len,
+    const uint8_t* dict_bytes,
+    size_t dict_bytes_len,
     const qwp_validity* validity,
     line_sender_error** err_out);
 
 QUESTDB_CLIENT_API
 bool qwp_chunk_symbol_i16(
     qwp_chunk* chunk,
-    const char* name, size_t name_len,
-    const int16_t* codes, size_t row_count,
-    const int32_t* dict_offsets, size_t dict_offsets_len,
-    const uint8_t* dict_bytes, size_t dict_bytes_len,
+    const char* name,
+    size_t name_len,
+    const int16_t* codes,
+    size_t row_count,
+    const int32_t* dict_offsets,
+    size_t dict_offsets_len,
+    const uint8_t* dict_bytes,
+    size_t dict_bytes_len,
     const qwp_validity* validity,
     line_sender_error** err_out);
 
 QUESTDB_CLIENT_API
 bool qwp_chunk_symbol_i32(
     qwp_chunk* chunk,
-    const char* name, size_t name_len,
-    const int32_t* codes, size_t row_count,
-    const int32_t* dict_offsets, size_t dict_offsets_len,
-    const uint8_t* dict_bytes, size_t dict_bytes_len,
+    const char* name,
+    size_t name_len,
+    const int32_t* codes,
+    size_t row_count,
+    const int32_t* dict_offsets,
+    size_t dict_offsets_len,
+    const uint8_t* dict_bytes,
+    size_t dict_bytes_len,
     const qwp_validity* validity,
     line_sender_error** err_out);
 
@@ -937,12 +952,12 @@ bool qwp_chunk_symbol_i32(
  * `ArrowSchema`; we consume `array->release` on success in the
  * column-sender entry points below, and leave it intact on failure.
  * https://arrow.apache.org/docs/format/CDataInterface.html */
-#ifndef ARROW_C_DATA_INTERFACE
-#    define ARROW_C_DATA_INTERFACE
+#    ifndef ARROW_C_DATA_INTERFACE
+#        define ARROW_C_DATA_INTERFACE
 
-#    define ARROW_FLAG_DICTIONARY_ORDERED 1
-#    define ARROW_FLAG_NULLABLE 2
-#    define ARROW_FLAG_MAP_KEYS_SORTED 4
+#        define ARROW_FLAG_DICTIONARY_ORDERED 1
+#        define ARROW_FLAG_NULLABLE 2
+#        define ARROW_FLAG_MAP_KEYS_SORTED 4
 
 struct ArrowSchema
 {
@@ -971,7 +986,7 @@ struct ArrowArray
     void* private_data;
 };
 
-#endif /* ARROW_C_DATA_INTERFACE */
+#    endif /* ARROW_C_DATA_INTERFACE */
 
 /**
  * Opaque handle wrapping an `ArrowArray` + `ArrowSchema` pair imported
@@ -1180,8 +1195,8 @@ typedef enum qwp_numpy_dtype
     qwp_numpy_u32 = 6, /* → LONG  (8B/row, widen u32→i64)             */
     qwp_numpy_u64 = 7, /* → LONG  (8B/row, reject values > i64::MAX)  */
 
-    qwp_numpy_f32 = 8, /* → FLOAT  (4B/row, direct)                   */
-    qwp_numpy_f64 = 9, /* → DOUBLE (8B/row, sentinel = NaN)           */
+    qwp_numpy_f32 = 8,   /* → FLOAT  (4B/row, direct)                   */
+    qwp_numpy_f64 = 9,   /* → DOUBLE (8B/row, sentinel = NaN)           */
     qwp_numpy_bool = 10, /* → BOOLEAN (bit-packed)                    */
 
     /* Half-precision + time */
@@ -1361,9 +1376,7 @@ bool qwp_chunk_at_seconds(
  * Rejects if a designated timestamp column is already set (and vice
  * versa). Cleared by `qwp_chunk_clear`. */
 QUESTDB_CLIENT_API
-bool qwp_chunk_at_now(
-    qwp_chunk* chunk,
-    line_sender_error** err_out);
+bool qwp_chunk_at_now(qwp_chunk* chunk, line_sender_error** err_out);
 
 /** Pin one scalar nanosecond-precision Unix epoch timestamp as every
  * row's designated timestamp, encoded as a repeated constant (wire type
@@ -1374,9 +1387,7 @@ bool qwp_chunk_at_now(
  * `qwp_chunk_clear`. */
 QUESTDB_CLIENT_API
 bool qwp_chunk_at_scalar_nanos(
-    qwp_chunk* chunk,
-    int64_t nanos,
-    line_sender_error** err_out);
+    qwp_chunk* chunk, int64_t nanos, line_sender_error** err_out);
 
 /* -------------------------------------------------------------------------
  * Flush / sync
@@ -1389,8 +1400,8 @@ bool qwp_chunk_at_scalar_nanos(
  * Every flushed frame is non-deferred and is first accepted into the local
  * store-and-forward queue, which owns delivery. `qwp_sender_flush_chunk`
  * success means local queue acceptance, not server acknowledgement.
- * `qwp_sender_flush_chunk_and_wait` combines local publication of `chunk` as the
- * sync-call boundary with the wait for `ack_level`. `qwp_sender_wait` does
+ * `qwp_sender_flush_chunk_and_wait` combines local publication of `chunk` as
+ * the sync-call boundary with the wait for `ack_level`. `qwp_sender_wait` does
  * not send a frame; it waits for frames already published to the local queue,
  * up to the sync-call boundary, to be acknowledged at `ack_level`.
  *
@@ -1409,9 +1420,7 @@ bool qwp_chunk_at_scalar_nanos(
 
 QUESTDB_CLIENT_API
 bool qwp_sender_flush_chunk(
-    qwp_sender* sender,
-    qwp_chunk* chunk,
-    line_sender_error** err_out);
+    qwp_sender* sender, qwp_chunk* chunk, line_sender_error** err_out);
 
 /**
  * Publish `chunk` locally through the borrowed store-and-forward QWP sender
@@ -1556,9 +1565,7 @@ bool qwp_sender_wait(
  */
 QUESTDB_CLIENT_API
 bool qwp_direct_sender_flush(
-    qwp_direct_sender* sender,
-    qwp_chunk* chunk,
-    line_sender_error** err_out);
+    qwp_direct_sender* sender, qwp_chunk* chunk, line_sender_error** err_out);
 
 /**
  * Direct commit: send the commit boundary for all pipelined frames and block
@@ -1568,9 +1575,7 @@ bool qwp_direct_sender_flush(
  */
 QUESTDB_CLIENT_API
 bool qwp_direct_sender_commit(
-    qwp_direct_sender* sender,
-    uint32_t ack_level,
-    line_sender_error** err_out);
+    qwp_direct_sender* sender, uint32_t ack_level, line_sender_error** err_out);
 
 #ifdef QUESTDB_CLIENT_ENABLE_ARROW
 

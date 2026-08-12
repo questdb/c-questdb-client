@@ -60,6 +60,9 @@ class pool;
  * The released `questdb::ingress::line_sender_error_code` remains an alias of
  * this type.
  */
+// clang-format off: the Rust test `mirrors_of_the_c_error_code_enum_are_complete`
+// parses this enum expecting exactly one `<short> = ::line_sender_error_<short>,`
+// per line; reflowing a long entry across two lines breaks the mirror check.
 enum class error_code : int
 {
     could_not_resolve_addr = ::line_sender_error_could_not_resolve_addr,
@@ -102,6 +105,7 @@ enum class error_code : int
     store_resend_required = ::line_sender_error_store_resend_required,
     symbol_dict_full = ::line_sender_error_symbol_dict_full,
 };
+// clang-format on
 
 // Bridge equality between the C++ `questdb::error_code` and the released C ABI
 // enum `::line_sender_error_code` (identical `int` values), so existing
@@ -165,7 +169,8 @@ public:
     {
         ::questdb_error* c_err{nullptr};
         auto result = f(std::forward<Args>(args)..., &c_err);
-        if (c_err) throw from_c(c_err);
+        if (c_err)
+            throw from_c(c_err);
         return result;
     }
 
@@ -261,13 +266,10 @@ inline qwp_ws_error qwp_ws_error_from_view(
     const ::line_sender_qwpws_error_view& view)
 {
     return qwp_ws_error{
-        static_cast<qwp_ws_error_category>(
-            static_cast<int>(view.category)),
-        static_cast<qwp_ws_error_policy>(
-            static_cast<int>(view.applied_policy)),
-        view.has_status
-            ? std::optional<uint8_t>{view.status}
-            : std::optional<uint8_t>{},
+        static_cast<qwp_ws_error_category>(static_cast<int>(view.category)),
+        static_cast<qwp_ws_error_policy>(static_cast<int>(view.applied_policy)),
+        view.has_status ? std::optional<uint8_t>{view.status}
+                        : std::optional<uint8_t>{},
         std::string{
             view.message ? view.message : "",
             view.message ? view.message_len : 0},
@@ -362,10 +364,9 @@ public:
 private:
     inline static line_sender_error from_c(::line_sender_error* c_err)
     {
-        const std::unique_ptr<
-            ::line_sender_error,
-            decltype(&::line_sender_error_free)>
-            owned_err{c_err, ::line_sender_error_free};
+        const std::
+            unique_ptr<::line_sender_error, decltype(&::line_sender_error_free)>
+                owned_err{c_err, ::line_sender_error_free};
         line_sender_error_code code = static_cast<line_sender_error_code>(
             static_cast<int>(::line_sender_error_get_code(owned_err.get())));
         size_t c_len{0};

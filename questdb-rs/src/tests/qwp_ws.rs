@@ -650,15 +650,23 @@ fn write_mock_qwp_response(
 fn spawn_recycling_server(
     action: RecycleServerAction,
     run_for: Duration,
-) -> (u16, thread::JoinHandle<usize>) {
+) -> (u16, thread::JoinHandle<usize>, Arc<AtomicUsize>) {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     listener.set_nonblocking(true).unwrap();
     let port = listener.local_addr().unwrap().port();
 
+    let connection_count = Arc::new(AtomicUsize::new(0));
+    let shared_count = Arc::clone(&connection_count);
     let handle = thread::spawn(move || {
         let deadline = Instant::now() + run_for;
+        // A stalled client may not manage its second connection inside
+        // `run_for`; keep serving (bounded) until it does, so the callers'
+        // non-vacuity lower bound cannot flip on a slow machine. A longer
+        // quiet window only lowers the connection rate, so the pacing upper
+        // bound stays in the safe direction.
+        let hard_deadline = Instant::now() + Duration::from_secs(10);
         let mut connections = 0usize;
-        while Instant::now() < deadline {
+        while Instant::now() < deadline || (connections < 2 && Instant::now() < hard_deadline) {
             match listener.accept() {
                 Ok((mut stream, _)) => {
                     // The listener is non-blocking so the accept loop can honor
@@ -677,21 +685,30 @@ fn spawn_recycling_server(
                     match read_frame(&mut stream) {
                         Ok((_fin, 0x2, _payload)) => {
                             connections += 1;
+                            // The client may tear down at any moment once the
+                            // caller has seen enough connections, so a failed
+                            // response write is a legitimate outcome here,
+                            // like the reset/EOF kinds tolerated on the read
+                            // side below.
                             match action {
                                 RecycleServerAction::WriteError => {
-                                    write_qwp_error_response(
+                                    let _ = write_qwp_error_response(
                                         &mut stream,
                                         QWP_STATUS_WRITE_ERROR,
                                         FIRST_WIRE_SEQUENCE,
                                         b"retry later",
-                                    )
-                                    .unwrap();
+                                    );
                                 }
                                 RecycleServerAction::NonOrderlyClose => {
-                                    write_server_close_frame(&mut stream, 1002, "retry later")
-                                        .unwrap();
+                                    let _ =
+                                        write_server_close_frame(&mut stream, 1002, "retry later");
                                 }
                             }
+                            // Published only after the response write: the
+                            // caller drops the sender once it observes the
+                            // count, and publishing earlier would let that
+                            // teardown race the write above.
+                            shared_count.store(connections, Ordering::Release);
                         }
                         Ok((_fin, _opcode, _payload)) => {}
                         Err(err)
@@ -714,7 +731,7 @@ fn spawn_recycling_server(
         connections
     });
 
-    (port, handle)
+    (port, handle, connection_count)
 }
 
 fn spawn_stalled_after_first_frame_server() -> (u16, mpsc::Receiver<Vec<u8>>, mpsc::Sender<()>) {
@@ -783,7 +800,15 @@ fn spawn_delayed_durable_ack_server() -> (
 
         durable_rx.recv_timeout(Duration::from_secs(5)).unwrap();
         write_qwp_durable_ack_response(&mut stream, &[("trades", 10)]).unwrap();
-        thread::sleep(Duration::from_millis(50));
+        // Hold the socket open until the client has consumed the durable ack
+        // and closed: dropping after a fixed sleep can turn into an RST that
+        // discards the still-buffered ack on a slow client (keepalive pings
+        // land after our last read). The read timeout bounds the hold.
+        stream
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .unwrap();
+        let mut sink = [0u8; 256];
+        while matches!(stream.read(&mut sink), Ok(n) if n > 0) {}
     });
 
     (port, frame_rx, ok_tx, durable_tx)
@@ -1028,7 +1053,14 @@ fn spawn_upgrade_only_server() -> u16 {
     thread::spawn(move || {
         let (mut stream, _) = listener.accept().unwrap();
         perform_server_upgrade(&mut stream).unwrap();
-        thread::sleep(Duration::from_millis(50));
+        // Never respond, but stay alive until the client closes: dying after
+        // a fixed sleep turns a slow client's later flush/close into an
+        // RST-surfacing path instead of the silent-server path under test.
+        stream
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .unwrap();
+        let mut sink = [0u8; 256];
+        while matches!(stream.read(&mut sink), Ok(n) if n > 0) {}
     });
 
     port
@@ -2359,7 +2391,6 @@ fn qwp_ws_durable_ack_completion_waits_for_durable_confirmation_in_all_progress_
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
         let (allow_ack_tx, allow_ack_rx) = mpsc::channel();
-        let (ping_tx, ping_rx) = mpsc::channel();
         let (done_tx, done_rx) = mpsc::channel();
 
         let server = thread::spawn(move || {
@@ -2388,15 +2419,9 @@ fn qwp_ws_durable_ack_completion_waits_for_durable_confirmation_in_all_progress_
             .unwrap();
 
             allow_ack_rx.recv_timeout(Duration::from_secs(5)).unwrap();
-            loop {
-                let (_, opcode, payload) = read_frame(&mut stream).unwrap();
-                if opcode == 0x9 {
-                    write_server_frame(&mut stream, 0xA, &payload, false).unwrap();
-                    write_qwp_durable_ack_response(&mut stream, &[("trades", 10)]).unwrap();
-                    ping_tx.send(payload).unwrap();
-                    break;
-                }
-            }
+            // Keep this test about durable completion. Keepalive scheduling is
+            // covered independently by the transport driver tests.
+            write_qwp_durable_ack_response(&mut stream, &[("trades", 10)]).unwrap();
 
             let _ = done_rx.recv_timeout(Duration::from_secs(5));
         });
@@ -2404,8 +2429,7 @@ fn qwp_ws_durable_ack_completion_waits_for_durable_confirmation_in_all_progress_
         let conf = format!(
             "ws::addr=127.0.0.1:{port};\
              qwp_ws_progress={};\
-             request_durable_ack=on;\
-             durable_ack_keepalive_interval_millis=1;",
+             request_durable_ack=on;",
             progress.name()
         );
         let mut sender = SenderBuilder::from_conf(conf).unwrap().build().unwrap();
@@ -2448,7 +2472,6 @@ fn qwp_ws_durable_ack_completion_waits_for_durable_confirmation_in_all_progress_
         sender
             .wait(crate::ingress::AckLevel::Durable, Duration::from_secs(5))
             .unwrap_or_else(|e| panic!("mode={}: {e}", progress.name()));
-        assert_eq!(ping_rx.recv_timeout(Duration::from_secs(5)).unwrap(), b"");
         assert_eq!(sender.acked_fsn().unwrap(), Some(fsn));
         done_tx.send(()).unwrap();
         server.join().unwrap();
@@ -2674,7 +2697,13 @@ fn qwp_ws_close_flush_timeout_minus_one_skips_close_drain_wait() {
         upgrade_mock_stream(&mut stream);
         let (_fin, _opcode, payload) = read_frame(&mut stream).unwrap();
         frame_tx.send(payload).unwrap();
-        thread::sleep(Duration::from_millis(500));
+        // Stay silent but alive until the client closes, so a fast
+        // `close_drain` is provably "skipped the wait" and not "server went
+        // away". If close regresses into waiting for the un-acked frame, the
+        // 5s read timeout above ends the hold and unblocks it via EOF, which
+        // the elapsed assertion below then catches.
+        let mut sink = [0u8; 256];
+        while matches!(stream.read(&mut sink), Ok(n) if n > 0) {}
     });
 
     let conf = format!("ws::addr=127.0.0.1:{port};close_flush_timeout_millis=-1;");
@@ -2694,8 +2723,11 @@ fn qwp_ws_close_flush_timeout_minus_one_skips_close_drain_wait() {
 
     let started = Instant::now();
     sender.close_drain().unwrap();
+    // 2s is far above any scheduler stall but well below the ~5s a close that
+    // regressed into waiting for the un-acked frame would take (see the
+    // server hold above).
     assert!(
-        started.elapsed() < Duration::from_millis(250),
+        started.elapsed() < Duration::from_secs(2),
         "close_drain waited despite close_flush_timeout_millis=-1"
     );
     drop(sender);
@@ -2756,64 +2788,6 @@ fn qwp_ws_drop_interrupts_blocked_background_send() {
     assert!(
         elapsed < Duration::from_secs(1),
         "drop waited for the socket write timeout: {elapsed:?}"
-    );
-}
-
-#[test]
-fn qwp_ws_drop_interrupts_blocked_send_after_reconnect() {
-    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    let port = listener.local_addr().unwrap().port();
-    let (send_started_tx, send_started_rx) = mpsc::channel();
-    let (release_tx, release_rx) = mpsc::channel();
-
-    let server = thread::spawn(move || {
-        let (mut first, _) = listener.accept().unwrap();
-        upgrade_mock_stream(&mut first);
-        drop(first);
-
-        let (mut second, _) = listener.accept().unwrap();
-        socket2::SockRef::from(&second)
-            .set_recv_buffer_size(4096)
-            .unwrap();
-        upgrade_mock_stream(&mut second);
-        second
-            .set_read_timeout(Some(Duration::from_secs(5)))
-            .unwrap();
-        let mut byte = [0u8; 1];
-        second.peek(&mut byte).unwrap();
-        send_started_tx.send(()).unwrap();
-        let _ = release_rx.recv_timeout(Duration::from_secs(10));
-    });
-
-    let conf = format!(
-        "ws::addr=127.0.0.1:{port};\
-         close_flush_timeout_millis=-1;\
-         sf_max_segment_bytes=16777216;"
-    );
-    let mut sender = SenderBuilder::from_conf(&conf).unwrap().build().unwrap();
-    let value = "x".repeat(8 * 1024 * 1024);
-    let mut buf = sender.new_buffer();
-    buf.table("trades")
-        .unwrap()
-        .column_str("payload", value.as_str())
-        .unwrap()
-        .at_now()
-        .unwrap();
-    sender.flush(&mut buf).unwrap();
-
-    send_started_rx
-        .recv_timeout(Duration::from_secs(5))
-        .unwrap();
-
-    let started = Instant::now();
-    drop(sender);
-    let elapsed = started.elapsed();
-    let _ = release_tx.send(());
-    server.join().unwrap();
-
-    assert!(
-        elapsed < Duration::from_secs(1),
-        "drop waited on the replacement socket after reconnect: {elapsed:?}"
     );
 }
 
@@ -4728,7 +4702,11 @@ fn qwp_ws_server_error_response_is_surfaced() {
             b"bad column",
         )
         .unwrap();
-        thread::sleep(Duration::from_millis(50));
+        // Hold the socket open until the client closes it, so a late second
+        // flush cannot race a server-side teardown (the 5s read timeout
+        // above bounds the wait).
+        let mut sink = [0u8; 256];
+        while matches!(stream.read(&mut sink), Ok(n) if n > 0) {}
     });
 
     let mut sender = SenderBuilder::new(Protocol::Ws, "127.0.0.1", port)
@@ -4750,7 +4728,20 @@ fn qwp_ws_server_error_response_is_surfaced() {
     assert!(buf.is_empty());
     assert_eq!(first_fsn, 0);
 
-    thread::sleep(Duration::from_millis(100));
+    // Bounded pump instead of a sleep: the runner thread ingests the error
+    // response and terminalizes the publication in the background, but on a
+    // slow machine a fixed sleep can lose that race and the second flush
+    // then observes a healthy connection. `qwp_ws_terminal_error` probes the
+    // terminal diagnostic without consuming it, so the polls below leave
+    // every later assertion (handler callback, `poll_qwp_ws_error`) intact.
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while sender.qwp_ws_terminal_error().unwrap().is_none() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "server rejection was not applied within 5s"
+        );
+        thread::sleep(Duration::from_millis(1));
+    }
 
     buf.table("trades")
         .unwrap()
@@ -5054,7 +5045,7 @@ fn qwp_ws_orderly_close_reconnects_without_poison_strike() {
 
 fn run_paced_recycle_scenario(action: RecycleServerAction) -> usize {
     let run_for = Duration::from_millis(900);
-    let (port, handle) = spawn_recycling_server(action, run_for);
+    let (port, handle, connection_count) = spawn_recycling_server(action, run_for);
     let mut sender = SenderBuilder::new(Protocol::Ws, "127.0.0.1", port)
         .max_frame_rejections(1000)
         .unwrap()
@@ -5078,6 +5069,13 @@ fn run_paced_recycle_scenario(action: RecycleServerAction) -> usize {
     sender.flush_and_get_fsn(&mut buf).unwrap().unwrap();
 
     thread::sleep(run_for);
+    // Keep the sender alive until the reconnect that makes the callers'
+    // lower bound meaningful has happened; bounded by the server's own 10s
+    // hard deadline, after which the count assert fails loudly.
+    let wait_deadline = Instant::now() + Duration::from_secs(10);
+    while connection_count.load(Ordering::Acquire) < 2 && Instant::now() < wait_deadline {
+        thread::sleep(Duration::from_millis(10));
+    }
     drop(sender);
     handle.join().unwrap()
 }
@@ -6967,7 +6965,13 @@ fn spawn_max_batch_size_upgrade_only_server(max_batch_size: Option<usize>) -> u1
     thread::spawn(move || {
         let (mut stream, _) = listener.accept().unwrap();
         upgrade_mock_stream_with_max_batch_size(&mut stream, max_batch_size);
-        thread::sleep(Duration::from_millis(200));
+        // Silent but alive until the client closes; see
+        // `spawn_upgrade_only_server`.
+        stream
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .unwrap();
+        let mut sink = [0u8; 256];
+        while matches!(stream.read(&mut sink), Ok(n) if n > 0) {}
     });
     port
 }

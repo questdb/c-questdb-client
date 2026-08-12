@@ -26,7 +26,8 @@
 
 /* One parallel sender: its own connection, chunk, scratch and row range.
  * bench_die() exits the whole process on error — acceptable for a bench. */
-typedef struct {
+typedef struct
+{
     qwp_direct_sender* sender;
     qwp_chunk* chunk;
     const bench_data* d;
@@ -38,20 +39,30 @@ typedef struct {
 static void* sender_thread(void* arg)
 {
     sender_job* j = arg;
-    ingest_pass(j->sender, j->chunk, j->d, j->kind, j->lo, j->hi,
-                j->max_batch_rows, &j->scratch, PROG);
+    ingest_pass(
+        j->sender,
+        j->chunk,
+        j->d,
+        j->kind,
+        j->lo,
+        j->hi,
+        j->max_batch_rows,
+        &j->scratch,
+        PROG);
     return NULL;
 }
 
 static void run_multi_pass(sender_job* jobs, size_t n)
 {
-    if (n == 1) { /* classic path: no thread overhead in the timed region */
+    if (n == 1)
+    { /* classic path: no thread overhead in the timed region */
         sender_thread(&jobs[0]);
         return;
     }
     pthread_t* tids = malloc(n * sizeof(pthread_t));
     for (size_t k = 0; k < n; k++)
-        if (pthread_create(&tids[k], NULL, sender_thread, &jobs[k]) != 0) {
+        if (pthread_create(&tids[k], NULL, sender_thread, &jobs[k]) != 0)
+        {
             fprintf(stderr, "[" PROG "] pthread_create failed\n");
             exit(1);
         }
@@ -63,7 +74,8 @@ static void run_multi_pass(sender_job* jobs, size_t n)
 int main(void)
 {
     schema_kind kind;
-    if (schema_parse(env_str("SCHEMA", "s1-narrow"), &kind) != 0) {
+    if (schema_parse(env_str("SCHEMA", "s1-narrow"), &kind) != 0)
+    {
         fprintf(stderr, "[" PROG "] unknown SCHEMA\n");
         return 1;
     }
@@ -75,7 +87,8 @@ int main(void)
     size_t warmups = env_zu("WARMUPS", 2);
     size_t max_batch_rows = env_zu("MAX_BATCH_ROWS", 10000);
     size_t n_senders = env_zu("SENDERS", 1);
-    if (n_senders < 1) n_senders = 1;
+    if (n_senders < 1)
+        n_senders = 1;
     const char* run_mode = env_str("RUN_MODE", "full");
     const char* host = env_str("QDB_HOST", "127.0.0.1");
     size_t port = env_zu("QDB_PORT", 9000);
@@ -83,12 +96,24 @@ int main(void)
     size_t columns = schema_columns(kind);
     const char* table = schema_table(kind);
 
-    fprintf(stderr,
-        "[" PROG "] schema=%s rows=%zu it=%zu wu=%zu batch=%zu senders=%zu host=%s:%zu\n",
-        schema_name(kind), rows, iterations, warmups, max_batch_rows, n_senders, host, port);
+    fprintf(
+        stderr,
+        "[" PROG
+        "] schema=%s rows=%zu it=%zu wu=%zu batch=%zu senders=%zu "
+        "host=%s:%zu\n",
+        schema_name(kind),
+        rows,
+        iterations,
+        warmups,
+        max_batch_rows,
+        n_senders,
+        host,
+        port);
 
     bench_data d;
-    if (bench_data_build(&d, kind, rows, sym_card, varchar_len, hi_sym_card) != 0) {
+    if (bench_data_build(&d, kind, rows, sym_card, varchar_len, hi_sym_card) !=
+        0)
+    {
         fprintf(stderr, "[" PROG "] data build OOM\n");
         return 1;
     }
@@ -101,36 +126,63 @@ int main(void)
 
     /* ---- floor: chunk-build (no server) ---- */
     qwp_chunk* chunk = qwp_chunk_new(table, strlen(table), &err);
-    if (!chunk) bench_die(PROG, "chunk_new", err);
+    if (!chunk)
+        bench_die(PROG, "chunk_new", err);
     stage_scratch floor_scratch = {0};
     for (size_t w = 0; w < warmups; w++)
-        ingest_pass(NULL, chunk, &d, kind, 0, rows, max_batch_rows, &floor_scratch, PROG);
-    for (size_t i = 0; i < iterations; i++) {
+        ingest_pass(
+            NULL,
+            chunk,
+            &d,
+            kind,
+            0,
+            rows,
+            max_batch_rows,
+            &floor_scratch,
+            PROG);
+    for (size_t i = 0; i < iterations; i++)
+    {
         uint64_t c0 = process_cpu_ns(), t0 = now_ns();
-        ingest_pass(NULL, chunk, &d, kind, 0, rows, max_batch_rows, &floor_scratch, PROG);
+        ingest_pass(
+            NULL,
+            chunk,
+            &d,
+            kind,
+            0,
+            rows,
+            max_batch_rows,
+            &floor_scratch,
+            PROG);
         wall[i] = now_ns() - t0;
         cpu[i] = process_cpu_ns() - c0;
     }
     free(floor_scratch.note_off);
     double floor_median = median_s_of(wall, iterations);
-    json_obj_obj(paths, "chunk-build",
-        path_summary(wall, cpu, iterations, rows, columns, 0, "floor", warmups > 0));
+    json_obj_obj(
+        paths,
+        "chunk-build",
+        path_summary(
+            wall, cpu, iterations, rows, columns, 0, "floor", warmups > 0));
 
     char base[256], conf[256];
     snprintf(base, sizeof(base), "http://%s:%zu", host, port);
-    snprintf(conf, sizeof(conf),
-             "ws::addr=%s:%zu;sender_pool_min=1;sender_pool_max=1;pool_reap=manual;"
-             /* ingestion-only: skip the eager reader pre-open */
-             "query_pool_min=0;",
-             host, port);
+    snprintf(
+        conf,
+        sizeof(conf),
+        "ws::addr=%s:%zu;sender_pool_min=1;sender_pool_max=1;pool_reap=manual;"
+        /* ingestion-only: skip the eager reader pre-open */
+        "query_pool_min=0;",
+        host,
+        port);
 
     long long count = -1;
     double e2e_median = 0.0;
-    if (!skip_e2e) {
+    if (!skip_e2e)
+    {
         char drop[256];
         snprintf(drop, sizeof(drop), "DROP TABLE IF EXISTS %s", table);
-        if (http_exec_sql(base, drop) != 0
-            || http_exec_sql(base, schema_create_sql(kind)) != 0)
+        if (http_exec_sql(base, drop) != 0 ||
+            http_exec_sql(base, schema_create_sql(kind)) != 0)
             return 1;
 
         /* Direct sender = the pipelined backend flush_polars_dataframe uses
@@ -140,13 +192,17 @@ int main(void)
          * bench (bench_die), which is the intended behavior. */
         questdb_db** dbs = malloc(n_senders * sizeof(questdb_db*));
         sender_job* jobs = calloc(n_senders, sizeof(sender_job));
-        for (size_t k = 0; k < n_senders; k++) {
+        for (size_t k = 0; k < n_senders; k++)
+        {
             dbs[k] = questdb_db_connect(conf, strlen(conf), &err);
-            if (!dbs[k]) bench_die(PROG, "connect", err);
+            if (!dbs[k])
+                bench_die(PROG, "connect", err);
             jobs[k].sender = questdb_db_borrow_direct_sender(dbs[k], &err);
-            if (!jobs[k].sender) bench_die(PROG, "borrow sender", err);
+            if (!jobs[k].sender)
+                bench_die(PROG, "borrow sender", err);
             jobs[k].chunk = qwp_chunk_new(table, strlen(table), &err);
-            if (!jobs[k].chunk) bench_die(PROG, "chunk_new", err);
+            if (!jobs[k].chunk)
+                bench_die(PROG, "chunk_new", err);
             jobs[k].d = &d;
             jobs[k].kind = kind;
             sender_range(rows, n_senders, k, &jobs[k].lo, &jobs[k].hi);
@@ -155,17 +211,22 @@ int main(void)
 
         for (size_t w = 0; w < warmups; w++)
             run_multi_pass(jobs, n_senders);
-        for (size_t i = 0; i < iterations; i++) {
+        for (size_t i = 0; i < iterations; i++)
+        {
             uint64_t c0 = process_cpu_ns(), t0 = now_ns();
             run_multi_pass(jobs, n_senders);
             wall[i] = now_ns() - t0;
             cpu[i] = process_cpu_ns() - c0;
         }
         e2e_median = median_s_of(wall, iterations);
-        json_obj_obj(paths, "flush-chunks",
-            path_summary(wall, cpu, iterations, rows, columns, 0, "e2e", warmups > 0));
+        json_obj_obj(
+            paths,
+            "flush-chunks",
+            path_summary(
+                wall, cpu, iterations, rows, columns, 0, "e2e", warmups > 0));
 
-        for (size_t k = 0; k < n_senders; k++) {
+        for (size_t k = 0; k < n_senders; k++)
+        {
             questdb_db_return_direct_sender(dbs[k], jobs[k].sender);
             questdb_db_close(dbs[k]);
             qwp_chunk_free(jobs[k].chunk);
@@ -174,9 +235,12 @@ int main(void)
         free(jobs);
         free(dbs);
 
-        fprintf(stderr, "[" PROG "] waiting for WAL apply (count == %zu)\n", rows);
+        fprintf(
+            stderr, "[" PROG "] waiting for WAL apply (count == %zu)\n", rows);
         count = wait_for_count(base, table, (long long)rows);
-    } else {
+    }
+    else
+    {
         fprintf(stderr, "[" PROG "] SKIP_E2E: floor only\n");
     }
     qwp_chunk_free(chunk);
@@ -210,21 +274,28 @@ int main(void)
     json_obj* commits = json_obj_new();
     const char* cc = getenv("C_QUESTDB_CLIENT_COMMIT");
     const char* py = getenv("PY_QUESTDB_CLIENT_COMMIT");
-    if (cc) json_obj_str(commits, "c_questdb_client", cc);
-    else json_obj_null(commits, "c_questdb_client");
-    if (py) json_obj_str(commits, "py_questdb_client", py);
-    else json_obj_null(commits, "py_questdb_client");
+    if (cc)
+        json_obj_str(commits, "c_questdb_client", cc);
+    else
+        json_obj_null(commits, "c_questdb_client");
+    if (py)
+        json_obj_str(commits, "py_questdb_client", py);
+    else
+        json_obj_null(commits, "py_questdb_client");
     json_obj_obj(report, "commits", commits);
 
     json_obj_float(headline, "chunk_build_s", floor_median);
     if (floor_median != 0.0)
-        json_obj_float(headline, "chunk_build_rows_per_s", (double)rows / floor_median);
-    if (!skip_e2e) {
+        json_obj_float(
+            headline, "chunk_build_rows_per_s", (double)rows / floor_median);
+    if (!skip_e2e)
+    {
         json_obj_float(headline, "flush_chunks_s", e2e_median);
         double ovh = e2e_median - floor_median;
         json_obj_float(headline, "staging_overhead_s", ovh < 0.0 ? 0.0 : ovh);
         if (e2e_median != 0.0)
-            json_obj_float(headline, "flush_chunks_rows_per_s", (double)rows / e2e_median);
+            json_obj_float(
+                headline, "flush_chunks_rows_per_s", (double)rows / e2e_median);
         json_obj* rcc = json_obj_new();
         json_obj_int(rcc, "expected", (uint64_t)rows);
         json_obj_int(rcc, "actual", (uint64_t)(count < 0 ? 0 : count));

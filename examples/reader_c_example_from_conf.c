@@ -18,8 +18,8 @@ int main(int argc, const char* argv[])
     if (!reader)
         goto on_error;
 
-    line_sender_utf8 sql = QDB_UTF8_LITERAL(
-        "SELECT x AS n, x * 1.5 AS d FROM long_sequence(5)");
+    line_sender_utf8 sql =
+        QDB_UTF8_LITERAL("SELECT x AS n, x * 1.5 AS d FROM long_sequence(5)");
     query = qwp_reader_prepare(reader, sql, &err);
     if (!query)
         goto on_error;
@@ -52,8 +52,7 @@ int main(int argc, const char* argv[])
                 bool is_null = false;
                 switch (d[c].kind)
                 {
-                case qwp_reader_column_kind_long:
-                {
+                case qwp_reader_column_kind_long: {
                     int64_t v =
                         qwp_reader_column_data_get_i64(&d[c], r, &is_null);
                     if (is_null)
@@ -62,8 +61,7 @@ int main(int argc, const char* argv[])
                         printf("%lld ", (long long)v);
                     break;
                 }
-                case qwp_reader_column_kind_double:
-                {
+                case qwp_reader_column_kind_double: {
                     double v =
                         qwp_reader_column_data_get_f64(&d[c], r, &is_null);
                     if (is_null)

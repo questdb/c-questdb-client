@@ -38,8 +38,7 @@
 
 static int closed_port_phase(void)
 {
-    line_sender_utf8 conf =
-        QDB_UTF8_LITERAL("ws::addr=127.0.0.1:1;");
+    line_sender_utf8 conf = QDB_UTF8_LITERAL("ws::addr=127.0.0.1:1;");
 
     questdb_error* err = NULL;
     qwp_reader* reader = qwp_reader_from_conf(conf, &err);
@@ -103,8 +102,7 @@ static int pool_eager_connect_fails_phase(void)
     static const char conf[] = "ws::addr=127.0.0.1:1;";
 
     questdb_error* err = NULL;
-    struct questdb_db* db =
-        questdb_db_connect(conf, strlen(conf), &err);
+    struct questdb_db* db = questdb_db_connect(conf, strlen(conf), &err);
 
     if (db != NULL)
     {
@@ -132,8 +130,7 @@ static int pool_reader_only_phase(void)
     static const char conf[] = "ws::addr=127.0.0.1:1;lazy_connect=true;";
 
     questdb_error* err = NULL;
-    struct questdb_db* db =
-        questdb_db_connect(conf, strlen(conf), &err);
+    struct questdb_db* db = questdb_db_connect(conf, strlen(conf), &err);
 
     /*
      * lazy_connect pool: connect opens nothing, so it succeeds even
@@ -225,8 +222,8 @@ static int live_lifecycle_phase(const char* addr)
      * multi-endpoint aggregation wrapping.
      */
     char conf_buf[256];
-    int n = snprintf(
-        conf_buf, sizeof(conf_buf), "ws::addr=%s;failover=off", addr);
+    int n =
+        snprintf(conf_buf, sizeof(conf_buf), "ws::addr=%s;failover=off", addr);
     if (n <= 0 || (size_t)n >= sizeof(conf_buf))
     {
         fprintf(
@@ -288,9 +285,7 @@ static int live_lifecycle_phase(const char* addr)
         const size_t cols = qwp_reader_batch_column_count(batch);
         if (cols == 0)
         {
-            fprintf(
-                stderr,
-                "smoke live: batch has zero columns; expected 1\n");
+            fprintf(stderr, "smoke live: batch has zero columns; expected 1\n");
             goto fail;
         }
 
@@ -356,10 +351,7 @@ fail:;
         size_t err_len = 0;
         const char* err_msg = questdb_error_msg(err, &err_len);
         fprintf(
-            stderr,
-            "smoke live: %.*s\n",
-            (int)err_len,
-            err_msg ? err_msg : "");
+            stderr, "smoke live: %.*s\n", (int)err_len, err_msg ? err_msg : "");
     }
     else
     {

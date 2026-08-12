@@ -129,14 +129,16 @@ TEST_CASE("mock: handshake + immediate ResultEnd drives cursor terminus")
 TEST_CASE("mock: column getter — i32 (Int) round-trip")
 {
     qm::ColumnSpec c{
-        "v", qm::COL_INT,
+        "v",
+        qm::COL_INT,
         qm::fixed_column_bytes(3, pack_le<int32_t>({100, 200, 300}))};
 
     qm::Script s = {
         qm::ActionSendServerInfo{},
         qm::ActionAwaitQueryRequest{},
-        qm::ActionSendBuilt{[c](int64_t rid)
-                            { return qm::result_batch_frame(rid, 0, 3, {c}); }},
+        qm::ActionSendBuilt{[c](int64_t rid) {
+            return qm::result_batch_frame(rid, 0, 3, {c});
+        }},
         qm::ActionSendResultEnd{},
     };
     qm::MockServer srv({s});
@@ -165,35 +167,39 @@ TEST_CASE("mock: column getter — i32 (Int) round-trip")
 TEST_CASE("mock: column getter — i64 / f64 / bool / i8 / i16 / f32")
 {
     qm::ColumnSpec c_i64{
-        "l", qm::COL_LONG,
-        qm::fixed_column_bytes(2, pack_le<int64_t>({-1, 9223372036854775807LL}))};
+        "l",
+        qm::COL_LONG,
+        qm::fixed_column_bytes(
+            2, pack_le<int64_t>({-1, 9223372036854775807LL}))};
     qm::ColumnSpec c_f64{
-        "d", qm::COL_DOUBLE,
+        "d",
+        qm::COL_DOUBLE,
         qm::fixed_column_bytes(2, pack_le<double>({1.5, -3.14}))};
     // BOOLEAN: validity then bit-packed values (1 row -> 1 bit).
     std::vector<uint8_t> bool_body;
-    bool_body.push_back(0x00);              // no validity
-    bool_body.push_back(0b00000010);        // bit0=0 (false), bit1=1 (true)
+    bool_body.push_back(0x00);       // no validity
+    bool_body.push_back(0b00000010); // bit0=0 (false), bit1=1 (true)
     qm::ColumnSpec c_bool{"b", qm::COL_BOOLEAN, std::move(bool_body)};
     qm::ColumnSpec c_i8{
-        "i8", qm::COL_BYTE,
+        "i8",
+        qm::COL_BYTE,
         qm::fixed_column_bytes(2, pack_le<int8_t>({-7, 42}))};
     qm::ColumnSpec c_i16{
-        "i16", qm::COL_SHORT,
+        "i16",
+        qm::COL_SHORT,
         qm::fixed_column_bytes(2, pack_le<int16_t>({-1234, 31000}))};
     qm::ColumnSpec c_f32{
-        "f32", qm::COL_FLOAT,
+        "f32",
+        qm::COL_FLOAT,
         qm::fixed_column_bytes(2, pack_le<float>({1.25f, -0.5f}))};
 
     qm::Script s = {
         qm::ActionSendServerInfo{},
         qm::ActionAwaitQueryRequest{},
-        qm::ActionSendBuilt{[=](int64_t rid)
-                            {
-                                return qm::result_batch_frame(
-                                    rid, 0, 2,
-                                    {c_i64, c_f64, c_bool, c_i8, c_i16, c_f32});
-                            }},
+        qm::ActionSendBuilt{[=](int64_t rid) {
+            return qm::result_batch_frame(
+                rid, 0, 2, {c_i64, c_f64, c_bool, c_i8, c_i16, c_f32});
+        }},
         qm::ActionSendResultEnd{},
     };
     qm::MockServer srv({s});
@@ -205,7 +211,8 @@ TEST_CASE("mock: column getter — i64 / f64 / bool / i8 / i16 / f32")
     REQUIRE(batch.row_count() == 2);
 
     REQUIRE(batch.column(0).get<int64_t>(0).value_or(0) == -1);
-    REQUIRE(batch.column(0).get<int64_t>(1).value_or(0) == 9223372036854775807LL);
+    REQUIRE(
+        batch.column(0).get<int64_t>(1).value_or(0) == 9223372036854775807LL);
     CHECK(batch.column(1).get<double>(0).value_or(0) == doctest::Approx(1.5));
     CHECK(batch.column(1).get<double>(1).value_or(0) == doctest::Approx(-3.14));
     CHECK(batch.column(2).get<bool>(0).value_or(true) == false);
@@ -214,20 +221,24 @@ TEST_CASE("mock: column getter — i64 / f64 / bool / i8 / i16 / f32")
     CHECK(batch.column(3).get<int8_t>(1).value_or(0) == 42);
     CHECK(batch.column(4).get<int16_t>(0).value_or(0) == -1234);
     CHECK(batch.column(4).get<int16_t>(1).value_or(0) == 31000);
-    CHECK(batch.column(5).get<float>(0).value_or(0.0f) == doctest::Approx(1.25f));
-    CHECK(batch.column(5).get<float>(1).value_or(0.0f) == doctest::Approx(-0.5f));
+    CHECK(
+        batch.column(5).get<float>(0).value_or(0.0f) == doctest::Approx(1.25f));
+    CHECK(
+        batch.column(5).get<float>(1).value_or(0.0f) == doctest::Approx(-0.5f));
 }
 
 TEST_CASE("mock: column getter — varchar")
 {
-    auto body = qm::varlen_column_bytes({{'h', 'i'}, {'h', 'e', 'l', 'l', 'o'}});
+    auto body =
+        qm::varlen_column_bytes({{'h', 'i'}, {'h', 'e', 'l', 'l', 'o'}});
     qm::ColumnSpec c{"s", qm::COL_VARCHAR, std::move(body)};
 
     qm::Script s = {
         qm::ActionSendServerInfo{},
         qm::ActionAwaitQueryRequest{},
-        qm::ActionSendBuilt{[c](int64_t rid)
-                            { return qm::result_batch_frame(rid, 0, 2, {c}); }},
+        qm::ActionSendBuilt{[c](int64_t rid) {
+            return qm::result_batch_frame(rid, 0, 2, {c});
+        }},
         qm::ActionSendResultEnd{},
     };
     qm::MockServer srv({s});
@@ -250,14 +261,14 @@ TEST_CASE("mock: column getter — uuid (16 raw bytes, big-endian on wire)")
     std::vector<uint8_t> uuid_bytes(16);
     for (int i = 0; i < 16; ++i)
         uuid_bytes[i] = uint8_t(0xA0 + i);
-    qm::ColumnSpec c{"u", qm::COL_UUID,
-                     qm::fixed_column_bytes(1, uuid_bytes)};
+    qm::ColumnSpec c{"u", qm::COL_UUID, qm::fixed_column_bytes(1, uuid_bytes)};
 
     qm::Script s = {
         qm::ActionSendServerInfo{},
         qm::ActionAwaitQueryRequest{},
-        qm::ActionSendBuilt{[c](int64_t rid)
-                            { return qm::result_batch_frame(rid, 0, 1, {c}); }},
+        qm::ActionSendBuilt{[c](int64_t rid) {
+            return qm::result_batch_frame(rid, 0, 1, {c});
+        }},
         qm::ActionSendResultEnd{},
     };
     qm::MockServer srv({s});
@@ -280,8 +291,9 @@ TEST_CASE("mock: column getter — decimal64 with non-zero scale")
     qm::Script s = {
         qm::ActionSendServerInfo{},
         qm::ActionAwaitQueryRequest{},
-        qm::ActionSendBuilt{[c](int64_t rid)
-                            { return qm::result_batch_frame(rid, 0, 2, {c}); }},
+        qm::ActionSendBuilt{[c](int64_t rid) {
+            return qm::result_batch_frame(rid, 0, 2, {c});
+        }},
         qm::ActionSendResultEnd{},
     };
     qm::MockServer srv({s});
@@ -311,8 +323,9 @@ TEST_CASE("mock: column getter — decimal128 with negative i128 mantissa")
     qm::Script s = {
         qm::ActionSendServerInfo{},
         qm::ActionAwaitQueryRequest{},
-        qm::ActionSendBuilt{[c](int64_t rid)
-                            { return qm::result_batch_frame(rid, 0, 1, {c}); }},
+        qm::ActionSendBuilt{[c](int64_t rid) {
+            return qm::result_batch_frame(rid, 0, 1, {c});
+        }},
         qm::ActionSendResultEnd{},
     };
     qm::MockServer srv({s});
@@ -345,8 +358,9 @@ TEST_CASE("mock: column validity bitmap matches null pattern from server")
     qm::Script s = {
         qm::ActionSendServerInfo{},
         qm::ActionAwaitQueryRequest{},
-        qm::ActionSendBuilt{[c](int64_t rid)
-                            { return qm::result_batch_frame(rid, 0, 5, {c}); }},
+        qm::ActionSendBuilt{[c](int64_t rid) {
+            return qm::result_batch_frame(rid, 0, 5, {c});
+        }},
         qm::ActionSendResultEnd{},
     };
     qm::MockServer srv({s});
@@ -361,7 +375,8 @@ TEST_CASE("mock: column validity bitmap matches null pattern from server")
     const uint8_t* vbits = col.validity();
     REQUIRE(vbits != nullptr);
     REQUIRE(col.validity_bytes() >= 1);
-    // Bit pattern: rows 1 and 3 set, others clear → low 5 bits = 0b01010 = 0x0A.
+    // Bit pattern: rows 1 and 3 set, others clear → low 5 bits = 0b01010 =
+    // 0x0A.
     CHECK((vbits[0] & 0x1F) == 0x0A);
 
     CHECK(col.get<int64_t>(0).value_or(-1) == 10);
@@ -380,12 +395,10 @@ TEST_CASE("mock: QueryError(parse) surfaces as ServerParseError")
     qm::Script s = {
         qm::ActionSendServerInfo{},
         qm::ActionAwaitQueryRequest{},
-        qm::ActionSendBuilt{
-            [](int64_t rid)
-            {
-                return qm::query_error_frame(
-                    rid, qm::STATUS_PARSE_ERROR, "bad sql at line 1");
-            }},
+        qm::ActionSendBuilt{[](int64_t rid) {
+            return qm::query_error_frame(
+                rid, qm::STATUS_PARSE_ERROR, "bad sql at line 1");
+        }},
     };
     qm::MockServer srv({s});
     auto reader = connect_to(srv);
@@ -394,7 +407,9 @@ TEST_CASE("mock: QueryError(parse) surfaces as ServerParseError")
     try
     {
         auto cur = reader.execute("nonsense"_utf8);
-        while (cur.next_batch()) {}
+        while (cur.next_batch())
+        {
+        }
     }
     catch (const questdb::error& e)
     {
@@ -410,12 +425,10 @@ TEST_CASE("mock: QueryError(internal) surfaces as ServerInternalError")
     qm::Script s = {
         qm::ActionSendServerInfo{},
         qm::ActionAwaitQueryRequest{},
-        qm::ActionSendBuilt{
-            [](int64_t rid)
-            {
-                return qm::query_error_frame(
-                    rid, qm::STATUS_INTERNAL_ERROR, "boom");
-            }},
+        qm::ActionSendBuilt{[](int64_t rid) {
+            return qm::query_error_frame(
+                rid, qm::STATUS_INTERNAL_ERROR, "boom");
+        }},
     };
     qm::MockServer srv({s});
     auto reader = connect_to(srv);
@@ -424,7 +437,9 @@ TEST_CASE("mock: QueryError(internal) surfaces as ServerInternalError")
     try
     {
         auto cur = reader.execute("x"_utf8);
-        while (cur.next_batch()) {}
+        while (cur.next_batch())
+        {
+        }
     }
     catch (const questdb::error& e)
     {
@@ -439,12 +454,10 @@ TEST_CASE("mock: QueryError(security) surfaces as ServerSecurityError")
     qm::Script s = {
         qm::ActionSendServerInfo{},
         qm::ActionAwaitQueryRequest{},
-        qm::ActionSendBuilt{
-            [](int64_t rid)
-            {
-                return qm::query_error_frame(
-                    rid, qm::STATUS_SECURITY_ERROR, "forbidden");
-            }},
+        qm::ActionSendBuilt{[](int64_t rid) {
+            return qm::query_error_frame(
+                rid, qm::STATUS_SECURITY_ERROR, "forbidden");
+        }},
     };
     qm::MockServer srv({s});
     auto reader = connect_to(srv);
@@ -452,7 +465,9 @@ TEST_CASE("mock: QueryError(security) surfaces as ServerSecurityError")
     try
     {
         auto cur = reader.execute("x"_utf8);
-        while (cur.next_batch()) {}
+        while (cur.next_batch())
+        {
+        }
     }
     catch (const questdb::error& e)
     {
@@ -494,7 +509,9 @@ TEST_CASE("mock: captured QueryRequest carries SQL and request_id")
     qm::MockServer srv({s});
     auto reader = connect_to(srv);
     auto cur = reader.execute("select 42"_utf8);
-    while (cur.next_batch()) {}
+    while (cur.next_batch())
+    {
+    }
 
     auto reqs = srv.captured_requests();
     REQUIRE(reqs.size() == 1);
@@ -526,21 +543,25 @@ TEST_CASE("mock: bind_i32 + bind_varchar appears verbatim in captured request")
                    .bind_i32(7)
                    .bind_varchar("widgets"_utf8)
                    .execute();
-    while (cur.next_batch()) {}
+    while (cur.next_batch())
+    {
+    }
 
     auto reqs = srv.captured_requests();
     REQUIRE(reqs.size() == 1);
     const auto& req = reqs[0];
-    // Layout: 0x10 | i64 rid | varint(1) sql_len | 'X' | varint(0) credit | varint(2) bind_count
+    // Layout: 0x10 | i64 rid | varint(1) sql_len | 'X' | varint(0) credit |
+    // varint(2) bind_count
     //         | bind1: 0x04 (Int) 0x00 (not null) i32 LE 7
-    //         | bind2: 0x0F (Varchar) 0x00 (not null) [u32_le 0][u32_le 7] "widgets"
+    //         | bind2: 0x0F (Varchar) 0x00 (not null) [u32_le 0][u32_le 7]
+    //         "widgets"
     REQUIRE(req.size() >= 1 + 8 + 1 + 1 + 1 + 1);
     CHECK(req[0] == 0x10);
     size_t p = 9;
     CHECK(req[p++] == 1); // sql_len varint
     CHECK(req[p++] == 'X');
-    CHECK(req[p++] == 0); // initial_credit varint
-    CHECK(req[p++] == 2); // bind_count varint
+    CHECK(req[p++] == 0);    // initial_credit varint
+    CHECK(req[p++] == 2);    // bind_count varint
     CHECK(req[p++] == 0x04); // Int
     CHECK(req[p++] == 0x00); // not null
     int32_t v_i32 = int32_t(req[p]) | (int32_t(req[p + 1]) << 8) |
@@ -571,13 +592,14 @@ TEST_CASE("mock: bind_i32 + bind_varchar appears verbatim in captured request")
 
 TEST_CASE("mock: bytes_received increases after a batch is consumed")
 {
-    qm::ColumnSpec c{"v", qm::COL_INT,
-                     qm::fixed_column_bytes(1, pack_le<int32_t>({42}))};
+    qm::ColumnSpec c{
+        "v", qm::COL_INT, qm::fixed_column_bytes(1, pack_le<int32_t>({42}))};
     qm::Script s = {
         qm::ActionSendServerInfo{},
         qm::ActionAwaitQueryRequest{},
-        qm::ActionSendBuilt{[c](int64_t rid)
-                            { return qm::result_batch_frame(rid, 0, 1, {c}); }},
+        qm::ActionSendBuilt{[c](int64_t rid) {
+            return qm::result_batch_frame(rid, 0, 1, {c});
+        }},
         qm::ActionSendResultEnd{},
     };
     qm::MockServer srv({s});
@@ -585,7 +607,9 @@ TEST_CASE("mock: bytes_received increases after a batch is consumed")
     const uint64_t before_query = reader.bytes_received();
 
     auto cur = reader.execute("select v"_utf8);
-    while (cur.next_batch()) {}
+    while (cur.next_batch())
+    {
+    }
     const uint64_t after = reader.bytes_received();
 
     CHECK(after > before_query);
@@ -603,8 +627,9 @@ void run_query_error_test(uint8_t status, ::questdb_error_code expected)
     qm::Script s = {
         qm::ActionSendServerInfo{},
         qm::ActionAwaitQueryRequest{},
-        qm::ActionSendBuilt{[status](int64_t rid)
-                            { return qm::query_error_frame(rid, status, "x"); }},
+        qm::ActionSendBuilt{[status](int64_t rid) {
+            return qm::query_error_frame(rid, status, "x");
+        }},
     };
     qm::MockServer srv({s});
     auto reader = connect_to(srv);
@@ -612,7 +637,9 @@ void run_query_error_test(uint8_t status, ::questdb_error_code expected)
     try
     {
         auto cur = reader.execute("x"_utf8);
-        while (cur.next_batch()) {}
+        while (cur.next_batch())
+        {
+        }
     }
     catch (const questdb::error& e)
     {
@@ -626,22 +653,18 @@ void run_query_error_test(uint8_t status, ::questdb_error_code expected)
 TEST_CASE("mock: QueryError(schema_mismatch) surfaces as ServerSchemaMismatch")
 {
     run_query_error_test(
-        qm::STATUS_SCHEMA_MISMATCH,
-        questdb_error_server_schema_mismatch);
+        qm::STATUS_SCHEMA_MISMATCH, questdb_error_server_schema_mismatch);
 }
 
 TEST_CASE("mock: QueryError(limit_exceeded) surfaces as ServerLimitExceeded")
 {
     run_query_error_test(
-        qm::STATUS_LIMIT_EXCEEDED,
-        questdb_error_server_limit_exceeded);
+        qm::STATUS_LIMIT_EXCEEDED, questdb_error_server_limit_exceeded);
 }
 
 TEST_CASE("mock: QueryError(cancelled) surfaces as Cancelled")
 {
-    run_query_error_test(
-        qm::STATUS_CANCELLED,
-        questdb_error_cancelled);
+    run_query_error_test(qm::STATUS_CANCELLED, questdb_error_cancelled);
 }
 
 // ---------------------------------------------------------------------------
@@ -658,8 +681,9 @@ TEST_CASE("mock: cursor::cancel writes MSG_CANCEL and surfaces Cancelled")
         qm::ActionSendServerInfo{},
         qm::ActionAwaitQueryRequest{},
         qm::ActionAwaitClientFrame{qm::MSG_CANCEL},
-        qm::ActionSendBuilt{[](int64_t rid)
-                            { return qm::query_error_frame(rid, qm::STATUS_CANCELLED, "user"); }},
+        qm::ActionSendBuilt{[](int64_t rid) {
+            return qm::query_error_frame(rid, qm::STATUS_CANCELLED, "user");
+        }},
     };
     qm::MockServer srv({s});
     auto reader = connect_to(srv);
@@ -702,7 +726,8 @@ TEST_CASE("mock: cursor::cancel writes MSG_CANCEL and surfaces Cancelled")
 // was sent, since the WS close already breaks the next query).
 // ---------------------------------------------------------------------------
 
-TEST_CASE("mock: dropping cursor without draining writes MSG_CANCEL on the wire")
+TEST_CASE(
+    "mock: dropping cursor without draining writes MSG_CANCEL on the wire")
 {
     qm::ColumnSpec c{
         "v", qm::COL_INT, qm::fixed_column_bytes(1, pack_le<int32_t>({42}))};
@@ -741,8 +766,7 @@ TEST_CASE("mock: dropping cursor without draining writes MSG_CANCEL on the wire"
     // synchronously when the destructor returns; the mock's
     // `read_until_kind` reads it within microseconds.
     bool saw_cancel = false;
-    auto deadline =
-        std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
     while (std::chrono::steady_clock::now() < deadline)
     {
         auto reqs = srv.captured_requests();
@@ -767,13 +791,14 @@ TEST_CASE("mock: dropping cursor without draining writes MSG_CANCEL on the wire"
 
 TEST_CASE("mock: cursor::add_credit writes MSG_CREDIT")
 {
-    qm::ColumnSpec c{"v", qm::COL_INT,
-                     qm::fixed_column_bytes(1, pack_le<int32_t>({1}))};
+    qm::ColumnSpec c{
+        "v", qm::COL_INT, qm::fixed_column_bytes(1, pack_le<int32_t>({1}))};
     qm::Script s = {
         qm::ActionSendServerInfo{},
         qm::ActionAwaitQueryRequest{},
-        qm::ActionSendBuilt{[c](int64_t rid)
-                            { return qm::result_batch_frame(rid, 0, 1, {c}); }},
+        qm::ActionSendBuilt{[c](int64_t rid) {
+            return qm::result_batch_frame(rid, 0, 1, {c});
+        }},
         qm::ActionAwaitClientFrame{qm::MSG_CREDIT},
         qm::ActionSendResultEnd{},
     };
@@ -782,7 +807,9 @@ TEST_CASE("mock: cursor::add_credit writes MSG_CREDIT")
     auto cur = reader.prepare("select v"_utf8).initial_credit(64).execute();
     REQUIRE(cur.next_batch());
     cur.add_credit(1024);
-    while (cur.next_batch()) {}
+    while (cur.next_batch())
+    {
+    }
 
     auto reqs = srv.captured_requests();
     bool saw_credit = false;
@@ -869,7 +896,8 @@ TEST_CASE("mock: add_credit failover on write failure replays credit on B")
     qm::MockServer srv_a({s_a});
     qm::MockServer srv_b({s_b});
 
-    const std::string conf = "ws::addr=" + srv_a.addr() + "," + srv_b.addr() +
+    const std::string conf =
+        "ws::addr=" + srv_a.addr() + "," + srv_b.addr() +
         ";failover_backoff_initial_ms=1;failover_backoff_max_ms=10";
     questdb::egress::reader reader{questdb::ingress::utf8_view{conf}};
 
@@ -982,26 +1010,26 @@ TEST_CASE("mock: failover trampoline fires once with populated event fields")
     };
     auto cap = std::make_shared<Capture>();
 
-    auto cur = reader.prepare("select 1"_utf8)
-                   .on_failover_reset(
-                       [cap](const questdb::egress::failover_reset_event_view& ev)
-                       {
-                           cap->count.fetch_add(1);
-                           cap->failed_host = std::string(ev.failed_host());
-                           cap->failed_port = ev.failed_port();
-                           cap->new_host = std::string(ev.new_host());
-                           cap->new_port = ev.new_port();
-                           cap->attempts = ev.attempts();
-                           cap->trigger_code = ev.trigger_code();
-                           auto si = ev.server_info();
-                           cap->server_info_snapshot = si.snapshot();
-                           if (static_cast<bool>(si))
-                           {
-                               cap->server_info_present = true;
-                               cap->new_node_id = std::string(si.node_id());
-                           }
-                       })
-                   .execute();
+    auto cur =
+        reader.prepare("select 1"_utf8)
+            .on_failover_reset(
+                [cap](const questdb::egress::failover_reset_event_view& ev) {
+                    cap->count.fetch_add(1);
+                    cap->failed_host = std::string(ev.failed_host());
+                    cap->failed_port = ev.failed_port();
+                    cap->new_host = std::string(ev.new_host());
+                    cap->new_port = ev.new_port();
+                    cap->attempts = ev.attempts();
+                    cap->trigger_code = ev.trigger_code();
+                    auto si = ev.server_info();
+                    cap->server_info_snapshot = si.snapshot();
+                    if (static_cast<bool>(si))
+                    {
+                        cap->server_info_present = true;
+                        cap->new_node_id = std::string(si.node_id());
+                    }
+                })
+            .execute();
     // First next_batch sees A close, fails over to B, gets RESULT_END.
     CHECK_FALSE(cur.next_batch());
     CHECK(cur.failover_resets() == 1);
@@ -1015,8 +1043,9 @@ TEST_CASE("mock: failover trampoline fires once with populated event fields")
     CHECK(cap->new_host == "127.0.0.1");
     CHECK(cap->attempts >= 1);
     // Trigger is a transport-class error.
-    CHECK((cap->trigger_code == questdb_error_socket_error ||
-           cap->trigger_code == questdb_error_protocol_error));
+    CHECK(
+        (cap->trigger_code == questdb_error_socket_error ||
+         cap->trigger_code == questdb_error_protocol_error));
     REQUIRE(cap->server_info_present);
     CHECK(cap->new_node_id == "b");
     REQUIRE(cap->server_info_snapshot.has_value());
@@ -1040,12 +1069,16 @@ TEST_CASE("mock: failover callback NOT invoked on the happy path")
     auto reader = connect_to(srv);
 
     std::atomic<int> count{0};
-    auto cur = reader.prepare("select 1"_utf8)
-                   .on_failover_reset(
-                       [&count](const questdb::egress::failover_reset_event_view&)
-                       { count.fetch_add(1); })
-                   .execute();
-    while (cur.next_batch()) {}
+    auto cur =
+        reader.prepare("select 1"_utf8)
+            .on_failover_reset(
+                [&count](const questdb::egress::failover_reset_event_view&) {
+                    count.fetch_add(1);
+                })
+            .execute();
+    while (cur.next_batch())
+    {
+    }
     CHECK(count.load() == 0);
     CHECK(cur.failover_resets() == 0);
 }
@@ -1065,8 +1098,9 @@ TEST_CASE("mock: column::shape + elements<double> round-trip")
     qm::Script s = {
         qm::ActionSendServerInfo{},
         qm::ActionAwaitQueryRequest{},
-        qm::ActionSendBuilt{[c](int64_t rid)
-                            { return qm::result_batch_frame(rid, 0, 2, {c}); }},
+        qm::ActionSendBuilt{[c](int64_t rid) {
+            return qm::result_batch_frame(rid, 0, 2, {c});
+        }},
         qm::ActionSendResultEnd{},
     };
     qm::MockServer srv({s});
@@ -1113,8 +1147,9 @@ TEST_CASE("mock: LONG_ARRAY column rejected (not supported in this revision)")
     qm::Script s = {
         qm::ActionSendServerInfo{},
         qm::ActionAwaitQueryRequest{},
-        qm::ActionSendBuilt{[c](int64_t rid)
-                            { return qm::result_batch_frame(rid, 0, 1, {c}); }},
+        qm::ActionSendBuilt{[c](int64_t rid) {
+            return qm::result_batch_frame(rid, 0, 1, {c});
+        }},
         qm::ActionSendResultEnd{},
     };
     qm::MockServer srv({s});
@@ -1123,8 +1158,7 @@ TEST_CASE("mock: LONG_ARRAY column rejected (not supported in this revision)")
     auto batch_opt = cur.next_batch();
     REQUIRE(batch_opt);
     auto& batch = *batch_opt;
-    CHECK_THROWS_AS(
-        (void)batch.column(0), questdb::error);
+    CHECK_THROWS_AS((void)batch.column(0), questdb::error);
 }
 
 TEST_CASE("mock: non-null empty-data array row exposes data_offsets symmetry")
@@ -1133,15 +1167,16 @@ TEST_CASE("mock: non-null empty-data array row exposes data_offsets symmetry")
     // is empty (data_offsets[r+1] - data_offsets[r] == 0). Pin the
     // contract: the row is reported non-null but yields zero elements.
     using Row = qm::ArrayRow;
-    Row r0{{2, 0, 3}, {}};                  // non-null, zero bytes of data
+    Row r0{{2, 0, 3}, {}}; // non-null, zero bytes of data
     auto body = qm::array_column_bytes({r0});
     qm::ColumnSpec c{"a", qm::COL_DOUBLE_ARRAY, std::move(body)};
 
     qm::Script s = {
         qm::ActionSendServerInfo{},
         qm::ActionAwaitQueryRequest{},
-        qm::ActionSendBuilt{[c](int64_t rid)
-                            { return qm::result_batch_frame(rid, 0, 1, {c}); }},
+        qm::ActionSendBuilt{[c](int64_t rid) {
+            return qm::result_batch_frame(rid, 0, 1, {c});
+        }},
         qm::ActionSendResultEnd{},
     };
     qm::MockServer srv({s});
@@ -1151,7 +1186,7 @@ TEST_CASE("mock: non-null empty-data array row exposes data_offsets symmetry")
     REQUIRE(batch_opt);
     auto& batch = *batch_opt;
     auto col = batch.column(0);
-    CHECK_FALSE(col.is_null(0));            // non-null
+    CHECK_FALSE(col.is_null(0)); // non-null
     size_t rank = 0;
     const uint32_t* shape = col.shape(0, &rank);
     REQUIRE(rank == 3);
@@ -1173,8 +1208,9 @@ TEST_CASE("mock: NULL array row surfaces via is_null")
     qm::Script s = {
         qm::ActionSendServerInfo{},
         qm::ActionAwaitQueryRequest{},
-        qm::ActionSendBuilt{[c](int64_t rid)
-                            { return qm::result_batch_frame(rid, 0, 2, {c}); }},
+        qm::ActionSendBuilt{[c](int64_t rid) {
+            return qm::result_batch_frame(rid, 0, 2, {c});
+        }},
         qm::ActionSendResultEnd{},
     };
     qm::MockServer srv({s});
@@ -1200,13 +1236,16 @@ TEST_CASE("mock: NULL array row surfaces via is_null")
 
 TEST_CASE("mock: get_char round-trip (u16 codepoint)")
 {
-    qm::ColumnSpec c{"c", qm::COL_CHAR,
-                     qm::fixed_column_bytes(2, pack_le<uint16_t>({u'A', u'\u00E9'}))};
+    qm::ColumnSpec c{
+        "c",
+        qm::COL_CHAR,
+        qm::fixed_column_bytes(2, pack_le<uint16_t>({u'A', u'\u00E9'}))};
     qm::Script s = {
         qm::ActionSendServerInfo{},
         qm::ActionAwaitQueryRequest{},
-        qm::ActionSendBuilt{[c](int64_t rid)
-                            { return qm::result_batch_frame(rid, 0, 2, {c}); }},
+        qm::ActionSendBuilt{[c](int64_t rid) {
+            return qm::result_batch_frame(rid, 0, 2, {c});
+        }},
         qm::ActionSendResultEnd{},
     };
     qm::MockServer srv({s});
@@ -1226,14 +1265,15 @@ TEST_CASE("mock: get_char round-trip (u16 codepoint)")
 TEST_CASE("mock: get_long256 round-trip (32 raw bytes)")
 {
     std::vector<uint8_t> bytes(32);
-    for (int i = 0; i < 32; ++i) bytes[i] = uint8_t(i + 1);
-    qm::ColumnSpec c{"l", qm::COL_LONG256,
-                     qm::fixed_column_bytes(1, bytes)};
+    for (int i = 0; i < 32; ++i)
+        bytes[i] = uint8_t(i + 1);
+    qm::ColumnSpec c{"l", qm::COL_LONG256, qm::fixed_column_bytes(1, bytes)};
     qm::Script s = {
         qm::ActionSendServerInfo{},
         qm::ActionAwaitQueryRequest{},
-        qm::ActionSendBuilt{[c](int64_t rid)
-                            { return qm::result_batch_frame(rid, 0, 1, {c}); }},
+        qm::ActionSendBuilt{[c](int64_t rid) {
+            return qm::result_batch_frame(rid, 0, 1, {c});
+        }},
         qm::ActionSendResultEnd{},
     };
     qm::MockServer srv({s});
@@ -1250,14 +1290,14 @@ TEST_CASE("mock: get_long256 round-trip (32 raw bytes)")
 
 TEST_CASE("mock: get_binary round-trip (zero-copy bytes)")
 {
-    auto body = qm::varlen_column_bytes(
-        {{0x00, 0x01, 0x02}, {0xFF, 0xEE}});
+    auto body = qm::varlen_column_bytes({{0x00, 0x01, 0x02}, {0xFF, 0xEE}});
     qm::ColumnSpec c{"b", qm::COL_BINARY, std::move(body)};
     qm::Script s = {
         qm::ActionSendServerInfo{},
         qm::ActionAwaitQueryRequest{},
-        qm::ActionSendBuilt{[c](int64_t rid)
-                            { return qm::result_batch_frame(rid, 0, 2, {c}); }},
+        qm::ActionSendBuilt{[c](int64_t rid) {
+            return qm::result_batch_frame(rid, 0, 2, {c});
+        }},
         qm::ActionSendResultEnd{},
     };
     qm::MockServer srv({s});
@@ -1282,14 +1322,17 @@ TEST_CASE("mock: get_binary round-trip (zero-copy bytes)")
 TEST_CASE("mock: get_decimal256 round-trip (32-byte mantissa + scale)")
 {
     std::array<uint8_t, 32> raw{};
-    raw[0] = 0xFE; raw[1] = 0xCA; raw[31] = 0x80;  // arbitrary pattern
+    raw[0] = 0xFE;
+    raw[1] = 0xCA;
+    raw[31] = 0x80; // arbitrary pattern
     auto body = qm::decimal256_column_bytes({raw}, /*scale=*/4);
     qm::ColumnSpec c{"d", qm::COL_DECIMAL256, std::move(body)};
     qm::Script s = {
         qm::ActionSendServerInfo{},
         qm::ActionAwaitQueryRequest{},
-        qm::ActionSendBuilt{[c](int64_t rid)
-                            { return qm::result_batch_frame(rid, 0, 1, {c}); }},
+        qm::ActionSendBuilt{[c](int64_t rid) {
+            return qm::result_batch_frame(rid, 0, 1, {c});
+        }},
         qm::ActionSendResultEnd{},
     };
     qm::MockServer srv({s});
@@ -1309,14 +1352,15 @@ TEST_CASE("mock: get_geohash round-trip (precision_bits + bits)")
 {
     // 8-bit precision: one byte per row.
     std::vector<uint8_t> packed = {0xAB, 0xCD};
-    auto body = qm::geohash_column_bytes(
-        {false, false}, packed, /*precision_bits=*/8);
+    auto body =
+        qm::geohash_column_bytes({false, false}, packed, /*precision_bits=*/8);
     qm::ColumnSpec c{"g", qm::COL_GEOHASH, std::move(body)};
     qm::Script s = {
         qm::ActionSendServerInfo{},
         qm::ActionAwaitQueryRequest{},
-        qm::ActionSendBuilt{[c](int64_t rid)
-                            { return qm::result_batch_frame(rid, 0, 2, {c}); }},
+        qm::ActionSendBuilt{[c](int64_t rid) {
+            return qm::result_batch_frame(rid, 0, 2, {c});
+        }},
         qm::ActionSendResultEnd{},
     };
     qm::MockServer srv({s});
@@ -1344,13 +1388,14 @@ TEST_CASE("mock: get_geohash round-trip (precision_bits + bits)")
 
 TEST_CASE("mock: stats and cursor introspection getters return live values")
 {
-    qm::ColumnSpec c{"v", qm::COL_INT,
-                     qm::fixed_column_bytes(1, pack_le<int32_t>({99}))};
+    qm::ColumnSpec c{
+        "v", qm::COL_INT, qm::fixed_column_bytes(1, pack_le<int32_t>({99}))};
     qm::Script s = {
         qm::ActionSendServerInfo{},
         qm::ActionAwaitQueryRequest{},
-        qm::ActionSendBuilt{[c](int64_t rid)
-                            { return qm::result_batch_frame(rid, /*batch_seq=*/0, 1, {c}); }},
+        qm::ActionSendBuilt{[c](int64_t rid) {
+            return qm::result_batch_frame(rid, /*batch_seq=*/0, 1, {c});
+        }},
         qm::ActionSendResultEnd{},
     };
     qm::MockServer srv({s});
@@ -1367,7 +1412,8 @@ TEST_CASE("mock: stats and cursor introspection getters return live values")
     // host but never negative; saturating semantics).
     const uint64_t r0 = reader.read_ns();
     const uint64_t d0 = reader.decode_ns();
-    (void)r0; (void)d0;
+    (void)r0;
+    (void)d0;
 
     auto cur = reader.prepare("select v"_utf8).initial_credit(1024).execute();
     auto batch_opt = cur.next_batch();
@@ -1396,7 +1442,9 @@ TEST_CASE("mock: stats and cursor introspection getters return live values")
     CHECK(cur.credit_granted_total() == r_credit_before);
 
     // Drain remaining batches.
-    while (cur.next_batch()) {}
+    while (cur.next_batch())
+    {
+    }
 
     // After at least one read, read_ns / decode_ns should have advanced
     // (or stayed equal on extremely fast hosts — saturating arithmetic
@@ -1436,7 +1484,9 @@ void run_bind_round_trip(Fn&& bind_apply)
     auto q = reader.prepare("X"_utf8);
     bind_apply(q);
     auto cur = q.execute();
-    while (cur.next_batch()) {}
+    while (cur.next_batch())
+    {
+    }
     auto reqs = srv.captured_requests();
     REQUIRE(reqs.size() == 1);
     CHECK(reqs[0][0] == qm::MSG_QUERY_REQUEST);
@@ -1479,7 +1529,8 @@ void run_bind_rejection(Fn&& bind_apply)
 // a clean error rather than crash. Exercises ActionReject401.
 // ---------------------------------------------------------------------------
 
-TEST_CASE("mock: WebSocket upgrade rejected with 401 surfaces a connect-time error")
+TEST_CASE(
+    "mock: WebSocket upgrade rejected with 401 surfaces a connect-time error")
 {
     qm::Script s = {qm::ActionReject401{}};
     qm::MockServer srv({s});
@@ -1496,8 +1547,9 @@ TEST_CASE("mock: WebSocket upgrade rejected with 401 surfaces a connect-time err
     // depending on which layer caught it; both are correct
     // connection-establishment failures. Anything else (e.g.
     // socket_error, config_error, success) is a regression.
-    CHECK((code == questdb_error_auth_error
-        || code == questdb_error_handshake_error));
+    CHECK(
+        (code == questdb_error_auth_error ||
+         code == questdb_error_handshake_error));
     questdb_error_free(err);
 }
 
@@ -1524,8 +1576,9 @@ TEST_CASE("mock: multi-addr walk aggregates per-endpoint 401 rejections")
     // class). The aggregated-message check below is the part that
     // actually pins the new behaviour.
     const auto code = questdb_error_get_code(err);
-    CHECK((code == questdb_error_auth_error
-        || code == questdb_error_handshake_error));
+    CHECK(
+        (code == questdb_error_auth_error ||
+         code == questdb_error_handshake_error));
     size_t mlen = 0;
     const char* msg = questdb_error_msg(err, &mlen);
     const std::string m{msg, mlen};
@@ -1547,12 +1600,13 @@ TEST_CASE("mock: multi-addr walk aggregates per-endpoint 401 rejections")
 // ActionSendCacheReset.
 // ---------------------------------------------------------------------------
 
-TEST_CASE("mock: CACHE_RESET mid-stream is consumed without breaking the cursor")
+TEST_CASE(
+    "mock: CACHE_RESET mid-stream is consumed without breaking the cursor")
 {
     qm::Script s = {
         qm::ActionSendServerInfo{},
         qm::ActionAwaitQueryRequest{},
-        qm::ActionSendCacheReset{},  // server invalidates symbol/schema caches
+        qm::ActionSendCacheReset{}, // server invalidates symbol/schema caches
         qm::ActionSendResultEnd{},
     };
     qm::MockServer srv({s});
@@ -1581,12 +1635,18 @@ namespace
 {
 ::qwp_reader* raw_handle(questdb::egress::reader& r) noexcept
 {
-    struct reader_layout { ::qwp_reader* impl; };
+    struct reader_layout
+    {
+        ::qwp_reader* impl;
+    };
     return reinterpret_cast<reader_layout*>(&r)->impl;
 }
 ::qwp_reader_query* raw_handle(questdb::egress::query& q) noexcept
 {
-    struct query_layout { ::qwp_reader_query* impl; };
+    struct query_layout
+    {
+        ::qwp_reader_query* impl;
+    };
     return reinterpret_cast<query_layout*>(&q)->impl;
 }
 } // namespace
@@ -1600,8 +1660,7 @@ TEST_CASE("mock: query_new rejects invalid UTF-8 SQL with InvalidUtf8")
     static const unsigned char bad[] = {'s', 'e', 'l', 'e', 'c', 't', 0xFF};
     line_sender_utf8 sql{7, reinterpret_cast<const char*>(bad)};
     questdb_error* err = nullptr;
-    qwp_reader_query* q =
-        qwp_reader_prepare(raw_handle(reader), sql, &err);
+    qwp_reader_query* q = qwp_reader_prepare(raw_handle(reader), sql, &err);
     REQUIRE(q == nullptr);
     REQUIRE(err != nullptr);
     CHECK(questdb_error_get_code(err) == questdb_error_invalid_utf8);
@@ -1610,7 +1669,8 @@ TEST_CASE("mock: query_new rejects invalid UTF-8 SQL with InvalidUtf8")
     CHECK(srv.captured_requests().empty());
 }
 
-TEST_CASE("mock: bind_varchar with invalid UTF-8 surfaces InvalidUtf8 at execute")
+TEST_CASE(
+    "mock: bind_varchar with invalid UTF-8 surfaces InvalidUtf8 at execute")
 {
     qm::Script s = {
         qm::ActionSendServerInfo{},
@@ -1620,7 +1680,7 @@ TEST_CASE("mock: bind_varchar with invalid UTF-8 surfaces InvalidUtf8 at execute
     auto reader = connect_to(srv);
 
     auto q = reader.prepare("X"_utf8);
-    static const unsigned char bad[] = {0xC3, 0x28};  // invalid 2-byte UTF-8
+    static const unsigned char bad[] = {0xC3, 0x28}; // invalid 2-byte UTF-8
     line_sender_utf8 v{2, reinterpret_cast<const char*>(bad)};
     qwp_reader_query_bind_varchar(raw_handle(q), v);
     // bind_varchar stashes the deferred error; execute() must surface
@@ -1672,47 +1732,80 @@ TEST_CASE("mock: bind variants round-trip without crashing")
 {
     using questdb::egress::query;
 
-    SUBCASE("bind_bool")           { run_bind_round_trip([](query& q){ q.bind_bool(true); }); }
-    SUBCASE("bind_i8")             { run_bind_round_trip([](query& q){ q.bind_i8(-7); }); }
-    SUBCASE("bind_i16")            { run_bind_round_trip([](query& q){ q.bind_i16(-31000); }); }
-    SUBCASE("bind_i64")            { run_bind_round_trip([](query& q){ q.bind_i64(-1); }); }
-    SUBCASE("bind_f32")            { run_bind_round_trip([](query& q){ q.bind_f32(1.5f); }); }
-    SUBCASE("bind_f64")            { run_bind_round_trip([](query& q){ q.bind_f64(-2.25); }); }
-    SUBCASE("bind_timestamp_micros"){ run_bind_round_trip([](query& q){ q.bind_timestamp_micros(1234567890); }); }
-    SUBCASE("bind_timestamp_nanos"){ run_bind_round_trip([](query& q){ q.bind_timestamp_nanos(1234567890123); }); }
-    SUBCASE("bind_date_millis")    { run_bind_round_trip([](query& q){ q.bind_date_millis(1234567890); }); }
-    SUBCASE("bind_char")           { run_bind_round_trip([](query& q){ q.bind_char(uint16_t(u'Z')); }); }
-    SUBCASE("bind_decimal64")      { run_bind_round_trip([](query& q){ q.bind_decimal64(12345, 2); }); }
+    SUBCASE("bind_bool")
+    {
+        run_bind_round_trip([](query& q) { q.bind_bool(true); });
+    }
+    SUBCASE("bind_i8")
+    {
+        run_bind_round_trip([](query& q) { q.bind_i8(-7); });
+    }
+    SUBCASE("bind_i16")
+    {
+        run_bind_round_trip([](query& q) { q.bind_i16(-31000); });
+    }
+    SUBCASE("bind_i64")
+    {
+        run_bind_round_trip([](query& q) { q.bind_i64(-1); });
+    }
+    SUBCASE("bind_f32")
+    {
+        run_bind_round_trip([](query& q) { q.bind_f32(1.5f); });
+    }
+    SUBCASE("bind_f64")
+    {
+        run_bind_round_trip([](query& q) { q.bind_f64(-2.25); });
+    }
+    SUBCASE("bind_timestamp_micros")
+    {
+        run_bind_round_trip(
+            [](query& q) { q.bind_timestamp_micros(1234567890); });
+    }
+    SUBCASE("bind_timestamp_nanos")
+    {
+        run_bind_round_trip(
+            [](query& q) { q.bind_timestamp_nanos(1234567890123); });
+    }
+    SUBCASE("bind_date_millis")
+    {
+        run_bind_round_trip([](query& q) { q.bind_date_millis(1234567890); });
+    }
+    SUBCASE("bind_char")
+    {
+        run_bind_round_trip([](query& q) { q.bind_char(uint16_t(u'Z')); });
+    }
+    SUBCASE("bind_decimal64")
+    {
+        run_bind_round_trip([](query& q) { q.bind_decimal64(12345, 2); });
+    }
     SUBCASE("bind_decimal256")
     {
-        run_bind_round_trip(
-            [](query& q)
-            {
-                std::array<uint8_t, 32> b{};
-                b[0] = 0xAB;
-                q.bind_decimal256(b, 4);
-            });
+        run_bind_round_trip([](query& q) {
+            std::array<uint8_t, 32> b{};
+            b[0] = 0xAB;
+            q.bind_decimal256(b, 4);
+        });
     }
-    SUBCASE("bind_geohash")        { run_bind_round_trip([](query& q){ q.bind_geohash(0xAB, 8); }); }
+    SUBCASE("bind_geohash")
+    {
+        run_bind_round_trip([](query& q) { q.bind_geohash(0xAB, 8); });
+    }
     SUBCASE("bind_uuid")
     {
-        run_bind_round_trip(
-            [](query& q)
-            {
-                std::array<uint8_t, 16> u{};
-                for (int i = 0; i < 16; ++i) u[i] = uint8_t(i);
-                q.bind_uuid(u);
-            });
+        run_bind_round_trip([](query& q) {
+            std::array<uint8_t, 16> u{};
+            for (int i = 0; i < 16; ++i)
+                u[i] = uint8_t(i);
+            q.bind_uuid(u);
+        });
     }
     SUBCASE("bind_long256")
     {
-        run_bind_round_trip(
-            [](query& q)
-            {
-                std::array<uint8_t, 32> l{};
-                l[31] = 0x80;
-                q.bind_long256(l);
-            });
+        run_bind_round_trip([](query& q) {
+            std::array<uint8_t, 32> l{};
+            l[31] = 0x80;
+            q.bind_long256(l);
+        });
     }
     // bind_ipv4 / bind_binary / bind_null_binary are exposed on the FFI
     // surface but the upstream encoder rejects them (see binds.rs
@@ -1721,33 +1814,47 @@ TEST_CASE("mock: bind variants round-trip without crashing")
     // an InvalidBind error rather than a panic / abort.
     SUBCASE("bind_ipv4 → InvalidBind")
     {
-        run_bind_rejection([](query& q){ q.bind_ipv4(0x7F000001); });
+        run_bind_rejection([](query& q) { q.bind_ipv4(0x7F000001); });
     }
     SUBCASE("bind_binary → InvalidBind")
     {
-        run_bind_rejection(
-            [](query& q)
-            {
-                const uint8_t buf[] = {0xDE, 0xAD, 0xBE, 0xEF};
-                q.bind_binary(buf, sizeof(buf));
-            });
+        run_bind_rejection([](query& q) {
+            const uint8_t buf[] = {0xDE, 0xAD, 0xBE, 0xEF};
+            q.bind_binary(buf, sizeof(buf));
+        });
     }
     SUBCASE("bind_binary empty → InvalidBind")
     {
-        run_bind_rejection([](query& q){ q.bind_binary(nullptr, 0); });
+        run_bind_rejection([](query& q) { q.bind_binary(nullptr, 0); });
     }
     SUBCASE("bind_null_binary → InvalidBind")
     {
-        run_bind_rejection([](query& q){ q.bind_null_binary(); });
+        run_bind_rejection([](query& q) { q.bind_null_binary(); });
     }
-    SUBCASE("bind_null_varchar")     { run_bind_round_trip([](query& q){ q.bind_null_varchar(); }); }
-    SUBCASE("bind_null_decimal64")   { run_bind_round_trip([](query& q){ q.bind_null_decimal64(2); }); }
-    SUBCASE("bind_null_decimal128")  { run_bind_round_trip([](query& q){ q.bind_null_decimal128(2); }); }
-    SUBCASE("bind_null_decimal256")  { run_bind_round_trip([](query& q){ q.bind_null_decimal256(2); }); }
-    SUBCASE("bind_null_geohash")     { run_bind_round_trip([](query& q){ q.bind_null_geohash(8); }); }
+    SUBCASE("bind_null_varchar")
+    {
+        run_bind_round_trip([](query& q) { q.bind_null_varchar(); });
+    }
+    SUBCASE("bind_null_decimal64")
+    {
+        run_bind_round_trip([](query& q) { q.bind_null_decimal64(2); });
+    }
+    SUBCASE("bind_null_decimal128")
+    {
+        run_bind_round_trip([](query& q) { q.bind_null_decimal128(2); });
+    }
+    SUBCASE("bind_null_decimal256")
+    {
+        run_bind_round_trip([](query& q) { q.bind_null_decimal256(2); });
+    }
+    SUBCASE("bind_null_geohash")
+    {
+        run_bind_round_trip([](query& q) { q.bind_null_geohash(8); });
+    }
     SUBCASE("bind_null(kind)")
     {
-        run_bind_round_trip([](query& q){ q.bind_null(questdb::egress::column_kind::int_); });
+        run_bind_round_trip(
+            [](query& q) { q.bind_null(questdb::egress::column_kind::int_); });
     }
 }
 
@@ -1768,8 +1875,9 @@ TEST_CASE("mock: column_name returns the schema's column name")
     qm::Script s = {
         qm::ActionSendServerInfo{},
         qm::ActionAwaitQueryRequest{},
-        qm::ActionSendBuilt{[c0, c1](int64_t rid)
-                            { return qm::result_batch_frame(rid, 0, 1, {c0, c1}); }},
+        qm::ActionSendBuilt{[c0, c1](int64_t rid) {
+            return qm::result_batch_frame(rid, 0, 1, {c0, c1});
+        }},
         qm::ActionSendResultEnd{},
     };
     qm::MockServer srv({s});
@@ -1788,15 +1896,14 @@ TEST_CASE("mock: column_name returns the schema's column name")
 TEST_CASE("mock: column_name fails cleanly on out-of-range index")
 {
     qm::ColumnSpec c{
-        "v",
-        qm::COL_LONG,
-        qm::fixed_column_bytes(1, pack_le<int64_t>({0}))};
+        "v", qm::COL_LONG, qm::fixed_column_bytes(1, pack_le<int64_t>({0}))};
 
     qm::Script s = {
         qm::ActionSendServerInfo{},
         qm::ActionAwaitQueryRequest{},
-        qm::ActionSendBuilt{[c](int64_t rid)
-                            { return qm::result_batch_frame(rid, 0, 1, {c}); }},
+        qm::ActionSendBuilt{[c](int64_t rid) {
+            return qm::result_batch_frame(rid, 0, 1, {c});
+        }},
         qm::ActionSendResultEnd{},
     };
     qm::MockServer srv({s});
@@ -1834,14 +1941,14 @@ TEST_CASE("mock: get_ipv4 round-trips high-bit IPs without sign-flipping")
         "ip",
         qm::COL_IPV4,
         qm::fixed_column_bytes(
-            3,
-            pack_le<uint32_t>({0xC0A80001u, 0x0A000001u, 0xF0010203u}))};
+            3, pack_le<uint32_t>({0xC0A80001u, 0x0A000001u, 0xF0010203u}))};
 
     qm::Script s = {
         qm::ActionSendServerInfo{},
         qm::ActionAwaitQueryRequest{},
-        qm::ActionSendBuilt{[c](int64_t rid)
-                            { return qm::result_batch_frame(rid, 0, 3, {c}); }},
+        qm::ActionSendBuilt{[c](int64_t rid) {
+            return qm::result_batch_frame(rid, 0, 3, {c});
+        }},
         qm::ActionSendResultEnd{},
     };
     qm::MockServer srv({s});
@@ -1875,8 +1982,9 @@ TEST_CASE("mock: get_i32 rejects an IPV4 column with a type-mismatch error")
     qm::Script s = {
         qm::ActionSendServerInfo{},
         qm::ActionAwaitQueryRequest{},
-        qm::ActionSendBuilt{[c](int64_t rid)
-                            { return qm::result_batch_frame(rid, 0, 1, {c}); }},
+        qm::ActionSendBuilt{[c](int64_t rid) {
+            return qm::result_batch_frame(rid, 0, 1, {c});
+        }},
         qm::ActionSendResultEnd{},
     };
     qm::MockServer srv({s});
@@ -1906,15 +2014,14 @@ TEST_CASE("mock: get_i32 rejects an IPV4 column with a type-mismatch error")
 TEST_CASE("mock: get_ipv4 rejects an INT column with a type-mismatch error")
 {
     qm::ColumnSpec c{
-        "n",
-        qm::COL_INT,
-        qm::fixed_column_bytes(1, pack_le<int32_t>({42}))};
+        "n", qm::COL_INT, qm::fixed_column_bytes(1, pack_le<int32_t>({42}))};
 
     qm::Script s = {
         qm::ActionSendServerInfo{},
         qm::ActionAwaitQueryRequest{},
-        qm::ActionSendBuilt{[c](int64_t rid)
-                            { return qm::result_batch_frame(rid, 0, 1, {c}); }},
+        qm::ActionSendBuilt{[c](int64_t rid) {
+            return qm::result_batch_frame(rid, 0, 1, {c});
+        }},
         qm::ActionSendResultEnd{},
     };
     qm::MockServer srv({s});
@@ -1962,8 +2069,9 @@ TEST_CASE("mock: typed getters reject mismatched column kind")
     qm::Script s = {
         qm::ActionSendServerInfo{},
         qm::ActionAwaitQueryRequest{},
-        qm::ActionSendBuilt{[int_col](int64_t rid)
-                            { return qm::result_batch_frame(rid, 0, 1, {int_col}); }},
+        qm::ActionSendBuilt{[int_col](int64_t rid) {
+            return qm::result_batch_frame(rid, 0, 1, {int_col});
+        }},
         qm::ActionSendResultEnd{},
     };
     qm::MockServer srv({s});
@@ -1990,26 +2098,81 @@ TEST_CASE("mock: typed getters reject mismatched column kind")
         CHECK(code == questdb_error_invalid_api_call);
     };
 
-    SUBCASE("get_bool")        { expect_throws([&]{ (void)batch.column(0).get<bool>(0); }); }
-    SUBCASE("get_i8")          { expect_throws([&]{ (void)batch.column(0).get<int8_t>(0); }); }
-    SUBCASE("get_i16")         { expect_throws([&]{ (void)batch.column(0).get<int16_t>(0); }); }
-    SUBCASE("get_i64")         { expect_throws([&]{ (void)batch.column(0).get<int64_t>(0); }); }
-    SUBCASE("get_f32")         { expect_throws([&]{ (void)batch.column(0).get<float>(0); }); }
-    SUBCASE("get_f64")         { expect_throws([&]{ (void)batch.column(0).get<double>(0); }); }
-    SUBCASE("get_char")        { expect_throws([&]{ (void)batch.column(0).get<uint16_t>(0); }); }
-    SUBCASE("get_uuid")        { expect_throws([&]{ (void)batch.column(0).get_uuid(0); }); }
-    SUBCASE("get_long256")     { expect_throws([&]{ (void)batch.column(0).get_long256(0); }); }
-    SUBCASE("get_varchar")     { expect_throws([&]{ (void)batch.column(0).varchar(0); }); }
-    SUBCASE("get_binary")      { expect_throws([&]{ (void)batch.column(0).binary(0); }); }
-    SUBCASE("get_symbol")      { expect_throws([&]{ (void)batch.column(0).symbol(0); }); }
-    SUBCASE("get_decimal64")   { expect_throws([&]{ (void)batch.column(0).get_decimal64(0); }); }
-    SUBCASE("get_decimal128")  { expect_throws([&]{ (void)batch.column(0).get_decimal128(0); }); }
-    SUBCASE("get_decimal256")  { expect_throws([&]{ (void)batch.column(0).get_decimal256(0); }); }
-    SUBCASE("get_geohash")     { expect_throws([&]{ (void)batch.column(0).get_geohash(0); }); }
-    SUBCASE("array shape on scalar col") {
-        expect_throws([&]{ size_t r=0; (void)batch.column(0).shape(0, &r); });
+    SUBCASE("get_bool")
+    {
+        expect_throws([&] { (void)batch.column(0).get<bool>(0); });
     }
-    SUBCASE("get_ipv4")        { expect_throws([&]{ (void)batch.column(0).get<uint32_t>(0); }); }
+    SUBCASE("get_i8")
+    {
+        expect_throws([&] { (void)batch.column(0).get<int8_t>(0); });
+    }
+    SUBCASE("get_i16")
+    {
+        expect_throws([&] { (void)batch.column(0).get<int16_t>(0); });
+    }
+    SUBCASE("get_i64")
+    {
+        expect_throws([&] { (void)batch.column(0).get<int64_t>(0); });
+    }
+    SUBCASE("get_f32")
+    {
+        expect_throws([&] { (void)batch.column(0).get<float>(0); });
+    }
+    SUBCASE("get_f64")
+    {
+        expect_throws([&] { (void)batch.column(0).get<double>(0); });
+    }
+    SUBCASE("get_char")
+    {
+        expect_throws([&] { (void)batch.column(0).get<uint16_t>(0); });
+    }
+    SUBCASE("get_uuid")
+    {
+        expect_throws([&] { (void)batch.column(0).get_uuid(0); });
+    }
+    SUBCASE("get_long256")
+    {
+        expect_throws([&] { (void)batch.column(0).get_long256(0); });
+    }
+    SUBCASE("get_varchar")
+    {
+        expect_throws([&] { (void)batch.column(0).varchar(0); });
+    }
+    SUBCASE("get_binary")
+    {
+        expect_throws([&] { (void)batch.column(0).binary(0); });
+    }
+    SUBCASE("get_symbol")
+    {
+        expect_throws([&] { (void)batch.column(0).symbol(0); });
+    }
+    SUBCASE("get_decimal64")
+    {
+        expect_throws([&] { (void)batch.column(0).get_decimal64(0); });
+    }
+    SUBCASE("get_decimal128")
+    {
+        expect_throws([&] { (void)batch.column(0).get_decimal128(0); });
+    }
+    SUBCASE("get_decimal256")
+    {
+        expect_throws([&] { (void)batch.column(0).get_decimal256(0); });
+    }
+    SUBCASE("get_geohash")
+    {
+        expect_throws([&] { (void)batch.column(0).get_geohash(0); });
+    }
+    SUBCASE("array shape on scalar col")
+    {
+        expect_throws([&] {
+            size_t r = 0;
+            (void)batch.column(0).shape(0, &r);
+        });
+    }
+    SUBCASE("get_ipv4")
+    {
+        expect_throws([&] { (void)batch.column(0).get<uint32_t>(0); });
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2018,12 +2181,15 @@ TEST_CASE("mock: typed getters reject mismatched column kind")
 TEST_CASE("mock: column accessors reject out-of-range indices")
 {
     qm::ColumnSpec int_col{
-        "n", qm::COL_INT, qm::fixed_column_bytes(2, pack_le<int32_t>({10, 20}))};
+        "n",
+        qm::COL_INT,
+        qm::fixed_column_bytes(2, pack_le<int32_t>({10, 20}))};
     qm::Script s = {
         qm::ActionSendServerInfo{},
         qm::ActionAwaitQueryRequest{},
-        qm::ActionSendBuilt{[int_col](int64_t rid)
-                            { return qm::result_batch_frame(rid, 0, 2, {int_col}); }},
+        qm::ActionSendBuilt{[int_col](int64_t rid) {
+            return qm::result_batch_frame(rid, 0, 2, {int_col});
+        }},
         qm::ActionSendResultEnd{},
     };
     qm::MockServer srv({s});
@@ -2054,19 +2220,19 @@ TEST_CASE("mock: column accessors reject out-of-range indices")
 
     SUBCASE("column_kind out-of-range column")
     {
-        expect_invalid_api([&]{ (void)batch.column_kind(99); });
+        expect_invalid_api([&] { (void)batch.column_kind(99); });
     }
     SUBCASE("column_name out-of-range column")
     {
-        expect_invalid_api([&]{ (void)batch.column_name(99); });
+        expect_invalid_api([&] { (void)batch.column_name(99); });
     }
     SUBCASE("get_i32 out-of-range column")
     {
-        expect_invalid_api([&]{ (void)batch.column(99).get<int32_t>(0); });
+        expect_invalid_api([&] { (void)batch.column(99).get<int32_t>(0); });
     }
     SUBCASE("get_i32 out-of-range row")
     {
-        expect_invalid_api([&]{ (void)batch.column(0).get<int32_t>(99); });
+        expect_invalid_api([&] { (void)batch.column(0).get<int32_t>(99); });
     }
 }
 
@@ -2082,23 +2248,24 @@ TEST_CASE("mock: get_i64 round-trips TIMESTAMP / DATE / TIMESTAMP_NANOS")
     const int64_t ts_ns = 1'700'000'000'123'456'789LL; // 2023-11-14, ns
 
     qm::ColumnSpec c_ts{
-        "ts", qm::COL_TIMESTAMP,
+        "ts",
+        qm::COL_TIMESTAMP,
         qm::fixed_column_bytes(1, pack_le<int64_t>({ts_us}))};
     qm::ColumnSpec c_date{
-        "d", qm::COL_DATE,
+        "d",
+        qm::COL_DATE,
         qm::fixed_column_bytes(1, pack_le<int64_t>({date_ms}))};
     qm::ColumnSpec c_tn{
-        "tn", qm::COL_TIMESTAMP_NANOS,
+        "tn",
+        qm::COL_TIMESTAMP_NANOS,
         qm::fixed_column_bytes(1, pack_le<int64_t>({ts_ns}))};
 
     qm::Script s = {
         qm::ActionSendServerInfo{},
         qm::ActionAwaitQueryRequest{},
-        qm::ActionSendBuilt{[c_ts, c_date, c_tn](int64_t rid)
-                            {
-                                return qm::result_batch_frame(
-                                    rid, 0, 1, {c_ts, c_date, c_tn});
-                            }},
+        qm::ActionSendBuilt{[c_ts, c_date, c_tn](int64_t rid) {
+            return qm::result_batch_frame(rid, 0, 1, {c_ts, c_date, c_tn});
+        }},
         qm::ActionSendResultEnd{},
     };
     qm::MockServer srv({s});
@@ -2134,19 +2301,20 @@ TEST_CASE("mock: get_i64 round-trips TIMESTAMP / DATE / TIMESTAMP_NANOS")
 // raising ProtocolError is acceptable; what matters is that NO call path
 // returns a valid-looking view from misaligned bytes.
 // ---------------------------------------------------------------------------
-TEST_CASE(
-    "mock: DOUBLE_ARRAY misaligned data_len surfaces as ProtocolError")
+TEST_CASE("mock: DOUBLE_ARRAY misaligned data_len surfaces as ProtocolError")
 {
     qm::ArrayRow row{{1u, 1u}, std::vector<uint8_t>(11, 0xCC)};
     qm::ColumnSpec c{
-        "a", qm::COL_DOUBLE_ARRAY,
+        "a",
+        qm::COL_DOUBLE_ARRAY,
         qm::array_column_bytes({std::optional<qm::ArrayRow>{std::move(row)}})};
 
     qm::Script s = {
         qm::ActionSendServerInfo{},
         qm::ActionAwaitQueryRequest{},
-        qm::ActionSendBuilt{[c](int64_t rid)
-                            { return qm::result_batch_frame(rid, 0, 1, {c}); }},
+        qm::ActionSendBuilt{[c](int64_t rid) {
+            return qm::result_batch_frame(rid, 0, 1, {c});
+        }},
         qm::ActionSendResultEnd{},
     };
     qm::MockServer srv({s});
@@ -2189,8 +2357,9 @@ TEST_CASE("mock: C++ wrapper move semantics — reader / cursor")
     qm::Script s = {
         qm::ActionSendServerInfo{},
         qm::ActionAwaitQueryRequest{},
-        qm::ActionSendBuilt{[c](int64_t rid)
-                            { return qm::result_batch_frame(rid, 0, 1, {c}); }},
+        qm::ActionSendBuilt{[c](int64_t rid) {
+            return qm::result_batch_frame(rid, 0, 1, {c});
+        }},
         qm::ActionSendResultEnd{},
     };
     qm::MockServer srv({s});
@@ -2203,8 +2372,8 @@ TEST_CASE("mock: C++ wrapper move semantics — reader / cursor")
         // r2 still owns the impl and must work normally.
         auto cur = r2.execute("select v from t"_utf8);
         auto batch_opt = cur.next_batch();
-    REQUIRE(batch_opt);
-    auto& batch = *batch_opt;
+        REQUIRE(batch_opt);
+        auto& batch = *batch_opt;
         auto v = batch.column(0).get<int32_t>(0);
         REQUIRE(v.has_value());
         CHECK(*v == 1);
@@ -2275,19 +2444,20 @@ TEST_CASE(
 TEST_CASE("mock: server_info exposes role / epoch / capabilities / wall_ns")
 {
     constexpr uint64_t expected_epoch = 0xCAFEBABEDEADBEEFULL;
-    constexpr uint32_t expected_caps  = 0x12345678u | qm::CAP_ZONE;
-    constexpr int64_t  expected_wall  = 1'700'000'000'000'000'000LL;
+    constexpr uint32_t expected_caps = 0x12345678u | qm::CAP_ZONE;
+    constexpr int64_t expected_wall = 1'700'000'000'000'000'000LL;
 
     qm::ActionSendServerInfo si{};
-    si.role           = qm::ROLE_PRIMARY;
-    si.cluster_id     = "cluster-x";
-    si.node_id        = "node-x";
-    si.epoch          = expected_epoch;
-    si.capabilities   = expected_caps;
+    si.role = qm::ROLE_PRIMARY;
+    si.cluster_id = "cluster-x";
+    si.node_id = "node-x";
+    si.epoch = expected_epoch;
+    si.capabilities = expected_caps;
     si.server_wall_ns = expected_wall;
-    si.zone_id        = "eu-west-1a";
+    si.zone_id = "eu-west-1a";
 
-    qm::Script s = {si, qm::ActionAwaitQueryRequest{}, qm::ActionSendResultEnd{}};
+    qm::Script s = {
+        si, qm::ActionAwaitQueryRequest{}, qm::ActionSendResultEnd{}};
     qm::MockServer srv({s});
 
     auto reader = connect_to(srv);
@@ -2306,13 +2476,12 @@ TEST_CASE("mock: server_info exposes role / epoch / capabilities / wall_ns")
     // the by-value server_info result therefore cannot refer into a destroyed
     // temporary.
     static_assert(std::is_same_v<
-        decltype(std::declval<eg::server_info&&>().cluster_id()),
-        std::string>);
+                  decltype(std::declval<eg::server_info&&>().cluster_id()),
+                  std::string>);
     static_assert(std::is_same_v<
-        decltype(std::declval<eg::server_info&&>().zone_id()),
-        std::optional<std::string>>);
-    const std::string& temporary_cluster =
-        reader.server_info().cluster_id();
+                  decltype(std::declval<eg::server_info&&>().zone_id()),
+                  std::optional<std::string>>);
+    const std::string& temporary_cluster = reader.server_info().cluster_id();
     const auto& temporary_zone = reader.server_info().zone_id();
     CHECK(temporary_cluster == "cluster-x");
     REQUIRE(temporary_zone.has_value());
@@ -2334,7 +2503,8 @@ TEST_CASE("mock: owning server_info preserves unknown role and outlives reader")
     }
 
     // The reader and its Rust-owned strings are gone. The C++ snapshot keeps
-    // independent storage rather than a dangling qwp_reader_server_info pointer.
+    // independent storage rather than a dangling qwp_reader_server_info
+    // pointer.
     REQUIRE(captured.has_value());
     CHECK(captured->cluster_id() == "cluster-owned");
     CHECK(captured->node_id() == "node-owned");
@@ -2350,7 +2520,7 @@ TEST_CASE("mock: owning server_info preserves unknown role and outlives reader")
 TEST_CASE("mock: cursor::terminal_exec_done returns op_type and rows_affected")
 {
     qm::ActionSendExecDone done{};
-    done.op_type       = 0x42;     // arbitrary non-zero, opaque to the client
+    done.op_type = 0x42; // arbitrary non-zero, opaque to the client
     done.rows_affected = 1'234'567ULL;
 
     qm::Script s = {
@@ -2379,7 +2549,8 @@ TEST_CASE("mock: cursor::terminal_exec_done returns op_type and rows_affected")
 // `new_request_id`, `elapsed_ns`, and `trigger_msg`, which the original
 // trampoline test left unobserved.
 // ---------------------------------------------------------------------------
-TEST_CASE("mock: failover event exposes new_request_id, elapsed_ns, trigger_msg")
+TEST_CASE(
+    "mock: failover event exposes new_request_id, elapsed_ns, trigger_msg")
 {
     qm::Script s_a = {
         qm::ActionSendServerInfo{qm::ROLE_STANDALONE, "c", "a"},
@@ -2404,22 +2575,22 @@ TEST_CASE("mock: failover event exposes new_request_id, elapsed_ns, trigger_msg"
     struct Capture
     {
         std::atomic<int> count{0};
-        int64_t  new_request_id{0};
+        int64_t new_request_id{0};
         uint64_t elapsed_ns{0};
         std::string trigger_msg;
     };
     auto cap = std::make_shared<Capture>();
 
-    auto cur = reader.prepare("select 1"_utf8)
-                   .on_failover_reset(
-                       [cap](const questdb::egress::failover_reset_event_view& ev)
-                       {
-                           cap->count.fetch_add(1);
-                           cap->new_request_id = ev.new_request_id();
-                           cap->elapsed_ns = ev.elapsed_ns();
-                           cap->trigger_msg = std::string(ev.trigger_msg());
-                       })
-                   .execute();
+    auto cur =
+        reader.prepare("select 1"_utf8)
+            .on_failover_reset(
+                [cap](const questdb::egress::failover_reset_event_view& ev) {
+                    cap->count.fetch_add(1);
+                    cap->new_request_id = ev.new_request_id();
+                    cap->elapsed_ns = ev.elapsed_ns();
+                    cap->trigger_msg = std::string(ev.trigger_msg());
+                })
+            .execute();
     CHECK_FALSE(cur.next_batch());
     REQUIRE(cap->count.load() == 1);
 
@@ -2454,21 +2625,21 @@ TEST_CASE("mock: C++ wrapper move-assignment — reader / query / cursor")
         qm::Script s2 = {
             qm::ActionSendServerInfo{},
             qm::ActionAwaitQueryRequest{},
-            qm::ActionSendBuilt{
-                [c](int64_t rid)
-                { return qm::result_batch_frame(rid, 0, 1, {c}); }},
+            qm::ActionSendBuilt{[c](int64_t rid) {
+                return qm::result_batch_frame(rid, 0, 1, {c});
+            }},
             qm::ActionSendResultEnd{},
         };
         qm::MockServer srv1({s1});
         qm::MockServer srv2({s2});
 
         auto r = connect_to(srv1);
-        r = connect_to(srv2);  // move-assign — must close srv1's socket
+        r = connect_to(srv2); // move-assign — must close srv1's socket
         // The new reader works against srv2.
         auto cur = r.execute("select v from t"_utf8);
         auto batch_opt = cur.next_batch();
-    REQUIRE(batch_opt);
-    auto& batch = *batch_opt;
+        REQUIRE(batch_opt);
+        auto& batch = *batch_opt;
         auto v = batch.column(0).get<int32_t>(0);
         REQUIRE(v.has_value());
         CHECK(*v == 7);
@@ -2484,9 +2655,9 @@ TEST_CASE("mock: C++ wrapper move-assignment — reader / query / cursor")
         qm::Script s2 = {
             qm::ActionSendServerInfo{},
             qm::ActionAwaitQueryRequest{},
-            qm::ActionSendBuilt{
-                [c](int64_t rid)
-                { return qm::result_batch_frame(rid, 0, 1, {c}); }},
+            qm::ActionSendBuilt{[c](int64_t rid) {
+                return qm::result_batch_frame(rid, 0, 1, {c});
+            }},
             qm::ActionSendResultEnd{},
         };
         qm::MockServer srv1({s1});
@@ -2497,11 +2668,11 @@ TEST_CASE("mock: C++ wrapper move-assignment — reader / query / cursor")
         q1.bind_i32(1);
         auto q2 = reader2.prepare("Y"_utf8);
         q2.bind_i32(7);
-        q1 = std::move(q2);  // move-assign — frees q1's old impl
+        q1 = std::move(q2); // move-assign — frees q1's old impl
         auto cur = q1.execute();
         auto batch_opt = cur.next_batch();
-    REQUIRE(batch_opt);
-    auto& batch = *batch_opt;
+        REQUIRE(batch_opt);
+        auto& batch = *batch_opt;
         auto v = batch.column(0).get<int32_t>(0);
         REQUIRE(v.has_value());
         CHECK(*v == 7);
@@ -2517,21 +2688,21 @@ TEST_CASE("mock: C++ wrapper move-assignment — reader / query / cursor")
         qm::Script s = {
             qm::ActionSendServerInfo{},
             qm::ActionAwaitQueryRequest{},
-            qm::ActionSendBuilt{
-                [c](int64_t rid)
-                { return qm::result_batch_frame(rid, 0, 1, {c}); }},
+            qm::ActionSendBuilt{[c](int64_t rid) {
+                return qm::result_batch_frame(rid, 0, 1, {c});
+            }},
             qm::ActionSendResultEnd{},
         };
         qm::MockServer srv({s});
         auto reader = connect_to(srv);
         auto q_a = reader.prepare("X"_utf8);
-        auto q_b = std::move(q_a);   // q_a empty
-        q_a = std::move(q_b);        // assign into empty — must not crash
+        auto q_b = std::move(q_a); // q_a empty
+        q_a = std::move(q_b);      // assign into empty — must not crash
         q_a.bind_i32(7);
         auto cur = q_a.execute();
         auto batch_opt = cur.next_batch();
-    REQUIRE(batch_opt);
-    auto& batch = *batch_opt;
+        REQUIRE(batch_opt);
+        auto& batch = *batch_opt;
         auto v = batch.column(0).get<int32_t>(0);
         REQUIRE(v.has_value());
         CHECK(*v == 7);
@@ -2549,9 +2720,9 @@ TEST_CASE("mock: C++ wrapper move-assignment — reader / query / cursor")
         qm::Script s2 = {
             qm::ActionSendServerInfo{},
             qm::ActionAwaitQueryRequest{},
-            qm::ActionSendBuilt{
-                [c](int64_t rid)
-                { return qm::result_batch_frame(rid, 0, 1, {c}); }},
+            qm::ActionSendBuilt{[c](int64_t rid) {
+                return qm::result_batch_frame(rid, 0, 1, {c});
+            }},
             qm::ActionSendResultEnd{},
         };
         qm::MockServer srv1({s1});
@@ -2563,11 +2734,13 @@ TEST_CASE("mock: C++ wrapper move-assignment — reader / query / cursor")
         // before we overwrite it (the move-assign would call _close on
         // the live cursor regardless, but draining keeps the lifecycle
         // observable).
-        while (cur.next_batch()) {}
-        cur = r2.execute("select v from t"_utf8);  // move-assign
+        while (cur.next_batch())
+        {
+        }
+        cur = r2.execute("select v from t"_utf8); // move-assign
         auto batch_opt = cur.next_batch();
-    REQUIRE(batch_opt);
-    auto& batch = *batch_opt;
+        REQUIRE(batch_opt);
+        auto& batch = *batch_opt;
         auto v = batch.column(0).get<int32_t>(0);
         REQUIRE(v.has_value());
         CHECK(*v == 7);
@@ -2610,7 +2783,8 @@ TEST_CASE("mock: next_batch is idempotent after the stream terminus")
 // `reader.rs::target_matches`; the positive half is exercised by every
 // other test that uses ROLE_STANDALONE/_PRIMARY without a target filter.
 // ---------------------------------------------------------------------------
-TEST_CASE("mock: target=primary against replica-only endpoint surfaces role_mismatch")
+TEST_CASE(
+    "mock: target=primary against replica-only endpoint surfaces role_mismatch")
 {
     qm::Script s = {
         qm::ActionSendServerInfo{qm::ROLE_REPLICA, "cluster-x", "replica-1"},
@@ -2649,10 +2823,8 @@ void run_malformed_batch(
     // so the client would otherwise reconnect to the (now scriptless)
     // mock and hang. Disabling makes the malformed-frame error
     // surface directly on `next_batch`.
-    const std::string conf =
-        "ws::addr=" + srv.addr() + ";failover=off;";
-    questdb::egress::reader reader{
-        questdb::ingress::utf8_view{conf}};
+    const std::string conf = "ws::addr=" + srv.addr() + ";failover=off;";
+    questdb::egress::reader reader{questdb::ingress::utf8_view{conf}};
     auto cur = reader.execute("select 1"_utf8);
     bool threw = false;
     try
@@ -2670,7 +2842,9 @@ void run_malformed_batch(
 
 } // anonymous namespace
 
-TEST_CASE("mock: protocol_error — header.payload_length lies (claims more bytes than sent)")
+TEST_CASE(
+    "mock: protocol_error — header.payload_length lies (claims more bytes than "
+    "sent)")
 {
     // Build a valid-looking RESULT_BATCH then overwrite the 4-byte
     // payload_length in the header with a value larger than the actual
@@ -2685,7 +2859,7 @@ TEST_CASE("mock: protocol_error — header.payload_length lies (claims more byte
             // Bump declared payload_length by 1024 — the actual bytes
             // are unchanged, so the frame parser sees a mismatch.
             uint32_t plen = uint32_t(f[8]) | (uint32_t(f[9]) << 8) |
-                (uint32_t(f[10]) << 16) | (uint32_t(f[11]) << 24);
+                            (uint32_t(f[10]) << 16) | (uint32_t(f[11]) << 24);
             uint32_t bumped = plen + 1024;
             f[8] = uint8_t(bumped);
             f[9] = uint8_t(bumped >> 8);
@@ -2770,17 +2944,22 @@ TEST_CASE("mock: continuation batch decodes against the batch-0 schema")
     // asserted here by row *values* through the C API, not just by the
     // drain not throwing.
     qm::ColumnSpec c0{
-        "v", qm::COL_LONG, qm::fixed_column_bytes(2, pack_le<int64_t>({10, 20}))};
+        "v",
+        qm::COL_LONG,
+        qm::fixed_column_bytes(2, pack_le<int64_t>({10, 20}))};
     qm::ColumnSpec c1{
-        "v", qm::COL_LONG,
+        "v",
+        qm::COL_LONG,
         qm::fixed_column_bytes(3, pack_le<int64_t>({30, 40, 50}))};
     qm::Script s = {
         qm::ActionSendServerInfo{},
         qm::ActionAwaitQueryRequest{},
-        qm::ActionSendBuilt{[c0](int64_t rid)
-                            { return qm::result_batch_frame(rid, 0, 2, {c0}); }},
-        qm::ActionSendBuilt{[c1](int64_t rid)
-                            { return qm::result_batch_frame(rid, 1, 3, {c1}); }},
+        qm::ActionSendBuilt{[c0](int64_t rid) {
+            return qm::result_batch_frame(rid, 0, 2, {c0});
+        }},
+        qm::ActionSendBuilt{[c1](int64_t rid) {
+            return qm::result_batch_frame(rid, 1, 3, {c1});
+        }},
         qm::ActionSendResultEnd{},
     };
     qm::MockServer srv({s});
@@ -2817,7 +2996,8 @@ TEST_CASE("mock: continuation batch decodes against the batch-0 schema")
     CHECK_FALSE(cur.next_batch());
 }
 
-TEST_CASE("mock: protocol_error — continuation batch before schema-bearing batch 0")
+TEST_CASE(
+    "mock: protocol_error — continuation batch before schema-bearing batch 0")
 {
     // A query whose *first* frame is a continuation (batch_seq > 0) has
     // no schema to bind rows to and must surface a protocol error
@@ -2827,9 +3007,9 @@ TEST_CASE("mock: protocol_error — continuation batch before schema-bearing bat
     qm::Script s = {
         qm::ActionSendServerInfo{},
         qm::ActionAwaitQueryRequest{},
-        qm::ActionSendBuilt{[c](int64_t rid)
-                            { return qm::result_batch_frame(
-                                  rid, /*batch_seq=*/1, 1, {c}); }},
+        qm::ActionSendBuilt{[c](int64_t rid) {
+            return qm::result_batch_frame(rid, /*batch_seq=*/1, 1, {c});
+        }},
         qm::ActionSendResultEnd{},
     };
     run_malformed_batch(s);
@@ -2865,12 +3045,16 @@ TEST_CASE("mock: SERVER_INFO zone trailer presence must match CAP_ZONE")
 {
     CHECK_THROWS_AS(
         (qm::server_info_frame(
-            qm::ROLE_PRIMARY, "c", "n", 0, 0, 0,
+            qm::ROLE_PRIMARY,
+            "c",
+            "n",
+            0,
+            0,
+            0,
             std::optional<std::string>{"zone-A"})),
         std::invalid_argument);
     CHECK_THROWS_AS(
-        (qm::server_info_frame(
-            qm::ROLE_PRIMARY, "c", "n", 0, qm::CAP_ZONE, 0)),
+        (qm::server_info_frame(qm::ROLE_PRIMARY, "c", "n", 0, qm::CAP_ZONE, 0)),
         std::invalid_argument);
 }
 
@@ -2881,7 +3065,8 @@ TEST_CASE("mock: SERVER_INFO zone trailer presence must match CAP_ZONE")
 // UB across a C frame — so it leaks the old reader (with a stderr
 // diagnostic) and adopts the source, rather than throwing or freeing under
 // the cursor. The cursor stays valid against the leaked reader.
-TEST_CASE("mock: reader move-assign over a live cursor leaks safely without throwing")
+TEST_CASE(
+    "mock: reader move-assign over a live cursor leaks safely without throwing")
 {
     qm::Script s_a = {
         qm::ActionSendServerInfo{},
@@ -2969,8 +3154,7 @@ TEST_CASE("mock: reader metadata getters reject while a cursor is live")
     {
         auto cur = reader.execute("select 1"_utf8);
 
-        const auto expect_live_cursor_error = [](auto&& fn)
-        {
+        const auto expect_live_cursor_error = [](auto&& fn) {
             bool threw = false;
             try
             {
@@ -2980,15 +3164,15 @@ TEST_CASE("mock: reader metadata getters reject while a cursor is live")
             {
                 threw = true;
                 CHECK(e.code() == questdb_error_invalid_api_call);
-                CHECK(std::string{e.what()}.find("cursor") !=
-                      std::string::npos);
+                CHECK(
+                    std::string{e.what()}.find("cursor") != std::string::npos);
             }
             CHECK(threw);
         };
-        expect_live_cursor_error([&]{ (void)reader.server_version(); });
-        expect_live_cursor_error([&]{ (void)reader.server_info(); });
-        expect_live_cursor_error([&]{ (void)reader.current_host(); });
-        expect_live_cursor_error([&]{ (void)reader.current_port(); });
+        expect_live_cursor_error([&] { (void)reader.server_version(); });
+        expect_live_cursor_error([&] { (void)reader.server_info(); });
+        expect_live_cursor_error([&] { (void)reader.current_host(); });
+        expect_live_cursor_error([&] { (void)reader.current_port(); });
 
         // The cursor handle owns the borrow — its mirror getters are the
         // sound path for the same metadata.
@@ -3030,8 +3214,7 @@ TEST_CASE("mock: reader metadata getters reject while a cursor is live")
 // frame is sent.
 // ---------------------------------------------------------------------------
 
-TEST_CASE(
-    "mock: every supported bind variant marshals through the FFI ABI")
+TEST_CASE("mock: every supported bind variant marshals through the FFI ABI")
 {
     qm::Script s = {
         qm::ActionSendServerInfo{},
@@ -3042,63 +3225,73 @@ TEST_CASE(
     auto reader = connect_to(srv);
 
     const std::array<uint8_t, 16> kUuid = {
-        0xA0, 0xA1, 0xA2, 0xA3, 0xA4, 0xA5, 0xA6, 0xA7,
-        0xA8, 0xA9, 0xAA, 0xAB, 0xAC, 0xAD, 0xAE, 0xAF,
+        0xA0,
+        0xA1,
+        0xA2,
+        0xA3,
+        0xA4,
+        0xA5,
+        0xA6,
+        0xA7,
+        0xA8,
+        0xA9,
+        0xAA,
+        0xAB,
+        0xAC,
+        0xAD,
+        0xAE,
+        0xAF,
     };
     const std::array<uint8_t, 32> kLong256 = {
-        0x80, 0x81, 0x82, 0x83, 0x84, 0x85, 0x86, 0x87,
-        0x88, 0x89, 0x8A, 0x8B, 0x8C, 0x8D, 0x8E, 0x8F,
-        0x90, 0x91, 0x92, 0x93, 0x94, 0x95, 0x96, 0x97,
-        0x98, 0x99, 0x9A, 0x9B, 0x9C, 0x9D, 0x9E, 0x9F,
+        0x80, 0x81, 0x82, 0x83, 0x84, 0x85, 0x86, 0x87, 0x88, 0x89, 0x8A,
+        0x8B, 0x8C, 0x8D, 0x8E, 0x8F, 0x90, 0x91, 0x92, 0x93, 0x94, 0x95,
+        0x96, 0x97, 0x98, 0x99, 0x9A, 0x9B, 0x9C, 0x9D, 0x9E, 0x9F,
     };
     const std::array<uint8_t, 32> kDecimal256 = {
-        0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07,
-        0x08, 0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E, 0x0F,
-        0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17,
-        0x18, 0x19, 0x1A, 0x1B, 0x1C, 0x1D, 0x1E, 0x1F,
+        0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0A,
+        0x0B, 0x0C, 0x0D, 0x0E, 0x0F, 0x10, 0x11, 0x12, 0x13, 0x14, 0x15,
+        0x16, 0x17, 0x18, 0x19, 0x1A, 0x1B, 0x1C, 0x1D, 0x1E, 0x1F,
     };
 
-    auto cur = reader.prepare("X"_utf8)
-                   .bind_bool(true)
-                   .bind_i8(static_cast<int8_t>(-13))
-                   .bind_i16(static_cast<int16_t>(0x1234))
-                   .bind_i32(static_cast<int32_t>(0x01020304))
-                   .bind_i64(static_cast<int64_t>(0x0102030405060708LL))
-                   .bind_f32(1.0f)
-                   .bind_f64(1.0)
-                   .bind_timestamp_micros(
-                       static_cast<int64_t>(0x1100AABBCCDDEEFFLL))
-                   .bind_timestamp_nanos(
-                       static_cast<int64_t>(0x2200AABBCCDDEEFFLL))
-                   .bind_date_millis(
-                       static_cast<int64_t>(0x3300AABBCCDDEEFFLL))
-                   .bind_uuid(kUuid)
-                   .bind_long256(kLong256)
-                   .bind_char(static_cast<uint16_t>(0xCAFE))
-                   .bind_decimal64(
-                       static_cast<int64_t>(0x4400AABBCCDDEEFFLL),
-                       static_cast<int8_t>(5))
-                   // `mantissa_lo` is u64 (low limb), `mantissa_hi` is i64
-                   // (sign-extends into the i128). The wire form is the
-                   // i128 in little-endian, so the captured bytes are
-                   // `lo_le` followed by `hi_le`.
-                   .bind_decimal128(
-                       static_cast<uint64_t>(0x1122334455667788ULL),
-                       static_cast<int64_t>(0x6655443322110000LL),
-                       static_cast<int8_t>(7))
-                   .bind_decimal256(kDecimal256, static_cast<int8_t>(9))
-                   .bind_geohash(
-                       static_cast<uint64_t>(0x1F),
-                       static_cast<uint8_t>(5))
-                   .bind_varchar("hello"_utf8)
-                   .bind_null(::questdb::egress::column_kind::int_)
-                   .bind_null_varchar()
-                   .bind_null_decimal64(static_cast<int8_t>(3))
-                   .bind_null_decimal128(static_cast<int8_t>(11))
-                   .bind_null_decimal256(static_cast<int8_t>(13))
-                   .bind_null_geohash(static_cast<uint8_t>(7))
-                   .execute();
-    while (cur.next_batch()) {}
+    auto cur =
+        reader.prepare("X"_utf8)
+            .bind_bool(true)
+            .bind_i8(static_cast<int8_t>(-13))
+            .bind_i16(static_cast<int16_t>(0x1234))
+            .bind_i32(static_cast<int32_t>(0x01020304))
+            .bind_i64(static_cast<int64_t>(0x0102030405060708LL))
+            .bind_f32(1.0f)
+            .bind_f64(1.0)
+            .bind_timestamp_micros(static_cast<int64_t>(0x1100AABBCCDDEEFFLL))
+            .bind_timestamp_nanos(static_cast<int64_t>(0x2200AABBCCDDEEFFLL))
+            .bind_date_millis(static_cast<int64_t>(0x3300AABBCCDDEEFFLL))
+            .bind_uuid(kUuid)
+            .bind_long256(kLong256)
+            .bind_char(static_cast<uint16_t>(0xCAFE))
+            .bind_decimal64(
+                static_cast<int64_t>(0x4400AABBCCDDEEFFLL),
+                static_cast<int8_t>(5))
+            // `mantissa_lo` is u64 (low limb), `mantissa_hi` is i64
+            // (sign-extends into the i128). The wire form is the
+            // i128 in little-endian, so the captured bytes are
+            // `lo_le` followed by `hi_le`.
+            .bind_decimal128(
+                static_cast<uint64_t>(0x1122334455667788ULL),
+                static_cast<int64_t>(0x6655443322110000LL),
+                static_cast<int8_t>(7))
+            .bind_decimal256(kDecimal256, static_cast<int8_t>(9))
+            .bind_geohash(static_cast<uint64_t>(0x1F), static_cast<uint8_t>(5))
+            .bind_varchar("hello"_utf8)
+            .bind_null(::questdb::egress::column_kind::int_)
+            .bind_null_varchar()
+            .bind_null_decimal64(static_cast<int8_t>(3))
+            .bind_null_decimal128(static_cast<int8_t>(11))
+            .bind_null_decimal256(static_cast<int8_t>(13))
+            .bind_null_geohash(static_cast<uint8_t>(7))
+            .execute();
+    while (cur.next_batch())
+    {
+    }
 
     auto reqs = srv.captured_requests();
     REQUIRE(reqs.size() == 1);
@@ -3109,7 +3302,8 @@ TEST_CASE(
     // post-preamble offset.
     std::vector<uint8_t> exp;
     auto put = [&](std::initializer_list<uint8_t> bs) {
-        for (auto b : bs) exp.push_back(b);
+        for (auto b : bs)
+            exp.push_back(b);
     };
     auto put_bytes = [&](const uint8_t* p, size_t n) {
         exp.insert(exp.end(), p, p + n);
@@ -3138,43 +3332,53 @@ TEST_CASE(
     };
 
     // Type codes mirror `ColumnKind::as_u8` in `column_kind.rs`.
-    constexpr uint8_t kBool = 0x01, kByte = 0x02, kShort = 0x03,
-                      kInt = 0x04, kLong = 0x05, kFloat = 0x06,
-                      kDouble = 0x07, kTimestamp = 0x0A, kDate = 0x0B,
-                      kUuidKind = 0x0C, kLong256Kind = 0x0D,
-                      kGeohash = 0x0E, kVarchar = 0x0F,
+    constexpr uint8_t kBool = 0x01, kByte = 0x02, kShort = 0x03, kInt = 0x04,
+                      kLong = 0x05, kFloat = 0x06, kDouble = 0x07,
+                      kTimestamp = 0x0A, kDate = 0x0B, kUuidKind = 0x0C,
+                      kLong256Kind = 0x0D, kGeohash = 0x0E, kVarchar = 0x0F,
                       kTimestampNanos = 0x10, kDecimal64 = 0x13,
-                      kDecimal128 = 0x14, kDecimal256Kind = 0x15,
-                      kChar = 0x16;
+                      kDecimal128 = 0x14, kDecimal256Kind = 0x15, kChar = 0x16;
 
     // 1. bool(true) -> [kBool, 0x00, 0x01]
     put({kBool, 0x00, 0x01});
     // 2. i8(-13)
     put({kByte, 0x00, static_cast<uint8_t>(int8_t(-13))});
     // 3. i16(0x1234)
-    put({kShort, 0x00}); put_u16_le(0x1234);
+    put({kShort, 0x00});
+    put_u16_le(0x1234);
     // 4. i32(0x01020304)
-    put({kInt, 0x00}); put_u32_le(0x01020304U);
+    put({kInt, 0x00});
+    put_u32_le(0x01020304U);
     // 5. i64(0x0102030405060708)
-    put({kLong, 0x00}); put_u64_le(0x0102030405060708ULL);
+    put({kLong, 0x00});
+    put_u64_le(0x0102030405060708ULL);
     // 6. f32(1.0)
-    put({kFloat, 0x00}); put_f32_le(1.0f);
+    put({kFloat, 0x00});
+    put_f32_le(1.0f);
     // 7. f64(1.0)
-    put({kDouble, 0x00}); put_f64_le(1.0);
+    put({kDouble, 0x00});
+    put_f64_le(1.0);
     // 8. timestamp_micros
-    put({kTimestamp, 0x00}); put_u64_le(0x1100AABBCCDDEEFFULL);
+    put({kTimestamp, 0x00});
+    put_u64_le(0x1100AABBCCDDEEFFULL);
     // 9. timestamp_nanos
-    put({kTimestampNanos, 0x00}); put_u64_le(0x2200AABBCCDDEEFFULL);
+    put({kTimestampNanos, 0x00});
+    put_u64_le(0x2200AABBCCDDEEFFULL);
     // 10. date_millis
-    put({kDate, 0x00}); put_u64_le(0x3300AABBCCDDEEFFULL);
+    put({kDate, 0x00});
+    put_u64_le(0x3300AABBCCDDEEFFULL);
     // 11. uuid (16 raw bytes, verbatim)
-    put({kUuidKind, 0x00}); put_bytes(kUuid.data(), kUuid.size());
+    put({kUuidKind, 0x00});
+    put_bytes(kUuid.data(), kUuid.size());
     // 12. long256 (32 raw bytes, verbatim)
-    put({kLong256Kind, 0x00}); put_bytes(kLong256.data(), kLong256.size());
+    put({kLong256Kind, 0x00});
+    put_bytes(kLong256.data(), kLong256.size());
     // 13. char(0xCAFE) - u16 LE
-    put({kChar, 0x00}); put_u16_le(0xCAFE);
+    put({kChar, 0x00});
+    put_u16_le(0xCAFE);
     // 14. decimal64(value, scale=5): [type, 0x00, scale, ...8 LE...]
-    put({kDecimal64, 0x00, 0x05}); put_u64_le(0x4400AABBCCDDEEFFULL);
+    put({kDecimal64, 0x00, 0x05});
+    put_u64_le(0x4400AABBCCDDEEFFULL);
     // 15. decimal128(lo, hi, scale=7): [type, 0x00, scale, lo_le(8), hi_le(8)]
     put({kDecimal128, 0x00, 0x07});
     put_u64_le(0x1122334455667788ULL);
@@ -3184,7 +3388,8 @@ TEST_CASE(
     put_bytes(kDecimal256.data(), kDecimal256.size());
     // 17. geohash(0x1F, prec=5): [type, 0x00, varint(5), ceil(5/8)=1 byte LE]
     put({kGeohash, 0x00, 0x05, 0x1F});
-    // 18. varchar("hello"): [type, 0x00, u32_le(0), u32_le(5), 'h','e','l','l','o']
+    // 18. varchar("hello"): [type, 0x00, u32_le(0), u32_le(5),
+    // 'h','e','l','l','o']
     put({kVarchar, 0x00});
     put_u32_le(0);
     put_u32_le(5);
@@ -3208,16 +3413,17 @@ TEST_CASE(
     REQUIRE(req.size() == kPreambleLen + exp.size());
     CHECK(req[0] == qm::MSG_QUERY_REQUEST);
     // req[1..9] is the request_id (i64 LE); non-deterministic, skip.
-    CHECK(req[9] == 0x01);           // sql_len varint
-    CHECK(req[10] == 'X');           // sql byte
-    CHECK(req[11] == 0x00);          // initial_credit varint
-    CHECK(req[12] == kBindCount);    // bind_count varint
+    CHECK(req[9] == 0x01);        // sql_len varint
+    CHECK(req[10] == 'X');        // sql byte
+    CHECK(req[11] == 0x00);       // initial_credit varint
+    CHECK(req[12] == kBindCount); // bind_count varint
 
     for (size_t i = 0; i < exp.size(); ++i)
     {
         // Per-byte CHECK so a diff localises to the failing bind.
-        CHECK_MESSAGE(req[kPreambleLen + i] == exp[i],
-                      "bind payload mismatch at byte " << i);
+        CHECK_MESSAGE(
+            req[kPreambleLen + i] == exp[i],
+            "bind payload mismatch at byte " << i);
     }
 }
 
@@ -3260,7 +3466,8 @@ TEST_CASE(
     // observe motion in `bytes_received`.
     constexpr int kBatches = 32;
     qm::ColumnSpec col{
-        "v", qm::COL_INT,
+        "v",
+        qm::COL_INT,
         qm::fixed_column_bytes(4, pack_le<int32_t>({1, 2, 3, 4}))};
     // `emplace_back` (not `push_back`) forwards the alternative directly
     // to `qm::Action`'s converting variant constructor, constructing in
@@ -3277,10 +3484,10 @@ TEST_CASE(
     s.emplace_back(qm::ActionAwaitQueryRequest{});
     for (int i = 0; i < kBatches; ++i)
     {
-        s.emplace_back(qm::ActionSendBuilt{
-            [col, i](int64_t rid)
-            { return qm::result_batch_frame(
-                  rid, static_cast<uint64_t>(i), 4, {col}); }});
+        s.emplace_back(qm::ActionSendBuilt{[col, i](int64_t rid) {
+            return qm::result_batch_frame(
+                rid, static_cast<uint64_t>(i), 4, {col});
+        }});
     }
     s.emplace_back(qm::ActionSendResultEnd{});
 
@@ -3296,25 +3503,23 @@ TEST_CASE(
     // `Arc<ReaderStats>` field — no overlapping non-atomic accesses,
     // so the C++ object model permits concurrent const + non-const
     // method calls on this specific reader.
-    std::thread worker(
-        [&reader, &done, &worker_err]()
+    std::thread worker([&reader, &done, &worker_err]() {
+        try
         {
-            try
+            auto cur = reader.execute("select v"_utf8);
+            // Drain every batch + the terminal RESULT_END.
+            while (cur.next_batch())
             {
-                auto cur = reader.execute("select v"_utf8);
-                // Drain every batch + the terminal RESULT_END.
-                while (cur.next_batch())
-                {
-                }
             }
-            catch (...)
-            {
-                // doctest macros are reserved for the main thread;
-                // surface the failure by rethrowing post-join.
-                worker_err = std::current_exception();
-            }
-            done.store(true, std::memory_order_release);
-        });
+        }
+        catch (...)
+        {
+            // doctest macros are reserved for the main thread;
+            // surface the failure by rethrowing post-join.
+            worker_err = std::current_exception();
+        }
+        done.store(true, std::memory_order_release);
+    });
 
     uint64_t last_bytes = 0;
     uint64_t max_observed_bytes = 0;
@@ -3364,7 +3569,8 @@ TEST_CASE(
 }
 
 TEST_CASE(
-    "mock: query and cursor migrate across threads with callbacks and destruction")
+    "mock: query and cursor migrate across threads with callbacks and "
+    "destruction")
 {
     qm::Script s_a = {
         qm::ActionSendServerInfo{qm::ROLE_STANDALONE, "c", "a"},
@@ -3418,16 +3624,13 @@ TEST_CASE(
     auto progress_payload = std::make_shared<ProgressCallbackPayload>();
     progress_payload->record = record;
     auto query = reader.prepare("select 1"_utf8);
-    query.on_failover_reset(
-        [reset_payload](const eg::failover_reset_event_view&)
-        {
-            std::lock_guard<std::mutex> guard{reset_payload->record->mutex};
-            reset_payload->record->reset_callback_on =
-                std::this_thread::get_id();
-        });
+    query.on_failover_reset([reset_payload](
+                                const eg::failover_reset_event_view&) {
+        std::lock_guard<std::mutex> guard{reset_payload->record->mutex};
+        reset_payload->record->reset_callback_on = std::this_thread::get_id();
+    });
     query.on_failover_progress(
-        [progress_payload](const eg::failover_progress_event_view&)
-        {
+        [progress_payload](const eg::failover_progress_event_view&) {
             std::lock_guard<std::mutex> guard{progress_payload->record->mutex};
             progress_payload->record->progress_callback_on =
                 std::this_thread::get_id();
@@ -3441,22 +3644,20 @@ TEST_CASE(
     std::optional<eg::cursor> cursor;
     std::thread::id execute_thread;
     std::exception_ptr execute_error;
-    std::thread execute_worker(
-        [query = std::move(query),
-         &cursor,
-         &execute_thread,
-         &execute_error]() mutable
+    std::thread execute_worker([query = std::move(query),
+                                &cursor,
+                                &execute_thread,
+                                &execute_error]() mutable {
+        execute_thread = std::this_thread::get_id();
+        try
         {
-            execute_thread = std::this_thread::get_id();
-            try
-            {
-                cursor.emplace(query.execute());
-            }
-            catch (...)
-            {
-                execute_error = std::current_exception();
-            }
-        });
+            cursor.emplace(query.execute());
+        }
+        catch (...)
+        {
+            execute_error = std::current_exception();
+        }
+    });
     execute_worker.join();
     if (execute_error)
         std::rethrow_exception(execute_error);
@@ -3467,24 +3668,22 @@ TEST_CASE(
     cursor.reset();
     std::thread::id drive_thread;
     std::exception_ptr drive_error;
-    std::thread drive_worker(
-        [cursor = std::move(migrated_cursor),
-         &drive_thread,
-         &drive_error]() mutable
+    std::thread drive_worker([cursor = std::move(migrated_cursor),
+                              &drive_thread,
+                              &drive_error]() mutable {
+        drive_thread = std::this_thread::get_id();
+        try
         {
-            drive_thread = std::this_thread::get_id();
-            try
+            while (cursor.next_batch())
             {
-                while (cursor.next_batch())
-                {
-                }
             }
-            catch (...)
-            {
-                drive_error = std::current_exception();
-            }
-            // `cursor` and its heap-stored callbacks are destroyed here.
-        });
+        }
+        catch (...)
+        {
+            drive_error = std::current_exception();
+        }
+        // `cursor` and its heap-stored callbacks are destroyed here.
+    });
     drive_worker.join();
     if (drive_error)
         std::rethrow_exception(drive_error);
@@ -3508,7 +3707,9 @@ TEST_CASE(
 // Rust mock can't drive (no synthetic RESULT_BATCH helper).
 // ---------------------------------------------------------------------------
 
-TEST_CASE("mock: progress callback observes Disconnected -> Retrying -> Reset on successful failover")
+TEST_CASE(
+    "mock: progress callback observes Disconnected -> Retrying -> Reset on "
+    "successful failover")
 {
     qm::Script s_a = {
         qm::ActionSendServerInfo{qm::ROLE_STANDALONE, "c", "a"},
@@ -3544,39 +3745,40 @@ TEST_CASE("mock: progress callback observes Disconnected -> Retrying -> Reset on
     };
     auto events = std::make_shared<std::vector<Capture>>();
 
-    auto cur = reader.prepare("select 1"_utf8)
-                   .on_failover_progress(
-                       [events](const questdb::egress::failover_progress_event_view& ev)
-                       {
-                           const auto server_info = ev.server_info();
-                           events->push_back({
-                               ev.phase(),
-                               ev.attempt(),
-                               std::string(ev.failed_host()),
-                               ev.failed_port(),
-                               std::string(ev.new_host()),
-                               ev.new_port(),
-                               ev.new_request_id(),
-                               ev.final_error_code().has_value(),
-                               static_cast<bool>(server_info),
-                               server_info.role(),
-                               server_info.snapshot().has_value(),
-                           });
-                       })
-                   .execute();
+    auto cur =
+        reader.prepare("select 1"_utf8)
+            .on_failover_progress(
+                [events](
+                    const questdb::egress::failover_progress_event_view& ev) {
+                    const auto server_info = ev.server_info();
+                    events->push_back({
+                        ev.phase(),
+                        ev.attempt(),
+                        std::string(ev.failed_host()),
+                        ev.failed_port(),
+                        std::string(ev.new_host()),
+                        ev.new_port(),
+                        ev.new_request_id(),
+                        ev.final_error_code().has_value(),
+                        static_cast<bool>(server_info),
+                        server_info.role(),
+                        server_info.snapshot().has_value(),
+                    });
+                })
+            .execute();
     CHECK_FALSE(cur.next_batch());
     CHECK(cur.failover_resets() == 1);
 
     REQUIRE(events->size() >= 3);
     // First event: Disconnected with attempt=0, no new_addr.
-    CHECK(events->front().phase == questdb::egress::failover_phase::disconnected);
+    CHECK(
+        events->front().phase == questdb::egress::failover_phase::disconnected);
     CHECK(events->front().attempt == 0);
     CHECK(events->front().new_port == 0);
     CHECK_FALSE(events->front().new_request_id.has_value());
     CHECK_FALSE(events->front().has_final_error);
     CHECK_FALSE(events->front().server_info_present);
-    CHECK(events->front().server_role ==
-          questdb::egress::server_role::other);
+    CHECK(events->front().server_role == questdb::egress::server_role::other);
     CHECK_FALSE(events->front().snapshot_present);
 
     // At least one Retrying event with attempt >= 1.
@@ -3619,7 +3821,9 @@ TEST_CASE("mock: progress callback observes Disconnected -> Retrying -> Reset on
     }
 }
 
-TEST_CASE("mock: progress callback fires GaveUp with final_error on budget exhaustion")
+TEST_CASE(
+    "mock: progress callback fires GaveUp with final_error on budget "
+    "exhaustion")
 {
     qm::Script s_initial = {
         qm::ActionSendServerInfo{qm::ROLE_STANDALONE, "c", "lonely"},
@@ -3629,7 +3833,8 @@ TEST_CASE("mock: progress callback fires GaveUp with final_error on budget exhau
     qm::Script s_dead = {qm::ActionHardDrop{}};
     qm::MockServer srv({s_initial, s_dead});
 
-    const std::string conf = "ws::addr=" + srv.addr() +
+    const std::string conf =
+        "ws::addr=" + srv.addr() +
         ";failover_max_attempts=3;failover_backoff_initial_ms=1;"
         "failover_backoff_max_ms=2";
     questdb::egress::reader reader{questdb::ingress::utf8_view{conf}};
@@ -3644,27 +3849,28 @@ TEST_CASE("mock: progress callback fires GaveUp with final_error on budget exhau
     };
     auto cap = std::make_shared<GaveUp>();
 
-    auto cur = reader.prepare("select 1"_utf8)
-                   .on_failover_progress(
-                       [cap](const questdb::egress::failover_progress_event_view& ev)
-                       {
-                           if (ev.phase() ==
-                               questdb::egress::failover_phase::gave_up)
-                           {
-                               cap->fired = true;
-                               cap->attempt = ev.attempt();
-                               if (auto c = ev.final_error_code())
-                                   cap->final_code =
-                                       static_cast<questdb_error_code>(*c);
-                               cap->final_msg = std::string(ev.final_error_msg());
-                               cap->elapsed_ns = ev.elapsed_ns();
-                           }
-                       })
-                   .execute();
+    auto cur =
+        reader.prepare("select 1"_utf8)
+            .on_failover_progress(
+                [cap](const questdb::egress::failover_progress_event_view& ev) {
+                    if (ev.phase() == questdb::egress::failover_phase::gave_up)
+                    {
+                        cap->fired = true;
+                        cap->attempt = ev.attempt();
+                        if (auto c = ev.final_error_code())
+                            cap->final_code =
+                                static_cast<questdb_error_code>(*c);
+                        cap->final_msg = std::string(ev.final_error_msg());
+                        cap->elapsed_ns = ev.elapsed_ns();
+                    }
+                })
+            .execute();
     bool threw = false;
     try
     {
-        while (cur.next_batch()) {}
+        while (cur.next_batch())
+        {
+        }
     }
     catch (const questdb::error&)
     {
@@ -3675,13 +3881,16 @@ TEST_CASE("mock: progress callback fires GaveUp with final_error on budget exhau
     CHECK(cap->fired);
     CHECK(cap->attempt >= 1);
     REQUIRE(cap->final_code.has_value());
-    CHECK((*cap->final_code == questdb_error_socket_error ||
-           *cap->final_code == questdb_error_protocol_error));
+    CHECK(
+        (*cap->final_code == questdb_error_socket_error ||
+         *cap->final_code == questdb_error_protocol_error));
     CHECK_FALSE(cap->final_msg.empty());
     CHECK(cap->elapsed_ns > 0);
 }
 
-TEST_CASE("mock: progress callback alone does not authorize replay-after-data-delivered")
+TEST_CASE(
+    "mock: progress callback alone does not authorize "
+    "replay-after-data-delivered")
 {
     // The Rust mock has no helper to emit a synthetic RESULT_BATCH; the
     // C++ mock does. This pins the distinction between telemetry and the
@@ -3691,8 +3900,9 @@ TEST_CASE("mock: progress callback alone does not authorize replay-after-data-de
     qm::Script s_a = {
         qm::ActionSendServerInfo{qm::ROLE_STANDALONE, "c", "a"},
         qm::ActionAwaitQueryRequest{},
-        qm::ActionSendBuilt{[col](int64_t rid)
-                            { return qm::result_batch_frame(rid, 0, 1, {col}); }},
+        qm::ActionSendBuilt{[col](int64_t rid) {
+            return qm::result_batch_frame(rid, 0, 1, {col});
+        }},
         qm::ActionHardDrop{},
     };
     qm::Script s_b = {
@@ -3709,18 +3919,17 @@ TEST_CASE("mock: progress callback alone does not authorize replay-after-data-de
     questdb::egress::reader reader{questdb::ingress::utf8_view{conf}};
 
     std::atomic<int> reset_phase_count{0};
-    auto cur = reader.prepare("select v"_utf8)
-                   .on_failover_progress(
-                       [&reset_phase_count](
-                           const questdb::egress::failover_progress_event_view& ev)
-                       {
-                           if (ev.phase() ==
-                               questdb::egress::failover_phase::reset)
-                           {
-                               reset_phase_count.fetch_add(1);
-                           }
-                       })
-                   .execute();
+    auto cur =
+        reader.prepare("select v"_utf8)
+            .on_failover_progress(
+                [&reset_phase_count](
+                    const questdb::egress::failover_progress_event_view& ev) {
+                    if (ev.phase() == questdb::egress::failover_phase::reset)
+                    {
+                        reset_phase_count.fetch_add(1);
+                    }
+                })
+            .execute();
     // First batch lands cleanly on A.
     REQUIRE(cur.next_batch());
     // The progress callback observes lifecycle events but cannot discard the
@@ -3740,7 +3949,8 @@ TEST_CASE("mock: progress callback alone does not authorize replay-after-data-de
     CHECK(reset_phase_count.load() == 0);
 }
 
-TEST_CASE("mock: progress callback noexcept trampoline swallows user exceptions")
+TEST_CASE(
+    "mock: progress callback noexcept trampoline swallows user exceptions")
 {
     qm::Script s_a = {
         qm::ActionSendServerInfo{qm::ROLE_STANDALONE, "c", "a"},
@@ -3763,11 +3973,13 @@ TEST_CASE("mock: progress callback noexcept trampoline swallows user exceptions"
     // Throwing from inside the callback would unwind into the Rust FFI
     // frame and abort the process if the trampoline didn't swallow it.
     // Asserting we reach the post-execute code proves the swallow ran.
-    auto cur = reader.prepare("select 1"_utf8)
-                   .on_failover_progress(
-                       [](const questdb::egress::failover_progress_event_view&)
-                       { throw std::runtime_error("boom"); })
-                   .execute();
+    auto cur =
+        reader.prepare("select 1"_utf8)
+            .on_failover_progress(
+                [](const questdb::egress::failover_progress_event_view&) {
+                    throw std::runtime_error("boom");
+                })
+            .execute();
     CHECK_FALSE(cur.next_batch());
     CHECK(cur.failover_resets() == 1);
 }
@@ -3843,13 +4055,15 @@ TEST_CASE(
 TEST_CASE("mock: batch::column<int32_t> dense values match get_i32 per cell")
 {
     qm::ColumnSpec c{
-        "v", qm::COL_INT,
+        "v",
+        qm::COL_INT,
         qm::fixed_column_bytes(4, pack_le<int32_t>({-1, 0, 42, 2147483647}))};
     qm::Script s = {
         qm::ActionSendServerInfo{},
         qm::ActionAwaitQueryRequest{},
-        qm::ActionSendBuilt{[c](int64_t rid)
-                            { return qm::result_batch_frame(rid, 0, 4, {c}); }},
+        qm::ActionSendBuilt{[c](int64_t rid) {
+            return qm::result_batch_frame(rid, 0, 4, {c});
+        }},
         qm::ActionSendResultEnd{},
     };
     qm::MockServer srv({s});
@@ -3876,7 +4090,8 @@ TEST_CASE("mock: batch::column<int32_t> dense values match get_i32 per cell")
         CHECK(load_le(values + r) == batch.column(0).get<int32_t>(r).value());
 }
 
-TEST_CASE("mock: batch::column<varchar> offsets/data match get_varchar per cell")
+TEST_CASE(
+    "mock: batch::column<varchar> offsets/data match get_varchar per cell")
 {
     std::string a = "alpha";
     std::string bb = "beta-beta";
@@ -3893,17 +4108,20 @@ TEST_CASE("mock: batch::column<varchar> offsets/data match get_varchar per cell"
         for (int i = 0; i < 4; ++i)
             body.push_back(static_cast<uint8_t>(o >> (i * 8)));
     }
-    for (char ch : a) body.push_back(static_cast<uint8_t>(ch));
-    for (char ch : bb) body.push_back(static_cast<uint8_t>(ch));
-    for (char ch : c) body.push_back(static_cast<uint8_t>(ch));
+    for (char ch : a)
+        body.push_back(static_cast<uint8_t>(ch));
+    for (char ch : bb)
+        body.push_back(static_cast<uint8_t>(ch));
+    for (char ch : c)
+        body.push_back(static_cast<uint8_t>(ch));
 
     qm::ColumnSpec col_spec{"s", qm::COL_VARCHAR, std::move(body)};
     qm::Script s = {
         qm::ActionSendServerInfo{},
         qm::ActionAwaitQueryRequest{},
-        qm::ActionSendBuilt{
-            [col_spec](int64_t rid)
-            { return qm::result_batch_frame(rid, 0, 3, {col_spec}); }},
+        qm::ActionSendBuilt{[col_spec](int64_t rid) {
+            return qm::result_batch_frame(rid, 0, 3, {col_spec});
+        }},
         qm::ActionSendResultEnd{},
     };
     qm::MockServer srv({s});
@@ -3936,7 +4154,8 @@ TEST_CASE("mock: batch::column INT validity bitmap matches is_null per cell")
     // INT can, so use it to exercise the validity-bitmap path. 4 rows,
     // rows 1 and 3 NULL.
     qm::ColumnSpec c{
-        "v", qm::COL_INT,
+        "v",
+        qm::COL_INT,
         qm::fixed_column_bytes_nullable(
             /*row_count=*/4,
             /*is_null=*/std::vector<bool>{false, true, false, true},
@@ -3946,8 +4165,9 @@ TEST_CASE("mock: batch::column INT validity bitmap matches is_null per cell")
     qm::Script s = {
         qm::ActionSendServerInfo{},
         qm::ActionAwaitQueryRequest{},
-        qm::ActionSendBuilt{[c](int64_t rid)
-                            { return qm::result_batch_frame(rid, 0, 4, {c}); }},
+        qm::ActionSendBuilt{[c](int64_t rid) {
+            return qm::result_batch_frame(rid, 0, 4, {c});
+        }},
         qm::ActionSendResultEnd{},
     };
     qm::MockServer srv({s});
@@ -3981,61 +4201,122 @@ TEST_CASE("mock: batch::column — every fixed-width scalar kind round-trip")
     using qm::ColumnSpec;
     using qm::fixed_column_bytes;
 
-    const std::array<uint8_t, 16> u0{{0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07,
-                                       0x08, 0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E,
-                                       0x0F, 0x10}};
-    const std::array<uint8_t, 16> u1{{0xFF, 0xFE, 0xFD, 0xFC, 0xFB, 0xFA, 0xF9,
-                                       0xF8, 0xF7, 0xF6, 0xF5, 0xF4, 0xF3, 0xF2,
-                                       0xF1, 0xF0}};
+    const std::array<uint8_t, 16> u0{
+        {0x01,
+         0x02,
+         0x03,
+         0x04,
+         0x05,
+         0x06,
+         0x07,
+         0x08,
+         0x09,
+         0x0A,
+         0x0B,
+         0x0C,
+         0x0D,
+         0x0E,
+         0x0F,
+         0x10}};
+    const std::array<uint8_t, 16> u1{
+        {0xFF,
+         0xFE,
+         0xFD,
+         0xFC,
+         0xFB,
+         0xFA,
+         0xF9,
+         0xF8,
+         0xF7,
+         0xF6,
+         0xF5,
+         0xF4,
+         0xF3,
+         0xF2,
+         0xF1,
+         0xF0}};
     std::vector<uint8_t> uuid_bytes;
     uuid_bytes.insert(uuid_bytes.end(), u0.begin(), u0.end());
     uuid_bytes.insert(uuid_bytes.end(), u1.begin(), u1.end());
 
     std::vector<uint8_t> long256_bytes(64, 0);
-    for (size_t i = 0; i < 32; ++i) long256_bytes[i] = static_cast<uint8_t>(i);
-    for (size_t i = 0; i < 32; ++i) long256_bytes[32 + i] = static_cast<uint8_t>(0x80 + i);
+    for (size_t i = 0; i < 32; ++i)
+        long256_bytes[i] = static_cast<uint8_t>(i);
+    for (size_t i = 0; i < 32; ++i)
+        long256_bytes[32 + i] = static_cast<uint8_t>(0x80 + i);
 
     // BOOLEAN: validity (1B: none) + bit-packed values (2 rows -> 1 byte).
     std::vector<uint8_t> bool_body{0x00, 0b00000010}; // row0=false, row1=true
     ColumnSpec c_bool{"b", qm::COL_BOOLEAN, std::move(bool_body)};
-    ColumnSpec c_byte{"by", qm::COL_BYTE,
-                      fixed_column_bytes(2, pack_le<int8_t>({-1, 42}))};
-    ColumnSpec c_short{"sh", qm::COL_SHORT,
-                       fixed_column_bytes(2, pack_le<int16_t>({-1234, 31000}))};
-    ColumnSpec c_char{"ch", qm::COL_CHAR,
-                      fixed_column_bytes(2, pack_le<uint16_t>({'A', 0x4E2D}))};
-    ColumnSpec c_int{"i", qm::COL_INT,
-                     fixed_column_bytes(2, pack_le<int32_t>({-7, 2147483647}))};
-    ColumnSpec c_ipv4{"ip", qm::COL_IPV4,
-                      fixed_column_bytes(2, pack_le<uint32_t>({0x7F000001u, 0xC0A80101u}))};
-    ColumnSpec c_long{"l", qm::COL_LONG,
-                      fixed_column_bytes(2, pack_le<int64_t>({-1, 9223372036854775807LL}))};
-    ColumnSpec c_f32{"f", qm::COL_FLOAT,
-                     fixed_column_bytes(2, pack_le<float>({1.25f, -0.5f}))};
-    ColumnSpec c_f64{"d", qm::COL_DOUBLE,
-                     fixed_column_bytes(2, pack_le<double>({1.5, -3.14}))};
-    ColumnSpec c_ts{"ts", qm::COL_TIMESTAMP,
-                    fixed_column_bytes(2, pack_le<int64_t>({1700000000000000LL, 1800000000000000LL}))};
-    ColumnSpec c_date{"dt", qm::COL_DATE,
-                      fixed_column_bytes(2, pack_le<int64_t>({0, 86400000LL}))};
-    ColumnSpec c_tsn{"tn", qm::COL_TIMESTAMP_NANOS,
-                     fixed_column_bytes(2, pack_le<int64_t>({1, 999999999LL}))};
+    ColumnSpec c_byte{
+        "by", qm::COL_BYTE, fixed_column_bytes(2, pack_le<int8_t>({-1, 42}))};
+    ColumnSpec c_short{
+        "sh",
+        qm::COL_SHORT,
+        fixed_column_bytes(2, pack_le<int16_t>({-1234, 31000}))};
+    ColumnSpec c_char{
+        "ch",
+        qm::COL_CHAR,
+        fixed_column_bytes(2, pack_le<uint16_t>({'A', 0x4E2D}))};
+    ColumnSpec c_int{
+        "i",
+        qm::COL_INT,
+        fixed_column_bytes(2, pack_le<int32_t>({-7, 2147483647}))};
+    ColumnSpec c_ipv4{
+        "ip",
+        qm::COL_IPV4,
+        fixed_column_bytes(2, pack_le<uint32_t>({0x7F000001u, 0xC0A80101u}))};
+    ColumnSpec c_long{
+        "l",
+        qm::COL_LONG,
+        fixed_column_bytes(2, pack_le<int64_t>({-1, 9223372036854775807LL}))};
+    ColumnSpec c_f32{
+        "f",
+        qm::COL_FLOAT,
+        fixed_column_bytes(2, pack_le<float>({1.25f, -0.5f}))};
+    ColumnSpec c_f64{
+        "d",
+        qm::COL_DOUBLE,
+        fixed_column_bytes(2, pack_le<double>({1.5, -3.14}))};
+    ColumnSpec c_ts{
+        "ts",
+        qm::COL_TIMESTAMP,
+        fixed_column_bytes(
+            2, pack_le<int64_t>({1700000000000000LL, 1800000000000000LL}))};
+    ColumnSpec c_date{
+        "dt",
+        qm::COL_DATE,
+        fixed_column_bytes(2, pack_le<int64_t>({0, 86400000LL}))};
+    ColumnSpec c_tsn{
+        "tn",
+        qm::COL_TIMESTAMP_NANOS,
+        fixed_column_bytes(2, pack_le<int64_t>({1, 999999999LL}))};
     ColumnSpec c_uuid{"u", qm::COL_UUID, fixed_column_bytes(2, uuid_bytes)};
-    ColumnSpec c_l256{"l256", qm::COL_LONG256,
-                      fixed_column_bytes(2, long256_bytes)};
+    ColumnSpec c_l256{
+        "l256", qm::COL_LONG256, fixed_column_bytes(2, long256_bytes)};
 
-    std::vector<ColumnSpec> cols{c_bool, c_byte, c_short, c_char, c_int,
-                                  c_ipv4, c_long, c_f32, c_f64, c_ts,
-                                  c_date, c_tsn, c_uuid, c_l256};
+    std::vector<ColumnSpec> cols{
+        c_bool,
+        c_byte,
+        c_short,
+        c_char,
+        c_int,
+        c_ipv4,
+        c_long,
+        c_f32,
+        c_f64,
+        c_ts,
+        c_date,
+        c_tsn,
+        c_uuid,
+        c_l256};
 
     qm::Script s = {
         qm::ActionSendServerInfo{},
         qm::ActionAwaitQueryRequest{},
-        qm::ActionSendBuilt{[cols](int64_t rid)
-                            {
-                                return qm::result_batch_frame(
-                                    rid, 0, 2, cols);
-                            }},
+        qm::ActionSendBuilt{[cols](int64_t rid) {
+            return qm::result_batch_frame(rid, 0, 2, cols);
+        }},
         qm::ActionSendResultEnd{},
     };
     qm::MockServer srv({s});
@@ -4153,35 +4434,46 @@ TEST_CASE("mock: batch::column — every fixed-width scalar kind round-trip")
     }
 }
 
-TEST_CASE("mock: batch::column — binary + decimal64/128/256 + geohash bulk vs per-cell")
+TEST_CASE(
+    "mock: batch::column — binary + decimal64/128/256 + geohash bulk vs "
+    "per-cell")
 {
     qm::ColumnSpec c_bin{
-        "bin", qm::COL_BINARY,
-        qm::varlen_column_bytes({{0xDE, 0xAD, 0xBE, 0xEF}, {0x00, 0x01, 0x02}})};
+        "bin",
+        qm::COL_BINARY,
+        qm::varlen_column_bytes(
+            {{0xDE, 0xAD, 0xBE, 0xEF}, {0x00, 0x01, 0x02}})};
 
     qm::ColumnSpec c_dec64{
-        "d64", qm::COL_DECIMAL64,
+        "d64",
+        qm::COL_DECIMAL64,
         qm::decimal64_column_bytes({12345, -67890}, /*scale=*/3)};
 
     // DECIMAL128 is the 16-byte two's-complement little-endian mantissa.
     std::array<uint8_t, 16> dec128_a{};
-    dec128_a[0] = 0x39; dec128_a[1] = 0x30; // 12345 LE
+    dec128_a[0] = 0x39;
+    dec128_a[1] = 0x30; // 12345 LE
     std::array<uint8_t, 16> dec128_b{};
-    for (auto& b : dec128_b) b = 0xFF; // -1 LE
+    for (auto& b : dec128_b)
+        b = 0xFF; // -1 LE
     qm::ColumnSpec c_dec128{
-        "d128", qm::COL_DECIMAL128,
+        "d128",
+        qm::COL_DECIMAL128,
         qm::decimal128_column_bytes({dec128_a, dec128_b}, /*scale=*/0)};
 
     std::array<uint8_t, 32> dec256_a{};
-    dec256_a[0] = 0x39; dec256_a[1] = 0x30;
+    dec256_a[0] = 0x39;
+    dec256_a[1] = 0x30;
     std::array<uint8_t, 32> dec256_b{};
     dec256_b[0] = 0x01;
     qm::ColumnSpec c_dec256{
-        "d256", qm::COL_DECIMAL256,
+        "d256",
+        qm::COL_DECIMAL256,
         qm::decimal256_column_bytes({dec256_a, dec256_b}, /*scale=*/2)};
 
     qm::ColumnSpec c_geo{
-        "g", qm::COL_GEOHASH,
+        "g",
+        qm::COL_GEOHASH,
         qm::geohash_column_bytes(
             std::vector<bool>{false, false},
             std::vector<uint8_t>{0xAB, 0xCD},
@@ -4191,11 +4483,9 @@ TEST_CASE("mock: batch::column — binary + decimal64/128/256 + geohash bulk vs 
         qm::ActionSendServerInfo{},
         qm::ActionAwaitQueryRequest{},
         qm::ActionSendBuilt{
-            [c_bin, c_dec64, c_dec128, c_dec256, c_geo](int64_t rid)
-            {
+            [c_bin, c_dec64, c_dec128, c_dec256, c_geo](int64_t rid) {
                 return qm::result_batch_frame(
-                    rid, 0, 2,
-                    {c_bin, c_dec64, c_dec128, c_dec256, c_geo});
+                    rid, 0, 2, {c_bin, c_dec64, c_dec128, c_dec256, c_geo});
             }},
         qm::ActionSendResultEnd{},
     };
@@ -4276,11 +4566,9 @@ TEST_CASE("mock: batch::column — DOUBLE_ARRAY round-trip")
     qm::Script s = {
         qm::ActionSendServerInfo{},
         qm::ActionAwaitQueryRequest{},
-        qm::ActionSendBuilt{
-            [c_da](int64_t rid)
-            {
-                return qm::result_batch_frame(rid, 0, 3, {c_da});
-            }},
+        qm::ActionSendBuilt{[c_da](int64_t rid) {
+            return qm::result_batch_frame(rid, 0, 3, {c_da});
+        }},
         qm::ActionSendResultEnd{},
     };
     qm::MockServer srv({s});
@@ -4326,20 +4614,20 @@ TEST_CASE("mock: batch::column — DOUBLE_ARRAY round-trip")
 TEST_CASE("mock: batch::symbol — column codes + dictionary bulk round-trip")
 {
     qm::ColumnSpec c_sym{
-        "s", qm::COL_SYMBOL,
-        qm::symbol_column_bytes({0u, 1u, 2u, 1u})};
+        "s", qm::COL_SYMBOL, qm::symbol_column_bytes({0u, 1u, 2u, 1u})};
 
     qm::Script script = {
         qm::ActionSendServerInfo{},
         qm::ActionAwaitQueryRequest{},
-        qm::ActionSendBuilt{
-            [c_sym](int64_t rid)
-            {
-                return qm::result_batch_frame_with_dict(
-                    rid, 0, 4, {c_sym},
-                    /*delta_start=*/0,
-                    {"alpha", "beta", "gamma"});
-            }},
+        qm::ActionSendBuilt{[c_sym](int64_t rid) {
+            return qm::result_batch_frame_with_dict(
+                rid,
+                0,
+                4,
+                {c_sym},
+                /*delta_start=*/0,
+                {"alpha", "beta", "gamma"});
+        }},
         qm::ActionSendResultEnd{},
     };
     qm::MockServer srv({script});
@@ -4397,8 +4685,9 @@ TEST_CASE("mock: array accessors on a scalar column raise")
     qm::Script s = {
         qm::ActionSendServerInfo{},
         qm::ActionAwaitQueryRequest{},
-        qm::ActionSendBuilt{[c](int64_t rid)
-                            { return qm::result_batch_frame(rid, 0, 1, {c}); }},
+        qm::ActionSendBuilt{[c](int64_t rid) {
+            return qm::result_batch_frame(rid, 0, 1, {c});
+        }},
         qm::ActionSendResultEnd{},
     };
     qm::MockServer srv({s});
@@ -4436,8 +4725,7 @@ TEST_CASE("decimal_view: mantissa_bytes is width-agnostic and null-safe")
         for (size_t i = 0; i < 2 * c.stride; ++i)
             values[i] = static_cast<uint8_t>(i + 1);
         const uint8_t validity = 0x02; // row 1 is NULL
-        const eg::decimal_view view{
-            c.kind, values, c.stride, 2, 3, &validity};
+        const eg::decimal_view view{c.kind, values, c.stride, 2, 3, &validity};
 
         const auto first = view.mantissa_bytes(0);
         REQUIRE(first.has_value());
@@ -4449,8 +4737,7 @@ TEST_CASE("decimal_view: mantissa_bytes is width-agnostic and null-safe")
     }
 }
 
-TEST_CASE(
-    "mock: column::visit dispatches to the matching typed view per kind")
+TEST_CASE("mock: column::visit dispatches to the matching typed view per kind")
 {
     // One batch covering one representative column per view family. visit
     // returns a stable discriminator string identifying which view branch
@@ -4471,32 +4758,41 @@ TEST_CASE(
     ColumnSpec c_double{
         "d", qm::COL_DOUBLE, fixed_column_bytes(1, pack_le<double>({3.5}))};
     ColumnSpec c_dec64{
-        "d64", qm::COL_DECIMAL64,
+        "d64",
+        qm::COL_DECIMAL64,
         qm::decimal64_column_bytes({12345}, /*scale=*/3)};
     ColumnSpec c_uuid{"u", qm::COL_UUID, fixed_column_bytes(1, uuid_bytes)};
     ColumnSpec c_geo{
-        "g", qm::COL_GEOHASH,
+        "g",
+        qm::COL_GEOHASH,
         qm::geohash_column_bytes(
             std::vector<bool>{false},
             std::vector<uint8_t>{0xAB},
             /*precision_bits=*/8)};
     ColumnSpec c_varchar{
         "s", qm::COL_VARCHAR, qm::varlen_column_bytes({{'h', 'i'}})};
-    ColumnSpec c_sym{
-        "sym", qm::COL_SYMBOL, qm::symbol_column_bytes({0u})};
+    ColumnSpec c_sym{"sym", qm::COL_SYMBOL, qm::symbol_column_bytes({0u})};
 
     qm::Script script = {
         qm::ActionSendServerInfo{},
         qm::ActionAwaitQueryRequest{},
-        qm::ActionSendBuilt{
-            [=](int64_t rid) {
-                return qm::result_batch_frame_with_dict(
-                    rid, 0, 1,
-                    {c_bool, c_int, c_long, c_double, c_dec64, c_uuid, c_geo,
-                     c_varchar, c_sym},
-                    /*delta_start=*/0,
-                    {"alpha"});
-            }},
+        qm::ActionSendBuilt{[=](int64_t rid) {
+            return qm::result_batch_frame_with_dict(
+                rid,
+                0,
+                1,
+                {c_bool,
+                 c_int,
+                 c_long,
+                 c_double,
+                 c_dec64,
+                 c_uuid,
+                 c_geo,
+                 c_varchar,
+                 c_sym},
+                /*delta_start=*/0,
+                {"alpha"});
+        }},
         qm::ActionSendResultEnd{},
     };
     qm::MockServer srv({script});
@@ -4508,23 +4804,24 @@ TEST_CASE(
     REQUIRE(batch.column_count() == 9);
 
     auto tag_of = [](const eg::column& col) -> std::string {
-        return col.visit(eg::overload{
-            [](eg::fixed_view<uint8_t>)  { return std::string{"bool"}; },
-            [](eg::fixed_view<int8_t>)   { return std::string{"byte"}; },
-            [](eg::fixed_view<int16_t>)  { return std::string{"short"}; },
-            [](eg::fixed_view<uint16_t>) { return std::string{"char"}; },
-            [](eg::fixed_view<int32_t>)  { return std::string{"i32"}; },
-            [](eg::fixed_view<uint32_t>) { return std::string{"ipv4"}; },
-            [](eg::fixed_view<int64_t>)  { return std::string{"i64"}; },
-            [](eg::fixed_view<float>)    { return std::string{"f32"}; },
-            [](eg::fixed_view<double>)   { return std::string{"f64"}; },
-            [](eg::decimal_view)         { return std::string{"decimal"}; },
-            [](eg::bytes_view)           { return std::string{"bytes"}; },
-            [](eg::geohash_view)         { return std::string{"geohash"}; },
-            [](eg::varlen_view)          { return std::string{"varlen"}; },
-            [](eg::symbol_view)          { return std::string{"symbol"}; },
-            [](eg::array_view<double>)   { return std::string{"darray"}; },
-        });
+        return col.visit(
+            eg::overload{
+                [](eg::fixed_view<uint8_t>) { return std::string{"bool"}; },
+                [](eg::fixed_view<int8_t>) { return std::string{"byte"}; },
+                [](eg::fixed_view<int16_t>) { return std::string{"short"}; },
+                [](eg::fixed_view<uint16_t>) { return std::string{"char"}; },
+                [](eg::fixed_view<int32_t>) { return std::string{"i32"}; },
+                [](eg::fixed_view<uint32_t>) { return std::string{"ipv4"}; },
+                [](eg::fixed_view<int64_t>) { return std::string{"i64"}; },
+                [](eg::fixed_view<float>) { return std::string{"f32"}; },
+                [](eg::fixed_view<double>) { return std::string{"f64"}; },
+                [](eg::decimal_view) { return std::string{"decimal"}; },
+                [](eg::bytes_view) { return std::string{"bytes"}; },
+                [](eg::geohash_view) { return std::string{"geohash"}; },
+                [](eg::varlen_view) { return std::string{"varlen"}; },
+                [](eg::symbol_view) { return std::string{"symbol"}; },
+                [](eg::array_view<double>) { return std::string{"darray"}; },
+            });
     };
 
     CHECK(tag_of(batch.column(0)) == "bool");
@@ -4538,41 +4835,46 @@ TEST_CASE(
     CHECK(tag_of(batch.column(8)) == "symbol");
 
     // Sanity: the dispatched view actually yields the right value.
-    batch.column(1).visit(eg::overload{
-        [](eg::fixed_view<int32_t> v) {
-            REQUIRE(v.row_count == 1);
-            REQUIRE_FALSE(v.is_null(0));
-            CHECK(load_le(v.values + 0) == 42);
-        },
-        [](auto&&) {
-            FAIL("INT column did not dispatch to fixed_view<int32_t>");
-        },
-    });
-    batch.column(4).visit(eg::overload{
-        [](eg::decimal_view v) {
-            CHECK(v.kind == eg::column_kind::decimal64);
-            CHECK(v.value_stride == 8);
-            CHECK(v.scale == 3);
-        },
-        [](auto&&) {
-            FAIL("DECIMAL64 column did not dispatch to decimal_view");
-        },
-    });
-    batch.column(8).visit(eg::overload{
-        [](eg::symbol_view v) {
-            const auto x = v.resolve(0);
-            REQUIRE(x);
-            CHECK(*x == "alpha");
-        },
-        [](auto&&) { FAIL("SYMBOL column did not dispatch to symbol_view"); },
-    });
+    batch.column(1).visit(
+        eg::overload{
+            [](eg::fixed_view<int32_t> v) {
+                REQUIRE(v.row_count == 1);
+                REQUIRE_FALSE(v.is_null(0));
+                CHECK(load_le(v.values + 0) == 42);
+            },
+            [](auto&&) {
+                FAIL("INT column did not dispatch to fixed_view<int32_t>");
+            },
+        });
+    batch.column(4).visit(
+        eg::overload{
+            [](eg::decimal_view v) {
+                CHECK(v.kind == eg::column_kind::decimal64);
+                CHECK(v.value_stride == 8);
+                CHECK(v.scale == 3);
+            },
+            [](auto&&) {
+                FAIL("DECIMAL64 column did not dispatch to decimal_view");
+            },
+        });
+    batch.column(8).visit(
+        eg::overload{
+            [](eg::symbol_view v) {
+                const auto x = v.resolve(0);
+                REQUIRE(x);
+                CHECK(*x == "alpha");
+            },
+            [](auto&&) {
+                FAIL("SYMBOL column did not dispatch to symbol_view");
+            },
+        });
 }
 
 TEST_CASE("mock: column::visit dispatches DOUBLE_ARRAY to array_view<double>")
 {
     qm::ArrayRow row0{{3}, pack_le<double>({1.5, 2.5, 3.5})};
-    auto body = qm::array_column_bytes(
-        {std::optional<qm::ArrayRow>{std::move(row0)}});
+    auto body =
+        qm::array_column_bytes({std::optional<qm::ArrayRow>{std::move(row0)}});
     qm::ColumnSpec c_da{"da", qm::COL_DOUBLE_ARRAY, std::move(body)};
     qm::Script s = {
         qm::ActionSendServerInfo{},
@@ -4588,24 +4890,25 @@ TEST_CASE("mock: column::visit dispatches DOUBLE_ARRAY to array_view<double>")
     auto batch_opt = cur.next_batch();
     REQUIRE(batch_opt);
 
-    batch_opt->column(0).visit(eg::overload{
-        [](eg::array_view<double> v) {
-            REQUIRE(v.row_count == 1);
-            const auto e = v.elements(0);
-            REQUIRE(e);
-            REQUIRE(e->second == 3);
-            CHECK(load_le(e->first + 0) == doctest::Approx(1.5));
-            CHECK(load_le(e->first + 1) == doctest::Approx(2.5));
-            CHECK(load_le(e->first + 2) == doctest::Approx(3.5));
-            const auto sh = v.shape(0);
-            REQUIRE(sh);
-            REQUIRE(sh->second == 1);
-            CHECK(load_le(sh->first + 0) == 3u);
-        },
-        [](auto&&) {
-            FAIL("DOUBLE_ARRAY did not dispatch to array_view<double>");
-        },
-    });
+    batch_opt->column(0).visit(
+        eg::overload{
+            [](eg::array_view<double> v) {
+                REQUIRE(v.row_count == 1);
+                const auto e = v.elements(0);
+                REQUIRE(e);
+                REQUIRE(e->second == 3);
+                CHECK(load_le(e->first + 0) == doctest::Approx(1.5));
+                CHECK(load_le(e->first + 1) == doctest::Approx(2.5));
+                CHECK(load_le(e->first + 2) == doctest::Approx(3.5));
+                const auto sh = v.shape(0);
+                REQUIRE(sh);
+                REQUIRE(sh->second == 1);
+                CHECK(load_le(sh->first + 0) == 3u);
+            },
+            [](auto&&) {
+                FAIL("DOUBLE_ARRAY did not dispatch to array_view<double>");
+            },
+        });
 }
 
 // ---------------------------------------------------------------------------

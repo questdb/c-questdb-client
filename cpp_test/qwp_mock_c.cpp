@@ -51,8 +51,7 @@ extern "C" qwp_mock_c* qwp_mock_c_start(int slot_count)
     return start_mock(slot_count, 1);
 }
 
-extern "C" qwp_mock_c* qwp_mock_c_start_frames(
-    int slot_count, int frame_count)
+extern "C" qwp_mock_c* qwp_mock_c_start_frames(int slot_count, int frame_count)
 {
     return start_mock(slot_count, frame_count);
 }
