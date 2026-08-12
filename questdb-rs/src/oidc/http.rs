@@ -55,11 +55,12 @@ const USER_AGENT: &str = concat!("questdb/rust/", env!("CARGO_PKG_VERSION"), " (
 /// server.
 const MAX_RESPONSE_BYTES: u64 = 4 * 1024 * 1024;
 
-/// Cap on how much of a non-JSON / error body is echoed into a diagnostic error
-/// message. Enough to show a proxy/WAF error title or an OAuth `error_description`,
-/// but short so an unexpected token-endpoint body can't spill much into a log. A
-/// valid token response is JSON and never reaches this path (only a parse failure
-/// snippets), so this only ever quotes an intermediary's error page.
+/// Cap on how much of an HTTP *error* body (status >= 400) is echoed into a
+/// diagnostic message. Enough to show a proxy/WAF error title or an OAuth
+/// `error_description`, but short so little can spill into a log. A 2xx/3xx body —
+/// which on the token / device-authorization endpoints can carry a credential — is
+/// never snippeted (see [`non_json_body_detail`]), so a non-conformant or truncated
+/// token response cannot leak the secret through this path.
 const MAX_BODY_SNIPPET_CHARS: usize = 120;
 
 /// The result of a `POST` to the IdP token / device-authorization endpoint:
@@ -174,12 +175,18 @@ impl HttpClient {
                 retry_after,
             }),
             Err(_) => {
-                let snippet = body_snippet(&body);
-                let msg = format!("HTTP {status} from {url}: {snippet}");
-                // Non-JSON body: a transient 408/429/5xx (a timeout or proxy/WAF
-                // error page) stays retryable; anything else is a terminal
-                // rejection. Either way carry the status + Retry-After so the
-                // poll loop / refresh can classify and back off correctly.
+                // A 2xx/3xx body from these endpoints can carry the OAuth secrets
+                // (access/refresh token, device_code); a non-conformant or truncated
+                // token response lands here, so its bytes must never be echoed into
+                // this (displayable/loggable) error. Only an HTTP error body
+                // (>= 400) — an intermediary/IdP error page that cannot carry an
+                // issued token — is snippeted for diagnostics.
+                let detail = non_json_body_detail(status, &body);
+                let msg = format!("HTTP {status} from {url}: {detail}");
+                // A transient 408/429/5xx (a timeout or proxy/WAF error page) stays
+                // retryable; anything else is a terminal rejection. Either way carry
+                // the status + Retry-After so the poll loop / refresh can classify
+                // and back off correctly.
                 let err = if is_transient_http_status(status) {
                     OidcError::network(msg)
                 } else {
@@ -246,6 +253,20 @@ fn body_snippet(body: &[u8]) -> String {
     let text = String::from_utf8_lossy(body);
     let snippet: String = text.chars().take(MAX_BODY_SNIPPET_CHARS).collect();
     crate::oidc::render::strip_control(&snippet)
+}
+
+/// Diagnostic detail for a token / device-authorization response whose body did
+/// not parse as JSON. These endpoints return the OAuth secrets (access/refresh
+/// token, device_code) in a *successful* (2xx) body, so a 2xx/3xx body is never
+/// echoed: a non-conformant or truncated token response would otherwise leak the
+/// credential into this displayable/loggable error. Only a genuine HTTP error
+/// response (status >= 400), which cannot carry an issued token, is snippeted.
+fn non_json_body_detail(status: u16, body: &[u8]) -> String {
+    if status >= 400 {
+        body_snippet(body)
+    } else {
+        "unexpected non-JSON response body".to_string()
+    }
 }
 
 /// Parse a `Retry-After` header as a non-negative number of seconds.
@@ -749,6 +770,34 @@ mod tests {
         for status in [200, 302, 400, 401, 403, 404] {
             assert!(!is_transient_http_status(status), "HTTP {status}");
         }
+    }
+
+    #[test]
+    fn non_json_success_body_is_never_echoed_into_error() {
+        // A non-conformant / truncated 2xx token response carries the secret in a
+        // non-JSON body; it must never reach a displayable/loggable error message.
+        let secret_form = "access_token=SECRET-eyJhbGciOiJSUzI1NiJ9&token_type=bearer";
+        let truncated_json = r#"{"access_token":"SECRET-eyJhbGciOiJSUzI1NiJ9.eyJzdWIi"#;
+        for status in [200u16, 201, 204, 301, 302, 399] {
+            for body in [secret_form, truncated_json] {
+                let detail = non_json_body_detail(status, body.as_bytes());
+                assert!(
+                    !detail.contains("SECRET"),
+                    "HTTP {status} non-JSON body leaked into the error detail: {detail}"
+                );
+                assert_eq!(detail, "unexpected non-JSON response body");
+            }
+        }
+
+        // A genuine HTTP error page (>= 400) cannot carry an issued token, so its
+        // body is still snippeted for diagnostics.
+        let detail = non_json_body_detail(503, b"Service Unavailable (upstream proxy)");
+        assert!(
+            detail.contains("Service Unavailable"),
+            "error-page body should still be snippeted, got: {detail}"
+        );
+        let detail = non_json_body_detail(400, b"invalid_request: bad client");
+        assert!(detail.contains("invalid_request"), "got: {detail}");
     }
 
     #[test]
