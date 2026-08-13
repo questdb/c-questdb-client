@@ -45,8 +45,8 @@ use super::chunk::{
 use super::numpy_wire;
 use super::wire::{
     F32_NULL, F64_NULL, I8_NULL, I16_NULL, I32_NULL, I64_NULL, QWP_FLAG_DEFER_COMMIT,
-    QWP_FLAG_DELTA_SYMBOL_DICT, QWP_HEADER_LEN, QWP_MAGIC, QWP_VERSION_1, validate_table_name,
-    write_qwp_bytes, write_qwp_varint,
+    QWP_FLAG_DELTA_SYMBOL_DICT, QWP_HEADER_LEN, QWP_MAGIC, QWP_VERSION_1, reverse_uuid_bytes,
+    validate_table_name, write_qwp_bytes, write_qwp_varint,
 };
 
 /// Per-sender reusable scratch state for one flush. The contained `Vec`s
@@ -925,7 +925,7 @@ unsafe fn encode_uuid_bitmap(
             out.reserve(16 * row_count);
             for i in 0..row_count {
                 let row = unsafe { slice::from_raw_parts(data.add(i * 16), 16) };
-                out.extend(row.iter().rev());
+                out.extend_from_slice(&reverse_uuid_bytes(row));
             }
         }
         Some(v) => {
@@ -935,7 +935,7 @@ unsafe fn encode_uuid_bitmap(
             for i in 0..row_count {
                 if unsafe { v.is_valid(i) } {
                     let row = unsafe { slice::from_raw_parts(data.add(i * 16), 16) };
-                    out.extend(row.iter().rev());
+                    out.extend_from_slice(&reverse_uuid_bytes(row));
                 }
             }
         }

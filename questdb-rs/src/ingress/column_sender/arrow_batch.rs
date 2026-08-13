@@ -60,7 +60,8 @@ use super::wire::{
     QWP_TYPE_DECIMAL128, QWP_TYPE_DECIMAL256, QWP_TYPE_DOUBLE, QWP_TYPE_DOUBLE_ARRAY,
     QWP_TYPE_FLOAT, QWP_TYPE_GEOHASH, QWP_TYPE_INT, QWP_TYPE_IPV4, QWP_TYPE_LONG, QWP_TYPE_LONG256,
     QWP_TYPE_SHORT, QWP_TYPE_SYMBOL, QWP_TYPE_TIMESTAMP, QWP_TYPE_TIMESTAMP_NANOS, QWP_TYPE_UUID,
-    QWP_TYPE_VARCHAR, QWP_VERSION_1, validate_table_name, write_qwp_bytes, write_qwp_varint,
+    QWP_TYPE_VARCHAR, QWP_VERSION_1, reverse_uuid_bytes, validate_table_name, write_qwp_bytes,
+    write_qwp_varint,
 };
 
 use super::MAX_CHUNK_ROWS as MAX_ARROW_INGEST_ROWS;
@@ -1022,10 +1023,10 @@ fn write_uuid_be_payload(out: &mut Vec<u8>, arr: &FixedSizeBinaryArray) -> Resul
         None => {
             // Bulk path: one window into `value_data()` (honoring the
             // slice offset) instead of a bounds-checked `value(row)` per
-            // row — the reverse loop then vectorizes like a copy.
+            // row.
             let start = arr.offset() * 16;
             for row in arr.value_data()[start..start + bytes].chunks_exact(16) {
-                out.extend(row.iter().rev());
+                out.extend_from_slice(&reverse_uuid_bytes(row));
             }
         }
         Some(nulls) => {
@@ -1033,7 +1034,7 @@ fn write_uuid_be_payload(out: &mut Vec<u8>, arr: &FixedSizeBinaryArray) -> Resul
                 if nulls.is_null(row) {
                     continue;
                 }
-                out.extend(arr.value(row).iter().rev());
+                out.extend_from_slice(&reverse_uuid_bytes(arr.value(row)));
             }
         }
     }

@@ -43,7 +43,7 @@ use super::wire::{
     QWP_TYPE_CHAR, QWP_TYPE_DATE, QWP_TYPE_DECIMAL64, QWP_TYPE_DECIMAL128, QWP_TYPE_DECIMAL256,
     QWP_TYPE_DOUBLE, QWP_TYPE_DOUBLE_ARRAY, QWP_TYPE_FLOAT, QWP_TYPE_GEOHASH, QWP_TYPE_INT,
     QWP_TYPE_IPV4, QWP_TYPE_LONG, QWP_TYPE_LONG256, QWP_TYPE_SHORT, QWP_TYPE_TIMESTAMP,
-    QWP_TYPE_TIMESTAMP_NANOS, QWP_TYPE_UUID, write_qwp_varint,
+    QWP_TYPE_TIMESTAMP_NANOS, QWP_TYPE_UUID, reverse_uuid_bytes, write_qwp_varint,
 };
 
 /// Numpy source-dtype tag. The chunk's `NumpyDeferred` variant stores
@@ -727,7 +727,7 @@ unsafe fn emit_uuid_bitmap(
             out.reserve(16 * row_count);
             for i in 0..row_count {
                 let row = unsafe { slice::from_raw_parts(data.add(i * 16), 16) };
-                out.extend(row.iter().rev());
+                out.extend_from_slice(&reverse_uuid_bytes(row));
             }
         }
         Some(v) => {
@@ -737,7 +737,7 @@ unsafe fn emit_uuid_bitmap(
             for i in 0..row_count {
                 if unsafe { v.is_valid(i) } {
                     let row = unsafe { slice::from_raw_parts(data.add(i * 16), 16) };
-                    out.extend(row.iter().rev());
+                    out.extend_from_slice(&reverse_uuid_bytes(row));
                 }
             }
         }
