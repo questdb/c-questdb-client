@@ -590,6 +590,8 @@ bool qwp_chunk_column_bool(
  * `UUID` column. `data` points to `row_count * 16` bytes; each 16-byte
  * group is one UUID in canonical RFC-4122 big-endian order. The client
  * byte-swaps to QWP wire order internally.
+ * `line_sender_buffer_column_uuid(lo, hi)` instead takes QWP wire-order
+ * integer halves.
  */
 QUESTDB_CLIENT_API
 bool qwp_chunk_column_uuid(
