@@ -187,15 +187,38 @@ impl TerminalRenderer {
     }
 }
 
+/// Build the terminal sign-in prompt for `challenge`.
+///
+/// The pre-filled "open directly" shortcut is offered only when it is the
+/// origin-vetted [`browser_target`](DeviceCodeChallenge::browser_target). A
+/// hostile or tampered device response can pair a trusted-looking
+/// `verification_uri` with a cross-origin `verification_uri_complete`; echoing
+/// the raw `display_verification_uri_complete()` here would present that attacker
+/// URL as an actionable link (auto-linkified by many terminals) — the exact
+/// steering `browser_target()` exists to refuse. `browser_target()` returns the
+/// `complete` only when it is safe and shares the origin of `verification_uri`,
+/// otherwise it falls back to the plain URI already shown above, which is then
+/// suppressed here as redundant.
+fn format_prompt(challenge: &DeviceCodeChallenge) -> String {
+    let uri = challenge.display_verification_uri();
+    let code = challenge.display_user_code();
+    let mut msg = format!("🔐 Sign in to QuestDB\n   Open {uri}  and enter code:  {code}\n");
+    // browser_target() yields the pre-filled `complete` only when it is safe and
+    // shares verification_uri's origin; otherwise it returns the plain URI shown
+    // above. Offer the shortcut only for a distinct, vetted complete.
+    let plain = safe_target(Some(&challenge.verification_uri));
+    if let Some(target) = challenge
+        .browser_target()
+        .filter(|target| Some(target) != plain.as_ref())
+    {
+        msg.push_str(&format!("   (or open directly: {target})\n"));
+    }
+    msg
+}
+
 impl Renderer for TerminalRenderer {
     fn on_prompt(&self, challenge: &DeviceCodeChallenge) {
-        let uri = challenge.display_verification_uri();
-        let code = challenge.display_user_code();
-        let mut msg = format!("🔐 Sign in to QuestDB\n   Open {uri}  and enter code:  {code}\n");
-        if let Some(complete) = challenge.display_verification_uri_complete() {
-            msg.push_str(&format!("   (or open directly: {complete})\n"));
-        }
-        self.write(&msg);
+        self.write(&format_prompt(challenge));
     }
 
     fn on_waiting(&self, seconds_left: f64) {
@@ -578,6 +601,43 @@ mod tests {
                 "cross-origin complete {evil:?} must fall back to verification_uri"
             );
         }
+    }
+
+    #[test]
+    fn terminal_prompt_offers_only_origin_vetted_complete() {
+        // A same-origin complete is offered as the one-click shortcut (the user
+        // code is pre-filled).
+        let same = DeviceCodeChallenge {
+            user_code: "WXYZ".into(),
+            verification_uri: "https://idp.example.com/activate".into(),
+            verification_uri_complete: Some(
+                "https://idp.example.com/activate?user_code=WXYZ".into(),
+            ),
+        };
+        let shown = format_prompt(&same);
+        assert!(shown.contains("or open directly"));
+        assert!(shown.contains("user_code=WXYZ"));
+
+        // A tampered device response pairs a trusted-looking verification_uri
+        // with a cross-origin `complete`. The shortcut must not be offered, and
+        // the attacker host must never reach the terminal — otherwise a terminal
+        // that auto-linkifies URLs would present the attacker link as clickable.
+        let cross = DeviceCodeChallenge {
+            user_code: "WXYZ".into(),
+            verification_uri: "https://login.questdb.io/device".into(),
+            verification_uri_complete: Some(
+                "https://login.questdb.io@evil.example/?user_code=WXYZ".into(),
+            ),
+        };
+        let shown = format_prompt(&cross);
+        assert!(
+            !shown.contains("or open directly"),
+            "cross-origin complete must not be offered as a shortcut; got: {shown}"
+        );
+        assert!(
+            !shown.contains("evil.example"),
+            "attacker host leaked into the terminal prompt: {shown}"
+        );
     }
 
     #[test]
