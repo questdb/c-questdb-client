@@ -4656,6 +4656,30 @@ mod tests {
     }
 
     #[test]
+    fn fsb_without_metadata_with_null_emits_binary_bitmap() {
+        let mut b = FixedSizeBinaryBuilder::new(4);
+        b.append_value([0x11, 0x12, 0x13, 0x14]).unwrap();
+        b.append_null();
+        b.append_value([0x21, 0x22, 0x23, 0x24]).unwrap();
+        let field = Field::new("data", DataType::FixedSizeBinary(4), true);
+        let rb = single_col_batch(field, b.finish());
+        let out = encode(&rb);
+        let (rows, ty, body) = decode_single_column(&out);
+        assert_eq!(rows, 3);
+        assert_eq!(ty, QWP_TYPE_BINARY);
+        assert_eq!(body[0], 1, "null-bearing BINARY uses a bitmap");
+        assert_eq!(body[1], 0b010, "row 1 is null");
+        assert_eq!(
+            decode_binary_body(body, rows),
+            vec![
+                Some(vec![0x11, 0x12, 0x13, 0x14]),
+                None,
+                Some(vec![0x21, 0x22, 0x23, 0x24]),
+            ]
+        );
+    }
+
+    #[test]
     fn fsb16_with_column_type_uuid_routes_to_column_uuid() {
         // `questdb.column_type=uuid` is the label-free way to claim UUID
         // semantics; bytes are canonical RFC-4122 and swap to wire order.
