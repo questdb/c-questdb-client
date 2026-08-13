@@ -403,6 +403,84 @@ fn uuid_round_trip() {
     );
 }
 
+// 123e4567-e89b-12d3-a456-426614174000, RFC-4122 big-endian.
+const UUID_CANONICAL: [u8; 16] = [
+    0x12, 0x3e, 0x45, 0x67, 0xe8, 0x9b, 0x12, 0xd3, 0xa4, 0x56, 0x42, 0x66, 0x14, 0x17, 0x40, 0x00,
+];
+const UUID_CANONICAL_STR: &str = "123e4567-e89b-12d3-a456-426614174000";
+
+/// Assert the server parsed the ingested UUID as `UUID_CANONICAL_STR` —
+/// server-side `cast(u as string)` is the absolute anchor (no client
+/// byte-order code on the verify path can cancel an ingest bug) — then
+/// assert the reader hands the canonical bytes back.
+fn assert_uuid_round_trip(srv: &QuestDbServer, table: &str) {
+    select_one_batch(
+        srv,
+        &format!("select cast(u as string) as s, u from \"{table}\""),
+        |view| {
+            let ColumnView::Varchar(s) = view.column(0).unwrap() else {
+                panic!("col 0 not Varchar")
+            };
+            assert_eq!(s.value(0).unwrap(), UUID_CANONICAL_STR);
+            let ColumnView::Uuid(c) = view.column(1).unwrap() else {
+                panic!("col 1 not Uuid")
+            };
+            assert_eq!(c.value(0), &UUID_CANONICAL);
+        },
+    );
+}
+
+/// Cross-context round-trip for the chunk byte API: canonical bytes into
+/// `column_uuid` → server text → reader bytes. Each swap is unit-pinned;
+/// this proves the composition against the server's own UUID parser.
+#[test]
+fn chunk_column_uuid_round_trip() {
+    use questdb::QuestDb;
+    use questdb::ingress::AckLevel;
+    use questdb::ingress::column_sender::Chunk;
+
+    let srv = server();
+    let table = unique_table("chunk_uuid");
+    let db = QuestDb::connect(&srv.qwp_conf()).expect("connect");
+    let mut sender = db.borrow_sender().expect("borrow");
+    let mut chunk = Chunk::new(table.as_str());
+    let uuids = [UUID_CANONICAL];
+    chunk.column_uuid("u", &uuids, None).expect("uuid col");
+    chunk.at_nanos(&[1_700_000_000_000_000_000]).expect("ts");
+    sender
+        .flush_and_wait(&mut chunk, AckLevel::Ok)
+        .expect("flush");
+    wait_for_rows(srv, &table, 1);
+    assert_uuid_round_trip(srv, &table);
+}
+
+/// Same composition through the numpy `S16` fast path.
+#[test]
+fn numpy_s16_uuid_round_trip() {
+    use questdb::QuestDb;
+    use questdb::ingress::AckLevel;
+    use questdb::ingress::column_sender::{Chunk, NumpyDtype};
+
+    let srv = server();
+    let table = unique_table("numpy_uuid");
+    let db = QuestDb::connect(&srv.qwp_conf()).expect("connect");
+    let mut sender = db.borrow_sender().expect("borrow");
+    let mut chunk = Chunk::new(table.as_str());
+    let uuids = [UUID_CANONICAL];
+    // SAFETY: `uuids` outlives the flush; 1 row of 16 bytes as declared.
+    unsafe {
+        chunk
+            .push_numpy_deferred("u", NumpyDtype::UuidDirect, uuids.as_ptr().cast(), 1, None)
+            .expect("numpy uuid col");
+    }
+    chunk.at_nanos(&[1_700_000_000_000_000_000]).expect("ts");
+    sender
+        .flush_and_wait(&mut chunk, AckLevel::Ok)
+        .expect("flush");
+    wait_for_rows(srv, &table, 1);
+    assert_uuid_round_trip(srv, &table);
+}
+
 #[test]
 fn char_round_trip() {
     let srv = server();
