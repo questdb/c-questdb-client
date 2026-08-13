@@ -831,6 +831,8 @@ public:
 
     /**
      * Record a UUID column value. QWP-only.
+     * For canonical RFC-4122 bytes, use `column_chunk::column_uuid` instead of
+     * splitting the bytes into `lo` and `hi`.
      */
     line_sender_buffer& column_uuid(
         column_name_view name, uint64_t lo, uint64_t hi)

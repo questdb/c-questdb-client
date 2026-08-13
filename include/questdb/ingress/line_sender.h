@@ -1119,6 +1119,8 @@ bool line_sender_buffer_column_dec128(
  * Record a UUID column value. QWP-only.
  *
  * The wire encoding writes `lo` (8 bytes LE) followed by `hi` (8 bytes LE).
+ * For canonical RFC-4122 bytes, use `qwp_chunk_column_uuid` instead of
+ * splitting the bytes into `lo` and `hi`.
  */
 QUESTDB_CLIENT_API
 bool line_sender_buffer_column_uuid(
