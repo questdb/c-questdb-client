@@ -2156,14 +2156,23 @@ mod tests {
 
     #[test]
     fn validity_with_null_emits_bitmap_uuid() {
-        let rows = [[1u8; 16], [2u8; 16], [3u8; 16]];
+        let rows: [[u8; 16]; 3] = [
+            core::array::from_fn(|i| i as u8),
+            core::array::from_fn(|i| 0x20 + i as u8),
+            core::array::from_fn(|i| 0x40 + i as u8),
+        ];
         let ts = [1i64, 2, 3];
         let bits = [0b0000_0101u8]; // row 1 null
         let v = Validity::from_bitmap(&bits, 3).unwrap();
-        assert_ne!(
-            make_chunk_uuid(&rows, Some(&v), &ts),
-            make_chunk_uuid(&rows, None, &ts),
-            "a real null must emit a bitmap and drop the null row's payload"
+        let out = make_chunk_uuid(&rows, Some(&v), &ts);
+
+        // Column body: null flag + QWP null bitmap + dense non-null UUIDs.
+        let mut expected = vec![1, 0b0000_0010];
+        expected.extend(rows[0].iter().rev());
+        expected.extend(rows[2].iter().rev());
+        assert!(
+            out.windows(expected.len()).any(|w| w == expected),
+            "non-null UUIDs in a column containing nulls must appear byte-reversed in the wire frame"
         );
     }
 

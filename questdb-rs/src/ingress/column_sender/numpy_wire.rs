@@ -1439,6 +1439,41 @@ mod tests {
     }
 
     #[test]
+    fn uuid_direct_with_nulls_swaps_non_null_values() {
+        let rows: [[u8; 16]; 3] = [
+            core::array::from_fn(|i| i as u8),
+            core::array::from_fn(|i| 0x20 + i as u8),
+            core::array::from_fn(|i| 0x40 + i as u8),
+        ];
+        let bits = [0b0000_0101u8]; // row 1 null
+        let validity = Validity::from_bitmap(&bits, rows.len()).unwrap();
+        let ts = [1i64, 2, 3];
+        let mut chunk = Chunk::new("t");
+        unsafe {
+            chunk
+                .push_numpy_deferred(
+                    "u",
+                    NumpyDtype::UuidDirect,
+                    rows.as_ptr().cast(),
+                    rows.len(),
+                    Some(&validity),
+                )
+                .unwrap();
+        }
+        chunk.at_nanos(&ts).unwrap();
+        let out = encode(&chunk);
+
+        // Column body: null flag + QWP null bitmap + dense non-null UUIDs.
+        let mut expected = vec![1, 0b0000_0010];
+        expected.extend(rows[0].iter().rev());
+        expected.extend(rows[2].iter().rev());
+        assert!(
+            out.windows(expected.len()).any(|w| w == expected),
+            "non-null UUIDs in a column containing nulls must appear byte-reversed in the wire frame"
+        );
+    }
+
+    #[test]
     fn source_elem_size_matches_read_stride() {
         use NumpyDtype as D;
         // Source-read stride per row (what emit_into_wire dereferences),

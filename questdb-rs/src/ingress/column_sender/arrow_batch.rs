@@ -6818,7 +6818,7 @@ mod tests {
         assert_eq!(ty, QWP_TYPE_UUID);
         // Bitmap body: flag(1) + ceil(3/8)=1 bitmap byte (1 = null) +
         // non-null values only, each reversed.
-        assert_eq!(body[0], 1, "null-bearing UUID column carries a bitmap");
+        assert_eq!(body[0], 1, "UUID column containing nulls carries a bitmap");
         assert_eq!(body[1], 0b010, "row 1 null");
         let vals = &body[2..];
         assert_eq!(vals.len(), 32);
