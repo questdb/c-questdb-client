@@ -2358,6 +2358,87 @@ fn qwp_ws_token_provider_rotates_across_reconnects() {
 }
 
 #[test]
+fn qwp_ws_provider_failure_keeps_sf_frames_recoverable() {
+    // The QWP/WebSocket ingress counterpart of the ILP/HTTP
+    // `provider_error_leaves_buffer_intact_for_retry`: a token-provider failure
+    // at the (background) connect handshake — resolved before any socket is
+    // opened in `connect_qwp_ws_endpoint_round` — must NOT terminalize the queued
+    // store-and-forward frame. A provider failure is a retryable `SocketError`,
+    // so the background drainer keeps reconnecting; once the provider recovers the
+    // frame drains against the real connect path and is durably acked, carrying
+    // the recovered token. If the failure had terminalized the slot, the `wait`
+    // below would return a terminal error instead of succeeding.
+    let provider_calls = Arc::new(AtomicUsize::new(0));
+    let (port, rx) = spawn_mock_server();
+    let builder = SenderBuilder::new(Protocol::Ws, "127.0.0.1", port)
+        .reconnect_initial_backoff(Duration::from_millis(1))
+        .unwrap()
+        .reconnect_max_backoff(Duration::from_millis(5))
+        .unwrap()
+        .reconnect_max_duration(Duration::from_secs(10))
+        .unwrap()
+        .qwp_ws_token_provider({
+            let provider_calls = Arc::clone(&provider_calls);
+            move || {
+                // Fail the first connect round's provider resolution, then recover.
+                if provider_calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                    Err(crate::Error::new(
+                        crate::ErrorCode::AuthError,
+                        "token source temporarily unavailable",
+                    ))
+                } else {
+                    Ok::<_, crate::Error>("recovered-tok".to_string())
+                }
+            }
+        })
+        .unwrap();
+    let mut sender = build_qwp_ws_sender_from_builder(ProgressCase::Background, builder);
+
+    let mut buf = sender.new_buffer();
+    buf.table("trades")
+        .unwrap()
+        .column_i64("qty", 1)
+        .unwrap()
+        .at_now()
+        .unwrap();
+    // Background store-and-forward: the flush queues the frame locally and returns
+    // even though the first background connect round will fail at the provider.
+    sender.flush_and_get_fsn(&mut buf).unwrap();
+
+    // Drains and durably acks only because the provider failure left the frame
+    // queued and recoverable (never `.failed`/terminal).
+    sender
+        .wait(crate::ingress::AckLevel::Ok, Duration::from_secs(10))
+        .expect("a provider failure must keep the queued frame recoverable and drain on recovery");
+
+    let result = rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    assert_eq!(
+        result.received_frames.len(),
+        1,
+        "the queued frame drained after the provider recovered"
+    );
+    assert_eq!(&result.received_frames[0][0..4], b"QWP1");
+    let auth = result
+        .request_lines
+        .iter()
+        .find_map(|line| {
+            let (k, v) = line.split_once(':')?;
+            k.trim()
+                .eq_ignore_ascii_case("authorization")
+                .then(|| v.trim().to_string())
+        })
+        .expect("the recovered handshake must carry an Authorization header");
+    assert_eq!(auth, "Bearer recovered-tok");
+
+    // The provider was re-pulled after its failure (the failed round + the
+    // recovered round), proving the failure was retried, not terminalized.
+    assert!(
+        provider_calls.load(Ordering::SeqCst) >= 2,
+        "the provider must be re-pulled on the reconnect after a failed round"
+    );
+}
+
+#[test]
 fn qwp_ws_terminal_reject_terminalizes_in_all_progress_modes() {
     for progress in [ProgressCase::Background, ProgressCase::Manual] {
         let (port, rx) = spawn_one_response_server(MockQwpResponse::Error {

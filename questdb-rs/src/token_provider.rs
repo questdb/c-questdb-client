@@ -265,4 +265,112 @@ mod tests {
         assert_eq!(provider.bearer_header().unwrap(), "Bearer recovered-token");
         assert_eq!(calls.load(Ordering::SeqCst), 2);
     }
+
+    /// Coverage for `bearer_header_isolated_until` — the QWP/WebSocket path that
+    /// runs an uncancellable synchronous provider closure on a throwaway thread so
+    /// a slow or blocking closure can never wedge sender shutdown. Only its
+    /// success path was previously exercised (via the connect handshake tests);
+    /// the cancellation branches — the whole reason the method exists — were not.
+    #[cfg(feature = "_sender-qwp-ws")]
+    mod isolated {
+        use super::super::TokenProvider;
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        use std::sync::{Arc, Condvar, Mutex};
+
+        /// A one-shot manual-reset event usable from a `Fn + Send + Sync` provider.
+        #[derive(Default)]
+        struct Gate {
+            set: Mutex<bool>,
+            cv: Condvar,
+        }
+        impl Gate {
+            fn signal(&self) {
+                *self.set.lock().unwrap() = true;
+                self.cv.notify_all();
+            }
+            fn wait(&self) {
+                let mut set = self.set.lock().unwrap();
+                while !*set {
+                    set = self.cv.wait(set).unwrap();
+                }
+            }
+        }
+
+        #[test]
+        fn returns_the_token_on_fast_success() {
+            let provider = TokenProvider::new(|| Ok::<_, crate::Error>("tok-iso".to_string()));
+            assert_eq!(
+                provider.bearer_header_isolated_until(|| false).unwrap(),
+                "Bearer tok-iso"
+            );
+        }
+
+        #[test]
+        fn cancelled_up_front_returns_shutdown_error_without_invoking_provider() {
+            let calls = Arc::new(AtomicUsize::new(0));
+            let provider = TokenProvider::new({
+                let calls = Arc::clone(&calls);
+                move || {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    Ok::<_, crate::Error>("unused".to_string())
+                }
+            });
+
+            let err = provider.bearer_header_isolated_until(|| true).unwrap_err();
+            assert_eq!(err.code(), crate::ErrorCode::SocketError);
+            assert!(err.msg().contains("shutting down"), "{}", err.msg());
+            // Cancellation short-circuits before any worker thread is spawned.
+            assert_eq!(calls.load(Ordering::SeqCst), 0);
+        }
+
+        #[test]
+        fn cancel_while_a_blocked_provider_runs_returns_promptly() {
+            // The provider blocks indefinitely; once cancellation is observed the
+            // call must return the shutdown error without waiting for it — the whole
+            // reason acquisition runs on an isolated thread. A regression that
+            // failed to observe cancellation in the poll loop would never return;
+            // the bounded `recv_timeout` below turns that wedge into a clear failure
+            // instead of a hang.
+            let started = Arc::new(Gate::default());
+            let release = Arc::new(Gate::default());
+            let provider = TokenProvider::new({
+                let started = Arc::clone(&started);
+                let release = Arc::clone(&release);
+                move || {
+                    started.signal();
+                    release.wait();
+                    Ok::<_, crate::Error>("late-token".to_string())
+                }
+            });
+
+            let cancelled = Arc::new(AtomicBool::new(false));
+            let (done_tx, done_rx) = std::sync::mpsc::channel();
+            let call = std::thread::spawn({
+                let cancelled = Arc::clone(&cancelled);
+                move || {
+                    let result = provider
+                        .bearer_header_isolated_until(move || cancelled.load(Ordering::SeqCst));
+                    let _ = done_tx.send(result);
+                }
+            });
+
+            // Only cancel once the worker is provably inside the blocked provider,
+            // so this exercises the poll-loop cancellation branch, not the entry
+            // guard.
+            started.wait();
+            cancelled.store(true, Ordering::SeqCst);
+
+            let result = done_rx
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .expect("cancellation must abandon the blocked provider promptly, not hang");
+            let err = result.unwrap_err();
+            assert_eq!(err.code(), crate::ErrorCode::SocketError);
+            assert!(err.msg().contains("shutting down"), "{}", err.msg());
+
+            // Release the abandoned worker so it exits cleanly; its send to the
+            // now-dropped receiver is ignored (no panic, no leak).
+            release.signal();
+            call.join().unwrap();
+        }
+    }
 }
