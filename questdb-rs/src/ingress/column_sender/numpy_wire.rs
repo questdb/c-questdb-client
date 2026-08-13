@@ -452,7 +452,7 @@ pub(crate) unsafe fn emit_into_wire(
         D::Ipv4Direct => unsafe {
             emit_bitmap_le::<u32, 4>(out, data, row_count, validity, u32::to_le_bytes)
         },
-        D::UuidDirect => unsafe { emit_bitmap_fsb::<16>(out, data, row_count, validity) },
+        D::UuidDirect => unsafe { emit_uuid_bitmap(out, data, row_count, validity) },
         D::Long256Direct => unsafe { emit_bitmap_fsb::<32>(out, data, row_count, validity) },
 
         // ---- Direct narrow signed integers (sentinel LE) ----
@@ -705,6 +705,39 @@ unsafe fn emit_bitmap_le<T, const N: usize>(
                 if unsafe { v.is_valid(i) } {
                     let value = unsafe { typed.add(i).read_unaligned() };
                     out.extend_from_slice(&to_le(value));
+                }
+            }
+        }
+    }
+}
+
+/// UUID rows: source is canonical RFC-4122 big-endian (`S16` numpy
+/// bytes); the QWP wire wants (lo LE, hi LE) — each 16-byte row is
+/// written fully reversed.
+#[inline]
+unsafe fn emit_uuid_bitmap(
+    out: &mut Vec<u8>,
+    data: *const u8,
+    row_count: usize,
+    validity: Option<&ValidityDescriptor>,
+) {
+    match validity.filter(|v| v.has_nulls()) {
+        None => {
+            out.push(0);
+            out.reserve(16 * row_count);
+            for i in 0..row_count {
+                let row = unsafe { slice::from_raw_parts(data.add(i * 16), 16) };
+                out.extend(row.iter().rev());
+            }
+        }
+        Some(v) => {
+            out.push(1);
+            unsafe { write_qwp_bitmap_from_validity(out, v) };
+            out.reserve(16 * v.non_null_count);
+            for i in 0..row_count {
+                if unsafe { v.is_valid(i) } {
+                    let row = unsafe { slice::from_raw_parts(data.add(i * 16), 16) };
+                    out.extend(row.iter().rev());
                 }
             }
         }
@@ -1373,6 +1406,36 @@ mod tests {
         let err = encode_err(&chunk);
         assert_eq!(err.code(), crate::ErrorCode::InvalidApiCall);
         assert!(err.msg().contains("MAX_CHUNK_ROWS"), "{}", err.msg());
+    }
+
+    #[test]
+    fn uuid_direct_swaps_canonical_to_wire_order() {
+        // `S16` UUID source rows are canonical RFC-4122 big-endian; the
+        // wire wants (lo LE, hi LE) — the full 16-byte reversal. A
+        // passthrough bug would corrupt every UUID, so pin the swap.
+        let canonical: [u8; 16] = [
+            0x12, 0x3e, 0x45, 0x67, 0xe8, 0x9b, 0x12, 0xd3, 0xa4, 0x56, 0x42, 0x66, 0x14, 0x17,
+            0x40, 0x00,
+        ];
+        let ts = [1i64];
+        let mut chunk = Chunk::new("t");
+        unsafe {
+            chunk
+                .push_numpy_deferred("u", NumpyDtype::UuidDirect, canonical.as_ptr(), 1, None)
+                .unwrap();
+        }
+        chunk.at_nanos(&ts).unwrap();
+        let out = encode(&chunk);
+        let mut wire = canonical;
+        wire.reverse();
+        assert!(
+            out.windows(16).any(|w| w == wire),
+            "UUID bytes must appear byte-reversed in the wire frame"
+        );
+        assert!(
+            !out.windows(16).any(|w| w == canonical),
+            "canonical bytes must not appear verbatim"
+        );
     }
 
     #[test]

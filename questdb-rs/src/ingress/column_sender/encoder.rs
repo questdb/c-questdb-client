@@ -727,7 +727,7 @@ unsafe fn encode_column(
             encode_bitmap_le::<i64, 8>(out, data, row_count, validity, i64::to_le_bytes);
         },
         ColumnKind::Uuid { data } => unsafe {
-            encode_fixed_width_bitmap::<16>(out, data as *const u8, row_count, validity);
+            encode_uuid_bitmap(out, data as *const u8, row_count, validity);
         },
         ColumnKind::Long256 { data } => unsafe {
             encode_fixed_width_bitmap::<32>(out, data as *const u8, row_count, validity);
@@ -911,7 +911,38 @@ unsafe fn encode_bitmap_le<T, const N: usize>(
     }
 }
 
-/// Bitmap-style fixed-width binary column (UUID, LONG256). `data`
+/// UUID column: caller rows are canonical RFC-4122 big-endian; the QWP
+/// wire wants (lo LE, hi LE), which is each 16-byte row fully reversed.
+unsafe fn encode_uuid_bitmap(
+    out: &mut Vec<u8>,
+    data: *const u8,
+    row_count: usize,
+    validity: Option<&ValidityDescriptor>,
+) {
+    match validity.filter(|v| v.has_nulls()) {
+        None => {
+            out.push(0);
+            out.reserve(16 * row_count);
+            for i in 0..row_count {
+                let row = unsafe { slice::from_raw_parts(data.add(i * 16), 16) };
+                out.extend(row.iter().rev());
+            }
+        }
+        Some(v) => {
+            out.push(1);
+            unsafe { write_qwp_bitmap_from_validity(out, v) };
+            out.reserve(16 * v.non_null_count);
+            for i in 0..row_count {
+                if unsafe { v.is_valid(i) } {
+                    let row = unsafe { slice::from_raw_parts(data.add(i * 16), 16) };
+                    out.extend(row.iter().rev());
+                }
+            }
+        }
+    }
+}
+
+/// Bitmap-style fixed-width binary column (LONG256). `data`
 /// points at row 0 of an `[u8; N]` block.
 unsafe fn encode_fixed_width_bitmap<const N: usize>(
     out: &mut Vec<u8>,
@@ -2137,18 +2168,20 @@ mod tests {
     }
 
     #[test]
-    fn uuid_payload_is_byte_verbatim() {
-        // QuestDB wire order is the caller's 16 bytes verbatim (low 64 bits
-        // little-endian then high 64 bits little-endian). A reordering bug
-        // would corrupt every UUID, so pin the passthrough.
+    fn uuid_payload_is_swapped_to_wire_order() {
+        // Caller rows are canonical RFC-4122 big-endian; QWP wire order is
+        // (lo LE, hi LE) — the full 16-byte reversal. A passthrough bug
+        // would corrupt every UUID, so pin the swap.
         let uuid = [
             0x00u8, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xAA, 0xBB, 0xCC, 0xDD,
             0xEE, 0xFF,
         ];
+        let mut wire = uuid;
+        wire.reverse();
         let out = make_chunk_uuid(&[uuid], None, &[1i64]);
         assert!(
-            out.windows(16).any(|w| w == uuid),
-            "UUID bytes must appear verbatim in the wire frame"
+            out.windows(16).any(|w| w == wire),
+            "UUID bytes must appear byte-reversed in the wire frame"
         );
     }
 

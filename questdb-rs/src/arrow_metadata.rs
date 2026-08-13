@@ -30,5 +30,10 @@ pub const ARRAY_DIM_TENTATIVE: &str = "questdb.array_dim_tentative";
 /// Standard Apache Arrow extension-name field-metadata key.
 pub const ARROW_EXTENSION_NAME: &str = "ARROW:extension:name";
 /// Value used in [`ARROW_EXTENSION_NAME`] to mark a
-/// `FixedSizeBinary(16)` column as the canonical Arrow UUID.
+/// `FixedSizeBinary(16)` column as the canonical Arrow UUID. Per the
+/// Arrow spec this fixes the storage bytes as RFC-4122 big-endian.
+/// Egress satisfies it for free — the QWP decoder already normalizes
+/// UUID rows to canonical order — while ingress reverses labeled values
+/// into wire order (lo LE, hi LE). Unlabeled `FixedSizeBinary(16)` is
+/// forwarded verbatim in wire order.
 pub const EXT_ARROW_UUID: &str = "arrow.uuid";

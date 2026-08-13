@@ -303,7 +303,7 @@ pub(crate) enum ColumnKind {
     Binary,
     LargeBinary,
     BinaryView,
-    Uuid,
+    Uuid { big_endian: bool },
     Long256,
     Geohash(u8),
     SymbolDict { key: DictKey, value: DictValue },
@@ -454,7 +454,13 @@ pub(crate) fn classify(field: &Field, _array: &dyn Array) -> Result<ColumnKind> 
         (DataType::Binary, _, _) => ColumnKind::Binary,
         (DataType::LargeBinary, _, _) => ColumnKind::LargeBinary,
         (DataType::BinaryView, _, _) => ColumnKind::BinaryView,
-        (DataType::FixedSizeBinary(16), _, _) => ColumnKind::Uuid,
+        // The `arrow.uuid` canonical extension fixes the storage bytes as
+        // RFC-4122 big-endian; QWP wire order is (lo LE, hi LE), so labeled
+        // columns must be byte-swapped. Unlabeled FixedSizeBinary(16) has no
+        // byte-order contract and is forwarded verbatim (wire order).
+        (DataType::FixedSizeBinary(16), _, ext) => ColumnKind::Uuid {
+            big_endian: ext == Some(crate::arrow_metadata::EXT_ARROW_UUID),
+        },
         (DataType::FixedSizeBinary(32), _, _) => ColumnKind::Long256,
         (DataType::Dictionary(key, value), _, _)
             if dict_key_for(key).is_some() && dict_value_for(value).is_some() =>
@@ -600,7 +606,7 @@ pub(crate) fn wire_type_byte(kind: ColumnKind, _has_nulls: bool) -> u8 {
         | ColumnKind::SymbolUtf8View
         | ColumnKind::SymbolDict { .. } => QWP_TYPE_SYMBOL,
         ColumnKind::Binary | ColumnKind::LargeBinary | ColumnKind::BinaryView => QWP_TYPE_BINARY,
-        ColumnKind::Uuid => QWP_TYPE_UUID,
+        ColumnKind::Uuid { .. } => QWP_TYPE_UUID,
         ColumnKind::Long256 => QWP_TYPE_LONG256,
         ColumnKind::Geohash(_) => QWP_TYPE_GEOHASH,
         ColumnKind::Decimal32WidenToDecimal64 | ColumnKind::Decimal64 => QWP_TYPE_DECIMAL64,
@@ -631,7 +637,7 @@ fn kind_supports_sparse_nulls(kind: ColumnKind) -> bool {
             | ColumnKind::Binary
             | ColumnKind::LargeBinary
             | ColumnKind::BinaryView
-            | ColumnKind::Uuid
+            | ColumnKind::Uuid { .. }
             | ColumnKind::Long256
             | ColumnKind::Geohash(_)
             | ColumnKind::Decimal32WidenToDecimal64
@@ -958,6 +964,37 @@ fn u64_to_i64_le_checked(v: u64, row: usize) -> Result<[u8; 8]> {
         ));
     }
     Ok((v as i64).to_le_bytes())
+}
+
+/// `arrow.uuid` column body: RFC-4122 big-endian storage → QWP wire order
+/// (lo LE, hi LE), i.e. each 16-byte value reversed. `arr.value(row)`
+/// accounts for any slice offset.
+fn write_uuid_be_payload(out: &mut Vec<u8>, arr: &FixedSizeBinaryArray) -> Result<()> {
+    let non_null = non_null_count(arr, "UUID column")?;
+    let bytes = non_null.checked_mul(16).ok_or_else(|| {
+        fmt!(
+            ArrowIngest,
+            "UUID column: non_null {} * 16 overflows usize",
+            non_null
+        )
+    })?;
+    try_reserve_bytes(out, bytes, "UUID column")?;
+    match arr.nulls() {
+        None => {
+            for row in 0..arr.len() {
+                out.extend(arr.value(row).iter().rev());
+            }
+        }
+        Some(nulls) => {
+            for row in 0..arr.len() {
+                if nulls.is_null(row) {
+                    continue;
+                }
+                out.extend(arr.value(row).iter().rev());
+            }
+        }
+    }
+    Ok(())
 }
 
 fn non_null_fsb(out: &mut Vec<u8>, arr: &FixedSizeBinaryArray, size: usize) -> Result<()> {
@@ -3315,17 +3352,21 @@ pub(crate) fn write_arrow_column_body(
         ColumnKind::DictToVarchar { key, value } => {
             write_dict_to_varchar_payload(out, arr, key, value)
         }
-        ColumnKind::Uuid => {
+        ColumnKind::Uuid { big_endian } => {
             let a = arr.as_any().downcast_ref::<FixedSizeBinaryArray>().unwrap();
-            let elem = a.value_length() as usize;
-            if null_count == 0 {
-                let start = a.offset() * elem;
-                let len = a.len() * elem;
-                try_reserve_bytes(out, len, "UUID column")?;
-                out.extend_from_slice(&a.value_data()[start..start + len]);
-                Ok(())
+            if big_endian {
+                write_uuid_be_payload(out, a)
             } else {
-                non_null_fsb(out, a, elem)
+                let elem = a.value_length() as usize;
+                if null_count == 0 {
+                    let start = a.offset() * elem;
+                    let len = a.len() * elem;
+                    try_reserve_bytes(out, len, "UUID column")?;
+                    out.extend_from_slice(&a.value_data()[start..start + len]);
+                    Ok(())
+                } else {
+                    non_null_fsb(out, a, elem)
+                }
             }
         }
         ColumnKind::Long256 => {
@@ -3882,7 +3923,7 @@ fn estimate_frame_size(
             | ColumnKind::Date64Ms
             | ColumnKind::TimeAsLong(_)
             | ColumnKind::DurationAsLong(_) => 8 * row_count,
-            ColumnKind::Uuid => 16 * row_count,
+            ColumnKind::Uuid { .. } => 16 * row_count,
             ColumnKind::Long256 => 32 * row_count,
             ColumnKind::Utf8
             | ColumnKind::LargeUtf8
@@ -4520,27 +4561,46 @@ mod tests {
     }
 
     #[test]
-    fn uuid_with_arrow_uuid_extension_routes_to_column_uuid() {
+    fn uuid_with_arrow_uuid_extension_swaps_to_wire_order() {
+        // `arrow.uuid` storage is RFC-4122 big-endian; the wire wants
+        // (lo LE, hi LE) — the full 16-byte reversal.
+        // UUID 123e4567-e89b-12d3-a456-426614174000.
+        let canonical: [u8; 16] = [
+            0x12, 0x3e, 0x45, 0x67, 0xe8, 0x9b, 0x12, 0xd3, 0xa4, 0x56, 0x42, 0x66, 0x14, 0x17,
+            0x40, 0x00,
+        ];
         let mut b = FixedSizeBinaryBuilder::new(16);
-        b.append_value([
-            0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E,
-            0x0F, 0x10,
-        ])
-        .unwrap();
+        b.append_value(canonical).unwrap();
         let field = Field::new("id", DataType::FixedSizeBinary(16), true).with_metadata(metadata(
             &[(crate::arrow_metadata::ARROW_EXTENSION_NAME, "arrow.uuid")],
         ));
         let rb = single_col_batch(field, b.finish());
-        assert_ok_with_table_count(&rb, 1);
+        let out = encode(&rb);
+        let (n, ty, body) = decode_single_column(&out);
+        assert_eq!(n, 1);
+        assert_eq!(ty, QWP_TYPE_UUID);
+        let mut wire = canonical;
+        wire.reverse();
+        assert_eq!(decode_uuid_body(body, 1), vec![wire]);
     }
 
     #[test]
     fn uuid_without_metadata_routes_to_column_uuid() {
+        // No `arrow.uuid` label → no byte-order contract → verbatim
+        // (wire-order) passthrough.
+        let raw: [u8; 16] = [
+            0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E,
+            0x0F, 0x10,
+        ];
         let mut b = FixedSizeBinaryBuilder::new(16);
-        b.append_value([0u8; 16]).unwrap();
+        b.append_value(raw).unwrap();
         let field = Field::new("id", DataType::FixedSizeBinary(16), true);
         let rb = single_col_batch(field, b.finish());
-        assert_ok_with_table_count(&rb, 1);
+        let out = encode(&rb);
+        let (n, ty, body) = decode_single_column(&out);
+        assert_eq!(n, 1);
+        assert_eq!(ty, QWP_TYPE_UUID);
+        assert_eq!(decode_uuid_body(body, 1), vec![raw]);
     }
 
     #[test]
@@ -6532,6 +6592,70 @@ mod tests {
         assert_eq!(n, 2);
         assert_eq!(ty, QWP_TYPE_UUID);
         assert_eq!(decode_uuid_body(body, n), vec![[0x11u8; 16], [0x22u8; 16]]);
+    }
+
+    #[test]
+    fn sliced_arrow_uuid_array_swaps_sliced_window_only() {
+        // The big-endian swap path goes through `arr.value(row)`, which
+        // must respect the slice window.
+        let rows: [[u8; 16]; 4] = [
+            core::array::from_fn(|i| i as u8),
+            core::array::from_fn(|i| 0x10 + i as u8),
+            core::array::from_fn(|i| 0x20 + i as u8),
+            core::array::from_fn(|i| 0x30 + i as u8),
+        ];
+        let mut b = FixedSizeBinaryBuilder::new(16);
+        for r in &rows {
+            b.append_value(r).unwrap();
+        }
+        let sliced = b.finish().slice(1, 2);
+        let field = Field::new("id", DataType::FixedSizeBinary(16), false).with_metadata(metadata(
+            &[(crate::arrow_metadata::ARROW_EXTENSION_NAME, "arrow.uuid")],
+        ));
+        let rb = single_col_batch(field, sliced);
+        let out = encode(&rb);
+        let (n, ty, body) = decode_single_column(&out);
+        assert_eq!(n, 2);
+        assert_eq!(ty, QWP_TYPE_UUID);
+        let expect: Vec<[u8; 16]> = rows[1..3]
+            .iter()
+            .map(|r| {
+                let mut v = *r;
+                v.reverse();
+                v
+            })
+            .collect();
+        assert_eq!(decode_uuid_body(body, n), expect);
+    }
+
+    #[test]
+    fn arrow_uuid_with_nulls_swaps_non_null_values() {
+        let mut b = FixedSizeBinaryBuilder::new(16);
+        let v0: [u8; 16] = core::array::from_fn(|i| i as u8);
+        let v2: [u8; 16] = core::array::from_fn(|i| 0x40 + i as u8);
+        b.append_value(v0).unwrap();
+        b.append_null();
+        b.append_value(v2).unwrap();
+        let field = Field::new("id", DataType::FixedSizeBinary(16), true).with_metadata(metadata(
+            &[(crate::arrow_metadata::ARROW_EXTENSION_NAME, "arrow.uuid")],
+        ));
+        let rb = single_col_batch(field, b.finish());
+        let out = encode(&rb);
+        let (n, ty, body) = decode_single_column(&out);
+        assert_eq!(n, 3);
+        assert_eq!(ty, QWP_TYPE_UUID);
+        // Bitmap body: flag(1) + ceil(3/8)=1 bitmap byte (1 = null) +
+        // non-null values only, each reversed.
+        assert_eq!(body[0], 1, "null-bearing UUID column carries a bitmap");
+        assert_eq!(body[1], 0b010, "row 1 null");
+        let vals = &body[2..];
+        assert_eq!(vals.len(), 32);
+        let mut e0 = v0;
+        e0.reverse();
+        let mut e2 = v2;
+        e2.reverse();
+        assert_eq!(&vals[..16], e0);
+        assert_eq!(&vals[16..], e2);
     }
 
     // -----------------------------------------------------------------

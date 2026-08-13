@@ -882,11 +882,11 @@ impl<'a> Chunk<'a> {
     // Bitmap-style fixed-width columns
     // -------------------------------------------------------------------
 
-    /// Append a UUID column (QWP wire type `UUID`). Each row is 16 bytes
-    /// in QuestDB wire order — the low 64 bits little-endian followed by
-    /// the high 64 bits little-endian. This matches the row API and the
-    /// bytes produced by Arrow egress; it is NOT canonical RFC-4122
-    /// big-endian, so callers holding big-endian UUIDs must reorder first.
+    /// Append a UUID column (QWP wire type `UUID`). Each row is the 16
+    /// UUID bytes in canonical RFC-4122 big-endian order — exactly what
+    /// `uuid::Uuid::as_bytes()` and Python's `uuid.bytes` produce, and
+    /// the storage order of Arrow's `arrow.uuid`. The encoder byte-swaps
+    /// to QWP wire order (lo LE, hi LE) internally.
     pub fn column_uuid(
         &mut self,
         name: &str,

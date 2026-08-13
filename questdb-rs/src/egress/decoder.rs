@@ -116,6 +116,8 @@ fn read_owned(r: &mut ByteReader<'_>, parent: &Bytes, n: usize) -> Result<Bytes>
 #[derive(Debug, Clone)]
 pub struct ColumnBuffer {
     /// Raw little-endian element bytes. Length = `row_count * elem_size`.
+    /// Exception: UUID rows are canonical RFC-4122 big-endian — the
+    /// decoder reverses them out of wire order (see `reverse_uuid_rows`).
     pub values: Bytes,
     /// `Some` iff the column carried a null bitmap (`null_flag != 0`).
     pub validity: Option<Bytes>,
@@ -606,13 +608,16 @@ fn decode_column(
         // IPv4 NULL sentinel is `0` per spec §11.5; zero-fill is correct,
         // pass `None` to short-circuit the per-row sentinel copy.
         ColumnKind::Ipv4 => DecodedColumn::Ipv4(decode_fixed(r, parent, row_count, 4, None)?),
-        ColumnKind::Uuid => DecodedColumn::Uuid(decode_fixed(
+        // The wire carries (lo LE, hi LE) per UUID row; every surface above
+        // the decoder speaks canonical RFC-4122 big-endian, so reverse each
+        // row once here. Validity/sentinel handling ran on the wire bytes.
+        ColumnKind::Uuid => DecodedColumn::Uuid(reverse_uuid_rows(decode_fixed(
             r,
             parent,
             row_count,
             16,
             Some(&null_sentinel::UUID_LE),
-        )?),
+        )?)),
         ColumnKind::Long256 => DecodedColumn::Long256(decode_fixed(
             r,
             parent,
@@ -1117,6 +1122,20 @@ fn decode_validity(
             "unknown null_flag 0x{:02X}; expected 0x00 or 0x01",
             other
         )),
+    }
+}
+
+/// Reverse each 16-byte UUID row: wire (lo LE, hi LE) → canonical
+/// RFC-4122 big-endian. Costs the column its zero-copy path; null slots
+/// hold reversed sentinel bytes, which is fine — validity governs.
+fn reverse_uuid_rows(buf: ColumnBuffer) -> ColumnBuffer {
+    let mut values = Vec::with_capacity(buf.values.len());
+    for row in buf.values.chunks_exact(16) {
+        values.extend(row.iter().rev());
+    }
+    ColumnBuffer {
+        values: Bytes::from(values),
+        validity: buf.validity,
     }
 }
 
@@ -2238,6 +2257,40 @@ mod tests {
     }
 
     #[test]
+    fn uuid_values_decode_to_canonical_big_endian() {
+        // Wire order is (lo LE, hi LE); the decoder must hand out
+        // RFC-4122 big-endian — the full 16-byte reversal.
+        // UUID 123e4567-e89b-12d3-a456-426614174000:
+        //   hi = 0x123e4567e89b12d3, lo = 0xa456426614174000.
+        let hi = 0x123e_4567_e89b_12d3u64;
+        let lo = 0xa456_4266_1417_4000u64;
+        let mut wire = vec![0x00]; // null_flag = 0, no bitmap
+        wire.extend_from_slice(&lo.to_le_bytes());
+        wire.extend_from_slice(&hi.to_le_bytes());
+        let (flags_byte, payload) = BatchBuilder::new(1)
+            .add_column("u", ColumnKind::Uuid, wire)
+            .build();
+        let mut dict = SymbolDict::new();
+        let mut schema: Option<Schema> = None;
+        let batch = decode_result_batch(
+            &payload,
+            flags_byte,
+            &mut dict,
+            &mut schema,
+            &mut ZstdScratch::new(),
+        )
+        .unwrap();
+        let ColumnView::Uuid(c) = batch.column_view(0, &dict).unwrap() else {
+            panic!("not a Uuid view");
+        };
+        let canonical: [u8; 16] = [
+            0x12, 0x3e, 0x45, 0x67, 0xe8, 0x9b, 0x12, 0xd3, 0xa4, 0x56, 0x42, 0x66, 0x14, 0x17,
+            0x40, 0x00,
+        ];
+        assert_eq!(c.value(0), &canonical);
+    }
+
+    #[test]
     fn null_sentinels_per_spec_11_5() {
         // Locks the per-type NULL sentinel patterns from spec §11.5
         // against drift. Each row 0 carries a real value; row 1 is NULL
@@ -2268,10 +2321,12 @@ mod tests {
                 le_f64s(&[1.5]),
                 &0x7FF8_0000_0000_0000u64.to_le_bytes(),
             ),
+            // UUID rows are reversed to canonical order at decode, so the
+            // observed null slot is the §11.5 wire sentinel byte-reversed.
             (
                 ColumnKind::Uuid,
                 uuid_vals,
-                &[0, 0, 0, 0, 0, 0, 0, 0x80, 0, 0, 0, 0, 0, 0, 0, 0x80],
+                &[0x80, 0, 0, 0, 0, 0, 0, 0, 0x80, 0, 0, 0, 0, 0, 0, 0],
             ),
             (
                 ColumnKind::Long256,

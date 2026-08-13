@@ -130,9 +130,13 @@ typedef enum line_sender_error_code
     line_sender_error_server_rejection = 14,
 
     /** Arrow column whose kind cannot be persisted (e.g.
-     *  `FixedSizeBinary(16)` without `arrow.uuid` extension metadata;
-     *  `ARRAY(LONG, N-D)` is egress-only; nested-list leaf must be
-     *  `Float64`). `arrow` feature only. */
+     *  `FixedSizeBinary` with a width other than 16 (UUID) or 32
+     *  (LONG256); `ARRAY(LONG, N-D)` is egress-only; nested-list leaf
+     *  must be `Float64`). Note `FixedSizeBinary(16)` is accepted with
+     *  or without `arrow.uuid` metadata: labeled columns are canonical
+     *  RFC-4122 big-endian and byte-swapped to wire order, unlabeled
+     *  ones are forwarded verbatim in wire order. `arrow` feature
+     *  only. */
     line_sender_error_arrow_unsupported_column_kind = 15,
 
     /** RecordBatch failed client-side structural validation

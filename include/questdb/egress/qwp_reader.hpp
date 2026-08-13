@@ -1509,8 +1509,10 @@ struct decimal_view
     }
 };
 
-/** UUID / LONG256 view. `values` is dense raw little-endian bytes;
- *  `value_stride` is 16 (UUID) or 32 (LONG256). */
+/** UUID / LONG256 view. `value_stride` is 16 (UUID) or 32 (LONG256).
+ *  UUID rows are canonical RFC-4122 big-endian bytes (already reversed
+ *  out of wire order); LONG256 rows are little-endian limbs, low limb
+ *  first, verbatim from the wire. */
 struct bytes_view
 {
     egress::column_kind kind;
@@ -1928,7 +1930,8 @@ public:
         return egress::decimal256{out, _scalar.decimal_scale};
     }
 
-    /** UUID row → `nullable<array<uint8_t, 16>>` (LE bytes). */
+    /** UUID row → `nullable<array<uint8_t, 16>>`, canonical RFC-4122
+     *  big-endian bytes. */
     nullable<std::array<uint8_t, 16>> get_uuid(size_t row) const
     {
         ensure_kind(column_kind::uuid, "column::get_uuid");

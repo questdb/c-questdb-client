@@ -629,13 +629,17 @@ def _arr_fsb(values, *, params) -> pa.Array:
     return pa.array(values, type=pa.binary(params["width"]))
 
 def _arr_uuid_lo_hi(values, *, params) -> pa.Array:
+    # The column carries the `arrow.uuid` extension label, whose contract
+    # is canonical RFC-4122 storage. Let the uuid library produce the
+    # bytes so the harness makes no byte-order choice of its own; the
+    # client swaps to QWP wire order internally.
     payload: List[Optional[bytes]] = []
     for v in values:
         if v is None:
             payload.append(None)
         else:
             lo, hi = v
-            payload.append(lo.to_bytes(8, "little") + hi.to_bytes(8, "little"))
+            payload.append(uuid.UUID(int=(hi << 64) | lo).bytes)
     return pa.array(payload, type=pa.binary(16))
 
 def _arr_timestamp(values, *, params) -> pa.Array:

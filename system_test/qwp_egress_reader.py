@@ -490,7 +490,9 @@ def _decode_uuid(col: _LineReaderColumnData) -> Tuple[str, list]:
         if _is_null(validity, r):
             out.append(None)
             continue
-        lo, hi = struct.unpack_from("<QQ", raw, r * 16)
+        # Reader values are canonical RFC-4122 big-endian: hi half
+        # first, both halves big-endian.
+        hi, lo = struct.unpack_from(">QQ", raw, r * 16)
         if lo == 0 and hi == _LONG_NULL & ((1 << 64) - 1):
             # QuestDB UUID NULL sentinel — lo=0, hi=Long.MIN_VALUE.
             out.append(None)

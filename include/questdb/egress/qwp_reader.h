@@ -856,7 +856,9 @@ QUESTDB_CLIENT_API void qwp_reader_query_bind_varchar(
 QUESTDB_CLIENT_API void qwp_reader_query_bind_binary(
     qwp_reader_query*, const uint8_t* buf, size_t len);
 
-/** Bind a 16-byte UUID value (raw bytes). `value` MUST be non-NULL and point
+/** Bind a 16-byte UUID value in canonical RFC-4122 big-endian order (the
+ *  client byte-swaps to QWP wire order internally; matches the byte order
+ *  UUID values are read back in). `value` MUST be non-NULL and point
  *  to at least 16 readable bytes. A NULL `value` stores a deferred
  *  `questdb_error_invalid_bind` on the query that surfaces from
  *  `qwp_reader_query_execute` — silently binding all-zero bytes would
@@ -1598,7 +1600,10 @@ static inline double qwp_reader_column_data_get_f64(
     return v;
 }
 
-/* UUID / LONG256: copy `value_stride` bytes (16 or 32) into out. */
+/* UUID / LONG256: copy `value_stride` bytes (16 or 32) into out.
+ * UUID bytes are canonical RFC-4122 big-endian (the client already
+ * reversed them out of wire order); LONG256 is little-endian limbs,
+ * low limb first, verbatim from the wire. */
 static inline void qwp_reader_column_data_get_bytes(
     const qwp_reader_column_data* d,
     size_t row,

@@ -588,7 +588,8 @@ bool qwp_chunk_column_bool(
 
 /**
  * `UUID` column. `data` points to `row_count * 16` bytes; each 16-byte
- * group is one UUID (bytes 0..8 lo half LE, 8..16 hi half LE).
+ * group is one UUID in canonical RFC-4122 big-endian order. The client
+ * byte-swaps to QWP wire order internally.
  */
 QUESTDB_CLIENT_API
 bool qwp_chunk_column_uuid(
@@ -1141,7 +1142,9 @@ bool qwp_chunk_append_arrow_column(
  *     datetime64[us] → TIMESTAMP
  *     datetime64[ns] → TIMESTAMP_NANOS
  *     timedelta64[s/ms/us/ns] → LONG
- *     S16          → UUID            (16 bytes per row)
+ *     S16          → UUID            (16 bytes per row, canonical
+ *                                     RFC-4122 big-endian; the client
+ *                                     byte-swaps to wire order)
  *     S32          → LONG256         (32 bytes per row)
  *     u32_ipv4     → IPV4
  *     u16_char     → CHAR
@@ -1211,7 +1214,7 @@ typedef enum qwp_numpy_dtype
     qwp_numpy_timedelta64_ns = 19,
 
     /* Fixed-size bytes */
-    qwp_numpy_s16 = 20, /* 16B/row → UUID */
+    qwp_numpy_s16 = 20, /* 16B/row → UUID (canonical RFC-4122 BE) */
     qwp_numpy_s32 = 21, /* 32B/row → LONG256 */
 
     /* Decimals (read decimal_scale from qwp_numpy_extras) */

@@ -389,12 +389,16 @@ fn uuid_round_trip() {
             let ColumnView::Uuid(c) = view.column(0).unwrap() else {
                 panic!("col 0")
             };
-            // 16 bytes — verify length and basic shape; exact byte order
-            // is QuestDB-internal. We just confirm it's non-zero and the
-            // round-trip ran end-to-end.
-            let bytes = c.value(0);
-            assert_eq!(bytes.len(), 16);
-            assert!(bytes.iter().any(|b| *b != 0));
+            // The reader hands out canonical RFC-4122 big-endian bytes,
+            // anchored against the server's own text parser: these must
+            // be exactly the bytes of the SQL literal above. The Arrow
+            // egress path serves the same decoder buffer verbatim under
+            // the `arrow.uuid` label, so this pins that surface too.
+            let canonical: [u8; 16] = [
+                0x55, 0x0e, 0x84, 0x00, 0xe2, 0x9b, 0x41, 0xd4, 0xa7, 0x16, 0x44, 0x66, 0x55,
+                0x44, 0x00, 0x00,
+            ];
+            assert_eq!(c.value(0), &canonical);
         },
     );
 }

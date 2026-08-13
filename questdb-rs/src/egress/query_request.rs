@@ -193,7 +193,11 @@ impl QueryRequestBuilder {
     pub fn bind_date_millis(self, v: i64) -> Self {
         self.bind(Bind::DateMillis(v))
     }
-    pub fn bind_uuid(self, v: [u8; 16]) -> Self {
+    /// Bind a UUID as its 16 canonical RFC-4122 big-endian bytes — what
+    /// `uuid::Uuid::as_bytes()` and Python's `uuid.bytes` produce. The
+    /// QWP wire wants (lo LE, hi LE), the full byte reversal, done here.
+    pub fn bind_uuid(self, mut v: [u8; 16]) -> Self {
+        v.reverse();
         self.bind(Bind::Uuid(v))
     }
     pub fn bind_long256(self, v: [u8; 32]) -> Self {
