@@ -307,6 +307,15 @@ fn require_secure(url: &str, allow_insecure: bool) -> Result<()> {
         .map_err(|e| OidcError::config(format!("Malformed endpoint URL {url:?}: {e}")))?;
     let scheme = uri.scheme_str().unwrap_or("").to_ascii_lowercase();
     if scheme == "https" {
+        // A hostless https URL (e.g. `https:///path`) would pass this gate and
+        // then reach the TLS connector, which needs a URI authority. Reject it
+        // here with a clear config error. Endpoints are already origin-checked
+        // at build time, so this is defense in depth.
+        if uri.host().unwrap_or("").is_empty() {
+            return Err(OidcError::config(format!(
+                "Malformed endpoint URL {url:?}: an https URL must have a host."
+            )));
+        }
         return Ok(());
     }
     if scheme == "http" {
@@ -402,10 +411,15 @@ impl<In: Transport> Connector<In> for TlsConnector {
             return Ok(Some(Either::A(transport)));
         }
 
+        // Never `.expect()` here: this crate is built into a `panic = "abort"`
+        // FFI, so a panic on a missing authority would abort the host process.
+        // A URI without an authority is already rejected upstream
+        // (`require_secure` + `reject_confusable_authority`); return a TLS error
+        // as a local safety net rather than relying on that.
         let name_borrowed: ServerName<'_> = details
             .uri
             .authority()
-            .expect("uri authority for tls")
+            .ok_or(ureq::Error::Tls("tls uri has no authority"))?
             .host()
             .try_into()
             .map_err(|_e| ureq::Error::Tls("tls invalid dns name error"))?;
@@ -725,6 +739,21 @@ mod tests {
     #[test]
     fn https_always_allowed() {
         assert!(require_secure("https://idp.example.com/token", false).is_ok());
+    }
+
+    #[test]
+    fn hostless_https_rejected() {
+        // A hostless https URL must never slip through to the TLS connector,
+        // which needs a URI authority (a missing one would otherwise reach the
+        // `.expect` there — an abort under the `panic = "abort"` FFI).
+        for url in ["https:///token", "https://:443/token"] {
+            let err = require_secure(url, false).unwrap_err();
+            assert_eq!(
+                err.kind(),
+                crate::oidc::error::OidcErrorKind::Config,
+                "{url} should be rejected as a config error"
+            );
+        }
     }
 
     #[test]
