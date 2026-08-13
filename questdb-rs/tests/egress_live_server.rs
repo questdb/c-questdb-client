@@ -1652,17 +1652,19 @@ fn bind_ipv4_rejected_client_side() {
 }
 
 #[test]
-fn bind_uuid_passthrough() {
+fn bind_uuid_round_trip() {
     let srv = server();
     let mut reader = make_reader(srv);
-    // 16 bytes. We bind raw bytes; the server stores them as a UUID.
-    // We just verify the round-trip matches what we sent.
+    // Canonical RFC-4122 bytes of 550e8400-e29b-41d4-a716-446655440000.
+    // The byte round-trip alone would be a tautology (bind-reverse and
+    // read-reverse cancel), so also anchor against the server's own text
+    // rendering of the bound value.
     let bytes: [u8; 16] = [
         0x55, 0x0e, 0x84, 0x00, 0xe2, 0x9b, 0x41, 0xd4, 0xa7, 0x16, 0x44, 0x66, 0x55, 0x44, 0x00,
         0x00,
     ];
     let mut cur = reader
-        .prepare("select $1::uuid as v")
+        .prepare("select $1::uuid as v, cast($1::uuid as string) as s")
         .bind_uuid(bytes)
         .execute()
         .expect("execute");
@@ -1671,6 +1673,13 @@ fn bind_uuid_passthrough() {
         panic!("col 0 not uuid: got {:?}", view.column(0).unwrap().kind())
     };
     assert_eq!(c.value(0), &bytes);
+    let ColumnView::Varchar(s) = view.column(1).unwrap() else {
+        panic!(
+            "col 1 not varchar: got {:?}",
+            view.column(1).unwrap().kind()
+        )
+    };
+    assert_eq!(s.value(0).unwrap(), "550e8400-e29b-41d4-a716-446655440000");
 }
 
 #[test]
