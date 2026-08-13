@@ -2733,7 +2733,9 @@ fn refresh_pre_send_failure_keeps_persisted_parent() {
         "a pre-send connect failure must not consume the persisted refresh token"
     );
     assert_eq!(
-        auth.token_set().and_then(|t| t.refresh_token).as_deref(),
+        auth.token_set()
+            .and_then(|t| t.refresh_token.clone())
+            .as_deref(),
         Some("RT-1")
     );
 }
@@ -2789,7 +2791,7 @@ fn transient_status_refresh_preserves_persisted_parent() {
         "a transient 503 must not consume the persisted refresh token"
     );
     assert_eq!(
-        auth.token_set().and_then(|t| t.refresh_token),
+        auth.token_set().and_then(|t| t.refresh_token.clone()),
         Some("RT-1".to_string()),
         "the in-memory refresh token must survive a transient 503"
     );

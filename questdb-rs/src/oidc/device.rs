@@ -28,6 +28,8 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex, TryLockError};
 use std::time::{Duration, Instant};
 
+use zeroize::Zeroize;
+
 use serde_json::Value;
 
 use crate::oidc::discovery::{
@@ -594,7 +596,10 @@ impl OidcDeviceAuth {
 
     fn discard_cached_refresh(&self) {
         if let Some(cached) = self.lock_tokens().as_mut() {
-            cached.refresh_token = None;
+            // Scrub the string buffer, don't just drop it: a bare `= None` would
+            // release the refresh token to the heap unwiped. `zeroize()`
+            // overwrites it and leaves the field `None`.
+            cached.refresh_token.zeroize();
         }
     }
 

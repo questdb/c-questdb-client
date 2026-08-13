@@ -27,6 +27,8 @@
 use std::fmt::{Debug, Formatter};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use zeroize::Zeroize;
+
 /// Refresh a little before the real expiry to absorb clock skew / latency.
 pub(crate) const DEFAULT_SKEW_SECONDS: f64 = 30.0;
 
@@ -129,6 +131,21 @@ impl Debug for TokenSet {
             .field("sub", &self.sub.as_ref().map(|_| "<redacted>"))
             .field("issued_at", &self.issued_at)
             .finish()
+    }
+}
+
+impl Drop for TokenSet {
+    fn drop(&mut self) {
+        // Scrub the bearer secrets (and the PII subject) from the heap when this
+        // cached token set is dropped — on rotation, `clear()`, or auth teardown
+        // — mirroring the `Zeroizing<String>` the FFI hands to callers. Every
+        // `Option<String>::zeroize()` overwrites the string buffer and drops it.
+        // serde-owned intermediates in the token store remain a documented
+        // residual (see `token_store::serialize` / `parse_and_verify`).
+        self.access_token.zeroize();
+        self.id_token.zeroize();
+        self.refresh_token.zeroize();
+        self.sub.zeroize();
     }
 }
 

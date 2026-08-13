@@ -23,6 +23,8 @@ libc = "0.2"
 socket2 = { version = "0.6.1", optional = true }
 dns-lookup = "3.0.0"
 base64ct = { version = "1.7", features = ["alloc"] }
+# OIDC-only: scrub cached/persisted token secrets from the heap on drop.
+zeroize = { version = "1", features = ["alloc"], optional = true }
 ryu = { version = "1.0" }
 itoa = "1.0"
 # Used in the QWP egress decoder for zero-copy slicing of frame
@@ -276,7 +278,7 @@ _sender-qwp-ws = []
 _sync-sender = []
 _egress = ["dep:bytes"]
 _keystore-roots = ["dep:jks", "dep:p12-keystore"]
-_oidc = []
+_oidc = ["dep:zeroize"]
 # Shared Arrow / Polars dependency bundles, enabled by both directional
 # features. Don't use directly.
 _arrow = ["dep:arrow", "dep:aligned-vec", "dep:bytes"]

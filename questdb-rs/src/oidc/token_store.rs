@@ -63,6 +63,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime};
 
 use serde_json::Value;
+use zeroize::{Zeroize, Zeroizing};
 
 /// The environment variable that overrides the default token-store directory.
 /// Shared with the other QuestDB clients.
@@ -179,6 +180,17 @@ impl fmt::Debug for PersistedToken {
             .field("expires_at", &self.expires_at)
             .field("token_ttl", &self.token_ttl)
             .finish()
+    }
+}
+
+impl Drop for PersistedToken {
+    fn drop(&mut self) {
+        // Scrub the persisted secrets from the heap when this carrier is dropped
+        // (after a save, or after a load hands the token on to the cache). Each
+        // `Option<String>::zeroize()` overwrites the string buffer.
+        self.access_token.zeroize();
+        self.id_token.zeroize();
+        self.refresh_token.zeroize();
     }
 }
 
@@ -617,7 +629,7 @@ impl FileTokenStore {
         })
     }
 
-    fn serialize(&self, key: &TokenStoreKey, token: &PersistedToken) -> Vec<u8> {
+    fn serialize(&self, key: &TokenStoreKey, token: &PersistedToken) -> Zeroizing<Vec<u8>> {
         // A null value (an absent audience/issuer, or a token kind the grant did
         // not return) is OMITTED, never written as JSON null — the only encoding
         // under which a present value round-trips verbatim and an absent one reads
@@ -659,8 +671,11 @@ impl FileTokenStore {
             Value::from(seconds_to_millis(token.token_ttl)),
         );
         // serde_json escapes `"`, `\` and control chars, so an opaque token string
-        // round-trips safely.
-        serde_json::to_vec(&Value::Object(map)).unwrap_or_default()
+        // round-trips safely. Wrap the write buffer in `Zeroizing` so the
+        // plaintext bytes are scrubbed once the caller has written them. The
+        // `serde_json::Value` intermediates in `map` still hold clones of the
+        // secrets and are serde-owned; scrubbing those is left as a residual.
+        Zeroizing::new(serde_json::to_vec(&Value::Object(map)).unwrap_or_default())
     }
 
     // -- lock-file protocol -------------------------------------------------
@@ -813,8 +828,9 @@ impl TokenStore for FileTokenStore {
             None => return Ok(None), // missing / non-regular / empty / oversized
         };
         // Read at most MAX_FILE_BYTES + 1 so an oversized file (grown after the
-        // metadata check) is rejected rather than read whole.
-        let mut data = Vec::new();
+        // metadata check) is rejected rather than read whole. `Zeroizing` scrubs
+        // the plaintext file bytes from the heap when this buffer is dropped.
+        let mut data = Zeroizing::new(Vec::new());
         file.take(MAX_FILE_BYTES + 1)
             .read_to_end(&mut data)
             .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { Box::new(e) })?;
