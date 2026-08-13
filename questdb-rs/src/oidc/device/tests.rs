@@ -754,6 +754,60 @@ fn refresh_request_omits_scope_when_grant_is_narrower() {
 }
 
 #[test]
+fn groups_mode_refresh_requests_openid_scope() {
+    // Groups mode must receive a fresh id_token on every refresh, and some IdPs
+    // only re-issue one when `openid` is present in the refresh request itself,
+    // not merely in the original grant. So a groups-mode refresh must carry
+    // `scope=openid` (a non-groups refresh still omits scope — see
+    // refresh_request_omits_scope_when_grant_is_narrower). Without it the IdP
+    // returns no id_token and a headless client is forced to re-sign-in on every
+    // expiry.
+    let refresh_body = Arc::new(Mutex::new(None));
+    let mock = {
+        let refresh_body = Arc::clone(&refresh_body);
+        MockServer::start(move |method, path, body| {
+            match (method, path) {
+            ("POST", "/device") => (200, device_response()),
+            ("POST", "/token") if body.contains("grant_type=refresh_token") => {
+                *refresh_body.lock().unwrap() = Some(body.to_string());
+                (
+                    200,
+                    r#"{"access_token":"AT-refreshed","id_token":"ID-refreshed","expires_in":300}"#
+                        .to_string(),
+                )
+            }
+            ("POST", "/token") => (
+                200,
+                r#"{"access_token":"AT-1","id_token":"ID-1","refresh_token":"RT-1","expires_in":300}"#
+                    .to_string(),
+            ),
+            _ => (404, "{}".to_string()),
+        }
+        })
+    };
+    let auth = explicit_auth(&mock, true);
+    assert_eq!(sign_in_and_token(&auth).unwrap(), "ID-1");
+
+    // Force a refresh; because the request carries `openid`, the IdP re-issues an
+    // id_token and the silent refresh succeeds without an interactive re-prompt.
+    auth.tokens.lock().unwrap().as_mut().unwrap().expires_at = 1.0;
+    assert_eq!(auth.token().unwrap(), "ID-refreshed");
+
+    let body = refresh_body
+        .lock()
+        .unwrap()
+        .clone()
+        .expect("refresh request was captured");
+    let fields: Vec<&str> = body.split('&').collect();
+    assert!(fields.contains(&"grant_type=refresh_token"));
+    assert!(
+        fields.contains(&"scope=openid"),
+        "groups-mode refresh must request the openid scope so the IdP re-issues \
+         an id_token; body={body}"
+    );
+}
+
+#[test]
 fn empty_scope_falls_back_to_openid() {
     // An explicit empty scope is filtered (like audience), not sent verbatim.
     let auth = OidcDeviceAuth::builder()

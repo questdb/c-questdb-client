@@ -1395,10 +1395,23 @@ impl OidcDeviceAuth {
             ("refresh_token", refresh_token),
             ("client_id", self.config.client_id.as_str()),
         ];
-        // Deliberately omit `scope`. RFC 6749 section 6 defines omission as
-        // requesting the scope of the original grant; sending the configured
-        // scope here could exceed a narrower scope actually granted by the IdP
-        // and make an otherwise valid refresh token fail with `invalid_scope`.
+        // RFC 6749 section 6 defines an omitted `scope` as requesting the scope
+        // of the original grant, so by default omit it: sending the full
+        // configured scope could exceed a narrower scope actually granted by the
+        // IdP and fail an otherwise valid refresh with `invalid_scope`.
+        //
+        // Groups mode is the exception. It must receive a fresh `id_token` on
+        // every refresh, and several IdPs (Azure AD, Okta, Auth0) only re-issue
+        // one when `openid` is present in *this* request, not merely in the
+        // original grant. Without it the refresh returns no `id_token`,
+        // `has_required_token` fails, and a headless client is forced back into
+        // an interactive sign-in on every expiry. Request `openid` alone: it is
+        // always within the granted scope (the initial device-authorization
+        // request forces it, so it cannot trigger `invalid_scope`) while the
+        // broader configured scope stays omitted.
+        if self.config.groups_in_token {
+            form.push(("scope", "openid"));
+        }
         if let Some(audience) = &self.config.audience {
             form.push(("audience", audience.as_str()));
         }
