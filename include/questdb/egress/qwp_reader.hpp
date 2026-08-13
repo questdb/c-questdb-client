@@ -1094,12 +1094,21 @@ public:
         ::qwp_reader_query_bind_binary(_impl, buf, len);
         return *this;
     }
+    /**
+     * Bind a UUID as 16 canonical RFC-4122 bytes in big-endian/network byte
+     * order. Earlier versions interpreted this byte array differently;
+     * callers upgrading must pass canonical bytes.
+     */
     query& bind_uuid(const std::array<uint8_t, 16>& bytes)
     {
         ensure_impl();
         ::qwp_reader_query_bind_uuid(_impl, bytes.data());
         return *this;
     }
+    /**
+     * Bind a LONG256 as 32 raw little-endian bytes: four 64-bit limbs,
+     * least-significant limb first.
+     */
     query& bind_long256(const std::array<uint8_t, 32>& bytes)
     {
         ensure_impl();
