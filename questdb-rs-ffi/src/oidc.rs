@@ -1949,10 +1949,11 @@ mod tests {
                 events.verification_uri_complete,
                 "https://idp.example.com/activate?code=ABCD"
             );
-            assert_eq!(
-                events.browser_target,
-                "https://idp.example.com/activate?code=ABCD"
-            );
+            // The verification_uri host is a non-ASCII confusable, so it is not
+            // a vettable browser target; the different-host complete is refused
+            // rather than silently offered for open/QR, and no target is
+            // emitted (empty string in the recording).
+            assert_eq!(events.browser_target, "");
             drop(events);
             questdb_oidc_token_free(token);
             questdb_oidc_auth_free(auth);

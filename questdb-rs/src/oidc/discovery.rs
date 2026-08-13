@@ -126,6 +126,17 @@ fn origin_str(url: &str) -> String {
     }
 }
 
+/// True when two URLs share an origin (scheme + host + effective port, with
+/// default ports folded in). Used to keep an auto-opened / QR-encoded
+/// `verification_uri_complete` from steering to a different host than the
+/// `verification_uri` shown to the user (see `DeviceCodeChallenge::browser_target`).
+pub(crate) fn same_origin(a: &str, b: &str) -> bool {
+    matches!(
+        (normalized_origin(a), normalized_origin(b)),
+        (Ok(a), Ok(b)) if a == b
+    )
+}
+
 /// True if the `/settings` channel is plaintext http to a non-loopback host — a
 /// MITM-tamperable channel (only reachable with `allow_insecure_transport`).
 fn settings_channel_is_plaintext(questdb_url: &str) -> bool {

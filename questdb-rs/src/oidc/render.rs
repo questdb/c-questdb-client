@@ -104,14 +104,34 @@ impl DeviceCodeChallenge {
     }
 
     /// The single vetted `http(s)` target to open in a browser / make clickable:
-    /// the pre-filled URL when safe, else the plain verification URL.
+    /// the pre-filled `verification_uri_complete` when it is safe **and shares
+    /// the origin of** `verification_uri`, otherwise the plain
+    /// `verification_uri`.
+    ///
+    /// `verification_uri_complete` is a target the user does not read
+    /// character-by-character — it is auto-opened, encoded into a QR, and can
+    /// back a fixed-label "authorize directly" link whose host is never shown.
+    /// RFC 8628 §3.3.1 makes it the same URL as `verification_uri` with the user
+    /// code added, so a legitimate pair shares an origin. A tampered or hostile
+    /// device response could instead pair a trusted-looking `verification_uri`
+    /// with a `complete` on a DIFFERENT host, silently steering the
+    /// opened/scanned target to the attacker while the displayed host still
+    /// reads as trusted. The origin check refuses such a `complete` and falls
+    /// back to the shown `verification_uri`; when `verification_uri` itself is
+    /// not a safe target (so there is no trusted host to anchor against), no
+    /// target is offered at all.
     ///
     /// The returned URL is control-stripped and has no userinfo; its host is
     /// non-empty ASCII. It remains separate from the display accessors so UI
     /// code cannot accidentally open a merely printable, untrusted value.
     pub fn browser_target(&self) -> Option<String> {
-        safe_target(self.verification_uri_complete.as_deref())
-            .or_else(|| safe_target(Some(&self.verification_uri)))
+        let plain = safe_target(Some(&self.verification_uri))?;
+        match safe_target(self.verification_uri_complete.as_deref()) {
+            Some(complete) if crate::oidc::discovery::same_origin(&complete, &plain) => {
+                Some(complete)
+            }
+            _ => Some(plain),
+        }
     }
 }
 
@@ -493,10 +513,71 @@ mod tests {
             challenge.display_verification_uri_complete().as_deref(),
             Some("https://idp.example.com/activate?code=ABCD")
         );
+        // The verification_uri host is a non-ASCII confusable, so it is not a
+        // vettable browser target. With no trusted host to anchor against, the
+        // cross-host `complete` is refused rather than silently opened/QR'd, so
+        // no browser target is offered.
+        assert_eq!(challenge.browser_target(), None);
+    }
+
+    #[test]
+    fn browser_target_uses_same_origin_complete() {
+        // The pre-filled complete shares verification_uri's origin, so it is the
+        // browser target (the user code is pre-filled for a one-click open/QR).
+        let challenge = DeviceCodeChallenge {
+            user_code: "WXYZ".into(),
+            verification_uri: "https://idp.example.com/activate".into(),
+            verification_uri_complete: Some(
+                "https://idp.example.com/activate?user_code=WXYZ".into(),
+            ),
+        };
         assert_eq!(
             challenge.browser_target().as_deref(),
-            Some("https://idp.example.com/activate?code=ABCD")
+            Some("https://idp.example.com/activate?user_code=WXYZ")
         );
+    }
+
+    #[test]
+    fn browser_target_ignores_default_port_difference() {
+        // An explicit default port on one side is still the same origin.
+        let challenge = DeviceCodeChallenge {
+            user_code: "WXYZ".into(),
+            verification_uri: "https://idp.example.com/activate".into(),
+            verification_uri_complete: Some(
+                "https://idp.example.com:443/activate?user_code=WXYZ".into(),
+            ),
+        };
+        assert_eq!(
+            challenge.browser_target().as_deref(),
+            Some("https://idp.example.com:443/activate?user_code=WXYZ")
+        );
+    }
+
+    #[test]
+    fn browser_target_rejects_cross_origin_complete() {
+        // A tampered device response pairs a trusted-looking verification_uri
+        // with a `complete` on a different origin. The complete must NOT become
+        // the browser / QR / auto-open target (that would silently steer the
+        // user to the attacker while the shown host still reads as trusted);
+        // fall back to the vetted, same-host verification_uri.
+        for evil in [
+            "https://evil.example/?code=WXYZ",            // different host
+            "https://login.questdb.io.evil.example/?x=1", // suffix trick
+            "http://login.questdb.io/device",             // scheme downgrade
+            "https://login.questdb.io:8443/device",       // different port
+            "https://trusted@login.questdb.io/device",    // userinfo (safe_target rejects)
+        ] {
+            let challenge = DeviceCodeChallenge {
+                user_code: "WXYZ".into(),
+                verification_uri: "https://login.questdb.io/device".into(),
+                verification_uri_complete: Some(evil.into()),
+            };
+            assert_eq!(
+                challenge.browser_target().as_deref(),
+                Some("https://login.questdb.io/device"),
+                "cross-origin complete {evil:?} must fall back to verification_uri"
+            );
+        }
     }
 
     #[test]
