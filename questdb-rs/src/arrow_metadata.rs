@@ -10,7 +10,8 @@
 //! detection (`schemas_equal`).
 
 /// Carries the QuestDB native column type when the Arrow type
-/// alone is ambiguous (e.g. `Int8` → `byte`, `UInt16` → `char`).
+/// alone is ambiguous (e.g. `Int8` → `byte`, `UInt16` → `char`,
+/// `FixedSizeBinary(16)` → `uuid`, `FixedSizeBinary(32)` → `long256`).
 pub const COLUMN_TYPE: &str = "questdb.column_type";
 /// `"true"` on the field that is the table's designated timestamp.
 /// Informational only — not load-bearing for drift detection.
@@ -34,6 +35,7 @@ pub const ARROW_EXTENSION_NAME: &str = "ARROW:extension:name";
 /// Arrow spec this fixes the storage bytes as RFC-4122 big-endian.
 /// Egress satisfies it for free — the QWP decoder already normalizes
 /// UUID rows to canonical order — while ingress reverses labeled values
-/// into wire order (lo LE, hi LE). Unlabeled `FixedSizeBinary(16)` is
-/// forwarded verbatim in wire order.
+/// into wire order (lo LE, hi LE). `FixedSizeBinary(16)` without this
+/// label (or a `questdb.column_type=uuid` claim) is opaque bytes and
+/// lands as a BINARY column, verbatim — width alone never implies UUID.
 pub const EXT_ARROW_UUID: &str = "arrow.uuid";

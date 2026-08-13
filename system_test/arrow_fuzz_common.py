@@ -1106,6 +1106,11 @@ def _md_none(p):
 def _md_char(p):
     return {b"questdb.column_type": b"char"}
 
+def _md_long256(p):
+    # LONG256 has no Arrow extension type; without this claim a
+    # FixedSizeBinary(32) column is opaque bytes and lands as BINARY.
+    return {b"questdb.column_type": b"long256"}
+
 def _md_ipv4(p):
     return {b"questdb.column_type": b"ipv4"}
 
@@ -1230,7 +1235,7 @@ def _build_kind_registry() -> Dict[str, KindSpec]:
     )
     reg["long256"] = KindSpec(
         "long256", "LONG256",
-        _ty_fsb32, _md_none,
+        _ty_fsb32, _md_long256,
         _vg_fixed_bytes(32), _arr_fsb, _set_long256,
         compare_fn=_cmp_uuid_bytes,
         params={"width": 32},

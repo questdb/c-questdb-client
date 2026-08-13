@@ -923,9 +923,18 @@ bool qwp_chunk_symbol_i32(
  *    the first column to append sets the count; subsequent appends
  *    must agree.
  *
+ * `FixedSizeBinary` mapping: UUID and LONG256 require an explicit
+ * claim — `FixedSizeBinary(16)` with the `arrow.uuid` extension or
+ * `questdb.column_type=uuid` metadata lands as UUID (bytes are
+ * canonical RFC-4122 big-endian, byte-swapped to wire order);
+ * `FixedSizeBinary(32)` with `questdb.column_type=long256` lands as
+ * LONG256 (LE limbs, verbatim). Any other `FixedSizeBinary` width or
+ * an unlabeled column is opaque bytes and lands as BINARY, verbatim.
+ * A claim on the wrong width is an error.
+ *
  * Type rejections (any Arrow type with no QuestDB mapping — `Null`,
- * `Struct`, `Map`, `RunEndEncoded`, `Interval(*)`, `FixedSizeBinary`
- * outside UUID/LONG256, non-Float64 `List` leaves) return
+ * `Struct`, `Map`, `RunEndEncoded`, `Interval(*)`, non-Float64 `List`
+ * leaves) return
  * `line_sender_error_arrow_unsupported_column_kind`. Structural
  * failures (validity-count mismatch, ms→µs overflow, decimal scale
  * out of range, etc.) return `line_sender_error_arrow_ingest`.

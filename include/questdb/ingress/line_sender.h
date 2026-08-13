@@ -129,14 +129,14 @@ typedef enum line_sender_error_code
     /** QWP/WebSocket server rejection or terminal protocol violation. */
     line_sender_error_server_rejection = 14,
 
-    /** Arrow column whose kind cannot be persisted (e.g.
-     *  `FixedSizeBinary` with a width other than 16 (UUID) or 32
-     *  (LONG256); `ARRAY(LONG, N-D)` is egress-only; nested-list leaf
-     *  must be `Float64`). Note `FixedSizeBinary(16)` is accepted with
-     *  or without `arrow.uuid` metadata: labeled columns are canonical
-     *  RFC-4122 big-endian and byte-swapped to wire order, unlabeled
-     *  ones are forwarded verbatim in wire order. `arrow` feature
-     *  only. */
+    /** Arrow column whose kind cannot be persisted (e.g. `Null`,
+     *  `Struct`, `Map`; `ARRAY(LONG, N-D)` is egress-only; nested-list
+     *  leaf must be `Float64`). Note `FixedSizeBinary` never lands
+     *  here: with an explicit UUID/LONG256 claim (`arrow.uuid` or
+     *  `questdb.column_type` metadata) it maps to that kind — canonical
+     *  RFC-4122 bytes for UUID — and without a claim it maps to BINARY
+     *  verbatim; only a claim on the wrong width is an error.
+     *  `arrow` feature only. */
     line_sender_error_arrow_unsupported_column_kind = 15,
 
     /** RecordBatch failed client-side structural validation

@@ -303,11 +303,20 @@ pub(crate) enum ColumnKind {
     Binary,
     LargeBinary,
     BinaryView,
-    Uuid { big_endian: bool },
+    /// FixedSizeBinary with no declared QuestDB kind: opaque bytes,
+    /// forwarded verbatim as a BINARY (blob) column.
+    FsbToBinary,
+    Uuid,
     Long256,
     Geohash(u8),
-    SymbolDict { key: DictKey, value: DictValue },
-    DictToVarchar { key: DictKey, value: DictValue },
+    SymbolDict {
+        key: DictKey,
+        value: DictValue,
+    },
+    DictToVarchar {
+        key: DictKey,
+        value: DictValue,
+    },
     Decimal32WidenToDecimal64,
     Decimal64,
     Decimal128,
@@ -454,14 +463,41 @@ pub(crate) fn classify(field: &Field, _array: &dyn Array) -> Result<ColumnKind> 
         (DataType::Binary, _, _) => ColumnKind::Binary,
         (DataType::LargeBinary, _, _) => ColumnKind::LargeBinary,
         (DataType::BinaryView, _, _) => ColumnKind::BinaryView,
-        // The `arrow.uuid` canonical extension fixes the storage bytes as
-        // RFC-4122 big-endian; QWP wire order is (lo LE, hi LE), so labeled
-        // columns must be byte-swapped. Unlabeled FixedSizeBinary(16) has no
-        // byte-order contract and is forwarded verbatim (wire order).
-        (DataType::FixedSizeBinary(16), _, ext) => ColumnKind::Uuid {
-            big_endian: ext == Some(crate::arrow_metadata::EXT_ARROW_UUID),
-        },
-        (DataType::FixedSizeBinary(32), _, _) => ColumnKind::Long256,
+        // FixedSizeBinary becomes a UUID or LONG256 column only on an
+        // explicit claim — the `arrow.uuid` canonical extension (whose
+        // contract is RFC-4122 big-endian storage, byte-swapped to QWP
+        // wire order here) or `questdb.column_type`. Without a claim the
+        // bytes are opaque and land verbatim as a BINARY column; guessing
+        // UUID from the width alone would silently pick a byte order on
+        // the user's behalf.
+        (DataType::FixedSizeBinary(w), t, ext) => {
+            let wants_uuid =
+                ext == Some(crate::arrow_metadata::EXT_ARROW_UUID) || t == Some("uuid");
+            let wants_long256 = t == Some("long256");
+            if wants_uuid {
+                if *w != 16 {
+                    return Err(fmt!(
+                        ArrowIngest,
+                        "column '{}': UUID requires FixedSizeBinary(16), got width {}",
+                        field.name(),
+                        w
+                    ));
+                }
+                ColumnKind::Uuid
+            } else if wants_long256 {
+                if *w != 32 {
+                    return Err(fmt!(
+                        ArrowIngest,
+                        "column '{}': LONG256 requires FixedSizeBinary(32), got width {}",
+                        field.name(),
+                        w
+                    ));
+                }
+                ColumnKind::Long256
+            } else {
+                ColumnKind::FsbToBinary
+            }
+        }
         (DataType::Dictionary(key, value), _, _)
             if dict_key_for(key).is_some() && dict_value_for(value).is_some() =>
         {
@@ -606,7 +642,8 @@ pub(crate) fn wire_type_byte(kind: ColumnKind, _has_nulls: bool) -> u8 {
         | ColumnKind::SymbolUtf8View
         | ColumnKind::SymbolDict { .. } => QWP_TYPE_SYMBOL,
         ColumnKind::Binary | ColumnKind::LargeBinary | ColumnKind::BinaryView => QWP_TYPE_BINARY,
-        ColumnKind::Uuid { .. } => QWP_TYPE_UUID,
+        ColumnKind::Uuid => QWP_TYPE_UUID,
+        ColumnKind::FsbToBinary => QWP_TYPE_BINARY,
         ColumnKind::Long256 => QWP_TYPE_LONG256,
         ColumnKind::Geohash(_) => QWP_TYPE_GEOHASH,
         ColumnKind::Decimal32WidenToDecimal64 | ColumnKind::Decimal64 => QWP_TYPE_DECIMAL64,
@@ -637,7 +674,8 @@ fn kind_supports_sparse_nulls(kind: ColumnKind) -> bool {
             | ColumnKind::Binary
             | ColumnKind::LargeBinary
             | ColumnKind::BinaryView
-            | ColumnKind::Uuid { .. }
+            | ColumnKind::FsbToBinary
+            | ColumnKind::Uuid
             | ColumnKind::Long256
             | ColumnKind::Geohash(_)
             | ColumnKind::Decimal32WidenToDecimal64
@@ -3352,22 +3390,28 @@ pub(crate) fn write_arrow_column_body(
         ColumnKind::DictToVarchar { key, value } => {
             write_dict_to_varchar_payload(out, arr, key, value)
         }
-        ColumnKind::Uuid { big_endian } => {
+        ColumnKind::Uuid => {
             let a = arr.as_any().downcast_ref::<FixedSizeBinaryArray>().unwrap();
-            if big_endian {
-                write_uuid_be_payload(out, a)
-            } else {
-                let elem = a.value_length() as usize;
-                if null_count == 0 {
-                    let start = a.offset() * elem;
-                    let len = a.len() * elem;
-                    try_reserve_bytes(out, len, "UUID column")?;
-                    out.extend_from_slice(&a.value_data()[start..start + len]);
-                    Ok(())
-                } else {
-                    non_null_fsb(out, a, elem)
-                }
-            }
+            write_uuid_be_payload(out, a)
+        }
+        ColumnKind::FsbToBinary => {
+            let a = arr.as_any().downcast_ref::<FixedSizeBinaryArray>().unwrap();
+            let elem = a.value_length() as usize;
+            let bound = a.len().checked_mul(elem).ok_or_else(|| {
+                fmt!(
+                    ArrowIngest,
+                    "FixedSizeBinary column: {} rows * width {} overflows usize",
+                    a.len(),
+                    elem
+                )
+            })?;
+            write_varlen_u32_offsets_with_bitmap(
+                out,
+                arr,
+                "FixedSizeBinary column",
+                Some(bound),
+                emit_bytes_row_no_reserve(|row| Ok(a.value(row))),
+            )
         }
         ColumnKind::Long256 => {
             let a = arr.as_any().downcast_ref::<FixedSizeBinaryArray>().unwrap();
@@ -3923,15 +3967,16 @@ fn estimate_frame_size(
             | ColumnKind::Date64Ms
             | ColumnKind::TimeAsLong(_)
             | ColumnKind::DurationAsLong(_) => 8 * row_count,
-            ColumnKind::Uuid { .. } => 16 * row_count,
+            ColumnKind::Uuid => 16 * row_count,
             ColumnKind::Long256 => 32 * row_count,
             ColumnKind::Utf8
             | ColumnKind::LargeUtf8
             | ColumnKind::Utf8View
             | ColumnKind::DictToVarchar { .. } => 4 * (row_count + 1) + 16 * row_count,
-            ColumnKind::Binary | ColumnKind::LargeBinary | ColumnKind::BinaryView => {
-                4 * (row_count + 1) + 16 * row_count
-            }
+            ColumnKind::Binary
+            | ColumnKind::LargeBinary
+            | ColumnKind::BinaryView
+            | ColumnKind::FsbToBinary => 4 * (row_count + 1) + 16 * row_count,
             ColumnKind::SymbolUtf8
             | ColumnKind::SymbolLargeUtf8
             | ColumnKind::SymbolUtf8View
@@ -4585,9 +4630,10 @@ mod tests {
     }
 
     #[test]
-    fn uuid_without_metadata_routes_to_column_uuid() {
-        // No `arrow.uuid` label → no byte-order contract → verbatim
-        // (wire-order) passthrough.
+    fn fsb16_without_metadata_routes_to_binary() {
+        // No UUID claim (no `arrow.uuid` label, no `questdb.column_type`)
+        // → opaque bytes → BINARY column, verbatim. Guessing UUID from the
+        // width alone would silently pick a byte order for the user.
         let raw: [u8; 16] = [
             0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E,
             0x0F, 0x10,
@@ -4599,17 +4645,91 @@ mod tests {
         let out = encode(&rb);
         let (n, ty, body) = decode_single_column(&out);
         assert_eq!(n, 1);
-        assert_eq!(ty, QWP_TYPE_UUID);
-        assert_eq!(decode_uuid_body(body, 1), vec![raw]);
+        assert_eq!(ty, QWP_TYPE_BINARY);
+        assert_eq!(decode_binary_body(body, 1), vec![Some(raw.to_vec())]);
     }
 
     #[test]
-    fn long256_routes_to_column_long256() {
+    fn fsb16_with_column_type_uuid_routes_to_column_uuid() {
+        // `questdb.column_type=uuid` is the label-free way to claim UUID
+        // semantics; bytes are canonical RFC-4122 and swap to wire order.
+        let canonical: [u8; 16] = [
+            0x12, 0x3e, 0x45, 0x67, 0xe8, 0x9b, 0x12, 0xd3, 0xa4, 0x56, 0x42, 0x66, 0x14, 0x17,
+            0x40, 0x00,
+        ];
+        let mut b = FixedSizeBinaryBuilder::new(16);
+        b.append_value(canonical).unwrap();
+        let field = Field::new("id", DataType::FixedSizeBinary(16), true)
+            .with_metadata(metadata(&[(crate::arrow_metadata::COLUMN_TYPE, "uuid")]));
+        let rb = single_col_batch(field, b.finish());
+        let out = encode(&rb);
+        let (n, ty, body) = decode_single_column(&out);
+        assert_eq!(n, 1);
+        assert_eq!(ty, QWP_TYPE_UUID);
+        let mut wire = canonical;
+        wire.reverse();
+        assert_eq!(decode_uuid_body(body, 1), vec![wire]);
+    }
+
+    #[test]
+    fn long256_with_column_type_routes_to_column_long256() {
+        // LONG256 has no Arrow extension; `questdb.column_type=long256`
+        // is the only claim. Bytes are wire order (LE limbs), verbatim.
         let mut b = FixedSizeBinaryBuilder::new(32);
-        b.append_value([0u8; 32]).unwrap();
+        b.append_value([0x5Au8; 32]).unwrap();
+        let field = Field::new("l", DataType::FixedSizeBinary(32), true)
+            .with_metadata(metadata(&[(crate::arrow_metadata::COLUMN_TYPE, "long256")]));
+        let rb = single_col_batch(field, b.finish());
+        let out = encode(&rb);
+        let (n, ty, _body) = decode_single_column(&out);
+        assert_eq!(n, 1);
+        assert_eq!(ty, QWP_TYPE_LONG256);
+    }
+
+    #[test]
+    fn fsb32_without_metadata_routes_to_binary() {
+        let mut b = FixedSizeBinaryBuilder::new(32);
+        b.append_value([0x5Au8; 32]).unwrap();
         let field = Field::new("l", DataType::FixedSizeBinary(32), true);
         let rb = single_col_batch(field, b.finish());
-        assert_ok_with_table_count(&rb, 1);
+        let out = encode(&rb);
+        let (n, ty, body) = decode_single_column(&out);
+        assert_eq!(n, 1);
+        assert_eq!(ty, QWP_TYPE_BINARY);
+        assert_eq!(decode_binary_body(body, 1), vec![Some(vec![0x5Au8; 32])]);
+    }
+
+    #[test]
+    fn arrow_uuid_label_on_wrong_width_rejected() {
+        let mut b = FixedSizeBinaryBuilder::new(8);
+        b.append_value([0u8; 8]).unwrap();
+        let field =
+            Field::new("u", DataType::FixedSizeBinary(8), true).with_metadata(metadata(&[(
+                crate::arrow_metadata::ARROW_EXTENSION_NAME,
+                "arrow.uuid",
+            )]));
+        let rb = single_col_batch(field, b.finish());
+        let err = encode_err(&rb);
+        assert!(
+            err.msg().contains("UUID requires FixedSizeBinary(16)"),
+            "{}",
+            err.msg()
+        );
+    }
+
+    #[test]
+    fn long256_column_type_on_wrong_width_rejected() {
+        let mut b = FixedSizeBinaryBuilder::new(16);
+        b.append_value([0u8; 16]).unwrap();
+        let field = Field::new("l", DataType::FixedSizeBinary(16), true)
+            .with_metadata(metadata(&[(crate::arrow_metadata::COLUMN_TYPE, "long256")]));
+        let rb = single_col_batch(field, b.finish());
+        let err = encode_err(&rb);
+        assert!(
+            err.msg().contains("LONG256 requires FixedSizeBinary(32)"),
+            "{}",
+            err.msg()
+        );
     }
 
     #[test]
@@ -4853,6 +4973,46 @@ mod tests {
                 out.push(Some(
                     String::from_utf8(body[data_start + s..data_start + e].to_vec()).unwrap(),
                 ));
+                k += 1;
+            }
+        }
+        out
+    }
+
+    /// Decode a BINARY column body (same layout as VARCHAR minus the
+    /// UTF-8 requirement): flag + optional bitmap + offsets + data.
+    fn decode_binary_body(body: &[u8], rows: usize) -> Vec<Option<Vec<u8>>> {
+        let use_bitmap = body[0];
+        let mut pos = 1usize;
+        let mut is_null = vec![false; rows];
+        if use_bitmap == 1 {
+            let bitmap_bytes = rows.div_ceil(8);
+            for (i, slot) in is_null.iter_mut().enumerate() {
+                *slot = (body[pos + i / 8] >> (i % 8)) & 1 == 1;
+            }
+            pos += bitmap_bytes;
+        } else {
+            assert_eq!(use_bitmap, 0, "unexpected bitmap flag {use_bitmap}");
+        }
+        let non_null = is_null.iter().filter(|n| !**n).count();
+        let off_start = pos;
+        let read_off = |k: usize| {
+            u32::from_le_bytes(
+                body[off_start + k * 4..off_start + k * 4 + 4]
+                    .try_into()
+                    .unwrap(),
+            ) as usize
+        };
+        let data_start = off_start + (non_null + 1) * 4;
+        let mut out = Vec::with_capacity(rows);
+        let mut k = 0usize;
+        for &null in &is_null {
+            if null {
+                out.push(None);
+            } else {
+                let s = read_off(k);
+                let e = read_off(k + 1);
+                out.push(Some(body[data_start + s..data_start + e].to_vec()));
                 k += 1;
             }
         }
@@ -6023,13 +6183,17 @@ mod tests {
     }
 
     #[test]
-    fn fixed_size_binary_arbitrary_width_rejected_as_unsupported() {
+    fn fixed_size_binary_arbitrary_width_routes_to_binary() {
+        // Any unlabeled FixedSizeBinary width is opaque bytes → BINARY.
         let mut b = FixedSizeBinaryBuilder::new(8);
-        b.append_value([0u8; 8]).unwrap();
-        assert_unsupported_column_with(
-            Field::new("c", DataType::FixedSizeBinary(8), true),
-            Arc::new(b.finish()) as ArrayRef,
-        );
+        b.append_value([0xA5u8; 8]).unwrap();
+        let field = Field::new("c", DataType::FixedSizeBinary(8), true);
+        let rb = single_col_batch(field, b.finish());
+        let out = encode(&rb);
+        let (n, ty, body) = decode_single_column(&out);
+        assert_eq!(n, 1);
+        assert_eq!(ty, QWP_TYPE_BINARY);
+        assert_eq!(decode_binary_body(body, 1), vec![Some(vec![0xA5u8; 8])]);
     }
 
     #[test]
@@ -6570,12 +6734,12 @@ mod tests {
     }
 
     #[test]
-    fn sliced_uuid_array_emits_sliced_window_only() {
-        // FixedSizeBinary(16) → UUID. Note arrow-rs normalises a sliced
+    fn sliced_fsb_array_emits_sliced_window_only() {
+        // Unlabeled FixedSizeBinary(16) → BINARY. The per-row `value(row)`
+        // copy must respect the slice window (arrow-rs normalises a sliced
         // FixedSizeBinaryArray to `offset() == 0` with a pre-windowed
-        // `value_data()`, so the `a.offset() * elem` multiply stays 0
-        // here; this guards the value-copy producing the correct window
-        // (a regression copying the wrong byte range is caught).
+        // `value_data()`; a regression copying the wrong byte range is
+        // caught here).
         let mut b = FixedSizeBinaryBuilder::new(16);
         let rows: [[u8; 16]; 4] = [[0x00; 16], [0x11; 16], [0x22; 16], [0x33; 16]];
         for r in &rows {
@@ -6590,8 +6754,11 @@ mod tests {
         let out = encode(&rb);
         let (n, ty, body) = decode_single_column(&out);
         assert_eq!(n, 2);
-        assert_eq!(ty, QWP_TYPE_UUID);
-        assert_eq!(decode_uuid_body(body, n), vec![[0x11u8; 16], [0x22u8; 16]]);
+        assert_eq!(ty, QWP_TYPE_BINARY);
+        assert_eq!(
+            decode_binary_body(body, n),
+            vec![Some(vec![0x11u8; 16]), Some(vec![0x22u8; 16])]
+        );
     }
 
     #[test]
