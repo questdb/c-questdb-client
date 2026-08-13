@@ -863,9 +863,8 @@ public:
      *
      * `value` is the address packed as a u32 with octet 0 in the high byte.
      *
-     * IPv4 (`0x18`) is part of the QWP v1 spec. Server-side ingest does not
-     * currently implement this wire type; batches using it will be rejected
-     * with a descriptive error. This may change in future server releases.
+     * IPv4 (`0x18`) is part of the QWP v1 spec and requires QuestDB 10.0
+     * or later.
      */
     line_sender_buffer& column_ipv4(column_name_view name, uint32_t value)
     {
@@ -900,10 +899,8 @@ public:
     /**
      * Record a BINARY column value. QWP-only.
      *
-     * BINARY (`0x17`) is part of the QWP v1 spec. Server-side ingest does
-     * not currently implement this wire type; batches using it will be
-     * rejected with a descriptive error. This may change in future server
-     * releases.
+     * BINARY (`0x17`) is part of the QWP v1 spec and requires QuestDB 10.0
+     * or later.
      */
     line_sender_buffer& column_binary(
         column_name_view name, const uint8_t* data, size_t data_len)
