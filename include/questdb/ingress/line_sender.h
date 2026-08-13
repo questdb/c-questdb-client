@@ -129,18 +129,14 @@ typedef enum line_sender_error_code
     /** QWP/WebSocket server rejection or terminal protocol violation. */
     line_sender_error_server_rejection = 14,
 
-    /** Arrow column whose kind cannot be persisted (e.g. `Null`,
-     *  `Struct`, `Map`; `ARRAY(LONG, N-D)` is egress-only; nested-list
-     *  leaf must be `Float64`). Note `FixedSizeBinary` never lands
-     *  here: with an explicit UUID/LONG256 claim (`arrow.uuid` or
-     *  `questdb.column_type` metadata) it maps to that kind — canonical
-     *  RFC-4122 bytes for UUID — and without a claim it maps to BINARY
-     *  verbatim; only a claim on the wrong width is an error.
+    /** An Arrow column cannot be written to QuestDB because its type is not
+     *  supported for ingestion.
      *  `arrow` feature only. */
     line_sender_error_arrow_unsupported_column_kind = 15,
 
-    /** RecordBatch failed client-side structural validation
-     *  (column count, name encoding, C Data Interface contract).
+    /** Arrow data is invalid or conflicts with its metadata or overrides. For
+     *  example, a UUID claim requires 16-byte values and a LONG256 claim
+     *  requires 32-byte values.
      *  `arrow` feature only. */
     line_sender_error_arrow_ingest = 16,
 

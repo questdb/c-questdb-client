@@ -106,16 +106,13 @@ pub enum ErrorCode {
     /// QWP/WebSocket server rejection or terminal protocol violation.
     ServerRejection,
 
-    /// `PooledSenderCore::flush_arrow_batch_*` was passed a column whose Arrow /
-    /// QuestDB kind cannot be persisted to a QuestDB table (e.g.
-    /// `ARRAY(LONG, N-D)` is query-result-only on the egress side and has
-    /// no QWP wire tag for ingress). Only emitted on the `arrow` feature.
+    /// An Arrow column cannot be written to QuestDB because its type is not
+    /// supported for ingestion. Only emitted on the `arrow` feature.
     ArrowUnsupportedColumnKind,
 
-    /// `PooledSenderCore::flush_arrow_batch_*` was passed a `RecordBatch` that
-    /// failed client-side structural validation (column count vs schema,
-    /// name encoding, ARROW C Data Interface invariants on a freshly
-    /// imported array, etc.). Only emitted on the `arrow` feature.
+    /// Arrow data is invalid or conflicts with its metadata or overrides. For
+    /// example, a UUID claim requires 16-byte values and a LONG256 claim
+    /// requires 32-byte values. Only emitted on the `arrow` feature.
     ArrowIngest,
 
     /// A reconnectable failure on the column-major sender's flush/sync path
