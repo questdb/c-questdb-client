@@ -73,7 +73,7 @@ use crate::egress::wire::ByteReader;
 use crate::egress::wire::header::flags;
 use crate::egress::wire::msg_kind::MsgKind;
 use crate::error::{Error, Result, fmt};
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 
 /// Per-batch caps mirrored from `java-questdb-client` (`QwpConstants.java`
 /// and `QwpResultBatchDecoder.java`). These cap wire-supplied counts and
@@ -111,7 +111,7 @@ fn read_owned(r: &mut ByteReader<'_>, parent: &Bytes, n: usize) -> Result<Bytes>
 /// `values` and `validity` are typically zero-copy `Bytes` slices into the
 /// frame's payload buffer (or, after FLAG_ZSTD, into the decompressed body).
 /// Paths that *have* to materialize new bytes (BOOLEAN bit-unpacking, GORILLA
-/// temporal expansion, null-bearing fixed-width densification) wrap a fresh
+/// temporal expansion, fixed-width densification for columns containing nulls) wrap a fresh
 /// `Vec<u8>` via `Bytes::from(vec)`.
 #[derive(Debug, Clone)]
 pub struct ColumnBuffer {
@@ -1126,16 +1126,21 @@ fn decode_validity(
 }
 
 /// Reverse each 16-byte UUID row: wire (lo LE, hi LE) → canonical
-/// RFC-4122 big-endian. Costs the column its zero-copy path; null slots
-/// hold reversed sentinel bytes, which is fine — validity governs.
+/// RFC-4122 big-endian. Reuses a uniquely owned buffer after null
+/// densification; a shared slice from the no-null path must be copied.
+/// Null slots hold reversed sentinel bytes, which is fine — validity governs.
 fn reverse_uuid_rows(buf: ColumnBuffer) -> ColumnBuffer {
-    let mut values = Vec::with_capacity(buf.values.len());
-    for row in buf.values.chunks_exact(16) {
-        values.extend(row.iter().rev());
+    let ColumnBuffer { values, validity } = buf;
+    let mut values = match values.try_into_mut() {
+        Ok(values) => values,
+        Err(shared) => BytesMut::from(&shared[..]),
+    };
+    for row in values.chunks_exact_mut(16) {
+        row.reverse();
     }
     ColumnBuffer {
-        values: Bytes::from(values),
-        validity: buf.validity,
+        values: values.freeze(),
+        validity,
     }
 }
 
@@ -2288,6 +2293,55 @@ mod tests {
             0x40, 0x00,
         ];
         assert_eq!(c.value(0), &canonical);
+    }
+
+    #[test]
+    fn uuid_reversal_reuses_unique_dense_buffer() {
+        let input: Vec<u8> = (0..32).collect();
+        let values = Bytes::from(input.clone());
+        let original_ptr = values.as_ptr();
+        let reversed = reverse_uuid_rows(ColumnBuffer {
+            values,
+            validity: Some(Bytes::from_static(&[0x02])),
+        });
+
+        let mut expected = input;
+        for row in expected.chunks_exact_mut(16) {
+            row.reverse();
+        }
+        assert_eq!(reversed.values, expected);
+        assert_eq!(
+            reversed.values.as_ptr(),
+            original_ptr,
+            "UUID reversal should reuse the uniquely owned dense buffer"
+        );
+    }
+
+    #[test]
+    fn uuid_reversal_copies_shared_frame_slice() {
+        let input: Vec<u8> = (0..32).collect();
+        let parent = Bytes::from(input.clone());
+        let values = parent.slice(..);
+        let original_ptr = values.as_ptr();
+        let reversed = reverse_uuid_rows(ColumnBuffer {
+            values,
+            validity: None,
+        });
+
+        let mut expected = input.clone();
+        for row in expected.chunks_exact_mut(16) {
+            row.reverse();
+        }
+        assert_eq!(reversed.values, expected);
+        assert_eq!(
+            parent, input,
+            "the shared frame buffer must remain unchanged"
+        );
+        assert_ne!(
+            reversed.values.as_ptr(),
+            original_ptr,
+            "UUID reversal must copy when the source shares the frame buffer"
+        );
     }
 
     #[test]
