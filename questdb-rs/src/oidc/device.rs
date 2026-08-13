@@ -28,7 +28,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex, TryLockError};
 use std::time::{Duration, Instant};
 
-use zeroize::Zeroize;
+use zeroize::{Zeroize, Zeroizing};
 
 use serde_json::Value;
 
@@ -96,6 +96,21 @@ struct StoreState {
     /// a peer may have consumed it; the matching in-memory copy must not be used.
     /// It also avoids redundant writes outside the coordinated-refresh path.
     last_persisted_refresh: Option<String>,
+}
+
+impl StoreState {
+    /// Replace the tracked refresh token, scrubbing the previous secret from the
+    /// heap first — a bare `= ...` would drop the old `String` un-wiped.
+    fn set_last_persisted_refresh(&mut self, value: Option<String>) {
+        self.last_persisted_refresh.zeroize();
+        self.last_persisted_refresh = value;
+    }
+}
+
+impl Drop for StoreState {
+    fn drop(&mut self) {
+        self.last_persisted_refresh.zeroize();
+    }
 }
 
 /// The RFC 8628 device-authorization response (device code is a secret used only
@@ -504,7 +519,7 @@ impl OidcDeviceAuth {
     pub fn try_clear(&self) -> Result<()> {
         let _acq = self.lock_acquire();
         *self.lock_tokens() = None;
-        self.lock_store_state().last_persisted_refresh = None;
+        self.lock_store_state().set_last_persisted_refresh(None);
         let mut clear_error = None;
         if let (Some(store), Some(key)) = (self.token_store.as_ref(), self.store_key.as_ref()) {
             // Delete under the per-identity lock so it serialises against a peer's
@@ -783,7 +798,7 @@ impl OidcDeviceAuth {
         *self.lock_tokens() = Some(tokens.clone());
         // It is already on disk, so a later non-rotating refresh must not rewrite
         // the file.
-        self.lock_store_state().last_persisted_refresh = rt;
+        self.lock_store_state().set_last_persisted_refresh(rt);
         Some(tokens)
     }
 
@@ -942,7 +957,7 @@ impl OidcDeviceAuth {
         key: &TokenStoreKey,
         existing: &TokenSet,
     ) -> Result<TokenSet> {
-        let last_persisted = self.lock_store_state().last_persisted_refresh.clone();
+        let last_persisted = Zeroizing::new(self.lock_store_state().last_persisted_refresh.clone());
         let persisted = store.load(key).map_err(|e| {
             OidcError::network(format!(
                 "Could not re-read the OIDC token store before refresh: {e}. Refusing to reuse a possibly rotated refresh token; retry later."
@@ -952,19 +967,20 @@ impl OidcDeviceAuth {
         let (current, current_is_persisted) = if let Some(persisted) = persisted {
             let peer = self.tokenset_from_persisted(&persisted).ok_or_else(|| {
                 self.discard_cached_refresh();
-                self.lock_store_state().last_persisted_refresh = None;
+                self.lock_store_state().set_last_persisted_refresh(None);
                 OidcError::network(
                     "The persisted OIDC token became invalid before refresh. Refusing to reuse a possibly rotated in-memory refresh token; retry or sign in again.",
                 )
             })?;
             if peer.is_valid(now_epoch(), DEFAULT_SKEW_SECONDS) && self.has_required_token(&peer) {
                 // A peer already refreshed; skip the network.
-                self.lock_store_state().last_persisted_refresh = peer.refresh_token.clone();
+                self.lock_store_state()
+                    .set_last_persisted_refresh(peer.refresh_token.clone());
                 return Ok(peer);
             }
             if peer.refresh_token.is_none() {
                 self.discard_cached_refresh();
-                self.lock_store_state().last_persisted_refresh = None;
+                self.lock_store_state().set_last_persisted_refresh(None);
                 return Err(OidcError::network(
                     "The persisted OIDC token has no refresh token. Refusing to fall back to a possibly rotated in-memory refresh token; sign in again.",
                 ));
@@ -976,9 +992,9 @@ impl OidcDeviceAuth {
             // its child. Never replay our stale in-memory copy in that case. When
             // the in-memory token differs (or no parent was known on disk), it is
             // an unpersisted child from this process and remains the freshest copy.
-            if last_persisted.is_some() && existing.refresh_token == last_persisted {
+            if last_persisted.is_some() && existing.refresh_token == *last_persisted {
                 self.discard_cached_refresh();
-                self.lock_store_state().last_persisted_refresh = None;
+                self.lock_store_state().set_last_persisted_refresh(None);
                 return Err(OidcError::network(
                     "The persisted OIDC refresh token was removed by another refresh attempt. Refusing to reuse its possibly rotated in-memory copy; retry or sign in again.",
                 ));
@@ -989,12 +1005,12 @@ impl OidcDeviceAuth {
         if current_is_persisted {
             if let Err(e) = store.clear(key) {
                 self.discard_cached_refresh();
-                self.lock_store_state().last_persisted_refresh = None;
+                self.lock_store_state().set_last_persisted_refresh(None);
                 return Err(OidcError::network(format!(
                     "Could not consume the persisted OIDC refresh token before use: {e}. Refusing to risk refresh-token reuse; retry later."
                 )));
             }
-            self.lock_store_state().last_persisted_refresh = None;
+            self.lock_store_state().set_last_persisted_refresh(None);
         }
 
         // Once submitted, a transport failure can mean the IdP consumed the
@@ -1071,7 +1087,7 @@ impl OidcDeviceAuth {
         if rt.is_none() {
             match store.clear(key) {
                 Ok(()) => {
-                    self.lock_store_state().last_persisted_refresh = None;
+                    self.lock_store_state().set_last_persisted_refresh(None);
                 }
                 Err(e) => warn_persistence("clear", &*e),
             }
@@ -1079,7 +1095,7 @@ impl OidcDeviceAuth {
         }
         match store.save(key, &snapshot(tokens)) {
             Ok(()) => {
-                self.lock_store_state().last_persisted_refresh = rt;
+                self.lock_store_state().set_last_persisted_refresh(rt);
             }
             Err(e) => warn_persistence("save", &*e),
         }

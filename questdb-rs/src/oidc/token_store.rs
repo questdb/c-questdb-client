@@ -600,33 +600,47 @@ impl FileTokenStore {
     }
 
     fn parse_and_verify(&self, key: &TokenStoreKey, data: &[u8]) -> Option<PersistedToken> {
-        let obj = serde_json::from_slice::<Value>(data).ok()?;
-        let obj = obj.as_object()?;
-        // Schema and fingerprint must match the live identity; a mismatch is a
-        // hash collision or a file copied from a different identity, so ignore it
-        // rather than serve the wrong identity's token.
-        if obj.get("v").and_then(Value::as_i64) != Some(SCHEMA_VERSION) {
-            return None;
+        let mut root = serde_json::from_slice::<Value>(data).ok()?;
+        // Extract under an immutable borrow; the returned PersistedToken owns its
+        // own copies (zeroized by its own Drop).
+        let result = (|| {
+            let obj = root.as_object()?;
+            // Schema and fingerprint must match the live identity; a mismatch is a
+            // hash collision or a file copied from a different identity, so ignore
+            // it rather than serve the wrong identity's token.
+            if obj.get("v").and_then(Value::as_i64) != Some(SCHEMA_VERSION) {
+                return None;
+            }
+            let str_field = |k: &str| obj.get(k).and_then(Value::as_str);
+            if str_field("client_id") != Some(key.client_id.as_str())
+                || str_field("token_endpoint") != Some(key.token_endpoint.as_str())
+                || str_field("device_authorization_endpoint")
+                    != Some(key.device_authorization_endpoint.as_str())
+                || str_field("scope") != Some(key.scope.as_str())
+                || !opt_str_matches(key.audience.as_deref(), obj.get("audience"))
+                || !opt_str_matches(key.issuer.as_deref(), obj.get("issuer"))
+                || obj.get("groups_in_token").and_then(Value::as_bool) != Some(key.groups_in_token)
+            {
+                return None;
+            }
+            Some(PersistedToken {
+                access_token: nonempty_str(obj.get("access_token")),
+                id_token: nonempty_str(obj.get("id_token")),
+                refresh_token: nonempty_str(obj.get("refresh_token")),
+                expires_at: millis_to_seconds(obj.get("expires_at_millis")),
+                token_ttl: millis_to_seconds(obj.get("token_ttl_millis")),
+            })
+        })();
+        // On every path (including a validation miss) scrub the secret strings
+        // the parser cloned out of `data` before the JSON tree is dropped.
+        if let Some(obj) = root.as_object_mut() {
+            for field in ["access_token", "id_token", "refresh_token"] {
+                if let Some(Value::String(secret)) = obj.get_mut(field) {
+                    secret.zeroize();
+                }
+            }
         }
-        let str_field = |k: &str| obj.get(k).and_then(Value::as_str);
-        if str_field("client_id") != Some(key.client_id.as_str())
-            || str_field("token_endpoint") != Some(key.token_endpoint.as_str())
-            || str_field("device_authorization_endpoint")
-                != Some(key.device_authorization_endpoint.as_str())
-            || str_field("scope") != Some(key.scope.as_str())
-            || !opt_str_matches(key.audience.as_deref(), obj.get("audience"))
-            || !opt_str_matches(key.issuer.as_deref(), obj.get("issuer"))
-            || obj.get("groups_in_token").and_then(Value::as_bool) != Some(key.groups_in_token)
-        {
-            return None;
-        }
-        Some(PersistedToken {
-            access_token: nonempty_str(obj.get("access_token")),
-            id_token: nonempty_str(obj.get("id_token")),
-            refresh_token: nonempty_str(obj.get("refresh_token")),
-            expires_at: millis_to_seconds(obj.get("expires_at_millis")),
-            token_ttl: millis_to_seconds(obj.get("token_ttl_millis")),
-        })
+        result
     }
 
     fn serialize(&self, key: &TokenStoreKey, token: &PersistedToken) -> Zeroizing<Vec<u8>> {
@@ -672,10 +686,16 @@ impl FileTokenStore {
         );
         // serde_json escapes `"`, `\` and control chars, so an opaque token string
         // round-trips safely. Wrap the write buffer in `Zeroizing` so the
-        // plaintext bytes are scrubbed once the caller has written them. The
-        // `serde_json::Value` intermediates in `map` still hold clones of the
-        // secrets and are serde-owned; scrubbing those is left as a residual.
-        Zeroizing::new(serde_json::to_vec(&Value::Object(map)).unwrap_or_default())
+        // plaintext bytes are scrubbed once the caller has written them. Serialize
+        // `&map` (not a moved `Value::Object(map)`, byte-identical output) so the
+        // map survives the call and its cloned secret strings can be scrubbed too.
+        let bytes = Zeroizing::new(serde_json::to_vec(&map).unwrap_or_default());
+        for field in ["access_token", "id_token", "refresh_token"] {
+            if let Some(Value::String(secret)) = map.get_mut(field) {
+                secret.zeroize();
+            }
+        }
+        bytes
     }
 
     // -- lock-file protocol -------------------------------------------------

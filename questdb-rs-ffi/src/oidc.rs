@@ -1117,6 +1117,49 @@ mod tests {
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicPtr, AtomicUsize, Ordering};
 
+    #[test]
+    fn error_kind_maps_every_variant_away_from_unknown() {
+        // The binding's `else -> base OidcError` (UNKNOWN=255) branch is reachable
+        // only if a native error carries a kind outside 0..=4. Every real
+        // OidcErrorKind must map to a specific FFI kind, keeping that branch
+        // defensive / forward-compat only; a new unmapped variant here would
+        // silently degrade the Python typed error to a base OidcError.
+        let cases = [
+            (
+                OidcErrorKind::Config,
+                questdb_oidc_error_kind::QUESTDB_OIDC_ERROR_CONFIG,
+            ),
+            (
+                OidcErrorKind::Network,
+                questdb_oidc_error_kind::QUESTDB_OIDC_ERROR_NETWORK,
+            ),
+            (
+                OidcErrorKind::DeviceFlow,
+                questdb_oidc_error_kind::QUESTDB_OIDC_ERROR_DEVICE_FLOW,
+            ),
+            (
+                OidcErrorKind::Timeout,
+                questdb_oidc_error_kind::QUESTDB_OIDC_ERROR_TIMEOUT,
+            ),
+            (
+                OidcErrorKind::InteractionRequired,
+                questdb_oidc_error_kind::QUESTDB_OIDC_ERROR_INTERACTION_REQUIRED,
+            ),
+        ];
+        for (kind, expected) in cases {
+            assert_eq!(
+                error_kind(kind) as u32,
+                expected as u32,
+                "{kind:?} mapped to the wrong FFI kind"
+            );
+            assert_ne!(
+                error_kind(kind) as u32,
+                questdb_oidc_error_kind::QUESTDB_OIDC_ERROR_UNKNOWN as u32,
+                "{kind:?} degraded to UNKNOWN"
+            );
+        }
+    }
+
     // Frozen copies of the first published output prefixes. They deliberately
     // remain unchanged when fields are appended to the public Rust structs.
     #[repr(C)]
