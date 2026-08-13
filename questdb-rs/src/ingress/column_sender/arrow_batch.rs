@@ -1005,8 +1005,9 @@ fn u64_to_i64_le_checked(v: u64, row: usize) -> Result<[u8; 8]> {
 }
 
 /// `arrow.uuid` column body: RFC-4122 big-endian storage → QWP wire order
-/// (lo LE, hi LE), i.e. each 16-byte value reversed. `arr.value(row)`
-/// accounts for any slice offset.
+/// (lo LE, hi LE), i.e. each 16-byte value reversed. Both branches
+/// honor the slice offset: the bulk path windows `value_data()`
+/// explicitly, the null path goes through `arr.value(row)`.
 fn write_uuid_be_payload(out: &mut Vec<u8>, arr: &FixedSizeBinaryArray) -> Result<()> {
     let non_null = non_null_count(arr, "UUID column")?;
     let bytes = non_null.checked_mul(16).ok_or_else(|| {
@@ -1019,8 +1020,12 @@ fn write_uuid_be_payload(out: &mut Vec<u8>, arr: &FixedSizeBinaryArray) -> Resul
     try_reserve_bytes(out, bytes, "UUID column")?;
     match arr.nulls() {
         None => {
-            for row in 0..arr.len() {
-                out.extend(arr.value(row).iter().rev());
+            // Bulk path: one window into `value_data()` (honoring the
+            // slice offset) instead of a bounds-checked `value(row)` per
+            // row — the reverse loop then vectorizes like a copy.
+            let start = arr.offset() * 16;
+            for row in arr.value_data()[start..start + bytes].chunks_exact(16) {
+                out.extend(row.iter().rev());
             }
         }
         Some(nulls) => {
