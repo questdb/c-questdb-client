@@ -246,6 +246,7 @@ live-server-tests = [
     "sync-reader-zstd",
     "sync-sender-http",
     "sync-sender-qwp-ws",
+    "arrow-ingress",
 ]
 
 ## FFI escape-hatch surface, consumed only by the `questdb-rs-ffi` C-ABI

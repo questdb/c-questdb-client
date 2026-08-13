@@ -481,6 +481,42 @@ fn numpy_s16_uuid_round_trip() {
     assert_uuid_round_trip(srv, &table);
 }
 
+/// Same server-anchored composition through an `arrow.uuid`-labelled
+/// `FixedSizeBinary(16)` column — the path whose byte order motivated #185.
+#[test]
+fn arrow_uuid_extension_round_trip() {
+    use std::collections::HashMap;
+    use std::sync::Arc;
+
+    use arrow::array::{ArrayRef, FixedSizeBinaryBuilder, RecordBatch};
+    use arrow::datatypes::{DataType, Field, Schema};
+    use questdb::QuestDb;
+    use questdb::arrow_metadata::{ARROW_EXTENSION_NAME, EXT_ARROW_UUID};
+    use questdb::ingress::AckLevel;
+
+    let srv = server();
+    let table = unique_table("arrow_uuid");
+    let db = QuestDb::connect(&srv.qwp_conf()).expect("connect");
+    let mut sender = db.borrow_sender().expect("borrow");
+
+    let mut values = FixedSizeBinaryBuilder::new(16);
+    values.append_value(UUID_CANONICAL).expect("canonical UUID");
+    let field = Field::new("u", DataType::FixedSizeBinary(16), false).with_metadata(HashMap::from(
+        [(ARROW_EXTENSION_NAME.to_owned(), EXT_ARROW_UUID.to_owned())],
+    ));
+    let batch = RecordBatch::try_new(
+        Arc::new(Schema::new(vec![field])),
+        vec![Arc::new(values.finish()) as ArrayRef],
+    )
+    .expect("record batch");
+
+    sender
+        .flush_arrow_batch_at_now_and_wait(table.as_str(), &batch, &[], AckLevel::Ok)
+        .expect("flush");
+    wait_for_rows(srv, &table, 1);
+    assert_uuid_round_trip(srv, &table);
+}
+
 #[test]
 fn char_round_trip() {
     let srv = server();
