@@ -742,6 +742,16 @@ class TestArrowIngressExtraTypes(afc.ArrowFuzzBase):
         table = self.fresh_table("arrow_extra_d32")
         self._ingest_one_col(table, "DECIMAL(18, 2)", "c", arr)
 
+    def test_extra_fixed_size_binary_routes_to_binary(self):
+        values = [b"12345678", None, b"abcdefgh"]
+        arr = pa.array(values, type=pa.binary(8))
+        table = self.fresh_table("arrow_extra_fsb8")
+        self._ingest_one_col(table, "BINARY", "c", arr)
+        actual = _read_back_arrow_cells(
+            self._fixture, table, [("c", KIND_REGISTRY["binary"])]
+        )
+        self.assertEqual(actual, values)
+
 
 class TestArrowIngressUnsupportedTypes(afc.ArrowFuzzBase):
     """Arrow primitive variants that QuestDB ingress explicitly rejects
@@ -802,10 +812,6 @@ class TestArrowIngressUnsupportedTypes(afc.ArrowFuzzBase):
 
     def test_reject_run_end_encoded(self):
         arr = pa.RunEndEncodedArray.from_arrays([3], pa.array([42]))
-        self._expect_unsupported(arr)
-
-    def test_reject_fixed_size_binary_non_uuid_width(self):
-        arr = pa.array([b"12345678"], type=pa.binary(8))
         self._expect_unsupported(arr)
 
     def test_reject_null(self):
