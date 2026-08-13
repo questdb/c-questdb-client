@@ -718,7 +718,8 @@ public:
      * @note Unlike the ingest sender (which throws `line_sender_error` with the
      *       OIDC detail on `oidc_diagnostic()`), the reader throws
      *       `questdb::oidc::error` directly. Catch `const questdb::error&` to
-     *       handle both. See `questdb::oidc::error` for the cross-surface model.
+     *       handle both. See `questdb::oidc::error` for the cross-surface
+     *       model.
      */
     reader(
         ::questdb::ingress::utf8_view config,

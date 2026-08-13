@@ -221,10 +221,10 @@ enum class error_kind : int
  *   existing sender catch blocks working.
  *
  * To handle every surface uniformly, catch the common base
- * `const questdb::error&`. A `catch (const questdb::oidc::error&)` placed around
- * a sender `flush()` will **never** match (flush throws `line_sender_error`);
- * likewise a `catch (const line_sender_error&)` around a device-API or reader
- * call will miss `questdb::oidc::error`.
+ * `const questdb::error&`. A `catch (const questdb::oidc::error&)` placed
+ * around a sender `flush()` will **never** match (flush throws
+ * `line_sender_error`); likewise a `catch (const line_sender_error&)` around a
+ * device-API or reader call will miss `questdb::oidc::error`.
  */
 class error : public ::questdb::error
 {

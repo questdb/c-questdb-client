@@ -1509,8 +1509,9 @@ public:
      * @note After attaching, a token-acquisition failure surfaces from
      *       `flush()` (and other sender calls) as a `line_sender_error`, with
      *       the structured OIDC detail on its `oidc_diagnostic()` member — not
-     *       as a `questdb::oidc::error`. Catch `const questdb::error&` to handle
-     *       both. See `questdb::oidc::error` for the cross-surface model.
+     *       as a `questdb::oidc::error`. Catch `const questdb::error&` to
+     *       handle both. See `questdb::oidc::error` for the cross-surface
+     *       model.
      */
     opts& oidc_auth(const ::questdb::oidc::device_auth& auth)
     {
