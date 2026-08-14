@@ -82,7 +82,10 @@ impl DeviceCodeChallenge {
     /// non-ASCII character is escaped visibly so a homoglyph cannot masquerade
     /// as an ordinary code character.
     pub fn display_user_code(&self) -> String {
-        ascii_visible(&strip_control(&self.user_code))
+        ascii_visible(&strip_control_capped(
+            &self.user_code,
+            MAX_DISPLAY_FIELD_CHARS,
+        ))
     }
 
     /// The verification URL rendered as inert, single-line ASCII text.
@@ -234,7 +237,10 @@ impl Renderer for TerminalRenderer {
             self.write("\n");
         }
         let who = match identity {
-            Some(id) => format!(" as {}", strip_control(id)),
+            Some(id) => format!(
+                " as {}",
+                ascii_visible(&strip_control_capped(id, MAX_DISPLAY_FIELD_CHARS))
+            ),
             None => String::new(),
         };
         let mins = ((expires_in_secs / 60.0).round() as i64).max(1);
@@ -386,6 +392,13 @@ pub(crate) fn strip_control(text: &str) -> String {
     sanitize_display_text(text)
 }
 
+/// Cap for untrusted device-flow fields shown to the user -- the code, the
+/// verification URLs, and the signed-in identity. A conformant value is short;
+/// this only bounds a hostile IdP field (otherwise limited only by the 4 MiB
+/// response cap) before it reaches a terminal or a notebook DOM, matching the
+/// cap the error path already applies. Well above any real code / URL / name.
+pub(crate) const MAX_DISPLAY_FIELD_CHARS: usize = 256;
+
 /// [`strip_control`], but bounded to `max_chars` visible characters (with a
 /// trailing `…` when truncated).
 ///
@@ -426,7 +439,7 @@ fn ascii_visible(text: &str) -> String {
 /// masquerade as a trusted one in the prompt. Clickability is decided
 /// separately by [`safe_target`].
 pub(crate) fn display_url(url: &str) -> String {
-    let text = strip_control(url);
+    let text = strip_control_capped(url, MAX_DISPLAY_FIELD_CHARS);
     if text.is_ascii() {
         text
     } else {
@@ -541,6 +554,23 @@ mod tests {
         // cross-host `complete` is refused rather than silently opened/QR'd, so
         // no browser target is offered.
         assert_eq!(challenge.browser_target(), None);
+    }
+
+    #[test]
+    fn display_accessors_bound_hostile_length() {
+        // A hostile IdP field is bounded only by the multi-MB response cap; the
+        // display accessors must cap it so a huge code / URL can't be copied
+        // whole into a terminal or a notebook DOM. The output length stays a
+        // small constant independent of the (here 1 MB) input.
+        let huge = "A".repeat(1_000_000);
+        let challenge = DeviceCodeChallenge {
+            user_code: huge.clone(),
+            verification_uri: format!("https://idp.example.com/{huge}"),
+            verification_uri_complete: Some(format!("https://idp.example.com/c/{huge}")),
+        };
+        assert!(challenge.display_user_code().len() < 4_096);
+        assert!(challenge.display_verification_uri().len() < 4_096);
+        assert!(challenge.display_verification_uri_complete().unwrap().len() < 4_096);
     }
 
     #[test]

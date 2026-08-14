@@ -53,6 +53,12 @@ use crate::{line_sender_error, line_sender_opts, questdb_error, set_err_out_from
 /// crate.
 const MAX_OIDC_INPUT_BYTES: usize = 1024 * 1024;
 
+/// Cap for the success event's identity (a best-effort, unverified name/email
+/// from the token claims) before it is copied into an event a terminal or
+/// notebook renderer displays. A hostile IdP claim is otherwise bounded only by
+/// the multi-MB token response; 256 chars is well above any real identity.
+const MAX_IDENTITY_DISPLAY_CHARS: usize = 256;
+
 #[derive(Clone)]
 enum BuilderSource {
     Explicit,
@@ -380,7 +386,12 @@ impl Renderer for CEventRenderer {
 
     fn on_success(&self, identity: Option<&str>, expires_in_secs: f64) {
         let mut event = empty_event(questdb_oidc_event_kind::QUESTDB_OIDC_EVENT_SUCCESS);
-        let display_identity = identity.map(sanitize_display_text);
+        // Cap before sanitizing so a hostile multi-MB identity claim is never
+        // copied in full into the event; take() only walks the bounded prefix.
+        let display_identity = identity.map(|id| {
+            let bounded: String = id.chars().take(MAX_IDENTITY_DISPLAY_CHARS).collect();
+            sanitize_display_text(&bounded)
+        });
         (event.identity, event.identity_len) = str_or_null(display_identity.as_deref());
         event.expires_in_seconds = expires_in_secs;
         self.invoke(&event);
