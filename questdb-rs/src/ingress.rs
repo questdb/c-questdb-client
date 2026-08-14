@@ -33,6 +33,7 @@
 pub(crate) use self::conf::QwpWsManagedSlotExclusion;
 pub use self::ndarr::{ArrayElement, NdArrayView};
 pub use self::timestamp::*;
+#[cfg(any(feature = "_sync-sender", feature = "_egress"))]
 use crate::error::Result;
 #[cfg(feature = "_sync-sender")]
 use crate::error::{self, fmt};
@@ -88,9 +89,17 @@ mod timestamp;
 
 mod buffer;
 pub use buffer::*;
+#[cfg(feature = "qwp-browser-codec")]
+pub(crate) use buffer::{QwpWsEncodeScratch, SymbolGlobalDict};
 
+#[cfg(all(feature = "qwp-browser-codec", not(feature = "_sender-qwp-ws")))]
+pub(crate) mod qwp_ws_core;
 #[cfg(feature = "_sync-sender")]
 pub(crate) mod sender;
+#[cfg(all(feature = "qwp-browser-codec", not(feature = "_sender-qwp-ws")))]
+pub(crate) use qwp_ws_core::{QwpWsRoleReject, QwpWsSenderError};
+#[cfg(all(feature = "qwp-browser-codec", feature = "_sender-qwp-ws"))]
+pub(crate) use sender as qwp_ws_core;
 #[cfg(feature = "_sender-qwp-ws")]
 pub(crate) use sender::QwpWsRoleReject;
 #[cfg(feature = "polars-ingress")]

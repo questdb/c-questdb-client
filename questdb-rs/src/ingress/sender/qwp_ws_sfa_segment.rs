@@ -39,6 +39,7 @@ use std::sync::OnceLock;
 #[cfg(unix)]
 use std::sync::atomic::{AtomicBool, Ordering};
 
+#[cfg(not(target_arch = "wasm32"))]
 use memmap2::{MmapMut, MmapOptions};
 
 pub(crate) const FILE_MAGIC: u32 = 0x3130_4653; // 'SF01' in little-endian bytes.
@@ -201,7 +202,12 @@ struct SfaSegmentMapping {
     // construction. Dereferencing it would synthesise a transient slice
     // covering the mapping, which is aliasing UB once this struct is shared
     // via Arc — even when concurrent callers touch disjoint byte ranges.
+    #[cfg(not(target_arch = "wasm32"))]
     _mmap: MmapMut,
+    // Browsers have no mmap. The in-memory publication log uses a boxed slice
+    // so the cached pointer remains stable while the mapping is shared.
+    #[cfg(target_arch = "wasm32")]
+    _bytes: Box<[u8]>,
     base: *mut u8,
     len: usize,
     #[cfg(test)]
@@ -458,6 +464,7 @@ impl SfaSegment {
             }
         })?;
         let lock_offset = durable - durable % page_size;
+        #[cfg(unix)]
         let lock_len = published - lock_offset;
         #[cfg(unix)]
         let locked = {
@@ -641,6 +648,7 @@ impl std::fmt::Debug for SfaMappedPayload {
 }
 
 impl SfaSegmentMapping {
+    #[cfg(not(target_arch = "wasm32"))]
     fn new(mut mmap: MmapMut) -> Self {
         let len = mmap.len();
         // Take the raw pointer once, while `self` is uniquely owned. After this
@@ -650,6 +658,19 @@ impl SfaSegmentMapping {
         let base = mmap.as_mut_ptr();
         Self {
             _mmap: mmap,
+            base,
+            len,
+            #[cfg(test)]
+            redirty_passes: std::sync::atomic::AtomicU64::new(0),
+        }
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    fn new_memory(len: usize) -> Self {
+        let mut bytes = vec![0; len].into_boxed_slice();
+        let base = bytes.as_mut_ptr();
+        Self {
+            _bytes: bytes,
             base,
             len,
             #[cfg(test)]
@@ -702,9 +723,17 @@ impl SfaSegmentMapping {
     }
 
     fn flush_range(&self, offset: usize, len: usize) -> Result<(), SfaSegmentError> {
-        self._mmap
-            .flush_range(offset, len)
-            .map_err(SfaSegmentError::Io)
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            self._mmap
+                .flush_range(offset, len)
+                .map_err(SfaSegmentError::Io)
+        }
+        #[cfg(target_arch = "wasm32")]
+        {
+            let _ = (offset, len);
+            Ok(())
+        }
     }
 
     fn with_slice<R>(&self, offset: usize, len: usize, f: impl FnOnce(&[u8]) -> R) -> R {
@@ -1015,6 +1044,14 @@ impl ReadAt for File {
         {
             std::os::windows::fs::FileExt::seek_read(self, buf, offset)
         }
+        #[cfg(not(any(unix, windows)))]
+        {
+            let _ = (buf, offset);
+            Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "positional file reads are unavailable on this target",
+            ))
+        }
     }
 }
 
@@ -1052,6 +1089,14 @@ pub(crate) fn write_all_at(file: &File, mut buf: &[u8], mut offset: u64) -> io::
             #[cfg(windows)]
             {
                 std::os::windows::fs::FileExt::seek_write(file, buf, offset)
+            }
+            #[cfg(not(any(unix, windows)))]
+            {
+                let _ = (file, buf, offset);
+                Err(io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    "positional file writes are unavailable on this target",
+                ))
             }
         };
         match written {
@@ -1143,6 +1188,7 @@ fn reserve_segment_blocks(file: &File, size_bytes: u64) -> Result<(), SfaSegment
     file.set_len(size_bytes).map_err(SfaSegmentError::Io)
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn map_file_mut(file: &File, size_bytes: u64) -> Result<Arc<SfaSegmentMapping>, SfaSegmentError> {
     let len = usize::try_from(size_bytes)
         .map_err(|_| SfaSegmentError::SizeTooLargeForPlatform { size: size_bytes })?;
@@ -1158,11 +1204,26 @@ fn map_file_mut(file: &File, size_bytes: u64) -> Result<Arc<SfaSegmentMapping>, 
     }
 }
 
+#[cfg(target_arch = "wasm32")]
+fn map_file_mut(_file: &File, _size_bytes: u64) -> Result<Arc<SfaSegmentMapping>, SfaSegmentError> {
+    Err(SfaSegmentError::Io(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "file-backed store-and-forward is unavailable in browser WebAssembly",
+    )))
+}
+
 fn map_anon_mut(size_bytes: u64) -> Result<Arc<SfaSegmentMapping>, SfaSegmentError> {
     let len = usize::try_from(size_bytes)
         .map_err(|_| SfaSegmentError::SizeTooLargeForPlatform { size: size_bytes })?;
-    let mmap = MmapMut::map_anon(len).map_err(SfaSegmentError::Io)?;
-    Ok(Arc::new(SfaSegmentMapping::new(mmap)))
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let mmap = MmapMut::map_anon(len).map_err(SfaSegmentError::Io)?;
+        Ok(Arc::new(SfaSegmentMapping::new(mmap)))
+    }
+    #[cfg(target_arch = "wasm32")]
+    {
+        Ok(Arc::new(SfaSegmentMapping::new_memory(len)))
+    }
 }
 
 impl std::fmt::Debug for SfaSegmentMapping {

@@ -46,10 +46,12 @@
 // change.
 #[cfg(feature = "arrow-egress")]
 pub mod arrow;
+#[cfg(feature = "_egress")]
 pub(crate) mod auth;
 pub(crate) mod binds;
 pub mod column;
 pub mod column_kind;
+#[cfg(feature = "_egress")]
 pub mod config;
 pub(crate) mod decoder;
 pub(crate) mod gorilla;
@@ -74,6 +76,7 @@ pub(crate) mod ws;
 // internals — column views, wire codecs the tests pin) or is fully
 // crate-private. Adding to this list commits the crate to a semver
 // contract; trim aggressively.
+#[cfg(feature = "_egress")]
 pub use crate::ingress::CertificateAuthority;
 pub use binds::{Bind, SimpleNullKind};
 pub use column::{
@@ -82,6 +85,7 @@ pub use column::{
     LongArrayColumn, SymbolColumn, UuidColumn, Validity, VarcharColumn,
 };
 pub use column_kind::ColumnKind;
+#[cfg(feature = "_egress")]
 pub use config::{
     Compression, DEFAULT_COMPRESSION_LEVEL, DEFAULT_FAILOVER_BACKOFF_INITIAL_MS,
     DEFAULT_FAILOVER_BACKOFF_MAX_MS, DEFAULT_FAILOVER_ENABLED, DEFAULT_FAILOVER_MAX_ATTEMPTS,

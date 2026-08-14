@@ -54,18 +54,18 @@ mod qwp_udp;
 #[cfg(feature = "sync-sender-qwp-udp")]
 pub(crate) use qwp_udp::*;
 
-#[cfg(feature = "_sender-qwp-ws")]
-mod qwp_ws_codec;
+#[cfg(feature = "_qwp-ws-codec")]
+pub(crate) mod qwp_ws_codec;
 
-#[cfg(feature = "_sender-qwp-ws")]
-mod qwp_ws_driver;
+#[cfg(feature = "_qwp-ws-driver-core")]
+pub(crate) mod qwp_ws_driver;
 
 #[cfg(feature = "sync-sender-qwp-ws")]
 pub(crate) use qwp_ws_driver::{
     ReconnectPolicy, ReconnectReason, reconnect_backoff_step, reconnect_error_is_terminal,
 };
 
-#[cfg(feature = "_sender-qwp-ws")]
+#[cfg(feature = "_qwp-ws-driver-core")]
 mod qwp_ws_ownership;
 
 #[cfg(feature = "_sender-qwp-ws")]
@@ -75,39 +75,39 @@ pub(crate) use qwp_ws_orphan::has_any_sfa_file;
 #[cfg(feature = "_sender-qwp-ws")]
 pub(crate) use qwp_ws_orphan::is_candidate_orphan;
 
-#[cfg(feature = "_sender-qwp-ws")]
+#[cfg(feature = "_qwp-ws-driver-core")]
 mod qwp_ws_publisher;
 
-#[cfg(feature = "_sender-qwp-ws")]
-mod qwp_ws_queue;
+#[cfg(feature = "_qwp-ws-driver-core")]
+pub(crate) mod qwp_ws_queue;
 
-#[cfg(feature = "_sender-qwp-ws")]
+#[cfg(feature = "_qwp-ws-driver-core")]
 mod qwp_ws_sfa_segment;
 
-#[cfg(feature = "_sender-qwp-ws")]
+#[cfg(feature = "_qwp-ws-driver-core")]
 pub(crate) mod qwp_ws_sfa_manifest;
 
-#[cfg(feature = "_sender-qwp-ws")]
-mod qwp_ws_sfa_queue;
+#[cfg(feature = "_qwp-ws-driver-core")]
+pub(crate) mod qwp_ws_sfa_queue;
 
-#[cfg(feature = "_sender-qwp-ws")]
+#[cfg(feature = "_qwp-ws-driver-core")]
 mod qwp_ws_sfa_slot;
 
-#[cfg(feature = "_sender-qwp-ws")]
+#[cfg(feature = "_qwp-ws-driver-core")]
 pub(crate) mod qwp_ws_sfa_publisher;
 
-#[cfg(feature = "_sender-qwp-ws")]
+#[cfg(feature = "_qwp-ws-driver-core")]
 pub(crate) mod qwp_ws_sfa_symbol_dict;
 
-#[cfg(feature = "_sender-qwp-ws")]
+#[cfg(feature = "_qwp-ws-driver-core")]
 mod qwp_ws_sfa_catchup;
 
 #[cfg(all(test, feature = "_sender-qwp-ws"))]
 pub(crate) use qwp_ws_sfa_catchup::fail_next_catch_up_allocation_for_test;
 
-#[cfg(feature = "_sender-qwp-ws")]
+#[cfg(feature = "_qwp-ws-driver-core")]
 pub(crate) use qwp_ws_ownership::QwpWsRoleReject;
-#[cfg(feature = "_sender-qwp-ws")]
+#[cfg(feature = "_qwp-ws-driver-core")]
 pub use qwp_ws_ownership::*;
 
 #[cfg(feature = "sync-sender-qwp-ws")]

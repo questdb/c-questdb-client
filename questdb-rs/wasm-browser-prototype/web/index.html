@@ -1,0 +1,47 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>QuestDB QWP browser prototype</title>
+  <link rel="stylesheet" href="./style.css">
+</head>
+<body>
+  <main>
+    <h1>QuestDB QWP browser prototype</h1>
+    <p>This page sends QWP v1 ingestion and query messages generated and decoded by Rust WebAssembly.</p>
+
+    <section>
+      <h2>QWP ingestion</h2>
+      <label>
+        QWP ingestion WebSocket URLs (comma-separated failover order)
+        <input id="url" value="ws://localhost:9000/api/v4/write">
+      </label>
+      <div class="buttons">
+        <button id="connect">Connect</button>
+        <button id="send" disabled>Send sample row</button>
+        <button id="close" disabled>Close</button>
+      </div>
+      <pre id="log" aria-label="QWP connection log"></pre>
+    </section>
+
+    <section>
+      <h2>SQL over QWP egress</h2>
+      <label>
+        QWP query WebSocket URL
+        <input id="query-url" value="ws://localhost:9000/read/v1">
+      </label>
+      <label>
+        SQL
+        <textarea id="sql" rows="5">select * from wasm_ticks</textarea>
+      </label>
+      <div class="buttons">
+        <button id="execute-sql">Execute SQL</button>
+      </div>
+      <div id="query-status" role="status"></div>
+      <div id="query-result" class="query-result"></div>
+    </section>
+  </main>
+  <script type="module" src="./main.js"></script>
+</body>
+</html>

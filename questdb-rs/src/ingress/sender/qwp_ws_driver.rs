@@ -34,7 +34,9 @@ use std::collections::{HashMap, VecDeque};
 #[cfg(feature = "sync-sender-qwp-ws")]
 use std::io::Write;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
+#[cfg(feature = "sync-sender-qwp-ws")]
+use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::time::{Duration, Instant};
 
 #[cfg(feature = "sync-sender-qwp-ws")]
@@ -158,12 +160,14 @@ impl PoisonFrameTracker {
     }
 }
 
-#[cfg(test)]
 #[derive(Debug)]
-pub(crate) struct QwpWsCoreTestHarness<Q, T> {
+pub(crate) struct QwpWsCoreHarness<Q, T> {
     store: QwpWsPublicationStore<Q>,
     send_core: QwpWsSendCore<T>,
 }
+
+#[cfg(test)]
+pub(crate) type QwpWsCoreTestHarness<Q, T> = QwpWsCoreHarness<Q, T>;
 
 // Connection-local send-loop state shared by the manual and background
 // schedulers. It owns transport and cursor state, but never owns publication
@@ -456,6 +460,7 @@ pub(crate) struct QwpWsPublicationStore<Q = SfaFrameQueue> {
     last_server_error: Option<QwpServerError>,
     rejected_frames: VecDeque<QwpRejectedFrame>,
     sender_errors: SenderErrorLog,
+    #[cfg(feature = "_sender-qwp-ws")]
     rejection_sink: Option<Arc<crate::ingress::rejection_events::RejectionEventSource>>,
     counters: QwpWsCounters,
 }
@@ -471,11 +476,13 @@ impl<Q: PublicationLog> QwpWsPublicationStore<Q> {
             last_server_error: None,
             rejected_frames: VecDeque::new(),
             sender_errors: SenderErrorLog::new(event_capacity),
+            #[cfg(feature = "_sender-qwp-ws")]
             rejection_sink: None,
             counters: QwpWsCounters::default(),
         }
     }
 
+    #[cfg(feature = "_sender-qwp-ws")]
     pub(crate) fn set_rejection_sink(
         &mut self,
         sink: Option<Arc<crate::ingress::rejection_events::RejectionEventSource>>,
@@ -691,6 +698,7 @@ impl<Q: PublicationLog> QwpWsPublicationStore<Q> {
         debug_assert!(committed);
         // User code is the final observer: the local diagnostic rings,
         // terminal error, lifecycle latch, and driver event all precede it.
+        #[cfg(feature = "_sender-qwp-ws")]
         if let Some(sink) = &self.rejection_sink {
             sink.publish(sender_error);
         }
@@ -814,6 +822,7 @@ impl<Q: PublicationLog> QwpWsPublicationStore<Q> {
 
     fn push_sender_error(&mut self, error: QwpWsSenderError) {
         self.sender_errors.push(error.clone());
+        #[cfg(feature = "_sender-qwp-ws")]
         if let Some(sink) = &self.rejection_sink {
             sink.publish(error);
         }
@@ -2308,7 +2317,7 @@ impl<T: QwpWsCoreTransport> QwpWsSendCore<T> {
 }
 
 #[cfg(test)]
-impl QwpWsCoreTestHarness<SfaFrameQueue, FakeOrderedServer> {
+impl QwpWsCoreHarness<SfaFrameQueue, FakeOrderedServer> {
     pub(crate) fn new(
         options: SfaMemoryQueueOptions,
         server: FakeOrderedServer,
@@ -2321,8 +2330,7 @@ impl QwpWsCoreTestHarness<SfaFrameQueue, FakeOrderedServer> {
     }
 }
 
-#[cfg(test)]
-impl<Q: PublicationLog, T: QwpWsCoreTransport> QwpWsCoreTestHarness<Q, T> {
+impl<Q: PublicationLog, T: QwpWsCoreTransport> QwpWsCoreHarness<Q, T> {
     pub(crate) fn from_queue(queue: Q, transport: T) -> Self {
         Self {
             store: QwpWsPublicationStore::new(queue, DEFAULT_EVENT_CAPACITY),
@@ -2490,6 +2498,18 @@ impl<Q: PublicationLog, T: QwpWsCoreTransport> QwpWsCoreTestHarness<Q, T> {
 
     pub(crate) fn drive_receive_once(&mut self) -> Result<DriveOutcome, DriverError> {
         self.send_core.drive_receive_once(&mut self.store)
+    }
+
+    /// Mark a browser-opened replacement WebSocket ready and rewind delivery
+    /// to the oldest unresolved publication. The existing replay cursor and
+    /// ACK watermark decide which frames are sent again.
+    pub(crate) fn finish_browser_reconnect(&mut self) -> DriveOutcome {
+        self.send_core
+            .finish_reconnect_success(&mut self.store, ReconnectReason::Disconnect)
+    }
+
+    pub(crate) fn transport_mut(&mut self) -> &mut T {
+        &mut self.send_core.transport
     }
 
     /// Reads the receipt's current delivery state without driving the transport.
@@ -3289,7 +3309,7 @@ impl Drop for BlockingQwpWsTransport {
     }
 }
 
-fn decode_transport_response(
+pub(crate) fn decode_transport_response(
     payload: &[u8],
 ) -> Result<Option<TransportResponse>, TransportFailure> {
     match codec::parse_pipelined_response(payload) {

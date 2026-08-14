@@ -37,6 +37,11 @@
 //! query_flags:    varint   optional trailer; omitted when 0
 //! ```
 
+#![cfg_attr(
+    all(feature = "qwp-browser-codec", not(feature = "sync-reader-qwp-ws")),
+    allow(dead_code)
+)]
+
 use std::net::Ipv4Addr;
 
 use crate::egress::binds::{Bind, SimpleNullKind, check_bindable, encode_bind};

@@ -1,0 +1,82 @@
+:root {
+  color-scheme: light dark;
+  font-family: system-ui, sans-serif;
+}
+
+body {
+  margin: 0;
+}
+
+main {
+  margin: 3rem auto;
+  max-width: 64rem;
+  padding: 0 1.5rem;
+}
+
+section {
+  border-top: 1px solid color-mix(in srgb, currentColor 35%, transparent);
+  margin-top: 2rem;
+  padding-top: 1rem;
+}
+
+label {
+  display: grid;
+  gap: 0.5rem;
+}
+
+input,
+textarea,
+button {
+  box-sizing: border-box;
+  font: inherit;
+  padding: 0.65rem;
+}
+
+input,
+textarea {
+  width: 100%;
+}
+
+.buttons {
+  display: flex;
+  gap: 0.75rem;
+  margin: 1rem 0;
+}
+
+pre {
+  border: 1px solid currentColor;
+  min-height: 16rem;
+  overflow: auto;
+  padding: 1rem;
+  white-space: pre-wrap;
+}
+
+#log {
+  min-height: 8rem;
+}
+
+#query-status {
+  min-height: 1.5rem;
+}
+
+.query-result {
+  overflow-x: auto;
+}
+
+table {
+  border-collapse: collapse;
+  margin-top: 0.75rem;
+  width: 100%;
+}
+
+th,
+td {
+  border: 1px solid color-mix(in srgb, currentColor 35%, transparent);
+  padding: 0.5rem;
+  text-align: left;
+  white-space: nowrap;
+}
+
+th {
+  background: color-mix(in srgb, CanvasText 8%, Canvas);
+}

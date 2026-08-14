@@ -23,6 +23,7 @@
  ******************************************************************************/
 
 #![allow(dead_code)]
+#![cfg_attr(target_arch = "wasm32", allow(clippy::drop_non_drop))]
 
 //! Java-compatible `.sfa` Store-and-Forward queue adapter.
 //!
@@ -37,7 +38,9 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
+#[cfg(not(target_arch = "wasm32"))]
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::error;
 
@@ -3416,6 +3419,14 @@ fn segment_cleanup_rank(name: &str) -> (u8, u64) {
     }
 }
 
+#[cfg(target_arch = "wasm32")]
+fn unix_time_micros() -> u64 {
+    // In-memory browser queues do not persist or compare this diagnostic
+    // creation timestamp. Avoid std::time's unsupported host clock call.
+    0
+}
+
+#[cfg(not(target_arch = "wasm32"))]
 fn unix_time_micros() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)

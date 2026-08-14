@@ -38,10 +38,10 @@ use crate::ingress::ndarr::{self, ArrayElementSealed};
 use crate::ingress::{ArrayElement, MAX_ARRAY_DIMS, NdArrayView, Timestamp};
 use std::collections::hash_map::RandomState;
 use std::fmt::Debug;
-#[cfg(feature = "_sender-qwp-ws")]
+#[cfg(feature = "_qwp-ws-codec")]
 use std::hash::BuildHasherDefault;
 use std::hash::{BuildHasher, Hash, Hasher};
-#[cfg(feature = "_sender-qwp-ws")]
+#[cfg(feature = "_qwp-ws-codec")]
 use std::sync::Mutex;
 
 use super::op_state::{Op, OpState};
@@ -2241,26 +2241,26 @@ impl QwpSendScratch {
 
 // --- WebSocket columnar buffer ---
 
-#[cfg(feature = "_sender-qwp-ws")]
+#[cfg(feature = "_qwp-ws-codec")]
 #[derive(Clone, Copy, Debug)]
 struct QwpWsMarker;
 
-#[cfg(feature = "_sender-qwp-ws")]
+#[cfg(feature = "_qwp-ws-codec")]
 type QwpWsSymbolHashMap<V> =
     std::collections::HashMap<std::sync::Arc<[u8]>, V, BuildHasherDefault<QwpWsSymbolHasher>>;
 
-#[cfg(feature = "_sender-qwp-ws")]
+#[cfg(feature = "_qwp-ws-codec")]
 const QWP_WS_SYMBOL_HASH_OFFSET: u64 = 0xcbf29ce484222325;
 
-#[cfg(feature = "_sender-qwp-ws")]
+#[cfg(feature = "_qwp-ws-codec")]
 const QWP_WS_SYMBOL_HASH_PRIME: u64 = 0x100000001b3;
 
-#[cfg(feature = "_sender-qwp-ws")]
+#[cfg(feature = "_qwp-ws-codec")]
 fn qwp_ws_symbol_hash(bytes: &[u8]) -> u64 {
     qwp_ws_symbol_hash_with_seed(QWP_WS_SYMBOL_HASH_OFFSET, bytes)
 }
 
-#[cfg(feature = "_sender-qwp-ws")]
+#[cfg(feature = "_qwp-ws-codec")]
 fn qwp_ws_symbol_hash_with_seed(mut hash: u64, bytes: &[u8]) -> u64 {
     for &byte in bytes {
         hash ^= u64::from(byte);
@@ -2269,18 +2269,18 @@ fn qwp_ws_symbol_hash_with_seed(mut hash: u64, bytes: &[u8]) -> u64 {
     hash
 }
 
-#[cfg(feature = "_sender-qwp-ws")]
+#[cfg(feature = "_qwp-ws-codec")]
 #[derive(Clone, Debug)]
 pub(crate) struct QwpWsSymbolHasher(u64);
 
-#[cfg(feature = "_sender-qwp-ws")]
+#[cfg(feature = "_qwp-ws-codec")]
 impl Default for QwpWsSymbolHasher {
     fn default() -> Self {
         Self(QWP_WS_SYMBOL_HASH_OFFSET)
     }
 }
 
-#[cfg(feature = "_sender-qwp-ws")]
+#[cfg(feature = "_qwp-ws-codec")]
 impl Hasher for QwpWsSymbolHasher {
     fn finish(&self) -> u64 {
         self.0
@@ -2291,15 +2291,15 @@ impl Hasher for QwpWsSymbolHasher {
     }
 }
 
-#[cfg(feature = "_sender-qwp-ws")]
+#[cfg(feature = "_qwp-ws-codec")]
 type QwpWsLocalSymbolHashMap =
     std::collections::HashMap<u64, QwpWsLocalSymbolBucket, BuildHasherDefault<QwpWsU64Hasher>>;
 
-#[cfg(feature = "_sender-qwp-ws")]
+#[cfg(feature = "_qwp-ws-codec")]
 #[derive(Clone, Debug, Default)]
 struct QwpWsU64Hasher(u64);
 
-#[cfg(feature = "_sender-qwp-ws")]
+#[cfg(feature = "_qwp-ws-codec")]
 impl Hasher for QwpWsU64Hasher {
     fn finish(&self) -> u64 {
         self.0
@@ -2318,20 +2318,20 @@ impl Hasher for QwpWsU64Hasher {
     }
 }
 
-#[cfg(feature = "_sender-qwp-ws")]
+#[cfg(feature = "_qwp-ws-codec")]
 #[derive(Clone, Debug)]
 enum QwpWsLocalSymbolBucket {
     One(u32),
     Many(Vec<u32>),
 }
 
-#[cfg(feature = "_sender-qwp-ws")]
+#[cfg(feature = "_qwp-ws-codec")]
 #[derive(Clone, Debug, Default)]
 struct QwpWsLocalSymbolLookup {
     buckets: QwpWsLocalSymbolHashMap,
 }
 
-#[cfg(feature = "_sender-qwp-ws")]
+#[cfg(feature = "_qwp-ws-codec")]
 impl QwpWsLocalSymbolLookup {
     fn reserve(&mut self, additional: usize) {
         self.buckets.reserve(additional);
@@ -2382,7 +2382,7 @@ impl QwpWsLocalSymbolLookup {
     }
 }
 
-#[cfg(feature = "_sender-qwp-ws")]
+#[cfg(feature = "_qwp-ws-codec")]
 #[derive(Clone, Debug)]
 struct QwpWsSnapshot {
     tables: Vec<QwpWsTableBuffer>,
@@ -2392,7 +2392,7 @@ struct QwpWsSnapshot {
     size_hint: QwpWsSizeHint,
 }
 
-#[cfg(feature = "_sender-qwp-ws")]
+#[cfg(feature = "_qwp-ws-codec")]
 #[derive(Clone, Debug)]
 struct QwpWsRowRollbackMark {
     tables_len: usize,
@@ -2401,7 +2401,7 @@ struct QwpWsRowRollbackMark {
     table_mark: QwpWsTableRollbackMark,
 }
 
-#[cfg(feature = "_sender-qwp-ws")]
+#[cfg(feature = "_qwp-ws-codec")]
 #[derive(Clone, Debug)]
 struct QwpWsTableRollbackMark {
     row_count: u32,
@@ -2411,7 +2411,7 @@ struct QwpWsTableRollbackMark {
     columns_len: usize,
 }
 
-#[cfg(feature = "_sender-qwp-ws")]
+#[cfg(feature = "_qwp-ws-codec")]
 #[derive(Clone, Debug)]
 struct QwpWsTableBuffer {
     table_name: Vec<u8>,
@@ -2425,7 +2425,7 @@ struct QwpWsTableBuffer {
     row_mark: Option<QwpWsRowRollbackMark>,
 }
 
-#[cfg(feature = "_sender-qwp-ws")]
+#[cfg(feature = "_qwp-ws-codec")]
 #[derive(Clone, Debug)]
 struct QwpWsColumnBuffer {
     name: Vec<u8>,
@@ -2440,7 +2440,7 @@ struct QwpWsColumnBuffer {
     values: QwpWsColumnValues,
 }
 
-#[cfg(feature = "_sender-qwp-ws")]
+#[cfg(feature = "_qwp-ws-codec")]
 #[derive(Clone, Copy, Debug, Default)]
 struct QwpWsTableSizeHint {
     encoded_table_len: usize,
@@ -2449,7 +2449,7 @@ struct QwpWsTableSizeHint {
     dirty: bool,
 }
 
-#[cfg(feature = "_sender-qwp-ws")]
+#[cfg(feature = "_qwp-ws-codec")]
 impl QwpWsTableSizeHint {
     fn from_table(table: &QwpWsTableBuffer) -> Self {
         if table.row_count == 0 {
@@ -2483,7 +2483,7 @@ impl QwpWsTableSizeHint {
 /// Row construction only dirties the table being edited. A size query then
 /// recomputes that table from per-column O(1) counters and folds the delta into
 /// the buffer total, avoiding walks over buffered rows and unrelated tables.
-#[cfg(feature = "_sender-qwp-ws")]
+#[cfg(feature = "_qwp-ws-codec")]
 #[derive(Clone, Debug, Default)]
 struct QwpWsSizeHint {
     tables: Vec<QwpWsTableSizeHint>,
@@ -2495,7 +2495,7 @@ struct QwpWsSizeHint {
     recomputed_tables: usize,
 }
 
-#[cfg(feature = "_sender-qwp-ws")]
+#[cfg(feature = "_qwp-ws-codec")]
 impl QwpWsSizeHint {
     fn mark_dirty(&mut self, table_idx: usize) {
         if self.tables.len() <= table_idx {
@@ -2558,7 +2558,7 @@ impl QwpWsSizeHint {
     }
 }
 
-#[cfg(feature = "_sender-qwp-ws")]
+#[cfg(feature = "_qwp-ws-codec")]
 #[derive(Clone, Debug)]
 enum QwpWsColumnValues {
     Bool {
@@ -2644,14 +2644,14 @@ enum QwpWsColumnValues {
     },
 }
 
-#[cfg(feature = "_sender-qwp-ws")]
+#[cfg(feature = "_qwp-ws-codec")]
 #[derive(Clone, Copy, Debug)]
 struct QwpWsCell<T: Copy> {
     row_idx: u32,
     value: T,
 }
 
-#[cfg(feature = "_sender-qwp-ws")]
+#[cfg(feature = "_qwp-ws-codec")]
 #[derive(Clone, Copy, Debug)]
 struct QwpWsSliceCell {
     row_idx: u32,
@@ -2659,7 +2659,7 @@ struct QwpWsSliceCell {
     len: u32,
 }
 
-#[cfg(feature = "_sender-qwp-ws")]
+#[cfg(feature = "_qwp-ws-codec")]
 #[derive(Clone, Copy, Debug)]
 struct QwpWsSymbolCell {
     row_idx: u32,
@@ -2667,14 +2667,14 @@ struct QwpWsSymbolCell {
     is_new: bool,
 }
 
-#[cfg(feature = "_sender-qwp-ws")]
+#[cfg(feature = "_qwp-ws-codec")]
 #[derive(Clone, Debug)]
 struct QwpWsSymbolEntry {
     offset: u32,
     len: u32,
 }
 
-#[cfg(feature = "_sender-qwp-ws")]
+#[cfg(feature = "_qwp-ws-codec")]
 fn symbol_entry_bytes<'a>(
     dict: &[QwpWsSymbolEntry],
     data: &'a [u8],
@@ -2686,14 +2686,14 @@ fn symbol_entry_bytes<'a>(
     data.get(start..end)
 }
 
-#[cfg(feature = "_sender-qwp-ws")]
+#[cfg(feature = "_qwp-ws-codec")]
 #[derive(Clone, Copy, Debug)]
 struct QwpWsDecimalCell {
     row_idx: u32,
     value: Option<StoredQwpDecimal>,
 }
 
-#[cfg(feature = "_sender-qwp-ws")]
+#[cfg(feature = "_qwp-ws-codec")]
 fn pop_value_cell_for_row<T: Copy>(cells: &mut Vec<QwpWsCell<T>>, row_idx: u32) -> bool {
     if cells.last().is_some_and(|cell| cell.row_idx == row_idx) {
         cells.pop();
@@ -2703,7 +2703,7 @@ fn pop_value_cell_for_row<T: Copy>(cells: &mut Vec<QwpWsCell<T>>, row_idx: u32) 
     }
 }
 
-#[cfg(feature = "_sender-qwp-ws")]
+#[cfg(feature = "_qwp-ws-codec")]
 fn pop_slice_cell_for_row(cells: &mut Vec<QwpWsSliceCell>, row_idx: u32) -> Option<QwpWsSliceCell> {
     if cells.last().is_some_and(|cell| cell.row_idx == row_idx) {
         cells.pop()
@@ -2712,7 +2712,7 @@ fn pop_slice_cell_for_row(cells: &mut Vec<QwpWsSliceCell>, row_idx: u32) -> Opti
     }
 }
 
-#[cfg(feature = "_sender-qwp-ws")]
+#[cfg(feature = "_qwp-ws-codec")]
 fn pop_symbol_cell_for_row(
     cells: &mut Vec<QwpWsSymbolCell>,
     row_idx: u32,
@@ -2724,7 +2724,7 @@ fn pop_symbol_cell_for_row(
     }
 }
 
-#[cfg(feature = "_sender-qwp-ws")]
+#[cfg(feature = "_qwp-ws-codec")]
 fn pop_decimal_cell_for_row(
     cells: &mut Vec<QwpWsDecimalCell>,
     row_idx: u32,
@@ -2736,7 +2736,7 @@ fn pop_decimal_cell_for_row(
     }
 }
 
-#[cfg(feature = "_sender-qwp-ws")]
+#[cfg(feature = "_qwp-ws-codec")]
 #[derive(Debug)]
 pub(crate) struct QwpWsColumnarBuffer {
     tables: Vec<QwpWsTableBuffer>,
@@ -2750,7 +2750,7 @@ pub(crate) struct QwpWsColumnarBuffer {
     max_name_len: usize,
 }
 
-#[cfg(feature = "_sender-qwp-ws")]
+#[cfg(feature = "_qwp-ws-codec")]
 impl Clone for QwpWsColumnarBuffer {
     fn clone(&self) -> Self {
         let size_hint = self
@@ -2775,7 +2775,7 @@ impl Clone for QwpWsColumnarBuffer {
     }
 }
 
-#[cfg(feature = "_sender-qwp-ws")]
+#[cfg(feature = "_qwp-ws-codec")]
 impl QwpWsColumnarBuffer {
     pub(crate) fn new(max_name_len: usize) -> Self {
         Self {
@@ -3873,7 +3873,7 @@ impl QwpWsColumnarBuffer {
     }
 }
 
-#[cfg(feature = "_sender-qwp-ws")]
+#[cfg(feature = "_qwp-ws-codec")]
 impl QwpWsTableBuffer {
     fn new(table_name: &[u8]) -> Self {
         Self {
@@ -3976,7 +3976,7 @@ impl QwpWsTableBuffer {
     }
 }
 
-#[cfg(feature = "_sender-qwp-ws")]
+#[cfg(feature = "_qwp-ws-codec")]
 impl QwpWsColumnBuffer {
     fn new(name: &[u8], kind: ColumnKind) -> Self {
         let name_is_ascii = name.is_ascii();
@@ -4520,7 +4520,7 @@ impl QwpWsColumnBuffer {
     }
 }
 
-#[cfg(feature = "_sender-qwp-ws")]
+#[cfg(feature = "_qwp-ws-codec")]
 impl QwpWsColumnValues {
     fn new(kind: ColumnKind) -> Self {
         match kind {
@@ -5228,7 +5228,7 @@ impl QwpWsColumnValues {
     }
 }
 
-#[cfg(feature = "_sender-qwp-ws")]
+#[cfg(feature = "_qwp-ws-codec")]
 fn lowercase_name_bytes(name: &[u8], is_ascii: bool) -> Vec<u8> {
     if is_ascii {
         return name.iter().map(|b| b.to_ascii_lowercase()).collect();
@@ -5239,7 +5239,7 @@ fn lowercase_name_bytes(name: &[u8], is_ascii: bool) -> Vec<u8> {
     }
 }
 
-#[cfg(feature = "_sender-qwp-ws")]
+#[cfg(feature = "_qwp-ws-codec")]
 #[inline(always)]
 fn packed_name(name: &[u8]) -> u64 {
     if name.len() > 8 {
@@ -5252,7 +5252,7 @@ fn packed_name(name: &[u8]) -> u64 {
     packed
 }
 
-#[cfg(feature = "_sender-qwp-ws")]
+#[cfg(feature = "_qwp-ws-codec")]
 #[inline(always)]
 fn packed_lower_ascii_name(name: &[u8]) -> u64 {
     if name.len() > 8 {
@@ -5265,7 +5265,7 @@ fn packed_lower_ascii_name(name: &[u8]) -> u64 {
     packed
 }
 
-#[cfg(feature = "_sender-qwp-ws")]
+#[cfg(feature = "_qwp-ws-codec")]
 #[inline(always)]
 fn names_equal_packed(left: &[u8], packed_left: u64, right: &[u8]) -> bool {
     if left.len() != right.len() {
@@ -5277,7 +5277,7 @@ fn names_equal_packed(left: &[u8], packed_left: u64, right: &[u8]) -> bool {
     left == right
 }
 
-#[cfg(feature = "_sender-qwp-ws")]
+#[cfg(feature = "_qwp-ws-codec")]
 #[inline(always)]
 fn names_equal_lower_ascii(left_lower: &[u8], packed_left_lower: u64, right: &[u8]) -> bool {
     if left_lower.len() != right.len() {
@@ -5292,12 +5292,12 @@ fn names_equal_lower_ascii(left_lower: &[u8], packed_left_lower: u64, right: &[u
         .all(|(&left, &right)| left == right.to_ascii_lowercase())
 }
 
-#[cfg(feature = "_sender-qwp-ws")]
+#[cfg(feature = "_qwp-ws-codec")]
 fn column_lookup_key(name: &[u8]) -> crate::Result<Box<[u8]>> {
     Ok(lowercase_name_bytes(name, name.is_ascii()).into_boxed_slice())
 }
 
-#[cfg(feature = "_sender-qwp-ws")]
+#[cfg(feature = "_qwp-ws-codec")]
 fn batched_type_change_error_ws(entry_name: &[u8]) -> crate::Error {
     if entry_name.is_empty() {
         error::fmt!(
@@ -5313,16 +5313,16 @@ fn batched_type_change_error_ws(entry_name: &[u8]) -> crate::Error {
     }
 }
 
-#[cfg(feature = "_sender-qwp-ws")]
+#[cfg(feature = "_qwp-ws-codec")]
 fn type_mismatch_error_ws(entry_name: &[u8]) -> crate::Error {
     batched_type_change_error_ws(entry_name)
 }
 
 // --- WebSocket (delta-symbol-dict) encoder ---
 
-#[cfg(feature = "_sender-qwp-ws")]
+#[cfg(feature = "_qwp-ws-codec")]
 const QWP_FLAG_DELTA_SYMBOL_DICT: u8 = 0x08;
-#[cfg(feature = "_sender-qwp-ws")]
+#[cfg(feature = "_qwp-ws-codec")]
 const QWP_FLAG_DEFER_COMMIT: u8 = 0x01;
 
 /// Connection-scoped global symbol dictionary used by the QWP/WebSocket
@@ -5343,7 +5343,7 @@ const QWP_FLAG_DEFER_COMMIT: u8 = 0x01;
 ///
 /// Capped at [`MAX_CONN_SYMBOL_DICT_SIZE`] to mirror the server's
 /// connection-scoped dictionary ceiling and the Java reference client.
-#[cfg(feature = "_sender-qwp-ws")]
+#[cfg(feature = "_qwp-ws-codec")]
 #[derive(Debug)]
 pub(crate) struct SymbolGlobalDict {
     map: QwpWsSymbolHashMap<u64>,
@@ -5384,7 +5384,7 @@ struct ArrowDictSlotMemo {
     slot_to_gid: Vec<u64>,
 }
 
-#[cfg(feature = "_sender-qwp-ws")]
+#[cfg(feature = "_qwp-ws-codec")]
 impl Default for SymbolGlobalDict {
     fn default() -> Self {
         Self::new()
@@ -5409,7 +5409,7 @@ impl Default for SymbolGlobalDict {
 /// earlier from being lost) is documented on
 /// [`SymbolDictFull`](crate::ErrorCode::SymbolDictFull). (The egress/query-result
 /// reader has its own, independent ceiling; see `egress/symbol_dict.rs`.)
-#[cfg(feature = "_sender-qwp-ws")]
+#[cfg(feature = "_qwp-ws-codec")]
 pub(crate) const MAX_CONN_SYMBOL_DICT_SIZE: usize = 2_000_000;
 
 /// Per-connection cap on the cumulative UTF-8 heap (in bytes) the QWP/WS global
@@ -5424,10 +5424,10 @@ pub(crate) const MAX_CONN_SYMBOL_DICT_SIZE: usize = 2_000_000;
 /// the slot's queued delta frames at the torn-dict guard. Enforcing the same
 /// 256 MiB bound the reader/server use keeps writer and reader in lockstep and a
 /// legitimate side-file well under `MAX_FILE_LEN`.
-#[cfg(feature = "_sender-qwp-ws")]
+#[cfg(feature = "_qwp-ws-codec")]
 pub(crate) const MAX_CONN_SYMBOL_DICT_HEAP_BYTES: usize = 256 * 1024 * 1024;
 
-#[cfg(feature = "_sender-qwp-ws")]
+#[cfg(feature = "_qwp-ws-codec")]
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct SymbolGlobalDictMark {
     entries_len: usize,
@@ -5435,7 +5435,7 @@ pub(crate) struct SymbolGlobalDictMark {
     heap_bytes: usize,
 }
 
-#[cfg(all(test, feature = "_sender-qwp-ws"))]
+#[cfg(all(test, feature = "_qwp-ws-codec"))]
 thread_local! {
     /// Entry cap applied to every [`SymbolGlobalDict::new`] on this thread; see
     /// [`TestDictCapGuard`].
@@ -5461,24 +5461,24 @@ thread_local! {
 /// thread, so the override reaches them without leaking into a concurrent test
 /// that happens to build a sender at the same moment. Restores the previous
 /// value on drop, so guards nest.
-#[cfg(all(test, feature = "_sender-qwp-ws"))]
+#[cfg(all(test, feature = "_qwp-ws-codec"))]
 pub(crate) struct TestDictCapGuard(Option<usize>);
 
-#[cfg(all(test, feature = "_sender-qwp-ws"))]
+#[cfg(all(test, feature = "_qwp-ws-codec"))]
 impl TestDictCapGuard {
     pub(crate) fn new(cap: usize) -> Self {
         Self(TEST_DICT_CAP.with(|c| c.replace(Some(cap))))
     }
 }
 
-#[cfg(all(test, feature = "_sender-qwp-ws"))]
+#[cfg(all(test, feature = "_qwp-ws-codec"))]
 impl Drop for TestDictCapGuard {
     fn drop(&mut self) {
         TEST_DICT_CAP.with(|c| c.set(self.0));
     }
 }
 
-#[cfg(feature = "_sender-qwp-ws")]
+#[cfg(feature = "_qwp-ws-codec")]
 impl SymbolGlobalDict {
     pub(crate) fn new() -> Self {
         #[allow(unused_mut)]
@@ -5821,7 +5821,7 @@ impl SymbolGlobalDict {
 }
 
 /// Reusable scratch buffers for encoding a single QWP/WebSocket message.
-#[cfg(feature = "_sender-qwp-ws")]
+#[cfg(feature = "_qwp-ws-codec")]
 #[derive(Default)]
 pub(crate) struct QwpWsEncodeScratch {
     /// Test-only retained output for the convenience encoders in this module.
@@ -5840,7 +5840,7 @@ pub(crate) struct QwpWsEncodeScratch {
     schema_signature: Vec<u8>,
 }
 
-#[cfg(feature = "_sender-qwp-ws")]
+#[cfg(feature = "_qwp-ws-codec")]
 impl QwpWsEncodeScratch {
     pub(crate) fn new() -> Self {
         Self {
@@ -5852,7 +5852,7 @@ impl QwpWsEncodeScratch {
     }
 }
 
-#[cfg(feature = "_sender-qwp-ws")]
+#[cfg(feature = "_qwp-ws-codec")]
 impl QwpBuffer {
     /// Encode all currently-buffered table blocks into a single QWP/WebSocket
     /// message using delta-symbol-dict mode (FLAG_DELTA_SYMBOL_DICT).
@@ -6121,7 +6121,7 @@ impl QwpBuffer {
     }
 }
 
-#[cfg(feature = "_sender-qwp-ws")]
+#[cfg(feature = "_qwp-ws-codec")]
 fn checked_qwp_u16(value: usize, what: &'static str) -> crate::Result<u16> {
     if value > u16::MAX as usize {
         return Err(error::fmt!(
@@ -6134,7 +6134,7 @@ fn checked_qwp_u16(value: usize, what: &'static str) -> crate::Result<u16> {
     Ok(value as u16)
 }
 
-#[cfg(all(test, feature = "_sender-qwp-ws"))]
+#[cfg(all(test, feature = "_qwp-ws-codec"))]
 fn encode_symbol_column_delta_dict(
     col: &ColumnStats,
     row_count: usize,
@@ -7403,7 +7403,7 @@ fn write_qwp_varint(out: &mut Vec<u8>, mut value: u64) {
 /// shared decoder for every QWP delta-symbol-dictionary reader — [`SymbolGlobalDict::seed`],
 /// the store-and-forward catch-up mirror, and the persisted side-file — so their
 /// varint bounds cannot silently diverge.
-#[cfg(feature = "_sender-qwp-ws")]
+#[cfg(feature = "_qwp-ws-codec")]
 pub(crate) fn decode_qwp_varint(buf: &[u8], pos: usize) -> Option<(u64, usize)> {
     let mut value: u64 = 0;
     let mut shift = 0u32;
@@ -7437,7 +7437,7 @@ pub(crate) fn decode_qwp_varint(buf: &[u8], pos: usize) -> Option<(u64, usize)> 
 /// three enforce one bound and cannot diverge (a symbol the writer accepts but the
 /// reader rejects would leave a queued frame unreplayable). Mirrors the Java
 /// client's `MAX_ENTRY_LEN`; a longer symbol is rejected at ingestion.
-#[cfg(feature = "_sender-qwp-ws")]
+#[cfg(feature = "_qwp-ws-codec")]
 pub(crate) const MAX_PERSISTED_SYMBOL_ENTRY_LEN: u64 = 1 << 20;
 
 fn write_qwp_bytes(out: &mut Vec<u8>, bytes: &[u8]) {
@@ -8042,7 +8042,7 @@ mod tests {
         datagram.len()
     }
 
-    #[cfg(feature = "_sender-qwp-ws")]
+    #[cfg(feature = "_qwp-ws-codec")]
     fn read_test_varint(bytes: &[u8], pos: &mut usize) -> u64 {
         let mut shift = 0;
         let mut value = 0u64;
@@ -8057,7 +8057,7 @@ mod tests {
         }
     }
 
-    #[cfg(feature = "_sender-qwp-ws")]
+    #[cfg(feature = "_qwp-ws-codec")]
     fn read_test_bytes(bytes: &[u8], pos: &mut usize) -> Vec<u8> {
         let len = read_test_varint(bytes, pos) as usize;
         let out = bytes[*pos..*pos + len].to_vec();
@@ -8065,7 +8065,7 @@ mod tests {
         out
     }
 
-    #[cfg(feature = "_sender-qwp-ws")]
+    #[cfg(feature = "_qwp-ws-codec")]
     fn ws_delta_entries(message: &[u8]) -> (u64, Vec<Vec<u8>>, usize) {
         assert_eq!(&message[0..4], b"QWP1");
         assert_eq!(message[4], QWP_VERSION_1);
@@ -8088,7 +8088,7 @@ mod tests {
         (delta_start, entries, pos)
     }
 
-    #[cfg(feature = "_sender-qwp-ws")]
+    #[cfg(feature = "_qwp-ws-codec")]
     #[test]
     fn qwp_ws_local_symbol_lookup_handles_hash_collisions() {
         let mut lookup = QwpWsLocalSymbolLookup::default();
@@ -8122,7 +8122,7 @@ mod tests {
         assert_eq!(lookup.get(forced_hash, b"beta", &dict, &data), None);
     }
 
-    #[cfg(feature = "_sender-qwp-ws")]
+    #[cfg(feature = "_qwp-ws-codec")]
     fn decode_single_i64_column_ws_replay(message: &[u8]) -> Vec<(String, String, Vec<i64>)> {
         let (_, _, mut pos) = ws_delta_entries(message);
         let table_count = u16::from_le_bytes([message[6], message[7]]) as usize;
@@ -8150,18 +8150,18 @@ mod tests {
         tables
     }
 
-    #[cfg(feature = "_sender-qwp-ws")]
+    #[cfg(feature = "_qwp-ws-codec")]
     #[derive(Clone, Copy)]
     struct PanicTableName(&'static str);
 
-    #[cfg(feature = "_sender-qwp-ws")]
+    #[cfg(feature = "_qwp-ws-codec")]
     impl AsRef<str> for PanicTableName {
         fn as_ref(&self) -> &str {
             self.0
         }
     }
 
-    #[cfg(feature = "_sender-qwp-ws")]
+    #[cfg(feature = "_qwp-ws-codec")]
     impl<'a> TryFrom<PanicTableName> for TableName<'a> {
         type Error = crate::Error;
 
@@ -8170,18 +8170,18 @@ mod tests {
         }
     }
 
-    #[cfg(feature = "_sender-qwp-ws")]
+    #[cfg(feature = "_qwp-ws-codec")]
     #[derive(Clone, Copy)]
     struct PanicColumnName(&'static str);
 
-    #[cfg(feature = "_sender-qwp-ws")]
+    #[cfg(feature = "_qwp-ws-codec")]
     impl AsRef<str> for PanicColumnName {
         fn as_ref(&self) -> &str {
             self.0
         }
     }
 
-    #[cfg(feature = "_sender-qwp-ws")]
+    #[cfg(feature = "_qwp-ws-codec")]
     impl<'a> TryFrom<PanicColumnName> for ColumnName<'a> {
         type Error = crate::Error;
 
@@ -8190,7 +8190,7 @@ mod tests {
         }
     }
 
-    #[cfg(feature = "_sender-qwp-ws")]
+    #[cfg(feature = "_qwp-ws-codec")]
     fn add_trade_row(buf: &mut QwpBuffer, sym: &str, qty: i64) {
         buf.table("trades")
             .unwrap()
@@ -9726,7 +9726,7 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "_sender-qwp-ws")]
+    #[cfg(feature = "_qwp-ws-codec")]
     #[test]
     fn qwp_ws_replay_reemits_dense_symbol_prefix_on_later_frame() {
         let mut buf = QwpBuffer::new(127);
@@ -9755,7 +9755,7 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "_sender-qwp-ws")]
+    #[cfg(feature = "_qwp-ws-codec")]
     #[test]
     fn symbol_dict_enforces_entry_cap() {
         let mut dict = SymbolGlobalDict::with_cap(3);
@@ -9778,7 +9778,7 @@ mod tests {
         assert_eq!(dict.len(), 3);
     }
 
-    #[cfg(feature = "_sender-qwp-ws")]
+    #[cfg(feature = "_qwp-ws-codec")]
     #[test]
     fn symbol_dict_intern_rejects_symbols_above_the_persisted_entry_cap() {
         // A symbol larger than the persisted side-file's per-entry cap must be
@@ -9799,7 +9799,7 @@ mod tests {
         assert!(err.msg().contains("exceeding"), "{}", err.msg());
     }
 
-    #[cfg(feature = "_sender-qwp-ws")]
+    #[cfg(feature = "_qwp-ws-codec")]
     #[test]
     fn symbol_dict_enforces_heap_byte_cap_independently_of_entry_and_per_entry_caps() {
         // The entry-count and per-entry caps do not bound the aggregate heap, so
@@ -9826,7 +9826,7 @@ mod tests {
         assert_eq!(id, 0);
     }
 
-    #[cfg(feature = "_sender-qwp-ws")]
+    #[cfg(feature = "_qwp-ws-codec")]
     #[test]
     fn symbol_dict_rollback_restores_the_heap_counter() {
         // mark/rollback must restore heap_bytes in lockstep with entries/next_id --
@@ -9854,7 +9854,7 @@ mod tests {
         assert!(err.msg().contains("heap"), "{}", err.msg());
     }
 
-    #[cfg(feature = "_sender-qwp-ws")]
+    #[cfg(feature = "_qwp-ws-codec")]
     #[test]
     fn decode_qwp_varint_rejects_overflowing_ten_byte_encodings() {
         // Boundary values round-trip through the writer + decoder unchanged.
@@ -9899,7 +9899,7 @@ mod tests {
         assert_eq!(decode_qwp_varint(&[0x80; 11], 0), None);
     }
 
-    #[cfg(feature = "_sender-qwp-ws")]
+    #[cfg(feature = "_qwp-ws-codec")]
     #[test]
     fn symbol_dict_rollback_restores_below_cap() {
         let mut dict = SymbolGlobalDict::with_cap(2);
@@ -9916,7 +9916,7 @@ mod tests {
         assert_eq!(dict.len(), 2);
     }
 
-    #[cfg(feature = "_sender-qwp-ws")]
+    #[cfg(feature = "_qwp-ws-codec")]
     #[test]
     fn symbol_dict_seed_recovers_entries_and_continues_ids() {
         // Producer-side recovery: seeding the dictionary from a persisted
@@ -9937,7 +9937,7 @@ mod tests {
         assert_eq!(dict.next_id(), 3);
     }
 
-    #[cfg(feature = "_sender-qwp-ws")]
+    #[cfg(feature = "_qwp-ws-codec")]
     #[test]
     fn symbol_dict_seed_rejects_corrupt_region_without_panicking() {
         // A torn / corrupt recovered side-file must surface as a recoverable
@@ -9966,7 +9966,7 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "_sender-qwp-ws")]
+    #[cfg(feature = "_qwp-ws-codec")]
     #[test]
     fn symbol_dict_seed_rejects_an_over_cap_entry_length() {
         // Defence in depth: `intern` caps a symbol at MAX_PERSISTED_SYMBOL_ENTRY_LEN
@@ -10004,7 +10004,7 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "_sender-qwp-ws")]
+    #[cfg(feature = "_qwp-ws-codec")]
     #[test]
     fn symbol_dict_seed_rejects_duplicate_entries_from_a_torn_tail() {
         // A host/power-crash zero-extended tail parses as a run of empty
@@ -10027,7 +10027,7 @@ mod tests {
         assert_eq!(ok.entry(1), Some(&b""[..]));
     }
 
-    #[cfg(all(feature = "_sender-qwp-ws", feature = "arrow-ingress"))]
+    #[cfg(all(feature = "_qwp-ws-codec", feature = "arrow-ingress"))]
     #[test]
     fn arrow_dict_memo_reuses_table_and_clears_on_rollback() {
         let mut dict = SymbolGlobalDict::new();
@@ -10060,7 +10060,7 @@ mod tests {
         assert_eq!(after_rollback, vec![u64::MAX; 3]);
     }
 
-    #[cfg(feature = "_sender-qwp-ws")]
+    #[cfg(feature = "_qwp-ws-codec")]
     #[test]
     fn symbol_dict_seed_fills_to_the_cap_and_rejects_the_entry_past_it() {
         // `seed` re-interns every recovered entry, so the connection's entry cap
@@ -10129,7 +10129,7 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "_sender-qwp-ws")]
+    #[cfg(feature = "_qwp-ws-codec")]
     #[test]
     fn symbol_dict_cap_matches_server_ceiling() {
         // Mirrors the server's ingress dictionary ceiling (2_000_000; the Java
@@ -10139,7 +10139,7 @@ mod tests {
         assert_eq!(MAX_CONN_SYMBOL_DICT_SIZE, 2_000_000);
     }
 
-    #[cfg(feature = "_sender-qwp-ws")]
+    #[cfg(feature = "_qwp-ws-codec")]
     #[test]
     fn qwp_ws_replay_dense_prefix_includes_lower_symbol_ids() {
         let mut buf = QwpBuffer::new(127);
@@ -10167,7 +10167,7 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "_sender-qwp-ws")]
+    #[cfg(feature = "_qwp-ws-codec")]
     #[test]
     fn qwp_ws_columnar_replacing_rewind_point_drops_previous_snapshot() {
         let mut buf = QwpWsColumnarBuffer::new(127);
@@ -10225,7 +10225,7 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "_sender-qwp-ws")]
+    #[cfg(feature = "_qwp-ws-codec")]
     #[test]
     fn qwp_ws_cached_size_hint_matches_full_recompute_across_state_changes() {
         let mut buf = QwpWsColumnarBuffer::new(127);
@@ -10286,7 +10286,7 @@ mod tests {
         assert_eq!(buf.len(), buf.recompute_len_slow());
     }
 
-    #[cfg(feature = "_sender-qwp-ws")]
+    #[cfg(feature = "_qwp-ws-codec")]
     #[test]
     fn qwp_ws_cached_size_hint_recomputes_only_dirty_tables() {
         let mut buf = QwpWsColumnarBuffer::new(127);
@@ -10316,7 +10316,7 @@ mod tests {
         assert_eq!(buf.size_hint_recomputed_tables(), recomputed + 1);
     }
 
-    #[cfg(feature = "_sender-qwp-ws")]
+    #[cfg(feature = "_qwp-ws-codec")]
     #[test]
     fn qwp_ws_columnar_clear_bookmark_drops_only_current_snapshot() {
         let mut buf = QwpWsColumnarBuffer::new(127);
@@ -10354,7 +10354,7 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "_sender-qwp-ws")]
+    #[cfg(feature = "_qwp-ws-codec")]
     #[test]
     fn qwp_ws_columnar_clear_resets_decimal_scale_for_reused_column() {
         let mut buf = QwpWsColumnarBuffer::new(127);
@@ -10382,7 +10382,7 @@ mod tests {
             .expect("clear() must let the next batch repin the decimal scale");
     }
 
-    #[cfg(feature = "_sender-qwp-ws")]
+    #[cfg(feature = "_qwp-ws-codec")]
     #[test]
     fn qwp_ws_columnar_rollback_last_decimal_resets_scale_for_reused_column() {
         let mut buf = QwpWsColumnarBuffer::new(127);
@@ -10413,7 +10413,7 @@ mod tests {
             .expect("rollback must let the next value repin the decimal scale");
     }
 
-    #[cfg(feature = "_sender-qwp-ws")]
+    #[cfg(feature = "_qwp-ws-codec")]
     #[test]
     fn qwp_ws_columnar_clear_resets_geohash_precision_for_reused_column() {
         let mut buf = QwpWsColumnarBuffer::new(127);
@@ -10443,7 +10443,7 @@ mod tests {
 
     /// Parse a single-table WS replay message whose first column is a GEOHASH
     /// and return `(row_count, precision_bits)` read straight off the wire.
-    #[cfg(feature = "_sender-qwp-ws")]
+    #[cfg(feature = "_qwp-ws-codec")]
     fn ws_first_geohash_precision(message: &[u8]) -> (u64, u64) {
         let (_, _, mut pos) = ws_delta_entries(message);
         let table_count = u16::from_le_bytes([message[6], message[7]]) as usize;
@@ -10477,7 +10477,7 @@ mod tests {
     /// buffer) must still encode a *valid* precision for its all-null rows —
     /// resetting the pinned precision to the sentinel `0` made the server
     /// reject the frame.
-    #[cfg(feature = "_sender-qwp-ws")]
+    #[cfg(feature = "_qwp-ws-codec")]
     #[test]
     fn qwp_ws_columnar_reused_geohash_omitted_in_next_batch_keeps_valid_precision() {
         let mut buf = QwpWsColumnarBuffer::new(127);
@@ -10516,7 +10516,7 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "_sender-qwp-ws")]
+    #[cfg(feature = "_qwp-ws-codec")]
     #[test]
     fn qwp_ws_columnar_rollback_last_geohash_resets_precision_for_reused_column() {
         let mut buf = QwpWsColumnarBuffer::new(127);
@@ -10537,7 +10537,7 @@ mod tests {
             .expect("rollback must let the next value repin the geohash precision");
     }
 
-    #[cfg(feature = "_sender-qwp-ws")]
+    #[cfg(feature = "_qwp-ws-codec")]
     #[test]
     fn qwp_ws_columnar_bookmark_rejects_cross_buffer_use_after_clone() {
         let mut original = QwpWsColumnarBuffer::new(127);
@@ -10600,7 +10600,7 @@ mod tests {
         assert_eq!(cloned.row_count(), 1);
     }
 
-    #[cfg(feature = "_sender-qwp-ws")]
+    #[cfg(feature = "_qwp-ws-codec")]
     #[test]
     fn qwp_ws_columnar_existing_names_skip_validation() {
         let mut buf = QwpWsColumnarBuffer::new(127);
@@ -10626,7 +10626,7 @@ mod tests {
         assert_eq!(buf.row_count(), 2);
     }
 
-    #[cfg(feature = "_sender-qwp-ws")]
+    #[cfg(feature = "_qwp-ws-codec")]
     #[test]
     fn qwp_ws_columnar_new_names_still_validate_and_rollback() {
         let mut buf = QwpWsColumnarBuffer::new(127);
@@ -10655,7 +10655,7 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "_sender-qwp-ws")]
+    #[cfg(feature = "_qwp-ws-codec")]
     #[test]
     fn qwp_ws_columnar_duplicate_column_with_different_type_errors() {
         let mut buf = QwpWsColumnarBuffer::new(127);
@@ -10685,7 +10685,7 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "_sender-qwp-ws")]
+    #[cfg(feature = "_qwp-ws-codec")]
     #[test]
     fn qwp_ws_columnar_rollback_removes_new_symbol_from_current_row() {
         let mut buf = QwpWsColumnarBuffer::new(127);
@@ -10724,7 +10724,7 @@ mod tests {
         assert_eq!(entries, vec![b"ETH-USD".to_vec(), b"BTC-USD".to_vec()]);
     }
 
-    #[cfg(feature = "_sender-qwp-ws")]
+    #[cfg(feature = "_qwp-ws-codec")]
     #[test]
     fn qwp_ws_columnar_duplicate_column_is_first_value_wins() {
         let mut buf = QwpWsColumnarBuffer::new(127);
@@ -10748,7 +10748,7 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "_sender-qwp-ws")]
+    #[cfg(feature = "_qwp-ws-codec")]
     #[test]
     fn qwp_ws_columnar_column_identity_is_case_insensitive() {
         let mut buf = QwpWsColumnarBuffer::new(127);
@@ -10776,7 +10776,7 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "_sender-qwp-ws")]
+    #[cfg(feature = "_qwp-ws-codec")]
     #[test]
     fn qwp_ws_columnar_column_identity_is_case_insensitive_unicode() {
         // Uppercase É (U+00C9) and lowercase é (U+00E9) are non-ASCII, so the
@@ -10807,7 +10807,7 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "_sender-qwp-ws")]
+    #[cfg(feature = "_qwp-ws-codec")]
     #[test]
     fn qwp_ws_columnar_type_mismatch_rolls_back_partial_row() {
         let mut buf = QwpWsColumnarBuffer::new(127);
@@ -10844,7 +10844,7 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "_sender-qwp-ws")]
+    #[cfg(feature = "_qwp-ws-codec")]
     #[test]
     fn qwp_ws_columnar_interleaved_tables_are_grouped_by_table() {
         let mut buf = QwpWsColumnarBuffer::new(127);
@@ -10881,7 +10881,7 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "_sender-qwp-ws")]
+    #[cfg(feature = "_qwp-ws-codec")]
     #[test]
     fn qwp_ws_columnar_replay_matches_row_log_for_all_value_kinds_and_schema_growth() {
         let mut row_log = QwpBuffer::new(127);
@@ -10980,10 +10980,10 @@ mod tests {
         assert_eq!(columnar_scratch.message, row_log_scratch.message);
     }
 
-    #[cfg(feature = "_sender-qwp-ws")]
+    #[cfg(feature = "_qwp-ws-codec")]
     const QWP_WS_COLUMNAR_BENCH_BATCH_SIZE: usize = 1000;
 
-    #[cfg(feature = "_sender-qwp-ws")]
+    #[cfg(feature = "_qwp-ws-codec")]
     fn qwp_ws_columnar_bench_rows() -> usize {
         std::env::var("QWP_WS_COLUMNAR_BENCH_ROWS")
             .ok()
@@ -10992,7 +10992,7 @@ mod tests {
             .unwrap_or(20_000_000)
     }
 
-    #[cfg(feature = "_sender-qwp-ws")]
+    #[cfg(feature = "_qwp-ws-codec")]
     fn fill_qwp_ws_columnar_benchmark_batch(
         buf: &mut QwpWsColumnarBuffer,
         batch_idx: usize,
@@ -11023,7 +11023,7 @@ mod tests {
 
     /// Run with:
     /// `cargo test --release --manifest-path questdb-rs/Cargo.toml --features sync-sender-qwp-ws qwp_ws_columnar_row_build_benchmark --lib -- --ignored --nocapture --test-threads=1`
-    #[cfg(feature = "_sender-qwp-ws")]
+    #[cfg(feature = "_qwp-ws-codec")]
     #[test]
     #[ignore = "performance benchmark"]
     fn qwp_ws_columnar_row_build_benchmark() {
@@ -11055,7 +11055,7 @@ mod tests {
 
     /// Run with:
     /// `cargo test --release --manifest-path questdb-rs/Cargo.toml --features sync-sender-qwp-ws qwp_ws_columnar_encode_benchmark --lib -- --ignored --nocapture --test-threads=1`
-    #[cfg(feature = "_sender-qwp-ws")]
+    #[cfg(feature = "_qwp-ws-codec")]
     #[test]
     #[ignore = "performance benchmark"]
     fn qwp_ws_columnar_encode_benchmark() {

@@ -32,7 +32,7 @@ mod gai;
 // needs it (ingress QWP/WS sender or egress QWP/WS reader). Each side
 // keeps its own transport-specific state machine on top of these
 // primitives.
-#[cfg(any(feature = "_sender-qwp-ws", feature = "_egress"))]
+#[cfg(any(feature = "_sender-qwp-ws", feature = "sync-reader-qwp-ws"))]
 mod ws;
 
 // JKS / PKCS#12 trust-store loader for `tls_roots_password`. Pulled
@@ -43,6 +43,11 @@ mod ws;
 mod keystore_roots;
 
 pub mod ingress;
+
+/// Experimental transport-neutral QWP v1 message encoding and response
+/// decoding for browser WebAssembly wrappers.
+#[cfg(feature = "qwp-browser-codec")]
+pub mod qwp_browser;
 
 // Transport-neutral Arrow field-metadata keys, shared by the ingress encoder
 // and the egress adapter. Homed here so a sender-only `arrow-ingress` build
@@ -56,7 +61,7 @@ pub mod arrow_metadata;
 #[doc(hidden)]
 pub(crate) mod polars_ffi;
 
-#[cfg(feature = "_egress")]
+#[cfg(feature = "_egress-codec")]
 pub mod egress;
 
 pub use error::*;
@@ -100,7 +105,7 @@ pub use db::BorrowedReader;
 #[doc(hidden)]
 pub use db::ffi_support;
 
-#[cfg(all(test, any(feature = "_sender-qwp-udp", feature = "_sender-qwp-ws")))]
+#[cfg(all(test, any(feature = "_sender-qwp-udp", feature = "_qwp-ws-codec")))]
 mod alloc_counter {
     use std::alloc::{GlobalAlloc, Layout, System};
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -151,7 +156,7 @@ mod alloc_counter {
     }
 }
 
-#[cfg(all(test, any(feature = "_sender-qwp-udp", feature = "_sender-qwp-ws")))]
+#[cfg(all(test, any(feature = "_sender-qwp-udp", feature = "_qwp-ws-codec")))]
 #[global_allocator]
 static GLOBAL: alloc_counter::CountingAllocator = alloc_counter::CountingAllocator;
 

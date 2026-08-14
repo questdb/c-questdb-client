@@ -318,13 +318,13 @@ struct ErrorInner {
     in_doubt: bool,
     /// Structured QWP/WebSocket sender rejection diagnostic.
     /// Sender-only.
-    #[cfg(feature = "_sender-qwp-ws")]
+    #[cfg(any(feature = "_sender-qwp-ws", feature = "_qwp-ws-driver-core"))]
     qwp_ws_rejection: Option<Box<crate::ingress::QwpWsSenderError>>,
     /// `421 + X-QuestDB-Role` topology reject seen on the QWP/WebSocket
     /// *sender* upgrade. Sender-only; kept distinct from the query-side
     /// [`UpgradeReject`](crate::egress::UpgradeReject), which
     /// carries the richer `SERVER_INFO` role byte.
-    #[cfg(feature = "_sender-qwp-ws")]
+    #[cfg(any(feature = "_sender-qwp-ws", feature = "_qwp-ws-driver-core"))]
     qwp_ws_role_reject: Option<crate::ingress::QwpWsRoleReject>,
     /// Server-advertised role + zone from a query-side `421 + X-QuestDB-Role`
     /// upgrade reject or `SERVER_INFO` target-filter mismatch. Query-only.
@@ -343,9 +343,9 @@ impl Error {
             code,
             msg: msg.into(),
             in_doubt: false,
-            #[cfg(feature = "_sender-qwp-ws")]
+            #[cfg(any(feature = "_sender-qwp-ws", feature = "_qwp-ws-driver-core"))]
             qwp_ws_rejection: None,
-            #[cfg(feature = "_sender-qwp-ws")]
+            #[cfg(any(feature = "_sender-qwp-ws", feature = "_qwp-ws-driver-core"))]
             qwp_ws_role_reject: None,
             #[cfg(feature = "_egress")]
             upgrade_reject: None,
@@ -384,13 +384,13 @@ impl Error {
     }
 
     /// Attach a structured QWP/WebSocket rejection to this error.
-    #[cfg(feature = "_sender-qwp-ws")]
+    #[cfg(any(feature = "_sender-qwp-ws", feature = "_qwp-ws-driver-core"))]
     pub fn with_qwp_ws_rejection(mut self, rejection: crate::ingress::QwpWsSenderError) -> Self {
         self.0.qwp_ws_rejection = Some(Box::new(rejection));
         self
     }
 
-    #[cfg(feature = "_sender-qwp-ws")]
+    #[cfg(any(feature = "_sender-qwp-ws", feature = "_qwp-ws-driver-core"))]
     pub(crate) fn with_qwp_ws_role_reject(
         mut self,
         role_reject: crate::ingress::QwpWsRoleReject,
@@ -456,12 +456,12 @@ impl Error {
 
     /// Return the structured QWP/WebSocket rejection that made this error
     /// terminal, if one is available.
-    #[cfg(feature = "_sender-qwp-ws")]
+    #[cfg(any(feature = "_sender-qwp-ws", feature = "_qwp-ws-driver-core"))]
     pub fn qwp_ws_rejection(&self) -> Option<&crate::ingress::QwpWsSenderError> {
         self.0.qwp_ws_rejection.as_deref()
     }
 
-    #[cfg(feature = "_sender-qwp-ws")]
+    #[cfg(any(feature = "_sender-qwp-ws", feature = "_qwp-ws-driver-core"))]
     pub(crate) fn qwp_ws_role_reject(&self) -> Option<&crate::ingress::QwpWsRoleReject> {
         self.0.qwp_ws_role_reject.as_ref()
     }

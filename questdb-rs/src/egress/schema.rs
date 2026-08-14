@@ -38,6 +38,11 @@
 //! (`batch_seq > 0`) carry rows only and reuse the schema parsed from
 //! `batch_seq == 0`; the reader holds it for the duration of the query.
 
+#![cfg_attr(
+    all(feature = "qwp-browser-codec", not(feature = "sync-reader-qwp-ws")),
+    allow(dead_code)
+)]
+
 use crate::egress::column_kind::ColumnKind;
 use crate::egress::decoder::MAX_COLUMN_NAME_LENGTH;
 use crate::egress::wire::varint;

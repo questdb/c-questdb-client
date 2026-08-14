@@ -28,9 +28,12 @@
 //! coupling them to a particular runtime.
 
 use crate::error;
+#[cfg(feature = "sync-sender-qwp-ws")]
 use crate::ingress::QwpWsRoleReject;
+#[cfg(feature = "sync-sender-qwp-ws")]
 use crate::ws::frame::{self, Opcode};
 
+#[cfg(feature = "sync-sender-qwp-ws")]
 pub(super) const WS_PATH: &str = "/api/v4/write";
 
 pub(super) const WS_STATUS_OK: u8 = 0x00;
@@ -44,6 +47,7 @@ pub(super) const WS_STATUS_NOT_WRITABLE: u8 = 0x0C;
 
 /// 256 MiB cap on a single inbound frame -- well above QWP's 16 MB batch limit
 /// but small enough to refuse obviously bogus declared lengths early.
+#[cfg(feature = "sync-sender-qwp-ws")]
 pub(super) const MAX_INBOUND_FRAME_BYTES: u64 = 256 * 1024 * 1024;
 
 // ---------- frame builder (pure bytes) ----------
@@ -53,6 +57,7 @@ pub(super) const MAX_INBOUND_FRAME_BYTES: u64 = 256 * 1024 * 1024;
 /// sets FIN=1 and ingress never sends fragmented frames, so there is no
 /// `fin` parameter to get wrong. `opcode` is a typed [`Opcode`], so
 /// invalid values cannot be expressed at the call site.
+#[cfg(feature = "sync-sender-qwp-ws")]
 pub(super) fn write_frame_to_buf(out: &mut Vec<u8>, opcode: Opcode, payload: &[u8], mask: [u8; 4]) {
     out.clear();
     frame::encode_client_frame(out, opcode, mask, payload);
@@ -63,6 +68,7 @@ pub(super) fn write_frame_to_buf(out: &mut Vec<u8>, opcode: Opcode, payload: &[u
 /// X-QWP-* + Authorization headers the ingress sender appends to the RFC
 /// 6455 baseline. Pass the result as `extra_headers` to
 /// [`crate::ws::handshake::upgrade`].
+#[cfg(feature = "sync-sender-qwp-ws")]
 pub(super) fn qwp_extra_headers(
     auth_header: Option<&str>,
     max_version: u32,
@@ -87,6 +93,7 @@ pub(super) fn qwp_extra_headers(
 
 /// Validated QWP handshake result extracted from the server's 101 response.
 #[derive(Debug)]
+#[cfg(feature = "sync-sender-qwp-ws")]
 pub(crate) struct QwpWsHandshakeResult {
     /// Negotiated protocol version.
     pub(super) version: u8,
@@ -102,6 +109,7 @@ pub(crate) struct QwpWsHandshakeResult {
 /// X-QWP-Version, matching the spec) and the server-advertised max batch
 /// size. Errors when the server returns an out-of-range version or fails
 /// to echo `X-QWP-Durable-Ack: enabled` after the client requested it.
+#[cfg(feature = "sync-sender-qwp-ws")]
 pub(super) fn validate_qwp_handshake_headers(
     headers: &crate::ws::handshake::Headers,
     max_version: u32,
@@ -155,6 +163,7 @@ pub(super) fn validate_qwp_handshake_headers(
 /// when the header is absent, malformed, or negative (older servers, or a
 /// server bug). Mirrors the Java reference implementation's
 /// `extractMaxBatchSize`.
+#[cfg(feature = "sync-sender-qwp-ws")]
 fn extract_server_max_batch_size(headers: &crate::ws::handshake::Headers) -> usize {
     headers
         .find_ci("x-qwp-max-batch-size")
@@ -167,6 +176,7 @@ fn extract_server_max_batch_size(headers: &crate::ws::handshake::Headers) -> usi
 /// ingress error code. Handles QWP-specific 421 role rejection (carries
 /// X-QuestDB-Role / X-QuestDB-Zone hints), 401/403 auth failure, and
 /// falls back to a generic SocketError for everything else.
+#[cfg(feature = "sync-sender-qwp-ws")]
 pub(super) fn classify_qwp_handshake_reject(
     reject: crate::ws::handshake::HttpReject,
 ) -> crate::Error {
@@ -212,6 +222,7 @@ pub(super) fn classify_qwp_handshake_reject(
 
 /// Map a [`crate::ws::handshake::HandshakeError`] from the shared handshake
 /// module to the matching ingress error.
+#[cfg(feature = "sync-sender-qwp-ws")]
 pub(super) fn handshake_error_to_ingress(e: crate::ws::handshake::HandshakeError) -> crate::Error {
     use crate::ws::handshake::HandshakeError;
     match e {
@@ -251,6 +262,7 @@ pub(super) fn handshake_error_to_ingress(e: crate::ws::handshake::HandshakeError
 /// A zero-byte payload is valid (no code, empty reason). A 1-byte payload is
 /// already rejected upstream by validate_control_frame_header, but is
 /// rejected here defensively for callers that bypass that check.
+#[cfg(feature = "sync-sender-qwp-ws")]
 pub(super) fn parse_ws_close_payload(payload: &[u8]) -> Result<(Option<u16>, String), String> {
     if payload.is_empty() {
         return Ok((None, String::new()));
@@ -274,6 +286,7 @@ pub(super) fn parse_ws_close_payload(payload: &[u8]) -> Result<(Option<u16>, Str
 // Codes 1004, 1005, 1006, 1015 are reserved sentinels that must not appear on
 // the wire. 1016–2999 are reserved for future protocol-level extensions.
 // 3000–3999 are framework-registered; 4000–4999 are private-use.
+#[cfg(feature = "sync-sender-qwp-ws")]
 fn is_valid_wire_ws_close_code(code: u16) -> bool {
     matches!(code, 1000..=1003 | 1007..=1014 | 3000..=4999)
 }
@@ -282,33 +295,33 @@ fn is_valid_wire_ws_close_code(code: u16) -> bool {
 
 /// Parse a QWP/WebSocket response and return the sequence so callers can
 /// dispatch the result to the matching in-flight request.
-pub(super) struct PipelinedError {
-    pub(super) sequence: u64,
-    pub(super) status: u8,
-    pub(super) message: String,
-    pub(super) err: crate::Error,
+pub(crate) struct PipelinedError {
+    pub(crate) sequence: u64,
+    pub(crate) status: u8,
+    pub(crate) message: String,
+    pub(crate) err: crate::Error,
 }
 
-pub(super) enum PipelinedResponse {
+pub(crate) enum PipelinedResponse {
     Ok { sequence: u64 },
     DurableAck,
     Error(PipelinedError),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum PipelinedTableEntryKind {
+pub(crate) enum PipelinedTableEntryKind {
     Ok,
     DurableAck,
 }
 
-pub(super) fn parse_pipelined_response(payload: &[u8]) -> crate::Result<PipelinedResponse> {
+pub(crate) fn parse_pipelined_response(payload: &[u8]) -> crate::Result<PipelinedResponse> {
     parse_pipelined_response_with_table_handler(payload, None)
 }
 
 type PipelinedTableEntryHandler<'a> =
     &'a mut dyn FnMut(PipelinedTableEntryKind, &str, i64) -> crate::Result<()>;
 
-pub(super) fn parse_pipelined_response_with_table_handler(
+pub(crate) fn parse_pipelined_response_with_table_handler(
     payload: &[u8],
     on_table_entry: Option<PipelinedTableEntryHandler<'_>>,
 ) -> crate::Result<PipelinedResponse> {

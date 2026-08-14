@@ -1,0 +1,12 @@
+[package]
+name = "questdb-qwp-browser"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+questdb-rs = { path = "..", default-features = false, features = ["qwp-browser-codec"] }
+wasm-bindgen = "=0.2.114"

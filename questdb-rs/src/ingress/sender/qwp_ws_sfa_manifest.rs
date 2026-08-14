@@ -22,6 +22,8 @@
  *
  ******************************************************************************/
 
+#![cfg_attr(target_arch = "wasm32", allow(clippy::drop_non_drop))]
+
 //! Java-compatible crash-safe records for an SFA slot.
 //!
 //! Both the segment-chain manifest and ACK watermark use two independently

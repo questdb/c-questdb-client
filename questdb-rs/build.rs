@@ -315,11 +315,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         feature = "_sender-http",
         feature = "_sender-qwp-udp",
         feature = "_sender-qwp-ws",
+        feature = "qwp-browser-codec",
         feature = "sync-reader-qwp-ws"
     )))]
-    compile_error!(
-        "At least one of `sync-sender-tcp`, `sync-sender-http`, `sync-sender-qwp-udp`, `sync-sender-qwp-ws` or `sync-reader-qwp-ws` features must be enabled"
-    );
+    compile_error!("At least one transport or the `qwp-browser-codec` feature must be enabled");
 
     #[cfg(all(
         any(

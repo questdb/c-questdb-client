@@ -19,9 +19,7 @@ name = "questdb"
 crate-type = ["lib"]
 
 [dependencies]
-libc = "0.2"
 socket2 = { version = "0.6.1", optional = true }
-dns-lookup = "3.0.0"
 base64ct = { version = "1.7", features = ["alloc"] }
 ryu = { version = "1.0" }
 itoa = "1.0"
@@ -31,10 +29,9 @@ itoa = "1.0"
 # does not download or compile this crate.
 bytes = { version = "1.7", optional = true }
 log = "0.4"
+crc32c = "0.6"
 aws-lc-rs = { version = "1.13", optional = true }
 ring = { version = "0.17.14", optional = true }
-rustls-pki-types = "1.12.0"
-rustls = { version = "0.23.25", default-features = false, features = ["logging", "std", "tls12"] }
 rustls-native-certs = { version = "0.8.2", optional = true }
 webpki-roots = { version = "1.0.3", default-features = false, optional = true }
 chrono = { version = "0.4.40", optional = true }
@@ -43,13 +40,12 @@ chrono = { version = "0.4.40", optional = true }
 # the `ureq::unversioned` module which does not respect semantic versioning.
 ureq = { version = "3.1.2, <3.2.0", default-features = false, optional = true }
 serde_json = { version = "1", optional = true }
+serde = { version = "1", features = ["derive"], optional = true }
 questdb-confstr = "0.1.1"
 rand = { version = "0.9.0", optional = true }
 ndarray = { version = "0.16", optional = true }
 rust_decimal = { version = "1.38.0", optional = true }
 bigdecimal = { version = "0.4.8", optional = true }
-crc32c = "0.6"
-memmap2 = "0.9"
 
 # Java KeyStore readers. Pulled in only for the QWP transports
 # (ingress qwp-ws and egress reader) when `tls_roots_password` is
@@ -98,6 +94,15 @@ windows-sys = { version = "0.60", features = [
     "Win32_System_IO",
     "Win32_System_Threading",
 ] }
+
+# Native transport implementation details. The browser-WASM codec feature
+# stops at QWP message bytes and must not compile any of these dependencies.
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+dns-lookup = "3.0.0"
+libc = "0.2"
+memmap2 = "0.9"
+rustls-pki-types = "1.12.0"
+rustls = { version = "0.23.25", default-features = false, features = ["logging", "std", "tls12"] }
 
 [build-dependencies]
 serde_json = { version = "1.0.108" }
@@ -162,7 +167,23 @@ sync-sender-http = [
 sync-sender-qwp-udp = ["_sync-sender", "_sender-qwp-udp", "dep:socket2"]
 
 ## Sync QWP/WebSocket
-sync-sender-qwp-ws = ["_sync-sender", "_sender-qwp-ws", "dep:rand", "dep:socket2", "_keystore-roots"]
+sync-sender-qwp-ws = [
+    "_sync-sender",
+    "_sender-qwp-ws",
+    "dep:rand",
+    "dep:socket2",
+    "_keystore-roots",
+]
+
+## Experimental QWP/WebSocket sender/reader core for browser WebAssembly.
+## Reuses the in-memory replay driver but excludes native sockets, TLS,
+## WebSocket framing, threads, and file-backed store-and-forward persistence.
+qwp-browser-codec = [
+    "_qwp-ws-driver-core",
+    "_egress-codec",
+    "dep:serde",
+    "dep:serde_json",
+]
 
 ## Allow use OS-provided root TLS certificates
 tls-native-certs = ["dep:rustls-native-certs"]
@@ -261,9 +282,12 @@ ffi-support = ["sync-sender-qwp-ws"]
 _sender-tcp = []
 _sender-http = []
 _sender-qwp-udp = []
-_sender-qwp-ws = []
+_sender-qwp-ws = ["_qwp-ws-driver-core"]
+_qwp-ws-driver-core = ["_qwp-ws-codec"]
+_qwp-ws-codec = []
 _sync-sender = []
-_egress = ["dep:bytes"]
+_egress = ["_egress-codec"]
+_egress-codec = ["dep:bytes"]
 _keystore-roots = ["dep:jks", "dep:p12-keystore"]
 # Shared Arrow / Polars dependency bundles, enabled by both directional
 # features. Don't use directly.
