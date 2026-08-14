@@ -44,11 +44,13 @@ With the development server on port 19000, open
 The page derives the QWP ingress `/api/v4/write` and QWP egress `/read/v1`
 WebSocket URLs from that origin. The ingress field accepts a comma-separated
 endpoint list and rotates automatically after disconnects or retriable server
-responses. Connect, send the sample row, then execute `select * from wasm_ticks`.
+responses. Rows can be published into the in-memory replay queue before a
+connection is open; they drain after a connection succeeds. Send the sample
+row, connect, then execute `select * from wasm_ticks`.
 
 Serving the page separately with `python3 -m http.server 5173 --directory web`
-also works because the experimental server allowlist accepts that WebSocket
-Origin for both ingress and egress.
+also works because the experimental server ignores the WebSocket `Origin` for
+both ingress and egress.
 
 For a repeatable wire-level smoke test against a development server on port
 19000, run:
@@ -66,19 +68,11 @@ comes back through QWP egress.
 ## Required experimental server change
 
 Stock QuestDB intentionally rejects QWP WebSocket handshakes containing an
-`Origin` header. A browser always sends one. In an experimental QuestDB build,
-change `QwpIngressHttpProcessor.validateHandshake` to accept exactly the
-development origins in use:
-
-```text
-http://localhost:5173
-http://localhost:19000
-```
-
-while continuing to reject every other non-null Origin. Do not remove the
-Origin check wholesale: that would allow arbitrary websites to connect to a
-locally reachable QuestDB server. The ingress and egress upgrade processors
-share this validator, so the same narrowly-scoped change can support both.
+`Origin` header. A browser always sends one. This experimental server removes
+that check from `QwpIngressHttpProcessor.validateHandshake`; the ingress and
+egress upgrade processors share the validator. This allows arbitrary websites
+to connect to a reachable QuestDB server, so it must not be used as a
+production default.
 
 Run the experiment against an unauthenticated development instance. The browser
 WebSocket API cannot set QuestDB's current `Authorization` upgrade header.

@@ -57,7 +57,6 @@ function drainIngress() {
 }
 
 function disconnected() {
-  send.disabled = true;
   socket = null;
   client.reset_connection();
   if (ingressManualClose || ingressEndpoints.length === 0) {
@@ -83,7 +82,6 @@ function connectIngress() {
     if (socket !== ws) return;
     client.connection_opened();
     log(`connected to ${endpoint}`);
-    send.disabled = false;
     close.disabled = false;
     drainIngress();
   });
