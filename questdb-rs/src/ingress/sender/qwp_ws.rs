@@ -113,12 +113,11 @@ struct TrafficGateState {
     /// may safely cancel any synchronous operation on the runner thread.
     setup_in_progress: bool,
     /// Raw handle of the ORIGINAL socket, not the `current` dup. On Windows,
-    /// `shutdown()` alone is not sufficient to interrupt every pending I/O
-    /// operation, so `shutdown()` also runs `CancelIoEx` on the handle that
-    /// issued it. A `try_clone` (WSADuplicateSocket) handle is not guaranteed
-    /// to share the file object. Only valid while `current` is `Some`: every
-    /// close of the original is mutex-ordered behind `clear()`/re-register,
-    /// so the handle cannot be recycled while the gate still holds it.
+    /// both `shutdown()` and `CancelIoEx` must target the handle that issues
+    /// traffic: a `try_clone` (WSADuplicateSocket) handle is not guaranteed to
+    /// share either effect. Only valid while `current` is `Some`: every close
+    /// of the original is mutex-ordered behind `clear()`/re-register, so the
+    /// handle cannot be recycled while the gate still holds it.
     #[cfg(windows)]
     original: Option<std::os::windows::io::RawSocket>,
     shut: bool,
@@ -231,17 +230,23 @@ impl TrafficGate {
         state.shut = true;
         let setup_in_progress = std::mem::take(&mut state.setup_in_progress);
         #[cfg(windows)]
-        if let Some(original) = state.original.take() {
-            // Winsock shutdown() does not unblock an in-progress recv() on
-            // another thread. Cancel outstanding I/O on the worker's own
-            // handle first, mirroring the Java client's windows/net.c
-            // shutdown(). A failure with ERROR_NOT_FOUND (nothing pending)
-            // is expected and deliberately ignored.
+        let result = state.original.take().map_or(Ok(()), |original| {
+            // Shut down the original before cancelling its pending I/O. If
+            // cancellation wins just before recv() starts, the shutdown is
+            // sticky on the handle that performs the later recv; if recv is
+            // already pending, cancellation interrupts it. The runner also
+            // uses CancelSynchronousIo during setup because std's blocking
+            // recv is not necessarily an overlapped operation.
+            let result = shutdown_original_socket(original);
             use windows_sys::Win32::Foundation::HANDLE;
             unsafe {
                 windows_sys::Win32::System::IO::CancelIoEx(original as HANDLE, std::ptr::null());
             }
-        }
+            result
+        });
+        #[cfg(windows)]
+        let _ = state.current.take();
+        #[cfg(not(windows))]
         let result = state
             .current
             .take()
@@ -288,6 +293,27 @@ fn shutdown_socket(stream: &TcpStream) -> std::io::Result<()> {
         Ok(()) => Ok(()),
         Err(err) if err.kind() == ErrorKind::NotConnected => Ok(()),
         Err(err) => Err(err),
+    }
+}
+
+#[cfg(windows)]
+fn shutdown_original_socket(socket: std::os::windows::io::RawSocket) -> std::io::Result<()> {
+    use windows_sys::Win32::Networking::WinSock::{
+        SD_BOTH, SOCKET, SOCKET_ERROR, WSAENOTCONN, WSAESHUTDOWN, WSAGetLastError, shutdown,
+    };
+
+    let socket = SOCKET::try_from(socket).map_err(|_| {
+        std::io::Error::new(ErrorKind::InvalidInput, "socket handle does not fit SOCKET")
+    })?;
+    if unsafe { shutdown(socket, SD_BOTH) } != SOCKET_ERROR {
+        return Ok(());
+    }
+
+    let code = unsafe { WSAGetLastError() };
+    if matches!(code, WSAENOTCONN | WSAESHUTDOWN) {
+        Ok(())
+    } else {
+        Err(std::io::Error::from_raw_os_error(code))
     }
 }
 

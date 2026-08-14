@@ -5811,36 +5811,19 @@ mod tests {
             .unwrap();
         let _server_streams = server.join().unwrap();
 
-        // A short read timeout plus a retry loop instead of one indefinitely
-        // blocking read: on Windows the gate's CancelIoEx only cancels a recv
-        // already in flight, and Winsock shutdown() does not wake one entered
-        // afterwards, so a single read can straddle the shutdown and miss
-        // both wake-ups. Retrying sidesteps the race: once the gate has shut
-        // the replacement socket down, the next read attempt fails
-        // immediately. A missing reconnect registration still fails the test,
-        // because the gate never touches this socket and every attempt times
-        // out until the deadline.
+        // Start the read after shutdown to cover the Windows cancellation race:
+        // CancelIoEx sees no pending recv in this ordering, so the original
+        // socket itself must have been shut down. A missing reconnect
+        // registration still fails because this read times out.
         transport
             .stream
             .set_timeouts(Some(Duration::from_millis(100)), None)
             .unwrap();
-        let reader = thread::spawn(move || {
-            let deadline = std::time::Instant::now() + Duration::from_secs(10);
-            let mut byte = [0u8; 1];
-            loop {
-                match transport.stream.read(&mut byte) {
-                    Err(err)
-                        if matches!(
-                            err.kind(),
-                            std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
-                        ) && std::time::Instant::now() < deadline => {}
-                    result => return result,
-                }
-            }
-        });
         traffic_gate.shutdown().unwrap();
+        let mut byte = [0u8; 1];
+        let result = transport.stream.read(&mut byte);
 
-        match reader.join().unwrap() {
+        match result {
             Ok(0) => {}
             Err(err)
                 if matches!(
