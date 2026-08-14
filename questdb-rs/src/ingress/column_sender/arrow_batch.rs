@@ -7575,17 +7575,25 @@ mod tests {
     #[test]
     fn flush_arrow_batch_overrides_long256_on_large_binary() {
         use arrow::array::builder::LargeBinaryBuilder;
+        let rows: [[u8; 32]; 2] = [
+            core::array::from_fn(|i| i as u8),
+            core::array::from_fn(|i| 0x80 + i as u8),
+        ];
         let mut b = LargeBinaryBuilder::new();
-        b.append_value([0x5Au8; 32]);
+        b.append_value(rows[0]);
+        b.append_null();
+        b.append_value(rows[1]);
         let rb = single_col_batch(Field::new("l", DataType::LargeBinary, true), b.finish());
         let (out, _dict) =
             encode_with_overrides(&rb, &[ArrowColumnOverride::Long256 { column: "l" }]).unwrap();
         let (n, ty, body) = decode_single_column(&out);
-        assert_eq!(n, 1);
+        assert_eq!(n, 3);
         assert_eq!(ty, QWP_TYPE_LONG256);
-        // LE limbs verbatim after the null flag.
-        assert_eq!(body[0], 0, "no bitmap for an all-valid column");
-        assert_eq!(&body[1..], [0x5Au8; 32]);
+        assert_eq!(body[0], 1, "null-bearing LONG256 column uses a bitmap");
+        assert_eq!(body[1], 0b010, "row 1 is null");
+        // Dense non-null values follow the bitmap as verbatim LE limbs.
+        let expected: Vec<u8> = rows.into_iter().flatten().collect();
+        assert_eq!(&body[2..], expected.as_slice());
     }
 
     #[test]

@@ -245,7 +245,7 @@ def _cmp_long256(expected, actual) -> bool:
                 actual_bytes = bytes.fromhex(actual[2:].zfill(64))
             except ValueError:
                 return False
-            return actual_bytes == expected[::-1] or actual_bytes == expected
+            return actual_bytes == expected[::-1]
     return False
 
 def _cmp_decimal(expected, actual, scale: int) -> bool:
