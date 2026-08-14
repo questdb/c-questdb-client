@@ -3793,7 +3793,8 @@ fn connect_blocking_transport_with_retry(
     let mut backoff = *qwp_ws.reconnect_initial_backoff;
     let mut last_error = None;
 
-    while deadline.is_none_or(|deadline| Instant::now() < deadline) {
+    // Always make one endpoint round; a tiny budget may expire during setup.
+    while attempts == 0 || deadline.is_none_or(|deadline| Instant::now() < deadline) {
         attempts += 1;
         match connect_qwp_ws_endpoint_round(
             &endpoints,
