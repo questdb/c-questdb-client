@@ -5019,6 +5019,50 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "arrow")]
+    #[test]
+    fn uuid_and_long256_override_constants_parse() {
+        assert_eq!(
+            qwp_arrow_override_kind::qwp_arrow_override_uuid as u32,
+            5,
+            "UUID override kind is part of the public C ABI"
+        );
+        assert_eq!(
+            qwp_arrow_override_kind::qwp_arrow_override_long256 as u32,
+            6,
+            "LONG256 override kind is part of the public C ABI"
+        );
+        let uuid = b"uuid_col";
+        let long256 = b"long256_col";
+        let raw = [
+            qwp_arrow_override {
+                column: uuid.as_ptr() as *const c_char,
+                column_len: uuid.len(),
+                kind: 5,
+                arg: 0,
+            },
+            qwp_arrow_override {
+                column: long256.as_ptr() as *const c_char,
+                column_len: long256.len(),
+                kind: 6,
+                arg: 0,
+            },
+        ];
+        let mut err: *mut line_sender_error = std::ptr::null_mut();
+        let parsed = unsafe { arrow_overrides_from_c("test", raw.as_ptr(), raw.len(), &mut err) }
+            .expect("UUID and LONG256 constants must parse");
+        assert!(err.is_null());
+        assert!(matches!(
+            parsed.as_slice(),
+            [
+                ArrowColumnOverride::Uuid { column: "uuid_col" },
+                ArrowColumnOverride::Long256 {
+                    column: "long256_col"
+                }
+            ]
+        ));
+    }
+
     #[test]
     fn connect_rejects_non_qwp_ws_schema() {
         let conf = b"http::addr=localhost:9000;";

@@ -1612,22 +1612,27 @@ typedef enum qwp_arrow_override_kind
      *  variable-length binary types every non-null value must be exactly
      *  16 bytes or the flush fails with
      *  `line_sender_error_arrow_ingest`. Use when the schema carries no
-     *  `arrow.uuid` extension or `questdb.column_type=uuid` metadata. */
+     *  `arrow.uuid` extension or `questdb.column_type=uuid` metadata, or
+     *  to replace a stale compatible metadata hint. The runtime override
+     *  is authoritative for this column. */
     qwp_arrow_override_uuid = 5,
     /** Treat a `FixedSizeBinary(32)` or `Binary`/`LargeBinary`/`BinaryView`
      *  column as `LONG256`. Bytes are little-endian limbs, low limb
      *  first, verbatim. On the variable-length binary types every
      *  non-null value must be exactly 32 bytes or the flush fails with
      *  `line_sender_error_arrow_ingest`. Use when the schema carries no
-     *  `questdb.column_type=long256` metadata. */
+     *  `questdb.column_type=long256` metadata, or to replace a stale
+     *  compatible metadata hint. The runtime override is authoritative
+     *  for this column. */
     qwp_arrow_override_long256 = 6,
 } qwp_arrow_override_kind;
 
 /**
  * Per-column wire-type hint passed to
  * `qwp_sender_flush_arrow_batch_at_now` (and `_at_column`) to
- * steer encoding without having to attach
- * `questdb.*` Field metadata to the Arrow schema. Caller owns `column`;
+ * steer encoding without having to attach `questdb.*` Field metadata to
+ * the Arrow schema. An override is authoritative for its column and ignores
+ * compatible but contradictory Field metadata. Caller owns `column`;
  * the bytes are borrowed for the duration of the call.
  *
  * `arg` carries the geohash precision (1..=60) when `kind ==
