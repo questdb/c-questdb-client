@@ -245,8 +245,18 @@ impl<T: std::fmt::Debug + Send + 'static> EventDispatcher<T> {
 
 impl<T> Drop for EventDispatcher<T> {
     fn drop(&mut self) {
-        self.inner.closed.store(true, Ordering::Release);
-        self.inner.available.notify_one();
+        // Publish `closed` and wake the worker while holding the inbox mutex it
+        // parks under, so the store + notify cannot slip into the worker's
+        // `closed`-check -> `available.wait` window and be lost. A lost wakeup
+        // there leaves the worker parked forever and hangs the join below —
+        // observed as a `questdb_db_close` hang when a pool is closed right
+        // after connect, before its freshly spawned dispatcher first parks.
+        // Mirrors the notify-under-lock pattern the pool's own Drop uses.
+        {
+            let _inbox = self.inner.lock_inbox();
+            self.inner.closed.store(true, Ordering::Release);
+            self.inner.available.notify_one();
+        }
         if let Some(handle) = self.thread.take()
             && handle.thread().id() != std::thread::current().id()
         {
@@ -495,6 +505,35 @@ mod tests {
             ]
         );
         assert_eq!(dispatcher.dropped(), 0);
+    }
+
+    #[test]
+    fn drop_immediately_after_new_never_hangs() {
+        // Regression: dropping a dispatcher right after construction — before
+        // its freshly spawned worker has parked on the condvar — must not lose
+        // the shutdown wakeup and hang the join in Drop. This is the create-
+        // then-close race that surfaced as a `questdb_db_close` hang when a
+        // pool was closed immediately after connect. Runs on a helper thread so
+        // a regression fails fast with a message instead of wedging the suite.
+        let done = Arc::new(AtomicBool::new(false));
+        let done_in_thread = Arc::clone(&done);
+        let runner = std::thread::spawn(move || {
+            for _ in 0..2000 {
+                let dispatcher =
+                    ConnectionEventDispatcher::new(Arc::new(|_: &ConnectionEvent| {}), 8);
+                drop(dispatcher);
+            }
+            done_in_thread.store(true, Ordering::Release);
+        });
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        while !done.load(Ordering::Acquire) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "EventDispatcher::drop hung joining a not-yet-parked worker (lost wakeup)"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        runner.join().unwrap();
     }
 
     #[test]
