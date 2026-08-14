@@ -30,6 +30,17 @@
 //!   values as metadata-free `FixedSizeBinary(8)` containing process-local
 //!   object handles, which is indistinguishable from legitimate opaque binary
 //!   after the conversion boundary.
+//! * **`Binary`**: lands as a `BINARY` column by default, since Polars
+//!   frames carry no `questdb.*` field metadata to imply a richer type.
+//!   To ingest a binary column as `UUID`/`LONG256`, pass an
+//!   [`ArrowColumnOverride::Uuid`] / [`ArrowColumnOverride::Long256`] via
+//!   [`PolarsIngestOptions`]: every non-null value must then be exactly
+//!   16/32 bytes — UUID bytes canonical RFC-4122 big-endian, LONG256
+//!   bytes LE limbs. (Polars has no fixed-size binary dtype; its Binary
+//!   columns export as Arrow `BinaryView`, which the overrides accept.)
+//!
+//! [`ArrowColumnOverride::Uuid`]: crate::ingress::column_sender::ArrowColumnOverride::Uuid
+//! [`ArrowColumnOverride::Long256`]: crate::ingress::column_sender::ArrowColumnOverride::Long256
 //!
 //! # Per-chunk dtype stability
 //!
@@ -648,6 +659,36 @@ mod tests {
         let mut batches = collect_ok(dataframe_to_batches(df, None));
         assert_eq!(batches.len(), 1);
         batches.pop().unwrap()
+    }
+
+    #[test]
+    fn binary_column_uuid_override_routes_polars_export_to_uuid() {
+        // The reachability pin for the override escape hatch: Polars has
+        // no fixed-size binary dtype, so a Binary column exports as
+        // `BinaryView` — the UUID/LONG256 overrides must accept that
+        // shape or they are unreachable from every practical Polars
+        // DataFrame. Byte-level wire correctness for the var-binary
+        // writers is pinned in `arrow_batch` tests.
+        use crate::ingress::column_sender::ArrowColumnOverride;
+        use crate::ingress::column_sender::arrow_batch::{ColumnKind, apply_overrides, classify};
+
+        let vals: Vec<&[u8]> = vec![&[0u8; 16], &[1u8; 16]];
+        let s = Series::new(PlSmallStr::from("u"), vals);
+        let df = crate::polars_ffi::df_from_columns(vec![s.into_column()]).unwrap();
+        let rb = one_batch(&df);
+        assert_eq!(
+            rb.schema().field(0).data_type(),
+            &arrow::datatypes::DataType::BinaryView,
+            "Polars Binary must export as BinaryView; if this changes, \
+             re-check the override applicability list"
+        );
+        let schema =
+            apply_overrides(&rb.schema(), &[ArrowColumnOverride::Uuid { column: "u" }]).unwrap();
+        let kind = classify(schema.field(0), rb.column(0).as_ref()).unwrap();
+        assert!(
+            matches!(kind, ColumnKind::UuidFromVarBinary),
+            "expected UuidFromVarBinary, got {kind:?}"
+        );
     }
 
     #[test]

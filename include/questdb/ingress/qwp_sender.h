@@ -1606,6 +1606,21 @@ typedef enum qwp_arrow_override_kind
     /** Force the column NOT to be SYMBOL: a Dictionary column is decoded
      *  to VARCHAR on emit; a no-op on plain Utf8 (already VARCHAR). */
     qwp_arrow_override_not_symbol = 4,
+    /** Treat a `FixedSizeBinary(16)` or `Binary`/`LargeBinary`/`BinaryView`
+     *  column as `UUID`. Bytes are canonical RFC-4122 big-endian; the
+     *  client byte-swaps to QWP wire order internally. On the
+     *  variable-length binary types every non-null value must be exactly
+     *  16 bytes or the flush fails with
+     *  `line_sender_error_arrow_ingest`. Use when the schema carries no
+     *  `arrow.uuid` extension or `questdb.column_type=uuid` metadata. */
+    qwp_arrow_override_uuid = 5,
+    /** Treat a `FixedSizeBinary(32)` or `Binary`/`LargeBinary`/`BinaryView`
+     *  column as `LONG256`. Bytes are little-endian limbs, low limb
+     *  first, verbatim. On the variable-length binary types every
+     *  non-null value must be exactly 32 bytes or the flush fails with
+     *  `line_sender_error_arrow_ingest`. Use when the schema carries no
+     *  `questdb.column_type=long256` metadata. */
+    qwp_arrow_override_long256 = 6,
 } qwp_arrow_override_kind;
 
 /**

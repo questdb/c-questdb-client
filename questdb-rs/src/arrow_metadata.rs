@@ -38,4 +38,9 @@ pub const ARROW_EXTENSION_NAME: &str = "ARROW:extension:name";
 /// into wire order (lo LE, hi LE). `FixedSizeBinary(16)` without this
 /// label (or a `questdb.column_type=uuid` claim) is opaque bytes and
 /// lands as a BINARY column, verbatim — width alone never implies UUID.
+/// The spec also fixes the extension's storage type to
+/// `FixedSizeBinary(16)`: this label on variable-width binary storage
+/// (`Binary`/`LargeBinary`/`BinaryView`) is a malformed schema and is
+/// rejected at ingress — claim `questdb.column_type=uuid` instead to
+/// ingest variable-width binary values as UUID.
 pub const EXT_ARROW_UUID: &str = "arrow.uuid";

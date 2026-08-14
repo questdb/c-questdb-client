@@ -4424,6 +4424,8 @@ pub enum qwp_arrow_override_kind {
     qwp_arrow_override_char = 2,
     qwp_arrow_override_geohash = 3,
     qwp_arrow_override_not_symbol = 4,
+    qwp_arrow_override_uuid = 5,
+    qwp_arrow_override_long256 = 6,
 }
 
 /// Per-column wire-type hint that overrides what the encoder would
@@ -4527,6 +4529,12 @@ unsafe fn arrow_overrides_from_c<'a>(
             }
             x if x == qwp_arrow_override_kind::qwp_arrow_override_char as u32 => {
                 ArrowColumnOverride::Char { column }
+            }
+            x if x == qwp_arrow_override_kind::qwp_arrow_override_uuid as u32 => {
+                ArrowColumnOverride::Uuid { column }
+            }
+            x if x == qwp_arrow_override_kind::qwp_arrow_override_long256 as u32 => {
+                ArrowColumnOverride::Long256 { column }
             }
             x if x == qwp_arrow_override_kind::qwp_arrow_override_geohash as u32 => {
                 if ov.arg == 0 || ov.arg > 60 {
