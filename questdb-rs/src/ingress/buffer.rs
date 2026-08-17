@@ -1362,8 +1362,6 @@ impl Buffer {
     ///
     /// The wire encoding writes the 4 octets as `u32::from(addr).to_le_bytes()`,
     /// matching Rust's natural Ipv4Addr packing (octet 0 in the high byte).
-    ///
-    /// IPv4 (`0x18`) requires QuestDB 10.0 or later.
     pub fn column_ipv4<'a, N>(
         &mut self,
         name: N,
@@ -1496,8 +1494,6 @@ impl Buffer {
     }
 
     /// Adds a BINARY column (opaque byte sequence). QWP-only.
-    ///
-    /// BINARY (`0x17`) requires QuestDB 10.0 or later.
     pub fn column_binary<'a, N>(&mut self, name: N, value: &[u8]) -> crate::Result<&mut Self>
     where
         N: AsRef<str> + TryInto<ColumnName<'a>>,

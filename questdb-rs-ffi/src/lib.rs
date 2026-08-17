@@ -2070,8 +2070,6 @@ pub unsafe extern "C" fn line_sender_buffer_column_long256(
 /// `value` is the address packed as a u32 with octet 0 in the high byte:
 /// `addr = ((a << 24) | (b << 16) | (c << 8) | d)`. The encoder writes
 /// `value.to_le_bytes()` so the wire bytes appear as `[d, c, b, a]`.
-///
-/// IPv4 (`0x18`) requires QuestDB 10.0 or later.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn line_sender_buffer_column_ipv4(
     buffer: *mut line_sender_buffer,
@@ -2118,8 +2116,6 @@ pub unsafe extern "C" fn line_sender_buffer_column_char(
 }
 
 /// Record a BINARY column value (opaque byte sequence). QWP-only.
-///
-/// BINARY (`0x17`) requires QuestDB 10.0 or later.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn line_sender_buffer_column_binary(
     buffer: *mut line_sender_buffer,

@@ -1146,8 +1146,6 @@ bool line_sender_buffer_column_long256(
  *   `addr = ((uint32_t)a << 24) | (b << 16) | (c << 8) | d`
  * The encoder writes `addr.to_le_bytes()` so the wire bytes appear as
  * `[d, c, b, a]`.
- *
- * IPv4 (`0x18`) requires QuestDB 10.0 or later.
  */
 QUESTDB_CLIENT_API
 bool line_sender_buffer_column_ipv4(
@@ -1178,8 +1176,6 @@ bool line_sender_buffer_column_char(
 
 /**
  * Record a BINARY column value (opaque byte sequence). QWP-only.
- *
- * BINARY (`0x17`) requires QuestDB 10.0 or later.
  */
 QUESTDB_CLIENT_API
 bool line_sender_buffer_column_binary(

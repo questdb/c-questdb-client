@@ -862,8 +862,6 @@ public:
      * Record an IPv4 column value. QWP-only.
      *
      * `value` is the address packed as a u32 with octet 0 in the high byte.
-     *
-     * IPv4 (`0x18`) requires QuestDB 10.0 or later.
      */
     line_sender_buffer& column_ipv4(column_name_view name, uint32_t value)
     {
@@ -897,8 +895,6 @@ public:
 
     /**
      * Record a BINARY column value. QWP-only.
-     *
-     * BINARY (`0x17`) requires QuestDB 10.0 or later.
      */
     line_sender_buffer& column_binary(
         column_name_view name, const uint8_t* data, size_t data_len)
