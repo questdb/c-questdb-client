@@ -403,6 +403,18 @@ const _: fn() = || {
     assert_send_sync::<Buffer>();
 };
 
+/// Returns whether `frame` is a complete, self-contained QWP/WebSocket
+/// message that can be relayed onto an unrelated connection.
+///
+/// This is a cheap framing check. It validates the fixed QWP v1 header and the
+/// leading symbol-dictionary base, but deliberately does not parse tenant table
+/// or column data. A self-contained frame declares dictionary base 0 and carries
+/// the dictionary entries its rows reference.
+#[cfg(feature = "_sender-qwp-ws")]
+pub fn is_self_contained(frame: &[u8]) -> bool {
+    QwpWsColumnarBuffer::is_self_contained_frame(frame)
+}
+
 impl Buffer {
     /// Creates a new ILP buffer with default parameters.
     pub fn new(protocol_version: ProtocolVersion) -> Self {
@@ -465,6 +477,26 @@ impl Buffer {
         Self {
             inner: BufferInner::QwpWs(Box::new(QwpWsColumnarBuffer::new(max_name_len))),
         }
+    }
+
+    /// Serializes this QWP/WebSocket buffer without a live connection.
+    ///
+    /// The returned QWP v1 message carries a complete symbol dictionary from id
+    /// 0, so it can be stored and later relayed over a connection that has never
+    /// seen the buffer's symbols. Ordinary sender flushes use a connection-local
+    /// delta dictionary and are not suitable for store-and-forward relaying.
+    ///
+    /// Returns [`crate::ErrorCode::InvalidApiCall`] for non-QWP/WebSocket and
+    /// empty buffers.
+    #[cfg(feature = "_sender-qwp-ws")]
+    pub fn encode_self_contained(&self) -> crate::Result<Vec<u8>> {
+        let qwp = self.as_qwp_ws().ok_or_else(|| {
+            error::fmt!(
+                InvalidApiCall,
+                "encode_self_contained requires a QWP/WebSocket buffer created by Buffer::new_qwp_ws()."
+            )
+        })?;
+        qwp.encode_self_contained()
     }
 
     #[cfg(feature = "_sync-sender")]

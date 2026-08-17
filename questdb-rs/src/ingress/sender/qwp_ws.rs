@@ -432,6 +432,7 @@ struct QwpWsConnectedParts {
     encoder: QwpWsReplayEncoder,
     store: QwpWsPublicationStore<SfaSlotQueue>,
     send_core: QwpWsSendCore<BlockingQwpWsTransport>,
+    relay_mode: Arc<AtomicBool>,
     /// Delta symbol-dict mode for the slot (memory always; file iff the side-file
     /// opened). Drives both the encoder and the driver mirror.
     delta_dict_enabled: bool,
@@ -479,6 +480,7 @@ pub(crate) struct SyncQwpWsHandlerState {
     /// [`super::column_sender::PooledSenderCore::new_store_and_forward`]; the two are
     /// mutually exclusive. `None` in memory mode / on side-file open failure.
     pub(crate) persisted_symbol_dict: Option<PersistedSymbolDict>,
+    pub(crate) relay_mode: Arc<AtomicBool>,
 }
 
 impl SyncQwpWsHandlerState {
@@ -502,6 +504,7 @@ pub(crate) struct ManualQwpWsHandlerState {
     orphan_drainers: Option<ManualOrphanDrainers>,
     append_deadline: Duration,
     close_drain_timeout: Duration,
+    pub(crate) relay_mode: Arc<AtomicBool>,
 }
 
 pub(crate) struct SyncQwpWsRunner<Q = SfaSlotQueue> {
@@ -554,6 +557,7 @@ struct QwpWsPendingConnect {
     /// Empty in memory mode / on a fresh slot.
     recovered_dict_entries: Vec<u8>,
     recovered_dict_count: u32,
+    relay_mode: Arc<AtomicBool>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1019,6 +1023,7 @@ impl QwpWsPendingConnect {
         delta_dict_enabled: bool,
         recovered_dict_entries: Vec<u8>,
         recovered_dict_count: u32,
+        relay_mode: Arc<AtomicBool>,
     ) -> Self {
         Self {
             host: host.to_string(),
@@ -1038,6 +1043,7 @@ impl QwpWsPendingConnect {
             delta_dict_enabled,
             recovered_dict_entries,
             recovered_dict_count,
+            relay_mode,
         }
     }
 
@@ -1143,6 +1149,7 @@ impl SyncQwpWsPendingRunnerCore {
                     *self.pending_connect.qwp_ws.max_frame_rejections,
                     *self.pending_connect.qwp_ws.poison_min_escalation_window,
                 );
+                send_core.set_relay_mode_flag(Arc::clone(&self.pending_connect.relay_mode));
                 // Enable the symbol-dict catch-up mirror on the same condition the
                 // foreground delta-encodes (memory mode always; file mode iff the
                 // side-file opened), seeding it from any recovered dictionary so
@@ -3445,8 +3452,10 @@ pub(crate) fn connect_qwp_ws_background_state(
         recovered_dict_entries,
         recovered_dict_count,
         persisted_symbol_dict,
+        relay_mode,
     ) = if *qwp_ws.initial_connect_retry == QwpWsInitialConnectMode::Async {
         let mut queue = open_configured_qwp_ws_queue(qwp_ws)?;
+        let relay_mode = Arc::new(AtomicBool::new(false));
         // Pull the slot's delta-dict state out of the queue before it moves into
         // the runner: whether delta is on, the recovered entries (to seed the
         // foreground dict + the I/O thread's catch-up mirror), and the side-file
@@ -3504,6 +3513,7 @@ pub(crate) fn connect_qwp_ws_background_state(
             delta_dict_enabled,
             try_dup_recovered(&recovered_dict_entries)?,
             recovered_dict_count,
+            Arc::clone(&relay_mode),
         );
         let runner = SyncQwpWsRunner::start_pending_connect(
             queue,
@@ -3519,6 +3529,7 @@ pub(crate) fn connect_qwp_ws_background_state(
             recovered_dict_entries,
             recovered_dict_count,
             persisted_symbol_dict,
+            relay_mode,
         )
     } else {
         let mut parts = open_qwp_ws_parts(
@@ -3564,6 +3575,7 @@ pub(crate) fn connect_qwp_ws_background_state(
             parts.recovered_dict_entries,
             parts.recovered_dict_count,
             parts.persisted_symbol_dict,
+            parts.relay_mode,
         )
     };
     let orphan_candidates = orphan_candidates(qwp_ws);
@@ -3586,6 +3598,7 @@ pub(crate) fn connect_qwp_ws_background_state(
         recovered_dict_entries,
         recovered_dict_count,
         persisted_symbol_dict,
+        relay_mode,
     })
 }
 
@@ -3673,6 +3686,7 @@ pub(crate) fn open_manual_qwp_ws(
         orphan_drainers,
         append_deadline: *qwp_ws.sf_append_deadline,
         close_drain_timeout: *qwp_ws.close_flush_timeout,
+        relay_mode: parts.relay_mode,
     })
 }
 
@@ -3712,7 +3726,8 @@ fn open_qwp_ws_parts(
     let persisted_symbol_dict = queue.take_persisted_symbol_dict();
     let mut store = QwpWsPublicationStore::new(queue, *qwp_ws.error_inbox_capacity);
     store.set_rejection_sink(qwp_ws.rejection_sink.clone());
-    let send_core = QwpWsSendCore::new_with_durable_ack_and_rejection_limit(
+    let relay_mode = Arc::new(AtomicBool::new(false));
+    let mut send_core = QwpWsSendCore::new_with_durable_ack_and_rejection_limit(
         transport,
         ReconnectPolicy::bounded(
             *qwp_ws.reconnect_max_duration,
@@ -3723,11 +3738,13 @@ fn open_qwp_ws_parts(
         *qwp_ws.max_frame_rejections,
         *qwp_ws.poison_min_escalation_window,
     );
+    send_core.set_relay_mode_flag(Arc::clone(&relay_mode));
 
     Ok(QwpWsConnectedParts {
         encoder: QwpWsReplayEncoder::new(negotiated_version),
         store,
         send_core,
+        relay_mode,
         delta_dict_enabled,
         recovered_dict_entries,
         recovered_dict_count,
@@ -3897,6 +3914,62 @@ pub(crate) fn publish_qwp_ws_payload_background(
         ));
     }
     state.runner.publish_replay_payload(payload)
+}
+
+#[cfg(test)]
+pub(crate) fn delta_encoded_frame_fixture() -> Vec<u8> {
+    use crate::ingress::{Buffer, TimestampNanos};
+
+    fn symbol_buffer(symbol: &str, seq: i64) -> Buffer {
+        let mut buffer = Buffer::new_qwp_ws();
+        buffer
+            .table("readings")
+            .unwrap()
+            .symbol("site", symbol)
+            .unwrap()
+            .column_i64("_seq", seq)
+            .unwrap();
+        buffer.at(TimestampNanos::new(seq)).unwrap();
+        buffer
+    }
+
+    let mut encoder = QwpWsReplayEncoder::new(1);
+    encoder.set_delta_dict_enabled(true);
+    encoder
+        .encode(symbol_buffer("alpha", 1).as_qwp_ws().unwrap())
+        .unwrap();
+    encoder
+        .encode(symbol_buffer("beta", 2).as_qwp_ws().unwrap())
+        .unwrap()
+        .to_vec()
+}
+
+pub(crate) fn publish_qwp_ws_payload_manual(
+    state: &mut ManualQwpWsHandlerState,
+    payload: &[u8],
+    max_buf_size: usize,
+) -> crate::Result<u64> {
+    if payload.is_empty() {
+        return Err(error::fmt!(
+            InvalidApiCall,
+            "Could not flush buffer: QWP/WebSocket encoded message is empty."
+        ));
+    }
+    if payload.len() > max_buf_size {
+        return Err(qwp_ws_encoded_message_size_error(
+            payload.len(),
+            max_buf_size,
+        ));
+    }
+    match manual_submit_with_drive_deadline(
+        &mut state.store,
+        &mut state.send_core,
+        payload,
+        state.append_deadline,
+    ) {
+        Ok(fsn) => Ok(fsn),
+        Err(err) => Err(driver_error_to_error_from_store(&state.store, err)),
+    }
 }
 
 pub(crate) fn flush_qwp_ws_manual(
