@@ -32,15 +32,15 @@ pub const ARRAY_DIM_TENTATIVE: &str = "questdb.array_dim_tentative";
 pub const ARROW_EXTENSION_NAME: &str = "ARROW:extension:name";
 /// Value used in [`ARROW_EXTENSION_NAME`] to mark a
 /// `FixedSizeBinary(16)` column as the canonical Arrow UUID. Per the
-/// Arrow spec this fixes the storage bytes as RFC-4122 big-endian.
-/// Egress satisfies it for free — the QWP decoder already normalizes
-/// UUID rows to canonical order — while ingress reverses labeled values
-/// into wire order (lo LE, hi LE). `FixedSizeBinary(16)` without this
-/// label (or a `questdb.column_type=uuid` claim) is opaque bytes and
-/// lands as a BINARY column, verbatim — width alone never implies UUID.
-/// The spec also fixes the extension's storage type to
-/// `FixedSizeBinary(16)`: this label on variable-width binary storage
-/// (`Binary`/`LargeBinary`/`BinaryView`) is a malformed schema and is
-/// rejected at ingress — claim `questdb.column_type=uuid` instead to
-/// ingest variable-width binary values as UUID.
+/// Arrow spec, the stored bytes are then RFC-4122 big-endian. Egress
+/// meets that requirement without extra work, because the QWP decoder
+/// already converts UUID rows to canonical order; ingress reverses
+/// labeled values into wire order (lo LE, hi LE). A `FixedSizeBinary(16)`
+/// column without this label (or a `questdb.column_type=uuid` claim) is
+/// opaque bytes and lands verbatim as a BINARY column: a 16-byte width on
+/// its own never makes a UUID. The spec also fixes the extension's
+/// storage type to `FixedSizeBinary(16)`, so this label on variable-width
+/// binary storage (`Binary`/`LargeBinary`/`BinaryView`) is a malformed
+/// schema and is rejected at ingress. To ingest variable-width binary
+/// values as UUID, claim `questdb.column_type=uuid` instead.
 pub const EXT_ARROW_UUID: &str = "arrow.uuid";

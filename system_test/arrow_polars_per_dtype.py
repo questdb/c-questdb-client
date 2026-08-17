@@ -565,10 +565,11 @@ class TestArrowPolarsPerDtype(afc.ArrowFuzzBase):
         field = rb.schema.field("c")
         self.assertEqual(field.type, pa.binary(8))
         self.assertIsNone(field.metadata)
-        # Do not pass this RecordBatch to the generic Arrow client: after
-        # export it is indistinguishable from legitimate opaque FSB8, and its
-        # bytes are process-local object handles. The Rust Polars adapter
-        # rejects Object while the original dtype is still available.
+        # Do not pass this RecordBatch to the generic Arrow client: once
+        # exported it looks exactly like ordinary opaque FSB8, and its bytes
+        # are handles that are only meaningful inside this process. The Rust
+        # Polars adapter rejects Object while the original dtype is still
+        # known.
 
     def test_dtype_null_rejected(self):
         import polars as pl

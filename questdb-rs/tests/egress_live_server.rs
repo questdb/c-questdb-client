@@ -390,10 +390,10 @@ fn uuid_round_trip() {
                 panic!("col 0")
             };
             // The reader hands out canonical RFC-4122 big-endian bytes,
-            // anchored against the server's own text parser: these must
-            // be exactly the bytes of the SQL literal above. The Arrow
-            // egress path serves the same decoder buffer verbatim under
-            // the `arrow.uuid` label, so this pins that surface too.
+            // checked against the server's own text parser: they must be
+            // exactly the bytes of the SQL literal above. The Arrow egress
+            // path serves the same decoder buffer verbatim under the
+            // `arrow.uuid` label, so this covers that path too.
             let canonical: [u8; 16] = [
                 0x55, 0x0e, 0x84, 0x00, 0xe2, 0x9b, 0x41, 0xd4, 0xa7, 0x16, 0x44, 0x66, 0x55, 0x44,
                 0x00, 0x00,
@@ -409,10 +409,10 @@ const UUID_CANONICAL: [u8; 16] = [
 ];
 const UUID_CANONICAL_STR: &str = "123e4567-e89b-12d3-a456-426614174000";
 
-/// Assert the server parsed the ingested UUID as `UUID_CANONICAL_STR` —
-/// server-side `cast(u as string)` is the absolute anchor (no client
-/// byte-order code on the verify path can cancel an ingest bug) — then
-/// assert the reader hands the canonical bytes back.
+/// Assert the server parsed the ingested UUID as `UUID_CANONICAL_STR`, then
+/// assert the reader hands the canonical bytes back. Server-side
+/// `cast(u as string)` is the reference point: no client-side byte-order
+/// code sits on that path, so it cannot cancel out an ingest bug.
 fn assert_uuid_round_trip(srv: &QuestDbServer, table: &str) {
     select_one_batch(
         srv,
@@ -430,9 +430,9 @@ fn assert_uuid_round_trip(srv: &QuestDbServer, table: &str) {
     );
 }
 
-/// Cross-context round-trip for the chunk byte API: canonical bytes into
-/// `column_uuid` → server text → reader bytes. Each swap is unit-pinned;
-/// this proves the composition against the server's own UUID parser.
+/// Round-trip for the chunk byte API: canonical bytes into `column_uuid`
+/// → server text → reader bytes. Each swap has its own unit test; this
+/// checks the whole chain against the server's own UUID parser.
 #[test]
 fn chunk_column_uuid_round_trip() {
     use questdb::QuestDb;
@@ -481,8 +481,9 @@ fn numpy_s16_uuid_round_trip() {
     assert_uuid_round_trip(srv, &table);
 }
 
-/// Same server-anchored composition through an `arrow.uuid`-labelled
-/// `FixedSizeBinary(16)` column — the path whose byte order motivated #185.
+/// The same chain, again checked against the server, through an
+/// `arrow.uuid`-labelled `FixedSizeBinary(16)` column — the path whose
+/// byte order prompted #185.
 #[test]
 fn arrow_uuid_extension_round_trip() {
     use std::collections::HashMap;
@@ -1692,9 +1693,9 @@ fn bind_uuid_round_trip() {
     let srv = server();
     let mut reader = make_reader(srv);
     // Canonical RFC-4122 bytes of 550e8400-e29b-41d4-a716-446655440000.
-    // The byte round-trip alone would be a tautology (bind-reverse and
-    // read-reverse cancel), so also anchor against the server's own text
-    // rendering of the bound value.
+    // Comparing the bytes alone would prove nothing, because the reversal
+    // on bind and the reversal on read cancel out. So also compare against
+    // the server's own text rendering of the bound value.
     let bytes: [u8; 16] = [
         0x55, 0x0e, 0x84, 0x00, 0xe2, 0x9b, 0x41, 0xd4, 0xa7, 0x16, 0x44, 0x66, 0x55, 0x44, 0x00,
         0x00,

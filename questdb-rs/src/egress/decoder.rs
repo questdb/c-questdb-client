@@ -111,8 +111,8 @@ fn read_owned(r: &mut ByteReader<'_>, parent: &Bytes, n: usize) -> Result<Bytes>
 /// `values` and `validity` are typically zero-copy `Bytes` slices into the
 /// frame's payload buffer (or, after FLAG_ZSTD, into the decompressed body).
 /// Paths that *have* to materialize new bytes (BOOLEAN bit-unpacking, GORILLA
-/// temporal expansion, fixed-width densification for columns containing nulls) wrap a fresh
-/// `Vec<u8>` via `Bytes::from(vec)`.
+/// temporal expansion, fixed-width densification for columns containing nulls)
+/// wrap a fresh `Vec<u8>` via `Bytes::from(vec)`.
 #[derive(Debug, Clone)]
 pub struct ColumnBuffer {
     /// Raw little-endian element bytes. Length = `row_count * elem_size`.
@@ -608,9 +608,10 @@ fn decode_column(
         // IPv4 NULL sentinel is `0` per spec §11.5; zero-fill is correct,
         // pass `None` to short-circuit the per-row sentinel copy.
         ColumnKind::Ipv4 => DecodedColumn::Ipv4(decode_fixed(r, parent, row_count, 4, None)?),
-        // The wire carries (lo LE, hi LE) per UUID row; every surface above
-        // the decoder speaks canonical RFC-4122 big-endian, so reverse each
-        // row once here. Validity/sentinel handling ran on the wire bytes.
+        // The wire carries (lo LE, hi LE) per UUID row, while everything
+        // above the decoder works in canonical RFC-4122 big-endian, so
+        // reverse each row once here. Validity and sentinel handling run
+        // first, on the wire bytes.
         ColumnKind::Uuid => DecodedColumn::Uuid(reverse_uuid_rows(decode_fixed(
             r,
             parent,
@@ -1126,9 +1127,11 @@ fn decode_validity(
 }
 
 /// Reverse each 16-byte UUID row: wire (lo LE, hi LE) → canonical
-/// RFC-4122 big-endian. Reuses a uniquely owned buffer after null
-/// densification; a shared slice from the no-null path must be copied.
-/// Null slots hold reversed sentinel bytes, which is fine — validity governs.
+/// RFC-4122 big-endian. Reverses in place when the buffer is uniquely
+/// owned, as it is after null densification; a shared slice from the
+/// no-null path is copied first. Null slots end up holding the reversed
+/// sentinel bytes, which is harmless: the validity bitmap decides which
+/// rows are null.
 fn reverse_uuid_rows(buf: ColumnBuffer) -> ColumnBuffer {
     let ColumnBuffer { values, validity } = buf;
     let mut values = match values.try_into_mut() {

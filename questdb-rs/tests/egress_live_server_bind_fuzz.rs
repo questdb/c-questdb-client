@@ -348,15 +348,15 @@ fn fuzz_same_sql_different_binds_cache_reuse() {
     let _ = srv.http_exec(&format!("drop table \"{table}\""));
 }
 
-/// Ports `testFuzzUuidBinds`. Bind 16 random canonical RFC-4122 bytes
-/// and assert they round-trip byte-identically — `bind_uuid` reverses
-/// to QWP wire order and the reader reverses back, so this pins the two
-/// swaps staying inverse of each other (the absolute anchor against the
-/// server's parser is `bind_uuid_round_trip` in `egress_live_server.rs`).
-/// The Java test skips the all-`MIN_VALUE` wire sentinel (NULL UUID);
-/// its canonical form is the reversal — `0x80` at bytes 0 and 8, zeros
-/// elsewhere — astronomically unlikely, and the spec represents NULL via
-/// the null-bitmap anyway, but the guard is cheap.
+/// Ports `testFuzzUuidBinds`. Bind 16 random canonical RFC-4122 bytes and
+/// assert they come back byte-identical: `bind_uuid` reverses them to QWP
+/// wire order and the reader reverses them back, so this checks that the
+/// two swaps remain exact inverses. The comparison against the server's
+/// own parser lives in `bind_uuid_round_trip` in `egress_live_server.rs`.
+/// The Java test skips the all-`MIN_VALUE` wire sentinel (NULL UUID); in
+/// canonical form that is `0x80` at bytes 0 and 8 and zeros elsewhere.
+/// Random bytes will practically never hit it, and the spec represents
+/// NULL through the null bitmap anyway, but the guard costs nothing.
 #[test]
 fn fuzz_uuid_binds() {
     const SENTINEL_CANONICAL: [u8; 16] = [0x80, 0, 0, 0, 0, 0, 0, 0, 0x80, 0, 0, 0, 0, 0, 0, 0];

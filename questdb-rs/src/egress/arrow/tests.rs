@@ -252,7 +252,8 @@ fn uuid_values_are_rfc4122_big_endian() {
         0x00,
     ];
     let mut vals = canonical.to_vec();
-    // Second row: distinct pattern to catch any per-row windowing slip.
+    // Second row: a different pattern, so a mistake in the per-row
+    // offsets shows up.
     vals.extend(0..16u8);
     let s = schema_of(&[("id", ColumnKind::Uuid)]);
     let batch = decoded_of(2, vec![DecodedColumn::Uuid(buf(vals, None))]);

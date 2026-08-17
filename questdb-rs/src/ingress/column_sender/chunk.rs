@@ -887,7 +887,8 @@ impl<'a> Chunk<'a> {
     /// `uuid::Uuid::as_bytes()` and Python's `uuid.bytes` produce, and
     /// the storage order of Arrow's `arrow.uuid`. The encoder byte-swaps
     /// to QWP wire order (lo LE, hi LE) internally.
-    /// `Buffer::column_uuid(lo, hi)` instead takes QWP wire-order integer halves.
+    /// `Buffer::column_uuid(lo, hi)` instead takes QWP wire-order integer
+    /// halves.
     pub fn column_uuid(
         &mut self,
         name: &str,

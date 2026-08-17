@@ -1095,9 +1095,8 @@ public:
         return *this;
     }
     /**
-     * Bind a UUID as 16 canonical RFC-4122 bytes in big-endian/network byte
-     * order. Earlier versions interpreted this byte array differently;
-     * callers upgrading must pass canonical bytes.
+     * Bind a UUID as 16 bytes in canonical RFC-4122 big-endian order —
+     * the same order UUID values are read back in.
      */
     query& bind_uuid(const std::array<uint8_t, 16>& bytes)
     {

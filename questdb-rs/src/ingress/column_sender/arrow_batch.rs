@@ -70,10 +70,10 @@ use crate::ingress::buffer::QWP_DECIMAL_MAX_SCALE;
 
 /// Per-column wire-type hint that overrides what `classify()` would
 /// otherwise derive from the Arrow `Field`'s data type and metadata.
-/// The override is authoritative: compatible but contradictory field
-/// metadata is ignored for that column. This is useful when the Arrow
-/// source has no metadata to carry the hint (e.g. Polars frames built
-/// without pyarrow), or when a caller deliberately replaces a stale hint.
+/// The override wins for its column: field metadata that is valid but
+/// says something different is ignored. Use it when the Arrow source has
+/// nowhere to put the metadata (e.g. Polars frames built without
+/// pyarrow), or when the caller wants to replace an out-of-date hint.
 #[derive(Clone, Copy, Debug)]
 #[non_exhaustive]
 pub enum ArrowColumnOverride<'a> {
@@ -98,7 +98,8 @@ pub enum ArrowColumnOverride<'a> {
     /// binary dtype — every non-null value must be exactly 16 bytes or
     /// the flush fails with [`ErrorCode::ArrowIngest`]. Use this when the
     /// Arrow source carries no UUID metadata (e.g. Polars frames), or to
-    /// replace a stale hint; width alone never implies UUID.
+    /// replace an out-of-date hint. A 16-byte width on its own never
+    /// makes a column a UUID.
     ///
     /// [`ErrorCode::ArrowIngest`]: crate::ErrorCode::ArrowIngest
     Uuid { column: &'a str },
@@ -107,8 +108,8 @@ pub enum ArrowColumnOverride<'a> {
     /// first, forwarded verbatim. On the variable-length binary dtypes
     /// every non-null value must be exactly 32 bytes or the flush fails
     /// with [`ErrorCode::ArrowIngest`]. Use this when the Arrow source
-    /// carries no LONG256 metadata, or to replace a stale hint; width alone
-    /// never implies LONG256.
+    /// carries no LONG256 metadata, or to replace an out-of-date hint. A
+    /// 32-byte width on its own never makes a column a LONG256.
     ///
     /// [`ErrorCode::ArrowIngest`]: crate::ErrorCode::ArrowIngest
     Long256 { column: &'a str },
@@ -131,10 +132,10 @@ impl<'a> ArrowColumnOverride<'a> {
 
 /// Validate the per-flush override list and index it by schema column.
 ///
-/// Overrides deliberately stay separate from Arrow field metadata. A runtime
-/// override is an authoritative caller choice; lowering it into metadata would
-/// erase that provenance and make stale, lower-priority metadata participate
-/// in classification again.
+/// Overrides stay separate from Arrow field metadata. An override is a
+/// direct choice by the caller and outranks metadata; rewriting it into
+/// the field metadata would lose that distinction and let out-of-date
+/// metadata take part in classification again.
 fn prepare_overrides<'a>(
     schema: &SchemaRef,
     overrides: &[ArrowColumnOverride<'a>],
@@ -166,8 +167,8 @@ fn prepare_overrides<'a>(
                 ov.column()
             ));
         };
-        // Preflight applicability even for an empty batch, whose columns are
-        // never classified below.
+        // Check that the override fits the column's type even for an empty
+        // batch, whose columns are never classified below.
         let _ = classify_override(field, ov)?;
         by_column[idx] = Some(ov);
     }
@@ -528,8 +529,10 @@ pub(crate) fn classify(field: &Field, _array: &dyn Array) -> Result<ColumnKind> 
     if md_ext == Some(crate::arrow_metadata::EXT_ARROW_UUID)
         && !matches!(dt, DataType::FixedSizeBinary(16))
     {
-        // The canonical Arrow UUID extension fixes its storage type; unlike a
-        // runtime override, metadata cannot opt variable binary into UUID.
+        // The canonical Arrow UUID extension fixes its storage type to
+        // FixedSizeBinary(16), so metadata alone cannot turn a
+        // variable-length binary column into a UUID. Only a runtime
+        // override can.
         if let DataType::FixedSizeBinary(width) = dt {
             return Err(fmt!(
                 ArrowIngest,
@@ -624,12 +627,12 @@ pub(crate) fn classify(field: &Field, _array: &dyn Array) -> Result<ColumnKind> 
         (DataType::Utf8View, _, _) if wants_symbol => ColumnKind::SymbolUtf8View,
         (DataType::Utf8View, _, _) => ColumnKind::Utf8View,
         // A `questdb.column_type` UUID/LONG256 claim on a variable-length
-        // binary column is honoured with per-value width validation at
-        // encode time. This is the only route to UUID/LONG256 for Polars
-        // sources: Polars has no fixed-size binary dtype, so its Binary
-        // columns export as `BinaryView` and can never satisfy the
-        // `FixedSizeBinary` arm below. Silently ignoring the claim would
-        // ship a BINARY column the user explicitly asked to be UUID/LONG256.
+        // binary column is accepted, and each value's width is checked at
+        // encode time. This is the only way to get a UUID or LONG256
+        // column out of Polars: Polars has no fixed-size binary dtype, so
+        // its Binary columns export as `BinaryView` and never reach the
+        // `FixedSizeBinary` arm below. Ignoring the claim would send a
+        // BINARY column when the user asked for UUID or LONG256.
         (DataType::Binary | DataType::LargeBinary | DataType::BinaryView, Some("uuid"), _) => {
             ColumnKind::UuidFromVarBinary
         }
@@ -640,12 +643,12 @@ pub(crate) fn classify(field: &Field, _array: &dyn Array) -> Result<ColumnKind> 
         (DataType::LargeBinary, _, _) => ColumnKind::LargeBinary,
         (DataType::BinaryView, _, _) => ColumnKind::BinaryView,
         // FixedSizeBinary becomes a UUID or LONG256 column only on an
-        // explicit claim — the `arrow.uuid` canonical extension (whose
-        // contract is RFC-4122 big-endian storage, byte-swapped to QWP
-        // wire order here) or `questdb.column_type`. Without a claim the
-        // bytes are opaque and land verbatim as a BINARY column; guessing
-        // UUID from the width alone would silently pick a byte order on
-        // the user's behalf.
+        // explicit claim: the `arrow.uuid` canonical extension (which
+        // stores RFC-4122 big-endian bytes, byte-swapped to QWP wire order
+        // here) or `questdb.column_type`. Without a claim the bytes are
+        // opaque and land verbatim as a BINARY column. Reading a 16-byte
+        // width as a UUID would mean picking a byte order for the user
+        // without being asked.
         (DataType::FixedSizeBinary(w), t, ext) => {
             let wants_uuid =
                 t == Some("uuid") || ext == Some(crate::arrow_metadata::EXT_ARROW_UUID);
@@ -1173,8 +1176,8 @@ fn u64_to_i64_le_checked(v: u64, row: usize) -> Result<[u8; 8]> {
 
 /// `arrow.uuid` column body: RFC-4122 big-endian storage → QWP wire order
 /// (lo LE, hi LE), i.e. each 16-byte value reversed. Both branches
-/// honor the slice offset: the bulk path windows `value_data()`
-/// explicitly, the null path goes through `arr.value(row)`.
+/// account for the array's slice offset: the bulk path slices
+/// `value_data()` explicitly, the null path goes through `arr.value(row)`.
 fn write_uuid_be_payload(out: &mut Vec<u8>, arr: &FixedSizeBinaryArray) -> Result<()> {
     let non_null = non_null_count(arr, "UUID column")?;
     let bytes = non_null.checked_mul(16).ok_or_else(|| {
@@ -1187,9 +1190,8 @@ fn write_uuid_be_payload(out: &mut Vec<u8>, arr: &FixedSizeBinaryArray) -> Resul
     try_reserve_bytes(out, bytes, "UUID column")?;
     match arr.nulls() {
         None => {
-            // Bulk path: one window into `value_data()` (honoring the
-            // slice offset) instead of a bounds-checked `value(row)` per
-            // row.
+            // Bulk path: slice `value_data()` once, starting at the array's
+            // own offset, instead of a bounds-checked `value(row)` per row.
             let start = arr.offset() * 16;
             for row in arr.value_data()[start..start + bytes].chunks_exact(16) {
                 out.extend_from_slice(&reverse_uuid_bytes(row));
@@ -1208,10 +1210,10 @@ fn write_uuid_be_payload(out: &mut Vec<u8>, arr: &FixedSizeBinaryArray) -> Resul
 }
 
 /// UUID / LONG256 claimed on a variable-length binary column
-/// (`Binary`/`LargeBinary`/`BinaryView` — the shape Polars exports, since
-/// it has no fixed-size binary dtype). Every non-null value must be
-/// exactly `elem` bytes; `reverse` selects the UUID canonical→wire
-/// byte-swap (LONG256 limbs pass verbatim).
+/// (`Binary`/`LargeBinary`/`BinaryView` — what Polars produces, since it
+/// has no fixed-size binary dtype). Every non-null value must be exactly
+/// `elem` bytes; `reverse` turns on the UUID canonical→wire byte swap
+/// (LONG256 limbs pass through verbatim).
 fn write_fixed_from_var_binary_payload(
     out: &mut Vec<u8>,
     arr: &dyn Array,
@@ -1230,8 +1232,8 @@ fn write_fixed_from_var_binary_payload(
         )
     })?;
     try_reserve_bytes(out, bytes, label)?;
-    // The dtype match is total over the three dtypes `classify` routes
-    // here, so each downcast is guaranteed by its own arm.
+    // `classify` sends only these three dtypes here, and each arm
+    // downcasts to the type its own pattern matched, so no downcast fails.
     match arr.data_type() {
         DataType::Binary => emit_fixed_rows(
             out,
@@ -4950,8 +4952,8 @@ mod tests {
 
     #[test]
     fn fsb16_with_column_type_uuid_routes_to_column_uuid() {
-        // `questdb.column_type=uuid` is the label-free way to claim UUID
-        // semantics; bytes are canonical RFC-4122 and swap to wire order.
+        // `questdb.column_type=uuid` claims UUID without the `arrow.uuid`
+        // label; bytes are canonical RFC-4122 and swap to wire order.
         let canonical: [u8; 16] = [
             0x12, 0x3e, 0x45, 0x67, 0xe8, 0x9b, 0x12, 0xd3, 0xa4, 0x56, 0x42, 0x66, 0x14, 0x17,
             0x40, 0x00,
@@ -7035,10 +7037,9 @@ mod tests {
     #[test]
     fn sliced_fsb_array_emits_sliced_window_only() {
         // Unlabeled FixedSizeBinary(16) → BINARY. The per-row `value(row)`
-        // copy must respect the slice window (arrow-rs normalises a sliced
-        // FixedSizeBinaryArray to `offset() == 0` with a pre-windowed
-        // `value_data()`; a regression copying the wrong byte range is
-        // caught here).
+        // copy must stay inside the slice: arrow-rs normalises a sliced
+        // FixedSizeBinaryArray to `offset() == 0` and trims `value_data()`
+        // to match, so copying the wrong byte range would show up here.
         let mut b = FixedSizeBinaryBuilder::new(16);
         let rows: [[u8; 16]; 4] = [[0x00; 16], [0x11; 16], [0x22; 16], [0x33; 16]];
         for r in &rows {
@@ -7063,7 +7064,7 @@ mod tests {
     #[test]
     fn sliced_arrow_uuid_array_swaps_sliced_window_only() {
         // The big-endian swap path goes through `arr.value(row)`, which
-        // must respect the slice window.
+        // must stay inside the slice.
         let rows: [[u8; 16]; 4] = [
             core::array::from_fn(|i| i as u8),
             core::array::from_fn(|i| 0x10 + i as u8),
@@ -7530,8 +7531,8 @@ mod tests {
 
     #[test]
     fn flush_arrow_batch_overrides_long256_on_fsb32() {
-        // The runtime override is authoritative over stale metadata. In
-        // particular, a stray UUID extension must not steal this FSB32.
+        // The runtime override outranks out-of-date metadata: a stray UUID
+        // extension must not turn this FSB32 into a UUID column.
         let mut b = FixedSizeBinaryBuilder::new(32);
         let value: [u8; 32] = core::array::from_fn(|i| i as u8);
         b.append_value(value).unwrap();
@@ -7587,10 +7588,10 @@ mod tests {
 
     #[test]
     fn flush_arrow_batch_overrides_uuid_on_binary_view() {
-        // The Polars reachability case: Polars has no fixed-size binary
+        // This is the case Polars needs: Polars has no fixed-size binary
         // dtype, so its Binary columns export as `BinaryView`. The UUID
-        // override must accept that shape and swap canonical bytes to
-        // wire order exactly like the FixedSizeBinary path.
+        // override must accept that type and swap canonical bytes to wire
+        // order exactly like the FixedSizeBinary path.
         use arrow::array::builder::BinaryViewBuilder;
         let canonical: [u8; 16] = [
             0x12, 0x3e, 0x45, 0x67, 0xe8, 0x9b, 0x12, 0xd3, 0xa4, 0x56, 0x42, 0x66, 0x14, 0x17,
@@ -7682,8 +7683,8 @@ mod tests {
 
     #[test]
     fn binary_with_column_type_uuid_metadata_routes_to_uuid() {
-        // Raw, internally consistent field metadata remains a supported
-        // claim source when there is no runtime override.
+        // Field metadata that is consistent with the column's type is a
+        // valid claim on its own, with no runtime override involved.
         let canonical: [u8; 16] = [
             0x12, 0x3e, 0x45, 0x67, 0xe8, 0x9b, 0x12, 0xd3, 0xa4, 0x56, 0x42, 0x66, 0x14, 0x17,
             0x40, 0x00,
@@ -7705,9 +7706,9 @@ mod tests {
     #[test]
     fn arrow_uuid_extension_on_var_binary_rejected() {
         // The canonical `arrow.uuid` extension fixes its storage type to
-        // FixedSizeBinary(16); on variable-width binary storage the
-        // schema is malformed and must be rejected, not silently
-        // byte-reversed. (`BinaryView` is the shape Polars exports.)
+        // FixedSizeBinary(16), so putting that label on variable-width
+        // binary storage is a malformed schema. Reject it rather than
+        // byte-reverse the values. (`BinaryView` is what Polars produces.)
         use arrow::array::builder::BinaryViewBuilder;
         let mut b = BinaryViewBuilder::new();
         b.append_value([0u8; 16]);
@@ -7728,8 +7729,9 @@ mod tests {
 
     #[test]
     fn column_type_uuid_with_arrow_uuid_ext_on_var_binary_is_rejected() {
-        // Metadata has no external precedence signal. The extension requires
-        // FSB16 storage, so this self-contradictory schema is rejected.
+        // Nothing says which of two metadata entries wins. The extension
+        // requires FSB16 storage, so this schema contradicts itself and is
+        // rejected.
         let canonical: [u8; 16] = [
             0x12, 0x3e, 0x45, 0x67, 0xe8, 0x9b, 0x12, 0xd3, 0xa4, 0x56, 0x42, 0x66, 0x14, 0x17,
             0x40, 0x00,

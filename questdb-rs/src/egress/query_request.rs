@@ -315,10 +315,10 @@ mod tests {
     fn bind_uuid_reverses_canonical_to_wire_order() {
         // Callers pass canonical RFC-4122 big-endian bytes; the QWP wire
         // wants (lo LE, hi LE) — the full 16-byte reversal, applied here
-        // at the API boundary. Mirrors the encoder-side pin
-        // (`encoder::tests::uuid_payload_is_swapped_to_wire_order`) so a
-        // bind-side passthrough bug can't hide behind the reader's
-        // decode-time reversal cancelling it out.
+        // at the API boundary. This checks the bind side on its own, the
+        // way `encoder::tests::uuid_payload_is_swapped_to_wire_order` does
+        // for the encoder, so a bind that forwards the bytes unchanged
+        // cannot be hidden by the reader reversing them again on decode.
         let canonical: [u8; 16] = [
             0x12, 0x3e, 0x45, 0x67, 0xe8, 0x9b, 0x12, 0xd3, 0xa4, 0x56, 0x42, 0x66, 0x14, 0x17,
             0x40, 0x00,

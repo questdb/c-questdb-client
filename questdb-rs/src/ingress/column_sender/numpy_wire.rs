@@ -1411,8 +1411,9 @@ mod tests {
     #[test]
     fn uuid_direct_swaps_canonical_to_wire_order() {
         // `S16` UUID source rows are canonical RFC-4122 big-endian; the
-        // wire wants (lo LE, hi LE) — the full 16-byte reversal. A
-        // passthrough bug would corrupt every UUID, so pin the swap.
+        // wire wants (lo LE, hi LE) — the full 16-byte reversal. Forwarding
+        // the bytes unchanged would corrupt every UUID, so check the swap
+        // directly.
         let canonical: [u8; 16] = [
             0x12, 0x3e, 0x45, 0x67, 0xe8, 0x9b, 0x12, 0xd3, 0xa4, 0x56, 0x42, 0x66, 0x14, 0x17,
             0x40, 0x00,

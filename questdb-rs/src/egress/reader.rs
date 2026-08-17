@@ -1054,10 +1054,8 @@ impl<'r> ReaderQuery<'r> {
     bind_method!(bind_timestamp_nanos, v: i64);
     bind_method!(bind_date_millis, v: i64);
     bind_method!(
-        /// Bind a UUID as 16 canonical RFC-4122 bytes in big-endian/network
-        /// byte order, matching `uuid::Uuid::as_bytes()`. Earlier versions
-        /// interpreted this byte array differently; callers upgrading must
-        /// pass canonical bytes.
+        /// Bind a UUID as 16 bytes in canonical RFC-4122 big-endian order,
+        /// which is what `uuid::Uuid::as_bytes()` returns.
         bind_uuid,
         v: [u8; 16]
     );

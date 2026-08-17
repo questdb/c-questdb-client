@@ -496,10 +496,10 @@ def _decode_uuid(col: _LineReaderColumnData) -> Tuple[str, list]:
         # first, both halves big-endian.
         hi, lo = struct.unpack_from(">QQ", raw, r * 16)
         if lo == _LONG_NULL_U64 and hi == _LONG_NULL_U64:
-            # QuestDB UUID NULL sentinel — BOTH halves Long.MIN_VALUE
-            # (see the Rust decoder's `null_sentinel::UUID_LE`). The
-            # old `lo == 0` variant false-positived on the legal UUID
-            # 80000000-0000-0000-0000-000000000000.
+            # QuestDB UUID NULL sentinel: BOTH halves are Long.MIN_VALUE
+            # (see the Rust decoder's `null_sentinel::UUID_LE`). Checking
+            # only one half would treat the legal UUID
+            # 80000000-0000-0000-0000-000000000000 as NULL.
             out.append(None)
             continue
         combined = (hi << 64) | lo

@@ -27,9 +27,10 @@
 //!   sizes (10 K rows ≈ µs of cast vs ms of wire send) but worth
 //!   knowing if you slice into many small batches.
 //! * **`Object`**: rejected before Arrow conversion. Polars exports object
-//!   values as metadata-free `FixedSizeBinary(8)` containing process-local
-//!   object handles, which is indistinguishable from legitimate opaque binary
-//!   after the conversion boundary.
+//!   values as `FixedSizeBinary(8)` with no metadata, holding handles that
+//!   are only meaningful inside this process. Once converted to Arrow they
+//!   look exactly like ordinary opaque binary data, so the rejection has to
+//!   happen while the Polars dtype is still known.
 //! * **`Binary`**: lands as a `BINARY` column by default, since Polars
 //!   frames carry no `questdb.*` field metadata to imply a richer type.
 //!   To ingest a binary column as `UUID`/`LONG256`, pass an
@@ -663,12 +664,11 @@ mod tests {
 
     #[test]
     fn binary_column_overrides_route_polars_export_to_claimed_type() {
-        // The reachability pin for the override escape hatch: Polars has
-        // no fixed-size binary dtype, so a Binary column exports as
-        // `BinaryView` — the UUID/LONG256 overrides must accept that
-        // shape or they are unreachable from every practical Polars
-        // DataFrame. Byte-level wire correctness for the var-binary
-        // writers is pinned in `arrow_batch` tests.
+        // Polars has no fixed-size binary dtype, so a Binary column
+        // exports as `BinaryView`. The UUID/LONG256 overrides must accept
+        // that type, or no real Polars DataFrame can ever use them. The
+        // bytes the writers actually put on the wire are checked in the
+        // `arrow_batch` tests.
         use crate::ingress::column_sender::ArrowColumnOverride;
         use crate::ingress::column_sender::arrow_batch::{ColumnKind, classify_with_override};
 
