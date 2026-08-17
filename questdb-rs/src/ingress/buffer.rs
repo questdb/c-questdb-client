@@ -403,13 +403,14 @@ const _: fn() = || {
     assert_send_sync::<Buffer>();
 };
 
-/// Returns whether `frame` is a complete, self-contained QWP/WebSocket
-/// message that can be relayed onto an unrelated connection.
+/// Returns whether `frame` has the QWP/WebSocket framing markers required for
+/// self-contained relay onto an unrelated connection.
 ///
-/// This is a cheap framing check. It validates the fixed QWP v1 header and the
-/// leading symbol-dictionary base, but deliberately does not parse tenant table
-/// or column data. A self-contained frame declares dictionary base 0 and carries
-/// the dictionary entries its rows reference.
+/// This is intentionally only a cheap framing check: it validates QWP v1 magic,
+/// version, declared payload length, dictionary mode, and dictionary base 0. It
+/// deliberately does not parse or semantically validate tenant tables, columns,
+/// dictionary entries, or symbol references; the destination server remains the
+/// authority for payload validity.
 #[cfg(feature = "_sender-qwp-ws")]
 pub fn is_self_contained(frame: &[u8]) -> bool {
     QwpWsColumnarBuffer::is_self_contained_frame(frame)

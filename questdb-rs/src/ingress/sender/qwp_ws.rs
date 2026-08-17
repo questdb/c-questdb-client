@@ -480,6 +480,9 @@ pub(crate) struct SyncQwpWsHandlerState {
     /// [`super::column_sender::PooledSenderCore::new_store_and_forward`]; the two are
     /// mutually exclusive. `None` in memory mode / on side-file open failure.
     pub(crate) persisted_symbol_dict: Option<PersistedSymbolDict>,
+    /// Persistent slots can outlive this sender's transient row/relay mode and
+    /// therefore cannot safely accept opaque relay frames.
+    pub(crate) persistent_store_and_forward: bool,
     pub(crate) relay_mode: Arc<AtomicBool>,
 }
 
@@ -504,6 +507,9 @@ pub(crate) struct ManualQwpWsHandlerState {
     orphan_drainers: Option<ManualOrphanDrainers>,
     append_deadline: Duration,
     close_drain_timeout: Duration,
+    /// Persistent slots can outlive this sender's transient row/relay mode and
+    /// therefore cannot safely accept opaque relay frames.
+    pub(crate) persistent_store_and_forward: bool,
     pub(crate) relay_mode: Arc<AtomicBool>,
 }
 
@@ -3598,6 +3604,7 @@ pub(crate) fn connect_qwp_ws_background_state(
         recovered_dict_entries,
         recovered_dict_count,
         persisted_symbol_dict,
+        persistent_store_and_forward: qwp_ws.sf_dir.as_ref().is_some(),
         relay_mode,
     })
 }
@@ -3686,6 +3693,7 @@ pub(crate) fn open_manual_qwp_ws(
         orphan_drainers,
         append_deadline: *qwp_ws.sf_append_deadline,
         close_drain_timeout: *qwp_ws.close_flush_timeout,
+        persistent_store_and_forward: qwp_ws.sf_dir.as_ref().is_some(),
         relay_mode: parts.relay_mode,
     })
 }

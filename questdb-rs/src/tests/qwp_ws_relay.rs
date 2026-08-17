@@ -53,6 +53,15 @@ fn connectionless_sender() -> Sender {
     Sender::from_conf("ws::addr=127.0.0.1:1;initial_connect_retry=async;").unwrap()
 }
 
+fn persistent_connectionless_sender(sf_dir: &std::path::Path) -> Sender {
+    Sender::from_conf(format!(
+        "ws::addr=127.0.0.1:1;initial_connect_retry=async;\
+         reconnect_max_duration_millis=5000;sf_dir={};sender_id=relay-test;",
+        sf_dir.display()
+    ))
+    .unwrap()
+}
+
 /// A self-contained frame must carry every symbol it references and declare
 /// dictionary base 0. Removing dense encoding from `encode_self_contained`
 /// must fail this test.
@@ -92,10 +101,11 @@ fn two_self_contained_frames_do_not_share_dictionary_state() {
     );
 }
 
-/// Weakening the header check to inspect only magic/base must fail these
-/// malformed/truncated cases.
+/// The cheap check still owns its framing contract. Weakening it to inspect
+/// only magic/base must fail these malformed or inconsistent headers; tenant
+/// table and column semantics remain deliberately unparsed.
 #[test]
-fn self_contained_validation_rejects_malformed_frames() {
+fn self_contained_validation_rejects_invalid_framing_markers() {
     let valid = self_contained_frame("alpha", 1);
     let mut bad_payload_len = valid.clone();
     bad_payload_len[8..12].copy_from_slice(&u32::MAX.to_le_bytes());
@@ -146,6 +156,28 @@ fn flush_encoded_rejects_non_self_contained_bytes_before_io() {
         assert_eq!(err.code(), ErrorCode::InvalidApiCall, "got {err:?}");
         assert!(err.msg().contains("self-contained"), "got {err:?}");
     }
+}
+
+/// A file-backed slot survives the `Sender` that chose its dictionary regime,
+/// while `qwp_ws_ingress_mode` does not. Accepting relay bytes here could put a
+/// base-0 relay frame behind recovered typed deltas (or interpret recovered
+/// relay bytes as typed history). The rejection must be local: this endpoint is
+/// unreachable and the caller must not publish anything while the background
+/// runner is still trying to dial it.
+#[test]
+fn flush_encoded_rejects_persistent_store_before_mode_claim_or_io() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut sender = persistent_connectionless_sender(dir.path());
+    let frame = self_contained_frame("alpha", 1);
+
+    let err = sender.flush_encoded(&frame).unwrap_err();
+    assert_eq!(err.code(), ErrorCode::InvalidApiCall, "got {err:?}");
+    assert!(err.msg().contains("persistent"), "got {err:?}");
+    assert_eq!(
+        sender.published_fsn().unwrap(),
+        None,
+        "a locally rejected relay frame must not enter the persistent queue"
+    );
 }
 
 fn spawn_two_frame_server() -> (u16, thread::JoinHandle<Vec<Vec<u8>>>) {

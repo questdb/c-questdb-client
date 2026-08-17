@@ -664,9 +664,12 @@ impl Sender {
     ///
     /// This has the same local-publication semantics as [`Sender::flush`]. Call
     /// [`Sender::wait`] with [`AckLevel::Ok`] to wait for server acceptance.
-    /// A sender connection is either a typed-row sender or a relay sender: mixing
-    /// the two dictionary regimes is rejected because it can resolve symbol ids
-    /// against the wrong connection dictionary.
+    /// Relay is supported only by the default in-memory Store-and-Forward queue.
+    /// A persistent/file-backed slot can outlive this sender's transient mode and
+    /// is rejected before publication or I/O. A sender connection is either a
+    /// typed-row sender or a relay sender: mixing the two dictionary regimes is
+    /// rejected because it can resolve symbol ids against the wrong connection
+    /// dictionary.
     #[cfg(feature = "sync-sender-qwp-ws")]
     pub fn flush_encoded(&mut self, frame: &[u8]) -> Result<()> {
         if !is_self_contained(frame) {
@@ -682,6 +685,17 @@ impl Sender {
             return Err(error::fmt!(
                 InvalidApiCall,
                 "flush_encoded is only supported for QWP/WebSocket senders."
+            ));
+        }
+        let persistent_store_and_forward = match &self.handler {
+            SyncProtocolHandler::SyncQwpWs(state) => state.persistent_store_and_forward,
+            SyncProtocolHandler::ManualQwpWs(state) => state.persistent_store_and_forward,
+            _ => unreachable!("QWP/WebSocket handler was checked above"),
+        };
+        if persistent_store_and_forward {
+            return Err(error::fmt!(
+                InvalidApiCall,
+                "flush_encoded does not support persistent/file-backed Store-and-Forward; use the default in-memory queue for self-contained relay frames."
             ));
         }
 
