@@ -8609,12 +8609,14 @@ mod sender_conn_event_tests {
             "ws::addr=127.0.0.1:{dead_port};lazy_connect=true;auth_timeout=2000;\
              reconnect_max_duration_millis=200;connect_timeout=100;"
         );
-        let err = SenderBuilder::from_conf(&conf)
+        let builder = SenderBuilder::from_conf(&conf)
             .unwrap()
             .connection_listener(listener, 0)
-            .unwrap()
-            .build()
-            .expect_err("no server listening");
+            .unwrap();
+        // Keep the builder alive until the dispatcher delivers both events.
+        // Chaining build() from a temporary drops the last event-source handle
+        // as soon as build() returns and may discard pending callbacks.
+        let err = builder.build().expect_err("no server listening");
         assert_eq!(err.code(), ErrorCode::SocketError);
         let attempt = wait_for_kind(&seen, ConnectionEventKind::EndpointAttemptFailed);
         assert!(attempt.attempt_number.is_some());
