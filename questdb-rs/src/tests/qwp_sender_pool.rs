@@ -1620,7 +1620,10 @@ fn failed_eager_borrow_on_disk_slot_releases_flock_and_keeps_data() {
     // rather than colliding on "slot in use") and leave the segments
     // recoverable by a later pool.
     let dir = TempDir::new().unwrap();
-    let dead_port = unused_local_port();
+    // Keep the dead endpoint outside the ephemeral range. Releasing a port
+    // from unused_local_port() lets a parallel mock server claim it, which
+    // turns the expected eager-connect failure into a successful borrow.
+    let dead_port = 1;
     let offline = format!(
         "ws::addr=127.0.0.1:{dead_port};lazy_connect=true;auth_timeout=200;\
          sf_dir={};sender_id=flockrec;sender_pool_min=1;sender_pool_max=1;\
