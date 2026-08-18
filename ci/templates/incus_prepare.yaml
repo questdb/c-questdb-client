@@ -12,17 +12,21 @@
 # (incus-azure-pipelines registers the agent with `run.sh --once`, then powers
 # the container off and lets Incus reap it), so there is no cross-job state to
 # clean up. Jobs that include compile.yaml must also set
-# `imageName: hetzner-incus` so its pip step is skipped (numpy comes from apt,
-# or the pipNumpy step below; PEP 668 on Ubuntu 24.04+ rejects
-# pip-into-system-python).
+# `imageName: hetzner-incus`; compile.yaml then installs its Python packages
+# with the PEP 668 override after this template provides python3-pip.
 parameters:
-  # Packages the image does not ship that this job needs. cmake +
-  # python3-numpy is the common case; override per job, e.g. [clang-format].
+  # Packages the image does not ship that this job needs. cmake plus the
+  # Python packages is the common compile.yaml case; override per job.
   - name: aptPackages
     type: object
     default:
       - cmake
       - python3-numpy
+      - python3-pip
+  # Jobs that need only the image JDKs and user-local Rust can skip apt.
+  - name: isAptInstallEnabled
+    type: boolean
+    default: true
   # Set true for jobs that run the full system_test suite. Ubuntu 24.04's apt
   # numpy is 1.26 (max 32 ndarray dims), but test_f64_arr_max_dims builds a
   # 33-dim array, which needs numpy >= 2.0. This installs pip + numpy>=2
@@ -33,11 +37,12 @@ parameters:
     default: false
 
 steps:
-  - bash: |
-      set -eux
-      sudo apt-get update
-      sudo apt-get install -y --no-install-recommends ${{ join(' ', parameters.aptPackages) }}
-    displayName: "incus: apt install"
+  - ${{ if parameters.isAptInstallEnabled }}:
+    - bash: |
+        set -eux
+        sudo apt-get update
+        sudo apt-get install -y --no-install-recommends ${{ join(' ', parameters.aptPackages) }}
+      displayName: "incus: apt install"
 
   - ${{ if parameters.pipNumpy }}:
     - bash: |

@@ -159,25 +159,31 @@ stages:
       - job: VersionMatrix
         displayName: "arrow/polars version-range tests (linux)"
         pool:
-          vmImage: "ubuntu-latest"
+          name: hetzner-incus
         timeoutInMinutes: 90
         steps:
           - checkout: self
             fetchDepth: 1
             lfs: false
             submodules: false
+          - template: templates/incus_prepare.yaml
+            parameters:
+              isAptInstallEnabled: false
           - script: python3 ci/run_version_matrix.py
             displayName: "questdb-rs: pinned arrow/polars versions"
       - job: RustMsrvAndDocs
         displayName: "Rust MSRV and release documentation"
         pool:
-          vmImage: "ubuntu-latest"
+          name: hetzner-incus
         timeoutInMinutes: 45
         steps:
           - checkout: self
             fetchDepth: 1
             lfs: false
             submodules: false
+          - template: templates/incus_prepare.yaml
+            parameters:
+              isAptInstallEnabled: false
           - script: rustup toolchain install 1.91.1 --profile minimal
             displayName: "Install Rust 1.91.1"
           - script: |
