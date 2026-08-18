@@ -208,6 +208,8 @@ stages:
         timeoutInMinutes: 10
         steps:
           - checkout: self
+          - script: python3 -m unittest ci/test_pipeline_pools.py
+            displayName: "Validate CI pool assignments"
           - template: templates/incus_prepare.yaml
             parameters:
               aptPackages:
@@ -218,6 +220,8 @@ stages:
               # and CI agree byte-for-byte; comment reflow differs between
               # clang-format major versions.
               pipx install clang-format==21.1.8
+              export PATH="$HOME/.local/bin:$PATH"
+              echo "##vso[task.prependpath]$HOME/.local/bin"
               clang-format --version | grep -F 21.1.8
               rustup component add clippy
               rustup component add rustfmt

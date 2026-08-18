@@ -8589,15 +8589,12 @@ mod sender_conn_event_tests {
 
     #[test]
     fn sender_unreachable_fires_attempt_failed_and_unreachable() {
-        let port = {
-            let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
-            listener.local_addr().unwrap().port()
-        };
+        // Keep this endpoint out of the ephemeral range. Releasing a port from
+        // a temporary listener lets a parallel test immediately bind it and
+        // turns the expected connection failure into a cross-test connection.
         let (seen, listener) = collecting_listener();
-        let conf = format!(
-            "ws::addr=127.0.0.1:{port};lazy_connect=true;auth_timeout=2000;\
-             reconnect_max_duration_millis=200;connect_timeout=100;"
-        );
+        let conf = "ws::addr=127.0.0.1:1;lazy_connect=true;auth_timeout=2000;\
+                    reconnect_max_duration_millis=200;connect_timeout=100;";
         let err = SenderBuilder::from_conf(conf)
             .unwrap()
             .connection_listener(listener, 0)

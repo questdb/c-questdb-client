@@ -4829,11 +4829,7 @@ mod tests {
         // Assert the timeout was set to approximately io_timeout rather than
         // bit-for-bit equal, so the test is portable across kernel HZ values.
         let slack = Duration::from_millis(20);
-        let read_timeout = tcp
-            .tcp()
-            .read_timeout()
-            .unwrap()
-            .expect("read timeout set");
+        let read_timeout = tcp.tcp().read_timeout().unwrap().expect("read timeout set");
         let write_timeout = tcp
             .tcp()
             .write_timeout()

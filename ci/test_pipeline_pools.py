@@ -64,6 +64,12 @@ class PullRequestPipelinePoolTest(unittest.TestCase):
             self.assertIn(HETZNER_POOL, jobs[name])
             self.assertIn(INCUS_PREPARE, jobs[name])
 
+    def test_format_job_exposes_pipx_tools_and_runs_pool_checks(self):
+        job = load_job_blocks("run_tests_pipeline.yaml")["FormatAndLinting"]
+        self.assertIn('export PATH="$HOME/.local/bin:$PATH"', job)
+        self.assertIn("##vso[task.prependpath]$HOME/.local/bin", job)
+        self.assertIn("python3 -m unittest ci/test_pipeline_pools.py", job)
+
 
 if __name__ == "__main__":
     unittest.main()
