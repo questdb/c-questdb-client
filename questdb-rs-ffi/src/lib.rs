@@ -303,15 +303,13 @@ pub enum line_sender_error_code {
     /// QWP/WebSocket server rejection or terminal protocol violation.
     line_sender_error_server_rejection = 14,
 
-    /// `qwp_sender_flush_arrow_batch_*` was passed a column whose
-    /// Arrow / QuestDB kind cannot be persisted to a QuestDB table.
-    /// Only emitted with the `arrow` feature enabled.
+    /// An Arrow column cannot be written to QuestDB because its type is not
+    /// supported for ingestion. Only emitted with the `arrow` feature enabled.
     line_sender_error_arrow_unsupported_column_kind = 15,
 
-    /// `qwp_sender_flush_arrow_batch_*` rejected a `RecordBatch` at
-    /// client-side structural validation (column count, name encoding,
-    /// FFI struct contract). Only emitted with the `arrow` feature
-    /// enabled.
+    /// Arrow data is invalid or conflicts with its metadata or overrides. For
+    /// example, a UUID claim requires 16-byte values and a LONG256 claim
+    /// requires 32-byte values. Only emitted with the `arrow` feature enabled.
     line_sender_error_arrow_ingest = 16,
 
     /// A reconnectable failure on the column-major sender's flush/sync
@@ -2019,6 +2017,8 @@ pub unsafe extern "C" fn line_sender_buffer_column_dec128(
 /// Record a UUID column value. QWP-only.
 ///
 /// The wire encoding writes `lo` (8 bytes LE) followed by `hi` (8 bytes LE).
+/// For canonical RFC-4122 bytes, use `qwp_chunk_column_uuid` instead of
+/// splitting the bytes into `lo` and `hi`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn line_sender_buffer_column_uuid(
     buffer: *mut line_sender_buffer,

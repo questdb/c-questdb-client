@@ -549,7 +549,7 @@ class TestArrowPolarsPerDtype(afc.ArrowFuzzBase):
         })
         self._expect_client_reject(df, ClientErrorCode.ARROW_UNSUPPORTED_COLUMN_KIND)
 
-    def test_dtype_object_rejected(self):
+    def test_dtype_object_export_erases_object_semantics(self):
         import polars as pl
         dt = getattr(pl, "Object", None)
         if dt is None:
@@ -561,9 +561,15 @@ class TestArrowPolarsPerDtype(afc.ArrowFuzzBase):
             }),
             "polars Object DataFrame construction",
         )
-        err = _try_ingest(self, self.fresh_table("polars_object"), df)
-        if err is None:
-            self.fail(self.label("expected polars Object to be rejected"))
+        rb = _polars_to_rb(df)
+        field = rb.schema.field("c")
+        self.assertEqual(field.type, pa.binary(8))
+        self.assertIsNone(field.metadata)
+        # Do not pass this RecordBatch to the generic Arrow client: once
+        # exported it looks exactly like ordinary opaque FSB8, and its bytes
+        # are handles that are only meaningful inside this process. The Rust
+        # Polars adapter rejects Object while the original dtype is still
+        # known.
 
     def test_dtype_null_rejected(self):
         import polars as pl

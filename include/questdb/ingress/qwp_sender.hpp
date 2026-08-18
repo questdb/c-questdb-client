@@ -309,8 +309,10 @@ public:
         return *this;
     }
 
-    /** UUID column: 16 bytes per row — low half LE in bytes 0..8, high half LE
-     * in bytes 8..16. */
+    /** UUID column: 16 bytes per row in canonical RFC-4122 big-endian order;
+     * the client byte-swaps to QWP wire order internally.
+     * `line_sender_buffer::column_uuid(lo, hi)` instead takes QWP wire-order
+     * integer halves. */
     column_chunk& column_uuid(
         std::string_view name,
         const uint8_t* data,
