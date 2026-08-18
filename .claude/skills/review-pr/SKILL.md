@@ -1,18 +1,29 @@
 ---
 name: review-pr
-description: Review a GitHub pull request against QuestDB client library coding standards
-argument-hint: [PR number or URL] [--level=0..3]
-allowed-tools: Bash(gh *), Read, Grep, Glob, Agent
+description: Review a GitHub pull request or local Git range against QuestDB client library coding standards
+argument-hint: "[PR number or URL | --range=<base>..<head>] [--level=0..3]"
+allowed-tools: Bash, Read, Grep, Glob, Agent
 ---
 
-Review the pull request `$ARGUMENTS`.
+Review the target in `$ARGUMENTS`. Parse exactly one PR number/URL or
+`--range=<base>..<head>` target. An omitted range head reviews the working tree,
+including uncommitted changes. Ask for a target when none is supplied and reject
+ambiguous invocations containing both forms. Use Bash for read-only Git/GitHub
+queries and test execution; do not edit files, commit, or push.
 
 ## Review mindset
 
 You are a senior QuestDB engineer performing a blocking code review. The QuestDB client library is mission-critical software — bugs can cause data loss, silent data corruption, or crashes in customer applications across Rust, C, C++, Python, and downstream language bindings. There is zero tolerance for correctness issues, resource leaks, undefined behavior, or unsound FFI. Be critical, thorough, and opinionated. Your job is to catch problems before they ship, not to be nice.
 
+**A review that blocks on everything blocks on nothing.** Report every verified
+issue, but reserve blocking severity for reachable defects with material user
+impact. Approval is the expected result when the correctness and test gates pass.
+
 - **Assume nothing is correct until you've verified it.** Read surrounding code to understand context — don't just look at the diff in isolation.
 - **The diff is a hint, not the boundary of the review.** The highest-value bugs almost always live at callsites outside the diff that depend on contracts the diff quietly changed. Treat the diff as the entry point, not the scope.
+- **Discovery is not a finding.** Treat every agent concern as an untrusted hypothesis until Step 3b establishes attribution, reachability, and evidence. Agent agreement is not proof.
+- **Falsify before explaining.** Search for guards, validation, retries, omitted callers, unsupported inputs, and identical merge-base behavior before writing report prose.
+- **Keep the PR blast radius small.** Do not attribute pre-existing behavior or residual hardening opportunities to this PR unless the change demonstrably exposes or worsens them.
 - **Flag every issue you find**, no matter how small. Do not soften language or hedge. Say "this is wrong" not "this might be an issue".
 - **Do not praise the code.** Skip "looks good", "nice work", "clever approach". Focus entirely on problems and risks.
 - **Think adversarially.** For each change, work through:
@@ -22,6 +33,7 @@ You are a senior QuestDB engineer performing a blocking code review. The QuestDB
   - Failure modes: connection dropping mid-flush, partial write, TLS handshake failure, auth rejection.
   - FFI callers: what happens when the caller passes NULL, an unaligned pointer, a freed handle, a buffer length lying about its actual size?
 - **Check what's missing**, not just what's there. Missing tests, missing error handling, missing edge cases, missing documentation for public API changes, C header out of sync with Rust impl.
+- **Untested behavior is a coverage risk, not proof of a functional defect.** Classify a gap by reachable impact and change risk; missing tests alone do not make it Critical.
 - **Treat public API ergonomics and cross-surface consistency as correctness, not polish.** This library is consumed from Rust, C, C++, and Python; an inconsistent, surprising, or footgun-prone public API leads users into data loss, silent misuse, and crashes just as surely as a logic bug. Every public/exported symbol the PR adds or changes must (a) express each shared concept — table/column names, timestamps, row/batch limits, ack levels, column-type overrides, buffer/handle ownership — the *same way* every sibling surface already does, and (b) make the easy path the safe path. An ergonomic inconsistency that can cause data loss or silent misuse is a blocking finding, not a Minor nit.
 - **Verify every claim.** If the PR title says "fix", verify the bug actually existed and the fix is correct. If it says "improve performance", look for benchmarks or reason about the algorithmic change. If it says "simplify", verify the new code is actually simpler and doesn't drop behavior. Treat the PR description as an unverified hypothesis.
 - **Read the full context of changed files** when the diff alone is ambiguous. Use Read/Grep/Glob to inspect surrounding code, callers, and related tests.
@@ -32,14 +44,14 @@ You are a senior QuestDB engineer performing a blocking code review. The QuestDB
 
 ## Review level
 
-Parse `$ARGUMENTS` for a level token: `--level=N`, `-lN`, or a bare single digit `0`-`3`. **If no level is given, default to 0.** Strip the level token before feeding the remainder (PR number or URL) to `gh` commands.
+Parse `$ARGUMENTS` for a level token: `--level=N`, `-lN`, or a bare single digit `0`-`3`. **If no level is given, default to 0.** Strip the level and range tokens before feeding a PR target to `gh` commands.
 
 The level controls how much of the review below actually runs. Lower levels keep the same review *spirit* — adversarial, blocking, no praise — but cut the breadth of the analysis. Higher levels have significantly higher token cost; reserve level 3 for high-stakes PRs (FFI ABI changes, ILP wire format, authentication/TLS, public C/C++ headers, new `unsafe` blocks, sender or buffer state-machine changes).
 
 | Level | What runs |
 |-------|-----------|
-| **0 (default)** | Steps 1, 2, 4. Skip Step 2.5. Skip Step 3 — no agent spawn; review the diff inline in the main loop, using Read/Grep on demand to resolve ambiguities. Skip Step 3b — verify each finding inline as you write it. Single-pass review covering correctness, FFI safety, panics, tests, public API ergonomics & cross-surface consistency, and coding standards on the diff itself. |
-| **1** | Adds Step 2.5a (semantic delta only — skip 2.5b/2.5c/2.5d). In Step 3, launch only Agent 1 (correctness), Agent 2 (Rust safety), Agent 7 (tests), and Agent 8 (public API ergonomics & cross-surface consistency) in parallel. Skip all other agents. Skip Step 3b — verify findings inline as you draft the report. |
+| **0 (default)** | Steps 1, 2, 2.4, 2.5e, 2.6, 4. Skip the rest of Step 2.5 and agent fanout. Review inline, applying the Step 3b admission rules from a blank evidence record before writing each finding. |
+| **1** | Adds Step 2.5a (semantic delta only — skip 2.5b/2.5c/2.5d). In Step 3, launch only Agent 1 (correctness), Agent 2 (Rust safety), Agent 7 (tests), and Agent 8 (public API ergonomics & cross-surface consistency) in parallel. Skip all other agents. Apply Step 3b inline to their candidates. |
 | **2** | Full Step 2.5, but in 2.5b restrict the callsite inventory to `pub`/`pub(crate)` Rust symbols plus every `#[no_mangle]`/`extern "C"` export. In Step 3, launch Agents 1-8. Skip Agent 9 (cross-context) and Agent 10 (adversarial fresh-context). Step 3b uses a single batched verification agent for all findings instead of one per finding. |
 | **3** | Every step below as written, all 10 agents, per-finding verification. The full mission-critical pass. |
 
@@ -47,16 +59,29 @@ State the chosen level in one line at the start of the review so the user knows 
 
 ## Step 1: Gather PR context
 
-Capture the PR identifier in `$PR` (the part of `$ARGUMENTS` left after stripping the level token), then fetch metadata, diff, and review comments in a single bash call so `$PR` is in scope for all three `gh` invocations:
+Every mode must establish `$BASE`, the revision against which attribution is
+measured. A behavioral finding without an identical-trigger base comparison is
+not attributable to the change.
+
+For a PR, capture `$PR` after stripping the level token, then fetch context and base:
 
 ```bash
 PR='<PR number or URL from $ARGUMENTS, with any --level=N / -lN / bare-digit level token removed>'
 gh pr view "$PR" --json number,title,body,labels,state
 gh pr diff "$PR"
 gh pr view "$PR" --comments
+BASE=$(gh pr view "$PR" --json baseRefOid --jq .baseRefOid)
+HEAD=$(gh pr view "$PR" --json headRefOid --jq .headRefOid)
 ```
 
+For `--range=<base>..<head>`, set `$BASE`; use `git diff "$BASE...$HEAD"` when
+the head is present. With an omitted head, inspect `git diff "$BASE"`,
+`git status --porcelain`, and relevant untracked files because they do not
+appear in the diff.
+
 ## Step 2: PR title and description
+
+Skip this step in local-range mode and state that no PR metadata exists.
 
 Check:
 - Title is clear and describes the change
@@ -64,6 +89,14 @@ Check:
 - If fixing an issue, `Fixes #NNN` or a link to the issue is present
 - Tone is level-headed and analytical
 - For public API changes (C header, C++ wrapper, Rust public types), the description calls out the API change explicitly
+
+## Step 2.4: Submodule provenance
+
+For every changed submodule pointer, determine whether the new commit is already
+on the submodule's default branch. Classify it as `UPSTREAM-SYNC` (contents are
+out of scope; review only integration in this diff), `OFF-DEFAULT` (contents are
+part of this logical change), or `UNRESOLVED` (treat as `OFF-DEFAULT` and disclose
+the missing provenance). Record each verdict for the final summary.
 
 ## Step 2.5: Map the change surface
 
@@ -147,15 +180,27 @@ Read `questdb-rs/Cargo.toml` and `questdb-rs-ffi/Cargo.toml` and record, with fi
 
 A review without this section is incomplete. State the panic mode in one line at the top of every Step 3 agent prompt so the agent reasons from the right premise.
 
+## Step 2.6: Test coverage map
+
+For every production-code behavioral change, record: the changed symbol/path;
+the exact test and search used to find it; why its assertion fails on regression;
+supported reachability and affected users; applicable happy/error/NULL/boundary/
+concurrency/resource dimensions; and a disposition of `COVERED`, `CRITICAL GAP`,
+`MODERATE GAP`, `ACCEPTED GAP`, or `EXEMPT`. A Critical gap requires a reachable
+material consequence such as data loss, host-process abort, security failure,
+compatibility break, or unbounded resource loss. Keep covered, accepted, and
+exempt rows private unless asked.
+
 ## Step 3: Parallel review
 
 Every agent receives:
-1. The PR diff
-2. The full change surface map from Step 2.5 (semantic deltas, callsite inventory, implicit contracts, cross-context exposure list)
+1. The PR or local-range diff
+2. The change surface material available at that level from Step 2.5
+3. The test coverage map from Step 2.6
 
 ### Anti-anchoring directive (applies to all agents)
 
-- **Bugs at callsites outside the diff outrank bugs inside the diff.** A confirmed bug in a file the PR did not touch but that calls a changed symbol is a P0 finding.
+- **Bugs at callsites outside the diff are high-priority candidates.** They become findings only after Step 3b proves the changed contract broke that caller; severity follows user impact.
 - **"Looks correct in isolation" is not a valid conclusion.** Before clearing a changed symbol, the agent must walk the callsite inventory from 2.5b and explicitly state, per callsite, whether the new behavior is still correct there.
 - **The diff is the entry point, not the scope.** If the change surface map shows the symbol is reachable from N other files, the review covers N+1 files.
 - **Crate-wide settings affect untouched code.** A change to `Cargo.toml` (panic strategy, allocator, feature defaults, MSRV, profile overrides), a new `#[global_allocator]`, or a new `panic_handler` retroactively changes the safety story for every existing function in the crate — not just the diff. When `Cargo.toml`, build scripts, or workspace-level config files appear in the diff, the review covers the panic/allocation/overflow contract of the **entire affected crate**, not just the touched lines. The same applies when 2.5e records a profile fact (e.g. `panic = "abort"`) that invalidates existing safety patterns in untouched code.
@@ -220,28 +265,40 @@ Also cover the mechanical hygiene that used to live here: backward-compatible C/
 - For changed `extern "C"` signatures: does the C header still match? Do the C++ wrapper and Python ctypes binding still pass the right types and lifetimes?
 - For changed buffer/sender state machines: do all callers respect the new state transitions (e.g., is a buffer cleared after error before being reused; is `flush` called only when the sender is in a flushable state)?
 
-This agent's output is structured per callsite, not per failure mode. Each callsite gets a verdict: SAFE / BROKEN / NEEDS VERIFICATION. Every BROKEN entry is a P0 finding regardless of whether the file is in the diff.
+This agent's output is structured per callsite, not per failure mode. Each callsite gets a verdict: SAFE / CANDIDATE / NEEDS VERIFICATION. A CANDIDATE is an untrusted hypothesis for Step 3b.
 
 This agent is not optional even when the diff is small. Small diffs to widely-used symbols (`Buffer::column_*`, `Sender::flush`, FFI exports) have the largest blast radius.
 
 **Agent 10 — Fresh-context adversarial:** Dispatched separately from agents 1-9 to escape checklist anchoring. This agent operates under different rules from the rest:
 
-- It receives ONLY the PR diff and the names of the changed files. It does NOT receive the change surface map from Step 2.5, the implicit contract list, the cross-context exposure list, or any of the review checklists below.
+- It receives ONLY the PR or local-range diff and the names of the changed files. It does NOT receive the change surface map from Step 2.5, the implicit contract list, the cross-context exposure list, or any of the review checklists below.
 - Its sole instruction: "find ways this code is wrong". No category list, no failure-mode taxonomy, no QuestDB-specific style guide.
 - It is free to use Read, Grep, and Glob to explore the repository however it wants.
-- Findings are not pre-classified by category. Each finding states: what's wrong, why it's wrong, and the code path that demonstrates it.
+- Candidates are not pre-classified by category. Each candidate states: what's wrong, why it's wrong, and the code path that demonstrates it.
 
-The point of this agent is to surface bugs the structured agents cannot see because they are reasoning inside the same frame. A finding here that none of agents 1-9 produced is high signal — it means the structured review missed it. A finding here that overlaps with agents 1-9 is corroboration.
+The point of this agent is to surface hypotheses the structured agents cannot see because they are reasoning inside the same frame. Novelty and overlap determine investigation priority, not truth or severity.
 
 Run this agent in parallel with agents 1-9. It is mandatory regardless of diff size.
 
-Combine all agent findings into a single deduplicated **draft** report. Do NOT present this draft to the user yet — it goes straight into verification.
+Combine agent outputs into a private candidate ledger. Split compound claims,
+deduplicate them, record dependencies, and do not draft severity or report prose yet.
 
-## Step 3b: Verify every finding against source code
+## Step 3b: Falsify, prove, and admit candidates
 
-The parallel review agents work from the diff plus the change surface map and frequently produce false positives — especially around memory ownership, `unsafe` blocks, FFI lifecycle conventions, and Rust control-flow guarantees. Every finding MUST be verified before it is reported.
+The parallel review agents work from the diff plus the change surface map and frequently produce false positives — especially around memory ownership, `unsafe` blocks, FFI lifecycle conventions, and Rust control-flow guarantees. Every candidate MUST be verified before it is reported.
 
-For each finding in the draft report:
+Use `HYPOTHESIS → FALSIFYING → PROVEN → ADMITTED`. Omit a candidate when any
+required premise remains unsupported. Behavioral candidates require: the exact
+changed hunk or broken unchanged caller; a supported input/state producer; the
+complete reachable path; observed head behavior; identical-trigger `$BASE`
+behavior (or proof of a genuinely new surface); user-visible impact; the strongest
+counterevidence attempted; and the command/test artifact with revision identity.
+Race, ordering, retry, restart, filesystem, compatibility, and protocol-state
+claims require executed evidence. Static compile/ABI/standards violations may cite
+complete source proof instead. If base behaves the same or worse, the issue is not
+a finding against this PR.
+
+For each candidate in the private ledger:
 
 1. **Read the actual source code** at the exact lines cited. Do not rely on the agent's description alone.
 2. **Trace the full code path**: follow callers, trait implementations, and generic instantiations. A method called on a trait object may dispatch to a specific impl.
@@ -255,15 +312,15 @@ For each finding in the draft report:
 10. **For cross-context findings (Agent 9)**: re-read the callsite in full, including its callers up two levels, and confirm the broken behavior is reachable from production code paths or test paths users will exercise. Cross-context findings are high-value but also the easiest to overstate — verify carefully.
 11. **For API ergonomics / consistency findings (Agent 8)**: name and read the specific peer surface the finding is measured against — the sibling method, the other sink/transport, or the C/C++/Python binding of the same concept — and quote both shapes side by side. An ergonomic complaint with no concrete peer surface to compare against, or one that contradicts an established crate-wide convention, is bikeshedding: drop it or downgrade to Minor. Then grade by user impact, not by appearance: a divergence that can cause data loss, unacked/uncommitted rows, or silent misuse is Critical/Moderate; a pure style/naming difference with no safety impact is Minor.
 
-**Classify each finding** as:
-- **CONFIRMED in-diff** — the bug is real and inside the diff
-- **CONFIRMED at out-of-diff callsite** — the bug is in an unchanged file because the changed symbol is used there in a way that's now broken (cite the file and the contract from 2.5c that was violated)
-- **FALSE POSITIVE** — the code is actually correct (explain why)
-- **CONFIRMED with nuance** — the issue exists but is less severe than stated (explain)
+**Classify each candidate** as:
+- **ADMITTED in-diff** — the bug is real and inside the diff
+- **ADMITTED out-of-diff-breakage** — an unchanged caller is broken by a contract this PR changed
+- **OMITTED pre-existing/not-attributed** — base has the same or worse behavior
+- **OMITTED false/unverified** — counterevidence disproves it or required proof is missing
 
-**Move false positives to a separate "Downgraded" section** at the end of the report. For each, give a one-line explanation of why it was dismissed. This lets the PR author verify the reasoning and catch verification mistakes.
+**Move omitted false candidates to a separate "Downgraded" section** at the end of the report. For each, give a one-line explanation of why it was dismissed. This lets the PR author verify the reasoning and catch verification mistakes.
 
-Launch verification agents in parallel where findings are independent. Each verification agent should read surrounding source files, not just the diff.
+Launch verification agents in parallel where candidates are independent. Each verification agent should read surrounding source files, not just the diff.
 
 ## Review checklists
 
@@ -386,6 +443,13 @@ Mission-critical for a client library: a confusing or inconsistent public API ca
 
 Present ONLY verified findings (false positives are excluded from Critical/Moderate/Minor). Structure as:
 
+Classify by reachable user impact, not review category. Critical means material
+data loss/corruption, host crash or outage, undefined behavior/security failure,
+public compatibility break, unbounded resource loss, or a material hot-path
+regression. Moderate is bounded or developer-facing impact. Minor is cosmetic.
+Every behavioral finding must state the problem, net impact, decisive evidence,
+and identical-trigger base behavior.
+
 ### Critical
 Issues that must be fixed before merge. Each must include:
 - Exact file path and line numbers (including out-of-diff files)
@@ -400,13 +464,20 @@ Issues worth addressing but not blocking.
 ### Minor
 Style nits and suggestions.
 
+### Coverage gaps
+List only admitted Critical and Moderate gaps, with the recorded test search and
+failure link. Critical gaps block through the same correctness gate as defects.
+
 ### Downgraded (false positives)
-Findings from the initial review that were dismissed after source code verification. For each, state:
+Candidates from discovery that were dismissed after source code verification. For each, state:
 - The original claim (one line)
 - Why it was dismissed (one line, citing the specific code that disproves it)
 
 ### Summary
-- One-line verdict: approve, request changes, or needs discussion
+- One-line verdict: approve, approve with comments, request changes, or needs discussion
+- Request changes while any admitted Critical finding or Critical coverage gap remains open
 - Highlight any regressions or tradeoffs
-- State how many draft findings were verified vs dropped as false positives (e.g., "8 findings verified, 4 false positives removed")
+- State the test-gate result and admitted coverage-gap count
+- State each changed submodule's provenance verdict
+- State how many candidates were admitted vs omitted as false positives (e.g., "8 findings admitted, 4 false positives removed")
 - State the in-diff vs out-of-diff split (e.g., "5 findings in-diff, 3 findings out-of-diff"). If the diff is non-trivial and out-of-diff is zero, the cross-context pass likely underran — re-invoke Agent 9 with a wider grep before finalizing.
