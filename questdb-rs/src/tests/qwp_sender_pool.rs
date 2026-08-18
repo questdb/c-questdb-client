@@ -35,10 +35,11 @@
 //! HTTP→WebSocket upgrade, then either parks on the connection or reads each
 //! QWP frame and replies with an OK ack (status 0x00).
 
+use socket2::{Domain, Protocol as SocketProtocol, Socket, Type};
 use std::collections::BTreeSet;
 use std::fs;
 use std::io::{Read, Write};
-use std::net::TcpListener;
+use std::net::{Ipv4Addr, SocketAddrV4, TcpListener};
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -754,6 +755,22 @@ fn frame_table_name(payload: &[u8]) -> String {
         .to_owned()
 }
 
+fn owned_refused_tcp_endpoint() -> (Socket, u16) {
+    let socket = Socket::new(Domain::IPV4, Type::STREAM, Some(SocketProtocol::TCP))
+        .expect("create refused endpoint socket");
+    let address = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0);
+    socket
+        .bind(&address.into())
+        .expect("bind refused endpoint socket");
+    let port = socket
+        .local_addr()
+        .expect("refused endpoint local addr")
+        .as_socket_ipv4()
+        .expect("refused endpoint IPv4 addr")
+        .port();
+    (socket, port)
+}
+
 fn unused_local_port() -> u16 {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind unused local port");
     listener.local_addr().expect("unused local addr").port()
@@ -1066,8 +1083,9 @@ fn eager_connect_with_sync_mode_still_fails_fast_on_reader_prewarm() {
     // Java permits this combination: sync governs ingest only, while readers
     // always connect fail-fast. Skip ingest prewarm so the down reader is the
     // observed failure; the long reconnect budget must not delay it.
+    let (_dead_socket, dead_port) = owned_refused_tcp_endpoint();
     let conf = eager_conf(
-        &[unused_local_port()],
+        &[dead_port],
         "initial_connect_retry=sync;reconnect_max_duration_millis=6000;\
          sender_pool_min=0;query_pool_min=1;",
     );
@@ -4680,11 +4698,14 @@ fn store_and_forward_flush_and_wait_surfaces_server_rejection_memory() {
 #[test]
 fn pool_is_lazy_and_opens_on_first_borrow() {
     let server = MockServer::spawn(8);
-    let db = QuestDb::connect(&conf_for(
-        server.port(),
-        "sender_pool_min=3;sender_pool_max=4;",
-    ))
-    .unwrap();
+    // Full-suite contention can delay the mock's upgrade response beyond the
+    // shared helper's two-second authentication timeout and trigger a retry.
+    let conf = format!(
+        "ws::addr=127.0.0.1:{};lazy_connect=true;auth_timeout=10000;\
+         reconnect_max_duration_millis=1000;sender_pool_min=3;sender_pool_max=4;",
+        server.port()
+    );
+    let db = QuestDb::connect(&conf).unwrap();
     // Lazy pool, like the row-major sender: `connect` opens nothing.
     assert_eq!(db.free_count(), 0);
     assert_eq!(db.in_use_count(), 0);
@@ -6665,7 +6686,7 @@ fn reborrow_after_primary_failure_lands_on_live_endpoint_and_skips_dead() {
 #[test]
 fn failed_reborrow_keeps_handle_erroring_without_panicking() {
     let primary = MockServer::spawn_upgrade_then_close(1);
-    let unreachable_port = unused_local_port();
+    let (_unreachable_socket, unreachable_port) = owned_refused_tcp_endpoint();
     let db = QuestDb::connect(&conf_for_endpoints(
         &[primary.port(), unreachable_port],
         "sender_pool_min=1;sender_pool_max=1;\
