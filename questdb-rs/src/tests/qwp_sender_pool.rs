@@ -1620,10 +1620,14 @@ fn failed_eager_borrow_on_disk_slot_releases_flock_and_keeps_data() {
     // rather than colliding on "slot in use") and leave the segments
     // recoverable by a later pool.
     let dir = TempDir::new().unwrap();
-    // Keep the dead endpoint outside the ephemeral range. Releasing a port
-    // from unused_local_port() lets a parallel mock server claim it, which
-    // turns the expected eager-connect failure into a successful borrow.
-    let dead_port = 1;
+    // Retain a test-owned listener so no parallel server can claim the port.
+    // Deliberately do not accept: TCP may connect, but the WebSocket upgrade
+    // cannot complete before the configured timeout.
+    let dead_listener = TcpListener::bind("127.0.0.1:0").expect("bind dead endpoint");
+    let dead_port = dead_listener
+        .local_addr()
+        .expect("dead endpoint local addr")
+        .port();
     let offline = format!(
         "ws::addr=127.0.0.1:{dead_port};lazy_connect=true;auth_timeout=200;\
          sf_dir={};sender_id=flockrec;sender_pool_min=1;sender_pool_max=1;\
@@ -8592,13 +8596,20 @@ mod sender_conn_event_tests {
 
     #[test]
     fn sender_unreachable_fires_attempt_failed_and_unreachable() {
-        // Keep this endpoint out of the ephemeral range. Releasing a port from
-        // a temporary listener lets a parallel test immediately bind it and
-        // turns the expected connection failure into a cross-test connection.
+        // Retain a test-owned listener so no parallel server can claim the port.
+        // Deliberately do not accept: TCP may connect, but the WebSocket upgrade
+        // cannot complete before the configured timeout.
+        let dead_listener = TcpListener::bind("127.0.0.1:0").expect("bind dead endpoint");
+        let dead_port = dead_listener
+            .local_addr()
+            .expect("dead endpoint local addr")
+            .port();
         let (seen, listener) = collecting_listener();
-        let conf = "ws::addr=127.0.0.1:1;lazy_connect=true;auth_timeout=2000;\
-                    reconnect_max_duration_millis=200;connect_timeout=100;";
-        let err = SenderBuilder::from_conf(conf)
+        let conf = format!(
+            "ws::addr=127.0.0.1:{dead_port};lazy_connect=true;auth_timeout=2000;\
+             reconnect_max_duration_millis=200;connect_timeout=100;"
+        );
+        let err = SenderBuilder::from_conf(&conf)
             .unwrap()
             .connection_listener(listener, 0)
             .unwrap()

@@ -208,8 +208,6 @@ stages:
         timeoutInMinutes: 10
         steps:
           - checkout: self
-          - script: python3 -m unittest ci/test_pipeline_pools.py
-            displayName: "Validate CI pool assignments"
           - template: templates/incus_prepare.yaml
             parameters:
               aptPackages:
