@@ -8630,34 +8630,95 @@ mod sender_conn_event_tests {
         drop(sender);
     }
 
-    #[test]
-    fn sender_unreachable_fires_attempt_failed_and_unreachable() {
-        // Retain a test-owned listener so no parallel server can claim the port.
-        // Deliberately do not accept: TCP may connect, but the WebSocket upgrade
-        // cannot complete before the configured timeout.
-        let dead_listener = bind_test_listener();
-        let dead_port = dead_listener
-            .local_addr()
-            .expect("dead endpoint local addr")
-            .port();
-        let (seen, listener) = collecting_listener();
-        let conf = format!(
+    /// The endpoint has to be genuinely dead — claimed, so no parallel
+    /// server can take it, and unbound, so the dial is refused outright.
+    /// A held-but-unlistening socket would move the failure to the
+    /// WebSocket upgrade timeout, which is a different code path from the
+    /// one these events describe.
+    fn dead_endpoint_conf(dead: &ReservedPort) -> String {
+        let dead_port = dead.port();
+        format!(
             "ws::addr=127.0.0.1:{dead_port};lazy_connect=true;auth_timeout=2000;\
              reconnect_max_duration_millis=200;connect_timeout=100;"
-        );
-        let builder = SenderBuilder::from_conf(&conf)
+        )
+    }
+
+    #[test]
+    fn sender_unreachable_fires_attempt_failed_and_unreachable() {
+        let dead = ReservedPort::reserve();
+        let (seen, listener) = collecting_listener();
+        // Deliberately the fluent form, with no binding to keep the builder
+        // alive: `build()` delivers the failure events before it returns, so
+        // the temporary's drop cannot discard them. See
+        // `failed_build_delivers_events_to_a_dropped_builder` for the same
+        // property stated without relying on statement-temporary lifetimes.
+        let err = SenderBuilder::from_conf(dead_endpoint_conf(&dead))
             .unwrap()
             .connection_listener(listener, 0)
-            .unwrap();
-        // Keep the builder alive until the dispatcher delivers both events.
-        // Chaining build() from a temporary drops the last event-source handle
-        // as soon as build() returns and may discard pending callbacks.
-        let err = builder.build().expect_err("no server listening");
+            .unwrap()
+            .build()
+            .expect_err("no server listening");
         assert_eq!(err.code(), ErrorCode::SocketError);
         let attempt = wait_for_kind(&seen, ConnectionEventKind::EndpointAttemptFailed);
         assert!(attempt.attempt_number.is_some());
         assert!(attempt.cause_code.is_some());
         wait_for_kind(&seen, ConnectionEventKind::AllEndpointsUnreachable);
+    }
+
+    /// The regression the barrier exists for: once `build()` has failed,
+    /// the builder holds the last handle to the event source, and dropping
+    /// a dispatcher discards its backlog. Only the first event survives
+    /// that drop — `EventDispatcher::drop` joins the one in-flight listener
+    /// invocation and throws the rest away.
+    ///
+    /// The listener is gated shut for longer than the connect walk takes, so
+    /// every event is still queued when `build()` reaches its return. Without
+    /// the barrier the walk's terminal `AllEndpointsUnreachable` is one of
+    /// the discarded ones; with it, `build()` does not return until the
+    /// listener has them all.
+    #[test]
+    fn failed_build_delivers_events_to_a_dropped_builder() {
+        let dead = ReservedPort::reserve();
+        let gate = Arc::new((StdMutex::new(false), std::sync::Condvar::new()));
+        let gate_in_listener = Arc::clone(&gate);
+        let seen: Arc<StdMutex<Vec<ConnectionEvent>>> = Arc::new(StdMutex::new(Vec::new()));
+        let seen_in_listener = Arc::clone(&seen);
+        let listener: crate::ingress::ConnectionListener =
+            Arc::new(move |event: &ConnectionEvent| {
+                let (open, opened) = &*gate_in_listener;
+                let mut open = open.lock().unwrap();
+                while !*open {
+                    open = opened.wait(open).unwrap();
+                }
+                drop(open);
+                seen_in_listener.lock().unwrap().push(event.clone());
+            });
+        let builder = SenderBuilder::from_conf(dead_endpoint_conf(&dead))
+            .unwrap()
+            .connection_listener(listener, 0)
+            .unwrap();
+        let gate_in_opener = Arc::clone(&gate);
+        let opener = thread::spawn(move || {
+            // Comfortably past the walk's `reconnect_max_duration_millis`,
+            // so the gate is still shut when `build()` returns.
+            thread::sleep(Duration::from_millis(500));
+            let (open, opened) = &*gate_in_opener;
+            *open.lock().unwrap() = true;
+            opened.notify_all();
+        });
+        let err = builder.build().expect_err("no server listening");
+        drop(builder);
+        opener.join().unwrap();
+        assert_eq!(err.code(), ErrorCode::SocketError);
+        let kinds: Vec<_> = seen.lock().unwrap().iter().map(|e| e.kind).collect();
+        assert!(
+            kinds.contains(&ConnectionEventKind::EndpointAttemptFailed),
+            "failed build must deliver EndpointAttemptFailed before returning: {kinds:?}"
+        );
+        assert!(
+            kinds.contains(&ConnectionEventKind::AllEndpointsUnreachable),
+            "failed build must deliver AllEndpointsUnreachable before returning: {kinds:?}"
+        );
     }
 
     #[test]
