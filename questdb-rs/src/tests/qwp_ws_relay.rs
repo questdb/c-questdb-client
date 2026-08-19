@@ -22,17 +22,25 @@
  *
  ******************************************************************************/
 
+use std::io::Read;
 use std::net::TcpListener;
+use std::sync::mpsc;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::ErrorCode;
 use crate::ingress::sender::delta_encoded_frame_fixture;
 use crate::ingress::{
-    AckLevel, Buffer, Protocol, QwpWsProgress, Sender, SenderBuilder, TimestampNanos,
+    AckLevel, Buffer, Protocol, QwpWsErrorCategory, QwpWsErrorPolicy, QwpWsProgress, Sender,
+    SenderBuilder, TimestampNanos,
 };
 
-use super::qwp_ws::{perform_server_upgrade, read_frame, write_qwp_ok_response};
+use super::qwp_ws::{
+    perform_server_upgrade, read_frame, write_qwp_error_response, write_qwp_ok_response,
+};
+
+const FIRST_WIRE_SEQUENCE: u64 = 0;
+const QWP_STATUS_PARSE_ERROR: u8 = 0x05;
 
 fn self_contained_frame(symbol: &str, seq: i64) -> Vec<u8> {
     let mut buffer = Buffer::new_qwp_ws();
@@ -250,4 +258,74 @@ fn a_qwp_websocket_sender_cannot_mix_row_and_relay_modes() {
     let err = row_first.flush_encoded(&encoded).unwrap_err();
     assert_eq!(err.code(), ErrorCode::InvalidApiCall);
     assert!(err.msg().contains("row"), "got {err:?}");
+}
+
+/// Accepts one connection, rejects its first frame with a terminal parse error,
+/// then holds the socket open so the client observes the rejection rather than a
+/// torn connection.
+fn spawn_rejecting_server() -> (u16, thread::JoinHandle<()>) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let handle = thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        perform_server_upgrade(&mut stream).unwrap();
+        read_frame(&mut stream).unwrap();
+        write_qwp_error_response(
+            &mut stream,
+            QWP_STATUS_PARSE_ERROR,
+            FIRST_WIRE_SEQUENCE,
+            b"bad column",
+        )
+        .unwrap();
+        let mut sink = [0u8; 256];
+        while matches!(stream.read(&mut sink), Ok(n) if n > 0) {}
+    });
+    (port, handle)
+}
+
+/// A relay-only caller has no reason to call `wait`, `drive_once`, or
+/// `close_drain`, so a rejected `flush_encoded` is its only delivery point for
+/// the registered error handler. Returning the terminal error without draining
+/// the notification inbox first must fail this test.
+#[test]
+fn a_rejected_relay_flush_still_notifies_the_error_handler() {
+    let (port, _server) = spawn_rejecting_server();
+    let (error_tx, error_rx) = mpsc::channel();
+    let mut sender = SenderBuilder::new(Protocol::Ws, "127.0.0.1", port)
+        .qwp_ws_error_handler(move |error| {
+            let _ = error_tx.send(error.clone());
+        })
+        .unwrap()
+        .build()
+        .unwrap();
+
+    sender
+        .flush_encoded(&self_contained_frame("alpha", 1))
+        .unwrap();
+
+    // Bounded pump instead of a sleep: the runner thread applies the rejection
+    // in the background. `qwp_ws_terminal_error` probes the diagnostic without
+    // consuming it, so the handler assertion below stays intact.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while sender.qwp_ws_terminal_error().unwrap().is_none() {
+        assert!(
+            Instant::now() < deadline,
+            "the server rejection was not applied within 5s"
+        );
+        thread::sleep(Duration::from_millis(1));
+    }
+
+    let err = sender
+        .flush_encoded(&self_contained_frame("beta", 2))
+        .unwrap_err();
+    assert_eq!(err.code(), ErrorCode::ServerRejection, "got {err:?}");
+
+    let notified = error_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("a rejected relay flush must hand the diagnostic to the error handler");
+    assert_eq!(notified.category, QwpWsErrorCategory::ParseError);
+    assert_eq!(notified.applied_policy, QwpWsErrorPolicy::Terminal);
 }

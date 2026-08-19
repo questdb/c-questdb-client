@@ -699,9 +699,22 @@ impl Sender {
             ));
         }
 
+        // Drain before returning the check error too: a relay-only caller never
+        // reaches `wait`/`drive_once`/`close_drain`, so this is the sole point
+        // at which its error handler can be notified.
         match &self.handler {
-            SyncProtocolHandler::SyncQwpWs(state) => qwp_ws_check_error_background(state)?,
-            SyncProtocolHandler::ManualQwpWs(state) => qwp_ws_check_error_manual(state)?,
+            SyncProtocolHandler::SyncQwpWs(state) => {
+                if let Err(err) = qwp_ws_check_error_background(state) {
+                    let _ = self.drain_qwp_ws_error_notifications();
+                    return Err(err);
+                }
+            }
+            SyncProtocolHandler::ManualQwpWs(state) => {
+                if let Err(err) = qwp_ws_check_error_manual(state) {
+                    let _ = self.drain_qwp_ws_error_notifications();
+                    return Err(err);
+                }
+            }
             _ => unreachable!("QWP/WebSocket handler was checked above"),
         }
         self.drain_qwp_ws_error_notifications()?;
