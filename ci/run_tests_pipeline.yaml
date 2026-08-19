@@ -45,6 +45,16 @@ stages:
               aptPackages:
                 - cmake
               pipNumpy: true
+              # The beta and nightly legs install their own toolchain in
+              # compile.yaml; bootstrapping stable first would download a
+              # toolchain they never compile with.
+              rustToolchain: none
+          # The one leg that pins no toolchain: compile.yaml's
+          # `rustup default $(toolchain)` step is conditional on a non-empty
+          # value, so this leg would otherwise reach cargo with none installed.
+          - script: rustup default stable
+            condition: eq(variables['toolchain'], '')
+            displayName: "Install stable for the unpinned leg"
           - template: templates/compile.yaml
             parameters:
               cxx20Variants: true
@@ -184,6 +194,9 @@ stages:
           - template: templates/incus_prepare.yaml
             parameters:
               isAptInstallEnabled: false
+              # Every cargo invocation below is `+1.91.1`; a bootstrap
+              # stable would be downloaded and never used.
+              rustToolchain: none
           - script: rustup toolchain install 1.91.1 --profile minimal
             displayName: "Install Rust 1.91.1"
           - script: |

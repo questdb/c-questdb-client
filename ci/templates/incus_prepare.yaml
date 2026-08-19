@@ -35,6 +35,13 @@ parameters:
   - name: pipNumpy
     type: boolean
     default: false
+  # Toolchain rustup-init installs as the default. Jobs that immediately
+  # install their own (the MSRV job's 1.91.1) pass `none` so the container
+  # does not download a stable it never compiles with; everything else wants
+  # a working `cargo` straight out of this template.
+  - name: rustToolchain
+    type: string
+    default: stable
 
 steps:
   - ${{ if parameters.isAptInstallEnabled }}:
@@ -80,21 +87,49 @@ steps:
     displayName: "incus: resolve JDKs"
 
   - bash: |
-      set -eux
+      set -euxo pipefail
       # The image installs rustup as root in /root/.cargo, which the agent
       # user can neither read nor extend — so `rustup install beta/nightly`
       # (needed by the RunOnLinux toolchain matrix) would fail against it.
       # Always provision a user-writable rustup in the default $HOME/.cargo +
       # $HOME/.rustup locations instead. The container is ephemeral (one job,
-      # then reaped), so $HOME/.cargo starts empty and rustup-init runs every
+      # then reaped), so $HOME/.rustup starts empty and rustup-init runs every
       # job; the guard below is just defensive. Subsequent steps get
       # cargo/rustup via prependpath.
-      if ! [ -x "$HOME/.cargo/bin/cargo" ]; then
-        curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
-          | sh -s -- -y --default-toolchain stable --profile minimal --no-modify-path
+      #
+      # The fetch is downloaded to a file rather than piped into `sh`:
+      # `curl | sh` reports `sh`'s exit status, so a transfer that dies
+      # mid-stream feeds a truncated installer to a shell that can still
+      # exit 0. Downloading first makes curl's own failure the job's
+      # failure, and the retries and timeouts keep a stalled connection
+      # from burning the enclosing 10-90 minute job timeout. This template
+      # runs on every Linux job in both pipelines, so an unbounded fetch
+      # here is thirteen jobs' worth of exposure.
+      if ! [ -x "$HOME/.cargo/bin/rustup" ]; then
+        init="$HOME/rustup-init.sh"
+        for attempt in 1 2 3; do
+          if curl --proto '=https' --tlsv1.2 -sSf \
+                  --retry 3 --retry-delay 5 --retry-connrefused \
+                  --connect-timeout 15 --max-time 300 \
+                  https://sh.rustup.rs -o "$init"; then
+            break
+          fi
+          if [ "$attempt" = 3 ]; then
+            echo "rustup-init download failed after 3 attempts" >&2
+            exit 1
+          fi
+          sleep $((attempt * 5))
+        done
+        sh "$init" -y \
+          --default-toolchain '${{ parameters.rustToolchain }}' \
+          --profile minimal --no-modify-path
+        rm -f "$init"
       fi
       . "$HOME/.cargo/env"
-      cargo --version
+      # `rustup --version`, not `cargo --version`: with
+      # `--default-toolchain none` there is no toolchain for cargo to
+      # proxy to yet, and the job's own install step provides it.
+      rustup --version
       # See the JAVA_HOME comment above re: `set -x` + `##vso[...]`.
       set +x
       echo "##vso[task.prependpath]$HOME/.cargo/bin"
