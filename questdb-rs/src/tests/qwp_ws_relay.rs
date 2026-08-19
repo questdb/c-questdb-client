@@ -186,6 +186,16 @@ fn flush_encoded_rejects_persistent_store_before_mode_claim_or_io() {
         None,
         "a locally rejected relay frame must not enter the persistent queue"
     );
+
+    // The other half of the contract: claiming relay mode before the persistent
+    // check would leave the sender permanently unable to flush typed rows.
+    let mut row = sender.new_buffer();
+    row.table("readings")
+        .unwrap()
+        .column_i64("_seq", 2)
+        .unwrap();
+    row.at(TimestampNanos::new(2)).unwrap();
+    sender.flush(&mut row).unwrap();
 }
 
 fn spawn_two_frame_server() -> (u16, thread::JoinHandle<Vec<Vec<u8>>>) {
