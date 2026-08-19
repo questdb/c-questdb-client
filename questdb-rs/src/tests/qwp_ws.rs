@@ -43,6 +43,7 @@ use crate::ingress::{
     Buffer, ColumnName, Protocol, QwpWsEncodeScratch, QwpWsErrorCategory, QwpWsErrorPolicy,
     QwpWsProgress, SenderBuilder, SymbolGlobalDict, TableName, TimestampNanos,
 };
+use crate::tests::net::ReservedPort;
 // `ProtocolVersion` is only referenced by the HTTP-gated sibling-sender checks
 // below, so gate the import to avoid an unused-import warning when the
 // qwp-ws sender is built without `sync-sender-http` (e.g. run_all_tests.py).
@@ -3760,10 +3761,9 @@ fn qwp_ws_manual_orphan_drainer_walks_endpoint_list() {
     let sf_dir = tempfile::TempDir::new().unwrap();
     seed_orphan_slot(sf_dir.path());
 
-    let bad_listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    let bad_port = bad_listener.local_addr().unwrap().port();
+    let bad_endpoint = ReservedPort::reserve();
+    let bad_port = bad_endpoint.port();
     let (port, rx) = spawn_manual_orphan_drain_server();
-    drop(bad_listener);
     let drain_conf = format!(
         "ws::addr=127.0.0.1:{bad_port},127.0.0.1:{port};qwp_ws_progress=manual;\
          sf_dir={};sender_id=primary;drain_orphans=on;\
@@ -6060,12 +6060,11 @@ fn qwp_ws_sync_initial_connect_retry_survives_dropped_upgrade() {
 
 #[test]
 fn qwp_ws_initial_connect_walks_endpoint_list_in_off_mode() {
-    let bad_listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    let bad_port = bad_listener.local_addr().unwrap().port();
+    let bad_endpoint = ReservedPort::reserve();
+    let bad_port = bad_endpoint.port();
 
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let good_port = listener.local_addr().unwrap().port();
-    drop(bad_listener);
     let (payload_tx, payload_rx) = mpsc::channel();
 
     thread::spawn(move || {
@@ -6693,9 +6692,8 @@ fn qwp_ws_sync_initial_retry_version_error_does_not_mask_transient_endpoint_fail
 
 #[test]
 fn qwp_ws_sync_initial_retry_budget_exhaustion_reports_context() {
-    let probe = TcpListener::bind("127.0.0.1:0").unwrap();
-    let port = probe.local_addr().unwrap().port();
-    drop(probe);
+    let dead_endpoint = ReservedPort::reserve();
+    let port = dead_endpoint.port();
 
     let conf = format!(
         "ws::addr=127.0.0.1:{port};\
