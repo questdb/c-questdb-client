@@ -35,7 +35,7 @@
 //! HTTP→WebSocket upgrade, then either parks on the connection or reads each
 //! QWP frame and replies with an OK ack (status 0x00).
 
-use crate::tests::net::ReservedPort;
+use crate::tests::net::{ReservedPort, bind_test_listener};
 use std::collections::BTreeSet;
 use std::fs;
 use std::io::{Read, Write};
@@ -185,9 +185,9 @@ impl MockServer {
 
     /// Bring a server up on an already-reserved port after `delay`.
     ///
-    /// The reservation is handed over rather than released and re-bound, so
-    /// the port refuses connections for `delay` and then starts accepting,
-    /// with no window in between for another test to claim it.
+    /// The claim is handed over and held for the server's lifetime, so the
+    /// port refuses connections for `delay` and then starts accepting, with
+    /// no window in between where another test could be given it.
     #[cfg(feature = "polars-ingress")]
     fn spawn_acking_on_reserved_port_after_delay(
         reserved: ReservedPort,
@@ -204,7 +204,8 @@ impl MockServer {
             .name("qwp-ingress-pool-delayed-mock-server".to_string())
             .spawn(move || {
                 thread::sleep(delay);
-                let listener = reserved.listen();
+                let listener =
+                    TcpListener::bind(("127.0.0.1", reserved.port())).expect("bind delayed port");
                 listener
                     .set_nonblocking(true)
                     .expect("set_nonblocking on delayed listener");
@@ -232,7 +233,7 @@ impl MockServer {
         mode: MockMode,
         capture: Option<mpsc::Sender<Vec<u8>>>,
     ) -> Self {
-        let listener = TcpListener::bind("127.0.0.1:0").expect("bind 127.0.0.1");
+        let listener = bind_test_listener();
         listener
             .set_nonblocking(true)
             .expect("set_nonblocking on listener");
@@ -1643,7 +1644,7 @@ fn failed_eager_borrow_on_disk_slot_releases_flock_and_keeps_data() {
     // Retain a test-owned listener so no parallel server can claim the port.
     // Deliberately do not accept: TCP may connect, but the WebSocket upgrade
     // cannot complete before the configured timeout.
-    let dead_listener = TcpListener::bind("127.0.0.1:0").expect("bind dead endpoint");
+    let dead_listener = bind_test_listener();
     let dead_port = dead_listener
         .local_addr()
         .expect("dead endpoint local addr")
@@ -5789,7 +5790,7 @@ fn refuses_durable_ack_without_opt_in() {
 
 #[test]
 fn durable_ack_without_opt_in_does_not_publish_commit_frame() {
-    let listener = TcpListener::bind("127.0.0.1:0").expect("bind 127.0.0.1");
+    let listener = bind_test_listener();
     let port = listener.local_addr().expect("local_addr").port();
     let (tx, rx) = mpsc::channel();
 
@@ -5946,7 +5947,7 @@ fn flush_and_wait_durable_without_opt_in_leaves_chunk_untouched() {
     // Mirror `durable_ack_without_opt_in_does_not_publish_commit_frame` but for
     // the ACKing flush of a *data* chunk: the durable opt-in is a preflight, so
     // no frame is published and the chunk is retained.
-    let listener = TcpListener::bind("127.0.0.1:0").expect("bind 127.0.0.1");
+    let listener = bind_test_listener();
     let port = listener.local_addr().expect("local_addr").port();
     let (tx, rx) = mpsc::channel();
 
@@ -7562,7 +7563,7 @@ fn flush_arrow_batch_at_column_commits_in_one_call() {
 /// borrow (which ignores the unsolicited `SERVER_INFO` while parked).
 #[cfg(feature = "sync-reader-qwp-ws")]
 mod reader_pool {
-    use std::net::TcpListener;
+    use crate::tests::net::bind_test_listener;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::thread;
@@ -7585,7 +7586,7 @@ mod reader_pool {
 
     impl ReaderMockServer {
         fn spawn(max_accepts: usize) -> Self {
-            let listener = TcpListener::bind("127.0.0.1:0").expect("bind 127.0.0.1");
+            let listener = bind_test_listener();
             listener
                 .set_nonblocking(true)
                 .expect("set_nonblocking on listener");
@@ -8171,7 +8172,7 @@ mod conn_event_tests {
     fn unreachable_endpoint_fires_attempt_failed_and_unreachable() {
         // Bind a port and close the listener so connects are refused.
         let port = {
-            let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+            let listener = bind_test_listener();
             listener.local_addr().unwrap().port()
         };
         let conf = format!(
@@ -8637,7 +8638,7 @@ mod sender_conn_event_tests {
         // Retain a test-owned listener so no parallel server can claim the port.
         // Deliberately do not accept: TCP may connect, but the WebSocket upgrade
         // cannot complete before the configured timeout.
-        let dead_listener = TcpListener::bind("127.0.0.1:0").expect("bind dead endpoint");
+        let dead_listener = bind_test_listener();
         let dead_port = dead_listener
             .local_addr()
             .expect("dead endpoint local addr")

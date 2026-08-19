@@ -1272,8 +1272,8 @@ mod tests {
 
     fn dummy_ws_stream() -> WsStream {
         use crate::ws::nosigpipe::NoSigpipeTcp;
-        use std::net::{TcpListener, TcpStream};
-        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        use std::net::TcpStream;
+        let listener = crate::tests::net::bind_test_listener();
         let addr = listener.local_addr().expect("local_addr");
         let client = TcpStream::connect(addr).expect("connect");
         // Keep the accepted peer alive only long enough to complete the
@@ -1352,13 +1352,13 @@ mod tests {
     #[test]
     fn sync_all_acks_fails_fast_on_non_advancing_peer() {
         use crate::ws::nosigpipe::NoSigpipeTcp;
-        use std::net::{TcpListener, TcpStream};
+        use std::net::TcpStream;
         use std::sync::Arc;
         use std::sync::atomic::{AtomicBool, Ordering};
         use std::sync::mpsc;
         use std::thread;
 
-        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let listener = crate::tests::net::bind_test_listener();
         let addr = listener.local_addr().expect("addr");
         let client = TcpStream::connect(addr).expect("connect");
         let (server, _) = listener.accept().expect("accept");
