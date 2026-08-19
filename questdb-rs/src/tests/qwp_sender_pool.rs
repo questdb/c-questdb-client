@@ -1641,14 +1641,11 @@ fn failed_eager_borrow_on_disk_slot_releases_flock_and_keeps_data() {
     // rather than colliding on "slot in use") and leave the segments
     // recoverable by a later pool.
     let dir = TempDir::new().unwrap();
-    // Retain a test-owned listener so no parallel server can claim the port.
-    // Deliberately do not accept: TCP may connect, but the WebSocket upgrade
-    // cannot complete before the configured timeout.
-    let dead_listener = bind_test_listener();
-    let dead_port = dead_listener
-        .local_addr()
-        .expect("dead endpoint local addr")
-        .port();
+    // A claimed-but-unbound port: connecting is refused outright, so the
+    // eager connect below fails on the dial rather than idling until the
+    // WebSocket upgrade times out.
+    let dead = ReservedPort::reserve();
+    let dead_port = dead.port();
     let offline = format!(
         "ws::addr=127.0.0.1:{dead_port};lazy_connect=true;auth_timeout=200;\
          sf_dir={};sender_id=flockrec;sender_pool_min=1;sender_pool_max=1;\

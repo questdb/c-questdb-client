@@ -4581,9 +4581,7 @@ mod tests {
 
     #[test]
     fn traffic_gate_shutdown_is_sticky_across_socket_registration() {
-        use std::net::{Ipv4Addr, TcpListener};
-
-        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let listener = crate::tests::net::bind_test_listener();
         let client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
         let (mut peer, _) = listener.accept().unwrap();
         peer.set_read_timeout(Some(Duration::from_secs(1))).unwrap();
@@ -4595,7 +4593,7 @@ mod tests {
         let mut byte = [0u8; 1];
         assert_eq!(peer.read(&mut byte).unwrap(), 0);
 
-        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let listener = crate::tests::net::bind_test_listener();
         let client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
         let (mut peer, _) = listener.accept().unwrap();
         peer.set_read_timeout(Some(Duration::from_secs(1))).unwrap();
@@ -4652,9 +4650,7 @@ mod tests {
 
     #[test]
     fn failed_upgrade_clears_traffic_gate_before_original_socket_closes() {
-        use std::net::{Ipv4Addr, TcpListener};
-
-        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let listener = crate::tests::net::bind_test_listener();
         let port = listener.local_addr().unwrap().port();
         let server = std::thread::spawn(move || {
             let (mut peer, _) = listener.accept().unwrap();
@@ -4685,9 +4681,7 @@ mod tests {
 
     #[test]
     fn failed_tls_upgrade_clears_traffic_gate_before_original_socket_closes() {
-        use std::net::{Ipv4Addr, TcpListener};
-
-        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let listener = crate::tests::net::bind_test_listener();
         let port = listener.local_addr().unwrap().port();
         let server_config = test_tls_server_config();
         let server = std::thread::spawn(move || {
@@ -4726,9 +4720,9 @@ mod tests {
 
     #[test]
     fn connect_tcp_to_any_addr_falls_back_after_refused_ipv6() {
-        use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6, TcpListener};
+        use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
 
-        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let listener = crate::tests::net::bind_test_listener();
         let port = listener.local_addr().unwrap().port();
         let accepted = std::thread::spawn(move || listener.accept().unwrap());
         let bad_v6 = SocketAddr::V6(SocketAddrV6::new(Ipv6Addr::LOCALHOST, port, 0, 0));
@@ -4813,9 +4807,7 @@ mod tests {
 
     #[test]
     fn connect_tcp_sets_post_connect_io_timeout() {
-        use std::net::{Ipv4Addr, TcpListener};
-
-        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let listener = crate::tests::net::bind_test_listener();
         let port = listener.local_addr().unwrap().port();
         let accepted = std::thread::spawn(move || listener.accept().unwrap());
         let io_timeout = Duration::from_millis(250);

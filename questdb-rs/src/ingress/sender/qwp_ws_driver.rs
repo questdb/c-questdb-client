@@ -4867,8 +4867,6 @@ mod tests {
     #[cfg(feature = "sync-sender-qwp-ws")]
     use std::io::{Read, Write};
     #[cfg(feature = "sync-sender-qwp-ws")]
-    use std::net::TcpListener;
-    #[cfg(feature = "sync-sender-qwp-ws")]
     use std::sync::mpsc;
     #[cfg(feature = "sync-sender-qwp-ws")]
     use std::thread;
@@ -5597,7 +5595,7 @@ mod tests {
         frames: usize,
     ) -> (String, u16, mpsc::Receiver<Vec<u8>>) {
         let host = if use_tls { "localhost" } else { "127.0.0.1" };
-        let listener = TcpListener::bind((host, 0)).unwrap();
+        let listener = crate::tests::net::bind_test_listener_at(host);
         let port = listener.local_addr().unwrap().port();
         let (payload_tx, payload_rx) = mpsc::channel();
         thread::spawn(move || {
@@ -5758,7 +5756,7 @@ mod tests {
     #[cfg(feature = "sync-sender-qwp-ws")]
     #[test]
     fn blocking_transport_emits_durable_keepalive_ping() {
-        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let listener = crate::tests::net::bind_test_listener();
         let port = listener.local_addr().unwrap().port();
         let server = thread::spawn(move || {
             let (mut stream, _) = listener.accept().unwrap();
@@ -5781,7 +5779,7 @@ mod tests {
     #[cfg(feature = "sync-sender-qwp-ws")]
     #[test]
     fn blocking_transport_reconnect_registers_replacement_with_traffic_gate() {
-        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let listener = crate::tests::net::bind_test_listener();
         let port = listener.local_addr().unwrap().port();
         let server = thread::spawn(move || {
             let mut streams = Vec::new();

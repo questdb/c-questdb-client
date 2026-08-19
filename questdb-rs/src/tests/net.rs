@@ -96,9 +96,16 @@ impl Drop for ReservedPort {
 /// Every test server in this crate goes through here; that is what makes a
 /// [`ReservedPort`] claim mean anything.
 pub(crate) fn bind_test_listener() -> TcpListener {
+    bind_test_listener_at("127.0.0.1")
+}
+
+/// [`bind_test_listener`] against a specific loopback name. Only the TLS
+/// tests need this: their certificates are issued for `localhost`, so the
+/// server has to answer on whatever that name resolves to.
+pub(crate) fn bind_test_listener_at(host: &str) -> TcpListener {
     let mut rejected = Vec::new();
     for _ in 0..MAX_DRAWS {
-        let listener = TcpListener::bind("127.0.0.1:0").expect("bind test listener");
+        let listener = TcpListener::bind((host, 0)).expect("bind test listener");
         let port = listener
             .local_addr()
             .expect("test listener local addr")
