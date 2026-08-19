@@ -2581,7 +2581,43 @@ impl SenderBuilder {
     /// returns once the connection is fully established. If the connection
     /// requires authentication or TLS, these will also be completed before
     /// returning.
+    ///
+    /// A QWP/WebSocket build that fails after reporting connection events to
+    /// a [`Self::connection_listener`] delivers those events before it
+    /// returns, so the listener sees them regardless of what the caller does
+    /// with the builder afterwards.
     pub fn build(&self) -> Result<Sender> {
+        let result = self.build_inner();
+        // A failed build leaves this builder holding the only handle to the
+        // event source: no `Sender` was returned to take it over, and
+        // dropping a dispatcher discards whatever it has not delivered yet.
+        // Without this barrier, `SenderBuilder::from_conf(..)
+        // .connection_listener(..).build()` races its own temporary's drop
+        // against the dispatcher thread and usually loses — the natural
+        // fluent form would silently be the one form that drops the events
+        // explaining the failure.
+        #[cfg(feature = "_sender-qwp-ws")]
+        if result.is_err()
+            && let Some(events) = self
+                .qwp_ws
+                .as_ref()
+                .and_then(|qwp_ws| qwp_ws.conn_events.as_ref())
+            && !events.drain(conn_events::FAILED_CONSTRUCTION_DRAIN_TIMEOUT)
+        {
+            log::warn!(
+                "connection listener did not consume the failed build's \
+                 events within {:?}; they are discarded",
+                conn_events::FAILED_CONSTRUCTION_DRAIN_TIMEOUT
+            );
+        }
+        result
+    }
+
+    #[cfg(feature = "_sync-sender")]
+    /// The build proper. Wrapped by [`Self::build`], which owns the
+    /// failure-path event barrier; every early return here is one the
+    /// listener still has to hear about.
+    fn build_inner(&self) -> Result<Sender> {
         // Fail fast on misconfigured buffer sizes before opening any sockets.
         // Only enforce the init-vs-max relationship when the user explicitly
         // set init_buf_size; a defaulted init_buf_size silently clamps to

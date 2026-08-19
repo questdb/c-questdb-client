@@ -8589,18 +8589,26 @@ mod sender_conn_event_tests {
         drop(sender);
     }
 
+    /// Keep a test-owned listener bound without accepting. This makes the
+    /// endpoint deterministic while forcing the WebSocket upgrade to time out.
+    fn failed_endpoint_conf(endpoint: &TcpListener) -> String {
+        let port = endpoint.local_addr().unwrap().port();
+        format!(
+            "ws::addr=127.0.0.1:{port};lazy_connect=true;auth_timeout=200;\
+             reconnect_max_duration_millis=200;connect_timeout=100;"
+        )
+    }
+
     #[test]
     fn sender_unreachable_fires_attempt_failed_and_unreachable() {
-        let port = {
-            let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
-            listener.local_addr().unwrap().port()
-        };
+        let endpoint = TcpListener::bind("127.0.0.1:0").expect("bind failed endpoint");
         let (seen, listener) = collecting_listener();
-        let conf = format!(
-            "ws::addr=127.0.0.1:{port};lazy_connect=true;auth_timeout=2000;\
-             reconnect_max_duration_millis=200;connect_timeout=100;"
-        );
-        let err = SenderBuilder::from_conf(conf)
+        // Deliberately the fluent form, with no binding to keep the builder
+        // alive: `build()` delivers the failure events before it returns, so
+        // the temporary's drop cannot discard them. See
+        // `failed_build_delivers_events_to_a_dropped_builder` for the same
+        // property stated without relying on statement-temporary lifetimes.
+        let err = SenderBuilder::from_conf(failed_endpoint_conf(&endpoint))
             .unwrap()
             .connection_listener(listener, 0)
             .unwrap()
@@ -8611,6 +8619,62 @@ mod sender_conn_event_tests {
         assert!(attempt.attempt_number.is_some());
         assert!(attempt.cause_code.is_some());
         wait_for_kind(&seen, ConnectionEventKind::AllEndpointsUnreachable);
+    }
+
+    /// The regression the barrier exists for: once `build()` has failed,
+    /// the builder holds the last handle to the event source, and dropping
+    /// a dispatcher discards its backlog. Only the first event survives
+    /// that drop — `EventDispatcher::drop` joins the one in-flight listener
+    /// invocation and throws the rest away.
+    ///
+    /// The listener is gated shut for longer than the connect walk takes, so
+    /// every event is still queued when `build()` reaches its return. Without
+    /// the barrier the walk's terminal `AllEndpointsUnreachable` is one of
+    /// the discarded ones; with it, `build()` does not return until the
+    /// listener has them all.
+    #[test]
+    fn failed_build_delivers_events_to_a_dropped_builder() {
+        let endpoint = TcpListener::bind("127.0.0.1:0").expect("bind failed endpoint");
+        let gate = Arc::new((StdMutex::new(false), std::sync::Condvar::new()));
+        let gate_in_listener = Arc::clone(&gate);
+        let seen: Arc<StdMutex<Vec<ConnectionEvent>>> = Arc::new(StdMutex::new(Vec::new()));
+        let seen_in_listener = Arc::clone(&seen);
+        let listener: crate::ingress::ConnectionListener =
+            Arc::new(move |event: &ConnectionEvent| {
+                let (open, opened) = &*gate_in_listener;
+                let mut open = open.lock().unwrap();
+                while !*open {
+                    open = opened.wait(open).unwrap();
+                }
+                drop(open);
+                seen_in_listener.lock().unwrap().push(event.clone());
+            });
+        let builder = SenderBuilder::from_conf(failed_endpoint_conf(&endpoint))
+            .unwrap()
+            .connection_listener(listener, 0)
+            .unwrap();
+        let gate_in_opener = Arc::clone(&gate);
+        let opener = thread::spawn(move || {
+            // Comfortably past the walk's `reconnect_max_duration_millis`,
+            // so the gate is still shut when `build()` returns.
+            thread::sleep(Duration::from_millis(500));
+            let (open, opened) = &*gate_in_opener;
+            *open.lock().unwrap() = true;
+            opened.notify_all();
+        });
+        let err = builder.build().expect_err("no server listening");
+        drop(builder);
+        opener.join().unwrap();
+        assert_eq!(err.code(), ErrorCode::SocketError);
+        let kinds: Vec<_> = seen.lock().unwrap().iter().map(|e| e.kind).collect();
+        assert!(
+            kinds.contains(&ConnectionEventKind::EndpointAttemptFailed),
+            "failed build must deliver EndpointAttemptFailed before returning: {kinds:?}"
+        );
+        assert!(
+            kinds.contains(&ConnectionEventKind::AllEndpointsUnreachable),
+            "failed build must deliver AllEndpointsUnreachable before returning: {kinds:?}"
+        );
     }
 
     #[test]

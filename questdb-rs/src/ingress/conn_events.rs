@@ -17,10 +17,21 @@ use std::collections::VecDeque;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 /// Default bounded-inbox capacity, matching the Java dispatcher.
 pub const DEFAULT_CONNECTION_EVENT_INBOX_CAPACITY: usize = 64;
+
+/// How long a failed construction waits for the failure events it queued to
+/// reach the listener before abandoning them.
+///
+/// A failed `SenderBuilder::build` or `QuestDb::connect` drops the event
+/// source it created, and dropping a dispatcher discards the backlog by
+/// design — so without a barrier the caller loses exactly the events that
+/// explain the failure. The bound is what keeps the barrier from turning a
+/// slow listener into a hung constructor: it is generous next to any
+/// reasonable listener and small next to any connect timeout.
+pub(crate) const FAILED_CONSTRUCTION_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// The set of connection-state transitions that fire as discrete events.
 #[derive(Debug, Copy, Clone, PartialEq, Eq, Hash)]
@@ -125,10 +136,18 @@ pub type ConnectionListener = Arc<dyn Fn(&ConnectionEvent) + Send + Sync>;
 struct DispatcherInner<T> {
     inbox: Mutex<VecDeque<T>>,
     available: Condvar,
+    /// Signalled whenever `delivered + dropped` advances, i.e. whenever one
+    /// more offered event has reached its final state. Waited on by
+    /// [`DispatcherInner::drain`].
+    settled: Condvar,
     capacity: usize,
     listener: Arc<dyn Fn(&T) + Send + Sync>,
     name: &'static str,
     closed: AtomicBool,
+    /// Total `offer` calls. Every one of them ends up counted exactly once
+    /// in `delivered` or `dropped`, which is what lets `drain` know when a
+    /// given point in the stream has been fully accounted for.
+    queued: AtomicU64,
     dropped: AtomicU64,
     delivered: AtomicU64,
     /// Set by the worker as it enters `dispatch_loop`, so a test can tell
@@ -176,6 +195,41 @@ impl<T> DispatcherInner<T> {
         }
         true
     }
+
+    fn settled(&self) -> u64 {
+        self.delivered.load(Ordering::Relaxed) + self.dropped.load(Ordering::Relaxed)
+    }
+
+    /// Take the inbox lock only to publish that one more event has settled.
+    /// The lock is what makes the wakeup reliable: `drain` checks the
+    /// counters and blocks while holding it, so a notification can never
+    /// slip between its check and its wait.
+    fn notify_settled(&self) {
+        let _inbox = self.lock_inbox();
+        self.settled.notify_all();
+    }
+
+    /// Block until every event offered before this call has been handed to
+    /// the listener or discarded. Returns false if `timeout` elapsed first.
+    fn drain(&self, timeout: Duration) -> bool {
+        let target = self.queued.load(Ordering::Relaxed);
+        let deadline = Instant::now() + timeout;
+        let mut inbox = self.lock_inbox();
+        while self.settled() < target {
+            let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+                return false;
+            };
+            let (guard, wait) = match self.settled.wait_timeout(inbox, remaining) {
+                Ok(result) => result,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            inbox = guard;
+            if wait.timed_out() && self.settled() < target {
+                return false;
+            }
+        }
+        true
+    }
 }
 
 /// Bounded inbox plus a dedicated dispatcher thread delivering events of
@@ -215,10 +269,12 @@ impl<T: std::fmt::Debug + Send + 'static> EventDispatcher<T> {
         let inner = Arc::new(DispatcherInner {
             inbox: Mutex::new(VecDeque::with_capacity(capacity)),
             available: Condvar::new(),
+            settled: Condvar::new(),
             capacity,
             listener,
             name,
             closed: AtomicBool::new(false),
+            queued: AtomicU64::new(0),
             dropped: AtomicU64::new(0),
             delivered: AtomicU64::new(0),
             #[cfg(test)]
@@ -242,8 +298,10 @@ impl<T: std::fmt::Debug + Send + 'static> EventDispatcher<T> {
     /// Queue one event for delivery. Non-blocking; drop-oldest on a full
     /// inbox; discarded outright after close.
     pub fn offer(&self, event: T) {
+        self.inner.queued.fetch_add(1, Ordering::Relaxed);
         if self.inner.closed.load(Ordering::Acquire) {
             self.inner.dropped.fetch_add(1, Ordering::Relaxed);
+            self.inner.notify_settled();
             return;
         }
         {
@@ -251,6 +309,7 @@ impl<T: std::fmt::Debug + Send + 'static> EventDispatcher<T> {
             if inbox.len() >= self.inner.capacity {
                 inbox.pop_front();
                 self.inner.dropped.fetch_add(1, Ordering::Relaxed);
+                self.inner.settled.notify_all();
             }
             inbox.push_back(event);
         }
@@ -276,6 +335,25 @@ impl<T: std::fmt::Debug + Send + 'static> EventDispatcher<T> {
     #[cfg(test)]
     pub(crate) fn wait_for_worker_start(&self, timeout: std::time::Duration) -> bool {
         self.thread.is_some() && self.inner.wait_for_worker_start(timeout)
+    }
+
+    /// Block until every event offered before this call has reached the
+    /// listener (or been discarded by the overflow policy). Returns false if
+    /// `timeout` elapsed first.
+    ///
+    /// This is the barrier a failed construction needs: dropping the
+    /// dispatcher discards its backlog, so without draining first the events
+    /// describing the failure die with the object that queued them.
+    #[cfg(test)]
+    fn drain(&self, timeout: Duration) -> bool {
+        self.inner.drain(timeout)
+    }
+
+    /// A handle to the shared state, so a caller can drain without holding
+    /// whatever lock guards the dispatcher itself — the listener runs on the
+    /// dispatcher thread and may call back into the owning source.
+    fn drain_handle(&self) -> Arc<DispatcherInner<T>> {
+        Arc::clone(&self.inner)
     }
 
     /// Drop the dispatcher (joining its thread, so any in-flight listener
@@ -336,6 +414,7 @@ fn dispatch_loop<T: std::fmt::Debug>(inner: Arc<DispatcherInner<T>>) {
                     if discarded > 0 {
                         inbox.clear();
                         inner.dropped.fetch_add(discarded, Ordering::Relaxed);
+                        inner.settled.notify_all();
                     }
                     break None;
                 }
@@ -356,6 +435,7 @@ fn dispatch_loop<T: std::fmt::Debug>(inner: Arc<DispatcherInner<T>>) {
             log::warn!("{} listener panicked; event: {event:?}", inner.name);
         }
         inner.delivered.fetch_add(1, Ordering::Relaxed);
+        inner.notify_settled();
     }
 }
 
@@ -429,6 +509,28 @@ impl ConnectionEventSource {
     fn offer(&self, event: ConnectionEvent) {
         if let Some(dispatcher) = self.lock_dispatcher().as_ref() {
             dispatcher.offer(event);
+        }
+    }
+
+    /// Block until every event emitted so far has reached the listener.
+    /// Returns false if `timeout` elapsed first, or when the dispatcher
+    /// thread never started; true immediately for a disabled source.
+    ///
+    /// Called on the failure path of a construction that owns the source, so
+    /// the events explaining that failure are delivered before the source is
+    /// dropped. The dispatcher handle is cloned out rather than draining
+    /// under `lock_dispatcher`: the listener runs on the dispatcher thread
+    /// and is free to call back into this source (the FFI's dropped/delivered
+    /// counters do exactly that), which would otherwise deadlock against the
+    /// very delivery being waited for.
+    pub(crate) fn drain(&self, timeout: Duration) -> bool {
+        let handle = self
+            .lock_dispatcher()
+            .as_ref()
+            .map(ConnectionEventDispatcher::drain_handle);
+        match handle {
+            Some(inner) => inner.drain(timeout),
+            None => true,
         }
     }
 
@@ -563,6 +665,68 @@ mod tests {
             ]
         );
         assert_eq!(dispatcher.dropped(), 0);
+    }
+
+    /// `drain` is a delivery barrier, not a poll: after it returns true the
+    /// listener has already seen everything offered before the call, even
+    /// with a listener slow enough that a naive `delivered()` check would
+    /// still read zero.
+    #[test]
+    fn drain_waits_for_a_slow_listener() {
+        let seen: Arc<Mutex<Vec<u64>>> = Arc::new(Mutex::new(Vec::new()));
+        let seen_in_listener = Arc::clone(&seen);
+        let dispatcher = ConnectionEventDispatcher::new(
+            Arc::new(move |event: &ConnectionEvent| {
+                std::thread::sleep(Duration::from_millis(20));
+                seen_in_listener
+                    .lock()
+                    .unwrap()
+                    .push(event.attempt_number.unwrap());
+            }),
+            8,
+        );
+        for attempt in 0..3u64 {
+            dispatcher.offer(
+                ConnectionEvent::new(ConnectionEventKind::EndpointAttemptFailed).attempt(attempt),
+            );
+        }
+        assert!(dispatcher.drain(Duration::from_secs(5)), "drain timed out");
+        assert_eq!(*seen.lock().unwrap(), vec![0, 1, 2]);
+        assert_eq!(dispatcher.delivered(), 3);
+    }
+
+    /// A listener that never returns cannot hold a caller forever: the
+    /// bounded wait gives up and says so.
+    #[test]
+    fn drain_gives_up_at_the_timeout() {
+        let gate = Arc::new(Mutex::new(()));
+        let gate_in_listener = Arc::clone(&gate);
+        let dispatcher = ConnectionEventDispatcher::new(
+            Arc::new(move |_: &ConnectionEvent| {
+                drop(gate_in_listener.lock().unwrap());
+            }),
+            8,
+        );
+        let held = gate.lock().unwrap();
+        dispatcher
+            .offer(ConnectionEvent::new(ConnectionEventKind::EndpointAttemptFailed).attempt(0));
+        assert!(!dispatcher.drain(Duration::from_millis(50)));
+        drop(held);
+        assert!(dispatcher.drain(Duration::from_secs(5)));
+    }
+
+    /// Events discarded by the overflow policy still settle: they will never
+    /// be delivered, so a barrier that waited for them would always time out.
+    #[test]
+    fn drain_counts_dropped_events_as_settled() {
+        let dispatcher = ConnectionEventDispatcher::new(Arc::new(|_: &ConnectionEvent| {}), 1);
+        for attempt in 0..64u64 {
+            dispatcher.offer(
+                ConnectionEvent::new(ConnectionEventKind::EndpointAttemptFailed).attempt(attempt),
+            );
+        }
+        assert!(dispatcher.drain(Duration::from_secs(5)), "drain timed out");
+        assert_eq!(dispatcher.delivered() + dispatcher.dropped(), 64);
     }
 
     #[test]
