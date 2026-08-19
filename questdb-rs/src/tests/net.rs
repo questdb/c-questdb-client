@@ -116,24 +116,25 @@ mod tests {
     use super::*;
     use std::io::ErrorKind;
     use std::net::{Ipv4Addr, SocketAddr, TcpStream};
-    use std::time::{Duration, Instant};
+    use std::time::Duration;
 
-    /// The property every dead-endpoint test measures against: connecting is
-    /// refused, and refused *promptly*. A reservation that held the socket
-    /// would black-hole the SYN on macOS and this would time out instead.
+    /// The property every dead-endpoint test rests on: connecting is
+    /// *refused*, not swallowed. A reservation that held the socket bound
+    /// but unlistening looks the same on Linux and Windows and is not: macOS
+    /// drops the SYN, and this fails with `TimedOut` instead.
+    ///
+    /// Only the error kind is asserted, deliberately. How fast the refusal
+    /// arrives is the platform's business — Windows retransmits the SYN
+    /// before reporting one, which takes it about two seconds — whereas a
+    /// port that has stopped refusing at all is always a defect. Hence the
+    /// generous timeout: it exists to bound a hang, not to time anything.
     #[test]
-    fn reserved_port_refuses_connections_promptly() {
+    fn reserved_port_refuses_connections() {
         let reserved = ReservedPort::reserve();
         let addr = SocketAddr::from((Ipv4Addr::LOCALHOST, reserved.port()));
-        let start = Instant::now();
-        let err = TcpStream::connect_timeout(&addr, Duration::from_secs(5))
+        let err = TcpStream::connect_timeout(&addr, Duration::from_secs(30))
             .expect_err("a reserved port must refuse connections");
         assert_eq!(err.kind(), ErrorKind::ConnectionRefused, "{err}");
-        assert!(
-            start.elapsed() < Duration::from_secs(1),
-            "refusal took {:?}",
-            start.elapsed()
-        );
     }
 
     /// The other half: while the claim stands, no test server can be handed
