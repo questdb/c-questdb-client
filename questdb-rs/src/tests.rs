@@ -25,8 +25,14 @@
 mod f64_serializer;
 
 /// Shared loopback port reservations. Reachable from unit tests outside
-/// `crate::tests` (e.g. `ingress::sender::qwp_ws_orphan::tests`).
-#[cfg(feature = "sync-sender-qwp-ws")]
+/// `crate::tests` (e.g. `ingress::sender::qwp_ws_orphan::tests`), and needed
+/// by every feature combination that opens a test server — `mock` binds one
+/// for the TCP and HTTP suites, with no QWP/WebSocket feature in sight.
+#[cfg(any(
+    feature = "sync-sender-qwp-ws",
+    feature = "sync-sender-tcp",
+    feature = "sync-sender-http"
+))]
 pub(crate) mod net;
 
 #[cfg(feature = "sync-sender-http")]

@@ -93,8 +93,9 @@ impl Drop for ReservedPort {
 
 /// Bind a loopback listener on a port no test has claimed as dead.
 ///
-/// Every test server in this crate goes through here; that is what makes a
-/// [`ReservedPort`] claim mean anything.
+/// Every test server in this crate goes through here or through
+/// [`bind_unclaimed`]; that is what makes a [`ReservedPort`] claim mean
+/// anything.
 pub(crate) fn bind_test_listener() -> TcpListener {
     bind_test_listener_at("127.0.0.1")
 }
@@ -103,17 +104,30 @@ pub(crate) fn bind_test_listener() -> TcpListener {
 /// tests need this: their certificates are issued for `localhost`, so the
 /// server has to answer on whatever that name resolves to.
 pub(crate) fn bind_test_listener_at(host: &str) -> TcpListener {
+    bind_unclaimed(|| {
+        let listener = TcpListener::bind((host, 0))?;
+        let port = listener.local_addr()?.port();
+        Ok((listener, port))
+    })
+    .expect("bind test listener")
+}
+
+/// Draw a bound socket until its port is one no test has claimed as dead.
+///
+/// The same rule as [`bind_test_listener`], for the test servers that cannot
+/// use a plain [`TcpListener`] — the ILP mock in `mock.rs` needs a `socket2`
+/// socket to hand to mio. Every rejected draw is held until the last one
+/// succeeds, so the kernel cannot keep offering the same claimed port.
+pub(crate) fn bind_unclaimed<S>(
+    mut bind: impl FnMut() -> std::io::Result<(S, u16)>,
+) -> std::io::Result<S> {
     let mut rejected = Vec::new();
     for _ in 0..MAX_DRAWS {
-        let listener = TcpListener::bind((host, 0)).expect("bind test listener");
-        let port = listener
-            .local_addr()
-            .expect("test listener local addr")
-            .port();
+        let (socket, port) = bind()?;
         if !CLAIMED.lock().unwrap().contains(&port) {
-            return listener;
+            return Ok(socket);
         }
-        rejected.push(listener);
+        rejected.push(socket);
     }
     panic!("no unclaimed loopback port in {MAX_DRAWS} draws");
 }
@@ -135,13 +149,38 @@ mod tests {
     /// before reporting one, which takes it about two seconds — whereas a
     /// port that has stopped refusing at all is always a defect. Hence the
     /// generous timeout: it exists to bound a hang, not to time anything.
+    ///
+    /// A *successful* connect is the one outcome that is not this crate's
+    /// doing: the claim binds nothing, so a process outside this test binary
+    /// can still be handed the port by its own kernel. That is rare and does
+    /// not repeat on a fresh draw, so it costs a retry rather than a
+    /// failure. The regression this guards against fails every draw.
     #[test]
     fn reserved_port_refuses_connections() {
-        let reserved = ReservedPort::reserve();
-        let addr = SocketAddr::from((Ipv4Addr::LOCALHOST, reserved.port()));
-        let err = TcpStream::connect_timeout(&addr, Duration::from_secs(30))
-            .expect_err("a reserved port must refuse connections");
-        assert_eq!(err.kind(), ErrorKind::ConnectionRefused, "{err}");
+        for attempt in 1..=8 {
+            let reserved = ReservedPort::reserve();
+            let addr = SocketAddr::from((Ipv4Addr::LOCALHOST, reserved.port()));
+            match TcpStream::connect_timeout(&addr, Duration::from_secs(30)) {
+                Ok(stream) => {
+                    // Loud, because the in-process racers are all closed: a
+                    // listener here means either a foreign process or a new
+                    // bind path in this crate that skipped the registry.
+                    eprintln!(
+                        "reserved port {} answered on attempt {attempt}: {stream:?}",
+                        reserved.port()
+                    );
+                    assert!(
+                        attempt < 8,
+                        "a reserved port must refuse connections, but a listener \
+                         answered on eight separate draws: {stream:?}"
+                    );
+                }
+                Err(err) => {
+                    assert_eq!(err.kind(), ErrorKind::ConnectionRefused, "{err}");
+                    return;
+                }
+            }
+        }
     }
 
     /// The other half: while the claim stands, no test server can be handed
