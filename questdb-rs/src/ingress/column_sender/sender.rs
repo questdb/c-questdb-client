@@ -262,6 +262,13 @@ struct SfaBackend {
     state: SyncQwpWsHandlerState,
     buffer_scratch: QwpWsEncodeScratch,
     scratch: encoder::EncodeScratch,
+    /// True while the queue holds a deferred frame with no committing frame
+    /// after it. Only a split can create that state, and only within one flush
+    /// -- the split's own last frame always commits. It exists so a split that
+    /// fails part-way knows whether there is a group to close: a split whose
+    /// window valve was shut throughout published nothing deferred, and
+    /// publishing a committing frame for it would be pure waste.
+    sfa_deferred_group_open: bool,
     max_buf_size: usize,
     request_durable_ack: bool,
     /// No-progress deadline for the `sync` poll loop. Mirrors the direct
@@ -342,6 +349,7 @@ impl PooledSenderCore {
                 state,
                 buffer_scratch: QwpWsEncodeScratch::new(),
                 scratch: encoder::EncodeScratch::new(),
+                sfa_deferred_group_open: false,
                 max_buf_size,
                 request_durable_ack,
                 sync_timeout,
@@ -1708,6 +1716,52 @@ impl SfaBackend {
         Ok(boundary)
     }
 
+    /// The queue's published-FSN watermark.
+    ///
+    /// `Err` is kept distinct from `Ok(None)`: a read can fail because the
+    /// runner latched a durability or terminal error *during* the flush, i.e.
+    /// after frames were already appended. Collapsing that into `None` would
+    /// make an errored read look like a virgin queue.
+    fn sfa_published_fsn(&self) -> crate::Result<Option<u64>> {
+        qwp_ws_published_fsn_background(&self.state)
+    }
+
+    /// Handle a split that failed part-way: close the group if anything reached
+    /// the queue, and classify the error accordingly.
+    ///
+    /// A split recurses, so a failure in either half can leave deferred frames
+    /// enqueued -- including the very first call, which publishes its own prefix
+    /// before failing on its own remainder. Comparing the published watermark
+    /// tells the two cases apart: frames enqueued means the chunk partly reached
+    /// the server, so it needs a committing frame after it AND must not be
+    /// reported as safe to blind-retry. Nothing enqueued means the flush is a
+    /// clean rejection and stays one.
+    fn close_failed_split(
+        &mut self,
+        published_before: crate::Result<Option<u64>>,
+        err: FlushFailure,
+    ) -> FlushFailure {
+        // Only a pair of successful reads showing the SAME watermark proves
+        // nothing was enqueued. If either read failed, assume frames reached the
+        // queue: over-closing costs one empty frame and an in_doubt error, while
+        // under-closing strands a deferred prefix nothing can commit.
+        let unchanged = match (&published_before, &self.sfa_published_fsn()) {
+            (Ok(before), Ok(after)) => before == after,
+            _ => false,
+        };
+        if unchanged {
+            return err;
+        }
+        // A committing frame is only needed if a deferred group is actually
+        // open. A split whose valve was closed throughout published nothing
+        // deferred, so there is nothing to close -- but its frames did reach the
+        // server, so the retry classification still applies.
+        if self.sfa_deferred_group_open {
+            self.commit_orphaned_prefix();
+        }
+        deny_retry_after_partial(err)
+    }
+
     /// Publish an empty committing frame to close a deferred prefix the rest of
     /// a split could not close.
     ///
@@ -1730,34 +1784,8 @@ impl SfaBackend {
     /// queue that failed the suffix), and there is nothing further to do about
     /// it: the caller is already returning an error, and returning THIS error
     /// instead would hide the size failure that actually explains the flush.
-    /// The queue's published-FSN watermark, or `None` if it cannot be read.
-    fn sfa_published_fsn(&self) -> Option<u64> {
-        qwp_ws_published_fsn_background(&self.state).ok().flatten()
-    }
-
-    /// Handle a split that failed part-way: close the group if anything reached
-    /// the queue, and classify the error accordingly.
-    ///
-    /// A split recurses, so a failure in either half can leave deferred frames
-    /// enqueued -- including the very first call, which publishes its own prefix
-    /// before failing on its own remainder. Comparing the published watermark
-    /// tells the two cases apart: frames enqueued means the chunk partly reached
-    /// the server, so it needs a committing frame after it AND must not be
-    /// reported as safe to blind-retry. Nothing enqueued means the flush is a
-    /// clean rejection and stays one.
-    fn close_failed_split(
-        &mut self,
-        published_before: Option<u64>,
-        err: FlushFailure,
-    ) -> FlushFailure {
-        if self.sfa_published_fsn() == published_before {
-            return err;
-        }
-        self.commit_orphaned_prefix();
-        deny_retry_after_partial(err)
-    }
-
     fn commit_orphaned_prefix(&mut self) {
+        self.sfa_deferred_group_open = false;
         let empty = Chunk::new("");
         let frame_cap = self.effective_frame_caps().hard;
         let _ = self.publish_chunk_sfa(&empty, None, frame_cap, false);
@@ -1815,6 +1843,11 @@ impl SfaBackend {
         };
         if let Err(err) = &result {
             self.latch_if_connection_is_spent(err);
+        }
+        if matches!(result, Ok(SfaPublishOutcome::Published(_))) {
+            // A committing frame closes whatever was open; a deferred one opens
+            // a group. `TooLarge` queued nothing, so it changes neither.
+            self.sfa_deferred_group_open = defer_commit;
         }
         result.map_err(FlushFailure::NotDelivered)
     }
@@ -2025,6 +2058,9 @@ impl SfaBackend {
         };
         if let Err(err) = &result {
             self.latch_if_connection_is_spent(err);
+        }
+        if matches!(result, Ok(SfaPublishOutcome::Published(_))) {
+            self.sfa_deferred_group_open = defer_commit;
         }
         result.map_err(FlushFailure::NotDelivered)
     }

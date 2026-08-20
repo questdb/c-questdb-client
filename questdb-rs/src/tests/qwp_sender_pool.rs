@@ -3715,21 +3715,41 @@ fn store_and_forward_irreducible_frame_over_segment_cap_is_batch_too_large() {
 /// express this -- the leading half would be exactly 8, which `split_mid`
 /// refuses to divide, so nothing is published and the flush is a clean
 /// rejection instead.
-fn split_floor_rows(rows: usize) -> (Vec<i32>, Vec<u8>) {
+fn split_floor_rows(shape: SplitFloorShape) -> (Vec<i32>, Vec<u8>) {
     const WIDE: usize = 4000;
+    let (rows, wide) = match shape {
+        SplitFloorShape::FailsInTrailingHalf => (16, 8..16),
+        SplitFloorShape::FailsInLeadingHalf => (32, 8..16),
+        SplitFloorShape::RejectsBeforePublishing => (16, 0..8),
+    };
     let mut bytes = Vec::new();
     let mut offsets = vec![0i32];
     for row in 0..rows {
-        let is_wide = (8..16).contains(&row);
+        let is_wide = wide.contains(&row);
         bytes.extend(std::iter::repeat_n(b'x', if is_wide { WIDE } else { 1 }));
         offsets.push(bytes.len() as i32);
     }
     (offsets, bytes)
 }
 
+#[derive(Clone, Copy)]
+enum SplitFloorShape {
+    /// 16 rows, irreducible block in 8..16. The leading half publishes; the
+    /// trailing half fails.
+    FailsInTrailingHalf,
+    /// 32 rows, irreducible block in 8..16. The top-level split is at 16, so the
+    /// LEADING half recurses, publishes rows 0..8 deferred, and only then hits
+    /// the irreducible block -- the error escapes before the trailing call runs.
+    FailsInLeadingHalf,
+    /// 16 rows, irreducible block in 0..8. The leading half is exactly 8, which
+    /// `split_mid` refuses to divide, so the flush is rejected with NOTHING
+    /// enqueued.
+    RejectsBeforePublishing,
+}
+
 #[test]
 fn store_and_forward_split_floor_failure_still_commits_the_deferred_prefix() {
-    check_split_floor_failure_commits_prefix(16);
+    check_split_floor_failure_commits_prefix(SplitFloorShape::FailsInTrailingHalf, 16);
 }
 
 /// The irreducible rows lead, so the failure happens inside the FIRST half's own
@@ -3737,10 +3757,124 @@ fn store_and_forward_split_floor_failure_still_commits_the_deferred_prefix() {
 /// the error then propagates past the trailing call entirely.
 #[test]
 fn store_and_forward_split_floor_failure_in_leading_half_still_commits_the_prefix() {
-    check_split_floor_failure_commits_prefix(32);
+    check_split_floor_failure_commits_prefix(SplitFloorShape::FailsInLeadingHalf, 32);
 }
 
-fn check_split_floor_failure_commits_prefix(rows: usize) {
+/// A split rejected before ANYTHING reaches the queue must stay a clean
+/// rejection: no committing frame, and an error the caller may safely retry.
+/// Over-closing is not free -- it costs a queue frame and a server-side
+/// `commitAll` walk of every table the connection registered, and it turns a
+/// retry-safe rejection into a delivery-unknown one.
+#[test]
+fn store_and_forward_split_rejected_before_publishing_stays_a_clean_rejection() {
+    const CAP: usize = 2048;
+
+    let (tx, frames) = mpsc::channel();
+    let server = MockServer::spawn_with_mode_capture(1, MockMode::DeferAwareAck, Some(tx));
+    let dir = TempDir::new().unwrap();
+    let conf = conf_for_endpoints(
+        &[server.port()],
+        &format!(
+            "max_buf_size={CAP};sf_dir={};pool_reap=manual;",
+            dir.path().display()
+        ),
+    );
+    let db = QuestDb::connect(&conf).unwrap();
+
+    let (offsets, bytes) = split_floor_rows(SplitFloorShape::RejectsBeforePublishing);
+    let ts: Vec<i64> = (0..16i64).map(|x| 1_700_000_000_000_000_000 + x).collect();
+    let mut chunk = Chunk::new("trades");
+    chunk.column_str("s", &offsets, &bytes, None).unwrap();
+    chunk.at_nanos(&ts).unwrap();
+
+    let mut sender = db.borrow_sender().unwrap();
+    let err = sender
+        .flush(&mut chunk)
+        .expect_err("the irreducible leading block must fail the flush");
+    assert_eq!(err.code(), ErrorCode::BatchTooLarge);
+    assert!(
+        !err.in_doubt(),
+        "nothing reached the queue, so the rejection must stay safe to retry"
+    );
+    assert_eq!(
+        sender.published_fsn().unwrap(),
+        None,
+        "a split rejected before anything reached the queue must not publish a \
+         commit frame"
+    );
+
+    let mut captured = Vec::new();
+    while let Ok(frame) = frames.recv_timeout(Duration::from_millis(500)) {
+        captured.push(frame);
+    }
+    assert!(
+        captured.is_empty(),
+        "nothing may reach the wire, got {} frame(s)",
+        captured.len()
+    );
+}
+
+/// A split whose valve was shut throughout defers nothing, so a failure has no
+/// group to close and must not publish a committing frame for one. Publishing it
+/// anyway costs a queue frame and a server-side `commitAll` walk of every table
+/// the connection ever registered, on a path that is already failing.
+#[test]
+fn store_and_forward_split_floor_failure_without_deferral_publishes_no_extra_frame() {
+    const CAP: usize = 2048;
+    const SEGMENT: usize = 1024;
+    // Three segments: a fresh slot holds active + hot spare, and the valve
+    // reserves one more, so it is shut for the whole flush and nothing defers.
+    const TOTAL: usize = SEGMENT * 3;
+
+    let (tx, frames) = mpsc::channel();
+    let server = MockServer::spawn_with_mode_capture(1, MockMode::DeferAwareAck, Some(tx));
+    let dir = TempDir::new().unwrap();
+    let conf = conf_for_endpoints(
+        &[server.port()],
+        &format!(
+            "max_buf_size={CAP};sf_dir={};pool_reap=manual;\
+             sf_max_segment_bytes={SEGMENT};sf_max_total_bytes={TOTAL};",
+            dir.path().display()
+        ),
+    );
+    let db = QuestDb::connect(&conf).unwrap();
+
+    let (offsets, bytes) = split_floor_rows(SplitFloorShape::FailsInTrailingHalf);
+    let ts: Vec<i64> = (0..16i64).map(|x| 1_700_000_000_000_000_000 + x).collect();
+    let mut chunk = Chunk::new("trades");
+    chunk.column_str("s", &offsets, &bytes, None).unwrap();
+    chunk.at_nanos(&ts).unwrap();
+
+    let mut sender = db.borrow_sender().unwrap();
+    let err = sender
+        .flush(&mut chunk)
+        .expect_err("the irreducible block must fail the flush");
+    assert_eq!(err.code(), ErrorCode::BatchTooLarge);
+    sender
+        .wait(AckLevel::Ok, Duration::from_secs(30))
+        .expect("the committed prefix must be acked");
+
+    let mut captured = Vec::new();
+    while let Ok(frame) = frames.recv_timeout(Duration::from_millis(500)) {
+        captured.push(frame);
+    }
+    const FLAG_DEFER_COMMIT: u8 = 0x01;
+    assert!(
+        captured
+            .iter()
+            .all(|frame| frame[5] & FLAG_DEFER_COMMIT == 0),
+        "premise: the valve must be shut at this budget, so nothing defers"
+    );
+    // Every frame carries rows. An empty header-only frame would be 14 bytes.
+    assert!(
+        captured.iter().all(|frame| frame.len() > 20),
+        "a split that deferred nothing must not publish a committing frame for a \
+         group that was never opened; frame sizes: {:?}",
+        captured.iter().map(|f| f.len()).collect::<Vec<_>>()
+    );
+}
+
+fn check_split_floor_failure_commits_prefix(shape: SplitFloorShape, rows: usize) {
     // A split whose remainder is irreducible leaves the prefix on the queue and
     // deferred. A deferred frame is never acked, so without a committing frame
     // after it the prefix can never be acked, never trimmed, and never commits:
@@ -3764,7 +3898,7 @@ fn check_split_floor_failure_commits_prefix(rows: usize) {
     );
     let db = QuestDb::connect(&conf).unwrap();
 
-    let (offsets, bytes) = split_floor_rows(rows);
+    let (offsets, bytes) = split_floor_rows(shape);
     let ts: Vec<i64> = (0..rows as i64)
         .map(|x| 1_700_000_000_000_000_000 + x)
         .collect();
@@ -3777,6 +3911,11 @@ fn check_split_floor_failure_commits_prefix(rows: usize) {
         .flush(&mut chunk)
         .expect_err("the irreducible block must fail the flush");
     assert_eq!(err.code(), ErrorCode::BatchTooLarge);
+    assert!(
+        err.in_doubt(),
+        "the prefix reached the server, so the chunk must not be reported as safe \
+         to blind-retry"
+    );
 
     // The flush failed, but the prefix reached the server. It must be committed,
     // not stranded: a wait that cannot succeed here is the whole defect.
@@ -7479,6 +7618,73 @@ fn store_and_forward_arrow_split_commits_once_at_the_last_frame() {
     }
 }
 
+/// Arrow counterpart of
+/// `store_and_forward_split_floor_failure_in_leading_half_still_commits_the_prefix`.
+/// Without it, reverting the Arrow half of the both-halves guard -- or removing
+/// its `close_failed_split` call entirely -- leaves the whole suite green.
+#[cfg(feature = "arrow-ingress")]
+#[test]
+fn store_and_forward_arrow_split_floor_failure_still_commits_the_deferred_prefix() {
+    use arrow::array::{ArrayRef, RecordBatch, StringArray};
+    use std::sync::Arc;
+
+    const CAP: usize = 2048;
+    const WIDE: usize = 4000;
+    // 32 rows with the irreducible block at 8..16, so the LEADING half recurses,
+    // publishes, and only then fails -- the shape the Arrow guard must cover.
+    const ROWS: usize = 32;
+
+    let (tx, frames) = mpsc::channel();
+    let server = MockServer::spawn_with_mode_capture(1, MockMode::DeferAwareAck, Some(tx));
+    let dir = TempDir::new().unwrap();
+    let conf = conf_for_endpoints(
+        &[server.port()],
+        &format!(
+            "max_buf_size={CAP};sf_dir={};pool_reap=manual;",
+            dir.path().display()
+        ),
+    );
+    let db = QuestDb::connect(&conf).unwrap();
+
+    let values: Vec<String> = (0..ROWS)
+        .map(|row| {
+            let len = if (8..16).contains(&row) { WIDE } else { 1 };
+            "x".repeat(len)
+        })
+        .collect();
+    let arr: ArrayRef = Arc::new(StringArray::from(values));
+    let batch = RecordBatch::try_from_iter([("s", arr)]).unwrap();
+
+    let mut sender = db.borrow_sender().unwrap();
+    let err = sender
+        .flush_arrow_batch_at_now("trades", &batch, &[])
+        .expect_err("the irreducible block must fail the Arrow flush");
+    assert_eq!(err.code(), ErrorCode::BatchTooLarge);
+    assert!(
+        err.in_doubt(),
+        "the prefix reached the server, so the batch must not be reported as safe \
+         to blind-retry"
+    );
+
+    sender.wait(AckLevel::Ok, Duration::from_secs(30)).expect(
+        "the prefix published before the failure must still be committed; a timeout \
+         here means the Arrow path left it deferred with nothing able to commit it",
+    );
+
+    let mut captured = Vec::new();
+    while let Ok(frame) = frames.recv_timeout(Duration::from_millis(500)) {
+        captured.push(frame);
+    }
+    const FLAG_DEFER_COMMIT: u8 = 0x01;
+    assert!(
+        captured
+            .iter()
+            .any(|frame| frame[5] & FLAG_DEFER_COMMIT == 0),
+        "a committing frame must close the group, got {} frame(s) all deferred",
+        captured.len()
+    );
+}
+
 #[cfg(feature = "arrow-ingress")]
 #[test]
 fn store_and_forward_arrow_split_commits_early_rather_than_stalling_on_queue_capacity() {
@@ -7552,6 +7758,20 @@ fn store_and_forward_arrow_split_commits_early_rather_than_stalling_on_queue_cap
         "the Arrow valve must commit mid-split once the reserve runs out; \
          {} frame(s), {deferred} deferred, none committing before the last",
         captured.len()
+    );
+
+    // Row coverage, matching the chunk counterpart: a split that drops or
+    // duplicates a frame still satisfies the flag assertions above.
+    let (replay_tx, replay_rx) = mpsc::channel();
+    for frame in captured {
+        replay_tx.send(frame).unwrap();
+    }
+    drop(replay_tx);
+    let mut got = redriven_i64_rows(&replay_rx);
+    got.sort_unstable();
+    assert_eq!(
+        got, vals,
+        "the Arrow split must carry every row exactly once"
     );
 }
 
