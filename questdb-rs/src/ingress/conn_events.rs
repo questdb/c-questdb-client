@@ -245,8 +245,18 @@ impl<T: std::fmt::Debug + Send + 'static> EventDispatcher<T> {
 
 impl<T> Drop for EventDispatcher<T> {
     fn drop(&mut self) {
-        self.inner.closed.store(true, Ordering::Release);
-        self.inner.available.notify_one();
+        // The inbox mutex is required for the wakeup to reach the
+        // dispatcher: `dispatch_loop` reads `closed` and parks while
+        // holding that same mutex, so publishing the close under it means
+        // the loop either sees the store before parking or is already
+        // registered as a waiter when the notify lands. `offer` discards
+        // events once `closed` is set, so this notify is the last one the
+        // loop can ever receive and the join below depends on it.
+        {
+            let _inbox = self.inner.lock_inbox();
+            self.inner.closed.store(true, Ordering::Release);
+            self.inner.available.notify_one();
+        }
         if let Some(handle) = self.thread.take()
             && handle.thread().id() != std::thread::current().id()
         {
@@ -606,6 +616,35 @@ mod tests {
         drop(dispatcher);
         wait_for(|| Arc::strong_count(&inner) == 1);
         assert!(inner.closed.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn drop_joins_a_dispatcher_thread_that_never_saw_an_event() {
+        // A dispatcher dropped right after construction races its own
+        // thread's first trip through the inbox lock: the thread reads
+        // `closed`, finds the inbox empty and parks. The close is
+        // published under that mutex, so the park stays reachable and
+        // every drop joins. Run the cycle often enough to cover the
+        // window; a stalled join shows up as the recv timeout.
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            for round in 0..20_000u32 {
+                let dispatcher =
+                    ConnectionEventDispatcher::new(Arc::new(|_: &ConnectionEvent| {}), 4);
+                // Sweep the gap so drops land across the whole startup
+                // window, including the instant the thread holds the inbox
+                // lock and is about to park.
+                for _ in 0..(round % 400) {
+                    std::hint::spin_loop();
+                }
+                drop(dispatcher);
+            }
+            let _ = done_tx.send(());
+        });
+        assert!(
+            done_rx.recv_timeout(Duration::from_secs(60)).is_ok(),
+            "a dispatcher drop stalled joining its thread",
+        );
     }
 
     #[test]
