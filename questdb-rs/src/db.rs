@@ -2925,6 +2925,10 @@ fn drain_sfa_before_drop(inner: &DbInner, sender: &mut PooledSenderCore) {
     if sender.sfa_fully_delivered(durable) {
         return;
     }
+    // Before begin_close stops accepting publications: a split that failed
+    // part-way may have left a deferred group open, and after this point
+    // nothing can close it.
+    sender.close_open_deferred_group();
     sender.begin_close();
     if let Err(err) = sender.drain_to_deadline(Instant::now().checked_add(timeout)) {
         log::warn!(
@@ -2947,7 +2951,9 @@ fn drain_sfa_senders_bounded(inner: &DbInner, senders: &mut [PooledSenderCore]) 
         return;
     }
     let durable = inner.connector.request_durable_ack();
-    for sender in senders.iter() {
+    for sender in senders.iter_mut() {
+        // See drain_sfa_before_drop: must precede begin_close.
+        sender.close_open_deferred_group();
         sender.begin_close();
     }
     let deadline = Instant::now().checked_add(timeout);

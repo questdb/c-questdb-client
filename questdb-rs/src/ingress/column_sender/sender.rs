@@ -431,6 +431,24 @@ impl PooledSenderCore {
         matches!(watermark, Ok(Some(w)) if w >= published)
     }
 
+    /// Publish a committing frame if a split left a deferred group open.
+    ///
+    /// Must run BEFORE [`Self::begin_close`], which stops accepting
+    /// publications: after that point the close itself is what makes the
+    /// publish fail, and the queue persists a tail nothing can commit. With
+    /// `sf_dir` that tail outlives the process -- every reopen replays it, the
+    /// server withholds the ack by design, and the drain burns its whole
+    /// timeout, on every open, indefinitely.
+    ///
+    /// Best-effort: if the publish fails the flag stays set, so a later attempt
+    /// on this backend retries. It does not cover a process death mid-split,
+    /// which needs commit-boundary recovery in the queue itself.
+    pub(crate) fn close_open_deferred_group(&mut self) {
+        if self.backend.sfa_deferred_group_open {
+            self.backend.commit_orphaned_prefix();
+        }
+    }
+
     /// Non-blocking: stop accepting new store-and-forward publications and wake
     /// the background runner to flush what is queued. Pairs with
     /// [`Self::drain_to_deadline`].
@@ -1785,9 +1803,14 @@ impl SfaBackend {
     /// it: the caller is already returning an error, and returning THIS error
     /// instead would hide the size failure that actually explains the flush.
     fn commit_orphaned_prefix(&mut self) {
-        self.sfa_deferred_group_open = false;
         let empty = Chunk::new("");
         let frame_cap = self.effective_frame_caps().hard;
+        // Deliberately does NOT clear `sfa_deferred_group_open` itself.
+        // `publish_chunk_sfa` sets the flag from `defer_commit` on a successful
+        // publish, so success clears it and failure leaves it set -- which is
+        // what lets a later attempt on this backend try the close again. Clearing
+        // it up front would record "no group open" over a queue whose tail is
+        // still deferred, and nothing would ever retry.
         let _ = self.publish_chunk_sfa(&empty, None, frame_cap, false);
     }
 

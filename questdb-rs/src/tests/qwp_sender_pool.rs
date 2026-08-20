@@ -3760,6 +3760,77 @@ fn store_and_forward_split_floor_failure_in_leading_half_still_commits_the_prefi
     check_split_floor_failure_commits_prefix(SplitFloorShape::FailsInLeadingHalf, 32);
 }
 
+/// A slot persisted after a failed split must have nothing left to replay when
+/// it is reopened.
+///
+/// This is the end-to-end durability property the in-flush close buys: with
+/// `sf_dir`, a tail left deferred outlives the process, and every reopen
+/// replays it, gets no ack by design, and burns the whole drain timeout.
+///
+/// Note what this does NOT cover. `PooledSenderCore::close_open_deferred_group`
+/// is a second line of defence for the case where the in-flush close itself
+/// fails -- a concurrent `begin_close` rejects the publish, and that rejection
+/// is not one the flush-entry check catches. Disabling that hook leaves this
+/// test green, because the in-flush close already ran. Reaching the hook needs
+/// a close racing a split, which I could not produce deterministically.
+#[test]
+fn store_and_forward_reopened_slot_has_nothing_to_replay_after_a_failed_split() {
+    const CAP: usize = 2048;
+
+    let (tx, frames) = mpsc::channel();
+    let server = MockServer::spawn_with_mode_capture(2, MockMode::DeferAwareAck, Some(tx));
+    let dir = TempDir::new().unwrap();
+    let conf = conf_for_endpoints(
+        &[server.port()],
+        &format!(
+            "max_buf_size={CAP};sf_dir={};pool_reap=manual;sender_id=reopen_me;",
+            dir.path().display()
+        ),
+    );
+
+    {
+        let db = QuestDb::connect(&conf).unwrap();
+        let (offsets, bytes) = split_floor_rows(SplitFloorShape::FailsInTrailingHalf);
+        let ts: Vec<i64> = (0..16i64).map(|x| 1_700_000_000_000_000_000 + x).collect();
+        let mut chunk = Chunk::new("trades");
+        chunk.column_str("s", &offsets, &bytes, None).unwrap();
+        chunk.at_nanos(&ts).unwrap();
+
+        let mut sender = db.borrow_sender().unwrap();
+        sender
+            .flush(&mut chunk)
+            .expect_err("the irreducible block must fail the flush");
+        drop(sender);
+        // Dropping the pool runs the close path.
+    }
+
+    // Reopen the same slot. A tail that was left deferred would replay here and
+    // never resolve; a closed group leaves nothing to replay.
+    let db = QuestDb::connect(&conf).unwrap();
+    let sender = db.borrow_sender().unwrap();
+    let replayed = sender.published_fsn().unwrap();
+    drop(sender);
+    drop(db);
+
+    let mut captured = Vec::new();
+    while let Ok(frame) = frames.recv_timeout(Duration::from_millis(500)) {
+        captured.push(frame);
+    }
+    const FLAG_DEFER_COMMIT: u8 = 0x01;
+    assert!(
+        captured
+            .iter()
+            .any(|frame| frame[5] & FLAG_DEFER_COMMIT == 0),
+        "a committing frame must have closed the group before the queue was \
+         persisted; captured {} frame(s), all deferred",
+        captured.len()
+    );
+    assert_eq!(
+        replayed, None,
+        "the reopened slot must have nothing left to replay, got {replayed:?}"
+    );
+}
+
 /// A split rejected before ANYTHING reaches the queue must stay a clean
 /// rejection: no committing frame, and an error the caller may safely retry.
 /// Over-closing is not free -- it costs a queue frame and a server-side
