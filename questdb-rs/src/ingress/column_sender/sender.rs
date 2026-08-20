@@ -39,6 +39,7 @@ use crate::ingress::sender::qwp_ws::{
     qwp_ws_drain_to_deadline_background, qwp_ws_is_terminal_background, qwp_ws_ok_fsn_background,
     qwp_ws_poll_sender_error_background, qwp_ws_poll_sender_error_notification_background,
     qwp_ws_published_fsn_background, qwp_ws_sender_errors_dropped_background,
+    sfa_has_deferred_commit_slot,
 };
 use crate::ingress::sender::qwp_ws_sfa_publisher::{SfaForegroundPublisher, SfaPublishOutcome};
 #[cfg(feature = "arrow-ingress")]
@@ -1655,16 +1656,17 @@ impl SfaBackend {
         // frame. The chunk stays the atomic commit boundary, which is also the
         // store-and-forward replay unit.
         //
-        // Safe against the reconnect-trim hazard because the server does not
-        // acknowledge deferred frames: while FLAG_DEFER_COMMIT rows sit
-        // uncommitted in its WAL writers it refuses to advance the cumulative-ack
-        // watermark over them (QwpIngressProcessorState.setHighestProcessedSequence,
-        // questdb#7144). Unacknowledged frames are never trimmed, so a reconnect
-        // mid-group replays the whole group -- at-least-once, as intended. The
-        // boundary to wait for is the last frame's FSN; its cumulative ack covers
-        // the prefix. (In delta mode the frames are not individually
-        // self-sufficient; the driver re-registers the dictionary via a catch-up
-        // frame on reconnect.)
+        // Safe against the reconnect-trim hazard because the server withholds a
+        // deferred frame's ack while its rows sit uncommitted in the WAL writers
+        // (QwpIngressProcessorState, questdb#7144 and questdb#7440). An
+        // unacknowledged frame is never trimmed, so a reconnect mid-group
+        // replays it -- at-least-once, as intended. The boundary to wait for is
+        // the last frame's FSN; its cumulative ack covers the prefix. (In delta
+        // mode the frames are not individually self-sufficient; the driver
+        // re-registers the dictionary via a catch-up frame on reconnect.)
+        //
+        // See `publish_split_sfa` for the window valve that keeps a long split
+        // from deferring more frames than the publication window can hold.
         let boundary =
             match self.publish_chunk_sfa(chunk, None, caps.for_range(chunk.row_count()), false)? {
                 SfaPublishOutcome::Published(fsn) => fsn,
@@ -1677,9 +1679,12 @@ impl SfaBackend {
                     match split_mid(row_count) {
                         Some(mid) => {
                             self.publish_split_sfa(chunk, 0, mid, caps, true)?;
-                            // The prefix is now durably queued (at-least-once); a
-                            // failure on the remainder leaves it enqueued, so the
-                            // chunk must not be reported as safe to blind-retry.
+                            // The prefix is now durably enqueued, and a failure
+                            // on the remainder leaves it there, so the chunk must
+                            // not be reported as safe to blind-retry. Note this
+                            // is durable-on-disk and recoverable, NOT delivered:
+                            // a deferred prefix with no committing frame commits
+                            // zero times until a later chunk supplies one.
                             self.publish_split_sfa(chunk, mid, row_count - mid, caps, false)
                                 .map_err(deny_retry_after_partial)?
                         }
@@ -1756,8 +1761,9 @@ impl SfaBackend {
     /// whenever a frame is still too large. Returns the last frame's FSN.
     ///
     /// `defer_commit` applies to the LAST frame this call emits; every earlier
-    /// frame is deferred unconditionally. So a split chunk commits exactly once,
-    /// at its final frame, however many times the range has to halve.
+    /// frame is deferred unconditionally. So a split chunk commits once, at its
+    /// final frame, however many times the range has to halve — unless the
+    /// publication window runs out first, see below.
     fn publish_split_sfa(
         &mut self,
         chunk: &Chunk<'_>,
@@ -1766,6 +1772,22 @@ impl SfaBackend {
         caps: SfaFrameCaps,
         defer_commit: bool,
     ) -> std::result::Result<u64, FlushFailure> {
+        // Bounded deferred window. A deferred frame is never acked, so it never
+        // frees its in-flight slot; a split long enough to fill the window would
+        // leave the committing frame unable to submit at all — the foreground
+        // would block on back-pressure until `sf_append_deadline` and fail, with
+        // the deferred prefix durably queued and no frame to commit it. At
+        // `max_in_flight=1` that is every oversize chunk.
+        //
+        // `DirectColumnBackend` bounds the same window with
+        // `has_sync_commit_slot()` and force-commits the prefix when it fills
+        // (see `publish_split`); the store-and-forward valve is to commit at
+        // THIS frame instead, which drains the window and starts a fresh
+        // deferred group. Rows are split whole, so an early-committed prefix is
+        // always complete — the cost is extra commits for an over-window chunk,
+        // not a partial row. The retry classification is unaffected: anything
+        // enqueued before a failure already denies a blind retry.
+        let defer_commit = defer_commit && sfa_has_deferred_commit_slot(&self.state);
         match self.publish_chunk_sfa(
             chunk,
             Some((row_offset, row_count)),
@@ -1843,10 +1865,12 @@ impl SfaBackend {
             ts,
             overrides,
         };
-        // Whole-batch fast path; split into self-sufficient frames only when one
-        // exceeds the cap (see the rationale on `flush_chunk`).
+        // Whole-batch fast path; only split when a single frame exceeds the cap.
+        // A split batch defers every frame but the last, so it commits once —
+        // see `flush_chunk_boundary` for the rationale and the bounded-window
+        // valve that keeps the deferred prefix from stranding.
         let boundary =
-            match self.publish_arrow_sfa(&spec, None, caps.for_range(batch.num_rows()))? {
+            match self.publish_arrow_sfa(&spec, None, caps.for_range(batch.num_rows()), false)? {
                 SfaPublishOutcome::Published(fsn) => fsn,
                 SfaPublishOutcome::TooLarge {
                     encoded_len,
@@ -1856,9 +1880,9 @@ impl SfaBackend {
                     let row_count = batch.num_rows();
                     match split_mid(row_count) {
                         Some(mid) => {
-                            self.publish_arrow_split_sfa(&spec, 0, mid, caps)?;
+                            self.publish_arrow_split_sfa(&spec, 0, mid, caps, true)?;
                             // Prefix is durably queued; see `flush_chunk_boundary`.
-                            self.publish_arrow_split_sfa(&spec, mid, row_count - mid, caps)
+                            self.publish_arrow_split_sfa(&spec, mid, row_count - mid, caps, false)
                                 .map_err(deny_retry_after_partial)?
                         }
                         None => return Err(FlushFailure::NotDelivered(err)),
@@ -1879,6 +1903,7 @@ impl SfaBackend {
         spec: &ArrowFrameSpec<'_>,
         range: Option<(usize, usize)>,
         frame_cap: usize,
+        defer_commit: bool,
     ) -> std::result::Result<SfaPublishOutcome, FlushFailure> {
         let sliced;
         let batch = match range {
@@ -1903,7 +1928,7 @@ impl SfaBackend {
                             spec.ts,
                             spec.overrides,
                             symbol_dict,
-                            false,
+                            defer_commit,
                         )
                     } else {
                         arrow_batch::encode_arrow_batch_replay_into(
@@ -1913,6 +1938,7 @@ impl SfaBackend {
                             spec.ts,
                             spec.overrides,
                             symbol_dict,
+                            defer_commit,
                         )
                     }
                 },
@@ -1925,8 +1951,8 @@ impl SfaBackend {
         result.map_err(FlushFailure::NotDelivered)
     }
 
-    /// Arrow counterpart of [`Self::publish_split_sfa`]. Returns the last
-    /// frame's FSN.
+    /// Arrow counterpart of [`Self::publish_split_sfa`], including its
+    /// bounded-deferred-window valve. Returns the last frame's FSN.
     #[cfg(feature = "arrow-ingress")]
     fn publish_arrow_split_sfa(
         &mut self,
@@ -1934,11 +1960,14 @@ impl SfaBackend {
         row_offset: usize,
         row_count: usize,
         caps: SfaFrameCaps,
+        defer_commit: bool,
     ) -> std::result::Result<u64, FlushFailure> {
+        let defer_commit = defer_commit && sfa_has_deferred_commit_slot(&self.state);
         match self.publish_arrow_sfa(
             spec,
             Some((row_offset, row_count)),
             caps.for_range(row_count),
+            defer_commit,
         )? {
             SfaPublishOutcome::Published(fsn) => Ok(fsn),
             SfaPublishOutcome::TooLarge {
@@ -1946,9 +1975,15 @@ impl SfaBackend {
                 max_buf_size,
             } => match split_mid(row_count) {
                 Some(mid) => {
-                    self.publish_arrow_split_sfa(spec, row_offset, mid, caps)?;
-                    self.publish_arrow_split_sfa(spec, row_offset + mid, row_count - mid, caps)
-                        .map_err(deny_retry_after_partial)
+                    self.publish_arrow_split_sfa(spec, row_offset, mid, caps, true)?;
+                    self.publish_arrow_split_sfa(
+                        spec,
+                        row_offset + mid,
+                        row_count - mid,
+                        caps,
+                        defer_commit,
+                    )
+                    .map_err(deny_retry_after_partial)
                 }
                 None => Err(FlushFailure::NotDelivered(sfa_frame_size_error(
                     encoded_len,

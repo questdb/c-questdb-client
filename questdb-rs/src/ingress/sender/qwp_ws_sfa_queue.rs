@@ -1355,6 +1355,11 @@ impl SfaFrameQueue {
 }
 
 impl SfaProgressView {
+    /// See [`SfaEngine::has_deferred_commit_headroom`].
+    pub(crate) fn has_deferred_commit_headroom(&self) -> bool {
+        self.engine.has_deferred_commit_headroom()
+    }
+
     pub(crate) fn next_outbound_frame(
         &self,
         send_cursor: &mut SendCursor,
@@ -1492,6 +1497,11 @@ impl SfaProgressView {
 }
 
 impl SfaProducer {
+    /// See [`SfaEngine::has_deferred_commit_headroom`].
+    pub(crate) fn has_deferred_commit_headroom(&self) -> bool {
+        self.engine.has_deferred_commit_headroom()
+    }
+
     pub(crate) fn try_submit(&mut self, payload: &[u8]) -> Result<QwpReceipt, SfaQueueError> {
         self.engine.check_durability()?;
         self.engine.validate_submit(payload)?;
@@ -1761,6 +1771,28 @@ struct SfaSegmentsSnapshot {
 }
 
 impl SfaEngine {
+    /// Whether the queue could still allocate a segment for a committing frame
+    /// AFTER growing by one more segment for a deferred one.
+    ///
+    /// Deferred frames are never acked, so the storage they occupy is never
+    /// reclaimed by `maintain_storage`. Filling the slot's byte budget with
+    /// them would leave the frame that commits them — the only thing that can
+    /// free the space — unable to publish. Reserving a segment's worth of
+    /// headroom keeps that from happening; see `SfaBackend::publish_split_sfa`.
+    fn has_deferred_commit_headroom(&self) -> bool {
+        let segment_size_bytes = self.segment_size_bytes;
+        let max_bytes = self.max_bytes;
+        self.with_state(|state| {
+            can_allocate_segment(
+                state
+                    .allocated_segment_bytes
+                    .saturating_add(segment_size_bytes),
+                segment_size_bytes,
+                max_bytes,
+            )
+        })
+    }
+
     fn close(&self, ack_watermark: &mut Option<SfaAckWatermark>) -> Result<(), SfaQueueError> {
         let mut state = self.lock_state()?;
         if state.closed {

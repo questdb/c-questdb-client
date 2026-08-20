@@ -934,6 +934,19 @@ where
             .map_err(|_| error::fmt!(SocketError, "QWP/WebSocket runner state lock is poisoned"))
     }
 
+    /// Whether the queue has room for a deferred frame AND the frame that will
+    /// commit it, or `None` when the runner cannot answer without blocking.
+    fn has_deferred_commit_headroom(&self) -> Option<bool> {
+        if let Some(producer) = self.producer.as_ref() {
+            return Some(producer.has_deferred_commit_headroom());
+        }
+        // try_lock, not lock: this only informs a defer/commit choice, and both
+        // answers are safe. Blocking the foreground on the driver thread to
+        // learn it would be a worse trade than committing the frame.
+        let store = self.shared.try_lock().ok()?;
+        Some(store.progress_view().has_deferred_commit_headroom())
+    }
+
     fn wait_for_publication_capacity(&self, generation: u64, deadline: Option<Instant>) -> bool {
         self.backpressure.wait_for_change(generation, deadline)
     }
@@ -3899,6 +3912,24 @@ pub(crate) fn publish_qwp_ws_payload_background(
         ));
     }
     state.runner.publish_replay_payload(payload)
+}
+
+/// Whether a deferred frame may be published without stranding the frame that
+/// will commit it.
+///
+/// A deferred frame is never acked, so the queue storage it occupies is never
+/// reclaimed. Publishing one that consumes the slot's last byte budget would
+/// leave the committing frame unable to publish at all: it would block on
+/// back-pressure until the append deadline and then fail, with the deferred
+/// prefix durably queued and nothing able to commit it. This is the
+/// store-and-forward counterpart of the direct backend's
+/// `Conn::has_sync_commit_slot`.
+///
+/// Answers conservatively (`false`) when the queue cannot be read without
+/// blocking: committing a frame that could have been deferred costs throughput,
+/// deferring one that should have committed costs liveness.
+pub(crate) fn sfa_has_deferred_commit_slot(state: &SyncQwpWsHandlerState) -> bool {
+    state.runner.has_deferred_commit_headroom().unwrap_or(false)
 }
 
 pub(crate) fn flush_qwp_ws_manual(
