@@ -399,7 +399,16 @@ impl QwpWsConfig {
         } else {
             QWP_WS_DEFAULT_SF_MEMORY_MAX_TOTAL_BYTES
         };
-        default_max_total_bytes.max(self.sf_max_segment_bytes.saturating_mul(2))
+        // Floor at four segments, not two. A freshly opened slot already holds
+        // an active segment plus a hot spare, and the split path's deferred
+        // window reserves one more segment for the frame that will commit the
+        // group (`SfaEngine::has_deferred_commit_headroom`). At a two-segment
+        // floor that reserve can never be satisfied, so deferral silently never
+        // engages and an oversize chunk commits once per frame -- correct, but
+        // without the batching the split path exists to get. An explicitly
+        // configured `sf_max_total_bytes` is left alone; it degrades the same
+        // safe way.
+        default_max_total_bytes.max(self.sf_max_segment_bytes.saturating_mul(4))
     }
 
     /// Closes a documented footgun: `reconnect_max_duration_millis` and the

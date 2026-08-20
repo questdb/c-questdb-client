@@ -1679,14 +1679,19 @@ impl SfaBackend {
                     match split_mid(row_count) {
                         Some(mid) => {
                             self.publish_split_sfa(chunk, 0, mid, caps, true)?;
-                            // The prefix is now durably enqueued, and a failure
-                            // on the remainder leaves it there, so the chunk must
-                            // not be reported as safe to blind-retry. Note this
-                            // is durable-on-disk and recoverable, NOT delivered:
-                            // a deferred prefix with no committing frame commits
-                            // zero times until a later chunk supplies one.
-                            self.publish_split_sfa(chunk, mid, row_count - mid, caps, false)
-                                .map_err(deny_retry_after_partial)?
+                            // The prefix is now durably enqueued and deferred. If
+                            // the remainder fails, it leaves that prefix with no
+                            // frame able to commit it, so close the group before
+                            // surfacing the error -- see `commit_orphaned_prefix`.
+                            // The chunk must also not be reported as safe to
+                            // blind-retry, since the prefix did reach the server.
+                            match self.publish_split_sfa(chunk, mid, row_count - mid, caps, false) {
+                                Ok(fsn) => fsn,
+                                Err(e) => {
+                                    self.commit_orphaned_prefix();
+                                    return Err(deny_retry_after_partial(e));
+                                }
+                            }
                         }
                         None => return Err(FlushFailure::NotDelivered(err)),
                     }
@@ -1699,6 +1704,34 @@ impl SfaBackend {
                 .map_err(FlushFailure::DeliveryUnknown)?;
         }
         Ok(boundary)
+    }
+
+    /// Publish an empty committing frame to close a deferred prefix the rest of
+    /// a split could not close.
+    ///
+    /// A deferred frame is never acked, so a prefix left with no committing
+    /// frame after it can never be acked, never trimmed, and never commits: the
+    /// slot's byte budget stays consumed, `wait()` can no longer succeed, and
+    /// `close()` burns its whole drain timeout before giving up. If the caller
+    /// then moves to another `sender_id` the slot becomes an orphan, and the
+    /// orphan queue is opened with no producer, so nothing can ever append the
+    /// committing frame it is waiting for.
+    ///
+    /// `DirectColumnBackend` handles the same case by marking the connection
+    /// must-close so the drop-time commit discards the prefix. Store-and-forward
+    /// cannot discard -- the frames are already durably enqueued -- so it does
+    /// the opposite and commits them, which is the outcome
+    /// `deny_retry_after_partial` already reports to the caller: delivery
+    /// unknown, do not blind-retry.
+    ///
+    /// Best-effort by construction. The publish can itself fail (the same full
+    /// queue that failed the suffix), and there is nothing further to do about
+    /// it: the caller is already returning an error, and returning THIS error
+    /// instead would hide the size failure that actually explains the flush.
+    fn commit_orphaned_prefix(&mut self) {
+        let empty = Chunk::new("");
+        let frame_cap = self.effective_frame_caps().hard;
+        let _ = self.publish_chunk_sfa(&empty, None, frame_cap, false);
     }
 
     /// Encode `range` (`None` = whole chunk, no slice allocation) as a replay
@@ -1881,9 +1914,21 @@ impl SfaBackend {
                     match split_mid(row_count) {
                         Some(mid) => {
                             self.publish_arrow_split_sfa(&spec, 0, mid, caps, true)?;
-                            // Prefix is durably queued; see `flush_chunk_boundary`.
-                            self.publish_arrow_split_sfa(&spec, mid, row_count - mid, caps, false)
-                                .map_err(deny_retry_after_partial)?
+                            // Prefix is durably queued and deferred; see
+                            // `flush_chunk_boundary` and `commit_orphaned_prefix`.
+                            match self.publish_arrow_split_sfa(
+                                &spec,
+                                mid,
+                                row_count - mid,
+                                caps,
+                                false,
+                            ) {
+                                Ok(fsn) => fsn,
+                                Err(e) => {
+                                    self.commit_orphaned_prefix();
+                                    return Err(deny_retry_after_partial(e));
+                                }
+                            }
                         }
                         None => return Err(FlushFailure::NotDelivered(err)),
                     }

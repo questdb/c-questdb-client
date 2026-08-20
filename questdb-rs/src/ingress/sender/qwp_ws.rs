@@ -935,14 +935,16 @@ where
     }
 
     /// Whether the queue has room for a deferred frame AND the frame that will
-    /// commit it, or `None` when the runner cannot answer without blocking.
+    /// commit it, or `None` when the runner has no producer and cannot read the
+    /// queue without blocking on the driver.
     fn has_deferred_commit_headroom(&self) -> Option<bool> {
         if let Some(producer) = self.producer.as_ref() {
             return Some(producer.has_deferred_commit_headroom());
         }
-        // try_lock, not lock: this only informs a defer/commit choice, and both
-        // answers are safe. Blocking the foreground on the driver thread to
-        // learn it would be a worse trade than committing the frame.
+        // Only reached once `take_producer` has run (close drain), so this is
+        // not the publishing path. try_lock, not lock: the answer only informs
+        // a defer/commit choice and both answers are safe, so blocking the
+        // foreground on the driver thread to learn it is the worse trade.
         let store = self.shared.try_lock().ok()?;
         Some(store.progress_view().has_deferred_commit_headroom())
     }
@@ -3925,9 +3927,11 @@ pub(crate) fn publish_qwp_ws_payload_background(
 /// store-and-forward counterpart of the direct backend's
 /// `Conn::has_sync_commit_slot`.
 ///
-/// Answers conservatively (`false`) when the queue cannot be read without
-/// blocking: committing a frame that could have been deferred costs throughput,
-/// deferring one that should have committed costs liveness.
+/// Normally answered from the foreground's own producer handle, which takes the
+/// engine's state lock briefly. The `try_lock` fallback only applies once the
+/// producer has been handed off (close drain), and answers conservatively
+/// (`false`) there: committing a frame that could have been deferred costs
+/// throughput, deferring one that should have committed costs liveness.
 pub(crate) fn sfa_has_deferred_commit_slot(state: &SyncQwpWsHandlerState) -> bool {
     state.runner.has_deferred_commit_headroom().unwrap_or(false)
 }
