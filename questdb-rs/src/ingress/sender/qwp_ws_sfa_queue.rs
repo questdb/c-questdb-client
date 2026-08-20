@@ -1784,9 +1784,17 @@ impl SfaEngine {
         let max_bytes = self.max_bytes;
         self.with_state(|state| {
             can_allocate_segment(
+                // Reserve TWO segments beyond this frame's own possible
+                // rotation. One is the committing frame's. The other is the
+                // driver's hot spare: `finish_storage_maintenance` installs it
+                // guarded only by `can_allocate_segment(allocated, ..)`, so it
+                // will take the last segment of budget between this check and
+                // the committing frame's publish. Reserving only one left that
+                // race open, and it was observed to reproduce the very stall
+                // this valve exists to prevent.
                 state
                     .allocated_segment_bytes
-                    .saturating_add(segment_size_bytes),
+                    .saturating_add(segment_size_bytes.saturating_mul(2)),
                 segment_size_bytes,
                 max_bytes,
             )

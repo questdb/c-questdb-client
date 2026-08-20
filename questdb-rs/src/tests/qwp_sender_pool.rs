@@ -3408,14 +3408,14 @@ fn store_and_forward_split_commits_early_rather_than_stalling_on_queue_capacity(
     // could not reproduce the stall at all.
     const CAP: usize = 2048;
     const SEGMENT: usize = 1024;
-    // Five segments, not three. A fresh slot already holds an active segment
+    // Six segments, not three. A fresh slot already holds an active segment
     // plus a hot spare, and the valve reserves one more for the committing
     // frame, so at three the valve is closed for the whole flush and this test
     // would pass without a single frame ever deferring -- unable to tell the
     // shipped valve from one hardwired to false. At five the split defers, then
     // downgrades mid-flight when the budget backs up, which is the transition
     // the production defaults actually take.
-    const TOTAL: usize = SEGMENT * 5;
+    const TOTAL: usize = SEGMENT * 6;
     const ROWS: usize = 512;
 
     let (tx, frames) = mpsc::channel();
@@ -3893,9 +3893,9 @@ fn store_and_forward_split_rejected_before_publishing_stays_a_clean_rejection() 
 fn store_and_forward_split_floor_failure_without_deferral_publishes_no_extra_frame() {
     const CAP: usize = 2048;
     const SEGMENT: usize = 1024;
-    // Three segments: a fresh slot holds active + hot spare, and the valve
-    // reserves one more, so it is shut for the whole flush and nothing defers.
-    const TOTAL: usize = SEGMENT * 3;
+    // Four segments: a fresh slot holds active + hot spare, and the valve
+    // reserves two more, so it is shut for the whole flush and nothing defers.
+    const TOTAL: usize = SEGMENT * 4;
 
     let (tx, frames) = mpsc::channel();
     let server = MockServer::spawn_with_mode_capture(1, MockMode::DeferAwareAck, Some(tx));
@@ -7768,7 +7768,7 @@ fn store_and_forward_arrow_split_commits_early_rather_than_stalling_on_queue_cap
 
     const CAP: usize = 2048;
     const SEGMENT: usize = 1024;
-    const TOTAL: usize = SEGMENT * 5;
+    const TOTAL: usize = SEGMENT * 6;
     const ROWS: usize = 512;
     const FLAG_DEFER_COMMIT: u8 = 0x01;
 
