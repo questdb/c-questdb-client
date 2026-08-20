@@ -323,8 +323,26 @@ impl<T: std::fmt::Debug + Send + 'static> EventDispatcher<T> {
 
 impl<T> Drop for EventDispatcher<T> {
     fn drop(&mut self) {
-        self.inner.closed.store(true, Ordering::Release);
-        self.inner.available.notify_one();
+        {
+            // Both under the inbox lock, deliberately. `closed` is the
+            // predicate `dispatch_loop` re-checks before parking on
+            // `available`, and it is an atomic rather than inbox state — so
+            // setting it outside the lock lets the whole notification fall
+            // through the gap between that check and the park, on a thread
+            // that is holding the lock throughout and cannot be woken by a
+            // notify that has already happened. The dispatcher then sleeps
+            // on a closed dispatcher and the join below never returns.
+            //
+            // The window is widest right after a `drain`: it returns as soon
+            // as the last delivery is counted, which is just before the
+            // dispatcher loops around to park, and the caller's next move is
+            // usually to drop. Taking the lock closes it — the dispatcher is
+            // either parked, and gets the notification, or has not reached
+            // its check, and sees `closed` when it does.
+            let _inbox = self.inner.lock_inbox();
+            self.inner.closed.store(true, Ordering::Release);
+            self.inner.available.notify_all();
+        }
         if let Some(handle) = self.thread.take()
             && handle.thread().id() != std::thread::current().id()
         {
@@ -625,6 +643,39 @@ mod tests {
         assert!(dispatcher.drain(Duration::from_secs(5)), "drain timed out");
         assert_eq!(*seen.lock().unwrap(), vec![0, 1, 2]);
         assert_eq!(dispatcher.delivered(), 3);
+    }
+
+    /// `drain` returns as soon as the last delivery is *counted*, which
+    /// leaves the dispatcher thread a few instructions short of parking on
+    /// `available` — and a caller that has just drained is usually about to
+    /// drop. So this is the ordinary interleaving, not a rare one, and the
+    /// join inside `Drop` has to survive it.
+    ///
+    /// Runs on a worker thread with a bounded wait here: a regression is a
+    /// deadlock, and a deadlocked test that hangs the suite tells you far
+    /// less than one that fails.
+    #[test]
+    fn drain_then_drop_does_not_deadlock_the_join() {
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            for _ in 0..50_000 {
+                let dispatcher =
+                    ConnectionEventDispatcher::new(Arc::new(|_: &ConnectionEvent| {}), 1);
+                for attempt in 0..8u64 {
+                    dispatcher.offer(
+                        ConnectionEvent::new(ConnectionEventKind::EndpointAttemptFailed)
+                            .attempt(attempt),
+                    );
+                }
+                assert!(dispatcher.drain(Duration::from_secs(5)), "drain timed out");
+                drop(dispatcher);
+            }
+            let _ = done_tx.send(());
+        });
+        assert!(
+            done_rx.recv_timeout(Duration::from_secs(60)).is_ok(),
+            "dropping a drained dispatcher deadlocked on its join"
+        );
     }
 
     /// A listener that never returns cannot hold a caller forever: the
