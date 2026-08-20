@@ -225,8 +225,31 @@ stages:
             parameters:
               aptPackages:
                 - pipx
+              # The pinned toolchain below is this job's compiler; skip the
+              # bootstrap stable it would otherwise replace.
+              rustToolchain: none
           - script: |
+              # `set -e` without `-x`: the trace of an `echo "##vso[...]"`
+              # line is itself parsed by Azure, quotes and all. See the
+              # JAVA_HOME comment in templates/incus_prepare.yaml.
               set -e
+              # Pinned for the same reason clang-format is, and now for a
+              # sharper one: this job runs `clippy -- -D warnings`, and the
+              # ephemeral containers install whatever stable is current at
+              # the moment the job starts. Every Rust release therefore
+              # lands its new lints on the next PR to build, as errors, in
+              # code that was clean the day before. 1.98.0 did exactly that
+              # on 2026-08-20 — `clippy::chunks_exact_to_as_chunks` turned
+              # 19 untouched call sites in `ws/crypto.rs` and
+              # `column_sender/arrow_batch.rs` into build failures.
+              #
+              # Bump this deliberately, in a change that also fixes whatever
+              # the newer clippy has to say. Do not let a release day pick
+              # the moment for you.
+              rustup toolchain install 1.97.1 --profile minimal \
+                --component clippy --component rustfmt
+              rustup default 1.97.1
+              rustc --version | grep -F 1.97.1
               # Pinned so local runs (`pipx install clang-format==21.1.8`)
               # and CI agree byte-for-byte; comment reflow differs between
               # clang-format major versions.
@@ -234,9 +257,7 @@ stages:
               export PATH="$HOME/.local/bin:$PATH"
               echo "##vso[task.prependpath]$HOME/.local/bin"
               clang-format --version | grep -F 21.1.8
-              rustup component add clippy
-              rustup component add rustfmt
-            displayName: "Install clang-format, clippy and rustfmt"
+            displayName: "Install pinned Rust, clang-format, clippy, rustfmt"
           - script: |
               cd questdb-rs
               cargo fmt --all -- --check
