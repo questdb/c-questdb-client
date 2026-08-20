@@ -6512,25 +6512,15 @@ mod tests {
     /// the dispatcher had not delivered. `line_sender_build` must hand the
     /// events over before it returns.
     ///
-    /// The endpoint holds a listening socket and never upgrades: the dial
-    /// connects, the WebSocket handshake times out, and the walk reports the
-    /// same failure events a refused dial would. Holding the socket is what
-    /// makes the port unstealable by a parallel test in this binary.
+    /// The endpoint holds a listening socket and never accepts: the kernel
+    /// completes the dial from the backlog, the WebSocket handshake then
+    /// times out, and the walk reports the same failure events a refused
+    /// dial would. Holding the socket is what makes the port unstealable by
+    /// a parallel test in this binary.
     #[test]
     fn failed_build_delivers_connection_events_before_opts_are_freed() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
-        let accepting = thread::spawn(move || {
-            // Accept and hold: never speak WebSocket, so the upgrade times
-            // out. Sockets close when this thread returns.
-            let mut held = Vec::new();
-            while held.len() < 8 {
-                match listener.accept() {
-                    Ok((stream, _)) => held.push(stream),
-                    Err(_) => break,
-                }
-            }
-        });
 
         let state = Arc::new(GatedConnectionEventState {
             gate: std::sync::Mutex::new(false),
@@ -6576,7 +6566,7 @@ mod tests {
         }
 
         opener.join().unwrap();
-        drop(accepting);
+        drop(listener);
         let kinds = state.kinds.lock().unwrap().clone();
         assert!(
             kinds.contains(&crate::column_sender::questdb_connection_event_endpoint_attempt_failed),
