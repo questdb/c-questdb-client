@@ -3702,8 +3702,45 @@ fn store_and_forward_irreducible_frame_over_segment_cap_is_batch_too_large() {
     );
 }
 
+/// Rows for a chunk that cannot be split down to a publishable frame, with the
+/// irreducible 8-row block placed to fail either half of the top-level split.
+///
+/// `Trailing` (16 rows, wide in 8..16): the leading half publishes, the trailing
+/// half is irreducible.
+///
+/// `Leading` (32 rows, wide in 8..16): the top-level split is at 16, so the
+/// LEADING half recurses, publishes rows 0..8 deferred, and only then hits the
+/// irreducible block. The error propagates past the trailing call entirely, so
+/// guarding only the trailing call leaves those frames stranded. 16 rows cannot
+/// express this -- the leading half would be exactly 8, which `split_mid`
+/// refuses to divide, so nothing is published and the flush is a clean
+/// rejection instead.
+fn split_floor_rows(rows: usize) -> (Vec<i32>, Vec<u8>) {
+    const WIDE: usize = 4000;
+    let mut bytes = Vec::new();
+    let mut offsets = vec![0i32];
+    for row in 0..rows {
+        let is_wide = (8..16).contains(&row);
+        bytes.extend(std::iter::repeat_n(b'x', if is_wide { WIDE } else { 1 }));
+        offsets.push(bytes.len() as i32);
+    }
+    (offsets, bytes)
+}
+
 #[test]
 fn store_and_forward_split_floor_failure_still_commits_the_deferred_prefix() {
+    check_split_floor_failure_commits_prefix(16);
+}
+
+/// The irreducible rows lead, so the failure happens inside the FIRST half's own
+/// recursion. That half publishes its own deferred prefix before failing, and
+/// the error then propagates past the trailing call entirely.
+#[test]
+fn store_and_forward_split_floor_failure_in_leading_half_still_commits_the_prefix() {
+    check_split_floor_failure_commits_prefix(32);
+}
+
+fn check_split_floor_failure_commits_prefix(rows: usize) {
     // A split whose remainder is irreducible leaves the prefix on the queue and
     // deferred. A deferred frame is never acked, so without a committing frame
     // after it the prefix can never be acked, never trimmed, and never commits:
@@ -3714,9 +3751,6 @@ fn store_and_forward_split_floor_failure_still_commits_the_deferred_prefix() {
     // mock the deferred prefix would be acked anyway and the test would be
     // vacuous.
     const CAP: usize = 2048;
-    const WIDE: usize = 4000;
-    const ROWS: usize = 16;
-    const NARROW_ROWS: usize = 8;
 
     let (tx, frames) = mpsc::channel();
     let server = MockServer::spawn_with_mode_capture(1, MockMode::DeferAwareAck, Some(tx));
@@ -3730,16 +3764,8 @@ fn store_and_forward_split_floor_failure_still_commits_the_deferred_prefix() {
     );
     let db = QuestDb::connect(&conf).unwrap();
 
-    // Rows 0..8 are one byte; rows 8..16 are wider than the cap, so the tail
-    // block is still too large at the 8-row split floor and split_mid gives up.
-    let mut bytes = Vec::new();
-    let mut offsets = vec![0i32];
-    for row in 0..ROWS {
-        let len = if row < NARROW_ROWS { 1 } else { WIDE };
-        bytes.extend(std::iter::repeat_n(b'x', len));
-        offsets.push(bytes.len() as i32);
-    }
-    let ts: Vec<i64> = (0..ROWS as i64)
+    let (offsets, bytes) = split_floor_rows(rows);
+    let ts: Vec<i64> = (0..rows as i64)
         .map(|x| 1_700_000_000_000_000_000 + x)
         .collect();
     let mut chunk = Chunk::new("trades");
@@ -3749,7 +3775,7 @@ fn store_and_forward_split_floor_failure_still_commits_the_deferred_prefix() {
     let mut sender = db.borrow_sender().unwrap();
     let err = sender
         .flush(&mut chunk)
-        .expect_err("the irreducible tail must fail the flush");
+        .expect_err("the irreducible block must fail the flush");
     assert_eq!(err.code(), ErrorCode::BatchTooLarge);
 
     // The flush failed, but the prefix reached the server. It must be committed,

@@ -1678,19 +1678,21 @@ impl SfaBackend {
                     let row_count = chunk.row_count();
                     match split_mid(row_count) {
                         Some(mid) => {
-                            self.publish_split_sfa(chunk, 0, mid, caps, true)?;
-                            // The prefix is now durably enqueued and deferred. If
-                            // the remainder fails, it leaves that prefix with no
-                            // frame able to commit it, so close the group before
-                            // surfacing the error -- see `commit_orphaned_prefix`.
-                            // The chunk must also not be reported as safe to
-                            // blind-retry, since the prefix did reach the server.
-                            match self.publish_split_sfa(chunk, mid, row_count - mid, caps, false) {
-                                Ok(fsn) => fsn,
-                                Err(e) => {
-                                    self.commit_orphaned_prefix();
-                                    return Err(deny_retry_after_partial(e));
+                            // Either half can fail after enqueueing deferred
+                            // frames -- the halves recurse, so the very first
+                            // call can publish a prefix and then fail on its own
+                            // remainder. Guard both together; see
+                            // `close_failed_split`.
+                            let published_before = self.sfa_published_fsn();
+                            let split = match self.publish_split_sfa(chunk, 0, mid, caps, true) {
+                                Ok(_) => {
+                                    self.publish_split_sfa(chunk, mid, row_count - mid, caps, false)
                                 }
+                                Err(e) => Err(e),
+                            };
+                            match split {
+                                Ok(fsn) => fsn,
+                                Err(e) => return Err(self.close_failed_split(published_before, e)),
                             }
                         }
                         None => return Err(FlushFailure::NotDelivered(err)),
@@ -1728,6 +1730,33 @@ impl SfaBackend {
     /// queue that failed the suffix), and there is nothing further to do about
     /// it: the caller is already returning an error, and returning THIS error
     /// instead would hide the size failure that actually explains the flush.
+    /// The queue's published-FSN watermark, or `None` if it cannot be read.
+    fn sfa_published_fsn(&self) -> Option<u64> {
+        qwp_ws_published_fsn_background(&self.state).ok().flatten()
+    }
+
+    /// Handle a split that failed part-way: close the group if anything reached
+    /// the queue, and classify the error accordingly.
+    ///
+    /// A split recurses, so a failure in either half can leave deferred frames
+    /// enqueued -- including the very first call, which publishes its own prefix
+    /// before failing on its own remainder. Comparing the published watermark
+    /// tells the two cases apart: frames enqueued means the chunk partly reached
+    /// the server, so it needs a committing frame after it AND must not be
+    /// reported as safe to blind-retry. Nothing enqueued means the flush is a
+    /// clean rejection and stays one.
+    fn close_failed_split(
+        &mut self,
+        published_before: Option<u64>,
+        err: FlushFailure,
+    ) -> FlushFailure {
+        if self.sfa_published_fsn() == published_before {
+            return err;
+        }
+        self.commit_orphaned_prefix();
+        deny_retry_after_partial(err)
+    }
+
     fn commit_orphaned_prefix(&mut self) {
         let empty = Chunk::new("");
         let frame_cap = self.effective_frame_caps().hard;
@@ -1913,20 +1942,24 @@ impl SfaBackend {
                     let row_count = batch.num_rows();
                     match split_mid(row_count) {
                         Some(mid) => {
-                            self.publish_arrow_split_sfa(&spec, 0, mid, caps, true)?;
-                            // Prefix is durably queued and deferred; see
-                            // `flush_chunk_boundary` and `commit_orphaned_prefix`.
-                            match self.publish_arrow_split_sfa(
-                                &spec,
-                                mid,
-                                row_count - mid,
-                                caps,
-                                false,
-                            ) {
+                            // Both halves guarded together; see
+                            // `flush_chunk_boundary` and `close_failed_split`.
+                            let published_before = self.sfa_published_fsn();
+                            let split =
+                                match self.publish_arrow_split_sfa(&spec, 0, mid, caps, true) {
+                                    Ok(_) => self.publish_arrow_split_sfa(
+                                        &spec,
+                                        mid,
+                                        row_count - mid,
+                                        caps,
+                                        false,
+                                    ),
+                                    Err(e) => Err(e),
+                                };
+                            match split {
                                 Ok(fsn) => fsn,
                                 Err(e) => {
-                                    self.commit_orphaned_prefix();
-                                    return Err(deny_retry_after_partial(e));
+                                    return Err(self.close_failed_split(published_before, e));
                                 }
                             }
                         }
