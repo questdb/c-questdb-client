@@ -119,6 +119,16 @@ impl RejectionEventSource {
             + live
     }
 
+    /// Test-only: block until the dispatcher's worker thread is running,
+    /// returning `false` on timeout, on a failed spawn, or when there is no
+    /// dispatcher at all.
+    #[cfg(test)]
+    pub(crate) fn wait_for_dispatcher_start(&self, timeout: std::time::Duration) -> bool {
+        self.lock_dispatcher()
+            .as_ref()
+            .is_some_and(|dispatcher| dispatcher.wait_for_worker_start(timeout))
+    }
+
     pub(crate) fn dropped(&self) -> u64 {
         let live = self
             .lock_dispatcher()
@@ -212,6 +222,13 @@ mod tests {
                 let source = RejectionEventSource::with_handler(
                     QwpWsErrorHandler::new(|_: &QwpWsSenderError| {}),
                     4,
+                );
+                // A failed spawn leaves nothing to join, which would make
+                // every close below trivially return; each round only
+                // exercises the join path once its worker is running.
+                assert!(
+                    source.wait_for_dispatcher_start(Duration::from_secs(10)),
+                    "round {round}: the dispatcher worker never started"
                 );
                 // Sweep the gap so the close lands across the whole startup
                 // window, including the instant the thread holds the inbox

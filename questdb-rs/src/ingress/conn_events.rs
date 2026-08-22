@@ -131,6 +131,10 @@ struct DispatcherInner<T> {
     closed: AtomicBool,
     dropped: AtomicU64,
     delivered: AtomicU64,
+    /// Set by the worker as it enters `dispatch_loop`, so a test can tell
+    /// a running worker from one that never spawned.
+    #[cfg(test)]
+    worker_started: (Mutex<bool>, Condvar),
 }
 
 impl<T> DispatcherInner<T> {
@@ -139,6 +143,38 @@ impl<T> DispatcherInner<T> {
             Ok(inbox) => inbox,
             Err(poisoned) => poisoned.into_inner(),
         }
+    }
+
+    #[cfg(test)]
+    fn signal_worker_start(&self) {
+        let (started, signal) = &self.worker_started;
+        let mut started = match started.lock() {
+            Ok(started) => started,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        *started = true;
+        signal.notify_all();
+    }
+
+    #[cfg(test)]
+    fn wait_for_worker_start(&self, timeout: std::time::Duration) -> bool {
+        let (started, signal) = &self.worker_started;
+        let deadline = std::time::Instant::now() + timeout;
+        let mut started = match started.lock() {
+            Ok(started) => started,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        while !*started {
+            let now = std::time::Instant::now();
+            if now >= deadline {
+                return false;
+            }
+            started = match signal.wait_timeout(started, deadline - now) {
+                Ok((started, _)) => started,
+                Err(poisoned) => poisoned.into_inner().0,
+            };
+        }
+        true
     }
 }
 
@@ -185,6 +221,8 @@ impl<T: std::fmt::Debug + Send + 'static> EventDispatcher<T> {
             closed: AtomicBool::new(false),
             dropped: AtomicU64::new(0),
             delivered: AtomicU64::new(0),
+            #[cfg(test)]
+            worker_started: (Mutex::new(false), Condvar::new()),
         });
         let thread_inner = Arc::clone(&inner);
         let thread = match std::thread::Builder::new()
@@ -231,6 +269,15 @@ impl<T: std::fmt::Debug + Send + 'static> EventDispatcher<T> {
         self.inner.delivered.load(Ordering::Relaxed)
     }
 
+    /// Test-only: block until the worker thread has entered its dispatch
+    /// loop, returning `false` on timeout or when the spawn failed. Lets a
+    /// test that exercises the close/join path prove there was a worker to
+    /// join, rather than passing because no thread was ever created.
+    #[cfg(test)]
+    pub(crate) fn wait_for_worker_start(&self, timeout: std::time::Duration) -> bool {
+        self.thread.is_some() && self.inner.wait_for_worker_start(timeout)
+    }
+
     /// Drop the dispatcher (joining its thread, so any in-flight listener
     /// invocation completes) and return the final `(delivered, dropped)`.
     pub(crate) fn shutdown(self) -> (u64, u64) {
@@ -275,6 +322,8 @@ impl<T> Drop for EventDispatcher<T> {
 }
 
 fn dispatch_loop<T: std::fmt::Debug>(inner: Arc<DispatcherInner<T>>) {
+    #[cfg(test)]
+    inner.signal_worker_start();
     loop {
         let event = {
             let mut inbox = inner.lock_inbox();
