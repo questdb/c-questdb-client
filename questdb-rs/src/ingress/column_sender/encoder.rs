@@ -820,7 +820,9 @@ unsafe fn encode_column(
             row_count: numpy_rows,
         } => {
             debug_assert_eq!(numpy_rows, row_count);
-            unsafe { numpy_wire::emit_into_wire(out, dtype, data, numpy_rows, validity)? };
+            unsafe {
+                numpy_wire::emit_into_wire(out, dtype, data, numpy_rows, validity, &col.name)?
+            };
         }
     }
     Ok(())

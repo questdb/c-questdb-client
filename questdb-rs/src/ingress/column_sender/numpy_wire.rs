@@ -32,6 +32,7 @@
 //! else. The numpy entry point can build (and run at full coverage)
 //! without the `arrow` Cargo feature.
 
+use std::ptr;
 use std::slice;
 
 use crate::ingress::{MAX_ARRAY_DIMS, MAX_NDARRAY_LEAF_ELEMS};
@@ -414,6 +415,7 @@ pub(crate) unsafe fn emit_into_wire(
     data: *const u8,
     row_count: usize,
     validity: Option<&ValidityDescriptor>,
+    column: &str,
 ) -> Result<()> {
     use NumpyDtype as D;
     match dtype {
@@ -595,16 +597,16 @@ pub(crate) unsafe fn emit_into_wire(
 
         // ---- Geohash (bits byte + bitmap-encoded width-N rows) ----
         D::GeohashI8 { bits } => unsafe {
-            emit_geohash::<1>(out, bits, data, row_count, validity)?
+            emit_geohash::<1>(out, bits, data, row_count, validity, column)?
         },
         D::GeohashI16 { bits } => unsafe {
-            emit_geohash::<2>(out, bits, data, row_count, validity)?
+            emit_geohash::<2>(out, bits, data, row_count, validity, column)?
         },
         D::GeohashI32 { bits } => unsafe {
-            emit_geohash::<4>(out, bits, data, row_count, validity)?
+            emit_geohash::<4>(out, bits, data, row_count, validity, column)?
         },
         D::GeohashI64 { bits } => unsafe {
-            emit_geohash::<8>(out, bits, data, row_count, validity)?
+            emit_geohash::<8>(out, bits, data, row_count, validity, column)?
         },
 
         // ---- f64 ndarray (DOUBLE_ARRAY, bitmap-encoded nulls) ----
@@ -1203,6 +1205,11 @@ unsafe fn emit_decimal<const N: usize>(
 /// The encoder writes the low `elem` bytes of each source int, matching
 /// `arrow_batch::write_geohash_payload`. Caller has validated `bits` is
 /// within the source dtype's representable range.
+///
+/// Every non-null value is held to the claimed precision first. The
+/// truncation is here, so the bound is here too, and it runs as its own
+/// pass so the whole-column memcpy stays available to the values that
+/// pass it.
 #[inline]
 unsafe fn emit_geohash<const SRC: usize>(
     out: &mut Vec<u8>,
@@ -1210,6 +1217,7 @@ unsafe fn emit_geohash<const SRC: usize>(
     data: *const u8,
     row_count: usize,
     validity: Option<&ValidityDescriptor>,
+    column: &str,
 ) -> Result<()> {
     let elem = (bits as usize).div_ceil(8);
     if elem > SRC {
@@ -1218,7 +1226,9 @@ unsafe fn emit_geohash<const SRC: usize>(
             "numpy geohash bits ({bits}) exceeds source dtype width ({SRC} bytes)"
         ));
     }
-    match validity.filter(|v| v.has_nulls()) {
+    let with_nulls = validity.filter(|v| v.has_nulls());
+    unsafe { check_geohash_range::<SRC>(bits, data, row_count, with_nulls, column)? };
+    match with_nulls {
         None => {
             out.push(0);
             out.reserve(1 + elem * row_count);
@@ -1246,6 +1256,60 @@ unsafe fn emit_geohash<const SRC: usize>(
                     out.extend_from_slice(row);
                 }
             }
+        }
+    }
+    Ok(())
+}
+
+/// Refuse a GEOHASH value the claimed precision cannot hold, naming the
+/// column and the row.
+///
+/// A geohash's high bits are its coarse position, so a value truncated
+/// to `bits` reaches the database as a valid geohash for somewhere else
+/// entirely. A precision that fills the source width uses every bit,
+/// including the one that reads as a sign, so its top half is stored as
+/// negative numbers and every value is in range; a narrower precision
+/// leaves the sign bit clear, so a negative value there is out of range.
+///
+/// # Safety
+///
+/// `data` must point at `row_count` contiguous `SRC`-byte signed ints,
+/// and `validity` (when present) must describe those same rows.
+unsafe fn check_geohash_range<const SRC: usize>(
+    bits: u8,
+    data: *const u8,
+    row_count: usize,
+    validity: Option<&ValidityDescriptor>,
+    column: &str,
+) -> Result<()> {
+    if bits as usize >= SRC * 8 {
+        return Ok(());
+    }
+    let max = (1i64 << bits) - 1;
+    for i in 0..row_count {
+        if let Some(v) = validity
+            && !unsafe { v.is_valid(i) }
+        {
+            continue;
+        }
+        let mut buf = [0u8; 8];
+        unsafe { ptr::copy_nonoverlapping(data.add(i * SRC), buf.as_mut_ptr(), SRC) };
+        // Sign-extend the source width into an `i64` so a negative
+        // value reads as negative whatever width it arrived in.
+        let raw = u64::from_le_bytes(buf);
+        let shift = 64 - SRC * 8;
+        let value = ((raw << shift) as i64) >> shift;
+        if value < 0 || value > max {
+            return Err(error::fmt!(
+                InvalidApiCall,
+                "column {:?}: row {} holds {}, which a GEOHASH({}b) cannot \
+                 carry; values must be in 0 .. {}",
+                column,
+                i,
+                value,
+                bits,
+                max
+            ));
         }
     }
     Ok(())
@@ -1507,6 +1571,108 @@ mod tests {
             D::F64Ndarray { ndim: 2, shape }.source_elem_size().unwrap(),
             2 * 3 * 8
         );
+    }
+
+    fn geohash_chunk_err(
+        dtype: NumpyDtype,
+        raw: &[u8],
+        validity: Option<&Validity<'_>>,
+    ) -> crate::Error {
+        let ts: Vec<i64> = (0..raw_rows(dtype, raw)).map(|i| i as i64 + 1).collect();
+        let mut chunk = Chunk::new("t");
+        unsafe {
+            chunk
+                .push_numpy_deferred("g", dtype, raw.as_ptr(), ts.len(), validity)
+                .unwrap();
+        }
+        chunk.at_nanos(&ts).unwrap();
+        encode_err(&chunk)
+    }
+
+    fn raw_rows(dtype: NumpyDtype, raw: &[u8]) -> usize {
+        raw.len() / dtype.source_elem_size().unwrap()
+    }
+
+    #[test]
+    fn geohash_value_wider_than_its_precision_is_refused_naming_column_and_row() {
+        // The wire keeps the low `ceil(bits/8)` bytes, so a value that does
+        // not fit would arrive as a valid geohash for somewhere else. The
+        // whole-column memcpy path (elem == SRC) is the one that used to
+        // carry it through unread, so exercise it: bits 60 over an i64.
+        let raw: Vec<u8> = [0i64, 1i64 << 60]
+            .iter()
+            .flat_map(|v| v.to_le_bytes())
+            .collect();
+        let err = geohash_chunk_err(NumpyDtype::GeohashI64 { bits: 60 }, &raw, None);
+        assert_eq!(err.code(), crate::ErrorCode::InvalidApiCall);
+        assert!(err.msg().contains("row 1"), "{}", err.msg());
+        assert!(err.msg().contains("GEOHASH(60b)"), "{}", err.msg());
+        assert!(err.msg().contains("\"g\""), "{}", err.msg());
+    }
+
+    #[test]
+    fn geohash_negative_value_below_full_width_is_refused() {
+        // A precision narrower than the source leaves the sign bit clear,
+        // so a negative value is out of range, not the top of the space.
+        let raw: Vec<u8> = (-1i32).to_le_bytes().to_vec();
+        let err = geohash_chunk_err(NumpyDtype::GeohashI32 { bits: 20 }, &raw, None);
+        assert_eq!(err.code(), crate::ErrorCode::InvalidApiCall);
+        assert!(err.msg().contains("row 0"), "{}", err.msg());
+    }
+
+    #[test]
+    fn geohash_filling_the_source_width_keeps_its_negative_half() {
+        // A 32-bit precision in an `int32` uses every bit, including the
+        // one that reads as a sign, so its top half sits in the source as
+        // negative numbers and every value is in range.
+        let src = [-1i32, i32::MIN];
+        let raw: Vec<u8> = src.iter().flat_map(|v| v.to_le_bytes()).collect();
+        let ts = [1i64, 2];
+        let mut chunk = Chunk::new("t");
+        unsafe {
+            chunk
+                .push_numpy_deferred(
+                    "g",
+                    NumpyDtype::GeohashI32 { bits: 32 },
+                    raw.as_ptr(),
+                    2,
+                    None,
+                )
+                .unwrap();
+        }
+        chunk.at_nanos(&ts).unwrap();
+        let out = encode(&chunk);
+        let expected: Vec<u8> = raw.clone();
+        assert!(
+            out.windows(expected.len()).any(|w| w == expected),
+            "a full-width geohash column must reach the wire unchanged"
+        );
+    }
+
+    #[test]
+    fn geohash_null_row_carries_no_value_to_check() {
+        // Row 0 is null and holds a value no precision could carry; only
+        // the rows that go out are held to the precision.
+        let src = [i32::MAX, 7i32];
+        let raw: Vec<u8> = src.iter().flat_map(|v| v.to_le_bytes()).collect();
+        let bits = [0b0000_0010u8]; // row 0 null
+        let validity = Validity::from_bitmap(&bits, 2).unwrap();
+        let ts = [1i64, 2];
+        let mut chunk = Chunk::new("t");
+        unsafe {
+            chunk
+                .push_numpy_deferred(
+                    "g",
+                    NumpyDtype::GeohashI32 { bits: 20 },
+                    raw.as_ptr(),
+                    2,
+                    Some(&validity),
+                )
+                .unwrap();
+        }
+        chunk.at_nanos(&ts).unwrap();
+        let out = encode(&chunk);
+        assert!(!out.is_empty());
     }
 
     #[test]

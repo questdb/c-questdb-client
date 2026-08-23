@@ -2063,6 +2063,36 @@ fn geohash_bytes_per_value(bits: u8) -> usize {
     (bits as usize).div_ceil(8)
 }
 
+/// Whether a source value fits the claimed GEOHASH precision.
+///
+/// The wire keeps the low `ceil(bits/8)` bytes of each value and a
+/// geohash's high bits are its coarse position, so a value that does not
+/// fit reaches the database as a valid geohash for somewhere else
+/// entirely. A precision that fills the source width uses every bit,
+/// including the one that reads as a sign, so its top half is stored as
+/// negative numbers and every value is in range; a narrower precision
+/// leaves the sign bit clear, so a negative value there is out of range.
+#[inline]
+fn geohash_value_fits(v: i64, bits: u8, src_width_bits: u32) -> bool {
+    if u32::from(bits) >= src_width_bits {
+        return true;
+    }
+    v >= 0 && v < (1i64 << bits)
+}
+
+#[cold]
+fn geohash_value_out_of_range(v: i64, bits: u8, row: usize) -> Error {
+    fmt!(
+        ArrowIngest,
+        "GEOHASH column: row {} holds {}, which a GEOHASH({}b) cannot carry; \
+         values must be in 0 .. {}",
+        row,
+        v,
+        bits,
+        (1i64 << bits) - 1
+    )
+}
+
 fn write_geohash_payload(out: &mut Vec<u8>, arr: &dyn Array, bits: u8) -> Result<()> {
     let elem = geohash_bytes_per_value(bits);
     let row_count = arr.len();
@@ -2071,47 +2101,32 @@ fn write_geohash_payload(out: &mut Vec<u8>, arr: &dyn Array, bits: u8) -> Result
     try_reserve_bytes(out, 1 + non_null * elem, label)?;
     write_qwp_varint(out, bits as u64);
     let dt = arr.data_type();
+
+    // Each arm reads the column at its own width, holds every non-null
+    // value to the claimed precision, and writes the low `elem` bytes.
+    // The bound is here, at the truncation, so every client that reaches
+    // this encoder is held to it.
+    macro_rules! write_rows {
+        ($ty:ty, $width_bits:expr) => {{
+            let a = arr.as_any().downcast_ref::<$ty>().unwrap();
+            for row in 0..row_count {
+                if arr.is_null(row) {
+                    continue;
+                }
+                let v = a.value(row) as i64;
+                if !geohash_value_fits(v, bits, $width_bits) {
+                    return Err(geohash_value_out_of_range(v, bits, row));
+                }
+                out.extend_from_slice(&(v as u64).to_le_bytes()[..elem]);
+            }
+        }};
+    }
+
     match dt {
-        DataType::Int8 => {
-            let a = arr.as_any().downcast_ref::<Int8Array>().unwrap();
-            for row in 0..row_count {
-                if arr.is_null(row) {
-                    continue;
-                }
-                let v = a.value(row) as u64;
-                out.extend_from_slice(&v.to_le_bytes()[..elem]);
-            }
-        }
-        DataType::Int16 => {
-            let a = arr.as_any().downcast_ref::<Int16Array>().unwrap();
-            for row in 0..row_count {
-                if arr.is_null(row) {
-                    continue;
-                }
-                let v = a.value(row) as u64;
-                out.extend_from_slice(&v.to_le_bytes()[..elem]);
-            }
-        }
-        DataType::Int32 => {
-            let a = arr.as_any().downcast_ref::<Int32Array>().unwrap();
-            for row in 0..row_count {
-                if arr.is_null(row) {
-                    continue;
-                }
-                let v = a.value(row) as u64;
-                out.extend_from_slice(&v.to_le_bytes()[..elem]);
-            }
-        }
-        DataType::Int64 => {
-            let a = arr.as_any().downcast_ref::<Int64Array>().unwrap();
-            for row in 0..row_count {
-                if arr.is_null(row) {
-                    continue;
-                }
-                let v = a.value(row) as u64;
-                out.extend_from_slice(&v.to_le_bytes()[..elem]);
-            }
-        }
+        DataType::Int8 => write_rows!(Int8Array, 8),
+        DataType::Int16 => write_rows!(Int16Array, 16),
+        DataType::Int32 => write_rows!(Int32Array, 32),
+        DataType::Int64 => write_rows!(Int64Array, 64),
         other => {
             return Err(fmt!(
                 ArrowIngest,
@@ -7436,6 +7451,62 @@ mod tests {
         let field = Field::new("g", DataType::Int64, true)
             .with_metadata(metadata(&[(crate::arrow_metadata::GEOHASH_BITS, "60")]));
         let rb = single_col_batch(field, b.finish());
+        assert_ok_with_table_count(&rb, 1);
+    }
+
+    fn geohash_batch<A: Array + 'static>(dt: DataType, bits: &str, arr: A) -> RecordBatch {
+        let field = Field::new("g", dt, true)
+            .with_metadata(metadata(&[(crate::arrow_metadata::GEOHASH_BITS, bits)]));
+        single_col_batch(field, arr)
+    }
+
+    #[test]
+    fn geohash_value_wider_than_its_precision_is_refused_naming_the_row() {
+        // The wire keeps the low `ceil(bits/8)` bytes, and a geohash's
+        // high bits are its coarse position, so a value that does not fit
+        // would arrive as a valid geohash for somewhere else entirely.
+        let mut b = Int64Builder::new();
+        b.append_value(0);
+        b.append_value(1i64 << 60);
+        let rb = geohash_batch(DataType::Int64, "60", b.finish());
+        let err = encode_err(&rb);
+        assert_eq!(err.code(), ErrorCode::ArrowIngest);
+        assert!(err.msg().contains("row 1"), "{}", err.msg());
+        assert!(err.msg().contains("GEOHASH(60b)"), "{}", err.msg());
+        assert!(err.msg().contains("'g'"), "{}", err.msg());
+    }
+
+    #[test]
+    fn geohash_negative_value_below_full_width_is_refused() {
+        // A precision narrower than the column leaves the sign bit clear,
+        // so a negative value is out of range rather than the top half of
+        // the space.
+        let mut b = Int32Builder::new();
+        b.append_value(-1);
+        let rb = geohash_batch(DataType::Int32, "20", b.finish());
+        let err = encode_err(&rb);
+        assert_eq!(err.code(), ErrorCode::ArrowIngest);
+        assert!(err.msg().contains("row 0"), "{}", err.msg());
+    }
+
+    #[test]
+    fn geohash_filling_the_column_width_keeps_its_negative_half() {
+        // A 32-bit precision in an `int32` uses every bit, including the
+        // one that reads as a sign, so its top half sits in the column as
+        // negative numbers and every value is in range.
+        let mut b = Int32Builder::new();
+        b.append_value(-1);
+        b.append_value(i32::MIN);
+        let rb = geohash_batch(DataType::Int32, "32", b.finish());
+        assert_ok_with_table_count(&rb, 1);
+    }
+
+    #[test]
+    fn geohash_null_row_carries_no_value_to_check() {
+        let mut b = Int32Builder::new();
+        b.append_null();
+        b.append_value(7);
+        let rb = geohash_batch(DataType::Int32, "20", b.finish());
         assert_ok_with_table_count(&rb, 1);
     }
 
