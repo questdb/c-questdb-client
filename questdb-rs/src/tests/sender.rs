@@ -598,6 +598,55 @@ fn test_clone_preserves_marker_rewind_state() -> TestResult {
     Ok(())
 }
 
+/// A rewind must unwind every table the bookmark spanned, not only the one
+/// being written when it was taken.
+///
+/// The rewind records the row and column counts each table had and truncates
+/// back to them, rather than copying what it would discard. That makes the
+/// interesting case several tables interleaved across the bookmark: tables
+/// written before it must keep exactly their earlier rows, tables created after
+/// it must disappear, and a table written both before and after must keep only
+/// the earlier rows. Columns introduced after the bookmark must go too, so
+/// reusing the table afterwards must not see them.
+#[test]
+fn test_bookmark_rewinds_every_table_it_spans() -> TestResult {
+    // QWP/WS specifically: this is the variant whose rewind point is captured
+    // by recording lengths. An ILP buffer takes a different path.
+    let mut buffer = Buffer::qwp_ws_with_max_name_len(127);
+
+    buffer.table("alpha")?.symbol("sym", "a1")?.at_now()?;
+    buffer.table("beta")?.symbol("sym", "b1")?.at_now()?;
+    assert_eq!(buffer.row_count(), 2);
+
+    let bookmark = buffer.bookmark()?;
+
+    // A table from before the bookmark, gaining a row and a new column.
+    buffer
+        .table("alpha")?
+        .symbol("sym", "a2")?
+        .symbol("extra", "late")?
+        .at_now()?;
+    // Another from before it.
+    buffer.table("beta")?.symbol("sym", "b2")?.at_now()?;
+    // And one that did not exist at all.
+    buffer.table("gamma")?.symbol("sym", "g1")?.at_now()?;
+    assert_eq!(buffer.row_count(), 5);
+
+    buffer.rewind_to_bookmark(bookmark)?;
+    assert_eq!(buffer.row_count(), 2, "only the pre-bookmark rows survive");
+
+    // The buffer stays usable, and the column added after the bookmark is gone:
+    // writing "alpha" again without it must still produce a coherent row.
+    buffer.table("alpha")?.symbol("sym", "a3")?.at_now()?;
+    assert_eq!(buffer.row_count(), 3);
+
+    // A table that only existed after the bookmark can be created afresh.
+    buffer.table("gamma")?.symbol("sym", "g2")?.at_now()?;
+    assert_eq!(buffer.row_count(), 4);
+
+    Ok(())
+}
+
 #[test]
 fn test_clear_bookmark_is_idempotent() -> TestResult {
     let mut buffer = Buffer::new(ProtocolVersion::V2);

@@ -2384,12 +2384,24 @@ impl QwpWsLocalSymbolLookup {
 
 #[cfg(feature = "_sender-qwp-ws")]
 #[derive(Clone, Debug)]
+/// Where a bookmark rewinds to.
+///
+/// Records the lengths a rewind truncates back to rather than copying what it
+/// would discard. A rewind only ever removes what was appended after the
+/// bookmark -- rows from each table, tables added since, and the columns those
+/// rows introduced -- and `QwpWsTableBuffer::restore` already performs exactly
+/// that truncation for row-level rollback. Cloning `tables` instead made the
+/// capture proportional to everything already buffered, so a caller that
+/// bookmarks per row paid a copy that grew as the buffer filled: quadratic in
+/// rows for a linear amount of appending.
 struct QwpWsSnapshot {
-    tables: Vec<QwpWsTableBuffer>,
-    table_lookup: std::collections::HashMap<Vec<u8>, usize>,
+    /// Tables present at capture. Any beyond this were added after, and are
+    /// truncated away.
+    tables_len: usize,
+    /// One mark per table present at capture, in table order.
+    table_marks: Vec<QwpWsTableRollbackMark>,
     current_table_idx: Option<usize>,
     state: BufferState,
-    size_hint: QwpWsSizeHint,
 }
 
 #[cfg(feature = "_sender-qwp-ws")]
@@ -2935,15 +2947,10 @@ impl QwpWsColumnarBuffer {
 
     fn capture_snapshot(&mut self) -> crate::Result<QwpWsMarker> {
         self.snapshot = Some(QwpWsSnapshot {
-            tables: self.tables.clone(),
-            table_lookup: self.table_lookup.clone(),
+            tables_len: self.tables.len(),
+            table_marks: self.tables.iter().map(|t| t.rollback_mark()).collect(),
             current_table_idx: self.current_table_idx,
             state: self.state,
-            size_hint: self
-                .size_hint
-                .get_mut()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .clone(),
         });
         Ok(QwpWsMarker)
     }
@@ -2953,11 +2960,25 @@ impl QwpWsColumnarBuffer {
             .snapshot
             .take()
             .ok_or_else(|| error::fmt!(InvalidApiCall, "Can't rewind to stale QWP/WS marker."))?;
-        self.tables = snapshot.tables;
-        self.table_lookup = snapshot.table_lookup;
+        // Drop tables added after the bookmark, then unwind each surviving table
+        // to the row and column counts it had. `restore` truncates every
+        // column's data back to `row_count`, so no per-column state is needed.
+        self.tables.truncate(snapshot.tables_len);
+        for (table, mark) in self.tables.iter_mut().zip(snapshot.table_marks) {
+            table.restore(mark);
+        }
+        self.rebuild_table_lookup();
         self.current_table_idx = snapshot.current_table_idx;
         self.state = snapshot.state;
-        self.size_hint = Mutex::new(snapshot.size_hint);
+        let table_count = self.tables.len();
+        let size_hint = self
+            .size_hint
+            .get_mut()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        size_hint.truncate(table_count);
+        for idx in 0..table_count {
+            size_hint.mark_dirty(idx);
+        }
         self.bookmark.clear();
         Ok(())
     }
