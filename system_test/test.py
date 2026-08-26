@@ -2479,14 +2479,6 @@ class TestQwpWsFuzz(QwpWsTestSupport, unittest.TestCase):
     def _is_windows():
         return qwp_ws_fuzz.is_windows()
 
-    @staticmethod
-    def _cap_macos_producer_threads(load):
-        # Each producer holds a WebSocket and several SFA descriptors in the
-        # Python runner. Bound producer concurrency on macOS to reduce its
-        # descriptor pressure while retaining full concurrency elsewhere.
-        if sys.platform == 'darwin':
-            load.num_of_threads = min(load.num_of_threads, 8)
-
     def _log(self, msg: str):
         sys.stderr.write(f'[qwp_ws_fuzz] {msg}\n')
         sys.stderr.flush()
@@ -2598,8 +2590,10 @@ class TestQwpWsFuzz(QwpWsTestSupport, unittest.TestCase):
 
     def _run_fuzz(self, load: 'qwp_ws_fuzz.LoadParams',
                   fuzz: 'qwp_ws_fuzz.FuzzParams'):
-        # Keep the platform-specific concurrency policy shared by every load.
-        self._cap_macos_producer_threads(load)
+        # High-concurrency schema fuzzing can drive enough concurrent
+        # QuestDB WAL/column files to exhaust the hosted macOS process FD cap.
+        # Apply one shared policy so every fuzz workload gets the same bound.
+        qwp_ws_fuzz.cap_macos_producer_threads(load, sys.platform)
 
         # Pre-create per-table buffers. Java keys by lowercase name (case-
         # insensitive) so 'WEATHER0' and 'weather0' resolve to the same
