@@ -74,12 +74,18 @@ stages:
           #   displayName: "Publish build directory"
       # mac/windows: run cargo vs native (build + C++ + integration) as two
       # parallel jobs to cut the slow legs' wall-clock. linux stays in RunOn.
+      #
+      # Every mac leg in this file pins macOS-15-arm64. The plain
+      # macOS-14/15/26 Azure images are Intel x86-64, and QuestDB bundles a
+      # macOS native library for aarch64 only, so a job that starts the server
+      # cannot run on an Intel agent. Keeping the cargo-only legs on the same
+      # image tests the one macOS architecture the client ships against.
       - job: RustTests
         displayName: "cargo tests (mac/windows)"
         strategy:
           matrix:
             mac:
-              imageName: "macos-latest"
+              imageName: "macOS-15-arm64"
             windows-msvc-2022:
               imageName: "windows-2022"
             windows-msvc-2025:
@@ -99,7 +105,7 @@ stages:
         strategy:
           matrix:
             mac:
-              imageName: "macos-latest"
+              imageName: "macOS-15-arm64"
             windows-msvc-2022:
               imageName: "windows-2022"
             windows-msvc-2025:
@@ -118,6 +124,7 @@ stages:
           - script: python3 ci/run_all_tests.py cpp
             displayName: "C++ tests"
           # Build QuestDB master for run_all_tests.py's `--repo ./questdb`.
+          - template: templates/resolve_jdk25.yaml
           - template: templates/clone_questdb.yaml
           - task: Maven@3
             displayName: "Compile QuestDB"
@@ -125,11 +132,11 @@ stages:
             inputs:
               mavenPOMFile: "questdb/pom.xml"
               javaHomeOption: "Path"
-              jdkDirectory: "$(JAVA_HOME_25_X64)"
+              jdkDirectory: "$(JAVA_HOME)"
               options: "-DskipTests -Pbuild-web-console$(CLIENT_PROFILE)"
           - script: python3 ci/run_all_tests.py integration
             env:
-              JAVA_HOME: $(JAVA_HOME_25_X64)
+              JAVA_HOME: $(JAVA_HOME)
             displayName: "Integration tests"
           - task: ArchiveFiles@2
             displayName: "Compress QuestDB server log on failure"
@@ -386,7 +393,7 @@ stages:
         strategy:
           matrix:
             mac:
-              imageName: "macos-latest"
+              imageName: "macOS-15-arm64"
             windows-2022:
               imageName: "windows-2022"
         pool:
@@ -398,32 +405,7 @@ stages:
             lfs: false
             submodules: false
           - template: templates/compile.yaml
-          # Linux and Windows runners ship with JDK 25 at $JAVA_HOME_25_X64.
-          # macOS-latest doesn't, so we brew-install openjdk@25 there and
-          # discover its install location with `brew --prefix`. Both
-          # paths set JAVA_HOME via a single bash step so the Windows
-          # version doesn't trip on cmd.exe's quote handling
-          # (`echo "##vso[...]$x"` in cmd preserves the surrounding
-          # quotes, which previously made Maven@3 see a stray `"` at
-          # the end of the JDK path).
-          - bash: |
-              set -e
-              if [[ "$AGENT_OS" == "Darwin" ]]; then
-                brew install openjdk@25
-                JDK_HOME="$(brew --prefix openjdk@25)/libexec/openjdk.jdk/Contents/Home"
-                if [ ! -d "$JDK_HOME" ]; then
-                  JDK_HOME="$(/usr/libexec/java_home -v 25 2>/dev/null || true)"
-                fi
-                if [ ! -d "$JDK_HOME" ]; then
-                  echo "JDK 25 not found after brew install" >&2
-                  exit 1
-                fi
-              else
-                JDK_HOME="$JAVA_HOME_25_X64"
-              fi
-              echo "Resolved JDK 25: $JDK_HOME"
-              echo "##vso[task.setvariable variable=JAVA_HOME]$JDK_HOME"
-            displayName: "Resolve JDK 25"
+          - template: templates/resolve_jdk25.yaml
           - template: templates/clone_questdb.yaml
           - template: templates/maven_settings.yaml
           - task: Maven@3

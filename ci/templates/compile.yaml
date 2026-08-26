@@ -21,16 +21,19 @@ steps:
       rustup default $(toolchain)
     condition: ne(variables['toolchain'], '')
     displayName: "Update and set Rust toolchain"
+  # Keyed on the agent OS, not the image label: the macOS legs run on
+  # macOS-15-arm64, the Linux legs run on both hosted and self-hosted images,
+  # and only the OS decides whether the dependencies come from Homebrew or pip.
   - script: |
       brew install numpy apache-arrow
       python3 -m pip install --break-system-packages pyarrow polars
       echo "##vso[task.setvariable variable=CMAKE_PREFIX_PATH]$(brew --prefix)"
-    condition: eq(variables['imageName'], 'macos-latest')
+    condition: eq(variables['Agent.OS'], 'Darwin')
     displayName: "Install numpy + pyarrow + polars + apache-arrow on macOS"
   - script: |
       python -m pip install --upgrade pip
       pip install numpy pyarrow polars tzdata
-    condition: ne(variables['imageName'], 'macos-latest')
+    condition: ne(variables['Agent.OS'], 'Darwin')
     env:
       PIP_BREAK_SYSTEM_PACKAGES: "1"
     displayName: "Install Python Dependencies"
