@@ -36,7 +36,9 @@ hung in graceful shutdown):
   being silently absorbed;
 * a clean shutdown stays quiet and does not raise;
 * `print_log()` reads the log as bytes so a force-kill that truncates
-  it mid-character can't crash the dump.
+  it mid-character can't crash the dump;
+* a managed macOS JVM inherits the hard open-file limit without leaving
+  the Python test runner's soft limit changed.
 
 Run with::
 
@@ -53,6 +55,7 @@ import signal
 import subprocess
 import tempfile
 import time
+import types
 import unittest
 from unittest import mock
 
@@ -63,6 +66,84 @@ def _make_fixture(tmp_dir: str) -> fixture.QuestDbFixture:
     root_dir = pathlib.Path(tmp_dir) / 'questdb-1.2.3'
     (root_dir / 'data').mkdir(parents=True)
     return fixture.QuestDbFixture(root_dir)
+
+
+class MacOsNoFileLimitTest(unittest.TestCase):
+
+    def test_raises_for_child_then_restores_runner_limit(self):
+        fake_resource = types.SimpleNamespace(
+            RLIMIT_NOFILE=8,
+            getrlimit=mock.Mock(return_value=(256, 1_048_576)),
+            setrlimit=mock.Mock())
+
+        with mock.patch.object(fixture.sys, 'platform', 'darwin'), \
+                mock.patch.dict(sys.modules, {'resource': fake_resource}):
+            with fixture._macos_java_nofile_limit() as prepared:
+                self.assertTrue(prepared)
+                fake_resource.setrlimit.assert_called_once_with(
+                    fake_resource.RLIMIT_NOFILE,
+                    (1_048_576, 1_048_576))
+
+        self.assertEqual(
+            fake_resource.setrlimit.call_args_list,
+            [
+                mock.call(fake_resource.RLIMIT_NOFILE,
+                          (1_048_576, 1_048_576)),
+                mock.call(fake_resource.RLIMIT_NOFILE,
+                          (256, 1_048_576)),
+            ])
+
+    def test_keeps_jvm_default_when_limit_preparation_fails(self):
+        fake_resource = types.SimpleNamespace(
+            RLIMIT_NOFILE=8,
+            getrlimit=mock.Mock(return_value=(256, 1_048_576)),
+            setrlimit=mock.Mock(side_effect=ValueError('not permitted')))
+        stderr = io.StringIO()
+
+        with mock.patch.object(fixture.sys, 'platform', 'darwin'), \
+                mock.patch.dict(sys.modules, {'resource': fake_resource}), \
+                contextlib.redirect_stderr(stderr):
+            with fixture._macos_java_nofile_limit() as prepared:
+                self.assertFalse(prepared)
+
+        self.assertIn('could not prepare', stderr.getvalue())
+
+    def test_managed_macos_jvm_disables_max_fd_limit(self):
+        fake_proc = mock.Mock()
+        fake_proc.poll.return_value = None
+        ping_response = mock.Mock(status=204)
+
+        @contextlib.contextmanager
+        def prepared_limit():
+            yield True
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            qdb = _make_fixture(tmp_dir)
+            with mock.patch.object(
+                    fixture, '_macos_java_nofile_limit', prepared_limit), \
+                    mock.patch.object(
+                        fixture, 'discover_avail_ports',
+                        return_value=[9000, 9009, 8812]), \
+                    mock.patch.object(
+                        fixture, '_find_java', return_value='/jdk/bin/java'), \
+                    mock.patch.object(
+                        fixture.subprocess, 'Popen', return_value=fake_proc
+                    ) as popen, \
+                    mock.patch.object(
+                        fixture.urllib.request, 'urlopen',
+                        return_value=ping_response), \
+                    mock.patch.object(
+                        qdb, 'query_version', return_value=(10, 0, 2)), \
+                    mock.patch.object(fixture.atexit, 'register'):
+                qdb.start()
+
+            try:
+                launch_args = popen.call_args.args[0]
+                self.assertIn('-XX:-MaxFDLimit', launch_args)
+            finally:
+                qdb._proc = None
+                qdb._log.close()
+                qdb._log = None
 
 
 # A stand-in for a JVM whose graceful shutdown hangs: ignores SIGTERM,

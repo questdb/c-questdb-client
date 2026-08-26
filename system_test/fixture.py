@@ -26,6 +26,7 @@ import sys
 
 sys.dont_write_bytecode = True
 
+import contextlib
 import os
 import re
 import pathlib
@@ -59,6 +60,49 @@ AUTH = dict(
 HTTP_AUTH = dict(
     username="admin",
     password="quest")
+
+
+@contextlib.contextmanager
+def _macos_java_nofile_limit():
+    """Prepare a macOS child JVM to inherit the process hard NOFILE limit.
+
+    HotSpot's enabled-by-default MaxFDLimit flag replaces the inherited soft
+    limit during startup on macOS. Mirror QuestDB's launcher: temporarily
+    raise the parent's soft limit to its hard limit and tell the JVM to keep
+    the inherited value. Restore the test runner's original limit as soon as
+    Popen has captured it.
+
+    Yield True when the caller should pass ``-XX:-MaxFDLimit``. If preparing
+    the limit fails, yield False so the JVM retains its safer default rather
+    than inheriting a potentially low soft limit.
+    """
+    if sys.platform != 'darwin':
+        yield False
+        return
+
+    try:
+        import resource
+
+        soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+        if soft != hard:
+            resource.setrlimit(resource.RLIMIT_NOFILE, (hard, hard))
+    except (ImportError, OSError, ValueError) as e:
+        sys.stderr.write(
+            f'>>>> WARNING: could not prepare the macOS open-file limit '
+            f'for QuestDB: {e}\n')
+        yield False
+        return
+
+    try:
+        yield True
+    finally:
+        if soft != hard:
+            try:
+                resource.setrlimit(resource.RLIMIT_NOFILE, (soft, hard))
+            except (OSError, ValueError) as e:
+                sys.stderr.write(
+                    f'>>>> WARNING: could not restore the test runner '
+                    f'open-file limit after starting QuestDB: {e}\n')
 
 CA_PATH = (pathlib.Path(__file__).parent.parent /
            'tls_certs' / 'server_rootCA.pem')
@@ -576,10 +620,6 @@ class QuestDbFixture(QuestDbFixtureBase):
             '-p', str(self._root_dir / 'bin' / 'questdb.jar'),
             '-m', 'io.questdb/io.questdb.ServerMain',
             '-d', str(self._data_dir)]
-        sys.stderr.write(
-            f'Starting QuestDB: {launch_args!r} '
-            f'(auth: {self.auth}, http_auth: {self.http_auth}, '
-            f'http: {self.http}, qwp_udp: {self.qwp_udp})\n')
         self._log_path.parent.mkdir(parents=True, exist_ok=True)
         self._log = open(self._log_path, 'ab')
         # On Windows, Popen.terminate() maps to TerminateProcess(), which kills
@@ -598,14 +638,25 @@ class QuestDbFixture(QuestDbFixtureBase):
         creationflags = (
             subprocess.CREATE_NO_WINDOW if sys.platform == 'win32' else 0)
         try:
-            self._proc = subprocess.Popen(
-                launch_args,
-                close_fds=True,
-                cwd=self._data_dir,
-                # env=launch_env,
-                stdout=self._log,
-                stderr=subprocess.STDOUT,
-                creationflags=creationflags)
+            with _macos_java_nofile_limit() as preserve_nofile_limit:
+                if preserve_nofile_limit:
+                    # QuestDB's launcher uses the same flag on macOS. Without
+                    # it HotSpot replaces the inherited soft limit during VM
+                    # startup, so raising the Python parent's limit has no
+                    # effect on the managed server.
+                    launch_args.insert(6, '-XX:-MaxFDLimit')
+                sys.stderr.write(
+                    f'Starting QuestDB: {launch_args!r} '
+                    f'(auth: {self.auth}, http_auth: {self.http_auth}, '
+                    f'http: {self.http}, qwp_udp: {self.qwp_udp})\n')
+                self._proc = subprocess.Popen(
+                    launch_args,
+                    close_fds=True,
+                    cwd=self._data_dir,
+                    # env=launch_env,
+                    stdout=self._log,
+                    stderr=subprocess.STDOUT,
+                    creationflags=creationflags)
 
             def check_http_up():
                 if self._proc.poll() is not None:

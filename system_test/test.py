@@ -147,10 +147,12 @@ QWP_WS_STATUS_SCHEMA_MISMATCH = 0x03
 
 
 def _raise_nofile_soft_limit_for_qwp_ws_fuzz(minimum=65_536):
-    """Raise the descriptor budget inherited by the managed QuestDB process.
+    """Raise the descriptor budget of the QWP/WS fuzz test runner.
 
-    Concurrent WAL fuzzing may keep many files open at once. Windows does not
-    expose RLIMIT_NOFILE.
+    Concurrent producers keep sockets and store-and-forward files open. On
+    Linux the managed QuestDB process also inherits this limit. The fixture
+    handles macOS separately because HotSpot otherwise replaces the inherited
+    soft limit during JVM startup. Windows does not expose RLIMIT_NOFILE.
     """
     if sys.platform == 'win32':
         return
