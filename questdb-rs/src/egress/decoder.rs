@@ -1138,7 +1138,7 @@ fn reverse_uuid_rows(buf: ColumnBuffer) -> ColumnBuffer {
         Ok(values) => values,
         Err(shared) => BytesMut::from(&shared[..]),
     };
-    for row in values.chunks_exact_mut(16) {
+    for row in values.as_chunks_mut::<16>().0 {
         row.reverse();
     }
     ColumnBuffer {
@@ -1743,13 +1743,13 @@ fn count_nulls(bitmap: &[u8], row_count: usize) -> usize {
     // bit-scan to find the *position* of a null), switch to
     // `from_le_bytes` — positions are endian-sensitive.
     let body = &bitmap[..full_bytes];
-    let mut chunks = body.chunks_exact(8);
+    let (words, tail) = body.as_chunks::<8>();
     let mut nulls: usize = 0;
-    for c in chunks.by_ref() {
-        let w = u64::from_ne_bytes(c.try_into().unwrap());
+    for c in words {
+        let w = u64::from_ne_bytes(*c);
         nulls += w.count_ones() as usize;
     }
-    for b in chunks.remainder() {
+    for b in tail {
         nulls += b.count_ones() as usize;
     }
     if tail_bits != 0 {
@@ -2309,7 +2309,7 @@ mod tests {
         });
 
         let mut expected = input;
-        for row in expected.chunks_exact_mut(16) {
+        for row in expected.as_chunks_mut::<16>().0 {
             row.reverse();
         }
         assert_eq!(reversed.values, expected);
@@ -2332,7 +2332,7 @@ mod tests {
         });
 
         let mut expected = input.clone();
-        for row in expected.chunks_exact_mut(16) {
+        for row in expected.as_chunks_mut::<16>().0 {
             row.reverse();
         }
         assert_eq!(reversed.values, expected);

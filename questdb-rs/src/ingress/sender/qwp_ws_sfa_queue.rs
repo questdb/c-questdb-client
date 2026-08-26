@@ -4066,7 +4066,9 @@ mod tests {
         assert_eq!(nibbles.len() % 2, 0, "hex fixture has odd length");
 
         nibbles
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .map(|pair| (pair[0] << 4) | pair[1])
             .collect()
     }

@@ -5368,9 +5368,9 @@ mod tests {
         padded.extend_from_slice(&bit_len.to_be_bytes());
 
         let mut words = [0u32; 80];
-        for chunk in padded.chunks_exact(64) {
-            for (idx, word) in chunk.chunks_exact(4).enumerate() {
-                words[idx] = u32::from_be_bytes([word[0], word[1], word[2], word[3]]);
+        for chunk in padded.as_chunks::<64>().0 {
+            for (idx, word) in chunk.as_chunks::<4>().0.iter().enumerate() {
+                words[idx] = u32::from_be_bytes(*word);
             }
             for idx in 16..80 {
                 words[idx] = (words[idx - 3] ^ words[idx - 8] ^ words[idx - 14] ^ words[idx - 16])
