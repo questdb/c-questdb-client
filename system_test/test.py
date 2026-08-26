@@ -145,6 +145,37 @@ SUITE_QWP_WS_RESTART = 'qwp_ws_restart'
 SUITE_QWP_WS_FUZZ = 'qwp_ws_fuzz'
 QWP_WS_STATUS_SCHEMA_MISMATCH = 0x03
 
+
+def _raise_nofile_soft_limit_for_qwp_ws_fuzz(minimum=65_536):
+    """Raise the descriptor budget inherited by the managed QuestDB process.
+
+    Concurrent WAL fuzzing may keep many files open at once. Windows does not
+    expose RLIMIT_NOFILE.
+    """
+    if sys.platform == 'win32':
+        return
+
+    try:
+        import resource
+
+        soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+        if soft >= minimum:
+            return
+        target = minimum if hard == resource.RLIM_INFINITY else min(minimum, hard)
+        if target <= soft:
+            sys.stderr.write(
+                f'>>>> WARNING: QWP/WS fuzz requested an open-file soft '
+                f'limit of {minimum}, but the hard limit is {hard}\n')
+            return
+        resource.setrlimit(resource.RLIMIT_NOFILE, (target, hard))
+        sys.stderr.write(
+            f'>>>> raised open-file soft limit for QWP/WS fuzz: '
+            f'{soft} -> {target}\n')
+    except (ImportError, OSError, ValueError) as e:
+        sys.stderr.write(
+            f'>>>> WARNING: could not raise the open-file soft limit for '
+            f'QWP/WS fuzz: {e}\n')
+
 QWP_DECIMAL256_POSITIVE_OVERFLOW = Decimal(
     "57896044618658097711785492504343953926634992332820282019728792003956564819968")
 QWP_DECIMAL256_SIGNED_RESCALE_OVERFLOW_BASE = Decimal(
@@ -4370,6 +4401,9 @@ def run_with_fixtures(args):
     run_qwp_ws_protocol_suite = _select_tests(SUITE_QWP_WS_PROTOCOL).countTestCases() > 0
     run_qwp_ws_restart_suite = _select_tests(SUITE_QWP_WS_RESTART).countTestCases() > 0
     run_qwp_ws_fuzz_suite = _select_tests(SUITE_QWP_WS_FUZZ).countTestCases() > 0
+
+    if run_qwp_ws_fuzz_suite:
+        _raise_nofile_soft_limit_for_qwp_ws_fuzz()
 
     for questdb_dir in iter_versions(args):
         if run_matrix_suite:
