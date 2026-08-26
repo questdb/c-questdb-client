@@ -55,6 +55,7 @@ def main() -> int:
             f'>>>> fuzz-loop started: iterations={ITERATIONS}, '
             f'log={LOG_PATH}\n')
 
+        t._raise_nofile_soft_limit_for_qwp_ws_fuzz()
         t.QDB_FIXTURE.start()
         try:
             for i in range(1, ITERATIONS + 1):

@@ -162,10 +162,12 @@ def _raise_nofile_soft_limit_for_qwp_ws_fuzz(minimum=65_536):
         if soft >= minimum:
             return
         target = minimum if hard == resource.RLIM_INFINITY else min(minimum, hard)
-        if target <= soft:
+        if target < minimum:
             sys.stderr.write(
                 f'>>>> WARNING: QWP/WS fuzz requested an open-file soft '
-                f'limit of {minimum}, but the hard limit is {hard}\n')
+                f'limit of {minimum}, but the hard limit caps it at '
+                f'{target}\n')
+        if target <= soft:
             return
         resource.setrlimit(resource.RLIMIT_NOFILE, (target, hard))
         sys.stderr.write(
