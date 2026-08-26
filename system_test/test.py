@@ -145,41 +145,6 @@ SUITE_QWP_WS_RESTART = 'qwp_ws_restart'
 SUITE_QWP_WS_FUZZ = 'qwp_ws_fuzz'
 QWP_WS_STATUS_SCHEMA_MISMATCH = 0x03
 
-
-def _raise_nofile_soft_limit_for_qwp_ws_fuzz(minimum=65_536):
-    """Raise the descriptor budget of the QWP/WS fuzz test runner.
-
-    Concurrent producers keep sockets and store-and-forward files open. On
-    Linux the managed QuestDB process also inherits this limit. The fixture
-    handles macOS separately because HotSpot otherwise replaces the inherited
-    soft limit during JVM startup. Windows does not expose RLIMIT_NOFILE.
-    """
-    if sys.platform == 'win32':
-        return
-
-    try:
-        import resource
-
-        soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
-        if soft >= minimum:
-            return
-        target = minimum if hard == resource.RLIM_INFINITY else min(minimum, hard)
-        if target < minimum:
-            sys.stderr.write(
-                f'>>>> WARNING: QWP/WS fuzz requested an open-file soft '
-                f'limit of {minimum}, but the hard limit caps it at '
-                f'{target}\n')
-        if target <= soft:
-            return
-        resource.setrlimit(resource.RLIMIT_NOFILE, (target, hard))
-        sys.stderr.write(
-            f'>>>> raised open-file soft limit for QWP/WS fuzz: '
-            f'{soft} -> {target}\n')
-    except (ImportError, OSError, ValueError) as e:
-        sys.stderr.write(
-            f'>>>> WARNING: could not raise the open-file soft limit for '
-            f'QWP/WS fuzz: {e}\n')
-
 QWP_DECIMAL256_POSITIVE_OVERFLOW = Decimal(
     "57896044618658097711785492504343953926634992332820282019728792003956564819968")
 QWP_DECIMAL256_SIGNED_RESCALE_OVERFLOW_BASE = Decimal(
@@ -3128,6 +3093,13 @@ class TestQwpWsFuzz(QwpWsTestSupport, unittest.TestCase):
             num_of_threads=2 + r.next_int(5 if self._is_windows() else 20),
             num_of_tables=1 + r.next_int(4),
             wait_between_iterations_ms=r.next_int(75))
+        if sys.platform == 'darwin':
+            # macOS enforces kern.maxfilesperproc (61,440 on the hosted
+            # agents) even when RLIMIT_NOFILE reports a higher value. Leave
+            # descriptor headroom for QuestDB while retaining meaningful
+            # concurrency. Cap after generating the full load so the rest of
+            # a frozen seed stays unchanged.
+            load.num_of_threads = min(load.num_of_threads, 8)
         fuzz = qwp_ws_fuzz.FuzzParams(
             column_reordering_factor=3,
             column_skip_factor=-1,
@@ -4405,9 +4377,6 @@ def run_with_fixtures(args):
     run_qwp_ws_protocol_suite = _select_tests(SUITE_QWP_WS_PROTOCOL).countTestCases() > 0
     run_qwp_ws_restart_suite = _select_tests(SUITE_QWP_WS_RESTART).countTestCases() > 0
     run_qwp_ws_fuzz_suite = _select_tests(SUITE_QWP_WS_FUZZ).countTestCases() > 0
-
-    if run_qwp_ws_fuzz_suite:
-        _raise_nofile_soft_limit_for_qwp_ws_fuzz()
 
     for questdb_dir in iter_versions(args):
         if run_matrix_suite:
