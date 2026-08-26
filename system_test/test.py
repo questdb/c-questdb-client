@@ -2479,6 +2479,14 @@ class TestQwpWsFuzz(QwpWsTestSupport, unittest.TestCase):
     def _is_windows():
         return qwp_ws_fuzz.is_windows()
 
+    @staticmethod
+    def _cap_macos_producer_threads(load):
+        # Each producer holds a WebSocket and several SFA descriptors in the
+        # Python runner. Bound producer concurrency on macOS to reduce its
+        # descriptor pressure while retaining full concurrency elsewhere.
+        if sys.platform == 'darwin':
+            load.num_of_threads = min(load.num_of_threads, 8)
+
     def _log(self, msg: str):
         sys.stderr.write(f'[qwp_ws_fuzz] {msg}\n')
         sys.stderr.flush()
@@ -2590,6 +2598,9 @@ class TestQwpWsFuzz(QwpWsTestSupport, unittest.TestCase):
 
     def _run_fuzz(self, load: 'qwp_ws_fuzz.LoadParams',
                   fuzz: 'qwp_ws_fuzz.FuzzParams'):
+        # Keep the platform-specific concurrency policy shared by every load.
+        self._cap_macos_producer_threads(load)
+
         # Pre-create per-table buffers. Java keys by lowercase name (case-
         # insensitive) so 'WEATHER0' and 'weather0' resolve to the same
         # table on both client- and server-side.
@@ -3093,13 +3104,6 @@ class TestQwpWsFuzz(QwpWsTestSupport, unittest.TestCase):
             num_of_threads=2 + r.next_int(5 if self._is_windows() else 20),
             num_of_tables=1 + r.next_int(4),
             wait_between_iterations_ms=r.next_int(75))
-        if sys.platform == 'darwin':
-            # macOS enforces kern.maxfilesperproc (61,440 on the hosted
-            # agents) even when RLIMIT_NOFILE reports a higher value. Leave
-            # descriptor headroom for QuestDB while retaining meaningful
-            # concurrency. Cap after generating the full load so the rest of
-            # a frozen seed stays unchanged.
-            load.num_of_threads = min(load.num_of_threads, 8)
         fuzz = qwp_ws_fuzz.FuzzParams(
             column_reordering_factor=3,
             column_skip_factor=-1,
