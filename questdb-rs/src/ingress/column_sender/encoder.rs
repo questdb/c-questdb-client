@@ -33,7 +33,7 @@
 
 use std::slice;
 
-use crate::ingress::buffer::SymbolGlobalDict;
+use crate::ingress::buffer::{SymbolGlobalDict, geohash_precision_needs_bitmap};
 use crate::{Result, error};
 
 #[cfg(feature = "arrow-ingress")]
@@ -441,11 +441,24 @@ fn estimate_frame_size(
 
     let bitmap_bytes = row_count.div_ceil(8);
     for col in &chunk.columns {
-        let null_overhead = 1usize.saturating_add(if col.validity.is_some() {
-            bitmap_bytes
-        } else {
-            0
-        });
+        let forced_geohash_bitmap = match col.kind {
+            ColumnKind::NumpyDeferred { dtype, .. } => dtype
+                .geohash_precision_bits()
+                .is_some_and(geohash_precision_needs_bitmap),
+            #[cfg(feature = "arrow-ingress")]
+            ColumnKind::ArrowDeferred { arrow_kind, .. } => matches!(
+                arrow_kind,
+                arrow_batch::ColumnKind::Geohash(bits)
+                    if geohash_precision_needs_bitmap(bits)
+            ),
+            _ => false,
+        };
+        let null_overhead =
+            1usize.saturating_add(if col.validity.is_some() || forced_geohash_bitmap {
+                bitmap_bytes
+            } else {
+                0
+            });
         let payload_size = match col.kind {
             ColumnKind::Byte { .. } => row_count,
             ColumnKind::Short { .. } => row_count.saturating_mul(2),
@@ -811,7 +824,13 @@ unsafe fn encode_column(
                 }
                 None => None,
             };
-            arrow_batch::write_arrow_column_body(out, arrow_kind, arr.as_ref(), sym_res)?;
+            arrow_batch::write_arrow_column_body(
+                out,
+                &col.name,
+                arrow_kind,
+                arr.as_ref(),
+                sym_res,
+            )?;
         }
         ColumnKind::NumpyDeferred {
             dtype,
@@ -820,7 +839,9 @@ unsafe fn encode_column(
             row_count: numpy_rows,
         } => {
             debug_assert_eq!(numpy_rows, row_count);
-            unsafe { numpy_wire::emit_into_wire(out, dtype, data, numpy_rows, validity)? };
+            unsafe {
+                numpy_wire::emit_into_wire(out, &col.name, dtype, data, numpy_rows, validity)?
+            };
         }
     }
     Ok(())
@@ -2039,6 +2060,35 @@ mod tests {
             row_by_row, out,
             "ArrowDeferred I64 must produce byte-identical wire to column_i64"
         );
+    }
+
+    #[cfg(feature = "arrow-ingress")]
+    #[test]
+    fn arrow_deferred_geohash_range_error_names_column() {
+        use crate::ingress::column_sender::arrow_batch;
+        use arrow::array::{ArrayRef, Int32Array};
+        use std::sync::Arc;
+
+        let arr: ArrayRef = Arc::new(Int32Array::from(vec![1 << 20]));
+        let ts = [1i64];
+        let mut chunk = Chunk::new("trades");
+        chunk
+            .push_arrow_deferred("position", arrow_batch::ColumnKind::Geohash(20), arr)
+            .unwrap();
+        chunk.at_nanos(&ts).unwrap();
+
+        let mut out = Vec::new();
+        let mut dict = SymbolGlobalDict::new();
+        let mut scratch = EncodeScratch::new();
+        let err = encode_chunk_into(&mut out, &chunk, &mut dict, &mut scratch, false).unwrap_err();
+        assert!(err.msg().contains("[column='position']"), "{}", err.msg());
+        assert!(
+            err.msg()
+                .contains("GEOHASH(20b) cannot carry value 1048576 at row 0"),
+            "{}",
+            err.msg()
+        );
+        assert!(out.is_empty(), "failed frame must be rolled back");
     }
 
     #[cfg(feature = "arrow-ingress")]

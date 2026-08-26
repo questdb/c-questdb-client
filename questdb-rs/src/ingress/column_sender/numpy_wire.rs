@@ -34,6 +34,7 @@
 
 use std::slice;
 
+use crate::ingress::buffer::{geohash_precision_needs_bitmap, geohash_value_fits_precision};
 use crate::ingress::{MAX_ARRAY_DIMS, MAX_NDARRAY_LEAF_ELEMS};
 use crate::{Result, error};
 
@@ -136,6 +137,16 @@ pub enum NumpyDtype {
 }
 
 impl NumpyDtype {
+    pub(crate) fn geohash_precision_bits(&self) -> Option<u8> {
+        match self {
+            Self::GeohashI8 { bits }
+            | Self::GeohashI16 { bits }
+            | Self::GeohashI32 { bits }
+            | Self::GeohashI64 { bits } => Some(*bits),
+            _ => None,
+        }
+    }
+
     /// QWP wire-type byte for the column slot this dtype produces.
     pub fn wire_type(&self) -> u8 {
         use NumpyDtype as D;
@@ -410,6 +421,7 @@ impl NumpyDtype {
 /// duration of the call.
 pub(crate) unsafe fn emit_into_wire(
     out: &mut Vec<u8>,
+    column_name: &str,
     dtype: NumpyDtype,
     data: *const u8,
     row_count: usize,
@@ -595,16 +607,16 @@ pub(crate) unsafe fn emit_into_wire(
 
         // ---- Geohash (bits byte + bitmap-encoded width-N rows) ----
         D::GeohashI8 { bits } => unsafe {
-            emit_geohash::<1>(out, bits, data, row_count, validity)?
+            emit_geohash::<1>(out, column_name, bits, data, row_count, validity)?
         },
         D::GeohashI16 { bits } => unsafe {
-            emit_geohash::<2>(out, bits, data, row_count, validity)?
+            emit_geohash::<2>(out, column_name, bits, data, row_count, validity)?
         },
         D::GeohashI32 { bits } => unsafe {
-            emit_geohash::<4>(out, bits, data, row_count, validity)?
+            emit_geohash::<4>(out, column_name, bits, data, row_count, validity)?
         },
         D::GeohashI64 { bits } => unsafe {
-            emit_geohash::<8>(out, bits, data, row_count, validity)?
+            emit_geohash::<8>(out, column_name, bits, data, row_count, validity)?
         },
 
         // ---- f64 ndarray (DOUBLE_ARRAY, bitmap-encoded nulls) ----
@@ -1206,6 +1218,7 @@ unsafe fn emit_decimal<const N: usize>(
 #[inline]
 unsafe fn emit_geohash<const SRC: usize>(
     out: &mut Vec<u8>,
+    column_name: &str,
     bits: u8,
     data: *const u8,
     row_count: usize,
@@ -1218,9 +1231,62 @@ unsafe fn emit_geohash<const SRC: usize>(
             "numpy geohash bits ({bits}) exceeds source dtype width ({SRC} bytes)"
         ));
     }
-    match validity.filter(|v| v.has_nulls()) {
-        None => {
+    let read_value = |row: usize| unsafe {
+        let ptr = data.add(row * SRC);
+        match SRC {
+            1 => ptr.read() as u64,
+            2 => (ptr as *const u16).read_unaligned() as u64,
+            4 => (ptr as *const u32).read_unaligned() as u64,
+            8 => (ptr as *const u64).read_unaligned(),
+            _ => unreachable!("unsupported GEOHASH source width"),
+        }
+    };
+
+    // The common case needs one cheap OR-reduction. Only a failing column is
+    // scanned again to identify the first offending row for the diagnostic.
+    let mut combined = 0u64;
+    for row in 0..row_count {
+        if validity.is_none_or(|v| unsafe { v.is_valid(row) }) {
+            combined |= read_value(row);
+        }
+    }
+    if !geohash_value_fits_precision(combined, bits) {
+        let (row, value) = (0..row_count)
+            .filter(|&row| validity.is_none_or(|v| unsafe { v.is_valid(row) }))
+            .map(|row| (row, read_value(row)))
+            .find(|&(_, value)| !geohash_value_fits_precision(value, bits))
+            .expect("OR-reduction found an out-of-range GEOHASH value");
+        return Err(error::fmt!(
+            InvalidApiCall,
+            "[column='{}'] GEOHASH({}b) cannot carry value {} at row {}",
+            column_name,
+            bits,
+            value,
+            row
+        ));
+    }
+
+    let sparse_validity = validity.filter(|v| v.has_nulls());
+    let force_bitmap = geohash_precision_needs_bitmap(bits);
+    match sparse_validity {
+        None if !force_bitmap => {
             out.push(0);
+            out.reserve(1 + elem * row_count);
+            write_qwp_varint(out, bits as u64);
+            if elem == SRC && row_count > 0 {
+                let bytes = unsafe { slice::from_raw_parts(data, SRC * row_count) };
+                out.extend_from_slice(bytes);
+            } else {
+                for i in 0..row_count {
+                    let row_start = unsafe { data.add(i * SRC) };
+                    let row = unsafe { slice::from_raw_parts(row_start, elem) };
+                    out.extend_from_slice(row);
+                }
+            }
+        }
+        None => {
+            out.push(1);
+            out.resize(out.len() + row_count.div_ceil(8), 0);
             out.reserve(1 + elem * row_count);
             write_qwp_varint(out, bits as u64);
             if elem == SRC && row_count > 0 {
@@ -1516,6 +1582,73 @@ mod tests {
         assert!(NumpyDtype::GeohashI64 { bits: 61 }.validate().is_err());
         assert!(NumpyDtype::GeohashI8 { bits: 8 }.validate().is_ok());
         assert!(NumpyDtype::GeohashI64 { bits: 60 }.validate().is_ok());
+    }
+
+    #[test]
+    fn numpy_geohash_rejects_first_out_of_range_non_null_row() {
+        let values = [0u8, 31, 32];
+        let ts = [1i64, 2, 3];
+        let mut chunk = Chunk::new("t");
+        unsafe {
+            chunk
+                .push_numpy_deferred(
+                    "position",
+                    NumpyDtype::GeohashI8 { bits: 5 },
+                    values.as_ptr(),
+                    values.len(),
+                    None,
+                )
+                .unwrap();
+        }
+        chunk.at_nanos(&ts).unwrap();
+        let err = encode_err(&chunk);
+        assert!(err.msg().contains("[column='position']"), "{}", err.msg());
+        assert!(
+            err.msg()
+                .contains("GEOHASH(5b) cannot carry value 32 at row 2"),
+            "{}",
+            err.msg()
+        );
+    }
+
+    #[test]
+    fn numpy_geohash_does_not_validate_null_storage() {
+        let values = [255u8, 31];
+        let validity_bits = [0b0000_0010u8];
+        let validity = Validity::from_bitmap(&validity_bits, values.len()).unwrap();
+        let ts = [1i64, 2];
+        let mut chunk = Chunk::new("t");
+        unsafe {
+            chunk
+                .push_numpy_deferred(
+                    "position",
+                    NumpyDtype::GeohashI8 { bits: 5 },
+                    values.as_ptr(),
+                    values.len(),
+                    Some(&validity),
+                )
+                .unwrap();
+        }
+        chunk.at_nanos(&ts).unwrap();
+        encode(&chunk);
+    }
+
+    #[test]
+    fn byte_aligned_numpy_geohash_uses_bitmap_to_preserve_max_value() {
+        let value = [-1i8];
+        let mut out = Vec::new();
+        unsafe {
+            emit_into_wire(
+                &mut out,
+                "position",
+                NumpyDtype::GeohashI8 { bits: 8 },
+                value.as_ptr().cast(),
+                value.len(),
+                None,
+            )
+            .unwrap();
+        }
+        assert_eq!(out, vec![1, 0, 8, 0xff]);
     }
 
     #[test]

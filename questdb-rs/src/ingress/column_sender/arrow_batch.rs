@@ -49,7 +49,10 @@ use arrow::buffer::NullBuffer;
 use arrow::datatypes::{DataType, Field, SchemaRef, TimeUnit};
 
 use crate::error::{Error, ErrorCode};
-use crate::ingress::buffer::{QwpWsSymbolHasher, SymbolGlobalDict};
+use crate::ingress::buffer::{
+    QwpWsSymbolHasher, SymbolGlobalDict, geohash_precision_needs_bitmap,
+    geohash_value_fits_precision,
+};
 use crate::ingress::{ColumnName, TableName};
 use crate::{Result, fmt};
 
@@ -2075,48 +2078,34 @@ fn write_geohash_payload(out: &mut Vec<u8>, arr: &dyn Array, bits: u8) -> Result
     let label = "GEOHASH column";
     try_reserve_bytes(out, 1 + non_null * elem, label)?;
     write_qwp_varint(out, bits as u64);
-    let dt = arr.data_type();
-    match dt {
-        DataType::Int8 => {
-            let a = arr.as_any().downcast_ref::<Int8Array>().unwrap();
+    macro_rules! write_signed {
+        ($array_ty:ty, $unsigned_ty:ty) => {{
+            let a = arr.as_any().downcast_ref::<$array_ty>().unwrap();
             for row in 0..row_count {
                 if arr.is_null(row) {
                     continue;
                 }
-                let v = a.value(row) as u64;
-                out.extend_from_slice(&v.to_le_bytes()[..elem]);
-            }
-        }
-        DataType::Int16 => {
-            let a = arr.as_any().downcast_ref::<Int16Array>().unwrap();
-            for row in 0..row_count {
-                if arr.is_null(row) {
-                    continue;
+                let signed = a.value(row);
+                let value = signed as $unsigned_ty as u64;
+                if !geohash_value_fits_precision(value, bits) {
+                    return Err(fmt!(
+                        ArrowIngest,
+                        "GEOHASH({}b) cannot carry value {} at row {}",
+                        bits,
+                        signed,
+                        row
+                    ));
                 }
-                let v = a.value(row) as u64;
-                out.extend_from_slice(&v.to_le_bytes()[..elem]);
+                out.extend_from_slice(&value.to_le_bytes()[..elem]);
             }
-        }
-        DataType::Int32 => {
-            let a = arr.as_any().downcast_ref::<Int32Array>().unwrap();
-            for row in 0..row_count {
-                if arr.is_null(row) {
-                    continue;
-                }
-                let v = a.value(row) as u64;
-                out.extend_from_slice(&v.to_le_bytes()[..elem]);
-            }
-        }
-        DataType::Int64 => {
-            let a = arr.as_any().downcast_ref::<Int64Array>().unwrap();
-            for row in 0..row_count {
-                if arr.is_null(row) {
-                    continue;
-                }
-                let v = a.value(row) as u64;
-                out.extend_from_slice(&v.to_le_bytes()[..elem]);
-            }
-        }
+        }};
+    }
+
+    match arr.data_type() {
+        DataType::Int8 => write_signed!(Int8Array, u8),
+        DataType::Int16 => write_signed!(Int16Array, u16),
+        DataType::Int32 => write_signed!(Int32Array, u32),
+        DataType::Int64 => write_signed!(Int64Array, u64),
         other => {
             return Err(fmt!(
                 ArrowIngest,
@@ -3258,6 +3247,7 @@ fn write_dict_to_varchar_payload(
 
 pub(crate) fn write_arrow_column_body(
     out: &mut Vec<u8>,
+    column_name: &str,
     kind: ColumnKind,
     arr: &dyn Array,
     sym_resolution: Option<&ArrowResolvedSymbolColumn>,
@@ -3269,16 +3259,19 @@ pub(crate) fn write_arrow_column_body(
     // is > 0 (so the bitmap is written from the real buffer). A count and buffer
     // that disagree cannot desync the frame here.
     let null_count = arr.null_count();
-    let use_bitmap = kind_supports_sparse_nulls(kind) && null_count > 0;
+    let use_bitmap = kind_supports_sparse_nulls(kind)
+        && (null_count > 0
+            || matches!(
+                kind,
+                ColumnKind::Geohash(bits) if geohash_precision_needs_bitmap(bits)
+            ));
     out.push(u8::from(use_bitmap));
     if use_bitmap {
-        let nulls = arr.nulls().ok_or_else(|| {
-            fmt!(
-                ArrowIngest,
-                "column: validity-bitmap encoding required but Arrow array reports no NullBuffer"
-            )
-        })?;
-        write_qwp_bitmap_from_arrow(out, nulls)?;
+        if let Some(nulls) = arr.nulls() {
+            write_qwp_bitmap_from_arrow(out, nulls)?;
+        } else {
+            out.resize(out.len() + arr.len().div_ceil(8), 0);
+        }
     }
     let le_target = cfg!(target_endian = "little");
     let le_no_nulls = le_target && null_count == 0;
@@ -3701,7 +3694,9 @@ pub(crate) fn write_arrow_column_body(
                 non_null_fsb(out, a, elem)
             }
         }
-        ColumnKind::Geohash(bits) => write_geohash_payload(out, arr, bits),
+        ColumnKind::Geohash(bits) => {
+            write_geohash_payload(out, arr, bits).map_err(|e| decorate_column(e, column_name))
+        }
         ColumnKind::Decimal32WidenToDecimal64 => {
             let a = arr.as_any().downcast_ref::<Decimal32Array>().unwrap();
             let scale = decimal_scale_u8(a.scale(), "Decimal32", 9)?;
@@ -4149,7 +4144,8 @@ fn encode_arrow_batch_into_mode(
 
     for (col_idx, col) in classified.iter().enumerate() {
         let sym_res = resolution.per_column[col_idx].as_ref();
-        if let Err(e) = write_arrow_column_body(out, col.kind, col.arr, sym_res) {
+        if let Err(e) = write_arrow_column_body(out, col.name.as_ref(), col.kind, col.arr, sym_res)
+        {
             let col_name = col.name.as_ref().to_string();
             return Err(rollback_on_err(
                 out,
@@ -5634,6 +5630,32 @@ mod tests {
             .with_metadata(metadata(&[(crate::arrow_metadata::GEOHASH_BITS, "20")]));
         let rb = single_col_batch(field, b.finish());
         assert_ok_with_table_count(&rb, 1);
+    }
+
+    #[test]
+    fn geohash_arrow_rejects_value_that_does_not_fit_precision() {
+        let arr = Int16Array::from(vec![127, 128]);
+        let mut out = Vec::new();
+        let err = write_arrow_column_body(&mut out, "position", ColumnKind::Geohash(7), &arr, None)
+            .unwrap_err();
+        assert_eq!(err.code(), ErrorCode::ArrowIngest);
+        assert!(err.msg().contains("[column='position']"), "{}", err.msg());
+        assert!(
+            err.msg()
+                .contains("GEOHASH(7b) cannot carry value 128 at row 1"),
+            "{}",
+            err.msg()
+        );
+    }
+
+    #[test]
+    fn byte_aligned_geohash_uses_bitmap_to_preserve_max_value() {
+        // Int8 -1 is the raw 8-bit GEOHASH value 0xff. Without a bitmap,
+        // QWP would interpret that all-ones value as its null sentinel.
+        let arr = Int8Array::from(vec![-1]);
+        let mut out = Vec::new();
+        write_arrow_column_body(&mut out, "position", ColumnKind::Geohash(8), &arr, None).unwrap();
+        assert_eq!(out, vec![1, 0, 8, 0xff]);
     }
 
     #[test]
