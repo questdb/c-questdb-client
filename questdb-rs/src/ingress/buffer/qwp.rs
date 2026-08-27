@@ -1753,14 +1753,6 @@ impl QwpBuffer {
                 precision_bits
             ));
         }
-        if !geohash_value_fits_precision(bits, precision_bits) {
-            return Err(error::fmt!(
-                InvalidApiCall,
-                "GEOHASH({}b) cannot carry value {}",
-                precision_bits,
-                bits
-            ));
-        }
         let name: ColumnName<'a> = name.try_into()?;
         self.validate_max_name_len(name.as_ref())?;
         self.check_op(Op::Column)?;
@@ -4485,14 +4477,6 @@ impl QwpWsColumnBuffer {
                 InvalidApiCall,
                 "GEOHASH precision must be in 1..=60, got {}",
                 precision_bits
-            ));
-        }
-        if !geohash_value_fits_precision(bits, precision_bits) {
-            return Err(error::fmt!(
-                InvalidApiCall,
-                "GEOHASH({}b) cannot carry value {}",
-                precision_bits,
-                bits
             ));
         }
         // The first value of a batch (re)pins the column precision. The
@@ -7377,10 +7361,6 @@ fn uses_null_bitmap(supports_sparse_nulls: bool, row_count: usize, non_null_coun
 /// QWP's all-ones sentinel for a null value of the same storage width.
 pub(crate) fn geohash_precision_needs_bitmap(precision_bits: u8) -> bool {
     precision_bits.is_multiple_of(8)
-}
-
-pub(crate) fn geohash_value_fits_precision(value: u64, precision_bits: u8) -> bool {
-    precision_bits == 64 || (precision_bits < 64 && value >> precision_bits == 0)
 }
 
 fn kind_supports_sparse_nulls(kind: ColumnKind) -> bool {
@@ -10513,7 +10493,7 @@ mod tests {
 
     #[cfg(feature = "_sender-qwp-ws")]
     #[test]
-    fn qwp_ws_byte_aligned_geohash_uses_bitmap_and_checks_range() {
+    fn qwp_ws_byte_aligned_geohash_uses_bitmap_and_wide_values_are_accepted() {
         let mut buf = QwpWsColumnarBuffer::new(127);
         let mut scratch = QwpWsEncodeScratch::new();
         let mut global_dict = SymbolGlobalDict::new();
@@ -10530,14 +10510,10 @@ mod tests {
 
         buf.clear();
         buf.table("pos").unwrap();
-        let err = buf
-            .column_geohash("g", 32, 5)
-            .expect_err("a value wider than the declared precision must fail");
-        assert!(
-            err.msg().contains("GEOHASH(5b) cannot carry value 32"),
-            "{}",
-            err.msg()
-        );
+        buf.column_geohash("g", 32, 5).unwrap().at_now().unwrap();
+        buf.encode_ws_replay_message(&mut scratch, &mut global_dict, QWP_VERSION_1)
+            .unwrap();
+        assert_eq!(ws_first_geohash_header(&scratch.message), (1, false, 5));
     }
 
     /// Regression for the QWP/WS fuzz failure "invalid GeoHash precision: 0".
@@ -13440,17 +13416,18 @@ mod tests {
     }
 
     #[test]
-    fn qwp_column_geohash_value_out_of_range_rejects() {
+    fn qwp_column_geohash_value_out_of_range_is_forwarded() {
         let mut buf = QwpBuffer::new(127);
-        buf.table("t").unwrap();
-        let err = buf
-            .column_geohash("g", 32, 5)
-            .expect_err("a value wider than the declared precision must fail");
-        assert_eq!(err.code(), crate::ErrorCode::InvalidApiCall);
-        assert!(
-            err.msg().contains("GEOHASH(5b) cannot carry value 32"),
-            "{}",
-            err.msg()
+        buf.table("t").unwrap().column_geohash("g", 32, 5).unwrap();
+        buf.at_now().unwrap();
+        let datagrams = buf.encode_datagrams(64 * 1024).unwrap();
+        let decoded = decode_datagram(&datagrams[0]).unwrap();
+        assert_eq!(
+            decoded.table.rows[0][0],
+            DecodedValue::Geohash {
+                bits: 32,
+                precision_bits: 5,
+            }
         );
     }
 

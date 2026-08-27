@@ -49,10 +49,7 @@ use arrow::buffer::NullBuffer;
 use arrow::datatypes::{DataType, Field, SchemaRef, TimeUnit};
 
 use crate::error::{Error, ErrorCode};
-use crate::ingress::buffer::{
-    QwpWsSymbolHasher, SymbolGlobalDict, geohash_precision_needs_bitmap,
-    geohash_value_fits_precision,
-};
+use crate::ingress::buffer::{QwpWsSymbolHasher, SymbolGlobalDict, geohash_precision_needs_bitmap};
 use crate::ingress::{ColumnName, TableName};
 use crate::{Result, fmt};
 
@@ -2085,17 +2082,7 @@ fn write_geohash_payload(out: &mut Vec<u8>, arr: &dyn Array, bits: u8) -> Result
                 if arr.is_null(row) {
                     continue;
                 }
-                let signed = a.value(row);
-                let value = signed as $unsigned_ty as u64;
-                if !geohash_value_fits_precision(value, bits) {
-                    return Err(fmt!(
-                        ArrowIngest,
-                        "GEOHASH({}b) cannot carry value {} at row {}",
-                        bits,
-                        signed,
-                        row
-                    ));
-                }
+                let value = a.value(row) as $unsigned_ty as u64;
                 out.extend_from_slice(&value.to_le_bytes()[..elem]);
             }
         }};
@@ -3247,7 +3234,6 @@ fn write_dict_to_varchar_payload(
 
 pub(crate) fn write_arrow_column_body(
     out: &mut Vec<u8>,
-    column_name: &str,
     kind: ColumnKind,
     arr: &dyn Array,
     sym_resolution: Option<&ArrowResolvedSymbolColumn>,
@@ -3694,9 +3680,7 @@ pub(crate) fn write_arrow_column_body(
                 non_null_fsb(out, a, elem)
             }
         }
-        ColumnKind::Geohash(bits) => {
-            write_geohash_payload(out, arr, bits).map_err(|e| decorate_column(e, column_name))
-        }
+        ColumnKind::Geohash(bits) => write_geohash_payload(out, arr, bits),
         ColumnKind::Decimal32WidenToDecimal64 => {
             let a = arr.as_any().downcast_ref::<Decimal32Array>().unwrap();
             let scale = decimal_scale_u8(a.scale(), "Decimal32", 9)?;
@@ -4144,8 +4128,7 @@ fn encode_arrow_batch_into_mode(
 
     for (col_idx, col) in classified.iter().enumerate() {
         let sym_res = resolution.per_column[col_idx].as_ref();
-        if let Err(e) = write_arrow_column_body(out, col.name.as_ref(), col.kind, col.arr, sym_res)
-        {
+        if let Err(e) = write_arrow_column_body(out, col.kind, col.arr, sym_res) {
             let col_name = col.name.as_ref().to_string();
             return Err(rollback_on_err(
                 out,
@@ -5633,19 +5616,11 @@ mod tests {
     }
 
     #[test]
-    fn geohash_arrow_rejects_value_that_does_not_fit_precision() {
+    fn geohash_arrow_forwards_value_that_does_not_fit_precision() {
         let arr = Int16Array::from(vec![127, 128]);
         let mut out = Vec::new();
-        let err = write_arrow_column_body(&mut out, "position", ColumnKind::Geohash(7), &arr, None)
-            .unwrap_err();
-        assert_eq!(err.code(), ErrorCode::ArrowIngest);
-        assert!(err.msg().contains("[column='position']"), "{}", err.msg());
-        assert!(
-            err.msg()
-                .contains("GEOHASH(7b) cannot carry value 128 at row 1"),
-            "{}",
-            err.msg()
-        );
+        write_arrow_column_body(&mut out, ColumnKind::Geohash(7), &arr, None).unwrap();
+        assert_eq!(out, vec![0, 7, 127, 128]);
     }
 
     #[test]
@@ -5654,7 +5629,7 @@ mod tests {
         // QWP would interpret that all-ones value as its null sentinel.
         let arr = Int8Array::from(vec![-1]);
         let mut out = Vec::new();
-        write_arrow_column_body(&mut out, "position", ColumnKind::Geohash(8), &arr, None).unwrap();
+        write_arrow_column_body(&mut out, ColumnKind::Geohash(8), &arr, None).unwrap();
         assert_eq!(out, vec![1, 0, 8, 0xff]);
     }
 

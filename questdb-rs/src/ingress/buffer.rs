@@ -47,7 +47,6 @@ pub(crate) use self::qwp::QwpSendScratch;
 pub(crate) use self::qwp::{
     MAX_PERSISTED_SYMBOL_ENTRY_LEN, QwpWsColumnarBuffer, QwpWsEncodeScratch, SymbolGlobalDict,
     SymbolGlobalDictMark, decode_qwp_varint, geohash_precision_needs_bitmap,
-    geohash_value_fits_precision,
 };
 // Test-only: lets the sender-level suites drive the connection dictionary's
 // cap-rejection path through a real `Sender` (see `TestDictCapGuard`).
@@ -1537,7 +1536,9 @@ impl Buffer {
     }
 
     /// Adds a GEOHASH column. `precision_bits` must be in `1..=60` and is
-    /// pinned per column (subsequent rows must match). QWP-only.
+    /// pinned per column (subsequent rows must match). `bits` is not checked
+    /// against that precision; excess high bits are forwarded and may be
+    /// truncated or reinterpreted by the server. QWP-only.
     pub fn column_geohash<'a, N>(
         &mut self,
         name: N,
