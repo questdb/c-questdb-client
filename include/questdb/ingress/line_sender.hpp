@@ -913,8 +913,9 @@ public:
      * Record a GEOHASH column value. QWP-only.
      *
      * `precision_bits` must be in 1..=60 and is pinned per column.
-     * `bits` is not range-checked against that precision; excess high bits
-     * are forwarded and may be truncated or reinterpreted by the server.
+     * `bits` is not range-checked against that precision. Only the low bytes
+     * required by the wire width are encoded; inconsistent bits may be
+     * truncated locally or reinterpreted by the server.
      */
     line_sender_buffer& column_geohash(
         column_name_view name, uint64_t bits, uint8_t precision_bits)

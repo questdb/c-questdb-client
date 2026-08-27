@@ -1537,8 +1537,9 @@ impl Buffer {
 
     /// Adds a GEOHASH column. `precision_bits` must be in `1..=60` and is
     /// pinned per column (subsequent rows must match). `bits` is not checked
-    /// against that precision; excess high bits are forwarded and may be
-    /// truncated or reinterpreted by the server. QWP-only.
+    /// against that precision. Only the low bytes required by the wire width
+    /// are encoded; inconsistent bits may be truncated locally or
+    /// reinterpreted by the server. QWP-only.
     pub fn column_geohash<'a, N>(
         &mut self,
         name: N,

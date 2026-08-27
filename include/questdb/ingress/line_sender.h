@@ -1189,8 +1189,9 @@ bool line_sender_buffer_column_binary(
  * Record a GEOHASH column value. QWP-only.
  *
  * `precision_bits` must be in `1..=60` and is pinned per column.
- * `bits` is not range-checked against that precision; excess high bits are
- * forwarded and may be truncated or reinterpreted by the server.
+ * `bits` is not range-checked against that precision. Only the low bytes
+ * required by the wire width are encoded; inconsistent bits may be truncated
+ * locally or reinterpreted by the server.
  */
 QUESTDB_CLIENT_API
 bool line_sender_buffer_column_geohash(
