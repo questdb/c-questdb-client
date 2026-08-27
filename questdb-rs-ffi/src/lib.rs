@@ -4479,7 +4479,8 @@ unsafe fn validate_arrow_array_depth(
                     "Arrow array declares buffers but the buffer pointer is NULL",
                 ));
             }
-            if let Ok(dt) = arrow::datatypes::DataType::try_from(&*s) {
+            let data_type = arrow::datatypes::DataType::try_from(&*s).ok();
+            if let Some(dt) = &data_type {
                 // Reject negative fixed-size widths/sizes that would overflow
                 // arrow-rs's `bit_width`. Runs at every schema node, so a
                 // negative size nested inside a container is caught when the
@@ -4508,7 +4509,7 @@ unsafe fn validate_arrow_array_depth(
                 // layout(key)`), so the eager-deref checks below must match on
                 // the key type too — otherwise `Dictionary(Utf8View, _)` skips
                 // them and `from_ffi` dereferences a NULL variadic slot.
-                let buf_dt = match &dt {
+                let buf_dt = match dt {
                     DataType::Dictionary(key, _) => key.as_ref(),
                     other => other,
                 };
@@ -4554,6 +4555,48 @@ unsafe fn validate_arrow_array_depth(
                 return Err(arrow_ingest_err(
                     "Arrow array or schema declares children but pointer is NULL",
                 ));
+            }
+            // Converting Struct and FixedSizeList ArrayData into their
+            // concrete arrow-rs arrays slices their children using the
+            // parent's offset and length. ArrayData::slice asserts when the
+            // requested range extends beyond the child's declared length;
+            // with panic = "abort" that would terminate the embedding
+            // process. Validate the same ranges while the FFI tree is still
+            // borrowed. Negative child lengths are left to the child's own
+            // iteration so the existing diagnostic remains intact.
+            let parent_end = offset.checked_add(length).ok_or_else(|| {
+                arrow_ingest_err(format!(
+                    "Arrow array slice offset {offset} + length {length} overflows"
+                ))
+            })?;
+            match data_type.as_ref() {
+                Some(arrow::datatypes::DataType::Struct(_)) => {
+                    for i in 0..na as usize {
+                        let child = *a_children.add(i);
+                        if !child.is_null() && (*child).length >= 0 && parent_end > (*child).length
+                        {
+                            return Err(arrow_ingest_err(format!(
+                                "Arrow Struct slice offset {offset} + length {length} ends at {parent_end}, beyond child {i} length {}",
+                                (*child).length
+                            )));
+                        }
+                    }
+                }
+                Some(arrow::datatypes::DataType::FixedSizeList(_, size)) if *size >= 0 => {
+                    let child_end = parent_end.checked_mul(*size as i64).ok_or_else(|| {
+                        arrow_ingest_err(format!(
+                            "Arrow FixedSizeList slice offset {offset} + length {length} with size {size} overflows"
+                        ))
+                    })?;
+                    let child = *a_children;
+                    if !child.is_null() && (*child).length >= 0 && child_end > (*child).length {
+                        return Err(arrow_ingest_err(format!(
+                            "Arrow FixedSizeList slice offset {offset} + length {length} with size {size} ends at {child_end}, beyond child 0 length {}",
+                            (*child).length
+                        )));
+                    }
+                }
+                _ => {}
             }
             for i in 0..na as usize {
                 let child_a = *a_children.add(i);
@@ -6680,6 +6723,56 @@ mod tests {
             }
         }
 
+        unsafe fn validate_one_child_tree(
+            formats: &[&str],
+            lengths: &[i64],
+            offsets: &[i64],
+        ) -> questdb::Result<()> {
+            assert_eq!(formats.len(), lengths.len());
+            assert_eq!(formats.len(), offsets.len());
+            let format_strings: Vec<CString> = formats
+                .iter()
+                .map(|format| CString::new(*format).unwrap())
+                .collect();
+            let mut schemas: Vec<Box<FFI_ArrowSchema>> = formats
+                .iter()
+                .map(|_| Box::new(FFI_ArrowSchema::empty()))
+                .collect();
+            let mut arrays: Vec<Box<FFI_ArrowArray>> = formats
+                .iter()
+                .map(|_| Box::new(FFI_ArrowArray::empty()))
+                .collect();
+            let mut schema_children: Vec<Vec<*mut FFI_ArrowSchema>> =
+                (0..formats.len()).map(|_| Vec::new()).collect();
+            let mut array_children: Vec<Vec<*mut FFI_ArrowArray>> =
+                (0..formats.len()).map(|_| Vec::new()).collect();
+            let mut buffers: Vec<Vec<*const std::ffi::c_void>> = formats
+                .iter()
+                .map(|format| {
+                    let count = if *format == "i" { 2 } else { 1 };
+                    vec![std::ptr::null(); count]
+                })
+                .collect();
+
+            for i in 0..formats.len() {
+                schemas[i].format = format_strings[i].as_ptr();
+                arrays[i].length = lengths[i];
+                arrays[i].offset = offsets[i];
+                arrays[i].n_buffers = buffers[i].len() as i64;
+                arrays[i].buffers = buffers[i].as_mut_ptr();
+                if i + 1 < formats.len() {
+                    schema_children[i].push(&mut *schemas[i + 1]);
+                    schemas[i].n_children = 1;
+                    schemas[i].children = schema_children[i].as_mut_ptr();
+                    array_children[i].push(&mut *arrays[i + 1]);
+                    arrays[i].n_children = 1;
+                    arrays[i].children = array_children[i].as_mut_ptr();
+                }
+            }
+
+            unsafe { validate_arrow_array_depth(&*arrays[0], &*schemas[0]) }
+        }
+
         #[test]
         fn schema_dictionary_chain_at_depth_cap_succeeds() {
             unsafe {
@@ -7243,6 +7336,61 @@ mod tests {
                 assert!(
                     err.msg().contains("length"),
                     "expected length-cap error, got: {}",
+                    err.msg()
+                );
+            }
+        }
+
+        #[test]
+        fn array_struct_slice_past_child_rejected() {
+            unsafe {
+                let err = validate_one_child_tree(&["+s", "i"], &[2, 2], &[1, 0]).unwrap_err();
+                assert_eq!(err.code(), ErrorCode::ArrowIngest);
+                assert!(
+                    err.msg().contains(
+                        "Struct slice offset 1 + length 2 ends at 3, beyond child 0 length 2"
+                    ),
+                    "expected Struct child-slice error, got: {}",
+                    err.msg()
+                );
+            }
+        }
+
+        #[test]
+        fn array_struct_slice_ending_at_child_length_succeeds() {
+            unsafe {
+                let res = validate_one_child_tree(&["+s", "i"], &[2, 3], &[1, 0]);
+                assert!(res.is_ok(), "exact-end Struct slice should pass: {res:?}");
+            }
+        }
+
+        #[test]
+        fn array_nested_struct_slice_past_child_rejected() {
+            unsafe {
+                let err = validate_one_child_tree(&["+s", "+s", "i"], &[1, 2, 2], &[0, 1, 0])
+                    .unwrap_err();
+                assert_eq!(err.code(), ErrorCode::ArrowIngest);
+                assert!(
+                    err.msg().contains(
+                        "Struct slice offset 1 + length 2 ends at 3, beyond child 0 length 2"
+                    ),
+                    "expected nested Struct child-slice error, got: {}",
+                    err.msg()
+                );
+            }
+        }
+
+        #[test]
+        fn array_nested_fixed_size_list_slice_past_child_rejected() {
+            unsafe {
+                let err = validate_one_child_tree(&["+s", "+w:2", "i"], &[1, 2, 4], &[0, 1, 0])
+                    .unwrap_err();
+                assert_eq!(err.code(), ErrorCode::ArrowIngest);
+                assert!(
+                    err.msg().contains(
+                        "FixedSizeList slice offset 1 + length 2 with size 2 ends at 6, beyond child 0 length 4"
+                    ),
+                    "expected nested FixedSizeList child-slice error, got: {}",
                     err.msg()
                 );
             }
