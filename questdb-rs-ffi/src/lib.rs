@@ -2138,10 +2138,13 @@ pub unsafe extern "C" fn line_sender_buffer_column_binary(
 
 /// Record a GEOHASH column value. QWP-only.
 ///
-/// `precision_bits` must be in `1..=60` and is pinned per column.
-/// `bits` is not range-checked against that precision. Only the low bytes
-/// required by the wire width are encoded; inconsistent bits may be truncated
-/// locally or reinterpreted by the server.
+/// `precision_bits` must be in `1..=60` and is pinned per column. `bits` is a
+/// raw pattern and is not checked to be less than `2^precision_bits`.
+/// Supplying the wrong precision or a pattern with bits set above it can
+/// succeed and store a different GEOHASH or NULL. Only the low
+/// `ceil(precision_bits / 8)` bytes are encoded; the exact result is
+/// unspecified. This is a semantic data-integrity risk, not a memory-safety
+/// risk for an otherwise valid call. The caller must validate `bits`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn line_sender_buffer_column_geohash(
     buffer: *mut line_sender_buffer,

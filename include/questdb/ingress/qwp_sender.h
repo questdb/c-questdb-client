@@ -1120,10 +1120,13 @@ size_t qwp_arrow_import_len(const qwp_arrow_import* imported);
  *
  * `array->offset` is honored (the Arrow C Data Interface logical
  * offset); `row_offset` further sub-slices within the call.
- * GEOHASH values are not range-checked against the precision declared by
- * Arrow field metadata. Only the low bytes required by the wire width are
- * encoded; inconsistent bits may be truncated locally or reinterpreted by
- * the server when the chunk is flushed.
+ * GEOHASH values are raw bit patterns and are not checked against the
+ * precision declared by Arrow field metadata. A wrong precision or a pattern
+ * with bits set above it can be accepted and store a different GEOHASH or
+ * NULL. Only the low `ceil(precision / 8)` bytes are encoded; the exact result
+ * is unspecified. This is a semantic data-integrity risk, not a memory-safety
+ * risk for otherwise valid Arrow C Data structures. The caller must validate
+ * values; malformed Arrow C Data structures remain invalid input.
  */
 QUESTDB_CLIENT_API
 bool qwp_chunk_append_arrow_column(
@@ -1179,10 +1182,11 @@ bool qwp_chunk_append_arrow_column(
  *     geohash_i16  → GEOHASH (bits ∈ 1..=16)
  *     geohash_i32  → GEOHASH (bits ∈ 1..=32)
  *     geohash_i64  → GEOHASH (bits ∈ 1..=60)
- *     Values are not range-checked against the declared precision. Only the
- *     low bytes required by the wire width are encoded; inconsistent bits may
- *     be truncated locally or reinterpreted by the server when the chunk is
- *     flushed.
+ *     Values are raw bit patterns and are not checked against the declared
+ *     precision. A wrong precision or a pattern with bits set above it can be
+ *     accepted and store a different GEOHASH or NULL. Only the low
+ *     ceil(precision / 8) bytes are encoded; the exact result is unspecified.
+ *     The caller must validate values.
  *   Multi-dim float64 (require `extras.array_ndim` + `extras.array_shape`):
  *     f64_ndarray  → DOUBLE_ARRAY (rectangular tensor; all rows share the
  *                    same per-row shape — ragged inputs must go through
@@ -1286,10 +1290,13 @@ typedef enum qwp_numpy_dtype
  *    / DECIMAL128, 76 for s32 / DECIMAL256). Signed type so an out-of-
  *    range negative value is rejected explicitly rather than wrapping.
  *  - geohash_bits: precision in bits. Range 1..=8 / 1..=16 / 1..=32 /
- *    1..=60 for i8 / i16 / i32 / i64 respectively. Values are not checked
- *    against this precision. Only the low bytes required by the wire width
- *    are encoded; inconsistent bits may be truncated locally or reinterpreted
- *    by the server at flush time.
+ *    1..=60 for i8 / i16 / i32 / i64 respectively. Values are raw bit
+ *    patterns and are not checked against this precision. A wrong precision
+ *    or a pattern with bits set above it can be accepted and store a different
+ *    GEOHASH or NULL. Only the low ceil(precision / 8) bytes are encoded; the
+ *    exact result is unspecified. This is a semantic data-integrity risk, not
+ *    a memory-safety risk when the documented data/validity pointer and length
+ *    contract is satisfied. The caller must validate values.
  *  - array_ndim / array_shape: for `qwp_numpy_f64_ndarray`
  *    only. `array_ndim` is the per-row tensor rank (1..=32, matching
  *    QuestDB's MAX_ARRAY_DIMS); `array_shape` points at `array_ndim`
@@ -1685,10 +1692,13 @@ typedef struct qwp_arrow_override
  * `qwp_arrow_override_geohash` — carries `arg` outside
  * `1..=60`.
  *
- * GEOHASH values are not range-checked against the precision in `arg`. Only
- * the low bytes required by the wire width are encoded; inconsistent bits may
- * be truncated locally or reinterpreted by the server when the batch is
- * flushed.
+ * GEOHASH values are raw bit patterns and are not checked against the
+ * precision in `arg`. A wrong precision or a pattern with bits set above it
+ * can be accepted and store a different GEOHASH or NULL. Only the low
+ * `ceil(arg / 8)` bytes are encoded; the exact result is unspecified. This is
+ * a semantic data-integrity risk, not a memory-safety risk for otherwise valid
+ * Arrow C Data structures. The caller must validate values; malformed Arrow C
+ * Data structures remain invalid input.
  *
  * Name validation timing: `table` is a `line_sender_table_name`, so the
  * name grammar was validated EAGERLY at `line_sender_table_name_init`
