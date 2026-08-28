@@ -87,7 +87,11 @@ The level controls how much of the review below actually runs. Lower levels keep
 | **2** | Full Step 2.5, with 2.5b restricted to `pub`/`pub(crate)` Rust symbols plus every `#[no_mangle]`/`extern "C"` export. Run Agent 1 plus at most **four** change-relevant roles from Agents 2-9 and 11-14. Run an independent falsification task for each surviving atomic candidate. |
 | **3** | Full Step 2.5 and the complete admission protocol. Select at most **six** applicable discovery roles from Agents 1-14: Agent 1 always; Agent 9 for changed symbols with out-of-diff callers; Agents 2-8 and 11 only when their domain is touched; Agents 12-14 only for changed tests or a fix claim; Agent 10 only when a distinct adversarial pass is warranted. Depth comes from producer/reachability evidence and independent falsification, not agent count. |
 
-State the chosen level in one line at the start of the review so the user knows what they're getting (e.g., "Reviewing PR #141 at level 2"). If the level was defaulted, mention that level 3 exists for full review.
+Once Step 1 resolves the target, begin the final review report with its immutable identity. In PR mode the first line must be exactly:
+
+`Reviewing PR #<number> at level <N>, head <full headRefOid>, base <full baseRefOid>.`
+
+Use the complete lowercase 40-character GitHub OIDs; never abbreviate them. In range mode, identify the resolved base and head commits, or label an uncommitted head as the working tree. This identity line is mandatory even when the review has no findings because `approve-pr` and `reject-pr` consume it. If the level was defaulted, mention separately that level 3 exists for full review.
 
 ## Spawning review agents
 
@@ -117,15 +121,36 @@ Every mode must end this step with **`$BASE`** set — the commit the change is 
 
 ### GitHub PR
 
-Capture the PR identifier in `$PR` after stripping the level token, then fetch metadata, diff, comments, and the base revision:
+Capture the PR target after stripping the level token, normalize it to numeric `$PR`, and snapshot both immutable revision identities **before** gathering the diff. Re-read the pair after gathering context and stop if either changed:
 
 ```bash
-PR='<PR number or URL from $ARGUMENTS, with any level token removed>'
-gh pr view "$PR" --json number,title,body,labels,state
+TARGET='<PR number or URL from $ARGUMENTS, with any level token removed>'
+if ! PR=$(gh pr view "$TARGET" --json number --jq .number); then
+  echo "Could not resolve PR target: $TARGET"
+  exit 1
+fi
+if ! IDENTITY=$(gh pr view "$PR" --json baseRefOid,headRefOid --jq '[.baseRefOid, .headRefOid] | @tsv'); then
+  echo "Could not resolve base/head OIDs for PR #$PR."
+  exit 1
+fi
+IFS=$'\t' read -r BASE HEAD <<< "$IDENTITY"
+if [[ ! "$BASE" =~ ^[0-9a-f]{40}$ || ! "$HEAD" =~ ^[0-9a-f]{40}$ ]]; then
+  echo "Could not resolve full base/head OIDs for PR #$PR."
+  exit 1
+fi
+
+gh pr view "$PR" --json number,title,body,labels,state,baseRefOid,headRefOid
 gh pr diff "$PR"
 gh pr view "$PR" --comments
-BASE=$(gh pr view "$PR" --json baseRefOid --jq .baseRefOid)
+
+if ! CURRENT_IDENTITY=$(gh pr view "$PR" --json baseRefOid,headRefOid --jq '[.baseRefOid, .headRefOid] | @tsv') ||
+   [ "$CURRENT_IDENTITY" != "$IDENTITY" ]; then
+  echo "PR #$PR changed while its diff was being gathered. Restart the review."
+  exit 1
+fi
 ```
+
+Treat `$IDENTITY` as the review snapshot token. Revalidate it again immediately before Step 4; a review that ran while the PR moved must not emit a verdict.
 
 ### Local range (`--range`)
 
@@ -684,6 +709,18 @@ Mission-critical for a client library: a confusing or inconsistent public API ca
 - Body explains the *why* and wraps at a readable width
 
 ## Step 4: Output
+
+In PR mode, revalidate the snapshot immediately before rendering any verdict:
+
+```bash
+if ! FINAL_IDENTITY=$(gh pr view "$PR" --json baseRefOid,headRefOid --jq '[.baseRefOid, .headRefOid] | @tsv') ||
+   [ "$FINAL_IDENTITY" != "$IDENTITY" ]; then
+  echo "PR #$PR changed during review. Discard the draft report and restart."
+  exit 1
+fi
+```
+
+Begin the final report with the exact immutable identity line required under **Review level**. Copy the full `$HEAD` and `$BASE` values captured in Step 1; do not reconstruct or shorten them.
 
 Present only **ADMITTED** findings. Omitted candidates, disproofs, retractions, agent counts, candidate counts, and the private ledger never appear in the public review. Do not publish a hypothesis and retract it later; finish falsification first. It is valid to report no findings. The single exception is the **Adjacent findings** section below, which carries proved pre-existing bugs as issue drafts — not findings against this PR, and weightless in every gate.
 
