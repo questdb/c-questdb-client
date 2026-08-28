@@ -40,6 +40,10 @@ stages:
             fetchDepth: 1
             lfs: false
             submodules: false
+          - task: UsePythonVersion@0
+            inputs:
+              versionSpec: "3.12"
+            displayName: "Use Python 3.12 for Arrow lock guard"
           - template: templates/compile.yaml
             parameters:
               cxx20Variants: true
@@ -98,6 +102,10 @@ stages:
             fetchDepth: 1
             lfs: false
             submodules: false
+          - task: UsePythonVersion@0
+            inputs:
+              versionSpec: "3.12"
+            displayName: "Use Python 3.12 for Arrow lock guard"
           - script: python3 ci/run_all_tests.py cargo
             displayName: "cargo tests"
       - job: NativeTests
@@ -180,14 +188,19 @@ stages:
             fetchDepth: 1
             lfs: false
             submodules: false
+          - task: UsePythonVersion@0
+            inputs:
+              versionSpec: "3.12"
+            displayName: "Use Python 3.12 for Arrow lock guard"
           - script: rustup toolchain install 1.91.1 --profile minimal
             displayName: "Install Rust 1.91.1"
           - script: |
+              python3 ci/check_arrow_ffi_lock.py
               cargo +1.91.1 check --manifest-path questdb-rs/Cargo.toml
               cargo +1.91.1 check --manifest-path questdb-rs/Cargo.toml \
                 --features almost-all-features,arrow,polars
               cargo +1.91.1 check \
-                --manifest-path questdb-rs-ffi/Cargo.toml --all-features
+                --manifest-path questdb-rs-ffi/Cargo.toml --all-features --locked
             displayName: "Check advertised features at the MSRV"
           - script: |
               cargo +1.91.1 doc --manifest-path questdb-rs/Cargo.toml \
@@ -204,6 +217,10 @@ stages:
         timeoutInMinutes: 10
         steps:
           - checkout: self
+          - task: UsePythonVersion@0
+            inputs:
+              versionSpec: "3.12"
+            displayName: "Use Python 3.12 for Arrow lock guard"
           - script: |
               set -e
               # Pinned so local runs (`pipx install clang-format==21.1.8`)
@@ -234,7 +251,8 @@ stages:
             displayName: "questdb-rs-ffi: fmt"
           - script: |
               cd questdb-rs-ffi
-              cargo clippy --all-targets --all-features -- -D warnings
+              python3 ../ci/check_arrow_ffi_lock.py
+              cargo clippy --locked --all-targets --all-features -- -D warnings
             displayName: "questdb-rs-ffi: clippy"
           - script: |
               python3 ci/format_cpp.py --check

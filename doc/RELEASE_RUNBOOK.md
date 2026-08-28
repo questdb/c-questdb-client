@@ -125,7 +125,8 @@ For 7.0.0, the approved compatibility decisions are:
   Open Source and Enterprise, while bearer-token and OIDC authentication,
   multi-host failover, and durable acknowledgement require QuestDB Enterprise;
 - Rust 1.91.1 is the MSRV for default and advertised docs.rs features;
-- Arrow `>=58, <60` and Polars `>=0.52, <0.55` are the supported ranges;
+- Arrow `>=58, <60` and Polars `>=0.52, <0.55` are the published crate's
+  supported ranges; the FFI artifact pins Arrow `=59.0.0`;
 - C/C++ remains source-only; and
 - release tags remain lightweight.
 
