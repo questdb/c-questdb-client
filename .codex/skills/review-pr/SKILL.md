@@ -1,24 +1,21 @@
 ---
 name: review-pr
 description: Review a GitHub pull request or local Git range against QuestDB client library coding standards. Use when asked to review a PR, a PR number or URL, or a BASE..HEAD range, optionally at review level 0..3. Performs an adversarial, blocking, evidence-gated code review.
-argument-hint: "[PR number or URL | --range=<base>..<head>] [--level=0..3]"
-allowed-tools: Bash, Read, Grep, Glob, Agent
 ---
 
 # Review a QuestDB client library pull request
 
-**Usage:** `/review-pr [PR number or URL | --range=<base>..<head>] [--level=0..3]`
+**Usage:** `$review-pr [PR number or URL | --range=<base>..<head>] [--level=0..3]`
 
-Review the PR or local range identified by the invocation arguments. When this skill
-is run as `/review-pr <args>`, Claude supplies `<args>` in `$ARGUMENTS`; treat
-that text as the invocation arguments. Parse exactly one review target: a PR number/URL,
+Review the PR or local range identified by the invocation arguments. Treat the
+arguments supplied with `$review-pr` as `$ARGUMENTS`. Parse exactly one review target: a PR number/URL,
 or `--range=<base>..<head>`. The range head may be omitted (`--range=<base>..`) to
 review the working tree, including uncommitted changes. If both targets are supplied,
 stop and ask which was intended. If neither is supplied, ask for one.
 
-**Tools this skill uses:** `Bash` for read-only `gh` and Git queries, `Read`, `Grep`,
-`Glob`, and fresh-context agents through the Agent tool. Do not edit files, commit,
-or push.
+> Harness note: this skill runs inside **Codex**. Use shell tools for read-only
+> `gh`, `git`, `rg`, `grep`, and `find` commands, file-reading tools for source
+> inspection, and fresh-context Codex subagents. Do not edit files, commit, or push.
 
 ## What this repository is
 
@@ -70,7 +67,7 @@ You are a senior QuestDB engineer performing a blocking code review. This librar
 - **Graceful role switch is not a protocol violation.** Enterprise primary↔replica switch happens without a process restart and with existing client connections still open. A write to an old primary after it becomes read-only is an expected server-side rejection under the surface's documented contract, not a WebSocket protocol violation, panic, drainer exit, or unrecoverable SFA failure.
 - **Demand appropriate algorithms where they matter.** On the buffer-build, encode, flush, and decode paths, "works correctly" is not sufficient — a per-row allocation, an extra copy of the payload, or an O(n²) pattern is a blocking defect. Off those paths (sender construction, config parsing, schema negotiation, startup) apply judgement: a bounded, non-scaling cost is worth reporting as Moderate, not worth blocking a merge over. Ask "is there a faster way?" for every loop and data-structure choice — then ask "does the user feel the difference?" before choosing the severity.
 - **Verify every claim.** If the PR title says "fix", verify the bug actually existed and the fix is correct. If it says "improve performance", look for benchmarks or reason about the algorithmic change — does it actually improve things, or could it regress elsewhere? If it says "simplify", verify the new code is actually simpler and doesn't drop behavior. Treat the PR description as an unverified hypothesis, not a statement of fact.
-- **Read the full context of changed files** when the diff alone is ambiguous. Use Read, Grep, and Glob to inspect surrounding code, callers, and related tests.
+- **Read the full context of changed files** when the diff alone is ambiguous. Use file reads and shell searches (`rg`/`grep`/`find`) to inspect surrounding code, callers, and related tests.
 - **Assess reachability before reporting.** For every potential bug, trace the actual callers and inputs. If a problem requires physically impossible conditions (a buffer larger than `usize::MAX`, NUL-byte injection through an API that already rejects it, panics behind validation guards), it is not a real finding — drop it. Focus on bugs that real workloads can trigger, not theoretical edge cases that exist only in the type system.
 - **`debug_assert!` and `assert!` are valid guards for invariants** that indicate library-internal bugs. Do NOT flag them as insufficient — they are the preferred mechanism for conditions that should never occur given the documented FFI contracts. Only flag an `assert!`/`debug_assert!` if the condition can plausibly be triggered by a caller honoring the documented contract. Note the interaction with Step 2.5f: under `panic = "abort"` a tripped `assert!` is a process abort, so a caller-reachable one is a crash finding, not a style nit.
 
@@ -93,9 +90,9 @@ Once Step 1 resolves the target, begin the final review report with its immutabl
 
 Use the complete lowercase 40-character GitHub OIDs; never abbreviate them. In range mode, identify the resolved base and head commits, or label an uncommitted head as the working tree. This identity line is mandatory even when the review has no findings because `approve-pr` and `reject-pr` consume it. If the level was defaulted, mention separately that level 3 exists for full review.
 
-## Spawning review agents
+## Spawning review agents in Codex
 
-Steps 3 and 3b use fresh-context agents through the Agent tool, one task
+Steps 3 and 3b use fresh-context Codex subagents, one task
 per role or atomic falsification candidate. Each task is self-contained and read-only —
 the child does not inherit the parent conversation. Discovery tasks receive the diff,
 Step 2.4 provenance verdicts, the Step 2.5 surface map, the Step 2.5f build-profile
@@ -105,10 +102,10 @@ only the neutral proposition, revision identities, relevant files, and raw artif
 paths. The parent owns role selection, the private ledger, admission, severity, and
 output.
 
-Launch the selected roles as a single parallel batch. State the panic mode from
-Step 2.5f in the first line of every agent prompt so the child reasons from the
-right premise, and add an explicit "review only — do not edit any files" constraint
-to every task.
+Launch the selected roles as one parallel batch through the available Codex
+subagent facility. State the panic mode from Step 2.5f in the first line of every
+agent prompt so the child reasons from the right premise, and add an explicit
+"review only — do not edit any files" constraint to every task.
 
 Use a shared temporary artifact for large maps rather than pasting them repeatedly.
 Never pass the discovery narrative, proposed severity/fix, votes, or verification
@@ -216,7 +213,7 @@ Record the verdict per submodule in one line each, and repeat it in the Step 4 r
 
 ## Step 2.5: Map the change surface
 
-Before launching review agents, produce a structured change surface map. This step is mandatory and must use Grep and Glob plus Read — do not reason about callsites from memory. The output of this step is required input for every agent in Step 3.
+Before launching review agents, produce a structured change surface map. This step is mandatory and must use shell searches (`rg`/`grep`/`find`) plus file reads — do not reason about callsites from memory. The output of this step is required input for every agent in Step 3.
 
 ### 2.5a Semantic delta per changed symbol
 
@@ -231,7 +228,7 @@ For every modified or added function, method, trait, struct field, public consta
 
 ### 2.5b Callsite inventory
 
-For every changed symbol that is `pub`, `pub(crate)`, `#[no_mangle]`, `extern "C"`, exported in a C header, or referenced from a C++ wrapper, run a repository-wide search with Grep to find every callsite, implementation, override, or reference outside the diff.
+For every changed symbol that is `pub`, `pub(crate)`, `#[no_mangle]`, `extern "C"`, exported in a C header, or referenced from a C++ wrapper, run a repository-wide search with `rg` to find every callsite, implementation, override, or reference outside the diff.
 
 Produce a list grouped by file. Search at minimum:
 
@@ -245,7 +242,7 @@ Produce a list grouped by file. Search at minimum:
 - **Examples:** `rg -n 'symbol_name' examples/`
 - **Doc-tests and rendered docs inside the crate:** `rg -n 'symbol_name' questdb-rs/src/ questdb-rs/README.md doc/`
 
-A changed `pub`/`pub(crate)`/`#[no_mangle]` symbol with zero recorded Grep calls in the trace is a skill violation. The model is not allowed to assert "this is only used here" without showing the search.
+A changed `pub`/`pub(crate)`/`#[no_mangle]` symbol with zero recorded search commands in the trace is a skill violation. The model is not allowed to assert "this is only used here" without showing the search.
 
 ### 2.5c Implicit contract list
 
@@ -289,7 +286,7 @@ Every entry on this list must be reviewed in Step 3.
 
 ### 2.5e Test surface & helper inventory
 
-Run this only when the PR adds or changes test code. It is the test-code counterpart to 2.5b and feeds Agents 12-14. Use real Grep/Glob searches — do not reason about helpers from memory.
+Run this only when the PR adds or changes test code. It is the test-code counterpart to 2.5b and feeds Agents 12-14. Use real `rg`/`find` searches — do not reason about helpers from memory.
 
 - **Existing-infrastructure inventory:** search the changed test files' module/directory for shared fixtures, mock servers, and assertion helpers the new tests could reuse — Rust `#[cfg(test)] mod tests` helpers and `questdb-rs/src/tests/`, the C++ `mock_server.hpp` / `qwp_mock_server.hpp` / `qwp_mock_c.h` harnesses and doctest `SUBCASE` patterns, Python `system_test/fixture.py`, `arrow_fuzz_common.py`, `_fuzz_loop.py`, and the `tls_proxy` / `c_sidecars` / `failover_clients` helpers. This list is the baseline Agent 13 uses to flag reinvented boilerplate — a "you stamped boilerplate instead of reusing helper X" finding requires X to appear in this inventory.
 - **Changed shared helpers as symbols:** if the PR changes a shared mock server, fixture, or test utility, run the 2.5b callsite inventory for it too — a changed mock server can silently weaken every test that uses it.
@@ -317,7 +314,7 @@ This step runs at EVERY review level, for EVERY PR that touches production code 
 Build a coverage table with one row per behavioral change: every changed symbol whose delta is not "no behavioral change", broken down further by every new or changed branch, error path, and NULL/boundary case inside it. For each row, record:
 
 - **Change:** symbol + the specific behavior/branch/path.
-- **Test:** the exact test file and test name that exercises it — found via real Grep/Glob searches across `questdb-rs/src/**/tests.rs`, `questdb-rs/src/tests/`, `cpp_test/`, `system_test/`, and `examples/` (search for the symbol name, the error message text, the config key, the C export name). Citing a test without a recorded search command in the trace is a skill violation, same as 2.5b. "Existing tests probably cover it" is banned.
+- **Test:** the exact test file and test name that exercises it — found via real `rg`/`find` searches across `questdb-rs/src/**/tests.rs`, `questdb-rs/src/tests/`, `cpp_test/`, `system_test/`, and `examples/` (search for the symbol name, the error message text, the config key, the C export name). Citing a test without a recorded search command in the trace is a skill violation, same as 2.5b. "Existing tests probably cover it" is banned.
 - **Test tier:** whether that test runs in PR CI or only in `TestVsQuestDBMaster` / a live-server or soak leg. A row whose only coverage is a suite PR CI does not run is not the same as a covered row — say which.
 - **Failure link:** what that test asserts and why the assertion fails if this behavior regresses. "The test calls the function" is not a failure link.
 - **Reachability / population:** the supported operation, configuration, transport, or host language that reaches the changed path and the users affected. "Public" or "user-visible" is not a population.
@@ -339,7 +336,7 @@ A bug-fix label or zero test changes triggers this analysis; neither predetermin
 
 ## Step 3: Change-specific candidate discovery
 
-Run this step with the Agent tool using fresh-context agents. Select only roles whose domain is materially touched, obey the level's discovery cap, and launch those roles as fresh-context, read-only tasks. Agent count is never evidence and unused roles are skipped.
+Run this step with fresh-context Codex subagents. Select only roles whose domain is materially touched, obey the level's discovery cap, and launch those roles as fresh-context, read-only tasks. Agent count is never evidence and unused roles are skipped.
 
 Every selected agent receives:
 1. The PR or local-range diff
@@ -442,7 +439,7 @@ Select this role whenever changed symbols have meaningful out-of-diff callers. I
 
 - It receives ONLY the diff and the names of the changed files. It does NOT receive the change surface map, the implicit contract list, the cross-context exposure list, the coverage map, or any of the review checklists below.
 - Its sole instruction: "generate a small set of falsifiable ways this code could be wrong, and try to disprove each before returning it." No category list, no failure-mode taxonomy, no QuestDB-specific style guide.
-- It is free to use Read, Grep, and Glob to explore the repository however it wants.
+- It is free to use file reads and shell searches (`rg`/`grep`/`find`) to explore the repository however it wants.
 - Each surviving output follows the candidate contract: atomic proposition, changed attribution, producer, reachability, head/base observations, symptom, counterevidence, missing evidence. No severity, no fix.
 
 The point is to escape the structured frame, not to create privileged candidates. A unique hypothesis is not high signal by itself, and overlap is not corroboration unless it supplies an independent evidence type. Select this role only when a distinct adversarial pass is warranted; it counts toward the level's discovery cap.
