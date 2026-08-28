@@ -4169,6 +4169,8 @@ unsafe fn arrow_format_str<'a>(
                 "Arrow schema {path}: format pointer is NULL"
             )));
         }
+        // RAW-READ AUDIT: NULL is rejected above; termination and allocation
+        // remain producer-memory obligations because the ABI exposes no size.
         let cstr = std::ffi::CStr::from_ptr(p);
         cstr.to_str().map_err(|_| {
             arrow_ingest_err(format!("Arrow schema {path}: format string is not UTF-8"))
@@ -4176,7 +4178,7 @@ unsafe fn arrow_format_str<'a>(
     }
 }
 
-// `FFI_ArrowSchema::name()` in arrow-schema-58.x calls `.expect("non-utf8
+// `FFI_ArrowSchema::name()` in arrow-schema 59 calls `.expect("non-utf8
 // as name")` on every import, and `TryFrom<&FFI_ArrowSchema> for Field`
 // invokes it unconditionally. Under `panic = "abort"` an invalid byte in
 // `name` from an Arrow producer aborts the host. NULL is allowed (treated
@@ -4191,6 +4193,8 @@ unsafe fn validate_name_str(
         if p.is_null() {
             return Ok(());
         }
+        // RAW-READ AUDIT: NULL is allowed above; termination and allocation
+        // remain producer-memory obligations because the ABI exposes no size.
         let cstr = std::ffi::CStr::from_ptr(p);
         cstr.to_str()
             .map_err(|_| arrow_ingest_err(format!("Arrow schema {path}: name is not UTF-8")))?;
@@ -4250,6 +4254,9 @@ impl ArrowMetadataBudget {
 #[cfg(feature = "arrow")]
 unsafe fn read_metadata_i32(metadata: *const u8, cursor: i64) -> i32 {
     unsafe {
+        // RAW-READ AUDIT: every caller first charges this exact four-byte
+        // header against the per-blob and schema-wide bounds. The producer is
+        // still responsible for allocating the declared stable blob bytes.
         let p = metadata.add(cursor as usize);
         i32::from_ne_bytes([*p, *p.add(1), *p.add(2), *p.add(3)])
     }
@@ -4616,6 +4623,9 @@ unsafe fn validate_arrow_schema_depth_with_budget(
                 )));
             }
             for i in 0..normal_children {
+                // RAW-READ AUDIT: `i` is bounded by exact accepted arity (or
+                // the 4,095-column root cap) and the total-node budget before
+                // this read. Actual pointer-array allocation is producer-owned.
                 let child = *children.add(i);
                 if child.is_null() {
                     return Err(arrow_ingest_err(format!(
@@ -4835,6 +4845,7 @@ unsafe fn validate_arrow_root_headers(
 
         let schema_children = (*schema).n_children;
         let array_children = (*array).n_children;
+        let length = (*array).length;
         if schema_children < 0 {
             return Err(arrow_ingest_err(format!(
                 "Arrow schema root: n_children {schema_children} is negative"
@@ -4863,12 +4874,11 @@ unsafe fn validate_arrow_root_headers(
             }
             if (*array).children.is_null() {
                 return Err(arrow_ingest_err(format!(
-                    "Arrow array root: declares {array_children} children but children pointer is NULL"
+                    "Arrow array root: length {length} declares {array_children} children but children pointer is NULL"
                 )));
             }
         }
 
-        let length = (*array).length;
         let offset = (*array).offset;
         if length < 0 {
             return Err(arrow_ingest_err(format!(
@@ -4916,6 +4926,9 @@ unsafe fn validate_parsed_column_types(
             let children = (*schema).children;
             for i in 0..(*schema).n_children as usize {
                 let path = format!("root.children[{i}]");
+                // RAW-READ AUDIT: pass 2 already checked the root cap, entire
+                // fan-out budget, non-NULL pointer, and every shallow node.
+                // Pointer-array allocation remains a producer obligation.
                 let child = *children.add(i);
                 let data_type = arrow::datatypes::DataType::try_from(&*child).map_err(|err| {
                     arrow_ingest_err(format!(
@@ -5044,6 +5057,8 @@ unsafe fn validate_arrow_buffer_layout(
                 | arrow::datatypes::DataType::Binary
                 | arrow::datatypes::DataType::LargeBinary
         ) && (*array).length > 0
+            // RAW-READ AUDIT: accepted variable-width layouts declare exactly
+            // three slots before slot 1 is read; allocation is producer-owned.
             && (*buffers.add(1)).is_null()
         {
             return Err(arrow_ingest_err(format!(
@@ -5057,6 +5072,8 @@ unsafe fn validate_arrow_buffer_layout(
                     "Arrow array {path}: variadic-lengths slot does not fit usize"
                 ))
             })?;
+            // RAW-READ AUDIT: the view model bounds `declared` to 3..=16 and
+            // derives this final slot; allocation remains producer-owned.
             let lengths = *buffers.add(lengths_slot);
             if lengths.is_null() {
                 return Err(arrow_ingest_err(format!(
@@ -5070,6 +5087,8 @@ unsafe fn validate_arrow_buffer_layout(
                 ))
             })?;
             for i in 0..variadic_count {
+                // RAW-READ AUDIT: `i` is layout-derived and capped at 13.
+                // The pointed-to lengths allocation is a producer obligation.
                 let length = *lengths.add(i);
                 checked_arrow_variadic_length(path, i, length, usize::MAX as u128)?;
             }
@@ -5212,13 +5231,16 @@ unsafe fn validate_arrow_array_depth_after_schema(
             let s_children = (*s).children;
             if a_children.is_null() || s_children.is_null() {
                 return Err(arrow_ingest_err(format!(
-                    "Arrow array {path}: array or schema declares {na} children but children pointer is NULL"
+                    "Arrow array {path}: length {length} declares {na} children but the array or schema children pointer is NULL"
                 )));
             }
             let parent_end = checked_arrow_parent_end(&path, offset, length)?;
             match &data_type {
                 arrow::datatypes::DataType::Struct(_) => {
                     for i in 0..normal_children {
+                        // RAW-READ AUDIT: root Struct fan-out is capped and
+                        // budgeted before the child slot; allocation is the
+                        // producer's obligation.
                         let child = *a_children.add(i);
                         if !child.is_null()
                             && (*child).length >= 0
@@ -5235,6 +5257,8 @@ unsafe fn validate_arrow_array_depth_after_schema(
                     // Negative sizes were rejected by reject_overflowing_fixed_size.
                     let child_end =
                         checked_fixed_size_child_end(&path, parent_end, *size, usize::MAX as u128)?;
+                    // RAW-READ AUDIT: exact FixedSizeList arity is one and its
+                    // product is checked before this sole child read.
                     let child = *a_children;
                     if !child.is_null()
                         && (*child).length >= 0
@@ -5292,6 +5316,9 @@ unsafe fn validate_arrow_array_depth_after_schema(
                 }
             }
             for i in 0..normal_children {
+                // RAW-READ AUDIT: both arrays have exact accepted arity and
+                // the complete fan-out fits the remaining node budget. Their
+                // actual pointer-array allocations remain producer-owned.
                 let child_a = *a_children.add(i);
                 let child_s = *s_children.add(i);
                 if child_a.is_null() || child_s.is_null() {
@@ -5385,6 +5412,12 @@ pub(crate) unsafe fn arrow_ffi_import_record_batch(
         }
         let imported_array = std::ptr::read(array);
         (*array).release = None;
+        // DOWNSTREAM AUDIT (Arrow 59): `from_ffi` recursively builds the
+        // complete tree with `ArrayData::new_unchecked` and structural-only
+        // validation. The preflight above has already checked every reachable
+        // schema/array node, exact arity and buffers, metadata, arithmetic, and
+        // modeled slice range. `validate_full`, StructArray materialization,
+        // and RecordBatch construction follow only after that complete pass.
         let array_data = match arrow::ffi::from_ffi(imported_array, &*schema) {
             Ok(d) => d,
             Err(e) => {
@@ -5498,6 +5531,9 @@ pub(crate) unsafe fn arrow_ffi_import_array_sliced(
         }
         let imported_array = std::ptr::read(array);
         (*array).release = None;
+        // DOWNSTREAM AUDIT (Arrow 59): the complete-tree preflight above
+        // precedes `from_ffi` (`ArrayData::new_unchecked` internally), then
+        // `validate_full`, `make_array`, and the caller-requested final slice.
         let array_data = match arrow::ffi::from_ffi(imported_array, &*schema) {
             Ok(d) => d,
             Err(e) => {
@@ -7540,7 +7576,7 @@ mod tests {
             unsafe { (*array).release = None };
         }
 
-        unsafe fn assert_nested_struct_entrypoint_rejected(root_offset: i64) {
+        unsafe fn assert_nested_struct_entrypoint_rejected(root_offset: i64, root_length: i64) {
             let root_format = CString::new("+s").unwrap();
             let struct_format = CString::new("+s").unwrap();
             let int_format = CString::new("i").unwrap();
@@ -7561,7 +7597,7 @@ mod tests {
             let mut root_array = Box::new(FFI_ArrowArray::empty());
             let mut struct_array = Box::new(FFI_ArrowArray::empty());
             let mut int_array = Box::new(FFI_ArrowArray::empty());
-            root_array.length = 1;
+            root_array.length = root_length;
             root_array.offset = root_offset;
             root_array.null_count = 0;
             root_array.release = Some(test_release_array);
@@ -7603,6 +7639,10 @@ mod tests {
                 )
             };
             assert!(imported.is_none());
+            assert!(
+                root_array.release.is_some(),
+                "unsupported Struct must be rejected before FFI ownership is consumed"
+            );
             assert!(!err.is_null());
             assert_eq!(
                 unsafe { (*err).error.code() },
@@ -7666,6 +7706,66 @@ mod tests {
             let _ = StructArray::from(data);
         }
 
+        unsafe fn assert_three_level_nested_struct_entrypoint_rejected() {
+            const NODE_COUNT: usize = 4;
+            let mut schemas: Vec<Box<FFI_ArrowSchema>> = (0..NODE_COUNT)
+                .map(|_| Box::new(FFI_ArrowSchema::empty()))
+                .collect();
+            let mut arrays: Vec<Box<FFI_ArrowArray>> = (0..NODE_COUNT)
+                .map(|_| Box::new(FFI_ArrowArray::empty()))
+                .collect();
+            let mut schema_children: Vec<Vec<*mut FFI_ArrowSchema>> =
+                (0..NODE_COUNT).map(|_| Vec::new()).collect();
+            let mut array_children: Vec<Vec<*mut FFI_ArrowArray>> =
+                (0..NODE_COUNT).map(|_| Vec::new()).collect();
+            let mut buffers: Vec<Vec<*const std::ffi::c_void>> =
+                vec![vec![std::ptr::null()]; NODE_COUNT];
+            let values = [11_i32, 22_i32];
+            buffers[NODE_COUNT - 1] =
+                vec![std::ptr::null(), values.as_ptr().cast::<std::ffi::c_void>()];
+
+            for i in 0..NODE_COUNT {
+                schemas[i].format = if i + 1 == NODE_COUNT {
+                    c"i".as_ptr()
+                } else {
+                    c"+s".as_ptr()
+                };
+                arrays[i].length = if i == 0 { 1 } else { 2 };
+                arrays[i].release = Some(test_release_array);
+                arrays[i].n_buffers = buffers[i].len() as i64;
+                arrays[i].buffers = buffers[i].as_mut_ptr();
+            }
+            for i in 0..NODE_COUNT - 1 {
+                schema_children[i].push(&mut *schemas[i + 1]);
+                schemas[i].n_children = 1;
+                schemas[i].children = schema_children[i].as_mut_ptr();
+                array_children[i].push(&mut *arrays[i + 1]);
+                arrays[i].n_children = 1;
+                arrays[i].children = array_children[i].as_mut_ptr();
+            }
+
+            let mut err = std::ptr::null_mut();
+            unsafe {
+                assert!(
+                    arrow_ffi_import_record_batch(
+                        &mut *arrays[0],
+                        &*schemas[0],
+                        "three_level_nested_struct_test",
+                        &mut err,
+                    )
+                    .is_none()
+                );
+                assert!(arrays[0].release.is_some());
+                assert_eq!((*err).error.code(), ErrorCode::ArrowUnsupportedColumnKind);
+                assert!(
+                    (*err).error.msg().contains(
+                        "Arrow schema root.children[0]: Struct columns are not supported"
+                    )
+                );
+                line_sender_error_free(err);
+            }
+        }
+
         unsafe fn with_fixed_size_list_fixture<R>(
             root_offset: i64,
             root_length: i64,
@@ -7718,8 +7818,10 @@ mod tests {
         #[test]
         fn record_batch_entrypoint_rejects_nested_struct_at_offsets_zero_and_one() {
             unsafe {
-                assert_nested_struct_entrypoint_rejected(0);
-                assert_nested_struct_entrypoint_rejected(1);
+                assert_nested_struct_entrypoint_rejected(0, 1);
+                assert_nested_struct_entrypoint_rejected(1, 1);
+                assert_nested_struct_entrypoint_rejected(0, 0);
+                assert_three_level_nested_struct_entrypoint_rejected();
             }
         }
 
@@ -7732,8 +7834,8 @@ mod tests {
                 }));
                 assert!(raw.is_err(), "Arrow 59 raw offset-1 conversion must panic");
 
-                assert_nested_struct_entrypoint_rejected(0);
-                assert_nested_struct_entrypoint_rejected(1);
+                assert_nested_struct_entrypoint_rejected(0, 1);
+                assert_nested_struct_entrypoint_rejected(1, 1);
             }
         }
 
@@ -7747,6 +7849,19 @@ mod tests {
                         validate_arrow_array_depth(array, schema).unwrap();
                     });
                     with_fixed_size_list_fixture(root_offset, 1, 4, |array, schema| {
+                        let mut err = std::ptr::null_mut();
+                        let batch = arrow_ffi_import_record_batch(
+                            array,
+                            schema,
+                            "fixed_size_list_boundary_test",
+                            &mut err,
+                        )
+                        .expect("valid FixedSizeList must reach materialization");
+                        assert!(err.is_null());
+                        assert_eq!(batch.num_rows(), 1);
+                        assert_eq!(batch.num_columns(), 1);
+                    });
+                    with_fixed_size_list_fixture(root_offset, 1, 4, |array, schema| {
                         let owned = std::ptr::read(array);
                         (*array).release = None;
                         let data = arrow::ffi::from_ffi(owned, &*schema).unwrap();
@@ -7758,7 +7873,33 @@ mod tests {
                     validate_arrow_array_depth(array, schema)
                 });
                 let err = guarded.unwrap_err();
+                assert_eq!(err.code(), ErrorCode::ArrowIngest);
                 assert!(err.msg().contains("ends at 4, beyond child 0 length 3"));
+
+                with_fixed_size_list_fixture(1, 1, 3, |array, schema| {
+                    let mut err = std::ptr::null_mut();
+                    assert!(
+                        arrow_ffi_import_record_batch(
+                            array,
+                            schema,
+                            "fixed_size_list_short_child_test",
+                            &mut err,
+                        )
+                        .is_none()
+                    );
+                    assert!(
+                        (*array).release.is_some(),
+                        "short FixedSizeList child must be rejected before materialization"
+                    );
+                    assert_eq!((*err).error.code(), ErrorCode::ArrowIngest);
+                    assert!(
+                        (*err)
+                            .error
+                            .msg()
+                            .contains("ends at 4, beyond child 0 length 3")
+                    );
+                    line_sender_error_free(err);
+                });
 
                 let raw = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     with_fixed_size_list_fixture(1, 1, 3, |array, schema| {
@@ -7963,6 +8104,56 @@ mod tests {
         }
 
         #[test]
+        fn metadata_signed_and_arithmetic_failures_have_stable_diagnostics() {
+            unsafe fn reject(blob: &[u8], needle: &str) {
+                let mut budget = ArrowMetadataBudget::new().unwrap();
+                let err = unsafe {
+                    validate_metadata_blob(
+                        blob.as_ptr().cast::<std::ffi::c_char>(),
+                        "root.children[7]",
+                        &mut budget,
+                    )
+                }
+                .unwrap_err();
+                assert_eq!(err.code(), ErrorCode::ArrowIngest);
+                assert!(
+                    err.msg().contains(needle),
+                    "expected {needle:?}, got: {}",
+                    err.msg()
+                );
+            }
+
+            unsafe {
+                reject(
+                    &(-1_i32).to_ne_bytes(),
+                    "root.children[7]: metadata entry count -1 is negative",
+                );
+                reject(
+                    &[1_i32.to_ne_bytes(), (-2_i32).to_ne_bytes()].concat(),
+                    "metadata entry 0 key length -2 is negative",
+                );
+                reject(
+                    &[
+                        1_i32.to_ne_bytes(),
+                        0_i32.to_ne_bytes(),
+                        (-3_i32).to_ne_bytes(),
+                    ]
+                    .concat(),
+                    "metadata entry 0 value length -3 is negative",
+                );
+                reject(
+                    &[1_i32.to_ne_bytes(), i32::MAX.to_ne_bytes()].concat(),
+                    "metadata blob exceeds 1048576 bytes",
+                );
+            }
+
+            let mut budget = ArrowMetadataBudget::new().unwrap();
+            let err = budget.charge_advance("root", i64::MAX, 1).unwrap_err();
+            assert_eq!(err.code(), ErrorCode::ArrowIngest);
+            assert!(err.msg().contains("metadata cursor arithmetic overflows"));
+        }
+
+        #[test]
         fn accepted_arrow_59_format_table_round_trips_through_model() {
             for family in ARROW_FORMAT_FAMILIES {
                 for pattern in family.patterns {
@@ -7992,6 +8183,137 @@ mod tests {
                     assert_eq!(model.buffers, family.buffers);
                     assert_eq!(model.conversion, family.conversion);
                 }
+            }
+        }
+
+        fn assert_empty_arrow_type_reaches_materialization(
+            label: &str,
+            data_type: arrow::datatypes::DataType,
+        ) {
+            let array = arrow::array::new_empty_array(&data_type);
+            let (mut ffi_array, ffi_schema) =
+                arrow::ffi::to_ffi(&array.to_data()).expect("empty Arrow export");
+            let mut err = std::ptr::null_mut();
+            let imported = unsafe {
+                arrow_ffi_import_array_sliced(
+                    &mut ffi_array,
+                    &ffi_schema,
+                    0,
+                    0,
+                    "accepted_arrow_59_layout_test",
+                    &mut err,
+                )
+            };
+            if imported.is_none() {
+                let message = if err.is_null() {
+                    "no native error".to_string()
+                } else {
+                    unsafe { (*err).error.msg().to_string() }
+                };
+                if !err.is_null() {
+                    unsafe { line_sender_error_free(err) };
+                }
+                panic!("{label} ({data_type:?}) failed guarded materialization: {message}");
+            }
+            assert!(err.is_null(), "{label}: success returned an error");
+            assert_eq!(imported.unwrap().data_type(), &data_type, "{label}");
+        }
+
+        #[test]
+        fn accepted_arrow_59_layout_families_reach_real_import_and_materialization() {
+            use arrow::datatypes::{DataType, Field, TimeUnit};
+            use std::sync::Arc;
+
+            let mut cases = vec![
+                ("Boolean", DataType::Boolean),
+                ("Int8", DataType::Int8),
+                ("Int16", DataType::Int16),
+                ("Int32", DataType::Int32),
+                ("Int64", DataType::Int64),
+                ("UInt8", DataType::UInt8),
+                ("UInt16", DataType::UInt16),
+                ("UInt32", DataType::UInt32),
+                ("UInt64", DataType::UInt64),
+                ("Float16", DataType::Float16),
+                ("Float32", DataType::Float32),
+                ("Float64", DataType::Float64),
+                ("Date32", DataType::Date32),
+                ("Date64", DataType::Date64),
+                ("Binary", DataType::Binary),
+                ("LargeBinary", DataType::LargeBinary),
+                ("BinaryView", DataType::BinaryView),
+                ("Utf8", DataType::Utf8),
+                ("LargeUtf8", DataType::LargeUtf8),
+                ("Utf8View", DataType::Utf8View),
+                ("FixedSizeBinary(1)", DataType::FixedSizeBinary(1)),
+                ("FixedSizeBinary(16)", DataType::FixedSizeBinary(16)),
+                ("FixedSizeBinary(32)", DataType::FixedSizeBinary(32)),
+                ("FixedSizeBinary(33)", DataType::FixedSizeBinary(33)),
+                ("Decimal32", DataType::Decimal32(7, 2)),
+                ("Decimal64", DataType::Decimal64(16, 3)),
+                ("Decimal128", DataType::Decimal128(30, 4)),
+                ("Decimal256", DataType::Decimal256(60, 5)),
+            ];
+            for unit in [
+                TimeUnit::Second,
+                TimeUnit::Millisecond,
+                TimeUnit::Microsecond,
+                TimeUnit::Nanosecond,
+            ] {
+                cases.push(("Timestamp", DataType::Timestamp(unit, None)));
+                cases.push(("Duration", DataType::Duration(unit)));
+            }
+            cases.extend([
+                (
+                    "Timestamp(UTC)",
+                    DataType::Timestamp(TimeUnit::Microsecond, Some(Arc::from("UTC"))),
+                ),
+                ("Time32(s)", DataType::Time32(TimeUnit::Second)),
+                ("Time32(ms)", DataType::Time32(TimeUnit::Millisecond)),
+                ("Time64(us)", DataType::Time64(TimeUnit::Microsecond)),
+                ("Time64(ns)", DataType::Time64(TimeUnit::Nanosecond)),
+            ]);
+
+            let item = Arc::new(Field::new("item", DataType::Float64, true));
+            cases.extend([
+                ("List<Float64>", DataType::List(item.clone())),
+                ("LargeList<Float64>", DataType::LargeList(item.clone())),
+                ("FixedSizeList<Float64,2>", DataType::FixedSizeList(item, 2)),
+            ]);
+            for key in [
+                DataType::Int8,
+                DataType::Int16,
+                DataType::Int32,
+                DataType::UInt8,
+                DataType::UInt16,
+                DataType::UInt32,
+            ] {
+                for value in [DataType::Utf8, DataType::LargeUtf8, DataType::Utf8View] {
+                    cases.push((
+                        "Dictionary",
+                        DataType::Dictionary(Box::new(key.clone()), Box::new(value)),
+                    ));
+                }
+            }
+
+            for (label, data_type) in cases {
+                assert_empty_arrow_type_reaches_materialization(label, data_type);
+            }
+        }
+
+        #[test]
+        fn invalid_time_unit_combinations_are_explicitly_rejected() {
+            use arrow::datatypes::{DataType, TimeUnit};
+
+            for data_type in [
+                DataType::Time32(TimeUnit::Microsecond),
+                DataType::Time32(TimeUnit::Nanosecond),
+                DataType::Time64(TimeUnit::Second),
+                DataType::Time64(TimeUnit::Millisecond),
+            ] {
+                let err = arrow_data_type_node_model(&data_type, "root", false).unwrap_err();
+                assert_eq!(err.code(), ErrorCode::ArrowUnsupportedColumnKind);
+                assert!(err.msg().contains("Arrow schema root:"));
             }
         }
 
@@ -8061,6 +8383,48 @@ mod tests {
                     "unexpected Dictionary total-node diagnostic: {}",
                     err.msg()
                 );
+            }
+        }
+
+        #[test]
+        fn exact_non_root_arity_rejects_before_child_pointer_traversal() {
+            unsafe {
+                let mut leaf = Box::new(FFI_ArrowSchema::empty());
+                leaf.format = c"i".as_ptr();
+                leaf.n_children = 1;
+                leaf.children = std::ptr::dangling_mut();
+                let err = validate_arrow_schema_depth(&*leaf).unwrap_err();
+                assert_eq!(err.code(), ErrorCode::ArrowIngest);
+                assert!(
+                    err.msg().contains(
+                        "root: format requires exactly 0 normal child(ren) but declares 1"
+                    )
+                );
+
+                let mut list = Box::new(FFI_ArrowSchema::empty());
+                list.format = c"+l".as_ptr();
+                list.n_children = 2;
+                list.children = std::ptr::dangling_mut();
+                let err = validate_arrow_schema_depth(&*list).unwrap_err();
+                assert_eq!(err.code(), ErrorCode::ArrowIngest);
+                assert!(
+                    err.msg().contains(
+                        "root: format requires exactly 1 normal child(ren) but declares 2"
+                    )
+                );
+            }
+        }
+
+        #[test]
+        fn schema_and_array_fanout_budget_diagnostics_are_distinct() {
+            for kind in ["schema", "array"] {
+                let err =
+                    validate_arrow_fanout_budget(kind, "root.children[2047]", 2_049, 2_047, 1)
+                        .unwrap_err();
+                assert_eq!(err.code(), ErrorCode::ArrowIngest);
+                assert!(err.msg().contains(&format!(
+                    "Arrow {kind} root.children[2047]: fan-out 1 exceeds remaining total-node budget 0"
+                )));
             }
         }
 
@@ -8309,6 +8673,7 @@ mod tests {
                 std::alloc::dealloc(s_raw as *mut u8, s_layout);
                 std::alloc::dealloc(a_raw as *mut u8, a_layout);
                 let err = res.unwrap_err();
+                assert_eq!(err.code(), ErrorCode::ArrowIngest);
                 assert!(
                     err.msg().contains("n_buffers"),
                     "expected n_buffers-negative error, got: {}",
@@ -8332,6 +8697,7 @@ mod tests {
                 std::alloc::dealloc(s_raw as *mut u8, s_layout);
                 std::alloc::dealloc(a_raw as *mut u8, a_layout);
                 let err = res.unwrap_err();
+                assert_eq!(err.code(), ErrorCode::ArrowIngest);
                 assert!(
                     err.msg().contains("Int32 requires exactly 2"),
                     "expected exact fixed-layout error, got: {}",
@@ -8354,6 +8720,7 @@ mod tests {
                 std::alloc::dealloc(s_raw as *mut u8, s_layout);
                 std::alloc::dealloc(a_raw as *mut u8, a_layout);
                 let err = res.unwrap_err();
+                assert_eq!(err.code(), ErrorCode::ArrowIngest);
                 assert!(
                     err.msg().contains("buffer pointer is NULL"),
                     "expected NULL-buffers error, got: {}",
@@ -8389,6 +8756,7 @@ mod tests {
                 std::alloc::dealloc(s_raw as *mut u8, s_layout);
                 std::alloc::dealloc(a_raw as *mut u8, a_layout);
                 let err = res.unwrap_err();
+                assert_eq!(err.code(), ErrorCode::ArrowIngest);
                 assert!(
                     err.msg().contains("offset buffer"),
                     "expected NULL offset-buffer rejection, got: {}",
@@ -8411,6 +8779,7 @@ mod tests {
                 std::alloc::dealloc(s_raw as *mut u8, s_layout);
                 std::alloc::dealloc(a_raw as *mut u8, a_layout);
                 let err = res.unwrap_err();
+                assert_eq!(err.code(), ErrorCode::ArrowIngest);
                 assert!(
                     err.msg().contains("view layout requires 3..=16"),
                     "expected too-few-buffers error, got: {}",
@@ -8420,16 +8789,25 @@ mod tests {
         }
 
         #[test]
-        fn fixed_layout_rejects_extra_buffer_below_global_cap() {
+        fn fixed_layout_rejects_counts_below_and_above_exact_layout() {
             unsafe {
                 let mut schema = Box::new(FFI_ArrowSchema::empty());
                 schema.format = c"i".as_ptr();
-                let mut array = Box::new(FFI_ArrowArray::empty());
-                let mut buffers = [std::ptr::null(), std::ptr::null(), std::ptr::null()];
-                array.n_buffers = 3;
-                array.buffers = buffers.as_mut_ptr();
-                let err = validate_arrow_array_depth(&*array, &*schema).unwrap_err();
-                assert!(err.msg().contains("Int32 requires exactly 2"));
+                for declared in [1, 3] {
+                    let mut array = Box::new(FFI_ArrowArray::empty());
+                    let mut buffers = [std::ptr::null(), std::ptr::null(), std::ptr::null()];
+                    array.n_buffers = declared;
+                    array.buffers = buffers.as_mut_ptr();
+                    let err = validate_arrow_array_depth(&*array, &*schema).unwrap_err();
+                    assert_eq!(err.code(), ErrorCode::ArrowIngest);
+                    assert!(
+                        err.msg().contains(&format!(
+                            "declares {declared} buffers but Int32 requires exactly 2"
+                        )),
+                        "unexpected exact-layout diagnostic: {}",
+                        err.msg()
+                    );
+                }
             }
         }
 
@@ -8457,6 +8835,7 @@ mod tests {
                 above.n_buffers = 17;
                 above.buffers = std::ptr::dangling_mut();
                 let err = validate_arrow_array_depth(&*above, &*schema).unwrap_err();
+                assert_eq!(err.code(), ErrorCode::ArrowIngest);
                 assert!(err.msg().contains("view layout requires 3..=16"));
 
                 let negative = [-1_i64];
@@ -8466,6 +8845,7 @@ mod tests {
                 malformed.n_buffers = 4;
                 malformed.buffers = malformed_buffers.as_mut_ptr();
                 let err = validate_arrow_array_depth(&*malformed, &*schema).unwrap_err();
+                assert_eq!(err.code(), ErrorCode::ArrowIngest);
                 assert!(
                     err.msg()
                         .contains("variadic buffer 0 length -1 is negative")
@@ -8834,11 +9214,33 @@ mod tests {
                 std::alloc::dealloc(s_raw as *mut u8, s_layout);
                 std::alloc::dealloc(a_raw as *mut u8, a_layout);
                 let err = res.unwrap_err();
+                assert_eq!(err.code(), ErrorCode::ArrowIngest);
                 assert!(
-                    err.msg().contains("length"),
+                    err.msg().contains("length 16777217 exceeds 16777216"),
                     "expected length-cap error, got: {}",
                     err.msg()
                 );
+            }
+        }
+
+        #[test]
+        fn array_row_and_offset_caps_are_inclusive_and_distinct() {
+            unsafe {
+                let mut schema = Box::new(FFI_ArrowSchema::empty());
+                schema.format = c"i".as_ptr();
+                let mut array = Box::new(FFI_ArrowArray::empty());
+                let mut buffers = [std::ptr::null(), std::ptr::null()];
+                array.length = MAX_ARROW_ARRAY_LENGTH;
+                array.offset = MAX_ARROW_ARRAY_LENGTH;
+                array.n_buffers = 2;
+                array.buffers = buffers.as_mut_ptr();
+                validate_arrow_array_depth(&*array, &*schema).unwrap();
+
+                array.length = 0;
+                array.offset = MAX_ARROW_ARRAY_LENGTH + 1;
+                let err = validate_arrow_array_depth(&*array, &*schema).unwrap_err();
+                assert_eq!(err.code(), ErrorCode::ArrowIngest);
+                assert!(err.msg().contains("offset 16777217 exceeds 16777216"));
             }
         }
 
