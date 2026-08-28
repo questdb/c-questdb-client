@@ -1,0 +1,7 @@
+interface:
+  display_name: "Approve PR"
+  short_description: "Post approval and mark a client PR READY"
+  default_prompt: "Use $approve-pr to post the completed review as an approval and add READY."
+
+policy:
+  allow_implicit_invocation: false

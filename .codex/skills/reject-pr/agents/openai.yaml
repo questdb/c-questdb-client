@@ -1,0 +1,7 @@
+interface:
+  display_name: "Reject PR"
+  short_description: "Request changes and clear client PR readiness"
+  default_prompt: "Use $reject-pr to post the completed review as a change request and remove READY."
+
+policy:
+  allow_implicit_invocation: false
