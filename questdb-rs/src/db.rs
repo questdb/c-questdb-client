@@ -1694,8 +1694,10 @@ impl<'a> BorrowedSender<'a> {
 
     /// Encode and publish `chunk` into the store-and-forward queue, returning
     /// as soon as the frame is accepted locally (no server round-trip). On
-    /// success `chunk` is cleared; on a delivery-uncertain failure the error
-    /// is tagged [`in_doubt`](crate::Error::in_doubt).
+    /// success `chunk` is cleared. On failure, retry the retained current chunk
+    /// only when [`Error::not_delivered`](crate::Error::not_delivered) is true;
+    /// [`Error::in_doubt`](crate::Error::in_doubt) independently governs replay
+    /// from an earlier source checkpoint.
     pub fn flush(&mut self, chunk: &mut crate::ingress::column_sender::Chunk<'_>) -> Result<()> {
         self.0.inner_mut().flush(chunk)
     }
@@ -1980,21 +1982,30 @@ impl Debug for BorrowedSender<'_> {
 /// [`QuestDb`] pool — the handle returned by
 /// [`QuestDb::borrow_direct_column_sender`], used by DataFrame ingestion.
 ///
-/// [`Self::flush`] pipelines a deferred frame; [`Self::commit`] (or
-/// [`Self::flush_and_wait`] on the final chunk) sends the commit boundary and
-/// waits for `ack_level`. Normal `Drop` makes a best-effort commit of
-/// uncommitted deferred frames at the pool's default ack level. If that commit
-/// fails, or if [`Self::drop_on_return`] was requested, those frames are
-/// discarded; for deterministic error handling, call [`Self::commit`] or
-/// [`Self::flush_and_wait`] yourself and re-drive from the last successful
-/// commit after failure.
+/// On a fresh physical connection, the first successful non-empty
+/// [`Self::flush`] is a non-deferred commit boundary; later calls pipeline
+/// deferred frames. [`Self::commit`] (or [`Self::flush_and_wait`] on the final
+/// chunk) sends the next commit boundary and waits for `ack_level`. Normal
+/// `Drop` makes a best-effort commit of uncommitted deferred frames at the
+/// pool's default ack level. If that commit fails, or if
+/// [`Self::drop_on_return`] was requested, those frames are discarded; for
+/// deterministic error handling, call [`Self::commit`] or
+/// [`Self::flush_and_wait`] yourself and re-drive only when the error is not
+/// [`in_doubt`](crate::Error::in_doubt).
 ///
 /// Not `Send` or `Sync`.
 pub struct BorrowedDirectColumnSender<'a>(DirectSenderHandle<'a>);
 
 impl<'a> BorrowedDirectColumnSender<'a> {
-    /// Encode and pipeline `chunk` as a deferred frame without waiting. The
-    /// frame is not committed until [`Self::commit`] / [`Self::flush_and_wait`].
+    /// Encode and publish `chunk` without waiting. The first non-empty flush on
+    /// a fresh physical connection is non-deferred and may commit immediately;
+    /// later frames are deferred until [`Self::commit`] /
+    /// [`Self::flush_and_wait`]. Check
+    /// [`Error::not_delivered`](crate::Error::not_delivered) before retrying
+    /// only the retained current chunk, and
+    /// [`Error::in_doubt`](crate::Error::in_doubt) before replaying a larger
+    /// source after any failure. Both may be true if this chunk was not sent
+    /// but an earlier publication committed.
     pub fn flush(&mut self, chunk: &mut crate::ingress::column_sender::Chunk<'_>) -> Result<()> {
         self.0.inner_mut().flush(chunk)
     }

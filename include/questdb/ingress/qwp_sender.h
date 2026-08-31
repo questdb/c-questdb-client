@@ -781,8 +781,10 @@ bool qwp_chunk_column_binary(
  * split and each half published on its own, so an earlier half can already be
  * durably queued (store-and-forward is at-least-once) when a later half hits
  * the cap. The flush is then delivery-unknown rather than
- * known-not-delivered — check `line_sender_error_in_doubt` before resending
- * the chunk, or the rows the committed prefix already carried are duplicated.
+ * known-not-delivered: `line_sender_error_not_delivered` is false, so
+ * resending the chunk would duplicate the rows its committed prefix already
+ * carried. Consult `line_sender_error_in_doubt` separately before replaying a
+ * larger source.
  *
  * Resetting the dictionary means discarding the connection that owns it — there
  * is no per-sender close. A full dictionary RETIRES the connection on return,
@@ -1587,13 +1589,17 @@ bool qwp_sender_wait(
     line_sender_error** err_out);
 
 /**
- * Pipeline a deferred frame on a direct connection. Not committed until
- * `qwp_direct_sender_commit`. On success the chunk is cleared for reuse.
+ * Publish a frame on a direct connection without waiting. The first non-empty
+ * flush on a fresh physical connection is non-deferred and may commit
+ * immediately; later frames are deferred until `qwp_direct_sender_commit`.
+ * On success the chunk is cleared for reuse.
  *
- * A transient transport failure reports `line_sender_error_failover_retry`;
- * check `line_sender_error_in_doubt` to tell provably-not-delivered (retry
- * with the same chunk on a fresh sender) from delivery-unknown (re-drive from
- * the source instead).
+ * A transient transport failure reports `line_sender_error_failover_retry`.
+ * The retained current chunk may be retried independently on a fresh sender
+ * only when `line_sender_error_not_delivered` is true. Separately, replay a
+ * larger source from its previous confirmed boundary only when
+ * `line_sender_error_in_doubt` is false. Both flags may be true: this chunk was
+ * not transmitted, but an earlier publication may already have committed.
  */
 QUESTDB_CLIENT_API
 bool qwp_direct_sender_flush(
@@ -1782,12 +1788,17 @@ bool qwp_sender_flush_arrow_batch_at_column(
     line_sender_error** err_out);
 
 /**
- * `qwp_sender_flush_arrow_batch_at_now` on a direct sender: pipeline the
- * batch as a deferred frame, not committed until `qwp_direct_sender_commit`.
+ * `qwp_sender_flush_arrow_batch_at_now` on a direct sender: publish without
+ * waiting. The first non-empty batch on a fresh physical connection is
+ * non-deferred and may commit immediately; later batches are deferred until
+ * `qwp_direct_sender_commit`.
  * Same Arrow ownership contract: `array->release` is consumed on success and
- * re-exported on a provably-not-delivered failure
- * (`line_sender_error_failover_retry` with `line_sender_error_in_doubt ==
- * false`); callers MUST check `array->release != NULL` on the failure path.
+ * re-exported when the current batch was provably not delivered. An earlier
+ * direct publication can make `line_sender_error_in_doubt` true even while
+ * this current batch is re-exported, so `array->release != NULL` is the
+ * authoritative ownership check on the failure path. The error flag remains
+ * authoritative for deciding whether a larger source is safe to replay;
+ * `line_sender_error_not_delivered` reports the current-batch classification.
  */
 QUESTDB_CLIENT_API
 bool qwp_direct_sender_flush_arrow_batch_at_now(

@@ -435,9 +435,10 @@ impl crate::db::BorrowedDirectColumnSender<'_> {
     /// `PolarsIngestOptions::default()` preserves the previous behaviour
     /// (server-assigned timestamps, schema-derived wire types).
     ///
-    /// Unlike the lower-level `flush` / `flush_arrow_batch_*`, which leave rows
-    /// uncommitted until you call [`BorrowedDirectColumnSender::commit`], this entry
-    /// owns the commit (and the failover replay boundary).
+    /// Unlike the lower-level `flush` / `flush_arrow_batch_*`, this entry owns
+    /// the commit and failover replay boundary. A fresh connection's first
+    /// publish-only flush is itself an eager commit boundary; subsequent
+    /// publish-only frames remain deferred until a checkpoint.
     ///
     /// [`BorrowedDirectColumnSender::commit`]: crate::db::BorrowedDirectColumnSender::commit
     ///
@@ -489,6 +490,12 @@ impl crate::db::BorrowedDirectColumnSender<'_> {
                 Ok(()) => return Ok(()),
                 Err(err) if err.code() != crate::ErrorCode::FailoverRetry => return Err(err),
                 Err(err) => {
+                    // This high-level entry point explicitly provides
+                    // at-least-once delivery and owns a precise checkpoint:
+                    // even an in-doubt failure re-drives only the tail after
+                    // the last ACKed checkpoint. Lower-level callers still
+                    // receive the truthful `in_doubt` flag and can decline to
+                    // replay a larger source.
                     // `reborrow_with_retry` returns as soon as a replacement
                     // connection opens, so a server that accepts connections but
                     // never advances acks would otherwise re-drive the tail
@@ -687,9 +694,7 @@ mod tests {
                 "Polars Binary must export as BinaryView; if this changes, \
                  re-check the override applicability list"
             );
-            let kind =
-                classify_with_override(rb.schema().field(0), rb.column(0).as_ref(), Some(ov))
-                    .unwrap();
+            let kind = classify_with_override(rb.schema().field(0), Some(ov)).unwrap();
             assert!(
                 matches!(
                     (name, kind),

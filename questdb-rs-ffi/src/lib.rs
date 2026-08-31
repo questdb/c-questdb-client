@@ -437,9 +437,10 @@ pub enum line_sender_error_code {
     /// too large for a single frame is split and each half published on its own,
     /// so an earlier half can already be durably queued (store-and-forward is
     /// at-least-once) when a later half hits the cap. The error is then
-    /// delivery-unknown rather than known-not-delivered — check
-    /// `line_sender_error_in_doubt` before resending, or the rows the committed
-    /// prefix already carried are duplicated.
+    /// delivery-unknown rather than known-not-delivered:
+    /// `line_sender_error_not_delivered` is false, so resending that chunk
+    /// would duplicate the rows its committed prefix already carried. Consult
+    /// `line_sender_error_in_doubt` separately before replaying a larger source.
     line_sender_error_symbol_dict_full = 37,
 }
 
@@ -724,16 +725,16 @@ pub unsafe extern "C" fn questdb_error_msg(
     }
 }
 
-/// `true` when the failed operation is *delivery-unknown* ("in doubt"): the
-/// current input's bytes may already have reached the server even though the
-/// call returned an error (e.g. a socket write that failed mid-frame, or a
-/// post-publish ACK wait that failed).
+/// `true` when replaying from the caller's previous confirmed boundary is
+/// unsafe ("in doubt"). The current input may already have reached the server,
+/// or an earlier direct publication may have committed even when the current
+/// input was provably not transmitted.
 ///
 /// This is independent of `line_sender_error_get_code`: a delivery-unknown
 /// failure typically reports `line_sender_error_failover_retry` (the connection
-/// may be replaced), yet that code alone does NOT mean the input is safe to
-/// resend. When this returns `true`, only replay the same input if table-level
-/// dedup/upsert keys make duplicate rows harmless.
+/// may be replaced), yet that code alone does NOT mean the source is safe to
+/// resend. When this returns `true`, only replay from the earlier boundary if
+/// table-level dedup/upsert keys make duplicate rows harmless.
 ///
 /// NULL-safe: passing `NULL` returns `false`.
 #[unsafe(no_mangle)]
@@ -742,6 +743,23 @@ pub unsafe extern "C" fn questdb_error_in_doubt(error: *const questdb_error) -> 
         return false;
     }
     unsafe { (*error).error.in_doubt() }
+}
+
+/// `true` only when the specific input passed to the failed operation was
+/// provably not transmitted and may be retried independently.
+///
+/// Independent of [`questdb_error_in_doubt`]: both can be true when this input
+/// was not delivered but an earlier direct publication committed after the
+/// caller's previous checkpoint. A false result is conservative and does not
+/// by itself establish that the current input was delivered.
+///
+/// NULL-safe: passing `NULL` returns `false`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn questdb_error_not_delivered(error: *const questdb_error) -> bool {
+    if error.is_null() {
+        return false;
+    }
+    unsafe { (*error).error.not_delivered() }
 }
 
 /// Clean up the error.
@@ -775,6 +793,12 @@ pub unsafe extern "C" fn line_sender_error_msg(
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn line_sender_error_in_doubt(error: *const line_sender_error) -> bool {
     unsafe { questdb_error_in_doubt(error) }
+}
+
+/// Released line-sender spelling of [`questdb_error_not_delivered`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn line_sender_error_not_delivered(error: *const line_sender_error) -> bool {
+    unsafe { questdb_error_not_delivered(error) }
 }
 
 /// Released line-sender spelling of [`questdb_error_free`].
@@ -5675,6 +5699,7 @@ mod tests {
     #[test]
     fn line_sender_error_in_doubt_is_null_safe() {
         assert!(!unsafe { line_sender_error_in_doubt(ptr::null()) });
+        assert!(!unsafe { line_sender_error_not_delivered(ptr::null()) });
     }
 
     #[test]
@@ -5687,6 +5712,7 @@ mod tests {
             qwp_ws_error: None,
         }));
         assert!(!unsafe { line_sender_error_in_doubt(plain) });
+        assert!(!unsafe { line_sender_error_not_delivered(plain) });
         unsafe { line_sender_error_free(plain) };
 
         // A delivery-unknown failure surfaces in_doubt even though it reports
@@ -5699,11 +5725,28 @@ mod tests {
             qwp_ws_error: None,
         }));
         assert!(unsafe { line_sender_error_in_doubt(in_doubt) });
+        assert!(!unsafe { line_sender_error_not_delivered(in_doubt) });
         assert_err_code(
             unsafe { line_sender_error_get_code(in_doubt) },
             line_sender_error_code::line_sender_error_failover_retry,
         );
         unsafe { line_sender_error_free(in_doubt) };
+
+        // Orthogonal truth-table corner: this input was not transmitted, but
+        // replay from an earlier boundary is unsafe because a prefix committed.
+        let source_unsafe = FlushFailure::DeliveryUnknown(Error::new(
+            ErrorCode::FailoverRetry,
+            "earlier prefix committed",
+        ))
+        .into_error();
+        let current_safe_source_unsafe = FlushFailure::NotDelivered(source_unsafe).into_error();
+        let both = Box::into_raw(Box::new(line_sender_error {
+            error: current_safe_source_unsafe,
+            qwp_ws_error: None,
+        }));
+        assert!(unsafe { line_sender_error_in_doubt(both) });
+        assert!(unsafe { line_sender_error_not_delivered(both) });
+        unsafe { line_sender_error_free(both) };
     }
 
     /// The hand-maintained, authoritative `(upstream ErrorCode, C enum

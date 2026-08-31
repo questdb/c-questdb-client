@@ -134,7 +134,8 @@ inline bool operator!=(::line_sender_error_code l, error_code r) noexcept
  *
  * `catch (const questdb::error&)` handles a failure from either direction.
  * The released `questdb::ingress::line_sender_error` subclass additionally
- * exposes `in_doubt()` / `qwp_ws_diagnostic()` for sender operations.
+ * exposes `in_doubt()` / `not_delivered()` / `qwp_ws_diagnostic()` for sender
+ * operations.
  */
 class error : public std::runtime_error
 {
@@ -332,9 +333,11 @@ public:
         line_sender_error_code code,
         const std::string& what,
         bool in_doubt = false,
-        std::optional<qwp_ws_error> qwp_ws_diagnostic = std::nullopt)
+        std::optional<qwp_ws_error> qwp_ws_diagnostic = std::nullopt,
+        bool not_delivered = false)
         : ::questdb::error{code, what}
         , _in_doubt{in_doubt}
+        , _not_delivered{not_delivered}
         , _qwp_ws_diagnostic{std::move(qwp_ws_diagnostic)}
     {
     }
@@ -343,16 +346,25 @@ public:
     // `error_code`, aliased here as `line_sender_error_code`).
 
     /**
-     * Whether the failed operation is *delivery-unknown* ("in doubt"): the
-     * current input may already have reached the server even though the call
-     * failed. Independent of `code()` — a delivery-unknown failure typically
-     * reports `failover_retry`, yet that code alone does not make the input
-     * safe to resend. When `true`, only replay the same input if table-level
-     * dedup/upsert keys make duplicate rows harmless.
+     * Whether replaying from the caller's previous confirmed boundary may
+     * duplicate data. The current input may be delivery-unknown, or an earlier
+     * direct publication may have committed even when the current input was
+     * provably not delivered. Consult `not_delivered()` separately before
+     * retrying only the current input.
      */
     bool in_doubt() const noexcept
     {
         return _in_doubt;
+    }
+
+    /**
+     * Whether the specific input passed to the failed operation was provably
+     * not transmitted and may be retried independently. This is orthogonal to
+     * `in_doubt()`; both can be true when an earlier publication committed.
+     */
+    bool not_delivered() const noexcept
+    {
+        return _not_delivered;
     }
 
     /** Structured diagnostic for a QWP/WebSocket server error, if available. */
@@ -373,6 +385,8 @@ private:
         const char* c_msg{::line_sender_error_msg(owned_err.get(), &c_len)};
         std::string msg{c_msg, c_len};
         const bool in_doubt{::line_sender_error_in_doubt(owned_err.get())};
+        const bool not_delivered{
+            ::line_sender_error_not_delivered(owned_err.get())};
 
         std::optional<qwp_ws_error> qwp_ws_diagnostic;
         line_sender_qwpws_error_view view{};
@@ -382,7 +396,11 @@ private:
         }
 
         return line_sender_error{
-            code, msg, in_doubt, std::move(qwp_ws_diagnostic)};
+            code,
+            msg,
+            in_doubt,
+            std::move(qwp_ws_diagnostic),
+            not_delivered};
     }
 
     template <typename F, typename... Args>
@@ -411,6 +429,7 @@ private:
     friend class basic_view;
 
     bool _in_doubt;
+    bool _not_delivered;
     std::optional<qwp_ws_error> _qwp_ws_diagnostic;
 };
 
