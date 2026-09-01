@@ -49,6 +49,11 @@ fn test_token() -> PersistedToken {
 // -- cross-language contract (frozen) ---------------------------------------
 
 #[test]
+fn token_store_directory_override_key_matches_java() {
+    assert_eq!(TOKEN_STORE_DIR_ENV, "questdb.client.oidc.token.store.dir");
+}
+
+#[test]
 fn hash_matches_frozen_cross_language_value() {
     // Pinned to the byte-exact canonical string the Java/Python clients hash, so
     // a drift in the prefix, field order, NUL separation, endpoint canonicalisation

@@ -68,8 +68,8 @@ use serde_json::Value;
 use zeroize::{Zeroize, Zeroizing};
 
 /// The environment variable that overrides the default token-store directory.
-/// Shared with the other QuestDB clients.
-pub const TOKEN_STORE_DIR_ENV: &str = "QUESTDB_CLIENT_OIDC_TOKEN_STORE_DIR";
+/// Uses Java's exact configuration key so every client selects the same store.
+pub const TOKEN_STORE_DIR_ENV: &str = "questdb.client.oidc.token.store.dir";
 
 const SCHEMA_VERSION: i64 = 1;
 const CANONICAL_PREFIX: &str = "questdb-oidc-token-v1";
@@ -469,7 +469,7 @@ pub trait TokenStore: Send + Sync {
 /// secrets manager instead.
 ///
 /// The default location is `${HOME}/.questdb/oidc-tokens/`, overridable with the
-/// `QUESTDB_CLIENT_OIDC_TOKEN_STORE_DIR` environment variable. The file name is
+/// `questdb.client.oidc.token.store.dir` environment variable. The file name is
 /// `<TokenStoreKey::hash()>.json`, so several identities coexist and the name
 /// leaks neither the endpoint nor the client id.
 ///
@@ -503,7 +503,8 @@ impl FileTokenStore {
         }
     }
 
-    /// A store at `$QUESTDB_CLIENT_OIDC_TOKEN_STORE_DIR` if that variable is set,
+    /// A store at the directory named by the
+    /// `questdb.client.oidc.token.store.dir` environment variable when set,
     /// otherwise at `${HOME}/.questdb/oidc-tokens/`.
     ///
     /// Errors if the home directory can't be resolved and no override is set

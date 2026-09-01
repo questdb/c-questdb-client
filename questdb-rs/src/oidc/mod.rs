@@ -127,7 +127,8 @@
 //! ```
 //!
 //! The bundled [`FileTokenStore`] writes one plaintext JSON file per identity
-//! (under `~/.questdb/oidc-tokens/`, or `$QUESTDB_CLIENT_OIDC_TOKEN_STORE_DIR`),
+//! (under `~/.questdb/oidc-tokens/`, or the directory named by the
+//! `questdb.client.oidc.token.store.dir` environment variable),
 //! protected by file permissions (`0600`/`0700`). **This writes a long-lived
 //! refresh token to disk in plaintext**, so persistence is opt-in; for at-rest
 //! encryption, implement [`TokenStore`] over an OS keychain or a secrets manager.
