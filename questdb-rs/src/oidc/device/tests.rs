@@ -775,7 +775,7 @@ fn silent_refresh_without_reprompt() {
 }
 
 #[test]
-fn refresh_request_omits_scope_when_grant_is_narrower() {
+fn refresh_request_sends_complete_configured_scope_like_java() {
     let refresh_body = Arc::new(Mutex::new(None));
     let mock = {
         let refresh_body = Arc::clone(&refresh_body);
@@ -835,20 +835,16 @@ fn refresh_request_omits_scope_when_grant_is_narrower() {
     assert!(fields.contains(&"refresh_token=RT-1"));
     assert!(fields.contains(&"client_id=questdb"));
     assert!(
-        !fields.iter().any(|field| field.starts_with("scope=")),
-        "refresh request must omit scope and reuse the original grant; body={body}"
+        fields.contains(&"scope=openid+profile+offline_access"),
+        "refresh request must preserve the complete configured scope; body={body}"
     );
 }
 
 #[test]
-fn groups_mode_refresh_requests_openid_scope() {
-    // Groups mode must receive a fresh id_token on every refresh, and some IdPs
-    // only re-issue one when `openid` is present in the refresh request itself,
-    // not merely in the original grant. So a groups-mode refresh must carry
-    // `scope=openid` (a non-groups refresh still omits scope — see
-    // refresh_request_omits_scope_when_grant_is_narrower). Without it the IdP
-    // returns no id_token and a headless client is forced to re-sign-in on every
-    // expiry.
+fn groups_mode_refresh_preserves_configured_openid_scope() {
+    // The configured scope is exactly `openid`, so Java-compatible refresh
+    // behavior sends exactly `scope=openid` without groups mode synthesizing or
+    // otherwise changing the request.
     let refresh_body = Arc::new(Mutex::new(None));
     let mock = {
         let refresh_body = Arc::clone(&refresh_body);
@@ -892,6 +888,54 @@ fn groups_mode_refresh_requests_openid_scope() {
         "groups-mode refresh must request the openid scope so the IdP re-issues \
          an id_token; body={body}"
     );
+}
+
+#[test]
+fn groups_mode_preserves_scope_and_loads_java_store_entry() {
+    let mock = MockServer::start(|_, _, _| (404, "{}".to_string()));
+    let dir = TempDir::new().unwrap();
+    let configured_scope = "profile offline_access";
+    let java_key = TokenStoreKey::from_config(
+        "questdb",
+        &mock.url("/token"),
+        &mock.url("/device"),
+        configured_scope,
+        None,
+        true,
+        None,
+    );
+    FileTokenStore::at(dir.path())
+        .save(
+            &java_key,
+            &PersistedToken::new(
+                None,
+                Some("ID-from-Java".to_string()),
+                Some("RT-from-Java".to_string()),
+                now_epoch() + 300.0,
+                300.0,
+            ),
+        )
+        .unwrap();
+
+    let auth = OidcDeviceAuth::builder()
+        .client_id("questdb")
+        .device_authorization_endpoint(mock.url("/device"))
+        .token_endpoint(mock.url("/token"))
+        .scope(configured_scope)
+        .groups_in_token(true)
+        .interactive(true)
+        .open_browser(false)
+        .token_store(FileTokenStore::at(dir.path()))
+        .build()
+        .unwrap();
+
+    assert_eq!(auth.config().scope, configured_scope);
+    assert_eq!(
+        auth.store_key.as_ref().unwrap().hash(),
+        java_key.hash(),
+        "groups mode changed the Java-compatible persisted identity"
+    );
+    assert_eq!(auth.token().unwrap(), "ID-from-Java");
 }
 
 #[test]

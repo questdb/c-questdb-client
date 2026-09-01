@@ -287,7 +287,7 @@ impl TokenStoreKey {
         &self.device_authorization_endpoint
     }
 
-    /// The order-normalised, space-separated scope.
+    /// The configured scope, preserved byte-for-byte for Java compatibility.
     pub fn scope(&self) -> &str {
         &self.scope
     }

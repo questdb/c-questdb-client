@@ -66,8 +66,7 @@ pub struct OidcConfig {
     pub token_endpoint: String,
     /// IdP device-authorization endpoint (RFC 8628 §3.1).
     pub device_authorization_endpoint: String,
-    /// Space-separated scopes. `openid` is added by
-    /// [`OidcDeviceAuth`](crate::oidc::OidcDeviceAuth) in groups mode.
+    /// Space-separated scopes, preserved exactly as configured or discovered.
     pub scope: String,
     /// When true, present the `id_token` (groups encoded in it) rather than the
     /// `access_token` — mirroring QuestDB's own selection.

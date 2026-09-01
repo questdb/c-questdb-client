@@ -235,8 +235,10 @@ impl OidcDeviceAuthBuilder {
         self
     }
 
-    /// Override the discovered scopes (space-separated). `openid` is added
-    /// automatically in groups mode.
+    /// Override the discovered scopes (space-separated). The configured value
+    /// is preserved exactly, including in groups mode, to match Java's token
+    /// requests and persisted-store identity. Request `openid` explicitly when
+    /// the identity provider requires it to issue an ID token.
     pub fn scope(mut self, scope: impl Into<String>) -> Self {
         self.scope = Some(scope.into());
         self
@@ -250,7 +252,7 @@ impl OidcDeviceAuthBuilder {
     }
 
     /// Override the discovered groups-in-token mode (`true` selects the
-    /// `id_token` and forces the `openid` scope).
+    /// `id_token`). This does not modify the configured scope.
     pub fn groups_in_token(mut self, groups_in_token: bool) -> Self {
         self.groups_in_token = Some(groups_in_token);
         self
@@ -393,12 +395,7 @@ impl OidcDeviceAuthBuilder {
             issuer: self.issuer,
             allow_insecure: self.allow_insecure,
         };
-        let mut config = resolve_config(&http, &params)?;
-
-        // Sending the id_token requires the `openid` scope.
-        if config.groups_in_token && !config.scope.split_whitespace().any(|s| s == "openid") {
-            config.scope = format!("openid {}", config.scope).trim().to_string();
-        }
+        let config = resolve_config(&http, &params)?;
 
         // Enforce credential-endpoint co-location centrally (every construction
         // path goes through here).
@@ -1541,24 +1538,12 @@ impl OidcDeviceAuth {
             ("grant_type", REFRESH_GRANT),
             ("refresh_token", refresh_token),
             ("client_id", self.config.client_id.as_str()),
+            ("scope", self.config.scope.as_str()),
         ];
-        // RFC 6749 section 6 defines an omitted `scope` as requesting the scope
-        // of the original grant, so by default omit it: sending the full
-        // configured scope could exceed a narrower scope actually granted by the
-        // IdP and fail an otherwise valid refresh with `invalid_scope`.
-        //
-        // Groups mode is the exception. It must receive a fresh `id_token` on
-        // every refresh, and several IdPs (Azure AD, Okta, Auth0) only re-issue
-        // one when `openid` is present in *this* request, not merely in the
-        // original grant. Without it the refresh returns no `id_token`,
-        // `has_required_token` fails, and a headless client is forced back into
-        // an interactive sign-in on every expiry. Request `openid` alone: it is
-        // always within the granted scope (the initial device-authorization
-        // request forces it, so it cannot trigger `invalid_scope`) while the
-        // broader configured scope stays omitted.
-        if self.config.groups_in_token {
-            form.push(("scope", "openid"));
-        }
+        // Match Java by sending the complete configured scope on refresh. In
+        // particular, groups mode does not synthesize `openid` here: the same
+        // exact scope participates in every request and in the persisted-store
+        // identity shared across language clients.
         if let Some(audience) = &self.config.audience {
             form.push(("audience", audience.as_str()));
         }
