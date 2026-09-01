@@ -13,6 +13,7 @@ readonly DIAG_DIR="${QWP_WS_DIAGNOSTICS_DIR:?QWP_WS_DIAGNOSTICS_DIR is required}
 readonly PRESSURE_MODE="${QWP_WS_MEMORY_PRESSURE:-natural}"
 readonly RUN_COUNT="${QWP_WS_DIAGNOSTIC_RUNS:-3}"
 readonly FUZZ_SEED="0x268579c36b106b74"
+readonly BUILD_MODE_SEED="7856154056746654427"
 
 if [[ "$(uname -s)" != "Darwin" ]]; then
     echo "This diagnostic harness must run on macOS." >&2
@@ -109,6 +110,7 @@ for run_number in $(seq 1 "$RUN_COUNT"); do
     mkdir -p "$run_dir"
 
     echo "=== run=$run_number pressure=$PRESSURE_MODE seed=$FUZZ_SEED "\
+         "build_mode_seed=$BUILD_MODE_SEED "\
          "started=$(date -u '+%Y-%m-%dT%H:%M:%SZ') ===" \
         | tee -a "$DIAG_DIR/test.log"
 
@@ -143,6 +145,7 @@ for run_number in $(seq 1 "$RUN_COUNT"); do
     controller_pid=$!
 
     QWP_WS_FUZZ_SEED="$FUZZ_SEED" \
+    QDB_BUILD_MODE_SEED="$BUILD_MODE_SEED" \
     QWP_WS_FUZZ_DIAGNOSTICS=1 \
     QWP_WS_FUZZ_READY_FILE="$ready_file" \
     QWP_WS_FUZZ_GO_FILE="$go_file" \
