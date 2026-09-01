@@ -387,6 +387,79 @@ fn token_does_not_wait_behind_interactive_sign_in() {
 }
 
 #[test]
+fn token_waits_behind_concurrent_silent_refresh_and_reuses_result() {
+    let token_calls = Arc::new(AtomicUsize::new(0));
+    let (refresh_entered_tx, refresh_entered_rx) = std::sync::mpsc::channel();
+    let (release_refresh_tx, release_refresh_rx) = std::sync::mpsc::channel();
+    let release_refresh_rx = Arc::new(Mutex::new(release_refresh_rx));
+    let mock = {
+        let token_calls = Arc::clone(&token_calls);
+        let release_refresh_rx = Arc::clone(&release_refresh_rx);
+        MockServer::start(move |method, path, _body| match (method, path) {
+            ("POST", "/token") => {
+                let call = token_calls.fetch_add(1, Ordering::SeqCst);
+                if call == 0 {
+                    refresh_entered_tx.send(()).unwrap();
+                    release_refresh_rx.lock().unwrap().recv().unwrap();
+                }
+                (
+                    200,
+                    r#"{"access_token":"AT-refreshed","refresh_token":"RT-2","expires_in":300}"#
+                        .to_string(),
+                )
+            }
+            _ => (404, "{}".to_string()),
+        })
+    };
+    let auth = Arc::new(explicit_auth(&mock, false));
+    *auth.tokens.lock().unwrap() = Some(expired_tokens("RT-1"));
+
+    let first = {
+        let auth = Arc::clone(&auth);
+        std::thread::spawn(move || auth.token())
+    };
+    refresh_entered_rx
+        .recv_timeout(Duration::from_secs(1))
+        .expect("first caller did not enter silent refresh");
+
+    let (second_tx, second_rx) = std::sync::mpsc::channel();
+    let second = {
+        let auth = Arc::clone(&auth);
+        std::thread::spawn(move || second_tx.send(auth.token()).unwrap())
+    };
+    let before_release = second_rx.recv_timeout(Duration::from_millis(200));
+    let waited_for_refresh = matches!(
+        &before_release,
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+    );
+
+    // Always release and join the refresh before asserting, so a regression
+    // cannot leave the mock or either caller blocked.
+    release_refresh_tx.send(()).unwrap();
+    let first_result = first.join().unwrap();
+    let second_result = match before_release {
+        Ok(result) => result,
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => second_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("second caller did not resume after refresh"),
+        Err(error) => panic!("second token caller disconnected: {error}"),
+    };
+    second.join().unwrap();
+
+    assert!(
+        waited_for_refresh,
+        "token() failed fast instead of waiting behind a silent refresh"
+    );
+    assert_eq!(first_result.unwrap(), "AT-refreshed");
+    assert_eq!(second_result.unwrap(), "AT-refreshed");
+    assert_eq!(
+        token_calls.load(Ordering::SeqCst),
+        1,
+        "concurrent callers performed duplicate refreshes"
+    );
+}
+
+#[test]
 fn happy_path_returns_access_token() {
     let poll = Arc::new(AtomicUsize::new(0));
     let mock = {
@@ -1255,10 +1328,14 @@ fn allow_insecure_does_not_relax_idp_endpoints() {
 #[test]
 fn refresh_transient_error_preserves_token_no_reprompt() {
     // A 5xx during refresh keeps the refresh token usable: surface a Network
-    // error and do NOT re-prompt (the refresh token is still valid).
+    // error and do NOT re-prompt (the refresh token is still valid). Repeated
+    // transport token lookups must then back off instead of POSTing once per
+    // flush while the provider is unavailable.
     let device_calls = Arc::new(AtomicUsize::new(0));
+    let refresh_calls = Arc::new(AtomicUsize::new(0));
     let mock = {
         let device_calls = Arc::clone(&device_calls);
+        let refresh_calls = Arc::clone(&refresh_calls);
         MockServer::start(move |method, path, body| match (method, path) {
             ("POST", "/device") => {
                 device_calls.fetch_add(1, Ordering::SeqCst);
@@ -1266,6 +1343,7 @@ fn refresh_transient_error_preserves_token_no_reprompt() {
             }
             ("POST", "/token") => {
                 if body.contains("grant_type=refresh_token") {
+                    refresh_calls.fetch_add(1, Ordering::SeqCst);
                     (503, r#"{"error":"temporarily_unavailable"}"#.to_string())
                 } else {
                     (
@@ -1284,6 +1362,11 @@ fn refresh_transient_error_preserves_token_no_reprompt() {
     auth.tokens.lock().unwrap().as_mut().unwrap().expires_at = 1.0;
     let err = auth.token().unwrap_err();
     assert_eq!(err.kind(), OidcErrorKind::Network);
+    assert_eq!(err.status(), Some(503));
+    let backed_off = auth.token().unwrap_err();
+    assert_eq!(backed_off.kind(), OidcErrorKind::Network);
+    assert!(backed_off.message().contains("temporarily backed off"));
+    assert_eq!(refresh_calls.load(Ordering::SeqCst), 1);
     assert_eq!(device_calls.load(Ordering::SeqCst), 1);
 }
 
@@ -2559,6 +2642,7 @@ fn failed_rotated_child_save_leaves_no_reusable_parent() {
     *stale_peer.store_state.lock().unwrap() = StoreState {
         load_attempted: true,
         last_persisted_refresh: Some("RT-1".to_string()),
+        ..StoreState::default()
     };
     let err = stale_peer.token().unwrap_err();
     assert_eq!(err.kind(), OidcErrorKind::Network);
@@ -2861,8 +2945,9 @@ fn transient_status_refresh_preserves_persisted_parent() {
         "the in-memory refresh token must survive a transient 503"
     );
 
-    // A later call retries the refresh (never InteractionRequired) and recovers,
-    // rotating RT-1 -> RT-2.
+    // An explicit recovery bypasses token()'s short stampede backoff and retries
+    // immediately, rotating RT-1 -> RT-2 without another device flow.
+    auth.sign_in().unwrap();
     assert_eq!(auth.token().unwrap(), "AT-2");
     assert_eq!(refresh_calls.load(Ordering::SeqCst), 2);
     assert_eq!(
@@ -3089,6 +3174,68 @@ fn transient_store_load_error_is_retryable_and_retried() {
         auth.token_set().unwrap().refresh_token.as_deref(),
         Some("RT-1")
     );
+}
+
+#[test]
+fn repeated_store_load_failures_are_backed_off() {
+    struct UnreadableStore {
+        loads: Arc<AtomicUsize>,
+    }
+
+    impl TokenStore for UnreadableStore {
+        fn load(&self, _key: &TokenStoreKey) -> TokenStoreResult<Option<PersistedToken>> {
+            self.loads.fetch_add(1, Ordering::SeqCst);
+            Err(Box::new(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "token store is unreadable",
+            )))
+        }
+
+        fn save(&self, _key: &TokenStoreKey, _token: &PersistedToken) -> TokenStoreResult<()> {
+            Ok(())
+        }
+
+        fn clear(&self, _key: &TokenStoreKey) -> TokenStoreResult<()> {
+            Ok(())
+        }
+
+        fn in_lock(
+            &self,
+            _key: &TokenStoreKey,
+            action: &mut dyn FnMut() -> TokenStoreResult<()>,
+        ) -> TokenStoreResult<()> {
+            action()
+        }
+    }
+
+    let loads = Arc::new(AtomicUsize::new(0));
+    let mock = MockServer::start(|_, _, _| (404, "{}".to_string()));
+    let auth = OidcDeviceAuth::builder()
+        .client_id("questdb")
+        .device_authorization_endpoint(mock.url("/device"))
+        .token_endpoint(mock.url("/token"))
+        .scope("openid")
+        .interactive(true)
+        .open_browser(false)
+        .token_store(UnreadableStore {
+            loads: Arc::clone(&loads),
+        })
+        .build()
+        .unwrap();
+
+    // Java gives a one-shot store fault one immediate free retry. A second
+    // consecutive failure starts the 5s exponential backoff, so the third hot
+    // path lookup reports the failure without opening/logging the store again.
+    assert_eq!(auth.token().unwrap_err().kind(), OidcErrorKind::Network);
+    assert_eq!(auth.token().unwrap_err().kind(), OidcErrorKind::Network);
+    let backed_off = auth.token().unwrap_err();
+    assert_eq!(backed_off.kind(), OidcErrorKind::Network);
+    assert!(backed_off.message().contains("temporarily backed off"));
+    assert_eq!(loads.load(Ordering::SeqCst), 2);
+
+    // An explicit recovery request bypasses the transport-path throttle.
+    assert_eq!(auth.sign_in().unwrap_err().kind(), OidcErrorKind::Network);
+    assert_eq!(loads.load(Ordering::SeqCst), 3);
 }
 
 /// A minimal JWT (`header.payload.sig`) whose payload carries `exp` (and a `sub`),

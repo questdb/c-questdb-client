@@ -25,6 +25,7 @@
 //! The OAuth 2.0 device authorization grant (RFC 8628) token manager.
 
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 use std::sync::{Arc, Mutex, TryLockError};
 use std::time::{Duration, Instant};
 
@@ -83,6 +84,18 @@ const MAX_TIMEOUT: Duration = Duration::from_secs(120);
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
 const DEFAULT_INTERVAL: u64 = 5;
 
+// Match the Java reference client's bounded wait behind a peer's silent
+// refresh. Six request-timeout phases cover connect, TLS, send, await, parse,
+// and drain; short polling slices still notice an interactive sign-in promptly.
+const ACQUIRE_WAIT_TIMEOUT_MULTIPLE: u32 = 6;
+const ACQUIRE_WAIT_POLL_SLICE: Duration = Duration::from_millis(50);
+
+// Stampede guards for token()'s transport-facing hot path. An explicit sign_in()
+// clears both so a user-initiated recovery is never throttled.
+const MIN_REFRESH_RETRY_INTERVAL: Duration = Duration::from_secs(5);
+const MIN_STORE_LOAD_RETRY_INTERVAL: Duration = Duration::from_secs(5);
+const MAX_STORE_LOAD_RETRY_INTERVAL: Duration = Duration::from_secs(60);
+
 type SleepFn = Arc<dyn Fn(Duration) + Send + Sync>;
 /// Monotonic clock source for the poll loop; overridable in tests to drive the
 /// device-code deadline without waiting. Defaults to [`Instant::now`].
@@ -93,6 +106,13 @@ type NowFn = Arc<dyn Fn() -> Instant + Send + Sync>;
 struct StoreState {
     /// Whether the one-shot lazy load from the store has run.
     load_attempted: bool,
+    /// Earliest instant at which a failed lazy load may be retried.
+    next_load_attempt: Option<Instant>,
+    /// Delay to apply after the next failed load. The first failure leaves the
+    /// next retry immediate, then this doubles from 5s to 60s like Java.
+    load_retry_interval: Duration,
+    /// The last failed silent-refresh attempt, used to prevent a POST per flush.
+    refresh_failed_at: Option<Instant>,
     /// The refresh token last known to be in the store. If it later disappears,
     /// a peer may have consumed it; the matching in-memory copy must not be used.
     /// It also avoids redundant writes outside the coordinated-refresh path.
@@ -106,11 +126,48 @@ impl StoreState {
         self.last_persisted_refresh.zeroize();
         self.last_persisted_refresh = value;
     }
+
+    fn reset_store_load_backoff(&mut self) {
+        self.next_load_attempt = None;
+        self.load_retry_interval = Duration::ZERO;
+    }
+
+    fn store_load_backed_off(&self, now: Instant) -> bool {
+        self.next_load_attempt.is_some_and(|next| now < next)
+    }
+
+    fn record_store_load_failure(&mut self, now: Instant) {
+        let delay = self.load_retry_interval;
+        self.load_retry_interval = if delay.is_zero() {
+            MIN_STORE_LOAD_RETRY_INTERVAL
+        } else {
+            delay.saturating_mul(2).min(MAX_STORE_LOAD_RETRY_INTERVAL)
+        };
+        self.next_load_attempt = Some(now + delay);
+    }
+
+    fn reset_refresh_backoff(&mut self) {
+        self.refresh_failed_at = None;
+    }
+
+    fn refresh_backed_off(&self, now: Instant) -> bool {
+        self.refresh_failed_at
+            .is_some_and(|failed| now.duration_since(failed) < MIN_REFRESH_RETRY_INTERVAL)
+    }
 }
 
 impl Drop for StoreState {
     fn drop(&mut self) {
         self.last_persisted_refresh.zeroize();
+    }
+}
+
+/// Resets the lock-free interactive marker even when renderer code panics.
+struct InteractiveGuard<'a>(&'a AtomicBool);
+
+impl Drop for InteractiveGuard<'_> {
+    fn drop(&mut self) {
+        self.0.store(false, AtomicOrdering::Release);
     }
 }
 
@@ -381,10 +438,12 @@ impl OidcDeviceAuthBuilder {
             open_browser: self.open_browser,
             interactive: self.interactive,
             default_interval: self.default_interval,
+            acquire_wait_timeout: self.timeout.saturating_mul(ACQUIRE_WAIT_TIMEOUT_MULTIPLE),
             sleep: self.sleep.unwrap_or_else(|| Arc::new(std::thread::sleep)),
             now: self.now.unwrap_or_else(|| Arc::new(Instant::now)),
             tokens: Mutex::new(None),
             acquire: Mutex::new(()),
+            interactive_in_progress: AtomicBool::new(false),
             token_store: self.token_store,
             store_key,
             store_state: Mutex::new(StoreState::default()),
@@ -409,12 +468,13 @@ impl OidcDeviceAuthBuilder {
 /// # Concurrency
 ///
 /// The acquisition lock is held for a whole interactive sign-in. A caller with a
-/// valid cached token remains lock-free; a [`token`](Self::token) call with no
-/// valid token fails with `InteractionRequired` rather than waiting behind an
-/// in-progress sign-in. A custom [`Renderer`]'s callbacks (and the `sleep` hook)
-/// run while this lock is held. They must not re-enter [`sign_in`](Self::sign_in)
-/// or [`clear`](Self::clear) on the same instance because that lock is not
-/// re-entrant. Re-entrant `token()` calls fail instead of deadlocking.
+/// valid cached token remains lock-free; a [`token`](Self::token) call waits for
+/// a bounded period behind another caller's silent refresh, but fails fast with
+/// `InteractionRequired` behind an interactive sign-in. A custom [`Renderer`]'s
+/// callbacks (and the `sleep` hook) run while this lock is held. They must not
+/// re-enter [`sign_in`](Self::sign_in) or [`clear`](Self::clear) on the same
+/// instance because that lock is not re-entrant. Re-entrant `token()` calls fail
+/// instead of deadlocking.
 pub struct OidcDeviceAuth {
     config: OidcConfig,
     http: HttpClient,
@@ -422,12 +482,17 @@ pub struct OidcDeviceAuth {
     open_browser: bool,
     interactive: Option<bool>,
     default_interval: u64,
+    /// Maximum time token() may wait behind a non-interactive acquisition.
+    acquire_wait_timeout: Duration,
     sleep: SleepFn,
     now: NowFn,
     /// The cached token; short critical sections only.
     tokens: Mutex<Option<TokenSet>>,
     /// Held across a silent refresh or interactive sign-in.
     acquire: Mutex<()>,
+    /// Set only around the device flow so token() can distinguish a long human
+    /// interaction from the short silent-refresh work that precedes it.
+    interactive_in_progress: AtomicBool,
     /// Optional cross-restart persistence (opt-in).
     token_store: Option<Arc<dyn TokenStore>>,
     /// The persisted-identity key; `Some` iff `token_store` is set.
@@ -479,10 +544,11 @@ impl OidcDeviceAuth {
     /// [`InteractionRequired`](crate::oidc::OidcErrorKind::InteractionRequired);
     /// call [`sign_in`](Self::sign_in) explicitly on a suitable UI thread.
     ///
-    /// If another acquisition is already in progress and no valid cached token
-    /// is available, this returns `InteractionRequired` immediately rather than
-    /// waiting behind a potentially long-running interactive sign-in. This makes
-    /// it safe to use as a synchronous or background transport token provider.
+    /// If another silent refresh is already in progress, this waits for it for a
+    /// bounded period so concurrent transports share its result. It still returns
+    /// `InteractionRequired` immediately behind an interactive sign-in rather
+    /// than waiting on a human. This makes it safe to use as a synchronous or
+    /// background transport token provider.
     pub fn token(&self) -> Result<String> {
         // HTTP providers call this once per flush. On the overwhelmingly common
         // cache hit, clone only the credential being returned rather than every
@@ -532,7 +598,12 @@ impl OidcDeviceAuth {
     pub fn try_clear(&self) -> Result<()> {
         let _acq = self.lock_acquire();
         *self.lock_tokens() = None;
-        self.lock_store_state().set_last_persisted_refresh(None);
+        {
+            let mut state = self.lock_store_state();
+            state.set_last_persisted_refresh(None);
+            state.reset_store_load_backoff();
+            state.reset_refresh_backoff();
+        }
         let mut clear_error = None;
         if let (Some(store), Some(key)) = (self.token_store.as_ref(), self.store_key.as_ref()) {
             // Delete under the per-identity lock so it serialises against a peer's
@@ -618,6 +689,40 @@ impl OidcDeviceAuth {
         self.acquire.lock().unwrap_or_else(|e| e.into_inner())
     }
 
+    /// Wait briefly behind a peer's cache/store/refresh work, but never behind
+    /// the interactive device flow. The short polling slice observes the marker
+    /// without requiring the interactive thread to release the acquisition lock.
+    fn acquire_for_token(&self) -> Result<std::sync::MutexGuard<'_, ()>> {
+        match self.acquire.try_lock() {
+            Ok(guard) => return Ok(guard),
+            Err(TryLockError::Poisoned(error)) => return Ok(error.into_inner()),
+            Err(TryLockError::WouldBlock) => {}
+        }
+
+        let deadline = Instant::now() + self.acquire_wait_timeout;
+        loop {
+            if self.interactive_in_progress.load(AtomicOrdering::Acquire) {
+                return Err(OidcError::interaction_required(
+                    "An interactive OIDC sign-in is in progress on another thread; no token \
+                     is available without blocking. Retry once it completes.",
+                ));
+            }
+            let now = Instant::now();
+            if now >= deadline {
+                return Err(OidcError::network(
+                    "An OIDC token refresh is already in progress on another thread and no \
+                     token became available in time. Retry shortly.",
+                ));
+            }
+            std::thread::sleep(ACQUIRE_WAIT_POLL_SLICE.min(deadline - now));
+            match self.acquire.try_lock() {
+                Ok(guard) => return Ok(guard),
+                Err(TryLockError::Poisoned(error)) => return Ok(error.into_inner()),
+                Err(TryLockError::WouldBlock) => {}
+            }
+        }
+    }
+
     fn lock_tokens(&self) -> std::sync::MutexGuard<'_, Option<TokenSet>> {
         self.tokens.lock().unwrap_or_else(|e| e.into_inner())
     }
@@ -655,28 +760,25 @@ impl OidcDeviceAuth {
     }
 
     fn obtain_tokens(&self, allow_interaction: bool) -> Result<TokenSet> {
-        // Fast path: a valid cached token never blocks behind another sign-in.
-        if let Some(tokens) = self.cached_if_valid() {
+        // token() keeps the cache-hit path lock-free. sign_in() is an explicit
+        // lifecycle operation and mirrors Java by taking the acquisition lock,
+        // where it also clears retry throttles before doing any network work.
+        if !allow_interaction && let Some(tokens) = self.cached_if_valid() {
             return Ok(tokens);
         }
         // Slow path: serialize acquisition so concurrent callers don't overlap
-        // refreshes or double-prompt. A transport-facing token lookup must not
-        // queue behind an explicit device flow, whose lifetime can be 30 minutes.
+        // refreshes or double-prompt. A transport-facing token lookup waits for a
+        // bounded period behind a silent refresh, but never behind a device flow.
         let _acq = if allow_interaction {
             self.lock_acquire()
         } else {
-            match self.acquire.try_lock() {
-                Ok(guard) => guard,
-                Err(TryLockError::Poisoned(error)) => error.into_inner(),
-                Err(TryLockError::WouldBlock) => {
-                    return Err(OidcError::interaction_required(
-                        "No usable OIDC token is currently available and another token \
-                         acquisition is already in progress. Retry after it finishes or call \
-                         sign_in() explicitly before starting the transport.",
-                    ));
-                }
-            }
+            self.acquire_for_token()?
         };
+        if allow_interaction {
+            let mut state = self.lock_store_state();
+            state.reset_store_load_backoff();
+            state.reset_refresh_backoff();
+        }
         // Seed the cache from the persisted store once, so a restart resumes from
         // a saved refresh token instead of re-prompting (a no-op without a store).
         let load_result = self.maybe_load_from_store();
@@ -701,8 +803,15 @@ impl OidcDeviceAuth {
         if let Some(tokens) = &existing
             && tokens.refresh_token.is_some()
         {
+            if !allow_interaction && self.lock_store_state().refresh_backed_off(Instant::now()) {
+                return Err(OidcError::network(
+                    "Silent OIDC token refresh is temporarily backed off after a recent \
+                     failure. Retry shortly or call sign_in() to retry explicitly.",
+                ));
+            }
             match self.try_refresh_coordinated(tokens) {
                 Ok(refreshed) if self.has_required_token(&refreshed) => {
+                    self.lock_store_state().reset_refresh_backoff();
                     *self.lock_tokens() = Some(refreshed.clone());
                     return Ok(refreshed);
                 }
@@ -715,6 +824,7 @@ impl OidcDeviceAuth {
                 // (stored or in-memory) may already have discarded an ambiguously
                 // consumed parent, leaving the next call to re-prompt.
                 Err(e) if e.kind() == crate::oidc::error::OidcErrorKind::Network => {
+                    self.lock_store_state().refresh_failed_at = Some(Instant::now());
                     return Err(e);
                 }
                 // Refresh token rejected (expired/revoked): fall through.
@@ -733,7 +843,14 @@ impl OidcDeviceAuth {
                  explicitly before starting the transport.",
             ));
         }
-        let fresh = self.run_device_flow()?;
+        self.interactive_in_progress
+            .store(true, AtomicOrdering::Release);
+        let fresh_result = {
+            let _interactive = InteractiveGuard(&self.interactive_in_progress);
+            self.run_device_flow()
+        };
+        let fresh = fresh_result?;
+        self.lock_store_state().reset_refresh_backoff();
         *self.lock_tokens() = Some(fresh.clone());
         // Persist the fresh sign-in (a new refresh token) for the next restart.
         self.persist_fresh(&fresh);
@@ -760,8 +877,18 @@ impl OidcDeviceAuth {
         let (Some(store), Some(key)) = (self.token_store.as_ref(), self.store_key.as_ref()) else {
             return Ok(());
         };
-        if self.lock_store_state().load_attempted {
-            return Ok(());
+        let now = Instant::now();
+        {
+            let state = self.lock_store_state();
+            if state.load_attempted {
+                return Ok(());
+            }
+            if state.store_load_backed_off(now) {
+                return Err(OidcError::network(
+                    "Loading the OIDC token store is temporarily backed off after repeated \
+                     failures. Retry shortly or call sign_in() to retry explicitly.",
+                ));
+            }
         }
 
         let mut loaded = None;
@@ -778,7 +905,10 @@ impl OidcDeviceAuth {
                 if let Err(e) = lock_result {
                     warn_persistence("lock", &*e);
                 }
-                self.lock_store_state().load_attempted = true;
+                let mut state = self.lock_store_state();
+                state.load_attempted = true;
+                state.reset_store_load_backoff();
+                drop(state);
                 self.adopt(persisted);
                 Ok(())
             }
@@ -786,6 +916,7 @@ impl OidcDeviceAuth {
                 // A genuine I/O error (EMFILE, an NFS / permission blip), lock
                 // failure, or acquire timeout is transient: leave
                 // `load_attempted` unset so the next call retries.
+                self.lock_store_state().record_store_load_failure(now);
                 let message = match lock_result {
                     Err(e) => {
                         warn_persistence("load", &*e);
