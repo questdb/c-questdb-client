@@ -52,6 +52,10 @@ steps:
   - ${{ if parameters.pipNumpy }}:
     - bash: |
         set -eux
+        # Refresh the lists here too, not just in the apt step above: this
+        # step must keep working if a job ever combines pipNumpy with
+        # isAptInstallEnabled false, where no other update has run.
+        sudo apt-get update
         sudo apt-get install -y --no-install-recommends python3-pip
         python3 -m pip install --break-system-packages --upgrade 'numpy>=2'
         python3 -c 'import numpy; print("numpy", numpy.__version__)'
