@@ -518,6 +518,88 @@ fn preexisting_loose_permissions_directory_is_retightened() {
     );
 }
 
+#[cfg(unix)]
+#[test]
+fn group_writable_directory_discards_planted_java_entry_before_load() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = TempDir::new().unwrap();
+    let store = FileTokenStore::at(dir.path());
+    let key = test_key();
+    let planted = store.serialize(&key, &test_token());
+    std::fs::write(store.token_file(&key), &*planted).unwrap();
+    std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o777)).unwrap();
+
+    assert!(store.load(&key).unwrap().is_none());
+    assert!(!store.token_file(&key).exists());
+    assert!(!store.untrusted_sentinel().exists());
+    let mode = std::fs::metadata(dir.path()).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode, 0o700);
+}
+
+#[cfg(unix)]
+#[test]
+fn untrusted_recovery_skips_cross_language_lock_capture() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = TempDir::new().unwrap();
+    let store = FileTokenStore::at(dir.path());
+    let key = test_key();
+    let capture = dir
+        .path()
+        .join(format!("{}.lock.java-capture.tmp", key.hash()));
+    let write_temp = dir.path().join(format!("{}.java-write.tmp", key.hash()));
+    std::fs::write(&capture, b"java-owner-stamp").unwrap();
+    std::fs::write(&write_temp, b"planted credential").unwrap();
+    std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o777)).unwrap();
+
+    assert!(store.load(&key).unwrap().is_none());
+    assert!(
+        capture.exists(),
+        "recovery deleted an in-flight lock capture"
+    );
+    assert!(!write_temp.exists(), "recovery retained a token write temp");
+}
+
+#[test]
+fn stale_java_directory_lock_is_reclaimed() {
+    let dir = TempDir::new().unwrap();
+    let store = FileTokenStore::at(dir.path());
+    let lock = store.directory_lock_file();
+    create_lock_file(&lock, "1725048000000 java-uuid").unwrap();
+    let file = OpenOptions::new().write(true).open(&lock).unwrap();
+    file.set_modified(SystemTime::now() - DIRECTORY_LOCK_STALE - Duration::from_secs(1))
+        .unwrap();
+    drop(file);
+
+    assert!(store.load(&test_key()).unwrap().is_none());
+    assert!(
+        !lock.exists(),
+        "abandoned Java .store.lock was not reclaimed"
+    );
+}
+
+#[test]
+fn fresh_java_directory_lock_is_required() {
+    let dir = TempDir::new().unwrap();
+    let store =
+        FileTokenStore::at(dir.path()).with_lock_timings(Duration::ZERO, DEFAULT_LOCK_STALE);
+    let key = test_key();
+    let lock = store.directory_lock_file();
+    create_lock_file(&lock, "1725048000000 java-uuid").unwrap();
+
+    let error = store.save(&key, &test_token()).unwrap_err();
+    assert_eq!(
+        error
+            .downcast_ref::<std::io::Error>()
+            .map(std::io::Error::kind),
+        Some(std::io::ErrorKind::WouldBlock)
+    );
+    assert!(!store.token_file(&key).exists());
+    assert!(
+        lock.exists(),
+        "required-lock failure removed the Java peer lock"
+    );
+}
+
 #[test]
 fn creates_missing_parent_chain() {
     // The parent chain is created recursively and the leaf non-recursively; a
@@ -543,7 +625,8 @@ fn with_lock_timings_clamps_acquire_budget() {
 fn release_lock_removes_our_own_lock() {
     let dir = TempDir::new().unwrap();
     let lock = dir.path().join("y.lock");
-    let ours = create_lock_file(&lock).unwrap();
+    let ours = holder_bytes().unwrap();
+    create_lock_file(&lock, &ours).unwrap();
     release_lock(&lock, &ours);
     assert!(!lock.exists(), "release must remove a lock we still own");
 }
@@ -556,9 +639,10 @@ fn release_lock_leaves_a_successor_lock() {
     // path alone would break mutual exclusion.
     let dir = TempDir::new().unwrap();
     let lock = dir.path().join("z.lock");
-    let ours = create_lock_file(&lock).unwrap();
+    let ours = holder_bytes().unwrap();
+    create_lock_file(&lock, &ours).unwrap();
     std::fs::remove_file(&lock).unwrap(); // steal: our inode is now orphaned
-    let _peer = create_lock_file(&lock).unwrap(); // peer's fresh inode at the path
+    create_lock_file(&lock, "java-peer-stamp").unwrap();
     release_lock(&lock, &ours);
     assert!(
         lock.exists(),
@@ -656,13 +740,13 @@ fn save_reuses_a_lock_already_held_by_the_current_action() {
 }
 
 #[test]
-fn standalone_save_never_bypasses_a_peer_lock() {
+fn standalone_save_uses_atomic_layer_without_identity_lock() {
     let dir = TempDir::new().unwrap();
     let store =
         FileTokenStore::at(dir.path()).with_lock_timings(Duration::ZERO, DEFAULT_LOCK_STALE);
     let key = test_key();
     let lock = store.lock_file(&key);
-    let _peer = create_lock_file(&lock).unwrap();
+    create_lock_file(&lock, "java-peer-stamp").unwrap();
     let stale = temp_path(dir.path(), &key.hash());
     std::fs::write(&stale, b"stale refresh credential").unwrap();
     let file = OpenOptions::new().write(true).open(&stale).unwrap();
@@ -670,16 +754,13 @@ fn standalone_save_never_bypasses_a_peer_lock() {
         .unwrap();
     drop(file);
 
-    let error = store.save(&key, &test_token()).unwrap_err();
+    store.save(&key, &test_token()).unwrap();
 
-    assert_eq!(
-        error
-            .downcast_ref::<std::io::Error>()
-            .map(std::io::Error::kind),
-        Some(std::io::ErrorKind::WouldBlock)
+    assert!(store.token_file(&key).exists());
+    assert!(
+        !stale.exists(),
+        "directory-locked save did not sweep stale temp"
     );
-    assert!(!store.token_file(&key).exists());
-    assert!(stale.exists(), "save swept a temp without owning the lock");
     assert!(lock.exists(), "save removed the peer's live lock");
 }
 
@@ -735,34 +816,32 @@ fn in_lock_serialises_concurrent_holders() {
 }
 
 #[test]
-fn in_lock_never_runs_action_after_acquire_timeout() {
+fn in_lock_degrades_to_atomic_layer_after_acquire_timeout() {
     let dir = TempDir::new().unwrap();
     let key = test_key();
     let store =
         FileTokenStore::at(dir.path()).with_lock_timings(Duration::ZERO, Duration::from_secs(600));
     let lock = store.lock_file(&key);
-    let _peer = create_lock_file(&lock).unwrap();
+    create_lock_file(&lock, "java-peer-stamp").unwrap();
 
     let ran = Arc::new(AtomicBool::new(false));
     let r = Arc::clone(&ran);
-    let err = store
+    store
         .in_lock(&key, &mut || {
             r.store(true, Ordering::SeqCst);
             Ok(())
         })
-        .unwrap_err();
+        .unwrap();
 
-    assert!(!ran.load(Ordering::SeqCst), "action ran without the lock");
-    assert_eq!(
-        err.downcast_ref::<std::io::Error>()
-            .map(std::io::Error::kind),
-        Some(std::io::ErrorKind::WouldBlock)
+    assert!(
+        ran.load(Ordering::SeqCst),
+        "action did not use Layer 1 fallback"
     );
     assert!(lock.exists(), "contender removed the peer's live lock");
 }
 
 #[test]
-fn stale_lock_is_reported_but_never_stolen() {
+fn stale_java_identity_lock_is_reclaimed() {
     let dir = TempDir::new().unwrap();
     let key = test_key();
     let store =
@@ -777,22 +856,15 @@ fn stale_lock_is_reported_but_never_stolen() {
 
     let ran = Arc::new(AtomicBool::new(false));
     let r = Arc::clone(&ran);
-    let err = store
+    store
         .in_lock(&key, &mut || {
             r.store(true, Ordering::SeqCst);
             Ok(())
         })
-        .unwrap_err();
+        .unwrap();
 
-    assert!(!ran.load(Ordering::SeqCst), "action ran without the lock");
-    assert!(
-        err.to_string().contains("appears stale"),
-        "unexpected error: {err}"
-    );
-    assert!(
-        lock.exists(),
-        "automatic stale recovery removed an unowned lock"
-    );
+    assert!(ran.load(Ordering::SeqCst));
+    assert!(!lock.exists(), "abandoned Java lock was not reclaimed");
 }
 
 #[test]
