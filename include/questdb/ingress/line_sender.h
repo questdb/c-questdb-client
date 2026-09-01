@@ -129,14 +129,14 @@ typedef enum line_sender_error_code
     /** QWP/WebSocket server rejection or terminal protocol violation. */
     line_sender_error_server_rejection = 14,
 
-    /** Arrow column whose kind cannot be persisted (e.g.
-     *  `FixedSizeBinary(16)` without `arrow.uuid` extension metadata;
-     *  `ARRAY(LONG, N-D)` is egress-only; nested-list leaf must be
-     *  `Float64`). `arrow` feature only. */
+    /** An Arrow column cannot be written to QuestDB because its type is not
+     *  supported for ingestion.
+     *  `arrow` feature only. */
     line_sender_error_arrow_unsupported_column_kind = 15,
 
-    /** RecordBatch failed client-side structural validation
-     *  (column count, name encoding, C Data Interface contract).
+    /** Arrow data is invalid or conflicts with its metadata or overrides. For
+     *  example, a UUID claim requires 16-byte values and a LONG256 claim
+     *  requires 32-byte values.
      *  `arrow` feature only. */
     line_sender_error_arrow_ingest = 16,
 
@@ -1119,6 +1119,8 @@ bool line_sender_buffer_column_dec128(
  * Record a UUID column value. QWP-only.
  *
  * The wire encoding writes `lo` (8 bytes LE) followed by `hi` (8 bytes LE).
+ * For canonical RFC-4122 bytes, use `qwp_chunk_column_uuid` instead of
+ * splitting the bytes into `lo` and `hi`.
  */
 QUESTDB_CLIENT_API
 bool line_sender_buffer_column_uuid(
@@ -1148,10 +1150,6 @@ bool line_sender_buffer_column_long256(
  *   `addr = ((uint32_t)a << 24) | (b << 16) | (c << 8) | d`
  * The encoder writes `addr.to_le_bytes()` so the wire bytes appear as
  * `[d, c, b, a]`.
- *
- * IPv4 (`0x18`) is part of the QWP v1 spec. Server-side ingest does not
- * currently implement this wire type; batches using it will be rejected
- * with a descriptive error. This may change in future server releases.
  */
 QUESTDB_CLIENT_API
 bool line_sender_buffer_column_ipv4(
@@ -1182,10 +1180,6 @@ bool line_sender_buffer_column_char(
 
 /**
  * Record a BINARY column value (opaque byte sequence). QWP-only.
- *
- * BINARY (`0x17`) is part of the QWP v1 spec. Server-side ingest does not
- * currently implement this wire type; batches using it will be rejected
- * with a descriptive error. This may change in future server releases.
  */
 QUESTDB_CLIENT_API
 bool line_sender_buffer_column_binary(

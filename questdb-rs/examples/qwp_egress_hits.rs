@@ -277,7 +277,7 @@ fn touch_column(col: &ColumnView<'_>, n: usize) -> u64 {
             for r in 0..n {
                 if !c.is_null(r) {
                     let b = c.value(r);
-                    acc ^= u64::from_le_bytes(b[..8].try_into().unwrap());
+                    acc ^= u64::from_be_bytes(b[..8].try_into().unwrap());
                 }
             }
         }

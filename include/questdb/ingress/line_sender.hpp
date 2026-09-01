@@ -832,6 +832,8 @@ public:
 
     /**
      * Record a UUID column value. QWP-only.
+     * For canonical RFC-4122 bytes, use `column_chunk::column_uuid` instead of
+     * splitting the bytes into `lo` and `hi`.
      */
     line_sender_buffer& column_uuid(
         column_name_view name, uint64_t lo, uint64_t hi)
@@ -861,10 +863,6 @@ public:
      * Record an IPv4 column value. QWP-only.
      *
      * `value` is the address packed as a u32 with octet 0 in the high byte.
-     *
-     * IPv4 (`0x18`) is part of the QWP v1 spec. Server-side ingest does not
-     * currently implement this wire type; batches using it will be rejected
-     * with a descriptive error. This may change in future server releases.
      */
     line_sender_buffer& column_ipv4(column_name_view name, uint32_t value)
     {
@@ -898,11 +896,6 @@ public:
 
     /**
      * Record a BINARY column value. QWP-only.
-     *
-     * BINARY (`0x17`) is part of the QWP v1 spec. Server-side ingest does
-     * not currently implement this wire type; batches using it will be
-     * rejected with a descriptive error. This may change in future server
-     * releases.
      */
     line_sender_buffer& column_binary(
         column_name_view name, const uint8_t* data, size_t data_len)

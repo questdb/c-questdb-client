@@ -33,6 +33,7 @@
 
 #include <questdb/egress/qwp_reader.hpp>
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cstring>
@@ -256,8 +257,10 @@ TEST_CASE("mock: column getter — varchar")
     CHECK(*v1 == "hello");
 }
 
-TEST_CASE("mock: column getter — uuid (16 raw bytes, big-endian on wire)")
+TEST_CASE("mock: column getter — uuid (wire lo/hi LE → canonical RFC-4122)")
 {
+    // Wire carries (lo LE, hi LE); the client reverses each 16-byte row,
+    // so get_uuid returns canonical big-endian bytes.
     std::vector<uint8_t> uuid_bytes(16);
     for (int i = 0; i < 16; ++i)
         uuid_bytes[i] = uint8_t(0xA0 + i);
@@ -280,7 +283,7 @@ TEST_CASE("mock: column getter — uuid (16 raw bytes, big-endian on wire)")
     auto u = batch.column(0).get_uuid(0);
     REQUIRE(u.has_value());
     for (int i = 0; i < 16; ++i)
-        CHECK((*u)[i] == uint8_t(0xA0 + i));
+        CHECK((*u)[i] == uint8_t(0xAF - i));
 }
 
 TEST_CASE("mock: column getter — decimal64 with non-zero scale")
@@ -3367,9 +3370,14 @@ TEST_CASE("mock: every supported bind variant marshals through the FFI ABI")
     // 10. date_millis
     put({kDate, 0x00});
     put_u64_le(0x3300AABBCCDDEEFFULL);
-    // 11. uuid (16 raw bytes, verbatim)
+    // 11. uuid — bound as canonical RFC-4122 big-endian; the client
+    // reverses to QWP wire order (lo LE, hi LE), the full 16-byte flip.
     put({kUuidKind, 0x00});
-    put_bytes(kUuid.data(), kUuid.size());
+    {
+        std::array<uint8_t, 16> uuid_wire = kUuid;
+        std::reverse(uuid_wire.begin(), uuid_wire.end());
+        put_bytes(uuid_wire.data(), uuid_wire.size());
+    }
     // 12. long256 (32 raw bytes, verbatim)
     put({kLong256Kind, 0x00});
     put_bytes(kLong256.data(), kLong256.size());

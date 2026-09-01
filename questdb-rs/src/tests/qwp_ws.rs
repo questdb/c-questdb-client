@@ -120,6 +120,20 @@ pub(crate) fn read_request_until_blank<R: Read>(stream: &mut R) -> std::io::Resu
     Ok(buf)
 }
 
+/// True for the errors a read or write hits when the client has closed its end
+/// of the connection. Tests drop their sender while the mock server is still
+/// running, so this is a normal thing for a mock to see. Which of these kinds
+/// comes back depends on the platform and on the timing.
+fn client_went_away(err: &std::io::Error) -> bool {
+    matches!(
+        err.kind(),
+        std::io::ErrorKind::UnexpectedEof
+            | std::io::ErrorKind::ConnectionReset
+            | std::io::ErrorKind::ConnectionAborted
+            | std::io::ErrorKind::BrokenPipe
+    )
+}
+
 pub(crate) fn parse_header(req: &str, name: &str) -> Option<String> {
     for line in req.split("\r\n").skip(1) {
         if let Some((k, v)) = line.split_once(':')
@@ -406,7 +420,34 @@ fn upgrade_mock_stream_with_durable_ack(
     stream: &mut TcpStream,
     durable_ack_enabled: bool,
 ) -> Vec<String> {
-    let req_bytes = read_request_until_blank(stream).unwrap();
+    try_upgrade_mock_stream_with_durable_ack(stream, durable_ack_enabled)
+        .unwrap()
+        .expect("client closed before sending the WS upgrade request")
+}
+
+/// Same as [`upgrade_mock_stream`], but returns `None` if the client closed the
+/// connection before it finished sending the request. A client that keeps
+/// reconnecting can open a connection and then walk away from it without
+/// sending anything, and a mock server that is still accepting will pick that
+/// one up. Dropping the sender at the end of a test is the usual cause.
+///
+/// A request that does arrive in full, but without a `Sec-WebSocket-Key`
+/// header, still panics: that means the client is broken.
+fn try_upgrade_mock_stream(stream: &mut TcpStream) -> std::io::Result<Option<Vec<String>>> {
+    try_upgrade_mock_stream_with_durable_ack(stream, false)
+}
+
+fn try_upgrade_mock_stream_with_durable_ack(
+    stream: &mut TcpStream,
+    durable_ack_enabled: bool,
+) -> std::io::Result<Option<Vec<String>>> {
+    let req_bytes = read_request_until_blank(stream)?;
+    // The read above stops at the blank line that ends the request, or at the
+    // end of the input if the client closed first. So the blank line is what
+    // tells a complete request from one that was cut short.
+    if !req_bytes.windows(4).any(|w| w == b"\r\n\r\n") {
+        return Ok(None);
+    }
     let req = String::from_utf8_lossy(&req_bytes).to_string();
     let request_lines: Vec<String> = req
         .split("\r\n")
@@ -429,8 +470,8 @@ fn upgrade_mock_stream_with_durable_ack(
          {durable_ack_header}\
          \r\n"
     );
-    stream.write_all(response.as_bytes()).unwrap();
-    request_lines
+    stream.write_all(response.as_bytes())?;
+    Ok(Some(request_lines))
 }
 
 fn upgrade_mock_stream_with_version(stream: &mut TcpStream, version: u8) -> Vec<String> {
@@ -490,9 +531,9 @@ pub(crate) fn sha1(input: &[u8]) -> [u8; 20] {
     }
     p.extend_from_slice(&bit_len.to_be_bytes());
     let mut w = [0u32; 80];
-    for chunk in p.chunks_exact(64) {
-        for (i, word) in chunk.chunks_exact(4).enumerate() {
-            w[i] = u32::from_be_bytes([word[0], word[1], word[2], word[3]]);
+    for chunk in p.as_chunks::<64>().0 {
+        for (i, word) in chunk.as_chunks::<4>().0.iter().enumerate() {
+            w[i] = u32::from_be_bytes(*word);
         }
         for i in 16..80 {
             w[i] = (w[i - 3] ^ w[i - 8] ^ w[i - 14] ^ w[i - 16]).rotate_left(1);
@@ -737,7 +778,19 @@ fn spawn_recycling_server(
                     stream
                         .set_write_timeout(Some(Duration::from_secs(5)))
                         .unwrap();
-                    upgrade_mock_stream(&mut stream);
+                    match try_upgrade_mock_stream(&mut stream) {
+                        Ok(Some(_)) => {}
+                        // This server is still accepting connections while the
+                        // test drops the sender, so now and then it picks up a
+                        // connection the client opened and then walked away
+                        // from. Skip it, the same way the frame read below
+                        // ignores a client that has gone. If the client could
+                        // never complete a handshake, the test still fails:
+                        // it checks how many connections got past this point.
+                        Ok(None) => continue,
+                        Err(err) if client_went_away(&err) => continue,
+                        Err(err) => panic!("recycling server failed the upgrade: {err}"),
+                    }
                     match read_frame(&mut stream) {
                         Ok((_fin, 0x2, _payload)) => {
                             connections += 1;
@@ -767,14 +820,7 @@ fn spawn_recycling_server(
                             shared_count.store(connections, Ordering::Release);
                         }
                         Ok((_fin, _opcode, _payload)) => {}
-                        Err(err)
-                            if matches!(
-                                err.kind(),
-                                std::io::ErrorKind::UnexpectedEof
-                                    | std::io::ErrorKind::ConnectionReset
-                                    | std::io::ErrorKind::ConnectionAborted
-                                    | std::io::ErrorKind::BrokenPipe
-                            ) => {}
+                        Err(err) if client_went_away(&err) => {}
                         Err(err) => panic!("recycling server failed to read frame: {err}"),
                     }
                 }
@@ -5369,6 +5415,57 @@ fn qwp_ws_non_orderly_close_recycles_are_paced() {
         (2..=8).contains(&connections),
         "expected paced close recycles to make a small number of connections, got {connections}"
     );
+}
+
+/// Runs one upgrade against a client that sends whatever `write_request`
+/// writes, then closes the connection. Returns what the mock server made of it.
+fn upgrade_against_abandoned_client<F>(write_request: F) -> Option<Vec<String>>
+where
+    F: FnOnce(&mut TcpStream) + Send + 'static,
+{
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let client = thread::spawn(move || {
+        let mut stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        write_request(&mut stream);
+    });
+    let (mut stream, _) = listener.accept().unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    let outcome = try_upgrade_mock_stream(&mut stream).unwrap();
+    client.join().unwrap();
+    outcome
+}
+
+#[test]
+fn upgrade_reports_a_client_that_leaves_before_finishing_its_request() {
+    // A client that opens a connection and goes away without sending a
+    // request. The mock server has to report that back to its accept loop
+    // instead of panicking over the missing handshake.
+    assert!(upgrade_against_abandoned_client(|_stream| {}).is_none());
+    assert!(
+        upgrade_against_abandoned_client(|stream| {
+            stream
+                .write_all(b"GET / HTTP/1.1\r\nHost: 127.0.0.1\r\n")
+                .unwrap();
+        })
+        .is_none(),
+        "a request that stops before the blank line is unfinished too"
+    );
+}
+
+#[test]
+#[should_panic(expected = "missing Sec-WebSocket-Key")]
+fn upgrade_still_rejects_a_finished_request_without_the_ws_key() {
+    // Only a client that left in the middle of its request gets a pass. A
+    // request that arrives in full but has no key means the client is broken,
+    // so the mock server still panics.
+    upgrade_against_abandoned_client(|stream| {
+        stream
+            .write_all(b"GET / HTTP/1.1\r\nHost: 127.0.0.1\r\nUpgrade: websocket\r\n\r\n")
+            .unwrap();
+    });
 }
 
 fn assert_server_protocol_violation<F>(write_bad_response: F, expected_message: &'static str)

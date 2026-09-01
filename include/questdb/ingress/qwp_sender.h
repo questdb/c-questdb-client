@@ -589,7 +589,10 @@ bool qwp_chunk_column_bool(
 
 /**
  * `UUID` column. `data` points to `row_count * 16` bytes; each 16-byte
- * group is one UUID (bytes 0..8 lo half LE, 8..16 hi half LE).
+ * group is one UUID in canonical RFC-4122 big-endian order. The client
+ * byte-swaps to QWP wire order internally.
+ * `line_sender_buffer_column_uuid(lo, hi)` instead takes QWP wire-order
+ * integer halves.
  */
 QUESTDB_CLIENT_API
 bool qwp_chunk_column_uuid(
@@ -923,9 +926,18 @@ bool qwp_chunk_symbol_i32(
  *    the first column to append sets the count; subsequent appends
  *    must agree.
  *
+ * `FixedSizeBinary` mapping: UUID and LONG256 require an explicit
+ * claim — `FixedSizeBinary(16)` with the `arrow.uuid` extension or
+ * `questdb.column_type=uuid` metadata lands as UUID (bytes are
+ * canonical RFC-4122 big-endian, byte-swapped to wire order);
+ * `FixedSizeBinary(32)` with `questdb.column_type=long256` lands as
+ * LONG256 (LE limbs, verbatim). Any other `FixedSizeBinary` width or
+ * an unlabeled column is opaque bytes and lands as BINARY, verbatim.
+ * A claim on the wrong width is an error.
+ *
  * Type rejections (any Arrow type with no QuestDB mapping — `Null`,
- * `Struct`, `Map`, `RunEndEncoded`, `Interval(*)`, `FixedSizeBinary`
- * outside UUID/LONG256, non-Float64 `List` leaves) return
+ * `Struct`, `Map`, `RunEndEncoded`, `Interval(*)`, non-Float64 `List`
+ * leaves) return
  * `line_sender_error_arrow_unsupported_column_kind`. Structural
  * failures (validity-count mismatch, ms→µs overflow, decimal scale
  * out of range, etc.) return `line_sender_error_arrow_ingest`.
@@ -1142,7 +1154,9 @@ bool qwp_chunk_append_arrow_column(
  *     datetime64[us] → TIMESTAMP
  *     datetime64[ns] → TIMESTAMP_NANOS
  *     timedelta64[s/ms/us/ns] → LONG
- *     S16          → UUID            (16 bytes per row)
+ *     S16          → UUID            (16 bytes per row, canonical
+ *                                     RFC-4122 big-endian; the client
+ *                                     byte-swaps to wire order)
  *     S32          → LONG256         (32 bytes per row)
  *     u32_ipv4     → IPV4
  *     u16_char     → CHAR
@@ -1212,7 +1226,7 @@ typedef enum qwp_numpy_dtype
     qwp_numpy_timedelta64_ns = 19,
 
     /* Fixed-size bytes */
-    qwp_numpy_s16 = 20, /* 16B/row → UUID */
+    qwp_numpy_s16 = 20, /* 16B/row → UUID (canonical RFC-4122 BE) */
     qwp_numpy_s32 = 21, /* 32B/row → LONG256 */
 
     /* Decimals (read decimal_scale from qwp_numpy_extras) */
@@ -1593,14 +1607,34 @@ typedef enum qwp_arrow_override_kind
     /** Force the column NOT to be SYMBOL: a Dictionary column is decoded
      *  to VARCHAR on emit; a no-op on plain Utf8 (already VARCHAR). */
     qwp_arrow_override_not_symbol = 4,
+    /** Treat a `FixedSizeBinary(16)` or `Binary`/`LargeBinary`/`BinaryView`
+     *  column as `UUID`. Bytes are canonical RFC-4122 big-endian; the
+     *  client byte-swaps to QWP wire order internally. On the
+     *  variable-length binary types every non-null value must be exactly
+     *  16 bytes or the flush fails with
+     *  `line_sender_error_arrow_ingest`. Use when the schema carries no
+     *  `arrow.uuid` extension or `questdb.column_type=uuid` metadata, or
+     *  to replace an out-of-date hint. The override wins over any field
+     *  metadata on this column. */
+    qwp_arrow_override_uuid = 5,
+    /** Treat a `FixedSizeBinary(32)` or `Binary`/`LargeBinary`/`BinaryView`
+     *  column as `LONG256`. Bytes are little-endian limbs, low limb
+     *  first, verbatim. On the variable-length binary types every
+     *  non-null value must be exactly 32 bytes or the flush fails with
+     *  `line_sender_error_arrow_ingest`. Use when the schema carries no
+     *  `questdb.column_type=long256` metadata, or to replace an
+     *  out-of-date hint. The override wins over any field metadata on
+     *  this column. */
+    qwp_arrow_override_long256 = 6,
 } qwp_arrow_override_kind;
 
 /**
  * Per-column wire-type hint passed to
  * `qwp_sender_flush_arrow_batch_at_now` (and `_at_column`) to
- * steer encoding without having to attach
- * `questdb.*` Field metadata to the Arrow schema. Caller owns `column`;
- * the bytes are borrowed for the duration of the call.
+ * choose the wire type without having to attach `questdb.*` Field
+ * metadata to the Arrow schema. An override wins for its column: Field
+ * metadata that is valid but says something different is ignored. Caller
+ * owns `column`; the bytes are borrowed for the duration of the call.
  *
  * `arg` carries the geohash precision (1..=60) when `kind ==
  * qwp_arrow_override_geohash`, and is ignored for every other

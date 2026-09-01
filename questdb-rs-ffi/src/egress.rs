@@ -2253,10 +2253,11 @@ pub unsafe extern "C" fn qwp_reader_query_bind_binary(
     }
 }
 
-/// Bind a 16-byte UUID value (raw bytes). `value` MUST be non-NULL and
-/// point to at least 16 readable bytes; passing a smaller buffer is a
-/// buffer over-read (undefined behaviour) — exactly 16 bytes are read
-/// unconditionally. A NULL `value` stashes a deferred `InvalidBind`
+/// Bind a 16-byte UUID value in canonical RFC-4122 big-endian order
+/// (the client byte-swaps to QWP wire order internally). `value` MUST be
+/// non-NULL and point to at least 16 readable bytes; passing a smaller
+/// buffer is a buffer over-read (undefined behaviour) — exactly 16 bytes
+/// are read unconditionally. A NULL `value` stashes a deferred `InvalidBind`
 /// error on the query that surfaces from `_query_execute`. Use
 /// `qwp_reader_query_bind_null` with `qwp_reader_column_kind_uuid` to
 /// bind SQL NULL.

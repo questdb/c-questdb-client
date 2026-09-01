@@ -2518,6 +2518,34 @@ class TestQwpWsFuzz(QwpWsTestSupport, unittest.TestCase):
         conf = f'ws::addr={QDB_FIXTURE.host}:{QDB_FIXTURE.http_server_port};'
         return qwp_egress_reader.query_table_sorted(conf, table_name)
 
+    def test_uuid_with_zero_low_half_is_not_null(self):
+        table_name = 'qwp_uuid_sentinel_' + uuid.uuid4().hex[:8]
+        self._created_tables.append(table_name)
+        sender_id = 'uuid-sentinel-' + uuid.uuid4().hex[:8]
+
+        with tempfile.TemporaryDirectory(prefix='qwp-ws-uuid-sentinel-') as sf_dir:
+            sender = self._connect_sender(self._sender_conf(
+                sender_id,
+                sf_dir,
+                close_flush_timeout_millis=30000))
+            try:
+                (sender
+                 .table(table_name)
+                 .column_uuid('id', 0, -(1 << 63))
+                 .at_micros(self.BASE_TIMESTAMP_US))
+                sender.flush()
+                sender.close_drain()
+            finally:
+                sender.close(False)
+
+        self._wait_for_row_count(table_name, 1)
+        columns, rows = self._query_table_sorted(table_name)
+        uuid_col = next(i for i, col in enumerate(columns) if col['name'] == 'id')
+        self.assertIsNotNone(rows[0][uuid_col])
+        self.assertEqual(
+            rows[0][uuid_col],
+            '80000000-0000-0000-0000-000000000000')
+
     def _wait_for_row_count(self, table_name: str, expected: int):
         deadline = time.monotonic() + self.DRAIN_TIMEOUT_SEC
         last = -1
@@ -2562,6 +2590,11 @@ class TestQwpWsFuzz(QwpWsTestSupport, unittest.TestCase):
 
     def _run_fuzz(self, load: 'qwp_ws_fuzz.LoadParams',
                   fuzz: 'qwp_ws_fuzz.FuzzParams'):
+        # High-concurrency schema fuzzing can drive enough concurrent
+        # QuestDB WAL/column files to exhaust the hosted macOS process FD cap.
+        # Apply one shared policy so every fuzz workload gets the same bound.
+        qwp_ws_fuzz.cap_macos_producer_threads(load, sys.platform)
+
         # Pre-create per-table buffers. Java keys by lowercase name (case-
         # insensitive) so 'WEATHER0' and 'weather0' resolve to the same
         # table on both client- and server-side.

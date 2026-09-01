@@ -1115,12 +1115,20 @@ public:
         ::qwp_reader_query_bind_binary(_impl, buf, len);
         return *this;
     }
+    /**
+     * Bind a UUID as 16 bytes in canonical RFC-4122 big-endian order —
+     * the same order UUID values are read back in.
+     */
     query& bind_uuid(const std::array<uint8_t, 16>& bytes)
     {
         ensure_impl();
         ::qwp_reader_query_bind_uuid(_impl, bytes.data());
         return *this;
     }
+    /**
+     * Bind a LONG256 as 32 raw little-endian bytes: four 64-bit limbs,
+     * least-significant limb first.
+     */
     query& bind_long256(const std::array<uint8_t, 32>& bytes)
     {
         ensure_impl();
@@ -1530,8 +1538,10 @@ struct decimal_view
     }
 };
 
-/** UUID / LONG256 view. `values` is dense raw little-endian bytes;
- *  `value_stride` is 16 (UUID) or 32 (LONG256). */
+/** UUID / LONG256 view. `value_stride` is 16 (UUID) or 32 (LONG256).
+ *  UUID rows are canonical RFC-4122 big-endian bytes (already reversed
+ *  out of wire order); LONG256 rows are little-endian limbs, low limb
+ *  first, verbatim from the wire. */
 struct bytes_view
 {
     egress::column_kind kind;
@@ -1949,7 +1959,8 @@ public:
         return egress::decimal256{out, _scalar.decimal_scale};
     }
 
-    /** UUID row → `nullable<array<uint8_t, 16>>` (LE bytes). */
+    /** UUID row → `nullable<array<uint8_t, 16>>`, canonical RFC-4122
+     *  big-endian bytes. */
     nullable<std::array<uint8_t, 16>> get_uuid(size_t row) const
     {
         ensure_kind(column_kind::uuid, "column::get_uuid");

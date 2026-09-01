@@ -326,15 +326,13 @@ pub enum line_sender_error_code {
     /// QWP/WebSocket server rejection or terminal protocol violation.
     line_sender_error_server_rejection = 14,
 
-    /// `qwp_sender_flush_arrow_batch_*` was passed a column whose
-    /// Arrow / QuestDB kind cannot be persisted to a QuestDB table.
-    /// Only emitted with the `arrow` feature enabled.
+    /// An Arrow column cannot be written to QuestDB because its type is not
+    /// supported for ingestion. Only emitted with the `arrow` feature enabled.
     line_sender_error_arrow_unsupported_column_kind = 15,
 
-    /// `qwp_sender_flush_arrow_batch_*` rejected a `RecordBatch` at
-    /// client-side structural validation (column count, name encoding,
-    /// FFI struct contract). Only emitted with the `arrow` feature
-    /// enabled.
+    /// Arrow data is invalid or conflicts with its metadata or overrides. For
+    /// example, a UUID claim requires 16-byte values and a LONG256 claim
+    /// requires 32-byte values. Only emitted with the `arrow` feature enabled.
     line_sender_error_arrow_ingest = 16,
 
     /// A reconnectable failure on the column-major sender's flush/sync
@@ -2063,6 +2061,8 @@ pub unsafe extern "C" fn line_sender_buffer_column_dec128(
 /// Record a UUID column value. QWP-only.
 ///
 /// The wire encoding writes `lo` (8 bytes LE) followed by `hi` (8 bytes LE).
+/// For canonical RFC-4122 bytes, use `qwp_chunk_column_uuid` instead of
+/// splitting the bytes into `lo` and `hi`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn line_sender_buffer_column_uuid(
     buffer: *mut line_sender_buffer,
@@ -5414,9 +5414,9 @@ mod tests {
         padded.extend_from_slice(&bit_len.to_be_bytes());
 
         let mut words = [0u32; 80];
-        for chunk in padded.chunks_exact(64) {
-            for (idx, word) in chunk.chunks_exact(4).enumerate() {
-                words[idx] = u32::from_be_bytes([word[0], word[1], word[2], word[3]]);
+        for chunk in padded.as_chunks::<64>().0 {
+            for (idx, word) in chunk.as_chunks::<4>().0.iter().enumerate() {
+                words[idx] = u32::from_be_bytes(*word);
             }
             for idx in 16..80 {
                 words[idx] = (words[idx - 3] ^ words[idx - 8] ^ words[idx - 14] ^ words[idx - 16])

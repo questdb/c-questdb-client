@@ -344,7 +344,12 @@ impl<'a, const N: usize> FixedBytesColumn<'a, N> {
     }
 }
 
+/// UUID column view. `value(row)` yields the 16 UUID bytes in canonical
+/// RFC-4122 big-endian order (what `uuid::Uuid::from_bytes` expects);
+/// the decoder already reversed them out of QWP wire order.
 pub type UuidColumn<'a> = FixedBytesColumn<'a, 16>;
+/// LONG256 column view: 32 bytes per row, little-endian limbs, low limb
+/// first (QWP wire order, verbatim).
 pub type Long256Column<'a> = FixedBytesColumn<'a, 32>;
 
 // ---------------------------------------------------------------------------

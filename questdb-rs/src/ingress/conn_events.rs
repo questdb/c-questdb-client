@@ -131,6 +131,10 @@ struct DispatcherInner<T> {
     closed: AtomicBool,
     dropped: AtomicU64,
     delivered: AtomicU64,
+    /// Set by the worker as it enters `dispatch_loop`, so a test can tell
+    /// a running worker from one that never spawned.
+    #[cfg(test)]
+    worker_started: (Mutex<bool>, Condvar),
 }
 
 impl<T> DispatcherInner<T> {
@@ -139,6 +143,38 @@ impl<T> DispatcherInner<T> {
             Ok(inbox) => inbox,
             Err(poisoned) => poisoned.into_inner(),
         }
+    }
+
+    #[cfg(test)]
+    fn signal_worker_start(&self) {
+        let (started, signal) = &self.worker_started;
+        let mut started = match started.lock() {
+            Ok(started) => started,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        *started = true;
+        signal.notify_all();
+    }
+
+    #[cfg(test)]
+    fn wait_for_worker_start(&self, timeout: std::time::Duration) -> bool {
+        let (started, signal) = &self.worker_started;
+        let deadline = std::time::Instant::now() + timeout;
+        let mut started = match started.lock() {
+            Ok(started) => started,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        while !*started {
+            let now = std::time::Instant::now();
+            if now >= deadline {
+                return false;
+            }
+            started = match signal.wait_timeout(started, deadline - now) {
+                Ok((started, _)) => started,
+                Err(poisoned) => poisoned.into_inner().0,
+            };
+        }
+        true
     }
 }
 
@@ -185,6 +221,8 @@ impl<T: std::fmt::Debug + Send + 'static> EventDispatcher<T> {
             closed: AtomicBool::new(false),
             dropped: AtomicU64::new(0),
             delivered: AtomicU64::new(0),
+            #[cfg(test)]
+            worker_started: (Mutex::new(false), Condvar::new()),
         });
         let thread_inner = Arc::clone(&inner);
         let thread = match std::thread::Builder::new()
@@ -231,6 +269,15 @@ impl<T: std::fmt::Debug + Send + 'static> EventDispatcher<T> {
         self.inner.delivered.load(Ordering::Relaxed)
     }
 
+    /// Test-only: block until the worker thread has entered its dispatch
+    /// loop, returning `false` on timeout or when the spawn failed. Lets a
+    /// test that exercises the close/join path prove there was a worker to
+    /// join, rather than passing because no thread was ever created.
+    #[cfg(test)]
+    pub(crate) fn wait_for_worker_start(&self, timeout: std::time::Duration) -> bool {
+        self.thread.is_some() && self.inner.wait_for_worker_start(timeout)
+    }
+
     /// Drop the dispatcher (joining its thread, so any in-flight listener
     /// invocation completes) and return the final `(delivered, dropped)`.
     pub(crate) fn shutdown(self) -> (u64, u64) {
@@ -245,13 +292,22 @@ impl<T: std::fmt::Debug + Send + 'static> EventDispatcher<T> {
 
 impl<T> Drop for EventDispatcher<T> {
     fn drop(&mut self) {
-        // Publish `closed` and wake the worker while holding the inbox mutex it
-        // parks under, so the store + notify cannot slip into the worker's
-        // `closed`-check -> `available.wait` window and be lost. A lost wakeup
-        // there leaves the worker parked forever and hangs the join below —
-        // observed as a `questdb_db_close` hang when a pool is closed right
-        // after connect, before its freshly spawned dispatcher first parks.
-        // Mirrors the notify-under-lock pattern the pool's own Drop uses.
+        // The inbox mutex is required for the wakeup to reach the
+        // dispatcher: `dispatch_loop` reads `closed` and parks while
+        // holding that same mutex, so publishing the close under it means
+        // the loop either sees the store before parking or is already
+        // registered as a waiter when the notify lands. The loop re-reads
+        // `closed` under the mutex before each park, so only this notify
+        // has to arrive; a surplus one is harmless.
+        //
+        // Keeping events from arriving after the close is what makes every
+        // offered event either delivered or counted in `dropped`, and that
+        // comes from the holders rather than from `offer`, whose `closed`
+        // check runs outside the inbox mutex and is not ordered against
+        // this store: `ConnectionEventSource::offer` and
+        // `RejectionEventSource::publish` hold their own dispatcher mutex
+        // across the whole `offer` call, and `close` takes that same mutex
+        // to remove the dispatcher.
         {
             let _inbox = self.inner.lock_inbox();
             self.inner.closed.store(true, Ordering::Release);
@@ -266,6 +322,8 @@ impl<T> Drop for EventDispatcher<T> {
 }
 
 fn dispatch_loop<T: std::fmt::Debug>(inner: Arc<DispatcherInner<T>>) {
+    #[cfg(test)]
+    inner.signal_worker_start();
     loop {
         let event = {
             let mut inbox = inner.lock_inbox();
@@ -645,6 +703,63 @@ mod tests {
         drop(dispatcher);
         wait_for(|| Arc::strong_count(&inner) == 1);
         assert!(inner.closed.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn drop_joins_a_dispatcher_thread_that_never_saw_an_event() {
+        // A dispatcher dropped right after construction races its own
+        // thread's first trip through the inbox lock: the thread reads
+        // `closed`, finds the inbox empty and parks. The close is
+        // published under that mutex, so the park stays reachable and
+        // every drop joins. Run the cycle often enough to cover the
+        // window; a stalled join shows up as the recv timeout.
+        //
+        // Against a dispatcher that publishes the close without the inbox
+        // mutex the stall lands within the first few hundred rounds, so
+        // this count carries a wide margin over the window it sweeps.
+        //
+        // The cycle runs on its own thread and reports over a channel so a
+        // stalled join fails this test rather than hanging the suite:
+        // libtest joins the test's own thread, so the same loop written
+        // inline would block `cargo test` with no output at all.
+        const ROUNDS: u32 = 5_000;
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let completed = Arc::new(AtomicU64::new(0));
+        let completed_in_thread = Arc::clone(&completed);
+        std::thread::spawn(move || {
+            for round in 0..ROUNDS {
+                let dispatcher =
+                    ConnectionEventDispatcher::new(Arc::new(|_: &ConnectionEvent| {}), 4);
+                // A round covers the race only if the thread started:
+                // `named` logs and gives up on a spawn failure, which would
+                // leave every drop a no-op and pass this test vacuously.
+                assert!(
+                    dispatcher.thread.is_some(),
+                    "dispatcher thread failed to spawn"
+                );
+                // Sweep the gap so drops land across the whole startup
+                // window, including the instant the thread holds the inbox
+                // lock and is about to park.
+                for _ in 0..(round % 400) {
+                    std::hint::spin_loop();
+                }
+                drop(dispatcher);
+                completed_in_thread.store(u64::from(round + 1), Ordering::Relaxed);
+            }
+            let _ = done_tx.send(());
+        });
+        match done_rx.recv_timeout(Duration::from_secs(60)) {
+            Ok(()) => {}
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => panic!(
+                "only {} of {ROUNDS} drop/join cycles finished in 60s; a stalled \
+                 join reports a few hundred, an overloaded machine reports most \
+                 of them",
+                completed.load(Ordering::Relaxed),
+            ),
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                panic!("the drop/join worker panicked")
+            }
+        }
     }
 
     #[test]

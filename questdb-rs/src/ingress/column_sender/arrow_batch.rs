@@ -33,8 +33,8 @@
 
 use arrow::array::ByteView;
 use arrow::array::{
-    Array, ArrayRef, BinaryArray, BinaryViewArray, BooleanArray, Date32Array, Date64Array,
-    Decimal32Array, Decimal64Array, Decimal128Array, Decimal256Array, DictionaryArray,
+    Array, ArrayAccessor, ArrayRef, BinaryArray, BinaryViewArray, BooleanArray, Date32Array,
+    Date64Array, Decimal32Array, Decimal64Array, Decimal128Array, Decimal256Array, DictionaryArray,
     DurationMicrosecondArray, DurationMillisecondArray, DurationNanosecondArray,
     DurationSecondArray, FixedSizeBinaryArray, FixedSizeListArray, Float16Array, Float32Array,
     Float64Array, GenericByteViewArray, Int8Array, Int16Array, Int32Array, Int64Array,
@@ -46,8 +46,7 @@ use arrow::array::{
     types::{ByteViewType, UInt8Type, UInt16Type, UInt32Type},
 };
 use arrow::buffer::NullBuffer;
-use arrow::datatypes::{DataType, Field, Schema as ArrowSchema, SchemaRef, TimeUnit};
-use std::sync::Arc;
+use arrow::datatypes::{DataType, Field, SchemaRef, TimeUnit};
 
 use crate::error::{Error, ErrorCode};
 use crate::ingress::buffer::{QwpWsSymbolHasher, SymbolGlobalDict};
@@ -60,7 +59,8 @@ use super::wire::{
     QWP_TYPE_DECIMAL128, QWP_TYPE_DECIMAL256, QWP_TYPE_DOUBLE, QWP_TYPE_DOUBLE_ARRAY,
     QWP_TYPE_FLOAT, QWP_TYPE_GEOHASH, QWP_TYPE_INT, QWP_TYPE_IPV4, QWP_TYPE_LONG, QWP_TYPE_LONG256,
     QWP_TYPE_SHORT, QWP_TYPE_SYMBOL, QWP_TYPE_TIMESTAMP, QWP_TYPE_TIMESTAMP_NANOS, QWP_TYPE_UUID,
-    QWP_TYPE_VARCHAR, QWP_VERSION_1, validate_table_name, write_qwp_bytes, write_qwp_varint,
+    QWP_TYPE_VARCHAR, QWP_VERSION_1, reverse_uuid_bytes, validate_table_name, write_qwp_bytes,
+    write_qwp_varint,
 };
 
 use super::MAX_CHUNK_ROWS as MAX_ARROW_INGEST_ROWS;
@@ -69,9 +69,11 @@ const COLUMN_ERR_PREFIX: &str = "[column='";
 use crate::ingress::buffer::QWP_DECIMAL_MAX_SCALE;
 
 /// Per-column wire-type hint that overrides what `classify()` would
-/// otherwise derive from the Arrow `Field`'s data type alone. Useful
-/// when the Arrow source has no `questdb.*` Field metadata to carry
-/// the hint (e.g. Polars frames built without pyarrow).
+/// otherwise derive from the Arrow `Field`'s data type and metadata.
+/// The override wins for its column: field metadata that is valid but
+/// says something different is ignored. Use it when the Arrow source has
+/// nowhere to put the metadata (e.g. Polars frames built without
+/// pyarrow), or when the caller wants to replace an out-of-date hint.
 #[derive(Clone, Copy, Debug)]
 #[non_exhaustive]
 pub enum ArrowColumnOverride<'a> {
@@ -88,6 +90,29 @@ pub enum ArrowColumnOverride<'a> {
     /// Treat an Int8/16/32/64 column as `GEOHASH(bits)`. `bits` must
     /// be in `1..=60`.
     Geohash { column: &'a str, bits: u8 },
+    /// Treat a `FixedSizeBinary(16)` or `Binary`/`LargeBinary`/`BinaryView`
+    /// column as `UUID`. The bytes are canonical RFC-4122 big-endian (what
+    /// `arrow.uuid` and `uuid::Uuid::as_bytes()` produce); the encoder
+    /// byte-swaps to QWP wire order internally. On the variable-length
+    /// binary dtypes — what Polars exports, since it has no fixed-size
+    /// binary dtype — every non-null value must be exactly 16 bytes or
+    /// the flush fails with [`ErrorCode::ArrowIngest`]. Use this when the
+    /// Arrow source carries no UUID metadata (e.g. Polars frames), or to
+    /// replace an out-of-date hint. A 16-byte width on its own never
+    /// makes a column a UUID.
+    ///
+    /// [`ErrorCode::ArrowIngest`]: crate::ErrorCode::ArrowIngest
+    Uuid { column: &'a str },
+    /// Treat a `FixedSizeBinary(32)` or `Binary`/`LargeBinary`/`BinaryView`
+    /// column as `LONG256`. The bytes are little-endian limbs, low limb
+    /// first, forwarded verbatim. On the variable-length binary dtypes
+    /// every non-null value must be exactly 32 bytes or the flush fails
+    /// with [`ErrorCode::ArrowIngest`]. Use this when the Arrow source
+    /// carries no LONG256 metadata, or to replace an out-of-date hint. A
+    /// 32-byte width on its own never makes a column a LONG256.
+    ///
+    /// [`ErrorCode::ArrowIngest`]: crate::ErrorCode::ArrowIngest
+    Long256 { column: &'a str },
 }
 
 impl<'a> ArrowColumnOverride<'a> {
@@ -98,156 +123,56 @@ impl<'a> ArrowColumnOverride<'a> {
             | Self::NotSymbol { column }
             | Self::Ipv4 { column }
             | Self::Char { column }
-            | Self::Geohash { column, .. } => column,
+            | Self::Geohash { column, .. }
+            | Self::Uuid { column }
+            | Self::Long256 { column } => column,
         }
     }
 }
 
-// We patch field metadata up-front rather than extending `classify`'s
-// signature: it keeps the per-column hot loop unchanged and lets the
-// override path reuse every existing metadata-driven branch.
-pub(crate) fn apply_overrides(
+/// Validate the per-flush override list and index it by schema column.
+///
+/// Overrides stay separate from Arrow field metadata. An override is a
+/// direct choice by the caller and outranks metadata; rewriting it into
+/// the field metadata would lose that distinction and let out-of-date
+/// metadata take part in classification again.
+fn prepare_overrides<'a>(
     schema: &SchemaRef,
-    overrides: &[ArrowColumnOverride<'_>],
-) -> Result<SchemaRef> {
-    use std::collections::HashMap;
+    overrides: &[ArrowColumnOverride<'a>],
+) -> Result<Vec<Option<ArrowColumnOverride<'a>>>> {
+    use std::collections::HashSet;
 
-    let mut by_name: HashMap<&str, &ArrowColumnOverride<'_>> =
-        HashMap::with_capacity(overrides.len());
-    for ov in overrides {
-        if by_name.insert(ov.column(), ov).is_some() {
+    let mut seen = HashSet::with_capacity(overrides.len());
+    for &ov in overrides {
+        if !seen.insert(ov.column()) {
             return Err(fmt!(
-                ArrowIngest,
+                InvalidApiCall,
                 "duplicate arrow override for column '{}'",
                 ov.column()
             ));
         }
     }
 
-    for ov in overrides {
-        let Some(field) = schema.fields().iter().find(|f| f.name() == ov.column()) else {
+    let mut by_column = vec![None; schema.fields().len()];
+    for &ov in overrides {
+        let Some((idx, field)) = schema
+            .fields()
+            .iter()
+            .enumerate()
+            .find(|(_, f)| f.name() == ov.column())
+        else {
             return Err(fmt!(
-                ArrowIngest,
+                InvalidApiCall,
                 "override targets unknown column '{}'",
                 ov.column()
             ));
         };
-        // Reject an override whose target wire type `classify` will not honour
-        // on this column's Arrow type, instead of silently dropping it and
-        // shipping the column under its default mapping.
-        let dt = field.data_type();
-        let (kind, applicable) = match ov {
-            ArrowColumnOverride::Symbol { .. } | ArrowColumnOverride::NotSymbol { .. } => {
-                let kind = if matches!(ov, ArrowColumnOverride::Symbol { .. }) {
-                    "symbol"
-                } else {
-                    "not_symbol"
-                };
-                (
-                    kind,
-                    matches!(
-                        dt,
-                        DataType::Utf8
-                            | DataType::LargeUtf8
-                            | DataType::Utf8View
-                            | DataType::Dictionary(_, _)
-                    ),
-                )
-            }
-            ArrowColumnOverride::Ipv4 { .. } => ("ipv4", matches!(dt, DataType::UInt32)),
-            ArrowColumnOverride::Char { .. } => ("char", matches!(dt, DataType::UInt16)),
-            ArrowColumnOverride::Geohash { bits, .. } => {
-                if *bits == 0 || *bits > 60 {
-                    return Err(fmt!(
-                        ArrowIngest,
-                        "override for column '{}' has invalid geohash bits {} (must be 1..=60)",
-                        ov.column(),
-                        bits
-                    ));
-                }
-                (
-                    "geohash",
-                    matches!(
-                        dt,
-                        DataType::Int8 | DataType::Int16 | DataType::Int32 | DataType::Int64
-                    ),
-                )
-            }
-        };
-        if !applicable {
-            return Err(fmt!(
-                ArrowIngest,
-                "override '{}' is not applicable to column '{}' of Arrow type {:?}",
-                kind,
-                ov.column(),
-                dt
-            ));
-        }
+        // Check that the override fits the column's type even for an empty
+        // batch, whose columns are never classified below.
+        let _ = classify_override(field, ov)?;
+        by_column[idx] = Some(ov);
     }
-
-    let mut patched_fields: Vec<Arc<Field>> = Vec::with_capacity(schema.fields().len());
-    let mut any_changed = false;
-    for field in schema.fields().iter() {
-        let Some(ov) = by_name.get(field.name().as_str()) else {
-            patched_fields.push(field.clone());
-            continue;
-        };
-        let mut md = field.metadata().clone();
-        match **ov {
-            ArrowColumnOverride::Symbol { .. } => {
-                md.insert(
-                    crate::arrow_metadata::COLUMN_TYPE.to_string(),
-                    "symbol".to_string(),
-                );
-                md.insert(
-                    crate::arrow_metadata::SYMBOL.to_string(),
-                    "true".to_string(),
-                );
-            }
-            ArrowColumnOverride::NotSymbol { .. } => {
-                md.insert(
-                    crate::arrow_metadata::SYMBOL.to_string(),
-                    "false".to_string(),
-                );
-            }
-            ArrowColumnOverride::Ipv4 { .. } => {
-                md.insert(
-                    crate::arrow_metadata::COLUMN_TYPE.to_string(),
-                    "ipv4".to_string(),
-                );
-            }
-            ArrowColumnOverride::Char { .. } => {
-                md.insert(
-                    crate::arrow_metadata::COLUMN_TYPE.to_string(),
-                    "char".to_string(),
-                );
-            }
-            ArrowColumnOverride::Geohash { bits, .. } => {
-                md.insert(
-                    crate::arrow_metadata::GEOHASH_BITS.to_string(),
-                    bits.to_string(),
-                );
-            }
-        }
-        if md == *field.metadata() {
-            patched_fields.push(field.clone());
-        } else {
-            any_changed = true;
-            let new_field = Field::new(
-                field.name().clone(),
-                field.data_type().clone(),
-                field.is_nullable(),
-            )
-            .with_metadata(md);
-            patched_fields.push(Arc::new(new_field));
-        }
-    }
-
-    if !any_changed {
-        return Ok(schema.clone());
-    }
-    let new_schema = ArrowSchema::new_with_metadata(patched_fields, schema.metadata().clone());
-    Ok(Arc::new(new_schema))
+    Ok(by_column)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -303,16 +228,163 @@ pub(crate) enum ColumnKind {
     Binary,
     LargeBinary,
     BinaryView,
+    /// FixedSizeBinary with no declared QuestDB kind: opaque bytes,
+    /// forwarded verbatim as a BINARY (blob) column.
+    FsbToBinary,
     Uuid,
     Long256,
+    /// UUID claimed on a `Binary`/`LargeBinary`/`BinaryView` column (what
+    /// Polars exports — it has no fixed-size binary dtype). Values are
+    /// canonical RFC-4122 big-endian, byte-swapped to wire order; every
+    /// non-null value must be exactly 16 bytes.
+    UuidFromVarBinary,
+    /// LONG256 claimed on a `Binary`/`LargeBinary`/`BinaryView` column.
+    /// Values are LE limbs, verbatim; every non-null value must be
+    /// exactly 32 bytes.
+    Long256FromVarBinary,
     Geohash(u8),
-    SymbolDict { key: DictKey, value: DictValue },
-    DictToVarchar { key: DictKey, value: DictValue },
+    SymbolDict {
+        key: DictKey,
+        value: DictValue,
+    },
+    DictToVarchar {
+        key: DictKey,
+        value: DictValue,
+    },
     Decimal32WidenToDecimal64,
     Decimal64,
     Decimal128,
     Decimal256,
     ArrayDouble(usize),
+}
+
+fn override_not_applicable(field: &Field, override_name: &str) -> Result<ColumnKind> {
+    Err(fmt!(
+        ArrowIngest,
+        "override '{}' is not applicable to column '{}' of Arrow type {:?}",
+        override_name,
+        field.name(),
+        field.data_type()
+    ))
+}
+
+fn classify_override(field: &Field, ov: ArrowColumnOverride<'_>) -> Result<ColumnKind> {
+    let dt = field.data_type();
+    match ov {
+        ArrowColumnOverride::Symbol { .. } => match dt {
+            DataType::Utf8 => Ok(ColumnKind::SymbolUtf8),
+            DataType::LargeUtf8 => Ok(ColumnKind::SymbolLargeUtf8),
+            DataType::Utf8View => Ok(ColumnKind::SymbolUtf8View),
+            DataType::Dictionary(key, value)
+                if dict_key_for(key).is_some() && dict_value_for(value).is_some() =>
+            {
+                Ok(ColumnKind::SymbolDict {
+                    key: dict_key_for(key).unwrap(),
+                    value: dict_value_for(value).unwrap(),
+                })
+            }
+            _ => override_not_applicable(field, "symbol"),
+        },
+        ArrowColumnOverride::NotSymbol { .. } => match dt {
+            DataType::Utf8 => Ok(ColumnKind::Utf8),
+            DataType::LargeUtf8 => Ok(ColumnKind::LargeUtf8),
+            DataType::Utf8View => Ok(ColumnKind::Utf8View),
+            DataType::Dictionary(key, value)
+                if dict_key_for(key).is_some() && dict_value_for(value).is_some() =>
+            {
+                Ok(ColumnKind::DictToVarchar {
+                    key: dict_key_for(key).unwrap(),
+                    value: dict_value_for(value).unwrap(),
+                })
+            }
+            _ => override_not_applicable(field, "not_symbol"),
+        },
+        ArrowColumnOverride::Ipv4 { .. } => match dt {
+            DataType::UInt32 => Ok(ColumnKind::Ipv4),
+            _ => override_not_applicable(field, "ipv4"),
+        },
+        ArrowColumnOverride::Char { .. } => match dt {
+            DataType::UInt16 => Ok(ColumnKind::Char),
+            _ => override_not_applicable(field, "char"),
+        },
+        ArrowColumnOverride::Geohash { bits, .. } => {
+            if bits == 0 || bits > 60 {
+                return Err(fmt!(
+                    InvalidApiCall,
+                    "override for column '{}' has invalid geohash bits {} (must be 1..=60)",
+                    field.name(),
+                    bits
+                ));
+            }
+            let (max_bits, dtype_name) = match dt {
+                DataType::Int8 => (8, "Int8"),
+                DataType::Int16 => (16, "Int16"),
+                DataType::Int32 => (32, "Int32"),
+                DataType::Int64 => (60, "Int64"),
+                _ => return override_not_applicable(field, "geohash"),
+            };
+            if bits > max_bits {
+                return Err(fmt!(
+                    ArrowIngest,
+                    "geohash precision_bits {} out of range for {} column (must be 1..={})",
+                    bits,
+                    dtype_name,
+                    max_bits
+                ));
+            }
+            Ok(ColumnKind::Geohash(bits))
+        }
+        ArrowColumnOverride::Uuid { .. } => match dt {
+            DataType::FixedSizeBinary(16) => Ok(ColumnKind::Uuid),
+            DataType::Binary | DataType::LargeBinary | DataType::BinaryView => {
+                Ok(ColumnKind::UuidFromVarBinary)
+            }
+            _ => override_not_applicable(field, "uuid"),
+        },
+        ArrowColumnOverride::Long256 { .. } => match dt {
+            DataType::FixedSizeBinary(32) => Ok(ColumnKind::Long256),
+            DataType::Binary | DataType::LargeBinary | DataType::BinaryView => {
+                Ok(ColumnKind::Long256FromVarBinary)
+            }
+            _ => override_not_applicable(field, "long256"),
+        },
+    }
+}
+
+pub(crate) fn classify_with_override(
+    field: &Field,
+    array: &dyn Array,
+    ov: Option<ArrowColumnOverride<'_>>,
+) -> Result<ColumnKind> {
+    match ov {
+        Some(ov) => classify_override(field, ov),
+        None => classify(field, array),
+    }
+}
+
+fn is_symbol_storage(dt: &DataType) -> bool {
+    matches!(
+        dt,
+        DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View
+    ) || matches!(dt, DataType::Dictionary(key, value)
+            if dict_key_for(key).is_some() && dict_value_for(value).is_some())
+}
+
+fn is_binary_claim_storage(dt: &DataType) -> bool {
+    matches!(
+        dt,
+        DataType::Binary
+            | DataType::LargeBinary
+            | DataType::BinaryView
+            | DataType::FixedSizeBinary(_)
+    )
+}
+
+fn is_geohash_storage(dt: &DataType) -> bool {
+    matches!(
+        dt,
+        DataType::Int8 | DataType::Int16 | DataType::Int32 | DataType::Int64
+    )
 }
 
 pub(crate) fn classify(field: &Field, _array: &dyn Array) -> Result<ColumnKind> {
@@ -324,19 +396,36 @@ pub(crate) fn classify(field: &Field, _array: &dyn Array) -> Result<ColumnKind> 
         .metadata()
         .get(crate::arrow_metadata::ARROW_EXTENSION_NAME)
         .map(String::as_str);
-    let md_geo_bits = field
-        .metadata()
-        .get(crate::arrow_metadata::GEOHASH_BITS)
-        .and_then(|s| s.parse::<u8>().ok());
-    let wants_symbol = md_type == Some("symbol")
-        || field
-            .metadata()
-            .get(crate::arrow_metadata::SYMBOL)
-            .is_some_and(|v| v == "true");
-    let wants_not_symbol = field
+    let md_geo_raw = field.metadata().get(crate::arrow_metadata::GEOHASH_BITS);
+    let md_geo_bits = match md_geo_raw {
+        Some(raw) => Some(raw.parse::<u8>().map_err(|_| {
+            fmt!(
+                ArrowIngest,
+                "column '{}' has invalid 'questdb.geohash_bits' metadata '{}' (1..=60 expected)",
+                field.name(),
+                raw
+            )
+        })?),
+        None => None,
+    };
+    let (symbol_true, wants_not_symbol) = match field
         .metadata()
         .get(crate::arrow_metadata::SYMBOL)
-        .is_some_and(|v| v == "false");
+        .map(String::as_str)
+    {
+        None => (false, false),
+        Some("true") => (true, false),
+        Some("false") => (false, true),
+        Some(value) => {
+            return Err(fmt!(
+                ArrowIngest,
+                "column '{}' has invalid 'questdb.symbol' metadata '{}' (expected 'true' or 'false')",
+                field.name(),
+                value
+            ));
+        }
+    };
+    let wants_symbol = md_type == Some("symbol") || symbol_true;
     let check_geohash_width = |bits: u8, max_bits: u8, dtype_name: &str| -> Result<u8> {
         if bits == 0 || bits > max_bits {
             return Err(fmt!(
@@ -349,6 +438,26 @@ pub(crate) fn classify(field: &Field, _array: &dyn Array) -> Result<ColumnKind> 
         }
         Ok(bits)
     };
+    if md_type == Some("symbol") && wants_not_symbol {
+        return Err(fmt!(
+            ArrowIngest,
+            "column '{}' carries column_type='symbol' but 'questdb.symbol=false'",
+            field.name()
+        ));
+    }
+    if md_type.is_some_and(|t| t != "symbol")
+        && field
+            .metadata()
+            .get(crate::arrow_metadata::SYMBOL)
+            .is_some_and(|v| v == "true")
+    {
+        return Err(fmt!(
+            ArrowIngest,
+            "column '{}' carries column_type='{}' but 'questdb.symbol=true'",
+            field.name(),
+            md_type.unwrap()
+        ));
+    }
     if md_geo_bits.is_some()
         && let Some(t) = md_type
         && !t.starts_with("geohash")
@@ -359,6 +468,84 @@ pub(crate) fn classify(field: &Field, _array: &dyn Array) -> Result<ColumnKind> 
              drop one of the hints or set column_type='geohash'",
             field.name(),
             t
+        ));
+    }
+    if md_type.is_some_and(|t| t.starts_with("geohash")) && md_geo_bits.is_none() {
+        return Err(fmt!(
+            ArrowIngest,
+            "column '{}' has column_type='{}' but missing 'questdb.geohash_bits' metadata (1..=60 expected)",
+            field.name(),
+            md_type.unwrap()
+        ));
+    }
+    if md_ext == Some(crate::arrow_metadata::EXT_ARROW_UUID) && md_type.is_some_and(|t| t != "uuid")
+    {
+        return Err(fmt!(
+            ArrowIngest,
+            "column '{}' carries contradictory binary type metadata: column_type='{}' and extension='arrow.uuid'",
+            field.name(),
+            md_type.unwrap()
+        ));
+    }
+    let dt = field.data_type();
+    let type_claim_applicable = match md_type {
+        Some("byte") => Some(matches!(dt, DataType::Int8)),
+        Some("short") => Some(matches!(dt, DataType::Int16)),
+        Some("int") => Some(matches!(dt, DataType::Int32)),
+        Some("char") => Some(matches!(dt, DataType::UInt16)),
+        Some("ipv4") => Some(matches!(dt, DataType::UInt32)),
+        Some("symbol") => Some(is_symbol_storage(dt)),
+        Some("uuid" | "long256") => Some(is_binary_claim_storage(dt)),
+        Some(t) if t.starts_with("geohash") => Some(is_geohash_storage(dt)),
+        _ => None,
+    };
+    if type_claim_applicable == Some(false) {
+        return Err(fmt!(
+            ArrowIngest,
+            "column '{}' has column_type='{}', which is not applicable to Arrow type {:?}",
+            field.name(),
+            md_type.unwrap(),
+            dt
+        ));
+    }
+    if (wants_symbol || wants_not_symbol) && !is_symbol_storage(dt) {
+        return Err(fmt!(
+            ArrowIngest,
+            "column '{}' carries 'questdb.symbol' metadata, which is not applicable to Arrow type {:?}",
+            field.name(),
+            dt
+        ));
+    }
+    if (md_geo_bits.is_some() || md_type.is_some_and(|t| t.starts_with("geohash")))
+        && !is_geohash_storage(dt)
+    {
+        return Err(fmt!(
+            ArrowIngest,
+            "column '{}' carries geohash metadata, which requires a signed Int8/16/32/64 Arrow type, got {:?}",
+            field.name(),
+            dt
+        ));
+    }
+    if md_ext == Some(crate::arrow_metadata::EXT_ARROW_UUID)
+        && !matches!(dt, DataType::FixedSizeBinary(16))
+    {
+        // The canonical Arrow UUID extension fixes its storage type to
+        // FixedSizeBinary(16), so metadata alone cannot turn a
+        // variable-length binary column into a UUID. Only a runtime
+        // override can.
+        if let DataType::FixedSizeBinary(width) = dt {
+            return Err(fmt!(
+                ArrowIngest,
+                "column '{}': UUID requires FixedSizeBinary(16), got width {}",
+                field.name(),
+                width
+            ));
+        }
+        return Err(fmt!(
+            ArrowIngest,
+            "column '{}': the `arrow.uuid` extension requires FixedSizeBinary(16) storage, got {:?}",
+            field.name(),
+            dt
         ));
     }
     Ok(match (field.data_type(), md_type, md_ext) {
@@ -396,23 +583,11 @@ pub(crate) fn classify(field: &Field, _array: &dyn Array) -> Result<ColumnKind> 
         (DataType::Float16, _, _) => ColumnKind::F16ToF32,
         (DataType::Float32, _, _) => ColumnKind::F32,
         (DataType::Float64, _, _) => ColumnKind::F64,
-        (DataType::UInt8, _, _) if md_geo_bits.is_some() => {
-            return Err(geohash_on_unsigned_error(field, "UInt8"));
-        }
         (DataType::UInt8, _, _) => ColumnKind::U8WidenToI32,
-        (DataType::UInt16, _, _) if md_geo_bits.is_some() => {
-            return Err(geohash_on_unsigned_error(field, "UInt16"));
-        }
         (DataType::UInt16, Some("char"), _) => ColumnKind::Char,
         (DataType::UInt16, _, _) => ColumnKind::U16WidenToI32,
-        (DataType::UInt32, _, _) if md_geo_bits.is_some() => {
-            return Err(geohash_on_unsigned_error(field, "UInt32"));
-        }
         (DataType::UInt32, Some("ipv4"), _) => ColumnKind::Ipv4,
         (DataType::UInt32, _, _) => ColumnKind::U32WidenToI64,
-        (DataType::UInt64, _, _) if md_geo_bits.is_some() => {
-            return Err(geohash_on_unsigned_error(field, "UInt64"));
-        }
         (DataType::UInt64, _, _) => ColumnKind::U64WidenToI64Checked,
         (DataType::Timestamp(TimeUnit::Second, _), _, _) => ColumnKind::TimestampSecondToMicros,
         (DataType::Timestamp(TimeUnit::Microsecond, _), _, _) => ColumnKind::TimestampMicros,
@@ -451,11 +626,57 @@ pub(crate) fn classify(field: &Field, _array: &dyn Array) -> Result<ColumnKind> 
         (DataType::LargeUtf8, _, _) => ColumnKind::LargeUtf8,
         (DataType::Utf8View, _, _) if wants_symbol => ColumnKind::SymbolUtf8View,
         (DataType::Utf8View, _, _) => ColumnKind::Utf8View,
+        // A `questdb.column_type` UUID/LONG256 claim on a variable-length
+        // binary column is accepted, and each value's width is checked at
+        // encode time. This is the only way to get a UUID or LONG256
+        // column out of Polars: Polars has no fixed-size binary dtype, so
+        // its Binary columns export as `BinaryView` and never reach the
+        // `FixedSizeBinary` arm below. Ignoring the claim would send a
+        // BINARY column when the user asked for UUID or LONG256.
+        (DataType::Binary | DataType::LargeBinary | DataType::BinaryView, Some("uuid"), _) => {
+            ColumnKind::UuidFromVarBinary
+        }
+        (DataType::Binary | DataType::LargeBinary | DataType::BinaryView, Some("long256"), _) => {
+            ColumnKind::Long256FromVarBinary
+        }
         (DataType::Binary, _, _) => ColumnKind::Binary,
         (DataType::LargeBinary, _, _) => ColumnKind::LargeBinary,
         (DataType::BinaryView, _, _) => ColumnKind::BinaryView,
-        (DataType::FixedSizeBinary(16), _, _) => ColumnKind::Uuid,
-        (DataType::FixedSizeBinary(32), _, _) => ColumnKind::Long256,
+        // FixedSizeBinary becomes a UUID or LONG256 column only on an
+        // explicit claim: the `arrow.uuid` canonical extension (which
+        // stores RFC-4122 big-endian bytes, byte-swapped to QWP wire order
+        // here) or `questdb.column_type`. Without a claim the bytes are
+        // opaque and land verbatim as a BINARY column. Reading a 16-byte
+        // width as a UUID would mean picking a byte order for the user
+        // without being asked.
+        (DataType::FixedSizeBinary(w), t, ext) => {
+            let wants_uuid =
+                t == Some("uuid") || ext == Some(crate::arrow_metadata::EXT_ARROW_UUID);
+            let wants_long256 = t == Some("long256");
+            if wants_uuid {
+                if *w != 16 {
+                    return Err(fmt!(
+                        ArrowIngest,
+                        "column '{}': UUID requires FixedSizeBinary(16), got width {}",
+                        field.name(),
+                        w
+                    ));
+                }
+                ColumnKind::Uuid
+            } else if wants_long256 {
+                if *w != 32 {
+                    return Err(fmt!(
+                        ArrowIngest,
+                        "column '{}': LONG256 requires FixedSizeBinary(32), got width {}",
+                        field.name(),
+                        w
+                    ));
+                }
+                ColumnKind::Long256
+            } else {
+                ColumnKind::FsbToBinary
+            }
+        }
         (DataType::Dictionary(key, value), _, _)
             if dict_key_for(key).is_some() && dict_value_for(value).is_some() =>
         {
@@ -553,17 +774,6 @@ fn dict_value_for(dt: &DataType) -> Option<DictValue> {
     })
 }
 
-fn geohash_on_unsigned_error(field: &Field, dtype_name: &str) -> Error {
-    Error::new(
-        ErrorCode::ArrowIngest,
-        format!(
-            "column '{}': geohash on unsigned Arrow type {} is not supported; widen to a signed type",
-            field.name(),
-            dtype_name
-        ),
-    )
-}
-
 // ===========================================================================
 // Wire-type byte mapping
 // ===========================================================================
@@ -600,8 +810,9 @@ pub(crate) fn wire_type_byte(kind: ColumnKind, _has_nulls: bool) -> u8 {
         | ColumnKind::SymbolUtf8View
         | ColumnKind::SymbolDict { .. } => QWP_TYPE_SYMBOL,
         ColumnKind::Binary | ColumnKind::LargeBinary | ColumnKind::BinaryView => QWP_TYPE_BINARY,
-        ColumnKind::Uuid => QWP_TYPE_UUID,
-        ColumnKind::Long256 => QWP_TYPE_LONG256,
+        ColumnKind::Uuid | ColumnKind::UuidFromVarBinary => QWP_TYPE_UUID,
+        ColumnKind::FsbToBinary => QWP_TYPE_BINARY,
+        ColumnKind::Long256 | ColumnKind::Long256FromVarBinary => QWP_TYPE_LONG256,
         ColumnKind::Geohash(_) => QWP_TYPE_GEOHASH,
         ColumnKind::Decimal32WidenToDecimal64 | ColumnKind::Decimal64 => QWP_TYPE_DECIMAL64,
         ColumnKind::Decimal128 => QWP_TYPE_DECIMAL128,
@@ -631,8 +842,11 @@ fn kind_supports_sparse_nulls(kind: ColumnKind) -> bool {
             | ColumnKind::Binary
             | ColumnKind::LargeBinary
             | ColumnKind::BinaryView
+            | ColumnKind::FsbToBinary
             | ColumnKind::Uuid
             | ColumnKind::Long256
+            | ColumnKind::UuidFromVarBinary
+            | ColumnKind::Long256FromVarBinary
             | ColumnKind::Geohash(_)
             | ColumnKind::Decimal32WidenToDecimal64
             | ColumnKind::Decimal64
@@ -711,9 +925,14 @@ fn write_qwp_bitmap_from_arrow(out: &mut Vec<u8>, nulls: &NullBuffer) -> Result<
         let word_bytes = (full_bytes / 8) * 8;
         let (src_words, src_rem) = src_slice.split_at(word_bytes);
         let (dst_words, dst_rem) = dst_slice.split_at_mut(word_bytes);
-        for (dchunk, schunk) in dst_words.chunks_exact_mut(8).zip(src_words.chunks_exact(8)) {
-            let w = u64::from_ne_bytes(schunk.try_into().unwrap());
-            dchunk.copy_from_slice(&(!w).to_ne_bytes());
+        for (dchunk, schunk) in dst_words
+            .as_chunks_mut::<8>()
+            .0
+            .iter_mut()
+            .zip(src_words.as_chunks::<8>().0)
+        {
+            let w = u64::from_ne_bytes(*schunk);
+            *dchunk = (!w).to_ne_bytes();
         }
         for (d, &s) in dst_rem.iter_mut().zip(src_rem) {
             *d = !s;
@@ -958,6 +1177,131 @@ fn u64_to_i64_le_checked(v: u64, row: usize) -> Result<[u8; 8]> {
         ));
     }
     Ok((v as i64).to_le_bytes())
+}
+
+/// `arrow.uuid` column body: RFC-4122 big-endian storage → QWP wire order
+/// (lo LE, hi LE), i.e. each 16-byte value reversed. Both branches
+/// account for the array's slice offset: the bulk path slices
+/// `value_data()` explicitly, the null path goes through `arr.value(row)`.
+fn write_uuid_be_payload(out: &mut Vec<u8>, arr: &FixedSizeBinaryArray) -> Result<()> {
+    let non_null = non_null_count(arr, "UUID column")?;
+    let bytes = non_null.checked_mul(16).ok_or_else(|| {
+        fmt!(
+            ArrowIngest,
+            "UUID column: non_null {} * 16 overflows usize",
+            non_null
+        )
+    })?;
+    try_reserve_bytes(out, bytes, "UUID column")?;
+    match arr.nulls() {
+        None => {
+            // Bulk path: slice `value_data()` once, starting at the array's
+            // own offset, instead of a bounds-checked `value(row)` per row.
+            let start = arr.offset() * 16;
+            for row in arr.value_data()[start..start + bytes].as_chunks::<16>().0 {
+                out.extend_from_slice(&reverse_uuid_bytes(row));
+            }
+        }
+        Some(nulls) => {
+            for row in 0..arr.len() {
+                if nulls.is_null(row) {
+                    continue;
+                }
+                out.extend_from_slice(&reverse_uuid_bytes(arr.value(row)));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// UUID / LONG256 claimed on a variable-length binary column
+/// (`Binary`/`LargeBinary`/`BinaryView` — what Polars produces, since it
+/// has no fixed-size binary dtype). Every non-null value must be exactly
+/// `elem` bytes; `reverse` turns on the UUID canonical→wire byte swap
+/// (LONG256 limbs pass through verbatim).
+fn write_fixed_from_var_binary_payload(
+    out: &mut Vec<u8>,
+    arr: &dyn Array,
+    elem: usize,
+    reverse: bool,
+    label: &'static str,
+) -> Result<()> {
+    let non_null = non_null_count(arr, label)?;
+    let bytes = non_null.checked_mul(elem).ok_or_else(|| {
+        fmt!(
+            ArrowIngest,
+            "{}: non_null {} * {} overflows usize",
+            label,
+            non_null,
+            elem
+        )
+    })?;
+    try_reserve_bytes(out, bytes, label)?;
+    // `classify` sends only these three dtypes here, and each arm
+    // downcasts to the type its own pattern matched, so no downcast fails.
+    match arr.data_type() {
+        DataType::Binary => emit_fixed_rows(
+            out,
+            arr.as_any().downcast_ref::<BinaryArray>().unwrap(),
+            elem,
+            reverse,
+            label,
+        ),
+        DataType::LargeBinary => emit_fixed_rows(
+            out,
+            arr.as_any().downcast_ref::<LargeBinaryArray>().unwrap(),
+            elem,
+            reverse,
+            label,
+        ),
+        DataType::BinaryView => emit_fixed_rows(
+            out,
+            arr.as_any().downcast_ref::<BinaryViewArray>().unwrap(),
+            elem,
+            reverse,
+            label,
+        ),
+        other => Err(fmt!(
+            ArrowIngest,
+            "{}: unexpected Arrow type {:?} for a fixed-width claim on a binary column",
+            label,
+            other
+        )),
+    }
+}
+
+fn emit_fixed_rows<'a, A>(
+    out: &mut Vec<u8>,
+    arr: A,
+    elem: usize,
+    reverse: bool,
+    label: &'static str,
+) -> Result<()>
+where
+    A: ArrayAccessor<Item = &'a [u8]>,
+{
+    for row in 0..arr.len() {
+        if arr.is_null(row) {
+            continue;
+        }
+        let v = arr.value(row);
+        if v.len() != elem {
+            return Err(fmt!(
+                ArrowIngest,
+                "{}: claim requires exactly {}-byte values, got {} bytes at row {}",
+                label,
+                elem,
+                v.len(),
+                row
+            ));
+        }
+        if reverse {
+            out.extend_from_slice(&reverse_uuid_bytes(v));
+        } else {
+            out.extend_from_slice(v);
+        }
+    }
+    Ok(())
 }
 
 fn non_null_fsb(out: &mut Vec<u8>, arr: &FixedSizeBinaryArray, size: usize) -> Result<()> {
@@ -3317,16 +3661,32 @@ pub(crate) fn write_arrow_column_body(
         }
         ColumnKind::Uuid => {
             let a = arr.as_any().downcast_ref::<FixedSizeBinaryArray>().unwrap();
+            write_uuid_be_payload(out, a)
+        }
+        ColumnKind::UuidFromVarBinary => {
+            write_fixed_from_var_binary_payload(out, arr, 16, true, "UUID column")
+        }
+        ColumnKind::Long256FromVarBinary => {
+            write_fixed_from_var_binary_payload(out, arr, 32, false, "LONG256 column")
+        }
+        ColumnKind::FsbToBinary => {
+            let a = arr.as_any().downcast_ref::<FixedSizeBinaryArray>().unwrap();
             let elem = a.value_length() as usize;
-            if null_count == 0 {
-                let start = a.offset() * elem;
-                let len = a.len() * elem;
-                try_reserve_bytes(out, len, "UUID column")?;
-                out.extend_from_slice(&a.value_data()[start..start + len]);
-                Ok(())
-            } else {
-                non_null_fsb(out, a, elem)
-            }
+            let bound = a.len().checked_mul(elem).ok_or_else(|| {
+                fmt!(
+                    ArrowIngest,
+                    "FixedSizeBinary column: {} rows * width {} overflows usize",
+                    a.len(),
+                    elem
+                )
+            })?;
+            write_varlen_u32_offsets_with_bitmap(
+                out,
+                arr,
+                "FixedSizeBinary column",
+                Some(bound),
+                emit_bytes_row_no_reserve(|row| Ok(a.value(row))),
+            )
         }
         ColumnKind::Long256 => {
             let a = arr.as_any().downcast_ref::<FixedSizeBinaryArray>().unwrap();
@@ -3633,10 +3993,10 @@ fn encode_arrow_batch_into_mode(
     replay_symbols: bool,
 ) -> Result<()> {
     let schema = batch.schema();
-    let schema = if overrides.is_empty() {
-        schema
+    let overrides_by_column = if overrides.is_empty() {
+        None
     } else {
-        apply_overrides(&schema, overrides)?
+        Some(prepare_overrides(&schema, overrides)?)
     };
     let row_count = batch.num_rows();
     let total_cols = batch.num_columns();
@@ -3694,7 +4054,10 @@ fn encode_arrow_batch_into_mode(
         }
         let col_name =
             ColumnName::new(field.name()).map_err(|e| decorate_column(e, field.name()))?;
-        let kind = classify(field, batch.column(idx).as_ref())
+        let ov = overrides_by_column
+            .as_ref()
+            .and_then(|by_column| by_column[idx]);
+        let kind = classify_with_override(field, batch.column(idx).as_ref(), ov)
             .map_err(|e| decorate_column(e, field.name()))?;
         classified.push(ClassifiedColumn {
             name: col_name,
@@ -3882,15 +4245,16 @@ fn estimate_frame_size(
             | ColumnKind::Date64Ms
             | ColumnKind::TimeAsLong(_)
             | ColumnKind::DurationAsLong(_) => 8 * row_count,
-            ColumnKind::Uuid => 16 * row_count,
-            ColumnKind::Long256 => 32 * row_count,
+            ColumnKind::Uuid | ColumnKind::UuidFromVarBinary => 16 * row_count,
+            ColumnKind::Long256 | ColumnKind::Long256FromVarBinary => 32 * row_count,
             ColumnKind::Utf8
             | ColumnKind::LargeUtf8
             | ColumnKind::Utf8View
             | ColumnKind::DictToVarchar { .. } => 4 * (row_count + 1) + 16 * row_count,
-            ColumnKind::Binary | ColumnKind::LargeBinary | ColumnKind::BinaryView => {
-                4 * (row_count + 1) + 16 * row_count
-            }
+            ColumnKind::Binary
+            | ColumnKind::LargeBinary
+            | ColumnKind::BinaryView
+            | ColumnKind::FsbToBinary => 4 * (row_count + 1) + 16 * row_count,
             ColumnKind::SymbolUtf8
             | ColumnKind::SymbolLargeUtf8
             | ColumnKind::SymbolUtf8View
@@ -4370,7 +4734,7 @@ mod tests {
     }
 
     #[test]
-    fn apply_overrides_rejects_type_incompatible_override() {
+    fn prepare_overrides_rejects_type_incompatible_override() {
         // Ipv4/Char on a type `classify` won't honour: previously the override
         // was silently dropped and the column shipped under its default wire
         // type. It must now error.
@@ -4379,11 +4743,11 @@ mod tests {
             DataType::Int64,
             true,
         )]));
-        let err = apply_overrides(&int64_schema, &[ArrowColumnOverride::Ipv4 { column: "c" }])
+        let err = prepare_overrides(&int64_schema, &[ArrowColumnOverride::Ipv4 { column: "c" }])
             .unwrap_err();
         assert!(err.msg().contains("not applicable"), "{}", err.msg());
         assert!(
-            apply_overrides(&int64_schema, &[ArrowColumnOverride::Char { column: "c" }]).is_err()
+            prepare_overrides(&int64_schema, &[ArrowColumnOverride::Char { column: "c" }]).is_err()
         );
 
         // Applicable overrides still pass.
@@ -4392,13 +4756,17 @@ mod tests {
             DataType::UInt32,
             true,
         )]));
-        assert!(apply_overrides(&u32_schema, &[ArrowColumnOverride::Ipv4 { column: "c" }]).is_ok());
+        assert!(
+            prepare_overrides(&u32_schema, &[ArrowColumnOverride::Ipv4 { column: "c" }]).is_ok()
+        );
         let u16_schema: SchemaRef = Arc::new(ArrowSchema::new(vec![Field::new(
             "c",
             DataType::UInt16,
             true,
         )]));
-        assert!(apply_overrides(&u16_schema, &[ArrowColumnOverride::Char { column: "c" }]).is_ok());
+        assert!(
+            prepare_overrides(&u16_schema, &[ArrowColumnOverride::Char { column: "c" }]).is_ok()
+        );
     }
 
     // -----------------------------------------------------------------
@@ -4520,36 +4888,154 @@ mod tests {
     }
 
     #[test]
-    fn uuid_with_arrow_uuid_extension_routes_to_column_uuid() {
+    fn uuid_with_arrow_uuid_extension_swaps_to_wire_order() {
+        // `arrow.uuid` storage is RFC-4122 big-endian; the wire wants
+        // (lo LE, hi LE) — the full 16-byte reversal.
+        // UUID 123e4567-e89b-12d3-a456-426614174000.
+        let canonical: [u8; 16] = [
+            0x12, 0x3e, 0x45, 0x67, 0xe8, 0x9b, 0x12, 0xd3, 0xa4, 0x56, 0x42, 0x66, 0x14, 0x17,
+            0x40, 0x00,
+        ];
         let mut b = FixedSizeBinaryBuilder::new(16);
-        b.append_value([
-            0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E,
-            0x0F, 0x10,
-        ])
-        .unwrap();
+        b.append_value(canonical).unwrap();
         let field = Field::new("id", DataType::FixedSizeBinary(16), true).with_metadata(metadata(
             &[(crate::arrow_metadata::ARROW_EXTENSION_NAME, "arrow.uuid")],
         ));
         let rb = single_col_batch(field, b.finish());
-        assert_ok_with_table_count(&rb, 1);
+        let out = encode(&rb);
+        let (n, ty, body) = decode_single_column(&out);
+        assert_eq!(n, 1);
+        assert_eq!(ty, QWP_TYPE_UUID);
+        let mut wire = canonical;
+        wire.reverse();
+        assert_eq!(decode_uuid_body(body, 1), vec![wire]);
     }
 
     #[test]
-    fn uuid_without_metadata_routes_to_column_uuid() {
+    fn fsb16_without_metadata_routes_to_binary() {
+        // No UUID claim (no `arrow.uuid` label, no `questdb.column_type`)
+        // → opaque bytes → BINARY column, verbatim. Guessing UUID from the
+        // width alone would silently pick a byte order for the user.
+        let raw: [u8; 16] = [
+            0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E,
+            0x0F, 0x10,
+        ];
         let mut b = FixedSizeBinaryBuilder::new(16);
-        b.append_value([0u8; 16]).unwrap();
+        b.append_value(raw).unwrap();
         let field = Field::new("id", DataType::FixedSizeBinary(16), true);
         let rb = single_col_batch(field, b.finish());
-        assert_ok_with_table_count(&rb, 1);
+        let out = encode(&rb);
+        let (n, ty, body) = decode_single_column(&out);
+        assert_eq!(n, 1);
+        assert_eq!(ty, QWP_TYPE_BINARY);
+        assert_eq!(decode_binary_body(body, 1), vec![Some(raw.to_vec())]);
     }
 
     #[test]
-    fn long256_routes_to_column_long256() {
+    fn fsb_without_metadata_with_null_emits_binary_bitmap() {
+        let mut b = FixedSizeBinaryBuilder::new(4);
+        b.append_value([0x11, 0x12, 0x13, 0x14]).unwrap();
+        b.append_null();
+        b.append_value([0x21, 0x22, 0x23, 0x24]).unwrap();
+        let field = Field::new("data", DataType::FixedSizeBinary(4), true);
+        let rb = single_col_batch(field, b.finish());
+        let out = encode(&rb);
+        let (rows, ty, body) = decode_single_column(&out);
+        assert_eq!(rows, 3);
+        assert_eq!(ty, QWP_TYPE_BINARY);
+        assert_eq!(body[0], 1, "null-bearing BINARY uses a bitmap");
+        assert_eq!(body[1], 0b010, "row 1 is null");
+        assert_eq!(
+            decode_binary_body(body, rows),
+            vec![
+                Some(vec![0x11, 0x12, 0x13, 0x14]),
+                None,
+                Some(vec![0x21, 0x22, 0x23, 0x24]),
+            ]
+        );
+    }
+
+    #[test]
+    fn fsb16_with_column_type_uuid_routes_to_column_uuid() {
+        // `questdb.column_type=uuid` claims UUID without the `arrow.uuid`
+        // label; bytes are canonical RFC-4122 and swap to wire order.
+        let canonical: [u8; 16] = [
+            0x12, 0x3e, 0x45, 0x67, 0xe8, 0x9b, 0x12, 0xd3, 0xa4, 0x56, 0x42, 0x66, 0x14, 0x17,
+            0x40, 0x00,
+        ];
+        let mut b = FixedSizeBinaryBuilder::new(16);
+        b.append_value(canonical).unwrap();
+        let field = Field::new("id", DataType::FixedSizeBinary(16), true)
+            .with_metadata(metadata(&[(crate::arrow_metadata::COLUMN_TYPE, "uuid")]));
+        let rb = single_col_batch(field, b.finish());
+        let out = encode(&rb);
+        let (n, ty, body) = decode_single_column(&out);
+        assert_eq!(n, 1);
+        assert_eq!(ty, QWP_TYPE_UUID);
+        let mut wire = canonical;
+        wire.reverse();
+        assert_eq!(decode_uuid_body(body, 1), vec![wire]);
+    }
+
+    #[test]
+    fn long256_with_column_type_routes_to_column_long256() {
+        // LONG256 has no Arrow extension; `questdb.column_type=long256`
+        // is the only claim. Bytes are wire order (LE limbs), verbatim.
         let mut b = FixedSizeBinaryBuilder::new(32);
-        b.append_value([0u8; 32]).unwrap();
+        b.append_value([0x5Au8; 32]).unwrap();
+        let field = Field::new("l", DataType::FixedSizeBinary(32), true)
+            .with_metadata(metadata(&[(crate::arrow_metadata::COLUMN_TYPE, "long256")]));
+        let rb = single_col_batch(field, b.finish());
+        let out = encode(&rb);
+        let (n, ty, _body) = decode_single_column(&out);
+        assert_eq!(n, 1);
+        assert_eq!(ty, QWP_TYPE_LONG256);
+    }
+
+    #[test]
+    fn fsb32_without_metadata_routes_to_binary() {
+        let mut b = FixedSizeBinaryBuilder::new(32);
+        b.append_value([0x5Au8; 32]).unwrap();
         let field = Field::new("l", DataType::FixedSizeBinary(32), true);
         let rb = single_col_batch(field, b.finish());
-        assert_ok_with_table_count(&rb, 1);
+        let out = encode(&rb);
+        let (n, ty, body) = decode_single_column(&out);
+        assert_eq!(n, 1);
+        assert_eq!(ty, QWP_TYPE_BINARY);
+        assert_eq!(decode_binary_body(body, 1), vec![Some(vec![0x5Au8; 32])]);
+    }
+
+    #[test]
+    fn arrow_uuid_label_on_wrong_width_rejected() {
+        let mut b = FixedSizeBinaryBuilder::new(8);
+        b.append_value([0u8; 8]).unwrap();
+        let field =
+            Field::new("u", DataType::FixedSizeBinary(8), true).with_metadata(metadata(&[(
+                crate::arrow_metadata::ARROW_EXTENSION_NAME,
+                "arrow.uuid",
+            )]));
+        let rb = single_col_batch(field, b.finish());
+        let err = encode_err(&rb);
+        assert!(
+            err.msg().contains("UUID requires FixedSizeBinary(16)"),
+            "{}",
+            err.msg()
+        );
+    }
+
+    #[test]
+    fn long256_column_type_on_wrong_width_rejected() {
+        let mut b = FixedSizeBinaryBuilder::new(16);
+        b.append_value([0u8; 16]).unwrap();
+        let field = Field::new("l", DataType::FixedSizeBinary(16), true)
+            .with_metadata(metadata(&[(crate::arrow_metadata::COLUMN_TYPE, "long256")]));
+        let rb = single_col_batch(field, b.finish());
+        let err = encode_err(&rb);
+        assert!(
+            err.msg().contains("LONG256 requires FixedSizeBinary(32)"),
+            "{}",
+            err.msg()
+        );
     }
 
     #[test]
@@ -4793,6 +5279,46 @@ mod tests {
                 out.push(Some(
                     String::from_utf8(body[data_start + s..data_start + e].to_vec()).unwrap(),
                 ));
+                k += 1;
+            }
+        }
+        out
+    }
+
+    /// Decode a BINARY column body (same layout as VARCHAR minus the
+    /// UTF-8 requirement): flag + optional bitmap + offsets + data.
+    fn decode_binary_body(body: &[u8], rows: usize) -> Vec<Option<Vec<u8>>> {
+        let use_bitmap = body[0];
+        let mut pos = 1usize;
+        let mut is_null = vec![false; rows];
+        if use_bitmap == 1 {
+            let bitmap_bytes = rows.div_ceil(8);
+            for (i, slot) in is_null.iter_mut().enumerate() {
+                *slot = (body[pos + i / 8] >> (i % 8)) & 1 == 1;
+            }
+            pos += bitmap_bytes;
+        } else {
+            assert_eq!(use_bitmap, 0, "unexpected bitmap flag {use_bitmap}");
+        }
+        let non_null = is_null.iter().filter(|n| !**n).count();
+        let off_start = pos;
+        let read_off = |k: usize| {
+            u32::from_le_bytes(
+                body[off_start + k * 4..off_start + k * 4 + 4]
+                    .try_into()
+                    .unwrap(),
+            ) as usize
+        };
+        let data_start = off_start + (non_null + 1) * 4;
+        let mut out = Vec::with_capacity(rows);
+        let mut k = 0usize;
+        for &null in &is_null {
+            if null {
+                out.push(None);
+            } else {
+                let s = read_off(k);
+                let e = read_off(k + 1);
+                out.push(Some(body[data_start + s..data_start + e].to_vec()));
                 k += 1;
             }
         }
@@ -5963,13 +6489,17 @@ mod tests {
     }
 
     #[test]
-    fn fixed_size_binary_arbitrary_width_rejected_as_unsupported() {
+    fn fixed_size_binary_arbitrary_width_routes_to_binary() {
+        // Any unlabeled FixedSizeBinary width is opaque bytes → BINARY.
         let mut b = FixedSizeBinaryBuilder::new(8);
-        b.append_value([0u8; 8]).unwrap();
-        assert_unsupported_column_with(
-            Field::new("c", DataType::FixedSizeBinary(8), true),
-            Arc::new(b.finish()) as ArrayRef,
-        );
+        b.append_value([0xA5u8; 8]).unwrap();
+        let field = Field::new("c", DataType::FixedSizeBinary(8), true);
+        let rb = single_col_batch(field, b.finish());
+        let out = encode(&rb);
+        let (n, ty, body) = decode_single_column(&out);
+        assert_eq!(n, 1);
+        assert_eq!(ty, QWP_TYPE_BINARY);
+        assert_eq!(decode_binary_body(body, 1), vec![Some(vec![0xA5u8; 8])]);
     }
 
     #[test]
@@ -6510,12 +7040,11 @@ mod tests {
     }
 
     #[test]
-    fn sliced_uuid_array_emits_sliced_window_only() {
-        // FixedSizeBinary(16) → UUID. Note arrow-rs normalises a sliced
-        // FixedSizeBinaryArray to `offset() == 0` with a pre-windowed
-        // `value_data()`, so the `a.offset() * elem` multiply stays 0
-        // here; this guards the value-copy producing the correct window
-        // (a regression copying the wrong byte range is caught).
+    fn sliced_fsb_array_emits_sliced_window_only() {
+        // Unlabeled FixedSizeBinary(16) → BINARY. The per-row `value(row)`
+        // copy must stay inside the slice: arrow-rs normalises a sliced
+        // FixedSizeBinaryArray to `offset() == 0` and trims `value_data()`
+        // to match, so copying the wrong byte range would show up here.
         let mut b = FixedSizeBinaryBuilder::new(16);
         let rows: [[u8; 16]; 4] = [[0x00; 16], [0x11; 16], [0x22; 16], [0x33; 16]];
         for r in &rows {
@@ -6530,8 +7059,75 @@ mod tests {
         let out = encode(&rb);
         let (n, ty, body) = decode_single_column(&out);
         assert_eq!(n, 2);
+        assert_eq!(ty, QWP_TYPE_BINARY);
+        assert_eq!(
+            decode_binary_body(body, n),
+            vec![Some(vec![0x11u8; 16]), Some(vec![0x22u8; 16])]
+        );
+    }
+
+    #[test]
+    fn sliced_arrow_uuid_array_swaps_sliced_window_only() {
+        // The big-endian swap path goes through `arr.value(row)`, which
+        // must stay inside the slice.
+        let rows: [[u8; 16]; 4] = [
+            core::array::from_fn(|i| i as u8),
+            core::array::from_fn(|i| 0x10 + i as u8),
+            core::array::from_fn(|i| 0x20 + i as u8),
+            core::array::from_fn(|i| 0x30 + i as u8),
+        ];
+        let mut b = FixedSizeBinaryBuilder::new(16);
+        for r in &rows {
+            b.append_value(r).unwrap();
+        }
+        let sliced = b.finish().slice(1, 2);
+        let field = Field::new("id", DataType::FixedSizeBinary(16), false).with_metadata(metadata(
+            &[(crate::arrow_metadata::ARROW_EXTENSION_NAME, "arrow.uuid")],
+        ));
+        let rb = single_col_batch(field, sliced);
+        let out = encode(&rb);
+        let (n, ty, body) = decode_single_column(&out);
+        assert_eq!(n, 2);
         assert_eq!(ty, QWP_TYPE_UUID);
-        assert_eq!(decode_uuid_body(body, n), vec![[0x11u8; 16], [0x22u8; 16]]);
+        let expect: Vec<[u8; 16]> = rows[1..3]
+            .iter()
+            .map(|r| {
+                let mut v = *r;
+                v.reverse();
+                v
+            })
+            .collect();
+        assert_eq!(decode_uuid_body(body, n), expect);
+    }
+
+    #[test]
+    fn arrow_uuid_with_nulls_swaps_non_null_values() {
+        let mut b = FixedSizeBinaryBuilder::new(16);
+        let v0: [u8; 16] = core::array::from_fn(|i| i as u8);
+        let v2: [u8; 16] = core::array::from_fn(|i| 0x40 + i as u8);
+        b.append_value(v0).unwrap();
+        b.append_null();
+        b.append_value(v2).unwrap();
+        let field = Field::new("id", DataType::FixedSizeBinary(16), true).with_metadata(metadata(
+            &[(crate::arrow_metadata::ARROW_EXTENSION_NAME, "arrow.uuid")],
+        ));
+        let rb = single_col_batch(field, b.finish());
+        let out = encode(&rb);
+        let (n, ty, body) = decode_single_column(&out);
+        assert_eq!(n, 3);
+        assert_eq!(ty, QWP_TYPE_UUID);
+        // Bitmap body: flag(1) + ceil(3/8)=1 bitmap byte (1 = null) +
+        // non-null values only, each reversed.
+        assert_eq!(body[0], 1, "UUID column containing nulls carries a bitmap");
+        assert_eq!(body[1], 0b010, "row 1 null");
+        let vals = &body[2..];
+        assert_eq!(vals.len(), 32);
+        let mut e0 = v0;
+        e0.reverse();
+        let mut e2 = v2;
+        e2.reverse();
+        assert_eq!(&vals[..16], e0);
+        assert_eq!(&vals[16..], e2);
     }
 
     // -----------------------------------------------------------------
@@ -6913,13 +7509,430 @@ mod tests {
     }
 
     #[test]
+    fn flush_arrow_batch_overrides_uuid_on_fsb16() {
+        // No `arrow.uuid` label and no `questdb.column_type` metadata —
+        // the override is the only UUID claim (the Polars path). Bytes are
+        // canonical RFC-4122 and swap to wire order, exactly as a labeled
+        // column would.
+        let canonical: [u8; 16] = [
+            0x12, 0x3e, 0x45, 0x67, 0xe8, 0x9b, 0x12, 0xd3, 0xa4, 0x56, 0x42, 0x66, 0x14, 0x17,
+            0x40, 0x00,
+        ];
+        let mut b = FixedSizeBinaryBuilder::new(16);
+        b.append_value(canonical).unwrap();
+        let rb = single_col_batch(
+            Field::new("u", DataType::FixedSizeBinary(16), true),
+            b.finish(),
+        );
+        let (out, _dict) =
+            encode_with_overrides(&rb, &[ArrowColumnOverride::Uuid { column: "u" }]).unwrap();
+        let (n, ty, body) = decode_single_column(&out);
+        assert_eq!(n, 1);
+        assert_eq!(ty, QWP_TYPE_UUID);
+        let mut wire = canonical;
+        wire.reverse();
+        assert_eq!(decode_uuid_body(body, 1), vec![wire]);
+    }
+
+    #[test]
+    fn flush_arrow_batch_overrides_long256_on_fsb32() {
+        // The runtime override outranks out-of-date metadata: a stray UUID
+        // extension must not turn this FSB32 into a UUID column.
+        let mut b = FixedSizeBinaryBuilder::new(32);
+        let value: [u8; 32] = core::array::from_fn(|i| i as u8);
+        b.append_value(value).unwrap();
+        let rb = single_col_batch(
+            Field::new("l", DataType::FixedSizeBinary(32), true).with_metadata(metadata(&[(
+                crate::arrow_metadata::ARROW_EXTENSION_NAME,
+                "arrow.uuid",
+            )])),
+            b.finish(),
+        );
+        let (out, _dict) =
+            encode_with_overrides(&rb, &[ArrowColumnOverride::Long256 { column: "l" }]).unwrap();
+        let (n, ty, body) = decode_single_column(&out);
+        assert_eq!(n, 1);
+        assert_eq!(ty, QWP_TYPE_LONG256);
+        assert_eq!(body[0], 0, "non-null LONG256 omits the bitmap");
+        assert_eq!(&body[1..], value.as_slice());
+    }
+
+    #[test]
+    fn flush_arrow_batch_overrides_uuid_wrong_width_rejected() {
+        let mut b = FixedSizeBinaryBuilder::new(8);
+        b.append_value([0u8; 8]).unwrap();
+        let rb = single_col_batch(
+            Field::new("u", DataType::FixedSizeBinary(8), true),
+            b.finish(),
+        );
+        let err = encode_with_overrides_err(&rb, &[ArrowColumnOverride::Uuid { column: "u" }]);
+        assert_eq!(err.code(), ErrorCode::ArrowIngest);
+        assert!(
+            err.msg().contains("'uuid' is not applicable"),
+            "unexpected error: {}",
+            err.msg()
+        );
+    }
+
+    #[test]
+    fn flush_arrow_batch_overrides_long256_wrong_width_rejected() {
+        let mut b = FixedSizeBinaryBuilder::new(16);
+        b.append_value([0u8; 16]).unwrap();
+        let rb = single_col_batch(
+            Field::new("l", DataType::FixedSizeBinary(16), true),
+            b.finish(),
+        );
+        let err = encode_with_overrides_err(&rb, &[ArrowColumnOverride::Long256 { column: "l" }]);
+        assert_eq!(err.code(), ErrorCode::ArrowIngest);
+        assert!(
+            err.msg().contains("'long256' is not applicable"),
+            "unexpected error: {}",
+            err.msg()
+        );
+    }
+
+    #[test]
+    fn flush_arrow_batch_overrides_uuid_on_binary_view() {
+        // This is the case Polars needs: Polars has no fixed-size binary
+        // dtype, so its Binary columns export as `BinaryView`. The UUID
+        // override must accept that type and swap canonical bytes to wire
+        // order exactly like the FixedSizeBinary path.
+        use arrow::array::builder::BinaryViewBuilder;
+        let canonical: [u8; 16] = [
+            0x12, 0x3e, 0x45, 0x67, 0xe8, 0x9b, 0x12, 0xd3, 0xa4, 0x56, 0x42, 0x66, 0x14, 0x17,
+            0x40, 0x00,
+        ];
+        let mut b = BinaryViewBuilder::new();
+        b.append_value(canonical);
+        let rb = single_col_batch(Field::new("u", DataType::BinaryView, true), b.finish());
+        let (out, _dict) =
+            encode_with_overrides(&rb, &[ArrowColumnOverride::Uuid { column: "u" }]).unwrap();
+        let (n, ty, body) = decode_single_column(&out);
+        assert_eq!(n, 1);
+        assert_eq!(ty, QWP_TYPE_UUID);
+        let mut wire = canonical;
+        wire.reverse();
+        assert_eq!(decode_uuid_body(body, 1), vec![wire]);
+    }
+
+    #[test]
+    fn flush_arrow_batch_overrides_uuid_on_binary_with_nulls() {
+        let rows: [[u8; 16]; 2] = [
+            core::array::from_fn(|i| i as u8),
+            core::array::from_fn(|i| 0x40 + i as u8),
+        ];
+        let mut b = BinaryBuilder::new();
+        b.append_value(rows[0]);
+        b.append_null();
+        b.append_value(rows[1]);
+        let rb = single_col_batch(Field::new("u", DataType::Binary, true), b.finish());
+        let (out, _dict) =
+            encode_with_overrides(&rb, &[ArrowColumnOverride::Uuid { column: "u" }]).unwrap();
+        let (n, ty, body) = decode_single_column(&out);
+        assert_eq!(n, 3);
+        assert_eq!(ty, QWP_TYPE_UUID);
+        assert_eq!(body[0], 1, "null-bearing UUID column uses a bitmap");
+        assert_eq!(body[1], 0b010, "row 1 is null");
+        // Dense non-null values follow the bitmap, each byte-reversed.
+        let mut expected: Vec<u8> = Vec::new();
+        expected.extend(rows[0].iter().rev());
+        expected.extend(rows[1].iter().rev());
+        assert_eq!(&body[2..], expected.as_slice());
+    }
+
+    #[test]
+    fn flush_arrow_batch_overrides_uuid_wrong_value_length_rejected() {
+        let mut b = BinaryBuilder::new();
+        b.append_value([0u8; 16]);
+        b.append_value([0u8; 8]);
+        let rb = single_col_batch(Field::new("u", DataType::Binary, true), b.finish());
+        let err = encode_with_overrides_err(&rb, &[ArrowColumnOverride::Uuid { column: "u" }]);
+        assert_eq!(err.code(), ErrorCode::ArrowIngest);
+        assert!(
+            err.msg()
+                .contains("claim requires exactly 16-byte values, got 8 bytes at row 1"),
+            "unexpected error: {}",
+            err.msg()
+        );
+    }
+
+    #[test]
+    fn flush_arrow_batch_overrides_long256_on_large_binary() {
+        use arrow::array::builder::LargeBinaryBuilder;
+        let rows: [[u8; 32]; 2] = [
+            core::array::from_fn(|i| i as u8),
+            core::array::from_fn(|i| 0x80 + i as u8),
+        ];
+        let mut b = LargeBinaryBuilder::new();
+        b.append_value(rows[0]);
+        b.append_null();
+        b.append_value(rows[1]);
+        let rb = single_col_batch(
+            Field::new("l", DataType::LargeBinary, true).with_metadata(metadata(&[(
+                crate::arrow_metadata::ARROW_EXTENSION_NAME,
+                "arrow.uuid",
+            )])),
+            b.finish(),
+        );
+        let (out, _dict) =
+            encode_with_overrides(&rb, &[ArrowColumnOverride::Long256 { column: "l" }]).unwrap();
+        let (n, ty, body) = decode_single_column(&out);
+        assert_eq!(n, 3);
+        assert_eq!(ty, QWP_TYPE_LONG256);
+        assert_eq!(body[0], 1, "null-bearing LONG256 column uses a bitmap");
+        assert_eq!(body[1], 0b010, "row 1 is null");
+        // Dense non-null values follow the bitmap as verbatim LE limbs.
+        let expected: Vec<u8> = rows.into_iter().flatten().collect();
+        assert_eq!(&body[2..], expected.as_slice());
+    }
+
+    #[test]
+    fn binary_with_column_type_uuid_metadata_routes_to_uuid() {
+        // Field metadata that is consistent with the column's type is a
+        // valid claim on its own, with no runtime override involved.
+        let canonical: [u8; 16] = [
+            0x12, 0x3e, 0x45, 0x67, 0xe8, 0x9b, 0x12, 0xd3, 0xa4, 0x56, 0x42, 0x66, 0x14, 0x17,
+            0x40, 0x00,
+        ];
+        let mut b = BinaryBuilder::new();
+        b.append_value(canonical);
+        let field = Field::new("u", DataType::Binary, true)
+            .with_metadata(metadata(&[(crate::arrow_metadata::COLUMN_TYPE, "uuid")]));
+        let rb = single_col_batch(field, b.finish());
+        let out = encode(&rb);
+        let (n, ty, body) = decode_single_column(&out);
+        assert_eq!(n, 1);
+        assert_eq!(ty, QWP_TYPE_UUID);
+        let mut wire = canonical;
+        wire.reverse();
+        assert_eq!(decode_uuid_body(body, 1), vec![wire]);
+    }
+
+    #[test]
+    fn arrow_uuid_extension_on_var_binary_rejected() {
+        // The canonical `arrow.uuid` extension fixes its storage type to
+        // FixedSizeBinary(16), so putting that label on variable-width
+        // binary storage is a malformed schema. Reject it rather than
+        // byte-reverse the values. (`BinaryView` is what Polars produces.)
+        use arrow::array::builder::BinaryViewBuilder;
+        let mut b = BinaryViewBuilder::new();
+        b.append_value([0u8; 16]);
+        let field = Field::new("u", DataType::BinaryView, true).with_metadata(metadata(&[(
+            crate::arrow_metadata::ARROW_EXTENSION_NAME,
+            "arrow.uuid",
+        )]));
+        let rb = single_col_batch(field, b.finish());
+        let err = encode_err(&rb);
+        assert_eq!(err.code(), ErrorCode::ArrowIngest);
+        assert!(
+            err.msg()
+                .contains("`arrow.uuid` extension requires FixedSizeBinary(16) storage"),
+            "unexpected error: {}",
+            err.msg()
+        );
+    }
+
+    #[test]
+    fn column_type_uuid_with_arrow_uuid_ext_on_var_binary_is_rejected() {
+        // Nothing says which of two metadata entries wins. The extension
+        // requires FSB16 storage, so this schema contradicts itself and is
+        // rejected.
+        let canonical: [u8; 16] = [
+            0x12, 0x3e, 0x45, 0x67, 0xe8, 0x9b, 0x12, 0xd3, 0xa4, 0x56, 0x42, 0x66, 0x14, 0x17,
+            0x40, 0x00,
+        ];
+        let mut b = BinaryBuilder::new();
+        b.append_value(canonical);
+        let field = Field::new("u", DataType::Binary, true).with_metadata(metadata(&[
+            (crate::arrow_metadata::COLUMN_TYPE, "uuid"),
+            (crate::arrow_metadata::ARROW_EXTENSION_NAME, "arrow.uuid"),
+        ]));
+        let rb = single_col_batch(field, b.finish());
+        let err = encode_err(&rb);
+        assert_eq!(err.code(), ErrorCode::ArrowIngest);
+        assert!(
+            err.msg()
+                .contains("`arrow.uuid` extension requires FixedSizeBinary(16) storage"),
+            "unexpected error: {}",
+            err.msg()
+        );
+    }
+
+    #[test]
+    fn contradictory_long256_and_arrow_uuid_metadata_is_rejected_for_binary_storage() {
+        let nulls = arrow::array::NullArray::new(0);
+        for dtype in [
+            DataType::Binary,
+            DataType::LargeBinary,
+            DataType::BinaryView,
+            DataType::FixedSizeBinary(16),
+            DataType::FixedSizeBinary(32),
+        ] {
+            let field = Field::new("v", dtype.clone(), true).with_metadata(metadata(&[
+                (crate::arrow_metadata::COLUMN_TYPE, "long256"),
+                (crate::arrow_metadata::ARROW_EXTENSION_NAME, "arrow.uuid"),
+            ]));
+            let err = classify(&field, &nulls).unwrap_err();
+            assert_eq!(err.code(), ErrorCode::ArrowIngest);
+            assert!(
+                err.msg().contains("contradictory binary type metadata"),
+                "unexpected error for {dtype:?}: {}",
+                err.msg()
+            );
+        }
+    }
+
+    #[test]
+    fn consistent_uuid_metadata_on_fsb16_is_accepted() {
+        let field =
+            Field::new("u", DataType::FixedSizeBinary(16), true).with_metadata(metadata(&[
+                (crate::arrow_metadata::COLUMN_TYPE, "uuid"),
+                (crate::arrow_metadata::ARROW_EXTENSION_NAME, "arrow.uuid"),
+            ]));
+        let nulls = arrow::array::NullArray::new(0);
+        assert!(matches!(
+            classify(&field, &nulls).unwrap(),
+            ColumnKind::Uuid
+        ));
+    }
+
+    #[test]
+    fn contradictory_symbol_metadata_is_rejected() {
+        let field = Field::new("s", DataType::Utf8, true).with_metadata(metadata(&[
+            (crate::arrow_metadata::COLUMN_TYPE, "symbol"),
+            (crate::arrow_metadata::SYMBOL, "false"),
+        ]));
+        let nulls = arrow::array::NullArray::new(0);
+        let err = classify(&field, &nulls).unwrap_err();
+        assert!(
+            err.msg().contains("column_type='symbol'")
+                && err.msg().contains("questdb.symbol=false"),
+            "unexpected error: {}",
+            err.msg()
+        );
+    }
+
+    #[test]
+    fn malformed_symbol_metadata_is_rejected_for_plain_and_dictionary_storage() {
+        let invalid = metadata(&[(crate::arrow_metadata::SYMBOL, "tru")]);
+
+        let mut plain = StringBuilder::new();
+        plain.append_value("AAPL");
+        let plain_rb = single_col_batch(
+            Field::new("s", DataType::Utf8, false).with_metadata(invalid.clone()),
+            plain.finish(),
+        );
+        let plain_err = encode_err(&plain_rb);
+        assert_eq!(plain_err.code(), ErrorCode::ArrowIngest);
+        assert!(
+            plain_err
+                .msg()
+                .contains("invalid 'questdb.symbol' metadata 'tru'"),
+            "unexpected error: {}",
+            plain_err.msg()
+        );
+
+        let mut dict = StringDictionaryBuilder::<DictU32>::new();
+        dict.append("AAPL").unwrap();
+        let dict_rb = single_col_batch(
+            Field::new(
+                "s",
+                DataType::Dictionary(Box::new(DataType::UInt32), Box::new(DataType::Utf8)),
+                false,
+            )
+            .with_metadata(invalid),
+            dict.finish(),
+        );
+        let dict_err = encode_err(&dict_rb);
+        assert_eq!(dict_err.code(), ErrorCode::ArrowIngest);
+        assert!(
+            dict_err
+                .msg()
+                .contains("invalid 'questdb.symbol' metadata 'tru'"),
+            "unexpected error: {}",
+            dict_err.msg()
+        );
+    }
+
+    #[test]
+    fn geohash_column_type_requires_valid_bits_for_every_signed_width() {
+        let nulls = arrow::array::NullArray::new(0);
+        for dtype in [
+            DataType::Int8,
+            DataType::Int16,
+            DataType::Int32,
+            DataType::Int64,
+        ] {
+            for bits in [None, Some("not-a-number")] {
+                let pairs = match bits {
+                    Some(bits) => vec![
+                        (crate::arrow_metadata::COLUMN_TYPE, "geohash"),
+                        (crate::arrow_metadata::GEOHASH_BITS, bits),
+                    ],
+                    None => vec![(crate::arrow_metadata::COLUMN_TYPE, "geohash")],
+                };
+                let field = Field::new("g", dtype.clone(), true).with_metadata(metadata(&pairs));
+                let err = classify(&field, &nulls).unwrap_err();
+                assert_eq!(err.code(), ErrorCode::ArrowIngest);
+                assert!(
+                    err.msg().contains("geohash_bits"),
+                    "unexpected error for {dtype:?}: {}",
+                    err.msg()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn known_metadata_claims_on_incompatible_arrow_types_are_rejected() {
+        let nulls = arrow::array::NullArray::new(0);
+        let cases = [
+            (
+                DataType::Int64,
+                vec![(crate::arrow_metadata::COLUMN_TYPE, "uuid")],
+                "column_type='uuid'",
+            ),
+            (
+                DataType::Utf8,
+                vec![(crate::arrow_metadata::COLUMN_TYPE, "long256")],
+                "column_type='long256'",
+            ),
+            (
+                DataType::Int64,
+                vec![(crate::arrow_metadata::ARROW_EXTENSION_NAME, "arrow.uuid")],
+                "requires FixedSizeBinary(16)",
+            ),
+            (
+                DataType::Int32,
+                vec![(crate::arrow_metadata::SYMBOL, "true")],
+                "questdb.symbol",
+            ),
+            (
+                DataType::Float64,
+                vec![(crate::arrow_metadata::GEOHASH_BITS, "12")],
+                "requires a signed Int8/16/32/64",
+            ),
+        ];
+        for (dtype, pairs, expected) in cases {
+            let field = Field::new("v", dtype.clone(), true).with_metadata(metadata(&pairs));
+            let err = classify(&field, &nulls).unwrap_err();
+            assert_eq!(err.code(), ErrorCode::ArrowIngest);
+            assert!(
+                err.msg().contains(expected),
+                "unexpected error for {dtype:?}: {}",
+                err.msg()
+            );
+        }
+    }
+
+    #[test]
     fn flush_arrow_batch_overrides_unknown_column_rejected() {
         let mut b = Int64Builder::new();
         b.append_value(1);
         let rb = single_col_batch(Field::new("c", DataType::Int64, false), b.finish());
         let err =
             encode_with_overrides_err(&rb, &[ArrowColumnOverride::Symbol { column: "missing" }]);
-        assert_eq!(err.code(), ErrorCode::ArrowIngest);
+        assert_eq!(err.code(), ErrorCode::InvalidApiCall);
         assert!(
             err.msg()
                 .contains("override targets unknown column 'missing'"),
@@ -6940,7 +7953,7 @@ mod tests {
                 ArrowColumnOverride::Symbol { column: "s" },
             ],
         );
-        assert_eq!(err.code(), ErrorCode::ArrowIngest);
+        assert_eq!(err.code(), ErrorCode::InvalidApiCall);
         assert!(
             err.msg()
                 .contains("duplicate arrow override for column 's'"),
@@ -6961,7 +7974,7 @@ mod tests {
                 bits: 0,
             }],
         );
-        assert_eq!(err_zero.code(), ErrorCode::ArrowIngest);
+        assert_eq!(err_zero.code(), ErrorCode::InvalidApiCall);
         assert!(
             err_zero.msg().contains("invalid geohash bits 0"),
             "unexpected error: {}",
@@ -6974,7 +7987,7 @@ mod tests {
                 bits: 61,
             }],
         );
-        assert_eq!(err_over.code(), ErrorCode::ArrowIngest);
+        assert_eq!(err_over.code(), ErrorCode::InvalidApiCall);
         assert!(
             err_over.msg().contains("invalid geohash bits 61"),
             "unexpected error: {}",
@@ -6983,45 +7996,40 @@ mod tests {
     }
 
     #[test]
-    fn flush_arrow_batch_overrides_preserves_existing_metadata() {
-        let mut b = Int64Builder::new();
-        b.append_value(1);
-        let mut sb = StringBuilder::new();
-        sb.append_value("AAPL");
-        let id_md = metadata(&[(crate::arrow_metadata::ARROW_EXTENSION_NAME, "arrow.uuid")]);
-        let id_field = Field::new("id", DataType::Int64, true).with_metadata(id_md);
-        let sym_field = Field::new("sym", DataType::Utf8, false);
-        let schema = Arc::new(ArrowSchema::new(vec![id_field, sym_field]));
-        let rb = RecordBatch::try_new(
-            schema.clone(),
-            vec![
-                Arc::new(b.finish()) as ArrayRef,
-                Arc::new(sb.finish()) as ArrayRef,
-            ],
+    fn runtime_geohash_override_wins_over_stale_column_type() {
+        let mut b = Int32Builder::new();
+        b.append_value(7);
+        let field = Field::new("g", DataType::Int32, false)
+            .with_metadata(metadata(&[(crate::arrow_metadata::COLUMN_TYPE, "int")]));
+        let rb = single_col_batch(field, b.finish());
+        let (out, _dict) = encode_with_overrides(
+            &rb,
+            &[ArrowColumnOverride::Geohash {
+                column: "g",
+                bits: 12,
+            }],
         )
         .unwrap();
-        let patched =
-            apply_overrides(&schema, &[ArrowColumnOverride::Symbol { column: "sym" }]).unwrap();
-        let id_after = patched.field(0);
-        assert_eq!(
-            id_after
-                .metadata()
-                .get(crate::arrow_metadata::ARROW_EXTENSION_NAME)
-                .map(String::as_str),
-            Some("arrow.uuid"),
-            "unrelated extension metadata stripped: {:?}",
-            id_after.metadata()
-        );
-        let sym_after = patched.field(1);
-        assert_eq!(
-            sym_after
-                .metadata()
-                .get(crate::arrow_metadata::SYMBOL)
-                .map(String::as_str),
-            Some("true")
-        );
-        let (_out, _dict) =
-            encode_with_overrides(&rb, &[ArrowColumnOverride::Symbol { column: "sym" }]).unwrap();
+        let (_rows, ty, body) = decode_single_column(&out);
+        assert_eq!(ty, QWP_TYPE_GEOHASH);
+        assert_eq!(body[0], 0, "non-null GEOHASH omits the bitmap");
+        assert_eq!(body[1], 12, "override precision is carried in the body");
+    }
+
+    #[test]
+    fn runtime_not_symbol_override_wins_over_stale_symbol_metadata() {
+        let mut sb = StringBuilder::new();
+        sb.append_value("AAPL");
+        let field = Field::new("sym", DataType::Utf8, false).with_metadata(metadata(&[
+            (crate::arrow_metadata::COLUMN_TYPE, "symbol"),
+            (crate::arrow_metadata::SYMBOL, "true"),
+        ]));
+        let rb = single_col_batch(field, sb.finish());
+        let (out, _dict) =
+            encode_with_overrides(&rb, &[ArrowColumnOverride::NotSymbol { column: "sym" }])
+                .unwrap();
+        let (_rows, ty, _body) = decode_single_column(&out);
+        assert_eq!(ty, QWP_TYPE_VARCHAR);
     }
 
     #[test]
