@@ -7,15 +7,23 @@ static void oidc_event(void* user_data, const questdb_oidc_event* event)
     (void)user_data;
     if (event->kind == QUESTDB_OIDC_EVENT_PROMPT)
     {
+        unsigned long long interval_seconds = 0;
+        if (event->struct_size >=
+            offsetof(questdb_oidc_event, interval_seconds) +
+                sizeof(event->interval_seconds))
+            interval_seconds = (unsigned long long)event->interval_seconds;
         /* Prompt fields are display-sanitized. Only browser_target is vetted
          * for opening or turning into a clickable link. */
         fprintf(
             stderr,
-            "Open %.*s and enter code %.*s\n",
+            "Open %.*s and enter code %.*s (valid for %.0f seconds; polling "
+            "every %llu seconds)\n",
             (int)event->verification_uri_len,
             event->verification_uri,
             (int)event->user_code_len,
-            event->user_code);
+            event->user_code,
+            event->expires_in_seconds,
+            interval_seconds);
     }
 }
 

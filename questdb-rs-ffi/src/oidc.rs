@@ -272,6 +272,7 @@ pub struct questdb_oidc_event {
     pub expires_in_seconds: f64,
     pub browser_target: *const c_char,
     pub browser_target_len: size_t,
+    pub interval_seconds: u64,
 }
 
 pub type questdb_oidc_event_cb =
@@ -372,9 +373,10 @@ impl Renderer for CEventRenderer {
             message: ptr::null(),
             message_len: 0,
             seconds_left: 0.0,
-            expires_in_seconds: 0.0,
+            expires_in_seconds: challenge.expires_in_seconds() as f64,
             browser_target,
             browser_target_len,
+            interval_seconds: challenge.interval_seconds(),
         });
     }
 
@@ -423,6 +425,7 @@ fn empty_event(kind: questdb_oidc_event_kind) -> questdb_oidc_event {
         expires_in_seconds: 0.0,
         browser_target: ptr::null(),
         browser_target_len: 0,
+        interval_seconds: 0,
     }
 }
 
@@ -1392,6 +1395,8 @@ mod tests {
         verification_uri: String,
         verification_uri_complete: String,
         browser_target: String,
+        prompt_expires_in_seconds: f64,
+        prompt_interval_seconds: u64,
         identity: String,
         message: String,
     }
@@ -1422,6 +1427,8 @@ mod tests {
                 };
                 events.browser_target =
                     unsafe { copy_event_text(event.browser_target, event.browser_target_len) };
+                events.prompt_expires_in_seconds = event.expires_in_seconds;
+                events.prompt_interval_seconds = event.interval_seconds;
             }
             questdb_oidc_event_kind::QUESTDB_OIDC_EVENT_SUCCESS => {
                 events.identity = unsafe { copy_event_text(event.identity, event.identity_len) };
@@ -2008,6 +2015,8 @@ mod tests {
             // rather than silently offered for open/QR, and no target is
             // emitted (empty string in the recording).
             assert_eq!(events.browser_target, "");
+            assert_eq!(events.prompt_expires_in_seconds, 600.0);
+            assert_eq!(events.prompt_interval_seconds, 5);
             drop(events);
             questdb_oidc_token_free(token);
             questdb_oidc_auth_free(auth);

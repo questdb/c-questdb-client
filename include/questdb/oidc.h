@@ -52,6 +52,15 @@ typedef enum questdb_oidc_event_kind
  * display only.
  * `browser_target`, when non-NULL, is the sole URL vetted for opening or making
  * clickable (HTTP(S), no userinfo, non-empty ASCII host).
+ *
+ * Event-specific numeric fields:
+ * - PROMPT: `expires_in_seconds` is the bounded device-code lifetime and
+ *   `interval_seconds` is the bounded initial polling interval.
+ * - WAITING: `seconds_left` is the remaining device-code lifetime.
+ * - SUCCESS: `expires_in_seconds` is the token's remaining lifetime.
+ *
+ * `interval_seconds` was appended to this struct. Code that can load an older
+ * shared library should check `struct_size` before reading it.
  */
 typedef struct questdb_oidc_event
 {
@@ -71,6 +80,7 @@ typedef struct questdb_oidc_event
     double expires_in_seconds;
     const char* browser_target;
     size_t browser_target_len;
+    uint64_t interval_seconds;
 } questdb_oidc_event;
 
 /**

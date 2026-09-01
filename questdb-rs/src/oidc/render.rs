@@ -39,17 +39,21 @@ use std::sync::atomic::{AtomicBool, Ordering};
 /// The `device_code` itself is deliberately absent — it is a secret used only in
 /// the poll request, never displayed.
 ///
-/// **These fields are the raw, untrusted IdP response values** (they are *not*
-/// pre-sanitized). The built-in [`TerminalRenderer`] passes them through its
-/// internal text-sanitization and URL-validation helpers at display time; a custom [`Renderer`]
-/// that echoes [`user_code`](Self::user_code) / [`verification_uri`](Self::verification_uri)
-/// to a terminal or DOM MUST sanitize them itself, or it re-opens the ANSI /
-/// bidi / zero-width prompt-spoofing surface.
+/// The text fields are raw, untrusted IdP response values (they are *not*
+/// pre-sanitized); the timing fields are the bounded values used by the polling
+/// loop. The built-in [`TerminalRenderer`] passes text through its internal
+/// sanitization and URL-validation helpers at display time. A custom
+/// [`Renderer`] that echoes [`user_code`](Self::user_code) /
+/// [`verification_uri`](Self::verification_uri) to a terminal or DOM MUST
+/// sanitize them itself, or it re-opens the ANSI / bidi / zero-width
+/// prompt-spoofing surface.
 #[derive(Debug, Clone)]
 pub struct DeviceCodeChallenge {
     pub(crate) user_code: String,
     pub(crate) verification_uri: String,
     pub(crate) verification_uri_complete: Option<String>,
+    pub(crate) expires_in_seconds: u64,
+    pub(crate) interval_seconds: u64,
 }
 
 impl DeviceCodeChallenge {
@@ -74,6 +78,22 @@ impl DeviceCodeChallenge {
     /// `verification_uri_complete`), when the IdP provides one.
     pub fn verification_uri_complete(&self) -> Option<&str> {
         self.verification_uri_complete.as_deref()
+    }
+
+    /// Number of seconds for which the device code remains valid.
+    ///
+    /// This is the bounded value used by the polling loop.
+    pub fn expires_in_seconds(&self) -> u64 {
+        self.expires_in_seconds
+    }
+
+    /// Minimum number of seconds between token-endpoint polls.
+    ///
+    /// This is the bounded initial interval used by the polling loop. It can
+    /// increase later when the identity provider responds with `slow_down` or
+    /// HTTP 429.
+    pub fn interval_seconds(&self) -> u64 {
+        self.interval_seconds
     }
 
     /// The user code rendered as inert, single-line ASCII display text.
@@ -538,6 +558,8 @@ mod tests {
             user_code: "AB\x1b[31m\u{202e}\u{0430}".into(),
             verification_uri: "https://exa\u{0430}mple.com/\nactivate".into(),
             verification_uri_complete: Some("https://idp.example.com/activate?code=ABCD\n".into()),
+            expires_in_seconds: 600,
+            interval_seconds: 5,
         };
 
         assert_eq!(challenge.display_user_code(), "AB[31m\\u{0430}");
@@ -549,6 +571,8 @@ mod tests {
             challenge.display_verification_uri_complete().as_deref(),
             Some("https://idp.example.com/activate?code=ABCD")
         );
+        assert_eq!(challenge.expires_in_seconds(), 600);
+        assert_eq!(challenge.interval_seconds(), 5);
         // The verification_uri host is a non-ASCII confusable, so it is not a
         // vettable browser target. With no trusted host to anchor against, the
         // cross-host `complete` is refused rather than silently opened/QR'd, so
@@ -567,6 +591,8 @@ mod tests {
             user_code: huge.clone(),
             verification_uri: format!("https://idp.example.com/{huge}"),
             verification_uri_complete: Some(format!("https://idp.example.com/c/{huge}")),
+            expires_in_seconds: 600,
+            interval_seconds: 5,
         };
         assert!(challenge.display_user_code().len() < 4_096);
         assert!(challenge.display_verification_uri().len() < 4_096);
@@ -583,6 +609,8 @@ mod tests {
             verification_uri_complete: Some(
                 "https://idp.example.com/activate?user_code=WXYZ".into(),
             ),
+            expires_in_seconds: 600,
+            interval_seconds: 5,
         };
         assert_eq!(
             challenge.browser_target().as_deref(),
@@ -599,6 +627,8 @@ mod tests {
             verification_uri_complete: Some(
                 "https://idp.example.com:443/activate?user_code=WXYZ".into(),
             ),
+            expires_in_seconds: 600,
+            interval_seconds: 5,
         };
         assert_eq!(
             challenge.browser_target().as_deref(),
@@ -624,6 +654,8 @@ mod tests {
                 user_code: "WXYZ".into(),
                 verification_uri: "https://login.questdb.io/device".into(),
                 verification_uri_complete: Some(evil.into()),
+                expires_in_seconds: 600,
+                interval_seconds: 5,
             };
             assert_eq!(
                 challenge.browser_target().as_deref(),
@@ -643,6 +675,8 @@ mod tests {
             verification_uri_complete: Some(
                 "https://idp.example.com/activate?user_code=WXYZ".into(),
             ),
+            expires_in_seconds: 600,
+            interval_seconds: 5,
         };
         let shown = format_prompt(&same);
         assert!(shown.contains("or open directly"));
@@ -658,6 +692,8 @@ mod tests {
             verification_uri_complete: Some(
                 "https://login.questdb.io@evil.example/?user_code=WXYZ".into(),
             ),
+            expires_in_seconds: 600,
+            interval_seconds: 5,
         };
         let shown = format_prompt(&cross);
         assert!(

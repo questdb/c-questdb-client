@@ -14,7 +14,10 @@ int main()
                         // Display fields are sanitized. Use
                         // event.browser_target() for a clickable URL.
                         std::cerr << "Open " << event.verification_uri()
-                                  << " and enter " << event.user_code() << '\n';
+                                  << " and enter " << event.user_code()
+                                  << " (valid for " << event.expires_in_seconds()
+                                  << " seconds; polling every "
+                                  << event.interval_seconds() << " seconds)\n";
                 })
                 .build();
 

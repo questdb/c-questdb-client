@@ -90,9 +90,19 @@ public:
     {
         return _event->seconds_left;
     }
+    /** Device-code lifetime on a prompt; token lifetime on success. */
     double expires_in_seconds() const noexcept
     {
         return _event->expires_in_seconds;
+    }
+    /** The prompt's bounded initial polling interval, or zero for other events. */
+    uint64_t interval_seconds() const noexcept
+    {
+        constexpr size_t required_size =
+            offsetof(::questdb_oidc_event, interval_seconds) + sizeof(uint64_t);
+        if (_event->struct_size < required_size)
+            return 0;
+        return _event->interval_seconds;
     }
     /** The only prompt URL vetted for opening or making clickable. */
     std::string_view browser_target() const noexcept

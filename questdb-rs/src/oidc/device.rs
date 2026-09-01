@@ -168,8 +168,6 @@ impl Drop for InteractiveGuard<'_> {
 struct DeviceResponse {
     device_code: String,
     challenge: DeviceCodeChallenge,
-    expires_in: u64,
-    interval: u64,
 }
 
 /// Builds an [`OidcDeviceAuth`], either from QuestDB `/settings` discovery
@@ -1299,17 +1297,19 @@ impl OidcDeviceAuth {
                     .trim()
                     .is_empty();
                 if uc_visible && vu_visible {
+                    let expires_in_seconds = clamp_lifetime(int_field(body, "expires_in"));
+                    let interval_seconds = clamp_interval(
+                        int_field(body, "interval").unwrap_or(self.default_interval as i64),
+                    );
                     return Ok(DeviceResponse {
                         device_code,
                         challenge: DeviceCodeChallenge {
                             user_code,
                             verification_uri,
                             verification_uri_complete: complete,
+                            expires_in_seconds,
+                            interval_seconds,
                         },
-                        expires_in: clamp_lifetime(int_field(body, "expires_in")),
-                        interval: clamp_interval(
-                            int_field(body, "interval").unwrap_or(self.default_interval as i64),
-                        ),
                     });
                 }
             }
@@ -1344,8 +1344,8 @@ impl OidcDeviceAuth {
     }
 
     fn poll_for_token(&self, resp: &DeviceResponse) -> Result<TokenSet> {
-        let mut interval = resp.interval;
-        let deadline = (self.now)() + Duration::from_secs(resp.expires_in);
+        let mut interval = resp.challenge.interval_seconds();
+        let deadline = (self.now)() + Duration::from_secs(resp.challenge.expires_in_seconds());
         let form: Vec<(&str, &str)> = vec![
             ("grant_type", DEVICE_CODE_GRANT),
             ("device_code", resp.device_code.as_str()),
