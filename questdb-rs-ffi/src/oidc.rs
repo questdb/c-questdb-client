@@ -212,7 +212,7 @@ impl SharedOidcAuth {
             return Err(Error::new(
                 ErrorCode::InvalidApiCall,
                 "OIDC authentication cannot be re-entered from its event callback; return from \
-                 the callback before calling sign_in, token, clear, or an attached transport"
+                 the callback before calling sign_in, token, clear, close, or an attached transport"
                     .to_string(),
             ));
         }
@@ -235,6 +235,14 @@ impl SharedOidcAuth {
     fn clear(&self) -> Result<(), Error> {
         self.reject_callback_reentry()?;
         self.inner.try_clear().map_err(Into::into)
+    }
+
+    fn close(&self) -> Result<(), Error> {
+        // close waits for the acquisition critical section to drain. Calling it
+        // from a renderer callback on that same section would self-deadlock.
+        self.reject_callback_reentry()?;
+        self.inner.close();
+        Ok(())
     }
 }
 
@@ -835,6 +843,24 @@ pub unsafe extern "C" fn questdb_oidc_auth_free(auth: *mut questdb_oidc_auth) {
     }
 }
 
+/// Permanently close this shared auth state and cancel interruptible waits.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn questdb_oidc_auth_close(
+    auth: *const questdb_oidc_auth,
+    err_out: *mut *mut questdb_error,
+) -> bool {
+    let Some(auth) = (unsafe { clone_auth(auth, err_out) }) else {
+        return false;
+    };
+    match auth.close() {
+        Ok(()) => true,
+        Err(err) => {
+            unsafe { set_err_out_from_error(err_out, err) };
+            false
+        }
+    }
+}
+
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn questdb_oidc_auth_sign_in(
     auth: *const questdb_oidc_auth,
@@ -1017,6 +1043,7 @@ pub enum questdb_oidc_error_kind {
     QUESTDB_OIDC_ERROR_DEVICE_FLOW = 2,
     QUESTDB_OIDC_ERROR_TIMEOUT = 3,
     QUESTDB_OIDC_ERROR_INTERACTION_REQUIRED = 4,
+    QUESTDB_OIDC_ERROR_CANCELLED = 5,
     QUESTDB_OIDC_ERROR_UNKNOWN = 255,
 }
 
@@ -1046,6 +1073,7 @@ fn error_kind(kind: OidcErrorKind) -> questdb_oidc_error_kind {
         OidcErrorKind::InteractionRequired => {
             questdb_oidc_error_kind::QUESTDB_OIDC_ERROR_INTERACTION_REQUIRED
         }
+        OidcErrorKind::Cancelled => questdb_oidc_error_kind::QUESTDB_OIDC_ERROR_CANCELLED,
         _ => questdb_oidc_error_kind::QUESTDB_OIDC_ERROR_UNKNOWN,
     }
 }
@@ -1134,7 +1162,7 @@ mod tests {
     #[test]
     fn error_kind_maps_every_variant_away_from_unknown() {
         // The binding's `else -> base OidcError` (UNKNOWN=255) branch is reachable
-        // only if a native error carries a kind outside 0..=4. Every real
+        // only if a native error carries a kind outside 0..=5. Every real
         // OidcErrorKind must map to a specific FFI kind, keeping that branch
         // defensive / forward-compat only; a new unmapped variant here would
         // silently degrade the Python typed error to a base OidcError.
@@ -1158,6 +1186,10 @@ mod tests {
             (
                 OidcErrorKind::InteractionRequired,
                 questdb_oidc_error_kind::QUESTDB_OIDC_ERROR_INTERACTION_REQUIRED,
+            ),
+            (
+                OidcErrorKind::Cancelled,
+                questdb_oidc_error_kind::QUESTDB_OIDC_ERROR_CANCELLED,
             ),
         ];
         for (kind, expected) in cases {
@@ -1301,6 +1333,11 @@ mod tests {
             assert!(!error.is_null());
             questdb_error_free(error);
 
+            error = ptr::null_mut();
+            assert!(!questdb_oidc_auth_close(ptr::null(), &mut error));
+            assert!(!error.is_null());
+            questdb_error_free(error);
+
             let mut error = ptr::null_mut();
             assert!(questdb_oidc_auth_token(ptr::null(), &mut error).is_null());
             assert!(!error.is_null());
@@ -1352,6 +1389,41 @@ mod tests {
             let mut view = std::mem::zeroed::<questdb_oidc_error_view>();
             view.struct_size = std::mem::size_of::<questdb_oidc_error_view>();
             assert!(!questdb_error_oidc_get_view(ptr::null(), &mut view));
+        }
+    }
+
+    #[test]
+    fn close_is_shared_idempotent_and_reports_cancelled_use() {
+        unsafe {
+            let builder = explicit_builder();
+            let mut error = ptr::null_mut();
+            let auth = questdb_oidc_builder_build(builder, &mut error);
+            assert!(!auth.is_null());
+            assert!(error.is_null());
+            let clone = questdb_oidc_auth_clone(auth, &mut error);
+            assert!(!clone.is_null());
+
+            assert!(questdb_oidc_auth_close(auth, &mut error));
+            assert!(error.is_null());
+            // A second handle shares the permanent closed signal.
+            let token = questdb_oidc_auth_token(clone, &mut error);
+            assert!(token.is_null());
+            assert!(!error.is_null());
+            let mut view = std::mem::zeroed::<questdb_oidc_error_view>();
+            view.struct_size = std::mem::size_of_val(&view);
+            assert!(questdb_error_oidc_get_view(error, &mut view));
+            assert_eq!(
+                view.kind,
+                questdb_oidc_error_kind::QUESTDB_OIDC_ERROR_CANCELLED
+            );
+            crate::questdb_error_free(error);
+            error = ptr::null_mut();
+
+            assert!(questdb_oidc_auth_close(clone, &mut error));
+            assert!(error.is_null());
+            questdb_oidc_auth_free(clone);
+            questdb_oidc_auth_free(auth);
+            questdb_oidc_builder_free(builder);
         }
     }
 
@@ -1519,6 +1591,10 @@ mod tests {
         error = ptr::null_mut();
         let cleared = unsafe { questdb_oidc_auth_clear(auth, &mut error) };
         unsafe { record_reentrant_result(state, cleared, error) };
+
+        error = ptr::null_mut();
+        let closed = unsafe { questdb_oidc_auth_close(auth, &mut error) };
+        unsafe { record_reentrant_result(state, closed, error) };
     }
 
     unsafe extern "C" fn attempt_reentrant_auth_calls(
@@ -1872,11 +1948,11 @@ mod tests {
             assert!(error.is_null());
             state.auth.store(auth, Ordering::SeqCst);
 
-            // Enter through the same renderer used by the auth. All three
+            // Enter through the same renderer used by the auth. All four
             // calls must fail before attempting to acquire the core mutex.
             CEventRenderer(handler).on_waiting(30.0);
 
-            assert_eq!(state.rejected.load(Ordering::SeqCst), 3);
+            assert_eq!(state.rejected.load(Ordering::SeqCst), 4);
             assert_eq!(state.unexpected.load(Ordering::SeqCst), 0);
             questdb_oidc_auth_free(auth);
             questdb_oidc_builder_free(builder);
@@ -1909,7 +1985,7 @@ mod tests {
             // a real interactive flow.
             CEventRenderer(handler).on_waiting(30.0);
 
-            assert_eq!(state.rejected.load(Ordering::SeqCst), 3);
+            assert_eq!(state.rejected.load(Ordering::SeqCst), 4);
             assert_eq!(state.unexpected.load(Ordering::SeqCst), 0);
             questdb_oidc_auth_free(auth);
             questdb_oidc_builder_free(builder);

@@ -68,6 +68,10 @@ pub enum OidcErrorKind {
     /// when an interactive sign-in was requested from a non-interactive process
     /// (e.g. no TTY or a CI job).
     InteractionRequired,
+
+    /// The authentication provider was closed while an operation was waiting
+    /// for device authorization or token-store coordination.
+    Cancelled,
 }
 
 /// An error raised while acquiring or refreshing an OIDC token.
@@ -134,6 +138,10 @@ impl OidcError {
 
     pub(crate) fn interaction_required(message: impl Into<String>) -> Self {
         Self::new(OidcErrorKind::InteractionRequired, message)
+    }
+
+    pub(crate) fn cancelled(message: impl Into<String>) -> Self {
+        Self::new(OidcErrorKind::Cancelled, message)
     }
 
     /// Attach the untrusted IdP `error` / `error_description` fields (each
@@ -255,7 +263,8 @@ impl From<OidcError> for Error {
             OidcErrorKind::Network => ErrorCode::SocketError,
             OidcErrorKind::DeviceFlow
             | OidcErrorKind::Timeout
-            | OidcErrorKind::InteractionRequired => ErrorCode::AuthError,
+            | OidcErrorKind::InteractionRequired
+            | OidcErrorKind::Cancelled => ErrorCode::AuthError,
         };
         let message = err.to_string();
         Error::new(code, message).with_oidc_error(err)
@@ -274,6 +283,7 @@ mod tests {
             (OidcError::device_flow("x"), ErrorCode::AuthError),
             (OidcError::timeout("x"), ErrorCode::AuthError),
             (OidcError::interaction_required("x"), ErrorCode::AuthError),
+            (OidcError::cancelled("x"), ErrorCode::AuthError),
         ];
         for (oidc_err, expected) in cases {
             let err: Error = oidc_err.into();

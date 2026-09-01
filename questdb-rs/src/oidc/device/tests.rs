@@ -32,6 +32,7 @@ use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::mpsc;
 use std::sync::{Arc, Barrier, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
@@ -229,6 +230,126 @@ fn explicit_auth(mock: &MockServer, groups_in_token: bool) -> OidcDeviceAuth {
 fn sign_in_and_token(auth: &OidcDeviceAuth) -> Result<String> {
     auth.sign_in()?;
     auth.token()
+}
+
+#[test]
+fn close_cancels_device_polling_and_disables_shared_auth() {
+    let (polling_tx, polling_rx) = mpsc::sync_channel(1);
+    let mock = MockServer::start(move |method, path, _body| match (method, path) {
+        ("POST", "/device") => (200, device_response()),
+        ("POST", "/token") => {
+            let _ = polling_tx.try_send(());
+            (400, r#"{"error":"authorization_pending"}"#.to_string())
+        }
+        _ => (404, "{}".to_string()),
+    });
+    // Do not install the test sleep hook: production polling waits on the close
+    // condvar, which must wake rather than wait out the five-second interval.
+    let auth = Arc::new(
+        OidcDeviceAuth::builder()
+            .client_id("questdb")
+            .device_authorization_endpoint(mock.url("/device"))
+            .token_endpoint(mock.url("/token"))
+            .scope("openid")
+            .interactive(true)
+            .open_browser(false)
+            .timeout(Duration::from_secs(5))
+            .build()
+            .expect("build auth"),
+    );
+    let worker_auth = Arc::clone(&auth);
+    let worker = std::thread::spawn(move || worker_auth.sign_in());
+
+    polling_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("sign-in did not reach token polling");
+    let started = Instant::now();
+    auth.close();
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "close waited out the device poll interval"
+    );
+    let error = worker.join().expect("sign-in thread panicked").unwrap_err();
+    assert_eq!(error.kind(), OidcErrorKind::Cancelled);
+    assert!(auth.is_closed());
+    assert_eq!(auth.token().unwrap_err().kind(), OidcErrorKind::Cancelled);
+    assert_eq!(
+        auth.try_clear().unwrap_err().kind(),
+        OidcErrorKind::Cancelled
+    );
+    // Idempotent, including the synchronous drain guarantee.
+    auth.close();
+}
+
+#[test]
+fn close_cancels_file_store_lock_wait() {
+    let dir = TempDir::new().unwrap();
+    let store = FileTokenStore::at(dir.path());
+    let auth = Arc::new(
+        OidcDeviceAuth::builder()
+            .client_id("questdb")
+            .device_authorization_endpoint("https://idp.example/device")
+            .token_endpoint("https://idp.example/token")
+            .scope("openid")
+            .interactive(true)
+            .open_browser(false)
+            .token_store(store.clone())
+            .build()
+            .expect("build auth"),
+    );
+    let key = auth.store_key.as_ref().unwrap().clone();
+    let release = Arc::new(Barrier::new(2));
+    let (locked_tx, locked_rx) = mpsc::sync_channel(1);
+    let holder_release = Arc::clone(&release);
+    let holder = std::thread::spawn(move || {
+        store
+            .in_lock(&key, &mut || {
+                locked_tx.send(()).unwrap();
+                holder_release.wait();
+                Ok(())
+            })
+            .unwrap();
+    });
+    locked_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("holder did not acquire token-store lock");
+
+    let clear_auth = Arc::clone(&auth);
+    let clear = std::thread::spawn(move || clear_auth.try_clear());
+    // Observe clear holding the auth acquisition lock, which means it has
+    // reached (or is about to reach) the externally held store lock.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        match auth.acquire.try_lock() {
+            Err(TryLockError::WouldBlock) => break,
+            Err(TryLockError::Poisoned(_)) => panic!("auth lock was poisoned"),
+            Ok(guard) => {
+                drop(guard);
+                assert!(Instant::now() < deadline, "clear did not acquire auth lock");
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
+    }
+
+    let close_auth = Arc::clone(&auth);
+    let (closed_tx, closed_rx) = mpsc::sync_channel(1);
+    let closer = std::thread::spawn(move || {
+        close_auth.close();
+        closed_tx.send(()).unwrap();
+    });
+    let closed_promptly = closed_rx.recv_timeout(Duration::from_secs(2)).is_ok();
+    // Always unblock the holder so a failed assertion cannot strand the test.
+    release.wait();
+    holder.join().unwrap();
+    closer.join().unwrap();
+    assert!(
+        closed_promptly,
+        "close waited for the held token-store lock"
+    );
+    assert_eq!(
+        clear.join().unwrap().unwrap_err().kind(),
+        OidcErrorKind::Cancelled
+    );
 }
 
 /// Reserve a loopback port with no listener, so connects to it are refused

@@ -208,7 +208,7 @@ struct config_view
 /**
  * Interactive OIDC device-flow sign-in handle.
  *
- * `sign_in()`, `token()`, and `clear()` throw `questdb::oidc::error` on
+ * `sign_in()`, `token()`, `clear()`, and `close()` throw `questdb::oidc::error` on
  * failure. Note that when this same auth state is attached to an ingest sender
  * via `opts::oidc_auth`, a later token-acquisition failure surfaces from
  * `flush()` as a `questdb::ingress::line_sender_error` (with the OIDC detail on
@@ -285,6 +285,17 @@ public:
     void clear() const
     {
         detail::wrapped_call(::questdb_oidc_auth_clear, raw());
+    }
+
+    /**
+     * Permanently close the shared provider and cancel a device-poll or bundled
+     * file-token-store lock wait running on another thread. Every copied handle
+     * and attached transport observes the same closed state. Idempotent. Do not
+     * call from this provider's event callback.
+     */
+    void close() const
+    {
+        detail::wrapped_call(::questdb_oidc_auth_close, raw());
     }
 
     config_view config() const&

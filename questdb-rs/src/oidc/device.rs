@@ -26,7 +26,7 @@
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
-use std::sync::{Arc, Mutex, TryLockError};
+use std::sync::{Arc, Condvar, Mutex, TryLockError};
 use std::time::{Duration, Instant};
 
 use zeroize::{Zeroize, Zeroizing};
@@ -416,6 +416,8 @@ impl OidcDeviceAuthBuilder {
             )
         });
 
+        let custom_sleep = self.sleep.is_some();
+        let sleep = self.sleep.unwrap_or_else(|| Arc::new(std::thread::sleep));
         Ok(OidcDeviceAuth {
             config,
             http,
@@ -426,7 +428,8 @@ impl OidcDeviceAuthBuilder {
             interactive: self.interactive,
             default_interval: self.default_interval,
             acquire_wait_timeout: self.timeout.saturating_mul(ACQUIRE_WAIT_TIMEOUT_MULTIPLE),
-            sleep: self.sleep.unwrap_or_else(|| Arc::new(std::thread::sleep)),
+            sleep,
+            custom_sleep,
             now: self.now.unwrap_or_else(|| Arc::new(Instant::now)),
             tokens: Mutex::new(None),
             acquire: Mutex::new(()),
@@ -434,6 +437,9 @@ impl OidcDeviceAuthBuilder {
             token_store: self.token_store,
             store_key,
             store_state: Mutex::new(StoreState::default()),
+            closed: AtomicBool::new(false),
+            close_wait: Mutex::new(()),
+            close_wake: Condvar::new(),
         })
     }
 }
@@ -461,7 +467,10 @@ impl OidcDeviceAuthBuilder {
 /// callbacks (and the `sleep` hook) run while this lock is held. They must not
 /// re-enter [`sign_in`](Self::sign_in) or [`clear`](Self::clear) on the same
 /// instance because that lock is not re-entrant. Re-entrant `token()` calls fail
-/// instead of deadlocking.
+/// instead of deadlocking. [`close`](Self::close) is thread-safe and wakes
+/// device-poll and bundled file-store lock waits; call it from another thread to
+/// cancel a running operation. It waits for that operation to leave the
+/// acquisition critical section before returning.
 pub struct OidcDeviceAuth {
     config: OidcConfig,
     http: HttpClient,
@@ -472,6 +481,10 @@ pub struct OidcDeviceAuth {
     /// Maximum time token() may wait behind a non-interactive acquisition.
     acquire_wait_timeout: Duration,
     sleep: SleepFn,
+    /// Test hooks drive a synthetic clock and must retain their exact sleep
+    /// callbacks. Production polling uses `close_wake` so close interrupts a
+    /// long RFC 8628 interval immediately.
+    custom_sleep: bool,
     now: NowFn,
     /// The cached token; short critical sections only.
     tokens: Mutex<Option<TokenSet>>,
@@ -486,6 +499,11 @@ pub struct OidcDeviceAuth {
     store_key: Option<TokenStoreKey>,
     /// Persistence bookkeeping, touched only under `acquire`.
     store_state: Mutex<StoreState>,
+    /// Permanent lifecycle/cancellation signal shared by every Arc clone.
+    closed: AtomicBool,
+    /// Condvar used to wake device-poll and acquisition-lock waiters on close.
+    close_wait: Mutex<()>,
+    close_wake: Condvar,
 }
 
 impl std::fmt::Debug for OidcDeviceAuth {
@@ -521,6 +539,33 @@ impl OidcDeviceAuth {
         &self.config
     }
 
+    /// Close this provider and cancel any operation currently waiting for
+    /// device authorization, this instance's acquisition lock, or the bundled
+    /// file token store's coordination locks.
+    ///
+    /// The signal is permanent and shared by every `Arc`/FFI clone and attached
+    /// transport. An HTTP request already in flight is not cancelled at the
+    /// transport layer, so this waits for that bounded request to return. Do not
+    /// call it from a [`Renderer`] callback on this same provider: callbacks run
+    /// inside the acquisition critical section that `close` waits to drain.
+    /// Idempotent.
+    pub fn close(&self) {
+        self.closed.store(true, AtomicOrdering::Release);
+        self.close_wake.notify_all();
+
+        // Match the Java lifecycle: close does not return while token work can
+        // still mutate this instance. The active operation observes `closed`
+        // between blocking steps and releases this lock promptly.
+        let _acq = self.lock_acquire();
+        *self.lock_tokens() = None;
+        self.lock_store_state().set_last_persisted_refresh(None);
+    }
+
+    /// Whether [`close`](Self::close) has permanently disabled this provider.
+    pub fn is_closed(&self) -> bool {
+        self.closed.load(AtomicOrdering::Acquire)
+    }
+
     /// Return a valid token for QuestDB without starting an interactive prompt.
     ///
     /// Returns the `id_token` when the server expects groups encoded in the
@@ -537,6 +582,7 @@ impl OidcDeviceAuth {
     /// than waiting on a human. This makes it safe to use as a synchronous or
     /// background transport token provider.
     pub fn token(&self) -> Result<String> {
+        self.ensure_open()?;
         // HTTP providers call this once per flush. On the overwhelmingly common
         // cache hit, clone only the credential being returned rather than every
         // secret and metadata field in TokenSet.
@@ -557,6 +603,7 @@ impl OidcDeviceAuth {
     /// Call this once up front when sharing the instance across threads, so the
     /// interactive prompt runs on the main thread rather than on a busy worker.
     pub fn sign_in(&self) -> Result<()> {
+        self.ensure_open()?;
         self.obtain_tokens(true).map(|_| ())
     }
 
@@ -583,7 +630,8 @@ impl OidcDeviceAuth {
     /// This only deletes local client credentials; it does **not** revoke access,
     /// ID, or refresh tokens at the identity provider.
     pub fn try_clear(&self) -> Result<()> {
-        let _acq = self.lock_acquire();
+        let _acq = self.acquire_for_operation()?;
+        self.ensure_open()?;
         *self.lock_tokens() = None;
         {
             let mut state = self.lock_store_state();
@@ -595,7 +643,11 @@ impl OidcDeviceAuth {
         if let (Some(store), Some(key)) = (self.token_store.as_ref(), self.store_key.as_ref()) {
             // Delete under the per-identity lock so it serialises against a peer's
             // in-flight save (which writes under the same lock).
-            let outcome = store.in_lock(key, &mut || store.clear(key));
+            let cancelled = || self.is_closed();
+            let outcome = store.in_lock_cancellable(key, &cancelled, &mut || {
+                store.clear_cancellable(key, &cancelled)
+            });
+            self.ensure_open()?;
             if let Err(e) = outcome {
                 clear_error = Some(OidcError::network(format!(
                     "Failed to delete persisted OIDC credentials: {e}"
@@ -668,6 +720,42 @@ impl OidcDeviceAuth {
         tokens.is_valid(now_epoch(), DEFAULT_SKEW_SECONDS) && self.has_required_token(tokens)
     }
 
+    fn ensure_open(&self) -> Result<()> {
+        if self.is_closed() {
+            Err(OidcError::cancelled(
+                "The OIDC authentication provider is closed.",
+            ))
+        } else {
+            Ok(())
+        }
+    }
+
+    /// Wait for a bounded slice, waking immediately when close signals. This
+    /// deliberately uses real monotonic time for lock acquisition. The device
+    /// poll path has a separate wrapper that preserves synthetic test clocks.
+    fn wait_or_cancel(&self, duration: Duration) -> Result<()> {
+        self.ensure_open()?;
+        let guard = self.close_wait.lock().unwrap_or_else(|e| e.into_inner());
+        if self.is_closed() {
+            return self.ensure_open();
+        }
+        match self.close_wake.wait_timeout(guard, duration) {
+            Ok((guard, _)) => drop(guard),
+            Err(error) => drop(error.into_inner().0),
+        }
+        self.ensure_open()
+    }
+
+    fn wait_between_polls(&self, duration: Duration) -> Result<()> {
+        if self.custom_sleep {
+            self.ensure_open()?;
+            (self.sleep)(duration);
+            self.ensure_open()
+        } else {
+            self.wait_or_cancel(duration)
+        }
+    }
+
     // Recover from a poisoned lock rather than propagate the panic: the guarded
     // data (`()` and `Option<TokenSet>`) is always consistent, and a panic in a
     // user-supplied renderer / sleep hook while `acquire` is held must not brick
@@ -676,18 +764,47 @@ impl OidcDeviceAuth {
         self.acquire.lock().unwrap_or_else(|e| e.into_inner())
     }
 
+    /// Cancellable acquisition for lifecycle operations that may otherwise
+    /// wait behind a whole device-code lifetime.
+    fn acquire_for_operation(&self) -> Result<std::sync::MutexGuard<'_, ()>> {
+        loop {
+            self.ensure_open()?;
+            match self.acquire.try_lock() {
+                Ok(guard) => {
+                    self.ensure_open()?;
+                    return Ok(guard);
+                }
+                Err(TryLockError::Poisoned(error)) => {
+                    self.ensure_open()?;
+                    return Ok(error.into_inner());
+                }
+                Err(TryLockError::WouldBlock) => {
+                    self.wait_or_cancel(ACQUIRE_WAIT_POLL_SLICE)?;
+                }
+            }
+        }
+    }
+
     /// Wait briefly behind a peer's cache/store/refresh work, but never behind
     /// the interactive device flow. The short polling slice observes the marker
     /// without requiring the interactive thread to release the acquisition lock.
     fn acquire_for_token(&self) -> Result<std::sync::MutexGuard<'_, ()>> {
+        self.ensure_open()?;
         match self.acquire.try_lock() {
-            Ok(guard) => return Ok(guard),
-            Err(TryLockError::Poisoned(error)) => return Ok(error.into_inner()),
+            Ok(guard) => {
+                self.ensure_open()?;
+                return Ok(guard);
+            }
+            Err(TryLockError::Poisoned(error)) => {
+                self.ensure_open()?;
+                return Ok(error.into_inner());
+            }
             Err(TryLockError::WouldBlock) => {}
         }
 
         let deadline = Instant::now() + self.acquire_wait_timeout;
         loop {
+            self.ensure_open()?;
             if self.interactive_in_progress.load(AtomicOrdering::Acquire) {
                 return Err(OidcError::interaction_required(
                     "An interactive OIDC sign-in is in progress on another thread; no token \
@@ -701,10 +818,16 @@ impl OidcDeviceAuth {
                      token became available in time. Retry shortly.",
                 ));
             }
-            std::thread::sleep(ACQUIRE_WAIT_POLL_SLICE.min(deadline - now));
+            self.wait_or_cancel(ACQUIRE_WAIT_POLL_SLICE.min(deadline - now))?;
             match self.acquire.try_lock() {
-                Ok(guard) => return Ok(guard),
-                Err(TryLockError::Poisoned(error)) => return Ok(error.into_inner()),
+                Ok(guard) => {
+                    self.ensure_open()?;
+                    return Ok(guard);
+                }
+                Err(TryLockError::Poisoned(error)) => {
+                    self.ensure_open()?;
+                    return Ok(error.into_inner());
+                }
                 Err(TryLockError::WouldBlock) => {}
             }
         }
@@ -747,6 +870,7 @@ impl OidcDeviceAuth {
     }
 
     fn obtain_tokens(&self, allow_interaction: bool) -> Result<TokenSet> {
+        self.ensure_open()?;
         // token() keeps the cache-hit path lock-free. sign_in() is an explicit
         // lifecycle operation and mirrors Java by taking the acquisition lock,
         // where it also clears retry throttles before doing any network work.
@@ -757,10 +881,11 @@ impl OidcDeviceAuth {
         // refreshes or double-prompt. A transport-facing token lookup waits for a
         // bounded period behind a silent refresh, but never behind a device flow.
         let _acq = if allow_interaction {
-            self.lock_acquire()
+            self.acquire_for_operation()?
         } else {
             self.acquire_for_token()?
         };
+        self.ensure_open()?;
         if allow_interaction {
             let mut state = self.lock_store_state();
             state.reset_store_load_backoff();
@@ -798,6 +923,7 @@ impl OidcDeviceAuth {
             }
             match self.try_refresh_coordinated(tokens) {
                 Ok(refreshed) if self.has_required_token(&refreshed) => {
+                    self.ensure_open()?;
                     self.lock_store_state().reset_refresh_backoff();
                     *self.lock_tokens() = Some(refreshed.clone());
                     return Ok(refreshed);
@@ -812,6 +938,9 @@ impl OidcDeviceAuth {
                 // consumed parent, leaving the next call to re-prompt.
                 Err(e) if e.kind() == crate::oidc::error::OidcErrorKind::Network => {
                     self.lock_store_state().refresh_failed_at = Some(Instant::now());
+                    return Err(e);
+                }
+                Err(e) if e.kind() == crate::oidc::error::OidcErrorKind::Cancelled => {
                     return Err(e);
                 }
                 // Refresh token rejected (expired/revoked): fall through.
@@ -837,16 +966,19 @@ impl OidcDeviceAuth {
             self.run_device_flow()
         };
         let fresh = fresh_result?;
+        self.ensure_open()?;
         self.lock_store_state().reset_refresh_backoff();
         *self.lock_tokens() = Some(fresh.clone());
         // Persist the fresh sign-in (a new refresh token) for the next restart.
-        self.persist_fresh(&fresh);
+        self.persist_fresh(&fresh)?;
+        self.ensure_open()?;
         // Commit the authorized token to memory and persistence before invoking
         // cosmetic user code. If a custom renderer panics and its caller catches
         // the panic, the completed sign-in must not be lost or repeated.
         let identity = identity_from_tokens(&fresh);
         self.renderer
             .on_success(identity.as_deref(), fresh.remaining_secs(now_epoch()));
+        self.ensure_open()?;
         Ok(fresh)
     }
 
@@ -879,10 +1011,12 @@ impl OidcDeviceAuth {
         }
 
         let mut loaded = None;
-        let lock_result = store.in_lock(key, &mut || {
-            loaded = Some(store.load(key)?);
+        let cancelled = || self.is_closed();
+        let lock_result = store.in_lock_cancellable(key, &cancelled, &mut || {
+            loaded = Some(store.load_cancellable(key, &cancelled)?);
             Ok(())
         });
+        self.ensure_open()?;
         match loaded {
             Some(persisted) => {
                 // The locked read completed, so even an absent entry is stable
@@ -1022,16 +1156,19 @@ impl OidcDeviceAuth {
     /// contract (an `Ok` without the required token kind, or a non-network `Err`,
     /// means "fall through to an interactive sign-in").
     fn try_refresh_coordinated(&self, existing: &TokenSet) -> Result<TokenSet> {
+        self.ensure_open()?;
         let (Some(store), Some(key)) = (self.token_store.as_ref(), self.store_key.as_ref()) else {
             return self.refresh_no_store(existing); // no store: memory-only coordination
         };
         let store = Arc::clone(store);
         let existing = existing.clone();
         let mut out: Option<Result<TokenSet>> = None;
-        let lock_res = store.in_lock(key, &mut || {
+        let cancelled = || self.is_closed();
+        let lock_res = store.in_lock_cancellable(key, &cancelled, &mut || {
             out = Some(self.refresh_under_lock(store.as_ref(), key, &existing));
             Ok(())
         });
+        self.ensure_open()?;
         match out {
             Some(result) => {
                 // A custom store may report a bookkeeping/release error after it
@@ -1091,8 +1228,12 @@ impl OidcDeviceAuth {
         key: &TokenStoreKey,
         existing: &TokenSet,
     ) -> Result<TokenSet> {
+        self.ensure_open()?;
+        let cancelled = || self.is_closed();
         let last_persisted = Zeroizing::new(self.lock_store_state().last_persisted_refresh.clone());
-        let persisted = store.load(key).map_err(|e| {
+        let persisted_result = store.load_cancellable(key, &cancelled);
+        self.ensure_open()?;
+        let persisted = persisted_result.map_err(|e| {
             OidcError::network(format!(
                 "Could not re-read the OIDC token store before refresh: {e}. Refusing to reuse a possibly rotated refresh token; retry later."
             ))
@@ -1137,7 +1278,9 @@ impl OidcDeviceAuth {
         };
 
         if current_is_persisted {
-            if let Err(e) = store.clear(key) {
+            let clear_result = store.clear_cancellable(key, &cancelled);
+            self.ensure_open()?;
+            if let Err(e) = clear_result {
                 self.discard_cached_refresh();
                 self.lock_store_state().set_last_persisted_refresh(None);
                 return Err(OidcError::network(format!(
@@ -1175,15 +1318,16 @@ impl OidcDeviceAuth {
                 if refresh_preserves_token(&e) {
                     *self.lock_tokens() = Some(current.clone());
                     if current_is_persisted {
-                        self.persist_if_changed(store, key, &current);
+                        self.persist_if_changed(store, key, &current)?;
                     }
                 }
                 return Err(e);
             }
         };
         if self.has_required_token(&refreshed) {
-            self.persist_if_changed(store, key, &refreshed);
+            self.persist_if_changed(store, key, &refreshed)?;
         }
+        self.ensure_open()?;
         Ok(refreshed)
     }
 
@@ -1191,19 +1335,26 @@ impl OidcDeviceAuth {
     /// superseded persisted credential when the IdP issues no refresh token.
     /// Wrap the change in the store's lock so it serialises against a concurrent
     /// save or clear.
-    fn persist_fresh(&self, tokens: &TokenSet) {
+    fn persist_fresh(&self, tokens: &TokenSet) -> Result<()> {
         let (Some(store), Some(key)) = (self.token_store.as_ref(), self.store_key.as_ref()) else {
-            return;
+            return self.ensure_open();
         };
         let store = Arc::clone(store);
         let tokens = tokens.clone();
-        let outcome = store.in_lock(key, &mut || {
-            self.persist_if_changed(store.as_ref(), key, &tokens);
+        let cancelled = || self.is_closed();
+        let mut persist_result = None;
+        let outcome = store.in_lock_cancellable(key, &cancelled, &mut || {
+            persist_result = Some(self.persist_if_changed(store.as_ref(), key, &tokens));
             Ok(())
         });
+        self.ensure_open()?;
+        if let Some(result) = persist_result {
+            result?;
+        }
         if let Err(e) = outcome {
             warn_persistence("save", &*e);
         }
+        Ok(())
     }
 
     /// Save when the refresh token is new or rotated; skip when unchanged so the
@@ -1211,28 +1362,40 @@ impl OidcDeviceAuth {
     /// sign-in has no refresh token, clear the credential it superseded so a
     /// restart cannot retry a refresh token the IdP already rejected. Must be
     /// called with the store lock held.
-    fn persist_if_changed(&self, store: &dyn TokenStore, key: &TokenStoreKey, tokens: &TokenSet) {
+    fn persist_if_changed(
+        &self,
+        store: &dyn TokenStore,
+        key: &TokenStoreKey,
+        tokens: &TokenSet,
+    ) -> Result<()> {
+        self.ensure_open()?;
+        let cancelled = || self.is_closed();
         let rt = tokens.refresh_token.clone();
         if rt == self.lock_store_state().last_persisted_refresh {
-            return; // not rotated; nothing to write
+            return Ok(()); // not rotated; nothing to write
         }
         // With no replacement refresh token there is nothing worth saving, but a
         // previously persisted one is now obsolete and must not survive restart.
         if rt.is_none() {
-            match store.clear(key) {
+            let clear_result = store.clear_cancellable(key, &cancelled);
+            self.ensure_open()?;
+            match clear_result {
                 Ok(()) => {
                     self.lock_store_state().set_last_persisted_refresh(None);
                 }
                 Err(e) => warn_persistence("clear", &*e),
             }
-            return;
+            return Ok(());
         }
-        match store.save(key, &snapshot(tokens)) {
+        let save_result = store.save_cancellable(key, &snapshot(tokens), &cancelled);
+        self.ensure_open()?;
+        match save_result {
             Ok(()) => {
                 self.lock_store_state().set_last_persisted_refresh(rt);
             }
             Err(e) => warn_persistence("save", &*e),
         }
+        Ok(())
     }
 
     // -- device flow (RFC 8628) ---------------------------------------------
@@ -1246,6 +1409,7 @@ impl OidcDeviceAuth {
     }
 
     fn run_device_flow(&self) -> Result<TokenSet> {
+        self.ensure_open()?;
         if !self.is_interactive() {
             return Err(OidcError::interaction_required(
                 "Interactive sign-in is required, but no interactive terminal was \
@@ -1256,16 +1420,20 @@ impl OidcDeviceAuth {
         }
 
         let resp = self.request_device_code()?;
+        self.ensure_open()?;
         self.renderer.on_prompt(&resp.challenge);
+        self.ensure_open()?;
         if self.open_browser
             && let Some(target) = resp.challenge.browser_target()
         {
             maybe_open_browser(&target);
         }
+        self.ensure_open()?;
         self.poll_for_token(&resp)
     }
 
     fn request_device_code(&self) -> Result<DeviceResponse> {
+        self.ensure_open()?;
         let mut form: Vec<(&str, &str)> = vec![
             ("client_id", self.config.client_id.as_str()),
             ("scope", self.config.scope.as_str()),
@@ -1276,6 +1444,7 @@ impl OidcDeviceAuth {
         let result =
             self.http
                 .post_form(&self.config.device_authorization_endpoint, &form, false)?;
+        self.ensure_open()?;
         let body = &result.body;
 
         if result.status == 200 {
@@ -1344,6 +1513,7 @@ impl OidcDeviceAuth {
     }
 
     fn poll_for_token(&self, resp: &DeviceResponse) -> Result<TokenSet> {
+        self.ensure_open()?;
         let mut interval = resp.challenge.interval_seconds();
         let deadline = (self.now)() + Duration::from_secs(resp.challenge.expires_in_seconds());
         let form: Vec<(&str, &str)> = vec![
@@ -1356,6 +1526,7 @@ impl OidcDeviceAuth {
         let mut poll_now = true;
 
         loop {
+            self.ensure_open()?;
             let now = (self.now)();
             if now >= deadline {
                 self.renderer
@@ -1369,7 +1540,8 @@ impl OidcDeviceAuth {
             let remaining = deadline - now;
             if !poll_now {
                 self.renderer.on_waiting(remaining.as_secs_f64());
-                (self.sleep)(remaining.min(Duration::from_secs(interval)));
+                self.ensure_open()?;
+                self.wait_between_polls(remaining.min(Duration::from_secs(interval)))?;
                 poll_now = true;
                 // Re-enter through the deadline check before retrying. This also
                 // keeps a sleep clipped to the remaining lifetime from polling an
@@ -1382,8 +1554,12 @@ impl OidcDeviceAuth {
                 .http
                 .post_form(&self.config.token_endpoint, &form, false)
             {
-                Ok(result) => result,
+                Ok(result) => {
+                    self.ensure_open()?;
+                    result
+                }
                 Err(e) => {
+                    self.ensure_open()?;
                     // A non-JSON, non-transient status is a terminal rejection (a
                     // WAF/proxy error page); a conformant poll reply is JSON, so
                     // it can never be authorization_pending / slow_down.
@@ -1487,6 +1663,7 @@ impl OidcDeviceAuth {
     }
 
     fn refresh(&self, tokens: &TokenSet) -> Result<TokenSet> {
+        self.ensure_open()?;
         // Callers gate on a present refresh token, but a persisted entry
         // (untrusted input) can reach here without one; return an error rather
         // than panic. A non-Network error routes `obtain_tokens` to a fresh
@@ -1515,6 +1692,7 @@ impl OidcDeviceAuth {
         let result = self
             .http
             .post_form(&self.config.token_endpoint, &form, false)?;
+        self.ensure_open()?;
 
         if result.status == 200 {
             // Carry the prior refresh token forward (a non-rotating IdP omits it

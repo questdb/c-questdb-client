@@ -22,8 +22,9 @@
  *
  ******************************************************************************/
 
-use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
+use std::sync::mpsc;
+use std::sync::{Arc, Barrier};
 
 use tempfile::TempDir;
 
@@ -44,6 +45,95 @@ fn test_token() -> PersistedToken {
         1_700_000_000.0,
         300.0,
     )
+}
+
+#[test]
+fn cancellable_lock_wait_abandons_in_process_contention() {
+    let dir = TempDir::new().unwrap();
+    let store = Arc::new(FileTokenStore::at(dir.path()));
+    let key = test_key();
+    let release = Arc::new(Barrier::new(2));
+    let (locked_tx, locked_rx) = mpsc::sync_channel(1);
+
+    let holder_store = Arc::clone(&store);
+    let holder_key = key.clone();
+    let holder_release = Arc::clone(&release);
+    let holder = std::thread::spawn(move || {
+        holder_store
+            .in_lock(&holder_key, &mut || {
+                locked_tx.send(()).unwrap();
+                holder_release.wait();
+                Ok(())
+            })
+            .unwrap();
+    });
+    locked_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("holder did not acquire the store lock");
+
+    let cancelled = Arc::new(AtomicBool::new(false));
+    let waiter_store = Arc::clone(&store);
+    let waiter_key = key.clone();
+    let waiter_cancelled = Arc::clone(&cancelled);
+    let waiter = std::thread::spawn(move || {
+        waiter_store.in_lock_cancellable(
+            &waiter_key,
+            &|| waiter_cancelled.load(Ordering::Acquire),
+            &mut || Ok(()),
+        )
+    });
+    std::thread::sleep(Duration::from_millis(100));
+    let started = Instant::now();
+    cancelled.store(true, Ordering::Release);
+    let error = waiter.join().expect("waiter panicked").unwrap_err();
+    assert!(
+        started.elapsed() < Duration::from_secs(1),
+        "cancellable store wait did not stop promptly"
+    );
+    assert_eq!(
+        error
+            .downcast_ref::<std::io::Error>()
+            .map(std::io::Error::kind),
+        Some(std::io::ErrorKind::Interrupted)
+    );
+
+    release.wait();
+    holder.join().unwrap();
+}
+
+#[test]
+fn cancellable_lock_wait_abandons_filesystem_contention() {
+    let dir = TempDir::new().unwrap();
+    let store = FileTokenStore::at(dir.path());
+    let key = test_key();
+    store.prepare_directory(&never_cancelled).unwrap();
+    let lock = store.lock_file(&key);
+    std::fs::write(&lock, holder_bytes().unwrap()).unwrap();
+
+    let cancelled = Arc::new(AtomicBool::new(false));
+    let waiter_cancelled = Arc::clone(&cancelled);
+    let waiter = std::thread::spawn(move || {
+        store.in_lock_cancellable(
+            &key,
+            &|| waiter_cancelled.load(Ordering::Acquire),
+            &mut || Ok(()),
+        )
+    });
+    std::thread::sleep(Duration::from_millis(100));
+    let started = Instant::now();
+    cancelled.store(true, Ordering::Release);
+    let error = waiter.join().expect("waiter panicked").unwrap_err();
+    assert!(
+        started.elapsed() < Duration::from_secs(1),
+        "filesystem store wait did not stop promptly"
+    );
+    assert_eq!(
+        error
+            .downcast_ref::<std::io::Error>()
+            .map(std::io::Error::kind),
+        Some(std::io::ErrorKind::Interrupted)
+    );
+    let _ = std::fs::remove_file(lock);
 }
 
 // -- cross-language contract (frozen) ---------------------------------------

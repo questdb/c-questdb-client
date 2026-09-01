@@ -223,6 +223,19 @@ QUESTDB_CLIENT_API
 void questdb_oidc_auth_free(questdb_oidc_auth* auth);
 
 /**
+ * Permanently close this shared auth state. Cancels a device flow or bundled
+ * file-token-store lock wait running on another thread and waits for the
+ * operation to stop. All cloned handles and attached transports share the
+ * closed state. Idempotent. This is distinct from `questdb_oidc_auth_free`,
+ * which releases only one handle and does not cancel shared work.
+ *
+ * Must not be called from this auth's event callback.
+ */
+QUESTDB_CLIENT_API
+bool questdb_oidc_auth_close(
+    const questdb_oidc_auth* auth, questdb_error** err_out);
+
+/**
  * Run the interactive device flow when no cached or silently refreshable token
  * is available. This is the only auth operation that may display a prompt and
  * wait for user authorization; call it on a suitable UI thread before starting
@@ -305,6 +318,7 @@ typedef enum questdb_oidc_error_kind
     QUESTDB_OIDC_ERROR_DEVICE_FLOW = 2,
     QUESTDB_OIDC_ERROR_TIMEOUT = 3,
     QUESTDB_OIDC_ERROR_INTERACTION_REQUIRED = 4,
+    QUESTDB_OIDC_ERROR_CANCELLED = 5,
     QUESTDB_OIDC_ERROR_UNKNOWN = 255,
 } questdb_oidc_error_kind;
 

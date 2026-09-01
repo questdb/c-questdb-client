@@ -61,7 +61,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock, TryLockError};
 use std::time::{Duration, Instant, SystemTime};
 
 use serde_json::Value;
@@ -107,6 +107,17 @@ const MIN_LOCK_STALE: Duration = Duration::from_secs(300);
 /// are surfaced as retryable token-acquisition errors so a refresh never runs
 /// concurrently or reuses an ambiguously rotated parent.
 pub type TokenStoreResult<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
+
+fn cancelled_error() -> Box<dyn std::error::Error + Send + Sync> {
+    Box::new(std::io::Error::new(
+        std::io::ErrorKind::Interrupted,
+        "OIDC authentication was closed while waiting for the token store",
+    ))
+}
+
+fn never_cancelled() -> bool {
+    false
+}
 
 // ---------------------------------------------------------------------------
 // PersistedToken
@@ -372,6 +383,60 @@ pub trait TokenStore: Send + Sync {
     /// must not return the removed refresh-token parent.
     fn clear(&self, key: &TokenStoreKey) -> TokenStoreResult<()>;
 
+    /// Cancellable form of [`load`](Self::load). Custom stores may override
+    /// this to abandon an interruptible backend wait promptly when `cancelled`
+    /// becomes true. The default preserves source compatibility and checks the
+    /// signal before and after the ordinary operation.
+    fn load_cancellable(
+        &self,
+        key: &TokenStoreKey,
+        cancelled: &dyn Fn() -> bool,
+    ) -> TokenStoreResult<Option<PersistedToken>> {
+        if cancelled() {
+            return Err(cancelled_error());
+        }
+        let result = self.load(key);
+        if cancelled() {
+            return Err(cancelled_error());
+        }
+        result
+    }
+
+    /// Cancellable form of [`save`](Self::save). See
+    /// [`load_cancellable`](Self::load_cancellable).
+    fn save_cancellable(
+        &self,
+        key: &TokenStoreKey,
+        token: &PersistedToken,
+        cancelled: &dyn Fn() -> bool,
+    ) -> TokenStoreResult<()> {
+        if cancelled() {
+            return Err(cancelled_error());
+        }
+        let result = self.save(key, token);
+        if cancelled() {
+            return Err(cancelled_error());
+        }
+        result
+    }
+
+    /// Cancellable form of [`clear`](Self::clear). See
+    /// [`load_cancellable`](Self::load_cancellable).
+    fn clear_cancellable(
+        &self,
+        key: &TokenStoreKey,
+        cancelled: &dyn Fn() -> bool,
+    ) -> TokenStoreResult<()> {
+        if cancelled() {
+            return Err(cancelled_error());
+        }
+        let result = self.clear(key);
+        if cancelled() {
+            return Err(cancelled_error());
+        }
+        result
+    }
+
     /// Run `action` while holding a cross-process lock scoped to `key`, so a
     /// refresh by another process sharing this identity is observed rather than
     /// raced, and return its result.
@@ -455,6 +520,27 @@ pub trait TokenStore: Send + Sync {
         key: &TokenStoreKey,
         action: &mut dyn FnMut() -> TokenStoreResult<()>,
     ) -> TokenStoreResult<()>;
+
+    /// Cancellable form of [`in_lock`](Self::in_lock). The bundled
+    /// [`FileTokenStore`] observes the signal while waiting for both its
+    /// in-process and filesystem locks. Custom stores that can interrupt their
+    /// coordination wait should override this method; the default checks only
+    /// before and after the existing `in_lock` call.
+    fn in_lock_cancellable(
+        &self,
+        key: &TokenStoreKey,
+        cancelled: &dyn Fn() -> bool,
+        action: &mut dyn FnMut() -> TokenStoreResult<()>,
+    ) -> TokenStoreResult<()> {
+        if cancelled() {
+            return Err(cancelled_error());
+        }
+        let result = self.in_lock(key, action);
+        if cancelled() {
+            return Err(cancelled_error());
+        }
+        result
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -716,12 +802,16 @@ impl FileTokenStore {
         required: bool,
         stale_after: Duration,
         empty_grace: Duration,
+        cancelled: &dyn Fn() -> bool,
     ) -> TokenStoreResult<Option<HeldLock>> {
         // `lock_acquire_budget` is clamped in `with_lock_timings`, so this add
         // cannot overflow.
         let deadline = Instant::now() + self.lock_acquire_budget;
         let stamp = holder_bytes()?;
         loop {
+            if cancelled() {
+                return Err(cancelled_error());
+            }
             match create_lock_file(lock, &stamp) {
                 Ok(()) => {
                     return Ok(Some(HeldLock {
@@ -795,12 +885,16 @@ impl FileTokenStore {
 
     fn with_directory_lock<T>(
         &self,
+        cancelled: &dyn Fn() -> bool,
         action: impl FnOnce(bool) -> TokenStoreResult<T>,
     ) -> TokenStoreResult<T> {
+        if cancelled() {
+            return Err(cancelled_error());
+        }
         self.create_directory()?;
         let lock = self.directory_lock_file();
         let process_lock = process_lock_for(&lock);
-        let _process_guard = process_lock.lock().unwrap_or_else(|e| e.into_inner());
+        let _process_guard = lock_process_cancellable(&process_lock, cancelled)?;
         let short_lease = directory_is_owner_only(&self.directory)
             && path_is_definitely_absent(&self.untrusted_sentinel());
         let stale_after = if short_lease {
@@ -814,7 +908,7 @@ impl FileTokenStore {
             EMPTY_LOCK_GRACE
         };
         let held = self
-            .acquire_lock(&lock, true, stale_after, empty_grace)?
+            .acquire_lock(&lock, true, stale_after, empty_grace, cancelled)?
             .expect("a required lock never degrades");
         let scope = HeldLockScope::enter(lock.clone());
 
@@ -835,15 +929,19 @@ impl FileTokenStore {
         if !trusted {
             discard_untrusted_directory_contents(&self.directory, &self.untrusted_sentinel());
         }
-        let result = action(trusted);
+        let result = if cancelled() {
+            Err(cancelled_error())
+        } else {
+            action(trusted)
+        };
         drop(heartbeat);
         drop(scope);
         drop(held);
         result
     }
 
-    fn prepare_directory(&self) -> TokenStoreResult<()> {
-        self.with_directory_lock(|_| Ok(()))
+    fn prepare_directory(&self, cancelled: &dyn Fn() -> bool) -> TokenStoreResult<()> {
+        self.with_directory_lock(cancelled, |_| Ok(()))
     }
 
     /// Run under this identity's process and filesystem locks. The filesystem
@@ -852,18 +950,29 @@ impl FileTokenStore {
     fn with_lock<T>(
         &self,
         key: &TokenStoreKey,
+        cancelled: &dyn Fn() -> bool,
         action: impl FnOnce() -> TokenStoreResult<T>,
     ) -> TokenStoreResult<T> {
+        if cancelled() {
+            return Err(cancelled_error());
+        }
         let lock = self.lock_file(key);
         if current_thread_holds(&lock) {
+            if cancelled() {
+                return Err(cancelled_error());
+            }
             return action();
         }
         let process_lock = process_lock_for(&lock);
-        let _process_guard = process_lock.lock().unwrap_or_else(|e| e.into_inner());
+        let _process_guard = lock_process_cancellable(&process_lock, cancelled)?;
         let _scope = HeldLockScope::enter(lock.clone());
-        self.prepare_directory()?;
-        let held = self.acquire_lock(&lock, false, self.lock_stale, EMPTY_LOCK_GRACE)?;
-        let result = action();
+        self.prepare_directory(cancelled)?;
+        let held = self.acquire_lock(&lock, false, self.lock_stale, EMPTY_LOCK_GRACE, cancelled)?;
+        let result = if cancelled() {
+            Err(cancelled_error())
+        } else {
+            action()
+        };
         drop(held);
         result
     }
@@ -941,7 +1050,15 @@ impl FileTokenStore {
 
 impl TokenStore for FileTokenStore {
     fn load(&self, key: &TokenStoreKey) -> TokenStoreResult<Option<PersistedToken>> {
-        self.with_directory_lock(|trusted| {
+        self.load_cancellable(key, &never_cancelled)
+    }
+
+    fn load_cancellable(
+        &self,
+        key: &TokenStoreKey,
+        cancelled: &dyn Fn() -> bool,
+    ) -> TokenStoreResult<Option<PersistedToken>> {
+        self.with_directory_lock(cancelled, |trusted| {
             if !trusted {
                 return Ok(None);
             }
@@ -964,6 +1081,15 @@ impl TokenStore for FileTokenStore {
     }
 
     fn save(&self, key: &TokenStoreKey, token: &PersistedToken) -> TokenStoreResult<()> {
+        self.save_cancellable(key, token, &never_cancelled)
+    }
+
+    fn save_cancellable(
+        &self,
+        key: &TokenStoreKey,
+        token: &PersistedToken,
+        cancelled: &dyn Fn() -> bool,
+    ) -> TokenStoreResult<()> {
         if token
             .access_token
             .as_deref()
@@ -988,18 +1114,29 @@ impl TokenStore for FileTokenStore {
                 ),
             )));
         }
-        self.with_directory_lock(|_| {
+        self.with_directory_lock(cancelled, |_| {
             self.sweep_orphan_temps(key, true);
             self.save_under_lock(key, &content)
         })
     }
 
     fn clear(&self, key: &TokenStoreKey) -> TokenStoreResult<()> {
+        self.clear_cancellable(key, &never_cancelled)
+    }
+
+    fn clear_cancellable(
+        &self,
+        key: &TokenStoreKey,
+        cancelled: &dyn Fn() -> bool,
+    ) -> TokenStoreResult<()> {
+        if cancelled() {
+            return Err(cancelled_error());
+        }
         if !self.directory.is_dir() {
             return Ok(());
         }
-        self.with_lock(key, || {
-            self.with_directory_lock(|_| self.clear_under_lock(key))
+        self.with_lock(key, cancelled, || {
+            self.with_directory_lock(cancelled, |_| self.clear_under_lock(key))
         })
     }
 
@@ -1008,7 +1145,16 @@ impl TokenStore for FileTokenStore {
         key: &TokenStoreKey,
         action: &mut dyn FnMut() -> TokenStoreResult<()>,
     ) -> TokenStoreResult<()> {
-        self.with_lock(key, action)
+        self.in_lock_cancellable(key, &never_cancelled, action)
+    }
+
+    fn in_lock_cancellable(
+        &self,
+        key: &TokenStoreKey,
+        cancelled: &dyn Fn() -> bool,
+        action: &mut dyn FnMut() -> TokenStoreResult<()>,
+    ) -> TokenStoreResult<()> {
+        self.with_lock(key, cancelled, action)
     }
 }
 
@@ -1166,6 +1312,22 @@ fn process_lock_for(lock: &Path) -> Arc<Mutex<()>> {
         .entry(lock.to_path_buf())
         .or_insert_with(|| Arc::new(Mutex::new(())))
         .clone()
+}
+
+fn lock_process_cancellable<'a>(
+    lock: &'a Mutex<()>,
+    cancelled: &dyn Fn() -> bool,
+) -> TokenStoreResult<MutexGuard<'a, ()>> {
+    loop {
+        if cancelled() {
+            return Err(cancelled_error());
+        }
+        match lock.try_lock() {
+            Ok(guard) => return Ok(guard),
+            Err(TryLockError::Poisoned(error)) => return Ok(error.into_inner()),
+            Err(TryLockError::WouldBlock) => std::thread::sleep(LOCK_POLL_SLICE),
+        }
+    }
 }
 
 std::thread_local! {

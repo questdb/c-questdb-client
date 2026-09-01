@@ -199,6 +199,7 @@ enum class error_kind : int
     device_flow = QUESTDB_OIDC_ERROR_DEVICE_FLOW,
     timeout = QUESTDB_OIDC_ERROR_TIMEOUT,
     interaction_required = QUESTDB_OIDC_ERROR_INTERACTION_REQUIRED,
+    cancelled = QUESTDB_OIDC_ERROR_CANCELLED,
     unknown = QUESTDB_OIDC_ERROR_UNKNOWN,
 };
 
