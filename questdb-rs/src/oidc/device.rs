@@ -34,6 +34,7 @@ use serde_json::Value;
 
 use crate::oidc::discovery::{
     DiscoveryParams, OidcConfig, resolve_config, validate_endpoint_origins,
+    validate_explicit_endpoint_issuer_origins,
 };
 use crate::oidc::error::{MAX_IDP_FIELD_CHARS, OidcError, Result};
 use crate::oidc::http::{HttpClient, is_transient_http_status};
@@ -201,6 +202,8 @@ impl OidcDeviceAuthBuilder {
     /// Pin the token issuer out-of-band. **Required** when the server does not
     /// advertise the device-authorization endpoint (so it is discovered from the
     /// IdP), so a tampered `/settings` cannot redirect the credential requests.
+    /// With [`OidcDeviceAuth::builder`], both explicitly configured credential
+    /// endpoints must be on this issuer's origin, matching the Java client.
     pub fn issuer(mut self, issuer: impl Into<String>) -> Self {
         self.issuer = Some(issuer.into());
         self
@@ -318,6 +321,9 @@ impl OidcDeviceAuthBuilder {
             )));
         }
 
+        let pin_explicit_endpoints_to_issuer = self.questdb_url.is_none()
+            && self.token_endpoint.is_some()
+            && self.device_authorization_endpoint.is_some();
         let http = HttpClient::new(self.ca_bundle.as_deref(), self.timeout)?;
         let params = DiscoveryParams {
             questdb_url: self.questdb_url,
@@ -343,6 +349,13 @@ impl OidcDeviceAuthBuilder {
             &config.token_endpoint,
             &config.device_authorization_endpoint,
         )?;
+        if pin_explicit_endpoints_to_issuer && let Some(issuer) = config.issuer.as_deref() {
+            validate_explicit_endpoint_issuer_origins(
+                &config.token_endpoint,
+                &config.device_authorization_endpoint,
+                issuer,
+            )?;
+        }
 
         // Build the store identity from the resolved config, so the on-disk key
         // (and its fingerprint re-check) matches the identity this instance acts

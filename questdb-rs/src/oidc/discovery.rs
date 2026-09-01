@@ -260,6 +260,42 @@ pub(crate) fn validate_endpoint_origins(
     Ok(())
 }
 
+/// Require both explicitly configured credential endpoints to belong to the
+/// caller-pinned issuer origin.
+///
+/// This is intentionally an origin-only check. Some providers place their
+/// endpoints outside the issuer path, while still serving them from the same
+/// trusted origin. Discovery has its own provenance-aware checks because an
+/// issuer's authenticated discovery document may legitimately advertise an
+/// endpoint on another origin.
+pub(crate) fn validate_explicit_endpoint_issuer_origins(
+    token_endpoint: &str,
+    device_authorization_endpoint: &str,
+    issuer: &str,
+) -> Result<()> {
+    reject_confusable_authority(issuer, "issuer")?;
+    let issuer_origin = normalized_origin(issuer)?;
+    for (label, endpoint) in [
+        ("token endpoint", token_endpoint),
+        (
+            "device-authorization endpoint",
+            device_authorization_endpoint,
+        ),
+    ] {
+        if normalized_origin(endpoint)? != issuer_origin {
+            return Err(OidcError::config(format!(
+                "The explicitly configured OIDC {label} ({endpoint:?}) does not \
+                 match the pinned issuer origin ({}); refusing to send credentials \
+                 outside the trusted issuer. Configure explicit endpoints without \
+                 issuer pinning only when the provider intentionally hosts them on \
+                 another origin.",
+                origin_str(issuer)
+            )));
+        }
+    }
+    Ok(())
+}
+
 /// True if `endpoint`'s path is the issuer's path or a sub-path of it.
 ///
 /// Segment-aware, so `/realms/prod` does not match `/realms/production`. A root
@@ -724,6 +760,30 @@ mod tests {
             )
             .is_ok()
         );
+    }
+
+    #[test]
+    fn explicit_endpoints_on_pinned_issuer_origin_ok() {
+        assert!(
+            validate_explicit_endpoint_issuer_origins(
+                "https://idp.example.com:443/oauth/token",
+                "https://idp.example.com/device",
+                "https://idp.example.com/realms/prod",
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn explicit_endpoint_off_pinned_issuer_origin_rejected() {
+        let err = validate_explicit_endpoint_issuer_origins(
+            "https://tokens.example.com/token",
+            "https://tokens.example.com/device",
+            "https://idp.example.com",
+        )
+        .unwrap_err();
+        assert_eq!(err.kind(), crate::oidc::error::OidcErrorKind::Config);
+        assert!(err.message().contains("pinned issuer origin"));
     }
 
     #[test]

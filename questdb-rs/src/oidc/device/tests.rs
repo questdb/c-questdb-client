@@ -305,6 +305,20 @@ fn token_requires_explicit_sign_in_without_starting_device_flow() {
 }
 
 #[test]
+fn explicit_builder_rejects_endpoints_off_pinned_issuer_origin() {
+    let err = OidcDeviceAuth::builder()
+        .client_id("questdb")
+        .issuer("https://idp.example.com/realms/prod")
+        .device_authorization_endpoint("https://tokens.example.com/device")
+        .token_endpoint("https://tokens.example.com/token")
+        .build()
+        .unwrap_err();
+
+    assert_eq!(err.kind(), OidcErrorKind::Config);
+    assert!(err.message().contains("pinned issuer origin"));
+}
+
+#[test]
 fn token_does_not_wait_behind_interactive_sign_in() {
     struct BlockingPrompt {
         entered: Arc<Barrier>,
