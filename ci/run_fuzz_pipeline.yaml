@@ -9,8 +9,8 @@ pr: none
 # Microsoft-hosted ubuntu-latest agents were hitting "Free disk space on /
 # is lower than 5%" and OOM-killing the test with SIGBUS mid-run. The
 # mac/windows legs stay on Microsoft-hosted images. The scheduled Linux
-# egress and notification jobs also use hetzner-incus; only platform-specific
-# macOS/Windows coverage remains hosted. Equivalent PR-time jobs live in
+# egress jobs also use hetzner-incus; the Slack notifier remains hosted so a
+# pool outage cannot swallow its own alert. Equivalent PR-time jobs live in
 # run_tests_pipeline.yaml
 # (TestQwpWsFuzz / TestQwpEgressLiveServerFuzz); this pipeline is the
 # always-on stability watchdog and the source of Slack #builds alerts.
