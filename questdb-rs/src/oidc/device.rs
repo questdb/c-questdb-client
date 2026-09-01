@@ -70,14 +70,6 @@ const MIN_DEVICE_CODE_LIFETIME: u64 = 60;
 const MIN_POLL_INTERVAL: u64 = 5;
 const MAX_POLL_INTERVAL: u64 = 60;
 
-// After this many consecutive transport-level poll failures (no HTTP status:
-// connection refused, TLS handshake, DNS, reset), stop polling and surface the
-// real cause rather than silently waiting out the device-code deadline and then
-// reporting a misleading "code expired". A conformant IdP answers with an HTTP
-// status even when rejecting; a run of pure transport failures means the
-// endpoint is unreachable or misconfigured, not that authorization is pending.
-const MAX_CONSECUTIVE_TRANSPORT_FAILURES: u32 = 3;
-
 // A token-endpoint round-trip never needs longer; bounding it keeps a stalled
 // IdP from pinning the acquisition lock. Matches the reference clients.
 const MAX_TIMEOUT: Duration = Duration::from_secs(120);
@@ -1359,9 +1351,6 @@ impl OidcDeviceAuth {
             ("device_code", resp.device_code.as_str()),
             ("client_id", self.config.client_id.as_str()),
         ];
-        // Consecutive transport-level failures (no HTTP status): a persistent run
-        // means the endpoint is unreachable, not that authorization is pending.
-        let mut transport_failures: u32 = 0;
         // RFC 8628 permits polling as soon as the device response arrives. Retry
         // polls wait for the configured interval; the first poll does not.
         let mut poll_now = true;
@@ -1409,43 +1398,16 @@ impl OidcDeviceAuth {
                         ))
                         .with_status(e.status()));
                     }
-                    // A pure transport failure (no HTTP status: connection refused,
-                    // TLS handshake, DNS, reset) that repeats is not a transient
-                    // blip — the endpoint is unreachable/misconfigured. Surface the
-                    // real cause rather than polling silently until the code
-                    // expires and reporting a misleading timeout.
-                    if e.status().is_none() {
-                        transport_failures += 1;
-                        if transport_failures >= MAX_CONSECUTIVE_TRANSPORT_FAILURES {
-                            self.renderer.on_failure(
-                                "Sign-in failed: the identity provider is unreachable.",
-                            );
-                            return Err(OidcError::network(format!(
-                                "Device flow aborted: the IdP token endpoint was \
-                                 unreachable on {transport_failures} consecutive \
-                                 polls ({e})."
-                            )));
-                        }
-                    } else {
-                        // An HTTP status came back (a non-JSON transient error
-                        // page): the endpoint IS reachable, so reset the
-                        // consecutive-transport-failure counter, mirroring the Ok
-                        // branch. A reachable-but-erroring poll must not count
-                        // toward the "unreachable on N consecutive polls" abort.
-                        transport_failures = 0;
-                    }
-                    // Transient (dropped connection / 408 / 429 / 5xx): keep polling.
+                    // Match Java by treating status-less transport failures like
+                    // other transient poll failures: keep polling until the
+                    // device code expires. This also lets a temporarily
+                    // unreachable token endpoint recover during an active flow.
                     if e.status() == Some(429) || e.retry_after_secs().is_some() {
                         interval = backoff(interval, e.retry_after_secs(), false);
                     }
                     continue;
                 }
             };
-
-            // An HTTP status came back, so the endpoint is reachable: reset the
-            // consecutive-transport-failure counter.
-            transport_failures = 0;
-
             let status = result.status;
             let body = result.body;
             let retry_after = result.retry_after;
