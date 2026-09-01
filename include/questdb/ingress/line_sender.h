@@ -2336,11 +2336,7 @@ typedef void (*questdb_connection_event_cb)(
  * Events are delivered on a dedicated dispatcher thread through a bounded
  * inbox (`inbox_capacity`; 0 = default 64) with a drop-oldest overflow
  * policy. The caller guarantees `user_data` is safe to use from that
- * thread. QWP/WebSocket only; at most one listener per builder.
- *
- * A `line_sender_build` that fails delivers the events describing that
- * failure before it returns, so `line_sender_opts_free` right afterwards
- * cannot discard them. */
+ * thread. QWP/WebSocket only; at most one listener per builder. */
 QUESTDB_CLIENT_API
 bool line_sender_opts_connection_event_handler(
     line_sender_opts* opts,

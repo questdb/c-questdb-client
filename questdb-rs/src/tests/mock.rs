@@ -200,20 +200,10 @@ fn position(haystack: &[u8], needle: &[u8]) -> Option<usize> {
 
 impl MockServer {
     pub fn new() -> io::Result<Self> {
-        // Through the claim registry like every other test server in this
-        // crate: most of the `sender` and `http` suites create one of these,
-        // so an unchecked draw here is the likeliest way for a port another
-        // test is proving dead to end up with a listener on it. `socket2` is
-        // what keeps this off `bind_test_listener` — mio needs this socket,
-        // not a `std::net::TcpListener`.
-        let listener = crate::tests::net::bind_unclaimed(|| {
-            let listener = Socket::new(Domain::IPV4, Type::STREAM, Some(SockProtocol::TCP))?;
-            let address: SocketAddr = "127.0.0.1:0".parse().unwrap();
-            listener.bind(&address.into())?;
-            listener.listen(128)?;
-            let port = listener.local_addr()?.as_socket_ipv4().unwrap().port();
-            Ok((listener, port))
-        })?;
+        let listener = Socket::new(Domain::IPV4, Type::STREAM, Some(SockProtocol::TCP))?;
+        let address: SocketAddr = "127.0.0.1:0".parse().unwrap();
+        listener.bind(&address.into())?;
+        listener.listen(128)?;
         let port = listener.local_addr()?.as_socket_ipv4().unwrap().port();
         Ok(Self {
             poll: Poll::new()?,

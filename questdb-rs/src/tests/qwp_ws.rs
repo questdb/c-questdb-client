@@ -43,7 +43,6 @@ use crate::ingress::{
     Buffer, ColumnName, Protocol, QwpWsEncodeScratch, QwpWsErrorCategory, QwpWsErrorPolicy,
     QwpWsProgress, SenderBuilder, SymbolGlobalDict, TableName, TimestampNanos,
 };
-use crate::tests::net::{ReservedPort, bind_test_listener};
 // `ProtocolVersion` is only referenced by the HTTP-gated sibling-sender checks
 // below, so gate the import to avoid an unused-import warning when the
 // qwp-ws sender is built without `sync-sender-http` (e.g. run_all_tests.py).
@@ -576,7 +575,7 @@ pub(crate) fn sha1(input: &[u8]) -> [u8; 20] {
 /// to the test thread. The first frame received is replied to with an OK
 /// response (status=0x00, sequence=0, table_count=0).
 fn spawn_mock_server() -> (u16, mpsc::Receiver<MockResult>) {
-    let listener = bind_test_listener();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();
     let (tx, rx) = mpsc::channel();
 
@@ -610,7 +609,7 @@ fn spawn_mock_server() -> (u16, mpsc::Receiver<MockResult>) {
 /// catch-up and acks the data frame so `close_drain` can complete; records only
 /// the data frame in `received_frames`.
 fn spawn_recovery_mock_server() -> (u16, mpsc::Receiver<MockResult>) {
-    let listener = bind_test_listener();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();
     let (tx, rx) = mpsc::channel();
 
@@ -637,7 +636,7 @@ fn spawn_recovery_mock_server() -> (u16, mpsc::Receiver<MockResult>) {
 }
 
 fn spawn_one_response_server(response: MockQwpResponse) -> (u16, mpsc::Receiver<MockResult>) {
-    let listener = bind_test_listener();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();
     let (tx, rx) = mpsc::channel();
 
@@ -693,7 +692,7 @@ fn spawn_recycling_server(
     action: RecycleServerAction,
     run_for: Duration,
 ) -> (u16, thread::JoinHandle<usize>, Arc<AtomicUsize>) {
-    let listener = bind_test_listener();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     listener.set_nonblocking(true).unwrap();
     let port = listener.local_addr().unwrap().port();
 
@@ -782,7 +781,7 @@ fn spawn_recycling_server(
 }
 
 fn spawn_stalled_after_first_frame_server() -> (u16, mpsc::Receiver<Vec<u8>>, mpsc::Sender<()>) {
-    let listener = bind_test_listener();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();
     let (frame_tx, frame_rx) = mpsc::channel();
     let (release_tx, release_rx) = mpsc::channel();
@@ -802,7 +801,7 @@ fn spawn_stalled_after_first_frame_server() -> (u16, mpsc::Receiver<Vec<u8>>, mp
 /// forwarding each payload. Lets a test observe how many frames the client is
 /// willing to put on the wire with zero ack progress.
 fn spawn_silent_never_acking_server() -> (u16, mpsc::Receiver<Vec<u8>>) {
-    let listener = bind_test_listener();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();
     let (frame_tx, frame_rx) = mpsc::channel();
 
@@ -825,7 +824,7 @@ fn spawn_delayed_durable_ack_server() -> (
     mpsc::Sender<()>,
     mpsc::Sender<()>,
 ) {
-    let listener = bind_test_listener();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();
     let (frame_tx, frame_rx) = mpsc::channel();
     let (ok_tx, ok_rx) = mpsc::channel();
@@ -888,7 +887,7 @@ fn qwp_frame_has_tables(payload: &[u8]) -> bool {
 /// durable ACK. It then accepts and durably ACKs one fresh publication so the
 /// test can prove that segment trimming restored producer capacity.
 fn spawn_durable_backlog_reconnect_server() -> DurableBacklogServer {
-    let listener = bind_test_listener();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();
     let initial_ok_count = Arc::new(AtomicUsize::new(0));
     let server_initial_ok_count = Arc::clone(&initial_ok_count);
@@ -1041,7 +1040,7 @@ fn spawn_durable_backlog_reconnect_server() -> DurableBacklogServer {
 }
 
 fn spawn_ack_each_frame_server() -> (u16, thread::JoinHandle<usize>) {
-    let listener = bind_test_listener();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();
 
     let handle = thread::spawn(move || {
@@ -1094,7 +1093,7 @@ fn wait_until<F: FnMut() -> bool>(timeout: Duration, mut predicate: F) -> bool {
 }
 
 fn spawn_upgrade_only_server() -> u16 {
-    let listener = bind_test_listener();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();
 
     thread::spawn(move || {
@@ -1312,7 +1311,7 @@ fn no_symbol_frame_at_local_hint_overcount_boundary(max: usize) -> Buffer {
 }
 
 fn spawn_manual_orphan_drain_server() -> (u16, mpsc::Receiver<Vec<u8>>) {
-    let listener = bind_test_listener();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();
     let (tx, rx) = mpsc::channel();
 
@@ -1338,7 +1337,7 @@ fn spawn_manual_orphan_drain_server() -> (u16, mpsc::Receiver<Vec<u8>>) {
 }
 
 fn spawn_two_frame_orphan_drain_server() -> (u16, mpsc::Receiver<Vec<Vec<u8>>>) {
-    let listener = bind_test_listener();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();
     let (tx, rx) = mpsc::channel();
 
@@ -1363,7 +1362,7 @@ fn spawn_two_frame_orphan_drain_server() -> (u16, mpsc::Receiver<Vec<Vec<u8>>>) 
 }
 
 fn spawn_manual_orphan_reject_server(status: u8) -> (u16, mpsc::Receiver<Vec<u8>>) {
-    let listener = bind_test_listener();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();
     let (tx, rx) = mpsc::channel();
 
@@ -1398,7 +1397,7 @@ struct TerminalThenDrainOrphanServer {
 }
 
 fn spawn_terminal_then_drain_orphan_server() -> TerminalThenDrainOrphanServer {
-    let listener = bind_test_listener();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();
     let (terminal_tx, terminal_rx) = mpsc::channel();
     let (drained_tx, drained_rx) = mpsc::channel();
@@ -1455,7 +1454,7 @@ struct CatchUpFailureThenDrainOrphanServer {
 fn spawn_catch_up_failure_then_drain_orphan_server(
     first_max_batch_size: Option<usize>,
 ) -> CatchUpFailureThenDrainOrphanServer {
-    let listener = bind_test_listener();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();
     let (retried_tx, retried_rx) = mpsc::channel();
     let (drained_tx, drained_rx) = mpsc::channel();
@@ -1493,7 +1492,7 @@ fn spawn_catch_up_failure_then_drain_orphan_server(
 /// but answers the data frame with NOT_WRITABLE; the recycled connection
 /// reaches the promoted primary, which ACKs the replayed frame.
 fn spawn_role_reject_then_drain_orphan_server() -> RoleRejectThenDrainOrphanServer {
-    let listener = bind_test_listener();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();
     let (rejected_tx, rejected_rx) = mpsc::channel();
     let (drained_tx, drained_rx) = mpsc::channel();
@@ -1546,7 +1545,7 @@ struct ReplicaWindowThenPromoteServer {
 /// frame, and ACKs it. Mirrors the Java `TestWebSocketServer`
 /// `setRejectWithRole("REPLICA")` -> `setRejectWithRole(null)` script.
 fn spawn_replica_window_then_promote_server() -> ReplicaWindowThenPromoteServer {
-    let listener = bind_test_listener();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     listener.set_nonblocking(true).unwrap();
     let port = listener.local_addr().unwrap().port();
     let promoted = Arc::new(AtomicBool::new(false));
@@ -1605,7 +1604,7 @@ fn spawn_replica_window_then_promote_server() -> ReplicaWindowThenPromoteServer 
 
 fn spawn_stalled_background_orphan_drain_server() -> (u16, mpsc::Receiver<Vec<u8>>, mpsc::Sender<()>)
 {
-    let listener = bind_test_listener();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();
     let (tx, rx) = mpsc::channel();
     let (release_tx, release_rx) = mpsc::channel();
@@ -1628,7 +1627,7 @@ fn spawn_stalled_background_orphan_drain_server() -> (u16, mpsc::Receiver<Vec<u8
 }
 
 fn spawn_stalled_background_orphan_connect_server() -> (u16, mpsc::Receiver<()>, mpsc::Sender<()>) {
-    let listener = bind_test_listener();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();
     let (accepted_tx, accepted_rx) = mpsc::channel();
     let (release_tx, release_rx) = mpsc::channel();
@@ -1651,7 +1650,7 @@ fn spawn_stalled_first_background_orphan_connect_server() -> (
     mpsc::Sender<()>,
     thread::JoinHandle<()>,
 ) {
-    let listener = bind_test_listener();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();
     let (accepted_tx, accepted_rx) = mpsc::channel();
     let (release_tx, release_rx) = mpsc::channel();
@@ -1674,7 +1673,7 @@ fn spawn_blocked_background_orphan_send_server() -> (
     mpsc::Sender<()>,
     thread::JoinHandle<()>,
 ) {
-    let listener = bind_test_listener();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();
     let (send_started_tx, send_started_rx) = mpsc::channel();
     let (release_tx, release_rx) = mpsc::channel();
@@ -1713,7 +1712,7 @@ fn spawn_role_reject_upgrade_server(
     expected_attempts: usize,
     role: &'static str,
 ) -> (u16, thread::JoinHandle<usize>) {
-    let listener = bind_test_listener();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     listener.set_nonblocking(true).unwrap();
     let port = listener.local_addr().unwrap().port();
 
@@ -1757,7 +1756,7 @@ fn spawn_role_reject_upgrade_server(
 /// pre-durable-ack server in a rolling upgrade) until `done` flips. Returns
 /// the number of accepted connections.
 fn spawn_no_durable_ack_upgrade_server(done: Arc<AtomicBool>) -> (u16, thread::JoinHandle<usize>) {
-    let listener = bind_test_listener();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     listener.set_nonblocking(true).unwrap();
     let port = listener.local_addr().unwrap().port();
 
@@ -1885,7 +1884,7 @@ fn seed_large_orphan_slot(sf_dir: &Path) {
 /// this keeps acking, so a multi-frame slot can drain to completion and a test
 /// can assert on how many frames actually arrived.
 fn spawn_orphan_drain_all_frames_server() -> (u16, mpsc::Receiver<Vec<u8>>) {
-    let listener = bind_test_listener();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();
     let (tx, rx) = mpsc::channel();
 
@@ -2405,7 +2404,7 @@ fn qwp_ws_backpressure_timeout_matches_in_all_progress_modes() {
 
 #[test]
 fn qwp_ws_durable_ack_requires_upgrade_echo() {
-    let listener = bind_test_listener();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();
     let (request_tx, request_rx) = mpsc::channel();
 
@@ -2435,7 +2434,7 @@ fn qwp_ws_durable_ack_requires_upgrade_echo() {
 #[test]
 fn qwp_ws_durable_ack_completion_waits_for_durable_confirmation_in_all_progress_modes() {
     for progress in [ProgressCase::Background, ProgressCase::Manual] {
-        let listener = bind_test_listener();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
         let (allow_ack_tx, allow_ack_rx) = mpsc::channel();
         let (done_tx, done_rx) = mpsc::channel();
@@ -2729,7 +2728,7 @@ fn qwp_ws_deep_durable_backlog_fills_byte_ring_replays_and_recovers() {
 
 #[test]
 fn qwp_ws_close_flush_timeout_minus_one_skips_close_drain_wait() {
-    let listener = bind_test_listener();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();
     let (frame_tx, frame_rx) = mpsc::channel();
 
@@ -2783,7 +2782,7 @@ fn qwp_ws_close_flush_timeout_minus_one_skips_close_drain_wait() {
 
 #[test]
 fn qwp_ws_drop_interrupts_blocked_background_send() {
-    let listener = bind_test_listener();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();
     let (send_started_tx, send_started_rx) = mpsc::channel();
     let (release_tx, release_rx) = mpsc::channel();
@@ -2839,7 +2838,7 @@ fn qwp_ws_drop_interrupts_blocked_background_send() {
 }
 
 fn assert_qwp_ws_drop_interrupts_stalled_connect(scheme: &str, tls_options: &str) {
-    let listener = bind_test_listener();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();
     let wait_for_client_hello = scheme == "wss";
     let (connect_stalled_tx, connect_stalled_rx) = mpsc::channel();
@@ -3009,7 +3008,7 @@ fn qwp_ws_public_sender_batch_throughput_benchmark() {
 
 #[test]
 fn qwp_ws_manual_sender_can_pipeline_before_waiting() {
-    let listener = bind_test_listener();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();
     let (frames_tx, frames_rx) = mpsc::channel();
 
@@ -3099,7 +3098,7 @@ fn qwp_ws_manual_sender_can_pipeline_before_waiting() {
 
 #[test]
 fn qwp_ws_manual_sender_schema_rejection_terminalizes_without_ack_advance() {
-    let listener = bind_test_listener();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();
 
     thread::spawn(move || {
@@ -3378,7 +3377,7 @@ fn qwp_ws_orphan_dict_copy_oom_retries_without_failed_sentinel() {
 /// accepted connection is the primary foreground sender (upgraded and ignored);
 /// the second is the orphan drainer.
 fn spawn_orphan_capture_first_frame_server() -> (u16, mpsc::Receiver<Vec<u8>>) {
-    let listener = bind_test_listener();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();
     let (tx, rx) = mpsc::channel();
 
@@ -3761,9 +3760,10 @@ fn qwp_ws_manual_orphan_drainer_walks_endpoint_list() {
     let sf_dir = tempfile::TempDir::new().unwrap();
     seed_orphan_slot(sf_dir.path());
 
-    let bad_endpoint = ReservedPort::reserve();
-    let bad_port = bad_endpoint.port();
+    let bad_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let bad_port = bad_listener.local_addr().unwrap().port();
     let (port, rx) = spawn_manual_orphan_drain_server();
+    drop(bad_listener);
     let drain_conf = format!(
         "ws::addr=127.0.0.1:{bad_port},127.0.0.1:{port};qwp_ws_progress=manual;\
          sf_dir={};sender_id=primary;drain_orphans=on;\
@@ -4065,7 +4065,7 @@ fn qwp_ws_manual_orphan_terminal_retires_slot_and_lets_caller_park() {
     let sf_dir = tempfile::TempDir::new().unwrap();
     seed_orphan_slot(sf_dir.path());
 
-    let listener = bind_test_listener();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();
     let (done_tx, done_rx) = mpsc::channel::<()>();
     let server = thread::spawn(move || {
@@ -4438,7 +4438,7 @@ fn qwp_ws_background_orphan_close_interrupts_blocked_send() {
 fn qwp_ws_subsequent_message_delta_encodes_dictionary_and_reemits_full_schema() {
     // Run two consecutive flushes against a server that processes both. We
     // build a slightly extended mock inline.
-    let listener = bind_test_listener();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();
     let (tx, rx) = mpsc::channel();
 
@@ -4524,7 +4524,7 @@ fn qwp_ws_subsequent_message_delta_encodes_dictionary_and_reemits_full_schema() 
 fn qwp_ws_replay_full_schema_used_when_columns_match() {
     // Public QWP/WS now uses the replay-safe encoder. Even when schemas match,
     // every frame carries its full schema so it can be delivered independently.
-    let listener = bind_test_listener();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();
     let (tx, rx) = mpsc::channel();
 
@@ -4602,7 +4602,7 @@ fn qwp_ws_replay_full_schema_used_when_columns_match() {
 
 #[test]
 fn qwp_ws_full_schema_re_emitted_when_columns_change() {
-    let listener = bind_test_listener();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();
     let (tx, rx) = mpsc::channel();
 
@@ -4713,7 +4713,7 @@ fn first_table_column_count(frame: &[u8]) -> u64 {
 
 #[test]
 fn qwp_ws_server_error_response_is_surfaced() {
-    let listener = bind_test_listener();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();
     let (error_tx, error_rx) = mpsc::channel();
 
@@ -4830,7 +4830,7 @@ fn qwp_ws_server_error_response_is_surfaced() {
 
 #[test]
 fn qwp_ws_schema_rejection_terminalizes_and_notifies_handler() {
-    let listener = bind_test_listener();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();
     let (tx, rx) = mpsc::channel();
     let (error_tx, error_rx) = mpsc::channel();
@@ -4922,7 +4922,7 @@ fn qwp_ws_schema_rejection_terminalizes_and_notifies_handler() {
 
 #[test]
 fn qwp_ws_repeated_head_close_poison_is_pollable_as_protocol_violation() {
-    let listener = bind_test_listener();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();
     let (frame_tx, frame_rx) = mpsc::channel();
 
@@ -5029,7 +5029,7 @@ fn qwp_ws_repeated_head_close_poison_is_pollable_as_protocol_violation() {
 
 #[test]
 fn qwp_ws_orderly_close_reconnects_without_poison_strike() {
-    let listener = bind_test_listener();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();
     let (accept_tx, accept_rx) = mpsc::channel();
 
@@ -5150,7 +5150,7 @@ fn upgrade_against_abandoned_client<F>(write_request: F) -> Option<Vec<String>>
 where
     F: FnOnce(&mut TcpStream) + Send + 'static,
 {
-    let listener = bind_test_listener();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();
     let client = thread::spawn(move || {
         let mut stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
@@ -5199,7 +5199,7 @@ fn assert_server_protocol_violation<F>(write_bad_response: F, expected_message: 
 where
     F: FnOnce(&mut TcpStream) -> std::io::Result<()> + Send + 'static,
 {
-    let listener = bind_test_listener();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();
     let (frame_tx, frame_rx) = mpsc::channel();
 
@@ -5426,7 +5426,7 @@ fn qwp_ws_close_frame_with_invalid_utf8_reason_is_protocol_violation() {
 
 #[test]
 fn qwp_ws_high_level_flush_returns_before_ack() {
-    let listener = bind_test_listener();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();
     let (frame_tx, frame_rx) = mpsc::channel();
     let (ack_tx, ack_rx) = mpsc::channel();
@@ -5468,7 +5468,7 @@ fn qwp_ws_high_level_flush_returns_before_ack() {
 
 #[test]
 fn qwp_ws_high_level_flush_and_keep_returns_before_ack_and_preserves_buffer() {
-    let listener = bind_test_listener();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();
     let (frame_tx, frame_rx) = mpsc::channel();
     let (ack_tx, ack_rx) = mpsc::channel();
@@ -5510,7 +5510,7 @@ fn qwp_ws_high_level_flush_and_keep_returns_before_ack_and_preserves_buffer() {
 
 #[test]
 fn qwp_ws_high_level_flushes_pipeline_before_ack() {
-    let listener = bind_test_listener();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();
     let (frames_tx, frames_rx) = mpsc::channel();
     let (ack_tx, ack_rx) = mpsc::channel();
@@ -5569,7 +5569,7 @@ fn qwp_ws_high_level_flushes_pipeline_before_ack() {
 /// frame (simulating mid-stream socket failure), then accept a *second*
 /// upgrade on retry, drain the replayed frame, ack it.
 fn spawn_dropping_then_recovering_server() -> (u16, std::sync::mpsc::Receiver<Vec<u8>>) {
-    let listener = bind_test_listener();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();
     let (tx, rx) = std::sync::mpsc::channel();
 
@@ -5685,7 +5685,7 @@ fn catch_up_symbols(frame: &[u8]) -> (u64, Vec<Vec<u8>>) {
 /// Drops the first connection unacked, then on reconnect forwards the catch-up
 /// frame (wire seq 0) to the test before acking the replayed data frame (seq 1).
 fn spawn_reconnect_forwarding_catch_up_server() -> (u16, mpsc::Receiver<Vec<u8>>) {
-    let listener = bind_test_listener();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();
     let (tx, rx) = mpsc::channel();
 
@@ -5768,9 +5768,9 @@ fn qwp_ws_reconnect_catch_up_re_registers_the_real_multi_symbol_dictionary() {
 
 #[test]
 fn qwp_ws_midstream_failure_reconnects_to_next_endpoint() {
-    let first_listener = bind_test_listener();
+    let first_listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let first_port = first_listener.local_addr().unwrap().port();
-    let second_listener = bind_test_listener();
+    let second_listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let second_port = second_listener.local_addr().unwrap().port();
     let (tx, rx) = std::sync::mpsc::channel();
 
@@ -5830,7 +5830,7 @@ fn qwp_ws_midstream_failure_version_error_on_other_endpoint_stays_retryable() {
     // round must NOT be treated as "the whole fleet is incompatible": the
     // reconnect stays retryable, the next round retries A, and the replayed
     // frame lands there.
-    let first_listener = bind_test_listener();
+    let first_listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let first_port = first_listener.local_addr().unwrap().port();
     let done = Arc::new(AtomicBool::new(false));
     let (second_port, second_handle) = spawn_no_durable_ack_upgrade_server(Arc::clone(&done));
@@ -5896,7 +5896,7 @@ fn qwp_ws_midstream_failure_version_error_on_other_endpoint_stays_retryable() {
 
 #[test]
 fn qwp_ws_sync_reconnect_retries_failed_attempt() {
-    let listener = bind_test_listener();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();
     let (payload_tx, payload_rx) = mpsc::channel();
     let (event_tx, event_rx) = mpsc::channel();
@@ -5980,7 +5980,7 @@ fn qwp_ws_sync_reconnect_retries_failed_attempt() {
 
 #[test]
 fn qwp_ws_sync_initial_connect_retry_survives_dropped_upgrade() {
-    let listener = bind_test_listener();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();
     let (payload_tx, payload_rx) = mpsc::channel();
     let (event_tx, event_rx) = mpsc::channel();
@@ -6060,11 +6060,12 @@ fn qwp_ws_sync_initial_connect_retry_survives_dropped_upgrade() {
 
 #[test]
 fn qwp_ws_initial_connect_walks_endpoint_list_in_off_mode() {
-    let bad_endpoint = ReservedPort::reserve();
-    let bad_port = bad_endpoint.port();
+    let bad_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let bad_port = bad_listener.local_addr().unwrap().port();
 
-    let listener = bind_test_listener();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let good_port = listener.local_addr().unwrap().port();
+    drop(bad_listener);
     let (payload_tx, payload_rx) = mpsc::channel();
 
     thread::spawn(move || {
@@ -6096,9 +6097,9 @@ fn qwp_ws_initial_connect_walks_endpoint_list_in_off_mode() {
 
 #[test]
 fn qwp_ws_initial_connect_role_reject_tries_next_endpoint() {
-    let first_listener = bind_test_listener();
+    let first_listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let first_port = first_listener.local_addr().unwrap().port();
-    let second_listener = bind_test_listener();
+    let second_listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let second_port = second_listener.local_addr().unwrap().port();
     let (payload_tx, payload_rx) = mpsc::channel();
 
@@ -6151,9 +6152,9 @@ fn qwp_ws_initial_connect_role_reject_tries_next_endpoint() {
 
 #[test]
 fn qwp_ws_initial_connect_retryable_status_tries_next_endpoint() {
-    let first_listener = bind_test_listener();
+    let first_listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let first_port = first_listener.local_addr().unwrap().port();
-    let second_listener = bind_test_listener();
+    let second_listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let second_port = second_listener.local_addr().unwrap().port();
     let (payload_tx, payload_rx) = mpsc::channel();
 
@@ -6206,7 +6207,7 @@ fn qwp_ws_initial_connect_retryable_status_tries_next_endpoint() {
 #[test]
 fn qwp_ws_initial_connect_mixed_role_and_transport_prefers_role_mismatch() {
     let (role_port, role_handle) = spawn_role_reject_upgrade_server(1, "PRIMARY_CATCHUP");
-    let status_listener = bind_test_listener();
+    let status_listener = TcpListener::bind("127.0.0.1:0").unwrap();
     status_listener.set_nonblocking(true).unwrap();
     let status_port = status_listener.local_addr().unwrap().port();
     let status_handle = thread::spawn(move || {
@@ -6260,9 +6261,9 @@ fn qwp_ws_initial_connect_mixed_role_and_transport_prefers_role_mismatch() {
 
 #[test]
 fn qwp_ws_initial_connect_unsupported_version_tries_next_endpoint() {
-    let first_listener = bind_test_listener();
+    let first_listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let first_port = first_listener.local_addr().unwrap().port();
-    let second_listener = bind_test_listener();
+    let second_listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let second_port = second_listener.local_addr().unwrap().port();
     let (payload_tx, payload_rx) = mpsc::channel();
 
@@ -6306,9 +6307,9 @@ fn qwp_ws_initial_connect_unsupported_version_tries_next_endpoint() {
 
 #[test]
 fn qwp_ws_sync_initial_retry_unsupported_version_retries_next_round() {
-    let first_listener = bind_test_listener();
+    let first_listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let first_port = first_listener.local_addr().unwrap().port();
-    let second_listener = bind_test_listener();
+    let second_listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let second_port = second_listener.local_addr().unwrap().port();
     let first_attempts = Arc::new(AtomicUsize::new(0));
     let second_attempts = Arc::new(AtomicUsize::new(0));
@@ -6389,9 +6390,9 @@ fn qwp_ws_sync_initial_retry_unsupported_version_retries_next_round() {
 
 #[test]
 fn qwp_ws_sync_initial_retry_malformed_101_retries_after_round_exhaustion() {
-    let first_listener = bind_test_listener();
+    let first_listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let first_port = first_listener.local_addr().unwrap().port();
-    let second_listener = bind_test_listener();
+    let second_listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let second_port = second_listener.local_addr().unwrap().port();
     let first_attempts = Arc::new(AtomicUsize::new(0));
     let second_attempts = Arc::new(AtomicUsize::new(0));
@@ -6473,7 +6474,7 @@ fn qwp_ws_sync_initial_retry_malformed_101_retries_after_round_exhaustion() {
 #[test]
 fn qwp_ws_sync_initial_retry_mixed_role_and_transport_prefers_role_mismatch() {
     let (role_port, role_handle) = spawn_role_reject_upgrade_server(1, "PRIMARY_CATCHUP");
-    let status_listener = bind_test_listener();
+    let status_listener = TcpListener::bind("127.0.0.1:0").unwrap();
     status_listener.set_nonblocking(true).unwrap();
     let status_port = status_listener.local_addr().unwrap().port();
     let status_handle = thread::spawn(move || {
@@ -6536,9 +6537,9 @@ fn qwp_ws_sync_initial_retry_mixed_role_and_transport_prefers_role_mismatch() {
 
 #[test]
 fn qwp_ws_initial_connect_durable_ack_mismatch_tries_next_endpoint() {
-    let first_listener = bind_test_listener();
+    let first_listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let first_port = first_listener.local_addr().unwrap().port();
-    let second_listener = bind_test_listener();
+    let second_listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let second_port = second_listener.local_addr().unwrap().port();
     let (payload_tx, payload_rx) = mpsc::channel();
 
@@ -6625,7 +6626,7 @@ fn qwp_ws_sync_initial_retry_durable_ack_all_role_rejects_retry_until_budget() {
 /// SYN against a refused port for ~1s, which would eat a whole sub-second
 /// retry budget in a single round.
 fn spawn_accept_then_drop_server(done: Arc<AtomicBool>) -> (u16, thread::JoinHandle<usize>) {
-    let listener = bind_test_listener();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     listener.set_nonblocking(true).unwrap();
     let port = listener.local_addr().unwrap().port();
 
@@ -6692,8 +6693,9 @@ fn qwp_ws_sync_initial_retry_version_error_does_not_mask_transient_endpoint_fail
 
 #[test]
 fn qwp_ws_sync_initial_retry_budget_exhaustion_reports_context() {
-    let dead_endpoint = ReservedPort::reserve();
-    let port = dead_endpoint.port();
+    let probe = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = probe.local_addr().unwrap().port();
+    drop(probe);
 
     let conf = format!(
         "ws::addr=127.0.0.1:{port};\
@@ -6726,10 +6728,10 @@ fn qwp_ws_sync_initial_retry_budget_exhaustion_reports_context() {
 
 #[test]
 fn qwp_ws_sync_initial_retry_resets_non_healthy_between_rounds() {
-    let first_listener = bind_test_listener();
+    let first_listener = TcpListener::bind("127.0.0.1:0").unwrap();
     first_listener.set_nonblocking(true).unwrap();
     let first_port = first_listener.local_addr().unwrap().port();
-    let second_listener = bind_test_listener();
+    let second_listener = TcpListener::bind("127.0.0.1:0").unwrap();
     second_listener.set_nonblocking(true).unwrap();
     let second_port = second_listener.local_addr().unwrap().port();
 
@@ -6842,7 +6844,7 @@ fn qwp_ws_sync_initial_retry_resets_non_healthy_between_rounds() {
 
 #[test]
 fn qwp_ws_async_initial_connect_background_can_flush() {
-    let listener = bind_test_listener();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();
     let (payload_tx, payload_rx) = mpsc::channel();
 
@@ -7034,7 +7036,7 @@ pub(crate) fn upgrade_mock_stream_with_max_batch_size(
 }
 
 fn spawn_max_batch_size_server(max_batch_size: Option<usize>) -> (u16, mpsc::Receiver<MockResult>) {
-    let listener = bind_test_listener();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();
     let (tx, rx) = mpsc::channel();
     thread::spawn(move || {
@@ -7055,7 +7057,7 @@ fn spawn_max_batch_size_server(max_batch_size: Option<usize>) -> (u16, mpsc::Rec
 }
 
 fn spawn_max_batch_size_upgrade_only_server(max_batch_size: Option<usize>) -> u16 {
-    let listener = bind_test_listener();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();
     thread::spawn(move || {
         let (mut stream, _) = listener.accept().unwrap();

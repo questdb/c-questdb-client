@@ -293,7 +293,7 @@ struct DropUnackedFrameProxy {
 
 impl DropUnackedFrameProxy {
     fn spawn(config: &ProbeConfig) -> ProbeResult<Self> {
-        let listener = crate::tests::net::bind_test_listener();
+        let listener = TcpListener::bind(("127.0.0.1", 0))?;
         listener.set_nonblocking(true)?;
         let port = listener.local_addr()?.port();
         let target_host = config.host.clone();

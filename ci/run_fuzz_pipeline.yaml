@@ -141,9 +141,11 @@ stages:
               pathToPublish: $(Build.ArtifactStagingDirectory)/qdb-log-$(Agent.OS).zip
               artifactName: qdb-log-$(Agent.OS)-linux
 
-      # Pure-Rust proptest fuzz for the QWP egress codec. The platform-specific
-      # macOS/Windows legs stay hosted; Linux runs separately on hetzner-incus.
-      # PROPTEST_CASES is intentionally higher than the in-source default.
+      # Pure-Rust proptest fuzz for the QWP egress codec. macOS/Windows stay
+      # hosted; Linux runs separately on hetzner-incus because Azure cannot
+      # assign different pools to matrix legs. PROPTEST_CASES is intentionally
+      # higher than the in-source default. Failures replay from the seeds in
+      # questdb-rs/proptest-regressions/egress/.
       - job: TestQwpEgressFuzz
         displayName: "QWP egress fuzz suite (mac/windows hosted)"
         strategy:
@@ -198,6 +200,8 @@ stages:
           - bash: |
               set -euxo pipefail
               cd questdb-rs
+              # Keep these scopes aligned with the hosted job above: filters
+              # under `--test` do not reach the library's `mod tests` blocks.
               PROPTEST_CASES=10000 cargo test --release \
                 --features sync-reader-qwp-ws \
                 --test qwp_egress_bounds_fuzz \
@@ -241,7 +245,8 @@ stages:
             retryCountOnTaskFailure: 2
             inputs:
               mavenPOMFile: "questdb/pom.xml"
-              jdkVersionOption: "default"
+              javaHomeOption: "Path"
+              jdkDirectory: "$(JAVA_HOME)"
               options: "-s $(MAVEN_SETTINGS_FILE) -DskipTests -Pbuild-web-console$(CLIENT_PROFILE) $(MAVEN_RUN_OPTS)"
           - script: |
               set -euxo pipefail
@@ -273,12 +278,9 @@ stages:
           - TestQwpEgressFuzzLinux
           - TestQwpEgressLiveServerFuzz
         condition: failed()
-        # Hosted, deliberately: every job this watches runs on
-        # hetzner-incus, and an alert that needs the pool it is reporting
-        # on can queue behind — or die with — the outage it exists to
-        # announce. It checks nothing out and only curls Slack, so it has
-        # no reason to want the self-hosted image. Same split as
-        # run_soak_pipeline.yaml's notifier.
+        # Hosted deliberately: a Hetzner outage can fail or strand the Linux
+        # jobs, so the notifier must not depend on that pool. It checks nothing
+        # out and only curls Slack. Same split as run_soak_pipeline.yaml.
         pool:
           vmImage: "ubuntu-latest"
         steps:

@@ -35,7 +35,6 @@
 //! HTTP→WebSocket upgrade, then either parks on the connection or reads each
 //! QWP frame and replies with an OK ack (status 0x00).
 
-use crate::tests::net::{ReservedPort, bind_test_listener};
 use std::collections::BTreeSet;
 use std::fs;
 use std::io::{Read, Write};
@@ -183,18 +182,8 @@ impl MockServer {
         Self::spawn_with_mode(max_accepts, MockMode::RejectAuth)
     }
 
-    /// Bring a server up on an already-reserved port after `delay`.
-    ///
-    /// The claim is handed over and held for the server's lifetime, so the
-    /// port refuses connections for `delay` and then starts accepting, with
-    /// no window in between where another test could be given it.
     #[cfg(feature = "polars-ingress")]
-    fn spawn_acking_on_reserved_port_after_delay(
-        reserved: ReservedPort,
-        max_accepts: usize,
-        delay: Duration,
-    ) -> Self {
-        let port = reserved.port();
+    fn spawn_acking_on_port_after_delay(port: u16, max_accepts: usize, delay: Duration) -> Self {
         let stop = Arc::new(AtomicBool::new(false));
         let accepted = Arc::new(AtomicUsize::new(0));
         let stop_clone = Arc::clone(&stop);
@@ -204,8 +193,7 @@ impl MockServer {
             .name("qwp-ingress-pool-delayed-mock-server".to_string())
             .spawn(move || {
                 thread::sleep(delay);
-                let listener =
-                    TcpListener::bind(("127.0.0.1", reserved.port())).expect("bind delayed port");
+                let listener = TcpListener::bind(("127.0.0.1", port)).expect("bind delayed port");
                 listener
                     .set_nonblocking(true)
                     .expect("set_nonblocking on delayed listener");
@@ -233,7 +221,7 @@ impl MockServer {
         mode: MockMode,
         capture: Option<mpsc::Sender<Vec<u8>>>,
     ) -> Self {
-        let listener = bind_test_listener();
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind 127.0.0.1");
         listener
             .set_nonblocking(true)
             .expect("set_nonblocking on listener");
@@ -768,6 +756,11 @@ fn frame_table_name(payload: &[u8]) -> String {
         .to_owned()
 }
 
+fn unused_local_port() -> u16 {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind unused local port");
+    listener.local_addr().expect("unused local addr").port()
+}
+
 /// Parse the `row_count` field out of a captured QWP frame: header(12) then
 /// `delta_start`, the new-symbol delta, the table name, then `row_count`.
 fn frame_row_count(payload: &[u8]) -> u64 {
@@ -794,8 +787,7 @@ fn sorted_slot_names(sf_dir: &Path) -> Vec<String> {
 }
 
 fn seed_async_qwp_ws_slot(sf_dir: &Path, sender_id: &str, value: i64) {
-    let dead_endpoint = ReservedPort::reserve();
-    let port = dead_endpoint.port();
+    let port = unused_local_port();
     let conf = format!(
         "ws::addr=127.0.0.1:{port};lazy_connect=true;initial_connect_retry=async;\
          sf_dir={};sender_id={sender_id};sf_max_segment_bytes=256;sf_max_total_bytes=1024;\
@@ -890,9 +882,8 @@ fn eager_borrow_honors_default_initial_connect_retry_off() {
     // Non-lazy pool, sender_pool_min=0 so connect() itself opens nothing:
     // the borrow performs the initial connect, honoring the default
     // fail-fast mode.
-    let dead = ReservedPort::reserve();
     let conf = eager_conf(
-        &[dead.port()],
+        &[unused_local_port()],
         "sender_pool_min=0;query_pool_min=0;sender_pool_max=1;acquire_timeout_ms=0;",
     );
     let db = QuestDb::connect(&conf).unwrap();
@@ -924,8 +915,7 @@ fn eager_connect_prewarms_and_fails_fast_offline() {
     // Default (non-lazy) startup with the default warm minimum of one
     // ingest sender: connect() itself performs the initial connect and
     // fails fast against a dead endpoint, matching the Java client.
-    let dead = ReservedPort::reserve();
-    let conf = eager_conf(&[dead.port()], "query_pool_min=0;");
+    let conf = eager_conf(&[unused_local_port()], "query_pool_min=0;");
     let start = std::time::Instant::now();
     QuestDb::connect(&conf).expect_err("eager connect must fail against a dead endpoint");
     assert!(
@@ -959,9 +949,8 @@ fn eager_connect_with_async_mode_still_fails_fast_on_reader_prewarm() {
     // initial_connect_retry is ingress-only: reader pre-opens always connect
     // synchronously and fail fast. Bare async is therefore not a
     // non-blocking startup while query_pool_min > 0; lazy_connect is.
-    let dead = ReservedPort::reserve();
     let conf = eager_conf(
-        &[dead.port()],
+        &[unused_local_port()],
         "initial_connect_retry=async;sender_pool_min=0;query_pool_min=1;",
     );
     let start = std::time::Instant::now();
@@ -978,9 +967,8 @@ fn reconnect_keys_do_not_stall_eager_connect() {
     // sender. The pool must not let that promotion drive its eager startup:
     // a mid-stream failover budget (default 300 s) must never become a
     // blocking connect() stall. Only an explicitly set mode counts.
-    let dead = ReservedPort::reserve();
     let conf = eager_conf(
-        &[dead.port()],
+        &[unused_local_port()],
         "reconnect_max_duration_millis=6000;query_pool_min=0;",
     );
     let start = std::time::Instant::now();
@@ -998,8 +986,7 @@ fn eager_connect_fails_fast_despite_dirty_recovery_slots() {
     // foreground connect, so a dead server fails connect() deterministically
     // whether or not a previous run left queued data behind.
     let dir = TempDir::new().unwrap();
-    let dead_endpoint = ReservedPort::reserve();
-    let dead_port = dead_endpoint.port();
+    let dead_port = unused_local_port();
     let offline = format!(
         "ws::addr=127.0.0.1:{dead_port};lazy_connect=true;auth_timeout=200;\
          connect_timeout=500;\
@@ -1037,8 +1024,7 @@ fn eager_connect_fails_fast_despite_dirty_recovery_slots() {
 #[test]
 fn eager_connect_adopts_dirty_slot_and_replays_on_live_server() {
     let dir = TempDir::new().unwrap();
-    let dead_endpoint = ReservedPort::reserve();
-    let dead_port = dead_endpoint.port();
+    let dead_port = unused_local_port();
     let offline = format!(
         "ws::addr=127.0.0.1:{dead_port};lazy_connect=true;auth_timeout=200;\
          sf_dir={};sender_id=eagerlive;sender_pool_min=1;sender_pool_max=1;\
@@ -1082,9 +1068,8 @@ fn eager_connect_with_sync_mode_still_fails_fast_on_reader_prewarm() {
     // Java permits this combination: sync governs ingest only, while readers
     // always connect fail-fast. Skip ingest prewarm so the down reader is the
     // observed failure; the long reconnect budget must not delay it.
-    let dead = ReservedPort::reserve();
     let conf = eager_conf(
-        &[dead.port()],
+        &[unused_local_port()],
         "initial_connect_retry=sync;reconnect_max_duration_millis=6000;\
          sender_pool_min=0;query_pool_min=1;",
     );
@@ -1112,10 +1097,9 @@ fn lazy_connect_rejects_explicit_blocking_initial_connect() {
         );
     }
     // Explicit async is the mode lazy_connect implies; no conflict.
-    let dead = ReservedPort::reserve();
     QuestDb::connect(&format!(
         "ws::addr=127.0.0.1:{};lazy_connect=true;initial_connect_retry=async;",
-        dead.port()
+        unused_local_port()
     ))
     .expect("lazy_connect with explicit async must be accepted");
 
@@ -1137,10 +1121,9 @@ fn lazy_connect_rejects_positive_query_pool_min() {
     assert_eq!(err.code(), ErrorCode::ConfigError);
     assert!(err.msg().contains("query_pool_min"), "{}", err.msg());
     // Explicit 0 restates the lazy default; accepted.
-    let dead = ReservedPort::reserve();
     QuestDb::connect(&format!(
         "ws::addr=127.0.0.1:{};lazy_connect=true;query_pool_min=0;",
-        dead.port()
+        unused_local_port()
     ))
     .expect("query_pool_min=0 is the lazy default");
 }
@@ -1196,8 +1179,7 @@ fn lazy_borrow_ignores_reconnect_promoted_sync_and_buffers_offline() {
     // `lazy_connect=true`. The lazy pool must keep its background initial
     // connect — the runner already applies the reconnect budget — so both
     // connect() and the borrow work while the server is away.
-    let dead = ReservedPort::reserve();
-    let conf = conf_for_endpoints(&[dead.port()], "");
+    let conf = conf_for_endpoints(&[unused_local_port()], "");
     let db = QuestDb::connect(&conf).unwrap();
     let _sender = db
         .borrow_sender()
@@ -1453,8 +1435,7 @@ fn disk_store_and_forward_buffer_and_chunk_borrow_and_flush_together() {
 
 #[test]
 fn disk_store_and_forward_duplicate_pool_collides_on_managed_slot() {
-    let dead_endpoint = ReservedPort::reserve();
-    let port = dead_endpoint.port();
+    let port = unused_local_port();
     let dir = TempDir::new().unwrap();
     let conf = format!(
         "ws::addr=127.0.0.1:{port};lazy_connect=true;auth_timeout=200;\
@@ -1486,8 +1467,7 @@ fn disk_store_and_forward_duplicate_pool_collides_on_managed_slot() {
 
 #[test]
 fn disk_store_and_forward_duplicate_pool_connect_warn_skips_flocked_slots() {
-    let dead_endpoint = ReservedPort::reserve();
-    let port = dead_endpoint.port();
+    let port = unused_local_port();
     let dir = TempDir::new().unwrap();
     let conf = format!(
         "ws::addr=127.0.0.1:{port};lazy_connect=true;auth_timeout=200;initial_connect_retry=async;\
@@ -1551,8 +1531,7 @@ fn sync_borrow_adopts_dirty_slot_and_continues_recovered_symbol_dict() {
     // replayed frame must register the recovered symbol from zero, and a new
     // symbol published afterwards must continue above the recovered id.
     let dir = TempDir::new().unwrap();
-    let dead_endpoint = ReservedPort::reserve();
-    let dead_port = dead_endpoint.port();
+    let dead_port = unused_local_port();
     let offline_conf = format!(
         "ws::addr=127.0.0.1:{dead_port};lazy_connect=true;auth_timeout=200;\
          sf_dir={};sender_id=syncrec;sender_pool_min=1;sender_pool_max=1;\
@@ -1643,11 +1622,7 @@ fn failed_eager_borrow_on_disk_slot_releases_flock_and_keeps_data() {
     // rather than colliding on "slot in use") and leave the segments
     // recoverable by a later pool.
     let dir = TempDir::new().unwrap();
-    // A claimed-but-unbound port: connecting is refused outright, so the
-    // eager connect below fails on the dial rather than idling until the
-    // WebSocket upgrade times out.
-    let dead = ReservedPort::reserve();
-    let dead_port = dead.port();
+    let dead_port = unused_local_port();
     let offline = format!(
         "ws::addr=127.0.0.1:{dead_port};lazy_connect=true;auth_timeout=200;\
          sf_dir={};sender_id=flockrec;sender_pool_min=1;sender_pool_max=1;\
@@ -1717,8 +1692,7 @@ fn failed_eager_borrow_on_disk_slot_releases_flock_and_keeps_data() {
 #[test]
 fn disk_store_and_forward_restart_replays_reminted_and_out_of_range_managed_slots() {
     let dir = TempDir::new().unwrap();
-    let seed_endpoint = ReservedPort::reserve();
-    let seed_port = seed_endpoint.port();
+    let seed_port = unused_local_port();
     let seed_conf = format!(
         "ws::addr=127.0.0.1:{seed_port};lazy_connect=true;auth_timeout=200;\
          reconnect_max_duration_millis=100;sf_dir={};sender_id=replay;\
@@ -1771,8 +1745,7 @@ fn disk_store_and_forward_restart_replays_reminted_and_out_of_range_managed_slot
 #[test]
 fn disk_store_and_forward_growth_uses_connect_time_recovery_snapshot() {
     let dir = TempDir::new().unwrap();
-    let seed_endpoint = ReservedPort::reserve();
-    let seed_port = seed_endpoint.port();
+    let seed_port = unused_local_port();
     let seed_conf = format!(
         "ws::addr=127.0.0.1:{seed_port};lazy_connect=true;auth_timeout=200;\
          reconnect_max_duration_millis=100;sf_dir={};sender_id=snapshot;\
@@ -1851,8 +1824,7 @@ fn disk_store_and_forward_growth_uses_connect_time_recovery_snapshot() {
 #[test]
 fn disk_store_and_forward_restart_same_pool_max_replays_in_range_slots_without_borrow() {
     let dir = TempDir::new().unwrap();
-    let seed_endpoint = ReservedPort::reserve();
-    let seed_port = seed_endpoint.port();
+    let seed_port = unused_local_port();
     let seed_conf = format!(
         "ws::addr=127.0.0.1:{seed_port};lazy_connect=true;auth_timeout=200;\
          reconnect_max_duration_millis=100;sf_dir={};sender_id=samepool;\
@@ -2009,8 +1981,7 @@ fn store_and_forward_column_sender_reports_fsn_progress() {
 
 #[test]
 fn store_and_forward_pool_borrow_buffers_with_no_server() {
-    let dead_endpoint = ReservedPort::reserve();
-    let port = dead_endpoint.port();
+    let port = unused_local_port();
     let conf = conf_for_endpoints(&[port], "pool_reap=manual;close_flush_timeout_millis=0;");
     let db = QuestDb::connect(&conf).unwrap();
 
@@ -2035,8 +2006,7 @@ fn store_and_forward_pool_borrow_buffers_with_no_server() {
 
 #[test]
 fn pooled_buffer_factory_uses_configured_name_limit_without_borrow() {
-    let dead_endpoint = ReservedPort::reserve();
-    let port = dead_endpoint.port();
+    let port = unused_local_port();
     let conf = conf_for_endpoints(
         &[port],
         "max_name_len=16;pool_reap=manual;close_flush_timeout_millis=0;",
@@ -2054,8 +2024,7 @@ fn pooled_buffer_factory_uses_configured_name_limit_without_borrow() {
 
 #[test]
 fn pooled_buffer_rejects_non_qwp_ws_without_modification() {
-    let dead_endpoint = ReservedPort::reserve();
-    let port = dead_endpoint.port();
+    let port = unused_local_port();
     let db = QuestDb::connect(&conf_for_endpoints(
         &[port],
         "pool_reap=manual;close_flush_timeout_millis=0;",
@@ -2175,8 +2144,7 @@ fn pooled_buffer_empty_incomplete_keep_clear_multi_table_and_fsn_contract() {
 
 #[test]
 fn pooled_buffer_too_large_is_not_split_and_keeps_input() {
-    let dead_endpoint = ReservedPort::reserve();
-    let port = dead_endpoint.port();
+    let port = unused_local_port();
     let db = QuestDb::connect(&conf_for_endpoints(
         &[port],
         "max_buf_size=1024;pool_reap=manual;close_flush_timeout_millis=0;",
@@ -2339,8 +2307,7 @@ fn pooled_buffer_wait_preflight_and_post_publish_failure_contract() {
 
 #[test]
 fn pooled_buffer_is_origin_independent_sendable_and_offline_first() {
-    let dead_endpoint = ReservedPort::reserve();
-    let port = dead_endpoint.port();
+    let port = unused_local_port();
     let db = Arc::new(
         QuestDb::connect(&conf_for_endpoints(
             &[port],
@@ -2720,8 +2687,7 @@ fn disk_recovery_orphan_drains_mixed_shapes_with_one_dictionary() {
     use crate::ingress::column_sender::ArrowColumnOverride;
 
     let dir = TempDir::new().unwrap();
-    let seed_endpoint = ReservedPort::reserve();
-    let seed_port = seed_endpoint.port();
+    let seed_port = unused_local_port();
     let seed_conf = format!(
         "ws::addr=127.0.0.1:{seed_port};lazy_connect=true;auth_timeout=200;\
          reconnect_max_duration_millis=10000;sf_dir={};sender_id=mixedrec;\
@@ -4709,14 +4675,11 @@ fn store_and_forward_flush_and_wait_surfaces_server_rejection_memory() {
 #[test]
 fn pool_is_lazy_and_opens_on_first_borrow() {
     let server = MockServer::spawn(8);
-    // Full-suite contention can delay the mock's upgrade response beyond the
-    // shared helper's two-second authentication timeout and trigger a retry.
-    let conf = format!(
-        "ws::addr=127.0.0.1:{};lazy_connect=true;auth_timeout=10000;\
-         reconnect_max_duration_millis=1000;sender_pool_min=3;sender_pool_max=4;",
-        server.port()
-    );
-    let db = QuestDb::connect(&conf).unwrap();
+    let db = QuestDb::connect(&conf_for(
+        server.port(),
+        "sender_pool_min=3;sender_pool_max=4;",
+    ))
+    .unwrap();
     // Lazy pool, like the row-major sender: `connect` opens nothing.
     assert_eq!(db.free_count(), 0);
     assert_eq!(db.in_use_count(), 0);
@@ -5620,8 +5583,7 @@ fn buffer_sender_local_build_failure_releases_in_use_slot() {
     // disk slot from another pool, then prove the failed borrow releases the
     // in-use reservation rather than permanently burning the cap.
     let dir = TempDir::new().unwrap();
-    let dead_endpoint = ReservedPort::reserve();
-    let port = dead_endpoint.port();
+    let port = unused_local_port();
     let conf = format!(
         "ws::addr=127.0.0.1:{port};lazy_connect=true;auth_timeout=200;sf_dir={};\
          sender_id=buildfail;sender_pool_min=1;sender_pool_max=1;pool_reap=manual;\
@@ -5789,7 +5751,7 @@ fn refuses_durable_ack_without_opt_in() {
 
 #[test]
 fn durable_ack_without_opt_in_does_not_publish_commit_frame() {
-    let listener = bind_test_listener();
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind 127.0.0.1");
     let port = listener.local_addr().expect("local_addr").port();
     let (tx, rx) = mpsc::channel();
 
@@ -5946,7 +5908,7 @@ fn flush_and_wait_durable_without_opt_in_leaves_chunk_untouched() {
     // Mirror `durable_ack_without_opt_in_does_not_publish_commit_frame` but for
     // the ACKing flush of a *data* chunk: the durable opt-in is a preflight, so
     // no frame is published and the chunk is retained.
-    let listener = bind_test_listener();
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind 127.0.0.1");
     let port = listener.local_addr().expect("local_addr").port();
     let (tx, rx) = mpsc::channel();
 
@@ -6698,9 +6660,9 @@ fn reborrow_after_primary_failure_lands_on_live_endpoint_and_skips_dead() {
 #[test]
 fn failed_reborrow_keeps_handle_erroring_without_panicking() {
     let primary = MockServer::spawn_upgrade_then_close(1);
-    let unreachable = ReservedPort::reserve();
+    let unreachable_port = unused_local_port();
     let db = QuestDb::connect(&conf_for_endpoints(
-        &[primary.port(), unreachable.port()],
+        &[primary.port(), unreachable_port],
         "sender_pool_min=1;sender_pool_max=1;\
          reconnect_initial_backoff_millis=1;\
          reconnect_max_backoff_millis=1;",
@@ -7324,13 +7286,9 @@ fn flush_polars_dataframe_retries_reborrow_connect_until_endpoint_recovers() {
     // keep trying the replacement-connect step instead of surfacing the first
     // SocketError from `reborrow_from_pool`.
     let primary = MockServer::spawn_upgrade_then_close(1);
-    let recovery_endpoint = ReservedPort::reserve();
-    let recovery_port = recovery_endpoint.port();
-    let recovery = MockServer::spawn_acking_on_reserved_port_after_delay(
-        recovery_endpoint,
-        2,
-        Duration::from_millis(150),
-    );
+    let recovery_port = unused_local_port();
+    let recovery =
+        MockServer::spawn_acking_on_port_after_delay(recovery_port, 2, Duration::from_millis(150));
     let db = QuestDb::connect(&conf_for_endpoints(
         &[primary.port(), recovery_port],
         "sender_pool_min=1;sender_pool_max=2;\
@@ -7562,7 +7520,7 @@ fn flush_arrow_batch_at_column_commits_in_one_call() {
 /// borrow (which ignores the unsolicited `SERVER_INFO` while parked).
 #[cfg(feature = "sync-reader-qwp-ws")]
 mod reader_pool {
-    use crate::tests::net::bind_test_listener;
+    use std::net::TcpListener;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::thread;
@@ -7585,7 +7543,7 @@ mod reader_pool {
 
     impl ReaderMockServer {
         fn spawn(max_accepts: usize) -> Self {
-            let listener = bind_test_listener();
+            let listener = TcpListener::bind("127.0.0.1:0").expect("bind 127.0.0.1");
             listener
                 .set_nonblocking(true)
                 .expect("set_nonblocking on listener");
@@ -8171,7 +8129,7 @@ mod conn_event_tests {
     fn unreachable_endpoint_fires_attempt_failed_and_unreachable() {
         // Bind a port and close the listener so connects are refused.
         let port = {
-            let listener = bind_test_listener();
+            let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
             listener.local_addr().unwrap().port()
         };
         let conf = format!(
@@ -8324,8 +8282,7 @@ mod conn_event_tests {
 
     #[test]
     fn sfa_unreachable_endpoint_fires_attempt_failed_and_unreachable() {
-        let dead = ReservedPort::reserve();
-        let port = dead.port();
+        let port = unused_local_port();
         let conf = format!(
             "ws::addr=127.0.0.1:{port};lazy_connect=true;auth_timeout=2000;\
              reconnect_max_duration_millis=200;connect_timeout=100;\
@@ -8632,29 +8589,18 @@ mod sender_conn_event_tests {
         drop(sender);
     }
 
-    /// The endpoint has to be genuinely dead — claimed, so no parallel
-    /// server can take it, and unbound, so the dial is refused outright.
-    /// A held-but-unlistening socket would move the failure to the
-    /// WebSocket upgrade timeout, which is a different code path from the
-    /// one these events describe.
-    fn dead_endpoint_conf(dead: &ReservedPort) -> String {
-        let dead_port = dead.port();
-        format!(
-            "ws::addr=127.0.0.1:{dead_port};lazy_connect=true;auth_timeout=2000;\
-             reconnect_max_duration_millis=200;connect_timeout=100;"
-        )
-    }
-
     #[test]
     fn sender_unreachable_fires_attempt_failed_and_unreachable() {
-        let dead = ReservedPort::reserve();
+        let port = {
+            let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+            listener.local_addr().unwrap().port()
+        };
         let (seen, listener) = collecting_listener();
-        // Deliberately the fluent form, with no binding to keep the builder
-        // alive: `build()` delivers the failure events before it returns, so
-        // the temporary's drop cannot discard them. See
-        // `failed_build_delivers_events_to_a_dropped_builder` for the same
-        // property stated without relying on statement-temporary lifetimes.
-        let err = SenderBuilder::from_conf(dead_endpoint_conf(&dead))
+        let conf = format!(
+            "ws::addr=127.0.0.1:{port};lazy_connect=true;auth_timeout=2000;\
+             reconnect_max_duration_millis=200;connect_timeout=100;"
+        );
+        let err = SenderBuilder::from_conf(conf)
             .unwrap()
             .connection_listener(listener, 0)
             .unwrap()
@@ -8665,62 +8611,6 @@ mod sender_conn_event_tests {
         assert!(attempt.attempt_number.is_some());
         assert!(attempt.cause_code.is_some());
         wait_for_kind(&seen, ConnectionEventKind::AllEndpointsUnreachable);
-    }
-
-    /// The regression the barrier exists for: once `build()` has failed,
-    /// the builder holds the last handle to the event source, and dropping
-    /// a dispatcher discards its backlog. Only the first event survives
-    /// that drop — `EventDispatcher::drop` joins the one in-flight listener
-    /// invocation and throws the rest away.
-    ///
-    /// The listener is gated shut for longer than the connect walk takes, so
-    /// every event is still queued when `build()` reaches its return. Without
-    /// the barrier the walk's terminal `AllEndpointsUnreachable` is one of
-    /// the discarded ones; with it, `build()` does not return until the
-    /// listener has them all.
-    #[test]
-    fn failed_build_delivers_events_to_a_dropped_builder() {
-        let dead = ReservedPort::reserve();
-        let gate = Arc::new((StdMutex::new(false), std::sync::Condvar::new()));
-        let gate_in_listener = Arc::clone(&gate);
-        let seen: Arc<StdMutex<Vec<ConnectionEvent>>> = Arc::new(StdMutex::new(Vec::new()));
-        let seen_in_listener = Arc::clone(&seen);
-        let listener: crate::ingress::ConnectionListener =
-            Arc::new(move |event: &ConnectionEvent| {
-                let (open, opened) = &*gate_in_listener;
-                let mut open = open.lock().unwrap();
-                while !*open {
-                    open = opened.wait(open).unwrap();
-                }
-                drop(open);
-                seen_in_listener.lock().unwrap().push(event.clone());
-            });
-        let builder = SenderBuilder::from_conf(dead_endpoint_conf(&dead))
-            .unwrap()
-            .connection_listener(listener, 0)
-            .unwrap();
-        let gate_in_opener = Arc::clone(&gate);
-        let opener = thread::spawn(move || {
-            // Comfortably past the walk's `reconnect_max_duration_millis`,
-            // so the gate is still shut when `build()` returns.
-            thread::sleep(Duration::from_millis(500));
-            let (open, opened) = &*gate_in_opener;
-            *open.lock().unwrap() = true;
-            opened.notify_all();
-        });
-        let err = builder.build().expect_err("no server listening");
-        drop(builder);
-        opener.join().unwrap();
-        assert_eq!(err.code(), ErrorCode::SocketError);
-        let kinds: Vec<_> = seen.lock().unwrap().iter().map(|e| e.kind).collect();
-        assert!(
-            kinds.contains(&ConnectionEventKind::EndpointAttemptFailed),
-            "failed build must deliver EndpointAttemptFailed before returning: {kinds:?}"
-        );
-        assert!(
-            kinds.contains(&ConnectionEventKind::AllEndpointsUnreachable),
-            "failed build must deliver AllEndpointsUnreachable before returning: {kinds:?}"
-        );
     }
 
     #[test]

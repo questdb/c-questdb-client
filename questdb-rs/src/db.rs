@@ -808,28 +808,6 @@ impl QuestDb {
         conn_events: conn_events::ConnectionEventSource,
         rejections: rejection_events::RejectionEventSource,
     ) -> Result<Self> {
-        // Hold a handle across the attempt so a failure can still deliver
-        // what it reported. Connect's own pre-open and prewarm connects emit
-        // through this source, and on the error path nothing survives to own
-        // it — the pool that would have is exactly what failed to exist, and
-        // dropping a dispatcher discards its undelivered backlog.
-        let conn_events = Arc::new(conn_events);
-        let result = Self::connect_impl_inner(conf, Arc::clone(&conn_events), rejections);
-        if result.is_err() && !conn_events.drain(conn_events::FAILED_CONSTRUCTION_DRAIN_TIMEOUT) {
-            log::warn!(
-                "connection listener did not consume the failed connect's \
-                 events within {:?}; they are discarded",
-                conn_events::FAILED_CONSTRUCTION_DRAIN_TIMEOUT
-            );
-        }
-        result
-    }
-
-    fn connect_impl_inner(
-        conf: &str,
-        conn_events: Arc<conn_events::ConnectionEventSource>,
-        rejections: rejection_events::RejectionEventSource,
-    ) -> Result<Self> {
         let parsed = conf::parse(conf)?;
         // The public ingestion pool is always store-and-forward: in-memory
         // queues when no `sf_dir`, disk-backed pool-minted slots when set.
@@ -913,7 +891,7 @@ impl QuestDb {
             reader_cv: Condvar::new(),
             rejections: Arc::new(rejections),
             shutdown: AtomicBool::new(false),
-            conn_events,
+            conn_events: Arc::new(conn_events),
         });
 
         let reaper = match pool_cfg.pool_reap {

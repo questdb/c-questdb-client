@@ -1012,7 +1012,7 @@ mod tests {
     #[cfg(feature = "sync-sender-qwp-ws")]
     use crate::ingress::{QwpWsErrorCategory, QwpWsErrorPolicy, QwpWsSenderError};
     #[cfg(all(feature = "sync-sender-qwp-ws", any(unix, windows)))]
-    use crate::tests::net::ReservedPort;
+    use std::net::TcpListener;
 
     #[test]
     fn scan_returns_no_orphans_for_missing_root() {
@@ -1401,8 +1401,9 @@ mod tests {
             vec![slot_dir.clone()]
         );
 
-        let dead_endpoint = ReservedPort::reserve();
-        let port = dead_endpoint.port();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
         let mut config = test_config();
         config.port = port.to_string();
         let mut drainers = ManualOrphanDrainers::new(vec![slot_dir.clone()], 1, config).unwrap();
@@ -1423,8 +1424,9 @@ mod tests {
         let temp = TempDir::new().unwrap();
         let sf_dir = temp.path().join("sf-root");
         let slot_dir = create_queued_orphan(&sf_dir, "orphan");
-        let dead_endpoint = ReservedPort::reserve();
-        let port = dead_endpoint.port();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
         let mut config = test_config();
         config.port = port.to_string();
         config.qwp_ws.reconnect_initial_backoff =
@@ -1451,8 +1453,9 @@ mod tests {
         let temp = TempDir::new().unwrap();
         let sf_dir = temp.path().join("sf-root");
         let slot_dir = create_queued_orphan(&sf_dir, "orphan");
-        let dead_endpoint = ReservedPort::reserve();
-        let port = dead_endpoint.port();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
         let mut config = test_config();
         config.port = port.to_string();
         config.qwp_ws.reconnect_initial_backoff =
@@ -1473,8 +1476,9 @@ mod tests {
         let temp = TempDir::new().unwrap();
         let sf_dir = temp.path().join("sf-root");
         let slot_dir = create_queued_orphan(&sf_dir, "orphan");
-        let dead_endpoint = ReservedPort::reserve();
-        let port = dead_endpoint.port();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
         let source = Arc::new(crate::ingress::conn_events::ConnectionEventSource::disabled());
         let mut config = test_config();
         config.port = port.to_string();
@@ -1512,8 +1516,9 @@ mod tests {
         watermark.sync_data().unwrap();
         drop(watermark);
 
-        let dead_endpoint = ReservedPort::reserve();
-        let port = dead_endpoint.port();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
         let mut config = test_config();
         config.port = port.to_string();
         let mut drainers = ManualOrphanDrainers::new(vec![slot_dir.clone()], 1, config).unwrap();

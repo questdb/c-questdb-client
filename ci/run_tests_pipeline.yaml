@@ -20,7 +20,6 @@ stages:
         displayName: "on"
         strategy:
           matrix:
-
             linux:
               imageName: "hetzner-incus"
             linux-stable:
@@ -35,6 +34,11 @@ stages:
         pool:
           name: hetzner-incus
         timeoutInMinutes: 90
+        variables:
+          # The higher-core-count pool exposes released-port races in the
+          # existing Rust tests. Match the hosted runner's concurrency until
+          # those tests are fixed separately.
+          RUST_TEST_THREADS: 4
         steps:
           - checkout: self
             fetchDepth: 1
@@ -178,6 +182,9 @@ stages:
         pool:
           name: hetzner-incus
         timeoutInMinutes: 90
+        variables:
+          # run_version_matrix.py executes the same Rust tests as RunOn.
+          RUST_TEST_THREADS: 4
         steps:
           - checkout: self
             fetchDepth: 1
@@ -523,7 +530,8 @@ stages:
             retryCountOnTaskFailure: 2
             inputs:
               mavenPOMFile: "questdb/pom.xml"
-              jdkVersionOption: "default"
+              javaHomeOption: "Path"
+              jdkDirectory: "$(JAVA_HOME)"
               options: "-s $(MAVEN_SETTINGS_FILE) -DskipTests -Pbuild-web-console$(CLIENT_PROFILE) $(MAVEN_RUN_OPTS)"
           - script: |
               set -euxo pipefail

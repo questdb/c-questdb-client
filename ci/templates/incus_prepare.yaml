@@ -11,9 +11,8 @@
 # *user-writable* Rust toolchain. Each job runs in a fresh ephemeral container
 # (incus-azure-pipelines registers the agent with `run.sh --once`, then powers
 # the container off and lets Incus reap it), so there is no cross-job state to
-# clean up. Jobs that include compile.yaml must also set
-# `imageName: hetzner-incus`; compile.yaml then installs its Python packages
-# with the PEP 668 override after this template provides python3-pip.
+# clean up. compile.yaml installs its Python packages with the PEP 668 override
+# after this template provides python3-pip.
 parameters:
   # Packages the image does not ship that this job needs. cmake plus the
   # Python packages is the common compile.yaml case; override per job.
@@ -21,7 +20,6 @@ parameters:
     type: object
     default:
       - cmake
-      - python3-numpy
       - python3-pip
   # Jobs that need only the image JDKs and user-local Rust can skip apt.
   - name: isAptInstallEnabled
@@ -90,7 +88,7 @@ steps:
       set -euxo pipefail
       # The image installs rustup as root in /root/.cargo, which the agent
       # user can neither read nor extend — so `rustup install beta/nightly`
-      # (needed by the RunOnLinux toolchain matrix) would fail against it.
+      # (needed by the RunOn toolchain matrix) would fail against it.
       # Always provision a user-writable rustup in the default $HOME/.cargo +
       # $HOME/.rustup locations instead. The container is ephemeral (one job,
       # then reaped), so $HOME/.rustup starts empty and rustup-init runs every
@@ -101,25 +99,14 @@ steps:
       # `curl | sh` reports `sh`'s exit status, so a transfer that dies
       # mid-stream feeds a truncated installer to a shell that can still
       # exit 0. Downloading first makes curl's own failure the job's
-      # failure, and the retries and timeouts keep a stalled connection
-      # from burning the enclosing 10-90 minute job timeout. This template
-      # runs on every Linux job in both pipelines, so an unbounded fetch
-      # here is thirteen jobs' worth of exposure.
+      # failure, and the bounded retry budget fits comfortably inside the
+      # shortest job timeout.
       if ! [ -x "$HOME/.cargo/bin/rustup" ]; then
         init="$HOME/rustup-init.sh"
-        for attempt in 1 2 3; do
-          if curl --proto '=https' --tlsv1.2 -sSf \
-                  --retry 3 --retry-delay 5 --retry-connrefused \
-                  --connect-timeout 15 --max-time 300 \
-                  https://sh.rustup.rs -o "$init"; then
-            break
-          fi
-          if [ "$attempt" = 3 ]; then
-            echo "rustup-init download failed after 3 attempts" >&2
-            exit 1
-          fi
-          sleep $((attempt * 5))
-        done
+        curl --proto '=https' --tlsv1.2 -fsSL \
+          --retry 2 --retry-delay 5 --retry-connrefused \
+          --connect-timeout 15 --max-time 60 --retry-max-time 180 \
+          https://sh.rustup.rs -o "$init"
         sh "$init" -y \
           --default-toolchain '${{ parameters.rustToolchain }}' \
           --profile minimal --no-modify-path
