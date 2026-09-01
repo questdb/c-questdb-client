@@ -30,11 +30,14 @@ def run_cargo_tests():
     CMake build and no running QuestDB."""
     run_cmd(sys.executable, 'ci/check_arrow_ffi_lock.py')
     rs_lock = pathlib.Path('questdb-rs/Cargo.lock')
-    if rs_lock.exists():
-        sys.stderr.write(
-            'questdb-rs/Cargo.lock must be absent before the pinned Arrow '
-            'test graph is generated\n')
-        sys.exit(1)
+    # `questdb-rs/Cargo.lock` is gitignored, and the pinned Arrow test graph
+    # below is resolved from scratch. Whatever lockfile the tree already holds
+    # — from a local `cargo build`, or from the pipeline's "Build Rust
+    # examples" step, which runs immediately before this script — is held in
+    # memory here and put back in the `finally`, so neither the caller's tree
+    # nor a later pipeline step loses it.
+    saved_lock = rs_lock.read_bytes() if rs_lock.exists() else None
+    rs_lock.unlink(missing_ok=True)
     try:
         run_cmd('cargo', 'generate-lockfile', cwd='questdb-rs')
         run_cmd('cargo', 'update', '-p', 'arrow', '--precise', '59.0.0',
@@ -82,7 +85,10 @@ def run_cargo_tests():
         run_cmd('cargo', 'test', '--locked', '--features=arrow',
                 cwd='questdb-rs-ffi')
     finally:
-        rs_lock.unlink(missing_ok=True)
+        if saved_lock is None:
+            rs_lock.unlink(missing_ok=True)
+        else:
+            rs_lock.write_bytes(saved_lock)
 
 
 def run_cpp_tests():
