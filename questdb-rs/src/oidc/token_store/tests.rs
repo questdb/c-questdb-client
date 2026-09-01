@@ -663,22 +663,25 @@ fn clear_removes_file_and_is_idempotent() {
 }
 
 #[test]
-fn clear_removes_stale_orphan_temp_without_a_token_file() {
+fn clear_removes_fresh_write_temp_but_preserves_lock_capture() {
     let dir = TempDir::new().unwrap();
     let store = FileTokenStore::at(dir.path());
     let key = test_key();
     let orphan = temp_path(dir.path(), &key.hash());
+    let capture = dir
+        .path()
+        .join(format!("{}.lock.java-capture.tmp", key.hash()));
     std::fs::write(&orphan, b"orphaned refresh credential").unwrap();
-    let file = OpenOptions::new().write(true).open(&orphan).unwrap();
-    file.set_modified(SystemTime::now() - DEFAULT_LOCK_STALE - Duration::from_secs(1))
-        .unwrap();
-    drop(file);
+    std::fs::write(&capture, b"java-owner-stamp").unwrap();
     assert!(!store.token_file(&key).exists());
 
     // This is the path where only the orphan deletion changes the directory;
-    // clear must detect it so the subsequent directory fsync is not skipped.
+    // clear must remove even a newly created plaintext write temp and detect the
+    // change so the subsequent directory fsync is not skipped. A `.lock.` temp
+    // is another client's in-flight stale-lock capture and must survive.
     store.clear(&key).unwrap();
     assert!(!orphan.exists());
+    assert!(capture.exists());
 }
 
 #[test]

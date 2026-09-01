@@ -963,14 +963,14 @@ impl TokenStore for FileTokenStore {
     }
 
     fn save(&self, key: &TokenStoreKey, token: &PersistedToken) -> TokenStoreResult<()> {
-        if !token
+        if token
             .access_token
             .as_deref()
-            .is_some_and(|value| !value.is_empty())
-            && !token
+            .is_none_or(|value| value.is_empty())
+            && token
                 .id_token
                 .as_deref()
-                .is_some_and(|value| !value.is_empty())
+                .is_none_or(|value| value.is_empty())
         {
             return Err(Box::new(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
