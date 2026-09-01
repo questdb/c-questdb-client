@@ -7,6 +7,7 @@ variables:
   Darwin-ARM: armosx
   Linux-ARM: armlinux
   Linux-X64: linux
+  QWP_WS_DIAGNOSTIC_BRANCH: refs/heads/investigate/qwp-ws-macos-pressure
 
 stages:
   - stage: BuildAndTest
@@ -14,6 +15,7 @@ stages:
     jobs:
       - job: RunOn
         displayName: "on"
+        condition: ne(variables['System.PullRequest.SourceBranch'], variables['QWP_WS_DIAGNOSTIC_BRANCH'])
         strategy:
           matrix:
             linux:
@@ -82,6 +84,7 @@ stages:
       # image tests the one macOS architecture the client ships against.
       - job: RustTests
         displayName: "cargo tests (mac/windows)"
+        condition: ne(variables['System.PullRequest.SourceBranch'], variables['QWP_WS_DIAGNOSTIC_BRANCH'])
         strategy:
           matrix:
             mac:
@@ -102,6 +105,7 @@ stages:
             displayName: "cargo tests"
       - job: NativeTests
         displayName: "build + C++ + integration (mac/windows)"
+        condition: ne(variables['System.PullRequest.SourceBranch'], variables['QWP_WS_DIAGNOSTIC_BRANCH'])
         strategy:
           matrix:
             mac:
@@ -160,6 +164,7 @@ stages:
               artifactName: qdb-log-native-$(imageName)
       - job: VersionMatrix
         displayName: "arrow/polars version-range tests (linux)"
+        condition: ne(variables['System.PullRequest.SourceBranch'], variables['QWP_WS_DIAGNOSTIC_BRANCH'])
         pool:
           vmImage: "ubuntu-latest"
         timeoutInMinutes: 90
@@ -172,6 +177,7 @@ stages:
             displayName: "questdb-rs: pinned arrow/polars versions"
       - job: RustMsrvAndDocs
         displayName: "Rust MSRV and release documentation"
+        condition: ne(variables['System.PullRequest.SourceBranch'], variables['QWP_WS_DIAGNOSTIC_BRANCH'])
         pool:
           vmImage: "ubuntu-latest"
         timeoutInMinutes: 45
@@ -199,6 +205,7 @@ stages:
             displayName: "Check release documentation"
       - job: FormatAndLinting
         displayName: "cargo fmt and clippy"
+        condition: ne(variables['System.PullRequest.SourceBranch'], variables['QWP_WS_DIAGNOSTIC_BRANCH'])
         pool:
           vmImage: "ubuntu-latest"
         timeoutInMinutes: 10
@@ -261,6 +268,7 @@ stages:
             displayName: "failover_clients: clippy"
       - job: SanitizeCppTests
         displayName: "C/C++ tests under ASan + UBSan"
+        condition: ne(variables['System.PullRequest.SourceBranch'], variables['QWP_WS_DIAGNOSTIC_BRANCH'])
         pool:
           vmImage: "ubuntu-latest"
         timeoutInMinutes: 60
@@ -293,6 +301,7 @@ stages:
       # Python dependencies, including pyarrow/polars, for non-macOS builds.
       - job: TestVsQuestDBMaster
         displayName: "Vs QuestDB master"
+        condition: ne(variables['System.PullRequest.SourceBranch'], variables['QWP_WS_DIAGNOSTIC_BRANCH'])
         pool:
           name: hetzner-incus
         timeoutInMinutes: 90
@@ -390,6 +399,7 @@ stages:
               artifactName: qdb-log-vs-master-$(Agent.OS)
       - job: TestQwpWsFuzz
         displayName: "QWP/WS add-columns diagnostics (macOS hosted)"
+        condition: eq(variables['System.PullRequest.SourceBranch'], variables['QWP_WS_DIAGNOSTIC_BRANCH'])
         strategy:
           matrix:
             natural-memory:
@@ -418,7 +428,7 @@ stages:
               javaHomeOption: "Path"
               jdkDirectory: "$(JAVA_HOME)"
               options: "-s $(MAVEN_SETTINGS_FILE) -DskipTests -Pbuild-web-console$(CLIENT_PROFILE) $(MAVEN_RUN_OPTS)"
-          - bash: ci/run_macos_qwp_ws_diagnostics.sh
+          - bash: bash ci/run_macos_qwp_ws_diagnostics.sh
             displayName: "Reproduce QWP/WS add-columns stall"
             env:
               QWP_WS_DIAGNOSTIC_RUNS: "3"
@@ -465,6 +475,7 @@ stages:
       # are available on the self-hosted image.
       - job: TestQwpWsFuzzLinux
         displayName: "QWP/WS fuzz suite (linux/hetzner-incus)"
+        condition: ne(variables['System.PullRequest.SourceBranch'], variables['QWP_WS_DIAGNOSTIC_BRANCH'])
         pool:
           name: hetzner-incus
         timeoutInMinutes: 90
@@ -563,6 +574,7 @@ stages:
       # run_fuzz_pipeline.yaml varies the seed per build.
       - job: TestQwpEgressLiveServerFuzz
         displayName: "QWP egress live-server suite"
+        condition: ne(variables['System.PullRequest.SourceBranch'], variables['QWP_WS_DIAGNOSTIC_BRANCH'])
         pool:
           vmImage: "ubuntu-latest"
         timeoutInMinutes: 60
@@ -653,7 +665,7 @@ stages:
         # tokens) are not exposed to fork builds, so the REST POST
         # would 401. Skipping rather than failing keeps fork-PR CI
         # clean.
-        condition: and(succeeded(), ne(variables['System.PullRequest.IsFork'], 'True'))
+        condition: and(succeeded(), ne(variables['System.PullRequest.IsFork'], 'True'), ne(variables['System.PullRequest.SourceBranch'], variables['QWP_WS_DIAGNOSTIC_BRANCH']))
         variables:
           # Hardcoded because the Enterprise pipeline lives in its own
           # ADO project, not the one this pipeline runs in.
