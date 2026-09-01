@@ -396,11 +396,7 @@ private:
         }
 
         return line_sender_error{
-            code,
-            msg,
-            in_doubt,
-            std::move(qwp_ws_diagnostic),
-            not_delivered};
+            code, msg, in_doubt, std::move(qwp_ws_diagnostic), not_delivered};
     }
 
     template <typename F, typename... Args>

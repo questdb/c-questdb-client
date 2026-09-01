@@ -544,14 +544,14 @@ TEST_CASE("direct C flush separates current chunk retry from source replay")
     qm::Script script;
     script.reserve(256);
     for (size_t i = 0; i < 256; ++i)
-        script.push_back(qm::ActionAwaitClientFrame{0x51});
+        script.emplace_back(qm::ActionAwaitClientFrame{0x51});
     auto mock = std::make_unique<qm::MockServer>(
         std::vector<qm::Script>{std::move(script)});
 
     const std::string conf = conf_for(mock->addr());
     line_sender_error* err = nullptr;
-    qwp_direct_sender* sender = qwp_direct_sender_from_conf(
-        conf.c_str(), conf.size(), &err);
+    qwp_direct_sender* sender =
+        qwp_direct_sender_from_conf(conf.c_str(), conf.size(), &err);
     REQUIRE(sender != nullptr);
     REQUIRE(err == nullptr);
 

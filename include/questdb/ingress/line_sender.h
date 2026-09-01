@@ -287,7 +287,8 @@ typedef enum line_sender_error_code
      * error is then delivery-unknown rather than known-not-delivered:
      * `line_sender_error_not_delivered` is false, so resending that chunk would
      * duplicate the rows its committed prefix already carried. Consult
-     * `line_sender_error_in_doubt` separately before replaying a larger source. */
+     * `line_sender_error_in_doubt` separately before replaying a larger source.
+     */
     line_sender_error_symbol_dict_full = 37,
 } line_sender_error_code;
 
