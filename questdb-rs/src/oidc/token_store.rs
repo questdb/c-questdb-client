@@ -202,19 +202,19 @@ impl Drop for PersistedToken {
 ///
 /// A [`TokenStore`] keys its entries by this so a token minted for one server /
 /// identity provider / scope / audience is never served to a process configured
-/// for another. The endpoint and scope fields must be passed already normalised —
-/// exactly as [`OidcDeviceAuth`](crate::oidc::OidcDeviceAuth) builds them (via
-/// [`from_config`](Self::from_config)) — so a directly-constructed key matches the
-/// same identity the auth object computes.
+/// for another. [`from_config`](Self::from_config) canonicalises the endpoints
+/// exactly as [`OidcDeviceAuth`](crate::oidc::OidcDeviceAuth) does; it preserves
+/// the configured scope because the frozen Java-compatible identity treats its
+/// spelling and order as significant.
 ///
 /// [`hash`](Self::hash) is a stable lowercase-hex SHA-256 over a canonical,
 /// NUL-separated rendering of the fields, identical across QuestDB client
 /// implementations, so processes (and languages) sharing one identity address the
-/// same persisted entry. `issuer` participates in the on-load identity re-check
-/// but **not** in [`hash`](Self::hash): it is excluded from the file name so the
-/// cross-language addressing contract stays byte-identical, while a session pinned
-/// to a different issuer still never adopts another's token.
-#[derive(Clone, Debug, PartialEq, Eq)]
+/// same persisted entry. `issuer` is retained as configuration metadata for API
+/// compatibility but is deliberately not part of the frozen store identity: the
+/// Java reference contract identifies a credential by its concrete token/device
+/// endpoints and the other fields below.
+#[derive(Clone, Debug)]
 pub struct TokenStoreKey {
     client_id: String,
     token_endpoint: String,
@@ -225,10 +225,23 @@ pub struct TokenStoreKey {
     issuer: Option<String>,
 }
 
+impl PartialEq for TokenStoreKey {
+    fn eq(&self, other: &Self) -> bool {
+        self.client_id == other.client_id
+            && self.token_endpoint == other.token_endpoint
+            && self.device_authorization_endpoint == other.device_authorization_endpoint
+            && self.scope == other.scope
+            && self.audience == other.audience
+            && self.groups_in_token == other.groups_in_token
+    }
+}
+
+impl Eq for TokenStoreKey {}
+
 impl TokenStoreKey {
-    /// Build a key from raw identity fields, canonicalising the endpoints and
-    /// order-normalising the scope so the same identity hashes the same way in
-    /// every process and language client.
+    /// Build a key from raw identity fields, canonicalising the endpoints while
+    /// preserving the configured scope byte-for-byte. Scope order is significant
+    /// in the frozen Java-compatible persistence contract.
     pub fn from_config(
         client_id: impl Into<String>,
         token_endpoint: &str,
@@ -242,8 +255,10 @@ impl TokenStoreKey {
             client_id: client_id.into(),
             token_endpoint: canonical_endpoint(token_endpoint),
             device_authorization_endpoint: canonical_endpoint(device_authorization_endpoint),
-            scope: normalize_scope(scope),
-            audience: audience.map(str::to_string),
+            scope: scope.to_string(),
+            audience: audience
+                .filter(|value| !value.is_empty())
+                .map(str::to_string),
             groups_in_token,
             issuer: issuer.map(str::to_string),
         }
@@ -290,8 +305,8 @@ impl TokenStoreKey {
         // NUL-separate the fields so no field value can be confused with a
         // separator (a client id / url / scope / audience never contains a NUL).
         // The prefix tags the domain and schema version. `issuer` is deliberately
-        // NOT folded in (the file name is a frozen cross-language contract);
-        // issuer isolation is enforced on load via the in-file fingerprint.
+        // not folded in: concrete endpoints, not the optional trust pin used to
+        // discover/validate them, are part of the Java-compatible identity.
         let canonical = [
             CANONICAL_PREFIX,
             &self.client_id,
@@ -605,6 +620,15 @@ impl FileTokenStore {
         // own copies (zeroized by its own Drop).
         let result = (|| {
             let obj = root.as_object()?;
+            // The shared schema is one flat object. Reject arrays and nested
+            // objects even in unknown fields so Java and Rust agree on which
+            // documents are usable.
+            if obj
+                .values()
+                .any(|value| value.is_array() || value.is_object())
+            {
+                return None;
+            }
             // Schema and fingerprint must match the live identity; a mismatch is a
             // hash collision or a file copied from a different identity, so ignore
             // it rather than serve the wrong identity's token.
@@ -618,14 +642,21 @@ impl FileTokenStore {
                     != Some(key.device_authorization_endpoint.as_str())
                 || str_field("scope") != Some(key.scope.as_str())
                 || !opt_str_matches(key.audience.as_deref(), obj.get("audience"))
-                || !opt_str_matches(key.issuer.as_deref(), obj.get("issuer"))
                 || obj.get("groups_in_token").and_then(Value::as_bool) != Some(key.groups_in_token)
             {
                 return None;
             }
+            let access_token = nonempty_str(obj.get("access_token"));
+            let id_token = nonempty_str(obj.get("id_token"));
+            // A conforming grant always carries at least one usable served
+            // token. Accepting a refresh-only file would let a writer who
+            // cannot read the 0600 credential silently replace the login.
+            if access_token.is_none() && id_token.is_none() {
+                return None;
+            }
             Some(PersistedToken {
-                access_token: nonempty_str(obj.get("access_token")),
-                id_token: nonempty_str(obj.get("id_token")),
+                access_token,
+                id_token,
                 refresh_token: nonempty_str(obj.get("refresh_token")),
                 expires_at: millis_to_seconds(obj.get("expires_at_millis")),
                 token_ttl: millis_to_seconds(obj.get("token_ttl_millis")),
@@ -644,7 +675,7 @@ impl FileTokenStore {
     }
 
     fn serialize(&self, key: &TokenStoreKey, token: &PersistedToken) -> Zeroizing<Vec<u8>> {
-        // A null value (an absent audience/issuer, or a token kind the grant did
+        // A null value (an absent audience, or a token kind the grant did
         // not return) is OMITTED, never written as JSON null — the only encoding
         // under which a present value round-trips verbatim and an absent one reads
         // back as null.
@@ -662,9 +693,6 @@ impl FileTokenStore {
         map.insert("scope".into(), Value::from(key.scope.clone()));
         if let Some(audience) = &key.audience {
             map.insert("audience".into(), Value::from(audience.clone()));
-        }
-        if let Some(issuer) = &key.issuer {
-            map.insert("issuer".into(), Value::from(issuer.clone()));
         }
         map.insert("groups_in_token".into(), Value::from(key.groups_in_token));
         if let Some(t) = &token.access_token {
@@ -861,6 +889,20 @@ impl TokenStore for FileTokenStore {
     }
 
     fn save(&self, key: &TokenStoreKey, token: &PersistedToken) -> TokenStoreResult<()> {
+        if !token
+            .access_token
+            .as_deref()
+            .is_some_and(|value| !value.is_empty())
+            && !token
+                .id_token
+                .as_deref()
+                .is_some_and(|value| !value.is_empty())
+        {
+            return Err(Box::new(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "an OIDC token-store entry must contain an access_token or id_token",
+            )));
+        }
         let content = self.serialize(key, token);
         if content.len() as u64 > MAX_FILE_BYTES {
             return Err(Box::new(std::io::Error::new(
@@ -926,14 +968,6 @@ fn canonical_endpoint(url: &str) -> String {
     }
 }
 
-/// Order-normalise a space-separated scope (sort the token set) so two spellings
-/// of the same scope set are one identity.
-fn normalize_scope(scope: &str) -> String {
-    let mut tokens: Vec<&str> = scope.split_whitespace().collect();
-    tokens.sort_unstable();
-    tokens.join(" ")
-}
-
 /// A persisted JSON field as a non-empty string, else `None` (a non-string —
 /// from a hand-edited or hostile file — reads as absent rather than landing in a
 /// token field as a raw object).
@@ -967,19 +1001,14 @@ fn seconds_to_millis(seconds: f64) -> i64 {
     millis as i64
 }
 
-/// An on-disk `*_millis` field as epoch/duration seconds; a non-numeric or
-/// non-finite value (a hostile file) reads as `0.0`, marking the entry expired so
-/// it falls through to a refresh rather than being served.
+/// An on-disk `*_millis` field as epoch/duration seconds. The frozen format
+/// permits plain JSON integers only; floats and exponent notation are rejected
+/// by returning `0.0`, marking the entry expired.
 fn millis_to_seconds(value: Option<&Value>) -> f64 {
-    let n = match value {
-        Some(Value::Number(n)) => n,
-        _ => return 0.0,
-    };
-    let millis = n.as_i64().map(|i| i as f64).or_else(|| n.as_f64());
-    match millis {
-        Some(m) if m.is_finite() => m / 1000.0,
-        _ => 0.0,
-    }
+    value
+        .and_then(Value::as_i64)
+        .map(|millis| millis as f64 / 1000.0)
+        .unwrap_or(0.0)
 }
 
 /// A unique sibling temp path under `dir` for an atomic write.

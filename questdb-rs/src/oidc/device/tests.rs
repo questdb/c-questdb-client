@@ -2107,8 +2107,8 @@ fn restart_resumes_from_persisted_token_without_reprompt() {
 }
 
 #[test]
-fn refresh_only_persisted_entry_silently_refreshes_in_both_token_modes() {
-    for (groups_in_token, expected) in [(false, "AT-refreshed"), (true, "ID-refreshed")] {
+fn refresh_only_persisted_entry_is_rejected_in_both_token_modes() {
+    for groups_in_token in [false, true] {
         let device_calls = Arc::new(AtomicUsize::new(0));
         let refresh_calls = Arc::new(AtomicUsize::new(0));
         let mock = {
@@ -2151,17 +2151,14 @@ fn refresh_only_persisted_entry_silently_refreshes_in_both_token_modes() {
             .build()
             .expect("build auth with refresh-only store");
 
-        assert_eq!(auth.token().unwrap(), expected);
-        assert_eq!(refresh_calls.load(Ordering::SeqCst), 1);
+        let err = auth.token().unwrap_err();
+        assert_eq!(err.kind(), OidcErrorKind::InteractionRequired);
+        assert_eq!(refresh_calls.load(Ordering::SeqCst), 0);
         assert_eq!(
             device_calls.load(Ordering::SeqCst),
             0,
-            "refresh-only persisted state unexpectedly started a device flow"
+            "non-interactive auth unexpectedly started a device flow"
         );
-        let persisted = store.token().expect("refreshed state was not persisted");
-        assert_eq!(persisted.access_token(), Some("AT-refreshed"));
-        assert_eq!(persisted.id_token(), Some("ID-refreshed"));
-        assert_eq!(persisted.refresh_token(), Some("RT-only"));
     }
 }
 

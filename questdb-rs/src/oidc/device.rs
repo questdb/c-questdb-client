@@ -806,11 +806,14 @@ impl OidcDeviceAuth {
     /// untrusted. A directly servable token goes through the same
     /// control/non-ASCII gate as the network path, and its expiry is bounded by
     /// its own JWT `exp` (its real, server-checked expiry) — or, for an opaque
-    /// token, capped to at most one hour from now. An entry with no required
-    /// access/ID token may still carry a safe refresh token written by another
-    /// client; retain it in an intentionally expired set so the caller performs
-    /// a coordinated silent refresh rather than prompting again.
+    /// token, capped to at most one hour from now. A file may omit the token kind
+    /// this configuration serves, but it must contain at least one access/ID
+    /// token: the frozen Java-compatible contract rejects refresh-only entries
+    /// as a possible silent credential swap.
     fn tokenset_from_persisted(&self, p: &PersistedToken) -> Option<TokenSet> {
+        if p.access_token().is_none() && p.id_token().is_none() {
+            return None;
+        }
         let access_token = p
             .access_token()
             .filter(|s| is_safe_token_str(s))
