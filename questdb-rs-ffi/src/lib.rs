@@ -4235,14 +4235,8 @@ struct ArrowMetadataBudget {
 #[cfg(feature = "arrow")]
 impl ArrowMetadataBudget {
     fn new() -> questdb::Result<Self> {
-        let mut charged_pointers = std::collections::HashSet::new();
-        charged_pointers
-            .try_reserve(MAX_ARROW_SCHEMA_TOTAL_NODES)
-            .map_err(|_| {
-                arrow_ingest_err("Arrow schema metadata pointer-set reservation failed")
-            })?;
         Ok(Self {
-            charged_pointers,
+            charged_pointers: std::collections::HashSet::new(),
             charged_bytes: 0,
         })
     }
@@ -4295,6 +4289,10 @@ unsafe fn validate_metadata_blob(
     if metadata.is_null() {
         return Ok(());
     }
+    budget
+        .charged_pointers
+        .try_reserve(1)
+        .map_err(|_| arrow_ingest_err("Arrow schema metadata pointer-set reservation failed"))?;
     if !budget.charged_pointers.insert(metadata as usize) {
         return Ok(());
     }
