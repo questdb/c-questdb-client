@@ -267,7 +267,7 @@ fn hex_to_bytes(hex: &str) -> Vec<u8> {
     let hex = hex.as_bytes();
     assert_eq!(hex.len() % 2, 0, "hex input must contain whole bytes");
     let mut out = Vec::with_capacity(hex.len() / 2);
-    for chunk in hex.chunks_exact(2) {
+    for chunk in hex.as_chunks::<2>().0 {
         let hi = hex_value(chunk[0]);
         let lo = hex_value(chunk[1]);
         out.push((hi << 4) | lo);
