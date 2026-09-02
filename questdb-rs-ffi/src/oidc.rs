@@ -2399,3 +2399,274 @@ mod tests {
         }
     }
 }
+
+/// Guards the hand-maintained C headers against drift from the Rust
+/// `#[repr(C)]` definitions they mirror.
+///
+/// The OIDC surface, and `questdb_db_connect_options` alongside it, had no such
+/// guard. C has no name mangling, so appending or reordering a field on one
+/// side links cleanly and corrupts memory at the call site instead of failing
+/// the build. The existing `c_header_line_sender_enum_matches_rust` covers only
+/// `line_sender.h`; this extends the same `include_str!` approach to the rest.
+///
+/// Each check pins both sides: the exhaustive destructuring fails to compile if
+/// a Rust field is added, renamed or removed, and the literal list is then
+/// compared against the header's own field order.
+#[cfg(test)]
+mod header_abi {
+    use super::*;
+
+    const OIDC_H: &str = include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../include/questdb/oidc.h"
+    ));
+    const CLIENT_H: &str = include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../include/questdb/client.h"
+    ));
+
+    /// The field identifiers of a C `typedef struct NAME { ... }`, in order.
+    fn c_struct_fields(header: &str, name: &str) -> Vec<String> {
+        let decl = format!("typedef struct {name}");
+        let start = header
+            .find(&decl)
+            .unwrap_or_else(|| panic!("`{decl}` not found in the header"));
+        let body_start = start
+            + header[start..]
+                .find('{')
+                .unwrap_or_else(|| panic!("no body for `{name}`"))
+            + 1;
+        let body_end = body_start
+            + header[body_start..]
+                .find('}')
+                .unwrap_or_else(|| panic!("unterminated body for `{name}`"));
+        header[body_start..body_end]
+            .lines()
+            .filter_map(|line| {
+                let line = line.trim();
+                if line.starts_with("//") || line.starts_with('*') {
+                    return None;
+                }
+                let decl = line.strip_suffix(';')?;
+                let ident = decl
+                    .rsplit(|c: char| c.is_whitespace() || c == '*')
+                    .next()?;
+                (!ident.is_empty()).then(|| ident.to_string())
+            })
+            .collect()
+    }
+
+    /// The `NAME = <discriminant>` entries of a C enum, in order.
+    fn c_enum_variants(header: &str, name: &str) -> Vec<(String, i64)> {
+        let decl = format!("typedef enum {name}");
+        let start = header
+            .find(&decl)
+            .unwrap_or_else(|| panic!("`{decl}` not found in the header"));
+        let body_start = start + header[start..].find('{').unwrap() + 1;
+        let body_end = body_start + header[body_start..].find('}').unwrap();
+        header[body_start..body_end]
+            .lines()
+            .filter_map(|line| {
+                let line = line.trim().strip_suffix(',')?;
+                let (name, value) = line.split_once('=')?;
+                Some((name.trim().to_string(), value.trim().parse::<i64>().ok()?))
+            })
+            .collect()
+    }
+
+    #[test]
+    fn oidc_event_struct_matches_the_header() {
+        #[allow(dead_code)]
+        fn exhaustive(event: &questdb_oidc_event) {
+            let questdb_oidc_event {
+                struct_size: _,
+                kind: _,
+                user_code: _,
+                user_code_len: _,
+                verification_uri: _,
+                verification_uri_len: _,
+                verification_uri_complete: _,
+                verification_uri_complete_len: _,
+                identity: _,
+                identity_len: _,
+                message: _,
+                message_len: _,
+                seconds_left: _,
+                expires_in_seconds: _,
+                browser_target: _,
+                browser_target_len: _,
+                interval_seconds: _,
+            } = event;
+        }
+        assert_eq!(
+            c_struct_fields(OIDC_H, "questdb_oidc_event"),
+            [
+                "struct_size",
+                "kind",
+                "user_code",
+                "user_code_len",
+                "verification_uri",
+                "verification_uri_len",
+                "verification_uri_complete",
+                "verification_uri_complete_len",
+                "identity",
+                "identity_len",
+                "message",
+                "message_len",
+                "seconds_left",
+                "expires_in_seconds",
+                "browser_target",
+                "browser_target_len",
+                "interval_seconds",
+            ]
+        );
+    }
+
+    #[test]
+    fn oidc_config_view_struct_matches_the_header() {
+        #[allow(dead_code)]
+        fn exhaustive(view: &questdb_oidc_config_view) {
+            let questdb_oidc_config_view {
+                struct_size: _,
+                groups_in_token: _,
+                client_id: _,
+                client_id_len: _,
+                token_endpoint: _,
+                token_endpoint_len: _,
+                device_authorization_endpoint: _,
+                device_authorization_endpoint_len: _,
+                scope: _,
+                scope_len: _,
+                audience: _,
+                audience_len: _,
+                issuer: _,
+                issuer_len: _,
+            } = view;
+        }
+        assert_eq!(
+            c_struct_fields(OIDC_H, "questdb_oidc_config_view"),
+            [
+                "struct_size",
+                "groups_in_token",
+                "client_id",
+                "client_id_len",
+                "token_endpoint",
+                "token_endpoint_len",
+                "device_authorization_endpoint",
+                "device_authorization_endpoint_len",
+                "scope",
+                "scope_len",
+                "audience",
+                "audience_len",
+                "issuer",
+                "issuer_len",
+            ]
+        );
+    }
+
+    #[test]
+    fn oidc_error_view_struct_matches_the_header() {
+        #[allow(dead_code)]
+        fn exhaustive(view: &questdb_oidc_error_view) {
+            let questdb_oidc_error_view {
+                struct_size: _,
+                kind: _,
+                idp_error: _,
+                idp_error_len: _,
+                idp_error_description: _,
+                idp_error_description_len: _,
+                has_status: _,
+                status: _,
+                has_retry_after: _,
+                retry_after_seconds: _,
+            } = view;
+        }
+        assert_eq!(
+            c_struct_fields(OIDC_H, "questdb_oidc_error_view"),
+            [
+                "struct_size",
+                "kind",
+                "idp_error",
+                "idp_error_len",
+                "idp_error_description",
+                "idp_error_description_len",
+                "has_status",
+                "status",
+                "has_retry_after",
+                "retry_after_seconds",
+            ]
+        );
+    }
+
+    #[test]
+    fn db_connect_options_struct_matches_the_header() {
+        #[allow(dead_code)]
+        fn exhaustive(options: &crate::column_sender::questdb_db_connect_options) {
+            let crate::column_sender::questdb_db_connect_options {
+                struct_size: _,
+                oidc_auth: _,
+                event_callback: _,
+                event_user_data: _,
+                event_inbox_capacity: _,
+                rejection_callback: _,
+                rejection_user_data: _,
+                rejection_inbox_capacity: _,
+            } = options;
+        }
+        assert_eq!(
+            c_struct_fields(CLIENT_H, "questdb_db_connect_options"),
+            [
+                "struct_size",
+                "oidc_auth",
+                "event_callback",
+                "event_user_data",
+                "event_inbox_capacity",
+                "rejection_callback",
+                "rejection_user_data",
+                "rejection_inbox_capacity",
+            ]
+        );
+    }
+
+    #[test]
+    fn oidc_enums_match_the_header() {
+        // Discriminants, not just names: QUESTDB_OIDC_ERROR_UNKNOWN is 255, not
+        // the 6 it would get by position, and the binding compares against the
+        // named constants.
+        assert_eq!(
+            c_enum_variants(OIDC_H, "questdb_oidc_event_kind"),
+            [
+                ("QUESTDB_OIDC_EVENT_PROMPT".to_string(), 0),
+                ("QUESTDB_OIDC_EVENT_WAITING".to_string(), 1),
+                ("QUESTDB_OIDC_EVENT_SUCCESS".to_string(), 2),
+                ("QUESTDB_OIDC_EVENT_FAILURE".to_string(), 3),
+            ]
+        );
+        assert_eq!(questdb_oidc_event_kind::QUESTDB_OIDC_EVENT_PROMPT as i64, 0);
+        assert_eq!(
+            questdb_oidc_event_kind::QUESTDB_OIDC_EVENT_FAILURE as i64,
+            3
+        );
+
+        assert_eq!(
+            c_enum_variants(OIDC_H, "questdb_oidc_error_kind"),
+            [
+                ("QUESTDB_OIDC_ERROR_CONFIG".to_string(), 0),
+                ("QUESTDB_OIDC_ERROR_NETWORK".to_string(), 1),
+                ("QUESTDB_OIDC_ERROR_DEVICE_FLOW".to_string(), 2),
+                ("QUESTDB_OIDC_ERROR_TIMEOUT".to_string(), 3),
+                ("QUESTDB_OIDC_ERROR_INTERACTION_REQUIRED".to_string(), 4),
+                ("QUESTDB_OIDC_ERROR_CANCELLED".to_string(), 5),
+                ("QUESTDB_OIDC_ERROR_UNKNOWN".to_string(), 255),
+            ]
+        );
+        assert_eq!(
+            questdb_oidc_error_kind::QUESTDB_OIDC_ERROR_UNKNOWN as i64,
+            255
+        );
+        assert_eq!(
+            questdb_oidc_error_kind::QUESTDB_OIDC_ERROR_CANCELLED as i64,
+            5
+        );
+    }
+}
