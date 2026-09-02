@@ -2657,6 +2657,134 @@ fn groups_mode_refresh_without_id_token_keeps_the_rotated_credential() {
 }
 
 #[test]
+fn a_long_retry_after_is_waited_out_in_slices() {
+    // Regression: `backoff` deliberately has no upper clamp, and the only other
+    // bound on the wait is the whole device-code lifetime, so a 429 carrying a
+    // large `Retry-After` -- routine from a WAF or proxy -- collapsed the wait
+    // into a single opaque sleep of up to MAX_DEVICE_CODE_LIFETIME. The prompt's
+    // countdown stopped updating for its duration, and because the renderer
+    // callback is the only place a host language runs code on the waiting
+    // thread, it also removed the point at which an interrupt such as Ctrl-C
+    // could be delivered.
+    struct CountingWaits(Arc<AtomicUsize>);
+    impl Renderer for CountingWaits {
+        fn on_waiting(&self, _seconds_left: f64) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    const RETRY_AFTER: u64 = 300;
+    let polls = Arc::new(AtomicUsize::new(0));
+    let mock = {
+        let polls = Arc::clone(&polls);
+        MockServer::start_with_retry_after(RETRY_AFTER, move |method, path, _body| {
+            match (method, path) {
+                ("POST", "/device") => (200, device_response()),
+                ("POST", "/token") => {
+                    if polls.fetch_add(1, Ordering::SeqCst) == 0 {
+                        (429, r#"{"error":"slow_down"}"#.to_string())
+                    } else {
+                        (
+                            200,
+                            r#"{"access_token":"AT-sliced","expires_in":300}"#.to_string(),
+                        )
+                    }
+                }
+                _ => (404, "{}".to_string()),
+            }
+        })
+    };
+    let sleeps = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let sleep_log = Arc::clone(&sleeps);
+    let waits = Arc::new(AtomicUsize::new(0));
+    let auth = OidcDeviceAuth::builder()
+        .client_id("questdb")
+        .device_authorization_endpoint(mock.url("/device"))
+        .token_endpoint(mock.url("/token"))
+        .interactive(true)
+        .open_browser(false)
+        .renderer(CountingWaits(Arc::clone(&waits)))
+        .sleep_hook(Arc::new(move |duration| {
+            sleep_log.lock().unwrap().push(duration)
+        }))
+        .build()
+        .expect("build");
+
+    assert_eq!(sign_in_and_token(&auth).unwrap(), "AT-sliced");
+    let slept = sleeps.lock().unwrap();
+
+    // No single wait exceeds the slice, so the prompt is refreshed and the
+    // interrupt point reached at least that often.
+    assert!(
+        slept
+            .iter()
+            .all(|d| *d <= Duration::from_secs(MAX_POLL_INTERVAL)),
+        "a wait exceeded MAX_POLL_INTERVAL: {slept:?}"
+    );
+    assert!(
+        slept.len() > 1,
+        "the long Retry-After was not sliced: {slept:?}"
+    );
+    // The polling RATE is unchanged: the server's full pause is still honoured
+    // before the next token request. Ignoring it is what earns a rate-limit ban.
+    assert_eq!(
+        slept.iter().sum::<Duration>(),
+        Duration::from_secs(RETRY_AFTER),
+        "slicing changed the total wait"
+    );
+    assert_eq!(
+        polls.load(Ordering::SeqCst),
+        2,
+        "polled before the pause elapsed"
+    );
+    // The countdown ticks once per slice rather than once for the whole pause.
+    assert_eq!(waits.load(Ordering::SeqCst), slept.len());
+}
+
+#[test]
+fn a_conformant_interval_is_not_sliced() {
+    // The slice must not change the shape of an ordinary flow: an interval at
+    // or below MAX_POLL_INTERVAL is still served as exactly one wait.
+    let polls = Arc::new(AtomicUsize::new(0));
+    let mock = {
+        let polls = Arc::clone(&polls);
+        MockServer::start(move |method, path, _body| match (method, path) {
+            ("POST", "/device") => (200, device_response()),
+            ("POST", "/token") => {
+                if polls.fetch_add(1, Ordering::SeqCst) == 0 {
+                    (400, r#"{"error":"authorization_pending"}"#.to_string())
+                } else {
+                    (
+                        200,
+                        r#"{"access_token":"AT-plain","expires_in":300}"#.to_string(),
+                    )
+                }
+            }
+            _ => (404, "{}".to_string()),
+        })
+    };
+    let sleeps = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let sleep_log = Arc::clone(&sleeps);
+    let auth = OidcDeviceAuth::builder()
+        .client_id("questdb")
+        .device_authorization_endpoint(mock.url("/device"))
+        .token_endpoint(mock.url("/token"))
+        .interactive(true)
+        .open_browser(false)
+        .sleep_hook(Arc::new(move |duration| {
+            sleep_log.lock().unwrap().push(duration)
+        }))
+        .build()
+        .expect("build");
+
+    assert_eq!(sign_in_and_token(&auth).unwrap(), "AT-plain");
+    assert_eq!(
+        sleeps.lock().unwrap().as_slice(),
+        &[Duration::from_secs(MIN_POLL_INTERVAL)]
+    );
+}
+
+#[test]
 fn retry_after_raises_the_poll_interval_and_never_lowers_it() {
     // RFC 8628 3.5: the client waits at least the advertised interval. A proxy
     // or WAF answering `Retry-After: 1` to a flow whose interval is 30 used to

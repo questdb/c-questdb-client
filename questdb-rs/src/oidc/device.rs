@@ -1625,6 +1625,20 @@ impl OidcDeviceAuth {
         // RFC 8628 permits polling as soon as the device response arrives. Retry
         // polls wait for the configured interval; the first poll does not.
         let mut poll_now = true;
+        // How much of the current interval has already been waited out. The
+        // wait is served in slices no longer than `MAX_POLL_INTERVAL` so a long
+        // `Retry-After` cannot collapse it into one opaque sleep: `backoff`
+        // deliberately has no upper clamp (a server that asks for a long pause
+        // should get it), and the only other bound is the whole device-code
+        // lifetime. Without slicing, a 429 carrying a large `Retry-After` --
+        // routine from a WAF or proxy -- stopped `on_waiting` firing for up to
+        // `MAX_DEVICE_CODE_LIFETIME`, freezing the prompt's countdown and,
+        // because that callback is the only place a host language runs code on
+        // the waiting thread, removing the point at which an interrupt such as
+        // Ctrl-C can be delivered. Slicing restores both without changing the
+        // polling rate: the next token request still waits the full interval.
+        // A conformant interval is at or below the slice, so it is unaffected.
+        let mut waited_in_interval = Duration::ZERO;
 
         loop {
             self.ensure_open()?;
@@ -1642,14 +1656,27 @@ impl OidcDeviceAuth {
             if !poll_now {
                 self.renderer.on_waiting(remaining.as_secs_f64());
                 self.ensure_open()?;
-                self.wait_between_polls(remaining.min(Duration::from_secs(interval)))?;
-                poll_now = true;
+                let target = Duration::from_secs(interval);
+                let slice = target
+                    .saturating_sub(waited_in_interval)
+                    .min(remaining)
+                    .min(Duration::from_secs(MAX_POLL_INTERVAL));
+                self.wait_between_polls(slice)?;
+                waited_in_interval = waited_in_interval.saturating_add(slice);
+                // Poll only once the whole interval has been served, or once the
+                // device code is about to expire (the deadline check at the top
+                // of the next iteration then reports the expiry).
+                if waited_in_interval >= target || slice >= remaining {
+                    poll_now = true;
+                    waited_in_interval = Duration::ZERO;
+                }
                 // Re-enter through the deadline check before retrying. This also
                 // keeps a sleep clipped to the remaining lifetime from polling an
                 // already-expired device code.
                 continue;
             }
             poll_now = false;
+            waited_in_interval = Duration::ZERO;
 
             let result = match self
                 .http
