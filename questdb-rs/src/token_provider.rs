@@ -269,6 +269,7 @@ mod tests {
         // is what stops the reconnect loop; `SocketError` is not.
     }
 
+    #[cfg(feature = "_oidc")]
     #[test]
     fn retry_classification_preserves_oidc_detail() {
         let provider = TokenProvider::new(|| {
