@@ -778,6 +778,43 @@ fn fresh_java_directory_lock_is_required() {
 }
 
 #[test]
+fn in_process_lock_wait_is_bounded_by_the_acquire_budget() {
+    // Regression: `lock_process_cancellable` spun on `try_lock` + sleep with no
+    // deadline, its only exit being cancellation. `acquire_for_token`
+    // deliberately bounds the flush-path wait so a transport never blocks
+    // indefinitely behind a peer, but this lock sits *past* that gate -- and the
+    // holder can be inside `refresh_under_lock`, which keeps it across an HTTP
+    // refresh POST. Two auth handles built from one configuration are explicitly
+    // supported, so the per-instance acquisition mutex does not serialize them.
+    let dir = TempDir::new().unwrap();
+    let store = FileTokenStore::at(dir.path())
+        .with_lock_timings(Duration::from_millis(150), DEFAULT_LOCK_STALE);
+    let key = test_key();
+
+    // Hold the in-process lock for this store path from another thread, the way
+    // a concurrent refresh would.
+    let process_lock = process_lock_for(&store.directory_lock_file());
+    let held = process_lock.lock().unwrap();
+
+    let started = Instant::now();
+    let error = store.save(&key, &test_token()).unwrap_err();
+    let elapsed = started.elapsed();
+    drop(held);
+
+    assert_eq!(
+        error
+            .downcast_ref::<std::io::Error>()
+            .map(std::io::Error::kind),
+        Some(std::io::ErrorKind::WouldBlock),
+        "a contended in-process lock must fail as a retryable lock timeout"
+    );
+    assert!(
+        elapsed < Duration::from_secs(5),
+        "the wait was not bounded by the acquire budget: {elapsed:?}"
+    );
+}
+
+#[test]
 fn creates_missing_parent_chain() {
     // The parent chain is created recursively and the leaf non-recursively; a
     // brand-new nested store path must still work.

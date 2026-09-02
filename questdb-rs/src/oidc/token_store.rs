@@ -886,7 +886,8 @@ impl FileTokenStore {
         self.create_directory()?;
         let lock = self.directory_lock_file();
         let process_lock = process_lock_for(&lock);
-        let _process_guard = lock_process_cancellable(&process_lock, cancelled)?;
+        let _process_guard =
+            lock_process_cancellable(&process_lock, self.lock_acquire_budget, cancelled)?;
         let short_lease = directory_is_owner_only(&self.directory)
             && path_is_definitely_absent(&self.untrusted_sentinel());
         let stale_after = if short_lease {
@@ -956,7 +957,8 @@ impl FileTokenStore {
             return action();
         }
         let process_lock = process_lock_for(&lock);
-        let _process_guard = lock_process_cancellable(&process_lock, cancelled)?;
+        let _process_guard =
+            lock_process_cancellable(&process_lock, self.lock_acquire_budget, cancelled)?;
         let _scope = HeldLockScope::enter(lock.clone());
         self.prepare_directory(cancelled)?;
         let held = self.acquire_lock(&lock, false, self.lock_stale, EMPTY_LOCK_GRACE, cancelled)?;
@@ -1292,10 +1294,28 @@ fn process_lock_for(lock: &Path) -> Arc<Mutex<()>> {
         .clone()
 }
 
+/// Take the in-process lock guarding one store path, bounded by `budget`.
+///
+/// The budget matters because a caller can reach here from the flush path:
+/// `acquire_for_token` deliberately bounds that wait so a transport never
+/// blocks indefinitely behind a peer, but past that gate `maybe_load_from_store`
+/// and `try_refresh_coordinated` enter this lock -- and an unbounded spin here
+/// escaped the very budget that gate exists to enforce. The holder can be inside
+/// `refresh_under_lock`, which keeps this lock across an HTTP refresh POST plus
+/// two nested directory-lock acquisitions, and two auth handles built from one
+/// configuration are explicitly supported, so the per-instance acquisition mutex
+/// does not serialize them.
+///
+/// Expiry is reported as an ordinary retryable lock-acquisition failure: the
+/// peer's refresh may well have populated the store by the next attempt.
 fn lock_process_cancellable<'a>(
     lock: &'a Mutex<()>,
+    budget: Duration,
     cancelled: &dyn Fn() -> bool,
 ) -> TokenStoreResult<MutexGuard<'a, ()>> {
+    // `budget` comes from `lock_acquire_budget`, clamped in `with_lock_timings`,
+    // so this add cannot overflow.
+    let deadline = Instant::now() + budget;
     loop {
         if cancelled() {
             return Err(cancelled_error());
@@ -1303,7 +1323,19 @@ fn lock_process_cancellable<'a>(
         match lock.try_lock() {
             Ok(guard) => return Ok(guard),
             Err(TryLockError::Poisoned(error)) => return Ok(error.into_inner()),
-            Err(TryLockError::WouldBlock) => std::thread::sleep(LOCK_POLL_SLICE),
+            Err(TryLockError::WouldBlock) => {
+                if Instant::now() >= deadline {
+                    return Err(Box::new(std::io::Error::new(
+                        std::io::ErrorKind::WouldBlock,
+                        format!(
+                            "could not acquire the in-process OIDC token-store \
+                             lock within {budget:?}; another token acquisition \
+                             in this process is still using it"
+                        ),
+                    )));
+                }
+                std::thread::sleep(LOCK_POLL_SLICE)
+            }
         }
     }
 }
