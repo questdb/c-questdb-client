@@ -462,6 +462,24 @@ impl ConnectionEventSource {
         );
     }
 
+    /// A token provider (e.g. OIDC) failed before any endpoint was dialled, so
+    /// the round ends without a connection.
+    ///
+    /// Reported as an `AuthFailed` carrying no endpoint: the failure is the
+    /// credential, not a host, and nothing was contacted. Without this the
+    /// whole round is silent — the provider is resolved above the endpoint
+    /// loop, so neither `auth_failed` nor `all_endpoints_unreachable` is ever
+    /// reached, and a listener sees no event at all for a sender that is in
+    /// fact reconnecting indefinitely.
+    pub(crate) fn token_provider_failed(&self, err: &crate::Error, attempt: u64) {
+        self.failed_since_success.store(true, Ordering::Relaxed);
+        self.offer(
+            ConnectionEvent::new(ConnectionEventKind::AuthFailed)
+                .attempt(attempt)
+                .caused_by(err),
+        );
+    }
+
     pub(crate) fn all_endpoints_unreachable(&self, err: &crate::Error) {
         self.failed_since_success.store(true, Ordering::Relaxed);
         self.offer(

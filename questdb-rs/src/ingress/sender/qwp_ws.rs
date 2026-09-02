@@ -3361,18 +3361,47 @@ pub(crate) fn connect_qwp_ws_endpoint_round<A: QwpWsHealthAccess>(
     // store-and-forward frames must remain drainable. Server authentication
     // rejections happen later in the handshake and remain terminal AuthErrors.
     let provided_header = match qwp_ws.token_provider.as_ref() {
-        Some(provider) => Some(if connect_kind.bounded_dial() {
-            match traffic_gate {
-                // Arbitrary synchronous providers cannot be cancelled. Isolate
-                // runner-owned acquisition so shutdown can abandon the result
-                // and release the publication store / slot lock immediately.
-                // The provider thread retains only its closure until it returns.
-                Some(gate) => provider.bearer_header_isolated_until(|| gate.is_shutdown())?,
-                None => provider.bearer_header()?,
-            }
-        } else {
-            provider.bearer_header()?
-        }),
+        Some(provider) => {
+            let acquired = if connect_kind.bounded_dial() {
+                match traffic_gate {
+                    // Arbitrary synchronous providers cannot be cancelled. Isolate
+                    // runner-owned acquisition so shutdown can abandon the result
+                    // and release the publication store / slot lock immediately.
+                    // The provider thread retains only its closure until it returns.
+                    Some(gate) => provider.bearer_header_isolated_until(|| gate.is_shutdown()),
+                    None => provider.bearer_header(),
+                }
+            } else {
+                provider.bearer_header()
+            };
+            // Narrate before propagating. This returns above the endpoint loop,
+            // so `auth_failed` (inside it) and `all_endpoints_unreachable`
+            // (after it) are both unreachable from here: without this the round
+            // produces no event and no log at all. Combined with a retryable
+            // provider error and a reconnect budget that restarts each round,
+            // the caller would otherwise observe an indefinite silent stall
+            // whose first symptom is unrelated store backpressure.
+            Some(acquired.map_err(|err| {
+                match events {
+                    // Foreground rounds narrate; background (orphan-drainer)
+                    // walks deliberately do not, so as not to claim an outage
+                    // against an endpoint the foreground may be using happily.
+                    Some(events) => {
+                        events.token_provider_failed(&err, events.next_attempt());
+                        log::warn!(
+                            "questdb: QWP/WebSocket token provider failed before \
+                             dialling any endpoint; abandoning this connection \
+                             round: {err}"
+                        );
+                    }
+                    None => log::debug!(
+                        "questdb: QWP/WebSocket token provider failed on a \
+                         background walk: {err}"
+                    ),
+                }
+                err
+            })?)
+        }
         None => None,
     };
     let auth_header = provided_header.as_deref().or(auth_header);
