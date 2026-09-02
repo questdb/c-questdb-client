@@ -95,7 +95,8 @@ public:
     {
         return _event->expires_in_seconds;
     }
-    /** The prompt's bounded initial polling interval, or zero for other events. */
+    /** The prompt's bounded initial polling interval, or zero for other events.
+     */
     uint64_t interval_seconds() const noexcept
     {
         constexpr size_t required_size =
@@ -208,9 +209,9 @@ struct config_view
 /**
  * Interactive OIDC device-flow sign-in handle.
  *
- * `sign_in()`, `token()`, `clear()`, and `close()` throw `questdb::oidc::error` on
- * failure. Note that when this same auth state is attached to an ingest sender
- * via `opts::oidc_auth`, a later token-acquisition failure surfaces from
+ * `sign_in()`, `token()`, `clear()`, and `close()` throw `questdb::oidc::error`
+ * on failure. Note that when this same auth state is attached to an ingest
+ * sender via `opts::oidc_auth`, a later token-acquisition failure surfaces from
  * `flush()` as a `questdb::ingress::line_sender_error` (with the OIDC detail on
  * its `oidc_diagnostic()` member), **not** as a `questdb::oidc::error` — so an
  * `oidc::error` handler written for this API does not transfer to a sender.
