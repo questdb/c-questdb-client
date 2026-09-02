@@ -273,10 +273,10 @@ fn close_cancels_device_polling_and_disables_shared_auth() {
     assert_eq!(error.kind(), OidcErrorKind::Cancelled);
     assert!(auth.is_closed());
     assert_eq!(auth.token().unwrap_err().kind(), OidcErrorKind::Cancelled);
-    assert_eq!(
-        auth.try_clear().unwrap_err().kind(),
-        OidcErrorKind::Cancelled
-    );
+    // clear is the exception: it is pure teardown, and close leaves the
+    // persisted entry behind, so it has to keep working afterwards.
+    auth.try_clear()
+        .expect("clear must remain available on a closed provider");
     // Idempotent, including the synchronous drain guarantee.
     auth.close();
 }
@@ -2610,6 +2610,43 @@ fn groups_mode_refresh_without_id_token_keeps_the_rotated_credential() {
         reader.load(&key).unwrap().unwrap().refresh_token(),
         Some("RT-2"),
         "a restart must not consume the credential without replacing it"
+    );
+}
+
+#[test]
+fn clear_after_close_still_deletes_the_persisted_entry() {
+    // close() drops the in-memory credential but deliberately leaves the
+    // persisted entry, so clear() has to outlive it. It used to refuse:
+    // acquire_for_operation and the store-cancellation predicate both key on
+    // `closed`, the latter aborting the delete before it began. That left a
+    // long-lived plaintext refresh token on disk with no supported way to
+    // remove it.
+    let device_calls = Arc::new(AtomicUsize::new(0));
+    let mock = persistence_mock(Arc::clone(&device_calls), || {
+        r#"{"access_token":"AT-refreshed","refresh_token":"RT-2","expires_in":300}"#.to_string()
+    });
+    let dir = TempDir::new().unwrap();
+    let reader = FileTokenStore::at(dir.path());
+    let key = key_for(&mock);
+
+    let auth = auth_with_store(&mock, dir.path());
+    assert_eq!(sign_in_and_token(&auth).unwrap(), "AT-initial");
+    assert!(
+        reader.load(&key).unwrap().is_some(),
+        "nothing was persisted"
+    );
+
+    auth.close();
+    assert!(
+        reader.load(&key).unwrap().is_some(),
+        "close must leave the persisted entry alone -- clear is what removes it"
+    );
+
+    auth.try_clear()
+        .expect("clear must work on a closed provider");
+    assert!(
+        reader.load(&key).unwrap().is_none(),
+        "the persisted credential survived clear() after close()"
     );
 }
 

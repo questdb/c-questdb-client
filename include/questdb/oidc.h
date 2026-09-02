@@ -270,6 +270,10 @@ questdb_oidc_token* questdb_oidc_auth_token(
  * when persisted deletion fails, because the credential may remain usable by a
  * new auth object or after process restart. This does not revoke any token at
  * the identity provider.
+ *
+ * Remains available after `questdb_oidc_auth_close`, which drops the in-memory
+ * credential but leaves the persisted entry: clearing is the only way to remove
+ * that, so it must outlive the close.
  */
 QUESTDB_CLIENT_API
 bool questdb_oidc_auth_clear(

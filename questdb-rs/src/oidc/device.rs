@@ -650,8 +650,21 @@ impl OidcDeviceAuth {
     /// This only deletes local client credentials; it does **not** revoke access,
     /// ID, or refresh tokens at the identity provider.
     pub fn try_clear(&self) -> Result<()> {
-        let _acq = self.acquire_for_operation()?;
-        self.ensure_open()?;
+        // Clearing is pure teardown, so it must keep working after `close`.
+        // `close` deliberately leaves the persisted entry alone -- it drops only
+        // the in-memory copy -- so refusing here stranded a long-lived plaintext
+        // refresh token on disk with no supported way to remove it. That is
+        // reachable through the ordinary scoped form, whose exit closes the
+        // provider before a cleanup path can call `clear`.
+        let started_closed = self.is_closed();
+        let _acq = if started_closed {
+            self.acquire_for_teardown()
+        } else {
+            self.acquire_for_operation()?
+        };
+        if !started_closed {
+            self.ensure_open()?;
+        }
         *self.lock_tokens() = None;
         {
             let mut state = self.lock_store_state();
@@ -663,11 +676,18 @@ impl OidcDeviceAuth {
         if let (Some(store), Some(key)) = (self.token_store.as_ref(), self.store_key.as_ref()) {
             // Delete under the per-identity lock so it serialises against a peer's
             // in-flight save (which writes under the same lock).
-            let cancelled = || self.is_closed();
+            // A clear that began on a live provider stays cancellable by a
+            // concurrent close. One that began after close must not be: that
+            // predicate is permanently true by then and would abort the delete
+            // before it started. The store's own bounded lock wait still bounds
+            // this.
+            let cancelled = || !started_closed && self.is_closed();
             let outcome = store.in_lock_cancellable(key, &cancelled, &mut || {
                 store.clear_cancellable(key, &cancelled)
             });
-            self.ensure_open()?;
+            if !started_closed {
+                self.ensure_open()?;
+            }
             if let Err(e) = outcome {
                 clear_error = Some(OidcError::network(format!(
                     "Failed to delete persisted OIDC credentials: {e}"
@@ -786,6 +806,24 @@ impl OidcDeviceAuth {
 
     /// Cancellable acquisition for lifecycle operations that may otherwise
     /// wait behind a whole device-code lifetime.
+    /// Take the acquisition lock for teardown on an already-closed provider.
+    /// Unlike [`acquire_for_operation`](Self::acquire_for_operation) it cannot
+    /// fail on the closed state -- that is the state it exists to serve -- and
+    /// it cannot wait on `close_wake`, which is already signalled. Any operation
+    /// still holding the lock observes `closed` between its blocking steps and
+    /// releases promptly, so this is a bounded spin, not an unbounded one.
+    fn acquire_for_teardown(&self) -> std::sync::MutexGuard<'_, ()> {
+        loop {
+            match self.acquire.try_lock() {
+                Ok(guard) => return guard,
+                Err(TryLockError::Poisoned(error)) => return error.into_inner(),
+                Err(TryLockError::WouldBlock) => {
+                    std::thread::sleep(ACQUIRE_WAIT_POLL_SLICE);
+                }
+            }
+        }
+    }
+
     fn acquire_for_operation(&self) -> Result<std::sync::MutexGuard<'_, ()>> {
         loop {
             self.ensure_open()?;
