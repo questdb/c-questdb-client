@@ -626,7 +626,19 @@ pub(crate) fn resolve_config(http: &HttpClient, params: &DiscoveryParams) -> Res
 
     // Fall back to IdP discovery when QuestDB doesn't advertise an endpoint. The
     // IdP is always held to https/loopback (never the allow_insecure flag).
-    if token_endpoint.is_none() || device_endpoint.is_none() {
+    let needs_discovery = token_endpoint.is_none() || device_endpoint.is_none();
+    // Also consult the IdP when a /settings-advertised endpoint is about to be
+    // pinned to the issuer. The pin below waives an endpoint the IdP's own
+    // document confirms, but the document was fetched only when an endpoint was
+    // *missing* -- so with both advertised the waiver could never fire, and any
+    // IdP that serves tokens from outside its issuer path or origin was
+    // rejected outright. That is not an exotic shape: Microsoft Entra ID's
+    // issuer is `.../{tenant}/v2.0` while its token endpoint is
+    // `.../{tenant}/oauth2/v2.0/token`, and Google's issuer is
+    // `accounts.google.com` against `oauth2.googleapis.com`. Both failed the
+    // very configuration the documentation recommends.
+    let wants_confirmation = issuer.is_some() && (token_from_settings || device_from_settings);
+    if needs_discovery || wants_confirmation {
         let Some(iss) = issuer.as_deref() else {
             return Err(OidcError::config(
                 "QuestDB did not advertise the OIDC device-authorization endpoint \
@@ -638,14 +650,27 @@ pub(crate) fn resolve_config(http: &HttpClient, params: &DiscoveryParams) -> Res
                  endpoint(s) explicitly to skip discovery.",
             ));
         };
-        let doc = discover_from_idp(http, iss)?;
-        doc_token_endpoint = str_setting(doc.get("token_endpoint"));
-        doc_device_endpoint = str_setting(doc.get("device_authorization_endpoint"));
-        if device_endpoint.is_none() {
-            device_endpoint = doc_device_endpoint.clone();
-        }
-        if token_endpoint.is_none() {
-            token_endpoint = doc_token_endpoint.clone();
+        match discover_from_idp(http, iss) {
+            Ok(doc) => {
+                doc_token_endpoint = str_setting(doc.get("token_endpoint"));
+                doc_device_endpoint = str_setting(doc.get("device_authorization_endpoint"));
+                if device_endpoint.is_none() {
+                    device_endpoint = doc_device_endpoint.clone();
+                }
+                if token_endpoint.is_none() {
+                    token_endpoint = doc_token_endpoint.clone();
+                }
+            }
+            // When discovery is required the endpoints are unresolvable without
+            // it, so the failure is fatal. A confirmation-only fetch is best
+            // effort: the pin below simply stays unconfirmed and applies as it
+            // did before, so an unreachable `.well-known` cannot newly break a
+            // configuration that used to build.
+            Err(err) => {
+                if needs_discovery {
+                    return Err(err);
+                }
+            }
         }
     }
 
@@ -936,6 +961,38 @@ mod tests {
         assert!(endpoint_path_under_issuer(
             "https://host/anything/token",
             "https://host"
+        ));
+    }
+
+    #[test]
+    fn real_world_idp_topologies_fail_the_path_pin_unconfirmed() {
+        // Documents exactly why the IdP confirmation fetch has to happen for a
+        // /settings-advertised endpoint. These are not exotic shapes -- they are
+        // the two most widely deployed enterprise IdPs -- and the pin alone
+        // rejects both, so before the fix the recommended `issuer=`
+        // configuration could not work against either.
+
+        // Microsoft Entra ID: issuer .../{tenant}/v2.0, token endpoint
+        // .../{tenant}/oauth2/v2.0/token. The segment prefix compares
+        // ["{tenant}", "oauth2"] against ["{tenant}", "v2.0"].
+        let entra_issuer = "https://login.microsoftonline.com/tid/v2.0";
+        assert!(!endpoint_path_under_issuer(
+            "https://login.microsoftonline.com/tid/oauth2/v2.0/token",
+            entra_issuer
+        ));
+
+        // Google: a different origin entirely, which the origin check rejects a
+        // step earlier.
+        assert_ne!(
+            normalized_origin("https://oauth2.googleapis.com/token").unwrap(),
+            normalized_origin("https://accounts.google.com").unwrap()
+        );
+
+        // Keycloak-style deployments, where the endpoints do sit under the
+        // issuer path, keep passing the pin unaided.
+        assert!(endpoint_path_under_issuer(
+            "https://host/realms/prod/protocol/openid-connect/token",
+            "https://host/realms/prod"
         ));
     }
 
