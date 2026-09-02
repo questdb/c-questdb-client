@@ -556,6 +556,26 @@ impl OidcDeviceAuth {
         // still mutate this instance. The active operation observes `closed`
         // between blocking steps and releases this lock promptly.
         let _acq = self.lock_acquire();
+        self.discard_credentials();
+    }
+
+    /// Drop the in-memory credential without waiting for the acquisition lock.
+    ///
+    /// This is the half of [`close`](Self::close) that must happen even when
+    /// the drain cannot: it takes only the tokens and store-state locks, never
+    /// `acquire`, so it is safe to call from inside this auth's own event
+    /// callback (which runs *within* the acquisition critical section and would
+    /// self-deadlock on it).
+    ///
+    /// Splitting it out is what keeps `close`'s documented promise — "drops the
+    /// in-memory credential but leaves the persisted entry" — true on every
+    /// path. While the teardown lived only after `lock_acquire()`, any close
+    /// that skipped the drain left the access and refresh tokens resident for
+    /// the remaining life of the provider.
+    ///
+    /// The persisted entry is deliberately untouched; removing that is
+    /// [`try_clear`](Self::try_clear)'s job, which outlives close.
+    pub fn discard_credentials(&self) {
         *self.lock_tokens() = None;
         self.lock_store_state().set_last_persisted_refresh(None);
     }

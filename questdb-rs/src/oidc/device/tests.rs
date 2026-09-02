@@ -233,6 +233,49 @@ fn sign_in_and_token(auth: &OidcDeviceAuth) -> Result<String> {
 }
 
 #[test]
+fn discard_credentials_drops_the_in_memory_token_without_the_acquire_lock() {
+    // Regression: the credential teardown used to live only after
+    // `lock_acquire()` inside `close()`. Any close that skipped the drain --
+    // notably one issued from inside a renderer callback, which runs within
+    // that very critical section -- therefore left the access and refresh
+    // tokens resident for the remaining life of the provider, contradicting
+    // close's documented "drops the in-memory credential".
+    let auth = OidcDeviceAuth::builder()
+        .client_id("questdb")
+        .device_authorization_endpoint("https://idp.example/device")
+        .token_endpoint("https://idp.example/token")
+        .scope("openid")
+        .interactive(false)
+        .open_browser(false)
+        .build()
+        .expect("build auth");
+
+    let now = now_epoch();
+    *auth.lock_tokens() = Some(TokenSet {
+        access_token: Some("AT-secret".to_string()),
+        id_token: Some("ID-secret".to_string()),
+        refresh_token: Some("RT-secret".to_string()),
+        expires_at: now + 300.0,
+        token_type: "Bearer".to_string(),
+        scope: Some("openid".to_string()),
+        sub: Some("subject".to_string()),
+        issued_at: now,
+    });
+    assert!(auth.lock_tokens().is_some());
+
+    // Hold the acquisition lock, exactly as a running callback would, and show
+    // the teardown still completes rather than deadlocking or being skipped.
+    let held = auth.lock_acquire();
+    auth.discard_credentials();
+    drop(held);
+
+    assert!(
+        auth.lock_tokens().is_none(),
+        "the in-memory credential must be dropped even when the drain is skipped"
+    );
+}
+
+#[test]
 fn close_cancels_device_polling_and_disables_shared_auth() {
     let (polling_tx, polling_rx) = mpsc::sync_channel(1);
     let mock = MockServer::start(move |method, path, _body| match (method, path) {

@@ -245,14 +245,19 @@ impl SharedOidcAuth {
         // flow from another thread, and a renderer's own "cancel" affordance has
         // nothing else to call.
         self.inner.signal_close();
-        // Only the drain can self-deadlock: it waits for the acquisition
-        // critical section that a callback runs inside. Skip it there; the close
-        // is already published either way.
-        if !self
-            .event_handler
-            .as_deref()
-            .is_some_and(CEventHandler::is_active)
-        {
+        // Only the drain can self-deadlock, and only for the thread actually
+        // running the callback: it alone holds the acquisition lock that the
+        // drain waits on. Every other caller must still wait, which is what the
+        // header promises. Keying this on the handler's shared `active` flag
+        // instead made an unrelated thread's close return early too.
+        if in_event_callback_on_this_thread() {
+            // The drain is skipped, but the credential teardown is not: it takes
+            // only the tokens lock, so it is safe inside the critical section.
+            // Without this the tokens stayed resident whenever close ran from a
+            // callback -- including the renderer "cancel" affordance the docs
+            // point users at -- contradicting close's documented contract.
+            self.inner.discard_credentials();
+        } else {
             self.inner.close();
         }
         Ok(())
@@ -316,6 +321,23 @@ struct CEventHandler {
     active: AtomicBool,
 }
 
+std::thread_local! {
+    /// Depth of C event callbacks this thread is currently inside.
+    ///
+    /// `CEventHandler::active` is deliberately shared across threads — it backs
+    /// the re-entry rejection, which must fire for any caller while a callback
+    /// runs. But *self-deadlock* is a per-thread property: only the thread
+    /// executing the callback holds the acquisition lock, so only that thread
+    /// must skip `close`'s drain. Using the shared flag for that made a
+    /// `close()` on an unrelated thread skip the drain too, silently voiding
+    /// the contract that it waits for token work to stop.
+    static IN_EVENT_CALLBACK: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+fn in_event_callback_on_this_thread() -> bool {
+    IN_EVENT_CALLBACK.with(|depth| depth.get() != 0)
+}
+
 struct ActiveEventHandler<'a> {
     handler: &'a CEventHandler,
 }
@@ -324,12 +346,14 @@ impl<'a> ActiveEventHandler<'a> {
     fn enter(handler: &'a CEventHandler) -> Self {
         let was_active = handler.active.swap(true, Ordering::AcqRel);
         debug_assert!(!was_active, "callback gate must serialize handler entry");
+        IN_EVENT_CALLBACK.with(|depth| depth.set(depth.get() + 1));
         Self { handler }
     }
 }
 
 impl Drop for ActiveEventHandler<'_> {
     fn drop(&mut self) {
+        IN_EVENT_CALLBACK.with(|depth| depth.set(depth.get() - 1));
         let was_active = self.handler.active.swap(false, Ordering::AcqRel);
         debug_assert!(was_active, "active callback guard must be balanced");
     }
@@ -1980,6 +2004,60 @@ mod tests {
             assert_eq!(state.closed_ok.load(Ordering::SeqCst), 1);
             assert_eq!(state.unexpected.load(Ordering::SeqCst), 0);
             questdb_oidc_auth_free(auth);
+            questdb_oidc_builder_free(builder);
+        }
+    }
+
+    #[test]
+    fn callback_thread_scope_is_per_thread_not_process_wide() {
+        // Regression: `close`'s drain was skipped whenever the handler's shared
+        // `active` flag was set -- by ANY thread, and by any sibling auth built
+        // from the same reusable builder. A close arriving from an unrelated
+        // thread therefore returned early without waiting for token work to
+        // stop, silently voiding the contract the header states. Self-deadlock
+        // is a per-thread property: only the thread inside the callback holds
+        // the acquisition lock, and only it may skip.
+        unsafe {
+            let builder = explicit_builder();
+            let mut error = ptr::null_mut();
+            assert!(questdb_oidc_builder_interactive(builder, false, &mut error));
+            let observed_other_thread = Arc::new(AtomicBool::new(true));
+            let observed_callback_thread = Arc::new(AtomicBool::new(false));
+            let probe_other = Arc::clone(&observed_other_thread);
+            let probe_self = Arc::clone(&observed_callback_thread);
+
+            assert!(!in_event_callback_on_this_thread());
+
+            let handler = Arc::new(CEventHandler {
+                callback: ignore_event,
+                user_data: 0,
+                release: None,
+                callback_gate: std::sync::Mutex::new(()),
+                active: AtomicBool::new(false),
+            });
+            {
+                let _entered = ActiveEventHandler::enter(&handler);
+                // On the callback's own thread the scope is active...
+                probe_self.store(in_event_callback_on_this_thread(), Ordering::SeqCst);
+                // ...while any other thread must NOT see itself as inside it,
+                // even though the shared `active` flag is set for both.
+                assert!(handler.is_active());
+                let other = std::thread::spawn(move || {
+                    probe_other.store(in_event_callback_on_this_thread(), Ordering::SeqCst);
+                });
+                other.join().unwrap();
+            }
+
+            assert!(
+                observed_callback_thread.load(Ordering::SeqCst),
+                "the callback's own thread must skip the drain"
+            );
+            assert!(
+                !observed_other_thread.load(Ordering::SeqCst),
+                "an unrelated thread must still wait for the drain"
+            );
+            assert!(!handler.is_active());
+            assert!(!in_event_callback_on_this_thread());
             questdb_oidc_builder_free(builder);
         }
     }
