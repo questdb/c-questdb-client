@@ -160,7 +160,21 @@ fn provider_shutdown_error() -> crate::Error {
 /// draining already-accepted frames rather than terminalizing the publication
 /// store. An actual server rejection is produced later by the handshake path as
 /// a terminal [`AuthError`](crate::ErrorCode::AuthError).
+///
+/// The one exception is a permanently closed provider. "May recover on its next
+/// invocation" is false for it: `close()` is monotonic, so `token()` returns
+/// `Cancelled` for the rest of the process. Marking that retryable makes a
+/// reconnect loop on state that can never recover, and because
+/// `RetryState::next_after_retryable_terminal` starts a fresh budget each round
+/// the loop never ends and never surfaces the real cause. Keep it terminal so
+/// the caller sees the close.
 fn classify_provider_error(e: crate::Error) -> crate::Error {
+    #[cfg(feature = "_oidc")]
+    if e.oidc_error()
+        .is_some_and(|oidc| oidc.kind() == crate::oidc::OidcErrorKind::Cancelled)
+    {
+        return e;
+    }
     if e.code() == crate::ErrorCode::SocketError {
         e
     } else {
@@ -230,6 +244,31 @@ mod tests {
     }
 
     #[cfg(feature = "_oidc")]
+    #[test]
+    fn cancelled_provider_stays_terminal() {
+        // Regression: `close()` is permanent and monotonic, so `token()` returns
+        // `Cancelled` forever after. Reclassifying that as a retryable
+        // `SocketError` made the QWP/WS reconnect loop treat it as transient --
+        // and because `next_after_retryable_terminal` starts a fresh budget each
+        // round, the sender retried indefinitely and never surfaced the close.
+        let provider = TokenProvider::new(|| {
+            Err::<String, _>(crate::oidc::OidcError::cancelled("provider closed"))
+        });
+
+        let err = provider.bearer_header().unwrap_err();
+        assert_eq!(
+            err.code(),
+            crate::ErrorCode::AuthError,
+            "a permanently closed provider must not be reported as retryable"
+        );
+        assert_eq!(
+            err.oidc_error().map(crate::oidc::OidcError::kind),
+            Some(crate::oidc::OidcErrorKind::Cancelled)
+        );
+        // `AuthError` is in `reconnect_error_is_terminal`'s terminal set, which
+        // is what stops the reconnect loop; `SocketError` is not.
+    }
+
     #[test]
     fn retry_classification_preserves_oidc_detail() {
         let provider = TokenProvider::new(|| {
