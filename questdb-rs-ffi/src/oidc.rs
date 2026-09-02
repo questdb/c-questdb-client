@@ -203,18 +203,56 @@ pub(crate) struct SharedOidcAuth {
 }
 
 impl SharedOidcAuth {
-    fn reject_callback_reentry(&self) -> Result<(), Error> {
-        if self
-            .event_handler
+    fn callback_is_active(&self) -> bool {
+        self.event_handler
             .as_deref()
             .is_some_and(CEventHandler::is_active)
-        {
-            return Err(Error::new(
-                ErrorCode::InvalidApiCall,
-                "OIDC authentication cannot be re-entered from its event callback; return from \
-                 the callback before calling sign_in, token, clear, close, or an attached transport"
-                    .to_string(),
-            ));
+    }
+
+    /// This thread is the one inside the callback: it already holds the
+    /// acquisition lock, so any operation needing it would deadlock on itself.
+    ///
+    /// `close` is absent from the list on purpose -- it is never rejected, and
+    /// is exactly what a renderer's "cancel" affordance is supposed to call.
+    fn reentry_error() -> Error {
+        Error::new(
+            ErrorCode::InvalidApiCall,
+            "OIDC authentication cannot be re-entered from its event callback; return from \
+             the callback before calling sign_in, token, clear, or an attached transport. \
+             close is exempt and may be called here to cancel the flow."
+                .to_string(),
+        )
+    }
+
+    /// Another thread is inside the callback, so the acquisition lock is held
+    /// and this caller would block behind a prompt that may be waiting on a
+    /// human. Distinct from re-entry: this caller did nothing wrong.
+    fn callback_busy_error() -> Error {
+        Error::new(
+            ErrorCode::InvalidApiCall,
+            "OIDC authentication is busy: a sign-in prompt for this provider is being \
+             rendered on another thread and no valid cached token is available. Acquire a \
+             token before starting an interactive sign-in, or retry once it completes."
+                .to_string(),
+        )
+    }
+
+    /// Reject an operation that would take the acquisition lock while a
+    /// callback holds it.
+    ///
+    /// The guard is keyed on the handler's shared flag rather than this
+    /// thread's, and deliberately so: a callback may dispatch to a worker and
+    /// *wait* for it, so a blocking acquisition on that worker deadlocks just
+    /// as surely as one on the callback's own thread. Only the diagnostic is
+    /// thread-scoped, since a caller that never entered a callback should not
+    /// be told it re-entered one.
+    fn reject_callback_reentry(&self) -> Result<(), Error> {
+        if self.callback_is_active() {
+            return Err(if in_event_callback_on_this_thread() {
+                Self::reentry_error()
+            } else {
+                Self::callback_busy_error()
+            });
         }
         Ok(())
     }
@@ -225,7 +263,21 @@ impl SharedOidcAuth {
     }
 
     pub(crate) fn token(&self) -> Result<String, Error> {
-        self.reject_callback_reentry()?;
+        // Serve a valid cached token even while a callback runs elsewhere. That
+        // path consults only the token cache, never the acquisition lock, so it
+        // cannot block behind the callback and cannot deadlock -- while the
+        // blanket rejection failed every unrelated caller, notably a pooled
+        // PG-wire checkout on another thread, for the whole time a prompt was
+        // on screen. Only an acquisition, which would block, is still refused.
+        if self.callback_is_active() {
+            if in_event_callback_on_this_thread() {
+                return Err(Self::reentry_error());
+            }
+            if let Some(cached) = self.inner.cached_token() {
+                return cached.map_err(Into::into);
+            }
+            return Err(Self::callback_busy_error());
+        }
         // OidcDeviceAuth::token is deliberately non-interactive. Every attached
         // transport shares this path, so flush/connect/reconnect can refresh
         // silently but can never start a device-flow prompt.
@@ -1586,7 +1638,12 @@ mod tests {
     #[derive(Default)]
     struct ReentrantCallState {
         auth: AtomicPtr<questdb_oidc_auth>,
+        /// Refused as re-entry: this thread is the one inside the callback.
         rejected: AtomicUsize,
+        /// Refused as busy: a callback holds the lock on ANOTHER thread, so
+        /// this caller would block behind it. It did not re-enter anything and
+        /// must not be told that it did.
+        busy: AtomicUsize,
         unexpected: AtomicUsize,
         closed_ok: AtomicUsize,
     }
@@ -1596,20 +1653,26 @@ mod tests {
         succeeded: bool,
         error: *mut questdb_error,
     ) {
-        let is_guard_error = !succeeded
+        let guard_message = (!succeeded
             && !error.is_null()
             && unsafe { crate::questdb_error_get_code(error) } as i32
-                == crate::line_sender_error_code::line_sender_error_invalid_api_call as i32
-            && {
+                == crate::line_sender_error_code::line_sender_error_invalid_api_call as i32)
+            .then(|| {
                 let mut len = 0;
                 let message = unsafe { crate::questdb_error_msg(error, &mut len) };
                 let message = unsafe { slice::from_raw_parts(message as *const u8, len) };
-                String::from_utf8_lossy(message).contains("cannot be re-entered")
-            };
-        if is_guard_error {
-            state.rejected.fetch_add(1, Ordering::SeqCst);
-        } else {
-            state.unexpected.fetch_add(1, Ordering::SeqCst);
+                String::from_utf8_lossy(message).into_owned()
+            });
+        match guard_message.as_deref() {
+            Some(message) if message.contains("cannot be re-entered") => {
+                state.rejected.fetch_add(1, Ordering::SeqCst);
+            }
+            Some(message) if message.contains("is busy") => {
+                state.busy.fetch_add(1, Ordering::SeqCst);
+            }
+            _ => {
+                state.unexpected.fetch_add(1, Ordering::SeqCst);
+            }
         }
         unsafe { crate::questdb_error_free(error) };
     }
@@ -2090,7 +2153,17 @@ mod tests {
             // point of it.
             CEventRenderer(handler).on_waiting(30.0);
 
-            assert_eq!(state.rejected.load(Ordering::SeqCst), 3);
+            // Still refused -- the callback JOINS this worker, so a blocking
+            // acquisition here would deadlock exactly as one on the callback's
+            // own thread would. But the diagnostic is now thread-scoped: this
+            // thread never entered a callback and must not be told it
+            // re-entered one.
+            assert_eq!(state.busy.load(Ordering::SeqCst), 3);
+            assert_eq!(
+                state.rejected.load(Ordering::SeqCst),
+                0,
+                "a thread that never entered a callback was accused of re-entry"
+            );
             assert_eq!(state.closed_ok.load(Ordering::SeqCst), 1);
             assert_eq!(state.unexpected.load(Ordering::SeqCst), 0);
             questdb_oidc_auth_free(auth);

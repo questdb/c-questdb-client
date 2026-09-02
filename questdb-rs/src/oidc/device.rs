@@ -947,6 +947,20 @@ impl OidcDeviceAuth {
         }
     }
 
+    /// The already-cached credential, if one is valid right now.
+    ///
+    /// Consults only the token cache, never the acquisition lock, so it can be
+    /// served while another thread holds the acquisition critical section --
+    /// notably while a renderer callback runs. Returns `None` when serving a
+    /// token would require an acquisition, which the caller must then decide
+    /// whether it can afford to wait for.
+    pub fn cached_token(&self) -> Option<Result<String>> {
+        if let Err(err) = self.ensure_open() {
+            return Some(Err(err));
+        }
+        self.cached_selected_if_valid()
+    }
+
     fn obtain_tokens(&self, allow_interaction: bool) -> Result<TokenSet> {
         self.ensure_open()?;
         // token() keeps the cache-hit path lock-free. sign_in() is an explicit

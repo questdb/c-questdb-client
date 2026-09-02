@@ -89,11 +89,19 @@ typedef struct questdb_oidc_event
  * auth object built from that builder, so its `user_data` is never entered
  * concurrently by OIDC events.
  *
- * While the callback is running, `sign_in`, `token`, and `clear` calls on an
- * auth object sharing this handler fail with `questdb_error_invalid_api_call`;
- * token acquisition through an attached sender, reader, or pool is likewise
- * rejected through that transport's provider-error path. Return from the
- * callback before starting another auth operation.
+ * While the callback is running, `sign_in` and `clear` on an auth object
+ * sharing this handler fail with `questdb_error_invalid_api_call`, as does
+ * `token` when no valid cached token is available -- including token
+ * acquisition through an attached sender, reader, or pool, which surfaces it
+ * through that transport's provider-error path. `token` DOES succeed from a
+ * valid cache: that path consults no lock the callback holds. The rejection
+ * applies to any thread, not only the callback's own, because a callback may
+ * dispatch to a worker and wait for it. Return from the callback before
+ * starting another auth operation.
+ *
+ * The two cases are distinguished in the error message: a caller on the
+ * callback's own thread is told it re-entered, while a caller on another thread
+ * is told the provider is busy. `close` is never rejected either way.
  */
 typedef void (*questdb_oidc_event_cb)(
     void* user_data, const questdb_oidc_event* event);

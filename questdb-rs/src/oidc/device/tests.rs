@@ -276,6 +276,53 @@ fn discard_credentials_drops_the_in_memory_token_without_the_acquire_lock() {
 }
 
 #[test]
+fn cached_token_is_served_while_the_acquisition_lock_is_held() {
+    // The property the FFI relies on to stop failing unrelated callers while a
+    // renderer callback runs on another thread: a valid cached token comes from
+    // the token cache alone, so it can be served even though the acquisition
+    // critical section is occupied. Blanket-rejecting those callers meant a
+    // pooled PG-wire checkout failed for the whole time a prompt was on screen,
+    // despite a perfectly good token being cached.
+    let auth = OidcDeviceAuth::builder()
+        .client_id("questdb")
+        .device_authorization_endpoint("https://idp.example/device")
+        .token_endpoint("https://idp.example/token")
+        .scope("openid")
+        .interactive(false)
+        .open_browser(false)
+        .build()
+        .expect("build auth");
+
+    let now = now_epoch();
+    *auth.lock_tokens() = Some(TokenSet {
+        access_token: Some("AT-cached".to_string()),
+        id_token: None,
+        refresh_token: None,
+        expires_at: now + 300.0,
+        token_type: "Bearer".to_string(),
+        scope: Some("openid".to_string()),
+        sub: Some("subject".to_string()),
+        issued_at: now,
+    });
+
+    // Stand in for a callback holding the acquisition critical section.
+    let held = auth.lock_acquire();
+    assert_eq!(
+        auth.cached_token().expect("a valid cached token").unwrap(),
+        "AT-cached"
+    );
+    drop(held);
+
+    // With no usable credential it reports "no cached token" rather than
+    // blocking, leaving the caller to decide whether to wait for an
+    // acquisition.
+    *auth.lock_tokens() = None;
+    let held = auth.lock_acquire();
+    assert!(auth.cached_token().is_none());
+    drop(held);
+}
+
+#[test]
 fn close_cancels_device_polling_and_disables_shared_auth() {
     let (polling_tx, polling_rx) = mpsc::sync_channel(1);
     let mock = MockServer::start(move |method, path, _body| match (method, path) {
