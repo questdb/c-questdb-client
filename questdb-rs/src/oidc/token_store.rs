@@ -714,17 +714,9 @@ impl FileTokenStore {
             {
                 return None;
             }
-            let access_token = nonempty_str(obj.get("access_token"));
-            let id_token = nonempty_str(obj.get("id_token"));
-            // A conforming grant always carries at least one usable served
-            // token. Accepting a refresh-only file would let a writer who
-            // cannot read the 0600 credential silently replace the login.
-            if access_token.is_none() && id_token.is_none() {
-                return None;
-            }
             Some(PersistedToken {
-                access_token,
-                id_token,
+                access_token: nonempty_str(obj.get("access_token")),
+                id_token: nonempty_str(obj.get("id_token")),
                 refresh_token: nonempty_str(obj.get("refresh_token")),
                 expires_at: millis_to_seconds(obj.get("expires_at_millis")),
                 token_ttl: millis_to_seconds(obj.get("token_ttl_millis")),
@@ -1090,20 +1082,6 @@ impl TokenStore for FileTokenStore {
         token: &PersistedToken,
         cancelled: &dyn Fn() -> bool,
     ) -> TokenStoreResult<()> {
-        if token
-            .access_token
-            .as_deref()
-            .is_none_or(|value| value.is_empty())
-            && token
-                .id_token
-                .as_deref()
-                .is_none_or(|value| value.is_empty())
-        {
-            return Err(Box::new(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "an OIDC token-store entry must contain an access_token or id_token",
-            )));
-        }
         let content = self.serialize(key, token);
         if content.len() as u64 > MAX_FILE_BYTES {
             return Err(Box::new(std::io::Error::new(
