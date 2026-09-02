@@ -6,6 +6,7 @@
 #include <questdb/ingress/line_sender.hpp>
 
 #include <cstdint>
+#include <memory>
 #include <string_view>
 #include <type_traits>
 #include <utility>
@@ -217,4 +218,51 @@ TEST_CASE("OIDC C++ wrappers preserve ownership and structured errors")
     // Lazy construction performs no network I/O, but exercises ownership and
     // the shared sender/reader provider configuration in the pool FFI.
     questdb::pool pool{"ws::addr=127.0.0.1:1;lazy_connect=true;", copied_auth};
+}
+
+TEST_CASE("OIDC C++ event handler ownership is released exactly once")
+{
+    // The C++ shim's ownership contract had no coverage: the case above only
+    // checks that an EMPTY std::function is rejected, so nothing exercised
+    // whether the caller's captured state is released, leaked, or released
+    // twice. A leak strands it for the process; a double release is a
+    // use-after-free.
+    //
+    // Only the exactly-once property is asserted. WHEN the release happens --
+    // observed here at builder destruction rather than at replacement -- is an
+    // implementation detail the header does not promise, so pinning it would
+    // make this brittle.
+    //
+    // What is NOT covered here, and cannot be from C++ without a live identity
+    // provider, is invoking the callback: the trampoline's catch(...)
+    // containment and the struct_size guards on the appended event fields are
+    // exercised only by the Rust-side tests, which drive a real flow.
+    static int releases = 0;
+    releases = 0;
+
+    struct tracker
+    {
+        ~tracker()
+        {
+            ++releases;
+        }
+    };
+
+    {
+        questdb::oidc::builder builder{};
+        auto owned = std::make_shared<tracker>();
+        builder.event_handler(
+            [owned](const questdb::oidc::event_view&) noexcept {});
+        // The registration owns a copy, so the caller's handle is not the last.
+        CHECK(owned.use_count() == 2);
+        CHECK(releases == 0);
+
+        // Replacing the handler must not release the first capture twice, nor
+        // lose track of it.
+        builder.event_handler(
+            [](const questdb::oidc::event_view&) noexcept {});
+        CHECK(releases <= 1);
+    }
+    // Exactly one release for the one capturing handler: no leak, no double.
+    CHECK(releases == 1);
 }
