@@ -29,21 +29,21 @@ use std::sync::atomic::Ordering;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use crate::ErrorCode;
-use crate::ingress::AckLevel;
-use crate::ingress::QwpWsSenderError;
 use crate::ingress::buffer::{Buffer, QwpWsColumnarBuffer, QwpWsEncodeScratch, SymbolGlobalDict};
 use crate::ingress::sender::qwp_ws::{
-    SyncQwpWsHandlerState, publish_qwp_ws_payload_background, qwp_ws_acked_fsn_background,
-    qwp_ws_begin_close_background, qwp_ws_check_error_background,
-    qwp_ws_drain_to_deadline_background, qwp_ws_is_terminal_background, qwp_ws_ok_fsn_background,
-    qwp_ws_poll_sender_error_background, qwp_ws_poll_sender_error_notification_background,
-    qwp_ws_published_fsn_background, qwp_ws_sender_errors_dropped_background,
+    publish_qwp_ws_payload_background, qwp_ws_acked_fsn_background, qwp_ws_begin_close_background,
+    qwp_ws_check_error_background, qwp_ws_drain_to_deadline_background,
+    qwp_ws_is_terminal_background, qwp_ws_ok_fsn_background, qwp_ws_poll_sender_error_background,
+    qwp_ws_poll_sender_error_notification_background, qwp_ws_published_fsn_background,
+    qwp_ws_sender_errors_dropped_background, SyncQwpWsHandlerState,
 };
 use crate::ingress::sender::qwp_ws_sfa_publisher::{SfaForegroundPublisher, SfaPublishOutcome};
+use crate::ingress::AckLevel;
+use crate::ingress::QwpWsSenderError;
 #[cfg(feature = "arrow-ingress")]
 use crate::ingress::{ColumnName, TableName};
-use crate::{Result, error};
+use crate::ErrorCode;
+use crate::{error, Result};
 
 #[cfg(feature = "arrow-ingress")]
 use super::arrow_batch::{self, ArrowColumnOverride, ArrowTsSource};
@@ -2197,7 +2197,7 @@ mod tests {
 
     #[test]
     fn deny_retry_after_partial_downgrades_not_delivered_and_never_upgrades() {
-        use super::{FlushFailure, deny_retry_after_partial};
+        use super::{deny_retry_after_partial, FlushFailure};
         use crate::{Error, ErrorCode};
 
         // Once a split has put a prefix on the server, a "safe to retry"
@@ -2223,7 +2223,7 @@ mod tests {
 
     #[test]
     fn prior_commit_preserves_current_input_for_reexport_but_denies_source_replay() {
-        use super::{FlushFailure, deny_retry_after_prior_commit};
+        use super::{deny_retry_after_prior_commit, FlushFailure};
         use crate::{Error, ErrorCode};
 
         let nd = FlushFailure::NotDelivered(Error::new(ErrorCode::SocketError, "boom"));
