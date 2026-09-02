@@ -95,6 +95,22 @@ const DEFAULT_LOCK_ACQUIRE_BUDGET: Duration = Duration::from_secs(3);
 const MAX_LOCK_ACQUIRE_BUDGET: Duration = Duration::from_secs(30);
 const LOCK_POLL_SLICE: Duration = Duration::from_millis(50);
 
+/// How far a lock's mtime may sit in the future before it is judged abandoned
+/// rather than fresh.
+///
+/// A future-dated mtime usually means a small clock disagreement -- an NFS/SMB
+/// server stamping from its own clock, or an NTP correction -- and must not let
+/// a contender break a live holder's lock, so within this window it still
+/// counts as fresh. What was missing is an upper bound: a lock stamped beyond
+/// any plausible skew (a clock stepped back, a VM snapshot resume, a restored
+/// backup) stayed fresh *forever*, because both reclaim paths treat "ahead of
+/// now" as age zero. Nothing could then take the lock, so every load, save and
+/// clear failed with a lock timeout for the life of the installation until
+/// someone deleted the file by hand.
+///
+/// Well beyond ordinary skew, and far short of the indefinite wait it replaces.
+const MAX_FUTURE_LOCK_SKEW: Duration = Duration::from_secs(300);
+
 /// A lock older than this is considered abandoned and reclaimed through the
 /// Java-compatible capture-then-verify protocol.
 const DEFAULT_LOCK_STALE: Duration = Duration::from_secs(600);
@@ -860,10 +876,13 @@ impl FileTokenStore {
             return false;
         };
         match SystemTime::now().duration_since(mtime) {
-            // A future-dated mtime (our clock reads behind the lock's) is
-            // untrustworthy; treat as fresh rather than break a possibly-live lock.
             Ok(elapsed) => elapsed > self.lock_stale,
-            Err(_) => false,
+            // A future-dated mtime (our clock reads behind the lock's) is
+            // untrustworthy; treat as fresh rather than break a possibly-live
+            // lock -- but only within a plausible skew. Past that no live
+            // holder can have written it, and treating it as fresh forever
+            // wedged the store permanently. See MAX_FUTURE_LOCK_SKEW.
+            Err(ahead) => ahead.duration() > MAX_FUTURE_LOCK_SKEW,
         }
     }
 
@@ -1094,7 +1113,45 @@ impl TokenStore for FileTokenStore {
                 ),
             )));
         }
-        self.with_directory_lock(cancelled, |_| {
+        self.with_directory_lock(cancelled, |trusted| {
+            // `trusted` is the verdict on what the directory *contained* on
+            // entry, which is what `load` must respect. For writing, the
+            // question is whether the directory is safe *now*: by this point
+            // `with_directory_lock` has retightened the permissions to 0700 and
+            // swept any untrusted contents, so an ordinary one-off loose
+            // directory is already repaired and persisting into it is fine.
+            //
+            // What must not happen is persisting when the repair did not take.
+            // Where the mode cannot be enforced at all -- WSL `drvfs` without
+            // `metadata`, CIFS/SMB with a fixed `file_mode`, vfat/exFAT -- the
+            // directory stays world-writable, every operation is untrusted, and
+            // the old unconditional write put a plaintext refresh token on disk
+            // on every sign-in that `load` would then always refuse to read
+            // back. The device flow re-ran on every start while the credential
+            // accumulated, with nothing logged or returned to say so.
+            //
+            // Reported rather than skipped silently: persistence is opt-in, so
+            // a user who asked for it should learn it is unavailable. The caller
+            // treats a save failure as a warning and still completes the
+            // sign-in, so this costs no functionality.
+            if !may_persist(trusted, &self.directory) {
+                return Err(Box::new(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    format!(
+                        "refusing to persist an OIDC token into {}: the directory is \
+                         writable by users other than its owner and could not be \
+                         restricted, so anything read back from it is not trusted. \
+                         Persisting would leave a plaintext refresh token on disk that \
+                         this client will never use. This is usual on a filesystem that \
+                         cannot represent POSIX permissions (WSL drvfs without metadata, \
+                         CIFS/SMB with a fixed file_mode, vfat/exFAT) -- choose a store \
+                         directory on a native filesystem, or omit the token store to \
+                         keep credentials in memory only.",
+                        self.directory.display(),
+                    ),
+                ))
+                    as Box<dyn std::error::Error + Send + Sync>);
+            }
             self.sweep_orphan_temps(key, true);
             self.save_under_lock(key, &content)
         })
@@ -1569,7 +1626,16 @@ fn steal_if_stale(lock: &Path, stale_after: Duration, empty_grace: Duration) -> 
         .duration_since(SystemTime::UNIX_EPOCH)
         .map(|duration| duration.as_millis())
         .unwrap_or(0);
-    if now_millis.saturating_sub(before.modified_millis) <= threshold.as_millis() {
+    let stale = if before.modified_millis > now_millis {
+        // Future-dated. `saturating_sub` used to floor this at zero, so such a
+        // lock was always "younger than the threshold" and could never be
+        // reclaimed -- the same permanent wedge `is_stale` had. Fresh within a
+        // plausible clock skew, abandoned past it. See MAX_FUTURE_LOCK_SKEW.
+        before.modified_millis - now_millis > MAX_FUTURE_LOCK_SKEW.as_millis()
+    } else {
+        now_millis - before.modified_millis > threshold.as_millis()
+    };
+    if !stale {
         return false;
     }
 
@@ -1708,6 +1774,23 @@ fn path_is_definitely_absent(path: &Path) -> bool {
 /// The short directory-lock lease is safe once no other user can write the
 /// directory. Read/execute bits alone do not make its 0600 token files
 /// attacker-writable, which is also Java's trust boundary.
+/// Whether a credential may be persisted into `dir`.
+///
+/// `trusted` is the verdict on what the directory *contained* on entry, which
+/// `load` must respect. Writing asks a different question: is the directory
+/// safe *now*? By the time an action runs, `with_directory_lock` has already
+/// retightened the permissions and swept any untrusted contents, so an ordinary
+/// one-off loose directory is repaired and persisting into it is fine.
+///
+/// The case this excludes is a directory whose permissions could not be
+/// restricted at all, where the retighten silently does nothing -- WSL `drvfs`
+/// without `metadata`, CIFS/SMB with a fixed `file_mode`, vfat/exFAT. There
+/// every operation is untrusted forever, and persisting would keep writing a
+/// plaintext refresh token that `load` will always refuse to read back.
+fn may_persist(trusted: bool, dir: &Path) -> bool {
+    trusted || directory_is_owner_only(dir)
+}
+
 #[cfg(unix)]
 fn directory_is_owner_only(dir: &Path) -> bool {
     use std::os::unix::fs::PermissionsExt;

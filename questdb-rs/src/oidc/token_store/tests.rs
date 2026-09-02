@@ -641,6 +641,101 @@ fn non_regular_token_file_is_ignored_not_hung() {
     assert!(store.load(&key).unwrap().is_none());
 }
 
+fn set_mtime_offset_from_now(path: &std::path::Path, offset: Duration, ahead: bool) {
+    let now = SystemTime::now();
+    let when = if ahead { now + offset } else { now - offset };
+    let file = std::fs::OpenOptions::new().write(true).open(path).unwrap();
+    file.set_times(std::fs::FileTimes::new().set_modified(when))
+        .unwrap();
+}
+
+#[test]
+fn a_far_future_lock_is_reclaimed_rather_than_wedging_the_store() {
+    // Regression: both reclaim paths treated an mtime ahead of the local clock
+    // as age zero -- `is_stale` via the Err arm of `duration_since`, and
+    // `steal_if_stale` via `saturating_sub` flooring at 0. A lock stamped into
+    // the future was therefore "fresh" forever: nothing could ever take it, so
+    // every load, save and clear failed with a lock timeout until someone
+    // deleted the file by hand. It needs no attacker -- a clock stepped back by
+    // NTP, a VM snapshot resume, a restored backup, or an NFS/SMB server
+    // stamping mtimes from its own clock all produce it.
+    let dir = TempDir::new().unwrap();
+    let store = FileTokenStore::at(dir.path())
+        .with_lock_timings(Duration::from_secs(2), DEFAULT_LOCK_STALE);
+    let key = test_key();
+    let lock = store.directory_lock_file();
+    create_lock_file(&lock, "1725048000000 abandoned-peer").unwrap();
+    set_mtime_offset_from_now(&lock, MAX_FUTURE_LOCK_SKEW * 4, true);
+
+    store
+        .save(&key, &test_token())
+        .expect("a far-future lock must be reclaimable");
+    assert!(store.load(&key).unwrap().is_some());
+}
+
+#[test]
+fn a_slightly_future_lock_is_still_treated_as_live() {
+    // The other half: a small clock disagreement must NOT let a contender break
+    // a lock a peer is actively holding, so within the plausible-skew window a
+    // future-dated lock still counts as fresh.
+    let dir = TempDir::new().unwrap();
+    let store =
+        FileTokenStore::at(dir.path()).with_lock_timings(Duration::ZERO, DEFAULT_LOCK_STALE);
+    let lock = store.directory_lock_file();
+    create_lock_file(&lock, "1725048000000 live-peer").unwrap();
+    set_mtime_offset_from_now(&lock, MAX_FUTURE_LOCK_SKEW / 5, true);
+
+    let error = store.save(&test_key(), &test_token()).unwrap_err();
+    assert_eq!(
+        error
+            .downcast_ref::<std::io::Error>()
+            .map(std::io::Error::kind),
+        Some(std::io::ErrorKind::WouldBlock),
+        "a lock within the skew window must be respected as live"
+    );
+    assert!(lock.exists(), "a live peer's lock was stolen");
+}
+
+#[cfg(unix)]
+#[test]
+fn persisting_is_refused_only_when_the_directory_cannot_be_restricted() {
+    // Regression: `load` fails closed on the trust verdict but `save` discarded
+    // it (`|_|`) and wrote regardless.
+    //
+    // The distinction matters in both directions. An ordinary one-off loose
+    // directory is retightened to 0700 and swept before the action runs, so
+    // persisting into it is fine and must keep working -- refusing on the entry
+    // verdict alone would break it. What must be refused is a directory whose
+    // permissions could not be restricted at all: on WSL drvfs without
+    // metadata, CIFS/SMB with a fixed file_mode or vfat/exFAT the retighten is
+    // a silent no-op, every operation is untrusted forever, and the old
+    // unconditional write kept persisting a plaintext refresh token that `load`
+    // would always refuse to read back.
+    //
+    // The predicate is exercised directly: on a normal filesystem the
+    // retighten always succeeds, so the unrepairable case cannot be produced
+    // through the store itself.
+    use std::os::unix::fs::PermissionsExt;
+    let dir = TempDir::new().unwrap();
+
+    std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    assert!(
+        may_persist(false, dir.path()),
+        "a repaired directory must still be writable despite the entry verdict"
+    );
+    assert!(may_persist(true, dir.path()));
+
+    std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o777)).unwrap();
+    assert!(
+        !may_persist(false, dir.path()),
+        "a plaintext token would be persisted where load will never trust it"
+    );
+    // A trusted verdict still wins: nothing was found wrong with the contents.
+    assert!(may_persist(true, dir.path()));
+
+    std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+}
+
 #[cfg(unix)]
 #[test]
 fn preexisting_loose_permissions_directory_is_retightened() {
