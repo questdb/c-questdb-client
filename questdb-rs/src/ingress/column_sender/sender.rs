@@ -222,6 +222,7 @@ fn direct_delivery_unknown(e: crate::Error) -> FlushFailure {
 }
 
 /// Validation/conversion rejected the current input before publication.
+#[cfg(feature = "arrow-ingress")]
 fn not_delivered_error<E>(e: E) -> crate::Error
 where
     crate::Error: From<E>,
