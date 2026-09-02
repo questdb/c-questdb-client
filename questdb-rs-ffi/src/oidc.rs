@@ -238,10 +238,23 @@ impl SharedOidcAuth {
     }
 
     fn close(&self) -> Result<(), Error> {
-        // close waits for the acquisition critical section to drain. Calling it
-        // from a renderer callback on that same section would self-deadlock.
-        self.reject_callback_reentry()?;
-        self.inner.close();
+        // Signalling is lock-free and cannot self-deadlock, so it always runs --
+        // including from this auth's own renderer callback, and from another
+        // thread while a callback happens to be in flight. Rejecting those was
+        // the bug: close is documented as the way to cancel a running device
+        // flow from another thread, and a renderer's own "cancel" affordance has
+        // nothing else to call.
+        self.inner.signal_close();
+        // Only the drain can self-deadlock: it waits for the acquisition
+        // critical section that a callback runs inside. Skip it there; the close
+        // is already published either way.
+        if !self
+            .event_handler
+            .as_deref()
+            .is_some_and(CEventHandler::is_active)
+        {
+            self.inner.close();
+        }
         Ok(())
     }
 }
@@ -1551,6 +1564,7 @@ mod tests {
         auth: AtomicPtr<questdb_oidc_auth>,
         rejected: AtomicUsize,
         unexpected: AtomicUsize,
+        closed_ok: AtomicUsize,
     }
 
     unsafe fn record_reentrant_result(
@@ -1592,9 +1606,18 @@ mod tests {
         let cleared = unsafe { questdb_oidc_auth_clear(auth, &mut error) };
         unsafe { record_reentrant_result(state, cleared, error) };
 
+        // close is deliberately NOT guarded. It publishes the close signal
+        // lock-free and skips only the drain while a callback is active, so it
+        // stays available exactly where it is needed most: a renderer's own
+        // cancel affordance, and a watchdog thread cancelling a running flow.
         error = ptr::null_mut();
         let closed = unsafe { questdb_oidc_auth_close(auth, &mut error) };
-        unsafe { record_reentrant_result(state, closed, error) };
+        if closed && error.is_null() {
+            state.closed_ok.fetch_add(1, Ordering::SeqCst);
+        } else {
+            state.unexpected.fetch_add(1, Ordering::SeqCst);
+        }
+        unsafe { crate::questdb_error_free(error) };
     }
 
     unsafe extern "C" fn attempt_reentrant_auth_calls(
@@ -1948,11 +1971,13 @@ mod tests {
             assert!(error.is_null());
             state.auth.store(auth, Ordering::SeqCst);
 
-            // Enter through the same renderer used by the auth. All four
-            // calls must fail before attempting to acquire the core mutex.
+            // Enter through the same renderer used by the auth. sign_in,
+            // token and clear must fail before attempting to acquire the core
+            // mutex; close must still work.
             CEventRenderer(handler).on_waiting(30.0);
 
-            assert_eq!(state.rejected.load(Ordering::SeqCst), 4);
+            assert_eq!(state.rejected.load(Ordering::SeqCst), 3);
+            assert_eq!(state.closed_ok.load(Ordering::SeqCst), 1);
             assert_eq!(state.unexpected.load(Ordering::SeqCst), 0);
             questdb_oidc_auth_free(auth);
             questdb_oidc_builder_free(builder);
@@ -1980,12 +2005,15 @@ mod tests {
             assert!(error.is_null());
             state.auth.store(auth, Ordering::SeqCst);
 
-            // The callback waits for another thread that tries all three auth
-            // operations. They must fail before trying the core mutex held by
-            // a real interactive flow.
+            // The callback waits for another thread that tries every auth
+            // operation. sign_in, token and clear must fail before trying the
+            // core mutex held by a real interactive flow; close must succeed,
+            // since cancelling a running flow from another thread is the whole
+            // point of it.
             CEventRenderer(handler).on_waiting(30.0);
 
-            assert_eq!(state.rejected.load(Ordering::SeqCst), 4);
+            assert_eq!(state.rejected.load(Ordering::SeqCst), 3);
+            assert_eq!(state.closed_ok.load(Ordering::SeqCst), 1);
             assert_eq!(state.unexpected.load(Ordering::SeqCst), 0);
             questdb_oidc_auth_free(auth);
             questdb_oidc_builder_free(builder);

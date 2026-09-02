@@ -291,8 +291,11 @@ public:
     /**
      * Permanently close the shared provider and cancel a device-poll or bundled
      * file-token-store lock wait running on another thread. Every copied handle
-     * and attached transport observes the same closed state. Idempotent. Do not
-     * call from this provider's event callback.
+     * and attached transport observes the same closed state. Idempotent.
+     *
+     * Safe from any thread, including this provider's own event callback: it
+     * publishes the close without blocking, and only skips the wait for the
+     * running operation to finish when called from inside a callback.
      */
     void close() const
     {

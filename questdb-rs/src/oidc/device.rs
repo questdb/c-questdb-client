@@ -547,11 +547,10 @@ impl OidcDeviceAuth {
     /// transport. An HTTP request already in flight is not cancelled at the
     /// transport layer, so this waits for that bounded request to return. Do not
     /// call it from a [`Renderer`] callback on this same provider: callbacks run
-    /// inside the acquisition critical section that `close` waits to drain.
-    /// Idempotent.
+    /// inside the acquisition critical section that `close` waits to drain --
+    /// use [`signal_close`](Self::signal_close) there instead. Idempotent.
     pub fn close(&self) {
-        self.closed.store(true, AtomicOrdering::Release);
-        self.close_wake.notify_all();
+        self.signal_close();
 
         // Match the Java lifecycle: close does not return while token work can
         // still mutate this instance. The active operation observes `closed`
@@ -559,6 +558,27 @@ impl OidcDeviceAuth {
         let _acq = self.lock_acquire();
         *self.lock_tokens() = None;
         self.lock_store_state().set_last_persisted_refresh(None);
+    }
+
+    /// Publish the permanent close and wake every cancellable wait, without
+    /// draining the acquisition critical section.
+    ///
+    /// Unlike [`close`](Self::close) this never blocks and never takes the
+    /// acquisition lock, so it is safe from any thread including a [`Renderer`]
+    /// callback running inside that very section. The caller gives up the
+    /// guarantee that token work has stopped by the time it returns.
+    pub fn signal_close(&self) {
+        // Publish and notify under the same mutex `wait_or_cancel` parks on.
+        // Storing outside it races that waiter's `is_closed()` re-check: the
+        // notify can land after the check and before the wait registers, and is
+        // then lost until the full slice expires -- up to a whole poll interval,
+        // with close() blocked on lock_acquire() for all of it.
+        let _guard = self
+            .close_wait
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.closed.store(true, AtomicOrdering::Release);
+        self.close_wake.notify_all();
     }
 
     /// Whether [`close`](Self::close) has permanently disabled this provider.
