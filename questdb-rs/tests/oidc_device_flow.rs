@@ -420,6 +420,110 @@ fn http_token_provider_conflicts_with_token() {
 }
 
 #[test]
+fn a_401_from_an_expired_token_is_retried_once_with_a_rotated_one() {
+    // Regression: the header is resolved once per flush, so a token that
+    // expired inside the retry window -- which the caller sets and may set
+    // large -- was replayed until the server answered 401. `need_retry` does
+    // not cover 401, so the flush ended as a terminal AuthError even though a
+    // silent refresh would have made it succeed.
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let mock = {
+        let attempts = Arc::clone(&attempts);
+        MockServer::start(move |_m, path, _b| match path {
+            "/write" => {
+                if attempts.fetch_add(1, Ordering::SeqCst) == 0 {
+                    (401, String::new()) // the stale token is rejected
+                } else {
+                    (204, String::new())
+                }
+            }
+            _ => (404, "{}".to_string()),
+        })
+    };
+
+    let provider_calls = Arc::new(AtomicUsize::new(0));
+    let mut sender = sender_with_provider(&mock, {
+        let provider_calls = Arc::clone(&provider_calls);
+        move || {
+            // Rotate: the second pull returns a different credential, standing
+            // in for a silent refresh of a token that had just expired.
+            let n = provider_calls.fetch_add(1, Ordering::SeqCst);
+            Ok::<_, questdb::Error>(if n == 0 {
+                "stale".to_string()
+            } else {
+                "rotated".to_string()
+            })
+        }
+    })
+    .expect("build sender");
+
+    send_one_row(&mut sender).expect("the rotated token must complete the flush");
+
+    let headers = mock.write_auth_headers();
+    assert_eq!(
+        headers.len(),
+        2,
+        "expected one auth retry, got: {headers:?}"
+    );
+    assert_eq!(headers[0].as_deref(), Some("Bearer stale"));
+    assert_eq!(headers[1].as_deref(), Some("Bearer rotated"));
+    assert_eq!(
+        provider_calls.load(Ordering::SeqCst),
+        2,
+        "the provider is pulled once per flush plus once for the 401"
+    );
+}
+
+#[test]
+fn a_401_with_an_unchanged_token_is_not_retried() {
+    // The other half: when the provider hands back the same credential the 401
+    // is a genuine rejection, not an expiry, and must stand without spending a
+    // second request on it.
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let mock = {
+        let attempts = Arc::clone(&attempts);
+        MockServer::start(move |_m, path, _b| match path {
+            "/write" => {
+                attempts.fetch_add(1, Ordering::SeqCst);
+                (401, String::new())
+            }
+            _ => (404, "{}".to_string()),
+        })
+    };
+
+    let mut sender = sender_with_provider(&mock, || Ok::<_, questdb::Error>("same".to_string()))
+        .expect("build sender");
+
+    send_one_row(&mut sender).expect_err("a genuine 401 must fail the flush");
+    assert_eq!(
+        attempts.load(Ordering::SeqCst),
+        1,
+        "an unchanged credential must not buy a second attempt"
+    );
+}
+
+#[test]
+fn qwp_ws_token_provider_conflicts_with_partial_basic_auth() {
+    // The WS twin of the HTTP test below. The pre-check was HTTP-only, so a WS
+    // provider plus a half-specified basic auth fell through to the generic
+    // "password is missing" arm -- sending the caller to supply a password that
+    // then produced a different error from the conflict check downstream.
+    let build = SenderBuilder::new(Protocol::Ws, "127.0.0.1", 9000u16)
+        .qwp_ws_token_provider(|| Ok::<_, questdb::Error>("provided".to_string()))
+        .unwrap()
+        .username("admin")
+        .unwrap()
+        .build();
+    let err = build.unwrap_err();
+    assert_eq!(err.code(), questdb::ErrorCode::ConfigError);
+    assert!(
+        err.msg().contains("qwp_ws_token_provider"),
+        "expected the provider-conflict message, got: {}",
+        err.msg()
+    );
+}
+
+#[test]
 fn http_token_provider_conflicts_with_partial_basic_auth() {
     // A provider plus a half-specified basic auth (username, no password) must
     // report the provider conflict precisely, not the generic "password missing".

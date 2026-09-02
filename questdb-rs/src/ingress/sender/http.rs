@@ -90,6 +90,12 @@ impl HttpAuth {
             HttpAuth::Provider(provider) => Ok(Some(Cow::Owned(provider.bearer_header()?))),
         }
     }
+
+    /// Whether the header can change between attempts, so a retry loop must
+    /// re-resolve rather than replay the value it started with.
+    pub(crate) fn is_rotating(&self) -> bool {
+        matches!(self, HttpAuth::Provider(_))
+    }
 }
 
 #[cfg(feature = "sync-sender-http")]
@@ -382,6 +388,20 @@ fn retry_http_send(
     let max_backoff_ms = clamp_backoff_ms(retry_max_backoff);
     let mut retry_interval_ms = 10i32;
     let mut need_retry;
+    // The provider is resolved once per flush, before this loop, and stays that
+    // way: a caller's provider closure is arbitrary code, so pulling it on every
+    // attempt could be expensive or have side effects.
+    //
+    // The exception is an expiry that lands *inside* the retry window, which the
+    // caller sets and may set large. The header resolved before the first
+    // attempt then gets a 401, which `need_retry` does not cover, so the flush
+    // ended as a terminal AuthError -- exactly the outcome the provider path
+    // otherwise works to avoid. Re-resolve once in that case: if the provider
+    // hands back a *different* header the credential really had rotated and the
+    // attempt is worth repeating; if it is unchanged this is a genuine
+    // rejection and the 401 stands, with no extra request.
+    let mut refreshed: Option<String> = None;
+    let mut auth_retry_used = false;
     loop {
         let jitter_ms = rng.random_range(-5i32..5);
         let to_sleep = retry_sleep(retry_interval_ms, jitter_ms);
@@ -394,8 +414,19 @@ fn retry_http_send(
             // see https://github.com/algesten/ureq/issues/94
             _ = last_rep.into_body().read_to_vec();
         }
-        (need_retry, last_rep) = state.send_request(buf, request_timeout, auth);
+        let attempt_auth = refreshed.as_deref().or(auth);
+        (need_retry, last_rep) = state.send_request(buf, request_timeout, attempt_auth);
         if !need_retry {
+            if !auth_retry_used
+                && let Some(value) = rotated_auth_after_401(state, &last_rep, attempt_auth)
+            {
+                auth_retry_used = true;
+                refreshed = Some(value);
+                // Retry immediately rather than backing off: nothing was
+                // overloaded, the credential had simply rotated.
+                retry_interval_ms = 0;
+                continue;
+            }
             return last_rep;
         }
         retry_interval_ms = retry_interval_ms.saturating_mul(2).min(max_backoff_ms);
@@ -416,6 +447,24 @@ fn retry_sleep(retry_interval_ms: i32, jitter_ms: i32) -> Duration {
     Duration::from_millis(retry_interval_ms.saturating_add(jitter_ms).max(0) as u64)
 }
 
+/// A rotated credential worth one more attempt after a 401, if there is one.
+///
+/// `None` means do not retry: the credential cannot rotate, the response was
+/// not a 401, the provider failed, or it handed back the very value that was
+/// just rejected -- which makes this a genuine rejection rather than an expiry,
+/// and spending another request on it would be pointless.
+fn rotated_auth_after_401(
+    state: &SyncHttpHandlerState,
+    rep: &Result<Response<Body>, ureq::Error>,
+    used: Option<&str>,
+) -> Option<String> {
+    if !state.auth.is_rotating() || !matches!(rep, Ok(rep) if rep.status() == 401) {
+        return None;
+    }
+    let value = state.auth.resolve().ok()??.into_owned();
+    (Some(value.as_str()) != used).then_some(value)
+}
+
 #[allow(clippy::result_large_err)] // `ureq::Error` is large enough to cause this warning.
 pub(super) fn http_send_with_retries(
     state: &SyncHttpHandlerState,
@@ -426,6 +475,31 @@ pub(super) fn http_send_with_retries(
     auth: Option<&str>,
 ) -> Result<Response<Body>, ureq::Error> {
     let (need_retry, last_rep) = state.send_request(buf, request_timeout, auth);
+    // A 401 is not retryable, so this is where a credential that expired
+    // between resolution and the request used to end the flush as a terminal
+    // AuthError. Give a rotated credential exactly one more attempt -- and only
+    // when the provider actually hands back a different value, so a genuine
+    // rejection still costs a single request.
+    if !need_retry && let Some(rotated) = rotated_auth_after_401(state, &last_rep, auth) {
+        if let Ok(rep) = last_rep {
+            // Return the connection to the pool before reusing the agent.
+            _ = rep.into_body().read_to_vec();
+        }
+        let (need_retry, last_rep) =
+            state.send_request(buf, request_timeout, Some(rotated.as_str()));
+        if !need_retry || retry_timeout.is_zero() {
+            return last_rep;
+        }
+        return retry_http_send(
+            state,
+            buf,
+            request_timeout,
+            retry_timeout,
+            retry_max_backoff,
+            Some(rotated.as_str()),
+            last_rep,
+        );
+    }
     if !need_retry || retry_timeout.is_zero() {
         return last_rep;
     }

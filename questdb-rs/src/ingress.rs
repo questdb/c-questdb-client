@@ -2645,13 +2645,12 @@ impl SenderBuilder {
         // below, where a half-specified basic auth (e.g. a username with no
         // password) would otherwise hit an "incomplete parameters" arm and hide
         // the real cause.
+        let fixed_credential_set = self.username.is_specified()
+            || self.password.is_specified()
+            || self.token.is_specified();
         #[cfg(feature = "_sender-http")]
         {
-            if self.http_token_provider.is_some()
-                && (self.username.is_specified()
-                    || self.password.is_specified()
-                    || self.token.is_specified())
-            {
+            if self.http_token_provider.is_some() && fixed_credential_set {
                 return Err(error::fmt!(
                     ConfigError,
                     "\"http_token_provider\" is mutually exclusive with \
@@ -2659,6 +2658,28 @@ impl SenderBuilder {
                 ));
             }
         }
+        // The QWP/WebSocket provider needs the same pre-check. Without it a
+        // provider combined with a half-specified basic auth -- a username and
+        // no password -- fell through to the match below and reported the
+        // missing password, sending the caller to fix the wrong thing:
+        // supplying it then produced a different error from the conflict check
+        // further downstream.
+        #[cfg(feature = "_sender-qwp-ws")]
+        {
+            if self
+                .qwp_ws
+                .as_ref()
+                .is_some_and(|qwp_ws| qwp_ws.token_provider.is_some())
+                && fixed_credential_set
+            {
+                return Err(error::fmt!(
+                    ConfigError,
+                    "\"qwp_ws_token_provider\" is mutually exclusive with \
+                     username/password and token authentication."
+                ));
+            }
+        }
+        let _ = fixed_credential_set;
         match (
             self.protocol,
             self.username.deref(),
