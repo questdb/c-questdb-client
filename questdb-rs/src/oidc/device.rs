@@ -912,6 +912,11 @@ impl OidcDeviceAuth {
         {
             load_result?;
         }
+        // A refresh that succeeds without the required token kind still rotates
+        // the refresh token; keep the whole set so the fall-through below cannot
+        // strand us. It is never servable: `is_usable` gates on
+        // `has_required_token`, which is exactly what failed here.
+        let mut refreshed_unusable: Option<TokenSet> = None;
         if let Some(tokens) = &existing
             && tokens.refresh_token.is_some()
         {
@@ -930,8 +935,16 @@ impl OidcDeviceAuth {
                 }
                 // Refresh succeeded but didn't yield the required kind: some
                 // IdPs don't re-issue the id_token on refresh. Fall through to
-                // a fresh sign-in.
-                Ok(_) => {}
+                // a fresh sign-in, but carry the rotated refresh token with us —
+                // the parent it replaced is already consumed and deleted, so
+                // dropping this too would lock a headless caller out for good.
+                Ok(refreshed) => {
+                    // Back off the next silent refresh: without this every
+                    // token() call would burn another refresh-token rotation to
+                    // reach the same InteractionRequired.
+                    self.lock_store_state().refresh_failed_at = Some(Instant::now());
+                    refreshed_unusable = Some(refreshed);
+                }
                 // A retryable transport or persistence failure must not trigger
                 // an unexpected prompt in the same call. Either refresh path
                 // (stored or in-memory) may already have discarded an ambiguously
@@ -951,8 +964,14 @@ impl OidcDeviceAuth {
         // The refresh path (if any) is exhausted; drop any stale cached token
         // before the interactive flow so a failure doesn't leave it cached. This
         // also covers a cached token that had no refresh token to begin with
-        // (which skips the block above entirely).
-        *self.lock_tokens() = None;
+        // (which skips the block above entirely). The one thing kept is a refresh
+        // that succeeded but withheld the required kind: it carries a rotated
+        // refresh token, and the parent it replaced is already consumed and
+        // deleted, so dropping it too would lock a headless caller out for good.
+        // It cannot leak as a served token -- `is_usable` gates on
+        // `has_required_token`, which is precisely what this set lacks. A
+        // rejected (expired/revoked) refresh token leaves this `None`.
+        *self.lock_tokens() = refreshed_unusable;
         if !allow_interaction {
             return Err(OidcError::interaction_required(
                 "No usable cached or refreshable OIDC token is available. Call sign_in() \
@@ -1324,9 +1343,13 @@ impl OidcDeviceAuth {
                 return Err(e);
             }
         };
-        if self.has_required_token(&refreshed) {
-            self.persist_if_changed(store, key, &refreshed)?;
-        }
+        // Persist even when the response lacked the required token kind. The
+        // parent was consumed and deleted above, so skipping the write would
+        // leave nothing on disk and force an interactive re-sign-in that a
+        // headless caller cannot perform. `persist_if_changed` is a no-op when
+        // the refresh token did not rotate, and removes the entry when the IdP
+        // returned none at all.
+        self.persist_if_changed(store, key, &refreshed)?;
         self.ensure_open()?;
         Ok(refreshed)
     }

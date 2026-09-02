@@ -2491,6 +2491,129 @@ fn persist_restores_non_rotating_refresh_token_after_consuming_parent() {
 }
 
 #[test]
+fn groups_mode_refresh_without_id_token_keeps_the_rotated_credential() {
+    // Regression: a refresh that rotates the refresh token but withholds the
+    // required kind must not destroy the credential.
+    //
+    // `refresh_under_lock` deletes the persisted parent and drops the in-memory
+    // copy *before* submitting (refresh-token-reuse defence). If the response
+    // then lacks the id_token this configuration serves -- which OIDC Core 12.1
+    // expressly permits -- the rotated replacement used to be discarded on both
+    // sides, leaving nothing anywhere. A headless caller with a token store was
+    // locked out after its first silent refresh, and a restart did not recover.
+    let device_calls = Arc::new(AtomicUsize::new(0));
+    let mock = {
+        let device_calls = Arc::clone(&device_calls);
+        MockServer::start(move |method, path, body| match (method, path) {
+            ("POST", "/device") => {
+                device_calls.fetch_add(1, Ordering::SeqCst);
+                (200, device_response())
+            }
+            ("POST", "/token") => {
+                if body.contains("grant_type=refresh_token") {
+                    // Rotates the refresh token, but returns no id_token.
+                    (
+                        200,
+                        r#"{"access_token":"AT-refreshed","refresh_token":"RT-2","expires_in":300}"#
+                            .to_string(),
+                    )
+                } else {
+                    (
+                        200,
+                        r#"{"access_token":"AT-1","id_token":"ID-1","refresh_token":"RT-1","expires_in":300}"#
+                            .to_string(),
+                    )
+                }
+            }
+            _ => (404, "{}".to_string()),
+        })
+    };
+    let dir = TempDir::new().unwrap();
+    let key = TokenStoreKey::from_config(
+        "questdb",
+        &mock.url("/token"),
+        &mock.url("/device"),
+        "openid",
+        None,
+        true, // groups_in_token
+        None,
+    );
+    let groups_auth = |dir: &Path| {
+        OidcDeviceAuth::builder()
+            .client_id("questdb")
+            .device_authorization_endpoint(mock.url("/device"))
+            .token_endpoint(mock.url("/token"))
+            .scope("openid")
+            .groups_in_token(true)
+            .interactive(false)
+            .open_browser(false)
+            .sleep_hook(no_sleep())
+            .token_store(FileTokenStore::at(dir))
+            .build()
+            .expect("build groups-mode auth with store")
+    };
+
+    // Sign in once so RT-1 is persisted, then expire the stored token so the
+    // next instance must refresh.
+    let first = OidcDeviceAuth::builder()
+        .client_id("questdb")
+        .device_authorization_endpoint(mock.url("/device"))
+        .token_endpoint(mock.url("/token"))
+        .scope("openid")
+        .groups_in_token(true)
+        .interactive(true)
+        .open_browser(false)
+        .sleep_hook(no_sleep())
+        .token_store(FileTokenStore::at(dir.path()))
+        .build()
+        .expect("build groups-mode auth");
+    assert_eq!(sign_in_and_token(&first).unwrap(), "ID-1");
+    drop(first);
+    expire_persisted(dir.path(), &key);
+
+    // The silent refresh cannot satisfy groups mode, so this still reports
+    // InteractionRequired and never prompts.
+    let auth = groups_auth(dir.path());
+    let err = auth.token().unwrap_err();
+    assert_eq!(err.kind(), OidcErrorKind::InteractionRequired);
+    assert_eq!(
+        device_calls.load(Ordering::SeqCst),
+        1,
+        "a non-interactive token() must not start a device flow"
+    );
+
+    // ...but the rotated credential survives, in memory and on disk. Before the
+    // fix both were empty here.
+    let cached = auth.tokens.lock().unwrap();
+    assert_eq!(
+        cached.as_ref().and_then(|t| t.refresh_token.as_deref()),
+        Some("RT-2"),
+        "the rotated refresh token was dropped from the in-memory cache"
+    );
+    drop(cached);
+
+    let reader = FileTokenStore::at(dir.path());
+    let after = reader
+        .load(&key)
+        .unwrap()
+        .expect("the persisted entry was destroyed by a refresh that rotated it");
+    assert_eq!(after.refresh_token(), Some("RT-2"));
+    assert_eq!(after.access_token(), Some("AT-refreshed"));
+
+    // A restart still finds a usable refresh token rather than being locked out.
+    let restarted = groups_auth(dir.path());
+    assert_eq!(
+        restarted.token().unwrap_err().kind(),
+        OidcErrorKind::InteractionRequired
+    );
+    assert_eq!(
+        reader.load(&key).unwrap().unwrap().refresh_token(),
+        Some("RT-2"),
+        "a restart must not consume the credential without replacing it"
+    );
+}
+
+#[test]
 fn persist_rewrites_when_refresh_token_rotates() {
     // Rotating IdP: the refresh response carries a new refresh_token.
     let device_calls = Arc::new(AtomicUsize::new(0));
