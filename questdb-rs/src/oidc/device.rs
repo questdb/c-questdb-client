@@ -1941,12 +1941,22 @@ fn clamp_lifetime(expires_in: Option<i64>) -> u64 {
 /// (delta-seconds) when present, else the RFC 8628 +5s step. `at_least_increment`
 /// enforces slow_down's MUST-increase, so a contradictory low Retry-After can't
 /// make the client poll faster right after being told to slow down.
+///
+/// `Retry-After` raises the wait and never lowers it. RFC 8628 3.5 requires the
+/// client to wait *at least* the advertised `interval`, and a proxy or WAF
+/// answering `Retry-After: 1` to a flow whose interval is 30 would otherwise
+/// make it poll six times faster for the remainder of the flow.
+///
+/// Only the floor is applied here. The result is clipped to the remaining
+/// device-code lifetime by the caller, so truncating a long `Retry-After` to
+/// `MAX_POLL_INTERVAL` buys nothing and merely ignores a server that asked for
+/// a longer pause -- which is what earns a rate-limit ban.
 fn backoff(interval: u64, retry_after: Option<u64>, at_least_increment: bool) -> u64 {
-    let mut target = retry_after.unwrap_or(interval + 5);
+    let mut target = retry_after.map_or(interval + 5, |after| after.max(interval));
     if at_least_increment {
         target = target.max(interval + 5);
     }
-    target.clamp(MIN_POLL_INTERVAL, MAX_POLL_INTERVAL)
+    target.max(MIN_POLL_INTERVAL)
 }
 
 /// A `/settings`/response value as a non-empty string.

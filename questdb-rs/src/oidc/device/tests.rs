@@ -2614,6 +2614,32 @@ fn groups_mode_refresh_without_id_token_keeps_the_rotated_credential() {
 }
 
 #[test]
+fn retry_after_raises_the_poll_interval_and_never_lowers_it() {
+    // RFC 8628 3.5: the client waits at least the advertised interval. A proxy
+    // or WAF answering `Retry-After: 1` to a flow whose interval is 30 used to
+    // set the interval to 5 -- six times faster than the identity provider
+    // asked for, for the rest of the flow.
+    assert_eq!(backoff(30, Some(1), false), 30);
+    assert_eq!(backoff(30, Some(45), false), 45);
+
+    // A long Retry-After is honoured rather than truncated to MAX_POLL_INTERVAL.
+    // Ignoring a rate limiter's stated pause is what earns a ban; the caller
+    // still clips the wait to the remaining device-code lifetime.
+    assert_eq!(backoff(5, Some(300), false), 300);
+    assert!(backoff(5, Some(300), false) > MAX_POLL_INTERVAL);
+
+    // Absent Retry-After keeps the RFC 8628 +5s step.
+    assert_eq!(backoff(10, None, false), 15);
+
+    // slow_down MUST increase, even against a contradictory low Retry-After.
+    assert_eq!(backoff(30, Some(1), true), 35);
+    assert_eq!(backoff(30, None, true), 35);
+
+    // The floor still applies.
+    assert_eq!(backoff(1, Some(0), false), MIN_POLL_INTERVAL);
+}
+
+#[test]
 fn clear_after_close_still_deletes_the_persisted_entry() {
     // close() drops the in-memory credential but deliberately leaves the
     // persisted entry, so clear() has to outlive it. It used to refuse:
