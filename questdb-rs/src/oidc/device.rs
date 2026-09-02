@@ -1232,7 +1232,23 @@ impl OidcDeviceAuth {
         // the untrusted-file cap and never trust a far-future on-disk expiry.
         let expires_at = match served.as_deref() {
             Some(served) => match jwt_exp(Some(served)) {
-                Some(exp) => p.expires_at().min(exp),
+                // Apply the same one-hour rotation ceiling the wire path applies
+                // when a refresh token is available. Bounding only by the JWT's
+                // own `exp` here meant a store entry carrying a long-lived JWT
+                // plus `offline_access` -- which another QuestDB language client
+                // may well have written -- was served for its full lifetime with
+                // no refresh round-trip, losing the "rotated at least hourly"
+                // property the module documents. Without a refresh token there
+                // is nothing to rotate with, so the signed `exp` stands, exactly
+                // as on the wire path.
+                Some(exp) => {
+                    let bound = p.expires_at().min(exp);
+                    if refresh_token.is_some() {
+                        bound.min(now + max_life)
+                    } else {
+                        bound
+                    }
+                }
                 None => p.expires_at().min(now + max_life),
             },
             // Never treat refresh-only persisted state as currently servable.

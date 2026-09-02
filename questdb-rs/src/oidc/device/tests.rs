@@ -3053,6 +3053,58 @@ fn try_clear_reports_persisted_deletion_failure() {
 }
 
 #[test]
+fn a_persisted_jwt_with_a_refresh_token_still_honours_the_rotation_cap() {
+    // Regression: the wire path caps a believed lifetime at MAX_EXPIRES_IN when
+    // a refresh token is available, so the credential rotates at least that
+    // often, and `oidc/mod.rs` documents that unconditionally. The persisted
+    // path bounded a JWT by its own `exp` alone, so a store entry carrying a
+    // long-lived JWT plus offline_access -- which another QuestDB language
+    // client may well have written -- was served for its full lifetime with no
+    // refresh round-trip, quietly losing that property. It needs a JWT served
+    // token, which Entra, Keycloak and Auth0 all issue; the bundled Java
+    // fixture carries an opaque token and so took the already-capped branch,
+    // which is why nothing caught it.
+    let mock = MockServer::start(|_, _, _| (404, "{}".to_string()));
+    let auth = auth_with_failing_store(&mock, FailingSaveStore::default(), false);
+    let now = now_epoch();
+    let far_future = (now + 30.0 * 86_400.0) as i64;
+
+    let with_refresh = PersistedToken::new(
+        Some(jwt_with_exp(far_future)),
+        None,
+        Some("RT-persisted".to_string()),
+        now + 30.0 * 86_400.0,
+        30.0 * 86_400.0,
+    );
+    let tokens = auth
+        .tokenset_from_persisted(&with_refresh)
+        .expect("a valid persisted entry");
+    assert!(
+        tokens.expires_at <= now + MAX_EXPIRES_IN as f64 + 1.0,
+        "a refreshable persisted JWT escaped the rotation cap: {} vs {}",
+        tokens.expires_at,
+        now + MAX_EXPIRES_IN as f64
+    );
+
+    // Without a refresh token there is nothing to rotate with, so the signed
+    // exp stands -- exactly as on the wire path, and as documented.
+    let no_refresh = PersistedToken::new(
+        Some(jwt_with_exp(far_future)),
+        None,
+        None,
+        now + 30.0 * 86_400.0,
+        30.0 * 86_400.0,
+    );
+    let tokens = auth
+        .tokenset_from_persisted(&no_refresh)
+        .expect("a valid persisted entry");
+    assert!(
+        tokens.expires_at > now + MAX_EXPIRES_IN as f64,
+        "a non-refreshable JWT must keep its signed exp"
+    );
+}
+
+#[test]
 fn tampered_persisted_token_is_rejected_on_load() {
     // A persisted access_token carrying a CR/LF (a header-injection vector) must be
     // rejected on load exactly like a wire token, so it never reaches a header. The

@@ -224,6 +224,19 @@ QUESTDB_CLIENT_API
 questdb_oidc_auth* questdb_oidc_builder_build(
     const questdb_oidc_builder* builder, questdb_error** err_out);
 
+/**
+ * Take an additional handle on the SAME shared auth state.
+ *
+ * Unlike `line_sender_opts_clone`, which produces an independent copy, this is
+ * a reference to one underlying provider: the token cache, the persisted entry
+ * and the closed state are shared by every handle and by every attached sender,
+ * reader and pool. `questdb_oidc_auth_clear` on any handle therefore removes
+ * the credential for all of them, and `questdb_oidc_auth_close` on any handle
+ * permanently closes all of them.
+ *
+ * Both the original and the clone must be freed with
+ * `questdb_oidc_auth_free`; freeing one does not disturb the other.
+ */
 QUESTDB_CLIENT_API
 questdb_oidc_auth* questdb_oidc_auth_clone(
     const questdb_oidc_auth* auth, questdb_error** err_out);
@@ -287,6 +300,10 @@ questdb_oidc_token* questdb_oidc_auth_token(
  * Remains available after `questdb_oidc_auth_close`, which drops the in-memory
  * credential but leaves the persisted entry: clearing is the only way to remove
  * that, so it must outlive the close.
+ *
+ * Affects the SHARED state, not just this handle: every handle obtained from
+ * `questdb_oidc_auth_clone`, and every attached sender, reader and pool, loses
+ * the credential too. See `questdb_oidc_auth_clone`.
  */
 QUESTDB_CLIENT_API
 bool questdb_oidc_auth_clear(
