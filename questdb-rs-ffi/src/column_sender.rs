@@ -2289,11 +2289,10 @@ symbol_fn!(qwp_chunk_symbol_i32, i32, symbol_i32, "symbol codes (i32)");
 ///
 /// Ownership: on success, `array->release` is consumed (set to NULL);
 /// the returned handle owns the underlying buffers and releases them on
-/// `qwp_arrow_import_free`. On failure, `array->release` may
-/// also have been consumed if the call reached the Arrow import step
-/// before failing — callers MUST check `array->release != NULL` before
-/// invoking it on the failure path. Early-fail paths (NULL pointer,
-/// depth-cap rejection) leave it intact. `schema` is borrowed in all
+/// `qwp_arrow_import_free`. A failure detected before the Arrow import
+/// step leaves `array->release` intact. Once import begins, a failure may
+/// also have consumed it — callers MUST check `array->release != NULL`
+/// before invoking it on the failure path. `schema` is borrowed in all
 /// cases.
 ///
 /// `auto`: Dictionary(*, Utf8/LargeUtf8) -> SYMBOL, plain Utf8 -> VARCHAR.
@@ -2470,12 +2469,11 @@ pub unsafe extern "C" fn qwp_chunk_append_arrow_import(
 ///
 /// Ownership: on success, `array->release` is consumed (set to NULL);
 /// the chunk holds the underlying buffers via an internal Arc until
-/// `qwp_sender_flush_chunk` returns. On failure, `array->release` may
-/// also have been consumed if the call reached the Arrow import step
-/// before failing — callers MUST check `array->release != NULL` before
-/// invoking it on the failure path. Early-fail paths (NULL pointer,
-/// depth-cap rejection) leave it intact. `schema` is borrowed in all
-/// cases.
+/// `qwp_sender_flush_chunk` returns. A failure detected before the Arrow
+/// import step leaves `array->release` intact. Once import begins, a
+/// failure may also have consumed it — callers MUST check
+/// `array->release != NULL` before invoking it on the failure path.
+/// `schema` is borrowed in all cases.
 ///
 /// `array->offset` is honored (the Arrow C Data Interface logical
 /// offset); `row_offset` further sub-slices within the call.

@@ -910,12 +910,11 @@ bool qwp_chunk_symbol_i32(
  *    holds the array's buffer lifetime via an internal Arc until
  *    `qwp_sender_flush_chunk` returns. The caller may free the
  *    `ArrowArray` struct shell immediately after this call returns.
- *  - On failure, `array->release` may have been consumed (set to NULL)
- *    if the function reached the Arrow import step before failing. The
- *    underlying buffers are always released by the function in that
- *    case. Callers MUST check `array->release != NULL` before invoking
- *    it on the failure path. Early-fail paths (NULL pointer check,
- *    schema/array depth-cap rejection) leave `array->release` intact.
+ *  - A failure detected before the Arrow import step leaves
+ *    `array->release` intact. Once import begins, a failure may have
+ *    consumed it (set it to NULL); the underlying buffers are always
+ *    released by the function in that case. Callers MUST check
+ *    `array->release != NULL` before invoking it on the failure path.
  *  - `schema` is borrowed; the caller retains `schema->release` in
  *    all cases.
  *
@@ -1030,11 +1029,11 @@ typedef enum qwp_symbol_mode
  *
  * Ownership of the array's buffers transfers into the returned handle.
  * On success, `array->release` is cleared to NULL — the caller MUST
- * NOT invoke it. On error, `array->release` may also have been
- * cleared if validation reached the Arrow import step; the caller
- * MUST check `array->release != NULL` before calling it on the
- * failure path. Depth-cap and NULL-pointer rejections leave it
- * intact. `schema` is borrowed only for the duration of this call.
+ * NOT invoke it. A failure detected before the Arrow import step leaves
+ * `array->release` intact. Once import begins, a failure may also have
+ * cleared it; the caller MUST check `array->release != NULL` before
+ * calling it on the failure path. `schema` is borrowed only for the
+ * duration of this call.
  *
  * `symbol_mode` selects the SYMBOL-vs-VARCHAR disposition of a string
  * column; it carries a `qwp_symbol_mode_*` constant and is a
@@ -1113,12 +1112,11 @@ size_t qwp_arrow_import_len(const qwp_arrow_import* imported);
  *
  * Ownership: on success, `array->release` is consumed (cleared to
  * NULL); the chunk holds the underlying buffers via an internal
- * reference until `qwp_sender_flush_chunk` returns. On failure,
- * `array->release` may also have been consumed if the call reached
- * the Arrow import step before failing — callers MUST check
+ * reference until `qwp_sender_flush_chunk` returns. A failure detected
+ * before the Arrow import step leaves `array->release` intact. Once
+ * import begins, a failure may also have consumed it; callers MUST check
  * `array->release != NULL` before invoking it on the failure path.
- * Early-fail paths (NULL pointer, depth-cap rejection) leave it
- * intact. `schema` is borrowed in all cases.
+ * `schema` is borrowed in all cases.
  *
  * `array->offset` is honored (the Arrow C Data Interface logical
  * offset); `row_offset` further sub-slices within the call.
