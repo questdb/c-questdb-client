@@ -484,6 +484,19 @@ pub(crate) fn safe_target(url: Option<&str>) -> Option<String> {
     if trimmed.is_empty() {
         return None;
     }
+    // Reject rather than truncate. Every other untrusted display field is
+    // capped at MAX_DISPLAY_FIELD_CHARS, but this one is actionable -- it is
+    // opened in a browser and encoded into the QR code -- and a truncated URL
+    // can still parse as a perfectly valid *different* URL, which would send the
+    // user somewhere the identity provider never named. A genuine
+    // verification_uri_complete is far below this bound; anything past it is
+    // shown as inert text by `display_url` (which does truncate) and simply
+    // never offered as a target. Without this the only bound was
+    // `Uri::MAX_LEN`, so a ~64 KB same-origin URL reached stderr, the C event
+    // callback, a notebook DOM and an `xdg-open` argv.
+    if trimmed.chars().count() > MAX_DISPLAY_FIELD_CHARS {
+        return None;
+    }
     let uri: ureq::http::Uri = trimmed.parse().ok()?;
     match uri.scheme_str() {
         Some("http") | Some("https") => {}
@@ -704,6 +717,32 @@ mod tests {
             !shown.contains("evil.example"),
             "attacker host leaked into the terminal prompt: {shown}"
         );
+    }
+
+    #[test]
+    fn safe_target_rejects_an_oversized_url() {
+        // The actionable target is opened in a browser and encoded into the QR
+        // code, so an over-long one is refused rather than truncated: a cut URL
+        // can still parse as a valid *different* URL. Bounded only by
+        // Uri::MAX_LEN before, a ~64 KB same-origin value reached stderr, the C
+        // event callback, a notebook DOM and an xdg-open argv.
+        let long_path = "a".repeat(MAX_DISPLAY_FIELD_CHARS);
+        let url = format!("https://idp.example.com/{long_path}");
+        assert!(url.chars().count() > MAX_DISPLAY_FIELD_CHARS);
+        assert_eq!(safe_target(Some(&url)), None);
+
+        // ...while it is still shown, inert and truncated, as text.
+        let shown = display_url(&url);
+        assert!(
+            shown.chars().count() < url.chars().count(),
+            "an oversized URL must not be echoed raw"
+        );
+        // The truncation marker is non-ASCII, so display_url escapes it.
+        assert!(shown.ends_with("\\u{2026}"));
+
+        // A realistic verification_uri_complete is unaffected.
+        let ok = "https://idp.example.com/device?user_code=ABCD-EFGH";
+        assert_eq!(safe_target(Some(ok)), Some(ok.to_string()));
     }
 
     #[test]
