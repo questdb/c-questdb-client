@@ -161,18 +161,41 @@ fn provider_shutdown_error() -> crate::Error {
 /// store. An actual server rejection is produced later by the handshake path as
 /// a terminal [`AuthError`](crate::ErrorCode::AuthError).
 ///
-/// The one exception is a permanently closed provider. "May recover on its next
-/// invocation" is false for it: `close()` is monotonic, so `token()` returns
-/// `Cancelled` for the rest of the process. Marking that retryable makes a
-/// reconnect loop on state that can never recover, and because
+/// The exceptions are the failures for which "may recover on its next
+/// invocation" is false, which must stay terminal: a permanently closed
+/// provider (`close()` is monotonic, so `token()` returns `Cancelled` for the
+/// rest of the process) and a misconfiguration (`Config` — the configured scope
+/// cannot yield the required token kind, and no call inside this process
+/// changes that). Marking either retryable puts the reconnect loop on state
+/// that can never recover, and because
 /// `RetryState::next_after_retryable_terminal` starts a fresh budget each round
-/// the loop never ends and never surfaces the real cause. Keep it terminal so
-/// the caller sees the close.
+/// the loop never ends and never surfaces the real cause.
+///
+/// `InteractionRequired` deliberately stays **retryable**: a lapsed credential
+/// is recoverable — a `sign_in()` on another thread clears it — and marking it
+/// terminal would stop the store-and-forward drainer on a condition a human can
+/// fix, abandoning queued frames. It is reported through the connection-event
+/// stream instead (see `ConnectionEvents::token_provider_failed`), so the
+/// retrying is visible rather than silent.
 fn classify_provider_error(e: crate::Error) -> crate::Error {
     #[cfg(feature = "_oidc")]
-    if e.oidc_error()
-        .is_some_and(|oidc| oidc.kind() == crate::oidc::OidcErrorKind::Cancelled)
-    {
+    if e.oidc_error().is_some_and(|oidc| {
+        matches!(
+            oidc.kind(),
+            // `close()` is monotonic: `token()` returns this for the rest of
+            // the process.
+            crate::oidc::OidcErrorKind::Cancelled
+                // A misconfiguration is fixed at build time, so `token()`
+                // cannot resolve it either: `select()` raises this when the
+                // configured scope cannot yield the required token kind (no
+                // `id_token` in groups mode, or no `access_token`), and it
+                // recurs identically on every invocation. Retrying it forever
+                // is the same trap the `Cancelled` carve-out exists to avoid,
+                // and unlike an expired credential no human action inside this
+                // process can clear it.
+                | crate::oidc::OidcErrorKind::Config
+        )
+    }) {
         return e;
     }
     if e.code() == crate::ErrorCode::SocketError {
@@ -267,6 +290,59 @@ mod tests {
         );
         // `AuthError` is in `reconnect_error_is_terminal`'s terminal set, which
         // is what stops the reconnect loop; `SocketError` is not.
+    }
+
+    #[cfg(feature = "_oidc")]
+    #[test]
+    fn misconfigured_provider_stays_terminal() {
+        // Regression, same trap as `cancelled_provider_stays_terminal`: a
+        // `Config` failure is raised by `select()` when the configured scope
+        // cannot yield the required token kind (no `id_token` in groups mode,
+        // or no `access_token`). It recurs identically on every invocation and
+        // no call inside this process clears it, so demoting it to a retryable
+        // `SocketError` put the QWP/WS reconnect loop on state that can never
+        // recover -- and `next_after_retryable_terminal` restarts the budget
+        // each round, so it never ended and never surfaced the misconfiguration.
+        let provider = TokenProvider::new(|| {
+            Err::<String, _>(crate::oidc::OidcError::config(
+                "Server expects groups encoded in the token but the IdP \
+                 returned no id_token.",
+            ))
+        });
+
+        let err = provider.bearer_header().unwrap_err();
+        assert_eq!(
+            err.code(),
+            crate::ErrorCode::ConfigError,
+            "a misconfigured provider must not be reported as retryable"
+        );
+        assert_eq!(
+            err.oidc_error().map(crate::oidc::OidcError::kind),
+            Some(crate::oidc::OidcErrorKind::Config)
+        );
+        // `ConfigError`, like `AuthError`, is in `reconnect_error_is_terminal`'s
+        // terminal set; `SocketError` is not.
+    }
+
+    #[cfg(feature = "_oidc")]
+    #[test]
+    fn interaction_required_stays_retryable() {
+        // The deliberate counter-case to the two carve-outs above: a lapsed
+        // credential IS recoverable -- a `sign_in()` on another thread clears
+        // it -- so it must stay retryable, or the store-and-forward drainer
+        // would abandon queued frames on a condition a human can fix. Its
+        // visibility is provided by `ConnectionEvents::token_provider_failed`
+        // instead, not by terminalizing the loop.
+        let provider = TokenProvider::new(|| {
+            Err::<String, _>(crate::oidc::OidcError::interaction_required("sign in"))
+        });
+
+        let err = provider.bearer_header().unwrap_err();
+        assert_eq!(err.code(), crate::ErrorCode::SocketError);
+        assert_eq!(
+            err.oidc_error().map(crate::oidc::OidcError::kind),
+            Some(crate::oidc::OidcErrorKind::InteractionRequired)
+        );
     }
 
     #[cfg(feature = "_oidc")]
