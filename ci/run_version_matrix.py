@@ -2,9 +2,9 @@
 
 # Exercises the non-default ends of the arrow (`>=58, <60`) and polars
 # (`>=0.52, <0.55`) version ranges, which the main run_all_tests.py leaves
-# untested (its default resolve is the newest of each). Only `questdb-rs` is
-# built: polars is absent from questdb-rs-ffi, and ffi's arrow surface is the
-# version-stable C Data Interface already covered by the default arrow build.
+# untested (a clean CI job's default resolve is the newest of each). Only
+# `questdb-rs` is built: polars is absent from questdb-rs-ffi, and the FFI's
+# version-specific Arrow surface is covered by its locked test builds.
 #
 # Pins via a Cargo.toml version rewrite + fresh resolve rather than `cargo
 # update --precise`: polars and polars-arrow are both direct deps, so a
@@ -54,9 +54,20 @@ def pin_and_test(label, pins):
 
 
 def main():
-    pin_and_test('arrow 58.0.0', [('arrow', '58.0.0')])
-    pin_and_test('polars 0.52.0', [('polars', '0.52.0'), ('polars-arrow', '0.52.0')])
-    pin_and_test('polars 0.53.0', [('polars', '0.53.0'), ('polars-arrow', '0.53.0')])
+    saved_lock = LOCK.read_bytes() if LOCK.exists() else None
+    try:
+        pin_and_test('arrow 58.0.0', [('arrow', '58.0.0')])
+        pin_and_test(
+            'polars 0.52.0',
+            [('polars', '0.52.0'), ('polars-arrow', '0.52.0')])
+        pin_and_test(
+            'polars 0.53.0',
+            [('polars', '0.53.0'), ('polars-arrow', '0.53.0')])
+    finally:
+        if saved_lock is None:
+            LOCK.unlink(missing_ok=True)
+        else:
+            LOCK.write_bytes(saved_lock)
 
 
 if __name__ == '__main__':

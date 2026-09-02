@@ -1,12 +1,29 @@
 #!/usr/bin/env python3
 """Verify the Arrow implementation pinned into questdb-rs-ffi artifacts."""
 
+import collections
 import pathlib
 import tomllib
 
 
 EXPECTED_ARROW_VERSION = '59.0.0'
 EXPECTED_ARROW_REQUIREMENT = f'={EXPECTED_ARROW_VERSION}'
+# Arrow 59.0.0's implementation graph is immutable. List its packages
+# explicitly instead of matching every `arrow-*` crate: unrelated packages
+# such as `arrow-format` do not share Arrow's release version.
+EXPECTED_ARROW_FAMILY = frozenset({
+    'arrow',
+    'arrow-arith',
+    'arrow-array',
+    'arrow-buffer',
+    'arrow-cast',
+    'arrow-data',
+    'arrow-ord',
+    'arrow-row',
+    'arrow-schema',
+    'arrow-select',
+    'arrow-string',
+})
 REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
 FFI_ROOT = REPO_ROOT / 'questdb-rs-ffi'
 
@@ -30,27 +47,24 @@ def main():
     with (FFI_ROOT / 'Cargo.lock').open('rb') as lock_file:
         lock = tomllib.load(lock_file)
     packages = lock.get('package', [])
-    arrow_packages = [package for package in packages
-                      if package.get('name') == 'arrow']
-    if len(arrow_packages) != 1:
-        fail(f'Cargo.lock contains {len(arrow_packages)} arrow packages, expected 1')
-    if arrow_packages[0].get('version') != EXPECTED_ARROW_VERSION:
-        fail(
-            f'Cargo.lock resolves arrow {arrow_packages[0].get("version")!r}, '
-            f'expected {EXPECTED_ARROW_VERSION!r}')
-
     family = sorted(
         (package.get('name'), package.get('version'))
         for package in packages
-        if package.get('name') == 'arrow'
-        or str(package.get('name', '')).startswith('arrow-'))
+        if package.get('name') in EXPECTED_ARROW_FAMILY)
+    counts = collections.Counter(name for name, _ in family)
+    missing = sorted(EXPECTED_ARROW_FAMILY - counts.keys())
+    duplicates = sorted(
+        name for name, count in counts.items() if count != 1)
+    if missing or duplicates:
+        fail(
+            'Cargo.lock does not contain exactly one copy of every Arrow 59 '
+            f'implementation package: missing={missing!r}, '
+            f'duplicates={duplicates!r}')
     mismatches = [(name, version) for name, version in family
                   if version != EXPECTED_ARROW_VERSION]
     if mismatches:
         fail(f'Arrow family versions are not pinned to {EXPECTED_ARROW_VERSION}: '
              f'{mismatches!r}')
-    if not family:
-        fail('Cargo.lock contains no Arrow family packages')
 
     print(
         f'Arrow FFI lock guard passed: {len(family)} packages at '

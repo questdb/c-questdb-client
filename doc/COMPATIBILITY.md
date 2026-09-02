@@ -39,9 +39,10 @@ the Rust FFI crate used by C and C++. CI also tests current stable, beta, and
 nightly Rust.
 
 The published Rust library keeps its compatible Arrow range for downstream
-resolution. The unpublished FFI crate used by C/Python artifacts pins Arrow
-59.0.0 so its version-specific C Data Interface preflight cannot silently
-resolve a different implementation.
+resolution. The unpublished FFI crate used by C/Python artifacts requires
+Arrow 59.0.0, and its tracked lockfile pins the complete Arrow implementation
+family to that version. Artifact builds use the lockfile so the version-specific
+C Data Interface preflight cannot silently resolve a different implementation.
 
 The supported native platforms are Linux, macOS, and Windows. CI covers GCC or
 Clang on Linux, Apple Clang on macOS, and the MSVC toolsets installed on the

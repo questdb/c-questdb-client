@@ -7,7 +7,6 @@ import pathlib
 import platform
 import subprocess
 import shlex
-import json
 
 
 def run_cmd(*args, cwd=None):
@@ -29,66 +28,35 @@ def run_cargo_tests():
     """The questdb-rs / questdb-rs-ffi cargo test matrix. Pure Rust: needs no
     CMake build and no running QuestDB."""
     run_cmd(sys.executable, 'ci/check_arrow_ffi_lock.py')
-    rs_lock = pathlib.Path('questdb-rs/Cargo.lock')
-    # `questdb-rs/Cargo.lock` is gitignored, and the pinned Arrow test graph
-    # below is resolved from scratch. Whatever lockfile the tree already holds
-    # — from a local `cargo build`, or from the pipeline's "Build Rust
-    # examples" step, which runs immediately before this script — is held in
-    # memory here and put back in the `finally`, so neither the caller's tree
-    # nor a later pipeline step loses it.
-    saved_lock = rs_lock.read_bytes() if rs_lock.exists() else None
-    rs_lock.unlink(missing_ok=True)
-    try:
-        run_cmd('cargo', 'generate-lockfile', cwd='questdb-rs')
-        run_cmd('cargo', 'update', '-p', 'arrow', '--precise', '59.0.0',
-                cwd='questdb-rs')
-        metadata = json.loads(subprocess.check_output(
-            ['cargo', 'metadata', '--locked', '--format-version', '1',
-             '--features', 'arrow'],
-            cwd='questdb-rs', text=True))
-        arrow_versions = sorted({package['version']
-                                 for package in metadata['packages']
-                                 if package['name'] == 'arrow'})
-        if arrow_versions != ['59.0.0']:
-            sys.stderr.write(
-                f'questdb-rs pinned test graph resolved arrow '
-                f'{arrow_versions!r}, expected [\'59.0.0\']\n')
-            sys.exit(1)
-
-        run_cmd('cargo', 'test',
-                '--', '--nocapture', cwd='questdb-rs')
-        run_cmd('cargo', 'test',
-                '--no-default-features',
-                '--features=aws-lc-crypto,tls-native-certs,sync-sender',
-                '--', '--nocapture', cwd='questdb-rs')
-        run_cmd('cargo', 'test', '--no-default-features',
-                '--features=ring-crypto,tls-native-certs,sync-sender',
-                '--', '--nocapture', cwd='questdb-rs')
-        run_cmd('cargo', 'test', '--no-default-features',
-                '--features=ring-crypto,tls-webpki-certs,sync-sender-tcp',
-                '--', '--nocapture', cwd='questdb-rs')
-        run_cmd('cargo', 'test', '--no-default-features',
-                '--features=ring-crypto,tls-webpki-certs,sync-sender-http',
-                '--', '--nocapture', cwd='questdb-rs')
-        run_cmd('cargo', 'test', '--lib', '--examples', '--no-default-features',
-                '--features=ring-crypto,tls-webpki-certs,sync-reader',
-                '--', '--nocapture', cwd='questdb-rs')
-        run_cmd('cargo', 'test', '--features=almost-all-features',
-                '--', '--nocapture', cwd='questdb-rs')
-        run_cmd('cargo', 'test', '--locked',
-                '--features=almost-all-features,arrow,polars',
-                '--', '--nocapture', cwd='questdb-rs')
-        run_cmd('cargo', 'test', '--locked', '--no-default-features',
-                '--features=ring-crypto,tls-webpki-certs,sync-sender-qwp-ws,sync-reader-qwp-ws,arrow',
-                '--', '--nocapture', cwd='questdb-rs')
-        run_cmd('cargo', 'test', '--locked', cwd='questdb-rs-ffi')
-        run_cmd('cargo', 'test', '--locked', '--features=arrow',
-                cwd='questdb-rs-ffi')
-    finally:
-        if saved_lock is None:
-            rs_lock.unlink(missing_ok=True)
-        else:
-            rs_lock.write_bytes(saved_lock)
+    run_cmd('cargo', 'test',
+            '--', '--nocapture', cwd='questdb-rs')
+    run_cmd('cargo', 'test',
+            '--no-default-features',
+            '--features=aws-lc-crypto,tls-native-certs,sync-sender',
+            '--', '--nocapture', cwd='questdb-rs')
+    run_cmd('cargo', 'test', '--no-default-features',
+            '--features=ring-crypto,tls-native-certs,sync-sender',
+            '--', '--nocapture', cwd='questdb-rs')
+    run_cmd('cargo', 'test', '--no-default-features',
+            '--features=ring-crypto,tls-webpki-certs,sync-sender-tcp',
+            '--', '--nocapture', cwd='questdb-rs')
+    run_cmd('cargo', 'test', '--no-default-features',
+            '--features=ring-crypto,tls-webpki-certs,sync-sender-http',
+            '--', '--nocapture', cwd='questdb-rs')
+    run_cmd('cargo', 'test', '--lib', '--examples', '--no-default-features',
+            '--features=ring-crypto,tls-webpki-certs,sync-reader',
+            '--', '--nocapture', cwd='questdb-rs')
+    run_cmd('cargo', 'test', '--features=almost-all-features',
+            '--', '--nocapture', cwd='questdb-rs')
+    run_cmd('cargo', 'test', '--locked',
+            '--features=almost-all-features,arrow,polars',
+            '--', '--nocapture', cwd='questdb-rs')
+    run_cmd('cargo', 'test', '--locked', '--no-default-features',
+            '--features=ring-crypto,tls-webpki-certs,sync-sender-qwp-ws,sync-reader-qwp-ws,arrow',
+            '--', '--nocapture', cwd='questdb-rs')
+    run_cmd('cargo', 'test', '--locked', cwd='questdb-rs-ffi')
+    run_cmd('cargo', 'test', '--locked', '--features=arrow',
+            cwd='questdb-rs-ffi')
 
 
 def run_cpp_tests():
