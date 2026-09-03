@@ -479,6 +479,18 @@ pub(crate) struct SyncQwpWsHandlerState {
     /// [`super::column_sender::PooledSenderCore::new_store_and_forward`]; the two are
     /// mutually exclusive. `None` in memory mode / on side-file open failure.
     pub(crate) persisted_symbol_dict: Option<PersistedSymbolDict>,
+    /// Whether a split chunk may defer its non-final frames' commit.
+    ///
+    /// Memory mode only. `FLAG_DEFER_COMMIT` is unknown to the queue, segment,
+    /// manifest and recovery layers, so a process death between a deferred
+    /// append and its committing append leaves a persisted tail nothing
+    /// downstream can interpret: the orphan drainer opens replay-only with no
+    /// producer, so it can never append the committing frame, and
+    /// `orphan_queue_drained` is `completed >= published`, which such a tail
+    /// never satisfies. In memory mode the queue dies with the process, so
+    /// there is no tail to strand. Lifting this needs commit-boundary
+    /// recovery in the queue itself.
+    pub(crate) sfa_split_deferral_enabled: bool,
 }
 
 impl SyncQwpWsHandlerState {
@@ -3601,6 +3613,7 @@ pub(crate) fn connect_qwp_ws_background_state(
         recovered_dict_entries,
         recovered_dict_count,
         persisted_symbol_dict,
+        sfa_split_deferral_enabled: qwp_ws.sf_dir.is_none(),
     })
 }
 
@@ -3933,7 +3946,7 @@ pub(crate) fn publish_qwp_ws_payload_background(
 /// (`false`) there: committing a frame that could have been deferred costs
 /// throughput, deferring one that should have committed costs liveness.
 pub(crate) fn sfa_has_deferred_commit_slot(state: &SyncQwpWsHandlerState) -> bool {
-    state.runner.has_deferred_commit_headroom().unwrap_or(false)
+    state.sfa_split_deferral_enabled && state.runner.has_deferred_commit_headroom().unwrap_or(false)
 }
 
 pub(crate) fn flush_qwp_ws_manual(

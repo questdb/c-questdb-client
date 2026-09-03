@@ -394,11 +394,9 @@ impl QwpWsConfig {
             return max_total_bytes;
         }
 
-        let default_max_total_bytes = if self.sf_dir.is_some() {
-            QWP_WS_DEFAULT_SF_DISK_MAX_TOTAL_BYTES
-        } else {
-            QWP_WS_DEFAULT_SF_MEMORY_MAX_TOTAL_BYTES
-        };
+        if self.sf_dir.is_some() {
+            return QWP_WS_DEFAULT_SF_DISK_MAX_TOTAL_BYTES;
+        }
         // Floor at five segments, not two. A freshly opened slot already holds an
         // active segment plus a hot spare, and `has_deferred_commit_headroom`
         // reserves two more beyond the deferred frame's own rotation: one for
@@ -408,7 +406,11 @@ impl QwpWsConfig {
         // commits once per frame -- correct, but without the batching the split
         // path exists to get. An explicitly configured `sf_max_total_bytes` is
         // left alone; it degrades the same safe way.
-        default_max_total_bytes.max(self.sf_max_segment_bytes.saturating_mul(5))
+        //
+        // Memory mode only, because split deferral is (see
+        // `SyncQwpWsHandlerState::sfa_split_deferral_enabled`). Applying it to
+        // the disk default would double a budget no valve can spend.
+        QWP_WS_DEFAULT_SF_MEMORY_MAX_TOTAL_BYTES.max(self.sf_max_segment_bytes.saturating_mul(5))
     }
 
     /// Closes a documented footgun: `reconnect_max_duration_millis` and the

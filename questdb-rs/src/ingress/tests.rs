@@ -248,6 +248,18 @@ fn qwpws_sf_max_total_bytes_floors_at_five_segments() {
         100 * 1024 * 1024,
         "an explicitly configured total must not be inflated by the floor"
     );
+
+    // With `sf_dir` the queue is persisted, split deferral is off, and the
+    // floor must not inflate a budget no valve can spend.
+    let dir = tempfile::TempDir::new().unwrap();
+    assert_eq!(
+        flat_default(&format!(
+            "ws::addr=localhost:9000;sf_max_segment_bytes=64mb;sf_dir={};",
+            dir.path().display()
+        )),
+        10 * 1024 * 1024 * 1024,
+        "the disk default must be untouched by the deferred-commit floor"
+    );
 }
 
 #[cfg(feature = "sync-sender-qwp-ws")]

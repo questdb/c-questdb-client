@@ -92,6 +92,11 @@ enum MockMode {
     /// reading `kill_after` frames, modelling a peer that drops mid-deferred
     /// group. Later connections ack normally so the client can replay.
     DeferAwareAckKillingFirstConn(usize),
+    /// As [`MockMode::DeferAwareAck`], but the FIRST connection answers data
+    /// frame `reject_at` with a retriable `NOT_WRITABLE` rejection — a primary
+    /// that becomes a read-only replica while it holds a deferred group. Later
+    /// connections ack normally so the client can replay onto the new primary.
+    DeferAwareRejectingFrame(usize),
     /// Read (consume) the first `n` binary frames — so the client's writes
     /// provably succeed — then close **without** acking. Models a peer that
     /// ingests a published frame and then dies before acknowledging it: the
@@ -349,6 +354,14 @@ fn run_mock_server_accept_loop(
                                 capture,
                                 (accept_index == 0).then_some(kill_after),
                             ),
+                            MockMode::DeferAwareRejectingFrame(reject_at) => {
+                                defer_aware_ack_rejecting(
+                                    &mut stream,
+                                    &stop,
+                                    capture,
+                                    (accept_index == 0).then_some(reject_at),
+                                )
+                            }
                             MockMode::ReadThenClose(n) => read_then_close(&mut stream, &stop, n),
                         }
                     }
@@ -650,6 +663,71 @@ fn defer_aware_ack(
                     && (payload[QWP_FLAGS_OFFSET] & FLAG_DEFER_COMMIT) != 0;
                 if let Some(tx) = capture.as_ref() {
                     let _ = tx.send(payload);
+                }
+                if !deferred && write_qwp_ok_response(stream, frame_index).is_err() {
+                    break;
+                }
+                frame_index += 1;
+            }
+            Err(e)
+                if e.kind() == std::io::ErrorKind::WouldBlock
+                    || e.kind() == std::io::ErrorKind::TimedOut =>
+            {
+                continue;
+            }
+            Err(_) => break,
+        }
+    }
+}
+
+/// As [`defer_aware_ack`], but with `reject_at = Some(n)` the `n`-th data
+/// frame (0-based) is answered with a retriable `NOT_WRITABLE` rejection
+/// instead of being acked or withheld — the role-switch response a primary
+/// gives while it is still holding a deferred group.
+fn defer_aware_ack_rejecting(
+    stream: &mut std::net::TcpStream,
+    stop: &AtomicBool,
+    capture: Option<mpsc::Sender<Vec<u8>>>,
+    reject_at: Option<usize>,
+) {
+    const FLAG_DEFER_COMMIT: u8 = 0x01;
+    const QWP_FLAGS_OFFSET: usize = 5;
+    const QWP_STATUS_NOT_WRITABLE: u8 = 0x0C;
+    let _ = stream.set_read_timeout(Some(Duration::from_millis(50)));
+    let mut frame_index: u64 = 0;
+    let mut read = 0usize;
+    loop {
+        if stop.load(Ordering::SeqCst) {
+            break;
+        }
+        match read_frame(stream) {
+            Ok((_fin, opcode, payload)) => {
+                if opcode == 0x8 {
+                    break;
+                }
+                if opcode != 0x2 {
+                    continue;
+                }
+                let index = read;
+                read += 1;
+                let deferred = payload.len() > QWP_FLAGS_OFFSET
+                    && (payload[QWP_FLAGS_OFFSET] & FLAG_DEFER_COMMIT) != 0;
+                if let Some(tx) = capture.as_ref() {
+                    let _ = tx.send(payload);
+                }
+                if reject_at == Some(index) {
+                    let _ = write_qwp_error_response(
+                        stream,
+                        QWP_STATUS_NOT_WRITABLE,
+                        frame_index,
+                        b"table is read only",
+                    );
+                    // Mark the boundary so a reader can split this peer's
+                    // frames from the replay without assuming a count.
+                    if let Some(tx) = capture.as_ref() {
+                        let _ = tx.send(Vec::new());
+                    }
+                    break;
                 }
                 if !deferred && write_qwp_ok_response(stream, frame_index).is_err() {
                     break;
@@ -3294,13 +3372,9 @@ fn store_and_forward_replays_the_whole_group_when_the_peer_dies_mid_deferred_gro
         Some(tx),
     );
 
-    let dir = TempDir::new().unwrap();
     let conf = conf_for_endpoints(
         &[server.port()],
-        &format!(
-            "max_buf_size={CAP};sf_dir={};pool_reap=manual;",
-            dir.path().display()
-        ),
+        &format!("max_buf_size={CAP};pool_reap=manual;",),
     );
     let db = QuestDb::connect(&conf).unwrap();
 
@@ -3390,6 +3464,88 @@ fn store_and_forward_replays_the_whole_group_when_the_peer_dies_mid_deferred_gro
 }
 
 #[test]
+fn store_and_forward_mid_group_reject_recycles_instead_of_terminalizing() {
+    // Deferring a split chunk's non-final frames makes the client legitimately
+    // produce frames the server never answers, which broke the driver's reject
+    // handler. `oldest_unresolved_fsn` is the first UN-ACKED frame, so inside a
+    // deferred group it stays pinned at the group head until the committing
+    // frame lands. The handler required the rejected FSN to equal that head and
+    // reported a WebSocket protocol violation otherwise -- turning an expected
+    // primary-to-replica role switch mid-split into a producer-fatal terminal,
+    // with the innocent head frame terminalized alongside it.
+    //
+    // The ack path was already prefix-cumulative (`complete_ack_through`),
+    // which is what makes deferral work at all; the reject path was not.
+    //
+    // REJECT_AT is a deferred frame, not the group head: at the head the old
+    // code was already correct, which is what makes this the discriminating
+    // configuration.
+    const CAP: usize = 2048;
+    const ROWS: usize = 512;
+    const REJECT_AT: usize = 1;
+
+    let (tx, frames) = mpsc::channel();
+    let server = MockServer::spawn_with_mode_capture(
+        2,
+        MockMode::DeferAwareRejectingFrame(REJECT_AT),
+        Some(tx),
+    );
+
+    let conf = conf_for_endpoints(
+        &[server.port()],
+        &format!("max_buf_size={CAP};pool_reap=manual;"),
+    );
+    let db = QuestDb::connect(&conf).unwrap();
+
+    let qty: Vec<i64> = (0..ROWS as i64).collect();
+    let ts: Vec<i64> = (0..ROWS as i64)
+        .map(|x| 1_700_000_000_000_000_000 + x)
+        .collect();
+    let mut chunk = Chunk::new("trades");
+    chunk.column_i64("qty", &qty, None).unwrap();
+    chunk.at_nanos(&ts).unwrap();
+
+    let mut sender = db.borrow_sender().unwrap();
+    sender.flush(&mut chunk).expect("oversize chunk splits");
+
+    sender.wait(AckLevel::Ok, Duration::from_secs(30)).expect(
+        "a NOT_WRITABLE reject of a deferred frame that is not the group head \
+         must recycle and replay, not raise a protocol violation",
+    );
+
+    // The mock marks the moment it rejects, so the replay boundary is read off
+    // the capture stream rather than assumed from a count.
+    let mut replayed_frames = Vec::new();
+    let mut rejected = false;
+    while let Ok(frame) = frames.recv_timeout(Duration::from_millis(500)) {
+        if frame.is_empty() {
+            rejected = true;
+        } else if rejected {
+            replayed_frames.push(frame);
+        }
+    }
+    assert!(rejected, "the mock never reported rejecting a frame");
+    assert!(
+        server.accepted() >= 2,
+        "the reject must have driven a reconnect, saw {} accept(s)",
+        server.accepted()
+    );
+
+    // Nothing in the group was acked, so the replay onto the new primary must
+    // carry every row exactly once.
+    let mut replayed_qty: Vec<i64> = replayed_frames
+        .iter()
+        .flat_map(|f| frame_qty_values(f))
+        .collect();
+    replayed_qty.sort_unstable();
+    assert_eq!(
+        replayed_qty,
+        (0..ROWS as i64).collect::<Vec<_>>(),
+        "the replayed group must carry every row's value exactly once"
+    );
+}
+
+#[test]
 fn store_and_forward_split_commits_early_rather_than_stalling_on_queue_capacity() {
     // A deferred frame is never acked, so the queue storage it occupies is
     // never reclaimed by `maintain_storage`. Deferring every frame but the last
@@ -3421,14 +3577,12 @@ fn store_and_forward_split_commits_early_rather_than_stalling_on_queue_capacity(
     let (tx, frames) = mpsc::channel();
     let server = MockServer::spawn_with_mode_capture(1, MockMode::DeferAwareAck, Some(tx));
 
-    let dir = TempDir::new().unwrap();
     let conf = conf_for_endpoints(
         &[server.port()],
         &format!(
-            "max_buf_size={CAP};sf_dir={};pool_reap=manual;\
+            "max_buf_size={CAP};pool_reap=manual;\
              sf_max_segment_bytes={SEGMENT};sf_max_total_bytes={TOTAL};\
              sf_append_deadline_millis=30000;",
-            dir.path().display()
         ),
     );
     let db = QuestDb::connect(&conf).unwrap();
@@ -3521,13 +3675,9 @@ fn store_and_forward_flush_splits_oversize_chunk_committing_once_at_the_last_fra
     const FLAG_DEFER_COMMIT: u8 = 0x01;
 
     let (server, frames) = MockServer::spawn_acking_capturing(1);
-    let dir = TempDir::new().unwrap();
     let conf = conf_for_endpoints(
         &[server.port()],
-        &format!(
-            "max_buf_size={CAP};sf_dir={};pool_reap=manual;",
-            dir.path().display()
-        ),
+        &format!("max_buf_size={CAP};pool_reap=manual;",),
     );
     let db = QuestDb::connect(&conf).unwrap();
 
@@ -3583,6 +3733,81 @@ fn store_and_forward_flush_splits_oversize_chunk_committing_once_at_the_last_fra
             !is_last,
             "frame {i} of {}: every frame but the last must be deferred, so the \
              chunk commits exactly once at its final frame",
+            captured.len()
+        );
+    }
+    let total: u64 = captured.iter().map(|f| frame_row_count(f)).sum();
+    assert_eq!(
+        total, ROWS as u64,
+        "split frames must cover every row exactly once"
+    );
+}
+
+#[test]
+fn store_and_forward_split_never_defers_when_sf_dir_persists_the_queue() {
+    // The mirror of the memory-mode test above, and the gate that keeps
+    // deferral out of the durable path.
+    //
+    // FLAG_DEFER_COMMIT is unknown to the queue, segment, manifest and
+    // recovery layers -- it appears nowhere under `ingress/sender/`. A process
+    // death between a deferred append and its committing append would leave an
+    // on-disk shape nothing downstream can interpret: the orphan drainer opens
+    // replay-only with no producer, so it can never append the committing
+    // frame, and `orphan_queue_drained` is `completed >= published`, which such
+    // a tail never satisfies -- an undrainable slot re-adopted on every start.
+    //
+    // So with `sf_dir` set the split still commits per frame, exactly as it did
+    // before deferral existed. Lifting this needs commit-boundary recovery in
+    // the queue itself (the Java client's `recoveredCommitBoundaryFsn` plus
+    // orphan-tail retirement); until then the throughput win is memory-mode
+    // only, which is the default (`sf_dir` unset).
+    const CAP: usize = 2048;
+    const ROWS: usize = 512;
+    const FLAG_DEFER_COMMIT: u8 = 0x01;
+
+    let (server, frames) = MockServer::spawn_acking_capturing(1);
+    let dir = TempDir::new().unwrap();
+    let conf = conf_for_endpoints(
+        &[server.port()],
+        &format!(
+            "max_buf_size={CAP};sf_dir={};pool_reap=manual;",
+            dir.path().display()
+        ),
+    );
+    let db = QuestDb::connect(&conf).unwrap();
+
+    let qty: Vec<i64> = (0..ROWS as i64).collect();
+    let ts: Vec<i64> = (0..ROWS as i64)
+        .map(|x| 1_700_000_000_000_000_000 + x)
+        .collect();
+    let mut chunk = Chunk::new("trades");
+    chunk.column_i64("qty", &qty, None).unwrap();
+    chunk.at_nanos(&ts).unwrap();
+
+    let mut sender = db.borrow_sender().unwrap();
+    sender
+        .flush(&mut chunk)
+        .expect("oversize chunk splits and appends");
+    sender
+        .wait(AckLevel::Ok, Duration::from_secs(30))
+        .expect("all split frames commit");
+
+    let mut captured = Vec::new();
+    while let Ok(frame) = frames.recv_timeout(Duration::from_millis(500)) {
+        captured.push(frame);
+    }
+    assert!(
+        captured.len() > 1,
+        "oversize chunk must split into multiple frames, got {}",
+        captured.len()
+    );
+    for (i, frame) in captured.iter().enumerate() {
+        assert_eq!(
+            frame[5] & FLAG_DEFER_COMMIT,
+            0,
+            "frame {i} of {}: no frame may be deferred while sf_dir persists \
+             the queue -- a tail left deferred outlives the process and no \
+             recovery path can commit it",
             captured.len()
         );
     }
@@ -3842,13 +4067,9 @@ fn store_and_forward_split_rejected_before_publishing_stays_a_clean_rejection() 
 
     let (tx, frames) = mpsc::channel();
     let server = MockServer::spawn_with_mode_capture(1, MockMode::DeferAwareAck, Some(tx));
-    let dir = TempDir::new().unwrap();
     let conf = conf_for_endpoints(
         &[server.port()],
-        &format!(
-            "max_buf_size={CAP};sf_dir={};pool_reap=manual;",
-            dir.path().display()
-        ),
+        &format!("max_buf_size={CAP};pool_reap=manual;",),
     );
     let db = QuestDb::connect(&conf).unwrap();
 
@@ -3899,13 +4120,11 @@ fn store_and_forward_split_floor_failure_without_deferral_publishes_no_extra_fra
 
     let (tx, frames) = mpsc::channel();
     let server = MockServer::spawn_with_mode_capture(1, MockMode::DeferAwareAck, Some(tx));
-    let dir = TempDir::new().unwrap();
     let conf = conf_for_endpoints(
         &[server.port()],
         &format!(
-            "max_buf_size={CAP};sf_dir={};pool_reap=manual;\
+            "max_buf_size={CAP};pool_reap=manual;\
              sf_max_segment_bytes={SEGMENT};sf_max_total_bytes={TOTAL};",
-            dir.path().display()
         ),
     );
     let db = QuestDb::connect(&conf).unwrap();
@@ -3959,13 +4178,9 @@ fn check_split_floor_failure_commits_prefix(shape: SplitFloorShape, rows: usize)
 
     let (tx, frames) = mpsc::channel();
     let server = MockServer::spawn_with_mode_capture(1, MockMode::DeferAwareAck, Some(tx));
-    let dir = TempDir::new().unwrap();
     let conf = conf_for_endpoints(
         &[server.port()],
-        &format!(
-            "max_buf_size={CAP};sf_dir={};pool_reap=manual;",
-            dir.path().display()
-        ),
+        &format!("max_buf_size={CAP};pool_reap=manual;",),
     );
     let db = QuestDb::connect(&conf).unwrap();
 
@@ -7645,13 +7860,9 @@ fn store_and_forward_arrow_split_commits_once_at_the_last_frame() {
 
     let (tx, frames) = mpsc::channel();
     let server = MockServer::spawn_with_mode_capture(1, MockMode::DeferAwareAck, Some(tx));
-    let dir = TempDir::new().unwrap();
     let conf = conf_for_endpoints(
         &[server.port()],
-        &format!(
-            "max_buf_size={CAP};sf_dir={};pool_reap=manual;",
-            dir.path().display()
-        ),
+        &format!("max_buf_size={CAP};pool_reap=manual;",),
     );
     let db = QuestDb::connect(&conf).unwrap();
 
@@ -7707,13 +7918,9 @@ fn store_and_forward_arrow_split_floor_failure_still_commits_the_deferred_prefix
 
     let (tx, frames) = mpsc::channel();
     let server = MockServer::spawn_with_mode_capture(1, MockMode::DeferAwareAck, Some(tx));
-    let dir = TempDir::new().unwrap();
     let conf = conf_for_endpoints(
         &[server.port()],
-        &format!(
-            "max_buf_size={CAP};sf_dir={};pool_reap=manual;",
-            dir.path().display()
-        ),
+        &format!("max_buf_size={CAP};pool_reap=manual;",),
     );
     let db = QuestDb::connect(&conf).unwrap();
 
@@ -7774,14 +7981,12 @@ fn store_and_forward_arrow_split_commits_early_rather_than_stalling_on_queue_cap
 
     let (tx, frames) = mpsc::channel();
     let server = MockServer::spawn_with_mode_capture(1, MockMode::DeferAwareAck, Some(tx));
-    let dir = TempDir::new().unwrap();
     let conf = conf_for_endpoints(
         &[server.port()],
         &format!(
-            "max_buf_size={CAP};sf_dir={};pool_reap=manual;\
+            "max_buf_size={CAP};pool_reap=manual;\
              sf_max_segment_bytes={SEGMENT};sf_max_total_bytes={TOTAL};\
              sf_append_deadline_millis=30000;",
-            dir.path().display()
         ),
     );
     let db = QuestDb::connect(&conf).unwrap();

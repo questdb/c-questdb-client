@@ -435,14 +435,15 @@ impl PooledSenderCore {
     ///
     /// Must run BEFORE [`Self::begin_close`], which stops accepting
     /// publications: after that point the close itself is what makes the
-    /// publish fail, and the queue persists a tail nothing can commit. With
-    /// `sf_dir` that tail outlives the process -- every reopen replays it, the
-    /// server withholds the ack by design, and the drain burns its whole
-    /// timeout, on every open, indefinitely.
+    /// publish fail, and the queue holds a tail nothing can commit -- the
+    /// server withholds the ack by design, so the drain burns its whole
+    /// timeout and the slot's bytes never become reclaimable.
     ///
     /// Best-effort: if the publish fails the flag stays set, so a later attempt
-    /// on this backend retries. It does not cover a process death mid-split,
-    /// which needs commit-boundary recovery in the queue itself.
+    /// on this backend retries. It does not cover a process death mid-split;
+    /// that is why deferral is gated to memory mode, where the queue dies with
+    /// the process (see
+    /// [`sfa_split_deferral_enabled`](crate::ingress::sender::qwp_ws::SyncQwpWsHandlerState)).
     pub(crate) fn close_open_deferred_group(&mut self) {
         if self.backend.sfa_deferred_group_open {
             self.backend.commit_orphaned_prefix();
