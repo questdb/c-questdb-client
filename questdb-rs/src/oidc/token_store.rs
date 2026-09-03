@@ -31,10 +31,20 @@
 //! instead of re-prompting.
 //!
 //! The default [`FileTokenStore`] writes one plaintext JSON file per identity,
-//! protected at rest by file permissions (`0600` file in a `0700` directory)
-//! rather than encryption — the same approach `gcloud`, `aws` and `gh` take. For
-//! at-rest encryption, back a custom [`TokenStore`] with an OS keychain or a
-//! secrets manager instead.
+//! protected at rest by file permissions rather than encryption — the same
+//! approach `gcloud`, `aws` and `gh` take. **On Unix** that means a `0600` file
+//! in a `0700` directory, enforced on every write. **On other platforms**, and
+//! on any filesystem that cannot represent POSIX permissions, the mode cannot
+//! be set or verified and protection falls back to whatever the directory's
+//! default ACL grants: the caller must ensure the directory is reachable only
+//! by the intended account. For at-rest encryption, back a custom
+//! [`TokenStore`] with an OS keychain or a secrets manager instead.
+//!
+//! Where the mode cannot be enforced the store emits one `log::warn!`. That
+//! reaches nobody unless the embedding application has installed a `log`
+//! subscriber — the C and Python clients do not — so an embedder that wants to
+//! see this class of diagnostic, which also covers best-effort cleanup and
+//! `clear` failures, must install one.
 //!
 //! # Security
 //!
@@ -565,10 +575,18 @@ pub trait TokenStore: Send + Sync {
 
 /// The default [`TokenStore`]: one plaintext JSON file per identity.
 ///
-/// The refresh token is protected at rest by file permissions (`0600` file,
-/// `0700` directory) rather than encryption — matching `gcloud`, `aws` and `gh`.
-/// For encryption at rest, supply a [`TokenStore`] backed by an OS keychain or a
+/// The refresh token is protected at rest by file permissions rather than
+/// encryption — matching `gcloud`, `aws` and `gh`. On Unix that is a `0600`
+/// file in a `0700` directory; on other platforms, and on any filesystem that
+/// cannot represent POSIX permissions, the mode is neither set nor verifiable
+/// and protection is whatever the directory's default ACL grants. For
+/// encryption at rest, supply a [`TokenStore`] backed by an OS keychain or a
 /// secrets manager instead.
+///
+/// A store that cannot enforce the mode warns once through `log`, which is
+/// silent unless the application installed a subscriber. On Unix the same
+/// condition additionally refuses to persist, because there `load` would
+/// reject anything written; see the module-level Security notes.
 ///
 /// The default location is `${HOME}/.questdb/oidc-tokens/`, overridable with the
 /// `questdb.client.oidc.token.store.dir` environment variable. The file name is
@@ -1529,11 +1547,24 @@ fn lock_snapshot(lock: &Path) -> std::io::Result<Option<LockSnapshot>> {
     if !meta.is_file() || meta.file_type().is_symlink() {
         return Ok(None);
     }
+    // An mtime the platform cannot report, or one before the epoch, reads as
+    // age zero rather than aborting the snapshot. Failing here wedged the whole
+    // store: `steal_if_stale` bails on a snapshot error, the directory lock is
+    // required, so every load, save and clear failed for the life of the
+    // installation until someone deleted the file by hand -- the same permanent
+    // wedge documented on MAX_FUTURE_LOCK_SKEW, arrived at from the other
+    // direction. Sources are mundane: a restored archive, some SMB/CIFS and
+    // FUSE mounts, a clock stepped back, `touch -t 196001010000`.
+    //
+    // Epoch is maximally old, so the age test below reclaims the lock through
+    // the ordinary stale path. That matches `is_stale`, which already handles a
+    // pre-epoch mtime correctly, and the `now_millis` conversion in
+    // `steal_if_stale`, which already falls back the same way.
     let modified_millis = meta
         .modified()
         .ok()
         .and_then(system_time_millis)
-        .ok_or_else(|| std::io::Error::other("OIDC token-store lock has no usable mtime"))?;
+        .unwrap_or(0);
     let stamp = match read_lock_stamp(lock) {
         Ok(stamp) => LockStamp::Readable(stamp),
         Err(_) => LockStamp::Unreadable,

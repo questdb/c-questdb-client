@@ -674,6 +674,33 @@ fn a_far_future_lock_is_reclaimed_rather_than_wedging_the_store() {
 }
 
 #[test]
+fn a_pre_epoch_lock_is_reclaimed_rather_than_wedging_the_store() {
+    // The mirror of the far-future wedge, arrived at from the other side.
+    // `lock_snapshot` turned an mtime it could not convert to milliseconds --
+    // anything before the epoch -- into a hard error. `steal_if_stale` bails on
+    // a snapshot error and the directory lock is required, so every load, save
+    // and clear failed forever until someone deleted the file by hand.
+    //
+    // `is_stale` always handled this correctly (`duration_since` returns a huge
+    // Ok elapsed), so only the steal path wedged; the two now agree. No
+    // attacker needed: a restored archive, some SMB/CIFS and FUSE mounts, a
+    // clock stepped back, or `touch -t 196001010000` all produce it.
+    let dir = TempDir::new().unwrap();
+    let store = FileTokenStore::at(dir.path())
+        .with_lock_timings(Duration::from_secs(2), DEFAULT_LOCK_STALE);
+    let key = test_key();
+    let lock = store.directory_lock_file();
+    create_lock_file(&lock, "1725048000000 abandoned-peer").unwrap();
+    // Comfortably before 1970 on any platform whose SystemTime can express it.
+    set_mtime_offset_from_now(&lock, Duration::from_secs(80 * 365 * 24 * 3600), false);
+
+    store
+        .save(&key, &test_token())
+        .expect("a pre-epoch lock must be reclaimable");
+    assert!(store.load(&key).unwrap().is_some());
+}
+
+#[test]
 fn a_slightly_future_lock_is_still_treated_as_live() {
     // The other half: a small clock disagreement must NOT let a contender break
     // a lock a peer is actively holding, so within the plausible-skew window a
