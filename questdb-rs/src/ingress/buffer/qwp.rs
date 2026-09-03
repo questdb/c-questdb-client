@@ -10558,6 +10558,81 @@ mod tests {
         }
     }
 
+    /// A rewind may run while a row is open: nothing gates it on the row
+    /// boundary, and a caller that hits an error mid-row is exactly who
+    /// reaches for it. The open row's cells must go with the committed ones,
+    /// whether the row sits in a table the mark knew or in one created after
+    /// it, and the buffer must come back on a row boundary.
+    #[cfg(feature = "_sender-qwp-ws")]
+    #[test]
+    fn qwp_ws_columnar_rewind_discards_an_open_row() {
+        fn write_committed(buf: &mut QwpWsColumnarBuffer, i: i64) {
+            buf.table("trades")
+                .unwrap()
+                .symbol("sym", format!("sym-{i}").as_str())
+                .unwrap()
+                .column_i64("qty", i)
+                .unwrap()
+                .at(TimestampNanos::new(1_700_000_000_000_000_000 + i))
+                .unwrap();
+        }
+
+        for api in ["marker", "bookmark"] {
+            for open_table in ["trades", "late_table"] {
+                let mut reference = QwpWsColumnarBuffer::new(127);
+                write_committed(&mut reference, 0);
+                write_committed(&mut reference, 1);
+
+                let mut buf = QwpWsColumnarBuffer::new(127);
+                write_committed(&mut buf, 0);
+                let bookmark = if api == "marker" {
+                    buf.set_marker().unwrap();
+                    None
+                } else {
+                    Some(buf.bookmark().unwrap())
+                };
+
+                // A committed row past the mark, then a row left open with a
+                // new symbol and a column the mark never saw.
+                write_committed(&mut buf, 5);
+                buf.table(open_table)
+                    .unwrap()
+                    .symbol("sym", "open")
+                    .unwrap()
+                    .column_str("note", "never committed")
+                    .unwrap();
+                let case = format!("{api}, open row in {open_table}");
+                assert_eq!(buf.row_count(), 2, "{case}: an open row is not counted");
+
+                match bookmark {
+                    Some(bookmark) => buf.rewind_to_bookmark(bookmark).unwrap(),
+                    None => buf.rewind_to_marker().unwrap(),
+                }
+
+                assert_eq!(buf.row_count(), 1, "{case}: only the pre-mark row survives");
+                let err = buf.column_i64("qty", 9).unwrap_err();
+                assert_eq!(
+                    err.code(),
+                    ErrorCode::InvalidApiCall,
+                    "{case}: the rewound buffer is back on a row boundary"
+                );
+
+                write_committed(&mut buf, 1);
+                assert_eq!(
+                    buf.len(),
+                    buf.recompute_len_slow(),
+                    "{case}: the cached size hint must match a full recompute"
+                );
+                assert_eq!(buf.len(), reference.len(), "{case}: size hint");
+                assert_eq!(
+                    ws_replay_bytes(&mut buf),
+                    ws_replay_bytes(&mut reference),
+                    "{case}: the open row must leave nothing behind"
+                );
+            }
+        }
+    }
+
     #[cfg(feature = "_sender-qwp-ws")]
     #[test]
     fn qwp_ws_columnar_rewind_recomputes_only_the_tables_it_unwound() {
