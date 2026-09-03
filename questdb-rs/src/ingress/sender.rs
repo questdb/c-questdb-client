@@ -607,8 +607,10 @@ impl Sender {
     ///
     /// Use this when you need non-blocking/pipelined progress tracking on this
     /// sender stream: keep the returned FSN and compare it with
-    /// [`Self::acked_fsn`]. Use [`Self::wait`] instead when you only need a
-    /// blocking barrier for everything published so far.
+    /// [`Self::acked_fsn`] for durable coverage, or with
+    /// [`Self::completed_fsn`] to release on server acceptance instead. Use
+    /// [`Self::wait`] instead when you only need a blocking barrier for
+    /// everything published so far.
     #[cfg(feature = "sync-sender-qwp-ws")]
     pub fn flush_and_get_fsn(&mut self, buf: &mut Buffer) -> Result<Option<u64>> {
         let fsn = self.flush_and_keep_and_get_fsn(buf)?;
@@ -650,7 +652,9 @@ impl Sender {
     /// After [`Self::flush_and_get_fsn`] returns `Some(fsn)`, that publication
     /// boundary has completed once this method returns a value greater than or
     /// equal to `fsn`. Use [`Self::wait`] when you need an explicit
-    /// [`AckLevel::Ok`] or [`AckLevel::Durable`] barrier.
+    /// [`AckLevel::Ok`] or [`AckLevel::Durable`] barrier, or
+    /// [`Self::completed_fsn`] to poll either level without blocking — this
+    /// method is equivalent to `completed_fsn(AckLevel::Durable)`.
     #[cfg(feature = "sync-sender-qwp-ws")]
     pub fn acked_fsn(&self) -> Result<Option<u64>> {
         match &self.handler {

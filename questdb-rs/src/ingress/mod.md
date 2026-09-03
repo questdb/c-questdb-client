@@ -121,8 +121,12 @@ to acknowledge every frame published so far, call
 [`sender.wait()`](Sender::wait) with the desired
 [`AckLevel`](crate::ingress::AckLevel) — the row-major counterpart to the
 column-major store-and-forward `wait`.
-[`sender.published_fsn()`](Sender::published_fsn) and
-[`sender.acked_fsn()`](Sender::acked_fsn) provide non-blocking polls.
+[`sender.published_fsn()`](Sender::published_fsn),
+[`sender.acked_fsn()`](Sender::acked_fsn) and
+[`sender.completed_fsn()`](Sender::completed_fsn) provide non-blocking polls;
+`completed_fsn` is the only one that reports the server-accepted
+([`AckLevel::Ok`](crate::ingress::AckLevel::Ok)) watermark, which sits between
+publication and durable coverage.
 
 In `manual` progress mode no background thread observes the transport.
 Server-side state — including terminal diagnostics — only becomes visible when the user
