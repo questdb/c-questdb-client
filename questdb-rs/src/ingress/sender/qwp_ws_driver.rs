@@ -136,14 +136,20 @@ impl PoisonFrameTracker {
         min_escalation_window: Duration,
         now: Instant,
     ) -> bool {
-        if self.fsn == Some(fsn) && self.completed_fsn == completed_fsn {
+        // Keyed on the completed watermark alone: a strike is "the server
+        // refused progress again", whichever frame it named this time. Inside
+        // a deferred group the head is unackable until the committing frame
+        // lands, so successive rejects may land on different frames of the
+        // same stalled group; keying on the frame would restart the count on
+        // every such change and never escalate.
+        if self.fsn.is_some() && self.completed_fsn == completed_fsn {
             self.rejection_count = self.rejection_count.saturating_add(1);
         } else {
-            self.fsn = Some(fsn);
             self.completed_fsn = completed_fsn;
             self.rejection_count = 1;
             self.first_strike_at = Some(now);
         }
+        self.fsn = Some(fsn);
         if self.rejection_count < limit {
             return false;
         }
@@ -1038,8 +1044,8 @@ impl<T: QwpWsCoreTransport> QwpWsSendCore<T> {
     /// deferred group the head is unackable until the committing frame lands,
     /// so requiring `fsn == oldest_unresolved_fsn` would leave a permanently
     /// rejected mid-group frame reconnecting forever without ever escalating.
-    /// The tracker already encodes "no ACK progress" by keying on
-    /// `completed_fsn` alongside the FSN.
+    /// The tracker keys on `completed_fsn` alone, so rejects that move
+    /// between frames of the same stalled group still add up.
     fn rejected_frame_is_poison<Q: PublicationLog>(
         &mut self,
         store: &QwpWsPublicationStore<Q>,
@@ -6699,16 +6705,33 @@ mod tests {
     }
 
     #[test]
-    fn poison_tracker_dwell_restamps_when_suspect_key_changes() {
+    fn poison_tracker_dwell_restamps_when_completed_watermark_moves() {
         let mut tracker = PoisonFrameTracker::default();
         let started = Instant::now();
         let window = Duration::from_secs(5);
 
         assert!(!tracker.record_failure(7, None, 2, window, started));
-        assert!(!tracker.record_failure(8, None, 2, window, started + Duration::from_secs(10)));
+        assert!(!tracker.record_failure(8, Some(3), 2, window, started + Duration::from_secs(10)));
         assert_eq!(tracker.strikes(), 1);
-        assert!(!tracker.record_failure(8, None, 2, window, started + Duration::from_secs(11)));
-        assert!(tracker.record_failure(8, None, 2, window, started + Duration::from_secs(15)));
+        assert!(!tracker.record_failure(8, Some(3), 2, window, started + Duration::from_secs(11)));
+        assert!(tracker.record_failure(8, Some(3), 2, window, started + Duration::from_secs(15)));
+    }
+
+    #[test]
+    fn poison_tracker_counts_rejects_of_different_frames_without_progress() {
+        // A deferred group's head is unackable until its committing frame
+        // lands, so the server may name a different frame of the same stalled
+        // group on each replay. With no ACK progress those are the same
+        // suspect and must add up rather than restart the count.
+        let mut tracker = PoisonFrameTracker::default();
+        let started = Instant::now();
+        let window = Duration::from_secs(5);
+
+        assert!(!tracker.record_failure(2, None, 3, window, started));
+        assert!(!tracker.record_failure(1, None, 3, window, started + Duration::from_secs(1)));
+        assert_eq!(tracker.strikes(), 2);
+        assert!(tracker.record_failure(2, None, 3, window, started + window));
+        assert_eq!(tracker.strikes(), 3);
     }
 
     #[test]
@@ -9050,6 +9073,58 @@ mod tests {
         let error = driver.poll_sender_error().unwrap();
         assert_eq!(error.category, QwpWsErrorCategory::NotWritable);
         assert_eq!(error.applied_policy, QwpWsErrorPolicy::RetriableOther);
+    }
+
+    #[test]
+    fn rejects_that_move_between_frames_of_a_stalled_group_still_escalate() {
+        // The server never acks and rejects fsn 2 on odd connections, fsn 1 on
+        // even ones -- a stalled deferred group whose reject lands on a
+        // different frame each replay. No ACK progress across four rejects
+        // must escalate exactly as four rejects of one frame do; a tracker
+        // keyed on the frame would restart its count on every alternation and
+        // reconnect forever at the level-1 pace.
+        let script: Vec<FakeSendResult> = (0..8)
+            .flat_map(|_| {
+                [
+                    FakeSendResult::NoResponse,
+                    FakeSendResult::NoResponse,
+                    FakeSendResult::RejectWire { wire_seq: 2 },
+                    FakeSendResult::NoResponse,
+                    FakeSendResult::RejectWire { wire_seq: 1 },
+                ]
+            })
+            .collect();
+        let mut driver = driver(FakeOrderedServer::scripted(script));
+        driver.try_submit(b"first").unwrap();
+        driver.try_submit(b"second").unwrap();
+        driver.try_submit(b"third").unwrap();
+
+        let mut terminal = false;
+        for _ in 0..64 {
+            if driver.drive_once().unwrap() == DriveOutcome::Terminal {
+                terminal = true;
+                break;
+            }
+        }
+        assert!(
+            terminal,
+            "rejects that name a different frame of the same stalled group must \
+             still escalate; strikes={}",
+            driver.send_core.poison_tracker.strikes()
+        );
+        let terminal_error = driver.terminal_sender_error().unwrap();
+        assert_eq!(
+            terminal_error.category,
+            QwpWsErrorCategory::ProtocolViolation
+        );
+        assert!(
+            terminal_error
+                .message
+                .as_deref()
+                .is_some_and(|message| message.contains("without ACK progress")),
+            "got {:?}",
+            terminal_error.message
+        );
     }
 
     #[test]
