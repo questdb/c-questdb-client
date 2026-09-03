@@ -292,9 +292,15 @@ impl OidcDeviceAuthBuilder {
         self
     }
 
-    /// Force interactive (`true`) or non-interactive (`false`) mode; the default
-    /// auto-detects a terminal on `stderr`. A non-interactive context errors
-    /// rather than starting a prompt no one can answer.
+    /// Whether `sign_in()` may prompt at all (default `true`).
+    ///
+    /// `false` makes `sign_in()` fail immediately with `InteractionRequired`
+    /// instead of printing a device code nobody will read and polling until it
+    /// expires -- what a headless service or a CI job wants.
+    ///
+    /// There is deliberately no TTY auto-detection: a missing TTY is not
+    /// evidence of a missing human, so refusing on it turned away sign-ins that
+    /// would have worked. The default is `true`, as in the Java client.
     pub fn interactive(mut self, interactive: bool) -> Self {
         self.interactive = Some(interactive);
         self
@@ -1531,22 +1537,34 @@ impl OidcDeviceAuth {
 
     // -- device flow (RFC 8628) ---------------------------------------------
 
+    /// Whether `sign_in()` may prompt. Unset means yes.
+    ///
+    /// This used to default to `stderr().is_terminal()`, which refuses on the
+    /// absence of evidence rather than on evidence of absence: a human watching
+    /// `prog 2>&1 | tee log`, or a supervisor or IDE that captures stderr and
+    /// displays it, has no TTY and was turned away from a sign-in that would
+    /// have worked -- with the opt-out only discoverable after the refusal.
+    /// `sign_in()` is an explicit, blocking, interactive-by-name call, so it is
+    /// honoured, and the device code's own lifetime bounds a flow nobody
+    /// answers, as in the Java client. A caller that wants to fail fast instead
+    /// asks for it with `interactive(false)`.
+    ///
+    /// A binding with a stronger signal than a TTY can still supply one. The
+    /// Python client passes `false` when the live Jupyter kernel reports
+    /// `allow_stdin=False`, which is a notebook executor (papermill, nbclient)
+    /// stating at protocol level that no human is there to authorize.
     fn is_interactive(&self) -> bool {
-        if let Some(v) = self.interactive {
-            return v;
-        }
-        use std::io::IsTerminal;
-        std::io::stderr().is_terminal()
+        self.interactive.unwrap_or(true)
     }
 
     fn run_device_flow(&self) -> Result<TokenSet> {
         self.ensure_open()?;
         if !self.is_interactive() {
             return Err(OidcError::interaction_required(
-                "Interactive sign-in is required, but no interactive terminal was \
-                 detected (e.g. a CI job or a redirected process). Use a QuestDB \
+                "Interactive sign-in is required, but this provider was built \
+                 non-interactive and will not prompt. Use a QuestDB \
                  service-account REST token or the OAuth2 client-credentials grant \
-                 for non-interactive contexts.",
+                 for unattended contexts.",
             ));
         }
 

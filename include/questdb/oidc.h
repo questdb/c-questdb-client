@@ -169,6 +169,19 @@ bool questdb_oidc_builder_allow_insecure_transport(
 QUESTDB_CLIENT_API
 bool questdb_oidc_builder_open_browser(
     questdb_oidc_builder* builder, bool enabled, questdb_error** err_out);
+/**
+ * Whether `questdb_oidc_auth_sign_in` may prompt at all (default `true`).
+ *
+ * `false` makes it fail immediately with
+ * `QUESTDB_OIDC_ERROR_INTERACTION_REQUIRED` instead of printing a device code
+ * nobody will read and polling until the code expires -- what a headless
+ * service or a CI job wants.
+ *
+ * There is deliberately no TTY auto-detection: a missing TTY is not evidence of
+ * a missing human (a pipe into `tee`, a supervisor or an IDE that captures
+ * stderr and displays it), so refusing on it turned away sign-ins that would
+ * have worked. A binding with a stronger signal can pass `false` itself.
+ */
 QUESTDB_CLIENT_API
 bool questdb_oidc_builder_interactive(
     questdb_oidc_builder* builder, bool enabled, questdb_error** err_out);

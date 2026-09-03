@@ -65,8 +65,8 @@ pub enum OidcErrorKind {
 
     /// No usable cached or silently refreshable token is available, so the
     /// caller must invoke `OidcDeviceAuth::sign_in()` explicitly. Also returned
-    /// when an interactive sign-in was requested from a non-interactive process
-    /// (e.g. no TTY or a CI job).
+    /// when `sign_in()` is called on a provider built non-interactive, which
+    /// will not prompt.
     InteractionRequired,
 
     /// The authentication provider was closed while an operation was waiting

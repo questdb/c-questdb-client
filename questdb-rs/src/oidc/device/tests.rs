@@ -1188,6 +1188,42 @@ fn non_interactive_context_refuses() {
 }
 
 #[test]
+fn sign_in_is_interactive_unless_told_otherwise() {
+    // The default used to be `stderr().is_terminal()`, so this whole suite --
+    // and every caller piping stderr, or watched by a human through a
+    // supervisor or IDE -- was refused before a device code was requested. A
+    // missing TTY is not evidence of a missing human; `sign_in()` is an
+    // explicit interactive call, so it runs, matching the Java client.
+    // Reaching the device request (a 404 here) is the proof: the refusal
+    // happens strictly before it.
+    let requested = Arc::new(AtomicUsize::new(0));
+    let mock = {
+        let requested = Arc::clone(&requested);
+        MockServer::start(move |_m, path, _b| {
+            if path == "/device" {
+                requested.fetch_add(1, Ordering::SeqCst);
+            }
+            (404, "{}".to_string())
+        })
+    };
+    let auth = OidcDeviceAuth::builder()
+        .client_id("questdb")
+        .device_authorization_endpoint(mock.url("/device"))
+        .token_endpoint(mock.url("/token"))
+        .open_browser(false)
+        .sleep_hook(no_sleep())
+        .build()
+        .unwrap();
+    let err = auth.sign_in().unwrap_err();
+    assert_eq!(
+        requested.load(Ordering::SeqCst),
+        1,
+        "the device flow was refused instead of started"
+    );
+    assert_ne!(err.kind(), OidcErrorKind::InteractionRequired);
+}
+
+#[test]
 fn explicit_empty_client_id_is_rejected_during_build() {
     let err = OidcDeviceAuth::builder()
         .client_id("")
