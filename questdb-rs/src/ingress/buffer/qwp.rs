@@ -10375,6 +10375,215 @@ mod tests {
         );
     }
 
+    /// Encodes `buf` as a WS replay frame against a fresh connection symbol
+    /// dictionary, so two buffers holding the same rows encode identically,
+    /// symbol delta section included.
+    #[cfg(feature = "_sender-qwp-ws")]
+    fn ws_replay_bytes(buf: &mut QwpWsColumnarBuffer) -> Vec<u8> {
+        let mut scratch = QwpWsEncodeScratch::new();
+        let mut global_dict = SymbolGlobalDict::new();
+        buf.encode_ws_replay_message(&mut scratch, &mut global_dict, QWP_VERSION_1)
+            .unwrap();
+        scratch.message.clone()
+    }
+
+    /// A rewind must unwind every row appended after the mark, not only the
+    /// last one.
+    ///
+    /// `row_count()` alone cannot see a partial rewind: it is a table-level
+    /// counter that the restore assigns directly, so it reads correct even
+    /// when the column buffers still hold the discarded cells. The decisive
+    /// check is the encoded frame -- a rewound buffer must serialise
+    /// byte-for-byte like one that only ever held the surviving rows.
+    #[cfg(feature = "_sender-qwp-ws")]
+    #[test]
+    fn qwp_ws_columnar_rewind_unwinds_every_row_after_the_mark() {
+        // Written before the mark: must survive untouched.
+        fn write_kept_rows(buf: &mut QwpWsColumnarBuffer) {
+            buf.table("trades")
+                .unwrap()
+                .symbol("sym", "ETH-USD")
+                .unwrap()
+                .at(TimestampNanos::new(1_700_000_000_000_000_000))
+                .unwrap();
+            buf.table("quotes")
+                .unwrap()
+                .column_i64("bid", 10)
+                .unwrap()
+                .at(TimestampNanos::new(1_700_000_000_000_000_001))
+                .unwrap();
+        }
+
+        // Written after it: several rows per table, so the rewind spans more
+        // than one row of each; a column that did not exist at the mark; a
+        // table that did not exist at all; and new symbol values, which must
+        // not survive in the column dictionary either.
+        fn write_discarded_rows(buf: &mut QwpWsColumnarBuffer) {
+            for i in 0..3i64 {
+                buf.table("trades")
+                    .unwrap()
+                    .symbol("sym", format!("BTC-USD-{i}").as_str())
+                    .unwrap()
+                    .column_str("note", "added after the mark")
+                    .unwrap()
+                    .at(TimestampNanos::new(1_700_000_001_000_000_000 + i))
+                    .unwrap();
+                buf.table("quotes")
+                    .unwrap()
+                    .column_i64("bid", 200 + i)
+                    .unwrap()
+                    .at(TimestampNanos::new(1_700_000_002_000_000_000 + i))
+                    .unwrap();
+                buf.table("late_table")
+                    .unwrap()
+                    .column_i64("v", i)
+                    .unwrap()
+                    .at(TimestampNanos::new(1_700_000_003_000_000_000 + i))
+                    .unwrap();
+            }
+        }
+
+        let mut reference = QwpWsColumnarBuffer::new(127);
+        write_kept_rows(&mut reference);
+        let expected = ws_replay_bytes(&mut reference);
+
+        // Both rewind surfaces share one capture/restore path.
+        for api in ["marker", "bookmark"] {
+            let mut buf = QwpWsColumnarBuffer::new(127);
+            write_kept_rows(&mut buf);
+
+            let bookmark = if api == "marker" {
+                buf.set_marker().unwrap();
+                None
+            } else {
+                Some(buf.bookmark().unwrap())
+            };
+
+            write_discarded_rows(&mut buf);
+            assert_eq!(buf.row_count(), 11, "{api}: rows before the rewind");
+
+            match bookmark {
+                Some(bookmark) => buf.rewind_to_bookmark(bookmark).unwrap(),
+                None => buf.rewind_to_marker().unwrap(),
+            }
+
+            assert_eq!(buf.row_count(), 2, "{api}: only the pre-mark rows survive");
+            assert_eq!(
+                ws_replay_bytes(&mut buf),
+                expected,
+                "{api}: a rewound buffer must encode exactly the pre-mark rows; \
+                 discarded cells, symbols and columns must not reach the wire"
+            );
+        }
+    }
+
+    /// A rewind must leave the buffer exactly as if the discarded rows had
+    /// never been appended -- for every column kind, at every mark position.
+    ///
+    /// Column state is spread across a per-kind cell vector, a slice arena, a
+    /// symbol dictionary with its lookup, and the counters the size hint
+    /// reads. Unwinding all of them is what makes a rewound buffer
+    /// indistinguishable from one that only ever held the surviving rows, so
+    /// that is what this asserts: same encoded bytes, same size hint.
+    #[cfg(feature = "_sender-qwp-ws")]
+    #[test]
+    fn qwp_ws_columnar_rewind_matches_a_buffer_without_the_discarded_rows() {
+        // Each row writes a different subset of the columns, so columns end up
+        // with sparse nulls and differing non-null counts, and the symbol
+        // column mixes repeated values with fresh dictionary entries.
+        fn write_row(buf: &mut QwpWsColumnarBuffer, table: &str, i: i64) {
+            let samples = vec![1.0_f64, i as f64];
+            let row = buf.table(table).unwrap();
+            row.symbol("sym", format!("sym-{}", i % 3).as_str())
+                .unwrap();
+            if i % 2 == 0 {
+                row.column_bool("flag", i % 4 == 0).unwrap();
+                row.column_i64("qty", i).unwrap();
+                row.column_str("note", format!("note-{i}").as_str())
+                    .unwrap();
+                row.column_binary("blob", &[i as u8, 0xff]).unwrap();
+                row.column_long256("hash", &[i as u8; 32]).unwrap();
+            }
+            if i % 3 == 0 {
+                row.column_f64("px", i as f64 + 0.5).unwrap();
+                row.column_dec("price", format!("{i}.25").as_str()).unwrap();
+                row.column_uuid("id", i as u64, 7).unwrap();
+                row.column_arr("samples", &samples).unwrap();
+            }
+            if i % 5 != 0 {
+                row.column_i32("i32", i as i32).unwrap();
+                row.column_char("ch", u16::from(b'q')).unwrap();
+                row.column_ipv4("ip", i as u32).unwrap();
+                row.column_date("day", i).unwrap();
+                row.column_geohash("g", 7, 5).unwrap();
+                row.column_ts("event_ts", TimestampMicros::new(i)).unwrap();
+            }
+            row.at(TimestampNanos::new(1_700_000_000_000_000_000 + i))
+                .unwrap();
+        }
+
+        for kept_rows in 1..=3i64 {
+            for discarded_rows in [1i64, 2, 4] {
+                for api in ["marker", "bookmark"] {
+                    let mut reference = QwpWsColumnarBuffer::new(127);
+                    for i in 0..kept_rows {
+                        write_row(&mut reference, "trades", i);
+                        write_row(&mut reference, "quotes", i);
+                    }
+                    let expected = ws_replay_bytes(&mut reference);
+                    let expected_len = reference.len();
+
+                    let mut buf = QwpWsColumnarBuffer::new(127);
+                    for i in 0..kept_rows {
+                        write_row(&mut buf, "trades", i);
+                        write_row(&mut buf, "quotes", i);
+                    }
+
+                    let bookmark = if api == "marker" {
+                        buf.set_marker().unwrap();
+                        None
+                    } else {
+                        Some(buf.bookmark().unwrap())
+                    };
+
+                    for i in kept_rows..kept_rows + discarded_rows {
+                        write_row(&mut buf, "trades", i);
+                        write_row(&mut buf, "quotes", i);
+                        // A table that did not exist at the mark at all.
+                        write_row(&mut buf, "late_table", i);
+                    }
+
+                    match bookmark {
+                        Some(bookmark) => buf.rewind_to_bookmark(bookmark).unwrap(),
+                        None => buf.rewind_to_marker().unwrap(),
+                    }
+
+                    let case = format!("{api}, kept {kept_rows}, discarded {discarded_rows}");
+                    assert_eq!(
+                        buf.row_count(),
+                        reference.row_count(),
+                        "{case}: row count after the rewind"
+                    );
+                    assert_eq!(
+                        buf.len(),
+                        buf.recompute_len_slow(),
+                        "{case}: the cached size hint must match a full recompute"
+                    );
+                    assert_eq!(
+                        buf.len(),
+                        expected_len,
+                        "{case}: size hint after the rewind"
+                    );
+                    assert_eq!(
+                        ws_replay_bytes(&mut buf),
+                        expected,
+                        "{case}: a rewound buffer must encode exactly the surviving rows"
+                    );
+                }
+            }
+        }
+    }
+
     #[cfg(feature = "_sender-qwp-ws")]
     #[test]
     fn qwp_ws_columnar_clear_resets_decimal_scale_for_reused_column() {
