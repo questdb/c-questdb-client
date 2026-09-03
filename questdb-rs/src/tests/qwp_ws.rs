@@ -1508,6 +1508,20 @@ fn qwp_ws_schema_reject_terminalizes_in_all_progress_modes() {
         assert_eq!(qwp_error.from_fsn, fsn);
         assert_eq!(qwp_error.to_fsn, fsn);
         assert_eq!(sender.poll_qwp_ws_error().unwrap(), None);
+
+        for level in [
+            crate::ingress::AckLevel::Ok,
+            crate::ingress::AckLevel::Durable,
+        ] {
+            let err = sender.completed_fsn(level).unwrap_err();
+            assert_eq!(
+                err.code(),
+                ErrorCode::ServerRejection,
+                "mode={} level={level:?}: {}",
+                progress.name(),
+                err.msg()
+            );
+        }
     }
 }
 
