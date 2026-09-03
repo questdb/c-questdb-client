@@ -2529,11 +2529,7 @@ impl QwpWsSizeHint {
     }
 
     fn len(&mut self, tables: &[QwpWsTableBuffer]) -> usize {
-        // Preserve the dirty-index allocation across size queries. Taking and
-        // dropping this vector allocated once per row after every buffer clear,
-        // even though the buffer itself is explicitly reusable.
-        let mut dirty_tables = std::mem::take(&mut self.dirty_tables);
-        for table_idx in dirty_tables.drain(..) {
+        for table_idx in self.dirty_tables.drain(..) {
             if table_idx >= tables.len() || table_idx >= self.tables.len() {
                 continue;
             }
@@ -2551,8 +2547,6 @@ impl QwpWsSizeHint {
                 self.recomputed_tables += 1;
             }
         }
-        debug_assert!(dirty_tables.is_empty());
-        self.dirty_tables = dirty_tables;
 
         QWP_MESSAGE_HEADER_SIZE
             + 2
@@ -10135,7 +10129,7 @@ mod tests {
             .unwrap()
             .at_now()
             .unwrap();
-        let _ = buf.len();
+        assert_eq!(buf.len(), buf.recompute_len_slow());
         let capacity = buf.size_hint_dirty_capacity();
         assert!(capacity >= 1);
 
@@ -10147,7 +10141,7 @@ mod tests {
                 .unwrap()
                 .at_now()
                 .unwrap();
-            let _ = buf.len();
+            assert_eq!(buf.len(), buf.recompute_len_slow());
             assert_eq!(buf.size_hint_dirty_capacity(), capacity);
         }
     }
