@@ -382,7 +382,24 @@ typedef struct questdb_oidc_error_view
     uint64_t retry_after_seconds;
 } questdb_oidc_error_view;
 
-/** Returns false for a non-OIDC error or an undersized output view. */
+/**
+ * Fill `out` when an OIDC failure is present in this error's causal chain.
+ *
+ * True does NOT mean the error *is* the OIDC failure, only that one caused it.
+ * `questdb_error_get_code` and `questdb_error_msg` still describe the outermost
+ * failure, and a transport that re-classifies an error on its way out keeps the
+ * OIDC payload attached: a token-provider failure surfacing as a retryable
+ * `line_sender_error_socket_error`, or a failover giving up after several
+ * attempts, both answer true here while their code and message are the
+ * transport's. Bindings that pick an exception type from this predicate should
+ * therefore keep it a subtype of their ordinary error type, and must not drop
+ * the outer code or message on the strength of it.
+ *
+ * Returns false for an error with no OIDC failure anywhere in its chain, or an
+ * undersized output view. On the undersized path `out->struct_size` is
+ * overwritten with the minimum this library requires, and no other field is
+ * written.
+ */
 QUESTDB_CLIENT_API
 bool questdb_error_oidc_get_view(
     const questdb_error* error, questdb_oidc_error_view* out);

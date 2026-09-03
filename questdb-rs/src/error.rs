@@ -407,8 +407,15 @@ impl Error {
         self
     }
 
-    /// The structured OIDC failure behind this error, when it originated from
-    /// the device-flow implementation.
+    /// The structured OIDC failure in this error's causal chain, if any.
+    ///
+    /// `Some` means an OIDC failure *caused* this error, not that this error
+    /// is one: [`reclassified`](Self::reclassified) deliberately preserves the
+    /// payload, so a token-provider failure re-coded to a retryable
+    /// [`SocketError`](crate::ErrorCode::SocketError), or a failover that then
+    /// exhausted its budget, both still answer `Some` while [`code`](Self::code)
+    /// and [`msg`](Self::msg) describe the outer failure. Read this for the auth
+    /// detail; keep using `code`/`msg` for what actually went wrong.
     #[cfg(feature = "_oidc")]
     pub fn oidc_error(&self) -> Option<&crate::oidc::OidcError> {
         self.0.oidc_error.as_deref()
