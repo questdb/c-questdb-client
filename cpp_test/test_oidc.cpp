@@ -136,19 +136,32 @@ TEST_CASE("OIDC C++ wrappers preserve ownership and structured errors")
         .device_authorization_endpoint("https://idp.example/device")
         .groups_in_token(true);
     auto auth = builder.build();
-    auto copied_auth = auth;
-    const auto config = copied_auth.config();
+    // An additional handle is taken explicitly. The copy constructor is
+    // deleted: `questdb_oidc_auth_clone` aliases one shared provider rather
+    // than duplicating it, so a value-shaped copy would let `clear()` on the
+    // "copy" delete the credential the original's transports are using.
+    static_assert(!std::is_copy_constructible<questdb::oidc::device_auth>::value);
+    static_assert(!std::is_copy_assignable<questdb::oidc::device_auth>::value);
+    auto shared_auth = auth.share();
+    const auto config = shared_auth.config();
     CHECK(config.client_id == std::string_view{"questdb-cpp"});
     CHECK(config.scope == std::string_view{"openid profile"});
     CHECK(config.groups_in_token);
+    // Both handles address the same provider.
+    CHECK(shared_auth.c_ptr() != auth.c_ptr());
+    CHECK(shared_auth.config().client_id == auth.config().client_id);
 
     auto moved_auth = std::move(auth);
-    CHECK_THROWS_AS(questdb::oidc::device_auth{auth}, questdb::oidc::error);
+    CHECK_THROWS_AS(auth.share(), questdb::oidc::error);
     CHECK_THROWS_AS(auth.sign_in(), questdb::oidc::error);
     CHECK_THROWS_AS(auth.token(), questdb::oidc::error);
     CHECK_THROWS_AS(auth.clear(), questdb::oidc::error);
     CHECK_THROWS_AS(auth.config(), questdb::oidc::error);
-    CHECK_THROWS_AS(copied_auth = auth, questdb::oidc::error);
+    // Move-assignment from a moved-from handle is still well defined; the
+    // previous copy-assignment check is covered by `auth.share()` above, which
+    // is now the only way to take another handle.
+    shared_auth = std::move(moved_auth);
+    CHECK_THROWS_AS(moved_auth.config(), questdb::oidc::error);
     CHECK_THROWS_AS(
         (questdb::pool{"ws::addr=127.0.0.1:1;lazy_connect=true;", auth}),
         questdb::oidc::error);
@@ -217,7 +230,7 @@ TEST_CASE("OIDC C++ wrappers preserve ownership and structured errors")
 
     // Lazy construction performs no network I/O, but exercises ownership and
     // the shared sender/reader provider configuration in the pool FFI.
-    questdb::pool pool{"ws::addr=127.0.0.1:1;lazy_connect=true;", copied_auth};
+    questdb::pool pool{"ws::addr=127.0.0.1:1;lazy_connect=true;", shared_auth};
 }
 
 TEST_CASE("OIDC C++ event handler ownership is released exactly once")

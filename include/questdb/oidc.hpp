@@ -221,21 +221,25 @@ struct config_view
 class device_auth
 {
 public:
-    device_auth(const device_auth& other)
-        : _raw{detail::wrapped_call(::questdb_oidc_auth_clone, other.raw())}
-    {
-    }
-    device_auth& operator=(const device_auth& other)
-    {
-        if (this != &other)
-        {
-            auto* replacement =
-                detail::wrapped_call(::questdb_oidc_auth_clone, other.raw());
-            ::questdb_oidc_auth_free(_raw);
-            _raw = replacement;
-        }
-        return *this;
-    }
+    /**
+     * Not copyable: copying would read as a value copy and alias instead.
+     *
+     * `questdb_oidc_auth_clone` does not duplicate the provider, unlike
+     * `line_sender_opts_clone`. It takes another handle on ONE shared state:
+     * the token cache, the persisted entry and the closed flag are common to
+     * every handle and to every attached sender, reader and pool. So
+     * `clear()` on the copy deletes the credential the original's transports
+     * are using -- including the on-disk refresh token -- and `close()` on it
+     * permanently closes them. Every other handle in this header (`builder`,
+     * `token`, `event_view`, `pool`, `reader`) is likewise non-copyable, so a
+     * silently aliasing copy here would be the odd one out in exactly the
+     * place the mistake is most expensive.
+     *
+     * Use `share()` when an additional handle is what you want, or pass
+     * `const device_auth&`.
+     */
+    device_auth(const device_auth&) = delete;
+    device_auth& operator=(const device_auth&) = delete;
     device_auth(device_auth&& other) noexcept
         : _raw{other._raw}
     {
@@ -251,6 +255,16 @@ public:
         }
         return *this;
     }
+    /**
+     * Releases THIS handle only.
+     *
+     * It neither closes the shared provider nor removes a persisted
+     * credential, unlike `~pool` and `~reader`, whose destructors do terminate
+     * what they own. Dropping the last handle cancels nothing: work already
+     * started -- a device poll on a worker, say -- runs to its own completion,
+     * because `sign_in` holds its own reference. Call `close()` to stop it, and
+     * `clear()` to remove a persisted refresh token.
+     */
     ~device_auth() noexcept
     {
         ::questdb_oidc_auth_free(_raw);
@@ -279,9 +293,34 @@ public:
     }
 
     /**
+     * Take an additional handle on the SAME shared provider.
+     *
+     * Not a copy. The token cache, the persisted entry and the closed state are
+     * shared by every handle `share()` produces and by every sender, reader and
+     * pool attached to any of them, so `clear()` on one removes the credential
+     * for all, and `close()` on one closes all. Contrast
+     * `line_sender_opts::clone`, which does produce an independent value.
+     *
+     * Each handle must be destroyed independently; destroying one leaves the
+     * others usable.
+     */
+    device_auth share() const
+    {
+        return device_auth{detail::wrapped_call(::questdb_oidc_auth_clone, raw())};
+    }
+
+    /**
      * Clear the in-memory credential and delete its persisted local entry.
      * Throws oidc::error if persisted deletion fails; memory is still cleared.
      * This does not revoke any token at the identity provider.
+     *
+     * Affects the SHARED state, not just this handle: every handle from
+     * `share()`, and every attached sender, reader and pool, loses the
+     * credential too.
+     *
+     * Remains available after `close()`, which drops the in-memory credential
+     * but deliberately leaves the persisted entry behind -- clearing is the
+     * only way to remove that, so it has to outlive the close.
      */
     void clear() const
     {
@@ -290,8 +329,9 @@ public:
 
     /**
      * Permanently close the shared provider and cancel a device-poll or bundled
-     * file-token-store lock wait running on another thread. Every copied handle
-     * and attached transport observes the same closed state. Idempotent.
+     * file-token-store lock wait running on another thread. Every handle from
+     * `share()` and every attached transport observes the same closed state.
+     * Idempotent. The persisted entry is left behind -- see `clear()`.
      *
      * Safe from any thread, including this provider's own event callback: it
      * publishes the close without blocking, and only skips the wait for the
