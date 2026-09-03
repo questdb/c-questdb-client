@@ -2044,20 +2044,28 @@ fn sender_completed_fsn_manual_mode_reports_one_watermark_under_durable_ack() {
         "manual mode must publish the frame once driven"
     );
 
-    // Acceptance only. Background mode would report `Ok` covering the frame
-    // here while `Durable` stayed `None`; manual mode must keep the two
-    // equal at every step, however far it is driven.
+    // Acceptance only: drive until the OK response has been consumed.
+    // Background mode would report `Ok` covering the frame here while
+    // `Durable` stayed `None`; manual mode must keep the two equal.
     ok_tx.send(()).unwrap();
-    for _ in 0..200 {
-        let _ = sender.drive_once();
-        assert_eq!(
-            sender.completed_fsn(crate::ingress::AckLevel::Ok).unwrap(),
-            sender
-                .completed_fsn(crate::ingress::AckLevel::Durable)
-                .unwrap(),
-            "manual mode must not expose a separate OK watermark"
-        );
-    }
+    assert!(
+        wait_until(Duration::from_secs(5), || {
+            let _ = sender.drive_once();
+            sender.qwp_ws_totals().unwrap().acks >= 1
+        }),
+        "server OK must be consumed"
+    );
+    assert_eq!(
+        sender.completed_fsn(crate::ingress::AckLevel::Ok).unwrap(),
+        None,
+        "manual mode must not expose a separate OK watermark"
+    );
+    assert_eq!(
+        sender
+            .completed_fsn(crate::ingress::AckLevel::Durable)
+            .unwrap(),
+        None
+    );
 
     durable_tx.send(()).unwrap();
     assert!(
