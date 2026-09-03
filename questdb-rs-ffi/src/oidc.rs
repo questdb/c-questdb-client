@@ -29,6 +29,7 @@
 //! pointers are validated before allocation or Rust string construction: the
 //! enclosing FFI crate ships with `panic = "abort"`.
 
+use std::cell::RefCell;
 use std::path::PathBuf;
 use std::ptr;
 use std::slice;
@@ -246,9 +247,13 @@ impl SharedOidcAuth {
     /// as surely as one on the callback's own thread. Only the diagnostic is
     /// thread-scoped, since a caller that never entered a callback should not
     /// be told it re-entered one.
+    fn in_own_event_callback(&self) -> bool {
+        in_event_callback_of_on_this_thread(self.event_handler.as_ref())
+    }
+
     fn reject_callback_reentry(&self) -> Result<(), Error> {
         if self.callback_is_active() {
-            return Err(if in_event_callback_on_this_thread() {
+            return Err(if self.in_own_event_callback() {
                 Self::reentry_error()
             } else {
                 Self::callback_busy_error()
@@ -263,20 +268,28 @@ impl SharedOidcAuth {
     }
 
     pub(crate) fn token(&self) -> Result<String, Error> {
-        // Serve a valid cached token even while a callback runs elsewhere. That
-        // path consults only the token cache, never the acquisition lock, so it
-        // cannot block behind the callback and cannot deadlock -- while the
-        // blanket rejection failed every unrelated caller, notably a pooled
-        // PG-wire checkout on another thread, for the whole time a prompt was
-        // on screen. Only an acquisition, which would block, is still refused.
+        // Serve a valid cached token even while a callback runs -- on any
+        // thread, including the callback's own. That path consults only the
+        // token cache, never the acquisition lock, so it cannot block behind
+        // the callback and cannot deadlock, and the header states this
+        // normatively: "`token` DOES succeed from a valid cache: that path
+        // consults no lock the callback holds."
+        //
+        // The cache lookup has to come before the thread test, not after. On
+        // the callback's own thread the old order returned the re-entry error
+        // without ever looking, so a renderer reacting to SUCCESS -- which
+        // fires *after* the token is committed -- was refused a token that was
+        // sitting in the cache, as was any sender, reader or pool it flushed
+        // from there. Only an acquisition, which would block, is still refused.
         if self.callback_is_active() {
-            if in_event_callback_on_this_thread() {
-                return Err(Self::reentry_error());
-            }
             if let Some(cached) = self.inner.cached_token() {
                 return cached.map_err(Into::into);
             }
-            return Err(Self::callback_busy_error());
+            return Err(if self.in_own_event_callback() {
+                Self::reentry_error()
+            } else {
+                Self::callback_busy_error()
+            });
         }
         // OidcDeviceAuth::token is deliberately non-interactive. Every attached
         // transport shares this path, so flush/connect/reconnect can refresh
@@ -298,11 +311,14 @@ impl SharedOidcAuth {
         // nothing else to call.
         self.inner.signal_close();
         // Only the drain can self-deadlock, and only for the thread actually
-        // running the callback: it alone holds the acquisition lock that the
-        // drain waits on. Every other caller must still wait, which is what the
-        // header promises. Keying this on the handler's shared `active` flag
-        // instead made an unrelated thread's close return early too.
-        if in_event_callback_on_this_thread() {
+        // running *this auth's own* callback: it alone holds the acquisition
+        // lock that the drain waits on. Every other caller must still wait,
+        // which is what the header promises. Keying this on the handler's
+        // shared `active` flag made an unrelated thread's close return early;
+        // keying it on a bare per-thread depth made a close on a *different*
+        // provider return early whenever this thread happened to be inside some
+        // other provider's callback, where no lock of ours is held at all.
+        if self.in_own_event_callback() {
             // The drain is skipped, but the credential teardown is not: it takes
             // only the tokens lock, so it is safe inside the critical section.
             // Without this the tokens stayed resident whenever close ran from a
@@ -374,7 +390,7 @@ struct CEventHandler {
 }
 
 std::thread_local! {
-    /// Depth of C event callbacks this thread is currently inside.
+    /// The C event handlers this thread is currently inside, innermost last.
     ///
     /// `CEventHandler::active` is deliberately shared across threads — it backs
     /// the re-entry rejection, which must fire for any caller while a callback
@@ -383,11 +399,33 @@ std::thread_local! {
     /// must skip `close`'s drain. Using the shared flag for that made a
     /// `close()` on an unrelated thread skip the drain too, silently voiding
     /// the contract that it waits for token work to stop.
-    static IN_EVENT_CALLBACK: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    ///
+    /// Handlers are recorded by identity, not merely counted. A bare depth
+    /// answered "am I inside *a* callback", which is the wrong question: it let
+    /// `close()` on provider B, called from inside provider A's callback, take
+    /// the skip-drain branch. Only A's acquisition lock is held on that thread,
+    /// so closing B could not have self-deadlocked and had no reason to skip its
+    /// drain — it returned while B's device flow was still running, contrary to
+    /// what both `oidc.h` and the Python binding promise.
+    ///
+    /// A stack rather than a single slot because two different handlers can
+    /// nest: a renderer for A may drive B synchronously. Each entry must stay
+    /// visible while it is held, or the outer one would be forgotten.
+    static IN_EVENT_CALLBACK: RefCell<Vec<*const CEventHandler>> =
+        const { RefCell::new(Vec::new()) };
 }
 
-fn in_event_callback_on_this_thread() -> bool {
-    IN_EVENT_CALLBACK.with(|depth| depth.get() != 0)
+/// Whether this thread is executing inside `handler`'s own callback — the only
+/// situation in which its acquisition lock is already held by this thread.
+///
+/// Borrows are short and never span a call into user code, so the `RefCell`
+/// cannot be re-entered.
+fn in_event_callback_of_on_this_thread(handler: Option<&Arc<CEventHandler>>) -> bool {
+    let Some(handler) = handler else {
+        return false;
+    };
+    let target: *const CEventHandler = Arc::as_ptr(handler);
+    IN_EVENT_CALLBACK.with(|stack| stack.borrow().contains(&target))
 }
 
 struct ActiveEventHandler<'a> {
@@ -398,14 +436,22 @@ impl<'a> ActiveEventHandler<'a> {
     fn enter(handler: &'a CEventHandler) -> Self {
         let was_active = handler.active.swap(true, Ordering::AcqRel);
         debug_assert!(!was_active, "callback gate must serialize handler entry");
-        IN_EVENT_CALLBACK.with(|depth| depth.set(depth.get() + 1));
+        IN_EVENT_CALLBACK.with(|stack| stack.borrow_mut().push(handler as *const _));
         Self { handler }
     }
 }
 
 impl Drop for ActiveEventHandler<'_> {
     fn drop(&mut self) {
-        IN_EVENT_CALLBACK.with(|depth| depth.set(depth.get() - 1));
+        IN_EVENT_CALLBACK.with(|stack| {
+            let mut stack = stack.borrow_mut();
+            let popped = stack.pop();
+            debug_assert_eq!(
+                popped,
+                Some(self.handler as *const _),
+                "callback handler stack must unwind in order"
+            );
+        });
         let was_active = self.handler.active.swap(false, Ordering::AcqRel);
         debug_assert!(was_active, "active callback guard must be balanced");
     }
@@ -2089,8 +2135,6 @@ mod tests {
             let probe_other = Arc::clone(&observed_other_thread);
             let probe_self = Arc::clone(&observed_callback_thread);
 
-            assert!(!in_event_callback_on_this_thread());
-
             let handler = Arc::new(CEventHandler {
                 callback: ignore_event,
                 user_data: 0,
@@ -2098,15 +2142,23 @@ mod tests {
                 callback_gate: std::sync::Mutex::new(()),
                 active: AtomicBool::new(false),
             });
+            assert!(!in_event_callback_of_on_this_thread(Some(&handler)));
+            let probe_handler = Arc::clone(&handler);
             {
                 let _entered = ActiveEventHandler::enter(&handler);
                 // On the callback's own thread the scope is active...
-                probe_self.store(in_event_callback_on_this_thread(), Ordering::SeqCst);
+                probe_self.store(
+                    in_event_callback_of_on_this_thread(Some(&handler)),
+                    Ordering::SeqCst,
+                );
                 // ...while any other thread must NOT see itself as inside it,
                 // even though the shared `active` flag is set for both.
                 assert!(handler.is_active());
                 let other = std::thread::spawn(move || {
-                    probe_other.store(in_event_callback_on_this_thread(), Ordering::SeqCst);
+                    probe_other.store(
+                        in_event_callback_of_on_this_thread(Some(&probe_handler)),
+                        Ordering::SeqCst,
+                    );
                 });
                 other.join().unwrap();
             }
@@ -2120,9 +2172,58 @@ mod tests {
                 "an unrelated thread must still wait for the drain"
             );
             assert!(!handler.is_active());
-            assert!(!in_event_callback_on_this_thread());
+            assert!(!in_event_callback_of_on_this_thread(Some(&handler)));
             questdb_oidc_builder_free(builder);
         }
+    }
+
+    #[test]
+    fn callback_thread_scope_is_keyed_per_handler() {
+        // The scope answers "is this thread inside *this handler's* callback",
+        // not "inside any callback". Only the handler actually running holds an
+        // acquisition lock on this thread, so a second provider's `close` has
+        // nothing to self-deadlock against and must still perform its drain.
+        //
+        // A bare per-thread depth counter got this wrong: a renderer for A that
+        // offered a "cancel everything" affordance and called close on B saw B
+        // take the skip-drain branch and return while B's device flow was still
+        // running -- contrary to `oidc.h` and to the Python docstring, both of
+        // which scope the exemption to "this provider's own renderer callback".
+        let make = || {
+            Arc::new(CEventHandler {
+                callback: ignore_event,
+                user_data: 0,
+                release: None,
+                callback_gate: std::sync::Mutex::new(()),
+                active: AtomicBool::new(false),
+            })
+        };
+        let a = make();
+        let b = make();
+        {
+            let _in_a = ActiveEventHandler::enter(&a);
+            assert!(
+                in_event_callback_of_on_this_thread(Some(&a)),
+                "inside A's callback"
+            );
+            assert!(
+                !in_event_callback_of_on_this_thread(Some(&b)),
+                "B holds no lock on this thread, so its drain must not be skipped"
+            );
+            // Nesting keeps both visible: an inner handler must not hide the
+            // outer one, whose lock this thread still holds.
+            {
+                let _in_b = ActiveEventHandler::enter(&b);
+                assert!(in_event_callback_of_on_this_thread(Some(&a)));
+                assert!(in_event_callback_of_on_this_thread(Some(&b)));
+            }
+            assert!(in_event_callback_of_on_this_thread(Some(&a)));
+            assert!(!in_event_callback_of_on_this_thread(Some(&b)));
+        }
+        assert!(!in_event_callback_of_on_this_thread(Some(&a)));
+        assert!(!in_event_callback_of_on_this_thread(Some(&b)));
+        // A handler-less auth is never inside its own callback.
+        assert!(!in_event_callback_of_on_this_thread(None));
     }
 
     #[test]
