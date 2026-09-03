@@ -61,6 +61,13 @@ fn connectionless_sender() -> Sender {
     Sender::from_conf("ws::addr=127.0.0.1:1;initial_connect_retry=async;").unwrap()
 }
 
+fn size_limited_connectionless_sender(max_buf_size: usize) -> Sender {
+    Sender::from_conf(format!(
+        "ws::addr=127.0.0.1:1;initial_connect_retry=async;max_buf_size={max_buf_size};"
+    ))
+    .unwrap()
+}
+
 fn persistent_connectionless_sender(sf_dir: &std::path::Path) -> Sender {
     Sender::from_conf(format!(
         "ws::addr=127.0.0.1:1;initial_connect_retry=async;\
@@ -196,6 +203,58 @@ fn flush_encoded_rejects_persistent_store_before_mode_claim_or_io() {
         .unwrap();
     row.at(TimestampNanos::new(2)).unwrap();
     sender.flush(&mut row).unwrap();
+}
+
+#[cfg(feature = "sync-sender-http")]
+#[test]
+fn rejected_transactional_row_flush_does_not_claim_row_mode() {
+    let mut sender = connectionless_sender();
+    let mut row = sender.new_buffer();
+    row.table("readings")
+        .unwrap()
+        .column_i64("_seq", 1)
+        .unwrap();
+    row.at(TimestampNanos::new(1)).unwrap();
+
+    let err = sender.flush_and_keep_with_flags(&row, true).unwrap_err();
+    assert_eq!(err.code(), ErrorCode::InvalidApiCall, "got {err:?}");
+    assert!(err.msg().contains("Transactional"), "got {err:?}");
+
+    sender
+        .flush_encoded(&self_contained_frame("alpha", 2))
+        .expect("a local row rejection must leave relay mode available");
+}
+
+#[test]
+fn rejected_oversized_relay_does_not_claim_relay_mode() {
+    let mut buffer = Buffer::new_qwp_ws();
+    let oversized = "x".repeat(2048);
+    buffer
+        .table("readings")
+        .unwrap()
+        .column_str("payload", &oversized)
+        .unwrap()
+        .column_i64("_seq", 1)
+        .unwrap();
+    buffer.at(TimestampNanos::new(1)).unwrap();
+    let frame = buffer.encode_self_contained().unwrap();
+    assert!(frame.len() > 1024, "fixture must exceed the sender limit");
+
+    let mut sender = size_limited_connectionless_sender(1024);
+    let err = sender.flush_encoded(&frame).unwrap_err();
+    assert_eq!(err.code(), ErrorCode::InvalidApiCall, "got {err:?}");
+    assert!(err.msg().contains("exceeds"), "got {err:?}");
+    assert_eq!(sender.published_fsn().unwrap(), None);
+
+    let mut row = sender.new_buffer();
+    row.table("readings")
+        .unwrap()
+        .column_i64("_seq", 2)
+        .unwrap();
+    row.at(TimestampNanos::new(2)).unwrap();
+    sender
+        .flush(&mut row)
+        .expect("an oversized relay rejection must leave row mode available");
 }
 
 fn spawn_two_frame_server() -> (u16, thread::JoinHandle<Vec<Vec<u8>>>) {
