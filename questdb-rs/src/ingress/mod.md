@@ -124,9 +124,10 @@ column-major store-and-forward `wait`.
 [`sender.published_fsn()`](Sender::published_fsn),
 [`sender.acked_fsn()`](Sender::acked_fsn) and
 [`sender.completed_fsn()`](Sender::completed_fsn) provide non-blocking polls;
-`completed_fsn` is the only one that reports the server-accepted
-([`AckLevel::Ok`](crate::ingress::AckLevel::Ok)) watermark, which sits between
-publication and durable coverage.
+`completed_fsn` is the only one that can report the server-accepted
+([`AckLevel::Ok`](crate::ingress::AckLevel::Ok)) watermark separately from
+durable coverage — in background progress mode with `request_durable_ack=on`;
+elsewhere the two coincide.
 
 In `manual` progress mode no background thread observes the transport.
 Server-side state — including terminal diagnostics — only becomes visible when the user

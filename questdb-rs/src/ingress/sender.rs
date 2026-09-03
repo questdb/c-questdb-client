@@ -607,10 +607,9 @@ impl Sender {
     ///
     /// Use this when you need non-blocking/pipelined progress tracking on this
     /// sender stream: keep the returned FSN and compare it with
-    /// [`Self::acked_fsn`] for durable coverage, or with
-    /// [`Self::completed_fsn`] to release on server acceptance instead. Use
-    /// [`Self::wait`] instead when you only need a blocking barrier for
-    /// everything published so far.
+    /// [`Self::acked_fsn`], or with [`Self::completed_fsn`] to pick the
+    /// completion level. Use [`Self::wait`] instead when you only need a
+    /// blocking barrier for everything published so far.
     #[cfg(feature = "sync-sender-qwp-ws")]
     pub fn flush_and_get_fsn(&mut self, buf: &mut Buffer) -> Result<Option<u64>> {
         let fsn = self.flush_and_keep_and_get_fsn(buf)?;
@@ -670,7 +669,8 @@ impl Sender {
     /// Non-blocking completion watermark for `ack_level`: the polling
     /// counterpart to [`Self::wait`].
     ///
-    /// * [`AckLevel::Ok`] reports the highest FSN the server has accepted.
+    /// * [`AckLevel::Ok`] reports the highest FSN the server has accepted
+    ///   (background progress mode; see below for manual mode).
     /// * [`AckLevel::Durable`] reports durable-ACK coverage, and is
     ///   equivalent to [`Self::acked_fsn`]. Unlike [`Self::wait`] it is also
     ///   accepted without `request_durable_ack=on`, where there is no durable
@@ -679,20 +679,20 @@ impl Sender {
     /// In background progress mode with durable ACKs `Ok` advances ahead of
     /// `Durable`; otherwise the two coincide. Manual progress mode has no
     /// separate OK tracker, so both levels report the completed watermark.
-    /// Both advance on server ACK or server-side reject-and-continue, so a
-    /// watermark past a rejected frame does not mean its rows were written.
     ///
-    /// `Ok` is never below the `Durable` value read in the same call, but two
+    /// An `Ok` read is never below a `Durable` read taken before it, but two
     /// calls are two snapshots: the background runner can advance `Durable`
     /// in between. Read `Durable` first if you need the pair ordered.
     ///
     /// Use this instead of [`Self::wait`] to keep doing other work rather
     /// than block until a boundary. It makes no progress itself: in manual
     /// mode the watermark only moves if the caller interleaves
-    /// [`Self::drive_once`], and it cannot dispatch buffered rejections to an
-    /// installed error handler the way [`Self::wait`] does — see
-    /// [`Self::qwp_ws_errors_dropped`]. QWP/WebSocket only; other protocols
-    /// return `InvalidApiCall`.
+    /// [`Self::drive_once`]. It also does not dispatch buffered server
+    /// rejections to an installed error handler; that happens on
+    /// [`Self::flush`], [`Self::flush_and_get_fsn`], [`Self::wait`],
+    /// [`Self::drive_once`] and [`Self::close_drain`], and a caller that only
+    /// polls between those can read them with [`Self::poll_qwp_ws_error`].
+    /// QWP/WebSocket only; other protocols return `InvalidApiCall`.
     #[cfg(feature = "sync-sender-qwp-ws")]
     pub fn completed_fsn(&self, ack_level: AckLevel) -> Result<Option<u64>> {
         if !matches!(
@@ -809,9 +809,6 @@ impl Sender {
     /// coverage. Terminal failures surface here as an `Err`.
     #[cfg(feature = "sync-sender-qwp-ws")]
     fn qwp_ws_completed_fsn(&self, ack_level: AckLevel) -> Result<Option<u64>> {
-        // `AckLevel` is `#[non_exhaustive]`; matching it without a wildcard
-        // makes a new variant a compile error here rather than a silently
-        // wrong watermark.
         match &self.handler {
             SyncProtocolHandler::SyncQwpWs(state) => match ack_level {
                 AckLevel::Ok => qwp_ws_ok_fsn_background(state),
