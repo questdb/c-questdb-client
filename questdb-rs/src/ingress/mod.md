@@ -121,8 +121,13 @@ to acknowledge every frame published so far, call
 [`sender.wait()`](Sender::wait) with the desired
 [`AckLevel`](crate::ingress::AckLevel) — the row-major counterpart to the
 column-major store-and-forward `wait`.
-[`sender.published_fsn()`](Sender::published_fsn) and
-[`sender.acked_fsn()`](Sender::acked_fsn) provide non-blocking polls.
+[`sender.published_fsn()`](Sender::published_fsn),
+[`sender.acked_fsn()`](Sender::acked_fsn) and
+[`sender.completed_fsn()`](Sender::completed_fsn) provide non-blocking polls;
+`completed_fsn` is the only one that can report the server-accepted
+([`AckLevel::Ok`](crate::ingress::AckLevel::Ok)) watermark separately from
+durable coverage — in background progress mode with `request_durable_ack=on`;
+elsewhere the two coincide.
 
 Configure `sf_dir` to recover the local publication log after reconnects and
 producer-process restarts. The default `sf_durability=memory` mode relies on

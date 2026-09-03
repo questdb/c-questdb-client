@@ -613,7 +613,8 @@ impl Sender {
     ///
     /// Use this when you need non-blocking/pipelined progress tracking on this
     /// sender stream: keep the returned FSN and compare it with
-    /// [`Self::acked_fsn`]. Use [`Self::wait`] instead when you only need a
+    /// [`Self::acked_fsn`], or with [`Self::completed_fsn`] to pick the
+    /// completion level. Use [`Self::wait`] instead when you only need a
     /// blocking barrier for everything published so far.
     #[cfg(feature = "sync-sender-qwp-ws")]
     pub fn flush_and_get_fsn(&mut self, buf: &mut Buffer) -> Result<Option<u64>> {
@@ -656,7 +657,9 @@ impl Sender {
     /// After [`Self::flush_and_get_fsn`] returns `Some(fsn)`, that publication
     /// boundary has completed once this method returns a value greater than or
     /// equal to `fsn`. Use [`Self::wait`] when you need an explicit
-    /// [`AckLevel::Ok`] or [`AckLevel::Durable`] barrier.
+    /// [`AckLevel::Ok`] or [`AckLevel::Durable`] barrier, or
+    /// [`Self::completed_fsn`] to poll either level without blocking — this
+    /// method is equivalent to `completed_fsn(AckLevel::Durable)`.
     #[cfg(feature = "sync-sender-qwp-ws")]
     pub fn acked_fsn(&self) -> Result<Option<u64>> {
         match &self.handler {
@@ -667,6 +670,47 @@ impl Sender {
                 "acked_fsn is only supported for QWP/WebSocket senders."
             )),
         }
+    }
+
+    /// Non-blocking completion watermark for `ack_level`: the polling
+    /// counterpart to [`Self::wait`].
+    ///
+    /// * [`AckLevel::Ok`] reports the highest FSN the server has accepted
+    ///   (background progress mode; see below for manual mode).
+    /// * [`AckLevel::Durable`] reports durable-ACK coverage, and is
+    ///   equivalent to [`Self::acked_fsn`]. Unlike [`Self::wait`] it is also
+    ///   accepted without `request_durable_ack=on`, where there is no durable
+    ///   ACK to report and the value is acceptance coverage instead.
+    ///
+    /// In background progress mode with durable ACKs `Ok` advances ahead of
+    /// `Durable`; otherwise the two coincide. Manual progress mode has no
+    /// separate OK tracker, so both levels report the completed watermark.
+    ///
+    /// An `Ok` read is never below a `Durable` read taken before it, but two
+    /// calls are two snapshots: the background runner can advance `Durable`
+    /// in between. Read `Durable` first if you need the pair ordered.
+    ///
+    /// Use this instead of [`Self::wait`] to keep doing other work rather
+    /// than block until a boundary. It makes no progress itself: in manual
+    /// mode the watermark only moves if the caller interleaves
+    /// [`Self::drive_once`]. It also does not dispatch buffered server
+    /// rejections to an installed error handler; that happens on
+    /// [`Self::flush`], [`Self::flush_and_get_fsn`], [`Self::wait`],
+    /// [`Self::drive_once`] and [`Self::close_drain`], and a caller that only
+    /// polls between those can read them with [`Self::poll_qwp_ws_error`].
+    /// QWP/WebSocket only; other protocols return `InvalidApiCall`.
+    #[cfg(feature = "sync-sender-qwp-ws")]
+    pub fn completed_fsn(&self, ack_level: AckLevel) -> Result<Option<u64>> {
+        if !matches!(
+            &self.handler,
+            SyncProtocolHandler::SyncQwpWs(_) | SyncProtocolHandler::ManualQwpWs(_)
+        ) {
+            return Err(error::fmt!(
+                InvalidApiCall,
+                "completed_fsn is only supported for QWP/WebSocket senders."
+            ));
+        }
+        self.qwp_ws_completed_fsn(ack_level)
     }
 
     /// Wait until every QWP/WebSocket frame published so far on this sender
@@ -771,20 +815,18 @@ impl Sender {
     /// coverage. Terminal failures surface here as an `Err`.
     #[cfg(feature = "sync-sender-qwp-ws")]
     fn qwp_ws_completed_fsn(&self, ack_level: AckLevel) -> Result<Option<u64>> {
-        match (&self.handler, ack_level) {
-            (SyncProtocolHandler::SyncQwpWs(state), AckLevel::Ok) => {
-                qwp_ws_ok_fsn_background(state)
-            }
-            (SyncProtocolHandler::SyncQwpWs(state), AckLevel::Durable) => {
-                qwp_ws_acked_fsn_background(state)
-            }
-            (SyncProtocolHandler::ManualQwpWs(state), AckLevel::Ok) => qwp_ws_ok_fsn_manual(state),
-            (SyncProtocolHandler::ManualQwpWs(state), AckLevel::Durable) => {
-                qwp_ws_acked_fsn_manual(state)
-            }
+        match &self.handler {
+            SyncProtocolHandler::SyncQwpWs(state) => match ack_level {
+                AckLevel::Ok => qwp_ws_ok_fsn_background(state),
+                AckLevel::Durable => qwp_ws_acked_fsn_background(state),
+            },
+            SyncProtocolHandler::ManualQwpWs(state) => match ack_level {
+                AckLevel::Ok => qwp_ws_ok_fsn_manual(state),
+                AckLevel::Durable => qwp_ws_acked_fsn_manual(state),
+            },
             _ => Err(error::fmt!(
                 InvalidApiCall,
-                "wait is only supported for QWP/WebSocket senders."
+                "completion watermarks are only supported for QWP/WebSocket senders."
             )),
         }
     }
