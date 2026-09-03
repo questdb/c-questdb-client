@@ -10430,7 +10430,8 @@ mod tests {
     /// symbol dictionary with its lookup, and the counters the size hint
     /// reads. Unwinding all of them is what makes a rewound buffer
     /// indistinguishable from one that only ever held the surviving rows, so
-    /// that is what this asserts: same encoded bytes, same size hint.
+    /// that is what this asserts: same encoded bytes, same size hint, both
+    /// right after the rewind and after appending past it.
     #[cfg(feature = "_sender-qwp-ws")]
     #[test]
     fn qwp_ws_columnar_rewind_matches_a_buffer_without_the_discarded_rows() {
@@ -10524,6 +10525,33 @@ mod tests {
                         ws_replay_bytes(&mut buf),
                         expected,
                         "{case}: a rewound buffer must encode exactly the surviving rows"
+                    );
+
+                    // Fixed-width kinds encode by walking row indexes, so a
+                    // leftover cell past the row count is invisible above. It
+                    // only shows once a new row lands on its index, so write
+                    // one more row per table with values no discarded row
+                    // held, and re-create the table the rewind removed.
+                    let next = 100 + kept_rows;
+                    for table in ["trades", "quotes", "late_table"] {
+                        write_row(&mut reference, table, next);
+                        write_row(&mut buf, table, next);
+                    }
+                    assert_eq!(
+                        buf.len(),
+                        buf.recompute_len_slow(),
+                        "{case}: size hint after appending past the rewind"
+                    );
+                    assert_eq!(
+                        buf.len(),
+                        reference.len(),
+                        "{case}: size hint after appending past the rewind"
+                    );
+                    assert_eq!(
+                        ws_replay_bytes(&mut buf),
+                        ws_replay_bytes(&mut reference),
+                        "{case}: rows appended after a rewind must land on \
+                         clean row indexes in every column"
                     );
                 }
             }
