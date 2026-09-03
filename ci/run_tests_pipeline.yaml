@@ -398,16 +398,16 @@ stages:
               pathToPublish: $(Build.ArtifactStagingDirectory)/qdb-log-vs-master-$(Agent.OS).zip
               artifactName: qdb-log-vs-master-$(Agent.OS)
       - job: TestQwpWsFuzz
-        displayName: "QWP/WS add-columns diagnostics (macOS hosted)"
+        displayName: "QWP/WS add-columns filesystem diagnostics (macOS hosted)"
         condition: eq(variables['Build.SourceBranch'], variables['QWP_WS_DIAGNOSTIC_REF'])
         strategy:
           matrix:
-            natural-memory:
+            replica-a:
               imageName: "macOS-15-arm64"
-              qwpMemoryPressure: "natural"
-            warning-memory-pressure:
+              diagnosticReplica: "a"
+            replica-b:
               imageName: "macOS-15-arm64"
-              qwpMemoryPressure: "warn"
+              diagnosticReplica: "b"
         pool:
           vmImage: $(imageName)
         timeoutInMinutes: 90
@@ -431,10 +431,10 @@ stages:
           - bash: bash ci/run_macos_qwp_ws_diagnostics.sh
             displayName: "Reproduce QWP/WS add-columns stall"
             env:
-              QWP_WS_DIAGNOSTIC_RUNS: "3"
+              QWP_WS_DIAGNOSTIC_RUNS: "20"
               QWP_WS_DIAGNOSTICS_DIR: >-
                 $(Build.ArtifactStagingDirectory)/qwp-ws-macos-diagnostics
-              QWP_WS_MEMORY_PRESSURE: $(qwpMemoryPressure)
+              QWP_WS_MEMORY_PRESSURE: natural
           - task: PublishBuildArtifacts@1
             displayName: "Publish macOS host diagnostics"
             condition: always()
@@ -442,7 +442,7 @@ stages:
             inputs:
               pathToPublish: >-
                 $(Build.ArtifactStagingDirectory)/qwp-ws-macos-diagnostics
-              artifactName: qwp-ws-macos-$(qwpMemoryPressure)
+              artifactName: qwp-ws-macos-$(diagnosticReplica)
           # Mirrors ci/run_fuzz_pipeline.yaml: on failure, archive and
           # publish the QuestDB server log so PR reviewers don't have to
           # repro locally. Path comes from system_test/fixture.py:_log_path.
@@ -455,7 +455,7 @@ stages:
               includeRootFolder: false
               archiveType: zip
               archiveFile: >-
-                $(Build.ArtifactStagingDirectory)/qdb-log-$(Agent.OS)-$(qwpMemoryPressure).zip
+                $(Build.ArtifactStagingDirectory)/qdb-log-$(Agent.OS)-$(diagnosticReplica).zip
               quiet: true
           - task: PublishBuildArtifacts@1
             displayName: "Publish QuestDB server log on failure"
@@ -463,8 +463,8 @@ stages:
             continueOnError: true
             inputs:
               pathToPublish: >-
-                $(Build.ArtifactStagingDirectory)/qdb-log-$(Agent.OS)-$(qwpMemoryPressure).zip
-              artifactName: qdb-log-$(Agent.OS)-$(qwpMemoryPressure)
+                $(Build.ArtifactStagingDirectory)/qdb-log-$(Agent.OS)-$(diagnosticReplica).zip
+              artifactName: qdb-log-$(Agent.OS)-$(diagnosticReplica)
 
       # Linux leg on self-hosted hetzner-incus — mirrors the equivalent
       # job in ci/run_fuzz_pipeline.yaml. Pool image is built from

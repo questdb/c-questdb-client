@@ -53,11 +53,25 @@ snapshot_host() {
 
 monitor_pids=()
 pressure_pid_file=""
+trace_pid_file=""
 controller_pid=""
+
+stop_trace() {
+    local pid
+    if [[ -n "$trace_pid_file" && -f "$trace_pid_file" ]]; then
+        pid="$(sed -n '1p' "$trace_pid_file")"
+        if [[ -n "$pid" ]]; then
+            sudo -n kill "$pid" 2>/dev/null || kill "$pid" 2>/dev/null || true
+            wait "$pid" 2>/dev/null || true
+        fi
+    fi
+    trace_pid_file=""
+}
 
 # shellcheck disable=SC2329  # Invoked through the EXIT trap below.
 stop_monitors() {
     local pid
+    stop_trace
     if [[ -n "$pressure_pid_file" && -f "$pressure_pid_file" ]]; then
         pid="$(sed -n '1p' "$pressure_pid_file")"
         if [[ -n "$pid" ]]; then
@@ -106,7 +120,9 @@ for run_number in $(seq 1 "$RUN_COUNT"); do
     run_dir="$DIAG_DIR/run-$run_number"
     ready_file="$run_dir/server-ready"
     go_file="$run_dir/start-test"
+    server_pid_file="$run_dir/questdb.pid"
     pressure_pid_file="$run_dir/memory-pressure.pid"
+    trace_pid_file="$run_dir/fs-usage.pid"
     mkdir -p "$run_dir"
 
     echo "=== run=$run_number pressure=$PRESSURE_MODE seed=$FUZZ_SEED "\
@@ -122,6 +138,18 @@ for run_number in $(seq 1 "$RUN_COUNT"); do
         while [[ ! -f "$ready_file" ]]; do
             sleep 0.1
         done
+        server_pid="$(sed -n '1p' "$server_pid_file")"
+        # The diagnostic directory belongs to the build user; only fs_usage
+        # itself needs elevation, not this output redirection.
+        # shellcheck disable=SC2024
+        sudo -n fs_usage -w -f filesys "$server_pid" \
+            >"$run_dir/fs-usage.log" 2>&1 &
+        fs_usage_pid=$!
+        echo "$fs_usage_pid" >"$trace_pid_file"
+        sleep 1
+        if ! sudo -n kill -0 "$fs_usage_pid" 2>/dev/null; then
+            touch "$run_dir/fs-usage-helper-exited"
+        fi
         if [[ "$PRESSURE_MODE" == "warn" ]]; then
             memory_pressure -l warn -s 300 \
                 >"$run_dir/memory-pressure.log" 2>&1 &
@@ -149,6 +177,7 @@ for run_number in $(seq 1 "$RUN_COUNT"); do
     QWP_WS_FUZZ_DIAGNOSTICS=1 \
     QWP_WS_FUZZ_READY_FILE="$ready_file" \
     QWP_WS_FUZZ_GO_FILE="$go_file" \
+    QWP_WS_FUZZ_PID_FILE="$server_pid_file" \
         python3 system_test/test.py run --repo ./questdb \
             TestQwpWsFuzz.test_add_columns -v \
             2>&1 | tee -a "$DIAG_DIR/test.log"
@@ -156,6 +185,12 @@ for run_number in $(seq 1 "$RUN_COUNT"); do
     if [[ "$test_rc" -eq 0 && \
           -f "$run_dir/memory-pressure-helper-exited" ]]; then
         echo "memory_pressure exited before the diagnostic gate" \
+            | tee -a "$DIAG_DIR/test.log"
+        test_rc=2
+    fi
+    if [[ "$test_rc" -eq 0 && \
+          -f "$run_dir/fs-usage-helper-exited" ]]; then
+        echo "fs_usage exited before the diagnostic gate" \
             | tee -a "$DIAG_DIR/test.log"
         test_rc=2
     fi
@@ -172,6 +207,7 @@ for run_number in $(seq 1 "$RUN_COUNT"); do
     fi
     wait "$controller_pid" 2>/dev/null || true
     controller_pid=""
+    stop_trace
     if [[ -f "$pressure_pid_file" ]]; then
         pressure_pid="$(sed -n '1p' "$pressure_pid_file")"
         kill "$pressure_pid" 2>/dev/null || true

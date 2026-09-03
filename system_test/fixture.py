@@ -309,6 +309,9 @@ class QuestDbFixtureBase:
     def capture_timeout_diagnostics(self, test_name):
         pass
 
+    def process_pid(self):
+        return None
+
     def http_headers(self):
         if not getattr(self, 'http_auth', False):
             return {}
@@ -515,6 +518,11 @@ class QuestDbFixture(QuestDbFixtureBase):
         sys.stderr.write(textwrap.indent(log, '    '))
         sys.stderr.write('\n\n')
 
+    def process_pid(self):
+        if self._proc is None or self._proc.poll() is not None:
+            return None
+        return self._proc.pid
+
     def start(self):
         if self.http_server_port is None:
             ports = discover_avail_ports(3)
@@ -704,6 +712,17 @@ class QuestDbFixture(QuestDbFixtureBase):
     def capture_timeout_diagnostics(self, test_name):
         sys.stderr.write(
             f'Capturing QuestDB diagnostics after timeout in {test_name}.\n')
+
+        # Request the dump before making another network call. If the timeout
+        # is transient, even the one-second /ping probe below can otherwise
+        # miss the threads while they are still blocked.
+        dump_requested = self._request_thread_dump()
+        if dump_requested:
+            sys.stderr.write(
+                f'Requested a JVM thread dump in `{self._log_path}`.\n')
+        else:
+            sys.stderr.write('Could not request a JVM thread dump.\n')
+
         req = urllib.request.Request(
             f'http://127.0.0.1:{self.http_server_port}/ping',
             headers=self.http_headers(),
@@ -715,12 +734,8 @@ class QuestDbFixture(QuestDbFixtureBase):
         except Exception as e:
             sys.stderr.write(f'QuestDB /ping after timeout failed: {e!r}.\n')
 
-        if self._request_thread_dump():
-            sys.stderr.write(
-                f'Requested a JVM thread dump in `{self._log_path}`.\n')
+        if dump_requested:
             time.sleep(2)
-        else:
-            sys.stderr.write('Could not request a JVM thread dump.\n')
 
     def stop(self, wait_timeout_sec=30):
         if self._tls_proxy:

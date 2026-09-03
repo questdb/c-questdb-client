@@ -158,7 +158,7 @@ class AlterThreadTransientErrorTest(unittest.TestCase):
     (Windows mid-bounce) were classified as fatal alter failures."""
 
     @staticmethod
-    def _make_thread(sql_query_raises):
+    def _make_thread(sql_query_raises, on_transient_network_error=None):
         """Build an AlterThread without starting it. `sql_query_raises`
         is the exception class to raise on the next SQL call."""
         list_columns_result = [{'name': 'price', 'type': 'DOUBLE'}]
@@ -186,7 +186,8 @@ class AlterThreadTransientErrorTest(unittest.TestCase):
             stop_event=threading.Event(),
             record_failure=record_failure,
             failure_counter=failure_counter,
-            log=lambda _msg: None)
+            log=lambda _msg: None,
+            on_transient_network_error=on_transient_network_error)
         return thread, failure_counter, failures
 
     def _assert_transient(self, exc):
@@ -215,6 +216,20 @@ class AlterThreadTransientErrorTest(unittest.TestCase):
         # The exact failure that took Windows CI down:
         #   `fuzz alter: unexpected failure on weather2.location -> VARCHAR: timed out`
         self._assert_transient(TimeoutError('timed out'))
+
+    def test_timeout_notifies_diagnostics_callback(self):
+        observed = []
+        thread, counter, failures = self._make_thread(
+            TimeoutError('timed out'), observed.append)
+
+        result = thread._try_one_alter('weather0')
+
+        self.assertFalse(result)
+        self.assertEqual(counter[0], 0)
+        self.assertEqual(failures, [])
+        self.assertEqual(len(observed), 1)
+        self.assertIn('ALTER TABLE', observed[0])
+        self.assertIn('TimeoutError: timed out', observed[0])
 
     def test_url_error_is_swallowed(self):
         self._assert_transient(urllib.error.URLError('Connection refused'))

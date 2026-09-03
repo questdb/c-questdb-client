@@ -169,11 +169,16 @@ class TimeoutDiagnosticsTest(unittest.TestCase):
             qdb._proc = mock.Mock()
             qdb._proc.poll.return_value = None
             stderr = io.StringIO()
+
+            def timeout_after_dump(*_args, **_kwargs):
+                self.assertTrue(qdb._proc.send_signal.called)
+                raise TimeoutError('timed out')
+
             with contextlib.redirect_stderr(stderr), \
                     mock.patch.object(
                         fixture.urllib.request,
                         'urlopen',
-                        side_effect=TimeoutError('timed out')), \
+                        side_effect=timeout_after_dump), \
                     mock.patch.object(fixture.time, 'sleep'):
                 qdb.capture_timeout_diagnostics('example.test')
 

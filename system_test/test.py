@@ -2624,21 +2624,29 @@ class TestQwpWsFuzz(QwpWsTestSupport, unittest.TestCase):
         diagnostics_enabled = (
             os.environ.get('QWP_WS_FUZZ_DIAGNOSTICS') == '1')
 
-        def record_failure(msg: str):
-            capture_diagnostics = False
+        def capture_diagnostics(reason: str):
+            if not diagnostics_enabled:
+                return
+            should_capture = False
             with fail_lock:
-                failure_messages.append(msg)
-                failure_counter[0] += 1
-                if diagnostics_enabled and not diagnostics_requested[0]:
+                if not diagnostics_requested[0]:
                     diagnostics_requested[0] = True
-                    capture_diagnostics = True
-            self._log(msg)
-            if capture_diagnostics:
+                    should_capture = True
+            if should_capture:
+                self._log(
+                    f'triggering immediate QuestDB diagnostics: {reason}')
                 try:
                     QDB_FIXTURE.capture_timeout_diagnostics(self.id())
                 except Exception as e:  # noqa: BLE001 — diagnostics are best effort
                     self._log(
                         f'immediate QuestDB diagnostics failed: {e!r}')
+
+        def record_failure(msg: str):
+            with fail_lock:
+                failure_messages.append(msg)
+                failure_counter[0] += 1
+            self._log(msg)
+            capture_diagnostics(msg)
 
         if fuzz.max_bounces > 0 and not (
                 hasattr(QDB_FIXTURE, 'stop') and hasattr(QDB_FIXTURE, 'start')):
@@ -2681,7 +2689,8 @@ class TestQwpWsFuzz(QwpWsTestSupport, unittest.TestCase):
                     stop_event=stop_event,
                     record_failure=record_failure,
                     failure_counter=failure_counter,
-                    log=self._log)
+                    log=self._log,
+                    on_transient_network_error=capture_diagnostics)
                 alter_thread.start()
 
             bounce_thread = None
@@ -4554,11 +4563,19 @@ def run_with_fixtures(args):
                 QDB_FIXTURE.drop_all_tables()
                 ready_file = os.environ.get('QWP_WS_FUZZ_READY_FILE')
                 go_file = os.environ.get('QWP_WS_FUZZ_GO_FILE')
+                pid_file = os.environ.get('QWP_WS_FUZZ_PID_FILE')
                 if ready_file or go_file:
                     if not ready_file or not go_file:
                         raise RuntimeError(
                             'QWP_WS_FUZZ_READY_FILE and '
                             'QWP_WS_FUZZ_GO_FILE must be set together')
+                    if pid_file:
+                        server_pid = QDB_FIXTURE.process_pid()
+                        if server_pid is None:
+                            raise RuntimeError(
+                                'Managed QuestDB process PID is unavailable')
+                        pathlib.Path(pid_file).write_text(
+                            f'{server_pid}\n', encoding='ascii')
                     pathlib.Path(ready_file).touch()
                     retry(
                         lambda: pathlib.Path(go_file).exists(),

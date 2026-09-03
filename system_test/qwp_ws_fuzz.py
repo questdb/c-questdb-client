@@ -1336,7 +1336,8 @@ class AlterThread(threading.Thread):
             stop_event: threading.Event,
             record_failure,
             failure_counter: list,
-            log):
+            log,
+            on_transient_network_error=None):
         super().__init__(name='qwp-ws-fuzz-alter', daemon=True)
         self._sql_query = sql_query
         self._list_columns = list_columns
@@ -1348,7 +1349,13 @@ class AlterThread(threading.Thread):
         self._record_failure = record_failure
         self._failure_counter = failure_counter
         self._log = log
+        self._on_transient_network_error = on_transient_network_error
         self.applied_conversions = 0
+
+    def _notify_transient_network_error(self, operation: str, exc):
+        if self._on_transient_network_error is not None:
+            self._on_transient_network_error(
+                f'{operation}: {type(exc).__name__}: {exc}')
 
     def run(self):
         remaining = self._convert_budget
@@ -1370,6 +1377,8 @@ class AlterThread(threading.Thread):
         except Exception as e:  # noqa: BLE001 — fixture surfaces a few error shapes
             if is_transient_network_error(e):
                 # Server is mid-bounce; the next iteration will retry.
+                self._notify_transient_network_error(
+                    f'list_columns({table_name!r})', e)
                 return False
             self._log(
                 f'fuzz alter: list_columns({table_name!r}) failed: {e}')
@@ -1404,6 +1413,7 @@ class AlterThread(threading.Thread):
                     self._log(
                         f'fuzz alter: transient network error '
                         f'({type(e).__name__}: {e}); retrying')
+                    self._notify_transient_network_error(stmt, e)
                     return False
                 message = str(e)
                 if any(p in message.lower() for p in _ALTER_TOLERATED_PATTERNS):
