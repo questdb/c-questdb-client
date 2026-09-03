@@ -259,9 +259,9 @@ void questdb_oidc_auth_free(questdb_oidc_auth* auth);
  * waits, even while a callback is in flight elsewhere. Unlike `sign_in`,
  * `token` and `clear`, it is never rejected as callback re-entry.
  *
- * The in-memory credential is dropped on every path, including the skipped-drain
- * one; only the wait is skipped. The persisted entry is left behind either way
- * -- see `questdb_oidc_auth_clear`.
+ * The in-memory credential is dropped on every path, including the
+ * skipped-drain one; only the wait is skipped. The persisted entry is
+ * left behind either way -- see `questdb_oidc_auth_clear`.
  */
 QUESTDB_CLIENT_API
 bool questdb_oidc_auth_close(

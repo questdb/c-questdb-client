@@ -502,6 +502,7 @@ fn a_401_with_an_unchanged_token_is_not_retried() {
     );
 }
 
+#[cfg(feature = "sync-sender-qwp-ws")]
 #[test]
 fn qwp_ws_token_provider_conflicts_with_partial_basic_auth() {
     // The WS twin of the HTTP test below. The pre-check was HTTP-only, so a WS

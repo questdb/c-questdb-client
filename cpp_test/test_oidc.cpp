@@ -259,8 +259,7 @@ TEST_CASE("OIDC C++ event handler ownership is released exactly once")
 
         // Replacing the handler must not release the first capture twice, nor
         // lose track of it.
-        builder.event_handler(
-            [](const questdb::oidc::event_view&) noexcept {});
+        builder.event_handler([](const questdb::oidc::event_view&) noexcept {});
         CHECK(releases <= 1);
     }
     // Exactly one release for the one capturing handler: no leak, no double.
