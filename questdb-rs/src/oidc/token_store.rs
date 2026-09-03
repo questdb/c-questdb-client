@@ -1134,13 +1134,15 @@ impl TokenStore for FileTokenStore {
             // a user who asked for it should learn it is unavailable. The caller
             // treats a save failure as a warning and still completes the
             // sign-in, so this costs no functionality.
-            if !may_persist(trusted, &self.directory) {
+            if !may_persist(trusted, &self.directory, &self.untrusted_sentinel()) {
                 return Err(Box::new(std::io::Error::new(
                     std::io::ErrorKind::PermissionDenied,
                     format!(
                         "refusing to persist an OIDC token into {}: the directory is \
                          writable by users other than its owner and could not be \
-                         restricted, so anything read back from it is not trusted. \
+                         restricted, or it is still marked untrusted from an earlier \
+                         run whose cleanup could not complete, so anything read back \
+                         from it is not trusted. \
                          Persisting would leave a plaintext refresh token on disk that \
                          this client will never use. This is usual on a filesystem that \
                          cannot represent POSIX permissions (WSL drvfs without metadata, \
@@ -1787,8 +1789,20 @@ fn path_is_definitely_absent(path: &Path) -> bool {
 /// without `metadata`, CIFS/SMB with a fixed `file_mode`, vfat/exFAT. There
 /// every operation is untrusted forever, and persisting would keep writing a
 /// plaintext refresh token that `load` will always refuse to read back.
-fn may_persist(trusted: bool, dir: &Path) -> bool {
-    trusted || directory_is_owner_only(dir)
+/// The sentinel half of the verdict has to be re-checked too, not just the
+/// permission half. `trusted` is `!was_other_writable && sentinel_absent`
+/// (`prepare_directory_trust`), and the sweep that clears the sentinel lifts it
+/// only `if swept_clean` -- so a `read_dir` error, an undeletable entry, or a
+/// non-empty directory squatting at the reserved name leaves it in place
+/// permanently. The retighten has already run by then, so
+/// `directory_is_owner_only` is true and the permission half alone says "go".
+/// That combination reproduces the exact fail-open this function exists to
+/// close: `load` returns `Ok(None)` for the untrusted directory while `save`
+/// keeps writing a plaintext refresh token into it, forever, with the device
+/// flow re-running on every start. Matching `with_directory_lock`'s own
+/// short-lease test keeps the two in step.
+fn may_persist(trusted: bool, dir: &Path, sentinel: &Path) -> bool {
+    trusted || (directory_is_owner_only(dir) && path_is_definitely_absent(sentinel))
 }
 
 #[cfg(unix)]

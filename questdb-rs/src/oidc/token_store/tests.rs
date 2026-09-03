@@ -717,23 +717,53 @@ fn persisting_is_refused_only_when_the_directory_cannot_be_restricted() {
     // through the store itself.
     use std::os::unix::fs::PermissionsExt;
     let dir = TempDir::new().unwrap();
+    let sentinel = dir.path().join(UNTRUSTED_SENTINEL_NAME);
 
     std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
     assert!(
-        may_persist(false, dir.path()),
+        may_persist(false, dir.path(), &sentinel),
         "a repaired directory must still be writable despite the entry verdict"
     );
-    assert!(may_persist(true, dir.path()));
+    assert!(may_persist(true, dir.path(), &sentinel));
 
     std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o777)).unwrap();
     assert!(
-        !may_persist(false, dir.path()),
+        !may_persist(false, dir.path(), &sentinel),
         "a plaintext token would be persisted where load will never trust it"
     );
     // A trusted verdict still wins: nothing was found wrong with the contents.
-    assert!(may_persist(true, dir.path()));
+    assert!(may_persist(true, dir.path(), &sentinel));
 
     std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+
+    // A stuck sentinel on a *repaired* directory is the fail-open this guards.
+    // The sweep lifts the sentinel only `if swept_clean`, so a `read_dir`
+    // error, an undeletable entry, or a non-empty directory squatting at the
+    // reserved name leaves it behind for good -- while the retighten has
+    // already made the permission half say "go". `load` refuses such a
+    // directory (`with_directory_lock` folds the same sentinel test into its
+    // trust verdict), so persisting would write a plaintext refresh token that
+    // is never read back, on every sign-in, silently.
+    std::fs::write(&sentinel, b"").unwrap();
+    assert!(
+        !may_persist(false, dir.path(), &sentinel),
+        "a repaired directory that is still marked untrusted must not be \
+         persisted into: load will refuse everything written there"
+    );
+    // Still fail-closed when the squatter is a directory `remove_dir` cannot
+    // displace, which is the shape `mark_untrusted` explicitly cannot clear.
+    std::fs::remove_file(&sentinel).unwrap();
+    std::fs::create_dir(&sentinel).unwrap();
+    std::fs::write(sentinel.join("squatter"), b"").unwrap();
+    assert!(
+        !may_persist(false, dir.path(), &sentinel),
+        "an undisplaceable sentinel must keep persistence closed"
+    );
+    // A trusted entry verdict is unreachable with a sentinel present -- it is
+    // one of that verdict's own conjuncts -- so there is nothing to assert for
+    // `true` here beyond the short-circuit, which the cases above cover.
+    std::fs::remove_dir_all(&sentinel).unwrap();
+    assert!(may_persist(false, dir.path(), &sentinel));
 }
 
 #[cfg(unix)]
