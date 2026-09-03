@@ -608,6 +608,7 @@ fn test_clone_preserves_marker_rewind_state() -> TestResult {
 /// it must disappear, and a table written both before and after must keep only
 /// the earlier rows. Columns introduced after the bookmark must go too, so
 /// reusing the table afterwards must not see them.
+#[cfg(feature = "_sender-qwp-ws")]
 #[test]
 fn test_bookmark_rewinds_every_table_it_spans() -> TestResult {
     // QWP/WS specifically: this is the variant whose rewind point is captured
@@ -655,6 +656,7 @@ fn test_bookmark_rewinds_every_table_it_spans() -> TestResult {
 /// public signal that stays honest is `len()`, the encoded size a flush would
 /// produce: a buffer still holding leftovers reports more than one that only
 /// ever held the surviving rows.
+#[cfg(feature = "_sender-qwp-ws")]
 #[test]
 fn test_rewind_discards_every_row_after_the_rewind_point() -> TestResult {
     fn write_rows(buffer: &mut Buffer, from: i64, to: i64) -> TestResult {
