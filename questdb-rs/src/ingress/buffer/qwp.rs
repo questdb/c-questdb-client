@@ -2706,46 +2706,8 @@ struct QwpWsDecimalCell {
 }
 
 #[cfg(feature = "_sender-qwp-ws")]
-fn pop_value_cell_for_row<T: Copy>(cells: &mut Vec<QwpWsCell<T>>, row_idx: u32) -> bool {
-    if cells.last().is_some_and(|cell| cell.row_idx == row_idx) {
-        cells.pop();
-        true
-    } else {
-        false
-    }
-}
-
-#[cfg(feature = "_sender-qwp-ws")]
-fn pop_slice_cell_for_row(cells: &mut Vec<QwpWsSliceCell>, row_idx: u32) -> Option<QwpWsSliceCell> {
-    if cells.last().is_some_and(|cell| cell.row_idx == row_idx) {
-        cells.pop()
-    } else {
-        None
-    }
-}
-
-#[cfg(feature = "_sender-qwp-ws")]
-fn pop_symbol_cell_for_row(
-    cells: &mut Vec<QwpWsSymbolCell>,
-    row_idx: u32,
-) -> Option<QwpWsSymbolCell> {
-    if cells.last().is_some_and(|cell| cell.row_idx == row_idx) {
-        cells.pop()
-    } else {
-        None
-    }
-}
-
-#[cfg(feature = "_sender-qwp-ws")]
-fn pop_decimal_cell_for_row(
-    cells: &mut Vec<QwpWsDecimalCell>,
-    row_idx: u32,
-) -> Option<QwpWsDecimalCell> {
-    if cells.last().is_some_and(|cell| cell.row_idx == row_idx) {
-        cells.pop()
-    } else {
-        None
-    }
+fn pop_value_cell_from<T: Copy>(cells: &mut Vec<QwpWsCell<T>>, from: u32) -> Option<bool> {
+    cells.pop_if(|cell| cell.row_idx >= from).map(|_| true)
 }
 
 #[cfg(feature = "_sender-qwp-ws")]
@@ -2963,22 +2925,21 @@ impl QwpWsColumnarBuffer {
         // Drop tables added after the bookmark, then unwind each surviving table
         // to the row and column counts it had. `restore` truncates every
         // column's data back to `row_count`, so no per-column state is needed.
-        self.tables.truncate(snapshot.tables_len);
-        for (table, mark) in self.tables.iter_mut().zip(snapshot.table_marks) {
-            table.restore(mark);
-        }
-        self.rebuild_table_lookup();
-        self.current_table_idx = snapshot.current_table_idx;
-        self.state = snapshot.state;
+        self.truncate_tables(snapshot.tables_len);
         let table_count = self.tables.len();
         let size_hint = self
             .size_hint
             .get_mut()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         size_hint.truncate(table_count);
-        for idx in 0..table_count {
-            size_hint.mark_dirty(idx);
+        let restored = self.tables.iter_mut().zip(snapshot.table_marks);
+        for (idx, (table, mark)) in restored.enumerate() {
+            if table.restore(mark) {
+                size_hint.mark_dirty(idx);
+            }
         }
+        self.current_table_idx = snapshot.current_table_idx;
+        self.state = snapshot.state;
         self.bookmark.clear();
         Ok(())
     }
@@ -3667,8 +3628,7 @@ impl QwpWsColumnarBuffer {
             return;
         };
         self.tables[table_idx].restore(row_mark.table_mark);
-        self.tables.truncate(row_mark.tables_len);
-        self.rebuild_table_lookup();
+        self.truncate_tables(row_mark.tables_len);
         self.current_table_idx = row_mark.current_table_idx;
         self.state = row_mark.state;
         let table_count = self.tables.len();
@@ -3679,6 +3639,13 @@ impl QwpWsColumnarBuffer {
         size_hint.truncate(table_count);
         if table_idx < table_count {
             size_hint.mark_dirty(table_idx);
+        }
+    }
+
+    fn truncate_tables(&mut self, tables_len: usize) {
+        if self.tables.len() > tables_len {
+            self.tables.truncate(tables_len);
+            self.rebuild_table_lookup();
         }
     }
 
@@ -3931,17 +3898,24 @@ impl QwpWsTableBuffer {
         }
     }
 
-    fn restore(&mut self, mark: QwpWsTableRollbackMark) {
+    /// Returns whether anything past the mark was discarded.
+    fn restore(&mut self, mark: QwpWsTableRollbackMark) -> bool {
+        let changed = self.row_count != mark.row_count
+            || self.columns.len() != mark.columns_len
+            || self.in_progress != mark.in_progress;
         for column in &mut self.columns[..mark.columns_len] {
-            column.rollback_row(mark.row_count);
+            column.rollback_rows_from(mark.row_count);
         }
-        self.columns.truncate(mark.columns_len);
+        if self.columns.len() > mark.columns_len {
+            self.columns.truncate(mark.columns_len);
+            self.rebuild_column_lookup();
+        }
         self.row_count = mark.row_count;
         self.in_progress = mark.in_progress;
         self.in_progress_column_count = mark.in_progress_column_count;
         self.column_access_cursor = mark.column_access_cursor;
         self.row_mark = None;
-        self.rebuild_column_lookup();
+        changed
     }
 
     #[inline(always)]
@@ -4085,31 +4059,44 @@ impl QwpWsColumnBuffer {
         self.values.capacity()
     }
 
-    fn rollback_row(&mut self, row_idx: u32) {
-        if self.last_written_row != Some(row_idx) {
-            return;
-        }
-        if self.values.rollback_row(row_idx) {
-            self.non_null_count -= 1;
-        }
-        self.rebuild_symbol_size_hint();
-        self.last_written_row = None;
-    }
-
-    fn rebuild_symbol_size_hint(&mut self) {
-        let QwpWsColumnValues::Symbol { cells, dict, .. } = &self.values else {
-            self.symbol_cells_encoded_len = 0;
-            self.symbol_dict_encoded_len = 0;
-            return;
+    fn rollback_rows_from(&mut self, from: u32) {
+        let dict_len_before = match &self.values {
+            QwpWsColumnValues::Symbol { cells, dict, .. } => {
+                for cell in cells.iter().rev().take_while(|cell| cell.row_idx >= from) {
+                    self.symbol_cells_encoded_len -= qwp_varint_size(cell.local_id as u64);
+                    if cell.is_new {
+                        let entry = &dict[cell.local_id as usize];
+                        self.symbol_dict_encoded_len -= qwp_string_byte_len(entry.len as usize);
+                    }
+                }
+                dict.len()
+            }
+            _ => 0,
         };
-        self.symbol_cells_encoded_len = cells
-            .iter()
-            .map(|cell| qwp_varint_size(cell.local_id as u64))
-            .sum();
-        self.symbol_dict_encoded_len = dict
-            .iter()
-            .map(|entry| qwp_string_byte_len(entry.len as usize))
-            .sum();
+        while let Some(non_null) = self.values.pop_cell_from(from) {
+            if non_null {
+                self.non_null_count -= 1;
+            }
+        }
+        match &mut self.values {
+            // One lookup sweep per rewind rather than one per popped entry.
+            QwpWsColumnValues::Symbol { dict, lookup, .. } if dict.len() < dict_len_before => {
+                lookup.retain_local_ids_below(dict.len());
+            }
+            // The scale is pinned by the first non-null value, so it only
+            // unpins once none remain.
+            QwpWsColumnValues::Decimal { decimal_scale, .. }
+            | QwpWsColumnValues::Decimal64 { decimal_scale, .. }
+            | QwpWsColumnValues::Decimal128 { decimal_scale, .. }
+                if self.non_null_count == 0 =>
+            {
+                *decimal_scale = QWP_DECIMAL_SCALE_UNSET;
+            }
+            _ => {}
+        }
+        if self.last_written_row.is_some_and(|row| row >= from) {
+            self.last_written_row = None;
+        }
     }
 
     fn uses_null_bitmap(&self, row_count: usize) -> bool {
@@ -4707,97 +4694,56 @@ impl QwpWsColumnValues {
         }
     }
 
-    fn rollback_row(&mut self, row_idx: u32) -> bool {
+    /// Pops the tail cell if it belongs to row `from` or a later one, reporting
+    /// whether it was non-null. `None` means no cell was popped.
+    fn pop_cell_from(&mut self, from: u32) -> Option<bool> {
         match self {
-            Self::Bool { cells } => pop_value_cell_for_row(cells, row_idx),
-            Self::I8 { cells } => pop_value_cell_for_row(cells, row_idx),
-            Self::I16 { cells } => pop_value_cell_for_row(cells, row_idx),
-            Self::I32 { cells } => pop_value_cell_for_row(cells, row_idx),
-            Self::I64 { cells } => pop_value_cell_for_row(cells, row_idx),
-            Self::F32 { cells } => pop_value_cell_for_row(cells, row_idx),
-            Self::F64 { cells } => pop_value_cell_for_row(cells, row_idx),
-            Self::TimestampMicros { cells } => pop_value_cell_for_row(cells, row_idx),
-            Self::TimestampNanos { cells } => pop_value_cell_for_row(cells, row_idx),
+            Self::Bool { cells } => pop_value_cell_from(cells, from),
+            Self::I8 { cells } => pop_value_cell_from(cells, from),
+            Self::I16 { cells } => pop_value_cell_from(cells, from),
+            Self::I32 { cells } => pop_value_cell_from(cells, from),
+            Self::I64 { cells } => pop_value_cell_from(cells, from),
+            Self::F32 { cells } => pop_value_cell_from(cells, from),
+            Self::F64 { cells } => pop_value_cell_from(cells, from),
+            Self::TimestampMicros { cells } => pop_value_cell_from(cells, from),
+            Self::TimestampNanos { cells } => pop_value_cell_from(cells, from),
             Self::String { cells, data }
             | Self::DoubleArray { cells, data }
-            | Self::Long256 { cells, data } => {
-                if let Some(cell) = pop_slice_cell_for_row(cells, row_idx) {
-                    data.truncate(cell.offset as usize);
-                    true
-                } else {
-                    false
-                }
+            | Self::Long256 { cells, data }
+            | Self::Binary { cells, data }
+            | Self::LongArray { cells, data } => {
+                let cell = cells.pop_if(|cell| cell.row_idx >= from)?;
+                data.truncate(cell.offset as usize);
+                Some(true)
             }
-            Self::Uuid { cells } => pop_value_cell_for_row(cells, row_idx),
-            Self::Ipv4 { cells } => pop_value_cell_for_row(cells, row_idx),
-            Self::Date { cells } => pop_value_cell_for_row(cells, row_idx),
-            Self::Char { cells } => pop_value_cell_for_row(cells, row_idx),
-            Self::Binary { cells, data } => {
-                if let Some(cell) = pop_slice_cell_for_row(cells, row_idx) {
-                    data.truncate(cell.offset as usize);
-                    true
-                } else {
-                    false
-                }
-            }
+            Self::Uuid { cells } => pop_value_cell_from(cells, from),
+            Self::Ipv4 { cells } => pop_value_cell_from(cells, from),
+            Self::Date { cells } => pop_value_cell_from(cells, from),
+            Self::Char { cells } => pop_value_cell_from(cells, from),
             Self::Geohash { cells, .. } => {
                 // Rolling back the last value leaves `cells` empty; the pinned
                 // precision is retained so a reused or partially-rolled-back
                 // column keeps a valid precision. The next value re-pins via
                 // `cells.is_empty()` in `append_geohash`.
-                pop_value_cell_for_row(cells, row_idx)
-            }
-            Self::LongArray { cells, data } => {
-                if let Some(cell) = pop_slice_cell_for_row(cells, row_idx) {
-                    data.truncate(cell.offset as usize);
-                    true
-                } else {
-                    false
-                }
+                pop_value_cell_from(cells, from)
             }
             Self::Symbol {
-                cells,
-                dict,
-                lookup,
-                data,
+                cells, dict, data, ..
             } => {
-                let Some(cell) = pop_symbol_cell_for_row(cells, row_idx) else {
-                    return false;
-                };
+                let cell = cells.pop_if(|cell| cell.row_idx >= from)?;
                 if cell.is_new
                     && let Some(entry) = dict.pop()
                 {
                     debug_assert_eq!(cell.local_id as usize, dict.len());
                     data.truncate(entry.offset as usize);
-                    lookup.retain_local_ids_below(dict.len());
                 }
-                true
+                Some(true)
             }
-            Self::Decimal {
-                cells,
-                decimal_scale,
-            }
-            | Self::Decimal64 {
-                cells,
-                decimal_scale,
-            }
-            | Self::Decimal128 {
-                cells,
-                decimal_scale,
-            } => {
-                let Some(cell) = pop_decimal_cell_for_row(cells, row_idx) else {
-                    return false;
-                };
-                if cell.value.is_some() {
-                    *decimal_scale = cells
-                        .iter()
-                        .filter_map(|cell| cell.value.map(|value| value.scale))
-                        .max()
-                        .unwrap_or(QWP_DECIMAL_SCALE_UNSET);
-                    true
-                } else {
-                    false
-                }
+            Self::Decimal { cells, .. }
+            | Self::Decimal64 { cells, .. }
+            | Self::Decimal128 { cells, .. } => {
+                let cell = cells.pop_if(|cell| cell.row_idx >= from)?;
+                Some(cell.value.is_some())
             }
         }
     }
@@ -10582,6 +10528,94 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[cfg(feature = "_sender-qwp-ws")]
+    #[test]
+    fn qwp_ws_columnar_rewind_recomputes_only_the_tables_it_unwound() {
+        let mut buf = QwpWsColumnarBuffer::new(127);
+        for table in ["a", "b", "c"] {
+            buf.table(table)
+                .unwrap()
+                .column_i64("value", 1)
+                .unwrap()
+                .at_now()
+                .unwrap();
+        }
+        assert_eq!(buf.len(), buf.recompute_len_slow());
+        let recomputed = buf.size_hint_recomputed_tables();
+
+        buf.set_marker().unwrap();
+        buf.rewind_to_marker().unwrap();
+        assert_eq!(buf.len(), buf.recompute_len_slow());
+        assert_eq!(
+            buf.size_hint_recomputed_tables(),
+            recomputed,
+            "a rewind that discards nothing leaves every table valid"
+        );
+
+        buf.set_marker().unwrap();
+        for i in 0..3 {
+            buf.table("b")
+                .unwrap()
+                .column_i64("value", i)
+                .unwrap()
+                .at_now()
+                .unwrap();
+        }
+        buf.rewind_to_marker().unwrap();
+        assert_eq!(buf.len(), buf.recompute_len_slow());
+        assert_eq!(
+            buf.size_hint_recomputed_tables(),
+            recomputed + 1,
+            "only the table the rewind unwound is recomputed"
+        );
+    }
+
+    /// The decimal scale is pinned by the first non-null value a column sees.
+    /// A rewind that discards that value must unpin it, and one that keeps it
+    /// must not, so that the next value encodes against the right scale.
+    #[cfg(feature = "_sender-qwp-ws")]
+    #[test]
+    fn qwp_ws_columnar_rewind_keeps_decimal_scale_pinned_by_surviving_rows() {
+        fn write_dec(buf: &mut QwpWsColumnarBuffer, value: &str) {
+            buf.table("trades")
+                .unwrap()
+                .column_dec("price", value)
+                .unwrap()
+                .at_now()
+                .unwrap();
+        }
+
+        // Every non-null value is discarded: the scale unpins, and "1.23"
+        // pins scale 2 afresh.
+        let mut reference = QwpWsColumnarBuffer::new(127);
+        write_dec(&mut reference, "NaN");
+        write_dec(&mut reference, "1.23");
+
+        let mut buf = QwpWsColumnarBuffer::new(127);
+        write_dec(&mut buf, "NaN");
+        buf.set_marker().unwrap();
+        write_dec(&mut buf, "1.2");
+        write_dec(&mut buf, "3.4");
+        buf.rewind_to_marker().unwrap();
+        write_dec(&mut buf, "1.23");
+        assert_eq!(ws_replay_bytes(&mut buf), ws_replay_bytes(&mut reference));
+
+        // The pinning value survives: scale 1 stays pinned and "5.6" encodes
+        // against it, exactly as if the discarded rows had never been written.
+        let mut reference = QwpWsColumnarBuffer::new(127);
+        write_dec(&mut reference, "1.2");
+        write_dec(&mut reference, "5.6");
+
+        let mut buf = QwpWsColumnarBuffer::new(127);
+        write_dec(&mut buf, "1.2");
+        buf.set_marker().unwrap();
+        write_dec(&mut buf, "3.45");
+        write_dec(&mut buf, "NaN");
+        buf.rewind_to_marker().unwrap();
+        write_dec(&mut buf, "5.6");
+        assert_eq!(ws_replay_bytes(&mut buf), ws_replay_bytes(&mut reference));
     }
 
     #[cfg(feature = "_sender-qwp-ws")]
