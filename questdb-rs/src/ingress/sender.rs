@@ -667,18 +667,28 @@ impl Sender {
     /// counterpart to [`Self::wait`].
     ///
     /// * [`AckLevel::Ok`] reports the highest FSN the server has accepted.
-    /// * [`AckLevel::Durable`] reports the highest FSN covered by a durable
-    ///   ACK, and is equivalent to [`Self::acked_fsn`].
+    /// * [`AckLevel::Durable`] reports durable-ACK coverage, and is
+    ///   equivalent to [`Self::acked_fsn`]. Unlike [`Self::wait`] it is also
+    ///   accepted without `request_durable_ack=on`, where there is no durable
+    ///   ACK to report and the value is acceptance coverage instead.
     ///
-    /// In durable-ACK mode the `Ok` watermark advances ahead of `Durable`;
-    /// outside durable-ACK mode the two coincide. `Ok` never lags `Durable`.
+    /// In background progress mode with durable ACKs `Ok` advances ahead of
+    /// `Durable`; otherwise the two coincide. Manual progress mode has no
+    /// separate OK tracker, so both levels report the completed watermark.
     /// Both advance on server ACK or server-side reject-and-continue, so a
-    /// rejected frame does not leave the watermark stuck behind it.
+    /// watermark past a rejected frame does not mean its rows were written.
     ///
-    /// Prefer this over [`Self::wait`] wherever the caller must not block —
-    /// for instance a thread that owns the socket and drives progress itself,
-    /// where a blocking barrier would stall the very transport it services.
-    /// QWP/WebSocket only; other protocols return `InvalidApiCall`.
+    /// `Ok` is never below the `Durable` value read in the same call, but two
+    /// calls are two snapshots: the background runner can advance `Durable`
+    /// in between. Read `Durable` first if you need the pair ordered.
+    ///
+    /// Use this instead of [`Self::wait`] to keep doing other work rather
+    /// than block until a boundary. It makes no progress itself: in manual
+    /// mode the watermark only moves if the caller interleaves
+    /// [`Self::drive_once`], and it cannot dispatch buffered rejections to an
+    /// installed error handler the way [`Self::wait`] does — see
+    /// [`Self::qwp_ws_errors_dropped`]. QWP/WebSocket only; other protocols
+    /// return `InvalidApiCall`.
     #[cfg(feature = "sync-sender-qwp-ws")]
     pub fn completed_fsn(&self, ack_level: AckLevel) -> Result<Option<u64>> {
         if !matches!(
