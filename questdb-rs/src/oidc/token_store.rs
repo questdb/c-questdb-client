@@ -2010,12 +2010,5 @@ fn warn_no_posix_perms_once() {
     }
 }
 
-// Referenced only on non-unix; silence the unused warning on unix.
-#[cfg(unix)]
-#[allow(dead_code)]
-fn warn_no_posix_perms_once() {
-    let _ = AtomicBool::new(false);
-}
-
 #[cfg(test)]
 mod tests;

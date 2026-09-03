@@ -342,6 +342,16 @@ public:
         detail::wrapped_call(::questdb_oidc_auth_close, raw());
     }
 
+    /**
+     * The resolved configuration. Each `string_view` borrows from this handle.
+     *
+     * WARNING: not display-sanitized. With `from_questdb` these values come
+     * from the QuestDB server's unauthenticated `/settings` response (and a
+     * discovered endpoint from the provider's discovery document), so strip
+     * control, bidi and zero-width characters before writing any of them to a
+     * terminal, a log, or an HTML sink. Only the device-flow event text is
+     * filtered for you.
+     */
     config_view config() const&
     {
         ::questdb_oidc_config_view raw{};

@@ -1657,23 +1657,50 @@ impl OidcDeviceAuth {
         let mut poll_now = true;
         // How much of the current interval has already been waited out. The
         // wait is served in slices no longer than `MAX_POLL_INTERVAL` so a long
-        // `Retry-After` cannot collapse it into one opaque sleep: `backoff`
-        // deliberately has no upper clamp (a server that asks for a long pause
-        // should get it), and the only other bound is the whole device-code
-        // lifetime. Without slicing, a 429 carrying a large `Retry-After` --
-        // routine from a WAF or proxy -- stopped `on_waiting` firing for up to
-        // `MAX_DEVICE_CODE_LIFETIME`, freezing the prompt's countdown and,
-        // because that callback is the only place a host language runs code on
-        // the waiting thread, removing the point at which an interrupt such as
-        // Ctrl-C can be delivered. Slicing restores both without changing the
-        // polling rate: the next token request still waits the full interval.
-        // A conformant interval is at or below the slice, so it is unaffected.
+        // interval cannot collapse it into one opaque sleep: neither `backoff`
+        // nor `clamp_interval` has a `MAX_POLL_INTERVAL` ceiling (a server that
+        // asks for a long pause should get it), and the only other bound is the
+        // whole device-code lifetime. Without slicing, a 429 carrying a large
+        // `Retry-After` -- routine from a WAF or proxy -- stopped `on_waiting`
+        // firing for up to `MAX_DEVICE_CODE_LIFETIME`, freezing the prompt's
+        // countdown and, because that callback is the only place a host language
+        // runs code on the waiting thread, removing the point at which an
+        // interrupt such as Ctrl-C can be delivered. Slicing restores both
+        // without changing the polling rate: the next token request still waits
+        // the full interval. A conformant interval is at or below the slice, so
+        // it is unaffected.
         let mut waited_in_interval = Duration::ZERO;
+        // Set to the interval in force once the wait still owed runs past the
+        // device code's expiry -- the flow then ends at the deadline without
+        // another poll. Reported as its own cause below: an unbounded
+        // `Retry-After` (or, now that `clamp_interval` honours RFC 8628 3.5, a
+        // long advertised interval) otherwise ended the sign-in indistinguishably
+        // from a user who never authorized.
+        let mut pause_outlived_code: Option<u64> = None;
 
         loop {
             self.ensure_open()?;
             let now = (self.now)();
             if now >= deadline {
+                // Same terminal condition either way -- the code is gone and a
+                // fresh sign-in is the only recovery, so the `expired_token`
+                // tag callers key on is unchanged -- but say which of the two
+                // caused it.
+                if let Some(interval) = pause_outlived_code {
+                    self.renderer.on_failure(&format!(
+                        "Sign-in stopped: the identity provider required a {interval}s \
+                         pause between polls, longer than the device code had left. \
+                         Run the sign-in again to retry."
+                    ));
+                    return Err(OidcError::timeout(format!(
+                        "The device code expired while waiting out the {interval}s poll \
+                         interval the IdP required (its advertised `interval`, or a \
+                         `Retry-After` it sent), which outlasted the code's remaining \
+                         life. Nothing was wrong with the authorization; run the \
+                         sign-in again."
+                    ))
+                    .with_idp_error(Some("expired_token"), None));
+                }
                 self.renderer
                     .on_failure("Code expired — run the sign-in again to retry.");
                 return Err(OidcError::timeout(
@@ -1687,8 +1714,13 @@ impl OidcDeviceAuth {
                 self.renderer.on_waiting(remaining.as_secs_f64());
                 self.ensure_open()?;
                 let target = Duration::from_secs(interval);
-                let slice = target
-                    .saturating_sub(waited_in_interval)
+                let owed = target.saturating_sub(waited_in_interval);
+                if owed > remaining {
+                    // This wait is the last: the deadline arrives before the
+                    // interval is served, so the loop cannot poll again.
+                    pause_outlived_code = Some(interval);
+                }
+                let slice = owed
                     .min(remaining)
                     .min(Duration::from_secs(MAX_POLL_INTERVAL));
                 self.wait_between_polls(slice)?;
@@ -1707,6 +1739,8 @@ impl OidcDeviceAuth {
             }
             poll_now = false;
             waited_in_interval = Duration::ZERO;
+            // A poll got through, so no pause has outlasted the code (yet).
+            pause_outlived_code = None;
 
             let result = match self
                 .http
@@ -2002,8 +2036,23 @@ fn refresh_preserves_token(e: &OidcError) -> bool {
         && (e.status().is_some() || e.request_unsent())
 }
 
+/// The advertised poll interval, floored at [`MIN_POLL_INTERVAL`] and capped at
+/// the longest device-code lifetime.
+///
+/// The floor stops a hostile or buggy `0` / negative value driving a poll flood.
+/// There is deliberately no `MAX_POLL_INTERVAL` ceiling: RFC 8628 3.5 requires
+/// the client to wait *at least* `interval` between polls, so truncating an
+/// advertised 300 to 60 would poll five times faster than the IdP asked --
+/// exactly what earns a rate-limit ban. A long interval does not freeze the
+/// prompt either: `poll_for_token` serves every wait in `MAX_POLL_INTERVAL`
+/// slices, so `on_waiting` keeps firing and Ctrl-C stays deliverable.
+///
+/// The cap exists only to keep the arithmetic bounded (`backoff` adds to this
+/// value). An interval at or above it cannot fit a second poll inside the code's
+/// life in any case, and `poll_for_token` reports that for what it is rather
+/// than as a bare expiry.
 fn clamp_interval(interval: i64) -> u64 {
-    (interval.max(0) as u64).clamp(MIN_POLL_INTERVAL, MAX_POLL_INTERVAL)
+    (interval.max(0) as u64).clamp(MIN_POLL_INTERVAL, MAX_DEVICE_CODE_LIFETIME)
 }
 
 fn clamp_lifetime(expires_in: Option<i64>) -> u64 {
@@ -2027,7 +2076,9 @@ fn clamp_lifetime(expires_in: Option<i64>) -> u64 {
 /// Only the floor is applied here. The result is clipped to the remaining
 /// device-code lifetime by the caller, so truncating a long `Retry-After` to
 /// `MAX_POLL_INTERVAL` buys nothing and merely ignores a server that asked for
-/// a longer pause -- which is what earns a rate-limit ban.
+/// a longer pause -- which is what earns a rate-limit ban. When that clip is
+/// what ends the flow, the caller reports the pause as the cause rather than
+/// letting it read as a plain code expiry.
 fn backoff(interval: u64, retry_after: Option<u64>, at_least_increment: bool) -> u64 {
     let mut target = retry_after.map_or(interval + 5, |after| after.max(interval));
     if at_least_increment {

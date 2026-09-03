@@ -863,14 +863,22 @@ fn device_code_lifetime_is_floored() {
 #[test]
 fn poll_interval_is_floored_and_capped() {
     // A hostile/buggy interval is floored to MIN_POLL_INTERVAL so a 0 or negative
-    // value can't drive a tight poll-flood against the IdP, and capped at
-    // MAX_POLL_INTERVAL; a sane value is unchanged.
+    // value can't drive a tight poll-flood against the IdP; a sane value is
+    // unchanged.
     assert_eq!(clamp_interval(-5), MIN_POLL_INTERVAL);
     assert_eq!(clamp_interval(0), MIN_POLL_INTERVAL);
     assert_eq!(clamp_interval(1), MIN_POLL_INTERVAL);
     assert_eq!(clamp_interval(MIN_POLL_INTERVAL as i64), MIN_POLL_INTERVAL);
     assert_eq!(clamp_interval(30), 30);
-    assert_eq!(clamp_interval(100_000), MAX_POLL_INTERVAL);
+
+    // RFC 8628 3.5: the client waits AT LEAST the advertised interval. An
+    // advertised value above MAX_POLL_INTERVAL used to be truncated to it,
+    // polling five times faster than the IdP asked -- the rate-limit-ban
+    // behaviour `backoff` already refuses for `Retry-After`. Only the
+    // device-code lifetime bounds it now.
+    assert_eq!(clamp_interval(300), 300);
+    assert!(clamp_interval(300) > MAX_POLL_INTERVAL);
+    assert_eq!(clamp_interval(100_000), MAX_DEVICE_CODE_LIFETIME);
 }
 
 #[test]
@@ -2786,6 +2794,91 @@ fn a_long_retry_after_is_waited_out_in_slices() {
     );
     // The countdown ticks once per slice rather than once for the whole pause.
     assert_eq!(waits.load(Ordering::SeqCst), slept.len());
+}
+
+#[test]
+fn a_pause_that_outlives_the_device_code_reports_the_pause() {
+    // Regression: `backoff` honours an unbounded `Retry-After` and the caller
+    // clips the wait to the remaining device-code lifetime, so a WAF answering
+    // `Retry-After: 600` to a 60-second code ended the sign-in at the deadline
+    // reported as a plain "Code expired" -- with nothing pointing at the pause
+    // that actually consumed the code, and nobody having failed to authorize.
+    struct RecordFailures(Arc<std::sync::Mutex<Vec<String>>>);
+    impl Renderer for RecordFailures {
+        fn on_failure(&self, message: &str) {
+            self.0.lock().unwrap().push(message.to_string());
+        }
+    }
+
+    const RETRY_AFTER: u64 = 600;
+    let polls = Arc::new(AtomicUsize::new(0));
+    let mock = {
+        let polls = Arc::clone(&polls);
+        MockServer::start_with_retry_after(RETRY_AFTER, move |method, path, _body| {
+            match (method, path) {
+                ("POST", "/device") => (
+                    200,
+                    serde_json::json!({
+                        "device_code": "DEV-CODE-123",
+                        "user_code": "WXYZ-1234",
+                        "verification_uri": "https://idp.example.com/activate",
+                        "expires_in": 60,
+                        "interval": 5
+                    })
+                    .to_string(),
+                ),
+                ("POST", "/token") => {
+                    polls.fetch_add(1, Ordering::SeqCst);
+                    (429, r#"{"error":"slow_down"}"#.to_string())
+                }
+                _ => (404, "{}".to_string()),
+            }
+        })
+    };
+    let failures = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let base = Instant::now();
+    let virtual_ns = Arc::new(AtomicU64::new(0));
+    let now_ns = Arc::clone(&virtual_ns);
+    let sleep_ns = Arc::clone(&virtual_ns);
+    let auth = OidcDeviceAuth::builder()
+        .client_id("questdb")
+        .device_authorization_endpoint(mock.url("/device"))
+        .token_endpoint(mock.url("/token"))
+        .interactive(true)
+        .open_browser(false)
+        .renderer(RecordFailures(Arc::clone(&failures)))
+        .now_hook(Arc::new(move || {
+            base + Duration::from_nanos(now_ns.load(Ordering::SeqCst))
+        }))
+        .sleep_hook(Arc::new(move |d: Duration| {
+            sleep_ns.fetch_add(d.as_nanos() as u64, Ordering::SeqCst);
+        }))
+        .build()
+        .expect("build");
+
+    let err = auth.sign_in().unwrap_err();
+    // The terminal condition is the same -- the code is gone, a fresh sign-in is
+    // the only recovery -- so the kind and the tag callers key on are unchanged.
+    assert_eq!(err.kind(), OidcErrorKind::Timeout);
+    assert_eq!(err.idp_error(), Some("expired_token"));
+    // What changed is that the cause is named.
+    let msg = err.message().to_string();
+    assert!(msg.contains("600s poll"), "got: {msg}");
+    assert!(msg.contains("outlasted"), "got: {msg}");
+    // One poll, then the mandated pause ate the rest of the code's life.
+    assert_eq!(polls.load(Ordering::SeqCst), 1);
+    let failures = failures.lock().unwrap();
+    assert_eq!(failures.len(), 1, "got: {failures:?}");
+    assert!(
+        failures[0].contains("required a 600s pause"),
+        "got: {:?}",
+        failures[0]
+    );
+    assert!(
+        !failures[0].starts_with("Code expired"),
+        "the bare expiry message hides the real cause: {:?}",
+        failures[0]
+    );
 }
 
 #[test]

@@ -145,6 +145,24 @@ QUESTDB_OIDC_STRING_BUILDER_FN(
 QUESTDB_CLIENT_API
 bool questdb_oidc_builder_groups_in_token(
     questdb_oidc_builder* builder, bool enabled, questdb_error** err_out);
+/**
+ * Permit plaintext `http` to the QuestDB server whose `/settings` endpoint
+ * supplies the OIDC configuration (local development only).
+ *
+ * Despite the name, this relaxes ONLY that one link. The identity provider's
+ * device-authorization and token endpoints are always held to `https`, so the
+ * device code and the refresh token are never sent in cleartext, and enabling
+ * this cannot change that.
+ *
+ * Plaintext `http` to a loopback host is allowed with or without this flag: the
+ * request never leaves the machine. (`localhost` is accepted only if it actually
+ * resolves to a loopback address.)
+ *
+ * A tampered `/settings` response can redirect where you sign in, so over a
+ * plaintext channel the client refuses settings-sourced values it cannot
+ * otherwise protect: pin the provider with `questdb_oidc_builder_issuer`, and
+ * pass any client id, scope, audience or groups flag you rely on explicitly.
+ */
 QUESTDB_CLIENT_API
 bool questdb_oidc_builder_allow_insecure_transport(
     questdb_oidc_builder* builder, bool enabled, questdb_error** err_out);
@@ -347,6 +365,24 @@ typedef struct questdb_oidc_config_view
     size_t issuer_len;
 } questdb_oidc_config_view;
 
+/**
+ * Read the resolved configuration into `*out`. See `questdb_oidc_config_view`
+ * for the zero-initialize-and-set-`struct_size` contract.
+ *
+ * WARNING: the strings are returned verbatim and are NOT display-sanitized.
+ * Unlike the device-flow event text, which the library filters before it
+ * reaches a renderer, these are raw bytes: with
+ * `questdb_oidc_builder_from_questdb` they come from the QuestDB server's
+ * unauthenticated `/settings` response (and, for a discovered endpoint, the
+ * provider's discovery document), so a hostile or MITM'd server can plant ANSI
+ * escapes, bidi overrides or zero-width characters in them. Strip control,
+ * bidi and zero-width characters yourself before writing any of them to a
+ * terminal, a log, or an HTML sink. They are also not NUL-terminated: read each
+ * with its `_len`.
+ *
+ * Returns `false` if `auth` is NULL, or if `out` is NULL or its `struct_size`
+ * is smaller than the library's v1 layout.
+ */
 QUESTDB_CLIENT_API
 bool questdb_oidc_auth_get_config(
     const questdb_oidc_auth* auth, questdb_oidc_config_view* out);

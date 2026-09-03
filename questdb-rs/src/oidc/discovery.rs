@@ -148,8 +148,12 @@ fn settings_channel_is_plaintext(questdb_url: &str) -> bool {
     {
         return false;
     }
-    let host = uri.host().unwrap_or("");
-    !is_loopback_host(host)
+    // The same loopback test the transport gate applies, so the two cannot
+    // disagree about which plaintext channel is trusted. It resolves the
+    // `localhost` name rather than trusting its spelling: a resolver that
+    // answers with a routable address would otherwise excuse a genuinely
+    // MITM-tamperable `/settings` channel from `plaintext_settings_guard`.
+    !crate::oidc::http::is_loopback(uri.host().unwrap_or(""))
 }
 
 /// The plaintext-`/settings` tamper guard: over a MITM-tamperable (non-loopback
@@ -183,19 +187,6 @@ fn plaintext_settings_guard(
         ));
     }
     Ok(())
-}
-
-fn is_loopback_host(host: &str) -> bool {
-    if host.eq_ignore_ascii_case("localhost") {
-        return true;
-    }
-    let bare = host
-        .strip_prefix('[')
-        .and_then(|h| h.strip_suffix(']'))
-        .unwrap_or(host);
-    bare.parse::<std::net::IpAddr>()
-        .map(|a| a.is_loopback())
-        .unwrap_or(false)
 }
 
 /// Reject a credential URL whose authority the HTTP transport may resolve unlike

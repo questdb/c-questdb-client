@@ -31,7 +31,7 @@
 
 use std::fmt::Debug;
 use std::io::{Read, Write};
-use std::net::IpAddr;
+use std::net::{IpAddr, ToSocketAddrs};
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
@@ -284,17 +284,42 @@ fn parse_retry_after(headers: &ureq::http::HeaderMap) -> Option<u64> {
 
 /// True if `host` is a loopback address — plaintext `http` is safe there because
 /// the request never leaves the machine.
-fn is_loopback(host: &str) -> bool {
-    if host.eq_ignore_ascii_case("localhost") {
-        return true;
-    }
+///
+/// An IP literal is answered from the literal itself, so the common case costs
+/// no lookup. The `localhost` name is *resolved and checked* rather than trusted
+/// on sight: RFC 6761 6.3 says a resolver should map it to loopback, but that is
+/// a should — an `/etc/hosts` line or a hostile resolver can point it at a real
+/// address, and matching the spelling alone would then hand the device code to
+/// whatever answered, in cleartext. Every address it resolves to must be
+/// loopback, so a name resolving to a mix cannot pass, and a name that resolves
+/// to nothing is not loopback either.
+///
+/// Only that one name is a candidate; any other host is rejected without a
+/// lookup, so an unrelated plaintext URL never triggers DNS traffic here.
+pub(crate) fn is_loopback(host: &str) -> bool {
     // Strip the brackets off an IPv6 literal before parsing.
     let bare = host
         .strip_prefix('[')
         .and_then(|h| h.strip_suffix(']'))
         .unwrap_or(host);
-    match bare.parse::<IpAddr>() {
-        Ok(addr) => addr.is_loopback(),
+    if let Ok(addr) = bare.parse::<IpAddr>() {
+        return addr.is_loopback();
+    }
+    if !host.eq_ignore_ascii_case("localhost") {
+        return false;
+    }
+    // Resolution needs a port; which one is irrelevant to the verdict.
+    match (host, 0u16).to_socket_addrs() {
+        Ok(addrs) => {
+            let mut resolved = false;
+            for addr in addrs {
+                resolved = true;
+                if !addr.ip().is_loopback() {
+                    return false;
+                }
+            }
+            resolved
+        }
         Err(_) => false,
     }
 }
@@ -319,14 +344,19 @@ fn require_secure(url: &str, allow_insecure: bool) -> Result<()> {
         return Ok(());
     }
     if scheme == "http" {
-        let host = uri.host().unwrap_or("");
-        if is_loopback(host) || allow_insecure {
+        // `allow_insecure` first: it is a plain bool, and `is_loopback` may
+        // resolve a name.
+        if allow_insecure {
+            return Ok(());
+        }
+        if is_loopback(uri.host().unwrap_or("")) {
             return Ok(());
         }
     }
     Err(OidcError::config(format!(
         "Refusing to use insecure URL {url:?} (scheme {scheme:?}). Use https \
-         (loopback http is always allowed for local development); enable \
+         (loopback http is always allowed for local development, but a host \
+         name has to actually resolve to a loopback address to count); enable \
          allow_insecure_transport only to permit plaintext to a non-loopback \
          QuestDB server. The identity provider is always held to https."
     )))
@@ -781,6 +811,8 @@ mod tests {
 
     #[test]
     fn is_loopback_cases() {
+        // The name is accepted only because it resolves to loopback here, which
+        // is what every sane resolver does (RFC 6761 6.3).
         assert!(is_loopback("localhost"));
         assert!(is_loopback("LOCALHOST"));
         assert!(is_loopback("127.0.0.1"));
@@ -789,6 +821,12 @@ mod tests {
         assert!(is_loopback("[::1]"));
         assert!(!is_loopback("example.com"));
         assert!(!is_loopback("10.0.0.1"));
+        // A name that merely embeds or resembles the special one is not it, and
+        // is rejected without a lookup.
+        assert!(!is_loopback("localhost.example.com"));
+        assert!(!is_loopback("notlocalhost"));
+        assert!(!is_loopback("localhost."));
+        assert!(!is_loopback(""));
     }
 
     #[test]
