@@ -362,7 +362,12 @@ fn format_mmss(seconds: f64) -> String {
 fn is_format_or_bidi(ch: char) -> bool {
     matches!(ch,
         '\u{00AD}'                    // soft hyphen
+        | '\u{0600}'..='\u{0605}'     // arabic number/subtending marks (Cf)
         | '\u{061C}'                  // arabic letter mark
+        | '\u{06DD}'                  // arabic end of ayah (Cf)
+        | '\u{070F}'                  // syriac abbreviation mark (Cf)
+        | '\u{0890}'..='\u{0891}'     // arabic pound/piastre marks (Cf)
+        | '\u{08E2}'                  // arabic disputed end of ayah (Cf)
         | '\u{180E}'                  // mongolian vowel separator
         | '\u{200B}'..='\u{200F}'     // zero-width space/joiner/non-joiner + LRM/RLM
         | '\u{202A}'..='\u{202E}'     // bidi embeddings / overrides
@@ -370,6 +375,9 @@ fn is_format_or_bidi(ch: char) -> bool {
         | '\u{2066}'..='\u{206F}'     // bidi isolates + deprecated format controls
         | '\u{FEFF}'                  // zero-width no-break space / BOM
         | '\u{FFF9}'..='\u{FFFB}'     // interlinear annotation anchors
+        | '\u{110BD}' | '\u{110CD}'   // kaithi number signs (Cf)
+        | '\u{13430}'..='\u{1343F}'   // egyptian hieroglyph format controls (Cf)
+        | '\u{1D173}'..='\u{1D17A}'   // musical symbol beams/slurs (Cf)
         | '\u{115F}' | '\u{1160}' | '\u{3164}' | '\u{FFA0}' // hangul fillers (render blank)
         | '\u{FE00}'..='\u{FE0F}'     // variation selectors
         | '\u{1BCA0}'..='\u{1BCA3}'   // shorthand format controls
@@ -378,21 +386,116 @@ fn is_format_or_bidi(ch: char) -> bool {
     )
 }
 
+/// Invisible or overlaying characters that `is_control` / [`is_format_or_bidi`]
+/// do not reach.
+///
+/// Enclosing combining marks (category `Me`) overlay the *preceding* glyph with
+/// a circle, slash or keycap, so they rewrite a character the reader has already
+/// accepted -- never part of a legitimate identity, URL or user code. The rest
+/// are individually invisible: the combining grapheme joiner, the Mongolian free
+/// variation selectors, the Khmer inherent vowels (all `Mn`, so the accent-
+/// keeping rule below would otherwise let them through), and the braille blank,
+/// which is category `So` and renders as an empty cell -- the same hidden-
+/// padding primitive as the Hangul fillers above.
+fn is_invisible_or_enclosing(ch: char) -> bool {
+    matches!(ch,
+        // Category Me, in full.
+        '\u{0488}'..='\u{0489}'
+        | '\u{1ABE}'
+        | '\u{20DD}'..='\u{20E0}'
+        | '\u{20E2}'..='\u{20E4}'
+        | '\u{A670}'..='\u{A672}'
+        // Invisible Default_Ignorable non-spacing marks.
+        | '\u{034F}'                  // combining grapheme joiner
+        | '\u{17B4}'..='\u{17B5}'     // khmer inherent vowels
+        | '\u{180B}'..='\u{180D}'     // mongolian free variation selectors
+        | '\u{180F}'
+        // Renders as a blank cell.
+        | '\u{2800}'                  // braille pattern blank
+        // Private use: no defined glyph, renders at the font's discretion.
+        | '\u{E000}'..='\u{F8FF}'
+        | '\u{F0000}'..='\u{FFFFD}'
+        | '\u{100000}'..='\u{10FFFD}'
+    )
+}
+
+/// Non-spacing combining marks (category `Mn`) that stack on the preceding
+/// glyph -- the "Zalgo" surface.
+///
+/// Only the stacking blocks are listed. A general-category table would be
+/// exhaustive, but it means a Unicode data dependency in a client library that
+/// deliberately has none, for a defence-in-depth display filter; these blocks
+/// carry the marks that actually pile up vertically. Anything missed is kept
+/// and merely counted against the run cap by its base character instead.
+fn is_stacking_mark(ch: char) -> bool {
+    matches!(ch,
+        '\u{0300}'..='\u{036F}'       // combining diacritical marks
+        | '\u{0483}'..='\u{0487}'     // cyrillic
+        | '\u{0591}'..='\u{05BD}'     // hebrew points / cantillation
+        | '\u{05BF}' | '\u{05C1}'..='\u{05C2}'
+        | '\u{05C4}'..='\u{05C5}' | '\u{05C7}'
+        | '\u{0610}'..='\u{061A}'     // arabic
+        | '\u{064B}'..='\u{065F}'
+        | '\u{0670}'
+        | '\u{06D6}'..='\u{06DC}'
+        | '\u{06DF}'..='\u{06E4}'
+        | '\u{06E7}'..='\u{06E8}'
+        | '\u{06EA}'..='\u{06ED}'
+        | '\u{1AB0}'..='\u{1ACE}'     // combining diacritical marks extended
+        | '\u{1DC0}'..='\u{1DFF}'     // combining diacritical marks supplement
+        | '\u{20D0}'..='\u{20DC}'     // combining marks for symbols (Mn part)
+        | '\u{20E1}'
+        | '\u{20E5}'..='\u{20F0}'
+        | '\u{FE20}'..='\u{FE2F}'     // combining half marks
+    )
+}
+
+/// Consecutive [stacking marks](is_stacking_mark) kept on one base character.
+///
+/// They pile up vertically, so a long run smears across the lines above and
+/// below and can obscure the real sign-in URL or code in a terminal prompt.
+/// Real accented text never needs more than a couple (decomposed Vietnamese and
+/// Hebrew nikud+cantillation reach about two), so this is generous for
+/// legitimate input while neutralising a runaway stack. Matches the cap the
+/// Python client applies to the same fields.
+const MAX_STACKING_MARK_RUN: usize = 4;
+
 /// Convert untrusted text to inert, single-line display text.
 ///
 /// C0/C1 controls and DEL (including ANSI, tabs, and line breaks), bidi
-/// controls, zero-width characters, and other invisible formatting are
-/// removed. Non-ASCII whitespace is folded to an ordinary space. This is
-/// suitable for human-readable labels and messages; URLs and short
-/// authentication codes need the stricter display accessors on
-/// [`DeviceCodeChallenge`] so confusable non-ASCII characters are also made
-/// visible. This sanitizer never fails.
+/// controls, zero-width characters, enclosing combining marks, private-use
+/// characters, and other invisible formatting are removed. Non-ASCII whitespace
+/// is folded to an ordinary space, and a run of stacking combining marks is
+/// truncated to [`MAX_STACKING_MARK_RUN`]. This is suitable for human-readable
+/// labels and messages; URLs and short authentication codes need the stricter
+/// display accessors on [`DeviceCodeChallenge`] so confusable non-ASCII
+/// characters are also made visible. This sanitizer never fails.
+///
+/// The character classes are enumerated rather than taken from a general-
+/// category table, so this is a strong filter and not a proof: an unassigned
+/// codepoint (category `Cn`) that a future Unicode version gives invisible
+/// semantics to would pass until the ranges here are updated. It is the last
+/// line before a terminal or a notebook DOM, not the only one -- the fields it
+/// guards are separately length-capped, and the actionable URL is vetted by
+/// [`safe_target`] rather than merely sanitized.
 pub fn sanitize_display_text(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
+    let mut mark_run = 0usize;
     for ch in text.chars() {
         // is_control() covers C0 (incl. tab/newline/CR), DEL and C1.
-        if ch.is_control() || is_format_or_bidi(ch) {
+        if ch.is_control() || is_format_or_bidi(ch) || is_invisible_or_enclosing(ch) {
             continue;
+        }
+        if is_stacking_mark(ch) {
+            // Count against the current base character; drop the overflow
+            // rather than the whole run, so a legitimately accented name keeps
+            // its accents.
+            mark_run += 1;
+            if mark_run > MAX_STACKING_MARK_RUN {
+                continue;
+            }
+        } else {
+            mark_run = 0;
         }
         if ch != ' ' && ch.is_whitespace() {
             // Fold an exotic space / line separator (NBSP, U+2028, ...) to a
@@ -471,10 +574,12 @@ pub(crate) fn display_url(url: &str) -> String {
 /// browser (or `None` if it can't be trusted).
 ///
 /// Rejects any URL that is not `http(s)`, carries userinfo (`user@host`, which
-/// connects to `host` while *reading* as the trusted user part), or whose host
-/// is not plain ASCII letters/digits/`.`/`-`/`:` (a homoglyph / confusable host,
-/// or a `%` percent-encoding / IPv6 zone-id). A rejected URL is still *shown* as
-/// inert text via [`display_url`]; it is just never opened.
+/// connects to `host` while *reading* as the trusted user part), whose host is
+/// not plain ASCII letters/digits/`.`/`-`/`:` (a homoglyph / confusable host,
+/// or a `%` percent-encoding / IPv6 zone-id), or whose host carries an IDNA
+/// A-label (`xn--`), which is a confusable that is already ASCII-encoded and so
+/// invisible to the previous test. A rejected URL is still *shown* as inert
+/// text via [`display_url`]; it is just never opened.
 pub(crate) fn safe_target(url: Option<&str>) -> Option<String> {
     let raw = url?;
     // Strip first so a control char can't survive into the opened URL, then trim
@@ -515,6 +620,20 @@ pub(crate) fn safe_target(url: Option<&str>) -> Option<String> {
     {
         return None;
     }
+    // The ASCII test above cannot see a homoglyph that arrives already encoded.
+    // An IDNA A-label is plain ASCII by construction, so `xn--80ak6aa92e.com`
+    // and `xn--pple-43d.com` pass it -- and then render as `аррӏе.com` and
+    // `àpple.com` in the address bar, which is exactly the confusable host this
+    // function promises to refuse. Rejecting the encoded form is the only way
+    // to keep that promise here: this is the sole URL vetted for opening in a
+    // browser and for QR encoding, and a QR is never read by a human before it
+    // is followed. A device-flow verification URI has no business being an IDN.
+    if host
+        .split('.')
+        .any(|label| label.len() >= 4 && label[..4].eq_ignore_ascii_case("xn--"))
+    {
+        return None;
+    }
     Some(trimmed.to_string())
 }
 
@@ -536,6 +655,61 @@ mod tests {
             strip_control("code\u{202e}reversed\u{200b}"),
             "codereversed"
         );
+    }
+
+    #[test]
+    fn strip_control_caps_a_stacking_mark_run() {
+        // A "Zalgo" stack piles up vertically and smears across the lines above
+        // and below -- in a terminal prompt those lines carry the real sign-in
+        // URL and the user code. The run is truncated rather than dropped
+        // whole, so a legitimately accented name keeps its accents.
+        let zalgo = format!("A{}B", "\u{0301}".repeat(200));
+        let cleaned = strip_control(&zalgo);
+        assert_eq!(
+            cleaned,
+            format!("A{}B", "\u{0301}".repeat(MAX_STACKING_MARK_RUN))
+        );
+        // Each base character gets its own allowance.
+        assert_eq!(strip_control("e\u{0301}a\u{0300}"), "e\u{0301}a\u{0300}");
+        // Decomposed Vietnamese (base + horn + tone) is well inside the cap.
+        assert_eq!(strip_control("o\u{031b}\u{0301}"), "o\u{031b}\u{0301}");
+    }
+
+    #[test]
+    fn strip_control_drops_enclosing_and_invisible_marks() {
+        // Enclosing marks (Me) overlay the *preceding* glyph with a circle,
+        // slash or keycap, rewriting a character the reader already accepted.
+        assert_eq!(strip_control("7\u{20e0}"), "7"); // combining enclosing slash
+        assert_eq!(strip_control("A\u{0489}"), "A"); // cyrillic million sign
+        // Individually invisible characters the category-free control and
+        // format tests do not reach.
+        assert_eq!(strip_control("a\u{2800}b"), "ab"); // braille blank
+        assert_eq!(strip_control("a\u{034f}b"), "ab"); // grapheme joiner
+        assert_eq!(strip_control("a\u{17b4}b"), "ab"); // khmer inherent vowel
+        assert_eq!(strip_control("a\u{180b}b"), "ab"); // mongolian FVS
+        // Private use has no defined glyph.
+        assert_eq!(strip_control("a\u{e000}b"), "ab");
+        // Format characters outside the previously enumerated runs.
+        assert_eq!(strip_control("a\u{0600}b"), "ab"); // arabic number sign
+        assert_eq!(strip_control("a\u{110bd}b"), "ab"); // kaithi number sign
+        assert_eq!(strip_control("a\u{1d173}b"), "ab"); // musical beam
+    }
+
+    #[test]
+    fn strip_control_keeps_legitimate_text() {
+        // The filter must not eat real identities: accents, Indic spacing
+        // marks (Mc), CJK, emoji and ordinary punctuation all survive.
+        for text in [
+            "Ana Gómez",
+            "Ann-Marie O'Neill",
+            "北京用户",
+            "user@example.com",
+            "\u{0915}\u{094b}", // devanagari ko (base + Mc vowel sign)
+            "Ελένη",
+            "Пользователь",
+        ] {
+            assert_eq!(strip_control(text), text, "mangled legitimate text");
+        }
     }
 
     #[test]
@@ -762,6 +936,38 @@ mod tests {
     fn safe_target_rejects_non_http_scheme() {
         assert_eq!(safe_target(Some("javascript:alert(1)")), None);
         assert_eq!(safe_target(Some("data:text/html,x")), None);
+    }
+
+    #[test]
+    fn safe_target_rejects_an_idna_a_label_host() {
+        // The plain-ASCII host test cannot see a confusable that arrives
+        // already encoded: an A-label is ASCII by construction. These two are
+        // `аррӏе.com` (Cyrillic) and `àpple.com`, and the browser renders them
+        // in their Unicode form in the address bar -- so the check that claims
+        // to reject "a homoglyph / confusable host" did not.
+        //
+        // This field is the one that is *acted on* rather than read: it is
+        // launched by `maybe_open_browser` and encoded into the QR, and a QR is
+        // never read by a human before it is followed. Showing the punycode --
+        // the mitigation `display_url` relies on -- protects nobody here.
+        for host in ["xn--80ak6aa92e.com", "xn--pple-43d.com", "XN--PPLE-43D.com"] {
+            assert_eq!(
+                safe_target(Some(&format!("https://{host}/device"))),
+                None,
+                "{host} must not be offered as an actionable target"
+            );
+        }
+        // A sub-domain A-label is equally confusable.
+        assert_eq!(
+            safe_target(Some("https://xn--pple-43d.idp.example.com/device")),
+            None
+        );
+        // Degrades gracefully rather than hiding the URL: the prompt still
+        // shows it, just never opens it or encodes it into a QR.
+        assert!(!display_url("https://xn--pple-43d.com/device").is_empty());
+        // A host that merely *contains* those letters is not an A-label.
+        assert!(safe_target(Some("https://xnotxn.example.com/device")).is_some());
+        assert!(safe_target(Some("https://example.com/xn--path")).is_some());
     }
 
     #[test]
