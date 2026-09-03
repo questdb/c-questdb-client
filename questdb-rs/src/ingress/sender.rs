@@ -795,20 +795,21 @@ impl Sender {
     /// coverage. Terminal failures surface here as an `Err`.
     #[cfg(feature = "sync-sender-qwp-ws")]
     fn qwp_ws_completed_fsn(&self, ack_level: AckLevel) -> Result<Option<u64>> {
-        match (&self.handler, ack_level) {
-            (SyncProtocolHandler::SyncQwpWs(state), AckLevel::Ok) => {
-                qwp_ws_ok_fsn_background(state)
-            }
-            (SyncProtocolHandler::SyncQwpWs(state), AckLevel::Durable) => {
-                qwp_ws_acked_fsn_background(state)
-            }
-            (SyncProtocolHandler::ManualQwpWs(state), AckLevel::Ok) => qwp_ws_ok_fsn_manual(state),
-            (SyncProtocolHandler::ManualQwpWs(state), AckLevel::Durable) => {
-                qwp_ws_acked_fsn_manual(state)
-            }
+        // `AckLevel` is `#[non_exhaustive]`; matching it without a wildcard
+        // makes a new variant a compile error here rather than a silently
+        // wrong watermark.
+        match &self.handler {
+            SyncProtocolHandler::SyncQwpWs(state) => match ack_level {
+                AckLevel::Ok => qwp_ws_ok_fsn_background(state),
+                AckLevel::Durable => qwp_ws_acked_fsn_background(state),
+            },
+            SyncProtocolHandler::ManualQwpWs(state) => match ack_level {
+                AckLevel::Ok => qwp_ws_ok_fsn_manual(state),
+                AckLevel::Durable => qwp_ws_acked_fsn_manual(state),
+            },
             _ => Err(error::fmt!(
                 InvalidApiCall,
-                "wait is only supported for QWP/WebSocket senders."
+                "completion watermarks are only supported for QWP/WebSocket senders."
             )),
         }
     }
