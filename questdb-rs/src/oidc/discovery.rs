@@ -299,11 +299,11 @@ pub(crate) fn validate_explicit_endpoint_issuer_origins(
 ///
 /// Segment-aware, so `/realms/prod` does not match `/realms/production`. A root
 /// issuer (no path) constrains the origin only and matches any unambiguous path.
-/// Compared on complete, once-percent-decoded segments; an encoded separator or a
-/// `.` / `..` / semicolon / still-encoded / non-ASCII / control segment is rejected
-/// outright, so a tampered `/settings` can't redirect credentials to a different
-/// tenant on a path-based multi-tenant IdP (e.g. Keycloak
-/// `https://host/realms/{realm}`).
+/// Compared on complete, once-percent-decoded segments; an encoded separator, a
+/// raw backslash, or a `.` / `..` / semicolon / still-encoded / non-ASCII /
+/// control segment is rejected outright, so a tampered `/settings` can't
+/// redirect credentials to a different tenant on a path-based multi-tenant IdP
+/// (e.g. Keycloak `https://host/realms/{realm}`).
 pub(crate) fn endpoint_path_under_issuer(endpoint: &str, issuer: &str) -> bool {
     let Ok(issuer_uri) = issuer.parse::<Uri>() else {
         return false;
@@ -357,14 +357,24 @@ pub(crate) fn endpoint_path_under_issuer(endpoint: &str, issuer: &str) -> bool {
 /// Decoding more than once can make the pin see a different path from a server
 /// that decodes the request target once. Any remaining `%` is rejected by the
 /// caller instead of being interpreted as another round of encoding.
-/// Backslash is treated as a separator (some proxies fold `\` to `/`).
+///
+/// A *raw* backslash fails closed for exactly the same reason as the encoded
+/// one, and must not be folded into a separator. `http`'s path validator
+/// accepts `0x5C`, so `Uri::path()` hands it back verbatim and it reaches the
+/// wire unchanged; whether the server then treats it as a separator is
+/// deployment-specific. Folding it here *adds* segment boundaries, which makes
+/// a foreign path look like a sub-path of the issuer: with issuer
+/// `https://host/realms/prod`, the endpoint `https://host/realms/prod\evil/token`
+/// would split to `["", "realms", "prod", "evil", "token"]` and pass the prefix
+/// test, while a server routing `\` literally sends the credential request to
+/// tenant `prod\evil`. Rejecting is the only answer that is correct for both
+/// kinds of server.
 fn decode_path_segments(path: &str) -> Option<Vec<String>> {
-    if path.split('/').any(has_encoded_path_separator) {
+    if path.contains('\\') || path.split('/').any(has_encoded_path_separator) {
         return None;
     }
     Some(
         percent_decode(path)
-            .replace('\\', "/")
             .split('/')
             .map(|s| s.to_string())
             .collect(),
@@ -910,6 +920,43 @@ mod tests {
                 "endpoint {endpoint} must not pass the issuer-path pin"
             );
         }
+    }
+
+    #[test]
+    fn issuer_path_pin_rejects_raw_backslash() {
+        // The raw byte must fail closed exactly like its `%5c` form. `http`'s
+        // path validator accepts `0x5C`, so `Uri::path()` preserves it and the
+        // request reaches the server as `/realms/prod\evil/...`. Folding it into
+        // a separator here would split to ["", "realms", "prod", "evil", ...],
+        // whose 3-segment prefix equals the issuer's — waiving the pin while a
+        // server that routes `\` literally sends the device code and token
+        // request to tenant `prod\evil` on the same host. That is precisely the
+        // same-host tenant redirect this pin exists to stop.
+        let issuer = "https://host/realms/prod";
+        for endpoint in [
+            "https://host/realms/prod\\evil/protocol/openid-connect/token",
+            "https://host/realms/prod\\evil/protocol/openid-connect/auth/device",
+            // Leading, so the whole path is foreign.
+            "https://host/\\realms/prod/token",
+            // Trailing, which a folding server reads as a bare separator.
+            "https://host/realms/prod\\",
+        ] {
+            assert!(
+                !endpoint_path_under_issuer(endpoint, issuer),
+                "endpoint {endpoint} must not pass the issuer-path pin"
+            );
+        }
+        // A backslash anywhere in the *issuer* is equally ambiguous.
+        assert!(!endpoint_path_under_issuer(
+            "https://host/realms/prod/token",
+            "https://host/realms\\prod"
+        ));
+        // The legitimate sub-path still passes, so the guard is not a blanket
+        // rejection of the pinned shape.
+        assert!(endpoint_path_under_issuer(
+            "https://host/realms/prod/protocol/openid-connect/token",
+            issuer
+        ));
     }
 
     #[test]
