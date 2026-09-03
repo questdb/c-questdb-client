@@ -918,11 +918,17 @@ impl<T: QwpWsCoreTransport> QwpWsSendCore<T> {
                     store.record_reject_error(fsn, wire_seq, error, policy);
                     return Ok(DriveOutcome::Idle);
                 }
-                if !self.reject_target_can_complete(store, fsn) {
-                    store.last_server_error = Some(error.clone());
-                    self.reject_gap_protocol_error(store, fsn);
-                    return Ok(DriveOutcome::Terminal);
-                }
+                // A reject names a frame this connection sent and the server
+                // has not acked, so it is never a protocol gap: whatever sits
+                // below it unanswered -- a deferred group's prefix by design,
+                // or a skipped response -- stays queued and replays from
+                // `oldest_unresolved_fsn` on the reconnect, exactly as after a
+                // socket drop.
+                debug_assert!(
+                    store.queue.oldest_unresolved_fsn() == Some(fsn)
+                        || self.send_cursor.wire_seq_for_fsn(fsn).is_some(),
+                    "reject for fsn {fsn} names a frame outside the in-flight run"
+                );
 
                 if policy == QwpWsErrorPolicy::Terminal {
                     let sender_error = sender_error_for_qwp_error(&error, wire_seq, fsn, policy);
@@ -994,56 +1000,9 @@ impl<T: QwpWsCoreTransport> QwpWsSendCore<T> {
                 .is_some_and(|completed_fsn| fsn <= completed_fsn)
     }
 
-    fn reject_target_can_complete<Q: PublicationLog>(
-        &self,
-        store: &QwpWsPublicationStore<Q>,
-        fsn: u64,
-    ) -> bool {
-        let Some(oldest) = store.queue.oldest_unresolved_fsn() else {
-            return false;
-        };
-        if fsn == oldest {
-            return true;
-        }
-        // A deferred group's frames are unacked by design until its committing
-        // frame lands, so `oldest` stays pinned at the group head for the whole
-        // group. A reject for a later frame of that group is not a gap: the
-        // send cursor still carries it in the sent-but-unacked run, which is
-        // the same prefix the ack path retires cumulatively.
-        if fsn > oldest && self.send_cursor.wire_seq_for_fsn(fsn).is_some() {
-            return true;
-        }
-        self.durable_ack
-            .as_ref()
-            .is_some_and(|tracker| tracker.pending_prefix_covers(oldest, fsn))
-    }
-
-    fn reject_gap_protocol_error<Q: PublicationLog>(
-        &self,
-        store: &mut QwpWsPublicationStore<Q>,
-        fsn: u64,
-    ) -> Error {
-        let oldest = store.queue.oldest_unresolved_fsn();
-        store.record_protocol_violation(
-            None,
-            match oldest {
-                Some(oldest) => format!(
-                    "QWP/WebSocket reject response for fsn {fsn} skipped unresolved fsn {oldest}"
-                ),
-                None => {
-                    format!("QWP/WebSocket reject response for fsn {fsn} has no unresolved frame")
-                }
-            },
-        )
-    }
-
     /// Whether `fsn` has now been rejected often enough, without ACK progress,
     /// to be treated as poison.
     ///
-    /// Keyed on the rejected frame rather than the queue head: inside a
-    /// deferred group the head is unackable until the committing frame lands,
-    /// so requiring `fsn == oldest_unresolved_fsn` would leave a permanently
-    /// rejected mid-group frame reconnecting forever without ever escalating.
     /// The tracker keys on `completed_fsn` alone, so rejects that move
     /// between frames of the same stalled group still add up.
     fn rejected_frame_is_poison<Q: PublicationLog>(
@@ -1051,11 +1010,6 @@ impl<T: QwpWsCoreTransport> QwpWsSendCore<T> {
         store: &QwpWsPublicationStore<Q>,
         fsn: u64,
     ) -> bool {
-        if self.send_cursor.wire_seq_for_fsn(fsn).is_none()
-            && store.queue.oldest_unresolved_fsn() != Some(fsn)
-        {
-            return false;
-        }
         let now = Instant::now();
         self.poison_tracker.record_failure(
             fsn,
@@ -3894,24 +3848,6 @@ impl DurableAckTracker {
             .ok()
             .and_then(|index| self.pending.get(index))
             .map(PendingDurableFrame::wire_seq)
-    }
-
-    fn pending_prefix_covers(&self, start_fsn: u64, end_before_fsn: u64) -> bool {
-        let mut next_fsn = start_fsn;
-        for entry in &self.pending {
-            if next_fsn >= end_before_fsn {
-                return true;
-            }
-            let PendingDurableFrame::Ok { fsn, .. } = entry;
-            if *fsn < next_fsn {
-                continue;
-            }
-            next_fsn = match fsn.checked_add(1) {
-                Some(next_fsn) => next_fsn,
-                None => return false,
-            }
-        }
-        next_fsn >= end_before_fsn
     }
 
     fn pop_ready(&mut self) -> Option<DurableCompletion> {
