@@ -174,15 +174,20 @@ TEST_CASE("OIDC C++ wrappers preserve ownership and structured errors")
         (questdb::egress::reader{"ws::addr=127.0.0.1:1;", auth}),
         questdb::oidc::error);
 
+    // `shared_auth` is the only live handle left: `auth` was moved from above,
+    // and `moved_auth` was moved into `shared_auth`. Everything from here on
+    // is a POSITIVE case, so it must use the live one -- passing an emptied
+    // handle makes `device_auth::raw()` throw before the call under test even
+    // runs, which aborts the rest of this case.
     auto sender_options =
         questdb::ingress::opts::from_conf("https::addr=127.0.0.1:1;");
-    sender_options.oidc_auth(moved_auth);
+    CHECK_NOTHROW(sender_options.oidc_auth(shared_auth));
 
     auto unsupported_sender_options =
         questdb::ingress::opts::from_conf("tcp::addr=127.0.0.1:1;");
     try
     {
-        unsupported_sender_options.oidc_auth(moved_auth);
+        unsupported_sender_options.oidc_auth(shared_auth);
         FAIL("unsupported sender OIDC attachment must throw");
     }
     catch (const questdb::ingress::line_sender_error& error)
