@@ -1688,13 +1688,27 @@ impl OidcDeviceAuth {
         // the full interval. A conformant interval is at or below the slice, so
         // it is unaffected.
         let mut waited_in_interval = Duration::ZERO;
-        // Set to the interval in force once the wait still owed runs past the
-        // device code's expiry -- the flow then ends at the deadline without
-        // another poll. Reported as its own cause below: an unbounded
-        // `Retry-After` (or, now that `clamp_interval` honours RFC 8628 3.5, a
-        // long advertised interval) otherwise ended the sign-in indistinguishably
-        // from a user who never authorized.
+        // Set to the interval in force when a pause the IdP *imposed* -- a
+        // `Retry-After` or a `slow_down` step, never the routine advertised
+        // cadence -- runs past the device code's expiry, so the flow ends at
+        // the deadline without another poll. Reported as its own cause below:
+        // an unbounded `Retry-After` is routine from a WAF and otherwise ended
+        // the sign-in indistinguishably from a user who never authorized.
+        //
+        // It is deliberately NOT set for the last, partial wait of an ordinary
+        // flow. `owed > remaining` on its own is true there for every device
+        // code whose lifetime is not an exact multiple of the interval plus the
+        // round-trip time -- which is essentially all of them -- so the routine
+        // "nobody authorized" expiry reported a pause the IdP never imposed and
+        // told the user "Nothing was wrong with the authorization" when
+        // something was. The virtual clock in the tests advances only by the
+        // amount slept, which makes lifetimes exact multiples and hid it.
         let mut pause_outlived_code: Option<u64> = None;
+        // Whether the pause now being served was raised by the IdP on the
+        // immediately preceding poll, rather than being the cadence the device
+        // response advertised. Cleared by every poll that does not raise it, so
+        // a raise early in a long flow does not colour an expiry much later.
+        let mut interval_raised = false;
 
         loop {
             self.ensure_open()?;
@@ -1711,11 +1725,11 @@ impl OidcDeviceAuth {
                          Run the sign-in again to retry."
                     ));
                     return Err(OidcError::timeout(format!(
-                        "The device code expired while waiting out the {interval}s poll \
-                         interval the IdP required (its advertised `interval`, or a \
-                         `Retry-After` it sent), which outlasted the code's remaining \
-                         life. Nothing was wrong with the authorization; run the \
-                         sign-in again."
+                        "The device code expired while waiting out a {interval}s poll \
+                         interval the IdP imposed part-way through the flow (a \
+                         `Retry-After` or a `slow_down` step), which outlasted the \
+                         code's remaining life. The authorization itself may never \
+                         have been checked; run the sign-in again."
                     ))
                     .with_idp_error(Some("expired_token"), None));
                 }
@@ -1733,9 +1747,11 @@ impl OidcDeviceAuth {
                 self.ensure_open()?;
                 let target = Duration::from_secs(interval);
                 let owed = target.saturating_sub(waited_in_interval);
-                if owed > remaining {
-                    // This wait is the last: the deadline arrives before the
-                    // interval is served, so the loop cannot poll again.
+                if interval_raised && owed > remaining {
+                    // This wait is the last -- the deadline arrives before the
+                    // interval is served, so the loop cannot poll again -- and
+                    // the pause is one the IdP has just imposed, so the pause,
+                    // not the user, is what ended the flow.
                     pause_outlived_code = Some(interval);
                 }
                 let slice = owed
@@ -1757,8 +1773,11 @@ impl OidcDeviceAuth {
             }
             poll_now = false;
             waited_in_interval = Duration::ZERO;
-            // A poll got through, so no pause has outlasted the code (yet).
+            // A poll got through, so no pause has outlasted the code (yet), and
+            // whatever raise led to this poll has now been served. Only a raise
+            // applied by *this* poll's response can colour the next wait.
             pause_outlived_code = None;
+            interval_raised = false;
 
             let result = match self
                 .http
@@ -1789,7 +1808,9 @@ impl OidcDeviceAuth {
                     // device code expires. This also lets a temporarily
                     // unreachable token endpoint recover during an active flow.
                     if e.status() == Some(429) || e.retry_after_secs().is_some() {
+                        let previous = interval;
                         interval = backoff(interval, e.retry_after_secs(), false);
+                        interval_raised = interval > previous;
                     }
                     continue;
                 }
@@ -1820,7 +1841,9 @@ impl OidcDeviceAuth {
                     // since this branch short-circuits before the error-body match
                     // below that otherwise handles slow_down.
                     let slow_down = body.get("error").and_then(Value::as_str) == Some("slow_down");
+                    let previous = interval;
                     interval = backoff(interval, retry_after, slow_down);
+                    interval_raised = interval > previous;
                 }
                 continue;
             }
@@ -1838,7 +1861,9 @@ impl OidcDeviceAuth {
             match body.get("error").and_then(Value::as_str) {
                 Some("authorization_pending") => continue,
                 Some("slow_down") => {
+                    let previous = interval;
                     interval = backoff(interval, retry_after, true);
+                    interval_raised = interval > previous;
                     continue;
                 }
                 Some("expired_token") => {

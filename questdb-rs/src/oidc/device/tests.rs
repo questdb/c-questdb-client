@@ -2918,6 +2918,94 @@ fn a_pause_that_outlives_the_device_code_reports_the_pause() {
 }
 
 #[test]
+fn an_ordinary_expiry_does_not_blame_a_pause() {
+    // Regression: the pause diagnostic was gated on `owed > remaining` alone,
+    // which is true on the LAST wait of every flow whose device-code lifetime
+    // is not an exact multiple of the interval plus the round-trip time -- i.e.
+    // essentially all of them. A user who simply walked away was then told the
+    // identity provider had required a pause, and that "Nothing was wrong with
+    // the authorization", when the authorization was exactly what was wrong.
+    //
+    // Every other test here hides this because the virtual clock advances only
+    // by the amount slept, making the lifetime an exact multiple. This one
+    // charges each poll a round trip, which is what any real flow does.
+    struct RecordFailures(Arc<std::sync::Mutex<Vec<String>>>);
+    impl Renderer for RecordFailures {
+        fn on_failure(&self, message: &str) {
+            self.0.lock().unwrap().push(message.to_string());
+        }
+    }
+
+    const RTT_NS: u64 = 100_000_000; // 100ms per poll.
+    let base = Instant::now();
+    let virtual_ns = Arc::new(AtomicU64::new(0));
+    let polls = Arc::new(AtomicUsize::new(0));
+    let mock = {
+        let polls = Arc::clone(&polls);
+        let rtt_ns = Arc::clone(&virtual_ns);
+        // No `Retry-After`, and never `slow_down`: the interval stays at the
+        // advertised 5s for the whole flow, so nothing the IdP did ended it.
+        MockServer::start(move |method, path, _body| match (method, path) {
+            ("POST", "/device") => (
+                200,
+                serde_json::json!({
+                    "device_code": "DEV-CODE-123",
+                    "user_code": "WXYZ-1234",
+                    "verification_uri": "https://idp.example.com/activate",
+                    "expires_in": 63,
+                    "interval": 5
+                })
+                .to_string(),
+            ),
+            ("POST", "/token") => {
+                polls.fetch_add(1, Ordering::SeqCst);
+                rtt_ns.fetch_add(RTT_NS, Ordering::SeqCst);
+                (400, r#"{"error":"authorization_pending"}"#.to_string())
+            }
+            _ => (404, "{}".to_string()),
+        })
+    };
+    let failures = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let now_ns = Arc::clone(&virtual_ns);
+    let sleep_ns = Arc::clone(&virtual_ns);
+    let auth = OidcDeviceAuth::builder()
+        .client_id("questdb")
+        .device_authorization_endpoint(mock.url("/device"))
+        .token_endpoint(mock.url("/token"))
+        .interactive(true)
+        .open_browser(false)
+        .renderer(RecordFailures(Arc::clone(&failures)))
+        .now_hook(Arc::new(move || {
+            base + Duration::from_nanos(now_ns.load(Ordering::SeqCst))
+        }))
+        .sleep_hook(Arc::new(move |d: Duration| {
+            sleep_ns.fetch_add(d.as_nanos() as u64, Ordering::SeqCst);
+        }))
+        .build()
+        .expect("build");
+
+    let err = auth.sign_in().unwrap_err();
+    // The terminal condition is unchanged: expiry, tagged `expired_token`.
+    assert_eq!(err.kind(), OidcErrorKind::Timeout);
+    assert_eq!(err.idp_error(), Some("expired_token"));
+    // The flow really did run to the deadline over many polls, so the last
+    // wait was the partial one that used to trip the diagnostic.
+    assert!(polls.load(Ordering::SeqCst) > 5, "the flow ended too early");
+    let msg = err.message().to_string();
+    assert!(
+        !msg.contains("poll interval the IdP imposed"),
+        "an ordinary expiry must not blame the IdP: {msg}"
+    );
+    let failures = failures.lock().unwrap();
+    assert_eq!(failures.len(), 1, "got: {failures:?}");
+    assert!(
+        failures[0].starts_with("Code expired"),
+        "an ordinary expiry must report itself as one: {:?}",
+        failures[0]
+    );
+}
+
+#[test]
 fn a_conformant_interval_is_not_sliced() {
     // The slice must not change the shape of an ordinary flow: an interval at
     // or below MAX_POLL_INTERVAL is still served as exactly one wait.
