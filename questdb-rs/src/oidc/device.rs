@@ -2006,10 +2006,17 @@ impl OidcDeviceAuth {
         // (for example DPoP), or persistence would also erase that distinction
         // and reload it as Bearer after restart. Retain the historical default
         // for IdPs that omit token_type, and normalize mixed-case Bearer.
-        let token_type = match str_field_val(body.get("token_type")) {
-            Some(value) if value.eq_ignore_ascii_case("Bearer") => "Bearer".to_string(),
+        let token_type = match body.get("token_type") {
+            Some(Value::String(value))
+                if !value.is_empty() && value.eq_ignore_ascii_case("Bearer") =>
+            {
+                "Bearer".to_string()
+            }
             Some(value) => {
-                let display = strip_control_capped(&value, MAX_IDP_FIELD_CHARS);
+                let display = match value {
+                    Value::String(value) => strip_control_capped(value, MAX_IDP_FIELD_CHARS),
+                    value => strip_control_capped(&value.to_string(), MAX_IDP_FIELD_CHARS),
+                };
                 return Err(OidcError::config(format!(
                     "The identity provider returned unsupported token_type {display:?}; this client supports only Bearer tokens."
                 )));

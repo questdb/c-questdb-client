@@ -433,7 +433,9 @@ fn str_setting(value: Option<&serde_json::Value>) -> Option<String> {
 /// discovery (which requires an `issuer` pin).
 fn resolve_endpoint(value: Option<&serde_json::Value>) -> Option<String> {
     let s = str_setting(value)?;
-    if s.starts_with("https://") || s.starts_with("http://") {
+    let uri: Uri = s.parse().ok()?;
+    let scheme = uri.scheme_str()?.to_ascii_lowercase();
+    if scheme == "https" || scheme == "http" {
         Some(s)
     } else {
         None
@@ -1060,6 +1062,25 @@ mod tests {
         let settings = serde_json::json!({"acl.oidc.client.id": "legacy"});
         let cfg = settings_config(&settings);
         assert_eq!(str_setting(cfg.get(K_CLIENT_ID)).as_deref(), Some("legacy"));
+    }
+
+    #[test]
+    fn settings_endpoint_scheme_is_case_insensitive() {
+        for endpoint in ["HTTPS://idp.example.com/token", "hTtP://127.0.0.1/device"] {
+            let value = serde_json::Value::String(endpoint.to_string());
+            assert_eq!(resolve_endpoint(Some(&value)).as_deref(), Some(endpoint));
+        }
+    }
+
+    #[test]
+    fn settings_endpoint_requires_an_http_uri() {
+        for value in [
+            serde_json::Value::String("/relative/token".to_string()),
+            serde_json::Value::String("ftp://idp.example.com/token".to_string()),
+            serde_json::Value::Number(123.into()),
+        ] {
+            assert_eq!(resolve_endpoint(Some(&value)), None);
+        }
     }
 
     #[test]

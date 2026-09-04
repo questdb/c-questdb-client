@@ -739,6 +739,31 @@ fn initial_non_bearer_token_type_is_rejected() {
 }
 
 #[test]
+fn initial_malformed_token_types_are_rejected() {
+    for invalid in ["\"\"", "null", "123", "{}", "[]"] {
+        let response =
+            format!(r#"{{"access_token":"AT-1","token_type":{invalid},"expires_in":300}}"#);
+        let mock = MockServer::start(move |method, path, _body| match (method, path) {
+            ("POST", "/device") => (200, device_response()),
+            ("POST", "/token") => (200, response.clone()),
+            _ => (404, "{}".to_string()),
+        });
+        let auth = explicit_auth(&mock, false);
+
+        let error = auth.sign_in().unwrap_err();
+        assert_eq!(error.kind(), OidcErrorKind::Config, "token_type={invalid}");
+        assert!(
+            error.message().contains("unsupported token_type"),
+            "token_type={invalid}: {error}"
+        );
+        assert!(
+            auth.token_set().is_none(),
+            "malformed token_type={invalid} was cached"
+        );
+    }
+}
+
+#[test]
 fn refreshed_non_bearer_token_type_is_rejected() {
     let token_calls = Arc::new(AtomicUsize::new(0));
     let mock = {
@@ -769,6 +794,35 @@ fn refreshed_non_bearer_token_type_is_rejected() {
         cached.refresh_token.is_none(),
         "the submitted refresh-token parent remained reusable"
     );
+}
+
+#[test]
+fn refreshed_malformed_token_types_are_rejected() {
+    for invalid in ["\"\"", "null", "123", "{}", "[]"] {
+        let response = format!(
+            r#"{{"access_token":"AT-2","refresh_token":"RT-2","token_type":{invalid},"expires_in":300}}"#
+        );
+        let mock = MockServer::start(move |method, path, _body| match (method, path) {
+            ("POST", "/token") => (200, response.clone()),
+            _ => (404, "{}".to_string()),
+        });
+        let auth = explicit_auth(&mock, false);
+        *auth.tokens.lock().unwrap() = Some(expired_tokens("RT-1"));
+
+        let error = auth.token().unwrap_err();
+        assert_eq!(error.kind(), OidcErrorKind::Config, "token_type={invalid}");
+        assert!(
+            error.message().contains("unsupported token_type"),
+            "token_type={invalid}: {error}"
+        );
+        let cached = auth
+            .token_set()
+            .expect("the expired parent remains inspectable");
+        assert!(
+            cached.refresh_token.is_none(),
+            "malformed token_type={invalid} left the submitted parent reusable"
+        );
+    }
 }
 
 #[test]
