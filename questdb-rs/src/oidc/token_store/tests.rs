@@ -1263,7 +1263,7 @@ fn in_lock_serialises_concurrent_holders() {
 }
 
 #[test]
-fn in_lock_degrades_to_atomic_layer_after_acquire_timeout() {
+fn in_lock_refuses_to_run_after_acquire_timeout() {
     let dir = TempDir::new().unwrap();
     let key = test_key();
     let store =
@@ -1273,18 +1273,49 @@ fn in_lock_degrades_to_atomic_layer_after_acquire_timeout() {
 
     let ran = Arc::new(AtomicBool::new(false));
     let r = Arc::clone(&ran);
-    store
+    let error = store
         .in_lock(&key, &mut || {
             r.store(true, Ordering::SeqCst);
             Ok(())
         })
-        .unwrap();
+        .unwrap_err();
 
     assert!(
-        ran.load(Ordering::SeqCst),
-        "action did not use Layer 1 fallback"
+        !ran.load(Ordering::SeqCst),
+        "refresh action ran without the identity lock"
+    );
+    assert_eq!(
+        error
+            .downcast_ref::<std::io::Error>()
+            .map(std::io::Error::kind),
+        Some(std::io::ErrorKind::WouldBlock)
     );
     assert!(lock.exists(), "contender removed the peer's live lock");
+}
+
+#[test]
+fn process_lock_registry_does_not_retain_unused_paths() {
+    let dir = TempDir::new().unwrap();
+    let retired_path = dir.path().join("retired.lock");
+    let retained = process_lock_for(&retired_path);
+    let weak = Arc::downgrade(&retained);
+    drop(retained);
+    assert!(
+        weak.upgrade().is_none(),
+        "the registry retained a strong reference"
+    );
+
+    // Any later lookup prunes dead entries. Inspect only this unique temp path
+    // so concurrently running token-store tests cannot affect the assertion.
+    let live_path = dir.path().join("live.lock");
+    let _live = process_lock_for(&live_path);
+    let registry = PROCESS_LOCKS
+        .get()
+        .expect("process registry initialized")
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    assert!(!registry.contains_key(&retired_path));
+    assert!(registry.contains_key(&live_path));
 }
 
 #[test]
@@ -1354,14 +1385,20 @@ fn fresh_empty_java_identity_lock_is_not_stolen() {
 
     let ran = Arc::new(AtomicBool::new(false));
     let r = Arc::clone(&ran);
-    store
+    let error = store
         .in_lock(&key, &mut || {
             r.store(true, Ordering::SeqCst);
             Ok(())
         })
-        .unwrap();
+        .unwrap_err();
 
-    assert!(ran.load(Ordering::SeqCst));
+    assert!(!ran.load(Ordering::SeqCst));
+    assert_eq!(
+        error
+            .downcast_ref::<std::io::Error>()
+            .map(std::io::Error::kind),
+        Some(std::io::ErrorKind::WouldBlock)
+    );
     assert!(
         lock.exists(),
         "native contention stole a Java lock inside the empty-file grace"

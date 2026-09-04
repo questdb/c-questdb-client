@@ -71,7 +71,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard, OnceLock, TryLockError};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock, TryLockError, Weak};
 use std::time::{Duration, Instant, SystemTime};
 
 use serde_json::Value;
@@ -96,9 +96,10 @@ const DIRECTORY_LOCK_STALE: Duration = Duration::from_secs(2);
 const DIRECTORY_LOCK_EMPTY_GRACE: Duration = Duration::from_secs(2);
 const EMPTY_LOCK_GRACE: Duration = Duration::from_secs(5);
 
-/// How long to spin trying to acquire a lock file. The directory lock is
-/// required; the per-identity refresh lock degrades to atomic replacement after
-/// this budget, matching the Java reference implementation.
+/// How long to spin trying to acquire a lock file. Both the directory and
+/// per-identity refresh locks are required: atomic replacement protects file
+/// integrity, but cannot prevent two processes from submitting the same
+/// rotating refresh token.
 const DEFAULT_LOCK_ACQUIRE_BUDGET: Duration = Duration::from_secs(3);
 /// Java caps the configurable budget at 30 seconds; use the same ceiling so the
 /// two clients have the same producer-path bound.
@@ -384,9 +385,9 @@ impl TokenStoreKey {
 /// (and other language clients), so it must keep a concurrent reader from
 /// observing a half-written entry. A store reports failure by returning `Err`.
 /// Lazy-load and fresh-sign-in persistence failures are best-effort. During a
-/// refresh, load/clear failures are retryable and abort the attempt; failure to
-/// acquire a best-effort cross-process refresh lock may instead degrade to the
-/// store's atomic replacement layer.
+/// refresh, lock/load/clear failures are retryable and abort the attempt. The
+/// refresh action must never run without its cross-process identity lock:
+/// atomic replacement cannot prevent reuse of a rotating refresh token.
 ///
 /// **Security — [`load`](Self::load) MUST re-verify identity.** `OidcDeviceAuth`
 /// does not re-check the returned token against `key`; it trusts `load` to only
@@ -467,12 +468,11 @@ pub trait TokenStore: Send + Sync {
     /// refresh by another process sharing this identity is observed rather than
     /// raced, and return its result.
     ///
-    /// Stores should coordinate all processes sharing their backing state. The
-    /// file implementation follows the frozen Java contract: it waits for a
-    /// bounded time, then invokes `action` under its in-process lock without the
-    /// cross-process lock, relying on atomic replacement rather than stalling a
-    /// sign-in indefinitely. That fallback can cause one extra sign-in with an
-    /// IdP that rotates and reuse-detects refresh tokens.
+    /// Stores must coordinate all processes sharing their backing state. If the
+    /// lock cannot be acquired within the store's bounded wait, return an error
+    /// without invoking `action`. Running it unlocked can submit one rotating
+    /// refresh token twice and cause a reuse-detecting IdP to revoke the entire
+    /// token family.
     ///
     /// `action` re-enters this store through [`load`](Self::load),
     /// [`save`](Self::save), or [`clear`](Self::clear). The coordination lock
@@ -832,11 +832,10 @@ impl FileTokenStore {
     fn acquire_lock(
         &self,
         lock: &Path,
-        required: bool,
         stale_after: Duration,
         empty_grace: Duration,
         cancelled: &dyn Fn() -> bool,
-    ) -> TokenStoreResult<Option<HeldLock>> {
+    ) -> TokenStoreResult<HeldLock> {
         // `lock_acquire_budget` is clamped in `with_lock_timings`, so this add
         // cannot overflow.
         let deadline = Instant::now() + self.lock_acquire_budget;
@@ -847,10 +846,10 @@ impl FileTokenStore {
             }
             match create_lock_file(lock, &stamp) {
                 Ok(()) => {
-                    return Ok(Some(HeldLock {
+                    return Ok(HeldLock {
                         lock: lock.to_path_buf(),
                         stamp,
-                    }));
+                    });
                 }
                 Err(e)
                     if e.kind() == std::io::ErrorKind::AlreadyExists
@@ -859,34 +858,25 @@ impl FileTokenStore {
                     // Java uses this same capture-then-verify reclaim protocol.
                     // It handles a killed peer without a path-only delete that
                     // could displace a freshly-created successor lock.
-                    let _ = steal_if_stale(lock, stale_after, empty_grace);
+                    // A zero acquire budget is still allowed to reclaim a lock
+                    // already proven stale. Retry create_new once after the
+                    // successful capture instead of reporting a timeout merely
+                    // because the original collision consumed the budget.
+                    if steal_if_stale(lock, stale_after, empty_grace) {
+                        continue;
+                    }
                     if Instant::now() >= deadline {
-                        if required {
-                            return Err(Box::new(std::io::Error::new(
-                                std::io::ErrorKind::WouldBlock,
-                                format!(
-                                    "could not acquire the required OIDC token-store lock {lock:?} within {:?}",
-                                    self.lock_acquire_budget
-                                ),
-                            )));
-                        }
-                        log::warn!(
-                            "questdb oidc: could not acquire the token-store lock {:?}; running this refresh without cross-process coordination",
-                            lock
-                        );
-                        return Ok(None);
+                        return Err(Box::new(std::io::Error::new(
+                            std::io::ErrorKind::WouldBlock,
+                            format!(
+                                "could not acquire the required OIDC token-store lock {lock:?} within {:?}",
+                                self.lock_acquire_budget
+                            ),
+                        )));
                     }
                     std::thread::sleep(LOCK_POLL_SLICE);
                 }
-                Err(e) if required => return Err(Box::new(e)),
-                Err(e) => {
-                    log::warn!(
-                        "questdb oidc: could not acquire the token-store lock {:?}; running this refresh without cross-process coordination: {}",
-                        lock,
-                        e
-                    );
-                    return Ok(None);
-                }
+                Err(e) => return Err(Box::new(e)),
             }
         }
     }
@@ -944,9 +934,7 @@ impl FileTokenStore {
         } else {
             EMPTY_LOCK_GRACE
         };
-        let held = self
-            .acquire_lock(&lock, true, stale_after, empty_grace, cancelled)?
-            .expect("a required lock never degrades");
+        let held = self.acquire_lock(&lock, stale_after, empty_grace, cancelled)?;
         let scope = HeldLockScope::enter(lock.clone());
 
         let trusted = prepare_directory_trust(&self.directory, &self.untrusted_sentinel())?;
@@ -981,9 +969,9 @@ impl FileTokenStore {
         self.with_directory_lock(cancelled, |_| Ok(()))
     }
 
-    /// Run under this identity's process and filesystem locks. The filesystem
-    /// lock follows Java's best-effort Layer 2 contract: after the bounded wait,
-    /// the action still runs under the in-process lock and atomic-file Layer 1.
+    /// Run under this identity's process and filesystem locks. Both are
+    /// required: atomic replacement alone protects file integrity, not the
+    /// single-consumer semantics of a rotating refresh token.
     fn with_lock<T>(
         &self,
         key: &TokenStoreKey,
@@ -1003,9 +991,13 @@ impl FileTokenStore {
         let process_lock = process_lock_for(&lock);
         let _process_guard =
             lock_process_cancellable(&process_lock, self.lock_acquire_budget, cancelled)?;
-        let _scope = HeldLockScope::enter(lock.clone());
         self.prepare_directory(cancelled)?;
-        let held = self.acquire_lock(&lock, false, self.lock_stale, EMPTY_LOCK_GRACE, cancelled)?;
+        let held = self.acquire_lock(&lock, self.lock_stale, EMPTY_LOCK_GRACE, cancelled)?;
+        // Re-entrant load/save/clear calls from `action` may bypass this same
+        // identity lock. Publish thread ownership only after the filesystem
+        // lease was actually obtained; the previous order falsely marked an
+        // unlocked fallback as coordinated.
+        let _scope = HeldLockScope::enter(lock.clone());
         let result = if cancelled() {
             Err(cancelled_error())
         } else {
@@ -1385,14 +1377,21 @@ impl Drop for HeldLock {
 /// In-process serialization keyed by the same lock pathname used between
 /// processes. The filesystem protocol is not re-entrant and Rust callers can
 /// otherwise contend with another thread in the same process unnecessarily.
+static PROCESS_LOCKS: OnceLock<Mutex<HashMap<PathBuf, Weak<Mutex<()>>>>> = OnceLock::new();
+
 fn process_lock_for(lock: &Path) -> Arc<Mutex<()>> {
-    static LOCKS: OnceLock<Mutex<HashMap<PathBuf, Arc<Mutex<()>>>>> = OnceLock::new();
-    let locks = LOCKS.get_or_init(|| Mutex::new(HashMap::new()));
+    let locks = PROCESS_LOCKS.get_or_init(|| Mutex::new(HashMap::new()));
     let mut locks = locks.lock().unwrap_or_else(|e| e.into_inner());
-    locks
-        .entry(lock.to_path_buf())
-        .or_insert_with(|| Arc::new(Mutex::new(())))
-        .clone()
+    // A store path is often stable, but multi-tenant and configuration-churn
+    // processes can use an unbounded number. Weak entries preserve same-path
+    // synchronization without retaining every historical path forever.
+    locks.retain(|_, value| value.strong_count() != 0);
+    if let Some(existing) = locks.get(lock).and_then(Weak::upgrade) {
+        return existing;
+    }
+    let created = Arc::new(Mutex::new(()));
+    locks.insert(lock.to_path_buf(), Arc::downgrade(&created));
+    created
 }
 
 /// Take the in-process lock guarding one store path, bounded by `budget`.
