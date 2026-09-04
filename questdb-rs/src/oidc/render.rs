@@ -466,7 +466,7 @@ const MAX_STACKING_MARK_RUN: usize = 4;
 /// controls, zero-width characters, enclosing combining marks, private-use
 /// characters, and other invisible formatting are removed. Non-ASCII whitespace
 /// is folded to an ordinary space, and a run of stacking combining marks is
-/// truncated to [`MAX_STACKING_MARK_RUN`]. This is suitable for human-readable
+/// truncated to a bounded length. This is suitable for human-readable
 /// labels and messages; URLs and short authentication codes need the stricter
 /// display accessors on [`DeviceCodeChallenge`] so confusable non-ASCII
 /// characters are also made visible. This sanitizer never fails.
@@ -477,7 +477,7 @@ const MAX_STACKING_MARK_RUN: usize = 4;
 /// semantics to would pass until the ranges here are updated. It is the last
 /// line before a terminal or a notebook DOM, not the only one -- the fields it
 /// guards are separately length-capped, and the actionable URL is vetted by
-/// [`safe_target`] rather than merely sanitized.
+/// the crate's URL vetter rather than merely sanitized.
 pub fn sanitize_display_text(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     let mut mark_run = 0usize;

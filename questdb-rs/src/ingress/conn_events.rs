@@ -53,7 +53,7 @@ pub enum ConnectionEventKind {
     ///
     /// When `host` and `port` are `None` the credential was never offered to
     /// anyone -- a token provider failed before any endpoint was dialled (see
-    /// [`ConnectionEvents::token_provider_failed`]). That is **retryable**:
+    /// `ConnectionEvents::token_provider_failed`). That is **retryable**:
     /// `classify_provider_error` keeps such a failure a `SocketError` so the
     /// store-and-forward drainer holds queued frames while a human signs in,
     /// and the sender goes on reconnecting. A listener that pages, tears down

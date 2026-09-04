@@ -410,7 +410,7 @@ impl Error {
     /// The structured OIDC failure in this error's causal chain, if any.
     ///
     /// `Some` means an OIDC failure *caused* this error, not that this error
-    /// is one: [`reclassified`](Self::reclassified) deliberately preserves the
+    /// is one: `reclassified` deliberately preserves the
     /// payload, so a token-provider failure re-coded to a retryable
     /// [`SocketError`](crate::ErrorCode::SocketError), or a failover that then
     /// exhausted its budget, both still answer `Some` while [`code`](Self::code)
