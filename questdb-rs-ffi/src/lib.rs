@@ -2016,7 +2016,15 @@ pub unsafe extern "C" fn line_sender_buffer_column_dec128(
 
 /// Record a UUID column value. QWP-only.
 ///
+/// `hi` is the most significant 64 bits of the UUID and `lo` the least
+/// significant, the same split as `java.util.UUID`. Both halves are
+/// big-endian reads of the canonical 16-byte form, so for
+/// `123e4567-e89b-12d3-a456-426614174000`, `hi` is `0x123e4567e89b12d3` and
+/// `lo` is `0xa456426614174000`.
+///
 /// The wire encoding writes `lo` (8 bytes LE) followed by `hi` (8 bytes LE).
+/// Do not derive the arguments from that layout: decoding either half
+/// little-endian silently writes a byte-reversed UUID.
 /// For canonical RFC-4122 bytes, use `qwp_chunk_column_uuid` instead of
 /// splitting the bytes into `lo` and `hi`.
 #[unsafe(no_mangle)]
