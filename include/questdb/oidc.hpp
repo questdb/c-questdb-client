@@ -339,7 +339,9 @@ public:
      * permanent close and dropping the in-memory credential, regardless of
      * which thread called it; waiting for the callback's authentication
      * operation could deadlock when the callback delegates close to that thread
-     * and joins it. A later close after the callback returns performs the drain.
+     * and joins it. Publishing does not wait for that authentication operation,
+     * though it may briefly contend with wait registration. A later close after
+     * the callback returns performs the drain.
      */
     void close() const
     {

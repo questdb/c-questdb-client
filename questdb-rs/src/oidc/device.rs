@@ -467,9 +467,10 @@ impl OidcDeviceAuthBuilder {
 /// # Concurrency
 ///
 /// The acquisition lock is held for a whole interactive sign-in. A caller with a
-/// valid cached token remains lock-free; a [`token`](Self::token) call waits for
-/// a bounded period behind another caller's silent refresh, but fails fast with
-/// `InteractionRequired` behind an interactive sign-in. A custom [`Renderer`]'s
+/// valid cached token does not wait for that critical section; a
+/// [`token`](Self::token) call waits for a bounded period behind another caller's
+/// silent refresh, but fails fast with `InteractionRequired` behind an interactive
+/// sign-in. A custom [`Renderer`]'s
 /// callbacks (and the `sleep` hook) run while this lock is held. They must not
 /// re-enter [`sign_in`](Self::sign_in) or [`clear`](Self::clear) on the same
 /// instance because that lock is not re-entrant. Re-entrant `token()` calls fail
@@ -589,10 +590,11 @@ impl OidcDeviceAuth {
     /// Publish the permanent close and wake every cancellable wait, without
     /// draining the acquisition critical section.
     ///
-    /// Unlike [`close`](Self::close) this never blocks and never takes the
-    /// acquisition lock, so it is safe from any thread including a [`Renderer`]
-    /// callback running inside that very section. The caller gives up the
-    /// guarantee that token work has stopped by the time it returns.
+    /// Unlike [`close`](Self::close) this never waits for the acquisition lock,
+    /// so it is safe from any thread including a [`Renderer`] callback running
+    /// inside that very section. It may briefly contend with a waiter registering
+    /// on `close_wait`; the caller also gives up the guarantee that token work has
+    /// stopped by the time it returns.
     pub fn signal_close(&self) {
         // Publish and notify under the same mutex `wait_or_cancel` parks on.
         // Storing outside it races that waiter's `is_closed()` re-check: the
@@ -734,9 +736,10 @@ impl OidcDeviceAuth {
     /// yet (or the cache was [`clear`](Self::clear)ed).
     ///
     /// A read-only snapshot for inspecting token metadata (expiry, scope, type)
-    /// — this never prompts, acquires, or refreshes, and never blocks behind an
-    /// in-flight sign-in. The returned set may be at or past expiry; check
-    /// [`expires_at`](TokenSet::expires_at) if that matters.
+    /// — this never prompts, acquires, or refreshes, and does not wait for an
+    /// in-flight sign-in's acquisition critical section. The returned set may be
+    /// at or past expiry; check [`expires_at`](TokenSet::expires_at) if that
+    /// matters.
     ///
     /// ```no_run
     /// # use questdb::oidc::OidcDeviceAuth;
@@ -969,9 +972,10 @@ impl OidcDeviceAuth {
 
     fn obtain_tokens(&self, allow_interaction: bool) -> Result<TokenSet> {
         self.ensure_open()?;
-        // token() keeps the cache-hit path lock-free. sign_in() is an explicit
-        // lifecycle operation and mirrors Java by taking the acquisition lock,
-        // where it also clears retry throttles before doing any network work.
+        // token() keeps the cache-hit path out of the acquisition critical
+        // section. sign_in() is an explicit lifecycle operation and mirrors Java
+        // by taking that lock, where it also clears retry throttles before doing
+        // any network work.
         if !allow_interaction && let Some(tokens) = self.cached_if_valid() {
             return Ok(tokens);
         }
