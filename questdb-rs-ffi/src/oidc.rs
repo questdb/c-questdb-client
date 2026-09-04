@@ -89,7 +89,7 @@ struct OidcBuilderConfig {
     interactive: Option<bool>,
     default_interval: Option<u64>,
     timeout_ms: Option<u64>,
-    renderer: Option<Arc<CEventHandler>>,
+    renderer: Option<Arc<CEventTarget>>,
     file_store: FileStoreConfig,
 }
 
@@ -115,7 +115,7 @@ impl OidcBuilderConfig {
         }
     }
 
-    fn build(&self) -> Result<OidcDeviceAuth, Error> {
+    fn build(&self) -> Result<(OidcDeviceAuth, Option<Arc<CEventHandler>>), Error> {
         let mut builder = match &self.source {
             BuilderSource::Explicit => OidcDeviceAuth::builder(),
             BuilderSource::QuestDb(url) => OidcDeviceAuth::from_questdb(url.clone()),
@@ -157,7 +157,15 @@ impl OidcBuilderConfig {
         if let Some(value) = self.timeout_ms {
             builder = builder.timeout(Duration::from_millis(value));
         }
-        if let Some(renderer) = &self.renderer {
+        // The callback target and its caller-owned `user_data` are shared by
+        // every auth built from a reusable builder, but callback activity and
+        // cancellation belong to one auth state. Sharing the whole handler
+        // made a callback on sibling A look like B's own callback to close().
+        let event_handler = self
+            .renderer
+            .as_ref()
+            .map(|target| Arc::new(CEventHandler::new(Arc::clone(target))));
+        if let Some(renderer) = &event_handler {
             builder = builder.renderer(CEventRenderer(Arc::clone(renderer)));
         }
         match &self.file_store {
@@ -175,7 +183,8 @@ impl OidcBuilderConfig {
                 builder = builder.token_store(store);
             }
         }
-        builder.build().map_err(Into::into)
+        let auth = builder.build().map_err(Error::from)?;
+        Ok((auth, event_handler))
     }
 }
 
@@ -207,7 +216,7 @@ impl SharedOidcAuth {
     fn callback_is_active(&self) -> bool {
         self.event_handler
             .as_deref()
-            .is_some_and(CEventHandler::is_active)
+            .is_some_and(CEventHandler::target_is_active)
     }
 
     /// This thread is the one inside the callback: it already holds the
@@ -303,22 +312,26 @@ impl SharedOidcAuth {
     }
 
     fn close(&self) -> Result<(), Error> {
-        // Signalling is lock-free and cannot self-deadlock, so it always runs --
-        // including from this auth's own renderer callback, and from another
-        // thread while a callback happens to be in flight. Rejecting those was
-        // the bug: close is documented as the way to cancel a running device
-        // flow from another thread, and a renderer's own "cancel" affordance has
-        // nothing else to call.
+        // Wake a callback for this auth that is queued behind a sibling built
+        // from the same reusable builder. Without this, the sibling can hold
+        // its acquisition lock while waiting for the shared callback gate, and
+        // a callback that closes and joins that sibling waits forever.
+        if let Some(handler) = &self.event_handler {
+            handler.cancel();
+        }
         self.inner.signal_close();
-        // Only the drain can self-deadlock, and only for the thread actually
-        // running *this auth's own* callback: it alone holds the acquisition
-        // lock that the drain waits on. Every other caller must still wait,
-        // which is what the header promises. Keying this on the handler's
-        // shared `active` flag made an unrelated thread's close return early;
-        // keying it on a bare per-thread depth made a close on a *different*
-        // provider return early whenever this thread happened to be inside some
-        // other provider's callback, where no lock of ours is held at all.
-        if self.in_own_event_callback() {
+        // A callback may delegate close to a worker and join that worker. The
+        // worker is not in callback TLS, but draining there still deadlocks:
+        // sign_in owns the acquisition lock until the callback returns. There
+        // is no way to distinguish a joined delegate from an unrelated closer,
+        // so close is non-draining whenever THIS auth's callback is active on
+        // any thread. The per-auth flag is essential: a sibling sharing the
+        // same callback target must still drain its own unrelated work.
+        if self
+            .event_handler
+            .as_deref()
+            .is_some_and(CEventHandler::is_active)
+        {
             // The drain is skipped, but the credential teardown is not: it takes
             // only the tokens lock, so it is safe inside the critical section.
             // Without this the tokens stayed resident whenever close ran from a
@@ -376,37 +389,43 @@ pub type questdb_oidc_event_cb =
 /// jump (for example, C `longjmp`) across the Rust FFI frame.
 pub type questdb_oidc_user_data_release_cb = Option<unsafe extern "C" fn(user_data: *mut c_void)>;
 
-struct CEventHandler {
+struct CEventTarget {
     callback: unsafe extern "C" fn(*mut c_void, *const questdb_oidc_event),
     user_data: usize,
     /// May be absent only for a null, stateless `user_data` registration.
     release: questdb_oidc_user_data_release_cb,
-    /// One handler is shared by every auth built from a reusable builder.
-    /// Serialize those sibling auths before entering caller-owned state.
-    callback_gate: std::sync::Mutex<()>,
-    /// Callback reentry can arrive from a different thread, so this state must
-    /// be shared with every auth that uses the handler rather than thread-local.
+    /// Auths built from one reusable builder share caller-owned callback state,
+    /// so entry must remain serialized across those siblings.
+    callback_gate: std::sync::Mutex<CallbackGateState>,
+    callback_ready: std::sync::Condvar,
+    /// Whether any sibling is currently inside the shared callback target.
     active: AtomicBool,
+}
+
+#[derive(Default)]
+struct CallbackGateState {
+    held: bool,
+}
+
+/// Per-auth callback state. The target is shared by reusable-builder siblings;
+/// activity and cancellation are deliberately not.
+struct CEventHandler {
+    target: Arc<CEventTarget>,
+    active: AtomicBool,
+    cancelled: AtomicBool,
 }
 
 std::thread_local! {
     /// The C event handlers this thread is currently inside, innermost last.
     ///
-    /// `CEventHandler::active` is deliberately shared across threads — it backs
-    /// the re-entry rejection, which must fire for any caller while a callback
-    /// runs. But *self-deadlock* is a per-thread property: only the thread
-    /// executing the callback holds the acquisition lock, so only that thread
-    /// must skip `close`'s drain. Using the shared flag for that made a
-    /// `close()` on an unrelated thread skip the drain too, silently voiding
-    /// the contract that it waits for token work to stop.
+    /// Target activity is deliberately shared across threads — it backs the
+    /// re-entry rejection, which must fire for any caller while a callback runs.
+    /// This stack supplies only the more precise diagnostic: whether this
+    /// thread itself re-entered the auth or merely encountered a busy callback.
     ///
-    /// Handlers are recorded by identity, not merely counted. A bare depth
-    /// answered "am I inside *a* callback", which is the wrong question: it let
-    /// `close()` on provider B, called from inside provider A's callback, take
-    /// the skip-drain branch. Only A's acquisition lock is held on that thread,
-    /// so closing B could not have self-deadlocked and had no reason to skip its
-    /// drain — it returned while B's device flow was still running, contrary to
-    /// what both `oidc.h` and the Python binding promise.
+    /// Handlers are recorded by per-auth identity, not merely counted. Auths
+    /// built from one reusable builder share a target but not their activity or
+    /// cancellation state, so A's callback is never mistaken for B's.
     ///
     /// A stack rather than a single slot because two different handlers can
     /// nest: a renderer for A may drive B synchronously. Each entry must stay
@@ -433,11 +452,33 @@ struct ActiveEventHandler<'a> {
 }
 
 impl<'a> ActiveEventHandler<'a> {
-    fn enter(handler: &'a CEventHandler) -> Self {
+    fn enter(handler: &'a CEventHandler) -> Option<Self> {
+        let mut gate = handler
+            .target
+            .callback_gate
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        while gate.held && !handler.cancelled.load(Ordering::Acquire) {
+            gate = handler
+                .target
+                .callback_ready
+                .wait(gate)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+        }
+        if handler.cancelled.load(Ordering::Acquire) {
+            return None;
+        }
+        gate.held = true;
         let was_active = handler.active.swap(true, Ordering::AcqRel);
-        debug_assert!(!was_active, "callback gate must serialize handler entry");
+        debug_assert!(!was_active, "one auth cannot overlap its callbacks");
+        let target_was_active = handler.target.active.swap(true, Ordering::AcqRel);
+        debug_assert!(
+            !target_was_active,
+            "callback gate must serialize shared target entry"
+        );
+        drop(gate);
         IN_EVENT_CALLBACK.with(|stack| stack.borrow_mut().push(handler as *const _));
-        Self { handler }
+        Some(Self { handler })
     }
 }
 
@@ -454,16 +495,51 @@ impl Drop for ActiveEventHandler<'_> {
         });
         let was_active = self.handler.active.swap(false, Ordering::AcqRel);
         debug_assert!(was_active, "active callback guard must be balanced");
+        let target_was_active = self.handler.target.active.swap(false, Ordering::AcqRel);
+        debug_assert!(target_was_active, "target callback guard must be balanced");
+        let mut gate = self
+            .handler
+            .target
+            .callback_gate
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        debug_assert!(gate.held, "callback gate must be held during callback");
+        gate.held = false;
+        self.handler.target.callback_ready.notify_all();
     }
 }
 
 impl CEventHandler {
+    fn new(target: Arc<CEventTarget>) -> Self {
+        Self {
+            target,
+            active: AtomicBool::new(false),
+            cancelled: AtomicBool::new(false),
+        }
+    }
+
     fn is_active(&self) -> bool {
         self.active.load(Ordering::Acquire)
     }
+
+    fn target_is_active(&self) -> bool {
+        self.target.active.load(Ordering::Acquire)
+    }
+
+    fn cancel(&self) {
+        // Serialize the cancellation predicate with callback admission so
+        // close cannot miss a waiter between its predicate check and wait.
+        let _gate = self
+            .target
+            .callback_gate
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.cancelled.store(true, Ordering::Release);
+        self.target.callback_ready.notify_all();
+    }
 }
 
-impl Drop for CEventHandler {
+impl Drop for CEventTarget {
     fn drop(&mut self) {
         if let Some(release) = self.release {
             // SAFETY: registration transfers ownership of `user_data` and
@@ -478,13 +554,11 @@ struct CEventRenderer(Arc<CEventHandler>);
 
 impl CEventRenderer {
     fn invoke(&self, event: &questdb_oidc_event) {
-        let _serialized = self
-            .0
-            .callback_gate
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let _active = ActiveEventHandler::enter(&self.0);
-        unsafe { (self.0.callback)(self.0.user_data as *mut c_void, event) };
+        let Some(_active) = ActiveEventHandler::enter(&self.0) else {
+            return;
+        };
+        let target = &self.0.target;
+        unsafe { (target.callback)(target.user_data as *mut c_void, event) };
     }
 }
 
@@ -919,11 +993,12 @@ pub unsafe extern "C" fn questdb_oidc_builder_event_handler(
         };
         return false;
     }
-    builder.config.renderer = Some(Arc::new(CEventHandler {
+    builder.config.renderer = Some(Arc::new(CEventTarget {
         callback,
         user_data: user_data as usize,
         release,
-        callback_gate: std::sync::Mutex::new(()),
+        callback_gate: std::sync::Mutex::new(CallbackGateState::default()),
+        callback_ready: std::sync::Condvar::new(),
         active: AtomicBool::new(false),
     }));
     true
@@ -945,9 +1020,8 @@ pub unsafe extern "C" fn questdb_oidc_builder_build(
         return ptr::null_mut();
     }
     let config = unsafe { &(*builder).config };
-    let event_handler = config.renderer.clone();
     match config.build() {
-        Ok(auth) => Box::into_raw(Box::new(questdb_oidc_auth {
+        Ok((auth, event_handler)) => Box::into_raw(Box::new(questdb_oidc_auth {
             shared: SharedOidcAuth {
                 inner: Arc::new(auth),
                 event_handler,
@@ -1428,6 +1502,31 @@ mod tests {
         builder
     }
 
+    fn event_target(
+        callback: unsafe extern "C" fn(*mut c_void, *const questdb_oidc_event),
+        user_data: usize,
+        release: questdb_oidc_user_data_release_cb,
+    ) -> Arc<CEventTarget> {
+        Arc::new(CEventTarget {
+            callback,
+            user_data,
+            release,
+            callback_gate: std::sync::Mutex::new(CallbackGateState::default()),
+            callback_ready: std::sync::Condvar::new(),
+            active: AtomicBool::new(false),
+        })
+    }
+
+    fn event_handler(
+        callback: unsafe extern "C" fn(*mut c_void, *const questdb_oidc_event),
+        user_data: usize,
+        release: questdb_oidc_user_data_release_cb,
+    ) -> Arc<CEventHandler> {
+        Arc::new(CEventHandler::new(event_target(
+            callback, user_data, release,
+        )))
+    }
+
     #[test]
     fn null_token_is_an_empty_null_span() {
         let token = ptr::null();
@@ -1739,10 +1838,9 @@ mod tests {
         let cleared = unsafe { questdb_oidc_auth_clear(auth, &mut error) };
         unsafe { record_reentrant_result(state, cleared, error) };
 
-        // close is deliberately NOT guarded. It publishes the close signal
-        // lock-free and skips only the drain while a callback is active, so it
-        // stays available exactly where it is needed most: a renderer's own
-        // cancel affordance, and a watchdog thread cancelling a running flow.
+        // close is deliberately NOT guarded. It publishes the close signal and
+        // skips the drain whenever this auth's callback is active, including a
+        // worker the callback delegates to and joins.
         error = ptr::null_mut();
         let closed = unsafe { questdb_oidc_auth_close(auth, &mut error) };
         if closed && error.is_null() {
@@ -2095,13 +2193,11 @@ mod tests {
 
         let state = Arc::new(SerializedCallbackState::default());
         let user_data = Box::into_raw(Box::new(Arc::clone(&state))) as *mut c_void;
-        let handler = Arc::new(CEventHandler {
-            callback: record_serialized_callback,
-            user_data: user_data as usize,
-            release: Some(release_serialized_callback),
-            callback_gate: std::sync::Mutex::new(()),
-            active: AtomicBool::new(false),
-        });
+        let handler = event_handler(
+            record_serialized_callback,
+            user_data as usize,
+            Some(release_serialized_callback),
+        );
         let start = Arc::new(std::sync::Barrier::new(THREADS + 1));
         let threads: Vec<_> = (0..THREADS)
             .map(|_| {
@@ -2144,10 +2240,10 @@ mod tests {
                 Some(release_reentrant_state),
                 &mut error,
             ));
-            let handler = Arc::clone((*builder).config.renderer.as_ref().unwrap());
             let auth = questdb_oidc_builder_build(builder, &mut error);
             assert!(!auth.is_null());
             assert!(error.is_null());
+            let handler = Arc::clone((*auth).shared.event_handler.as_ref().unwrap());
             state.auth.store(auth, Ordering::SeqCst);
 
             // Enter through the same renderer used by the auth. sign_in,
@@ -2165,13 +2261,8 @@ mod tests {
 
     #[test]
     fn callback_thread_scope_is_per_thread_not_process_wide() {
-        // Regression: `close`'s drain was skipped whenever the handler's shared
-        // `active` flag was set -- by ANY thread, and by any sibling auth built
-        // from the same reusable builder. A close arriving from an unrelated
-        // thread therefore returned early without waiting for token work to
-        // stop, silently voiding the contract the header states. Self-deadlock
-        // is a per-thread property: only the thread inside the callback holds
-        // the acquisition lock, and only it may skip.
+        // The shared active flag drives busy rejection and callback-safe close,
+        // but the re-entry diagnostic remains scoped to the callback thread.
         unsafe {
             let builder = explicit_builder();
             let mut error = ptr::null_mut();
@@ -2181,13 +2272,7 @@ mod tests {
             let probe_other = Arc::clone(&observed_other_thread);
             let probe_self = Arc::clone(&observed_callback_thread);
 
-            let handler = Arc::new(CEventHandler {
-                callback: ignore_event,
-                user_data: 0,
-                release: None,
-                callback_gate: std::sync::Mutex::new(()),
-                active: AtomicBool::new(false),
-            });
+            let handler = event_handler(ignore_event, 0, None);
             assert!(!in_event_callback_of_on_this_thread(Some(&handler)));
             let probe_handler = Arc::clone(&handler);
             {
@@ -2211,11 +2296,11 @@ mod tests {
 
             assert!(
                 observed_callback_thread.load(Ordering::SeqCst),
-                "the callback's own thread must skip the drain"
+                "the callback's own thread must be identified as re-entry"
             );
             assert!(
                 !observed_other_thread.load(Ordering::SeqCst),
-                "an unrelated thread must still wait for the drain"
+                "an unrelated thread must be diagnosed as busy, not re-entry"
             );
             assert!(!handler.is_active());
             assert!(!in_event_callback_of_on_this_thread(Some(&handler)));
@@ -2226,24 +2311,11 @@ mod tests {
     #[test]
     fn callback_thread_scope_is_keyed_per_handler() {
         // The scope answers "is this thread inside *this handler's* callback",
-        // not "inside any callback". Only the handler actually running holds an
-        // acquisition lock on this thread, so a second provider's `close` has
-        // nothing to self-deadlock against and must still perform its drain.
-        //
-        // A bare per-thread depth counter got this wrong: a renderer for A that
-        // offered a "cancel everything" affordance and called close on B saw B
-        // take the skip-drain branch and return while B's device flow was still
-        // running -- contrary to `oidc.h` and to the Python docstring, both of
-        // which scope the exemption to "this provider's own renderer callback".
-        let make = || {
-            Arc::new(CEventHandler {
-                callback: ignore_event,
-                user_data: 0,
-                release: None,
-                callback_gate: std::sync::Mutex::new(()),
-                active: AtomicBool::new(false),
-            })
-        };
+        // not "inside any callback". A bare depth counter gave the wrong
+        // re-entry diagnostic for B while A's callback was running. Close now
+        // uses the per-auth shared activity flag instead, because a callback can
+        // delegate close to another thread and join it.
+        let make = || event_handler(ignore_event, 0, None);
         let a = make();
         let b = make();
         {
@@ -2273,11 +2345,69 @@ mod tests {
     }
 
     #[test]
+    fn reusable_builder_siblings_have_distinct_cancellable_callback_state() {
+        let target = event_target(ignore_event, 0, None);
+        let a = Arc::new(CEventHandler::new(Arc::clone(&target)));
+        let b = Arc::new(CEventHandler::new(target));
+        let in_a = ActiveEventHandler::enter(&a).expect("A callback enters");
+
+        assert!(a.is_active());
+        assert!(
+            !b.is_active(),
+            "A's callback must not mark sibling B active"
+        );
+        assert!(a.target_is_active(), "the shared target remains busy");
+        assert!(in_event_callback_of_on_this_thread(Some(&a)));
+        assert!(!in_event_callback_of_on_this_thread(Some(&b)));
+
+        // B is now queued behind A's shared callback gate. Closing B marks
+        // only B cancelled and wakes that waiter; it must not enter caller
+        // state after close or wait for A to return.
+        let started = Arc::new(std::sync::Barrier::new(2));
+        let waiter_started = Arc::clone(&started);
+        let waiting_b = Arc::clone(&b);
+        let waiter = std::thread::spawn(move || {
+            waiter_started.wait();
+            ActiveEventHandler::enter(&waiting_b).is_none()
+        });
+        started.wait();
+        b.cancel();
+        assert!(waiter.join().unwrap(), "cancelled sibling entered callback");
+        assert!(a.is_active(), "cancelling B must not cancel A");
+        drop(in_a);
+    }
+
+    #[test]
     fn auth_operations_from_another_thread_during_event_callback_are_rejected() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (device, _) = listener.accept().unwrap();
+            write_json_response(
+                device,
+                r#"{"device_code":"DEV-CODE","user_code":"ABCD-1234","verification_uri":"https://idp.example.com/activate","expires_in":600,"interval":5}"#,
+            );
+        });
+
         unsafe {
-            let builder = explicit_builder();
+            let builder = questdb_oidc_builder_new();
+            set_string(questdb_oidc_builder_client_id, builder, "questdb-c");
+            set_string(questdb_oidc_builder_scope, builder, "openid");
+            set_string(
+                questdb_oidc_builder_device_authorization_endpoint,
+                builder,
+                &format!("http://{address}/device"),
+            );
+            set_string(
+                questdb_oidc_builder_token_endpoint,
+                builder,
+                &format!("http://{address}/token"),
+            );
             let mut error = ptr::null_mut();
-            assert!(questdb_oidc_builder_interactive(builder, false, &mut error));
+            assert!(questdb_oidc_builder_interactive(builder, true, &mut error));
+            assert!(questdb_oidc_builder_open_browser(
+                builder, false, &mut error
+            ));
             let state = Arc::new(ReentrantCallState::default());
             let user_data = Box::into_raw(Box::new(Arc::clone(&state))) as *mut c_void;
             assert!(questdb_oidc_builder_event_handler(
@@ -2287,20 +2417,19 @@ mod tests {
                 Some(release_reentrant_state),
                 &mut error,
             ));
-            let handler = Arc::clone((*builder).config.renderer.as_ref().unwrap());
             let auth = questdb_oidc_builder_build(builder, &mut error);
             assert!(!auth.is_null());
             assert!(error.is_null());
             state.auth.store(auth, Ordering::SeqCst);
 
-            // The callback waits for another thread that tries every auth
-            // operation. sign_in, token and clear must fail before trying the
-            // core mutex held by a real interactive flow; close must succeed,
-            // since cancelling a running flow from another thread is the whole
-            // point of it.
-            CEventRenderer(handler).on_waiting(30.0);
+            // Enter through a real sign-in so the acquisition lock is held.
+            // The callback joins a worker that calls close: draining on that
+            // worker would wait for the callback itself and deadlock.
+            assert!(!questdb_oidc_auth_sign_in(auth, &mut error));
+            assert!(!error.is_null());
+            crate::questdb_error_free(error);
 
-            // Still refused -- the callback JOINS this worker, so a blocking
+            // sign_in, token and clear are refused -- the callback JOINS this worker, so a blocking
             // acquisition here would deadlock exactly as one on the callback's
             // own thread would. But the diagnostic is now thread-scoped: this
             // thread never entered a callback and must not be told it
@@ -2316,6 +2445,7 @@ mod tests {
             questdb_oidc_auth_free(auth);
             questdb_oidc_builder_free(builder);
         }
+        server.join().unwrap();
     }
 
     #[test]
@@ -2546,13 +2676,11 @@ mod tests {
     fn renderer_sanitizes_identity_and_failure_message() {
         let events = Arc::new(Mutex::new(EventLog::default()));
         let user_data = Box::into_raw(Box::new(Arc::clone(&events))) as *mut c_void;
-        let renderer = CEventRenderer(Arc::new(CEventHandler {
-            callback: record_event,
-            user_data: user_data as usize,
-            release: Some(release_events),
-            callback_gate: std::sync::Mutex::new(()),
-            active: AtomicBool::new(false),
-        }));
+        let renderer = CEventRenderer(event_handler(
+            record_event,
+            user_data as usize,
+            Some(release_events),
+        ));
 
         renderer.on_success(Some("alice\x1b[31m\u{202e}"), 300.0);
         renderer.on_failure("failed\n\u{200b}try again");

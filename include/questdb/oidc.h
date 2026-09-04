@@ -324,13 +324,15 @@ void questdb_oidc_auth_free(questdb_oidc_auth* auth);
  * shared work.
  *
  * Safe to call from any thread, including this auth's own event callback and
- * while a callback is running on another thread -- publishing the close never
- * blocks. It additionally waits for the running operation to leave the
- * authentication critical section, except when called *on the thread currently
- * executing a callback*, which runs inside that very section: only there does
- * it return as soon as the close is published. A call from any other thread
- * waits, even while a callback is in flight elsewhere. Unlike `sign_in`,
- * `token` and `clear`, it is never rejected as callback re-entry.
+ * while that callback is running on another thread -- publishing the close
+ * never blocks. It ordinarily waits for the running operation to leave the
+ * authentication critical section. While this auth's callback is active it
+ * instead returns as soon as close is published, regardless of which thread
+ * calls it: a callback may delegate close to a worker and join that worker, so
+ * draining there would deadlock just as it would on the callback thread itself.
+ * Activity on an independent auth built from the same reusable builder does
+ * not skip this auth's drain. Unlike `sign_in`, `token` and `clear`, close is
+ * never rejected as callback re-entry.
  *
  * The in-memory credential is dropped on every path, including the
  * skipped-drain one; only the wait is skipped. The persisted entry is
