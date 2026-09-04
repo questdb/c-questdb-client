@@ -1620,7 +1620,9 @@ fn spawn_stalled_background_orphan_drain_server() -> (u16, mpsc::Receiver<Vec<u8
 
         // Keep the orphan connection open until the test releases it. A
         // regression that waits for stalled orphan work would block close.
-        let _ = release_rx.recv_timeout(Duration::from_secs(6));
+        // The window matches the other stalled-orphan mocks: a shorter one
+        // lets a slow CI host time out before the test gets to release.
+        let _ = release_rx.recv_timeout(Duration::from_secs(10));
     });
 
     (port, rx, release_tx)
@@ -4282,7 +4284,11 @@ fn qwp_ws_background_orphan_close_is_bounded_and_leaves_orphan_recoverable() {
     );
     assert!(!orphan_slot.join(".failed").exists());
 
-    release_stalled_orphan.send(()).unwrap();
+    // Best-effort unblock: the mock server thread parks on a bounded
+    // `recv_timeout`, so on a slow host it can already have timed out and
+    // dropped the receiver. That is not a product failure, so do not
+    // turn the disconnected channel into a test failure.
+    let _ = release_stalled_orphan.send(());
 
     // The recovered slot delta-encodes, so it re-registers its dictionary with a
     // catch-up frame before replaying the data frame; use a server that expects
@@ -4353,7 +4359,11 @@ fn qwp_ws_background_orphan_close_interrupts_stalled_connect() {
     let recovered = recover_rx.recv_timeout(Duration::from_secs(5)).unwrap();
     assert_eq!(recovered.received_frames.len(), 1);
 
-    release_stalled_orphan.send(()).unwrap();
+    // Best-effort unblock: the mock server thread parks on a bounded
+    // `recv_timeout`, so on a slow host it can already have timed out and
+    // dropped the receiver. That is not a product failure, so do not
+    // turn the disconnected channel into a test failure.
+    let _ = release_stalled_orphan.send(());
 }
 
 #[test]
@@ -4386,7 +4396,11 @@ fn qwp_ws_background_orphan_close_does_not_dial_next_slot() {
     assert!(slot_has_sfa_file(&sf_dir.path().join("orphan-a")));
     assert!(slot_has_sfa_file(&sf_dir.path().join("orphan-b")));
 
-    release_stalled_orphan.send(()).unwrap();
+    // Best-effort unblock: the mock server thread parks on a bounded
+    // `recv_timeout`, so on a slow host it can already have timed out and
+    // dropped the receiver. That is not a product failure, so do not
+    // turn the disconnected channel into a test failure.
+    let _ = release_stalled_orphan.send(());
     server.join().unwrap();
 }
 
@@ -4430,7 +4444,11 @@ fn qwp_ws_background_orphan_close_interrupts_blocked_send() {
     drop(reopened);
     assert!(slot_has_sfa_file(&sf_dir.path().join("orphan")));
 
-    release_stalled_orphan.send(()).unwrap();
+    // Best-effort unblock: the mock server thread parks on a bounded
+    // `recv_timeout`, so on a slow host it can already have timed out and
+    // dropped the receiver. That is not a product failure, so do not
+    // turn the disconnected channel into a test failure.
+    let _ = release_stalled_orphan.send(());
     server.join().unwrap();
 }
 

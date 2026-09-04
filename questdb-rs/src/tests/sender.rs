@@ -598,6 +598,124 @@ fn test_clone_preserves_marker_rewind_state() -> TestResult {
     Ok(())
 }
 
+/// A rewind must unwind every table the bookmark spanned, not only the one
+/// being written when it was taken.
+///
+/// The rewind records the row and column counts each table had and truncates
+/// back to them, rather than copying what it would discard. That makes the
+/// interesting case several tables interleaved across the bookmark: tables
+/// written before it must keep exactly their earlier rows, tables created after
+/// it must disappear, and a table written both before and after must keep only
+/// the earlier rows. Columns introduced after the bookmark must go too, so
+/// reusing the table afterwards must not see them.
+#[cfg(feature = "_sender-qwp-ws")]
+#[test]
+fn test_bookmark_rewinds_every_table_it_spans() -> TestResult {
+    // QWP/WS specifically: this is the variant whose rewind point is captured
+    // by recording lengths. An ILP buffer takes a different path.
+    let mut buffer = Buffer::qwp_ws_with_max_name_len(127);
+
+    buffer.table("alpha")?.symbol("sym", "a1")?.at_now()?;
+    buffer.table("beta")?.symbol("sym", "b1")?.at_now()?;
+    assert_eq!(buffer.row_count(), 2);
+
+    let bookmark = buffer.bookmark()?;
+
+    // A table from before the bookmark, gaining a row and a new column.
+    buffer
+        .table("alpha")?
+        .symbol("sym", "a2")?
+        .symbol("extra", "late")?
+        .at_now()?;
+    // Another from before it.
+    buffer.table("beta")?.symbol("sym", "b2")?.at_now()?;
+    // And one that did not exist at all.
+    buffer.table("gamma")?.symbol("sym", "g1")?.at_now()?;
+    assert_eq!(buffer.row_count(), 5);
+
+    buffer.rewind_to_bookmark(bookmark)?;
+    assert_eq!(buffer.row_count(), 2, "only the pre-bookmark rows survive");
+
+    // The buffer stays usable, and the column added after the bookmark is gone:
+    // writing "alpha" again without it must still produce a coherent row.
+    buffer.table("alpha")?.symbol("sym", "a3")?.at_now()?;
+    assert_eq!(buffer.row_count(), 3);
+
+    // A table that only existed after the bookmark can be created afresh.
+    buffer.table("gamma")?.symbol("sym", "g2")?.at_now()?;
+    assert_eq!(buffer.row_count(), 4);
+
+    Ok(())
+}
+
+/// A rewind through the public surfaces must discard every row appended after
+/// the rewind point, not only the last one.
+///
+/// `row_count()` is a counter the rewind assigns directly, so it reads correct
+/// even while column data from the discarded rows is still buffered. The
+/// public signal that stays honest is `len()`, the encoded size a flush would
+/// produce: a buffer still holding leftovers reports more than one that only
+/// ever held the surviving rows.
+#[cfg(feature = "_sender-qwp-ws")]
+#[test]
+fn test_rewind_discards_every_row_after_the_rewind_point() -> TestResult {
+    fn write_rows(buffer: &mut Buffer, from: i64, to: i64) -> TestResult {
+        for i in from..to {
+            buffer
+                .table("trades")?
+                .symbol("sym", format!("sym-{i}").as_str())?
+                .column_i64("qty", i)?
+                .at(TimestampNanos::new(1_700_000_000_000_000_000 + i))?;
+            buffer
+                .table("quotes")?
+                .column_f64("bid", i as f64)?
+                .at(TimestampNanos::new(1_700_000_001_000_000_000 + i))?;
+        }
+        Ok(())
+    }
+
+    // QWP/WS specifically: this is the variant whose rewind point is captured
+    // by recording lengths. An ILP buffer takes a different path.
+    for api in ["marker", "bookmark"] {
+        let mut reference = Buffer::qwp_ws_with_max_name_len(127);
+        write_rows(&mut reference, 0, 2)?;
+
+        let mut buffer = Buffer::qwp_ws_with_max_name_len(127);
+        write_rows(&mut buffer, 0, 2)?;
+
+        let bookmark = if api == "marker" {
+            buffer.set_marker()?;
+            None
+        } else {
+            Some(buffer.bookmark()?)
+        };
+
+        // Three rows per table after the rewind point: unwinding one row is
+        // the case a single-row rollback happens to cover, unwinding several
+        // is not.
+        write_rows(&mut buffer, 2, 5)?;
+        assert_eq!(buffer.row_count(), 10);
+
+        match bookmark {
+            Some(bookmark) => buffer.rewind_to_bookmark(bookmark)?,
+            None => buffer.rewind_to_marker()?,
+        }
+
+        assert_eq!(
+            buffer.row_count(),
+            reference.row_count(),
+            "{api}: row count after the rewind"
+        );
+        assert_eq!(
+            buffer.len(),
+            reference.len(),
+            "{api}: a rewound buffer must hold exactly the surviving rows"
+        );
+    }
+
+    Ok(())
+}
+
 #[test]
 fn test_clear_bookmark_is_idempotent() -> TestResult {
     let mut buffer = Buffer::new(ProtocolVersion::V2);
