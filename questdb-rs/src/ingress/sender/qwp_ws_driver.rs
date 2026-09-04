@@ -2727,32 +2727,20 @@ pub(super) fn retry_budget_exhausted_error(
     last_error: Option<Error>,
 ) -> Error {
     let elapsed_ms = started.elapsed().as_millis();
-    let code = last_error
-        .as_ref()
-        .map_or(ErrorCode::SocketError, |err| err.code());
     let last_error_msg = last_error
         .as_ref()
         .map_or_else(|| "none".to_string(), |err| err.msg().to_string());
-    let qwp_ws_rejection = last_error
-        .as_ref()
-        .and_then(|err| err.qwp_ws_rejection().cloned());
-    let qwp_ws_role_reject = last_error
-        .as_ref()
-        .and_then(|err| err.qwp_ws_role_reject().cloned());
-
-    let mut err = Error::new(
-        code,
-        format!(
-            "{context} retry budget exhausted [attempts={attempts}, elapsed_ms={elapsed_ms}, last_error={last_error_msg}]"
-        ),
+    let msg = format!(
+        "{context} retry budget exhausted [attempts={attempts}, elapsed_ms={elapsed_ms}, last_error={last_error_msg}]"
     );
-    if let Some(rejection) = qwp_ws_rejection {
-        err = err.with_qwp_ws_rejection(rejection);
+
+    match last_error {
+        Some(err) => {
+            let code = err.code();
+            err.reclassified(code, msg)
+        }
+        None => Error::new(ErrorCode::SocketError, msg),
     }
-    if let Some(role_reject) = qwp_ws_role_reject {
-        err = err.with_qwp_ws_role_reject(role_reject);
-    }
-    err
 }
 
 pub(crate) trait PublicationLog {
@@ -4657,6 +4645,25 @@ mod tests {
     }
 
     #[test]
+    fn reconnect_retries_provider_failures_but_terminalizes_server_auth_rejection() {
+        let provider = crate::token_provider::TokenProvider::new(|| {
+            Err::<String, _>(Error::new(ErrorCode::ConfigError, "refresh unavailable"))
+        });
+        let provider_error = provider.bearer_header().unwrap_err();
+        assert_eq!(provider_error.code(), ErrorCode::SocketError);
+        assert!(
+            !reconnect_error_is_terminal(&provider_error),
+            "a callback can recover on its next invocation, so its failure must not poison SFA data"
+        );
+
+        let server_rejection = Error::new(ErrorCode::AuthError, "server rejected Bearer token");
+        assert!(
+            reconnect_error_is_terminal(&server_rejection),
+            "a completed handshake authentication rejection remains terminal"
+        );
+    }
+
+    #[test]
     fn reconnect_catch_up_splits_across_frames_when_server_caps_batch() {
         // Five recovered symbols and a server batch cap too small for a one-frame
         // re-registration: the driver must split the catch-up across multiple
@@ -5804,36 +5811,19 @@ mod tests {
             .unwrap();
         let _server_streams = server.join().unwrap();
 
-        // A short read timeout plus a retry loop instead of one indefinitely
-        // blocking read: on Windows the gate's CancelIoEx only cancels a recv
-        // already in flight, and Winsock shutdown() does not wake one entered
-        // afterwards, so a single read can straddle the shutdown and miss
-        // both wake-ups. Retrying sidesteps the race: once the gate has shut
-        // the replacement socket down, the next read attempt fails
-        // immediately. A missing reconnect registration still fails the test,
-        // because the gate never touches this socket and every attempt times
-        // out until the deadline.
+        // Start the read after shutdown to cover the Windows cancellation race:
+        // CancelIoEx sees no pending recv in this ordering, so the original
+        // socket itself must have been shut down. A missing reconnect
+        // registration still fails because this read times out.
         transport
             .stream
             .set_timeouts(Some(Duration::from_millis(100)), None)
             .unwrap();
-        let reader = thread::spawn(move || {
-            let deadline = std::time::Instant::now() + Duration::from_secs(10);
-            let mut byte = [0u8; 1];
-            loop {
-                match transport.stream.read(&mut byte) {
-                    Err(err)
-                        if matches!(
-                            err.kind(),
-                            std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
-                        ) && std::time::Instant::now() < deadline => {}
-                    result => return result,
-                }
-            }
-        });
         traffic_gate.shutdown().unwrap();
+        let mut byte = [0u8; 1];
+        let result = transport.stream.read(&mut byte);
 
-        match reader.join().unwrap() {
+        match result {
             Ok(0) => {}
             Err(err)
                 if matches!(
@@ -8723,6 +8713,61 @@ mod tests {
             driver.drive_once().unwrap(),
             DriveOutcome::ReconnectDelay { .. }
         ));
+        assert_eq!(driver.send_core.transport.restart_attempts, 1);
+        assert_eq!(driver.terminal_error(), None);
+        assert!(driver.receipt_status(first).is_pending());
+        assert!(driver.receipt_status(second).is_pending());
+        assert!(driver.try_submit(b"third").is_ok());
+    }
+
+    #[test]
+    fn reconnect_provider_failure_keeps_sf_frames_replayable() {
+        // A token-provider failure on reconnect is not terminal (the callback can
+        // recover next round), so queued SFA frames must stay persisted and
+        // replayable — never terminalized or dropped. This drives the *actual*
+        // error a provider failure yields (a reclassified SocketError carrying the
+        // original diagnostic) through the reconnect path directly, closing the
+        // gap between `reconnect_retries_provider_failures_...` (classification
+        // only) and `reconnect_policy_exhaustion_keeps_sf_receipts_replayable`
+        // (transport failure only).
+        let provider_error = crate::token_provider::TokenProvider::new(|| {
+            Err::<String, _>(Error::new(ErrorCode::AuthError, "token refresh failed"))
+        })
+        .bearer_header()
+        .unwrap_err();
+        // Sanity: an acquisition failure is retryable, never a terminal AuthError.
+        assert_eq!(provider_error.code(), ErrorCode::SocketError);
+        assert!(!reconnect_error_is_terminal(&provider_error));
+
+        let transport = TestTransport::scripted([Ok(TransportSendResult::Failure(
+            TransportFailure::Retryable(fake_transport_error("outage")),
+        ))])
+        .with_restart_results([Err(DriverError::Transport(provider_error))]);
+        let mut driver = QwpWsCoreTestHarness::from_queue_with_reconnect_policy(
+            memory_queue(options(8, 1024)),
+            transport,
+            ReconnectPolicy::bounded(
+                Duration::from_millis(1),
+                Duration::from_millis(10),
+                Duration::from_millis(10),
+            ),
+            false,
+        );
+        let first = driver.try_submit(b"first").unwrap();
+        let second = driver.try_submit(b"second").unwrap();
+
+        assert!(matches!(
+            driver.drive_once().unwrap(),
+            DriveOutcome::ReconnectDelay { .. }
+        ));
+        std::thread::sleep(Duration::from_millis(20));
+        assert!(matches!(
+            driver.drive_once().unwrap(),
+            DriveOutcome::ReconnectDelay { .. }
+        ));
+
+        // The provider failure did not terminalize the store or drop receipts, and
+        // the queue still accepts frames.
         assert_eq!(driver.send_core.transport.restart_attempts, 1);
         assert_eq!(driver.terminal_error(), None);
         assert!(driver.receipt_status(first).is_pending());

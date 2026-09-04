@@ -254,6 +254,7 @@ qwp_direct_sender* questdb_db_borrow_direct_sender_with_retry(
  * `qwp_direct_sender_free` (there is no pool to return it to). To discard
  * uncommitted frames after a failure, call
  * `questdb_db_drop_direct_sender(NULL, sender)` instead.
+ * `conf_len` must not exceed `QUESTDB_CONFIG_MAX_BYTES`.
  */
 QUESTDB_CLIENT_API
 qwp_direct_sender* qwp_direct_sender_from_conf(

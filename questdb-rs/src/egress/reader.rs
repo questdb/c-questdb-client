@@ -332,22 +332,21 @@ impl Reader {
     /// error carrying the observed role + zone via `UpgradeReject` is
     /// surfaced so the tracker can classify identically to a `421`
     /// upgrade reject.
-    fn connect_endpoint(cfg: &ReaderConfig, idx: usize) -> Result<TransportSession> {
-        let mut transport = WsTransport::connect_to(cfg, idx).map_err(|e| {
+    fn connect_endpoint(
+        cfg: &ReaderConfig,
+        idx: usize,
+        upgrade_headers: &[(&'static str, String)],
+    ) -> Result<TransportSession> {
+        let mut transport = WsTransport::connect_to(cfg, idx, upgrade_headers).map_err(|e| {
             // Prepend the endpoint so a connect/handshake/auth failure
             // names the host it came from. Without this, aggregated
             // multi-endpoint diagnostics surface only the tungstenite
             // message ("HTTP error: 401") with no way to tell which
             // endpoint refused.
             let endpoint = &cfg.addrs[idx];
-            let mut annotated = Error::new(e.code(), format!("endpoint {}: {}", endpoint, e.msg()));
-            if let Some(r) = e.upgrade_reject() {
-                annotated = annotated.with_upgrade_reject(r.clone());
-            }
-            if let Some(info) = e.server_info() {
-                annotated = annotated.with_server_info(info.clone());
-            }
-            annotated
+            let code = e.code();
+            let msg = format!("endpoint {}: {}", endpoint, e.msg());
+            e.reclassified(code, msg)
         })?;
         let server_info = if transport.server_version() >= 1 {
             Some(read_server_info_frame(
@@ -544,16 +543,10 @@ impl Reader {
             }
         }
         if deadline_exhausted {
-            let last_msg = last_err
-                .as_ref()
-                .map(|e| e.msg().to_string())
-                .unwrap_or_else(|| "<no error captured>".to_string());
-            return Err(fmt!(
-                SocketError,
-                "failover wall-clock budget exhausted (failover_max_duration_ms={}) after {} attempt(s); last error: {}",
+            return Err(failover_deadline_exhausted_error(
                 cfg.failover_max_duration_ms,
                 attempts_made,
-                last_msg
+                last_err,
             ));
         }
         Err(last_err.unwrap_or_else(|| {
@@ -2415,11 +2408,7 @@ impl<'r> Cursor<'r> {
                     // mismatched on every endpoint, config-level issue —
                     // tells the user *what to fix* and should win over
                     // the original cause-of-death.
-                    return Err(if prefer_over_trigger(e.code()) {
-                        e
-                    } else {
-                        trigger
-                    });
+                    return Err(if prefer_over_trigger(&e) { e } else { trigger });
                 }
             };
             // Reset connection-scoped state. The new connection has its
@@ -2949,8 +2938,8 @@ fn warn_on_protocol_error_failover(err: &Error, context: &str) {
 /// failover loop surfaces one of these, the user should see *that*,
 /// not the original socket close — these tell the user *what to fix*
 /// (credentials, cluster topology, server version, config, TLS / WS
-/// handshake), whereas the trigger just says "the network broke at
-/// some point."
+/// handshake, or an attached OIDC recovery action), whereas the trigger
+/// just says "the network broke at some point."
 ///
 /// `HandshakeError` and `TlsError` are preferred for the same reason
 /// as `AuthError`: when every reachable endpoint rejects the WS
@@ -2958,9 +2947,14 @@ fn warn_on_protocol_error_failover(err: &Error, context: &str) {
 /// `SocketError` trigger ("connection dropped") is far less
 /// actionable than the handshake/cert message that actually names
 /// the problem.
-fn prefer_over_trigger(code: ErrorCode) -> bool {
+fn prefer_over_trigger(err: &Error) -> bool {
+    #[cfg(feature = "_oidc")]
+    if err.oidc_error().is_some() {
+        return true;
+    }
+
     matches!(
-        code,
+        err.code(),
         ErrorCode::AuthError
             | ErrorCode::RoleMismatch
             | ErrorCode::ConfigError
@@ -2968,6 +2962,26 @@ fn prefer_over_trigger(code: ErrorCode) -> bool {
             | ErrorCode::HandshakeError
             | ErrorCode::TlsError
     )
+}
+
+/// Add wall-clock exhaustion context without replacing any structured
+/// diagnostics attached to the last reconnect error.
+fn failover_deadline_exhausted_error(
+    max_duration_ms: u64,
+    attempts: u32,
+    last_error: Option<Error>,
+) -> Error {
+    let last_msg = last_error
+        .as_ref()
+        .map_or("<no error captured>", |err| err.msg());
+    let msg = format!(
+        "failover wall-clock budget exhausted (failover_max_duration_ms={max_duration_ms}) after {attempts} attempt(s); last error: {last_msg}"
+    );
+
+    match last_error {
+        Some(err) => err.reclassified(ErrorCode::SocketError, msg),
+        None => Error::new(ErrorCode::SocketError, msg),
+    }
 }
 
 /// Splitmix64 PRNG state for failover backoff jitter. Lives on the
@@ -3094,6 +3108,13 @@ fn walk_via_tracker(
     // reset per failover.md §11.9.2). The fall-through pass below is
     // what re-evaluates stale classifications.
     tracker.begin_round(false);
+    // Resolve the fallible token provider once for this whole endpoint walk,
+    // before DNS or TCP work. A successful token is cluster-wide and can be
+    // reused across endpoints in the walk; a failed provider must not create
+    // and immediately discard one socket per endpoint (or twice per endpoint
+    // when the reconnect fall-through pass runs). The next outer reconnect
+    // round calls this function again and therefore polls the provider afresh.
+    let upgrade_headers = cfg.upgrade_headers()?;
     let mut last_role_mismatch: Option<Error> = None;
     let mut last_transport_err: Option<Error> = None;
     let mut retried_after_reset = false;
@@ -3115,7 +3136,7 @@ fn walk_via_tracker(
             }
         };
         dials = dials.saturating_add(1);
-        match Reader::connect_endpoint(cfg.as_ref(), idx) {
+        match Reader::connect_endpoint(cfg.as_ref(), idx, &upgrade_headers) {
             Ok(session) => {
                 // Update zone tier from `SERVER_INFO.zone_id` when the
                 // server advertised one (gated by `CAP_ZONE`). `record_zone`
@@ -3486,8 +3507,9 @@ mod tests {
             HandshakeError,
             TlsError,
         ] {
+            let err = Error::new(code, "test");
             assert!(
-                prefer_over_trigger(code),
+                prefer_over_trigger(&err),
                 "{:?} must be preferred over the trigger",
                 code
             );
@@ -3505,12 +3527,39 @@ mod tests {
             ServerInternalError,
             Cancelled,
         ] {
+            let err = Error::new(code, "test");
             assert!(
-                !prefer_over_trigger(code),
+                !prefer_over_trigger(&err),
                 "{:?} must NOT be preferred over the trigger",
                 code
             );
         }
+    }
+
+    #[cfg(feature = "_oidc")]
+    #[test]
+    fn structured_oidc_socket_error_is_preferred_over_trigger() {
+        let err = Error::from(crate::oidc::OidcError::interaction_required("sign in"))
+            .reclassified(ErrorCode::SocketError, "token provider failed");
+
+        assert!(prefer_over_trigger(&err));
+    }
+
+    #[cfg(feature = "_oidc")]
+    #[test]
+    fn failover_deadline_context_preserves_oidc_detail() {
+        let original = Error::from(crate::oidc::OidcError::interaction_required("sign in"))
+            .reclassified(ErrorCode::SocketError, "token provider failed");
+
+        let err = failover_deadline_exhausted_error(25, 2, Some(original));
+
+        assert_eq!(err.code(), ErrorCode::SocketError);
+        assert!(err.msg().contains("wall-clock budget exhausted"));
+        assert!(err.msg().contains("last error: token provider failed"));
+        assert_eq!(
+            err.oidc_error().map(crate::oidc::OidcError::kind),
+            Some(crate::oidc::OidcErrorKind::InteractionRequired)
+        );
     }
 
     /// Pin the exponential base schedule without measuring wall-clock

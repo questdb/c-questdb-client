@@ -108,14 +108,16 @@ pub(crate) struct TrafficGate {
 #[derive(Default)]
 struct TrafficGateState {
     current: Option<TcpStream>,
-    /// Raw handle of the ORIGINAL socket, not the `current` dup. Winsock
-    /// `shutdown()` does not unblock a `recv()` already in progress on
-    /// another thread, so `shutdown()` first runs `CancelIoEx` — and that
-    /// must target the handle the blocked thread issued its I/O on; a
-    /// `try_clone` (WSADuplicateSocket) handle is not guaranteed to share
-    /// the file object. Only valid while `current` is `Some`: every close
-    /// of the original is mutex-ordered behind `clear()`/re-register, so
-    /// the handle cannot be recycled while the gate still holds it.
+    /// True only while the runner is performing TLS/WebSocket setup. During
+    /// this phase it cannot be doing store-and-forward file I/O, so Windows
+    /// may safely cancel any synchronous operation on the runner thread.
+    setup_in_progress: bool,
+    /// Raw handle of the ORIGINAL socket, not the `current` dup. On Windows,
+    /// both `shutdown()` and `CancelIoEx` must target the handle that issues
+    /// traffic: a `try_clone` (WSADuplicateSocket) handle is not guaranteed to
+    /// share either effect. Only valid while `current` is `Some`: every close
+    /// of the original is mutex-ordered behind `clear()`/re-register, so the
+    /// handle cannot be recycled while the gate still holds it.
     #[cfg(windows)]
     original: Option<std::os::windows::io::RawSocket>,
     shut: bool,
@@ -176,6 +178,7 @@ impl TrafficGate {
             ));
         }
         state.current = Some(shutdown_handle);
+        state.setup_in_progress = true;
         #[cfg(windows)]
         {
             use std::os::windows::io::AsRawSocket;
@@ -200,6 +203,7 @@ impl TrafficGate {
     pub(super) fn clear(&self) {
         let mut state = self.state.lock().unwrap_or_else(|err| err.into_inner());
         state.current = None;
+        state.setup_in_progress = false;
         #[cfg(windows)]
         {
             state.original = None;
@@ -214,33 +218,50 @@ impl TrafficGate {
     }
 
     pub(super) fn shutdown(&self) -> std::io::Result<()> {
+        self.shutdown_with_setup_state().1
+    }
+
+    fn shutdown_with_setup_state(&self) -> (bool, std::io::Result<()>) {
         // The syscalls run under the gate mutex on purpose: every close of
         // the original socket is mutex-ordered behind `clear()`, so while
         // `current` is `Some` the original handle is still open and
         // `CancelIoEx` cannot hit a recycled handle. Cold path only.
         let mut state = self.state.lock().unwrap_or_else(|err| err.into_inner());
         state.shut = true;
+        let setup_in_progress = std::mem::take(&mut state.setup_in_progress);
         #[cfg(windows)]
-        if let Some(original) = state.original.take() {
-            // Winsock shutdown() does not unblock an in-progress recv() on
-            // another thread. Cancel outstanding I/O on the worker's own
-            // handle first, mirroring the Java client's windows/net.c
-            // shutdown(). A failure with ERROR_NOT_FOUND (nothing pending)
-            // is expected and deliberately ignored.
+        let result = state.original.take().map_or(Ok(()), |original| {
+            // Shut down the original before cancelling its pending I/O. If
+            // cancellation wins just before recv() starts, the shutdown is
+            // sticky on the handle that performs the later recv; if recv is
+            // already pending, cancellation interrupts it. The runner also
+            // uses CancelSynchronousIo during setup because std's blocking
+            // recv is not necessarily an overlapped operation.
+            let result = shutdown_original_socket(original);
             use windows_sys::Win32::Foundation::HANDLE;
             unsafe {
                 windows_sys::Win32::System::IO::CancelIoEx(original as HANDLE, std::ptr::null());
             }
-        }
-        if let Some(stream) = state.current.take() {
-            shutdown_socket(&stream)?;
-        }
-        Ok(())
+            result
+        });
+        #[cfg(windows)]
+        let _ = state.current.take();
+        #[cfg(not(windows))]
+        let result = state
+            .current
+            .take()
+            .map_or(Ok(()), |stream| shutdown_socket(&stream));
+        (setup_in_progress, result)
     }
 }
 
 impl TrafficRegistration<'_> {
     fn keep(mut self) {
+        self.gate
+            .state
+            .lock()
+            .unwrap_or_else(|err| err.into_inner())
+            .setup_in_progress = false;
         self.armed = false;
     }
 }
@@ -275,17 +296,64 @@ fn shutdown_socket(stream: &TcpStream) -> std::io::Result<()> {
     }
 }
 
+#[cfg(windows)]
+fn shutdown_original_socket(socket: std::os::windows::io::RawSocket) -> std::io::Result<()> {
+    use windows_sys::Win32::Networking::WinSock::{
+        SD_BOTH, SOCKET, SOCKET_ERROR, WSAENOTCONN, WSAESHUTDOWN, WSAGetLastError, shutdown,
+    };
+
+    let socket = SOCKET::try_from(socket).map_err(|_| {
+        std::io::Error::new(ErrorKind::InvalidInput, "socket handle does not fit SOCKET")
+    })?;
+    if unsafe { shutdown(socket, SD_BOTH) } != SOCKET_ERROR {
+        return Ok(());
+    }
+
+    let code = unsafe { WSAGetLastError() };
+    if matches!(code, WSAENOTCONN | WSAESHUTDOWN) {
+        Ok(())
+    } else {
+        Err(std::io::Error::from_raw_os_error(code))
+    }
+}
+
+/// Cancel a blocking synchronous socket operation owned by the runner.
+///
+/// `CancelIoEx` covers pending overlapped I/O on the socket handle, while the
+/// standard library's blocking `recv`/`send` calls require cancellation by
+/// thread handle. `ERROR_NOT_FOUND` is the expected race when the runner is
+/// between operations or has already exited.
+#[cfg(windows)]
+fn cancel_synchronous_worker_io(thread: &thread::JoinHandle<()>) -> std::io::Result<()> {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Foundation::{ERROR_NOT_FOUND, HANDLE};
+
+    let result = unsafe {
+        windows_sys::Win32::System::IO::CancelSynchronousIo(thread.as_raw_handle() as HANDLE)
+    };
+    if result != 0 {
+        return Ok(());
+    }
+
+    let error = std::io::Error::last_os_error();
+    if error.raw_os_error() == Some(ERROR_NOT_FOUND as i32) {
+        Ok(())
+    } else {
+        Err(error)
+    }
+}
+
 /// Which lifecycle owns a shared QWP/WebSocket connect walk.
 ///
 /// `Foreground` is a caller-thread initial connect: the user is synchronously
 /// waiting and no bounded-shutdown deadline depends on the dial returning.
-/// `ForegroundBounded` is foreground work whose dial a bounded wait does
-/// depend on -- I/O-runner reconnects and the async initial-connect retry
-/// loop (both raced by the 30s runner shutdown), and manual-mode reconnects
-/// inside `drive_once`. Only orphan-slot drainers use `BackgroundDrainer`,
-/// matching Java's background-connect policy; a transport stores the kind of
-/// its lifecycle (`Foreground`/`BackgroundDrainer`) and derives the bounded
-/// variant per reconnect via [`Self::for_reconnect`].
+/// `ForegroundBounded` is foreground work whose connection setup a bounded
+/// wait depends on -- I/O-runner reconnects and the async initial-connect
+/// retry loop (both raced by the 30s runner shutdown), and manual-mode
+/// reconnects inside `drive_once`. Only orphan-slot drainers use
+/// `BackgroundDrainer`, matching Java's background-connect policy; a transport
+/// stores the kind of its lifecycle (`Foreground`/`BackgroundDrainer`) and
+/// derives the bounded variant per reconnect via [`Self::for_reconnect`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum QwpWsConnectKind {
     Foreground,
@@ -574,6 +642,40 @@ struct BackpressureNotifier {
 const DEFAULT_APPEND_DEADLINE: Duration = Duration::from_secs(30);
 const BACKPRESSURE_PARK: Duration = Duration::from_micros(50);
 
+/// Run a background publication worker behind an unwind boundary. Provider
+/// callbacks have their own narrower guard so they can be retried; this is the
+/// last-resort invariant guard for any other panic in an unwind-enabled build.
+/// A vanished worker must never leave the publication lifecycle open or a
+/// backpressured publisher asleep indefinitely.
+fn run_qwp_ws_worker_guarded<Q, F>(
+    shared: &Arc<Mutex<QwpWsPublicationStore<Q>>>,
+    backpressure: &BackpressureNotifier,
+    worker: F,
+) where
+    Q: PublicationLog,
+    F: FnOnce(),
+{
+    if std::panic::catch_unwind(std::panic::AssertUnwindSafe(worker)).is_ok() {
+        return;
+    }
+
+    let mut store = match shared.lock() {
+        Ok(store) => store,
+        // A panic while the worker held the publication lock poisons it. The
+        // guard is still valid after unwind and must be used to close the
+        // lifecycle before any producer can publish another frame.
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    store.mark_terminal(Some(error::fmt!(
+        SocketError,
+        "QWP/WebSocket background worker panicked and stopped"
+    )));
+    shared.clear_poison();
+    drop(store);
+    backpressure.notify_all();
+    log::error!("QWP/WebSocket background worker panicked; publication was terminalized");
+}
+
 impl<Q> SyncQwpWsRunner<Q>
 where
     Q: PublicationLog + Send + 'static,
@@ -625,21 +727,23 @@ where
         let thread_stop = Arc::clone(&stop);
         let thread_lifecycle = lifecycle.clone();
         let thread = thread::spawn(move || {
-            let mut core = SyncQwpWsRunnerCore {
-                send_core,
-                progress,
-                cold_effects: VecDeque::new(),
-                backpressure: thread_backpressure,
-                ok_completed_upper: thread_ok_completed_upper,
-                lifecycle: thread_lifecycle,
-            };
-            while !thread_stop.load(Ordering::Acquire) {
-                match core.drive_step(&thread_shared, &thread_stop) {
-                    RunnerStep::Idle => thread::sleep(Duration::from_micros(50)),
-                    RunnerStep::Continue => {}
-                    RunnerStep::Stop => break,
+            run_qwp_ws_worker_guarded(&thread_shared, &thread_backpressure, || {
+                let mut core = SyncQwpWsRunnerCore {
+                    send_core,
+                    progress,
+                    cold_effects: VecDeque::new(),
+                    backpressure: Arc::clone(&thread_backpressure),
+                    ok_completed_upper: thread_ok_completed_upper,
+                    lifecycle: thread_lifecycle,
                 };
-            }
+                while !thread_stop.load(Ordering::Acquire) {
+                    match core.drive_step(&thread_shared, &thread_stop) {
+                        RunnerStep::Idle => thread::sleep(Duration::from_micros(50)),
+                        RunnerStep::Continue => {}
+                        RunnerStep::Stop => break,
+                    };
+                }
+            });
         });
 
         Self {
@@ -679,21 +783,23 @@ where
         let thread_stop = Arc::clone(&stop);
         let thread_lifecycle = lifecycle.clone();
         let thread = thread::spawn(move || {
-            let mut core = SyncQwpWsPendingRunnerCore {
-                connected: None,
-                pending_connect,
-                progress,
-                backpressure: thread_backpressure,
-                ok_completed_upper: thread_ok_completed_upper,
-                lifecycle: thread_lifecycle,
-            };
-            while !thread_stop.load(Ordering::Acquire) {
-                match core.drive_step(&thread_shared, &thread_stop) {
-                    RunnerStep::Idle => thread::sleep(Duration::from_micros(50)),
-                    RunnerStep::Continue => {}
-                    RunnerStep::Stop => break,
+            run_qwp_ws_worker_guarded(&thread_shared, &thread_backpressure, || {
+                let mut core = SyncQwpWsPendingRunnerCore {
+                    connected: None,
+                    pending_connect,
+                    progress,
+                    backpressure: Arc::clone(&thread_backpressure),
+                    ok_completed_upper: thread_ok_completed_upper,
+                    lifecycle: thread_lifecycle,
                 };
-            }
+                while !thread_stop.load(Ordering::Acquire) {
+                    match core.drive_step(&thread_shared, &thread_stop) {
+                        RunnerStep::Idle => thread::sleep(Duration::from_micros(50)),
+                        RunnerStep::Continue => {}
+                        RunnerStep::Stop => break,
+                    };
+                }
+            });
         });
 
         Self {
@@ -1926,10 +2032,21 @@ fn sleep_before_runner_reconnect(
 impl<Q> Drop for SyncQwpWsRunner<Q> {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::Release);
-        if let Err(err) = self.traffic_gate.shutdown() {
+        let thread = self.thread.take();
+        let (setup_in_progress, shutdown_result) = self.traffic_gate.shutdown_with_setup_state();
+        #[cfg(not(windows))]
+        let _ = setup_in_progress;
+        if let Err(err) = shutdown_result {
             log::warn!("could not shut down QWP/WebSocket runner traffic: {err}");
         }
-        if let Some(thread) = self.thread.take() {
+        #[cfg(windows)]
+        if setup_in_progress
+            && let Some(thread) = thread.as_ref()
+            && let Err(err) = cancel_synchronous_worker_io(thread)
+        {
+            log::warn!("could not cancel QWP/WebSocket runner I/O: {err}");
+        }
+        if let Some(thread) = thread {
             if wait_for_runner_exit(&thread, self.shutdown_timeout) {
                 if thread.join().is_err() {
                     log::error!("QWP/WebSocket runner thread panicked during shutdown");
@@ -3081,13 +3198,13 @@ fn qwp_ws_all_endpoints_unreachable_error(
     last_failure: Option<(usize, crate::Error)>,
 ) -> crate::Error {
     match last_failure {
-        Some((idx, err)) => error::fmt!(
-            SocketError,
-            "QWP/WebSocket all endpoints unreachable; last endpoint {}:{} failed: {}",
-            endpoints[idx].host,
-            endpoints[idx].port,
-            err
-        ),
+        Some((idx, err)) => {
+            let msg = format!(
+                "QWP/WebSocket all endpoints unreachable; last endpoint {}:{} failed: {}",
+                endpoints[idx].host, endpoints[idx].port, err
+            );
+            err.reclassified(crate::ErrorCode::SocketError, msg)
+        }
         None => error::fmt!(SocketError, "QWP/WebSocket all endpoints unreachable"),
     }
 }
@@ -3236,6 +3353,59 @@ pub(crate) fn connect_qwp_ws_endpoint_round<A: QwpWsHealthAccess>(
     if let Some(idx) = previous_idx.take() {
         health.with_tracker(|t| t.record_mid_stream_failure(idx, previous_failure));
     }
+
+    // A token provider (e.g. OIDC) is pulled fresh on every (re)connect round,
+    // overriding the static basic/token header, so a long-lived sender keeps a
+    // valid Bearer as the token rotates. Provider acquisition/validation failures
+    // are retryable SocketErrors: the next invocation may recover, and accepted
+    // store-and-forward frames must remain drainable. Server authentication
+    // rejections happen later in the handshake and remain terminal AuthErrors.
+    let provided_header = match qwp_ws.token_provider.as_ref() {
+        Some(provider) => {
+            let acquired = if connect_kind.bounded_dial() {
+                match traffic_gate {
+                    // Arbitrary synchronous providers cannot be cancelled. Isolate
+                    // runner-owned acquisition so shutdown can abandon the result
+                    // and release the publication store / slot lock immediately.
+                    // The provider thread retains only its closure until it returns.
+                    Some(gate) => provider.bearer_header_isolated_until(|| gate.is_shutdown()),
+                    None => provider.bearer_header(),
+                }
+            } else {
+                provider.bearer_header()
+            };
+            // Narrate before propagating. This returns above the endpoint loop,
+            // so `auth_failed` (inside it) and `all_endpoints_unreachable`
+            // (after it) are both unreachable from here: without this the round
+            // produces no event and no log at all. Combined with a retryable
+            // provider error and a reconnect budget that restarts each round,
+            // the caller would otherwise observe an indefinite silent stall
+            // whose first symptom is unrelated store backpressure.
+            Some(acquired.map_err(|err| {
+                match events {
+                    // Foreground rounds narrate; background (orphan-drainer)
+                    // walks deliberately do not, so as not to claim an outage
+                    // against an endpoint the foreground may be using happily.
+                    Some(events) => {
+                        events.token_provider_failed(&err, events.next_attempt());
+                        log::warn!(
+                            "questdb: QWP/WebSocket token provider failed before \
+                             dialling any endpoint; abandoning this connection \
+                             round: {err}"
+                        );
+                    }
+                    None => log::debug!(
+                        "questdb: QWP/WebSocket token provider failed on a \
+                         background walk: {err}"
+                    ),
+                }
+                err
+            })?)
+        }
+        None => None,
+    };
+    let auth_header = provided_header.as_deref().or(auth_header);
+
     let mut last_role_mismatch = None;
     let mut last_transport_failure: Option<(usize, crate::Error)> = None;
     let mut role_reject_count = 0usize;
@@ -4324,6 +4494,42 @@ mod tests {
         .unwrap()
     }
 
+    #[cfg(feature = "_oidc")]
+    #[test]
+    fn endpoint_aggregation_preserves_oidc_detail() {
+        let endpoints = [QwpWsEndpoint::new("localhost".into(), "9000".into())];
+        let original = crate::Error::from(crate::oidc::OidcError::interaction_required("sign in"));
+
+        let err = qwp_ws_all_endpoints_unreachable_error(&endpoints, Some((0, original)));
+        assert_eq!(err.code(), crate::ErrorCode::SocketError);
+        assert!(err.msg().contains("localhost:9000"));
+        assert_eq!(
+            err.oidc_error().map(crate::oidc::OidcError::kind),
+            Some(crate::oidc::OidcErrorKind::InteractionRequired)
+        );
+    }
+
+    #[cfg(feature = "_oidc")]
+    #[test]
+    fn retry_budget_exhaustion_preserves_oidc_detail() {
+        let original = crate::Error::from(crate::oidc::OidcError::interaction_required("sign in"))
+            .reclassified(crate::ErrorCode::SocketError, "token provider failed");
+
+        let err = retry_budget_exhausted_error(
+            "QWP/WebSocket initial connect",
+            3,
+            Instant::now(),
+            Some(original),
+        );
+
+        assert_eq!(err.code(), crate::ErrorCode::SocketError);
+        assert!(err.msg().contains("retry budget exhausted"));
+        assert_eq!(
+            err.oidc_error().map(crate::oidc::OidcError::kind),
+            Some(crate::oidc::OidcErrorKind::InteractionRequired)
+        );
+    }
+
     #[cfg(any(unix, windows))]
     fn periodic_qwp_ws_config(sf_dir: &std::path::Path, sender_id: &str) -> QwpWsConfig {
         crate::ingress::SenderBuilder::from_conf(format!(
@@ -4335,6 +4541,65 @@ mod tests {
         .unwrap()
         .qwp_ws
         .unwrap()
+    }
+
+    #[cfg(any(unix, windows))]
+    struct BlockedProviderControl {
+        started: mpsc::Receiver<()>,
+        release: mpsc::Sender<()>,
+        finished: mpsc::Receiver<()>,
+    }
+
+    #[cfg(any(unix, windows))]
+    impl BlockedProviderControl {
+        fn wait_until_started(&self) {
+            self.started
+                .recv_timeout(Duration::from_secs(5))
+                .expect("token provider did not start");
+        }
+
+        fn release_and_wait(self) {
+            self.release.send(()).unwrap();
+            self.finished
+                .recv_timeout(Duration::from_secs(5))
+                .expect("token provider did not finish after release");
+        }
+    }
+
+    #[cfg(any(unix, windows))]
+    fn qwp_ws_config_with_blocked_provider(
+        sf_dir: &std::path::Path,
+        sender_id: &str,
+    ) -> (QwpWsConfig, BlockedProviderControl) {
+        let (started_tx, started_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let (finished_tx, finished_rx) = mpsc::channel();
+        let release_rx = Mutex::new(release_rx);
+        let qwp_ws = crate::ingress::SenderBuilder::from_conf(format!(
+            "ws::addr=127.0.0.1:1;sf_dir={};sender_id={sender_id};\
+             sf_max_segment_bytes=4096;sf_max_total_bytes=8192;\
+             initial_connect_retry=async;",
+            sf_dir.display()
+        ))
+        .unwrap()
+        .qwp_ws_token_provider(move || {
+            let _ = started_tx.send(());
+            release_rx.lock().unwrap().recv().unwrap();
+            let _ = finished_tx.send(());
+            Ok::<_, crate::Error>("eventual-token".to_string())
+        })
+        .unwrap()
+        .qwp_ws
+        .unwrap();
+
+        (
+            qwp_ws,
+            BlockedProviderControl {
+                started: started_rx,
+                release: release_tx,
+                finished: finished_rx,
+            },
+        )
     }
 
     #[test]
@@ -5319,6 +5584,34 @@ mod tests {
     }
 
     #[derive(Debug)]
+    struct PanicAfterSendTransport {
+        sent: mpsc::Sender<()>,
+        trigger_panic: mpsc::Receiver<()>,
+        frame_sent: bool,
+    }
+
+    impl QwpWsCoreTransport for PanicAfterSendTransport {
+        fn try_poll_response(&mut self) -> Result<TransportPoll, TransportFailure> {
+            if self.frame_sent {
+                self.trigger_panic
+                    .recv_timeout(Duration::from_secs(5))
+                    .unwrap();
+                panic!("synthetic worker panic");
+            }
+            Ok(TransportPoll::Idle)
+        }
+
+        fn send_frame(
+            &mut self,
+            _frame: OutboundFrameView<'_>,
+        ) -> Result<TransportSendResult, TransportFailure> {
+            self.frame_sent = true;
+            self.sent.send(()).unwrap();
+            Ok(TransportSendResult::NoResponse)
+        }
+    }
+
+    #[derive(Debug)]
     struct AckWhenReadyTransport {
         ack_ready: Arc<AtomicBool>,
         sent_frames: Vec<SentFrame>,
@@ -5427,6 +5720,75 @@ mod tests {
         drop(runner);
     }
 
+    // Two 10-byte frames fill this two-segment byte budget. Using byte capacity
+    // keeps the panic/backpressure regression independent of the legacy
+    // max_in_flight window.
+    fn panic_backpressured_queue() -> SfaSlotQueue {
+        let qwp_ws = crate::ingress::SenderBuilder::from_conf(
+            "ws::addr=127.0.0.1:1;sf_max_segment_bytes=48;sf_max_total_bytes=96;",
+        )
+        .unwrap()
+        .qwp_ws
+        .unwrap();
+        open_configured_qwp_ws_queue(&qwp_ws).unwrap()
+    }
+
+    #[test]
+    fn threaded_runner_panic_terminalizes_and_wakes_backpressured_publisher() {
+        let (sent_tx, sent_rx) = mpsc::channel();
+        let (panic_tx, panic_rx) = mpsc::channel();
+        let queue = panic_backpressured_queue();
+        let transport = PanicAfterSendTransport {
+            sent: sent_tx,
+            trigger_panic: panic_rx,
+            frame_sent: false,
+        };
+        let driver = QwpWsCoreTestHarness::from_queue(queue, transport);
+        let mut runner =
+            SyncQwpWsRunner::start_driver_with_append_deadline(driver, Duration::from_secs(5));
+
+        runner.publish_replay_payload(b"aaaaaaaaaa").unwrap();
+        sent_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        runner.publish_replay_payload(b"bbbbbbbbbb").unwrap();
+
+        std::thread::scope(|scope| {
+            let (published_tx, published_rx) = mpsc::channel();
+            let runner = &mut runner;
+            let publish_thread = scope.spawn(move || {
+                let result = runner.publish_replay_payload(b"cccccccccc");
+                let _ = published_tx.send(result.map(|_| ()));
+            });
+
+            assert!(
+                published_rx
+                    .recv_timeout(Duration::from_millis(50))
+                    .is_err(),
+                "second publication should be waiting for queue capacity"
+            );
+            panic_tx.send(()).unwrap();
+            let err = published_rx
+                .recv_timeout(Duration::from_secs(5))
+                .unwrap()
+                .unwrap_err();
+            assert_eq!(err.code(), crate::ErrorCode::SocketError);
+            assert!(
+                err.msg().contains("background worker panicked"),
+                "got: {}",
+                err.msg()
+            );
+            publish_thread.join().unwrap();
+        });
+
+        assert!(runner.lifecycle_is_terminal());
+        let terminal_error = runner.published_fsn().unwrap_err();
+        assert!(
+            terminal_error.msg().contains("background worker panicked"),
+            "got: {}",
+            terminal_error.msg()
+        );
+        drop(runner);
+    }
+
     #[cfg(any(unix, windows))]
     #[test]
     fn runner_shutdown_timeout_keeps_slot_locked_until_worker_exit() {
@@ -5497,6 +5859,125 @@ mod tests {
                 Err(err) => panic!("slot did not become reusable after worker exit: {err:?}"),
             }
         }
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn async_initial_connect_shutdown_releases_slot_while_provider_is_blocked() {
+        let dir = TempDir::new().unwrap();
+        let (qwp_ws, provider) =
+            qwp_ws_config_with_blocked_provider(dir.path(), "blocked-initial-provider");
+        let queue = open_configured_qwp_ws_queue(&qwp_ws).unwrap();
+        let traffic_gate = Arc::new(TrafficGate::default());
+        let pending_connect = QwpWsPendingConnect::new(
+            "127.0.0.1",
+            "1",
+            false,
+            None,
+            &qwp_ws,
+            None,
+            *qwp_ws.request_durable_ack,
+            Arc::new(AtomicUsize::new(0)),
+            Arc::clone(&traffic_gate),
+            false,
+            Vec::new(),
+            0,
+        );
+        let mut runner = SyncQwpWsRunner::start_pending_connect(
+            queue,
+            pending_connect,
+            Duration::from_secs(1),
+            *qwp_ws.error_inbox_capacity,
+            None,
+        );
+        runner.shutdown_timeout = Duration::from_millis(100);
+        provider.wait_until_started();
+
+        let started = Instant::now();
+        drop(runner);
+        let drop_elapsed = started.elapsed();
+        let reopened = open_configured_qwp_ws_queue(&qwp_ws);
+        provider.release_and_wait();
+
+        assert!(
+            drop_elapsed < Duration::from_secs(1),
+            "runner shutdown waited for the blocked token provider: {drop_elapsed:?}"
+        );
+        drop(reopened.unwrap_or_else(|err| {
+            panic!("blocked initial-connect provider retained the SFA slot after shutdown: {err}")
+        }));
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn reconnect_shutdown_releases_slot_while_provider_is_blocked() {
+        use std::net::{Ipv4Addr, TcpListener};
+
+        let dir = TempDir::new().unwrap();
+        let (qwp_ws, provider) =
+            qwp_ws_config_with_blocked_provider(dir.path(), "blocked-reconnect-provider");
+        let queue = open_configured_qwp_ws_queue(&qwp_ws).unwrap();
+
+        // Seed the transport with an already-connected socket, then close its
+        // peer. The first publication drives the real blocking transport into
+        // its reconnect path, where token acquisition deliberately blocks.
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .unwrap();
+        client
+            .set_write_timeout(Some(Duration::from_secs(1)))
+            .unwrap();
+        let (peer, _) = listener.accept().unwrap();
+        drop(peer);
+
+        let traffic_gate = Arc::new(TrafficGate::default());
+        let endpoints = qwp_ws_configured_endpoints("127.0.0.1", &port.to_string(), &qwp_ws);
+        let transport = BlockingQwpWsTransport::from_connected(
+            Arc::clone(&endpoints),
+            QwpWsHostHealthTracker::new(endpoints.len()),
+            false,
+            None,
+            QwpWsConnectKind::Foreground,
+            qwp_ws.clone(),
+            None,
+            Arc::new(AtomicUsize::new(0)),
+            Some(Arc::clone(&traffic_gate)),
+            QwpWsConnectRoundSuccess {
+                endpoint_idx: 0,
+                stream: WsStream::Plain(NoSigpipeTcp::new(client).unwrap()),
+                negotiated_version: 1,
+                server_max_batch_size: 0,
+                leftover: Vec::new(),
+            },
+        );
+        let driver = QwpWsCoreTestHarness::from_queue(queue, transport);
+        let (store, send_core) = driver.into_parts();
+        let mut runner = SyncQwpWsRunner::start_with_append_deadline(
+            store,
+            send_core,
+            Duration::from_secs(1),
+            traffic_gate,
+        );
+        runner.shutdown_timeout = Duration::from_millis(100);
+        runner.publish_replay_payload(b"blocked reconnect").unwrap();
+        provider.wait_until_started();
+
+        let started = Instant::now();
+        drop(runner);
+        let drop_elapsed = started.elapsed();
+        let reopened = open_configured_qwp_ws_queue(&qwp_ws);
+        provider.release_and_wait();
+
+        assert!(
+            drop_elapsed < Duration::from_secs(1),
+            "runner shutdown waited for the blocked reconnect provider: {drop_elapsed:?}"
+        );
+        drop(reopened.unwrap_or_else(|err| {
+            panic!("blocked reconnect provider retained the SFA slot after shutdown: {err}")
+        }));
     }
 
     #[cfg(any(unix, windows))]

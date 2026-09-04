@@ -3,7 +3,8 @@ use crate::ingress::CertificateAuthority;
 #[cfg(any(
     feature = "_sender-tcp",
     feature = "_sender-http",
-    feature = "_sender-qwp-ws"
+    feature = "_sender-qwp-ws",
+    feature = "_oidc"
 ))]
 use rustls::RootCertStore;
 use rustls_pki_types::CertificateDer;
@@ -13,7 +14,8 @@ use std::path::Path;
 #[cfg(any(
     feature = "_sender-tcp",
     feature = "_sender-http",
-    feature = "_sender-qwp-ws"
+    feature = "_sender-qwp-ws",
+    feature = "_oidc"
 ))]
 use std::sync::Arc;
 
@@ -77,7 +79,8 @@ mod danger {
     any(
         feature = "_sender-tcp",
         feature = "_sender-http",
-        feature = "_sender-qwp-ws"
+        feature = "_sender-qwp-ws",
+        feature = "_oidc"
     ),
 ))]
 fn add_webpki_roots(root_store: &mut RootCertStore) {
@@ -91,7 +94,8 @@ fn add_webpki_roots(root_store: &mut RootCertStore) {
     any(
         feature = "_sender-tcp",
         feature = "_sender-http",
-        feature = "_sender-qwp-ws"
+        feature = "_sender-qwp-ws",
+        feature = "_oidc"
     ),
 ))]
 fn unpack_os_native_certs(
@@ -117,7 +121,8 @@ fn unpack_os_native_certs(
     any(
         feature = "_sender-tcp",
         feature = "_sender-http",
-        feature = "_sender-qwp-ws"
+        feature = "_sender-qwp-ws",
+        feature = "_oidc"
     ),
 ))]
 fn add_os_roots(root_store: &mut RootCertStore) -> crate::Result<()> {
@@ -155,7 +160,8 @@ pub(crate) enum TlsSettings {
         not(any(
             feature = "_sender-tcp",
             feature = "_sender-http",
-            feature = "_sender-qwp-ws"
+            feature = "_sender-qwp-ws",
+            feature = "_oidc"
         )),
         allow(dead_code)
     )]
@@ -279,7 +285,8 @@ impl TlsSettings {
 #[cfg(any(
     feature = "_sender-tcp",
     feature = "_sender-http",
-    feature = "_sender-qwp-ws"
+    feature = "_sender-qwp-ws",
+    feature = "_oidc"
 ))]
 pub(crate) fn configure_tls(tls: TlsSettings) -> Result<Arc<rustls::ClientConfig>> {
     let mut root_store = RootCertStore::empty();

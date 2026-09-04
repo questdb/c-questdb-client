@@ -177,6 +177,7 @@ typedef struct qwp_reader_query qwp_reader_query;
  * `line_sender_utf8` carrying invalid bytes (i.e. one not built via
  * `line_sender_utf8_init`) surfaces as `questdb_error_invalid_utf8`
  * instead of triggering undefined behaviour.
+ * The config string must not exceed `QUESTDB_CONFIG_MAX_BYTES` bytes.
  *
  * @param[in] config UTF-8 config string.
  * @param[out] err_out Set on error.
@@ -185,6 +186,20 @@ typedef struct qwp_reader_query qwp_reader_query;
 QUESTDB_CLIENT_API
 qwp_reader* qwp_reader_from_conf(
     line_sender_utf8 config, questdb_error** err_out);
+
+/**
+ * Construct a reader whose WebSocket handshake uses `auth` as a rotating
+ * Bearer-token provider. The reader retains shared ownership of the auth state,
+ * so the caller may free its auth handle after this call returns. Provider
+ * calls may load or silently refresh a token but never start an interactive
+ * device flow; call questdb_oidc_auth_sign_in before opening the reader.
+ * The config string must not exceed `QUESTDB_CONFIG_MAX_BYTES` bytes.
+ */
+QUESTDB_CLIENT_API
+qwp_reader* qwp_reader_from_conf_with_oidc(
+    line_sender_utf8 config,
+    const questdb_oidc_auth* auth,
+    questdb_error** err_out);
 
 /**
  * Construct a reader from the configuration stored in the
@@ -1146,7 +1161,15 @@ bool qwp_reader_batch_column_name(
  * borrows from the batch (see the section-level lifetime note).
  *
  * `values` holds the wire's little-endian bytes — the decoder does not
- * byte-swap. A fixed-width slot whose `validity` bit is set still contains
+ * byte-swap — with ONE exception: a `qwp_reader_column_kind_uuid` column is
+ * handed over as canonical RFC-4122 big-endian, because the decoder has
+ * already reversed it out of the wire's (lo LE, hi LE) pair order. LONG256 is
+ * not reversed: it stays little-endian limbs, low limb first. See
+ * `qwp_reader_column_data_get_bytes`, which states the same contract for the
+ * two 16/32-byte kinds. Reading a UUID as if it were still in wire order
+ * yields a byte-reversed value, not an error.
+ *
+ * A fixed-width slot whose `validity` bit is set still contains
  * a value (QuestDB's NULL sentinel); consult `validity` first.
  */
 typedef struct qwp_reader_column_data

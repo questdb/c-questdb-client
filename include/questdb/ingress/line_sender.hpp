@@ -26,6 +26,7 @@
 
 #include "line_sender_array.hpp"
 #include "line_sender_decimal.hpp"
+#include "../oidc.hpp"
 
 namespace questdb::ingress
 {
@@ -295,7 +296,7 @@ public:
         ::line_sender_error* c_err{nullptr};
         if (::line_sender_buffer_bookmark(_impl, &out, &c_err))
             return buffer_bookmark{out};
-        throw line_sender_error::from_c(c_err);
+        line_sender_error::throw_from_c(c_err);
     }
 
     /**
@@ -1487,6 +1488,28 @@ public:
     {
         line_sender_error::wrapped_call(
             ::line_sender_opts_token, _impl, token._impl);
+        return *this;
+    }
+
+    /**
+     * Use an OIDC device-flow auth state as a rotating Bearer-token provider.
+     * Supported by HTTP(S) and QWP/WebSocket senders. The Rust builder retains
+     * shared ownership, so `auth` does not need to outlive these options.
+     * Provider calls may silently refresh but never prompt from flush/connect;
+     * call auth.sign_in() explicitly before starting the sender.
+     * @throws questdb::oidc::error if `auth` is empty or moved from.
+     * @throws line_sender_error if the sender configuration cannot use OIDC.
+     * @note After attaching, a token-acquisition failure surfaces from
+     *       `flush()` (and other sender calls) as a `line_sender_error`, with
+     *       the structured OIDC detail on its `oidc_diagnostic()` member — not
+     *       as a `questdb::oidc::error`. Catch `const questdb::error&` to
+     *       handle both. See `questdb::oidc::error` for the cross-surface
+     *       model.
+     */
+    opts& oidc_auth(const ::questdb::oidc::device_auth& auth)
+    {
+        line_sender_error::wrapped_call(
+            ::line_sender_opts_oidc_auth, _impl, auth.raw());
         return *this;
     }
 

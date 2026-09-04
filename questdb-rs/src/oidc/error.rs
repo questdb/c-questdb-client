@@ -1,0 +1,353 @@
+/*******************************************************************************
+ *     ___                  _   ____  ____
+ *    / _ \ _   _  ___  ___| |_|  _ \| __ )
+ *   | | | | | | |/ _ \/ __| __| | | |  _ \
+ *   | |_| | |_| |  __/\__ \ |_| |_| | |_) |
+ *    \__\_\\__,_|\___||___/\__|____/|____/
+ *
+ *  Copyright (c) 2014-2019 Appsicle
+ *  Copyright (c) 2019-2025 QuestDB
+ *
+ *  Licensed under the Apache License, Version 2.0 (the "License");
+ *  you may not use this file except in compliance with the License.
+ *  You may obtain a copy of the License at
+ *
+ *  http://www.apache.org/licenses/LICENSE-2.0
+ *
+ *  Unless required by applicable law or agreed to in writing, software
+ *  distributed under the License is distributed on an "AS IS" BASIS,
+ *  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ *  See the License for the specific language governing permissions and
+ *  limitations under the License.
+ *
+ ******************************************************************************/
+
+//! Errors raised by the [`oidc`](crate::oidc) module.
+
+use crate::oidc::render::{strip_control, strip_control_capped};
+use crate::{Error, ErrorCode};
+use std::fmt::{Display, Formatter};
+
+/// A specialized [`Result`](std::result::Result) type for OIDC operations.
+pub type Result<T> = std::result::Result<T, OidcError>;
+
+/// Cap on how many characters of an untrusted IdP `error` / `error_description`
+/// are kept when interpolated into a message or stored on the error. A
+/// conformant value is short (an OAuth error code plus a sentence); this bounds
+/// a hostile multi-MB `error_description` — which JSON-parses fine and so slips
+/// past the non-JSON body-snippet cap in `oidc::http` — from being echoed raw.
+pub(crate) const MAX_IDP_FIELD_CHARS: usize = 200;
+
+/// The category of an [`OidcError`], mirroring the reference clients' typed
+/// exception hierarchy.
+///
+/// `#[non_exhaustive]`: match with a `_` arm so a future variant is not a
+/// breaking change.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum OidcErrorKind {
+    /// The OIDC configuration could not be resolved or is inconsistent (e.g.
+    /// QuestDB does not advertise OIDC, the IdP device-authorization endpoint
+    /// cannot be discovered, or a required argument is missing).
+    Config,
+
+    /// A retryable network or refresh-coordination failure. After an ambiguous
+    /// refresh response, the parent token is discarded and a later retry may
+    /// require a fresh interactive sign-in.
+    Network,
+
+    /// The OAuth 2.0 device authorization grant failed; the IdP
+    /// `error`/`error_description` are preserved when available.
+    DeviceFlow,
+
+    /// The user did not authorize the device in time (the code expired).
+    Timeout,
+
+    /// No usable cached or silently refreshable token is available, so the
+    /// caller must invoke `OidcDeviceAuth::sign_in()` explicitly. Also returned
+    /// when `sign_in()` is called on a provider built non-interactive, which
+    /// will not prompt.
+    InteractionRequired,
+
+    /// The authentication provider was closed while an operation was waiting
+    /// for device authorization or token-store coordination.
+    Cancelled,
+}
+
+/// An error raised while acquiring or refreshing an OIDC token.
+///
+/// Converts into the crate-wide [`Error`](crate::Error) (via `From`), mapping
+/// [`Config`](OidcErrorKind::Config) to [`ConfigError`](ErrorCode::ConfigError),
+/// [`Network`](OidcErrorKind::Network) to [`SocketError`](ErrorCode::SocketError),
+/// and the remaining kinds to [`AuthError`](ErrorCode::AuthError) — so it flows
+/// straight into a [`SenderBuilder`](crate::ingress::SenderBuilder) token
+/// provider's `Result`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OidcError {
+    kind: OidcErrorKind,
+    message: String,
+    /// The raw `error` field from an untrusted IdP response (control-stripped).
+    error: Option<String>,
+    /// The raw `error_description` from an untrusted IdP response (control-stripped).
+    error_description: Option<String>,
+    /// The HTTP status associated with the IdP response, when available.
+    status: Option<u16>,
+    /// A parsed `Retry-After` (delta-seconds) from a transient response, when present.
+    retry_after: Option<u64>,
+    /// True when this network failure proves the request was never transmitted
+    /// (a pre-send connect / DNS / TLS-handshake failure), so a refresh token
+    /// carried in it was not consumed by the IdP and is safe to retry. Left
+    /// `false` for any failure that may have reached the IdP.
+    request_unsent: bool,
+}
+
+impl OidcError {
+    fn new(kind: OidcErrorKind, message: impl Into<String>) -> Self {
+        // Strip terminal / bidi / zero-width control characters from every
+        // message before it can reach a display sink. Error messages routinely
+        // interpolate untrusted IdP fields (error_description, response bodies,
+        // verification URIs), and an uncaught error printed to a terminal is a
+        // sink the renderer's own sanitization never sees. Doing it here (not at
+        // each construction site) means no site can forget.
+        OidcError {
+            kind,
+            message: strip_control(&message.into()),
+            error: None,
+            error_description: None,
+            status: None,
+            retry_after: None,
+            request_unsent: false,
+        }
+    }
+
+    pub(crate) fn config(message: impl Into<String>) -> Self {
+        Self::new(OidcErrorKind::Config, message)
+    }
+
+    pub(crate) fn network(message: impl Into<String>) -> Self {
+        Self::new(OidcErrorKind::Network, message)
+    }
+
+    pub(crate) fn device_flow(message: impl Into<String>) -> Self {
+        Self::new(OidcErrorKind::DeviceFlow, message)
+    }
+
+    pub(crate) fn timeout(message: impl Into<String>) -> Self {
+        Self::new(OidcErrorKind::Timeout, message)
+    }
+
+    pub(crate) fn interaction_required(message: impl Into<String>) -> Self {
+        Self::new(OidcErrorKind::InteractionRequired, message)
+    }
+
+    pub(crate) fn cancelled(message: impl Into<String>) -> Self {
+        Self::new(OidcErrorKind::Cancelled, message)
+    }
+
+    /// Attach the untrusted IdP `error` / `error_description` fields (each
+    /// control-stripped, same rationale as the message).
+    pub(crate) fn with_idp_error(
+        mut self,
+        error: Option<&str>,
+        error_description: Option<&str>,
+    ) -> Self {
+        // Normalize an empty (or all-control, post-strip) field to `None` so an
+        // empty `error_description` can't shadow the `error` code in the message
+        // or in `Display`, and the accessors don't hand back a blank `Some("")`.
+        // Length-cap both: a hostile IdP can return a multi-MB `error_description`.
+        self.error = error
+            .map(|s| strip_control_capped(s, MAX_IDP_FIELD_CHARS))
+            .filter(|s| !s.is_empty());
+        self.error_description = error_description
+            .map(|s| strip_control_capped(s, MAX_IDP_FIELD_CHARS))
+            .filter(|s| !s.is_empty());
+        self
+    }
+
+    pub(crate) fn with_status(mut self, status: Option<u16>) -> Self {
+        self.status = status;
+        self
+    }
+
+    pub(crate) fn with_retry_after(mut self, retry_after: Option<u64>) -> Self {
+        self.retry_after = retry_after;
+        self
+    }
+
+    /// Mark this network failure as one where the request was provably never
+    /// transmitted (see [`request_unsent`](Self::request_unsent)).
+    pub(crate) fn with_request_unsent(mut self, request_unsent: bool) -> Self {
+        self.request_unsent = request_unsent;
+        self
+    }
+
+    /// The category of this error.
+    ///
+    /// Match on the returned [`OidcErrorKind`] to branch on the failure — e.g.
+    /// retry a [`Network`](OidcErrorKind::Network) error while surfacing the
+    /// rest:
+    ///
+    /// ```
+    /// use questdb::oidc::{OidcError, OidcErrorKind};
+    ///
+    /// fn is_retryable(err: &OidcError) -> bool {
+    ///     matches!(err.kind(), OidcErrorKind::Network)
+    /// }
+    /// # let _ = is_retryable;
+    /// ```
+    pub fn kind(&self) -> OidcErrorKind {
+        self.kind
+    }
+
+    /// The human-readable message (control-stripped).
+    pub fn message(&self) -> &str {
+        &self.message
+    }
+
+    /// The untrusted IdP `error` field, when the response carried one.
+    pub fn idp_error(&self) -> Option<&str> {
+        self.error.as_deref()
+    }
+
+    /// The untrusted IdP `error_description` field, when the response carried one.
+    pub fn idp_error_description(&self) -> Option<&str> {
+        self.error_description.as_deref()
+    }
+
+    /// The HTTP status associated with the IdP response, when available.
+    pub fn status(&self) -> Option<u16> {
+        self.status
+    }
+
+    /// The parsed `Retry-After` delta-seconds value carried by a rate-limit or
+    /// transient IdP response, when present.
+    pub fn retry_after_secs(&self) -> Option<u64> {
+        self.retry_after
+    }
+
+    /// True when this failure proves the underlying HTTP request never left the
+    /// client — a pre-send connect / DNS / TLS-handshake failure — so a refresh
+    /// token carried in that request was not consumed by the IdP and may be
+    /// safely retried. Any failure that might have transmitted the request
+    /// (including a status-less mid-flight drop) leaves this `false`.
+    pub(crate) fn request_unsent(&self) -> bool {
+        self.request_unsent
+    }
+}
+
+impl Display for OidcError {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)?;
+        // Surface the structured IdP fields for a device-flow error so a
+        // top-level `{}` print (or a converted crate::Error) carries them.
+        if let Some(desc) = &self.error_description {
+            if !desc.is_empty() && !self.message.contains(desc.as_str()) {
+                write!(f, " [{desc}]")?;
+            }
+        } else if let Some(err) = &self.error
+            && !err.is_empty()
+            && !self.message.contains(err.as_str())
+        {
+            write!(f, " [{err}]")?;
+        }
+        Ok(())
+    }
+}
+
+impl std::error::Error for OidcError {}
+
+impl From<OidcError> for Error {
+    fn from(err: OidcError) -> Error {
+        let code = match err.kind {
+            OidcErrorKind::Config => ErrorCode::ConfigError,
+            OidcErrorKind::Network => ErrorCode::SocketError,
+            OidcErrorKind::DeviceFlow
+            | OidcErrorKind::Timeout
+            | OidcErrorKind::InteractionRequired
+            | OidcErrorKind::Cancelled => ErrorCode::AuthError,
+        };
+        let message = err.to_string();
+        Error::new(code, message).with_oidc_error(err)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn kind_maps_to_error_code() {
+        let cases = [
+            (OidcError::config("x"), ErrorCode::ConfigError),
+            (OidcError::network("x"), ErrorCode::SocketError),
+            (OidcError::device_flow("x"), ErrorCode::AuthError),
+            (OidcError::timeout("x"), ErrorCode::AuthError),
+            (OidcError::interaction_required("x"), ErrorCode::AuthError),
+            (OidcError::cancelled("x"), ErrorCode::AuthError),
+        ];
+        for (oidc_err, expected) in cases {
+            let err: Error = oidc_err.into();
+            assert_eq!(err.code(), expected);
+            assert!(err.oidc_error().is_some());
+        }
+    }
+
+    #[test]
+    fn conversion_preserves_structured_details() {
+        let oidc = OidcError::device_flow("Device flow failed")
+            .with_idp_error(Some("access_denied"), Some("user declined"))
+            .with_status(Some(403))
+            .with_retry_after(Some(7));
+        let err: Error = oidc.clone().into();
+        let preserved = err.oidc_error().unwrap();
+        assert_eq!(preserved, &oidc);
+        assert_eq!(preserved.kind(), OidcErrorKind::DeviceFlow);
+        assert_eq!(preserved.idp_error(), Some("access_denied"));
+        assert_eq!(preserved.idp_error_description(), Some("user declined"));
+        assert_eq!(preserved.status(), Some(403));
+        assert_eq!(preserved.retry_after_secs(), Some(7));
+    }
+
+    #[test]
+    fn message_is_control_stripped() {
+        let err = OidcError::device_flow("bad\x1b[31mred\nnewline");
+        assert!(!err.message().contains('\x1b'));
+        assert!(!err.message().contains('\n'));
+    }
+
+    #[test]
+    fn idp_error_description_appended_once() {
+        let err = OidcError::device_flow("Device flow failed")
+            .with_idp_error(Some("access_denied"), Some("user said no"));
+        let shown = err.to_string();
+        assert!(shown.contains("Device flow failed"));
+        assert!(shown.contains("user said no"));
+    }
+
+    #[test]
+    fn idp_fields_control_stripped() {
+        let err = OidcError::device_flow("failed").with_idp_error(Some("a\x1bb"), Some("c\x07d"));
+        assert_eq!(err.idp_error(), Some("ab"));
+        assert_eq!(err.idp_error_description(), Some("cd"));
+    }
+
+    #[test]
+    fn idp_fields_length_capped() {
+        // A hostile IdP returns a multi-MB error_description (valid JSON, so it
+        // bypasses the non-JSON body-snippet cap). It must not be stored or
+        // displayed verbatim.
+        let huge = "x".repeat(1_000_000);
+        let err = OidcError::device_flow("Token refresh failed").with_idp_error(None, Some(&huge));
+        let desc = err.idp_error_description().unwrap();
+        assert!(
+            desc.chars().count() <= MAX_IDP_FIELD_CHARS + 1,
+            "error_description not capped: {} chars",
+            desc.chars().count()
+        );
+        // The rendered error stays small too (message + the bounded field).
+        assert!(
+            err.to_string().len() < 1_000,
+            "Display leaked the huge field"
+        );
+    }
+}

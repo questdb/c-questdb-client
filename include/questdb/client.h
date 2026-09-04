@@ -62,6 +62,31 @@ extern "C" {
  *  owning handle remains open. `questdb_db_close` is the final owner release:
  *  do not call it concurrently with other operations on the same `db`. */
 typedef struct questdb_db questdb_db;
+#ifndef QUESTDB_OIDC_AUTH_DEFINED
+#    define QUESTDB_OIDC_AUTH_DEFINED
+typedef struct questdb_oidc_auth questdb_oidc_auth;
+#endif
+
+/** Maximum accepted capacity for a pool callback inbox. */
+#define QUESTDB_DB_MAX_CALLBACK_INBOX_CAPACITY ((size_t)65536)
+
+/** Extensible options for `questdb_db_connect_ex`. Initialize with
+ *  `questdb_db_connect_options_init(&options, sizeof options)`, then override
+ *  the needed fields. `struct_size` records the caller's allocation size; do
+ *  not modify it after initialization. For each non-NULL callback, an inbox
+ *  capacity of 0 selects the default (64) and must not exceed
+ *  `QUESTDB_DB_MAX_CALLBACK_INBOX_CAPACITY`. */
+typedef struct questdb_db_connect_options
+{
+    size_t struct_size;
+    const questdb_oidc_auth* oidc_auth;
+    questdb_connection_event_cb event_callback;
+    void* event_user_data;
+    size_t event_inbox_capacity;
+    line_sender_qwpws_error_cb rejection_callback;
+    void* rejection_user_data;
+    size_t rejection_inbox_capacity;
+} questdb_db_connect_options;
 
 /* -------------------------------------------------------------------------
  * Pool lifecycle
@@ -118,10 +143,32 @@ typedef struct questdb_db questdb_db;
  * sender is currently closing and has not yet released its slot lock. An
  * unsuffixed slot `<sf_dir>/<sender_id>` is not pool-managed; it is treated
  * like any other orphan slot and is drained only when `drain_orphans=on`.
+ * `conf_len` must not exceed `QUESTDB_CONFIG_MAX_BYTES`.
  */
 QUESTDB_CLIENT_API
 questdb_db* questdb_db_connect(
     const char* conf, size_t conf_len, questdb_error** err_out);
+
+QUESTDB_CLIENT_API
+void questdb_db_connect_options_init(
+    questdb_db_connect_options* options, size_t options_size);
+
+/**
+ * Open a pool with optional callbacks and a shared OIDC token provider.
+ * `options` may be NULL. When `oidc_auth` is set, the pool retains shared
+ * ownership and pulls a fresh token for every sender/reader connect or
+ * reconnect; the caller may free its auth handle after this call returns.
+ * Provider calls may load or silently refresh a token but never start an
+ * interactive device flow. Call questdb_oidc_auth_sign_in before opening the
+ * pool; otherwise token acquisition reports InteractionRequired.
+ * `conf_len` must not exceed `QUESTDB_CONFIG_MAX_BYTES`.
+ */
+QUESTDB_CLIENT_API
+questdb_db* questdb_db_connect_ex(
+    const char* conf,
+    size_t conf_len,
+    const questdb_db_connect_options* options,
+    questdb_error** err_out);
 
 /**
  * Close the pool. Accepts NULL and no-ops.
@@ -184,7 +231,9 @@ size_t questdb_db_reap_idle(questdb_db* db);
  * `line_sender_opts_connection_event_handler`. */
 
 /** `questdb_db_connect` with a connection lifecycle listener.
- * `inbox_capacity` of 0 selects the default (64). The caller guarantees
+ * `conf_len` must not exceed `QUESTDB_CONFIG_MAX_BYTES`.
+ * `inbox_capacity` of 0 selects the default (64) and must not exceed
+ * `QUESTDB_DB_MAX_CALLBACK_INBOX_CAPACITY`. The caller guarantees
  * `user_data` is safe to use from the dispatcher thread until
  * `questdb_db_close` returns. On failure (NULL return) no callback runs
  * after this function returns and `user_data` may be released
@@ -199,7 +248,8 @@ questdb_db* questdb_db_connect_with_event_handler(
     questdb_error** err_out);
 
 /** Like `questdb_db_connect_with_event_handler`, additionally registering a
- * server-rejection handler. Either callback may be NULL: a NULL
+ * server-rejection handler. `conf_len` must not exceed
+ * `QUESTDB_CONFIG_MAX_BYTES`. Either callback may be NULL: a NULL
  * `event_callback` disables connection lifecycle events; a NULL
  * `rejection_callback` selects the default of logging every rejection (warn
  * for retriable policies — the frames are replayed, not lost — error for
@@ -209,8 +259,9 @@ questdb_db* questdb_db_connect_with_event_handler(
  * store-and-forward connections records — including rejections for frames
  * whose sender was already returned to the pool — on a dedicated dispatcher
  * thread through a bounded inbox (`rejection_inbox_capacity` of 0 selects
- * the default 64; overflow drops the oldest event, counted by
- * `questdb_db_rejection_events_dropped`). The caller guarantees each
+ * the default 64; each non-NULL callback's capacity must not exceed
+ * `QUESTDB_DB_MAX_CALLBACK_INBOX_CAPACITY`; overflow drops the oldest event,
+ * counted by `questdb_db_rejection_events_dropped`). The caller guarantees each
  * `user_data` is safe to use from its dispatcher thread until
  * `questdb_db_close` returns. A terminal rejection enters the handler inbox
  * only after the connection's terminal latch and pollable diagnostic have

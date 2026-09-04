@@ -45,8 +45,22 @@ pub enum ConnectionEventKind {
     /// Every configured endpoint was attempted and none accepted the
     /// connection in this sweep.
     AllEndpointsUnreachable,
-    /// Terminal: the server rejected credentials. The owning
-    /// sender/pool operation surfaces the error to the caller.
+    /// A credential was rejected or could not be obtained.
+    ///
+    /// Terminal **only when `host` is set**: the server rejected the
+    /// credential it was offered, and the owning sender/pool operation
+    /// surfaces the error to the caller.
+    ///
+    /// When `host` and `port` are `None` the credential was never offered to
+    /// anyone -- a token provider failed before any endpoint was dialled (see
+    /// `ConnectionEvents::token_provider_failed`). That is **retryable**:
+    /// `classify_provider_error` keeps such a failure a `SocketError` so the
+    /// store-and-forward drainer holds queued frames while a human signs in,
+    /// and the sender goes on reconnecting. A listener that pages, tears down
+    /// the pool, or exits on `AuthFailed` must gate on `host.is_some()`, or it
+    /// will fire on an ordinary silent-refresh blip. The `cause_code` tells the
+    /// two apart as well: `AuthError` for a rejection, `SocketError` for a
+    /// provider failure.
     AuthFailed,
 }
 
@@ -462,6 +476,24 @@ impl ConnectionEventSource {
         );
     }
 
+    /// A token provider (e.g. OIDC) failed before any endpoint was dialled, so
+    /// the round ends without a connection.
+    ///
+    /// Reported as an `AuthFailed` carrying no endpoint: the failure is the
+    /// credential, not a host, and nothing was contacted. Without this the
+    /// whole round is silent — the provider is resolved above the endpoint
+    /// loop, so neither `auth_failed` nor `all_endpoints_unreachable` is ever
+    /// reached, and a listener sees no event at all for a sender that is in
+    /// fact reconnecting indefinitely.
+    pub(crate) fn token_provider_failed(&self, err: &crate::Error, attempt: u64) {
+        self.failed_since_success.store(true, Ordering::Relaxed);
+        self.offer(
+            ConnectionEvent::new(ConnectionEventKind::AuthFailed)
+                .attempt(attempt)
+                .caused_by(err),
+        );
+    }
+
     pub(crate) fn all_endpoints_unreachable(&self, err: &crate::Error) {
         self.failed_since_success.store(true, Ordering::Relaxed);
         self.offer(
@@ -563,6 +595,35 @@ mod tests {
             ]
         );
         assert_eq!(dispatcher.dropped(), 0);
+    }
+
+    #[test]
+    fn drop_immediately_after_new_never_hangs() {
+        // Regression: dropping a dispatcher right after construction — before
+        // its freshly spawned worker has parked on the condvar — must not lose
+        // the shutdown wakeup and hang the join in Drop. This is the create-
+        // then-close race that surfaced as a `questdb_db_close` hang when a
+        // pool was closed immediately after connect. Runs on a helper thread so
+        // a regression fails fast with a message instead of wedging the suite.
+        let done = Arc::new(AtomicBool::new(false));
+        let done_in_thread = Arc::clone(&done);
+        let runner = std::thread::spawn(move || {
+            for _ in 0..2000 {
+                let dispatcher =
+                    ConnectionEventDispatcher::new(Arc::new(|_: &ConnectionEvent| {}), 8);
+                drop(dispatcher);
+            }
+            done_in_thread.store(true, Ordering::Release);
+        });
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        while !done.load(Ordering::Acquire) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "EventDispatcher::drop hung joining a not-yet-parked worker (lost wakeup)"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        runner.join().unwrap();
     }
 
     #[test]

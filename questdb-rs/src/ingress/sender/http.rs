@@ -51,11 +51,51 @@ pub(crate) struct SyncHttpHandlerState {
     /// The URL of the HTTP endpoint.
     pub(crate) url: String,
 
-    /// The content of the `Authorization` HTTP header.
-    pub(crate) auth: Option<String>,
+    /// How to produce the `Authorization` HTTP header.
+    pub(crate) auth: HttpAuth,
 
     /// HTTP params configured via the `SenderBuilder`.
     pub(crate) config: HttpConfig,
+}
+
+/// The source of the `Authorization` header value on each flush.
+///
+/// A static value (Basic / a fixed Bearer token) is precomputed once; a provider
+/// is called per flush so a rotating token (e.g. OIDC) stays fresh for a
+/// long-lived sender.
+#[cfg(feature = "sync-sender-http")]
+pub(crate) enum HttpAuth {
+    None,
+    Static(String),
+    Provider(crate::token_provider::TokenProvider),
+}
+
+#[cfg(feature = "sync-sender-http")]
+impl HttpAuth {
+    /// Resolve the `Authorization` header value for one flush, calling the token
+    /// provider if present. A `Static` value is borrowed (no per-flush
+    /// allocation on the hot path); only the `Provider` case allocates.
+    pub(crate) fn resolve(&self) -> Result<Option<std::borrow::Cow<'_, str>>, Error> {
+        use std::borrow::Cow;
+        match self {
+            HttpAuth::None => Ok(None),
+            HttpAuth::Static(value) => Ok(Some(Cow::Borrowed(value.as_str()))),
+            // Pull, validate, and classify through the shared `TokenProvider`
+            // gate — the same path the QWP/WebSocket sender and reader use — so a
+            // provider acquisition failure, a blank / non-printable-ASCII token (a
+            // decoded CR/LF is a header-injection vector), and a caller-closure
+            // panic (in unwind builds) all surface as one retryable `SocketError`
+            // here too, never a terminal `AuthError`. A server rejection of a
+            // successfully acquired token remains a separate terminal auth error.
+            HttpAuth::Provider(provider) => Ok(Some(Cow::Owned(provider.bearer_header()?))),
+        }
+    }
+
+    /// Whether the header can change between attempts, so a retry loop must
+    /// re-resolve rather than replay the value it started with.
+    pub(crate) fn is_rotating(&self) -> bool {
+        matches!(self, HttpAuth::Provider(_))
+    }
 }
 
 #[cfg(feature = "sync-sender-http")]
@@ -64,6 +104,7 @@ impl SyncHttpHandlerState {
         &self,
         buf: &[u8],
         request_timeout: Duration,
+        auth: Option<&str>,
     ) -> (bool, Result<Response<Body>, ureq::Error>) {
         let request = self
             .agent
@@ -74,7 +115,7 @@ impl SyncHttpHandlerState {
             .query_pairs([("precision", "n")])
             .content_type("text/plain; charset=utf-8");
 
-        let request = match self.auth.as_ref() {
+        let request = match auth {
             Some(auth) => request.header("Authorization", auth),
             None => request,
         };
@@ -339,6 +380,7 @@ fn retry_http_send(
     request_timeout: Duration,
     retry_timeout: Duration,
     retry_max_backoff: Duration,
+    auth: Option<&str>,
     mut last_rep: Result<Response<Body>, ureq::Error>,
 ) -> Result<Response<Body>, ureq::Error> {
     let mut rng = rand::rng();
@@ -346,9 +388,35 @@ fn retry_http_send(
     let max_backoff_ms = clamp_backoff_ms(retry_max_backoff);
     let mut retry_interval_ms = 10i32;
     let mut need_retry;
+    // The provider is resolved once per flush, before this loop, and stays that
+    // way: a caller's provider closure is arbitrary code, so pulling it on every
+    // attempt could be expensive or have side effects.
+    //
+    // The exception is an expiry that lands *inside* the retry window, which the
+    // caller sets and may set large. The header resolved before the first
+    // attempt then gets a 401, which `need_retry` does not cover, so the flush
+    // ended as a terminal AuthError -- exactly the outcome the provider path
+    // otherwise works to avoid. Re-resolve once in that case: if the provider
+    // hands back a *different* header the credential really had rotated and the
+    // attempt is worth repeating; if it is unchanged this is a genuine
+    // rejection and the 401 stands, with no extra request.
+    let mut refreshed: Option<String> = None;
+    let mut auth_retry_used = false;
+    // Set for exactly one iteration by the credential-rotation branch below, so
+    // that retry goes out without a wait. It is a one-shot override rather than
+    // `retry_interval_ms = 0` because the interval is the *ladder*: zeroing it
+    // made every later `saturating_mul(2)` compute `0 * 2`, so a single
+    // rotation disabled backoff for the rest of the window and any genuinely
+    // retryable failure after it re-sent the whole buffer in a ~1 ms loop until
+    // `retry_end`.
+    let mut retry_now = false;
     loop {
         let jitter_ms = rng.random_range(-5i32..5);
-        let to_sleep = retry_sleep(retry_interval_ms, jitter_ms);
+        let to_sleep = if std::mem::take(&mut retry_now) {
+            Duration::ZERO
+        } else {
+            retry_sleep(retry_interval_ms, jitter_ms)
+        };
         if (std::time::Instant::now() + to_sleep) > retry_end {
             return last_rep;
         }
@@ -358,8 +426,22 @@ fn retry_http_send(
             // see https://github.com/algesten/ureq/issues/94
             _ = last_rep.into_body().read_to_vec();
         }
-        (need_retry, last_rep) = state.send_request(buf, request_timeout);
+        let attempt_auth = refreshed.as_deref().or(auth);
+        (need_retry, last_rep) = state.send_request(buf, request_timeout, attempt_auth);
         if !need_retry {
+            if !auth_retry_used
+                && let Some(value) = rotated_auth_after_401(state, &last_rep, attempt_auth)
+            {
+                auth_retry_used = true;
+                refreshed = Some(value);
+                // Retry immediately rather than backing off: nothing was
+                // overloaded, the credential had simply rotated. The backoff
+                // ladder is deliberately left where it is -- this attempt is
+                // free, but a later 5xx in the same window must still escalate
+                // from wherever congestion had already pushed it.
+                retry_now = true;
+                continue;
+            }
             return last_rep;
         }
         retry_interval_ms = retry_interval_ms.saturating_mul(2).min(max_backoff_ms);
@@ -380,6 +462,24 @@ fn retry_sleep(retry_interval_ms: i32, jitter_ms: i32) -> Duration {
     Duration::from_millis(retry_interval_ms.saturating_add(jitter_ms).max(0) as u64)
 }
 
+/// A rotated credential worth one more attempt after a 401, if there is one.
+///
+/// `None` means do not retry: the credential cannot rotate, the response was
+/// not a 401, the provider failed, or it handed back the very value that was
+/// just rejected -- which makes this a genuine rejection rather than an expiry,
+/// and spending another request on it would be pointless.
+fn rotated_auth_after_401(
+    state: &SyncHttpHandlerState,
+    rep: &Result<Response<Body>, ureq::Error>,
+    used: Option<&str>,
+) -> Option<String> {
+    if !state.auth.is_rotating() || !matches!(rep, Ok(rep) if rep.status() == 401) {
+        return None;
+    }
+    let value = state.auth.resolve().ok()??.into_owned();
+    (Some(value.as_str()) != used).then_some(value)
+}
+
 #[allow(clippy::result_large_err)] // `ureq::Error` is large enough to cause this warning.
 pub(super) fn http_send_with_retries(
     state: &SyncHttpHandlerState,
@@ -387,8 +487,34 @@ pub(super) fn http_send_with_retries(
     request_timeout: Duration,
     retry_timeout: Duration,
     retry_max_backoff: Duration,
+    auth: Option<&str>,
 ) -> Result<Response<Body>, ureq::Error> {
-    let (need_retry, last_rep) = state.send_request(buf, request_timeout);
+    let (need_retry, last_rep) = state.send_request(buf, request_timeout, auth);
+    // A 401 is not retryable, so this is where a credential that expired
+    // between resolution and the request used to end the flush as a terminal
+    // AuthError. Give a rotated credential exactly one more attempt -- and only
+    // when the provider actually hands back a different value, so a genuine
+    // rejection still costs a single request.
+    if !need_retry && let Some(rotated) = rotated_auth_after_401(state, &last_rep, auth) {
+        if let Ok(rep) = last_rep {
+            // Return the connection to the pool before reusing the agent.
+            _ = rep.into_body().read_to_vec();
+        }
+        let (need_retry, last_rep) =
+            state.send_request(buf, request_timeout, Some(rotated.as_str()));
+        if !need_retry || retry_timeout.is_zero() {
+            return last_rep;
+        }
+        return retry_http_send(
+            state,
+            buf,
+            request_timeout,
+            retry_timeout,
+            retry_max_backoff,
+            Some(rotated.as_str()),
+            last_rep,
+        );
+    }
     if !need_retry || retry_timeout.is_zero() {
         return last_rep;
     }
@@ -399,6 +525,7 @@ pub(super) fn http_send_with_retries(
         request_timeout,
         retry_timeout,
         retry_max_backoff,
+        auth,
         last_rep,
     )
 }
@@ -585,5 +712,20 @@ mod tests {
             retry_sleep(i32::MAX, 4),
             Duration::from_millis(i32::MAX as u64)
         );
+    }
+
+    #[test]
+    fn resolve_rejects_blank_provider_token() {
+        // A blank / all-whitespace provider token is refused (matching safe_token),
+        // never reaching the wire as "Bearer   ".
+        let blank = HttpAuth::Provider(crate::token_provider::TokenProvider::new(|| {
+            Ok::<_, crate::Error>("   ".to_string())
+        }));
+        assert!(blank.resolve().is_err());
+        // A normal token resolves to a Bearer header.
+        let ok = HttpAuth::Provider(crate::token_provider::TokenProvider::new(|| {
+            Ok::<_, crate::Error>("tok".to_string())
+        }));
+        assert_eq!(ok.resolve().unwrap().as_deref(), Some("Bearer tok"));
     }
 }

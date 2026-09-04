@@ -41,12 +41,12 @@ use libc::{c_char, c_void, size_t};
 
 use questdb::egress::{
     BatchView, ColumnKind, ColumnView, Cursor, FailoverPhase, FailoverProgressEvent,
-    FailoverResetEvent, Reader, ReaderQuery, ReaderStats, ServerInfo, ServerRole, SimpleNullKind,
-    SymbolEntry, Terminal, Validity,
+    FailoverResetEvent, Reader, ReaderConfig, ReaderQuery, ReaderStats, ServerInfo, ServerRole,
+    SimpleNullKind, SymbolEntry, Terminal, Validity,
 };
 use questdb::{Error, ErrorCode};
 
-use crate::{line_sender_utf8, questdb_error, questdb_error_code};
+use crate::{line_sender_utf8, questdb_error, questdb_error_code, validated_config_str};
 #[cfg(test)]
 use crate::{questdb_error_free, questdb_error_get_code, questdb_error_msg};
 
@@ -129,6 +129,16 @@ fn wrap_pooled_reader(
             handle: pool,
             must_close: AtomicBool::new(false),
         },
+    }))
+}
+
+fn wrap_standalone_reader(reader: Reader) -> *mut qwp_reader {
+    let stats = Arc::clone(reader.stats());
+    Box::into_raw(Box::new(qwp_reader {
+        reader_cell: UnsafeCell::new(reader),
+        cursor_active: AtomicBool::new(false),
+        stats,
+        ownership: ReaderOwnership::Standalone,
     }))
 }
 
@@ -451,6 +461,7 @@ unsafe fn pooled_reader_pool_closed(reader: *const qwp_reader) -> bool {
 ///
 /// The config string follows the same format documented in the Rust
 /// `ReaderConfig::from_conf` API (e.g. `"ws::addr=localhost:9000;"`).
+/// It must not exceed [`crate::MAX_CONFIG_BYTES`] bytes.
 /// On success returns a non-NULL handle that must be released with
 /// `qwp_reader_close`. On failure returns NULL and sets `*err_out`.
 #[unsafe(no_mangle)]
@@ -467,7 +478,7 @@ pub unsafe extern "C" fn qwp_reader_from_conf(
     // `_cursor_next_batch`, etc.).
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
         // Re-validate UTF-8 (see `validated_utf8` for the rationale).
-        let conf = match validated_utf8(&config) {
+        let conf = match validated_config_str(&config) {
             Ok(s) => s,
             Err(e) => {
                 write_err_box(err_out, e);
@@ -476,18 +487,46 @@ pub unsafe extern "C" fn qwp_reader_from_conf(
         };
         let reader_result = Reader::from_conf(conf);
         let reader = reader_bubble!(err_out, reader_result, ptr::null_mut());
-        let stats = Arc::clone(reader.stats());
-        Box::into_raw(Box::new(qwp_reader {
-            reader_cell: UnsafeCell::new(reader),
-            cursor_active: AtomicBool::new(false),
-            stats,
-            ownership: ReaderOwnership::Standalone,
-        }))
+        wrap_standalone_reader(reader)
     }));
     match result {
         Ok(p) => p,
         Err(_) => std::process::abort(),
     }
+}
+
+/// Construct a reader from a QuestDB config string and use `auth` as its
+/// rotating, non-prompting Bearer-token provider. The auth handle may be freed
+/// after this call returns; the reader retains shared ownership of the OIDC
+/// state. Explicit sign-in must happen before a token that cannot be silently
+/// refreshed is needed. The config must not exceed
+/// [`crate::MAX_CONFIG_BYTES`] bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn qwp_reader_from_conf_with_oidc(
+    config: line_sender_utf8,
+    auth: *const crate::oidc::questdb_oidc_auth,
+    err_out: *mut *mut questdb_error,
+) -> *mut qwp_reader {
+    panic_guard(|| unsafe {
+        let conf = match validated_config_str(&config) {
+            Ok(s) => s,
+            Err(err) => {
+                write_err_box(err_out, err);
+                return ptr::null_mut();
+            }
+        };
+        let Some(auth) = crate::oidc::clone_auth(auth, err_out) else {
+            return ptr::null_mut();
+        };
+        let config = reader_bubble!(err_out, ReaderConfig::from_conf(conf), ptr::null_mut());
+        let config = reader_bubble!(
+            err_out,
+            config.token_provider(move || auth.token()),
+            ptr::null_mut()
+        );
+        let reader = reader_bubble!(err_out, Reader::from_config(&config), ptr::null_mut());
+        wrap_standalone_reader(reader)
+    })
 }
 
 /// Construct a reader from the configuration stored in the
@@ -525,13 +564,7 @@ pub unsafe extern "C" fn qwp_reader_from_env(err_out: *mut *mut questdb_error) -
         };
         let reader_result = Reader::from_conf(&conf);
         let reader = reader_bubble!(err_out, reader_result, ptr::null_mut());
-        let stats = Arc::clone(reader.stats());
-        Box::into_raw(Box::new(qwp_reader {
-            reader_cell: UnsafeCell::new(reader),
-            cursor_active: AtomicBool::new(false),
-            stats,
-            ownership: ReaderOwnership::Standalone,
-        }))
+        wrap_standalone_reader(reader)
     }));
     match result {
         Ok(p) => p,
@@ -4019,6 +4052,37 @@ mod tests {
             assert!(r.is_null());
             assert!(!err.is_null());
             questdb_error_free(err);
+        }
+    }
+
+    #[test]
+    fn reader_config_apis_reject_oversized_inputs_before_reading_them() {
+        let config = line_sender_utf8 {
+            len: crate::MAX_CONFIG_BYTES + 1,
+            // The size gate must run before any slice is formed.
+            buf: std::ptr::NonNull::<c_char>::dangling().as_ptr(),
+        };
+
+        for with_oidc in [false, true] {
+            let mut err = ptr::null_mut();
+            let reader = unsafe {
+                if with_oidc {
+                    qwp_reader_from_conf_with_oidc(config, ptr::null(), &mut err)
+                } else {
+                    qwp_reader_from_conf(config, &mut err)
+                }
+            };
+            assert!(reader.is_null());
+            assert!(!err.is_null());
+            assert_eq!(
+                unsafe { questdb_error_get_code(err) } as u32,
+                questdb_error_code::line_sender_error_invalid_api_call as u32
+            );
+            let mut len = 0;
+            let message = unsafe { questdb_error_msg(err, &mut len) };
+            let message = unsafe { slice::from_raw_parts(message as *const u8, len) };
+            assert!(String::from_utf8_lossy(message).contains("maximum is 1048576 bytes"));
+            unsafe { questdb_error_free(err) };
         }
     }
 

@@ -57,8 +57,11 @@ use std::path::PathBuf;
 #[cfg(feature = "_sync-sender")]
 use std::str::FromStr;
 
+// `pub(crate)` so the `oidc` module can reuse `configure_tls` / `TlsSettings`
+// for its IdP HTTPS calls (see `oidc::http`). The items themselves stay
+// `pub(crate)`, so this widens visibility only within the crate.
 #[cfg(feature = "_sync-sender")]
-mod tls;
+pub(crate) mod tls;
 
 #[cfg(all(feature = "_sender-tcp", feature = "aws-lc-crypto"))]
 use aws_lc_rs::signature::{ECDSA_P256_SHA256_FIXED_SIGNING, EcdsaKeyPair};
@@ -957,6 +960,11 @@ pub struct SenderBuilder {
     #[cfg(feature = "_sender-http")]
     http: Option<conf::HttpConfig>,
 
+    /// Per-request Bearer-token source for ILP/HTTP; mutually exclusive with
+    /// `username`/`password`/`token`. See [`SenderBuilder::http_token_provider`].
+    #[cfg(feature = "_sender-http")]
+    http_token_provider: Option<crate::token_provider::TokenProvider>,
+
     #[cfg(feature = "_sender-qwp-udp")]
     qwp_udp: Option<conf::QwpUdpConfig>,
 
@@ -1450,6 +1458,9 @@ impl SenderBuilder {
                 None
             },
 
+            #[cfg(feature = "_sender-http")]
+            http_token_provider: None,
+
             #[cfg(feature = "_sender-qwp-udp")]
             qwp_udp: if protocol.is_qwp_udp() {
                 Some(conf::QwpUdpConfig::default())
@@ -1544,6 +1555,166 @@ impl SenderBuilder {
         self.token
             .set_specified("token", Some(validate_value(token.to_string())?))?;
         Ok(self)
+    }
+
+    /// Supply a fresh HTTP Bearer token for every flush via a callback.
+    ///
+    /// Unlike [`token`](Self::token), which captures a fixed token once, the
+    /// provider is called on each flush, so a long-lived sender keeps working as
+    /// the token silently refreshes / rotates. Pass
+    /// [`OidcDeviceAuth::token`](crate::oidc::OidcDeviceAuth::token) here after an
+    /// explicit sign-in:
+    ///
+    /// ```no_run
+    /// # #[cfg(feature = "oidc")] {
+    /// use std::sync::Arc;
+    /// use questdb::oidc::OidcDeviceAuth;
+    /// use questdb::ingress::{Protocol, SenderBuilder};
+    ///
+    /// # fn run() -> questdb::Result<()> {
+    /// let auth = Arc::new(OidcDeviceAuth::from_questdb("https://questdb.example.com:9000").build()?);
+    /// auth.sign_in()?;
+    /// let sender = SenderBuilder::new(Protocol::Https, "questdb.example.com", 9000)
+    ///     .http_token_provider({ let auth = Arc::clone(&auth); move || auth.token() })?
+    ///     .build()?;
+    /// # let _ = sender; Ok(())
+    /// # }
+    /// # }
+    /// ```
+    ///
+    /// The returned token is sent as `Authorization: Bearer <token>`; a token
+    /// with a non-printable-ASCII character (a header-injection vector) is
+    /// rejected at flush time. A provider acquisition or validation failure fails
+    /// that flush as a retryable [`SocketError`](crate::ErrorCode::SocketError) —
+    /// the same classification the QWP/WebSocket sender and reader apply — because
+    /// the callback may recover on the next flush; the buffer is left intact for a
+    /// retry. In unwind-enabled builds a callback panic is contained and treated
+    /// as such a retryable failure (a `panic = "abort"` build cannot contain
+    /// panics). A server rejection of a successfully acquired token is a separate
+    /// terminal authentication error. Mutually exclusive with
+    /// [`username`](Self::username) / [`password`](Self::password) /
+    /// [`token`](Self::token); ILP/HTTP only.
+    ///
+    /// **Use [`Protocol::Https`].** The token is a
+    /// bearer credential for QuestDB; over
+    /// [`Protocol::Http`] to a non-loopback host it
+    /// is sent in cleartext and can be captured in transit — plaintext http is
+    /// meant only for a loopback server during local development.
+    ///
+    /// The provider runs **synchronously on the flush path**, so it must not
+    /// block indefinitely. [`OidcDeviceAuth::token`](crate::oidc::OidcDeviceAuth::token)
+    /// returns a cached token or performs a silent refresh, but never starts an
+    /// interactive device flow. If no usable cached/persisted token or refresh
+    /// token is available, the flush fails as the retryable `SocketError` above,
+    /// with the OIDC `InteractionRequired` kind preserved for inspection. Call
+    /// [`OidcDeviceAuth::sign_in`](crate::oidc::OidcDeviceAuth::sign_in) on a
+    /// suitable UI thread before flushing, and request the `offline_access` scope
+    /// so unattended senders can refresh without another explicit sign-in.
+    #[cfg(feature = "_sender-http")]
+    pub fn http_token_provider<F, E>(mut self, provider: F) -> Result<Self>
+    where
+        F: Fn() -> std::result::Result<String, E> + Send + Sync + 'static,
+        E: Into<crate::Error>,
+    {
+        if !self.protocol.is_httpx() {
+            return Err(fmt!(
+                ConfigError,
+                "\"http_token_provider\" is only supported for ILP over HTTP."
+            ));
+        }
+        if self.username.is_specified() || self.password.is_specified() || self.token.is_specified()
+        {
+            return Err(fmt!(
+                ConfigError,
+                "\"http_token_provider\" is mutually exclusive with \
+                 username/password and token authentication."
+            ));
+        }
+        self.http_token_provider = Some(crate::token_provider::TokenProvider::new(provider));
+        Ok(self)
+    }
+
+    /// Supply a fresh Bearer token on every QWP/WebSocket (re)connect via a
+    /// callback (e.g. [`OidcDeviceAuth::token`](crate::oidc::OidcDeviceAuth::token)).
+    ///
+    /// Unlike [`token`](Self::token), which captures a fixed token once, the
+    /// provider is called at each connect and reconnect, so a long-lived sender
+    /// keeps working as the token silently refreshes / rotates. The returned token
+    /// is sent as the `Authorization: Bearer <token>` handshake header; a token
+    /// with a non-printable-ASCII character (a header-injection vector) is
+    /// rejected. A provider error fails that connection attempt and is retried by
+    /// the reconnect loop because the callback may recover on its next invocation;
+    /// already accepted store-and-forward frames remain queued. A server rejection
+    /// of a successfully acquired token is a separate terminal authentication
+    /// error. In unwind-enabled builds, a callback panic is contained and treated
+    /// as a retryable provider failure; a process built with `panic = "abort"`
+    /// cannot contain panics, so providers must not rely on this as their normal
+    /// error path. Runner-owned acquisition is isolated so sender shutdown can
+    /// release its store-and-forward slot even if the callback blocks; in that
+    /// case the in-flight callback may outlive the sender until it returns and
+    /// must own everything it accesses. Mutually exclusive with
+    /// [`username`](Self::username) / [`password`](Self::password) /
+    /// [`token`](Self::token); QWP/WebSocket only.
+    /// `OidcDeviceAuth::token` never launches an interactive device flow from a
+    /// connect or reconnect thread; it returns `InteractionRequired` if explicit
+    /// sign-in is needed.
+    ///
+    /// **Use [`Protocol::Wss`]** (TLS): the
+    /// token is a bearer credential, sent in cleartext over plain
+    /// [`Protocol::Ws`] to a non-loopback host.
+    #[cfg(feature = "_sender-qwp-ws")]
+    pub fn qwp_ws_token_provider<F, E>(mut self, provider: F) -> Result<Self>
+    where
+        F: Fn() -> std::result::Result<String, E> + Send + Sync + 'static,
+        E: Into<crate::Error>,
+    {
+        if self.qwp_ws.is_none() {
+            return Err(fmt!(
+                ConfigError,
+                "\"qwp_ws_token_provider\" is only supported for QWP over WebSocket."
+            ));
+        }
+        if self.username.is_specified() || self.password.is_specified() || self.token.is_specified()
+        {
+            return Err(fmt!(
+                ConfigError,
+                "\"qwp_ws_token_provider\" is mutually exclusive with \
+                 username/password and token authentication."
+            ));
+        }
+        self.qwp_ws.as_mut().unwrap().token_provider =
+            Some(crate::token_provider::TokenProvider::new(provider));
+        Ok(self)
+    }
+
+    /// Supply a rotating Bearer-token provider for either ILP/HTTP(S) or
+    /// QWP/WebSocket. This protocol-neutral counterpart of
+    /// [`http_token_provider`](Self::http_token_provider) and
+    /// [`qwp_ws_token_provider`](Self::qwp_ws_token_provider) is useful to
+    /// language bindings that attach one shared authentication object without
+    /// reimplementing protocol dispatch.
+    ///
+    /// TCP and QWP/UDP do not support Bearer authentication and are rejected.
+    #[cfg(all(feature = "_sender-http", feature = "_sender-qwp-ws"))]
+    pub fn bearer_token_provider<F, E>(self, provider: F) -> Result<Self>
+    where
+        F: Fn() -> std::result::Result<String, E> + Send + Sync + 'static,
+        E: Into<crate::Error>,
+    {
+        match self.protocol {
+            Protocol::Http | Protocol::Https => self.http_token_provider(provider),
+            Protocol::Ws | Protocol::Wss => self.qwp_ws_token_provider(provider),
+            #[cfg(feature = "_sender-tcp")]
+            Protocol::Tcp | Protocol::Tcps => Err(fmt!(
+                ConfigError,
+                "Bearer token providers are supported only for ILP/HTTP(S) and QWP/WebSocket."
+            )),
+            #[cfg(feature = "_sender-qwp-udp")]
+            Protocol::Udp => Err(fmt!(
+                ConfigError,
+                "Bearer token providers are supported only for ILP/HTTP(S) and QWP/WebSocket."
+            )),
+        }
     }
 
     /// Set the ECDSA public key X for TCP authentication.
@@ -2469,6 +2640,46 @@ impl SenderBuilder {
     }
 
     fn build_auth(&self) -> Result<Option<conf::AuthParams>> {
+        // Report the precise conflict when a token provider is combined with any
+        // username/password/token — whichever was set first — before the match
+        // below, where a half-specified basic auth (e.g. a username with no
+        // password) would otherwise hit an "incomplete parameters" arm and hide
+        // the real cause.
+        let fixed_credential_set = self.username.is_specified()
+            || self.password.is_specified()
+            || self.token.is_specified();
+        #[cfg(feature = "_sender-http")]
+        {
+            if self.http_token_provider.is_some() && fixed_credential_set {
+                return Err(error::fmt!(
+                    ConfigError,
+                    "\"http_token_provider\" is mutually exclusive with \
+                     username/password and token authentication."
+                ));
+            }
+        }
+        // The QWP/WebSocket provider needs the same pre-check. Without it a
+        // provider combined with a half-specified basic auth -- a username and
+        // no password -- fell through to the match below and reported the
+        // missing password, sending the caller to fix the wrong thing:
+        // supplying it then produced a different error from the conflict check
+        // further downstream.
+        #[cfg(feature = "_sender-qwp-ws")]
+        {
+            if self
+                .qwp_ws
+                .as_ref()
+                .is_some_and(|qwp_ws| qwp_ws.token_provider.is_some())
+                && fixed_credential_set
+            {
+                return Err(error::fmt!(
+                    ConfigError,
+                    "\"qwp_ws_token_provider\" is mutually exclusive with \
+                     username/password and token authentication."
+                ));
+            }
+        }
+        let _ = fixed_credential_set;
         match (
             self.protocol,
             self.username.deref(),
@@ -2574,6 +2785,24 @@ impl SenderBuilder {
         }
     }
 
+    /// Whether this builder has protocol-appropriate dynamic authentication.
+    /// Static authentication is returned separately by [`Self::build_auth`].
+    fn has_token_provider_auth(&self) -> bool {
+        match self.protocol {
+            #[cfg(feature = "_sender-http")]
+            Protocol::Http | Protocol::Https => self.http_token_provider.is_some(),
+            #[cfg(feature = "_sender-qwp-ws")]
+            Protocol::Ws | Protocol::Wss => self
+                .qwp_ws
+                .as_ref()
+                .is_some_and(|qwp_ws| qwp_ws.token_provider.is_some()),
+            #[cfg(feature = "_sender-tcp")]
+            Protocol::Tcp | Protocol::Tcps => false,
+            #[cfg(feature = "_sender-qwp-udp")]
+            Protocol::Udp => false,
+        }
+    }
+
     #[cfg(feature = "_sync-sender")]
     /// Build the sender.
     ///
@@ -2672,9 +2901,20 @@ impl SenderBuilder {
 
                 let connector = connector.chain(TlsConnector::new(tls_config));
 
+                if self.http_token_provider.is_some() && auth.is_some() {
+                    return Err(fmt!(
+                        ConfigError,
+                        "\"http_token_provider\" is mutually exclusive with \
+                         username/password and token authentication."
+                    ));
+                }
                 let auth = match auth {
-                    Some(conf::AuthParams::Basic(ref auth)) => Some(auth.to_header_string()),
-                    Some(conf::AuthParams::Token(ref auth)) => Some(auth.to_header_string()?),
+                    Some(conf::AuthParams::Basic(ref auth)) => {
+                        HttpAuth::Static(auth.to_header_string())
+                    }
+                    Some(conf::AuthParams::Token(ref auth)) => {
+                        HttpAuth::Static(auth.to_header_string()?)
+                    }
 
                     #[cfg(feature = "sync-sender-tcp")]
                     Some(conf::AuthParams::Ecdsa(_)) => {
@@ -2684,7 +2924,10 @@ impl SenderBuilder {
                             Please use basic or token authentication instead."
                         ));
                     }
-                    None => None,
+                    None => match self.http_token_provider {
+                        Some(ref provider) => HttpAuth::Provider(provider.clone()),
+                        None => HttpAuth::None,
+                    },
                 };
                 let agent_builder = agent_builder
                     .timeout_connect(Some(*http_config.request_timeout.deref()))
@@ -2747,6 +2990,7 @@ impl SenderBuilder {
                     ConfigSetting::Specified(actual_initial_connect_retry);
                 let qwp_ws = &qwp_ws;
                 reject_unsupported_qwp_ws_sf_config(qwp_ws)?;
+                reject_qwp_ws_token_provider_auth_conflict(qwp_ws, &auth)?;
                 let basic_auth = qwp_ws_auth_header(&auth)?;
                 if *qwp_ws.progress == QwpWsProgress::Manual {
                     if *qwp_ws.initial_connect_retry == conf::QwpWsInitialConnectMode::Async {
@@ -2819,7 +3063,7 @@ impl SenderBuilder {
             },
         };
 
-        if auth.is_some() {
+        if auth.is_some() || self.has_token_provider_auth() {
             descr.push_str("auth=on]");
         } else {
             descr.push_str("auth=off]");
@@ -2914,6 +3158,7 @@ impl SenderBuilder {
         )?;
 
         let auth = self.build_auth()?;
+        reject_qwp_ws_token_provider_auth_conflict(qwp_ws, &auth)?;
         let auth_header = qwp_ws_auth_header(&auth)?;
         let qwp_ws = qwp_ws.clone();
         reject_unsupported_qwp_ws_sf_config(&qwp_ws)?;
@@ -3170,6 +3415,21 @@ fn reject_unsupported_qwp_ws_sf_config(qwp_ws: &conf::QwpWsConfig) -> Result<()>
         ));
     }
 
+    Ok(())
+}
+
+#[cfg(feature = "_sender-qwp-ws")]
+fn reject_qwp_ws_token_provider_auth_conflict(
+    qwp_ws: &conf::QwpWsConfig,
+    auth: &Option<conf::AuthParams>,
+) -> Result<()> {
+    if qwp_ws.token_provider.is_some() && auth.is_some() {
+        return Err(fmt!(
+            ConfigError,
+            "\"qwp_ws_token_provider\" is mutually exclusive with \
+             username/password and token authentication."
+        ));
+    }
     Ok(())
 }
 

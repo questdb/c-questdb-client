@@ -1749,3 +1749,45 @@ fn assert_conf_err<T, M: AsRef<str>>(result: Result<T>, expect_msg: M) {
     assert_eq!(err.code(), ErrorCode::ConfigError);
     assert_eq!(err.msg(), expect_msg.as_ref());
 }
+
+#[cfg(feature = "_sender-qwp-ws")]
+#[test]
+fn qwp_ws_token_provider_conflicts_with_static_auth() {
+    // A rotating token provider is mutually exclusive with static auth.
+    let result = SenderBuilder::new(Protocol::Ws, "127.0.0.1", 9000)
+        .username("u")
+        .unwrap()
+        .qwp_ws_token_provider(|| Ok::<_, crate::Error>("provided".to_string()));
+    assert_eq!(result.unwrap_err().code(), ErrorCode::ConfigError);
+}
+
+#[cfg(feature = "_sender-qwp-ws")]
+#[test]
+fn qwp_ws_token_provider_stored_in_config() {
+    // With no static auth, the provider is accepted and stored on the QWP/WS
+    // config, ready to be pulled at each (re)connect.
+    let builder = SenderBuilder::new(Protocol::Ws, "127.0.0.1", 9000)
+        .qwp_ws_token_provider(|| Ok::<_, crate::Error>("tok".to_string()))
+        .unwrap();
+    assert!(builder.qwp_ws.as_ref().unwrap().token_provider.is_some());
+    assert!(builder.has_token_provider_auth());
+}
+
+#[cfg(feature = "sync-sender-qwp-ws")]
+#[test]
+fn qwp_ws_connector_rejects_static_auth_added_after_token_provider() {
+    // The pooled connector bypasses SenderBuilder::build, so its shared
+    // validation must independently catch auth assigned after the provider.
+    let builder = SenderBuilder::new(Protocol::Ws, "127.0.0.1", 9000)
+        .qwp_ws_token_provider(|| Ok::<_, crate::Error>("provided".to_string()))
+        .unwrap()
+        .username("u")
+        .unwrap()
+        .password("p")
+        .unwrap();
+    let Err(err) = builder.build_qwp_ws_connector() else {
+        panic!("expected the pooled connector to reject provider plus static auth");
+    };
+    assert_eq!(err.code(), ErrorCode::ConfigError);
+    assert!(err.msg().contains("qwp_ws_token_provider"));
+}
