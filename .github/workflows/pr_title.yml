@@ -1,0 +1,53 @@
+name: PR title
+
+on:
+  pull_request:
+    # synchronize is here even though pushing cannot change a title: the status is
+    # attached to the head commit, so every new head needs its own verdict or the
+    # check reads as missing against the commit the pull request is showing.
+    types: [ synchronize, opened, reopened, edited ]
+  merge_group:
+
+permissions: {}
+
+jobs:
+  # Deliberately a separate job rather than a first step of `validate`. Run in one
+  # job, a broken or flaky test would stop check.js from running at all, which
+  # leaves a fixed title still carrying its rejection comment and no status posted.
+  # The rules and the reporting are worth failing on, but not at the cost of the
+  # verdict itself.
+  test:
+    runs-on: ubuntu-latest
+    permissions:
+      # Needed to clone. This repository is private, so the top-level `permissions:
+      # {}` above leaves a job that declares nothing with a token that cannot read
+      # it, and checkout fails with "Repository not found" rather than a permission
+      # error. The OSS copy omits this and works only because that repository is
+      # public.
+      contents: read
+    steps:
+      - uses: actions/checkout@v5
+      # No setup-node step: the runner ships a current Node, and nothing under
+      # ci/validate-pr-title depends on anything outside the standard library.
+      - name: Test the title rules and the reporting
+        working-directory: ./ci/validate-pr-title
+        run: |
+          node validate.test.js
+          node check.test.js
+
+  validate:
+    # A pull request from a fork gets a read-only token, so this job could post
+    # neither the status nor the comment.
+    if: ${{ github.event_name == 'merge_group' || github.event.pull_request.head.repo.full_name == github.repository }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      statuses: write      # the "PR title" commit status
+      pull-requests: write # write, update and delete the explanation comment
+    steps:
+      - uses: actions/checkout@v5
+      - name: Validate the pull request title
+        working-directory: ./ci/validate-pr-title
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: node check.js
