@@ -34,7 +34,7 @@ use std::collections::{HashMap, VecDeque};
 #[cfg(feature = "sync-sender-qwp-ws")]
 use std::io::Write;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 #[cfg(feature = "sync-sender-qwp-ws")]
@@ -177,6 +177,10 @@ pub(crate) struct QwpWsSendCore<T> {
     /// on reconnect. Inert (disabled) unless the store enables delta mode via
     /// [`Self::enable_delta_dict`]; disabled keeps every frame self-sufficient.
     dict_mirror: SentDictMirror,
+    /// Shared with the public sender. Relay mode forwards independently encoded
+    /// base-0 dictionaries, so connection-dictionary mirroring and catch-up must
+    /// stay inert or a later frame redefining id 0 would look like torn history.
+    relay_mode: Arc<AtomicBool>,
     /// Set on a successful reconnect when delta mode is active: the next send
     /// iteration emits the full-dictionary catch-up frame(s) before replaying the
     /// queued delta frames, so the fresh server can resolve them. Cleared once
@@ -850,6 +854,7 @@ impl<T: QwpWsCoreTransport> QwpWsSendCore<T> {
             transport,
             send_cursor: SendCursor::new(),
             dict_mirror: SentDictMirror::new(false),
+            relay_mode: Arc::new(AtomicBool::new(false)),
             catch_up_pending: false,
             catch_up_retry_strikes: 0,
             durable_ack: durable_ack.then(DurableAckTracker::new),
@@ -1288,10 +1293,11 @@ impl<T: QwpWsCoreTransport> QwpWsSendCore<T> {
         // transport. `accumulate` is a no-op in full-dict mode.
         let transport = &mut self.transport;
         let dict_mirror = &mut self.dict_mirror;
+        let relay_mode = self.relay_mode.load(Ordering::Acquire);
         let result = outbound.with_view(|view| {
             let payload = view.payload;
             let sent = transport.send_frame(view);
-            if sent.is_ok() {
+            if sent.is_ok() && !relay_mode {
                 // The frame's delta is on the wire; mirror the symbols it
                 // introduced so a later reconnect can re-register them.
                 //
@@ -1319,6 +1325,9 @@ impl<T: QwpWsCoreTransport> QwpWsSendCore<T> {
     /// loudly rather than send the server a frame it cannot decode. `Ok(())` for
     /// non-dict frames and self-sufficient (base-0) frames.
     pub(crate) fn guard_dict_not_torn(&self, payload: &[u8]) -> Result<(), Error> {
+        if self.relay_mode.load(Ordering::Acquire) {
+            return Ok(());
+        }
         let Some(delta_start) = frame_delta_start(payload) else {
             return Ok(()); // not a delta-dict frame -> nothing to re-register
         };
@@ -1426,6 +1435,10 @@ impl<T: QwpWsCoreTransport> QwpWsSendCore<T> {
         self.catch_up_pending = !self.dict_mirror.is_empty();
     }
 
+    pub(crate) fn set_relay_mode_flag(&mut self, relay_mode: Arc<AtomicBool>) {
+        self.relay_mode = relay_mode;
+    }
+
     /// Sends the full-dictionary catch-up frame(s) on the freshly reconnected
     /// transport — split so none exceeds the server's batch cap — and returns how
     /// many were sent (they consume wire seqs `[0, n)`). The caller then calls
@@ -1468,6 +1481,10 @@ impl<T: QwpWsCoreTransport> QwpWsSendCore<T> {
     /// transport drop or retryable local build failure means reconnect again;
     /// only data that exceeds the protocol's own payload limit is terminal.
     pub(crate) fn drive_catch_up(&mut self) -> Result<(), CatchUpDriveError> {
+        if self.relay_mode.load(Ordering::Acquire) {
+            self.catch_up_pending = false;
+            return Ok(());
+        }
         if !self.catch_up_pending {
             return Ok(());
         }

@@ -41,6 +41,10 @@ use crate::error::{self, Result};
 use crate::ingress::AckLevel;
 #[cfg(feature = "_sync-sender")]
 use crate::ingress::SenderBuilder;
+#[cfg(feature = "sync-sender-qwp-ws")]
+use crate::ingress::is_self_contained;
+#[cfg(feature = "sync-sender-qwp-ws")]
+use crate::ingress::sender::qwp_ws_publisher::qwp_ws_encoded_message_size_error;
 use crate::ingress::{Buffer, Protocol, ProtocolVersion};
 use std::fmt::{Debug, Formatter};
 #[cfg(feature = "sync-sender-qwp-ws")]
@@ -162,6 +166,13 @@ pub(crate) enum SyncProtocolHandler {
     SyncHttp(SyncHttpHandlerState),
 }
 
+#[cfg(feature = "sync-sender-qwp-ws")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum QwpWsIngressMode {
+    Rows,
+    Relay,
+}
+
 /// Connects to a QuestDB instance and inserts data via the configured
 /// ingestion protocol.
 ///
@@ -181,6 +192,8 @@ pub struct Sender {
     qwp_ws_error_handler: QwpWsErrorHandler,
     #[cfg(feature = "_sender-qwp-ws")]
     conn_events: Option<std::sync::Arc<crate::ingress::conn_events::ConnectionEventSource>>,
+    #[cfg(feature = "sync-sender-qwp-ws")]
+    qwp_ws_ingress_mode: Option<QwpWsIngressMode>,
 }
 
 impl Debug for Sender {
@@ -237,6 +250,8 @@ impl Sender {
             qwp_ws_error_handler,
             #[cfg(feature = "_sender-qwp-ws")]
             conn_events,
+            #[cfg(feature = "sync-sender-qwp-ws")]
+            qwp_ws_ingress_mode: None,
         }
     }
 
@@ -323,6 +338,63 @@ impl Sender {
     }
 
     #[cfg(feature = "sync-sender-qwp-ws")]
+    fn claim_qwp_ws_ingress_mode(&mut self, requested: QwpWsIngressMode) -> Result<bool> {
+        match (self.qwp_ws_ingress_mode, requested) {
+            (None, QwpWsIngressMode::Relay) => {
+                match &self.handler {
+                    SyncProtocolHandler::SyncQwpWs(state) => {
+                        state.relay_mode.store(true, Ordering::Release)
+                    }
+                    SyncProtocolHandler::ManualQwpWs(state) => {
+                        state.relay_mode.store(true, Ordering::Release)
+                    }
+                    _ => {
+                        return Err(error::fmt!(
+                            InvalidApiCall,
+                            "flush_encoded is only supported for QWP/WebSocket senders."
+                        ));
+                    }
+                }
+                self.qwp_ws_ingress_mode = Some(requested);
+                Ok(true)
+            }
+            (None, QwpWsIngressMode::Rows) => {
+                self.qwp_ws_ingress_mode = Some(requested);
+                Ok(true)
+            }
+            (Some(QwpWsIngressMode::Rows), QwpWsIngressMode::Rows)
+            | (Some(QwpWsIngressMode::Relay), QwpWsIngressMode::Relay) => Ok(false),
+            (Some(QwpWsIngressMode::Relay), QwpWsIngressMode::Rows) => Err(error::fmt!(
+                InvalidApiCall,
+                "A QWP/WebSocket relay sender cannot also flush typed row buffers; use a separate sender connection."
+            )),
+            (Some(QwpWsIngressMode::Rows), QwpWsIngressMode::Relay) => Err(error::fmt!(
+                InvalidApiCall,
+                "A QWP/WebSocket row sender cannot also relay independently encoded frames; use a separate sender connection."
+            )),
+        }
+    }
+
+    #[cfg(feature = "sync-sender-qwp-ws")]
+    fn rollback_qwp_ws_ingress_mode(&mut self, mode: QwpWsIngressMode, newly_claimed: bool) {
+        if !newly_claimed {
+            return;
+        }
+        if mode == QwpWsIngressMode::Relay {
+            match &self.handler {
+                SyncProtocolHandler::SyncQwpWs(state) => {
+                    state.relay_mode.store(false, Ordering::Release)
+                }
+                SyncProtocolHandler::ManualQwpWs(state) => {
+                    state.relay_mode.store(false, Ordering::Release)
+                }
+                _ => unreachable!("QWP/WebSocket handler was checked before claiming mode"),
+            }
+        }
+        self.qwp_ws_ingress_mode = None;
+    }
+
+    #[cfg(feature = "sync-sender-qwp-ws")]
     fn flush_qwp_ws_buffer(&mut self, buf: &Buffer, transactional: bool) -> Result<Option<u64>> {
         if !matches!(
             &self.handler,
@@ -366,6 +438,7 @@ impl Sender {
                 "Transactional flushes are not supported for QWP/WebSocket."
             ));
         }
+        let newly_claimed = self.claim_qwp_ws_ingress_mode(QwpWsIngressMode::Rows)?;
 
         let result = match &mut self.handler {
             SyncProtocolHandler::SyncQwpWs(state) => {
@@ -380,11 +453,11 @@ impl Sender {
             }
             _ => unreachable!("QWP/WebSocket handler was checked above"),
         };
-        if result
-            .as_ref()
-            .is_err_and(|err| matches!(err.code(), crate::ErrorCode::SocketError))
-        {
-            self.connected = false;
+        if let Err(err) = &result {
+            self.rollback_qwp_ws_ingress_mode(QwpWsIngressMode::Rows, newly_claimed);
+            if matches!(err.code(), crate::ErrorCode::SocketError) {
+                self.connected = false;
+            }
         }
         result
     }
@@ -601,6 +674,102 @@ impl Sender {
         self.flush_impl(buf, false)?;
         buf.clear();
         Ok(())
+    }
+
+    /// Publish a pre-encoded self-contained QWP/WebSocket frame verbatim.
+    ///
+    /// The frame must have been produced by [`Buffer::encode_self_contained`]
+    /// (or satisfy the same QWP v1 header contract). Only the fixed header and
+    /// dictionary base are inspected; tenant table and column data remain opaque.
+    /// Validation happens before publication or socket I/O.
+    ///
+    /// This has the same local-publication semantics as [`Sender::flush`]. Call
+    /// [`Sender::wait`] with [`AckLevel::Ok`] to wait for server acceptance.
+    /// Relay is supported only by the default in-memory Store-and-Forward queue.
+    /// A persistent/file-backed slot can outlive this sender's transient mode and
+    /// is rejected before publication or I/O. A sender connection is either a
+    /// typed-row sender or a relay sender: mixing the two dictionary regimes is
+    /// rejected because it can resolve symbol ids against the wrong connection
+    /// dictionary.
+    #[cfg(feature = "sync-sender-qwp-ws")]
+    pub fn flush_encoded(&mut self, frame: &[u8]) -> Result<()> {
+        if !is_self_contained(frame) {
+            return Err(error::fmt!(
+                InvalidApiCall,
+                "flush_encoded requires a self-contained QWP/WebSocket frame produced by Buffer::encode_self_contained()."
+            ));
+        }
+        if !matches!(
+            &self.handler,
+            SyncProtocolHandler::SyncQwpWs(_) | SyncProtocolHandler::ManualQwpWs(_)
+        ) {
+            return Err(error::fmt!(
+                InvalidApiCall,
+                "flush_encoded is only supported for QWP/WebSocket senders."
+            ));
+        }
+        let persistent_store_and_forward = match &self.handler {
+            SyncProtocolHandler::SyncQwpWs(state) => state.persistent_store_and_forward,
+            SyncProtocolHandler::ManualQwpWs(state) => state.persistent_store_and_forward,
+            _ => unreachable!("QWP/WebSocket handler was checked above"),
+        };
+        if persistent_store_and_forward {
+            return Err(error::fmt!(
+                InvalidApiCall,
+                "flush_encoded does not support persistent/file-backed Store-and-Forward; use the default in-memory queue for self-contained relay frames."
+            ));
+        }
+
+        // Drain before returning the check error too: a relay-only caller never
+        // reaches `wait`/`drive_once`/`close_drain`, so this is the sole point
+        // at which its error handler can be notified.
+        match &self.handler {
+            SyncProtocolHandler::SyncQwpWs(state) => {
+                if let Err(err) = qwp_ws_check_error_background(state) {
+                    let _ = self.drain_qwp_ws_error_notifications();
+                    return Err(err);
+                }
+            }
+            SyncProtocolHandler::ManualQwpWs(state) => {
+                if let Err(err) = qwp_ws_check_error_manual(state) {
+                    let _ = self.drain_qwp_ws_error_notifications();
+                    return Err(err);
+                }
+            }
+            _ => unreachable!("QWP/WebSocket handler was checked above"),
+        }
+        self.drain_qwp_ws_error_notifications()?;
+
+        let max = match &self.handler {
+            SyncProtocolHandler::SyncQwpWs(state) => {
+                effective_qwp_ws_max_buf_size(self.max_buf_size, &state.server_max_batch_size)
+            }
+            SyncProtocolHandler::ManualQwpWs(state) => {
+                effective_qwp_ws_max_buf_size(self.max_buf_size, &state.server_max_batch_size)
+            }
+            _ => unreachable!("QWP/WebSocket handler was checked above"),
+        };
+        if frame.len() > max {
+            return Err(qwp_ws_encoded_message_size_error(frame.len(), max));
+        }
+
+        let newly_claimed = self.claim_qwp_ws_ingress_mode(QwpWsIngressMode::Relay)?;
+        let result = match &mut self.handler {
+            SyncProtocolHandler::SyncQwpWs(state) => {
+                publish_qwp_ws_payload_background(state, frame, max)
+            }
+            SyncProtocolHandler::ManualQwpWs(state) => {
+                publish_qwp_ws_payload_manual(state, frame, max)
+            }
+            _ => unreachable!("QWP/WebSocket handler was checked above"),
+        };
+        if let Err(err) = &result {
+            self.rollback_qwp_ws_ingress_mode(QwpWsIngressMode::Relay, newly_claimed);
+            if matches!(err.code(), crate::ErrorCode::SocketError) {
+                self.connected = false;
+            }
+        }
+        result.map(|_| ())
     }
 
     /// Publish the QWP/WebSocket buffer and return the highest published frame
