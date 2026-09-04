@@ -161,6 +161,73 @@ fn cancellable_lock_wait_abandons_filesystem_contention() {
     let _ = std::fs::remove_file(lock);
 }
 
+#[test]
+fn directory_lock_heartbeat_spawn_failure_aborts_action() {
+    let dir = TempDir::new().unwrap();
+    let store = FileTokenStore::at(dir.path()).with_heartbeat_spawn_failure();
+    let ran = AtomicBool::new(false);
+
+    let error = store
+        .with_directory_lock(&never_cancelled, |_, _| {
+            ran.store(true, Ordering::Release);
+            Ok(())
+        })
+        .unwrap_err();
+
+    assert!(!ran.load(Ordering::Acquire));
+    assert!(error.downcast_ref::<std::io::Error>().is_some());
+}
+
+#[test]
+fn directory_lock_heartbeat_reports_runtime_renewal_failure() {
+    let dir = TempDir::new().unwrap();
+    let store = FileTokenStore::at(dir.path());
+    let lock = store.directory_lock_file();
+
+    let error = store
+        .with_directory_lock(&never_cancelled, |_, _| {
+            std::fs::remove_file(&lock)?;
+            std::thread::sleep(DIRECTORY_LOCK_HEARTBEAT + Duration::from_millis(250));
+            Ok(())
+        })
+        .unwrap_err();
+
+    assert_eq!(
+        error
+            .downcast_ref::<std::io::Error>()
+            .map(std::io::Error::kind),
+        Some(std::io::ErrorKind::PermissionDenied)
+    );
+}
+
+#[test]
+fn directory_lock_fence_prevents_mutation_after_ownership_loss() {
+    let dir = TempDir::new().unwrap();
+    let store = FileTokenStore::at(dir.path());
+    let lock = store.directory_lock_file();
+    let marker = dir.path().join("must-not-be-written");
+    let successor = "successor-owner-stamp";
+
+    let error = store
+        .with_directory_lock(&never_cancelled, |_, heartbeat| {
+            std::fs::remove_file(&lock)?;
+            std::fs::write(&lock, successor)?;
+            heartbeat.check_owned()?;
+            std::fs::write(&marker, b"unfenced mutation")?;
+            Ok(())
+        })
+        .unwrap_err();
+
+    assert_eq!(
+        error
+            .downcast_ref::<std::io::Error>()
+            .map(std::io::Error::kind),
+        Some(std::io::ErrorKind::PermissionDenied)
+    );
+    assert!(!marker.exists());
+    assert_eq!(std::fs::read_to_string(lock).unwrap(), successor);
+}
+
 // -- cross-language contract (frozen) ---------------------------------------
 
 #[test]

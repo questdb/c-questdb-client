@@ -91,6 +91,7 @@ const MAX_LOCK_FILE_BYTES: u64 = 1 << 12;
 
 const DIRECTORY_LOCK_FILE_NAME: &str = ".store.lock";
 const UNTRUSTED_SENTINEL_NAME: &str = ".untrusted";
+const DIRECTORY_LOCK_HEARTBEAT_THREAD: &str = "questdb-oidc-store-lock-heartbeat";
 const DIRECTORY_LOCK_HEARTBEAT: Duration = Duration::from_millis(500);
 const DIRECTORY_LOCK_STALE: Duration = Duration::from_secs(2);
 const DIRECTORY_LOCK_EMPTY_GRACE: Duration = Duration::from_secs(2);
@@ -611,6 +612,8 @@ pub struct FileTokenStore {
     directory: PathBuf,
     lock_acquire_budget: Duration,
     lock_stale: Duration,
+    #[cfg(test)]
+    fail_heartbeat_spawn: bool,
 }
 
 impl FileTokenStore {
@@ -620,7 +623,29 @@ impl FileTokenStore {
             directory: directory.into(),
             lock_acquire_budget: DEFAULT_LOCK_ACQUIRE_BUDGET,
             lock_stale: DEFAULT_LOCK_STALE,
+            #[cfg(test)]
+            fail_heartbeat_spawn: false,
         }
+    }
+
+    #[cfg(test)]
+    fn with_heartbeat_spawn_failure(mut self) -> Self {
+        self.fail_heartbeat_spawn = true;
+        self
+    }
+
+    fn start_directory_lock_heartbeat(
+        &self,
+        lock: PathBuf,
+        stamp: String,
+    ) -> std::io::Result<DirectoryLockHeartbeat> {
+        #[cfg(test)]
+        if self.fail_heartbeat_spawn {
+            return Err(std::io::Error::other(
+                "injected OIDC directory-lock heartbeat spawn failure",
+            ));
+        }
+        DirectoryLockHeartbeat::start(lock, stamp)
     }
 
     /// A store at the directory named by the
@@ -912,7 +937,7 @@ impl FileTokenStore {
     fn with_directory_lock<T>(
         &self,
         cancelled: &dyn Fn() -> bool,
-        action: impl FnOnce(bool) -> TokenStoreResult<T>,
+        action: impl FnOnce(bool, &DirectoryLockHeartbeat) -> TokenStoreResult<T>,
     ) -> TokenStoreResult<T> {
         if cancelled() {
             return Err(cancelled_error());
@@ -936,12 +961,12 @@ impl FileTokenStore {
         };
         let held = self.acquire_lock(&lock, stale_after, empty_grace, cancelled)?;
         let scope = HeldLockScope::enter(lock.clone());
+        let heartbeat = self.start_directory_lock_heartbeat(lock.clone(), held.stamp.clone())?;
+        heartbeat.check_owned()?;
 
-        let trusted = prepare_directory_trust(&self.directory, &self.untrusted_sentinel())?;
+        let trusted =
+            prepare_directory_trust(&self.directory, &self.untrusted_sentinel(), &heartbeat)?;
         if !lock_is_owned(&lock, &held.stamp) {
-            if !trusted {
-                let _ = mark_untrusted(&self.untrusted_sentinel());
-            }
             drop(scope);
             drop(held);
             return Err(Box::new(std::io::Error::new(
@@ -950,23 +975,31 @@ impl FileTokenStore {
             )));
         }
 
-        let heartbeat = DirectoryLockHeartbeat::start(lock, held.stamp.clone());
+        heartbeat.check_owned()?;
         if !trusted {
-            discard_untrusted_directory_contents(&self.directory, &self.untrusted_sentinel());
+            discard_untrusted_directory_contents(
+                &self.directory,
+                &self.untrusted_sentinel(),
+                &heartbeat,
+            )?;
         }
         let result = if cancelled() {
             Err(cancelled_error())
         } else {
-            action(trusted)
+            action(trusted, &heartbeat)
         };
-        drop(heartbeat);
+        let heartbeat_result = heartbeat.finish();
         drop(scope);
         drop(held);
-        result
+        match (result, heartbeat_result) {
+            (Ok(value), Ok(())) => Ok(value),
+            (Ok(_), Err(error)) => Err(Box::new(error)),
+            (Err(error), _) => Err(error),
+        }
     }
 
     fn prepare_directory(&self, cancelled: &dyn Fn() -> bool) -> TokenStoreResult<()> {
-        self.with_directory_lock(cancelled, |_| Ok(()))
+        self.with_directory_lock(cancelled, |_, _| Ok(()))
     }
 
     /// Run under this identity's process and filesystem locks. Both are
@@ -1010,11 +1043,16 @@ impl FileTokenStore {
     /// Remove only crash-orphaned temps old enough to be unambiguously stale.
     /// The caller holds the directory lock, so a cooperating save cannot still
     /// be writing any candidate. Never touch `.lock.*.tmp` steal captures.
-    fn sweep_orphan_temps(&self, key: &TokenStoreKey, stale_only: bool) -> bool {
+    fn sweep_orphan_temps(
+        &self,
+        key: &TokenStoreKey,
+        stale_only: bool,
+        heartbeat: &DirectoryLockHeartbeat,
+    ) -> TokenStoreResult<bool> {
         debug_assert!(current_thread_holds(&self.directory_lock_file()));
         let hash = key.hash();
         let Ok(entries) = fs::read_dir(&self.directory) else {
-            return false;
+            return Ok(false);
         };
         let mut removed = false;
         for entry in entries.flatten() {
@@ -1025,14 +1063,21 @@ impl FileTokenStore {
                 && !name.contains(".lock.")
                 && (!stale_only || self.is_stale(&entry.path()))
             {
+                heartbeat.check_owned()?;
                 removed |= fs::remove_file(entry.path()).is_ok();
             }
         }
-        removed
+        Ok(removed)
     }
 
-    fn save_under_lock(&self, key: &TokenStoreKey, content: &[u8]) -> TokenStoreResult<()> {
+    fn save_under_lock(
+        &self,
+        key: &TokenStoreKey,
+        content: &[u8],
+        heartbeat: &DirectoryLockHeartbeat,
+    ) -> TokenStoreResult<()> {
         debug_assert!(current_thread_holds(&self.directory_lock_file()));
+        heartbeat.check_owned()?;
         let target = self.token_file(key);
         let tmp = temp_path(&self.directory, &key.hash());
         // create_new + 0600 (POSIX): no world-readable window before the rename.
@@ -1048,6 +1093,7 @@ impl FileTokenStore {
             f.write_all(content)?;
             f.flush()?;
             f.sync_all()?; // force to disk before the rename
+            heartbeat.check_owned()?;
             fs::rename(&tmp, &target)?; // atomic on POSIX and Windows
             Ok(())
         })();
@@ -1058,7 +1104,7 @@ impl FileTokenStore {
         // A successful save is a recovery point for plaintext temps left by a
         // crashed predecessor. Fresh temps are retained until their age proves
         // they are not from a live cross-language writer.
-        self.sweep_orphan_temps(key, true);
+        self.sweep_orphan_temps(key, true, heartbeat)?;
         // Fatal, exactly as in `clear_under_lock`, and for the same reason.
         // The rename above publishes a ROTATED refresh token, and
         // `persist_if_changed` then writes nothing further until it rotates
@@ -1066,19 +1112,26 @@ impl FileTokenStore {
         // consumed parent as what the next start reads, which is the reuse the
         // whole rotation protocol exists to avoid. Making the directory entry
         // durable is part of having saved it, not a nicety.
+        heartbeat.check_owned()?;
         fsync_directory(&self.directory)?;
         Ok(())
     }
 
-    fn clear_under_lock(&self, key: &TokenStoreKey) -> TokenStoreResult<()> {
+    fn clear_under_lock(
+        &self,
+        key: &TokenStoreKey,
+        heartbeat: &DirectoryLockHeartbeat,
+    ) -> TokenStoreResult<()> {
         debug_assert!(current_thread_holds(&self.directory_lock_file()));
+        heartbeat.check_owned()?;
         let removed = match fs::remove_file(self.token_file(key)) {
             Ok(()) => true,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
             Err(e) => return Err(Box::new(e)),
         };
-        let removed_orphans = self.sweep_orphan_temps(key, false);
+        let removed_orphans = self.sweep_orphan_temps(key, false, heartbeat)?;
         if removed || removed_orphans {
+            heartbeat.check_owned()?;
             fsync_directory(&self.directory)?; // make the refresh-parent tombstone durable
         }
         Ok(())
@@ -1095,7 +1148,7 @@ impl TokenStore for FileTokenStore {
         key: &TokenStoreKey,
         cancelled: &dyn Fn() -> bool,
     ) -> TokenStoreResult<Option<PersistedToken>> {
-        self.with_directory_lock(cancelled, |trusted| {
+        self.with_directory_lock(cancelled, |trusted, _| {
             if !trusted {
                 return Ok(None);
             }
@@ -1137,7 +1190,7 @@ impl TokenStore for FileTokenStore {
                 ),
             )));
         }
-        self.with_directory_lock(cancelled, |trusted| {
+        self.with_directory_lock(cancelled, |trusted, heartbeat| {
             // `trusted` is the verdict on what the directory *contained* on
             // entry, which is what `load` must respect. For writing, the
             // question is whether the directory is safe *now*: by this point
@@ -1178,8 +1231,8 @@ impl TokenStore for FileTokenStore {
                 ))
                     as Box<dyn std::error::Error + Send + Sync>);
             }
-            self.sweep_orphan_temps(key, true);
-            self.save_under_lock(key, &content)
+            self.sweep_orphan_temps(key, true, heartbeat)?;
+            self.save_under_lock(key, &content, heartbeat)
         })
     }
 
@@ -1209,7 +1262,9 @@ impl TokenStore for FileTokenStore {
             return Ok(());
         }
         self.with_lock(key, cancelled, || {
-            self.with_directory_lock(cancelled, |_| self.clear_under_lock(key))
+            self.with_directory_lock(cancelled, |_, heartbeat| {
+                self.clear_under_lock(key, heartbeat)
+            })
         })
     }
 
@@ -1933,7 +1988,11 @@ fn mark_untrusted(sentinel: &Path) -> std::io::Result<()> {
 }
 
 #[cfg(unix)]
-fn prepare_directory_trust(dir: &Path, sentinel: &Path) -> std::io::Result<bool> {
+fn prepare_directory_trust(
+    dir: &Path,
+    sentinel: &Path,
+    heartbeat: &DirectoryLockHeartbeat,
+) -> std::io::Result<bool> {
     use std::os::unix::fs::PermissionsExt;
     let meta = fs::symlink_metadata(dir)?;
     let mode = meta.permissions().mode();
@@ -1941,16 +2000,23 @@ fn prepare_directory_trust(dir: &Path, sentinel: &Path) -> std::io::Result<bool>
     if was_other_writable {
         // Best effort, matching Java: this caller retains the untrusted verdict
         // even if publishing it for a concurrent caller fails.
+        heartbeat.check_owned()?;
         let _ = mark_untrusted(sentinel);
     }
     if mode & 0o077 != 0 {
+        heartbeat.check_owned()?;
         fs::set_permissions(dir, fs::Permissions::from_mode(0o700))?;
     }
     Ok(!was_other_writable && path_is_definitely_absent(sentinel))
 }
 
 #[cfg(not(unix))]
-fn prepare_directory_trust(_dir: &Path, sentinel: &Path) -> std::io::Result<bool> {
+fn prepare_directory_trust(
+    _dir: &Path,
+    sentinel: &Path,
+    heartbeat: &DirectoryLockHeartbeat,
+) -> std::io::Result<bool> {
+    heartbeat.check_owned()?;
     warn_no_posix_perms_once();
     Ok(path_is_definitely_absent(sentinel))
 }
@@ -1967,7 +2033,11 @@ fn has_store_hash_prefix(name: &str) -> bool {
 /// Sweep only names this token store could have written. A captured lock name
 /// contains `.lock.` and must survive because another client may be deciding
 /// whether to restore it.
-fn discard_untrusted_directory_contents(dir: &Path, sentinel: &Path) {
+fn discard_untrusted_directory_contents(
+    dir: &Path,
+    sentinel: &Path,
+    heartbeat: &DirectoryLockHeartbeat,
+) -> TokenStoreResult<()> {
     let mut swept_clean = true;
     match fs::read_dir(dir) {
         Ok(entries) => {
@@ -1983,58 +2053,133 @@ fn discard_untrusted_directory_contents(dir: &Path, sentinel: &Path) {
                 }
                 let is_entry = name.len() == 69 && name.ends_with(".json");
                 let is_write_temp = name.ends_with(".tmp") && !name.contains(".lock.");
-                if (is_entry || is_write_temp) && fs::remove_file(entry.path()).is_err() {
-                    swept_clean = false;
+                if is_entry || is_write_temp {
+                    heartbeat.check_owned()?;
+                    if fs::remove_file(entry.path()).is_err() {
+                        swept_clean = false;
+                    }
                 }
             }
         }
         Err(_) => swept_clean = false,
     }
-    if swept_clean && fs::remove_file(sentinel).is_err() && !path_is_definitely_absent(sentinel) {
-        // Preserve the marker if it cannot be lifted. A later load must remain
-        // fail-closed and retry the sweep rather than trust partial recovery.
-        let _ = mark_untrusted(sentinel);
+    if swept_clean {
+        heartbeat.check_owned()?;
+        if fs::remove_file(sentinel).is_err() && !path_is_definitely_absent(sentinel) {
+            // Preserve the marker if it cannot be lifted. A later load must remain
+            // fail-closed and retry the sweep rather than trust partial recovery.
+            heartbeat.check_owned()?;
+            let _ = mark_untrusted(sentinel);
+        }
     }
+    Ok(())
 }
 
 struct DirectoryLockHeartbeat {
     closed: Arc<AtomicBool>,
+    failed: Arc<AtomicBool>,
+    lock: PathBuf,
+    stamp: String,
     thread: Option<std::thread::JoinHandle<()>>,
 }
 
 impl DirectoryLockHeartbeat {
-    fn start(lock: PathBuf, stamp: String) -> Self {
+    fn start(lock: PathBuf, stamp: String) -> std::io::Result<Self> {
         let closed = Arc::new(AtomicBool::new(false));
+        let failed = Arc::new(AtomicBool::new(false));
         let thread_closed = Arc::clone(&closed);
+        let thread_failed = Arc::clone(&failed);
+        let thread_lock = lock.clone();
+        let thread_stamp = stamp.clone();
         let thread = std::thread::Builder::new()
-            .name("questdb-oidc-store-lock-heartbeat".into())
+            .name(DIRECTORY_LOCK_HEARTBEAT_THREAD.into())
             .spawn(move || {
                 while !thread_closed.load(Ordering::Acquire) {
                     std::thread::park_timeout(DIRECTORY_LOCK_HEARTBEAT);
-                    if thread_closed.load(Ordering::Acquire) || !lock_is_owned(&lock, &stamp) {
+                    if thread_closed.load(Ordering::Acquire) {
                         return;
                     }
-                    let Ok(file) = OpenOptions::new().write(true).open(&lock) else {
-                        return;
-                    };
-                    if file.set_modified(SystemTime::now()).is_err() {
+                    if renew_directory_lock(&thread_lock, &thread_stamp).is_err() {
+                        thread_failed.store(true, Ordering::Release);
                         return;
                     }
                 }
-            })
-            .ok();
-        Self { closed, thread }
+            })?;
+        Ok(Self {
+            closed,
+            failed,
+            lock,
+            stamp,
+            thread: Some(thread),
+        })
+    }
+
+    fn check_owned(&self) -> std::io::Result<()> {
+        if self.failed.load(Ordering::Acquire) || !lock_is_owned(&self.lock, &self.stamp) {
+            self.failed.store(true, Ordering::Release);
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                format!(
+                    "lost ownership of the OIDC token-store directory lock {:?}",
+                    self.lock
+                ),
+            ));
+        }
+        Ok(())
+    }
+
+    fn stop_thread(&mut self) {
+        self.closed.store(true, Ordering::Release);
+        if let Some(thread) = self.thread.take() {
+            thread.thread().unpark();
+            if thread.join().is_err() {
+                self.failed.store(true, Ordering::Release);
+            }
+        }
+    }
+
+    fn finish(mut self) -> std::io::Result<()> {
+        self.stop_thread();
+        self.check_owned()
     }
 }
 
 impl Drop for DirectoryLockHeartbeat {
     fn drop(&mut self) {
-        self.closed.store(true, Ordering::Release);
-        if let Some(thread) = self.thread.take() {
-            thread.thread().unpark();
-            let _ = thread.join();
-        }
+        self.stop_thread();
     }
+}
+
+/// Renew the exact lock file opened by the heartbeat. Validating through the
+/// handle before touching its mtime avoids extending a successor's lease if a
+/// stale-lock takeover renames our lock between path checks.
+fn renew_directory_lock(lock: &Path, stamp: &str) -> std::io::Result<()> {
+    let mut opts = OpenOptions::new();
+    opts.read(true).write(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.custom_flags(libc::O_NONBLOCK);
+    }
+    let file = opts.open(lock)?;
+    let meta = file.metadata()?;
+    if !meta.is_file() || meta.len() == 0 || meta.len() > MAX_LOCK_FILE_BYTES {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "OIDC token-store directory lock owner stamp is invalid",
+        ));
+    }
+    let mut bytes = Vec::with_capacity(meta.len() as usize);
+    (&file)
+        .take(MAX_LOCK_FILE_BYTES + 1)
+        .read_to_end(&mut bytes)?;
+    if bytes != stamp.as_bytes() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "OIDC token-store directory lock ownership changed",
+        ));
+    }
+    file.set_modified(SystemTime::now())
 }
 
 #[cfg(unix)]
