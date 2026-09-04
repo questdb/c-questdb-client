@@ -1776,6 +1776,52 @@ mod tests {
         unsafe { drop(Box::from_raw(user_data as *mut Arc<ReentrantCallState>)) };
     }
 
+    /// What a renderer callback saw when it asked for the cached token.
+    #[derive(Default)]
+    struct CallbackTokenState {
+        auth: AtomicPtr<questdb_oidc_auth>,
+        /// Token bytes returned to the callback, per SUCCESS event.
+        served: Mutex<Vec<String>>,
+        /// The callback asked and was refused.
+        refused: AtomicUsize,
+    }
+
+    unsafe extern "C" fn take_token_on_success(
+        user_data: *mut c_void,
+        event: *const questdb_oidc_event,
+    ) {
+        let state = unsafe { &*(user_data as *const Arc<CallbackTokenState>) };
+        if unsafe { (*event).kind } != questdb_oidc_event_kind::QUESTDB_OIDC_EVENT_SUCCESS {
+            return;
+        }
+        let auth = state.auth.load(Ordering::SeqCst);
+        if auth.is_null() {
+            return;
+        }
+        let mut error = ptr::null_mut();
+        let token = unsafe { questdb_oidc_auth_token(auth, &mut error) };
+        if token.is_null() {
+            state.refused.fetch_add(1, Ordering::SeqCst);
+            if !error.is_null() {
+                unsafe { crate::questdb_error_free(error) };
+            }
+            return;
+        }
+        let data = unsafe { questdb_oidc_token_data(token) };
+        let len = unsafe { questdb_oidc_token_len(token) };
+        let bytes = unsafe { slice::from_raw_parts(data as *const u8, len) };
+        state
+            .served
+            .lock()
+            .unwrap()
+            .push(String::from_utf8_lossy(bytes).into_owned());
+        unsafe { questdb_oidc_token_free(token) };
+    }
+
+    unsafe extern "C" fn release_callback_token_state(user_data: *mut c_void) {
+        unsafe { drop(Box::from_raw(user_data as *mut Arc<CallbackTokenState>)) };
+    }
+
     fn write_json_response(mut stream: TcpStream, body: &str) {
         stream
             .set_read_timeout(Some(Duration::from_secs(5)))
@@ -2270,6 +2316,84 @@ mod tests {
             questdb_oidc_auth_free(auth);
             questdb_oidc_builder_free(builder);
         }
+    }
+
+    #[test]
+    fn a_callback_is_served_the_cached_token() {
+        // Regression: `SharedOidcAuth::token` checked the callback-active flag
+        // BEFORE the cache, so a renderer reacting to SUCCESS -- which fires
+        // after the token is committed -- was refused a token sitting in the
+        // cache, as was any sender, reader or pool it flushed from there. Only
+        // an acquisition, which would block, may be refused.
+        //
+        // The existing re-entrancy tests cannot catch this: their provider has
+        // an empty cache, so they only ever exercise the `Err` fallback.
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (device, _) = listener.accept().unwrap();
+            write_json_response(
+                device,
+                r#"{"device_code":"DEV-CODE","user_code":"ABCD-1234","verification_uri":"https://idp.example.com/activate","expires_in":600,"interval":5}"#,
+            );
+            let (token, _) = listener.accept().unwrap();
+            write_json_response(
+                token,
+                r#"{"access_token":"cached-access-token","token_type":"Bearer","expires_in":300}"#,
+            );
+        });
+
+        unsafe {
+            let builder = questdb_oidc_builder_new();
+            set_string(questdb_oidc_builder_client_id, builder, "questdb-c");
+            set_string(questdb_oidc_builder_scope, builder, "openid");
+            set_string(
+                questdb_oidc_builder_device_authorization_endpoint,
+                builder,
+                &format!("http://{address}/device"),
+            );
+            set_string(
+                questdb_oidc_builder_token_endpoint,
+                builder,
+                &format!("http://{address}/token"),
+            );
+            let mut error = ptr::null_mut();
+            assert!(questdb_oidc_builder_interactive(builder, true, &mut error));
+            assert!(questdb_oidc_builder_open_browser(
+                builder, false, &mut error
+            ));
+            let state = Arc::new(CallbackTokenState::default());
+            let user_data = Box::into_raw(Box::new(Arc::clone(&state))) as *mut c_void;
+            assert!(questdb_oidc_builder_event_handler(
+                builder,
+                Some(take_token_on_success),
+                user_data,
+                Some(release_callback_token_state),
+                &mut error,
+            ));
+            let auth = questdb_oidc_builder_build(builder, &mut error);
+            assert!(!auth.is_null());
+            // The callback can only reach the auth once it exists.
+            state.auth.store(auth, Ordering::SeqCst);
+
+            assert!(questdb_oidc_auth_sign_in(auth, &mut error));
+
+            assert_eq!(
+                state.refused.load(Ordering::SeqCst),
+                0,
+                "the SUCCESS callback was refused a token already in the cache"
+            );
+            let served = state.served.lock().unwrap().clone();
+            assert_eq!(
+                served,
+                vec!["cached-access-token".to_string()],
+                "the callback did not receive the committed token"
+            );
+
+            questdb_oidc_auth_free(auth);
+            questdb_oidc_builder_free(builder);
+        }
+        server.join().unwrap();
     }
 
     #[test]
