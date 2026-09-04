@@ -117,7 +117,14 @@ typedef void (*questdb_oidc_user_data_release_cb)(void* user_data);
 QUESTDB_CLIENT_API
 questdb_oidc_builder* questdb_oidc_builder_new(void);
 
-/** Discover OIDC settings from the QuestDB server's `/settings` endpoint. */
+/**
+ * Record a QuestDB server URL to discover OIDC settings from.
+ *
+ * This performs NO network I/O: it only stores the URL. The `/settings`
+ * request, and any follow-up IdP discovery it triggers, run inside
+ * `questdb_oidc_builder_build` -- see the blocking note there before deciding
+ * which thread to call each of these on.
+ */
 QUESTDB_CLIENT_API
 questdb_oidc_builder* questdb_oidc_builder_from_questdb(
     const char* url, size_t url_len, questdb_error** err_out);
@@ -250,7 +257,22 @@ bool questdb_oidc_builder_event_handler(
     questdb_oidc_user_data_release_cb release,
     questdb_error** err_out);
 
-/** The builder is reusable; each call creates an independent auth state. */
+/**
+ * Resolve the configuration and create an auth state.
+ *
+ * **This call blocks on the network** when the builder came from
+ * `questdb_oidc_builder_from_questdb`: it issues the QuestDB `/settings`
+ * request here, and may follow it with the identity provider's own discovery
+ * document to confirm the advertised endpoints. Each request is bounded by
+ * `questdb_oidc_builder_timeout_ms` (default 30s, maximum 120s), so a call can
+ * take twice that before returning. Do not call it on a UI thread; a language
+ * binding holding a runtime lock should release it around this call, as the
+ * Python binding does with the GIL.
+ *
+ * A builder configured with explicit endpoints performs no I/O here.
+ *
+ * The builder is reusable; each call creates an independent auth state.
+ */
 QUESTDB_CLIENT_API
 questdb_oidc_auth* questdb_oidc_builder_build(
     const questdb_oidc_builder* builder, questdb_error** err_out);

@@ -45,8 +45,22 @@ pub enum ConnectionEventKind {
     /// Every configured endpoint was attempted and none accepted the
     /// connection in this sweep.
     AllEndpointsUnreachable,
-    /// Terminal: the server rejected credentials. The owning
-    /// sender/pool operation surfaces the error to the caller.
+    /// A credential was rejected or could not be obtained.
+    ///
+    /// Terminal **only when `host` is set**: the server rejected the
+    /// credential it was offered, and the owning sender/pool operation
+    /// surfaces the error to the caller.
+    ///
+    /// When `host` and `port` are `None` the credential was never offered to
+    /// anyone -- a token provider failed before any endpoint was dialled (see
+    /// [`ConnectionEvents::token_provider_failed`]). That is **retryable**:
+    /// `classify_provider_error` keeps such a failure a `SocketError` so the
+    /// store-and-forward drainer holds queued frames while a human signs in,
+    /// and the sender goes on reconnecting. A listener that pages, tears down
+    /// the pool, or exits on `AuthFailed` must gate on `host.is_some()`, or it
+    /// will fire on an ordinary silent-refresh blip. The `cause_code` tells the
+    /// two apart as well: `AuthError` for a rejection, `SocketError` for a
+    /// provider failure.
     AuthFailed,
 }
 

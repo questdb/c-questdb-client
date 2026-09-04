@@ -417,6 +417,14 @@ public:
     {
     }
 
+    /**
+     * Record a QuestDB server URL to discover OIDC settings from.
+     *
+     * Performs no network I/O: it only stores the URL. The `/settings`
+     * request, and any follow-up IdP discovery it triggers, run inside
+     * `build()` -- see the blocking note there before deciding which thread to
+     * call each of these on.
+     */
     static builder from_questdb(std::string_view url)
     {
         return builder{detail::wrapped_call(
@@ -557,6 +565,20 @@ public:
         return *this;
     }
 
+    /**
+     * Resolve the configuration and create an auth state.
+     *
+     * **This call blocks on the network** when the builder came from
+     * `from_questdb`: it issues the QuestDB `/settings` request here, and may
+     * follow it with the identity provider's own discovery document to confirm
+     * the advertised endpoints. Each request is bounded by `timeout_ms`
+     * (default 30s, maximum 120s), so a call can take twice that before
+     * returning. Do not call it on a UI thread.
+     *
+     * A builder configured with explicit endpoints performs no I/O here.
+     *
+     * The builder is reusable; each call creates an independent auth state.
+     */
     device_auth build() const
     {
         return device_auth{
