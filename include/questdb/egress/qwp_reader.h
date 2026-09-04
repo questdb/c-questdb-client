@@ -1161,7 +1161,15 @@ bool qwp_reader_batch_column_name(
  * borrows from the batch (see the section-level lifetime note).
  *
  * `values` holds the wire's little-endian bytes — the decoder does not
- * byte-swap. A fixed-width slot whose `validity` bit is set still contains
+ * byte-swap — with ONE exception: a `qwp_reader_column_kind_uuid` column is
+ * handed over as canonical RFC-4122 big-endian, because the decoder has
+ * already reversed it out of the wire's (lo LE, hi LE) pair order. LONG256 is
+ * not reversed: it stays little-endian limbs, low limb first. See
+ * `qwp_reader_column_data_get_bytes`, which states the same contract for the
+ * two 16/32-byte kinds. Reading a UUID as if it were still in wire order
+ * yields a byte-reversed value, not an error.
+ *
+ * A fixed-width slot whose `validity` bit is set still contains
  * a value (QuestDB's NULL sentinel); consult `validity` first.
  */
 typedef struct qwp_reader_column_data

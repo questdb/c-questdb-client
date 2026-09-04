@@ -192,9 +192,29 @@ bool questdb_oidc_builder_open_browser(
 QUESTDB_CLIENT_API
 bool questdb_oidc_builder_interactive(
     questdb_oidc_builder* builder, bool enabled, questdb_error** err_out);
+/**
+ * Seconds to wait between device-code polls when the identity provider does
+ * not advertise an `interval` of its own (default 5).
+ *
+ * This is only a fallback. A server-supplied `interval`, and any `Retry-After`
+ * the provider sends, both take precedence, and the value is clamped to
+ * [5, 1800] seconds -- the latter being the longest a device code may live.
+ */
 QUESTDB_CLIENT_API
 bool questdb_oidc_builder_default_interval_seconds(
     questdb_oidc_builder* builder, uint64_t seconds, questdb_error** err_out);
+/**
+ * Timeout for each individual HTTP request, in milliseconds (default 30000,
+ * maximum 120000).
+ *
+ * This is NOT a deadline for the sign-in as a whole, which is bounded by the
+ * device code's own lifetime: a device flow makes many requests and may run
+ * for minutes. It bounds one request -- discovery, the device-authorization
+ * call, or a single poll.
+ *
+ * Note the value is not validated here; an out-of-range one is reported by
+ * `questdb_oidc_builder_build`.
+ */
 QUESTDB_CLIENT_API
 bool questdb_oidc_builder_timeout_ms(
     questdb_oidc_builder* builder,

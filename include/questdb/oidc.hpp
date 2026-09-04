@@ -357,7 +357,22 @@ public:
     {
         ::questdb_oidc_config_view raw{};
         raw.struct_size = sizeof raw;
-        ::questdb_oidc_auth_get_config(this->raw(), &raw);
+        // Check the return: `questdb_oidc_auth_get_config` reports false for a
+        // NULL auth or an undersized `struct_size`, and discarding it returned
+        // a config_view of empty string_views that reads as a provider with no
+        // client id rather than as the failure it is. The Python binding
+        // raises for the same condition.
+        if (!::questdb_oidc_auth_get_config(this->raw(), &raw))
+        {
+            throw error{
+                ::questdb::error_code::invalid_api_call,
+                "Could not read the OIDC configuration.",
+                error_kind::unknown,
+                {},
+                {},
+                std::nullopt,
+                std::nullopt};
+        }
         return {
             view(raw.client_id, raw.client_id_len),
             view(raw.token_endpoint, raw.token_endpoint_len),
@@ -497,24 +512,51 @@ public:
         return *this;                                                          \
     }
 
+    /** Select the ID token instead of the access token. See
+     *  `questdb_oidc_builder_groups_in_token`. */
     QUESTDB_OIDC_CPP_BOOL_SETTER(
         groups_in_token, ::questdb_oidc_builder_groups_in_token)
+    /** Permit plaintext `http` for the QuestDB `/settings` request only; the
+     *  identity provider is always held to `https` (or loopback). See
+     *  `questdb_oidc_builder_allow_insecure_transport`. */
     QUESTDB_OIDC_CPP_BOOL_SETTER(
         allow_insecure_transport,
         ::questdb_oidc_builder_allow_insecure_transport)
+    /** Whether `sign_in` launches a browser at the verification URL. */
     QUESTDB_OIDC_CPP_BOOL_SETTER(
         open_browser, ::questdb_oidc_builder_open_browser)
+    /**
+     * Whether `sign_in` may prompt at all (default `true`).
+     *
+     * `false` fails immediately instead of printing a device code nobody will
+     * read and polling until it expires -- what a headless service or a CI job
+     * wants. There is deliberately NO TTY auto-detection: a missing TTY is not
+     * evidence of a missing human, so a caller that wants to fail fast has to
+     * ask for it. See `questdb_oidc_builder_interactive`.
+     */
     QUESTDB_OIDC_CPP_BOOL_SETTER(
         interactive, ::questdb_oidc_builder_interactive)
 
 #undef QUESTDB_OIDC_CPP_BOOL_SETTER
 
+    /**
+     * Fallback seconds between device-code polls, used only when the identity
+     * provider advertises no `interval` (default 5). A server-supplied
+     * interval and any `Retry-After` take precedence; the value is clamped to
+     * [5, 1800]. See `questdb_oidc_builder_default_interval_seconds`.
+     */
     builder& default_interval_seconds(uint64_t seconds)
     {
         detail::wrapped_call(
             ::questdb_oidc_builder_default_interval_seconds, _raw, seconds);
         return *this;
     }
+    /**
+     * Timeout for each individual HTTP request (default 30000, maximum
+     * 120000). NOT a deadline for the sign-in as a whole, which the device
+     * code's own lifetime bounds. An out-of-range value is reported by
+     * `build()`, not here. See `questdb_oidc_builder_timeout_ms`.
+     */
     builder& timeout_ms(uint64_t milliseconds)
     {
         detail::wrapped_call(
