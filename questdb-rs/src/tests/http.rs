@@ -579,6 +579,99 @@ fn test_two_retries(
     Ok(())
 }
 
+#[test]
+fn test_credential_rotation_keeps_retry_backoff() -> TestResult {
+    // Regression: `retry_http_send`'s credential-rotation branch used to make
+    // the rotated retry immediate by setting `retry_interval_ms = 0`. That
+    // value is the backoff *ladder*, so every later
+    // `retry_interval_ms.saturating_mul(2)` computed `0 * 2` and a single 401
+    // disabled backoff for the rest of the window: any genuinely retryable
+    // failure after it re-sent the whole buffer with a sub-millisecond gap
+    // until `retry_end`.
+    //
+    // The script is 500 (ladder -> 10ms), 401 (rotate, retried with no wait),
+    // 500 (ladder -> 20ms); the wait before the fourth request is then the
+    // assertion -- with the bug it arrives in ~1ms.
+    let mut server = MockServer::new()?;
+    let provider_seq = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let mut sender = server
+        .lsb_http()
+        .protocol_version(ProtocolVersion::V2)?
+        // A fresh value per call, so the 401 reads as an expiry the provider
+        // can rotate out of rather than a genuine rejection (which is what
+        // `rotated_auth_after_401` returning `None` would mean).
+        .http_token_provider(move || {
+            Ok::<_, crate::Error>(format!(
+                "tok{}",
+                provider_seq.fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+            ))
+        })?
+        .retry_timeout(Duration::from_secs(30))?
+        .build()?;
+    let mut buffer = sender.new_buffer();
+    buffer
+        .table("test")?
+        .symbol("t1", "v1")?
+        .column_f64("f1", 0.5)?
+        .at(TimestampNanos::new(10000000))?;
+
+    let server_thread = std::thread::spawn(move || -> io::Result<MockServer> {
+        server.accept()?;
+
+        // 1: the attempt made before the retry loop. A 5xx starts the ladder.
+        let req = server.recv_http_q()?;
+        assert_eq!(req.header("authorization"), Some("Bearer tok0"));
+        server.send_http_response_q(
+            HttpResponse::empty()
+                .with_status(500, "Internal Server Error")
+                .with_body_str("client should retry"),
+        )?;
+
+        // 2: still the credential resolved for the flush. Answer 401 so the
+        // provider is consulted again and hands back a rotated value.
+        let req = server.recv_http_q()?;
+        assert_eq!(req.header("authorization"), Some("Bearer tok0"));
+        server.send_http_response_q(
+            HttpResponse::empty()
+                .with_status(401, "Unauthorized")
+                .with_body_str("Unauthorized"),
+        )?;
+
+        // 3: carries the rotated credential, which is what proves the
+        // rotation branch ran at all.
+        let req = server.recv_http_q()?;
+        assert_eq!(req.header("authorization"), Some("Bearer tok1"));
+        server.send_http_response_q(
+            HttpResponse::empty()
+                .with_status(500, "Internal Server Error")
+                .with_body_str("client should retry"),
+        )?;
+
+        // 4: the ladder must have survived the rotation and be at ~20ms.
+        let start_time = std::time::Instant::now();
+        let req = server.recv_http_q()?;
+        let elapsed = std::time::Instant::now().duration_since(start_time);
+        assert_eq!(req.header("authorization"), Some("Bearer tok1"));
+        assert!(
+            elapsed > Duration::from_millis(15),
+            "credential rotation disabled the retry backoff: \
+             the next attempt came after {elapsed:?}"
+        );
+
+        server.send_http_response_q(HttpResponse::empty())?;
+
+        Ok(server)
+    });
+
+    let res = sender.flush_and_keep(&buffer);
+
+    _ = server_thread.join().unwrap()?;
+
+    res?;
+
+    Ok(())
+}
+
 #[rstest]
 fn test_one_retry(
     #[values(ProtocolVersion::V1, ProtocolVersion::V2)] version: ProtocolVersion,

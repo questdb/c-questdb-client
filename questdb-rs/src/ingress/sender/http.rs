@@ -402,9 +402,21 @@ fn retry_http_send(
     // rejection and the 401 stands, with no extra request.
     let mut refreshed: Option<String> = None;
     let mut auth_retry_used = false;
+    // Set for exactly one iteration by the credential-rotation branch below, so
+    // that retry goes out without a wait. It is a one-shot override rather than
+    // `retry_interval_ms = 0` because the interval is the *ladder*: zeroing it
+    // made every later `saturating_mul(2)` compute `0 * 2`, so a single
+    // rotation disabled backoff for the rest of the window and any genuinely
+    // retryable failure after it re-sent the whole buffer in a ~1 ms loop until
+    // `retry_end`.
+    let mut retry_now = false;
     loop {
         let jitter_ms = rng.random_range(-5i32..5);
-        let to_sleep = retry_sleep(retry_interval_ms, jitter_ms);
+        let to_sleep = if std::mem::take(&mut retry_now) {
+            Duration::ZERO
+        } else {
+            retry_sleep(retry_interval_ms, jitter_ms)
+        };
         if (std::time::Instant::now() + to_sleep) > retry_end {
             return last_rep;
         }
@@ -423,8 +435,11 @@ fn retry_http_send(
                 auth_retry_used = true;
                 refreshed = Some(value);
                 // Retry immediately rather than backing off: nothing was
-                // overloaded, the credential had simply rotated.
-                retry_interval_ms = 0;
+                // overloaded, the credential had simply rotated. The backoff
+                // ladder is deliberately left where it is -- this attempt is
+                // free, but a later 5xx in the same window must still escalate
+                // from wherever congestion had already pushed it.
+                retry_now = true;
                 continue;
             }
             return last_rep;
