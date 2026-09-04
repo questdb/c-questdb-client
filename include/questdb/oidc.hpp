@@ -334,9 +334,12 @@ public:
      * `share()` and every attached transport observes the same closed state.
      * Idempotent. The persisted entry is left behind -- see `clear()`.
      *
-     * Safe from any thread, including this provider's own event callback: it
-     * publishes the close without blocking, and only skips the wait for the
-     * running operation to finish when called from inside a callback.
+     * Safe from any thread, including this provider's own event callback. While
+     * this provider's callback is active, close returns after publishing the
+     * permanent close and dropping the in-memory credential, regardless of
+     * which thread called it; waiting for the callback's authentication
+     * operation could deadlock when the callback delegates close to that thread
+     * and joins it. A later close after the callback returns performs the drain.
      */
     void close() const
     {
