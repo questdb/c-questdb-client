@@ -2803,6 +2803,7 @@ TEST_CASE("line_sender_error c++ can carry qwpws diagnostic")
         diagnostic};
 
     CHECK_FALSE(error.in_doubt());
+    CHECK_FALSE(error.not_delivered());
     REQUIRE(error.qwp_ws_diagnostic().has_value());
     CHECK(
         error.qwp_ws_diagnostic()->category ==
@@ -2819,6 +2820,15 @@ TEST_CASE("line_sender_error c++ can carry qwpws diagnostic")
         std::optional<uint64_t>{44});
     CHECK(error.qwp_ws_diagnostic()->from_fsn == 5);
     CHECK(error.qwp_ws_diagnostic()->to_fsn == 6);
+
+    questdb::ingress::line_sender_error independently_retryable{
+        questdb::ingress::line_sender_error_code::failover_retry,
+        "current chunk retained after an earlier commit",
+        true,
+        std::nullopt,
+        true};
+    CHECK(independently_retryable.in_doubt());
+    CHECK(independently_retryable.not_delivered());
 }
 
 TEST_CASE("line_sender c++ qwpws progress option rejects udp opts")

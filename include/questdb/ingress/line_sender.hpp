@@ -912,7 +912,13 @@ public:
     /**
      * Record a GEOHASH column value. QWP-only.
      *
-     * `precision_bits` must be in 1..=60 and is pinned per column.
+     * `precision_bits` must be in 1..=60 and is pinned per column. `bits` is
+     * a raw pattern and is not checked to be less than 2^precision_bits.
+     * Supplying the wrong precision or a pattern with bits set above it can
+     * succeed and store a different GEOHASH or NULL. Only the low
+     * ceil(precision_bits / 8) bytes are encoded; the exact result is
+     * unspecified. This is a semantic data-integrity risk, not a memory-safety
+     * risk for an otherwise valid call. The caller must validate `bits`.
      */
     line_sender_buffer& column_geohash(
         column_name_view name, uint64_t bits, uint8_t precision_bits)

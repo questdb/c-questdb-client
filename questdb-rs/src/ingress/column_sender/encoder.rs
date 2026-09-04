@@ -33,7 +33,7 @@
 
 use std::slice;
 
-use crate::ingress::buffer::SymbolGlobalDict;
+use crate::ingress::buffer::{SymbolGlobalDict, geohash_precision_needs_bitmap};
 use crate::{Result, error};
 
 #[cfg(feature = "arrow-ingress")]
@@ -441,11 +441,24 @@ fn estimate_frame_size(
 
     let bitmap_bytes = row_count.div_ceil(8);
     for col in &chunk.columns {
-        let null_overhead = 1usize.saturating_add(if col.validity.is_some() {
-            bitmap_bytes
-        } else {
-            0
-        });
+        let forced_geohash_bitmap = match col.kind {
+            ColumnKind::NumpyDeferred { dtype, .. } => dtype
+                .geohash_precision_bits()
+                .is_some_and(geohash_precision_needs_bitmap),
+            #[cfg(feature = "arrow-ingress")]
+            ColumnKind::ArrowDeferred { arrow_kind, .. } => matches!(
+                arrow_kind,
+                arrow_batch::ColumnKind::Geohash(bits)
+                    if geohash_precision_needs_bitmap(bits)
+            ),
+            _ => false,
+        };
+        let null_overhead =
+            1usize.saturating_add(if col.validity.is_some() || forced_geohash_bitmap {
+                bitmap_bytes
+            } else {
+                0
+            });
         let payload_size = match col.kind {
             ColumnKind::Byte { .. } => row_count,
             ColumnKind::Short { .. } => row_count.saturating_mul(2),

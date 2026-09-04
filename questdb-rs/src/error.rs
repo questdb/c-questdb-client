@@ -287,10 +287,11 @@ pub enum ErrorCode {
     /// single frame is split, and each half is published on its own;
     /// store-and-forward is at-least-once, so an earlier half can already be
     /// durably queued when a later half hits the cap. Nothing is lost then
-    /// either, but the operation is no longer known-not-delivered: it is
-    /// reported as delivery-unknown, so **check [`in_doubt`](Error::in_doubt)
-    /// before resending** — a blind resend of the whole chunk duplicates the
-    /// rows the committed prefix already carried.
+    /// either, but the operation is no longer known-not-delivered:
+    /// [`not_delivered`](Error::not_delivered) is false. Do not resend that
+    /// chunk — its committed prefix would be duplicated. Consult
+    /// [`in_doubt`](Error::in_doubt) separately before replaying a larger
+    /// source from an earlier checkpoint.
     ///
     /// Distinct from [`InvalidApiCall`](Self::InvalidApiCall) — a caller
     /// mistake with no recovery — so callers can recognise a full dictionary
@@ -313,6 +314,10 @@ struct ErrorInner {
     code: ErrorCode,
     msg: String,
     in_doubt: bool,
+    /// The specific input passed to the operation that produced this error was
+    /// provably not transmitted. Orthogonal to `in_doubt`, which describes
+    /// replay from the caller's earlier checkpoint.
+    not_delivered: bool,
     /// Structured QWP/WebSocket sender rejection diagnostic.
     /// Sender-only.
     #[cfg(feature = "_sender-qwp-ws")]
@@ -340,6 +345,7 @@ impl Error {
             code,
             msg: msg.into(),
             in_doubt: false,
+            not_delivered: false,
             #[cfg(feature = "_sender-qwp-ws")]
             qwp_ws_rejection: None,
             #[cfg(feature = "_sender-qwp-ws")]
@@ -351,12 +357,12 @@ impl Error {
         }))
     }
 
-    /// Mark this error as *delivery-unknown* ("in doubt"): the current input's
-    /// bytes may already have reached the server even though the operation
-    /// reported failure (e.g. a socket write that failed mid-frame, or a
-    /// post-publish ACK wait that failed). Surfaced to callers via
-    /// [`Error::in_doubt`]. See `PooledSenderCore::flush` and the `FlushFailure`
-    /// delivery classification.
+    /// Mark this error as unsafe for blind replay ("in doubt"): either the
+    /// current input may have reached the server, or an earlier direct-sender
+    /// publication may have committed since the caller's last successful ACK
+    /// boundary. Surfaced to callers via [`Error::in_doubt`]. See
+    /// `PooledSenderCore::flush` and the `FlushFailure` delivery
+    /// classification.
     #[must_use]
     #[cfg(feature = "sync-sender-qwp-ws")]
     pub(crate) fn with_in_doubt(mut self, in_doubt: bool) -> Self {
@@ -364,20 +370,46 @@ impl Error {
         self
     }
 
-    /// `true` when the operation that produced this error is *delivery-unknown*
-    /// ("in doubt"): the current input may already have reached the server, so
-    /// blindly replaying it on a fresh connection can duplicate rows.
+    /// `true` when replaying from the caller's previous successful ACK boundary
+    /// is unsafe ("in doubt"). The current input may already have reached the
+    /// server, or an earlier direct-sender publication may have committed even
+    /// when the current input was provably not transmitted.
     ///
     /// This is independent of the [`code`](Error::code): a delivery-unknown
     /// failure typically reports [`ErrorCode::FailoverRetry`] (the connection
-    /// can be replaced), yet `FailoverRetry` alone does **not** mean the input
-    /// is safe to retry. Use `in_doubt() == false` together with a retryable
-    /// code to decide whether re-sending the same input is safe; when
-    /// `in_doubt()` is `true`, only replay if table-level dedup/upsert keys
-    /// make duplicates harmless.
+    /// can be replaced), yet `FailoverRetry` alone does **not** make any replay
+    /// safe. Use this flag to decide whether replaying from the earlier source
+    /// boundary is safe, and use [`not_delivered`](Self::not_delivered) to
+    /// decide whether the specific current input may be retried independently.
+    /// Low-level APIs can report both flags as `true` when only an earlier
+    /// publication caused the source-level ambiguity.
     #[must_use]
     pub fn in_doubt(&self) -> bool {
         self.0.in_doubt
+    }
+
+    /// Mark the specific input associated with this error as provably not
+    /// transmitted. This metadata is set by QWP column-sender flush paths when
+    /// they retain the caller's current chunk or can return its Arrow array.
+    #[must_use]
+    #[cfg(feature = "sync-sender-qwp-ws")]
+    pub(crate) fn with_not_delivered(mut self, not_delivered: bool) -> Self {
+        self.0.not_delivered = not_delivered;
+        self
+    }
+
+    /// `true` only when the specific input passed to the failed operation was
+    /// provably not transmitted and may be retried independently.
+    ///
+    /// This is intentionally independent of [`in_doubt`](Self::in_doubt).
+    /// Both may be `true`: the current input is safe to retry, while replaying
+    /// a larger source from an earlier checkpoint would duplicate a prefix
+    /// committed by a previous direct-sender publication. A `false` result is
+    /// conservative and does not by itself say whether an API-specific input
+    /// remains available for retry.
+    #[must_use]
+    pub fn not_delivered(&self) -> bool {
+        self.0.not_delivered
     }
 
     /// Attach a structured QWP/WebSocket rejection to this error.
@@ -507,9 +539,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn errors_are_not_in_doubt_by_default() {
+    fn errors_have_no_delivery_guarantee_by_default() {
         let err = Error::new(ErrorCode::SocketError, "boom");
         assert!(!err.in_doubt());
+        assert!(!err.not_delivered());
     }
 
     #[test]
@@ -522,6 +555,18 @@ mod tests {
         assert_eq!(err.msg(), "mid-frame write failed");
         // The flag is a flat boolean, not a one-way latch.
         assert!(!err.with_in_doubt(false).in_doubt());
+    }
+
+    #[test]
+    #[cfg(feature = "sync-sender-qwp-ws")]
+    fn current_input_delivery_is_independent_of_checkpoint_replay() {
+        let err = Error::new(ErrorCode::FailoverRetry, "earlier prefix committed")
+            .with_not_delivered(true)
+            .with_in_doubt(true);
+        assert!(err.not_delivered());
+        assert!(err.in_doubt());
+        assert_eq!(err.code(), ErrorCode::FailoverRetry);
+        assert_eq!(err.msg(), "earlier prefix committed");
     }
 
     #[test]

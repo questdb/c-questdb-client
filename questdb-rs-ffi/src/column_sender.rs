@@ -2289,11 +2289,10 @@ symbol_fn!(qwp_chunk_symbol_i32, i32, symbol_i32, "symbol codes (i32)");
 ///
 /// Ownership: on success, `array->release` is consumed (set to NULL);
 /// the returned handle owns the underlying buffers and releases them on
-/// `qwp_arrow_import_free`. On failure, `array->release` may
-/// also have been consumed if the call reached the Arrow import step
-/// before failing — callers MUST check `array->release != NULL` before
-/// invoking it on the failure path. Early-fail paths (NULL pointer,
-/// depth-cap rejection) leave it intact. `schema` is borrowed in all
+/// `qwp_arrow_import_free`. A failure detected before the Arrow import
+/// step leaves `array->release` intact. Once import begins, a failure may
+/// also have consumed it — callers MUST check `array->release != NULL`
+/// before invoking it on the failure path. `schema` is borrowed in all
 /// cases.
 ///
 /// `auto`: Dictionary(*, Utf8/LargeUtf8) -> SYMBOL, plain Utf8 -> VARCHAR.
@@ -2470,12 +2469,11 @@ pub unsafe extern "C" fn qwp_chunk_append_arrow_import(
 ///
 /// Ownership: on success, `array->release` is consumed (set to NULL);
 /// the chunk holds the underlying buffers via an internal Arc until
-/// `qwp_sender_flush_chunk` returns. On failure, `array->release` may
-/// also have been consumed if the call reached the Arrow import step
-/// before failing — callers MUST check `array->release != NULL` before
-/// invoking it on the failure path. Early-fail paths (NULL pointer,
-/// depth-cap rejection) leave it intact. `schema` is borrowed in all
-/// cases.
+/// `qwp_sender_flush_chunk` returns. A failure detected before the Arrow
+/// import step leaves `array->release` intact. Once import begins, a
+/// failure may also have consumed it — callers MUST check
+/// `array->release != NULL` before invoking it on the failure path.
+/// `schema` is borrowed in all cases.
 ///
 /// `array->offset` is honored (the Arrow C Data Interface logical
 /// offset); `row_offset` further sub-slices within the call.
@@ -3478,11 +3476,13 @@ pub unsafe extern "C" fn qwp_sender_flush_buffer_and_keep_and_get_fsn(
 /// provided).
 ///
 /// A `false` return does **not** prove the rows were not sent: a transport
-/// error that fails mid-frame may already have put bytes on the wire. Such a
-/// failure reports `line_sender_error_failover_retry`, yet re-flushing the
-/// retained `chunk` on a fresh connection could duplicate rows. Call
-/// [`line_sender_error_in_doubt`](crate::line_sender_error_in_doubt) on
-/// `*err_out` to detect this delivery-unknown case before retrying.
+/// error that fails mid-frame may already have put bytes on the wire. Retry the
+/// retained current `chunk` independently only when
+/// [`line_sender_error_not_delivered`](crate::line_sender_error_not_delivered)
+/// is true. Consult [`line_sender_error_in_doubt`](crate::line_sender_error_in_doubt)
+/// separately before replaying a larger source from an earlier checkpoint;
+/// both flags may be true when this chunk was not transmitted but an earlier
+/// publication committed.
 ///
 /// Call `qwp_sender_wait` (store-and-forward) or
 /// `qwp_direct_sender_commit` (direct) after the last flush to drain all
@@ -3966,8 +3966,12 @@ pub unsafe extern "C" fn qwp_sender_acked_fsn(
     }
 }
 
-/// Pipeline a deferred frame on a direct connection. Not committed until
-/// `qwp_direct_sender_commit` / `qwp_direct_sender_flush_and_wait`.
+/// Publish a frame on a direct connection without waiting. The first non-empty
+/// flush on a fresh physical connection is non-deferred and may commit
+/// immediately; later frames are deferred until `qwp_direct_sender_commit` /
+/// `qwp_direct_sender_flush_and_wait`. Check
+/// `line_sender_error_not_delivered` before retrying only the retained current
+/// chunk, and `line_sender_error_in_doubt` before replaying a larger source.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn qwp_direct_sender_flush(
     sender: *mut qwp_direct_sender,
@@ -4031,18 +4035,15 @@ pub unsafe extern "C" fn qwp_direct_sender_flush_and_wait(
 /// batch — reaching for this entry point would discard that column's role
 /// as the designated timestamp and silently substitute server arrival time.
 ///
-/// Ownership: on success, `array->release` is consumed (set to NULL)
-/// and the function has invoked it internally. On a **transient,
-/// provably-not-delivered** (`line_sender_error_failover_retry` with
-/// `line_sender_error_in_doubt == false`) failure `array` is left intact
-/// (re-exported back into `*array` with a fresh `release`) so the caller
-/// can drop+re-borrow a live sender and retry with the same array. A
-/// delivery-unknown failure (a partial write that fails mid-frame: also
-/// `line_sender_error_failover_retry` but with `line_sender_error_in_doubt ==
-/// true`) is **not** re-exported, since replaying it could duplicate rows. On
-/// any failure `array->release` may have been consumed if the call reached the
-/// Arrow import step — callers MUST check `array->release != NULL` before
-/// invoking it on the failure path. `schema` is always borrowed.
+/// Ownership: on success, `array->release` is consumed (set to NULL) and the
+/// function has invoked it internally. When the current batch was provably not
+/// delivered it is re-exported back into `*array` with a fresh `release`, so
+/// the caller can retry that batch independently. This is reported by
+/// `line_sender_error_not_delivered`; `line_sender_error_in_doubt` separately
+/// governs replay from an earlier source boundary, and both may be true. A
+/// delivery-unknown current batch is not re-exported. On any failure callers
+/// MUST still treat `array->release != NULL` as the authoritative ownership
+/// check before invoking it; `schema` is always borrowed.
 ///
 /// Returns `true` on success, `false` on error (with `*err_out` set).
 ///
@@ -4146,6 +4147,11 @@ pub unsafe extern "C" fn qwp_sender_flush_arrow_batch_at_now_and_wait(
 /// Direct-handle publish-only Arrow flush (server-stamped). Pair with
 /// `qwp_direct_sender_commit`, or use
 /// `qwp_direct_sender_flush_arrow_batch_at_now_and_wait`.
+///
+/// On failure, `array->release != NULL` means this current batch was provably
+/// not delivered and was re-exported. `line_sender_error_in_doubt` may still be
+/// true when an earlier direct publication committed; that flag governs
+/// replay of a larger source from its previous confirmed boundary.
 #[cfg(feature = "arrow")]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn qwp_direct_sender_flush_arrow_batch_at_now(
@@ -4579,6 +4585,11 @@ enum FfiArrowTs {
 }
 
 #[cfg(feature = "arrow")]
+fn current_input_is_reexportable(err: &Error) -> bool {
+    err.not_delivered()
+}
+
+#[cfg(feature = "arrow")]
 #[allow(clippy::too_many_arguments)]
 unsafe fn arrow_batch_impl<T: CsHandle>(
     fn_name: &'static str,
@@ -4641,11 +4652,11 @@ unsafe fn arrow_batch_impl<T: CsHandle>(
             // (matching the caller's retained `schema` shape), restoring a
             // valid release.
             //
-            // `in_doubt` carries the delivery classification: a direct-mode
-            // partial write fails mid-frame delivery-unknown (`in_doubt`),
-            // and re-exporting it would invite a duplicate-causing retry —
-            // that is the one case that must consume the array.
-            if !err.in_doubt() {
+            // Current-input delivery and larger-source replay are orthogonal:
+            // `not_delivered` can remain true while `in_doubt` is true because
+            // an earlier direct publication committed. Re-export only from
+            // the affirmative current-input classification.
+            if current_input_is_reexportable(&err) {
                 unsafe { reexport_record_batch_into(rb, array, schema) };
             }
             unsafe { set_err_out_from_error(err_out, err) };
@@ -4723,7 +4734,7 @@ unsafe fn arrow_batch_impl_and_get_fsn(
             true
         }
         Err(err) => {
-            if !err.in_doubt() {
+            if current_input_is_reexportable(&err) {
                 unsafe { reexport_record_batch_into(rb, array, schema) };
             }
             unsafe { set_err_out_from_error(err_out, err) };
@@ -6166,6 +6177,33 @@ mod tests {
         assert_eq!(symbol_mode_from_u32(5, &mut err), None);
         assert!(!err.is_null());
         unsafe { line_sender_error_free(err) };
+    }
+
+    #[cfg(feature = "arrow")]
+    #[test]
+    fn arrow_reexport_uses_current_input_not_source_replay_scope() {
+        use questdb::ingress::column_sender::FlushFailure;
+
+        let source_unsafe = FlushFailure::DeliveryUnknown(Error::new(
+            ErrorCode::FailoverRetry,
+            "earlier prefix committed",
+        ))
+        .into_error();
+        let both = FlushFailure::NotDelivered(source_unsafe).into_error();
+        assert!(both.in_doubt(), "whole-source replay must stay blocked");
+        assert!(
+            current_input_is_reexportable(&both),
+            "the provably undelivered current Arrow batch must still be returned"
+        );
+
+        let current_unknown =
+            FlushFailure::DeliveryUnknown(Error::new(ErrorCode::FailoverRetry, "partial write"))
+                .into_error();
+        assert!(current_unknown.in_doubt());
+        assert!(
+            !current_input_is_reexportable(&current_unknown),
+            "a delivery-unknown current batch must stay consumed"
+        );
     }
 
     /// Regression: a bare single-column (non-Struct) Arrow input must re-export

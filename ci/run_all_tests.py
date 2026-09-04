@@ -27,6 +27,7 @@ def find_binary(build_dir, name, exe_suffix):
 def run_cargo_tests():
     """The questdb-rs / questdb-rs-ffi cargo test matrix. Pure Rust: needs no
     CMake build and no running QuestDB."""
+    run_cmd(sys.executable, 'ci/check_arrow_ffi_lock.py')
     run_cmd('cargo', 'test',
             '--', '--nocapture', cwd='questdb-rs')
     run_cmd('cargo', 'test',
@@ -47,14 +48,15 @@ def run_cargo_tests():
             '--', '--nocapture', cwd='questdb-rs')
     run_cmd('cargo', 'test', '--features=almost-all-features',
             '--', '--nocapture', cwd='questdb-rs')
-    run_cmd('cargo', 'test',
+    run_cmd('cargo', 'test', '--locked',
             '--features=almost-all-features,arrow,polars',
             '--', '--nocapture', cwd='questdb-rs')
-    run_cmd('cargo', 'test', '--no-default-features',
+    run_cmd('cargo', 'test', '--locked', '--no-default-features',
             '--features=ring-crypto,tls-webpki-certs,sync-sender-qwp-ws,sync-reader-qwp-ws,arrow',
             '--', '--nocapture', cwd='questdb-rs')
-    run_cmd('cargo', 'test', cwd='questdb-rs-ffi')
-    run_cmd('cargo', 'test', '--features=arrow', cwd='questdb-rs-ffi')
+    run_cmd('cargo', 'test', '--locked', cwd='questdb-rs-ffi')
+    run_cmd('cargo', 'test', '--locked', '--features=arrow',
+            cwd='questdb-rs-ffi')
 
 
 def run_cpp_tests():

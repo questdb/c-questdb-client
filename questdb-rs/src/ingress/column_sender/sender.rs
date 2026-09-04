@@ -154,10 +154,14 @@ pub(crate) enum WaitForAck {
 /// Delivery certainty of the **current input** when an ACKing flush fails.
 ///
 /// Drives the C FFI Arrow re-export decision: `NotDelivered` may re-export the
-/// caller's batch for retry; `DeliveryUnknown` must not. The
-/// distinction is delivery certainty of the current input, *not* the error
-/// code — a direct-mode `write_all`/`flush` error or a post-publish ACK-wait
-/// failure is `DeliveryUnknown` even though it reports `FailoverRetry`.
+/// caller's batch for retry; `DeliveryUnknown` must not. Independently, the
+/// embedded [`Error::in_doubt`](crate::Error::in_doubt) bit tells callers
+/// whether replaying a larger source from its previous confirmed boundary is
+/// safe. It may therefore be true even for `NotDelivered` when an earlier
+/// publication committed. The enum distinction is delivery certainty of the
+/// current input, *not* the error code — a direct-mode `write_all`/`flush`
+/// error or a post-publish ACK-wait failure is `DeliveryUnknown` even though it
+/// reports `FailoverRetry`.
 #[derive(Debug)]
 #[doc(hidden)]
 #[non_exhaustive]
@@ -186,12 +190,14 @@ impl FlushFailure {
     /// plain [`crate::Error`]. Used by the public `Result<()>`-returning API,
     /// which never re-exports. The `DeliveryUnknown` arm tags the error
     /// [`in_doubt`](crate::Error::in_doubt) so publish-only callers retain the
-    /// delivery-unknown signal that the enum carried.
+    /// delivery-unknown signal that the enum carried. The `NotDelivered` arm
+    /// tags [`Error::not_delivered`](crate::Error::not_delivered), preserving
+    /// the independent current-input retry signal after the enum is collapsed.
     #[doc(hidden)]
     pub fn into_error(self) -> crate::Error {
         match self {
-            FlushFailure::NotDelivered(e) => e,
-            FlushFailure::DeliveryUnknown(e) => e.with_in_doubt(true),
+            FlushFailure::NotDelivered(e) => e.with_not_delivered(true),
+            FlushFailure::DeliveryUnknown(e) => e.with_not_delivered(false).with_in_doubt(true),
         }
     }
 
@@ -215,6 +221,15 @@ fn direct_delivery_unknown(e: crate::Error) -> FlushFailure {
     FlushFailure::DeliveryUnknown(classify_flush_error(e))
 }
 
+/// Validation/conversion rejected the current input before publication.
+#[cfg(feature = "arrow-ingress")]
+fn not_delivered_error<E>(e: E) -> crate::Error
+where
+    crate::Error: From<E>,
+{
+    crate::Error::from(e).with_not_delivered(true)
+}
+
 /// Downgrade a split sub-range failure once an earlier sub-range has already
 /// committed (direct) or been enqueued (store-and-forward): the chunk is now
 /// partially on the server, so it is no longer safe to blind-retry the whole
@@ -224,6 +239,15 @@ fn direct_delivery_unknown(e: crate::Error) -> FlushFailure {
 fn deny_retry_after_partial(f: FlushFailure) -> FlushFailure {
     match f {
         FlushFailure::NotDelivered(e) => FlushFailure::DeliveryUnknown(e),
+        other => other,
+    }
+}
+
+/// Preserve that the current input was not transmitted while denying a blind
+/// replay from an earlier caller boundary that may already have committed.
+fn deny_retry_after_prior_commit(f: FlushFailure) -> FlushFailure {
+    match f {
+        FlushFailure::NotDelivered(e) => FlushFailure::NotDelivered(e.with_in_doubt(true)),
         other => other,
     }
 }
@@ -245,11 +269,12 @@ struct DirectColumnBackend {
     symbol_dict: SymbolGlobalDict,
     scratch: encoder::EncodeScratch,
     first_frame_sent: bool,
-    /// A mid-split internal `sync` committed a prefix server-side since the
-    /// last successful commit+ack boundary (a caller `sync` or a waited
-    /// flush). While set, a failed `sync` classifies as delivery-unknown
-    /// even at "provably not delivered" sites: a blind whole-operation
-    /// resend would duplicate that prefix.
+    /// A non-deferred publication or mid-split internal `sync` may have
+    /// committed data server-side since the last successful commit+ack
+    /// boundary (a caller `sync` or a waited flush). While set, a failure from
+    /// any flush or sync classifies as delivery-unknown even at "provably not
+    /// delivered" sites: a blind whole-operation resend would duplicate that
+    /// prefix.
     commit_since_sync: bool,
 }
 
@@ -567,7 +592,7 @@ impl PooledSenderCore {
         T: TryInto<TableName<'t>>,
         crate::Error: From<T::Error>,
     {
-        let table: TableName<'t> = table.try_into()?;
+        let table: TableName<'t> = table.try_into().map_err(not_delivered_error)?;
         self.flush_arrow_batch_dispatch(
             table,
             batch,
@@ -591,7 +616,7 @@ impl PooledSenderCore {
         T: TryInto<TableName<'t>>,
         crate::Error: From<T::Error>,
     {
-        let table: TableName<'t> = table.try_into()?;
+        let table: TableName<'t> = table.try_into().map_err(not_delivered_error)?;
         self.flush_arrow_batch_dispatch_get_fsn(table, batch, ArrowTsSource::ServerNow, overrides)
             .map_err(FlushFailure::into_error)
     }
@@ -611,7 +636,7 @@ impl PooledSenderCore {
         T: TryInto<TableName<'t>>,
         crate::Error: From<T::Error>,
     {
-        let table: TableName<'t> = table.try_into()?;
+        let table: TableName<'t> = table.try_into().map_err(not_delivered_error)?;
         self.flush_arrow_batch_dispatch(
             table,
             batch,
@@ -639,8 +664,9 @@ impl PooledSenderCore {
         T: TryInto<TableName<'t>>,
         crate::Error: From<T::Error>,
     {
-        let table: TableName<'t> = table.try_into()?;
-        let ts_col_idx = arrow_batch::resolve_ts_column(batch, ts_column)?;
+        let table: TableName<'t> = table.try_into().map_err(not_delivered_error)?;
+        let ts_col_idx = arrow_batch::resolve_ts_column(batch, ts_column)
+            .map_err(|e| e.with_not_delivered(true))?;
         self.flush_arrow_batch_dispatch(
             table,
             batch,
@@ -669,7 +695,7 @@ impl PooledSenderCore {
         T: TryInto<TableName<'t>>,
         crate::Error: From<T::Error>,
     {
-        let table: TableName<'t> = table.try_into()?;
+        let table: TableName<'t> = table.try_into().map_err(not_delivered_error)?;
         self.flush_arrow_batch_dispatch(
             table,
             batch,
@@ -694,8 +720,9 @@ impl PooledSenderCore {
         T: TryInto<TableName<'t>>,
         crate::Error: From<T::Error>,
     {
-        let table: TableName<'t> = table.try_into()?;
-        let ts_col_idx = arrow_batch::resolve_ts_column(batch, ts_column)?;
+        let table: TableName<'t> = table.try_into().map_err(not_delivered_error)?;
+        let ts_col_idx = arrow_batch::resolve_ts_column(batch, ts_column)
+            .map_err(|e| e.with_not_delivered(true))?;
         self.flush_arrow_batch_dispatch_get_fsn(
             table,
             batch,
@@ -721,8 +748,9 @@ impl PooledSenderCore {
         T: TryInto<TableName<'t>>,
         crate::Error: From<T::Error>,
     {
-        let table: TableName<'t> = table.try_into()?;
-        let ts_col_idx = arrow_batch::resolve_ts_column(batch, ts_column)?;
+        let table: TableName<'t> = table.try_into().map_err(not_delivered_error)?;
+        let ts_col_idx = arrow_batch::resolve_ts_column(batch, ts_column)
+            .map_err(|e| e.with_not_delivered(true))?;
         self.flush_arrow_batch_dispatch(
             table,
             batch,
@@ -913,7 +941,7 @@ impl DirectSenderCore {
         T: TryInto<TableName<'t>>,
         crate::Error: From<T::Error>,
     {
-        let table: TableName<'t> = table.try_into()?;
+        let table: TableName<'t> = table.try_into().map_err(not_delivered_error)?;
         self.backend
             .flush_arrow_batch_inner(
                 table,
@@ -937,8 +965,9 @@ impl DirectSenderCore {
         T: TryInto<TableName<'t>>,
         crate::Error: From<T::Error>,
     {
-        let table: TableName<'t> = table.try_into()?;
-        let ts_col_idx = arrow_batch::resolve_ts_column(batch, ts_column)?;
+        let table: TableName<'t> = table.try_into().map_err(not_delivered_error)?;
+        let ts_col_idx = arrow_batch::resolve_ts_column(batch, ts_column)
+            .map_err(|e| e.with_not_delivered(true))?;
         self.backend
             .flush_arrow_batch_inner(
                 table,
@@ -962,7 +991,7 @@ impl DirectSenderCore {
         T: TryInto<TableName<'t>>,
         crate::Error: From<T::Error>,
     {
-        let table: TableName<'t> = table.try_into()?;
+        let table: TableName<'t> = table.try_into().map_err(not_delivered_error)?;
         self.backend
             .flush_arrow_batch_inner(
                 table,
@@ -986,7 +1015,7 @@ impl DirectSenderCore {
         T: TryInto<TableName<'t>>,
         crate::Error: From<T::Error>,
     {
-        let table: TableName<'t> = table.try_into()?;
+        let table: TableName<'t> = table.try_into().map_err(not_delivered_error)?;
         self.backend
             .flush_arrow_batch_inner(
                 table,
@@ -1011,8 +1040,9 @@ impl DirectSenderCore {
         T: TryInto<TableName<'t>>,
         crate::Error: From<T::Error>,
     {
-        let table: TableName<'t> = table.try_into()?;
-        let ts_col_idx = arrow_batch::resolve_ts_column(batch, ts_column)?;
+        let table: TableName<'t> = table.try_into().map_err(not_delivered_error)?;
+        let ts_col_idx = arrow_batch::resolve_ts_column(batch, ts_column)
+            .map_err(|e| e.with_not_delivered(true))?;
         self.backend
             .flush_arrow_batch_inner(
                 table,
@@ -1084,20 +1114,31 @@ impl DirectColumnBackend {
         // Pending deferred frames die uncommitted with the connection, so a
         // failure before this sync's commit frame could reach the wire is
         // genuinely not-delivered and a whole-operation resend is safe —
-        // unless a mid-split internal sync already committed a prefix
-        // (`commit_since_sync`): then the same sites must report
-        // delivery-unknown or a blind resend would duplicate that prefix.
+        // unless an earlier non-deferred publication or mid-split internal
+        // sync already committed a prefix (`commit_since_sync`): then the same
+        // sites must report delivery-unknown or a blind resend would duplicate
+        // that prefix.
         let first_frame_sent = self.first_frame_sent;
         let mut commit_chunk = Chunk::new("");
-        let mut result = self.flush_inner(&mut commit_chunk, WaitForAck::Yes(ack_level));
+        let result = self.flush_inner(&mut commit_chunk, WaitForAck::Yes(ack_level));
         self.first_frame_sent = first_frame_sent;
-        if self.commit_since_sync {
-            result = result.map_err(deny_retry_after_partial);
-        }
         result.map_err(FlushFailure::into_error)
     }
 
     fn flush_inner(
+        &mut self,
+        chunk: &mut Chunk<'_>,
+        wait: WaitForAck,
+    ) -> std::result::Result<(), FlushFailure> {
+        let result = self.flush_inner_impl(chunk, wait);
+        if self.commit_since_sync {
+            result.map_err(deny_retry_after_prior_commit)
+        } else {
+            result
+        }
+    }
+
+    fn flush_inner_impl(
         &mut self,
         chunk: &mut Chunk<'_>,
         wait: WaitForAck,
@@ -1163,6 +1204,14 @@ impl DirectColumnBackend {
                     None => return Err(direct_not_delivered(err)),
                 }
             }
+        }
+
+        // A successful non-deferred data publication is a commit boundary.
+        // The publish-only API does not wait for its ACK, so a later failure
+        // cannot make a whole-source replay safe merely because that later
+        // frame itself was provably not delivered.
+        if !defer_commit && chunk.row_count() != 0 {
+            self.commit_since_sync = true;
         }
 
         // Once published, the chunk is no longer needed for completion/replay
@@ -1344,6 +1393,24 @@ impl DirectColumnBackend {
         overrides: &[ArrowColumnOverride<'_>],
         wait: WaitForAck,
     ) -> std::result::Result<(), FlushFailure> {
+        let result = self.flush_arrow_batch_inner_impl(table, batch, ts, overrides, wait);
+        if self.commit_since_sync {
+            result.map_err(deny_retry_after_prior_commit)
+        } else {
+            result
+        }
+    }
+
+    #[cfg(feature = "arrow-ingress")]
+    #[allow(clippy::too_many_arguments)]
+    fn flush_arrow_batch_inner_impl(
+        &mut self,
+        table: TableName<'_>,
+        batch: &RecordBatch,
+        ts: ArrowTsSource,
+        overrides: &[ArrowColumnOverride<'_>],
+        wait: WaitForAck,
+    ) -> std::result::Result<(), FlushFailure> {
         let defer_commit = match wait {
             WaitForAck::No => self.first_frame_sent,
             WaitForAck::Yes(level) => {
@@ -1399,6 +1466,10 @@ impl DirectColumnBackend {
                     None => return Err(direct_not_delivered(err)),
                 }
             }
+        }
+
+        if !defer_commit && batch.num_rows() != 0 {
+            self.commit_since_sync = true;
         }
 
         if let WaitForAck::Yes(level) = wait {
@@ -2148,5 +2219,27 @@ mod tests {
         let still = deny_retry_after_partial(du);
         assert!(!still.is_not_delivered());
         assert!(still.into_error().in_doubt());
+    }
+
+    #[test]
+    fn prior_commit_preserves_current_input_for_reexport_but_denies_source_replay() {
+        use super::{FlushFailure, deny_retry_after_prior_commit};
+        use crate::{Error, ErrorCode};
+
+        let nd = FlushFailure::NotDelivered(Error::new(ErrorCode::SocketError, "boom"));
+        let classified = deny_retry_after_prior_commit(nd);
+        assert!(
+            classified.is_not_delivered(),
+            "the classified enum must retain current-input precision"
+        );
+        let err = classified.into_error();
+        assert!(
+            err.in_doubt(),
+            "the public error must still block replay from the earlier boundary"
+        );
+        assert!(
+            err.not_delivered(),
+            "collapsing to Error must preserve that this input is safe to retry"
+        );
     }
 }

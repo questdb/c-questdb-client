@@ -30,12 +30,19 @@ as soon as it exists.
 | C language | C11 |
 | C++ language | C++17 |
 | CMake | 3.15 |
-| Arrow crate | `>=58, <60` |
+| Published `questdb-rs` Arrow crate | `>=58, <60` |
+| `questdb-rs-ffi` artifact Arrow crate | `=59.0.0` |
 | Polars crates | `>=0.52, <0.55` |
 
 Rust 1.91.1 applies to `questdb-rs`, all features advertised on docs.rs, and
 the Rust FFI crate used by C and C++. CI also tests current stable, beta, and
 nightly Rust.
+
+The published Rust library keeps its compatible Arrow range for downstream
+resolution. The unpublished FFI crate used by C/Python artifacts requires
+Arrow 59.0.0, and its tracked lockfile pins the complete Arrow implementation
+family to that version. Artifact builds use the lockfile so the version-specific
+C Data Interface preflight cannot silently resolve a different implementation.
 
 The supported native platforms are Linux, macOS, and Windows. CI covers GCC or
 Clang on Linux, Apple Clang on macOS, and the MSVC toolsets installed on the

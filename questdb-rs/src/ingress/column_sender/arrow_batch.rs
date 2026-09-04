@@ -49,7 +49,7 @@ use arrow::buffer::NullBuffer;
 use arrow::datatypes::{DataType, Field, SchemaRef, TimeUnit};
 
 use crate::error::{Error, ErrorCode};
-use crate::ingress::buffer::{QwpWsSymbolHasher, SymbolGlobalDict};
+use crate::ingress::buffer::{QwpWsSymbolHasher, SymbolGlobalDict, geohash_precision_needs_bitmap};
 use crate::ingress::{ColumnName, TableName};
 use crate::{Result, fmt};
 
@@ -353,12 +353,11 @@ fn classify_override(field: &Field, ov: ArrowColumnOverride<'_>) -> Result<Colum
 
 pub(crate) fn classify_with_override(
     field: &Field,
-    array: &dyn Array,
     ov: Option<ArrowColumnOverride<'_>>,
 ) -> Result<ColumnKind> {
     match ov {
         Some(ov) => classify_override(field, ov),
-        None => classify(field, array),
+        None => classify(field),
     }
 }
 
@@ -387,7 +386,7 @@ fn is_geohash_storage(dt: &DataType) -> bool {
     )
 }
 
-pub(crate) fn classify(field: &Field, _array: &dyn Array) -> Result<ColumnKind> {
+pub(crate) fn classify(field: &Field) -> Result<ColumnKind> {
     let md_type = field
         .metadata()
         .get(crate::arrow_metadata::COLUMN_TYPE)
@@ -2075,48 +2074,24 @@ fn write_geohash_payload(out: &mut Vec<u8>, arr: &dyn Array, bits: u8) -> Result
     let label = "GEOHASH column";
     try_reserve_bytes(out, 1 + non_null * elem, label)?;
     write_qwp_varint(out, bits as u64);
-    let dt = arr.data_type();
-    match dt {
-        DataType::Int8 => {
-            let a = arr.as_any().downcast_ref::<Int8Array>().unwrap();
+    macro_rules! write_signed {
+        ($array_ty:ty, $unsigned_ty:ty) => {{
+            let a = arr.as_any().downcast_ref::<$array_ty>().unwrap();
             for row in 0..row_count {
                 if arr.is_null(row) {
                     continue;
                 }
-                let v = a.value(row) as u64;
-                out.extend_from_slice(&v.to_le_bytes()[..elem]);
+                let value = a.value(row) as $unsigned_ty as u64;
+                out.extend_from_slice(&value.to_le_bytes()[..elem]);
             }
-        }
-        DataType::Int16 => {
-            let a = arr.as_any().downcast_ref::<Int16Array>().unwrap();
-            for row in 0..row_count {
-                if arr.is_null(row) {
-                    continue;
-                }
-                let v = a.value(row) as u64;
-                out.extend_from_slice(&v.to_le_bytes()[..elem]);
-            }
-        }
-        DataType::Int32 => {
-            let a = arr.as_any().downcast_ref::<Int32Array>().unwrap();
-            for row in 0..row_count {
-                if arr.is_null(row) {
-                    continue;
-                }
-                let v = a.value(row) as u64;
-                out.extend_from_slice(&v.to_le_bytes()[..elem]);
-            }
-        }
-        DataType::Int64 => {
-            let a = arr.as_any().downcast_ref::<Int64Array>().unwrap();
-            for row in 0..row_count {
-                if arr.is_null(row) {
-                    continue;
-                }
-                let v = a.value(row) as u64;
-                out.extend_from_slice(&v.to_le_bytes()[..elem]);
-            }
-        }
+        }};
+    }
+
+    match arr.data_type() {
+        DataType::Int8 => write_signed!(Int8Array, u8),
+        DataType::Int16 => write_signed!(Int16Array, u16),
+        DataType::Int32 => write_signed!(Int32Array, u32),
+        DataType::Int64 => write_signed!(Int64Array, u64),
         other => {
             return Err(fmt!(
                 ArrowIngest,
@@ -3269,16 +3244,19 @@ pub(crate) fn write_arrow_column_body(
     // is > 0 (so the bitmap is written from the real buffer). A count and buffer
     // that disagree cannot desync the frame here.
     let null_count = arr.null_count();
-    let use_bitmap = kind_supports_sparse_nulls(kind) && null_count > 0;
+    let use_bitmap = kind_supports_sparse_nulls(kind)
+        && (null_count > 0
+            || matches!(
+                kind,
+                ColumnKind::Geohash(bits) if geohash_precision_needs_bitmap(bits)
+            ));
     out.push(u8::from(use_bitmap));
     if use_bitmap {
-        let nulls = arr.nulls().ok_or_else(|| {
-            fmt!(
-                ArrowIngest,
-                "column: validity-bitmap encoding required but Arrow array reports no NullBuffer"
-            )
-        })?;
-        write_qwp_bitmap_from_arrow(out, nulls)?;
+        if let Some(nulls) = arr.nulls() {
+            write_qwp_bitmap_from_arrow(out, nulls)?;
+        } else {
+            out.resize(out.len() + arr.len().div_ceil(8), 0);
+        }
     }
     let le_target = cfg!(target_endian = "little");
     let le_no_nulls = le_target && null_count == 0;
@@ -4057,8 +4035,8 @@ fn encode_arrow_batch_into_mode(
         let ov = overrides_by_column
             .as_ref()
             .and_then(|by_column| by_column[idx]);
-        let kind = classify_with_override(field, batch.column(idx).as_ref(), ov)
-            .map_err(|e| decorate_column(e, field.name()))?;
+        let kind =
+            classify_with_override(field, ov).map_err(|e| decorate_column(e, field.name()))?;
         classified.push(ClassifiedColumn {
             name: col_name,
             kind,
@@ -5637,6 +5615,24 @@ mod tests {
     }
 
     #[test]
+    fn geohash_arrow_forwards_value_that_does_not_fit_precision() {
+        let arr = Int16Array::from(vec![127, 128]);
+        let mut out = Vec::new();
+        write_arrow_column_body(&mut out, ColumnKind::Geohash(7), &arr, None).unwrap();
+        assert_eq!(out, vec![0, 7, 127, 128]);
+    }
+
+    #[test]
+    fn byte_aligned_geohash_uses_bitmap_to_preserve_max_value() {
+        // Int8 -1 is the raw 8-bit GEOHASH value 0xff. Without a bitmap,
+        // QWP would interpret that all-ones value as its null sentinel.
+        let arr = Int8Array::from(vec![-1]);
+        let mut out = Vec::new();
+        write_arrow_column_body(&mut out, ColumnKind::Geohash(8), &arr, None).unwrap();
+        assert_eq!(out, vec![1, 0, 8, 0xff]);
+    }
+
+    #[test]
     fn designated_ts_with_null_rejects() {
         let mut payload = Int64Builder::new();
         payload.append_value(1);
@@ -5698,8 +5694,7 @@ mod tests {
     #[test]
     fn uint8_widens_to_int_classifier() {
         let field = Field::new("v", DataType::UInt8, true);
-        let arr = arrow::array::UInt8Array::from(vec![0u8, 1, u8::MAX]);
-        let kind = classify(&field, &arr).unwrap();
+        let kind = classify(&field).unwrap();
         assert!(matches!(kind, ColumnKind::U8WidenToI32));
         assert_eq!(wire_type_byte(kind, false), QWP_TYPE_INT);
     }
@@ -5707,8 +5702,7 @@ mod tests {
     #[test]
     fn uint16_widens_to_int_classifier() {
         let field = Field::new("v", DataType::UInt16, true);
-        let arr = arrow::array::UInt16Array::from(vec![0u16, 1, u16::MAX]);
-        let kind = classify(&field, &arr).unwrap();
+        let kind = classify(&field).unwrap();
         assert!(matches!(kind, ColumnKind::U16WidenToI32));
         assert_eq!(wire_type_byte(kind, false), QWP_TYPE_INT);
     }
@@ -5716,8 +5710,7 @@ mod tests {
     #[test]
     fn int8_widens_to_int_classifier() {
         let field = Field::new("v", DataType::Int8, true);
-        let arr = arrow::array::Int8Array::from(vec![0i8, -1, 127]);
-        let kind = classify(&field, &arr).unwrap();
+        let kind = classify(&field).unwrap();
         assert!(matches!(kind, ColumnKind::I8WidenToI32));
         assert_eq!(wire_type_byte(kind, false), QWP_TYPE_INT);
     }
@@ -5725,8 +5718,7 @@ mod tests {
     #[test]
     fn int16_widens_to_int_classifier() {
         let field = Field::new("v", DataType::Int16, true);
-        let arr = arrow::array::Int16Array::from(vec![0i16, -1, i16::MAX]);
-        let kind = classify(&field, &arr).unwrap();
+        let kind = classify(&field).unwrap();
         assert!(matches!(kind, ColumnKind::I16WidenToI32));
         assert_eq!(wire_type_byte(kind, false), QWP_TYPE_INT);
     }
@@ -5734,8 +5726,7 @@ mod tests {
     #[test]
     fn int32_widens_to_long_classifier() {
         let field = Field::new("v", DataType::Int32, true);
-        let arr = arrow::array::Int32Array::from(vec![0i32, -1, i32::MAX]);
-        let kind = classify(&field, &arr).unwrap();
+        let kind = classify(&field).unwrap();
         assert!(matches!(kind, ColumnKind::I32WidenToI64));
         assert_eq!(wire_type_byte(kind, false), QWP_TYPE_LONG);
     }
@@ -5744,8 +5735,7 @@ mod tests {
     fn int8_byte_metadata_override_preserves_byte_wire() {
         let field = Field::new("v", DataType::Int8, true)
             .with_metadata(metadata(&[(crate::arrow_metadata::COLUMN_TYPE, "byte")]));
-        let arr = arrow::array::Int8Array::from(vec![1i8, 2, 3]);
-        let kind = classify(&field, &arr).unwrap();
+        let kind = classify(&field).unwrap();
         assert!(matches!(kind, ColumnKind::I8));
         assert_eq!(wire_type_byte(kind, false), QWP_TYPE_BYTE);
     }
@@ -5754,8 +5744,7 @@ mod tests {
     fn int16_short_metadata_override_preserves_short_wire() {
         let field = Field::new("v", DataType::Int16, true)
             .with_metadata(metadata(&[(crate::arrow_metadata::COLUMN_TYPE, "short")]));
-        let arr = arrow::array::Int16Array::from(vec![1i16, 2, 3]);
-        let kind = classify(&field, &arr).unwrap();
+        let kind = classify(&field).unwrap();
         assert!(matches!(kind, ColumnKind::I16));
         assert_eq!(wire_type_byte(kind, false), QWP_TYPE_SHORT);
     }
@@ -5764,8 +5753,7 @@ mod tests {
     fn int32_int_metadata_override_preserves_int_wire() {
         let field = Field::new("v", DataType::Int32, true)
             .with_metadata(metadata(&[(crate::arrow_metadata::COLUMN_TYPE, "int")]));
-        let arr = arrow::array::Int32Array::from(vec![1i32, 2, 3]);
-        let kind = classify(&field, &arr).unwrap();
+        let kind = classify(&field).unwrap();
         assert!(matches!(kind, ColumnKind::I32));
         assert_eq!(wire_type_byte(kind, false), QWP_TYPE_INT);
     }
@@ -7760,7 +7748,6 @@ mod tests {
 
     #[test]
     fn contradictory_long256_and_arrow_uuid_metadata_is_rejected_for_binary_storage() {
-        let nulls = arrow::array::NullArray::new(0);
         for dtype in [
             DataType::Binary,
             DataType::LargeBinary,
@@ -7772,7 +7759,7 @@ mod tests {
                 (crate::arrow_metadata::COLUMN_TYPE, "long256"),
                 (crate::arrow_metadata::ARROW_EXTENSION_NAME, "arrow.uuid"),
             ]));
-            let err = classify(&field, &nulls).unwrap_err();
+            let err = classify(&field).unwrap_err();
             assert_eq!(err.code(), ErrorCode::ArrowIngest);
             assert!(
                 err.msg().contains("contradictory binary type metadata"),
@@ -7789,11 +7776,7 @@ mod tests {
                 (crate::arrow_metadata::COLUMN_TYPE, "uuid"),
                 (crate::arrow_metadata::ARROW_EXTENSION_NAME, "arrow.uuid"),
             ]));
-        let nulls = arrow::array::NullArray::new(0);
-        assert!(matches!(
-            classify(&field, &nulls).unwrap(),
-            ColumnKind::Uuid
-        ));
+        assert!(matches!(classify(&field).unwrap(), ColumnKind::Uuid));
     }
 
     #[test]
@@ -7802,8 +7785,7 @@ mod tests {
             (crate::arrow_metadata::COLUMN_TYPE, "symbol"),
             (crate::arrow_metadata::SYMBOL, "false"),
         ]));
-        let nulls = arrow::array::NullArray::new(0);
-        let err = classify(&field, &nulls).unwrap_err();
+        let err = classify(&field).unwrap_err();
         assert!(
             err.msg().contains("column_type='symbol'")
                 && err.msg().contains("questdb.symbol=false"),
@@ -7856,7 +7838,6 @@ mod tests {
 
     #[test]
     fn geohash_column_type_requires_valid_bits_for_every_signed_width() {
-        let nulls = arrow::array::NullArray::new(0);
         for dtype in [
             DataType::Int8,
             DataType::Int16,
@@ -7872,7 +7853,7 @@ mod tests {
                     None => vec![(crate::arrow_metadata::COLUMN_TYPE, "geohash")],
                 };
                 let field = Field::new("g", dtype.clone(), true).with_metadata(metadata(&pairs));
-                let err = classify(&field, &nulls).unwrap_err();
+                let err = classify(&field).unwrap_err();
                 assert_eq!(err.code(), ErrorCode::ArrowIngest);
                 assert!(
                     err.msg().contains("geohash_bits"),
@@ -7885,7 +7866,6 @@ mod tests {
 
     #[test]
     fn known_metadata_claims_on_incompatible_arrow_types_are_rejected() {
-        let nulls = arrow::array::NullArray::new(0);
         let cases = [
             (
                 DataType::Int64,
@@ -7915,7 +7895,7 @@ mod tests {
         ];
         for (dtype, pairs, expected) in cases {
             let field = Field::new("v", dtype.clone(), true).with_metadata(metadata(&pairs));
-            let err = classify(&field, &nulls).unwrap_err();
+            let err = classify(&field).unwrap_err();
             assert_eq!(err.code(), ErrorCode::ArrowIngest);
             assert!(
                 err.msg().contains(expected),

@@ -4096,6 +4096,10 @@ impl QwpWsColumnBuffer {
             kind_supports_sparse_nulls(self.kind),
             row_count,
             self.non_null_count,
+        ) || matches!(
+            &self.values,
+            QwpWsColumnValues::Geohash { precision_bits, .. }
+                if geohash_precision_needs_bitmap(*precision_bits)
         )
     }
 
@@ -6246,6 +6250,7 @@ impl ColumnStats {
     fn payload_len_parts(
         kind: ColumnKind,
         supports_sparse_nulls: bool,
+        geohash_precision_bits: u8,
         row_count: usize,
         non_null_count: u32,
         variable_data_len: usize,
@@ -6253,7 +6258,9 @@ impl ColumnStats {
         symbol_row_index_bytes: usize,
         dict_count: u32,
     ) -> crate::Result<usize> {
-        let uses_null_bitmap = uses_null_bitmap(supports_sparse_nulls, row_count, non_null_count);
+        let uses_null_bitmap = uses_null_bitmap(supports_sparse_nulls, row_count, non_null_count)
+            || (kind == ColumnKind::Geohash
+                && geohash_precision_needs_bitmap(geohash_precision_bits));
         let bitmap = if uses_null_bitmap {
             bitmap_bytes(row_count)
         } else {
@@ -6362,6 +6369,7 @@ impl ColumnStats {
         Self::payload_len_parts(
             self.kind,
             self.supports_sparse_nulls,
+            self.geohash_precision_bits,
             row_count,
             self.non_null_count,
             self.variable_data_len,
@@ -6659,6 +6667,8 @@ impl ColumnStats {
 
     fn uses_null_bitmap(&self, row_count: usize) -> bool {
         uses_null_bitmap(self.supports_sparse_nulls, row_count, self.non_null_count)
+            || (self.kind == ColumnKind::Geohash
+                && geohash_precision_needs_bitmap(self.geohash_precision_bits))
     }
 }
 
@@ -7038,7 +7048,9 @@ impl RowGroupPlanner {
                         col.supports_sparse_nulls,
                         old_row_count,
                         undo.non_null_count,
-                    ) {
+                    ) || (col.kind == ColumnKind::Geohash
+                        && geohash_precision_needs_bitmap(undo.geohash_precision_bits))
+                    {
                         touched_old_active_bitmap_column_count += 1;
                     }
                     if col.uses_null_bitmap(new_row_count) {
@@ -7050,6 +7062,7 @@ impl RowGroupPlanner {
                 - ColumnStats::payload_len_parts(
                     col.kind,
                     col.supports_sparse_nulls,
+                    undo.geohash_precision_bits,
                     old_row_count,
                     undo.non_null_count,
                     undo.variable_data_len,
@@ -7341,6 +7354,13 @@ fn bitmap_bytes(value_count: usize) -> usize {
 
 fn uses_null_bitmap(supports_sparse_nulls: bool, row_count: usize, non_null_count: u32) -> bool {
     supports_sparse_nulls && (non_null_count as usize) < row_count
+}
+
+/// Byte-aligned GEOHASH values need an explicit validity bitmap even when
+/// every row is present. Without it, the maximum valid value is identical to
+/// QWP's all-ones sentinel for a null value of the same storage width.
+pub(crate) fn geohash_precision_needs_bitmap(precision_bits: u8) -> bool {
+    precision_bits.is_multiple_of(8)
 }
 
 fn kind_supports_sparse_nulls(kind: ColumnKind) -> bool {
@@ -10442,9 +10462,10 @@ mod tests {
     }
 
     /// Parse a single-table WS replay message whose first column is a GEOHASH
-    /// and return `(row_count, precision_bits)` read straight off the wire.
+    /// and return `(row_count, uses_null_bitmap, precision_bits)` read straight
+    /// off the wire.
     #[cfg(feature = "_sender-qwp-ws")]
-    fn ws_first_geohash_precision(message: &[u8]) -> (u64, u64) {
+    fn ws_first_geohash_header(message: &[u8]) -> (u64, bool, u64) {
         let (_, _, mut pos) = ws_delta_entries(message);
         let table_count = u16::from_le_bytes([message[6], message[7]]) as usize;
         assert_eq!(table_count, 1, "helper expects exactly one table");
@@ -10467,7 +10488,32 @@ mod tests {
             pos += row_count.div_ceil(8) as usize;
         }
         let precision = read_test_varint(message, &mut pos);
-        (row_count, precision)
+        (row_count, uses_null_bitmap == 1, precision)
+    }
+
+    #[cfg(feature = "_sender-qwp-ws")]
+    #[test]
+    fn qwp_ws_byte_aligned_geohash_uses_bitmap_and_wide_values_are_accepted() {
+        let mut buf = QwpWsColumnarBuffer::new(127);
+        let mut scratch = QwpWsEncodeScratch::new();
+        let mut global_dict = SymbolGlobalDict::new();
+
+        buf.table("pos")
+            .unwrap()
+            .column_geohash("g", 0xff, 8)
+            .unwrap()
+            .at_now()
+            .unwrap();
+        buf.encode_ws_replay_message(&mut scratch, &mut global_dict, QWP_VERSION_1)
+            .unwrap();
+        assert_eq!(ws_first_geohash_header(&scratch.message), (1, true, 8));
+
+        buf.clear();
+        buf.table("pos").unwrap();
+        buf.column_geohash("g", 32, 5).unwrap().at_now().unwrap();
+        buf.encode_ws_replay_message(&mut scratch, &mut global_dict, QWP_VERSION_1)
+            .unwrap();
+        assert_eq!(ws_first_geohash_header(&scratch.message), (1, false, 5));
     }
 
     /// Regression for the QWP/WS fuzz failure "invalid GeoHash precision: 0".
@@ -10508,7 +10554,7 @@ mod tests {
         buf.encode_ws_replay_message(&mut scratch, &mut global_dict, QWP_VERSION_1)
             .unwrap();
 
-        let (row_count, precision) = ws_first_geohash_precision(&scratch.message);
+        let (row_count, _, precision) = ws_first_geohash_header(&scratch.message);
         assert_eq!(row_count, 1);
         assert_eq!(
             precision, 25,
@@ -13348,6 +13394,41 @@ mod tests {
             })
             .collect();
         assert_eq!(got, expected);
+    }
+
+    #[test]
+    fn qwp_byte_aligned_geohash_max_value_is_not_null() {
+        let mut buf = QwpBuffer::new(127);
+        buf.table("t")
+            .unwrap()
+            .column_geohash("g", 0xff, 8)
+            .unwrap();
+        buf.at_now().unwrap();
+        let datagrams = buf.encode_datagrams(64 * 1024).unwrap();
+        let decoded = decode_datagram(&datagrams[0]).unwrap();
+        assert_eq!(
+            decoded.table.rows[0][0],
+            DecodedValue::Geohash {
+                bits: 0xff,
+                precision_bits: 8,
+            }
+        );
+    }
+
+    #[test]
+    fn qwp_column_geohash_value_out_of_range_is_forwarded() {
+        let mut buf = QwpBuffer::new(127);
+        buf.table("t").unwrap().column_geohash("g", 32, 5).unwrap();
+        buf.at_now().unwrap();
+        let datagrams = buf.encode_datagrams(64 * 1024).unwrap();
+        let decoded = decode_datagram(&datagrams[0]).unwrap();
+        assert_eq!(
+            decoded.table.rows[0][0],
+            DecodedValue::Geohash {
+                bits: 32,
+                precision_bits: 5,
+            }
+        );
     }
 
     #[test]

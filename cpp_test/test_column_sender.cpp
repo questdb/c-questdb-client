@@ -523,9 +523,63 @@ TEST_CASE("flush rejects oversized table name")
     int64_t t[] = {1};
     chunk.column_i64("v", v, 1).at_nanos(t, 1);
 
-    CHECK_THROWS_AS(conn.flush(chunk), qdb::line_sender_error);
+    try
+    {
+        conn.flush(chunk);
+        FAIL("oversized table name must fail before publication");
+    }
+    catch (const qdb::line_sender_error& e)
+    {
+        CHECK(e.not_delivered());
+        CHECK_FALSE(e.in_doubt());
+    }
     CHECK(chunk.row_count() == 1);
     conn.drop_on_return();
+}
+
+TEST_CASE("direct C flush separates current chunk retry from source replay")
+{
+    // Keep the mock waiting beyond the sender's in-flight capacity so the
+    // failure is the local pre-write reserve guard, not a server disconnect.
+    qm::Script script;
+    script.reserve(256);
+    for (size_t i = 0; i < 256; ++i)
+        script.emplace_back(qm::ActionAwaitClientFrame{0x51});
+    auto mock = std::make_unique<qm::MockServer>(
+        std::vector<qm::Script>{std::move(script)});
+
+    const std::string conf = conf_for(mock->addr());
+    line_sender_error* err = nullptr;
+    qwp_direct_sender* sender =
+        qwp_direct_sender_from_conf(conf.c_str(), conf.size(), &err);
+    REQUIRE(sender != nullptr);
+    REQUIRE(err == nullptr);
+
+    qdb::column_chunk chunk{"trades"};
+    bool failed = false;
+    for (int64_t i = 0; i < 256; ++i)
+    {
+        const int64_t qty[] = {i};
+        const int64_t ts[] = {i + 1};
+        chunk.column_i64("qty", qty, 1).at_nanos(ts, 1);
+        if (!qwp_direct_sender_flush(sender, chunk.c_ptr(), &err))
+        {
+            failed = true;
+            break;
+        }
+    }
+
+    REQUIRE(failed);
+    REQUIRE(err != nullptr);
+    // The retained current chunk never reached the wire, but the first eager
+    // publication may already have committed. These are deliberately
+    // independent answers for two different replay scopes.
+    CHECK(line_sender_error_not_delivered(err));
+    CHECK(line_sender_error_in_doubt(err));
+    CHECK(chunk.row_count() == 1);
+
+    line_sender_error_free(err);
+    questdb_db_drop_direct_sender(nullptr, sender);
 }
 
 TEST_CASE("wait rejects durable ACK without opt-in and keeps the chunk")
