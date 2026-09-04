@@ -475,6 +475,49 @@ fn a_401_from_an_expired_token_is_retried_once_with_a_rotated_one() {
 }
 
 #[test]
+fn a_provider_failure_after_401_replaces_the_stale_rejection() {
+    // Cover both places a 401 can trigger credential rotation: the first send,
+    // and a send reached after an ordinary retryable response.
+    for statuses in [vec![401], vec![503, 401]] {
+        let expected_attempts = statuses.len();
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let mock = {
+            let attempts = Arc::clone(&attempts);
+            MockServer::start(move |_m, path, _b| match path {
+                "/write" => {
+                    let attempt = attempts.fetch_add(1, Ordering::SeqCst);
+                    (statuses[attempt], String::new())
+                }
+                _ => (404, "{}".to_string()),
+            })
+        };
+
+        let provider_calls = Arc::new(AtomicUsize::new(0));
+        let mut sender = sender_with_provider(&mock, {
+            let provider_calls = Arc::clone(&provider_calls);
+            move || {
+                if provider_calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                    Ok("stale".to_string())
+                } else {
+                    Err(questdb::Error::new(
+                        questdb::ErrorCode::AuthError,
+                        "refresh failed",
+                    ))
+                }
+            }
+        })
+        .expect("build sender");
+
+        let error =
+            send_one_row(&mut sender).expect_err("the second provider failure must end the flush");
+        assert_eq!(error.code(), questdb::ErrorCode::SocketError);
+        assert!(error.msg().contains("refresh failed"), "{error}");
+        assert_eq!(attempts.load(Ordering::SeqCst), expected_attempts);
+        assert_eq!(provider_calls.load(Ordering::SeqCst), 2);
+    }
+}
+
+#[test]
 fn a_401_with_an_unchanged_token_is_not_retried() {
     // The other half: when the provider hands back the same credential the 401
     // is a genuine rejection, not an expiry, and must stand without spending a

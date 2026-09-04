@@ -514,7 +514,7 @@ impl Sender {
                             Ok(())
                         }
                     }
-                    Err(err) => Err(crate::error::Error::from_ureq_error(err, &state.url)),
+                    Err(err) => Err(err),
                 }
             }
             #[cfg(feature = "sync-sender-qwp-udp")]

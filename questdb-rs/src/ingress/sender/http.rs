@@ -373,7 +373,6 @@ pub(super) fn parse_http_error(http_status_code: u16, response: Response<Body>) 
     }
 }
 
-#[allow(clippy::result_large_err)] // `ureq::Error` is large enough to cause this warning.
 fn retry_http_send(
     state: &SyncHttpHandlerState,
     buf: &[u8],
@@ -382,7 +381,7 @@ fn retry_http_send(
     retry_max_backoff: Duration,
     auth: Option<&str>,
     mut last_rep: Result<Response<Body>, ureq::Error>,
-) -> Result<Response<Body>, ureq::Error> {
+) -> crate::Result<Response<Body>> {
     let mut rng = rand::rng();
     let retry_end = std::time::Instant::now() + retry_timeout;
     let max_backoff_ms = clamp_backoff_ms(retry_max_backoff);
@@ -418,7 +417,7 @@ fn retry_http_send(
             retry_sleep(retry_interval_ms, jitter_ms)
         };
         if (std::time::Instant::now() + to_sleep) > retry_end {
-            return last_rep;
+            return finish_http_send(state, last_rep);
         }
         sleep(to_sleep);
         if let Ok(last_rep) = last_rep {
@@ -430,7 +429,7 @@ fn retry_http_send(
         (need_retry, last_rep) = state.send_request(buf, request_timeout, attempt_auth);
         if !need_retry {
             if !auth_retry_used
-                && let Some(value) = rotated_auth_after_401(state, &last_rep, attempt_auth)
+                && let Some(value) = rotated_auth_after_401(state, &last_rep, attempt_auth)?
             {
                 auth_retry_used = true;
                 refreshed = Some(value);
@@ -442,7 +441,7 @@ fn retry_http_send(
                 retry_now = true;
                 continue;
             }
-            return last_rep;
+            return finish_http_send(state, last_rep);
         }
         retry_interval_ms = retry_interval_ms.saturating_mul(2).min(max_backoff_ms);
     }
@@ -464,23 +463,32 @@ fn retry_sleep(retry_interval_ms: i32, jitter_ms: i32) -> Duration {
 
 /// A rotated credential worth one more attempt after a 401, if there is one.
 ///
-/// `None` means do not retry: the credential cannot rotate, the response was
-/// not a 401, the provider failed, or it handed back the very value that was
-/// just rejected -- which makes this a genuine rejection rather than an expiry,
-/// and spending another request on it would be pointless.
+/// `Ok(None)` means do not retry: the credential cannot rotate, the response
+/// was not a 401, or the provider handed back the very value that was just
+/// rejected. A provider failure is returned so its current classification and
+/// OIDC cause are not replaced by the stale 401.
 fn rotated_auth_after_401(
     state: &SyncHttpHandlerState,
     rep: &Result<Response<Body>, ureq::Error>,
     used: Option<&str>,
-) -> Option<String> {
+) -> crate::Result<Option<String>> {
     if !state.auth.is_rotating() || !matches!(rep, Ok(rep) if rep.status() == 401) {
-        return None;
+        return Ok(None);
     }
-    let value = state.auth.resolve().ok()??.into_owned();
-    (Some(value.as_str()) != used).then_some(value)
+    let Some(value) = state.auth.resolve()? else {
+        return Ok(None);
+    };
+    let value = value.into_owned();
+    Ok((Some(value.as_str()) != used).then_some(value))
 }
 
-#[allow(clippy::result_large_err)] // `ureq::Error` is large enough to cause this warning.
+fn finish_http_send(
+    state: &SyncHttpHandlerState,
+    response: Result<Response<Body>, ureq::Error>,
+) -> crate::Result<Response<Body>> {
+    response.map_err(|error| Error::from_ureq_error(error, &state.url))
+}
+
 pub(super) fn http_send_with_retries(
     state: &SyncHttpHandlerState,
     buf: &[u8],
@@ -488,14 +496,14 @@ pub(super) fn http_send_with_retries(
     retry_timeout: Duration,
     retry_max_backoff: Duration,
     auth: Option<&str>,
-) -> Result<Response<Body>, ureq::Error> {
+) -> crate::Result<Response<Body>> {
     let (need_retry, last_rep) = state.send_request(buf, request_timeout, auth);
     // A 401 is not retryable, so this is where a credential that expired
     // between resolution and the request used to end the flush as a terminal
     // AuthError. Give a rotated credential exactly one more attempt -- and only
     // when the provider actually hands back a different value, so a genuine
     // rejection still costs a single request.
-    if !need_retry && let Some(rotated) = rotated_auth_after_401(state, &last_rep, auth) {
+    if !need_retry && let Some(rotated) = rotated_auth_after_401(state, &last_rep, auth)? {
         if let Ok(rep) = last_rep {
             // Return the connection to the pool before reusing the agent.
             _ = rep.into_body().read_to_vec();
@@ -503,7 +511,7 @@ pub(super) fn http_send_with_retries(
         let (need_retry, last_rep) =
             state.send_request(buf, request_timeout, Some(rotated.as_str()));
         if !need_retry || retry_timeout.is_zero() {
-            return last_rep;
+            return finish_http_send(state, last_rep);
         }
         return retry_http_send(
             state,
@@ -516,7 +524,7 @@ pub(super) fn http_send_with_retries(
         );
     }
     if !need_retry || retry_timeout.is_zero() {
-        return last_rep;
+        return finish_http_send(state, last_rep);
     }
 
     retry_http_send(
@@ -727,5 +735,35 @@ mod tests {
             Ok::<_, crate::Error>("tok".to_string())
         }));
         assert_eq!(ok.resolve().unwrap().as_deref(), Some("Bearer tok"));
+    }
+
+    #[cfg(feature = "_oidc")]
+    #[test]
+    fn rotation_preserves_provider_error_after_401() {
+        let state = SyncHttpHandlerState {
+            agent: ureq::Agent::new_with_defaults(),
+            url: "http://127.0.0.1/write".to_string(),
+            auth: HttpAuth::Provider(crate::token_provider::TokenProvider::new(|| {
+                Err::<String, crate::Error>(
+                    crate::oidc::OidcError::network("refresh failed").into(),
+                )
+            })),
+            config: HttpConfig::default(),
+        };
+        let response = Ok::<_, ureq::Error>(
+            Response::builder()
+                .status(401)
+                .body(Body::builder().data("unauthorized"))
+                .unwrap(),
+        );
+
+        let error = rotated_auth_after_401(&state, &response, Some("Bearer expired"))
+            .expect_err("the second provider failure was replaced by the stale 401");
+        assert_eq!(error.code(), crate::ErrorCode::SocketError);
+        assert_eq!(
+            error.oidc_error().map(crate::oidc::OidcError::kind),
+            Some(crate::oidc::OidcErrorKind::Network)
+        );
+        assert!(error.msg().contains("refresh failed"));
     }
 }
