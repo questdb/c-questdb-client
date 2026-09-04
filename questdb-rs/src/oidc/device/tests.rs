@@ -702,6 +702,76 @@ fn happy_path_returns_access_token() {
 }
 
 #[test]
+fn mixed_case_bearer_token_type_is_normalized() {
+    let mock = MockServer::start(|method, path, _body| match (method, path) {
+        ("POST", "/device") => (200, device_response()),
+        ("POST", "/token") => (
+            200,
+            r#"{"access_token":"AT-1","token_type":"bEaReR","expires_in":300}"#.to_string(),
+        ),
+        _ => (404, "{}".to_string()),
+    });
+    let auth = explicit_auth(&mock, false);
+
+    assert_eq!(sign_in_and_token(&auth).unwrap(), "AT-1");
+    assert_eq!(
+        auth.token_set().as_ref().map(TokenSet::token_type),
+        Some("Bearer")
+    );
+}
+
+#[test]
+fn initial_non_bearer_token_type_is_rejected() {
+    let mock = MockServer::start(|method, path, _body| match (method, path) {
+        ("POST", "/device") => (200, device_response()),
+        ("POST", "/token") => (
+            200,
+            r#"{"access_token":"AT-1","token_type":"DPoP","expires_in":300}"#.to_string(),
+        ),
+        _ => (404, "{}".to_string()),
+    });
+    let auth = explicit_auth(&mock, false);
+
+    let error = auth.sign_in().unwrap_err();
+    assert_eq!(error.kind(), OidcErrorKind::Config);
+    assert!(error.message().contains("unsupported token_type \"DPoP\""));
+    assert!(auth.token_set().is_none(), "unsupported token was cached");
+}
+
+#[test]
+fn refreshed_non_bearer_token_type_is_rejected() {
+    let token_calls = Arc::new(AtomicUsize::new(0));
+    let mock = {
+        let token_calls = Arc::clone(&token_calls);
+        MockServer::start(move |method, path, _body| match (method, path) {
+            ("POST", "/token") => {
+                token_calls.fetch_add(1, Ordering::SeqCst);
+                (
+                    200,
+                    r#"{"access_token":"AT-2","refresh_token":"RT-2","token_type":"DPoP","expires_in":300}"#.to_string(),
+                )
+            }
+            _ => (404, "{}".to_string()),
+        })
+    };
+    let auth = explicit_auth(&mock, false);
+    *auth.tokens.lock().unwrap() = Some(expired_tokens("RT-1"));
+
+    let error = auth.token().unwrap_err();
+    assert_eq!(error.kind(), OidcErrorKind::Config);
+    assert!(error.message().contains("unsupported token_type \"DPoP\""));
+    assert_eq!(token_calls.load(Ordering::SeqCst), 1);
+    let cached = auth
+        .token_set()
+        .expect("the expired parent remains inspectable");
+    assert_eq!(cached.access_token.as_deref(), Some("AT-expired"));
+    assert!(
+        cached.refresh_token.is_none(),
+        "the submitted refresh-token parent remained reusable"
+    );
+}
+
+#[test]
 fn groups_mode_selects_id_token() {
     let mock = MockServer::start(|method, path, _body| match (method, path) {
         ("POST", "/device") => (200, device_response()),
@@ -1848,13 +1918,15 @@ fn lifetime_cap_bounds_refreshable_and_opaque_tokens() {
 
     // No refresh token and an opaque access token: cap the believed lifetime so a
     // hostile or stale `expires_in` cannot wedge the client indefinitely.
-    let ts = auth.tokenset_from_response(
-        &serde_json::json!({
-            "access_token": "AT",
-            "expires_in": long,
-        }),
-        None,
-    );
+    let ts = auth
+        .tokenset_from_response(
+            &serde_json::json!({
+                "access_token": "AT",
+                "expires_in": long,
+            }),
+            None,
+        )
+        .unwrap();
     assert!(ts.refresh_token.is_none());
     assert!(
         (ts.expires_at - ts.issued_at - MAX_EXPIRES_IN as f64).abs() < 1.0,
@@ -1864,14 +1936,16 @@ fn lifetime_cap_bounds_refreshable_and_opaque_tokens() {
 
     // With a refresh token in the response: the cap fires, so a silent refresh
     // re-checks at least hourly (bounding a leaked long-lived access token).
-    let ts = auth.tokenset_from_response(
-        &serde_json::json!({
-            "access_token": "AT",
-            "refresh_token": "RT",
-            "expires_in": long,
-        }),
-        None,
-    );
+    let ts = auth
+        .tokenset_from_response(
+            &serde_json::json!({
+                "access_token": "AT",
+                "refresh_token": "RT",
+                "expires_in": long,
+            }),
+            None,
+        )
+        .unwrap();
     assert!(ts.refresh_token.is_some());
     assert!(
         (ts.expires_at - ts.issued_at - MAX_EXPIRES_IN as f64).abs() < 1.0,
@@ -1883,13 +1957,15 @@ fn lifetime_cap_bounds_refreshable_and_opaque_tokens() {
     // the prior one is carried forward — the effective token can rotate, so the
     // cap MUST still fire. Previously the cap keyed off the response body alone,
     // leaving the carried-forward case uncapped for the sender's whole lifetime.
-    let ts = auth.tokenset_from_response(
-        &serde_json::json!({
-            "access_token": "AT",
-            "expires_in": long,
-        }),
-        Some("carried-RT"),
-    );
+    let ts = auth
+        .tokenset_from_response(
+            &serde_json::json!({
+                "access_token": "AT",
+                "expires_in": long,
+            }),
+            Some("carried-RT"),
+        )
+        .unwrap();
     assert_eq!(ts.refresh_token.as_deref(), Some("carried-RT"));
     assert!(
         (ts.expires_at - ts.issued_at - MAX_EXPIRES_IN as f64).abs() < 1.0,
@@ -4130,7 +4206,7 @@ fn wire_expiry_bounded_by_jwt_exp() {
         "access_token": jwt_with_exp(exp as i64),
         "expires_in": 99_999_999_999i64,
     });
-    let ts = auth.tokenset_from_response(&body, None);
+    let ts = auth.tokenset_from_response(&body, None).unwrap();
     assert!(
         (ts.expires_at() - exp).abs() < 1.5,
         "expires_at not bounded by the JWT exp: {} (exp {exp})",
@@ -4151,7 +4227,7 @@ fn groups_mode_expiry_uses_id_token_exp() {
         "id_token": jwt_with_exp(id_exp as i64),                // short-lived
         "expires_in": 100_000,
     });
-    let ts = auth.tokenset_from_response(&body, None);
+    let ts = auth.tokenset_from_response(&body, None).unwrap();
     assert!(
         (ts.expires_at() - id_exp).abs() < 1.5,
         "groups mode ignored the id_token exp: {} (id_exp {id_exp})",

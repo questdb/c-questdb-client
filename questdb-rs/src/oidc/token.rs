@@ -101,7 +101,8 @@ impl TokenSet {
         self.expires_at
     }
 
-    /// The OAuth `token_type` (`"Bearer"` unless the IdP said otherwise).
+    /// The OAuth `token_type` (`"Bearer"`; other advertised types are rejected
+    /// because QuestDB transports support only the Bearer authorization scheme).
     pub fn token_type(&self) -> &str {
         &self.token_type
     }

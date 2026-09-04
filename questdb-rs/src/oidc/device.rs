@@ -1054,6 +1054,13 @@ impl OidcDeviceAuth {
                 Err(e) if e.kind() == crate::oidc::error::OidcErrorKind::Cancelled => {
                     return Err(e);
                 }
+                // A successful token response using an unsupported
+                // authorization scheme is a terminal client/IdP capability
+                // mismatch, not an expired refresh token. Do not hide it by
+                // starting an interactive device flow.
+                Err(e) if e.kind() == crate::oidc::error::OidcErrorKind::Config => {
+                    return Err(e);
+                }
                 // Refresh token rejected (expired/revoked): fall through.
                 Err(_) => {}
             }
@@ -1820,7 +1827,15 @@ impl OidcDeviceAuth {
             let retry_after = result.retry_after;
 
             if status == 200 {
-                let tokens = self.tokenset_from_response(&body, None);
+                let tokens = match self.tokenset_from_response(&body, None) {
+                    Ok(tokens) => tokens,
+                    Err(error) => {
+                        self.renderer.on_failure(
+                            "Sign-in failed: the identity provider returned an unsupported token type.",
+                        );
+                        return Err(error);
+                    }
+                };
                 if self.has_required_token(&tokens) {
                     return Ok(tokens);
                 }
@@ -1933,7 +1948,7 @@ impl OidcDeviceAuth {
             // Carry the prior refresh token forward (a non-rotating IdP omits it
             // on refresh) and let the lifetime cap see it — see
             // `tokenset_from_response`.
-            return Ok(self.tokenset_from_response(&result.body, Some(refresh_token)));
+            return self.tokenset_from_response(&result.body, Some(refresh_token));
         }
         if is_transient_http_status(result.status) {
             let error = result.body.get("error").and_then(Value::as_str);
@@ -1981,7 +1996,26 @@ impl OidcDeviceAuth {
     /// don't re-send it on a refresh); it is `None` on the initial device flow.
     /// The lifetime cap keys off the *effective* refresh token — fresh or
     /// carried forward — so a non-rotating IdP's long TTL is still capped.
-    fn tokenset_from_response(&self, body: &Value, prior_refresh: Option<&str>) -> TokenSet {
+    fn tokenset_from_response(
+        &self,
+        body: &Value,
+        prior_refresh: Option<&str>,
+    ) -> Result<TokenSet> {
+        // Every attached transport emits the Bearer authorization scheme. Do
+        // not cache a token whose advertised type requires another scheme
+        // (for example DPoP), or persistence would also erase that distinction
+        // and reload it as Bearer after restart. Retain the historical default
+        // for IdPs that omit token_type, and normalize mixed-case Bearer.
+        let token_type = match str_field_val(body.get("token_type")) {
+            Some(value) if value.eq_ignore_ascii_case("Bearer") => "Bearer".to_string(),
+            Some(value) => {
+                let display = strip_control_capped(&value, MAX_IDP_FIELD_CHARS);
+                return Err(OidcError::config(format!(
+                    "The identity provider returned unsupported token_type {display:?}; this client supports only Bearer tokens."
+                )));
+            }
+            None => "Bearer".to_string(),
+        };
         let access_token = safe_token(body.get("access_token"));
         let id_token = safe_token(body.get("id_token"));
         // The effective refresh token: the response's own, else the carried-
@@ -2027,16 +2061,16 @@ impl OidcDeviceAuth {
         } else if refresh_token.is_none() {
             expires_at = expires_at.min(now + MAX_EXPIRES_IN as f64);
         }
-        TokenSet {
+        Ok(TokenSet {
             access_token,
             id_token,
             refresh_token,
             expires_at,
             issued_at: now,
-            token_type: str_field_val(body.get("token_type")).unwrap_or_else(|| "Bearer".into()),
+            token_type,
             scope: str_field_val(body.get("scope")).or_else(|| Some(self.config.scope.clone())),
             sub,
-        }
+        })
     }
 }
 
