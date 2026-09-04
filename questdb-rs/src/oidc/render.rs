@@ -613,6 +613,21 @@ pub(crate) fn safe_target(url: Option<&str>) -> Option<String> {
         return None;
     }
     let host = authority.host();
+    // `Authority::host()` hands back an IPv6 literal in its bracketed form,
+    // `[::1]`, and the byte allowlist below has no brackets -- so every IPv6
+    // verification URI was refused outright: no link, no QR, no browser open,
+    // on a host that is about as un-confusable as one gets. Unwrap it and
+    // require the inside to parse as an address, which is stricter than the
+    // allowlist would have been: a zone id (`%eth0`) is rejected with it.
+    let host = match host.strip_prefix('[').and_then(|h| h.strip_suffix(']')) {
+        Some(inner) => {
+            if inner.parse::<std::net::Ipv6Addr>().is_err() {
+                return None;
+            }
+            inner
+        }
+        None => host,
+    };
     if host.is_empty()
         || !host
             .bytes()
@@ -968,6 +983,24 @@ mod tests {
         // A host that merely *contains* those letters is not an A-label.
         assert!(safe_target(Some("https://xnotxn.example.com/device")).is_some());
         assert!(safe_target(Some("https://example.com/xn--path")).is_some());
+    }
+
+    #[test]
+    fn safe_target_accepts_an_ipv6_literal_host() {
+        // Regression: `Authority::host()` returns the bracketed form, and the
+        // byte allowlist had no brackets, so EVERY IPv6 verification URI was
+        // refused -- no link, no QR, no browser open -- on a host that cannot
+        // be a homoglyph.
+        assert_eq!(
+            safe_target(Some("https://[::1]:8443/device")),
+            Some("https://[::1]:8443/device".to_string())
+        );
+        assert!(safe_target(Some("http://[fe80::1]/device")).is_some());
+        // A zone id is still refused: `%` can misrepresent the destination, and
+        // the address parse rejects it.
+        assert_eq!(safe_target(Some("https://[fe80::1%25eth0]/device")), None);
+        // Brackets are not a way past the host allowlist for a name.
+        assert_eq!(safe_target(Some("https://[not-an-address]/device")), None);
     }
 
     #[test]

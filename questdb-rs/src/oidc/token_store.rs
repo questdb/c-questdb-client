@@ -627,12 +627,19 @@ impl FileTokenStore {
     /// `questdb.client.oidc.token.store.dir` environment variable when set,
     /// otherwise at `${HOME}/.questdb/oidc-tokens/`.
     ///
+    /// The override **must be an absolute path**. A relative one follows the
+    /// process working directory, and `~` is expanded by shells rather than by
+    /// any client runtime, so neither names one stable store — and this setting
+    /// is shared with the Java client, so an ambiguous value would split the
+    /// store across languages instead of sharing it. Either is rejected.
+    ///
     /// Errors if the home directory can't be resolved and no override is set
     /// (e.g. a distroless container with no `HOME`) — set the environment variable
-    /// to an absolute path, or use [`at`](Self::at) explicitly.
+    /// to an absolute path, or use [`at`](Self::at) explicitly, which applies no
+    /// such restriction to a path the caller supplies directly.
     pub fn at_default_location() -> std::io::Result<Self> {
         if let Some(dir) = std::env::var_os(TOKEN_STORE_DIR_ENV).filter(|v| !v.is_empty()) {
-            return Ok(Self::at(PathBuf::from(dir)));
+            return Ok(Self::at(validate_override_dir(PathBuf::from(dir))?));
         }
         let home = home_dir().ok_or_else(|| {
             std::io::Error::new(
@@ -1060,7 +1067,14 @@ impl FileTokenStore {
         // crashed predecessor. Fresh temps are retained until their age proves
         // they are not from a live cross-language writer.
         self.sweep_orphan_temps(key, true);
-        let _ = fsync_directory(&self.directory); // best-effort: persist changes
+        // Fatal, exactly as in `clear_under_lock`, and for the same reason.
+        // The rename above publishes a ROTATED refresh token, and
+        // `persist_if_changed` then writes nothing further until it rotates
+        // again -- so a crash in that window loses the new token and leaves the
+        // consumed parent as what the next start reads, which is the reuse the
+        // whole rotation protocol exists to avoid. Making the directory entry
+        // durable is part of having saved it, not a nicety.
+        fsync_directory(&self.directory)?;
         Ok(())
     }
 
@@ -1189,7 +1203,17 @@ impl TokenStore for FileTokenStore {
         if cancelled() {
             return Err(cancelled_error());
         }
-        if !self.directory.is_dir() {
+        // Only a DEFINITE absence is "nothing to clear". `Path::is_dir()`
+        // reports false for EACCES, ELOOP and EIO just as it does for a missing
+        // directory, so an unreadable store made `clear` report success with
+        // the credential still on disk -- and `discard_credentials` treats that
+        // `Ok` as the durable tombstone it writes before submitting the parent
+        // refresh token, so a restart would replay a consumed one. Every other
+        // entry point here already distinguishes the two (`create_directory`
+        // matches `ErrorKind::NotFound`, `path_is_definitely_absent` uses
+        // `is_err_and(NotFound)`); this one conflated them. Anything we cannot
+        // positively rule out now falls through and surfaces the real error.
+        if path_is_definitely_absent(&self.directory) {
             return Ok(());
         }
         self.with_lock(key, cancelled, || {
@@ -1798,6 +1822,33 @@ fn symlink_leaf_error() -> std::io::Error {
          the plaintext token files could be redirected outside the owner-only \
          directory",
     )
+}
+
+/// Reject a `TOKEN_STORE_DIR_ENV` value that does not name one stable store.
+///
+/// A relative path is resolved against the process working directory at every
+/// use, so a chdir silently moves the store and re-runs the whole device flow,
+/// leaving a second plaintext refresh token behind at the old path. A `~/...`
+/// value is worse: no runtime expands it (a shell does), so this client and
+/// Java both create a directory literally named `~`, while a binding that does
+/// expand it -- as the Python client does for a path handed to its constructor
+/// -- lands somewhere else entirely. This one setting is meant to be shared
+/// across clients, so an ambiguous value has to fail loudly rather than split
+/// the store in two.
+fn validate_override_dir(dir: PathBuf) -> std::io::Result<PathBuf> {
+    if dir.is_absolute() {
+        return Ok(dir);
+    }
+    Err(std::io::Error::new(
+        std::io::ErrorKind::InvalidInput,
+        format!(
+            "the {TOKEN_STORE_DIR_ENV} environment variable must be an absolute \
+             path, but is {dir:?}. A relative path follows the process working \
+             directory, and `~` is expanded by shells rather than by this client, \
+             so neither names one stable store. Use an absolute path, or construct \
+             FileTokenStore::at(dir) explicitly."
+        ),
+    ))
 }
 
 fn path_is_definitely_absent(path: &Path) -> bool {

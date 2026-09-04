@@ -169,6 +169,40 @@ fn token_store_directory_override_key_matches_java() {
 }
 
 #[test]
+fn token_store_directory_override_must_be_absolute() {
+    // The setting is shared with Java, so an ambiguous value splits the store
+    // instead of sharing it. `~/qdb-tokens` is the trap: no runtime expands it,
+    // so this client and Java create a directory literally named `~`, while the
+    // Python client expands a constructor path to `$HOME/qdb-tokens`. A
+    // relative path is the other: it follows the process working directory, so
+    // a chdir re-runs the device flow and strands a second plaintext refresh
+    // token at the old path. Both now fail loudly.
+    for bad in [
+        "~/qdb-tokens",
+        "qdb-tokens",
+        "./qdb-tokens",
+        "../qdb-tokens",
+    ] {
+        let err = validate_override_dir(PathBuf::from(bad))
+            .expect_err(&format!("{bad} should be rejected"));
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+        assert!(
+            err.to_string().contains(TOKEN_STORE_DIR_ENV),
+            "the error must name the setting: {err}"
+        );
+    }
+    let good = if cfg!(windows) {
+        r"C:\qdb-tokens"
+    } else {
+        "/var/lib/qdb-tokens"
+    };
+    assert_eq!(
+        validate_override_dir(PathBuf::from(good)).unwrap(),
+        PathBuf::from(good)
+    );
+}
+
+#[test]
 fn hash_matches_frozen_cross_language_value() {
     // Pinned to the byte-exact canonical string the Java/Python clients hash, so
     // a drift in the prefix, field order, NUL separation, endpoint canonicalisation
