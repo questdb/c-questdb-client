@@ -162,8 +162,8 @@ bool questdb_oidc_builder_groups_in_token(
  * this cannot change that.
  *
  * Plaintext `http` to a loopback host is allowed with or without this flag: the
- * request never leaves the machine. (`localhost` is accepted only if it actually
- * resolves to a loopback address.)
+ * request never leaves the machine. (`localhost` is accepted only if it
+ * actually resolves to a loopback address.)
  *
  * A tampered `/settings` response can redirect where you sign in, so over a
  * plaintext channel the client refuses settings-sourced values it cannot

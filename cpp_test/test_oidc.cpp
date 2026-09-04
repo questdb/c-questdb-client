@@ -140,7 +140,8 @@ TEST_CASE("OIDC C++ wrappers preserve ownership and structured errors")
     // deleted: `questdb_oidc_auth_clone` aliases one shared provider rather
     // than duplicating it, so a value-shaped copy would let `clear()` on the
     // "copy" delete the credential the original's transports are using.
-    static_assert(!std::is_copy_constructible<questdb::oidc::device_auth>::value);
+    static_assert(
+        !std::is_copy_constructible<questdb::oidc::device_auth>::value);
     static_assert(!std::is_copy_assignable<questdb::oidc::device_auth>::value);
     auto shared_auth = auth.share();
     const auto config = shared_auth.config();

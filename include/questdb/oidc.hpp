@@ -306,7 +306,8 @@ public:
      */
     device_auth share() const
     {
-        return device_auth{detail::wrapped_call(::questdb_oidc_auth_clone, raw())};
+        return device_auth{
+            detail::wrapped_call(::questdb_oidc_auth_clone, raw())};
     }
 
     /**
