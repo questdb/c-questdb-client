@@ -2955,7 +2955,8 @@ fn prefer_over_trigger(err: &Error) -> bool {
 
     matches!(
         err.code(),
-        ErrorCode::AuthError
+        ErrorCode::InvalidApiCall
+            | ErrorCode::AuthError
             | ErrorCode::RoleMismatch
             | ErrorCode::ConfigError
             | ErrorCode::UnsupportedServer
@@ -3514,14 +3515,12 @@ mod tests {
                 code
             );
         }
-        // Generic transport flops, decode failures, and client-side
-        // validation errors are NOT more diagnostic than the trigger
-        // — keep the original cause-of-death in those cases.
+        // Generic transport flops and decode failures are NOT more diagnostic
+        // than the trigger — keep the original cause-of-death in those cases.
         for code in [
             SocketError,
             ProtocolError,
             CouldNotResolveAddr,
-            InvalidApiCall,
             InvalidUtf8,
             InvalidBind,
             ServerInternalError,
@@ -3534,6 +3533,8 @@ mod tests {
                 code
             );
         }
+        let invalid_call = Error::new(InvalidApiCall, "provider callback contract violated");
+        assert!(prefer_over_trigger(&invalid_call));
     }
 
     #[cfg(feature = "_oidc")]

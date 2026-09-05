@@ -3357,9 +3357,10 @@ pub(crate) fn connect_qwp_ws_endpoint_round<A: QwpWsHealthAccess>(
     // A token provider (e.g. OIDC) is pulled fresh on every (re)connect round,
     // overriding the static basic/token header, so a long-lived sender keeps a
     // valid Bearer as the token rotates. Provider acquisition/validation failures
-    // are retryable SocketErrors: the next invocation may recover, and accepted
-    // store-and-forward frames must remain drainable. Server authentication
-    // rejections happen later in the handshake and remain terminal AuthErrors.
+    // are normally retryable SocketErrors: the next invocation may recover, and
+    // accepted store-and-forward frames must remain drainable. InvalidApiCall is
+    // a terminal caller-contract violation. Server authentication rejections
+    // happen later in the handshake and remain terminal AuthErrors.
     let provided_header = match qwp_ws.token_provider.as_ref() {
         Some(provider) => {
             let acquired = if connect_kind.bounded_dial() {

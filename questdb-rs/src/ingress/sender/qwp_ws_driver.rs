@@ -2611,7 +2611,8 @@ pub(crate) fn reconnect_error_is_terminal(err: &Error) -> bool {
     }
     matches!(
         err.code(),
-        ErrorCode::AuthError
+        ErrorCode::InvalidApiCall
+            | ErrorCode::AuthError
             | ErrorCode::ConfigError
             | ErrorCode::ProtocolVersionError
             | ErrorCode::StoreResendRequired
@@ -4642,6 +4643,19 @@ mod tests {
             !reconnect_error_is_terminal(&Error::new(ErrorCode::SocketError, "connection reset")),
             "a transient SocketError must stay retryable"
         );
+    }
+
+    #[test]
+    fn reconnect_error_is_terminal_treats_invalid_provider_call_as_terminal() {
+        let provider = crate::token_provider::TokenProvider::new(|| {
+            Err::<String, _>(Error::new(
+                ErrorCode::InvalidApiCall,
+                "provider callback contract violated",
+            ))
+        });
+        let error = provider.bearer_header().unwrap_err();
+        assert_eq!(error.code(), ErrorCode::InvalidApiCall);
+        assert!(reconnect_error_is_terminal(&error));
     }
 
     #[test]

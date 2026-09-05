@@ -71,11 +71,13 @@ impl TokenProvider {
     /// or a blank value is rejected — the token never reaches the wire. Mirrors
     /// the ILP/HTTP `HttpAuth::resolve` gate and the device flow's `safe_token`.
     ///
-    /// Provider acquisition and validation failures are retryable: the callback
-    /// can return a different token on its next invocation, and a QWP
+    /// Provider acquisition and validation failures are normally retryable: the
+    /// callback can return a different token on its next invocation, and a QWP
     /// store-and-forward sender must not abandon accepted frames because one
-    /// refresh attempt failed. Server authentication rejections remain separate
-    /// terminal `AuthError`s because they occur after this method succeeds.
+    /// refresh attempt failed. `InvalidApiCall` is preserved because it denotes
+    /// a caller contract violation that retrying cannot repair. Server
+    /// authentication rejections remain separate terminal `AuthError`s because
+    /// they occur after this method succeeds.
     pub(crate) fn bearer_header(&self) -> crate::Result<String> {
         let provided = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.provide()))
             .map_err(|_| {
@@ -162,7 +164,8 @@ fn provider_shutdown_error() -> crate::Error {
 /// a terminal [`AuthError`](crate::ErrorCode::AuthError).
 ///
 /// The exceptions are the failures for which "may recover on its next
-/// invocation" is false, which must stay terminal: a permanently closed
+/// invocation" is false, which must stay terminal: a caller contract violation
+/// (`InvalidApiCall`), a permanently closed
 /// provider (`close()` is monotonic, so `token()` returns `Cancelled` for the
 /// rest of the process) and a misconfiguration (`Config` — the configured scope
 /// cannot yield the required token kind, and no call inside this process
@@ -178,6 +181,9 @@ fn provider_shutdown_error() -> crate::Error {
 /// stream instead (see `ConnectionEvents::token_provider_failed`), so the
 /// retrying is visible rather than silent.
 fn classify_provider_error(e: crate::Error) -> crate::Error {
+    if e.code() == crate::ErrorCode::InvalidApiCall {
+        return e;
+    }
     #[cfg(feature = "_oidc")]
     if e.oidc_error().is_some_and(|oidc| {
         matches!(
@@ -264,6 +270,20 @@ mod tests {
             blank.bearer_header().unwrap_err().code(),
             ErrorCode::SocketError
         );
+    }
+
+    #[test]
+    fn invalid_api_call_provider_error_stays_terminal() {
+        let provider = TokenProvider::new(|| {
+            Err::<String, _>(crate::Error::new(
+                crate::ErrorCode::InvalidApiCall,
+                "provider callback contract violated",
+            ))
+        });
+
+        let err = provider.bearer_header().unwrap_err();
+        assert_eq!(err.code(), crate::ErrorCode::InvalidApiCall);
+        assert_eq!(err.msg(), "provider callback contract violated");
     }
 
     #[cfg(feature = "_oidc")]
