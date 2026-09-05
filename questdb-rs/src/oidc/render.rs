@@ -573,7 +573,7 @@ pub(crate) fn display_url(url: &str) -> String {
 /// The control-stripped, scheme/userinfo/host-vetted URL safe to open in a
 /// browser (or `None` if it can't be trusted).
 ///
-/// Rejects any URL that is not `http(s)`, carries userinfo (`user@host`, which
+/// Rejects any URL that is not `https` or loopback `http`, carries userinfo (`user@host`, which
 /// connects to `host` while *reading* as the trusted user part), whose host is
 /// not plain ASCII letters/digits/`.`/`-`/`:` (a homoglyph / confusable host,
 /// or a `%` percent-encoding / IPv6 zone-id), or whose host carries an IDNA
@@ -647,6 +647,12 @@ pub(crate) fn safe_target(url: Option<&str>) -> Option<String> {
         .split('.')
         .any(|label| label.len() >= 4 && label[..4].eq_ignore_ascii_case("xn--"))
     {
+        return None;
+    }
+    // Device codes are credentials. Plaintext is actionable only on the local
+    // machine; a remote HTTP URL must remain inert text and must never reach a
+    // browser opener or QR code.
+    if uri.scheme_str() == Some("http") && !crate::oidc::http::is_loopback(host) {
         return None;
     }
     Some(trimmed.to_string())
@@ -995,12 +1001,34 @@ mod tests {
             safe_target(Some("https://[::1]:8443/device")),
             Some("https://[::1]:8443/device".to_string())
         );
-        assert!(safe_target(Some("http://[fe80::1]/device")).is_some());
+        assert_eq!(safe_target(Some("http://[fe80::1]/device")), None);
         // A zone id is still refused: `%` can misrepresent the destination, and
         // the address parse rejects it.
         assert_eq!(safe_target(Some("https://[fe80::1%25eth0]/device")), None);
         // Brackets are not a way past the host allowlist for a name.
         assert_eq!(safe_target(Some("https://[not-an-address]/device")), None);
+    }
+
+    #[test]
+    fn safe_target_allows_plaintext_only_on_loopback() {
+        for url in [
+            "http://localhost/device",
+            "http://LOCALHOST:8080/device",
+            "http://localhost./device",
+            "http://127.0.0.1/device",
+            "http://127.5.5.5/device",
+            "http://[::1]/device",
+        ] {
+            assert_eq!(safe_target(Some(url)), Some(url.to_string()), "{url}");
+        }
+        for url in [
+            "http://idp.example.com/device",
+            "http://10.0.0.1/device",
+            "http://169.254.1.1/device",
+            "http://[fe80::1]/device",
+        ] {
+            assert_eq!(safe_target(Some(url)), None, "{url}");
+        }
     }
 
     #[test]

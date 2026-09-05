@@ -59,14 +59,10 @@ const DEFAULT_EXPIRES_IN: i64 = 300;
 const MAX_EXPIRES_IN: i64 = 3600;
 
 // Clamp the device-authorization timing fields so a hostile / buggy response
-// can't time the flow out before its first poll, pin the polling thread in one
-// huge sleep, or keep the loop alive indefinitely.
+// can't pin the polling thread in one huge sleep or keep the loop alive
+// indefinitely. A positive lifetime remains authoritative, even when short.
 const DEFAULT_DEVICE_CODE_LIFETIME: u64 = 600;
 const MAX_DEVICE_CODE_LIFETIME: u64 = 1800;
-// A floor so a hostile/buggy `expires_in: 1` can't abort the flow after a single
-// poll before the user can authorize. Well below any conformant code lifetime
-// (RFC 8628 codes live minutes), so it never shortens a legitimate one.
-const MIN_DEVICE_CODE_LIFETIME: u64 = 60;
 const MIN_POLL_INTERVAL: u64 = 5;
 const MAX_POLL_INTERVAL: u64 = 60;
 
@@ -1346,8 +1342,7 @@ impl OidcDeviceAuth {
     /// the cross-process lock or disk I/O. Drop the cached refresh token before
     /// the request so an ambiguous transport failure cannot resubmit a
     /// possibly-rotated parent to a reuse-detecting IdP, then restore it only when
-    /// the failure proves the IdP never consumed it (a clean transient status, or
-    /// a request that provably never left the client).
+    /// the failure proves the request never left the client.
     fn refresh_no_store(&self, existing: &TokenSet) -> Result<TokenSet> {
         self.discard_cached_refresh();
         match self.refresh(existing) {
@@ -1442,22 +1437,16 @@ impl OidcDeviceAuth {
             Ok(refreshed) => refreshed,
             Err(e) => {
                 // Restore the refresh token only when the failure proves the IdP
-                // never consumed it (see `refresh_preserves_token`): a clean
-                // transient HTTP status (408 / 429 / 5xx — the IdP answered
-                // without rotating), or a request that provably never left the
-                // client (a pre-send connect / DNS / TLS failure). Restore it in
-                // memory, and back on disk if we consumed the persisted copy
-                // above, so a later retry — this process, a peer, or a restart —
-                // resumes the silent refresh instead of forcing an interactive
-                // re-sign-in a headless client cannot perform. The no-store path
+                // never received it (see `refresh_preserves_token`): a pre-send
+                // connect / DNS / TLS failure. Restore it in memory, and back on
+                // disk if we consumed the persisted copy above, so a later retry
+                // can resume the silent refresh. The no-store path
                 // (`refresh_no_store`) makes the identical choice.
                 //
-                // Everything else stays discarded: a status-less failure that may
-                // have transmitted the request is an ambiguous post-send transport
-                // failure (the IdP may have consumed and rotated the parent with
-                // its response lost, so a reuse-detecting IdP must never be sent it
-                // twice), and a terminal rejection (a non-`Network` kind, e.g.
-                // `invalid_grant`) means the parent is dead and must not be
+                // Everything else stays discarded. Even a received transient
+                // status can be synthesized by an intermediary after the IdP
+                // consumed and rotated the parent, so it does not prove safety.
+                // A terminal rejection likewise means the parent must not be
                 // replayed.
                 if refresh_preserves_token(&e) {
                     *self.lock_tokens() = Some(current.clone());
@@ -1818,7 +1807,11 @@ impl OidcDeviceAuth {
                     // other transient poll failures: keep polling until the
                     // device code expires. This also lets a temporarily
                     // unreachable token endpoint recover during an active flow.
-                    if e.status() == Some(429) || e.retry_after_secs().is_some() {
+                    if e.request_timed_out() {
+                        let previous = interval;
+                        interval = backoff(interval, None, true);
+                        interval_raised = interval > previous;
+                    } else if e.status() == Some(429) || e.retry_after_secs().is_some() {
                         let previous = interval;
                         interval = backoff(interval, e.retry_after_secs(), false);
                         interval_raised = interval > previous;
@@ -1878,7 +1871,14 @@ impl OidcDeviceAuth {
             }
 
             match body.get("error").and_then(Value::as_str) {
-                Some("authorization_pending") => continue,
+                Some("authorization_pending") => {
+                    if retry_after.is_some() {
+                        let previous = interval;
+                        interval = backoff(interval, retry_after, false);
+                        interval_raised = interval > previous;
+                    }
+                    continue;
+                }
                 Some("slow_down") => {
                     let previous = interval;
                     interval = backoff(interval, retry_after, true);
@@ -2113,15 +2113,12 @@ fn warn_persistence(op: &str, err: &(dyn std::error::Error + Send + Sync)) {
 
 /// True when a failed [`refresh`](OidcDeviceAuth::refresh) proves the refresh
 /// token was NOT consumed by the IdP, so keeping it for a later retry cannot
-/// trigger rotating-refresh-token reuse detection. Two cases qualify: a clean
-/// transient HTTP status (the IdP answered without rotating the parent), or a
-/// request that provably never reached the IdP (a pre-send connect / DNS / TLS
-/// failure, flagged via [`OidcError::request_unsent`]). A status-less failure
-/// that may have transmitted the request is ambiguous — the parent may have been
-/// consumed and its response lost — and does not qualify.
+/// trigger rotating-refresh-token reuse detection. Only a request that provably
+/// never reached the IdP (a pre-send connect / DNS / TLS failure, flagged via
+/// [`OidcError::request_unsent`]) qualifies. A received status can be generated
+/// by an intermediary after the IdP consumed the parent, so it is ambiguous too.
 fn refresh_preserves_token(e: &OidcError) -> bool {
-    e.kind() == crate::oidc::error::OidcErrorKind::Network
-        && (e.status().is_some() || e.request_unsent())
+    e.kind() == crate::oidc::error::OidcErrorKind::Network && e.request_unsent()
 }
 
 /// The advertised poll interval, floored at [`MIN_POLL_INTERVAL`] and capped at
@@ -2148,7 +2145,7 @@ fn clamp_lifetime(expires_in: Option<i64>) -> u64 {
         Some(v) if v > 0 => v as u64,
         _ => DEFAULT_DEVICE_CODE_LIFETIME,
     };
-    secs.clamp(MIN_DEVICE_CODE_LIFETIME, MAX_DEVICE_CODE_LIFETIME)
+    secs.min(MAX_DEVICE_CODE_LIFETIME)
 }
 
 /// The next poll interval after a 429 / `slow_down`. Honors a `Retry-After`

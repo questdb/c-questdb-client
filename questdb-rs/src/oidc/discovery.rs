@@ -512,7 +512,7 @@ fn discover_from_idp(http: &HttpClient, issuer: &str) -> Result<serde_json::Valu
     // requiring the match turns a wrong-tenant — or a non-conformant, issuer-less —
     // IdP into a clear failure rather than silently trusting its endpoints.
     match str_setting(doc.get("issuer")) {
-        Some(doc_issuer) if doc_issuer.trim_end_matches('/') == issuer.trim_end_matches('/') => {}
+        Some(doc_issuer) if doc_issuer == issuer => {}
         Some(doc_issuer) => {
             return Err(OidcError::config(format!(
                 "The IdP discovery document declares issuer {doc_issuer:?}, which \

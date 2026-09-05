@@ -31,7 +31,7 @@
 
 use std::fmt::Debug;
 use std::io::{Read, Write};
-use std::net::{IpAddr, ToSocketAddrs};
+use std::net::IpAddr;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
@@ -55,12 +55,9 @@ const USER_AGENT: &str = concat!("questdb/rust/", env!("CARGO_PKG_VERSION"), " (
 /// server.
 const MAX_RESPONSE_BYTES: u64 = 4 * 1024 * 1024;
 
-/// Cap on how much of an HTTP *error* body (status >= 400) is echoed into a
-/// diagnostic message. Enough to show a proxy/WAF error title or an OAuth
-/// `error_description`, but short so little can spill into a log. A 2xx/3xx body —
-/// which on the token / device-authorization endpoints can carry a credential — is
-/// never snippeted (see [`non_json_body_detail`]), so a non-conformant or truncated
-/// token response cannot leak the secret through this path.
+/// Cap on how much of a discovery/settings GET response is echoed into a
+/// diagnostic message. POST response bodies are never echoed because they can
+/// contain request credentials copied by an IdP, proxy, or WAF.
 const MAX_BODY_SNIPPET_CHARS: usize = 120;
 
 /// The result of a `POST` to the IdP token / device-authorization endpoint:
@@ -162,8 +159,10 @@ impl HttpClient {
                 // cannot have seen (vs. an ambiguous mid-flight drop, where the
                 // parent may have been consumed and rotated).
                 let unsent = request_provably_unsent(&e);
+                let timed_out = request_timed_out(&e);
                 OidcError::network(format!("Failed to reach {url}: {e}"))
                     .with_request_unsent(unsent)
+                    .with_request_timed_out(timed_out)
             })?;
         let status = response.status().as_u16();
         let retry_after = parse_retry_after(response.headers());
@@ -175,12 +174,10 @@ impl HttpClient {
                 retry_after,
             }),
             Err(_) => {
-                // A 2xx/3xx body from these endpoints can carry the OAuth secrets
-                // (access/refresh token, device_code); a non-conformant or truncated
-                // token response lands here, so its bytes must never be echoed into
-                // this (displayable/loggable) error. Only an HTTP error body
-                // (>= 400) — an intermediary/IdP error page that cannot carry an
-                // issued token — is snippeted for diagnostics.
+                // A response from these POST endpoints can contain OAuth secrets,
+                // including when an IdP/proxy reflects the request body into an
+                // error page. Never echo its bytes into a displayable/loggable
+                // error, regardless of status.
                 let detail = non_json_body_detail(status, &body);
                 let msg = format!("HTTP {status} from {url}: {detail}");
                 // A transient 408/429/5xx (a timeout or proxy/WAF error page) stays
@@ -237,6 +234,19 @@ fn request_provably_unsent(err: &ureq::Error) -> bool {
     }
 }
 
+/// True when `ureq` reports that a request deadline elapsed. This is transport
+/// provenance for the RFC 8628 polling rule; it deliberately says nothing
+/// about whether the request was transmitted.
+fn request_timed_out(err: &ureq::Error) -> bool {
+    use std::io::ErrorKind;
+    use ureq::Error;
+    match err {
+        Error::Timeout(_) => true,
+        Error::Io(e) => e.kind() == ErrorKind::TimedOut,
+        _ => false,
+    }
+}
+
 /// Read a response body, bounded by [`MAX_RESPONSE_BYTES`].
 fn read_body(url: &str, response: ureq::http::Response<ureq::Body>) -> Result<Vec<u8>> {
     response
@@ -256,17 +266,10 @@ fn body_snippet(body: &[u8]) -> String {
 }
 
 /// Diagnostic detail for a token / device-authorization response whose body did
-/// not parse as JSON. These endpoints return the OAuth secrets (access/refresh
-/// token, device_code) in a *successful* (2xx) body, so a 2xx/3xx body is never
-/// echoed: a non-conformant or truncated token response would otherwise leak the
-/// credential into this displayable/loggable error. Only a genuine HTTP error
-/// response (status >= 400), which cannot carry an issued token, is snippeted.
-fn non_json_body_detail(status: u16, body: &[u8]) -> String {
-    if status >= 400 {
-        body_snippet(body)
-    } else {
-        "unexpected non-JSON response body".to_string()
-    }
+/// not parse as JSON. Never echo the body: an IdP, proxy, or WAF may reflect the
+/// POST form, including a device code or refresh token, at any HTTP status.
+fn non_json_body_detail(_status: u16, _body: &[u8]) -> String {
+    "unexpected non-JSON response body".to_string()
 }
 
 /// Parse a `Retry-After` header as a non-negative number of seconds.
@@ -285,17 +288,9 @@ fn parse_retry_after(headers: &ureq::http::HeaderMap) -> Option<u64> {
 /// True if `host` is a loopback address — plaintext `http` is safe there because
 /// the request never leaves the machine.
 ///
-/// An IP literal is answered from the literal itself, so the common case costs
-/// no lookup. The `localhost` name is *resolved and checked* rather than trusted
-/// on sight: RFC 6761 6.3 says a resolver should map it to loopback, but that is
-/// a should — an `/etc/hosts` line or a hostile resolver can point it at a real
-/// address, and matching the spelling alone would then hand the device code to
-/// whatever answered, in cleartext. Every address it resolves to must be
-/// loopback, so a name resolving to a mix cannot pass, and a name that resolves
-/// to nothing is not loopback either.
-///
-/// Only that one name is a candidate; any other host is rejected without a
-/// lookup, so an unrelated plaintext URL never triggers DNS traffic here.
+/// An IP literal is answered from the literal itself. The special-use
+/// `localhost` name is accepted by spelling, without DNS: local development must
+/// remain usable even when TLS is disabled or the host resolver is unavailable.
 pub(crate) fn is_loopback(host: &str) -> bool {
     // Strip the brackets off an IPv6 literal before parsing.
     let bare = host
@@ -305,23 +300,7 @@ pub(crate) fn is_loopback(host: &str) -> bool {
     if let Ok(addr) = bare.parse::<IpAddr>() {
         return addr.is_loopback();
     }
-    if !host.eq_ignore_ascii_case("localhost") {
-        return false;
-    }
-    // Resolution needs a port; which one is irrelevant to the verdict.
-    match (host, 0u16).to_socket_addrs() {
-        Ok(addrs) => {
-            let mut resolved = false;
-            for addr in addrs {
-                resolved = true;
-                if !addr.ip().is_loopback() {
-                    return false;
-                }
-            }
-            resolved
-        }
-        Err(_) => false,
-    }
+    host.eq_ignore_ascii_case("localhost") || host.eq_ignore_ascii_case("localhost.")
 }
 
 /// Refuse to send a request over a channel that isn't `https` (or loopback
@@ -344,8 +323,7 @@ fn require_secure(url: &str, allow_insecure: bool) -> Result<()> {
         return Ok(());
     }
     if scheme == "http" {
-        // `allow_insecure` first: it is a plain bool, and `is_loopback` may
-        // resolve a name.
+        // `allow_insecure` first: it is a plain bool.
         if allow_insecure {
             return Ok(());
         }
@@ -355,8 +333,7 @@ fn require_secure(url: &str, allow_insecure: bool) -> Result<()> {
     }
     Err(OidcError::config(format!(
         "Refusing to use insecure URL {url:?} (scheme {scheme:?}). Use https \
-         (loopback http is always allowed for local development, but a host \
-         name has to actually resolve to a loopback address to count); enable \
+         (localhost and loopback IP http are always allowed for local development); enable \
          allow_insecure_transport only to permit plaintext to a non-loopback \
          QuestDB server. The identity provider is always held to https."
     )))
@@ -811,10 +788,10 @@ mod tests {
 
     #[test]
     fn is_loopback_cases() {
-        // The name is accepted only because it resolves to loopback here, which
-        // is what every sane resolver does (RFC 6761 6.3).
+        // The special-use name is accepted by spelling, without consulting DNS.
         assert!(is_loopback("localhost"));
         assert!(is_loopback("LOCALHOST"));
+        assert!(is_loopback("localhost."));
         assert!(is_loopback("127.0.0.1"));
         assert!(is_loopback("127.5.5.5"));
         assert!(is_loopback("::1"));
@@ -825,7 +802,6 @@ mod tests {
         // is rejected without a lookup.
         assert!(!is_loopback("localhost.example.com"));
         assert!(!is_loopback("notlocalhost"));
-        assert!(!is_loopback("localhost."));
         assert!(!is_loopback(""));
     }
 
@@ -840,12 +816,12 @@ mod tests {
     }
 
     #[test]
-    fn non_json_success_body_is_never_echoed_into_error() {
-        // A non-conformant / truncated 2xx token response carries the secret in a
-        // non-JSON body; it must never reach a displayable/loggable error message.
+    fn non_json_post_body_is_never_echoed_into_error() {
+        // A non-conformant response or error-page reflection may carry POSTed
+        // secrets in its non-JSON body; no status may expose it in an error.
         let secret_form = "access_token=SECRET-eyJhbGciOiJSUzI1NiJ9&token_type=bearer";
         let truncated_json = r#"{"access_token":"SECRET-eyJhbGciOiJSUzI1NiJ9.eyJzdWIi"#;
-        for status in [200u16, 201, 204, 301, 302, 399] {
+        for status in [200u16, 201, 204, 301, 302, 399, 400, 408, 429, 500, 503] {
             for body in [secret_form, truncated_json] {
                 let detail = non_json_body_detail(status, body.as_bytes());
                 assert!(
@@ -855,16 +831,6 @@ mod tests {
                 assert_eq!(detail, "unexpected non-JSON response body");
             }
         }
-
-        // A genuine HTTP error page (>= 400) cannot carry an issued token, so its
-        // body is still snippeted for diagnostics.
-        let detail = non_json_body_detail(503, b"Service Unavailable (upstream proxy)");
-        assert!(
-            detail.contains("Service Unavailable"),
-            "error-page body should still be snippeted, got: {detail}"
-        );
-        let detail = non_json_body_detail(400, b"invalid_request: bad client");
-        assert!(detail.contains("invalid_request"), "got: {detail}");
     }
 
     #[test]
@@ -945,5 +911,17 @@ mod tests {
             "eof reading response",
         ))));
         assert!(!request_provably_unsent(&Error::StatusCode(500)));
+    }
+
+    #[test]
+    fn request_timeout_classification_is_independent_of_send_provenance() {
+        use std::io;
+        use ureq::Error;
+
+        assert!(request_timed_out(&Error::Timeout(ureq::Timeout::Global)));
+        assert!(request_timed_out(&Error::Io(io::Error::from(
+            io::ErrorKind::TimedOut
+        ))));
+        assert!(!request_timed_out(&Error::HostNotFound));
     }
 }

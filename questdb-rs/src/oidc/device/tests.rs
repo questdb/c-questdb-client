@@ -925,6 +925,45 @@ fn slow_down_via_429_still_increases_interval() {
 }
 
 #[test]
+fn authorization_pending_honors_retry_after() {
+    let slept: Arc<std::sync::Mutex<Vec<Duration>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let poll = Arc::new(AtomicUsize::new(0));
+    let mock = {
+        let poll = Arc::clone(&poll);
+        MockServer::start_with_retry_after(30, move |method, path, _body| match (method, path) {
+            ("POST", "/device") => (200, device_response()),
+            ("POST", "/token") => {
+                if poll.fetch_add(1, Ordering::SeqCst) == 0 {
+                    (400, r#"{"error":"authorization_pending"}"#.to_string())
+                } else {
+                    (
+                        200,
+                        r#"{"access_token":"AT-pending","expires_in":300}"#.to_string(),
+                    )
+                }
+            }
+            _ => (404, "{}".to_string()),
+        })
+    };
+    let recorder = Arc::clone(&slept);
+    let auth = OidcDeviceAuth::builder()
+        .client_id("questdb")
+        .device_authorization_endpoint(mock.url("/device"))
+        .token_endpoint(mock.url("/token"))
+        .interactive(true)
+        .open_browser(false)
+        .sleep_hook(Arc::new(move |duration| {
+            recorder.lock().unwrap().push(duration)
+        }))
+        .build()
+        .expect("build");
+
+    assert_eq!(sign_in_and_token(&auth).unwrap(), "AT-pending");
+    assert_eq!(poll.load(Ordering::SeqCst), 2);
+    assert_eq!(slept.lock().unwrap().as_slice(), &[Duration::from_secs(30)]);
+}
+
+#[test]
 fn poll_retries_json_and_non_json_http_408() {
     for transient_body in [
         r#"{"error":"request_timeout"}"#,
@@ -974,10 +1013,10 @@ fn poll_retries_json_and_non_json_http_408() {
 }
 
 #[test]
-fn device_code_lifetime_is_floored() {
-    // A hostile/buggy tiny expires_in is raised to the minimum so the flow isn't
-    // aborted after a single poll; a huge one is capped; a sane one is unchanged.
-    assert_eq!(clamp_lifetime(Some(1)), MIN_DEVICE_CODE_LIFETIME);
+fn device_code_lifetime_preserves_positive_values() {
+    // A positive expires_in is authoritative; a huge one is capped, while a
+    // missing or non-positive value receives the defensive default.
+    assert_eq!(clamp_lifetime(Some(1)), 1);
     assert_eq!(clamp_lifetime(Some(0)), DEFAULT_DEVICE_CODE_LIFETIME);
     assert_eq!(clamp_lifetime(None), DEFAULT_DEVICE_CODE_LIFETIME);
     assert_eq!(clamp_lifetime(Some(600)), 600);
@@ -1596,6 +1635,50 @@ fn idp_discovery_issuer_mismatch_rejected() {
 }
 
 #[test]
+fn idp_discovery_issuer_trailing_slash_mismatch_rejected() {
+    for document_has_slash in [false, true] {
+        let base: Arc<std::sync::OnceLock<String>> = Arc::new(std::sync::OnceLock::new());
+        let mock = {
+            let base = Arc::clone(&base);
+            MockServer::start(move |method, path, _body| match (method, path) {
+                ("GET", "/settings") => (200, settings_client_only()),
+                ("GET", "/.well-known/openid-configuration") => {
+                    let b = base.get().cloned().unwrap_or_default();
+                    let declared = if document_has_slash {
+                        format!("{b}/")
+                    } else {
+                        b.clone()
+                    };
+                    (
+                        200,
+                        serde_json::json!({
+                            "issuer": declared,
+                            "token_endpoint": format!("{b}/token"),
+                            "device_authorization_endpoint": format!("{b}/device"),
+                        })
+                        .to_string(),
+                    )
+                }
+                _ => (404, "{}".to_string()),
+            })
+        };
+        base.set(mock.url("")).unwrap();
+        let pinned = if document_has_slash {
+            mock.url("")
+        } else {
+            format!("{}/", mock.url(""))
+        };
+        let err = OidcDeviceAuth::from_questdb(mock.url(""))
+            .issuer(pinned)
+            .allow_insecure_transport(true)
+            .build()
+            .unwrap_err();
+        assert_eq!(err.kind(), OidcErrorKind::Config);
+        assert!(err.message().contains("does not match the pinned issuer"));
+    }
+}
+
+#[test]
 fn idp_discovery_missing_device_endpoint_rejected() {
     // The discovery doc declares a matching issuer + token endpoint but omits
     // device_authorization_endpoint (the IdP does not support the device grant) —
@@ -1749,11 +1832,10 @@ fn allow_insecure_does_not_relax_idp_endpoints() {
 // -- refresh branches --------------------------------------------------------
 
 #[test]
-fn refresh_transient_error_preserves_token_no_reprompt() {
-    // A 5xx during refresh keeps the refresh token usable: surface a Network
-    // error and do NOT re-prompt (the refresh token is still valid). Repeated
-    // transport token lookups must then back off instead of POSTing once per
-    // flush while the provider is unavailable.
+fn refresh_transient_error_discards_ambiguous_parent() {
+    // A 5xx can be synthesized by an intermediary after the IdP consumed the
+    // rotating parent. Surface a Network error, discard the ambiguous parent,
+    // and require a fresh explicit sign-in on the next lookup.
     let device_calls = Arc::new(AtomicUsize::new(0));
     let refresh_calls = Arc::new(AtomicUsize::new(0));
     let mock = {
@@ -1786,9 +1868,9 @@ fn refresh_transient_error_preserves_token_no_reprompt() {
     let err = auth.token().unwrap_err();
     assert_eq!(err.kind(), OidcErrorKind::Network);
     assert_eq!(err.status(), Some(503));
-    let backed_off = auth.token().unwrap_err();
-    assert_eq!(backed_off.kind(), OidcErrorKind::Network);
-    assert!(backed_off.message().contains("temporarily backed off"));
+    assert_eq!(auth.token_set().unwrap().refresh_token, None);
+    let next = auth.token().unwrap_err();
+    assert_eq!(next.kind(), OidcErrorKind::InteractionRequired);
     assert_eq!(refresh_calls.load(Ordering::SeqCst), 1);
     assert_eq!(device_calls.load(Ordering::SeqCst), 1);
 }
@@ -1847,6 +1929,7 @@ fn refresh_transient_responses_preserve_structured_metadata() {
         assert_eq!(err.idp_error(), expected_error);
         assert_eq!(err.idp_error_description(), expected_description);
         assert_eq!(refresh_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(auth.token_set().unwrap().refresh_token, None);
         assert_eq!(
             device_calls.load(Ordering::SeqCst),
             1,
@@ -2030,9 +2113,8 @@ fn lifetime_cap_bounds_refreshable_and_opaque_tokens() {
 
 // -- poll-loop error branches ------------------------------------------------
 
-/// A device-authorization response with a tiny lifetime (clamped up to the 60s
-/// floor) and the max poll interval, so a single virtual sleep crosses the
-/// deadline.
+/// A device-authorization response with a one-second lifetime and a longer poll
+/// interval, so a single clipped virtual sleep reaches the deadline.
 fn device_response_short() -> String {
     serde_json::json!({
         "device_code": "DEV-CODE-123",
@@ -2061,7 +2143,7 @@ fn expired_token_error_returns_timeout() {
 #[test]
 fn deadline_expiry_returns_timeout() {
     // The IdP never authorizes (always pending). A virtual clock advanced by the
-    // sleep hook drives the loop past the (60s-clamped) device-code deadline,
+    // sleep hook drives the loop to the one-second device-code deadline,
     // exercising the deadline-expiry Timeout branch instantly.
     let mock = MockServer::start(|method, path, _body| match (method, path) {
         ("POST", "/device") => (200, device_response_short()),
@@ -2096,9 +2178,8 @@ fn deadline_expiry_returns_timeout() {
 fn transport_failures_continue_until_device_code_expiry() {
     // Every token-endpoint poll drops the connection without an HTTP status.
     // Match Java by retrying throughout the device-code lifetime instead of
-    // aborting after three consecutive failures. The server's one-second
-    // lifetime is clamped to 60 seconds and polled every five seconds, yielding
-    // twelve attempts before the virtual clock reaches the deadline.
+    // aborting early for an arbitrary failure count. The server's one-second
+    // lifetime is authoritative, yielding one immediate attempt before expiry.
     let polls = Arc::new(AtomicUsize::new(0));
     let mock = {
         let polls = Arc::clone(&polls);
@@ -2143,7 +2224,65 @@ fn transport_failures_continue_until_device_code_expiry() {
     let err = auth.sign_in().unwrap_err();
     assert_eq!(err.kind(), OidcErrorKind::Timeout);
     assert_eq!(err.idp_error(), Some("expired_token"));
-    assert_eq!(polls.load(Ordering::SeqCst), 12);
+    assert_eq!(polls.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn connection_timeout_increases_poll_interval() {
+    // RFC 8628 requires a five-second increase after a connection timeout. With
+    // a six-second code lifetime, increasing 5s -> 10s leaves room for only the
+    // immediate poll; retaining 5s would incorrectly make a second request.
+    let polls = Arc::new(AtomicUsize::new(0));
+    let mock = {
+        let polls = Arc::clone(&polls);
+        MockServer::start(move |method, path, _body| match (method, path) {
+            ("POST", "/device") => (
+                200,
+                serde_json::json!({
+                    "device_code": "DEV-CODE-123",
+                    "user_code": "WXYZ-1234",
+                    "verification_uri": "https://idp.example.com/activate",
+                    "expires_in": 6,
+                    "interval": 5
+                })
+                .to_string(),
+            ),
+            ("POST", "/token") => {
+                polls.fetch_add(1, Ordering::SeqCst);
+                std::thread::sleep(Duration::from_millis(100));
+                (400, r#"{"error":"authorization_pending"}"#.to_string())
+            }
+            _ => (404, "{}".to_string()),
+        })
+    };
+    let base = Instant::now();
+    let virtual_ns = Arc::new(AtomicU64::new(0));
+    let now_ns = Arc::clone(&virtual_ns);
+    let sleep_ns = Arc::clone(&virtual_ns);
+    let sleeps = Arc::new(Mutex::new(Vec::new()));
+    let sleep_log = Arc::clone(&sleeps);
+    let auth = OidcDeviceAuth::builder()
+        .client_id("questdb")
+        .device_authorization_endpoint(mock.url("/device"))
+        .token_endpoint(mock.url("/token"))
+        .scope("openid")
+        .interactive(true)
+        .open_browser(false)
+        .timeout(Duration::from_millis(20))
+        .now_hook(Arc::new(move || {
+            base + Duration::from_nanos(now_ns.load(Ordering::SeqCst))
+        }))
+        .sleep_hook(Arc::new(move |duration| {
+            sleep_ns.fetch_add(duration.as_nanos() as u64, Ordering::SeqCst);
+            sleep_log.lock().unwrap().push(duration);
+        }))
+        .build()
+        .expect("build");
+
+    let err = auth.sign_in().unwrap_err();
+    assert_eq!(err.kind(), OidcErrorKind::Timeout);
+    assert_eq!(polls.load(Ordering::SeqCst), 1);
+    assert_eq!(sleeps.lock().unwrap().as_slice(), &[Duration::from_secs(6)]);
 }
 
 #[test]
@@ -3747,8 +3886,8 @@ fn lost_refresh_response_consumes_parent_before_retry() {
                 // 0 == drop the connection: an ambiguous post-send transport
                 // failure with NO HTTP status. The IdP may have consumed and
                 // rotated RT-1 before the response was lost, so the parent must
-                // stay discarded (a clean HTTP status is handled the opposite
-                // way — see `transient_status_refresh_preserves_persisted_parent`).
+                // stay discarded. A received transient status is ambiguous for
+                // the same reason: an intermediary may have generated it.
                 return (0, String::new());
             }
             (404, "{}".to_string())
@@ -3890,29 +4029,16 @@ fn refresh_pre_send_failure_keeps_persisted_parent() {
 }
 
 #[test]
-fn transient_status_refresh_preserves_persisted_parent() {
-    // A clean transient HTTP status (503) means the IdP answered WITHOUT
-    // consuming the refresh token, so a store-backed refresh must keep RT-1 (on
-    // disk and in memory) and retry — never brick an unattended client by
-    // forcing an interactive re-sign-in it cannot perform. Mirrors the no-store
-    // path (`refresh_transient_error_preserves_token_no_reprompt`). Regression
-    // test for a transient IdP hiccup permanently destroying a still-valid
-    // persisted refresh token.
+fn transient_status_refresh_discards_persisted_parent() {
+    // A proxy can return 503 after the IdP consumed and rotated RT-1. The parent
+    // is therefore ambiguous and must remain tombstoned on disk and in memory.
     let refresh_calls = Arc::new(AtomicUsize::new(0));
     let mock = {
         let refresh_calls = Arc::clone(&refresh_calls);
         MockServer::start(move |method, path, body| {
             if (method, path) == ("POST", "/token") && body.contains("grant_type=refresh_token") {
-                // First poll: transient 503 (non-consuming). Second: success,
-                // rotating RT-1 -> RT-2.
-                if refresh_calls.fetch_add(1, Ordering::SeqCst) == 0 {
-                    return (503, r#"{"error":"temporarily_unavailable"}"#.to_string());
-                }
-                return (
-                    200,
-                    r#"{"access_token":"AT-2","refresh_token":"RT-2","expires_in":300}"#
-                        .to_string(),
-                );
+                refresh_calls.fetch_add(1, Ordering::SeqCst);
+                return (503, r#"{"error":"temporarily_unavailable"}"#.to_string());
             }
             (404, "{}".to_string())
         })
@@ -3927,8 +4053,7 @@ fn transient_status_refresh_preserves_persisted_parent() {
     ));
     let auth = auth_with_failing_store(&mock, store.clone(), false);
 
-    // The transient 503 surfaces a Network error, but the still-valid refresh
-    // token is retained on disk and in memory rather than consumed.
+    // The transient 503 surfaces a Network error, and RT-1 stays consumed.
     let err = auth.token().unwrap_err();
     assert_eq!(err.kind(), OidcErrorKind::Network);
     assert_eq!(err.status(), Some(503));
@@ -3936,26 +4061,15 @@ fn transient_status_refresh_preserves_persisted_parent() {
         store
             .token()
             .and_then(|t| t.refresh_token().map(str::to_string)),
-        Some("RT-1".to_string()),
-        "a transient 503 must not consume the persisted refresh token"
+        None,
+        "a transient 503 must consume the ambiguous persisted refresh token"
     );
     assert_eq!(
         auth.token_set().and_then(|t| t.refresh_token.clone()),
-        Some("RT-1".to_string()),
-        "the in-memory refresh token must survive a transient 503"
+        None,
+        "the in-memory refresh token must not survive a transient 503"
     );
-
-    // An explicit recovery bypasses token()'s short stampede backoff and retries
-    // immediately, rotating RT-1 -> RT-2 without another device flow.
-    auth.sign_in().unwrap();
-    assert_eq!(auth.token().unwrap(), "AT-2");
-    assert_eq!(refresh_calls.load(Ordering::SeqCst), 2);
-    assert_eq!(
-        store
-            .token()
-            .and_then(|t| t.refresh_token().map(str::to_string)),
-        Some("RT-2".to_string()),
-    );
+    assert_eq!(refresh_calls.load(Ordering::SeqCst), 1);
 }
 
 #[test]

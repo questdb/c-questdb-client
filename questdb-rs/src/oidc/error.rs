@@ -99,6 +99,10 @@ pub struct OidcError {
     /// carried in it was not consumed by the IdP and is safe to retry. Left
     /// `false` for any failure that may have reached the IdP.
     request_unsent: bool,
+    /// True when the request failed because a transport deadline elapsed. The
+    /// device-flow polling loop uses this provenance to apply RFC 8628's
+    /// mandatory five-second interval increase after connection timeouts.
+    request_timed_out: bool,
 }
 
 impl OidcError {
@@ -117,6 +121,7 @@ impl OidcError {
             status: None,
             retry_after: None,
             request_unsent: false,
+            request_timed_out: false,
         }
     }
 
@@ -181,6 +186,11 @@ impl OidcError {
         self
     }
 
+    pub(crate) fn with_request_timed_out(mut self, request_timed_out: bool) -> Self {
+        self.request_timed_out = request_timed_out;
+        self
+    }
+
     /// The category of this error.
     ///
     /// Match on the returned [`OidcErrorKind`] to branch on the failure — e.g.
@@ -232,6 +242,13 @@ impl OidcError {
     /// (including a status-less mid-flight drop) leaves this `false`.
     pub(crate) fn request_unsent(&self) -> bool {
         self.request_unsent
+    }
+
+    /// True when the underlying HTTP request ended because a transport timeout
+    /// elapsed. Kept separate from `request_unsent`: a timeout can happen
+    /// before or after the request was transmitted.
+    pub(crate) fn request_timed_out(&self) -> bool {
+        self.request_timed_out
     }
 }
 
