@@ -125,13 +125,14 @@ pub(crate) fn encode_chunk_replay_into(
     chunk: &Chunk<'_>,
     symbol_dict: &mut SymbolGlobalDict,
     scratch: &mut EncodeScratch,
+    defer_commit: bool,
 ) -> Result<()> {
     encode_chunk_into_mode(
         out,
         chunk,
         symbol_dict,
         scratch,
-        /* defer_commit = */ false,
+        defer_commit,
         /* replay_symbols = */ true,
     )
 }
@@ -1970,7 +1971,7 @@ mod tests {
         c2.at_nanos(&ts2).unwrap();
 
         let mut replay = Vec::new();
-        encode_chunk_replay_into(&mut replay, &c2, &mut dict, &mut scratch).unwrap();
+        encode_chunk_replay_into(&mut replay, &c2, &mut dict, &mut scratch, false).unwrap();
         assert_eq!(replay[5] & QWP_FLAG_DEFER_COMMIT, 0);
 
         let mut pos = QWP_HEADER_LEN;

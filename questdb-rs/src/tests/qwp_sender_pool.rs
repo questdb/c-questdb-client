@@ -83,6 +83,20 @@ enum MockMode {
     /// EOF and surfaces a transient (`FailoverRetry`) failure.
     #[cfg(feature = "arrow-ingress")]
     AckThenClose(usize),
+    /// Model QuestDB's deferred-commit ack contract (questdb#7144): a frame
+    /// carrying FLAG_DEFER_COMMIT leaves rows uncommitted, so the cumulative-ack
+    /// watermark must NOT advance over it; only a non-deferred (committing)
+    /// frame is acked, and its cumulative ack covers the whole group.
+    DeferAwareAck,
+    /// As [`MockMode::DeferAwareAck`], but the FIRST connection dies after
+    /// reading `kill_after` frames, modelling a peer that drops mid-deferred
+    /// group. Later connections ack normally so the client can replay.
+    DeferAwareAckKillingFirstConn(usize),
+    /// As [`MockMode::DeferAwareAck`], but the FIRST connection answers data
+    /// frame `reject_at` with a retriable `NOT_WRITABLE` rejection — a primary
+    /// that becomes a read-only replica while it holds a deferred group. Later
+    /// connections ack normally so the client can replay onto the new primary.
+    DeferAwareRejectingFrame(usize),
     /// Read (consume) the first `n` binary frames — so the client's writes
     /// provably succeed — then close **without** acking. Models a peer that
     /// ingests a published frame and then dies before acknowledging it: the
@@ -331,6 +345,23 @@ fn run_mock_server_accept_loop(
                             }
                             #[cfg(feature = "arrow-ingress")]
                             MockMode::AckThenClose(n) => ack_then_close(&mut stream, &stop, n),
+                            MockMode::DeferAwareAck => {
+                                defer_aware_ack(&mut stream, &stop, capture, None)
+                            }
+                            MockMode::DeferAwareAckKillingFirstConn(kill_after) => defer_aware_ack(
+                                &mut stream,
+                                &stop,
+                                capture,
+                                (accept_index == 0).then_some(kill_after),
+                            ),
+                            MockMode::DeferAwareRejectingFrame(reject_at) => {
+                                defer_aware_ack_rejecting(
+                                    &mut stream,
+                                    &stop,
+                                    capture,
+                                    (accept_index == 0).then_some(reject_at),
+                                )
+                            }
                             MockMode::ReadThenClose(n) => read_then_close(&mut stream, &stop, n),
                         }
                     }
@@ -591,6 +622,129 @@ fn ack_then_close(stream: &mut std::net::TcpStream, stop: &AtomicBool, n: usize)
     // Returning drops the stream: the client's next read sees EOF.
 }
 
+/// Ack like QuestDB does once deferred commits are in play: a frame carrying
+/// FLAG_DEFER_COMMIT leaves its rows uncommitted, so no cumulative OK ack may
+/// cover it; only a committing frame is acked, and that ack covers the group.
+/// With `kill_after = Some(n)`, close the socket after reading `n` frames —
+/// a peer that dies mid-group.
+fn defer_aware_ack(
+    stream: &mut std::net::TcpStream,
+    stop: &AtomicBool,
+    capture: Option<mpsc::Sender<Vec<u8>>>,
+    kill_after: Option<usize>,
+) {
+    const FLAG_DEFER_COMMIT: u8 = 0x01;
+    const QWP_FLAGS_OFFSET: usize = 5;
+    let _ = stream.set_read_timeout(Some(Duration::from_millis(50)));
+    let mut frame_index: u64 = 0;
+    let mut read = 0usize;
+    loop {
+        if stop.load(Ordering::SeqCst) {
+            break;
+        }
+        if kill_after.is_some_and(|n| read >= n) {
+            // Mark the boundary in the capture stream so a reader can split the
+            // dead peer's frames from the replay without assuming a count.
+            if let Some(tx) = capture.as_ref() {
+                let _ = tx.send(Vec::new());
+            }
+            break; // returning drops the stream: the client's next read sees EOF
+        }
+        match read_frame(stream) {
+            Ok((_fin, opcode, payload)) => {
+                if opcode == 0x8 {
+                    break;
+                }
+                if opcode != 0x2 {
+                    continue;
+                }
+                read += 1;
+                let deferred = payload.len() > QWP_FLAGS_OFFSET
+                    && (payload[QWP_FLAGS_OFFSET] & FLAG_DEFER_COMMIT) != 0;
+                if let Some(tx) = capture.as_ref() {
+                    let _ = tx.send(payload);
+                }
+                if !deferred && write_qwp_ok_response(stream, frame_index).is_err() {
+                    break;
+                }
+                frame_index += 1;
+            }
+            Err(e)
+                if e.kind() == std::io::ErrorKind::WouldBlock
+                    || e.kind() == std::io::ErrorKind::TimedOut =>
+            {
+                continue;
+            }
+            Err(_) => break,
+        }
+    }
+}
+
+/// As [`defer_aware_ack`], but with `reject_at = Some(n)` the `n`-th data
+/// frame (0-based) is answered with a retriable `NOT_WRITABLE` rejection
+/// instead of being acked or withheld — the role-switch response a primary
+/// gives while it is still holding a deferred group.
+fn defer_aware_ack_rejecting(
+    stream: &mut std::net::TcpStream,
+    stop: &AtomicBool,
+    capture: Option<mpsc::Sender<Vec<u8>>>,
+    reject_at: Option<usize>,
+) {
+    const FLAG_DEFER_COMMIT: u8 = 0x01;
+    const QWP_FLAGS_OFFSET: usize = 5;
+    const QWP_STATUS_NOT_WRITABLE: u8 = 0x0C;
+    let _ = stream.set_read_timeout(Some(Duration::from_millis(50)));
+    let mut frame_index: u64 = 0;
+    let mut read = 0usize;
+    loop {
+        if stop.load(Ordering::SeqCst) {
+            break;
+        }
+        match read_frame(stream) {
+            Ok((_fin, opcode, payload)) => {
+                if opcode == 0x8 {
+                    break;
+                }
+                if opcode != 0x2 {
+                    continue;
+                }
+                let index = read;
+                read += 1;
+                let deferred = payload.len() > QWP_FLAGS_OFFSET
+                    && (payload[QWP_FLAGS_OFFSET] & FLAG_DEFER_COMMIT) != 0;
+                if let Some(tx) = capture.as_ref() {
+                    let _ = tx.send(payload);
+                }
+                if reject_at == Some(index) {
+                    let _ = write_qwp_error_response(
+                        stream,
+                        QWP_STATUS_NOT_WRITABLE,
+                        frame_index,
+                        b"table is read only",
+                    );
+                    // Mark the boundary so a reader can split this peer's
+                    // frames from the replay without assuming a count.
+                    if let Some(tx) = capture.as_ref() {
+                        let _ = tx.send(Vec::new());
+                    }
+                    break;
+                }
+                if !deferred && write_qwp_ok_response(stream, frame_index).is_err() {
+                    break;
+                }
+                frame_index += 1;
+            }
+            Err(e)
+                if e.kind() == std::io::ErrorKind::WouldBlock
+                    || e.kind() == std::io::ErrorKind::TimedOut =>
+            {
+                continue;
+            }
+            Err(_) => break,
+        }
+    }
+}
+
 /// Read (consume) the first `n` binary frames the client sends — so its
 /// `write_all`s provably succeed — then close without ever acking. The client's
 /// subsequent ACK-wait read hits EOF.
@@ -773,6 +927,47 @@ fn frame_row_count(payload: &[u8]) -> u64 {
     }
     read_test_bytes(payload, &mut pos); // table name
     read_test_varint(payload, &mut pos)
+}
+
+/// Decode the `qty` i64 column out of a captured frame from the `trades`
+/// chunks these tests build (one `column_i64` plus a designated timestamp).
+/// Layout after [`frame_row_count`]'s prefix: `column_count`, the signature
+/// (`name`, wire type) per column, then the column's null flag and its
+/// little-endian slab.
+///
+/// Row COUNTS alone cannot tell an exactly-once replay from a
+/// drop-and-duplicate one that happens to sum the same; the values can.
+fn frame_qty_values(payload: &[u8]) -> Vec<i64> {
+    const QWP_HEADER_LEN: usize = 12;
+    // Only data frames have the layout below. A header-only or dictionary frame
+    // would walk the cursor off the end and panic, turning "the capture held an
+    // unexpected frame" into an unattributable index-out-of-bounds.
+    if payload.len() < QWP_HEADER_LEN
+        || &payload[..4] != b"QWP1"
+        || u16::from_le_bytes([payload[6], payload[7]]) == 0
+    {
+        return Vec::new();
+    }
+    let mut pos = QWP_HEADER_LEN;
+    read_test_varint(payload, &mut pos); // delta_start
+    let new_symbols = read_test_varint(payload, &mut pos);
+    for _ in 0..new_symbols {
+        read_test_bytes(payload, &mut pos);
+    }
+    read_test_bytes(payload, &mut pos); // table name
+    let row_count = read_test_varint(payload, &mut pos) as usize;
+    let column_count = read_test_varint(payload, &mut pos) as usize;
+    for _ in 0..column_count {
+        read_test_bytes(payload, &mut pos); // column name; empty for designated ts
+        pos += 1; // wire type
+    }
+    pos += 1; // qty null flag: 0x00, sentinel encoding
+    (0..row_count)
+        .map(|row| {
+            let at = pos + row * 8;
+            i64::from_le_bytes(payload[at..at + 8].try_into().unwrap())
+        })
+        .collect()
 }
 
 fn sorted_slot_names(sf_dir: &Path) -> Vec<String> {
@@ -3152,23 +3347,337 @@ fn standalone_direct_sender_force_drop_discards_in_flight() {
 }
 
 #[test]
-fn store_and_forward_flush_splits_oversize_chunk_into_self_sufficient_frames() {
-    // The store-and-forward backend also splits an oversize chunk, but into
-    // independently-committed self-sufficient frames — never deferred ones,
-    // which the frame-granular replay queue could drop on a reconnect that
-    // trims them after their ack but before a commit boundary.
+fn store_and_forward_replays_the_whole_group_when_the_peer_dies_mid_deferred_group() {
+    // The safety property behind committing a split chunk only at its last
+    // frame: a peer death mid-group must lose nothing.
+    //
+    // Every frame but the last carries FLAG_DEFER_COMMIT. A server that models
+    // QuestDB's deferred-commit ack contract (questdb#7144) never acks those
+    // frames -- while their rows sit uncommitted it refuses to advance the
+    // cumulative-ack watermark over them. So when the peer dies mid-group the
+    // client has no ack covering any of it, nothing is trimmed from the replay
+    // queue, and the whole group is re-sent on the next connection.
+    //
+    // This is the test the old "never defer on store-and-forward" comment was
+    // written in the absence of: it names the hazard (trimmed after ack, before
+    // commit) and shows the clamp closes it.
+    const CAP: usize = 2048;
+    const ROWS: usize = 512;
+    const KILL_AFTER: usize = 2; // die partway through the deferred prefix
+
+    let (tx, frames) = mpsc::channel();
+    let server = MockServer::spawn_with_mode_capture(
+        2,
+        MockMode::DeferAwareAckKillingFirstConn(KILL_AFTER),
+        Some(tx),
+    );
+
+    let conf = conf_for_endpoints(
+        &[server.port()],
+        &format!("max_buf_size={CAP};pool_reap=manual;",),
+    );
+    let db = QuestDb::connect(&conf).unwrap();
+
+    let qty: Vec<i64> = (0..ROWS as i64).collect();
+    let ts: Vec<i64> = (0..ROWS as i64)
+        .map(|x| 1_700_000_000_000_000_000 + x)
+        .collect();
+    let mut chunk = Chunk::new("trades");
+    chunk.column_i64("qty", &qty, None).unwrap();
+    chunk.at_nanos(&ts).unwrap();
+
+    let mut sender = db.borrow_sender().unwrap();
+    sender
+        .flush(&mut chunk)
+        .expect("oversize chunk splits and queues");
+
+    // The first peer dies mid-group; the pool reconnects and replays. The wait
+    // only succeeds once a committing frame is acked on the new connection.
+    sender
+        .wait(AckLevel::Ok, Duration::from_secs(30))
+        .expect("group replays and commits after the peer death");
+
+    // The mock pushes an empty marker frame at the moment the first peer dies,
+    // so the split between "seen by the dead peer" and "replayed" is read off
+    // the capture stream rather than assumed from a count.
+    let mut before_death = Vec::new();
+    let mut replayed_frames = Vec::new();
+    let mut peer_died = false;
+    while let Ok(frame) = frames.recv_timeout(Duration::from_millis(500)) {
+        if frame.is_empty() {
+            peer_died = true;
+        } else if peer_died {
+            replayed_frames.push(frame);
+        } else {
+            before_death.push(frame);
+        }
+    }
+    let captured: Vec<Vec<u8>> = before_death
+        .iter()
+        .chain(replayed_frames.iter())
+        .cloned()
+        .collect();
+
+    assert!(peer_died, "the mock never reported the first peer dying");
+    assert_eq!(
+        before_death.len(),
+        KILL_AFTER,
+        "the dead peer must have captured exactly {KILL_AFTER} frames before dying"
+    );
+    assert!(
+        server.accepted() >= 2,
+        "the peer death must have driven a reconnect, saw {} accept(s)",
+        server.accepted()
+    );
+
+    // Nothing was acked before the death, so the whole group -- including the
+    // frames the dead peer already received -- must appear again.
+    let total_rows: u64 = captured.iter().map(|f| frame_row_count(f)).sum();
+    assert!(
+        total_rows > ROWS as u64,
+        "frames received before the peer death must be replayed, not trimmed: \
+         saw {total_rows} rows across {} frames for a {ROWS}-row chunk",
+        captured.len()
+    );
+
+    // And the replay is complete: the frames after the reconnect cover every row,
+    // exactly once each. The boundary came off the capture stream above, so a
+    // miscount fails there by name rather than masquerading as a short replay.
+    let replayed: u64 = replayed_frames.iter().map(|f| frame_row_count(f)).sum();
+    assert_eq!(
+        replayed, ROWS as u64,
+        "the replayed group must cover every row exactly once"
+    );
+    // Row identity, not just the count: a drop-and-duplicate replay sums to
+    // ROWS too. Every qty value 0..ROWS must appear exactly once after the
+    // reconnect.
+    let mut replayed_qty: Vec<i64> = replayed_frames
+        .iter()
+        .flat_map(|f| frame_qty_values(f))
+        .collect();
+    replayed_qty.sort_unstable();
+    assert_eq!(
+        replayed_qty,
+        (0..ROWS as i64).collect::<Vec<_>>(),
+        "the replayed group must carry every row's value exactly once"
+    );
+}
+
+#[test]
+fn store_and_forward_mid_group_reject_recycles_instead_of_terminalizing() {
+    // Deferring a split chunk's non-final frames makes the client legitimately
+    // produce frames the server never answers, which broke the driver's reject
+    // handler. `oldest_unresolved_fsn` is the first UN-ACKED frame, so inside a
+    // deferred group it stays pinned at the group head until the committing
+    // frame lands. The handler required the rejected FSN to equal that head and
+    // reported a WebSocket protocol violation otherwise -- turning an expected
+    // primary-to-replica role switch mid-split into a producer-fatal terminal,
+    // with the innocent head frame terminalized alongside it.
+    //
+    // The ack path was already prefix-cumulative (`complete_ack_through`),
+    // which is what makes deferral work at all; the reject path was not.
+    //
+    // REJECT_AT is a deferred frame, not the group head: at the head the old
+    // code was already correct, which is what makes this the discriminating
+    // configuration.
+    const CAP: usize = 2048;
+    const ROWS: usize = 512;
+    const REJECT_AT: usize = 1;
+
+    let (tx, frames) = mpsc::channel();
+    let server = MockServer::spawn_with_mode_capture(
+        2,
+        MockMode::DeferAwareRejectingFrame(REJECT_AT),
+        Some(tx),
+    );
+
+    let conf = conf_for_endpoints(
+        &[server.port()],
+        &format!("max_buf_size={CAP};pool_reap=manual;"),
+    );
+    let db = QuestDb::connect(&conf).unwrap();
+
+    let qty: Vec<i64> = (0..ROWS as i64).collect();
+    let ts: Vec<i64> = (0..ROWS as i64)
+        .map(|x| 1_700_000_000_000_000_000 + x)
+        .collect();
+    let mut chunk = Chunk::new("trades");
+    chunk.column_i64("qty", &qty, None).unwrap();
+    chunk.at_nanos(&ts).unwrap();
+
+    let mut sender = db.borrow_sender().unwrap();
+    sender.flush(&mut chunk).expect("oversize chunk splits");
+
+    sender.wait(AckLevel::Ok, Duration::from_secs(30)).expect(
+        "a NOT_WRITABLE reject of a deferred frame that is not the group head \
+         must recycle and replay, not raise a protocol violation",
+    );
+
+    // The mock marks the moment it rejects, so the replay boundary is read off
+    // the capture stream rather than assumed from a count.
+    let mut replayed_frames = Vec::new();
+    let mut rejected = false;
+    while let Ok(frame) = frames.recv_timeout(Duration::from_millis(500)) {
+        if frame.is_empty() {
+            rejected = true;
+        } else if rejected {
+            replayed_frames.push(frame);
+        }
+    }
+    assert!(rejected, "the mock never reported rejecting a frame");
+    assert!(
+        server.accepted() >= 2,
+        "the reject must have driven a reconnect, saw {} accept(s)",
+        server.accepted()
+    );
+
+    // Nothing in the group was acked, so the replay onto the new primary must
+    // carry every row exactly once.
+    let mut replayed_qty: Vec<i64> = replayed_frames
+        .iter()
+        .flat_map(|f| frame_qty_values(f))
+        .collect();
+    replayed_qty.sort_unstable();
+    assert_eq!(
+        replayed_qty,
+        (0..ROWS as i64).collect::<Vec<_>>(),
+        "the replayed group must carry every row's value exactly once"
+    );
+}
+
+#[test]
+fn store_and_forward_split_commits_early_rather_than_stalling_on_queue_capacity() {
+    // A deferred frame is never acked, so the queue storage it occupies is
+    // never reclaimed by `maintain_storage`. Deferring every frame but the last
+    // therefore lets a long enough split consume the slot's whole byte budget
+    // with frames that only the committing frame can release -- and that frame
+    // cannot publish, because the budget is gone. The foreground blocks on
+    // back-pressure until `sf_append_deadline` and fails, leaving the deferred
+    // prefix durably enqueued with nothing to commit it.
+    //
+    // A tight `sf_max_total_bytes` makes it certain. The valve commits at the
+    // frame where the reserved headroom runs out, which lets the queue reclaim
+    // and starts a fresh deferred group.
+    //
+    // The server here is defer-aware -- it acks only non-deferred frames, the
+    // contract questdb#7144/#7440 implement. An unconditionally-acking mock
+    // could not reproduce the stall at all.
+    const CAP: usize = 2048;
+    const SEGMENT: usize = 1024;
+    // Six segments, not three. A fresh slot already holds an active segment
+    // plus a hot spare, and the valve reserves one more for the committing
+    // frame, so at three the valve is closed for the whole flush and this test
+    // would pass without a single frame ever deferring -- unable to tell the
+    // shipped valve from one hardwired to false. At five the split defers, then
+    // downgrades mid-flight when the budget backs up, which is the transition
+    // the production defaults actually take.
+    const TOTAL: usize = SEGMENT * 6;
+    const ROWS: usize = 512;
+
+    let (tx, frames) = mpsc::channel();
+    let server = MockServer::spawn_with_mode_capture(1, MockMode::DeferAwareAck, Some(tx));
+
+    let conf = conf_for_endpoints(
+        &[server.port()],
+        &format!(
+            "max_buf_size={CAP};pool_reap=manual;\
+             sf_max_segment_bytes={SEGMENT};sf_max_total_bytes={TOTAL};\
+             sf_append_deadline_millis=30000;",
+        ),
+    );
+    let db = QuestDb::connect(&conf).unwrap();
+
+    let qty: Vec<i64> = (0..ROWS as i64).collect();
+    let ts: Vec<i64> = (0..ROWS as i64)
+        .map(|x| 1_700_000_000_000_000_000 + x)
+        .collect();
+    let mut chunk = Chunk::new("trades");
+    chunk.column_i64("qty", &qty, None).unwrap();
+    chunk.at_nanos(&ts).unwrap();
+
+    let mut sender = db.borrow_sender().unwrap();
+    sender.flush(&mut chunk).expect(
+        "an oversize chunk must still publish inside a tight sf_max_total_bytes; the \
+         deferred prefix must not consume the budget the committing frame needs",
+    );
+    sender
+        .wait(AckLevel::Ok, Duration::from_secs(30))
+        .expect("every frame must reach a committing frame's ack");
+
+    let mut captured = Vec::new();
+    while let Ok(frame) = frames.recv_timeout(Duration::from_millis(500)) {
+        captured.push(frame);
+    }
+    assert!(
+        captured.len() > 1,
+        "the chunk must have split, got {} frame(s)",
+        captured.len()
+    );
+
+    // The valve's actual signature, and what distinguishes this from a run in
+    // which nothing ever deferred: the split both DEFERS and, when the reserve
+    // runs out, COMMITS at a frame that is not the last one.
+    const FLAG_DEFER_COMMIT: u8 = 0x01;
+    let deferred = captured
+        .iter()
+        .filter(|frame| frame[5] & FLAG_DEFER_COMMIT != 0)
+        .count();
+    let committing_before_last = captured[..captured.len() - 1]
+        .iter()
+        .filter(|frame| frame[5] & FLAG_DEFER_COMMIT == 0)
+        .count();
+    assert!(
+        deferred > 0,
+        "the valve must still allow deferral while the budget has headroom; \
+         {} frame(s), none deferred",
+        captured.len()
+    );
+    assert!(
+        committing_before_last > 0,
+        "the valve must commit mid-split once the reserve runs out; {} frame(s), \
+         {deferred} deferred, none committing before the last",
+        captured.len()
+    );
+    assert_eq!(
+        captured[captured.len() - 1][5] & FLAG_DEFER_COMMIT,
+        0,
+        "the last frame must always commit"
+    );
+
+    let mut values: Vec<i64> = captured.iter().flat_map(|f| frame_qty_values(f)).collect();
+    values.sort_unstable();
+    assert_eq!(
+        values,
+        (0..ROWS as i64).collect::<Vec<_>>(),
+        "the split must carry every row exactly once"
+    );
+}
+
+#[test]
+fn store_and_forward_flush_splits_oversize_chunk_committing_once_at_the_last_frame() {
+    // The store-and-forward backend splits an oversize chunk into frames that
+    // commit ONCE, at the last frame: every earlier frame carries
+    // FLAG_DEFER_COMMIT so the chunk -- which is also the replay unit -- stays
+    // the atomic commit boundary instead of committing once per frame.
+    //
+    // This used to assert the opposite (no frame deferred), on the grounds that
+    // the frame-granular replay queue could drop a deferred frame on a reconnect
+    // that trimmed it after its ack but before a commit. The server closed that
+    // hole in questdb#7144: while FLAG_DEFER_COMMIT rows sit uncommitted it
+    // refuses to advance the cumulative-ack watermark over them, so deferred
+    // frames are never acked, never trimmed, and replay on reconnect.
+    //
+    // NOTE: MockServer acks unconditionally, so the ack assertions below do NOT
+    // exercise that clamp -- they only pin that the closing frame's cumulative
+    // ack still covers the whole group. The clamp itself is server-side.
     const CAP: usize = 2048;
     const ROWS: usize = 512;
     const FLAG_DEFER_COMMIT: u8 = 0x01;
 
     let (server, frames) = MockServer::spawn_acking_capturing(1);
-    let dir = TempDir::new().unwrap();
     let conf = conf_for_endpoints(
         &[server.port()],
-        &format!(
-            "max_buf_size={CAP};sf_dir={};pool_reap=manual;",
-            dir.path().display()
-        ),
+        &format!("max_buf_size={CAP};pool_reap=manual;",),
     );
     let db = QuestDb::connect(&conf).unwrap();
 
@@ -3218,10 +3727,88 @@ fn store_and_forward_flush_splits_oversize_chunk_into_self_sufficient_frames() {
             "frame {i} is {} bytes, exceeds cap {CAP}",
             frame.len()
         );
+        let is_last = i == captured.len() - 1;
+        assert_eq!(
+            frame[5] & FLAG_DEFER_COMMIT != 0,
+            !is_last,
+            "frame {i} of {}: every frame but the last must be deferred, so the \
+             chunk commits exactly once at its final frame",
+            captured.len()
+        );
+    }
+    let total: u64 = captured.iter().map(|f| frame_row_count(f)).sum();
+    assert_eq!(
+        total, ROWS as u64,
+        "split frames must cover every row exactly once"
+    );
+}
+
+#[test]
+fn store_and_forward_split_never_defers_when_sf_dir_persists_the_queue() {
+    // The mirror of the memory-mode test above, and the gate that keeps
+    // deferral out of the durable path.
+    //
+    // FLAG_DEFER_COMMIT is unknown to the queue, segment, manifest and
+    // recovery layers -- it appears nowhere under `ingress/sender/`. A process
+    // death between a deferred append and its committing append would leave an
+    // on-disk shape nothing downstream can interpret: the orphan drainer opens
+    // replay-only with no producer, so it can never append the committing
+    // frame, and `orphan_queue_drained` is `completed >= published`, which such
+    // a tail never satisfies -- an undrainable slot re-adopted on every start.
+    //
+    // So with `sf_dir` set the split still commits per frame, exactly as it did
+    // before deferral existed. Lifting this needs commit-boundary recovery in
+    // the queue itself (the Java client's `recoveredCommitBoundaryFsn` plus
+    // orphan-tail retirement); until then the throughput win is memory-mode
+    // only, which is the default (`sf_dir` unset).
+    const CAP: usize = 2048;
+    const ROWS: usize = 512;
+    const FLAG_DEFER_COMMIT: u8 = 0x01;
+
+    let (server, frames) = MockServer::spawn_acking_capturing(1);
+    let dir = TempDir::new().unwrap();
+    let conf = conf_for_endpoints(
+        &[server.port()],
+        &format!(
+            "max_buf_size={CAP};sf_dir={};pool_reap=manual;",
+            dir.path().display()
+        ),
+    );
+    let db = QuestDb::connect(&conf).unwrap();
+
+    let qty: Vec<i64> = (0..ROWS as i64).collect();
+    let ts: Vec<i64> = (0..ROWS as i64)
+        .map(|x| 1_700_000_000_000_000_000 + x)
+        .collect();
+    let mut chunk = Chunk::new("trades");
+    chunk.column_i64("qty", &qty, None).unwrap();
+    chunk.at_nanos(&ts).unwrap();
+
+    let mut sender = db.borrow_sender().unwrap();
+    sender
+        .flush(&mut chunk)
+        .expect("oversize chunk splits and appends");
+    sender
+        .wait(AckLevel::Ok, Duration::from_secs(30))
+        .expect("all split frames commit");
+
+    let mut captured = Vec::new();
+    while let Ok(frame) = frames.recv_timeout(Duration::from_millis(500)) {
+        captured.push(frame);
+    }
+    assert!(
+        captured.len() > 1,
+        "oversize chunk must split into multiple frames, got {}",
+        captured.len()
+    );
+    for (i, frame) in captured.iter().enumerate() {
         assert_eq!(
             frame[5] & FLAG_DEFER_COMMIT,
             0,
-            "store-and-forward frame {i} must be self-sufficient, not deferred"
+            "frame {i} of {}: no frame may be deferred while sf_dir persists \
+             the queue -- a tail left deferred outlives the process and no \
+             recovery path can commit it",
+            captured.len()
         );
     }
     let total: u64 = captured.iter().map(|f| frame_row_count(f)).sum();
@@ -3337,6 +3924,303 @@ fn store_and_forward_irreducible_frame_over_segment_cap_is_batch_too_large() {
         sender.published_fsn().unwrap(),
         None,
         "nothing may be queued for a rejected irreducible frame"
+    );
+}
+
+/// Rows for a chunk that cannot be split down to a publishable frame, with the
+/// irreducible 8-row block placed to fail either half of the top-level split.
+///
+/// `Trailing` (16 rows, wide in 8..16): the leading half publishes, the trailing
+/// half is irreducible.
+///
+/// `Leading` (32 rows, wide in 8..16): the top-level split is at 16, so the
+/// LEADING half recurses, publishes rows 0..8 deferred, and only then hits the
+/// irreducible block. The error propagates past the trailing call entirely, so
+/// guarding only the trailing call leaves those frames stranded. 16 rows cannot
+/// express this -- the leading half would be exactly 8, which `split_mid`
+/// refuses to divide, so nothing is published and the flush is a clean
+/// rejection instead.
+fn split_floor_rows(shape: SplitFloorShape) -> (Vec<i32>, Vec<u8>) {
+    const WIDE: usize = 4000;
+    let (rows, wide) = match shape {
+        SplitFloorShape::FailsInTrailingHalf => (16, 8..16),
+        SplitFloorShape::FailsInLeadingHalf => (32, 8..16),
+        SplitFloorShape::RejectsBeforePublishing => (16, 0..8),
+    };
+    let mut bytes = Vec::new();
+    let mut offsets = vec![0i32];
+    for row in 0..rows {
+        let is_wide = wide.contains(&row);
+        bytes.extend(std::iter::repeat_n(b'x', if is_wide { WIDE } else { 1 }));
+        offsets.push(bytes.len() as i32);
+    }
+    (offsets, bytes)
+}
+
+#[derive(Clone, Copy)]
+enum SplitFloorShape {
+    /// 16 rows, irreducible block in 8..16. The leading half publishes; the
+    /// trailing half fails.
+    FailsInTrailingHalf,
+    /// 32 rows, irreducible block in 8..16. The top-level split is at 16, so the
+    /// LEADING half recurses, publishes rows 0..8 deferred, and only then hits
+    /// the irreducible block -- the error escapes before the trailing call runs.
+    FailsInLeadingHalf,
+    /// 16 rows, irreducible block in 0..8. The leading half is exactly 8, which
+    /// `split_mid` refuses to divide, so the flush is rejected with NOTHING
+    /// enqueued.
+    RejectsBeforePublishing,
+}
+
+#[test]
+fn store_and_forward_split_floor_failure_still_commits_the_deferred_prefix() {
+    check_split_floor_failure_commits_prefix(SplitFloorShape::FailsInTrailingHalf, 16);
+}
+
+/// The irreducible rows lead, so the failure happens inside the FIRST half's own
+/// recursion. That half publishes its own deferred prefix before failing, and
+/// the error then propagates past the trailing call entirely.
+#[test]
+fn store_and_forward_split_floor_failure_in_leading_half_still_commits_the_prefix() {
+    check_split_floor_failure_commits_prefix(SplitFloorShape::FailsInLeadingHalf, 32);
+}
+
+/// A slot persisted after a failed split must have nothing left to replay when
+/// it is reopened.
+///
+/// This is the end-to-end durability property the in-flush close buys: with
+/// `sf_dir`, a tail left deferred outlives the process, and every reopen
+/// replays it, gets no ack by design, and burns the whole drain timeout.
+///
+/// Note what this does NOT cover. `PooledSenderCore::close_open_deferred_group`
+/// is a second line of defence for the case where the in-flush close itself
+/// fails -- a concurrent `begin_close` rejects the publish, and that rejection
+/// is not one the flush-entry check catches. Disabling that hook leaves this
+/// test green, because the in-flush close already ran. Reaching the hook needs
+/// a close racing a split, which I could not produce deterministically.
+#[test]
+fn store_and_forward_reopened_slot_has_nothing_to_replay_after_a_failed_split() {
+    const CAP: usize = 2048;
+
+    let (tx, frames) = mpsc::channel();
+    let server = MockServer::spawn_with_mode_capture(2, MockMode::DeferAwareAck, Some(tx));
+    let dir = TempDir::new().unwrap();
+    let conf = conf_for_endpoints(
+        &[server.port()],
+        &format!(
+            "max_buf_size={CAP};sf_dir={};pool_reap=manual;sender_id=reopen_me;",
+            dir.path().display()
+        ),
+    );
+
+    {
+        let db = QuestDb::connect(&conf).unwrap();
+        let (offsets, bytes) = split_floor_rows(SplitFloorShape::FailsInTrailingHalf);
+        let ts: Vec<i64> = (0..16i64).map(|x| 1_700_000_000_000_000_000 + x).collect();
+        let mut chunk = Chunk::new("trades");
+        chunk.column_str("s", &offsets, &bytes, None).unwrap();
+        chunk.at_nanos(&ts).unwrap();
+
+        let mut sender = db.borrow_sender().unwrap();
+        sender
+            .flush(&mut chunk)
+            .expect_err("the irreducible block must fail the flush");
+        drop(sender);
+        // Dropping the pool runs the close path.
+    }
+
+    // Reopen the same slot. A tail that was left deferred would replay here and
+    // never resolve; a closed group leaves nothing to replay.
+    let db = QuestDb::connect(&conf).unwrap();
+    let sender = db.borrow_sender().unwrap();
+    let replayed = sender.published_fsn().unwrap();
+    drop(sender);
+    drop(db);
+
+    let mut captured = Vec::new();
+    while let Ok(frame) = frames.recv_timeout(Duration::from_millis(500)) {
+        captured.push(frame);
+    }
+    const FLAG_DEFER_COMMIT: u8 = 0x01;
+    assert!(
+        captured
+            .iter()
+            .any(|frame| frame[5] & FLAG_DEFER_COMMIT == 0),
+        "a committing frame must have closed the group before the queue was \
+         persisted; captured {} frame(s), all deferred",
+        captured.len()
+    );
+    assert_eq!(
+        replayed, None,
+        "the reopened slot must have nothing left to replay, got {replayed:?}"
+    );
+}
+
+/// A split rejected before ANYTHING reaches the queue must stay a clean
+/// rejection: no committing frame, and an error the caller may safely retry.
+/// Over-closing is not free -- it costs a queue frame and a server-side
+/// `commitAll` walk of every table the connection registered, and it turns a
+/// retry-safe rejection into a delivery-unknown one.
+#[test]
+fn store_and_forward_split_rejected_before_publishing_stays_a_clean_rejection() {
+    const CAP: usize = 2048;
+
+    let (tx, frames) = mpsc::channel();
+    let server = MockServer::spawn_with_mode_capture(1, MockMode::DeferAwareAck, Some(tx));
+    let conf = conf_for_endpoints(
+        &[server.port()],
+        &format!("max_buf_size={CAP};pool_reap=manual;",),
+    );
+    let db = QuestDb::connect(&conf).unwrap();
+
+    let (offsets, bytes) = split_floor_rows(SplitFloorShape::RejectsBeforePublishing);
+    let ts: Vec<i64> = (0..16i64).map(|x| 1_700_000_000_000_000_000 + x).collect();
+    let mut chunk = Chunk::new("trades");
+    chunk.column_str("s", &offsets, &bytes, None).unwrap();
+    chunk.at_nanos(&ts).unwrap();
+
+    let mut sender = db.borrow_sender().unwrap();
+    let err = sender
+        .flush(&mut chunk)
+        .expect_err("the irreducible leading block must fail the flush");
+    assert_eq!(err.code(), ErrorCode::BatchTooLarge);
+    assert!(
+        !err.in_doubt(),
+        "nothing reached the queue, so the rejection must stay safe to retry"
+    );
+    assert_eq!(
+        sender.published_fsn().unwrap(),
+        None,
+        "a split rejected before anything reached the queue must not publish a \
+         commit frame"
+    );
+
+    let mut captured = Vec::new();
+    while let Ok(frame) = frames.recv_timeout(Duration::from_millis(500)) {
+        captured.push(frame);
+    }
+    assert!(
+        captured.is_empty(),
+        "nothing may reach the wire, got {} frame(s)",
+        captured.len()
+    );
+}
+
+/// A split whose valve was shut throughout defers nothing, so a failure has no
+/// group to close and must not publish a committing frame for one. Publishing it
+/// anyway costs a queue frame and a server-side `commitAll` walk of every table
+/// the connection ever registered, on a path that is already failing.
+#[test]
+fn store_and_forward_split_floor_failure_without_deferral_publishes_no_extra_frame() {
+    const CAP: usize = 2048;
+    const SEGMENT: usize = 1024;
+    // Four segments: a fresh slot holds active + hot spare, and the valve
+    // reserves two more, so it is shut for the whole flush and nothing defers.
+    const TOTAL: usize = SEGMENT * 4;
+
+    let (tx, frames) = mpsc::channel();
+    let server = MockServer::spawn_with_mode_capture(1, MockMode::DeferAwareAck, Some(tx));
+    let conf = conf_for_endpoints(
+        &[server.port()],
+        &format!(
+            "max_buf_size={CAP};pool_reap=manual;\
+             sf_max_segment_bytes={SEGMENT};sf_max_total_bytes={TOTAL};",
+        ),
+    );
+    let db = QuestDb::connect(&conf).unwrap();
+
+    let (offsets, bytes) = split_floor_rows(SplitFloorShape::FailsInTrailingHalf);
+    let ts: Vec<i64> = (0..16i64).map(|x| 1_700_000_000_000_000_000 + x).collect();
+    let mut chunk = Chunk::new("trades");
+    chunk.column_str("s", &offsets, &bytes, None).unwrap();
+    chunk.at_nanos(&ts).unwrap();
+
+    let mut sender = db.borrow_sender().unwrap();
+    let err = sender
+        .flush(&mut chunk)
+        .expect_err("the irreducible block must fail the flush");
+    assert_eq!(err.code(), ErrorCode::BatchTooLarge);
+    sender
+        .wait(AckLevel::Ok, Duration::from_secs(30))
+        .expect("the committed prefix must be acked");
+
+    let mut captured = Vec::new();
+    while let Ok(frame) = frames.recv_timeout(Duration::from_millis(500)) {
+        captured.push(frame);
+    }
+    const FLAG_DEFER_COMMIT: u8 = 0x01;
+    assert!(
+        captured
+            .iter()
+            .all(|frame| frame[5] & FLAG_DEFER_COMMIT == 0),
+        "premise: the valve must be shut at this budget, so nothing defers"
+    );
+    // Every frame carries rows. An empty header-only frame would be 14 bytes.
+    assert!(
+        captured.iter().all(|frame| frame.len() > 20),
+        "a split that deferred nothing must not publish a committing frame for a \
+         group that was never opened; frame sizes: {:?}",
+        captured.iter().map(|f| f.len()).collect::<Vec<_>>()
+    );
+}
+
+fn check_split_floor_failure_commits_prefix(shape: SplitFloorShape, rows: usize) {
+    // A split whose remainder is irreducible leaves the prefix on the queue and
+    // deferred. A deferred frame is never acked, so without a committing frame
+    // after it the prefix can never be acked, never trimmed, and never commits:
+    // wait() can no longer succeed and close() burns its whole drain timeout.
+    //
+    // The server here is defer-aware -- it acks only non-deferred frames, which
+    // is what makes the hazard observable. Against an unconditionally-acking
+    // mock the deferred prefix would be acked anyway and the test would be
+    // vacuous.
+    const CAP: usize = 2048;
+
+    let (tx, frames) = mpsc::channel();
+    let server = MockServer::spawn_with_mode_capture(1, MockMode::DeferAwareAck, Some(tx));
+    let conf = conf_for_endpoints(
+        &[server.port()],
+        &format!("max_buf_size={CAP};pool_reap=manual;",),
+    );
+    let db = QuestDb::connect(&conf).unwrap();
+
+    let (offsets, bytes) = split_floor_rows(shape);
+    let ts: Vec<i64> = (0..rows as i64)
+        .map(|x| 1_700_000_000_000_000_000 + x)
+        .collect();
+    let mut chunk = Chunk::new("trades");
+    chunk.column_str("s", &offsets, &bytes, None).unwrap();
+    chunk.at_nanos(&ts).unwrap();
+
+    let mut sender = db.borrow_sender().unwrap();
+    let err = sender
+        .flush(&mut chunk)
+        .expect_err("the irreducible block must fail the flush");
+    assert_eq!(err.code(), ErrorCode::BatchTooLarge);
+    assert!(
+        err.in_doubt(),
+        "the prefix reached the server, so the chunk must not be reported as safe \
+         to blind-retry"
+    );
+
+    // The flush failed, but the prefix reached the server. It must be committed,
+    // not stranded: a wait that cannot succeed here is the whole defect.
+    sender.wait(AckLevel::Ok, Duration::from_secs(30)).expect(
+        "the prefix published before the failure must still be committed; a timeout \
+         here means it was left deferred with no frame able to commit it",
+    );
+
+    let mut captured = Vec::new();
+    while let Ok(frame) = frames.recv_timeout(Duration::from_millis(500)) {
+        captured.push(frame);
+    }
+    const FLAG_DEFER_COMMIT: u8 = 0x01;
+    assert!(
+        captured
+            .iter()
+            .any(|frame| frame[5] & FLAG_DEFER_COMMIT == 0),
+        "a committing frame must close the group, got {} frame(s) all deferred",
+        captured.len()
     );
 }
 
@@ -6956,6 +7840,214 @@ fn store_and_forward_arrow_batch_reports_fsn_progress_and_split_boundary() {
     assert_eq!(
         got, vals,
         "split frames must cover every row of the batch exactly once"
+    );
+}
+
+#[cfg(feature = "arrow-ingress")]
+#[test]
+fn store_and_forward_arrow_split_commits_once_at_the_last_frame() {
+    // The Arrow SFA path splits the same way the manual chunk path does, so it
+    // gets the same commit boundary: every frame but the last is deferred, and
+    // the batch commits once. Without this the backend would be internally
+    // inconsistent -- manual flushes committing once per batch while the
+    // Arrow/Polars/pandas surface still committed once per frame.
+    use arrow::array::{ArrayRef, Int64Array, RecordBatch};
+    use std::sync::Arc;
+
+    const CAP: usize = 2048;
+    const ROWS: usize = 512;
+    const FLAG_DEFER_COMMIT: u8 = 0x01;
+
+    let (tx, frames) = mpsc::channel();
+    let server = MockServer::spawn_with_mode_capture(1, MockMode::DeferAwareAck, Some(tx));
+    let conf = conf_for_endpoints(
+        &[server.port()],
+        &format!("max_buf_size={CAP};pool_reap=manual;",),
+    );
+    let db = QuestDb::connect(&conf).unwrap();
+
+    let vals: Vec<i64> = (0..ROWS as i64).collect();
+    let arr: ArrayRef = Arc::new(Int64Array::from(vals.clone()));
+    let batch = RecordBatch::try_from_iter([("seq", arr)]).unwrap();
+
+    let mut sender = db.borrow_sender().unwrap();
+    sender
+        .flush_arrow_batch_at_now("trades", &batch, &[])
+        .expect("oversize Arrow batch splits and queues");
+    // A defer-aware server acks only the committing frame, so this returning at
+    // all proves one was emitted.
+    sender
+        .wait(AckLevel::Ok, Duration::from_secs(30))
+        .expect("the split must reach a committing frame");
+
+    let mut captured = Vec::new();
+    while let Ok(frame) = frames.recv_timeout(Duration::from_millis(500)) {
+        captured.push(frame);
+    }
+    assert!(
+        captured.len() > 1,
+        "oversize Arrow batch must split into multiple frames, got {}",
+        captured.len()
+    );
+    for (i, frame) in captured.iter().enumerate() {
+        let is_last = i == captured.len() - 1;
+        assert_eq!(
+            frame[5] & FLAG_DEFER_COMMIT != 0,
+            !is_last,
+            "Arrow frame {i} of {}: every frame but the last must be deferred",
+            captured.len()
+        );
+    }
+}
+
+/// Arrow counterpart of
+/// `store_and_forward_split_floor_failure_in_leading_half_still_commits_the_prefix`.
+/// Without it, reverting the Arrow half of the both-halves guard -- or removing
+/// its `close_failed_split` call entirely -- leaves the whole suite green.
+#[cfg(feature = "arrow-ingress")]
+#[test]
+fn store_and_forward_arrow_split_floor_failure_still_commits_the_deferred_prefix() {
+    use arrow::array::{ArrayRef, RecordBatch, StringArray};
+    use std::sync::Arc;
+
+    const CAP: usize = 2048;
+    const WIDE: usize = 4000;
+    // 32 rows with the irreducible block at 8..16, so the LEADING half recurses,
+    // publishes, and only then fails -- the shape the Arrow guard must cover.
+    const ROWS: usize = 32;
+
+    let (tx, frames) = mpsc::channel();
+    let server = MockServer::spawn_with_mode_capture(1, MockMode::DeferAwareAck, Some(tx));
+    let conf = conf_for_endpoints(
+        &[server.port()],
+        &format!("max_buf_size={CAP};pool_reap=manual;",),
+    );
+    let db = QuestDb::connect(&conf).unwrap();
+
+    let values: Vec<String> = (0..ROWS)
+        .map(|row| {
+            let len = if (8..16).contains(&row) { WIDE } else { 1 };
+            "x".repeat(len)
+        })
+        .collect();
+    let arr: ArrayRef = Arc::new(StringArray::from(values));
+    let batch = RecordBatch::try_from_iter([("s", arr)]).unwrap();
+
+    let mut sender = db.borrow_sender().unwrap();
+    let err = sender
+        .flush_arrow_batch_at_now("trades", &batch, &[])
+        .expect_err("the irreducible block must fail the Arrow flush");
+    assert_eq!(err.code(), ErrorCode::BatchTooLarge);
+    assert!(
+        err.in_doubt(),
+        "the prefix reached the server, so the batch must not be reported as safe \
+         to blind-retry"
+    );
+
+    sender.wait(AckLevel::Ok, Duration::from_secs(30)).expect(
+        "the prefix published before the failure must still be committed; a timeout \
+         here means the Arrow path left it deferred with nothing able to commit it",
+    );
+
+    let mut captured = Vec::new();
+    while let Ok(frame) = frames.recv_timeout(Duration::from_millis(500)) {
+        captured.push(frame);
+    }
+    const FLAG_DEFER_COMMIT: u8 = 0x01;
+    assert!(
+        captured
+            .iter()
+            .any(|frame| frame[5] & FLAG_DEFER_COMMIT == 0),
+        "a committing frame must close the group, got {} frame(s) all deferred",
+        captured.len()
+    );
+}
+
+#[cfg(feature = "arrow-ingress")]
+#[test]
+fn store_and_forward_arrow_split_commits_early_rather_than_stalling_on_queue_capacity() {
+    // Arrow counterpart of
+    // `store_and_forward_split_commits_early_rather_than_stalling_on_queue_capacity`.
+    // Without it, deleting the valve from `publish_arrow_split_sfa` leaves the
+    // whole suite green: the chunk-path test does not cover the Arrow path.
+    use arrow::array::{ArrayRef, Int64Array, RecordBatch};
+    use std::sync::Arc;
+
+    const CAP: usize = 2048;
+    const SEGMENT: usize = 1024;
+    const TOTAL: usize = SEGMENT * 6;
+    const ROWS: usize = 512;
+    const FLAG_DEFER_COMMIT: u8 = 0x01;
+
+    let (tx, frames) = mpsc::channel();
+    let server = MockServer::spawn_with_mode_capture(1, MockMode::DeferAwareAck, Some(tx));
+    let conf = conf_for_endpoints(
+        &[server.port()],
+        &format!(
+            "max_buf_size={CAP};pool_reap=manual;\
+             sf_max_segment_bytes={SEGMENT};sf_max_total_bytes={TOTAL};\
+             sf_append_deadline_millis=30000;",
+        ),
+    );
+    let db = QuestDb::connect(&conf).unwrap();
+
+    let vals: Vec<i64> = (0..ROWS as i64).collect();
+    let arr: ArrayRef = Arc::new(Int64Array::from(vals.clone()));
+    let batch = RecordBatch::try_from_iter([("seq", arr)]).unwrap();
+
+    let mut sender = db.borrow_sender().unwrap();
+    sender
+        .flush_arrow_batch_at_now("trades", &batch, &[])
+        .expect(
+            "an oversize Arrow batch must still publish inside a tight sf_max_total_bytes; \
+         the deferred prefix must not consume the budget the committing frame needs",
+        );
+    sender
+        .wait(AckLevel::Ok, Duration::from_secs(30))
+        .expect("the split must reach a committing frame");
+
+    let mut captured = Vec::new();
+    while let Ok(frame) = frames.recv_timeout(Duration::from_millis(500)) {
+        captured.push(frame);
+    }
+    assert!(
+        captured.len() > 1,
+        "the Arrow batch must have split, got {} frame(s)",
+        captured.len()
+    );
+    let deferred = captured
+        .iter()
+        .filter(|frame| frame[5] & FLAG_DEFER_COMMIT != 0)
+        .count();
+    let committing_before_last = captured[..captured.len() - 1]
+        .iter()
+        .filter(|frame| frame[5] & FLAG_DEFER_COMMIT == 0)
+        .count();
+    assert!(
+        deferred > 0,
+        "the Arrow valve must still allow deferral while the budget has headroom; \
+         {} frame(s), none deferred",
+        captured.len()
+    );
+    assert!(
+        committing_before_last > 0,
+        "the Arrow valve must commit mid-split once the reserve runs out; \
+         {} frame(s), {deferred} deferred, none committing before the last",
+        captured.len()
+    );
+
+    // Row coverage, matching the chunk counterpart: a split that drops or
+    // duplicates a frame still satisfies the flag assertions above.
+    let (replay_tx, replay_rx) = mpsc::channel();
+    for frame in captured {
+        replay_tx.send(frame).unwrap();
+    }
+    drop(replay_tx);
+    let mut got = redriven_i64_rows(&replay_rx);
+    got.sort_unstable();
+    assert_eq!(
+        got, vals,
+        "the Arrow split must carry every row exactly once"
     );
 }
 

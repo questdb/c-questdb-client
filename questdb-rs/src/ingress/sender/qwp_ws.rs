@@ -479,6 +479,18 @@ pub(crate) struct SyncQwpWsHandlerState {
     /// [`super::column_sender::PooledSenderCore::new_store_and_forward`]; the two are
     /// mutually exclusive. `None` in memory mode / on side-file open failure.
     pub(crate) persisted_symbol_dict: Option<PersistedSymbolDict>,
+    /// Whether a split chunk may defer its non-final frames' commit.
+    ///
+    /// Memory mode only. `FLAG_DEFER_COMMIT` is unknown to the queue, segment,
+    /// manifest and recovery layers, so a process death between a deferred
+    /// append and its committing append leaves a persisted tail nothing
+    /// downstream can interpret: the orphan drainer opens replay-only with no
+    /// producer, so it can never append the committing frame, and
+    /// `orphan_queue_drained` is `completed >= published`, which such a tail
+    /// never satisfies. In memory mode the queue dies with the process, so
+    /// there is no tail to strand. Lifting this needs commit-boundary
+    /// recovery in the queue itself.
+    pub(crate) sfa_split_deferral_enabled: bool,
 }
 
 impl SyncQwpWsHandlerState {
@@ -932,6 +944,21 @@ where
         self.shared
             .lock()
             .map_err(|_| error::fmt!(SocketError, "QWP/WebSocket runner state lock is poisoned"))
+    }
+
+    /// Whether the queue has room for a deferred frame AND the frame that will
+    /// commit it, or `None` when the runner has no producer and cannot read the
+    /// queue without blocking on the driver.
+    fn has_deferred_commit_headroom(&self) -> Option<bool> {
+        if let Some(producer) = self.producer.as_ref() {
+            return Some(producer.has_deferred_commit_headroom());
+        }
+        // Only reached once `take_producer` has run (close drain), so this is
+        // not the publishing path. try_lock, not lock: the answer only informs
+        // a defer/commit choice and both answers are safe, so blocking the
+        // foreground on the driver thread to learn it is the worse trade.
+        let store = self.shared.try_lock().ok()?;
+        Some(store.progress_view().has_deferred_commit_headroom())
     }
 
     fn wait_for_publication_capacity(&self, generation: u64, deadline: Option<Instant>) -> bool {
@@ -3586,6 +3613,7 @@ pub(crate) fn connect_qwp_ws_background_state(
         recovered_dict_entries,
         recovered_dict_count,
         persisted_symbol_dict,
+        sfa_split_deferral_enabled: qwp_ws.sf_dir.is_none(),
     })
 }
 
@@ -3899,6 +3927,26 @@ pub(crate) fn publish_qwp_ws_payload_background(
         ));
     }
     state.runner.publish_replay_payload(payload)
+}
+
+/// Whether a deferred frame may be published without stranding the frame that
+/// will commit it.
+///
+/// A deferred frame is never acked, so the queue storage it occupies is never
+/// reclaimed. Publishing one that consumes the slot's last byte budget would
+/// leave the committing frame unable to publish at all: it would block on
+/// back-pressure until the append deadline and then fail, with the deferred
+/// prefix durably queued and nothing able to commit it. This is the
+/// store-and-forward counterpart of the direct backend's
+/// `Conn::has_sync_commit_slot`.
+///
+/// Normally answered from the foreground's own producer handle, which takes the
+/// engine's state lock briefly. The `try_lock` fallback only applies once the
+/// producer has been handed off (close drain), and answers conservatively
+/// (`false`) there: committing a frame that could have been deferred costs
+/// throughput, deferring one that should have committed costs liveness.
+pub(crate) fn sfa_has_deferred_commit_slot(state: &SyncQwpWsHandlerState) -> bool {
+    state.sfa_split_deferral_enabled && state.runner.has_deferred_commit_headroom().unwrap_or(false)
 }
 
 pub(crate) fn flush_qwp_ws_manual(

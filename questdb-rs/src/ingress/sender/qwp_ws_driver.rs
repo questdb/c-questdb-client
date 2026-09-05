@@ -136,14 +136,20 @@ impl PoisonFrameTracker {
         min_escalation_window: Duration,
         now: Instant,
     ) -> bool {
-        if self.fsn == Some(fsn) && self.completed_fsn == completed_fsn {
+        // Keyed on the completed watermark alone: a strike is "the server
+        // refused progress again", whichever frame it named this time. Inside
+        // a deferred group the head is unackable until the committing frame
+        // lands, so successive rejects may land on different frames of the
+        // same stalled group; keying on the frame would restart the count on
+        // every such change and never escalate.
+        if self.fsn.is_some() && self.completed_fsn == completed_fsn {
             self.rejection_count = self.rejection_count.saturating_add(1);
         } else {
-            self.fsn = Some(fsn);
             self.completed_fsn = completed_fsn;
             self.rejection_count = 1;
             self.first_strike_at = Some(now);
         }
+        self.fsn = Some(fsn);
         if self.rejection_count < limit {
             return false;
         }
@@ -912,11 +918,17 @@ impl<T: QwpWsCoreTransport> QwpWsSendCore<T> {
                     store.record_reject_error(fsn, wire_seq, error, policy);
                     return Ok(DriveOutcome::Idle);
                 }
-                if !self.reject_target_can_complete(store, fsn) {
-                    store.last_server_error = Some(error.clone());
-                    self.reject_gap_protocol_error(store, fsn);
-                    return Ok(DriveOutcome::Terminal);
-                }
+                // A reject names a frame this connection sent and the server
+                // has not acked, so it is never a protocol gap: whatever sits
+                // below it unanswered -- a deferred group's prefix by design,
+                // or a skipped response -- stays queued and replays from
+                // `oldest_unresolved_fsn` on the reconnect, exactly as after a
+                // socket drop.
+                debug_assert!(
+                    store.queue.oldest_unresolved_fsn() == Some(fsn)
+                        || self.send_cursor.wire_seq_for_fsn(fsn).is_some(),
+                    "reject for fsn {fsn} names a frame outside the in-flight run"
+                );
 
                 if policy == QwpWsErrorPolicy::Terminal {
                     let sender_error = sender_error_for_qwp_error(&error, wire_seq, fsn, policy);
@@ -936,7 +948,7 @@ impl<T: QwpWsCoreTransport> QwpWsSendCore<T> {
                 // pace so a persistent window churns at the backoff cap
                 // rather than at handshake RTT rate.
                 if policy != QwpWsErrorPolicy::RetriableOther
-                    && self.rejected_head_is_poison(store, fsn)
+                    && self.rejected_frame_is_poison(store, fsn)
                 {
                     let strikes = self.poison_tracker.strikes();
                     let reason = if error.message.is_empty() {
@@ -988,49 +1000,16 @@ impl<T: QwpWsCoreTransport> QwpWsSendCore<T> {
                 .is_some_and(|completed_fsn| fsn <= completed_fsn)
     }
 
-    fn reject_target_can_complete<Q: PublicationLog>(
-        &self,
-        store: &QwpWsPublicationStore<Q>,
-        fsn: u64,
-    ) -> bool {
-        let Some(oldest) = store.queue.oldest_unresolved_fsn() else {
-            return false;
-        };
-        if fsn == oldest {
-            return true;
-        }
-        self.durable_ack
-            .as_ref()
-            .is_some_and(|tracker| tracker.pending_prefix_covers(oldest, fsn))
-    }
-
-    fn reject_gap_protocol_error<Q: PublicationLog>(
-        &self,
-        store: &mut QwpWsPublicationStore<Q>,
-        fsn: u64,
-    ) -> Error {
-        let oldest = store.queue.oldest_unresolved_fsn();
-        store.record_protocol_violation(
-            None,
-            match oldest {
-                Some(oldest) => format!(
-                    "QWP/WebSocket reject response for fsn {fsn} skipped unresolved fsn {oldest}"
-                ),
-                None => {
-                    format!("QWP/WebSocket reject response for fsn {fsn} has no unresolved frame")
-                }
-            },
-        )
-    }
-
-    fn rejected_head_is_poison<Q: PublicationLog>(
+    /// Whether `fsn` has now been rejected often enough, without ACK progress,
+    /// to be treated as poison.
+    ///
+    /// The tracker keys on `completed_fsn` alone, so rejects that move
+    /// between frames of the same stalled group still add up.
+    fn rejected_frame_is_poison<Q: PublicationLog>(
         &mut self,
         store: &QwpWsPublicationStore<Q>,
         fsn: u64,
     ) -> bool {
-        if store.queue.oldest_unresolved_fsn() != Some(fsn) {
-            return false;
-        }
         let now = Instant::now();
         self.poison_tracker.record_failure(
             fsn,
@@ -1083,7 +1062,7 @@ impl<T: QwpWsCoreTransport> QwpWsSendCore<T> {
             // -- the zero-progress pace below bounds its recycle rate instead.
             if policy != QwpWsErrorPolicy::RetriableOther
                 && let Some(oldest) = store.queue.oldest_unresolved_fsn()
-                && self.rejected_head_is_poison(store, oldest)
+                && self.rejected_frame_is_poison(store, oldest)
             {
                 let strikes = self.poison_tracker.strikes();
                 let reason = if error.message.is_empty() {
@@ -3869,24 +3848,6 @@ impl DurableAckTracker {
             .ok()
             .and_then(|index| self.pending.get(index))
             .map(PendingDurableFrame::wire_seq)
-    }
-
-    fn pending_prefix_covers(&self, start_fsn: u64, end_before_fsn: u64) -> bool {
-        let mut next_fsn = start_fsn;
-        for entry in &self.pending {
-            if next_fsn >= end_before_fsn {
-                return true;
-            }
-            let PendingDurableFrame::Ok { fsn, .. } = entry;
-            if *fsn < next_fsn {
-                continue;
-            }
-            next_fsn = match fsn.checked_add(1) {
-                Some(next_fsn) => next_fsn,
-                None => return false,
-            }
-        }
-        next_fsn >= end_before_fsn
     }
 
     fn pop_ready(&mut self) -> Option<DurableCompletion> {
@@ -6680,16 +6641,33 @@ mod tests {
     }
 
     #[test]
-    fn poison_tracker_dwell_restamps_when_suspect_key_changes() {
+    fn poison_tracker_dwell_restamps_when_completed_watermark_moves() {
         let mut tracker = PoisonFrameTracker::default();
         let started = Instant::now();
         let window = Duration::from_secs(5);
 
         assert!(!tracker.record_failure(7, None, 2, window, started));
-        assert!(!tracker.record_failure(8, None, 2, window, started + Duration::from_secs(10)));
+        assert!(!tracker.record_failure(8, Some(3), 2, window, started + Duration::from_secs(10)));
         assert_eq!(tracker.strikes(), 1);
-        assert!(!tracker.record_failure(8, None, 2, window, started + Duration::from_secs(11)));
-        assert!(tracker.record_failure(8, None, 2, window, started + Duration::from_secs(15)));
+        assert!(!tracker.record_failure(8, Some(3), 2, window, started + Duration::from_secs(11)));
+        assert!(tracker.record_failure(8, Some(3), 2, window, started + Duration::from_secs(15)));
+    }
+
+    #[test]
+    fn poison_tracker_counts_rejects_of_different_frames_without_progress() {
+        // A deferred group's head is unackable until its committing frame
+        // lands, so the server may name a different frame of the same stalled
+        // group on each replay. With no ACK progress those are the same
+        // suspect and must add up rather than restart the count.
+        let mut tracker = PoisonFrameTracker::default();
+        let started = Instant::now();
+        let window = Duration::from_secs(5);
+
+        assert!(!tracker.record_failure(2, None, 3, window, started));
+        assert!(!tracker.record_failure(1, None, 3, window, started + Duration::from_secs(1)));
+        assert_eq!(tracker.strikes(), 2);
+        assert!(tracker.record_failure(2, None, 3, window, started + window));
+        assert_eq!(tracker.strikes(), 3);
     }
 
     #[test]
@@ -8948,7 +8926,16 @@ mod tests {
     }
 
     #[test]
-    fn reject_gap_terminalizes_without_completing_unresolved_lower_frame() {
+    fn reject_of_a_later_in_flight_frame_neither_terminalizes_nor_completes_the_lower_frame() {
+        // An unanswered lower frame is the normal shape of a deferred group:
+        // the server withholds the ack for every FLAG_DEFER_COMMIT frame until
+        // the committing frame lands, so `oldest_unresolved_fsn` stays pinned
+        // at the group head. A reject for a later frame of that group is a
+        // frame verdict, not a protocol gap, and must run through the policy.
+        //
+        // The invariant this has always pinned still holds: the rejected frame
+        // says nothing good about the unanswered one below it, so fsn 0 must
+        // NOT be completed. Both stay queued and replay on the reconnect.
         let mut driver = driver(FakeOrderedServer::scripted([
             FakeSendResult::NoResponse,
             FakeSendResult::RejectWire { wire_seq: 1 },
@@ -8960,24 +8947,171 @@ mod tests {
             driver.drive_once().unwrap(),
             DriveOutcome::Sent(_)
         ));
-        assert_eq!(driver.drive_once().unwrap(), DriveOutcome::Terminal);
+        assert_ne!(driver.drive_once().unwrap(), DriveOutcome::Terminal);
 
+        assert!(!driver.is_terminal());
+        assert!(driver.terminal_sender_error().is_none());
+        for (label, receipt) in [("first", first), ("second", second)] {
+            let status = driver.receipt_status(receipt);
+            assert!(
+                matches!(
+                    status,
+                    QwpReceiptStatus::Published { .. } | QwpReceiptStatus::Sent { .. }
+                ),
+                "{label} must stay queued and replayable, got {status:?}"
+            );
+        }
+        let error = driver.poll_sender_error().unwrap();
+        assert_eq!(error.applied_policy, QwpWsErrorPolicy::Retriable);
+        assert_eq!(error.from_fsn, 1, "the reject is attributed to fsn 1 only");
+    }
+
+    #[test]
+    fn role_reject_of_a_later_in_flight_frame_never_terminalizes() {
+        // The sharp case for a deferred group: a primary that becomes a
+        // read-only replica mid-split rejects the frame it is holding. That is
+        // an expected role transition, and the RetriableOther carve-out exists
+        // so it recycles rather than escalating to a producer-fatal terminal.
+        // While the gap check ran ahead of the policy dispatch, a role reject
+        // landing on any frame but the group head reported a WebSocket
+        // protocol violation instead -- the same response that
+        // `role_reject_never_terminalizes_and_never_strikes` pins as
+        // never-terminal when it lands on the head.
+        let mut driver = driver(FakeOrderedServer::scripted([
+            FakeSendResult::NoResponse,
+            FakeSendResult::RejectWireNotWritable { wire_seq: 1 },
+        ]));
+        let first = driver.try_submit(b"first").unwrap();
+        let second = driver.try_submit(b"second").unwrap();
+
+        assert!(matches!(
+            driver.drive_once().unwrap(),
+            DriveOutcome::Sent(_)
+        ));
+        assert_ne!(driver.drive_once().unwrap(), DriveOutcome::Terminal);
+
+        assert!(!driver.is_terminal());
         assert_eq!(
-            driver.receipt_status(first),
-            QwpReceiptStatus::Terminal { fsn: 0 }
+            driver.send_core.poison_tracker.strikes(),
+            0,
+            "role rejects are strike-exempt wherever they land"
         );
-        assert_eq!(
-            driver.receipt_status(second),
-            QwpReceiptStatus::Terminal { fsn: 1 }
+        for (label, receipt) in [("first", first), ("second", second)] {
+            let status = driver.receipt_status(receipt);
+            assert!(
+                matches!(
+                    status,
+                    QwpReceiptStatus::Published { .. } | QwpReceiptStatus::Sent { .. }
+                ),
+                "{label} must stay queued and replayable, got {status:?}"
+            );
+        }
+        let error = driver.poll_sender_error().unwrap();
+        assert_eq!(error.category, QwpWsErrorCategory::NotWritable);
+        assert_eq!(error.applied_policy, QwpWsErrorPolicy::RetriableOther);
+    }
+
+    #[test]
+    fn rejects_that_move_between_frames_of_a_stalled_group_still_escalate() {
+        // The server never acks and rejects fsn 2 on odd connections, fsn 1 on
+        // even ones -- a stalled deferred group whose reject lands on a
+        // different frame each replay. No ACK progress across four rejects
+        // must escalate exactly as four rejects of one frame do; a tracker
+        // keyed on the frame would restart its count on every alternation and
+        // reconnect forever at the level-1 pace.
+        let script: Vec<FakeSendResult> = (0..8)
+            .flat_map(|_| {
+                [
+                    FakeSendResult::NoResponse,
+                    FakeSendResult::NoResponse,
+                    FakeSendResult::RejectWire { wire_seq: 2 },
+                    FakeSendResult::NoResponse,
+                    FakeSendResult::RejectWire { wire_seq: 1 },
+                ]
+            })
+            .collect();
+        let mut driver = driver(FakeOrderedServer::scripted(script));
+        driver.try_submit(b"first").unwrap();
+        driver.try_submit(b"second").unwrap();
+        driver.try_submit(b"third").unwrap();
+
+        let mut terminal = false;
+        for _ in 0..64 {
+            if driver.drive_once().unwrap() == DriveOutcome::Terminal {
+                terminal = true;
+                break;
+            }
+        }
+        assert!(
+            terminal,
+            "rejects that name a different frame of the same stalled group must \
+             still escalate; strikes={}",
+            driver.send_core.poison_tracker.strikes()
         );
         let terminal_error = driver.terminal_sender_error().unwrap();
         assert_eq!(
             terminal_error.category,
             QwpWsErrorCategory::ProtocolViolation
         );
-        assert!(terminal_error.message.as_deref().is_some_and(|message| {
-            message.contains("reject response for fsn 1 skipped unresolved fsn 0")
-        }));
+        assert!(
+            terminal_error
+                .message
+                .as_deref()
+                .is_some_and(|message| message.contains("without ACK progress")),
+            "got {:?}",
+            terminal_error.message
+        );
+    }
+
+    #[test]
+    fn repeated_reject_of_a_later_in_flight_frame_still_escalates_to_poison() {
+        // Poison escalation keys on the rejected frame, not the queue head.
+        // Inside a deferred group the head is unackable until the committing
+        // frame lands, so a head-only rule would let a permanently rejected
+        // mid-group frame reconnect forever without ever escalating.
+        // The script alternates so every reject lands on fsn 1 and never on
+        // the head: on each connection frame 0 goes unanswered (a deferred
+        // frame) and frame 1 is rejected. A reject scripted against the head's
+        // own send would be clamped to fsn 0 and strike the head instead,
+        // which is what a head-keyed tracker already counts.
+        let script: Vec<FakeSendResult> = (0..12)
+            .flat_map(|_| {
+                [
+                    FakeSendResult::NoResponse,
+                    FakeSendResult::RejectWire { wire_seq: 1 },
+                ]
+            })
+            .collect();
+        let mut driver = driver(FakeOrderedServer::scripted(script));
+        driver.try_submit(b"first").unwrap();
+        driver.try_submit(b"second").unwrap();
+
+        let mut terminal = false;
+        for _ in 0..64 {
+            if driver.drive_once().unwrap() == DriveOutcome::Terminal {
+                terminal = true;
+                break;
+            }
+        }
+        assert!(
+            terminal,
+            "a permanently rejected non-head frame must escalate rather than \
+             reconnect forever; strikes={}",
+            driver.send_core.poison_tracker.strikes()
+        );
+        let terminal_error = driver.terminal_sender_error().unwrap();
+        assert_eq!(
+            terminal_error.category,
+            QwpWsErrorCategory::ProtocolViolation
+        );
+        assert!(
+            terminal_error
+                .message
+                .as_deref()
+                .is_some_and(|message| message.contains("fsn 1 was rejected")),
+            "the escalation must name the rejected frame, got {:?}",
+            terminal_error.message
+        );
     }
 
     #[test]

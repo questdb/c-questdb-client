@@ -205,6 +205,63 @@ fn qwpws_config_accepts_websocket_schemes() {
     assert_eq!(tls.protocol, Protocol::Wss);
 }
 
+/// The derived `sf_max_total_bytes` floor, which no other test reaches.
+///
+/// `has_deferred_commit_headroom` needs the budget to hold a fresh slot's
+/// active segment and hot spare, plus a reserve of two (the committing frame,
+/// and the spare the driver may install concurrently). Below five segments the
+/// reserve can never be satisfied and deferral silently never engages -- an
+/// oversize chunk then commits once per frame, which is safe but is exactly the
+/// batching the split path exists to get.
+///
+/// The floor only binds when `sf_max_segment_bytes` is large enough to beat the
+/// flat default, so every other test in the tree either sets `sf_max_total_bytes`
+/// explicitly (taking the early return) or uses the 4 MiB default segment (where
+/// the flat default wins). Both `4` and `5` would look identical there.
+#[cfg(feature = "sync-sender-qwp-ws")]
+#[test]
+fn qwpws_sf_max_total_bytes_floors_at_five_segments() {
+    let flat_default = |conf: &str| {
+        let builder = SenderBuilder::from_conf(conf).unwrap();
+        builder.qwp_ws.as_ref().unwrap().sf_max_total_bytes()
+    };
+
+    // Default segment: the flat 128 MiB default wins, so the floor is invisible.
+    assert_eq!(
+        flat_default("ws::addr=localhost:9000;"),
+        128 * 1024 * 1024,
+        "the flat memory default must win at the default segment size"
+    );
+
+    // Large segment, total unset: the floor binds at five segments.
+    let seg = 64 * 1024 * 1024_u64;
+    assert_eq!(
+        flat_default("ws::addr=localhost:9000;sf_max_segment_bytes=64mb;"),
+        seg * 5,
+        "a segment large enough to beat the flat default must floor at five \
+         segments, or the deferred-commit valve can never open"
+    );
+
+    // An explicit total is left alone, however small.
+    assert_eq!(
+        flat_default("ws::addr=localhost:9000;sf_max_segment_bytes=64mb;sf_max_total_bytes=100mb;"),
+        100 * 1024 * 1024,
+        "an explicitly configured total must not be inflated by the floor"
+    );
+
+    // With `sf_dir` the queue is persisted, split deferral is off, and the
+    // floor must not inflate a budget no valve can spend.
+    let dir = tempfile::TempDir::new().unwrap();
+    assert_eq!(
+        flat_default(&format!(
+            "ws::addr=localhost:9000;sf_max_segment_bytes=64mb;sf_dir={};",
+            dir.path().display()
+        )),
+        10 * 1024 * 1024 * 1024,
+        "the disk default must be untouched by the deferred-commit floor"
+    );
+}
+
 #[cfg(feature = "sync-sender-qwp-ws")]
 #[test]
 fn qwpws_store_and_forward_defaults_match_java() {

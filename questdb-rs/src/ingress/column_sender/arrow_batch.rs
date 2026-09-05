@@ -3961,6 +3961,7 @@ pub(crate) fn encode_arrow_batch_into(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn encode_arrow_batch_replay_into(
     out: &mut Vec<u8>,
     table: TableName<'_>,
@@ -3968,6 +3969,7 @@ pub(crate) fn encode_arrow_batch_replay_into(
     ts: ArrowTsSource,
     overrides: &[ArrowColumnOverride<'_>],
     symbol_dict: &mut SymbolGlobalDict,
+    defer_commit: bool,
 ) -> Result<()> {
     encode_arrow_batch_into_mode(
         out,
@@ -3976,7 +3978,7 @@ pub(crate) fn encode_arrow_batch_replay_into(
         ts,
         overrides,
         symbol_dict,
-        /* defer_commit = */ false,
+        defer_commit,
         /* replay_symbols = */ true,
     )
 }
