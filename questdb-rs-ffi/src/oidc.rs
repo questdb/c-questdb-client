@@ -970,37 +970,44 @@ pub unsafe extern "C" fn questdb_oidc_builder_event_handler(
     release: questdb_oidc_user_data_release_cb,
     err_out: *mut *mut questdb_error,
 ) -> bool {
-    let Some(builder) = (unsafe { builder_mut(builder, err_out) }) else {
-        return false;
-    };
-    let Some(callback) = callback else {
-        unsafe {
-            set_input_error(
-                err_out,
-                ErrorCode::InvalidApiCall,
-                "OIDC event callback is NULL",
-            )
+    let previous = {
+        let Some(builder) = (unsafe { builder_mut(builder, err_out) }) else {
+            return false;
         };
-        return false;
-    };
-    if !user_data.is_null() && release.is_none() {
-        unsafe {
-            set_input_error(
-                err_out,
-                ErrorCode::InvalidApiCall,
-                "OIDC event user_data is non-NULL but its release callback is NULL",
-            )
+        let Some(callback) = callback else {
+            unsafe {
+                set_input_error(
+                    err_out,
+                    ErrorCode::InvalidApiCall,
+                    "OIDC event callback is NULL",
+                )
+            };
+            return false;
         };
-        return false;
-    }
-    builder.config.renderer = Some(Arc::new(CEventTarget {
-        callback,
-        user_data: user_data as usize,
-        release,
-        callback_gate: std::sync::Mutex::new(CallbackGateState::default()),
-        callback_ready: std::sync::Condvar::new(),
-        active: AtomicBool::new(false),
-    }));
+        if !user_data.is_null() && release.is_none() {
+            unsafe {
+                set_input_error(
+                    err_out,
+                    ErrorCode::InvalidApiCall,
+                    "OIDC event user_data is non-NULL but its release callback is NULL",
+                )
+            };
+            return false;
+        }
+        let replacement = Arc::new(CEventTarget {
+            callback,
+            user_data: user_data as usize,
+            release,
+            callback_gate: std::sync::Mutex::new(CallbackGateState::default()),
+            callback_ready: std::sync::Condvar::new(),
+            active: AtomicBool::new(false),
+        });
+        std::mem::replace(&mut builder.config.renderer, Some(replacement))
+    };
+    // Dropping the previous target calls foreign code. Its mutable builder
+    // borrow is now out of scope, so a release callback may safely re-enter this
+    // setter on the same builder.
+    drop(previous);
     true
 }
 
@@ -1694,6 +1701,39 @@ mod tests {
         counter.fetch_add(1, Ordering::SeqCst);
     }
 
+    struct ReentrantReleaseState {
+        builder: *mut questdb_oidc_builder,
+        releases: Arc<AtomicUsize>,
+        nested_releases: Arc<AtomicUsize>,
+        reentry_succeeded: Arc<AtomicBool>,
+    }
+
+    unsafe extern "C" fn release_and_replace_handler(user_data: *mut c_void) {
+        let state = unsafe { Box::from_raw(user_data as *mut ReentrantReleaseState) };
+        state.releases.fetch_add(1, Ordering::SeqCst);
+
+        let nested_data =
+            Box::into_raw(Box::new(Arc::clone(&state.nested_releases))) as *mut c_void;
+        let mut error = ptr::null_mut();
+        let installed = unsafe {
+            questdb_oidc_builder_event_handler(
+                state.builder,
+                Some(ignore_event),
+                nested_data,
+                Some(release_counter),
+                &mut error,
+            )
+        };
+        state.reentry_succeeded.store(installed, Ordering::SeqCst);
+        if !installed {
+            // Registration failure leaves ownership with the caller.
+            drop(unsafe { Box::from_raw(nested_data as *mut Arc<AtomicUsize>) });
+        }
+        if !error.is_null() {
+            unsafe { crate::questdb_error_free(error) };
+        }
+    }
+
     #[derive(Default)]
     struct EventLog {
         kinds: Vec<questdb_oidc_event_kind>,
@@ -2183,6 +2223,51 @@ mod tests {
 
             questdb_oidc_builder_free(builder);
             assert_eq!(releases.load(Ordering::SeqCst), 3);
+        }
+    }
+
+    #[test]
+    fn replacing_handler_allows_release_callback_reentry() {
+        unsafe {
+            let old_releases = Arc::new(AtomicUsize::new(0));
+            let outer_releases = Arc::new(AtomicUsize::new(0));
+            let nested_releases = Arc::new(AtomicUsize::new(0));
+            let reentry_succeeded = Arc::new(AtomicBool::new(false));
+            let builder = explicit_builder();
+            let mut error = ptr::null_mut();
+
+            let old_data = Box::into_raw(Box::new(ReentrantReleaseState {
+                builder,
+                releases: Arc::clone(&old_releases),
+                nested_releases: Arc::clone(&nested_releases),
+                reentry_succeeded: Arc::clone(&reentry_succeeded),
+            })) as *mut c_void;
+            assert!(questdb_oidc_builder_event_handler(
+                builder,
+                Some(ignore_event),
+                old_data,
+                Some(release_and_replace_handler),
+                &mut error,
+            ));
+
+            let outer_data = Box::into_raw(Box::new(Arc::clone(&outer_releases))) as *mut c_void;
+            assert!(questdb_oidc_builder_event_handler(
+                builder,
+                Some(ignore_event),
+                outer_data,
+                Some(release_counter),
+                &mut error,
+            ));
+            assert!(error.is_null());
+            assert!(reentry_succeeded.load(Ordering::SeqCst));
+            assert_eq!(old_releases.load(Ordering::SeqCst), 1);
+            // The old target's release callback replaced the just-installed
+            // outer target; it too was released after its setter borrow ended.
+            assert_eq!(outer_releases.load(Ordering::SeqCst), 1);
+            assert_eq!(nested_releases.load(Ordering::SeqCst), 0);
+
+            questdb_oidc_builder_free(builder);
+            assert_eq!(nested_releases.load(Ordering::SeqCst), 1);
         }
     }
 
