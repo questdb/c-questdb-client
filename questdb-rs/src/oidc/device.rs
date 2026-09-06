@@ -305,7 +305,10 @@ impl OidcDeviceAuthBuilder {
     /// Fallback poll interval in seconds when the IdP's response omits one
     /// (default 5; clamped to the RFC 8628 range).
     pub fn default_interval(mut self, seconds: u64) -> Self {
-        self.default_interval = seconds;
+        // Clamp while the value is still unsigned. Narrowing an unchecked value
+        // first made values above i64::MAX wrap negative and select the five-
+        // second minimum instead of the documented maximum.
+        self.default_interval = seconds.clamp(MIN_POLL_INTERVAL, MAX_DEVICE_CODE_LIFETIME);
         self
     }
 

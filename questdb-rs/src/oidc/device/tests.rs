@@ -1045,6 +1045,29 @@ fn poll_interval_is_floored_and_capped() {
 }
 
 #[test]
+fn configured_default_poll_interval_is_clamped_before_narrowing() {
+    assert_eq!(
+        OidcDeviceAuth::builder()
+            .default_interval(0)
+            .default_interval,
+        MIN_POLL_INTERVAL
+    );
+    assert_eq!(
+        OidcDeviceAuth::builder()
+            .default_interval(30)
+            .default_interval,
+        30
+    );
+    assert_eq!(
+        OidcDeviceAuth::builder()
+            .default_interval(u64::MAX)
+            .default_interval,
+        MAX_DEVICE_CODE_LIFETIME,
+        "an unsigned overflow boundary must select the maximum, not wrap to the minimum"
+    );
+}
+
+#[test]
 fn access_denied_is_device_flow_error() {
     let mock = MockServer::start(|method, path, _body| match (method, path) {
         ("POST", "/device") => (200, device_response()),
