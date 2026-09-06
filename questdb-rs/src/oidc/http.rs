@@ -40,7 +40,7 @@ use rustls::{ClientConfig, ClientConnection, StreamOwned};
 use rustls_pki_types::ServerName;
 use rustls_pki_types::pem::PemObject;
 use ureq::http::Uri;
-use ureq::unversioned::resolver::DefaultResolver;
+use ureq::unversioned::resolver::{DefaultResolver, ResolvedSocketAddrs, Resolver};
 use ureq::unversioned::transport::{
     Buffers, Connector, Either, LazyBuffers, NextTimeout, TcpConnector, Transport, TransportAdapter,
 };
@@ -79,6 +79,48 @@ pub(crate) struct HttpClient {
     agent: ureq::Agent,
 }
 
+/// The OIDC transport permits plaintext HTTP only for local development. Keep
+/// the convenient `localhost` spelling, but verify the exact addresses handed
+/// to the connector: trusting the name alone lets a poisoned hosts/NSS/DNS
+/// configuration send device or refresh credentials off-machine in plaintext.
+#[derive(Debug, Default)]
+struct OidcResolver(DefaultResolver);
+
+impl Resolver for OidcResolver {
+    fn resolve(
+        &self,
+        uri: &Uri,
+        config: &ureq::config::Config,
+        timeout: NextTimeout,
+    ) -> std::result::Result<ResolvedSocketAddrs, ureq::Error> {
+        let addresses = self.0.resolve(uri, config, timeout)?;
+        enforce_plaintext_localhost_resolution(uri, &addresses)?;
+        Ok(addresses)
+    }
+}
+
+fn is_localhost_name(host: &str) -> bool {
+    host.eq_ignore_ascii_case("localhost") || host.eq_ignore_ascii_case("localhost.")
+}
+
+fn enforce_plaintext_localhost_resolution(
+    uri: &Uri,
+    addresses: &ResolvedSocketAddrs,
+) -> std::result::Result<(), ureq::Error> {
+    if uri
+        .scheme_str()
+        .is_some_and(|scheme| scheme.eq_ignore_ascii_case("http"))
+        && uri.host().is_some_and(is_localhost_name)
+        && (addresses.is_empty() || addresses.iter().any(|addr| !addr.ip().is_loopback()))
+    {
+        return Err(ureq::Error::Io(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "refusing plaintext HTTP because localhost resolved outside the loopback range",
+        )));
+    }
+    Ok(())
+}
+
 impl HttpClient {
     /// Build a client verifying TLS against the default roots, or against
     /// `ca_bundle` (a PEM file) when given. `timeout` bounds each whole request
@@ -102,7 +144,7 @@ impl HttpClient {
             .timeout_global(Some(timeout))
             .timeout_connect(Some(timeout))
             .build();
-        let agent = ureq::Agent::with_parts(config, connector, DefaultResolver::default());
+        let agent = ureq::Agent::with_parts(config, connector, OidcResolver::default());
         Ok(HttpClient { agent })
     }
 
@@ -289,8 +331,9 @@ fn parse_retry_after(headers: &ureq::http::HeaderMap) -> Option<u64> {
 /// the request never leaves the machine.
 ///
 /// An IP literal is answered from the literal itself. The special-use
-/// `localhost` name is accepted by spelling, without DNS: local development must
-/// remain usable even when TLS is disabled or the host resolver is unavailable.
+/// `localhost` name is accepted provisionally by spelling; [`OidcResolver`]
+/// verifies that the exact addresses used for a plaintext connection are all
+/// loopback before handing them to the connector.
 pub(crate) fn is_loopback(host: &str) -> bool {
     // Strip the brackets off an IPv6 literal before parsing.
     let bare = host
@@ -300,7 +343,7 @@ pub(crate) fn is_loopback(host: &str) -> bool {
     if let Ok(addr) = bare.parse::<IpAddr>() {
         return addr.is_loopback();
     }
-    host.eq_ignore_ascii_case("localhost") || host.eq_ignore_ascii_case("localhost.")
+    is_localhost_name(host)
 }
 
 /// Refuse to send a request over a channel that isn't `https` (or loopback
@@ -788,7 +831,8 @@ mod tests {
 
     #[test]
     fn is_loopback_cases() {
-        // The special-use name is accepted by spelling, without consulting DNS.
+        // The special-use name passes this configuration-time check; the OIDC
+        // resolver separately verifies the addresses used by the connection.
         assert!(is_loopback("localhost"));
         assert!(is_loopback("LOCALHOST"));
         assert!(is_loopback("localhost."));
@@ -803,6 +847,47 @@ mod tests {
         assert!(!is_loopback("localhost.example.com"));
         assert!(!is_loopback("notlocalhost"));
         assert!(!is_loopback(""));
+    }
+
+    #[test]
+    fn plaintext_localhost_resolution_must_remain_on_loopback() {
+        fn resolved(values: &[&str]) -> ResolvedSocketAddrs {
+            let resolver = OidcResolver::default();
+            let mut result = resolver.empty();
+            for value in values {
+                result.push(value.parse().unwrap());
+            }
+            result
+        }
+
+        let localhost: Uri = "http://localhost:9000/settings".parse().unwrap();
+        assert!(
+            enforce_plaintext_localhost_resolution(
+                &localhost,
+                &resolved(&["127.0.0.1:9000", "[::1]:9000"]),
+            )
+            .is_ok()
+        );
+        assert!(
+            enforce_plaintext_localhost_resolution(
+                &localhost,
+                &resolved(&["127.0.0.1:9000", "203.0.113.7:9000"]),
+            )
+            .is_err(),
+            "one routable candidate must make the plaintext request fail closed"
+        );
+        assert!(
+            enforce_plaintext_localhost_resolution(&localhost, &resolved(&["203.0.113.7:9000"]),)
+                .is_err()
+        );
+
+        // HTTPS still relies on certificate verification and may legitimately
+        // resolve through a non-loopback test/container mapping.
+        let secure: Uri = "https://localhost:9000/settings".parse().unwrap();
+        assert!(
+            enforce_plaintext_localhost_resolution(&secure, &resolved(&["203.0.113.7:9000"]),)
+                .is_ok()
+        );
     }
 
     #[test]

@@ -482,6 +482,10 @@ fn settings_config(settings: &serde_json::Value) -> serde_json::Value {
 }
 
 fn settings_url(questdb_url: &str) -> Result<String> {
+    // The QuestDB discovery URL is a trust root just like the credential
+    // endpoints it advertises. Reject userinfo and parser-confusable authority
+    // bytes before constructing or sending the /settings request.
+    reject_confusable_authority(questdb_url, "QuestDB server")?;
     let uri: Uri = questdb_url
         .parse()
         .map_err(|e| OidcError::config(format!("Malformed QuestDB URL {questdb_url:?}: {e}")))?;
@@ -1098,6 +1102,17 @@ mod tests {
     #[test]
     fn settings_url_requires_scheme() {
         assert!(settings_url("host:9000").is_err());
+    }
+
+    #[test]
+    fn settings_url_rejects_confusable_authority() {
+        for url in [
+            "https://trusted.example@evil.example:9000",
+            "https://evil.example\\@trusted.example:9000",
+            "https://ex%41mple.com:9000",
+        ] {
+            assert!(settings_url(url).is_err(), "should reject {url}");
+        }
     }
 
     #[test]
