@@ -162,7 +162,7 @@ impl Drop for InteractiveGuard<'_> {
 /// The RFC 8628 device-authorization response (device code is a secret used only
 /// in the poll body, never displayed).
 struct DeviceResponse {
-    device_code: String,
+    device_code: Zeroizing<String>,
     challenge: DeviceCodeChallenge,
 }
 
@@ -1623,7 +1623,7 @@ impl OidcDeviceAuth {
                         int_field(body, "interval").unwrap_or(self.default_interval as i64),
                     );
                     return Ok(DeviceResponse {
-                        device_code,
+                        device_code: Zeroizing::new(device_code),
                         challenge: DeviceCodeChallenge {
                             user_code,
                             verification_uri,
@@ -1823,11 +1823,11 @@ impl OidcDeviceAuth {
                 }
             };
             let status = result.status;
-            let body = result.body;
             let retry_after = result.retry_after;
+            let body = &result.body;
 
             if status == 200 {
-                let tokens = match self.tokenset_from_response(&body, None) {
+                let tokens = match self.tokenset_from_response(body, None) {
                     Ok(tokens) => tokens,
                     Err(error) => {
                         self.renderer.on_failure(

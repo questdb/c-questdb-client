@@ -44,6 +44,7 @@ use ureq::unversioned::resolver::{DefaultResolver, ResolvedSocketAddrs, Resolver
 use ureq::unversioned::transport::{
     Buffers, Connector, Either, LazyBuffers, NextTimeout, TcpConnector, Transport, TransportAdapter,
 };
+use zeroize::{Zeroize, Zeroizing};
 
 use crate::ingress::tls::{TlsSettings, configure_tls};
 use crate::oidc::error::{OidcError, Result};
@@ -66,6 +67,32 @@ pub(crate) struct PostResult {
     pub(crate) status: u16,
     pub(crate) body: serde_json::Value,
     pub(crate) retry_after: Option<u64>,
+}
+
+impl Drop for PostResult {
+    fn drop(&mut self) {
+        zeroize_json_strings(&mut self.body);
+    }
+}
+
+/// Wipe every response-owned string before serde releases its allocation. POST
+/// bodies may carry device, access, ID, or refresh credentials, including in a
+/// proxy/WAF error response that reflects request data.
+fn zeroize_json_strings(value: &mut serde_json::Value) {
+    match value {
+        serde_json::Value::String(value) => value.zeroize(),
+        serde_json::Value::Array(values) => {
+            for value in values {
+                zeroize_json_strings(value);
+            }
+        }
+        serde_json::Value::Object(values) => {
+            for value in values.values_mut() {
+                zeroize_json_strings(value);
+            }
+        }
+        _ => {}
+    }
 }
 
 /// HTTP statuses that indicate a retryable timeout, rate limit, or server-side
@@ -208,7 +235,9 @@ impl HttpClient {
             })?;
         let status = response.status().as_u16();
         let retry_after = parse_retry_after(response.headers());
-        let body = read_body(url, response)?;
+        // Keep the raw response allocation under RAII zeroization as well as the
+        // parsed strings below. Both otherwise survive in freed allocator pages.
+        let body = Zeroizing::new(read_body(url, response)?);
         match serde_json::from_slice::<serde_json::Value>(&body) {
             Ok(value) => Ok(PostResult {
                 status,
@@ -916,6 +945,23 @@ mod tests {
                 assert_eq!(detail, "unexpected non-JSON response body");
             }
         }
+    }
+
+    #[test]
+    fn post_response_json_strings_are_zeroized_recursively() {
+        let mut body = serde_json::json!({
+            "access_token": "AT-secret",
+            "nested": ["RT-secret", {"device_code": "DC-secret"}],
+            "expires_in": 300,
+            "present": true,
+        });
+        zeroize_json_strings(&mut body);
+
+        assert_eq!(body["access_token"], "");
+        assert_eq!(body["nested"][0], "");
+        assert_eq!(body["nested"][1]["device_code"], "");
+        assert_eq!(body["expires_in"], 300);
+        assert_eq!(body["present"], true);
     }
 
     #[test]
