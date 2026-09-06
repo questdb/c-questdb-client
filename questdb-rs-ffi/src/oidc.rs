@@ -1002,7 +1002,7 @@ pub unsafe extern "C" fn questdb_oidc_builder_event_handler(
             callback_ready: std::sync::Condvar::new(),
             active: AtomicBool::new(false),
         });
-        std::mem::replace(&mut builder.config.renderer, Some(replacement))
+        builder.config.renderer.replace(replacement)
     };
     // Dropping the previous target calls foreign code. Its mutable builder
     // borrow is now out of scope, so a release callback may safely re-enter this
