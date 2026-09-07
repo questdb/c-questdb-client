@@ -1685,8 +1685,12 @@ impl SfaBackend {
         //
         // Safe against the reconnect-trim hazard because the server withholds a
         // deferred frame's ack while its rows sit uncommitted in the WAL writers
-        // (QwpIngressProcessorState, questdb#7144 and questdb#7440). An
-        // unacknowledged frame is never trimmed, so a reconnect mid-group
+        // (QwpIngressProcessorState, questdb#7366, first shipped in 10.0.0;
+        // questdb#7440 adds an early ack once the rows are force-committed).
+        // questdb#7144 (9.4.1) introduced the flag but still acked deferred
+        // frames, so a 9.4.x server can trim a prefix the reconnect then never
+        // replays -- below the documented 10.0 floor, see doc/COMPATIBILITY.md.
+        // An unacknowledged frame is never trimmed, so a reconnect mid-group
         // replays it -- at-least-once, as intended. The boundary to wait for is
         // the last frame's FSN; its cumulative ack covers the prefix. (In delta
         // mode the frames are not individually self-sufficient; the driver
