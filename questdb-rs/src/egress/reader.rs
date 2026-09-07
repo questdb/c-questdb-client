@@ -1129,33 +1129,74 @@ impl<'r> ReaderQuery<'r> {
     }
 
     /// Send the QUERY_REQUEST and return a streaming `Cursor`.
+    ///
+    /// The submit itself lives in `CursorState::submit` so the owning
+    /// handle ([`crate::egress::OwnedQuery`]) sends byte-identical
+    /// QUERY_REQUESTs through one implementation; all this adds is the
+    /// `'r`-bound reader borrow and the failover callbacks, neither of
+    /// which `CursorState` can hold.
     pub fn execute(self) -> Result<Cursor<'r>> {
-        if self.reader.cursor_active {
+        let ReaderQuery {
+            reader,
+            builder,
+            reset_symbol_dict,
+            on_failover_reset,
+            on_failover_progress,
+        } = self;
+        let state = CursorState::submit(&mut *reader, builder, reset_symbol_dict)?;
+        Ok(Cursor {
+            reader,
+            state,
+            on_failover_reset,
+            on_failover_progress,
+        })
+    }
+}
+
+impl CursorState {
+    /// Send one `QUERY_REQUEST` on `reader` and return the per-query state
+    /// that tracks its result stream.
+    ///
+    /// The whole of query submission: the one-cursor-per-Reader guard,
+    /// request_id allocation, stale-schema clearing, the cap-gated
+    /// `query_flags` trailer, encoding, the replay-layout invariant check,
+    /// and the initial write. Shared verbatim by the borrowing
+    /// [`ReaderQuery::execute`] and the owning
+    /// [`crate::egress::OwnedQuery::execute`] — there is exactly one
+    /// implementation of the wire format on the submit path.
+    ///
+    /// Takes `&mut Reader` rather than living on `ReaderQuery` precisely
+    /// because the owning path has no `&'r mut Reader` to offer: it owns
+    /// its connection and reborrows it per call.
+    pub(crate) fn submit(
+        reader: &mut Reader,
+        builder: QueryRequestBuilder,
+        reset_symbol_dict: bool,
+    ) -> Result<CursorState> {
+        if reader.cursor_active {
             return Err(fmt!(
                 InvalidApiCall,
                 "another cursor is already in flight on this connection (only one cursor at a time per Reader)"
             ));
         }
-        let request_id = self.reader.alloc_request_id();
+        let request_id = reader.alloc_request_id();
         // The schema rides the first RESULT_BATCH (batch_seq == 0) of each
         // query; clear any schema left from the prior query so a stray
         // continuation batch can't bind rows to a stale schema.
-        self.reader.query_schema = None;
+        reader.query_schema = None;
         // Cap-gate the query_flags trailer: only emit it when the server
         // advertised CAP_QUERY_FLAGS, so an older server sees the baseline
         // QUERY_REQUEST layout and the reset request silently degrades.
-        let server_supports_query_flags = self
-            .reader
+        let server_supports_query_flags = reader
             .server_info()
             .map(|info| has_query_flags(info.capabilities))
             .unwrap_or(false);
-        let query_flags = if self.reset_symbol_dict && server_supports_query_flags {
+        let query_flags = if reset_symbol_dict && server_supports_query_flags {
             QUERY_FLAG_RESET_DICT
         } else {
             0
         };
-        let req = self
-            .builder
+        let req = builder
             .request_id(request_id)
             .query_flags(query_flags)
             .build()?;
@@ -1207,41 +1248,36 @@ impl<'r> ReaderQuery<'r> {
         // a zero-copy move; cloning a Bytes is a refcount bump so the
         // initial write and the stashed copy share one allocation.
         let encoded_request: Bytes = encoded_request.into();
-        self.reader
+        reader
             .transport_mut()?
             .write_message(encoded_request.clone())?;
 
-        self.reader.cursor_active = true;
-        let failover_budget = FailoverBudget::new(&self.reader.cfg);
-        Ok(Cursor {
-            reader: self.reader,
-            state: CursorState {
-                request_id,
-                last_batch: None,
-                terminal: None,
-                credit_enabled,
-                cancelling: false,
-                done: false,
-                terminal_error: None,
-                encoded_request,
-                failover_budget,
-                failover_resets: 0,
-                decode_failover_rounds: 0,
-                stale_plan_retries: 0,
-                data_delivered: false,
-                #[cfg(feature = "arrow-egress")]
-                drifted_batch: None,
-                #[cfg(feature = "arrow-egress")]
-                sym_values: crate::egress::arrow::SymbolValuesCache::default(),
-                #[cfg(feature = "arrow-egress")]
-                sym_scratch: crate::egress::arrow::SymbolBuildScratch::default(),
-                #[cfg(feature = "polars-egress")]
-                symbol_registry: None,
-                #[cfg(feature = "polars-egress")]
-                symbol_delta_modes: Vec::new(),
-            },
-            on_failover_reset: self.on_failover_reset,
-            on_failover_progress: self.on_failover_progress,
+        reader.cursor_active = true;
+        let failover_budget = FailoverBudget::new(&reader.cfg);
+        Ok(CursorState {
+            request_id,
+            last_batch: None,
+            terminal: None,
+            credit_enabled,
+            cancelling: false,
+            done: false,
+            terminal_error: None,
+            encoded_request,
+            failover_budget,
+            failover_resets: 0,
+            decode_failover_rounds: 0,
+            stale_plan_retries: 0,
+            data_delivered: false,
+            #[cfg(feature = "arrow-egress")]
+            drifted_batch: None,
+            #[cfg(feature = "arrow-egress")]
+            sym_values: crate::egress::arrow::SymbolValuesCache::default(),
+            #[cfg(feature = "arrow-egress")]
+            sym_scratch: crate::egress::arrow::SymbolBuildScratch::default(),
+            #[cfg(feature = "polars-egress")]
+            symbol_registry: None,
+            #[cfg(feature = "polars-egress")]
+            symbol_delta_modes: Vec::new(),
         })
     }
 }
@@ -2677,8 +2713,13 @@ impl CursorState {
     }
 
     /// Abandon-mid-stream cleanup, shared by every cursor handle's `Drop`
-    /// impl (today just `Drop for Cursor`).
-    fn drop_cleanup(&mut self, reader: &mut Reader) {
+    /// impl: `Drop for Cursor` and `Drop for OwnedCursor` (which also runs
+    /// it from `into_owner`, so a handed-back connection is never recycled
+    /// with a half-read result still en route).
+    ///
+    /// `pub(crate)` so `egress::owned` can reuse this body rather than
+    /// keeping a second copy of the teardown in step with it.
+    pub(crate) fn drop_cleanup(&mut self, reader: &mut Reader) {
         // `cursor_active` is cleared by `next_batch()` on every terminal
         // path (RESULT_END, EXEC_DONE, QUERY_ERROR) and by `cancel()`
         // once it's drained. If it's still set at drop time, this cursor

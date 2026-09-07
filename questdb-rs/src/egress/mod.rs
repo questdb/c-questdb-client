@@ -53,6 +53,10 @@ pub mod column_kind;
 pub mod config;
 pub(crate) mod decoder;
 pub(crate) mod gorilla;
+/// Owning (lifetime-free) counterparts to `ReaderQuery` / `Cursor`, for
+/// consumers that must hold a result stream rather than borrow one.
+#[cfg(feature = "sync-reader-qwp-ws")]
+pub mod owned;
 pub(crate) mod query_request;
 #[cfg(feature = "sync-reader-qwp-ws")]
 pub mod reader;
@@ -89,10 +93,16 @@ pub use config::{
     MAX_FAILOVER_MAX_ATTEMPTS, MIN_COMPRESSION_LEVEL, ReaderConfig, Target, TlsVerify,
 };
 #[cfg(feature = "sync-reader-qwp-ws")]
+pub use owned::{OwnedCursor, OwnedQuery};
+#[cfg(feature = "sync-reader-qwp-ws")]
 pub use reader::{
     BatchView, Cursor, FailoverPhase, FailoverProgressEvent, FailoverResetEvent, Reader,
     ReaderQuery, ReaderStats, Terminal,
 };
+// `PooledQuery` / `PooledCursor` name `OwnedReader`, which (like `QuestDb`
+// itself) is gated on the QWP/WS sender as well as the reader.
+#[cfg(all(feature = "sync-reader-qwp-ws", feature = "sync-sender-qwp-ws"))]
+pub use owned::{PooledCursor, PooledQuery};
 pub use server_event::{ServerInfo, ServerRole, UpgradeReject};
 pub use symbol_dict::{SymbolDict, SymbolEntry};
 

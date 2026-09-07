@@ -4260,6 +4260,76 @@ fn progress_and_reset_callbacks_both_fire_on_reset() {
 }
 
 #[test]
+fn failover_callback_sequence_is_pinned_end_to_end() {
+    // The four callback firings of one successful mid-query failover, in a
+    // SINGLE interleaved log, asserted as an exact ordered sequence.
+    //
+    // Why this exists on top of the tests above. Each of them pins one
+    // *pair*: `progress_callback_phase_order_on_successful_failover` orders
+    // the progress phases among themselves (and only by relative index, so
+    // a spurious extra event slips through);
+    // `progress_and_reset_callbacks_both_fire_on_reset` records only the
+    // `Reset` phase, so it cannot see where `Disconnected` / `Retrying` sit
+    // relative to the reset hook; `progress_callback_disconnected_fires_before_any_dial`
+    // pins Disconnected-before-Retrying alone. Nothing asserted the whole
+    // sequence, so several transpositions — firing the reset hook between
+    // `Disconnected` and `Retrying`, emitting a second `Disconnected` per
+    // reconnect round, moving the `Reset` phase after the hook — were
+    // preserved only by reading `failover_reconnect_and_replay`.
+    //
+    // Scenario: A serves the query then drops mid-stream; B is next in the
+    // address list and answers the replay on the first dial. That makes the
+    // reconnect deterministic — exactly one `Retrying` — so the expected
+    // vector can be written out literally rather than derived from what was
+    // observed.
+    let srv_a = MockServer::start(vec![drop_after_query_script(ServerRole::Standalone, "a")]);
+    let srv_b = MockServer::start(vec![happy_script(ServerRole::Standalone, "b")]);
+    let conf = format!(
+        "ws::addr={};failover_backoff_initial_ms=1;failover_backoff_max_ms=2",
+        build_addr_list(&[&srv_a, &srv_b])
+    );
+    let mut reader = Reader::from_conf(&conf).expect("connect");
+
+    // Both callbacks run on the cursor's drive thread (pinned by
+    // `query_and_cursor_migrate_across_threads_with_callbacks_and_drop`), so appending to
+    // one shared Vec records a true happens-before order, not a race.
+    let log: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    let log_progress = Arc::clone(&log);
+    let log_reset = Arc::clone(&log);
+
+    let mut cursor = reader
+        .prepare("select 1")
+        .on_failover_progress(move |ev: &FailoverProgressEvent| {
+            log_progress
+                .lock()
+                .unwrap()
+                .push(format!("progress:{:?}", ev.phase));
+        })
+        .on_failover_reset(move |_ev: &FailoverResetEvent| {
+            log_reset.lock().unwrap().push("reset-hook".to_string());
+        })
+        .execute()
+        .expect("execute");
+
+    assert!(cursor.next_batch().expect("next").is_none());
+    assert_eq!(cursor.failover_resets(), 1, "exactly one failover happened");
+
+    let seen = log.lock().unwrap().clone();
+    assert_eq!(
+        seen,
+        vec![
+            "progress:Disconnected".to_string(),
+            "progress:Retrying".to_string(),
+            "progress:Reset".to_string(),
+            "reset-hook".to_string(),
+        ],
+        "the failover callback sequence must be exactly \
+         Disconnected -> Retrying -> Reset -> reset hook; got {:?}",
+        seen
+    );
+}
+
+#[test]
 fn progress_callback_disconnected_fires_before_any_dial() {
     // Tight invariant: Disconnected MUST fire before any Retrying or
     // dial sees the wire. Tested by giving B a slow accept and

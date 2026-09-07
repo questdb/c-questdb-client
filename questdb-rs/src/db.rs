@@ -2514,6 +2514,25 @@ impl OwnedReader {
     }
 }
 
+/// Lets `OwnedReader` stand in as the owner of an
+/// [`OwnedCursor`](crate::egress::OwnedCursor) — the bound is
+/// `BorrowMut<Reader>` so a bare `Reader` (via the standard library's
+/// reflexive blanket impl) and a pooled reader share one implementation.
+/// `BorrowMut` requires `Borrow`, hence both.
+#[cfg(feature = "_egress")]
+impl std::borrow::Borrow<Reader> for OwnedReader {
+    fn borrow(&self) -> &Reader {
+        self.get()
+    }
+}
+
+#[cfg(feature = "_egress")]
+impl std::borrow::BorrowMut<Reader> for OwnedReader {
+    fn borrow_mut(&mut self) -> &mut Reader {
+        self.get_mut()
+    }
+}
+
 #[cfg(feature = "_egress")]
 impl Drop for OwnedReader {
     fn drop(&mut self) {
