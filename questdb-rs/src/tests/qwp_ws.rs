@@ -4581,7 +4581,7 @@ fn qwp_ws_rewind_after_a_failed_publication_republishes_only_surviving_rows() {
     }
 
     // The cap sits at the configurable floor: the surviving rows encode well
-    // under it, the doomed ones -- whose symbols alone run past 8 KiB -- well
+    // under it, the doomed ones -- whose symbols alone run past 7 KiB -- well
     // over, so that flush and only it is rejected.
     let max = 1024;
     let mut probe = Buffer::qwp_ws_with_max_name_len(127);
@@ -4631,6 +4631,11 @@ fn qwp_ws_rewind_after_a_failed_publication_republishes_only_surviving_rows() {
     write_doomed_rows(&mut buf);
     let err = sender.flush_and_keep(&buf).unwrap_err();
     assert_eq!(err.code(), ErrorCode::InvalidApiCall, "{err}");
+    assert!(
+        err.msg()
+            .contains("exceeds maximum configured allowed size"),
+        "the doomed flush must fail on the size cap, not another guard: {err}"
+    );
 
     buf.rewind_to_bookmark(bookmark).unwrap();
     write_row(&mut buf, "keep-d", 2);

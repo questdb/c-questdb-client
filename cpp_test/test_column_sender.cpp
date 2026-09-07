@@ -388,10 +388,9 @@ TEST_CASE("one borrowed_sender sends a Buffer and a Chunk")
 }
 
 // The QWP/WS row buffer reaches C and C++ through the pool, and its rewind
-// records lengths rather than copying what it discards. This is the only
-// foreign-language cover for that path on a real connection: the discarded
-// rows' symbols would ride in the published frame's dictionary if the rewind
-// left their cells behind.
+// records lengths rather than copying what it discards. On a real connection
+// the discarded rows' symbols would ride in the published frame's dictionary
+// if the rewind left their cells behind.
 TEST_CASE("borrowed_sender publishes only the rows a bookmark rewind kept")
 {
     auto mock = spawn_acking_mock(1);

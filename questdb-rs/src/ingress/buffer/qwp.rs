@@ -10494,9 +10494,10 @@ mod tests {
         }
 
         // A cleared buffer keeps its schema, so the kept rows land in columns
-        // that already carry state from the batch before: a pinned geohash
-        // precision, a spent symbol dictionary, a decimal scale back at its
-        // unset sentinel. A rewind has to restore that state too.
+        // the batch before already shaped. Most column state is reset by the
+        // clear; the geohash precision is not, and a rewind has to restore it
+        // too. Only row 0 skips the geohash column, so the restore is
+        // exercised by the `kept 1` cases.
         fn prime_then_clear(buf: &mut QwpWsColumnarBuffer) {
             for table in ["trades", "quotes"] {
                 buf.table(table)
@@ -10842,6 +10843,54 @@ mod tests {
                 "{api}: a row appended after the rewind must repin the precision"
             );
         }
+    }
+
+    /// The mid-row error rollback reaches the same column unwind as a rewind,
+    /// through the mark `table()` took at the start of the row. A row that
+    /// repins a reused geohash column and then fails must leave the retained
+    /// precision in place, or the next batch's all-null column encodes the
+    /// precision the failed row asked for.
+    #[cfg(feature = "_sender-qwp-ws")]
+    #[test]
+    fn qwp_ws_columnar_failed_row_restores_the_precision_it_repinned() {
+        fn write_geohash(buf: &mut QwpWsColumnarBuffer, precision_bits: u8) {
+            buf.table("pos")
+                .unwrap()
+                .column_geohash("g", 7, precision_bits)
+                .unwrap()
+                .at_now()
+                .unwrap();
+        }
+
+        fn write_without_geohash(buf: &mut QwpWsColumnarBuffer) {
+            buf.table("pos")
+                .unwrap()
+                .column_i64("n", 1)
+                .unwrap()
+                .at_now()
+                .unwrap();
+        }
+
+        let mut reference = QwpWsColumnarBuffer::new(127);
+        write_geohash(&mut reference, 25);
+        reference.clear();
+        write_without_geohash(&mut reference);
+
+        let mut buf = QwpWsColumnarBuffer::new(127);
+        write_geohash(&mut buf, 25);
+        buf.clear();
+        buf.table("pos").unwrap().column_geohash("g", 7, 5).unwrap();
+        let err = buf.column_i64("g", 1).unwrap_err();
+        assert_eq!(err.code(), ErrorCode::InvalidApiCall);
+        write_without_geohash(&mut buf);
+
+        let bytes = ws_replay_bytes(&mut buf);
+        let (_, precision) = ws_first_geohash_precision(&bytes);
+        assert_eq!(
+            precision, 25,
+            "a failed row's repin must not outlive its rollback"
+        );
+        assert_eq!(bytes, ws_replay_bytes(&mut reference));
     }
 
     #[cfg(feature = "_sender-qwp-ws")]
