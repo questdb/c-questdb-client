@@ -1820,7 +1820,8 @@ impl SfaBackend {
     /// committing frame it is waiting for.
     ///
     /// `DirectColumnBackend` handles the same case by marking the connection
-    /// must-close so the drop-time commit discards the prefix. Store-and-forward
+    /// must-close, so the deferred remainder dies with the connection (a prefix
+    /// its valve already force-committed stays committed). Store-and-forward
     /// cannot discard -- the frames are already durably enqueued -- so it does
     /// the opposite and commits them, which is the outcome
     /// `deny_retry_after_partial` already reports to the caller: delivery
@@ -1918,12 +1919,12 @@ impl SfaBackend {
         caps: SfaFrameCaps,
         defer_commit: bool,
     ) -> std::result::Result<u64, FlushFailure> {
-        // Bounded deferred window. A deferred frame is never acked, so it never
-        // frees its in-flight slot; a split long enough to fill the window would
-        // leave the committing frame unable to submit at all — the foreground
-        // would block on back-pressure until `sf_append_deadline` and fail, with
-        // the deferred prefix durably queued and no frame to commit it. At
-        // `max_in_flight=1` that is every oversize chunk.
+        // Bounded deferred window. A deferred frame is never acked, so the
+        // queue bytes it occupies are never reclaimed; a split long enough to
+        // fill the slot's byte budget would leave the committing frame unable
+        // to submit at all — the foreground would block on back-pressure until
+        // `sf_append_deadline` and fail, with the deferred prefix durably queued
+        // and no frame to commit it.
         //
         // `DirectColumnBackend` bounds the same window with
         // `has_sync_commit_slot()` and force-commits the prefix when it fills
