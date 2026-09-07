@@ -4402,6 +4402,21 @@ fn qwp_ws_background_orphan_close_does_not_dial_next_slot() {
         listener.accept(),
         Err(err) if err.kind() == std::io::ErrorKind::WouldBlock
     ));
+
+    // The close bound alone cannot tell an interrupted worker from one the
+    // pool gave up on and detached, which would still hold the slot lock.
+    // Reopening the stalled slot proves the worker actually exited.
+    let reopen_port = spawn_upgrade_only_server();
+    let reopen_conf = format!(
+        "ws::addr=127.0.0.1:{reopen_port};qwp_ws_progress=manual;\
+         sf_dir={};sender_id=orphan-a;sf_max_segment_bytes=256;sf_max_total_bytes=1024;",
+        sf_dir.path().display()
+    );
+    let reopened = SenderBuilder::from_conf(&reopen_conf)
+        .unwrap()
+        .build()
+        .expect("stalled orphan worker retained the slot lock after close");
+    drop(reopened);
     assert!(slot_has_sfa_file(&sf_dir.path().join("orphan-a")));
     assert!(slot_has_sfa_file(&sf_dir.path().join("orphan-b")));
 
@@ -4570,19 +4585,20 @@ fn qwp_ws_rewind_after_a_failed_publication_republishes_only_surviving_rows() {
             .unwrap();
     }
 
+    // Two rows whose symbols each weigh most of the cap: together they run
+    // past it, alone either fits. A rewind that unwound only the last row
+    // would therefore leave a buffer that still publishes, and the
+    // dictionary assertions below get to see what it ships.
     fn write_doomed_rows(buf: &mut Buffer) {
-        for i in 0..256 {
-            write_row(
-                buf,
-                format!("drop-{i}-aaaaaaaaaaaaaaaaaaaa").as_str(),
-                100 + i,
-            );
+        for i in 0..2 {
+            let symbol = format!("drop-{i}-{}", "a".repeat(700));
+            write_row(buf, symbol.as_str(), 100 + i);
         }
     }
 
     // The cap sits at the configurable floor: the surviving rows encode well
-    // under it, the doomed ones -- whose symbols alone run past 7 KiB -- well
-    // over, so that flush and only it is rejected.
+    // under it, the doomed ones well over, so that flush and only it is
+    // rejected.
     let max = 1024;
     let mut probe = Buffer::qwp_ws_with_max_name_len(127);
     write_row(&mut probe, "keep-a", 1);
