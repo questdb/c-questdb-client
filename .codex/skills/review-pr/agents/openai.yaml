@@ -1,0 +1,4 @@
+interface:
+  display_name: "Review PR"
+  short_description: "Review client PRs with evidence-gated findings"
+  default_prompt: "Use $review-pr to review a PR or local Git range at the requested level."
