@@ -4386,7 +4386,16 @@ fn qwp_ws_background_orphan_close_does_not_dial_next_slot() {
         .unwrap();
     let listener = listener_rx.recv_timeout(Duration::from_secs(5)).unwrap();
 
+    // The mock parks on the stalled orphan for 10s. Without a bound here, a
+    // close that waited for that park to expire would still find no second
+    // dial and pass.
+    let started = Instant::now();
     sender.close_drain().unwrap();
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed < Duration::from_secs(5),
+        "background orphan shutdown took {elapsed:?}"
+    );
 
     listener.set_nonblocking(true).unwrap();
     assert!(matches!(
