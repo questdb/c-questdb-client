@@ -1900,6 +1900,23 @@ fn sender_completed_fsn_polls_ok_ahead_of_durable() {
     let fsn = sender.flush_and_get_fsn(&mut buf).unwrap().unwrap();
     frame_rx.recv_timeout(Duration::from_secs(5)).unwrap();
 
+    // Publication alone must not move either completion level, so a
+    // watermark wired to `published_fsn()` cannot pass the gate below.
+    assert_eq!(sender.published_fsn().unwrap(), Some(fsn));
+    assert_eq!(
+        sender.completed_fsn(crate::ingress::AckLevel::Ok).unwrap(),
+        None,
+        "OK watermark must not cover a frame the server has not accepted"
+    );
+    assert_eq!(
+        sender
+            .completed_fsn(crate::ingress::AckLevel::Durable)
+            .unwrap(),
+        None,
+        "durable watermark must not cover a frame the server has not accepted"
+    );
+    assert_eq!(sender.acked_fsn().unwrap(), None);
+
     // Server accepts the frame but the durable ACK is still gated: the OK
     // watermark must cover the frame while the durable one does not.
     ok_tx.send(()).unwrap();
