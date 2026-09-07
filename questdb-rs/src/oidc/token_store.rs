@@ -2273,6 +2273,20 @@ fn fsync_directory(dir: &Path) -> std::io::Result<()> {
     File::open(dir)?.sync_all()
 }
 
+/// No-op off Unix, and NOT an equivalent.
+///
+/// There is no portable way to fsync a directory entry: Windows has no
+/// `O_DIRECTORY` handle to `sync_all`, and `fs::rename` there is not
+/// write-through. So on those platforms the barrier the callers above treat as
+/// mandatory does not exist.
+///
+/// What that costs, concretely: a power failure between the rename and this
+/// call can lose the directory entry for a freshly persisted ROTATED child
+/// token while the parent's tombstone survives, or vice versa. The next start
+/// then reads and submits a refresh token the IdP already consumed, which a
+/// rotation-detecting IdP answers by revoking the whole token family. The
+/// window is small and needs an unclean shutdown, but it is real, and callers
+/// on those platforms should not read the `Ok(())` here as durability.
 #[cfg(not(unix))]
 fn fsync_directory(_dir: &Path) -> std::io::Result<()> {
     Ok(())

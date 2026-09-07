@@ -84,9 +84,13 @@ impl HttpAuth {
             // gate — the same path the QWP/WebSocket sender and reader use — so a
             // provider acquisition failure, a blank / non-printable-ASCII token (a
             // decoded CR/LF is a header-injection vector), and a caller-closure
-            // panic (in unwind builds) all surface as one retryable `SocketError`
-            // here too, never a terminal `AuthError`. A server rejection of a
-            // successfully acquired token remains a separate terminal auth error.
+            // panic (in unwind builds only -- see `TokenProvider::bearer_header`)
+            // surface as a retryable `SocketError`. The exceptions are the
+            // failures that cannot recover on the next invocation: a permanently
+            // closed provider and a misconfiguration stay as they are, and a
+            // caller contract violation is carried out as a terminal
+            // `ConfigError`. A server rejection of a successfully acquired token
+            // remains a separate terminal auth error.
             HttpAuth::Provider(provider) => Ok(Some(Cow::Owned(provider.bearer_header()?))),
         }
     }

@@ -144,6 +144,13 @@ pub(crate) const QWP_WS_DEFAULT_CLOSE_DRAIN_TIMEOUT: std::time::Duration =
 pub(crate) const QWP_WS_DEFAULT_ERROR_INBOX_CAPACITY: usize = 256;
 #[cfg(feature = "_sender-qwp-ws")]
 pub(crate) const QWP_WS_MIN_ERROR_INBOX_CAPACITY: usize = 16;
+/// Upper bound for a caller-selected error inbox, mirroring the FFI's
+/// `MAX_DB_CALLBACK_INBOX_CAPACITY`. The value reaches
+/// `VecDeque::with_capacity`, and the allocator aborts on failure, so an
+/// absurd one from a configuration string must be refused rather than turned
+/// into a process abort with no traceback.
+#[cfg(feature = "_sender-qwp-ws")]
+pub(crate) const QWP_WS_MAX_ERROR_INBOX_CAPACITY: usize = 65_536;
 #[cfg(feature = "_sender-qwp-ws")]
 pub(crate) const QWP_WS_DEFAULT_MAX_FRAME_REJECTIONS: usize = 4;
 #[cfg(feature = "_sender-qwp-ws")]

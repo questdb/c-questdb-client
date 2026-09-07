@@ -54,6 +54,13 @@ pub struct DeviceCodeChallenge {
     pub(crate) verification_uri_complete: Option<String>,
     pub(crate) expires_in_seconds: u64,
     pub(crate) interval_seconds: u64,
+    /// Whether the CONFIGURED device-authorization endpoint is itself a
+    /// loopback host. Gates the plaintext exemption in [`safe_target`]: a local
+    /// IdP names its own loopback port, and that must keep working without
+    /// TLS, but a remote HTTPS IdP has no business handing back a loopback URL
+    /// and must not be able to aim a browser, a clickable link or a QR code at
+    /// whatever else is listening on the machine.
+    pub(crate) idp_is_loopback: bool,
 }
 
 impl DeviceCodeChallenge {
@@ -148,8 +155,11 @@ impl DeviceCodeChallenge {
     /// non-empty ASCII. It remains separate from the display accessors so UI
     /// code cannot accidentally open a merely printable, untrusted value.
     pub fn browser_target(&self) -> Option<String> {
-        let plain = safe_target(Some(&self.verification_uri))?;
-        match safe_target(self.verification_uri_complete.as_deref()) {
+        let plain = safe_target(Some(&self.verification_uri), self.idp_is_loopback)?;
+        match safe_target(
+            self.verification_uri_complete.as_deref(),
+            self.idp_is_loopback,
+        ) {
             Some(complete) if crate::oidc::discovery::same_origin(&complete, &plain) => {
                 Some(complete)
             }
@@ -229,7 +239,7 @@ fn format_prompt(challenge: &DeviceCodeChallenge) -> String {
     // browser_target() yields the pre-filled `complete` only when it is safe and
     // shares verification_uri's origin; otherwise it returns the plain URI shown
     // above. Offer the shortcut only for a distinct, vetted complete.
-    let plain = safe_target(Some(&challenge.verification_uri));
+    let plain = safe_target(Some(&challenge.verification_uri), challenge.idp_is_loopback);
     if let Some(target) = challenge
         .browser_target()
         .filter(|target| Some(target) != plain.as_ref())
@@ -580,7 +590,7 @@ pub(crate) fn display_url(url: &str) -> String {
 /// A-label (`xn--`), which is a confusable that is already ASCII-encoded and so
 /// invisible to the previous test. A rejected URL is still *shown* as inert
 /// text via [`display_url`]; it is just never opened.
-pub(crate) fn safe_target(url: Option<&str>) -> Option<String> {
+pub(crate) fn safe_target(url: Option<&str>, idp_is_loopback: bool) -> Option<String> {
     let raw = url?;
     // Strip first so a control char can't survive into the opened URL, then trim
     // (a leading space would make the scheme parse fail or shift).
@@ -652,7 +662,18 @@ pub(crate) fn safe_target(url: Option<&str>) -> Option<String> {
     // Device codes are credentials. Plaintext is actionable only on the local
     // machine; a remote HTTP URL must remain inert text and must never reach a
     // browser opener or QR code.
-    if uri.scheme_str() == Some("http") && !crate::oidc::http::is_loopback(host) {
+    //
+    // `idp_is_loopback` narrows that exemption to the case it exists for. The
+    // test used to be "is this host loopback?" rather than "is this the IdP we
+    // are talking to?", with no tie back to the configured endpoint -- the only
+    // origin check compares `verification_uri` against
+    // `verification_uri_complete`, both fields of the same response. So a
+    // REMOTE https IdP could return `http://127.0.0.1:9000/exec?query=...` and
+    // have it opened, linkified and QR-encoded. A local IdP names its own
+    // loopback port and still works.
+    if uri.scheme_str() == Some("http")
+        && !(idp_is_loopback && crate::oidc::http::is_loopback(host))
+    {
         return None;
     }
     Some(trimmed.to_string())
@@ -768,6 +789,7 @@ mod tests {
             verification_uri_complete: Some("https://idp.example.com/activate?code=ABCD\n".into()),
             expires_in_seconds: 600,
             interval_seconds: 5,
+            idp_is_loopback: false,
         };
 
         assert_eq!(challenge.display_user_code(), "AB[31m\\u{0430}");
@@ -801,6 +823,7 @@ mod tests {
             verification_uri_complete: Some(format!("https://idp.example.com/c/{huge}")),
             expires_in_seconds: 600,
             interval_seconds: 5,
+            idp_is_loopback: false,
         };
         assert!(challenge.display_user_code().len() < 4_096);
         assert!(challenge.display_verification_uri().len() < 4_096);
@@ -819,6 +842,7 @@ mod tests {
             ),
             expires_in_seconds: 600,
             interval_seconds: 5,
+            idp_is_loopback: false,
         };
         assert_eq!(
             challenge.browser_target().as_deref(),
@@ -837,6 +861,7 @@ mod tests {
             ),
             expires_in_seconds: 600,
             interval_seconds: 5,
+            idp_is_loopback: false,
         };
         assert_eq!(
             challenge.browser_target().as_deref(),
@@ -864,6 +889,7 @@ mod tests {
                 verification_uri_complete: Some(evil.into()),
                 expires_in_seconds: 600,
                 interval_seconds: 5,
+                idp_is_loopback: false,
             };
             assert_eq!(
                 challenge.browser_target().as_deref(),
@@ -885,6 +911,7 @@ mod tests {
             ),
             expires_in_seconds: 600,
             interval_seconds: 5,
+            idp_is_loopback: false,
         };
         let shown = format_prompt(&same);
         assert!(shown.contains("or open directly"));
@@ -902,6 +929,7 @@ mod tests {
             ),
             expires_in_seconds: 600,
             interval_seconds: 5,
+            idp_is_loopback: false,
         };
         let shown = format_prompt(&cross);
         assert!(
@@ -924,7 +952,7 @@ mod tests {
         let long_path = "a".repeat(MAX_DISPLAY_FIELD_CHARS);
         let url = format!("https://idp.example.com/{long_path}");
         assert!(url.chars().count() > MAX_DISPLAY_FIELD_CHARS);
-        assert_eq!(safe_target(Some(&url)), None);
+        assert_eq!(safe_target(Some(&url), false), None);
 
         // ...while it is still shown, inert and truncated, as text.
         let shown = display_url(&url);
@@ -937,26 +965,29 @@ mod tests {
 
         // A realistic verification_uri_complete is unaffected.
         let ok = "https://idp.example.com/device?user_code=ABCD-EFGH";
-        assert_eq!(safe_target(Some(ok)), Some(ok.to_string()));
+        assert_eq!(safe_target(Some(ok), false), Some(ok.to_string()));
     }
 
     #[test]
     fn safe_target_accepts_plain_https() {
         assert_eq!(
-            safe_target(Some("https://idp.example.com/device?code=ABCD")),
+            safe_target(Some("https://idp.example.com/device?code=ABCD"), false),
             Some("https://idp.example.com/device?code=ABCD".to_string())
         );
     }
 
     #[test]
     fn safe_target_rejects_userinfo() {
-        assert_eq!(safe_target(Some("https://trusted.io@evil.example/")), None);
+        assert_eq!(
+            safe_target(Some("https://trusted.io@evil.example/"), false),
+            None
+        );
     }
 
     #[test]
     fn safe_target_rejects_non_http_scheme() {
-        assert_eq!(safe_target(Some("javascript:alert(1)")), None);
-        assert_eq!(safe_target(Some("data:text/html,x")), None);
+        assert_eq!(safe_target(Some("javascript:alert(1)"), false), None);
+        assert_eq!(safe_target(Some("data:text/html,x"), false), None);
     }
 
     #[test]
@@ -973,22 +1004,22 @@ mod tests {
         // the mitigation `display_url` relies on -- protects nobody here.
         for host in ["xn--80ak6aa92e.com", "xn--pple-43d.com", "XN--PPLE-43D.com"] {
             assert_eq!(
-                safe_target(Some(&format!("https://{host}/device"))),
+                safe_target(Some(&format!("https://{host}/device")), false),
                 None,
                 "{host} must not be offered as an actionable target"
             );
         }
         // A sub-domain A-label is equally confusable.
         assert_eq!(
-            safe_target(Some("https://xn--pple-43d.idp.example.com/device")),
+            safe_target(Some("https://xn--pple-43d.idp.example.com/device"), false),
             None
         );
         // Degrades gracefully rather than hiding the URL: the prompt still
         // shows it, just never opens it or encodes it into a QR.
         assert!(!display_url("https://xn--pple-43d.com/device").is_empty());
         // A host that merely *contains* those letters is not an A-label.
-        assert!(safe_target(Some("https://xnotxn.example.com/device")).is_some());
-        assert!(safe_target(Some("https://example.com/xn--path")).is_some());
+        assert!(safe_target(Some("https://xnotxn.example.com/device"), false).is_some());
+        assert!(safe_target(Some("https://example.com/xn--path"), false).is_some());
     }
 
     #[test]
@@ -998,19 +1029,27 @@ mod tests {
         // refused -- no link, no QR, no browser open -- on a host that cannot
         // be a homoglyph.
         assert_eq!(
-            safe_target(Some("https://[::1]:8443/device")),
+            safe_target(Some("https://[::1]:8443/device"), false),
             Some("https://[::1]:8443/device".to_string())
         );
-        assert_eq!(safe_target(Some("http://[fe80::1]/device")), None);
+        assert_eq!(safe_target(Some("http://[fe80::1]/device"), false), None);
         // A zone id is still refused: `%` can misrepresent the destination, and
         // the address parse rejects it.
-        assert_eq!(safe_target(Some("https://[fe80::1%25eth0]/device")), None);
+        assert_eq!(
+            safe_target(Some("https://[fe80::1%25eth0]/device"), false),
+            None
+        );
         // Brackets are not a way past the host allowlist for a name.
-        assert_eq!(safe_target(Some("https://[not-an-address]/device")), None);
+        assert_eq!(
+            safe_target(Some("https://[not-an-address]/device"), false),
+            None
+        );
     }
 
     #[test]
     fn safe_target_allows_plaintext_only_on_loopback() {
+        // ...and only when the CONFIGURED IdP is itself on loopback, which is
+        // what the exemption exists for: a local IdP names its own port.
         for url in [
             "http://localhost/device",
             "http://LOCALHOST:8080/device",
@@ -1019,7 +1058,7 @@ mod tests {
             "http://127.5.5.5/device",
             "http://[::1]/device",
         ] {
-            assert_eq!(safe_target(Some(url)), Some(url.to_string()), "{url}");
+            assert_eq!(safe_target(Some(url), true), Some(url.to_string()), "{url}");
         }
         for url in [
             "http://idp.example.com/device",
@@ -1027,20 +1066,45 @@ mod tests {
             "http://169.254.1.1/device",
             "http://[fe80::1]/device",
         ] {
-            assert_eq!(safe_target(Some(url)), None, "{url}");
+            assert_eq!(safe_target(Some(url), true), None, "{url}");
         }
     }
 
     #[test]
+    fn safe_target_refuses_loopback_plaintext_from_a_remote_idp() {
+        // A REMOTE https IdP has no business naming a loopback URL, and must
+        // not be able to aim a browser open, a clickable link or a QR code at
+        // whatever else is listening on the machine -- QuestDB's own REST API
+        // is on loopback:9000 and takes `?query=`. The gate used to ask only
+        // "is this host loopback?", with no tie back to the configured
+        // endpoint, so this was accepted.
+        for url in [
+            "http://127.0.0.1:9000/exec?query=DROP+TABLE+x",
+            "http://localhost:9000/exec?query=SELECT+1",
+            "http://[::1]:9000/exec",
+        ] {
+            assert_eq!(safe_target(Some(url), false), None, "{url}");
+        }
+        // https is unaffected either way.
+        assert_eq!(
+            safe_target(Some("https://idp.example.com/device"), false),
+            Some("https://idp.example.com/device".to_string())
+        );
+    }
+
+    #[test]
     fn safe_target_rejects_non_ascii_host() {
-        assert_eq!(safe_target(Some("https://exa\u{0430}mple.com/")), None);
+        assert_eq!(
+            safe_target(Some("https://exa\u{0430}mple.com/"), false),
+            None
+        );
     }
 
     #[test]
     fn safe_target_strips_then_vets() {
         // An embedded newline is stripped; the result is still a valid target.
         assert_eq!(
-            safe_target(Some("https://idp.example.com/\n")),
+            safe_target(Some("https://idp.example.com/\n"), false),
             Some("https://idp.example.com/".to_string())
         );
     }

@@ -1645,7 +1645,17 @@ impl OidcDeviceAuth {
         self.poll_for_token(&resp)
     }
 
+    /// Whether the CONFIGURED device-authorization endpoint is on a loopback
+    /// host. Computed from our own configuration, never from the IdP's
+    /// response, so a remote IdP cannot grant itself the plaintext exemption
+    /// that `safe_target` applies to actionable URLs.
+    fn device_endpoint_is_loopback(&self) -> bool {
+        crate::oidc::http::url_host(&self.config.device_authorization_endpoint)
+            .is_some_and(|host| crate::oidc::http::is_loopback(&host))
+    }
+
     fn request_device_code(&self) -> Result<DeviceResponse> {
+        let device_endpoint_is_loopback = self.device_endpoint_is_loopback();
         self.ensure_open()?;
         let mut form: Vec<(&str, &str)> = vec![
             ("client_id", self.config.client_id.as_str()),
@@ -1691,6 +1701,11 @@ impl OidcDeviceAuth {
                             verification_uri_complete: complete,
                             expires_in_seconds,
                             interval_seconds,
+                            // Scope the plaintext-loopback exemption in
+                            // `safe_target` to a local IdP. Derived from the
+                            // CONFIGURED endpoint, never from the response, so
+                            // a remote IdP cannot grant itself the exemption.
+                            idp_is_loopback: device_endpoint_is_loopback,
                         },
                     });
                 }

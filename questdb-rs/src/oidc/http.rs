@@ -393,6 +393,22 @@ pub(crate) fn is_loopback(host: &str) -> bool {
     is_localhost_name(host)
 }
 
+/// The host of a URL, unbracketed for an IPv6 literal, or `None` when it does
+/// not parse or carries no authority.
+pub(crate) fn url_host(url: &str) -> Option<String> {
+    let uri: Uri = url.parse().ok()?;
+    let host = uri.host()?;
+    let host = host
+        .strip_prefix('[')
+        .and_then(|h| h.strip_suffix(']'))
+        .unwrap_or(host);
+    if host.is_empty() {
+        None
+    } else {
+        Some(host.to_string())
+    }
+}
+
 /// Refuse to send a request over a channel that isn't `https` (or loopback
 /// `http`, or — when `allow_insecure` — any `http`).
 fn require_secure(url: &str, allow_insecure: bool) -> Result<()> {

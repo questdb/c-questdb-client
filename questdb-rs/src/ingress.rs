@@ -1695,6 +1695,23 @@ impl SenderBuilder {
     /// reimplementing protocol dispatch.
     ///
     /// TCP and QWP/UDP do not support Bearer authentication and are rejected.
+    ///
+    /// # Retry classification
+    ///
+    /// Every provider failure is treated as **retryable** by default: the
+    /// closure is caller-controlled and may succeed on its next invocation, and
+    /// a QWP store-and-forward sender must not abandon accepted frames because
+    /// one refresh attempt failed. `AuthError` and `ConfigError` returned from
+    /// the closure are reclassified to a retryable `SocketError` for that
+    /// reason.
+    ///
+    /// To signal a failure that retrying can never clear, return
+    /// [`ErrorCode::InvalidApiCall`](crate::ErrorCode::InvalidApiCall). That is
+    /// the one terminal channel: it is carried out as a terminal `ConfigError`,
+    /// so the reconnect loop stops and reports it. Without it a permanently
+    /// broken provider reconnects forever -- `next_after_retryable_terminal`
+    /// starts a fresh budget each round -- spawning a worker per attempt and
+    /// never surfacing the cause.
     #[cfg(all(feature = "_sender-http", feature = "_sender-qwp-ws"))]
     pub fn bearer_token_provider<F, E>(self, provider: F) -> Result<Self>
     where
@@ -1864,6 +1881,13 @@ impl SenderBuilder {
             return Err(error::fmt!(
                 ConfigError,
                 "A connection listener is already registered on this builder."
+            ));
+        }
+        if inbox_capacity > conn_events::MAX_CONNECTION_EVENT_INBOX_CAPACITY {
+            return Err(error::fmt!(
+                ConfigError,
+                "connection_listener inbox_capacity must be <= {}: {inbox_capacity}",
+                conn_events::MAX_CONNECTION_EVENT_INBOX_CAPACITY
             ));
         }
         qwp_ws.conn_events = Some(std::sync::Arc::new(
@@ -2348,6 +2372,17 @@ impl SenderBuilder {
                 ConfigError,
                 "error_inbox_capacity must be >= {}: {value}",
                 conf::QWP_WS_MIN_ERROR_INBOX_CAPACITY
+            ));
+        }
+        // Only the lower bound was checked. The value flows to
+        // `VecDeque::with_capacity`, and the allocator aborts on failure, so a
+        // large one from a configuration string was a process abort with no
+        // traceback rather than a config error.
+        if value > conf::QWP_WS_MAX_ERROR_INBOX_CAPACITY {
+            return Err(error::fmt!(
+                ConfigError,
+                "error_inbox_capacity must be <= {}: {value}",
+                conf::QWP_WS_MAX_ERROR_INBOX_CAPACITY
             ));
         }
         qwp_ws

@@ -84,10 +84,19 @@ typedef struct questdb_oidc_event
 } questdb_oidc_event;
 
 /**
- * May run on any thread that acquires or refreshes a token and must not
- * unwind. Invocations of one installed handler are serialized across every
- * auth object built from that builder, so its `user_data` is never entered
- * concurrently by OIDC events.
+ * Runs on the thread inside `questdb_oidc_auth_sign_in`, and must not unwind.
+ *
+ * Every event is emitted by the interactive device flow, which is reachable
+ * only through `questdb_oidc_auth_sign_in`. A silent refresh does not render:
+ * `questdb_oidc_auth_token` -- and so every token pull an attached sender,
+ * reader or pool makes on a background reconnect -- returns
+ * `QUESTDB_OIDC_ERROR_INTERACTION_REQUIRED` rather than prompting. A binding
+ * that must enter a managed runtime from this callback may rely on that: no
+ * background or otherwise unmanaged thread reaches it.
+ *
+ * Invocations of one installed handler are serialized across every auth object
+ * built from that builder, so its `user_data` is never entered concurrently by
+ * OIDC events.
  *
  * While the callback is running, `sign_in` and `clear` on an auth object
  * sharing this handler fail with `questdb_error_invalid_api_call`.

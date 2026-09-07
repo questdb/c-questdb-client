@@ -1100,6 +1100,28 @@ impl ReaderConfig {
     /// # }
     /// # }
     /// ```
+    ///
+    /// # Retry classification
+    ///
+    /// Every provider failure is treated as **retryable** by default: the
+    /// closure is caller-controlled and may succeed on its next invocation, and
+    /// a QWP store-and-forward sender must not abandon accepted frames because
+    /// one refresh attempt failed. `AuthError` and `ConfigError` returned from
+    /// the closure are reclassified to a retryable `SocketError` for that
+    /// reason.
+    ///
+    /// To signal a failure that retrying can never clear, return
+    /// [`ErrorCode::InvalidApiCall`](crate::ErrorCode::InvalidApiCall). That is
+    /// the one terminal channel: it is carried out as a terminal `ConfigError`,
+    /// so the reconnect loop stops and reports it. Without it a permanently
+    /// broken provider reconnects forever -- `next_after_retryable_terminal`
+    /// starts a fresh budget each round -- spawning a worker per attempt and
+    /// never surfacing the cause.
+    ///
+    /// Note the provider is also resolved at the top of a mid-query failover
+    /// walk, on the thread inside `next_batch`. That call is not cancellable
+    /// and `failover_max_duration_ms` is only checked between attempts, so a
+    /// slow provider stalls the reader for as long as it takes to return.
     pub fn token_provider<F, E>(mut self, provider: F) -> Result<Self>
     where
         F: Fn() -> std::result::Result<String, E> + Send + Sync + 'static,

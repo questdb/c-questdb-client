@@ -81,12 +81,22 @@ impl TokenProvider {
     /// remain separate terminal `AuthError`s because they occur after this
     /// method succeeds.
     pub(crate) fn bearer_header(&self) -> crate::Result<String> {
+        // Only reachable in an UNWIND-enabled build. `questdb-rs-ffi` sets
+        // `panic = "abort"` in both profiles, and a Cargo profile is chosen by
+        // the top-level artifact, so in the shipped cdylib -- and therefore in
+        // the C, C++ and Python clients -- a panic here aborts the process and
+        // this guard never runs. Kept for `questdb-rs` used directly as a
+        // library, where a caller's closure panicking should not take the
+        // sender down with it. Mirrors the qualification on
+        // `run_qwp_ws_worker_guarded`.
         let provided = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.provide()))
             .map_err(|_| {
                 crate::error::fmt!(
                     SocketError,
                     "The token provider panicked while acquiring a Bearer token; \
-                     it will be polled again on the next connection attempt."
+                     it will be polled again on the next connection attempt. \
+                     (Unwind-enabled builds only: under `panic = \"abort\"` the \
+                     panic terminates the process instead.)"
                 )
             })?;
         let token = provided.map_err(classify_provider_error)?;
@@ -400,6 +410,11 @@ mod tests {
         );
     }
 
+    // `questdb-rs`'s own test profile unwinds, so this passes here -- but the
+    // behaviour it pins does not exist in the shipped `questdb-rs-ffi` cdylib,
+    // which is `panic = "abort"`. Ignore it in an abort build rather than let
+    // a green test imply a guarantee the artifact cannot give.
+    #[cfg_attr(panic = "abort", ignore)]
     #[test]
     fn provider_panic_is_retryable_and_provider_is_polled_again() {
         use std::sync::atomic::{AtomicUsize, Ordering};

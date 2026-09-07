@@ -22,6 +22,16 @@ use std::time::{SystemTime, UNIX_EPOCH};
 /// Default bounded-inbox capacity, matching the Java dispatcher.
 pub const DEFAULT_CONNECTION_EVENT_INBOX_CAPACITY: usize = 64;
 
+/// Upper bound for a caller-selected connection-event inbox, mirroring the
+/// FFI's `MAX_DB_CALLBACK_INBOX_CAPACITY` and the conf string's
+/// `QWP_WS_MAX_ERROR_INBOX_CAPACITY`. The value reaches
+/// `VecDeque::with_capacity` and the allocator aborts on failure, so an absurd
+/// one must be refused rather than becoming a process abort with no traceback.
+/// Enforced here in the core so every caller is covered, not only the C entry
+/// point: `line_sender_opts_connection_event_handler` takes a `size_t`
+/// straight from C.
+pub const MAX_CONNECTION_EVENT_INBOX_CAPACITY: usize = 65_536;
+
 /// The set of connection-state transitions that fire as discrete events.
 #[derive(Debug, Copy, Clone, PartialEq, Eq, Hash)]
 #[non_exhaustive]
