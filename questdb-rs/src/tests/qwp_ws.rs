@@ -1509,19 +1509,30 @@ fn qwp_ws_schema_reject_terminalizes_in_all_progress_modes() {
         assert_eq!(qwp_error.to_fsn, fsn);
         assert_eq!(sender.poll_qwp_ws_error().unwrap(), None);
 
-        for level in [
-            crate::ingress::AckLevel::Ok,
-            crate::ingress::AckLevel::Durable,
-        ] {
-            let err = sender.completed_fsn(level).unwrap_err();
-            assert_eq!(
-                err.code(),
-                ErrorCode::ServerRejection,
-                "mode={} level={level:?}: {}",
-                progress.name(),
-                err.msg()
-            );
-        }
+        let err = sender
+            .completed_fsn(crate::ingress::AckLevel::Ok)
+            .unwrap_err();
+        assert_eq!(
+            err.code(),
+            ErrorCode::ServerRejection,
+            "mode={}: {}",
+            progress.name(),
+            err.msg()
+        );
+        // The durable opt-in check runs ahead of the terminal state, on the
+        // poll and the barrier alike.
+        assert_durable_ack_without_opt_in(
+            sender
+                .completed_fsn(crate::ingress::AckLevel::Durable)
+                .unwrap_err(),
+            progress,
+        );
+        assert_durable_ack_without_opt_in(
+            sender
+                .wait(crate::ingress::AckLevel::Durable, Duration::from_secs(5))
+                .unwrap_err(),
+            progress,
+        );
     }
 }
 
@@ -1981,12 +1992,13 @@ fn qwp_ws_wait_rejects_non_qwp_ws_senders() {
     );
 }
 
-/// `Durable` is accepted without `request_durable_ack=on`, matching
-/// `acked_fsn`, rather than rejected the way `wait` rejects it. The value is
-/// acceptance coverage in that configuration, so this pins the deliberate
-/// asymmetry between the poll and the barrier.
+/// An explicit `Durable` poll is refused without `request_durable_ack=on`,
+/// exactly as `wait` refuses it: in that configuration the durable watermark
+/// is only acceptance coverage, so answering the poll would hand a caller a
+/// weaker guarantee than it asked for. `acked_fsn` keeps its older unchecked
+/// behaviour, which this pins too.
 #[test]
-fn sender_completed_fsn_allows_durable_without_opt_in_unlike_wait() {
+fn sender_completed_fsn_rejects_durable_without_opt_in_like_wait() {
     for progress in [ProgressCase::Background, ProgressCase::Manual] {
         let (port, _rx) = spawn_mock_server();
         let mut sender = build_qwp_ws_sender(progress, port);
@@ -2003,27 +2015,31 @@ fn sender_completed_fsn_allows_durable_without_opt_in_unlike_wait() {
             .wait(crate::ingress::AckLevel::Ok, Duration::from_secs(5))
             .unwrap_or_else(|e| panic!("mode={}: {e}", progress.name()));
 
-        let durable = sender
+        let err = sender
             .completed_fsn(crate::ingress::AckLevel::Durable)
-            .unwrap_or_else(|e| {
-                panic!(
-                    "mode={}: Durable poll must not be rejected without opt-in: {e}",
-                    progress.name()
-                )
-            });
-        assert_eq!(durable, Some(fsn), "mode={}", progress.name());
-        assert_eq!(
-            durable,
-            sender.acked_fsn().unwrap(),
-            "mode={}",
-            progress.name()
-        );
+            .expect_err("completed_fsn must reject Durable without opt-in");
+        assert_durable_ack_without_opt_in(err, progress);
 
-        // The blocking barrier still refuses the same input.
+        // The blocking barrier refuses the same input.
         let err = sender
             .wait(crate::ingress::AckLevel::Durable, Duration::from_secs(5))
             .expect_err("wait must reject Durable without opt-in");
         assert_durable_ack_without_opt_in(err, progress);
+
+        // `acked_fsn` predates the check and still reports the watermark,
+        // which is acceptance coverage here.
+        assert_eq!(
+            sender.acked_fsn().unwrap(),
+            Some(fsn),
+            "mode={}",
+            progress.name()
+        );
+        assert_eq!(
+            sender.completed_fsn(crate::ingress::AckLevel::Ok).unwrap(),
+            Some(fsn),
+            "mode={}",
+            progress.name()
+        );
     }
 }
 

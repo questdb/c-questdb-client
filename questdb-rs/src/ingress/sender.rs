@@ -652,8 +652,11 @@ impl Sender {
     /// boundary has completed once this method returns a value greater than or
     /// equal to `fsn`. Use [`Self::wait`] when you need an explicit
     /// [`AckLevel::Ok`] or [`AckLevel::Durable`] barrier, or
-    /// [`Self::completed_fsn`] to poll either level without blocking — this
-    /// method is equivalent to `completed_fsn(AckLevel::Durable)`.
+    /// [`Self::completed_fsn`] to poll either level without blocking. This
+    /// method reports the watermark at the sender's configured level: with
+    /// `request_durable_ack=on` it equals `completed_fsn(AckLevel::Durable)`;
+    /// without it, it reports acceptance coverage whereas an explicit
+    /// `Durable` poll is rejected.
     #[cfg(feature = "sync-sender-qwp-ws")]
     pub fn acked_fsn(&self) -> Result<Option<u64>> {
         match &self.handler {
@@ -671,10 +674,13 @@ impl Sender {
     ///
     /// * [`AckLevel::Ok`] reports the highest FSN the server has accepted
     ///   (background progress mode; see below for manual mode).
-    /// * [`AckLevel::Durable`] reports durable-ACK coverage, and is
-    ///   equivalent to [`Self::acked_fsn`]. Unlike [`Self::wait`] it is also
-    ///   accepted without `request_durable_ack=on`, where there is no durable
-    ///   ACK to report and the value is acceptance coverage instead.
+    /// * [`AckLevel::Durable`] reports durable-ACK coverage. Like
+    ///   [`Self::wait`] it requires QuestDB Enterprise and a sender opened with
+    ///   `request_durable_ack=on`; otherwise the call is rejected up front,
+    ///   ahead of any terminal error the sender holds, so a caller polling
+    ///   for durability cannot silently read acceptance coverage instead.
+    ///   [`Self::acked_fsn`] keeps the older unchecked behaviour and is
+    ///   equivalent only under that opt-in.
     ///
     /// In background progress mode with durable ACKs `Ok` advances ahead of
     /// `Durable`; otherwise the two coincide. Manual progress mode has no
@@ -704,6 +710,7 @@ impl Sender {
                 "completed_fsn is only supported for QWP/WebSocket senders."
             ));
         }
+        self.check_durable_ack_opt_in(ack_level)?;
         self.qwp_ws_completed_fsn(ack_level)
     }
 
@@ -755,20 +762,7 @@ impl Sender {
             ));
         }
 
-        if ack_level == AckLevel::Durable {
-            let request_durable_ack = match &self.handler {
-                SyncProtocolHandler::SyncQwpWs(state) => state.request_durable_ack,
-                SyncProtocolHandler::ManualQwpWs(state) => state.request_durable_ack,
-                _ => unreachable!("QWP/WebSocket handler was checked above"),
-            };
-            if !request_durable_ack {
-                return Err(error::fmt!(
-                    InvalidApiCall,
-                    "AckLevel::Durable requires the pool to be opened with \
-                     `request_durable_ack=on` in the connect string."
-                ));
-            }
-        }
+        self.check_durable_ack_opt_in(ack_level)?;
 
         let Some(boundary) = self.published_fsn()? else {
             return Ok(());
@@ -802,6 +796,34 @@ impl Sender {
                 _ => unreachable!("QWP/WebSocket handler was checked above"),
             }
         }
+    }
+
+    /// Without `request_durable_ack=on` the durable watermark degrades to
+    /// acceptance coverage, so an explicit durable request is refused rather
+    /// than answered with a weaker guarantee.
+    #[cfg(feature = "sync-sender-qwp-ws")]
+    fn check_durable_ack_opt_in(&self, ack_level: AckLevel) -> Result<()> {
+        if ack_level != AckLevel::Durable {
+            return Ok(());
+        }
+        let request_durable_ack = match &self.handler {
+            SyncProtocolHandler::SyncQwpWs(state) => state.request_durable_ack,
+            SyncProtocolHandler::ManualQwpWs(state) => state.request_durable_ack,
+            _ => {
+                return Err(error::fmt!(
+                    InvalidApiCall,
+                    "AckLevel::Durable is only supported for QWP/WebSocket senders."
+                ));
+            }
+        };
+        if !request_durable_ack {
+            return Err(error::fmt!(
+                InvalidApiCall,
+                "AckLevel::Durable requires the pool to be opened with \
+                 `request_durable_ack=on` in the connect string."
+            ));
+        }
+        Ok(())
     }
 
     /// Completion watermark for `ack_level` across both QWP/WebSocket progress
