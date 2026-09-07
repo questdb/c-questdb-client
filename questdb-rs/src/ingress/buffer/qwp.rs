@@ -1115,7 +1115,7 @@ impl QwpBuffer {
 
     #[inline(always)]
     fn check_op(&self, op: Op) -> crate::Result<()> {
-        self.state.op_state.check(op)
+        self.state.op_state.check_unordered(op)
     }
 
     fn validate_max_name_len(&self, name: &str) -> crate::Result<()> {
@@ -2964,7 +2964,7 @@ impl QwpWsColumnarBuffer {
 
     #[inline(always)]
     fn check_op(&self, op: Op) -> crate::Result<()> {
-        self.state.op_state.check(op)
+        self.state.op_state.check_unordered(op)
     }
 
     fn validate_max_name_len(&self, name: &str) -> crate::Result<()> {
@@ -10165,6 +10165,32 @@ mod tests {
             vec![b"A".to_vec(), b"B".to_vec(), b"C".to_vec()],
             "a frame referencing id 2 must carry the dense 0..=2 prefix"
         );
+    }
+
+    #[cfg(feature = "_sender-qwp-ws")]
+    #[test]
+    fn qwp_ws_columnar_allows_symbols_after_non_symbol_columns() {
+        let mut buf = QwpWsColumnarBuffer::new(127);
+        let mut scratch = QwpWsEncodeScratch::new();
+        let mut global_dict = SymbolGlobalDict::new();
+
+        buf.table("trades")
+            .unwrap()
+            .column_i64("qty", 4)
+            .unwrap()
+            .symbol("sym", "ETH-USD")
+            .unwrap()
+            .column_bool("active", true)
+            .unwrap()
+            .symbol("venue", "XNAS")
+            .unwrap()
+            .at_now()
+            .unwrap();
+
+        buf.encode_ws_replay_message(&mut scratch, &mut global_dict, QWP_VERSION_1)
+            .unwrap();
+        let (_, entries, _) = ws_delta_entries(&scratch.message);
+        assert_eq!(entries, vec![b"ETH-USD".to_vec(), b"XNAS".to_vec()]);
     }
 
     #[cfg(feature = "_sender-qwp-ws")]

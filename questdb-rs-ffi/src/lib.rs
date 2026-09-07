@@ -1577,7 +1577,9 @@ pub unsafe extern "C" fn line_sender_buffer_table(
 }
 
 /// Record a symbol value for the given column.
-/// Make sure you record all the symbol columns before any other column type.
+/// For ILP buffers, record all symbol columns before any other column type.
+/// QWP buffers allow symbol and non-symbol columns in any order before the
+/// designated timestamp.
 /// @param[in] buffer Line buffer object.
 /// @param[in] name Column name.
 /// @param[in] value Column value.

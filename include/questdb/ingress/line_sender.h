@@ -873,7 +873,9 @@ bool line_sender_buffer_table(
 
 /**
  * Record a symbol value for the given column.
- * Make sure you record all the symbol columns before any other column type.
+ * For ILP buffers, record all symbol columns before any other column type.
+ * QWP buffers allow symbol and non-symbol columns in any order before the
+ * designated timestamp.
  *
  * When the buffer is flushed over QWP/WebSocket — `qwp_sender_flush_buffer*` on
  * a pooled sender, or `line_sender_flush*` on a `line_sender` opened against a

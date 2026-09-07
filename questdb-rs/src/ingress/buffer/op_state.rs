@@ -89,6 +89,14 @@ impl OpCase {
             OpCase::MayFlushOrTable => "should have called `flush` or `table` instead",
         }
     }
+
+    #[cfg(any(feature = "_sender-qwp-udp", feature = "_sender-qwp-ws"))]
+    fn next_unordered_op_descr(self) -> &'static str {
+        match self {
+            OpCase::ColumnWritten => "should have called `symbol`, `column` or `at` instead",
+            _ => self.next_op_descr(),
+        }
+    }
 }
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
@@ -112,6 +120,18 @@ impl OpState {
         }
     }
 
+    /// Checks a write for protocols where symbols are ordinary typed columns
+    /// and may therefore follow non-symbol columns in the same row.
+    #[cfg(any(feature = "_sender-qwp-udp", feature = "_sender-qwp-ws"))]
+    #[inline(always)]
+    pub(super) fn check_unordered(self, op: Op) -> crate::Result<()> {
+        if self.op_case.allows(op) || (self.op_case == OpCase::ColumnWritten && op == Op::Symbol) {
+            Ok(())
+        } else {
+            Err(self.bad_unordered_op_error(op))
+        }
+    }
+
     #[cold]
     #[inline(never)]
     fn bad_op_error(self, op: Op) -> crate::Error {
@@ -120,6 +140,18 @@ impl OpState {
             "State error: Bad call to `{}`, {}.",
             op.descr(),
             self.op_case.next_op_descr()
+        )
+    }
+
+    #[cfg(any(feature = "_sender-qwp-udp", feature = "_sender-qwp-ws"))]
+    #[cold]
+    #[inline(never)]
+    fn bad_unordered_op_error(self, op: Op) -> crate::Error {
+        error::fmt!(
+            InvalidApiCall,
+            "State error: Bad call to `{}`, {}.",
+            op.descr(),
+            self.op_case.next_unordered_op_descr()
         )
     }
 
@@ -241,6 +273,29 @@ mod tests {
         state.finish_row();
         assert!(state.can_set_marker());
         assert!(!state.allows_symbol());
+    }
+
+    #[cfg(any(feature = "_sender-qwp-udp", feature = "_sender-qwp-ws"))]
+    #[test]
+    fn unordered_symbols_may_follow_columns_without_weakening_ilp_ordering() {
+        let mut state = OpState::new();
+        state.record_table();
+        state.record_column();
+
+        assert!(state.check(Op::Symbol).is_err());
+        state.check_unordered(Op::Symbol).unwrap();
+
+        state.record_symbol();
+        state.check_unordered(Op::Symbol).unwrap();
+        state.check_unordered(Op::Column).unwrap();
+        state.check_unordered(Op::At).unwrap();
+
+        state.record_column();
+        let err = state.check_unordered(Op::Flush).unwrap_err();
+        assert_eq!(
+            err.msg(),
+            "State error: Bad call to `flush`, should have called `symbol`, `column` or `at` instead."
+        );
     }
 
     #[test]

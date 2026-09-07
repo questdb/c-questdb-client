@@ -755,7 +755,9 @@ impl Buffer {
 
     /// Adds a symbol column to the current row.
     ///
-    /// All symbol columns must be recorded before any non-symbol columns.
+    /// For ILP buffers, all symbol columns must be recorded before any
+    /// non-symbol columns. QWP buffers allow symbols and non-symbol columns in
+    /// any order before the designated timestamp.
     ///
     /// When the buffer is flushed over QWP/WebSocket, every distinct symbol
     /// recorded here is interned into the *same* connection-scoped dictionary
