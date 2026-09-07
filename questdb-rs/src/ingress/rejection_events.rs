@@ -119,6 +119,16 @@ impl RejectionEventSource {
             + live
     }
 
+    /// Test-only: block until the dispatcher's worker thread is running,
+    /// returning `false` on timeout, on a failed spawn, or when there is no
+    /// dispatcher at all.
+    #[cfg(test)]
+    pub(crate) fn wait_for_dispatcher_start(&self, timeout: std::time::Duration) -> bool {
+        self.lock_dispatcher()
+            .as_ref()
+            .is_some_and(|dispatcher| dispatcher.wait_for_worker_start(timeout))
+    }
+
     pub(crate) fn dropped(&self) -> u64 {
         let live = self
             .lock_dispatcher()
@@ -192,6 +202,56 @@ mod tests {
         assert_eq!(source.delivered(), 1);
         assert_eq!(source.dropped(), 0);
         assert_eq!(*seen.lock().unwrap(), vec![1]);
+    }
+
+    #[test]
+    fn close_joins_a_handler_dispatcher_that_never_saw_a_rejection() {
+        // The shape behind the reported hang: a pool closes with a handler
+        // installed and no rejection ever published, so the dispatcher
+        // thread is still on its first trip through the inbox lock. The
+        // close is published under that mutex, so every `close()` joins.
+        //
+        // Runs on its own thread and reports over a channel so a stalled
+        // join fails this test rather than hanging the suite.
+        const ROUNDS: u32 = 2_000;
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let completed = Arc::new(AtomicU64::new(0));
+        let completed_in_thread = Arc::clone(&completed);
+        std::thread::spawn(move || {
+            for round in 0..ROUNDS {
+                let source = RejectionEventSource::with_handler(
+                    QwpWsErrorHandler::new(|_: &QwpWsSenderError| {}),
+                    4,
+                );
+                // A failed spawn leaves nothing to join, which would make
+                // every close below trivially return; each round only
+                // exercises the join path once its worker is running.
+                assert!(
+                    source.wait_for_dispatcher_start(Duration::from_secs(10)),
+                    "round {round}: the dispatcher worker never started"
+                );
+                // Sweep the gap so the close lands across the whole startup
+                // window, including the instant the thread holds the inbox
+                // lock and is about to park.
+                for _ in 0..(round % 400) {
+                    std::hint::spin_loop();
+                }
+                source.close();
+                completed_in_thread.store(u64::from(round + 1), Ordering::Relaxed);
+            }
+            let _ = done_tx.send(());
+        });
+        match done_rx.recv_timeout(Duration::from_secs(60)) {
+            Ok(()) => {}
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => panic!(
+                "only {} of {ROUNDS} close cycles finished in 60s; a stalled join \
+                 reports a few hundred, an overloaded machine reports most of them",
+                completed.load(Ordering::Relaxed),
+            ),
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                panic!("the close worker panicked")
+            }
+        }
     }
 
     #[test]

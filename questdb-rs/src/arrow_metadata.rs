@@ -10,7 +10,8 @@
 //! detection (`schemas_equal`).
 
 /// Carries the QuestDB native column type when the Arrow type
-/// alone is ambiguous (e.g. `Int8` → `byte`, `UInt16` → `char`).
+/// alone is ambiguous (e.g. `Int8` → `byte`, `UInt16` → `char`,
+/// `FixedSizeBinary(16)` → `uuid`, `FixedSizeBinary(32)` → `long256`).
 pub const COLUMN_TYPE: &str = "questdb.column_type";
 /// `"true"` on the field that is the table's designated timestamp.
 /// Informational only — not load-bearing for drift detection.
@@ -30,5 +31,16 @@ pub const ARRAY_DIM_TENTATIVE: &str = "questdb.array_dim_tentative";
 /// Standard Apache Arrow extension-name field-metadata key.
 pub const ARROW_EXTENSION_NAME: &str = "ARROW:extension:name";
 /// Value used in [`ARROW_EXTENSION_NAME`] to mark a
-/// `FixedSizeBinary(16)` column as the canonical Arrow UUID.
+/// `FixedSizeBinary(16)` column as the canonical Arrow UUID. Per the
+/// Arrow spec, the stored bytes are then RFC-4122 big-endian. Egress
+/// meets that requirement without extra work, because the QWP decoder
+/// already converts UUID rows to canonical order; ingress reverses
+/// labeled values into wire order (lo LE, hi LE). A `FixedSizeBinary(16)`
+/// column without this label (or a `questdb.column_type=uuid` claim) is
+/// opaque bytes and lands verbatim as a BINARY column: a 16-byte width on
+/// its own never makes a UUID. The spec also fixes the extension's
+/// storage type to `FixedSizeBinary(16)`, so this label on variable-width
+/// binary storage (`Binary`/`LargeBinary`/`BinaryView`) is a malformed
+/// schema and is rejected at ingress. To ingest variable-width binary
+/// values as UUID, claim `questdb.column_type=uuid` instead.
 pub const EXT_ARROW_UUID: &str = "arrow.uuid";

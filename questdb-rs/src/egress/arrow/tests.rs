@@ -242,6 +242,34 @@ fn uuid_field_carries_arrow_uuid_extension() {
 }
 
 #[test]
+fn uuid_values_are_rfc4122_big_endian() {
+    // The decoder hands `DecodedColumn::Uuid` already in canonical
+    // RFC-4122 big-endian order (see
+    // `decoder::tests::uuid_values_decode_to_canonical_big_endian`);
+    // the `arrow.uuid`-labeled array must carry those bytes verbatim.
+    let canonical: [u8; 16] = [
+        0x12, 0x3e, 0x45, 0x67, 0xe8, 0x9b, 0x12, 0xd3, 0xa4, 0x56, 0x42, 0x66, 0x14, 0x17, 0x40,
+        0x00,
+    ];
+    let mut vals = canonical.to_vec();
+    // Second row: a different pattern, so a mistake in the per-row
+    // offsets shows up.
+    vals.extend(0..16u8);
+    let s = schema_of(&[("id", ColumnKind::Uuid)]);
+    let batch = decoded_of(2, vec![DecodedColumn::Uuid(buf(vals, None))]);
+    let arrow_schema = Arc::new(batch_arrow_schema(&s, &batch).unwrap());
+    let rb = batch_to_record_batch(arrow_schema, &s, batch, &SymbolDict::new()).unwrap();
+    let col = rb
+        .column(0)
+        .as_any()
+        .downcast_ref::<arrow::array::FixedSizeBinaryArray>()
+        .unwrap();
+    assert_eq!(col.value(0), canonical);
+    let second: Vec<u8> = (0..16u8).collect();
+    assert_eq!(col.value(1), second.as_slice());
+}
+
+#[test]
 fn symbol_uses_global_codes_against_full_dict() {
     // Aggressive build: the Arrow keys are the decoder's global codes verbatim
     // (no per-batch compaction) and the values are the full active dict in dict

@@ -26,6 +26,22 @@
 //!   iterator crosses a chunk boundary. Acceptable for typical batch
 //!   sizes (10 K rows ≈ µs of cast vs ms of wire send) but worth
 //!   knowing if you slice into many small batches.
+//! * **`Object`**: rejected before Arrow conversion. Polars exports object
+//!   values as `FixedSizeBinary(8)` with no metadata, holding handles that
+//!   are only meaningful inside this process. Once converted to Arrow they
+//!   look exactly like ordinary opaque binary data, so the rejection has to
+//!   happen while the Polars dtype is still known.
+//! * **`Binary`**: lands as a `BINARY` column by default, since Polars
+//!   frames carry no `questdb.*` field metadata to imply a richer type.
+//!   To ingest a binary column as `UUID`/`LONG256`, pass an
+//!   [`ArrowColumnOverride::Uuid`] / [`ArrowColumnOverride::Long256`] via
+//!   [`PolarsIngestOptions`]: every non-null value must then be exactly
+//!   16/32 bytes — UUID bytes canonical RFC-4122 big-endian, LONG256
+//!   bytes LE limbs. (Polars has no fixed-size binary dtype; its Binary
+//!   columns export as Arrow `BinaryView`, which the overrides accept.)
+//!
+//! [`ArrowColumnOverride::Uuid`]: crate::ingress::column_sender::ArrowColumnOverride::Uuid
+//! [`ArrowColumnOverride::Long256`]: crate::ingress::column_sender::ArrowColumnOverride::Long256
 //!
 //! # Per-chunk dtype stability
 //!
@@ -117,9 +133,23 @@ pub fn dataframe_to_batches(
 ) -> DataFrameBatches<'_> {
     let max_rows = max_rows.map_or(DEFAULT_MAX_BATCH_ROWS, NonZeroUsize::get);
     let compat = CompatLevel::newest();
-    let cursors: Vec<ColumnCursor<'_>> = (0..df.width())
-        .map(|i| ColumnCursor::new(df.select_at_idx(i).unwrap(), compat))
-        .collect();
+    let pending_error = (0..df.width()).find_map(|i| {
+        let column = df.select_at_idx(i).unwrap();
+        column.dtype().is_object().then(|| {
+            fmt!(
+                ArrowUnsupportedColumnKind,
+                "column '{}': Polars Object dtype is not supported; cast it to a supported dtype before ingest",
+                column.name()
+            )
+        })
+    });
+    let cursors: Vec<ColumnCursor<'_>> = if pending_error.is_none() {
+        (0..df.width())
+            .map(|i| ColumnCursor::new(df.select_at_idx(i).unwrap(), compat))
+            .collect()
+    } else {
+        Vec::new()
+    };
     DataFrameBatches {
         max_rows,
         compat,
@@ -127,6 +157,7 @@ pub fn dataframe_to_batches(
         rows_emitted: 0,
         cursors,
         schema: None,
+        pending_error,
         poisoned: false,
     }
 }
@@ -141,6 +172,7 @@ pub struct DataFrameBatches<'a> {
     rows_emitted: usize,
     cursors: Vec<ColumnCursor<'a>>,
     schema: Option<Arc<ArrowSchema>>,
+    pending_error: Option<crate::Error>,
     poisoned: bool,
 }
 
@@ -211,6 +243,10 @@ impl Iterator for DataFrameBatches<'_> {
     type Item = Result<RecordBatch>;
 
     fn next(&mut self) -> Option<Self::Item> {
+        if let Some(err) = self.pending_error.take() {
+            self.poisoned = true;
+            return Some(Err(err));
+        }
         if self.poisoned || self.cursors.is_empty() || self.rows_emitted >= self.total_rows {
             return None;
         }
@@ -593,10 +629,17 @@ fn ffi_polars_to_arrow_rs(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fmt::{Display, Formatter};
+    use std::hash::{Hash, Hasher};
+
     use arrow::array::Int64Array;
     use arrow::array::cast::AsArray;
     use arrow::array::types::Int64Type;
-    use polars::prelude::{IntoColumn, NamedFrom, PlSmallStr, Series};
+    use polars::polars_utils::total_ord::{TotalEq, TotalHash};
+    use polars::prelude::{
+        IntoColumn, IntoSeries, NamedFrom, NewChunkedArray, ObjectChunked, PlSmallStr,
+        PolarsObject, Series,
+    };
 
     const TWO: NonZeroUsize = NonZeroUsize::new(2).unwrap();
     const HUNDRED: NonZeroUsize = NonZeroUsize::new(100).unwrap();
@@ -620,6 +663,44 @@ mod tests {
     }
 
     #[test]
+    fn binary_column_overrides_route_polars_export_to_claimed_type() {
+        // Polars has no fixed-size binary dtype, so a Binary column
+        // exports as `BinaryView`. The UUID/LONG256 overrides must accept
+        // that type, or no real Polars DataFrame can ever use them. The
+        // bytes the writers actually put on the wire are checked in the
+        // `arrow_batch` tests.
+        use crate::ingress::column_sender::ArrowColumnOverride;
+        use crate::ingress::column_sender::arrow_batch::{ColumnKind, classify_with_override};
+
+        for (name, width, ov) in [
+            ("u", 16, ArrowColumnOverride::Uuid { column: "u" }),
+            ("l", 32, ArrowColumnOverride::Long256 { column: "l" }),
+        ] {
+            let values = vec![vec![0u8; width], vec![1u8; width]];
+            let vals: Vec<&[u8]> = values.iter().map(Vec::as_slice).collect();
+            let s = Series::new(PlSmallStr::from(name), vals);
+            let df = crate::polars_ffi::df_from_columns(vec![s.into_column()]).unwrap();
+            let rb = one_batch(&df);
+            assert_eq!(
+                rb.schema().field(0).data_type(),
+                &arrow::datatypes::DataType::BinaryView,
+                "Polars Binary must export as BinaryView; if this changes, \
+                 re-check the override applicability list"
+            );
+            let kind =
+                classify_with_override(rb.schema().field(0), rb.column(0).as_ref(), Some(ov))
+                    .unwrap();
+            assert!(
+                matches!(
+                    (name, kind),
+                    ("u", ColumnKind::UuidFromVarBinary) | ("l", ColumnKind::Long256FromVarBinary)
+                ),
+                "unexpected kind for {name}: {kind:?}"
+            );
+        }
+    }
+
+    #[test]
     fn dataframe_to_batches_preserves_columns_and_height() {
         let df = make_df();
         let rb = one_batch(&df);
@@ -628,6 +709,50 @@ mod tests {
         assert_eq!(rb.schema().field(0).name(), "i");
         assert_eq!(rb.schema().field(1).name(), "f");
         assert_eq!(rb.schema().field(2).name(), "s");
+    }
+
+    #[derive(Clone, Debug, Default, Eq, Hash, PartialEq)]
+    struct TestObject(u64);
+
+    impl TotalEq for TestObject {
+        fn tot_eq(&self, other: &Self) -> bool {
+            self == other
+        }
+    }
+
+    impl TotalHash for TestObject {
+        fn tot_hash<H: Hasher>(&self, state: &mut H) {
+            self.hash(state);
+        }
+    }
+
+    impl Display for TestObject {
+        fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+            write!(f, "{}", self.0)
+        }
+    }
+
+    impl PolarsObject for TestObject {
+        fn type_name() -> &'static str {
+            "questdb_test_object"
+        }
+    }
+
+    #[test]
+    fn dataframe_to_batches_rejects_object_before_arrow_export() {
+        let objects =
+            ObjectChunked::from_slice(PlSmallStr::from("o"), &[TestObject(1), TestObject(2)]);
+        let df =
+            crate::polars_ffi::df_from_columns(vec![objects.into_series().into_column()]).unwrap();
+
+        let mut batches = dataframe_to_batches(&df, None);
+        let err = batches
+            .next()
+            .expect("Object dtype must produce one error")
+            .expect_err("Object dtype must be rejected before Arrow export");
+        assert_eq!(err.code(), crate::ErrorCode::ArrowUnsupportedColumnKind);
+        assert!(err.msg().contains("Polars Object dtype is not supported"));
+        assert!(batches.next().is_none(), "conversion error is one-shot");
     }
 
     #[test]

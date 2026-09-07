@@ -44,15 +44,11 @@ fn pack_bit(bits: &mut Vec<u8>, idx: usize, val: bool) {
     }
 }
 
-/// Parse the generator's canonical UUID text into QuestDB wire bytes:
-/// low 64 bits little-endian followed by high 64 bits little-endian.
+/// Parse the generator's canonical UUID text into the RFC-4122 big-endian
+/// bytes `column_uuid` expects; the client swaps to wire order itself.
 fn uuid_bytes(s: &str) -> [u8; 16] {
     let hex: String = s.chars().filter(|c| *c != '-').collect();
-    let v = u128::from_str_radix(&hex, 16).unwrap_or(0);
-    let mut b = [0u8; 16];
-    b[0..8].copy_from_slice(&(v as u64).to_le_bytes());
-    b[8..16].copy_from_slice(&((v >> 64) as u64).to_le_bytes());
-    b
+    u128::from_str_radix(&hex, 16).unwrap_or(0).to_be_bytes()
 }
 
 /// Per-batch columnar buffers. Cleared and refilled each batch; a `Chunk`

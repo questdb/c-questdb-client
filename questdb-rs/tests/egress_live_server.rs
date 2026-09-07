@@ -389,14 +389,133 @@ fn uuid_round_trip() {
             let ColumnView::Uuid(c) = view.column(0).unwrap() else {
                 panic!("col 0")
             };
-            // 16 bytes — verify length and basic shape; exact byte order
-            // is QuestDB-internal. We just confirm it's non-zero and the
-            // round-trip ran end-to-end.
-            let bytes = c.value(0);
-            assert_eq!(bytes.len(), 16);
-            assert!(bytes.iter().any(|b| *b != 0));
+            // The reader hands out canonical RFC-4122 big-endian bytes,
+            // checked against the server's own text parser: they must be
+            // exactly the bytes of the SQL literal above. The Arrow egress
+            // path serves the same decoder buffer verbatim under the
+            // `arrow.uuid` label, so this covers that path too.
+            let canonical: [u8; 16] = [
+                0x55, 0x0e, 0x84, 0x00, 0xe2, 0x9b, 0x41, 0xd4, 0xa7, 0x16, 0x44, 0x66, 0x55, 0x44,
+                0x00, 0x00,
+            ];
+            assert_eq!(c.value(0), &canonical);
         },
     );
+}
+
+// 123e4567-e89b-12d3-a456-426614174000, RFC-4122 big-endian.
+const UUID_CANONICAL: [u8; 16] = [
+    0x12, 0x3e, 0x45, 0x67, 0xe8, 0x9b, 0x12, 0xd3, 0xa4, 0x56, 0x42, 0x66, 0x14, 0x17, 0x40, 0x00,
+];
+const UUID_CANONICAL_STR: &str = "123e4567-e89b-12d3-a456-426614174000";
+
+/// Assert the server parsed the ingested UUID as `UUID_CANONICAL_STR`, then
+/// assert the reader hands the canonical bytes back. Server-side
+/// `cast(u as string)` is the reference point: no client-side byte-order
+/// code sits on that path, so it cannot cancel out an ingest bug.
+fn assert_uuid_round_trip(srv: &QuestDbServer, table: &str) {
+    select_one_batch(
+        srv,
+        &format!("select cast(u as string) as s, u from \"{table}\""),
+        |view| {
+            let ColumnView::Varchar(s) = view.column(0).unwrap() else {
+                panic!("col 0 not Varchar")
+            };
+            assert_eq!(s.value(0).unwrap(), UUID_CANONICAL_STR);
+            let ColumnView::Uuid(c) = view.column(1).unwrap() else {
+                panic!("col 1 not Uuid")
+            };
+            assert_eq!(c.value(0), &UUID_CANONICAL);
+        },
+    );
+}
+
+/// Round-trip for the chunk byte API: canonical bytes into `column_uuid`
+/// → server text → reader bytes. Each swap has its own unit test; this
+/// checks the whole chain against the server's own UUID parser.
+#[test]
+fn chunk_column_uuid_round_trip() {
+    use questdb::QuestDb;
+    use questdb::ingress::AckLevel;
+    use questdb::ingress::column_sender::Chunk;
+
+    let srv = server();
+    let table = unique_table("chunk_uuid");
+    let db = QuestDb::connect(&srv.qwp_conf()).expect("connect");
+    let mut sender = db.borrow_sender().expect("borrow");
+    let mut chunk = Chunk::new(table.as_str());
+    let uuids = [UUID_CANONICAL];
+    chunk.column_uuid("u", &uuids, None).expect("uuid col");
+    chunk.at_nanos(&[1_700_000_000_000_000_000]).expect("ts");
+    sender
+        .flush_and_wait(&mut chunk, AckLevel::Ok)
+        .expect("flush");
+    wait_for_rows(srv, &table, 1);
+    assert_uuid_round_trip(srv, &table);
+}
+
+/// Same composition through the numpy `S16` fast path.
+#[test]
+fn numpy_s16_uuid_round_trip() {
+    use questdb::QuestDb;
+    use questdb::ingress::AckLevel;
+    use questdb::ingress::column_sender::{Chunk, NumpyDtype};
+
+    let srv = server();
+    let table = unique_table("numpy_uuid");
+    let db = QuestDb::connect(&srv.qwp_conf()).expect("connect");
+    let mut sender = db.borrow_sender().expect("borrow");
+    let mut chunk = Chunk::new(table.as_str());
+    let uuids = [UUID_CANONICAL];
+    // SAFETY: `uuids` outlives the flush; 1 row of 16 bytes as declared.
+    unsafe {
+        chunk
+            .push_numpy_deferred("u", NumpyDtype::UuidDirect, uuids.as_ptr().cast(), 1, None)
+            .expect("numpy uuid col");
+    }
+    chunk.at_nanos(&[1_700_000_000_000_000_000]).expect("ts");
+    sender
+        .flush_and_wait(&mut chunk, AckLevel::Ok)
+        .expect("flush");
+    wait_for_rows(srv, &table, 1);
+    assert_uuid_round_trip(srv, &table);
+}
+
+/// The same chain, again checked against the server, through an
+/// `arrow.uuid`-labelled `FixedSizeBinary(16)` column — the path whose
+/// byte order prompted #185.
+#[test]
+fn arrow_uuid_extension_round_trip() {
+    use std::collections::HashMap;
+    use std::sync::Arc;
+
+    use arrow::array::{ArrayRef, FixedSizeBinaryBuilder, RecordBatch};
+    use arrow::datatypes::{DataType, Field, Schema};
+    use questdb::QuestDb;
+    use questdb::arrow_metadata::{ARROW_EXTENSION_NAME, EXT_ARROW_UUID};
+    use questdb::ingress::AckLevel;
+
+    let srv = server();
+    let table = unique_table("arrow_uuid");
+    let db = QuestDb::connect(&srv.qwp_conf()).expect("connect");
+    let mut sender = db.borrow_sender().expect("borrow");
+
+    let mut values = FixedSizeBinaryBuilder::new(16);
+    values.append_value(UUID_CANONICAL).expect("canonical UUID");
+    let field = Field::new("u", DataType::FixedSizeBinary(16), false).with_metadata(HashMap::from(
+        [(ARROW_EXTENSION_NAME.to_owned(), EXT_ARROW_UUID.to_owned())],
+    ));
+    let batch = RecordBatch::try_new(
+        Arc::new(Schema::new(vec![field])),
+        vec![Arc::new(values.finish()) as ArrayRef],
+    )
+    .expect("record batch");
+
+    sender
+        .flush_arrow_batch_at_now_and_wait(table.as_str(), &batch, &[], AckLevel::Ok)
+        .expect("flush");
+    wait_for_rows(srv, &table, 1);
+    assert_uuid_round_trip(srv, &table);
 }
 
 #[test]
@@ -1570,17 +1689,19 @@ fn bind_ipv4_rejected_client_side() {
 }
 
 #[test]
-fn bind_uuid_passthrough() {
+fn bind_uuid_round_trip() {
     let srv = server();
     let mut reader = make_reader(srv);
-    // 16 bytes. We bind raw bytes; the server stores them as a UUID.
-    // We just verify the round-trip matches what we sent.
+    // Canonical RFC-4122 bytes of 550e8400-e29b-41d4-a716-446655440000.
+    // Comparing the bytes alone would prove nothing, because the reversal
+    // on bind and the reversal on read cancel out. So also compare against
+    // the server's own text rendering of the bound value.
     let bytes: [u8; 16] = [
         0x55, 0x0e, 0x84, 0x00, 0xe2, 0x9b, 0x41, 0xd4, 0xa7, 0x16, 0x44, 0x66, 0x55, 0x44, 0x00,
         0x00,
     ];
     let mut cur = reader
-        .prepare("select $1::uuid as v")
+        .prepare("select $1::uuid as v, cast($1::uuid as string) as s")
         .bind_uuid(bytes)
         .execute()
         .expect("execute");
@@ -1589,6 +1710,13 @@ fn bind_uuid_passthrough() {
         panic!("col 0 not uuid: got {:?}", view.column(0).unwrap().kind())
     };
     assert_eq!(c.value(0), &bytes);
+    let ColumnView::Varchar(s) = view.column(1).unwrap() else {
+        panic!(
+            "col 1 not varchar: got {:?}",
+            view.column(1).unwrap().kind()
+        )
+    };
+    assert_eq!(s.value(0).unwrap(), "550e8400-e29b-41d4-a716-446655440000");
 }
 
 #[test]

@@ -1,0 +1,44 @@
+# Resolve a JDK 25 into $(JAVA_HOME) for every hosted agent family that
+# builds QuestDB from source.
+#
+# Linux and Windows hosted agents expose it as $JAVA_HOME_25_X64. The
+# macOS-15-arm64 image exposes $JAVA_HOME_25_ARM64 instead, with
+# `/usr/libexec/java_home -v 25` and a Homebrew install as fallbacks.
+# Resolution stays in a single bash step so the Windows leg's cmd.exe quote
+# handling doesn't leave a stray `"` on the resolved path (which Maven@3
+# then takes as part of the JDK directory).
+steps:
+  - bash: |
+      set -e
+      if [[ "$AGENT_OS" == "Darwin" ]]; then
+        # QuestDB ships a macOS native library for aarch64 only, so an Intel
+        # agent - or an x86-64 JDK running under Rosetta - cannot start the
+        # server the system tests need. Assert the architecture here so an
+        # image swap fails with this message rather than as a FatalError out
+        # of io.questdb.std.Os.loadLib several minutes later.
+        if [ "$(uname -m)" != "arm64" ]; then
+          echo "Expected an arm64 macOS agent, got $(uname -m); x86-64 macOS is not a supported QuestDB platform" >&2
+          exit 1
+        fi
+        JDK_HOME="${JAVA_HOME_25_ARM64:-}"
+        if [ ! -d "$JDK_HOME" ]; then
+          JDK_HOME="$(/usr/libexec/java_home -v 25 2>/dev/null || true)"
+        fi
+        if [ ! -d "$JDK_HOME" ]; then
+          brew install openjdk@25
+          JDK_HOME="$(brew --prefix openjdk@25)/libexec/openjdk.jdk/Contents/Home"
+        fi
+        if [ ! -x "$JDK_HOME/bin/java" ]; then
+          echo "JDK 25 not found on this agent. Available:" >&2
+          /usr/libexec/java_home -V 2>&1 || true
+          exit 1
+        fi
+        # `-version` goes to stderr; keep it visible so the log records which
+        # architecture the JVM itself reports.
+        "$JDK_HOME/bin/java" -XshowSettings:properties -version 2>&1 | grep -E 'os\.arch|java\.version' || true
+      else
+        JDK_HOME="$JAVA_HOME_25_X64"
+      fi
+      echo "Resolved JDK 25: $JDK_HOME"
+      echo "##vso[task.setvariable variable=JAVA_HOME]$JDK_HOME"
+    displayName: "Resolve JDK 25"

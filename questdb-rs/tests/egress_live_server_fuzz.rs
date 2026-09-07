@@ -686,13 +686,15 @@ impl ColumnGenerator for UuidGenerator {
         let ColumnView::Uuid(c) = view.column(col).unwrap() else {
             panic!("col {col} not Uuid");
         };
+        // Reader values are canonical RFC-4122 big-endian: hi half
+        // first, both halves big-endian.
         let bytes = c.value(row);
-        let mut lo_arr = [0u8; 8];
         let mut hi_arr = [0u8; 8];
-        lo_arr.copy_from_slice(&bytes[..8]);
-        hi_arr.copy_from_slice(&bytes[8..]);
-        let lo = u64::from_le_bytes(lo_arr);
-        let hi = u64::from_le_bytes(hi_arr);
+        let mut lo_arr = [0u8; 8];
+        hi_arr.copy_from_slice(&bytes[..8]);
+        lo_arr.copy_from_slice(&bytes[8..]);
+        let hi = u64::from_be_bytes(hi_arr);
+        let lo = u64::from_be_bytes(lo_arr);
         (hi ^ lo) as i64
     }
 }

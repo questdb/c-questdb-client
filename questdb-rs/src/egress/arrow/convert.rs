@@ -191,6 +191,8 @@ fn column_to_array(
         (ColumnKind::Date, DecodedColumn::Date(buf)) => {
             timestamp_array(buf, row_count, TimeUnit::Millisecond)?
         }
+        // Decoder already delivers canonical RFC-4122 big-endian UUID rows,
+        // exactly what the `arrow.uuid` extension label promises.
         (ColumnKind::Uuid, DecodedColumn::Uuid(buf)) => fixed_bytes_array(buf, row_count, 16)?,
         (ColumnKind::Long256, DecodedColumn::Long256(buf)) => {
             fixed_bytes_array(buf, row_count, 32)?

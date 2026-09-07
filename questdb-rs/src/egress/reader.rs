@@ -886,7 +886,8 @@ pub struct ReaderQuery<'r> {
 }
 
 macro_rules! bind_method {
-    ($name:ident, $($arg:ident : $ty:ty),*) => {
+    ($(#[$meta:meta])* $name:ident, $($arg:ident : $ty:ty),*) => {
+        $(#[$meta])*
         pub fn $name(mut self, $($arg : $ty),*) -> Self {
             // Manually re-assign because QueryRequestBuilder consumes self.
             self.builder = self.builder.$name($($arg),*);
@@ -1052,8 +1053,18 @@ impl<'r> ReaderQuery<'r> {
     bind_method!(bind_timestamp_micros, v: i64);
     bind_method!(bind_timestamp_nanos, v: i64);
     bind_method!(bind_date_millis, v: i64);
-    bind_method!(bind_uuid, v: [u8; 16]);
-    bind_method!(bind_long256, v: [u8; 32]);
+    bind_method!(
+        /// Bind a UUID as 16 bytes in canonical RFC-4122 big-endian order,
+        /// which is what `uuid::Uuid::as_bytes()` returns.
+        bind_uuid,
+        v: [u8; 16]
+    );
+    bind_method!(
+        /// Bind a LONG256 as 32 raw little-endian bytes: four 64-bit limbs,
+        /// least-significant limb first.
+        bind_long256,
+        v: [u8; 32]
+    );
     bind_method!(bind_char, v: u16);
     bind_method!(bind_ipv4, v: Ipv4Addr);
 

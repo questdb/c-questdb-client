@@ -1302,6 +1302,8 @@ impl Buffer {
     ///
     /// Per spec, the wire encoding writes `lo` (8 bytes LE) followed by `hi`
     /// (8 bytes LE).
+    /// For canonical RFC-4122 bytes, use `column_sender::Chunk::column_uuid`
+    /// instead of splitting the bytes into `lo` and `hi`.
     pub fn column_uuid<'a, N>(&mut self, name: N, lo: u64, hi: u64) -> crate::Result<&mut Self>
     where
         N: AsRef<str> + TryInto<ColumnName<'a>>,
@@ -1393,8 +1395,6 @@ impl Buffer {
     ///
     /// The wire encoding writes the 4 octets as `u32::from(addr).to_le_bytes()`,
     /// matching Rust's natural Ipv4Addr packing (octet 0 in the high byte).
-    ///
-    /// IPv4 (`0x18`) is part of the QWP v1 spec.
     pub fn column_ipv4<'a, N>(
         &mut self,
         name: N,
@@ -1527,8 +1527,6 @@ impl Buffer {
     }
 
     /// Adds a BINARY column (opaque byte sequence). QWP-only.
-    ///
-    /// BINARY (`0x17`) is part of the QWP v1 spec.
     pub fn column_binary<'a, N>(&mut self, name: N, value: &[u8]) -> crate::Result<&mut Self>
     where
         N: AsRef<str> + TryInto<ColumnName<'a>>,

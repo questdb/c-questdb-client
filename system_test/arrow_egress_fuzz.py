@@ -201,12 +201,14 @@ def _canonicalise_for_compare(value, spec: KindSpec):
         return int(value.scaleb(scale))
     if spec.name == "uuid":
         import uuid as _uuid
-        if isinstance(value, _uuid.UUID):
-            value = value.bytes
+        # The harness makes no byte-order choice of its own: the raw
+        # FixedSizeBinary(16) egress bytes go straight to the uuid library,
+        # which reads them per RFC 4122 — the same spec `arrow.uuid`
+        # requires. pyarrow's own extension decode is the reference.
         if isinstance(value, (bytes, bytearray)):
-            lo = int.from_bytes(value[:8], "little")
-            hi = int.from_bytes(value[8:], "little")
-            return (lo, hi)
+            value = _uuid.UUID(bytes=bytes(value))
+        if isinstance(value, _uuid.UUID):
+            return (value.int & ((1 << 64) - 1), value.int >> 64)
     return value
 
 # Inject one test method per kind so failures pinpoint the offending type.

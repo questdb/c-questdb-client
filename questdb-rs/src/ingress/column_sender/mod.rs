@@ -54,7 +54,7 @@
 //! ```
 
 #[cfg(feature = "arrow-ingress")]
-mod arrow_batch;
+pub(crate) mod arrow_batch;
 mod chunk;
 pub(crate) mod conn;
 pub(crate) mod encoder;
