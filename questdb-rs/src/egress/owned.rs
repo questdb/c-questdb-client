@@ -59,6 +59,9 @@ use crate::egress::schema::Schema;
 use crate::egress::{Bind, Endpoint, ServerInfo};
 use crate::error::{Result, fmt};
 
+#[cfg(feature = "arrow-egress")]
+use crate::egress::arrow::{external_arrow_error, has_tentative_array};
+
 /// A query being built against an owned connection.
 ///
 /// The owning counterpart of [`ReaderQuery`](crate::egress::ReaderQuery).
@@ -351,6 +354,189 @@ impl<O: BorrowMut<Reader>> Drop for OwnedCursor<O> {
         }
     }
 }
+
+#[cfg(feature = "arrow-egress")]
+impl<O: BorrowMut<Reader>> OwnedCursor<O> {
+    /// Next batch as an Arrow [`RecordBatch`](arrow::array::RecordBatch).
+    /// `Ok(None)` on stream end; replays terminal errors like
+    /// [`Self::next_batch`]. No drift check — build an [`OwnedArrowReader`]
+    /// via [`Self::into_arrow_reader`] for that.
+    ///
+    /// The owning counterpart of
+    /// [`Cursor::next_arrow_batch`](crate::egress::Cursor::next_arrow_batch).
+    pub fn next_arrow_batch(&mut self) -> Result<Option<arrow::array::RecordBatch>> {
+        self.next_arrow_batch_checked(None)
+    }
+
+    /// Shared by [`Self::next_arrow_batch`] and [`OwnedArrowReader`]'s
+    /// `Iterator` impl — `expected_schema` is `Some` only from the latter,
+    /// which pins a schema at construction and wants every later batch
+    /// checked against it. Forwards straight to
+    /// `CursorState::next_arrow_batch_inner`, the same method the borrowing
+    /// path's `Cursor::next_arrow_batch_inner` calls: no protocol logic is
+    /// duplicated here.
+    ///
+    /// `compact` (symbol-dictionary compaction) is hardcoded `false`, same
+    /// as every other streaming entry point (`Cursor::next_arrow_batch`,
+    /// `CursorRecordBatchReader`) — only the materialise-whole adapters opt
+    /// into it. `on_reset`/`on_progress` are hardcoded `None`, same as
+    /// [`Self::next_batch`]: no reset callback can be installed on this
+    /// handle yet, so — per [`Self::next_batch`]'s doc comment — a mid-query
+    /// failover after the first batch surfaces `FailoverWouldDuplicate`
+    /// rather than silently replaying.
+    fn next_arrow_batch_checked(
+        &mut self,
+        expected_schema: Option<&arrow::datatypes::SchemaRef>,
+    ) -> Result<Option<arrow::array::RecordBatch>> {
+        let reader = reader_of(&mut self.owner);
+        self.state
+            .next_arrow_batch_inner(reader, expected_schema, false, None, None)
+    }
+
+    /// Consume this cursor as an owned Arrow
+    /// [`RecordBatchReader`](arrow::array::RecordBatchReader).
+    ///
+    /// The owning counterpart of
+    /// [`Cursor::as_arrow_reader`](crate::egress::Cursor::as_arrow_reader).
+    /// Blocks until the first batch arrives, because `RecordBatchReader`
+    /// requires a schema before iteration; the result's latency is
+    /// therefore data-dependent. A statement that yields no batch at all
+    /// (DDL) gives an empty schema and an immediately-exhausted stream —
+    /// that is the documented shape of a schema-less result, not an error.
+    ///
+    /// Mid-stream schema drift on a later batch poisons the reader exactly
+    /// like
+    /// [`CursorRecordBatchReader`](crate::egress::arrow::CursorRecordBatchReader)
+    /// does, including its tentative-array special case (see that type's
+    /// docs for why `schemas_equal` alone can't catch a tentative→firm
+    /// ndim upgrade). What is deliberately **not** mirrored is the
+    /// post-failover replay/re-pin dance `CursorRecordBatchReader` performs
+    /// with `resets_at_pin`: that logic exists only because a borrowed
+    /// [`Cursor`](crate::egress::Cursor) can have an `on_failover_reset`
+    /// callback installed, which is what clears `CursorState`'s
+    /// silent-duplicate guard and allows a batch beyond the first to be
+    /// transparently replayed. `OwnedCursor` has no way to install that
+    /// callback yet (see [`Self::next_batch`]'s doc comment), so once a
+    /// batch has been decoded here, a mid-query failover always surfaces
+    /// as `FailoverWouldDuplicate` instead of a transparent replay — the
+    /// replay path the borrowing reader guards against is unreachable on
+    /// this handle, not silently weaker.
+    pub fn into_arrow_reader(mut self) -> Result<OwnedArrowReader<O>> {
+        let first = self.next_arrow_batch_checked(None)?;
+        let schema = match &first {
+            Some(b) => b.schema(),
+            None => std::sync::Arc::new(arrow::datatypes::Schema::empty()),
+        };
+        Ok(OwnedArrowReader {
+            cursor: self,
+            schema,
+            pending: first,
+            poisoned: false,
+        })
+    }
+}
+
+/// An owned Arrow [`RecordBatchReader`](arrow::array::RecordBatchReader).
+///
+/// The owning counterpart of
+/// [`CursorRecordBatchReader`](crate::egress::arrow::CursorRecordBatchReader):
+/// built from [`OwnedCursor::into_arrow_reader`] rather than borrowing a
+/// [`Cursor`](crate::egress::Cursor), so it carries no lifetime and can be
+/// boxed as `Box<dyn RecordBatchReader + Send + 'static>` — the exact shape
+/// ADBC's `Statement::execute` must return. It is `Send` whenever `O` is,
+/// same as [`OwnedCursor`].
+///
+/// `OwnedArrowReader` owns the `OwnedCursor` it was built from, which owns
+/// the connection, so the ordinary `Drop` glue tears everything down in the
+/// right order — abandoning the stream mid-iteration runs the same
+/// best-effort `CANCEL` + close as dropping an `OwnedCursor` directly.
+/// There is no `unsafe`, `transmute`, or `ManuallyDrop` anywhere in this
+/// module: that is the entire point of the owning handles.
+#[cfg(feature = "arrow-egress")]
+#[must_use = "OwnedArrowReader does nothing until iterated; dropping it mid-stream sends \
+              a best-effort CANCEL and closes the WebSocket, retiring the connection it owns"]
+pub struct OwnedArrowReader<O: BorrowMut<Reader>> {
+    cursor: OwnedCursor<O>,
+    schema: arrow::datatypes::SchemaRef,
+    pending: Option<arrow::array::RecordBatch>,
+    poisoned: bool,
+}
+
+#[cfg(feature = "arrow-egress")]
+impl<O: BorrowMut<Reader>> OwnedArrowReader<O> {
+    /// Snapshotted schema. Same as the
+    /// [`RecordBatchReader::schema`](arrow::array::RecordBatchReader::schema)
+    /// trait method, exposed for callers without the trait imported.
+    pub fn schema(&self) -> arrow::datatypes::SchemaRef {
+        self.schema.clone()
+    }
+}
+
+#[cfg(feature = "arrow-egress")]
+impl<O: BorrowMut<Reader>> Iterator for OwnedArrowReader<O> {
+    type Item = std::result::Result<arrow::array::RecordBatch, arrow::error::ArrowError>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.poisoned {
+            return None;
+        }
+        if let Some(rb) = self.pending.take() {
+            return Some(Ok(rb));
+        }
+        match self.cursor.next_arrow_batch_checked(Some(&self.schema)) {
+            Ok(Some(rb)) => {
+                // Same representability gap `CursorRecordBatchReader` guards
+                // against: `schemas_equal` (which backs the `expected_schema`
+                // drift check just above) deliberately treats a tentative
+                // ndim metadata field as matching any concrete dimension, so
+                // a tentative→firm upgrade sails past that check even though
+                // the actual `arrow::datatypes::Schema` now differs from the
+                // one already handed out as this reader's fixed schema.
+                if has_tentative_array(&self.schema) && rb.schema() != self.schema {
+                    self.poisoned = true;
+                    return Some(Err(external_arrow_error(fmt!(
+                        SchemaDrift,
+                        "tentative→firm ndim upgrade is not representable in \
+                         RecordBatchReader (schema must be stable for the \
+                         reader's lifetime); use OwnedCursor::next_arrow_batch \
+                         to handle drift explicitly"
+                    ))));
+                }
+                Some(Ok(rb))
+            }
+            Ok(None) => {
+                self.poisoned = true;
+                None
+            }
+            Err(e) => {
+                self.poisoned = true;
+                Some(Err(external_arrow_error(e)))
+            }
+        }
+    }
+}
+
+#[cfg(feature = "arrow-egress")]
+impl<O: BorrowMut<Reader>> arrow::array::RecordBatchReader for OwnedArrowReader<O> {
+    fn schema(&self) -> arrow::datatypes::SchemaRef {
+        self.schema.clone()
+    }
+}
+
+// `Send` holds whenever `O` does: `OwnedArrowReader` adds only a
+// `SchemaRef` (`Arc`, `Send + Sync`), an `Option<RecordBatch>` (`Send`
+// when its arrays are, which QuestDB's Arrow arrays are), and a `bool` on
+// top of the `OwnedCursor` it wraps — no interior mutability, no raw
+// pointers. Checked here for the pool-backed `OwnedReader` shape ADBC
+// actually uses (only available when `sync-sender-qwp-ws` is also on); a
+// second copy against `PooledCursor` lives in `tests/egress_owned_arrow.rs`
+// so the assertion is exercised from outside the crate too.
+#[cfg(all(feature = "arrow-egress", feature = "sync-sender-qwp-ws"))]
+const _: fn() = || {
+    fn assert_send<T: Send>() {}
+    assert_send::<OwnedCursor<crate::OwnedReader>>();
+    assert_send::<OwnedArrowReader<crate::OwnedReader>>();
+};
 
 impl Reader {
     /// Begin a query that takes ownership of this connection.

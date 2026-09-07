@@ -94,6 +94,10 @@ pub use config::{
 };
 #[cfg(feature = "sync-reader-qwp-ws")]
 pub use owned::{OwnedCursor, OwnedQuery};
+// `OwnedArrowReader` names Arrow types in its public API, so it only
+// exists when the Arrow egress adapter is compiled in.
+#[cfg(all(feature = "sync-reader-qwp-ws", feature = "arrow-egress"))]
+pub use owned::OwnedArrowReader;
 #[cfg(feature = "sync-reader-qwp-ws")]
 pub use reader::{
     BatchView, Cursor, FailoverPhase, FailoverProgressEvent, FailoverResetEvent, Reader,
