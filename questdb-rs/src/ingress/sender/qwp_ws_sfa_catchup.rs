@@ -55,6 +55,9 @@
 // silently diverge. Imported under the local name for the existing call sites.
 use crate::ingress::buffer::decode_qwp_varint as decode_varint;
 
+#[cfg(test)]
+use std::sync::atomic::{AtomicBool, Ordering};
+
 const QWP_HEADER_SIZE: usize = 12;
 const QWP_MAGIC: [u8; 4] = *b"QWP1";
 const HEADER_OFFSET_FLAGS: usize = 5;
@@ -65,10 +68,28 @@ const QWP_FLAG_DELTA_SYMBOL_DICT: u8 = 0x08;
 /// bytes each maximum; 16 is a safe round bound.
 const CATCH_UP_VARINT_HEADROOM: usize = 16;
 
+#[cfg(test)]
+const FAIL_CATCH_UP_ALLOCATION_SYMBOL: &[u8] = b"qdb-test-catch-up-allocation";
+#[cfg(test)]
+static FAIL_NEXT_MATCHING_CATCH_UP_ALLOCATION: AtomicBool = AtomicBool::new(false);
+
+#[cfg(test)]
+pub(crate) fn fail_next_catch_up_allocation_for_test() {
+    FAIL_NEXT_MATCHING_CATCH_UP_ALLOCATION.store(true, Ordering::Release);
+}
+
+#[cfg(test)]
+fn should_fail_catch_up_allocation_for_test(entries: &[u8]) -> bool {
+    entries
+        .windows(FAIL_CATCH_UP_ALLOCATION_SYMBOL.len())
+        .any(|window| window == FAIL_CATCH_UP_ALLOCATION_SYMBOL)
+        && FAIL_NEXT_MATCHING_CATCH_UP_ALLOCATION.swap(false, Ordering::AcqRel)
+}
+
 /// A single symbol dictionary entry did not fit a catch-up frame even alone,
 /// because the server's advertised batch cap is smaller than the entry plus
-/// framing overhead. Surfaced as a terminal error: the entry cannot be
-/// re-registered, so replay would dangle a reference.
+/// framing overhead. The entry cannot be re-registered on that endpoint, so the
+/// caller must reconnect/fail over before replaying its references.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct CatchUpEntryTooLarge {
     pub(crate) entry_bytes: usize,
@@ -99,6 +120,23 @@ pub(crate) struct SentDictMirror {
     bytes: Vec<u8>,
     count: u32,
     enabled: bool,
+    /// Memoised position of a previously-resolved entry boundary in
+    /// [`bytes`](Self::bytes), as `(entry index, byte offset)`.
+    ///
+    /// [`bytes`](Self::bytes) is append-only between seeds, so an entry that
+    /// already exists never moves — which makes this a valid starting point for
+    /// any lookup at or above the cached index. Reset by [`seed`](Self::seed) /
+    /// [`seed_owned`](Self::seed_owned), which replace the region wholesale.
+    ///
+    /// Without it [`conflicts_with`](Self::conflicts_with) walked the whole
+    /// mirror from byte 0 *twice per frame*, which made the recovery fold in
+    /// `SfaFrameQueue::rebuild_recovered_dict_from_frames` O(frames x
+    /// dictionary). A byte-ring-sized backlog over a large dictionary can make
+    /// that prohibitive on the connecting thread, and the `delta_start >= tip`
+    /// short-circuit does NOT fire on the common path (an untorn side-file covers
+    /// every id, so every surviving frame bases below the tip). `Cell` because the
+    /// guard reads through `&self` on the send path.
+    seek_hint: std::cell::Cell<(usize, usize)>,
 }
 
 impl SentDictMirror {
@@ -107,6 +145,31 @@ impl SentDictMirror {
             bytes: Vec::new(),
             count: 0,
             enabled,
+            seek_hint: std::cell::Cell::new((0, 0)),
+        }
+    }
+
+    /// Byte offset of entry `n` in [`bytes`](Self::bytes), resuming from
+    /// [`seek_hint`](Self::seek_hint) when it sits at or below `n` and walking
+    /// from the start otherwise — a mid-backlog dense frame (`delta_start == 0`)
+    /// bases below the hint, so the fallback is load-bearing, not defensive.
+    fn entry_offset(&self, n: usize) -> usize {
+        let (hint_idx, hint_off) = self.seek_hint.get();
+        let (start_idx, start_off) = if hint_idx <= n && hint_off <= self.bytes.len() {
+            (hint_idx, hint_off)
+        } else {
+            (0, 0)
+        };
+        match skip_entries_checked(&self.bytes[start_off..], n - start_idx) {
+            Some(rel) => {
+                let off = start_off + rel;
+                self.seek_hint.set((n, off));
+                off
+            }
+            // Short/malformed region — never produced by a validated seed or fold,
+            // but if it happens, fall back to the unhinted walk and leave the hint
+            // alone rather than caching an offset that is not entry `n`.
+            None => skip_entries(&self.bytes, n),
         }
     }
 
@@ -123,29 +186,82 @@ impl SentDictMirror {
         self.count == 0
     }
 
+    /// Consumes the mirror, yielding its `[len][utf8]...` entries in id order —
+    /// the same shape a delta section carries.
+    ///
+    /// Exists so recovery can use this type purely as a *folding* helper:
+    /// `SfaFrameQueue::rebuild_recovered_dict_from_frames` seeds a throwaway
+    /// mirror from the side-file's intact prefix, replays the surviving frames'
+    /// delta sections through [`accumulate`](Self::accumulate), and hands the
+    /// result to BOTH the producer dictionary and this mirror's real seed. Using
+    /// the same code for the rebuild and for the live mirror is what makes the
+    /// producer's next id and [`count`](Self::count) agree by construction rather
+    /// than by two implementations happening to match.
+    ///
+    /// By value, not `&[u8]`: the rebuilt region is up to a full connection
+    /// dictionary, and recovery already holds several copies of it (the side-file
+    /// read buffer, the loaded region, the driver seed). Moving the buffer out
+    /// keeps this helper from adding one more.
+    pub(crate) fn into_entries(self) -> Vec<u8> {
+        self.bytes
+    }
+
     /// Seeds the mirror from a recovered [`PersistedSymbolDict`]'s loaded entry
     /// region (`[len][utf8]...` in id order) and its entry count. Called once,
     /// before the first connection, on recovery / orphan-drain. No-op when
     /// disabled or given nothing.
     ///
+    /// Returns `false` when the region could not be allocated, in which case the
+    /// mirror is left DISABLED and empty. That degrade is safe for the driver's
+    /// own mirror -- the send loop's torn-dict guard then rejects the recovered
+    /// delta frames (`StoreResendRequired`, resend from source) rather than
+    /// shipping them -- but it is NOT safe for a caller using this type as a
+    /// folding helper over recovered state, which would silently end up with an
+    /// empty dictionary it believes is complete. Hence the `#[must_use]`: the two
+    /// call sites have to state which of the two they are.
+    ///
     /// [`PersistedSymbolDict`]: super::qwp_ws_sfa_symbol_dict::PersistedSymbolDict
-    pub(crate) fn seed(&mut self, entries: &[u8], count: u32) {
-        if !self.enabled || count == 0 {
-            return;
+    #[must_use = "an allocation failure leaves the mirror disabled and empty; a \
+                  caller folding recovered state must fail rather than continue"]
+    pub(crate) fn seed(&mut self, entries: &[u8], count: u32) -> bool {
+        if !self.enabled {
+            return false;
         }
+        // Reset ALL THREE before the `count == 0` early return, not after: this
+        // replaces the region wholesale, so reporting success while leaving stale
+        // bytes, a stale count, or a seek hint pointing into the old region behind
+        // would be a trap for any future caller that seeds twice. Clearing the bytes
+        // without the count is worse than clearing neither -- it is the one
+        // combination that is internally inconsistent.
         self.bytes.clear();
+        self.count = 0;
+        self.seek_hint.set((0, 0));
+        if count == 0 {
+            return true;
+        }
         // Fallible: a very large recovered dictionary (~2 GiB) must not abort the
-        // host via an infallible copy. On OOM, disable the mirror instead -- the
-        // send loop's torn-dict guard then rejects the recovered delta frames
-        // (`StoreResendRequired`, resend from source), a graceful degrade rather
-        // than a crash.
+        // host via an infallible copy.
         if self.bytes.try_reserve(entries.len()).is_err() {
             self.enabled = false;
             self.count = 0;
-            return;
+            return false;
         }
         self.bytes.extend_from_slice(entries);
         self.count = count;
+        true
+    }
+
+    /// Installs an already-owned recovered entry region without allocating another
+    /// full dictionary copy. Used by cold recovery paths that have completed their
+    /// fallible copy and validation before constructing the send core.
+    pub(crate) fn seed_owned(&mut self, entries: Vec<u8>, count: u32) {
+        if !self.enabled || count == 0 {
+            return;
+        }
+        self.bytes = entries;
+        self.count = count;
+        // The region was replaced, so any cached entry offset is meaningless.
+        self.seek_hint.set((0, 0));
     }
 
     /// Copies the symbol-dictionary delta that a just-sent `frame` carries into
@@ -156,15 +272,32 @@ impl SentDictMirror {
     /// replay. No-op when disabled.
     ///
     /// `frame` is the whole QWP message (12-byte header first).
-    pub(crate) fn accumulate(&mut self, frame: &[u8]) {
+    ///
+    /// Returns `false` **only** when the suffix could not be allocated, in which
+    /// case the mirror is left DISABLED and empty — the same degrade
+    /// [`seed`](Self::seed) applies, and safe for the same reason on the driver's
+    /// own mirror (the torn-dict guard then rejects the frames rather than
+    /// shipping them against a dictionary that was never registered). A caller
+    /// using this type as a *folding helper* over recovered state must fail
+    /// instead, hence the `#[must_use]`: without it the fold would silently end up
+    /// with a short dictionary it believes is complete, and the producer's next
+    /// interned symbol would take an id the stored frames already own.
+    ///
+    /// `true` for every non-allocating outcome, including the no-ops (disabled,
+    /// non-delta frame, empty delta, pure replay, or a `delta_start > tip` gap) —
+    /// those are not failures, and a gap in particular is the ordinary
+    /// torn-dictionary case `guard_dict_not_torn` reports downstream.
+    #[must_use = "an allocation failure leaves the mirror disabled and empty; a \
+                  caller folding recovered state must fail rather than continue"]
+    pub(crate) fn accumulate(&mut self, frame: &[u8]) -> bool {
         if !self.enabled {
-            return;
+            return true;
         }
         let Some(section) = parse_delta_section(frame) else {
-            return;
+            return true;
         };
         if section.delta_count == 0 {
-            return;
+            return true;
         }
         let tip = u64::from(self.count);
         let frame_end = section
@@ -179,16 +312,31 @@ impl SentDictMirror {
         // suffix beyond the tip — or a later frame's guard would false-fire even
         // though this re-registration already covers its base.
         if section.delta_start > tip || frame_end <= tip {
-            return;
+            return true;
         }
         // Append only the suffix beyond the tip: skip the `tip - delta_start`
         // already-mirrored entries at the head of this frame's region (0 in the
         // common exactly-contiguous case, so it appends the whole region).
         let skip = (tip - section.delta_start) as usize;
         let suffix_off = skip_entries(section.entries, skip);
-        self.bytes.extend_from_slice(&section.entries[suffix_off..]);
+        let suffix = &section.entries[suffix_off..];
+        // Fallibly: a bare `extend_from_slice` grows through the infallible
+        // `RawVec` path, which ABORTS the host on OOM -- and `seed` reserves
+        // exactly `entries.len()`, so the very first fold past the seed asks for
+        // 2x the dictionary while the original is still live (~1 GiB transient at
+        // the 256 MiB connection heap cap). That abort would sit UPSTREAM of every
+        // `try_reserve` the recovery path takes (`open_existing`, `try_dup_
+        // recovered`, `build_catch_up_frame`), so those guards could never fire.
+        if self.bytes.try_reserve(suffix.len()).is_err() {
+            self.enabled = false;
+            self.count = 0;
+            self.bytes = Vec::new();
+            self.seek_hint.set((0, 0));
+            return false;
+        }
+        self.bytes.extend_from_slice(suffix);
         // `frame_end` is bounded by the connection dict cap
-        // (`MAX_CONN_SYMBOL_DICT_SIZE`, ~8.4M) so it always fits `u32`; the
+        // (`MAX_CONN_SYMBOL_DICT_SIZE`, 2M) so it always fits `u32`; the
         // truncating cast is only reachable via a ~4 GB single frame, which the
         // frame-size caps preclude. Assert in debug so a future cap change that
         // breaks the invariant is caught in tests rather than silently wrapping the
@@ -198,6 +346,7 @@ impl SentDictMirror {
             "catch-up mirror count {frame_end} exceeds u32::MAX"
         );
         self.count = frame_end as u32;
+        true
     }
 
     /// Returns `true` when `frame`'s delta section redefines an already-mirrored
@@ -240,8 +389,12 @@ impl SentDictMirror {
         let overlap_end = frame_end.min(tip);
         let overlap_entries = (overlap_end - section.delta_start) as usize;
         // Byte ranges of the overlapping entries in the mirror and in the frame.
-        let mirror_lo = skip_entries(&self.bytes, section.delta_start as usize);
-        let mirror_hi = skip_entries(&self.bytes, overlap_end as usize);
+        // Hinted: `overlap_end >= delta_start`, so the second lookup resumes from
+        // the first rather than restarting at byte 0, and a later frame (which
+        // bases at or above this one, except for a dense re-ship) resumes from
+        // there again.
+        let mirror_lo = self.entry_offset(section.delta_start as usize);
+        let mirror_hi = self.entry_offset(overlap_end as usize);
         let frame_hi = skip_entries(section.entries, overlap_entries);
         self.bytes[mirror_lo..mirror_hi] != section.entries[..frame_hi]
     }
@@ -321,7 +474,7 @@ impl SentDictMirror {
                     &self.bytes[chunk_start_off..entry_start],
                     version,
                 )
-                .ok_or(CatchUpStreamError::FrameBuildFailed)?;
+                .map_err(CatchUpStreamError::FrameBuild)?;
                 emit(&frame).map_err(CatchUpStreamError::Emit)?;
                 emitted += 1;
                 chunk_start_id += chunk_symbols;
@@ -341,7 +494,7 @@ impl SentDictMirror {
                 &self.bytes[chunk_start_off..p],
                 version,
             )
-            .ok_or(CatchUpStreamError::FrameBuildFailed)?;
+            .map_err(CatchUpStreamError::FrameBuild)?;
             emit(&frame).map_err(CatchUpStreamError::Emit)?;
             emitted += 1;
         }
@@ -369,7 +522,7 @@ impl SentDictMirror {
         ) {
             Ok(_) => Ok(frames),
             Err(CatchUpStreamError::EntryTooLarge(e)) => Err(e),
-            Err(CatchUpStreamError::FrameBuildFailed) => {
+            Err(CatchUpStreamError::FrameBuild(_)) => {
                 unreachable!("catch-up frame build cannot fail at test scale")
             }
             Err(CatchUpStreamError::Emit(never)) => match never {},
@@ -378,19 +531,23 @@ impl SentDictMirror {
 }
 
 /// Error from [`SentDictMirror::for_each_catch_up_frame`]: a single dictionary
-/// entry too large for the server's batch cap (terminal — the entry cannot be
-/// re-registered), a catch-up frame that could not be built (allocation failed,
-/// or its payload would overflow the QWP `u32` length field), or a failure
+/// entry too large for the current server's batch cap, a catch-up frame that
+/// could not be built, or a failure
 /// returned by the caller's `emit` (e.g. the transport dropped mid-catch-up,
 /// which recovers by reconnecting again).
 pub(crate) enum CatchUpStreamError<E> {
     EntryTooLarge(CatchUpEntryTooLarge),
-    /// A catch-up frame could not be allocated (fallible `try_reserve` failed) or
-    /// its payload would exceed the QWP `u32` payload-length field. Recoverable:
-    /// nothing was sent, and the queued data stays persisted for a later retry /
-    /// drain.
-    FrameBuildFailed,
+    FrameBuild(CatchUpFrameBuildError),
     Emit(E),
+}
+
+/// Why a catch-up frame could not be built. Allocation failure is transient and
+/// may succeed in a fresh session; exceeding the wire format's `u32` payload
+/// limit is deterministic for the persisted dictionary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CatchUpFrameBuildError {
+    AllocationFailed,
+    PayloadTooLarge,
 }
 
 /// The `delta_start` a `frame` carries, or `None` when the frame has no delta
@@ -447,7 +604,7 @@ fn parse_delta_section(frame: &[u8]) -> Option<DeltaSection<'_>> {
 
 /// Builds one table-less catch-up frame carrying dictionary ids
 /// `[delta_start .. delta_start+delta_count)` whose `[len][utf8]` bytes are
-/// `entries`. Returns `None` when the frame cannot be built:
+/// `entries`. Returns a typed error when the frame cannot be built:
 ///
 /// * the allocation cannot be reserved — fallible `try_reserve` (rather than an
 ///   infallible `Vec::with_capacity`) so a huge recovered dictionary degrades to
@@ -458,25 +615,39 @@ fn parse_delta_section(frame: &[u8]) -> Option<DeltaSection<'_>> {
 ///   [`SentDictMirror::for_each_catch_up_frame`] already keeps the payload under
 ///   `u32::MAX`, so this is defence in depth.
 ///
-/// The caller surfaces `None` as a recoverable `FrameBuildFailed`: nothing is
-/// sent and the queued data stays persisted for a later retry / drain.
+/// The caller can retry allocation failure while keeping payload overflow
+/// terminal. In either case nothing is sent and the queued data stays persisted.
 fn build_catch_up_frame(
     delta_start: u32,
     delta_count: u32,
     entries: &[u8],
     version: u8,
-) -> Option<Vec<u8>> {
+) -> Result<Vec<u8>, CatchUpFrameBuildError> {
+    #[cfg(test)]
+    if should_fail_catch_up_allocation_for_test(entries) {
+        return Err(CatchUpFrameBuildError::AllocationFailed);
+    }
+
     let mut payload = Vec::new();
+    let payload_capacity = CATCH_UP_VARINT_HEADROOM
+        .checked_add(entries.len())
+        .ok_or(CatchUpFrameBuildError::PayloadTooLarge)?;
     payload
-        .try_reserve(CATCH_UP_VARINT_HEADROOM + entries.len())
-        .ok()?;
+        .try_reserve(payload_capacity)
+        .map_err(|_| CatchUpFrameBuildError::AllocationFailed)?;
     write_varint(&mut payload, u64::from(delta_start));
     write_varint(&mut payload, u64::from(delta_count));
     payload.extend_from_slice(entries);
-    let payload_len = u32::try_from(payload.len()).ok()?;
+    let payload_len =
+        u32::try_from(payload.len()).map_err(|_| CatchUpFrameBuildError::PayloadTooLarge)?;
 
     let mut frame = Vec::new();
-    frame.try_reserve(QWP_HEADER_SIZE + payload.len()).ok()?;
+    let frame_capacity = QWP_HEADER_SIZE
+        .checked_add(payload.len())
+        .ok_or(CatchUpFrameBuildError::PayloadTooLarge)?;
+    frame
+        .try_reserve(frame_capacity)
+        .map_err(|_| CatchUpFrameBuildError::AllocationFailed)?;
     frame.extend_from_slice(&QWP_MAGIC);
     frame.push(version);
     // Table-less: DELTA_SYMBOL_DICT only. No DEFER_COMMIT — the catch-up runs on
@@ -486,7 +657,7 @@ fn build_catch_up_frame(
     frame.extend_from_slice(&0u16.to_le_bytes()); // table_count = 0
     frame.extend_from_slice(&payload_len.to_le_bytes());
     frame.extend_from_slice(&payload);
-    Some(frame)
+    Ok(frame)
 }
 
 /// Byte offset in `entries` (a `[len][utf8]...` region) just past the first `n`
@@ -494,6 +665,24 @@ fn build_catch_up_frame(
 /// malformed/overrunning entry — unreachable for a section already validated by
 /// [`parse_delta_section`], but keeps the walk panic-free under the FFI
 /// `panic = "abort"` profile.
+/// Like [`skip_entries`], but `None` when the region does not actually hold `n`
+/// well-formed entries. [`SentDictMirror::entry_offset`] needs that distinction:
+/// caching a partial walk's offset as "entry `n`" would poison every later
+/// hinted lookup, where returning the partial offset is harmless for the
+/// frame-side callers below.
+fn skip_entries_checked(entries: &[u8], n: usize) -> Option<usize> {
+    let mut p = 0usize;
+    for _ in 0..n {
+        let (len, after_len) = decode_varint(entries, p)?;
+        let end = after_len.checked_add(len as usize)?;
+        if end > entries.len() {
+            return None;
+        }
+        p = end;
+    }
+    Some(p)
+}
+
 fn skip_entries(entries: &[u8], n: usize) -> usize {
     let mut p = 0usize;
     for _ in 0..n {
@@ -518,30 +707,42 @@ fn write_varint(out: &mut Vec<u8>, mut value: u64) {
     out.push(value as u8);
 }
 
+/// Builds a synthetic delta frame: header + `[delta_start][count]` + entries,
+/// with optional trailing `table_junk` to prove the parser ignores the
+/// (table) bytes past the dict section.
+///
+/// Module-scoped (not buried in this file's `mod tests`) so the store-and-forward
+/// queue's tests can build the same frame shape when they need a payload that
+/// actually carries a dict delta — `try_submit`ting raw bytes produces a frame
+/// [`parse_delta_section`] rejects, which silently no-ops every dictionary
+/// assertion built on it.
+#[cfg(test)]
+pub(crate) fn make_delta_frame(delta_start: u64, entries: &[&[u8]], table_junk: &[u8]) -> Vec<u8> {
+    let mut payload = Vec::new();
+    write_varint(&mut payload, delta_start);
+    write_varint(&mut payload, entries.len() as u64);
+    for e in entries {
+        write_varint(&mut payload, e.len() as u64);
+        payload.extend_from_slice(e);
+    }
+    payload.extend_from_slice(table_junk);
+    let mut frame = Vec::new();
+    frame.extend_from_slice(&QWP_MAGIC);
+    frame.push(1);
+    frame.push(QWP_FLAG_DELTA_SYMBOL_DICT);
+    frame.extend_from_slice(&1u16.to_le_bytes());
+    frame.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+    frame.extend_from_slice(&payload);
+    frame
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// Builds a synthetic delta frame: header + `[delta_start][count]` + entries,
-    /// with optional trailing `table_junk` to prove the parser ignores the
-    /// (table) bytes past the dict section.
+    /// Local alias for the module-level builder these tests were written against.
     fn make_frame(delta_start: u64, entries: &[&[u8]], table_junk: &[u8]) -> Vec<u8> {
-        let mut payload = Vec::new();
-        write_varint(&mut payload, delta_start);
-        write_varint(&mut payload, entries.len() as u64);
-        for e in entries {
-            write_varint(&mut payload, e.len() as u64);
-            payload.extend_from_slice(e);
-        }
-        payload.extend_from_slice(table_junk);
-        let mut frame = Vec::new();
-        frame.extend_from_slice(&QWP_MAGIC);
-        frame.push(1);
-        frame.push(QWP_FLAG_DELTA_SYMBOL_DICT);
-        frame.extend_from_slice(&1u16.to_le_bytes());
-        frame.extend_from_slice(&(payload.len() as u32).to_le_bytes());
-        frame.extend_from_slice(&payload);
-        frame
+        make_delta_frame(delta_start, entries, table_junk)
     }
 
     /// Symbols reconstructed from a mirror's would-be catch-up frames.
@@ -569,9 +770,15 @@ mod tests {
     #[test]
     fn accumulate_extends_on_contiguous_delta() {
         let mut m = SentDictMirror::new(true);
-        m.accumulate(&make_frame(0, &[b"AAPL", b"GOOG"], b"tabledata"));
+        assert!(
+            m.accumulate(&make_frame(0, &[b"AAPL", b"GOOG"], b"tabledata")),
+            "folding a small frame cannot fail"
+        );
         assert_eq!(m.count(), 2);
-        m.accumulate(&make_frame(2, &[b"MSFT"], b"more"));
+        assert!(
+            m.accumulate(&make_frame(2, &[b"MSFT"], b"more")),
+            "folding a small frame cannot fail"
+        );
         assert_eq!(m.count(), 3);
         let frames = m.build_catch_up_frames(0, 1).unwrap();
         assert_eq!(
@@ -583,17 +790,29 @@ mod tests {
     #[test]
     fn accumulate_skips_replay_overlap_and_empty() {
         let mut m = SentDictMirror::new(true);
-        m.accumulate(&make_frame(0, &[b"A", b"B"], b""));
+        assert!(
+            m.accumulate(&make_frame(0, &[b"A", b"B"], b"")),
+            "folding a small frame cannot fail"
+        );
         assert_eq!(m.count(), 2);
         // Replay of an already-held prefix (delta_start < count): ignored.
-        m.accumulate(&make_frame(0, &[b"A", b"B"], b""));
+        assert!(
+            m.accumulate(&make_frame(0, &[b"A", b"B"], b"")),
+            "folding a small frame cannot fail"
+        );
         assert_eq!(m.count(), 2);
         // Empty delta (a commit frame): ignored.
-        m.accumulate(&make_frame(2, &[], b""));
+        assert!(
+            m.accumulate(&make_frame(2, &[], b"")),
+            "folding a small frame cannot fail"
+        );
         assert_eq!(m.count(), 2);
         // A gap (delta_start > count) must NOT silently extend — it is the torn
         // case the driver guards before send; accumulate leaves the mirror intact.
-        m.accumulate(&make_frame(5, &[b"X"], b""));
+        assert!(
+            m.accumulate(&make_frame(5, &[b"X"], b"")),
+            "folding a small frame cannot fail"
+        );
         assert_eq!(m.count(), 2);
     }
 
@@ -607,10 +826,13 @@ mod tests {
         let mut m = SentDictMirror::new(true);
         // Seed short: only id 0 = "a" recovered, though the queued frame below
         // re-registers ids 0,1,2.
-        m.seed(&[1, b'a'], 1);
+        assert!(m.seed(&[1, b'a'], 1), "seeding a small region cannot fail");
         assert_eq!(m.count(), 1);
 
-        m.accumulate(&make_frame(0, &[b"a", b"b", b"c"], b"table"));
+        assert!(
+            m.accumulate(&make_frame(0, &[b"a", b"b", b"c"], b"table")),
+            "folding a small frame cannot fail"
+        );
         assert_eq!(
             m.count(),
             3,
@@ -634,8 +856,11 @@ mod tests {
         // keep B, so the reconnect catch-up would re-register the wrong symbol.
         // `conflicts_with` must flag it so the send loop rejects it as torn.
         let mut m = SentDictMirror::new(true);
-        m.seed(&[1, b'A'], 1); // id0 = A
-        m.accumulate(&make_frame(1, &[b"B"], b"")); // id1 = B
+        assert!(m.seed(&[1, b'A'], 1), "seeding a small region cannot fail"); // id0 = A
+        assert!(
+            m.accumulate(&make_frame(1, &[b"B"], b"")),
+            "folding a small frame cannot fail"
+        ); // id1 = B
         assert_eq!(m.count(), 2);
 
         // Fresh frame redefines id1 = C (different) -> conflict.
@@ -666,19 +891,95 @@ mod tests {
     #[test]
     fn disabled_mirror_is_inert() {
         let mut m = SentDictMirror::new(false);
-        m.accumulate(&make_frame(0, &[b"A"], b""));
-        m.seed(&[1, b'z'], 1);
+        assert!(
+            m.accumulate(&make_frame(0, &[b"A"], b"")),
+            "folding a small frame cannot fail"
+        );
+        assert!(
+            !m.seed(&[1, b'z'], 1),
+            "a disabled mirror reports `false`: it holds nothing, so a caller \
+             folding recovered state must not treat it as seeded"
+        );
         assert_eq!(m.count(), 0);
         assert!(m.build_catch_up_frames(0, 1).unwrap().is_empty());
+    }
+
+    #[test]
+    fn the_seek_hint_survives_a_dense_frame_that_bases_below_it() {
+        // `conflicts_with` memoises `(entry index, byte offset)` so a fold over N
+        // frames does not re-walk the whole mirror from byte 0 for each one. The
+        // hint is only valid for lookups AT OR ABOVE the cached index, and there is
+        // exactly one thing that bases below it: a mid-backlog DENSE frame
+        // (`delta_start == 0`), which the foreground emits after a failed side-file
+        // rollback drops delta encoding. Get the fallback wrong and the guard
+        // compares the wrong byte range -- either missing a real conflict (a wrong
+        // symbol registered on the server) or inventing one (a healthy slot
+        // rejected as resend-required).
+        //
+        // Entries are deliberately different lengths, so a byte offset computed
+        // from the wrong starting index cannot coincidentally land on an entry
+        // boundary.
+        let mut m = SentDictMirror::new(true);
+        assert!(m.seed(&[1, b'a'], 1), "seeding a small region cannot fail");
+        assert!(
+            m.accumulate(&make_frame(1, &[b"bb", b"ccc", b"dddd"], b"")),
+            "folding a small frame cannot fail"
+        );
+        assert_eq!(m.count(), 4);
+
+        // Walk upward so the hint advances to a high entry index...
+        assert!(!m.conflicts_with(&make_frame(3, &[b"dddd", b"e"], b"")));
+        // ...then a dense re-ship from id 0. Its overlap is the WHOLE mirror, so
+        // both lookups sit below the hint and must restart from the beginning.
+        assert!(
+            !m.conflicts_with(&make_frame(0, &[b"a", b"bb", b"ccc", b"dddd"], b"")),
+            "a dense frame that agrees with the mirror is a benign replay"
+        );
+        assert!(
+            m.conflicts_with(&make_frame(0, &[b"a", b"bb", b"XXX", b"dddd"], b"")),
+            "...and one that disagrees at id 2 must still be caught after the hint \
+             has advanced past it"
+        );
+        // The hint is usable again afterwards, in both directions.
+        assert!(!m.conflicts_with(&make_frame(2, &[b"ccc", b"dddd"], b"")));
+        assert!(m.conflicts_with(&make_frame(1, &[b"ZZ"], b"")));
+    }
+
+    #[test]
+    fn seed_resets_the_seek_hint_and_the_region_even_when_given_nothing() {
+        // `seed` replaces the region wholesale, so a stale hint pointing into the
+        // old bytes would survive into the new ones. The `count == 0` path is the
+        // one that used to return early before clearing anything.
+        let mut m = SentDictMirror::new(true);
+        assert!(m.seed(&[1, b'a', 2, b'b', b'b'], 2));
+        assert!(!m.conflicts_with(&make_frame(0, &[b"a", b"bb"], b"")));
+
+        assert!(m.seed(&[], 0), "an empty seed reports success");
+        assert_eq!(m.count(), 0);
+        assert!(
+            m.build_catch_up_frames(0, 1).unwrap().is_empty(),
+            "the previous region must be gone, not merely unreachable via `count`"
+        );
+        // A fresh, differently-shaped dictionary must not be judged against the old
+        // bytes or the old hint.
+        assert!(m.seed(&[3, b'x', b'y', b'z'], 1));
+        assert!(!m.conflicts_with(&make_frame(0, &[b"xyz"], b"")));
+        assert!(m.conflicts_with(&make_frame(0, &[b"a"], b"")));
     }
 
     #[test]
     fn seed_from_persisted_then_extend() {
         let mut m = SentDictMirror::new(true);
         // [len=1]['a'][len=1]['b'] == two entries
-        m.seed(&[1, b'a', 1, b'b'], 2);
+        assert!(
+            m.seed(&[1, b'a', 1, b'b'], 2),
+            "seeding a small region cannot fail"
+        );
         assert_eq!(m.count(), 2);
-        m.accumulate(&make_frame(2, &[b"c"], b""));
+        assert!(
+            m.accumulate(&make_frame(2, &[b"c"], b"")),
+            "folding a small frame cannot fail"
+        );
         assert_eq!(m.count(), 3);
         let frames = m.build_catch_up_frames(0, 1).unwrap();
         assert_eq!(
@@ -703,7 +1004,10 @@ mod tests {
         // slot reconnects.
         let pd = PersistedSymbolDict::open(dir.path()).unwrap();
         let mut mirror = SentDictMirror::new(true);
-        mirror.seed(pd.loaded_entries(), pd.size());
+        assert!(
+            mirror.seed(pd.loaded_entries(), pd.size()),
+            "seeding a small region cannot fail"
+        );
         assert_eq!(mirror.count(), 2);
         // The catch-up frame re-registers the whole recovered dictionary from id 0,
         // so the stored delta frames replay gap-free against a server that never
@@ -718,7 +1022,10 @@ mod tests {
     #[test]
     fn catch_up_single_frame_when_uncapped() {
         let mut m = SentDictMirror::new(true);
-        m.accumulate(&make_frame(0, &[b"AAPL", b"GOOG", b"MSFT"], b""));
+        assert!(
+            m.accumulate(&make_frame(0, &[b"AAPL", b"GOOG", b"MSFT"], b"")),
+            "folding a small frame cannot fail"
+        );
         let frames = m.build_catch_up_frames(0, 7).unwrap();
         assert_eq!(frames.len(), 1);
         assert_eq!(frame_delta_start(&frames[0]), Some(0));
@@ -730,7 +1037,10 @@ mod tests {
         // Ten 4-byte symbols → each entry is 5 bytes ([len=4]+4).
         let syms: Vec<Vec<u8>> = (0..10).map(|i| format!("sy{i:02}").into_bytes()).collect();
         let refs: Vec<&[u8]> = syms.iter().map(|s| s.as_slice()).collect();
-        m.accumulate(&make_frame(0, &refs, b""));
+        assert!(
+            m.accumulate(&make_frame(0, &refs, b"")),
+            "folding a small frame cannot fail"
+        );
         assert_eq!(m.count(), 10);
 
         // Cap that fits ~3 entries per frame: budget = cap-12-16, want ~15 bytes.
@@ -751,7 +1061,10 @@ mod tests {
     #[test]
     fn catch_up_errors_when_entry_exceeds_cap() {
         let mut m = SentDictMirror::new(true);
-        m.accumulate(&make_frame(0, &[b"a_very_long_symbol_value"], b""));
+        assert!(
+            m.accumulate(&make_frame(0, &[b"a_very_long_symbol_value"], b"")),
+            "folding a small frame cannot fail"
+        );
         // Tiny cap: even one entry cannot fit.
         let err = m.build_catch_up_frames(20, 1).unwrap_err();
         assert!(err.entry_bytes > err.budget);
@@ -765,7 +1078,10 @@ mod tests {
         // `panic = "abort"` profile). Truncate mid-entry so the second entry's
         // `[len][utf8]` is torn.
         let mut m = SentDictMirror::new(true);
-        m.accumulate(&make_frame(0, &[b"AAPL", b"GOOG"], b""));
+        assert!(
+            m.accumulate(&make_frame(0, &[b"AAPL", b"GOOG"], b"")),
+            "folding a small frame cannot fail"
+        );
         assert_eq!(m.count(), 2);
         m.bytes.truncate(m.bytes.len() - 2);
 
@@ -782,14 +1098,23 @@ mod tests {
         // Simulate: send several delta frames, build catch-up, then a fresh
         // server-side mirror re-accumulating the catch-up reconstructs identically.
         let mut sender = SentDictMirror::new(true);
-        sender.accumulate(&make_frame(0, &[b"one", b"two"], b"t"));
-        sender.accumulate(&make_frame(2, &[b"three"], b"t"));
-        sender.accumulate(&make_frame(3, &[b"four", b"five"], b"t"));
+        assert!(
+            sender.accumulate(&make_frame(0, &[b"one", b"two"], b"t")),
+            "folding a small frame cannot fail"
+        );
+        assert!(
+            sender.accumulate(&make_frame(2, &[b"three"], b"t")),
+            "folding a small frame cannot fail"
+        );
+        assert!(
+            sender.accumulate(&make_frame(3, &[b"four", b"five"], b"t")),
+            "folding a small frame cannot fail"
+        );
         let frames = sender.build_catch_up_frames(12 + 16 + 8, 1).unwrap();
 
         let mut replayed = SentDictMirror::new(true);
         for f in &frames {
-            replayed.accumulate(f);
+            assert!(replayed.accumulate(f), "folding a small frame cannot fail");
         }
         assert_eq!(replayed.count(), sender.count());
         assert_eq!(

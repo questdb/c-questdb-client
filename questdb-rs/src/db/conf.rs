@@ -518,6 +518,7 @@ mod tests {
             "sf_max_segment_bytes",
             "sf_max_total_bytes",
             "sf_durability",
+            "sf_sync_interval_millis",
             "sf_append_deadline_millis",
         ] {
             let conf = format!("ws::addr=localhost:9000;{key}=whatever;");

@@ -11,7 +11,8 @@
 #include <iostream>
 #include <string>
 
-namespace {
+namespace
+{
 
 namespace egress = questdb::egress;
 namespace ingress = questdb::ingress;
@@ -21,8 +22,9 @@ bool example()
     try
     {
         egress::reader reader{ingress::utf8_view{"ws::addr=localhost:9000;"}};
-        auto cursor = reader.execute(ingress::utf8_view{
-            "SELECT x AS n, x * 1.5 AS d FROM long_sequence(5)"});
+        auto cursor = reader.execute(
+            ingress::utf8_view{
+                "SELECT x AS n, x * 1.5 AS d FROM long_sequence(5)"});
 
         while (auto batch = cursor.next_arrow_batch())
         {
@@ -34,7 +36,8 @@ bool example()
             if (!rb_res.ok())
             {
                 std::fprintf(
-                    stderr, "ImportRecordBatch: %s\n",
+                    stderr,
+                    "ImportRecordBatch: %s\n",
                     rb_res.status().ToString().c_str());
                 if (batch->array.release)
                     batch->array.release(&batch->array);

@@ -215,6 +215,8 @@ fn qwpws_store_and_forward_defaults_match_java() {
     assert_defaulted_eq(&qwp_ws.sf_max_segment_bytes, 4 * 1024 * 1024_u64);
     assert_defaulted_eq(&qwp_ws.sf_max_total_bytes, None);
     assert_defaulted_eq(&qwp_ws.sf_durability, conf::SfDurability::Memory);
+    assert_defaulted_eq(&qwp_ws.sf_sync_interval, None);
+    assert_eq!(qwp_ws.periodic_sync_interval(), None);
     assert_defaulted_eq(&qwp_ws.sf_append_deadline, Duration::from_secs(30));
     assert_defaulted_eq(&qwp_ws.auth_timeout, Duration::from_secs(15));
     assert_defaulted_eq(&qwp_ws.progress, QwpWsProgress::Background);
@@ -251,25 +253,20 @@ fn qwpws_progress_config_parses_manual_and_background() {
     assert_specified_eq(&qwp_ws.progress, QwpWsProgress::Background);
 }
 
+/// `in_flight_window` and `max_in_flight` were removed. They are no longer
+/// configuration keys, so the QWP/WebSocket parser rejects them as unknown --
+/// matching the Java client, which also rejects `in_flight_window`.
 #[cfg(feature = "sync-sender-qwp-ws")]
 #[test]
-fn qwpws_config_accepts_java_in_flight_window_alias() {
-    let builder = SenderBuilder::from_conf("ws::addr=localhost:9000;in_flight_window=7;").unwrap();
-    let qwp_ws = builder.qwp_ws.as_ref().unwrap();
-    assert_specified_eq(&qwp_ws.max_in_flight, 7usize);
-
+fn qwpws_config_rejects_removed_in_flight_keys() {
     assert_conf_err(
-        SenderBuilder::from_conf("ws::addr=localhost:9000;in_flight_window=1;"),
-        "WebSocket transport requires async mode (in_flight_window > 1)",
+        SenderBuilder::from_conf("ws::addr=localhost:9000;in_flight_window=7;"),
+        "Unknown config key \"in_flight_window\"",
     );
     assert_conf_err(
-        SenderBuilder::from_conf("ws::addr=localhost:9000;in_flight_window=-1;"),
-        "in-flight window size must be positive[size=-1]",
+        SenderBuilder::from_conf("ws::addr=localhost:9000;max_in_flight=3;"),
+        "Unknown config key \"max_in_flight\"",
     );
-
-    let builder = SenderBuilder::from_conf("ws::addr=localhost:9000;max_in_flight=1;").unwrap();
-    let qwp_ws = builder.qwp_ws.as_ref().unwrap();
-    assert_specified_eq(&qwp_ws.max_in_flight, 1usize);
 }
 
 /// Connect-string keys that the Rust egress reader
@@ -449,7 +446,7 @@ fn qwpws_store_and_forward_config_accepts_and_rejects_java_keys() {
     );
     assert_conf_err(
         SenderBuilder::from_conf("ws::addr=localhost:9000;sf_durability=sync;"),
-        "invalid sf_durability [value=sync, allowed-values=[memory, flush, append]]",
+        "invalid sf_durability [value=sync, allowed-values=[memory, periodic, flush, append]]",
     );
     assert_conf_err(
         SenderBuilder::from_conf("ws::addr=localhost:9000;qwp_ws_progress=sync;"),
@@ -539,6 +536,15 @@ fn qwpws_store_and_forward_config_is_websocket_only() {
         "The \"sf_append_deadline_millis\" setting is only supported for QWP/WebSocket.",
     );
     assert_conf_err(
+        SenderBuilder::from_conf("tcp::addr=localhost:9009;sf_sync_interval_millis=5000;"),
+        "The \"sf_sync_interval_millis\" setting is only supported for QWP/WebSocket.",
+    );
+    #[cfg(feature = "sync-sender-http")]
+    assert_conf_err(
+        SenderBuilder::from_conf("http::addr=localhost:9000;sf_sync_interval_millis=5000;"),
+        "The \"sf_sync_interval_millis\" setting is only supported for QWP/WebSocket.",
+    );
+    assert_conf_err(
         SenderBuilder::from_conf("tcp::addr=localhost:9009;qwp_ws_progress=manual;"),
         "The \"qwp_ws_progress\" setting is only supported for QWP/WebSocket.",
     );
@@ -579,13 +585,75 @@ fn qwpws_store_and_forward_reserved_durability_fails_before_connect() {
         SenderBuilder::from_conf("ws::addr=127.0.0.1:1;sf_durability=flush;")
             .unwrap()
             .build(),
-        "sf_durability=flush is not yet supported (deferred follow-up; use sf_durability=memory)",
+        "sf_durability=flush is not yet supported (use sf_durability=memory or periodic)",
     );
     assert_conf_err(
         SenderBuilder::from_conf("ws::addr=127.0.0.1:1;sf_durability=append;")
             .unwrap()
             .build(),
-        "sf_durability=append is not yet supported (deferred follow-up; use sf_durability=memory)",
+        "sf_durability=append is not yet supported (use sf_durability=memory or periodic)",
+    );
+}
+
+#[cfg(feature = "sync-sender-qwp-ws")]
+#[test]
+fn qwpws_periodic_durability_config_matches_java() {
+    let defaulted = SenderBuilder::from_conf(
+        "ws::addr=localhost:9000;sf_dir=/tmp/qdb-rust-sf;sf_durability=periodic;",
+    )
+    .unwrap();
+    let qwp_ws = defaulted.qwp_ws.as_ref().unwrap();
+    assert_specified_eq(&qwp_ws.sf_durability, conf::SfDurability::Periodic);
+    assert_defaulted_eq(&qwp_ws.sf_sync_interval, None);
+    assert_eq!(
+        qwp_ws.periodic_sync_interval(),
+        Some(Duration::from_millis(5000))
+    );
+
+    let explicit = SenderBuilder::from_conf(
+        "ws::addr=localhost:9000;sf_dir=/tmp/qdb-rust-sf;sf_durability=periodic;\
+         sf_sync_interval_millis=123;",
+    )
+    .unwrap();
+    let qwp_ws = explicit.qwp_ws.as_ref().unwrap();
+    assert_specified_eq(&qwp_ws.sf_sync_interval, Some(Duration::from_millis(123)));
+    assert_eq!(
+        qwp_ws.periodic_sync_interval(),
+        Some(Duration::from_millis(123))
+    );
+
+    assert_conf_err(
+        SenderBuilder::from_conf("ws::addr=127.0.0.1:1;sf_sync_interval_millis=5000;")
+            .unwrap()
+            .build(),
+        "sf_sync_interval_millis requires sf_durability=periodic",
+    );
+    assert_conf_err(
+        SenderBuilder::from_conf("ws::addr=127.0.0.1:1;sf_durability=periodic;")
+            .unwrap()
+            .build(),
+        "sf_durability=periodic requires sf_dir",
+    );
+    assert_conf_err(
+        SenderBuilder::from_conf(
+            "ws::addr=127.0.0.1:1;sf_durability=periodic;sf_sync_interval_millis=0;",
+        ),
+        "\"sf_sync_interval_millis\" must be greater than 0.",
+    );
+
+    let max_valid = i64::MAX / 1_000_000;
+    SenderBuilder::from_conf(format!(
+        "ws::addr=localhost:9000;sf_dir=/tmp/qdb-rust-sf;sf_durability=periodic;\
+         sf_sync_interval_millis={max_valid};"
+    ))
+    .unwrap();
+    assert_conf_err(
+        SenderBuilder::from_conf(format!(
+            "ws::addr=localhost:9000;sf_dir=/tmp/qdb-rust-sf;sf_durability=periodic;\
+             sf_sync_interval_millis={};",
+            max_valid + 1
+        )),
+        format!("\"sf_sync_interval_millis\" must be at most {max_valid}."),
     );
 }
 

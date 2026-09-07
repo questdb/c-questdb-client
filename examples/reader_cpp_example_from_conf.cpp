@@ -25,14 +25,18 @@ int main()
                     if (k == questdb::egress::column_kind::long_)
                     {
                         auto v = col.get<int64_t>(r);
-                        if (v) std::cout << *v << " ";
-                        else std::cout << "NULL ";
+                        if (v)
+                            std::cout << *v << " ";
+                        else
+                            std::cout << "NULL ";
                     }
                     else if (k == questdb::egress::column_kind::double_)
                     {
                         auto v = col.get<double>(r);
-                        if (v) std::cout << *v << " ";
-                        else std::cout << "NULL ";
+                        if (v)
+                            std::cout << *v << " ";
+                        else
+                            std::cout << "NULL ";
                     }
                     else
                     {

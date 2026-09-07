@@ -17,8 +17,7 @@
 #define QWP_MOCK_C_H
 
 #ifdef __cplusplus
-extern "C"
-{
+extern "C" {
 #endif
 
 typedef struct qwp_mock_c qwp_mock_c;

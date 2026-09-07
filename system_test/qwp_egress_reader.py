@@ -73,6 +73,8 @@ KIND_UNKNOWN = 0xFF
 # `Numbers.INT_NULL`, `Numbers.SHORT_NULL`. BYTE is non-nullable on the server,
 # but the wire still carries a slot per row.
 _LONG_NULL = -(1 << 63)
+# Long.MIN_VALUE reinterpreted as u64 (how `>QQ` unpacks it).
+_LONG_NULL_U64 = 1 << 63
 _INT_NULL = -(1 << 31)
 
 
@@ -490,9 +492,14 @@ def _decode_uuid(col: _LineReaderColumnData) -> Tuple[str, list]:
         if _is_null(validity, r):
             out.append(None)
             continue
-        lo, hi = struct.unpack_from("<QQ", raw, r * 16)
-        if lo == 0 and hi == _LONG_NULL & ((1 << 64) - 1):
-            # QuestDB UUID NULL sentinel — lo=0, hi=Long.MIN_VALUE.
+        # Reader values are canonical RFC-4122 big-endian: hi half
+        # first, both halves big-endian.
+        hi, lo = struct.unpack_from(">QQ", raw, r * 16)
+        if lo == _LONG_NULL_U64 and hi == _LONG_NULL_U64:
+            # QuestDB UUID NULL sentinel: BOTH halves are Long.MIN_VALUE
+            # (see the Rust decoder's `null_sentinel::UUID_LE`). Checking
+            # only one half would treat the legal UUID
+            # 80000000-0000-0000-0000-000000000000 as NULL.
             out.append(None)
             continue
         combined = (hi << 64) | lo

@@ -53,8 +53,10 @@ see [`questdb-rs/Cargo.toml`](questdb-rs/Cargo.toml)).
 - **Rust:** `cargo fmt` + `cargo clippy --all-targets -- -D warnings` must
   pass. The `almost-all-features` flag is the canonical lint target. Apply
   this to both `questdb-rs/` and `questdb-rs-ffi/`.
-- **C / C++:** run `clang-format` on touched files (config lives in
-  [`.clang-format`](.clang-format)).
+- **C / C++:** run `python3 ci/format_cpp.py` (config lives in
+  [`.clang-format`](.clang-format)). CI pins clang-format 21.1.8
+  (`pipx install clang-format==21.1.8`); other versions reflow comments
+  differently and will fail the check.
 - **Comments:** explain *why*, not *what*. The reviewers look closely at any
   comment that restates the code.
 - **Unsafe Rust:** keep `unsafe` blocks narrow and document the safety

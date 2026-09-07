@@ -39,7 +39,8 @@
 // would tautologically pass.
 // The expected numbers here are themselves cross-checked against the Rust enum
 // + C header by `c_header_line_sender_enum_matches_rust` in questdb-rs-ffi.
-static_assert(questdb_error_could_not_resolve_addr == 0, "client error alias drift");
+static_assert(
+    questdb_error_could_not_resolve_addr == 0, "client error alias drift");
 static_assert(questdb_error_invalid_api_call == 1, "client error alias drift");
 static_assert(questdb_error_socket_error == 2, "client error alias drift");
 static_assert(questdb_error_invalid_utf8 == 3, "client error alias drift");
@@ -49,17 +50,24 @@ static_assert(questdb_error_config_error == 10, "client error alias drift");
 static_assert(questdb_error_role_mismatch == 18, "client error alias drift");
 static_assert(questdb_error_connect_timeout == 19, "client error alias drift");
 static_assert(questdb_error_handshake_error == 20, "client error alias drift");
-static_assert(questdb_error_unsupported_server == 21, "client error alias drift");
+static_assert(
+    questdb_error_unsupported_server == 21, "client error alias drift");
 static_assert(questdb_error_protocol_error == 22, "client error alias drift");
 static_assert(questdb_error_invalid_bind == 23, "client error alias drift");
-static_assert(questdb_error_server_schema_mismatch == 24, "client error alias drift");
-static_assert(questdb_error_server_parse_error == 25, "client error alias drift");
-static_assert(questdb_error_server_internal_error == 26, "client error alias drift");
-static_assert(questdb_error_server_security_error == 27, "client error alias drift");
+static_assert(
+    questdb_error_server_schema_mismatch == 24, "client error alias drift");
+static_assert(
+    questdb_error_server_parse_error == 25, "client error alias drift");
+static_assert(
+    questdb_error_server_internal_error == 26, "client error alias drift");
+static_assert(
+    questdb_error_server_security_error == 27, "client error alias drift");
 static_assert(questdb_error_limit_exceeded == 28, "client error alias drift");
-static_assert(questdb_error_server_limit_exceeded == 29, "client error alias drift");
+static_assert(
+    questdb_error_server_limit_exceeded == 29, "client error alias drift");
 static_assert(questdb_error_cancelled == 30, "client error alias drift");
-static_assert(questdb_error_failover_would_duplicate == 31, "client error alias drift");
+static_assert(
+    questdb_error_failover_would_duplicate == 31, "client error alias drift");
 static_assert(questdb_error_schema_drift == 32, "client error alias drift");
 static_assert(questdb_error_no_schema == 33, "client error alias drift");
 static_assert(questdb_error_arrow_export == 34, "client error alias drift");
@@ -69,19 +77,25 @@ static_assert(questdb_error_arrow_export == 34, "client error alias drift");
 #include <string>
 
 #ifdef _WIN32
-#include <stdlib.h>
+#    include <stdlib.h>
 static int set_env(const char* name, const char* value)
 {
     return _putenv_s(name, value);
 }
-static int unset_env(const char* name) { return _putenv_s(name, ""); }
+static int unset_env(const char* name)
+{
+    return _putenv_s(name, "");
+}
 #else
-#include <stdlib.h>
+#    include <stdlib.h>
 static int set_env(const char* name, const char* value)
 {
     return setenv(name, value, 1);
 }
-static int unset_env(const char* name) { return unsetenv(name); }
+static int unset_env(const char* name)
+{
+    return unsetenv(name);
+}
 #endif
 
 using namespace questdb::ingress::literals;
@@ -168,8 +182,7 @@ TEST_CASE("reader stat / accessor getters return documented sentinels on NULL")
         bool ok = qwp_reader_server_version(nullptr, &version, &err);
         CHECK_FALSE(ok);
         REQUIRE(err != nullptr);
-        CHECK(questdb_error_get_code(err) ==
-              questdb_error_invalid_api_call);
+        CHECK(questdb_error_get_code(err) == questdb_error_invalid_api_call);
         questdb_error_free(err);
     }
     {
@@ -195,8 +208,7 @@ TEST_CASE("reader stat / accessor getters return documented sentinels on NULL")
 
 TEST_CASE("server_info accessors return documented sentinels on NULL")
 {
-    CHECK(qwp_reader_server_info_role(nullptr) ==
-          qwp_reader_server_role_other);
+    CHECK(qwp_reader_server_info_role(nullptr) == qwp_reader_server_role_other);
     CHECK(qwp_reader_server_info_role_byte(nullptr) == 0xFF);
     CHECK(qwp_reader_server_info_epoch(nullptr) == 0);
     CHECK(qwp_reader_server_info_capabilities(nullptr) == 0);
@@ -264,8 +276,9 @@ TEST_CASE("failover_event accessors return documented sentinels on NULL")
     CHECK(qwp_reader_failover_reset_event_elapsed_ns(nullptr) == 0);
 
     // _trigger_code mirrors `_error_get_code(NULL)`: same sentinel.
-    CHECK(qwp_reader_failover_reset_event_trigger_code(nullptr) ==
-          questdb_error_invalid_api_call);
+    CHECK(
+        qwp_reader_failover_reset_event_trigger_code(nullptr) ==
+        questdb_error_invalid_api_call);
 
     {
         const char* buf = reinterpret_cast<const char*>(0x1);
@@ -309,8 +322,7 @@ TEST_CASE("from_conf rejects malformed config strings as ConfigError")
         qwp_reader* r = qwp_reader_from_conf(conf, &err);
         REQUIRE(r == nullptr);
         REQUIRE(err != nullptr);
-        CHECK(questdb_error_get_code(err) ==
-              questdb_error_config_error);
+        CHECK(questdb_error_get_code(err) == questdb_error_config_error);
         size_t msg_len = 0;
         const char* msg = questdb_error_msg(err, &msg_len);
         CHECK(msg != nullptr);
@@ -361,8 +373,7 @@ TEST_CASE("from_env returns ConfigError when QDB_CLIENT_CONF is unset")
     qwp_reader* r = qwp_reader_from_env(&err);
     REQUIRE(r == nullptr);
     REQUIRE(err != nullptr);
-    CHECK(questdb_error_get_code(err) ==
-          questdb_error_config_error);
+    CHECK(questdb_error_get_code(err) == questdb_error_config_error);
 
     size_t msg_len = 0;
     const char* msg = questdb_error_msg(err, &msg_len);
@@ -379,8 +390,7 @@ TEST_CASE("from_env propagates parser errors when QDB_CLIENT_CONF is malformed")
     qwp_reader* r = qwp_reader_from_env(&err);
     REQUIRE(r == nullptr);
     REQUIRE(err != nullptr);
-    CHECK(questdb_error_get_code(err) ==
-          questdb_error_config_error);
+    CHECK(questdb_error_get_code(err) == questdb_error_config_error);
     questdb_error_free(err);
 
     REQUIRE(unset_env("QDB_CLIENT_CONF") == 0);
@@ -402,8 +412,7 @@ TEST_CASE("from_env distinguishes invalid-UTF-8 env value from unset")
     REQUIRE(err != nullptr);
     // Previously this collapsed to "not set" (ConfigError); the M-10 fix
     // surfaces the actual cause as InvalidUtf8.
-    CHECK(questdb_error_get_code(err) ==
-          questdb_error_invalid_utf8);
+    CHECK(questdb_error_get_code(err) == questdb_error_invalid_utf8);
     questdb_error_free(err);
 
     REQUIRE(unset_env("QDB_CLIENT_CONF") == 0);
@@ -420,8 +429,7 @@ TEST_CASE("from_env reaches the connect path when QDB_CLIENT_CONF is parseable")
     REQUIRE(err != nullptr);
     // We don't pin the code — connect-failure shape varies — but it must
     // NOT be ConfigError, since the config parsed successfully.
-    CHECK(questdb_error_get_code(err) !=
-          questdb_error_config_error);
+    CHECK(questdb_error_get_code(err) != questdb_error_config_error);
     questdb_error_free(err);
 
     REQUIRE(unset_env("QDB_CLIENT_CONF") == 0);

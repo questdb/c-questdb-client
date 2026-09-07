@@ -99,7 +99,8 @@ TEST_CASE("arrow egress: empty stream returns _end without touching out_*")
 
     // `next_arrow_batch` snapshots schema eagerly. With ZERO batches the
     // adapter must EITHER:
-    //   - throw `questdb::error` with `questdb_error_no_schema` (when the QWP path
+    //   - throw `questdb::error` with `questdb_error_no_schema` (when the QWP
+    //   path
     //     reaches `as_arrow_reader` with no first batch), OR
     //   - return `nullopt` directly (when the inner pump terminates
     //     first).
@@ -122,7 +123,8 @@ TEST_CASE("arrow egress: empty stream returns _end without touching out_*")
 TEST_CASE("arrow egress: single Long batch — struct layout + release order")
 {
     qm::ColumnSpec col_v{
-        "v", qm::COL_LONG,
+        "v",
+        qm::COL_LONG,
         qm::fixed_column_bytes(3, pack_le<int64_t>({10, 20, 30}))};
 
     qm::Script s = {
@@ -170,7 +172,9 @@ TEST_CASE("arrow egress: single Long batch — struct layout + release order")
 // schema and verify each child's format code.
 // ---------------------------------------------------------------------------
 
-TEST_CASE("arrow egress: mixed kinds — Bool / Byte / Short / Int / Long / Float / Double")
+TEST_CASE(
+    "arrow egress: mixed kinds — Bool / Byte / Short / Int / Long / Float / "
+    "Double")
 {
     std::vector<uint8_t> bool_body;
     bool_body.push_back(0x00);
@@ -178,17 +182,29 @@ TEST_CASE("arrow egress: mixed kinds — Bool / Byte / Short / Int / Long / Floa
 
     qm::ColumnSpec c_bool{"b", qm::COL_BOOLEAN, std::move(bool_body)};
     qm::ColumnSpec c_byte{
-        "by", qm::COL_BYTE, qm::fixed_column_bytes(2, pack_le<int8_t>({-1, 1}))};
+        "by",
+        qm::COL_BYTE,
+        qm::fixed_column_bytes(2, pack_le<int8_t>({-1, 1}))};
     qm::ColumnSpec c_short{
-        "sh", qm::COL_SHORT, qm::fixed_column_bytes(2, pack_le<int16_t>({-2, 2}))};
+        "sh",
+        qm::COL_SHORT,
+        qm::fixed_column_bytes(2, pack_le<int16_t>({-2, 2}))};
     qm::ColumnSpec c_int{
-        "in", qm::COL_INT, qm::fixed_column_bytes(2, pack_le<int32_t>({-3, 3}))};
+        "in",
+        qm::COL_INT,
+        qm::fixed_column_bytes(2, pack_le<int32_t>({-3, 3}))};
     qm::ColumnSpec c_long{
-        "lo", qm::COL_LONG, qm::fixed_column_bytes(2, pack_le<int64_t>({-4, 4}))};
+        "lo",
+        qm::COL_LONG,
+        qm::fixed_column_bytes(2, pack_le<int64_t>({-4, 4}))};
     qm::ColumnSpec c_f32{
-        "f3", qm::COL_FLOAT, qm::fixed_column_bytes(2, pack_le<float>({1.5f, -2.5f}))};
+        "f3",
+        qm::COL_FLOAT,
+        qm::fixed_column_bytes(2, pack_le<float>({1.5f, -2.5f}))};
     qm::ColumnSpec c_f64{
-        "f6", qm::COL_DOUBLE, qm::fixed_column_bytes(2, pack_le<double>({1.5, -2.5}))};
+        "f6",
+        qm::COL_DOUBLE,
+        qm::fixed_column_bytes(2, pack_le<double>({1.5, -2.5}))};
 
     auto cols = std::vector<qm::ColumnSpec>{
         c_bool, c_byte, c_short, c_int, c_long, c_f32, c_f64};
@@ -224,17 +240,26 @@ TEST_CASE("arrow egress: mixed kinds — Bool / Byte / Short / Int / Long / Floa
     release_pair(&arr, &sch);
 }
 
-TEST_CASE("arrow egress: TIMESTAMP / TIMESTAMP_NS / DATE — timezone-carrying format codes")
+TEST_CASE(
+    "arrow egress: TIMESTAMP / TIMESTAMP_NS / DATE — timezone-carrying format "
+    "codes")
 {
     qm::ColumnSpec c_ts{
-        "ts", qm::COL_TIMESTAMP,
-        qm::fixed_column_bytes(2, pack_le<int64_t>({1700000000000000LL, 1700000000000001LL}))};
+        "ts",
+        qm::COL_TIMESTAMP,
+        qm::fixed_column_bytes(
+            2, pack_le<int64_t>({1700000000000000LL, 1700000000000001LL}))};
     qm::ColumnSpec c_ts_ns{
-        "tn", qm::COL_TIMESTAMP_NANOS,
-        qm::fixed_column_bytes(2, pack_le<int64_t>({1700000000000000000LL, 1700000000000000001LL}))};
+        "tn",
+        qm::COL_TIMESTAMP_NANOS,
+        qm::fixed_column_bytes(
+            2,
+            pack_le<int64_t>({1700000000000000000LL, 1700000000000000001LL}))};
     qm::ColumnSpec c_date{
-        "dt", qm::COL_DATE,
-        qm::fixed_column_bytes(2, pack_le<int64_t>({1700000000000LL, 1700000000001LL}))};
+        "dt",
+        qm::COL_DATE,
+        qm::fixed_column_bytes(
+            2, pack_le<int64_t>({1700000000000LL, 1700000000001LL}))};
 
     qm::Script s = {
         qm::ActionSendServerInfo{},
@@ -267,10 +292,10 @@ TEST_CASE("arrow egress: TIMESTAMP / TIMESTAMP_NS / DATE — timezone-carrying f
 TEST_CASE("arrow egress: VARCHAR + BINARY — variable-length format codes")
 {
     qm::ColumnSpec c_v{
-        "v", qm::COL_VARCHAR,
-        qm::varlen_column_bytes({{'a'}, {}, {'b', 'c'}})};
+        "v", qm::COL_VARCHAR, qm::varlen_column_bytes({{'a'}, {}, {'b', 'c'}})};
     qm::ColumnSpec c_b{
-        "b", qm::COL_BINARY,
+        "b",
+        qm::COL_BINARY,
         qm::varlen_column_bytes({{0x01}, {}, {0xFF, 0x00}})};
 
     qm::Script s = {
@@ -300,7 +325,9 @@ TEST_CASE("arrow egress: VARCHAR + BINARY — variable-length format codes")
     release_pair(&arr, &sch);
 }
 
-TEST_CASE("arrow egress: UUID — FixedSizeBinary(16) with arrow.uuid extension metadata")
+TEST_CASE(
+    "arrow egress: UUID — FixedSizeBinary(16) with arrow.uuid extension "
+    "metadata")
 {
     std::vector<uint8_t> raw;
     for (int i = 0; i < 32; ++i)
@@ -324,7 +351,8 @@ TEST_CASE("arrow egress: UUID — FixedSizeBinary(16) with arrow.uuid extension 
     auto& sch = _b->schema;
 
     REQUIRE(sch.children[0]->format != nullptr);
-    CHECK(std::string(sch.children[0]->format) == "w:16"); // FixedSizeBinary(16)
+    CHECK(
+        std::string(sch.children[0]->format) == "w:16"); // FixedSizeBinary(16)
 
     // Metadata is encoded as a length-prefixed byte buffer in the spec. We
     // don't decode it here exhaustively — but it MUST be non-NULL because
@@ -360,18 +388,22 @@ TEST_CASE("arrow egress: LONG256 — FixedSizeBinary(32)")
     release_pair(&arr, &sch);
 }
 
-TEST_CASE("arrow egress: SYMBOL — Dictionary(UInt32, Utf8) with questdb.symbol metadata")
+TEST_CASE(
+    "arrow egress: SYMBOL — Dictionary(UInt32, Utf8) with questdb.symbol "
+    "metadata")
 {
     qm::ColumnSpec c_sym{
-        "sym", qm::COL_SYMBOL,
-        qm::symbol_column_bytes({0u, 1u, 0u})};
+        "sym", qm::COL_SYMBOL, qm::symbol_column_bytes({0u, 1u, 0u})};
 
     qm::Script s = {
         qm::ActionSendServerInfo{},
         qm::ActionAwaitQueryRequest{},
         qm::ActionSendBuilt{[=](int64_t rid) {
             return qm::result_batch_frame_with_dict(
-                rid, 0, 3, {c_sym},
+                rid,
+                0,
+                3,
+                {c_sym},
                 /*dict_delta_start=*/0,
                 {"alpha", "beta"});
         }},
@@ -395,18 +427,23 @@ TEST_CASE("arrow egress: SYMBOL — Dictionary(UInt32, Utf8) with questdb.symbol
     release_pair(&arr, &sch);
 }
 
-TEST_CASE("arrow egress: DECIMAL64 / DECIMAL128 / DECIMAL256 — decimal format codes")
+TEST_CASE(
+    "arrow egress: DECIMAL64 / DECIMAL128 / DECIMAL256 — decimal format codes")
 {
-    qm::ColumnSpec c_d64{"d64", qm::COL_DECIMAL64,
-                        qm::decimal64_column_bytes({12345, 6789}, 2)};
+    qm::ColumnSpec c_d64{
+        "d64", qm::COL_DECIMAL64, qm::decimal64_column_bytes({12345, 6789}, 2)};
 
     std::vector<std::array<uint8_t, 16>> dec128_values(2);
-    qm::ColumnSpec c_d128{"d128", qm::COL_DECIMAL128,
-                          qm::decimal128_column_bytes(dec128_values, 5)};
+    qm::ColumnSpec c_d128{
+        "d128",
+        qm::COL_DECIMAL128,
+        qm::decimal128_column_bytes(dec128_values, 5)};
 
     std::vector<std::array<uint8_t, 32>> dec256_values(2);
-    qm::ColumnSpec c_d256{"d256", qm::COL_DECIMAL256,
-                          qm::decimal256_column_bytes(dec256_values, 7)};
+    qm::ColumnSpec c_d256{
+        "d256",
+        qm::COL_DECIMAL256,
+        qm::decimal256_column_bytes(dec256_values, 7)};
 
     qm::Script s = {
         qm::ActionSendServerInfo{},
@@ -424,7 +461,8 @@ TEST_CASE("arrow egress: DECIMAL64 / DECIMAL128 / DECIMAL256 — decimal format 
     auto& arr = _b->array;
     auto& sch = _b->schema;
 
-    // Arrow decimal format: "d:precision,scale" or "d:precision,scale,bitwidth".
+    // Arrow decimal format: "d:precision,scale" or
+    // "d:precision,scale,bitwidth".
     REQUIRE(sch.children[0]->format != nullptr);
     REQUIRE(sch.children[1]->format != nullptr);
     REQUIRE(sch.children[2]->format != nullptr);
@@ -441,8 +479,8 @@ TEST_CASE("arrow egress: DOUBLE_ARRAY — nested List(Float64)")
         qm::ArrayRow{{3}, pack_le<double>({1.0, 2.0, 3.0})},
         qm::ArrayRow{{2}, pack_le<double>({10.0, 20.0})},
     };
-    qm::ColumnSpec c_arr{"a", qm::COL_DOUBLE_ARRAY,
-                         qm::array_column_bytes(rows)};
+    qm::ColumnSpec c_arr{
+        "a", qm::COL_DOUBLE_ARRAY, qm::array_column_bytes(rows)};
 
     qm::Script s = {
         qm::ActionSendServerInfo{},
@@ -477,8 +515,8 @@ TEST_CASE("arrow egress: DOUBLE_ARRAY — nested List(Float64)")
 
 TEST_CASE("arrow egress: stream exhaustion — second call returns nullopt")
 {
-    qm::ColumnSpec c{"v", qm::COL_LONG,
-                     qm::fixed_column_bytes(1, pack_le<int64_t>({42}))};
+    qm::ColumnSpec c{
+        "v", qm::COL_LONG, qm::fixed_column_bytes(1, pack_le<int64_t>({42}))};
     qm::Script s = {
         qm::ActionSendServerInfo{},
         qm::ActionAwaitQueryRequest{},
@@ -503,7 +541,9 @@ TEST_CASE("arrow egress: stream exhaustion — second call returns nullopt")
 // is array ndim (derived from each batch's row shapes, not the query
 // schema), so that is the only mid-stream drift the streaming Arrow adapter
 // can observe end-to-end.
-TEST_CASE("arrow egress: schema drift — array ndim change between batches throws schema_drift")
+TEST_CASE(
+    "arrow egress: schema drift — array ndim change between batches throws "
+    "schema_drift")
 {
     std::vector<std::optional<qm::ArrayRow>> b1_rows = {
         qm::ArrayRow{{3}, pack_le<double>({1.0, 2.0, 3.0})}};
@@ -547,7 +587,9 @@ TEST_CASE("arrow egress: schema drift — array ndim change between batches thro
 // is marked tentative. A later firm batch refines ndim; the streaming
 // adapter accepts this as an upgrade (`schemas_equal` ignores ndim while
 // either side is tentative) rather than rejecting it as drift.
-TEST_CASE("arrow egress: schema drift — tentative→firm array ndim upgrade does NOT drift")
+TEST_CASE(
+    "arrow egress: schema drift — tentative→firm array ndim upgrade does NOT "
+    "drift")
 {
     std::vector<std::optional<qm::ArrayRow>> b1_rows = {std::nullopt};
     std::vector<std::optional<qm::ArrayRow>> b2_rows = {
@@ -582,10 +624,12 @@ TEST_CASE("arrow egress: schema drift — tentative→firm array ndim upgrade do
     CHECK(!h.cursor.next_arrow_batch().has_value());
 }
 
-TEST_CASE("arrow egress: schema drift — same schema across batches does NOT drift")
+TEST_CASE(
+    "arrow egress: schema drift — same schema across batches does NOT drift")
 {
     qm::ColumnSpec b_col{
-        "v", qm::COL_LONG,
+        "v",
+        qm::COL_LONG,
         qm::fixed_column_bytes(2, pack_le<int64_t>({10, 20}))};
     qm::Script s = {
         qm::ActionSendServerInfo{},

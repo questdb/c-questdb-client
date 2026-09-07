@@ -348,22 +348,28 @@ fn fuzz_same_sql_different_binds_cache_reuse() {
     let _ = srv.http_exec(&format!("drop table \"{table}\""));
 }
 
-/// Ports `testFuzzUuidBinds`. UUID is 16 raw bytes on the wire — bind
-/// random bytes and assert they round-trip. The Java test additionally
-/// skips the all-`MIN_VALUE` sentinel (NULL UUID); since the spec
-/// represents NULL via the null-bitmap rather than a bit-pattern, our
-/// random 16-byte payload never accidentally lands on a NULL.
+/// Ports `testFuzzUuidBinds`. Bind 16 random canonical RFC-4122 bytes and
+/// assert they come back byte-identical: `bind_uuid` reverses them to QWP
+/// wire order and the reader reverses them back, so this checks that the
+/// two swaps remain exact inverses. The comparison against the server's
+/// own parser lives in `bind_uuid_round_trip` in `egress_live_server.rs`.
+/// The Java test skips the all-`MIN_VALUE` wire sentinel (NULL UUID); in
+/// canonical form that is `0x80` at bytes 0 and 8 and zeros elsewhere.
+/// Random bytes will practically never hit it, and the spec represents
+/// NULL through the null bitmap anyway, but the guard costs nothing.
 #[test]
 fn fuzz_uuid_binds() {
+    const SENTINEL_CANONICAL: [u8; 16] = [0x80, 0, 0, 0, 0, 0, 0, 0, 0x80, 0, 0, 0, 0, 0, 0, 0];
     let srv = server();
     let mut rng = SplitMix64::new(fuzz_seed_for("fuzz_uuid_binds"));
     let mut reader = make_reader(srv);
     for iter in 0..ITERATIONS_PER_TEST {
         let mut bytes = [0u8; 16];
-        let lo = rng.next_u64().to_le_bytes();
-        let hi = rng.next_u64().to_le_bytes();
-        bytes[..8].copy_from_slice(&lo);
-        bytes[8..].copy_from_slice(&hi);
+        bytes[..8].copy_from_slice(&rng.next_u64().to_le_bytes());
+        bytes[8..].copy_from_slice(&rng.next_u64().to_le_bytes());
+        if bytes == SENTINEL_CANONICAL {
+            bytes[15] = 1;
+        }
         let mut cur = reader
             .prepare("SELECT $1::UUID AS u FROM long_sequence(1)")
             .bind_uuid(bytes)

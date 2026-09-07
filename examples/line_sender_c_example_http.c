@@ -50,7 +50,8 @@ static bool example(const char* host, const char* port)
     if (!line_sender_buffer_symbol(buffer, side_name, side_value, &err))
         goto on_error;
 
-    // The table must be created beforehand with the appropriate DECIMAL(N,M) type for the column.
+    // The table must be created beforehand with the appropriate DECIMAL(N,M)
+    // type for the column.
     if (!line_sender_buffer_column_dec_str(
             buffer, price_name, "2615.54", strlen("2615.54"), &err))
         goto on_error;

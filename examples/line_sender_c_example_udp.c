@@ -125,14 +125,11 @@ static bool displayed_help(int argc, const char* argv[])
         {
             fprintf(stderr, "Usage:\n");
             fprintf(
-                stderr,
-                "line_sender_c_example_udp: [HOST [PORT [TABLE]]]\n");
+                stderr, "line_sender_c_example_udp: [HOST [PORT [TABLE]]]\n");
             fprintf(
                 stderr,
                 "    HOST: QWP/UDP host (defaults to \"localhost\").\n");
-            fprintf(
-                stderr,
-                "    PORT: QWP/UDP port (defaults to \"9007\").\n");
+            fprintf(stderr, "    PORT: QWP/UDP port (defaults to \"9007\").\n");
             fprintf(
                 stderr,
                 "    TABLE: Target table (defaults to \"c_udp_example\").\n");

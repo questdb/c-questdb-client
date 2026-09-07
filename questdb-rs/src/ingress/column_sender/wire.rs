@@ -79,6 +79,15 @@ pub(crate) const I64_NULL: i64 = i64::MIN;
 pub(crate) const F32_NULL: f32 = f32::NAN;
 pub(crate) const F64_NULL: f64 = f64::NAN;
 
+/// Reverse one canonical UUID value into QWP wire byte order.
+#[inline]
+pub(crate) fn reverse_uuid_bytes(bytes: &[u8]) -> [u8; 16] {
+    let bytes: [u8; 16] = bytes
+        .try_into()
+        .expect("UUID value must contain exactly 16 bytes");
+    u128::from_ne_bytes(bytes).swap_bytes().to_ne_bytes()
+}
+
 /// Append `value` to `out` as an unsigned QWP varint (LEB128).
 #[inline]
 pub(crate) fn write_qwp_varint(out: &mut Vec<u8>, mut value: u64) {

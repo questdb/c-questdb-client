@@ -45,9 +45,13 @@ pub(crate) use self::qwp::QwpBuffer;
 pub(crate) use self::qwp::QwpSendScratch;
 #[cfg(feature = "_sender-qwp-ws")]
 pub(crate) use self::qwp::{
-    MAX_CONN_SYMBOL_DICT_SIZE, MAX_PERSISTED_SYMBOL_ENTRY_LEN, QwpWsColumnarBuffer,
-    QwpWsEncodeScratch, SymbolGlobalDict, SymbolGlobalDictMark, decode_qwp_varint,
+    MAX_PERSISTED_SYMBOL_ENTRY_LEN, QwpWsColumnarBuffer, QwpWsEncodeScratch, SymbolGlobalDict,
+    SymbolGlobalDictMark, decode_qwp_varint,
 };
+// Test-only: lets the sender-level suites drive the connection dictionary's
+// cap-rejection path through a real `Sender` (see `TestDictCapGuard`).
+#[cfg(all(test, feature = "_sender-qwp-ws"))]
+pub(crate) use self::qwp::TestDictCapGuard;
 // `QwpWsSymbolHasher`'s only re-export consumer is the `arrow`-gated
 // `column_sender::arrow_batch`, so it is gated identically: a `_sender-qwp-ws`
 // build without `arrow` would otherwise carry an unused import.
@@ -752,6 +756,19 @@ impl Buffer {
     /// Adds a symbol column to the current row.
     ///
     /// All symbol columns must be recorded before any non-symbol columns.
+    ///
+    /// When the buffer is flushed over QWP/WebSocket, every distinct symbol
+    /// recorded here is interned into the *same* connection-scoped dictionary
+    /// the column/chunk API uses — capped at 2,000,000 entries and 256 MiB of
+    /// UTF-8 across the whole connection, not per buffer or per flush.
+    /// Exceeding it fails the flush with
+    /// [`SymbolDictFull`](crate::ErrorCode::SymbolDictFull), and the dictionary
+    /// is only reset by retiring the connection that owns it — which a full
+    /// dictionary now does automatically on return, so a pooled sender is dropped
+    /// (not recycled) and the next borrow gets a fresh one. Wait / commit first if
+    /// frames flushed earlier must not be lost; see
+    /// [`SymbolDictFull`](crate::ErrorCode::SymbolDictFull) for the per-API
+    /// list. ILP (TCP/HTTP) flushes carry no such dictionary and are unaffected.
     #[inline(always)]
     pub fn symbol<'a, N, S>(&mut self, name: N, value: S) -> crate::Result<&mut Self>
     where
@@ -776,6 +793,9 @@ impl Buffer {
     }
 
     /// Adds a symbol column if `value` is `Some`; otherwise leaves the row unchanged.
+    ///
+    /// See [`symbol`](Self::symbol) for the QWP/WebSocket connection-scoped
+    /// dictionary cap that applies to every symbol recorded this way.
     pub fn symbol_opt<'a, N, S>(&mut self, name: N, value: Option<S>) -> crate::Result<&mut Self>
     where
         N: AsRef<str> + TryInto<ColumnName<'a>>,
@@ -1249,6 +1269,8 @@ impl Buffer {
     ///
     /// Per spec, the wire encoding writes `lo` (8 bytes LE) followed by `hi`
     /// (8 bytes LE).
+    /// For canonical RFC-4122 bytes, use `column_sender::Chunk::column_uuid`
+    /// instead of splitting the bytes into `lo` and `hi`.
     pub fn column_uuid<'a, N>(&mut self, name: N, lo: u64, hi: u64) -> crate::Result<&mut Self>
     where
         N: AsRef<str> + TryInto<ColumnName<'a>>,
@@ -1340,8 +1362,6 @@ impl Buffer {
     ///
     /// The wire encoding writes the 4 octets as `u32::from(addr).to_le_bytes()`,
     /// matching Rust's natural Ipv4Addr packing (octet 0 in the high byte).
-    ///
-    /// IPv4 (`0x18`) is part of the QWP v1 spec.
     pub fn column_ipv4<'a, N>(
         &mut self,
         name: N,
@@ -1474,8 +1494,6 @@ impl Buffer {
     }
 
     /// Adds a BINARY column (opaque byte sequence). QWP-only.
-    ///
-    /// BINARY (`0x17`) is part of the QWP v1 spec.
     pub fn column_binary<'a, N>(&mut self, name: N, value: &[u8]) -> crate::Result<&mut Self>
     where
         N: AsRef<str> + TryInto<ColumnName<'a>>,

@@ -13,7 +13,8 @@
 #include <memory>
 #include <string>
 
-namespace {
+namespace
+{
 
 namespace qdb = questdb::ingress;
 using namespace questdb::ingress::literals;
@@ -36,7 +37,8 @@ std::shared_ptr<arrow::RecordBatch> build_batch()
     auto schema = arrow::schema(
         {arrow::field("ts", ts_arr->type()),
          arrow::field("price", arrow::float64())});
-    return arrow::RecordBatch::Make(schema, ts_arr->length(), {ts_arr, price_arr});
+    return arrow::RecordBatch::Make(
+        schema, ts_arr->length(), {ts_arr, price_arr});
 }
 
 bool example(const std::string& host, const std::string& port)
@@ -50,8 +52,10 @@ bool example(const std::string& host, const std::string& port)
         size_t err_len = 0;
         const char* err_msg = ::line_sender_error_msg(err, &err_len);
         std::fprintf(
-            stderr, "questdb_db_connect: %.*s\n",
-            static_cast<int>(err_len), err_msg);
+            stderr,
+            "questdb_db_connect: %.*s\n",
+            static_cast<int>(err_len),
+            err_msg);
         ::line_sender_error_free(err);
         return false;
     }
@@ -61,8 +65,10 @@ bool example(const std::string& host, const std::string& port)
         size_t err_len = 0;
         const char* err_msg = ::line_sender_error_msg(err, &err_len);
         std::fprintf(
-            stderr, "questdb_db_borrow_sender: %.*s\n",
-            static_cast<int>(err_len), err_msg);
+            stderr,
+            "questdb_db_borrow_sender: %.*s\n",
+            static_cast<int>(err_len),
+            err_msg);
         ::line_sender_error_free(err);
         ::questdb_db_close(db);
         return false;
@@ -90,21 +96,24 @@ bool example(const std::string& host, const std::string& port)
         auto st = arrow::ExportRecordBatch(*batch, &c_arr, &c_sch);
         if (!st.ok())
         {
-            std::fprintf(stderr, "ExportRecordBatch: %s\n", st.ToString().c_str());
+            std::fprintf(
+                stderr, "ExportRecordBatch: %s\n", st.ToString().c_str());
         }
         else
         {
             arrow_c_guard guard{c_arr, c_sch};
             qdb::sender_view sender_view{raw_sender};
-            sender_view.flush_arrow_batch("cpp_arrow_trades"_tn, c_arr, c_sch, "ts"_cn);
-            if (!::qwp_sender_wait(
-                    raw_sender, ::qwpws_ack_level_ok, 0, &err))
+            sender_view.flush_arrow_batch(
+                "cpp_arrow_trades"_tn, c_arr, c_sch, "ts"_cn);
+            if (!::qwp_sender_wait(raw_sender, ::qwpws_ack_level_ok, 0, &err))
             {
                 size_t err_len = 0;
                 const char* err_msg = ::line_sender_error_msg(err, &err_len);
                 std::fprintf(
-                    stderr, "qwp_sender_wait: %.*s\n",
-                    static_cast<int>(err_len), err_msg);
+                    stderr,
+                    "qwp_sender_wait: %.*s\n",
+                    static_cast<int>(err_len),
+                    err_msg);
                 ::line_sender_error_free(err);
             }
             else

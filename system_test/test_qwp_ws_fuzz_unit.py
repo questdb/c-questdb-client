@@ -28,8 +28,9 @@ These do not need a QuestDB fixture — they drive the helper module
 directly with injected mocks. The point is to pin down the
 classification of transient network errors (the bug surfaced by
 `test_all_mixed_with_bounce` seed=0xa2127d1c2e42ba0f on Linux CI and
-seed=0x8da2facf78940b06 on Windows CI) so the timing race is no
-longer the only way to verify the fix.
+seed=0x8da2facf78940b06 on Windows CI) and the macOS producer limit
+(triggered by `test_add_columns` seed=0x9e0f91f260ea5e7e) so timing and
+host resource limits are no longer the only ways to verify the fixes.
 
 Run with::
 
@@ -41,9 +42,11 @@ sys.dont_write_bytecode = True
 
 import threading
 import unittest
+from unittest import mock
 import urllib.error
 
 import qwp_ws_fuzz
+import test as system_test
 
 
 class TransientNetworkErrorClassificationTest(unittest.TestCase):
@@ -104,6 +107,48 @@ class TransientNetworkErrorClassificationTest(unittest.TestCase):
             CustomError('Read timed out')))
         self.assertTrue(qwp_ws_fuzz.is_transient_network_error(
             CustomError('Connection reset by peer')))
+
+
+class MacOsProducerLimitTest(unittest.TestCase):
+
+    def test_caps_failing_sixteen_producer_macos_load(self):
+        load = qwp_ws_fuzz.LoadParams(98, 5, 16, 4, 6)
+
+        qwp_ws_fuzz.cap_macos_producer_threads(load, 'darwin')
+
+        self.assertEqual(load.num_of_threads, 8)
+
+    def test_preserves_sixteen_producers_on_linux(self):
+        load = qwp_ws_fuzz.LoadParams(98, 5, 16, 4, 6)
+
+        qwp_ws_fuzz.cap_macos_producer_threads(load, 'linux')
+
+        self.assertEqual(load.num_of_threads, 16)
+
+    def test_run_fuzz_applies_macos_cap_before_starting_producers(self):
+        started_threads = []
+
+        class RecordingThread:
+            def __init__(self, *args, **kwargs):
+                pass
+
+            def start(self):
+                started_threads.append(self)
+
+            def join(self):
+                pass
+
+        case = system_test.TestQwpWsFuzz('test_load')
+        case._master_rng = qwp_ws_fuzz.Rng(seed=0xdeadbeef)
+        case._seed_label = 'macOS producer-limit unit test'
+        load = qwp_ws_fuzz.LoadParams(0, 0, 16, 0, 0)
+
+        with mock.patch.object(system_test.sys, 'platform', 'darwin'), \
+                mock.patch.object(
+                    system_test.threading, 'Thread', RecordingThread):
+            case._run_fuzz(load, qwp_ws_fuzz.FuzzParams())
+
+        self.assertEqual(len(started_threads), 8)
 
 
 class AlterThreadTransientErrorTest(unittest.TestCase):

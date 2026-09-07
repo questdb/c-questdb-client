@@ -5,9 +5,7 @@ using namespace std::literals::string_view_literals;
 using namespace questdb::ingress::literals;
 
 static bool example(
-    std::string_view host,
-    std::string_view port,
-    std::string_view table_name)
+    std::string_view host, std::string_view port, std::string_view table_name)
 {
     try
     {
@@ -55,7 +53,8 @@ static bool displayed_help(int argc, const char* argv[])
                 << "line_sender_cpp_example_udp_batch: [HOST [PORT [TABLE]]]\n"
                 << "    HOST: QWP/UDP host (defaults to \"localhost\").\n"
                 << "    PORT: QWP/UDP port (defaults to \"9007\").\n"
-                << "    TABLE: Target table (defaults to \"cpp_udp_batch_example\")."
+                << "    TABLE: Target table (defaults to "
+                   "\"cpp_udp_batch_example\")."
                 << std::endl;
             return true;
         }

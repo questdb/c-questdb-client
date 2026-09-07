@@ -60,6 +60,26 @@ Transient connection failures and retriable server states are retried;
 terminal schema, parse, security, or protocol rejections make that sender
 unusable and must be handled explicitly.
 
+With `sf_dir`, the QWP/WebSocket publication log can be recovered after a
+producer-process restart. The default `sf_durability=memory` mode relies on the
+OS page cache, so it does not protect the newest published frames from host
+power loss. Configure
+`sf_durability=periodic;sf_sync_interval_millis=5000;` for background
+memory-map/file-sync checkpoints. The interval defaults to 5000 ms and is a
+target cadence, not a hard upper bound: sender scheduling and storage latency
+extend the actual recovery window. If a segment fills before its published
+data is durable, rotation waits for a requested checkpoint and publication
+sees the normal store-and-forward backpressure response.
+
+In manual QWP progress mode, periodic checkpoints advance only when the
+application calls a progress-driving API such as `drive_once` or `wait`.
+
+A periodic checkpoint protects only the client's local replay log.
+`request_durable_ack=on` is orthogonal: it requests QuestDB Enterprise
+server-side durable ACKs. Use periodic local durability together with durable
+ACK waits when both sides of the delivery path must cross a durability
+barrier.
+
 Returning a borrowed QWP sender does not discard already-published frames. For
 in-memory store-and-forward, pool shutdown drains best-effort within
 `close_flush_timeout`; call `wait` before close when delivery must be confirmed,

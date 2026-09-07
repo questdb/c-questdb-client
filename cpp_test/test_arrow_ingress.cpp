@@ -2,18 +2,18 @@
 // over the conn-level Arrow batch ingest API.
 //
 // This layer is a thin, type-agnostic forwarder: it packs `table_name_view` /
-// `column_name_view` into the C structs, passes the `ArrowArray*` / `ArrowSchema*`
-// through to the C ABI, and translates a C error into a thrown
+// `column_name_view` into the C structs, passes the `ArrowArray*` /
+// `ArrowSchema*` through to the C ABI, and translates a C error into a thrown
 // `line_sender_error`. So the only things it can get wrong are argument
 // marshalling and error translation — which is all this file covers:
 //   * error / NULL paths (wrong conn, NULL array/schema, empty name);
 //   * happy publish-only, FSN-returning, and ACKing Arrow flushes to prove
 //     the marshalling paths reach the C ABI.
 //
-// Per-type Arrow->column classification is backend-agnostic Rust code, exercised
-// exhaustively in `questdb-rs/src/ingress/qwp_sender/arrow_batch.rs` and
-// round-tripped in C in `cpp_test/test_arrow_c.c`; re-testing it per type here
-// would add no coverage.
+// Per-type Arrow->column classification is backend-agnostic Rust code,
+// exercised exhaustively in `questdb-rs/src/ingress/qwp_sender/arrow_batch.rs`
+// and round-tripped in C in `cpp_test/test_arrow_c.c`; re-testing it per type
+// here would add no coverage.
 
 #define DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN
 #include "doctest.h"
@@ -164,11 +164,13 @@ struct MockConn
     questdb_db* db = nullptr;
     qwp_sender* conn = nullptr;
 
-    explicit MockConn(qm::Script script = qm::Script{qm::ActionAwaitClientFrame{0x51}})
+    explicit MockConn(
+        qm::Script script = qm::Script{qm::ActionAwaitClientFrame{0x51}})
         : server(std::vector<qm::Script>{std::move(script)})
     {
         const std::string conf = "ws::addr=" + server.addr() +
-            ";lazy_connect=true;sender_pool_min=1;pool_reap=manual;close_flush_timeout_millis=0;";
+                                 ";lazy_connect=true;sender_pool_min=1;pool_"
+                                 "reap=manual;close_flush_timeout_millis=0;";
         line_sender_error* err = nullptr;
         db = questdb_db_connect(conf.c_str(), conf.size(), &err);
         REQUIRE(db != nullptr);
@@ -205,7 +207,8 @@ TEST_CASE("flush_arrow_batch: NULL array -> invalid_api_call")
         mc.conn, tbl, nullptr, &sch, nullptr, 0, &err);
     CHECK_FALSE(ok);
     REQUIRE(err != nullptr);
-    CHECK(line_sender_error_get_code(err) == line_sender_error_invalid_api_call);
+    CHECK(
+        line_sender_error_get_code(err) == line_sender_error_invalid_api_call);
     line_sender_error_free(err);
 }
 
@@ -220,11 +223,13 @@ TEST_CASE("flush_arrow_batch: NULL schema -> invalid_api_call")
         mc.conn, tbl, &arr, nullptr, nullptr, 0, &err);
     CHECK_FALSE(ok);
     REQUIRE(err != nullptr);
-    CHECK(line_sender_error_get_code(err) == line_sender_error_invalid_api_call);
+    CHECK(
+        line_sender_error_get_code(err) == line_sender_error_invalid_api_call);
     line_sender_error_free(err);
 }
 
-TEST_CASE("flush_arrow_batch_at_column: empty ts_column_name throws invalid_name")
+TEST_CASE(
+    "flush_arrow_batch_at_column: empty ts_column_name throws invalid_name")
 {
     try
     {
@@ -263,11 +268,12 @@ TEST_CASE("flush_arrow_batch_at_now: happy path marshals through to the C ABI")
 
 TEST_CASE("borrowed_sender exposes Arrow FSN helper")
 {
-    qm::MockServer server(std::vector<qm::Script>{
-        qm::Script{qm::ActionAwaitClientFrame{0x51}}});
+    qm::MockServer server(
+        std::vector<qm::Script>{qm::Script{qm::ActionAwaitClientFrame{0x51}}});
     questdb::pool db{
         "ws::addr=" + server.addr() +
-        ";lazy_connect=true;sender_pool_min=1;pool_reap=manual;close_flush_timeout_millis=0;"};
+        ";lazy_connect=true;sender_pool_min=1;pool_reap=manual;close_flush_"
+        "timeout_millis=0;"};
     auto conn = db.borrow_sender();
 
     auto col = pack_le<int64_t>({10, 20, 30});
@@ -275,8 +281,8 @@ TEST_CASE("borrowed_sender exposes Arrow FSN helper")
     auto sch = make_schema("l", "v");
     try
     {
-        const auto fsn =
-            conn.flush_arrow_batch_at_now_and_get_fsn("t_borrowed"_tn, arr, sch);
+        const auto fsn = conn.flush_arrow_batch_at_now_and_get_fsn(
+            "t_borrowed"_tn, arr, sch);
         REQUIRE(fsn.has_value());
         CHECK(conn.published_fsn() == fsn);
     }
@@ -299,14 +305,7 @@ TEST_CASE("qwp_sender_flush_arrow_batch_at_now_and_wait: C ABI happy path")
     line_sender_error* err = nullptr;
     line_sender_table_name tbl{6, "t_wait"};
     const bool ok = qwp_sender_flush_arrow_batch_at_now_and_wait(
-        mc.conn,
-        tbl,
-        &arr,
-        &sch,
-        nullptr,
-        0,
-        qwpws_ack_level_ok,
-        &err);
+        mc.conn, tbl, &arr, &sch, nullptr, 0, qwpws_ack_level_ok, &err);
     CHECK(ok);
     CHECK(err == nullptr);
     CHECK_FALSE(static_cast<bool>(arr.release));
@@ -314,14 +313,16 @@ TEST_CASE("qwp_sender_flush_arrow_batch_at_now_and_wait: C ABI happy path")
 
 TEST_CASE("borrowed_sender exposes Arrow ACKing helpers")
 {
-    qm::MockServer server(std::vector<qm::Script>{qm::Script{
-        qm::ActionAwaitClientFrame{0x51},
-        qm::ActionSendRaw{qm::ingress_ok_frame(0)},
-        qm::ActionAwaitClientFrame{0x51},
-        qm::ActionSendRaw{qm::ingress_ok_frame(1)}}});
+    qm::MockServer server(
+        std::vector<qm::Script>{qm::Script{
+            qm::ActionAwaitClientFrame{0x51},
+            qm::ActionSendRaw{qm::ingress_ok_frame(0)},
+            qm::ActionAwaitClientFrame{0x51},
+            qm::ActionSendRaw{qm::ingress_ok_frame(1)}}});
     questdb::pool db{
         "ws::addr=" + server.addr() +
-        ";lazy_connect=true;sender_pool_min=1;pool_reap=manual;close_flush_timeout_millis=0;"};
+        ";lazy_connect=true;sender_pool_min=1;pool_reap=manual;close_flush_"
+        "timeout_millis=0;"};
     auto conn = db.borrow_sender();
 
     auto col = pack_le<int64_t>({10, 20, 30});
@@ -337,8 +338,7 @@ TEST_CASE("borrowed_sender exposes Arrow ACKing helpers")
         FAIL("borrowed Arrow at-now ACKing flush threw: " << e.what());
     }
 
-    auto ts_col = pack_le<int64_t>(
-        {1700000000000000LL, 1700000000000001LL});
+    auto ts_col = pack_le<int64_t>({1700000000000000LL, 1700000000000001LL});
     auto v_col = pack_le<int64_t>({10, 20});
 
     auto ts_arr =
@@ -394,12 +394,12 @@ TEST_CASE("borrowed_sender exposes Arrow ACKing helpers")
 
 // Happy path for the second marshalling path: the designated timestamp is taken
 // from a named Timestamp column of a struct batch.
-TEST_CASE("flush_arrow_batch (at_column): happy path picks ts from named column")
+TEST_CASE(
+    "flush_arrow_batch (at_column): happy path picks ts from named column")
 {
     MockConn mc;
 
-    auto ts_col = pack_le<int64_t>(
-        {1700000000000000LL, 1700000000000001LL});
+    auto ts_col = pack_le<int64_t>({1700000000000000LL, 1700000000000001LL});
     auto v_col = pack_le<int64_t>({10, 20});
 
     auto ts_arr =

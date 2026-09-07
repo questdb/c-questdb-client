@@ -55,14 +55,14 @@
 #include <thread>
 
 #ifdef _WIN32
-#include <winsock2.h>
-#include <ws2tcpip.h>
-#pragma comment(lib, "Ws2_32.lib")
+#    include <winsock2.h>
+#    include <ws2tcpip.h>
+#    pragma comment(lib, "Ws2_32.lib")
 #else
-#include <netdb.h>
-#include <sys/socket.h>
-#include <sys/types.h>
-#include <unistd.h>
+#    include <netdb.h>
+#    include <sys/socket.h>
+#    include <sys/types.h>
+#    include <unistd.h>
 #endif
 
 using namespace questdb::ingress::literals;
@@ -73,15 +73,15 @@ namespace
 // MSVC flags `std::getenv` as deprecated (C4996) in favour of `_dupenv_s`,
 // but the function is standard C/C++ and the test's usage is single-threaded.
 #ifdef _MSC_VER
-#pragma warning(push)
-#pragma warning(disable : 4996)
+#    pragma warning(push)
+#    pragma warning(disable : 4996)
 #endif
 inline const char* env_or_null(const char* name)
 {
     return std::getenv(name);
 }
 #ifdef _MSC_VER
-#pragma warning(pop)
+#    pragma warning(pop)
 #endif
 
 std::string broker_host()
@@ -127,14 +127,20 @@ bool broker_reachable()
     bool ok = false;
     for (addrinfo* p = res; p != nullptr; p = p->ai_next)
     {
-        int fd = static_cast<int>(::socket(p->ai_family, p->ai_socktype, p->ai_protocol));
-        if (fd < 0) continue;
+        int fd = static_cast<int>(
+            ::socket(p->ai_family, p->ai_socktype, p->ai_protocol));
+        if (fd < 0)
+            continue;
         // Best-effort short timeout. On non-blocking it'd be nicer; but
         // a 500ms blocking connect attempt is fine for a one-time gate.
 #ifdef _WIN32
         DWORD timeout_ms = 500;
-        setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO,
-                   reinterpret_cast<const char*>(&timeout_ms), sizeof(timeout_ms));
+        setsockopt(
+            fd,
+            SOL_SOCKET,
+            SO_SNDTIMEO,
+            reinterpret_cast<const char*>(&timeout_ms),
+            sizeof(timeout_ms));
 #else
         timeval tv{};
         tv.tv_sec = 0;
@@ -150,7 +156,8 @@ bool broker_reachable()
 #else
         ::close(fd);
 #endif
-        if (ok) break;
+        if (ok)
+            break;
     }
     freeaddrinfo(res);
 #ifdef _WIN32
@@ -240,8 +247,7 @@ TEST_CASE("multi-row literal: long_sequence(5)")
     REQUIRE_LIVE_BROKER();
 
     auto reader = make_reader();
-    auto cur = reader.execute(
-        "select x as n from long_sequence(5)"_utf8);
+    auto cur = reader.execute("select x as n from long_sequence(5)"_utf8);
 
     size_t total_rows = 0;
     int64_t expected = 1;
@@ -302,13 +308,13 @@ TEST_CASE("bind: i32 + varchar")
     // Cast the result to LONG so the column kind is server-version-
     // independent (otherwise the server may surface int*long as INT or
     // LONG depending on its widening rules).
-    auto cur =
-        reader
-            .prepare("select ($1::int * x)::long as scaled, "
-                     "$2 as label from long_sequence(3)"_utf8)
-            .bind_i32(7)
-            .bind_varchar("widgets"_utf8)
-            .execute();
+    auto cur = reader
+                   .prepare(
+                       "select ($1::int * x)::long as scaled, "
+                       "$2 as label from long_sequence(3)"_utf8)
+                   .bind_i32(7)
+                   .bind_varchar("widgets"_utf8)
+                   .execute();
 
     auto batch_opt = cur.next_batch();
     REQUIRE(batch_opt);
@@ -368,8 +374,8 @@ TEST_CASE("column_validity: bitmap matches null pattern, empty when no nulls")
             "v "
             "from long_sequence(5)"_utf8);
         auto batch_opt = cur.next_batch();
-    REQUIRE(batch_opt);
-    auto& batch = *batch_opt;
+        REQUIRE(batch_opt);
+        auto& batch = *batch_opt;
         REQUIRE(batch.row_count() == 5);
         REQUIRE(batch.column_count() == 1);
         REQUIRE(batch.column_kind(0) == qwp_reader_column_kind_long);
@@ -397,8 +403,7 @@ TEST_CASE("column_validity: bitmap matches null pattern, empty when no nulls")
     }
 
     // No-nulls case: every row is non-null, so the validity pointer is null.
-    auto cur2 =
-        reader.execute("select x from long_sequence(3)"_utf8);
+    auto cur2 = reader.execute("select x from long_sequence(3)"_utf8);
     auto bo2 = cur2.next_batch();
     REQUIRE(bo2);
     REQUIRE(bo2->row_count() == 3);
@@ -436,10 +441,7 @@ TEST_CASE("bind: decimal128 sign-extension round-trip")
     // silently, which would mask a real bind regression).
     auto reader = make_reader();
     auto cur = reader.prepare("select $1::decimal(38, 0) as v"_utf8)
-                   .bind_decimal128(
-                       static_cast<uint64_t>(-1LL),
-                       -1,
-                       0)
+                   .bind_decimal128(static_cast<uint64_t>(-1LL), -1, 0)
                    .execute();
     auto batch_opt = cur.next_batch();
     REQUIRE(batch_opt);
@@ -489,7 +491,9 @@ TEST_CASE("cursor reusable after explicit close")
     auto reader = make_reader();
     {
         auto cur = reader.execute("select 1 as v"_utf8);
-        while (cur.next_batch()) {}
+        while (cur.next_batch())
+        {
+        }
     } // cur dtor closes
     // The reader's active flag should be cleared; a second cursor opens
     // without throwing.
@@ -562,7 +566,9 @@ TEST_CASE("terminal_kind reaches end after stream completes")
 
     auto reader = make_reader();
     auto cur = reader.execute("select x from long_sequence(2)"_utf8);
-    while (cur.next_batch()) {}
+    while (cur.next_batch())
+    {
+    }
     // SELECT streams terminate with `end` carrying total_rows; `exec_done`
     // is the terminator for non-result statements (DDL/DML), so a SELECT
     // here must always land on `end`.
@@ -611,8 +617,9 @@ TEST_CASE("invalid SQL surfaces a server error")
     // (e.g.) `socket_error`, `cancelled`, or any client-side code
     // would fail this check loudly instead of being masked by an
     // any-message-is-fine assertion.
-    CHECK((code == questdb_error_server_parse_error
-        || code == questdb_error_server_internal_error));
+    CHECK(
+        (code == questdb_error_server_parse_error ||
+         code == questdb_error_server_internal_error));
 }
 
 TEST_CASE("get_i64 type-mismatch on string column is reported, not a crash")
@@ -684,8 +691,7 @@ TEST_CASE("ingress sender → egress reader round-trip for primitives")
         {
             std::ostringstream sql_s;
             sql_s << "select count(*) as c from \"" << table << "\"";
-            auto cur = reader.execute(
-                questdb::ingress::utf8_view{sql_s.str()});
+            auto cur = reader.execute(questdb::ingress::utf8_view{sql_s.str()});
             int64_t n = -1;
             if (auto bo = cur.next_batch())
             {
@@ -696,19 +702,23 @@ TEST_CASE("ingress sender → egress reader round-trip for primitives")
                     if (k == qwp_reader_column_kind_long)
                     {
                         auto v = batch.column(0).get<int64_t>(0);
-                        if (v) n = *v;
+                        if (v)
+                            n = *v;
                     }
                     else if (k == qwp_reader_column_kind_int)
                     {
                         auto v = batch.column(0).get<int32_t>(0);
-                        if (v) n = *v;
+                        if (v)
+                            n = *v;
                     }
                 }
             }
             // Drain to terminal so the cursor isn't dropped mid-stream —
             // otherwise `~cursor()` sends CANCEL and tears down the WS
             // transport, and the next iteration writes into a dead pipe.
-            while (cur.next_batch()) {}
+            while (cur.next_batch())
+            {
+            }
             if (n >= 3)
             {
                 ready = true;

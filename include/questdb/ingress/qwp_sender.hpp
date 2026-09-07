@@ -122,8 +122,8 @@ public:
     {
         ::line_sender_table_name table_c{table.size(), table.data()};
         column_chunk chunk;
-        chunk._raw = line_sender_error::wrapped_call(
-            ::qwp_chunk_new_validated, table_c);
+        chunk._raw =
+            line_sender_error::wrapped_call(::qwp_chunk_new_validated, table_c);
         return chunk;
     }
 
@@ -154,8 +154,14 @@ public:
             ::qwp_chunk_free(_raw);
     }
 
-    ::qwp_chunk* c_ptr() noexcept { return _raw; }
-    const ::qwp_chunk* c_ptr() const noexcept { return _raw; }
+    ::qwp_chunk* c_ptr() noexcept
+    {
+        return _raw;
+    }
+    const ::qwp_chunk* c_ptr() const noexcept
+    {
+        return _raw;
+    }
 
     /**
      * Row count locked by the first appended column / designated ts.
@@ -303,7 +309,10 @@ public:
         return *this;
     }
 
-    /** UUID column: 16 bytes per row — low half LE in bytes 0..8, high half LE in bytes 8..16. */
+    /** UUID column: 16 bytes per row in canonical RFC-4122 big-endian order;
+     * the client byte-swaps to QWP wire order internally.
+     * `line_sender_buffer::column_uuid(lo, hi)` instead takes QWP wire-order
+     * integer halves. */
     column_chunk& column_uuid(
         std::string_view name,
         const uint8_t* data,
@@ -449,9 +458,23 @@ public:
      * dictionary index (in `0 .. dict_offsets_len - 1`) for non-null rows;
      * `dict_offsets` (length `dict_offsets_len`, Arrow `Utf8` layout) and
      * `dict_bytes` (length `dict_bytes_len`) describe the dictionary. Only
-     * referenced entries are interned into the connection symbol table, so a
-     * wide dictionary (e.g. a Pandas `Categorical`) costs nothing for unused
-     * entries. Each entry must be valid UTF-8 (validated eagerly here) and
+     * referenced entries are interned into the connection symbol table, so
+     * unused entries cost nothing on the wire or against the connection
+     * dictionary. They are not free locally, though, and the cost tracks the
+     * *declared* length rather than the referenced count: this call
+     * UTF-8-validates the whole declared dictionary, and each flush fills and
+     * scans roughly 9 bytes of scratch per declared entry — so declare a
+     * dictionary (e.g. a Pandas `Categorical`) no wider than you need.
+     *
+     * Two separate caps apply. The distinct entry count you may *declare* is
+     * capped at 8,388,608 per column, rejected by this call. The symbols
+     * actually *referenced* across every column and every chunk on one
+     * connection are capped at 2,000,000 entries and 256 MiB of UTF-8; that
+     * cap is reached at `flush()` / `flush_and_wait()`, not here, and fails
+     * them with `error_code::symbol_dict_full`. A wide dictionary consumes
+     * none of that second budget until its entries are referenced.
+     *
+     * Each entry must be valid UTF-8 (validated eagerly here) and
      * every non-null code must be in range (checked here); the borrowed
      * buffers must stay alive and unchanged until the next `flush()` /
      * `wait()` returns. See `qwp_sender.h` for the full contract and caps.
@@ -535,47 +558,31 @@ public:
 
     // -- Designated timestamp -----------------------------------------
 
-    column_chunk& at_micros(
-        const int64_t* data, size_t row_count)
+    column_chunk& at_micros(const int64_t* data, size_t row_count)
     {
         line_sender_error::wrapped_call(
-            ::qwp_chunk_at_micros,
-            _raw,
-            data,
-            row_count);
+            ::qwp_chunk_at_micros, _raw, data, row_count);
         return *this;
     }
 
-    column_chunk& at_nanos(
-        const int64_t* data, size_t row_count)
+    column_chunk& at_nanos(const int64_t* data, size_t row_count)
     {
         line_sender_error::wrapped_call(
-            ::qwp_chunk_at_nanos,
-            _raw,
-            data,
-            row_count);
+            ::qwp_chunk_at_nanos, _raw, data, row_count);
         return *this;
     }
 
-    column_chunk& at_millis(
-        const int64_t* data, size_t row_count)
+    column_chunk& at_millis(const int64_t* data, size_t row_count)
     {
         line_sender_error::wrapped_call(
-            ::qwp_chunk_at_millis,
-            _raw,
-            data,
-            row_count);
+            ::qwp_chunk_at_millis, _raw, data, row_count);
         return *this;
     }
 
-    column_chunk& at_seconds(
-        const int64_t* data, size_t row_count)
+    column_chunk& at_seconds(const int64_t* data, size_t row_count)
     {
         line_sender_error::wrapped_call(
-            ::qwp_chunk_at_seconds,
-            _raw,
-            data,
-            row_count);
+            ::qwp_chunk_at_seconds, _raw, data, row_count);
         return *this;
     }
 
@@ -650,14 +657,10 @@ public:
     arrow_import(
         ::ArrowArray& array,
         const ::ArrowSchema& schema,
-        ::qwp_symbol_mode symbol_mode =
-            ::qwp_symbol_mode_auto)
+        ::qwp_symbol_mode symbol_mode = ::qwp_symbol_mode_auto)
     {
         _raw = line_sender_error::wrapped_call(
-            ::qwp_arrow_import_new,
-            &array,
-            &schema,
-            symbol_mode);
+            ::qwp_arrow_import_new, &array, &schema, symbol_mode);
     }
 
     arrow_import(const arrow_import&) = delete;
@@ -693,8 +696,14 @@ public:
         return ::qwp_arrow_import_len(_raw);
     }
 
-    ::qwp_arrow_import* c_ptr() noexcept { return _raw; }
-    const ::qwp_arrow_import* c_ptr() const noexcept { return _raw; }
+    ::qwp_arrow_import* c_ptr() noexcept
+    {
+        return _raw;
+    }
+    const ::qwp_arrow_import* c_ptr() const noexcept
+    {
+        return _raw;
+    }
 
 private:
     ::qwp_arrow_import* _raw{nullptr};
@@ -738,6 +747,13 @@ public:
      * as soon as it is accepted locally. On success `chunk` is cleared; on
      * failure it is left untouched. Call `wait()` to block for the server ack.
      * Throws on error.
+     *
+     * This is where the connection-scoped symbol dictionary is filled, so a
+     * chunk introducing a symbol past its 2,000,000-entry / 256 MiB cap throws
+     * `error_code::symbol_dict_full` here rather than at the `symbol_i*` call
+     * that declared the dictionary. Retrying on the same sender cannot succeed
+     * — only retiring the connection resets it; see the symbol-column preamble
+     * in `qwp_sender.h`.
      */
     void flush(column_chunk& chunk)
     {
@@ -746,13 +762,13 @@ public:
     }
 
     /**
-     * Publish `chunk` as a completion boundary, then wait until it and all prior
-     * frames published through this sender reach `level`. Uses the pool-wide
-     * `request_timeout` as the wait's no-progress deadline. Throws on error.
+     * Publish `chunk` as a completion boundary, then wait until it and all
+     * prior frames published through this sender reach `level`. Uses the
+     * pool-wide `request_timeout` as the wait's no-progress deadline. Throws on
+     * error.
      */
     void flush_and_wait(
-        column_chunk& chunk,
-        qwpws_ack_level level = qwpws_ack_level::ok)
+        column_chunk& chunk, qwpws_ack_level level = qwpws_ack_level::ok)
     {
         line_sender_error::wrapped_call(
             ::qwp_sender_flush_chunk_and_wait,
@@ -770,10 +786,7 @@ public:
     {
         ::line_sender_qwpws_fsn fsn{};
         line_sender_error::wrapped_call(
-            ::qwp_sender_flush_chunk_and_get_fsn,
-            _raw,
-            chunk.c_ptr(),
-            &fsn);
+            ::qwp_sender_flush_chunk_and_get_fsn, _raw, chunk.c_ptr(), &fsn);
         return optional_fsn(fsn);
     }
 
@@ -800,8 +813,7 @@ public:
     std::optional<uint64_t> published_fsn() const
     {
         ::line_sender_qwpws_fsn fsn{};
-        line_sender_error::wrapped_call(
-            ::qwp_sender_published_fsn, _raw, &fsn);
+        line_sender_error::wrapped_call(::qwp_sender_published_fsn, _raw, &fsn);
         return optional_fsn(fsn);
     }
 
@@ -812,8 +824,7 @@ public:
     std::optional<uint64_t> acked_fsn() const
     {
         ::line_sender_qwpws_fsn fsn{};
-        line_sender_error::wrapped_call(
-            ::qwp_sender_acked_fsn, _raw, &fsn);
+        line_sender_error::wrapped_call(::qwp_sender_acked_fsn, _raw, &fsn);
         return optional_fsn(fsn);
     }
 
@@ -843,7 +854,8 @@ public:
     /**
      * Publish-only Arrow flush (server-stamped) into the queue. Pair with
      * `wait()`. Ownership: on success `array.release` is consumed; on failure
-     * it may also have been consumed — check before invoking. `schema` borrowed.
+     * it may also have been consumed — check before invoking. `schema`
+     * borrowed.
      */
     void flush_arrow_batch_at_now(
         table_name_view table,
@@ -1022,8 +1034,14 @@ public:
 private:
     friend class borrowed_sender;
 
-    ::qwp_sender* c_ptr() noexcept { return _raw; }
-    const ::qwp_sender* c_ptr() const noexcept { return _raw; }
+    ::qwp_sender* c_ptr() noexcept
+    {
+        return _raw;
+    }
+    const ::qwp_sender* c_ptr() const noexcept
+    {
+        return _raw;
+    }
 
     static std::optional<uint64_t> optional_fsn(
         const ::line_sender_qwpws_fsn& fsn)
@@ -1047,6 +1065,13 @@ private:
  * destructor is non-blocking by design. Use `wait()` for a simple barrier over
  * everything published so far; use FSNs for non-blocking progress tracking
  * while you still hold the same borrowed sender.
+ *
+ * With `sf_dir`, `sf_durability=memory` is the default and uses the OS page
+ * cache. Use `sf_durability=periodic` to checkpoint the local replay log.
+ * `sf_sync_interval_millis` defaults to 5000; it is a target, not a maximum
+ * loss window. `sf_durability=flush` and `sf_durability=append` are not yet
+ * supported. End-to-end durability also requires
+ * `request_durable_ack=on` and a durable ACK from QuestDB Enterprise.
  */
 class borrowed_sender
 {
@@ -1079,7 +1104,10 @@ public:
         return *this;
     }
 
-    ~borrowed_sender() noexcept { release(); }
+    ~borrowed_sender() noexcept
+    {
+        release();
+    }
 
     /** `true` if this guard currently owns a borrowed sender. */
     explicit operator bool() const noexcept
@@ -1122,8 +1150,7 @@ public:
 
     /** Publish and clear a Buffer, then wait for `level`. */
     void flush_and_wait(
-        line_sender_buffer& buffer,
-        qwpws_ack_level level = qwpws_ack_level::ok)
+        line_sender_buffer& buffer, qwpws_ack_level level = qwpws_ack_level::ok)
     {
         buffer.may_init();
         line_sender_error::wrapped_call(
@@ -1175,6 +1202,16 @@ public:
      * as soon as it is accepted locally. On success `chunk` is cleared; on
      * failure it is left untouched. Call `wait()` to block for the server ack.
      * Throws on error.
+     *
+     * A chunk introducing a symbol past the connection-scoped dictionary's
+     * 2,000,000-entry / 256 MiB cap throws `error_code::symbol_dict_full` here.
+     * Retrying a new symbol on this sender cannot succeed: the dictionary
+     * belongs to the connection. A full dictionary retires the connection on
+     * return, so simply letting this guard be destroyed drops it (not recycled)
+     * and drains its queue best-effort — the next borrow gets a fresh
+     * connection. Call `wait()` first if the queued frames must not be lost
+     * (`drop_on_return()` is no longer required for a full dictionary). See the
+     * symbol-column preamble in `qwp_sender.h`.
      */
     void flush(column_chunk& chunk)
     {
@@ -1182,12 +1219,11 @@ public:
     }
 
     /**
-     * Publish `chunk` as a completion boundary, then wait until it and all prior
-     * frames published through this sender reach `level`.
+     * Publish `chunk` as a completion boundary, then wait until it and all
+     * prior frames published through this sender reach `level`.
      */
     void flush_and_wait(
-        column_chunk& chunk,
-        qwpws_ack_level level = qwpws_ack_level::ok)
+        column_chunk& chunk, qwpws_ack_level level = qwpws_ack_level::ok)
     {
         _view.flush_and_wait(chunk, level);
     }
@@ -1356,17 +1392,20 @@ public:
 #endif
 
     /**
-     * Force this borrowed sender to be closed instead of recycled when the guard
-     * is destroyed.
+     * Force this borrowed sender to be closed instead of recycled when the
+     * guard is destroyed.
      *
-     * Use normal destruction for healthy senders: the return path already closes
-     * senders that have latched terminal state, or whose pool has been closed.
-     * Call this after abandoning work or handling an error where the next
-     * borrower must not inherit this backend. If queued store-and-forward
+     * Use normal destruction for healthy senders: the return path already
+     * closes senders that have latched terminal state, or whose pool has been
+     * closed. Call this after abandoning work or handling an error where the
+     * next borrower must not inherit this backend. If queued store-and-forward
      * frames must not be lost, call `wait()` first or configure `sf_dir` for
      * replay.
      */
-    void drop_on_return() noexcept { _force_drop = true; }
+    void drop_on_return() noexcept
+    {
+        _force_drop = true;
+    }
 
 private:
     friend class ::questdb::pool;

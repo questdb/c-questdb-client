@@ -117,7 +117,9 @@ void encode_varint_u64(uint64_t v, std::vector<uint8_t>& out);
 // Wrap a payload in the 12-byte QWP1 frame header. Server frames carry
 // this header; client→server frames are bare payloads (no header).
 std::vector<uint8_t> framed(
-    uint8_t version, uint8_t flags, uint16_t table_count,
+    uint8_t version,
+    uint8_t flags,
+    uint16_t table_count,
     const std::vector<uint8_t>& payload);
 
 // Convenience builders.
@@ -156,8 +158,10 @@ struct ColumnSpec
     std::vector<uint8_t> data;
 };
 std::vector<uint8_t> result_batch_frame(
-    int64_t request_id, uint64_t batch_seq,
-    size_t row_count, const std::vector<ColumnSpec>& columns);
+    int64_t request_id,
+    uint64_t batch_seq,
+    size_t row_count,
+    const std::vector<ColumnSpec>& columns);
 
 // `result_batch_frame` variant that ships a `FLAG_DELTA_SYMBOL_DICT` delta
 // section in the payload before the table block. `dict_delta_start` is the
@@ -165,8 +169,10 @@ std::vector<uint8_t> result_batch_frame(
 // connection (the client validates `delta_start == current dict size`).
 // Pair with `symbol_column_bytes` for any SYMBOL columns in `columns`.
 std::vector<uint8_t> result_batch_frame_with_dict(
-    int64_t request_id, uint64_t batch_seq,
-    size_t row_count, const std::vector<ColumnSpec>& columns,
+    int64_t request_id,
+    uint64_t batch_seq,
+    size_t row_count,
+    const std::vector<ColumnSpec>& columns,
     uint64_t dict_delta_start,
     const std::vector<std::string>& dict_entries);
 
@@ -199,29 +205,31 @@ std::vector<uint8_t> fixed_column_bytes_nullable(
 std::vector<uint8_t> decimal64_column_bytes(
     const std::vector<int64_t>& values, int8_t scale);
 
-// Build a DECIMAL128 column body: `[validity][varint scale][non_null × 16 raw LE bytes]`.
-// Each entry in `values` is the raw 16-byte two's-complement little-endian
-// mantissa exactly as it should appear on the wire.
+// Build a DECIMAL128 column body: `[validity][varint scale][non_null × 16 raw
+// LE bytes]`. Each entry in `values` is the raw 16-byte two's-complement
+// little-endian mantissa exactly as it should appear on the wire.
 std::vector<uint8_t> decimal128_column_bytes(
     const std::vector<std::array<uint8_t, 16>>& values, int8_t scale);
 
-// Build a DECIMAL256 column body: `[validity][1B scale][non_null × 32 raw LE bytes]`.
-// Each entry in `values` is the raw 32-byte two's-complement little-endian
-// mantissa exactly as it should appear on the wire.
+// Build a DECIMAL256 column body: `[validity][1B scale][non_null × 32 raw LE
+// bytes]`. Each entry in `values` is the raw 32-byte two's-complement
+// little-endian mantissa exactly as it should appear on the wire.
 std::vector<uint8_t> decimal256_column_bytes(
     const std::vector<std::array<uint8_t, 32>>& values, int8_t scale);
 
-// Build a GEOHASH column body: `[validity][varint precision_bits][non_null × ceil(precision_bits/8) LE bytes]`.
-// `packed_non_null_values` must already be `non_null_count × byte_width` bytes.
+// Build a GEOHASH column body: `[validity][varint precision_bits][non_null ×
+// ceil(precision_bits/8) LE bytes]`. `packed_non_null_values` must already be
+// `non_null_count × byte_width` bytes.
 std::vector<uint8_t> geohash_column_bytes(
     const std::vector<bool>& is_null,
     const std::vector<uint8_t>& packed_non_null_values,
     uint8_t precision_bits);
 
-// Build a DOUBLE_ARRAY / LONG_ARRAY column body: `[validity][per-row: 1B nDims, nDims×u32_le shape, prod(shape)×8 LE element bytes]`.
-// `rows[i] == std::nullopt` marks a NULL row. Each present row carries its
-// own shape and packed flat-data bytes (caller-provided so this helper
-// stays single for both DOUBLE_ARRAY and LONG_ARRAY).
+// Build a DOUBLE_ARRAY / LONG_ARRAY column body: `[validity][per-row: 1B nDims,
+// nDims×u32_le shape, prod(shape)×8 LE element bytes]`. `rows[i] ==
+// std::nullopt` marks a NULL row. Each present row carries its own shape and
+// packed flat-data bytes (caller-provided so this helper stays single for both
+// DOUBLE_ARRAY and LONG_ARRAY).
 struct ArrayRow
 {
     std::vector<uint32_t> shape;
@@ -245,9 +253,11 @@ struct ActionSendServerInfo
     std::optional<std::string> zone_id = std::nullopt;
 };
 struct ActionAwaitQueryRequest
-{};
+{
+};
 struct ActionSendResultEnd
-{};
+{
+};
 struct ActionSendExecDone
 {
     uint8_t op_type = 0;
@@ -276,9 +286,11 @@ struct ActionAwaitClientFrame
     uint8_t expected_msg_kind;
 };
 struct ActionHardDrop
-{};
+{
+};
 struct ActionReject401
-{};
+{
+};
 
 using Action = std::variant<
     ActionSendServerInfo,

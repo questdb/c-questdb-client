@@ -78,8 +78,7 @@ public:
      * `line_sender::new_buffer()`.
      */
     static line_sender_buffer qwp_udp(
-        size_t init_buf_size = 64 * 1024,
-        size_t max_name_len = 127)
+        size_t init_buf_size = 64 * 1024, size_t max_name_len = 127)
     {
         auto* raw_buffer =
             ::line_sender_buffer_new_qwp_with_max_name_len(max_name_len);
@@ -108,8 +107,7 @@ public:
      * `borrowed_sender::new_buffer()`, which uses the pool configuration.
      */
     static line_sender_buffer qwp_ws(
-        size_t init_buf_size = 64 * 1024,
-        size_t max_name_len = 127)
+        size_t init_buf_size = 64 * 1024, size_t max_name_len = 127)
     {
         auto* raw_buffer =
             ::line_sender_buffer_new_qwp_ws_with_max_name_len(max_name_len);
@@ -163,10 +161,9 @@ public:
             // Clone before freeing the old buffer so a clone failure leaves
             // *this unchanged (strong exception guarantee).
             ::line_sender_buffer* new_impl =
-                other._impl
-                    ? line_sender_error::wrapped_call(
-                          ::line_sender_buffer_clone, other._impl)
-                    : nullptr;
+                other._impl ? line_sender_error::wrapped_call(
+                                  ::line_sender_buffer_clone, other._impl)
+                            : nullptr;
             ::line_sender_buffer_free(_impl);
             _impl = new_impl;
             _init_buf_size = other._init_buf_size;
@@ -386,6 +383,22 @@ public:
     /**
      * Record a symbol value for the given column.
      * Make sure you record all the symbol columns before any other column type.
+     *
+     * When the buffer is flushed over QWP/WebSocket — whether by a pooled
+     * sender or by `line_sender::flush*` on a `line_sender` opened against a
+     * `ws://` / `wss://` address — every distinct symbol recorded here is
+     * interned into the *same* connection-scoped dictionary the chunk API uses:
+     * capped at 2,000,000 entries and 256 MiB of UTF-8 across the whole
+     * connection, not per buffer or per flush. Exceeding it throws
+     * `error_code::symbol_dict_full`, and the dictionary is only reset by
+     * retiring the connection that owns it. For a standalone `line_sender` that
+     * means `close_drain()` — checked — and only then letting the sender go;
+     * the destructor and `close()` drain nothing, so every
+     * published-but-unacked frame would be discarded with no wait. See the
+     * symbol-column preamble in `qwp_sender.h` for the per-flavour list. ILP
+     * (TCP/HTTP) and QWP/UDP flushes carry no such dictionary and are
+     * unaffected.
+     *
      * @param name Column name.
      * @param value Column value.
      */
@@ -694,8 +707,9 @@ public:
      *
      * When specifying a decimal as a string, use a '.' to separate the whole
      * from the fractional parts. For example, "12.20".
-     * Infinity is encoded as "+Infinity" or "-Infinity", while NaN as "NaN". 
-     * Note that Infinity and NaN values decay to nulls when stored in the database.
+     * Infinity is encoded as "+Infinity" or "-Infinity", while NaN as "NaN".
+     * Note that Infinity and NaN values decay to nulls when stored in the
+     * database.
      *
      * For better performance and precision control, consider using the binary
      * format via `decimal::decimal_view` instead.
@@ -817,6 +831,8 @@ public:
 
     /**
      * Record a UUID column value. QWP-only.
+     * For canonical RFC-4122 bytes, use `column_chunk::column_uuid` instead of
+     * splitting the bytes into `lo` and `hi`.
      */
     line_sender_buffer& column_uuid(
         column_name_view name, uint64_t lo, uint64_t hi)
@@ -846,10 +862,6 @@ public:
      * Record an IPv4 column value. QWP-only.
      *
      * `value` is the address packed as a u32 with octet 0 in the high byte.
-     *
-     * IPv4 (`0x18`) is part of the QWP v1 spec. Server-side ingest does not
-     * currently implement this wire type; batches using it will be rejected
-     * with a descriptive error. This may change in future server releases.
      */
     line_sender_buffer& column_ipv4(column_name_view name, uint32_t value)
     {
@@ -883,11 +895,6 @@ public:
 
     /**
      * Record a BINARY column value. QWP-only.
-     *
-     * BINARY (`0x17`) is part of the QWP v1 spec. Server-side ingest does
-     * not currently implement this wire type; batches using it will be
-     * rejected with a descriptive error. This may change in future server
-     * releases.
      */
     line_sender_buffer& column_binary(
         column_name_view name, const uint8_t* data, size_t data_len)
@@ -1308,7 +1315,8 @@ public:
      * service name.
      * @param[in] protocol The protocol to use.
      * @param[in] host The QuestDB database host.
-     * @param[in] port The QuestDB port as service name for the selected protocol.
+     * @param[in] port The QuestDB port as service name for the selected
+     * protocol.
      */
     opts(protocol protocol, utf8_view host, utf8_view port) noexcept
         : _impl{::line_sender_opts_new_service(
@@ -1430,8 +1438,7 @@ public:
      * synchronously from sender API calls such as `flush` and must not call
      * methods on the same sender.
      */
-    opts& qwp_ws_error_handler(
-        std::function<void(const qwp_ws_error&)> handler)
+    opts& qwp_ws_error_handler(std::function<void(const qwp_ws_error&)> handler)
     {
         _qwp_ws_error_handler =
             std::make_shared<std::function<void(const qwp_ws_error&)>>(
@@ -1698,8 +1705,7 @@ private:
     }
 
     static void qwp_ws_error_trampoline(
-        void* user_data,
-        const ::line_sender_qwpws_error_view* view) noexcept
+        void* user_data, const ::line_sender_qwpws_error_view* view) noexcept
     {
         auto* handler =
             static_cast<std::function<void(const qwp_ws_error&)>*>(user_data);
@@ -1795,8 +1801,8 @@ public:
     }
 
     line_sender(const opts& opts)
-        : _impl{
-              line_sender_error::wrapped_call(::line_sender_build, opts._impl)}
+        : _impl{line_sender_error::wrapped_call(
+              ::line_sender_build, opts._impl)}
         , _qwp_ws_error_handler{opts._qwp_ws_error_handler}
     {
     }
@@ -1865,8 +1871,7 @@ public:
         auto version = this->protocol_version();
         auto max_name_len = ::line_sender_get_max_name_len(_impl);
         auto sender_protocol = this->protocol();
-        if (sender_protocol == protocol::ws ||
-            sender_protocol == protocol::wss)
+        if (sender_protocol == protocol::ws || sender_protocol == protocol::wss)
         {
             throw line_sender_error{
                 line_sender_error_code::invalid_api_call,
@@ -2029,10 +2034,7 @@ public:
         ensure_impl();
         ::line_sender_qwpws_fsn fsn{};
         line_sender_error::wrapped_call(
-            ::line_sender_qwpws_flush_and_get_fsn,
-            _impl,
-            buffer._impl,
-            &fsn);
+            ::line_sender_qwpws_flush_and_get_fsn, _impl, buffer._impl, &fsn);
         return optional_fsn(fsn);
     }
 
@@ -2186,8 +2188,7 @@ public:
     void close_drain()
     {
         ensure_impl();
-        line_sender_error::wrapped_call(
-            ::line_sender_qwpws_close_drain, _impl);
+        line_sender_error::wrapped_call(::line_sender_qwpws_close_drain, _impl);
     }
 
     /**

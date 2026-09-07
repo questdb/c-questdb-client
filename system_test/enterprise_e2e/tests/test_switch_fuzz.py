@@ -77,7 +77,6 @@ def _connect_string(http_port: int, sf_dir: Path, *, sender_id: str) -> str:
         ";request_durable_ack=on"
         ";reconnect_max_duration_millis=60000"
         ";close_flush_timeout_millis=5000"
-        ";max_in_flight=1024"
         ";sf_max_total_bytes=67108864"
         ";sf_append_deadline_millis=30000;"
     )

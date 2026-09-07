@@ -117,6 +117,22 @@ Handles return to the pool on drop, and the pool reconnects to the configured
 endpoint transparently. With QuestDB Enterprise it also fails over across
 `addr=host-a:9000,host-b:9000` endpoint lists.
 
+To keep the ingest publication log across reconnects and producer-process
+restarts, configure `sf_dir`. Its default `sf_durability=memory` mode relies on
+the OS page cache and does not protect against host power loss. Periodic
+durability adds background disk checkpoints:
+
+```text
+ws::addr=localhost:9000;sf_dir=/var/lib/my-app/questdb-sf;sender_id=orders;sf_durability=periodic;sf_sync_interval_millis=5000;
+```
+
+The interval defaults to 5000 ms in periodic mode and is a target cadence:
+runner scheduling and storage-sync latency add to the actual recovery window.
+Publication can see ordinary backpressure at a segment boundary until the
+segment has been checkpointed. This local durability is independent of the
+QuestDB Enterprise server barrier selected by `request_durable_ack=on`; use
+both when end-to-end durability is required.
+
 A standalone `Reader::from_conf("ws::addr=...")` gives the query side
 without a pool (`sync-reader-qwp-ws` feature), yielding results as native
 columnar batches, Arrow `RecordBatch`es (`cursor.next_arrow_batch()`) or

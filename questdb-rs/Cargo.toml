@@ -87,7 +87,7 @@ aligned-vec = { version = "0.6", optional = true }
 # `get_columns`. CI exercises 0.52, 0.53 and 0.54. `questdb-rs/Cargo.lock` is
 # gitignored, so the `<0.55` ceiling keeps an unrelated build from floating
 # onto an untested polars.
-polars = { version = ">=0.52, <0.55", optional = true, default-features = false, features = ["dtype-categorical", "dtype-datetime", "dtype-date", "timezones"] }
+polars = { version = ">=0.52, <0.55", optional = true, default-features = false, features = ["dtype-categorical", "dtype-datetime", "dtype-date", "object", "timezones"] }
 polars-arrow = { version = ">=0.52, <0.55", optional = true, default-features = false, features = ["compute"] }
 
 [target.'cfg(windows)'.dependencies]
@@ -246,6 +246,7 @@ live-server-tests = [
     "sync-reader-zstd",
     "sync-sender-http",
     "sync-sender-qwp-ws",
+    "arrow-ingress",
 ]
 
 ## FFI escape-hatch surface, consumed only by the `questdb-rs-ffi` C-ABI

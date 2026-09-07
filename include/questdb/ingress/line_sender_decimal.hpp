@@ -56,7 +56,8 @@ class decimal_str_view
 {
 public:
     decimal_str_view(const char* buf, size_t len)
-        : buf{buf}, len{len}
+        : buf{buf}
+        , len{len}
     {
     }
 

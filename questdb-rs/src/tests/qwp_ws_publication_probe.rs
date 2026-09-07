@@ -72,10 +72,7 @@ fn qwp_ws_public_manual_sender_submit_waits_and_row_is_queryable() -> TestResult
     eprintln!("probe table: {table}");
     let _cleanup = TableCleanup::new(config.clone(), table.clone());
 
-    let conf = format!(
-        "ws::addr={}:{};max_in_flight=4;",
-        config.host, config.qwp_ws_port
-    );
+    let conf = format!("ws::addr={}:{};", config.host, config.qwp_ws_port);
     let mut sender = SenderBuilder::from_conf(conf)?
         .qwp_ws_progress(QwpWsProgress::Manual)?
         .build()?;
@@ -212,7 +209,7 @@ fn public_sfa_conf(
     short_reconnect: bool,
 ) -> String {
     let mut conf = format!(
-        "ws::addr={host}:{port};sf_dir={};sender_id={sender_id};sf_max_segment_bytes=64k;sf_max_total_bytes=128k;max_in_flight=4;",
+        "ws::addr={host}:{port};sf_dir={};sender_id={sender_id};sf_max_segment_bytes=64k;sf_max_total_bytes=128k;",
         sf_dir.display()
     );
     if short_reconnect {
