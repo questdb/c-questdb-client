@@ -475,7 +475,18 @@ fn rotated_auth_after_401(
     if !state.auth.is_rotating() || !matches!(rep, Ok(rep) if rep.status() == 401) {
         return Ok(None);
     }
-    let Some(value) = state.auth.resolve()? else {
+    let Some(value) = state.auth.resolve().map_err(|e| {
+        // Both call sites reach here only AFTER `send_request` has already
+        // POSTed the whole buffer at least once, and `need_retry` classifies
+        // `ureq::Error::Timeout(_)` / `ConnectionFailed` as retryable, so a
+        // preceding attempt may already have been applied server-side. Mark it
+        // in-doubt. Bindings key on this flag to decide whether replaying the
+        // buffer is safe; without it a provider failure raised here looked
+        // provably unsent, which is what let the Python side retain the buffer
+        // and re-send rows the server had already stored.
+        e.with_in_doubt(true)
+    })?
+    else {
         return Ok(None);
     };
     let value = value.into_owned();
