@@ -2649,6 +2649,9 @@ enum QwpWsColumnValues {
     Geohash {
         cells: Vec<QwpWsCell<u64>>,
         precision_bits: u8,
+        /// The precision `precision_bits` displaced when the current batch
+        /// pinned it, restored if a rollback empties the column again.
+        displaced_precision_bits: u8,
     },
     LongArray {
         cells: Vec<QwpWsSliceCell>,
@@ -4472,6 +4475,7 @@ impl QwpWsColumnBuffer {
         let QwpWsColumnValues::Geohash {
             cells,
             precision_bits: col_precision,
+            displaced_precision_bits,
         } = &mut self.values
         else {
             return Err(type_mismatch_error_ws(&self.name));
@@ -4491,6 +4495,7 @@ impl QwpWsColumnBuffer {
         // encoding precision 0, which the server rejects with
         // "invalid GeoHash precision: 0".
         if cells.is_empty() {
+            *displaced_precision_bits = *col_precision;
             *col_precision = precision_bits;
         } else if *col_precision != precision_bits {
             return Err(error::fmt!(
@@ -4582,6 +4587,7 @@ impl QwpWsColumnValues {
             ColumnKind::Geohash => Self::Geohash {
                 cells: Vec::new(),
                 precision_bits: 0,
+                displaced_precision_bits: 0,
             },
             ColumnKind::LongArray => Self::LongArray {
                 cells: Vec::new(),
@@ -4720,12 +4726,20 @@ impl QwpWsColumnValues {
             Self::Ipv4 { cells } => pop_value_cell_from(cells, from),
             Self::Date { cells } => pop_value_cell_from(cells, from),
             Self::Char { cells } => pop_value_cell_from(cells, from),
-            Self::Geohash { cells, .. } => {
-                // Rolling back the last value leaves `cells` empty; the pinned
-                // precision is retained so a reused or partially-rolled-back
-                // column keeps a valid precision. The next value re-pins via
-                // `cells.is_empty()` in `append_geohash`.
-                pop_value_cell_from(cells, from)
+            Self::Geohash {
+                cells,
+                precision_bits,
+                displaced_precision_bits,
+            } => {
+                let popped = pop_value_cell_from(cells, from)?;
+                // Emptying the column unpins the precision this batch set,
+                // putting back the one it displaced. A rollback can only empty
+                // a column that was empty at the mark, so the displaced value
+                // is exactly the precision the column carried then.
+                if cells.is_empty() {
+                    *precision_bits = *displaced_precision_bits;
+                }
+                Some(popped)
             }
             Self::Symbol {
                 cells, dict, data, ..
@@ -4795,6 +4809,7 @@ impl QwpWsColumnValues {
             Self::Geohash {
                 cells,
                 precision_bits,
+                ..
             } => {
                 1 + cells
                     .len()
@@ -5131,6 +5146,7 @@ impl QwpWsColumnValues {
             Self::Geohash {
                 cells,
                 precision_bits,
+                ..
             } => {
                 write_qwp_varint(out, *precision_bits as u64);
                 let bytes_per_value = geohash_bytes_per_value(*precision_bits);
@@ -10719,6 +10735,75 @@ mod tests {
         buf.rewind_to_marker().unwrap();
         write_dec(&mut buf, "5.6");
         assert_eq!(ws_replay_bytes(&mut buf), ws_replay_bytes(&mut reference));
+    }
+
+    /// A geohash column keeps its precision across a clear, so a reused
+    /// column that no row writes still encodes the precision the server's
+    /// column has. The first value of the next batch repins it -- and a rewind
+    /// that discards that value must put back the precision it displaced,
+    /// otherwise the surviving all-null column advertises a precision no row
+    /// ever asked for and the server rejects the batch.
+    #[cfg(feature = "_sender-qwp-ws")]
+    #[test]
+    fn qwp_ws_columnar_rewind_restores_the_precision_a_discarded_row_repinned() {
+        fn write_geohash(buf: &mut QwpWsColumnarBuffer, precision_bits: u8) {
+            buf.table("trades")
+                .unwrap()
+                .column_geohash("g", 7, precision_bits)
+                .unwrap()
+                .at_now()
+                .unwrap();
+        }
+
+        fn write_without_geohash(buf: &mut QwpWsColumnarBuffer) {
+            buf.table("trades")
+                .unwrap()
+                .column_i64("n", 1)
+                .unwrap()
+                .at_now()
+                .unwrap();
+        }
+
+        for api in ["marker", "bookmark"] {
+            let mut reference = QwpWsColumnarBuffer::new(127);
+            write_geohash(&mut reference, 25);
+            reference.clear();
+            write_without_geohash(&mut reference);
+
+            let mut buf = QwpWsColumnarBuffer::new(127);
+            write_geohash(&mut buf, 25);
+            buf.clear();
+            write_without_geohash(&mut buf);
+
+            let bookmark = if api == "marker" {
+                buf.set_marker().unwrap();
+                None
+            } else {
+                Some(buf.bookmark().unwrap())
+            };
+            write_geohash(&mut buf, 5);
+            match bookmark {
+                Some(bookmark) => buf.rewind_to_bookmark(bookmark).unwrap(),
+                None => buf.rewind_to_marker().unwrap(),
+            }
+
+            assert_eq!(
+                ws_replay_bytes(&mut buf),
+                ws_replay_bytes(&mut reference),
+                "{api}: a rewound all-null geohash column must keep the \
+                 precision it carried at the mark"
+            );
+
+            // The repin is undone, not disabled: the next batch still sets its
+            // own precision.
+            write_geohash(&mut buf, 5);
+            write_geohash(&mut reference, 5);
+            assert_eq!(
+                ws_replay_bytes(&mut buf),
+                ws_replay_bytes(&mut reference),
+                "{api}: a row appended after the rewind must repin the precision"
+            );
+        }
     }
 
     #[cfg(feature = "_sender-qwp-ws")]
