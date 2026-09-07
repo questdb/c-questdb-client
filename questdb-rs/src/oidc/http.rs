@@ -325,7 +325,11 @@ fn read_body(url: &str, response: ureq::http::Response<ureq::Body>) -> Result<Ve
         .into_with_config()
         .limit(MAX_RESPONSE_BYTES)
         .read_to_vec()
-        .map_err(|e| OidcError::network(format!("Failed to read response body from {url}: {e}")))
+        .map_err(|e| {
+            let timed_out = request_timed_out(&e);
+            OidcError::network(format!("Failed to read response body from {url}: {e}"))
+                .with_request_timed_out(timed_out)
+        })
 }
 
 /// A short, printable snippet of a (possibly binary / error-page) body for a
@@ -1054,5 +1058,52 @@ mod tests {
             io::ErrorKind::TimedOut
         ))));
         assert!(!request_timed_out(&Error::HostNotFound));
+    }
+
+    #[test]
+    fn response_body_timeout_preserves_timeout_provenance() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            let mut request = Vec::new();
+            let mut chunk = [0_u8; 1024];
+            while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+                let amount = stream.read(&mut chunk).unwrap();
+                assert_ne!(amount, 0, "client closed before sending request headers");
+                request.extend_from_slice(&chunk[..amount]);
+            }
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 64\r\nConnection: close\r\n\r\n",
+                )
+                .unwrap();
+            stream.flush().unwrap();
+            thread::sleep(Duration::from_millis(500));
+        });
+
+        let client = HttpClient::new(None, Duration::from_millis(100)).unwrap();
+        let error = match client.post_form(
+            &format!("http://{addr}/token"),
+            &[("grant_type", "urn:ietf:params:oauth:grant-type:device_code")],
+            false,
+        ) {
+            Ok(_) => panic!("a stalled response body must time out"),
+            Err(error) => error,
+        };
+
+        assert_eq!(error.kind(), crate::oidc::error::OidcErrorKind::Network);
+        assert!(
+            error.request_timed_out(),
+            "a timeout while reading the response body lost its provenance: {error}"
+        );
+        assert!(
+            !error.request_unsent(),
+            "response headers prove the request reached the peer"
+        );
+        server.join().unwrap();
     }
 }

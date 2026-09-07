@@ -1895,6 +1895,8 @@ fn refresh_transient_error_discards_ambiguous_parent() {
     let err = auth.token().unwrap_err();
     assert_eq!(err.kind(), OidcErrorKind::Network);
     assert_eq!(err.status(), Some(503));
+    assert!(err.message().contains("refresh token was discarded"));
+    assert!(err.message().contains("Sign in again"));
     assert_eq!(auth.token_set().unwrap().refresh_token, None);
     let next = auth.token().unwrap_err();
     assert_eq!(next.kind(), OidcErrorKind::InteractionRequired);
@@ -4084,6 +4086,8 @@ fn transient_status_refresh_discards_persisted_parent() {
     let err = auth.token().unwrap_err();
     assert_eq!(err.kind(), OidcErrorKind::Network);
     assert_eq!(err.status(), Some(503));
+    assert!(err.message().contains("refresh token was discarded"));
+    assert!(err.message().contains("Sign in again"));
     assert_eq!(
         store
             .token()

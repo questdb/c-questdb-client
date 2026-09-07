@@ -1962,8 +1962,9 @@ impl OidcDeviceAuth {
             let error = result.body.get("error").and_then(Value::as_str);
             let error_description = result.body.get("error_description").and_then(Value::as_str);
             return Err(OidcError::network(format!(
-                "Token refresh hit a transient IdP error (HTTP {}); the refresh \
-                     token is still valid — retry later.",
+                "Token refresh received an ambiguous transient IdP response (HTTP {}); \
+                     the refresh token was discarded to prevent unsafe reuse. Sign in \
+                     again before retrying.",
                 result.status
             ))
             .with_idp_error(error, error_description)
