@@ -127,7 +127,8 @@ column-major store-and-forward `wait`.
 `completed_fsn` is the only one that can report the server-accepted
 ([`AckLevel::Ok`](crate::ingress::AckLevel::Ok)) watermark separately from
 durable coverage — in background progress mode with `request_durable_ack=on`;
-elsewhere the two coincide. Like `wait`, an
+in manual progress mode both levels report the completed watermark. Like
+`wait`, an
 [`AckLevel::Durable`](crate::ingress::AckLevel::Durable) poll requires
 QuestDB Enterprise and that opt-in, and is otherwise rejected; `acked_fsn`
 reports the watermark at the sender's configured level and is never

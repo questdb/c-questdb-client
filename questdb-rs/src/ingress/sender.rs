@@ -679,12 +679,13 @@ impl Sender {
     ///   `request_durable_ack=on`; otherwise the call is rejected up front,
     ///   ahead of any terminal error the sender holds, so a caller polling
     ///   for durability cannot silently read acceptance coverage instead.
-    ///   [`Self::acked_fsn`] keeps the older unchecked behaviour and is
-    ///   equivalent only under that opt-in.
+    ///   [`Self::acked_fsn`] reports the watermark at the sender's configured
+    ///   level instead and is equivalent only under that opt-in.
     ///
     /// In background progress mode with durable ACKs `Ok` advances ahead of
-    /// `Durable`; otherwise the two coincide. Manual progress mode has no
-    /// separate OK tracker, so both levels report the completed watermark.
+    /// `Durable`. Manual progress mode has no separate OK tracker, so there
+    /// both levels report the completed watermark even under
+    /// `request_durable_ack=on`.
     ///
     /// An `Ok` read is never below a `Durable` read taken before it, but two
     /// calls are two snapshots: the background runner can advance `Durable`
