@@ -953,13 +953,14 @@ impl<T: QwpWsCoreTransport> QwpWsSendCore<T> {
                     let strikes = self.poison_tracker.strikes();
                     let reason = if error.message.is_empty() {
                         format!(
-                            "QWP/WebSocket frame fsn {fsn} was rejected {strikes} times without ACK progress"
+                            "QWP/WebSocket: {strikes} frame rejections without ACK progress \
+                             (latest: fsn {fsn})"
                         )
                     } else {
                         format!(
-                            "QWP/WebSocket frame fsn {fsn} was rejected {} times without ACK \
-                             progress; last server error: {}",
-                            strikes, error.message
+                            "QWP/WebSocket: {strikes} frame rejections without ACK progress \
+                             (latest: fsn {fsn}); last server error: {}",
+                            error.message
                         )
                     };
                     store.last_server_error = Some(error);
@@ -1000,8 +1001,8 @@ impl<T: QwpWsCoreTransport> QwpWsSendCore<T> {
                 .is_some_and(|completed_fsn| fsn <= completed_fsn)
     }
 
-    /// Whether `fsn` has now been rejected often enough, without ACK progress,
-    /// to be treated as poison.
+    /// Whether this reject of `fsn` brings the rejects seen without ACK
+    /// progress -- of any in-flight frame -- to the poison limit.
     ///
     /// The tracker keys on `completed_fsn` alone, so rejects that move
     /// between frames of the same stalled group still add up.
@@ -9108,7 +9109,7 @@ mod tests {
             terminal_error
                 .message
                 .as_deref()
-                .is_some_and(|message| message.contains("fsn 1 was rejected")),
+                .is_some_and(|message| message.contains("latest: fsn 1")),
             "the escalation must name the rejected frame, got {:?}",
             terminal_error.message
         );
@@ -9282,7 +9283,7 @@ mod tests {
         );
         assert!(
             terminal_error.message.as_deref().is_some_and(|message| {
-                message.contains("was rejected 4 times without ACK progress")
+                message.contains("4 frame rejections without ACK progress")
                     && message.contains("fake write error")
             }),
             "poison terminal must carry the last server error, got: {:?}",
@@ -9382,7 +9383,7 @@ mod tests {
         let terminal_error = driver.terminal_sender_error().unwrap();
         assert!(
             terminal_error.message.as_deref().is_some_and(|message| {
-                message.contains("was rejected 3 times without ACK progress")
+                message.contains("3 frame rejections without ACK progress")
                     && message.contains("fake write error")
             }),
             "poison terminal must report actual strike count, got: {:?}",

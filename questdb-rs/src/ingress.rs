@@ -1876,9 +1876,9 @@ impl SenderBuilder {
     }
 
     #[cfg(feature = "_sender-qwp-ws")]
-    /// Maximum repeated same-head-FSN rejects or server close frames tolerated
-    /// without ACK progress before the sender treats the frame as poison.
-    /// Default 4, matching the Java QWP/WebSocket sender.
+    /// Maximum rejects of any in-flight frame, or server close frames,
+    /// tolerated without ACK progress before the sender treats the stream as
+    /// poisoned. Default 4, matching the Java QWP/WebSocket sender.
     pub fn max_frame_rejections(mut self, value: usize) -> Result<Self> {
         if value == 0 {
             return Err(error::fmt!(
@@ -1899,8 +1899,9 @@ impl SenderBuilder {
     }
 
     #[cfg(feature = "_sender-qwp-ws")]
-    /// Minimum dwell before repeated same-head-FSN rejects or server close
-    /// frames can escalate to a poison-frame protocol violation. Default 5s.
+    /// Minimum dwell before repeated rejects of any in-flight frame, or server
+    /// close frames, can escalate to a poison-frame protocol violation.
+    /// Default 5s.
     /// Set to zero to escalate immediately at `max_frame_rejections`.
     pub fn poison_min_escalation_window(mut self, value: Duration) -> Result<Self> {
         let Some(qwp_ws) = &mut self.qwp_ws else {
