@@ -4547,6 +4547,118 @@ fn qwp_ws_subsequent_message_delta_encodes_dictionary_and_reemits_full_schema() 
     assert_eq!(first_table_column_count(&second), 2);
 }
 
+/// A publication can fail with the buffer still held: `flush_and_keep` leaves
+/// the rows in place, and a failed flush rolls the connection dictionary back
+/// so the aborted frame's symbols are freed. The caller's recovery is to rewind
+/// to a bookmark taken before the doomed rows and republish.
+///
+/// The buffer tests compare encoded bytes for a buffer in isolation. What only
+/// shows on a live connection is the shared symbol dictionary: it spans frames,
+/// so a rewind that left the discarded rows' cells behind would re-intern their
+/// symbols on the next flush, and the republished frame's delta dictionary
+/// would carry symbols no surviving row references.
+#[test]
+fn qwp_ws_rewind_after_a_failed_publication_republishes_only_surviving_rows() {
+    fn write_row(buf: &mut Buffer, sym: &str, qty: i64) {
+        buf.table("trades")
+            .unwrap()
+            .symbol("sym", sym)
+            .unwrap()
+            .column_i64("qty", qty)
+            .unwrap()
+            .at(TimestampNanos::new(1_700_000_000_000_000_000 + qty))
+            .unwrap();
+    }
+
+    fn write_doomed_rows(buf: &mut Buffer) {
+        for i in 0..256 {
+            write_row(
+                buf,
+                format!("drop-{i}-aaaaaaaaaaaaaaaaaaaa").as_str(),
+                100 + i,
+            );
+        }
+    }
+
+    // The cap sits at the configurable floor: the surviving rows encode well
+    // under it, the doomed ones -- whose symbols alone run past 8 KiB -- well
+    // over, so that flush and only it is rejected.
+    let max = 1024;
+    let mut probe = Buffer::qwp_ws_with_max_name_len(127);
+    write_row(&mut probe, "keep-a", 1);
+    write_row(&mut probe, "keep-d", 2);
+    let kept_len = qwp_ws_replay_encoded_len(&probe);
+    assert!(kept_len < max, "kept_len={kept_len}, max={max}");
+
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let (tx, rx) = mpsc::channel();
+
+    thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        stream
+            .set_write_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let request_lines = perform_server_upgrade(&mut stream).unwrap();
+        let mut received_frames = Vec::new();
+        for seq in FIRST_WIRE_SEQUENCE..FIRST_WIRE_SEQUENCE + 2 {
+            let (_fin, _op, payload) = read_frame(&mut stream).unwrap();
+            received_frames.push(payload);
+            write_qwp_ok_response(&mut stream, seq).unwrap();
+        }
+        let _ = tx.send(MockResult {
+            request_lines,
+            received_frames,
+        });
+        thread::sleep(Duration::from_millis(50));
+    });
+
+    let mut sender = SenderBuilder::new(Protocol::Ws, "127.0.0.1", port)
+        .max_buf_size(max)
+        .unwrap()
+        .build()
+        .unwrap();
+    let mut buf = sender.new_buffer();
+
+    // Published, and kept: the buffer the bookmark is taken on is not empty.
+    write_row(&mut buf, "keep-a", 1);
+    sender.flush_and_keep(&buf).unwrap();
+
+    let bookmark = buf.bookmark().unwrap();
+    write_doomed_rows(&mut buf);
+    let err = sender.flush_and_keep(&buf).unwrap_err();
+    assert_eq!(err.code(), ErrorCode::InvalidApiCall, "{err}");
+
+    buf.rewind_to_bookmark(bookmark).unwrap();
+    write_row(&mut buf, "keep-d", 2);
+    sender.flush(&mut buf).unwrap();
+
+    let result = rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    assert_eq!(result.received_frames.len(), 2);
+    let republished = &result.received_frames[1];
+
+    // "keep-a" took id 0 on the first frame, and the doomed flush released the
+    // ids it had claimed. So the republished frame resumes at the watermark and
+    // ships exactly one new symbol: "keep-d".
+    let mut pos = 12;
+    assert_eq!(read_varint(republished, &mut pos), 1, "delta_start");
+    assert_eq!(read_varint(republished, &mut pos), 1, "delta_count");
+    let name_len = read_varint(republished, &mut pos) as usize;
+    assert_eq!(&republished[pos..pos + name_len], b"keep-d");
+    assert!(
+        !republished.windows(5).any(|window| window == b"drop-"),
+        "a discarded row's symbol reached the wire"
+    );
+    assert_eq!(
+        first_table_row_count(republished),
+        2,
+        "kept row + the new one"
+    );
+}
+
 #[test]
 fn qwp_ws_replay_full_schema_used_when_columns_match() {
     // Public QWP/WS now uses the replay-safe encoder. Even when schemas match,
@@ -4735,6 +4847,21 @@ fn first_table_column_count(frame: &[u8]) -> u64 {
     let name_len = read_varint(frame, &mut pos) as usize;
     pos += name_len;
     let _row_count = read_varint(frame, &mut pos);
+    read_varint(frame, &mut pos)
+}
+
+/// The row count declared in the first table block. See
+/// [`first_table_column_count`] for the layout this walks.
+fn first_table_row_count(frame: &[u8]) -> u64 {
+    let mut pos = 12; // header
+    let _delta_start = read_varint(frame, &mut pos);
+    let delta_count = read_varint(frame, &mut pos);
+    for _ in 0..delta_count {
+        let name_len = read_varint(frame, &mut pos) as usize;
+        pos += name_len;
+    }
+    let name_len = read_varint(frame, &mut pos) as usize;
+    pos += name_len;
     read_varint(frame, &mut pos)
 }
 
