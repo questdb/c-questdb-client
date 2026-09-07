@@ -1180,7 +1180,7 @@ fn silent_refresh_without_reprompt() {
 }
 
 #[test]
-fn refresh_request_sends_complete_configured_scope_like_java() {
+fn refresh_request_omits_scope_after_narrower_grant() {
     let refresh_body = Arc::new(Mutex::new(None));
     let mock = {
         let refresh_body = Arc::clone(&refresh_body);
@@ -1189,10 +1189,18 @@ fn refresh_request_sends_complete_configured_scope_like_java() {
             ("POST", "/device") => (200, device_response()),
             ("POST", "/token") if body.contains("grant_type=refresh_token") => {
                 *refresh_body.lock().unwrap() = Some(body.to_string());
-                (
-                    200,
-                    r#"{"access_token":"AT-refreshed","expires_in":300}"#.to_string(),
-                )
+                if body.split('&').any(|field| field.starts_with("scope=")) {
+                    (
+                        400,
+                        r#"{"error":"invalid_scope","error_description":"refresh scope exceeds the original grant"}"#
+                            .to_string(),
+                    )
+                } else {
+                    (
+                        200,
+                        r#"{"access_token":"AT-refreshed","expires_in":300}"#.to_string(),
+                    )
+                }
             }
             ("POST", "/token") => (
                 200,
@@ -1240,16 +1248,13 @@ fn refresh_request_sends_complete_configured_scope_like_java() {
     assert!(fields.contains(&"refresh_token=RT-1"));
     assert!(fields.contains(&"client_id=questdb"));
     assert!(
-        fields.contains(&"scope=openid+profile+offline_access"),
-        "refresh request must preserve the complete configured scope; body={body}"
+        !fields.iter().any(|field| field.starts_with("scope=")),
+        "refresh must omit scope so the original grant is preserved; body={body}"
     );
 }
 
 #[test]
-fn groups_mode_refresh_preserves_configured_openid_scope() {
-    // The configured scope is exactly `openid`, so Java-compatible refresh
-    // behavior sends exactly `scope=openid` without groups mode synthesizing or
-    // otherwise changing the request.
+fn groups_mode_refresh_omits_scope_and_keeps_original_grant() {
     let refresh_body = Arc::new(Mutex::new(None));
     let mock = {
         let refresh_body = Arc::clone(&refresh_body);
@@ -1276,8 +1281,8 @@ fn groups_mode_refresh_preserves_configured_openid_scope() {
     let auth = explicit_auth(&mock, true);
     assert_eq!(sign_in_and_token(&auth).unwrap(), "ID-1");
 
-    // Force a refresh; because the request carries `openid`, the IdP re-issues an
-    // id_token and the silent refresh succeeds without an interactive re-prompt.
+    // Force a refresh. An omitted scope preserves the original `openid` grant,
+    // so the IdP re-issues an id_token without an interactive re-prompt.
     auth.tokens.lock().unwrap().as_mut().unwrap().expires_at = 1.0;
     assert_eq!(auth.token().unwrap(), "ID-refreshed");
 
@@ -1289,9 +1294,8 @@ fn groups_mode_refresh_preserves_configured_openid_scope() {
     let fields: Vec<&str> = body.split('&').collect();
     assert!(fields.contains(&"grant_type=refresh_token"));
     assert!(
-        fields.contains(&"scope=openid"),
-        "groups-mode refresh must request the openid scope so the IdP re-issues \
-         an id_token; body={body}"
+        !fields.iter().any(|field| field.starts_with("scope=")),
+        "groups-mode refresh must omit scope and preserve the original grant; body={body}"
     );
 }
 

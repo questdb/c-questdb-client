@@ -1934,12 +1934,13 @@ impl OidcDeviceAuth {
             ("grant_type", REFRESH_GRANT),
             ("refresh_token", refresh_token),
             ("client_id", self.config.client_id.as_str()),
-            ("scope", self.config.scope.as_str()),
         ];
-        // Match Java by sending the complete configured scope on refresh. In
-        // particular, groups mode does not synthesize `openid` here: the same
-        // exact scope participates in every request and in the persisted-store
-        // identity shared across language clients.
+        // Deliberately omit `scope`. RFC 6749 section 6 treats an omitted scope
+        // as the scope originally granted to this refresh token. Re-sending the
+        // configured scope is unsafe because the authorization server may have
+        // granted a narrower set and must reject a refresh that asks for more.
+        // Omission also remains correct after restart, where the persisted token
+        // format does not retain the granted response scope.
         if let Some(audience) = &self.config.audience {
             form.push(("audience", audience.as_str()));
         }
