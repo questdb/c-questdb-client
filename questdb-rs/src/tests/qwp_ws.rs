@@ -709,7 +709,14 @@ fn spawn_recycling_server(
     (port, handle)
 }
 
-fn spawn_stalled_after_first_frame_server() -> (u16, mpsc::Receiver<Vec<u8>>, mpsc::Sender<()>) {
+type ServerUpgrade = fn(&mut TcpStream) -> std::io::Result<Vec<String>>;
+
+/// Hands the first frame to the test, then parks until released; a configured
+/// rejection is written on release, otherwise the socket just closes.
+fn spawn_gated_server(
+    upgrade: ServerUpgrade,
+    reject: Option<(u8, &'static [u8])>,
+) -> (u16, mpsc::Receiver<Vec<u8>>, mpsc::Sender<()>) {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();
     let (frame_tx, frame_rx) = mpsc::channel();
@@ -717,37 +724,18 @@ fn spawn_stalled_after_first_frame_server() -> (u16, mpsc::Receiver<Vec<u8>>, mp
 
     thread::spawn(move || {
         let (mut stream, _) = listener.accept().unwrap();
-        perform_server_upgrade(&mut stream).unwrap();
+        upgrade(&mut stream).unwrap();
         let (_fin, _opcode, payload) = read_frame(&mut stream).unwrap();
         frame_tx.send(payload).unwrap();
-        let _ = release_rx.recv_timeout(Duration::from_secs(5));
+
+        let released = release_rx.recv_timeout(Duration::from_secs(5));
+        if let (Ok(()), Some((status, message))) = (released, reject) {
+            let _ = write_qwp_error_response(&mut stream, status, FIRST_WIRE_SEQUENCE, message);
+            thread::sleep(Duration::from_millis(50));
+        }
     });
 
     (port, frame_rx, release_tx)
-}
-
-fn spawn_gated_reject_server(
-    status: u8,
-    message: &'static [u8],
-) -> (u16, mpsc::Receiver<Vec<u8>>, mpsc::Sender<()>) {
-    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    let port = listener.local_addr().unwrap().port();
-    let (frame_tx, frame_rx) = mpsc::channel();
-    let (reject_tx, reject_rx) = mpsc::channel();
-
-    thread::spawn(move || {
-        let (mut stream, _) = listener.accept().unwrap();
-        perform_server_upgrade(&mut stream).unwrap();
-        let (_fin, _opcode, payload) = read_frame(&mut stream).unwrap();
-        frame_tx.send(payload).unwrap();
-
-        if reject_rx.recv_timeout(Duration::from_secs(5)).is_ok() {
-            let _ = write_qwp_error_response(&mut stream, status, FIRST_WIRE_SEQUENCE, message);
-        }
-        thread::sleep(Duration::from_millis(50));
-    });
-
-    (port, frame_rx, reject_tx)
 }
 
 fn spawn_delayed_durable_ack_server() -> (
@@ -1556,6 +1544,12 @@ fn qwp_ws_schema_reject_terminalizes_in_all_progress_modes() {
                 .unwrap_err(),
             progress,
         );
+        assert_eq!(
+            sender.acked_fsn().unwrap_err().code(),
+            ErrorCode::ServerRejection,
+            "mode={}",
+            progress.name()
+        );
     }
 }
 
@@ -1632,7 +1626,7 @@ fn qwp_ws_terminal_reject_terminalizes_in_all_progress_modes() {
 #[test]
 fn qwp_ws_backpressure_timeout_matches_in_all_progress_modes() {
     for progress in [ProgressCase::Background, ProgressCase::Manual] {
-        let (port, frame_rx, release_tx) = spawn_stalled_after_first_frame_server();
+        let (port, frame_rx, release_tx) = spawn_gated_server(perform_server_upgrade, None);
         let conf = format!(
             "ws::addr=127.0.0.1:{port};\
              qwp_ws_progress={};\
@@ -2091,8 +2085,10 @@ fn sender_completed_fsn_rejects_durable_without_opt_in_like_wait() {
 /// ahead of the handler there.
 #[test]
 fn sender_completed_fsn_polls_terminal_reject_without_dispatching_handler() {
-    let (port, frame_rx, reject_tx) =
-        spawn_gated_reject_server(QWP_STATUS_PARSE_ERROR, b"bad column");
+    let (port, frame_rx, reject_tx) = spawn_gated_server(
+        perform_server_upgrade,
+        Some((QWP_STATUS_PARSE_ERROR, b"bad column")),
+    );
     let (error_tx, error_rx) = mpsc::channel();
     let mut sender = SenderBuilder::new(Protocol::Ws, "127.0.0.1", port)
         .qwp_ws_error_handler(move |error| {
@@ -2149,6 +2145,70 @@ fn sender_completed_fsn_polls_terminal_reject_without_dispatching_handler() {
     assert_eq!(callback_error.category, QwpWsErrorCategory::ParseError);
     assert_eq!(callback_error.applied_policy, QwpWsErrorPolicy::Terminal);
     assert_eq!(callback_error.from_fsn, fsn);
+}
+
+/// A durable-ACK sender whose frame is rejected outright never receives a
+/// durable ACK, so the `Durable` poll must report the terminal rejection
+/// rather than `None`: a poller reading `None` would take a dead sender for a
+/// stalled one.
+#[test]
+fn sender_completed_fsn_durable_poll_reports_terminal_reject() {
+    let (port, frame_rx, reject_tx) = spawn_gated_server(
+        perform_server_upgrade_durable,
+        Some((QWP_STATUS_SCHEMA_MISMATCH, b"bad schema")),
+    );
+    let conf = format!("ws::addr=127.0.0.1:{port};request_durable_ack=on;");
+    let mut sender = SenderBuilder::from_conf(conf).unwrap().build().unwrap();
+
+    let mut buf = sender.new_buffer();
+    buf.table("trades")
+        .unwrap()
+        .column_i64("qty", 1)
+        .unwrap()
+        .at_now()
+        .unwrap();
+    let fsn = sender.flush_and_get_fsn(&mut buf).unwrap().unwrap();
+    frame_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    assert_eq!(
+        sender
+            .completed_fsn(crate::ingress::AckLevel::Durable)
+            .unwrap(),
+        None
+    );
+
+    reject_tx.send(()).unwrap();
+    let mut polled = None;
+    assert!(
+        wait_until(Duration::from_secs(5), || {
+            polled = sender
+                .completed_fsn(crate::ingress::AckLevel::Durable)
+                .err();
+            polled.is_some()
+        }),
+        "the durable poll must surface the terminal rejection"
+    );
+    let polled = polled.unwrap();
+    assert_eq!(polled.code(), ErrorCode::ServerRejection);
+    assert_eq!(
+        polled.qwp_ws_rejection().map(|error| error.category),
+        Some(QwpWsErrorCategory::SchemaMismatch)
+    );
+    assert_eq!(
+        sender.acked_fsn().unwrap_err().code(),
+        ErrorCode::ServerRejection
+    );
+    assert_eq!(
+        sender
+            .completed_fsn(crate::ingress::AckLevel::Ok)
+            .unwrap_err()
+            .code(),
+        ErrorCode::ServerRejection
+    );
+
+    let qwp_error = sender.poll_qwp_ws_error().unwrap().unwrap();
+    assert_eq!(qwp_error.category, QwpWsErrorCategory::SchemaMismatch);
+    assert_eq!(qwp_error.applied_policy, QwpWsErrorPolicy::Terminal);
+    assert_eq!(qwp_error.from_fsn, fsn);
 }
 
 /// Manual progress mode has no separate OK tracker, so `Ok` does not become
