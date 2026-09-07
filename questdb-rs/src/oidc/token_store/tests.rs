@@ -50,6 +50,19 @@ fn test_token() -> PersistedToken {
     )
 }
 
+fn assert_lock_released(lock: &Path, message: &str) {
+    assert_eq!(
+        std::fs::read(lock).unwrap(),
+        b"",
+        "{message}: released inode was not empty"
+    );
+    assert!(
+        steal_if_stale(lock, DEFAULT_LOCK_STALE, EMPTY_LOCK_GRACE),
+        "{message}: released inode was not immediately reclaimable"
+    );
+    assert!(!lock.exists(), "{message}: reclaim left the lock behind");
+}
+
 fn multiscope_key(issuer: Option<&str>) -> TokenStoreKey {
     TokenStoreKey::from_config(
         "questdb",
@@ -983,10 +996,7 @@ fn stale_java_directory_lock_is_reclaimed() {
     drop(file);
 
     assert!(store.load(&test_key()).unwrap().is_none());
-    assert!(
-        !lock.exists(),
-        "abandoned Java .store.lock was not reclaimed"
-    );
+    assert_lock_released(&lock, "abandoned Java .store.lock was not reclaimed");
 }
 
 #[test]
@@ -1001,10 +1011,7 @@ fn empty_java_directory_lock_is_reclaimed_after_the_shared_grace() {
     drop(file);
 
     assert!(store.load(&test_key()).unwrap().is_none());
-    assert!(
-        !lock.exists(),
-        "abandoned empty Java .store.lock was not reclaimed"
-    );
+    assert_lock_released(&lock, "abandoned empty Java .store.lock was not reclaimed");
 }
 
 #[test]
@@ -1089,31 +1096,42 @@ fn with_lock_timings_clamps_acquire_budget() {
 
 #[cfg(unix)]
 #[test]
-fn release_lock_removes_our_own_lock() {
+fn release_lock_marks_our_inode_immediately_reclaimable() {
     let dir = TempDir::new().unwrap();
     let lock = dir.path().join("y.lock");
     let ours = holder_bytes().unwrap();
-    create_lock_file(&lock, &ours).unwrap();
-    release_lock(&lock, &ours);
-    assert!(!lock.exists(), "release must remove a lock we still own");
+    let file = create_lock_file_handle(&lock, &ours).unwrap();
+    release_lock(&file);
+
+    assert_eq!(
+        std::fs::read(&lock).unwrap(),
+        b"",
+        "release must empty the inode acquired by this holder"
+    );
+    assert!(
+        steal_if_stale(&lock, DEFAULT_LOCK_STALE, EMPTY_LOCK_GRACE),
+        "the released inode must be reclaimable without waiting for the stale lease"
+    );
+    assert!(!lock.exists());
 }
 
 #[cfg(unix)]
 #[test]
 fn release_lock_leaves_a_successor_lock() {
-    // If our lock is stolen and a peer recreates it (a different inode), releasing
-    // our now-orphaned handle must NOT delete the peer's live lock — deleting by
-    // path alone would break mutual exclusion.
+    // If our lock is stolen and a peer recreates it (a different inode), release
+    // must touch only our retained handle, never the canonical path now owned by
+    // the peer.
     let dir = TempDir::new().unwrap();
     let lock = dir.path().join("z.lock");
     let ours = holder_bytes().unwrap();
-    create_lock_file(&lock, &ours).unwrap();
+    let ours_file = create_lock_file_handle(&lock, &ours).unwrap();
     std::fs::remove_file(&lock).unwrap(); // steal: our inode is now orphaned
     create_lock_file(&lock, "java-peer-stamp").unwrap();
-    release_lock(&lock, &ours);
-    assert!(
-        lock.exists(),
-        "release deleted the peer's successor lock (by-path unlink)"
+    release_lock(&ours_file);
+    assert_eq!(
+        std::fs::read_to_string(&lock).unwrap(),
+        "java-peer-stamp",
+        "release modified the peer's successor lock"
     );
 }
 
@@ -1275,8 +1293,7 @@ fn in_lock_runs_action_and_releases() {
         })
         .unwrap();
     assert!(ran.load(Ordering::SeqCst));
-    // The lock file is released (deleted) after in_lock returns.
-    assert!(!store.lock_file(&key).exists(), "lock not released");
+    assert_lock_released(&store.lock_file(&key), "lock not released");
 }
 
 #[test]
@@ -1291,7 +1308,7 @@ fn save_reuses_a_lock_already_held_by_the_current_action() {
         .unwrap();
 
     assert!(store.load(&key).unwrap().is_some());
-    assert!(!store.lock_file(&key).exists(), "lock was not released");
+    assert_lock_released(&store.lock_file(&key), "lock was not released");
 }
 
 #[test]
@@ -1450,7 +1467,7 @@ fn stale_java_identity_lock_is_reclaimed() {
         .unwrap();
 
     assert!(ran.load(Ordering::SeqCst));
-    assert!(!lock.exists(), "abandoned Java lock was not reclaimed");
+    assert_lock_released(&lock, "abandoned Java lock was not reclaimed");
 }
 
 #[test]
@@ -1476,9 +1493,9 @@ fn empty_java_identity_lock_is_reclaimed_after_the_shared_grace() {
         .unwrap();
 
     assert!(ran.load(Ordering::SeqCst));
-    assert!(
-        !lock.exists(),
-        "abandoned empty Java identity lock was not reclaimed"
+    assert_lock_released(
+        &lock,
+        "abandoned empty Java identity lock was not reclaimed",
     );
 }
 
@@ -1527,7 +1544,7 @@ fn in_lock_releases_during_unwind() {
     }));
 
     assert!(unwind.is_err());
-    assert!(!lock.exists(), "unwinding left the owned lock behind");
+    assert_lock_released(&lock, "unwinding left the owned lock behind");
     store.in_lock(&key, &mut || Ok(())).unwrap();
 }
 

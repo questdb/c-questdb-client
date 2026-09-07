@@ -67,7 +67,7 @@
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::fmt;
-use std::fs::{self, File, OpenOptions};
+use std::fs::{self, File, FileTimes, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -603,10 +603,10 @@ pub trait TokenStore: Send + Sync {
 /// `.untrusted`, tightened, and swept before its contents can be trusted.
 ///
 /// Per-identity refresh locks use `O_CREAT|O_EXCL`, bounded owner stamps,
-/// owner-verified release, and the shared capture-then-verify stale-lock recovery
-/// protocol. If one cannot be acquired within the configured budget, refresh
-/// continues using the atomic-file layer; a required directory-lock failure is
-/// returned.
+/// handle-bound release markers, and the shared capture-then-verify stale-lock
+/// recovery protocol. If one cannot be acquired within the configured budget,
+/// refresh continues using the atomic-file layer; a required directory-lock
+/// failure is returned.
 #[derive(Debug, Clone)]
 pub struct FileTokenStore {
     directory: PathBuf,
@@ -869,12 +869,9 @@ impl FileTokenStore {
             if cancelled() {
                 return Err(cancelled_error());
             }
-            match create_lock_file(lock, &stamp) {
-                Ok(()) => {
-                    return Ok(HeldLock {
-                        lock: lock.to_path_buf(),
-                        stamp,
-                    });
+            match create_lock_file_handle(lock, &stamp) {
+                Ok(file) => {
+                    return Ok(HeldLock { stamp, file });
                 }
                 Err(e)
                     if e.kind() == std::io::ErrorKind::AlreadyExists
@@ -1379,7 +1376,7 @@ fn temp_path(dir: &Path, hash: &str) -> PathBuf {
     dir.join(format!("{hash}.{}.{n}.{nanos}.tmp", std::process::id()))
 }
 
-fn create_lock_file(lock: &Path, stamp: &str) -> std::io::Result<()> {
+fn create_lock_file_handle(lock: &Path, stamp: &str) -> std::io::Result<File> {
     // The exclusive create is the acquisition. The file necessarily exists
     // empty for a tiny create-to-stamp window; the shared empty-lock grace is
     // what protects a creator paused in that window.
@@ -1391,7 +1388,12 @@ fn create_lock_file(lock: &Path, stamp: &str) -> std::io::Result<()> {
         opts.mode(0o600);
     }
     let mut f = opts.open(lock)?;
-    f.write_all(stamp.as_bytes())
+    f.write_all(stamp.as_bytes())?;
+    Ok(f)
+}
+
+fn create_lock_file(lock: &Path, stamp: &str) -> std::io::Result<()> {
+    create_lock_file_handle(lock, stamp).map(drop)
 }
 
 /// A failed `create_new` acquisition that reflects momentary contention rather than
@@ -1419,13 +1421,13 @@ fn is_transient_create_contention(_e: &std::io::Error) -> bool {
 /// section. In particular, unwinding through a user-provided `in_lock` action
 /// still runs the ownership-checked release.
 struct HeldLock {
-    lock: PathBuf,
     stamp: String,
+    file: File,
 }
 
 impl Drop for HeldLock {
     fn drop(&mut self) {
-        release_lock(&self.lock, &self.stamp);
+        release_lock(&self.file);
     }
 }
 
@@ -1535,13 +1537,18 @@ impl Drop for HeldLockScope {
     }
 }
 
-/// Delete the canonical lock only while it still carries our exact owner stamp.
-/// Java makes the same byte-for-byte check, so neither implementation can delete
-/// a successor created after a stale-lock handover.
-fn release_lock(lock: &Path, stamp: &str) {
-    if lock_is_owned(lock, stamp) {
-        let _ = fs::remove_file(lock);
-    }
+/// Mark the inode acquired by this holder as immediately stale without touching
+/// the canonical pathname. A path-based check followed by unlink is not atomic:
+/// a stale-lock contender can replace the pathname between those operations,
+/// causing the departing owner to delete the contender's successor lock.
+///
+/// Keeping the acquisition handle makes release identity-safe. If a contender
+/// already captured or deleted this inode, these writes affect only that orphaned
+/// inode. Otherwise the empty, epoch-dated canonical file is reclaimed through
+/// the ordinary cross-language capture-then-verify protocol on the next acquire.
+fn release_lock(file: &File) {
+    let _ = file.set_len(0);
+    let _ = file.set_times(FileTimes::new().set_modified(SystemTime::UNIX_EPOCH));
 }
 
 fn holder_bytes() -> std::io::Result<String> {
