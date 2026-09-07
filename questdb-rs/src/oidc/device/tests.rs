@@ -1348,17 +1348,55 @@ fn groups_mode_preserves_scope_and_loads_java_store_entry() {
 }
 
 #[test]
-fn empty_scope_falls_back_to_openid() {
-    // An explicit empty scope is filtered (like audience), not sent verbatim.
-    let auth = OidcDeviceAuth::builder()
-        .client_id("questdb")
-        .device_authorization_endpoint("https://idp.example.com/device")
-        .token_endpoint("https://idp.example.com/token")
+fn empty_optional_overrides_are_rejected() {
+    let cases = [
+        (
+            "scope",
+            OidcDeviceAuth::builder()
+                .client_id("questdb")
+                .device_authorization_endpoint("https://idp.example.com/device")
+                .token_endpoint("https://idp.example.com/token")
+                .scope("")
+                .build(),
+        ),
+        (
+            "audience",
+            OidcDeviceAuth::builder()
+                .client_id("questdb")
+                .device_authorization_endpoint("https://idp.example.com/device")
+                .token_endpoint("https://idp.example.com/token")
+                .audience("")
+                .build(),
+        ),
+        (
+            "issuer",
+            OidcDeviceAuth::builder()
+                .client_id("questdb")
+                .device_authorization_endpoint("https://idp.example.com/device")
+                .token_endpoint("https://idp.example.com/token")
+                .issuer("")
+                .build(),
+        ),
+    ];
+
+    for (name, result) in cases {
+        let error = result.unwrap_err();
+        assert_eq!(error.kind(), OidcErrorKind::Config);
+        assert!(
+            error.message().contains(name) && error.message().contains("must not be empty"),
+            "unexpected {name} error: {error}"
+        );
+    }
+}
+
+#[test]
+fn empty_discovery_override_is_rejected_before_network_io() {
+    let error = OidcDeviceAuth::from_questdb("http://127.0.0.1:1")
         .scope("")
-        .interactive(false)
         .build()
-        .expect("build");
-    assert_eq!(auth.config().scope, "openid");
+        .unwrap_err();
+    assert_eq!(error.kind(), OidcErrorKind::Config);
+    assert!(error.message().contains("scope must not be empty"));
 }
 
 #[test]

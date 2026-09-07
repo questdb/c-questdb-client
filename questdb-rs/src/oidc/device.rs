@@ -221,17 +221,17 @@ impl OidcDeviceAuthBuilder {
         self
     }
 
-    /// Override the discovered scopes (space-separated). The configured value
-    /// is preserved exactly, including in groups mode, to match Java's token
-    /// requests and persisted-store identity. Request `openid` explicitly when
-    /// the identity provider requires it to issue an ID token.
+    /// Override the discovered scopes (space-separated). The value must be
+    /// non-empty and is preserved exactly, including in groups mode, to match
+    /// Java's token requests and persisted-store identity. Request `openid`
+    /// explicitly when the identity provider requires it to issue an ID token.
     pub fn scope(mut self, scope: impl Into<String>) -> Self {
         self.scope = Some(scope.into());
         self
     }
 
     /// Override the discovered OAuth `audience` (some IdPs, e.g. Auth0, require
-    /// it to mint a token QuestDB accepts).
+    /// it to mint a token QuestDB accepts). The value must be non-empty.
     pub fn audience(mut self, audience: impl Into<String>) -> Self {
         self.audience = Some(audience.into());
         self
@@ -248,7 +248,8 @@ impl OidcDeviceAuthBuilder {
     /// advertise the device-authorization endpoint (so it is discovered from the
     /// IdP), so a tampered `/settings` cannot redirect the credential requests.
     /// With [`OidcDeviceAuth::builder`], both explicitly configured credential
-    /// endpoints must be on this issuer's origin, matching the Java client.
+    /// endpoints must be on this issuer's origin, matching the Java client. The
+    /// value must be non-empty.
     pub fn issuer(mut self, issuer: impl Into<String>) -> Self {
         self.issuer = Some(issuer.into());
         self

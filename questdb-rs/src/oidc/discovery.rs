@@ -539,6 +539,19 @@ fn discover_from_idp(http: &HttpClient, issuer: &str) -> Result<serde_json::Valu
 /// left `None` is filled from QuestDB `/settings` and, as a last resort for the
 /// device endpoint, the IdP discovery document.
 pub(crate) fn resolve_config(http: &HttpClient, params: &DiscoveryParams) -> Result<OidcConfig> {
+    for (name, value) in [
+        ("client_id", params.client_id.as_deref()),
+        ("scope", params.scope.as_deref()),
+        ("audience", params.audience.as_deref()),
+        ("issuer", params.issuer.as_deref()),
+    ] {
+        if value == Some("") {
+            return Err(OidcError::config(format!(
+                "OIDC {name} must not be empty; provide a non-empty value or leave the override unset."
+            )));
+        }
+    }
+
     let mut cfg = serde_json::Value::Object(Default::default());
     if let Some(url) = params.questdb_url.as_deref() {
         let settings = http.get_json(&settings_url(url)?, params.allow_insecure)?;
@@ -552,11 +565,6 @@ pub(crate) fn resolve_config(http: &HttpClient, params: &DiscoveryParams) -> Res
     }
 
     let client_id = match params.client_id.clone() {
-        Some(client_id) if client_id.is_empty() => {
-            return Err(OidcError::config(
-                "OIDC client_id must not be empty; pass the IdP's registered client id.",
-            ));
-        }
         Some(client_id) => client_id,
         None => str_setting(cfg.get(K_CLIENT_ID)).ok_or_else(|| {
             OidcError::config(format!(
@@ -569,7 +577,6 @@ pub(crate) fn resolve_config(http: &HttpClient, params: &DiscoveryParams) -> Res
     let scope = params
         .scope
         .clone()
-        .filter(|s| !s.is_empty())
         .or_else(|| str_setting(cfg.get(K_SCOPE)))
         .unwrap_or_else(|| "openid".to_string());
     let groups_in_token = params
@@ -579,9 +586,8 @@ pub(crate) fn resolve_config(http: &HttpClient, params: &DiscoveryParams) -> Res
     let audience = params
         .audience
         .clone()
-        .filter(|a| !a.is_empty())
         .or_else(|| str_setting(cfg.get(K_AUDIENCE)));
-    let issuer = params.issuer.clone().filter(|s| !s.is_empty());
+    let issuer = params.issuer.clone();
 
     // Track provenance: caller-explicit endpoints are trusted; /settings ones
     // are only as trustworthy as the channel that delivered them.
@@ -609,10 +615,8 @@ pub(crate) fn resolve_config(http: &HttpClient, params: &DiscoveryParams) -> Res
     let endpoint_from_settings = token_from_settings || device_from_settings;
     let non_endpoint_from_settings = (params.client_id.is_none()
         && str_setting(cfg.get(K_CLIENT_ID)).is_some())
-        || (params.scope.as_deref().unwrap_or("").is_empty()
-            && str_setting(cfg.get(K_SCOPE)).is_some())
-        || (params.audience.as_deref().unwrap_or("").is_empty()
-            && str_setting(cfg.get(K_AUDIENCE)).is_some())
+        || (params.scope.is_none() && str_setting(cfg.get(K_SCOPE)).is_some())
+        || (params.audience.is_none() && str_setting(cfg.get(K_AUDIENCE)).is_some())
         || (params.groups_in_token.is_none() && cfg.get(K_GROUPS_IN_TOKEN).is_some());
     if let Some(url) = params.questdb_url.as_deref() {
         plaintext_settings_guard(

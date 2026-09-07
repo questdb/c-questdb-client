@@ -139,6 +139,9 @@ void questdb_oidc_builder_free(questdb_oidc_builder* builder);
         size_t value_len,                                                      \
         questdb_error** err_out)
 
+/** `client_id`, `scope`, `audience`, and `issuer` must be non-empty when set;
+ *  `questdb_oidc_builder_build` reports an OIDC configuration error otherwise.
+ */
 QUESTDB_OIDC_STRING_BUILDER_FN(questdb_oidc_builder_client_id);
 QUESTDB_OIDC_STRING_BUILDER_FN(questdb_oidc_builder_scope);
 QUESTDB_OIDC_STRING_BUILDER_FN(questdb_oidc_builder_audience);
