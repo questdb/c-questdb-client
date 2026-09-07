@@ -14,6 +14,8 @@ readonly PRESSURE_MODE="${QWP_WS_MEMORY_PRESSURE:-natural}"
 readonly RUN_COUNT="${QWP_WS_DIAGNOSTIC_RUNS:-3}"
 readonly FUZZ_SEED="0x268579c36b106b74"
 readonly BUILD_MODE_SEED="7856154056746654427"
+readonly SERVER_REVISION="12a33d651e51e2682e7a448c8db5168fc72dfad3"
+readonly FS_TRACE="${QWP_WS_FS_TRACE:-0}"
 
 if [[ "$(uname -s)" != "Darwin" ]]; then
     echo "This diagnostic harness must run on macOS." >&2
@@ -25,8 +27,26 @@ if [[ "$PRESSURE_MODE" != "natural" && "$PRESSURE_MODE" != "warn" ]]; then
     exit 2
 fi
 
+if [[ "$FS_TRACE" != "0" && "$FS_TRACE" != "1" ]]; then
+    echo "Unsupported QWP_WS_FS_TRACE=$FS_TRACE" >&2
+    exit 2
+fi
+
 cd "$ROOT_DIR" || exit 2
 mkdir -p "$DIAG_DIR"
+if [[ "$(git -C questdb rev-parse HEAD)" != "$SERVER_REVISION" ]]; then
+    echo "Diagnostic server revision must be $SERVER_REVISION" >&2
+    exit 2
+fi
+# Keep the original worker sizing and runtime. Do not quietly replay on a
+# different hosted-machine shape or a newer JDK after an image update.
+if [[ "$(sysctl -n hw.logicalcpu)" != "3" ||
+      "$(java -version 2>&1)" != *"25.0.3+9"* ]]; then
+    echo "Expected three CPUs and JDK 25.0.3+9; inspect the hosted image" >&2
+    sysctl hw.logicalcpu
+    java -version
+    exit 2
+fi
 
 snapshot_host() {
     local label="$1"
@@ -45,6 +65,7 @@ snapshot_host() {
         java -version
         git rev-parse HEAD
         git -C questdb rev-parse HEAD
+        echo "fs_trace=$FS_TRACE server_revision=$SERVER_REVISION"
         find questdb/core/target -maxdepth 1 -type f \
             -name 'questdb*-SNAPSHOT.jar' \
             -exec shasum -a 256 {} \;
@@ -55,6 +76,17 @@ monitor_pids=()
 pressure_pid_file=""
 trace_pid_file=""
 controller_pid=""
+watchdog_pid_file=""
+
+stop_watchdog() {
+    local pid
+    if [[ -n "$watchdog_pid_file" && -f "$watchdog_pid_file" ]]; then
+        pid="$(sed -n '1p' "$watchdog_pid_file")"
+        kill "$pid" 2>/dev/null || true
+        wait "$pid" 2>/dev/null || true
+    fi
+    watchdog_pid_file=""
+}
 
 stop_trace() {
     local pid
@@ -71,6 +103,7 @@ stop_trace() {
 # shellcheck disable=SC2329  # Invoked through the EXIT trap below.
 stop_monitors() {
     local pid
+    stop_watchdog
     stop_trace
     if [[ -n "$pressure_pid_file" && -f "$pressure_pid_file" ]]; then
         pid="$(sed -n '1p' "$pressure_pid_file")"
@@ -123,7 +156,10 @@ for run_number in $(seq 1 "$RUN_COUNT"); do
     server_pid_file="$run_dir/questdb.pid"
     pressure_pid_file="$run_dir/memory-pressure.pid"
     trace_pid_file="$run_dir/fs-usage.pid"
-    mkdir -p "$run_dir"
+    watchdog_pid_file="$run_dir/watchdog.pid"
+    # Keep Python store-and-forward buffers and JVM temporary files on the
+    # worker's real filesystem. Never inherit a possibly memory-backed /tmp.
+    mkdir -p "$run_dir/tmp"
 
     echo "=== run=$run_number pressure=$PRESSURE_MODE seed=$FUZZ_SEED "\
          "build_mode_seed=$BUILD_MODE_SEED "\
@@ -139,16 +175,29 @@ for run_number in $(seq 1 "$RUN_COUNT"); do
             sleep 0.1
         done
         server_pid="$(sed -n '1p' "$server_pid_file")"
-        # The diagnostic directory belongs to the build user; only fs_usage
-        # itself needs elevation, not this output redirection.
-        # shellcheck disable=SC2024
-        sudo -n fs_usage -w -f filesys "$server_pid" \
-            >"$run_dir/fs-usage.log" 2>&1 &
-        fs_usage_pid=$!
-        echo "$fs_usage_pid" >"$trace_pid_file"
-        sleep 1
-        if ! sudo -n kill -0 "$fs_usage_pid" 2>/dev/null; then
-            touch "$run_dir/fs-usage-helper-exited"
+        if [[ "$FS_TRACE" == "1" ]]; then
+            # Only the tracing replica pays continuous syscall-tracing cost.
+            # shellcheck disable=SC2024
+            sudo -n fs_usage -w -f filesys "$server_pid" \
+                >"$run_dir/fs-usage.log" 2>&1 &
+            fs_usage_pid=$!
+            echo "$fs_usage_pid" >"$trace_pid_file"
+            sleep 1
+            if ! sudo -n kill -0 "$fs_usage_pid" 2>/dev/null; then
+                touch "$run_dir/fs-usage-helper-exited"
+            fi
+        fi
+        python3 system_test/qwp_ws_watchdog.py --run-dir "$run_dir" \
+            >"$run_dir/watchdog-process.log" 2>&1 &
+        watchdog_pid=$!
+        echo "$watchdog_pid" >"$watchdog_pid_file"
+        for _ in $(seq 1 50); do
+            [[ -f "$run_dir/watchdog-ready" ]] && break
+            kill -0 "$watchdog_pid" 2>/dev/null || break
+            sleep 0.1
+        done
+        if [[ ! -f "$run_dir/watchdog-ready" ]]; then
+            touch "$run_dir/watchdog-helper-failed"
         fi
         if [[ "$PRESSURE_MODE" == "warn" ]]; then
             memory_pressure -l warn -s 300 \
@@ -178,10 +227,21 @@ for run_number in $(seq 1 "$RUN_COUNT"); do
     QWP_WS_FUZZ_READY_FILE="$ready_file" \
     QWP_WS_FUZZ_GO_FILE="$go_file" \
     QWP_WS_FUZZ_PID_FILE="$server_pid_file" \
+    QWP_WS_FUZZ_WATCHDOG_DIR="$run_dir" \
+    TMPDIR="$run_dir/tmp" \
         python3 system_test/test.py run --repo ./questdb \
             TestQwpWsFuzz.test_add_columns -v \
             2>&1 | tee -a "$DIAG_DIR/test.log"
     test_rc=${PIPESTATUS[0]}
+    if [[ ! -f "$run_dir/workload-finished" ||
+          -f "$run_dir/watchdog-helper-failed" ||
+          ! -s "$run_dir/heartbeat.jsonl" ||
+          ! -s "$run_dir/jvm-pauses.log" ||
+          -f "$run_dir/capture-error" ]]; then
+        echo "Incomplete onset diagnostics; inspect run=$run_number artifacts" \
+            | tee -a "$DIAG_DIR/test.log"
+        [[ "$test_rc" -ne 0 ]] || test_rc=2
+    fi
     if [[ "$test_rc" -eq 0 && \
           -f "$run_dir/memory-pressure-helper-exited" ]]; then
         echo "memory_pressure exited before the diagnostic gate" \
@@ -207,6 +267,18 @@ for run_number in $(seq 1 "$RUN_COUNT"); do
     fi
     wait "$controller_pid" 2>/dev/null || true
     controller_pid=""
+    # The watchdog normally exits after the workload-finished marker. Allow
+    # its in-flight probe to return, then detect an unexpected helper death.
+    for _ in $(seq 1 20); do
+        [[ -f "$run_dir/watchdog-stopped" ]] && break
+        sleep 0.1
+    done
+    if [[ ! -f "$run_dir/watchdog-stopped" ]] ||
+            ! grep -q '"event": "workload_finished"' "$run_dir/watchdog.jsonl"; then
+        echo "Watchdog did not observe workload completion" | tee -a "$DIAG_DIR/test.log"
+        [[ "$test_rc" -ne 0 ]] || test_rc=2
+    fi
+    stop_watchdog
     stop_trace
     if [[ -f "$pressure_pid_file" ]]; then
         pressure_pid="$(sed -n '1p' "$pressure_pid_file")"
@@ -219,6 +291,7 @@ for run_number in $(seq 1 "$RUN_COUNT"); do
     if [[ -f "$server_log" ]]; then
         cp "$server_log" "$run_dir/questdb-server.log"
     fi
+    cp build/questdb/repo/data/conf/server.conf "$run_dir/server.conf" || true
 
     echo "=== run=$run_number rc=$test_rc "\
          "finished=$(date -u '+%Y-%m-%dT%H:%M:%SZ') ===" \
@@ -226,6 +299,11 @@ for run_number in $(seq 1 "$RUN_COUNT"); do
 
     if [[ "$test_rc" -ne 0 ]]; then
         overall_rc="$test_rc"
+        break
+    fi
+    if [[ -f "$run_dir/capture-started" ]]; then
+        echo "Onset captured; ending this replica to inspect evidence" \
+            | tee -a "$DIAG_DIR/test.log"
         break
     fi
 done

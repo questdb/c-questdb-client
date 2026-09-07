@@ -160,6 +160,52 @@ class PrintLogTest(unittest.TestCase):
 
 class TimeoutDiagnosticsTest(unittest.TestCase):
 
+    def test_watchdog_request_does_not_block_on_http_or_dump(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            qdb = _make_fixture(tmp_dir)
+            with mock.patch.dict(fixture.os.environ, {
+                    'QWP_WS_FUZZ_DIAGNOSTICS': '1',
+                    'QWP_WS_FUZZ_WATCHDOG_DIR': tmp_dir}), \
+                    mock.patch.object(fixture.urllib.request, 'urlopen') as ping, \
+                    mock.patch.object(qdb, '_request_thread_dump') as dump:
+                qdb.capture_timeout_diagnostics('lookup timeout')
+            self.assertEqual(
+                (pathlib.Path(tmp_dir) / 'capture-request').read_text(),
+                'lookup timeout\n')
+            ping.assert_not_called()
+            dump.assert_not_called()
+
+    def test_teardown_waits_for_requested_capture(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            qdb = _make_fixture(tmp_dir)
+            directory = pathlib.Path(tmp_dir)
+            (directory / 'capture-request').touch()
+
+            def complete_capture(_seconds):
+                self.assertTrue((directory / 'workload-finished').exists())
+                (directory / 'capture-complete').touch()
+                (directory / 'watchdog-stopped').touch()
+
+            with mock.patch.dict(fixture.os.environ, {
+                    'QWP_WS_FUZZ_DIAGNOSTICS': '1',
+                    'QWP_WS_FUZZ_WATCHDOG_DIR': tmp_dir}), \
+                    mock.patch.object(fixture.time, 'sleep', complete_capture):
+                qdb.finish_fuzz_diagnostics()
+            self.assertTrue((directory / 'workload-finished').exists())
+
+    def test_teardown_wait_is_bounded_if_watchdog_dies(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            qdb = _make_fixture(tmp_dir)
+            directory = pathlib.Path(tmp_dir)
+            (directory / 'capture-request').touch()
+            with mock.patch.dict(fixture.os.environ, {
+                    'QWP_WS_FUZZ_DIAGNOSTICS': '1',
+                    'QWP_WS_FUZZ_WATCHDOG_DIR': tmp_dir}), \
+                    mock.patch.object(fixture.time, 'monotonic', side_effect=[0, 16]):
+                qdb.finish_fuzz_diagnostics()
+            self.assertTrue((directory / 'capture-error').exists())
+            self.assertTrue((directory / 'workload-finished').exists())
+
     @unittest.skipUnless(
         hasattr(signal, 'SIGQUIT'), 'SIGQUIT is POSIX-only')
     def test_probes_ping_and_requests_thread_dump(self):

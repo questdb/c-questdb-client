@@ -231,6 +231,21 @@ class AlterThreadTransientErrorTest(unittest.TestCase):
         self.assertIn('ALTER TABLE', observed[0])
         self.assertIn('TimeoutError: timed out', observed[0])
 
+    def test_real_list_columns_timeout_reaches_diagnostics(self):
+        observed = []
+        thread, counter, failures = self._make_thread(
+            AssertionError('ALTER must not execute'), observed.append)
+        case = system_test.TestQwpWsFuzz('test_add_columns')
+        thread._list_columns = case._list_columns
+        with mock.patch.object(system_test, 'sql_query',
+                               side_effect=TimeoutError('lookup timed out')):
+            self.assertFalse(thread._try_one_alter('weather0'))
+        self.assertEqual(counter[0], 0)
+        self.assertEqual(failures, [])
+        self.assertEqual(len(observed), 1)
+        self.assertIn("list_columns('weather0')", observed[0])
+        self.assertIn('lookup timed out', observed[0])
+
     def test_url_error_is_swallowed(self):
         self._assert_transient(urllib.error.URLError('Connection refused'))
 

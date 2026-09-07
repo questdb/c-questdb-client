@@ -398,16 +398,18 @@ stages:
               pathToPublish: $(Build.ArtifactStagingDirectory)/qdb-log-vs-master-$(Agent.OS).zip
               artifactName: qdb-log-vs-master-$(Agent.OS)
       - job: TestQwpWsFuzz
-        displayName: "QWP/WS add-columns filesystem diagnostics (macOS hosted)"
+        displayName: "QWP/WS add-columns onset diagnostics (macOS hosted)"
         condition: eq(variables['Build.SourceBranch'], variables['QWP_WS_DIAGNOSTIC_REF'])
         strategy:
           matrix:
             replica-a:
               imageName: "macOS-15-arm64"
               diagnosticReplica: "a"
+              diagnosticFsTrace: "0"
             replica-b:
               imageName: "macOS-15-arm64"
               diagnosticReplica: "b"
+              diagnosticFsTrace: "1"
         pool:
           vmImage: $(imageName)
         timeoutInMinutes: 90
@@ -419,6 +421,11 @@ stages:
           - template: templates/compile.yaml
           - template: templates/resolve_jdk25.yaml
           - template: templates/clone_questdb.yaml
+            parameters:
+              # Original build 266336 task log 122 prints this build hash.
+              revision: 12a33d651e51e2682e7a448c8db5168fc72dfad3
+          - bash: bash ci/prepare_qwp_ws_jdk.sh
+            displayName: "Pin original Temurin 25.0.3+9"
           - template: templates/maven_settings.yaml
           - task: Maven@3
             displayName: "Compile QuestDB"
@@ -435,6 +442,7 @@ stages:
               QWP_WS_DIAGNOSTICS_DIR: >-
                 $(Build.ArtifactStagingDirectory)/qwp-ws-macos-diagnostics
               QWP_WS_MEMORY_PRESSURE: natural
+              QWP_WS_FS_TRACE: $(diagnosticFsTrace)
           - task: PublishBuildArtifacts@1
             displayName: "Publish macOS host diagnostics"
             condition: always()

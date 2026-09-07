@@ -2460,6 +2460,7 @@ class TestQwpWsFuzz(QwpWsTestSupport, unittest.TestCase):
 
     def tearDown(self):
         if isinstance(QDB_FIXTURE, QuestDbFixture) and QDB_FIXTURE._proc:
+            QDB_FIXTURE.finish_fuzz_diagnostics()
             for name in self._created_tables:
                 self._drop_table_if_exists(name)
             QDB_FIXTURE.http_sql_query(
@@ -2485,10 +2486,9 @@ class TestQwpWsFuzz(QwpWsTestSupport, unittest.TestCase):
         sys.stderr.flush()
 
     def _list_columns(self, table_name: str):
-        try:
-            resp = sql_query(f'SHOW COLUMNS FROM \'{table_name}\'')
-        except Exception:
-            return []
+        # AlterThread already tolerates lookup failures and reports transient
+        # ones to diagnostics. Swallowing here hid SHOW COLUMNS stalls.
+        resp = sql_query(f'SHOW COLUMNS FROM \'{table_name}\'')
         cols = resp.get('columns') or []
         dataset = resp.get('dataset') or []
         name_idx = type_idx = None
