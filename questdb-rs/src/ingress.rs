@@ -1004,7 +1004,11 @@ impl SenderBuilder {
     /// `sf_max_segment_bytes` defaults to 4 MiB. Smaller disk-backed segments
     /// release acknowledged space more granularly, but rotate more often and
     /// therefore increase crash-consistency synchronization and file-operation
-    /// overhead.
+    /// overhead. When `sf_max_total_bytes` is unset it defaults per sender to
+    /// the larger of 128 MiB and five segments without `sf_dir` (the in-memory
+    /// split-commit valve needs that headroom), and to the larger of 10 GiB
+    /// and two segments with `sf_dir`; a large `sf_max_segment_bytes` therefore
+    /// raises the in-memory budget.
     ///
     /// You can also load the configuration from an environment variable. See
     /// [`SenderBuilder::from_env`].

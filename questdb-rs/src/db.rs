@@ -735,6 +735,17 @@ impl QuestDb {
     /// source, not retried in place.
     /// In-memory store-and-forward (no `sf_dir`) has no cross-restart durability.
     ///
+    /// # Oversize chunks
+    ///
+    /// A chunk too large for one frame is split into several frames and may
+    /// be committed in more than one server transaction: always once per
+    /// frame with `sf_dir`; without `sf_dir` normally once, at its last frame,
+    /// but earlier if the sender's queue byte budget is tight. Do not rely on
+    /// oversize-chunk atomicity. Without `sf_dir` the server also withholds
+    /// the acks of the chunk's earlier frames until its committing frame
+    /// lands, so a `wait` no-progress deadline sees no watermark movement for
+    /// the whole chunk; size the timeout for the largest chunk you flush.
+    ///
     pub fn connect(conf: &str) -> Result<Self> {
         Self::connect_with_handlers(conf, ConnectHandlers::default())
     }
@@ -1740,7 +1751,10 @@ impl<'a> BorrowedSender<'a> {
     /// this call's wait is bounded by the pool-wide `request_timeout` setting
     /// (the no-progress timeout fires when the ack watermark stops advancing
     /// for that long); compose the two calls yourself to choose the timeout
-    /// per call.
+    /// per call. Without `sf_dir`, an oversize chunk's split frames are acked
+    /// only once its committing frame lands, so the watermark does not move
+    /// mid-chunk: a chunk that takes longer than `request_timeout` to deliver
+    /// times out here even though delivery is progressing.
     ///
     /// `AckLevel::Durable` requires QuestDB Enterprise and a pool opened with
     /// `request_durable_ack=on`; otherwise the call is rejected up front
@@ -1770,7 +1784,9 @@ impl<'a> BorrowedSender<'a> {
     /// success means the frame was accepted locally, not that the server has
     /// ACKed it. If the chunk is split into multiple frames, the returned FSN
     /// is the final frame boundary; cumulative ACK coverage of that boundary
-    /// covers the whole chunk. Use [`Self::wait`] when you only need a simple
+    /// covers the whole chunk. Without `sf_dir` the split commits once at that
+    /// frame (earlier if the queue byte budget is tight); with `sf_dir` each
+    /// frame commits on its own. Use [`Self::wait`] when you only need a simple
     /// blocking barrier for everything published so far. Treat the returned
     /// FSN as meaningful only with this sender stream while this borrow is
     /// held.
@@ -1817,6 +1833,9 @@ impl<'a> BorrowedSender<'a> {
     /// error; the frames remain queued and the background runner keeps
     /// delivering them, so recover by calling `wait()` again until it returns
     /// `Ok` — not by re-flushing, which would deliver the same rows twice.
+    /// Without `sf_dir`, an oversize chunk's split frames are acked only once
+    /// its committing frame lands, so the watermark does not move mid-chunk;
+    /// size `timeout` for the largest chunk flushed.
     pub fn wait(&mut self, ack_level: AckLevel, timeout: Duration) -> Result<()> {
         self.0.inner_mut().wait(ack_level, timeout)
     }

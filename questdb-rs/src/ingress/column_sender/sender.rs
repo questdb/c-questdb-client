@@ -852,6 +852,10 @@ impl PooledSenderCore {
     /// `Duration::ZERO` waits indefinitely. On expiry it returns a
     /// [`ErrorCode::FailoverRetry`](crate::ErrorCode::FailoverRetry)
     /// error and the queued frames are retained for replay.
+    ///
+    /// Without `sf_dir`, an oversize chunk's split frames are acked only once
+    /// its committing frame lands, so the watermark — and this deadline — do
+    /// not advance mid-chunk. Size `timeout` for the largest chunk flushed.
     pub fn wait(&mut self, ack_level: AckLevel, timeout: Duration) -> Result<()> {
         self.backend.wait(ack_level, timeout)
     }
