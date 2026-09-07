@@ -91,6 +91,14 @@ pub use db::BorrowedDirectColumnSender;
 #[cfg(all(feature = "sync-sender-qwp-ws", feature = "_egress"))]
 pub use db::BorrowedReader;
 
+// Owned (lifetime-free) counterpart to `BorrowedReader`, entered via
+// `QuestDb::take_reader`. Unlike the FFI escape-hatch surface below, this is
+// a fully public, semver-stable type: normal Rust callers that need a
+// pool-backed reader without a borrow's lifetime (e.g. to move it into a
+// struct or across a thread boundary) use it directly.
+#[cfg(all(feature = "sync-sender-qwp-ws", feature = "_egress"))]
+pub use db::OwnedReader;
+
 // FFI escape-hatch surface. Hidden and not semver-stable: it exists so the
 // `questdb-rs-ffi` C-ABI crate can borrow owned (lifetime-free) pool handles
 // that C / Python cannot express as Rust lifetimes. Normal Rust users borrow

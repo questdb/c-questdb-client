@@ -1314,14 +1314,26 @@ impl QuestDb {
         Ok(BorrowedReader::new(self, reader))
     }
 
-    /// FFI escape hatch: borrow a reader from the egress pool.
+    /// Check out a reader that owns its pool slot.
+    ///
+    /// Unlike [`Self::borrow_reader`], the returned [`OwnedReader`] carries
+    /// no lifetime, so it can be moved into a struct, returned across an FFI
+    /// boundary, or parked in a `Box<dyn ..>`. It returns itself to the pool
+    /// when dropped.
+    #[cfg(feature = "_egress")]
+    pub fn take_reader(&self) -> crate::error::Result<OwnedReader> {
+        self.borrow_reader_owned()
+    }
+
+    /// Escape hatch backing both [`Self::take_reader`] and the C FFI: borrow
+    /// a reader from the egress pool.
     ///
     /// Same shape as [`Self::borrow_sender_owned`] but pulls a
     /// [`Reader`] from the reader free list (lazily opens one if the
     /// free list is empty and total < `query_pool_max`). Returned via
     /// [`OwnedReader`]'s Drop: see the sender variant for the same
     /// pattern.
-    #[cfg(all(feature = "_egress", feature = "ffi-support"))]
+    #[cfg(feature = "_egress")]
     pub(crate) fn borrow_reader_owned(&self) -> crate::error::Result<OwnedReader> {
         let reader = self.pick_reader()?;
         Ok(OwnedReader {
@@ -2433,26 +2445,31 @@ impl Drop for BorrowedReader<'_> {
     }
 }
 
-/// Owned (lifetime-free) variant of a borrowed reader used by the C FFI.
+/// Owned (lifetime-free) variant of a borrowed reader.
 ///
-/// Holds an `Arc<DbInner>` for the same reason [`OwnedSender`] does: the
-/// C ABI can free its `questdb_db*` pointer before dropping outstanding
-/// reader handles. After pool close, returned readers are dropped instead of
-/// recycled.
+/// The pool-backed counterpart to [`BorrowedReader`]: it carries no
+/// lifetime, so it can be moved into a struct, returned across an FFI
+/// boundary, or parked in a `Box<dyn ..>`. Construct one via
+/// [`QuestDb::take_reader`].
+///
+/// Holds an `Arc<DbInner>` for the same reason `OwnedSender` (the FFI's
+/// analogous owned-sender handle) does: a holder can outlive (or be dropped
+/// after) the `QuestDb` it came from.
+/// After pool close, returned readers are dropped instead of recycled.
 ///
 /// `must_close` short-circuits the return path: when set, the reader is
 /// dropped instead of being returned to the pool. Pool shutdown has the same
 /// effect. The egress-side
 /// cursor lifecycle uses this to force-close readers whose underlying
 /// transport has been torn down by a mid-stream cursor drop.
-#[cfg(all(feature = "_egress", feature = "ffi-support"))]
+#[cfg(feature = "_egress")]
 pub struct OwnedReader {
     inner: Arc<DbInner>,
     reader: Option<Reader>,
     must_close: bool,
 }
 
-#[cfg(all(feature = "_egress", feature = "ffi-support"))]
+#[cfg(feature = "_egress")]
 impl OwnedReader {
     /// Inspect the wrapped reader without taking ownership.
     pub fn get(&self) -> &Reader {
@@ -2482,14 +2499,14 @@ impl OwnedReader {
     /// `in_use` counter — the caller has assumed responsibility for
     /// either dropping the returned `Reader` into oblivion (e.g.
     /// `qwp_reader_close`'s leak-on-active branch) or routing it
-    /// back to the pool via [`ReaderPoolHandle::return_reader`].
+    /// back to the pool via the FFI's reader-pool handle.
     /// Forgetting both permanently burns one pool slot.
     pub fn take(mut self) -> Option<Reader> {
         self.reader.take()
     }
 }
 
-#[cfg(all(feature = "_egress", feature = "ffi-support"))]
+#[cfg(feature = "_egress")]
 impl Drop for OwnedReader {
     fn drop(&mut self) {
         if let Some(reader) = self.reader.take() {
@@ -3257,6 +3274,13 @@ const _: fn() = || {
         fn assert_send<T: Send>() {}
         assert_send::<OwnedSender>();
         assert_send::<OwnedDirectColumnSender>();
+    }
+    // Downstream `RecordBatchReader + Send` claims depend on this: pin it
+    // as a compile-time regression check, not just an incidental property.
+    #[cfg(feature = "_egress")]
+    {
+        fn assert_send<T: Send>() {}
+        assert_send::<OwnedReader>();
     }
 };
 

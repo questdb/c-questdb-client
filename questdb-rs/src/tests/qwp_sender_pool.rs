@@ -7796,6 +7796,34 @@ mod reader_pool {
         assert_eq!(db.reader_in_use_count(), 2);
     }
 
+    /// `take_reader` is the public, lifetime-free entry point for a
+    /// pool-backed reader ([`crate::OwnedReader`]). Dropping it must return
+    /// the reader to the pool, or a driver that opens and closes connections
+    /// in a loop would exhaust the pool.
+    #[test]
+    fn take_reader_returns_to_the_pool_on_drop() {
+        let server = ReaderMockServer::spawn(8);
+        let db = QuestDb::connect(&conf_for(
+            server.port(),
+            "query_pool_max=1;acquire_timeout_ms=0;",
+        ))
+        .unwrap();
+
+        {
+            let reader = db.take_reader().expect("first checkout");
+            assert!(reader.get().server_info().is_some());
+            assert_eq!(db.reader_in_use_count(), 1);
+            assert_eq!(db.reader_free_count(), 0);
+        } // dropped here
+
+        assert_eq!(db.reader_in_use_count(), 0);
+        assert_eq!(db.reader_free_count(), 1, "a clean reader must be recycled");
+
+        // With query_pool_max=1 this only succeeds if the first reader went
+        // back to the pool on drop.
+        let _second = db.take_reader().expect("second checkout after drop");
+    }
+
     /// `drop_on_return` forces the reader to be dropped (not recycled) on
     /// return, so the next borrow opens a brand-new connection.
     #[test]
