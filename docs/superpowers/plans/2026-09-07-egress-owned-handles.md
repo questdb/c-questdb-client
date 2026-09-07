@@ -20,7 +20,7 @@
   - `cargo clippy --manifest-path questdb-rs/Cargo.toml --tests`
   and the same pair for `questdb-rs-ffi` when that crate is touched.
 - **No new dependencies** in `questdb-rs` or `questdb-rs-ffi`.
-- **No behaviour change on the borrowing path.** Tasks 1 and 2 must leave every existing test passing without modification. A test that needs editing to pass is a signal you changed behaviour — stop and report it.
+- **No behaviour change on the borrowing path.** Tasks 1 and 2 must leave every existing test passing with no change to any test's body or assertions. Task 1 necessarily edits `egress_failover.rs` to remove the harness it extracts, and to add the `mod`/`use` lines — that is expected. What is forbidden is altering what a test asserts. A test whose assertions need editing to pass is a signal you changed behaviour: stop and report it.
 - Working directory is the worktree `~/claude/wt/cqc/egress-owned-handles`, branch `design/egress-owned-handles`. Do not touch `/home/nick/repos/c-questdb-client`, which has an unrelated branch checked out.
 
 ## A note on how this plan specifies the refactor
@@ -48,7 +48,7 @@ cd ~/claude/wt/cqc/egress-owned-handles
 cargo test --manifest-path questdb-rs/Cargo.toml --test egress_failover 2>&1 | tail -3
 ```
 
-Expected: `test result: ok. 86 passed`. Write the exact number down — it is the acceptance criterion for this task and Task 2.
+Expected: a passing line. **On default features this measured `79 passed` on 2026-09-07** — that is the number to hold constant, not the count of `#[test]` attributes in the file (86), several of which are feature-gated. Record whatever your run reports; it is the acceptance criterion for this task and Task 2.
 
 - [ ] **Step 2: Move the harness into the new module**
 
@@ -76,11 +76,11 @@ cd ~/claude/wt/cqc/egress-owned-handles
 cargo test --manifest-path questdb-rs/Cargo.toml --test egress_failover 2>&1 | tail -3
 ```
 
-Expected: `test result: ok. 86 passed` — the same count as Step 1, with **no test edited**. If a test had to change, you changed behaviour: revert and redo the move faithfully.
+Expected: the same count as Step 1 (79 on default features), with **no test's body or assertions edited**. If a test had to change, you changed behaviour: revert and redo the move faithfully.
 
 - [ ] **Step 5: Confirm the module is genuinely reusable**
 
-Add a temporary second test file `questdb-rs/tests/qwp_mock_smoke.rs`:
+Add a second test file `questdb-rs/tests/qwp_mock_smoke.rs`. It is permanent — it is the harness's own regression guard, and the only thing that would catch the shared module silently becoming unusable from outside `egress_failover.rs`:
 
 ```rust
 #![cfg(feature = "sync-reader-qwp-ws")]
