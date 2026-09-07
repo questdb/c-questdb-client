@@ -605,8 +605,13 @@ pub trait TokenStore: Send + Sync {
 /// Per-identity refresh locks use `O_CREAT|O_EXCL`, bounded owner stamps,
 /// handle-bound release markers, and the shared capture-then-verify stale-lock
 /// recovery protocol. If one cannot be acquired within the configured budget,
-/// refresh continues using the atomic-file layer; a required directory-lock
-/// failure is returned.
+/// the refresh action is *not* run and the failure is returned to the caller.
+/// There is deliberately no unlocked fallback — see
+/// [`TokenStore::in_lock`] — because two processes submitting the same
+/// rotating parent token can make a reuse-detecting IdP revoke the whole token
+/// family; the atomic-file layer protects file integrity, not the
+/// single-consumer semantics of a refresh token. A required directory-lock
+/// failure is returned the same way.
 #[derive(Debug, Clone)]
 pub struct FileTokenStore {
     directory: PathBuf,
