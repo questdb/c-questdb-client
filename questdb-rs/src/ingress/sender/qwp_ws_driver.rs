@@ -2611,8 +2611,14 @@ pub(crate) fn reconnect_error_is_terminal(err: &Error) -> bool {
     }
     matches!(
         err.code(),
-        ErrorCode::InvalidApiCall
-            | ErrorCode::AuthError
+        // NB: `InvalidApiCall` is deliberately NOT here. The connection pool
+        // raises it for ordinary exhaustion, which is transient contention,
+        // and `db.rs`'s borrow-retry loops key on this predicate -- listing it
+        // made them give up on the first `acquire_timeout` expiry instead of
+        // retrying with backoff to the caller's budget. A provider contract
+        // violation reaches this set as `ConfigError` instead; see
+        // `classify_provider_error`.
+        ErrorCode::AuthError
             | ErrorCode::ConfigError
             | ErrorCode::ProtocolVersionError
             | ErrorCode::StoreResendRequired
@@ -4654,8 +4660,25 @@ mod tests {
             ))
         });
         let error = provider.bearer_header().unwrap_err();
-        assert_eq!(error.code(), ErrorCode::InvalidApiCall);
+        // Reclassified by `classify_provider_error` so it can be terminal
+        // without dragging every other `InvalidApiCall` with it.
+        assert_eq!(error.code(), ErrorCode::ConfigError);
         assert!(reconnect_error_is_terminal(&error));
+    }
+
+    #[test]
+    fn reconnect_error_is_terminal_retries_bare_invalid_api_call() {
+        // Pool exhaustion is `InvalidApiCall` and is transient contention that
+        // resolves when a peer returns its handle. `db.rs`'s
+        // `borrow_sender_owned_with_retry` / `reborrow_with_retry` key on this
+        // predicate, so listing the bare code made them give up on the first
+        // `acquire_timeout` expiry instead of retrying with backoff to the
+        // caller's budget.
+        let exhausted = Error::new(
+            ErrorCode::InvalidApiCall,
+            "Connection pool exhausted: 4 sender(s) in use at the sender_pool_max cap of 4",
+        );
+        assert!(!reconnect_error_is_terminal(&exhausted));
     }
 
     #[test]

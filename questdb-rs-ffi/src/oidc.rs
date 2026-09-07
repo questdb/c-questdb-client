@@ -247,6 +247,30 @@ impl SharedOidcAuth {
         )
     }
 
+    /// `callback_busy_error` for the `token()` acquisition path, which needs a
+    /// RETRYABLE class.
+    ///
+    /// `sign_in` and `clear` are direct user calls, so `InvalidApiCall` is
+    /// right for them and is what `oidc.h` documents. `token()` is different:
+    /// it is what an attached sender, reader or pool calls on a background
+    /// reconnect, and its result runs through `classify_provider_error`, whose
+    /// `InvalidApiCall` carve-out is terminal. A reconnect that merely landed
+    /// inside a renderer's paint -- a window that is live on every
+    /// `on_prompt` / `on_waiting` of a first sign-in, because there is no
+    /// cached token to serve -- therefore stopped reconnecting permanently and
+    /// terminalized a store-and-forward publication store with accepted frames
+    /// still queued. The condition clears as soon as the callback returns.
+    fn token_busy_error() -> Error {
+        Error::new(
+            ErrorCode::SocketError,
+            "OIDC authentication is busy: a sign-in prompt for this provider is being \
+             rendered on another thread and no valid cached token is available. The \
+             token will be requested again on the next attempt; acquire a token before \
+             starting an interactive sign-in to avoid the wait."
+                .to_string(),
+        )
+    }
+
     /// Reject an operation that would take the acquisition lock while a
     /// callback holds it.
     ///
@@ -297,7 +321,7 @@ impl SharedOidcAuth {
             return Err(if self.in_own_event_callback() {
                 Self::reentry_error()
             } else {
-                Self::callback_busy_error()
+                Self::token_busy_error()
             });
         }
         // OidcDeviceAuth::token is deliberately non-interactive. Every attached
@@ -1827,8 +1851,14 @@ mod tests {
         rejected: AtomicUsize,
         /// Refused as busy: a callback holds the lock on ANOTHER thread, so
         /// this caller would block behind it. It did not re-enter anything and
-        /// must not be told that it did.
+        /// must not be told that it did. `sign_in` / `clear` are direct user
+        /// calls and keep the `InvalidApiCall` the header documents.
         busy: AtomicUsize,
+        /// As `busy`, but from `token()`, which must be RETRYABLE: it is what a
+        /// sender/reader/pool calls on a background reconnect, and a terminal
+        /// class there stops the reconnect permanently over a condition that
+        /// clears when the callback returns.
+        busy_retryable: AtomicUsize,
         unexpected: AtomicUsize,
         closed_ok: AtomicUsize,
     }
@@ -1838,22 +1868,27 @@ mod tests {
         succeeded: bool,
         error: *mut questdb_error,
     ) {
-        let guard_message = (!succeeded
-            && !error.is_null()
-            && unsafe { crate::questdb_error_get_code(error) } as i32
-                == crate::line_sender_error_code::line_sender_error_invalid_api_call as i32)
-            .then(|| {
-                let mut len = 0;
-                let message = unsafe { crate::questdb_error_msg(error, &mut len) };
-                let message = unsafe { slice::from_raw_parts(message as *const u8, len) };
-                String::from_utf8_lossy(message).into_owned()
-            });
+        let code = (!succeeded && !error.is_null())
+            .then(|| unsafe { crate::questdb_error_get_code(error) } as i32);
+        let is_invalid_api_call =
+            code == Some(crate::line_sender_error_code::line_sender_error_invalid_api_call as i32);
+        let is_socket_error =
+            code == Some(crate::line_sender_error_code::line_sender_error_socket_error as i32);
+        let guard_message = (is_invalid_api_call || is_socket_error).then(|| {
+            let mut len = 0;
+            let message = unsafe { crate::questdb_error_msg(error, &mut len) };
+            let message = unsafe { slice::from_raw_parts(message as *const u8, len) };
+            String::from_utf8_lossy(message).into_owned()
+        });
         match guard_message.as_deref() {
-            Some(message) if message.contains("cannot be re-entered") => {
+            Some(message) if message.contains("cannot be re-entered") && is_invalid_api_call => {
                 state.rejected.fetch_add(1, Ordering::SeqCst);
             }
-            Some(message) if message.contains("is busy") => {
+            Some(message) if message.contains("is busy") && is_invalid_api_call => {
                 state.busy.fetch_add(1, Ordering::SeqCst);
+            }
+            Some(message) if message.contains("is busy") && is_socket_error => {
+                state.busy_retryable.fetch_add(1, Ordering::SeqCst);
             }
             _ => {
                 state.unexpected.fetch_add(1, Ordering::SeqCst);
@@ -2519,7 +2554,11 @@ mod tests {
             // own thread would. But the diagnostic is now thread-scoped: this
             // thread never entered a callback and must not be told it
             // re-entered one.
-            assert_eq!(state.busy.load(Ordering::SeqCst), 3);
+            // sign_in and clear keep the documented terminal InvalidApiCall;
+            // token's refusal is retryable so a background reconnect that
+            // merely landed inside a renderer's paint is not terminalized.
+            assert_eq!(state.busy.load(Ordering::SeqCst), 2);
+            assert_eq!(state.busy_retryable.load(Ordering::SeqCst), 1);
             assert_eq!(
                 state.rejected.load(Ordering::SeqCst),
                 0,

@@ -90,14 +90,23 @@ typedef struct questdb_oidc_event
  * concurrently by OIDC events.
  *
  * While the callback is running, `sign_in` and `clear` on an auth object
- * sharing this handler fail with `questdb_error_invalid_api_call`, as does
- * `token` when no valid cached token is available -- including token
- * acquisition through an attached sender, reader, or pool, which surfaces it
- * through that transport's provider-error path. `token` DOES succeed from a
- * valid cache: that path consults no lock the callback holds. The rejection
- * applies to any thread, not only the callback's own, because a callback may
- * dispatch to a worker and wait for it. Return from the callback before
- * starting another auth operation.
+ * sharing this handler fail with `questdb_error_invalid_api_call`.
+ *
+ * `token` also fails when no valid cached token is available -- including
+ * token acquisition through an attached sender, reader, or pool, which
+ * surfaces it through that transport's provider-error path -- but on ANOTHER
+ * thread it fails with the RETRYABLE `questdb_error_socket_error`, not
+ * `questdb_error_invalid_api_call`. The condition clears as soon as the
+ * callback returns, so a transport must retry rather than terminalize: a
+ * terminal class here stopped a background reconnect permanently and stranded
+ * a store-and-forward queue over a prompt that was still being painted. On the
+ * callback's OWN thread `token` still reports `questdb_error_invalid_api_call`,
+ * because that is a genuine re-entry the caller controls.
+ *
+ * `token` DOES succeed from a valid cache: that path consults no lock the
+ * callback holds. The rejection applies to any thread, not only the callback's
+ * own, because a callback may dispatch to a worker and wait for it. Return
+ * from the callback before starting another auth operation.
  *
  * The two cases are distinguished in the error message: a caller on the
  * callback's own thread is told it re-entered, while a caller on another thread

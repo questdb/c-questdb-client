@@ -74,10 +74,12 @@ impl TokenProvider {
     /// Provider acquisition and validation failures are normally retryable: the
     /// callback can return a different token on its next invocation, and a QWP
     /// store-and-forward sender must not abandon accepted frames because one
-    /// refresh attempt failed. `InvalidApiCall` is preserved because it denotes
-    /// a caller contract violation that retrying cannot repair. Server
-    /// authentication rejections remain separate terminal `AuthError`s because
-    /// they occur after this method succeeds.
+    /// refresh attempt failed. A caller contract violation (`InvalidApiCall`)
+    /// stays terminal but is carried out as `ConfigError`, so the bare code --
+    /// which the connection pool also uses for ordinary exhaustion -- is not
+    /// dragged into the terminal set with it. Server authentication rejections
+    /// remain separate terminal `AuthError`s because they occur after this
+    /// method succeeds.
     pub(crate) fn bearer_header(&self) -> crate::Result<String> {
         let provided = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.provide()))
             .map_err(|_| {
@@ -165,7 +167,7 @@ fn provider_shutdown_error() -> crate::Error {
 ///
 /// The exceptions are the failures for which "may recover on its next
 /// invocation" is false, which must stay terminal: a caller contract violation
-/// (`InvalidApiCall`), a permanently closed
+/// (`InvalidApiCall`, re-carried as `ConfigError`), a permanently closed
 /// provider (`close()` is monotonic, so `token()` returns `Cancelled` for the
 /// rest of the process) and a misconfiguration (`Config` — the configured scope
 /// cannot yield the required token kind, and no call inside this process
@@ -182,7 +184,19 @@ fn provider_shutdown_error() -> crate::Error {
 /// retrying is visible rather than silent.
 fn classify_provider_error(e: crate::Error) -> crate::Error {
     if e.code() == crate::ErrorCode::InvalidApiCall {
-        return e;
+        // Keep it terminal, but carry it as `ConfigError` rather than leaving
+        // `InvalidApiCall` for `reconnect_error_is_terminal` to match on.
+        // `InvalidApiCall` is not a provider-private code: the connection pool
+        // raises it for ordinary exhaustion ("Connection pool exhausted: N
+        // sender(s) in use at the sender_pool_max cap"), which is transient
+        // contention that resolves when a peer returns its handle. Adding the
+        // bare code to the terminal set therefore stopped
+        // `borrow_sender_owned_with_retry` and `reborrow_with_retry` retrying
+        // it at all -- they now returned on the first `acquire_timeout`
+        // expiry. `ConfigError` is already in that set, so a genuine provider
+        // contract violation stays terminal without the collateral.
+        let msg = format!("Token provider failed: {}", e.msg());
+        return e.reclassified(crate::ErrorCode::ConfigError, msg);
     }
     #[cfg(feature = "_oidc")]
     if e.oidc_error().is_some_and(|oidc| {
@@ -273,7 +287,13 @@ mod tests {
     }
 
     #[test]
-    fn invalid_api_call_provider_error_stays_terminal() {
+    fn invalid_api_call_provider_error_stays_terminal_as_config_error() {
+        // A provider contract violation must stay terminal, but it must NOT
+        // stay `InvalidApiCall`. That code is not provider-private: the
+        // connection pool raises it for ordinary exhaustion, so putting the
+        // bare code in `reconnect_error_is_terminal` stopped `db.rs`'s borrow
+        // retry loops retrying transient contention. Carry it as `ConfigError`,
+        // which is already in that terminal set.
         let provider = TokenProvider::new(|| {
             Err::<String, _>(crate::Error::new(
                 crate::ErrorCode::InvalidApiCall,
@@ -282,8 +302,8 @@ mod tests {
         });
 
         let err = provider.bearer_header().unwrap_err();
-        assert_eq!(err.code(), crate::ErrorCode::InvalidApiCall);
-        assert_eq!(err.msg(), "provider callback contract violated");
+        assert_eq!(err.code(), crate::ErrorCode::ConfigError);
+        assert!(err.msg().contains("provider callback contract violated"));
     }
 
     #[cfg(feature = "_oidc")]
