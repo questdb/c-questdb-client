@@ -819,7 +819,7 @@ impl Sender {
         if !request_durable_ack {
             return Err(error::fmt!(
                 InvalidApiCall,
-                "AckLevel::Durable requires the pool to be opened with \
+                "AckLevel::Durable requires a sender opened with \
                  `request_durable_ack=on` in the connect string."
             ));
         }
