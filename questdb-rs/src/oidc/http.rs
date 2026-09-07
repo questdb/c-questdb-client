@@ -158,6 +158,20 @@ impl HttpClient {
         let connector = TcpConnector::default().chain(TlsConnector::new(tls_config));
         let config = ureq::Agent::config_builder()
             .user_agent(USER_AGENT)
+            // `Config::default()` sets `proxy: Proxy::try_from_env()`, which
+            // reads ALL_PROXY / HTTPS_PROXY / HTTP_PROXY (and the lowercase
+            // spellings), first match winning regardless of target scheme. Our
+            // connector chain below is TcpConnector -> TlsConnector with no
+            // proxy connector, so a configured proxy made ureq hand
+            // `resolver.empty()` to TcpConnector and every request failed with
+            // a bare "Connection refused" without contacting anything --
+            // including the IdP, which a corporate NO_PROXY list never covers.
+            // Ignore proxies explicitly rather than half-honouring them. Real
+            // proxy support needs `ConnectProxyConnector` in the chain AND a
+            // decision about `OidcResolver`, which would then be resolving the
+            // proxy host rather than the target and so cannot enforce the
+            // plaintext-only-to-loopback rule as written.
+            .proxy(None)
             .no_delay(true)
             // We inspect the status ourselves (a 4xx token-endpoint reply carries
             // `authorization_pending` / `slow_down`), so don't turn it into an error.
