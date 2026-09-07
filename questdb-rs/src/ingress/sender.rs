@@ -683,8 +683,14 @@ impl Sender {
     /// dictionary base are inspected; tenant table and column data remain opaque.
     /// Validation happens before publication or socket I/O.
     ///
-    /// This has the same local-publication semantics as [`Sender::flush`]. Call
-    /// [`Sender::wait`] with [`AckLevel::Ok`] to wait for server acceptance.
+    /// This has the same local-publication semantics as [`Sender::flush`]: it
+    /// returns the frame's sequence number once the frame is accepted by the
+    /// local replay queue, before the server necessarily ACKs it. Unlike
+    /// [`Self::flush_and_get_fsn`] the FSN is not optional: a self-contained
+    /// frame is never empty, so every successful call publishes exactly one
+    /// frame. Keep the FSN to correlate this frame with [`Self::acked_fsn`] or
+    /// with the `from_fsn..=to_fsn` span of a [`QwpWsSenderError`], or call
+    /// [`Sender::wait`] with [`AckLevel::Ok`] to block for server acceptance.
     /// Relay is supported only by the default in-memory Store-and-Forward queue.
     /// A persistent/file-backed slot can outlive this sender's transient mode and
     /// is rejected before publication or I/O. A sender connection is either a
@@ -692,7 +698,7 @@ impl Sender {
     /// rejected because it can resolve symbol ids against the wrong connection
     /// dictionary.
     #[cfg(feature = "sync-sender-qwp-ws")]
-    pub fn flush_encoded(&mut self, frame: &[u8]) -> Result<()> {
+    pub fn flush_encoded(&mut self, frame: &[u8]) -> Result<u64> {
         if !is_self_contained(frame) {
             return Err(error::fmt!(
                 InvalidApiCall,
@@ -769,7 +775,7 @@ impl Sender {
                 self.connected = false;
             }
         }
-        result.map(|_| ())
+        result
     }
 
     /// Publish the QWP/WebSocket buffer and return the highest published frame

@@ -298,6 +298,26 @@ fn two_self_contained_frames_relay_verbatim_on_one_connection() {
     }
 }
 
+/// The FSN is allocated locally when the frame enters the replay queue, so
+/// this needs no server and nothing can race the assertions. Each relay frame
+/// gets its own consecutive FSN, and the returned value is the same watermark
+/// `published_fsn` reports while the sender is healthy.
+#[test]
+fn flush_encoded_returns_the_published_frame_sequence_number() {
+    let mut sender = connectionless_sender();
+
+    let first = sender
+        .flush_encoded(&self_contained_frame("alpha", 1))
+        .unwrap();
+    assert_eq!(sender.published_fsn().unwrap(), Some(first));
+
+    let second = sender
+        .flush_encoded(&self_contained_frame("beta", 2))
+        .unwrap();
+    assert_eq!(second, first + 1);
+    assert_eq!(sender.published_fsn().unwrap(), Some(second));
+}
+
 /// Allowing typed rows and independent base-0 dictionaries to share one
 /// connection can silently resolve a row frame's ids against relay symbols.
 #[test]
@@ -397,4 +417,56 @@ fn a_rejected_relay_flush_still_notifies_the_error_handler() {
         .expect("a rejected relay flush must hand the diagnostic to the error handler");
     assert_eq!(notified.category, QwpWsErrorCategory::ParseError);
     assert_eq!(notified.applied_policy, QwpWsErrorPolicy::Terminal);
+}
+
+/// A store-and-forward relay keeps each frame's FSN so it can map a later
+/// `QwpWsSenderError` span back to the frames it relayed. Once the runner
+/// latches terminal, `published_fsn` is gated behind the terminal error, so
+/// the FSN returned by `flush_encoded` is the only copy the caller can get.
+/// The FSN is captured from the synchronous return value before any I/O, so
+/// the bounded pump below only orders the terminal latch, not the FSN.
+#[test]
+fn flush_encoded_fsn_outlives_the_terminal_error_and_matches_the_error_span() {
+    let (port, _server) = spawn_rejecting_server();
+    let (error_tx, error_rx) = mpsc::channel();
+    let mut sender = SenderBuilder::new(Protocol::Ws, "127.0.0.1", port)
+        .qwp_ws_error_handler(move |error| {
+            let _ = error_tx.send(error.clone());
+        })
+        .unwrap()
+        .build()
+        .unwrap();
+
+    let fsn = sender
+        .flush_encoded(&self_contained_frame("alpha", 1))
+        .unwrap();
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while sender.qwp_ws_terminal_error().unwrap().is_none() {
+        assert!(
+            Instant::now() < deadline,
+            "the server rejection was not applied within 5s"
+        );
+        thread::sleep(Duration::from_millis(1));
+    }
+
+    // The watermark accessor is no substitute: it fails once terminal.
+    let err = sender.published_fsn().unwrap_err();
+    assert_eq!(err.code(), ErrorCode::ServerRejection, "got {err:?}");
+
+    // Drain the diagnostic to the handler through the relay-only path.
+    let err = sender
+        .flush_encoded(&self_contained_frame("beta", 2))
+        .unwrap_err();
+    assert_eq!(err.code(), ErrorCode::ServerRejection, "got {err:?}");
+
+    let notified = error_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("a rejected relay flush must hand the diagnostic to the error handler");
+    assert!(
+        (notified.from_fsn..=notified.to_fsn).contains(&fsn),
+        "relayed frame {fsn} is not covered by the rejected span {}..={}",
+        notified.from_fsn,
+        notified.to_fsn
+    );
 }
