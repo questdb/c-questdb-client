@@ -1686,15 +1686,51 @@ fn delete_capture(captured: &Path) {
 }
 
 /// Restore a captured peer lock without replacing a third party that claimed the
-/// canonical name. Hard-linking is the cross-language no-replace primitive; a
-/// plain rename is only a fallback for filesystems that do not support links.
+/// canonical name. Hard-linking is the cross-language no-replace primitive. On a
+/// filesystem that does not support links, first reserve the canonical name with
+/// an exclusive create, then replace only that reservation. A bare rename is not
+/// safe here because it replaces a successor that won the name after capture.
 fn restore_captured_lock(lock: &Path, captured: &Path) {
-    match fs::hard_link(captured, lock) {
+    restore_captured_lock_with(lock, captured, |source, destination| {
+        fs::hard_link(source, destination)
+    });
+}
+
+fn restore_captured_lock_with(
+    lock: &Path,
+    captured: &Path,
+    hard_link: impl FnOnce(&Path, &Path) -> std::io::Result<()>,
+) {
+    match hard_link(captured, lock) {
         Ok(()) => delete_capture(captured),
         Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => delete_capture(captured),
         Err(_) => {
-            if fs::rename(captured, lock).is_err() {
-                delete_capture(captured);
+            let Ok(reservation) = holder_bytes() else {
+                // Keep the capture: losing evidence of the displaced owner is
+                // safer than opening the name to an unlocked successor.
+                return;
+            };
+            match create_lock_file(lock, &reservation) {
+                Ok(()) => {
+                    // Cooperating contenders cannot replace this fresh lock. Check
+                    // ownership anyway so the rename never knowingly clobbers a
+                    // path that changed outside the lock protocol.
+                    if lock_is_owned(lock, &reservation) {
+                        let _ = fs::rename(captured, lock);
+                    }
+                    // Leave both the reservation and capture in place on failure.
+                    // The reservation blocks refresh until ordinary stale-lock
+                    // recovery can safely resolve the interrupted restoration.
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                    // A successor won the canonical name. Never replace it.
+                    delete_capture(captured);
+                }
+                Err(_) => {
+                    // Preserve the capture when the destination could not be
+                    // reserved. Retrying with a replacing rename would violate
+                    // the lock's single-owner contract.
+                }
             }
         }
     }

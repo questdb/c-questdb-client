@@ -1118,6 +1118,47 @@ fn release_lock_leaves_a_successor_lock() {
 }
 
 #[test]
+fn restore_without_hard_links_preserves_a_successor() {
+    let dir = TempDir::new().unwrap();
+    let lock = dir.path().join("restore.lock");
+    let captured = dir.path().join("restore.lock.capture");
+    std::fs::write(&captured, b"captured-peer").unwrap();
+
+    restore_captured_lock_with(&lock, &captured, |_, _| {
+        create_lock_file(&lock, "successor-peer")?;
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "hard links disabled by test",
+        ))
+    });
+
+    assert_eq!(
+        std::fs::read_to_string(&lock).unwrap(),
+        "successor-peer",
+        "fallback restoration replaced the successor lock"
+    );
+    assert!(!captured.exists());
+}
+
+#[test]
+fn restore_without_hard_links_reserves_an_unclaimed_name() {
+    let dir = TempDir::new().unwrap();
+    let lock = dir.path().join("restore.lock");
+    let captured = dir.path().join("restore.lock.capture");
+    std::fs::write(&captured, b"captured-peer").unwrap();
+
+    restore_captured_lock_with(&lock, &captured, |_, _| {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "hard links disabled by test",
+        ))
+    });
+
+    assert_eq!(std::fs::read_to_string(&lock).unwrap(), "captured-peer");
+    assert!(!captured.exists());
+}
+
+#[test]
 fn clear_removes_file_and_is_idempotent() {
     let dir = TempDir::new().unwrap();
     let store = FileTokenStore::at(dir.path());
