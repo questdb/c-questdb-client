@@ -2501,6 +2501,14 @@ impl OwnedReader {
     /// `qwp_reader_close`'s leak-on-active branch) or routing it
     /// back to the pool via the FFI's reader-pool handle.
     /// Forgetting both permanently burns one pool slot.
+    ///
+    /// Gated on `ffi-support`: the only supported way back into the pool,
+    /// [`ReaderPoolHandle::return_reader`], is itself `ffi-support`-gated, so
+    /// a plain Rust caller that could call `take` would have no supported
+    /// route to return the slot — it would just permanently burn it. Normal
+    /// Rust callers should use [`Self::get`] / [`Self::get_mut`] and let
+    /// `Drop` return the reader to the pool.
+    #[cfg(feature = "ffi-support")]
     pub fn take(mut self) -> Option<Reader> {
         self.reader.take()
     }
