@@ -3954,6 +3954,31 @@ mod tests {
         assert_eq!(queue.allocated_segment_bytes(), 96);
     }
 
+    /// The deferred-commit valve opens only with three segments of headroom
+    /// above what is allocated: the deferred frame's own rotation, the
+    /// committing frame's, and the hot spare the driver may install in
+    /// between. A fresh slot holds two (active + spare), so five segments is
+    /// the budget at which deferral first engages -- the floor
+    /// `QwpWsConfig::sf_max_total_bytes` derives.
+    #[test]
+    fn memory_queue_deferred_commit_headroom_needs_three_free_segments() {
+        const SEG: u64 = 48;
+        let queue = SfaFrameQueue::open_memory(memory_options(SEG, SEG as usize * 4)).unwrap();
+        assert_eq!(queue.allocated_segment_bytes(), SEG * 2);
+        assert!(
+            !queue.engine.has_deferred_commit_headroom(),
+            "four segments leave two free: the committing frame or the spare \
+             could take the last one, so the valve must stay shut"
+        );
+
+        let queue = SfaFrameQueue::open_memory(memory_options(SEG, SEG as usize * 5)).unwrap();
+        assert_eq!(queue.allocated_segment_bytes(), SEG * 2);
+        assert!(
+            queue.engine.has_deferred_commit_headroom(),
+            "five segments leave three free, exactly the reserve the valve needs"
+        );
+    }
+
     #[test]
     fn memory_queue_rotates_and_trims_without_filesystem_cleanup() {
         let mut queue = SfaFrameQueue::open_memory(memory_options(48, 96)).unwrap();

@@ -696,6 +696,7 @@ fn defer_aware_ack_rejecting(
     let _ = stream.set_read_timeout(Some(Duration::from_millis(50)));
     let mut frame_index: u64 = 0;
     let mut read = 0usize;
+    let mut rejected = false;
     loop {
         if stop.load(Ordering::SeqCst) {
             break;
@@ -706,6 +707,16 @@ fn defer_aware_ack_rejecting(
                     break;
                 }
                 if opcode != 0x2 {
+                    continue;
+                }
+                // Keep reading after the reject until the client hangs up.
+                // Dropping the socket with unread client data sends an RST,
+                // and on Windows an RST discards the buffered receive data,
+                // so the client could reconnect on plain EOF without ever
+                // parsing the reject. Frames pipelined behind the rejected
+                // one belong to this peer, not the replay, so they are drained
+                // without being captured.
+                if rejected {
                     continue;
                 }
                 let index = read;
@@ -727,7 +738,8 @@ fn defer_aware_ack_rejecting(
                     if let Some(tx) = capture.as_ref() {
                         let _ = tx.send(Vec::new());
                     }
-                    break;
+                    rejected = true;
+                    continue;
                 }
                 if !deferred && write_qwp_ok_response(stream, frame_index).is_err() {
                     break;
@@ -3495,7 +3507,24 @@ fn store_and_forward_mid_group_reject_recycles_instead_of_terminalizing() {
         &[server.port()],
         &format!("max_buf_size={CAP};pool_reap=manual;"),
     );
-    let db = QuestDb::connect(&conf).unwrap();
+    // The reject must be observed client-side, not inferred from the
+    // reconnect: an EOF-driven reconnect would pass every wire assertion
+    // below without the reject handler ever running.
+    let seen: Arc<std::sync::Mutex<Vec<crate::ingress::QwpWsSenderError>>> =
+        Arc::new(std::sync::Mutex::new(Vec::new()));
+    let seen_in_handler = Arc::clone(&seen);
+    let db = QuestDb::connect_with_handlers(
+        &conf,
+        crate::db::ConnectHandlers {
+            error_handler: Some(crate::ingress::QwpWsErrorHandler::new(
+                move |error: &crate::ingress::QwpWsSenderError| {
+                    seen_in_handler.lock().unwrap().push(error.clone());
+                },
+            )),
+            ..Default::default()
+        },
+    )
+    .unwrap();
 
     let qty: Vec<i64> = (0..ROWS as i64).collect();
     let ts: Vec<i64> = (0..ROWS as i64)
@@ -3511,6 +3540,24 @@ fn store_and_forward_mid_group_reject_recycles_instead_of_terminalizing() {
     sender.wait(AckLevel::Ok, Duration::from_secs(30)).expect(
         "a NOT_WRITABLE reject of a deferred frame that is not the group head \
          must recycle and replay, not raise a protocol violation",
+    );
+
+    assert!(
+        wait_until(Duration::from_secs(5), || db.rejection_events_delivered()
+            >= 1),
+        "the reject must reach the pool handler"
+    );
+    let rejection = seen
+        .lock()
+        .unwrap()
+        .iter()
+        .find(|error| error.category == crate::ingress::QwpWsErrorCategory::NotWritable)
+        .cloned()
+        .expect("the client must have parsed the NOT_WRITABLE reject, not just seen EOF");
+    assert_eq!(
+        rejection.applied_policy,
+        crate::ingress::QwpWsErrorPolicy::RetriableOther,
+        "a role-switch reject is a node-state verdict, never a poison strike"
     );
 
     // The mock marks the moment it rejects, so the replay boundary is read off
@@ -3985,19 +4032,14 @@ fn store_and_forward_split_floor_failure_in_leading_half_still_commits_the_prefi
     check_split_floor_failure_commits_prefix(SplitFloorShape::FailsInLeadingHalf, 32);
 }
 
-/// A slot persisted after a failed split must have nothing left to replay when
-/// it is reopened.
+/// Disk-mode twin of the split-floor tests: with `sf_dir` split deferral is
+/// gated off, so a failed split leaves only per-frame-committed frames behind,
+/// and a slot persisted after it has nothing left to replay when reopened.
 ///
-/// This is the end-to-end durability property the in-flush close buys: with
-/// `sf_dir`, a tail left deferred outlives the process, and every reopen
-/// replays it, gets no ack by design, and burns the whole drain timeout.
-///
-/// Note what this does NOT cover. `PooledSenderCore::close_open_deferred_group`
-/// is a second line of defence for the case where the in-flush close itself
-/// fails -- a concurrent `begin_close` rejects the publish, and that rejection
-/// is not one the flush-entry check catches. Disabling that hook leaves this
-/// test green, because the in-flush close already ran. Reaching the hook needs
-/// a close racing a split, which I could not produce deterministically.
+/// The gate is what this pins. A tail left deferred on disk would outlive the
+/// process, and every reopen would replay it, get no ack by design, and burn
+/// the whole drain timeout -- so the test asserts that nothing deferred was
+/// ever sent, not merely that something committed.
 #[test]
 fn store_and_forward_reopened_slot_has_nothing_to_replay_after_a_failed_split() {
     const CAP: usize = 2048;
@@ -4043,12 +4085,16 @@ fn store_and_forward_reopened_slot_has_nothing_to_replay_after_a_failed_split() 
     }
     const FLAG_DEFER_COMMIT: u8 = 0x01;
     assert!(
+        !captured.is_empty(),
+        "premise: the prefix before the irreducible block must reach the server"
+    );
+    assert!(
         captured
             .iter()
-            .any(|frame| frame[5] & FLAG_DEFER_COMMIT == 0),
-        "a committing frame must have closed the group before the queue was \
-         persisted; captured {} frame(s), all deferred",
-        captured.len()
+            .all(|frame| frame[5] & FLAG_DEFER_COMMIT == 0),
+        "with sf_dir nothing may defer: a deferred frame would outlive the \
+         process and replay forever; frame flags: {:?}",
+        captured.iter().map(|f| f[5]).collect::<Vec<_>>()
     );
     assert_eq!(
         replayed, None,
@@ -4140,6 +4186,11 @@ fn store_and_forward_split_floor_failure_without_deferral_publishes_no_extra_fra
         .flush(&mut chunk)
         .expect_err("the irreducible block must fail the flush");
     assert_eq!(err.code(), ErrorCode::BatchTooLarge);
+    assert!(
+        err.in_doubt(),
+        "the prefix reached the server even though nothing deferred, so the \
+         chunk must not be reported as safe to blind-retry"
+    );
     sender
         .wait(AckLevel::Ok, Duration::from_secs(30))
         .expect("the committed prefix must be acked");
@@ -4149,6 +4200,10 @@ fn store_and_forward_split_floor_failure_without_deferral_publishes_no_extra_fra
         captured.push(frame);
     }
     const FLAG_DEFER_COMMIT: u8 = 0x01;
+    assert!(
+        !captured.is_empty(),
+        "premise: the prefix before the irreducible block must reach the server"
+    );
     assert!(
         captured
             .iter()
@@ -4214,13 +4269,37 @@ fn check_split_floor_failure_commits_prefix(shape: SplitFloorShape, rows: usize)
     while let Ok(frame) = frames.recv_timeout(Duration::from_millis(500)) {
         captured.push(frame);
     }
+    assert_split_closed_by_empty_committing_frame(&captured);
+}
+
+/// The prefix must have gone out deferred and been closed by a header-only
+/// committing frame. A regression that re-published the prefix non-deferred
+/// (duplicating its rows) would satisfy a bare "some frame committed" check.
+fn assert_split_closed_by_empty_committing_frame(captured: &[Vec<u8>]) {
     const FLAG_DEFER_COMMIT: u8 = 0x01;
+    let table_count = |frame: &[u8]| u16::from_le_bytes([frame[6], frame[7]]);
     assert!(
         captured
             .iter()
-            .any(|frame| frame[5] & FLAG_DEFER_COMMIT == 0),
-        "a committing frame must close the group, got {} frame(s) all deferred",
-        captured.len()
+            .any(|frame| frame[5] & FLAG_DEFER_COMMIT != 0),
+        "premise: the prefix must have been published deferred; frame flags: {:?}",
+        captured.iter().map(|f| f[5]).collect::<Vec<_>>()
+    );
+    let closing = captured
+        .last()
+        .expect("the prefix before the irreducible block must reach the server");
+    assert_eq!(
+        closing[5] & FLAG_DEFER_COMMIT,
+        0,
+        "the last frame must be the committing one; frame flags: {:?}",
+        captured.iter().map(|f| f[5]).collect::<Vec<_>>()
+    );
+    assert_eq!(
+        table_count(closing),
+        0,
+        "the committing frame must be header-only, not a re-publish of the prefix; \
+         frame sizes: {:?}",
+        captured.iter().map(|f| f.len()).collect::<Vec<_>>()
     );
 }
 
@@ -7953,14 +8032,7 @@ fn store_and_forward_arrow_split_floor_failure_still_commits_the_deferred_prefix
     while let Ok(frame) = frames.recv_timeout(Duration::from_millis(500)) {
         captured.push(frame);
     }
-    const FLAG_DEFER_COMMIT: u8 = 0x01;
-    assert!(
-        captured
-            .iter()
-            .any(|frame| frame[5] & FLAG_DEFER_COMMIT == 0),
-        "a committing frame must close the group, got {} frame(s) all deferred",
-        captured.len()
-    );
+    assert_split_closed_by_empty_committing_frame(&captured);
 }
 
 #[cfg(feature = "arrow-ingress")]
