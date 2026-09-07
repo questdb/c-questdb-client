@@ -2302,7 +2302,14 @@ int64_t line_sender_now_micros(void);
 #define questdb_connection_event_failed_over 3u
 #define questdb_connection_event_endpoint_attempt_failed 4u
 #define questdb_connection_event_all_endpoints_unreachable 5u
+/** Terminal: the server rejected a credential the client presented.
+ *  `host` / `port` are set. */
 #define questdb_connection_event_auth_failed 6u
+/** Retryable: the token provider failed, so no credential was ever
+ *  offered and no endpoint was dialled. `host` / `port` are NULL.
+ *  The sender keeps reconnecting and store-and-forward keeps its
+ *  queued frames; only a foreground/initial connect fails fast. */
+#define questdb_connection_event_credential_unavailable 7u
 
 /** One connection-state transition. String fields are borrowed UTF-8
  * slices valid only for the duration of the callback; absent strings are

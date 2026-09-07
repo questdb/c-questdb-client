@@ -1471,6 +1471,7 @@ pub const questdb_connection_event_failed_over: u32 = 3;
 pub const questdb_connection_event_endpoint_attempt_failed: u32 = 4;
 pub const questdb_connection_event_all_endpoints_unreachable: u32 = 5;
 pub const questdb_connection_event_auth_failed: u32 = 6;
+pub const questdb_connection_event_credential_unavailable: u32 = 7;
 
 /// One connection-state transition, delivered to a
 /// `questdb_connection_event_cb`. String fields are borrowed UTF-8
@@ -1563,6 +1564,9 @@ pub(crate) fn connection_listener_from_c(
             }
             questdb::ingress::ConnectionEventKind::AuthFailed => {
                 questdb_connection_event_auth_failed
+            }
+            questdb::ingress::ConnectionEventKind::CredentialUnavailable => {
+                questdb_connection_event_credential_unavailable
             }
             _ => return,
         };

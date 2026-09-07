@@ -51,17 +51,36 @@ pub enum ConnectionEventKind {
     /// credential it was offered, and the owning sender/pool operation
     /// surfaces the error to the caller.
     ///
-    /// When `host` and `port` are `None` the credential was never offered to
-    /// anyone -- a token provider failed before any endpoint was dialled (see
-    /// `ConnectionEvents::token_provider_failed`). That is **retryable**:
-    /// `classify_provider_error` keeps such a failure a `SocketError` so the
-    /// store-and-forward drainer holds queued frames while a human signs in,
-    /// and the sender goes on reconnecting. A listener that pages, tears down
-    /// the pool, or exits on `AuthFailed` must gate on `host.is_some()`, or it
-    /// will fire on an ordinary silent-refresh blip. The `cause_code` tells the
-    /// two apart as well: `AuthError` for a rejection, `SocketError` for a
-    /// provider failure.
+    /// Always terminal, and always a credential the client DID present and the
+    /// server rejected. `host` and `port` are set. A listener may page, tear
+    /// down the pool, or exit on this without further qualification.
+    ///
+    /// A credential the client could not OBTAIN is
+    /// [`CredentialUnavailable`](Self::CredentialUnavailable), never this.
+    /// Mirrors the Java client, whose `AUTH_FAILED` is likewise unconditional
+    /// and whose cause is always a `QwpAuthFailedException`, distinct from its
+    /// `QwpCredentialUnavailableException`.
     AuthFailed,
+
+    /// The token provider failed, so no credential was ever offered to anyone
+    /// and the round ended without dialling an endpoint. `host` and `port` are
+    /// `None`; `cause_code` is the provider's classification, ordinarily
+    /// `SocketError`.
+    ///
+    /// **Retryable, and deliberately so.** `classify_provider_error` keeps such
+    /// a failure a `SocketError`, so the store-and-forward drainer holds queued
+    /// frames while the IdP recovers or a human signs in, and the sender goes
+    /// on reconnecting. Only a foreground/initial connect fails fast, because a
+    /// credential problem during initialization is the caller's to see.
+    ///
+    /// This is the counterpart of the Java client's
+    /// `QwpCredentialUnavailableException`: "a credential the client cannot
+    /// ACQUIRE is instead handled by connection phase, exactly like a transport
+    /// outage". It exists as its own kind so `AuthFailed` can stay
+    /// unconditionally terminal; folding the two together forced every listener
+    /// to gate on `host.is_some()` and made an ordinary silent-refresh blip
+    /// indistinguishable from a rejected credential.
+    CredentialUnavailable,
 }
 
 /// One connection-state transition. All `Option` fields are `None` when
@@ -479,16 +498,21 @@ impl ConnectionEventSource {
     /// A token provider (e.g. OIDC) failed before any endpoint was dialled, so
     /// the round ends without a connection.
     ///
-    /// Reported as an `AuthFailed` carrying no endpoint: the failure is the
-    /// credential, not a host, and nothing was contacted. Without this the
-    /// whole round is silent — the provider is resolved above the endpoint
-    /// loop, so neither `auth_failed` nor `all_endpoints_unreachable` is ever
-    /// reached, and a listener sees no event at all for a sender that is in
+    /// Reported as a `CredentialUnavailable` carrying no endpoint: the failure
+    /// is the credential, not a host, and nothing was contacted. Without an
+    /// event the whole round is silent — the provider is resolved above the
+    /// endpoint loop, so neither `auth_failed` nor `all_endpoints_unreachable`
+    /// is ever reached, and a listener sees nothing for a sender that is in
     /// fact reconnecting indefinitely.
+    ///
+    /// It is NOT an `AuthFailed`. That kind is terminal and means the server
+    /// rejected a credential we presented; this one is retryable and means we
+    /// never had one to present. The Java client draws the same line with two
+    /// exception types.
     pub(crate) fn token_provider_failed(&self, err: &crate::Error, attempt: u64) {
         self.failed_since_success.store(true, Ordering::Relaxed);
         self.offer(
-            ConnectionEvent::new(ConnectionEventKind::AuthFailed)
+            ConnectionEvent::new(ConnectionEventKind::CredentialUnavailable)
                 .attempt(attempt)
                 .caused_by(err),
         );
