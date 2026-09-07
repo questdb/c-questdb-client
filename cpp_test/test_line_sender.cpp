@@ -1544,8 +1544,13 @@ TEST_CASE("ILP rejects symbol after column")
     questdb::ingress::line_sender_buffer buffer = sender.new_buffer();
     buffer.table("test").column("t1", "v1");
 
-    CHECK_THROWS_AS(
-        buffer.symbol("t2", "v2"), questdb::ingress::line_sender_error);
+    CHECK_THROWS_WITH_AS(
+        buffer.symbol("t2", "v2"),
+        "State error: Bad call to `symbol`, ILP requires all symbols before "
+        "the row's first `column`; move the symbol earlier, or use a QWP "
+        "buffer, where symbols may follow columns. `column_str` is not "
+        "equivalent: it writes a VARCHAR, not a SYMBOL.",
+        questdb::ingress::line_sender_error);
 
     CHECK(!sender.must_close());
 
@@ -3491,6 +3496,17 @@ TEST_CASE("line_sender c++ qwp allows symbols after columns")
     CHECK(decoded.table_name == "trades");
     CHECK(decoded.row_count == 1);
     qwp_check_column_count(decoded, 4);
+    // `qwp_cell` resolves columns by name, so it would pass even if the client
+    // hoisted the symbols to the front. Pin the schema order explicitly.
+    REQUIRE(decoded.columns.size() == 4);
+    CHECK(decoded.columns[0].name == "qty");
+    CHECK(decoded.columns[1].name == "sym");
+    CHECK(decoded.columns[2].name == "active");
+    CHECK(decoded.columns[3].name == "venue");
+    qwp_check_column(decoded, "qty", qwp_test_type_long, false);
+    qwp_check_column(decoded, "sym", qwp_test_type_symbol, false);
+    qwp_check_column(decoded, "active", qwp_test_type_boolean, false);
+    qwp_check_column(decoded, "venue", qwp_test_type_symbol, false);
     qwp_expect_i64(qwp_cell(decoded, 0, "qty"), 4);
     qwp_expect_symbol(qwp_cell(decoded, 0, "sym"), "ETH-USD");
     qwp_expect_bool(qwp_cell(decoded, 0, "active"), true);

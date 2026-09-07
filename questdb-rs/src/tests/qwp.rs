@@ -737,6 +737,30 @@ fn qwp_udp_rejects_duplicate_entry_names_within_row() -> TestResult {
     Ok(())
 }
 
+/// Relaxed symbol ordering makes duplicate-name detection reachable through
+/// `symbol` as well. The two QWP transports deliberately differ here: this
+/// pins the QWP/UDP half, and
+/// `qwp_ws_columnar_duplicate_symbol_after_column_keeps_first_value` pins the
+/// QWP/WebSocket half, where the second write is silently dropped.
+#[test]
+fn qwp_udp_rejects_duplicate_symbol_after_column_within_row() -> TestResult {
+    let mock = QwpUdpMock::new()?;
+    let sender = mock.sender_builder().build()?;
+    let mut buffer = sender.new_buffer();
+
+    buffer
+        .table("trades")?
+        .symbol("sym", "ETH-USD")?
+        .column_i64("qty", 4)?;
+    assert_err_contains(
+        buffer.symbol("sym", "XNAS"),
+        ErrorCode::InvalidApiCall,
+        "column 'sym' already set for current row",
+    );
+
+    Ok(())
+}
+
 #[test]
 fn qwp_udp_rejects_ilp_buffer_with_qwp_sender() -> TestResult {
     let mock = QwpUdpMock::new()?;

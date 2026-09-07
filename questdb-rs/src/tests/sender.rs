@@ -335,6 +335,38 @@ fn ilp_buffer_check_can_flush_tracks_public_state_machine() -> TestResult {
     Ok(())
 }
 
+/// ILP keeps its strict symbol-before-column ordering even though QWP has
+/// relaxed it. This is the behavioural guard on the public `Buffer` API — the
+/// `OpState` unit tests exercise the state machine directly and would still
+/// pass if the ILP buffer were rewired to the relaxed check.
+#[test]
+fn ilp_buffer_rejects_symbol_after_column() -> TestResult {
+    let mut buffer = Buffer::new(ProtocolVersion::V3);
+
+    buffer.table("t")?.column_i64("q", 1)?;
+
+    let err = buffer.symbol("s", "v").unwrap_err();
+    assert_eq!(err.code(), ErrorCode::InvalidApiCall);
+    assert_eq!(
+        err.msg(),
+        concat!(
+            "State error: Bad call to `symbol`, ILP requires all symbols before ",
+            "the row's first `column`; move the symbol earlier, or use a QWP ",
+            "buffer, where symbols may follow columns. `column_str` is not ",
+            "equivalent: it writes a VARCHAR, not a SYMBOL."
+        )
+    );
+
+    // The rejected call wrote nothing: the row is still completable and the
+    // line carries only the column.
+    buffer.at_now()?;
+    assert_eq!(buffer.row_count(), 1);
+    let line = std::str::from_utf8(buffer.as_bytes())?.to_owned();
+    assert!(line.starts_with("t q=1i"), "unexpected line: {line:?}");
+
+    Ok(())
+}
+
 #[test]
 fn test_row_count() -> TestResult {
     let mut buffer = Buffer::new(ProtocolVersion::V2);

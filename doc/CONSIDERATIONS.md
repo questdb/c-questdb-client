@@ -113,7 +113,9 @@ timestamp ends a row. Prefer `SYMBOL` for frequently repeated categorical
 values and `STRING`/`VARCHAR` for free-form text. The QWP column APIs support a
 broader native type set, dictionary-encoded symbols, arrays, and Arrow/Polars
 paths; validate equal row counts and keep all borrowed input arrays alive until
-the flush returns.
+the flush returns. QWP treats symbols as ordinary typed columns, so — unlike
+ILP — a QWP row may interleave `symbol` and the other column calls in any order
+before the designated timestamp.
 
 Client-side validation failures are returned as Rust `Result` errors, C error
 out-pointers, or C++ exceptions. Server-side data errors follow the transport

@@ -48,7 +48,8 @@ pub enum ErrorCode {
     /// The host, port, or interface was incorrect.
     CouldNotResolveAddr,
 
-    /// Called methods in the wrong order. E.g. `symbol` after `column`.
+    /// Called methods in the wrong order. E.g. `symbol` after `column` on an
+    /// ILP buffer.
     InvalidApiCall,
 
     /// A network error connecting or flushing data out. **Transient** — obtain a

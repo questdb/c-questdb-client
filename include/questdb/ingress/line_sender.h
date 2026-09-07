@@ -87,7 +87,8 @@ typedef enum line_sender_error_code
     /** The host, port, or interface was incorrect. */
     line_sender_error_could_not_resolve_addr = 0,
 
-    /** Called methods in the wrong order. E.g. `symbol` after `column`. */
+    /** Called methods in the wrong order. E.g. `symbol` after `column` on an
+     * ILP buffer. */
     line_sender_error_invalid_api_call = 1,
 
     /** A network error connecting or flushing data out. */
