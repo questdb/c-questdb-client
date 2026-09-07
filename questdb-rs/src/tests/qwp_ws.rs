@@ -2137,14 +2137,26 @@ fn sender_completed_fsn_polls_terminal_reject_without_dispatching_handler() {
     assert_eq!(qwp_error.status, Some(QWP_STATUS_PARSE_ERROR));
     assert_eq!(qwp_error.from_fsn, fsn);
 
-    let err = sender
-        .wait(crate::ingress::AckLevel::Ok, Duration::from_secs(5))
-        .unwrap_err();
+    // The next flush is the dispatch point a polling caller reaches first;
+    // it must deliver the notification exactly once.
+    buf.table("trades")
+        .unwrap()
+        .column_i64("qty", 2)
+        .unwrap()
+        .at_now()
+        .unwrap();
+    let err = sender.flush(&mut buf).unwrap_err();
     assert_eq!(err.code(), ErrorCode::ServerRejection);
     let callback_error = error_rx.recv_timeout(Duration::from_secs(5)).unwrap();
     assert_eq!(callback_error.category, QwpWsErrorCategory::ParseError);
     assert_eq!(callback_error.applied_policy, QwpWsErrorPolicy::Terminal);
     assert_eq!(callback_error.from_fsn, fsn);
+
+    let err = sender
+        .wait(crate::ingress::AckLevel::Ok, Duration::from_secs(5))
+        .unwrap_err();
+    assert_eq!(err.code(), ErrorCode::ServerRejection);
+    assert_eq!(error_rx.try_recv(), Err(mpsc::TryRecvError::Empty));
 }
 
 /// A durable-ACK sender whose frame is rejected outright never receives a
