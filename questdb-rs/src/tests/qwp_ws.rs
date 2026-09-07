@@ -726,6 +726,30 @@ fn spawn_stalled_after_first_frame_server() -> (u16, mpsc::Receiver<Vec<u8>>, mp
     (port, frame_rx, release_tx)
 }
 
+fn spawn_gated_reject_server(
+    status: u8,
+    message: &'static [u8],
+) -> (u16, mpsc::Receiver<Vec<u8>>, mpsc::Sender<()>) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let (frame_tx, frame_rx) = mpsc::channel();
+    let (reject_tx, reject_rx) = mpsc::channel();
+
+    thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        perform_server_upgrade(&mut stream).unwrap();
+        let (_fin, _opcode, payload) = read_frame(&mut stream).unwrap();
+        frame_tx.send(payload).unwrap();
+
+        if reject_rx.recv_timeout(Duration::from_secs(5)).is_ok() {
+            let _ = write_qwp_error_response(&mut stream, status, FIRST_WIRE_SEQUENCE, message);
+        }
+        thread::sleep(Duration::from_millis(50));
+    });
+
+    (port, frame_rx, reject_tx)
+}
+
 fn spawn_delayed_durable_ack_server() -> (
     u16,
     mpsc::Receiver<Vec<u8>>,
@@ -2058,6 +2082,74 @@ fn sender_completed_fsn_rejects_durable_without_opt_in_like_wait() {
             progress.name()
         );
     }
+}
+
+/// The poll reports a terminal rejection but is not a dispatch point: the
+/// buffered diagnostic must survive it for the error handler, which only runs
+/// on `flush`, `flush_and_get_fsn`, `wait`, `drive_once` and `close_drain`.
+/// Background mode only: a manual sender observes the socket solely through
+/// `drive_once`, which dispatches in the same call, so nothing can be polled
+/// ahead of the handler there.
+#[test]
+fn sender_completed_fsn_polls_terminal_reject_without_dispatching_handler() {
+    let (port, frame_rx, reject_tx) =
+        spawn_gated_reject_server(QWP_STATUS_PARSE_ERROR, b"bad column");
+    let (error_tx, error_rx) = mpsc::channel();
+    let mut sender = SenderBuilder::new(Protocol::Ws, "127.0.0.1", port)
+        .qwp_ws_error_handler(move |error| {
+            error_tx.send(error.clone()).unwrap();
+        })
+        .unwrap()
+        .build()
+        .unwrap();
+
+    let mut buf = sender.new_buffer();
+    buf.table("trades")
+        .unwrap()
+        .column_i64("qty", 1)
+        .unwrap()
+        .at_now()
+        .unwrap();
+    let fsn = sender.flush_and_get_fsn(&mut buf).unwrap().unwrap();
+    frame_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+
+    // The rejection is gated until after publication, so the flush above
+    // cannot have dispatched it and polling is the only thing that observes it.
+    reject_tx.send(()).unwrap();
+    let mut polled = None;
+    assert!(
+        wait_until(Duration::from_secs(5), || {
+            polled = sender.completed_fsn(crate::ingress::AckLevel::Ok).err();
+            polled.is_some()
+        }),
+        "the poll must surface the terminal rejection"
+    );
+    let polled = polled.unwrap();
+    assert_eq!(polled.code(), ErrorCode::ServerRejection);
+    assert_eq!(
+        polled.qwp_ws_rejection().map(|error| error.category),
+        Some(QwpWsErrorCategory::ParseError)
+    );
+    assert_eq!(
+        error_rx.try_recv(),
+        Err(mpsc::TryRecvError::Empty),
+        "polling must not dispatch to the error handler"
+    );
+
+    let qwp_error = sender.poll_qwp_ws_error().unwrap().unwrap();
+    assert_eq!(qwp_error.category, QwpWsErrorCategory::ParseError);
+    assert_eq!(qwp_error.applied_policy, QwpWsErrorPolicy::Terminal);
+    assert_eq!(qwp_error.status, Some(QWP_STATUS_PARSE_ERROR));
+    assert_eq!(qwp_error.from_fsn, fsn);
+
+    let err = sender
+        .wait(crate::ingress::AckLevel::Ok, Duration::from_secs(5))
+        .unwrap_err();
+    assert_eq!(err.code(), ErrorCode::ServerRejection);
+    let callback_error = error_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    assert_eq!(callback_error.category, QwpWsErrorCategory::ParseError);
+    assert_eq!(callback_error.applied_policy, QwpWsErrorPolicy::Terminal);
+    assert_eq!(callback_error.from_fsn, fsn);
 }
 
 /// Manual progress mode has no separate OK tracker, so `Ok` does not become
