@@ -10456,11 +10456,14 @@ mod tests {
         // column mixes repeated values with fresh dictionary entries.
         fn write_row(buf: &mut QwpWsColumnarBuffer, table: &str, i: i64) {
             let samples = vec![1.0_f64, i as f64];
+            let counts = vec![1_i64, i];
             let row = buf.table(table).unwrap();
             row.symbol("sym", format!("sym-{}", i % 3).as_str())
                 .unwrap();
             if i % 2 == 0 {
                 row.column_bool("flag", i % 4 == 0).unwrap();
+                row.column_i8("i8", i as i8).unwrap();
+                row.column_i16("i16", i as i16).unwrap();
                 row.column_i64("qty", i).unwrap();
                 row.column_str("note", format!("note-{i}").as_str())
                     .unwrap();
@@ -10468,8 +10471,12 @@ mod tests {
                 row.column_long256("hash", &[i as u8; 32]).unwrap();
             }
             if i % 3 == 0 {
+                row.column_f32("f32", i as f32 + 0.25).unwrap();
                 row.column_f64("px", i as f64 + 0.5).unwrap();
                 row.column_dec("price", format!("{i}.25").as_str()).unwrap();
+                row.column_dec64("fee", format!("{i}.5").as_str()).unwrap();
+                row.column_dec128("notional", format!("{i}.75").as_str())
+                    .unwrap();
                 row.column_uuid("id", i as u64, 7).unwrap();
                 row.column_arr("samples", &samples).unwrap();
             }
@@ -10479,96 +10486,127 @@ mod tests {
                 row.column_ipv4("ip", i as u32).unwrap();
                 row.column_date("day", i).unwrap();
                 row.column_geohash("g", 7, 5).unwrap();
+                row.column_arr("counts", &counts).unwrap();
                 row.column_ts("event_ts", TimestampMicros::new(i)).unwrap();
             }
             row.at(TimestampNanos::new(1_700_000_000_000_000_000 + i))
                 .unwrap();
         }
 
+        // A cleared buffer keeps its schema, so the kept rows land in columns
+        // that already carry state from the batch before: a pinned geohash
+        // precision, a spent symbol dictionary, a decimal scale back at its
+        // unset sentinel. A rewind has to restore that state too.
+        fn prime_then_clear(buf: &mut QwpWsColumnarBuffer) {
+            for table in ["trades", "quotes"] {
+                buf.table(table)
+                    .unwrap()
+                    .symbol("sym", "primed")
+                    .unwrap()
+                    .column_geohash("g", 7, 25)
+                    .unwrap()
+                    .column_dec("price", "9.125")
+                    .unwrap()
+                    .at(TimestampNanos::new(1_600_000_000_000_000_000))
+                    .unwrap();
+            }
+            buf.clear();
+        }
+
         for kept_rows in 1..=3i64 {
             for discarded_rows in [1i64, 2, 4] {
-                for api in ["marker", "bookmark"] {
-                    let mut reference = QwpWsColumnarBuffer::new(127);
-                    for i in 0..kept_rows {
-                        write_row(&mut reference, "trades", i);
-                        write_row(&mut reference, "quotes", i);
-                    }
-                    let expected = ws_replay_bytes(&mut reference);
-                    let expected_len = reference.len();
+                for start in ["fresh", "cleared"] {
+                    for api in ["marker", "bookmark"] {
+                        let mut reference = QwpWsColumnarBuffer::new(127);
+                        if start == "cleared" {
+                            prime_then_clear(&mut reference);
+                        }
+                        for i in 0..kept_rows {
+                            write_row(&mut reference, "trades", i);
+                            write_row(&mut reference, "quotes", i);
+                        }
+                        let expected = ws_replay_bytes(&mut reference);
+                        let expected_len = reference.len();
 
-                    let mut buf = QwpWsColumnarBuffer::new(127);
-                    for i in 0..kept_rows {
-                        write_row(&mut buf, "trades", i);
-                        write_row(&mut buf, "quotes", i);
-                    }
+                        let mut buf = QwpWsColumnarBuffer::new(127);
+                        if start == "cleared" {
+                            prime_then_clear(&mut buf);
+                        }
+                        for i in 0..kept_rows {
+                            write_row(&mut buf, "trades", i);
+                            write_row(&mut buf, "quotes", i);
+                        }
 
-                    let bookmark = if api == "marker" {
-                        buf.set_marker().unwrap();
-                        None
-                    } else {
-                        Some(buf.bookmark().unwrap())
-                    };
+                        let bookmark = if api == "marker" {
+                            buf.set_marker().unwrap();
+                            None
+                        } else {
+                            Some(buf.bookmark().unwrap())
+                        };
 
-                    for i in kept_rows..kept_rows + discarded_rows {
-                        write_row(&mut buf, "trades", i);
-                        write_row(&mut buf, "quotes", i);
-                        // A table that did not exist at the mark at all.
-                        write_row(&mut buf, "late_table", i);
-                    }
+                        for i in kept_rows..kept_rows + discarded_rows {
+                            write_row(&mut buf, "trades", i);
+                            write_row(&mut buf, "quotes", i);
+                            // A table that did not exist at the mark at all.
+                            write_row(&mut buf, "late_table", i);
+                        }
 
-                    match bookmark {
-                        Some(bookmark) => buf.rewind_to_bookmark(bookmark).unwrap(),
-                        None => buf.rewind_to_marker().unwrap(),
-                    }
+                        match bookmark {
+                            Some(bookmark) => buf.rewind_to_bookmark(bookmark).unwrap(),
+                            None => buf.rewind_to_marker().unwrap(),
+                        }
 
-                    let case = format!("{api}, kept {kept_rows}, discarded {discarded_rows}");
-                    assert_eq!(
-                        buf.row_count(),
-                        reference.row_count(),
-                        "{case}: row count after the rewind"
-                    );
-                    assert_eq!(
-                        buf.len(),
-                        buf.recompute_len_slow(),
-                        "{case}: the cached size hint must match a full recompute"
-                    );
-                    assert_eq!(
-                        buf.len(),
-                        expected_len,
-                        "{case}: size hint after the rewind"
-                    );
-                    assert_eq!(
-                        ws_replay_bytes(&mut buf),
-                        expected,
-                        "{case}: a rewound buffer must encode exactly the surviving rows"
-                    );
+                        let case = format!(
+                            "{api}, {start} start, kept {kept_rows}, discarded {discarded_rows}"
+                        );
+                        assert_eq!(
+                            buf.row_count(),
+                            reference.row_count(),
+                            "{case}: row count after the rewind"
+                        );
+                        assert_eq!(
+                            buf.len(),
+                            buf.recompute_len_slow(),
+                            "{case}: the cached size hint must match a full recompute"
+                        );
+                        assert_eq!(
+                            buf.len(),
+                            expected_len,
+                            "{case}: size hint after the rewind"
+                        );
+                        assert_eq!(
+                            ws_replay_bytes(&mut buf),
+                            expected,
+                            "{case}: a rewound buffer must encode exactly the surviving rows"
+                        );
 
-                    // Fixed-width kinds encode by walking row indexes, so a
-                    // leftover cell past the row count is invisible above. It
-                    // only shows once a new row lands on its index, so write
-                    // one more row per table with values no discarded row
-                    // held, and re-create the table the rewind removed.
-                    let next = 100 + kept_rows;
-                    for table in ["trades", "quotes", "late_table"] {
-                        write_row(&mut reference, table, next);
-                        write_row(&mut buf, table, next);
-                    }
-                    assert_eq!(
-                        buf.len(),
-                        buf.recompute_len_slow(),
-                        "{case}: size hint after appending past the rewind"
-                    );
-                    assert_eq!(
-                        buf.len(),
-                        reference.len(),
-                        "{case}: size hint after appending past the rewind"
-                    );
-                    assert_eq!(
-                        ws_replay_bytes(&mut buf),
-                        ws_replay_bytes(&mut reference),
-                        "{case}: rows appended after a rewind must land on \
+                        // Fixed-width kinds encode by walking row indexes, so a
+                        // leftover cell past the row count is invisible above. It
+                        // only shows once a new row lands on its index, so write
+                        // one more row per table with values no discarded row
+                        // held, and re-create the table the rewind removed.
+                        let next = 100 + kept_rows;
+                        for table in ["trades", "quotes", "late_table"] {
+                            write_row(&mut reference, table, next);
+                            write_row(&mut buf, table, next);
+                        }
+                        assert_eq!(
+                            buf.len(),
+                            buf.recompute_len_slow(),
+                            "{case}: size hint after appending past the rewind"
+                        );
+                        assert_eq!(
+                            buf.len(),
+                            reference.len(),
+                            "{case}: size hint after appending past the rewind"
+                        );
+                        assert_eq!(
+                            ws_replay_bytes(&mut buf),
+                            ws_replay_bytes(&mut reference),
+                            "{case}: rows appended after a rewind must land on \
                          clean row indexes in every column"
-                    );
+                        );
+                    }
                 }
             }
         }
