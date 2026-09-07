@@ -870,6 +870,14 @@ impl FileTokenStore {
         // cannot overflow.
         let deadline = Instant::now() + self.lock_acquire_budget;
         let stamp = holder_bytes()?;
+        // A successful steal is allowed to retry `create_new` outside the
+        // budget (see below), but that concession must stay bounded: without a
+        // cap, any `steal_if_stale` that keeps answering `true` without
+        // clearing the path spins at 100% CPU forever, consulting neither the
+        // deadline nor `LOCK_POLL_SLICE`. One retry per genuine steal plus a
+        // small margin for losing the create race to a peer is ample.
+        const MAX_BUDGET_FREE_STEAL_RETRIES: u32 = 8;
+        let mut steal_retries: u32 = 0;
         loop {
             if cancelled() {
                 return Err(cancelled_error());
@@ -889,7 +897,10 @@ impl FileTokenStore {
                     // already proven stale. Retry create_new once after the
                     // successful capture instead of reporting a timeout merely
                     // because the original collision consumed the budget.
-                    if steal_if_stale(lock, stale_after, empty_grace) {
+                    if steal_if_stale(lock, stale_after, empty_grace)
+                        && steal_retries < MAX_BUDGET_FREE_STEAL_RETRIES
+                    {
+                        steal_retries += 1;
                         continue;
                     }
                     if Instant::now() >= deadline {
@@ -1028,6 +1039,19 @@ impl FileTokenStore {
             lock_process_cancellable(&process_lock, self.lock_acquire_budget, cancelled)?;
         self.prepare_directory(cancelled)?;
         let held = self.acquire_lock(&lock, self.lock_stale, EMPTY_LOCK_GRACE, cancelled)?;
+        // The per-identity lock guards the ROTATING refresh token, so it needs
+        // the same fence the directory lock has had: renew the mtime while the
+        // critical section runs, and verify ownership before publishing the
+        // result. Without it the mtime was stamped once and never revisited,
+        // so `steal_if_stale`'s MAX_FUTURE_LOCK_SKEW branch could hand the
+        // lock to a second holder -- routinely, and not only after a clock
+        // step, on an NFS/SMB store directory whose server clock runs ahead of
+        // its clients, where every mtime is permanently "in the future". Two
+        // holders is exactly the refresh-token double-submission this lock
+        // exists to prevent, and a reuse-detecting IdP answers it by revoking
+        // the whole token family.
+        let heartbeat = self.start_directory_lock_heartbeat(lock.clone(), held.stamp.clone())?;
+        heartbeat.check_owned()?;
         // Re-entrant load/save/clear calls from `action` may bypass this same
         // identity lock. Publish thread ownership only after the filesystem
         // lease was actually obtained; the previous order falsely marked an
@@ -1038,8 +1062,17 @@ impl FileTokenStore {
         } else {
             action()
         };
+        // Fail closed on a lost lease. A displaced holder cannot claim its
+        // action was coordinated: a peer may have written the same entry
+        // underneath it, so reporting success would be the silent half of the
+        // double-submission.
+        let still_owned = heartbeat.finish();
         drop(held);
-        result
+        match (result, still_owned) {
+            (Ok(value), Ok(())) => Ok(value),
+            (Ok(_), Err(lost)) => Err(Box::new(lost)),
+            (Err(e), _) => Err(e),
+        }
     }
 
     /// Remove only crash-orphaned temps old enough to be unambiguously stale.
@@ -1771,7 +1804,12 @@ fn steal_if_stale(lock: &Path, stale_after: Duration, empty_grace: Duration) -> 
     };
     if !meta.is_file() || meta.file_type().is_symlink() {
         displace_lock_squatter(lock);
-        return !lock.exists();
+        // lstat, not `Path::exists()`. `exists()` follows the link, so a
+        // DANGLING symlink we failed to rename away reported "gone" while
+        // `O_CREAT|O_EXCL` still answered EEXIST on it -- an unbounded
+        // no-progress spin in `acquire_lock`, which treats `true` as
+        // "something changed, retry immediately".
+        return path_is_definitely_absent(lock);
     }
     let before = match lock_snapshot(lock) {
         Ok(Some(snapshot)) => snapshot,
