@@ -2970,12 +2970,15 @@ fn drain_sfa_senders_bounded(inner: &DbInner, senders: &mut [PooledSenderCore]) 
         return;
     }
     let durable = inner.connector.request_durable_ack();
+    // Anchor the shared deadline before the orphan closes, which can block on
+    // queue back-pressure: the "one close_flush_timeout" bound is on the whole
+    // retirement, not just the drain.
+    let deadline = Instant::now().checked_add(timeout);
     for sender in senders.iter_mut() {
         // See drain_sfa_before_drop: must precede begin_close.
         sender.close_open_deferred_group();
         sender.begin_close();
     }
-    let deadline = Instant::now().checked_add(timeout);
     for sender in senders.iter_mut() {
         if sender.sfa_fully_delivered(durable) {
             continue;

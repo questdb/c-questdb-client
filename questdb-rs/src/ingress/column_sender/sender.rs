@@ -263,11 +263,13 @@ struct SfaBackend {
     buffer_scratch: QwpWsEncodeScratch,
     scratch: encoder::EncodeScratch,
     /// True while the queue holds a deferred frame with no committing frame
-    /// after it. Only a split can create that state, and only within one flush
-    /// -- the split's own last frame always commits. It exists so a split that
-    /// fails part-way knows whether there is a group to close: a split whose
-    /// window valve was shut throughout published nothing deferred, and
-    /// publishing a committing frame for it would be pure waste.
+    /// after it. Only a split can create that state, and it normally ends
+    /// within the same flush -- the split's own last frame commits. It exists
+    /// so a split that fails part-way knows whether there is a group to close:
+    /// a split whose window valve was shut throughout published nothing
+    /// deferred, and publishing a committing frame for it would be pure waste.
+    /// It outlives the flush only when that close itself failed, so the next
+    /// `wait`, `flush`, or pool return can retry it.
     sfa_deferred_group_open: bool,
     max_buf_size: usize,
     request_durable_ack: bool,
@@ -1639,7 +1641,12 @@ impl SfaBackend {
             self.latch_if_connection_is_spent(err);
         }
         match result.map_err(FlushFailure::NotDelivered)? {
-            SfaPublishOutcome::Published(fsn) => Ok(Some(fsn)),
+            SfaPublishOutcome::Published(fsn) => {
+                // A buffer frame always commits, so it also closes a group a
+                // failed split could not.
+                self.sfa_deferred_group_open = false;
+                Ok(Some(fsn))
+            }
             SfaPublishOutcome::TooLarge {
                 encoded_len,
                 max_buf_size,
@@ -1768,13 +1775,18 @@ impl SfaBackend {
         published_before: crate::Result<Option<u64>>,
         err: FlushFailure,
     ) -> FlushFailure {
-        // Only a pair of successful reads showing the SAME watermark proves
-        // nothing was enqueued. If either read failed, assume frames reached the
-        // queue: over-closing costs one empty frame and an in_doubt error, while
-        // under-closing strands a deferred prefix nothing can commit.
+        // A pair of successful reads showing the SAME watermark proves nothing
+        // was enqueued. So does a failed read BEFORE the split: the terminal
+        // and durability latches are permanent and every publish checks them,
+        // so nothing could have been appended after. A read that fails only
+        // AFTER the split latched mid-flight, when frames may already have been
+        // appended: assume they were. Over-closing costs one empty frame and an
+        // in_doubt error, while under-closing strands a deferred prefix nothing
+        // can commit.
         let unchanged = match (&published_before, &self.sfa_published_fsn()) {
             (Ok(before), Ok(after)) => before == after,
-            _ => false,
+            (Err(_), _) => true,
+            (Ok(_), Err(_)) => false,
         };
         if unchanged {
             return err;
@@ -1785,6 +1797,13 @@ impl SfaBackend {
         // server, so the retry classification still applies.
         if self.sfa_deferred_group_open {
             self.commit_orphaned_prefix();
+            // Still open: the close itself failed. Retire the connection on
+            // return rather than park a queue whose tail nothing has committed
+            // -- the reaper cannot reclaim it, and the next borrower's first
+            // flush would commit this lease's prefix under its own boundary.
+            if self.sfa_deferred_group_open {
+                self.drop_on_return = true;
+            }
         }
         deny_retry_after_partial(err)
     }
@@ -2145,6 +2164,12 @@ impl SfaBackend {
 
     fn wait(&mut self, ack_level: AckLevel, timeout: Duration) -> Result<()> {
         self.validate_ack_level(ack_level)?;
+        // A group a failed split could not close is un-ackable, so a wait on
+        // it can only time out. Retry the close first; on success the
+        // committing frame becomes the boundary.
+        if self.sfa_deferred_group_open {
+            self.commit_orphaned_prefix();
+        }
         let Some(boundary) = qwp_ws_published_fsn_background(&self.state)? else {
             return Ok(());
         };
