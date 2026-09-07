@@ -924,11 +924,19 @@ impl<T: QwpWsCoreTransport> QwpWsSendCore<T> {
                 // or a skipped response -- stays queued and replays from
                 // `oldest_unresolved_fsn` on the reconnect, exactly as after a
                 // socket drop.
-                debug_assert!(
-                    store.queue.oldest_unresolved_fsn() == Some(fsn)
-                        || self.send_cursor.wire_seq_for_fsn(fsn).is_some(),
-                    "reject for fsn {fsn} names a frame outside the in-flight run"
-                );
+                //
+                // A frame that is neither the oldest unresolved nor still in
+                // the in-flight run was already answered on this connection: a
+                // cumulative durable OK emptied the run past it, and the
+                // server then rejected a lower wire_seq. That is the server's
+                // violation, not a frame verdict; keep the diagnostic and let
+                // the durable ack path finish resolving it.
+                if store.queue.oldest_unresolved_fsn() != Some(fsn)
+                    && self.send_cursor.wire_seq_for_fsn(fsn).is_none()
+                {
+                    store.record_reject_error(fsn, wire_seq, error, policy);
+                    return Ok(DriveOutcome::Idle);
+                }
 
                 if policy == QwpWsErrorPolicy::Terminal {
                     let sender_error = sender_error_for_qwp_error(&error, wire_seq, fsn, policy);
