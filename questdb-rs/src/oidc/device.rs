@@ -1421,8 +1421,14 @@ impl OidcDeviceAuth {
         };
 
         if current_is_persisted {
-            let clear_result = store.clear_cancellable(key, &cancelled);
+            // Bail BEFORE deleting anything. Checking afterwards meant a close
+            // landing here returned `Cancelled` with the parent already gone
+            // from disk -- and the clear was itself cancellable, so it was not
+            // even knowable whether it had happened. The clear is bounded local
+            // filesystem work; `close()` is documented to cancel network waits,
+            // not this.
             self.ensure_open()?;
+            let clear_result = store.clear_cancellable(key, &|| false);
             if let Err(e) = clear_result {
                 self.discard_cached_refresh();
                 self.lock_store_state().set_last_persisted_refresh(None);
@@ -1455,7 +1461,10 @@ impl OidcDeviceAuth {
                 if refresh_preserves_token(&e) {
                     *self.lock_tokens() = Some(current.clone());
                     if current_is_persisted {
-                        self.persist_if_changed(store, key, &current)?;
+                        // Durable: we deleted the parent above, so this restore
+                        // must land even if the failure that brought us here
+                        // was a close.
+                        self.persist_if_changed_durable(store, key, &current)?;
                     }
                 }
                 return Err(e);
@@ -1467,7 +1476,13 @@ impl OidcDeviceAuth {
         // headless caller cannot perform. `persist_if_changed` is a no-op when
         // the refresh token did not rotate, and removes the entry when the IdP
         // returned none at all.
-        self.persist_if_changed(store, key, &refreshed)?;
+        // Durable, and deliberately BEFORE any `ensure_open()`: a `close()`
+        // racing the token-endpoint POST used to make this write return
+        // `Cancelled` with the parent already deleted, destroying the on-disk
+        // credential and, via close()'s own `discard_credentials`, the
+        // in-memory one too. The comment above already argued this write must
+        // happen; now it does.
+        self.persist_if_changed_durable(store, key, &refreshed)?;
         self.ensure_open()?;
         Ok(refreshed)
     }
@@ -1509,8 +1524,49 @@ impl OidcDeviceAuth {
         key: &TokenStoreKey,
         tokens: &TokenSet,
     ) -> Result<()> {
-        self.ensure_open()?;
-        let cancelled = || self.is_closed();
+        self.persist_if_changed_inner(store, key, tokens, false)
+    }
+
+    /// `persist_if_changed`, but for a write that MUST land: the caller has
+    /// already consumed and deleted the parent refresh token, so skipping this
+    /// leaves nothing on disk and forces an interactive re-sign-in a headless
+    /// caller cannot perform.
+    ///
+    /// The difference from the ordinary path is cancellability: `close()`
+    /// landing during the token-endpoint POST used to make the write-back
+    /// return `Cancelled` with the parent already gone, destroying the on-disk
+    /// credential and, via `close()`'s own `discard_credentials`, the in-memory
+    /// one too.
+    ///
+    /// A store failure is still only warned, not propagated. That is
+    /// deliberate and is pinned by
+    /// `failed_rotated_child_save_leaves_no_reusable_parent`: the caller holds
+    /// a working rotated token for this process, and failing `token()` because
+    /// the disk is full would turn a persistence problem into an ingestion
+    /// outage. What that leaves open is visibility -- the only signal is a
+    /// `log::warn!`, and neither the C nor the Python client installs a
+    /// subscriber -- which needs a reporting channel rather than a louder
+    /// return value.
+    fn persist_if_changed_durable(
+        &self,
+        store: &dyn TokenStore,
+        key: &TokenStoreKey,
+        tokens: &TokenSet,
+    ) -> Result<()> {
+        self.persist_if_changed_inner(store, key, tokens, true)
+    }
+
+    fn persist_if_changed_inner(
+        &self,
+        store: &dyn TokenStore,
+        key: &TokenStoreKey,
+        tokens: &TokenSet,
+        durable: bool,
+    ) -> Result<()> {
+        if !durable {
+            self.ensure_open()?;
+        }
+        let cancelled = || !durable && self.is_closed();
         let rt = tokens.refresh_token.clone();
         if rt == self.lock_store_state().last_persisted_refresh {
             return Ok(()); // not rotated; nothing to write
@@ -1519,7 +1575,9 @@ impl OidcDeviceAuth {
         // previously persisted one is now obsolete and must not survive restart.
         if rt.is_none() {
             let clear_result = store.clear_cancellable(key, &cancelled);
-            self.ensure_open()?;
+            if !durable {
+                self.ensure_open()?;
+            }
             match clear_result {
                 Ok(()) => {
                     self.lock_store_state().set_last_persisted_refresh(None);
@@ -1529,7 +1587,9 @@ impl OidcDeviceAuth {
             return Ok(());
         }
         let save_result = store.save_cancellable(key, &snapshot(tokens), &cancelled);
-        self.ensure_open()?;
+        if !durable {
+            self.ensure_open()?;
+        }
         match save_result {
             Ok(()) => {
                 self.lock_store_state().set_last_persisted_refresh(rt);
