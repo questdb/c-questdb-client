@@ -52,10 +52,12 @@
 // `.borrow()` resolves through the `O: BorrowMut<Reader>` bound.
 use std::borrow::BorrowMut;
 
+use crate::egress::column::ColumnView;
 use crate::egress::query_request::{QueryRequest, QueryRequestBuilder};
 use crate::egress::reader::{CursorState, NextOutcome, Reader, Terminal};
+use crate::egress::schema::Schema;
 use crate::egress::{Bind, Endpoint, ServerInfo};
-use crate::error::Result;
+use crate::error::{Result, fmt};
 
 /// A query being built against an owned connection.
 ///
@@ -299,6 +301,44 @@ impl<O: BorrowMut<Reader>> OwnedCursor<O> {
         // `self` still drops here; its `owner` is now `None`, so the `Drop`
         // impl below is a no-op and the cleanup is not run twice.
         owner
+    }
+
+    /// Rows in the current batch, or `0` before the first `next_batch`.
+    pub fn batch_row_count(&self) -> usize {
+        self.state.last_batch().map_or(0, |b| b.row_count)
+    }
+
+    /// Columns in the current batch, or `0` before the first `next_batch`.
+    pub fn batch_column_count(&self) -> usize {
+        self.state.last_batch().map_or(0, |b| b.columns.len())
+    }
+
+    /// Schema of the current query, or `None` before the first `next_batch`.
+    pub fn batch_schema(&self) -> Option<&Schema> {
+        self.reader_ref().query_schema()
+    }
+
+    /// Sequence number of the current batch, or `None` before the first
+    /// `next_batch`.
+    pub fn batch_seq(&self) -> Option<u64> {
+        self.state.last_batch().map(|b| b.batch_seq)
+    }
+
+    /// A view of one column of the current batch.
+    ///
+    /// This is the owning replacement for going through [`BatchView`]: the
+    /// returned view borrows `&self`, so no second handle spanning the
+    /// cursor and the reader has to exist — `decoded` comes from
+    /// `self.state`, `dict` from `self.owner`'s `Reader`, both reachable
+    /// through the same `&self`.
+    ///
+    /// [`BatchView`]: crate::egress::BatchView
+    pub fn batch_column(&self, idx: usize) -> Result<ColumnView<'_>> {
+        let decoded = self
+            .state
+            .last_batch()
+            .ok_or_else(|| fmt!(InvalidApiCall, "no current batch; call next_batch() first"))?;
+        decoded.column_view(idx, self.reader_ref().symbol_dict())
     }
 }
 

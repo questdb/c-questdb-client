@@ -255,3 +255,186 @@ fn dropping_an_owned_cursor_mid_stream_retires_the_connection() {
         "the abandoned connection must have been retired, forcing a redial"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Batch accessors on `OwnedCursor`
+// ---------------------------------------------------------------------------
+
+use questdb::egress::{ColumnView, Reader};
+
+/// Hand-build a two-column, multi-row `RESULT_BATCH` frame.
+///
+/// `Action::SendBatch` / `BatchColumn` (in `qwp_mock.rs`, which this task
+/// must not modify) only carries a single named column per frame — see its
+/// own doc comment ("single-table, single-column RESULT_BATCH"). The parity
+/// test below needs a batch with *more than one column* so that comparing
+/// column 0 alone couldn't hide a bug in how the accessors index into
+/// `DecodedBatch::columns`. This builds the frame by hand from the same
+/// public wire helpers (`framed`, `encode_varint_u64`, `MSG_RESULT_BATCH`)
+/// that `qwp_mock::result_batch_frame` itself uses, then delivers it with
+/// `Action::SendRaw` — the escape hatch the mock already exposes for
+/// scripts it can't otherwise express (see the malformed-frame tests in
+/// `egress_failover.rs`).
+///
+/// `request_id` must match what the client allocates for its query. Every
+/// test below opens exactly one fresh `Reader` and issues exactly one
+/// query on it, so per `Reader::from_config` / `CursorState::alloc_request_id`
+/// the id is deterministically `1`.
+fn two_column_batch_frame(
+    request_id: i64,
+    batch_seq: u64,
+    longs: &[i64],
+    doubles: &[f64],
+) -> Vec<u8> {
+    const KIND_LONG: u8 = 0x05;
+    const KIND_DOUBLE: u8 = 0x07;
+    assert_eq!(
+        longs.len(),
+        doubles.len(),
+        "test fixture: row counts must match"
+    );
+    let row_count = longs.len();
+
+    let mut payload = Vec::new();
+    payload.push(MSG_RESULT_BATCH);
+    payload.extend_from_slice(&request_id.to_le_bytes());
+    encode_varint_u64(batch_seq, &mut payload);
+    encode_varint_u64(0, &mut payload); // empty table name
+    encode_varint_u64(row_count as u64, &mut payload);
+    if batch_seq == 0 {
+        encode_varint_u64(2, &mut payload); // col_count
+        encode_varint_u64(1, &mut payload);
+        payload.push(b'v');
+        payload.push(KIND_LONG);
+        encode_varint_u64(1, &mut payload);
+        payload.push(b'd');
+        payload.push(KIND_DOUBLE);
+    }
+    // Column 0 (LONG "v"): null_flag=0x00 (no bitmap), then raw i64 LE values.
+    payload.push(0x00);
+    for v in longs {
+        payload.extend_from_slice(&v.to_le_bytes());
+    }
+    // Column 1 (DOUBLE "d"): same shape.
+    payload.push(0x00);
+    for v in doubles {
+        payload.extend_from_slice(&v.to_le_bytes());
+    }
+    framed(1, 0, 1, &payload)
+}
+
+/// One complete query round delivering the hand-built two-column batch,
+/// then a clean `RESULT_END`.
+fn two_column_script(role: ServerRole, node_id: &str, longs: &[i64], doubles: &[f64]) -> Script {
+    vec![
+        Action::SendServerInfo {
+            role,
+            node_id: node_id.into(),
+        },
+        Action::AwaitQueryRequest,
+        Action::SendRaw(two_column_batch_frame(1, 0, longs, doubles)),
+        Action::SendResultEnd,
+    ]
+}
+
+/// Read column `v` (LONG, index 0) and column `d` (DOUBLE, index 1) out of
+/// whichever `ColumnView`-yielding accessor the caller supplies, returning
+/// every row so the parity test compares actual decoded values rather than
+/// just counts.
+fn read_long_column(view: &ColumnView<'_>) -> Vec<i64> {
+    match view {
+        ColumnView::Long(c) => (0..c.len()).map(|i| c.value(i)).collect(),
+        other => panic!("expected a LONG column, got {:?}", other.kind()),
+    }
+}
+
+fn read_double_column(view: &ColumnView<'_>) -> Vec<f64> {
+    match view {
+        ColumnView::Double(c) => (0..c.len()).map(|i| c.value(i)).collect(),
+        other => panic!("expected a DOUBLE column, got {:?}", other.kind()),
+    }
+}
+
+/// The accessors must return exactly what `BatchView` returns on the
+/// borrowing path — same script, same assertions, two APIs. The script
+/// carries two columns (LONG, DOUBLE) and three rows so that a bug which
+/// swapped columns, dropped rows, or misindexed `DecodedBatch::columns`
+/// would show up as a value mismatch, not just a count mismatch.
+#[test]
+fn owned_batch_accessors_match_the_borrowing_batchview() {
+    let longs = vec![10_i64, 20, 30];
+    let doubles = vec![1.5_f64, 2.5, 3.5];
+    let script = two_column_script(ServerRole::Primary, "n1", &longs, &doubles);
+
+    // Borrowing path: read the first batch through BatchView.
+    let server_a = MockServer::start(vec![script.clone()]);
+    let conf_a = format!("ws::addr={};", server_a.url());
+    let mut reader = Reader::from_conf(&conf_a).expect("connect");
+    let mut cursor = reader.execute("SELECT 1").expect("execute");
+    let view = cursor.next_batch().expect("next_batch").expect("a batch");
+    let expected_rows = view.row_count();
+    let expected_cols = view.column_count();
+    let expected_long = read_long_column(&view.column(0).expect("column 0"));
+    let expected_double = read_double_column(&view.column(1).expect("column 1"));
+    let expected_batch_seq = view.batch_seq();
+    let expected_schema_len = view.schema().len();
+    drop(cursor);
+
+    // Owning path: the same, through the accessors.
+    let server_b = MockServer::start(vec![script]);
+    let conf_b = format!("ws::addr={};", server_b.url());
+    let db = QuestDb::connect(&conf_b).expect("connect");
+    let mut owned = db
+        .take_reader()
+        .expect("take_reader")
+        .query("SELECT 1")
+        .execute()
+        .expect("execute");
+    assert!(owned.next_batch().expect("next_batch"), "expected a batch");
+
+    assert_eq!(owned.batch_row_count(), expected_rows, "row count differs");
+    assert_eq!(
+        owned.batch_column_count(),
+        expected_cols,
+        "column count differs"
+    );
+    let actual_long = read_long_column(&owned.batch_column(0).expect("column 0"));
+    let actual_double = read_double_column(&owned.batch_column(1).expect("column 1"));
+    assert_eq!(actual_long, expected_long, "column 0 (LONG) values differ");
+    assert_eq!(
+        actual_double, expected_double,
+        "column 1 (DOUBLE) values differ"
+    );
+    assert_eq!(
+        owned.batch_seq(),
+        Some(expected_batch_seq),
+        "batch_seq differs"
+    );
+    assert_eq!(
+        owned.batch_schema().map(|s| s.len()),
+        Some(expected_schema_len),
+        "schema column count differs"
+    );
+}
+
+/// Accessors before the first `next_batch` must not panic.
+#[test]
+fn owned_batch_accessors_are_safe_before_the_first_batch() {
+    let server = MockServer::start(vec![happy_script(ServerRole::Primary, "n1")]);
+    let conf = format!("ws::addr={};", server.url());
+    let db = QuestDb::connect(&conf).expect("connect");
+    let cursor = db
+        .take_reader()
+        .expect("take_reader")
+        .query("SELECT 1")
+        .execute()
+        .expect("execute");
+
+    assert_eq!(cursor.batch_row_count(), 0);
+    assert_eq!(cursor.batch_column_count(), 0);
+    assert!(cursor.batch_schema().is_none());
+    assert!(
+        cursor.batch_column(0).is_err(),
+        "column access must error, not panic"
+    );
+}

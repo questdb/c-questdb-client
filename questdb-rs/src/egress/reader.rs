@@ -692,6 +692,19 @@ impl Reader {
         &self.dict
     }
 
+    /// Schema of the in-flight query, populated from the first
+    /// `RESULT_BATCH` (`batch_seq == 0`). `None` before the first batch of
+    /// a query has been decoded. `pub(crate)`, not `pub`: this mirrors the
+    /// `dict`/`schema` half of [`BatchView`] for [`OwnedCursor`]'s batch
+    /// accessors, which need it as `&self` alongside `CursorState::last_batch`
+    /// — the same two sources `BatchView` spans, now reachable through one
+    /// owner instead of two borrows.
+    ///
+    /// [`OwnedCursor`]: crate::egress::OwnedCursor
+    pub(crate) fn query_schema(&self) -> Option<&Schema> {
+        self.query_schema.as_ref()
+    }
+
     /// Begin building a parametrised query. The returned `ReaderQuery`
     /// exclusively borrows the reader; only one in-flight cursor at a
     /// time. Append binds in placeholder order, then call `.execute()`.
@@ -1648,6 +1661,16 @@ impl CursorState {
 
     pub(crate) fn terminal(&self) -> Option<&Terminal> {
         self.terminal.as_ref()
+    }
+
+    /// The most recently decoded batch, or `None` before the first
+    /// `next_batch`/`next_batch_step` call has produced one. Exposed so
+    /// [`OwnedCursor`](crate::egress::OwnedCursor)'s `&self` batch
+    /// accessors can reach the same `DecodedBatch` that the borrowing
+    /// `Cursor::next_batch` wraps into a `BatchView` — no second copy of
+    /// the decode, just a second way to reach it.
+    pub(crate) fn last_batch(&self) -> Option<&DecodedBatch> {
+        self.last_batch.as_ref()
     }
 
     pub(crate) fn connection_reusable(&self, reader: &Reader) -> bool {
