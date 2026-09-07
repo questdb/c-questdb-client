@@ -1391,8 +1391,7 @@ fn assert_durable_ack_without_opt_in(err: crate::Error, mode: ProgressCase) {
     );
     assert_eq!(
         err.msg(),
-        "AckLevel::Durable requires a sender opened with \
-         `request_durable_ack=on` in the connect string.",
+        "AckLevel::Durable requires `request_durable_ack=on` in the connect string.",
         "mode={}",
         mode.name()
     );

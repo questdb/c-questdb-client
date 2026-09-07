@@ -1472,8 +1472,7 @@ impl SfaBackend {
         if ack_level == AckLevel::Durable && !self.request_durable_ack {
             return Err(error::fmt!(
                 InvalidApiCall,
-                "AckLevel::Durable requires the pool to be opened with \
-                 `request_durable_ack=on` in the connect string."
+                "AckLevel::Durable requires `request_durable_ack=on` in the connect string."
             ));
         }
         Ok(())
