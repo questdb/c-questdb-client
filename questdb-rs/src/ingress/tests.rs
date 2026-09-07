@@ -260,6 +260,19 @@ fn qwpws_sf_max_total_bytes_floors_at_five_segments() {
         10 * 1024 * 1024 * 1024,
         "the disk default must be untouched by the deferred-commit floor"
     );
+
+    // Disk mode keeps the queue's two-segment publishable minimum, so a
+    // segment above half the disk default is caught at the knob rather than
+    // failing the slot open with an unattributable capacity error.
+    let huge_seg = 6 * 1024 * 1024 * 1024_u64;
+    assert_eq!(
+        flat_default(&format!(
+            "ws::addr=localhost:9000;sf_max_segment_bytes={huge_seg};sf_dir={};",
+            dir.path().display()
+        )),
+        huge_seg * 2,
+        "the disk default must floor at two segments"
+    );
 }
 
 #[cfg(feature = "sync-sender-qwp-ws")]

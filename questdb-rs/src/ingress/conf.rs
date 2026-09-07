@@ -395,7 +395,12 @@ impl QwpWsConfig {
         }
 
         if self.sf_dir.is_some() {
-            return QWP_WS_DEFAULT_SF_DISK_MAX_TOTAL_BYTES;
+            // Two segments is the queue's publishable minimum. Keep the floor so
+            // an oversize segment is caught at the knob rather than failing a
+            // fresh slot's open with an unattributable capacity error, or
+            // opening a recovered slot that back-pressures on every rotation.
+            return QWP_WS_DEFAULT_SF_DISK_MAX_TOTAL_BYTES
+                .max(self.sf_max_segment_bytes.saturating_mul(2));
         }
         // Floor at five segments, not two. A freshly opened slot already holds an
         // active segment plus a hot spare, and `has_deferred_commit_headroom`
