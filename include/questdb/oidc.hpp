@@ -174,11 +174,14 @@ public:
         ::questdb_oidc_token_free(_raw);
     }
 
-    /** Borrowed bytes; valid only while this token object remains alive. */
+    /** Borrowed bytes; valid only while this token object remains alive.
+     *  Empty (and never a null-pointer `string_view`) on a moved-from token,
+     *  matching `event_view::view` and `device_auth::view`. */
     std::string_view view() const& noexcept
     {
-        return {
-            ::questdb_oidc_token_data(_raw), ::questdb_oidc_token_len(_raw)};
+        const char* const data = ::questdb_oidc_token_data(_raw);
+        return data ? std::string_view{data, ::questdb_oidc_token_len(_raw)}
+                    : std::string_view{};
     }
     std::string_view view() const&& = delete;
 
@@ -342,6 +345,20 @@ public:
      * and joins it. Publishing does not wait for that authentication operation,
      * though it may briefly contend with wait registration. A later close after
      * the callback returns performs the drain.
+     *
+     * Closing is TERMINAL for every attached transport, not merely a state they
+     * observe. Closing is monotonic, so each sender, reader and pool built from
+     * this provider (or any `share()` handle) fails its next token pull with a
+     * non-retryable error: reconnect loops stop rather than retry, a
+     * QWP/WebSocket publication store is terminalized with accepted frames
+     * still queued, and no replacement provider can be attached to an existing
+     * handle. Disk-backed store-and-forward slots are not deleted and stay
+     * drainable by a later process, but this one will not send them.
+     *
+     * Recovery is to build a new provider and rebuild every sender, reader and
+     * pool that used the old one. Where that matters, sign in on a provider
+     * before attaching it and keep re-authentication on a separate, unattached
+     * one.
      */
     void close() const
     {

@@ -157,8 +157,13 @@ void questdb_oidc_builder_free(questdb_oidc_builder* builder);
         size_t value_len,                                                      \
         questdb_error** err_out)
 
-/** `client_id`, `scope`, `audience`, and `issuer` must be non-empty when set;
+/** Every setter below must be non-empty when set -- `client_id`, `scope`,
+ *  `audience`, `issuer`, and both endpoint overrides;
  *  `questdb_oidc_builder_build` reports an OIDC configuration error otherwise.
+ *  An empty endpoint override is rejected rather than treated as "discover it":
+ *  it would otherwise suppress both the `/settings` value and the IdP discovery
+ *  fallback, then fail much later with an unrelated message. Leave an override
+ *  unset to discover that endpoint.
  */
 QUESTDB_OIDC_STRING_BUILDER_FN(questdb_oidc_builder_client_id);
 QUESTDB_OIDC_STRING_BUILDER_FN(questdb_oidc_builder_scope);
@@ -170,6 +175,16 @@ QUESTDB_OIDC_STRING_BUILDER_FN(
 
 #undef QUESTDB_OIDC_STRING_BUILDER_FN
 
+/**
+ * Override the discovered groups-in-token mode. `true` selects the `id_token`
+ * as the token presented to QuestDB; otherwise the `access_token` is used.
+ *
+ * This does NOT modify the configured scope -- the scope is sent verbatim, both
+ * on the device-authorization request and on refresh, matching the Java client.
+ * Include `openid` in `questdb_oidc_builder_scope` explicitly when the identity
+ * provider requires it to issue an ID token, or the flow fails with an OIDC
+ * configuration error that no retry inside this process can clear.
+ */
 QUESTDB_CLIENT_API
 bool questdb_oidc_builder_groups_in_token(
     questdb_oidc_builder* builder, bool enabled, questdb_error** err_out);
@@ -194,6 +209,19 @@ bool questdb_oidc_builder_groups_in_token(
 QUESTDB_CLIENT_API
 bool questdb_oidc_builder_allow_insecure_transport(
     questdb_oidc_builder* builder, bool enabled, questdb_error** err_out);
+/**
+ * Whether `questdb_oidc_auth_sign_in` opens a browser at the verification URL
+ * (default `true`).
+ *
+ * The default spawns a detached child process (`xdg-open` / `open` /
+ * `rundll32`) once per sign-in. Spawn failure is ignored, so on a host with no
+ * opener this costs nothing -- but set it to `false` on a headless or shared
+ * host where launching a browser is not wanted. The device code and URL are
+ * still reported through the event handler either way.
+ *
+ * A binding may narrow this: the Python client defaults to opening a browser
+ * except inside a Jupyter kernel, where the reader may be on another machine.
+ */
 QUESTDB_CLIENT_API
 bool questdb_oidc_builder_open_browser(
     questdb_oidc_builder* builder, bool enabled, questdb_error** err_out);
@@ -241,6 +269,11 @@ bool questdb_oidc_builder_timeout_ms(
     questdb_oidc_builder* builder,
     uint64_t timeout_ms,
     questdb_error** err_out);
+/**
+ * PEM CA bundle used to verify TLS for BOTH the QuestDB `/settings` discovery
+ * request and every identity-provider request. Unset means the platform trust
+ * store. The path is read at `questdb_oidc_builder_build` time, not here.
+ */
 QUESTDB_CLIENT_API
 bool questdb_oidc_builder_ca_bundle(
     questdb_oidc_builder* builder,
@@ -366,6 +399,19 @@ void questdb_oidc_auth_free(questdb_oidc_auth* auth);
  * The in-memory credential is dropped on every path, including the
  * skipped-drain one; only the wait is skipped. The persisted entry is
  * left behind either way -- see `questdb_oidc_auth_clear`.
+ *
+ * Closing is TERMINAL for every attached transport, not merely a state they
+ * observe. Closing is monotonic, so each sender, reader and pool built from
+ * this auth (or from any `questdb_oidc_auth_clone` handle) fails its next
+ * token pull with a non-retryable error: reconnect loops stop rather than
+ * retry, a QWP/WebSocket publication store is terminalized with accepted
+ * frames still queued, and no replacement auth can be attached to an existing
+ * handle. Disk-backed store-and-forward slots are not deleted and stay
+ * drainable by a later process, but this one will not send them.
+ *
+ * Recovery is to build a new auth and rebuild every sender, reader and pool
+ * that used the old one. Where that matters, sign in on an auth before
+ * attaching it and keep re-authentication on a separate, unattached one.
  */
 QUESTDB_CLIENT_API
 bool questdb_oidc_auth_close(
