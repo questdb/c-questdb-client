@@ -55,11 +55,7 @@ pub enum ConnectionEventKind {
     /// Every configured endpoint was attempted and none accepted the
     /// connection in this sweep.
     AllEndpointsUnreachable,
-    /// A credential was rejected or could not be obtained.
-    ///
-    /// Terminal **only when `host` is set**: the server rejected the
-    /// credential it was offered, and the owning sender/pool operation
-    /// surfaces the error to the caller.
+    /// The server rejected a credential the client presented.
     ///
     /// Always terminal, and always a credential the client DID present and the
     /// server rejected. `host` and `port` are set. A listener may page, tear
