@@ -580,10 +580,19 @@ impl OidcDeviceAuth {
     ///
     /// The signal is permanent and shared by every `Arc`/FFI clone and attached
     /// transport. An HTTP request already in flight is not cancelled at the
-    /// transport layer, so this waits for that bounded request to return. Do not
-    /// call it from a [`Renderer`] callback on this same provider: callbacks run
-    /// inside the acquisition critical section that `close` waits to drain --
-    /// use [`signal_close`](Self::signal_close) there instead. Idempotent.
+    /// transport layer, so this waits for that bounded request to return.
+    /// Idempotent.
+    ///
+    /// Do not call it from a [`Renderer`] callback on this same provider:
+    /// callbacks run inside the acquisition critical section that `close` waits
+    /// to drain. There, call [`signal_close`](Self::signal_close) **and then**
+    /// [`discard_credentials`](Self::discard_credentials) -- together they are
+    /// what `close` does, minus the drain it cannot perform from inside the
+    /// section. `signal_close` alone publishes the close but leaves the access,
+    /// ID and refresh tokens resident for the life of the provider, which is
+    /// not what the C, C++ and Python bindings promise for their `close`: they
+    /// compose both calls, and their headers state the credential is dropped on
+    /// every path including the skipped-drain one.
     pub fn close(&self) {
         self.signal_close();
 
@@ -623,6 +632,13 @@ impl OidcDeviceAuth {
     /// inside that very section. It may briefly contend with a waiter registering
     /// on `close_wait`; the caller also gives up the guarantee that token work has
     /// stopped by the time it returns.
+    ///
+    /// It also does **not** drop the in-memory credential -- that half is
+    /// [`discard_credentials`](Self::discard_credentials), which takes neither
+    /// the acquisition lock nor anything a callback holds. Call both to get
+    /// `close`'s semantics from a context that cannot drain; calling this alone
+    /// leaves the tokens readable through [`token_set`](Self::token_set) and
+    /// un-zeroized until the provider itself is dropped.
     pub fn signal_close(&self) {
         // Publish and notify under the same mutex `wait_or_cancel` parks on.
         // Storing outside it races that waiter's `is_closed()` re-check: the

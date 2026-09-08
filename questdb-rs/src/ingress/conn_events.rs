@@ -73,11 +73,26 @@ pub enum ConnectionEventKind {
     /// `None`; `cause_code` is the provider's classification, ordinarily
     /// `SocketError`.
     ///
-    /// **Retryable, and deliberately so.** `classify_provider_error` keeps such
-    /// a failure a `SocketError`, so the store-and-forward drainer holds queued
-    /// frames while the IdP recovers or a human signs in, and the sender goes
-    /// on reconnecting. Only a foreground/initial connect fails fast, because a
-    /// credential problem during initialization is the caller's to see.
+    /// **Read `cause_code` to tell a retry from a stop.** This kind is emitted
+    /// for every provider failure, and `classify_provider_error` does not treat
+    /// them alike:
+    ///
+    /// * `SocketError` -- the ordinary case, and retryable by design. The
+    ///   store-and-forward drainer holds queued frames while the IdP recovers
+    ///   or a human signs in, and the sender goes on reconnecting. Only a
+    ///   foreground/initial connect fails fast, because a credential problem
+    ///   during initialization is the caller's to see.
+    /// * `AuthError` or `ConfigError` -- the provider cannot recover *in this
+    ///   process*, so the reconnect is **terminal** and the runner stops. Two
+    ///   causes reach here: a permanently closed provider (an OIDC provider's
+    ///   `close()` is monotonic) and a misconfiguration the scope cannot satisfy,
+    ///   such as groups mode against an IdP that returns no `id_token`. Queued
+    ///   frames are not deleted -- a disk-backed store-and-forward slot stays
+    ///   drainable by a later process -- but this process will not send them.
+    ///
+    /// A listener that pages on a permanent stop must therefore qualify on
+    /// `cause_code`, not on the kind alone. [`AuthFailed`](Self::AuthFailed)
+    /// stays the *server-rejected-a-credential* signal and is unaffected.
     ///
     /// This is the counterpart of the Java client's
     /// `QwpCredentialUnavailableException`: "a credential the client cannot

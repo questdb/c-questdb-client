@@ -2305,10 +2305,23 @@ int64_t line_sender_now_micros(void);
 /** Terminal: the server rejected a credential the client presented.
  *  `host` / `port` are set. */
 #define questdb_connection_event_auth_failed 6u
-/** Retryable: the token provider failed, so no credential was ever
- *  offered and no endpoint was dialled. `host` / `port` are NULL.
- *  The sender keeps reconnecting and store-and-forward keeps its
- *  queued frames; only a foreground/initial connect fails fast. */
+/** The token provider failed, so no credential was ever offered and no
+ *  endpoint was dialled. `host` / `port` are NULL. Read `cause_code` to
+ *  tell a retry from a stop:
+ *
+ *  - `line_sender_error_socket_error` -- the ordinary case, retryable.
+ *    The sender keeps reconnecting and store-and-forward keeps its queued
+ *    frames; only a foreground/initial connect fails fast.
+ *  - `line_sender_error_auth_error` / `line_sender_error_config_error` --
+ *    the provider cannot recover in this process (a permanently closed
+ *    OIDC provider, or a scope that cannot yield the required token kind),
+ *    so the reconnect is TERMINAL and the runner stops. Queued frames are
+ *    not deleted and a disk-backed slot stays drainable by a later
+ *    process, but this process will not send them.
+ *
+ *  A listener that pages on a permanent stop must qualify on `cause_code`,
+ *  not on the kind alone. `questdb_connection_event_auth_failed` remains
+ *  the server-rejected-a-credential signal and is unaffected. */
 #define questdb_connection_event_credential_unavailable 7u
 
 /** One connection-state transition. String fields are borrowed UTF-8
