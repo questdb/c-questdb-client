@@ -5,6 +5,13 @@ This branch is diagnostic only. Keep sender timeouts and correctness assertions
 unchanged. Azure PR 200 allocates only two macOS workers for
 `TestQwpWsFuzz.test_add_columns`.
 
+Local follow-up, 2026-09-08: a controlled O3 close delay demonstrated global
+`FdCache` lock propagation into both WAL segment work and the serial network
+dispatcher (socket acceptance/closure). Three interleaved inside-lock trials
+delayed unrelated-table ACKs by six seconds; three outside-lock controls did
+not. This establishes a mechanism, not the original macOS trigger. See the
+[experiment, results and rerun instructions](diagnostics/fd_cache_close/README.md).
+
 ## Evidence and limits
 
 - Original [build 266336](https://dev.azure.com/questdb/questdb/_build/results?buildId=266336):
