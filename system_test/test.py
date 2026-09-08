@@ -2023,6 +2023,32 @@ class TestQwpWsProtocol(QwpWsTestSupport, unittest.TestCase):
                 ['r3', None, 'three'],
             ])
 
+    def test_interleaved_symbol_columns_round_trip(self):
+        table_name = 'qwp_ws_order_' + uuid.uuid4().hex[:8]
+        sender_id = 'proto-order-' + uuid.uuid4().hex[:8]
+
+        with tempfile.TemporaryDirectory(prefix='qwp-ws-order-') as sf_dir:
+            sender = self._connect_protocol_sender(sender_id, sf_dir)
+            try:
+                (sender
+                 .table(table_name)
+                 .column('qty', 4)
+                 .symbol('sym', 'ETH-USD')
+                 .column('active', True)
+                 .at_micros(self.BASE_TS_US))
+                fsn = sender.flush_and_get_fsn()
+                self.assertEqual(fsn, 0)
+                sender.wait(0)  # AckLevel::Ok
+                sender.close_drain()
+            finally:
+                sender.close(False)
+
+        resp = self._retry_query_rows(
+            f"select qty, sym, active from '{table_name}'",
+            1,
+            timeout_sec=30)
+        self.assertEqual(resp['dataset'], [[4, 'ETH-USD', True]])
+
     def test_schema_rejection_terminalizes_and_preserves_store(self):
         table_name = 'qwp_ws_reject_' + uuid.uuid4().hex[:8]
         sql_query(
@@ -3479,8 +3505,8 @@ class TestQwpUdpSender(unittest.TestCase):
             for i in range(3):
                 (sender
                  .table(table_name)
-                 .symbol('host', f'srv-{i}')
                  .column('active', i % 2 == 0)
+                 .symbol('host', f'srv-{i}')
                  .column('qty', i + 1)
                  .column('temp', 20.5 + i)
                  .column('note', f'row-{i}')
@@ -3489,8 +3515,8 @@ class TestQwpUdpSender(unittest.TestCase):
 
         resp = retry_check_table(table_name, min_rows=3, timeout_sec=30)
         exp_columns = [
-            {'name': 'host', 'type': 'SYMBOL'},
             {'name': 'active', 'type': 'BOOLEAN'},
+            {'name': 'host', 'type': 'SYMBOL'},
             {'name': 'qty', 'type': 'LONG'},
             {'name': 'temp', 'type': 'DOUBLE'},
             {'name': 'note', 'type': 'VARCHAR'},
@@ -3501,9 +3527,9 @@ class TestQwpUdpSender(unittest.TestCase):
         self.assertEqual(
             scrubbed_dataset,
             [
-                ['srv-0', True, 1, 20.5, 'row-0'],
-                ['srv-1', False, 2, 21.5, 'row-1'],
-                ['srv-2', True, 3, 22.5, 'row-2'],
+                [True, 'srv-0', 1, 20.5, 'row-0'],
+                [False, 'srv-1', 2, 21.5, 'row-1'],
+                [True, 'srv-2', 3, 22.5, 'row-2'],
             ])
 
     def test_f64_array_columns_round_trip_over_qwp_udp(self):
