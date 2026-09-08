@@ -774,7 +774,7 @@ class QuestDbFixture(QuestDbFixtureBase):
         if directory is not None and (directory / 'system-trace-enabled').exists():
             return 90  # recorder initialization only, before workload starts
         if directory is not None and os.environ.get('QWP_WS_MEMORY_PRESSURE') == 'paired':
-            return 60  # recovery and pressure setup only; workload budgets unchanged
+            return 90  # recovery and pressure setup only; workload budgets unchanged
         return 30
 
     def finish_fuzz_diagnostics(self):

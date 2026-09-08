@@ -255,8 +255,7 @@ for run_number in $(seq 1 "$RUN_COUNT"); do
 
     # The test process creates ready_file after QuestDB is accepting requests
     # but before it starts the selected unittest. In the pressure arm, hold it
-    # at that barrier until the macOS pressure helper has had five seconds to
-    # reach the warning state.
+    # at that barrier until the paired arm verifies the actual kernel state.
     (
         system_trace_pid=""
         disk_load_pid=""
@@ -350,7 +349,7 @@ for run_number in $(seq 1 "$RUN_COUNT"); do
             echo "natural-memory control" >"$run_dir/memory-pressure.log"
         fi
         if [[ "$PRESSURE_PLAN" == "paired" ]]; then
-            pressure_gate_args=(gate "$PRESSURE_MODE")
+            pressure_gate_args=(gate "$PRESSURE_MODE" --timeout 45)
             if [[ "$PRESSURE_MODE" == "warn" ]]; then
                 pressure_gate_args+=(--pid "$pressure_pid")
             fi
@@ -358,7 +357,7 @@ for run_number in $(seq 1 "$RUN_COUNT"); do
                     >"$run_dir/pressure-gate.jsonl" 2>"$run_dir/pressure-gate-error.log"; then
                 touch "$run_dir/pressure-target-not-reached"
                 # Do not release a workload under a falsely labelled condition.
-                # Paired pressure setup has a separate 60-second gate budget.
+                # Paired pressure setup has a separate 90-second gate budget.
                 exit 2
             fi
         fi

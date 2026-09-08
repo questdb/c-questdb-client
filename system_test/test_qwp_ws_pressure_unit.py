@@ -26,6 +26,16 @@ class PressureTest(unittest.TestCase):
         wait_for_level('natural', read, mock.Mock(), clock=lambda: 0, sleep=mock.Mock())
         self.assertEqual(read.call_count, 2)
 
+    def test_warning_can_arrive_after_old_twenty_second_bound(self):
+        record = mock.Mock()
+        wait_for_level('warn', mock.Mock(side_effect=[1, 2]), record,
+                       timeout=45, clock=mock.Mock(side_effect=[0, 20, 36]),
+                       sleep=mock.Mock())
+        self.assertEqual(record.call_args_list, [mock.call(1), mock.call(2)])
+        with self.assertRaisesRegex(RuntimeError, 'not reached'):
+            wait_for_level('warn', mock.Mock(), mock.Mock(), timeout=45,
+                           clock=mock.Mock(side_effect=[0, 46]))
+
     def test_gate_rejects_critical_unknown_and_unreached(self):
         for level in (0, 4):
             with self.assertRaisesRegex(RuntimeError, 'unsafe or unknown'):

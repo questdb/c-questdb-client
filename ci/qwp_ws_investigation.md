@@ -4,9 +4,54 @@ Status: server progress interruption observed; root cause **not established**.
 This branch is diagnostic only. Keep sender timeouts and correctness assertions
 unchanged. Azure PR 200 allocates only one macOS worker, running only
 `TestQwpWsFuzz.test_add_columns` with the focused query-stage probe below when
-workload mode is enabled. The current default is export-only, described next.
+workload mode is enabled. The current default is four paired-memory attempts.
 
-## Current action: decode retained VM and scheduler evidence
+## Current action: actual warning-pressure workload
+
+Build 268431's warning state arrived only after its 20-second setup gate had
+expired. The next arm uses natural/warn/warn/natural, keeps the 72-lookup prefix
+and query overlay, and disables the separate disk load. Actual kernel pressure
+must reach the selected level before the workload starts. The target gate is
+45 seconds; fixture setup allows 90 seconds for recovery, helper startup and
+verification. These are pre-workload bounds, not sender or SQL timeout changes.
+Stop on first slow query, observer loss or failure; no new attempt after 600 s.
+Warning at the gate is not proof of sustained warning throughout the workload:
+interpret the retained host samples alongside query events.
+
+## New retained evidence: APFS transaction wake-up chain
+
+Build 268456 decoded build 268363/run-4 without a new workload. Mach VM and
+context-switch exports completed. The all-system scheduler export hit its
+45-second limit after writing a 449 MB partial XML; the complete event rows
+cover the interval below and can be parsed locally. Later tables were not
+exported. Do not equate this tooling failure with a QuestDB failure.
+
+Relative to that recording's retained-window origin, the three HTTP threads
+assert wait on the same kernel event `0x787d29237fe859cd` at 575.828, 576.505
+and 576.515 ms, then block inside their already measured ftruncate calls.
+`apfs_transaction_flusher` (TID 0x1dd) emits make-runnable events for all three
+HTTP TIDs at 853.856208, 853.862708 and 853.863291 ms. The independent target
+context-switch table confirms the corresponding Runnable transitions.
+
+Within that interval the flusher asserts a wait at 635.518541 ms; the next
+make-runnable event for it is emitted by `AppleVirtIOQueue` (TID 0xe4) at
+850.838541 ms: 215.320 ms later. The virtual-I/O thread itself had asserted a
+wait and switched out around 635.512 ms, and does not resume until 850.800 ms.
+This is evidence of an APFS transaction wait and a virtual-I/O wake-up chain
+for this captured short stall, not Java FdCache contention. It does not reveal
+the host-side completion delay, physical device latency, or any burst quota.
+
+Event semantics were checked against Apple's published macOS 15-era XNU
+`xnu-11417.140.69`: `MACH_WAIT` (0x10) records the obfuscated event; and
+`MACH_MAKE_RUNNABLE` (0x6) records the target TID in arg1. The waking execution
+context must not automatically be treated as the originator of an I/O request;
+interrupts may run in an unrelated Java thread's context. APFS internals are
+not established from these event names or opaque wait IDs.
+
+This remains a later short-stall capture. It does not identify what blocked
+the original already-started SHOW COLUMNS for 74.7 seconds.
+
+## Completed arm: decode retained VM and scheduler evidence
 
 Build 268446 passed all eight probe/load attempts, with 95 completed probe
 cursors and maximum query duration 104.499 ms. Each load arm completed its
@@ -16,7 +61,7 @@ No original-like query stall was reproduced. This short, bounded workload does
 not establish quota exhaustion or clear storage as a suspect. Ordinary fsync
 also does not reproduce the Apple F_FULLFSYNC calls used by Rust file syncing.
 
-The next job sets `qwpWsDecodeOnly=true`: download the already recorded build
+Build 268456 used `qwpWsDecodeOnly=true`: download the already recorded build
 268363/run-4 System Trace and export context-switch, virtual-memory, system-load,
 Mach VM and scheduler tables. The run's file names and contents are SHA-256
 pinned independently of ZIP packaging. Export selection uses the current

@@ -169,7 +169,7 @@ class TimeoutDiagnosticsTest(unittest.TestCase):
                     'QWP_WS_MEMORY_PRESSURE': 'natural'}):
                 self.assertEqual(qdb.fuzz_diagnostic_gate_timeout(), 30)
                 with mock.patch.dict(fixture.os.environ, {'QWP_WS_MEMORY_PRESSURE': 'paired'}):
-                    self.assertEqual(qdb.fuzz_diagnostic_gate_timeout(), 60)
+                    self.assertEqual(qdb.fuzz_diagnostic_gate_timeout(), 90)
                     with mock.patch.dict(fixture.os.environ, {'QWP_WS_FUZZ_DIAGNOSTICS': '0'}):
                         self.assertEqual(qdb.fuzz_diagnostic_gate_timeout(), 30)
                 (directory / 'system-trace-enabled').touch()

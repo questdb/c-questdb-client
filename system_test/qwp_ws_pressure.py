@@ -40,6 +40,7 @@ def main():
     gate = commands.add_parser('gate')
     gate.add_argument('mode', choices=('natural', 'warn'))
     gate.add_argument('--pid', type=int)
+    gate.add_argument('--timeout', type=int, choices=range(1, 61), default=20)
     args = parser.parse_args()
     if args.command == 'mode':
         print(mode_for_run(args.plan, args.run))
@@ -56,7 +57,7 @@ def main():
         print(json.dumps(dict(wall_ns=time.time_ns(), monotonic_ns=time.monotonic_ns(),
                               mode=args.mode, level=level)), flush=True)
 
-    wait_for_level(args.mode, read_level, record)
+    wait_for_level(args.mode, read_level, record, timeout=args.timeout)
 
 
 if __name__ == '__main__':
