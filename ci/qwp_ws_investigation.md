@@ -7,7 +7,24 @@ unchanged. Azure PR 200 allocates only one macOS worker, running only
 workload mode is enabled. The current default follows the severe filesystem
 episode captured in build 268479.
 
-## Current action: decode retained raw samples, no workload
+## Current action: repeat without the filesystem helper, query-focused capture
+
+Decoder-only build 268496 successfully regenerated the existing raw report
+using the retained symbolicated report via -symbols. It contains 6,403 kernel
+frame lines, 1,240 named; resolution is partial, not every frame is named.
+The original 151 samples and timestamps are preserved. No new workload ran.
+
+Return to workload mode with up to 24 attempts on ONE Mac and no new attempt
+after 600 seconds. No disk helper and natural guest memory; preserve original
+test inputs, 72-lookup startup prefix, server/JDK and worker shape. Kernel
+capture is query/failure focused: slow SHOW, observer loss or explicit workload
+failure, not short failed pings. Stop at the first capture/failure. Fetch the
+hash-pinned symbol report once before workload gates; onset recording stays
+pipe-based, with no symbol lookup during recording and post-shutdown decoding.
+This removes the external filesystem-helper confound and prioritizes the
+original already-started long query. A passing loop is not proof of root cause.
+
+## Completed arm: decode retained raw samples, no workload
 
 Build 268494 passed three attempts (59 completed SHOW cursors, maximum 52.751
 ms) and retained a 2,140,573-byte raw capture from attempt 3. It decoded into a

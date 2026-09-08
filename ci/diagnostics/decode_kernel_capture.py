@@ -31,15 +31,19 @@ def extract_member(archive_path, member, expected_hash, destination):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('directory', type=Path)
+    parser.add_argument('--symbols-only', action='store_true',
+                        help='Fetch the pinned symbol report before a workload; do not decode or sample')
+    parser.add_argument('--source-directory', type=Path, default=Path('build-exp/kernel-decode-input'))
     args = parser.parse_args()
     directory = args.directory.resolve()
     directory.mkdir(parents=True, exist_ok=False)
     (directory / 'tmp').mkdir()
     if shutil.disk_usage(directory).free < 2 * 1024**3:
         raise RuntimeError('less than 2 GiB free for decoder inputs')
-    source_dir = Path('build-exp/kernel-decode-input').resolve()
+    source_dir = args.source_directory.resolve()
     source_dir.mkdir(parents=True, exist_ok=False)
-    for build, member, digest, filename in SOURCES:
+    sources = SOURCES[1:] if args.symbols_only else SOURCES
+    for build, member, digest, filename in sources:
         archive = source_dir / f'{build}.zip'
         url = (f'https://dev.azure.com/questdb/questdb/_apis/build/builds/{build}/artifacts'
                '?artifactName=qwp-ws-macos-show-columns&api-version=7.1&%24format=zip')
@@ -47,7 +51,9 @@ def main():
                         '--max-time', '90', url, '--output', str(archive)],
                        timeout=95, check=True)
         extract_member(archive, member, digest, directory / filename)
-    (directory / 'inputs.json').write_text(json.dumps(SOURCES, indent=2) + '\n')
+    (directory / 'inputs.json').write_text(json.dumps(sources, indent=2) + '\n')
+    if args.symbols_only:
+        return
     controller = Path(__file__).with_name('kernel_wait_preflight.py').resolve()
     with (directory / 'decode.log').open('w') as log:
         subprocess.run(['sudo', '-n', 'env', f'TMPDIR={directory / "tmp"}',

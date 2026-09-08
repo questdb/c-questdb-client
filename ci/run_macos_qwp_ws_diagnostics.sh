@@ -94,6 +94,12 @@ if [[ "$(sysctl -n hw.logicalcpu)" != "3" ||
     exit 2
 fi
 
+if [[ "$KERNEL_CAPTURE" != "off" ]]; then
+    # Fetch once before workload/monitor gates, never during onset capture.
+    python3 ci/diagnostics/decode_kernel_capture.py \
+        "$DIAG_DIR/kernel-symbols" --symbols-only || exit 2
+fi
+
 snapshot_host() {
     local label="$1"
     {
@@ -525,6 +531,7 @@ for run_number in $(seq 1 "$RUN_COUNT"); do
         if ! sudo -n env TMPDIR="$run_dir/kernel-stacks/tmp" \
                 python3 ci/diagnostics/kernel_wait_preflight.py \
                 "$run_dir/kernel-stacks" --decode \
+                --symbols "$DIAG_DIR/kernel-symbols/symbols.spindump" \
                 >"$run_dir/kernel-stacks/decode.log" 2>&1; then
             echo "Kernel decode failed; raw capture retained" | tee -a "$DIAG_DIR/test.log"
             [[ "$test_rc" -ne 0 ]] || test_rc=2

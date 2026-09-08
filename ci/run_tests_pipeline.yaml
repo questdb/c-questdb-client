@@ -4,7 +4,7 @@ parameters:
   - name: qwpWsDecodeOnly
     displayName: "QWP diagnostics: decode existing trace only (no builds/tests)"
     type: boolean
-    default: true
+    default: false
   - name: qwpWsPreflightOnly
     displayName: "QWP diagnostics: verify recorder startup only (no builds/tests)"
     type: boolean
@@ -480,14 +480,14 @@ stages:
                 # Restore the original 72 missing-table ALTER lookups before
                 # producer connection. This is a scheduling perturbation, not
                 # a recreation of the unknown original startup delay.
-                # Follow the severe low-rate-control failure in 268479.
-                # Keep paired raw-mapping workload, capture two consecutive
-                # failed pings before diagnostic output can stall the observer.
-                # Every attempt permits kernel capture; heartbeat buffers in RAM.
-                # No new attempt after ten minutes; stop at first capture.
-                QWP_WS_DIAGNOSTIC_RUNS: "4"
-                QWP_WS_KERNEL_CAPTURE: ping
-                QWP_WS_DISK_LOAD: "1"
+                # Return to the original query failure without the external
+                # filesystem helper. More repetitions amortize this one build.
+                # Capture slow queries, observer loss or actual workload failure;
+                # short ping failures are telemetry only. Stop first capture.
+                # No new attempt after ten minutes, regardless of run count.
+                QWP_WS_DIAGNOSTIC_RUNS: "24"
+                QWP_WS_KERNEL_CAPTURE: query
+                QWP_WS_DISK_LOAD: "0"
                 QWP_WS_DISK_PATTERN: mapped
                 QWP_WS_STARTUP_LOOKUPS: "72"
                 QWP_WS_MAX_SECONDS: "600"

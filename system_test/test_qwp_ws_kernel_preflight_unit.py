@@ -9,11 +9,31 @@ import zipfile
 from unittest import mock
 
 from ci.diagnostics import kernel_wait_preflight as recorder
+from ci.diagnostics import decode_kernel_capture as decoder
 from ci.diagnostics.kernel_wait_preflight import command, decode_command, inspect_report, raw_command
 from ci.diagnostics.decode_kernel_capture import extract_member
 
 
 class KernelPreflightTest(unittest.TestCase):
+    def test_symbols_only_fetch_does_not_download_raw_or_run_decoder(self):
+        with tempfile.TemporaryDirectory() as temp:
+            directory = Path(temp)
+            output = directory / 'output'
+            sources = ((1, 'unused', 'unused', 'spindump.raw'),
+                       (2, 'symbols', hashlib.sha256(b'symbol bytes').hexdigest(), 'symbols.spindump'))
+            def download(command, **kwargs):
+                self.assertEqual(command[0], 'curl')
+                with zipfile.ZipFile(command[-1], 'w') as z:
+                    z.writestr('symbols', b'symbol bytes')
+            with mock.patch.object(sys, 'argv', ['decoder', str(output), '--symbols-only',
+                                                 '--source-directory', str(directory / 'inputs')]), \
+                    mock.patch.object(decoder, 'SOURCES', sources), \
+                    mock.patch.object(decoder.subprocess, 'run', side_effect=download) as run:
+                decoder.main()
+            self.assertEqual(run.call_count, 1)
+            self.assertEqual((output / 'symbols.spindump').read_bytes(), b'symbol bytes')
+            self.assertFalse((output / 'spindump.raw').exists())
+
     def test_decoder_member_is_hash_pinned_and_does_not_extract_other_paths(self):
         with tempfile.TemporaryDirectory() as temp:
             directory = Path(temp)
