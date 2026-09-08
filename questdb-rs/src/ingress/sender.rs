@@ -678,8 +678,11 @@ impl Sender {
     /// Non-blocking completion watermark for `ack_level`: the polling
     /// counterpart to [`Self::wait`].
     ///
-    /// * [`AckLevel::Ok`] reports the highest FSN the server has accepted
-    ///   (background progress mode; see below for manual mode).
+    /// * [`AckLevel::Ok`] reports the highest FSN completed by server ACK or
+    ///   server-side reject-and-continue, as [`Self::acked_fsn`] describes it
+    ///   (background progress mode; see below for manual mode). A covered
+    ///   frame can therefore have been rejected: check
+    ///   [`Self::poll_qwp_ws_error`] before treating coverage as delivery.
     /// * [`AckLevel::Durable`] reports durable-ACK coverage. Like
     ///   [`Self::wait`] it requires QuestDB Enterprise and a sender opened with
     ///   `request_durable_ack=on`; otherwise the call is rejected up front,
@@ -702,7 +705,8 @@ impl Sender {
     /// mode the watermark only moves if the caller interleaves
     /// [`Self::drive_once`]. It also does not dispatch buffered server
     /// rejections to an installed error handler; that happens on
-    /// [`Self::flush`], [`Self::flush_and_get_fsn`], [`Self::wait`],
+    /// [`Self::flush`], [`Self::flush_and_keep`], [`Self::flush_and_get_fsn`],
+    /// [`Self::flush_and_keep_and_get_fsn`], [`Self::wait`],
     /// [`Self::drive_once`] and [`Self::close_drain`], and a caller that only
     /// polls between those can read them with [`Self::poll_qwp_ws_error`].
     /// QWP/WebSocket only; other protocols return `InvalidApiCall`.
@@ -833,8 +837,8 @@ impl Sender {
     }
 
     /// Completion watermark for `ack_level` across both QWP/WebSocket progress
-    /// modes. `Ok` tracks server acceptance; `Durable` tracks durable-ACK
-    /// coverage. Terminal failures surface here as an `Err`.
+    /// modes. `Ok` tracks completion at the OK level; `Durable` tracks
+    /// durable-ACK coverage. Terminal failures surface here as an `Err`.
     #[cfg(feature = "sync-sender-qwp-ws")]
     fn qwp_ws_completed_fsn(&self, ack_level: AckLevel) -> Result<Option<u64>> {
         match &self.handler {
