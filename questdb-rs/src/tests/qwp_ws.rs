@@ -1620,7 +1620,11 @@ fn spawn_stalled_background_orphan_drain_server() -> (u16, mpsc::Receiver<Vec<u8
 
         // Keep the orphan connection open until the test releases it. A
         // regression that waits for stalled orphan work would block close.
-        let _ = release_rx.recv_timeout(Duration::from_secs(6));
+        // The window matches the other stalled-orphan mocks: a shorter one
+        // lets a slow CI host time out before the test gets to release.
+        // Tests release best-effort for the same reason: an expired park has
+        // dropped the receiver, which is not a product failure.
+        let _ = release_rx.recv_timeout(Duration::from_secs(10));
     });
 
     (port, rx, release_tx)
@@ -4282,7 +4286,7 @@ fn qwp_ws_background_orphan_close_is_bounded_and_leaves_orphan_recoverable() {
     );
     assert!(!orphan_slot.join(".failed").exists());
 
-    release_stalled_orphan.send(()).unwrap();
+    let _ = release_stalled_orphan.send(());
 
     // The recovered slot delta-encodes, so it re-registers its dictionary with a
     // catch-up frame before replaying the data frame; use a server that expects
@@ -4353,7 +4357,7 @@ fn qwp_ws_background_orphan_close_interrupts_stalled_connect() {
     let recovered = recover_rx.recv_timeout(Duration::from_secs(5)).unwrap();
     assert_eq!(recovered.received_frames.len(), 1);
 
-    release_stalled_orphan.send(()).unwrap();
+    let _ = release_stalled_orphan.send(());
 }
 
 #[test]
@@ -4376,17 +4380,41 @@ fn qwp_ws_background_orphan_close_does_not_dial_next_slot() {
         .unwrap();
     let listener = listener_rx.recv_timeout(Duration::from_secs(5)).unwrap();
 
+    // The mock parks on the stalled orphan for 10s. Without a bound here, a
+    // close that waited for that park to expire would still find no second
+    // dial and pass.
+    let started = Instant::now();
     sender.close_drain().unwrap();
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed < Duration::from_secs(5),
+        "background orphan shutdown took {elapsed:?}"
+    );
 
     listener.set_nonblocking(true).unwrap();
     assert!(matches!(
         listener.accept(),
         Err(err) if err.kind() == std::io::ErrorKind::WouldBlock
     ));
+
+    // The close bound alone cannot tell an interrupted worker from one the
+    // pool gave up on and detached, which would still hold the slot lock.
+    // Reopening the stalled slot proves the worker actually exited.
+    let reopen_port = spawn_upgrade_only_server();
+    let reopen_conf = format!(
+        "ws::addr=127.0.0.1:{reopen_port};qwp_ws_progress=manual;\
+         sf_dir={};sender_id=orphan-a;sf_max_segment_bytes=256;sf_max_total_bytes=1024;",
+        sf_dir.path().display()
+    );
+    let reopened = SenderBuilder::from_conf(&reopen_conf)
+        .unwrap()
+        .build()
+        .expect("stalled orphan worker retained the slot lock after close");
+    drop(reopened);
     assert!(slot_has_sfa_file(&sf_dir.path().join("orphan-a")));
     assert!(slot_has_sfa_file(&sf_dir.path().join("orphan-b")));
 
-    release_stalled_orphan.send(()).unwrap();
+    let _ = release_stalled_orphan.send(());
     server.join().unwrap();
 }
 
@@ -4430,7 +4458,7 @@ fn qwp_ws_background_orphan_close_interrupts_blocked_send() {
     drop(reopened);
     assert!(slot_has_sfa_file(&sf_dir.path().join("orphan")));
 
-    release_stalled_orphan.send(()).unwrap();
+    let _ = release_stalled_orphan.send(());
     server.join().unwrap();
 }
 
@@ -4518,6 +4546,124 @@ fn qwp_ws_subsequent_message_delta_encodes_dictionary_and_reemits_full_schema() 
     // (sym, qty) on every frame (at_now() carries no timestamp column).
     assert_eq!(first_table_column_count(&first), 2);
     assert_eq!(first_table_column_count(&second), 2);
+}
+
+/// A publication can fail with the buffer still held: `flush_and_keep` leaves
+/// the rows in place, and a failed flush rolls the connection dictionary back
+/// so the aborted frame's symbols are freed. The caller's recovery is to rewind
+/// to a bookmark taken before the doomed rows and republish.
+///
+/// The buffer tests compare encoded bytes for a buffer in isolation. What only
+/// shows on a live connection is the shared symbol dictionary: it spans frames,
+/// so a rewind that left the discarded rows' cells behind would re-intern their
+/// symbols on the next flush, and the republished frame's delta dictionary
+/// would carry symbols no surviving row references.
+#[test]
+fn qwp_ws_rewind_after_a_failed_publication_republishes_only_surviving_rows() {
+    fn write_row(buf: &mut Buffer, sym: &str, qty: i64) {
+        buf.table("trades")
+            .unwrap()
+            .symbol("sym", sym)
+            .unwrap()
+            .column_i64("qty", qty)
+            .unwrap()
+            .at(TimestampNanos::new(1_700_000_000_000_000_000 + qty))
+            .unwrap();
+    }
+
+    // Two rows whose symbols each weigh most of the cap: together they run
+    // past it, alone either fits. A rewind that unwound only the last row
+    // would therefore leave a buffer that still publishes, and the
+    // dictionary assertions below get to see what it ships.
+    fn write_doomed_rows(buf: &mut Buffer) {
+        for i in 0..2 {
+            let symbol = format!("drop-{i}-{}", "a".repeat(700));
+            write_row(buf, symbol.as_str(), 100 + i);
+        }
+    }
+
+    // The cap sits at the configurable floor: the surviving rows encode well
+    // under it, the doomed ones well over, so that flush and only it is
+    // rejected.
+    let max = 1024;
+    let mut probe = Buffer::qwp_ws_with_max_name_len(127);
+    write_row(&mut probe, "keep-a", 1);
+    write_row(&mut probe, "keep-d", 2);
+    let kept_len = qwp_ws_replay_encoded_len(&probe);
+    assert!(kept_len < max, "kept_len={kept_len}, max={max}");
+
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let (tx, rx) = mpsc::channel();
+
+    thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        stream
+            .set_write_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let request_lines = perform_server_upgrade(&mut stream).unwrap();
+        let mut received_frames = Vec::new();
+        for seq in FIRST_WIRE_SEQUENCE..FIRST_WIRE_SEQUENCE + 2 {
+            let (_fin, _op, payload) = read_frame(&mut stream).unwrap();
+            received_frames.push(payload);
+            write_qwp_ok_response(&mut stream, seq).unwrap();
+        }
+        let _ = tx.send(MockResult {
+            request_lines,
+            received_frames,
+        });
+        thread::sleep(Duration::from_millis(50));
+    });
+
+    let mut sender = SenderBuilder::new(Protocol::Ws, "127.0.0.1", port)
+        .max_buf_size(max)
+        .unwrap()
+        .build()
+        .unwrap();
+    let mut buf = sender.new_buffer();
+
+    // Published, and kept: the buffer the bookmark is taken on is not empty.
+    write_row(&mut buf, "keep-a", 1);
+    sender.flush_and_keep(&buf).unwrap();
+
+    let bookmark = buf.bookmark().unwrap();
+    write_doomed_rows(&mut buf);
+    let err = sender.flush_and_keep(&buf).unwrap_err();
+    assert_eq!(err.code(), ErrorCode::InvalidApiCall, "{err}");
+    assert!(
+        err.msg()
+            .contains("exceeds maximum configured allowed size"),
+        "the doomed flush must fail on the size cap, not another guard: {err}"
+    );
+
+    buf.rewind_to_bookmark(bookmark).unwrap();
+    write_row(&mut buf, "keep-d", 2);
+    sender.flush(&mut buf).unwrap();
+
+    let result = rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    assert_eq!(result.received_frames.len(), 2);
+    let republished = &result.received_frames[1];
+
+    // "keep-a" took id 0 on the first frame, and the doomed flush released the
+    // ids it had claimed. So the republished frame resumes at the watermark and
+    // ships exactly one new symbol: "keep-d".
+    let mut pos = 12;
+    assert_eq!(read_varint(republished, &mut pos), 1, "delta_start");
+    assert_eq!(read_varint(republished, &mut pos), 1, "delta_count");
+    let name_len = read_varint(republished, &mut pos) as usize;
+    assert_eq!(&republished[pos..pos + name_len], b"keep-d");
+    assert!(
+        !republished.windows(5).any(|window| window == b"drop-"),
+        "a discarded row's symbol reached the wire"
+    );
+    assert_eq!(
+        first_table_row_count(republished),
+        2,
+        "kept row + the new one"
+    );
 }
 
 #[test]
@@ -4692,11 +4838,9 @@ fn read_varint(buf: &[u8], pos: &mut usize) -> u64 {
     }
 }
 
-/// Skip past message header + delta dictionary section + first table header,
-/// returning the inline column count declared in the first table block. The
-/// column descriptors ride inline right after this count (no schema-mode byte,
-/// no schema id).
-fn first_table_column_count(frame: &[u8]) -> u64 {
+/// Skip past message header + delta dictionary section + first table name.
+/// What follows is the table's row count varint, then its column count.
+fn first_table_body_pos(frame: &[u8]) -> usize {
     let mut pos = 12; // header
     let _delta_start = read_varint(frame, &mut pos);
     let delta_count = read_varint(frame, &mut pos);
@@ -4704,10 +4848,22 @@ fn first_table_column_count(frame: &[u8]) -> u64 {
         let name_len = read_varint(frame, &mut pos) as usize;
         pos += name_len;
     }
-    // Table header: name (varint+bytes), row_count varint, column_count varint.
     let name_len = read_varint(frame, &mut pos) as usize;
-    pos += name_len;
+    pos + name_len
+}
+
+/// The inline column count declared in the first table block. The column
+/// descriptors ride inline right after this count (no schema-mode byte, no
+/// schema id).
+fn first_table_column_count(frame: &[u8]) -> u64 {
+    let mut pos = first_table_body_pos(frame);
     let _row_count = read_varint(frame, &mut pos);
+    read_varint(frame, &mut pos)
+}
+
+/// The row count declared in the first table block.
+fn first_table_row_count(frame: &[u8]) -> u64 {
+    let mut pos = first_table_body_pos(frame);
     read_varint(frame, &mut pos)
 }
 

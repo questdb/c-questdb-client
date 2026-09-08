@@ -2371,25 +2371,35 @@ impl QwpWsLocalSymbolLookup {
         }
     }
 
-    fn retain_local_ids_below(&mut self, dict_len: usize) {
-        self.buckets.retain(|_, bucket| match bucket {
-            QwpWsLocalSymbolBucket::One(local_id) => (*local_id as usize) < dict_len,
+    fn remove(&mut self, hash: u64, local_id: u32) {
+        use std::collections::hash_map::Entry;
+
+        let Entry::Occupied(mut entry) = self.buckets.entry(hash) else {
+            return;
+        };
+        let now_empty = match entry.get_mut() {
+            QwpWsLocalSymbolBucket::One(existing) => *existing == local_id,
             QwpWsLocalSymbolBucket::Many(local_ids) => {
-                local_ids.retain(|local_id| (*local_id as usize) < dict_len);
-                !local_ids.is_empty()
+                if let Some(pos) = local_ids.iter().rposition(|id| *id == local_id) {
+                    local_ids.remove(pos);
+                }
+                local_ids.is_empty()
             }
-        });
+        };
+        if now_empty {
+            entry.remove();
+        }
     }
 }
 
+/// Lengths a rewind truncates back to; nothing is copied.
 #[cfg(feature = "_sender-qwp-ws")]
 #[derive(Clone, Debug)]
 struct QwpWsSnapshot {
-    tables: Vec<QwpWsTableBuffer>,
-    table_lookup: std::collections::HashMap<Vec<u8>, usize>,
+    tables_len: usize,
+    table_marks: Vec<QwpWsTableRollbackMark>,
     current_table_idx: Option<usize>,
     state: BufferState,
-    size_hint: QwpWsSizeHint,
 }
 
 #[cfg(feature = "_sender-qwp-ws")]
@@ -2637,6 +2647,9 @@ enum QwpWsColumnValues {
     Geohash {
         cells: Vec<QwpWsCell<u64>>,
         precision_bits: u8,
+        /// The precision `precision_bits` displaced when the current batch
+        /// pinned it, restored if a rollback empties the column again.
+        displaced_precision_bits: u8,
     },
     LongArray {
         cells: Vec<QwpWsSliceCell>,
@@ -2694,46 +2707,8 @@ struct QwpWsDecimalCell {
 }
 
 #[cfg(feature = "_sender-qwp-ws")]
-fn pop_value_cell_for_row<T: Copy>(cells: &mut Vec<QwpWsCell<T>>, row_idx: u32) -> bool {
-    if cells.last().is_some_and(|cell| cell.row_idx == row_idx) {
-        cells.pop();
-        true
-    } else {
-        false
-    }
-}
-
-#[cfg(feature = "_sender-qwp-ws")]
-fn pop_slice_cell_for_row(cells: &mut Vec<QwpWsSliceCell>, row_idx: u32) -> Option<QwpWsSliceCell> {
-    if cells.last().is_some_and(|cell| cell.row_idx == row_idx) {
-        cells.pop()
-    } else {
-        None
-    }
-}
-
-#[cfg(feature = "_sender-qwp-ws")]
-fn pop_symbol_cell_for_row(
-    cells: &mut Vec<QwpWsSymbolCell>,
-    row_idx: u32,
-) -> Option<QwpWsSymbolCell> {
-    if cells.last().is_some_and(|cell| cell.row_idx == row_idx) {
-        cells.pop()
-    } else {
-        None
-    }
-}
-
-#[cfg(feature = "_sender-qwp-ws")]
-fn pop_decimal_cell_for_row(
-    cells: &mut Vec<QwpWsDecimalCell>,
-    row_idx: u32,
-) -> Option<QwpWsDecimalCell> {
-    if cells.last().is_some_and(|cell| cell.row_idx == row_idx) {
-        cells.pop()
-    } else {
-        None
-    }
+fn pop_value_cell_from<T: Copy>(cells: &mut Vec<QwpWsCell<T>>, from: u32) -> Option<bool> {
+    cells.pop_if(|cell| cell.row_idx >= from).map(|_| true)
 }
 
 #[cfg(feature = "_sender-qwp-ws")]
@@ -2934,16 +2909,18 @@ impl QwpWsColumnarBuffer {
     }
 
     fn capture_snapshot(&mut self) -> crate::Result<QwpWsMarker> {
+        let mut table_marks = self
+            .snapshot
+            .take()
+            .map(|snapshot| snapshot.table_marks)
+            .unwrap_or_default();
+        table_marks.clear();
+        table_marks.extend(self.tables.iter().map(|t| t.rollback_mark()));
         self.snapshot = Some(QwpWsSnapshot {
-            tables: self.tables.clone(),
-            table_lookup: self.table_lookup.clone(),
+            tables_len: self.tables.len(),
+            table_marks,
             current_table_idx: self.current_table_idx,
             state: self.state,
-            size_hint: self
-                .size_hint
-                .get_mut()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .clone(),
         });
         Ok(QwpWsMarker)
     }
@@ -2953,11 +2930,23 @@ impl QwpWsColumnarBuffer {
             .snapshot
             .take()
             .ok_or_else(|| error::fmt!(InvalidApiCall, "Can't rewind to stale QWP/WS marker."))?;
-        self.tables = snapshot.tables;
-        self.table_lookup = snapshot.table_lookup;
+        // The snapshot carries no per-column state: the one thing truncation
+        // cannot recover, a repinned geohash precision, lives on the column.
+        self.truncate_tables(snapshot.tables_len);
+        let table_count = self.tables.len();
+        let size_hint = self
+            .size_hint
+            .get_mut()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        size_hint.truncate(table_count);
+        let restored = self.tables.iter_mut().zip(snapshot.table_marks);
+        for (idx, (table, mark)) in restored.enumerate() {
+            if table.restore(mark) {
+                size_hint.mark_dirty(idx);
+            }
+        }
         self.current_table_idx = snapshot.current_table_idx;
         self.state = snapshot.state;
-        self.size_hint = Mutex::new(snapshot.size_hint);
         self.bookmark.clear();
         Ok(())
     }
@@ -3646,8 +3635,7 @@ impl QwpWsColumnarBuffer {
             return;
         };
         self.tables[table_idx].restore(row_mark.table_mark);
-        self.tables.truncate(row_mark.tables_len);
-        self.rebuild_table_lookup();
+        self.truncate_tables(row_mark.tables_len);
         self.current_table_idx = row_mark.current_table_idx;
         self.state = row_mark.state;
         let table_count = self.tables.len();
@@ -3658,6 +3646,13 @@ impl QwpWsColumnarBuffer {
         size_hint.truncate(table_count);
         if table_idx < table_count {
             size_hint.mark_dirty(table_idx);
+        }
+    }
+
+    fn truncate_tables(&mut self, tables_len: usize) {
+        if self.tables.len() > tables_len {
+            self.tables.truncate(tables_len);
+            self.rebuild_table_lookup();
         }
     }
 
@@ -3910,17 +3905,30 @@ impl QwpWsTableBuffer {
         }
     }
 
-    fn restore(&mut self, mark: QwpWsTableRollbackMark) {
-        for column in &mut self.columns[..mark.columns_len] {
-            column.rollback_row(mark.row_count);
+    /// Returns whether anything past the mark was discarded. Marks are taken
+    /// on row boundaries, so equal row and column counts with no open row
+    /// mean no cell was appended since.
+    fn restore(&mut self, mark: QwpWsTableRollbackMark) -> bool {
+        debug_assert!(!mark.in_progress);
+        let changed = self.row_count != mark.row_count
+            || self.columns.len() != mark.columns_len
+            || self.in_progress != mark.in_progress;
+        if !changed {
+            return false;
         }
-        self.columns.truncate(mark.columns_len);
+        for column in &mut self.columns[..mark.columns_len] {
+            column.rollback_rows_from(mark.row_count);
+        }
+        if self.columns.len() > mark.columns_len {
+            self.columns.truncate(mark.columns_len);
+            self.rebuild_column_lookup();
+        }
         self.row_count = mark.row_count;
         self.in_progress = mark.in_progress;
         self.in_progress_column_count = mark.in_progress_column_count;
         self.column_access_cursor = mark.column_access_cursor;
         self.row_mark = None;
-        self.rebuild_column_lookup();
+        true
     }
 
     #[inline(always)]
@@ -4064,31 +4072,33 @@ impl QwpWsColumnBuffer {
         self.values.capacity()
     }
 
-    fn rollback_row(&mut self, row_idx: u32) {
-        if self.last_written_row != Some(row_idx) {
-            return;
+    fn rollback_rows_from(&mut self, from: u32) {
+        if let QwpWsColumnValues::Symbol { cells, dict, .. } = &self.values {
+            for cell in cells.iter().rev().take_while(|cell| cell.row_idx >= from) {
+                self.symbol_cells_encoded_len -= qwp_varint_size(cell.local_id as u64);
+                if cell.is_new {
+                    let entry = &dict[cell.local_id as usize];
+                    self.symbol_dict_encoded_len -= qwp_string_byte_len(entry.len as usize);
+                }
+            }
         }
-        if self.values.rollback_row(row_idx) {
-            self.non_null_count -= 1;
+        while let Some(non_null) = self.values.pop_cell_from(from) {
+            if non_null {
+                self.non_null_count -= 1;
+            }
         }
-        self.rebuild_symbol_size_hint();
-        self.last_written_row = None;
-    }
-
-    fn rebuild_symbol_size_hint(&mut self) {
-        let QwpWsColumnValues::Symbol { cells, dict, .. } = &self.values else {
-            self.symbol_cells_encoded_len = 0;
-            self.symbol_dict_encoded_len = 0;
-            return;
-        };
-        self.symbol_cells_encoded_len = cells
-            .iter()
-            .map(|cell| qwp_varint_size(cell.local_id as u64))
-            .sum();
-        self.symbol_dict_encoded_len = dict
-            .iter()
-            .map(|entry| qwp_string_byte_len(entry.len as usize))
-            .sum();
+        // The scale is pinned by the first non-null value, so it only unpins
+        // once none remain.
+        if let QwpWsColumnValues::Decimal { decimal_scale, .. }
+        | QwpWsColumnValues::Decimal64 { decimal_scale, .. }
+        | QwpWsColumnValues::Decimal128 { decimal_scale, .. } = &mut self.values
+            && self.non_null_count == 0
+        {
+            *decimal_scale = QWP_DECIMAL_SCALE_UNSET;
+        }
+        if self.last_written_row.is_some_and(|row| row >= from) {
+            self.last_written_row = None;
+        }
     }
 
     fn uses_null_bitmap(&self, row_count: usize) -> bool {
@@ -4464,6 +4474,7 @@ impl QwpWsColumnBuffer {
         let QwpWsColumnValues::Geohash {
             cells,
             precision_bits: col_precision,
+            displaced_precision_bits,
         } = &mut self.values
         else {
             return Err(type_mismatch_error_ws(&self.name));
@@ -4483,6 +4494,7 @@ impl QwpWsColumnBuffer {
         // encoding precision 0, which the server rejects with
         // "invalid GeoHash precision: 0".
         if cells.is_empty() {
+            *displaced_precision_bits = *col_precision;
             *col_precision = precision_bits;
         } else if *col_precision != precision_bits {
             return Err(error::fmt!(
@@ -4574,6 +4586,7 @@ impl QwpWsColumnValues {
             ColumnKind::Geohash => Self::Geohash {
                 cells: Vec::new(),
                 precision_bits: 0,
+                displaced_precision_bits: 0,
             },
             ColumnKind::LongArray => Self::LongArray {
                 cells: Vec::new(),
@@ -4686,53 +4699,46 @@ impl QwpWsColumnValues {
         }
     }
 
-    fn rollback_row(&mut self, row_idx: u32) -> bool {
+    /// Pops the tail cell if it belongs to row `from` or a later one, reporting
+    /// whether it was non-null. `None` means no cell was popped.
+    fn pop_cell_from(&mut self, from: u32) -> Option<bool> {
         match self {
-            Self::Bool { cells } => pop_value_cell_for_row(cells, row_idx),
-            Self::I8 { cells } => pop_value_cell_for_row(cells, row_idx),
-            Self::I16 { cells } => pop_value_cell_for_row(cells, row_idx),
-            Self::I32 { cells } => pop_value_cell_for_row(cells, row_idx),
-            Self::I64 { cells } => pop_value_cell_for_row(cells, row_idx),
-            Self::F32 { cells } => pop_value_cell_for_row(cells, row_idx),
-            Self::F64 { cells } => pop_value_cell_for_row(cells, row_idx),
-            Self::TimestampMicros { cells } => pop_value_cell_for_row(cells, row_idx),
-            Self::TimestampNanos { cells } => pop_value_cell_for_row(cells, row_idx),
+            Self::Bool { cells } => pop_value_cell_from(cells, from),
+            Self::I8 { cells } => pop_value_cell_from(cells, from),
+            Self::I16 { cells } => pop_value_cell_from(cells, from),
+            Self::I32 { cells } => pop_value_cell_from(cells, from),
+            Self::I64 { cells } => pop_value_cell_from(cells, from),
+            Self::F32 { cells } => pop_value_cell_from(cells, from),
+            Self::F64 { cells } => pop_value_cell_from(cells, from),
+            Self::TimestampMicros { cells } => pop_value_cell_from(cells, from),
+            Self::TimestampNanos { cells } => pop_value_cell_from(cells, from),
             Self::String { cells, data }
             | Self::DoubleArray { cells, data }
-            | Self::Long256 { cells, data } => {
-                if let Some(cell) = pop_slice_cell_for_row(cells, row_idx) {
-                    data.truncate(cell.offset as usize);
-                    true
-                } else {
-                    false
-                }
+            | Self::Long256 { cells, data }
+            | Self::Binary { cells, data }
+            | Self::LongArray { cells, data } => {
+                let cell = cells.pop_if(|cell| cell.row_idx >= from)?;
+                data.truncate(cell.offset as usize);
+                Some(true)
             }
-            Self::Uuid { cells } => pop_value_cell_for_row(cells, row_idx),
-            Self::Ipv4 { cells } => pop_value_cell_for_row(cells, row_idx),
-            Self::Date { cells } => pop_value_cell_for_row(cells, row_idx),
-            Self::Char { cells } => pop_value_cell_for_row(cells, row_idx),
-            Self::Binary { cells, data } => {
-                if let Some(cell) = pop_slice_cell_for_row(cells, row_idx) {
-                    data.truncate(cell.offset as usize);
-                    true
-                } else {
-                    false
+            Self::Uuid { cells } => pop_value_cell_from(cells, from),
+            Self::Ipv4 { cells } => pop_value_cell_from(cells, from),
+            Self::Date { cells } => pop_value_cell_from(cells, from),
+            Self::Char { cells } => pop_value_cell_from(cells, from),
+            Self::Geohash {
+                cells,
+                precision_bits,
+                displaced_precision_bits,
+            } => {
+                let popped = pop_value_cell_from(cells, from)?;
+                // Emptying the column unpins the precision this batch set,
+                // putting back the one it displaced. A rollback can only empty
+                // a column that was empty at the mark, so the displaced value
+                // is exactly the precision the column carried then.
+                if cells.is_empty() {
+                    *precision_bits = *displaced_precision_bits;
                 }
-            }
-            Self::Geohash { cells, .. } => {
-                // Rolling back the last value leaves `cells` empty; the pinned
-                // precision is retained so a reused or partially-rolled-back
-                // column keeps a valid precision. The next value re-pins via
-                // `cells.is_empty()` in `append_geohash`.
-                pop_value_cell_for_row(cells, row_idx)
-            }
-            Self::LongArray { cells, data } => {
-                if let Some(cell) = pop_slice_cell_for_row(cells, row_idx) {
-                    data.truncate(cell.offset as usize);
-                    true
-                } else {
-                    false
-                }
+                Some(popped)
             }
             Self::Symbol {
                 cells,
@@ -4740,43 +4746,22 @@ impl QwpWsColumnValues {
                 lookup,
                 data,
             } => {
-                let Some(cell) = pop_symbol_cell_for_row(cells, row_idx) else {
-                    return false;
-                };
+                let cell = cells.pop_if(|cell| cell.row_idx >= from)?;
                 if cell.is_new
                     && let Some(entry) = dict.pop()
                 {
                     debug_assert_eq!(cell.local_id as usize, dict.len());
+                    let bytes = &data[entry.offset as usize..][..entry.len as usize];
+                    lookup.remove(qwp_ws_symbol_hash(bytes), cell.local_id);
                     data.truncate(entry.offset as usize);
-                    lookup.retain_local_ids_below(dict.len());
                 }
-                true
+                Some(true)
             }
-            Self::Decimal {
-                cells,
-                decimal_scale,
-            }
-            | Self::Decimal64 {
-                cells,
-                decimal_scale,
-            }
-            | Self::Decimal128 {
-                cells,
-                decimal_scale,
-            } => {
-                let Some(cell) = pop_decimal_cell_for_row(cells, row_idx) else {
-                    return false;
-                };
-                if cell.value.is_some() {
-                    *decimal_scale = cells
-                        .iter()
-                        .filter_map(|cell| cell.value.map(|value| value.scale))
-                        .max()
-                        .unwrap_or(QWP_DECIMAL_SCALE_UNSET);
-                    true
-                } else {
-                    false
-                }
+            Self::Decimal { cells, .. }
+            | Self::Decimal64 { cells, .. }
+            | Self::Decimal128 { cells, .. } => {
+                let cell = cells.pop_if(|cell| cell.row_idx >= from)?;
+                Some(cell.value.is_some())
             }
         }
     }
@@ -4828,6 +4813,7 @@ impl QwpWsColumnValues {
             Self::Geohash {
                 cells,
                 precision_bits,
+                ..
             } => {
                 1 + cells
                     .len()
@@ -5164,6 +5150,7 @@ impl QwpWsColumnValues {
             Self::Geohash {
                 cells,
                 precision_bits,
+                ..
             } => {
                 write_qwp_varint(out, *precision_bits as u64);
                 let bytes_per_value = geohash_bytes_per_value(*precision_bits);
@@ -8116,10 +8103,15 @@ mod tests {
         assert_eq!(lookup.get(forced_hash, b"beta", &dict, &data), Some(1));
         assert_eq!(lookup.get(forced_hash, b"gamma", &dict, &data), None);
 
-        lookup.retain_local_ids_below(1);
+        lookup.remove(forced_hash, 1);
 
         assert_eq!(lookup.get(forced_hash, b"alpha", &dict, &data), Some(0));
         assert_eq!(lookup.get(forced_hash, b"beta", &dict, &data), None);
+
+        lookup.remove(forced_hash, 0);
+
+        assert_eq!(lookup.get(forced_hash, b"alpha", &dict, &data), None);
+        assert!(lookup.buckets.is_empty());
     }
 
     #[cfg(feature = "_sender-qwp-ws")]
@@ -10318,6 +10310,49 @@ mod tests {
 
     #[cfg(feature = "_sender-qwp-ws")]
     #[test]
+    fn qwp_ws_columnar_clear_drops_the_rewind_point() {
+        for api in ["marker", "bookmark"] {
+            let mut buf = QwpWsColumnarBuffer::new(127);
+            buf.table("t")
+                .unwrap()
+                .column_i64("v", 1)
+                .unwrap()
+                .at_now()
+                .unwrap();
+            let bookmark = if api == "marker" {
+                buf.set_marker().unwrap();
+                None
+            } else {
+                Some(buf.bookmark().unwrap())
+            };
+            buf.table("t")
+                .unwrap()
+                .column_i64("v", 2)
+                .unwrap()
+                .at_now()
+                .unwrap();
+            buf.clear();
+
+            // The marker is simply gone; a bookmark handle outlives the clear
+            // and is rejected by generation.
+            let (err, expected) = match bookmark {
+                Some(bookmark) => (
+                    buf.rewind_to_bookmark(bookmark).unwrap_err(),
+                    "Bookmark is stale",
+                ),
+                None => (buf.rewind_to_marker().unwrap_err(), "No marker set"),
+            };
+            assert_eq!(err.code(), ErrorCode::InvalidApiCall, "{api}");
+            assert!(
+                err.msg().contains(expected),
+                "{api}: a cleared buffer has no rewind point: {err}"
+            );
+            assert_eq!(buf.row_count(), 0, "{api}: the clear stands");
+        }
+    }
+
+    #[cfg(feature = "_sender-qwp-ws")]
+    #[test]
     fn qwp_ws_columnar_clear_bookmark_drops_only_current_snapshot() {
         let mut buf = QwpWsColumnarBuffer::new(127);
 
@@ -10352,6 +10387,570 @@ mod tests {
             buf.snapshot.is_none(),
             "clearing the current bookmark must release the QWP/WS snapshot"
         );
+    }
+
+    /// Encodes `buf` as a WS replay frame against a fresh connection symbol
+    /// dictionary, so two buffers holding the same rows encode identically,
+    /// symbol delta section included.
+    #[cfg(feature = "_sender-qwp-ws")]
+    fn ws_replay_bytes(buf: &mut QwpWsColumnarBuffer) -> Vec<u8> {
+        let mut scratch = QwpWsEncodeScratch::new();
+        let mut global_dict = SymbolGlobalDict::new();
+        buf.encode_ws_replay_message(&mut scratch, &mut global_dict, QWP_VERSION_1)
+            .unwrap();
+        scratch.message.clone()
+    }
+
+    /// A rewind must unwind every row appended after the mark, not only the
+    /// last one.
+    ///
+    /// `row_count()` alone cannot see a partial rewind: it is a table-level
+    /// counter that the restore assigns directly, so it reads correct even
+    /// when the column buffers still hold the discarded cells. The decisive
+    /// check is the encoded frame -- a rewound buffer must serialise
+    /// byte-for-byte like one that only ever held the surviving rows.
+    #[cfg(feature = "_sender-qwp-ws")]
+    #[test]
+    fn qwp_ws_columnar_rewind_unwinds_every_row_after_the_mark() {
+        // Written before the mark: must survive untouched.
+        fn write_kept_rows(buf: &mut QwpWsColumnarBuffer) {
+            buf.table("trades")
+                .unwrap()
+                .symbol("sym", "ETH-USD")
+                .unwrap()
+                .at(TimestampNanos::new(1_700_000_000_000_000_000))
+                .unwrap();
+            buf.table("quotes")
+                .unwrap()
+                .column_i64("bid", 10)
+                .unwrap()
+                .at(TimestampNanos::new(1_700_000_000_000_000_001))
+                .unwrap();
+        }
+
+        // Written after it: several rows per table, so the rewind spans more
+        // than one row of each; a column that did not exist at the mark; a
+        // table that did not exist at all; and new symbol values, which must
+        // not survive in the column dictionary either.
+        fn write_discarded_rows(buf: &mut QwpWsColumnarBuffer) {
+            for i in 0..3i64 {
+                buf.table("trades")
+                    .unwrap()
+                    .symbol("sym", format!("BTC-USD-{i}").as_str())
+                    .unwrap()
+                    .column_str("note", "added after the mark")
+                    .unwrap()
+                    .at(TimestampNanos::new(1_700_000_001_000_000_000 + i))
+                    .unwrap();
+                buf.table("quotes")
+                    .unwrap()
+                    .column_i64("bid", 200 + i)
+                    .unwrap()
+                    .at(TimestampNanos::new(1_700_000_002_000_000_000 + i))
+                    .unwrap();
+                buf.table("late_table")
+                    .unwrap()
+                    .column_i64("v", i)
+                    .unwrap()
+                    .at(TimestampNanos::new(1_700_000_003_000_000_000 + i))
+                    .unwrap();
+            }
+        }
+
+        let mut reference = QwpWsColumnarBuffer::new(127);
+        write_kept_rows(&mut reference);
+        let expected = ws_replay_bytes(&mut reference);
+
+        // Both rewind surfaces share one capture/restore path.
+        for api in ["marker", "bookmark"] {
+            let mut buf = QwpWsColumnarBuffer::new(127);
+            write_kept_rows(&mut buf);
+
+            let bookmark = if api == "marker" {
+                buf.set_marker().unwrap();
+                None
+            } else {
+                Some(buf.bookmark().unwrap())
+            };
+
+            write_discarded_rows(&mut buf);
+            assert_eq!(buf.row_count(), 11, "{api}: rows before the rewind");
+
+            match bookmark {
+                Some(bookmark) => buf.rewind_to_bookmark(bookmark).unwrap(),
+                None => buf.rewind_to_marker().unwrap(),
+            }
+
+            assert_eq!(buf.row_count(), 2, "{api}: only the pre-mark rows survive");
+            assert_eq!(
+                ws_replay_bytes(&mut buf),
+                expected,
+                "{api}: a rewound buffer must encode exactly the pre-mark rows; \
+                 discarded cells, symbols and columns must not reach the wire"
+            );
+        }
+    }
+
+    /// A rewind must leave the buffer exactly as if the discarded rows had
+    /// never been appended -- for every column kind, at every mark position.
+    ///
+    /// Column state is spread across a per-kind cell vector, a slice arena, a
+    /// symbol dictionary with its lookup, and the counters the size hint
+    /// reads. Unwinding all of them is what makes a rewound buffer
+    /// indistinguishable from one that only ever held the surviving rows, so
+    /// that is what this asserts: same encoded bytes, same size hint, both
+    /// right after the rewind and after appending past it.
+    #[cfg(feature = "_sender-qwp-ws")]
+    #[test]
+    fn qwp_ws_columnar_rewind_matches_a_buffer_without_the_discarded_rows() {
+        // Each row writes a different subset of the columns, so columns end up
+        // with sparse nulls and differing non-null counts, and the symbol
+        // column mixes repeated values with fresh dictionary entries.
+        fn write_row(buf: &mut QwpWsColumnarBuffer, table: &str, i: i64) {
+            let samples = vec![1.0_f64, i as f64];
+            let counts = vec![1_i64, i];
+            let row = buf.table(table).unwrap();
+            row.symbol("sym", format!("sym-{}", i % 3).as_str())
+                .unwrap();
+            if i % 2 == 0 {
+                row.column_bool("flag", i % 4 == 0).unwrap();
+                row.column_i8("i8", i as i8).unwrap();
+                row.column_i16("i16", i as i16).unwrap();
+                row.column_i64("qty", i).unwrap();
+                row.column_str("note", format!("note-{i}").as_str())
+                    .unwrap();
+                row.column_binary("blob", &[i as u8, 0xff]).unwrap();
+                row.column_long256("hash", &[i as u8; 32]).unwrap();
+            }
+            if i % 3 == 0 {
+                row.column_f32("f32", i as f32 + 0.25).unwrap();
+                row.column_f64("px", i as f64 + 0.5).unwrap();
+                row.column_dec("price", format!("{i}.25").as_str()).unwrap();
+                row.column_dec64("fee", format!("{i}.5").as_str()).unwrap();
+                row.column_dec128("notional", format!("{i}.75").as_str())
+                    .unwrap();
+                row.column_uuid("id", i as u64, 7).unwrap();
+                row.column_arr("samples", &samples).unwrap();
+            }
+            if i % 5 != 0 {
+                row.column_i32("i32", i as i32).unwrap();
+                row.column_char("ch", u16::from(b'q')).unwrap();
+                row.column_ipv4("ip", i as u32).unwrap();
+                row.column_date("day", i).unwrap();
+                row.column_geohash("g", 7, 5).unwrap();
+                row.column_arr("counts", &counts).unwrap();
+                row.column_ts("event_ts", TimestampMicros::new(i)).unwrap();
+            }
+            row.at(TimestampNanos::new(1_700_000_000_000_000_000 + i))
+                .unwrap();
+        }
+
+        // A cleared buffer keeps its schema, so the kept rows land in columns
+        // the batch before already shaped. Most column state is reset by the
+        // clear; the geohash precision is not, and a rewind has to restore it
+        // too. Only row 0 skips the geohash column, so the restore is
+        // exercised by the `kept 1` cases.
+        fn prime_then_clear(buf: &mut QwpWsColumnarBuffer) {
+            for table in ["trades", "quotes"] {
+                buf.table(table)
+                    .unwrap()
+                    .symbol("sym", "primed")
+                    .unwrap()
+                    .column_geohash("g", 7, 25)
+                    .unwrap()
+                    .column_dec("price", "9.125")
+                    .unwrap()
+                    .at(TimestampNanos::new(1_600_000_000_000_000_000))
+                    .unwrap();
+            }
+            buf.clear();
+        }
+
+        for kept_rows in 1..=3i64 {
+            for discarded_rows in [1i64, 2, 4] {
+                for start in ["fresh", "cleared"] {
+                    for api in ["marker", "bookmark"] {
+                        let mut reference = QwpWsColumnarBuffer::new(127);
+                        if start == "cleared" {
+                            prime_then_clear(&mut reference);
+                        }
+                        for i in 0..kept_rows {
+                            write_row(&mut reference, "trades", i);
+                            write_row(&mut reference, "quotes", i);
+                        }
+                        let expected = ws_replay_bytes(&mut reference);
+                        let expected_len = reference.len();
+
+                        let mut buf = QwpWsColumnarBuffer::new(127);
+                        if start == "cleared" {
+                            prime_then_clear(&mut buf);
+                        }
+                        for i in 0..kept_rows {
+                            write_row(&mut buf, "trades", i);
+                            write_row(&mut buf, "quotes", i);
+                        }
+
+                        let bookmark = if api == "marker" {
+                            buf.set_marker().unwrap();
+                            None
+                        } else {
+                            Some(buf.bookmark().unwrap())
+                        };
+
+                        for i in kept_rows..kept_rows + discarded_rows {
+                            write_row(&mut buf, "trades", i);
+                            write_row(&mut buf, "quotes", i);
+                            // A table that did not exist at the mark at all.
+                            write_row(&mut buf, "late_table", i);
+                        }
+                        // Fold the size hint now, so the rewind has to refresh
+                        // it rather than inherit the appends' dirty marks.
+                        assert!(
+                            buf.len() > expected_len,
+                            "{api}: the discarded rows must grow the size hint"
+                        );
+
+                        match bookmark {
+                            Some(bookmark) => buf.rewind_to_bookmark(bookmark).unwrap(),
+                            None => buf.rewind_to_marker().unwrap(),
+                        }
+
+                        let case = format!(
+                            "{api}, {start} start, kept {kept_rows}, discarded {discarded_rows}"
+                        );
+                        assert_eq!(
+                            buf.row_count(),
+                            reference.row_count(),
+                            "{case}: row count after the rewind"
+                        );
+                        assert_eq!(
+                            buf.len(),
+                            buf.recompute_len_slow(),
+                            "{case}: the cached size hint must match a full recompute"
+                        );
+                        assert_eq!(
+                            buf.len(),
+                            expected_len,
+                            "{case}: size hint after the rewind"
+                        );
+                        assert_eq!(
+                            ws_replay_bytes(&mut buf),
+                            expected,
+                            "{case}: a rewound buffer must encode exactly the surviving rows"
+                        );
+
+                        // Fixed-width kinds encode by walking row indexes, so a
+                        // leftover cell past the row count is invisible above. It
+                        // only shows once a new row lands on its index, so write
+                        // one more row per table with values no discarded row
+                        // held, and re-create the table the rewind removed.
+                        let next = 100 + kept_rows;
+                        for table in ["trades", "quotes", "late_table"] {
+                            write_row(&mut reference, table, next);
+                            write_row(&mut buf, table, next);
+                        }
+                        assert_eq!(
+                            buf.len(),
+                            buf.recompute_len_slow(),
+                            "{case}: size hint after appending past the rewind"
+                        );
+                        assert_eq!(
+                            buf.len(),
+                            reference.len(),
+                            "{case}: size hint after appending past the rewind"
+                        );
+                        assert_eq!(
+                            ws_replay_bytes(&mut buf),
+                            ws_replay_bytes(&mut reference),
+                            "{case}: rows appended after a rewind must land on \
+                         clean row indexes in every column"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// A rewind may run while a row is open: nothing gates it on the row
+    /// boundary, and a caller that hits an error mid-row is exactly who
+    /// reaches for it. The open row's cells must go with the committed ones,
+    /// whether the row sits in a table the mark knew or in one created after
+    /// it, and the buffer must come back on a row boundary.
+    #[cfg(feature = "_sender-qwp-ws")]
+    #[test]
+    fn qwp_ws_columnar_rewind_discards_an_open_row() {
+        fn write_committed(buf: &mut QwpWsColumnarBuffer, i: i64) {
+            buf.table("trades")
+                .unwrap()
+                .symbol("sym", format!("sym-{i}").as_str())
+                .unwrap()
+                .column_i64("qty", i)
+                .unwrap()
+                .at(TimestampNanos::new(1_700_000_000_000_000_000 + i))
+                .unwrap();
+        }
+
+        for api in ["marker", "bookmark"] {
+            for open_table in ["trades", "late_table"] {
+                let mut reference = QwpWsColumnarBuffer::new(127);
+                write_committed(&mut reference, 0);
+                write_committed(&mut reference, 1);
+
+                let mut buf = QwpWsColumnarBuffer::new(127);
+                write_committed(&mut buf, 0);
+                let bookmark = if api == "marker" {
+                    buf.set_marker().unwrap();
+                    None
+                } else {
+                    Some(buf.bookmark().unwrap())
+                };
+
+                // A committed row past the mark, then a row left open with a
+                // new symbol and a column the mark never saw.
+                write_committed(&mut buf, 5);
+                buf.table(open_table)
+                    .unwrap()
+                    .symbol("sym", "open")
+                    .unwrap()
+                    .column_str("note", "never committed")
+                    .unwrap();
+                let case = format!("{api}, open row in {open_table}");
+                assert_eq!(buf.row_count(), 2, "{case}: an open row is not counted");
+
+                match bookmark {
+                    Some(bookmark) => buf.rewind_to_bookmark(bookmark).unwrap(),
+                    None => buf.rewind_to_marker().unwrap(),
+                }
+
+                assert_eq!(buf.row_count(), 1, "{case}: only the pre-mark row survives");
+                let err = buf.column_i64("qty", 9).unwrap_err();
+                assert_eq!(
+                    err.code(),
+                    ErrorCode::InvalidApiCall,
+                    "{case}: the rewound buffer is back on a row boundary"
+                );
+
+                write_committed(&mut buf, 1);
+                assert_eq!(
+                    buf.len(),
+                    buf.recompute_len_slow(),
+                    "{case}: the cached size hint must match a full recompute"
+                );
+                assert_eq!(buf.len(), reference.len(), "{case}: size hint");
+                assert_eq!(
+                    ws_replay_bytes(&mut buf),
+                    ws_replay_bytes(&mut reference),
+                    "{case}: the open row must leave nothing behind"
+                );
+            }
+        }
+    }
+
+    #[cfg(feature = "_sender-qwp-ws")]
+    #[test]
+    fn qwp_ws_columnar_rewind_recomputes_only_the_tables_it_unwound() {
+        let mut buf = QwpWsColumnarBuffer::new(127);
+        for table in ["a", "b", "c"] {
+            buf.table(table)
+                .unwrap()
+                .column_i64("value", 1)
+                .unwrap()
+                .at_now()
+                .unwrap();
+        }
+        assert_eq!(buf.len(), buf.recompute_len_slow());
+        let recomputed = buf.size_hint_recomputed_tables();
+
+        buf.set_marker().unwrap();
+        buf.rewind_to_marker().unwrap();
+        assert_eq!(buf.len(), buf.recompute_len_slow());
+        assert_eq!(
+            buf.size_hint_recomputed_tables(),
+            recomputed,
+            "a rewind that discards nothing leaves every table valid"
+        );
+
+        buf.set_marker().unwrap();
+        for i in 0..3 {
+            buf.table("b")
+                .unwrap()
+                .column_i64("value", i)
+                .unwrap()
+                .at_now()
+                .unwrap();
+        }
+        buf.rewind_to_marker().unwrap();
+        assert_eq!(buf.len(), buf.recompute_len_slow());
+        assert_eq!(
+            buf.size_hint_recomputed_tables(),
+            recomputed + 1,
+            "only the table the rewind unwound is recomputed"
+        );
+    }
+
+    /// The decimal scale is pinned by the first non-null value a column sees.
+    /// A rewind that discards that value must unpin it, and one that keeps it
+    /// must not, so that the next value encodes against the right scale.
+    #[cfg(feature = "_sender-qwp-ws")]
+    #[test]
+    fn qwp_ws_columnar_rewind_keeps_decimal_scale_pinned_by_surviving_rows() {
+        fn write_dec(buf: &mut QwpWsColumnarBuffer, value: &str) {
+            buf.table("trades")
+                .unwrap()
+                .column_dec("price", value)
+                .unwrap()
+                .at_now()
+                .unwrap();
+        }
+
+        // Every non-null value is discarded: the scale unpins, and "1.23"
+        // pins scale 2 afresh.
+        let mut reference = QwpWsColumnarBuffer::new(127);
+        write_dec(&mut reference, "NaN");
+        write_dec(&mut reference, "1.23");
+
+        let mut buf = QwpWsColumnarBuffer::new(127);
+        write_dec(&mut buf, "NaN");
+        buf.set_marker().unwrap();
+        write_dec(&mut buf, "1.2");
+        write_dec(&mut buf, "3.4");
+        buf.rewind_to_marker().unwrap();
+        write_dec(&mut buf, "1.23");
+        assert_eq!(ws_replay_bytes(&mut buf), ws_replay_bytes(&mut reference));
+
+        // The pinning value survives: scale 2 stays pinned and "5.6" is
+        // rescaled to it, exactly as if the discarded rows had never been
+        // written. An unpinned column would let "5.6" pin scale 1 instead,
+        // which "1.25" cannot be encoded at.
+        let mut reference = QwpWsColumnarBuffer::new(127);
+        write_dec(&mut reference, "1.25");
+        write_dec(&mut reference, "5.6");
+
+        let mut buf = QwpWsColumnarBuffer::new(127);
+        write_dec(&mut buf, "1.25");
+        buf.set_marker().unwrap();
+        write_dec(&mut buf, "3.4");
+        write_dec(&mut buf, "NaN");
+        buf.rewind_to_marker().unwrap();
+        write_dec(&mut buf, "5.6");
+        assert_eq!(ws_replay_bytes(&mut buf), ws_replay_bytes(&mut reference));
+    }
+
+    /// A geohash column keeps its precision across a clear, so a reused
+    /// column that no row writes still encodes the precision the server's
+    /// column has. The first value of the next batch repins it -- and a rewind
+    /// that discards that value must put back the precision it displaced,
+    /// otherwise the surviving all-null column advertises a precision no row
+    /// ever asked for and the server rejects the batch.
+    #[cfg(feature = "_sender-qwp-ws")]
+    #[test]
+    fn qwp_ws_columnar_rewind_restores_the_precision_a_discarded_row_repinned() {
+        fn write_geohash(buf: &mut QwpWsColumnarBuffer, precision_bits: u8) {
+            buf.table("trades")
+                .unwrap()
+                .column_geohash("g", 7, precision_bits)
+                .unwrap()
+                .at_now()
+                .unwrap();
+        }
+
+        fn write_without_geohash(buf: &mut QwpWsColumnarBuffer) {
+            buf.table("trades")
+                .unwrap()
+                .column_i64("n", 1)
+                .unwrap()
+                .at_now()
+                .unwrap();
+        }
+
+        for api in ["marker", "bookmark"] {
+            let mut reference = QwpWsColumnarBuffer::new(127);
+            write_geohash(&mut reference, 25);
+            reference.clear();
+            write_without_geohash(&mut reference);
+
+            let mut buf = QwpWsColumnarBuffer::new(127);
+            write_geohash(&mut buf, 25);
+            buf.clear();
+            write_without_geohash(&mut buf);
+
+            let bookmark = if api == "marker" {
+                buf.set_marker().unwrap();
+                None
+            } else {
+                Some(buf.bookmark().unwrap())
+            };
+            write_geohash(&mut buf, 5);
+            match bookmark {
+                Some(bookmark) => buf.rewind_to_bookmark(bookmark).unwrap(),
+                None => buf.rewind_to_marker().unwrap(),
+            }
+
+            assert_eq!(
+                ws_replay_bytes(&mut buf),
+                ws_replay_bytes(&mut reference),
+                "{api}: a rewound all-null geohash column must keep the \
+                 precision it carried at the mark"
+            );
+
+            // The repin is undone, not disabled: the next batch still sets its
+            // own precision.
+            write_geohash(&mut buf, 5);
+            write_geohash(&mut reference, 5);
+            assert_eq!(
+                ws_replay_bytes(&mut buf),
+                ws_replay_bytes(&mut reference),
+                "{api}: a row appended after the rewind must repin the precision"
+            );
+        }
+    }
+
+    /// The mid-row error rollback reaches the same column unwind as a rewind,
+    /// through the mark `table()` took at the start of the row. A row that
+    /// repins a reused geohash column and then fails must leave the retained
+    /// precision in place, or the next batch's all-null column encodes the
+    /// precision the failed row asked for.
+    #[cfg(feature = "_sender-qwp-ws")]
+    #[test]
+    fn qwp_ws_columnar_failed_row_restores_the_precision_it_repinned() {
+        fn write_geohash(buf: &mut QwpWsColumnarBuffer, precision_bits: u8) {
+            buf.table("pos")
+                .unwrap()
+                .column_geohash("g", 7, precision_bits)
+                .unwrap()
+                .at_now()
+                .unwrap();
+        }
+
+        fn write_without_geohash(buf: &mut QwpWsColumnarBuffer) {
+            buf.table("pos")
+                .unwrap()
+                .column_i64("n", 1)
+                .unwrap()
+                .at_now()
+                .unwrap();
+        }
+
+        let mut reference = QwpWsColumnarBuffer::new(127);
+        write_geohash(&mut reference, 25);
+        reference.clear();
+        write_without_geohash(&mut reference);
+
+        let mut buf = QwpWsColumnarBuffer::new(127);
+        write_geohash(&mut buf, 25);
+        buf.clear();
+        buf.table("pos").unwrap().column_geohash("g", 7, 5).unwrap();
+        let err = buf.column_i64("g", 1).unwrap_err();
+        assert_eq!(err.code(), ErrorCode::InvalidApiCall);
+        write_without_geohash(&mut buf);
+
+        let bytes = ws_replay_bytes(&mut buf);
+        let (_, precision) = ws_first_geohash_precision(&bytes);
+        assert_eq!(
+            precision, 25,
+            "a failed row's repin must not outlive its rollback"
+        );
+        assert_eq!(bytes, ws_replay_bytes(&mut reference));
     }
 
     #[cfg(feature = "_sender-qwp-ws")]

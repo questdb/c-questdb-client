@@ -387,6 +387,49 @@ TEST_CASE("one borrowed_sender sends a Buffer and a Chunk")
     sender.drop_on_return();
 }
 
+// The QWP/WS row buffer reaches C and C++ through the pool, and its rewind
+// records lengths rather than copying what it discards. On a real connection
+// the discarded rows' symbols would ride in the published frame's dictionary
+// if the rewind left their cells behind.
+TEST_CASE("borrowed_sender publishes only the rows a bookmark rewind kept")
+{
+    auto mock = spawn_acking_mock(1);
+    questdb::pool db{conf_for(mock->addr())};
+    auto sender = db.borrow_sender();
+
+    auto buf = sender.new_buffer();
+    buf.table("trades")
+        .symbol("sym", "keep")
+        .column("qty", int64_t{1})
+        .at_now();
+
+    auto bm = buf.bookmark();
+    // Several rows past the bookmark: unwinding one is the case a single-row
+    // rollback happens to cover, unwinding several is not.
+    for (int i = 0; i < 3; ++i)
+    {
+        buf.table("trades")
+            .symbol("sym", "drop-" + std::to_string(i))
+            .column("qty", static_cast<int64_t>(100 + i))
+            .at_now();
+    }
+    CHECK(buf.row_count() == 4);
+
+    buf.rewind_to_bookmark(bm);
+    CHECK(buf.row_count() == 1);
+
+    sender.flush_and_wait(buf);
+
+    auto requests = mock->captured_requests();
+    REQUIRE(requests.size() == 1);
+    const std::string frame{
+        reinterpret_cast<const char*>(requests[0].data()), requests[0].size()};
+    CHECK(frame.find("keep") != std::string::npos);
+    CHECK(frame.find("drop-") == std::string::npos);
+
+    sender.drop_on_return();
+}
+
 TEST_CASE("borrowed_sender flush_and_wait round-trips through the mock")
 {
     auto mock = spawn_acking_mock(1);

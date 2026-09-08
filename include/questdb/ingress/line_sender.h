@@ -814,7 +814,8 @@ void line_sender_buffer_clear_marker(line_sender_buffer* buffer);
 
 /**
  * Remove all accumulated data and prepare the buffer for new lines.
- * This does not affect the buffer's capacity.
+ * This does not affect the buffer's capacity. Any stored rewind point
+ * (marker or bookmark) is discarded.
  */
 QUESTDB_CLIENT_API
 void line_sender_buffer_clear(line_sender_buffer* buffer);

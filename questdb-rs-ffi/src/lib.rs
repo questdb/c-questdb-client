@@ -1477,7 +1477,8 @@ pub unsafe extern "C" fn line_sender_buffer_clear_marker(buffer: *mut line_sende
 }
 
 /// Remove all accumulated data and prepare the buffer for new lines.
-/// This does not affect the buffer's capacity.
+/// This does not affect the buffer's capacity. Any stored rewind point
+/// (marker or bookmark) is discarded.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn line_sender_buffer_clear(buffer: *mut line_sender_buffer) {
     unsafe {
