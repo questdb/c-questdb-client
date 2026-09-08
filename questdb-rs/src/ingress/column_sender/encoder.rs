@@ -1342,6 +1342,72 @@ mod tests {
         out
     }
 
+    // Comparing equal-width precisions isolates the forced bitmap from the
+    // estimator's other conservative slack: a mere estimated >= encoded
+    // assertion would pass even if the bitmap accounting were removed.
+    fn assert_geohash_bitmap_estimate(dense: &Chunk<'_>, bitmap: &Chunk<'_>, rows: usize) {
+        let estimate = |chunk| estimate_frame_size(chunk, rows, &[], 0, &[]);
+        assert_eq!(estimate(bitmap) - estimate(dense), rows.div_ceil(8));
+        let dense_frame = encode_fresh(dense);
+        let bitmap_frame = encode_fresh(bitmap);
+        assert_eq!(bitmap_frame.len() - dense_frame.len(), rows.div_ceil(8));
+        assert!(estimate(bitmap) >= bitmap_frame.len());
+    }
+
+    #[test]
+    fn numpy_geohash_estimator_accounts_for_forced_bitmap_boundaries() {
+        use super::super::NumpyDtype;
+        for rows in [7_usize, 8, 9, 16, 17, 129] {
+            let values = vec![1_i64; rows];
+            for bits in [8, 16, 24, 32, 40, 48, 56] {
+                let mut dense = Chunk::new("t");
+                let mut bitmap = Chunk::new("t");
+                for (chunk, precision) in [(&mut dense, bits - 1), (&mut bitmap, bits)] {
+                    // SAFETY: values is contiguous i64 storage and outlives
+                    // both chunks and their synchronous encodes.
+                    unsafe {
+                        chunk
+                            .push_numpy_deferred(
+                                "g",
+                                NumpyDtype::GeohashI64 { bits: precision },
+                                values.as_ptr().cast(),
+                                rows,
+                                None,
+                            )
+                            .unwrap();
+                    }
+                    chunk.at_now().unwrap();
+                }
+                assert_geohash_bitmap_estimate(&dense, &bitmap, rows);
+            }
+        }
+    }
+
+    #[cfg(feature = "arrow-ingress")]
+    #[test]
+    fn arrow_geohash_estimator_accounts_for_forced_bitmap_boundaries() {
+        use arrow::array::Int64Array;
+        use std::sync::Arc;
+        for rows in [7_usize, 8, 9, 16, 17, 129] {
+            let values = Arc::new(Int64Array::from(vec![1_i64; rows]));
+            for bits in [8, 16, 24, 32, 40, 48, 56] {
+                let mut dense = Chunk::new("t");
+                let mut bitmap = Chunk::new("t");
+                for (chunk, precision) in [(&mut dense, bits - 1), (&mut bitmap, bits)] {
+                    chunk
+                        .push_arrow_deferred(
+                            "g",
+                            arrow_batch::ColumnKind::Geohash(precision),
+                            values.clone(),
+                        )
+                        .unwrap();
+                    chunk.at_now().unwrap();
+                }
+                assert_geohash_bitmap_estimate(&dense, &bitmap, rows);
+            }
+        }
+    }
+
     #[test]
     fn checked_symbol_slot_rejects_out_of_range_and_negative_codes() {
         // Defence-in-depth for a codes buffer mutated between append and flush

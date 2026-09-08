@@ -13397,6 +13397,84 @@ mod tests {
     }
 
     #[test]
+    fn qwp_geohash_planner_bitmap_boundaries_rollback_and_datagram_caps() {
+        for bits in [8, 16, 24, 32, 40, 48, 56] {
+            for sparse in [false, true] {
+                let mut buf = QwpBuffer::new(127);
+                for i in 0..17 {
+                    buf.table("t").unwrap().column_i64("id", i).unwrap();
+                    if !sparse || i % 3 != 1 {
+                        buf.column_geohash("g", (1_u64 << bits) - 1, bits).unwrap();
+                    }
+                    buf.at_now().unwrap();
+                }
+                let mut planner = RowGroupPlanner::new();
+                let mut first_row_len = 0;
+                for (idx, row) in buf.rows.iter().enumerate() {
+                    let checkpoint = planner.checkpoint();
+                    let before = planner.current_len;
+                    let entries = buf.entries_for_row(row);
+                    planner
+                        .add_row(row, entries, &buf.name_bytes, &buf.value_bytes, 1)
+                        .unwrap();
+                    let actual =
+                        encoded_planner_len(&planner, &buf.name_bytes, &buf.value_bytes, "t");
+                    assert_eq!(
+                        planner.current_len,
+                        actual,
+                        "bits={bits}, sparse={sparse}, rows={}",
+                        idx + 1
+                    );
+                    // Roll back and re-add at every prefix, including 7/8/9
+                    // and 16/17 rows where bitmap byte accounting changes.
+                    planner.rollback(checkpoint);
+                    assert_eq!(planner.current_len, before);
+                    if idx != 0 {
+                        assert_eq!(
+                            before,
+                            encoded_planner_len(&planner, &buf.name_bytes, &buf.value_bytes, "t",)
+                        );
+                    }
+                    planner
+                        .add_row(row, entries, &buf.name_bytes, &buf.value_bytes, 1)
+                        .unwrap();
+                    assert_eq!(planner.current_len, actual);
+                    if idx == 0 {
+                        first_row_len = actual;
+                    }
+                }
+                let whole = buf.encode_datagrams(64 * 1024).unwrap();
+                assert_eq!(whole.len(), 1);
+                let expected = decode_datagram(&whole[0]).unwrap().table.rows;
+                for cap in [first_row_len, first_row_len + 1, first_row_len + 16] {
+                    let datagrams = buf.encode_datagrams(cap).unwrap();
+                    assert!(datagrams.len() > 1);
+                    let mut rows = Vec::new();
+                    for datagram in datagrams {
+                        assert!(
+                            datagram.len() <= cap,
+                            "bits={bits}, sparse={sparse}, cap={cap}"
+                        );
+                        rows.extend(decode_datagram(&datagram).unwrap().table.rows);
+                    }
+                    // Sparse datagrams can omit the GEOHASH column altogether;
+                    // the id column still proves every row survived in order.
+                    assert_eq!(rows.len(), expected.len());
+                    for (got, expected) in rows.iter().zip(&expected) {
+                        assert_eq!(got[0], expected[0]);
+                        if got.len() == expected.len() {
+                            assert_eq!(got, expected);
+                        } else {
+                            assert!(sparse);
+                            assert_eq!(expected[1], DecodedValue::Null);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
     fn qwp_byte_aligned_geohash_max_value_is_not_null() {
         let mut buf = QwpBuffer::new(127);
         buf.table("t")
