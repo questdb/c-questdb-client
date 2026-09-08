@@ -37,6 +37,10 @@ watchdog samples native/JVM stacks. Do not interpret post-trigger samples as the
 entire preceding interval. Normal queries perform no diagnostic file I/O on the
 request worker. There is still allocation/queue overhead; this is not a zero-cost
 observer. The queue is bounded to 8192 records and loss is explicitly rejected.
+Native sampling finishes before SIGQUIT is sent: HotSpot prints SIGQUIT dumps
+at a safepoint, and blocked dump output can itself extend the JVM pause. Native
+samples still begin after detection; the subsequent Java stacks are later
+snapshots, not simultaneous observations of the same state.
 
 The observer is a JVM daemon and can be paused with the JVM. Its file writes can
 also block. Missing telemetry is a diagnostic failure, not a healthy result.

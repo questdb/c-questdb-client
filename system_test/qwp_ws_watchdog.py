@@ -105,15 +105,25 @@ def capture(run_dir, pid, reason):
                     (run_dir / 'capture-error').write_text(repr(exc) + '\n')
             else:
                 write_event(log, 'native_sample_unavailable', platform=sys.platform)
+            if sample is not None:
+                try:
+                    # SIGQUIT prints at a JVM safepoint. A blocked stdout can
+                    # extend that pause, so finish native sampling first;
+                    # otherwise we can profile our own dump-induced stall.
+                    rc = sample.wait(timeout=10)
+                    write_event(log, 'native_sample_exit', returncode=rc)
+                    if rc != 0 or not (run_dir / 'native-sample.txt').is_file():
+                        raise RuntimeError('native sample failed or produced no output')
+                except Exception as exc:
+                    write_event(log, 'native_sample_error', error=repr(exc))
+                    (run_dir / 'capture-error').write_text(repr(exc) + '\n')
+                    if sample.poll() is None:
+                        sample.kill()
+                        sample.wait()
             for index in range(3):
                 os.kill(pid, signal.SIGQUIT)
                 write_event(log, 'sigquit_requested', index=index)
                 time.sleep(0.5)
-            if sample is not None:
-                rc = sample.wait(timeout=10)
-                write_event(log, 'native_sample_exit', returncode=rc)
-                if rc != 0 or not (run_dir / 'native-sample.txt').is_file():
-                    raise RuntimeError('native sample failed or produced no output')
         except Exception as exc:
             write_event(log, 'capture_error', error=repr(exc))
             (run_dir / 'capture-error').write_text(repr(exc) + '\n')

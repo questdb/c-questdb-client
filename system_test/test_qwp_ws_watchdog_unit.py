@@ -230,8 +230,26 @@ class WatchdogTest(unittest.TestCase):
                 '/usr/bin/sample', '123', '3', '10', '-file',
                 str(directory / 'native-sample.txt')])
             self.assertEqual(send.call_args_list, [mock.call(123, signal.SIGQUIT)] * 3)
+            events = [json.loads(line)['event'] for line in (directory / 'capture.jsonl').read_text().splitlines()]
+            self.assertLess(events.index('native_sample_exit'), events.index('sigquit_requested'))
             self.assertTrue((directory / 'capture-complete').exists())
             self.assertFalse((directory / 'capture-error').exists())
+
+    def test_native_sample_timeout_still_requests_jvm_dumps(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            child = mock.Mock()
+            child.wait.side_effect = [watchdog.subprocess.TimeoutExpired('sample', 10), 0]
+            child.poll.side_effect = [None, 0]
+            with mock.patch.object(watchdog.sys, 'platform', 'darwin'), \
+                    mock.patch.object(watchdog.subprocess, 'Popen', return_value=child), \
+                    mock.patch.object(watchdog.os, 'kill') as send, \
+                    mock.patch.object(watchdog.time, 'sleep'):
+                watchdog.capture(directory, 123, 'timeout')
+            child.kill.assert_called_once()
+            self.assertEqual(send.call_count, 3)
+            self.assertTrue((directory / 'capture-error').exists())
+            self.assertTrue((directory / 'capture-complete').exists())
 
     def test_final_workload_error_is_captured_before_teardown_ack(self):
         with tempfile.TemporaryDirectory() as tmp:

@@ -52,9 +52,23 @@ not. This establishes a mechanism, not the original macOS trigger. See the
   12:19:06.083621, then reports a server-side timeout after 74,706 ms.
   HTTP, WAL purge and WAL-apply log activity resumes together. A producer's
   close-drain timeout follows at 12:19:44.
-- The first JVM dump, at 12:20:12, is **after failure and during DROP cleanup**:
+- The first JVM dump, headed 12:20:12, is **after failure and during DROP cleanup**:
   three HTTP workers in truncate/msync paths, two WAL-apply workers idle.
   It establishes a late software location, not the original limiting resource.
+- Timing audit: QueryProgress duration uses `Os.currentTimeNanos()` backed by
+  `clock_gettime(CLOCK_REALTIME)` in the pinned server; the SQL breaker uses
+  `System.currentTimeMillis()`. Agreement between reported duration and log
+  timestamps is not independent monotonic confirmation. Client close-drain
+  deadlines use Rust `Instant`. A wall-clock adjustment alone does not explain
+  the client deadline expiring; the original interval lacks paired clocks.
+- The two original dump headers are 391 seconds apart, but the persistent
+  Reference Handler's monotonic elapsed counters differ by 363.79 seconds.
+  HotSpot samples the header before printing thread elapsed counters; stalled
+  output can separate them. Do not assign all first-dump frames precisely to
+  12:20:12. No original clock-adjustment or dump-output latency record exists.
+- First-dump cumulative CPU: all three HTTP threads total 3941.47 ms; GC workers
+  total 227.60 ms. These constrain CPU-work explanations, not off-CPU waits or
+  time to reach a safepoint. They are not interval-specific measurements.
 - WAL commit/ordinary ACK does not normally await O3 application. Both paths
   still share OS resources; schema changes also reconcile and roll WAL files.
   The fuzz case includes type conversions, despite its name.
