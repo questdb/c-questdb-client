@@ -31,7 +31,7 @@ use std::time::{Duration, Instant};
 use crate::ErrorCode;
 use crate::ingress::sender::delta_encoded_frame_fixture;
 use crate::ingress::{
-    AckLevel, Buffer, Protocol, QwpWsErrorCategory, QwpWsErrorPolicy, QwpWsProgress, Sender,
+    AckLevel, Buffer, Protocol, QwpWsErrorCategory, QwpWsErrorPolicy, QwpWsProgress, RelaySender,
     SenderBuilder, TimestampNanos,
 };
 
@@ -57,22 +57,13 @@ fn self_contained_frame(symbol: &str, seq: i64) -> Vec<u8> {
     buffer.encode_self_contained().unwrap()
 }
 
-fn connectionless_sender() -> Sender {
-    Sender::from_conf("ws::addr=127.0.0.1:1;initial_connect_retry=async;").unwrap()
+fn connectionless_relay() -> RelaySender {
+    RelaySender::from_conf("ws::addr=127.0.0.1:1;initial_connect_retry=async;").unwrap()
 }
 
-fn size_limited_connectionless_sender(max_buf_size: usize) -> Sender {
-    Sender::from_conf(format!(
+fn size_limited_connectionless_relay(max_buf_size: usize) -> RelaySender {
+    RelaySender::from_conf(format!(
         "ws::addr=127.0.0.1:1;initial_connect_retry=async;max_buf_size={max_buf_size};"
-    ))
-    .unwrap()
-}
-
-fn persistent_connectionless_sender(sf_dir: &std::path::Path) -> Sender {
-    Sender::from_conf(format!(
-        "ws::addr=127.0.0.1:1;initial_connect_retry=async;\
-         reconnect_max_duration_millis=5000;sf_dir={};sender_id=relay-test;",
-        sf_dir.display()
     ))
     .unwrap()
 }
@@ -162,7 +153,7 @@ fn encode_self_contained_rejects_non_websocket_and_empty_buffers() {
 
 #[test]
 fn flush_encoded_rejects_non_self_contained_bytes_before_io() {
-    let mut sender = connectionless_sender();
+    let mut sender = connectionless_relay();
     for invalid in [
         &[0xff, 0xff, 0xff, 0xff][..],
         delta_encoded_frame_fixture().as_slice(),
@@ -173,60 +164,44 @@ fn flush_encoded_rejects_non_self_contained_bytes_before_io() {
     }
 }
 
-/// A file-backed slot survives the `Sender` that chose its dictionary regime,
-/// while `qwp_ws_ingress_mode` does not. Accepting relay bytes here could put a
-/// base-0 relay frame behind recovered typed deltas (or interpret recovered
-/// relay bytes as typed history). The rejection must be local: this endpoint is
-/// unreachable and the caller must not publish anything while the background
-/// runner is still trying to dial it.
+/// A file-backed slot survives the process that chose its dictionary regime,
+/// so a later typed-row `Sender` could recover base-0 relay frames as typed
+/// history (or vice versa). The rejection is a build-time config error: no
+/// connection is dialled and no slot is minted under `sf_dir`.
 #[test]
-fn flush_encoded_rejects_persistent_store_before_mode_claim_or_io() {
+fn build_relay_rejects_persistent_store_before_opening_a_slot() {
     let dir = tempfile::tempdir().unwrap();
-    let mut sender = persistent_connectionless_sender(dir.path());
-    let frame = self_contained_frame("alpha", 1);
-
-    let err = sender.flush_encoded(&frame).unwrap_err();
-    assert_eq!(err.code(), ErrorCode::InvalidApiCall, "got {err:?}");
-    assert!(err.msg().contains("persistent"), "got {err:?}");
+    let err = SenderBuilder::from_conf(format!(
+        "ws::addr=127.0.0.1:1;initial_connect_retry=async;\
+         reconnect_max_duration_millis=5000;sf_dir={};sender_id=relay-test;",
+        dir.path().display()
+    ))
+    .unwrap()
+    .build_relay()
+    .unwrap_err();
+    assert_eq!(err.code(), ErrorCode::ConfigError, "got {err:?}");
+    assert!(err.msg().contains("sf_dir"), "got {err:?}");
     assert_eq!(
-        sender.published_fsn().unwrap(),
-        None,
-        "a locally rejected relay frame must not enter the persistent queue"
+        std::fs::read_dir(dir.path()).unwrap().count(),
+        0,
+        "a rejected relay build must not mint a store-and-forward slot"
     );
-
-    // The other half of the contract: claiming relay mode before the persistent
-    // check would leave the sender permanently unable to flush typed rows.
-    let mut row = sender.new_buffer();
-    row.table("readings")
-        .unwrap()
-        .column_i64("_seq", 2)
-        .unwrap();
-    row.at(TimestampNanos::new(2)).unwrap();
-    sender.flush(&mut row).unwrap();
 }
 
+/// Relay is a QWP/WebSocket-only regime; any other protocol is a config error
+/// before a socket is opened, so this needs no server.
 #[cfg(feature = "sync-sender-http")]
 #[test]
-fn rejected_transactional_row_flush_does_not_claim_row_mode() {
-    let mut sender = connectionless_sender();
-    let mut row = sender.new_buffer();
-    row.table("readings")
-        .unwrap()
-        .column_i64("_seq", 1)
-        .unwrap();
-    row.at(TimestampNanos::new(1)).unwrap();
-
-    let err = sender.flush_and_keep_with_flags(&row, true).unwrap_err();
-    assert_eq!(err.code(), ErrorCode::InvalidApiCall, "got {err:?}");
-    assert!(err.msg().contains("Transactional"), "got {err:?}");
-
-    sender
-        .flush_encoded(&self_contained_frame("alpha", 2))
-        .expect("a local row rejection must leave relay mode available");
+fn build_relay_rejects_non_websocket_protocols() {
+    let err = SenderBuilder::new(Protocol::Http, "127.0.0.1", 1)
+        .build_relay()
+        .unwrap_err();
+    assert_eq!(err.code(), ErrorCode::ConfigError, "got {err:?}");
+    assert!(err.msg().contains("ws"), "got {err:?}");
 }
 
 #[test]
-fn rejected_oversized_relay_does_not_claim_relay_mode() {
+fn oversized_relay_frame_is_rejected_before_publication() {
     let mut buffer = Buffer::new_qwp_ws();
     let oversized = "x".repeat(2048);
     buffer
@@ -240,21 +215,15 @@ fn rejected_oversized_relay_does_not_claim_relay_mode() {
     let frame = buffer.encode_self_contained().unwrap();
     assert!(frame.len() > 1024, "fixture must exceed the sender limit");
 
-    let mut sender = size_limited_connectionless_sender(1024);
+    let mut sender = size_limited_connectionless_relay(1024);
     let err = sender.flush_encoded(&frame).unwrap_err();
     assert_eq!(err.code(), ErrorCode::InvalidApiCall, "got {err:?}");
     assert!(err.msg().contains("exceeds"), "got {err:?}");
-    assert_eq!(sender.published_fsn().unwrap(), None);
-
-    let mut row = sender.new_buffer();
-    row.table("readings")
-        .unwrap()
-        .column_i64("_seq", 2)
-        .unwrap();
-    row.at(TimestampNanos::new(2)).unwrap();
-    sender
-        .flush(&mut row)
-        .expect("an oversized relay rejection must leave row mode available");
+    assert_eq!(
+        sender.published_fsn().unwrap(),
+        None,
+        "an oversized frame must be rejected before it enters the replay queue"
+    );
 }
 
 fn spawn_two_frame_server() -> (u16, thread::JoinHandle<Vec<Vec<u8>>>) {
@@ -285,7 +254,7 @@ fn two_self_contained_frames_relay_verbatim_on_one_connection() {
         let mut sender = SenderBuilder::new(Protocol::Ws, "127.0.0.1", port)
             .qwp_ws_progress(progress)
             .unwrap()
-            .build()
+            .build_relay()
             .unwrap();
 
         sender.flush_encoded(&first).unwrap();
@@ -304,7 +273,7 @@ fn two_self_contained_frames_relay_verbatim_on_one_connection() {
 /// `published_fsn` reports while the sender is healthy.
 #[test]
 fn flush_encoded_returns_the_published_frame_sequence_number() {
-    let mut sender = connectionless_sender();
+    let mut sender = connectionless_relay();
 
     let first = sender
         .flush_encoded(&self_contained_frame("alpha", 1))
@@ -316,37 +285,6 @@ fn flush_encoded_returns_the_published_frame_sequence_number() {
         .unwrap();
     assert_eq!(second, first + 1);
     assert_eq!(sender.published_fsn().unwrap(), Some(second));
-}
-
-/// Allowing typed rows and independent base-0 dictionaries to share one
-/// connection can silently resolve a row frame's ids against relay symbols.
-#[test]
-fn a_qwp_websocket_sender_cannot_mix_row_and_relay_modes() {
-    let encoded = self_contained_frame("alpha", 1);
-
-    let mut relay_first = connectionless_sender();
-    relay_first.flush_encoded(&encoded).unwrap();
-    let mut row = relay_first.new_buffer();
-    row.table("readings")
-        .unwrap()
-        .column_i64("_seq", 2)
-        .unwrap();
-    row.at(TimestampNanos::new(2)).unwrap();
-    let err = relay_first.flush(&mut row).unwrap_err();
-    assert_eq!(err.code(), ErrorCode::InvalidApiCall);
-    assert!(err.msg().contains("relay"), "got {err:?}");
-
-    let mut row_first = connectionless_sender();
-    let mut row = row_first.new_buffer();
-    row.table("readings")
-        .unwrap()
-        .column_i64("_seq", 1)
-        .unwrap();
-    row.at(TimestampNanos::new(1)).unwrap();
-    row_first.flush(&mut row).unwrap();
-    let err = row_first.flush_encoded(&encoded).unwrap_err();
-    assert_eq!(err.code(), ErrorCode::InvalidApiCall);
-    assert!(err.msg().contains("row"), "got {err:?}");
 }
 
 /// Accepts one connection, rejects its first frame with a terminal parse error,
@@ -388,7 +326,7 @@ fn a_rejected_relay_flush_still_notifies_the_error_handler() {
             let _ = error_tx.send(error.clone());
         })
         .unwrap()
-        .build()
+        .build_relay()
         .unwrap();
 
     sender
@@ -434,7 +372,7 @@ fn flush_encoded_fsn_outlives_the_terminal_error_and_matches_the_error_span() {
             let _ = error_tx.send(error.clone());
         })
         .unwrap()
-        .build()
+        .build_relay()
         .unwrap();
 
     let fsn = sender

@@ -2582,6 +2582,49 @@ impl SenderBuilder {
     /// requires authentication or TLS, these will also be completed before
     /// returning.
     pub fn build(&self) -> Result<Sender> {
+        self.build_inner(
+            #[cfg(feature = "sync-sender-qwp-ws")]
+            false,
+        )
+    }
+
+    /// Build a [`RelaySender`]: a QWP/WebSocket connection that ships
+    /// pre-encoded self-contained frames verbatim instead of typed rows.
+    ///
+    /// The protocol must be `ws` or `wss`, and `sf_dir` must not be set:
+    /// relay runs over the default in-memory Store-and-Forward queue only,
+    /// because a file-backed slot outlives the process that chose its
+    /// dictionary regime and could later be recovered by a typed-row
+    /// [`Sender`]. Both are rejected with
+    /// [`ErrorCode::ConfigError`](crate::ErrorCode::ConfigError) before any
+    /// connection is opened. Every other QWP/WebSocket setting — progress
+    /// mode, reconnect budget, error handler, connection listener — applies
+    /// unchanged, and the connection is established exactly as by
+    /// [`Self::build`].
+    #[cfg(feature = "sync-sender-qwp-ws")]
+    pub fn build_relay(&self) -> Result<RelaySender> {
+        if !matches!(self.protocol, Protocol::Ws | Protocol::Wss) {
+            return Err(error::fmt!(
+                ConfigError,
+                "build_relay requires a QWP/WebSocket connect string \
+                 (protocol ws or wss, got {:?})",
+                self.protocol
+            ));
+        }
+        if let Some(qwp_ws) = self.qwp_ws.as_ref()
+            && qwp_ws.sf_dir.is_some()
+        {
+            return Err(error::fmt!(
+                ConfigError,
+                "build_relay does not support persistent/file-backed Store-and-Forward \
+                 (sf_dir); a relay sender uses the default in-memory queue"
+            ));
+        }
+        self.build_inner(true).map(RelaySender::new)
+    }
+
+    #[cfg(feature = "_sync-sender")]
+    fn build_inner(&self, #[cfg(feature = "sync-sender-qwp-ws")] relay: bool) -> Result<Sender> {
         // Fail fast on misconfigured buffer sizes before opening any sockets.
         // Only enforce the init-vs-max relationship when the user explicitly
         // set init_buf_size; a defaulted init_buf_size silently clamps to
@@ -2745,6 +2788,9 @@ impl SenderBuilder {
                 let mut qwp_ws = qwp_ws.clone();
                 qwp_ws.initial_connect_retry =
                     ConfigSetting::Specified(actual_initial_connect_retry);
+                // Declared up front so the runner starts in relay mode rather
+                // than being switched after it is already live.
+                qwp_ws.relay = relay;
                 let qwp_ws = &qwp_ws;
                 reject_unsupported_qwp_ws_sf_config(qwp_ws)?;
                 let basic_auth = qwp_ws_auth_header(&auth)?;

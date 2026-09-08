@@ -487,6 +487,9 @@ impl Buffer {
     /// seen the buffer's symbols. Ordinary sender flushes use a connection-local
     /// delta dictionary and are not suitable for store-and-forward relaying.
     ///
+    /// The relaying side ships the bytes verbatim with
+    /// `RelaySender::flush_encoded` (`sync-sender-qwp-ws`).
+    ///
     /// Returns [`crate::ErrorCode::InvalidApiCall`] for non-QWP/WebSocket and
     /// empty buffers.
     #[cfg(feature = "_sender-qwp-ws")]
