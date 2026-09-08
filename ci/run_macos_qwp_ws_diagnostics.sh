@@ -22,6 +22,7 @@ readonly MIN_FREE_KB="${QWP_WS_MIN_FREE_KB:-2097152}"
 readonly SYSTEM_TRACE="${QWP_WS_SYSTEM_TRACE:-0}"
 readonly QUERY_OVERLAY="${QWP_WS_SHOW_COLUMNS_OVERLAY:-}"
 readonly DISK_LOAD="${QWP_WS_DISK_LOAD:-0}"
+readonly DISK_PATTERN="${QWP_WS_DISK_PATTERN:-pwrite}"
 readonly KERNEL_CAPTURE="${QWP_WS_KERNEL_CAPTURE:-off}"
 
 if [[ ! "$RUN_COUNT" =~ ^[1-9][0-9]*$ ||
@@ -55,6 +56,10 @@ if [[ "$KERNEL_CAPTURE" != "off" && "$KERNEL_CAPTURE" != "query" && "$KERNEL_CAP
 fi
 if [[ "$KERNEL_CAPTURE" != "off" && -z "$QUERY_OVERLAY" ]]; then
     echo "Kernel follow-up requires query-stage telemetry" >&2
+    exit 2
+fi
+if [[ "$DISK_PATTERN" != "pwrite" && "$DISK_PATTERN" != "mapped" ]]; then
+    echo "Unsupported QWP_WS_DISK_PATTERN=$DISK_PATTERN" >&2
     exit 2
 fi
 
@@ -112,6 +117,7 @@ snapshot_host() {
         echo "pressure_plan=$PRESSURE_PLAN"
         echo "startup_missing_lookups=${QWP_WS_STARTUP_LOOKUPS:-0}"
         echo "disk_load=$DISK_LOAD paired_order=probe,load,load,probe max_write_bytes_per_attempt=268435456"
+        echo "disk_pattern=$DISK_PATTERN mapped_max_file_bytes=1048576 mapped_load_pacing_seconds=0.01"
         echo "min_free_kb=$MIN_FREE_KB"
         echo "system_trace=$SYSTEM_TRACE trace_capture_limit=2 controls=1,6,11"
         echo "kernel_capture=$KERNEL_CAPTURE kernel_unrecorded_control=1"
@@ -385,7 +391,7 @@ for run_number in $(seq 1 "$RUN_COUNT"); do
         } >"$run_dir/pressure-at-gate.log" 2>&1
         if [[ "$DISK_LOAD" == "1" ]]; then
             TMPDIR="$run_dir/tmp" python3 system_test/qwp_ws_disk_load.py \
-                "$run_dir" --run "$run_number" >"$run_dir/disk-load-process.log" 2>&1 &
+                "$run_dir" --run "$run_number" --pattern "$DISK_PATTERN" >"$run_dir/disk-load-process.log" 2>&1 &
             disk_load_pid=$!
             for _ in $(seq 1 50); do
                 [[ -f "$run_dir/disk-load-ready" ]] && break

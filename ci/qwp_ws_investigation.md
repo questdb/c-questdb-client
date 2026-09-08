@@ -4,9 +4,39 @@ Status: server progress interruption observed; root cause **not established**.
 This branch is diagnostic only. Keep sender timeouts and correctness assertions
 unchanged. Azure PR 200 allocates only one macOS worker, running only
 `TestQwpWsFuzz.test_add_columns` with the focused query-stage probe below when
-workload mode is enabled. The current default is a bounded kernel-wait follow-up.
+workload mode is enabled. The current default is a paired mapped-file perturbation.
 
-## Current action: kernel wait capture with query-stage context
+## Current action: mapped-file shrink with slow-query capture
+
+Build 268472 passed four attempts and captured kernel stacks in run 4. All 47
+SHOW COLUMNS cursors completed; maximum 45.495 ms. The one-second ping failed
+before sampling, but another ping succeeded 143 ms before the first sample.
+These are recovery stacks, not an onset capture or original reproduction.
+
+All three HTTP workers sampled buffer-I/O completion waits inside ftruncate,
+including mapped-pageout and clustered-write paths. Each had 5 of 156 samples
+in throttle_lowpri_io, versus 45-59 in buf_biowait. These distinct waits must not
+be conflated with provider quota or measured physical-device service time.
+The APFS flusher also sampled synchronous virtual-disk unmap waits, while HTTP
+workers waited for transaction entry. No evidence ties these later stacks to
+the original already-started 74.7-second SHOW COLUMNS.
+
+The previous load helper used pwrite/fsync and exhausted its byte budget within
+1.4-4.2 seconds. The next paired low-rate/load/load/low-rate arm uses mapped
+writes, unmap, then shrink, following MemoryCMARWImpl.close ordering. Its sparse
+growth does not reproduce physical F_PREALLOCATE. A fresh file stays at most
+1 MiB; each cycle dirties 64 KiB. The 256 MiB application-write cap, 60-second
+helper deadline and workload-finished stop remain; load cycles have 10 ms pacing
+to maintain overlap. Control cycles use the same pattern once per second.
+No explicit fsync/msync drains the dirty mapping before shrink.
+
+Only four attempts on one Mac, original 72-lookup prefix, natural memory. The
+query overlay remains; kernel capture is reserved for slow queries, observer
+loss or workload failure, not short ping failures. Stop on first capture/failure.
+No sender or SQL deadline is changed. This arm asks whether this measured class
+of filesystem work can impede SHOW COLUMNS, not whether a known quota exists.
+
+## Completed arm: kernel wait capture with query-stage context
 
 Build 268468 collected a real three-second system spindump with 156 samples.
 The original validator incorrectly expected the kernel marker after the sample

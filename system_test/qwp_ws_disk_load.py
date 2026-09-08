@@ -1,10 +1,12 @@
 """Bounded filesystem perturbation with per-call elapsed and process CPU clocks.
 
-Only touches a newly created 64 KiB file in this attempt's artifact directory.
+Only touches a newly created file in this attempt's artifact directory (1 MiB
+maximum with the mapped pattern; 64 KiB with the original pwrite pattern).
 This generates filesystem work; it does not emulate a known hosted-disk quota.
 """
 import argparse
 import json
+import mmap
 import os
 from pathlib import Path
 import time
@@ -16,7 +18,8 @@ def mode_for_run(run):
     return 'load' if run % 4 in (2, 3) else 'probe'
 
 
-def cycle(fd, payload, record, clock=time.monotonic_ns, cpu=time.process_time_ns):
+def cycle(fd, payload, record, clock=time.monotonic_ns, cpu=time.process_time_ns,
+          pattern='pwrite'):
     def measure(stage, action):
         started, cpu_start = clock(), cpu()
         wall_start = time.time_ns()
@@ -27,6 +30,21 @@ def cycle(fd, payload, record, clock=time.monotonic_ns, cpu=time.process_time_ns
                     cpu_ns=cpu_end - cpu_start, wall_start_ns=wall_start))
         return result
 
+    if pattern == 'mapped':
+        # Match the ordering of MemoryCMARWImpl.close: dirty mapped data,
+        # unmap, then shrink. No msync/fsync, which would drain the dirty pages
+        # before the operation we want to observe. Growth is sparse, not a
+        # claim to reproduce QuestDB's physical F_PREALLOCATE behavior.
+        measure('grow', lambda: os.ftruncate(fd, 1024 * 1024))
+        mapping = measure('mmap', lambda: mmap.mmap(fd, 1024 * 1024, access=mmap.ACCESS_WRITE))
+        try:
+            measure('mapped_write', lambda: mapping.__setitem__(slice(0, len(payload)), payload))
+        finally:
+            measure('munmap', mapping.close)
+        measure('shrink', lambda: os.ftruncate(fd, len(payload)))
+        return
+    if pattern != 'pwrite':
+        raise ValueError('unknown disk pattern')
     measure('truncate', lambda: os.ftruncate(fd, 0))
     written = measure('pwrite', lambda: os.pwrite(fd, payload, 0))
     if written != len(payload):
@@ -34,19 +52,21 @@ def cycle(fd, payload, record, clock=time.monotonic_ns, cpu=time.process_time_ns
     measure('fsync', lambda: os.fsync(fd))
 
 
-def run(directory, mode, max_cycles=4096, max_seconds=60):
+def run(directory, mode, max_cycles=4096, max_seconds=60, pattern='pwrite'):
     directory = Path(directory)
     if mode not in ('probe', 'load'):
         raise ValueError('unknown disk mode')
+    if pattern not in ('pwrite', 'mapped'):
+        raise ValueError('unknown disk pattern')
     payload = os.urandom(64 * 1024)
     # O_EXCL prevents overwriting any existing artifact or following a symlink.
-    fd = os.open(directory / 'disk-load.data', os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    fd = os.open(directory / 'disk-load.data', os.O_RDWR | os.O_CREAT | os.O_EXCL, 0o600)
     try:
         with (directory / 'disk-load.jsonl').open('x') as output:
             def record(value):
                 output.write(json.dumps(value) + '\n')
 
-            record(dict(event='ready', mode=mode, pid=os.getpid(),
+            record(dict(event='ready', mode=mode, pattern=pattern, pid=os.getpid(),
                         max_bytes=max_cycles * len(payload), max_seconds=max_seconds))
             output.flush()
             (directory / 'disk-load-ready').touch()
@@ -62,13 +82,17 @@ def run(directory, mode, max_cycles=4096, max_seconds=60):
             count = 0
             while (count < max_cycles and time.monotonic() - started < max_seconds
                    and not (directory / 'workload-finished').exists()):
-                cycle(fd, payload, record)
+                cycle(fd, payload, record, pattern=pattern)
                 count += 1
                 if time.monotonic() - last_flush >= 1:
                     output.flush()
                     last_flush = time.monotonic()
                 if mode == 'probe':
                     time.sleep(1)
+                elif pattern == 'mapped':
+                    # Pace the finite byte budget across the workload, instead
+                    # of spending all 4096 cycles in its first few seconds.
+                    time.sleep(.01)
             if count == 0:
                 raise RuntimeError('disk experiment had no overlap with workload')
             record(dict(event='finished', cycles=count, bytes_written=count * len(payload),
@@ -84,9 +108,10 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('directory', type=Path)
     parser.add_argument('--run', type=int, required=True)
+    parser.add_argument('--pattern', choices=('pwrite', 'mapped'), default='pwrite')
     args = parser.parse_args()
     try:
-        run(args.directory, mode_for_run(args.run))
+        run(args.directory, mode_for_run(args.run), pattern=args.pattern)
     except Exception as exc:
         (args.directory / 'disk-load-error').write_text(repr(exc) + '\n')
         raise

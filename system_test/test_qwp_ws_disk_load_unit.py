@@ -36,6 +36,28 @@ class DiskLoadTest(unittest.TestCase):
                 run(root, 'load')
             self.assertFalse((root / 'disk-load-finished').exists())
 
+    def test_real_mapped_work_and_pacing(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            (root / 'show-columns.tsv').touch()
+            with patch('qwp_ws_disk_load.time.sleep') as sleep:
+                run(root, 'load', max_cycles=2, pattern='mapped')
+            self.assertEqual(sleep.call_count, 2)
+            sleep.assert_called_with(.01)
+            rows = [json.loads(s) for s in (root / 'disk-load.jsonl').read_text().splitlines()]
+            self.assertEqual(rows[0]['pattern'], 'mapped')
+            self.assertEqual(rows[-1]['bytes_written'], 128 * 1024)
+            self.assertEqual((root / 'disk-load.data').stat().st_size, 64 * 1024)
+            self.assertEqual([r['stage'] for r in rows if r['event'] == 'syscall'],
+                             ['grow', 'mmap', 'mapped_write', 'munmap', 'shrink'] * 2)
+            self.assertTrue((root / 'disk-load-finished').exists())
+
+    def test_bad_pattern_creates_no_file(self):
+        with tempfile.TemporaryDirectory() as temp:
+            with self.assertRaisesRegex(ValueError, 'pattern'):
+                run(temp, 'load', pattern='invalid')
+            self.assertEqual(list(Path(temp).iterdir()), [])
+
     def test_short_write_fails(self):
         with patch('qwp_ws_disk_load.os.ftruncate'), patch('qwp_ws_disk_load.os.pwrite', return_value=1):
             with self.assertRaisesRegex(RuntimeError, 'short diagnostic write'):

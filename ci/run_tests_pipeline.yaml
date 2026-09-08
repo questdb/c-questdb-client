@@ -480,14 +480,15 @@ stages:
                 # Restore the original 72 missing-table ALTER lookups before
                 # producer connection. This is a scheduling perturbation, not
                 # a recreation of the unknown original startup delay.
-                # Kernel-resource follow-up: one unrecorded control, then up to
-                # seven attempts that capture the first failed ping or slow
-                # query. Preserve query stages; short pings are not the original
-                # long-query failure. No pressure or separate disk load.
+                # Paired mapped-file perturbation: low-rate/load/load/low-rate.
+                # Unlike the earlier pwrite/fsync helper, dirty a mapping,
+                # unmap and shrink; pace the finite byte budget across the test.
+                # Capture only slow query/observer/workload failure, not pings.
                 # No new attempt after ten minutes; stop at first capture.
-                QWP_WS_DIAGNOSTIC_RUNS: "8"
-                QWP_WS_KERNEL_CAPTURE: ping
-                QWP_WS_DISK_LOAD: "0"
+                QWP_WS_DIAGNOSTIC_RUNS: "4"
+                QWP_WS_KERNEL_CAPTURE: query
+                QWP_WS_DISK_LOAD: "1"
+                QWP_WS_DISK_PATTERN: mapped
                 QWP_WS_STARTUP_LOOKUPS: "72"
                 QWP_WS_MAX_SECONDS: "600"
                 QWP_WS_STOP_ON_CAPTURE: "1"
