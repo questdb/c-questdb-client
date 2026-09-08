@@ -7,7 +7,34 @@ unchanged. Azure PR 200 allocates only one macOS worker, running only
 workload mode is enabled. The current default follows the severe filesystem
 episode captured in build 268479.
 
-## Current action: retain raw kernel samples before symbol processing
+## Current action: remove file writes from the onset path
+
+Build 268487 reproduced five close-drain timeouts in its first low-rate control.
+The helper completed only two cycles (128 KiB application writes). Its second
+grow/ftruncate took 66.224 seconds with 34 us CPU, entirely BEFORE recorder
+launch. The memory-buffered heartbeat covered it with no gap over 400 ms.
+This particular interval was neither a continuous whole-VM scheduling freeze
+nor initiated by the profiler. One SHOW cursor completed in 6.629 ms; this still
+does not reproduce the original already-started long SHOW query.
+
+Capture launched only after the long wait ended: file-writing diagnostics again
+stopped advancing. Raw spindump sampled successfully according to stderr but
+timed out generating its output file; the raw file is empty. Removing symbol
+lookup alone did not solve retention. There are no usable kernel frames here.
+
+Next revision buffers ping/capture events in memory, pre-creates recorder
+directories before watchdog-ready, and uses documented -noFile output through
+two drained pipes (binary stdout, diagnostic stderr). The privileged recorder
+controller opens no output files. After bytes reach the watchdog process they
+are persisted outside the recorder's timeout, then decoded after workload and
+server shutdown. A nonempty binary is still only transport validation; decoded
+named kernel frames are required for a successful diagnostic outcome. The
+64 MiB raw artifact limit is checked after collection, not a streaming memory
+limit. File-based query markers and filesystem persistence can still block;
+this is not a claim of an entirely filesystem-independent observer. Same one
+Mac, four-attempt bounds and unchanged workload/deadlines.
+
+## Completed arm: retain raw kernel samples before symbol processing
 
 Build 268483 failed in teardown on its first low-rate attempt, not in producer
 close-drain. All eight drains completed, maximum 31.496 seconds. All 16 SHOW

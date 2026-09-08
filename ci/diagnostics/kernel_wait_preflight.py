@@ -18,11 +18,11 @@ def command(directory, time_limit=45):
             '-noProcessingWhileSampling']
 
 
-def raw_command(directory, time_limit=25):
+def raw_command(time_limit=25):
     # Save the sample before expensive symbol lookup. The installed Mac help
     # explicitly supports binary-only output and deferred symbolication.
     return ['/usr/sbin/spindump', '-notarget', '3', '20',
-            '-o', str(directory / 'spindump.raw'), '-noText', '-noSymbolicate',
+            '-noFile', '-noText', '-noSymbolicate',
             '-timelimit', str(time_limit), '-noProcessingWhileSampling']
 
 
@@ -88,13 +88,25 @@ def main():
     parser.add_argument('--limit', type=int, choices=(25, 45), default=45)
     args = parser.parse_args()
     if args.record_raw:
-        subprocess.run(raw_command(args.directory, args.limit), timeout=args.limit+5, check=True)
-        size = (args.directory / 'spindump.raw').stat().st_size
-        if not size:
+        try:
+            result = subprocess.run(raw_command(args.limit), timeout=args.limit+5,
+                                    stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True)
+        except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
+            # Preserve partial bytes and the actual native-tool diagnostic,
+            # not only the wrapper's traceback. Parent marks them incomplete.
+            if exc.stdout:
+                sys.stdout.buffer.write(exc.stdout)
+            if exc.stderr:
+                sys.stderr.buffer.write(exc.stderr)
+            raise
+        if not result.stdout:
             raise RuntimeError('empty raw kernel capture')
-        # Nonempty is transport validation only, not proof of usable stacks.
-        (args.directory / 'recorder-validation.json').write_text(json.dumps(
-            dict(format='raw', bytes=size, decoded=False)) + '\n')
+        if len(result.stdout) > 64 * 1024**2:
+            raise RuntimeError('raw kernel capture exceeds 64 MiB artifact limit')
+        # Parent drains these pipes in memory. Never open an output file in
+        # the recording process: the filesystem is the resource under test.
+        sys.stderr.buffer.write(result.stderr)
+        sys.stdout.buffer.write(result.stdout)
         return
     if args.decode:
         subprocess.run(decode_command(args.directory), timeout=65, check=True)

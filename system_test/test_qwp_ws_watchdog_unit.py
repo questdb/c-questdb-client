@@ -76,14 +76,20 @@ class WatchdogTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             directory = Path(tmp)
             (directory / 'kernel-stacks-enabled').touch()
+            (directory / 'kernel-stacks/tmp').mkdir(parents=True)
             events = []
 
             def record(*args, **kwargs):
                 argv = args[0]
                 self.assertEqual(argv[:3], ['sudo', '-n', 'env'])
                 self.assertEqual(argv[-3:], ['--record-raw', '--limit', '25'])
-                (directory / 'kernel-stacks/recorder-validation.json').write_text('{}')
+                self.assertEqual(kwargs['stdout'], watchdog.subprocess.PIPE)
+                self.assertEqual(kwargs['stderr'], watchdog.subprocess.PIPE)
+                for filename in ('capture-started', 'capture.jsonl', 'sample-command.log',
+                                 'kernel-stacks/spindump.raw'):
+                    self.assertFalse((directory / filename).exists())
                 events.append('kernel-recorded')
+                return watchdog.subprocess.CompletedProcess(argv, 0, stdout=b'raw fixture', stderr=b'')
 
             with mock.patch.object(watchdog.sys, 'platform', 'darwin'), \
                     mock.patch.object(watchdog.subprocess, 'run', side_effect=record), \
@@ -94,6 +100,30 @@ class WatchdogTest(unittest.TestCase):
             native.assert_not_called()
             self.assertEqual(events, ['kernel-recorded', 'sigquit', 'sigquit', 'sigquit'])
             self.assertFalse((directory / 'capture-error').exists())
+            self.assertEqual((directory / 'kernel-stacks/spindump.raw').read_bytes(), b'raw fixture')
+
+    def test_buffered_ping_loop_starts_capture_without_publishing_files(self):
+        with tempfile.TemporaryDirectory() as temp:
+            directory = Path(temp)
+            for name in ('start-test', 'show-columns-enabled', 'kernel-stacks-enabled',
+                         'kernel-ping-capture-enabled', 'memory-heartbeat-enabled'):
+                (directory / name).touch()
+            stop = threading.Event()
+            opener = mock.Mock()
+            def ping(*args, **kwargs):
+                self.assertFalse((directory / 'watchdog.jsonl').exists())
+                raise TimeoutError('injected')
+            def collect(*args):
+                self.assertFalse((directory / 'capture-started').exists())
+                self.assertTrue((directory / 'kernel-stacks/tmp').is_dir())
+                stop.set()
+            opener.open.side_effect = ping
+            with mock.patch.object(watchdog.urllib.request, 'build_opener', return_value=opener), \
+                    mock.patch.object(watchdog, 'capture', side_effect=collect) as capture:
+                watchdog.watch(directory, 123, 9000, stop)
+            capture.assert_called_once()
+            self.assertEqual(opener.open.call_count, 2)
+            self.assertTrue((directory / 'watchdog.jsonl').is_file())
 
     def test_kernel_capture_error_does_not_suppress_jvm_dump(self):
         with tempfile.TemporaryDirectory() as tmp:

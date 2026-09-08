@@ -1,4 +1,5 @@
 from pathlib import Path
+import io
 import subprocess
 import sys
 import tempfile
@@ -10,6 +11,33 @@ from ci.diagnostics.kernel_wait_preflight import command, decode_command, inspec
 
 
 class KernelPreflightTest(unittest.TestCase):
+    def test_raw_timeout_forwards_partial_binary_and_native_error(self):
+        output, errors = io.BytesIO(), io.BytesIO()
+        failure = subprocess.TimeoutExpired('spindump', 30, output=b'partial', stderr=b'native detail')
+        with mock.patch.object(sys, 'argv', ['recorder', '/unused', '--record-raw']), \
+                mock.patch.object(recorder.subprocess, 'run', side_effect=failure), \
+                mock.patch.object(sys, 'stdout', mock.Mock(buffer=output)), \
+                mock.patch.object(sys, 'stderr', mock.Mock(buffer=errors)):
+            with self.assertRaises(subprocess.TimeoutExpired):
+                recorder.main()
+        self.assertEqual(output.getvalue(), b'partial')
+        self.assertEqual(errors.getvalue(), b'native detail')
+
+    def test_raw_controller_transfers_binary_over_pipes_without_files(self):
+        with tempfile.TemporaryDirectory() as temp:
+            output, errors = io.BytesIO(), io.BytesIO()
+            child = [sys.executable, '-c',
+                     'import sys; sys.stdout.buffer.write(bytes([0,255,10,13])); '
+                     'sys.stderr.write("sampler status")']
+            with mock.patch.object(sys, 'argv', ['recorder', temp, '--record-raw']), \
+                    mock.patch.object(recorder, 'raw_command', return_value=child), \
+                    mock.patch.object(sys, 'stdout', mock.Mock(buffer=output)), \
+                    mock.patch.object(sys, 'stderr', mock.Mock(buffer=errors)):
+                recorder.main()
+            self.assertEqual(output.getvalue(), bytes([0, 255, 10, 13]))
+            self.assertEqual(errors.getvalue(), b'sampler status')
+            self.assertEqual(list(Path(temp).iterdir()), [])
+
     def test_decode_timeout_preserves_raw_capture(self):
         with tempfile.TemporaryDirectory() as temp:
             directory = Path(temp)
@@ -29,16 +57,17 @@ class KernelPreflightTest(unittest.TestCase):
             directory = Path(temp)
             (directory / 'spindump.raw').touch()
             with mock.patch.object(sys, 'argv', ['recorder', temp, '--record-raw']), \
-                    mock.patch.object(recorder.subprocess, 'run'):
+                    mock.patch.object(recorder.subprocess, 'run',
+                                      return_value=subprocess.CompletedProcess([], 0, stdout=b'', stderr=b'')):
                 with self.assertRaisesRegex(RuntimeError, 'empty raw'):
                     recorder.main()
             self.assertFalse((directory / 'recorder-validation.json').exists())
 
-    def test_raw_capture_defers_symbols_and_keeps_explicit_path(self):
+    def test_raw_capture_defers_symbols_and_avoids_output_files(self):
         directory = Path('/artifact/kernel-stacks')
-        args = raw_command(directory)
+        args = raw_command()
         self.assertEqual(args, ['/usr/sbin/spindump', '-notarget', '3', '20',
-                                '-o', str(directory / 'spindump.raw'),
+                                '-noFile',
                                 '-noText', '-noSymbolicate', '-timelimit', '25',
                                 '-noProcessingWhileSampling'])
         decode = decode_command(directory)

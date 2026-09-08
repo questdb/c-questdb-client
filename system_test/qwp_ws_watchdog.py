@@ -7,6 +7,8 @@ lets us identify one source of observer delay). All artifacts stay in run_dir.
 
 import argparse
 from collections import deque
+from contextlib import contextmanager
+import io
 import json
 import os
 from pathlib import Path
@@ -25,6 +27,19 @@ def write_event(stream, event, **fields):
         event=event, wall_ns=time.time_ns(), monotonic_ns=time.monotonic_ns(),
         **fields)) + '\n')
     stream.flush()
+
+
+@contextmanager
+def event_log(path, buffered=False):
+    if not buffered:
+        with path.open('w') as stream:
+            yield stream
+        return
+    with io.StringIO() as stream:
+        try:
+            yield stream
+        finally:
+            path.write_text(stream.getvalue())
 
 
 def heartbeat(run_dir, stop, delayed):
@@ -102,8 +117,52 @@ class QueryObserverProgress:
         return None
 
 
+def capture_kernel(run_dir, pid, reason):
+    """No diagnostic file writes until the recorder has returned its bytes."""
+    directory = run_dir / 'kernel-stacks'  # created before watchdog-ready
+    controller = Path(__file__).resolve().parents[1] / 'ci/diagnostics/kernel_wait_preflight.py'
+    with event_log(run_dir / 'capture.jsonl', buffered=True) as log:
+        try:
+            write_event(log, 'capture_start', reason=reason, pid=pid)
+            write_event(log, 'kernel_sample_start')
+            try:
+                result = subprocess.run(
+                    ['sudo', '-n', 'env', f'TMPDIR={directory / "tmp"}',
+                     sys.executable, str(controller), str(directory),
+                     '--record-raw', '--limit', '25'],
+                    stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=35, check=True)
+                write_event(log, 'kernel_sample_received', bytes=len(result.stdout))
+                if not result.stdout:
+                    raise RuntimeError('empty raw kernel capture')
+                # Raw bytes are now in this process, outside recorder timeout.
+                (directory / 'spindump.raw').write_bytes(result.stdout)
+                (run_dir / 'sample-command.log').write_bytes(result.stderr)
+                (directory / 'recorder-validation.json').write_text(json.dumps(
+                    dict(format='raw', bytes=len(result.stdout), decoded=False)) + '\n')
+                write_event(log, 'kernel_sample_complete')
+            except Exception as exc:
+                write_event(log, 'kernel_sample_error', error=repr(exc))
+                partial = getattr(exc, 'stdout', None)
+                if partial:
+                    (directory / 'spindump.partial.raw').write_bytes(partial)
+                stderr = getattr(exc, 'stderr', None)
+                if stderr:
+                    (run_dir / 'sample-command.log').write_bytes(stderr)
+                (run_dir / 'capture-error').write_text(repr(exc) + '\n')
+            for index in range(3):
+                os.kill(pid, signal.SIGQUIT)
+                write_event(log, 'sigquit_requested', index=index)
+                time.sleep(0.5)
+        finally:
+            write_event(log, 'capture_complete')
+            (run_dir / 'capture-started').write_text(reason + '\n')
+            (run_dir / 'capture-complete').touch()
+
+
 def capture(run_dir, pid, reason):
     """Stop the active trace, or take native/JVM samples; no HTTP dependency."""
+    if sys.platform == 'darwin' and (run_dir / 'kernel-stacks-enabled').exists():
+        return capture_kernel(run_dir, pid, reason)
     (run_dir / 'capture-started').write_text(reason + '\n')
     sample = None
     with (run_dir / 'capture.jsonl').open('w') as log, \
@@ -116,25 +175,7 @@ def capture(run_dir, pid, reason):
                 # No additional profilers in this arm. The recorder finalizes
                 # independently; the harness validates exported data afterward.
                 return
-            if sys.platform == 'darwin' and (run_dir / 'kernel-stacks-enabled').exists():
-                try:
-                    directory = run_dir / 'kernel-stacks'
-                    directory.mkdir()
-                    (directory / 'tmp').mkdir()
-                    controller = Path(__file__).resolve().parents[1] / 'ci/diagnostics/kernel_wait_preflight.py'
-                    write_event(log, 'kernel_sample_start')
-                    subprocess.run(['sudo', '-n', 'env', f'TMPDIR={directory / "tmp"}',
-                                    sys.executable, str(controller), str(directory),
-                                    '--record-raw', '--limit', '25'],
-                                   stdout=sample_log, stderr=subprocess.STDOUT,
-                                   timeout=35, check=True)
-                    if not (directory / 'recorder-validation.json').is_file():
-                        raise RuntimeError('kernel sample produced no validation')
-                    write_event(log, 'kernel_sample_complete')
-                except Exception as exc:
-                    write_event(log, 'kernel_sample_error', error=repr(exc))
-                    (run_dir / 'capture-error').write_text(repr(exc) + '\n')
-            elif sys.platform == 'darwin':
+            if sys.platform == 'darwin':
                 # Explicit output path: sample otherwise writes into /tmp.
                 try:
                     sample = subprocess.Popen(
@@ -178,6 +219,10 @@ def capture(run_dir, pid, reason):
 
 
 def watch(run_dir, pid, port, stop):
+    buffered = (run_dir / 'memory-heartbeat-enabled').exists()
+    kernel = (run_dir / 'kernel-stacks-enabled').exists()
+    if kernel:
+        (run_dir / 'kernel-stacks/tmp').mkdir(parents=True, exist_ok=True)
     delayed = threading.Event()
     pulse = threading.Thread(target=heartbeat, args=(run_dir, stop, delayed),
                              name='watchdog-heartbeat', daemon=True)
@@ -188,7 +233,7 @@ def watch(run_dir, pid, port, stop):
     # Do not inherit proxy settings for the loopback probe.
     opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
     try:
-        with (run_dir / 'watchdog.jsonl').open('w') as log:
+        with event_log(run_dir / 'watchdog.jsonl', buffered=buffered) as log:
             write_event(log, 'ready', pid=pid, port=port)
             (run_dir / 'watchdog-ready').touch()
             while not (run_dir / 'start-test').exists():
@@ -241,7 +286,8 @@ def watch(run_dir, pid, port, stop):
                 if reason and collector is None and not (run_dir / 'workload-finished').exists():
                     # Publish synchronously so teardown sees an in-flight
                     # capture even before the collector thread is scheduled.
-                    (run_dir / 'capture-started').write_text(reason + '\n')
+                    if not kernel:
+                        (run_dir / 'capture-started').write_text(reason + '\n')
                     if (run_dir / 'system-trace-enabled').exists():
                         request_stop(run_dir, reason)
                     collector = threading.Thread(
