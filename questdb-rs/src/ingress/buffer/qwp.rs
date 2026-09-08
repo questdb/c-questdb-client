@@ -2911,9 +2911,16 @@ impl QwpWsColumnarBuffer {
     }
 
     fn capture_snapshot(&mut self) -> crate::Result<QwpWsMarker> {
+        let mut table_marks = self
+            .snapshot
+            .take()
+            .map(|snapshot| snapshot.table_marks)
+            .unwrap_or_default();
+        table_marks.clear();
+        table_marks.extend(self.tables.iter().map(|t| t.rollback_mark()));
         self.snapshot = Some(QwpWsSnapshot {
             tables_len: self.tables.len(),
-            table_marks: self.tables.iter().map(|t| t.rollback_mark()).collect(),
+            table_marks,
             current_table_idx: self.current_table_idx,
             state: self.state,
         });
