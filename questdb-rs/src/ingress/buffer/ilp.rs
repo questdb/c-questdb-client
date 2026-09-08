@@ -608,12 +608,11 @@ impl Buffer {
         let name: ColumnName<'a> = name.try_into()?;
         self.validate_max_name_len(name.name)?;
         self.check_op(Op::Column)?;
-        let separator = if self.state.op_state.ilp_symbol_section_is_open() {
+        self.output.push(if self.state.op_state.allows_symbol() {
             b' '
         } else {
             b','
-        };
-        self.output.push(separator);
+        });
         write_escaped_unquoted(&mut self.output, name.name);
         self.output.push(b'=');
         self.state.op_state.record_column();

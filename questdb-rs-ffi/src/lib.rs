@@ -1580,12 +1580,6 @@ pub unsafe extern "C" fn line_sender_buffer_table(
 /// For ILP buffers, record all symbol columns before any other column type.
 /// QWP buffers allow symbol and non-symbol columns in any order before the
 /// designated timestamp.
-///
-/// Treat column names as case-insensitive, record each name once per row, and
-/// keep its type consistent across rows. Duplicate handling differs by QWP
-/// transport and spelling: a later value may fail, be silently ignored, or be
-/// encoded as a separate column. Type-change errors can be reported at different
-/// calls and may discard the in-progress row.
 /// @param[in] buffer Line buffer object.
 /// @param[in] name Column name.
 /// @param[in] value Column value.

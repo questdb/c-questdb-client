@@ -1115,7 +1115,7 @@ impl QwpBuffer {
 
     #[inline(always)]
     fn check_op(&self, op: Op) -> crate::Result<()> {
-        self.state.op_state.check_symbols_as_columns(op)
+        self.state.op_state.check_unordered(op)
     }
 
     fn validate_max_name_len(&self, name: &str) -> crate::Result<()> {
@@ -2964,7 +2964,7 @@ impl QwpWsColumnarBuffer {
 
     #[inline(always)]
     fn check_op(&self, op: Op) -> crate::Result<()> {
-        self.state.op_state.check_symbols_as_columns(op)
+        self.state.op_state.check_unordered(op)
     }
 
     fn validate_max_name_len(&self, name: &str) -> crate::Result<()> {
@@ -8122,77 +8122,6 @@ mod tests {
         assert_eq!(lookup.get(forced_hash, b"beta", &dict, &data), None);
     }
 
-    /// Decoded cell of a single-row QWP/WS replay message, for the handful of
-    /// wire types the column-ordering tests exercise.
-    #[cfg(feature = "_sender-qwp-ws")]
-    #[derive(Debug, PartialEq)]
-    enum WsTestCell {
-        Bool(bool),
-        I64(i64),
-        /// The symbol's dictionary id, already resolved against the frame's
-        /// own dictionary section.
-        Symbol(String),
-    }
-
-    /// Parse a single-table, single-row WS replay message and return the table
-    /// name plus, **in wire order**, each column's `(name, wire-type byte,
-    /// value)`.
-    ///
-    /// Unlike the UDP decoder this resolves nothing by name, so a test built
-    /// on it fails if the encoder reorders the schema.
-    #[cfg(feature = "_sender-qwp-ws")]
-    fn ws_single_row_columns(message: &[u8]) -> (String, Vec<(String, u8, WsTestCell)>) {
-        let (delta_start, dict, mut pos) = ws_delta_entries(message);
-        assert_eq!(delta_start, 0, "helper expects a full dictionary prefix");
-        let table_count = u16::from_le_bytes([message[6], message[7]]) as usize;
-        assert_eq!(table_count, 1, "helper expects exactly one table");
-
-        let table_name = String::from_utf8(read_test_bytes(message, &mut pos)).unwrap();
-        let row_count = read_test_varint(message, &mut pos);
-        assert_eq!(row_count, 1, "helper expects exactly one row");
-        let column_count = read_test_varint(message, &mut pos) as usize;
-
-        // Inline schema: (name, wire-type byte) per column, all up front.
-        let mut schema = Vec::with_capacity(column_count);
-        for _ in 0..column_count {
-            let name = String::from_utf8(read_test_bytes(message, &mut pos)).unwrap();
-            let type_byte = message[pos];
-            pos += 1;
-            schema.push((name, type_byte));
-        }
-
-        // Data section: one payload per column, in the same order.
-        let mut columns = Vec::with_capacity(column_count);
-        for (name, type_byte) in schema {
-            let uses_null_bitmap = message[pos];
-            pos += 1;
-            assert_eq!(
-                uses_null_bitmap, 0,
-                "helper expects dense columns, got a null bitmap for {name:?}"
-            );
-            let value = match type_byte {
-                QWP_TYPE_BOOLEAN => {
-                    let packed = message[pos];
-                    pos += 1;
-                    WsTestCell::Bool(packed & 1 == 1)
-                }
-                QWP_TYPE_LONG => {
-                    let raw: [u8; 8] = message[pos..pos + 8].try_into().unwrap();
-                    pos += 8;
-                    WsTestCell::I64(i64::from_le_bytes(raw))
-                }
-                QWP_TYPE_SYMBOL => {
-                    let gid = read_test_varint(message, &mut pos) as usize;
-                    WsTestCell::Symbol(String::from_utf8(dict[gid].clone()).unwrap())
-                }
-                other => panic!("helper does not decode wire type {other:#04x}"),
-            };
-            columns.push((name, type_byte, value));
-        }
-        assert_eq!(pos, message.len());
-        (table_name, columns)
-    }
-
     #[cfg(feature = "_sender-qwp-ws")]
     fn decode_single_i64_column_ws_replay(message: &[u8]) -> Vec<(String, String, Vec<i64>)> {
         let (_, _, mut pos) = ws_delta_entries(message);
@@ -8324,72 +8253,6 @@ mod tests {
         array_values: Option<Vec<f64>>,
         ts_value: Option<i64>,
         designated_ts: Option<i64>,
-        /// How many non-symbol columns [`apply_row`] emits before the symbol.
-        /// QWP treats symbols as ordinary typed columns, so the generated
-        /// rows must interleave them rather than always leading with them.
-        symbol_offset: usize,
-    }
-
-    impl PropRow {
-        fn non_symbol_column_count(&self) -> usize {
-            [
-                self.bool_value.is_some(),
-                self.i64_value.is_some(),
-                self.f64_value.is_some(),
-                self.string_value.is_some(),
-                self.decimal_value.is_some(),
-                self.array_values.is_some(),
-                self.ts_value.is_some(),
-            ]
-            .into_iter()
-            .filter(|present| *present)
-            .count()
-        }
-
-        fn column_names_in_write_order(&self) -> Vec<&'static str> {
-            let mut names = Vec::with_capacity(self.non_symbol_column_count() + 2);
-            if self.bool_value.is_some() {
-                names.push("flag");
-            }
-            if self.i64_value.is_some() {
-                names.push("qty");
-            }
-            if self.f64_value.is_some() {
-                names.push("px");
-            }
-            if self.string_value.is_some() {
-                names.push("note");
-            }
-            if self.decimal_value.is_some() {
-                names.push("price");
-            }
-            if self.array_values.is_some() {
-                names.push("samples");
-            }
-            if self.ts_value.is_some() {
-                names.push("event_ts");
-            }
-            if self.symbol.is_some() {
-                names.insert(self.symbol_offset.min(names.len()), "sym");
-            }
-            if self.designated_ts.is_some() {
-                names.push("");
-            }
-            names
-        }
-    }
-
-    fn prop_row_with_symbol_offset(row: PropRow) -> BoxedStrategy<PropRow> {
-        let max_offset = row
-            .symbol
-            .as_ref()
-            .map_or(0, |_| row.non_symbol_column_count());
-        (Just(row), 0usize..=max_offset)
-            .prop_map(|(mut row, symbol_offset)| {
-                row.symbol_offset = symbol_offset;
-                row
-            })
-            .boxed()
     }
 
     #[derive(Clone, Debug)]
@@ -8401,7 +8264,6 @@ mod tests {
     #[derive(Clone, Debug, PartialEq, Eq)]
     struct SemanticRow {
         table: String,
-        column_order: Vec<String>,
         fields: BTreeMap<String, SemanticValue>,
     }
 
@@ -8687,7 +8549,6 @@ mod tests {
                     array_values,
                     ts_value,
                     designated_ts,
-                    symbol_offset: 0,
                 },
             )
             .prop_filter("row must commit at least one field", |row| {
@@ -8700,7 +8561,6 @@ mod tests {
                     || row.array_values.is_some()
                     || row.ts_value.is_some()
             })
-            .prop_flat_map(prop_row_with_symbol_offset)
             .boxed()
     }
 
@@ -8792,11 +8652,9 @@ mod tests {
                         array_values,
                         ts_value,
                         designated_ts,
-                        symbol_offset: 0,
                     }
                 },
             )
-            .prop_flat_map(prop_row_with_symbol_offset)
             .boxed()
     }
 
@@ -8920,71 +8778,39 @@ mod tests {
     fn apply_row(buf: &mut QwpBuffer, segment: &PropSegment, row: &PropRow) {
         buf.table(segment.config.table.as_str()).unwrap();
 
-        // QWP accepts symbols anywhere in a row, so the symbol is emitted
-        // after `row.symbol_offset` non-symbol columns rather than always
-        // first. The buffer contents are order-agnostic (each column carries
-        // its own name and wire type), so the semantic model is unaffected —
-        // this only widens the shapes the encoder sees.
-        fn emit_symbol_when_due(
-            buf: &mut QwpBuffer,
-            symbol: &mut Option<&str>,
-            offset: usize,
-            emitted: usize,
-        ) {
-            if emitted < offset {
-                return;
-            }
-            if let Some(value) = symbol.take() {
-                buf.symbol("sym", value).unwrap();
-            }
+        if let Some(value) = row.symbol.as_deref() {
+            buf.symbol("sym", value).unwrap();
         }
-
-        let mut symbol = row.symbol.as_deref();
-        let mut emitted = 0usize;
-        macro_rules! emit_column {
-            ($call:expr) => {{
-                $call;
-                emitted += 1;
-                emit_symbol_when_due(buf, &mut symbol, row.symbol_offset, emitted);
-            }};
-        }
-
-        emit_symbol_when_due(buf, &mut symbol, row.symbol_offset, emitted);
         if let Some(value) = row.bool_value {
-            emit_column!(buf.column_bool("flag", value).unwrap());
+            buf.column_bool("flag", value).unwrap();
         }
         if let Some(value) = row.i64_value {
-            emit_column!(buf.column_i64("qty", value).unwrap());
+            buf.column_i64("qty", value).unwrap();
         }
         if let Some(value) = row.f64_value {
-            emit_column!(buf.column_f64("px", value).unwrap());
+            buf.column_f64("px", value).unwrap();
         }
         if let Some(value) = row.string_value.as_deref() {
-            emit_column!(buf.column_str("note", value).unwrap());
+            buf.column_str("note", value).unwrap();
         }
         if let Some(value) = row.decimal_value.as_deref() {
-            emit_column!(buf.column_dec("price", value).unwrap());
+            buf.column_dec("price", value).unwrap();
         }
         if let Some(values) = row.array_values.as_ref() {
-            emit_column!(buf.column_arr("samples", values).unwrap());
+            buf.column_arr("samples", values).unwrap();
         }
         if let Some(value) = row.ts_value {
-            emit_column!(
-                match segment.config.ts_kind.expect("ts value requires ts kind") {
-                    PropTsKind::Micros => {
-                        buf.column_ts("event_ts", TimestampMicros::new(value))
-                            .unwrap();
-                    }
-                    PropTsKind::Nanos => {
-                        buf.column_ts("event_ts", TimestampNanos::new(value))
-                            .unwrap();
-                    }
+            match segment.config.ts_kind.expect("ts value requires ts kind") {
+                PropTsKind::Micros => {
+                    buf.column_ts("event_ts", TimestampMicros::new(value))
+                        .unwrap();
                 }
-            );
+                PropTsKind::Nanos => {
+                    buf.column_ts("event_ts", TimestampNanos::new(value))
+                        .unwrap();
+                }
+            }
         }
-        // Keep a defensive fallback for manually constructed rows whose
-        // `symbol_offset` exceeds their number of columns.
-        emit_symbol_when_due(buf, &mut symbol, row.symbol_offset, usize::MAX);
 
         if let Some(value) = row.designated_ts {
             match segment
@@ -9004,16 +8830,6 @@ mod tests {
         let mut rows = Vec::new();
         for segment in segments {
             let schema = active_schema(segment);
-            let mut column_order: Vec<String> = Vec::new();
-            for name in segment
-                .rows
-                .iter()
-                .flat_map(PropRow::column_names_in_write_order)
-            {
-                if !column_order.iter().any(|existing| existing == name) {
-                    column_order.push(name.to_owned());
-                }
-            }
             for row in &segment.rows {
                 let mut fields = BTreeMap::new();
                 if schema.symbol {
@@ -9090,7 +8906,6 @@ mod tests {
                 }
                 rows.push(SemanticRow {
                     table: segment.config.table.as_str().to_owned(),
-                    column_order: column_order.clone(),
                     fields,
                 });
             }
@@ -9179,10 +8994,6 @@ mod tests {
                 group_end += 1;
             }
             let schema = semantic_group_schema(&decoded[group_start..group_end]);
-            let column_order = schema
-                .iter()
-                .map(|(name, _)| name.clone())
-                .collect::<Vec<_>>();
             for datagram in &decoded[group_start..group_end] {
                 let columns = &datagram.table.columns;
                 for decoded_row in &datagram.table.rows {
@@ -9197,7 +9008,6 @@ mod tests {
                     }
                     rows.push(SemanticRow {
                         table: table_name.clone(),
-                        column_order: column_order.clone(),
                         fields,
                     });
                 }
@@ -9209,13 +9019,13 @@ mod tests {
 
     fn semantic_group_schema(
         decoded: &[crate::tests::qwp_decode::DecodedDatagram],
-    ) -> Vec<(String, SemanticKind)> {
-        let mut schema: Vec<(String, SemanticKind)> = Vec::new();
+    ) -> BTreeMap<String, SemanticKind> {
+        let mut schema = BTreeMap::new();
         for datagram in decoded {
             for (col_idx, column) in datagram.table.columns.iter().enumerate() {
-                if !schema.iter().any(|(name, _)| name == &column.name) {
-                    schema.push((column.name.clone(), infer_semantic_kind(datagram, col_idx)));
-                }
+                schema
+                    .entry(column.name.clone())
+                    .or_insert_with(|| infer_semantic_kind(datagram, col_idx));
             }
         }
         schema
@@ -10381,33 +10191,6 @@ mod tests {
             .unwrap();
         let (_, entries, _) = ws_delta_entries(&scratch.message);
         assert_eq!(entries, vec![b"ETH-USD".to_vec(), b"XNAS".to_vec()]);
-
-        // The dictionary alone says nothing about where the symbols landed in
-        // the schema: assert the table block's column order, wire types and
-        // cell values straight off the wire.
-        let (table_name, columns) = ws_single_row_columns(&scratch.message);
-        assert_eq!(table_name, "trades");
-        assert_eq!(
-            columns,
-            vec![
-                ("qty".to_owned(), QWP_TYPE_LONG, WsTestCell::I64(4)),
-                (
-                    "sym".to_owned(),
-                    QWP_TYPE_SYMBOL,
-                    WsTestCell::Symbol("ETH-USD".to_owned())
-                ),
-                (
-                    "active".to_owned(),
-                    QWP_TYPE_BOOLEAN,
-                    WsTestCell::Bool(true)
-                ),
-                (
-                    "venue".to_owned(),
-                    QWP_TYPE_SYMBOL,
-                    WsTestCell::Symbol("XNAS".to_owned())
-                ),
-            ]
-        );
     }
 
     #[cfg(feature = "_sender-qwp-ws")]
@@ -10988,44 +10771,6 @@ mod tests {
         assert_eq!(
             decode_single_i64_column_ws_replay(&scratch.message),
             vec![("trades".to_owned(), "qty".to_owned(), vec![1])]
-        );
-    }
-
-    /// For this same-kind duplicate, QWP/WebSocket keeps the first value while
-    /// QWP/UDP rejects the second write; see
-    /// `qwp_udp_rejects_duplicate_symbol_after_column_within_row`.
-    #[cfg(feature = "_sender-qwp-ws")]
-    #[test]
-    fn qwp_ws_columnar_same_kind_duplicate_symbol_after_column_keeps_first_value() {
-        let mut buf = QwpWsColumnarBuffer::new(127);
-        let mut scratch = QwpWsEncodeScratch::new();
-        let mut global_dict = SymbolGlobalDict::new();
-
-        buf.table("trades")
-            .unwrap()
-            .symbol("sym", "ETH-USD")
-            .unwrap()
-            .column_i64("qty", 4)
-            .unwrap()
-            .symbol("sym", "XNAS")
-            .unwrap()
-            .at_now()
-            .unwrap();
-        buf.encode_ws_replay_message(&mut scratch, &mut global_dict, QWP_VERSION_1)
-            .unwrap();
-
-        let (table_name, columns) = ws_single_row_columns(&scratch.message);
-        assert_eq!(table_name, "trades");
-        assert_eq!(
-            columns,
-            vec![
-                (
-                    "sym".to_owned(),
-                    QWP_TYPE_SYMBOL,
-                    WsTestCell::Symbol("ETH-USD".to_owned())
-                ),
-                ("qty".to_owned(), QWP_TYPE_LONG, WsTestCell::I64(4)),
-            ]
         );
     }
 

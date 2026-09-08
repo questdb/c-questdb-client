@@ -759,12 +759,6 @@ impl Buffer {
     /// non-symbol columns. QWP buffers allow symbols and non-symbol columns in
     /// any order before the designated timestamp.
     ///
-    /// Treat column names as case-insensitive, record each name once per row,
-    /// and keep its type consistent across rows. Duplicate handling differs by
-    /// QWP transport and spelling: a later value may fail, be silently ignored,
-    /// or be encoded as a separate column. Type-change errors can be reported at
-    /// different calls and may discard the in-progress row.
-    ///
     /// When the buffer is flushed over QWP/WebSocket, every distinct symbol
     /// recorded here is interned into the *same* connection-scoped dictionary
     /// the column/chunk API uses — capped at 2,000,000 entries and 256 MiB of
