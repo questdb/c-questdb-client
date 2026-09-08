@@ -523,7 +523,7 @@ struct CountedArrow
             // Four inline Arrow ByteViews: u32 length followed by up to 12
             // bytes, with no variadic data buffers. Exercise the view layout
             // independently of the ordinary UTF-8 offsets layout.
-            auto views = std::make_shared<std::vector<uint8_t>>(64, 0);
+            auto views = std::make_shared<std::vector<uint8_t>>(64, uint8_t{0});
             const std::string values[] = {"a", "bc", "def", "ghij"};
             for (size_t i = 0; i < 4; ++i)
             {
@@ -1160,7 +1160,7 @@ TEST_CASE(
             // fields read before the deliberately negative key length is
             // rejected.
             const int32_t metadata[] = {1, -2, 0};
-            const char invalid_name[] = {char(0xff), 0};
+            const char invalid_name[] = "\xff";
             // Allocate the full declared blob, even though the size guard must
             // reject before reading its payload. Never test with fictitious
             // memory.
