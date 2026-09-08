@@ -92,7 +92,25 @@ def capture(run_dir, pid, reason):
                 # No additional profilers in this arm. The recorder finalizes
                 # independently; the harness validates exported data afterward.
                 return
-            if sys.platform == 'darwin':
+            if sys.platform == 'darwin' and (run_dir / 'kernel-stacks-enabled').exists():
+                try:
+                    directory = run_dir / 'kernel-stacks'
+                    directory.mkdir()
+                    (directory / 'tmp').mkdir()
+                    controller = Path(__file__).resolve().parents[1] / 'ci/diagnostics/kernel_wait_preflight.py'
+                    write_event(log, 'kernel_sample_start')
+                    subprocess.run(['sudo', '-n', 'env', f'TMPDIR={directory / "tmp"}',
+                                    sys.executable, str(controller), str(directory),
+                                    '--record', '--limit', '25'],
+                                   stdout=sample_log, stderr=subprocess.STDOUT,
+                                   timeout=35, check=True)
+                    if not (directory / 'recorder-validation.json').is_file():
+                        raise RuntimeError('kernel sample produced no validation')
+                    write_event(log, 'kernel_sample_complete')
+                except Exception as exc:
+                    write_event(log, 'kernel_sample_error', error=repr(exc))
+                    (run_dir / 'capture-error').write_text(repr(exc) + '\n')
+            elif sys.platform == 'darwin':
                 # Explicit output path: sample otherwise writes into /tmp.
                 try:
                     sample = subprocess.Popen(
@@ -181,11 +199,14 @@ def watch(run_dir, pid, port, stop):
                 if (run_dir / 'show-columns-enabled').exists():
                     # Keep ping/heartbeat telemetry, but reserve invasive capture
                     # for a slow query or an actual workload failure in this arm.
+                    ping_reason = reason
                     slow_query = run_dir / 'show-columns-slow'
                     reason = ('slow SHOW COLUMNS: ' + slow_query.read_text()) if slow_query.exists() else None
                     observer_reason = query_observer.check(time.monotonic())
                     if reason is None:
                         reason = observer_reason
+                    if reason is None and ping_reason and (run_dir / 'kernel-ping-capture-enabled').exists():
+                        reason = 'kernel resource follow-up: ' + ping_reason
                 if request.exists():
                     reason = request.read_text()
                 if delayed.is_set() and reason is None and not (run_dir / 'show-columns-enabled').exists():
@@ -212,7 +233,7 @@ def watch(run_dir, pid, port, stop):
         stop.set()
         pulse.join(timeout=2)
         if collector is not None:
-            collector.join(timeout=15)
+            collector.join(timeout=45 if (run_dir / 'kernel-stacks-enabled').exists() else 15)
         (run_dir / 'watchdog-stopped').touch()
 
 

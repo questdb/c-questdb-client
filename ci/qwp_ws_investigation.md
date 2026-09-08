@@ -4,9 +4,42 @@ Status: server progress interruption observed; root cause **not established**.
 This branch is diagnostic only. Keep sender timeouts and correctness assertions
 unchanged. Azure PR 200 allocates only one macOS worker, running only
 `TestQwpWsFuzz.test_add_columns` with the focused query-stage probe below when
-workload mode is enabled. The current default is a kernel-stack recorder preflight.
+workload mode is enabled. The current default is a bounded kernel-wait follow-up.
 
-## Current action: kernel-stack access check, no server build
+## Current action: kernel wait capture with query-stage context
+
+Build 268468 collected a real three-second system spindump with 156 samples.
+The original validator incorrectly expected the kernel marker after the sample
+count, while report v60 prints `*156 function`. Local parsing of the retained
+report finds 4,829 kernel-frame lines and 693 named frames, including APFS and
+AppleVirtIOStorage frames. This access check succeeded; the CI failure was the
+validator, now covered by a regression test. No repeat preflight is needed.
+
+The next arm uses one natural-memory unrecorded control, then at most seven
+attempts with kernel capture on the first failed ping, slow SHOW or explicit
+workload failure. Original test inputs, 72-lookup prefix and query-stage overlay
+remain. There is no extra disk load or memory-pressure helper. Stop after the
+first capture/failure, one Mac, no new attempt after 600 seconds.
+
+`QWP_WS_KERNEL_CAPTURE=ping` explicitly enables this resource follow-up;
+`query` reserves kernel capture for the existing query/failure triggers, and
+`off` leaves the old sampler unchanged. Attempt 1 remains unrecorded in either
+enabled mode. The ping follow-up is not a reproduction of the original long
+query. Its purpose is to distinguish kernel transaction coordination, I/O
+completion and throttling behind the already captured APFS wake-up chain.
+
+The kernel recorder starts only after the triggering anomaly. Sampling lasts
+three seconds at 20 ms intervals; symbol processing is deferred until sampling
+ends. The tool has a 25-second total limit, its privileged controller bounds
+and reaps the actual recorder process, and no SIGQUIT is sent until it finishes.
+Kernel mode replaces the ordinary native sample rather than layering another
+sampler on top. Only post-workload teardown waits longer (50 seconds) to retain
+the report before DROP; workload assertions and sender/SQL deadlines are not
+extended. A missing/unusable report remains an explicit diagnostic failure.
+Reporter overhead can affect subsequent progress; align its time range with
+query stages and workload completion before interpreting any stack.
+
+## Completed arm: kernel-stack access check, no server build
 
 Build 268458 passed all four natural/warn/warn/natural attempts. Both warning
 gates reached kernel level 2 (after 30.369 and 20.408 seconds of polling), and

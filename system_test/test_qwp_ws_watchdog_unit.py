@@ -22,6 +22,55 @@ def wait_for(predicate):
 
 
 class WatchdogTest(unittest.TestCase):
+    def test_kernel_ping_followup_is_opt_in_and_keeps_query_observer(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            for name in ('start-test', 'show-columns-enabled', 'kernel-stacks-enabled',
+                         'kernel-ping-capture-enabled'):
+                (directory / name).touch()
+            stop = threading.Event()
+            opener = mock.Mock()
+            opener.open.side_effect = TimeoutError('injected ping')
+            with mock.patch.object(watchdog.urllib.request, 'build_opener', return_value=opener), \
+                    mock.patch.object(watchdog, 'capture', side_effect=lambda *_: stop.set()) as collect:
+                watchdog.watch(directory, 123, 9000, stop)
+            self.assertIn('kernel resource follow-up: ping:', collect.call_args.args[2])
+
+    def test_kernel_capture_finishes_before_jvm_dump_without_second_sampler(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            (directory / 'kernel-stacks-enabled').touch()
+            events = []
+
+            def record(*args, **kwargs):
+                argv = args[0]
+                self.assertEqual(argv[:3], ['sudo', '-n', 'env'])
+                self.assertEqual(argv[-3:], ['--record', '--limit', '25'])
+                (directory / 'kernel-stacks/recorder-validation.json').write_text('{}')
+                events.append('kernel-recorded')
+
+            with mock.patch.object(watchdog.sys, 'platform', 'darwin'), \
+                    mock.patch.object(watchdog.subprocess, 'run', side_effect=record), \
+                    mock.patch.object(watchdog.subprocess, 'Popen') as native, \
+                    mock.patch.object(watchdog.os, 'kill', side_effect=lambda *_: events.append('sigquit')), \
+                    mock.patch.object(watchdog.time, 'sleep'):
+                watchdog.capture(directory, 123, 'slow query')
+            native.assert_not_called()
+            self.assertEqual(events, ['kernel-recorded', 'sigquit', 'sigquit', 'sigquit'])
+            self.assertFalse((directory / 'capture-error').exists())
+
+    def test_kernel_capture_error_does_not_suppress_jvm_dump(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            (directory / 'kernel-stacks-enabled').touch()
+            with mock.patch.object(watchdog.sys, 'platform', 'darwin'), \
+                    mock.patch.object(watchdog.subprocess, 'run', side_effect=RuntimeError('denied')), \
+                    mock.patch.object(watchdog.os, 'kill') as send, \
+                    mock.patch.object(watchdog.time, 'sleep'):
+                watchdog.capture(directory, 123, 'slow query')
+            self.assertEqual(send.call_count, 3)
+            self.assertIn('denied', (directory / 'capture-error').read_text())
+
     def test_query_observer_fallback_waits_for_first_data_and_tracks_progress(self):
         with tempfile.TemporaryDirectory() as tmp:
             directory = Path(tmp)

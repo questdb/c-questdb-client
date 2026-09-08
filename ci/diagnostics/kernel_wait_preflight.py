@@ -11,18 +11,25 @@ import sys
 import time
 
 
-def command(directory):
+def command(directory, time_limit=45):
     return ['/usr/sbin/spindump', '-notarget', '3', '20',
             '-o', str(directory / 'spindump.txt'), '-timeline', '-symbolicate',
-            '-timelimit', '45', '-timestampsInCallTrees', 'all']
+            '-timelimit', str(time_limit), '-timestampsInCallTrees', 'all',
+            '-noProcessingWhileSampling']
 
 
 def inspect_report(report):
     # This is an access check, not proof of a filesystem bottleneck. Keep the
     # actual text so kernel symbols and thread identities can be inspected.
-    frames = [line.strip() for line in report.splitlines()
-              if re.match(r'^\s*\d+\s+\*', line)]
-    named = [line for line in frames if re.match(r'^\d+\s+\*[A-Za-z_]', line)]
+    frames, named = [], []
+    for line in report.splitlines():
+        # Report v60 uses '*156 function'; older reports can place '*' after
+        # the count. An image-list entry '*0xffff...' is not a sampled frame.
+        match = re.match(r'^\s*(?:\*\d+\s+|\d+\s+\*)(.*)', line)
+        if match:
+            frames.append(line.strip())
+            if re.match(r'[A-Za-z_]', match[1]):
+                named.append(line.strip())
     return dict(kernel_frame_lines=len(frames), named_kernel_frame_lines=len(named),
                 apfs_present='apfs_transaction_flusher' in report,
                 virtio_present='AppleVirtIO' in report,
@@ -62,11 +69,16 @@ def main():
     parser.add_argument('directory', type=Path)
     parser.add_argument('--workload', action='store_true')
     parser.add_argument('--record', action='store_true')
+    parser.add_argument('--limit', type=int, choices=(25, 45), default=45)
     args = parser.parse_args()
     if args.record:
         # This small controller runs as root, so subprocess timeout can kill
         # and reap its actual recorder child, not merely an intervening sudo.
-        subprocess.run(command(args.directory), timeout=60, check=True)
+        subprocess.run(command(args.directory, args.limit), timeout=args.limit+5, check=True)
+        result = inspect_report((args.directory / 'spindump.txt').read_text(errors='replace'))
+        (args.directory / 'recorder-validation.json').write_text(json.dumps(result) + '\n')
+        if not result['named_kernel_frame_lines']:
+            raise RuntimeError('recorder returned no named kernel frames')
         return
     if args.workload:
         workload(args.directory)
@@ -84,7 +96,7 @@ def main():
                                  env=environment)
     (directory / 'spindump-help.txt').write_text(help_result.stdout)
     for option in ('-notarget', '-o <path>', '-timeline', '-symbolicate',
-                   '-timelimit', '-timestampsincalltrees'):
+                   '-timelimit', '-timestampsincalltrees', '-noprocessingwhilesampling'):
         if option not in help_result.stdout.lower():
             raise RuntimeError(f'installed recorder does not advertise {option}')
     child = None

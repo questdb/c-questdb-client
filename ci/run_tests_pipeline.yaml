@@ -8,7 +8,7 @@ parameters:
   - name: qwpWsPreflightOnly
     displayName: "QWP diagnostics: verify recorder startup only (no builds/tests)"
     type: boolean
-    default: true
+    default: false
 
 variables:
   OS_MAPPING: none
@@ -480,10 +480,13 @@ stages:
                 # Restore the original 72 missing-table ALTER lookups before
                 # producer connection. This is a scheduling perturbation, not
                 # a recreation of the unknown original startup delay.
-                # One natural/warn/warn/natural cycle. Verify actual kernel
-                # pressure before releasing each workload; no disk-load helper.
+                # Kernel-resource follow-up: one unrecorded control, then up to
+                # seven attempts that capture the first failed ping or slow
+                # query. Preserve query stages; short pings are not the original
+                # long-query failure. No pressure or separate disk load.
                 # No new attempt after ten minutes; stop at first capture.
-                QWP_WS_DIAGNOSTIC_RUNS: "4"
+                QWP_WS_DIAGNOSTIC_RUNS: "8"
+                QWP_WS_KERNEL_CAPTURE: ping
                 QWP_WS_DISK_LOAD: "0"
                 QWP_WS_STARTUP_LOOKUPS: "72"
                 QWP_WS_MAX_SECONDS: "600"
@@ -494,7 +497,7 @@ stages:
                 QWP_WS_MIN_FREE_KB: "2097152"
                 QWP_WS_DIAGNOSTICS_DIR: >-
                   $(Build.ArtifactStagingDirectory)/qwp-ws-macos-diagnostics
-                QWP_WS_MEMORY_PRESSURE: paired
+                QWP_WS_MEMORY_PRESSURE: natural
                 QWP_WS_FS_TRACE: "0"
           - bash: |
               # xctrace may create private root-owned files despite umask.

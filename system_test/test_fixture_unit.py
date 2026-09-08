@@ -159,6 +159,21 @@ class PrintLogTest(unittest.TestCase):
 
 
 class TimeoutDiagnosticsTest(unittest.TestCase):
+    def test_kernel_report_wait_is_bounded_after_workload_completion(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = pathlib.Path(tmp)
+            (directory / 'kernel-stacks-enabled').touch()
+            qdb = _make_fixture(tmp)
+            with mock.patch.dict(fixture.os.environ, {
+                    'QWP_WS_FUZZ_DIAGNOSTICS': '1',
+                    'QWP_WS_FUZZ_WATCHDOG_DIR': str(directory)}), \
+                    mock.patch.object(fixture.time, 'monotonic', side_effect=[0, 20, 40, 51]), \
+                    mock.patch.object(fixture.time, 'sleep') as sleep:
+                qdb.finish_fuzz_diagnostics()
+            self.assertTrue((directory / 'workload-finished').exists())
+            self.assertEqual(sleep.call_count, 2)
+            self.assertIn('did not stop', (directory / 'capture-error').read_text())
+
     def test_only_traced_or_pressure_diagnostic_setup_gets_longer_gate(self):
         with tempfile.TemporaryDirectory() as tmp:
             directory = pathlib.Path(tmp)

@@ -22,6 +22,7 @@ readonly MIN_FREE_KB="${QWP_WS_MIN_FREE_KB:-2097152}"
 readonly SYSTEM_TRACE="${QWP_WS_SYSTEM_TRACE:-0}"
 readonly QUERY_OVERLAY="${QWP_WS_SHOW_COLUMNS_OVERLAY:-}"
 readonly DISK_LOAD="${QWP_WS_DISK_LOAD:-0}"
+readonly KERNEL_CAPTURE="${QWP_WS_KERNEL_CAPTURE:-off}"
 
 if [[ ! "$RUN_COUNT" =~ ^[1-9][0-9]*$ ||
       ! "$MAX_SECONDS" =~ ^[1-9][0-9]*$ ||
@@ -45,6 +46,15 @@ fi
 
 if [[ "$FS_TRACE" != "0" && "$FS_TRACE" != "1" ]]; then
     echo "Unsupported QWP_WS_FS_TRACE=$FS_TRACE" >&2
+    exit 2
+fi
+
+if [[ "$KERNEL_CAPTURE" != "off" && "$KERNEL_CAPTURE" != "query" && "$KERNEL_CAPTURE" != "ping" ]]; then
+    echo "Unsupported QWP_WS_KERNEL_CAPTURE=$KERNEL_CAPTURE" >&2
+    exit 2
+fi
+if [[ "$KERNEL_CAPTURE" != "off" && -z "$QUERY_OVERLAY" ]]; then
+    echo "Kernel follow-up requires query-stage telemetry" >&2
     exit 2
 fi
 
@@ -104,6 +114,7 @@ snapshot_host() {
         echo "disk_load=$DISK_LOAD paired_order=probe,load,load,probe max_write_bytes_per_attempt=268435456"
         echo "min_free_kb=$MIN_FREE_KB"
         echo "system_trace=$SYSTEM_TRACE trace_capture_limit=2 controls=1,6,11"
+        echo "kernel_capture=$KERNEL_CAPTURE kernel_unrecorded_control=1"
         find questdb/core/target -maxdepth 1 -type f \
             -name 'questdb*-SNAPSHOT.jar' \
             -exec shasum -a 256 {} \;
@@ -247,6 +258,10 @@ for run_number in $(seq 1 "$RUN_COUNT"); do
     fi
     mkdir -p "$run_dir/tmp"
     [[ "$traced" == "0" ]] || touch "$run_dir/system-trace-enabled"
+    if [[ "$KERNEL_CAPTURE" != "off" && "$run_number" != "1" ]]; then
+        touch "$run_dir/kernel-stacks-enabled"
+        [[ "$KERNEL_CAPTURE" != "ping" ]] || touch "$run_dir/kernel-ping-capture-enabled"
+    fi
 
     echo "=== run=$run_number pressure=$PRESSURE_MODE seed=$FUZZ_SEED "\
          "build_mode_seed=$BUILD_MODE_SEED "\

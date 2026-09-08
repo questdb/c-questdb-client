@@ -786,7 +786,10 @@ class QuestDbFixture(QuestDbFixtureBase):
         # between its capture-started marker and this teardown thread.
         # This is after workload assertions, outside sender timeout budgets.
         (directory / 'workload-finished').touch()
-        deadline = time.monotonic() + 15
+        # Kernel report processing is after onset, outside workload assertions
+        # and sender/SQL deadlines. Do not start DROP while it is still reading.
+        wait_seconds = 50 if (directory / 'kernel-stacks-enabled').exists() else 15
+        deadline = time.monotonic() + wait_seconds
         while not (directory / 'watchdog-stopped').exists():
             if time.monotonic() >= deadline:
                 (directory / 'capture-error').write_text(
