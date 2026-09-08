@@ -69,28 +69,88 @@ let stream: Box<dyn RecordBatchReader + Send> =
     Box::new(cursor.into_arrow_reader()?);                  // Statement::execute
 ```
 
-That deletes the driver's 611-line module outright. What remains is a ranked list of gaps, from a driver's point of view.
+That deletes the driver's 611-line module outright. What follows is what a driver
+still cannot do, split by whether it is *impossible* or merely awkward.
 
-**1. A detachable cancel handle — the one real blocker.**
-ADBC's `AdbcStatementCancel` may be called from another thread *while execution is in progress*. Today `cancel(&mut self)` needs exclusive access on both paths, and `into_arrow_reader` consumes the cursor, so once a stream is handed to the caller there is no handle left to cancel through. Our driver reports `NotImplemented` for cancel, and no amount of driver-side work fixes that. The ask: something like `cursor.cancel_handle() -> CancelHandle` that is `Send + Sync`, survives the wrap, and is safe to fire concurrently with a read.
+### Blockers — ADBC features that cannot be implemented at all today
 
-**2. Schema without the first batch.**
-`RecordBatchReader::schema()` must work before iteration, so `into_arrow_reader` blocks until the first batch arrives — making `execute()` latency data-dependent. It also means ADBC's `execute_schema` (schema without running the query) cannot be implemented at all. If QWP can deliver the result schema ahead of the first batch, both problems go away.
+**B1. Query cancellation.** `AdbcStatementCancel` may be called from another thread
+*while execution is in progress*. `cancel(&mut self)` needs exclusive access on both
+paths, and `into_arrow_reader` consumes the cursor, so once a stream is handed to the
+caller there is no handle left to cancel through. Our driver reports `NotImplemented`,
+and no driver-side work changes that. **Ask:** `cursor.cancel_handle() -> CancelHandle`,
+`Send + Sync`, surviving the wrap, safe to fire concurrently with a read.
 
-**3. Rows affected without draining.**
-ADBC's `execute_update` wants a row count. Today: submit, drain every batch, then read `Terminal::ExecDone { rows_affected }`. A direct path would be cleaner and avoids decoding batches nobody wants.
+**B2. `execute_schema` — the result schema without running the query.**
+`RecordBatchReader::schema()` must work before iteration, so `into_arrow_reader` blocks
+until the first batch arrives. That makes `execute()` latency data-dependent, and makes
+ADBC's schema-only call impossible. **Ask:** deliver the result schema ahead of the
+first batch.
 
-**4. Reversibility.** `into_arrow_reader` is a one-way door: the returned reader exposes only `schema()`. An `into_cursor()` / `get_ref()` would let a driver reach `terminal()`, `connection_reusable()` and `into_owner()` after wrapping — all of which ADBC needs for error reporting and connection reuse.
+**B3. Prepared statements and `get_parameter_schema`.** QWP has no prepare message —
+`Reader::prepare` is a client-side builder that encodes a `QUERY_REQUEST`. So
+`statement_prepare` has no server-side meaning, and there is no way to ask what types
+the parameters are. Both are permanently off in the driver's capability flags.
+**Ask:** a protocol-level prepare, or an explicit statement that this is out of scope
+so drivers stop treating it as pending.
 
-**5. `try_execute` as the default.** `execute()` consumes the owner, so a failed submit drops the connection even for an error that never reached the wire. `try_execute` is the escape, but the fluent default is the footgun.
+**B4. Multi-row bind.** ADBC binds a whole `RecordBatch` — N parameter *sets* — and
+executes once per set. QWP binds a single set per query. The driver rejects multi-row
+batches explicitly rather than silently using row 0, and the validation suite's
+`test_parameter_execute` is xfailed as a genuine capability boundary. **Ask:** multiple
+bind sets per request, or batched submission.
 
-**6. A documented `ErrorCode` → meaning contract.** The driver maps `questdb::ErrorCode` onto ADBC statuses, and consumers branch on those. We got two wrong on the first pass (`RoleMismatch`, `ProtocolError` fell into a catch-all despite being connect-time reachable). A table saying which codes are transient, which are caller error, and which are protocol faults would remove the guesswork.
+**B5. Bulk ingest needs a public `OwnedSender`.** The write path has the same ownership
+problem the read path just fixed: `OwnedSender` exists but is exported **only** through
+`ffi_support`, which is `#[doc(hidden)]` and semver-exempt. `OwnedReader` was promoted
+in this branch; `OwnedSender` was not. ADBC's `statement_bulk_ingest` will hit this the
+moment we start it. **Ask:** promote `OwnedSender` symmetrically.
 
-**7. Polars has no owning path at all.** `next_polars`/`iter_polars`/`fetch_all_polars` are borrowing-only, and the public substitute interns symbols into a process-global rather than the per-cursor registry. Not needed for ADBC — flagging it because it is the one corner where a consumer would still be pushed back toward a self-referential struct.
+### Frictions — implementable, but they cost the driver something
+
+**F1. Rows affected requires draining.** `execute_update` wants a count; today that
+means submit, drain every batch, then read `Terminal::ExecDone { rows_affected }` —
+decoding batches nobody wants.
+
+**F2. `into_arrow_reader` is a one-way door.** The returned reader exposes only
+`schema()`. An `into_cursor()` / `get_ref()` would let a driver reach `terminal()`,
+`connection_reusable()` and `into_owner()` after wrapping — all needed for error
+reporting and connection reuse.
+
+**F3. `execute()` consumes the owner on failure,** dropping the connection even for an
+error that never reached the wire. `try_execute` is the escape, but the fluent default
+is the footgun.
+
+**F4. No documented `ErrorCode` → meaning contract.** Drivers map these onto ADBC
+statuses and consumers branch on them. We got two wrong on the first pass
+(`RoleMismatch` and `ProtocolError` fell into a catch-all despite being connect-time
+reachable). A table of which codes are transient, which are caller error and which are
+protocol faults would remove the guesswork.
+
+**F5. The concurrency ceiling is low and fails slowly.** Each in-flight, undrained
+result stream holds one pooled reader; `query_pool_max` defaults to **4**, and the
+fifth stalls for `acquire_timeout_ms` (default **5000 ms**) before erroring. ADBC
+consumers routinely hold several result sets open — a notebook with four open queries
+is not exotic. The default and the slow failure mode are both worth revisiting.
+
+**F6. Polars has no owning path** — `next_polars`/`iter_polars`/`fetch_all_polars` are
+borrowing-only, and the public substitute interns symbols into a process-global rather
+than the per-cursor registry. Not needed for ADBC; flagged because it is the one corner
+where a consumer would still be pushed back toward a self-referential struct.
 
 ## 5. Recommendation
 
-Items 4–6 are small and I would fold them in before this lands. Item 1 is the one that needs a design decision rather than plumbing, and it is worth making early: it is the difference between an ADBC driver that supports query cancellation and one that never can.
+F2, F3 and F4 are small and worth folding in before this lands. B5 is mechanical —
+the same promotion `OwnedReader` just had.
+
+B1 is the one that needs a design decision rather than plumbing, and it is worth making
+early: it is the difference between an ADBC driver that supports query cancellation and
+one that never can. B2 is next, because it decides whether `execute()` can ever be
+non-blocking.
+
+B3 and B4 are protocol questions, not API questions. Both are currently recorded in the
+driver as permanent limitations; if either is actually on the roadmap, we should say so,
+because the capability flags we ship are a public claim about what QuestDB can do.
 
 Everything else in the branch is verified — `questdb-rs` 2111 tests pass, the FFI 120, the C++ suite 106 cases, the C ABI is byte-identical by symbol and signature diff, and the one regression the migration introduced (an Arrow cursor that wedged permanently after schema drift) was caught by a purpose-built baseline-vs-HEAD probe, fixed, and pinned.
 
