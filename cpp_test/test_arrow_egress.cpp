@@ -581,6 +581,31 @@ TEST_CASE(
     {
         CHECK(e.code() == questdb::error_code::schema_drift);
     }
+
+    // The documented recovery contract (qwp_reader.h, "Mid-stream schema
+    // drift"): reporting the drift CLEARS the cursor's pinned schema
+    // snapshot, so the very next call re-snapshots against the new schema
+    // and re-delivers the batch that tripped the check — it is preserved,
+    // not discarded. A cursor that kept the stale pin would answer
+    // schema_drift forever, which is unrecoverable for every downstream
+    // binding (C, C++, Python, ADBC). This third call is the whole point of
+    // the case; stopping at the error above proves only that drift is
+    // *detected*.
+    auto resumed = h.cursor.next_arrow_batch();
+    REQUIRE(resumed.has_value());
+    CHECK(resumed->array.length == 1);
+    // Re-snapshotted against the 2-D schema: List(List(Float64)).
+    REQUIRE(resumed->schema.children[0]->format != nullptr);
+    CHECK(std::string(resumed->schema.children[0]->format) == "+l");
+    REQUIRE(resumed->schema.children[0]->n_children == 1);
+    const auto* inner = resumed->schema.children[0]->children[0];
+    REQUIRE(inner != nullptr);
+    CHECK(std::string(inner->format) == "+l");
+    release_pair(&resumed->array, &resumed->schema);
+
+    // And the stream still terminates normally afterwards — the resume
+    // must not leave the cursor stuck or double-deliver.
+    CHECK(!h.cursor.next_arrow_batch().has_value());
 }
 
 // Batch 0's only array row is null, so ndim can't be inferred and the field

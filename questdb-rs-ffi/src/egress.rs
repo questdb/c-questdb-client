@@ -2165,7 +2165,18 @@ where
             return;
         }
         let Some(q) = (*query).inner.take() else {
-            eprintln!("qwp_reader_query_bind_*: query handle already consumed; bind dropped");
+            // Reachable only through misuse (binding after `_query_execute`
+            // consumed the handle), but report it the way every other bind
+            // error is reported rather than dropping it on stderr: stash a
+            // deferred error so the next `_query_execute` surfaces it.
+            defer_query_err(
+                query,
+                "qwp_reader_query_bind_*",
+                Error::new(
+                    ErrorCode::InvalidApiCall,
+                    "qwp_reader_query_bind_*: query handle already consumed; bind dropped",
+                ),
+            );
             return;
         };
         match std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || f(q))) {
@@ -4192,8 +4203,12 @@ unsafe fn reader_cursor_next_arrow_batch_export(
         }
         let pinned = (*cursor).arrow_schema_pin.clone();
         // No `cursor_for_mut` any more: there is no laundered `BatchView`
-        // to clear before re-borrowing the cursor. The pin is re-derived
-        // from `pinned` on every arm below, exactly as before.
+        // to clear before re-borrowing the cursor. `cursor_for_mut` also
+        // cleared the pin on the way in, so every arm below had to state
+        // the pin it wanted; with the helper gone the pin survives the
+        // call, so every arm must state it explicitly instead. Missing one
+        // is not cosmetic: leaving a stale pin in place after a drift
+        // error wedges the cursor into reporting `schema_drift` forever.
         let Some(inner) = cursor_mut_or_err(cursor, err_out, "qwp_reader_cursor_next_arrow_batch")
         else {
             return qwp_reader_arrow_batch_result::qwp_reader_arrow_batch_error;
@@ -4223,16 +4238,29 @@ unsafe fn reader_cursor_next_arrow_batch_export(
                 std::ptr::write(out_schema, ffi_schema);
                 qwp_reader_arrow_batch_result::qwp_reader_arrow_batch_ok
             }
-            NextArrow::End => qwp_reader_arrow_batch_result::qwp_reader_arrow_batch_end,
+            NextArrow::End => {
+                // Stream over: drop the pin, as the old `cursor_for_mut`
+                // did on the way in and never restored on this arm.
+                c.arrow_schema_pin = None;
+                qwp_reader_arrow_batch_result::qwp_reader_arrow_batch_end
+            }
             NextArrow::Err(e, pin_to_restore) => {
                 match pin_to_restore {
                     Some(pin) => {
                         c.arrow_schema_pin = Some(pin);
                     }
                     None => {
-                        if e.code() != ErrorCode::SchemaDrift {
-                            c.arrow_schema_pin = pinned;
-                        }
+                        // Schema drift is the one error the cursor recovers
+                        // from: clearing the pin makes the next call
+                        // re-snapshot the new schema and re-deliver the
+                        // batch that tripped the check. Any other error
+                        // leaves the stream where it was, so the pin the
+                        // call started with is restored.
+                        c.arrow_schema_pin = if e.code() == ErrorCode::SchemaDrift {
+                            None
+                        } else {
+                            pinned
+                        };
                     }
                 }
                 write_err_box(err_out, e);
