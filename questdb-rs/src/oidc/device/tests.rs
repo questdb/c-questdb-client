@@ -4662,3 +4662,37 @@ fn persisted_expiry_honors_jwt_exp_but_caps_opaque() {
         ts2.expires_at()
     );
 }
+
+/// The silent-refresh backoff must escalate, not sit at a flat 5s.
+///
+/// Regression: an IdP that withholds the required token kind on the refresh
+/// grant fails identically every time, so a flat interval re-asked the token
+/// endpoint -- rotating another refresh token and rewriting the store -- twelve
+/// times a minute for the life of the process. The delay now doubles to the
+/// same 60s ceiling `load_retry_interval` uses.
+#[test]
+fn refresh_backoff_escalates_and_caps() {
+    let mut state = StoreState::default();
+    let start = Instant::now();
+
+    for expected in [5u64, 10, 20, 40, 60, 60] {
+        state.record_refresh_failure(start);
+        assert!(
+            state.refresh_backed_off(
+                start + Duration::from_secs(expected) - Duration::from_millis(1)
+            ),
+            "still backed off just before {expected}s"
+        );
+        assert!(
+            !state.refresh_backed_off(start + Duration::from_secs(expected)),
+            "retry allowed at {expected}s"
+        );
+    }
+
+    // A success -- or an explicit sign_in() -- clears the ladder, so a recovered
+    // provider is not left waiting a minute between attempts.
+    state.reset_refresh_backoff();
+    assert!(!state.refresh_backed_off(start));
+    state.record_refresh_failure(start);
+    assert!(!state.refresh_backed_off(start + Duration::from_secs(5)));
+}

@@ -1202,13 +1202,18 @@ impl TokenStore for FileTokenStore {
                 return Ok(None);
             }
             let path = self.token_file(key);
-            let file = match open_regular_bounded(&path)? {
+            let (file, size) = match open_regular_bounded(&path)? {
                 Some(f) => f,
                 None => return Ok(None), // missing / non-regular / empty / oversized
             };
             // Read at most MAX_FILE_BYTES + 1 so an oversized file (grown after
             // the metadata check) is rejected rather than read whole.
-            let mut data = Zeroizing::new(Vec::new());
+            //
+            // Sized from the metadata `open_regular_bounded` already took, so
+            // the buffer does not grow: `Zeroizing` scrubs the buffer it holds
+            // at drop, and every superseded one a geometric growth left behind
+            // was freed with a plaintext prefix of the credential JSON.
+            let mut data = Zeroizing::new(Vec::with_capacity(size as usize));
             file.take(MAX_FILE_BYTES + 1)
                 .read_to_end(&mut data)
                 .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { Box::new(e) })?;
@@ -1869,7 +1874,7 @@ fn steal_if_stale(lock: &Path, stale_after: Duration, empty_grace: Duration) -> 
 /// Open a file for reading only if it is a regular file within the size bound;
 /// `None` for a missing / non-regular / empty / oversized entry (per the load
 /// contract), `Err` only for a genuine I/O error.
-fn open_regular_bounded(path: &Path) -> TokenStoreResult<Option<File>> {
+fn open_regular_bounded(path: &Path) -> TokenStoreResult<Option<(File, u64)>> {
     // Open first (with O_NONBLOCK on unix so a FIFO swapped in doesn't hang the
     // thread), then fstat the OPENED handle — closing the stat→open TOCTOU.
     let mut opts = OpenOptions::new();
@@ -1895,7 +1900,9 @@ fn open_regular_bounded(path: &Path) -> TokenStoreResult<Option<File>> {
     if !meta.is_file() || meta.len() == 0 || meta.len() > MAX_FILE_BYTES {
         return Ok(None);
     }
-    Ok(Some(file))
+    // The length comes back with the handle so the caller can size its read
+    // buffer exactly; it is already bounded by MAX_FILE_BYTES above.
+    Ok(Some((file, meta.len())))
 }
 
 /// SHA-256 hex digest using the crate's configured crypto provider.

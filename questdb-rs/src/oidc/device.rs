@@ -81,6 +81,7 @@ const ACQUIRE_WAIT_POLL_SLICE: Duration = Duration::from_millis(50);
 // Stampede guards for token()'s transport-facing hot path. An explicit sign_in()
 // clears both so a user-initiated recovery is never throttled.
 const MIN_REFRESH_RETRY_INTERVAL: Duration = Duration::from_secs(5);
+const MAX_REFRESH_RETRY_INTERVAL: Duration = Duration::from_secs(60);
 const MIN_STORE_LOAD_RETRY_INTERVAL: Duration = Duration::from_secs(5);
 const MAX_STORE_LOAD_RETRY_INTERVAL: Duration = Duration::from_secs(60);
 // How often an unauthenticated provider re-reads a store that was empty last
@@ -114,8 +115,20 @@ struct StoreState {
     /// Delay to apply after the next failed load. The first failure leaves the
     /// next retry immediate, then this doubles from 5s to 60s like Java.
     load_retry_interval: Duration,
-    /// The last failed silent-refresh attempt, used to prevent a POST per flush.
-    refresh_failed_at: Option<Instant>,
+    /// Earliest instant at which a failed silent refresh may be retried.
+    next_refresh_attempt: Option<Instant>,
+    /// Delay to apply after the next failed refresh. Starts at 5s and doubles
+    /// to 60s, mirroring `load_retry_interval`.
+    ///
+    /// The escalation is load-bearing, not tidiness. A flat interval is fine
+    /// for a transient network failure, which clears on its own, but the
+    /// `Ok(refreshed)`-but-unusable arm below is not transient: an IdP that
+    /// withholds the required token kind on the refresh grant withholds it
+    /// every time. At a flat 5s that arm re-asked the token endpoint -- and
+    /// burned another refresh-token rotation, plus a store delete and write --
+    /// twelve times a minute for the life of the process, against an IdP whose
+    /// answer never changes.
+    refresh_retry_interval: Duration,
     /// The refresh token last known to be in the store. If it later disappears,
     /// a peer may have consumed it; the matching in-memory copy must not be used.
     /// It also avoids redundant writes outside the coordinated-refresh path.
@@ -163,12 +176,26 @@ impl StoreState {
     }
 
     fn reset_refresh_backoff(&mut self) {
-        self.refresh_failed_at = None;
+        self.next_refresh_attempt = None;
+        self.refresh_retry_interval = Duration::ZERO;
     }
 
     fn refresh_backed_off(&self, now: Instant) -> bool {
-        self.refresh_failed_at
-            .is_some_and(|failed| now.duration_since(failed) < MIN_REFRESH_RETRY_INTERVAL)
+        self.next_refresh_attempt.is_some_and(|next| now < next)
+    }
+
+    /// Back off the next silent refresh, doubling the delay each time. Unlike
+    /// `record_store_load_failure` the first failure already waits: this guard
+    /// exists to stop one POST per flush, so an immediate first retry would
+    /// defeat it.
+    fn record_refresh_failure(&mut self, now: Instant) {
+        let delay = if self.refresh_retry_interval.is_zero() {
+            MIN_REFRESH_RETRY_INTERVAL
+        } else {
+            self.refresh_retry_interval
+        };
+        self.refresh_retry_interval = delay.saturating_mul(2).min(MAX_REFRESH_RETRY_INTERVAL);
+        self.next_refresh_attempt = Some(now + delay);
     }
 }
 
@@ -1101,7 +1128,8 @@ impl OidcDeviceAuth {
                     // Back off the next silent refresh: without this every
                     // token() call would burn another refresh-token rotation to
                     // reach the same InteractionRequired.
-                    self.lock_store_state().refresh_failed_at = Some(Instant::now());
+                    self.lock_store_state()
+                        .record_refresh_failure(Instant::now());
                     refreshed_unusable = Some(refreshed);
                 }
                 // A retryable transport or persistence failure must not trigger
@@ -1109,7 +1137,8 @@ impl OidcDeviceAuth {
                 // (stored or in-memory) may already have discarded an ambiguously
                 // consumed parent, leaving the next call to re-prompt.
                 Err(e) if e.kind() == crate::oidc::error::OidcErrorKind::Network => {
-                    self.lock_store_state().refresh_failed_at = Some(Instant::now());
+                    self.lock_store_state()
+                        .record_refresh_failure(Instant::now());
                     return Err(e);
                 }
                 Err(e) if e.kind() == crate::oidc::error::OidcErrorKind::Cancelled => {
@@ -1152,11 +1181,21 @@ impl OidcDeviceAuth {
             self.run_device_flow()
         };
         let fresh = fresh_result?;
+        // Persist the fresh sign-in (a new refresh token) for the next restart,
+        // durably and deliberately BEFORE any `ensure_open()` -- the same
+        // ordering, for the same reason, as the rotated-child write in
+        // `refresh_under_lock`. A `close()` published between the device flow
+        // completing and this write used to make it return `Cancelled`,
+        // discarding a credential the human had just authorized: nothing
+        // reached the store, so the next process start faced a full interactive
+        // sign-in, and the refresh token stayed live at the IdP, never stored
+        // and never used. The store is deliberately independent of provider
+        // lifetime -- that is why `clear()` has to outlive `close()` -- so a
+        // credential acquired before the close was published belongs in it.
+        self.persist_fresh_durable(&fresh)?;
         self.ensure_open()?;
         self.lock_store_state().reset_refresh_backoff();
         *self.lock_tokens() = Some(fresh.clone());
-        // Persist the fresh sign-in (a new refresh token) for the next restart.
-        self.persist_fresh(&fresh)?;
         self.ensure_open()?;
         // Commit the authorized token to memory and persistence before invoking
         // cosmetic user code. If a custom renderer panics and its caller catches
@@ -1571,19 +1610,22 @@ impl OidcDeviceAuth {
     /// superseded persisted credential when the IdP issues no refresh token.
     /// Wrap the change in the store's lock so it serialises against a concurrent
     /// save or clear.
-    fn persist_fresh(&self, tokens: &TokenSet) -> Result<()> {
+    /// `persist_fresh`, but for a write that MUST land: the device flow has
+    /// completed and the human has authorized, so a `close()` arriving now must
+    /// not cost the credential. Uncancellable, and it does not consult
+    /// `ensure_open()` before the write -- the caller re-checks afterwards.
+    fn persist_fresh_durable(&self, tokens: &TokenSet) -> Result<()> {
         let (Some(store), Some(key)) = (self.token_store.as_ref(), self.store_key.as_ref()) else {
-            return self.ensure_open();
+            return Ok(());
         };
         let store = Arc::clone(store);
         let tokens = tokens.clone();
-        let cancelled = || self.is_closed();
+        let cancelled = || false;
         let mut persist_result = None;
         let outcome = store.in_lock_cancellable(key, &cancelled, &mut || {
-            persist_result = Some(self.persist_if_changed(store.as_ref(), key, &tokens));
+            persist_result = Some(self.persist_if_changed_durable(store.as_ref(), key, &tokens));
             Ok(())
         });
-        self.ensure_open()?;
         if let Some(result) = persist_result {
             result?;
         }
@@ -1598,16 +1640,8 @@ impl OidcDeviceAuth {
     /// sign-in has no refresh token, clear the credential it superseded so a
     /// restart cannot retry a refresh token the IdP already rejected. Must be
     /// called with the store lock held.
-    fn persist_if_changed(
-        &self,
-        store: &dyn TokenStore,
-        key: &TokenStoreKey,
-        tokens: &TokenSet,
-    ) -> Result<()> {
-        self.persist_if_changed_inner(store, key, tokens, false)
-    }
-
-    /// `persist_if_changed`, but for a write that MUST land: the caller has
+    ///
+    /// A write that MUST land: the caller has
     /// already consumed and deleted the parent refresh token, so skipping this
     /// leaves nothing on disk and forces an interactive re-sign-in a headless
     /// caller cannot perform.
@@ -1647,8 +1681,14 @@ impl OidcDeviceAuth {
             self.ensure_open()?;
         }
         let cancelled = || !durable && self.is_closed();
-        let rt = tokens.refresh_token.clone();
-        if rt == self.lock_store_state().last_persisted_refresh {
+        // `Zeroizing`, because three of the four exits below drop this clone
+        // rather than handing it to `set_last_persisted_refresh`: the
+        // not-rotated early return (the common case for a non-rotating IdP, so
+        // once per silent refresh), the `ensure_open()?` inside the save path,
+        // and the save-failure arm. A bare clone left the plaintext refresh
+        // token in freed heap on all three.
+        let mut rt = Zeroizing::new(tokens.refresh_token.clone());
+        if *rt == self.lock_store_state().last_persisted_refresh {
             return Ok(()); // not rotated; nothing to write
         }
         // With no replacement refresh token there is nothing worth saving, but a
@@ -1672,7 +1712,11 @@ impl OidcDeviceAuth {
         }
         match save_result {
             Ok(()) => {
-                self.lock_store_state().set_last_persisted_refresh(rt);
+                // Move the secret out rather than cloning it: the guard is left
+                // holding `None`, and `set_last_persisted_refresh` scrubs
+                // whatever it replaces.
+                let taken = std::mem::take(&mut *rt);
+                self.lock_store_state().set_last_persisted_refresh(taken);
             }
             Err(e) => warn_persistence("save", &*e),
         }
