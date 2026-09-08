@@ -146,6 +146,27 @@ that drives the transport (such as `flush` or `wait`). As a
 consequence, `must_close()` on an otherwise-idle manual sender does not
 reflect a terminal diagnostic until the next drive.
 
+### Relaying pre-encoded frames
+
+A store-and-forward relay that receives frames produced elsewhere — by
+[`buffer.encode_self_contained()`](Buffer::encode_self_contained) in another
+process — ships them verbatim through a [`RelaySender`], built with
+[`SenderBuilder::build_relay`](SenderBuilder::build_relay) or
+[`RelaySender::from_conf`](RelaySender::from_conf), and
+[`relay.flush_encoded(&frame)`](RelaySender::flush_encoded), which returns the
+frame's FSN. A self-contained frame carries its own base-0 symbol dictionary,
+whereas typed rows use the connection's delta dictionary, so the two cannot
+share a connection: `RelaySender` is a separate type with no `new_buffer` or
+row `flush`, and `Sender` has no `flush_encoded`. Open one of each if a
+process needs both.
+
+Relay runs over the default in-memory queue only. `build_relay` rejects
+`sf_dir` with `ErrorCode::ConfigError` because a file-backed slot outlives
+the process that chose its dictionary regime and could later be recovered by
+a typed-row sender. Everything else above — progress modes, reconnect and
+replay, `wait`, the FSN watermarks, error polling and the error handler —
+applies to `RelaySender` unchanged.
+
 ## HTTP
 
 HTTP distinguishes between recoverable and non-recoverable errors. For

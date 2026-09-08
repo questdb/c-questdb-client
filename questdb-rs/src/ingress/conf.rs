@@ -312,6 +312,12 @@ pub(crate) struct QwpWsConfig {
     /// flock collision is a deterministic producer-id conflict rather than a
     /// retryable transport condition.
     pub(crate) pool_managed_slot: bool,
+    /// Internal build hook: this connection relays pre-encoded self-contained
+    /// frames instead of typed rows. Set only by `SenderBuilder::build_relay`,
+    /// never from a connect string. The runner reads it at construction so it
+    /// skips the connection symbol-dictionary mirror, the torn-dictionary guard,
+    /// and reconnect catch-up, none of which apply to base-0 frames.
+    pub(crate) relay: bool,
     pub(crate) max_background_drainers: ConfigSetting<usize>,
     pub(crate) error_inbox_capacity: ConfigSetting<usize>,
     pub(crate) progress: ConfigSetting<QwpWsProgress>,
@@ -363,6 +369,7 @@ impl Default for QwpWsConfig {
             orphan_exclude_managed_slots: Vec::new(),
             orphan_extra_slots: Vec::new(),
             pool_managed_slot: false,
+            relay: false,
             max_background_drainers: ConfigSetting::new_default(
                 QWP_WS_DEFAULT_MAX_BACKGROUND_DRAINERS,
             ),

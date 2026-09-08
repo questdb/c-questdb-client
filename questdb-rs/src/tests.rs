@@ -42,6 +42,9 @@ mod qwp_mock;
 #[cfg(feature = "sync-sender-qwp-ws")]
 mod qwp_ws;
 
+#[cfg(feature = "sync-sender-qwp-ws")]
+mod qwp_ws_relay;
+
 #[cfg(all(feature = "sync-sender-qwp-ws", feature = "sync-sender-http"))]
 mod qwp_ws_replay_probe;
 

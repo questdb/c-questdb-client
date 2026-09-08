@@ -116,6 +116,12 @@ pub(crate) mod qwp_ws;
 #[cfg(feature = "sync-sender-qwp-ws")]
 pub(crate) use qwp_ws::*;
 
+#[cfg(feature = "sync-sender-qwp-ws")]
+mod relay;
+
+#[cfg(feature = "sync-sender-qwp-ws")]
+pub use relay::RelaySender;
+
 #[cfg(feature = "sync-sender-tcp")]
 mod tcp;
 
@@ -168,6 +174,11 @@ pub(crate) enum SyncProtocolHandler {
 /// * To construct an instance, use [`Sender::from_conf`] or the [`SenderBuilder`].
 /// * To prepare messages, use [`Buffer`] objects.
 /// * To send messages, call the [`flush`](Sender::flush) method.
+///
+/// A `Sender` always ships typed rows it encoded itself. To relay
+/// pre-encoded self-contained QWP/WebSocket frames verbatim, build a
+/// [`RelaySender`] instead; the two are distinct types because one
+/// connection cannot carry both dictionary regimes.
 pub struct Sender {
     descr: String,
     handler: SyncProtocolHandler,
@@ -380,9 +391,8 @@ impl Sender {
             }
             _ => unreachable!("QWP/WebSocket handler was checked above"),
         };
-        if result
-            .as_ref()
-            .is_err_and(|err| matches!(err.code(), crate::ErrorCode::SocketError))
+        if let Err(err) = &result
+            && matches!(err.code(), crate::ErrorCode::SocketError)
         {
             self.connected = false;
         }

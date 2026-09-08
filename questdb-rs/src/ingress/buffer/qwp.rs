@@ -2877,6 +2877,47 @@ impl QwpWsColumnarBuffer {
         self.check_op(Op::Flush)
     }
 
+    pub(crate) fn encode_self_contained(&self) -> crate::Result<Vec<u8>> {
+        if self.is_empty() {
+            return Err(error::fmt!(
+                InvalidApiCall,
+                "Cannot encode an empty QWP/WebSocket buffer."
+            ));
+        }
+        let mut payload = Vec::new();
+        let mut scratch = QwpWsEncodeScratch::new();
+        let mut global_dict = SymbolGlobalDict::new();
+        self.encode_ws_replay_message_with_defer(
+            &mut payload,
+            &mut scratch,
+            &mut global_dict,
+            QWP_VERSION_1,
+            false,
+            false,
+        )?;
+        Ok(payload)
+    }
+
+    pub(super) fn is_self_contained_frame(frame: &[u8]) -> bool {
+        if frame.len() < QWP_MESSAGE_HEADER_SIZE + 2
+            || &frame[..4] != b"QWP1"
+            || frame[4] != QWP_VERSION_1
+            || frame[5] != QWP_FLAG_DELTA_SYMBOL_DICT
+            || u16::from_le_bytes([frame[6], frame[7]]) == 0
+        {
+            return false;
+        }
+        let payload_len = u32::from_le_bytes([frame[8], frame[9], frame[10], frame[11]]) as usize;
+        if payload_len != frame.len() - QWP_MESSAGE_HEADER_SIZE {
+            return false;
+        }
+        let Some((dictionary_base, after_base)) = decode_qwp_varint(frame, QWP_MESSAGE_HEADER_SIZE)
+        else {
+            return false;
+        };
+        dictionary_base == 0 && decode_qwp_varint(frame, after_base).is_some()
+    }
+
     pub(crate) fn set_marker(&mut self) -> crate::Result<()> {
         self.state.op_state.ensure_marker_can_be_set()?;
         let marker = self.capture_snapshot()?;
