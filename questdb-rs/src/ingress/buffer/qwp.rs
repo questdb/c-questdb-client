@@ -10310,6 +10310,49 @@ mod tests {
 
     #[cfg(feature = "_sender-qwp-ws")]
     #[test]
+    fn qwp_ws_columnar_clear_drops_the_rewind_point() {
+        for api in ["marker", "bookmark"] {
+            let mut buf = QwpWsColumnarBuffer::new(127);
+            buf.table("t")
+                .unwrap()
+                .column_i64("v", 1)
+                .unwrap()
+                .at_now()
+                .unwrap();
+            let bookmark = if api == "marker" {
+                buf.set_marker().unwrap();
+                None
+            } else {
+                Some(buf.bookmark().unwrap())
+            };
+            buf.table("t")
+                .unwrap()
+                .column_i64("v", 2)
+                .unwrap()
+                .at_now()
+                .unwrap();
+            buf.clear();
+
+            // The marker is simply gone; a bookmark handle outlives the clear
+            // and is rejected by generation.
+            let (err, expected) = match bookmark {
+                Some(bookmark) => (
+                    buf.rewind_to_bookmark(bookmark).unwrap_err(),
+                    "Bookmark is stale",
+                ),
+                None => (buf.rewind_to_marker().unwrap_err(), "No marker set"),
+            };
+            assert_eq!(err.code(), ErrorCode::InvalidApiCall, "{api}");
+            assert!(
+                err.msg().contains(expected),
+                "{api}: a cleared buffer has no rewind point: {err}"
+            );
+            assert_eq!(buf.row_count(), 0, "{api}: the clear stands");
+        }
+    }
+
+    #[cfg(feature = "_sender-qwp-ws")]
+    #[test]
     fn qwp_ws_columnar_clear_bookmark_drops_only_current_snapshot() {
         let mut buf = QwpWsColumnarBuffer::new(127);
 
