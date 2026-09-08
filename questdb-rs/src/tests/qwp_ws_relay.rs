@@ -319,15 +319,23 @@ fn spawn_two_frame_server() -> (u16, thread::JoinHandle<Vec<Vec<u8>>>) {
 /// the first frame's connection dictionary (both define id 0 differently).
 #[test]
 fn two_self_contained_frames_relay_verbatim_on_one_connection() {
-    for progress in [QwpWsProgress::Background, QwpWsProgress::Manual] {
+    for (progress, initial_connect_retry) in [
+        (QwpWsProgress::Background, "off"),
+        (QwpWsProgress::Manual, "off"),
+        // Async initial connect builds the send core on the runner thread.
+        (QwpWsProgress::Background, "async"),
+    ] {
         let first = self_contained_frame("alpha", 1);
         let second = self_contained_frame("beta", 2);
         let (port, server) = spawn_two_frame_server();
-        let mut sender = SenderBuilder::new(Protocol::Ws, "127.0.0.1", port)
-            .qwp_ws_progress(progress)
-            .unwrap()
-            .build_relay()
-            .unwrap();
+        let mut sender = SenderBuilder::from_conf(format!(
+            "ws::addr=127.0.0.1:{port};initial_connect_retry={initial_connect_retry};"
+        ))
+        .unwrap()
+        .qwp_ws_progress(progress)
+        .unwrap()
+        .build_relay()
+        .unwrap();
 
         sender.flush_encoded(&first).unwrap();
         sender.wait(AckLevel::Ok, Duration::from_secs(5)).unwrap();
