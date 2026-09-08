@@ -266,7 +266,9 @@ for run_number in $(seq 1 "$RUN_COUNT"); do
                 --pid "$server_pid" >"$run_dir/system-trace-helper.log" 2>&1 &
             system_trace_pid=$!
             echo "$system_trace_pid" >"$system_trace_pid_file"
-            for _ in $(seq 1 200); do
+            # Recorder startup allows 60s; the traced fixture setup gate allows
+            # 90s. Leave time for watchdog startup and the host snapshot.
+            for _ in $(seq 1 700); do
                 [[ -f "$run_dir/system-trace-ready.json" ]] && break
                 kill -0 "$system_trace_pid" 2>/dev/null || break
                 [[ ! -f "$run_dir/system-trace-error.json" ]] || break

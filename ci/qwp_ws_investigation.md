@@ -2,9 +2,8 @@
 
 Status: server progress interruption observed; root cause **not established**.
 This branch is diagnostic only. Keep sender timeouts and correctness assertions
-unchanged. Azure PR 200 allocates only one macOS worker. The next run is
-**preflight-only**: establish recorder startup before resuming
-`TestQwpWsFuzz.test_add_columns`. It will not compile or start QuestDB.
+unchanged. Azure PR 200 allocates only one macOS worker, running only
+`TestQwpWsFuzz.test_add_columns` after validating recorder capability.
 
 Local follow-up, 2026-09-08: a controlled O3 close delay demonstrated global
 `FdCache` lock propagation into both WAL segment work and the serial network
@@ -69,17 +68,30 @@ not. This establishes a mechanism, not the original macOS trigger. See the
   a permissions failure or lack of System Trace support. Compilation and the
   QuestDB test were skipped; only one macOS job ran.
 
-## Current experiment: recorder startup only
+## Recorder startup validation (completed)
 
-Pipeline parameter `qwpWsPreflightOnly` defaults to `true`. In that mode the
+[Build 268361](https://dev.azure.com/questdb/questdb/_build/results?buildId=268361)
+passed the preflight-only run. Recorder readiness took 18.712 seconds: the old
+15-second allowance would have interrupted this successful start. It exported
+1,224 target syscalls with CPU/wait duration fields and 1,084 target thread-state
+intervals; the raw trace was retained. Its template uses a five-second rolling
+window. This establishes recorder capability on that hosted Mac, not the cause
+of the original QuestDB timeout. Kernel wait causes remain to be investigated;
+the exported syscall stacks in this smoke recording contain user-space frames.
+
+Pipeline parameter `qwpWsPreflightOnly` now defaults to `false`. Set it to `true`
+to repeat just the startup check. In that mode the
 expanded job contains checkout, tracing preflight, artifact ownership hand-back,
 and publication only. Dependency installs, client/server builds, the fuzz test,
 and server-log archival are excluded even if the smoke check succeeds. The job
 limit is ten minutes; the preflight step limit is five minutes. Do not turn the
-full experiment back on until the startup artifact has been inspected.
+full experiment on without first inspecting the startup artifact.
 
-Only the preflight receives a 60-second startup budget. The full test's recorder
-startup budget remains 15 seconds within its unchanged 30-second fixture gate.
+Both preflight and full-test recorders now receive a 60-second startup budget.
+Only traced attempts get a 90-second diagnostic setup gate, before the workload
+starts; controls retain their 30-second gate. The shell controller waits up to
+70 seconds for recorder readiness. Workload assertions and sender/SQL timeouts
+are unchanged.
 The smoke process now waits through cold startup and recorder cleanup rather
 than expiring at the old 25-second deadline. It exits without replacing the
 parent's error if the recorder finishes before releasing the smoke workload.
@@ -110,7 +122,7 @@ is an exploratory cold-start allowance, not a claim that slow initialization
 caused build 268344. A successful check still requires actual target syscall
 and scheduler rows; readiness alone is not sufficient.
 
-## Full experiment (disabled by default)
+## Current experiment: bounded full test
 
 The single worker uses server `12a33d651e51e2682e7a448c8db5168fc72dfad3`, Temurin
 25.0.3+9 (official download with pinned SHA-256), fuzz seed
@@ -144,8 +156,8 @@ the outer bound; the test and sender retain all existing timeouts/assertions.
 The recorder starts at the existing server-ready gate and must post its explicit
 Darwin readiness notification before the workload is released. Registration's
 initial notification state is consumed **before** recorder launch, so it cannot
-be mistaken for readiness. Startup is bounded to leave room within the unchanged
-30-second fixture gate.
+be mistaken for readiness. Startup is bounded to leave room within the traced
+attempt's 90-second diagnostic setup gate.
 
 At the first failed ping, heartbeat gap, or workload-error request, the watchdog
 synchronously requests SIGINT of the recorder. The privileged collector polls
@@ -196,7 +208,7 @@ previously its catch-all hid timeouts from the diagnostic callback.
 
 ## Reading the next artifact
 
-Download `qwp-ws-macos-system-trace`. For the current preflight-only run, inspect
+Download `qwp-ws-macos-system-trace`. For a preflight-only run, inspect
 the startup artifacts above and `system-trace-valid.json`/`system-trace-error.json`.
 There should be no `run-*` directories or QuestDB logs. Success establishes
 recorder capability only, not a reproduced ping timeout.

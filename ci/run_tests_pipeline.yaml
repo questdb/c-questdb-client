@@ -4,7 +4,7 @@ parameters:
   - name: qwpWsPreflightOnly
     displayName: "QWP diagnostics: verify recorder startup only (no builds/tests)"
     type: boolean
-    default: true
+    default: false
 
 variables:
   OS_MAPPING: none

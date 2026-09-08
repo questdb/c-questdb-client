@@ -159,6 +159,19 @@ class PrintLogTest(unittest.TestCase):
 
 
 class TimeoutDiagnosticsTest(unittest.TestCase):
+    def test_only_traced_diagnostic_setup_gets_longer_gate(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = pathlib.Path(tmp)
+            qdb = _make_fixture(tmp)
+            with mock.patch.dict(fixture.os.environ, {
+                    'QWP_WS_FUZZ_DIAGNOSTICS': '1',
+                    'QWP_WS_FUZZ_WATCHDOG_DIR': str(directory)}):
+                self.assertEqual(qdb.fuzz_diagnostic_gate_timeout(), 30)
+                (directory / 'system-trace-enabled').touch()
+                self.assertEqual(qdb.fuzz_diagnostic_gate_timeout(), 90)
+                with mock.patch.dict(fixture.os.environ, {'QWP_WS_FUZZ_DIAGNOSTICS': '0'}):
+                    self.assertEqual(qdb.fuzz_diagnostic_gate_timeout(), 30)
+
 
     def test_watchdog_request_does_not_block_on_http_or_dump(self):
         with tempfile.TemporaryDirectory() as tmp_dir:

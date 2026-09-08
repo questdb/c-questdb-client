@@ -20,9 +20,9 @@ import uuid
 
 from qwp_ws_trace_export import export_and_validate
 
-# The unchanged fixture gate has a 30-second budget; leave time for watchdog
-# startup and the host snapshot after the recorder is ready.
-START_TIMEOUT = 15
+# Build 268361 needed 18.7 seconds just to start recording. Traced attempts
+# have a separate 90-second setup gate; no workload timeout is extended.
+START_TIMEOUT = 60
 PREFLIGHT_START_TIMEOUT = 60
 FINISH_TIMEOUT = 30
 RECORD_SECONDS = 30

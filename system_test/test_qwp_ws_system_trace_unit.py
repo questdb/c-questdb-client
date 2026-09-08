@@ -191,7 +191,7 @@ class CollectorTest(unittest.TestCase):
 
         self.patch(trace.time, 'sleep', side_effect=advance)
 
-    def test_slow_preflight_start_is_allowed_without_extending_test_gate(self):
+    def test_observed_18_second_start_is_allowed(self):
         self.simulated_clock()
         self.notification.check.side_effect = lambda: self.elapsed >= 18
         trace.collect(self.directory, 123, on_ready=self.request,
@@ -199,11 +199,11 @@ class CollectorTest(unittest.TestCase):
         ready = json.loads((self.directory / 'system-trace-ready.json').read_text())
         self.assertGreaterEqual(ready['startup_seconds'], 18)
         self.assertEqual(trace.PREFLIGHT_START_TIMEOUT, 60)
-        self.assertEqual(trace.START_TIMEOUT, 15)
+        self.assertEqual(trace.START_TIMEOUT, 60)
         self.startup_diagnostics.assert_not_called()
         self.validate.assert_called_once()
 
-    def test_default_gate_still_fails_at_15_seconds_with_original_state_saved(self):
+    def test_startup_still_fails_at_60_seconds_with_original_state_saved(self):
         self.simulated_clock()
         self.notification.check.return_value = False
 
@@ -217,9 +217,9 @@ class CollectorTest(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, 'readiness_timeout'):
             trace.collect(self.directory, 123)
         failure = json.loads((self.directory / 'system-trace-startup-failure.json').read_text())
-        self.assertGreaterEqual(failure['elapsed_seconds'], 15)
-        self.assertLess(failure['elapsed_seconds'], 15.1)
-        self.assertEqual(failure['timeout_seconds'], 15)
+        self.assertGreaterEqual(failure['elapsed_seconds'], 60)
+        self.assertLess(failure['elapsed_seconds'], 60.1)
+        self.assertEqual(failure['timeout_seconds'], 60)
         exit_event = json.loads((self.directory / 'system-trace-recorder-exit.json').read_text())
         self.assertEqual(exit_event['returncode'], 0)  # after our cleanup, not spontaneous
         self.startup_diagnostics.assert_called_once_with(self.directory, self.child, 123)

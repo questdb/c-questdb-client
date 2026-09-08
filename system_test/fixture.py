@@ -762,6 +762,12 @@ class QuestDbFixture(QuestDbFixtureBase):
             return pathlib.Path(directory).resolve()
         return None
 
+    def fuzz_diagnostic_gate_timeout(self):
+        directory = self._watchdog_dir()
+        if directory is not None and (directory / 'system-trace-enabled').exists():
+            return 90  # recorder initialization only, before workload starts
+        return 30
+
     def finish_fuzz_diagnostics(self):
         directory = self._watchdog_dir()
         if directory is None:

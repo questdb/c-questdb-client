@@ -4579,7 +4579,7 @@ def run_with_fixtures(args):
                     pathlib.Path(ready_file).touch()
                     retry(
                         lambda: pathlib.Path(go_file).exists(),
-                        timeout_sec=30,
+                        timeout_sec=QDB_FIXTURE.fuzz_diagnostic_gate_timeout(),
                         every=0.05,
                         backoff_till=0.05,
                         lead_sleep=0,
