@@ -35,7 +35,6 @@
 )]
 
 use crate::error::{self, Result};
-use crate::ingress::sender::qwp_ws_publisher::qwp_ws_encoded_message_size_error;
 use crate::ingress::sender::{
     SyncProtocolHandler, effective_qwp_ws_max_buf_size, publish_qwp_ws_payload_background,
     publish_qwp_ws_payload_manual, qwp_ws_check_error_background, qwp_ws_check_error_manual,
@@ -109,6 +108,14 @@ impl RelaySender {
     /// frame with [`Self::acked_fsn`] or with the `from_fsn..=to_fsn` span of a
     /// [`QwpWsSenderError`], or call [`Self::wait`] with [`AckLevel::Ok`] to
     /// block for server acceptance.
+    ///
+    /// A frame is shipped as exactly one WebSocket message and is never split,
+    /// so it must fit the smallest of `max_buf_size`, the server's advertised
+    /// batch cap, and the per-frame capacity of the replay queue
+    /// (`sf_max_segment_bytes` less the segment headers, ~4 MiB by default).
+    /// Larger frames are rejected with
+    /// [`ErrorCode::InvalidApiCall`](crate::ErrorCode::InvalidApiCall) before
+    /// publication.
     pub fn flush_encoded(&mut self, frame: &[u8]) -> Result<u64> {
         if !is_self_contained(frame) {
             return Err(error::fmt!(
@@ -137,17 +144,44 @@ impl RelaySender {
         }
         self.inner.drain_qwp_ws_error_notifications()?;
 
-        let max = match &self.inner.handler {
-            SyncProtocolHandler::SyncQwpWs(state) => {
-                effective_qwp_ws_max_buf_size(self.inner.max_buf_size, &state.server_max_batch_size)
-            }
-            SyncProtocolHandler::ManualQwpWs(state) => {
-                effective_qwp_ws_max_buf_size(self.inner.max_buf_size, &state.server_max_batch_size)
-            }
+        // Two caps bind a relay frame: the negotiated message size
+        // (`max_buf_size` narrowed by the server's advertised batch cap) and
+        // the replay queue's per-frame payload capacity. The queue enforces
+        // the latter itself, but only after this call has promised to validate
+        // before publication, and with an internal error rather than one that
+        // names the knob. A self-contained frame cannot be split, so check the
+        // tighter of the two here.
+        let (negotiated, queue_cap) = match &self.inner.handler {
+            SyncProtocolHandler::SyncQwpWs(state) => (
+                effective_qwp_ws_max_buf_size(
+                    self.inner.max_buf_size,
+                    &state.server_max_batch_size,
+                ),
+                state.sfa_frame_payload_cap,
+            ),
+            SyncProtocolHandler::ManualQwpWs(state) => (
+                effective_qwp_ws_max_buf_size(
+                    self.inner.max_buf_size,
+                    &state.server_max_batch_size,
+                ),
+                state.sfa_frame_payload_cap,
+            ),
             _ => unreachable!("RelaySender is built only over a QWP/WebSocket handler"),
         };
+        let max = negotiated.min(queue_cap);
         if frame.len() > max {
-            return Err(qwp_ws_encoded_message_size_error(frame.len(), max));
+            let bound_by = if queue_cap < negotiated {
+                "the replay queue's per-frame capacity (sf_max_segment_bytes less segment headers)"
+            } else {
+                "max_buf_size or the server's advertised batch cap"
+            };
+            return Err(error::fmt!(
+                InvalidApiCall,
+                "flush_encoded: self-contained frame of {} bytes exceeds the {}-byte limit set by {}; a relay frame is shipped as one message and cannot be split.",
+                frame.len(),
+                max,
+                bound_by
+            ));
         }
 
         let result = match &mut self.inner.handler {

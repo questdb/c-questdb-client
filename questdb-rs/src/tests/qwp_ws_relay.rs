@@ -226,6 +226,78 @@ fn oversized_relay_frame_is_rejected_before_publication() {
     );
 }
 
+/// Two caps bind a relay frame: the negotiated message size (`max_buf_size`
+/// narrowed by the server's batch cap) and the replay queue's per-frame
+/// payload capacity derived from `sf_max_segment_bytes`. The queue enforces
+/// the latter itself, but only after `flush_encoded` has promised to validate
+/// before publication, and with an internal error dump rather than a message
+/// naming the knob. A self-contained frame cannot be split, so the tighter cap
+/// must be checked up front in both progress modes.
+#[test]
+fn relay_frame_above_the_replay_queue_frame_cap_is_rejected_before_publication() {
+    const SEGMENT_BYTES: usize = 64 * 1024;
+    let mut buffer = Buffer::new_qwp_ws();
+    let oversized = "x".repeat(SEGMENT_BYTES + 1024);
+    buffer
+        .table("readings")
+        .unwrap()
+        .column_str("payload", &oversized)
+        .unwrap()
+        .column_i64("_seq", 1)
+        .unwrap();
+    buffer.at(TimestampNanos::new(1)).unwrap();
+    let frame = buffer.encode_self_contained().unwrap();
+    assert!(
+        frame.len() > SEGMENT_BYTES && frame.len() < 100 * 1024 * 1024,
+        "fixture must sit between the segment cap and the default max_buf_size"
+    );
+
+    // Background mode dials asynchronously, so an unreachable endpoint will
+    // do; manual mode connects on the caller's thread and needs a socket that
+    // completes the upgrade, and the idle server below expects no frame.
+    let (port, _server) = spawn_idle_server();
+    let confs = [
+        format!(
+            "ws::addr=127.0.0.1:1;initial_connect_retry=async;\
+             sf_max_segment_bytes={SEGMENT_BYTES};qwp_ws_progress=background;"
+        ),
+        format!(
+            "ws::addr=127.0.0.1:{port};\
+             sf_max_segment_bytes={SEGMENT_BYTES};qwp_ws_progress=manual;"
+        ),
+    ];
+    for conf in confs {
+        let mut sender = RelaySender::from_conf(&conf).unwrap();
+        let err = sender.flush_encoded(&frame).unwrap_err();
+        assert_eq!(err.code(), ErrorCode::InvalidApiCall, "got {err:?}");
+        assert!(err.msg().contains("exceeds"), "got {err:?}");
+        assert!(err.msg().contains("sf_max_segment_bytes"), "got {err:?}");
+        assert!(
+            !err.msg().contains("PayloadExceedsByteCapacity"),
+            "got {err:?}"
+        );
+        assert_eq!(
+            sender.published_fsn().unwrap(),
+            None,
+            "an oversized frame must be rejected before it enters the replay queue"
+        );
+    }
+}
+
+/// Accepts one connection, completes the upgrade, then holds the socket open
+/// without expecting any frame, for tests that must publish nothing.
+fn spawn_idle_server() -> (u16, thread::JoinHandle<()>) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let handle = thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        perform_server_upgrade(&mut stream).unwrap();
+        let mut sink = [0u8; 256];
+        while matches!(stream.read(&mut sink), Ok(n) if n > 0) {}
+    });
+    (port, handle)
+}
+
 fn spawn_two_frame_server() -> (u16, thread::JoinHandle<Vec<Vec<u8>>>) {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();
