@@ -7458,6 +7458,10 @@ fn flush_arrow_batch_durable_without_opt_in_is_rejected() {
         .flush_arrow_batch("trades", &batch, None, &[], Some(AckLevel::Durable))
         .expect_err("Durable without request_durable_ack=on must be rejected");
     assert_eq!(err.code(), ErrorCode::InvalidApiCall);
+    assert_eq!(
+        err.msg(),
+        "AckLevel::Durable requires `request_durable_ack=on` in the connect string."
+    );
 }
 
 #[cfg(feature = "arrow-ingress")]
