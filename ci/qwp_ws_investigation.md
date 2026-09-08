@@ -3,7 +3,31 @@
 Status: server progress interruption observed; root cause **not established**.
 This branch is diagnostic only. Keep sender timeouts and correctness assertions
 unchanged. Azure PR 200 allocates only one macOS worker, running only
-`TestQwpWsFuzz.test_add_columns` with the focused query-stage probe below.
+`TestQwpWsFuzz.test_add_columns` with the focused query-stage probe below when
+workload mode is enabled. The current default is export-only, described next.
+
+## Current action: decode retained VM and scheduler evidence
+
+Build 268446 passed all eight probe/load attempts, with 95 completed probe
+cursors and maximum query duration 104.499 ms. Each load arm completed its
+4096-cycle budget in 1.393, 2.005, 2.053 or 4.240 seconds. The longest independent
+truncate took 274.514 ms, pwrite 136.634 ms, and ordinary fsync 141.423 ms.
+No original-like query stall was reproduced. This short, bounded workload does
+not establish quota exhaustion or clear storage as a suspect. Ordinary fsync
+also does not reproduce the Apple F_FULLFSYNC calls used by Rust file syncing.
+
+The next job sets `qwpWsDecodeOnly=true`: download the already recorded build
+268363/run-4 System Trace and export context-switch, virtual-memory, system-load,
+Mach VM and scheduler tables. The run's file names and contents are SHA-256
+pinned independently of ZIP packaging. Export selection uses the current
+xctrace TOC, not assumed old table positions. No dependency installation, client
+or server build, pressure helper or test workload runs. One Mac is needed only
+because xctrace cannot decode the recording on this Linux host. Download and
+exports are bounded; a 2 GiB free-space guard remains.
+
+This examines an existing short stall, not the original 74.7-second operation.
+The recording did not enable kernel callstack capture, so VM/scheduler events
+may narrow the waits without identifying the kernel lock or device responsible.
 
 ## Current focus: the original slow SHOW COLUMNS
 
@@ -36,6 +60,10 @@ second workload started: all sampled kernel pressure levels remained normal
 through the 20-second gate. The allocator substantially increased compression,
 but that is not a valid warning-pressure test and says nothing about the
 original timeout's cause. Pressure is disabled for the next arm.
+Later audit of the retained host monitor found level 2 in the 16:26:19 sample,
+after the gate had expired around 16:26:08. The allocator did reach warning:
+the 20-second gate was too short, and no workload ran under that verified state.
+Do not rerun that pressure plan unchanged or claim the helper cannot reach warn.
 
 The original startup prefix is measurably different: 72 failed SHOW COLUMNS
 lookups occurred during the 8.948517 seconds before the first QWP handshake.
