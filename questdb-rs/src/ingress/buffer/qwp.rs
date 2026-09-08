@@ -2392,23 +2392,11 @@ impl QwpWsLocalSymbolLookup {
     }
 }
 
+/// Lengths a rewind truncates back to; nothing is copied.
 #[cfg(feature = "_sender-qwp-ws")]
 #[derive(Clone, Debug)]
-/// Where a bookmark rewinds to.
-///
-/// Records the lengths a rewind truncates back to rather than copying what it
-/// would discard. A rewind only ever removes what was appended after the
-/// bookmark -- rows from each table, tables added since, and the columns those
-/// rows introduced -- and `QwpWsTableBuffer::restore` already performs exactly
-/// that truncation for row-level rollback. Cloning `tables` instead made the
-/// capture proportional to everything already buffered, so a caller that
-/// bookmarks per row paid a copy that grew as the buffer filled: quadratic in
-/// rows for a linear amount of appending.
 struct QwpWsSnapshot {
-    /// Tables present at capture. Any beyond this were added after, and are
-    /// truncated away.
     tables_len: usize,
-    /// One mark per table present at capture, in table order.
     table_marks: Vec<QwpWsTableRollbackMark>,
     current_table_idx: Option<usize>,
     state: BufferState,
@@ -2942,9 +2930,8 @@ impl QwpWsColumnarBuffer {
             .snapshot
             .take()
             .ok_or_else(|| error::fmt!(InvalidApiCall, "Can't rewind to stale QWP/WS marker."))?;
-        // Drop tables added after the bookmark, then unwind each surviving table
-        // to the row and column counts it had. `restore` truncates every
-        // column's data back to `row_count`, so no per-column state is needed.
+        // The snapshot carries no per-column state: the one thing truncation
+        // cannot recover, a repinned geohash precision, lives on the column.
         self.truncate_tables(snapshot.tables_len);
         let table_count = self.tables.len();
         let size_hint = self
