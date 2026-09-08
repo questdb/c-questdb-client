@@ -402,6 +402,21 @@ required-features = ["sync-sender-qwp-ws", "sync-sender-http"]
 name = "qwp_egress_polars"
 required-features = ["polars", "sync-reader-qwp-ws", "sync-sender-http"]
 
+# Compile-only proof that the owning egress API (QuestDb::take_reader ->
+# PooledQuery -> PooledCursor -> OwnedArrowReader) needs no `unsafe` from a
+# consumer, under `#![forbid(unsafe_code)]`. Exercises the four shapes that
+# were undefined behaviour in a hand-rolled self-referential stream: dropped
+# by value, consumed by a by-value iterator adaptor, moved across a thread,
+# and boxed as `Box<dyn RecordBatchReader + Send>` (the ADBC shape). Not run
+# in CI and not expected to reach a live server — `cargo build --example` is
+# the assertion. Requires `sync-sender-qwp-ws` (for `OwnedReader::query` /
+# `PooledQuery` / `PooledCursor`, which are gated on the sender as well as
+# the reader, see `questdb-rs/src/egress/mod.rs`) alongside `arrow-egress`
+# (which already implies `sync-reader-qwp-ws`).
+[[example]]
+name = "owned_egress_no_unsafe"
+required-features = ["sync-sender-qwp-ws", "arrow-egress"]
+
 # Decoder microbenchmark anchoring the perf claims from commits
 # `8ec0a85` (zero-copy decode) and `1163d43` (tighter SYMBOL/VARCHAR
 # decode hot paths). Run with:
