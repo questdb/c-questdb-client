@@ -40,6 +40,13 @@ observer. The queue is bounded to 8192 records and loss is explicitly rejected.
 
 The observer is a JVM daemon and can be paused with the JVM. Its file writes can
 also block. Missing telemetry is a diagnostic failure, not a healthy result.
+After first observing telemetry, the external watchdog also captures when the
+TSV stops advancing for five seconds, even without a Java slow-query marker.
+This detects loss of observer progress, not its cause: JVM suspension, observer
+scheduling, and blocked diagnostic file output remain distinguishable suspects.
+It does not cover a pause before the helper first publishes data, and cannot
+capture during a host-wide pause that prevents the watchdog itself from running.
+Isolated one-second ping failures still do not trigger this arm.
 The harness retains independent Python heartbeat and JVM pause logs. An exe log
 without cursor-enter can indicate delay before the probe, or lost/delayed
 telemetry; it is not evidence of a metadata lock wait.

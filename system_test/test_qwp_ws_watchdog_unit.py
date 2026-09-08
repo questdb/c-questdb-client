@@ -22,6 +22,39 @@ def wait_for(predicate):
 
 
 class WatchdogTest(unittest.TestCase):
+    def test_query_observer_fallback_waits_for_first_data_and_tracks_progress(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            progress = watchdog.QueryObserverProgress(directory)
+            self.assertIsNone(progress.check(0))
+            self.assertIsNone(progress.check(100))
+            path = directory / 'show-columns.tsv'
+            path.write_text('heartbeat\n')
+            self.assertIsNone(progress.check(101))
+            self.assertIsNone(progress.check(105.9))
+            self.assertIn('5.000s', progress.check(106))
+            path.write_text('heartbeat\nheartbeat\n')
+            self.assertIsNone(progress.check(107))
+            self.assertIsNone(progress.check(111.9))
+            self.assertIn('cause unknown', progress.check(112))
+            path.unlink()
+            self.assertIn('cause unknown', progress.check(113))
+
+    def test_query_arm_captures_observer_loss_even_when_ping_is_healthy(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            for name in ('start-test', 'show-columns-enabled'):
+                (directory / name).touch()
+            stop = threading.Event()
+            opener = mock.MagicMock()
+            opener.open.return_value.__enter__.return_value.status = 204
+            reason = 'Java query observer telemetry stopped advancing for 5.000s; cause unknown'
+            with mock.patch.object(watchdog.urllib.request, 'build_opener', return_value=opener), \
+                    mock.patch.object(watchdog.QueryObserverProgress, 'check', return_value=reason), \
+                    mock.patch.object(watchdog, 'capture', side_effect=lambda *_: stop.set()) as capture:
+                watchdog.watch(directory, 123, 9000, stop)
+            capture.assert_called_once_with(directory, 123, reason)
+
     def test_traced_capture_requests_stop_without_dumping_or_sampling(self):
         with tempfile.TemporaryDirectory() as tmp:
             directory = Path(tmp)

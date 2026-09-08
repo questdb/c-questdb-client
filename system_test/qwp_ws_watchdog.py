@@ -50,6 +50,34 @@ def stop_system_trace(run_dir, reason):
         time.sleep(0.02)
 
 
+class QueryObserverProgress:
+    """External fallback: absence of telemetry is not proof of a JVM pause."""
+
+    def __init__(self, run_dir):
+        self.path = run_dir / 'show-columns.tsv'
+        self.size = None
+        self.changed_at = None
+
+    def check(self, now):
+        try:
+            size = self.path.stat().st_size
+        except FileNotFoundError:
+            size = 0
+        if self.size is None:
+            # The helper starts lazily on the first SHOW COLUMNS. Do not
+            # diagnose its absence before it has published any telemetry.
+            if size > 0:
+                self.size, self.changed_at = size, now
+            return None
+        if size != self.size and size > 0:
+            self.size, self.changed_at = size, now
+            return None
+        elapsed = now - self.changed_at
+        if elapsed >= 5:
+            return f'Java query observer telemetry stopped advancing for {elapsed:.3f}s; cause unknown'
+        return None
+
+
 def capture(run_dir, pid, reason):
     """Stop the active trace, or take native/JVM samples; no HTTP dependency."""
     (run_dir / 'capture-started').write_text(reason + '\n')
@@ -103,6 +131,7 @@ def watch(run_dir, pid, port, stop):
                              name='watchdog-heartbeat', daemon=True)
     pulse.start()
     collector = None
+    query_observer = QueryObserverProgress(run_dir)
     # Do not inherit proxy settings for the loopback probe.
     opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
     try:
@@ -144,6 +173,9 @@ def watch(run_dir, pid, port, stop):
                     # for a slow query or an actual workload failure in this arm.
                     slow_query = run_dir / 'show-columns-slow'
                     reason = ('slow SHOW COLUMNS: ' + slow_query.read_text()) if slow_query.exists() else None
+                    observer_reason = query_observer.check(time.monotonic())
+                    if reason is None:
+                        reason = observer_reason
                 if request.exists():
                     reason = request.read_text()
                 if delayed.is_set() and reason is None and not (run_dir / 'show-columns-enabled').exists():
