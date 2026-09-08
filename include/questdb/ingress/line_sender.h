@@ -2360,9 +2360,14 @@ typedef void (*questdb_connection_event_cb)(
 
 /** Register a connection lifecycle listener on the sender being built.
  * Events are delivered on a dedicated dispatcher thread through a bounded
- * inbox (`inbox_capacity`; 0 = default 64) with a drop-oldest overflow
- * policy. The caller guarantees `user_data` is safe to use from that
- * thread. QWP/WebSocket only; at most one listener per builder. */
+ * inbox (`inbox_capacity`; 0 = default 64, maximum 65536) with a
+ * drop-oldest overflow policy. The caller guarantees `user_data` is safe to
+ * use from that thread. QWP/WebSocket only; at most one listener per builder.
+ *
+ * Returns `false` with a config error when a listener is already registered,
+ * or when `inbox_capacity` exceeds 65536: the capacity reaches an allocation
+ * whose failure aborts the process, so an absurd value is refused here
+ * instead. */
 QUESTDB_CLIENT_API
 bool line_sender_opts_connection_event_handler(
     line_sender_opts* opts,

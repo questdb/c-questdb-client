@@ -1864,8 +1864,17 @@ impl SenderBuilder {
     /// connection (initial connect, per-endpoint attempt failures,
     /// disconnect, reconnect/failover, terminal auth rejection).
     /// Delivered on a dedicated dispatcher thread through a bounded inbox
-    /// (`inbox_capacity`; `0` selects the default of 64) with a
-    /// drop-oldest overflow policy. At most one listener per sender.
+    /// (`inbox_capacity`; `0` selects the default of 64, and the maximum is
+    /// [`conn_events::MAX_CONNECTION_EVENT_INBOX_CAPACITY`]) with a drop-oldest overflow
+    /// policy. At most one listener per sender.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ErrorCode::ConfigError`](crate::ErrorCode::ConfigError) when a
+    /// listener is already registered, or when `inbox_capacity` exceeds
+    /// [`conn_events::MAX_CONNECTION_EVENT_INBOX_CAPACITY`]. The capacity reaches
+    /// `VecDeque::with_capacity`, where the allocator aborts on failure, so an
+    /// absurd value is refused rather than becoming a process abort.
     pub fn connection_listener(
         mut self,
         listener: crate::ingress::ConnectionListener,
