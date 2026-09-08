@@ -13,7 +13,8 @@ import time
 
 def command(directory):
     return ['/usr/sbin/spindump', '-notarget', '3', '20',
-            '-file', str(directory / 'spindump.txt'), '-timeline', '-symbolicate']
+            '-o', str(directory / 'spindump.txt'), '-timeline', '-symbolicate',
+            '-timelimit', '45', '-timestampsInCallTrees', 'all']
 
 
 def inspect_report(report):
@@ -82,7 +83,8 @@ def main():
                                  stderr=subprocess.STDOUT, text=True, timeout=10,
                                  env=environment)
     (directory / 'spindump-help.txt').write_text(help_result.stdout)
-    for option in ('-notarget', '-file', '-timeline', '-symbolicate'):
+    for option in ('-notarget', '-o <path>', '-timeline', '-symbolicate',
+                   '-timelimit', '-timestampsincalltrees'):
         if option not in help_result.stdout.lower():
             raise RuntimeError(f'installed recorder does not advertise {option}')
     child = None

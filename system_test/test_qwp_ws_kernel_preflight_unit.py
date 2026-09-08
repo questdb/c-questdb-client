@@ -11,7 +11,8 @@ class KernelPreflightTest(unittest.TestCase):
             directory = Path(temp)
             self.assertEqual(command(directory),
                 ['/usr/sbin/spindump', '-notarget', '3', '20',
-                 '-file', str(directory / 'spindump.txt'), '-timeline', '-symbolicate'])
+                 '-o', str(directory / 'spindump.txt'), '-timeline', '-symbolicate',
+                 '-timelimit', '45', '-timestampsInCallTrees', 'all'])
 
     def test_named_kernel_frames_not_user_frames_or_image_list(self):
         result = inspect_report('kernel.release.vmapple\n'
