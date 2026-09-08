@@ -10818,16 +10818,18 @@ mod tests {
         write_dec(&mut buf, "1.23");
         assert_eq!(ws_replay_bytes(&mut buf), ws_replay_bytes(&mut reference));
 
-        // The pinning value survives: scale 1 stays pinned and "5.6" encodes
-        // against it, exactly as if the discarded rows had never been written.
+        // The pinning value survives: scale 2 stays pinned and "5.6" is
+        // rescaled to it, exactly as if the discarded rows had never been
+        // written. An unpinned column would let "5.6" pin scale 1 instead,
+        // which "1.25" cannot be encoded at.
         let mut reference = QwpWsColumnarBuffer::new(127);
-        write_dec(&mut reference, "1.2");
+        write_dec(&mut reference, "1.25");
         write_dec(&mut reference, "5.6");
 
         let mut buf = QwpWsColumnarBuffer::new(127);
-        write_dec(&mut buf, "1.2");
+        write_dec(&mut buf, "1.25");
         buf.set_marker().unwrap();
-        write_dec(&mut buf, "3.45");
+        write_dec(&mut buf, "3.4");
         write_dec(&mut buf, "NaN");
         buf.rewind_to_marker().unwrap();
         write_dec(&mut buf, "5.6");
