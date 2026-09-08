@@ -24,7 +24,7 @@ telemetry and a heartbeat. Dropped/missing telemetry fails the diagnostic arm.
 An active cursor reaching five seconds requests the existing native/JVM stack
 capture. Ping and heartbeat measurements remain enabled but short anomalies no
 longer trigger invasive captures. Workload-error capture remains enabled. Stop
-after the first capture/failure, at most 12 repetitions, no new attempt after
+after the first capture/failure, at most 8 repetitions, no new attempt after
 600 seconds, one macOS worker. Original test/sender/SQL timeouts are unchanged.
 
 Builds 268394 and 268424 passed 40 natural-memory attempts each, with respectively
@@ -43,7 +43,7 @@ Across all 80 attempts above, only 1..3 lookups preceded that handshake, after
 28..374 ms. All recorded missing-table sequences match the seeded ALTER RNG.
 Thus the same seed did not restore the original ALTER RNG position at ingestion.
 
-The next 12 attempts gate producer connection until the real ALTER thread has
+Build 268433 gated producer connection until the real ALTER thread had
 received 72 actual table-not-found errors. Every query, table-choice draw and
 normal loop sleep still runs. No RNG is skipped or replaced. The gate has a
 30-second bound and rejects unexpected lookup outcomes; it is opt-in via
@@ -56,6 +56,45 @@ Local Linux calibration passed the full test in 7.787 seconds with three CPUs,
 eight producers and the original server revision. All 72 gated table names
 matched the original recorded prefix exactly. Its JDK 25.0.4 and Linux filesystem
 make this a harness check, not a macOS resource-wait reproduction.
+
+Build 268433 passed all 12 attempts: 165 completed probe cursors, maximum
+185.126 ms, zero failed pings and maximum close-drain 5.446 seconds. Every gated
+72-name sequence matched the original. Ten runs had exactly 72 missing lookups
+before the first handshake; two had 73. No original stall was reproduced.
+
+### Current arm: bounded filesystem work with independent call timing
+
+The failing worker was unusually slow before QuestDB startup. The exact grpc
+1.83.0 bottle took 129.437 seconds to pour versus 1.707 on a sibling Mac in the
+same build; LLVM 22.1.8 took 63.427 versus 7.854 seconds. Adjacent scheduled
+QWP/WS Macs used the same client/server/JVM/macOS image and poured grpc in
+2.306/2.231 seconds. These are log intervals, not physical-disk measurements;
+they support a pre-existing worker problem, not a particular resource cause.
+Original logs: build 266336 task 79 versus 54; neighboring builds 266323 task 57
+and 266352 task 62. Different neighboring fuzz seeds prevent same-workload claims.
+
+The next eight attempts use probe/load/load/probe twice. The 72-lookup gate,
+query overlay and original deadlines remain fixed; memory pressure is off.
+A separate Python process repeatedly truncates its own file to zero, writes
+64 KiB of pre-generated random bytes, and calls fsync. Probe arms sleep one
+second between cycles; load arms do not. It starts only after SHOW COLUMNS
+telemetry exists, so it does not spend its budget on the artificial startup
+prefix. Each process records every call's monotonic elapsed and process CPU time.
+
+Each attempt starts at most 4096 cycles (256 MiB written) and stops starting
+cycles after 60 seconds or workload completion. Four load arms therefore write
+at most 1 GiB combined. The file itself is at most 64 KiB, created exclusively
+inside the attempt directory; it is retained as an artifact. No external files,
+devices, mounts or quotas are modified. Existing free-space and CI time guards
+remain. An in-flight kernel call can exceed the cycle deadline: that delay is
+precisely what must be retained, not hidden by a timeout increase.
+
+This is an exploratory filesystem-load perturbation, not an emulation of a
+known Azure burst quota. fsync does not establish physical-media latency or
+an Apple full-device flush. The control probe also performs I/O, so it is not
+an untouched natural control. Compare actual syscall timing and overlap with
+the query stages, independent heartbeat, CPU/memory and host I/O before drawing
+conclusions. A failed/absent/no-overlap helper invalidates the attempt.
 
 ### Optional pressure arm (currently disabled)
 

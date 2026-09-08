@@ -21,10 +21,12 @@ readonly MAX_SECONDS="${QWP_WS_MAX_SECONDS:-1200}"
 readonly MIN_FREE_KB="${QWP_WS_MIN_FREE_KB:-2097152}"
 readonly SYSTEM_TRACE="${QWP_WS_SYSTEM_TRACE:-0}"
 readonly QUERY_OVERLAY="${QWP_WS_SHOW_COLUMNS_OVERLAY:-}"
+readonly DISK_LOAD="${QWP_WS_DISK_LOAD:-0}"
 
 if [[ ! "$RUN_COUNT" =~ ^[1-9][0-9]*$ ||
       ! "$MAX_SECONDS" =~ ^[1-9][0-9]*$ ||
       ! "$MIN_FREE_KB" =~ ^[1-9][0-9]*$ ||
+      ( "$DISK_LOAD" != "0" && "$DISK_LOAD" != "1" ) ||
       ( "$SYSTEM_TRACE" != "0" && "$SYSTEM_TRACE" != "1" ) ||
       ( "$STOP_ON_CAPTURE" != "0" && "$STOP_ON_CAPTURE" != "1" ) ]]; then
     echo "Invalid repetition, time, disk-space or capture-stop setting" >&2
@@ -47,6 +49,10 @@ if [[ "$FS_TRACE" != "0" && "$FS_TRACE" != "1" ]]; then
 fi
 
 cd "$ROOT_DIR" || exit 2
+if [[ "$DISK_LOAD" == "1" && ( -z "$QUERY_OVERLAY" || "$PRESSURE_PLAN" != "natural" ) ]]; then
+    echo "Disk experiment requires query overlay and natural memory" >&2
+    exit 2
+fi
 if [[ -n "$QUERY_OVERLAY" && ( ! -s "$QUERY_OVERLAY" || "$SYSTEM_TRACE" != "0" ) ]]; then
     echo "SHOW COLUMNS requires a compiled overlay and no System Trace" >&2
     exit 2
@@ -95,6 +101,7 @@ snapshot_host() {
         echo "runs=$RUN_COUNT max_seconds=$MAX_SECONDS stop_on_capture=$STOP_ON_CAPTURE"
         echo "pressure_plan=$PRESSURE_PLAN"
         echo "startup_missing_lookups=${QWP_WS_STARTUP_LOOKUPS:-0}"
+        echo "disk_load=$DISK_LOAD paired_order=probe,load,load,probe max_write_bytes_per_attempt=268435456"
         echo "min_free_kb=$MIN_FREE_KB"
         echo "system_trace=$SYSTEM_TRACE trace_capture_limit=2 controls=1,6,11"
         find questdb/core/target -maxdepth 1 -type f \
@@ -252,10 +259,15 @@ for run_number in $(seq 1 "$RUN_COUNT"); do
     # reach the warning state.
     (
         system_trace_pid=""
+        disk_load_pid=""
         # This shell is the parent of sudo/collector. On setup failure or
         # cancellation, signal that exact child and wait for it to reap xctrace.
         # shellcheck disable=SC2329
         stop_controller_trace() {
+            if [[ -n "$disk_load_pid" ]]; then
+                kill -TERM "$disk_load_pid" 2>/dev/null || true
+                wait "$disk_load_pid" 2>/dev/null || true
+            fi
             if [[ -n "$system_trace_pid" ]]; then
                 sudo -n kill -TERM "$system_trace_pid" 2>/dev/null || true
                 wait "$system_trace_pid" 2>/dev/null || true
@@ -357,7 +369,26 @@ for run_number in $(seq 1 "$RUN_COUNT"); do
             sysctl kern.memorystatus_vm_pressure_level || true
             vm_stat || true
         } >"$run_dir/pressure-at-gate.log" 2>&1
+        if [[ "$DISK_LOAD" == "1" ]]; then
+            TMPDIR="$run_dir/tmp" python3 system_test/qwp_ws_disk_load.py \
+                "$run_dir" --run "$run_number" >"$run_dir/disk-load-process.log" 2>&1 &
+            disk_load_pid=$!
+            for _ in $(seq 1 50); do
+                [[ -f "$run_dir/disk-load-ready" ]] && break
+                kill -0 "$disk_load_pid" 2>/dev/null || break
+                sleep 0.1
+            done
+            if [[ ! -f "$run_dir/disk-load-ready" || -f "$run_dir/disk-load-error" ]]; then
+                exit 2
+            fi
+        fi
         touch "$go_file"
+        if [[ -n "$disk_load_pid" ]]; then
+            wait "$disk_load_pid"
+            disk_rc=$?
+            disk_load_pid=""
+            [[ "$disk_rc" -eq 0 ]] || exit "$disk_rc"
+        fi
         if [[ "$traced" == "1" ]]; then
             wait "$system_trace_pid"
             trace_rc=$?
@@ -427,6 +458,11 @@ for run_number in $(seq 1 "$RUN_COUNT"); do
         [[ "$test_rc" -ne 0 ]] || test_rc=2
     fi
     controller_pid=""
+    if [[ "$DISK_LOAD" == "1" &&
+          ( ! -f "$run_dir/disk-load-finished" || -f "$run_dir/disk-load-error" ) ]]; then
+        echo "Missing or failed filesystem load telemetry" | tee -a "$DIAG_DIR/test.log"
+        [[ "$test_rc" -ne 0 ]] || test_rc=2
+    fi
     if [[ "$traced" == "1" &&
           ( ! -s "$run_dir/system-trace-valid.json" ||
             -f "$run_dir/system-trace-error.json" ) ]]; then

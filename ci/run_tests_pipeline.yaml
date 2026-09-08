@@ -461,8 +461,12 @@ stages:
                 # Restore the original 72 missing-table ALTER lookups before
                 # producer connection. This is a scheduling perturbation, not
                 # a recreation of the unknown original startup delay.
+                # Two probe/load/load/probe cycles; filesystem load only starts
+                # once SHOW COLUMNS telemetry exists. Maximum 1 GiB load writes
+                # across the four load attempts, on one hosted worker.
                 # No new attempt after ten minutes; stop at first capture.
-                QWP_WS_DIAGNOSTIC_RUNS: "12"
+                QWP_WS_DIAGNOSTIC_RUNS: "8"
+                QWP_WS_DISK_LOAD: "1"
                 QWP_WS_STARTUP_LOOKUPS: "72"
                 QWP_WS_MAX_SECONDS: "600"
                 QWP_WS_STOP_ON_CAPTURE: "1"
