@@ -81,7 +81,7 @@ class WatchdogTest(unittest.TestCase):
             def record(*args, **kwargs):
                 argv = args[0]
                 self.assertEqual(argv[:3], ['sudo', '-n', 'env'])
-                self.assertEqual(argv[-3:], ['--record', '--limit', '25'])
+                self.assertEqual(argv[-3:], ['--record-raw', '--limit', '25'])
                 (directory / 'kernel-stacks/recorder-validation.json').write_text('{}')
                 events.append('kernel-recorded')
 

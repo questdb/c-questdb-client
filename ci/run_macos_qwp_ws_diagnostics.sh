@@ -516,6 +516,21 @@ for run_number in $(seq 1 "$RUN_COUNT"); do
     fi
     cp build/questdb/repo/data/conf/server.conf "$run_dir/server.conf" || true
 
+    # Decode only after the test and server shutdown. Keep the raw capture
+    # even when symbol processing times out; do not rerun the workload for it.
+    if [[ -s "$run_dir/kernel-stacks/spindump.raw" ]]; then
+        # The watchdog creates this directory as the runner; log ownership
+        # deliberately stays with the runner, not the privileged decoder.
+        # shellcheck disable=SC2024
+        if ! sudo -n env TMPDIR="$run_dir/kernel-stacks/tmp" \
+                python3 ci/diagnostics/kernel_wait_preflight.py \
+                "$run_dir/kernel-stacks" --decode \
+                >"$run_dir/kernel-stacks/decode.log" 2>&1; then
+            echo "Kernel decode failed; raw capture retained" | tee -a "$DIAG_DIR/test.log"
+            [[ "$test_rc" -ne 0 ]] || test_rc=2
+        fi
+    fi
+
     echo "=== run=$run_number rc=$test_rc "\
          "finished=$(date -u '+%Y-%m-%dT%H:%M:%SZ') ===" \
         | tee -a "$DIAG_DIR/test.log"

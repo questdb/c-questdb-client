@@ -18,6 +18,20 @@ def command(directory, time_limit=45):
             '-noProcessingWhileSampling']
 
 
+def raw_command(directory, time_limit=25):
+    # Save the sample before expensive symbol lookup. The installed Mac help
+    # explicitly supports binary-only output and deferred symbolication.
+    return ['/usr/sbin/spindump', '-notarget', '3', '20',
+            '-o', str(directory / 'spindump.raw'), '-noText', '-noSymbolicate',
+            '-timelimit', str(time_limit), '-noProcessingWhileSampling']
+
+
+def decode_command(directory):
+    return ['/usr/sbin/spindump', '-i', str(directory / 'spindump.raw'),
+            '-o', str(directory / 'spindump.txt'), '-timeline', '-symbolicate',
+            '-noBinary', '-timestampsInCallTrees', 'all', '-timelimit', '60']
+
+
 def inspect_report(report):
     # This is an access check, not proof of a filesystem bottleneck. Keep the
     # actual text so kernel symbols and thread identities can be inspected.
@@ -69,8 +83,26 @@ def main():
     parser.add_argument('directory', type=Path)
     parser.add_argument('--workload', action='store_true')
     parser.add_argument('--record', action='store_true')
+    parser.add_argument('--record-raw', action='store_true')
+    parser.add_argument('--decode', action='store_true')
     parser.add_argument('--limit', type=int, choices=(25, 45), default=45)
     args = parser.parse_args()
+    if args.record_raw:
+        subprocess.run(raw_command(args.directory, args.limit), timeout=args.limit+5, check=True)
+        size = (args.directory / 'spindump.raw').stat().st_size
+        if not size:
+            raise RuntimeError('empty raw kernel capture')
+        # Nonempty is transport validation only, not proof of usable stacks.
+        (args.directory / 'recorder-validation.json').write_text(json.dumps(
+            dict(format='raw', bytes=size, decoded=False)) + '\n')
+        return
+    if args.decode:
+        subprocess.run(decode_command(args.directory), timeout=65, check=True)
+        result = inspect_report((args.directory / 'spindump.txt').read_text(errors='replace'))
+        (args.directory / 'decode-validation.json').write_text(json.dumps(result) + '\n')
+        if not result['named_kernel_frame_lines']:
+            raise RuntimeError('decoded capture has no named kernel frames')
+        return
     if args.record:
         # This small controller runs as root, so subprocess timeout can kill
         # and reap its actual recorder child, not merely an intervening sudo.

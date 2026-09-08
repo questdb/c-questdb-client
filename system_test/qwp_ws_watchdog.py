@@ -125,7 +125,7 @@ def capture(run_dir, pid, reason):
                     write_event(log, 'kernel_sample_start')
                     subprocess.run(['sudo', '-n', 'env', f'TMPDIR={directory / "tmp"}',
                                     sys.executable, str(controller), str(directory),
-                                    '--record', '--limit', '25'],
+                                    '--record-raw', '--limit', '25'],
                                    stdout=sample_log, stderr=subprocess.STDOUT,
                                    timeout=35, check=True)
                     if not (directory / 'recorder-validation.json').is_file():

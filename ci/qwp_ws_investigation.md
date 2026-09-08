@@ -7,7 +7,33 @@ unchanged. Azure PR 200 allocates only one macOS worker, running only
 workload mode is enabled. The current default follows the severe filesystem
 episode captured in build 268479.
 
-## Current action: earlier kernel capture and memory-buffered heartbeat
+## Current action: retain raw kernel samples before symbol processing
+
+Build 268483 failed in teardown on its first low-rate attempt, not in producer
+close-drain. All eight drains completed, maximum 31.496 seconds. All 16 SHOW
+cursors completed; the longest was 930.846 ms, including 929.753 ms in reader
+open. That query began after the kernel recorder was launched; do not attribute
+its duration to uninstrumented workload behavior. No original long-query
+signature was captured.
+
+The independent helper spent 16.386 seconds in grow/ftruncate with 141 us CPU,
+and another grow took 9.143 seconds. The memory-buffered heartbeat covered both
+intervals without a gap over 403.333 ms. This excludes a continuous multi-second
+whole-VM scheduling freeze for those intervals, not all host scheduling effects.
+Thirty low-rate cycles wrote 1.875 MiB; no high-rate attempt ran.
+
+The recorder announced sampling complete, then timed out during symbol
+processing and left a zero-byte report. The next run uses the installed tool's
+documented -noText -noSymbolicate options to save a binary capture first.
+Nonempty raw output is only transport validation, not proof of useful frames.
+After workload/server shutdown, -i regenerates a symbolic text report with a
+60-second tool limit and 65-second controller bound. A failed decode fails the
+diagnostics but preserves the raw artifact for another decode without rerunning
+the workload. Onset sampling remains three seconds at 20 ms, bounded as before;
+SIGQUIT still follows the recorder, never overlaps sampling. Same four-attempt
+plan, one Mac, stop first capture/failure, unchanged sender and SQL deadlines.
+
+## Completed arm: earlier kernel capture and memory-buffered heartbeat
 
 Build 268479 failed in the first low-rate control attempt: seven producers
 reported close-drain timeout, 24 pings failed, and the server needed forced
