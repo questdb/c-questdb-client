@@ -2166,7 +2166,7 @@ mod tests {
         // column body subsequence appears exactly once.
         let mut body: Vec<u8> = Vec::new();
         body.push(0u8); // null_flag = 0 (no validity)
-        for row_chunk in rows.chunks_exact(3) {
+        for row_chunk in rows.as_chunks::<3>().0 {
             body.push(1u8); // ndim
             body.extend_from_slice(&3u32.to_le_bytes()); // dim
             for &v in row_chunk {

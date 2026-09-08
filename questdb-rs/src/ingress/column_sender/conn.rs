@@ -1161,24 +1161,18 @@ fn write_ws_header(out: &mut [u8], payload_len: usize, mask_key: [u8; 4]) {
     const BINARY_OPCODE: u8 = 0x2;
     const MASK_BIT: u8 = 0x80;
     out[0] = FIN_BIT | BINARY_OPCODE;
-    let len_bytes;
-    let mask_offset;
-    if payload_len <= 125 {
+    let mask_offset = if payload_len <= 125 {
         out[1] = MASK_BIT | (payload_len as u8);
-        mask_offset = 2;
-        len_bytes = 0;
+        2
     } else if payload_len <= 0xFFFF {
         out[1] = MASK_BIT | 126;
         out[2..4].copy_from_slice(&(payload_len as u16).to_be_bytes());
-        mask_offset = 4;
-        len_bytes = 2;
+        4
     } else {
         out[1] = MASK_BIT | 127;
         out[2..10].copy_from_slice(&(payload_len as u64).to_be_bytes());
-        mask_offset = 10;
-        len_bytes = 8;
-    }
-    let _ = len_bytes;
+        10
+    };
     out[mask_offset..mask_offset + 4].copy_from_slice(&mask_key);
 }
 

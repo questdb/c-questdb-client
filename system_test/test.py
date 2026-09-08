@@ -2590,6 +2590,11 @@ class TestQwpWsFuzz(QwpWsTestSupport, unittest.TestCase):
 
     def _run_fuzz(self, load: 'qwp_ws_fuzz.LoadParams',
                   fuzz: 'qwp_ws_fuzz.FuzzParams'):
+        # High-concurrency schema fuzzing can drive enough concurrent
+        # QuestDB WAL/column files to exhaust the hosted macOS process FD cap.
+        # Apply one shared policy so every fuzz workload gets the same bound.
+        qwp_ws_fuzz.cap_macos_producer_threads(load, sys.platform)
+
         # Pre-create per-table buffers. Java keys by lowercase name (case-
         # insensitive) so 'WEATHER0' and 'weather0' resolve to the same
         # table on both client- and server-side.

@@ -925,9 +925,14 @@ fn write_qwp_bitmap_from_arrow(out: &mut Vec<u8>, nulls: &NullBuffer) -> Result<
         let word_bytes = (full_bytes / 8) * 8;
         let (src_words, src_rem) = src_slice.split_at(word_bytes);
         let (dst_words, dst_rem) = dst_slice.split_at_mut(word_bytes);
-        for (dchunk, schunk) in dst_words.chunks_exact_mut(8).zip(src_words.chunks_exact(8)) {
-            let w = u64::from_ne_bytes(schunk.try_into().unwrap());
-            dchunk.copy_from_slice(&(!w).to_ne_bytes());
+        for (dchunk, schunk) in dst_words
+            .as_chunks_mut::<8>()
+            .0
+            .iter_mut()
+            .zip(src_words.as_chunks::<8>().0)
+        {
+            let w = u64::from_ne_bytes(*schunk);
+            *dchunk = (!w).to_ne_bytes();
         }
         for (d, &s) in dst_rem.iter_mut().zip(src_rem) {
             *d = !s;
@@ -1193,7 +1198,7 @@ fn write_uuid_be_payload(out: &mut Vec<u8>, arr: &FixedSizeBinaryArray) -> Resul
             // Bulk path: slice `value_data()` once, starting at the array's
             // own offset, instead of a bounds-checked `value(row)` per row.
             let start = arr.offset() * 16;
-            for row in arr.value_data()[start..start + bytes].chunks_exact(16) {
+            for row in arr.value_data()[start..start + bytes].as_chunks::<16>().0 {
                 out.extend_from_slice(&reverse_uuid_bytes(row));
             }
         }

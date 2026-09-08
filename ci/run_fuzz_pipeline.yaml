@@ -13,6 +13,11 @@ pr: none
 # server). Equivalent PR-time jobs live in run_tests_pipeline.yaml
 # (TestQwpWsFuzz / TestQwpEgressLiveServerFuzz); this pipeline is the
 # always-on stability watchdog and the source of Slack #builds alerts.
+#
+# The mac legs pin macOS-15-arm64. The plain macOS-14/15/26 Azure images are
+# Intel x86-64, and QuestDB bundles a macOS native library for aarch64 only,
+# so the server refuses to start on an Intel agent. This mirrors the image
+# questdb/questdb's own macOS legs run on.
 schedules:
   - cron: "0 * * * *"
     displayName: Run QWP/WS + QWP egress fuzz every hour
@@ -30,7 +35,7 @@ stages:
         strategy:
           matrix:
             mac:
-              imageName: "macos-latest"
+              imageName: "macOS-15-arm64"
             windows-2022:
               imageName: "windows-2022"
         pool:
@@ -42,30 +47,7 @@ stages:
             lfs: false
             submodules: false
           - template: templates/compile.yaml
-          # Same JDK 25 dance as the PR-time fuzz job in
-          # run_tests_pipeline.yaml — Linux/Windows hosted agents ship JDK
-          # 25 at $JAVA_HOME_25_X64; macos-latest does not, so we brew it
-          # in. Resolution stays in a single bash step so the Windows
-          # leg's cmd.exe quote handling doesn't leave a stray `"` on
-          # the resolved path.
-          - bash: |
-              set -e
-              if [[ "$AGENT_OS" == "Darwin" ]]; then
-                brew install openjdk@25
-                JDK_HOME="$(brew --prefix openjdk@25)/libexec/openjdk.jdk/Contents/Home"
-                if [ ! -d "$JDK_HOME" ]; then
-                  JDK_HOME="$(/usr/libexec/java_home -v 25 2>/dev/null || true)"
-                fi
-                if [ ! -d "$JDK_HOME" ]; then
-                  echo "JDK 25 not found after brew install" >&2
-                  exit 1
-                fi
-              else
-                JDK_HOME="$JAVA_HOME_25_X64"
-              fi
-              echo "Resolved JDK 25: $JDK_HOME"
-              echo "##vso[task.setvariable variable=JAVA_HOME]$JDK_HOME"
-            displayName: "Resolve JDK 25"
+          - template: templates/resolve_jdk25.yaml
           - template: templates/clone_questdb.yaml
           - template: templates/maven_settings.yaml
           - task: Maven@3
@@ -231,7 +213,7 @@ stages:
             linux:
               imageName: "ubuntu-latest"
             mac:
-              imageName: "macos-latest"
+              imageName: "macOS-15-arm64"
             windows-2022:
               imageName: "windows-2022"
         pool:
