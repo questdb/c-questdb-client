@@ -2371,14 +2371,24 @@ impl QwpWsLocalSymbolLookup {
         }
     }
 
-    fn retain_local_ids_below(&mut self, dict_len: usize) {
-        self.buckets.retain(|_, bucket| match bucket {
-            QwpWsLocalSymbolBucket::One(local_id) => (*local_id as usize) < dict_len,
+    fn remove(&mut self, hash: u64, local_id: u32) {
+        use std::collections::hash_map::Entry;
+
+        let Entry::Occupied(mut entry) = self.buckets.entry(hash) else {
+            return;
+        };
+        let now_empty = match entry.get_mut() {
+            QwpWsLocalSymbolBucket::One(existing) => *existing == local_id,
             QwpWsLocalSymbolBucket::Many(local_ids) => {
-                local_ids.retain(|local_id| (*local_id as usize) < dict_len);
-                !local_ids.is_empty()
+                if let Some(pos) = local_ids.iter().rposition(|id| *id == local_id) {
+                    local_ids.remove(pos);
+                }
+                local_ids.is_empty()
             }
-        });
+        };
+        if now_empty {
+            entry.remove();
+        }
     }
 }
 
@@ -4076,39 +4086,28 @@ impl QwpWsColumnBuffer {
     }
 
     fn rollback_rows_from(&mut self, from: u32) {
-        let dict_len_before = match &self.values {
-            QwpWsColumnValues::Symbol { cells, dict, .. } => {
-                for cell in cells.iter().rev().take_while(|cell| cell.row_idx >= from) {
-                    self.symbol_cells_encoded_len -= qwp_varint_size(cell.local_id as u64);
-                    if cell.is_new {
-                        let entry = &dict[cell.local_id as usize];
-                        self.symbol_dict_encoded_len -= qwp_string_byte_len(entry.len as usize);
-                    }
+        if let QwpWsColumnValues::Symbol { cells, dict, .. } = &self.values {
+            for cell in cells.iter().rev().take_while(|cell| cell.row_idx >= from) {
+                self.symbol_cells_encoded_len -= qwp_varint_size(cell.local_id as u64);
+                if cell.is_new {
+                    let entry = &dict[cell.local_id as usize];
+                    self.symbol_dict_encoded_len -= qwp_string_byte_len(entry.len as usize);
                 }
-                dict.len()
             }
-            _ => 0,
-        };
+        }
         while let Some(non_null) = self.values.pop_cell_from(from) {
             if non_null {
                 self.non_null_count -= 1;
             }
         }
-        match &mut self.values {
-            // One lookup sweep per rewind rather than one per popped entry.
-            QwpWsColumnValues::Symbol { dict, lookup, .. } if dict.len() < dict_len_before => {
-                lookup.retain_local_ids_below(dict.len());
-            }
-            // The scale is pinned by the first non-null value, so it only
-            // unpins once none remain.
-            QwpWsColumnValues::Decimal { decimal_scale, .. }
-            | QwpWsColumnValues::Decimal64 { decimal_scale, .. }
-            | QwpWsColumnValues::Decimal128 { decimal_scale, .. }
-                if self.non_null_count == 0 =>
-            {
-                *decimal_scale = QWP_DECIMAL_SCALE_UNSET;
-            }
-            _ => {}
+        // The scale is pinned by the first non-null value, so it only unpins
+        // once none remain.
+        if let QwpWsColumnValues::Decimal { decimal_scale, .. }
+        | QwpWsColumnValues::Decimal64 { decimal_scale, .. }
+        | QwpWsColumnValues::Decimal128 { decimal_scale, .. } = &mut self.values
+            && self.non_null_count == 0
+        {
+            *decimal_scale = QWP_DECIMAL_SCALE_UNSET;
         }
         if self.last_written_row.is_some_and(|row| row >= from) {
             self.last_written_row = None;
@@ -4755,13 +4754,18 @@ impl QwpWsColumnValues {
                 Some(popped)
             }
             Self::Symbol {
-                cells, dict, data, ..
+                cells,
+                dict,
+                lookup,
+                data,
             } => {
                 let cell = cells.pop_if(|cell| cell.row_idx >= from)?;
                 if cell.is_new
                     && let Some(entry) = dict.pop()
                 {
                     debug_assert_eq!(cell.local_id as usize, dict.len());
+                    let bytes = &data[entry.offset as usize..][..entry.len as usize];
+                    lookup.remove(qwp_ws_symbol_hash(bytes), cell.local_id);
                     data.truncate(entry.offset as usize);
                 }
                 Some(true)
@@ -8112,10 +8116,15 @@ mod tests {
         assert_eq!(lookup.get(forced_hash, b"beta", &dict, &data), Some(1));
         assert_eq!(lookup.get(forced_hash, b"gamma", &dict, &data), None);
 
-        lookup.retain_local_ids_below(1);
+        lookup.remove(forced_hash, 1);
 
         assert_eq!(lookup.get(forced_hash, b"alpha", &dict, &data), Some(0));
         assert_eq!(lookup.get(forced_hash, b"beta", &dict, &data), None);
+
+        lookup.remove(forced_hash, 0);
+
+        assert_eq!(lookup.get(forced_hash, b"alpha", &dict, &data), None);
+        assert!(lookup.buckets.is_empty());
     }
 
     #[cfg(feature = "_sender-qwp-ws")]
