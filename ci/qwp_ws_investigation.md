@@ -2,7 +2,7 @@
 
 Status: server progress interruption observed; root cause **not established**.
 This branch is diagnostic only. Keep sender timeouts and correctness assertions
-unchanged. Azure PR 200 allocates only two macOS workers for
+unchanged. Azure PR 200 now allocates only one macOS worker for
 `TestQwpWsFuzz.test_add_columns`.
 
 Local follow-up, 2026-09-08: a controlled O3 close delay demonstrated global
@@ -42,43 +42,90 @@ not. This establishes a mechanism, not the original macOS trigger. See the
   This pins the source directly, even though the clone step did not print it.
 - Seeds do not pin concurrent scheduling, schema observations, or the exact
   number of conversions. Two hosts do not provide 40 independent host states.
+- [Build 268075](https://dev.azure.com/questdb/questdb/_build/results?buildId=268075),
+  with the original server/JVM restored, captured a short ping timeout. During
+  its one-second probe, selected file calls occupied approximately 943/950/942 ms
+  on the three HTTP workers. There were 3,462 selected calls, not one long close.
+  Three outlying open/preallocate/truncate calls took 232–251 ms and finished
+  within about 51 microseconds of each other. This is elapsed syscall time,
+  **not a measurement of physical disk service time**.
+- [Build 268312](https://dev.azure.com/questdb/questdb/_build/results?buildId=268312)
+  passed 60 attempts on each of two VMs, with 27 onset captures and 29 failed
+  one-second pings. A/run-36 naturally captured an O3 worker inside native close
+  while holding `FdCache`, with all three HTTP workers waiting for that monitor.
+  A/run-24 captured a WAL-apply worker holding it during native open. These first
+  dumps came after detection: they establish real cross-pool contention but
+  cannot measure its duration during the preceding failed ping.
+- That soak did not reproduce the original 120-second close-drain failure.
+  Maximum completed drain was 9.795 seconds; no consistent across-host latency
+  deterioration or sampled swap activity was observed. Provider burst-credit
+  exhaustion and physical-storage saturation remain unproven.
 
 ## Current experiment
 
-Both replicas use server `12a33d651e51e2682e7a448c8db5168fc72dfad3`, Temurin
+The single worker uses server `12a33d651e51e2682e7a448c8db5168fc72dfad3`, Temurin
 25.0.3+9 (official download with pinned SHA-256), fuzz seed
 `0x268579c36b106b74`, build-mode seed `7856154056746654427`, three hosted CPUs,
 and JVM `ActiveProcessorCount=3`. The managed hosted macOS image is still
 moving; record its version, do not call this an exact environment reproduction.
 
-Both replicas now use lightweight monitoring and loop the unchanged test up to
-60 times on their respective hosted VM. Do not schedule each attempt as a new
-job: that would replace the VM instead of testing cumulative host load. A fresh
-JVM and fixture are installed for each attempt, with no added cooldown; the
-test's existing internal waits and setup/teardown remain unchanged.
+The next measurement is a pre-timeout **System Trace**, not another identical
+soak. The question is whether a long native file call is executing on CPU,
+blocked in a kernel/filesystem wait, or runnable but not scheduled. Kernel
+backtraces and wakeups may identify a wait; an elapsed syscall alone cannot.
 
-The prior 20-attempt configuration stopped at the first onset capture, including
-a recovered one-second ping timeout. The soak continues after such captures
-when the test passes. It stops immediately on a test/diagnostic failure, refuses
-to start another attempt after 20 minutes, and stops below 2 GiB free space.
-The in-flight test keeps its original timeouts; a 30-minute pipeline step limit
-is the outer safety bound. Artifact publishing remains unconditional.
+Before compiling anything, `prepare_qwp_ws_system_trace.sh` records a five-second
+filesystem/sleep smoke workload on the worker. It exports the trace TOC, discovers
+syscall and thread-state tables, and requires actual rows associated with the
+smoke PID in both. Merely finding Xcode or creating a `.trace` directory is not
+success. Unsupported schemas or denied tracing stop the job at this preflight,
+which has a three-minute step limit; its logs/artifacts are still published.
+No SIP or developer-security settings are changed. The root collector owns and
+reaps its recorder child; artifact ownership is returned to the CI uploader.
 
-Continuous `fs_usage` is disabled on both replicas so its large trace output
-does not become the soak's disk workload. Onset thread dumps and native samples,
-JVM pause logs, per-second `iostat`/`vm_stat`, and five-second memory/process
-snapshots remain enabled. No synthetic memory pressure or injected delays.
-Store-and-forward, Java temporary data, and diagnostics are explicitly on the
-worker filesystem, not `/tmp`.
+Run at most 13 attempts on that same VM: attempts **1, 6, 11 are untraced
+controls**, the other ten use System Trace. Stop after two event-bearing traced
+onset captures, or immediately on a test/diagnostic failure. Refuse to start
+another attempt after ten minutes or below 2 GiB free space. The recording itself
+has a 30-second hard limit, finalization a 30-second wait, and export/validation
+a 60-second budget. Recording expiry before onset/completion is a diagnostic
+failure, not evidence of a healthy run. The 30-minute test-step limit remains
+the outer bound; the test and sender retain all existing timeouts/assertions.
+
+The recorder starts at the existing server-ready gate and must post its explicit
+Darwin readiness notification before the workload is released. Registration's
+initial notification state is consumed **before** recorder launch, so it cannot
+be mistaken for readiness. Startup is bounded to leave room within the unchanged
+30-second fixture gate.
+
+At the first failed ping, heartbeat gap, or workload-error request, the watchdog
+synchronously requests SIGINT of the recorder. The privileged collector polls
+that request every 20 ms; the watchdog waits up to three seconds for the
+stop-sent acknowledgment before permitting teardown. Normal workload completion
+uses the same stop/acknowledgment handshake. Traced attempts do **not** launch
+SIGQUIT or native `sample`. Untraced controls retain the previous onset captures.
+Any nonzero recorder exit, missing target events, or stop lag over two seconds
+fails the diagnostic run. Raw `.trace`, TOC, exported rows, and tool stderr are
+kept even when validation fails.
+
+System Trace can use a rolling window; stopping quickly is important, but does
+not itself prove that the whole failed probe was retained. Inspect actual event
+coverage before interpreting a capture. This policy counts event-bearing onset
+captures to bound CI spending, not to declare the investigation solved.
+
+Continuous `fs_usage` is disabled. JVM pause logs, per-second `iostat`/`vm_stat`,
+and five-second memory/process snapshots remain enabled. No synthetic memory
+pressure or injected delays. Store-and-forward, Java/tool temporary data, and
+diagnostics are explicitly directed to the worker filesystem, not `/tmp`.
 
 `runs.jsonl` records attempt index, UTC start, elapsed soak/attempt time, unittest
 duration, free space, completed drain maximum, ping errors/maximum, heartbeat
-maximum, capture reason and exit status. Raw per-attempt `test.log` and server
+maximum, capture reason, trace/validation flags and exit status. Raw per-attempt `test.log` and server
 logs are preserved. Compare successive fixed-seed attempts with the continuous
 host measurements; concurrent scheduling and schema interleavings can still vary.
 The first disk/VM-stat sample includes statistics since boot, not just this test.
 
-This tests cumulative degradation, not a known provider quota. Microsoft's
+Neither this experiment nor the preceding soak tests a known provider quota. Microsoft's
 [hosted-agent documentation](https://learn.microsoft.com/en-us/azure/devops/pipelines/agents/hosted?view=azure-devops)
 places these macOS machines in GitHub's macOS cloud; an Azure managed-disk burst
 credit policy must not be assumed. A worsening latency curve alone would not
@@ -87,8 +134,9 @@ prove quota exhaustion, and no degradation would not exclude an unknown quota.
 The external Python watchdog probes `/ping` once per second with a one-second
 timeout. A separate thread records quarter-second heartbeats in another file.
 The first probe failure, heartbeat gap over one second, or transient workload
-error requests one bounded capture: three SIGQUIT requests 500 ms apart and
-a three-second native `sample` at 10 ms intervals. The JVM writes GC/safepoint
+error requests one bounded capture. In untraced controls, that means three
+SIGQUIT requests 500 ms apart and a three-second native `sample` at 10 ms
+intervals. The JVM writes GC/safepoint
 records to a dedicated rotating log from startup. Capture is allowed to finish
 before DROP cleanup, with a 15-second bound; this does not change workload or
 sender timeout budgets. Failures occurring during teardown do not trigger onset
@@ -99,6 +147,36 @@ previously its catch-all hid timeouts from the diagnostic callback.
 
 ## Reading the next artifact
 
+Download `qwp-ws-macos-system-trace`. First check `preflight/`, the final stop
+reason in `test.log`, and each run's `system-trace-valid.json` or error marker.
+A green job with zero onset captures is a negative replay, not a diagnosis.
+
+For each traced onset:
+
+1. Locate the failed probe's `started_wall_ns` and completion `wall_ns` in
+   `watchdog.jsonl`, and the request/stop markers. Their UTC, monotonic, and Mach
+   clock readings include a clock-read uncertainty bracket. Use the TOC's run
+   start metadata when aligning exported relative timestamps; do not assume the
+   ready notification is the recording origin.
+2. Open `system.trace` in Instruments and verify the failed interval is covered
+   by syscall and scheduler events for the server PID. Check for lost/truncated
+   events. Inspect native thread identities/names in that interval, particularly
+   `shared-network_*`, `shared-write_*`, and `wal-apply_*`.
+3. For long file calls, split elapsed time into running, runnable, and blocked
+   intervals using the thread-state timeline. Inspect available kernel stacks
+   and wakeups for the blocking dependency. Do not label a generic blocked state
+   as disk I/O without supporting stack/event evidence.
+4. Correlate with JVM pause logs, heartbeat, and host paging/CPU/I/O observations.
+   The nominal one-second host counters can drift; they are not exact per-probe
+   service-time measurements. Compare untraced controls for gross observer effects;
+   this small interleaved sample cannot quantify tracing overhead precisely.
+
+If syscall/scheduling tables are unavailable, the preflight stops before build.
+If events are present but their kernel stacks cannot identify the wait, report
+that boundary explicitly; do not spend more identical CI runs assuming the trace
+can expose it. Guest traces cannot prove a provider's storage quota or measure
+unavailable hypervisor steal time.
+
 | Evidence during the same interval | Interpretation |
 |---|---|
 | Heartbeat regular; HTTP blocked; repeated native file-operation stacks | Investigate filesystem/page-fault service and worker occupancy. Correlate with syscall durations and host paging. |
@@ -108,10 +186,10 @@ previously its catch-all hid timeouts from the diagnostic callback.
 | HTTP stays responsive; sender drain stalls | Investigate connection-specific ACK/commit/replay progress, not a global server freeze. |
 
 Artifact files: `watchdog.jsonl`, `heartbeat.jsonl`, `capture.jsonl`,
-`native-sample.txt`, `sample-command.log`, `jvm-pauses.log*`, `questdb-server.log`,
+`native-sample.txt` (controls), `sample-command.log`, `jvm-pauses.log*`, `questdb-server.log`,
 `server.conf`, per-attempt `test.log`, `runs.jsonl`, plus host
 manifest/memory/iostat logs. `fs-usage.log` is only present when the optional
-continuous tracing setting is explicitly enabled (off in the current soak).
+continuous tracing setting is explicitly enabled (off in this experiment).
 SIGQUIT request time is not dump completion time. JVM dumps use the server log;
 native sampling and watchdog output do not depend on that logger. All files
 still share storage. `previous_write_ms` exposes one source of observer delay.
@@ -120,3 +198,14 @@ Completed filesystem traces cannot reveal every in-flight operation. Sampling
 and SIGQUIT perturb scheduling after detection; continuous tracing perturbs the
 entire traced arm. Hosted-VM steal time and the original host's pressure timeline
 remain unavailable. Do not optimize production code based only on these stacks.
+
+Tool references: Apple's [System Trace walkthrough](https://developer.apple.com/videos/play/wwdc2016/411/)
+describes scheduling, syscall, and windowed tracing; the current hosted Xcode is
+verified by the smoke test, not assumed to match that older demonstration.
+The [notify API documentation](https://developer.apple.com/library/archive/documentation/System/Conceptual/ManPages_iPhoneOS/man3/notify_register_check.3.html)
+documents notification polling. CLI usage is described in the
+[xctrace manual](https://keith.github.io/xcode-man-pages/xctrace.1.html).
+
+Local validation uses mocked recorder/notification calls and synthetic exported
+XML on Linux; it cannot establish hosted macOS permissions or actual schema
+support. Keep all local unit-test temporary files under the repository as well.

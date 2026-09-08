@@ -34,6 +34,9 @@ def summarize(directory):
         max_drain_seconds=max(drains, default=None),
         capture_reason=(directory / 'capture-started').read_text().strip()
         if (directory / 'capture-started').exists() else None,
+        system_trace=(directory / 'system-trace-enabled').exists(),
+        system_trace_valid=(directory / 'system-trace-valid.json').exists()
+        and not (directory / 'system-trace-error.json').exists(),
     )
 
 

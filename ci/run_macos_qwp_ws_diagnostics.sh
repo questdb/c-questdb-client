@@ -19,10 +19,12 @@ readonly FS_TRACE="${QWP_WS_FS_TRACE:-0}"
 readonly STOP_ON_CAPTURE="${QWP_WS_STOP_ON_CAPTURE:-1}"
 readonly MAX_SECONDS="${QWP_WS_MAX_SECONDS:-1200}"
 readonly MIN_FREE_KB="${QWP_WS_MIN_FREE_KB:-2097152}"
+readonly SYSTEM_TRACE="${QWP_WS_SYSTEM_TRACE:-0}"
 
 if [[ ! "$RUN_COUNT" =~ ^[1-9][0-9]*$ ||
       ! "$MAX_SECONDS" =~ ^[1-9][0-9]*$ ||
       ! "$MIN_FREE_KB" =~ ^[1-9][0-9]*$ ||
+      ( "$SYSTEM_TRACE" != "0" && "$SYSTEM_TRACE" != "1" ) ||
       ( "$STOP_ON_CAPTURE" != "0" && "$STOP_ON_CAPTURE" != "1" ) ]]; then
     echo "Invalid repetition, time, disk-space or capture-stop setting" >&2
     exit 2
@@ -45,6 +47,13 @@ fi
 
 cd "$ROOT_DIR" || exit 2
 mkdir -p "$DIAG_DIR"
+if [[ "$SYSTEM_TRACE" == "1" &&
+      ( ! -s "$DIAG_DIR/preflight/system-trace-valid.json" ||
+        -e "$DIAG_DIR/preflight/system-trace-error.json" ||
+        "$FS_TRACE" != "0" || "$PRESSURE_MODE" != "natural" ) ]]; then
+    echo "System Trace requires a successful preflight, no fs_usage and natural memory" >&2
+    exit 2
+fi
 if [[ "$(git -C questdb rev-parse HEAD)" != "$SERVER_REVISION" ]]; then
     echo "Diagnostic server revision must be $SERVER_REVISION" >&2
     exit 2
@@ -79,6 +88,7 @@ snapshot_host() {
         echo "fs_trace=$FS_TRACE server_revision=$SERVER_REVISION"
         echo "runs=$RUN_COUNT max_seconds=$MAX_SECONDS stop_on_capture=$STOP_ON_CAPTURE"
         echo "min_free_kb=$MIN_FREE_KB"
+        echo "system_trace=$SYSTEM_TRACE trace_capture_limit=2 controls=1,6,11"
         find questdb/core/target -maxdepth 1 -type f \
             -name 'questdb*-SNAPSHOT.jar' \
             -exec shasum -a 256 {} \;
@@ -170,6 +180,7 @@ monitor_pids+=("$!")
 overall_rc=0
 soak_started=$SECONDS
 stop_reason="run_limit"
+trace_captures=0
 for run_number in $(seq 1 "$RUN_COUNT"); do
     # Stay on this hosted VM for the whole loop. JVM/fixture restarts do not
     # allocate a new worker. Let an in-flight test retain its original timeout.
@@ -203,6 +214,12 @@ for run_number in $(seq 1 "$RUN_COUNT"); do
     pressure_pid_file="$run_dir/memory-pressure.pid"
     trace_pid_file="$run_dir/fs-usage.pid"
     watchdog_pid_file="$run_dir/watchdog.pid"
+    system_trace_pid_file="$run_dir/system-trace-helper.pid"
+    traced=0
+    if [[ "$SYSTEM_TRACE" == "1" && "$run_number" != "1" &&
+          "$run_number" != "6" && "$run_number" != "11" ]]; then
+        traced=1
+    fi
     # Keep Python store-and-forward buffers and JVM temporary files on the
     # worker's real filesystem. Never inherit a possibly memory-backed /tmp.
     if [[ -e "$run_dir" ]]; then
@@ -212,10 +229,11 @@ for run_number in $(seq 1 "$RUN_COUNT"); do
         break
     fi
     mkdir -p "$run_dir/tmp"
+    [[ "$traced" == "0" ]] || touch "$run_dir/system-trace-enabled"
 
     echo "=== run=$run_number pressure=$PRESSURE_MODE seed=$FUZZ_SEED "\
          "build_mode_seed=$BUILD_MODE_SEED "\
-         "started=$(date -u '+%Y-%m-%dT%H:%M:%SZ') ===" \
+         "system_trace=$traced started=$(date -u '+%Y-%m-%dT%H:%M:%SZ') ===" \
         | tee -a "$DIAG_DIR/test.log"
 
     # The test process creates ready_file after QuestDB is accepting requests
@@ -223,10 +241,45 @@ for run_number in $(seq 1 "$RUN_COUNT"); do
     # at that barrier until the macOS pressure helper has had five seconds to
     # reach the warning state.
     (
+        system_trace_pid=""
+        # This shell is the parent of sudo/collector. On setup failure or
+        # cancellation, signal that exact child and wait for it to reap xctrace.
+        # shellcheck disable=SC2329
+        stop_controller_trace() {
+            if [[ -n "$system_trace_pid" ]]; then
+                sudo -n kill -TERM "$system_trace_pid" 2>/dev/null || true
+                wait "$system_trace_pid" 2>/dev/null || true
+            fi
+        }
+        trap stop_controller_trace EXIT
+        trap 'exit 130' INT
+        trap 'exit 143' TERM
         while [[ ! -f "$ready_file" ]]; do
             sleep 0.1
         done
         server_pid="$(sed -n '1p' "$server_pid_file")"
+        if [[ "$traced" == "1" ]]; then
+            # Redirection deliberately belongs to the unprivileged uploader.
+            # shellcheck disable=SC2024
+            sudo -n env TMPDIR="$run_dir/tmp" "$(command -v python3)" \
+                system_test/qwp_ws_system_trace.py collect --run-dir "$run_dir" \
+                --pid "$server_pid" >"$run_dir/system-trace-helper.log" 2>&1 &
+            system_trace_pid=$!
+            echo "$system_trace_pid" >"$system_trace_pid_file"
+            for _ in $(seq 1 200); do
+                [[ -f "$run_dir/system-trace-ready.json" ]] && break
+                kill -0 "$system_trace_pid" 2>/dev/null || break
+                [[ ! -f "$run_dir/system-trace-error.json" ]] || break
+                sleep 0.1
+            done
+            if [[ ! -f "$run_dir/system-trace-ready.json" ||
+                  -f "$run_dir/system-trace-error.json" ]]; then
+                touch "$run_dir/watchdog-helper-failed"
+                # Never release an unobserved workload; test setup will report
+                # its existing gate timeout, and artifacts explain the cause.
+                exit 2
+            fi
+        fi
         if [[ "$FS_TRACE" == "1" ]]; then
             # Only the tracing replica pays continuous syscall-tracing cost.
             # shellcheck disable=SC2024
@@ -270,6 +323,12 @@ for run_number in $(seq 1 "$RUN_COUNT"); do
             vm_stat || true
         } >"$run_dir/pressure-at-gate.log" 2>&1
         touch "$go_file"
+        if [[ "$traced" == "1" ]]; then
+            wait "$system_trace_pid"
+            trace_rc=$?
+            system_trace_pid=""
+            exit "$trace_rc"
+        fi
     ) &
     controller_pid=$!
 
@@ -321,8 +380,17 @@ for run_number in $(seq 1 "$RUN_COUNT"); do
     if [[ ! -f "$go_file" ]]; then
         kill "$controller_pid" 2>/dev/null || true
     fi
-    wait "$controller_pid" 2>/dev/null || true
+    if ! wait "$controller_pid"; then
+        echo "Diagnostic controller failed; inspect run=$run_number" | tee -a "$DIAG_DIR/test.log"
+        [[ "$test_rc" -ne 0 ]] || test_rc=2
+    fi
     controller_pid=""
+    if [[ "$traced" == "1" &&
+          ( ! -s "$run_dir/system-trace-valid.json" ||
+            -f "$run_dir/system-trace-error.json" ) ]]; then
+        echo "Missing or invalid System Trace; refusing a green result" | tee -a "$DIAG_DIR/test.log"
+        [[ "$test_rc" -ne 0 ]] || test_rc=2
+    fi
     # The watchdog normally exits after the workload-finished marker. Allow
     # its in-flight probe to return, then detect an unexpected helper death.
     for _ in $(seq 1 20); do
@@ -370,6 +438,13 @@ for run_number in $(seq 1 "$RUN_COUNT"); do
         break
     fi
     if [[ -f "$run_dir/capture-started" ]]; then
+        if [[ "$traced" == "1" ]]; then
+            trace_captures=$((trace_captures + 1))
+            if (( trace_captures >= 2 )); then
+                stop_reason="two_system_trace_captures"
+                break
+            fi
+        fi
         echo "Onset captured; test passed; stop_on_capture=$STOP_ON_CAPTURE" \
             | tee -a "$DIAG_DIR/test.log"
         if [[ "$STOP_ON_CAPTURE" == "1" ]]; then
@@ -379,7 +454,8 @@ for run_number in $(seq 1 "$RUN_COUNT"); do
     fi
 done
 
-echo "=== soak stop=$stop_reason elapsed_seconds=$((SECONDS - soak_started)) rc=$overall_rc ===" \
+echo "=== soak stop=$stop_reason elapsed_seconds=$((SECONDS - soak_started)) "\
+     "system_trace_captures=$trace_captures rc=$overall_rc ===" \
     | tee -a "$DIAG_DIR/test.log"
 snapshot_host after
 exit "$overall_rc"

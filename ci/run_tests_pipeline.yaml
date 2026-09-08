@@ -398,27 +398,27 @@ stages:
               pathToPublish: $(Build.ArtifactStagingDirectory)/qdb-log-vs-master-$(Agent.OS).zip
               artifactName: qdb-log-vs-master-$(Agent.OS)
       - job: TestQwpWsFuzz
-        displayName: "QWP/WS add-columns repeated-load diagnostics (macOS hosted)"
+        displayName: "QWP/WS syscall and scheduler diagnostics (one macOS worker)"
         condition: eq(variables['Build.SourceBranch'], variables['QWP_WS_DIAGNOSTIC_REF'])
-        strategy:
-          matrix:
-            replica-a:
-              imageName: "macOS-15-arm64"
-              diagnosticReplica: "a"
-              diagnosticFsTrace: "0"
-            replica-b:
-              imageName: "macOS-15-arm64"
-              diagnosticReplica: "b"
-              diagnosticFsTrace: "0"
+        variables:
+          diagnosticReplica: system-trace
         pool:
-          vmImage: $(imageName)
+          vmImage: macOS-15-arm64
         timeoutInMinutes: 90
         steps:
           - checkout: self
             fetchDepth: 1
             lfs: false
             submodules: false
+          - bash: bash ci/prepare_qwp_ws_system_trace.sh
+            displayName: "Verify syscall and scheduler tracing before compilation"
+            timeoutInMinutes: 3
+            env:
+              QWP_WS_DIAGNOSTICS_DIR: >-
+                $(Build.ArtifactStagingDirectory)/qwp-ws-macos-diagnostics
           - template: templates/compile.yaml
+            parameters:
+              prerequisiteCondition: succeeded()
           - template: templates/resolve_jdk25.yaml
           - template: templates/clone_questdb.yaml
             parameters:
@@ -436,21 +436,33 @@ stages:
               jdkDirectory: "$(JAVA_HOME)"
               options: "-s $(MAVEN_SETTINGS_FILE) -DskipTests -Pbuild-web-console$(CLIENT_PROFILE) $(MAVEN_RUN_OPTS)"
           - bash: bash ci/run_macos_qwp_ws_diagnostics.sh
-            displayName: "Loop unchanged QWP/WS test on the same worker"
+            displayName: "Capture two onset events with interleaved tracing controls"
             timeoutInMinutes: 30
             env:
-              QWP_WS_DIAGNOSTIC_RUNS: "60"
-              QWP_WS_MAX_SECONDS: "1200"
+              # Attempts 1, 6, 11 are controls; at most ten traced attempts.
+              QWP_WS_DIAGNOSTIC_RUNS: "13"
+              QWP_WS_MAX_SECONDS: "600"
               QWP_WS_STOP_ON_CAPTURE: "0"
+              QWP_WS_SYSTEM_TRACE: "1"
               QWP_WS_MIN_FREE_KB: "2097152"
               QWP_WS_DIAGNOSTICS_DIR: >-
                 $(Build.ArtifactStagingDirectory)/qwp-ws-macos-diagnostics
               QWP_WS_MEMORY_PRESSURE: natural
-              QWP_WS_FS_TRACE: $(diagnosticFsTrace)
+              QWP_WS_FS_TRACE: "0"
+          - bash: |
+              # xctrace may create private root-owned files despite umask.
+              # Return only this job's diagnostic artifacts to the uploader.
+              if [[ -d "$QWP_WS_DIAGNOSTICS_DIR" ]]; then
+                sudo -n chown -R "$(id -u):$(id -g)" "$QWP_WS_DIAGNOSTICS_DIR"
+              fi
+            displayName: "Make privileged trace artifacts readable by uploader"
+            condition: always()
+            env:
+              QWP_WS_DIAGNOSTICS_DIR: >-
+                $(Build.ArtifactStagingDirectory)/qwp-ws-macos-diagnostics
           - task: PublishBuildArtifacts@1
             displayName: "Publish macOS host diagnostics"
             condition: always()
-            continueOnError: true
             inputs:
               pathToPublish: >-
                 $(Build.ArtifactStagingDirectory)/qwp-ws-macos-diagnostics

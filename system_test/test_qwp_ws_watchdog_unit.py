@@ -22,6 +22,66 @@ def wait_for(predicate):
 
 
 class WatchdogTest(unittest.TestCase):
+    def test_traced_capture_requests_stop_without_dumping_or_sampling(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            (directory / 'system-trace-enabled').touch()
+            (directory / 'system-trace-stop-sent.json').write_text('{}')
+            with mock.patch.object(watchdog.os, 'kill') as send, \
+                    mock.patch.object(watchdog.subprocess, 'Popen') as launch:
+                watchdog.capture(directory, 123, 'ping timeout')
+            send.assert_not_called()
+            launch.assert_not_called()
+            request = json.loads((directory / 'system-trace-stop-request.json').read_text())
+            self.assertEqual(request['reason'], 'ping timeout')
+            self.assertTrue((directory / 'capture-complete').exists())
+            self.assertFalse((directory / 'capture-error').exists())
+
+    def test_trace_failure_releases_teardown_with_explicit_error(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            (directory / 'system-trace-enabled').touch()
+            (directory / 'system-trace-error.json').write_text('{}')
+            with mock.patch.object(watchdog.os, 'kill') as send:
+                watchdog.capture(directory, 123, 'ping timeout')
+            send.assert_not_called()
+            self.assertTrue((directory / 'capture-complete').exists())
+            self.assertIn('did not acknowledge', (directory / 'capture-error').read_text())
+
+    def test_normal_completion_requests_trace_stop_before_teardown_ack(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            for name in ('start-test', 'workload-finished', 'system-trace-enabled'):
+                (directory / name).touch()
+            (directory / 'system-trace-stop-sent.json').write_text('{}')
+            watchdog.watch(directory, 123, 9000, threading.Event())
+            request = json.loads((directory / 'system-trace-stop-request.json').read_text())
+            self.assertEqual(request['reason'], 'workload-finished')
+            self.assertTrue((directory / 'watchdog-stopped').exists())
+            self.assertFalse((directory / 'capture-error').exists())
+
+    def test_trace_stop_is_requested_before_capture_thread_starts(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            for name in ('start-test', 'system-trace-enabled'):
+                (directory / name).touch()
+            stop = threading.Event()
+            opener = mock.Mock()
+            opener.open.side_effect = TimeoutError('injected stall')
+
+            def capture(*_args):
+                self.assertTrue((directory / 'system-trace-stop-request.json').exists())
+                (directory / 'system-trace-stop-sent.json').write_text('{}')
+                stop.set()
+
+            with mock.patch.object(watchdog.urllib.request, 'build_opener', return_value=opener), \
+                    mock.patch.object(watchdog, 'capture', side_effect=capture) as collect:
+                watchdog.watch(directory, 123, 9000, stop)
+            collect.assert_called_once()
+            events = [json.loads(line) for line in (directory / 'watchdog.jsonl').read_text().splitlines()]
+            ping = next(event for event in events if event['event'] == 'ping')
+            self.assertLessEqual(ping['started_wall_ns'], ping['wall_ns'])
+
     def test_event_has_wall_and_monotonic_clocks(self):
         log = io.StringIO()
         watchdog.write_event(log, 'example', elapsed_ms=7)

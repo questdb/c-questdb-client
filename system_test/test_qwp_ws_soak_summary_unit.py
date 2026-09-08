@@ -34,6 +34,16 @@ class SoakSummaryTest(unittest.TestCase):
         self.assertEqual(result['max_heartbeat_gap_ms'], 251.1)
         self.assertIsNone(result['capture_reason'])
         self.assertEqual(result['missing_telemetry'], [])
+        self.assertFalse(result['system_trace'])
+        self.assertFalse(result['system_trace_valid'])
+
+    def test_trace_error_overrides_valid_marker(self):
+        (self.directory / 'system-trace-enabled').touch()
+        (self.directory / 'system-trace-valid.json').write_text('{}')
+        self.assertTrue(SUMMARY.summarize(self.directory)['system_trace'])
+        self.assertTrue(SUMMARY.summarize(self.directory)['system_trace_valid'])
+        (self.directory / 'system-trace-error.json').write_text('{}')
+        self.assertFalse(SUMMARY.summarize(self.directory)['system_trace_valid'])
 
     def test_recovered_ping_stall_is_preserved(self):
         self.write_events('watchdog.jsonl', [dict(event='ping', elapsed_ms=1002, error='timeout'),

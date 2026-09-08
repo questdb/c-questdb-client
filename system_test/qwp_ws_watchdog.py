@@ -16,6 +16,8 @@ import threading
 import time
 import urllib.request
 
+from qwp_ws_system_trace import request_stop
+
 
 def write_event(stream, event, **fields):
     stream.write(json.dumps(dict(
@@ -39,14 +41,29 @@ def heartbeat(run_dir, stop, delayed):
             previous_write_ms = (time.monotonic() - now) * 1000
 
 
+def stop_system_trace(run_dir, reason):
+    request_stop(run_dir, reason)
+    deadline = time.monotonic() + 3
+    while not (run_dir / 'system-trace-stop-sent.json').exists():
+        if (run_dir / 'system-trace-error.json').exists() or time.monotonic() > deadline:
+            raise RuntimeError('System Trace did not acknowledge onset/completion stop')
+        time.sleep(0.02)
+
+
 def capture(run_dir, pid, reason):
-    """One native sample and three JVM dump requests; no HTTP dependency."""
+    """Stop the active trace, or take native/JVM samples; no HTTP dependency."""
     (run_dir / 'capture-started').write_text(reason + '\n')
     sample = None
     with (run_dir / 'capture.jsonl').open('w') as log, \
             (run_dir / 'sample-command.log').open('w') as sample_log:
         try:
             write_event(log, 'capture_start', reason=reason, pid=pid)
+            if (run_dir / 'system-trace-enabled').exists():
+                stop_system_trace(run_dir, reason)
+                write_event(log, 'system_trace_stop_acknowledged')
+                # No additional profilers in this arm. The recorder finalizes
+                # independently; the harness validates exported data afterward.
+                return
             if sys.platform == 'darwin':
                 # Explicit output path: sample otherwise writes into /tmp.
                 try:
@@ -110,16 +127,17 @@ def watch(run_dir, pid, port, stop):
                     break
                 reason = None
                 started = time.monotonic()
+                started_wall_ns = time.time_ns()
                 try:
                     with opener.open(f'http://127.0.0.1:{port}/ping', timeout=1) as resp:
                         if resp.status != 204:
                             reason = f'ping HTTP {resp.status}'
                     write_event(log, 'ping', elapsed_ms=(time.monotonic() - started) * 1000,
-                                error=reason)
+                                started_wall_ns=started_wall_ns, error=reason)
                 except Exception as exc:
                     reason = f'ping: {type(exc).__name__}: {exc}'
                     write_event(log, 'ping', elapsed_ms=(time.monotonic() - started) * 1000,
-                                error=reason)
+                                started_wall_ns=started_wall_ns, error=reason)
                 request = run_dir / 'capture-request'
                 if request.exists():
                     reason = request.read_text()
@@ -130,12 +148,20 @@ def watch(run_dir, pid, port, stop):
                     # Publish synchronously so teardown sees an in-flight
                     # capture even before the collector thread is scheduled.
                     (run_dir / 'capture-started').write_text(reason + '\n')
+                    if (run_dir / 'system-trace-enabled').exists():
+                        request_stop(run_dir, reason)
                     collector = threading.Thread(
                         target=capture, args=(run_dir, pid, reason),
                         name='watchdog-capture')
                     collector.start()
                 stop.wait(max(0, 1 - (time.monotonic() - started)))
     finally:
+        if (run_dir / 'system-trace-enabled').exists():
+            try:
+                stop_system_trace(run_dir, 'workload-finished' if (run_dir / 'workload-finished').exists()
+                                  else 'watchdog-stopped')
+            except Exception as exc:
+                (run_dir / 'capture-error').write_text(repr(exc) + '\n')
         stop.set()
         pulse.join(timeout=2)
         if collector is not None:
