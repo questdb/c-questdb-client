@@ -3901,11 +3901,17 @@ impl QwpWsTableBuffer {
         }
     }
 
-    /// Returns whether anything past the mark was discarded.
+    /// Returns whether anything past the mark was discarded. Marks are taken
+    /// on row boundaries, so equal row and column counts with no open row
+    /// mean no cell was appended since.
     fn restore(&mut self, mark: QwpWsTableRollbackMark) -> bool {
+        debug_assert!(!mark.in_progress);
         let changed = self.row_count != mark.row_count
             || self.columns.len() != mark.columns_len
             || self.in_progress != mark.in_progress;
+        if !changed {
+            return false;
+        }
         for column in &mut self.columns[..mark.columns_len] {
             column.rollback_rows_from(mark.row_count);
         }
@@ -3918,7 +3924,7 @@ impl QwpWsTableBuffer {
         self.in_progress_column_count = mark.in_progress_column_count;
         self.column_access_cursor = mark.column_access_cursor;
         self.row_mark = None;
-        changed
+        true
     }
 
     #[inline(always)]
