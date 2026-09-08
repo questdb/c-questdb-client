@@ -7,7 +7,26 @@ unchanged. Azure PR 200 allocates only one macOS worker, running only
 workload mode is enabled. The current default follows the severe filesystem
 episode captured in build 268479.
 
-## Current action: remove file writes from the onset path
+## Current action: decode retained raw samples, no workload
+
+Build 268494 passed three attempts (59 completed SHOW cursors, maximum 52.751
+ms) and retained a 2,140,573-byte raw capture from attempt 3. It decoded into a
+full 151-sample report but without kernel names, so validation correctly failed.
+Exact UUID-plus-offset matching to retained symbolicated builds 268472/268468
+recovers 1,197 frame lines, leaving 5,205 unresolved and no ambiguous keys. This
+is explicitly partial annotation, not nearest-symbol guessing. During samples
+11-15 all three HTTP workers wait at APFS transaction entry while the flusher
+waits in virtual-disk unmap; sample 16 is a barrier. These are short sampled
+intervals, not the previous build's 66-second wait or the original slow query.
+
+The next job defaults qwpWsDecodeOnly=true and downloads only hash-pinned
+retained inputs: 268494/run-3 raw data and 268472/run-4 symbolicated report.
+It tests the installed tool's documented -symbols input when decoding with -i.
+No live-system inspection is requested for historical process identities.
+No dependencies, client/server build, test, filesystem helper or new sampling
+runs. One Mac, bounded download/decoder times, raw data preserved on failure.
+
+## Completed arm: remove file writes from the onset path
 
 Build 268487 reproduced five close-drain timeouts in its first low-rate control.
 The helper completed only two cycles (128 KiB application writes). Its second

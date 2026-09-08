@@ -26,10 +26,13 @@ def raw_command(time_limit=25):
             '-timelimit', str(time_limit), '-noProcessingWhileSampling']
 
 
-def decode_command(directory):
-    return ['/usr/sbin/spindump', '-i', str(directory / 'spindump.raw'),
+def decode_command(directory, symbols=None):
+    args = ['/usr/sbin/spindump', '-i', str(directory / 'spindump.raw'),
             '-o', str(directory / 'spindump.txt'), '-timeline', '-symbolicate',
             '-noBinary', '-timestampsInCallTrees', 'all', '-timelimit', '60']
+    if symbols is not None:
+        args.extend(['-symbols', str(symbols)])
+    return args
 
 
 def inspect_report(report):
@@ -85,6 +88,7 @@ def main():
     parser.add_argument('--record', action='store_true')
     parser.add_argument('--record-raw', action='store_true')
     parser.add_argument('--decode', action='store_true')
+    parser.add_argument('--symbols', type=Path)
     parser.add_argument('--limit', type=int, choices=(25, 45), default=45)
     args = parser.parse_args()
     if args.record_raw:
@@ -109,7 +113,7 @@ def main():
         sys.stdout.buffer.write(result.stdout)
         return
     if args.decode:
-        subprocess.run(decode_command(args.directory), timeout=65, check=True)
+        subprocess.run(decode_command(args.directory, args.symbols), timeout=65, check=True)
         result = inspect_report((args.directory / 'spindump.txt').read_text(errors='replace'))
         (args.directory / 'decode-validation.json').write_text(json.dumps(result) + '\n')
         if not result['named_kernel_frame_lines']:

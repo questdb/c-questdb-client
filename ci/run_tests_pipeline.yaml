@@ -4,7 +4,7 @@ parameters:
   - name: qwpWsDecodeOnly
     displayName: "QWP diagnostics: decode existing trace only (no builds/tests)"
     type: boolean
-    default: false
+    default: true
   - name: qwpWsPreflightOnly
     displayName: "QWP diagnostics: verify recorder startup only (no builds/tests)"
     type: boolean
@@ -432,8 +432,8 @@ stages:
             - bash: |
                 mkdir -p "$QWP_WS_DIAGNOSTICS_DIR/tmp"
                 export TMPDIR="$QWP_WS_DIAGNOSTICS_DIR/tmp"
-                python3 ci/diagnostics/decode_system_trace.py "$QWP_WS_DIAGNOSTICS_DIR/decoded"
-              displayName: "Decode retained VM and scheduler events (no workload)"
+                python3 ci/diagnostics/decode_kernel_capture.py "$QWP_WS_DIAGNOSTICS_DIR/decoded"
+              displayName: "Decode retained kernel capture with retained symbols (no workload)"
               timeoutInMinutes: 7
               env:
                 QWP_WS_DIAGNOSTICS_DIR: >-

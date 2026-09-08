@@ -1,16 +1,39 @@
 from pathlib import Path
 import io
+import hashlib
 import subprocess
 import sys
 import tempfile
 import unittest
+import zipfile
 from unittest import mock
 
 from ci.diagnostics import kernel_wait_preflight as recorder
 from ci.diagnostics.kernel_wait_preflight import command, decode_command, inspect_report, raw_command
+from ci.diagnostics.decode_kernel_capture import extract_member
 
 
 class KernelPreflightTest(unittest.TestCase):
+    def test_decoder_member_is_hash_pinned_and_does_not_extract_other_paths(self):
+        with tempfile.TemporaryDirectory() as temp:
+            directory = Path(temp)
+            archive = directory / 'input.zip'
+            output = directory / 'raw'
+            with zipfile.ZipFile(archive, 'w') as z:
+                z.writestr('wanted', b'raw bytes')
+                z.writestr('../unwanted', b'never extract')
+            with self.assertRaisesRegex(RuntimeError, 'hash mismatch'):
+                extract_member(archive, 'wanted', 'bad hash', output)
+            self.assertFalse(output.exists())
+            extract_member(archive, 'wanted', hashlib.sha256(b'raw bytes').hexdigest(), output)
+            self.assertEqual(output.read_bytes(), b'raw bytes')
+            self.assertEqual(sorted(p.name for p in directory.iterdir()), ['input.zip', 'raw'])
+
+    def test_decoder_uses_retained_symbols_not_live_process_inspection(self):
+        args = decode_command(Path('/capture'), Path('/retained/symbols'))
+        self.assertEqual(args[-2:], ['-symbols', '/retained/symbols'])
+        self.assertNotIn('-inspectLiveSystem', args)
+
     def test_raw_timeout_forwards_partial_binary_and_native_error(self):
         output, errors = io.BytesIO(), io.BytesIO()
         failure = subprocess.TimeoutExpired('spindump', 30, output=b'partial', stderr=b'native detail')
