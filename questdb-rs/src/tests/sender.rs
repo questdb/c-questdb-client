@@ -347,15 +347,6 @@ fn ilp_buffer_rejects_symbol_after_column() -> TestResult {
 
     let err = buffer.symbol("s", "v").unwrap_err();
     assert_eq!(err.code(), ErrorCode::InvalidApiCall);
-    assert_eq!(
-        err.msg(),
-        concat!(
-            "State error: Bad call to `symbol`, ILP requires all symbols before ",
-            "the row's first `column`; move the symbol earlier, or use a QWP ",
-            "buffer, where symbols may follow columns. `column_str` is not ",
-            "equivalent: it writes a VARCHAR, not a SYMBOL."
-        )
-    );
 
     // The rejected call wrote nothing: the row is still completable and the
     // line carries only the column.

@@ -738,10 +738,9 @@ fn qwp_udp_rejects_duplicate_entry_names_within_row() -> TestResult {
 }
 
 /// Relaxed symbol ordering makes duplicate-name detection reachable through
-/// `symbol` as well. The two QWP transports deliberately differ here: this
-/// pins the QWP/UDP half, and
-/// `qwp_ws_columnar_duplicate_symbol_after_column_keeps_first_value` pins the
-/// QWP/WebSocket half, where the second write is silently dropped.
+/// `symbol` as well. This pins the QWP/UDP error for a same-kind duplicate;
+/// `qwp_ws_columnar_same_kind_duplicate_symbol_after_column_keeps_first_value`
+/// pins the equivalent QWP/WebSocket case.
 #[test]
 fn qwp_udp_rejects_duplicate_symbol_after_column_within_row() -> TestResult {
     let mock = QwpUdpMock::new()?;

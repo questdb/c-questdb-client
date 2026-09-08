@@ -8327,14 +8327,70 @@ mod tests {
         /// How many non-symbol columns [`apply_row`] emits before the symbol.
         /// QWP treats symbols as ordinary typed columns, so the generated
         /// rows must interleave them rather than always leading with them.
-        /// Clamped to the end of the row when it exceeds the column count.
         symbol_offset: usize,
     }
 
-    /// Upper bound of [`PropRow::symbol_offset`]: the number of non-symbol
-    /// columns [`apply_row`] can emit (flag, qty, px, note, price, samples,
-    /// event_ts).
-    const PROP_ROW_MAX_SYMBOL_OFFSET: usize = 7;
+    impl PropRow {
+        fn non_symbol_column_count(&self) -> usize {
+            [
+                self.bool_value.is_some(),
+                self.i64_value.is_some(),
+                self.f64_value.is_some(),
+                self.string_value.is_some(),
+                self.decimal_value.is_some(),
+                self.array_values.is_some(),
+                self.ts_value.is_some(),
+            ]
+            .into_iter()
+            .filter(|present| *present)
+            .count()
+        }
+
+        fn column_names_in_write_order(&self) -> Vec<&'static str> {
+            let mut names = Vec::with_capacity(self.non_symbol_column_count() + 2);
+            if self.bool_value.is_some() {
+                names.push("flag");
+            }
+            if self.i64_value.is_some() {
+                names.push("qty");
+            }
+            if self.f64_value.is_some() {
+                names.push("px");
+            }
+            if self.string_value.is_some() {
+                names.push("note");
+            }
+            if self.decimal_value.is_some() {
+                names.push("price");
+            }
+            if self.array_values.is_some() {
+                names.push("samples");
+            }
+            if self.ts_value.is_some() {
+                names.push("event_ts");
+            }
+            if self.symbol.is_some() {
+                names.insert(self.symbol_offset.min(names.len()), "sym");
+            }
+            if self.designated_ts.is_some() {
+                names.push("");
+            }
+            names
+        }
+    }
+
+    fn prop_row_with_symbol_offset(row: PropRow) -> BoxedStrategy<PropRow> {
+        let max_offset = row
+            .symbol
+            .as_ref()
+            .map_or(0, |_| row.non_symbol_column_count());
+        (Just(row), 0usize..=max_offset)
+            .prop_map(|(mut row, symbol_offset)| {
+                row.symbol_offset = symbol_offset;
+                row
+            })
+            .boxed()
+    }
 
     #[derive(Clone, Debug)]
     struct PropSegment {
@@ -8345,6 +8401,7 @@ mod tests {
     #[derive(Clone, Debug, PartialEq, Eq)]
     struct SemanticRow {
         table: String,
+        column_order: Vec<String>,
         fields: BTreeMap<String, SemanticValue>,
     }
 
@@ -8599,33 +8656,27 @@ mod tests {
         };
 
         (
-            (
-                symbol,
-                bool_value,
-                i64_value,
-                f64_value,
-                string_value,
-                decimal_value,
-                array_values,
-                ts_value,
-                designated_ts,
-            ),
-            0usize..=PROP_ROW_MAX_SYMBOL_OFFSET,
+            symbol,
+            bool_value,
+            i64_value,
+            f64_value,
+            string_value,
+            decimal_value,
+            array_values,
+            ts_value,
+            designated_ts,
         )
             .prop_map(
                 |(
-                    (
-                        symbol,
-                        bool_value,
-                        i64_value,
-                        f64_value,
-                        string_value,
-                        decimal_value,
-                        array_values,
-                        ts_value,
-                        designated_ts,
-                    ),
-                    symbol_offset,
+                    symbol,
+                    bool_value,
+                    i64_value,
+                    f64_value,
+                    string_value,
+                    decimal_value,
+                    array_values,
+                    ts_value,
+                    designated_ts,
                 )| PropRow {
                     symbol,
                     bool_value,
@@ -8636,7 +8687,7 @@ mod tests {
                     array_values,
                     ts_value,
                     designated_ts,
-                    symbol_offset,
+                    symbol_offset: 0,
                 },
             )
             .prop_filter("row must commit at least one field", |row| {
@@ -8649,6 +8700,7 @@ mod tests {
                     || row.array_values.is_some()
                     || row.ts_value.is_some()
             })
+            .prop_flat_map(prop_row_with_symbol_offset)
             .boxed()
     }
 
@@ -8727,18 +8779,9 @@ mod tests {
             array_values,
             ts_value,
             designated_ts,
-            0usize..=PROP_ROW_MAX_SYMBOL_OFFSET,
         )
             .prop_map(
-                |(
-                    symbol,
-                    string_value,
-                    decimal_value,
-                    array_values,
-                    ts_value,
-                    designated_ts,
-                    symbol_offset,
-                )| {
+                |(symbol, string_value, decimal_value, array_values, ts_value, designated_ts)| {
                     PropRow {
                         symbol,
                         bool_value: None,
@@ -8749,10 +8792,11 @@ mod tests {
                         array_values,
                         ts_value,
                         designated_ts,
-                        symbol_offset,
+                        symbol_offset: 0,
                     }
                 },
             )
+            .prop_flat_map(prop_row_with_symbol_offset)
             .boxed()
     }
 
@@ -8938,8 +8982,8 @@ mod tests {
                 }
             );
         }
-        // `symbol_offset` beyond the row's column count: the symbol still
-        // belongs to the row, it just lands last.
+        // Keep a defensive fallback for manually constructed rows whose
+        // `symbol_offset` exceeds their number of columns.
         emit_symbol_when_due(buf, &mut symbol, row.symbol_offset, usize::MAX);
 
         if let Some(value) = row.designated_ts {
@@ -8960,6 +9004,16 @@ mod tests {
         let mut rows = Vec::new();
         for segment in segments {
             let schema = active_schema(segment);
+            let mut column_order: Vec<String> = Vec::new();
+            for name in segment
+                .rows
+                .iter()
+                .flat_map(PropRow::column_names_in_write_order)
+            {
+                if !column_order.iter().any(|existing| existing == name) {
+                    column_order.push(name.to_owned());
+                }
+            }
             for row in &segment.rows {
                 let mut fields = BTreeMap::new();
                 if schema.symbol {
@@ -9036,6 +9090,7 @@ mod tests {
                 }
                 rows.push(SemanticRow {
                     table: segment.config.table.as_str().to_owned(),
+                    column_order: column_order.clone(),
                     fields,
                 });
             }
@@ -9124,6 +9179,10 @@ mod tests {
                 group_end += 1;
             }
             let schema = semantic_group_schema(&decoded[group_start..group_end]);
+            let column_order = schema
+                .iter()
+                .map(|(name, _)| name.clone())
+                .collect::<Vec<_>>();
             for datagram in &decoded[group_start..group_end] {
                 let columns = &datagram.table.columns;
                 for decoded_row in &datagram.table.rows {
@@ -9138,6 +9197,7 @@ mod tests {
                     }
                     rows.push(SemanticRow {
                         table: table_name.clone(),
+                        column_order: column_order.clone(),
                         fields,
                     });
                 }
@@ -9149,13 +9209,13 @@ mod tests {
 
     fn semantic_group_schema(
         decoded: &[crate::tests::qwp_decode::DecodedDatagram],
-    ) -> BTreeMap<String, SemanticKind> {
-        let mut schema = BTreeMap::new();
+    ) -> Vec<(String, SemanticKind)> {
+        let mut schema: Vec<(String, SemanticKind)> = Vec::new();
         for datagram in decoded {
             for (col_idx, column) in datagram.table.columns.iter().enumerate() {
-                schema
-                    .entry(column.name.clone())
-                    .or_insert_with(|| infer_semantic_kind(datagram, col_idx));
+                if !schema.iter().any(|(name, _)| name == &column.name) {
+                    schema.push((column.name.clone(), infer_semantic_kind(datagram, col_idx)));
+                }
             }
         }
         schema
@@ -10931,13 +10991,12 @@ mod tests {
         );
     }
 
-    /// The QWP/WebSocket half of the duplicate-name divergence documented on
-    /// [`Buffer::symbol`](crate::ingress::Buffer::symbol): the second write is
-    /// silently dropped rather than rejected. QWP/UDP errors instead — see
+    /// For this same-kind duplicate, QWP/WebSocket keeps the first value while
+    /// QWP/UDP rejects the second write; see
     /// `qwp_udp_rejects_duplicate_symbol_after_column_within_row`.
     #[cfg(feature = "_sender-qwp-ws")]
     #[test]
-    fn qwp_ws_columnar_duplicate_symbol_after_column_keeps_first_value() {
+    fn qwp_ws_columnar_same_kind_duplicate_symbol_after_column_keeps_first_value() {
         let mut buf = QwpWsColumnarBuffer::new(127);
         let mut scratch = QwpWsEncodeScratch::new();
         let mut global_dict = SymbolGlobalDict::new();

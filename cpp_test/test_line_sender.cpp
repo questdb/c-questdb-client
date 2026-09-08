@@ -1544,13 +1544,8 @@ TEST_CASE("ILP rejects symbol after column")
     questdb::ingress::line_sender_buffer buffer = sender.new_buffer();
     buffer.table("test").column("t1", "v1");
 
-    CHECK_THROWS_WITH_AS(
-        buffer.symbol("t2", "v2"),
-        "State error: Bad call to `symbol`, ILP requires all symbols before "
-        "the row's first `column`; move the symbol earlier, or use a QWP "
-        "buffer, where symbols may follow columns. `column_str` is not "
-        "equivalent: it writes a VARCHAR, not a SYMBOL.",
-        questdb::ingress::line_sender_error);
+    CHECK_THROWS_AS(
+        buffer.symbol("t2", "v2"), questdb::ingress::line_sender_error);
 
     CHECK(!sender.must_close());
 
@@ -3473,7 +3468,7 @@ TEST_CASE("line_sender c++ udp opts reusable after protocol_version error")
     sender.flush(buffer);
 }
 
-TEST_CASE("line_sender c++ qwp allows symbols after columns")
+TEST_CASE("line_sender c++ qwp udp allows symbols after columns")
 {
     udp_capture receiver;
     questdb::ingress::opts opts{

@@ -90,31 +90,12 @@ impl OpCase {
         }
     }
 
-    /// Advice tail for an op this case rejects.
-    ///
-    /// Usually just the per-case "what to call instead", but `symbol` after a
-    /// non-symbol column earns its own message: the constraint belongs to ILP
-    /// alone, and the substitute the generic advice points at (`column_str`)
-    /// silently writes a different column type.
-    fn rejected_op_descr(self, op: Op) -> &'static str {
-        match (self, op) {
-            (OpCase::ColumnWritten, Op::Symbol) => {
-                "ILP requires all symbols before the row's first `column`; \
-                 move the symbol earlier, or use a QWP buffer, where symbols \
-                 may follow columns. `column_str` is not equivalent: it writes \
-                 a VARCHAR, not a SYMBOL"
-            }
-            _ => self.next_op_descr(),
-        }
-    }
-
     /// The equivalent case for protocols where symbols are ordinary typed
     /// columns: a row that has written a non-symbol column is then in exactly
     /// the same position as one that has written a symbol.
     ///
-    /// Both [`OpState::check_symbols_as_columns`] and its error message are
-    /// derived from this single mapping, so the allowed-op set and the advice
-    /// text cannot drift apart.
+    /// This mapping is applied only when formatting a rejected QWP operation,
+    /// keeping the remap off the accepted-operation path.
     #[cfg(any(feature = "_sender-qwp-udp", feature = "_sender-qwp-ws"))]
     const fn symbols_as_columns(self) -> Self {
         match self {
@@ -131,7 +112,7 @@ fn bad_op_error(op_case: OpCase, op: Op) -> crate::Error {
         InvalidApiCall,
         "State error: Bad call to `{}`, {}.",
         op.descr(),
-        op_case.rejected_op_descr(op)
+        op_case.next_op_descr()
     )
 }
 
@@ -164,11 +145,10 @@ impl OpState {
     #[cfg(any(feature = "_sender-qwp-udp", feature = "_sender-qwp-ws"))]
     #[inline(always)]
     pub(super) fn check_symbols_as_columns(self, op: Op) -> crate::Result<()> {
-        let op_case = self.op_case.symbols_as_columns();
-        if op_case.allows(op) {
+        if self.op_case.allows(op) || (self.op_case == OpCase::ColumnWritten && op == Op::Symbol) {
             Ok(())
         } else {
-            Err(bad_op_error(op_case, op))
+            Err(bad_op_error(self.op_case.symbols_as_columns(), op))
         }
     }
 
@@ -305,38 +285,13 @@ mod tests {
         assert!(!state.ilp_symbol_section_is_open());
     }
 
-    #[test]
-    fn op_state_reports_ilp_symbol_ordering_in_its_own_message() {
-        let mut state = OpState::new();
-        state.record_table();
-        state.record_column();
-
-        let err = state.check(Op::Symbol).unwrap_err();
-        assert_eq!(err.code(), ErrorCode::InvalidApiCall);
-        assert_eq!(
-            err.msg(),
-            concat!(
-                "State error: Bad call to `symbol`, ILP requires all symbols before ",
-                "the row's first `column`; move the symbol earlier, or use a QWP ",
-                "buffer, where symbols may follow columns. `column_str` is not ",
-                "equivalent: it writes a VARCHAR, not a SYMBOL."
-            )
-        );
-
-        // The advice for the *other* ops rejected in this state is unchanged.
-        assert_eq!(
-            state.check(Op::Flush).unwrap_err().msg(),
-            "State error: Bad call to `flush`, should have called `column` or `at` instead."
-        );
-    }
-
     /// Unit test of [`OpState::check_symbols_as_columns`] in isolation. The
     /// end-to-end claim that ILP `Buffer`s still reject a symbol after a
     /// column is pinned by `ilp_buffer_rejects_symbol_after_column` in
     /// `crate::tests::sender`.
     #[cfg(any(feature = "_sender-qwp-udp", feature = "_sender-qwp-ws"))]
     #[test]
-    fn op_state_symbols_as_columns_relaxes_only_symbol_after_column() {
+    fn op_state_symbols_as_columns_accepts_symbol_after_column() {
         let mut state = OpState::new();
         state.record_table();
         state.record_column();

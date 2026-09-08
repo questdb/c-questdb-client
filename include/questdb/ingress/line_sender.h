@@ -87,8 +87,7 @@ typedef enum line_sender_error_code
     /** The host, port, or interface was incorrect. */
     line_sender_error_could_not_resolve_addr = 0,
 
-    /** Called methods in the wrong order. E.g. `symbol` after `column` on an
-     * ILP buffer. */
+    /** Called methods in the wrong order. E.g. `symbol` after `column`. */
     line_sender_error_invalid_api_call = 1,
 
     /** A network error connecting or flushing data out. */
@@ -877,6 +876,12 @@ bool line_sender_buffer_table(
  * For ILP buffers, record all symbol columns before any other column type.
  * QWP buffers allow symbol and non-symbol columns in any order before the
  * designated timestamp.
+ *
+ * Treat column names as case-insensitive, record each name once per row, and
+ * keep its type consistent across rows. Duplicate handling differs by QWP
+ * transport and spelling: a later value may fail, be silently ignored, or be
+ * encoded as a separate column. Type-change errors can be reported at different
+ * calls and may discard the in-progress row.
  *
  * When the buffer is flushed over QWP/WebSocket — `qwp_sender_flush_buffer*` on
  * a pooled sender, or `line_sender_flush*` on a `line_sender` opened against a

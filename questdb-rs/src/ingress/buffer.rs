@@ -759,19 +759,11 @@ impl Buffer {
     /// non-symbol columns. QWP buffers allow symbols and non-symbol columns in
     /// any order before the designated timestamp.
     ///
-    /// Because a symbol may now follow a column, two pre-existing differences
-    /// between the QWP transports are reachable from this method as well as
-    /// from [`column_str`](Self::column_str) and friends:
-    ///
-    /// * Recording the same column name twice in one row (symbol or not):
-    ///   QWP/UDP fails with `column '<name>' already set for current row`,
-    ///   while QWP/WebSocket silently keeps the **first** value.
-    /// * A mid-row error such as a column type change: QWP/WebSocket discards
-    ///   the whole in-progress row, while QWP/UDP keeps what was written
-    ///   before the failing call.
-    ///
-    /// Neither is new behaviour and neither depends on symbol ordering; write
-    /// each column of a row exactly once and the transports agree.
+    /// Treat column names as case-insensitive, record each name once per row,
+    /// and keep its type consistent across rows. Duplicate handling differs by
+    /// QWP transport and spelling: a later value may fail, be silently ignored,
+    /// or be encoded as a separate column. Type-change errors can be reported at
+    /// different calls and may discard the in-progress row.
     ///
     /// When the buffer is flushed over QWP/WebSocket, every distinct symbol
     /// recorded here is interned into the *same* connection-scoped dictionary

@@ -106,7 +106,8 @@ both application concurrency and server connection capacity.
 
 Names and string values must be valid UTF-8; C APIs take explicit lengths and
 do not require NUL termination. Table and column names must satisfy QuestDB's
-naming rules. Keep a column's type consistent across rows.
+naming rules. Treat column names as case-insensitive, record each name once per
+row, and keep its type consistent across rows.
 
 For ILP row ingestion, symbols must be added before fields and the designated
 timestamp ends a row. Prefer `SYMBOL` for frequently repeated categorical
@@ -115,7 +116,10 @@ broader native type set, dictionary-encoded symbols, arrays, and Arrow/Polars
 paths; validate equal row counts and keep all borrowed input arrays alive until
 the flush returns. QWP treats symbols as ordinary typed columns, so — unlike
 ILP — a QWP row may interleave `symbol` and the other column calls in any order
-before the designated timestamp.
+before the designated timestamp. Duplicate handling differs by QWP transport
+and spelling: a later value may fail, be silently ignored, or be encoded as a
+separate column. Type-change errors can be reported at different calls and may
+discard the in-progress row.
 
 Client-side validation failures are returned as Rust `Result` errors, C error
 out-pointers, or C++ exceptions. Server-side data errors follow the transport
