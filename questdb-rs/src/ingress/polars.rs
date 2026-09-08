@@ -484,34 +484,47 @@ impl crate::db::BorrowedDirectColumnSender<'_> {
         // failure re-drives only the tail past this.
         let mut committed = 0usize;
 
-        loop {
-            let committed_before = committed;
-            match drive_from_checkpoint(self, table, df, options, &mut committed) {
-                Ok(()) => return Ok(()),
-                Err(err) if err.code() != crate::ErrorCode::FailoverRetry => return Err(err),
-                Err(err) => {
-                    // This high-level entry point explicitly provides
-                    // at-least-once delivery and owns a precise checkpoint:
-                    // even an in-doubt failure re-drives only the tail after
-                    // the last ACKed checkpoint. Lower-level callers still
-                    // receive the truthful `in_doubt` flag and can decline to
-                    // replay a larger source.
-                    // `reborrow_with_retry` returns as soon as a replacement
-                    // connection opens, so a server that accepts connections but
-                    // never advances acks would otherwise re-drive the tail
-                    // forever (unbounded duplicate writes). Bound the retries by
-                    // the reconnect budget, refreshed whenever a checkpoint makes
-                    // progress so a steadily-advancing ingest is never cut short.
-                    if committed > committed_before {
-                        deadline = std::time::Instant::now()
-                            .checked_add(self.reconnect_policy().max_duration());
-                    } else if crate::db::reconnect_deadline_expired(deadline) {
-                        return Err(err);
+        // This flag belongs to the whole DataFrame call, not a connection or
+        // the internal checkpoint used to retry its tail.
+        let mut published = false;
+        let result = (|| {
+            loop {
+                let committed_before = committed;
+                match drive_from_checkpoint(
+                    self,
+                    table,
+                    df,
+                    options,
+                    &mut committed,
+                    &mut published,
+                ) {
+                    Ok(()) => return Ok(()),
+                    Err(err) if err.code() != crate::ErrorCode::FailoverRetry => return Err(err),
+                    Err(err) => {
+                        // A failed attempt may have published part of its first
+                        // batch. Keep that uncertainty across replacement too.
+                        published |= err.in_doubt();
+                        // `reborrow_with_retry` returns as soon as a replacement
+                        // connection opens, so a server that accepts connections but
+                        // never advances acks would otherwise re-drive the tail
+                        // forever (unbounded duplicate writes). Bound the retries by
+                        // the reconnect budget, refreshed whenever a checkpoint makes
+                        // progress so a steadily-advancing ingest is never cut short.
+                        if committed > committed_before {
+                            deadline = std::time::Instant::now()
+                                .checked_add(self.reconnect_policy().max_duration());
+                        } else if crate::db::reconnect_deadline_expired(deadline) {
+                            return Err(err);
+                        }
+                        self.reborrow_with_retry(deadline)?;
                     }
-                    self.reborrow_with_retry(deadline)?;
                 }
             }
-        }
+        })();
+        result.map_err(|err: crate::Error| {
+            let in_doubt = published || err.in_doubt();
+            err.with_in_doubt(in_doubt)
+        })
     }
 }
 
@@ -536,6 +549,12 @@ impl crate::db::QuestDb {
     /// configured reconnect budget, and returns only once the whole `df` is
     /// committed. A re-driven tail can produce **duplicate rows** unless the
     /// destination table has `DEDUP UPSERT KEYS` covering them.
+    ///
+    /// On failure, [`Error::in_doubt`](crate::Error::in_doubt) covers the whole
+    /// DataFrame: it is true if any batch may have been delivered, including
+    /// batches confirmed by an earlier checkpoint. This also applies to local
+    /// validation failures after publication. A false flag does not make a
+    /// validation error retryable; correct the input first.
     ///
     /// [`TableName`]: crate::ingress::TableName
     /// [`ErrorCode::FailoverRetry`]: crate::ErrorCode::FailoverRetry
@@ -568,6 +587,7 @@ fn drive_from_checkpoint(
     df: &DataFrame,
     options: &PolarsIngestOptions<'_>,
     committed: &mut usize,
+    published: &mut bool,
 ) -> Result<()> {
     // No caller-named level falls back to the connect string's default — the
     // same level the store-and-forward senders use for this pool.
@@ -602,6 +622,7 @@ fn drive_from_checkpoint(
                 sender.flush_arrow_batch_at_now_and_wait(table, &rb, options.overrides, ack)?
             }
         }
+        *published = true;
         if checkpoint {
             // The ACKing flush committed the boundary covering every batch up
             // to and including this one.

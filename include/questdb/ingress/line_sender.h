@@ -284,10 +284,9 @@ typedef enum line_sender_error_code
      * a chunk too large for a single frame is split and each half published on
      * its own, so an earlier half can already be durably queued
      * (store-and-forward is at-least-once) when a later half hits the cap. The
-     * error is then delivery-unknown rather than known-not-delivered:
-     * `line_sender_error_not_delivered` is false, so resending that chunk would
-     * duplicate the rows its committed prefix already carried. Consult
-     * `line_sender_error_in_doubt` separately before replaying a larger source.
+     * error is then delivery-unknown rather than known-not-delivered - check
+     * `line_sender_error_in_doubt` before resending, or the rows the committed
+     * prefix already carried are duplicated.
      */
     line_sender_error_symbol_dict_full = 37,
 } line_sender_error_code;
@@ -449,22 +448,17 @@ questdb_error_code questdb_error_get_code(const questdb_error*);
 QUESTDB_CLIENT_API
 const char* questdb_error_msg(const questdb_error*, size_t* len_out);
 
-/** Whether replaying from the caller's previous confirmed boundary may
- *  duplicate data. The current input may be delivery-unknown, or an earlier
- *  direct publication may have committed even when the current input was not
- *  transmitted. A true result means replay requires an application-level
- *  deduplication guarantee. NULL-safe: a NULL input returns false. */
+/**
+ * Whether the failed operation may already have delivered its input. A true
+ * result means replay can duplicate data unless the application has its own
+ * deduplication guarantee.
+ *
+ * For a low-level flush, this does not track earlier independent flushes.
+ *
+ * NULL-safe: a NULL input returns false.
+ */
 QUESTDB_CLIENT_API
 bool questdb_error_in_doubt(const questdb_error*);
-
-/** Whether the specific input passed to the failed operation was provably not
- *  transmitted and may be retried independently. This is orthogonal to
- *  `questdb_error_in_doubt`: both may be true when the current input was not
- *  delivered but an earlier direct publication committed after the caller's
- *  previous checkpoint. A false result is conservative. NULL-safe: a NULL
- *  input returns false. */
-QUESTDB_CLIENT_API
-bool questdb_error_not_delivered(const questdb_error*);
 
 /** Clean up a client-wide error. Idempotent on NULL. */
 QUESTDB_CLIENT_API
@@ -483,31 +477,21 @@ QUESTDB_CLIENT_API
 const char* line_sender_error_msg(const line_sender_error*, size_t* len_out);
 
 /**
- * Whether replaying from the caller's previous confirmed boundary is unsafe
- * ("in doubt"). The current input may already have reached the server, or an
- * earlier direct publication may have committed even when the current input
- * was provably not transmitted.
+ * Whether the failed operation is *delivery-unknown* ("in doubt"): the current
+ * input's bytes may already have reached the server even though the call
+ * returned an error (e.g. a socket write that failed mid-frame, or a
+ * post-publish ACK wait that failed).
+ *
+ * For a low-level flush, this does not track earlier independent flushes.
  *
  * Independent of `line_sender_error_get_code`: a delivery-unknown failure
  * typically reports `line_sender_error_failover_retry`, yet that code alone
- * does NOT mean the source is safe to resend. When this returns `true`, only
- * replay from the earlier boundary if table-level dedup/upsert keys make
- * duplicate rows harmless. NULL-safe: passing NULL returns `false`.
+ * does NOT mean the input is safe to resend. When this returns `true`, only
+ * replay the same input if table-level dedup/upsert keys make duplicate rows
+ * harmless. NULL-safe: passing NULL returns `false`.
  */
 QUESTDB_CLIENT_API
 bool line_sender_error_in_doubt(const line_sender_error*);
-
-/**
- * Whether the specific input passed to the failed operation was provably not
- * transmitted and may be retried independently. This is distinct from
- * `line_sender_error_in_doubt`, which governs replay from the caller's earlier
- * checkpoint. Both may be true: retrying the retained current chunk is safe,
- * while replaying a larger source would duplicate an earlier committed prefix.
- * A false result is conservative and does not prove delivery. NULL-safe:
- * passing NULL returns `false`.
- */
-QUESTDB_CLIENT_API
-bool line_sender_error_not_delivered(const line_sender_error*);
 
 /** Clean up the error. */
 QUESTDB_CLIENT_API

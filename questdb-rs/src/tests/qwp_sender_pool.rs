@@ -3867,67 +3867,6 @@ fn store_and_forward_symbol_dict_full_rolls_back_and_keeps_flushing() {
 }
 
 #[test]
-fn direct_manual_failure_after_eager_commit_is_in_doubt() {
-    // The first publish-only direct flush is deliberately non-deferred: it is
-    // the connection's eager commit boundary. A later frame can fail before
-    // writing anything, but that does not make replaying the caller's whole
-    // source safe because the first row may already be committed.
-    let _cap = crate::ingress::TestDictCapGuard::new(1);
-    let server = MockServer::spawn_acking(1);
-    let db = QuestDb::connect(&conf_for(server.port(), "pool_reap=manual;")).unwrap();
-    let mut sender = db.borrow_direct_column_sender().unwrap();
-
-    let mut first = Chunk::new("trades");
-    append_one_symbol_row(&mut first, b"alpha", &[1_i64]);
-    sender.flush(&mut first).expect("eager commit publishes");
-
-    let mut second = Chunk::new("trades");
-    append_one_symbol_row(&mut second, b"bravo", &[2_i64]);
-    let err = sender
-        .flush(&mut second)
-        .expect_err("the second symbol exceeds the test dictionary cap");
-    assert_eq!(err.code(), ErrorCode::SymbolDictFull, "{}", err.msg());
-    assert!(
-        err.in_doubt(),
-        "a committed prefix makes whole-source replay unsafe even though the \
-         second frame was provably not delivered"
-    );
-    assert!(
-        err.not_delivered(),
-        "the retained second chunk itself remains safe to retry independently"
-    );
-    assert_eq!(second.row_count(), 1, "the undelivered chunk stays intact");
-}
-
-#[cfg(feature = "polars-ingress")]
-#[test]
-fn direct_arrow_failure_after_eager_commit_is_in_doubt() {
-    use crate::ingress::column_sender::ArrowColumnOverride;
-
-    let _cap = crate::ingress::TestDictCapGuard::new(1);
-    let server = MockServer::spawn_acking(1);
-    let db = QuestDb::connect(&conf_for(server.port(), "pool_reap=manual;")).unwrap();
-    let mut sender = db.borrow_direct_column_sender().unwrap();
-    let overrides = [ArrowColumnOverride::Symbol { column: "sym" }];
-
-    sender
-        .flush_arrow_batch_at_now("trades", &symbol_arrow_batch(vec!["alpha"]), &overrides)
-        .expect("eager Arrow commit publishes");
-    let err = sender
-        .flush_arrow_batch_at_now("trades", &symbol_arrow_batch(vec!["bravo"]), &overrides)
-        .expect_err("the second Arrow symbol exceeds the test dictionary cap");
-    assert_eq!(err.code(), ErrorCode::SymbolDictFull, "{}", err.msg());
-    assert!(
-        err.in_doubt(),
-        "the Arrow entry point must preserve the earlier commit boundary"
-    );
-    assert!(
-        err.not_delivered(),
-        "the failed current Arrow batch remains independently retryable"
-    );
-}
-
-#[test]
 fn a_full_symbol_dict_latches_the_direct_connection_so_reborrow_replaces_it() {
     // Regression (silent ingest stall). `reborrow_from_pool` is the direct
     // sender's documented failover primitive and the first thing a caller reaches
@@ -3959,19 +3898,10 @@ fn a_full_symbol_dict_latches_the_direct_connection_so_reborrow_replaces_it() {
 
     let mut second = Chunk::new("trades");
     append_one_symbol_row(&mut second, b"bravo", &[2_i64]);
-    let err = sender.flush(&mut second).unwrap_err();
     assert_eq!(
-        err.code(),
+        sender.flush(&mut second).unwrap_err().code(),
         ErrorCode::SymbolDictFull,
         "the second distinct symbol must exhaust the cap"
-    );
-    assert!(
-        !err.in_doubt(),
-        "the successful ACKing flush established a clean replay boundary"
-    );
-    assert!(
-        err.not_delivered(),
-        "the rejected current chunk was not sent"
     );
 
     // The whole point: the failover primitive must actually fail over. Unlatched
@@ -5906,10 +5836,6 @@ fn deferred_flush_reserves_slot_for_sync_commit() {
         !err.in_doubt(),
         "a pre-publication (not-delivered) failure is never in_doubt"
     );
-    assert!(
-        err.not_delivered(),
-        "the retained current chunk is affirmatively safe to retry"
-    );
     assert_eq!(
         chunk.row_count(),
         1,
@@ -6128,10 +6054,6 @@ fn flush_and_wait_ack_wait_failure_after_publish_clears_chunk() {
         err.in_doubt(),
         "a post-publication delivery-unknown failure must be flagged in_doubt \
          even though it reports FailoverRetry"
-    );
-    assert!(
-        !err.not_delivered(),
-        "a published current chunk must not be advertised as safe to retry"
     );
     assert!(
         chunk.is_empty(),
@@ -7393,6 +7315,91 @@ fn flush_polars_dataframe_retries_reborrow_connect_until_endpoint_recovers() {
     assert!(
         wait_until(Duration::from_secs(2), || recovery.accepted() >= 1),
         "the delayed recovery endpoint must eventually be used"
+    );
+}
+
+#[cfg(feature = "polars-ingress")]
+#[test]
+fn flush_polars_dataframe_validation_error_covers_published_prefix() {
+    use crate::ingress::polars::PolarsIngestOptions;
+    use polars::prelude::{IntoColumn, NamedFrom, PlSmallStr, Series};
+
+    // Reject UInt64 outside QuestDB LONG's range before publication, after
+    // one eager publication, and after a full 64-batch ACK checkpoint.
+    for prefix in [0, 1, 64] {
+        let (server, frames) = MockServer::spawn_acking_capturing(1);
+        let db = QuestDb::connect(&conf_for(server.port(), "")).unwrap();
+        let mut values = vec![1_u64; prefix];
+        values.push(u64::MAX);
+        let column = Series::new(PlSmallStr::from("i"), values.as_slice()).into_column();
+        let df = crate::polars_ffi::df_from_columns(vec![column]).unwrap();
+
+        let err = db
+            .flush_polars_dataframe("trades", &df, &PolarsIngestOptions::new().max_rows(1))
+            .unwrap_err();
+        assert_eq!(err.code(), ErrorCode::ArrowIngest, "{err}");
+        assert_eq!(err.in_doubt(), prefix != 0, "prefix={prefix}: {err}");
+        let fresh_error = db
+            .flush_polars_dataframe(
+                "trades",
+                &df.slice(prefix as i64, 1),
+                &PolarsIngestOptions::new(),
+            )
+            .unwrap_err();
+        assert!(!fresh_error.in_doubt(), "a new call starts with no history");
+        drop(db);
+        assert_eq!(data_frame_count(&frames), prefix, "prefix={prefix}");
+        assert_eq!(server.accepted(), 1);
+    }
+}
+
+#[test]
+fn direct_flush_error_does_not_aggregate_earlier_calls() {
+    let _cap = crate::ingress::TestDictCapGuard::new(1);
+    let server = MockServer::spawn_acking(1);
+    let db = QuestDb::connect(&conf_for(server.port(), "pool_reap=manual;")).unwrap();
+    let mut sender = db.borrow_direct_column_sender().unwrap();
+    let mut first = Chunk::new("trades");
+    append_one_symbol_row(&mut first, b"alpha", &[1_i64]);
+    sender.flush(&mut first).unwrap();
+
+    let mut second = Chunk::new("trades");
+    append_one_symbol_row(&mut second, b"bravo", &[2_i64]);
+    let err = sender.flush(&mut second).unwrap_err();
+    assert_eq!(err.code(), ErrorCode::SymbolDictFull);
+    assert!(!err.in_doubt(), "only the current chunk is classified");
+    assert_eq!(second.row_count(), 1);
+    sender.drop_on_return();
+}
+
+#[cfg(feature = "polars-ingress")]
+#[test]
+fn flush_polars_dataframe_failure_after_reconnect_keeps_call_status() {
+    use crate::ingress::polars::PolarsIngestOptions;
+    use polars::prelude::{IntoColumn, NamedFrom, PlSmallStr, Series};
+
+    let primary = MockServer::spawn_ack_then_close(1, 64);
+    let live = MockServer::spawn_acking(1);
+    let db = QuestDb::connect(&conf_for_endpoints(
+        &[primary.port(), live.port()],
+        "sender_pool_min=1;sender_pool_max=2;",
+    ))
+    .unwrap();
+    let mut values = vec![1_u64; 129];
+    values.push(u64::MAX);
+    let column = Series::new(PlSmallStr::from("i"), values.as_slice()).into_column();
+    let df = crate::polars_ffi::df_from_columns(vec![column]).unwrap();
+
+    let err = db
+        .flush_polars_dataframe("trades", &df, &PolarsIngestOptions::new().max_rows(1))
+        .unwrap_err();
+    assert_eq!(err.code(), ErrorCode::ArrowIngest, "{err}");
+    assert!(err.in_doubt());
+    assert_eq!(primary.accepted(), 1);
+    assert_eq!(
+        live.accepted(),
+        1,
+        "the call must have replaced its connection"
     );
 }
 
