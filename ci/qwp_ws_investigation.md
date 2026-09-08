@@ -29,11 +29,35 @@ after the first capture/failure, at most 12 repetitions, no new attempt after
 
 Builds 268394 and 268424 passed 40 natural-memory attempts each, with respectively
 504 and 555 completed probe cursors and maxima of 137.21 and 158.25 ms. No
-five-second query or observer-loss marker appeared. The next experiment uses
-three natural/warn/warn/natural cycles on one worker, with the same query probe.
-This is an exploratory resource perturbation, not a claim that original memory
-pressure was established. It tests whether real warning pressure can reproduce
-the prolonged query stage, rather than merely slowing WAL/ping traffic.
+five-second query or observer-loss marker appeared.
+
+Build 268431 passed its natural control, then failed pressure setup before the
+second workload started: all sampled kernel pressure levels remained normal
+through the 20-second gate. The allocator substantially increased compression,
+but that is not a valid warning-pressure test and says nothing about the
+original timeout's cause. Pressure is disabled for the next arm.
+
+The original startup prefix is measurably different: 72 failed SHOW COLUMNS
+lookups occurred during the 8.948517 seconds before the first QWP handshake.
+Across all 80 attempts above, only 1..3 lookups preceded that handshake, after
+28..374 ms. All recorded missing-table sequences match the seeded ALTER RNG.
+Thus the same seed did not restore the original ALTER RNG position at ingestion.
+
+The next 12 attempts gate producer connection until the real ALTER thread has
+received 72 actual table-not-found errors. Every query, table-choice draw and
+normal loop sleep still runs. No RNG is skipped or replaced. The gate has a
+30-second bound and rejects unexpected lookup outcomes; it is opt-in via
+`QWP_WS_STARTUP_LOOKUPS=72` and requires fuzz diagnostics. It releases producers
+after lookup 72; further missing lookups may occur while they connect. Artifacts
+must verify the resulting prefix. This restores a recorded scheduling prefix,
+not the unknown cause of the original nine-second startup delay or the later
+exact interleaving. Sender and SQL deadlines and data assertions are unchanged.
+Local Linux calibration passed the full test in 7.787 seconds with three CPUs,
+eight producers and the original server revision. All 72 gated table names
+matched the original recorded prefix exactly. Its JDK 25.0.4 and Linux filesystem
+make this a harness check, not a macOS resource-wait reproduction.
+
+### Optional pressure arm (currently disabled)
 
 `memory_pressure -l warn -s 1` applies real allocation pressure (no `-S`), with
 one-second regulation. Before releasing each paired-plan workload, the harness

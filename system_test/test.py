@@ -2624,6 +2624,19 @@ class TestQwpWsFuzz(QwpWsTestSupport, unittest.TestCase):
         diagnostics_enabled = (
             os.environ.get('QWP_WS_FUZZ_DIAGNOSTICS') == '1')
 
+        startup_gate = None
+        startup_prefix = int(os.environ.get('QWP_WS_STARTUP_LOOKUPS', '0'))
+        if startup_prefix:
+            if not diagnostics_enabled or fuzz.column_convert_prob <= 0:
+                raise ValueError('startup prefix requires diagnostics and ALTER workload')
+            from qwp_ws_startup_gate import StartupGate
+            startup_gate = StartupGate(startup_prefix, self._log)
+
+        def list_columns_for_alter(table_name):
+            if startup_gate is not None:
+                return startup_gate.lookup(self._list_columns, table_name)
+            return self._list_columns(table_name)
+
         def capture_diagnostics(reason: str):
             if not diagnostics_enabled:
                 return
@@ -2669,7 +2682,7 @@ class TestQwpWsFuzz(QwpWsTestSupport, unittest.TestCase):
                     name=f'qwp-ws-fuzz-producer-{thread_index}',
                     args=(
                         sender_id, producer_sf, load, fuzz, thread_seed_rng,
-                        tables, next_ts, record_failure))
+                        tables, next_ts, record_failure, startup_gate))
                 producer_threads.append(thread)
                 thread.start()
 
@@ -2681,7 +2694,7 @@ class TestQwpWsFuzz(QwpWsTestSupport, unittest.TestCase):
                     * fuzz.column_convert_prob))
                 alter_thread = qwp_ws_fuzz.AlterThread(
                     sql_query=sql_query,
-                    list_columns=self._list_columns,
+                    list_columns=list_columns_for_alter,
                     tables=list(tables.keys()),
                     convert_budget=budget,
                     rnd=self._master_rng.child(),
@@ -2759,7 +2772,7 @@ class TestQwpWsFuzz(QwpWsTestSupport, unittest.TestCase):
                 self.fail(str(e))
 
     def _producer_loop(self, sender_id, sf_root, load, fuzz, rnd,
-                       tables, next_ts, record_failure):
+                       tables, next_ts, record_failure, startup_gate=None):
         # A post-restart SFA replay storm can starve the server's accept loop
         # for ~1.5 min, so bounce variants need a wider drain budget; kept
         # equal so the reconnect sub-budget never trips first.
@@ -2789,6 +2802,8 @@ class TestQwpWsFuzz(QwpWsTestSupport, unittest.TestCase):
             reconnect_max_backoff_millis=250,
             close_flush_timeout_millis=budget_millis)
         try:
+            if startup_gate is not None:
+                startup_gate.wait()
             sender = self._connect_sender(conf)
         except Exception as e:  # noqa: BLE001
             record_failure(f'connect failed for {sender_id}: {e}')

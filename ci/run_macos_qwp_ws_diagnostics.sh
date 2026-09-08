@@ -94,6 +94,7 @@ snapshot_host() {
         echo "fs_trace=$FS_TRACE server_revision=$SERVER_REVISION"
         echo "runs=$RUN_COUNT max_seconds=$MAX_SECONDS stop_on_capture=$STOP_ON_CAPTURE"
         echo "pressure_plan=$PRESSURE_PLAN"
+        echo "startup_missing_lookups=${QWP_WS_STARTUP_LOOKUPS:-0}"
         echo "min_free_kb=$MIN_FREE_KB"
         echo "system_trace=$SYSTEM_TRACE trace_capture_limit=2 controls=1,6,11"
         find questdb/core/target -maxdepth 1 -type f \

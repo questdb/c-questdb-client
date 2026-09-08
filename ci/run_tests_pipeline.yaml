@@ -458,9 +458,12 @@ stages:
               displayName: "Repeat only add-columns until slow query or failure"
               timeoutInMinutes: 30
               env:
-                # Three natural/warn/warn/natural cycles, one host, same test.
+                # Restore the original 72 missing-table ALTER lookups before
+                # producer connection. This is a scheduling perturbation, not
+                # a recreation of the unknown original startup delay.
                 # No new attempt after ten minutes; stop at first capture.
                 QWP_WS_DIAGNOSTIC_RUNS: "12"
+                QWP_WS_STARTUP_LOOKUPS: "72"
                 QWP_WS_MAX_SECONDS: "600"
                 QWP_WS_STOP_ON_CAPTURE: "1"
                 QWP_WS_SYSTEM_TRACE: "0"
@@ -469,7 +472,7 @@ stages:
                 QWP_WS_MIN_FREE_KB: "2097152"
                 QWP_WS_DIAGNOSTICS_DIR: >-
                   $(Build.ArtifactStagingDirectory)/qwp-ws-macos-diagnostics
-                QWP_WS_MEMORY_PRESSURE: paired
+                QWP_WS_MEMORY_PRESSURE: natural
                 QWP_WS_FS_TRACE: "0"
           - bash: |
               # xctrace may create private root-owned files despite umask.
