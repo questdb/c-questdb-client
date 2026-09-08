@@ -267,11 +267,21 @@ mechanically, not a test to write once.
 ## 10. Migration for `questdb-rs-ffi`
 
 The C ABI is updated in the same change — it is both the proof the new API is
-sufficient and the largest single reduction in `unsafe`. Its public C surface
-does not change: `qwp_reader_cursor` keeps its handle semantics, but its
-internals become `OwnedCursor<OwnedReader>` with no `transmute`, and the batch
-handle becomes an accessor over the cursor rather than a laundered
-`BatchView<'static>`.
+sufficient and the place where the *unsound-capable* subset of `unsafe` is
+eliminated: 7 lifetime launders, 3 self-referential `ManuallyDrop` slots, and an
+aliasing invariant maintained by a comment. Its public C surface does not
+change: `qwp_reader_cursor` keeps its handle semantics, but its internals become
+`OwnedCursor<OwnedReader>` with no `transmute`, and the batch handle becomes an
+accessor over the cursor rather than a laundered `BatchView<'static>`.
+
+This is not a reduction in the *volume* of `unsafe` and should not be claimed as
+one. Measured on `questdb-rs-ffi/src/egress.rs`: `transmute` 7 → 0 and
+`ManuallyDrop` 14 → 0, while `unsafe {` blocks went 124 → **132** and
+`unsafe fn` 13 → **20** — named helpers replacing open-coded raw-pointer sites.
+The residual `unsafe` is irreducible `*mut T → &T` work at the C boundary: a C
+ABI has raw pointers in its signatures by definition, and no owning type on the
+Rust side removes them. What changes is that none of it can any longer produce a
+handle whose lifetime is a lie.
 
 If the C batch surface cannot be preserved exactly, that is a finding worth
 surfacing rather than working around — say so and stop, rather than

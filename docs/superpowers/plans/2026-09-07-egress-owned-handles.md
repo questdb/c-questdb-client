@@ -1129,7 +1129,9 @@ git commit -m "test: prove the owning egress API needs no unsafe"
 
 ### Task 8: Migrate `questdb-rs-ffi` off the laundered handles
 
-The C ABI is both the proof the new API is sufficient and the largest single reduction in `unsafe`.
+The C ABI is both the proof the new API is sufficient and the place where the *unsound-capable* subset of `unsafe` is eliminated: 7 lifetime launders, 3 self-referential `ManuallyDrop` slots, and an aliasing invariant maintained by a comment.
+
+It is **not** a reduction in the volume of `unsafe`, and the task must not be judged on one. Measured on `questdb-rs-ffi/src/egress.rs`: `transmute` 7 → 0 and `ManuallyDrop` 14 → 0, while `unsafe {` blocks went 124 → **132** and `unsafe fn` 13 → **20**. The increase is benign — named helpers (`cursor_mut_or_err`, `defer_query_err`, ...) replacing open-coded raw-pointer sites, each small and locally checkable. What remains is irreducible `*mut T → &T` work at the C boundary, which no owning type can remove: a C ABI has raw pointers in its signatures by definition.
 
 **Files:**
 - Modify: `questdb-rs-ffi/src/egress.rs` (4,206 lines; 7 `transmute` sites)
