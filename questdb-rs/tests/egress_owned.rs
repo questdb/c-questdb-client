@@ -256,6 +256,71 @@ fn dropping_an_owned_cursor_mid_stream_retires_the_connection() {
     );
 }
 
+/// `into_owner` on a *still-active* cursor must run the same teardown as
+/// `Drop`: the stream is abandoned mid-flight, so the connection handed back
+/// has to be a retired one, not a live one carrying an unread remainder.
+///
+/// This is the sibling of `dropping_an_owned_cursor_mid_stream_retires_the_connection`
+/// for the hand-back path, and it is deliberately distinct from
+/// `into_owner_returns_a_reusable_reader`: that test drains first, which
+/// clears `cursor_active` and makes `into_owner`'s cleanup call a no-op. Only
+/// an undrained cursor exercises it. The C ABI reaches this path through
+/// `qwp_reader_cursor_free`, but `questdb-rs` ships standalone on crates.io,
+/// so the contract has to be pinned here too.
+///
+/// Observable proof, same as the drop sibling: the retired reader cannot be
+/// recycled, so the next `take_reader` has to dial a second connection.
+#[test]
+fn into_owner_mid_stream_retires_the_connection() {
+    let abandoned = vec![
+        server_info(),
+        Action::AwaitQueryRequest,
+        Action::SendBatch {
+            batch_seq: 0,
+            column: BatchColumn::Long(vec![1, 2, 3]),
+        },
+        Action::SendBatch {
+            batch_seq: 1,
+            column: BatchColumn::Long(vec![4, 5, 6]),
+        },
+    ];
+    let server = MockServer::start(vec![abandoned, script(1)]);
+    let db = QuestDb::connect(&pool_conf(&server)).expect("connect");
+
+    let mut cursor = db
+        .take_reader()
+        .expect("take_reader")
+        .query("SELECT 1")
+        .execute()
+        .expect("execute");
+    assert!(
+        cursor.next_batch().expect("first batch"),
+        "the scripted batch must arrive"
+    );
+    assert!(
+        !cursor.connection_reusable(),
+        "a mid-stream cursor's connection is not reusable"
+    );
+
+    // Handed back mid-stream, with a second batch still en route.
+    let reader = cursor.into_owner();
+    drop(reader);
+
+    let mut fresh = db
+        .take_reader()
+        .expect("take_reader after hand-back")
+        .query("SELECT 1")
+        .execute()
+        .expect("execute on a fresh connection");
+    while fresh.next_batch().expect("drain") {}
+    assert!(fresh.terminal().is_some());
+    assert_eq!(
+        server.accepts(),
+        2,
+        "into_owner on an undrained cursor must retire the connection, forcing a redial"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Batch accessors on `OwnedCursor`
 // ---------------------------------------------------------------------------
@@ -379,6 +444,25 @@ fn owned_batch_accessors_match_the_borrowing_batchview() {
     let expected_batch_seq = view.batch_seq();
     let expected_schema_len = view.schema().len();
     drop(cursor);
+
+    // Anti-vacuity: every "expected" above is read off the *borrowing* path,
+    // so a regression in the shared `DecodedBatch::column_view` would move
+    // both arms together and the parity assertions below would still pass.
+    // Pin the borrowing arm against the fixture's absolute values first, so a
+    // shared-decoder regression fails here rather than sailing through.
+    assert_eq!(
+        expected_long, longs,
+        "borrowing path must decode the fixture's LONG column, else the parity check below is vacuous"
+    );
+    assert_eq!(
+        expected_double, doubles,
+        "borrowing path must decode the fixture's DOUBLE column, else the parity check below is vacuous"
+    );
+    assert_eq!(
+        (expected_rows, expected_cols, expected_schema_len),
+        (3, 2, 2),
+        "fixture shape must be 3 rows x 2 columns, else the parity check below is vacuous"
+    );
 
     // Owning path: the same, through the accessors.
     let server_b = MockServer::start(vec![script]);

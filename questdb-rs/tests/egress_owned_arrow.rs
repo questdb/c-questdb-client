@@ -92,13 +92,26 @@ fn boxed_dyn_record_batch_reader_streams_to_completion() {
 }
 
 /// Abandoning the stream part-way is what a LIMIT or an error does. It must
-/// not panic, and must release the reader back to the pool.
+/// not panic, and must retire the connection rather than recycle it with an
+/// unread remainder still on the wire.
+///
+/// `lazy_connect=on` is load-bearing: without it the pool dials eagerly at
+/// `connect()` time and `server.accepts()` stops being a usable signal for
+/// *this* test's dials. With it, the accept count is the observable — a
+/// regression that recycled the torn connection instead of retiring it would
+/// leave `accepts() == 1`, whereas merely asserting that a later
+/// `take_reader()` succeeds cannot tell the two apart. Same shape as
+/// `dropping_an_owned_cursor_mid_stream_retires_the_connection` in
+/// `egress_owned.rs`.
 #[test]
 fn abandoning_the_stream_releases_the_pooled_reader() {
     let abandoned = batches_script(&[(0, vec![1, 2, 3]), (1, vec![4, 5])]);
     let follow_up = batches_script(&[(0, vec![9])]);
     let server = MockServer::start(vec![abandoned, follow_up]);
-    let conf = format!("ws::addr={};query_pool_max=1;", server.url());
+    let conf = format!(
+        "ws::addr={};lazy_connect=on;query_pool_max=1;",
+        server.url()
+    );
     let db = QuestDb::connect(&conf).expect("connect");
 
     {
@@ -115,8 +128,24 @@ fn abandoning_the_stream_releases_the_pooled_reader() {
     }
 
     // Only succeeds if the abandoned reader was released (or retired,
-    // freeing pool capacity for a fresh dial).
-    let _again = db.take_reader().expect("reader must be available again");
+    // freeing pool capacity for a fresh dial). Driving the follow-up query
+    // to completion proves the connection it ran on is intact, not a
+    // recycled half-read one.
+    let mut again = db
+        .take_reader()
+        .expect("reader must be available again")
+        .query("SELECT 1")
+        .execute()
+        .expect("execute on a fresh connection")
+        .into_arrow_reader()
+        .expect("into_arrow_reader");
+    let rows: usize = (&mut again).map(|b| b.expect("batch").num_rows()).sum();
+    assert_eq!(rows, 1, "the follow-up script's single row must arrive");
+    assert_eq!(
+        server.accepts(),
+        2,
+        "the abandoned connection must have been retired, forcing a redial"
+    );
 }
 
 /// A statement that produces no batch at all (DDL) must not be treated as
