@@ -120,7 +120,7 @@ snapshot_host() {
         echo "disk_pattern=$DISK_PATTERN mapped_max_file_bytes=1048576 mapped_load_pacing_seconds=0.01"
         echo "min_free_kb=$MIN_FREE_KB"
         echo "system_trace=$SYSTEM_TRACE trace_capture_limit=2 controls=1,6,11"
-        echo "kernel_capture=$KERNEL_CAPTURE kernel_unrecorded_control=1"
+        echo "kernel_capture=$KERNEL_CAPTURE ping_trigger_consecutive_failures=2 memory_heartbeat=1"
         find questdb/core/target -maxdepth 1 -type f \
             -name 'questdb*-SNAPSHOT.jar' \
             -exec shasum -a 256 {} \;
@@ -263,8 +263,9 @@ for run_number in $(seq 1 "$RUN_COUNT"); do
         break
     fi
     mkdir -p "$run_dir/tmp"
+    touch "$run_dir/memory-heartbeat-enabled"
     [[ "$traced" == "0" ]] || touch "$run_dir/system-trace-enabled"
-    if [[ "$KERNEL_CAPTURE" != "off" && "$run_number" != "1" ]]; then
+    if [[ "$KERNEL_CAPTURE" != "off" ]]; then
         touch "$run_dir/kernel-stacks-enabled"
         [[ "$KERNEL_CAPTURE" != "ping" ]] || touch "$run_dir/kernel-ping-capture-enabled"
     fi

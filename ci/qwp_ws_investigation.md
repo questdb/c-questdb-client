@@ -4,9 +4,42 @@ Status: server progress interruption observed; root cause **not established**.
 This branch is diagnostic only. Keep sender timeouts and correctness assertions
 unchanged. Azure PR 200 allocates only one macOS worker, running only
 `TestQwpWsFuzz.test_add_columns` with the focused query-stage probe below when
-workload mode is enabled. The current default is a paired mapped-file perturbation.
+workload mode is enabled. The current default follows the severe filesystem
+episode captured in build 268479.
 
-## Current action: mapped-file shrink with slow-query capture
+## Current action: earlier kernel capture and memory-buffered heartbeat
+
+Build 268479 failed in the first low-rate control attempt: seven producers
+reported close-drain timeout, 24 pings failed, and the server needed forced
+shutdown. Only 18 helper cycles (1.125 MiB application writes) ran. Its final
+grow/ftruncate interval lasted 88.783 seconds with 79 microseconds process CPU.
+The helper starts no new cycle after 60 seconds; this in-flight call exceeded
+that bound. It is not an intentional 89-second sleep or heavy-write load.
+
+The independent heartbeat's 89.260-second gap included 88.922 seconds inside
+its prior log-write call. The gap alone therefore does not establish a whole-VM
+scheduling pause. All sampled guest pressure levels were normal (1), with no
+swap. Earlier dumps show HTTP workers in truncate, copy and allocation; WAL
+apply workers are also in allocation. No O3-held Java monitor is established.
+Only two observed SHOW COLUMNS cursors ran, both completed (51.153 and 2.398 ms):
+the original already-started long-query signature is still not reproduced.
+
+The first attempt used the ordinary native sampler, which timed out without a
+report. The next bounded four-attempt paired run permits kernel capture on
+EVERY attempt, including the first, after two consecutive one-second ping
+failures (or existing query/observer/workload triggers). This targets sustained
+HTTP loss before the log-writing observer becomes blocked. Single short ping
+failures do not trigger kernel capture. No sampler starts before the anomaly.
+
+The independent heartbeat now stores at most 8192 events in memory and writes
+them on stop, with explicit loss rejection if capacity is exceeded. Its gap
+measurements no longer include per-event file writes; buffered records are
+labelled. No ramdisk file or /tmp path is introduced. Main ping/capture logs
+still write to disk and can be delayed by filesystem stalls; this does not
+pretend to eliminate every observation limit. Test deadlines and helper bounds
+remain unchanged; stop after first capture/failure and use only one Mac.
+
+## Completed arm: mapped-file shrink with slow-query capture
 
 Build 268475 completed all four attempts and 56 query cursors (maximum 130 ms).
 Its helper overlapped the workload, but a source audit found a confound:

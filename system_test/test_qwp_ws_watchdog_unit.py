@@ -35,6 +35,42 @@ class WatchdogTest(unittest.TestCase):
                     mock.patch.object(watchdog, 'capture', side_effect=lambda *_: stop.set()) as collect:
                 watchdog.watch(directory, 123, 9000, stop)
             self.assertIn('kernel resource follow-up: ping:', collect.call_args.args[2])
+            self.assertGreaterEqual(opener.open.call_count, 2)
+
+    def test_successful_ping_resets_kernel_failure_streak(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            for name in ('start-test', 'show-columns-enabled', 'kernel-stacks-enabled',
+                         'kernel-ping-capture-enabled'):
+                (directory / name).touch()
+            stop = threading.Event()
+            response = mock.MagicMock()
+            response.__enter__.return_value.status = 204
+            opener = mock.Mock()
+            opener.open.side_effect = [TimeoutError(), response, TimeoutError(), TimeoutError()]
+            with mock.patch.object(watchdog.urllib.request, 'build_opener', return_value=opener), \
+                    mock.patch.object(watchdog, 'capture', side_effect=lambda *_: stop.set()) as collect:
+                watchdog.watch(directory, 123, 9000, stop)
+            collect.assert_called_once()
+            self.assertEqual(opener.open.call_count, 4)
+
+    def test_memory_heartbeat_does_not_write_until_stop(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            (directory / 'memory-heartbeat-enabled').touch()
+            stop = mock.Mock()
+            observed = []
+
+            def wait(_):
+                self.assertFalse((directory / 'heartbeat.jsonl').exists())
+                observed.append(1)
+                return len(observed) == 4
+
+            stop.wait.side_effect = wait
+            watchdog.heartbeat(directory, stop, threading.Event())
+            rows = [json.loads(line) for line in (directory / 'heartbeat.jsonl').read_text().splitlines()]
+            self.assertEqual(len(rows), 3)
+            self.assertTrue(all(row['buffered'] and row['previous_write_ms'] == 0 for row in rows))
 
     def test_kernel_capture_finishes_before_jvm_dump_without_second_sampler(self):
         with tempfile.TemporaryDirectory() as tmp:

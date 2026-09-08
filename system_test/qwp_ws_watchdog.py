@@ -6,6 +6,7 @@ lets us identify one source of observer delay). All artifacts stay in run_dir.
 """
 
 import argparse
+from collections import deque
 import json
 import os
 from pathlib import Path
@@ -27,6 +28,29 @@ def write_event(stream, event, **fields):
 
 
 def heartbeat(run_dir, stop, delayed):
+    if (run_dir / 'memory-heartbeat-enabled').exists():
+        # A filesystem stall must not stall the scheduling observer itself.
+        # Keep at most ~34 minutes at 4 Hz; report loss explicitly if exceeded.
+        records = deque(maxlen=8192)
+        dropped = 0
+        previous = time.monotonic()
+        while not stop.wait(0.25):
+            now = time.monotonic()
+            gap_ms = (now - previous) * 1000
+            previous = now
+            if gap_ms > 1000:
+                delayed.set()
+            if len(records) == records.maxlen:
+                dropped += 1
+            records.append(dict(event='heartbeat', wall_ns=time.time_ns(),
+                                monotonic_ns=time.monotonic_ns(), gap_ms=gap_ms,
+                                previous_write_ms=0, buffered=True))
+        with (run_dir / 'heartbeat.jsonl').open('w') as log:
+            for record in records:
+                log.write(json.dumps(record) + '\n')
+        if dropped:
+            (run_dir / 'capture-error').write_text(f'memory heartbeat dropped {dropped} events\n')
+        return
     with (run_dir / 'heartbeat.jsonl').open('w') as log:
         previous = time.monotonic()
         previous_write_ms = 0.0
@@ -160,6 +184,7 @@ def watch(run_dir, pid, port, stop):
     pulse.start()
     collector = None
     query_observer = QueryObserverProgress(run_dir)
+    ping_failures = 0
     # Do not inherit proxy settings for the loopback probe.
     opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
     try:
@@ -196,6 +221,7 @@ def watch(run_dir, pid, port, stop):
                     write_event(log, 'ping', elapsed_ms=(time.monotonic() - started) * 1000,
                                 started_wall_ns=started_wall_ns, error=reason)
                 request = run_dir / 'capture-request'
+                ping_failures = ping_failures + 1 if reason else 0
                 if (run_dir / 'show-columns-enabled').exists():
                     # Keep ping/heartbeat telemetry, but reserve invasive capture
                     # for a slow query or an actual workload failure in this arm.
@@ -205,7 +231,7 @@ def watch(run_dir, pid, port, stop):
                     observer_reason = query_observer.check(time.monotonic())
                     if reason is None:
                         reason = observer_reason
-                    if reason is None and ping_reason and (run_dir / 'kernel-ping-capture-enabled').exists():
+                    if reason is None and ping_reason and ping_failures >= 2 and (run_dir / 'kernel-ping-capture-enabled').exists():
                         reason = 'kernel resource follow-up: ' + ping_reason
                 if request.exists():
                     reason = request.read_text()
