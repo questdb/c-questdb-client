@@ -398,7 +398,7 @@ stages:
               pathToPublish: $(Build.ArtifactStagingDirectory)/qdb-log-vs-master-$(Agent.OS).zip
               artifactName: qdb-log-vs-master-$(Agent.OS)
       - job: TestQwpWsFuzz
-        displayName: "QWP/WS add-columns onset diagnostics (macOS hosted)"
+        displayName: "QWP/WS add-columns repeated-load diagnostics (macOS hosted)"
         condition: eq(variables['Build.SourceBranch'], variables['QWP_WS_DIAGNOSTIC_REF'])
         strategy:
           matrix:
@@ -409,7 +409,7 @@ stages:
             replica-b:
               imageName: "macOS-15-arm64"
               diagnosticReplica: "b"
-              diagnosticFsTrace: "1"
+              diagnosticFsTrace: "0"
         pool:
           vmImage: $(imageName)
         timeoutInMinutes: 90
@@ -436,9 +436,13 @@ stages:
               jdkDirectory: "$(JAVA_HOME)"
               options: "-s $(MAVEN_SETTINGS_FILE) -DskipTests -Pbuild-web-console$(CLIENT_PROFILE) $(MAVEN_RUN_OPTS)"
           - bash: bash ci/run_macos_qwp_ws_diagnostics.sh
-            displayName: "Reproduce QWP/WS add-columns stall"
+            displayName: "Loop unchanged QWP/WS test on the same worker"
+            timeoutInMinutes: 30
             env:
-              QWP_WS_DIAGNOSTIC_RUNS: "20"
+              QWP_WS_DIAGNOSTIC_RUNS: "60"
+              QWP_WS_MAX_SECONDS: "1200"
+              QWP_WS_STOP_ON_CAPTURE: "0"
+              QWP_WS_MIN_FREE_KB: "2097152"
               QWP_WS_DIAGNOSTICS_DIR: >-
                 $(Build.ArtifactStagingDirectory)/qwp-ws-macos-diagnostics
               QWP_WS_MEMORY_PRESSURE: natural

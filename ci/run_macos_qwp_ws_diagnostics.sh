@@ -16,6 +16,17 @@ readonly FUZZ_SEED="0x268579c36b106b74"
 readonly BUILD_MODE_SEED="7856154056746654427"
 readonly SERVER_REVISION="12a33d651e51e2682e7a448c8db5168fc72dfad3"
 readonly FS_TRACE="${QWP_WS_FS_TRACE:-0}"
+readonly STOP_ON_CAPTURE="${QWP_WS_STOP_ON_CAPTURE:-1}"
+readonly MAX_SECONDS="${QWP_WS_MAX_SECONDS:-1200}"
+readonly MIN_FREE_KB="${QWP_WS_MIN_FREE_KB:-2097152}"
+
+if [[ ! "$RUN_COUNT" =~ ^[1-9][0-9]*$ ||
+      ! "$MAX_SECONDS" =~ ^[1-9][0-9]*$ ||
+      ! "$MIN_FREE_KB" =~ ^[1-9][0-9]*$ ||
+      ( "$STOP_ON_CAPTURE" != "0" && "$STOP_ON_CAPTURE" != "1" ) ]]; then
+    echo "Invalid repetition, time, disk-space or capture-stop setting" >&2
+    exit 2
+fi
 
 if [[ "$(uname -s)" != "Darwin" ]]; then
     echo "This diagnostic harness must run on macOS." >&2
@@ -66,6 +77,8 @@ snapshot_host() {
         git rev-parse HEAD
         git -C questdb rev-parse HEAD
         echo "fs_trace=$FS_TRACE server_revision=$SERVER_REVISION"
+        echo "runs=$RUN_COUNT max_seconds=$MAX_SECONDS stop_on_capture=$STOP_ON_CAPTURE"
+        echo "min_free_kb=$MIN_FREE_KB"
         find questdb/core/target -maxdepth 1 -type f \
             -name 'questdb*-SNAPSHOT.jar' \
             -exec shasum -a 256 {} \;
@@ -131,10 +144,16 @@ trap 'exit 143' TERM
 
 snapshot_host before
 
-vm_stat 1 >"$DIAG_DIR/vm-stat.log" 2>&1 &
+{
+    date -u '+monitor_start=%Y-%m-%dT%H:%M:%SZ interval_seconds=1'
+    exec vm_stat 1
+} >"$DIAG_DIR/vm-stat.log" 2>&1 &
 monitor_pids+=("$!")
 
-iostat -w 1 >"$DIAG_DIR/iostat.log" 2>&1 &
+{
+    date -u '+monitor_start=%Y-%m-%dT%H:%M:%SZ interval_seconds=1'
+    exec iostat -w 1
+} >"$DIAG_DIR/iostat.log" 2>&1 &
 monitor_pids+=("$!")
 
 (
@@ -149,7 +168,34 @@ monitor_pids+=("$!")
 monitor_pids+=("$!")
 
 overall_rc=0
+soak_started=$SECONDS
+stop_reason="run_limit"
 for run_number in $(seq 1 "$RUN_COUNT"); do
+    # Stay on this hosted VM for the whole loop. JVM/fixture restarts do not
+    # allocate a new worker. Let an in-flight test retain its original timeout.
+    if (( SECONDS - soak_started >= MAX_SECONDS )); then
+        stop_reason="time_budget"
+        break
+    fi
+    for pid in "${monitor_pids[@]}"; do
+        if ! kill -0 "$pid" 2>/dev/null; then
+            echo "Host monitor exited; refusing an unobserved soak" | tee -a "$DIAG_DIR/test.log"
+            overall_rc=2
+            stop_reason="host_monitor_failure"
+            break
+        fi
+    done
+    [[ "$overall_rc" -eq 0 ]] || break
+    free_kb="$(df -Pk "$DIAG_DIR" | awk 'NR == 2 { print $4 }')"
+    if [[ ! "$free_kb" =~ ^[0-9]+$ ]] || (( free_kb < MIN_FREE_KB )); then
+        echo "Disk-space safety stop: available_kb=$free_kb required_kb=$MIN_FREE_KB" \
+            | tee -a "$DIAG_DIR/test.log"
+        overall_rc=2
+        stop_reason="disk_space_guard"
+        break
+    fi
+    run_started=$SECONDS
+    run_epoch="$(date -u '+%s')"
     run_dir="$DIAG_DIR/run-$run_number"
     ready_file="$run_dir/server-ready"
     go_file="$run_dir/start-test"
@@ -159,6 +205,12 @@ for run_number in $(seq 1 "$RUN_COUNT"); do
     watchdog_pid_file="$run_dir/watchdog.pid"
     # Keep Python store-and-forward buffers and JVM temporary files on the
     # worker's real filesystem. Never inherit a possibly memory-backed /tmp.
+    if [[ -e "$run_dir" ]]; then
+        echo "Refusing to reuse existing diagnostic artifacts: $run_dir" >&2
+        overall_rc=2
+        stop_reason="existing_artifacts"
+        break
+    fi
     mkdir -p "$run_dir/tmp"
 
     echo "=== run=$run_number pressure=$PRESSURE_MODE seed=$FUZZ_SEED "\
@@ -231,8 +283,12 @@ for run_number in $(seq 1 "$RUN_COUNT"); do
     TMPDIR="$run_dir/tmp" \
         python3 system_test/test.py run --repo ./questdb \
             TestQwpWsFuzz.test_add_columns -v \
-            2>&1 | tee -a "$DIAG_DIR/test.log"
-    test_rc=${PIPESTATUS[0]}
+            2>&1 | tee -a "$DIAG_DIR/test.log" "$run_dir/test.log"
+    test_status=("${PIPESTATUS[@]}")
+    test_rc=${test_status[0]}
+    if [[ "${test_status[1]}" -ne 0 && "$test_rc" -eq 0 ]]; then
+        test_rc=2
+    fi
     if [[ ! -f "$run_dir/workload-finished" ||
           -f "$run_dir/watchdog-helper-failed" ||
           ! -s "$run_dir/heartbeat.jsonl" ||
@@ -297,16 +353,33 @@ for run_number in $(seq 1 "$RUN_COUNT"); do
          "finished=$(date -u '+%Y-%m-%dT%H:%M:%SZ') ===" \
         | tee -a "$DIAG_DIR/test.log"
 
+    python3 ci/summarize_qwp_ws_run.py "$run_dir" \
+        --run "$run_number" --started "$run_epoch" \
+        --duration "$((SECONDS - run_started))" \
+        --soak-elapsed "$((SECONDS - soak_started))" \
+        --free-kb "$free_kb" --returncode "$test_rc" \
+        | tee -a "$DIAG_DIR/runs.jsonl"
+    summary_status=("${PIPESTATUS[@]}")
+    if [[ ( "${summary_status[0]}" -ne 0 || "${summary_status[1]}" -ne 0 ) && "$test_rc" -eq 0 ]]; then
+        test_rc=2
+    fi
+
     if [[ "$test_rc" -ne 0 ]]; then
         overall_rc="$test_rc"
+        stop_reason="test_or_diagnostic_failure"
         break
     fi
     if [[ -f "$run_dir/capture-started" ]]; then
-        echo "Onset captured; ending this replica to inspect evidence" \
+        echo "Onset captured; test passed; stop_on_capture=$STOP_ON_CAPTURE" \
             | tee -a "$DIAG_DIR/test.log"
-        break
+        if [[ "$STOP_ON_CAPTURE" == "1" ]]; then
+            stop_reason="onset_capture"
+            break
+        fi
     fi
 done
 
+echo "=== soak stop=$stop_reason elapsed_seconds=$((SECONDS - soak_started)) rc=$overall_rc ===" \
+    | tee -a "$DIAG_DIR/test.log"
 snapshot_host after
 exit "$overall_rc"

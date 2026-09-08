@@ -51,10 +51,38 @@ Both replicas use server `12a33d651e51e2682e7a448c8db5168fc72dfad3`, Temurin
 and JVM `ActiveProcessorCount=3`. The managed hosted macOS image is still
 moving; record its version, do not call this an exact environment reproduction.
 
-Replica A has lightweight monitoring; replica B additionally runs continuous
-`fs_usage`. Each runs at most 20 attempts and stops at its first capture or test
-failure. No synthetic memory pressure. Store-and-forward, Java temporary data,
-and diagnostics are explicitly on the worker filesystem, not `/tmp`.
+Both replicas now use lightweight monitoring and loop the unchanged test up to
+60 times on their respective hosted VM. Do not schedule each attempt as a new
+job: that would replace the VM instead of testing cumulative host load. A fresh
+JVM and fixture are installed for each attempt, with no added cooldown; the
+test's existing internal waits and setup/teardown remain unchanged.
+
+The prior 20-attempt configuration stopped at the first onset capture, including
+a recovered one-second ping timeout. The soak continues after such captures
+when the test passes. It stops immediately on a test/diagnostic failure, refuses
+to start another attempt after 20 minutes, and stops below 2 GiB free space.
+The in-flight test keeps its original timeouts; a 30-minute pipeline step limit
+is the outer safety bound. Artifact publishing remains unconditional.
+
+Continuous `fs_usage` is disabled on both replicas so its large trace output
+does not become the soak's disk workload. Onset thread dumps and native samples,
+JVM pause logs, per-second `iostat`/`vm_stat`, and five-second memory/process
+snapshots remain enabled. No synthetic memory pressure or injected delays.
+Store-and-forward, Java temporary data, and diagnostics are explicitly on the
+worker filesystem, not `/tmp`.
+
+`runs.jsonl` records attempt index, UTC start, elapsed soak/attempt time, unittest
+duration, free space, completed drain maximum, ping errors/maximum, heartbeat
+maximum, capture reason and exit status. Raw per-attempt `test.log` and server
+logs are preserved. Compare successive fixed-seed attempts with the continuous
+host measurements; concurrent scheduling and schema interleavings can still vary.
+The first disk/VM-stat sample includes statistics since boot, not just this test.
+
+This tests cumulative degradation, not a known provider quota. Microsoft's
+[hosted-agent documentation](https://learn.microsoft.com/en-us/azure/devops/pipelines/agents/hosted?view=azure-devops)
+places these macOS machines in GitHub's macOS cloud; an Azure managed-disk burst
+credit policy must not be assumed. A worsening latency curve alone would not
+prove quota exhaustion, and no degradation would not exclude an unknown quota.
 
 The external Python watchdog probes `/ping` once per second with a one-second
 timeout. A separate thread records quarter-second heartbeats in another file.
@@ -81,7 +109,9 @@ previously its catch-all hid timeouts from the diagnostic callback.
 
 Artifact files: `watchdog.jsonl`, `heartbeat.jsonl`, `capture.jsonl`,
 `native-sample.txt`, `sample-command.log`, `jvm-pauses.log*`, `questdb-server.log`,
-`server.conf`, and on B `fs-usage.log`, plus host manifest/memory/iostat logs.
+`server.conf`, per-attempt `test.log`, `runs.jsonl`, plus host
+manifest/memory/iostat logs. `fs-usage.log` is only present when the optional
+continuous tracing setting is explicitly enabled (off in the current soak).
 SIGQUIT request time is not dump completion time. JVM dumps use the server log;
 native sampling and watchdog output do not depend on that logger. All files
 still share storage. `previous_write_ms` exposes one source of observer delay.
