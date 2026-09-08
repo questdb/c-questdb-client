@@ -4,9 +4,34 @@ Status: server progress interruption observed; root cause **not established**.
 This branch is diagnostic only. Keep sender timeouts and correctness assertions
 unchanged. Azure PR 200 allocates only one macOS worker, running only
 `TestQwpWsFuzz.test_add_columns` with the focused query-stage probe below when
-workload mode is enabled. The current default is four paired-memory attempts.
+workload mode is enabled. The current default is a kernel-stack recorder preflight.
 
-## Current action: actual warning-pressure workload
+## Current action: kernel-stack access check, no server build
+
+Build 268458 passed all four natural/warn/warn/natural attempts. Both warning
+gates reached kernel level 2 (after 30.369 and 20.408 seconds of polling), and
+all seven host samples during those two workloads remained level 2. There were
+67 completed query cursors, maximum 98.908 ms, with no slow-query marker. Both
+one-second ping failures occurred in the natural controls. This does not show
+warning pressure alone is sufficient, nor rule out other pressure conditions.
+
+The next job enables recorder-only mode and runs `kernel_wait_preflight.py`.
+It retains the installed spindump help, takes a three-second system sample at
+20 ms intervals, and requires named kernel frames in the report. A single
+helper performs at most 100 truncate/write/fsync cycles (6.25 MiB application
+writes), over at most ten seconds before starting another cycle. This is an
+access check, not a stall reproduction or a storage benchmark. Recorder time,
+free disk space and the job are bounded. No SIP or other security setting is
+changed. All files and recorder temporary storage are in the artifact directory.
+No dependency installation, client/server compilation or fuzz workload runs.
+
+Read-only historical scan: 73 failed scheduled builds since August 25 contained
+34 failed macOS fuzz tasks. Only the original 266336 reported a close-drain
+timeout; other task failures were startup, file-open or row-visibility errors.
+This is not proof that those runs had no slow queries; it found no second
+matching close-drain failure from the task logs.
+
+## Completed arm: actual warning-pressure workload
 
 Build 268431's warning state arrived only after its 20-second setup gate had
 expired. The next arm uses natural/warn/warn/natural, keeps the 72-lookup prefix

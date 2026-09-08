@@ -8,7 +8,7 @@ parameters:
   - name: qwpWsPreflightOnly
     displayName: "QWP diagnostics: verify recorder startup only (no builds/tests)"
     type: boolean
-    default: false
+    default: true
 
 variables:
   OS_MAPPING: none
@@ -413,6 +413,8 @@ stages:
         variables:
           ${{ if parameters.qwpWsDecodeOnly }}:
             diagnosticReplica: trace-decode
+          ${{ elseif parameters.qwpWsPreflightOnly }}:
+            diagnosticReplica: kernel-preflight
           ${{ else }}:
             diagnosticReplica: show-columns
         pool:
@@ -437,8 +439,8 @@ stages:
                 QWP_WS_DIAGNOSTICS_DIR: >-
                   $(Build.ArtifactStagingDirectory)/qwp-ws-macos-diagnostics
           - ${{ if and(parameters.qwpWsPreflightOnly, not(parameters.qwpWsDecodeOnly)) }}:
-            - bash: bash ci/prepare_qwp_ws_system_trace.sh
-              displayName: "Verify recorder startup and exported syscall/scheduler events"
+            - bash: python3 ci/diagnostics/kernel_wait_preflight.py "$QWP_WS_DIAGNOSTICS_DIR/kernel-preflight"
+              displayName: "Verify kernel wait stacks with a bounded filesystem smoke test"
               timeoutInMinutes: 5
               env:
                 QWP_WS_DIAGNOSTICS_DIR: >-
