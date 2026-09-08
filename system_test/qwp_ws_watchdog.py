@@ -18,6 +18,7 @@ import sys
 import threading
 import time
 import urllib.request
+import urllib.parse
 
 from qwp_ws_system_trace import request_stop
 
@@ -218,6 +219,74 @@ def capture(run_dir, pid, reason):
             (run_dir / 'capture-complete').touch()
 
 
+def query_reader(run_dir, port, stop, max_requests=300, max_seconds=60):
+    """Opt-in stress traffic, not an unchanged replay. Never retry a timeout.
+
+    One serial reader starts only after an existing fuzz cursor is observed.
+    Keep events in memory so diagnostic writes cannot precede an HTTP call.
+    Socket timeouts bound inactivity, not a slowly trickling response's lifetime.
+    """
+    records = deque(maxlen=602)
+
+    def record(event, **fields):
+        records.append(dict(event=event, wall_ns=time.time_ns(),
+                            monotonic_ns=time.monotonic_ns(), **fields))
+
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    waiting_since = time.monotonic()
+    table = None
+    try:
+        while not stop.is_set() and not (run_dir / 'workload-finished').exists():
+            try:
+                with (run_dir / 'show-columns.tsv').open() as source:
+                    for line in source.read(65536).splitlines():
+                        fields = line.split('\t')
+                        if len(fields) == 8 and fields[6] == 'cursor-enter' and fields[5].lower() in (
+                                'weather0', 'weather1', 'weather2', 'weather3'):
+                            table = fields[5]
+                            break
+            except FileNotFoundError:
+                pass
+            if table is not None:
+                break
+            if time.monotonic() - waiting_since >= 30:
+                record('gate_timeout')
+                return
+            stop.wait(.05)
+        if table is None:
+            return
+        record('ready', table=table, max_requests=min(max_requests, 300),
+               max_seconds=max_seconds, interval_seconds=.2)
+        started = time.monotonic()
+        url = f'http://127.0.0.1:{port}/exec?' + urllib.parse.urlencode(
+            {'query': f'SHOW COLUMNS FROM {table}'})
+        for index in range(min(max_requests, 300)):
+            if stop.is_set() or (run_dir / 'workload-finished').exists() or time.monotonic() - started >= max_seconds:
+                break
+            record('query_start', index=index, table=table)
+            try:
+                with opener.open(url, timeout=5) as response:
+                    body = response.read(1048577)
+                    if len(body) > 1048576:
+                        raise ValueError('diagnostic response exceeds 1 MiB')
+                    data = json.loads(body)
+                    if response.status != 200 or 'error' in data or 'dataset' not in data:
+                        raise ValueError('unsuccessful diagnostic SQL response')
+                record('query_finish', index=index, bytes=len(body))
+            except Exception as exc:
+                record('query_error', index=index, error=repr(exc))
+                break  # At most one abandoned request, never a retry backlog.
+            if stop.wait(.2):
+                break
+    except Exception as exc:
+        record('reader_error', error=repr(exc))
+    finally:
+        record('stopped')
+        with (run_dir / 'query-reader.jsonl').open('w') as output:
+            for row in records:
+                output.write(json.dumps(row) + '\n')
+
+
 def watch(run_dir, pid, port, stop):
     buffered = (run_dir / 'memory-heartbeat-enabled').exists()
     kernel = (run_dir / 'kernel-stacks-enabled').exists()
@@ -228,6 +297,7 @@ def watch(run_dir, pid, port, stop):
                              name='watchdog-heartbeat', daemon=True)
     pulse.start()
     collector = None
+    reader = None
     query_observer = QueryObserverProgress(run_dir)
     ping_failures = 0
     # Do not inherit proxy settings for the loopback probe.
@@ -240,6 +310,10 @@ def watch(run_dir, pid, port, stop):
                 if stop.wait(0.05):
                     return
             delayed.clear()  # Do not turn a pre-workload gate delay into onset.
+            if (run_dir / 'query-reader-enabled').exists():
+                reader = threading.Thread(target=query_reader, args=(run_dir, port, stop),
+                                          name='diagnostic-query-reader', daemon=True)
+                reader.start()
             while not stop.is_set():
                 if not pulse.is_alive():
                     raise RuntimeError('independent heartbeat stopped')
@@ -303,9 +377,12 @@ def watch(run_dir, pid, port, stop):
             except Exception as exc:
                 (run_dir / 'capture-error').write_text(repr(exc) + '\n')
         stop.set()
+        shutdown_deadline = time.monotonic() + (47 if kernel else 17)
         pulse.join(timeout=2)
+        if reader is not None:
+            reader.join(timeout=min(6, max(0, shutdown_deadline - time.monotonic())))
         if collector is not None:
-            collector.join(timeout=45 if (run_dir / 'kernel-stacks-enabled').exists() else 15)
+            collector.join(timeout=max(0, shutdown_deadline - time.monotonic()))
         (run_dir / 'watchdog-stopped').touch()
 
 

@@ -480,14 +480,17 @@ stages:
                 # Restore the original 72 missing-table ALTER lookups before
                 # producer connection. This is a scheduling perturbation, not
                 # a recreation of the unknown original startup delay.
-                # Return to the original query failure without the external
-                # filesystem helper. More repetitions amortize this one build.
+                # Stress reproduction: one serial 5 Hz SHOW COLUMNS reader
+                # stops on its first error. Only a 1 Hz tiny mapped-file probe;
+                # no high-rate filesystem load. This changes query traffic.
                 # Capture slow queries, observer loss or actual workload failure;
                 # short ping failures are telemetry only. Stop first capture.
                 # No new attempt after ten minutes, regardless of run count.
-                QWP_WS_DIAGNOSTIC_RUNS: "24"
+                QWP_WS_DIAGNOSTIC_RUNS: "4"
                 QWP_WS_KERNEL_CAPTURE: query
-                QWP_WS_DISK_LOAD: "0"
+                QWP_WS_QUERY_READER: "1"
+                QWP_WS_DISK_LOAD: "1"
+                QWP_WS_DISK_MODE: probe
                 QWP_WS_DISK_PATTERN: mapped
                 QWP_WS_STARTUP_LOOKUPS: "72"
                 QWP_WS_MAX_SECONDS: "600"

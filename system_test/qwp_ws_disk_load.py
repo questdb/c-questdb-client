@@ -142,9 +142,11 @@ def main():
     parser.add_argument('directory', type=Path)
     parser.add_argument('--run', type=int, required=True)
     parser.add_argument('--pattern', choices=('pwrite', 'mapped'), default='pwrite')
+    parser.add_argument('--mode', choices=('paired', 'probe'), default='paired')
     args = parser.parse_args()
     try:
-        run(args.directory, mode_for_run(args.run), pattern=args.pattern)
+        run(args.directory, 'probe' if args.mode == 'probe' else mode_for_run(args.run),
+            pattern=args.pattern)
     except Exception as exc:
         (args.directory / 'disk-load-error').write_text(repr(exc) + '\n')
         raise

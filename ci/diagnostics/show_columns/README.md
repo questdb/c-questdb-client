@@ -87,3 +87,23 @@ not the original macOS failure or performance equivalence.
 Build 268391 exposed the generated-manifest problem before any fuzz test ran.
 The strengthened smoke reproduces that failure with the old overlay and passes
 with the manifest-free overlay. Its result is not a server-stall reproduction.
+
+## Bounded query-overlap arm
+
+`QWP_WS_QUERY_READER=1` adds one external, serial HTTP reader after the first
+real fuzz cursor appears in the stage log. It repeatedly reads that observed
+weather table, with 200 ms between completed requests, at most 300 requests,
+and no new request after 60 seconds or workload completion. The five-second
+socket timeout matches the test; the first error stops the reader permanently.
+This is deliberately changed query traffic, not an unchanged original replay.
+
+`query-reader.jsonl` records request boundaries and errors using both clocks.
+Its bounded event buffer is persisted only when the reader stops. Match those
+boundaries and the table against server query IDs/stages; do not infer that a
+timed-out HTTP request ever started executing. A separate watchdog thread keeps
+the filesystem helper's process-CPU measurements free of reader CPU time.
+
+This arm uses `QWP_WS_DISK_MODE=probe` with the mapped helper: one tiny cycle
+per second, never the paired arm's high-rate load. Four attempts on one Mac,
+stopping on the first capture/failure, bound worker use. Slow query/observer
+loss/workload failure triggers capture; isolated ping failures remain telemetry.

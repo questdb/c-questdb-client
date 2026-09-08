@@ -22,6 +22,55 @@ def wait_for(predicate):
 
 
 class WatchdogTest(unittest.TestCase):
+    def test_query_reader_stops_on_first_timeout_and_buffers_events(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            (directory / 'show-columns.tsv').write_text('1\t2\t3\t4\tnetwork\tWEATHER2\tcursor-enter\t0\n')
+            opener = mock.Mock()
+
+            def fail(*args, **kwargs):
+                self.assertFalse((directory / 'query-reader.jsonl').exists())
+                self.assertIn('SHOW+COLUMNS+FROM+WEATHER2', args[0])
+                self.assertEqual(kwargs['timeout'], 5)
+                raise TimeoutError('injected')
+
+            opener.open.side_effect = fail
+            with mock.patch.object(watchdog.urllib.request, 'build_opener', return_value=opener):
+                watchdog.query_reader(directory, 9000, threading.Event())
+            self.assertEqual(opener.open.call_count, 1)
+            rows = [json.loads(line) for line in (directory / 'query-reader.jsonl').read_text().splitlines()]
+            self.assertEqual([row['event'] for row in rows], ['ready', 'query_start', 'query_error', 'stopped'])
+
+    def test_query_reader_request_budget_and_no_teardown_queries(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            (directory / 'show-columns.tsv').write_text('1\t2\t3\t4\tnetwork\tweather0\tcursor-enter\t0\n')
+            opener = mock.Mock()
+            response = mock.MagicMock()
+            response.__enter__.return_value.status = 200
+            response.__enter__.return_value.read.return_value = b'{"dataset": []}'
+            opener.open.return_value = response
+            stop = mock.Mock()
+            stop.is_set.return_value = False
+            stop.wait.return_value = False
+            with mock.patch.object(watchdog.urllib.request, 'build_opener', return_value=opener):
+                watchdog.query_reader(directory, 9000, stop, max_requests=2)
+                self.assertEqual(opener.open.call_count, 2)
+                self.assertEqual(stop.wait.call_args_list, [mock.call(.2), mock.call(.2)])
+                (directory / 'workload-finished').touch()
+                watchdog.query_reader(directory, 9000, stop)
+                self.assertEqual(opener.open.call_count, 2)
+
+    def test_query_reader_waits_for_real_cursor_not_observer_heartbeat(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            (directory / 'show-columns.tsv').write_text('1\t2\t0\t0\tobserver\t\theartbeat dropped=0\t0\n')
+            stop = threading.Event()
+            with mock.patch.object(watchdog.urllib.request, 'build_opener') as opener, \
+                    mock.patch.object(stop, 'wait', side_effect=lambda _: stop.set()):
+                watchdog.query_reader(directory, 9000, stop)
+            opener.return_value.open.assert_not_called()
+
     def test_kernel_ping_followup_is_opt_in_and_keeps_query_observer(self):
         with tempfile.TemporaryDirectory() as tmp:
             directory = Path(tmp)

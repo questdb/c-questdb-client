@@ -24,11 +24,15 @@ readonly QUERY_OVERLAY="${QWP_WS_SHOW_COLUMNS_OVERLAY:-}"
 readonly DISK_LOAD="${QWP_WS_DISK_LOAD:-0}"
 readonly DISK_PATTERN="${QWP_WS_DISK_PATTERN:-pwrite}"
 readonly KERNEL_CAPTURE="${QWP_WS_KERNEL_CAPTURE:-off}"
+readonly QUERY_READER="${QWP_WS_QUERY_READER:-0}"
+readonly DISK_MODE="${QWP_WS_DISK_MODE:-paired}"
 
 if [[ ! "$RUN_COUNT" =~ ^[1-9][0-9]*$ ||
       ! "$MAX_SECONDS" =~ ^[1-9][0-9]*$ ||
       ! "$MIN_FREE_KB" =~ ^[1-9][0-9]*$ ||
       ( "$DISK_LOAD" != "0" && "$DISK_LOAD" != "1" ) ||
+      ( "$QUERY_READER" != "0" && "$QUERY_READER" != "1" ) ||
+      ( "$DISK_MODE" != "paired" && "$DISK_MODE" != "probe" ) ||
       ( "$SYSTEM_TRACE" != "0" && "$SYSTEM_TRACE" != "1" ) ||
       ( "$STOP_ON_CAPTURE" != "0" && "$STOP_ON_CAPTURE" != "1" ) ]]; then
     echo "Invalid repetition, time, disk-space or capture-stop setting" >&2
@@ -64,6 +68,10 @@ if [[ "$DISK_PATTERN" != "pwrite" && "$DISK_PATTERN" != "mapped" ]]; then
 fi
 
 cd "$ROOT_DIR" || exit 2
+if [[ "$QUERY_READER" == "1" && -z "$QUERY_OVERLAY" ]]; then
+    echo "Query reader requires query-stage telemetry" >&2
+    exit 2
+fi
 if [[ "$DISK_LOAD" == "1" && ( -z "$QUERY_OVERLAY" || "$PRESSURE_PLAN" != "natural" ) ]]; then
     echo "Disk experiment requires query overlay and natural memory" >&2
     exit 2
@@ -270,6 +278,7 @@ for run_number in $(seq 1 "$RUN_COUNT"); do
     fi
     mkdir -p "$run_dir/tmp"
     touch "$run_dir/memory-heartbeat-enabled"
+    [[ "$QUERY_READER" != "1" ]] || touch "$run_dir/query-reader-enabled"
     [[ "$traced" == "0" ]] || touch "$run_dir/system-trace-enabled"
     if [[ "$KERNEL_CAPTURE" != "off" ]]; then
         touch "$run_dir/kernel-stacks-enabled"
@@ -398,7 +407,7 @@ for run_number in $(seq 1 "$RUN_COUNT"); do
         } >"$run_dir/pressure-at-gate.log" 2>&1
         if [[ "$DISK_LOAD" == "1" ]]; then
             TMPDIR="$run_dir/tmp" python3 system_test/qwp_ws_disk_load.py \
-                "$run_dir" --run "$run_number" --pattern "$DISK_PATTERN" >"$run_dir/disk-load-process.log" 2>&1 &
+                "$run_dir" --run "$run_number" --pattern "$DISK_PATTERN" --mode "$DISK_MODE" >"$run_dir/disk-load-process.log" 2>&1 &
             disk_load_pid=$!
             for _ in $(seq 1 50); do
                 [[ -f "$run_dir/disk-load-ready" ]] && break
@@ -508,6 +517,12 @@ for run_number in $(seq 1 "$RUN_COUNT"); do
         [[ "$test_rc" -ne 0 ]] || test_rc=2
     fi
     stop_watchdog
+    if [[ "$QUERY_READER" == "1" ]] &&
+            { ! grep -q '"event": "query_start"' "$run_dir/query-reader.jsonl" ||
+              ! grep -q '"event": "stopped"' "$run_dir/query-reader.jsonl"; }; then
+        echo "Query reader had no overlap or incomplete telemetry" | tee -a "$DIAG_DIR/test.log"
+        [[ "$test_rc" -ne 0 ]] || test_rc=2
+    fi
     stop_trace
     if [[ -f "$pressure_pid_file" ]]; then
         pressure_pid="$(sed -n '1p' "$pressure_pid_file")"
