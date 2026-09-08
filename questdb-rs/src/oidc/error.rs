@@ -149,6 +149,30 @@ impl OidcError {
         Self::new(OidcErrorKind::Cancelled, message)
     }
 
+    /// The retryable failure a binding reports when an interactive sign-in
+    /// holds this provider's acquisition lock on another thread and no valid
+    /// token is cached.
+    ///
+    /// Classified [`SocketError`](crate::ErrorCode::SocketError) rather than
+    /// the [`AuthError`](crate::ErrorCode::AuthError) that
+    /// [`InteractionRequired`](OidcErrorKind::InteractionRequired) ordinarily
+    /// carries, because the condition clears as soon as the callback returns:
+    /// a terminal class here stops a background reconnect permanently and
+    /// strands a store-and-forward queue behind a prompt that is still being
+    /// painted. The structured payload rides along, so `Error::oidc_error` --
+    /// and the C `questdb_error_oidc_get_view`, and every binding that picks an
+    /// exception type from it -- still sees an OIDC cause, which a bare
+    /// `Error::new` did not provide.
+    ///
+    /// Exposed for the C ABI shim, which owns the callback-activity tracking
+    /// this condition is derived from and cannot reach `Error`'s crate-private
+    /// constructors.
+    pub fn retryable_interaction_required(message: impl Into<String>) -> crate::Error {
+        let message = message.into();
+        crate::Error::from(Self::interaction_required(message.clone()))
+            .reclassified(crate::ErrorCode::SocketError, message)
+    }
+
     /// Attach the untrusted IdP `error` / `error_description` fields (each
     /// control-stripped, same rationale as the message).
     pub(crate) fn with_idp_error(

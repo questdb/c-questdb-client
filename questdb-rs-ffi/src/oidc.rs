@@ -40,7 +40,7 @@ use std::time::Duration;
 
 use libc::{c_char, c_void, size_t};
 use questdb::oidc::{
-    DeviceCodeChallenge, FileTokenStore, OidcDeviceAuth, OidcErrorKind, Renderer,
+    DeviceCodeChallenge, FileTokenStore, OidcDeviceAuth, OidcError, OidcErrorKind, Renderer,
     sanitize_display_text,
 };
 use questdb::{Error, ErrorCode};
@@ -261,13 +261,22 @@ impl SharedOidcAuth {
     /// terminalized a store-and-forward publication store with accepted frames
     /// still queued. The condition clears as soon as the callback returns.
     fn token_busy_error() -> Error {
-        Error::new(
-            ErrorCode::SocketError,
+        // Carries the structured `InteractionRequired` payload rather than
+        // being a bare `Error::new`. This error reaches a caller through the
+        // transport's provider-error path, where `questdb_error_oidc_get_view`
+        // -- and every binding that picks an exception type from it -- decides
+        // whether an OIDC failure caused the flush to fail. Without a payload
+        // the predicate answered false, so `oidc.h`'s own promise that "a
+        // token-provider failure surfacing as a retryable
+        // `line_sender_error_socket_error` ... answer[s] true here" did not
+        // hold, and the Python binding reported a plain `QuestDBError` for a
+        // condition its documentation types as `OidcInteractionRequired`.
+        // The retryable `SocketError` classification is unchanged.
+        OidcError::retryable_interaction_required(
             "OIDC authentication is busy: a sign-in prompt for this provider is being \
              rendered on another thread and no valid cached token is available. The \
              token will be requested again on the next attempt; acquire a token before \
-             starting an interactive sign-in to avoid the wait."
-                .to_string(),
+             starting an interactive sign-in to avoid the wait.",
         )
     }
 
@@ -1398,6 +1407,43 @@ mod tests {
     use std::net::{TcpListener, TcpStream};
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicPtr, AtomicUsize, Ordering};
+
+    #[test]
+    fn token_busy_error_carries_a_structured_oidc_cause() {
+        // The busy error reaches a caller through the transport's
+        // provider-error path, where `questdb_error_oidc_get_view` decides
+        // whether a binding reports a typed OIDC failure. A bare `Error::new`
+        // answered false there, so Python raised a plain `QuestDBError` for a
+        // condition `docs/auth.rst` types as `OidcInteractionRequired`.
+        let err = SharedOidcAuth::token_busy_error();
+
+        // The retryable classification is load-bearing and must not change:
+        // `oidc.h` documents this window as `questdb_error_socket_error`, and a
+        // terminal class strands a store-and-forward queue behind a prompt.
+        assert_eq!(err.code(), ErrorCode::SocketError);
+        assert_eq!(
+            err.oidc_error().map(questdb::oidc::OidcError::kind),
+            Some(OidcErrorKind::InteractionRequired),
+            "the busy error must carry an OIDC cause the C view can surface"
+        );
+
+        // And the C predicate the header promises actually answers true.
+        let boxed = Box::into_raw(Box::new(questdb_error {
+            error: err,
+            qwp_ws_error: None,
+        }));
+        let mut view = questdb_oidc_error_view {
+            struct_size: std::mem::size_of::<questdb_oidc_error_view>(),
+            ..unsafe { std::mem::zeroed() }
+        };
+        let seen = unsafe { questdb_error_oidc_get_view(boxed, &mut view) };
+        assert!(seen, "questdb_error_oidc_get_view must report the cause");
+        assert_eq!(
+            view.kind,
+            questdb_oidc_error_kind::QUESTDB_OIDC_ERROR_INTERACTION_REQUIRED
+        );
+        unsafe { drop(Box::from_raw(boxed)) };
+    }
 
     #[test]
     fn error_kind_maps_every_variant_away_from_unknown() {
