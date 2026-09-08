@@ -74,7 +74,9 @@ def main():
     subprocess.run(['javac', f'-J-Djava.io.tmpdir={args.output / "tmp"}', '--patch-module', f'io.questdb={args.output / "src"}',
                     '-p', os.pathsep.join(map(str, (args.jar, args.annotations))), '-d', str(classes),
                     *map(str, sorted(source_dir.glob('*.java')))], check=True)
-    subprocess.run(['jar', f'-J-Djava.io.tmpdir={args.output / "tmp"}', '--create', '--file', str(args.output / 'show-columns-probe.jar'),
+    # A generated manifest shadows the server's /META-INF/MANIFEST.MF under
+    # --patch-module and makes BuildInformationHolder return "unknown".
+    subprocess.run(['jar', f'-J-Djava.io.tmpdir={args.output / "tmp"}', '--create', '--no-manifest', '--file', str(args.output / 'show-columns-probe.jar'),
                     '-C', str(classes), '.'], check=True)
     (args.output / 'identity.json').write_text(json.dumps(dict(
         server_revision=REVISION,

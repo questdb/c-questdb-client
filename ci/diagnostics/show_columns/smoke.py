@@ -52,7 +52,10 @@ def run(root, jar, overlay):
                         raise RuntimeError(f'Server failed; inspect {root / "server.log"}')
                     time.sleep(.1)
             sql('create table probe (s symbol, v double, ts timestamp) timestamp(ts) partition by day wal')
-            results = []
+            build = sql('select build()')
+            assert 'QuestDB 10.0.2-SNAPSHOT' in build['dataset'][0][0], build
+            assert '12a33d651e51e2682e7a448c8db5168fc72dfad3' in build['dataset'][0][0], build
+            results = [build]
             for _ in range(3):
                 results.append(sql('show columns from probe'))
             sql('alter table probe add column extra long')

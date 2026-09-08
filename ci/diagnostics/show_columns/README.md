@@ -9,6 +9,9 @@ anchor occurs exactly once, and compiles an isolated `--patch-module io.questdb`
 JAR against the built server. It preserves source/JAR hashes and patched source
 in the output directory. No server checkout files are changed. Compilation uses
 the pinned server's JetBrains annotations 17.0.0 dependency from Maven's cache.
+The overlay deliberately has no manifest: a generated manifest shadows the
+server's build metadata under --patch-module. The smoke test requires the
+original version/commit and identical build() results with and without the patch.
 
 Only `QWP_WS_SHOW_COLUMNS_OVERLAY` plus the existing diagnostic fixture gates
 activate it. The normal product/test configuration is unchanged. The observer
@@ -69,3 +72,7 @@ COLUMNS and after ADD COLUMN; all expected stages recorded; no false slow
 trigger. Standalone six-second delay triggers at the expected stage, and fast
 completion and exception completion are retained. These validate instrumentation,
 not the original macOS failure or performance equivalence.
+
+Build 268391 exposed the generated-manifest problem before any fuzz test ran.
+The strengthened smoke reproduces that failure with the old overlay and passes
+with the manifest-free overlay. Its result is not a server-stall reproduction.
