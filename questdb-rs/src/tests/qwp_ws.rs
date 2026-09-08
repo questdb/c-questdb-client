@@ -3106,6 +3106,7 @@ fn qwp_ws_deep_durable_backlog_fills_byte_ring_replays_and_recovers() {
         }
     };
 
+    let last_fsn = last_fsn.unwrap();
     assert!(!blocked.is_empty());
     assert_eq!(backpressure.code(), ErrorCode::SocketError);
     assert!(
@@ -3136,6 +3137,17 @@ fn qwp_ws_deep_durable_backlog_fills_byte_ring_replays_and_recovers() {
         "durable watermark advanced while durable ACKs were withheld"
     );
     assert_eq!(sender.acked_fsn().unwrap(), None);
+    assert_eq!(
+        sender.completed_fsn(crate::ingress::AckLevel::Ok).unwrap(),
+        Some(last_fsn),
+        "OK poll must cover every ordinary-OKed frame"
+    );
+    assert_eq!(
+        sender
+            .completed_fsn(crate::ingress::AckLevel::Durable)
+            .unwrap(),
+        None
+    );
 
     disconnect_tx.send(published).unwrap();
     let replayed = replayed_rx.recv_timeout(Duration::from_secs(5)).unwrap();
@@ -3145,6 +3157,18 @@ fn qwp_ws_deep_durable_backlog_fills_byte_ring_replays_and_recovers() {
         "ordinary OK watermark did not recover after replay"
     );
     assert!(!sender.sfa_fully_delivered(true));
+    // Replay must leave the OK poll covering the backlog while the durable
+    // level is still withheld.
+    assert_eq!(
+        sender.completed_fsn(crate::ingress::AckLevel::Ok).unwrap(),
+        Some(last_fsn)
+    );
+    assert_eq!(
+        sender
+            .completed_fsn(crate::ingress::AckLevel::Durable)
+            .unwrap(),
+        None
+    );
     assert!(
         wait_until(Duration::from_secs(5), || {
             let totals = sender.qwp_ws_totals().unwrap();
@@ -3161,7 +3185,16 @@ fn qwp_ws_deep_durable_backlog_fills_byte_ring_replays_and_recovers() {
     sender
         .wait(crate::ingress::AckLevel::Durable, Duration::from_secs(5))
         .unwrap();
-    let last_fsn = last_fsn.unwrap();
+    assert_eq!(
+        sender
+            .completed_fsn(crate::ingress::AckLevel::Durable)
+            .unwrap(),
+        Some(last_fsn)
+    );
+    assert_eq!(
+        sender.completed_fsn(crate::ingress::AckLevel::Ok).unwrap(),
+        Some(last_fsn)
+    );
     assert_eq!(sender.acked_fsn().unwrap(), Some(last_fsn));
     assert!(sender.sfa_fully_delivered(true));
 
@@ -3175,6 +3208,12 @@ fn qwp_ws_deep_durable_backlog_fills_byte_ring_replays_and_recovers() {
         .unwrap();
     resumed_rx.recv_timeout(Duration::from_secs(5)).unwrap();
     assert_eq!(sender.acked_fsn().unwrap(), Some(resumed_fsn));
+    assert_eq!(
+        sender
+            .completed_fsn(crate::ingress::AckLevel::Durable)
+            .unwrap(),
+        Some(resumed_fsn)
+    );
 
     done_tx.send(()).unwrap();
     drop(sender);
