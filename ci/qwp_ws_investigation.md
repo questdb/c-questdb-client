@@ -8,6 +8,15 @@ workload mode is enabled. The current default is a paired mapped-file perturbati
 
 ## Current action: mapped-file shrink with slow-query capture
 
+Build 268475 completed all four attempts and 56 query cursors (maximum 130 ms).
+Its helper overlapped the workload, but a source audit found a confound:
+CPython 3.14.7 mmapmodule.c:1855-1859 issues F_FULLFSYNC before mmap on macOS.
+The helper's measured mapping stage therefore included an implicit full flush
+(maximum 293 ms). This run is not a clean test of the intended sequence.
+The follow-up changes only the mapping wrapper to raw libc mmap/munmap and
+retains the same paired plan and budgets. A real-filesystem regression test
+forbids calling Python's mmap constructor and checks the mapped bytes/size.
+
 Build 268472 passed four attempts and captured kernel stacks in run 4. All 47
 SHOW COLUMNS cursors completed; maximum 45.495 ms. The one-second ping failed
 before sampling, but another ping succeeded 143 ms before the first sample.
