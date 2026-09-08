@@ -51,13 +51,35 @@
 // `Borrow` is not imported: it is a supertrait of `BorrowMut`, so
 // `.borrow()` resolves through the `O: BorrowMut<Reader>` bound.
 use std::borrow::BorrowMut;
+use std::net::Ipv4Addr;
 
 use crate::egress::column::ColumnView;
 use crate::egress::query_request::{QueryRequest, QueryRequestBuilder};
-use crate::egress::reader::{CursorState, NextOutcome, Reader, Terminal};
+use crate::egress::reader::{
+    CursorState, FailoverProgressEvent, FailoverResetEvent, NextOutcome, Reader, Terminal,
+};
 use crate::egress::schema::Schema;
-use crate::egress::{Bind, Endpoint, ServerInfo};
+use crate::egress::symbol_dict::SymbolDict;
+use crate::egress::{Bind, Endpoint, ServerInfo, SimpleNullKind};
 use crate::error::{Result, fmt};
+
+/// Owning counterpart of `reader::FailoverResetCallback<'r>`. `'static`
+/// rather than `'r`: an [`OwnedQuery`] borrows nothing, so a callback that
+/// borrowed from the caller's stack would reintroduce exactly the lifetime
+/// an owning handle exists to avoid. FFI trampolines and `move` closures
+/// over owned state both satisfy it.
+type OwnedResetCallback = Box<dyn FnMut(&FailoverResetEvent) + Send + 'static>;
+
+/// Owning counterpart of `reader::FailoverProgressCallback<'r>`. See
+/// [`OwnedResetCallback`] for why this is `'static`.
+type OwnedProgressCallback = Box<dyn FnMut(&FailoverProgressEvent) + Send + 'static>;
+
+/// `CursorState`'s hook parameter shape, restated here because the aliases
+/// in `reader` are module-private. Erasing `Send` is deliberate and matches
+/// `Cursor::split`: the bound is enforced where the callback is *stored*,
+/// not where it is called.
+type ResetHook<'cb> = dyn FnMut(&FailoverResetEvent) + 'cb;
+type ProgressHook<'cb> = dyn FnMut(&FailoverProgressEvent) + 'cb;
 
 #[cfg(feature = "arrow-egress")]
 use crate::egress::arrow::{external_arrow_error, has_tentative_array};
@@ -80,6 +102,27 @@ pub struct OwnedQuery<O: BorrowMut<Reader>> {
     /// advertised `CAP_QUERY_FLAGS`. Same semantics as
     /// [`ReaderQuery::reset_symbol_dict`](crate::egress::ReaderQuery::reset_symbol_dict).
     reset_symbol_dict: bool,
+    /// Mirrors `ReaderQuery::on_failover_reset`, `'static` instead of `'r`.
+    on_failover_reset: Option<OwnedResetCallback>,
+    /// Mirrors `ReaderQuery::on_failover_progress`, `'static` instead of `'r`.
+    on_failover_progress: Option<OwnedProgressCallback>,
+}
+
+/// Forward one typed bind to the shared [`QueryRequestBuilder`], the same
+/// single implementation `ReaderQuery`'s `bind_method!` forwards to. These
+/// exist rather than leaving callers to build [`Bind`] values by hand
+/// because some of them are *not* plain wrappers — `bind_uuid` reverses the
+/// caller's canonical RFC-4122 bytes into QWP wire order, and a caller
+/// reaching for `Bind::Uuid` directly would silently emit a byte-swapped
+/// UUID.
+macro_rules! owned_bind_method {
+    ($(#[$meta:meta])* $name:ident, $($arg:ident : $ty:ty),*) => {
+        $(#[$meta])*
+        pub fn $name(mut self, $($arg : $ty),*) -> Self {
+            self.builder = self.builder.$name($($arg),*);
+            self
+        }
+    };
 }
 
 /// [`OwnedQuery`] over a reader checked out of a
@@ -100,12 +143,98 @@ impl<O: BorrowMut<Reader>> OwnedQuery<O> {
             owner,
             builder: QueryRequest::builder(sql),
             reset_symbol_dict: false,
+            on_failover_reset: None,
+            on_failover_progress: None,
         }
     }
 
     /// Append one bind value, in placeholder order.
     pub fn bind(mut self, value: Bind) -> Self {
         self.builder = self.builder.bind(value);
+        self
+    }
+
+    owned_bind_method!(bind_null, kind: SimpleNullKind);
+    owned_bind_method!(bind_bool, v: bool);
+    owned_bind_method!(bind_i8, v: i8);
+    owned_bind_method!(bind_i16, v: i16);
+    owned_bind_method!(bind_i32, v: i32);
+    owned_bind_method!(bind_i64, v: i64);
+    owned_bind_method!(bind_f32, v: f32);
+    owned_bind_method!(bind_f64, v: f64);
+    owned_bind_method!(bind_timestamp_micros, v: i64);
+    owned_bind_method!(bind_timestamp_nanos, v: i64);
+    owned_bind_method!(bind_date_millis, v: i64);
+    owned_bind_method!(
+        /// Bind a UUID as 16 bytes in canonical RFC-4122 big-endian order,
+        /// which is what `uuid::Uuid::as_bytes()` returns.
+        bind_uuid,
+        v: [u8; 16]
+    );
+    owned_bind_method!(
+        /// Bind a LONG256 as 32 raw little-endian bytes: four 64-bit limbs,
+        /// least-significant limb first.
+        bind_long256,
+        v: [u8; 32]
+    );
+    owned_bind_method!(bind_char, v: u16);
+    owned_bind_method!(bind_ipv4, v: Ipv4Addr);
+    owned_bind_method!(bind_decimal64, value: i64, scale: i8);
+    owned_bind_method!(bind_decimal128, value: i128, scale: i8);
+    owned_bind_method!(bind_decimal256, bytes: [u8; 32], scale: i8);
+    owned_bind_method!(bind_geohash, value: u64, precision_bits: u8);
+    owned_bind_method!(bind_null_varchar,);
+    owned_bind_method!(bind_null_binary,);
+    owned_bind_method!(bind_null_decimal64, scale: i8);
+    owned_bind_method!(bind_null_decimal128, scale: i8);
+    owned_bind_method!(bind_null_decimal256, scale: i8);
+    owned_bind_method!(bind_null_geohash, precision_bits: u8);
+
+    /// Bind a UTF-8 VARCHAR. The bytes are copied.
+    pub fn bind_varchar<S: Into<String>>(mut self, v: S) -> Self {
+        self.builder = self.builder.bind_varchar(v);
+        self
+    }
+
+    /// Bind a BINARY value. The bytes are copied.
+    pub fn bind_binary<B: Into<Vec<u8>>>(mut self, v: B) -> Self {
+        self.builder = self.builder.bind_binary(v);
+        self
+    }
+
+    /// Install a failover-reset callback — the owning counterpart of
+    /// [`ReaderQuery::on_failover_reset`], with the identical contract
+    /// (installing it is the caller's opt-in to handling replay after rows
+    /// have already been delivered; without it a post-delivery transport
+    /// failure surfaces [`FailoverWouldDuplicate`] instead of silently
+    /// replaying). Calling it twice replaces the previous closure.
+    ///
+    /// The `'static` bound is the only difference from the borrowing
+    /// handle: an [`OwnedCursor`] outlives every stack frame, so a callback
+    /// borrowing from one would be unsound. Capture by `move`.
+    ///
+    /// [`ReaderQuery::on_failover_reset`]: crate::egress::ReaderQuery::on_failover_reset
+    /// [`FailoverWouldDuplicate`]: crate::ErrorCode::FailoverWouldDuplicate
+    pub fn on_failover_reset<F>(mut self, callback: F) -> Self
+    where
+        F: FnMut(&FailoverResetEvent) + Send + 'static,
+    {
+        self.on_failover_reset = Some(Box::new(callback));
+        self
+    }
+
+    /// Install a failover-progress callback — the owning counterpart of
+    /// [`ReaderQuery::on_failover_progress`], with the identical contract:
+    /// observational only, and it does **not** authorize replay after
+    /// delivery. Calling it twice replaces the previous closure. See
+    /// [`Self::on_failover_reset`] for why the bound is `'static`.
+    ///
+    /// [`ReaderQuery::on_failover_progress`]: crate::egress::ReaderQuery::on_failover_progress
+    pub fn on_failover_progress<F>(mut self, callback: F) -> Self
+    where
+        F: FnMut(&FailoverProgressEvent) + Send + 'static,
+    {
+        self.on_failover_progress = Some(Box::new(callback));
         self
     }
 
@@ -135,16 +264,43 @@ impl<O: BorrowMut<Reader>> OwnedQuery<O> {
     /// On failure the connection is *not* returned to the caller: the
     /// `OwnedQuery` is consumed, so `owner` drops here — which for a pooled
     /// reader releases the slot, and for a bare `Reader` closes it. Take a
-    /// clone of anything you need from the connection before calling.
-    pub fn execute(mut self) -> Result<OwnedCursor<O>> {
-        let state = CursorState::submit(
-            self.owner.borrow_mut(),
-            self.builder,
-            self.reset_symbol_dict,
-        )?;
+    /// clone of anything you need from the connection before calling, or
+    /// use [`Self::try_execute`] to get the connection back.
+    pub fn execute(self) -> Result<OwnedCursor<O>> {
+        self.try_execute().map_err(|(err, _owner)| err)
+    }
+
+    /// [`Self::execute`], but hands the connection back on failure instead
+    /// of dropping it.
+    ///
+    /// A failed submit does not necessarily kill the connection — a
+    /// rejected bind or an encode error never reaches the wire — so a
+    /// caller that manages the connection's lifetime itself (a C ABI handle
+    /// the user still holds, a pool slot with its own return path) must be
+    /// able to keep it. `execute()` discarding the owner is the right
+    /// default for the fluent path, but it is a policy, not a constraint,
+    /// and it cannot be the only option.
+    ///
+    /// Whether the returned connection is still *usable* depends on the
+    /// error: check [`Reader::transport_torn_down`] before reusing it.
+    #[allow(clippy::result_large_err)]
+    pub fn try_execute(self) -> std::result::Result<OwnedCursor<O>, (crate::Error, O)> {
+        let OwnedQuery {
+            mut owner,
+            builder,
+            reset_symbol_dict,
+            on_failover_reset,
+            on_failover_progress,
+        } = self;
+        let state = match CursorState::submit(owner.borrow_mut(), builder, reset_symbol_dict) {
+            Ok(state) => state,
+            Err(err) => return Err((err, owner)),
+        };
         Ok(OwnedCursor {
-            owner: Some(self.owner),
+            owner: Some(owner),
             state,
+            on_failover_reset,
+            on_failover_progress,
         })
     }
 }
@@ -175,6 +331,10 @@ pub struct OwnedCursor<O: BorrowMut<Reader>> {
     /// unsafe-code pattern this type exists to spare its callers.
     owner: Option<O>,
     state: CursorState,
+    /// Moved across from the [`OwnedQuery`] at `execute()`, exactly as
+    /// `Cursor` moves its `'r`-bound pair across from `ReaderQuery`.
+    on_failover_reset: Option<OwnedResetCallback>,
+    on_failover_progress: Option<OwnedProgressCallback>,
 }
 
 /// The owned connection, reached through a borrow of just the `owner`
@@ -192,6 +352,38 @@ fn reader_of<O: BorrowMut<Reader>>(owner: &mut Option<O>) -> &mut Reader {
 }
 
 impl<O: BorrowMut<Reader>> OwnedCursor<O> {
+    /// Disjoint reborrow of the four fields, with the callbacks erased to
+    /// `&mut dyn FnMut` for [`CursorState`]. The verbatim shape of
+    /// `Cursor::split`, and load-bearing for the same reason: the compiler
+    /// sees a whole-`self` borrow at `self.state.f(reader_of(&mut
+    /// self.owner), ..)` once the callee also wants `&mut self.on_*`.
+    #[allow(clippy::type_complexity)]
+    fn split(
+        &mut self,
+    ) -> (
+        &mut Reader,
+        &mut CursorState,
+        Option<&mut ResetHook<'_>>,
+        Option<&mut ProgressHook<'_>>,
+    ) {
+        let OwnedCursor {
+            owner,
+            state,
+            on_failover_reset,
+            on_failover_progress,
+        } = self;
+        (
+            reader_of(owner),
+            state,
+            on_failover_reset
+                .as_mut()
+                .map(|cb| cb as &mut ResetHook<'_>),
+            on_failover_progress
+                .as_mut()
+                .map(|cb| cb as &mut ProgressHook<'_>),
+        )
+    }
+
     /// Shared read-only view of the owned connection. `BorrowMut<Reader>`
     /// implies `Borrow<Reader>`, so the `&self` accessors need no `&mut`.
     fn reader_ref(&self) -> &Reader {
@@ -208,19 +400,17 @@ impl<O: BorrowMut<Reader>> OwnedCursor<O> {
     /// — and is re-raised on every subsequent call, so a retry loop cannot
     /// mistake a failed stream for a clean one.
     ///
-    /// Mid-query failover behaves as on [`Cursor::next_batch`]: because no
-    /// reset callback can be installed on this handle yet, a transport
-    /// failure *after* a batch has been yielded surfaces
+    /// Mid-query failover behaves exactly as on [`Cursor::next_batch`]:
+    /// transparent before the first batch, and after one has been yielded
+    /// only if [`OwnedQuery::on_failover_reset`] was installed —
+    /// otherwise
     /// [`FailoverWouldDuplicate`](crate::ErrorCode::FailoverWouldDuplicate)
-    /// rather than silently replaying from `batch_seq=0`. Failover before
-    /// the first batch stays transparent.
+    /// rather than a silent replay from `batch_seq=0`.
     ///
     /// [`Cursor::next_batch`]: crate::egress::Cursor::next_batch
     pub fn next_batch(&mut self) -> Result<bool> {
-        // Disjoint field borrows: `&mut self.owner` for the argument,
-        // `&mut self.state` for the receiver.
-        let reader = reader_of(&mut self.owner);
-        match self.state.next_batch_step(reader, None, None)? {
+        let (reader, state, on_reset, on_progress) = self.split();
+        match state.next_batch_step(reader, on_reset, on_progress)? {
             NextOutcome::HaveBatch => Ok(true),
             NextOutcome::Done => Ok(false),
         }
@@ -278,14 +468,14 @@ impl<O: BorrowMut<Reader>> OwnedCursor<O> {
 
     /// Send a `CANCEL` frame and drain until the server's terminal.
     pub fn cancel(&mut self) -> Result<()> {
-        let reader = reader_of(&mut self.owner);
-        self.state.cancel(reader, None, None)
+        let (reader, state, on_reset, on_progress) = self.split();
+        state.cancel(reader, on_reset, on_progress)
     }
 
     /// Grant the server `additional_bytes` of read budget on this request.
     pub fn add_credit(&mut self, additional_bytes: u64) -> Result<()> {
-        let reader = reader_of(&mut self.owner);
-        self.state.add_credit(reader, additional_bytes, None, None)
+        let (reader, state, on_reset, on_progress) = self.split();
+        state.add_credit(reader, additional_bytes, on_reset, on_progress)
     }
 
     /// Hand the connection back, discarding any unread remainder of the
@@ -327,6 +517,30 @@ impl<O: BorrowMut<Reader>> OwnedCursor<O> {
         self.state.last_batch().map(|b| b.batch_seq)
     }
 
+    /// `request_id` echoed on the current batch, or `None` before the first
+    /// `next_batch`. Differs from [`Self::request_id`] only in the window
+    /// after a mid-query failover has re-issued the query but before the
+    /// replayed batch has been decoded.
+    pub fn batch_request_id(&self) -> Option<i64> {
+        self.state.last_batch().map(|b| b.request_id)
+    }
+
+    /// Per-batch wire flags (`FLAG_GORILLA` / `FLAG_DELTA_SYMBOL_DICT` /
+    /// `FLAG_ZSTD`) from the current batch's frame header, or `None` before
+    /// the first `next_batch`.
+    pub fn batch_flags(&self) -> Option<u8> {
+        self.state.last_batch().map(|b| b.flags)
+    }
+
+    /// Connection-scoped symbol dictionary the current batch's SYMBOL
+    /// columns index into. The owning replacement for
+    /// [`BatchView::dict`](crate::egress::BatchView::dict); unlike the
+    /// per-batch accessors it is always available, because the dictionary
+    /// is a property of the connection rather than of a decoded batch.
+    pub fn symbol_dict(&self) -> &SymbolDict {
+        self.reader_ref().symbol_dict()
+    }
+
     /// A view of one column of the current batch.
     ///
     /// This is the owning replacement for going through [`BatchView`]: the
@@ -365,7 +579,27 @@ impl<O: BorrowMut<Reader>> OwnedCursor<O> {
     /// The owning counterpart of
     /// [`Cursor::next_arrow_batch`](crate::egress::Cursor::next_arrow_batch).
     pub fn next_arrow_batch(&mut self) -> Result<Option<arrow::array::RecordBatch>> {
-        self.next_arrow_batch_checked(None)
+        self.next_arrow_batch_inner(None, false)
+    }
+
+    /// Next batch as an Arrow `RecordBatch`, with explicit control over the
+    /// two knobs [`Self::next_arrow_batch`] fixes: `expected_schema` (drift
+    /// check against a schema pinned by the caller) and `compact` (emit
+    /// SYMBOL columns with only the referenced values and batch-local
+    /// codes).
+    ///
+    /// The owning counterpart of
+    /// [`Cursor::next_arrow_batch_inner`](crate::egress::Cursor::next_arrow_batch_inner),
+    /// and — like it — the entry point a consumer that pins its own schema
+    /// (an FFI shim, an ADBC statement) needs; the convenience wrappers
+    /// cannot express it.
+    pub fn next_arrow_batch_inner(
+        &mut self,
+        expected_schema: Option<&arrow::datatypes::SchemaRef>,
+        compact: bool,
+    ) -> Result<Option<arrow::array::RecordBatch>> {
+        let (reader, state, on_reset, on_progress) = self.split();
+        state.next_arrow_batch_inner(reader, expected_schema, compact, on_reset, on_progress)
     }
 
     /// Shared by [`Self::next_arrow_batch`] and [`OwnedArrowReader`]'s
@@ -379,18 +613,12 @@ impl<O: BorrowMut<Reader>> OwnedCursor<O> {
     /// `compact` (symbol-dictionary compaction) is hardcoded `false`, same
     /// as every other streaming entry point (`Cursor::next_arrow_batch`,
     /// `CursorRecordBatchReader`) — only the materialise-whole adapters opt
-    /// into it. `on_reset`/`on_progress` are hardcoded `None`, same as
-    /// [`Self::next_batch`]: no reset callback can be installed on this
-    /// handle yet, so — per [`Self::next_batch`]'s doc comment — a mid-query
-    /// failover after the first batch surfaces `FailoverWouldDuplicate`
-    /// rather than silently replaying.
+    /// into it.
     fn next_arrow_batch_checked(
         &mut self,
         expected_schema: Option<&arrow::datatypes::SchemaRef>,
     ) -> Result<Option<arrow::array::RecordBatch>> {
-        let reader = reader_of(&mut self.owner);
-        self.state
-            .next_arrow_batch_inner(reader, expected_schema, false, None, None)
+        self.next_arrow_batch_inner(expected_schema, false)
     }
 
     /// Consume this cursor as an owned Arrow
@@ -411,16 +639,16 @@ impl<O: BorrowMut<Reader>> OwnedCursor<O> {
     /// docs for why `schemas_equal` alone can't catch a tentative→firm
     /// ndim upgrade). What is deliberately **not** mirrored is the
     /// post-failover replay/re-pin dance `CursorRecordBatchReader` performs
-    /// with `resets_at_pin`: that logic exists only because a borrowed
-    /// [`Cursor`](crate::egress::Cursor) can have an `on_failover_reset`
-    /// callback installed, which is what clears `CursorState`'s
-    /// silent-duplicate guard and allows a batch beyond the first to be
-    /// transparently replayed. `OwnedCursor` has no way to install that
-    /// callback yet (see [`Self::next_batch`]'s doc comment), so once a
-    /// batch has been decoded here, a mid-query failover always surfaces
-    /// as `FailoverWouldDuplicate` instead of a transparent replay — the
-    /// replay path the borrowing reader guards against is unreachable on
-    /// this handle, not silently weaker.
+    /// with `resets_at_pin`. Without an `on_failover_reset` callback that
+    /// dance is unreachable — `CursorState`'s silent-duplicate guard turns
+    /// a post-first-batch failover into `FailoverWouldDuplicate` — so for
+    /// the default case it is dead code. A caller that *does* install
+    /// [`OwnedQuery::on_failover_reset`] and then wraps the cursor here
+    /// authorises replay, and a replayed stream restarting at
+    /// `batch_seq=0` re-delivers batches this reader has already yielded:
+    /// use [`Self::next_arrow_batch_inner`] and handle the reset
+    /// explicitly if that matters. Schema *drift* across the replay is
+    /// still caught, by the pinned-schema check.
     pub fn into_arrow_reader(mut self) -> Result<OwnedArrowReader<O>> {
         let first = self.next_arrow_batch_checked(None)?;
         let schema = match &first {

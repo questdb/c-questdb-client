@@ -438,3 +438,425 @@ fn owned_batch_accessors_are_safe_before_the_first_batch() {
         "column access must error, not panic"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Batch metadata the FFI reads through the batch handle
+// ---------------------------------------------------------------------------
+
+/// `batch_request_id`, `batch_flags` and `symbol_dict` complete the set of
+/// things `BatchView` exposes, and the C ABI's `qwp_reader_batch_*`
+/// accessors need every one of them. Assert parity with the borrowing path
+/// against a SYMBOL batch, which is the only shape that makes the
+/// connection-scoped dictionary non-empty and sets a frame flag
+/// (`FLAG_DELTA_SYMBOL_DICT`) — so a stubbed-out `batch_flags` returning
+/// `0` would fail here rather than pass by coincidence.
+#[test]
+fn owned_batch_metadata_matches_the_borrowing_batchview() {
+    let symbols = || BatchColumn::Symbol {
+        dict: vec!["alpha".into(), "beta".into()],
+        codes: vec![0, 1, 0],
+    };
+    let script = || {
+        vec![
+            server_info(),
+            Action::AwaitQueryRequest,
+            Action::SendBatch {
+                batch_seq: 0,
+                column: symbols(),
+            },
+            Action::SendResultEnd,
+        ]
+    };
+
+    // Borrowing path.
+    let server_a = MockServer::start(vec![script()]);
+    let mut reader = Reader::from_conf(format!("ws::addr={};", server_a.url())).expect("connect");
+    let mut cursor = reader.execute("SELECT s").expect("execute");
+    let view = cursor.next_batch().expect("next_batch").expect("a batch");
+    let expected_request_id = view.request_id();
+    let expected_flags = view.flags();
+    let expected_dict: Vec<String> = (0..view.dict().len())
+        .map(|i| view.dict().get(i as u32).expect("dict entry").to_owned())
+        .collect();
+    drop(cursor);
+
+    assert_ne!(
+        expected_flags, 0,
+        "fixture must set a frame flag, else the parity check below is vacuous"
+    );
+    assert_eq!(expected_dict, ["alpha", "beta"]);
+
+    // Owning path.
+    let server_b = MockServer::start(vec![script()]);
+    let owner = Reader::from_conf(format!("ws::addr={};", server_b.url())).expect("connect");
+    let mut owned = owner.into_query("SELECT s").execute().expect("execute");
+    assert!(owned.next_batch().expect("next_batch"), "expected a batch");
+
+    assert_eq!(owned.batch_request_id(), Some(expected_request_id));
+    assert_eq!(owned.batch_flags(), Some(expected_flags));
+    let actual_dict: Vec<String> = (0..owned.symbol_dict().len())
+        .map(|i| {
+            owned
+                .symbol_dict()
+                .get(i as u32)
+                .expect("dict entry")
+                .to_owned()
+        })
+        .collect();
+    assert_eq!(actual_dict, expected_dict);
+}
+
+/// The per-batch metadata accessors must be `None` — not `0`, and not a
+/// panic — before the first batch, so a caller cannot mistake "no batch
+/// yet" for "batch 0 with no flags".
+#[test]
+fn owned_batch_metadata_is_none_before_the_first_batch() {
+    let server = MockServer::start(vec![happy_script(ServerRole::Primary, "n1")]);
+    let owner = Reader::from_conf(format!("ws::addr={};", server.url())).expect("connect");
+    let cursor = owner.into_query("SELECT 1").execute().expect("execute");
+    assert_eq!(cursor.batch_request_id(), None);
+    assert_eq!(cursor.batch_flags(), None);
+    assert_eq!(cursor.symbol_dict().len(), 0);
+}
+
+// ---------------------------------------------------------------------------
+// Typed binds
+// ---------------------------------------------------------------------------
+
+/// The typed bind forwarders must produce a byte-identical
+/// `QUERY_REQUEST` to the borrowing path's.
+///
+/// Byte-equality rather than "it didn't error" because several of these are
+/// not plain `Bind` constructors: `bind_uuid` reverses the caller's
+/// canonical RFC-4122 bytes into QWP wire order. A forwarder that reached
+/// for `Bind::Uuid(v)` directly would compile, run, and silently transmit a
+/// byte-swapped UUID — this assertion is what catches that.
+///
+/// `bind_binary` / `bind_null_binary` / `bind_ipv4` are absent because
+/// `check_bindable` rejects BINARY and IPV4 as bind kinds on both paths;
+/// their forwarders are covered by
+/// `owned_binds_reject_the_same_kinds_as_the_borrowing_path` below.
+#[test]
+fn owned_typed_binds_encode_identically_to_the_borrowing_path() {
+    const UUID: [u8; 16] = [
+        0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xAA, 0xBB, 0xCC, 0xDD, 0xEE,
+        0xFF,
+    ];
+    const LONG256: [u8; 32] = [0xA5; 32];
+    const DEC256: [u8; 32] = [0x5A; 32];
+
+    let server_a = MockServer::start(vec![happy_script(ServerRole::Primary, "n1")]);
+    let mut reader = Reader::from_conf(format!("ws::addr={};", server_a.url())).expect("connect");
+    let mut borrowed = reader
+        .prepare("SELECT $1")
+        .initial_credit(4096)
+        .bind_bool(true)
+        .bind_i8(-1)
+        .bind_i16(-2)
+        .bind_i32(-3)
+        .bind_i64(-4)
+        .bind_f32(1.5)
+        .bind_f64(2.5)
+        .bind_varchar("hello")
+        .bind_timestamp_micros(111)
+        .bind_timestamp_nanos(222)
+        .bind_date_millis(333)
+        .bind_uuid(UUID)
+        .bind_long256(LONG256)
+        .bind_char(b'q' as u16)
+        .bind_decimal64(1234, 2)
+        .bind_decimal128(-5678, 3)
+        .bind_decimal256(DEC256, 4)
+        .bind_geohash(0xABCD, 20)
+        .bind_null(questdb::egress::SimpleNullKind::Long)
+        .bind_null_varchar()
+        .bind_null_decimal64(2)
+        .bind_null_decimal128(3)
+        .bind_null_decimal256(4)
+        .bind_null_geohash(20)
+        .execute()
+        .expect("borrowing execute");
+    while borrowed.next_batch().expect("drain").is_some() {}
+    drop(borrowed);
+
+    let server_b = MockServer::start(vec![happy_script(ServerRole::Primary, "n1")]);
+    let owner = Reader::from_conf(format!("ws::addr={};", server_b.url())).expect("connect");
+    let mut owned = owner
+        .into_query("SELECT $1")
+        .initial_credit(4096)
+        .bind_bool(true)
+        .bind_i8(-1)
+        .bind_i16(-2)
+        .bind_i32(-3)
+        .bind_i64(-4)
+        .bind_f32(1.5)
+        .bind_f64(2.5)
+        .bind_varchar("hello")
+        .bind_timestamp_micros(111)
+        .bind_timestamp_nanos(222)
+        .bind_date_millis(333)
+        .bind_uuid(UUID)
+        .bind_long256(LONG256)
+        .bind_char(b'q' as u16)
+        .bind_decimal64(1234, 2)
+        .bind_decimal128(-5678, 3)
+        .bind_decimal256(DEC256, 4)
+        .bind_geohash(0xABCD, 20)
+        .bind_null(questdb::egress::SimpleNullKind::Long)
+        .bind_null_varchar()
+        .bind_null_decimal64(2)
+        .bind_null_decimal128(3)
+        .bind_null_decimal256(4)
+        .bind_null_geohash(20)
+        .execute()
+        .expect("owning execute");
+    while owned.next_batch().expect("drain") {}
+
+    let borrowed_bytes = server_a.captured_requests();
+    let owned_bytes = server_b.captured_requests();
+    assert_eq!(borrowed_bytes.len(), 1, "one QUERY_REQUEST per path");
+    assert_eq!(owned_bytes.len(), 1, "one QUERY_REQUEST per path");
+    // Both readers are fresh and issue exactly one query, so both requests
+    // carry request_id 1 and the buffers are comparable byte for byte.
+    assert_eq!(
+        borrowed_bytes[0], owned_bytes[0],
+        "the owning path must encode the same QUERY_REQUEST as the borrowing path"
+    );
+    // Guard against a vacuous pass: the UUID's wire bytes must be the
+    // reversal of the caller's input, present somewhere in the request.
+    let mut reversed = UUID;
+    reversed.reverse();
+    assert!(
+        owned_bytes[0].windows(16).any(|w| w == reversed.as_slice()),
+        "bind_uuid must emit the reversed byte order on the wire"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// try_execute
+// ---------------------------------------------------------------------------
+
+/// A submit that fails before anything reaches the wire must hand the
+/// connection back intact, not close it. The C ABI depends on this: its
+/// `qwp_reader` handle is still held by the caller and is where the
+/// connection lives between queries, so an `execute` that swallowed the
+/// connection on failure would strand a pool slot and leave the handle's
+/// `_close` with nothing to return.
+#[test]
+fn try_execute_hands_the_connection_back_on_a_pre_wire_failure() {
+    let server = MockServer::start(vec![happy_script(ServerRole::Primary, "n1")]);
+    let owner = Reader::from_conf(format!("ws::addr={};", server.url())).expect("connect");
+
+    // Over `MAX_SQL_BYTES`, rejected by `QueryRequestBuilder::build` before
+    // the encode, let alone the write.
+    let too_long = "x".repeat(1024 * 1024 + 1);
+    let (err, owner) = owner
+        .into_query(too_long)
+        .try_execute()
+        .err()
+        .expect("an over-long SQL must be rejected");
+    assert_eq!(err.code(), questdb::ErrorCode::InvalidApiCall);
+    assert!(
+        !owner.transport_torn_down(),
+        "a pre-wire rejection must leave the connection usable"
+    );
+
+    // The proof that it is usable: run a real query on the same connection.
+    let mut cursor = owner.into_query("SELECT 1").execute().expect("execute");
+    while cursor.next_batch().expect("drain") {}
+    assert!(cursor.terminal().is_some());
+    assert_eq!(
+        server.accepts(),
+        1,
+        "the handed-back connection must be reused, not redialled"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Failover callbacks on the owning path
+// ---------------------------------------------------------------------------
+
+use std::sync::{Arc, Mutex};
+
+use questdb::ErrorCode;
+use questdb::egress::{FailoverPhase, FailoverResetEvent};
+
+/// Server A serves one batch then dies; server B serves a different batch
+/// and terminates. This is the post-delivery failover shape: rows have
+/// already reached the caller when the connection drops, so replaying from
+/// `batch_seq=0` would duplicate them.
+fn post_delivery_failover_servers() -> (MockServer, MockServer) {
+    let a = MockServer::start(vec![vec![
+        Action::SendServerInfo {
+            role: ServerRole::Standalone,
+            node_id: "a".into(),
+        },
+        Action::AwaitQueryRequest,
+        Action::SendBatch {
+            batch_seq: 0,
+            column: BatchColumn::Long(vec![1, 2]),
+        },
+        Action::HardDrop,
+    ]]);
+    let b = MockServer::start(vec![vec![
+        Action::SendServerInfo {
+            role: ServerRole::Standalone,
+            node_id: "b".into(),
+        },
+        Action::AwaitQueryRequest,
+        Action::SendBatch {
+            batch_seq: 0,
+            column: BatchColumn::Long(vec![7, 8, 9]),
+        },
+        Action::SendResultEnd,
+    ]]);
+    (a, b)
+}
+
+fn failover_conf(a: &MockServer, b: &MockServer) -> String {
+    format!(
+        "ws::addr={};failover_backoff_initial_ms=1;failover_backoff_max_ms=10",
+        build_addr_list(&[a, b])
+    )
+}
+
+/// Installing `on_failover_reset` on an `OwnedQuery` must do what it does
+/// on a `ReaderQuery`: fire with the new endpoint, and thereby authorise
+/// the replay that would otherwise be refused.
+#[test]
+fn owned_failover_reset_callback_fires_and_authorises_replay() {
+    let (srv_a, srv_b) = post_delivery_failover_servers();
+    let owner = Reader::from_conf(failover_conf(&srv_a, &srv_b)).expect("connect to A");
+
+    let observed: Arc<Mutex<Vec<FailoverResetEvent>>> = Arc::new(Mutex::new(Vec::new()));
+    let sink = Arc::clone(&observed);
+    let mut cursor = owner
+        .into_query("select 1")
+        .on_failover_reset(move |ev: &FailoverResetEvent| {
+            sink.lock().unwrap().push(ev.clone());
+        })
+        .execute()
+        .expect("execute");
+
+    // A's batch, delivered before the drop.
+    assert!(cursor.next_batch().expect("first batch"));
+    assert_eq!(cursor.batch_row_count(), 2);
+    // A is gone: this call observes the close, fails over, replays, and
+    // yields B's batch — which only happens because the callback is
+    // installed.
+    assert!(cursor.next_batch().expect("post-failover batch"));
+    assert_eq!(cursor.batch_row_count(), 3);
+    assert_eq!(cursor.failover_resets(), 1);
+    assert!(!cursor.next_batch().expect("terminal"));
+
+    let events = observed.lock().unwrap();
+    assert_eq!(events.len(), 1, "reset callback fired exactly once");
+    assert_eq!(events[0].new_addr.port, srv_b.addr.port());
+    assert_eq!(events[0].failed_addr.port, srv_a.addr.port());
+}
+
+/// The negative control for the test above: the identical script with no
+/// callback installed must surface `FailoverWouldDuplicate` instead of
+/// silently replaying. Without this, a callback field that was stored but
+/// never threaded through to `CursorState` would still pass the positive
+/// test if the guard happened to be off.
+#[test]
+fn owned_cursor_without_a_reset_callback_refuses_post_delivery_replay() {
+    let (srv_a, srv_b) = post_delivery_failover_servers();
+    let owner = Reader::from_conf(failover_conf(&srv_a, &srv_b)).expect("connect to A");
+    let mut cursor = owner.into_query("select 1").execute().expect("execute");
+
+    assert!(cursor.next_batch().expect("first batch"));
+    let err = cursor
+        .next_batch()
+        .expect_err("post-delivery failover must be refused without a reset callback");
+    assert_eq!(err.code(), ErrorCode::FailoverWouldDuplicate);
+}
+
+/// `on_failover_progress` is telemetry-only, so it must fire through every
+/// phase of the same failover — including on a cursor that also has a reset
+/// callback, which is how the C ABI installs them.
+#[test]
+fn owned_failover_progress_callback_observes_every_phase() {
+    let (srv_a, srv_b) = post_delivery_failover_servers();
+    let owner = Reader::from_conf(failover_conf(&srv_a, &srv_b)).expect("connect to A");
+
+    let phases: Arc<Mutex<Vec<FailoverPhase>>> = Arc::new(Mutex::new(Vec::new()));
+    let sink = Arc::clone(&phases);
+    let mut cursor = owner
+        .into_query("select 1")
+        .on_failover_reset(|_: &FailoverResetEvent| {})
+        .on_failover_progress(move |ev: &questdb::egress::FailoverProgressEvent| {
+            sink.lock().unwrap().push(ev.phase);
+        })
+        .execute()
+        .expect("execute");
+
+    assert!(cursor.next_batch().expect("first batch"));
+    assert!(cursor.next_batch().expect("post-failover batch"));
+
+    let seen = phases.lock().unwrap();
+    assert!(
+        seen.contains(&FailoverPhase::Disconnected),
+        "expected a Disconnected phase, saw {seen:?}"
+    );
+    assert!(
+        seen.contains(&FailoverPhase::Reset),
+        "expected a Reset phase, saw {seen:?}"
+    );
+}
+
+/// BINARY and IPV4 are not bindable (`check_bindable`), so their
+/// forwarders must fail on the owning path exactly as they do on the
+/// borrowing one — same code, same message. Without this the three
+/// forwarders the byte-parity test above has to skip would be untested.
+#[test]
+fn owned_binds_reject_the_same_kinds_as_the_borrowing_path() {
+    fn borrowed_err(
+        f: impl FnOnce(questdb::egress::ReaderQuery<'_>) -> questdb::egress::ReaderQuery<'_>,
+    ) -> questdb::Error {
+        let server = MockServer::start(vec![happy_script(ServerRole::Primary, "n1")]);
+        let mut reader = Reader::from_conf(format!("ws::addr={};", server.url())).expect("connect");
+        f(reader.prepare("SELECT $1"))
+            .execute()
+            .err()
+            .expect("must be rejected")
+    }
+    fn owned_err(
+        f: impl FnOnce(questdb::egress::OwnedQuery<Reader>) -> questdb::egress::OwnedQuery<Reader>,
+    ) -> questdb::Error {
+        let server = MockServer::start(vec![happy_script(ServerRole::Primary, "n1")]);
+        let owner = Reader::from_conf(format!("ws::addr={};", server.url())).expect("connect");
+        f(owner.into_query("SELECT $1"))
+            .execute()
+            .err()
+            .expect("must be rejected")
+    }
+
+    let cases: Vec<(&str, questdb::Error, questdb::Error)> = vec![
+        (
+            "binary",
+            borrowed_err(|q| q.bind_binary(vec![1u8, 2, 3])),
+            owned_err(|q| q.bind_binary(vec![1u8, 2, 3])),
+        ),
+        (
+            "null_binary",
+            borrowed_err(|q| q.bind_null_binary()),
+            owned_err(|q| q.bind_null_binary()),
+        ),
+        (
+            "ipv4",
+            borrowed_err(|q| q.bind_ipv4(std::net::Ipv4Addr::new(10, 0, 0, 1))),
+            owned_err(|q| q.bind_ipv4(std::net::Ipv4Addr::new(10, 0, 0, 1))),
+        ),
+    ];
+    for (name, borrowed, owned) in cases {
+        assert_eq!(
+            borrowed.code(),
+            ErrorCode::InvalidBind,
+            "{name}: borrowing code"
+        );
+        assert_eq!(owned.code(), borrowed.code(), "{name}: code differs");
+        assert_eq!(owned.msg(), borrowed.msg(), "{name}: message differs");
+    }
+}
