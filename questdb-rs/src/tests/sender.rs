@@ -695,6 +695,12 @@ fn test_rewind_discards_every_row_after_the_rewind_point() -> TestResult {
         // is not.
         write_rows(&mut buffer, 2, 5)?;
         assert_eq!(buffer.row_count(), 10);
+        // Fold the size hint now, so the rewind has to refresh it rather than
+        // inherit the appends' dirty marks.
+        assert!(
+            buffer.len() > reference.len(),
+            "{api}: the discarded rows must grow the buffer"
+        );
 
         match bookmark {
             Some(bookmark) => buffer.rewind_to_bookmark(bookmark)?,

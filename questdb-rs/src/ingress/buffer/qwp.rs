@@ -10560,6 +10560,12 @@ mod tests {
                             // A table that did not exist at the mark at all.
                             write_row(&mut buf, "late_table", i);
                         }
+                        // Fold the size hint now, so the rewind has to refresh
+                        // it rather than inherit the appends' dirty marks.
+                        assert!(
+                            buf.len() > expected_len,
+                            "{api}: the discarded rows must grow the size hint"
+                        );
 
                         match bookmark {
                             Some(bookmark) => buf.rewind_to_bookmark(bookmark).unwrap(),
