@@ -499,6 +499,11 @@ public:
      * unencrypted JSON in `directory`. Unix uses `0600` token files and a
      * `0700` store directory; other platforms depend on the directory's
      * default ACL. Without this opt-in, credentials remain in memory only.
+     *
+     * `directory` is used verbatim: nothing expands `~`, so a value starting
+     * with `~` throws rather than creating a directory literally named `~`
+     * under the working directory. A relative path follows the process
+     * working directory; prefer an absolute one.
      */
     builder& file_token_store(std::string_view directory)
     {

@@ -946,6 +946,12 @@ pub unsafe extern "C" fn questdb_oidc_builder_ca_bundle(
 /// Access, ID, and long-lived refresh tokens are stored as unencrypted JSON.
 /// Unix uses owner-only file/directory modes; other platforms depend on the
 /// directory's default ACL. Without this opt-in, credentials remain in memory.
+///
+/// `directory` is used verbatim: no runtime expands `~`, so a `~/...` value is
+/// rejected here rather than silently creating a directory literally named `~`
+/// under the working directory and leaving a long-lived refresh token in it.
+/// A relative path is accepted but follows the process working directory, so
+/// prefer an absolute one.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn questdb_oidc_builder_file_token_store(
     builder: *mut questdb_oidc_builder,
@@ -966,8 +972,37 @@ pub unsafe extern "C" fn questdb_oidc_builder_file_token_store(
     }) else {
         return false;
     };
+    if let Err(err) = reject_unexpanded_home(directory) {
+        unsafe { set_err_out_from_error(err_out, err) };
+        return false;
+    }
     builder.config.file_store = FileStoreConfig::Directory(PathBuf::from(directory));
     true
+}
+
+/// Refuse a token-store directory whose leading `~` nothing will expand.
+///
+/// A shell expands `~`, a runtime does not, so this client and the Java client
+/// both create a directory literally *named* `~` and write a long-lived
+/// plaintext refresh token into it -- usually under whatever directory the
+/// process happened to start in. The Python binding expands and absolutises the
+/// same argument at construction, so without this check one spelling means two
+/// different locations depending on which binding a user reached for. Fail
+/// loudly instead, matching `at_default_location`'s treatment of the shared
+/// environment override.
+fn reject_unexpanded_home(directory: &str) -> questdb::Result<()> {
+    if directory == "~" || directory.starts_with("~/") || directory.starts_with("~\\") {
+        return Err(Error::new(
+            ErrorCode::ConfigError,
+            format!(
+                "the OIDC token-store directory {directory:?} starts with `~`, which \
+                 shells expand but this client does not: it would create a directory \
+                 literally named `~` under the working directory and leave a plaintext \
+                 refresh token there. Pass an already-expanded absolute path."
+            ),
+        ));
+    }
+    Ok(())
 }
 
 /// Explicitly enable plaintext token persistence at the configured default
@@ -1407,6 +1442,29 @@ mod tests {
     use std::net::{TcpListener, TcpStream};
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicPtr, AtomicUsize, Ordering};
+
+    #[test]
+    fn file_token_store_rejects_an_unexpanded_home_path() {
+        // A shell expands `~`; no runtime does. Left alone, this created a
+        // directory literally named `~` under the working directory and left a
+        // long-lived plaintext refresh token in it, while the same string
+        // handed to the Python binding landed in $HOME. Reject it here so one
+        // spelling cannot mean two locations.
+        for bad in ["~", "~/tokens", "~/.questdb/oidc-tokens"] {
+            assert!(
+                reject_unexpanded_home(bad).is_err(),
+                "{bad:?} must be rejected"
+            );
+        }
+        // An already-expanded path, a relative one, and a name that merely
+        // contains a tilde all stay acceptable.
+        for ok in ["/home/u/.questdb/oidc-tokens", "tokens", "./t", "a~b"] {
+            assert!(
+                reject_unexpanded_home(ok).is_ok(),
+                "{ok:?} must be accepted"
+            );
+        }
+    }
 
     #[test]
     fn token_busy_error_carries_a_structured_oidc_cause() {

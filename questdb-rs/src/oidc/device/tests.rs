@@ -1129,6 +1129,33 @@ fn control_chars_in_token_are_rejected() {
 }
 
 #[test]
+fn empty_endpoint_overrides_are_rejected_like_the_other_four() {
+    // An empty override still counts as EXPLICIT, so it suppresses both the
+    // `/settings` value and the IdP discovery fallback for that endpoint and
+    // then fails far away with a message about unsafe authority characters.
+    // All six string overrides now fail the same way, as the Python binding
+    // already made them.
+    for (label, builder) in [
+        (
+            "token endpoint",
+            OidcDeviceAuth::from_questdb("https://q.example.com:9000").token_endpoint(""),
+        ),
+        (
+            "device-authorization endpoint",
+            OidcDeviceAuth::from_questdb("https://q.example.com:9000")
+                .device_authorization_endpoint(""),
+        ),
+    ] {
+        let err = builder.build().unwrap_err();
+        assert_eq!(err.kind(), OidcErrorKind::Config, "{label}");
+        assert!(
+            err.to_string().contains("must not be empty"),
+            "{label}: expected the empty-override message, got {err}"
+        );
+    }
+}
+
+#[test]
 fn silent_refresh_without_reprompt() {
     let device_calls = Arc::new(AtomicUsize::new(0));
     let mock = {

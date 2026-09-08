@@ -257,6 +257,13 @@ bool questdb_oidc_builder_ca_bundle(
  * directory's default ACL. The caller must ensure that the directory is
  * accessible only to the intended account and accept the at-rest exposure.
  * Without this call, credentials remain in memory only.
+ *
+ * `directory` is used verbatim. Nothing here expands `~` -- a shell does that,
+ * a runtime does not -- so a value starting with `~` is REJECTED rather than
+ * creating a directory literally named `~` under the working directory and
+ * leaving a plaintext refresh token in it. A relative path is accepted but is
+ * resolved afresh at every use, so a chdir moves the store; prefer an absolute
+ * path. Pass an already-expanded absolute path for `~`-style locations.
  */
 QUESTDB_CLIENT_API
 bool questdb_oidc_builder_file_token_store(

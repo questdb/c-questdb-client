@@ -544,6 +544,18 @@ pub(crate) fn resolve_config(http: &HttpClient, params: &DiscoveryParams) -> Res
         ("scope", params.scope.as_deref()),
         ("audience", params.audience.as_deref()),
         ("issuer", params.issuer.as_deref()),
+        // The endpoints belong here too. An empty override still counts as
+        // EXPLICIT below, so it suppresses the `/settings` value and the IdP
+        // discovery fallback for that endpoint, then fails far away in
+        // `reject_confusable_authority` with a message about userinfo and
+        // non-ASCII characters -- none of which is "it is empty". The Python
+        // binding already rejects all six at its own layer; this is the same
+        // check for every other surface.
+        ("token endpoint", params.token_endpoint.as_deref()),
+        (
+            "device-authorization endpoint",
+            params.device_authorization_endpoint.as_deref(),
+        ),
     ] {
         if value == Some("") {
             return Err(OidcError::config(format!(

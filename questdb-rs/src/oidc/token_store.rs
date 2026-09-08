@@ -623,6 +623,20 @@ pub struct FileTokenStore {
 
 impl FileTokenStore {
     /// A store rooted at the given directory.
+    ///
+    /// The path is used **verbatim**. Nothing expands `~` — a shell does that,
+    /// a runtime does not — so `at("~/tokens")` creates a directory literally
+    /// named `~` under the process working directory and leaves a long-lived
+    /// plaintext refresh token in it. A relative path is resolved afresh at
+    /// every use, so a `chdir` moves the store and re-runs the device flow.
+    /// Pass an already-expanded absolute path, or use
+    /// [`at_default_location`](Self::at_default_location).
+    ///
+    /// Unlike that constructor and the shared environment override, this one
+    /// applies no restriction: it is the deliberate escape hatch for a caller
+    /// that has resolved the path itself. The C setter
+    /// `questdb_oidc_builder_file_token_store` does reject a leading `~`,
+    /// matching the Python binding, which expands and absolutises instead.
     pub fn at(directory: impl Into<PathBuf>) -> Self {
         FileTokenStore {
             directory: directory.into(),
