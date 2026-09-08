@@ -605,7 +605,9 @@ impl<O: BorrowMut<Reader>> OwnedCursor<O> {
     /// Shared by [`Self::next_arrow_batch`] and [`OwnedArrowReader`]'s
     /// `Iterator` impl — `expected_schema` is `Some` only from the latter,
     /// which pins a schema at construction and wants every later batch
-    /// checked against it. Forwards straight to
+    /// checked against it, except for the first frame after a failover
+    /// replay, which it passes `None` and validates itself. Forwards
+    /// straight to
     /// `CursorState::next_arrow_batch_inner`, the same method the borrowing
     /// path's `Cursor::next_arrow_batch_inner` calls: no protocol logic is
     /// duplicated here.
@@ -637,29 +639,43 @@ impl<O: BorrowMut<Reader>> OwnedCursor<O> {
     /// [`CursorRecordBatchReader`](crate::egress::arrow::CursorRecordBatchReader)
     /// does, including its tentative-array special case (see that type's
     /// docs for why `schemas_equal` alone can't catch a tentative→firm
-    /// ndim upgrade). What is deliberately **not** mirrored is the
-    /// post-failover replay/re-pin dance `CursorRecordBatchReader` performs
-    /// with `resets_at_pin`. Without an `on_failover_reset` callback that
-    /// dance is unreachable — `CursorState`'s silent-duplicate guard turns
-    /// a post-first-batch failover into `FailoverWouldDuplicate` — so for
-    /// the default case it is dead code. A caller that *does* install
-    /// [`OwnedQuery::on_failover_reset`] and then wraps the cursor here
-    /// authorises replay, and a replayed stream restarting at
-    /// `batch_seq=0` re-delivers batches this reader has already yielded:
-    /// use [`Self::next_arrow_batch_inner`] and handle the reset
-    /// explicitly if that matters. Schema *drift* across the replay is
-    /// still caught, by the pinned-schema check.
+    /// ndim upgrade) and its post-failover replay/re-pin dance with
+    /// `resets_at_pin`.
+    ///
+    /// That last part is reachable only for a caller that installs
+    /// [`OwnedQuery::on_failover_reset`] and then wraps the cursor here:
+    /// without the callback, `CursorState`'s silent-duplicate guard turns a
+    /// post-first-batch failover into `FailoverWouldDuplicate` and the
+    /// stream never replays. With the callback the caller has authorised
+    /// replay, and a replayed stream restarts at `batch_seq=0`, so this
+    /// reader **re-delivers batches it has already yielded** — that is what
+    /// installing the callback opts into, and the callback is where a
+    /// consumer learns to discard what it accumulated. What the re-pin
+    /// dance adds is the part a
+    /// [`RecordBatchReader`](arrow::array::RecordBatchReader) cannot
+    /// negotiate: the first replayed frame is passed to the decoder without
+    /// an internal drift check (a new endpoint's batch 0 legitimately
+    /// re-sends its schema and dictionary state), then required to match
+    /// the schema already handed out, because a `RecordBatchReader`'s
+    /// schema is fixed for its lifetime. Without it, every replay would
+    /// surface as spurious
+    /// [`SchemaDrift`](crate::ErrorCode::SchemaDrift); with it, only a
+    /// genuinely different post-failover schema does. Use
+    /// [`Self::next_arrow_batch_inner`] directly if you need to observe the
+    /// reset and de-duplicate yourself.
     pub fn into_arrow_reader(mut self) -> Result<OwnedArrowReader<O>> {
         let first = self.next_arrow_batch_checked(None)?;
         let schema = match &first {
             Some(b) => b.schema(),
             None => std::sync::Arc::new(arrow::datatypes::Schema::empty()),
         };
+        let resets_at_pin = self.failover_resets();
         Ok(OwnedArrowReader {
             cursor: self,
             schema,
             pending: first,
             poisoned: false,
+            resets_at_pin,
         })
     }
 }
@@ -688,6 +704,11 @@ pub struct OwnedArrowReader<O: BorrowMut<Reader>> {
     schema: arrow::datatypes::SchemaRef,
     pending: Option<arrow::array::RecordBatch>,
     poisoned: bool,
+    /// [`OwnedCursor::failover_resets`] at the point `schema` was pinned.
+    /// Mirrors `CursorRecordBatchReader::resets_at_pin`; see
+    /// [`OwnedCursor::into_arrow_reader`] for when it moves and why the
+    /// replayed frame still has to match the pinned schema.
+    resets_at_pin: u32,
 }
 
 #[cfg(feature = "arrow-egress")]
@@ -711,16 +732,42 @@ impl<O: BorrowMut<Reader>> Iterator for OwnedArrowReader<O> {
         if let Some(rb) = self.pending.take() {
             return Some(Ok(rb));
         }
-        match self.cursor.next_arrow_batch_checked(Some(&self.schema)) {
+        // A transparent mid-query failover (only possible when the caller
+        // installed `on_failover_reset`) re-reads the result from
+        // `batch_seq 0` on a new endpoint. Pass `None` (no drift check) for
+        // that first replayed frame so the new node's batch 0 isn't rejected,
+        // then require it to match the pinned schema: a RecordBatchReader's
+        // schema must be stable for its lifetime, so a genuinely different
+        // post-failover schema is surfaced as drift, not silently swapped in.
+        let drift_check = if self.cursor.failover_resets() == self.resets_at_pin {
+            Some(&self.schema)
+        } else {
+            None
+        };
+        match self.cursor.next_arrow_batch_checked(drift_check) {
             Ok(Some(rb)) => {
-                // Same representability gap `CursorRecordBatchReader` guards
-                // against: `schemas_equal` (which backs the `expected_schema`
-                // drift check just above) deliberately treats a tentative
-                // ndim metadata field as matching any concrete dimension, so
-                // a tentative→firm upgrade sails past that check even though
-                // the actual `arrow::datatypes::Schema` now differs from the
-                // one already handed out as this reader's fixed schema.
-                if has_tentative_array(&self.schema) && rb.schema() != self.schema {
+                if self.cursor.failover_resets() != self.resets_at_pin {
+                    if rb.schema() != self.schema {
+                        self.poisoned = true;
+                        return Some(Err(external_arrow_error(fmt!(
+                            SchemaDrift,
+                            "post-failover replay returned a different schema; \
+                             a RecordBatchReader schema must be stable for the \
+                             reader's lifetime; use \
+                             OwnedCursor::next_arrow_batch_inner to handle \
+                             drift explicitly"
+                        ))));
+                    }
+                    self.resets_at_pin = self.cursor.failover_resets();
+                } else if has_tentative_array(&self.schema) && rb.schema() != self.schema {
+                    // Same representability gap `CursorRecordBatchReader`
+                    // guards against: `schemas_equal` (which backs the
+                    // `expected_schema` drift check just above) deliberately
+                    // treats a tentative ndim metadata field as matching any
+                    // concrete dimension, so a tentative→firm upgrade sails
+                    // past that check even though the actual
+                    // `arrow::datatypes::Schema` now differs from the one
+                    // already handed out as this reader's fixed schema.
                     self.poisoned = true;
                     return Some(Err(external_arrow_error(fmt!(
                         SchemaDrift,
@@ -753,8 +800,8 @@ impl<O: BorrowMut<Reader>> arrow::array::RecordBatchReader for OwnedArrowReader<
 
 // `Send` holds whenever `O` does: `OwnedArrowReader` adds only a
 // `SchemaRef` (`Arc`, `Send + Sync`), an `Option<RecordBatch>` (`Send`
-// when its arrays are, which QuestDB's Arrow arrays are), and a `bool` on
-// top of the `OwnedCursor` it wraps — no interior mutability, no raw
+// when its arrays are, which QuestDB's Arrow arrays are), a `bool` and a
+// `u32` on top of the `OwnedCursor` it wraps — no interior mutability, no raw
 // pointers. Checked here for the pool-backed `OwnedReader` shape ADBC
 // actually uses (only available when `sync-sender-qwp-ws` is also on); a
 // second copy against `PooledCursor` lives in `tests/egress_owned_arrow.rs`
