@@ -3,7 +3,39 @@
 Status: server progress interruption observed; root cause **not established**.
 This branch is diagnostic only. Keep sender timeouts and correctness assertions
 unchanged. Azure PR 200 allocates only one macOS worker, running only
-`TestQwpWsFuzz.test_add_columns` after validating recorder capability.
+`TestQwpWsFuzz.test_add_columns` with the focused query-stage probe below.
+
+## Current focus: the original slow SHOW COLUMNS
+
+Build 268363 successfully captured two short ping stalls. All three HTTP workers
+spent most of each failed probe in repeated ftruncate calls, predominantly
+blocked. Those captures do not establish the original 74.7-second SHOW COLUMNS
+delay or the 120-second QWP close-drain failure. HTTP and O3 already use distinct
+shared-network/shared-write pools in the failing revision.
+
+The next arm replaces System Trace with an exact-source, diagnostic-only module
+overlay for ShowColumnsRecordCursorFactory. Neither the server checkout nor its
+JAR is edited. The overlay logs cursor entry, initial circuit-breaker check,
+metadata hydration, metadata read-lock wait/acquisition, reader open, symbol
+size collection, reader close, cursor-ready, iteration, and completion/error.
+Query threads enqueue records in memory; one daemon writes bounded-queue
+telemetry and a heartbeat. Dropped/missing telemetry fails the diagnostic arm.
+
+An active cursor reaching five seconds requests the existing native/JVM stack
+capture. Ping and heartbeat measurements remain enabled but short anomalies no
+longer trigger invasive captures. Workload-error capture remains enabled. Stop
+after the first capture/failure, at most 40 repetitions, no new attempt after
+600 seconds, one macOS worker. Original test/sender/SQL timeouts are unchanged.
+
+The entry marker is inside ShowColumnsRecordCursorFactory.getCursor, after
+QueryProgress's exe log: a gap between exe and cursor-enter is itself evidence
+outside the instrumented cursor stages. The observer can also be delayed by a
+VM/JVM/storage pause; its heartbeat is not independent of the JVM. The existing
+external heartbeat and JVM safepoint logs help distinguish those cases.
+
+See [probe implementation and validation](diagnostics/show_columns/README.md).
+The recorder configuration described below is historical unless explicitly
+selecting the recorder-only preflight parameter.
 
 Local follow-up, 2026-09-08: a controlled O3 close delay demonstrated global
 `FdCache` lock propagation into both WAL segment work and the serial network

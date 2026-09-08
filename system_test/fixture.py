@@ -593,6 +593,13 @@ class QuestDbFixture(QuestDbFixtureBase):
                 '-Xlog:gc*,safepoint=debug:file='
                 f'{watchdog_dir / "jvm-pauses.log"}'
                 ':utctime,uptimemillis,level,tags:filecount=2,filesize=16M']
+            query_probe = os.environ.get('QWP_WS_SHOW_COLUMNS_OVERLAY')
+            if query_probe:
+                overlay = pathlib.Path(query_probe).resolve(strict=True)
+                launch_args[1:1] = [
+                    '--patch-module', f'io.questdb={overlay}',
+                    f'-Dqwp.show.columns.dir={watchdog_dir}']
+                (watchdog_dir / 'show-columns-enabled').touch()
         sys.stderr.write(
             f'Starting QuestDB: {launch_args!r} '
             f'(auth: {self.auth}, http_auth: {self.http_auth}, '

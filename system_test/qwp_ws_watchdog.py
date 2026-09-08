@@ -139,9 +139,14 @@ def watch(run_dir, pid, port, stop):
                     write_event(log, 'ping', elapsed_ms=(time.monotonic() - started) * 1000,
                                 started_wall_ns=started_wall_ns, error=reason)
                 request = run_dir / 'capture-request'
+                if (run_dir / 'show-columns-enabled').exists():
+                    # Keep ping/heartbeat telemetry, but reserve invasive capture
+                    # for a slow query or an actual workload failure in this arm.
+                    slow_query = run_dir / 'show-columns-slow'
+                    reason = ('slow SHOW COLUMNS: ' + slow_query.read_text()) if slow_query.exists() else None
                 if request.exists():
                     reason = request.read_text()
-                if delayed.is_set() and reason is None:
+                if delayed.is_set() and reason is None and not (run_dir / 'show-columns-enabled').exists():
                     reason = 'watchdog heartbeat gap exceeded 1 second'
                 # Recheck after the probe: never diagnose teardown as onset.
                 if reason and collector is None and not (run_dir / 'workload-finished').exists():

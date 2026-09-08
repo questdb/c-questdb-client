@@ -20,6 +20,7 @@ readonly STOP_ON_CAPTURE="${QWP_WS_STOP_ON_CAPTURE:-1}"
 readonly MAX_SECONDS="${QWP_WS_MAX_SECONDS:-1200}"
 readonly MIN_FREE_KB="${QWP_WS_MIN_FREE_KB:-2097152}"
 readonly SYSTEM_TRACE="${QWP_WS_SYSTEM_TRACE:-0}"
+readonly QUERY_OVERLAY="${QWP_WS_SHOW_COLUMNS_OVERLAY:-}"
 
 if [[ ! "$RUN_COUNT" =~ ^[1-9][0-9]*$ ||
       ! "$MAX_SECONDS" =~ ^[1-9][0-9]*$ ||
@@ -46,6 +47,10 @@ if [[ "$FS_TRACE" != "0" && "$FS_TRACE" != "1" ]]; then
 fi
 
 cd "$ROOT_DIR" || exit 2
+if [[ -n "$QUERY_OVERLAY" && ( ! -s "$QUERY_OVERLAY" || "$SYSTEM_TRACE" != "0" ) ]]; then
+    echo "SHOW COLUMNS requires a compiled overlay and no System Trace" >&2
+    exit 2
+fi
 mkdir -p "$DIAG_DIR"
 if [[ "$SYSTEM_TRACE" == "1" &&
       ( ! -s "$DIAG_DIR/preflight/system-trace-valid.json" ||
@@ -364,6 +369,12 @@ for run_number in $(seq 1 "$RUN_COUNT"); do
         echo "memory_pressure exited before the diagnostic gate" \
             | tee -a "$DIAG_DIR/test.log"
         test_rc=2
+    fi
+    if [[ -n "$QUERY_OVERLAY" ]]; then
+        if ! python3 ci/diagnostics/show_columns/validate.py "$run_dir"; then
+            echo "Invalid SHOW COLUMNS telemetry" | tee -a "$DIAG_DIR/test.log"
+            [[ "$test_rc" -ne 0 ]] || test_rc=2
+        fi
     fi
     if [[ "$test_rc" -eq 0 && \
           -f "$run_dir/fs-usage-helper-exited" ]]; then

@@ -143,6 +143,28 @@ class WatchdogTest(unittest.TestCase):
                     thread.join(5)
                 capture.assert_called_once_with(directory, 123, 'SHOW COLUMNS timeout')
 
+    def test_query_arm_ignores_ping_timeout_then_captures_slow_query(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            (directory / 'start-test').touch()
+            (directory / 'show-columns-enabled').touch()
+            stop = threading.Event()
+            opener = mock.Mock()
+            calls = []
+
+            def ping(*args, **kwargs):
+                calls.append(1)
+                if len(calls) == 2:
+                    (directory / 'show-columns-slow').write_text('metadata-read-lock-wait')
+                raise TimeoutError('ping only')
+
+            opener.open.side_effect = ping
+            with mock.patch.object(watchdog.urllib.request, 'build_opener', return_value=opener), \
+                    mock.patch.object(watchdog, 'capture', side_effect=lambda *_: stop.set()) as capture:
+                watchdog.watch(directory, 123, 9000, stop)
+                capture.assert_called_once_with(directory, 123, 'slow SHOW COLUMNS: metadata-read-lock-wait')
+                self.assertEqual(len(calls), 2)
+
     def test_does_not_capture_a_ping_that_finishes_during_teardown(self):
         with tempfile.TemporaryDirectory() as tmp:
             directory = Path(tmp)
