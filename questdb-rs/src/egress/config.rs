@@ -1130,9 +1130,8 @@ impl ReaderConfig {
         if !matches!(self.auth, AuthMode::None) {
             return Err(fmt!(
                 ConfigError,
-                "\"token_provider\" is mutually exclusive with the static \
-                 username/password and token authentication set via the config \
-                 string."
+                "{}",
+                crate::token_provider::PROVIDER_CONFLICTS_WITH_STATIC_AUTH
             ));
         }
         self.token_provider = Some(crate::token_provider::TokenProvider::new(provider));
@@ -1273,9 +1272,8 @@ impl ReaderConfig {
         if self.token_provider.is_some() && !matches!(&self.auth, AuthMode::None) {
             return Err(fmt!(
                 ConfigError,
-                "\"token_provider\" is mutually exclusive with the static \
-                 username/password and token authentication set via the config \
-                 string."
+                "{}",
+                crate::token_provider::PROVIDER_CONFLICTS_WITH_STATIC_AUTH
             ));
         }
         // tls_verify=unsafe_off needs the crate feature. Re-checked
@@ -1324,10 +1322,17 @@ impl ReaderConfig {
     /// the Java reference client emits them. Authorization is appended last
     /// when an auth mode is set.
     ///
-    /// Crate-internal: this is the reader's handshake-header builder (resolving a
-    /// rotating token provider, hence fallible), not part of the public
-    /// `ReaderConfig` surface — callers use [`Reader::from_config`](crate::egress::Reader::from_config).
-    pub(crate) fn upgrade_headers(&self) -> Result<Vec<(&'static str, String)>> {
+    /// Most callers want [`Reader::from_config`](crate::egress::Reader::from_config)
+    /// instead; this is exposed for inspecting or logging the handshake the
+    /// reader will send.
+    ///
+    /// # Compatibility
+    ///
+    /// This returned a bare `Vec` before rotating token providers existed.
+    /// Resolving a provider can fail, so it now returns [`Result`]; a config
+    /// with no token provider never returns `Err`. Add `?` (or `.unwrap()` on a
+    /// static-credential config) at the callsite.
+    pub fn upgrade_headers(&self) -> Result<Vec<(&'static str, String)>> {
         let mut headers = Vec::with_capacity(8);
         headers.push(("X-QWP-Max-Version", self.max_version.to_string()));
         if let Some(id) = &self.client_id {

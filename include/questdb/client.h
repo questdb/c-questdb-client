@@ -161,6 +161,9 @@ void questdb_db_connect_options_init(
  * Provider calls may load or silently refresh a token but never start an
  * interactive device flow. Call questdb_oidc_auth_sign_in before opening the
  * pool; otherwise token acquisition reports InteractionRequired.
+ * `oidc_auth` is mutually exclusive with static credentials: `conf` must not
+ * also set `username`/`password` or `token`. Setting both fails with
+ * `questdb_error_config_error`.
  * `conf_len` must not exceed `QUESTDB_CONFIG_MAX_BYTES`.
  */
 QUESTDB_CLIENT_API

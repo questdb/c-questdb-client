@@ -1497,8 +1497,12 @@ public:
      * shared ownership, so `auth` does not need to outlive these options.
      * Provider calls may silently refresh but never prompt from flush/connect;
      * call auth.sign_in() explicitly before starting the sender.
+     * Mutually exclusive with static credentials: these opts must not also
+     * carry `username`/`password` or `token`, from the config string or from
+     * `username()` and friends.
      * @throws questdb::oidc::error if `auth` is empty or moved from.
-     * @throws line_sender_error if the sender configuration cannot use OIDC.
+     * @throws line_sender_error if the sender configuration cannot use OIDC,
+     *         including when static credentials are already set.
      * @note After attaching, a token-acquisition failure surfaces from
      *       `flush()` (and other sender calls) as a `line_sender_error`, with
      *       the structured OIDC detail on its `oidc_diagnostic()` member — not

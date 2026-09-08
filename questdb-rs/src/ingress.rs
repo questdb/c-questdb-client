@@ -1626,8 +1626,8 @@ impl SenderBuilder {
         {
             return Err(fmt!(
                 ConfigError,
-                "\"http_token_provider\" is mutually exclusive with \
-                 username/password and token authentication."
+                "{}",
+                crate::token_provider::PROVIDER_CONFLICTS_WITH_STATIC_AUTH
             ));
         }
         self.http_token_provider = Some(crate::token_provider::TokenProvider::new(provider));
@@ -1678,8 +1678,8 @@ impl SenderBuilder {
         {
             return Err(fmt!(
                 ConfigError,
-                "\"qwp_ws_token_provider\" is mutually exclusive with \
-                 username/password and token authentication."
+                "{}",
+                crate::token_provider::PROVIDER_CONFLICTS_WITH_STATIC_AUTH
             ));
         }
         self.qwp_ws.as_mut().unwrap().token_provider =
@@ -2688,8 +2688,8 @@ impl SenderBuilder {
             if self.http_token_provider.is_some() && fixed_credential_set {
                 return Err(error::fmt!(
                     ConfigError,
-                    "\"http_token_provider\" is mutually exclusive with \
-                     username/password and token authentication."
+                    "{}",
+                    crate::token_provider::PROVIDER_CONFLICTS_WITH_STATIC_AUTH
                 ));
             }
         }
@@ -2709,8 +2709,8 @@ impl SenderBuilder {
             {
                 return Err(error::fmt!(
                     ConfigError,
-                    "\"qwp_ws_token_provider\" is mutually exclusive with \
-                     username/password and token authentication."
+                    "{}",
+                    crate::token_provider::PROVIDER_CONFLICTS_WITH_STATIC_AUTH
                 ));
             }
         }
@@ -2939,8 +2939,8 @@ impl SenderBuilder {
                 if self.http_token_provider.is_some() && auth.is_some() {
                     return Err(fmt!(
                         ConfigError,
-                        "\"http_token_provider\" is mutually exclusive with \
-                         username/password and token authentication."
+                        "{}",
+                        crate::token_provider::PROVIDER_CONFLICTS_WITH_STATIC_AUTH
                     ));
                 }
                 let auth = match auth {
@@ -3461,8 +3461,8 @@ fn reject_qwp_ws_token_provider_auth_conflict(
     if qwp_ws.token_provider.is_some() && auth.is_some() {
         return Err(fmt!(
             ConfigError,
-            "\"qwp_ws_token_provider\" is mutually exclusive with \
-             username/password and token authentication."
+            "{}",
+            crate::token_provider::PROVIDER_CONFLICTS_WITH_STATIC_AUTH
         ));
     }
     Ok(())

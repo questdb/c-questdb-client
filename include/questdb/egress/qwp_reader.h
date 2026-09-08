@@ -193,6 +193,9 @@ qwp_reader* qwp_reader_from_conf(
  * so the caller may free its auth handle after this call returns. Provider
  * calls may load or silently refresh a token but never start an interactive
  * device flow; call questdb_oidc_auth_sign_in before opening the reader.
+ * Mutually exclusive with static credentials: `config` must not also set
+ * `username`/`password` or `token`. Setting both fails with
+ * `questdb_error_config_error`.
  * The config string must not exceed `QUESTDB_CONFIG_MAX_BYTES` bytes.
  */
 QUESTDB_CLIENT_API

@@ -526,6 +526,11 @@ bool questdb_error_oidc_get_view(
  * questdb_oidc_auth_sign_in before starting the sender; if another explicit
  * sign-in later becomes necessary, the transport reports
  * QUESTDB_OIDC_ERROR_INTERACTION_REQUIRED.
+ *
+ * Mutually exclusive with static credentials: the opts must not also carry
+ * `username`/`password` or `token` (whether set through the config string or
+ * through `line_sender_opts_username` and friends). Setting both fails with
+ * `questdb_error_config_error`.
  */
 QUESTDB_CLIENT_API
 bool line_sender_opts_oidc_auth(

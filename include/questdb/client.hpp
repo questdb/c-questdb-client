@@ -103,6 +103,9 @@ public:
      * Open a pool whose sender and reader connections share one rotating OIDC
      * token provider. The pool retains the auth state internally. Provider
      * calls may silently refresh but never prompt; call auth.sign_in() first.
+     * Mutually exclusive with static credentials: `conf` must not also set
+     * `username`/`password` or `token`.
+     * @throws questdb::error with `config_error` if it does.
      */
     pool(std::string_view conf, const ::questdb::oidc::device_auth& auth)
     {

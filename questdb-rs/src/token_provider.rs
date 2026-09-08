@@ -38,6 +38,23 @@ use std::time::Duration;
 #[cfg(feature = "_sender-qwp-ws")]
 const ISOLATED_PROVIDER_POLL: Duration = Duration::from_millis(5);
 
+/// User-facing text for "a rotating token provider and static credentials were
+/// both configured".
+///
+/// Phrased in terms of the public surfaces rather than the internal builder
+/// field. `http_token_provider`, `qwp_ws_token_provider` and `token_provider`
+/// appear in no C or C++ header, so a caller who arrived here through
+/// `line_sender_opts_oidc_auth`, `questdb_db_connect_options.oidc_auth`,
+/// `qwp_reader_from_conf_with_oidc` or Python's `oidc_auth=` was told to go
+/// looking for a symbol that does not exist on their surface.
+pub(crate) const PROVIDER_CONFLICTS_WITH_STATIC_AUTH: &str = "A rotating token provider is mutually exclusive with the static \
+     username/password and token authentication. Configure exactly one: an OIDC \
+     or token provider (Python `oidc_auth=`; C/C++ `line_sender_opts_oidc_auth`, \
+     `questdb_db_connect_options.oidc_auth` or `qwp_reader_from_conf_with_oidc`; \
+     Rust `SenderBuilder::http_token_provider` / `qwp_ws_token_provider` or \
+     `ReaderConfig::token_provider`), or the `username` / `password` / `token` \
+     settings.";
+
 /// The boxed provider closure. Returns a fresh token (the raw token, *not* the
 /// `Bearer` header) or an error that fails the connection attempt.
 pub(crate) type TokenProviderFn = Arc<dyn Fn() -> crate::Result<String> + Send + Sync>;
