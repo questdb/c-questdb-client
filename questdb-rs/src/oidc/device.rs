@@ -83,6 +83,11 @@ const ACQUIRE_WAIT_POLL_SLICE: Duration = Duration::from_millis(50);
 const MIN_REFRESH_RETRY_INTERVAL: Duration = Duration::from_secs(5);
 const MIN_STORE_LOAD_RETRY_INTERVAL: Duration = Duration::from_secs(5);
 const MAX_STORE_LOAD_RETRY_INTERVAL: Duration = Duration::from_secs(60);
+// How often an unauthenticated provider re-reads a store that was empty last
+// time, so a sign-in performed in another process is picked up without a
+// restart. Bounded so the re-check is one locked read per interval rather than
+// one per `token()` — i.e. per flush on the ILP/HTTP path.
+const EMPTY_STORE_LOAD_RECHECK_INTERVAL: Duration = Duration::from_secs(5);
 
 type SleepFn = Arc<dyn Fn(Duration) + Send + Sync>;
 /// Monotonic clock source for the poll loop; overridable in tests to drive the
@@ -92,8 +97,18 @@ type NowFn = Arc<dyn Fn() -> Instant + Send + Sync>;
 /// Persistence bookkeeping, touched only under the `acquire` lock.
 #[derive(Default)]
 struct StoreState {
-    /// Whether the one-shot lazy load from the store has run.
+    /// Whether the store has been adopted into this instance's cache — set by a
+    /// locked read that actually found an entry, and by `try_clear` so a cleared
+    /// credential is not reloaded. An *empty* read does not set it; see
+    /// `next_empty_load_recheck`.
     load_attempted: bool,
+    /// Earliest instant at which an empty lazy load may be repeated. A read that
+    /// found nothing is not a failure and must not latch: the locked read makes
+    /// an absent entry stable against a peer *refresh*, but not against a peer
+    /// *sign-in*, which a long-lived provider must still be able to pick up.
+    /// Throttled rather than repeated per `token()` so the re-check costs one
+    /// locked read per interval, not one per flush.
+    next_empty_load_recheck: Option<Instant>,
     /// Earliest instant at which a failed lazy load may be retried.
     next_load_attempt: Option<Instant>,
     /// Delay to apply after the next failed load. The first failure leaves the
@@ -118,6 +133,19 @@ impl StoreState {
     fn reset_store_load_backoff(&mut self) {
         self.next_load_attempt = None;
         self.load_retry_interval = Duration::ZERO;
+        self.next_empty_load_recheck = None;
+    }
+
+    /// Whether an empty read is still within its re-check interval. Unlike
+    /// `store_load_backed_off` this is not an error condition: the caller simply
+    /// skips the read and proceeds, ending at `InteractionRequired` as it would
+    /// have anyway.
+    fn empty_load_throttled(&self, now: Instant) -> bool {
+        self.next_empty_load_recheck.is_some_and(|next| now < next)
+    }
+
+    fn record_store_load_empty(&mut self, now: Instant) {
+        self.next_empty_load_recheck = Some(now + EMPTY_STORE_LOAD_RECHECK_INTERVAL);
     }
 
     fn store_load_backed_off(&self, now: Instant) -> bool {
@@ -1029,17 +1057,30 @@ impl OidcDeviceAuth {
                 ));
             }
             match self.try_refresh_coordinated(tokens) {
-                Ok(refreshed) if self.has_required_token(&refreshed) => {
+                // `is_usable`, not `has_required_token`: the served token must
+                // also still be valid. Bounding `expires_at` by the served
+                // token's own `exp` (see `tokenset_from_response`) means an IdP
+                // that re-returns the original `id_token` on a refresh -- the
+                // same IdP behaviour the arm below exists for -- yields a set
+                // that HAS the required kind and is already expired. Admitting
+                // it here reset the refresh backoff and cached a dead token, so
+                // every later `token()` missed the cache and ran the whole
+                // coordinated refresh again: one IdP round-trip and one
+                // refresh-token rotation per flush, with the caller handed an
+                // expired token and a 401 instead of `InteractionRequired`.
+                Ok(refreshed) if self.is_usable(&refreshed) => {
                     self.ensure_open()?;
                     self.lock_store_state().reset_refresh_backoff();
                     *self.lock_tokens() = Some(refreshed.clone());
                     return Ok(refreshed);
                 }
-                // Refresh succeeded but didn't yield the required kind: some
-                // IdPs don't re-issue the id_token on refresh. Fall through to
-                // a fresh sign-in, but carry the rotated refresh token with us —
-                // the parent it replaced is already consumed and deleted, so
-                // dropping this too would lock a headless caller out for good.
+                // Refresh succeeded but the result is not servable: some IdPs
+                // don't re-issue the id_token on refresh, and some re-issue the
+                // *original* one, so the required kind is either missing or
+                // already expired. Fall through to a fresh sign-in either way,
+                // but carry the rotated refresh token with us — the parent it
+                // replaced is already consumed and deleted, so dropping this too
+                // would lock a headless caller out for good.
                 Ok(refreshed) => {
                     // Back off the next silent refresh: without this every
                     // token() call would burn another refresh-token rotation to
@@ -1074,12 +1115,13 @@ impl OidcDeviceAuth {
         // before the interactive flow so a failure doesn't leave it cached. This
         // also covers a cached token that had no refresh token to begin with
         // (which skips the block above entirely). The one thing kept is a refresh
-        // that succeeded but withheld the required kind: it carries a rotated
-        // refresh token, and the parent it replaced is already consumed and
-        // deleted, so dropping it too would lock a headless caller out for good.
-        // It cannot leak as a served token -- `is_usable` gates on
-        // `has_required_token`, which is precisely what this set lacks. A
-        // rejected (expired/revoked) refresh token leaves this `None`.
+        // that succeeded but was not servable: it carries a rotated refresh
+        // token, and the parent it replaced is already consumed and deleted, so
+        // dropping it too would lock a headless caller out for good. It cannot
+        // leak as a served token: every read path gates on `is_usable`, which
+        // this set fails either because it withheld the required kind or because
+        // the kind it returned is already expired. A rejected (expired/revoked)
+        // refresh token leaves this `None`.
         *self.lock_tokens() = refreshed_unusable;
         if !allow_interaction {
             return Err(OidcError::interaction_required(
@@ -1130,6 +1172,12 @@ impl OidcDeviceAuth {
             if state.load_attempted {
                 return Ok(());
             }
+            // Nothing was there a moment ago. Skip the read but stay unlatched,
+            // so the next interval re-checks; this is not an error, and the
+            // caller ends at `InteractionRequired` exactly as it would have.
+            if state.empty_load_throttled(now) {
+                return Ok(());
+            }
             if state.store_load_backed_off(now) {
                 return Err(OidcError::network(
                     "Loading the OIDC token store is temporarily backed off after repeated \
@@ -1155,8 +1203,24 @@ impl OidcDeviceAuth {
                     warn_persistence("lock", &*e);
                 }
                 let mut state = self.lock_store_state();
-                state.load_attempted = true;
-                state.reset_store_load_backoff();
+                if persisted.is_some() {
+                    // An entry was found and is adopted below: the one-shot load
+                    // is done and must not run again.
+                    state.load_attempted = true;
+                    state.reset_store_load_backoff();
+                } else {
+                    // A locked read that found nothing is authoritative against a
+                    // peer *refresh*, but says nothing about a peer *sign-in*.
+                    // Latching it stranded a long-lived provider that started
+                    // before any credential existed: it returned
+                    // InteractionRequired for the life of the process even after
+                    // an operator signed in from another process, while the QWP
+                    // drainer retried forever on the human-fixable condition
+                    // `classify_provider_error` keeps retryable for exactly that
+                    // recovery. Re-check on an interval instead.
+                    state.reset_store_load_backoff();
+                    state.record_store_load_empty(now);
+                }
                 drop(state);
                 self.adopt(persisted);
                 Ok(())

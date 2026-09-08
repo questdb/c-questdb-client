@@ -2098,6 +2098,79 @@ fn groups_mode_refresh_without_id_token_requires_explicit_sign_in() {
     assert_eq!(device_calls.load(Ordering::SeqCst), 2);
 }
 
+#[test]
+fn groups_mode_refresh_returning_an_expired_id_token_requires_explicit_sign_in() {
+    // Twin of `groups_mode_refresh_without_id_token_requires_explicit_sign_in`
+    // for the IdP that re-returns the ORIGINAL id_token instead of omitting it.
+    // The set then HAS the required kind and is already expired, so gating the
+    // accept arm on `has_required_token` admitted it: the refresh backoff was
+    // reset, a dead token was cached and served, and because `is_usable` still
+    // rejected it on the read path every later `token()` ran the whole
+    // coordinated refresh again -- one IdP round-trip and one refresh-token
+    // rotation per call, with the caller handed an expired token and a 401
+    // rather than InteractionRequired.
+    let refresh_calls = Arc::new(AtomicUsize::new(0));
+    let device_calls = Arc::new(AtomicUsize::new(0));
+    let stale_id = jwt_with_exp(1);
+    let mock = {
+        let refresh_calls = Arc::clone(&refresh_calls);
+        let device_calls = Arc::clone(&device_calls);
+        let stale_id = stale_id.clone();
+        MockServer::start(move |method, path, body| match (method, path) {
+            ("POST", "/device") => {
+                device_calls.fetch_add(1, Ordering::SeqCst);
+                (200, device_response())
+            }
+            ("POST", "/token") => {
+                if body.contains("grant_type=refresh_token") {
+                    let n = refresh_calls.fetch_add(1, Ordering::SeqCst) + 1;
+                    (
+                        200,
+                        format!(
+                            r#"{{"access_token":"AT-{n}","id_token":"{stale_id}","refresh_token":"RT-{n}","expires_in":3600}}"#
+                        ),
+                    )
+                } else {
+                    (
+                        200,
+                        r#"{"access_token":"AT-1","id_token":"ID-1","refresh_token":"RT-1","expires_in":300}"#
+                            .to_string(),
+                    )
+                }
+            }
+            _ => (404, "{}".to_string()),
+        })
+    };
+    let auth = explicit_auth(&mock, true);
+    assert_eq!(sign_in_and_token(&auth).unwrap(), "ID-1");
+    auth.tokens.lock().unwrap().as_mut().unwrap().expires_at = 1.0;
+
+    // The expired id_token must never be served, and the refresh must not be
+    // re-armed by accepting it.
+    let err = auth.token().unwrap_err();
+    assert_eq!(err.kind(), OidcErrorKind::InteractionRequired);
+    assert_eq!(refresh_calls.load(Ordering::SeqCst), 1);
+
+    // The backoff the accept arm used to clear now holds, so repeated calls do
+    // not burn a refresh-token rotation each. They report the same
+    // "temporarily backed off" Network error the missing-kind case produces.
+    for _ in 0..4 {
+        assert_eq!(auth.token().unwrap_err().kind(), OidcErrorKind::Network);
+    }
+    assert_eq!(
+        refresh_calls.load(Ordering::SeqCst),
+        1,
+        "each token() burned another refresh-token rotation"
+    );
+    assert_eq!(device_calls.load(Ordering::SeqCst), 1);
+
+    // The rotated refresh token is still carried, so an explicit sign_in()
+    // recovers through a fresh device flow.
+    auth.sign_in().unwrap();
+    assert_eq!(auth.token().unwrap(), "ID-1");
+    assert_eq!(device_calls.load(Ordering::SeqCst), 2);
+}
+
 /// Build an auth with explicit dummy endpoints — no server is contacted, enough
 /// to exercise the pure `tokenset_from_response` mapping.
 fn offline_auth() -> OidcDeviceAuth {
@@ -3859,6 +3932,57 @@ fn failed_rotated_child_save_leaves_no_reusable_parent() {
         "the stale peer replayed a refresh-token parent"
     );
     assert_eq!(stale_peer.token_set().unwrap().refresh_token, None);
+}
+
+#[test]
+fn a_peer_process_sign_in_is_adopted_without_a_restart() {
+    // Regression: an empty locked read latched `load_attempted`, so a provider
+    // that started before any credential existed never consulted the store
+    // again. A headless service sharing a FileTokenStore with an operator's
+    // separate sign-in then returned InteractionRequired for the life of the
+    // process, and the QWP drainer retried forever -- while
+    // `classify_provider_error` keeps that error retryable precisely because a
+    // human is expected to be able to clear it. Only a restart worked.
+    let mock = MockServer::start(|method, path, _body| match (method, path) {
+        ("POST", "/device") => (200, device_response()),
+        ("POST", "/token") => (
+            200,
+            r#"{"access_token":"AT-1","refresh_token":"RT-1","expires_in":300}"#.to_string(),
+        ),
+        _ => (404, "{}".to_string()),
+    });
+    let dir = TempDir::new().unwrap();
+
+    // The long-lived service starts before anyone has signed in.
+    let service = auth_with_store(&mock, dir.path());
+    assert_eq!(
+        service.token().unwrap_err().kind(),
+        OidcErrorKind::InteractionRequired
+    );
+    {
+        // The empty read is throttled, not latched.
+        let state = service.store_state.lock().unwrap();
+        assert!(
+            !state.load_attempted,
+            "an empty read latched the one-shot load"
+        );
+        assert!(
+            state.next_empty_load_recheck.is_some(),
+            "an empty read must schedule a re-check"
+        );
+    }
+
+    // An operator signs in from another process against the same store.
+    let operator = auth_with_store(&mock, dir.path());
+    operator.sign_in().unwrap();
+
+    // Let the re-check interval elapse without sleeping in the test.
+    service.store_state.lock().unwrap().next_empty_load_recheck = None;
+    assert_eq!(service.token().unwrap(), "AT-1");
+    assert!(
+        service.store_state.lock().unwrap().load_attempted,
+        "adopting an entry must latch the one-shot load"
+    );
 }
 
 #[test]
