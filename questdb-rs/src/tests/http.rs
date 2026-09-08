@@ -580,6 +580,90 @@ fn test_two_retries(
 }
 
 #[test]
+fn test_credential_rotation_budget_is_one_per_flush() -> TestResult {
+    // Regression: the rotation budget is one per FLUSH. `http_send_with_retries`
+    // spends it on the pre-loop 401, then hands off to `retry_http_send`, which
+    // used to start its own `auth_retry_used` at `false` -- so a second 401 later
+    // in the same flush rotated again and replayed the whole buffer a second
+    // time, twice what the C header and this module both promise.
+    //
+    // Script: 401 (rotate) -> 500 (ladder) -> 401. The assertion is that the
+    // second 401 ends the flush instead of buying another replay.
+    let mut server = MockServer::new()?;
+    let provider_seq = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let mut sender = server
+        .lsb_http()
+        .protocol_version(ProtocolVersion::V2)?
+        .http_token_provider(move || {
+            Ok::<_, crate::Error>(format!(
+                "tok{}",
+                provider_seq.fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+            ))
+        })?
+        .retry_timeout(Duration::from_secs(30))?
+        .build()?;
+    let mut buffer = sender.new_buffer();
+    buffer
+        .table("test")?
+        .symbol("t1", "v1")?
+        .column_f64("f1", 0.5)?
+        .at(TimestampNanos::new(10000000))?;
+
+    let server_thread = std::thread::spawn(move || -> io::Result<usize> {
+        server.accept()?;
+        let mut requests = 0usize;
+
+        // 1: the credential resolved for the flush. 401 spends the budget.
+        let req = server.recv_http_q()?;
+        requests += 1;
+        assert_eq!(req.header("authorization"), Some("Bearer tok0"));
+        server.send_http_response_q(
+            HttpResponse::empty()
+                .with_status(401, "Unauthorized")
+                .with_body_str("Unauthorized"),
+        )?;
+
+        // 2: the one rotated replay, answered 5xx so the flush enters
+        // `retry_http_send` with the budget already spent.
+        let req = server.recv_http_q()?;
+        requests += 1;
+        assert_eq!(req.header("authorization"), Some("Bearer tok1"));
+        server.send_http_response_q(
+            HttpResponse::empty()
+                .with_status(500, "Internal Server Error")
+                .with_body_str("client should retry"),
+        )?;
+
+        // 3: a second 401 inside the retry loop. It must be reported, not
+        // rotated: the provider still has fresh values to hand out, so a
+        // surviving budget would show up as a fourth request bearing "tok2".
+        let req = server.recv_http_q()?;
+        requests += 1;
+        assert_eq!(req.header("authorization"), Some("Bearer tok1"));
+        server.send_http_response_q(
+            HttpResponse::empty()
+                .with_status(401, "Unauthorized")
+                .with_body_str("Unauthorized"),
+        )?;
+
+        // Nothing further may arrive. Read with a short deadline so a
+        // regression fails here rather than hanging the suite.
+        Ok(requests)
+    });
+
+    let res = sender.flush_and_keep(&buffer);
+    let requests = server_thread.join().unwrap()?;
+
+    assert_eq!(
+        requests, 3,
+        "one flush must not spend the rotation budget twice"
+    );
+    let err = res.unwrap_err();
+    assert_eq!(err.code(), ErrorCode::AuthError);
+    Ok(())
+}
+
+#[test]
 fn test_credential_rotation_keeps_retry_backoff() -> TestResult {
     // Regression: `retry_http_send`'s credential-rotation branch used to make
     // the rotated retry immediate by setting `retry_interval_ms = 0`. That

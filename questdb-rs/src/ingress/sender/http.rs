@@ -377,6 +377,10 @@ pub(super) fn parse_http_error(http_status_code: u16, response: Response<Body>) 
     }
 }
 
+// One more than clippy's default, following the same convention as the other
+// private connect/send plumbing in this module tree: these are the flush's
+// already-resolved knobs, not a design that wants a struct.
+#[allow(clippy::too_many_arguments)]
 fn retry_http_send(
     state: &SyncHttpHandlerState,
     buf: &[u8],
@@ -385,6 +389,7 @@ fn retry_http_send(
     retry_max_backoff: Duration,
     auth: Option<&str>,
     mut last_rep: Result<Response<Body>, ureq::Error>,
+    auth_already_rotated: bool,
 ) -> crate::Result<Response<Body>> {
     let mut rng = rand::rng();
     let retry_end = std::time::Instant::now() + retry_timeout;
@@ -404,7 +409,12 @@ fn retry_http_send(
     // attempt is worth repeating; if it is unchanged this is a genuine
     // rejection and the 401 stands, with no extra request.
     let mut refreshed: Option<String> = None;
-    let mut auth_retry_used = false;
+    // Carried in from `http_send_with_retries`: the rotation budget is one per
+    // FLUSH, not one per function. That caller may already have spent it on the
+    // pre-loop attempt and then handed control here, so starting this loop at
+    // `false` gave a single flush two rotated replays of the same buffer --
+    // twice what both this comment block and the C header promise.
+    let mut auth_retry_used = auth_already_rotated;
     // Set for exactly one iteration by the credential-rotation branch below, so
     // that retry goes out without a wait. It is a one-shot override rather than
     // `retry_interval_ms = 0` because the interval is the *ladder*: zeroing it
@@ -545,6 +555,9 @@ pub(super) fn http_send_with_retries(
             retry_max_backoff,
             Some(rotated.as_str()),
             last_rep,
+            // The rotation budget is spent: this call already replayed the
+            // buffer with a rotated credential.
+            true,
         );
     }
     if !need_retry || retry_timeout.is_zero() {
@@ -559,6 +572,8 @@ pub(super) fn http_send_with_retries(
         retry_max_backoff,
         auth,
         last_rep,
+        // No 401 was seen before the loop, so the rotation budget is intact.
+        false,
     )
 }
 
