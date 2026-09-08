@@ -2,8 +2,9 @@
 
 Status: server progress interruption observed; root cause **not established**.
 This branch is diagnostic only. Keep sender timeouts and correctness assertions
-unchanged. Azure PR 200 now allocates only one macOS worker for
-`TestQwpWsFuzz.test_add_columns`.
+unchanged. Azure PR 200 allocates only one macOS worker. The next run is
+**preflight-only**: establish recorder startup before resuming
+`TestQwpWsFuzz.test_add_columns`. It will not compile or start QuestDB.
 
 Local follow-up, 2026-09-08: a controlled O3 close delay demonstrated global
 `FdCache` lock propagation into both WAL segment work and the serial network
@@ -60,8 +61,56 @@ not. This establishes a mechanism, not the original macOS trigger. See the
   Maximum completed drain was 9.795 seconds; no consistent across-host latency
   deterioration or sampled swap activity was observed. Provider burst-credit
   exhaustion and physical-storage saturation remain unproven.
+- [Build 268344](https://dev.azure.com/questdb/questdb/_build/results?buildId=268344)
+  reached the System Trace preflight on Xcode 16.4. Readiness was absent when
+  the collector's 15-second startup budget expired; the recorder log was empty
+  and no trace was published. The error combined early exit, cancellation, and
+  timeout, and did not record the child PID/exit status. This does not establish
+  a permissions failure or lack of System Trace support. Compilation and the
+  QuestDB test were skipped; only one macOS job ran.
 
-## Current experiment
+## Current experiment: recorder startup only
+
+Pipeline parameter `qwpWsPreflightOnly` defaults to `true`. In that mode the
+expanded job contains checkout, tracing preflight, artifact ownership hand-back,
+and publication only. Dependency installs, client/server builds, the fuzz test,
+and server-log archival are excluded even if the smoke check succeeds. The job
+limit is ten minutes; the preflight step limit is five minutes. Do not turn the
+full experiment back on until the startup artifact has been inspected.
+
+Only the preflight receives a 60-second startup budget. The full test's recorder
+startup budget remains 15 seconds within its unchanged 30-second fixture gate.
+The smoke process now waits through cold startup and recorder cleanup rather
+than expiring at the old 25-second deadline. It exits without replacing the
+parent's error if the recorder finishes before releasing the smoke workload.
+
+New startup artifacts in `preflight/`:
+
+- `system-trace-launch.json`: exact recorder command and startup budget.
+- `system-trace-recorder.json`: actual recorder PID and attach-target PID.
+- `system-trace-startup.jsonl`: elapsed startup/clock readings and exit state
+  every five seconds, plus the failure transition.
+- `system-trace-ready.json`: startup latency when the notification arrives.
+- `system-trace-startup-failure.json`: distinct timeout, spontaneous exit, or
+  interruption, with the return code **before cleanup**.
+- `system-trace-startup-processes.log`: PID/parent, process group, state, CPU,
+  RSS, elapsed time, and command for the collector, recorder, and smoke target.
+- `system-trace-startup-sample.txt`: a one-second native sample of a recorder
+  still alive after startup failure. It is never taken during successful startup
+  or while running the QuestDB test. The process snapshot and sample have
+  five-/ten-second command deadlines; command errors/statuses are retained in
+  `system-trace-startup-diagnostics.json` and its accompanying command logs.
+- `system-trace-cleanup.json` and `system-trace-recorder-exit.json`: state before
+  cleanup and the final child return code. Do not mistake a cleanup-induced
+  SIGINT/SIGKILL exit for a spontaneous recorder failure.
+
+Startup diagnostic failure cannot suppress recorder cleanup or replace the
+original failure reason. Cancellation skips startup sampling. A longer deadline
+is an exploratory cold-start allowance, not a claim that slow initialization
+caused build 268344. A successful check still requires actual target syscall
+and scheduler rows; readiness alone is not sufficient.
+
+## Full experiment (disabled by default)
 
 The single worker uses server `12a33d651e51e2682e7a448c8db5168fc72dfad3`, Temurin
 25.0.3+9 (official download with pinned SHA-256), fuzz seed
@@ -79,7 +128,7 @@ filesystem/sleep smoke workload on the worker. It exports the trace TOC, discove
 syscall and thread-state tables, and requires actual rows associated with the
 smoke PID in both. Merely finding Xcode or creating a `.trace` directory is not
 success. Unsupported schemas or denied tracing stop the job at this preflight,
-which has a three-minute step limit; its logs/artifacts are still published.
+which has a five-minute step limit; its logs/artifacts are still published.
 No SIP or developer-security settings are changed. The root collector owns and
 reaps its recorder child; artifact ownership is returned to the CI uploader.
 
@@ -147,7 +196,12 @@ previously its catch-all hid timeouts from the diagnostic callback.
 
 ## Reading the next artifact
 
-Download `qwp-ws-macos-system-trace`. First check `preflight/`, the final stop
+Download `qwp-ws-macos-system-trace`. For the current preflight-only run, inspect
+the startup artifacts above and `system-trace-valid.json`/`system-trace-error.json`.
+There should be no `run-*` directories or QuestDB logs. Success establishes
+recorder capability only, not a reproduced ping timeout.
+
+When full testing is re-enabled, first check `preflight/`, the final stop
 reason in `test.log`, and each run's `system-trace-valid.json` or error marker.
 A green job with zero onset captures is a negative replay, not a diagnosis.
 

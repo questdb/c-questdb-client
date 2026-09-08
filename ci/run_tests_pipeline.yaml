@@ -1,5 +1,11 @@
 trigger: none
 
+parameters:
+  - name: qwpWsPreflightOnly
+    displayName: "QWP diagnostics: verify recorder startup only (no builds/tests)"
+    type: boolean
+    default: true
+
 variables:
   OS_MAPPING: none
   Windows_NT-X86: windows
@@ -398,57 +404,63 @@ stages:
               pathToPublish: $(Build.ArtifactStagingDirectory)/qdb-log-vs-master-$(Agent.OS).zip
               artifactName: qdb-log-vs-master-$(Agent.OS)
       - job: TestQwpWsFuzz
-        displayName: "QWP/WS syscall and scheduler diagnostics (one macOS worker)"
+        displayName: "QWP/WS recorder diagnostics (one macOS worker)"
         condition: eq(variables['Build.SourceBranch'], variables['QWP_WS_DIAGNOSTIC_REF'])
         variables:
           diagnosticReplica: system-trace
         pool:
           vmImage: macOS-15-arm64
-        timeoutInMinutes: 90
+        ${{ if parameters.qwpWsPreflightOnly }}:
+          timeoutInMinutes: 10
+        ${{ else }}:
+          timeoutInMinutes: 90
         steps:
           - checkout: self
             fetchDepth: 1
             lfs: false
             submodules: false
           - bash: bash ci/prepare_qwp_ws_system_trace.sh
-            displayName: "Verify syscall and scheduler tracing before compilation"
-            timeoutInMinutes: 3
+            displayName: "Verify recorder startup and exported syscall/scheduler events"
+            timeoutInMinutes: 5
             env:
               QWP_WS_DIAGNOSTICS_DIR: >-
                 $(Build.ArtifactStagingDirectory)/qwp-ws-macos-diagnostics
-          - template: templates/compile.yaml
-            parameters:
-              prerequisiteCondition: succeeded()
-          - template: templates/resolve_jdk25.yaml
-          - template: templates/clone_questdb.yaml
-            parameters:
-              # Original build 266336 task log 122 prints this build hash.
-              revision: 12a33d651e51e2682e7a448c8db5168fc72dfad3
-          - bash: bash ci/prepare_qwp_ws_jdk.sh
-            displayName: "Pin original Temurin 25.0.3+9"
-          - template: templates/maven_settings.yaml
-          - task: Maven@3
-            displayName: "Compile QuestDB"
-            retryCountOnTaskFailure: 2
-            inputs:
-              mavenPOMFile: "questdb/pom.xml"
-              javaHomeOption: "Path"
-              jdkDirectory: "$(JAVA_HOME)"
-              options: "-s $(MAVEN_SETTINGS_FILE) -DskipTests -Pbuild-web-console$(CLIENT_PROFILE) $(MAVEN_RUN_OPTS)"
-          - bash: bash ci/run_macos_qwp_ws_diagnostics.sh
-            displayName: "Capture two onset events with interleaved tracing controls"
-            timeoutInMinutes: 30
-            env:
-              # Attempts 1, 6, 11 are controls; at most ten traced attempts.
-              QWP_WS_DIAGNOSTIC_RUNS: "13"
-              QWP_WS_MAX_SECONDS: "600"
-              QWP_WS_STOP_ON_CAPTURE: "0"
-              QWP_WS_SYSTEM_TRACE: "1"
-              QWP_WS_MIN_FREE_KB: "2097152"
-              QWP_WS_DIAGNOSTICS_DIR: >-
-                $(Build.ArtifactStagingDirectory)/qwp-ws-macos-diagnostics
-              QWP_WS_MEMORY_PRESSURE: natural
-              QWP_WS_FS_TRACE: "0"
+          # Compile-time exclusion: a successful smoke check must not silently
+          # turn this startup investigation into another expensive test run.
+          - ${{ if not(parameters.qwpWsPreflightOnly) }}:
+            - template: templates/compile.yaml
+              parameters:
+                prerequisiteCondition: succeeded()
+            - template: templates/resolve_jdk25.yaml
+            - template: templates/clone_questdb.yaml
+              parameters:
+                # Original build 266336 task log 122 prints this build hash.
+                revision: 12a33d651e51e2682e7a448c8db5168fc72dfad3
+            - bash: bash ci/prepare_qwp_ws_jdk.sh
+              displayName: "Pin original Temurin 25.0.3+9"
+            - template: templates/maven_settings.yaml
+            - task: Maven@3
+              displayName: "Compile QuestDB"
+              retryCountOnTaskFailure: 2
+              inputs:
+                mavenPOMFile: "questdb/pom.xml"
+                javaHomeOption: "Path"
+                jdkDirectory: "$(JAVA_HOME)"
+                options: "-s $(MAVEN_SETTINGS_FILE) -DskipTests -Pbuild-web-console$(CLIENT_PROFILE) $(MAVEN_RUN_OPTS)"
+            - bash: bash ci/run_macos_qwp_ws_diagnostics.sh
+              displayName: "Capture two onset events with interleaved tracing controls"
+              timeoutInMinutes: 30
+              env:
+                # Attempts 1, 6, 11 are controls; at most ten traced attempts.
+                QWP_WS_DIAGNOSTIC_RUNS: "13"
+                QWP_WS_MAX_SECONDS: "600"
+                QWP_WS_STOP_ON_CAPTURE: "0"
+                QWP_WS_SYSTEM_TRACE: "1"
+                QWP_WS_MIN_FREE_KB: "2097152"
+                QWP_WS_DIAGNOSTICS_DIR: >-
+                  $(Build.ArtifactStagingDirectory)/qwp-ws-macos-diagnostics
+                QWP_WS_MEMORY_PRESSURE: natural
+                QWP_WS_FS_TRACE: "0"
           - bash: |
               # xctrace may create private root-owned files despite umask.
               # Return only this job's diagnostic artifacts to the uploader.
@@ -470,25 +482,26 @@ stages:
           # Mirrors ci/run_fuzz_pipeline.yaml: on failure, archive and
           # publish the QuestDB server log so PR reviewers don't have to
           # repro locally. Path comes from system_test/fixture.py:_log_path.
-          - task: ArchiveFiles@2
-            displayName: "Compress QuestDB server log on failure"
-            condition: failed()
-            continueOnError: true
-            inputs:
-              rootFolderOrFile: $(Build.SourcesDirectory)/build/questdb/repo/data/log
-              includeRootFolder: false
-              archiveType: zip
-              archiveFile: >-
-                $(Build.ArtifactStagingDirectory)/qdb-log-$(Agent.OS)-$(diagnosticReplica).zip
-              quiet: true
-          - task: PublishBuildArtifacts@1
-            displayName: "Publish QuestDB server log on failure"
-            condition: failed()
-            continueOnError: true
-            inputs:
-              pathToPublish: >-
-                $(Build.ArtifactStagingDirectory)/qdb-log-$(Agent.OS)-$(diagnosticReplica).zip
-              artifactName: qdb-log-$(Agent.OS)-$(diagnosticReplica)
+          - ${{ if not(parameters.qwpWsPreflightOnly) }}:
+            - task: ArchiveFiles@2
+              displayName: "Compress QuestDB server log on failure"
+              condition: failed()
+              continueOnError: true
+              inputs:
+                rootFolderOrFile: $(Build.SourcesDirectory)/build/questdb/repo/data/log
+                includeRootFolder: false
+                archiveType: zip
+                archiveFile: >-
+                  $(Build.ArtifactStagingDirectory)/qdb-log-$(Agent.OS)-$(diagnosticReplica).zip
+                quiet: true
+            - task: PublishBuildArtifacts@1
+              displayName: "Publish QuestDB server log on failure"
+              condition: failed()
+              continueOnError: true
+              inputs:
+                pathToPublish: >-
+                  $(Build.ArtifactStagingDirectory)/qdb-log-$(Agent.OS)-$(diagnosticReplica).zip
+                artifactName: qdb-log-$(Agent.OS)-$(diagnosticReplica)
 
       # Linux leg on self-hosted hetzner-incus — mirrors the equivalent
       # job in ci/run_fuzz_pipeline.yaml. Pool image is built from

@@ -23,6 +23,7 @@ from qwp_ws_trace_export import export_and_validate
 # The unchanged fixture gate has a 30-second budget; leave time for watchdog
 # startup and the host snapshot after the recorder is ready.
 START_TIMEOUT = 15
+PREFLIGHT_START_TIMEOUT = 60
 FINISH_TIMEOUT = 30
 RECORD_SECONDS = 30
 MIN_FREE_BYTES = 2 * 1024 ** 3
@@ -113,7 +114,80 @@ def stop_child(child):
             raise RuntimeError('xctrace did not finalize after SIGINT')
 
 
-def collect(directory, pid, on_ready=None):
+def capture_startup_state(directory, child, target_pid):
+    """Best-effort evidence before stopping a recorder that never became ready."""
+    results = []
+
+    def run(name, command, timeout):
+        result = dict(command=command)
+        try:
+            with (directory / name).open('w') as log:
+                completed = subprocess.run(command, stdout=log, stderr=subprocess.STDOUT,
+                                           timeout=timeout, check=False)
+                result['returncode'] = completed.returncode
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            result['error'] = repr(exc)
+        results.append(result)
+
+    run('system-trace-startup-processes.log', [
+        '/bin/ps', '-p', f'{child.pid},{target_pid},{os.getpid()}',
+        '-o', 'pid,ppid,pgid,state,%cpu,rss,etime,command'], 5)
+    # Sample only a still-owned, live recorder, never another process by name.
+    # This is after startup failure, not during the test or a successful start.
+    sampling_returncode = child.poll()
+    if sampling_returncode is None:
+        run('system-trace-startup-sample-command.log', [
+            '/usr/bin/sample', str(child.pid), '1', '10', '-file',
+            str(directory / 'system-trace-startup-sample.txt')], 10)
+    marker(directory, 'system-trace-startup-diagnostics.json', commands=results,
+           recorder_returncode_at_sampling=sampling_returncode,
+           sample_present=(directory / 'system-trace-startup-sample.txt').is_file())
+
+
+def wait_for_ready(directory, child, target_pid, notification, timeout, interrupted):
+    started = time.monotonic()
+    next_progress = 0
+    with (directory / 'system-trace-startup.jsonl').open('w') as progress:
+        while True:
+            elapsed = time.monotonic() - started
+            returncode = child.poll()
+            if interrupted():
+                reason = 'interrupted'
+            elif returncode is not None:
+                reason = 'recorder_exited'
+            elif notification.check():
+                marker(directory, 'system-trace-ready.json', pid=target_pid,
+                       recorder_pid=child.pid, startup_seconds=elapsed)
+                return
+            elif elapsed >= timeout:
+                reason = 'readiness_timeout'
+            else:
+                reason = None
+            if elapsed >= next_progress or reason is not None:
+                progress.write(json.dumps(dict(
+                    **clocks(), recorder_pid=child.pid, elapsed_seconds=elapsed,
+                    returncode=returncode, reason=reason)) + '\n')
+                progress.flush()
+                next_progress = elapsed + 5
+            if reason is not None:
+                # Preserve spontaneous exit vs. still running BEFORE our SIGINT.
+                marker(directory, 'system-trace-startup-failure.json', reason=reason,
+                       recorder_pid=child.pid, target_pid=target_pid,
+                       returncode_before_cleanup=returncode, elapsed_seconds=elapsed,
+                       timeout_seconds=timeout)
+                if reason != 'interrupted':
+                    try:
+                        capture_startup_state(directory, child, target_pid)
+                    except Exception as exc:
+                        marker(directory, 'system-trace-startup-diagnostics-error.json',
+                               error=repr(exc))
+                raise RuntimeError(f'System Trace startup {reason}: recorder PID {child.pid}, '
+                                   f'exit={returncode}, elapsed={elapsed:.3f}s, budget={timeout}s; '
+                                   'inspect system-trace-startup-* artifacts')
+            time.sleep(0.02)
+
+
+def collect(directory, pid, on_ready=None, start_timeout=START_TIMEOUT):
     child = None
     notification = None
     interrupted = False
@@ -128,19 +202,16 @@ def collect(directory, pid, on_ready=None):
             raise RuntimeError('Refusing to overwrite an existing trace')
         notification = StartedNotification()
         with (directory / 'system-trace-record.log').open('w') as log:
-            marker(directory, 'system-trace-launch.json', pid=pid)
-            child = subprocess.Popen([
+            command = [
                 '/usr/bin/xcrun', 'xctrace', 'record', '--template', 'System Trace',
                 '--attach', str(pid), '--time-limit', f'{RECORD_SECONDS}s',
                 '--no-prompt', '--notify-tracing-started', notification.name,
-                '--output', str(directory / 'system.trace')],
-                stdout=log, stderr=subprocess.STDOUT)
-            deadline = time.monotonic() + START_TIMEOUT
-            while not notification.check():
-                if interrupted or child.poll() is not None or time.monotonic() >= deadline:
-                    raise RuntimeError('System Trace did not signal readiness; inspect record log')
-                time.sleep(0.02)
-            marker(directory, 'system-trace-ready.json', pid=pid)
+                '--output', str(directory / 'system.trace')]
+            marker(directory, 'system-trace-launch.json', pid=pid, command=command,
+                   startup_timeout_seconds=start_timeout)
+            child = subprocess.Popen(command, stdout=log, stderr=subprocess.STDOUT)
+            marker(directory, 'system-trace-recorder.json', pid=child.pid, target_pid=pid)
+            wait_for_ready(directory, child, pid, notification, start_timeout, lambda: interrupted)
             if on_ready is not None:
                 on_ready()
             deadline = time.monotonic() + RECORD_SECONDS
@@ -180,7 +251,16 @@ def collect(directory, pid, on_ready=None):
     finally:
         try:
             if child is not None:
-                stop_child(child)
+                try:
+                    marker(directory, 'system-trace-cleanup.json', recorder_pid=child.pid,
+                           returncode_before_cleanup=child.poll())
+                finally:
+                    # Diagnostic writes must never prevent reaping our child.
+                    try:
+                        stop_child(child)
+                    finally:
+                        marker(directory, 'system-trace-recorder-exit.json', recorder_pid=child.pid,
+                               returncode=child.poll())
         finally:
             if notification is not None:
                 notification.close()
@@ -192,8 +272,12 @@ def collect(directory, pid, on_ready=None):
 def smoke_target(directory):
     # Exercise real open/truncate/write/close and sleeping thread states on the
     # worker filesystem for five seconds, without compiling or starting Java.
-    deadline = time.monotonic() + START_TIMEOUT + 10
+    # Allow the longer cold-start preflight plus failure sampling/finalization.
+    # This process must not disappear while the recorder is still attaching.
+    deadline = time.monotonic() + PREFLIGHT_START_TIMEOUT + FINISH_TIMEOUT + 30
     while not (directory / 'smoke-go').exists():
+        if (directory / 'system-trace-finished.json').exists():
+            return  # Parent owns the startup error; do not overwrite it.
         if time.monotonic() >= deadline:
             raise RuntimeError('Smoke workload was never released')
         time.sleep(0.02)
@@ -226,7 +310,8 @@ def preflight(directory):
                                    '--run-dir', str(directory)], stdout=log,
                                   stderr=subprocess.STDOUT)
         try:
-            collect(directory, target.pid, on_ready=lambda: (directory / 'smoke-go').touch())
+            collect(directory, target.pid, on_ready=lambda: (directory / 'smoke-go').touch(),
+                    start_timeout=PREFLIGHT_START_TIMEOUT)
             target.wait(timeout=5)
             if target.returncode != 0:
                 raise RuntimeError('Smoke workload failed')
