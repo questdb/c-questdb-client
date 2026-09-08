@@ -10,7 +10,7 @@ set -uo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 readonly ROOT_DIR
 readonly DIAG_DIR="${QWP_WS_DIAGNOSTICS_DIR:?QWP_WS_DIAGNOSTICS_DIR is required}"
-readonly PRESSURE_MODE="${QWP_WS_MEMORY_PRESSURE:-natural}"
+readonly PRESSURE_PLAN="${QWP_WS_MEMORY_PRESSURE:-natural}"
 readonly RUN_COUNT="${QWP_WS_DIAGNOSTIC_RUNS:-3}"
 readonly FUZZ_SEED="0x268579c36b106b74"
 readonly BUILD_MODE_SEED="7856154056746654427"
@@ -36,8 +36,8 @@ if [[ "$(uname -s)" != "Darwin" ]]; then
     exit 2
 fi
 
-if [[ "$PRESSURE_MODE" != "natural" && "$PRESSURE_MODE" != "warn" ]]; then
-    echo "Unsupported QWP_WS_MEMORY_PRESSURE=$PRESSURE_MODE" >&2
+if [[ "$PRESSURE_PLAN" != "natural" && "$PRESSURE_PLAN" != "warn" && "$PRESSURE_PLAN" != "paired" ]]; then
+    echo "Unsupported QWP_WS_MEMORY_PRESSURE=$PRESSURE_PLAN" >&2
     exit 2
 fi
 
@@ -55,7 +55,7 @@ mkdir -p "$DIAG_DIR"
 if [[ "$SYSTEM_TRACE" == "1" &&
       ( ! -s "$DIAG_DIR/preflight/system-trace-valid.json" ||
         -e "$DIAG_DIR/preflight/system-trace-error.json" ||
-        "$FS_TRACE" != "0" || "$PRESSURE_MODE" != "natural" ) ]]; then
+        "$FS_TRACE" != "0" || "$PRESSURE_PLAN" != "natural" ) ]]; then
     echo "System Trace requires a successful preflight, no fs_usage and natural memory" >&2
     exit 2
 fi
@@ -83,6 +83,7 @@ snapshot_host() {
         sysctl hw.physicalcpu || true
         sysctl hw.logicalcpu || true
         sysctl vm.swapusage || true
+        sysctl kern.memorystatus_vm_pressure_level || true
         memory_pressure || true
         diskutil info / || true
         df -h /
@@ -92,6 +93,7 @@ snapshot_host() {
         git -C questdb rev-parse HEAD
         echo "fs_trace=$FS_TRACE server_revision=$SERVER_REVISION"
         echo "runs=$RUN_COUNT max_seconds=$MAX_SECONDS stop_on_capture=$STOP_ON_CAPTURE"
+        echo "pressure_plan=$PRESSURE_PLAN"
         echo "min_free_kb=$MIN_FREE_KB"
         echo "system_trace=$SYSTEM_TRACE trace_capture_limit=2 controls=1,6,11"
         find questdb/core/target -maxdepth 1 -type f \
@@ -176,6 +178,7 @@ monitor_pids+=("$!")
         echo "=== $(date -u '+%Y-%m-%dT%H:%M:%SZ') ==="
         memory_pressure || true
         sysctl vm.swapusage || true
+        sysctl kern.memorystatus_vm_pressure_level || true
         ps -axo pid,ppid,rss,vsz,%cpu,state,etime,command || true
         sleep 5
     done
@@ -187,6 +190,7 @@ soak_started=$SECONDS
 stop_reason="run_limit"
 trace_captures=0
 for run_number in $(seq 1 "$RUN_COUNT"); do
+    PRESSURE_MODE="$(python3 system_test/qwp_ws_pressure.py mode "$PRESSURE_PLAN" "$run_number")" || exit 2
     # Stay on this hosted VM for the whole loop. JVM/fixture restarts do not
     # allocate a new worker. Let an in-flight test retain its original timeout.
     if (( SECONDS - soak_started >= MAX_SECONDS )); then
@@ -311,8 +315,17 @@ for run_number in $(seq 1 "$RUN_COUNT"); do
         if [[ ! -f "$run_dir/watchdog-ready" ]]; then
             touch "$run_dir/watchdog-helper-failed"
         fi
+        if [[ "$PRESSURE_PLAN" == "paired" ]]; then
+            # The previous allocator has been stopped. Require recovery before
+            # creating the next one; memory_pressure exits if already at warn.
+            if ! python3 system_test/qwp_ws_pressure.py gate natural \
+                    >"$run_dir/pressure-recovery.jsonl" 2>"$run_dir/pressure-recovery-error.log"; then
+                touch "$run_dir/pressure-target-not-reached"
+                exit 2
+            fi
+        fi
         if [[ "$PRESSURE_MODE" == "warn" ]]; then
-            memory_pressure -l warn -s 300 \
+            memory_pressure -l warn -s 1 \
                 >"$run_dir/memory-pressure.log" 2>&1 &
             pressure_pid=$!
             echo "$pressure_pid" >"$pressure_pid_file"
@@ -323,10 +336,24 @@ for run_number in $(seq 1 "$RUN_COUNT"); do
         else
             echo "natural-memory control" >"$run_dir/memory-pressure.log"
         fi
+        if [[ "$PRESSURE_PLAN" == "paired" ]]; then
+            pressure_gate_args=(gate "$PRESSURE_MODE")
+            if [[ "$PRESSURE_MODE" == "warn" ]]; then
+                pressure_gate_args+=(--pid "$pressure_pid")
+            fi
+            if ! python3 system_test/qwp_ws_pressure.py "${pressure_gate_args[@]}" \
+                    >"$run_dir/pressure-gate.jsonl" 2>"$run_dir/pressure-gate-error.log"; then
+                touch "$run_dir/pressure-target-not-reached"
+                # Do not release a workload under a falsely labelled condition.
+                # Paired pressure setup has a separate 60-second gate budget.
+                exit 2
+            fi
+        fi
         {
             date -u '+%Y-%m-%dT%H:%M:%SZ'
             memory_pressure || true
             sysctl vm.swapusage || true
+            sysctl kern.memorystatus_vm_pressure_level || true
             vm_stat || true
         } >"$run_dir/pressure-at-gate.log" 2>&1
         touch "$go_file"
@@ -387,6 +414,7 @@ for run_number in $(seq 1 "$RUN_COUNT"); do
         date -u '+%Y-%m-%dT%H:%M:%SZ'
         memory_pressure || true
         sysctl vm.swapusage || true
+        sysctl kern.memorystatus_vm_pressure_level || true
         vm_stat || true
     } >"$run_dir/pressure-after-test.log" 2>&1
 

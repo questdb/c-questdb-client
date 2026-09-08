@@ -24,8 +24,33 @@ telemetry and a heartbeat. Dropped/missing telemetry fails the diagnostic arm.
 An active cursor reaching five seconds requests the existing native/JVM stack
 capture. Ping and heartbeat measurements remain enabled but short anomalies no
 longer trigger invasive captures. Workload-error capture remains enabled. Stop
-after the first capture/failure, at most 40 repetitions, no new attempt after
+after the first capture/failure, at most 12 repetitions, no new attempt after
 600 seconds, one macOS worker. Original test/sender/SQL timeouts are unchanged.
+
+Builds 268394 and 268424 passed 40 natural-memory attempts each, with respectively
+504 and 555 completed probe cursors and maxima of 137.21 and 158.25 ms. No
+five-second query or observer-loss marker appeared. The next experiment uses
+three natural/warn/warn/natural cycles on one worker, with the same query probe.
+This is an exploratory resource perturbation, not a claim that original memory
+pressure was established. It tests whether real warning pressure can reproduce
+the prolonged query stage, rather than merely slowing WAL/ping traffic.
+
+`memory_pressure -l warn -s 1` applies real allocation pressure (no `-S`), with
+one-second regulation. Before releasing each paired-plan workload, the harness
+requires `kern.memorystatus_vm_pressure_level` to reach 1 (natural) or 2 (warn)
+within 20 seconds. Unknown/critical levels and an unmet target fail setup; a
+five-second sleep alone is not evidence that pressure was reached. Each attempt
+first requires recovery to normal, so a helper cannot immediately exit because
+the previous attempt left the system at warning pressure. Only this arm's
+pre-workload setup gate is extended to 60 seconds; sender and SQL deadlines are
+unchanged. Per-run gate samples and five-
+second host samples retain the actual levels, compression and swap counters.
+The helper is stopped between attempts. Post-pressure natural runs are recovery
+controls, not independent cold machines: page-cache/compression carryover is a
+known limitation. Stop at the first capture/failure; do not increase workers.
+
+Apple's [memory_pressure manual](https://github.com/apple-oss-distributions/system_cmds/blob/main/memory_pressure/memory_pressure.1)
+and implementation distinguish allocation mode from `-S` notification simulation.
 
 The entry marker is inside ShowColumnsRecordCursorFactory.getCursor, after
 QueryProgress's exe log: a gap between exe and cursor-enter is itself evidence

@@ -159,14 +159,19 @@ class PrintLogTest(unittest.TestCase):
 
 
 class TimeoutDiagnosticsTest(unittest.TestCase):
-    def test_only_traced_diagnostic_setup_gets_longer_gate(self):
+    def test_only_traced_or_pressure_diagnostic_setup_gets_longer_gate(self):
         with tempfile.TemporaryDirectory() as tmp:
             directory = pathlib.Path(tmp)
             qdb = _make_fixture(tmp)
             with mock.patch.dict(fixture.os.environ, {
                     'QWP_WS_FUZZ_DIAGNOSTICS': '1',
-                    'QWP_WS_FUZZ_WATCHDOG_DIR': str(directory)}):
+                    'QWP_WS_FUZZ_WATCHDOG_DIR': str(directory),
+                    'QWP_WS_MEMORY_PRESSURE': 'natural'}):
                 self.assertEqual(qdb.fuzz_diagnostic_gate_timeout(), 30)
+                with mock.patch.dict(fixture.os.environ, {'QWP_WS_MEMORY_PRESSURE': 'paired'}):
+                    self.assertEqual(qdb.fuzz_diagnostic_gate_timeout(), 60)
+                    with mock.patch.dict(fixture.os.environ, {'QWP_WS_FUZZ_DIAGNOSTICS': '0'}):
+                        self.assertEqual(qdb.fuzz_diagnostic_gate_timeout(), 30)
                 (directory / 'system-trace-enabled').touch()
                 self.assertEqual(qdb.fuzz_diagnostic_gate_timeout(), 90)
                 with mock.patch.dict(fixture.os.environ, {'QWP_WS_FUZZ_DIAGNOSTICS': '0'}):
