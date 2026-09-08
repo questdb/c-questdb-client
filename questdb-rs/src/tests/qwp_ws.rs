@@ -1622,6 +1622,8 @@ fn spawn_stalled_background_orphan_drain_server() -> (u16, mpsc::Receiver<Vec<u8
         // regression that waits for stalled orphan work would block close.
         // The window matches the other stalled-orphan mocks: a shorter one
         // lets a slow CI host time out before the test gets to release.
+        // Tests release best-effort for the same reason: an expired park has
+        // dropped the receiver, which is not a product failure.
         let _ = release_rx.recv_timeout(Duration::from_secs(10));
     });
 
@@ -4284,10 +4286,6 @@ fn qwp_ws_background_orphan_close_is_bounded_and_leaves_orphan_recoverable() {
     );
     assert!(!orphan_slot.join(".failed").exists());
 
-    // Best-effort unblock: the mock server thread parks on a bounded
-    // `recv_timeout`, so on a slow host it can already have timed out and
-    // dropped the receiver. That is not a product failure, so do not
-    // turn the disconnected channel into a test failure.
     let _ = release_stalled_orphan.send(());
 
     // The recovered slot delta-encodes, so it re-registers its dictionary with a
@@ -4359,10 +4357,6 @@ fn qwp_ws_background_orphan_close_interrupts_stalled_connect() {
     let recovered = recover_rx.recv_timeout(Duration::from_secs(5)).unwrap();
     assert_eq!(recovered.received_frames.len(), 1);
 
-    // Best-effort unblock: the mock server thread parks on a bounded
-    // `recv_timeout`, so on a slow host it can already have timed out and
-    // dropped the receiver. That is not a product failure, so do not
-    // turn the disconnected channel into a test failure.
     let _ = release_stalled_orphan.send(());
 }
 
@@ -4420,10 +4414,6 @@ fn qwp_ws_background_orphan_close_does_not_dial_next_slot() {
     assert!(slot_has_sfa_file(&sf_dir.path().join("orphan-a")));
     assert!(slot_has_sfa_file(&sf_dir.path().join("orphan-b")));
 
-    // Best-effort unblock: the mock server thread parks on a bounded
-    // `recv_timeout`, so on a slow host it can already have timed out and
-    // dropped the receiver. That is not a product failure, so do not
-    // turn the disconnected channel into a test failure.
     let _ = release_stalled_orphan.send(());
     server.join().unwrap();
 }
@@ -4468,10 +4458,6 @@ fn qwp_ws_background_orphan_close_interrupts_blocked_send() {
     drop(reopened);
     assert!(slot_has_sfa_file(&sf_dir.path().join("orphan")));
 
-    // Best-effort unblock: the mock server thread parks on a bounded
-    // `recv_timeout`, so on a slow host it can already have timed out and
-    // dropped the receiver. That is not a product failure, so do not
-    // turn the disconnected channel into a test failure.
     let _ = release_stalled_orphan.send(());
     server.join().unwrap();
 }
@@ -4852,11 +4838,9 @@ fn read_varint(buf: &[u8], pos: &mut usize) -> u64 {
     }
 }
 
-/// Skip past message header + delta dictionary section + first table header,
-/// returning the inline column count declared in the first table block. The
-/// column descriptors ride inline right after this count (no schema-mode byte,
-/// no schema id).
-fn first_table_column_count(frame: &[u8]) -> u64 {
+/// Skip past message header + delta dictionary section + first table name.
+/// What follows is the table's row count varint, then its column count.
+fn first_table_body_pos(frame: &[u8]) -> usize {
     let mut pos = 12; // header
     let _delta_start = read_varint(frame, &mut pos);
     let delta_count = read_varint(frame, &mut pos);
@@ -4864,25 +4848,22 @@ fn first_table_column_count(frame: &[u8]) -> u64 {
         let name_len = read_varint(frame, &mut pos) as usize;
         pos += name_len;
     }
-    // Table header: name (varint+bytes), row_count varint, column_count varint.
     let name_len = read_varint(frame, &mut pos) as usize;
-    pos += name_len;
+    pos + name_len
+}
+
+/// The inline column count declared in the first table block. The column
+/// descriptors ride inline right after this count (no schema-mode byte, no
+/// schema id).
+fn first_table_column_count(frame: &[u8]) -> u64 {
+    let mut pos = first_table_body_pos(frame);
     let _row_count = read_varint(frame, &mut pos);
     read_varint(frame, &mut pos)
 }
 
-/// The row count declared in the first table block. See
-/// [`first_table_column_count`] for the layout this walks.
+/// The row count declared in the first table block.
 fn first_table_row_count(frame: &[u8]) -> u64 {
-    let mut pos = 12; // header
-    let _delta_start = read_varint(frame, &mut pos);
-    let delta_count = read_varint(frame, &mut pos);
-    for _ in 0..delta_count {
-        let name_len = read_varint(frame, &mut pos) as usize;
-        pos += name_len;
-    }
-    let name_len = read_varint(frame, &mut pos) as usize;
-    pos += name_len;
+    let mut pos = first_table_body_pos(frame);
     read_varint(frame, &mut pos)
 }
 
