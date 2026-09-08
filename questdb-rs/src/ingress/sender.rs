@@ -820,12 +820,7 @@ impl Sender {
         let request_durable_ack = match &self.handler {
             SyncProtocolHandler::SyncQwpWs(state) => state.request_durable_ack,
             SyncProtocolHandler::ManualQwpWs(state) => state.request_durable_ack,
-            _ => {
-                return Err(error::fmt!(
-                    InvalidApiCall,
-                    "AckLevel::Durable is only supported for QWP/WebSocket senders."
-                ));
-            }
+            _ => unreachable!("QWP/WebSocket handler was checked above"),
         };
         if !request_durable_ack {
             return Err(error::fmt!(
@@ -850,10 +845,7 @@ impl Sender {
                 AckLevel::Ok => qwp_ws_ok_fsn_manual(state),
                 AckLevel::Durable => qwp_ws_acked_fsn_manual(state),
             },
-            _ => Err(error::fmt!(
-                InvalidApiCall,
-                "completion watermarks are only supported for QWP/WebSocket senders."
-            )),
+            _ => unreachable!("QWP/WebSocket handler was checked above"),
         }
     }
 
