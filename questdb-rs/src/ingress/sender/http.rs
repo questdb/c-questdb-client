@@ -433,7 +433,7 @@ fn retry_http_send(
         (need_retry, last_rep) = state.send_request(buf, request_timeout, attempt_auth);
         if !need_retry {
             if !auth_retry_used
-                && let Some(value) = rotated_auth_after_401(state, &last_rep, attempt_auth)?
+                && let Some(value) = rotated_auth_after_401(state, &last_rep, attempt_auth, true)?
             {
                 auth_retry_used = true;
                 refreshed = Some(value);
@@ -471,24 +471,33 @@ fn retry_sleep(retry_interval_ms: i32, jitter_ms: i32) -> Duration {
 /// was not a 401, or the provider handed back the very value that was just
 /// rejected. A provider failure is returned so its current classification and
 /// OIDC cause are not replaced by the stale 401.
+///
+/// `prior_attempt_in_doubt` says whether an earlier attempt in this flush may
+/// already have been applied server-side, and is what a provider failure
+/// raised here is marked with. It is NOT a property of reaching this function:
+/// the caller in `http_send_with_retries` gets here after exactly one request
+/// that completed with a definite 401, so nothing was applied and replaying is
+/// safe, while the caller inside `retry_http_send` may have had an earlier
+/// attempt time out -- `need_retry` classifies `ureq::Error::Timeout(_)` and
+/// `ConnectionFailed` as retryable -- and must stay conservative. Marking both
+/// in-doubt told callers a buffer the server had definitively rejected might
+/// have landed, and `Error::in_doubt` is what they use to decide whether a
+/// replay can duplicate rows.
 fn rotated_auth_after_401(
     state: &SyncHttpHandlerState,
     rep: &Result<Response<Body>, ureq::Error>,
     used: Option<&str>,
+    prior_attempt_in_doubt: bool,
 ) -> crate::Result<Option<String>> {
     if !state.auth.is_rotating() || !matches!(rep, Ok(rep) if rep.status() == 401) {
         return Ok(None);
     }
     let Some(value) = state.auth.resolve().map_err(|e| {
-        // Both call sites reach here only AFTER `send_request` has already
-        // POSTed the whole buffer at least once, and `need_retry` classifies
-        // `ureq::Error::Timeout(_)` / `ConnectionFailed` as retryable, so a
-        // preceding attempt may already have been applied server-side. Mark it
-        // in-doubt. Bindings key on this flag to decide whether replaying the
-        // buffer is safe; without it a provider failure raised here looked
-        // provably unsent, which is what let the Python side retain the buffer
-        // and re-send rows the server had already stored.
-        e.with_in_doubt(true)
+        if prior_attempt_in_doubt {
+            e.with_in_doubt(true)
+        } else {
+            e
+        }
     })?
     else {
         return Ok(None);
@@ -518,7 +527,7 @@ pub(super) fn http_send_with_retries(
     // AuthError. Give a rotated credential exactly one more attempt -- and only
     // when the provider actually hands back a different value, so a genuine
     // rejection still costs a single request.
-    if !need_retry && let Some(rotated) = rotated_auth_after_401(state, &last_rep, auth)? {
+    if !need_retry && let Some(rotated) = rotated_auth_after_401(state, &last_rep, auth, false)? {
         if let Ok(rep) = last_rep {
             // Return the connection to the pool before reusing the agent.
             _ = rep.into_body().read_to_vec();
@@ -772,7 +781,7 @@ mod tests {
                 .unwrap(),
         );
 
-        let error = rotated_auth_after_401(&state, &response, Some("Bearer expired"))
+        let error = rotated_auth_after_401(&state, &response, Some("Bearer expired"), false)
             .expect_err("the second provider failure was replaced by the stale 401");
         assert_eq!(error.code(), crate::ErrorCode::SocketError);
         assert_eq!(
@@ -780,5 +789,50 @@ mod tests {
             Some(crate::oidc::OidcErrorKind::Network)
         );
         assert!(error.msg().contains("refresh failed"));
+    }
+
+    #[cfg(feature = "_oidc")]
+    #[test]
+    fn rotation_marks_in_doubt_only_when_an_earlier_attempt_could_have_landed() {
+        // `in_doubt` is the flag callers read to decide whether replaying the
+        // buffer can duplicate rows, so it has to track what actually happened.
+        // Reaching this function is not itself evidence of delivery: after a
+        // single request that completed with a definite 401 the buffer was
+        // rejected outright, and reporting it in-doubt costs the caller a
+        // replay it could safely have made.
+        let state = SyncHttpHandlerState {
+            agent: ureq::Agent::new_with_defaults(),
+            url: "http://127.0.0.1/write".to_string(),
+            auth: HttpAuth::Provider(crate::token_provider::TokenProvider::new(|| {
+                Err::<String, crate::Error>(
+                    crate::oidc::OidcError::network("refresh failed").into(),
+                )
+            })),
+            config: HttpConfig::default(),
+        };
+        let unauthorized = || {
+            Ok::<_, ureq::Error>(
+                Response::builder()
+                    .status(401)
+                    .body(Body::builder().data("unauthorized"))
+                    .unwrap(),
+            )
+        };
+
+        let provably_unsent =
+            rotated_auth_after_401(&state, &unauthorized(), Some("Bearer expired"), false)
+                .expect_err("the provider failure must surface");
+        assert!(
+            !provably_unsent.in_doubt(),
+            "a definite 401 on the only request applied nothing"
+        );
+
+        let after_a_retry =
+            rotated_auth_after_401(&state, &unauthorized(), Some("Bearer expired"), true)
+                .expect_err("the provider failure must surface");
+        assert!(
+            after_a_retry.in_doubt(),
+            "an earlier attempt may have timed out after being applied"
+        );
     }
 }

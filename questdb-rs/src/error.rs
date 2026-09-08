@@ -364,7 +364,7 @@ impl Error {
     /// [`Error::in_doubt`]. See `PooledSenderCore::flush` and the `FlushFailure`
     /// delivery classification.
     #[must_use]
-    #[cfg(feature = "sync-sender-qwp-ws")]
+    #[cfg(any(feature = "sync-sender-qwp-ws", feature = "sync-sender-http"))]
     pub(crate) fn with_in_doubt(mut self, in_doubt: bool) -> Self {
         self.0.in_doubt = in_doubt;
         self
