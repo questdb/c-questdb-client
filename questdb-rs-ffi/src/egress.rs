@@ -30,7 +30,6 @@
 //! columns (`DOUBLE_ARRAY` / `LONG_ARRAY`) land in follow-up changes.
 
 use std::cell::UnsafeCell;
-use std::mem::ManuallyDrop;
 use std::net::Ipv4Addr;
 use std::ptr;
 use std::slice;
@@ -40,10 +39,22 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use libc::{c_char, c_void, size_t};
 
 use questdb::egress::{
-    BatchView, ColumnKind, ColumnView, Cursor, FailoverPhase, FailoverProgressEvent,
-    FailoverResetEvent, Reader, ReaderQuery, ReaderStats, ServerInfo, ServerRole, SimpleNullKind,
-    SymbolEntry, Terminal, Validity,
+    ColumnKind, ColumnView, FailoverPhase, FailoverProgressEvent, FailoverResetEvent, OwnedCursor,
+    OwnedQuery, Reader, ReaderStats, ServerInfo, ServerRole, SimpleNullKind, SymbolEntry, Terminal,
+    Validity,
 };
+
+/// The FFI's query handle: an [`OwnedQuery`] whose owner is a bare
+/// [`Reader`] moved out of the [`qwp_reader`] box for the duration.
+///
+/// The owner is `Reader`, not `questdb::OwnedReader`, because a pooled
+/// `qwp_reader` keeps its `ReaderPoolHandle` behind in the box (see
+/// [`ReaderOwnership`]) — only the connection itself travels into the
+/// query/cursor, and it travels back on `_query_free` / `_cursor_free`.
+type FfiQuery = OwnedQuery<Reader>;
+
+/// The FFI's cursor handle. See [`FfiQuery`] for why the owner is `Reader`.
+type FfiCursor = OwnedCursor<Reader>;
 use questdb::{Error, ErrorCode};
 
 use crate::{line_sender_utf8, questdb_error, questdb_error_code};
@@ -122,7 +133,7 @@ fn wrap_pooled_reader(
 ) -> *mut qwp_reader {
     let stats = Arc::clone(reader.stats());
     Box::into_raw(Box::new(qwp_reader {
-        reader_cell: UnsafeCell::new(reader),
+        reader_cell: UnsafeCell::new(Some(reader)),
         cursor_active: AtomicBool::new(false),
         stats,
         ownership: ReaderOwnership::Pooled {
@@ -145,10 +156,9 @@ pub unsafe extern "C" fn qwp_reader_drop_on_return(reader: *mut qwp_reader) {
     if reader.is_null() {
         return;
     }
-    // Project to the `ownership` field via `addr_of!` so we never
-    // form a `&reader` reborrow that could alias an in-flight
-    // `&mut Reader` held by a cursor. Same pattern as the stat
-    // getters above.
+    // Project to the `ownership` field via `addr_of!` rather than
+    // reborrowing the whole handle, which would also cover the cell.
+    // Same pattern as the stat getters above.
     let ownership_ptr: *const ReaderOwnership = unsafe { std::ptr::addr_of!((*reader).ownership) };
     if let ReaderOwnership::Pooled { must_close, .. } = unsafe { &*ownership_ptr } {
         must_close.store(true, Ordering::Release);
@@ -334,49 +344,70 @@ impl From<ColumnKind> for qwp_reader_column_kind {
 
 /// Opaque QWP egress reader.
 ///
-/// The `Reader` lives inside an `UnsafeCell` so that the lifetime-laundered
-/// `&mut Reader` held by an in-flight `ReaderQuery<'static>` / `Cursor<'static>`
-/// can coexist with shared reborrows synthesised by the non-counter
-/// stat/info getters (`_server_version`, `_current_server_info`,
-/// `_current_addr_*`). All references to the inner `Reader` are derived
-/// from `UnsafeCell::get()`, intentionally without ever creating a
-/// `&mut Reader` outside the FFI's own laundering path. The non-counter
-/// getters are still bound by the one-thread-at-a-time contract, so
-/// they cannot race with the laundered `&mut Reader` even in principle.
+/// # Where the connection lives
 ///
-/// The counter getters (`_bytes_received`, `_credit_granted_total`,
-/// `_read_ns`, `_decode_ns`, `_reset_timing`) go through a separate
-/// `Arc<ReaderStats>` field, NOT through the cell. That decouples the
-/// counter accesses from the Reader's borrow stack — a monitoring
-/// thread reading the counters never touches the `UnsafeCell`, so the
-/// laundered `&mut Reader` inside an in-flight query/cursor is
-/// unaffected (no `&Reader` synthesised, no Stacked-Borrows pop). The
-/// `Arc` is cloned once at handle construction; both the FFI and the
-/// inner `Reader` hold strong references to the same counters.
+/// `reader_cell` is the connection's home *between* queries. While a
+/// `qwp_reader_query` / `qwp_reader_cursor` is live the `Reader` has been
+/// **moved out** of the cell and into that handle's `OwnedQuery` /
+/// `OwnedCursor`, and the cell holds `None`; `_query_free`,
+/// `_query_execute`'s error arm and `_cursor_free` move it back.
 ///
-/// `active` still tracks whether a `qwp_reader_query` or `qwp_reader_cursor`
-/// has taken a laundered `&mut Reader` out of the cell. While `active` is
-/// true, no new query/cursor may be created against this reader — the FFI
-/// rejects `_query_new` / `_execute` to prevent two laundered `&mut Reader`
-/// from existing simultaneously (which would be UB even with `UnsafeCell`,
-/// since the laundered borrows themselves still need to be unique
-/// w.r.t. each other).
+/// That is the whole of the ownership story, and it is why this file
+/// contains no lifetime laundering. The handles do not borrow the reader across an
+/// FFI call — a C ABI has nowhere to put the lifetime that would make such
+/// a borrow expressible — they own it, so `Reader`, `OwnedQuery<Reader>`
+/// and `OwnedCursor<Reader>` are all plain `'static` values that a `Box`
+/// can hold and ordinary drop glue can tear down.
 ///
-/// `AtomicBool` (rather than `Cell<bool>`) so that a reader migrated
-/// between threads — permitted by the C contract under the user's
-/// happens-before edge — sees a consistent view of the flag even on
-/// weakly-ordered targets. Access uses `Acquire`/`Release` so the flag's
-/// state pairs with the reader-mutating operation that flipped it.
+/// `UnsafeCell` remains only because the metadata getters take
+/// `*const qwp_reader` and must reach the connection through a shared
+/// pointer; nothing derives a `&mut Reader` that outlives its call.
 ///
-/// Field `.2` is a clone of the inner `Reader::stats()` `Arc`. Stat
-/// getters read from here and never touch `.0`, so a monitoring
-/// thread firing a stat getter while another thread is driving a
-/// cursor cannot disturb the cursor's laundered `&mut Reader`.
+/// `cursor_active` tracks whether the connection is currently out on loan.
+/// While it is true the cell is empty, so the metadata getters that read
+/// the connection (`_server_version`, `_current_server_info`,
+/// `_current_addr_*`) return their documented sentinels and refer the
+/// caller to the `_cursor_*` counterparts, and `_prepare` / `_execute`
+/// reject a second concurrent query. `AtomicBool` (rather than
+/// `Cell<bool>`) so that a reader migrated between threads — permitted by
+/// the C contract under the user's happens-before edge — sees a consistent
+/// view of the flag even on weakly-ordered targets. Access uses
+/// `Acquire`/`Release` so the flag's state pairs with the operation that
+/// flipped it.
+///
+/// `stats` is a clone of the inner `Reader::stats()` `Arc`, taken once at
+/// handle construction. The counter getters (`_bytes_received`,
+/// `_credit_granted_total`, `_read_ns`, `_decode_ns`, `_reset_timing`) read
+/// it and never touch the cell, so they keep working — and stay
+/// cross-thread safe — while the connection is out on loan to a cursor.
 pub struct qwp_reader {
-    reader_cell: UnsafeCell<Reader>,
+    /// `None` exactly while `cursor_active` is true; see the type docs.
+    reader_cell: UnsafeCell<Option<Reader>>,
     cursor_active: AtomicBool,
     stats: Arc<ReaderStats>,
     ownership: ReaderOwnership,
+}
+
+/// Move the connection out of the handle for the duration of a query or
+/// cursor. `None` if it is already on loan — which the `cursor_active` CAS
+/// at every call site has already excluded, so a `None` here is a bug, not
+/// a user error.
+unsafe fn take_reader(reader: *mut qwp_reader) -> Option<Reader> {
+    unsafe { (*(*reader).reader_cell.get()).take() }
+}
+
+/// Move the connection back into the handle when a query or cursor ends.
+unsafe fn put_reader(reader: *mut qwp_reader, inner: Reader) {
+    unsafe {
+        *(*reader).reader_cell.get() = Some(inner);
+    }
+}
+
+/// Shared view of the connection for the metadata getters. `None` while it
+/// is on loan to a query/cursor; every caller already short-circuits on
+/// `reader_active`, so this is the same answer reached twice.
+unsafe fn reader_ref<'a>(reader: *const qwp_reader) -> Option<&'a Reader> {
+    unsafe { (*(*reader).reader_cell.get()).as_ref() }
 }
 
 /// Raw reader backpointer carried by a query/cursor across an externally
@@ -478,7 +509,7 @@ pub unsafe extern "C" fn qwp_reader_from_conf(
         let reader = reader_bubble!(err_out, reader_result, ptr::null_mut());
         let stats = Arc::clone(reader.stats());
         Box::into_raw(Box::new(qwp_reader {
-            reader_cell: UnsafeCell::new(reader),
+            reader_cell: UnsafeCell::new(Some(reader)),
             cursor_active: AtomicBool::new(false),
             stats,
             ownership: ReaderOwnership::Standalone,
@@ -527,7 +558,7 @@ pub unsafe extern "C" fn qwp_reader_from_env(err_out: *mut *mut questdb_error) -
         let reader = reader_bubble!(err_out, reader_result, ptr::null_mut());
         let stats = Arc::clone(reader.stats());
         Box::into_raw(Box::new(qwp_reader {
-            reader_cell: UnsafeCell::new(reader),
+            reader_cell: UnsafeCell::new(Some(reader)),
             cursor_active: AtomicBool::new(false),
             stats,
             ownership: ReaderOwnership::Standalone,
@@ -542,18 +573,21 @@ pub unsafe extern "C" fn qwp_reader_from_env(err_out: *mut *mut questdb_error) -
 /// Close the reader and release all associated resources. Idempotent on NULL.
 ///
 /// Any `qwp_reader_query` or `qwp_reader_cursor` obtained from this reader
-/// MUST be freed/closed first. Closing the reader while a query or cursor is
-/// still live would otherwise be undefined behaviour — the cursor's internal
-/// `&mut Reader` (lifetime-laundered to `'static` via `transmute`) becomes a
-/// dangling reference and any subsequent operation on it is use-after-free.
+/// MUST be freed/closed first. The connection has been moved into that
+/// handle and is no longer in this box, so an early free can no longer
+/// dangle a borrow into it — but the live handle still writes its
+/// `cursor_active` release through a backpointer to this box, and still
+/// needs somewhere to hand the connection back to.
 ///
 /// As defense-in-depth against this misuse, the library checks the `active`
 /// flag and, if a query/cursor is still outstanding, prints a diagnostic to
-/// `stderr` and **leaks the reader** rather than freeing it. Leaking is
-/// strictly better than a use-after-free: the leaked storage is finite (one
-/// reader) and the live cursor remains valid, while a free here would let
-/// the next allocation alias the cursor's `&mut Reader` and produce silent
-/// memory corruption.
+/// `stderr` and **leaks the box** rather than freeing it. Leaking is
+/// strictly better than freeing: the live handle's backpointer stays valid,
+/// so freeing that handle later still writes somewhere real instead of into
+/// reclaimed memory. The connection ends up parked in the leaked box and
+/// leaks with it — the same net outcome as before this handle owned it —
+/// but the pool slot is released here so a misuse cannot permanently burn
+/// the pool's `query_pool_max` budget.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn qwp_reader_close(reader: *mut qwp_reader) {
     panic_guard(|| unsafe {
@@ -565,12 +599,13 @@ pub unsafe extern "C" fn qwp_reader_close(reader: *mut qwp_reader) {
         // but `_query_new` already uses CAS as defense-in-depth, so a bare
         // `load` here would leave a window between the read and the free
         // during which a misbehaving caller's concurrent `_query_new`
-        // could flip `active` from false to true and end up holding a
-        // freed `&mut Reader`. Atomically claim the flag instead: on
-        // success no query/cursor exists nor can be created, so the free
-        // is sound; on failure (active already true, or another thread
-        // racing) we leak — matching the existing leak-on-active policy
-        // documented above.
+        // could take the connection out of a box this call is about to
+        // free — leaving it with no home to return to and a dangling
+        // backpointer to write `cursor_active` through. Atomically claim
+        // the flag instead: on success no query/cursor exists nor can be
+        // created, so the free is sound; on failure (active already true,
+        // or another thread racing) we leak — matching the existing
+        // leak-on-active policy documented above.
         if (*reader)
             .cursor_active
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
@@ -580,18 +615,19 @@ pub unsafe extern "C" fn qwp_reader_close(reader: *mut qwp_reader) {
             let bytes_in_flight = (&*stats_ptr).bytes_received.load(Ordering::Relaxed);
             // Release the pool slot before leaking the box so the pool's
             // `query_pool_max` budget isn't permanently burned by misuse.
-            // The Reader stays inside the leaked box (cursor still holds
-            // a `&mut Reader`); only the bookkeeping slot is freed.
+            // The connection is in the live query/cursor, not in this box;
+            // only the bookkeeping slot is freed here.
             let ownership_ptr = std::ptr::addr_of!((*reader).ownership);
             if let ReaderOwnership::Pooled { handle, .. } = &*ownership_ptr {
                 handle.release_leaked_slot();
             }
             eprintln!(
                 "qwp_reader_close: a query or cursor is still live on this \
-                 reader. The reader has been LEAKED (TCP socket + TLS session + \
-                 ~{bytes_in_flight} bytes of in-flight buffers + up to the \
-                 symbol-dict heap cap) to avoid use-after-free. The pool slot \
-                 has been released. Close the cursor / free the query before \
+                 reader. The reader handle has been LEAKED (TCP socket + TLS \
+                 session + ~{bytes_in_flight} bytes of in-flight buffers + up \
+                 to the symbol-dict heap cap, all held by the live handle) so \
+                 the live handle keeps a valid backpointer. The pool slot has \
+                 been released. Close the cursor / free the query before \
                  closing the reader. This is a contract violation — see the \
                  qwp_reader_close docstring."
             );
@@ -613,12 +649,17 @@ pub unsafe extern "C" fn qwp_reader_close(reader: *mut qwp_reader) {
             ownership,
             ..
         } = *boxed;
-        let inner = reader_cell.into_inner();
-        match ownership {
-            ReaderOwnership::Standalone => drop(inner),
-            ReaderOwnership::Pooled { handle, must_close } => {
+        // `None` is unreachable: the CAS above succeeded, so no query or
+        // cursor holds the connection. Handle it anyway rather than
+        // `unwrap`-ing — a panic here would abort the process — and still
+        // release the pool slot so a bug cannot burn the pool's budget.
+        match (reader_cell.into_inner(), ownership) {
+            (Some(inner), ReaderOwnership::Standalone) => drop(inner),
+            (Some(inner), ReaderOwnership::Pooled { handle, must_close }) => {
                 handle.return_reader(inner, must_close.load(Ordering::Acquire));
             }
+            (None, ReaderOwnership::Standalone) => {}
+            (None, ReaderOwnership::Pooled { handle, .. }) => handle.release_leaked_slot(),
         }
     })
 }
@@ -642,11 +683,10 @@ pub unsafe extern "C" fn qwp_reader_has_active_query(reader: *const qwp_reader) 
         if reader.is_null() {
             return 0;
         }
-        // Project to the `AtomicBool` field via `addr_of!` so we never
-        // synthesise an intermediate `&reader` reborrow — doing so
-        // would cover the `UnsafeCell<Reader>` field and disturb the
-        // laundered `&mut Reader` held by an in-flight query/cursor under
-        // Stacked Borrows. Same pattern as the stat getters below.
+        // Project to the `AtomicBool` field via `addr_of!` rather than
+        // reborrowing the whole handle: the flag is readable from a
+        // monitoring thread, and a whole-handle reborrow would also cover
+        // the `UnsafeCell`. Same pattern as the stat getters below.
         let active: &AtomicBool = &*std::ptr::addr_of!((*reader).cursor_active);
         // `Acquire` pairs with the `AcqRel` flip in `_query_new` / the
         // `Release` clear in `_query_free` / `_cursor_free`, so observers
@@ -665,13 +705,12 @@ pub unsafe extern "C" fn qwp_reader_bytes_received(reader: *const qwp_reader) ->
         if reader.is_null() {
             return 0;
         }
-        // Project to the `Arc<ReaderStats>` field via `addr_of!` so we
-        // never synthesise an intermediate `&reader` reborrow —
-        // doing so would cover the `UnsafeCell<Reader>` field and
-        // disturb the laundered `&mut Reader` held by any in-flight
-        // `ReaderQuery` / `Cursor` under Stacked Borrows. The explicit
-        // `&Arc<ReaderStats>` borrow below covers only the Arc field,
-        // which lives at a distinct offset and is unrelated to the cell.
+        // Project to the `Arc<ReaderStats>` field via `addr_of!` rather
+        // than reborrowing the whole handle: this getter is explicitly
+        // cross-thread safe, and the counters must stay readable while a
+        // cursor on another thread owns the connection. The explicit
+        // `&Arc<ReaderStats>` borrow covers only the Arc field, which
+        // lives at a distinct offset and never touches the cell.
         let stats: &Arc<ReaderStats> = &*std::ptr::addr_of!((*reader).stats);
         stats.bytes_received.load(Ordering::Relaxed)
     }
@@ -731,13 +770,12 @@ pub unsafe extern "C" fn qwp_reader_reset_timing(reader: *mut qwp_reader) {
 }
 
 /// `true` while a `qwp_reader_query` / `qwp_reader_cursor` produced by
-/// this reader holds a lifetime-laundered `&mut Reader` taken out of the
-/// `UnsafeCell`. The connection-metadata getters consult this before
-/// synthesising a shared `&Reader`, which would otherwise alias that
-/// `&mut` — aliasing UB the `UnsafeCell` does not sanction.
+/// this reader owns the connection, i.e. while `reader_cell` is `None`.
+/// The connection-metadata getters consult this so they report their
+/// documented sentinel instead of quietly answering from an empty cell.
 #[inline]
 unsafe fn reader_active(reader: *const qwp_reader) -> bool {
-    // `addr_of!` avoids a `&reader` reborrow over the cell — see
+    // `addr_of!` projects straight to the flag; see
     // `qwp_reader_has_active_query`.
     let active: &AtomicBool = unsafe { &*std::ptr::addr_of!((*reader).cursor_active) };
     active.load(Ordering::Acquire)
@@ -748,9 +786,9 @@ unsafe fn reader_active(reader: *const qwp_reader) -> bool {
 /// Returns `false` and sets `*err_out` on failure: the connection is not
 /// established yet (no `SERVER_INFO` received), the `qwp_reader` handle is
 /// NULL, or a `qwp_reader_query` / `qwp_reader_cursor` produced by this
-/// reader is still live — all surfaced as `InvalidApiCall`. The
-/// query/cursor rejection prevents the synthesised `&Reader` from aliasing
-/// the laundered `&mut Reader` that handle holds.
+/// reader is still live — all surfaced as `InvalidApiCall`. In the
+/// query/cursor case the connection has been moved into that handle;
+/// read it there via `qwp_reader_cursor_server_version`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn qwp_reader_server_version(
     reader: *const qwp_reader,
@@ -792,13 +830,23 @@ pub unsafe extern "C" fn qwp_reader_server_version(
             }
             return false;
         }
-        match (*(*reader).reader_cell.get()).server_version() {
-            Ok(v) => {
+        // `reader_active` is false, so the cell holds the connection.
+        match reader_ref(reader).map(Reader::server_version) {
+            Some(Ok(v)) => {
                 *out_version = v;
                 true
             }
-            Err(e) => {
+            Some(Err(e)) => {
                 write_err_box(err_out, e);
+                false
+            }
+            None => {
+                set_reader_err(
+                    err_out,
+                    ErrorCode::InvalidApiCall,
+                    "qwp_reader_server_version: the connection is not in this \
+                     handle (a query or cursor owns it)",
+                );
                 false
             }
         }
@@ -813,9 +861,9 @@ pub unsafe extern "C" fn qwp_reader_server_version(
 /// `qwp_reader_close`).
 ///
 /// Returns NULL for a NULL handle, and also NULL while a `qwp_reader_query`
-/// / `qwp_reader_cursor` produced by this reader is still live — reading
-/// the metadata then would alias that handle's laundered `&mut Reader`.
-/// Release the query/cursor first to read connection metadata.
+/// / `qwp_reader_cursor` produced by this reader is still live — the
+/// connection has been moved into that handle. Read it there via
+/// `qwp_reader_cursor_current_server_info`, or release the handle first.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn qwp_reader_current_server_info(
     reader: *const qwp_reader,
@@ -827,7 +875,7 @@ pub unsafe extern "C" fn qwp_reader_current_server_info(
         if reader_active(reader) {
             return ptr::null();
         }
-        match (*(*reader).reader_cell.get()).server_info() {
+        match reader_ref(reader).and_then(Reader::server_info) {
             Some(si) => si as *const ServerInfo as *const qwp_reader_server_info,
             None => ptr::null(),
         }
@@ -839,8 +887,8 @@ pub unsafe extern "C" fn qwp_reader_current_server_info(
 ///
 /// Writes an empty `(NULL, 0)` pair for a NULL handle, and also while a
 /// `qwp_reader_query` / `qwp_reader_cursor` produced by this reader is
-/// still live — reading the metadata then would alias that handle's
-/// laundered `&mut Reader`. Release the query/cursor first.
+/// still live — the connection has been moved into that handle. Read it
+/// there via `qwp_reader_cursor_current_addr_host`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn qwp_reader_current_addr_host(
     reader: *const qwp_reader,
@@ -863,7 +911,11 @@ pub unsafe extern "C" fn qwp_reader_current_addr_host(
             *out_len = 0;
             return;
         }
-        let ep = (*(*reader).reader_cell.get()).current_addr();
+        let Some(ep) = reader_ref(reader).map(Reader::current_addr) else {
+            *out_buf = ptr::null();
+            *out_len = 0;
+            return;
+        };
         *out_buf = ep.host.as_ptr() as *const c_char;
         *out_len = ep.host.len();
     }
@@ -872,9 +924,9 @@ pub unsafe extern "C" fn qwp_reader_current_addr_host(
 /// Port of the endpoint the reader is currently connected to.
 ///
 /// Returns `0` for a NULL handle, and also `0` while a `qwp_reader_query`
-/// / `qwp_reader_cursor` produced by this reader is still live — reading
-/// the metadata then would alias that handle's laundered `&mut Reader`.
-/// Release the query/cursor first.
+/// / `qwp_reader_cursor` produced by this reader is still live — the
+/// connection has been moved into that handle. Read it there via
+/// `qwp_reader_cursor_current_addr_port`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn qwp_reader_current_addr_port(reader: *const qwp_reader) -> u16 {
     unsafe {
@@ -884,7 +936,7 @@ pub unsafe extern "C" fn qwp_reader_current_addr_port(reader: *const qwp_reader)
         if reader_active(reader) {
             return 0;
         }
-        (*(*reader).reader_cell.get()).current_addr().port
+        reader_ref(reader).map_or(0, |r| r.current_addr().port)
     }
 }
 
@@ -1700,20 +1752,23 @@ pub unsafe extern "C" fn qwp_reader_query_on_failover_progress(
 // Query builder (binds)
 // ---------------------------------------------------------------------------
 
-/// Opaque query-builder handle. Holds an in-progress `ReaderQuery` that the
-/// caller can append bind parameters to before consuming it via
+/// Opaque query-builder handle. Holds an in-progress `OwnedQuery` — and
+/// with it the connection, moved out of the originating `qwp_reader` — that
+/// the caller can append bind parameters to before consuming it via
 /// `qwp_reader_query_execute`. The originating `qwp_reader` MUST outlive
-/// the query.
+/// the query: that is where the connection goes back to.
 pub struct qwp_reader_query {
-    /// Lifetime extended to `'static`; bounded by the reader's lifetime.
-    /// `ManuallyDrop` lets us move the inner `ReaderQuery` out via
-    /// `ptr::read` / `ptr::write` for each builder mutation, and lets
-    /// `_execute` consume it without double-dropping.
-    inner: ManuallyDrop<ReaderQuery<'static>>,
-    /// Backpointer to the originating reader, used to clear its `active`
-    /// flag on `_query_free` or `_query_execute` failure. Always non-NULL
-    /// for a valid query (the C contract requires the reader to outlive
-    /// the query).
+    /// `Some` for the whole normal life of the handle. The `Option` is what
+    /// lets the builder methods move the query out, apply a
+    /// consuming-and-returning builder step, and put it back, and lets
+    /// `_execute` / `_free` consume it — all in safe code. The laundered
+    /// predecessor needed a manually-dropped slot plus `ptr::read`/`ptr::write` for the
+    /// same three operations.
+    inner: Option<FfiQuery>,
+    /// Backpointer to the originating reader: where the connection is
+    /// returned and the `active` flag cleared on `_query_free` or
+    /// `_query_execute` failure. Always non-NULL for a valid query (the C
+    /// contract requires the reader to outlive the query).
     reader: ReaderBackptr,
     /// First fatal error detected by an FFI-level bind/builder method
     /// that has no `err_out` slot of its own (currently only
@@ -1804,44 +1859,33 @@ pub unsafe extern "C" fn qwp_reader_prepare(
                 return ptr::null_mut();
             }
         };
-        // Derive `&mut Reader` through the `UnsafeCell::get()` raw pointer
-        // (rather than `&mut (*reader).reader_cell`, which would give the borrow a
-        // `Unique` tag under Stacked/Tree Borrows and conflict with the
-        // shared reborrows synthesised by the read-only stat getters).
-        // Going through the cell's raw pointer tags this borrow as
-        // `SharedReadWrite`, compatible with those temporary `&Reader`s.
-        let r: &mut Reader = &mut *(*reader).reader_cell.get();
-        // Catch any unwind out of `r.prepare(sql_str)` AND the
-        // wrapper allocation that publishes the result, then abort.
-        // No-op under this crate's `panic = abort` policy (see
-        // `panic_guard` docstring); active in test builds.
-        // Upstream `Reader::prepare` is in practice infallible (it
-        // just builds a small `ReaderQuery` struct) and the default
-        // Rust allocator aborts on OOM rather than unwinds — but if
-        // the policy ever flipped to `unwind`, or a test panic is
-        // injected here, an escape would (a) leave the `active` flag
-        // stuck `true` (the early-claim of the flag would not be
-        // undone) and (b) violate the FFI no-unwind contract.
-        // Including the `Box::into_raw(Box::new(...))` inside the
-        // guarded closure closes the allocation gap left by the
-        // previous narrower `catch_unwind` that wrapped only the
-        // upstream call.
-        //
-        // The lifetime launder happens INSIDE the closure: a `FnMut`
-        // closure cannot return a borrow of a variable it captured, so
-        // returning `ReaderQuery<'a>` (which borrows `r`) is rejected by
-        // the borrow checker. Transmuting to `ReaderQuery<'static>` first
-        // detaches the borrow, satisfying the closure's
-        // no-references-to-captures rule. SAFETY: the launder is sound
-        // because the C caller's contract requires the reader to outlive
-        // the query handle and any cursor it produces, and the `active`
-        // flag prevents a second laundered borrow from being taken while
-        // this one is alive.
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let q = r.prepare(sql_str);
-            let q_static: ReaderQuery<'static> = std::mem::transmute(q);
+        // Move the connection out of the reader handle and into the query.
+        // The CAS above succeeded, so the cell holds it; `None` would mean
+        // the flag and the cell had disagreed, which nothing can produce.
+        let Some(r) = take_reader(reader) else {
+            (*reader).cursor_active.store(false, Ordering::Release);
+            set_reader_err(
+                err_out,
+                ErrorCode::InvalidApiCall,
+                "qwp_reader_prepare: the connection is not in this handle",
+            );
+            return ptr::null_mut();
+        };
+        // Catch any unwind out of `r.into_query(sql_str)` AND the wrapper
+        // allocation that publishes the result, then abort. No-op under
+        // this crate's `panic = abort` policy (see `panic_guard`
+        // docstring); active in test builds. Upstream `Reader::into_query`
+        // is in practice infallible (it just builds a small `OwnedQuery`
+        // struct) and the default Rust allocator aborts on OOM rather than
+        // unwinds — but if the policy ever flipped to `unwind`, or a test
+        // panic is injected here, an escape would (a) leave the `active`
+        // flag stuck `true` with the connection dropped on the unwind path
+        // and (b) violate the FFI no-unwind contract. The
+        // `Box::into_raw(Box::new(...))` sits inside the guarded closure so
+        // the allocation is covered too.
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
             Box::into_raw(Box::new(qwp_reader_query {
-                inner: ManuallyDrop::new(q_static),
+                inner: Some(r.into_query(sql_str)),
                 reader: ReaderBackptr(reader),
                 deferred_err: None,
             }))
@@ -1864,15 +1908,12 @@ pub unsafe extern "C" fn qwp_reader_query_free(query: *mut qwp_reader_query) {
             return;
         }
         let mut boxed = Box::from_raw(query);
-        ManuallyDrop::drop(&mut boxed.inner);
-        // Release the reader's active flag so a new query/cursor can be
-        // started.
-        if !boxed.reader.is_null() {
-            (*boxed.reader.as_ptr())
-                .cursor_active
-                .store(false, Ordering::Release);
-        }
-        drop(boxed);
+        // Hand the connection back to the reader handle before clearing the
+        // flag, so the two are never observably out of step: `cursor_active
+        // == false` must imply the cell is populated. `into_owner` on an
+        // unsubmitted query is pure ownership transfer — nothing was sent,
+        // so there is nothing to tear down.
+        release_to_reader(boxed.reader, boxed.inner.take().map(FfiQuery::into_owner));
     })
 }
 
@@ -1918,63 +1959,61 @@ pub unsafe extern "C" fn qwp_reader_query_execute(
         // then a NULL no-op.
         *query_inout = ptr::null_mut();
         let mut boxed = Box::from_raw(query);
-        let q: ReaderQuery<'static> = ManuallyDrop::take(&mut boxed.inner);
         let reader = boxed.reader;
-        // boxed is dropped at end of scope; ManuallyDrop's no-op drop is fine
-        // since we already moved the inner out via `take`.
+        let Some(q) = boxed.inner.take() else {
+            // Unreachable: `inner` is only vacated by this function and by
+            // `_query_free`, both of which consume the handle.
+            release_to_reader(reader, None);
+            set_reader_err(
+                err_out,
+                ErrorCode::InvalidApiCall,
+                "qwp_reader_query_execute: query handle has already been consumed",
+            );
+            return ptr::null_mut();
+        };
 
         // Surface deferred errors stashed by void-returning bind helpers
-        // (see `qwp_reader_query_bind_varchar`). `q` is consumed and
-        // dropped along with `boxed`; the active flag is released so a
-        // new query can start.
+        // (see `qwp_reader_query_bind_varchar`). Nothing has been sent, so
+        // the connection goes straight back and a new query can start.
         if let Some(e) = boxed.deferred_err.take() {
-            drop(q);
-            if !reader.is_null() {
-                (*reader.as_ptr())
-                    .cursor_active
-                    .store(false, Ordering::Release);
-            }
+            release_to_reader(reader, Some(q.into_owner()));
             write_err_box(err_out, e);
             return ptr::null_mut();
         }
 
-        // Catch any unwind out of `q.execute()` AND the wrapper
+        // Catch any unwind out of `q.try_execute()` AND the wrapper
         // allocations that publish either the cursor handle or the
         // error envelope. No-op under this crate's `panic = abort`
         // policy (see `panic_guard` docstring); active in test
-        // builds. `q` was moved out of the now-dead
-        // `Box<qwp_reader_query>` via `ManuallyDrop::take`, so if
-        // the policy ever flipped to `unwind`, an escape would (a)
-        // leave the reader's `active` flag stuck `true` on the
-        // success-arm path (no cursor produced, no Err arm taken to
-        // clear it) and (b) violate the FFI no-unwind contract.
-        // Including both the success-side
-        // `Box::into_raw(Box::new(qwp_reader_cursor { .. }))` and
-        // the error-side
-        // `Box::into_raw(Box::new(line_sender_error::from_error(..)))` inside
-        // the guarded closure closes the two allocation gaps left by
-        // the previous narrower `catch_unwind` that wrapped only
-        // `q.execute()`.
+        // builds. `q` — and with it the connection — was moved out of the
+        // now-dead `Box<qwp_reader_query>`, so if the policy ever flipped
+        // to `unwind`, an escape would (a) leave the reader's `active` flag
+        // stuck `true` with an empty cell and (b) violate the FFI no-unwind
+        // contract. Both the success-side
+        // `Box::into_raw(Box::new(qwp_reader_cursor { .. }))` and the
+        // error-side `Box::into_raw(Box::new(line_sender_error::from_error(..)))`
+        // sit inside the guarded closure so the allocations are covered too.
+        //
+        // `try_execute` rather than `execute`: a failed submit must hand
+        // the connection back to the `qwp_reader` box the C caller still
+        // holds. `execute` drops it, which would strand a pooled slot and
+        // leave `_close` with nothing to return.
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            match q.execute() {
+            match q.try_execute() {
                 Ok(cursor) => {
-                    // Active flag stays set; ownership transfers to the cursor.
-                    let cursor_static: Cursor<'static> = std::mem::transmute(cursor);
+                    // Active flag stays set; the connection travels on into
+                    // the cursor and comes back at `_cursor_free`.
                     Box::into_raw(Box::new(qwp_reader_cursor {
-                        cursor: ManuallyDrop::new(cursor_static),
-                        current_batch: None,
+                        cursor: Some(cursor),
                         #[cfg(feature = "arrow")]
                         arrow_schema_pin: None,
                         reader,
                     }))
                 }
-                Err(e) => {
-                    // Query gone, no cursor produced — release the active flag.
-                    if !reader.is_null() {
-                        (*reader.as_ptr())
-                            .cursor_active
-                            .store(false, Ordering::Release);
-                    }
+                Err((e, owner)) => {
+                    // No cursor produced — return the connection and release
+                    // the active flag.
+                    release_to_reader(reader, Some(owner));
                     write_err_box(err_out, e);
                     ptr::null_mut()
                 }
@@ -2029,32 +2068,37 @@ pub unsafe extern "C" fn qwp_reader_execute(
                 return ptr::null_mut();
             }
         };
-        let r: &mut Reader = &mut *(*reader).reader_cell.get();
-        // Single guarded closure covers `r.execute(...)`, the lifetime
-        // launder, and both success/error Box allocations — same
-        // pattern as `_prepare` and `_query_execute`. No-op under this
-        // crate's `panic = abort` policy (see `panic_guard`
-        // docstring); active in test builds. Active flag is kept
-        // claimed on success (transferred to the cursor) and released
-        // on the error arm.
-        let result =
-            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| match r.execute(sql_str) {
-                Ok(cursor) => {
-                    let cursor_static: Cursor<'static> = std::mem::transmute(cursor);
-                    Box::into_raw(Box::new(qwp_reader_cursor {
-                        cursor: ManuallyDrop::new(cursor_static),
-                        current_batch: None,
-                        #[cfg(feature = "arrow")]
-                        arrow_schema_pin: None,
-                        reader: ReaderBackptr(reader),
-                    }))
-                }
-                Err(e) => {
-                    (*reader).cursor_active.store(false, Ordering::Release);
+        let Some(r) = take_reader(reader) else {
+            (*reader).cursor_active.store(false, Ordering::Release);
+            set_reader_err(
+                err_out,
+                ErrorCode::InvalidApiCall,
+                "qwp_reader_execute: the connection is not in this handle",
+            );
+            return ptr::null_mut();
+        };
+        // Single guarded closure covers the submit and both success/error
+        // Box allocations — same pattern as `_prepare` and
+        // `_query_execute`. No-op under this crate's `panic = abort`
+        // policy (see `panic_guard` docstring); active in test builds.
+        // Active flag is kept claimed on success (the connection travels
+        // into the cursor) and released on the error arm, which also puts
+        // the connection back — see `_query_execute` on why `try_execute`.
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+            match r.into_query(sql_str).try_execute() {
+                Ok(cursor) => Box::into_raw(Box::new(qwp_reader_cursor {
+                    cursor: Some(cursor),
+                    #[cfg(feature = "arrow")]
+                    arrow_schema_pin: None,
+                    reader: ReaderBackptr(reader),
+                })),
+                Err((e, owner)) => {
+                    release_to_reader(ReaderBackptr(reader), Some(owner));
                     write_err_box(err_out, e);
                     ptr::null_mut()
                 }
-            }));
+            }
+        }));
         match result {
             Ok(p) => p,
             Err(_) => std::process::abort(),
@@ -2062,7 +2106,30 @@ pub unsafe extern "C" fn qwp_reader_execute(
     }
 }
 
-/// Apply a builder method to the in-place `ReaderQuery`.
+/// Return a connection to its `qwp_reader` box and clear the box's
+/// `active` flag, in that order.
+///
+/// The order is the invariant: `cursor_active == false` must imply the
+/// cell holds the connection, because that is precisely what `_prepare`,
+/// `_execute` and the metadata getters rely on. `None` means the caller
+/// had no connection to return (a handle already consumed); the flag is
+/// still cleared so the reader is not wedged, and the empty cell is then
+/// reported by the next `_prepare`.
+unsafe fn release_to_reader(reader: ReaderBackptr, inner: Option<Reader>) {
+    if reader.is_null() {
+        return;
+    }
+    unsafe {
+        if let Some(inner) = inner {
+            put_reader(reader.as_ptr(), inner);
+        }
+        (*reader.as_ptr())
+            .cursor_active
+            .store(false, Ordering::Release);
+    }
+}
+
+/// Apply a builder method to the in-place `OwnedQuery`.
 ///
 /// Skips the upstream call entirely if a previous void-return bind has
 /// stashed a `deferred_err` on the query. This keeps subsequent bind
@@ -2073,22 +2140,21 @@ pub unsafe extern "C" fn qwp_reader_execute(
 /// shift every later bind position by one and produce confusing
 /// downstream errors.
 ///
-/// `f` is in practice infallible — the upstream `ReaderQuery::bind_*`
-/// methods just push into a `Vec`, and allocation failure under the default
-/// allocator aborts rather than unwinds. The `catch_unwind` here is a
-/// no-op under the crate's `panic = abort` policy (see [`panic_guard`])
-/// and is kept for two reasons: (a) in test builds, where cargo forces
-/// `panic = unwind`, it converts any unwind from `f` between
-/// `ptr::read(inner_ptr)` and `ptr::write` — the window during which the
-/// slot is logically uninitialised — into a hard abort, instead of
-/// letting the test harness recover and leak the stale value into
-/// `_query_free`'s drop; (b) it preserves the structural barrier if the
-/// crate ever moves off `panic = abort`. The line_sender FFI does not
-/// wrap its bind sites; the extra wrap here is justified by the
-/// lifetime-laundered `ReaderQuery<'static>` surface area.
+/// The take/apply/put dance is `Option::take` + assignment rather than the
+/// `ptr::read`/`ptr::write` pair the laundered predecessor needed: because
+/// `OwnedQuery` carries no lifetime, the slot can be a plain `Option` and
+/// the whole helper is safe code apart from the raw-pointer deref.
+///
+/// `f` is in practice infallible — the upstream `bind_*` methods just push
+/// into a `Vec`, and allocation failure under the default allocator aborts
+/// rather than unwinds. The `catch_unwind` is a no-op under the crate's
+/// `panic = abort` policy (see [`panic_guard`]) and is kept so that in test
+/// builds, where cargo forces `panic = unwind`, an unwind out of `f`
+/// aborts rather than leaving the handle permanently empty (which would
+/// then swallow every later bind and strand the connection).
 unsafe fn mutate_query<F>(query: *mut qwp_reader_query, f: F)
 where
-    F: FnOnce(ReaderQuery<'static>) -> ReaderQuery<'static>,
+    F: FnOnce(FfiQuery) -> FfiQuery,
 {
     unsafe {
         if query.is_null() {
@@ -2098,10 +2164,12 @@ where
         if (*query).deferred_err.is_some() {
             return;
         }
-        let inner_ptr: *mut ReaderQuery<'static> = &mut *(*query).inner;
-        let q = ptr::read(inner_ptr);
+        let Some(q) = (*query).inner.take() else {
+            eprintln!("qwp_reader_query_bind_*: query handle already consumed; bind dropped");
+            return;
+        };
         match std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || f(q))) {
-            Ok(new_q) => ptr::write(inner_ptr, new_q),
+            Ok(new_q) => (*query).inner = Some(new_q),
             Err(_) => std::process::abort(),
         }
     }
@@ -2421,49 +2489,33 @@ fn column_kind_from_c(k: u32) -> Option<ColumnKind> {
 // Cursor
 // ---------------------------------------------------------------------------
 
-/// Opaque cursor handle. Borrows from the originating `qwp_reader` for its
-/// entire lifetime — the reader MUST outlive the cursor. Thread-mobile but
-/// single-threaded.
+/// Opaque cursor handle. **Owns** the connection for its entire lifetime —
+/// it was moved here out of the originating `qwp_reader`, which MUST
+/// outlive the cursor because that is where the connection goes back to.
+/// Thread-mobile but single-threaded.
 ///
-/// # Self-referential invariant (READ BEFORE EDITING)
-///
-/// `current_batch: Option<BatchView<'static>>` is laundered to `'static`
-/// but in reality borrows from `cursor: ManuallyDrop<Cursor<'static>>`
-/// (also laundered). This is a self-referential struct held together
-/// purely by convention; the Rust type system cannot enforce the
-/// invariant. The convention is:
-///
-///   *Any code path that takes `&mut self.cursor` MUST first set
-///   `self.current_batch = None`, OR be the one final consumer that
-///   tears the whole struct down.*
-///
-/// Violating this aliases the immutable borrow held by the live
-/// `BatchView` against the new exclusive borrow on the `Cursor` it came
-/// from — instant Rust aliasing UB even though the C caller would see
-/// no symptom until later memory corruption.
-///
-/// To make accidental violation harder, all in-place cursor mutations
-/// (`_cursor_cancel`, `_cursor_add_credit`, `_cursor_next_batch`) route
-/// through `cursor_for_mut()`, which clears the batch and yields the
-/// exclusive borrow in one step. `_cursor_free` is the one teardown
-/// path that does not use the helper — it consumes the `Box` and drops
-/// the `BatchView` first, then the cursor, then the box.
+/// This type used to be a self-referential struct: a `Cursor<'static>` and
+/// a `BatchView<'static>` borrowed from it, both lifetime-laundered,
+/// with a hand-maintained "clear the view before you touch the cursor"
+/// convention that the type system could not enforce and whose failure
+/// mode was aliasing UB. Neither field survives. The current batch is
+/// reached through `&self` on the `OwnedCursor` (`batch_row_count`,
+/// `batch_column`, ...), so there is no second handle to keep valid, no
+/// convention to maintain, and no chokepoint needed to enforce it.
 pub struct qwp_reader_cursor {
-    /// Cursor borrowing from the originating Reader. Lifetime extended to
-    /// `'static` via `transmute`; the actual lifetime is bounded by the
-    /// reader the C caller holds. ManuallyDrop because the cursor must be
-    /// dropped before the surrounding box is freed.
-    cursor: ManuallyDrop<Cursor<'static>>,
-    /// View over the most recently decoded batch. Re-issued on each
-    /// `next_batch`; cleared when the stream terminates. Lifetime extended
-    /// for the same reason as `cursor`. See the struct-level safety note —
-    /// this field MUST be `None` whenever `&mut self.cursor` is exposed.
-    current_batch: Option<BatchView<'static>>,
+    /// `Some` for the whole normal life of the handle; vacated only by
+    /// `_cursor_free`, which needs to move the cursor out in order to call
+    /// `into_owner` and hand the connection back.
+    cursor: Option<FfiCursor>,
     /// Pins the first Arrow batch's schema for mid-stream drift detection.
+    /// Unrelated to the borrow chain: it is FFI-local state that exists
+    /// because the C Arrow entry points are one-shot calls with nowhere to
+    /// keep a caller-side schema.
     #[cfg(feature = "arrow")]
     arrow_schema_pin: Option<arrow::datatypes::SchemaRef>,
-    /// Backpointer to the originating reader, used to clear its `active`
-    /// flag on `_cursor_free`. Always non-NULL for a valid cursor.
+    /// Backpointer to the originating reader: where the connection is
+    /// returned and the `active` flag cleared on `_cursor_free`. Always
+    /// non-NULL for a valid cursor.
     reader: ReaderBackptr,
 }
 
@@ -2479,34 +2531,64 @@ const _: fn() = || {
 };
 
 impl qwp_reader_cursor {
-    /// Drop any in-flight `BatchView` and yield exclusive access to the
-    /// inner `Cursor`. The single chokepoint that maintains the
-    /// "no-`current_batch`-while-`&mut cursor`" invariant documented on
-    /// `qwp_reader_cursor`. Mutating cursor ops MUST go through here
-    /// instead of taking `&mut self.cursor` directly.
+    /// Exclusive access to the owning cursor. What is left of
+    /// `cursor_for_mut` / `cursor_for_aux`: those existed to clear the
+    /// laundered `BatchView` before every re-borrow of the `Cursor`, and
+    /// with no such view there is nothing to clear. Callers that advance
+    /// the stream additionally reset the Arrow schema pin at their own
+    /// call site — that is an Arrow-drift concern, not a borrow concern,
+    /// and the two do not belong behind one helper.
     ///
-    /// Also clears any Arrow schema pin — switching back from the raw
-    /// `BatchView` path to `_next_arrow_batch` should re-snapshot the
-    /// schema, not compare against a stale one from before the detour.
-    fn cursor_for_mut(&mut self) -> &mut Cursor<'static> {
-        self.current_batch = None;
-        debug_assert!(self.current_batch.is_none());
-        #[cfg(feature = "arrow")]
-        {
-            self.arrow_schema_pin = None;
-        }
-        &mut self.cursor
+    /// `None` only after `_cursor_free` has consumed the handle, which the
+    /// C contract forbids callers from observing.
+    fn get_mut(&mut self) -> Option<&mut FfiCursor> {
+        self.cursor.as_mut()
     }
 
-    /// Like `cursor_for_mut` but preserves any Arrow schema pin. For
-    /// auxiliary cursor ops (`cancel`, `add_credit`) that do not advance
-    /// the stream and therefore must not lose the drift-detection
-    /// snapshot established by a prior `_next_arrow_batch`.
-    fn cursor_for_aux(&mut self) -> &mut Cursor<'static> {
-        self.current_batch = None;
-        debug_assert!(self.current_batch.is_none());
-        &mut self.cursor
+    /// Shared access to the owning cursor, for the read-only getters and
+    /// for every `qwp_reader_batch_*` accessor.
+    fn get(&self) -> Option<&FfiCursor> {
+        self.cursor.as_ref()
     }
+}
+
+/// Borrow the owning cursor behind a C handle, reporting a NULL handle or
+/// a consumed handle through `err_out`.
+unsafe fn cursor_mut_or_err<'a>(
+    cursor: *mut qwp_reader_cursor,
+    err_out: *mut *mut questdb_error,
+    fn_name: &str,
+) -> Option<&'a mut FfiCursor> {
+    unsafe {
+        if cursor.is_null() {
+            set_reader_err(
+                err_out,
+                ErrorCode::InvalidApiCall,
+                format!("{fn_name}: cursor is NULL"),
+            );
+            return None;
+        }
+        match (*cursor).get_mut() {
+            Some(c) => Some(c),
+            None => {
+                set_reader_err(
+                    err_out,
+                    ErrorCode::InvalidApiCall,
+                    format!("{fn_name}: cursor handle has already been freed"),
+                );
+                None
+            }
+        }
+    }
+}
+
+/// NULL-tolerant shared borrow for the pure-return getters, which have no
+/// `err_out` channel and answer with a documented sentinel instead.
+unsafe fn cursor_ref<'a>(cursor: *const qwp_reader_cursor) -> Option<&'a FfiCursor> {
+    if cursor.is_null() {
+        return None;
+    }
+    unsafe { (*cursor).get() }
 }
 
 /// Free the cursor and release its resources. Drops any in-flight
@@ -2532,23 +2614,18 @@ pub unsafe extern "C" fn qwp_reader_cursor_free(cursor: *mut qwp_reader_cursor) 
             return;
         }
         let mut boxed = Box::from_raw(cursor);
-        // Drop the BatchView (it borrows from the cursor) before the
-        // cursor itself. Wrapped in `panic_guard` because the cursor's
-        // `Drop` runs `close_in_place`, which writes a Close frame
-        // and shuts down the TCP socket. No-op under this crate's
-        // `panic = abort` policy (the panic site aborts directly);
-        // active in test builds and a structural barrier if the
-        // policy ever moves to `unwind`. See `panic_guard` docstring.
-        boxed.current_batch = None;
-        ManuallyDrop::drop(&mut boxed.cursor);
-        // Release the reader's active flag so a new query/cursor can be
-        // started.
-        if !boxed.reader.is_null() {
-            (*boxed.reader.as_ptr())
-                .cursor_active
-                .store(false, Ordering::Release);
-        }
-        drop(boxed);
+        // `into_owner` runs the identical teardown `Drop for OwnedCursor`
+        // runs — best-effort CANCEL then close, on an undrained stream —
+        // and then yields the connection, which goes back to the reader
+        // handle. The old explicit view-then-cursor-then-box ordering is
+        // gone: there is no view, and ordinary drop glue handles the rest.
+        //
+        // Wrapped in `panic_guard` because that teardown writes a Close
+        // frame and shuts down the TCP socket. No-op under this crate's
+        // `panic = abort` policy (the panic site aborts directly); active
+        // in test builds and a structural barrier if the policy ever moves
+        // to `unwind`. See `panic_guard` docstring.
+        release_to_reader(boxed.reader, boxed.cursor.take().map(FfiCursor::into_owner));
     })
 }
 
@@ -2576,52 +2653,42 @@ pub unsafe extern "C" fn qwp_reader_cursor_next_batch(
             );
             return std::ptr::null();
         }
-        let c = &mut *cursor;
-        // `cursor_for_mut` clears `current_batch` (releasing the prior
-        // BatchView's borrow on the cursor) and yields exclusive access
-        // to the inner Cursor in one step — see the struct-level safety
-        // note. The borrow is released before we re-assign
-        // `c.current_batch` below; the explicit binding (`inner`) keeps
-        // borrowck happy across the match.
-        let inner: &mut Cursor<'static> = c.cursor_for_mut();
+        // Advancing the raw path invalidates any Arrow schema pin:
+        // switching back to `_next_arrow_batch` should re-snapshot the
+        // schema, not compare against a stale one from before the detour.
+        // This used to ride inside `cursor_for_mut`; it is stated here
+        // because it is an Arrow-drift concern and has nothing to do with
+        // how the batch is borrowed.
+        #[cfg(feature = "arrow")]
+        {
+            (*cursor).arrow_schema_pin = None;
+        }
+        let Some(inner) = cursor_mut_or_err(cursor, err_out, "qwp_reader_cursor_next_batch") else {
+            return std::ptr::null();
+        };
         // The decoder pipeline (varint parse, schema/dict bookkeeping,
         // Gorilla decode, validity walks) contains panic sites; under
         // this crate's `panic = abort` policy the panic site aborts
         // directly, so the `catch_unwind` + abort below is a no-op in
         // shipped builds. It is kept active for test builds (cargo
         // forces `panic = unwind`) and to match the wrap pattern used
-        // by `_query_new` and `_query_execute`. See `panic_guard`
-        // docstring. The lifetime launder happens INSIDE the closure:
-        // `BatchView<'_>` borrows from `inner`, which the closure
-        // can't return as a borrow of a captured variable. The
-        // launder is sound for the same reason as in `_query_new` —
-        // the cursor (and therefore the batch's backing buffers) lives
-        // at least as long as the FFI call sequence ends with
-        // `_cursor_free`.
-        let result =
-            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| match inner.next_batch() {
-                Ok(Some(batch)) => {
-                    let batch_static: BatchView<'static> = std::mem::transmute(batch);
-                    Ok(Some(batch_static))
-                }
-                Ok(None) => Ok(None),
-                Err(e) => Err(e),
-            }));
+        // by `_prepare` and `_query_execute`. See `panic_guard`
+        // docstring.
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| inner.next_batch()));
         let next = match result {
             Ok(r) => r,
             Err(_) => std::process::abort(),
         };
         match next {
-            Ok(Some(batch_static)) => {
-                c.current_batch = Some(batch_static);
-                // SAFETY: `repr(transparent)` over `BatchView<'static>`; the
-                // pointer borrows the cursor's `current_batch` field and is
-                // valid until the next `cursor_for_mut` (i.e. next
-                // `next_batch` / `cancel` / `free`).
-                let bv: &BatchView<'static> = c.current_batch.as_ref().unwrap();
-                (bv as *const BatchView<'static>).cast()
-            }
-            Ok(None) => ptr::null(),
+            // The batch handle IS the cursor handle: every
+            // `qwp_reader_batch_*` accessor reads the decoded batch back
+            // out of the cursor through `&self`, so there is nothing to
+            // store and no second handle to keep valid. The C contract is
+            // unchanged — the returned pointer is still opaque, still
+            // borrowed, and still documented as invalidated by the next
+            // `_next_batch` / `_cancel` / `_add_credit` / `_free`.
+            Ok(true) => (cursor as *const qwp_reader_cursor).cast(),
+            Ok(false) => ptr::null(),
             Err(e) => {
                 write_err_box(err_out, e);
                 ptr::null()
@@ -2638,19 +2705,14 @@ pub unsafe extern "C" fn qwp_reader_cursor_next_batch(
 /// Returns `0` for a NULL handle.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn qwp_reader_cursor_request_id(cursor: *const qwp_reader_cursor) -> i64 {
-    unsafe {
-        if cursor.is_null() {
-            return 0;
-        }
-        (*cursor).cursor.request_id()
-    }
+    unsafe { cursor_ref(cursor).map_or(0, FfiCursor::request_id) }
 }
 
 /// Cumulative bytes of CREDIT this cursor has granted the server. Pulls
 /// through to the underlying reader's connection-level counter.
 ///
 /// **Single-thread only.** This getter reads the counter through the
-/// laundered `Cursor<'static>` and is bound by the cursor's one-thread-at-a-time
+/// cursor's owned connection and is bound by the cursor's one-thread-at-a-time
 /// contract — calling it from a monitoring thread while the cursor's
 /// owning thread is inside `next_batch` / `cancel` / `add_credit` is
 /// undefined behaviour. For cross-thread monitoring (e.g. a stats
@@ -2662,12 +2724,7 @@ pub unsafe extern "C" fn qwp_reader_cursor_request_id(cursor: *const qwp_reader_
 pub unsafe extern "C" fn qwp_reader_cursor_credit_granted_total(
     cursor: *const qwp_reader_cursor,
 ) -> u64 {
-    unsafe {
-        if cursor.is_null() {
-            return 0;
-        }
-        (*cursor).cursor.credit_granted_total()
-    }
+    unsafe { cursor_ref(cursor).map_or(0, FfiCursor::credit_granted_total) }
 }
 
 /// Number of successful failover resets observed by this cursor since
@@ -2676,12 +2733,7 @@ pub unsafe extern "C" fn qwp_reader_cursor_credit_granted_total(
 pub unsafe extern "C" fn qwp_reader_cursor_failover_resets(
     cursor: *const qwp_reader_cursor,
 ) -> u32 {
-    unsafe {
-        if cursor.is_null() {
-            return 0;
-        }
-        (*cursor).cursor.failover_resets()
-    }
+    unsafe { cursor_ref(cursor).map_or(0, FfiCursor::failover_resets) }
 }
 
 /// Host of the endpoint the cursor is currently connected to. Borrowed;
@@ -2699,12 +2751,11 @@ pub unsafe extern "C" fn qwp_reader_cursor_current_addr_host(
         if out_buf.is_null() || out_len.is_null() {
             return;
         }
-        if cursor.is_null() {
+        let Some(ep) = cursor_ref(cursor).map(FfiCursor::current_addr) else {
             *out_buf = ptr::null();
             *out_len = 0;
             return;
-        }
-        let ep = (*cursor).cursor.current_addr();
+        };
         *out_buf = ep.host.as_ptr() as *const c_char;
         *out_len = ep.host.len();
     }
@@ -2716,12 +2767,7 @@ pub unsafe extern "C" fn qwp_reader_cursor_current_addr_host(
 pub unsafe extern "C" fn qwp_reader_cursor_current_addr_port(
     cursor: *const qwp_reader_cursor,
 ) -> u16 {
-    unsafe {
-        if cursor.is_null() {
-            return 0;
-        }
-        (*cursor).cursor.current_addr().port
-    }
+    unsafe { cursor_ref(cursor).map_or(0, |c| c.current_addr().port) }
 }
 
 /// Negotiated QWP version of the cursor's underlying connection. The
@@ -2750,7 +2796,7 @@ pub unsafe extern "C" fn qwp_reader_cursor_server_version(
             }
             return false;
         }
-        if cursor.is_null() {
+        let Some(c) = cursor_ref(cursor) else {
             if !err_out.is_null() {
                 set_reader_err(
                     err_out,
@@ -2759,8 +2805,8 @@ pub unsafe extern "C" fn qwp_reader_cursor_server_version(
                 );
             }
             return false;
-        }
-        match (*cursor).cursor.server_version() {
+        };
+        match c.server_version() {
             Ok(v) => {
                 *out_version = v;
                 true
@@ -2786,10 +2832,7 @@ pub unsafe extern "C" fn qwp_reader_cursor_current_server_info(
     cursor: *const qwp_reader_cursor,
 ) -> *const qwp_reader_server_info {
     unsafe {
-        if cursor.is_null() {
-            return ptr::null();
-        }
-        match (*cursor).cursor.server_info() {
+        match cursor_ref(cursor).and_then(FfiCursor::server_info) {
             Some(si) => si as *const ServerInfo as *const qwp_reader_server_info,
             None => ptr::null(),
         }
@@ -2817,10 +2860,7 @@ pub unsafe extern "C" fn qwp_reader_cursor_terminal_kind(
     cursor: *const qwp_reader_cursor,
 ) -> qwp_reader_terminal_kind {
     unsafe {
-        if cursor.is_null() {
-            return qwp_reader_terminal_kind::qwp_reader_terminal_kind_none;
-        }
-        match (*cursor).cursor.terminal() {
+        match cursor_ref(cursor).and_then(FfiCursor::terminal) {
             None => qwp_reader_terminal_kind::qwp_reader_terminal_kind_none,
             Some(Terminal::End { .. }) => qwp_reader_terminal_kind::qwp_reader_terminal_kind_end,
             Some(Terminal::ExecDone { .. }) => {
@@ -2851,12 +2891,7 @@ pub unsafe extern "C" fn qwp_reader_cursor_terminal_end(
         if out_final_seq.is_null() || out_total_rows.is_null() {
             return false;
         }
-        if cursor.is_null() {
-            *out_final_seq = 0;
-            *out_total_rows = 0;
-            return false;
-        }
-        match (*cursor).cursor.terminal() {
+        match cursor_ref(cursor).and_then(FfiCursor::terminal) {
             Some(Terminal::End {
                 final_seq,
                 total_rows,
@@ -2889,12 +2924,7 @@ pub unsafe extern "C" fn qwp_reader_cursor_terminal_exec_done(
         if out_op_type.is_null() || out_rows_affected.is_null() {
             return false;
         }
-        if cursor.is_null() {
-            *out_op_type = 0;
-            *out_rows_affected = 0;
-            return false;
-        }
-        match (*cursor).cursor.terminal() {
+        match cursor_ref(cursor).and_then(FfiCursor::terminal) {
             Some(Terminal::ExecDone {
                 op_type,
                 rows_affected,
@@ -2918,7 +2948,7 @@ pub unsafe extern "C" fn qwp_reader_cursor_terminal_exec_done(
 pub unsafe extern "C" fn qwp_reader_cursor_connection_reusable(
     cursor: *const qwp_reader_cursor,
 ) -> bool {
-    unsafe { !cursor.is_null() && (*cursor).cursor.connection_reusable() }
+    unsafe { cursor_ref(cursor).is_some_and(FfiCursor::connection_reusable) }
 }
 
 /// Send `CANCEL` and drain to terminal. On failure, use
@@ -2930,18 +2960,12 @@ pub unsafe extern "C" fn qwp_reader_cursor_cancel(
     err_out: *mut *mut questdb_error,
 ) -> bool {
     unsafe {
-        if cursor.is_null() {
-            set_reader_err(
-                err_out,
-                ErrorCode::InvalidApiCall,
-                "qwp_reader_cursor_cancel: cursor is NULL",
-            );
+        // The Arrow schema pin is deliberately left intact: `cancel` does
+        // not advance the stream, so it must not lose the drift-detection
+        // snapshot a prior `_next_arrow_batch` established.
+        let Some(inner) = cursor_mut_or_err(cursor, err_out, "qwp_reader_cursor_cancel") else {
             return false;
-        }
-        // `cursor_for_aux` keeps the Arrow schema pin intact — `cancel`
-        // is a terminal op so the pin is about to be irrelevant, but
-        // sharing the helper with `add_credit` keeps the contract uniform.
-        let inner = (*cursor).cursor_for_aux();
+        };
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| inner.cancel()));
         let res = match result {
             Ok(r) => r,
@@ -2959,10 +2983,9 @@ pub unsafe extern "C" fn qwp_reader_cursor_cancel(
 
 /// Grant the server an additional CREDIT budget. Only valid for cursors
 /// started with `initial_credit > 0`. Invalidates the current batch handle
-/// and every pointer borrowed from it (routes through `cursor_for_aux`,
-/// which clears the batch but preserves any Arrow schema pin), and may
-/// transparently trigger mid-query failover when the CREDIT write hits a
-/// transport failure.
+/// and every pointer borrowed from it (any Arrow schema pin is preserved),
+/// and may transparently trigger mid-query failover when the CREDIT write
+/// hits a transport failure.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn qwp_reader_cursor_add_credit(
     cursor: *mut qwp_reader_cursor,
@@ -2970,18 +2993,12 @@ pub unsafe extern "C" fn qwp_reader_cursor_add_credit(
     err_out: *mut *mut questdb_error,
 ) -> bool {
     unsafe {
-        if cursor.is_null() {
-            set_reader_err(
-                err_out,
-                ErrorCode::InvalidApiCall,
-                "qwp_reader_cursor_add_credit: cursor is NULL",
-            );
-            return false;
-        }
-        // `cursor_for_aux` keeps the Arrow schema pin intact across this
+        // The Arrow schema pin is deliberately left intact across this
         // flow-control call; otherwise a subsequent `_next_arrow_batch`
         // would lose its drift snapshot.
-        let inner = (*cursor).cursor_for_aux();
+        let Some(inner) = cursor_mut_or_err(cursor, err_out, "qwp_reader_cursor_add_credit") else {
+            return false;
+        };
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             inner.add_credit(additional_bytes)
         }));
@@ -3036,13 +3053,20 @@ unsafe fn null_out_param_err(err_out: *mut *mut questdb_error, fn_name: &str) {
 // Batch & column bulk access
 // ---------------------------------------------------------------------------
 
-/// Borrowed handle for the batch currently loaded in a cursor. Backed by
-/// the cursor's `current_batch`; invalidated by the next
-/// `qwp_reader_cursor_next_batch`, `qwp_reader_cursor_cancel`,
-/// `qwp_reader_cursor_add_credit`, `qwp_reader_cursor_free`, or
-/// mid-query failover. Never freed by the caller.
+/// Borrowed handle for the batch currently loaded in a cursor.
+/// Invalidated by the next `qwp_reader_cursor_next_batch`,
+/// `qwp_reader_cursor_cancel`, `qwp_reader_cursor_add_credit`,
+/// `qwp_reader_cursor_free`, or mid-query failover. Never freed by the
+/// caller.
+///
+/// Opaque to C, and its C-visible contract is unchanged. Internally it is
+/// now the cursor handle itself rather than a laundered `BatchView`: the
+/// accessors below read the decoded batch back out of the `OwnedCursor`
+/// through `&self`, which is what removes the need for a second handle
+/// spanning the cursor and its reader. `repr(transparent)` is what makes
+/// the pointer cast in `_cursor_next_batch` sound.
 #[repr(transparent)]
-pub struct qwp_reader_batch(BatchView<'static>);
+pub struct qwp_reader_batch(qwp_reader_cursor);
 
 /// Bulk descriptor for one scalar / variable-width column. Every pointer
 /// borrows from the batch and shares its lifetime.
@@ -3133,7 +3157,7 @@ unsafe fn batch_or_err<'a>(
     batch: *const qwp_reader_batch,
     err_out: *mut *mut questdb_error,
     fn_name: &str,
-) -> Option<&'a BatchView<'static>> {
+) -> Option<&'a FfiCursor> {
     if batch.is_null() {
         unsafe {
             set_reader_err(
@@ -3144,29 +3168,40 @@ unsafe fn batch_or_err<'a>(
         }
         return None;
     }
-    Some(unsafe { &(*batch).0 })
+    match unsafe { (*batch).0.get() } {
+        Some(c) => Some(c),
+        None => {
+            unsafe {
+                set_reader_err(
+                    err_out,
+                    ErrorCode::InvalidApiCall,
+                    format!("{fn_name}: the cursor this batch came from has been freed"),
+                );
+            }
+            None
+        }
+    }
+}
+
+/// NULL-tolerant shared borrow for the pure-return batch getters, which
+/// have no `err_out` channel and answer with a documented sentinel.
+unsafe fn batch_ref<'a>(batch: *const qwp_reader_batch) -> Option<&'a FfiCursor> {
+    if batch.is_null() {
+        return None;
+    }
+    unsafe { (*batch).0.get() }
 }
 
 /// Rows in the batch. `0` on a NULL handle.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn qwp_reader_batch_row_count(batch: *const qwp_reader_batch) -> size_t {
-    unsafe {
-        if batch.is_null() {
-            return 0;
-        }
-        (*batch).0.row_count()
-    }
+    unsafe { batch_ref(batch).map_or(0, FfiCursor::batch_row_count) }
 }
 
 /// Columns in the batch. `0` on a NULL handle.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn qwp_reader_batch_column_count(batch: *const qwp_reader_batch) -> size_t {
-    unsafe {
-        if batch.is_null() {
-            return 0;
-        }
-        (*batch).0.column_count()
-    }
+    unsafe { batch_ref(batch).map_or(0, FfiCursor::batch_column_count) }
 }
 
 /// `request_id` echoed from the originating `QUERY_REQUEST`. `0` on a NULL
@@ -3174,32 +3209,25 @@ pub unsafe extern "C" fn qwp_reader_batch_column_count(batch: *const qwp_reader_
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn qwp_reader_batch_request_id(batch: *const qwp_reader_batch) -> i64 {
     unsafe {
-        if batch.is_null() {
-            return 0;
-        }
-        (*batch).0.request_id()
+        batch_ref(batch)
+            .and_then(FfiCursor::batch_request_id)
+            .unwrap_or(0)
     }
 }
 
 /// Monotonic per-request batch sequence number. `0` on a NULL handle.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn qwp_reader_batch_seq(batch: *const qwp_reader_batch) -> u64 {
-    unsafe {
-        if batch.is_null() {
-            return 0;
-        }
-        (*batch).0.batch_seq()
-    }
+    unsafe { batch_ref(batch).and_then(FfiCursor::batch_seq).unwrap_or(0) }
 }
 
 /// Per-batch wire flags from the frame header. `0` on a NULL handle.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn qwp_reader_batch_flags(batch: *const qwp_reader_batch) -> u8 {
     unsafe {
-        if batch.is_null() {
-            return 0;
-        }
-        (*batch).0.flags()
+        batch_ref(batch)
+            .and_then(FfiCursor::batch_flags)
+            .unwrap_or(0)
     }
 }
 
@@ -3248,8 +3276,11 @@ pub unsafe extern "C" fn qwp_reader_batch_column_name(
         let Some(batch) = batch_or_err(batch, err_out, "qwp_reader_batch_column_name") else {
             return false;
         };
-        let schema = batch.schema();
-        match schema.column(col_idx) {
+        // `batch_schema()` is `None` only before the first `next_batch`,
+        // which a caller holding a batch handle cannot be — but report it
+        // as an out-of-range index rather than assuming.
+        let schema = batch.batch_schema();
+        match schema.and_then(|s| s.column(col_idx)) {
             Some(col) => {
                 *out_buf = col.name.as_ptr() as *const c_char;
                 *out_len = col.name.len();
@@ -3262,7 +3293,7 @@ pub unsafe extern "C" fn qwp_reader_batch_column_name(
                     format!(
                         "column index {} out of range (column_count={})",
                         col_idx,
-                        schema.len()
+                        schema.map_or(0, |s| s.len())
                     ),
                 );
                 false
@@ -3294,7 +3325,7 @@ pub unsafe extern "C" fn qwp_reader_batch_column_data(
         };
         let mut d = qwp_reader_column_data {
             kind: view.kind().into(),
-            row_count: batch.row_count(),
+            row_count: batch.batch_row_count(),
             validity: ptr::null(),
             values: ptr::null(),
             value_stride: 0,
@@ -3418,7 +3449,7 @@ pub unsafe extern "C" fn qwp_reader_batch_array_column_data(
         };
         let mut d = qwp_reader_array_data {
             kind: view.kind().into(),
-            row_count: batch.row_count(),
+            row_count: batch.batch_row_count(),
             validity: ptr::null(),
             data: ptr::null(),
             data_len: 0,
@@ -3500,7 +3531,7 @@ pub unsafe extern "C" fn qwp_reader_batch_symbol(
             );
             return false;
         }
-        let dict = batch.dict();
+        let dict = batch.symbol_dict();
         match dict.get(code) {
             Some(s) => {
                 *out_buf = s.as_ptr() as *const c_char;
@@ -3539,7 +3570,7 @@ pub unsafe extern "C" fn qwp_reader_batch_symbol_dict(
         let Some(batch) = batch_or_err(batch, err_out, "qwp_reader_batch_symbol_dict") else {
             return false;
         };
-        let dict = batch.dict();
+        let dict = batch.symbol_dict();
         let entries = dict.entries();
         let heap = dict.arena();
         *out = qwp_reader_symbol_dict {
@@ -3555,11 +3586,11 @@ pub unsafe extern "C" fn qwp_reader_batch_symbol_dict(
 /// Build a `ColumnView` for `col_idx`, reporting an out-of-range index or a
 /// projection failure through `err_out`.
 unsafe fn column_view_or_err<'a>(
-    batch: &'a BatchView<'a>,
+    batch: &'a FfiCursor,
     col_idx: size_t,
     err_out: *mut *mut questdb_error,
 ) -> Option<ColumnView<'a>> {
-    if col_idx >= batch.column_count() {
+    if col_idx >= batch.batch_column_count() {
         unsafe {
             set_reader_err(
                 err_out,
@@ -3567,13 +3598,13 @@ unsafe fn column_view_or_err<'a>(
                 format!(
                     "column index {} out of range (column_count={})",
                     col_idx,
-                    batch.column_count()
+                    batch.batch_column_count()
                 ),
             );
         }
         return None;
     }
-    match batch.column(col_idx) {
+    match batch.batch_column(col_idx) {
         Ok(view) => Some(view),
         Err(e) => {
             unsafe { write_err_box(err_out, e) };
@@ -4047,7 +4078,7 @@ mod tests {
     /// callback — so testing it via raw pointer preserves the dispatch
     /// invariant we care about while sidestepping the validity invariants
     /// of `FailoverResetEvent` (which would be violated by an all-zeros buffer
-    /// transmuted to `&FailoverResetEvent`).
+    /// reinterpreted as `&FailoverResetEvent`).
     fn dispatch_via_trampoline(
         cb: qwp_reader_failover_reset_callback,
         user_data: *mut c_void,
@@ -4159,9 +4190,14 @@ unsafe fn reader_cursor_next_arrow_batch_export(
             End,
             Err(Error, Option<arrow::datatypes::SchemaRef>),
         }
-        let c = &mut *cursor;
-        let pinned = c.arrow_schema_pin.clone();
-        let inner: &mut Cursor<'static> = c.cursor_for_mut();
+        let pinned = (*cursor).arrow_schema_pin.clone();
+        // No `cursor_for_mut` any more: there is no laundered `BatchView`
+        // to clear before re-borrowing the cursor. The pin is re-derived
+        // from `pinned` on every arm below, exactly as before.
+        let Some(inner) = cursor_mut_or_err(cursor, err_out, "qwp_reader_cursor_next_arrow_batch")
+        else {
+            return qwp_reader_arrow_batch_result::qwp_reader_arrow_batch_error;
+        };
         let outcome = panic_guard(|| -> NextArrow {
             let rb = match inner.next_arrow_batch_inner(pinned.as_ref(), compact) {
                 Ok(Some(rb)) => rb,
@@ -4179,6 +4215,7 @@ unsafe fn reader_cursor_next_arrow_batch_export(
                 ),
             }
         });
+        let c = &mut *cursor;
         match outcome {
             NextArrow::Ok(ffi_array, ffi_schema, schema_ref) => {
                 c.arrow_schema_pin = Some(schema_ref);
