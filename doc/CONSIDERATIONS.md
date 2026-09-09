@@ -48,7 +48,7 @@ acknowledgement. Use `flush_and_wait` or `wait` when the caller needs a barrier:
 - `ok` waits until the server accepts every frame published through that
   sender up to the captured frame-sequence boundary;
 - `durable` requires QuestDB Enterprise, waits for the server's durable
-  watermark, and requires the pool to be configured with
+  watermark, and requires the sender or pool to be opened with
   `request_durable_ack=on`; and
 - neither ACK guarantees that a WAL table row is immediately query-visible.
   WAL application remains asynchronous, so read-after-write workflows should

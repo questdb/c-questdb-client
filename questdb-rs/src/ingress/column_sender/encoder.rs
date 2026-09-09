@@ -125,13 +125,14 @@ pub(crate) fn encode_chunk_replay_into(
     chunk: &Chunk<'_>,
     symbol_dict: &mut SymbolGlobalDict,
     scratch: &mut EncodeScratch,
+    defer_commit: bool,
 ) -> Result<()> {
     encode_chunk_into_mode(
         out,
         chunk,
         symbol_dict,
         scratch,
-        /* defer_commit = */ false,
+        defer_commit,
         /* replay_symbols = */ true,
     )
 }
@@ -1734,6 +1735,26 @@ mod tests {
     }
 
     #[test]
+    fn replay_frame_defer_commit_changes_only_the_flag() {
+        // The store-and-forward split path defers replay (full-dictionary)
+        // frames too. The flag must survive that encoder and touch nothing
+        // else: the deferred frame is the plain one plus one header bit.
+        let mut chunk = Chunk::new("trades");
+        chunk.column_i64("qty", &[1, 2], None).unwrap();
+        chunk.at_nanos(&[1, 2]).unwrap();
+        let mut dict = SymbolGlobalDict::new();
+        let mut scratch = EncodeScratch::new();
+        let mut plain = Vec::new();
+        encode_chunk_replay_into(&mut plain, &chunk, &mut dict, &mut scratch, false).unwrap();
+        let mut deferred = Vec::new();
+        encode_chunk_replay_into(&mut deferred, &chunk, &mut dict, &mut scratch, true).unwrap();
+        assert_eq!(plain[5] & QWP_FLAG_DEFER_COMMIT, 0);
+        assert_eq!(deferred[5], plain[5] | QWP_FLAG_DEFER_COMMIT);
+        deferred[5] = plain[5];
+        assert_eq!(deferred, plain);
+    }
+
+    #[test]
     fn non_empty_chunk_without_designated_ts_errors() {
         let mut chunk = Chunk::new("trades");
         let data = [1i64, 2, 3];
@@ -2049,7 +2070,7 @@ mod tests {
         c2.at_nanos(&ts2).unwrap();
 
         let mut replay = Vec::new();
-        encode_chunk_replay_into(&mut replay, &c2, &mut dict, &mut scratch).unwrap();
+        encode_chunk_replay_into(&mut replay, &c2, &mut dict, &mut scratch, false).unwrap();
         assert_eq!(replay[5] & QWP_FLAG_DEFER_COMMIT, 0);
 
         let mut pos = QWP_HEADER_LEN;

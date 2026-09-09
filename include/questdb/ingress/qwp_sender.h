@@ -93,7 +93,13 @@ extern "C" {
  *  `sf_sync_interval_millis` defaults to 5000; it is a target, not a maximum
  *  loss window. `sf_durability=flush` and `sf_durability=append` are not yet
  *  supported. End-to-end durability also requires
- *  `request_durable_ack=on` and a durable ACK from QuestDB Enterprise. */
+ *  `request_durable_ack=on` and a durable ACK from QuestDB Enterprise.
+ *
+ *  A chunk too large for one frame is split into several frames and may be
+ *  committed in more than one server transaction: always once per frame with
+ *  `sf_dir`; without `sf_dir` normally once, at its last frame, but earlier
+ *  if the queue byte budget is tight. Do not rely on oversize-chunk
+ *  atomicity. */
 typedef struct qwp_sender qwp_sender;
 
 /** Direct (pipelined, non-store-and-forward) column-major QWP/WS sender.
@@ -778,11 +784,11 @@ bool qwp_chunk_column_binary(
  *
  * The failing chunk is rejected before any byte reaches the wire, with one
  * exception that matters for resends: a chunk too large for a single frame is
- * split and each half published on its own, so an earlier half can already be
- * durably queued (store-and-forward is at-least-once) when a later half hits
- * the cap. The flush is then delivery-unknown rather than
+ * split into several frames, published as it goes, so earlier frames can
+ * already be durably queued (store-and-forward is at-least-once) when a later
+ * frame hits the cap. The flush is then delivery-unknown rather than
  * known-not-delivered — check `line_sender_error_in_doubt` before resending
- * the chunk, or the rows the committed prefix already carried are duplicated.
+ * the chunk, or the rows the queued prefix already carried are duplicated.
  *
  * Resetting the dictionary means discarding the connection that owns it — there
  * is no per-sender close. A full dictionary RETIRES the connection on return,
@@ -1427,9 +1433,12 @@ bool qwp_chunk_at_scalar_nanos(
  * ACK. On success, `chunk` is cleared (allocations retained) and `true`
  * is returned. On failure, `chunk` is left untouched.
  *
- * Every flushed frame is non-deferred and is first accepted into the local
- * store-and-forward queue, which owns delivery. `qwp_sender_flush_chunk`
- * success means local queue acceptance, not server acknowledgement.
+ * Every flushed frame is first accepted into the local store-and-forward
+ * queue, which owns delivery. `qwp_sender_flush_chunk` success means local
+ * queue acceptance, not server acknowledgement. A chunk too large for one
+ * frame is split: without `sf_dir` every frame but the last is deferred so
+ * the chunk commits once (earlier if the queue byte budget is tight); with
+ * `sf_dir` each frame commits on its own.
  * `qwp_sender_flush_chunk_and_wait` combines local publication of `chunk` as
  * the sync-call boundary with the wait for `ack_level`. `qwp_sender_wait` does
  * not send a frame; it waits for frames already published to the local queue,
@@ -1443,9 +1452,11 @@ bool qwp_chunk_at_scalar_nanos(
  * `qwp_sender_flush_chunk_and_wait` it is the pool-wide `request_timeout`
  * (default 30s). The deadline resets on every watermark advance, so a
  * slow-but-progressing sync (e.g. a `durable` upload under pressure) is not
- * cut off. On this error the frames remain queued and the background runner
- * keeps delivering them: wait again (or watch the FSN watermark) rather than
- * re-flushing the same rows.
+ * cut off. Without `sf_dir`, an oversize chunk's split frames are acked only
+ * once its committing frame lands, so the watermark does not move mid-chunk;
+ * size the timeout for the largest chunk flushed. On this error the frames
+ * remain queued and the background runner keeps delivering them: wait again
+ * (or watch the FSN watermark) rather than re-flushing the same rows.
  * ------------------------------------------------------------------------- */
 
 QUESTDB_CLIENT_API

@@ -16,12 +16,24 @@ deferred tail. The Rust QWP/WS row sender does not implement that mode:
     (contrast ``request_durable_ack`` at conf.rs:209).
   * ``questdb-rs/src/ingress/buffer/qwp.rs:3559`` -- the encoder CAN frame
     deferred commits (``encode_ws_replay_message_with_defer``, flag applied
-    at qwp.rs:3654) but the only production caller hardcodes
-    ``defer_commit=false``; ``qwp_ws_publisher.rs:52`` uses the non-defer
-    wrapper. Dead capability on the publish path.
+    at qwp.rs:3654). The column sender's store-and-forward split now uses
+    it: an oversize chunk defers every frame but the last so the chunk
+    commits once. That is gated to MEMORY mode
+    (``SyncQwpWsHandlerState::sfa_split_deferral_enabled``, set from
+    ``sf_dir.is_none()``) precisely because of the next point -- so no
+    ``FLAG_DEFER_COMMIT`` frame ever reaches a persisted slot, and the
+    on-disk shapes these scenarios need cannot be produced by the client.
   * No orphan-tail retirement in SF recovery (no retirement logic in
     ``qwp_ws_sfa_slot.rs`` / ``qwp_ws_sfa_segment.rs``; the segment scan
-    handles torn frames only).
+    handles torn frames only). ``FLAG_DEFER_COMMIT`` appears nowhere under
+    ``ingress/sender/``, so a recovered tail has no commit boundary to read:
+    the orphan drainer opens replay-only with no producer and can never
+    append the committing frame, while ``orphan_queue_drained`` is
+    ``completed >= published``, which such a tail never satisfies. The Java
+    client has the machinery to port -- ``RecoveredFrameAnalysis``
+    (``commitBoundaryFsn``) and
+    ``CursorSendEngine.retireRecoveredOrphanTailIfReady``, which retires the
+    tail by a local cumulative self-acknowledge rather than truncating.
 
 Blocked until the client grows ``transaction=on`` + tail retirement:
 
