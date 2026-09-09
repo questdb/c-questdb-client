@@ -1267,8 +1267,16 @@ impl Buffer {
 
     /// Adds a UUID column to the current row. QWP-only.
     ///
+    /// `hi` is the most significant 64 bits of the UUID and `lo` the least
+    /// significant, the same split as `java.util.UUID` and as the
+    /// `(high, low)` pair returned by `uuid::Uuid::as_u64_pair()`. Both
+    /// halves are big-endian reads of the canonical 16-byte form, so for
+    /// `123e4567-e89b-12d3-a456-426614174000`, `hi` is `0x123e4567e89b12d3`
+    /// and `lo` is `0xa456426614174000`.
+    ///
     /// Per spec, the wire encoding writes `lo` (8 bytes LE) followed by `hi`
-    /// (8 bytes LE).
+    /// (8 bytes LE). Do not derive the arguments from that layout: decoding
+    /// either half little-endian silently writes a byte-reversed UUID.
     /// For canonical RFC-4122 bytes, use `column_sender::Chunk::column_uuid`
     /// instead of splitting the bytes into `lo` and `hi`.
     pub fn column_uuid<'a, N>(&mut self, name: N, lo: u64, hi: u64) -> crate::Result<&mut Self>
@@ -1297,6 +1305,9 @@ impl Buffer {
     }
 
     /// Adds a UUID column if `value` is `Some`. QWP-only.
+    ///
+    /// The tuple is `(lo, hi)`, split as described on
+    /// [`column_uuid`](Self::column_uuid).
     pub fn column_uuid_opt<'a, N>(
         &mut self,
         name: N,
