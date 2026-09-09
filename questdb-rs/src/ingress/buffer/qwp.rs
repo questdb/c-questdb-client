@@ -1115,7 +1115,7 @@ impl QwpBuffer {
 
     #[inline(always)]
     fn check_op(&self, op: Op) -> crate::Result<()> {
-        self.state.op_state.check(op)
+        self.state.op_state.check_unordered(op)
     }
 
     fn validate_max_name_len(&self, name: &str) -> crate::Result<()> {
@@ -2972,7 +2972,7 @@ impl QwpWsColumnarBuffer {
 
     #[inline(always)]
     fn check_op(&self, op: Op) -> crate::Result<()> {
-        self.state.op_state.check(op)
+        self.state.op_state.check_unordered(op)
     }
 
     fn validate_max_name_len(&self, name: &str) -> crate::Result<()> {
@@ -8096,6 +8096,69 @@ mod tests {
         (delta_start, entries, pos)
     }
 
+    /// Decoded cell of a single-row QWP/WS replay message, for the wire types
+    /// exercised by the column-ordering test.
+    #[cfg(feature = "_sender-qwp-ws")]
+    #[derive(Debug, PartialEq)]
+    enum WsTestCell {
+        Bool(bool),
+        I64(i64),
+        Symbol(String),
+    }
+
+    /// Parses a single-table, single-row WS replay message and returns each
+    /// column's name, wire type, and value in wire order.
+    #[cfg(feature = "_sender-qwp-ws")]
+    fn ws_single_row_columns(message: &[u8]) -> (String, Vec<(String, u8, WsTestCell)>) {
+        let (delta_start, dict, mut pos) = ws_delta_entries(message);
+        assert_eq!(delta_start, 0, "helper expects a full dictionary prefix");
+        let table_count = u16::from_le_bytes([message[6], message[7]]) as usize;
+        assert_eq!(table_count, 1, "helper expects exactly one table");
+
+        let table_name = String::from_utf8(read_test_bytes(message, &mut pos)).unwrap();
+        let row_count = read_test_varint(message, &mut pos);
+        assert_eq!(row_count, 1, "helper expects exactly one row");
+        let column_count = read_test_varint(message, &mut pos) as usize;
+
+        let mut schema = Vec::with_capacity(column_count);
+        for _ in 0..column_count {
+            let name = String::from_utf8(read_test_bytes(message, &mut pos)).unwrap();
+            let type_byte = message[pos];
+            pos += 1;
+            schema.push((name, type_byte));
+        }
+
+        let mut columns = Vec::with_capacity(column_count);
+        for (name, type_byte) in schema {
+            let uses_null_bitmap = message[pos];
+            pos += 1;
+            assert_eq!(
+                uses_null_bitmap, 0,
+                "helper expects a dense column for {name:?}"
+            );
+            let value = match type_byte {
+                QWP_TYPE_BOOLEAN => {
+                    let packed = message[pos];
+                    pos += 1;
+                    WsTestCell::Bool(packed & 1 == 1)
+                }
+                QWP_TYPE_LONG => {
+                    let raw: [u8; 8] = message[pos..pos + 8].try_into().unwrap();
+                    pos += 8;
+                    WsTestCell::I64(i64::from_le_bytes(raw))
+                }
+                QWP_TYPE_SYMBOL => {
+                    let id = read_test_varint(message, &mut pos) as usize;
+                    WsTestCell::Symbol(String::from_utf8(dict[id].clone()).unwrap())
+                }
+                other => panic!("helper does not decode wire type {other:#04x}"),
+            };
+            columns.push((name, type_byte, value));
+        }
+        assert_eq!(pos, message.len());
+        (table_name, columns)
+    }
+
     #[cfg(feature = "_sender-qwp-ws")]
     #[test]
     fn qwp_ws_local_symbol_lookup_handles_hash_collisions() {
@@ -8261,7 +8324,13 @@ mod tests {
         array_values: Option<Vec<f64>>,
         ts_value: Option<i64>,
         designated_ts: Option<i64>,
+        /// Number of non-symbol columns emitted before the symbol. Values past
+        /// the number of present columns place the symbol last.
+        symbol_offset: usize,
     }
+
+    /// Maximum number of non-symbol columns emitted by [`apply_row`].
+    const PROP_ROW_MAX_SYMBOL_OFFSET: usize = 7;
 
     #[derive(Clone, Debug)]
     struct PropSegment {
@@ -8526,27 +8595,33 @@ mod tests {
         };
 
         (
-            symbol,
-            bool_value,
-            i64_value,
-            f64_value,
-            string_value,
-            decimal_value,
-            array_values,
-            ts_value,
-            designated_ts,
+            (
+                symbol,
+                bool_value,
+                i64_value,
+                f64_value,
+                string_value,
+                decimal_value,
+                array_values,
+                ts_value,
+                designated_ts,
+            ),
+            0usize..=PROP_ROW_MAX_SYMBOL_OFFSET,
         )
             .prop_map(
                 |(
-                    symbol,
-                    bool_value,
-                    i64_value,
-                    f64_value,
-                    string_value,
-                    decimal_value,
-                    array_values,
-                    ts_value,
-                    designated_ts,
+                    (
+                        symbol,
+                        bool_value,
+                        i64_value,
+                        f64_value,
+                        string_value,
+                        decimal_value,
+                        array_values,
+                        ts_value,
+                        designated_ts,
+                    ),
+                    symbol_offset,
                 )| PropRow {
                     symbol,
                     bool_value,
@@ -8557,6 +8632,7 @@ mod tests {
                     array_values,
                     ts_value,
                     designated_ts,
+                    symbol_offset,
                 },
             )
             .prop_filter("row must commit at least one field", |row| {
@@ -8647,9 +8723,18 @@ mod tests {
             array_values,
             ts_value,
             designated_ts,
+            0usize..=PROP_ROW_MAX_SYMBOL_OFFSET,
         )
             .prop_map(
-                |(symbol, string_value, decimal_value, array_values, ts_value, designated_ts)| {
+                |(
+                    symbol,
+                    string_value,
+                    decimal_value,
+                    array_values,
+                    ts_value,
+                    designated_ts,
+                    symbol_offset,
+                )| {
                     PropRow {
                         symbol,
                         bool_value: None,
@@ -8660,6 +8745,7 @@ mod tests {
                         array_values,
                         ts_value,
                         designated_ts,
+                        symbol_offset,
                     }
                 },
             )
@@ -8786,39 +8872,63 @@ mod tests {
     fn apply_row(buf: &mut QwpBuffer, segment: &PropSegment, row: &PropRow) {
         buf.table(segment.config.table.as_str()).unwrap();
 
-        if let Some(value) = row.symbol.as_deref() {
-            buf.symbol("sym", value).unwrap();
-        }
-        if let Some(value) = row.bool_value {
-            buf.column_bool("flag", value).unwrap();
-        }
-        if let Some(value) = row.i64_value {
-            buf.column_i64("qty", value).unwrap();
-        }
-        if let Some(value) = row.f64_value {
-            buf.column_f64("px", value).unwrap();
-        }
-        if let Some(value) = row.string_value.as_deref() {
-            buf.column_str("note", value).unwrap();
-        }
-        if let Some(value) = row.decimal_value.as_deref() {
-            buf.column_dec("price", value).unwrap();
-        }
-        if let Some(values) = row.array_values.as_ref() {
-            buf.column_arr("samples", values).unwrap();
-        }
-        if let Some(value) = row.ts_value {
-            match segment.config.ts_kind.expect("ts value requires ts kind") {
-                PropTsKind::Micros => {
-                    buf.column_ts("event_ts", TimestampMicros::new(value))
-                        .unwrap();
-                }
-                PropTsKind::Nanos => {
-                    buf.column_ts("event_ts", TimestampNanos::new(value))
-                        .unwrap();
-                }
+        fn emit_symbol_when_due(
+            buf: &mut QwpBuffer,
+            symbol: &mut Option<&str>,
+            offset: usize,
+            emitted: usize,
+        ) {
+            if emitted >= offset
+                && let Some(value) = symbol.take()
+            {
+                buf.symbol("sym", value).unwrap();
             }
         }
+
+        let mut symbol = row.symbol.as_deref();
+        let mut emitted = 0usize;
+        macro_rules! emit_column {
+            ($call:expr) => {{
+                $call;
+                emitted += 1;
+                emit_symbol_when_due(buf, &mut symbol, row.symbol_offset, emitted);
+            }};
+        }
+
+        emit_symbol_when_due(buf, &mut symbol, row.symbol_offset, emitted);
+        if let Some(value) = row.bool_value {
+            emit_column!(buf.column_bool("flag", value).unwrap());
+        }
+        if let Some(value) = row.i64_value {
+            emit_column!(buf.column_i64("qty", value).unwrap());
+        }
+        if let Some(value) = row.f64_value {
+            emit_column!(buf.column_f64("px", value).unwrap());
+        }
+        if let Some(value) = row.string_value.as_deref() {
+            emit_column!(buf.column_str("note", value).unwrap());
+        }
+        if let Some(value) = row.decimal_value.as_deref() {
+            emit_column!(buf.column_dec("price", value).unwrap());
+        }
+        if let Some(values) = row.array_values.as_ref() {
+            emit_column!(buf.column_arr("samples", values).unwrap());
+        }
+        if let Some(value) = row.ts_value {
+            emit_column!(
+                match segment.config.ts_kind.expect("ts value requires ts kind") {
+                    PropTsKind::Micros => {
+                        buf.column_ts("event_ts", TimestampMicros::new(value))
+                            .unwrap();
+                    }
+                    PropTsKind::Nanos => {
+                        buf.column_ts("event_ts", TimestampNanos::new(value))
+                            .unwrap();
+                    }
+                }
+            );
+        }
+        emit_symbol_when_due(buf, &mut symbol, row.symbol_offset, usize::MAX);
 
         if let Some(value) = row.designated_ts {
             match segment
@@ -10172,6 +10282,56 @@ mod tests {
             entries,
             vec![b"A".to_vec(), b"B".to_vec(), b"C".to_vec()],
             "a frame referencing id 2 must carry the dense 0..=2 prefix"
+        );
+    }
+
+    #[cfg(feature = "_sender-qwp-ws")]
+    #[test]
+    fn qwp_ws_columnar_allows_symbols_after_non_symbol_columns() {
+        let mut buf = QwpWsColumnarBuffer::new(127);
+        let mut scratch = QwpWsEncodeScratch::new();
+        let mut global_dict = SymbolGlobalDict::new();
+
+        buf.table("trades")
+            .unwrap()
+            .column_i64("qty", 4)
+            .unwrap()
+            .symbol("sym", "ETH-USD")
+            .unwrap()
+            .column_bool("active", true)
+            .unwrap()
+            .symbol("venue", "XNAS")
+            .unwrap()
+            .at_now()
+            .unwrap();
+
+        buf.encode_ws_replay_message(&mut scratch, &mut global_dict, QWP_VERSION_1)
+            .unwrap();
+        let (_, entries, _) = ws_delta_entries(&scratch.message);
+        assert_eq!(entries, vec![b"ETH-USD".to_vec(), b"XNAS".to_vec()]);
+
+        let (table_name, columns) = ws_single_row_columns(&scratch.message);
+        assert_eq!(table_name, "trades");
+        assert_eq!(
+            columns,
+            vec![
+                ("qty".to_owned(), QWP_TYPE_LONG, WsTestCell::I64(4)),
+                (
+                    "sym".to_owned(),
+                    QWP_TYPE_SYMBOL,
+                    WsTestCell::Symbol("ETH-USD".to_owned()),
+                ),
+                (
+                    "active".to_owned(),
+                    QWP_TYPE_BOOLEAN,
+                    WsTestCell::Bool(true),
+                ),
+                (
+                    "venue".to_owned(),
+                    QWP_TYPE_SYMBOL,
+                    WsTestCell::Symbol("XNAS".to_owned()),
+                ),
+            ]
         );
     }
 

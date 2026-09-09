@@ -261,7 +261,8 @@ pub enum line_sender_error_code {
     /// The host, port, or interface was incorrect.
     line_sender_error_could_not_resolve_addr = 0,
 
-    /// Called methods in the wrong order. E.g. `symbol` after `column`.
+    /// Called methods in the wrong order, such as writing a symbol after a
+    /// non-symbol column on an ILP buffer or calling `at` before any column.
     line_sender_error_invalid_api_call = 1,
 
     /// A network error connecting or flushing data out.
@@ -1577,7 +1578,9 @@ pub unsafe extern "C" fn line_sender_buffer_table(
 }
 
 /// Record a symbol value for the given column.
-/// Make sure you record all the symbol columns before any other column type.
+/// For ILP buffers, record all symbol columns before any other column type.
+/// QWP buffers allow symbol and non-symbol columns in any order before the
+/// designated timestamp.
 /// @param[in] buffer Line buffer object.
 /// @param[in] name Column name.
 /// @param[in] value Column value.
