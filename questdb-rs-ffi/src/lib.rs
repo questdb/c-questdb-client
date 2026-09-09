@@ -4158,13 +4158,55 @@ fn arrow_unsupported_err(msg: impl Into<String>) -> Error {
     Error::new(ErrorCode::ArrowUnsupportedColumnKind, msg.into())
 }
 
+// Pending DFS entries carry only their incoming edge, never a borrow of the
+// current path. Popping a sibling truncates the previous branch to its parent;
+// the shared breadcrumbs grow only with depth, not with the number of columns.
+#[cfg(feature = "arrow")]
+#[derive(Clone, Copy)]
+enum ArrowPathSegment {
+    Child(usize),
+    Dictionary,
+}
+
+#[cfg(feature = "arrow")]
+struct ArrowPath<'a>(&'a [ArrowPathSegment]);
+
+#[cfg(feature = "arrow")]
+impl std::fmt::Display for ArrowPath<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("root")?;
+        for segment in self.0 {
+            match segment {
+                ArrowPathSegment::Child(index) => write!(f, ".children[{index}]")?,
+                ArrowPathSegment::Dictionary => f.write_str(".dictionary")?,
+            }
+        }
+        Ok(())
+    }
+}
+
+#[cfg(feature = "arrow")]
+fn arrow_path_at_depth(
+    breadcrumbs: &mut Vec<ArrowPathSegment>,
+    depth: usize,
+    segment: Option<ArrowPathSegment>,
+) -> questdb::Result<ArrowPath<'_>> {
+    breadcrumbs.truncate(depth.saturating_sub(1));
+    if let Some(segment) = segment {
+        // Same fallible reservation policy as the pending traversal stack.
+        unsafe { try_reserve_one(breadcrumbs)? };
+        breadcrumbs.push(segment);
+    }
+    Ok(ArrowPath(breadcrumbs))
+}
+
 // Read the producer-owned format string after its pointer check. The bounded
 // structural whitelist below handles arity and traversal; arrow-rs's own
 // `DataType::try_from` still performs the complete semantic parse.
 #[cfg(feature = "arrow")]
 unsafe fn arrow_format_str<'a>(
     s: *const arrow::ffi::FFI_ArrowSchema,
-    path: &str,
+    path: &(impl std::fmt::Display + ?Sized),
 ) -> questdb::Result<&'a str> {
     unsafe {
         let p = (*s).format;
@@ -4190,7 +4232,7 @@ unsafe fn arrow_format_str<'a>(
 #[cfg(feature = "arrow")]
 unsafe fn validate_name_str(
     s: *const arrow::ffi::FFI_ArrowSchema,
-    path: &str,
+    path: &(impl std::fmt::Display + ?Sized),
 ) -> questdb::Result<()> {
     unsafe {
         let p = (*s).name;
@@ -4221,7 +4263,12 @@ impl ArrowMetadataBudget {
         })
     }
 
-    fn charge_advance(&mut self, path: &str, cursor: i64, amount: i64) -> questdb::Result<i64> {
+    fn charge_advance(
+        &mut self,
+        path: &(impl std::fmt::Display + ?Sized),
+        cursor: i64,
+        amount: i64,
+    ) -> questdb::Result<i64> {
         let end = cursor.checked_add(amount).ok_or_else(|| {
             arrow_ingest_err(format!(
                 "Arrow schema {path}: metadata cursor arithmetic overflows"
@@ -4263,7 +4310,7 @@ unsafe fn read_metadata_i32(metadata: *const u8, cursor: i64) -> i32 {
 #[cfg(feature = "arrow")]
 unsafe fn validate_metadata_blob(
     metadata: *const std::ffi::c_char,
-    path: &str,
+    path: &(impl std::fmt::Display + ?Sized),
     budget: &mut ArrowMetadataBudget,
 ) -> questdb::Result<()> {
     if metadata.is_null() {
@@ -4442,7 +4489,7 @@ fn arrow_format_is_known_unsupported(format: &str) -> bool {
 #[cfg(feature = "arrow")]
 fn arrow_format_node_model(
     format: &str,
-    path: &str,
+    path: &(impl std::fmt::Display + ?Sized),
     root_kind: ArrowImportRootKind,
     depth: usize,
     has_dictionary: bool,
@@ -4499,7 +4546,7 @@ fn arrow_format_node_model(
 
 #[cfg(feature = "arrow")]
 fn validate_arrow_child_arity(
-    path: &str,
+    path: &(impl std::fmt::Display + ?Sized),
     declared: i64,
     arity: ArrowChildArity,
 ) -> questdb::Result<()> {
@@ -4519,7 +4566,7 @@ fn validate_arrow_child_arity(
 #[cfg(feature = "arrow")]
 fn validate_arrow_fanout_budget(
     kind: &str,
-    path: &str,
+    path: &(impl std::fmt::Display + ?Sized),
     total_visited: usize,
     pending: usize,
     additional: usize,
@@ -4566,11 +4613,18 @@ unsafe fn validate_arrow_schema_depth_with_budget(
     // ownership safe to infer. Cycles are nevertheless rejected by the total
     // node and depth limits before any recursive Arrow parser is called.
     unsafe {
-        let mut stack: Vec<(*const arrow::ffi::FFI_ArrowSchema, usize, String, bool)> = Vec::new();
+        let mut breadcrumbs = Vec::new();
+        let mut stack: Vec<(
+            *const arrow::ffi::FFI_ArrowSchema,
+            usize,
+            Option<ArrowPathSegment>,
+            bool,
+        )> = Vec::new();
         let mut total: usize = 0;
         try_reserve_one(&mut stack)?;
-        stack.push((schema, 0, "root".to_string(), false));
-        while let Some((s, depth, path, dictionary_value)) = stack.pop() {
+        stack.push((schema, 0, None, false));
+        while let Some((s, depth, segment, dictionary_value)) = stack.pop() {
+            let path = arrow_path_at_depth(&mut breadcrumbs, depth, segment)?;
             total += 1;
             if depth >= MAX_ARROW_SCHEMA_DEPTH {
                 return Err(arrow_ingest_err(format!(
@@ -4611,7 +4665,7 @@ unsafe fn validate_arrow_schema_depth_with_budget(
                 stack.push((
                     dict as *const _,
                     depth + 1,
-                    format!("{path}.dictionary"),
+                    Some(ArrowPathSegment::Dictionary),
                     true,
                 ));
             }
@@ -4637,7 +4691,7 @@ unsafe fn validate_arrow_schema_depth_with_budget(
                 stack.push((
                     child as *const _,
                     depth + 1,
-                    format!("{path}.children[{i}]"),
+                    Some(ArrowPathSegment::Child(i)),
                     false,
                 ));
             }
@@ -4652,7 +4706,7 @@ unsafe fn validate_arrow_schema_depth_with_budget(
 #[cfg(feature = "arrow")]
 fn arrow_data_type_node_model(
     data_type: &arrow::datatypes::DataType,
-    path: &str,
+    path: &(impl std::fmt::Display + ?Sized),
     allow_record_batch_struct: bool,
 ) -> questdb::Result<ArrowNodeModel> {
     use arrow::datatypes::{DataType, TimeUnit};
@@ -4764,7 +4818,7 @@ fn arrow_data_type_node_model(
 #[cfg(feature = "arrow")]
 fn validate_arrow_column_data_type(
     data_type: &arrow::datatypes::DataType,
-    path: &str,
+    path: &(impl std::fmt::Display + ?Sized),
 ) -> questdb::Result<()> {
     use arrow::datatypes::DataType;
     let model = arrow_data_type_node_model(data_type, path, false)?;
@@ -4927,7 +4981,8 @@ unsafe fn validate_parsed_column_types(
         if root_kind == ArrowImportRootKind::RecordBatchEnvelope && root_format == "+s" {
             let children = (*schema).children;
             for i in 0..(*schema).n_children as usize {
-                let path = format!("root.children[{i}]");
+                let segments = [ArrowPathSegment::Child(i)];
+                let path = ArrowPath(&segments);
                 // RAW-READ AUDIT: pass 2 already checked the root cap, entire
                 // fan-out budget, non-NULL pointer, and every shallow node.
                 // Pointer-array allocation remains a producer obligation.
@@ -4954,7 +5009,11 @@ unsafe fn validate_parsed_column_types(
 }
 
 #[cfg(feature = "arrow")]
-fn checked_arrow_parent_end(path: &str, offset: i64, length: i64) -> questdb::Result<i128> {
+fn checked_arrow_parent_end(
+    path: &(impl std::fmt::Display + ?Sized),
+    offset: i64,
+    length: i64,
+) -> questdb::Result<i128> {
     i128::from(offset)
         .checked_add(i128::from(length))
         .ok_or_else(|| {
@@ -4966,7 +5025,7 @@ fn checked_arrow_parent_end(path: &str, offset: i64, length: i64) -> questdb::Re
 
 #[cfg(feature = "arrow")]
 fn checked_fixed_size_child_end(
-    path: &str,
+    path: &(impl std::fmt::Display + ?Sized),
     parent_end: i128,
     size: i32,
     platform_usize_max: u128,
@@ -4991,7 +5050,7 @@ fn checked_fixed_size_child_end(
 
 #[cfg(feature = "arrow")]
 fn checked_arrow_variadic_length(
-    path: &str,
+    path: &(impl std::fmt::Display + ?Sized),
     index: usize,
     length: i64,
     platform_usize_max: u128,
@@ -5018,7 +5077,7 @@ unsafe fn validate_arrow_buffer_layout(
     array: *const arrow::ffi::FFI_ArrowArray,
     data_type: &arrow::datatypes::DataType,
     model: ArrowNodeModel,
-    path: &str,
+    path: &(impl std::fmt::Display + ?Sized),
 ) -> questdb::Result<()> {
     unsafe {
         let declared = (*array).n_buffers;
@@ -5112,17 +5171,19 @@ unsafe fn validate_arrow_array_depth_after_schema(
     // Shared children are legal — see validate_arrow_schema_depth for
     // the same rationale. Cycles are bounded by total + depth caps.
     unsafe {
+        let mut breadcrumbs = Vec::new();
         let mut stack: Vec<(
             *const arrow::ffi::FFI_ArrowArray,
             *const arrow::ffi::FFI_ArrowSchema,
             usize,
-            String,
+            Option<ArrowPathSegment>,
             bool,
         )> = Vec::new();
         let mut total: usize = 0;
         try_reserve_one(&mut stack)?;
-        stack.push((array, schema, 0, "root".to_string(), false));
-        while let Some((a, s, depth, path, dictionary_value)) = stack.pop() {
+        stack.push((array, schema, 0, None, false));
+        while let Some((a, s, depth, segment, dictionary_value)) = stack.pop() {
+            let path = arrow_path_at_depth(&mut breadcrumbs, depth, segment)?;
             total += 1;
             if depth >= MAX_ARROW_SCHEMA_DEPTH {
                 return Err(arrow_ingest_err(format!(
@@ -5201,7 +5262,7 @@ unsafe fn validate_arrow_array_depth_after_schema(
             validate_arrow_buffer_layout(a, &data_type, parsed_model, &path)?;
 
             let expects_dictionary = parsed_model.conversion == ArrowConversionCategory::Dictionary;
-            if dict_a.is_null() != dict_s.is_null() || expects_dictionary != !dict_s.is_null() {
+            if dict_a.is_null() != dict_s.is_null() || expects_dictionary == dict_s.is_null() {
                 return Err(arrow_ingest_err(format!(
                     "Arrow array {path}: array/schema dictionary presence disagrees with the accepted datatype"
                 )));
@@ -5220,7 +5281,7 @@ unsafe fn validate_arrow_array_depth_after_schema(
                     dict_a as *const _,
                     dict_s as *const _,
                     depth + 1,
-                    format!("{path}.dictionary"),
+                    Some(ArrowPathSegment::Dictionary),
                     true,
                 ));
             }
@@ -5332,7 +5393,7 @@ unsafe fn validate_arrow_array_depth_after_schema(
                     child_a as *const _,
                     child_s as *const _,
                     depth + 1,
-                    format!("{path}.children[{i}]"),
+                    Some(ArrowPathSegment::Child(i)),
                     false,
                 ));
             }
@@ -7462,6 +7523,101 @@ mod tests {
         use super::super::*;
         use arrow::ffi::{FFI_ArrowArray, FFI_ArrowSchema};
         use std::ffi::CString;
+
+        #[test]
+        fn arrow_path_breadcrumbs_restore_parent_on_sibling_pop() {
+            use ArrowPathSegment::{Child, Dictionary};
+            let mut breadcrumbs = Vec::new();
+            for (depth, segment, expected) in [
+                (0, None, "root"),
+                (1, Some(Child(2)), "root.children[2]"),
+                (2, Some(Child(0)), "root.children[2].children[0]"),
+                (1, Some(Child(1)), "root.children[1]"),
+                (2, Some(Dictionary), "root.children[1].dictionary"),
+                (1, Some(Child(0)), "root.children[0]"),
+                (0, None, "root"),
+            ] {
+                let path = arrow_path_at_depth(&mut breadcrumbs, depth, segment).unwrap();
+                assert_eq!(path.to_string(), expected);
+            }
+        }
+
+        #[test]
+        fn arrow_preflight_nested_dictionary_and_sibling_error_paths() {
+            use arrow::array::{Array, StructArray, new_empty_array};
+            use arrow::datatypes::{DataType, Field};
+            use std::sync::Arc;
+
+            let dictionary =
+                DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Utf8));
+            let list = DataType::List(Arc::new(Field::new("item", DataType::Float64, true)));
+            // DFS visits child 2's nested branch, then child 1's dictionary,
+            // then child 0. Failures must not retain a previous sibling's path.
+            let types = [DataType::Int64, dictionary, list];
+            let fields = types
+                .iter()
+                .enumerate()
+                .map(|(i, dt)| Arc::new(Field::new(format!("c{i}"), dt.clone(), true)))
+                .collect::<Vec<_>>();
+            let producer = StructArray::new(
+                fields.into(),
+                types.iter().map(new_empty_array).collect(),
+                None,
+            );
+            let schema = FFI_ArrowSchema::try_from(producer.data_type()).unwrap();
+            let array = FFI_ArrowArray::new(&producer.to_data());
+            unsafe {
+                let schema_nodes = [
+                    *schema.children,
+                    (**schema.children.add(1)).dictionary,
+                    *(**schema.children.add(2)).children,
+                ];
+                let array_nodes = [
+                    *array.children,
+                    (**array.children.add(1)).dictionary,
+                    *(**array.children.add(2)).children,
+                ];
+                let paths = [
+                    "root.children[0]",
+                    "root.children[1].dictionary",
+                    "root.children[2].children[0]",
+                ];
+                for ((s, a), path) in schema_nodes.into_iter().zip(array_nodes).zip(paths) {
+                    let format = (*s).format;
+                    (*s).format = std::ptr::null();
+                    let result = validate_arrow_array_depth(&array, &schema);
+                    (*s).format = format;
+                    assert_eq!(
+                        result.unwrap_err().msg(),
+                        format!("Arrow schema {path}: format pointer is NULL")
+                    );
+
+                    (*a).offset = -1;
+                    let result = validate_arrow_array_depth(&array, &schema);
+                    (*a).offset = 0;
+                    assert_eq!(
+                        result.unwrap_err().msg(),
+                        format!("Arrow array {path}: offset -1 is negative")
+                    );
+                    assert!(array.release.is_some(), "preflight retains array ownership");
+                    assert!(
+                        schema.release.is_some(),
+                        "preflight retains schema ownership"
+                    );
+                }
+                // The semantic pass reports the column path, not its leaf.
+                let leaf = schema_nodes[2];
+                let format = (*leaf).format;
+                (*leaf).format = c"l".as_ptr();
+                let result = validate_arrow_array_depth(&array, &schema);
+                (*leaf).format = format;
+                assert_eq!(
+                    result.unwrap_err().msg(),
+                    "Arrow schema root.children[2]: nested-list leaf Int64 is not supported; QuestDB ARRAY ingress requires Float64"
+                );
+                validate_arrow_array_depth(&array, &schema).unwrap();
+            }
+        }
 
         // Build an accepted List chain of exactly `depth` schema nodes, ending
         // in Float64. The shallow walker reaches its depth cap before semantic
