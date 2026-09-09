@@ -1355,6 +1355,11 @@ impl SfaFrameQueue {
 }
 
 impl SfaProgressView {
+    /// See [`SfaEngine::has_deferred_commit_headroom`].
+    pub(crate) fn has_deferred_commit_headroom(&self) -> bool {
+        self.engine.has_deferred_commit_headroom()
+    }
+
     pub(crate) fn next_outbound_frame(
         &self,
         send_cursor: &mut SendCursor,
@@ -1492,6 +1497,11 @@ impl SfaProgressView {
 }
 
 impl SfaProducer {
+    /// See [`SfaEngine::has_deferred_commit_headroom`].
+    pub(crate) fn has_deferred_commit_headroom(&self) -> bool {
+        self.engine.has_deferred_commit_headroom()
+    }
+
     pub(crate) fn try_submit(&mut self, payload: &[u8]) -> Result<QwpReceipt, SfaQueueError> {
         self.engine.check_durability()?;
         self.engine.validate_submit(payload)?;
@@ -1761,6 +1771,36 @@ struct SfaSegmentsSnapshot {
 }
 
 impl SfaEngine {
+    /// Whether the queue could still allocate a segment for a committing frame
+    /// AFTER growing by one more segment for a deferred one.
+    ///
+    /// Deferred frames are never acked, so the storage they occupy is never
+    /// reclaimed by `maintain_storage`. Filling the slot's byte budget with
+    /// them would leave the frame that commits them — the only thing that can
+    /// free the space — unable to publish. Reserving a segment's worth of
+    /// headroom keeps that from happening; see `SfaBackend::publish_split_sfa`.
+    fn has_deferred_commit_headroom(&self) -> bool {
+        let segment_size_bytes = self.segment_size_bytes;
+        let max_bytes = self.max_bytes;
+        self.with_state(|state| {
+            can_allocate_segment(
+                // Reserve TWO segments beyond this frame's own possible
+                // rotation. One is the committing frame's. The other is the
+                // driver's hot spare: `finish_storage_maintenance` installs it
+                // guarded only by `can_allocate_segment(allocated, ..)`, so it
+                // will take the last segment of budget between this check and
+                // the committing frame's publish. Reserving only one left that
+                // race open, and it was observed to reproduce the very stall
+                // this valve exists to prevent.
+                state
+                    .allocated_segment_bytes
+                    .saturating_add(segment_size_bytes.saturating_mul(2)),
+                segment_size_bytes,
+                max_bytes,
+            )
+        })
+    }
+
     fn close(&self, ack_watermark: &mut Option<SfaAckWatermark>) -> Result<(), SfaQueueError> {
         let mut state = self.lock_state()?;
         if state.closed {
@@ -3912,6 +3952,31 @@ mod tests {
         let queue = SfaFrameQueue::open_memory(memory_options(48, 96)).unwrap();
         assert!(queue.hot_spare_installed());
         assert_eq!(queue.allocated_segment_bytes(), 96);
+    }
+
+    /// The deferred-commit valve opens only with three segments of headroom
+    /// above what is allocated: the deferred frame's own rotation, the
+    /// committing frame's, and the hot spare the driver may install in
+    /// between. A fresh slot holds two (active + spare), so five segments is
+    /// the budget at which deferral first engages -- the floor
+    /// `QwpWsConfig::sf_max_total_bytes` derives.
+    #[test]
+    fn memory_queue_deferred_commit_headroom_needs_three_free_segments() {
+        const SEG: u64 = 48;
+        let queue = SfaFrameQueue::open_memory(memory_options(SEG, SEG as usize * 4)).unwrap();
+        assert_eq!(queue.allocated_segment_bytes(), SEG * 2);
+        assert!(
+            !queue.engine.has_deferred_commit_headroom(),
+            "four segments leave two free: the committing frame or the spare \
+             could take the last one, so the valve must stay shut"
+        );
+
+        let queue = SfaFrameQueue::open_memory(memory_options(SEG, SEG as usize * 5)).unwrap();
+        assert_eq!(queue.allocated_segment_bytes(), SEG * 2);
+        assert!(
+            queue.engine.has_deferred_commit_headroom(),
+            "five segments leave three free, exactly the reserve the valve needs"
+        );
     }
 
     #[test]

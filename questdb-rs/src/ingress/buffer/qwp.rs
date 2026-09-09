@@ -2529,8 +2529,7 @@ impl QwpWsSizeHint {
     }
 
     fn len(&mut self, tables: &[QwpWsTableBuffer]) -> usize {
-        let dirty_tables = std::mem::take(&mut self.dirty_tables);
-        for table_idx in dirty_tables {
+        for table_idx in self.dirty_tables.drain(..) {
             if table_idx >= tables.len() || table_idx >= self.tables.len() {
                 continue;
             }
@@ -2845,6 +2844,15 @@ impl QwpWsColumnarBuffer {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .recomputed_tables
+    }
+
+    #[cfg(test)]
+    fn size_hint_dirty_capacity(&self) -> usize {
+        self.size_hint
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .dirty_tables
+            .capacity()
     }
 
     pub(crate) fn row_count(&self) -> usize {
@@ -10314,6 +10322,33 @@ mod tests {
             .unwrap();
         assert_eq!(buf.len(), buf.recompute_len_slow());
         assert_eq!(buf.size_hint_recomputed_tables(), recomputed + 1);
+    }
+
+    #[cfg(feature = "_sender-qwp-ws")]
+    #[test]
+    fn qwp_ws_cached_size_hint_retains_dirty_index_capacity() {
+        let mut buf = QwpWsColumnarBuffer::new(127);
+        buf.table("trades")
+            .unwrap()
+            .column_i64("value", 1)
+            .unwrap()
+            .at_now()
+            .unwrap();
+        assert_eq!(buf.len(), buf.recompute_len_slow());
+        let capacity = buf.size_hint_dirty_capacity();
+        assert!(capacity >= 1);
+
+        for value in 2..=10 {
+            buf.clear();
+            buf.table("trades")
+                .unwrap()
+                .column_i64("value", value)
+                .unwrap()
+                .at_now()
+                .unwrap();
+            assert_eq!(buf.len(), buf.recompute_len_slow());
+            assert_eq!(buf.size_hint_dirty_capacity(), capacity);
+        }
     }
 
     #[cfg(feature = "_sender-qwp-ws")]

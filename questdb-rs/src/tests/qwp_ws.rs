@@ -836,7 +836,14 @@ fn spawn_recycling_server(
     (port, handle, connection_count)
 }
 
-fn spawn_stalled_after_first_frame_server() -> (u16, mpsc::Receiver<Vec<u8>>, mpsc::Sender<()>) {
+type ServerUpgrade = fn(&mut TcpStream) -> std::io::Result<Vec<String>>;
+
+/// Hands the first frame to the test, then parks until released; a configured
+/// rejection is written on release, otherwise the socket just closes.
+fn spawn_gated_server(
+    upgrade: ServerUpgrade,
+    reject: Option<(u8, &'static [u8])>,
+) -> (u16, mpsc::Receiver<Vec<u8>>, mpsc::Sender<()>) {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();
     let (frame_tx, frame_rx) = mpsc::channel();
@@ -844,10 +851,15 @@ fn spawn_stalled_after_first_frame_server() -> (u16, mpsc::Receiver<Vec<u8>>, mp
 
     thread::spawn(move || {
         let (mut stream, _) = listener.accept().unwrap();
-        perform_server_upgrade(&mut stream).unwrap();
+        upgrade(&mut stream).unwrap();
         let (_fin, _opcode, payload) = read_frame(&mut stream).unwrap();
         frame_tx.send(payload).unwrap();
-        let _ = release_rx.recv_timeout(Duration::from_secs(5));
+
+        let released = release_rx.recv_timeout(Duration::from_secs(5));
+        if let (Ok(()), Some((status, message))) = (released, reject) {
+            let _ = write_qwp_error_response(&mut stream, status, FIRST_WIRE_SEQUENCE, message);
+            thread::sleep(Duration::from_millis(50));
+        }
     });
 
     (port, frame_rx, release_tx)
@@ -2137,8 +2149,7 @@ fn assert_durable_ack_without_opt_in(err: crate::Error, mode: ProgressCase) {
     );
     assert_eq!(
         err.msg(),
-        "AckLevel::Durable requires the pool to be opened with \
-         `request_durable_ack=on` in the connect string.",
+        "AckLevel::Durable requires `request_durable_ack=on` in the connect string.",
         "mode={}",
         mode.name()
     );
@@ -2278,6 +2289,37 @@ fn qwp_ws_schema_reject_terminalizes_in_all_progress_modes() {
         assert_eq!(qwp_error.from_fsn, fsn);
         assert_eq!(qwp_error.to_fsn, fsn);
         assert_eq!(sender.poll_qwp_ws_error().unwrap(), None);
+
+        let err = sender
+            .completed_fsn(crate::ingress::AckLevel::Ok)
+            .unwrap_err();
+        assert_eq!(
+            err.code(),
+            ErrorCode::ServerRejection,
+            "mode={}: {}",
+            progress.name(),
+            err.msg()
+        );
+        // The durable opt-in check runs ahead of the terminal state, on the
+        // poll and the barrier alike.
+        assert_durable_ack_without_opt_in(
+            sender
+                .completed_fsn(crate::ingress::AckLevel::Durable)
+                .unwrap_err(),
+            progress,
+        );
+        assert_durable_ack_without_opt_in(
+            sender
+                .wait(crate::ingress::AckLevel::Durable, Duration::from_secs(5))
+                .unwrap_err(),
+            progress,
+        );
+        assert_eq!(
+            sender.acked_fsn().unwrap_err().code(),
+            ErrorCode::ServerRejection,
+            "mode={}",
+            progress.name()
+        );
     }
 }
 
@@ -2592,7 +2634,7 @@ fn qwp_ws_wire_has_no_frame_count_cap() {
 #[test]
 fn qwp_ws_backpressure_timeout_matches_in_all_progress_modes() {
     for progress in [ProgressCase::Background, ProgressCase::Manual] {
-        let (port, frame_rx, release_tx) = spawn_stalled_after_first_frame_server();
+        let (port, frame_rx, release_tx) = spawn_gated_server(perform_server_upgrade, None);
         // In ordinary-ACK mode the frame-count window is gone, so backpressure
         // comes solely from the segment ring's byte budget: two 512-byte
         // segments, neither of which can be trimmed while the server sits on
@@ -2863,6 +2905,419 @@ fn sender_sfa_fully_delivered_tracks_ok_and_durable_watermarks() {
     }
 }
 
+/// `completed_fsn` is the non-blocking counterpart to `wait`: it must expose
+/// the OK (server-accepted) watermark separately from the durable one, without
+/// blocking. A caller that polls watermarks on the thread owning the socket
+/// cannot use `wait` for this — a blocking barrier there stalls the whole
+/// pipeline — so the split has to be observable by polling alone.
+#[test]
+fn sender_completed_fsn_polls_ok_ahead_of_durable() {
+    let (port, frame_rx, ok_tx, durable_tx) = spawn_delayed_durable_ack_server();
+    let conf = format!("ws::addr=127.0.0.1:{port};request_durable_ack=on;");
+    let mut sender = SenderBuilder::from_conf(conf).unwrap().build().unwrap();
+    assert_eq!(
+        sender.completed_fsn(crate::ingress::AckLevel::Ok).unwrap(),
+        None
+    );
+    assert_eq!(
+        sender
+            .completed_fsn(crate::ingress::AckLevel::Durable)
+            .unwrap(),
+        None
+    );
+
+    let mut buf = sender.new_buffer();
+    buf.table("trades")
+        .unwrap()
+        .column_i64("qty", 7)
+        .unwrap()
+        .at_now()
+        .unwrap();
+    let fsn = sender.flush_and_get_fsn(&mut buf).unwrap().unwrap();
+    frame_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+
+    // Publication alone must not move either completion level, so a
+    // watermark wired to `published_fsn()` cannot pass the gate below.
+    assert_eq!(sender.published_fsn().unwrap(), Some(fsn));
+    assert_eq!(
+        sender.completed_fsn(crate::ingress::AckLevel::Ok).unwrap(),
+        None,
+        "OK watermark must not cover a frame the server has not accepted"
+    );
+    assert_eq!(
+        sender
+            .completed_fsn(crate::ingress::AckLevel::Durable)
+            .unwrap(),
+        None,
+        "durable watermark must not cover a frame the server has not accepted"
+    );
+    assert_eq!(sender.acked_fsn().unwrap(), None);
+
+    // Server accepts the frame but the durable ACK is still gated: the OK
+    // watermark must cover the frame while the durable one does not.
+    ok_tx.send(()).unwrap();
+    assert!(
+        wait_until(Duration::from_secs(5), || sender
+            .completed_fsn(crate::ingress::AckLevel::Ok)
+            .unwrap()
+            == Some(fsn)),
+        "OK watermark must cover the published frame once the server accepts it"
+    );
+    assert_eq!(
+        sender
+            .completed_fsn(crate::ingress::AckLevel::Durable)
+            .unwrap(),
+        None,
+        "durable watermark must not advance before durable ACK coverage"
+    );
+    // The durable poll must agree with the existing accessor at all times.
+    assert_eq!(
+        sender
+            .completed_fsn(crate::ingress::AckLevel::Durable)
+            .unwrap(),
+        sender.acked_fsn().unwrap()
+    );
+
+    durable_tx.send(()).unwrap();
+    sender
+        .wait(crate::ingress::AckLevel::Durable, Duration::from_secs(5))
+        .unwrap();
+    assert_eq!(
+        sender.completed_fsn(crate::ingress::AckLevel::Ok).unwrap(),
+        Some(fsn)
+    );
+    assert_eq!(
+        sender
+            .completed_fsn(crate::ingress::AckLevel::Durable)
+            .unwrap(),
+        Some(fsn)
+    );
+    assert_eq!(
+        sender
+            .completed_fsn(crate::ingress::AckLevel::Durable)
+            .unwrap(),
+        sender.acked_fsn().unwrap()
+    );
+}
+
+/// Negative control: the poll is QWP/WebSocket-only and must say so rather
+/// than silently reporting "nothing completed" on a transport that has no
+/// frame sequence numbers at all.
+#[cfg(feature = "sync-sender-http")]
+#[test]
+fn sender_completed_fsn_rejects_non_qwp_ws_senders() {
+    let http_sender = SenderBuilder::new(Protocol::Http, "127.0.0.1", 1)
+        .protocol_version(ProtocolVersion::V1)
+        .unwrap()
+        .build()
+        .unwrap();
+    let err = http_sender
+        .completed_fsn(crate::ingress::AckLevel::Ok)
+        .expect_err("completed_fsn is QWP/WebSocket-only");
+    assert_eq!(err.code(), ErrorCode::InvalidApiCall);
+    assert!(
+        err.msg().contains("completed_fsn"),
+        "error should name the rejected call, got: {}",
+        err.msg()
+    );
+}
+
+/// `wait` guards the handler variant before dispatching to
+/// `qwp_ws_completed_fsn`, whose own fallback is a plain error rather than a
+/// panic. Sibling of the `completed_fsn` control above, which was covered
+/// while this one was not.
+#[cfg(feature = "sync-sender-http")]
+#[test]
+fn qwp_ws_wait_rejects_non_qwp_ws_senders() {
+    let mut http_sender = SenderBuilder::new(Protocol::Http, "127.0.0.1", 1)
+        .protocol_version(ProtocolVersion::V1)
+        .unwrap()
+        .build()
+        .unwrap();
+    let err = http_sender
+        .wait(crate::ingress::AckLevel::Ok, Duration::from_millis(100))
+        .expect_err("wait is QWP/WebSocket-only");
+    assert_eq!(err.code(), ErrorCode::InvalidApiCall);
+    assert!(
+        err.msg().contains("wait"),
+        "error should name the rejected call, got: {}",
+        err.msg()
+    );
+}
+
+/// An explicit `Durable` poll is refused without `request_durable_ack=on`,
+/// exactly as `wait` refuses it: in that configuration the durable watermark
+/// is only acceptance coverage, so answering the poll would hand a caller a
+/// weaker guarantee than it asked for. `acked_fsn` keeps its older unchecked
+/// behaviour, which this pins too.
+#[test]
+fn sender_completed_fsn_rejects_durable_without_opt_in_like_wait() {
+    for progress in [ProgressCase::Background, ProgressCase::Manual] {
+        let (port, _rx) = spawn_mock_server();
+        let mut sender = build_qwp_ws_sender(progress, port);
+
+        let mut buf = sender.new_buffer();
+        buf.table("trades")
+            .unwrap()
+            .column_i64("qty", 1)
+            .unwrap()
+            .at_now()
+            .unwrap();
+        let fsn = sender.flush_and_get_fsn(&mut buf).unwrap().unwrap();
+        sender
+            .wait(crate::ingress::AckLevel::Ok, Duration::from_secs(5))
+            .unwrap_or_else(|e| panic!("mode={}: {e}", progress.name()));
+
+        let err = sender
+            .completed_fsn(crate::ingress::AckLevel::Durable)
+            .expect_err("completed_fsn must reject Durable without opt-in");
+        assert_durable_ack_without_opt_in(err, progress);
+
+        // The blocking barrier refuses the same input.
+        let err = sender
+            .wait(crate::ingress::AckLevel::Durable, Duration::from_secs(5))
+            .expect_err("wait must reject Durable without opt-in");
+        assert_durable_ack_without_opt_in(err, progress);
+
+        // `acked_fsn` predates the check and still reports the watermark,
+        // which is acceptance coverage here.
+        assert_eq!(
+            sender.acked_fsn().unwrap(),
+            Some(fsn),
+            "mode={}",
+            progress.name()
+        );
+        assert_eq!(
+            sender.completed_fsn(crate::ingress::AckLevel::Ok).unwrap(),
+            Some(fsn),
+            "mode={}",
+            progress.name()
+        );
+    }
+}
+
+/// The poll reports a terminal rejection but is not a dispatch point: the
+/// buffered diagnostic must survive it for the error handler, which only runs
+/// on `flush`, `flush_and_get_fsn`, `wait`, `drive_once` and `close_drain`.
+/// Background mode only: a manual sender observes the socket solely through
+/// `drive_once`, which dispatches in the same call, so nothing can be polled
+/// ahead of the handler there.
+#[test]
+fn sender_completed_fsn_polls_terminal_reject_without_dispatching_handler() {
+    let (port, frame_rx, reject_tx) = spawn_gated_server(
+        perform_server_upgrade,
+        Some((QWP_STATUS_PARSE_ERROR, b"bad column")),
+    );
+    let (error_tx, error_rx) = mpsc::channel();
+    let mut sender = SenderBuilder::new(Protocol::Ws, "127.0.0.1", port)
+        .qwp_ws_error_handler(move |error| {
+            error_tx.send(error.clone()).unwrap();
+        })
+        .unwrap()
+        .build()
+        .unwrap();
+
+    let mut buf = sender.new_buffer();
+    buf.table("trades")
+        .unwrap()
+        .column_i64("qty", 1)
+        .unwrap()
+        .at_now()
+        .unwrap();
+    let fsn = sender.flush_and_get_fsn(&mut buf).unwrap().unwrap();
+    frame_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+
+    // The rejection is gated until after publication, so the flush above
+    // cannot have dispatched it and polling is the only thing that observes it.
+    reject_tx.send(()).unwrap();
+    let mut polled = None;
+    assert!(
+        wait_until(Duration::from_secs(5), || {
+            polled = sender.completed_fsn(crate::ingress::AckLevel::Ok).err();
+            polled.is_some()
+        }),
+        "the poll must surface the terminal rejection"
+    );
+    let polled = polled.unwrap();
+    assert_eq!(polled.code(), ErrorCode::ServerRejection);
+    assert_eq!(
+        polled.qwp_ws_rejection().map(|error| error.category),
+        Some(QwpWsErrorCategory::ParseError)
+    );
+    assert_eq!(
+        error_rx.try_recv(),
+        Err(mpsc::TryRecvError::Empty),
+        "polling must not dispatch to the error handler"
+    );
+
+    let qwp_error = sender.poll_qwp_ws_error().unwrap().unwrap();
+    assert_eq!(qwp_error.category, QwpWsErrorCategory::ParseError);
+    assert_eq!(qwp_error.applied_policy, QwpWsErrorPolicy::Terminal);
+    assert_eq!(qwp_error.status, Some(QWP_STATUS_PARSE_ERROR));
+    assert_eq!(qwp_error.from_fsn, fsn);
+
+    // The next flush is the dispatch point a polling caller reaches first;
+    // it must deliver the notification exactly once.
+    buf.table("trades")
+        .unwrap()
+        .column_i64("qty", 2)
+        .unwrap()
+        .at_now()
+        .unwrap();
+    let err = sender.flush(&mut buf).unwrap_err();
+    assert_eq!(err.code(), ErrorCode::ServerRejection);
+    let callback_error = error_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    assert_eq!(callback_error.category, QwpWsErrorCategory::ParseError);
+    assert_eq!(callback_error.applied_policy, QwpWsErrorPolicy::Terminal);
+    assert_eq!(callback_error.from_fsn, fsn);
+
+    let err = sender
+        .wait(crate::ingress::AckLevel::Ok, Duration::from_secs(5))
+        .unwrap_err();
+    assert_eq!(err.code(), ErrorCode::ServerRejection);
+    assert_eq!(error_rx.try_recv(), Err(mpsc::TryRecvError::Empty));
+}
+
+/// A durable-ACK sender whose frame is rejected outright never receives a
+/// durable ACK, so the `Durable` poll must report the terminal rejection
+/// rather than `None`: a poller reading `None` would take a dead sender for a
+/// stalled one.
+#[test]
+fn sender_completed_fsn_durable_poll_reports_terminal_reject() {
+    let (port, frame_rx, reject_tx) = spawn_gated_server(
+        perform_server_upgrade_durable,
+        Some((QWP_STATUS_SCHEMA_MISMATCH, b"bad schema")),
+    );
+    let conf = format!("ws::addr=127.0.0.1:{port};request_durable_ack=on;");
+    let mut sender = SenderBuilder::from_conf(conf).unwrap().build().unwrap();
+
+    let mut buf = sender.new_buffer();
+    buf.table("trades")
+        .unwrap()
+        .column_i64("qty", 1)
+        .unwrap()
+        .at_now()
+        .unwrap();
+    let fsn = sender.flush_and_get_fsn(&mut buf).unwrap().unwrap();
+    frame_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    assert_eq!(
+        sender
+            .completed_fsn(crate::ingress::AckLevel::Durable)
+            .unwrap(),
+        None
+    );
+
+    reject_tx.send(()).unwrap();
+    let mut polled = None;
+    assert!(
+        wait_until(Duration::from_secs(5), || {
+            polled = sender
+                .completed_fsn(crate::ingress::AckLevel::Durable)
+                .err();
+            polled.is_some()
+        }),
+        "the durable poll must surface the terminal rejection"
+    );
+    let polled = polled.unwrap();
+    assert_eq!(polled.code(), ErrorCode::ServerRejection);
+    assert_eq!(
+        polled.qwp_ws_rejection().map(|error| error.category),
+        Some(QwpWsErrorCategory::SchemaMismatch)
+    );
+    assert_eq!(
+        sender.acked_fsn().unwrap_err().code(),
+        ErrorCode::ServerRejection
+    );
+    assert_eq!(
+        sender
+            .completed_fsn(crate::ingress::AckLevel::Ok)
+            .unwrap_err()
+            .code(),
+        ErrorCode::ServerRejection
+    );
+
+    let qwp_error = sender.poll_qwp_ws_error().unwrap().unwrap();
+    assert_eq!(qwp_error.category, QwpWsErrorCategory::SchemaMismatch);
+    assert_eq!(qwp_error.applied_policy, QwpWsErrorPolicy::Terminal);
+    assert_eq!(qwp_error.from_fsn, fsn);
+}
+
+/// Manual progress mode has no separate OK tracker, so `Ok` does not become
+/// observable on acceptance the way it does in background mode. The doc
+/// scopes the "Ok advances ahead of Durable" split to background mode; this
+/// pins the manual half of that claim, which nothing covered.
+#[test]
+fn sender_completed_fsn_manual_mode_reports_one_watermark_under_durable_ack() {
+    let (port, frame_rx, ok_tx, durable_tx) = spawn_delayed_durable_ack_server();
+    let conf = format!("ws::addr=127.0.0.1:{port};qwp_ws_progress=manual;request_durable_ack=on;");
+    let mut sender = SenderBuilder::from_conf(conf).unwrap().build().unwrap();
+
+    let mut buf = sender.new_buffer();
+    buf.table("trades")
+        .unwrap()
+        .column_i64("qty", 7)
+        .unwrap()
+        .at_now()
+        .unwrap();
+    let fsn = sender.flush_and_get_fsn(&mut buf).unwrap().unwrap();
+
+    // Manual mode does not touch the socket until driven, so the frame only
+    // reaches the server once `drive_once` runs.
+    let mut published = false;
+    assert!(
+        wait_until(Duration::from_secs(5), || {
+            let _ = sender.drive_once();
+            published |= frame_rx.try_recv().is_ok();
+            published
+        }),
+        "manual mode must publish the frame once driven"
+    );
+
+    // Acceptance only: drive until the OK response has been consumed.
+    // Background mode would report `Ok` covering the frame here while
+    // `Durable` stayed `None`; manual mode must keep the two equal.
+    ok_tx.send(()).unwrap();
+    assert!(
+        wait_until(Duration::from_secs(5), || {
+            let _ = sender.drive_once();
+            sender.qwp_ws_totals().unwrap().acks >= 1
+        }),
+        "server OK must be consumed"
+    );
+    assert_eq!(
+        sender.completed_fsn(crate::ingress::AckLevel::Ok).unwrap(),
+        None,
+        "manual mode must not expose a separate OK watermark"
+    );
+    assert_eq!(
+        sender
+            .completed_fsn(crate::ingress::AckLevel::Durable)
+            .unwrap(),
+        None
+    );
+
+    durable_tx.send(()).unwrap();
+    assert!(
+        wait_until(Duration::from_secs(5), || {
+            let _ = sender.drive_once();
+            sender
+                .completed_fsn(crate::ingress::AckLevel::Durable)
+                .unwrap()
+                == Some(fsn)
+        }),
+        "durable watermark must cover the frame once driven"
+    );
+    assert_eq!(
+        sender.completed_fsn(crate::ingress::AckLevel::Ok).unwrap(),
+        Some(fsn),
+        "both levels converge once the durable ACK lands"
+    );
+    assert_eq!(
+        sender.completed_fsn(crate::ingress::AckLevel::Ok).unwrap(),
+        sender.acked_fsn().unwrap()
+    );
+}
+
 #[test]
 fn qwp_ws_deep_durable_backlog_fills_byte_ring_replays_and_recovers() {
     const MIN_DEEP_BACKLOG: usize = 64;
@@ -2910,6 +3365,7 @@ fn qwp_ws_deep_durable_backlog_fills_byte_ring_replays_and_recovers() {
         }
     };
 
+    let last_fsn = last_fsn.unwrap();
     assert!(!blocked.is_empty());
     assert_eq!(backpressure.code(), ErrorCode::SocketError);
     assert!(
@@ -2940,6 +3396,17 @@ fn qwp_ws_deep_durable_backlog_fills_byte_ring_replays_and_recovers() {
         "durable watermark advanced while durable ACKs were withheld"
     );
     assert_eq!(sender.acked_fsn().unwrap(), None);
+    assert_eq!(
+        sender.completed_fsn(crate::ingress::AckLevel::Ok).unwrap(),
+        Some(last_fsn),
+        "OK poll must cover every ordinary-OKed frame"
+    );
+    assert_eq!(
+        sender
+            .completed_fsn(crate::ingress::AckLevel::Durable)
+            .unwrap(),
+        None
+    );
 
     disconnect_tx.send(published).unwrap();
     let replayed = replayed_rx.recv_timeout(Duration::from_secs(5)).unwrap();
@@ -2949,6 +3416,18 @@ fn qwp_ws_deep_durable_backlog_fills_byte_ring_replays_and_recovers() {
         "ordinary OK watermark did not recover after replay"
     );
     assert!(!sender.sfa_fully_delivered(true));
+    // Replay must leave the OK poll covering the backlog while the durable
+    // level is still withheld.
+    assert_eq!(
+        sender.completed_fsn(crate::ingress::AckLevel::Ok).unwrap(),
+        Some(last_fsn)
+    );
+    assert_eq!(
+        sender
+            .completed_fsn(crate::ingress::AckLevel::Durable)
+            .unwrap(),
+        None
+    );
     assert!(
         wait_until(Duration::from_secs(5), || {
             let totals = sender.qwp_ws_totals().unwrap();
@@ -2965,7 +3444,16 @@ fn qwp_ws_deep_durable_backlog_fills_byte_ring_replays_and_recovers() {
     sender
         .wait(crate::ingress::AckLevel::Durable, Duration::from_secs(5))
         .unwrap();
-    let last_fsn = last_fsn.unwrap();
+    assert_eq!(
+        sender
+            .completed_fsn(crate::ingress::AckLevel::Durable)
+            .unwrap(),
+        Some(last_fsn)
+    );
+    assert_eq!(
+        sender.completed_fsn(crate::ingress::AckLevel::Ok).unwrap(),
+        Some(last_fsn)
+    );
     assert_eq!(sender.acked_fsn().unwrap(), Some(last_fsn));
     assert!(sender.sfa_fully_delivered(true));
 
@@ -2979,6 +3467,12 @@ fn qwp_ws_deep_durable_backlog_fills_byte_ring_replays_and_recovers() {
         .unwrap();
     resumed_rx.recv_timeout(Duration::from_secs(5)).unwrap();
     assert_eq!(sender.acked_fsn().unwrap(), Some(resumed_fsn));
+    assert_eq!(
+        sender
+            .completed_fsn(crate::ingress::AckLevel::Durable)
+            .unwrap(),
+        Some(resumed_fsn)
+    );
 
     done_tx.send(()).unwrap();
     drop(sender);
