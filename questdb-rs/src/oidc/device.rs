@@ -2307,8 +2307,31 @@ impl OidcDeviceAuth {
         let id_token = safe_token(body.get("id_token"));
         // The effective refresh token: the response's own, else the carried-
         // forward prior one (a refresh from a non-rotating IdP omits it).
+        // The refresh token goes through the same gate as the access and ID
+        // tokens above, and as `tokenset_from_persisted` applies on the way
+        // back in. It used to be taken verbatim, so a refresh token carrying a
+        // control or non-ASCII byte was accepted here, written to the store,
+        // and then dropped by that stricter load on the next process start --
+        // which still adopted the entry for its access/ID token and failed
+        // every refresh afterwards with "the persisted OIDC token has no
+        // refresh token", describing a rotation hazard that had not happened,
+        // while the plaintext file stayed on disk. Reject it once, here, rather
+        // than persisting a credential that cannot survive its own round trip.
+        // A `null`, absent or empty value is not an error: it simply means the
+        // response carries no refresh token and the prior one is carried
+        // forward.
+        match body.get("refresh_token") {
+            Some(Value::String(rt)) if !rt.is_empty() && !is_safe_token_str(rt) => {
+                return Err(OidcError::config(
+                    "The identity provider returned a refresh token containing \
+                     characters this client cannot store or replay; it must be \
+                     non-blank printable ASCII.",
+                ));
+            }
+            _ => {}
+        }
         let refresh_token =
-            str_field_val(body.get("refresh_token")).or_else(|| prior_refresh.map(String::from));
+            safe_token(body.get("refresh_token")).or_else(|| prior_refresh.map(String::from));
 
         let mut expires_in = int_field(body, "expires_in").unwrap_or(DEFAULT_EXPIRES_IN);
         if expires_in <= 0 {

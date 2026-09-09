@@ -1573,3 +1573,52 @@ fn with_lock_timings_enforces_stale_floor() {
     // A sub-floor staleness window is clamped up to the 5-minute minimum.
     assert_eq!(store.lock_stale, MIN_LOCK_STALE);
 }
+
+/// `FileTokenStore::at("~/...")` must fail loudly rather than create a
+/// directory literally named `~`.
+///
+/// The check existed only in the C binding (`reject_unexpanded_home`), and the
+/// Python binding expands the same spelling to `$HOME`, so the Rust API was the
+/// one surface where a caller silently got a plaintext refresh token in
+/// `./~/qdb-tokens`. `at()` stays infallible -- it is the documented escape
+/// hatch for a caller that resolved the path itself -- so the guard sits at the
+/// single choke point every store operation goes through, and `preflight`
+/// reports it before a device flow starts.
+#[test]
+fn unexpanded_home_directory_is_refused_on_use() {
+    for bad in ["~/qdb-tokens", "~"] {
+        let store = FileTokenStore::at(bad);
+        let err = store
+            .save(&test_key(), &test_token())
+            .expect_err(&format!("{bad:?} must be refused"));
+        let msg = err.to_string();
+        assert!(
+            msg.contains("starts with `~`"),
+            "the error must name the cause, got: {msg}"
+        );
+        // Nothing was created on the way to the refusal.
+        assert!(
+            !Path::new(bad.split('/').next().unwrap()).exists(),
+            "a directory named `~` must not be created"
+        );
+
+        // `load` goes through the same choke point, and so does the
+        // interactive preflight -- which is what makes this reach a user
+        // before they are shown a device code rather than after.
+        assert!(store.load(&test_key()).is_err());
+        assert!(store.preflight(&never_cancelled).is_err());
+        // `clear` stays tolerant on purpose: the directory is definitely
+        // absent, so there is genuinely nothing to remove, and `clear` is the
+        // recovery operation that must keep working.
+        store
+            .clear(&test_key())
+            .expect("clearing an absent store is not an error");
+    }
+
+    // A path that merely *contains* a tilde is not the trap and still works.
+    let dir = TempDir::new().unwrap();
+    let ok = dir.path().join("has~tilde");
+    let store = FileTokenStore::at(&ok);
+    store.save(&test_key(), &test_token()).unwrap();
+    assert!(ok.is_dir());
+}

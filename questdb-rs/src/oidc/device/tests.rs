@@ -4699,6 +4699,52 @@ fn refresh_backoff_escalates_and_caps() {
 
 // -- review fixes ------------------------------------------------------------
 
+/// A refresh token the store cannot round-trip must be rejected where it
+/// arrives, not persisted and then silently dropped on the next start.
+///
+/// `tokenset_from_response` took the refresh token verbatim while the access
+/// and ID tokens went through `safe_token`, and `tokenset_from_persisted`
+/// applied the strict gate to all three. A refresh token holding a control or
+/// non-ASCII byte was therefore accepted in memory, written to the plaintext
+/// store, and dropped by the stricter load on the next process start -- which
+/// still adopted the entry for its access token and then failed every refresh
+/// with "the persisted OIDC token has no refresh token", naming a rotation
+/// hazard that had not happened, while the file stayed on disk.
+#[test]
+fn unsafe_refresh_token_is_rejected_at_ingestion() {
+    let auth = offline_auth();
+    for bad in ["RT\nwith-newline", "RT\u{0}nul", "RT-caf\u{e9}", "   "] {
+        let err = auth
+            .tokenset_from_response(
+                &serde_json::json!({
+                    "access_token": "AT",
+                    "refresh_token": bad,
+                    "expires_in": 300,
+                }),
+                None,
+            )
+            .expect_err(&format!("{bad:?} must be refused"));
+        assert_eq!(err.kind(), OidcErrorKind::Config, "for {bad:?}: {err}");
+        assert!(
+            err.to_string().contains("refresh token"),
+            "the error must name the field: {err}"
+        );
+    }
+
+    // An absent, null or empty refresh token is not an error: it means the
+    // response carries none and the prior one is carried forward.
+    for ok in [
+        serde_json::json!({"access_token": "AT", "expires_in": 300}),
+        serde_json::json!({"access_token": "AT", "refresh_token": null, "expires_in": 300}),
+        serde_json::json!({"access_token": "AT", "refresh_token": "", "expires_in": 300}),
+    ] {
+        let ts = auth
+            .tokenset_from_response(&ok, Some("RT-prior"))
+            .expect("a missing refresh token is not a failure");
+        assert_eq!(ts.refresh_token.as_deref(), Some("RT-prior"));
+    }
+}
+
 /// A device flow whose polls never reach the token endpoint must say so, not
 /// report that the user failed to authorize in time.
 ///

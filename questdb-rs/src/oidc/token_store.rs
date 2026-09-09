@@ -750,6 +750,30 @@ impl FileTokenStore {
     /// `.store.lock`, otherwise two clients can race recovery and one can sweep a
     /// token the other has just saved.
     fn create_directory(&self) -> std::io::Result<()> {
+        // A leading `~` reaches here only from a caller that passed one to
+        // `at()`: shells expand it, no runtime does, and `at_default_location`
+        // already rejects it in the environment override. Creating it would
+        // make a directory literally *named* `~` under the working directory
+        // and leave a long-lived plaintext refresh token in it -- and the
+        // Python binding expands the same spelling to `$HOME`, so one string
+        // would mean two locations depending on the binding reached for. The C
+        // setter rejects it at configuration time; this is the backstop for the
+        // Rust API, and `preflight` surfaces it before a device flow starts.
+        if let Some(first) = self.directory.iter().next()
+            && first == std::ffi::OsStr::new("~")
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!(
+                    "the OIDC token-store directory {} starts with `~`, which shells \
+                     expand but this client does not: it would create a directory \
+                     literally named `~` under the working directory and leave a \
+                     plaintext refresh token there. Pass an already-expanded \
+                     absolute path.",
+                    self.directory.display(),
+                ),
+            ));
+        }
         // lstat the leaf: a symlink planted at the store path would have us write
         // (and chmod) the link's target, outside any directory we own. Only the
         // final component is checked, so a symlinked parent (the whole store moved
