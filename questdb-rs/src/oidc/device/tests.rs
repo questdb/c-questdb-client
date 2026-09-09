@@ -2769,6 +2769,15 @@ impl FailingSaveStore {
     }
 }
 
+#[derive(Clone, Default)]
+struct RecordingDiagnostic(Arc<Mutex<Vec<String>>>);
+
+impl DiagnosticHandler for RecordingDiagnostic {
+    fn on_persistence_warning(&self, message: &str) {
+        self.0.lock().unwrap().push(message.to_string());
+    }
+}
+
 impl TokenStore for FailingSaveStore {
     fn load(&self, _key: &TokenStoreKey) -> TokenStoreResult<Option<PersistedToken>> {
         self.operations.lock().unwrap().push("load");
@@ -4002,8 +4011,25 @@ fn failed_rotated_child_save_leaves_no_reusable_parent() {
     ));
     store.fail_save.store(true, Ordering::SeqCst);
 
-    let auth = auth_with_failing_store(&mock, store.clone(), false);
+    let diagnostic = RecordingDiagnostic::default();
+    let auth = OidcDeviceAuth::builder()
+        .client_id("questdb")
+        .device_authorization_endpoint(mock.url("/device"))
+        .token_endpoint(mock.url("/token"))
+        .scope("openid")
+        .interactive(false)
+        .open_browser(false)
+        .sleep_hook(no_sleep())
+        .token_store(store.clone())
+        .diagnostic_handler(diagnostic.clone())
+        .build()
+        .expect("build auth with diagnostic handler");
     assert_eq!(auth.token().unwrap(), "AT-2");
+    let warnings = diagnostic.0.lock().unwrap();
+    assert_eq!(warnings.len(), 1);
+    assert!(warnings[0].contains("token store save failed"));
+    assert!(!warnings[0].contains("AT-2"));
+    drop(warnings);
     assert_eq!(
         auth.token_set().unwrap().refresh_token.as_deref(),
         Some("RT-2")
@@ -4437,6 +4463,80 @@ fn coordinated_refresh_never_falls_back_without_the_store_lock() {
         token_calls.load(Ordering::SeqCst),
         0,
         "refresh ran after coordination failed"
+    );
+}
+
+#[test]
+fn refresh_result_is_rejected_when_store_loses_lock_after_action() {
+    struct LosesLockAfterAction;
+
+    impl TokenStore for LosesLockAfterAction {
+        fn load(&self, _key: &TokenStoreKey) -> TokenStoreResult<Option<PersistedToken>> {
+            Ok(None)
+        }
+        fn save(&self, _key: &TokenStoreKey, _token: &PersistedToken) -> TokenStoreResult<()> {
+            Ok(())
+        }
+        fn clear(&self, _key: &TokenStoreKey) -> TokenStoreResult<()> {
+            Ok(())
+        }
+        fn in_lock(
+            &self,
+            _key: &TokenStoreKey,
+            action: &mut dyn FnMut() -> TokenStoreResult<()>,
+        ) -> TokenStoreResult<()> {
+            action()?;
+            Err(Box::new(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "injected ownership loss",
+            )))
+        }
+    }
+
+    let calls = Arc::new(AtomicUsize::new(0));
+    let mock = {
+        let calls = Arc::clone(&calls);
+        MockServer::start(move |method, path, _body| {
+            if (method, path) == ("POST", "/token") {
+                calls.fetch_add(1, Ordering::SeqCst);
+                return (
+                    200,
+                    r#"{"access_token":"AT-child","refresh_token":"RT-child","expires_in":300}"#
+                        .to_string(),
+                );
+            }
+            (500, r#"{"error":"must_not_be_called"}"#.to_string())
+        })
+    };
+    let auth = OidcDeviceAuth::builder()
+        .client_id("questdb")
+        .device_authorization_endpoint(mock.url("/device"))
+        .token_endpoint(mock.url("/token"))
+        .scope("openid")
+        .open_browser(false)
+        .token_store(LosesLockAfterAction)
+        .build()
+        .unwrap();
+    *auth.tokens.lock().unwrap() = Some(TokenSet {
+        access_token: Some("AT-expired".to_string()),
+        id_token: None,
+        refresh_token: Some("RT-parent".to_string()),
+        expires_at: 1.0,
+        token_type: "Bearer".to_string(),
+        scope: Some("openid".to_string()),
+        sub: None,
+        issued_at: 0.0,
+    });
+
+    let err = auth.token().unwrap_err();
+    assert_eq!(err.kind(), OidcErrorKind::Network);
+    assert!(err.message().contains("Lost the cross-process"));
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    assert_ne!(
+        auth.token_set()
+            .and_then(|tokens| tokens.access_token.clone()),
+        Some("AT-child".to_string()),
+        "an uncoordinated refresh child must not be cached"
     );
 }
 

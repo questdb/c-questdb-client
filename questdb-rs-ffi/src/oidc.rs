@@ -40,8 +40,8 @@ use std::time::Duration;
 
 use libc::{c_char, c_void, size_t};
 use questdb::oidc::{
-    DeviceCodeChallenge, FileTokenStore, OidcDeviceAuth, OidcError, OidcErrorKind, Renderer,
-    sanitize_display_text,
+    DeviceCodeChallenge, DiagnosticHandler, FileTokenStore, OidcDeviceAuth, OidcError,
+    OidcErrorKind, Renderer, sanitize_display_text,
 };
 use questdb::{Error, ErrorCode};
 use zeroize::Zeroizing;
@@ -90,6 +90,7 @@ struct OidcBuilderConfig {
     default_interval: Option<u64>,
     timeout_ms: Option<u64>,
     renderer: Option<Arc<CEventTarget>>,
+    diagnostic: Option<Arc<CDiagnosticTarget>>,
     file_store: FileStoreConfig,
 }
 
@@ -111,6 +112,7 @@ impl OidcBuilderConfig {
             default_interval: None,
             timeout_ms: None,
             renderer: None,
+            diagnostic: None,
             file_store: FileStoreConfig::None,
         }
     }
@@ -167,6 +169,9 @@ impl OidcBuilderConfig {
             .map(|target| Arc::new(CEventHandler::new(Arc::clone(target))));
         if let Some(renderer) = &event_handler {
             builder = builder.renderer(CEventRenderer(Arc::clone(renderer)));
+        }
+        if let Some(diagnostic) = &self.diagnostic {
+            builder = builder.diagnostic_handler(CDiagnosticSink(Arc::clone(diagnostic)));
         }
         match &self.file_store {
             FileStoreConfig::None => {}
@@ -443,6 +448,61 @@ pub type questdb_oidc_event_cb =
 /// thread and must return normally without unwinding or performing a non-local
 /// jump (for example, C `longjmp`) across the Rust FFI frame.
 pub type questdb_oidc_user_data_release_cb = Option<unsafe extern "C" fn(user_data: *mut c_void)>;
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum questdb_oidc_diagnostic_kind {
+    QUESTDB_OIDC_DIAGNOSTIC_PERSISTENCE_WARNING = 0,
+}
+
+#[repr(C)]
+pub struct questdb_oidc_diagnostic {
+    pub struct_size: size_t,
+    pub kind: questdb_oidc_diagnostic_kind,
+    pub message: *const c_char,
+    pub message_len: size_t,
+}
+
+pub type questdb_oidc_diagnostic_cb = Option<
+    unsafe extern "C" fn(user_data: *mut c_void, diagnostic: *const questdb_oidc_diagnostic),
+>;
+
+struct CDiagnosticTarget {
+    callback: unsafe extern "C" fn(*mut c_void, *const questdb_oidc_diagnostic),
+    user_data: usize,
+    release: questdb_oidc_user_data_release_cb,
+    gate: std::sync::Mutex<()>,
+}
+
+impl Drop for CDiagnosticTarget {
+    fn drop(&mut self) {
+        if let Some(release) = self.release {
+            unsafe { release(self.user_data as *mut c_void) };
+        }
+    }
+}
+
+#[derive(Clone)]
+struct CDiagnosticSink(Arc<CDiagnosticTarget>);
+
+impl DiagnosticHandler for CDiagnosticSink {
+    fn on_persistence_warning(&self, message: &str) {
+        let display = sanitize_display_text(message);
+        let (message, message_len) = str_or_null(Some(&display));
+        let diagnostic = questdb_oidc_diagnostic {
+            struct_size: std::mem::size_of::<questdb_oidc_diagnostic>(),
+            kind: questdb_oidc_diagnostic_kind::QUESTDB_OIDC_DIAGNOSTIC_PERSISTENCE_WARNING,
+            message,
+            message_len,
+        };
+        let _gate = self
+            .0
+            .gate
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        unsafe { (self.0.callback)(self.0.user_data as *mut c_void, &diagnostic) };
+    }
+}
 
 struct CEventTarget {
     callback: unsafe extern "C" fn(*mut c_void, *const questdb_oidc_event),
@@ -1126,6 +1186,53 @@ pub unsafe extern "C" fn questdb_oidc_builder_event_handler(
     true
 }
 
+/// Install a persistence diagnostic callback. It may run on a token-provider
+/// or transport thread, is serialized, must return promptly, and must not
+/// unwind or re-enter the auth/transport operation that emitted it.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn questdb_oidc_builder_diagnostic_handler(
+    builder: *mut questdb_oidc_builder,
+    callback: questdb_oidc_diagnostic_cb,
+    user_data: *mut c_void,
+    release: questdb_oidc_user_data_release_cb,
+    err_out: *mut *mut questdb_error,
+) -> bool {
+    let previous = {
+        let Some(builder) = (unsafe { builder_mut(builder, err_out) }) else {
+            return false;
+        };
+        let Some(callback) = callback else {
+            unsafe {
+                set_input_error(
+                    err_out,
+                    ErrorCode::InvalidApiCall,
+                    "OIDC diagnostic callback is NULL",
+                )
+            };
+            return false;
+        };
+        if !user_data.is_null() && release.is_none() {
+            unsafe {
+                set_input_error(
+                    err_out,
+                    ErrorCode::InvalidApiCall,
+                    "OIDC diagnostic user_data is non-NULL but its release callback is NULL",
+                )
+            };
+            return false;
+        }
+        let replacement = Arc::new(CDiagnosticTarget {
+            callback,
+            user_data: user_data as usize,
+            release,
+            gate: std::sync::Mutex::new(()),
+        });
+        builder.config.diagnostic.replace(replacement)
+    };
+    drop(previous);
+    true
+}
+
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn questdb_oidc_builder_build(
     builder: *const questdb_oidc_builder,
@@ -1529,6 +1636,37 @@ mod tests {
                 "{ok:?} must be accepted"
             );
         }
+    }
+
+    unsafe extern "C" fn record_diagnostic(
+        user_data: *mut c_void,
+        diagnostic: *const questdb_oidc_diagnostic,
+    ) {
+        let messages = unsafe { &*(user_data as *const Mutex<Vec<String>>) };
+        let diagnostic = unsafe { &*diagnostic };
+        let message = unsafe {
+            std::str::from_utf8_unchecked(std::slice::from_raw_parts(
+                diagnostic.message.cast::<u8>(),
+                diagnostic.message_len,
+            ))
+        };
+        messages.lock().unwrap().push(message.to_string());
+    }
+
+    #[test]
+    fn persistence_diagnostic_is_bounded_sanitized_and_separate_from_renderer() {
+        let messages = Mutex::new(Vec::<String>::new());
+        let target = Arc::new(CDiagnosticTarget {
+            callback: record_diagnostic,
+            user_data: (&messages as *const Mutex<Vec<String>>) as usize,
+            release: None,
+            gate: Mutex::new(()),
+        });
+        CDiagnosticSink(target).on_persistence_warning("save failed\n\x1b[31m");
+        let messages = messages.lock().unwrap();
+        assert_eq!(messages.len(), 1);
+        assert!(!messages[0].contains('\n'));
+        assert!(!messages[0].contains('\x1b'));
     }
 
     #[test]
@@ -3222,6 +3360,23 @@ mod header_abi {
     }
 
     #[test]
+    fn oidc_diagnostic_struct_matches_the_header() {
+        #[allow(dead_code)]
+        fn exhaustive(diagnostic: &questdb_oidc_diagnostic) {
+            let questdb_oidc_diagnostic {
+                struct_size: _,
+                kind: _,
+                message: _,
+                message_len: _,
+            } = diagnostic;
+        }
+        assert_eq!(
+            c_struct_fields(OIDC_H, "questdb_oidc_diagnostic"),
+            ["struct_size", "kind", "message", "message_len"]
+        );
+    }
+
+    #[test]
     fn oidc_config_view_struct_matches_the_header() {
         #[allow(dead_code)]
         fn exhaustive(view: &questdb_oidc_config_view) {
@@ -3342,6 +3497,14 @@ mod header_abi {
             ]
         );
         assert_eq!(questdb_oidc_event_kind::QUESTDB_OIDC_EVENT_PROMPT as i64, 0);
+        assert_eq!(
+            c_enum_variants(OIDC_H, "questdb_oidc_diagnostic_kind"),
+            [("QUESTDB_OIDC_DIAGNOSTIC_PERSISTENCE_WARNING".to_string(), 0)]
+        );
+        assert_eq!(
+            questdb_oidc_diagnostic_kind::QUESTDB_OIDC_DIAGNOSTIC_PERSISTENCE_WARNING as i64,
+            0
+        );
         assert_eq!(
             questdb_oidc_event_kind::QUESTDB_OIDC_EVENT_FAILURE as i64,
             3

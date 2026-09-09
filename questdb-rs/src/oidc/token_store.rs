@@ -40,11 +40,11 @@
 //! by the intended account. For at-rest encryption, back a custom
 //! [`TokenStore`] with an OS keychain or a secrets manager instead.
 //!
-//! Where the mode cannot be enforced the store emits one `log::warn!`. That
-//! reaches nobody unless the embedding application has installed a `log`
-//! subscriber — the C and Python clients do not — so an embedder that wants to
-//! see this class of diagnostic, which also covers best-effort cleanup and
-//! `clear` failures, must install one.
+//! Where the mode cannot be enforced the store emits a persistence diagnostic.
+//! Rust applications receive the default stderr warning unless they install a
+//! custom handler; C/C++ can register the dedicated diagnostic callback and the
+//! Python binding forwards it to the `questdb` logger. The same channel covers
+//! best-effort save and automatic-clear failures.
 //!
 //! # Security
 //!
@@ -115,22 +115,6 @@ const DEFAULT_LOCK_ACQUIRE_BUDGET: Duration = Duration::from_secs(3);
 /// two clients have the same producer-path bound.
 const MAX_LOCK_ACQUIRE_BUDGET: Duration = Duration::from_secs(30);
 const LOCK_POLL_SLICE: Duration = Duration::from_millis(50);
-
-/// How far a lock's mtime may sit in the future before it is judged abandoned
-/// rather than fresh.
-///
-/// A future-dated mtime usually means a small clock disagreement -- an NFS/SMB
-/// server stamping from its own clock, or an NTP correction -- and must not let
-/// a contender break a live holder's lock, so within this window it still
-/// counts as fresh. What was missing is an upper bound: a lock stamped beyond
-/// any plausible skew (a clock stepped back, a VM snapshot resume, a restored
-/// backup) stayed fresh *forever*, because both reclaim paths treat "ahead of
-/// now" as age zero. Nothing could then take the lock, so every load, save and
-/// clear failed with a lock timeout for the life of the installation until
-/// someone deleted the file by hand.
-///
-/// Well beyond ordinary skew, and far short of the indefinite wait it replaces.
-const MAX_FUTURE_LOCK_SKEW: Duration = Duration::from_secs(300);
 
 /// A lock older than this is considered abandoned and reclaimed through the
 /// Java-compatible capture-then-verify protocol.
@@ -997,12 +981,12 @@ impl FileTokenStore {
         };
         match SystemTime::now().duration_since(mtime) {
             Ok(elapsed) => elapsed > self.lock_stale,
-            // A future-dated mtime (our clock reads behind the lock's) is
-            // untrustworthy; treat as fresh rather than break a possibly-live
-            // lock -- but only within a plausible skew. Past that no live
-            // holder can have written it, and treating it as fresh forever
-            // wedged the store permanently. See MAX_FUTURE_LOCK_SKEW.
-            Err(ahead) => ahead.duration() > MAX_FUTURE_LOCK_SKEW,
+            // Wall-clock distance cannot distinguish an abandoned lock from a
+            // live holder whose clock is ahead. Fail closed: stealing a live
+            // refresh lock can submit a rotating parent twice and revoke the
+            // whole token family. A genuinely abandoned future-dated lock must
+            // be removed manually after its timestamp is investigated.
+            Err(_) => false,
         }
     }
 
@@ -1133,10 +1117,7 @@ impl FileTokenStore {
         // the same fence the directory lock has had: renew the mtime while the
         // critical section runs, and verify ownership before publishing the
         // result. Without it the mtime was stamped once and never revisited,
-        // so `steal_if_stale`'s MAX_FUTURE_LOCK_SKEW branch could hand the
-        // lock to a second holder -- routinely, and not only after a clock
-        // step, on an NFS/SMB store directory whose server clock runs ahead of
-        // its clients, where every mtime is permanently "in the future". Two
+        // so an ordinarily stale lock could be handed to a second holder. Two
         // holders is exactly the refresh-token double-submission this lock
         // exists to prevent, and a reuse-detecting IdP answers it by revoking
         // the whole token family.
@@ -1685,6 +1666,19 @@ fn release_lock(file: &File) {
     let _ = file.set_times(FileTimes::new().set_modified(SystemTime::UNIX_EPOCH));
 }
 
+const MAX_LOCK_HOSTNAME_BYTES: usize = 255;
+
+fn bounded_hostname(raw: &str) -> &str {
+    if raw.len() <= MAX_LOCK_HOSTNAME_BYTES {
+        return raw;
+    }
+    let mut end = MAX_LOCK_HOSTNAME_BYTES;
+    while !raw.is_char_boundary(end) {
+        end -= 1;
+    }
+    &raw[..end]
+}
+
 fn holder_bytes() -> std::io::Result<String> {
     let mut nonce = [0_u8; 16];
     fill_random_lock_nonce(&mut nonce)?;
@@ -1692,12 +1686,14 @@ fn holder_bytes() -> std::io::Result<String> {
         .duration_since(SystemTime::UNIX_EPOCH)
         .map(|d| d.as_nanos())
         .unwrap_or(0);
-    Ok(format!(
+    let stamp = format!(
         "{nanos} {} {}@{}",
         to_hex(&nonce),
         std::process::id(),
         hostname()
-    ))
+    );
+    debug_assert!(stamp.len() as u64 <= MAX_LOCK_FILE_BYTES);
+    Ok(stamp)
 }
 
 #[cfg(feature = "ring-crypto")]
@@ -1771,8 +1767,8 @@ fn lock_snapshot(lock: &Path) -> std::io::Result<Option<LockSnapshot>> {
     // store: `steal_if_stale` bails on a snapshot error, the directory lock is
     // required, so every load, save and clear failed for the life of the
     // installation until someone deleted the file by hand -- the same permanent
-    // wedge documented on MAX_FUTURE_LOCK_SKEW, arrived at from the other
-    // direction. Sources are mundane: a restored archive, some SMB/CIFS and
+    // wedge caused by an unrepresentable timestamp from the other direction.
+    // Sources are mundane: a restored archive, some SMB/CIFS and
     // FUSE mounts, a clock stepped back, `touch -t 196001010000`.
     //
     // Epoch is maximally old, so the age test below reclaims the lock through
@@ -1919,15 +1915,11 @@ fn steal_if_stale(lock: &Path, stale_after: Duration, empty_grace: Duration) -> 
         .duration_since(SystemTime::UNIX_EPOCH)
         .map(|duration| duration.as_millis())
         .unwrap_or(0);
-    let stale = if before.modified_millis > now_millis {
-        // Future-dated. `saturating_sub` used to floor this at zero, so such a
-        // lock was always "younger than the threshold" and could never be
-        // reclaimed -- the same permanent wedge `is_stale` had. Fresh within a
-        // plausible clock skew, abandoned past it. See MAX_FUTURE_LOCK_SKEW.
-        before.modified_millis - now_millis > MAX_FUTURE_LOCK_SKEW.as_millis()
-    } else {
-        now_millis - before.modified_millis > threshold.as_millis()
-    };
+    // A future timestamp is not evidence of abandonment: it may be a live
+    // holder on a host whose clock is ahead. Fail closed rather than risk two
+    // refresh-token submissions.
+    let stale = before.modified_millis <= now_millis
+        && now_millis - before.modified_millis > threshold.as_millis();
     if !stale {
         return false;
     }
@@ -2019,6 +2011,7 @@ fn hostname() -> String {
     std::env::var("HOSTNAME")
         .ok()
         .filter(|h| !h.is_empty())
+        .map(|h| bounded_hostname(&h).to_string())
         .unwrap_or_else(|| "localhost".to_string())
 }
 

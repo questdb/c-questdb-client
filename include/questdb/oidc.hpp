@@ -50,6 +50,39 @@ enum class event_kind : int
     failure = QUESTDB_OIDC_EVENT_FAILURE,
 };
 
+enum class diagnostic_kind : int
+{
+    persistence_warning = QUESTDB_OIDC_DIAGNOSTIC_PERSISTENCE_WARNING,
+};
+
+class diagnostic_view
+{
+public:
+    diagnostic_view(const diagnostic_view&) = delete;
+    diagnostic_view& operator=(const diagnostic_view&) = delete;
+    diagnostic_kind kind() const noexcept
+    {
+        return static_cast<diagnostic_kind>(
+            static_cast<int>(_diagnostic->kind));
+    }
+    std::string_view message() const noexcept
+    {
+        return _diagnostic->message
+                   ? std::
+                         string_view{_diagnostic->message, _diagnostic->message_len}
+                   : std::string_view{};
+    }
+
+private:
+    explicit diagnostic_view(
+        const ::questdb_oidc_diagnostic* diagnostic) noexcept
+        : _diagnostic{diagnostic}
+    {
+    }
+    const ::questdb_oidc_diagnostic* _diagnostic;
+    friend class builder;
+};
+
 class event_view
 {
 public:
@@ -622,8 +655,9 @@ public:
     }
 
     /**
-     * Install an event handler. It may run on any token-acquisition thread;
-     * calls are serialized across auth objects built by this builder. Starting
+     * Install a renderer event handler. It runs inside the foreground
+     * `sign_in()` call; persistence warnings use `diagnostic_handler` instead.
+     * Calls are serialized across auth objects built by this builder. Starting
      * another auth operation that shares this handler from inside the callback
      * fails with invalid_api_call. Destruction of captured state may occur on
      * whichever thread releases the final auth/transport reference.
@@ -648,6 +682,29 @@ public:
             &builder::event_trampoline,
             owned.get(),
             &builder::release_handler);
+        owned.release();
+        return *this;
+    }
+
+    /** Install a serialized persistence diagnostic handler. The callback may
+     * run on a background token-provider thread and must return promptly. */
+    builder& diagnostic_handler(
+        std::function<void(const diagnostic_view&)> handler)
+    {
+        using handler_type = std::function<void(const diagnostic_view&)>;
+        if (!handler)
+        {
+            throw ::questdb::error{
+                ::questdb::error_code::invalid_api_call,
+                "OIDC diagnostic handler must not be empty."};
+        }
+        auto owned = std::make_unique<handler_type>(std::move(handler));
+        detail::wrapped_call(
+            ::questdb_oidc_builder_diagnostic_handler,
+            _raw,
+            &builder::diagnostic_trampoline,
+            owned.get(),
+            &builder::release_diagnostic_handler);
         owned.release();
         return *this;
     }
@@ -701,6 +758,29 @@ private:
     static void release_handler(void* user_data) noexcept
     {
         delete static_cast<std::function<void(const event_view&)>*>(user_data);
+    }
+    static void diagnostic_trampoline(
+        void* user_data, const ::questdb_oidc_diagnostic* diagnostic) noexcept
+    {
+        try
+        {
+            auto* handler =
+                static_cast<std::function<void(const diagnostic_view&)>*>(
+                    user_data);
+            if (handler && *handler && diagnostic)
+            {
+                const diagnostic_view view{diagnostic};
+                (*handler)(view);
+            }
+        }
+        catch (...)
+        {
+        }
+    }
+    static void release_diagnostic_handler(void* user_data) noexcept
+    {
+        delete static_cast<std::function<void(const diagnostic_view&)>*>(
+            user_data);
     }
 
     ::questdb_oidc_builder* _raw;

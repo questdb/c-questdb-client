@@ -175,6 +175,24 @@ impl DeviceCodeChallenge {
 /// custom renderer that writes them to a terminal must sanitise them itself;
 /// echoing them raw re-opens the prompt-spoofing
 /// surface the built-in [`TerminalRenderer`] closes.
+pub trait DiagnosticHandler: Send + Sync {
+    /// Report a best-effort persistence operation that failed while the
+    /// in-memory credential remains usable. Messages are display-sanitized and
+    /// bounded, but custom stores must not include token values in errors.
+    fn on_persistence_warning(&self, message: &str);
+}
+
+/// Default persistence diagnostic sink. Kept separate from [`Renderer`]
+/// because warnings may originate on background transport/provider threads.
+#[derive(Debug, Default)]
+pub struct TerminalDiagnosticHandler;
+
+impl DiagnosticHandler for TerminalDiagnosticHandler {
+    fn on_persistence_warning(&self, message: &str) {
+        let _ = writeln!(std::io::stderr(), "questdb oidc warning: {message}");
+    }
+}
+
 pub trait Renderer: Send + Sync {
     /// Show the sign-in prompt at the start of the device flow.
     fn on_prompt(&self, challenge: &DeviceCodeChallenge) {
@@ -232,18 +250,31 @@ impl TerminalRenderer {
 /// `complete` only when it is safe and shares the origin of `verification_uri`,
 /// otherwise it falls back to the plain URI already shown above, which is then
 /// suppressed here as redundant.
+fn defang_terminal_url(uri: &str) -> String {
+    if let Some(rest) = uri.strip_prefix("https://") {
+        format!("https[:]//{rest}")
+    } else if let Some(rest) = uri.strip_prefix("http://") {
+        format!("http[:]//{rest}")
+    } else {
+        uri.to_string()
+    }
+}
+
 fn format_prompt(challenge: &DeviceCodeChallenge) -> String {
-    let uri = challenge.display_verification_uri();
+    let browser_target = challenge.browser_target();
+    let displayed = challenge.display_verification_uri();
+    let uri = if browser_target.is_some() {
+        displayed.to_string()
+    } else {
+        defang_terminal_url(&displayed)
+    };
     let code = challenge.display_user_code();
     let mut msg = format!("🔐 Sign in to QuestDB\n   Open {uri}  and enter code:  {code}\n");
     // browser_target() yields the pre-filled `complete` only when it is safe and
     // shares verification_uri's origin; otherwise it returns the plain URI shown
     // above. Offer the shortcut only for a distinct, vetted complete.
     let plain = safe_target(Some(&challenge.verification_uri), challenge.idp_is_loopback);
-    if let Some(target) = challenge
-        .browser_target()
-        .filter(|target| Some(target) != plain.as_ref())
-    {
+    if let Some(target) = browser_target.filter(|target| Some(target) != plain.as_ref()) {
         msg.push_str(&format!("   (or open directly: {target})\n"));
     }
     msg
@@ -940,6 +971,22 @@ mod tests {
             !shown.contains("evil.example"),
             "attacker host leaked into the terminal prompt: {shown}"
         );
+
+        // Native refuses punycode A-labels as confusable. The terminal must
+        // still show the address for manual transcription without leaving an
+        // intact scheme that terminal emulators auto-link.
+        let refused = DeviceCodeChallenge {
+            user_code: "WXYZ".into(),
+            verification_uri: "https://xn--80ak6aa92e.com/device".into(),
+            verification_uri_complete: None,
+            expires_in_seconds: 600,
+            interval_seconds: 5,
+            idp_is_loopback: false,
+        };
+        assert!(refused.browser_target().is_none());
+        let shown = format_prompt(&refused);
+        assert!(shown.contains("https[:]//xn--80ak6aa92e.com/device"));
+        assert!(!shown.contains("https://"));
     }
 
     #[test]

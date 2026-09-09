@@ -782,27 +782,25 @@ fn set_mtime_offset_from_now(path: &std::path::Path, offset: Duration, ahead: bo
 }
 
 #[test]
-fn a_far_future_lock_is_reclaimed_rather_than_wedging_the_store() {
-    // Regression: both reclaim paths treated an mtime ahead of the local clock
-    // as age zero -- `is_stale` via the Err arm of `duration_since`, and
-    // `steal_if_stale` via `saturating_sub` flooring at 0. A lock stamped into
-    // the future was therefore "fresh" forever: nothing could ever take it, so
-    // every load, save and clear failed with a lock timeout until someone
-    // deleted the file by hand. It needs no attacker -- a clock stepped back by
-    // NTP, a VM snapshot resume, a restored backup, or an NFS/SMB server
-    // stamping mtimes from its own clock all produce it.
+fn a_far_future_lock_is_never_stolen() {
+    // A live holder on a host whose clock is far ahead is indistinguishable
+    // from an abandoned lock. Refresh-token exclusivity wins over automatic
+    // recovery: the contender must fail closed and leave the lock untouched.
     let dir = TempDir::new().unwrap();
-    let store = FileTokenStore::at(dir.path())
-        .with_lock_timings(Duration::from_secs(2), DEFAULT_LOCK_STALE);
-    let key = test_key();
+    let store =
+        FileTokenStore::at(dir.path()).with_lock_timings(Duration::ZERO, DEFAULT_LOCK_STALE);
     let lock = store.directory_lock_file();
-    create_lock_file(&lock, "1725048000000 abandoned-peer").unwrap();
-    set_mtime_offset_from_now(&lock, MAX_FUTURE_LOCK_SKEW * 4, true);
+    create_lock_file(&lock, "1725048000000 live-peer").unwrap();
+    set_mtime_offset_from_now(&lock, Duration::from_secs(20 * 60), true);
 
-    store
-        .save(&key, &test_token())
-        .expect("a far-future lock must be reclaimable");
-    assert!(store.load(&key).unwrap().is_some());
+    let error = store.save(&test_key(), &test_token()).unwrap_err();
+    assert_eq!(
+        error
+            .downcast_ref::<std::io::Error>()
+            .map(std::io::Error::kind),
+        Some(std::io::ErrorKind::WouldBlock)
+    );
+    assert!(lock.exists(), "a future-dated live lock was stolen");
 }
 
 #[test]
@@ -842,7 +840,7 @@ fn a_slightly_future_lock_is_still_treated_as_live() {
         FileTokenStore::at(dir.path()).with_lock_timings(Duration::ZERO, DEFAULT_LOCK_STALE);
     let lock = store.directory_lock_file();
     create_lock_file(&lock, "1725048000000 live-peer").unwrap();
-    set_mtime_offset_from_now(&lock, MAX_FUTURE_LOCK_SKEW / 5, true);
+    set_mtime_offset_from_now(&lock, Duration::from_secs(60), true);
 
     let error = store.save(&test_key(), &test_token()).unwrap_err();
     assert_eq!(
@@ -853,6 +851,22 @@ fn a_slightly_future_lock_is_still_treated_as_live() {
         "a lock within the skew window must be respected as live"
     );
     assert!(lock.exists(), "a live peer's lock was stolen");
+}
+
+#[test]
+fn oversized_hostnames_still_produce_readable_lock_stamps() {
+    for raw in [&"h".repeat(5000), &"é".repeat(5000)] {
+        let bounded = bounded_hostname(raw);
+        assert!(bounded.len() <= MAX_LOCK_HOSTNAME_BYTES);
+        assert!(std::str::from_utf8(bounded.as_bytes()).is_ok());
+    }
+
+    let dir = TempDir::new().unwrap();
+    let lock = dir.path().join("owner.lock");
+    let stamp = format!("1 nonce 42@{}", bounded_hostname(&"h".repeat(5000)));
+    assert!(stamp.len() as u64 <= MAX_LOCK_FILE_BYTES);
+    create_lock_file(&lock, &stamp).unwrap();
+    assert_eq!(read_lock_stamp(&lock).unwrap(), Some(stamp.into_bytes()));
 }
 
 #[cfg(unix)]

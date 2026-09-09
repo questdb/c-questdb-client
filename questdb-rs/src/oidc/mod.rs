@@ -56,9 +56,9 @@
 //! auth.sign_in()?; // prompts on first use, then caches (and refreshes silently
 //!                  // if the IdP issued a refresh token — see below)
 //!
-//! // Pass a token provider (not a fixed string): the sender pulls a freshly
-//! // refreshed token on each request, so a long-lived sender keeps working as
-//! // the token rotates.
+//! // Pass a token provider (not a fixed string): the sender resolves it once
+//! // per flush, reuses that value for ordinary retries, and resolves once more
+//! // only after a 401 when the credential may have rotated.
 //! let mut sender = SenderBuilder::new(Protocol::Https, "questdb.example.com", 9000)
 //!     .http_token_provider({
 //!         let auth = Arc::clone(&auth);
@@ -203,7 +203,10 @@ mod token_store;
 pub use device::{OidcDeviceAuth, OidcDeviceAuthBuilder};
 pub use discovery::OidcConfig;
 pub use error::{OidcError, OidcErrorKind};
-pub use render::{DeviceCodeChallenge, Renderer, TerminalRenderer, sanitize_display_text};
+pub use render::{
+    DeviceCodeChallenge, DiagnosticHandler, Renderer, TerminalDiagnosticHandler, TerminalRenderer,
+    sanitize_display_text,
+};
 pub use token::TokenSet;
 pub use token_store::{
     FileTokenStore, PersistedToken, TOKEN_STORE_DIR_ENV, TokenStore, TokenStoreKey,

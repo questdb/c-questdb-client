@@ -40,7 +40,8 @@ use crate::oidc::discovery::{
 use crate::oidc::error::{MAX_IDP_FIELD_CHARS, OidcError, Result};
 use crate::oidc::http::{HttpClient, is_transient_http_status};
 use crate::oidc::render::{
-    DeviceCodeChallenge, Renderer, TerminalRenderer, maybe_open_browser, strip_control_capped,
+    DeviceCodeChallenge, DiagnosticHandler, Renderer, TerminalDiagnosticHandler, TerminalRenderer,
+    maybe_open_browser, sanitize_display_text, strip_control_capped,
 };
 use crate::oidc::token::{DEFAULT_SKEW_SECONDS, TokenSet, is_safe_token_str, now_epoch};
 use crate::oidc::token_store::{PersistedToken, TokenStore, TokenStoreKey};
@@ -241,6 +242,7 @@ pub struct OidcDeviceAuthBuilder {
     default_interval: u64,
     timeout: Duration,
     renderer: Option<Box<dyn Renderer>>,
+    diagnostic_handler: Option<Box<dyn DiagnosticHandler>>,
     sleep: Option<SleepFn>,
     now: Option<NowFn>,
     token_store: Option<Arc<dyn TokenStore>>,
@@ -264,6 +266,7 @@ impl OidcDeviceAuthBuilder {
             default_interval: DEFAULT_INTERVAL,
             timeout: DEFAULT_TIMEOUT,
             renderer: None,
+            diagnostic_handler: None,
             sleep: None,
             now: None,
             token_store: None,
@@ -388,6 +391,14 @@ impl OidcDeviceAuthBuilder {
         self
     }
 
+    /// Receive best-effort persistence warnings. Unlike renderer callbacks,
+    /// this handler may run on a transport/provider thread during silent
+    /// refresh and must return promptly without re-entering this auth object.
+    pub fn diagnostic_handler(mut self, handler: impl DiagnosticHandler + 'static) -> Self {
+        self.diagnostic_handler = Some(Box::new(handler));
+        self
+    }
+
     /// Persist the token state across process restarts via a
     /// [`TokenStore`](crate::oidc::TokenStore) (default: none — in-memory only).
     ///
@@ -486,6 +497,9 @@ impl OidcDeviceAuthBuilder {
             renderer: self
                 .renderer
                 .unwrap_or_else(|| Box::new(TerminalRenderer::new())),
+            diagnostic_handler: self
+                .diagnostic_handler
+                .unwrap_or_else(|| Box::new(TerminalDiagnosticHandler)),
             open_browser: self.open_browser,
             interactive: self.interactive,
             default_interval: self.default_interval,
@@ -540,6 +554,7 @@ pub struct OidcDeviceAuth {
     config: OidcConfig,
     http: HttpClient,
     renderer: Box<dyn Renderer>,
+    diagnostic_handler: Box<dyn DiagnosticHandler>,
     open_browser: bool,
     interactive: Option<bool>,
     default_interval: u64,
@@ -587,6 +602,13 @@ impl std::fmt::Debug for OidcDeviceAuth {
 }
 
 impl OidcDeviceAuth {
+    fn warn_persistence(&self, op: &str, err: &(dyn std::error::Error + Send + Sync)) {
+        let raw = format!("token store {op} failed: {err}");
+        let message = sanitize_display_text(&raw);
+        log::warn!("questdb oidc: {message}");
+        self.diagnostic_handler.on_persistence_warning(&message);
+    }
+
     /// Build an [`OidcDeviceAuth`] by discovering config from a QuestDB server's
     /// `/settings` (client id, scope, endpoints, groups mode), falling back to
     /// the IdP `.well-known` document for the device-authorization endpoint when
@@ -1339,7 +1361,7 @@ impl OidcDeviceAuth {
                 // bookkeeping/release error after running the action; the read is
                 // still authoritative in that case.
                 if let Err(e) = lock_result {
-                    warn_persistence("lock", &*e);
+                    self.warn_persistence("lock", &*e);
                 }
                 let mut state = self.lock_store_state();
                 if persisted.is_some() {
@@ -1371,7 +1393,7 @@ impl OidcDeviceAuth {
                 self.lock_store_state().record_store_load_failure(now);
                 let message = match lock_result {
                     Err(e) => {
-                        warn_persistence("load", &*e);
+                        self.warn_persistence("load", &*e);
                         format!(
                             "Could not load the OIDC token store under its cross-process lock: {e}. Retry later."
                         )
@@ -1516,31 +1538,22 @@ impl OidcDeviceAuth {
             Ok(())
         });
         self.ensure_open()?;
+        // A post-action lock error means the lease was lost while the refresh
+        // was in flight. The child is not authoritative: a peer may have
+        // consumed the same rotating parent or published a successor. Drop it
+        // and fail closed rather than caching or serving an uncoordinated token.
+        if let Err(e) = lock_res {
+            self.warn_persistence("lock", &*e);
+            return Err(OidcError::network(format!(
+                "Lost the cross-process OIDC refresh lock: {e}. Retry later."
+            )));
+        }
         match out {
-            Some(result) => {
-                // A custom store may report a bookkeeping/release error after it
-                // ran the action. The refresh result is still authoritative.
-                if let Err(e) = lock_res {
-                    warn_persistence("lock", &*e);
-                }
-                result
-            }
-            None => {
-                // Never fall back to an unlocked refresh. Two processes can submit
-                // the same rotating parent token, which reuse-detecting IdPs may
-                // answer by revoking the whole token family.
-                let message = match lock_res {
-                    Err(e) => {
-                        warn_persistence("lock", &*e);
-                        format!(
-                            "Could not acquire the cross-process OIDC refresh lock: {e}. Retry later."
-                        )
-                    }
-                    Ok(()) => "The token store returned without running the coordinated refresh action. Retry later."
-                        .to_string(),
-                };
-                Err(OidcError::network(message))
-            }
+            Some(result) => result,
+            None => Err(OidcError::network(
+                "The token store returned without running the coordinated refresh action. Retry later."
+                    .to_string(),
+            )),
         }
     }
 
@@ -1740,7 +1753,7 @@ impl OidcDeviceAuth {
             result?;
         }
         if let Err(e) = outcome {
-            warn_persistence("save", &*e);
+            self.warn_persistence("save", &*e);
         }
         Ok(())
     }
@@ -1812,7 +1825,7 @@ impl OidcDeviceAuth {
                 Ok(()) => {
                     self.lock_store_state().set_last_persisted_refresh(None);
                 }
-                Err(e) => warn_persistence("clear", &*e),
+                Err(e) => self.warn_persistence("clear", &*e),
             }
             return Ok(());
         }
@@ -1828,7 +1841,7 @@ impl OidcDeviceAuth {
                 let taken = std::mem::take(&mut *rt);
                 self.lock_store_state().set_last_persisted_refresh(taken);
             }
-            Err(e) => warn_persistence("save", &*e),
+            Err(e) => self.warn_persistence("save", &*e),
         }
         Ok(())
     }
@@ -2484,12 +2497,6 @@ fn snapshot(tokens: &TokenSet) -> PersistedToken {
         tokens.expires_at,
         ttl,
     )
-}
-
-/// Warn (once per failure) about a best-effort token-store operation that failed.
-/// Never logs a token value — a store's error carries only paths / I/O kinds.
-fn warn_persistence(op: &str, err: &(dyn std::error::Error + Send + Sync)) {
-    log::warn!("questdb oidc: token store {op} failed: {err}");
 }
 
 /// True when a failed [`refresh`](OidcDeviceAuth::refresh) proves the refresh

@@ -132,6 +132,29 @@ typedef void (*questdb_oidc_event_cb)(
  */
 typedef void (*questdb_oidc_user_data_release_cb)(void* user_data);
 
+typedef enum questdb_oidc_diagnostic_kind
+{
+    QUESTDB_OIDC_DIAGNOSTIC_PERSISTENCE_WARNING = 0,
+} questdb_oidc_diagnostic_kind;
+
+/** Borrowed best-effort diagnostic view, valid only during the callback. */
+typedef struct questdb_oidc_diagnostic
+{
+    size_t struct_size;
+    questdb_oidc_diagnostic_kind kind;
+    const char* message;
+    size_t message_len;
+} questdb_oidc_diagnostic;
+
+/**
+ * Persistence diagnostic callback. It may run on a token-provider or transport
+ * thread during silent refresh. Invocations are serialized. Return promptly;
+ * do not re-enter the auth or transport operation that emitted it, and never
+ * throw, unwind, or perform a non-local jump across this boundary.
+ */
+typedef void (*questdb_oidc_diagnostic_cb)(
+    void* user_data, const questdb_oidc_diagnostic* diagnostic);
+
 /** Explicit configuration; set client id and both OAuth endpoints before build.
  */
 QUESTDB_CLIENT_API
@@ -181,9 +204,11 @@ QUESTDB_OIDC_STRING_BUILDER_FN(
  * Override the discovered groups-in-token mode. `true` selects the `id_token`
  * as the token presented to QuestDB; otherwise the `access_token` is used.
  *
- * This does NOT modify the configured scope -- the scope is sent verbatim, both
- * on the device-authorization request and on refresh, matching the Java client.
- * Include `openid` in `questdb_oidc_builder_scope` explicitly when the identity
+ * This does NOT modify the configured scope. The scope is sent verbatim on the
+ * device-authorization request and retained for token selection and persisted
+ * identity. Refresh requests intentionally omit it per RFC 6749 section 6, so
+ * they cannot request scope beyond the original grant. Include `openid` in
+ * `questdb_oidc_builder_scope` explicitly when the identity
  * provider requires it to issue an ID token, or the flow fails with an OIDC
  * configuration error that no retry inside this process can clear.
  */
@@ -336,6 +361,19 @@ QUESTDB_CLIENT_API
 bool questdb_oidc_builder_event_handler(
     questdb_oidc_builder* builder,
     questdb_oidc_event_cb callback,
+    void* user_data,
+    questdb_oidc_user_data_release_cb release,
+    questdb_error** err_out);
+
+/**
+ * Install a best-effort persistence diagnostic callback. Ownership and release
+ * rules match `questdb_oidc_builder_event_handler`; unlike renderer events,
+ * diagnostics may originate on background token-provider threads.
+ */
+QUESTDB_CLIENT_API
+bool questdb_oidc_builder_diagnostic_handler(
+    questdb_oidc_builder* builder,
+    questdb_oidc_diagnostic_cb callback,
     void* user_data,
     questdb_oidc_user_data_release_cb release,
     questdb_error** err_out);
