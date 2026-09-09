@@ -78,8 +78,17 @@ use serde_json::Value;
 use zeroize::{Zeroize, Zeroizing};
 
 /// The environment variable that overrides the default token-store directory.
-/// Uses Java's exact configuration key so every client selects the same store.
-pub const TOKEN_STORE_DIR_ENV: &str = "questdb.client.oidc.token.store.dir";
+///
+/// Spelled as a conventional environment-variable name so a shell can actually
+/// set it: `export QUESTDB_CLIENT_OIDC_TOKEN_STORE_DIR=/path`. Java spells the
+/// same setting `questdb.client.oidc.token.store.dir`, but that is a JVM
+/// *system property* (`-Dquestdb.client.oidc.token.store.dir=...`), which never
+/// reaches this process's environment -- so borrowing that spelling bought no
+/// cross-language sharing, and cost a name `sh`/`bash`/`zsh` reject from
+/// `export` as "not a valid identifier", settable only via `env 'name=value'`.
+/// This client and the Python binding read this variable, so it still selects
+/// one store across both.
+pub const TOKEN_STORE_DIR_ENV: &str = "QUESTDB_CLIENT_OIDC_TOKEN_STORE_DIR";
 
 const SCHEMA_VERSION: i64 = 1;
 const CANONICAL_PREFIX: &str = "questdb-oidc-token-v1";
@@ -590,7 +599,7 @@ pub trait TokenStore: Send + Sync {
 /// reject anything written; see the module-level Security notes.
 ///
 /// The default location is `${HOME}/.questdb/oidc-tokens/`, overridable with the
-/// `questdb.client.oidc.token.store.dir` environment variable. The file name is
+/// `QUESTDB_CLIENT_OIDC_TOKEN_STORE_DIR` environment variable. The file name is
 /// `<TokenStoreKey::hash()>.json`, so several identities coexist and the name
 /// leaks neither the endpoint nor the client id.
 ///
@@ -668,14 +677,14 @@ impl FileTokenStore {
     }
 
     /// A store at the directory named by the
-    /// `questdb.client.oidc.token.store.dir` environment variable when set,
+    /// `QUESTDB_CLIENT_OIDC_TOKEN_STORE_DIR` environment variable when set,
     /// otherwise at `${HOME}/.questdb/oidc-tokens/`.
     ///
     /// The override **must be an absolute path**. A relative one follows the
     /// process working directory, and `~` is expanded by shells rather than by
     /// any client runtime, so neither names one stable store — and this setting
-    /// is shared with the Java client, so an ambiguous value would split the
-    /// store across languages instead of sharing it. Either is rejected.
+    /// is shared with the Python binding, so an ambiguous value would split the
+    /// store across bindings instead of sharing it. Either is rejected.
     ///
     /// Errors if the home directory can't be resolved and no override is set
     /// (e.g. a distroless container with no `HOME`) — set the environment variable

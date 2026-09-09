@@ -241,19 +241,37 @@ fn directory_lock_fence_prevents_mutation_after_ownership_loss() {
     assert_eq!(std::fs::read_to_string(lock).unwrap(), successor);
 }
 
-// -- cross-language contract (frozen) ---------------------------------------
+// -- cross-binding contract (frozen) ----------------------------------------
 
 #[test]
-fn token_store_directory_override_key_matches_java() {
-    assert_eq!(TOKEN_STORE_DIR_ENV, "questdb.client.oidc.token.store.dir");
+fn token_store_directory_override_key_is_shell_settable() {
+    // Frozen: this client and the Python binding must name the same variable.
+    assert_eq!(TOKEN_STORE_DIR_ENV, "QUESTDB_CLIENT_OIDC_TOKEN_STORE_DIR");
+    // And it must stay settable with `export`. The previous spelling,
+    // `questdb.client.oidc.token.store.dir`, was copied from Java, where it is
+    // a JVM system property (`-D...`) rather than an environment variable --
+    // so it shared nothing with Java, while `sh`/`bash`/`zsh` reject a name
+    // containing `.` as "not a valid identifier". It could only be set via
+    // `env 'name=value' prog`. A name that fails this assertion regresses that.
+    assert!(
+        TOKEN_STORE_DIR_ENV
+            .bytes()
+            .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit() || b == b'_'),
+        "must be settable with `export`: {TOKEN_STORE_DIR_ENV}"
+    );
+    assert!(
+        !TOKEN_STORE_DIR_ENV.starts_with(|c: char| c.is_ascii_digit()),
+        "an environment variable name may not start with a digit"
+    );
 }
 
 #[test]
 fn token_store_directory_override_must_be_absolute() {
-    // The setting is shared with Java, so an ambiguous value splits the store
-    // instead of sharing it. `~/qdb-tokens` is the trap: no runtime expands it,
-    // so this client and Java create a directory literally named `~`, while the
-    // Python client expands a constructor path to `$HOME/qdb-tokens`. A
+    // The setting is shared with the Python binding, so an ambiguous value
+    // splits the store instead of sharing it. `~/qdb-tokens` is the trap: no
+    // runtime expands it, so this client creates a directory literally named
+    // `~`, while the Python client expands a constructor path to
+    // `$HOME/qdb-tokens`. A
     // relative path is the other: it follows the process working directory, so
     // a chdir re-runs the device flow and strands a second plaintext refresh
     // token at the old path. Both now fail loudly.

@@ -593,7 +593,7 @@ public:
     /**
      * Explicitly persist access, ID, and long-lived refresh tokens as
      * unencrypted JSON under the directory named by the
-     * `questdb.client.oidc.token.store.dir` environment variable, or
+     * `QUESTDB_CLIENT_OIDC_TOKEN_STORE_DIR` environment variable, or
      * `${HOME}/.questdb/oidc-tokens/` when unset. Unix uses owner-only modes;
      * other platforms depend on the directory's default ACL.
      */

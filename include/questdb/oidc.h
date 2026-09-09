@@ -307,7 +307,7 @@ bool questdb_oidc_builder_file_token_store(
 
 /**
  * Explicitly enable plaintext file persistence at
- * the directory named by the `questdb.client.oidc.token.store.dir` environment
+ * the directory named by the `QUESTDB_CLIENT_OIDC_TOKEN_STORE_DIR` environment
  * variable, or `${HOME}/.questdb/oidc-tokens/` when it is unset.
  *
  * The store writes access, ID, and long-lived refresh tokens as unencrypted
