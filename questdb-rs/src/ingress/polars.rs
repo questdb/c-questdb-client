@@ -704,7 +704,7 @@ mod tests {
             ("u", 16, ArrowColumnOverride::Uuid { column: "u" }),
             ("l", 32, ArrowColumnOverride::Long256 { column: "l" }),
         ] {
-            let values = vec![vec![0u8; width], vec![1u8; width]];
+            let values = [vec![0u8; width], vec![1u8; width]];
             let vals: Vec<&[u8]> = values.iter().map(Vec::as_slice).collect();
             let s = Series::new(PlSmallStr::from(name), vals);
             let df = crate::polars_ffi::df_from_columns(vec![s.into_column()]).unwrap();
