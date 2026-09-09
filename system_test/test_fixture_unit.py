@@ -159,6 +159,85 @@ class PrintLogTest(unittest.TestCase):
 
 
 class TimeoutDiagnosticsTest(unittest.TestCase):
+    def test_kernel_report_wait_is_bounded_after_workload_completion(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = pathlib.Path(tmp)
+            (directory / 'kernel-stacks-enabled').touch()
+            qdb = _make_fixture(tmp)
+            with mock.patch.dict(fixture.os.environ, {
+                    'QWP_WS_FUZZ_DIAGNOSTICS': '1',
+                    'QWP_WS_FUZZ_WATCHDOG_DIR': str(directory)}), \
+                    mock.patch.object(fixture.time, 'monotonic', side_effect=[0, 20, 40, 51]), \
+                    mock.patch.object(fixture.time, 'sleep') as sleep:
+                qdb.finish_fuzz_diagnostics()
+            self.assertTrue((directory / 'workload-finished').exists())
+            self.assertEqual(sleep.call_count, 2)
+            self.assertIn('did not stop', (directory / 'capture-error').read_text())
+
+    def test_only_traced_or_pressure_diagnostic_setup_gets_longer_gate(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = pathlib.Path(tmp)
+            qdb = _make_fixture(tmp)
+            with mock.patch.dict(fixture.os.environ, {
+                    'QWP_WS_FUZZ_DIAGNOSTICS': '1',
+                    'QWP_WS_FUZZ_WATCHDOG_DIR': str(directory),
+                    'QWP_WS_MEMORY_PRESSURE': 'natural'}):
+                self.assertEqual(qdb.fuzz_diagnostic_gate_timeout(), 30)
+                with mock.patch.dict(fixture.os.environ, {'QWP_WS_MEMORY_PRESSURE': 'paired'}):
+                    self.assertEqual(qdb.fuzz_diagnostic_gate_timeout(), 90)
+                    with mock.patch.dict(fixture.os.environ, {'QWP_WS_FUZZ_DIAGNOSTICS': '0'}):
+                        self.assertEqual(qdb.fuzz_diagnostic_gate_timeout(), 30)
+                (directory / 'system-trace-enabled').touch()
+                self.assertEqual(qdb.fuzz_diagnostic_gate_timeout(), 90)
+                with mock.patch.dict(fixture.os.environ, {'QWP_WS_FUZZ_DIAGNOSTICS': '0'}):
+                    self.assertEqual(qdb.fuzz_diagnostic_gate_timeout(), 30)
+
+
+    def test_watchdog_request_does_not_block_on_http_or_dump(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            qdb = _make_fixture(tmp_dir)
+            with mock.patch.dict(fixture.os.environ, {
+                    'QWP_WS_FUZZ_DIAGNOSTICS': '1',
+                    'QWP_WS_FUZZ_WATCHDOG_DIR': tmp_dir}), \
+                    mock.patch.object(fixture.urllib.request, 'urlopen') as ping, \
+                    mock.patch.object(qdb, '_request_thread_dump') as dump:
+                qdb.capture_timeout_diagnostics('lookup timeout')
+            self.assertEqual(
+                (pathlib.Path(tmp_dir) / 'capture-request').read_text(),
+                'lookup timeout\n')
+            ping.assert_not_called()
+            dump.assert_not_called()
+
+    def test_teardown_waits_for_requested_capture(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            qdb = _make_fixture(tmp_dir)
+            directory = pathlib.Path(tmp_dir)
+            (directory / 'capture-request').touch()
+
+            def complete_capture(_seconds):
+                self.assertTrue((directory / 'workload-finished').exists())
+                (directory / 'capture-complete').touch()
+                (directory / 'watchdog-stopped').touch()
+
+            with mock.patch.dict(fixture.os.environ, {
+                    'QWP_WS_FUZZ_DIAGNOSTICS': '1',
+                    'QWP_WS_FUZZ_WATCHDOG_DIR': tmp_dir}), \
+                    mock.patch.object(fixture.time, 'sleep', complete_capture):
+                qdb.finish_fuzz_diagnostics()
+            self.assertTrue((directory / 'workload-finished').exists())
+
+    def test_teardown_wait_is_bounded_if_watchdog_dies(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            qdb = _make_fixture(tmp_dir)
+            directory = pathlib.Path(tmp_dir)
+            (directory / 'capture-request').touch()
+            with mock.patch.dict(fixture.os.environ, {
+                    'QWP_WS_FUZZ_DIAGNOSTICS': '1',
+                    'QWP_WS_FUZZ_WATCHDOG_DIR': tmp_dir}), \
+                    mock.patch.object(fixture.time, 'monotonic', side_effect=[0, 16]):
+                qdb.finish_fuzz_diagnostics()
+            self.assertTrue((directory / 'capture-error').exists())
+            self.assertTrue((directory / 'workload-finished').exists())
 
     @unittest.skipUnless(
         hasattr(signal, 'SIGQUIT'), 'SIGQUIT is POSIX-only')
@@ -169,11 +248,16 @@ class TimeoutDiagnosticsTest(unittest.TestCase):
             qdb._proc = mock.Mock()
             qdb._proc.poll.return_value = None
             stderr = io.StringIO()
+
+            def timeout_after_dump(*_args, **_kwargs):
+                self.assertTrue(qdb._proc.send_signal.called)
+                raise TimeoutError('timed out')
+
             with contextlib.redirect_stderr(stderr), \
                     mock.patch.object(
                         fixture.urllib.request,
                         'urlopen',
-                        side_effect=TimeoutError('timed out')), \
+                        side_effect=timeout_after_dump), \
                     mock.patch.object(fixture.time, 'sleep'):
                 qdb.capture_timeout_diagnostics('example.test')
 

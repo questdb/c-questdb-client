@@ -110,6 +110,7 @@ from fixture import (
     QuestDbExternalFixture,
     QuestDbFixture,
     TlsProxyFixture,
+    retry,
     install_questdb,
     install_questdb_from_repo,
     list_questdb_releases,
@@ -2485,6 +2486,7 @@ class TestQwpWsFuzz(QwpWsTestSupport, unittest.TestCase):
 
     def tearDown(self):
         if isinstance(QDB_FIXTURE, QuestDbFixture) and QDB_FIXTURE._proc:
+            QDB_FIXTURE.finish_fuzz_diagnostics()
             for name in self._created_tables:
                 self._drop_table_if_exists(name)
             QDB_FIXTURE.http_sql_query(
@@ -2510,10 +2512,9 @@ class TestQwpWsFuzz(QwpWsTestSupport, unittest.TestCase):
         sys.stderr.flush()
 
     def _list_columns(self, table_name: str):
-        try:
-            resp = sql_query(f'SHOW COLUMNS FROM \'{table_name}\'')
-        except Exception:
-            return []
+        # AlterThread already tolerates lookup failures and reports transient
+        # ones to diagnostics. Swallowing here hid SHOW COLUMNS stalls.
+        resp = sql_query(f'SHOW COLUMNS FROM \'{table_name}\'')
         cols = resp.get('columns') or []
         dataset = resp.get('dataset') or []
         name_idx = type_idx = None
@@ -2645,12 +2646,46 @@ class TestQwpWsFuzz(QwpWsTestSupport, unittest.TestCase):
         failure_counter = [0]
         failure_messages = []
         fail_lock = threading.Lock()
+        diagnostics_requested = [False]
+        diagnostics_enabled = (
+            os.environ.get('QWP_WS_FUZZ_DIAGNOSTICS') == '1')
+
+        startup_gate = None
+        startup_prefix = int(os.environ.get('QWP_WS_STARTUP_LOOKUPS', '0'))
+        if startup_prefix:
+            if not diagnostics_enabled or fuzz.column_convert_prob <= 0:
+                raise ValueError('startup prefix requires diagnostics and ALTER workload')
+            from qwp_ws_startup_gate import StartupGate
+            startup_gate = StartupGate(startup_prefix, self._log)
+
+        def list_columns_for_alter(table_name):
+            if startup_gate is not None:
+                return startup_gate.lookup(self._list_columns, table_name)
+            return self._list_columns(table_name)
+
+        def capture_diagnostics(reason: str):
+            if not diagnostics_enabled:
+                return
+            should_capture = False
+            with fail_lock:
+                if not diagnostics_requested[0]:
+                    diagnostics_requested[0] = True
+                    should_capture = True
+            if should_capture:
+                self._log(
+                    f'triggering immediate QuestDB diagnostics: {reason}')
+                try:
+                    QDB_FIXTURE.capture_timeout_diagnostics(self.id())
+                except Exception as e:  # noqa: BLE001 — diagnostics are best effort
+                    self._log(
+                        f'immediate QuestDB diagnostics failed: {e!r}')
 
         def record_failure(msg: str):
             with fail_lock:
                 failure_messages.append(msg)
                 failure_counter[0] += 1
             self._log(msg)
+            capture_diagnostics(msg)
 
         if fuzz.max_bounces > 0 and not (
                 hasattr(QDB_FIXTURE, 'stop') and hasattr(QDB_FIXTURE, 'start')):
@@ -2673,7 +2708,7 @@ class TestQwpWsFuzz(QwpWsTestSupport, unittest.TestCase):
                     name=f'qwp-ws-fuzz-producer-{thread_index}',
                     args=(
                         sender_id, producer_sf, load, fuzz, thread_seed_rng,
-                        tables, next_ts, record_failure))
+                        tables, next_ts, record_failure, startup_gate))
                 producer_threads.append(thread)
                 thread.start()
 
@@ -2685,7 +2720,7 @@ class TestQwpWsFuzz(QwpWsTestSupport, unittest.TestCase):
                     * fuzz.column_convert_prob))
                 alter_thread = qwp_ws_fuzz.AlterThread(
                     sql_query=sql_query,
-                    list_columns=self._list_columns,
+                    list_columns=list_columns_for_alter,
                     tables=list(tables.keys()),
                     convert_budget=budget,
                     rnd=self._master_rng.child(),
@@ -2693,7 +2728,8 @@ class TestQwpWsFuzz(QwpWsTestSupport, unittest.TestCase):
                     stop_event=stop_event,
                     record_failure=record_failure,
                     failure_counter=failure_counter,
-                    log=self._log)
+                    log=self._log,
+                    on_transient_network_error=capture_diagnostics)
                 alter_thread.start()
 
             bounce_thread = None
@@ -2762,7 +2798,7 @@ class TestQwpWsFuzz(QwpWsTestSupport, unittest.TestCase):
                 self.fail(str(e))
 
     def _producer_loop(self, sender_id, sf_root, load, fuzz, rnd,
-                       tables, next_ts, record_failure):
+                       tables, next_ts, record_failure, startup_gate=None):
         # A post-restart SFA replay storm can starve the server's accept loop
         # for ~1.5 min, so bounce variants need a wider drain budget; kept
         # equal so the reconnect sub-budget never trips first.
@@ -2792,10 +2828,15 @@ class TestQwpWsFuzz(QwpWsTestSupport, unittest.TestCase):
             reconnect_max_backoff_millis=250,
             close_flush_timeout_millis=budget_millis)
         try:
+            if startup_gate is not None:
+                startup_gate.wait()
             sender = self._connect_sender(conf)
         except Exception as e:  # noqa: BLE001
             record_failure(f'connect failed for {sender_id}: {e}')
             return
+        diagnostics_enabled = (
+            os.environ.get('QWP_WS_FUZZ_DIAGNOSTICS') == '1')
+        drain_started = None
         try:
             points = 0
             for _ in range(load.num_of_iterations):
@@ -2813,14 +2854,41 @@ class TestQwpWsFuzz(QwpWsTestSupport, unittest.TestCase):
                 sender.flush()
                 if load.wait_between_iterations_ms > 0:
                     time.sleep(load.wait_between_iterations_ms / 1000.0)
+            if diagnostics_enabled:
+                self._log_sender_progress(sender_id, sender, 'drain-start')
+            drain_started = time.monotonic()
             sender.close_drain()
+            if diagnostics_enabled:
+                self._log_sender_progress(
+                    sender_id,
+                    sender,
+                    'drain-complete',
+                    time.monotonic() - drain_started)
         except Exception as e:  # noqa: BLE001
+            if diagnostics_enabled:
+                elapsed = None if drain_started is None else (
+                    time.monotonic() - drain_started)
+                self._log_sender_progress(
+                    sender_id, sender, 'producer-failed', elapsed)
             record_failure(f'producer {sender_id} failed: {e}')
         finally:
             try:
                 sender.close(False)
             except Exception:  # noqa: BLE001
                 pass
+
+    def _log_sender_progress(self, sender_id, sender, event, elapsed=None):
+        try:
+            progress = (
+                f'published_fsn={sender.published_fsn()}, '
+                f'acked_fsn={sender.acked_fsn()}')
+        except Exception as e:  # noqa: BLE001 — diagnostics must not affect the test
+            progress = f'progress_unavailable={e!r}'
+        elapsed_text = '' if elapsed is None else f', elapsed={elapsed:.3f}s'
+        now = datetime.datetime.now(datetime.timezone.utc).isoformat()
+        self._log(
+            f'diagnostics event={event}, at={now}, sender={sender_id}, '
+            f'{progress}{elapsed_text}')
 
     def _r(self):
         """Shorthand alias for the master RNG used in test parameterization."""
@@ -4368,11 +4436,15 @@ def _stop_and_maybe_wipe(fixture):
     and want that server log to survive for the CI "Compress QuestDB server
     log on failure" archive step. So skip the wipe whenever an exception is
     propagating — including the ``SystemExit`` from ``sys.exit(1)`` —
-    detected via ``sys.exc_info()`` captured before ``stop()`` runs.
+    detected via ``sys.exc_info()`` captured before ``stop()`` runs. The
+    focused QWP/WS diagnostic job also preserves successful runs long enough
+    for its wrapper to copy the server log into the published artifact.
     """
     failed = sys.exc_info()[0] is not None
+    preserve_diagnostics = (
+        os.environ.get('QWP_WS_FUZZ_DIAGNOSTICS') == '1')
     fixture.stop()
-    if not failed:
+    if not failed and not preserve_diagnostics:
         fixture.wipe_data_dir()
 
 
@@ -4530,6 +4602,29 @@ def run_with_fixtures(args):
                 QDB_FIXTURE.http = False
                 QDB_FIXTURE.protocol_version = latest_protocol
                 QDB_FIXTURE.drop_all_tables()
+                ready_file = os.environ.get('QWP_WS_FUZZ_READY_FILE')
+                go_file = os.environ.get('QWP_WS_FUZZ_GO_FILE')
+                pid_file = os.environ.get('QWP_WS_FUZZ_PID_FILE')
+                if ready_file or go_file:
+                    if not ready_file or not go_file:
+                        raise RuntimeError(
+                            'QWP_WS_FUZZ_READY_FILE and '
+                            'QWP_WS_FUZZ_GO_FILE must be set together')
+                    if pid_file:
+                        server_pid = QDB_FIXTURE.process_pid()
+                        if server_pid is None:
+                            raise RuntimeError(
+                                'Managed QuestDB process PID is unavailable')
+                        pathlib.Path(pid_file).write_text(
+                            f'{server_pid}\n', encoding='ascii')
+                    pathlib.Path(ready_file).touch()
+                    retry(
+                        lambda: pathlib.Path(go_file).exists(),
+                        timeout_sec=QDB_FIXTURE.fuzz_diagnostic_gate_timeout(),
+                        every=0.05,
+                        backoff_till=0.05,
+                        lead_sleep=0,
+                        msg='Timed out waiting for QWP/WS diagnostic gate')
                 if not _run_selected_tests(SUITE_QWP_WS_FUZZ):
                     sys.exit(1)
             finally:

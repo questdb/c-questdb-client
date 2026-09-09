@@ -309,6 +309,9 @@ class QuestDbFixtureBase:
     def capture_timeout_diagnostics(self, test_name):
         pass
 
+    def process_pid(self):
+        return None
+
     def http_headers(self):
         if not getattr(self, 'http_auth', False):
             return {}
@@ -515,6 +518,11 @@ class QuestDbFixture(QuestDbFixtureBase):
         sys.stderr.write(textwrap.indent(log, '    '))
         sys.stderr.write('\n\n')
 
+    def process_pid(self):
+        if self._proc is None or self._proc.poll() is not None:
+            return None
+        return self._proc.pid
+
     def start(self):
         if self.http_server_port is None:
             ports = discover_avail_ports(3)
@@ -576,6 +584,22 @@ class QuestDbFixture(QuestDbFixtureBase):
             '-p', str(self._root_dir / 'bin' / 'questdb.jar'),
             '-m', 'io.questdb/io.questdb.ServerMain',
             '-d', str(self._data_dir)]
+        watchdog_dir = self._watchdog_dir()
+        if watchdog_dir is not None:
+            watchdog_dir.mkdir(parents=True, exist_ok=True)
+            launch_args[1:1] = [
+                '-XX:ActiveProcessorCount=3',
+                f'-Djava.io.tmpdir={os.environ["TMPDIR"]}',
+                '-Xlog:gc*,safepoint=debug:file='
+                f'{watchdog_dir / "jvm-pauses.log"}'
+                ':utctime,uptimemillis,level,tags:filecount=2,filesize=16M']
+            query_probe = os.environ.get('QWP_WS_SHOW_COLUMNS_OVERLAY')
+            if query_probe:
+                overlay = pathlib.Path(query_probe).resolve(strict=True)
+                launch_args[1:1] = [
+                    '--patch-module', f'io.questdb={overlay}',
+                    f'-Dqwp.show.columns.dir={watchdog_dir}']
+                (watchdog_dir / 'show-columns-enabled').touch()
         sys.stderr.write(
             f'Starting QuestDB: {launch_args!r} '
             f'(auth: {self.auth}, http_auth: {self.http_auth}, '
@@ -606,6 +630,9 @@ class QuestDbFixture(QuestDbFixtureBase):
                 stdout=self._log,
                 stderr=subprocess.STDOUT,
                 creationflags=creationflags)
+            if watchdog_dir is not None:
+                (watchdog_dir / 'watchdog-endpoint.json').write_text(json.dumps(
+                    dict(pid=self._proc.pid, port=self.http_server_port)))
 
             def check_http_up():
                 if self._proc.poll() is not None:
@@ -702,8 +729,25 @@ class QuestDbFixture(QuestDbFixtureBase):
         return False
 
     def capture_timeout_diagnostics(self, test_name):
+        watchdog_dir = self._watchdog_dir()
+        if watchdog_dir is not None:
+            # Let the independent collector do the work. Do not pause a
+            # producer/ALTER thread for another HTTP request or dump sleep.
+            (watchdog_dir / 'capture-request').write_text(test_name + '\n')
+            return
         sys.stderr.write(
             f'Capturing QuestDB diagnostics after timeout in {test_name}.\n')
+
+        # Request the dump before making another network call. If the timeout
+        # is transient, even the one-second /ping probe below can otherwise
+        # miss the threads while they are still blocked.
+        dump_requested = self._request_thread_dump()
+        if dump_requested:
+            sys.stderr.write(
+                f'Requested a JVM thread dump in `{self._log_path}`.\n')
+        else:
+            sys.stderr.write('Could not request a JVM thread dump.\n')
+
         req = urllib.request.Request(
             f'http://127.0.0.1:{self.http_server_port}/ping',
             headers=self.http_headers(),
@@ -715,12 +759,43 @@ class QuestDbFixture(QuestDbFixtureBase):
         except Exception as e:
             sys.stderr.write(f'QuestDB /ping after timeout failed: {e!r}.\n')
 
-        if self._request_thread_dump():
-            sys.stderr.write(
-                f'Requested a JVM thread dump in `{self._log_path}`.\n')
+        if dump_requested:
             time.sleep(2)
-        else:
-            sys.stderr.write('Could not request a JVM thread dump.\n')
+
+    @staticmethod
+    def _watchdog_dir():
+        directory = os.environ.get('QWP_WS_FUZZ_WATCHDOG_DIR')
+        if directory and os.environ.get('QWP_WS_FUZZ_DIAGNOSTICS') == '1':
+            return pathlib.Path(directory).resolve()
+        return None
+
+    def fuzz_diagnostic_gate_timeout(self):
+        directory = self._watchdog_dir()
+        if directory is not None and (directory / 'system-trace-enabled').exists():
+            return 90  # recorder initialization only, before workload starts
+        if directory is not None and os.environ.get('QWP_WS_MEMORY_PRESSURE') == 'paired':
+            return 90  # recovery and pressure setup only; workload budgets unchanged
+        return 30
+
+    def finish_fuzz_diagnostics(self):
+        directory = self._watchdog_dir()
+        if directory is None:
+            return
+        # Handshake before DROP: stop new probes and let pending collection
+        # finish. Waiting for the watchdog's acknowledgment closes the race
+        # between its capture-started marker and this teardown thread.
+        # This is after workload assertions, outside sender timeout budgets.
+        (directory / 'workload-finished').touch()
+        # Kernel report processing is after onset, outside workload assertions
+        # and sender/SQL deadlines. Do not start DROP while it is still reading.
+        wait_seconds = 50 if (directory / 'kernel-stacks-enabled').exists() else 15
+        deadline = time.monotonic() + wait_seconds
+        while not (directory / 'watchdog-stopped').exists():
+            if time.monotonic() >= deadline:
+                (directory / 'capture-error').write_text(
+                    'watchdog did not stop before teardown\n')
+                break
+            time.sleep(0.05)
 
     def stop(self, wait_timeout_sec=30):
         if self._tls_proxy:

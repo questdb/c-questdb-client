@@ -1,5 +1,15 @@
 trigger: none
 
+parameters:
+  - name: qwpWsDecodeOnly
+    displayName: "QWP diagnostics: decode existing trace only (no builds/tests)"
+    type: boolean
+    default: false
+  - name: qwpWsPreflightOnly
+    displayName: "QWP diagnostics: verify recorder startup only (no builds/tests)"
+    type: boolean
+    default: false
+
 variables:
   OS_MAPPING: none
   Windows_NT-X86: windows
@@ -7,6 +17,7 @@ variables:
   Darwin-ARM: armosx
   Linux-ARM: armlinux
   Linux-X64: linux
+  QWP_WS_DIAGNOSTIC_REF: refs/pull/200/merge
 
 stages:
   - stage: BuildAndTest
@@ -14,6 +25,7 @@ stages:
     jobs:
       - job: RunOn
         displayName: "on"
+        condition: ne(variables['Build.SourceBranch'], variables['QWP_WS_DIAGNOSTIC_REF'])
         strategy:
           matrix:
             linux:
@@ -82,6 +94,7 @@ stages:
       # image tests the one macOS architecture the client ships against.
       - job: RustTests
         displayName: "cargo tests (mac/windows)"
+        condition: ne(variables['Build.SourceBranch'], variables['QWP_WS_DIAGNOSTIC_REF'])
         strategy:
           matrix:
             mac:
@@ -102,6 +115,7 @@ stages:
             displayName: "cargo tests"
       - job: NativeTests
         displayName: "build + C++ + integration (mac/windows)"
+        condition: ne(variables['Build.SourceBranch'], variables['QWP_WS_DIAGNOSTIC_REF'])
         strategy:
           matrix:
             mac:
@@ -160,6 +174,7 @@ stages:
               artifactName: qdb-log-native-$(imageName)
       - job: VersionMatrix
         displayName: "arrow/polars version-range tests (linux)"
+        condition: ne(variables['Build.SourceBranch'], variables['QWP_WS_DIAGNOSTIC_REF'])
         pool:
           vmImage: "ubuntu-latest"
         timeoutInMinutes: 90
@@ -172,6 +187,7 @@ stages:
             displayName: "questdb-rs: pinned arrow/polars versions"
       - job: RustMsrvAndDocs
         displayName: "Rust MSRV and release documentation"
+        condition: ne(variables['Build.SourceBranch'], variables['QWP_WS_DIAGNOSTIC_REF'])
         pool:
           vmImage: "ubuntu-latest"
         timeoutInMinutes: 45
@@ -199,6 +215,7 @@ stages:
             displayName: "Check release documentation"
       - job: FormatAndLinting
         displayName: "cargo fmt and clippy"
+        condition: ne(variables['Build.SourceBranch'], variables['QWP_WS_DIAGNOSTIC_REF'])
         pool:
           vmImage: "ubuntu-latest"
         timeoutInMinutes: 10
@@ -261,6 +278,7 @@ stages:
             displayName: "failover_clients: clippy"
       - job: SanitizeCppTests
         displayName: "C/C++ tests under ASan + UBSan"
+        condition: ne(variables['Build.SourceBranch'], variables['QWP_WS_DIAGNOSTIC_REF'])
         pool:
           vmImage: "ubuntu-latest"
         timeoutInMinutes: 60
@@ -293,6 +311,7 @@ stages:
       # Python dependencies, including pyarrow/polars, for non-macOS builds.
       - job: TestVsQuestDBMaster
         displayName: "Vs QuestDB master"
+        condition: ne(variables['Build.SourceBranch'], variables['QWP_WS_DIAGNOSTIC_REF'])
         pool:
           name: hetzner-incus
         timeoutInMinutes: 90
@@ -389,59 +408,142 @@ stages:
               pathToPublish: $(Build.ArtifactStagingDirectory)/qdb-log-vs-master-$(Agent.OS).zip
               artifactName: qdb-log-vs-master-$(Agent.OS)
       - job: TestQwpWsFuzz
-        displayName: "QWP/WS fuzz suite (mac/windows hosted)"
-        strategy:
-          matrix:
-            mac:
-              imageName: "macOS-15-arm64"
-            windows-2022:
-              imageName: "windows-2022"
+        displayName: "QWP/WS slow SHOW COLUMNS diagnostics (one macOS worker)"
+        condition: eq(variables['Build.SourceBranch'], variables['QWP_WS_DIAGNOSTIC_REF'])
+        variables:
+          ${{ if parameters.qwpWsDecodeOnly }}:
+            diagnosticReplica: trace-decode
+          ${{ elseif parameters.qwpWsPreflightOnly }}:
+            diagnosticReplica: kernel-preflight
+          ${{ else }}:
+            diagnosticReplica: show-columns
         pool:
-          vmImage: $(imageName)
-        timeoutInMinutes: 90
+          vmImage: macOS-15-arm64
+        ${{ if or(parameters.qwpWsPreflightOnly, parameters.qwpWsDecodeOnly) }}:
+          timeoutInMinutes: 10
+        ${{ else }}:
+          timeoutInMinutes: 90
         steps:
           - checkout: self
             fetchDepth: 1
             lfs: false
             submodules: false
-          - template: templates/compile.yaml
-          - template: templates/resolve_jdk25.yaml
-          - template: templates/clone_questdb.yaml
-          - template: templates/maven_settings.yaml
-          - task: Maven@3
-            displayName: "Compile QuestDB"
-            retryCountOnTaskFailure: 2
+          - ${{ if parameters.qwpWsDecodeOnly }}:
+            - bash: |
+                mkdir -p "$QWP_WS_DIAGNOSTICS_DIR/tmp"
+                export TMPDIR="$QWP_WS_DIAGNOSTICS_DIR/tmp"
+                python3 ci/diagnostics/decode_kernel_capture.py "$QWP_WS_DIAGNOSTICS_DIR/decoded"
+              displayName: "Decode retained kernel capture with retained symbols (no workload)"
+              timeoutInMinutes: 7
+              env:
+                QWP_WS_DIAGNOSTICS_DIR: >-
+                  $(Build.ArtifactStagingDirectory)/qwp-ws-macos-diagnostics
+          - ${{ if and(parameters.qwpWsPreflightOnly, not(parameters.qwpWsDecodeOnly)) }}:
+            - bash: python3 ci/diagnostics/kernel_wait_preflight.py "$QWP_WS_DIAGNOSTICS_DIR/kernel-preflight"
+              displayName: "Verify kernel wait stacks with a bounded filesystem smoke test"
+              timeoutInMinutes: 5
+              env:
+                QWP_WS_DIAGNOSTICS_DIR: >-
+                  $(Build.ArtifactStagingDirectory)/qwp-ws-macos-diagnostics
+          # The optional recorder-only mode still excludes all builds/tests.
+          # The normal query-stage arm does not start System Trace.
+          - ${{ if and(not(parameters.qwpWsPreflightOnly), not(parameters.qwpWsDecodeOnly)) }}:
+            - template: templates/compile.yaml
+              parameters:
+                prerequisiteCondition: succeeded()
+            - template: templates/resolve_jdk25.yaml
+            - template: templates/clone_questdb.yaml
+              parameters:
+                # Original build 266336 task log 122 prints this build hash.
+                revision: 12a33d651e51e2682e7a448c8db5168fc72dfad3
+            - bash: bash ci/prepare_qwp_ws_jdk.sh
+              displayName: "Pin original Temurin 25.0.3+9"
+            - template: templates/maven_settings.yaml
+            - task: Maven@3
+              displayName: "Compile QuestDB"
+              retryCountOnTaskFailure: 2
+              inputs:
+                mavenPOMFile: "questdb/pom.xml"
+                javaHomeOption: "Path"
+                jdkDirectory: "$(JAVA_HOME)"
+                options: "-s $(MAVEN_SETTINGS_FILE) -DskipTests -Pbuild-web-console$(CLIENT_PROFILE) $(MAVEN_RUN_OPTS)"
+            - bash: |
+                python3 ci/diagnostics/show_columns/prepare.py \
+                  --repo questdb \
+                  --jar questdb/core/target/questdb-10.0.2-SNAPSHOT.jar \
+                  --output "$(Build.ArtifactStagingDirectory)/qwp-ws-macos-diagnostics/query-probe"
+              displayName: "Compile exact-revision SHOW COLUMNS diagnostic overlay"
+            - bash: bash ci/run_macos_qwp_ws_diagnostics.sh
+              displayName: "Repeat only add-columns until slow query or failure"
+              timeoutInMinutes: 30
+              env:
+                # Restore the original 72 missing-table ALTER lookups before
+                # producer connection. This is a scheduling perturbation, not
+                # a recreation of the unknown original startup delay.
+                # Stress reproduction: one serial 5 Hz SHOW COLUMNS reader
+                # stops on its first error. Only a 1 Hz tiny mapped-file probe;
+                # no high-rate filesystem load. This changes query traffic.
+                # Capture slow queries, observer loss or actual workload failure;
+                # short ping failures are telemetry only. Stop first capture.
+                # No new attempt after ten minutes, regardless of run count.
+                QWP_WS_DIAGNOSTIC_RUNS: "4"
+                QWP_WS_KERNEL_CAPTURE: query
+                QWP_WS_QUERY_READER: "1"
+                QWP_WS_DISK_LOAD: "1"
+                QWP_WS_DISK_MODE: probe
+                QWP_WS_DISK_PATTERN: mapped
+                QWP_WS_STARTUP_LOOKUPS: "72"
+                QWP_WS_MAX_SECONDS: "600"
+                QWP_WS_STOP_ON_CAPTURE: "1"
+                QWP_WS_SYSTEM_TRACE: "0"
+                QWP_WS_SHOW_COLUMNS_OVERLAY: >-
+                  $(Build.ArtifactStagingDirectory)/qwp-ws-macos-diagnostics/query-probe/show-columns-probe.jar
+                QWP_WS_MIN_FREE_KB: "2097152"
+                QWP_WS_DIAGNOSTICS_DIR: >-
+                  $(Build.ArtifactStagingDirectory)/qwp-ws-macos-diagnostics
+                QWP_WS_MEMORY_PRESSURE: natural
+                QWP_WS_FS_TRACE: "0"
+          - bash: |
+              # xctrace may create private root-owned files despite umask.
+              # Return only this job's diagnostic artifacts to the uploader.
+              if [[ -d "$QWP_WS_DIAGNOSTICS_DIR" ]]; then
+                sudo -n chown -R "$(id -u):$(id -g)" "$QWP_WS_DIAGNOSTICS_DIR"
+              fi
+            displayName: "Make privileged trace artifacts readable by uploader"
+            condition: always()
+            env:
+              QWP_WS_DIAGNOSTICS_DIR: >-
+                $(Build.ArtifactStagingDirectory)/qwp-ws-macos-diagnostics
+          - task: PublishBuildArtifacts@1
+            displayName: "Publish macOS host diagnostics"
+            condition: always()
             inputs:
-              mavenPOMFile: "questdb/pom.xml"
-              javaHomeOption: "Path"
-              jdkDirectory: "$(JAVA_HOME)"
-              options: "-s $(MAVEN_SETTINGS_FILE) -DskipTests -Pbuild-web-console$(CLIENT_PROFILE) $(MAVEN_RUN_OPTS)"
-          - script: |
-              python3 system_test/test.py run --repo ./questdb TestQwpWsFuzz -v
-            displayName: "TestQwpWsFuzz"
-          - script: |
-              python3 system_test/test.py run --repo ./questdb TestArrowEgressFuzz TestArrowEgressPerKind TestArrowEgressEmpty TestArrowIngressFuzz TestArrowIngressPerKind TestArrowIngressDesignatedTs TestArrowIngressErrors TestArrowIngressMultiBatch TestArrowIngressExtraTypes TestArrowIngressUnsupportedTypes TestArrowIngressSfa TestArrowRoundTripFuzz TestArrowRoundTripPerKind TestArrowAlignment TestArrowPolarsFuzz TestArrowPolarsRoundTripPerKind TestArrowPolarsPerDtype -v
-            displayName: "TestArrowWsFuzz"
+              pathToPublish: >-
+                $(Build.ArtifactStagingDirectory)/qwp-ws-macos-diagnostics
+              artifactName: qwp-ws-macos-$(diagnosticReplica)
           # Mirrors ci/run_fuzz_pipeline.yaml: on failure, archive and
           # publish the QuestDB server log so PR reviewers don't have to
           # repro locally. Path comes from system_test/fixture.py:_log_path.
-          - task: ArchiveFiles@2
-            displayName: "Compress QuestDB server log on failure"
-            condition: failed()
-            continueOnError: true
-            inputs:
-              rootFolderOrFile: $(Build.SourcesDirectory)/build/questdb/repo/data/log
-              includeRootFolder: false
-              archiveType: zip
-              archiveFile: $(Build.ArtifactStagingDirectory)/qdb-log-$(Agent.OS).zip
-              quiet: true
-          - task: PublishBuildArtifacts@1
-            displayName: "Publish QuestDB server log on failure"
-            condition: failed()
-            continueOnError: true
-            inputs:
-              pathToPublish: $(Build.ArtifactStagingDirectory)/qdb-log-$(Agent.OS).zip
-              artifactName: qdb-log-$(Agent.OS)
+          - ${{ if and(not(parameters.qwpWsPreflightOnly), not(parameters.qwpWsDecodeOnly)) }}:
+            - task: ArchiveFiles@2
+              displayName: "Compress QuestDB server log on failure"
+              condition: failed()
+              continueOnError: true
+              inputs:
+                rootFolderOrFile: $(Build.SourcesDirectory)/build/questdb/repo/data/log
+                includeRootFolder: false
+                archiveType: zip
+                archiveFile: >-
+                  $(Build.ArtifactStagingDirectory)/qdb-log-$(Agent.OS)-$(diagnosticReplica).zip
+                quiet: true
+            - task: PublishBuildArtifacts@1
+              displayName: "Publish QuestDB server log on failure"
+              condition: failed()
+              continueOnError: true
+              inputs:
+                pathToPublish: >-
+                  $(Build.ArtifactStagingDirectory)/qdb-log-$(Agent.OS)-$(diagnosticReplica).zip
+                artifactName: qdb-log-$(Agent.OS)-$(diagnosticReplica)
 
       # Linux leg on self-hosted hetzner-incus — mirrors the equivalent
       # job in ci/run_fuzz_pipeline.yaml. Pool image is built from
@@ -452,6 +554,7 @@ stages:
       # are available on the self-hosted image.
       - job: TestQwpWsFuzzLinux
         displayName: "QWP/WS fuzz suite (linux/hetzner-incus)"
+        condition: ne(variables['Build.SourceBranch'], variables['QWP_WS_DIAGNOSTIC_REF'])
         pool:
           name: hetzner-incus
         timeoutInMinutes: 90
@@ -550,6 +653,7 @@ stages:
       # run_fuzz_pipeline.yaml varies the seed per build.
       - job: TestQwpEgressLiveServerFuzz
         displayName: "QWP egress live-server suite"
+        condition: ne(variables['Build.SourceBranch'], variables['QWP_WS_DIAGNOSTIC_REF'])
         pool:
           vmImage: "ubuntu-latest"
         timeoutInMinutes: 60
@@ -640,7 +744,7 @@ stages:
         # tokens) are not exposed to fork builds, so the REST POST
         # would 401. Skipping rather than failing keeps fork-PR CI
         # clean.
-        condition: and(succeeded(), ne(variables['System.PullRequest.IsFork'], 'True'))
+        condition: and(succeeded(), ne(variables['System.PullRequest.IsFork'], 'True'), ne(variables['Build.SourceBranch'], variables['QWP_WS_DIAGNOSTIC_REF']))
         variables:
           # Hardcoded because the Enterprise pipeline lives in its own
           # ADO project, not the one this pipeline runs in.
