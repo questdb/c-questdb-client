@@ -125,19 +125,32 @@ fn root_ca_path() -> PathBuf {
     certs_dir().join("server_rootCA.pem")
 }
 
+/// The crypto provider for the enabled crypto feature. Mirrors the
+/// selection the library makes in `egress::tls`, so the mock server
+/// handshakes with the same primitives as the client. `build.rs`
+/// enforces that exactly one of the two features is on, so these
+/// arms are mutually exclusive and exhaustive.
+#[cfg(feature = "aws-lc-crypto")]
+fn default_crypto_provider() -> rustls::crypto::CryptoProvider {
+    rustls::crypto::aws_lc_rs::default_provider()
+}
+
+#[cfg(feature = "ring-crypto")]
+fn default_crypto_provider() -> rustls::crypto::CryptoProvider {
+    rustls::crypto::ring::default_provider()
+}
+
 /// Build the rustls server config once per process. The first
 /// `ServerConfig::builder()` on a fresh process needs a default
 /// `CryptoProvider` installed; we install one lazily here so this
-/// file works whether or not other tests have already done so. The
-/// `ring` provider is the lib's default-feature crypto provider,
-/// matching what the client side will use during the handshake.
+/// file works whether or not other tests have already done so.
 fn tls_server_config() -> Arc<ServerConfig> {
     static CFG: OnceLock<Arc<ServerConfig>> = OnceLock::new();
     CFG.get_or_init(|| {
         // Install the default provider, ignoring "already installed"
         // because another test or the client side may have got there
-        // first. Ring is the lib's default crypto feature.
-        let _ = rustls::crypto::ring::default_provider().install_default();
+        // first.
+        let _ = default_crypto_provider().install_default();
 
         let dir = certs_dir();
         let cert_chain: Vec<CertificateDer<'static>> =
