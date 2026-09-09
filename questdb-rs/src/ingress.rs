@@ -1642,8 +1642,10 @@ impl SenderBuilder {
     /// callback (e.g. [`OidcDeviceAuth::token`](crate::oidc::OidcDeviceAuth::token)).
     ///
     /// Unlike [`token`](Self::token), which captures a fixed token once, the
-    /// provider is called at each connect and reconnect, so a long-lived sender
-    /// keeps working as the token silently refreshes / rotates. The returned token
+    /// provider is called once at each connect/reconnect endpoint walk. That
+    /// value is reused across endpoint failover; after one handshake 401 it is
+    /// resolved once more and the same endpoint is replayed only if it changed.
+    /// Thus a long-lived sender keeps working as the token rotates. The returned token
     /// is sent as the `Authorization: Bearer <token>` handshake header; a token
     /// with a non-printable-ASCII character (a header-injection vector) is
     /// rejected. A provider error fails that connection attempt and is retried by

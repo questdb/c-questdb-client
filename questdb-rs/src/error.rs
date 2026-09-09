@@ -334,6 +334,11 @@ struct ErrorInner {
     /// mismatch. Query-only.
     #[cfg(feature = "_egress")]
     server_info: Option<crate::egress::server_event::ServerInfo>,
+    /// HTTP status from a WebSocket upgrade rejection. Kept structured so
+    /// rotating-auth callers can distinguish a replayable 401 from 403 and
+    /// other terminal errors without parsing diagnostic text.
+    #[cfg(any(feature = "_sender-qwp-ws", feature = "_egress"))]
+    ws_http_status: Option<u16>,
 }
 
 impl Error {
@@ -353,6 +358,8 @@ impl Error {
             upgrade_reject: None,
             #[cfg(feature = "_egress")]
             server_info: None,
+            #[cfg(any(feature = "_sender-qwp-ws", feature = "_egress"))]
+            ws_http_status: None,
         }))
     }
 
@@ -479,6 +486,17 @@ impl Error {
                 fmt!(SocketError, "Could not flush buffer: {}: {}", url, e)
             }
         }
+    }
+
+    #[cfg(any(feature = "_sender-qwp-ws", feature = "_egress"))]
+    pub(crate) fn with_ws_http_status(mut self, status: u16) -> Self {
+        self.0.ws_http_status = Some(status);
+        self
+    }
+
+    #[cfg(any(feature = "_sender-qwp-ws", feature = "_egress"))]
+    pub(crate) fn ws_http_status(&self) -> Option<u16> {
+        self.0.ws_http_status
     }
 
     /// Get the error code (category) of this error.

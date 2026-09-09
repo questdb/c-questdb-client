@@ -660,6 +660,49 @@ fn spawn_one_response_server(response: MockQwpResponse) -> (u16, mpsc::Receiver<
     (port, rx)
 }
 
+fn spawn_401_then_response_server() -> (u16, mpsc::Receiver<MockResult>) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let (tx, rx) = mpsc::channel();
+    thread::spawn(move || {
+        let (mut first, _) = listener.accept().unwrap();
+        let request = read_request_until_blank(&mut first).unwrap();
+        let request_lines = String::from_utf8_lossy(&request)
+            .split("\r\n")
+            .take_while(|line| !line.is_empty())
+            .map(String::from)
+            .collect();
+        first
+            .write_all(
+                b"HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+            )
+            .unwrap();
+        tx.send(MockResult {
+            request_lines,
+            received_frames: Vec::new(),
+        })
+        .unwrap();
+
+        let (mut second, _) = listener.accept().unwrap();
+        let request_lines = perform_server_upgrade(&mut second).unwrap();
+        let mut received_frames = Vec::new();
+        if let Ok((_fin, _opcode, payload)) = read_frame(&mut second) {
+            received_frames.push(payload);
+            let _ = write_qwp_error_response(
+                &mut second,
+                QWP_STATUS_SCHEMA_MISMATCH,
+                FIRST_WIRE_SEQUENCE,
+                b"done",
+            );
+        }
+        let _ = tx.send(MockResult {
+            request_lines,
+            received_frames,
+        });
+    });
+    (port, rx)
+}
+
 /// Captures the upgrade `Authorization` header on every connection and NACKs each
 /// posted frame with a retryable `WRITE_ERROR`, so a background drainer keeps
 /// reconnecting (re-running the handshake). Streams one [`MockResult`] per
@@ -2373,6 +2416,50 @@ fn qwp_ws_token_provider_reaches_upgrade_handshake() {
         provider_calls.load(Ordering::SeqCst) >= 1,
         "the token provider must be pulled at connect"
     );
+}
+
+#[test]
+fn qwp_ws_retries_one_401_with_a_changed_provider_token() {
+    let provider_calls = Arc::new(AtomicUsize::new(0));
+    let (port, rx) = spawn_401_then_response_server();
+    let builder = SenderBuilder::new(Protocol::Ws, "127.0.0.1", port)
+        .qwp_ws_token_provider({
+            let provider_calls = Arc::clone(&provider_calls);
+            move || {
+                let n = provider_calls.fetch_add(1, Ordering::SeqCst);
+                Ok::<_, crate::Error>(if n == 0 { "stale" } else { "fresh" }.to_string())
+            }
+        })
+        .unwrap();
+    let mut sender = build_qwp_ws_sender_from_builder(ProgressCase::Background, builder);
+    let mut buf = sender.new_buffer();
+    buf.table("trades")
+        .unwrap()
+        .column_i64("qty", 1)
+        .unwrap()
+        .at_now()
+        .unwrap();
+    let _ = sender.flush_and_get_fsn(&mut buf);
+
+    let auth_of = |result: &MockResult| {
+        result
+            .request_lines
+            .iter()
+            .find_map(|line| line.split_once(':'))
+            .and_then(|_| {
+                result.request_lines.iter().find_map(|line| {
+                    let (key, value) = line.split_once(':')?;
+                    key.eq_ignore_ascii_case("authorization")
+                        .then(|| value.trim().to_string())
+                })
+            })
+            .expect("authorization header")
+    };
+    let first = rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    let second = rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    assert_eq!(auth_of(&first), "Bearer stale");
+    assert_eq!(auth_of(&second), "Bearer fresh");
+    assert_eq!(provider_calls.load(Ordering::SeqCst), 2);
 }
 
 #[test]

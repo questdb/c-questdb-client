@@ -31,12 +31,46 @@
 
 use std::sync::Arc;
 #[cfg(feature = "_sender-qwp-ws")]
+use std::sync::atomic::{AtomicUsize, Ordering};
+#[cfg(feature = "_sender-qwp-ws")]
 use std::sync::mpsc::{self, RecvTimeoutError};
 #[cfg(feature = "_sender-qwp-ws")]
 use std::time::Duration;
 
 #[cfg(feature = "_sender-qwp-ws")]
 const ISOLATED_PROVIDER_POLL: Duration = Duration::from_millis(5);
+#[cfg(feature = "_sender-qwp-ws")]
+const MAX_ISOLATED_PROVIDER_WORKERS: usize = 16;
+#[cfg(feature = "_sender-qwp-ws")]
+static ISOLATED_PROVIDER_WORKERS: AtomicUsize = AtomicUsize::new(0);
+
+#[cfg(feature = "_sender-qwp-ws")]
+#[derive(Debug)]
+struct IsolatedProviderPermit<'a>(&'a AtomicUsize);
+
+#[cfg(feature = "_sender-qwp-ws")]
+impl<'a> IsolatedProviderPermit<'a> {
+    fn acquire(counter: &'a AtomicUsize, limit: usize) -> crate::Result<Self> {
+        counter
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |active| {
+                (active < limit).then_some(active + 1)
+            })
+            .map_err(|_| {
+                crate::error::fmt!(
+                    SocketError,
+                    "The isolated token-provider worker limit ({limit}) is busy; retry later"
+                )
+            })?;
+        Ok(Self(counter))
+    }
+}
+
+#[cfg(feature = "_sender-qwp-ws")]
+impl Drop for IsolatedProviderPermit<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::AcqRel);
+    }
+}
 
 /// User-facing text for "a rotating token provider and static credentials were
 /// both configured".
@@ -144,11 +178,20 @@ impl TokenProvider {
             return Err(provider_shutdown_error());
         }
 
+        // A blocked synchronous callback cannot be killed, but it must not
+        // permit repeated sender teardown to grow process-global thread count
+        // without bound. The permit lives on the worker and is released on
+        // normal return, unwind-enabled panic, or spawn failure.
+        let permit = IsolatedProviderPermit::acquire(
+            &ISOLATED_PROVIDER_WORKERS,
+            MAX_ISOLATED_PROVIDER_WORKERS,
+        )?;
         let provider = self.clone();
         let (result_tx, result_rx) = mpsc::sync_channel(1);
         std::thread::Builder::new()
             .name("questdb-token-provider".to_string())
             .spawn(move || {
+                let _permit = permit;
                 let _ = result_tx.send(provider.bearer_header());
             })
             .map_err(|err| {
@@ -461,7 +504,7 @@ mod tests {
     /// the cancellation branches — the whole reason the method exists — were not.
     #[cfg(feature = "_sender-qwp-ws")]
     mod isolated {
-        use super::super::TokenProvider;
+        use super::super::{IsolatedProviderPermit, TokenProvider};
         use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
         use std::sync::{Arc, Condvar, Mutex};
 
@@ -482,6 +525,17 @@ mod tests {
                     set = self.cv.wait(set).unwrap();
                 }
             }
+        }
+
+        #[test]
+        fn worker_permits_are_bounded_and_released() {
+            let counter = AtomicUsize::new(0);
+            let first = IsolatedProviderPermit::acquire(&counter, 1).unwrap();
+            let err = IsolatedProviderPermit::acquire(&counter, 1).unwrap_err();
+            assert_eq!(err.code(), crate::ErrorCode::SocketError);
+            assert!(err.msg().contains("worker limit"));
+            drop(first);
+            assert!(IsolatedProviderPermit::acquire(&counter, 1).is_ok());
         }
 
         #[test]

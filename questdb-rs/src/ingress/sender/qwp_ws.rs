@@ -3354,6 +3354,21 @@ pub(crate) fn establish_connection(
     Ok((stream, handshake_result, leftover))
 }
 
+fn acquire_qwp_ws_provider_header(
+    provider: &crate::token_provider::TokenProvider,
+    connect_kind: QwpWsConnectKind,
+    traffic_gate: Option<&TrafficGate>,
+) -> crate::Result<String> {
+    if connect_kind.bounded_dial() {
+        match traffic_gate {
+            Some(gate) => provider.bearer_header_isolated_until(|| gate.is_shutdown()),
+            None => provider.bearer_header(),
+        }
+    } else {
+        provider.bearer_header()
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn connect_qwp_ws_endpoint_round<A: QwpWsHealthAccess>(
     endpoints: &Arc<[QwpWsEndpoint]>,
@@ -3388,20 +3403,9 @@ pub(crate) fn connect_qwp_ws_endpoint_round<A: QwpWsHealthAccess>(
     // accepted store-and-forward frames must remain drainable. InvalidApiCall is
     // a terminal caller-contract violation. Server authentication rejections
     // happen later in the handshake and remain terminal AuthErrors.
-    let provided_header = match qwp_ws.token_provider.as_ref() {
+    let mut provided_header = match qwp_ws.token_provider.as_ref() {
         Some(provider) => {
-            let acquired = if connect_kind.bounded_dial() {
-                match traffic_gate {
-                    // Arbitrary synchronous providers cannot be cancelled. Isolate
-                    // runner-owned acquisition so shutdown can abandon the result
-                    // and release the publication store / slot lock immediately.
-                    // The provider thread retains only its closure until it returns.
-                    Some(gate) => provider.bearer_header_isolated_until(|| gate.is_shutdown()),
-                    None => provider.bearer_header(),
-                }
-            } else {
-                provider.bearer_header()
-            };
+            let acquired = acquire_qwp_ws_provider_header(provider, connect_kind, traffic_gate);
             // Narrate before propagating. This returns above the endpoint loop,
             // so `auth_failed` (inside it) and `all_endpoints_unreachable`
             // (after it) are both unreachable from here: without this the round
@@ -3432,7 +3436,7 @@ pub(crate) fn connect_qwp_ws_endpoint_round<A: QwpWsHealthAccess>(
         }
         None => None,
     };
-    let auth_header = provided_header.as_deref().or(auth_header);
+    let static_auth_header = auth_header;
 
     let mut last_role_mismatch = None;
     let mut last_transport_failure: Option<(usize, crate::Error)> = None;
@@ -3448,19 +3452,49 @@ pub(crate) fn connect_qwp_ws_endpoint_round<A: QwpWsHealthAccess>(
     // contender can claim the just-reset round before this caller does.
     // Do this only for the first pick so failed attempts terminate normally.
     let mut first_pick = true;
+    let mut auth_rotation_retry_used = false;
     while let Some(idx) = health.with_tracker(|t| t.pick_next_and_claim_connect_round(first_pick)) {
         first_pick = false;
         let endpoint = &endpoints[idx];
-        let connected = establish_connection(
+        let mut connected = establish_connection(
             &endpoint.host,
             &endpoint.port,
             use_tls,
             tls_settings.clone(),
             connect_kind,
             qwp_ws,
-            auth_header,
+            provided_header.as_deref().or(static_auth_header),
             traffic_gate,
         );
+        // A credential can expire during DNS/TCP/TLS setup. Resolve once more
+        // after a definite 401 and replay this endpoint only when the rotating
+        // provider actually supplies a changed header. Static credentials, 403,
+        // unchanged values, and a second 401 remain terminal.
+        if matches!(&connected, Err(err) if err.ws_http_status() == Some(401))
+            && !auth_rotation_retry_used
+            && let Some(provider) = qwp_ws.token_provider.as_ref()
+        {
+            auth_rotation_retry_used = true;
+            let rotated = acquire_qwp_ws_provider_header(provider, connect_kind, traffic_gate)
+                .inspect_err(|err| {
+                    if let Some(events) = events {
+                        events.token_provider_failed(err, events.next_attempt());
+                    }
+                })?;
+            if Some(rotated.as_str()) != provided_header.as_deref() {
+                provided_header = Some(rotated);
+                connected = establish_connection(
+                    &endpoint.host,
+                    &endpoint.port,
+                    use_tls,
+                    tls_settings.clone(),
+                    connect_kind,
+                    qwp_ws,
+                    provided_header.as_deref(),
+                    traffic_gate,
+                );
+            }
+        }
         if traffic_gate.is_some_and(TrafficGate::is_shutdown) {
             return Err(match connected {
                 Ok(_) => error::fmt!(

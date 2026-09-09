@@ -55,9 +55,9 @@ fn main() -> Result<()> {
     // Parse host:port out of the QuestDB URL for the sender.
     let (host, port) = split_host_port(&url);
 
-    // Pass a token provider, not a fixed string: the sender pulls a freshly
-    // refreshed token on each request, so a long-lived sender keeps working as
-    // the token rotates.
+    // Pass a token provider, not a fixed string: the sender resolves it once
+    // per flush, reuses that value for ordinary retries, and resolves once more
+    // only after a 401 when the credential may have rotated.
     let mut sender = SenderBuilder::new(Protocol::Https, host, port)
         .http_token_provider({
             let auth = Arc::clone(&auth);

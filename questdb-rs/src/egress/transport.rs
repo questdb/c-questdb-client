@@ -673,6 +673,7 @@ fn map_http_reject(reject: HttpReject) -> Error {
         code,
         format!("WebSocket handshake failed with HTTP {}", status),
     )
+    .with_ws_http_status(status)
 }
 
 /// Extract `X-QuestDB-Role` (and the optional `X-QuestDB-Zone`) from a

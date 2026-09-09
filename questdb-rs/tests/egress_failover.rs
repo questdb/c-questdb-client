@@ -2793,6 +2793,29 @@ fn initial_connect_bails_immediately_on_auth_error() {
 }
 
 #[test]
+fn initial_connect_retries_same_endpoint_once_with_rotated_token() {
+    let srv = MockServer::start(vec![
+        vec![Action::Reject401],
+        happy_script(ServerRole::Standalone, "a"),
+    ]);
+    let calls = Arc::new(AtomicUsize::new(0));
+    let cfg = questdb::egress::ReaderConfig::from_conf(format!("ws::addr={}", srv.url()))
+        .unwrap()
+        .token_provider({
+            let calls = Arc::clone(&calls);
+            move || {
+                let n = calls.fetch_add(1, Ordering::SeqCst);
+                Ok::<_, questdb::Error>(if n == 0 { "stale" } else { "fresh" }.to_string())
+            }
+        })
+        .unwrap();
+
+    let _reader = Reader::from_config(&cfg).expect("changed token should recover one 401");
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
+    assert_eq!(srv.accepts(), 2, "the same endpoint must be replayed once");
+}
+
+#[test]
 fn initial_provider_failure_does_not_dial_any_endpoint() {
     let srv_a = MockServer::start(vec![happy_script(ServerRole::Standalone, "a")]);
     let srv_b = MockServer::start(vec![happy_script(ServerRole::Standalone, "b")]);

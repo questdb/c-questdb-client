@@ -3098,6 +3098,12 @@ struct WalkOutcome {
 /// or config-level (bad URL / unresolved name). Retrying every host
 /// against any of these floods server logs without recovery, so the
 /// walk bails on the first occurrence per spec §6 / §11.9.3.
+fn authorization_header<'a>(headers: &'a [(&'static str, String)]) -> Option<&'a str> {
+    headers
+        .iter()
+        .find_map(|(name, value)| (*name == "Authorization").then_some(value.as_str()))
+}
+
 fn walk_via_tracker(
     tracker: &mut HostHealthTracker,
     cfg: &Arc<ReaderConfig>,
@@ -3115,7 +3121,8 @@ fn walk_via_tracker(
     // and immediately discard one socket per endpoint (or twice per endpoint
     // when the reconnect fall-through pass runs). The next outer reconnect
     // round calls this function again and therefore polls the provider afresh.
-    let upgrade_headers = cfg.upgrade_headers()?;
+    let mut upgrade_headers = cfg.upgrade_headers()?;
+    let mut auth_rotation_retry_used = false;
     let mut last_role_mismatch: Option<Error> = None;
     let mut last_transport_err: Option<Error> = None;
     let mut retried_after_reset = false;
@@ -3137,7 +3144,25 @@ fn walk_via_tracker(
             }
         };
         dials = dials.saturating_add(1);
-        match Reader::connect_endpoint(cfg.as_ref(), idx, &upgrade_headers) {
+        let mut connected = Reader::connect_endpoint(cfg.as_ref(), idx, &upgrade_headers);
+        // A valid credential can expire during endpoint setup. On one definite
+        // 401, ask only a rotating provider for a fresh header and replay this
+        // same endpoint once when the value changed. Endpoint failover still
+        // reuses one cluster-wide credential and all other auth failures remain
+        // terminal.
+        if matches!(&connected, Err(err) if err.ws_http_status() == Some(401))
+            && !auth_rotation_retry_used
+            && cfg.token_provider.is_some()
+        {
+            auth_rotation_retry_used = true;
+            let rotated_headers = cfg.upgrade_headers()?;
+            if authorization_header(&rotated_headers) != authorization_header(&upgrade_headers) {
+                upgrade_headers = rotated_headers;
+                dials = dials.saturating_add(1);
+                connected = Reader::connect_endpoint(cfg.as_ref(), idx, &upgrade_headers);
+            }
+        }
+        match connected {
             Ok(session) => {
                 // Update zone tier from `SERVER_INFO.zone_id` when the
                 // server advertised one (gated by `CAP_ZONE`). `record_zone`
