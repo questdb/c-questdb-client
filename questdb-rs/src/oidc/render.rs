@@ -168,17 +168,26 @@ impl DeviceCodeChallenge {
     }
 }
 
-/// Receives device-flow sign-in events so they can be presented to the user.
+/// Receives token-store persistence warnings.
 ///
-/// Every method has a no-op default, so a custom renderer overrides only what it
-/// needs. The callbacks receive **untrusted, MITM-tamperable IdP fields**; a
-/// custom renderer that writes them to a terminal must sanitise them itself;
-/// echoing them raw re-opens the prompt-spoofing
-/// surface the built-in [`TerminalRenderer`] closes.
+/// Kept separate from [`Renderer`] because, unlike sign-in events, these may
+/// be raised on a background transport/provider thread during silent refresh.
+/// A handler must return promptly and must not re-enter the auth object that
+/// raised it.
 pub trait DiagnosticHandler: Send + Sync {
-    /// Report a best-effort persistence operation that failed while the
-    /// in-memory credential remains usable. Messages are display-sanitized and
-    /// bounded, but custom stores must not include token values in errors.
+    /// Report a token-store operation that failed.
+    ///
+    /// Receiving this says nothing about whether the surrounding call
+    /// succeeded, so a handler must not infer either outcome from it. A failed
+    /// save or automatic clear is best-effort: it is reported here only, and
+    /// the in-memory credential stays usable. A load, or a lost refresh lease,
+    /// additionally fails the call with an
+    /// [`OidcErrorKind::Network`](crate::oidc::OidcErrorKind::Network) error,
+    /// because an uncoordinated refresh could resubmit a rotating parent
+    /// token. The message names the operation in both cases.
+    ///
+    /// Messages are display-sanitized and bounded, but custom stores must not
+    /// include token values in errors.
     fn on_persistence_warning(&self, message: &str);
 }
 
@@ -193,6 +202,13 @@ impl DiagnosticHandler for TerminalDiagnosticHandler {
     }
 }
 
+/// Receives device-flow sign-in events so they can be presented to the user.
+///
+/// Every method has a no-op default, so a custom renderer overrides only what it
+/// needs. The callbacks receive **untrusted, MITM-tamperable IdP fields**; a
+/// custom renderer that writes them to a terminal must sanitise them itself;
+/// echoing them raw re-opens the prompt-spoofing
+/// surface the built-in [`TerminalRenderer`] closes.
 pub trait Renderer: Send + Sync {
     /// Show the sign-in prompt at the start of the device flow.
     fn on_prompt(&self, challenge: &DeviceCodeChallenge) {

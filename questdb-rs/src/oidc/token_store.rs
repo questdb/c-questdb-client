@@ -44,7 +44,9 @@
 //! Rust applications receive the default stderr warning unless they install a
 //! custom handler; C/C++ can register the dedicated diagnostic callback and the
 //! Python binding forwards it to the `questdb` logger. The same channel covers
-//! best-effort save and automatic-clear failures.
+//! every failed store operation: save and automatic clear are reported there
+//! and nowhere else, while a load or a lost refresh lease is reported there
+//! *and* returned to the caller as a network error.
 //!
 //! # Security
 //!

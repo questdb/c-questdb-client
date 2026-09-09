@@ -3080,6 +3080,14 @@ struct WalkOutcome {
     dials: u32,
 }
 
+/// The `Authorization` header value from an upgrade header set, if present.
+/// Used to tell a rotated credential from an unchanged one after a 401.
+fn authorization_header<'a>(headers: &'a [(&'static str, String)]) -> Option<&'a str> {
+    headers
+        .iter()
+        .find_map(|(name, value)| (*name == "Authorization").then_some(value.as_str()))
+}
+
 /// Walk the tracker until either an endpoint accepts or the round is
 /// exhausted. Shared between [`Reader::from_config`] (initial connect)
 /// and [`Reader::reconnect_with_failover`] (mid-query failover).
@@ -3098,12 +3106,6 @@ struct WalkOutcome {
 /// or config-level (bad URL / unresolved name). Retrying every host
 /// against any of these floods server logs without recovery, so the
 /// walk bails on the first occurrence per spec §6 / §11.9.3.
-fn authorization_header<'a>(headers: &'a [(&'static str, String)]) -> Option<&'a str> {
-    headers
-        .iter()
-        .find_map(|(name, value)| (*name == "Authorization").then_some(value.as_str()))
-}
-
 fn walk_via_tracker(
     tracker: &mut HostHealthTracker,
     cfg: &Arc<ReaderConfig>,
