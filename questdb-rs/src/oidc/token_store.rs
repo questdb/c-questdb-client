@@ -457,6 +457,26 @@ pub trait TokenStore: Send + Sync {
         result
     }
 
+    /// Whether this store can hold a credential, asked before an interactive
+    /// sign-in starts.
+    ///
+    /// Persistence is opt-in, but a store that can never enforce owner-only
+    /// access silently does nothing: the write refuses, the refusal is only
+    /// `log::warn!`-ed, and neither the C nor the Python binding installs a
+    /// subscriber -- so the whole device flow re-ran on every process start
+    /// with no error, no exception and no output anywhere. Answering here lets
+    /// `sign_in` report it while the user is present and before they have been
+    /// shown a code, which is the difference between an actionable message and
+    /// an unexplained loop.
+    ///
+    /// The default is `Ok(())`: a custom store managing its own medium has
+    /// nothing to pre-check, and a store that only fails transiently should
+    /// keep failing at write time, where the failure is warned and the
+    /// in-process credential still works.
+    fn preflight(&self, _cancelled: &dyn Fn() -> bool) -> TokenStoreResult<()> {
+        Ok(())
+    }
+
     /// Cancellable form of [`clear`](Self::clear). See
     /// [`load_cancellable`](Self::load_cancellable).
     fn clear_cancellable(
@@ -970,6 +990,29 @@ impl FileTokenStore {
         self.directory.join(UNTRUSTED_SENTINEL_NAME)
     }
 
+    /// The refusal shared by `save_cancellable` and `preflight`, so the
+    /// condition is described identically whether it is met before a device
+    /// flow starts or on the write that follows it.
+    fn persist_refused_error(&self) -> Box<dyn std::error::Error + Send + Sync> {
+        Box::new(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            format!(
+                "refusing to persist an OIDC token into {}: the directory is \
+                 writable by users other than its owner and could not be \
+                 restricted, or it is still marked untrusted from an earlier \
+                 run whose cleanup could not complete, so anything read back \
+                 from it is not trusted. \
+                 Persisting would leave a plaintext refresh token on disk that \
+                 this client will never use. This is usual on a filesystem that \
+                 cannot represent POSIX permissions (WSL drvfs without metadata, \
+                 CIFS/SMB with a fixed file_mode, vfat/exFAT) -- choose a store \
+                 directory on a native filesystem, or omit the token store to \
+                 keep credentials in memory only.",
+                self.directory.display(),
+            ),
+        ))
+    }
+
     fn with_directory_lock<T>(
         &self,
         cancelled: &dyn Fn() -> bool,
@@ -1175,6 +1218,20 @@ impl FileTokenStore {
         Ok(())
     }
 
+    /// Take the directory lock exactly as a save would, and answer the same
+    /// `may_persist` question against the trust verdict that produces. Running
+    /// the real lock path rather than a cheaper stat is the point: it is what
+    /// repairs a one-off loose directory to 0700, so a preflight that a save
+    /// would have survived does not fail.
+    fn preflight_store(&self, cancelled: &dyn Fn() -> bool) -> TokenStoreResult<()> {
+        self.with_directory_lock(cancelled, |trusted, _| {
+            if may_persist(trusted, &self.directory, &self.untrusted_sentinel()) {
+                return Ok(());
+            }
+            Err(self.persist_refused_error())
+        })
+    }
+
     fn clear_under_lock(
         &self,
         key: &TokenStoreKey,
@@ -1199,6 +1256,10 @@ impl FileTokenStore {
 impl TokenStore for FileTokenStore {
     fn load(&self, key: &TokenStoreKey) -> TokenStoreResult<Option<PersistedToken>> {
         self.load_cancellable(key, &never_cancelled)
+    }
+
+    fn preflight(&self, cancelled: &dyn Fn() -> bool) -> TokenStoreResult<()> {
+        self.preflight_store(cancelled)
     }
 
     fn load_cancellable(
@@ -1275,24 +1336,7 @@ impl TokenStore for FileTokenStore {
             // treats a save failure as a warning and still completes the
             // sign-in, so this costs no functionality.
             if !may_persist(trusted, &self.directory, &self.untrusted_sentinel()) {
-                return Err(Box::new(std::io::Error::new(
-                    std::io::ErrorKind::PermissionDenied,
-                    format!(
-                        "refusing to persist an OIDC token into {}: the directory is \
-                         writable by users other than its owner and could not be \
-                         restricted, or it is still marked untrusted from an earlier \
-                         run whose cleanup could not complete, so anything read back \
-                         from it is not trusted. \
-                         Persisting would leave a plaintext refresh token on disk that \
-                         this client will never use. This is usual on a filesystem that \
-                         cannot represent POSIX permissions (WSL drvfs without metadata, \
-                         CIFS/SMB with a fixed file_mode, vfat/exFAT) -- choose a store \
-                         directory on a native filesystem, or omit the token store to \
-                         keep credentials in memory only.",
-                        self.directory.display(),
-                    ),
-                ))
-                    as Box<dyn std::error::Error + Send + Sync>);
+                return Err(self.persist_refused_error());
             }
             self.sweep_orphan_temps(key, true, heartbeat)?;
             self.save_under_lock(key, &content, heartbeat)

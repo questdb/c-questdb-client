@@ -1174,6 +1174,15 @@ impl OidcDeviceAuth {
                  explicitly before starting the transport.",
             ));
         }
+        // Ask the store whether it can hold what this flow is about to produce,
+        // before the user is shown a code. A store that can never enforce
+        // owner-only access refuses the write, and that refusal is only
+        // `log::warn!`-ed into a facade no shipped binding subscribes to -- so
+        // the flow completed, persisted nothing, and re-ran in full on the next
+        // process start with nothing reported anywhere. Persistence is opt-in,
+        // so the caller who asked for it is told it is unavailable while the
+        // answer is still actionable.
+        self.preflight_token_store()?;
         self.interactive_in_progress
             .store(true, AtomicOrdering::Release);
         let fresh_result = {
@@ -1614,6 +1623,32 @@ impl OidcDeviceAuth {
     /// completed and the human has authorized, so a `close()` arriving now must
     /// not cost the credential. Uncancellable, and it does not consult
     /// `ensure_open()` before the write -- the caller re-checks afterwards.
+    /// Fail an about-to-start device flow when the configured token store
+    /// cannot persist a credential.
+    ///
+    /// Only the permanent condition is reported: a transient write failure
+    /// (a full disk, EMFILE, an NFS blip) still warns and completes, because
+    /// failing an ingestion path over a persistence problem would be worse
+    /// than the problem. This runs only on the interactive path, so a `token()`
+    /// served from cache or a silent refresh never pays for the directory lock.
+    fn preflight_token_store(&self) -> Result<()> {
+        let Some(store) = self.token_store.as_ref() else {
+            return Ok(());
+        };
+        let cancelled = || self.is_closed();
+        let result = store.preflight(&cancelled);
+        // A `close()` landing during the preflight is a cancellation, not a
+        // misconfigured store; let `ensure_open` classify it.
+        self.ensure_open()?;
+        result.map_err(|e| {
+            OidcError::config(format!(
+                "The configured OIDC token store cannot persist a credential, so \
+                 signing in would store nothing and the device flow would run \
+                 again on every start: {e}"
+            ))
+        })
+    }
+
     fn persist_fresh_durable(&self, tokens: &TokenSet) -> Result<()> {
         let (Some(store), Some(key)) = (self.token_store.as_ref(), self.store_key.as_ref()) else {
             return Ok(());
@@ -1912,6 +1947,15 @@ impl OidcDeviceAuth {
         // response advertised. Cleared by every poll that does not raise it, so
         // a raise early in a long flow does not colour an expiry much later.
         let mut interval_raised = false;
+        // The last poll failure that never reached the token endpoint, and
+        // whether any poll ever did. A status-less transport error is retried
+        // until the code expires (see the arm below), which is right for a blip
+        // but wrong for a token endpoint that is misconfigured, unresolvable or
+        // firewalled: every poll fails the same way, none of it is recorded,
+        // and the expiry below then blames the user for not authorizing. Keep
+        // the cause so the expiry can name it instead.
+        let mut last_unsent_error: Option<String> = None;
+        let mut reached_token_endpoint = false;
 
         loop {
             self.ensure_open()?;
@@ -1921,6 +1965,26 @@ impl OidcDeviceAuth {
                 // fresh sign-in is the only recovery, so the `expired_token`
                 // tag callers key on is unchanged -- but say which of the two
                 // caused it.
+                // Nothing ever got through to the token endpoint, so the
+                // authorization was never checked even once. Keep the terminal
+                // class and the `expired_token` tag -- the code is still gone
+                // and a fresh sign-in is still the only recovery -- but report
+                // the transport failure that actually ended the flow rather
+                // than implying the user walked away.
+                match last_unsent_error.as_deref() {
+                    Some(cause) if !reached_token_endpoint => {
+                        self.renderer
+                            .on_failure("Sign-in failed: the token endpoint was never reachable.");
+                        return Err(OidcError::timeout(format!(
+                            "No poll of the token endpoint completed before the device \
+                             code expired, so the authorization was never checked. The \
+                             last failure was: {cause}. Verify the token endpoint and \
+                             its network reachability, then run the sign-in again."
+                        ))
+                        .with_idp_error(Some("expired_token"), None));
+                    }
+                    _ => {}
+                }
                 if let Some(interval) = pause_outlived_code {
                     self.renderer.on_failure(&format!(
                         "Sign-in stopped: the identity provider required a {interval}s \
@@ -1988,6 +2052,7 @@ impl OidcDeviceAuth {
             {
                 Ok(result) => {
                     self.ensure_open()?;
+                    reached_token_endpoint = true;
                     result
                 }
                 Err(e) => {
@@ -2010,6 +2075,12 @@ impl OidcDeviceAuth {
                     // other transient poll failures: keep polling until the
                     // device code expires. This also lets a temporarily
                     // unreachable token endpoint recover during an active flow.
+                    // Retain the cause: if no poll ever reaches the endpoint,
+                    // the expiry branch reports this instead of "you did not
+                    // authorize in time".
+                    if e.status().is_none() {
+                        last_unsent_error = Some(e.to_string());
+                    }
                     if e.request_timed_out() {
                         let previous = interval;
                         interval = backoff(interval, None, true);

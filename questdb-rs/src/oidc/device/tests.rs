@@ -4696,3 +4696,262 @@ fn refresh_backoff_escalates_and_caps() {
     state.record_refresh_failure(start);
     assert!(!state.refresh_backed_off(start + Duration::from_secs(5)));
 }
+
+// -- review fixes ------------------------------------------------------------
+
+/// A device flow whose polls never reach the token endpoint must say so, not
+/// report that the user failed to authorize in time.
+///
+/// A status-less transport error is retried until the code dies -- right for a
+/// blip, and matching Java -- but the loop kept no record of the cause, so a
+/// `token_endpoint` that is misconfigured, unresolvable or firewalled polled
+/// silently for up to the code's lifetime (`MAX_DEVICE_CODE_LIFETIME`, 1800s)
+/// and then blamed the user. The retry policy is unchanged; only the cause
+/// reported at expiry is.
+#[test]
+fn expiry_names_the_transport_failure_when_no_poll_ever_landed() {
+    let mock = MockServer::start(move |method, path, _body| match (method, path) {
+        ("POST", "/device") => (
+            200,
+            serde_json::json!({
+                "device_code": "DEV-CODE-123",
+                "user_code": "WXYZ-1234",
+                "verification_uri": "https://idp.example.com/activate",
+                "expires_in": 1,
+                "interval": 5
+            })
+            .to_string(),
+        ),
+        // 0 == drop the connection, so the poll fails with no HTTP status.
+        ("POST", "/token") => (0, String::new()),
+        _ => (404, "{}".to_string()),
+    });
+    let base = Instant::now();
+    let virtual_ns = Arc::new(AtomicU64::new(0));
+    let now_ns = Arc::clone(&virtual_ns);
+    let sleep_ns = Arc::clone(&virtual_ns);
+    let auth = OidcDeviceAuth::builder()
+        .client_id("questdb")
+        .device_authorization_endpoint(mock.url("/device"))
+        .token_endpoint(mock.url("/token"))
+        .scope("openid")
+        .interactive(true)
+        .open_browser(false)
+        .now_hook(Arc::new(move || {
+            base + Duration::from_nanos(now_ns.load(Ordering::SeqCst))
+        }))
+        .sleep_hook(Arc::new(move |d: Duration| {
+            sleep_ns.fetch_add(d.as_nanos() as u64, Ordering::SeqCst);
+        }))
+        .build()
+        .expect("build");
+
+    let err = auth.sign_in().unwrap_err();
+    assert!(
+        err.message()
+            .contains("No poll of the token endpoint completed"),
+        "expiry must name the transport failure, got: {}",
+        err.message()
+    );
+    assert!(
+        !err.message()
+            .contains("expired before authorization completed"),
+        "must not blame the user for not authorizing: {}",
+        err.message()
+    );
+    // Unchanged terminal classification: the code is still gone and a fresh
+    // sign-in is still the only recovery, so anything keying on these is safe.
+    assert_eq!(err.kind(), OidcErrorKind::Timeout);
+    assert_eq!(err.idp_error(), Some("expired_token"));
+}
+
+/// The counterpart: once a poll *has* reached the endpoint, an expiry is a
+/// genuine "nobody authorized" and must keep saying so.
+#[test]
+fn expiry_still_reports_authorization_pending_when_polls_landed() {
+    let mock = MockServer::start(|method, path, _body| match (method, path) {
+        ("POST", "/device") => (200, device_response_short()),
+        ("POST", "/token") => (400, r#"{"error":"authorization_pending"}"#.to_string()),
+        _ => (404, "{}".to_string()),
+    });
+    let base = Instant::now();
+    let virtual_ns = Arc::new(AtomicU64::new(0));
+    let now_ns = Arc::clone(&virtual_ns);
+    let sleep_ns = Arc::clone(&virtual_ns);
+    let auth = OidcDeviceAuth::builder()
+        .client_id("questdb")
+        .device_authorization_endpoint(mock.url("/device"))
+        .token_endpoint(mock.url("/token"))
+        .scope("openid")
+        .interactive(true)
+        .open_browser(false)
+        .now_hook(Arc::new(move || {
+            base + Duration::from_nanos(now_ns.load(Ordering::SeqCst))
+        }))
+        .sleep_hook(Arc::new(move |d: Duration| {
+            sleep_ns.fetch_add(d.as_nanos() as u64, Ordering::SeqCst);
+        }))
+        .build()
+        .expect("build");
+
+    let err = auth.sign_in().unwrap_err();
+    assert!(
+        err.message()
+            .contains("expired before authorization completed"),
+        "a reached endpoint must keep the ordinary expiry message, got: {}",
+        err.message()
+    );
+    assert_eq!(err.kind(), OidcErrorKind::Timeout);
+}
+
+/// A store that can never hold a credential must fail the sign-in before the
+/// user is shown a code, rather than completing and persisting nothing.
+///
+/// `save` already refused, but the refusal was only `log::warn!`-ed into a
+/// facade neither the C nor the Python binding subscribes to: the flow
+/// succeeded, wrote nothing, and re-ran in full on every process start with no
+/// error, no exception and no output anywhere.
+#[derive(Default)]
+struct PreflightRefusingStore {
+    preflights: Arc<AtomicUsize>,
+    saves: Arc<AtomicUsize>,
+}
+
+impl TokenStore for PreflightRefusingStore {
+    fn load(&self, _key: &TokenStoreKey) -> TokenStoreResult<Option<PersistedToken>> {
+        Ok(None)
+    }
+
+    fn save(&self, _key: &TokenStoreKey, _token: &PersistedToken) -> TokenStoreResult<()> {
+        self.saves.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    }
+
+    fn clear(&self, _key: &TokenStoreKey) -> TokenStoreResult<()> {
+        Ok(())
+    }
+
+    fn in_lock(
+        &self,
+        _key: &TokenStoreKey,
+        action: &mut dyn FnMut() -> TokenStoreResult<()>,
+    ) -> TokenStoreResult<()> {
+        action()
+    }
+
+    fn preflight(&self, _cancelled: &dyn Fn() -> bool) -> TokenStoreResult<()> {
+        self.preflights.fetch_add(1, Ordering::SeqCst);
+        Err(Box::new(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "refusing to persist: the directory could not be restricted",
+        )))
+    }
+}
+
+/// A store with no `preflight` override, proving the trait default is a no-op
+/// and that only an opting-in store changes `sign_in`'s behaviour.
+#[derive(Default)]
+struct SilentStore {
+    saves: Arc<AtomicUsize>,
+}
+
+impl TokenStore for SilentStore {
+    fn load(&self, _key: &TokenStoreKey) -> TokenStoreResult<Option<PersistedToken>> {
+        Ok(None)
+    }
+
+    fn in_lock(
+        &self,
+        _key: &TokenStoreKey,
+        action: &mut dyn FnMut() -> TokenStoreResult<()>,
+    ) -> TokenStoreResult<()> {
+        action()
+    }
+
+    fn save(&self, _key: &TokenStoreKey, _token: &PersistedToken) -> TokenStoreResult<()> {
+        self.saves.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    }
+
+    fn clear(&self, _key: &TokenStoreKey) -> TokenStoreResult<()> {
+        Ok(())
+    }
+}
+
+#[test]
+fn sign_in_refuses_a_token_store_that_cannot_persist() {
+    let device_calls = Arc::new(AtomicUsize::new(0));
+    let mock = persistence_mock(Arc::clone(&device_calls), || {
+        r#"{"access_token":"AT-refreshed","refresh_token":"RT-2","expires_in":300}"#.to_string()
+    });
+
+    let preflights = Arc::new(AtomicUsize::new(0));
+    let saves = Arc::new(AtomicUsize::new(0));
+    let auth = OidcDeviceAuth::builder()
+        .client_id("questdb")
+        .device_authorization_endpoint(mock.url("/device"))
+        .token_endpoint(mock.url("/token"))
+        .scope("openid")
+        .interactive(true)
+        .open_browser(false)
+        .sleep_hook(no_sleep())
+        .token_store(PreflightRefusingStore {
+            preflights: Arc::clone(&preflights),
+            saves: Arc::clone(&saves),
+        })
+        .build()
+        .expect("build auth with refusing store");
+
+    let err = auth
+        .sign_in()
+        .expect_err("an unusable store must fail the sign-in");
+    assert_eq!(err.kind(), OidcErrorKind::Config, "{err}");
+    assert!(
+        err.message().contains("cannot persist a credential"),
+        "the error must say persistence is what failed: {}",
+        err.message()
+    );
+    assert!(
+        err.message().contains("could not be restricted"),
+        "the store's own reason must be carried through: {}",
+        err.message()
+    );
+    assert_eq!(preflights.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        device_calls.load(Ordering::SeqCst),
+        0,
+        "the preflight must run before the device flow, so no code is ever shown"
+    );
+    assert_eq!(saves.load(Ordering::SeqCst), 0);
+}
+
+#[test]
+fn sign_in_is_unaffected_by_a_store_that_does_not_override_preflight() {
+    let device_calls = Arc::new(AtomicUsize::new(0));
+    let mock = persistence_mock(Arc::clone(&device_calls), || {
+        r#"{"access_token":"AT-refreshed","refresh_token":"RT-2","expires_in":300}"#.to_string()
+    });
+    let saves = Arc::new(AtomicUsize::new(0));
+    let auth = OidcDeviceAuth::builder()
+        .client_id("questdb")
+        .device_authorization_endpoint(mock.url("/device"))
+        .token_endpoint(mock.url("/token"))
+        .scope("openid")
+        .interactive(true)
+        .open_browser(false)
+        .sleep_hook(no_sleep())
+        .token_store(SilentStore {
+            saves: Arc::clone(&saves),
+        })
+        .build()
+        .expect("build auth with silent store");
+
+    auth.sign_in()
+        .expect("the default preflight must be a no-op");
+    assert_eq!(device_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        saves.load(Ordering::SeqCst),
+        1,
+        "the credential is persisted"
+    );
+}
