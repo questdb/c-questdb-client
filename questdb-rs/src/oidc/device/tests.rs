@@ -2360,16 +2360,28 @@ fn device_response_short() -> String {
 
 #[test]
 fn expired_token_error_returns_timeout() {
-    // The IdP reports the code expired via the OAuth error body → Timeout kind.
-    let mock = MockServer::start(|method, path, _body| match (method, path) {
+    // The IdP reports the code expired via the OAuth error body → Timeout kind,
+    // while the response's structured diagnostics remain available to bindings.
+    let mock = MockServer::start(|method, path, _body| {
+        match (method, path) {
         ("POST", "/device") => (200, device_response()),
-        ("POST", "/token") => (400, r#"{"error":"expired_token"}"#.to_string()),
+        ("POST", "/token") => (
+            400,
+            r#"{"error":"expired_token","error_description":"The device code is no longer valid."}"#
+                .to_string(),
+        ),
         _ => (404, "{}".to_string()),
+    }
     });
     let auth = explicit_auth(&mock, false);
     let err = auth.sign_in().unwrap_err();
     assert_eq!(err.kind(), OidcErrorKind::Timeout);
     assert_eq!(err.idp_error(), Some("expired_token"));
+    assert_eq!(
+        err.idp_error_description(),
+        Some("The device code is no longer valid.")
+    );
+    assert_eq!(err.status(), Some(400));
 }
 
 #[test]

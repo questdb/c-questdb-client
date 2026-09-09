@@ -2244,7 +2244,11 @@ impl OidcDeviceAuth {
                         "The device code expired before authorization completed. Run \
                          the sign-in again.",
                     )
-                    .with_idp_error(Some("expired_token"), None));
+                    .with_idp_error(
+                        Some("expired_token"),
+                        body.get("error_description").and_then(Value::as_str),
+                    )
+                    .with_status(Some(status)));
                 }
                 error => {
                     let description = body
