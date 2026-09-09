@@ -119,7 +119,9 @@ typedef struct questdb_oidc_event
  *
  * The two cases are distinguished in the error message: a caller on the
  * callback's own thread is told it re-entered, while a caller on another thread
- * is told the provider is busy. `close` is never rejected either way.
+ * is told the provider is busy. `questdb_oidc_auth_cancel_sign_in` and `close`
+ * are never rejected either way. Use the former for an ordinary UI "cancel":
+ * it aborts only this device flow and leaves the shared provider usable.
  */
 typedef void (*questdb_oidc_event_cb)(
     void* user_data, const questdb_oidc_event* event);
@@ -376,6 +378,29 @@ questdb_oidc_auth* questdb_oidc_auth_clone(
     const questdb_oidc_auth* auth, questdb_error** err_out);
 QUESTDB_CLIENT_API
 void questdb_oidc_auth_free(questdb_oidc_auth* auth);
+
+/**
+ * Cancel only the interactive device flow currently running in
+ * `questdb_oidc_auth_sign_in`.
+ *
+ * This is attempt-scoped: the active sign-in returns a
+ * `QUESTDB_OIDC_ERROR_CANCELLED` error, but the shared provider remains open,
+ * cached credentials are not discarded, and attached senders, readers and
+ * pools remain usable. A later sign-in on the same provider can succeed. If no
+ * device flow is running, this is an idempotent no-op that does not affect the
+ * next sign-in.
+ *
+ * Safe to call from any thread, including this auth's own event callback and
+ * while that callback is waiting behind a sibling built from the same reusable
+ * builder. An HTTP request already in flight is not cancelled at the transport
+ * layer, so the sign-in stops after that bounded request returns.
+ *
+ * Use `questdb_oidc_auth_close` instead only to permanently disable the shared
+ * provider and every attached transport.
+ */
+QUESTDB_CLIENT_API
+bool questdb_oidc_auth_cancel_sign_in(
+    const questdb_oidc_auth* auth, questdb_error** err_out);
 
 /**
  * Permanently close this shared auth state. Cancels a device flow or bundled

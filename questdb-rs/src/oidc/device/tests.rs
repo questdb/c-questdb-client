@@ -372,6 +372,71 @@ fn close_cancels_device_polling_and_disables_shared_auth() {
 }
 
 #[test]
+fn cancel_sign_in_aborts_only_the_current_device_flow() {
+    let (polling_tx, polling_rx) = mpsc::sync_channel(1);
+    let authorized = Arc::new(AtomicBool::new(false));
+    let mock = {
+        let authorized = Arc::clone(&authorized);
+        MockServer::start(move |method, path, _body| match (method, path) {
+            ("POST", "/device") => (200, device_response()),
+            ("POST", "/token") if authorized.load(Ordering::Acquire) => (
+                200,
+                r#"{"access_token":"AT-after-cancel","expires_in":300}"#.to_string(),
+            ),
+            ("POST", "/token") => {
+                let _ = polling_tx.try_send(());
+                (400, r#"{"error":"authorization_pending"}"#.to_string())
+            }
+            _ => (404, "{}".to_string()),
+        })
+    };
+    // Production polling waits on the cancellation condvar; a synthetic sleep
+    // would not prove that cancel_sign_in wakes the five-second interval.
+    let auth = Arc::new(
+        OidcDeviceAuth::builder()
+            .client_id("questdb")
+            .device_authorization_endpoint(mock.url("/device"))
+            .token_endpoint(mock.url("/token"))
+            .scope("openid")
+            .interactive(true)
+            .open_browser(false)
+            .timeout(Duration::from_secs(5))
+            .build()
+            .expect("build auth"),
+    );
+    let worker_auth = Arc::clone(&auth);
+    let worker = std::thread::spawn(move || worker_auth.sign_in());
+
+    polling_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("sign-in did not reach token polling");
+    let started = Instant::now();
+    auth.cancel_sign_in();
+    let error = worker.join().expect("sign-in thread panicked").unwrap_err();
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "attempt cancellation waited out the device poll interval"
+    );
+    assert_eq!(error.kind(), OidcErrorKind::Cancelled);
+    assert!(error.message().contains("provider remains open"));
+    assert!(
+        !auth.is_closed(),
+        "attempt cancellation must not close auth"
+    );
+    assert_eq!(
+        auth.token().unwrap_err().kind(),
+        OidcErrorKind::InteractionRequired,
+        "attached token consumers must see a recoverable missing credential"
+    );
+
+    // Cancellation while idle is a no-op and must not poison the next flow.
+    auth.cancel_sign_in();
+    authorized.store(true, Ordering::Release);
+    auth.sign_in().expect("same provider must be reusable");
+    assert_eq!(auth.token().unwrap(), "AT-after-cancel");
+}
+
+#[test]
 fn close_cancels_file_store_lock_wait() {
     let dir = TempDir::new().unwrap();
     let store = FileTokenStore::at(dir.path());

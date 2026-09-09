@@ -222,14 +222,15 @@ impl SharedOidcAuth {
     /// This thread is the one inside the callback: it already holds the
     /// acquisition lock, so any operation needing it would deadlock on itself.
     ///
-    /// `close` is absent from the list on purpose -- it is never rejected, and
-    /// is exactly what a renderer's "cancel" affordance is supposed to call.
+    /// `cancel_sign_in` and `close` are absent from the list on purpose: both
+    /// are safe here. A renderer's ordinary "cancel" affordance should use the
+    /// attempt-scoped former; close remains the permanent lifecycle operation.
     fn reentry_error() -> Error {
         Error::new(
             ErrorCode::InvalidApiCall,
             "OIDC authentication cannot be re-entered from its event callback; return from \
              the callback before calling sign_in, token, clear, or an attached transport. \
-             close is exempt and may be called here to cancel the flow."
+             cancel_sign_in and close are exempt and may be called here."
                 .to_string(),
         )
     }
@@ -306,7 +307,28 @@ impl SharedOidcAuth {
 
     fn sign_in(&self) -> Result<(), Error> {
         self.reject_callback_reentry()?;
-        self.inner.sign_in().map_err(Into::into)
+        let result = self.inner.sign_in().map_err(Into::into);
+        // Native serializes sign-ins on this auth. Clear an attempt-scoped
+        // callback cancellation only when the invocation it belongs to has
+        // returned; clearing it at entry lets a queued second sign-in undo the
+        // first one's cancellation while its callback is still blocked.
+        if let Some(handler) = &self.event_handler {
+            handler.finish_sign_in();
+        }
+        result
+    }
+
+    fn cancel_sign_in(&self) -> Result<(), Error> {
+        // First publish to the Rust flow. If it is currently blocked waiting to
+        // enter a callback shared with a sibling auth, wake that FFI-level wait
+        // too. Do not poison the handler when there is no active device flow:
+        // cancellation while idle must not suppress the next sign-in's events.
+        if self.inner.cancel_sign_in()
+            && let Some(handler) = &self.event_handler
+        {
+            handler.cancel_sign_in();
+        }
+        Ok(())
     }
 
     pub(crate) fn token(&self) -> Result<String, Error> {
@@ -350,7 +372,7 @@ impl SharedOidcAuth {
         // its acquisition lock while waiting for the shared callback gate, and
         // a callback that closes and joins that sibling waits forever.
         if let Some(handler) = &self.event_handler {
-            handler.cancel();
+            handler.close();
         }
         self.inner.signal_close();
         // A callback may delegate close to a worker and join that worker. The
@@ -445,7 +467,10 @@ struct CallbackGateState {
 struct CEventHandler {
     target: Arc<CEventTarget>,
     active: AtomicBool,
-    cancelled: AtomicBool,
+    /// Permanent callback cancellation, paired with provider close.
+    closed: AtomicBool,
+    /// Cancellation scoped to the current `sign_in` invocation.
+    sign_in_cancelled: AtomicBool,
 }
 
 std::thread_local! {
@@ -491,14 +516,14 @@ impl<'a> ActiveEventHandler<'a> {
             .callback_gate
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        while gate.held && !handler.cancelled.load(Ordering::Acquire) {
+        while gate.held && !handler.callbacks_cancelled() {
             gate = handler
                 .target
                 .callback_ready
                 .wait(gate)
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
         }
-        if handler.cancelled.load(Ordering::Acquire) {
+        if handler.callbacks_cancelled() {
             return None;
         }
         gate.held = true;
@@ -547,7 +572,8 @@ impl CEventHandler {
         Self {
             target,
             active: AtomicBool::new(false),
-            cancelled: AtomicBool::new(false),
+            closed: AtomicBool::new(false),
+            sign_in_cancelled: AtomicBool::new(false),
         }
     }
 
@@ -559,7 +585,28 @@ impl CEventHandler {
         self.target.active.load(Ordering::Acquire)
     }
 
-    fn cancel(&self) {
+    fn callbacks_cancelled(&self) -> bool {
+        self.closed.load(Ordering::Acquire) || self.sign_in_cancelled.load(Ordering::Acquire)
+    }
+
+    fn finish_sign_in(&self) {
+        self.sign_in_cancelled.store(false, Ordering::Release);
+    }
+
+    fn cancel_sign_in(&self) {
+        // Serialize the cancellation predicate with callback admission so an
+        // attempt cancellation cannot miss a waiter between its predicate
+        // check and wait.
+        let _gate = self
+            .target
+            .callback_gate
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.sign_in_cancelled.store(true, Ordering::Release);
+        self.target.callback_ready.notify_all();
+    }
+
+    fn close(&self) {
         // Serialize the cancellation predicate with callback admission so
         // close cannot miss a waiter between its predicate check and wait.
         let _gate = self
@@ -567,7 +614,7 @@ impl CEventHandler {
             .callback_gate
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        self.cancelled.store(true, Ordering::Release);
+        self.closed.store(true, Ordering::Release);
         self.target.callback_ready.notify_all();
     }
 }
@@ -1124,6 +1171,24 @@ pub unsafe extern "C" fn questdb_oidc_auth_clone(
 pub unsafe extern "C" fn questdb_oidc_auth_free(auth: *mut questdb_oidc_auth) {
     if !auth.is_null() {
         unsafe { drop(Box::from_raw(auth)) };
+    }
+}
+
+/// Cancel only the currently running interactive device flow.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn questdb_oidc_auth_cancel_sign_in(
+    auth: *const questdb_oidc_auth,
+    err_out: *mut *mut questdb_error,
+) -> bool {
+    let Some(auth) = (unsafe { clone_auth(auth, err_out) }) else {
+        return false;
+    };
+    match auth.cancel_sign_in() {
+        Ok(()) => true,
+        Err(err) => {
+            unsafe { set_err_out_from_error(err_out, err) };
+            false
+        }
     }
 }
 
@@ -1703,6 +1768,11 @@ mod tests {
             questdb_error_free(error);
 
             error = ptr::null_mut();
+            assert!(!questdb_oidc_auth_cancel_sign_in(ptr::null(), &mut error));
+            assert!(!error.is_null());
+            questdb_error_free(error);
+
+            error = ptr::null_mut();
             assert!(!questdb_oidc_auth_close(ptr::null(), &mut error));
             assert!(!error.is_null());
             questdb_error_free(error);
@@ -1771,6 +1841,23 @@ mod tests {
             assert!(error.is_null());
             let clone = questdb_oidc_auth_clone(auth, &mut error);
             assert!(!clone.is_null());
+
+            // Attempt-scoped cancellation while idle is a successful no-op,
+            // not a permanent close shared by the clone.
+            assert!(questdb_oidc_auth_cancel_sign_in(auth, &mut error));
+            assert!(error.is_null());
+            let token = questdb_oidc_auth_token(clone, &mut error);
+            assert!(token.is_null());
+            assert!(!error.is_null());
+            let mut idle_view = std::mem::zeroed::<questdb_oidc_error_view>();
+            idle_view.struct_size = std::mem::size_of_val(&idle_view);
+            assert!(questdb_error_oidc_get_view(error, &mut idle_view));
+            assert_eq!(
+                idle_view.kind,
+                questdb_oidc_error_kind::QUESTDB_OIDC_ERROR_INTERACTION_REQUIRED
+            );
+            crate::questdb_error_free(error);
+            error = ptr::null_mut();
 
             assert!(questdb_oidc_auth_close(auth, &mut error));
             assert!(error.is_null());
@@ -2569,6 +2656,37 @@ mod tests {
     }
 
     #[test]
+    fn attempt_cancelled_callback_handler_is_reusable() {
+        let target = event_target(ignore_event, 0, None);
+        let a = Arc::new(CEventHandler::new(Arc::clone(&target)));
+        let b = Arc::new(CEventHandler::new(target));
+        let in_a = ActiveEventHandler::enter(&a).expect("A callback enters");
+
+        // B waits behind the target shared with A. Attempt cancellation must
+        // wake it without permanently disabling B's callback state.
+        let started = Arc::new(std::sync::Barrier::new(2));
+        let waiter_started = Arc::clone(&started);
+        let waiting_b = Arc::clone(&b);
+        let waiter = std::thread::spawn(move || {
+            waiter_started.wait();
+            ActiveEventHandler::enter(&waiting_b).is_none()
+        });
+        started.wait();
+        b.cancel_sign_in();
+        assert!(
+            waiter.join().unwrap(),
+            "attempt-cancelled sibling entered callback"
+        );
+        drop(in_a);
+
+        b.finish_sign_in();
+        assert!(
+            ActiveEventHandler::enter(&b).is_some(),
+            "a later sign-in must be allowed to render"
+        );
+    }
+
+    #[test]
     fn reusable_builder_siblings_have_distinct_cancellable_callback_state() {
         let target = event_target(ignore_event, 0, None);
         let a = Arc::new(CEventHandler::new(Arc::clone(&target)));
@@ -2585,8 +2703,8 @@ mod tests {
         assert!(!in_event_callback_of_on_this_thread(Some(&b)));
 
         // B is now queued behind A's shared callback gate. Closing B marks
-        // only B cancelled and wakes that waiter; it must not enter caller
-        // state after close or wait for A to return.
+        // only B closed and wakes that waiter; it must not enter caller state
+        // after close or wait for A to return.
         let started = Arc::new(std::sync::Barrier::new(2));
         let waiter_started = Arc::clone(&started);
         let waiting_b = Arc::clone(&b);
@@ -2595,8 +2713,8 @@ mod tests {
             ActiveEventHandler::enter(&waiting_b).is_none()
         });
         started.wait();
-        b.cancel();
-        assert!(waiter.join().unwrap(), "cancelled sibling entered callback");
+        b.close();
+        assert!(waiter.join().unwrap(), "closed sibling entered callback");
         assert!(a.is_active(), "cancelling B must not cancel A");
         drop(in_a);
     }

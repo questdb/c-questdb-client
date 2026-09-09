@@ -205,12 +205,13 @@ impl Drop for StoreState {
     }
 }
 
-/// Resets the lock-free interactive marker even when renderer code panics.
-struct InteractiveGuard<'a>(&'a AtomicBool);
+/// Resets the interactive marker and its attempt-scoped cancellation signal
+/// even when renderer code panics.
+struct InteractiveGuard<'a>(&'a OidcDeviceAuth);
 
 impl Drop for InteractiveGuard<'_> {
     fn drop(&mut self) {
-        self.0.store(false, AtomicOrdering::Release);
+        self.0.finish_interactive_flow();
     }
 }
 
@@ -495,6 +496,7 @@ impl OidcDeviceAuthBuilder {
             tokens: Mutex::new(None),
             acquire: Mutex::new(()),
             interactive_in_progress: AtomicBool::new(false),
+            sign_in_cancelled: AtomicBool::new(false),
             token_store: self.token_store,
             store_key,
             store_state: Mutex::new(StoreState::default()),
@@ -529,10 +531,11 @@ impl OidcDeviceAuthBuilder {
 /// callbacks (and the `sleep` hook) run while this lock is held. They must not
 /// re-enter [`sign_in`](Self::sign_in) or [`clear`](Self::clear) on the same
 /// instance because that lock is not re-entrant. Re-entrant `token()` calls fail
-/// instead of deadlocking. [`close`](Self::close) is thread-safe and wakes
-/// device-poll and bundled file-store lock waits; call it from another thread to
-/// cancel a running operation. It waits for that operation to leave the
-/// acquisition critical section before returning.
+/// instead of deadlocking. [`cancel_sign_in`](Self::cancel_sign_in) is
+/// thread-safe and aborts only the current interactive device flow, leaving the
+/// provider and attached transports usable. [`close`](Self::close) is the
+/// permanent operation: it wakes device-poll and bundled file-store lock waits,
+/// then waits for the operation to leave the acquisition critical section.
 pub struct OidcDeviceAuth {
     config: OidcConfig,
     http: HttpClient,
@@ -555,6 +558,9 @@ pub struct OidcDeviceAuth {
     /// Set only around the device flow so token() can distinguish a long human
     /// interaction from the short silent-refresh work that precedes it.
     interactive_in_progress: AtomicBool,
+    /// Cancellation signal for only the current interactive device flow. It is
+    /// reset before and after every flow and never changes `closed`.
+    sign_in_cancelled: AtomicBool,
     /// Optional cross-restart persistence (opt-in).
     token_store: Option<Arc<dyn TokenStore>>,
     /// The persisted-identity key; `Some` iff `token_store` is set.
@@ -563,7 +569,8 @@ pub struct OidcDeviceAuth {
     store_state: Mutex<StoreState>,
     /// Permanent lifecycle/cancellation signal shared by every Arc clone.
     closed: AtomicBool,
-    /// Condvar used to wake device-poll and acquisition-lock waiters on close.
+    /// Condvar used to wake device-poll and acquisition-lock waiters on close,
+    /// and device-poll waiters on attempt-scoped sign-in cancellation.
     close_wait: Mutex<()>,
     close_wake: Condvar,
 }
@@ -685,6 +692,35 @@ impl OidcDeviceAuth {
         self.closed.load(AtomicOrdering::Acquire)
     }
 
+    /// Cancel the interactive device flow currently running in [`sign_in`](Self::sign_in).
+    ///
+    /// Unlike [`close`](Self::close), this is attempt-scoped: it does not close
+    /// the provider, discard credentials, or disable any attached transport.
+    /// The active `sign_in` returns a
+    /// [`Cancelled`](crate::oidc::OidcErrorKind::Cancelled) error, after which
+    /// the same provider can be used to sign in again. If no interactive flow
+    /// is running, this is an idempotent no-op and does not poison the next one.
+    /// Returns whether a running flow was signalled.
+    ///
+    /// Safe from any thread, including a [`Renderer`] callback. An HTTP request
+    /// already in flight is not cancelled at the transport layer, so the flow
+    /// stops after that bounded request returns.
+    pub fn cancel_sign_in(&self) -> bool {
+        // Serialize predicate publication with the waiter's registration so a
+        // cancellation cannot land between its check and condvar wait.
+        let _guard = self
+            .close_wait
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if self.interactive_in_progress.load(AtomicOrdering::Acquire) {
+            self.sign_in_cancelled.store(true, AtomicOrdering::Release);
+            self.close_wake.notify_all();
+            true
+        } else {
+            false
+        }
+    }
+
     /// Return a valid token for QuestDB without starting an interactive prompt.
     ///
     /// Returns the `id_token` when the server expects groups encoded in the
@@ -721,6 +757,8 @@ impl OidcDeviceAuth {
     ///
     /// Call this once up front when sharing the instance across threads, so the
     /// interactive prompt runs on the main thread rather than on a busy worker.
+    /// [`cancel_sign_in`](Self::cancel_sign_in) aborts only a running device-flow
+    /// attempt; the same provider may call `sign_in` again afterwards.
     pub fn sign_in(&self) -> Result<()> {
         self.ensure_open()?;
         self.obtain_tokens(true).map(|_| ())
@@ -870,6 +908,37 @@ impl OidcDeviceAuth {
         }
     }
 
+    fn ensure_interactive_flow_active(&self) -> Result<()> {
+        self.ensure_open()?;
+        if self.sign_in_cancelled.load(AtomicOrdering::Acquire) {
+            Err(OidcError::cancelled(
+                "The current OIDC sign-in was cancelled; the provider remains open.",
+            ))
+        } else {
+            Ok(())
+        }
+    }
+
+    fn begin_interactive_flow(&self) {
+        let _guard = self
+            .close_wait
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.sign_in_cancelled.store(false, AtomicOrdering::Release);
+        self.interactive_in_progress
+            .store(true, AtomicOrdering::Release);
+    }
+
+    fn finish_interactive_flow(&self) {
+        let _guard = self
+            .close_wait
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.interactive_in_progress
+            .store(false, AtomicOrdering::Release);
+        self.sign_in_cancelled.store(false, AtomicOrdering::Release);
+    }
+
     /// Wait for a bounded slice, waking immediately when close signals. This
     /// deliberately uses real monotonic time for lock acquisition. The device
     /// poll path has a separate wrapper that preserves synthetic test clocks.
@@ -888,11 +957,18 @@ impl OidcDeviceAuth {
 
     fn wait_between_polls(&self, duration: Duration) -> Result<()> {
         if self.custom_sleep {
-            self.ensure_open()?;
+            self.ensure_interactive_flow_active()?;
             (self.sleep)(duration);
-            self.ensure_open()
+            self.ensure_interactive_flow_active()
         } else {
-            self.wait_or_cancel(duration)
+            self.ensure_interactive_flow_active()?;
+            let guard = self.close_wait.lock().unwrap_or_else(|e| e.into_inner());
+            self.ensure_interactive_flow_active()?;
+            match self.close_wake.wait_timeout(guard, duration) {
+                Ok((guard, _)) => drop(guard),
+                Err(error) => drop(error.into_inner().0),
+            }
+            self.ensure_interactive_flow_active()
         }
     }
 
@@ -1183,10 +1259,9 @@ impl OidcDeviceAuth {
         // so the caller who asked for it is told it is unavailable while the
         // answer is still actionable.
         self.preflight_token_store()?;
-        self.interactive_in_progress
-            .store(true, AtomicOrdering::Release);
+        self.begin_interactive_flow();
         let fresh_result = {
-            let _interactive = InteractiveGuard(&self.interactive_in_progress);
+            let _interactive = InteractiveGuard(self);
             self.run_device_flow()
         };
         let fresh = fresh_result?;
@@ -1781,7 +1856,7 @@ impl OidcDeviceAuth {
     }
 
     fn run_device_flow(&self) -> Result<TokenSet> {
-        self.ensure_open()?;
+        self.ensure_interactive_flow_active()?;
         if !self.is_interactive() {
             return Err(OidcError::interaction_required(
                 "Interactive sign-in is required, but this provider was built \
@@ -1792,15 +1867,15 @@ impl OidcDeviceAuth {
         }
 
         let resp = self.request_device_code()?;
-        self.ensure_open()?;
+        self.ensure_interactive_flow_active()?;
         self.renderer.on_prompt(&resp.challenge);
-        self.ensure_open()?;
+        self.ensure_interactive_flow_active()?;
         if self.open_browser
             && let Some(target) = resp.challenge.browser_target()
         {
             maybe_open_browser(&target);
         }
-        self.ensure_open()?;
+        self.ensure_interactive_flow_active()?;
         self.poll_for_token(&resp)
     }
 
@@ -1815,7 +1890,7 @@ impl OidcDeviceAuth {
 
     fn request_device_code(&self) -> Result<DeviceResponse> {
         let device_endpoint_is_loopback = self.device_endpoint_is_loopback();
-        self.ensure_open()?;
+        self.ensure_interactive_flow_active()?;
         let mut form: Vec<(&str, &str)> = vec![
             ("client_id", self.config.client_id.as_str()),
             ("scope", self.config.scope.as_str()),
@@ -1823,10 +1898,13 @@ impl OidcDeviceAuth {
         if let Some(audience) = &self.config.audience {
             form.push(("audience", audience.as_str()));
         }
-        let result =
-            self.http
-                .post_form(&self.config.device_authorization_endpoint, &form, false)?;
-        self.ensure_open()?;
+        let result = self
+            .http
+            .post_form(&self.config.device_authorization_endpoint, &form, false);
+        // Cancellation cannot stop an HTTP request already in flight, but it
+        // wins over that request's result once the bounded call returns.
+        self.ensure_interactive_flow_active()?;
+        let result = result?;
         let body = &result.body;
 
         if result.status == 200 {
@@ -1900,7 +1978,7 @@ impl OidcDeviceAuth {
     }
 
     fn poll_for_token(&self, resp: &DeviceResponse) -> Result<TokenSet> {
-        self.ensure_open()?;
+        self.ensure_interactive_flow_active()?;
         let mut interval = resp.challenge.interval_seconds();
         let deadline = (self.now)() + Duration::from_secs(resp.challenge.expires_in_seconds());
         let form: Vec<(&str, &str)> = vec![
@@ -1958,7 +2036,7 @@ impl OidcDeviceAuth {
         let mut reached_token_endpoint = false;
 
         loop {
-            self.ensure_open()?;
+            self.ensure_interactive_flow_active()?;
             let now = (self.now)();
             if now >= deadline {
                 // Same terminal condition either way -- the code is gone and a
@@ -2011,7 +2089,7 @@ impl OidcDeviceAuth {
             let remaining = deadline - now;
             if !poll_now {
                 self.renderer.on_waiting(remaining.as_secs_f64());
-                self.ensure_open()?;
+                self.ensure_interactive_flow_active()?;
                 let target = Duration::from_secs(interval);
                 let owed = target.saturating_sub(waited_in_interval);
                 if interval_raised && owed > remaining {
@@ -2051,12 +2129,12 @@ impl OidcDeviceAuth {
                 .post_form(&self.config.token_endpoint, &form, false)
             {
                 Ok(result) => {
-                    self.ensure_open()?;
+                    self.ensure_interactive_flow_active()?;
                     reached_token_endpoint = true;
                     result
                 }
                 Err(e) => {
-                    self.ensure_open()?;
+                    self.ensure_interactive_flow_active()?;
                     // A non-JSON, non-transient status is a terminal rejection (a
                     // WAF/proxy error page); a conformant poll reply is JSON, so
                     // it can never be authorization_pending / slow_down.

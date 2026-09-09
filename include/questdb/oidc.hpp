@@ -283,6 +283,23 @@ public:
     {
         detail::wrapped_call(::questdb_oidc_auth_sign_in, raw());
     }
+
+    /**
+     * Cancel only the interactive device flow currently running in sign_in().
+     * The active sign-in throws `oidc::error` with kind `cancelled`, but this
+     * shared provider remains open, credentials are not discarded, and every
+     * attached sender, reader and pool remains usable. A later sign_in() on the
+     * same provider can succeed. A no-op when no device flow is running.
+     *
+     * Safe from any thread, including this provider's event callback. Use
+     * close() instead only when the provider and every attached transport must
+     * be disabled permanently.
+     */
+    void cancel_sign_in() const
+    {
+        detail::wrapped_call(::questdb_oidc_auth_cancel_sign_in, raw());
+    }
+
     /**
      * Return a cached, persisted, or silently refreshed QuestDB bearer token.
      * This is the access token by default, or the ID token when
