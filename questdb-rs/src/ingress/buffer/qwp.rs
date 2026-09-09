@@ -1312,7 +1312,7 @@ impl QwpBuffer {
         let name_bytes = name.as_bytes();
         for entry in &self.entries[start..] {
             let entry_name = &self.name_bytes[entry.name.0.as_range()];
-            if entry_name == name_bytes {
+            if names_eq_ignore_case(entry_name, name_bytes) {
                 return Err(error::fmt!(
                     InvalidApiCall,
                     "column '{}' already set for current row",
@@ -5236,6 +5236,26 @@ impl QwpWsColumnValues {
     }
 }
 
+/// Compare two column names the way the server does, case insensitively.
+///
+/// QWP/WebSocket already folds case, through `lowercase_name_bytes`, but QWP/UDP
+/// compared byte for byte, so `Side` and `side` were treated as two columns and a
+/// single row could set the same server column twice, with conflicting values or
+/// even conflicting types (issue #204). Folding is done in place rather than by
+/// building the lowercase key, since these comparisons sit in the per-row scan and
+/// the ASCII case is the common one. The non-ASCII fallback mirrors
+/// `lowercase_name_bytes`: full Unicode lowercasing, dropping back to ASCII folding
+/// when the bytes are not valid UTF-8.
+fn names_eq_ignore_case(a: &[u8], b: &[u8]) -> bool {
+    if a.is_ascii() && b.is_ascii() {
+        return a.eq_ignore_ascii_case(b);
+    }
+    match (std::str::from_utf8(a), std::str::from_utf8(b)) {
+        (Ok(a), Ok(b)) => a.to_lowercase() == b.to_lowercase(),
+        _ => a.eq_ignore_ascii_case(b),
+    }
+}
+
 #[cfg(feature = "_sender-qwp-ws")]
 fn lowercase_name_bytes(name: &[u8], is_ascii: bool) -> Vec<u8> {
     if is_ascii {
@@ -7313,7 +7333,7 @@ impl RowGroupPlanner {
     fn find_column(&self, name: &[u8], name_bytes: &[u8]) -> Option<usize> {
         self.columns
             .iter()
-            .position(|c| &name_bytes[c.name.0.as_range()] == name)
+            .position(|c| names_eq_ignore_case(&name_bytes[c.name.0.as_range()], name))
     }
 }
 
