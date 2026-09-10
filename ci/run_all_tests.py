@@ -32,7 +32,7 @@ def run_cargo_tests():
             '--', '--nocapture', cwd='questdb-rs')
     run_cmd('cargo', 'test',
             '--no-default-features',
-            '--features=aws-lc-crypto,tls-native-certs,sync-sender',
+            '--features=aws-lc-crypto,tls-native-certs,sync-sender,sync-reader-qwp-ws',
             '--', '--nocapture', cwd='questdb-rs')
     run_cmd('cargo', 'test', '--no-default-features',
             '--features=ring-crypto,tls-native-certs,sync-sender',
