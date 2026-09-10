@@ -287,7 +287,8 @@ typedef enum line_sender_error_code
      *  (store-and-forward is at-least-once) when a later frame hits the cap.
      *  The error is then delivery-unknown rather than known-not-delivered -
      *  check `line_sender_error_in_doubt` before resending, or the rows the
-     *  queued prefix already carried are duplicated. */
+     *  queued prefix already carried are duplicated.
+     */
     line_sender_error_symbol_dict_full = 37,
 } line_sender_error_code;
 
@@ -448,9 +449,15 @@ questdb_error_code questdb_error_get_code(const questdb_error*);
 QUESTDB_CLIENT_API
 const char* questdb_error_msg(const questdb_error*, size_t* len_out);
 
-/** Whether the failed operation may already have delivered its input. A true
- *  result means replay can duplicate data unless the application has its own
- *  deduplication guarantee. NULL-safe: a NULL input returns false. */
+/**
+ * Whether the failed operation may already have delivered its input. A true
+ * result means replay can duplicate data unless the application has its own
+ * deduplication guarantee.
+ *
+ * For a low-level flush, this does not track earlier independent flushes.
+ *
+ * NULL-safe: a NULL input returns false.
+ */
 QUESTDB_CLIENT_API
 bool questdb_error_in_doubt(const questdb_error*);
 
@@ -475,6 +482,8 @@ const char* line_sender_error_msg(const line_sender_error*, size_t* len_out);
  * input's bytes may already have reached the server even though the call
  * returned an error (e.g. a socket write that failed mid-frame, or a
  * post-publish ACK wait that failed).
+ *
+ * For a low-level flush, this does not track earlier independent flushes.
  *
  * Independent of `line_sender_error_get_code`: a delivery-unknown failure
  * typically reports `line_sender_error_failover_retry`, yet that code alone
@@ -1191,7 +1200,13 @@ bool line_sender_buffer_column_binary(
 /**
  * Record a GEOHASH column value. QWP-only.
  *
- * `precision_bits` must be in `1..=60` and is pinned per column.
+ * `precision_bits` must be in `1..=60` and is pinned per column. `bits` is a
+ * raw pattern and is not checked to be less than `2^precision_bits`.
+ * Supplying the wrong precision or a pattern with bits set above it can
+ * succeed and store a different GEOHASH or NULL. Only the low
+ * `ceil(precision_bits / 8)` bytes are encoded; the exact result is
+ * unspecified. This is a semantic data-integrity risk, not a memory-safety
+ * risk for an otherwise valid call. The caller must validate `bits`.
  */
 QUESTDB_CLIENT_API
 bool line_sender_buffer_column_geohash(

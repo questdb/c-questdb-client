@@ -1999,21 +1999,24 @@ impl Debug for BorrowedSender<'_> {
 /// [`QuestDb`] pool — the handle returned by
 /// [`QuestDb::borrow_direct_column_sender`], used by DataFrame ingestion.
 ///
-/// [`Self::flush`] pipelines a deferred frame; [`Self::commit`] (or
-/// [`Self::flush_and_wait`] on the final chunk) sends the commit boundary and
-/// waits for `ack_level`. Normal `Drop` makes a best-effort commit of
+/// The first successful [`Self::flush`] on a fresh physical connection is
+/// non-deferred, including an empty flush; subsequent flushes are deferred.
+/// [`Self::commit`] (or [`Self::flush_and_wait`] on the final chunk) sends a
+/// commit boundary and waits for `ack_level`. Normal `Drop` makes a best-effort commit of
 /// uncommitted deferred frames at the pool's default ack level. If that commit
 /// fails, or if [`Self::drop_on_return`] was requested, those frames are
 /// discarded; for deterministic error handling, call [`Self::commit`] or
-/// [`Self::flush_and_wait`] yourself and re-drive from the last successful
-/// commit after failure.
+/// [`Self::flush_and_wait`] yourself. A low-level flush error describes that
+/// operation; callers track any earlier publications before replaying a source.
 ///
 /// Not `Send` or `Sync`.
 pub struct BorrowedDirectColumnSender<'a>(DirectSenderHandle<'a>);
 
 impl<'a> BorrowedDirectColumnSender<'a> {
-    /// Encode and pipeline `chunk` as a deferred frame without waiting. The
-    /// frame is not committed until [`Self::commit`] / [`Self::flush_and_wait`].
+    /// Encode and publish `chunk` without waiting. The first successful flush
+    /// on a fresh physical connection is non-deferred, including an empty
+    /// flush; subsequent flushes are deferred until [`Self::commit`] /
+    /// [`Self::flush_and_wait`].
     pub fn flush(&mut self, chunk: &mut crate::ingress::column_sender::Chunk<'_>) -> Result<()> {
         self.0.inner_mut().flush(chunk)
     }

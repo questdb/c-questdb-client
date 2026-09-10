@@ -914,12 +914,11 @@ bool qwp_chunk_symbol_i32(
  *    holds the array's buffer lifetime via an internal Arc until
  *    `qwp_sender_flush_chunk` returns. The caller may free the
  *    `ArrowArray` struct shell immediately after this call returns.
- *  - On failure, `array->release` may have been consumed (set to NULL)
- *    if the function reached the Arrow import step before failing. The
- *    underlying buffers are always released by the function in that
- *    case. Callers MUST check `array->release != NULL` before invoking
- *    it on the failure path. Early-fail paths (NULL pointer check,
- *    schema/array depth-cap rejection) leave `array->release` intact.
+ *  - A failure detected before the Arrow import step leaves
+ *    `array->release` intact. Once import begins, a failure may have
+ *    consumed it (set it to NULL); the underlying buffers are always
+ *    released by the function in that case. Callers MUST check
+ *    `array->release != NULL` before invoking it on the failure path.
  *  - `schema` is borrowed; the caller retains `schema->release` in
  *    all cases.
  *
@@ -1034,11 +1033,11 @@ typedef enum qwp_symbol_mode
  *
  * Ownership of the array's buffers transfers into the returned handle.
  * On success, `array->release` is cleared to NULL — the caller MUST
- * NOT invoke it. On error, `array->release` may also have been
- * cleared if validation reached the Arrow import step; the caller
- * MUST check `array->release != NULL` before calling it on the
- * failure path. Depth-cap and NULL-pointer rejections leave it
- * intact. `schema` is borrowed only for the duration of this call.
+ * NOT invoke it. A failure detected before the Arrow import step leaves
+ * `array->release` intact. Once import begins, a failure may also have
+ * cleared it; the caller MUST check `array->release != NULL` before
+ * calling it on the failure path. `schema` is borrowed only for the
+ * duration of this call.
  *
  * `symbol_mode` selects the SYMBOL-vs-VARCHAR disposition of a string
  * column; it carries a `qwp_symbol_mode_*` constant and is a
@@ -1117,15 +1116,21 @@ size_t qwp_arrow_import_len(const qwp_arrow_import* imported);
  *
  * Ownership: on success, `array->release` is consumed (cleared to
  * NULL); the chunk holds the underlying buffers via an internal
- * reference until `qwp_sender_flush_chunk` returns. On failure,
- * `array->release` may also have been consumed if the call reached
- * the Arrow import step before failing — callers MUST check
+ * reference until `qwp_sender_flush_chunk` returns. A failure detected
+ * before the Arrow import step leaves `array->release` intact. Once
+ * import begins, a failure may also have consumed it; callers MUST check
  * `array->release != NULL` before invoking it on the failure path.
- * Early-fail paths (NULL pointer, depth-cap rejection) leave it
- * intact. `schema` is borrowed in all cases.
+ * `schema` is borrowed in all cases.
  *
  * `array->offset` is honored (the Arrow C Data Interface logical
  * offset); `row_offset` further sub-slices within the call.
+ * GEOHASH values are raw bit patterns and are not checked against the
+ * precision declared by Arrow field metadata. A wrong precision or a pattern
+ * with bits set above it can be accepted and store a different GEOHASH or
+ * NULL. Only the low `ceil(precision / 8)` bytes are encoded; the exact result
+ * is unspecified. This is a semantic data-integrity risk, not a memory-safety
+ * risk for otherwise valid Arrow C Data structures. The caller must validate
+ * values; malformed Arrow C Data structures remain invalid input.
  */
 QUESTDB_CLIENT_API
 bool qwp_chunk_append_arrow_column(
@@ -1181,6 +1186,11 @@ bool qwp_chunk_append_arrow_column(
  *     geohash_i16  → GEOHASH (bits ∈ 1..=16)
  *     geohash_i32  → GEOHASH (bits ∈ 1..=32)
  *     geohash_i64  → GEOHASH (bits ∈ 1..=60)
+ *     Values are raw bit patterns and are not checked against the declared
+ *     precision. A wrong precision or a pattern with bits set above it can be
+ *     accepted and store a different GEOHASH or NULL. Only the low
+ *     ceil(precision / 8) bytes are encoded; the exact result is unspecified.
+ *     The caller must validate values.
  *   Multi-dim float64 (require `extras.array_ndim` + `extras.array_shape`):
  *     f64_ndarray  → DOUBLE_ARRAY (rectangular tensor; all rows share the
  *                    same per-row shape — ragged inputs must go through
@@ -1284,7 +1294,13 @@ typedef enum qwp_numpy_dtype
  *    / DECIMAL128, 76 for s32 / DECIMAL256). Signed type so an out-of-
  *    range negative value is rejected explicitly rather than wrapping.
  *  - geohash_bits: precision in bits. Range 1..=8 / 1..=16 / 1..=32 /
- *    1..=60 for i8 / i16 / i32 / i64 respectively.
+ *    1..=60 for i8 / i16 / i32 / i64 respectively. Values are raw bit
+ *    patterns and are not checked against this precision. A wrong precision
+ *    or a pattern with bits set above it can be accepted and store a different
+ *    GEOHASH or NULL. Only the low ceil(precision / 8) bytes are encoded; the
+ *    exact result is unspecified. This is a semantic data-integrity risk, not
+ *    a memory-safety risk when the documented data/validity pointer and length
+ *    contract is satisfied. The caller must validate values.
  *  - array_ndim / array_shape: for `qwp_numpy_f64_ndarray`
  *    only. `array_ndim` is the per-row tensor rank (1..=32, matching
  *    QuestDB's MAX_ARRAY_DIMS); `array_shape` points at `array_ndim`
@@ -1580,13 +1596,16 @@ bool qwp_sender_wait(
     line_sender_error** err_out);
 
 /**
- * Pipeline a deferred frame on a direct connection. Not committed until
- * `qwp_direct_sender_commit`. On success the chunk is cleared for reuse.
+ * Publish a frame on a direct connection without waiting. The first successful
+ * flush on a fresh physical connection is non-deferred, including an empty
+ * flush; subsequent flushes are deferred until `qwp_direct_sender_commit`.
+ * On success the chunk is cleared for reuse.
  *
  * A transient transport failure reports `line_sender_error_failover_retry`;
  * check `line_sender_error_in_doubt` to tell provably-not-delivered (retry
- * with the same chunk on a fresh sender) from delivery-unknown (re-drive from
- * the source instead).
+ * with the same chunk on a fresh sender) from delivery-unknown. Replaying
+ * delivery-unknown input can duplicate rows. The flag does not summarize
+ * earlier independent flushes; callers track those before replaying a source.
  */
 QUESTDB_CLIENT_API
 bool qwp_direct_sender_flush(
@@ -1685,6 +1704,14 @@ typedef struct qwp_arrow_override
  * `qwp_arrow_override_geohash` — carries `arg` outside
  * `1..=60`.
  *
+ * GEOHASH values are raw bit patterns and are not checked against the
+ * precision in `arg`. A wrong precision or a pattern with bits set above it
+ * can be accepted and store a different GEOHASH or NULL. Only the low
+ * `ceil(arg / 8)` bytes are encoded; the exact result is unspecified. This is
+ * a semantic data-integrity risk, not a memory-safety risk for otherwise valid
+ * Arrow C Data structures. The caller must validate values; malformed Arrow C
+ * Data structures remain invalid input.
+ *
  * Name validation timing: `table` is a `line_sender_table_name`, so the
  * name grammar was validated EAGERLY at `line_sender_table_name_init`
  * time; only the 127-byte length cap is checked here at flush. The chunk
@@ -1767,8 +1794,8 @@ bool qwp_sender_flush_arrow_batch_at_column(
     line_sender_error** err_out);
 
 /**
- * `qwp_sender_flush_arrow_batch_at_now` on a direct sender: pipeline the
- * batch as a deferred frame, not committed until `qwp_direct_sender_commit`.
+ * `qwp_sender_flush_arrow_batch_at_now` on a direct sender: publish without
+ * waiting, with the first-flush behavior of `qwp_direct_sender_flush`.
  * Same Arrow ownership contract: `array->release` is consumed on success and
  * re-exported on a provably-not-delivered failure
  * (`line_sender_error_failover_retry` with `line_sender_error_in_doubt ==
