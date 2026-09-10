@@ -1569,7 +1569,7 @@ TEST_CASE("One column only - server.accept() after flush, before close")
     CHECK(server.msgs(0) == "test t1=\"v1\"\n");
 }
 
-TEST_CASE("Symbol after column")
+TEST_CASE("ILP rejects symbol after column")
 {
     questdb::ingress::test::mock_server server;
     questdb::ingress::line_sender sender{questdb::ingress::opts{
@@ -3117,8 +3117,8 @@ TEST_CASE("line_sender c++ udp rejects flush with incomplete row")
 
     CHECK_THROWS_WITH_AS(
         sender.flush(buffer),
-        "State error: Bad call to `flush`, should have called `column` or "
-        "`at` instead.",
+        "State error: Bad call to `flush`, should have called `symbol`, "
+        "`column` or `at` instead.",
         questdb::ingress::line_sender_error);
 }
 
@@ -3500,6 +3500,35 @@ TEST_CASE("line_sender c++ udp opts reusable after protocol_version error")
     questdb::ingress::line_sender_buffer buffer = sender.new_buffer();
     buffer.table("test").column("x", int64_t{1}).at_now();
     sender.flush(buffer);
+}
+
+TEST_CASE("line_sender c++ qwp udp allows symbols after columns")
+{
+    udp_capture receiver;
+    questdb::ingress::opts opts{
+        questdb::ingress::protocol::udp,
+        std::string("127.0.0.1"),
+        std::to_string(receiver.port())};
+    questdb::ingress::line_sender sender{opts};
+
+    questdb::ingress::line_sender_buffer buffer = sender.new_buffer();
+    buffer.table("trades")
+        .column("qty", int64_t{4})
+        .symbol("sym", "ETH-USD")
+        .column("active", true)
+        .symbol("venue", "XNAS")
+        .at_now();
+
+    sender.flush(buffer);
+    const auto datagram = receiver.recv_datagram();
+    const auto decoded = decode_single_scalar_qwp_datagram(datagram);
+    CHECK(decoded.table_name == "trades");
+    CHECK(decoded.row_count == 1);
+    qwp_check_column_count(decoded, 4);
+    qwp_expect_i64(qwp_cell(decoded, 0, "qty"), 4);
+    qwp_expect_symbol(qwp_cell(decoded, 0, "sym"), "ETH-USD");
+    qwp_expect_bool(qwp_cell(decoded, 0, "active"), true);
+    qwp_expect_symbol(qwp_cell(decoded, 0, "venue"), "XNAS");
 }
 
 TEST_CASE("line_sender c++ udp all column types with designated timestamp")

@@ -382,7 +382,9 @@ public:
 
     /**
      * Record a symbol value for the given column.
-     * Make sure you record all the symbol columns before any other column type.
+     * For ILP buffers, record all symbol columns before any other column type.
+     * QWP buffers allow symbol and non-symbol columns in any order before the
+     * designated timestamp.
      *
      * When the buffer is flushed over QWP/WebSocket — whether by a pooled
      * sender or by `line_sender::flush*` on a `line_sender` opened against a
