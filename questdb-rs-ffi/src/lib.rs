@@ -5762,6 +5762,100 @@ mod tests {
         *err = ptr::null_mut();
     }
 
+    /// Every `questdb_connection_event_*` kind, paired with the Rust constant a
+    /// C caller compares against. Adding a variant means adding it here.
+    fn c_connection_event_abi() -> &'static [(&'static str, u32)] {
+        use crate::column_sender::*;
+        &[
+            ("connected", questdb_connection_event_connected),
+            ("disconnected", questdb_connection_event_disconnected),
+            ("reconnected", questdb_connection_event_reconnected),
+            ("failed_over", questdb_connection_event_failed_over),
+            (
+                "endpoint_attempt_failed",
+                questdb_connection_event_endpoint_attempt_failed,
+            ),
+            (
+                "all_endpoints_unreachable",
+                questdb_connection_event_all_endpoints_unreachable,
+            ),
+            ("auth_failed", questdb_connection_event_auth_failed),
+            (
+                "credential_unavailable",
+                questdb_connection_event_credential_unavailable,
+            ),
+        ]
+    }
+
+    #[test]
+    fn c_header_connection_event_kinds_match_rust() {
+        // These are hand-maintained in two places -- `#define`s in the C header
+        // and `pub const`s here -- and a C listener switches on the header's
+        // value. A drift silently relabels every lifecycle event: most
+        // damagingly a retryable `credential_unavailable` read as the terminal
+        // `auth_failed`, which the header itself says a listener may tear the
+        // pool down on. `c_header_line_sender_enum_matches_rust` guards the
+        // error-code enum the same way; this covers the kinds, which had no
+        // guard when `credential_unavailable` was appended.
+        let header = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../include/questdb/ingress/line_sender.h"
+        ));
+        for (name, value) in c_connection_event_abi() {
+            let needle = format!("#define questdb_connection_event_{name} {value}u");
+            assert!(
+                header.contains(&needle),
+                "C header is missing or disagrees on `{needle}` \
+                 (include/questdb/ingress/line_sender.h vs the Rust constant)",
+            );
+        }
+        // And the header must not declare kinds Rust does not know about.
+        let header_kinds = header
+            .lines()
+            .filter(|l| {
+                l.trim_start()
+                    .starts_with("#define questdb_connection_event_")
+            })
+            .count();
+        assert_eq!(
+            header_kinds,
+            c_connection_event_abi().len(),
+            "C header declares {header_kinds} connection-event kinds but Rust has {} \
+             -- a kind was added on one side only",
+            c_connection_event_abi().len(),
+        );
+        // Ordinals are an ABI: they must stay dense from 0 and, above all, keep
+        // their existing values. An already-compiled C caller holds the old
+        // numbers.
+        let mut values: Vec<u32> = c_connection_event_abi().iter().map(|(_, v)| *v).collect();
+        values.sort_unstable();
+        assert_eq!(
+            values,
+            (0..c_connection_event_abi().len() as u32).collect::<Vec<_>>(),
+            "connection-event ordinals must be dense from 0 and only ever appended"
+        );
+    }
+
+    #[test]
+    fn c_header_callback_inbox_cap_matches_rust() {
+        // Same hand-maintained-mirror hazard, one file over: the header
+        // advertises a cap the library is the one actually enforcing.
+        let header = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../include/questdb/client.h"
+        ));
+        let needle = format!(
+            "#define QUESTDB_DB_MAX_CALLBACK_INBOX_CAPACITY ((size_t){})",
+            crate::column_sender::MAX_DB_CALLBACK_INBOX_CAPACITY
+        );
+        assert!(
+            header.contains(&needle),
+            "public C callback-inbox cap drifted from Rust's {} \
+             (expected `{needle}` in include/questdb/client.h)",
+            crate::column_sender::MAX_DB_CALLBACK_INBOX_CAPACITY,
+        );
+    }
+
     #[test]
     fn config_size_cap_matches_public_header() {
         assert!(validate_config_len(MAX_CONFIG_BYTES).is_ok());

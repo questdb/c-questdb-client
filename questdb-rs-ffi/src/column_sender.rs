@@ -105,7 +105,7 @@ const QUESTDB_DB_CONNECT_OPTIONS_V1_SIZE: usize =
 /// Upper bound for caller-selected connection-event and rejection inboxes.
 /// The FFI crate aborts on allocation failure, so capacities from C must be
 /// validated before they reach `VecDeque::with_capacity` in the core client.
-const MAX_DB_CALLBACK_INBOX_CAPACITY: usize = 65_536;
+pub(crate) const MAX_DB_CALLBACK_INBOX_CAPACITY: usize = 65_536;
 
 unsafe fn connect_options_field<T: Copy>(
     options: *const questdb_db_connect_options,
