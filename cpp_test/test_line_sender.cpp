@@ -4497,11 +4497,11 @@ TEST_CASE("line_sender c++ qwp geohash maxima and omission round trip")
     qwp_check_column(decoded, "", qwp_test_type_timestamp_nanos, false);
     for (size_t row = 0; row < 3; ++row)
     {
-        const auto& dense = qwp_cell(decoded, row, "dense");
+        const auto dense = qwp_cell(decoded, row, "dense");
         REQUIRE(dense.kind == qwp_test_decoded_value_kind::geohash);
         CHECK(dense.geohash_precision == 8);
         CHECK(dense.geohash_bits == 0xFF);
-        const auto& sparse = qwp_cell(decoded, row, "sparse");
+        const auto sparse = qwp_cell(decoded, row, "sparse");
         if (row == 1)
             CHECK(sparse.kind == qwp_test_decoded_value_kind::null);
         else
