@@ -8633,6 +8633,64 @@ fn flush_polars_dataframe_failure_after_reconnect_keeps_call_status() {
 
 #[cfg(feature = "polars-ingress")]
 #[test]
+fn flush_polars_dataframe_failure_before_replay_keeps_call_status() {
+    use crate::ingress::polars::PolarsIngestOptions;
+    use polars::prelude::{IntoColumn, NamedFrom, PlSmallStr, Series};
+
+    const CHECKPOINT_BATCHES: usize = 64;
+    const VALUE_BYTES: usize = 4096;
+    const REPLACEMENT_CAP: usize = 2048;
+    const FLAG_DEFER_COMMIT: u8 = 0x01;
+
+    // Commit a checkpoint on the primary, then reconnect successfully to a
+    // peer whose frame limit cannot fit even one row. No successful replay
+    // batch can restore `published` if reconnecting incorrectly cleared it.
+    let (tx, frames) = mpsc::channel();
+    let primary = MockServer::spawn_with_mode_capture(
+        1,
+        MockMode::DeferAwareAckKillingFirstConn(CHECKPOINT_BATCHES),
+        Some(tx),
+    );
+    let replacement = MockServer::spawn_with_max_batch_size(1, REPLACEMENT_CAP);
+    let db = QuestDb::connect(&conf_for_endpoints(
+        &[primary.port(), replacement.port()],
+        "sender_pool_min=1;sender_pool_max=2;pool_reap=manual;max_buf_size=8192;",
+    ))
+    .unwrap();
+    let values: Vec<String> = (0..130).map(|_| "x".repeat(VALUE_BYTES)).collect();
+    let column = Series::new(PlSmallStr::from("s"), values.as_slice()).into_column();
+    let df = crate::polars_ffi::df_from_columns(vec![column]).unwrap();
+
+    let err = db
+        .flush_polars_dataframe("trades", &df, &PolarsIngestOptions::new().max_rows(1))
+        .unwrap_err();
+
+    assert_eq!(primary.accepted(), 1);
+    assert_eq!(replacement.accepted(), 1, "reconnect must succeed");
+    assert_eq!(err.code(), ErrorCode::BatchTooLarge, "{err}");
+    assert!(
+        err.in_doubt(),
+        "earlier publication must survive a failure before replay: {err}"
+    );
+
+    // EOF precedes the completed reconnect, so capture needs no sleeps.
+    // The mock emits an empty marker when it drops the primary connection.
+    let captured: Vec<_> = frames
+        .try_iter()
+        .filter(|frame| !frame.is_empty())
+        .collect();
+    assert_eq!(captured.len(), CHECKPOINT_BATCHES);
+    for (index, frame) in captured.iter().enumerate() {
+        assert!(frame.len() >= 12);
+        assert_eq!(&frame[..4], b"QWP1");
+        assert_eq!(u16::from_le_bytes([frame[6], frame[7]]), 1);
+        let deferred = index != 0 && index != CHECKPOINT_BATCHES - 1;
+        assert_eq!(frame[5] & FLAG_DEFER_COMMIT != 0, deferred);
+    }
+}
+
+#[cfg(feature = "polars-ingress")]
+#[test]
 fn flush_polars_dataframe_single_endpoint_commits_in_one_pass() {
     use crate::ingress::polars::PolarsIngestOptions;
     use polars::prelude::{IntoColumn, NamedFrom, PlSmallStr, Series};
