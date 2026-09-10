@@ -2233,7 +2233,30 @@ impl OidcDeviceAuth {
                     }
                 };
                 if self.has_required_token(&tokens) {
-                    return Ok(tokens);
+                    // `is_usable`, not `has_required_token` alone -- the same
+                    // distinction the refresh arm in `obtain_tokens` makes, and
+                    // for the same reason. `tokenset_from_response` bounds
+                    // `expires_at` by the served token's own `exp`, so an IdP
+                    // that hands back a stale token on the device grant yields a
+                    // set that HAS the required kind and is already expired.
+                    // With no refresh token, accepting it reported a
+                    // successful sign-in through the renderer and persisted a
+                    // dead credential, and the caller's very next request said
+                    // no usable token was available and to call `sign_in()` --
+                    // which is what they had just done.
+                    // A refresh token makes an expired set recoverable: the
+                    // next `token()` mints a usable one without a prompt, which
+                    // is the ordinary shape for an IdP issuing a short-lived
+                    // access token. Only a set with nothing to recover with is
+                    // a dead end.
+                    if self.is_usable(&tokens) || tokens.refresh_token.is_some() {
+                        return Ok(tokens);
+                    }
+                    self.renderer.on_failure(
+                        "Sign-in failed: the identity provider returned a token that \
+                         had already expired, and no refresh token to renew it with.",
+                    );
+                    return Err(self.expired_on_issue_error());
                 }
                 self.renderer.on_failure(
                     "Sign-in failed: the identity provider did not return the token \
@@ -2382,6 +2405,27 @@ impl OidcDeviceAuth {
                 )
                 .with_status(Some(result.status)),
         )
+    }
+
+    /// The device grant returned the required token kind, already expired.
+    ///
+    /// Distinct from [`Self::missing_required_token_error`]: the kind IS
+    /// present, so pointing the user at their `scope` would send them after the
+    /// wrong thing. The realistic causes are this host's clock running far
+    /// enough ahead of the IdP's to consume the whole lifetime, and an IdP that
+    /// replays a stale `id_token` on the device grant in groups mode.
+    fn expired_on_issue_error(&self) -> OidcError {
+        OidcError::device_flow(format!(
+            "Device authorization completed, but the {} the IdP returned had \
+             already expired and it issued no refresh token to renew it with. \
+             Check this host's clock against the identity provider's; if they \
+             agree, the provider issued a stale token.",
+            if self.config.groups_in_token {
+                "id_token"
+            } else {
+                "access_token"
+            }
+        ))
     }
 
     fn missing_required_token_error(&self) -> OidcError {

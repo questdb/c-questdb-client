@@ -2419,6 +2419,46 @@ fn qwp_ws_token_provider_reaches_upgrade_handshake() {
 }
 
 #[test]
+fn qwp_ws_does_not_replay_a_401_with_an_unchanged_provider_token() {
+    // The other half of `qwp_ws_retries_one_401_with_a_changed_provider_token`.
+    // Only the changed-token branch was covered, so neutralising the guard --
+    // replaying unconditionally -- failed nothing, and a genuine rejection
+    // would cost a second full TCP+TLS+upgrade round trip per connect round.
+    // The HTTP sender has both halves (`a_401_with_an_unchanged_token_is_not_
+    // retried`); this brings QWP/WebSocket up to the same level.
+    let provider_calls = Arc::new(AtomicUsize::new(0));
+    let (port, rx) = spawn_401_then_response_server();
+    let builder = SenderBuilder::new(Protocol::Ws, "127.0.0.1", port)
+        .qwp_ws_token_provider({
+            let provider_calls = Arc::clone(&provider_calls);
+            // Byte-identical every time: the IdP re-issuing the same credential
+            // means the 401 is a real rejection, not an expiry to rotate out of.
+            move || {
+                provider_calls.fetch_add(1, Ordering::SeqCst);
+                Ok::<_, crate::Error>("same".to_string())
+            }
+        })
+        .unwrap();
+    // Unlike the changed-token case, no attempt here succeeds, so the connect
+    // itself is what returns -- and it must return the server's rejection
+    // rather than a second attempt's.
+    let err = builder.build().unwrap_err();
+    assert_eq!(err.code(), crate::ErrorCode::AuthError);
+    assert_eq!(err.ws_http_status(), Some(401));
+
+    // Exactly one upgrade attempt reaches the server.
+    rx.recv_timeout(Duration::from_secs(5))
+        .expect("the first upgrade attempt");
+    assert!(
+        rx.recv_timeout(Duration::from_millis(500)).is_err(),
+        "an unchanged token bought a second upgrade attempt"
+    );
+    // The provider is re-asked once to find out whether the credential rotated;
+    // it is the replay, not the re-resolution, that the guard prevents.
+    assert_eq!(provider_calls.load(Ordering::SeqCst), 2);
+}
+
+#[test]
 fn qwp_ws_retries_one_401_with_a_changed_provider_token() {
     let provider_calls = Arc::new(AtomicUsize::new(0));
     let (port, rx) = spawn_401_then_response_server();

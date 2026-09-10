@@ -2812,6 +2812,143 @@ impl TokenStore for FailingSaveStore {
     }
 }
 
+/// `(entered, release)`: the store signals the first and then waits on the
+/// second, so a test can act while the write is parked.
+type LockGate = (Arc<Barrier>, Arc<Barrier>);
+
+/// A store whose locked write waits for a peer before acting, consulting
+/// `cancelled` while it waits. That is the shape `FileTokenStore::with_lock`
+/// has when another process holds the per-identity lock, and that wait is the
+/// window a concurrent `close()` lands in.
+#[derive(Clone, Default)]
+struct SlowLockStore {
+    token: Arc<Mutex<Option<PersistedToken>>>,
+    /// `in_lock_cancellable` entries so far. Entry 0 is the seed load, which
+    /// must not block; entry 1 is the post-sign-in write.
+    entries: Arc<AtomicUsize>,
+    gate: Arc<Mutex<Option<LockGate>>>,
+    refused: Arc<AtomicBool>,
+}
+
+impl TokenStore for SlowLockStore {
+    fn load(&self, _key: &TokenStoreKey) -> TokenStoreResult<Option<PersistedToken>> {
+        Ok(self.token.lock().unwrap().clone())
+    }
+
+    fn save(&self, _key: &TokenStoreKey, token: &PersistedToken) -> TokenStoreResult<()> {
+        *self.token.lock().unwrap() = Some(token.clone());
+        Ok(())
+    }
+
+    fn clear(&self, _key: &TokenStoreKey) -> TokenStoreResult<()> {
+        *self.token.lock().unwrap() = None;
+        Ok(())
+    }
+
+    fn in_lock(
+        &self,
+        _key: &TokenStoreKey,
+        action: &mut dyn FnMut() -> TokenStoreResult<()>,
+    ) -> TokenStoreResult<()> {
+        action()
+    }
+
+    fn in_lock_cancellable(
+        &self,
+        key: &TokenStoreKey,
+        cancelled: &dyn Fn() -> bool,
+        action: &mut dyn FnMut() -> TokenStoreResult<()>,
+    ) -> TokenStoreResult<()> {
+        if self.entries.fetch_add(1, Ordering::SeqCst) == 1
+            && let Some((entered, release)) = self.gate.lock().unwrap().clone()
+        {
+            entered.wait();
+            release.wait();
+            if cancelled() {
+                self.refused.store(true, Ordering::SeqCst);
+                return Err(Box::new(std::io::Error::other(
+                    "cancelled during lock wait",
+                )));
+            }
+        }
+        self.in_lock(key, action)
+    }
+}
+
+#[test]
+fn a_close_racing_a_completed_device_flow_keeps_the_credential() {
+    // Regression: `obtain_tokens` gated the post-sign-in store write behind
+    // `ensure_open()`, and `persist_fresh_durable` passed `|| self.is_closed()`
+    // as its cancellation predicate. A close published between the device flow
+    // completing and that write therefore threw away a credential the human had
+    // just authorized: nothing reached the store, the next process start faced a
+    // full interactive sign-in, and the refresh token stayed live at the IdP,
+    // never stored and never used. `refresh_under_lock` already wrote before
+    // `ensure_open()` for exactly this reason.
+    //
+    // The realistic window is the store-lock wait, which is seconds wide when a
+    // peer process is mid-refresh -- not the few instructions between two
+    // statements. `SlowLockStore` reproduces that wait deterministically.
+    let mock = MockServer::start(|method, path, _body| match (method, path) {
+        ("POST", "/device") => (200, device_response()),
+        ("POST", "/token") => (
+            200,
+            r#"{"access_token":"AT-1","refresh_token":"RT-1","expires_in":300}"#.to_string(),
+        ),
+        _ => (404, "{}".to_string()),
+    });
+    let entered = Arc::new(Barrier::new(2));
+    let release = Arc::new(Barrier::new(2));
+    let store = SlowLockStore::default();
+    *store.gate.lock().unwrap() = Some((Arc::clone(&entered), Arc::clone(&release)));
+
+    let auth = Arc::new(
+        OidcDeviceAuth::builder()
+            .client_id("questdb")
+            .device_authorization_endpoint(mock.url("/device"))
+            .token_endpoint(mock.url("/token"))
+            .scope("openid")
+            .interactive(true)
+            .open_browser(false)
+            .sleep_hook(no_sleep())
+            .token_store(store.clone())
+            .build()
+            .expect("build auth"),
+    );
+
+    let signer = {
+        let auth = Arc::clone(&auth);
+        std::thread::spawn(move || auth.sign_in())
+    };
+
+    // The human has authorized and the write is parked behind the peer's lock.
+    entered.wait();
+    // A close lands right there. `signal_close` publishes without draining, as
+    // a close from another thread does.
+    auth.signal_close();
+    release.wait();
+
+    let result = signer.join().unwrap();
+    // The close is reported to the caller...
+    assert_eq!(
+        result.unwrap_err().kind(),
+        OidcErrorKind::Cancelled,
+        "the close must still be reported"
+    );
+    // ...and the credential the human authorized survived it.
+    assert!(
+        !store.refused.load(Ordering::SeqCst),
+        "the close cancelled the write of an already-authorized credential"
+    );
+    let persisted = store
+        .token
+        .lock()
+        .unwrap()
+        .clone()
+        .expect("a close racing the write discarded the authorized credential");
+    assert_eq!(persisted.refresh_token(), Some("RT-1"));
+}
+
 /// An in-memory store that exposes whether a peer attempted the locked lazy
 /// load while another auth instance holds the coordination lock across refresh.
 #[derive(Clone, Default)]
@@ -3352,6 +3489,124 @@ fn a_long_retry_after_is_waited_out_in_slices() {
     );
     // The countdown ticks once per slice rather than once for the whole pause.
     assert_eq!(waits.load(Ordering::SeqCst), slept.len());
+}
+
+/// An unsigned JWT (native never verifies one) whose payload is `{"exp":1}`,
+/// i.e. an `exp` one second after the epoch. `tokenset_from_response` bounds
+/// `expires_at` by that, so the resulting set is expired the moment it is built.
+const ALREADY_EXPIRED_JWT: &str = "e30.eyJleHAiOjF9.";
+
+#[test]
+fn a_device_grant_that_returns_an_expired_token_fails_the_sign_in() {
+    // Regression: the device-flow arm accepted on `has_required_token` alone
+    // while the refresh arm in `obtain_tokens` deliberately requires
+    // `is_usable`. `tokenset_from_response` bounds `expires_at` by the served
+    // token's own `exp`, so a stale token from the IdP -- or a host clock far
+    // enough ahead to consume the whole lifetime -- produced a set that HAS the
+    // required kind and is already expired. `sign_in()` then returned Ok,
+    // announced success through the renderer, and persisted a dead credential;
+    // the caller's very next request answered "no usable token, call sign_in()",
+    // which is exactly what they had just done.
+    struct RecordRenderer {
+        failures: Arc<std::sync::Mutex<Vec<String>>>,
+        successes: Arc<AtomicUsize>,
+    }
+    impl Renderer for RecordRenderer {
+        fn on_failure(&self, message: &str) {
+            self.failures.lock().unwrap().push(message.to_string());
+        }
+        fn on_success(&self, _identity: Option<&str>, _expires_in_secs: f64) {
+            self.successes.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    // No refresh token: nothing can renew this, so it is a dead end rather
+    // than one extra round trip. The recoverable shape is pinned separately by
+    // `an_expired_token_with_a_refresh_token_still_signs_in`.
+    let mock = MockServer::start(move |method, path, _body| match (method, path) {
+        ("POST", "/device") => (200, device_response()),
+        ("POST", "/token") => (
+            200,
+            format!(r#"{{"access_token":"{ALREADY_EXPIRED_JWT}","expires_in":300}}"#),
+        ),
+        _ => (404, "{}".to_string()),
+    });
+    let dir = TempDir::new().unwrap();
+    let key = key_for(&mock);
+    let failures = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let successes = Arc::new(AtomicUsize::new(0));
+
+    let auth = OidcDeviceAuth::builder()
+        .client_id("questdb")
+        .device_authorization_endpoint(mock.url("/device"))
+        .token_endpoint(mock.url("/token"))
+        .scope("openid")
+        .interactive(true)
+        .open_browser(false)
+        .sleep_hook(no_sleep())
+        .token_store(FileTokenStore::at(dir.path()))
+        .renderer(RecordRenderer {
+            failures: Arc::clone(&failures),
+            successes: Arc::clone(&successes),
+        })
+        .build()
+        .expect("build auth");
+
+    let err = auth.sign_in().unwrap_err();
+    assert_eq!(err.kind(), OidcErrorKind::DeviceFlow);
+    let msg = err.to_string();
+    assert!(msg.contains("already expired"), "{msg}");
+    assert!(msg.contains("no refresh token"), "{msg}");
+    // Not the missing-kind message: the kind IS present, so pointing the user
+    // at their scope would send them after the wrong thing.
+    assert!(!msg.contains("no access_token"), "{msg}");
+
+    assert_eq!(
+        successes.load(Ordering::SeqCst),
+        0,
+        "a dead credential was announced as a successful sign-in"
+    );
+    let failures = failures.lock().unwrap();
+    assert_eq!(failures.len(), 1);
+    assert!(failures[0].contains("already expired"), "{:?}", failures[0]);
+
+    // Nothing dead was written to the store.
+    assert!(
+        FileTokenStore::at(dir.path()).load(&key).unwrap().is_none(),
+        "an expired credential was persisted"
+    );
+}
+
+#[test]
+fn an_expired_token_with_a_refresh_token_still_signs_in() {
+    // The boundary of the guard above, and a live constraint: three Python
+    // integration tests reach the refresh path by signing in with exactly this
+    // shape. An IdP issuing a short-lived access token alongside a refresh
+    // token is ordinary, and the next `token()` renews it without a prompt --
+    // one extra round trip, not a dead end. Refusing it here would be a
+    // regression, not a fix.
+    let mock = MockServer::start(move |method, path, body| match (method, path) {
+        ("POST", "/device") => (200, device_response()),
+        ("POST", "/token") if body.contains("grant_type=refresh_token") => (
+            200,
+            r#"{"access_token":"AT-fresh","refresh_token":"RT-2","expires_in":300}"#.to_string(),
+        ),
+        ("POST", "/token") => (
+            200,
+            format!(
+                r#"{{"access_token":"{ALREADY_EXPIRED_JWT}","refresh_token":"RT-1","expires_in":300}}"#
+            ),
+        ),
+        _ => (404, "{}".to_string()),
+    });
+    let dir = TempDir::new().unwrap();
+    let auth = auth_with_store(&mock, dir.path());
+
+    auth.sign_in()
+        .expect("a refreshable credential must sign in");
+    // ...and the very next call renews it silently rather than demanding a
+    // second sign-in.
+    assert_eq!(auth.token().unwrap(), "AT-fresh");
 }
 
 #[test]

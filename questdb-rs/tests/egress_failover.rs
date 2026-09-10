@@ -2793,6 +2793,46 @@ fn initial_connect_bails_immediately_on_auth_error() {
 }
 
 #[test]
+fn initial_connect_does_not_replay_a_401_with_an_unchanged_token() {
+    // The other half of `initial_connect_retries_same_endpoint_once_with_
+    // rotated_token`. Only the changed-token branch was covered, so replaying
+    // unconditionally failed nothing -- and a genuine rejection would cost a
+    // second full connect per endpoint on every walk.
+    let srv = MockServer::start(vec![
+        vec![Action::Reject401],
+        happy_script(ServerRole::Standalone, "a"),
+    ]);
+    let calls = Arc::new(AtomicUsize::new(0));
+    let cfg = questdb::egress::ReaderConfig::from_conf(format!("ws::addr={}", srv.url()))
+        .unwrap()
+        .token_provider({
+            let calls = Arc::clone(&calls);
+            // Byte-identical every time, so the 401 is a real rejection rather
+            // than an expiry the provider can rotate out of.
+            move || {
+                calls.fetch_add(1, Ordering::SeqCst);
+                Ok::<_, questdb::Error>("same".to_string())
+            }
+        })
+        .unwrap();
+
+    let err = match Reader::from_config(&cfg) {
+        Err(err) => err,
+        Ok(_) => panic!("an unchanged token must not recover a 401"),
+    };
+    assert_eq!(err.code(), ErrorCode::AuthError, "{err}");
+    // The provider is re-asked once to learn whether the credential rotated; it
+    // is the replay, not the re-resolution, that the guard prevents. The second
+    // scripted script stays untouched.
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
+    assert_eq!(
+        srv.accepts(),
+        1,
+        "the endpoint was replayed after a real reject"
+    );
+}
+
+#[test]
 fn initial_connect_retries_same_endpoint_once_with_rotated_token() {
     let srv = MockServer::start(vec![
         vec![Action::Reject401],
