@@ -493,18 +493,20 @@ impl Sender {
                     0.0f64
                 };
 
-                // Resolve the auth header once per flush (a token provider is
-                // called here); a provider failure fails the flush before any
-                // network I/O and is retriable by the caller.
-                let auth_header = state.auth.resolve()?;
-
+                // The auth header is resolved inside `http_send_with_retries`,
+                // under the same `retry_timeout` deadline as the request
+                // attempts. A token provider is called there, and a recoverable
+                // provider failure is re-resolved rather than ending the flush:
+                // resolving out here returned a `SocketError` after zero
+                // requests, and the bindings clear the sender-owned buffer on any
+                // flush failure, so the batch died on a transient the budget was
+                // meant to cover.
                 match http_send_with_retries(
                     state,
                     bytes,
                     *state.config.request_timeout + std::time::Duration::from_secs_f64(extra_time),
                     *state.config.retry_timeout,
                     *state.config.retry_max_backoff,
-                    auth_header.as_deref(),
                 ) {
                     Ok(res) => {
                         if res.status().is_client_error() || res.status().is_server_error() {

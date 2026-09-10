@@ -385,14 +385,13 @@ fn retry_http_send(
     state: &SyncHttpHandlerState,
     buf: &[u8],
     request_timeout: Duration,
-    retry_timeout: Duration,
+    retry_end: std::time::Instant,
     retry_max_backoff: Duration,
     auth: Option<&str>,
     mut last_rep: Result<Response<Body>, ureq::Error>,
     auth_already_rotated: bool,
 ) -> crate::Result<Response<Body>> {
     let mut rng = rand::rng();
-    let retry_end = std::time::Instant::now() + retry_timeout;
     let max_backoff_ms = clamp_backoff_ms(retry_max_backoff);
     let mut retry_interval_ms = 10i32;
     let mut need_retry;
@@ -523,14 +522,94 @@ fn finish_http_send(
     response.map_err(|error| Error::from_ureq_error(error, &state.url))
 }
 
+/// Whether a token-provider failure can clear *on its own*, and so is worth
+/// re-resolving inside the flush's retry budget.
+///
+/// `token_provider::classify_provider_error` leaves the recoverable failures as
+/// `SocketError`. The ones that cannot recover on a later invocation -- a
+/// permanently closed provider, a misconfigured scope, a caller contract
+/// violation -- arrive as `AuthError` / `ConfigError` and must fail the flush at
+/// once rather than burn the whole window on state that never changes.
+///
+/// `InteractionRequired` is the one retryable kind excluded here. It is
+/// retryable in the classifier's sense -- a `sign_in()` on another thread clears
+/// it, which is why the QWP store-and-forward drainer must keep retrying it
+/// rather than abandon queued frames -- but nothing *this flush* waits for makes
+/// it clear, because it needs a human. Spending the window on it would turn
+/// "nobody has signed in" from an immediate, actionable error into one
+/// `retry_timeout` late on every flush. The Python foreground gate makes the
+/// same split for `dataframe()`.
+fn provider_error_is_retryable(e: &Error) -> bool {
+    if e.code() != crate::ErrorCode::SocketError {
+        return false;
+    }
+    #[cfg(feature = "_oidc")]
+    if e.oidc_error()
+        .is_some_and(|oidc| oidc.kind() == crate::oidc::OidcErrorKind::InteractionRequired)
+    {
+        return false;
+    }
+    true
+}
+
+/// Resolve the `Authorization` header for this flush, re-resolving a
+/// recoverable provider failure until `retry_end`.
+///
+/// Resolution shares the flush's retry budget rather than sitting outside it. A
+/// failure here has sent nothing, so the batch is still intact and the usual
+/// causes clear in well under a second: a peer process holding the OIDC
+/// token-store lock across its own refresh, or a transient IdP blip. Returning
+/// such a failure straight to the caller destroyed the batch anyway, because the
+/// C and Python bindings clear the sender-owned buffer on any flush failure, and
+/// the retry those bindings document -- `SocketError` means "retry, exactly as
+/// you would any other" -- then re-flushed an empty buffer and reported success.
+/// The QWP/WebSocket transport already absorbs the same failure into its
+/// reconnect loop and keeps its queued frames; this brings ILP/HTTP into line.
+///
+/// A `Static` or absent credential cannot fail, so this costs those senders one
+/// infallible call and no allocation.
+fn resolve_auth_with_retries(
+    state: &SyncHttpHandlerState,
+    retry_end: std::time::Instant,
+    retry_max_backoff: Duration,
+) -> crate::Result<Option<std::borrow::Cow<'_, str>>> {
+    let mut last = match state.auth.resolve() {
+        Ok(auth) => return Ok(auth),
+        Err(e) => e,
+    };
+    let max_backoff_ms = clamp_backoff_ms(retry_max_backoff);
+    let mut rng = rand::rng();
+    // Same ladder as the request loop: 10ms doubling to `retry_max_backoff`.
+    let mut retry_interval_ms = 10i32;
+    while provider_error_is_retryable(&last) {
+        let to_sleep = retry_sleep(retry_interval_ms, rng.random_range(-5i32..5));
+        if (std::time::Instant::now() + to_sleep) > retry_end {
+            break;
+        }
+        sleep(to_sleep);
+        match state.auth.resolve() {
+            Ok(auth) => return Ok(auth),
+            Err(e) => last = e,
+        }
+        retry_interval_ms = retry_interval_ms.saturating_mul(2).min(max_backoff_ms);
+    }
+    Err(last)
+}
+
 pub(super) fn http_send_with_retries(
     state: &SyncHttpHandlerState,
     buf: &[u8],
     request_timeout: Duration,
     retry_timeout: Duration,
     retry_max_backoff: Duration,
-    auth: Option<&str>,
 ) -> crate::Result<Response<Body>> {
+    // One deadline for the whole flush, covering credential resolution and every
+    // request attempt. Resolving outside it let a recoverable provider failure
+    // end the flush after zero requests and zero milliseconds of a budget the
+    // caller had set for exactly this kind of transient.
+    let retry_end = std::time::Instant::now() + retry_timeout;
+    let auth = resolve_auth_with_retries(state, retry_end, retry_max_backoff)?;
+    let auth = auth.as_deref();
     let (need_retry, last_rep) = state.send_request(buf, request_timeout, auth);
     // A 401 is not retryable, so this is where a credential that expired
     // between resolution and the request used to end the flush as a terminal
@@ -551,7 +630,7 @@ pub(super) fn http_send_with_retries(
             state,
             buf,
             request_timeout,
-            retry_timeout,
+            retry_end,
             retry_max_backoff,
             Some(rotated.as_str()),
             last_rep,
@@ -568,7 +647,7 @@ pub(super) fn http_send_with_retries(
         state,
         buf,
         request_timeout,
-        retry_timeout,
+        retry_end,
         retry_max_backoff,
         auth,
         last_rep,
