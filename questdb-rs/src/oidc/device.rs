@@ -162,6 +162,30 @@ impl StoreState {
         self.next_empty_load_recheck = Some(now + EMPTY_STORE_LOAD_RECHECK_INTERVAL);
     }
 
+    /// Re-arm the lazy store read after this provider has been left holding no
+    /// credential at all.
+    ///
+    /// `load_attempted` means "the store has already been folded into this
+    /// cache", which is true only while the adopted credential still exists. A
+    /// refresh the IdP rejects ends that: `refresh_under_lock` consumes and
+    /// deletes the persisted parent before submitting it, to prevent
+    /// refresh-token reuse, and scrubs the in-memory copy alongside it. The
+    /// provider then holds nothing while the latch still claims the store was
+    /// consumed, so every later `token()` short-circuits the read and returns
+    /// `InteractionRequired` for the life of the process — and an operator
+    /// signing in from another process writes a good entry nobody ever reads.
+    /// `classify_provider_error` deliberately keeps `InteractionRequired`
+    /// retryable, so the drainer retries a condition that can never clear.
+    ///
+    /// This is the same lock-out `next_empty_load_recheck` exists to prevent for
+    /// a store that was empty on first read; it puts the adopted-then-lost case
+    /// on the same footing, throttled by the same interval so the re-check costs
+    /// one locked read per interval rather than one per flush.
+    fn rearm_store_load(&mut self, now: Instant) {
+        self.load_attempted = false;
+        self.record_store_load_empty(now);
+    }
+
     fn store_load_backed_off(&self, now: Instant) -> bool {
         self.next_load_attempt.is_some_and(|next| now < next)
     }
@@ -1250,7 +1274,17 @@ impl OidcDeviceAuth {
                     return Err(e);
                 }
                 // Refresh token rejected (expired/revoked): fall through.
-                Err(_) => {}
+                Err(_) => {
+                    // The parent was consumed and deleted before the request and
+                    // the in-memory copy is scrubbed, so this provider now holds
+                    // no credential anywhere. Re-arm the lazy store read: the
+                    // latch set when that entry was adopted describes a store
+                    // this provider no longer has, and leaving it set strands a
+                    // headless caller for the life of the process even after a
+                    // peer signs in against the same store. See
+                    // `StoreState::rearm_store_load`.
+                    self.lock_store_state().rearm_store_load(Instant::now());
+                }
             }
         }
 

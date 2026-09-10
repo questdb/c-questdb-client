@@ -4116,6 +4116,96 @@ fn a_peer_process_sign_in_is_adopted_without_a_restart() {
 }
 
 #[test]
+fn a_rejected_refresh_does_not_strand_the_provider_against_a_peer_sign_in() {
+    // Regression, and the sibling of
+    // `a_peer_process_sign_in_is_adopted_without_a_restart` for a store that was
+    // read and adopted before it was lost.
+    //
+    // `load_attempted` means "the store has been folded into this cache", which
+    // holds only while the adopted credential still exists. A refresh the IdP
+    // rejects ends that: `refresh_under_lock` consumes and deletes the persisted
+    // parent before submitting it, to prevent refresh-token reuse, and scrubs
+    // the in-memory copy alongside it. The provider was then left holding
+    // nothing while the latch still claimed the store had been consumed, so
+    // every later `token()` short-circuited the read and returned
+    // InteractionRequired for the life of the process. `classify_provider_error`
+    // keeps that retryable, so the QWP drainer retried a condition that could
+    // never clear, while an operator signing in from another process wrote a
+    // perfectly good entry nobody ever read. Only a restart recovered.
+    let reject_refresh = Arc::new(AtomicBool::new(true));
+    let mock = {
+        let reject_refresh = Arc::clone(&reject_refresh);
+        MockServer::start(move |method, path, body| match (method, path) {
+            ("POST", "/device") => (200, device_response()),
+            ("POST", "/token") if body.contains("grant_type=refresh_token") => {
+                if reject_refresh.load(Ordering::SeqCst) {
+                    // Expired, revoked, or reuse-detected: ordinary IdP
+                    // behaviour over a long process lifetime.
+                    (400, r#"{"error":"invalid_grant"}"#.to_string())
+                } else {
+                    (
+                        200,
+                        r#"{"access_token":"AT-2","refresh_token":"RT-2","expires_in":300}"#
+                            .to_string(),
+                    )
+                }
+            }
+            ("POST", "/token") => (
+                200,
+                r#"{"access_token":"AT-1","refresh_token":"RT-1","expires_in":300}"#.to_string(),
+            ),
+            _ => (404, "{}".to_string()),
+        })
+    };
+    let dir = TempDir::new().unwrap();
+    let key = key_for(&mock);
+
+    // An operator signs in, so the shared store holds a credential.
+    auth_with_store(&mock, dir.path()).sign_in().unwrap();
+
+    // The long-lived headless service adopts it, which latches the one-shot read.
+    let service = auth_with_store(&mock, dir.path());
+    assert_eq!(service.token().unwrap(), "AT-1");
+    assert!(
+        service.store_state.lock().unwrap().load_attempted,
+        "adopting an entry must latch the one-shot load"
+    );
+
+    // The access token's lifetime elapses, on disk as well as in memory, so the
+    // next call must actually go to the token endpoint. The refresh is rejected
+    // there, which consumes the persisted parent and scrubs the in-memory copy.
+    expire_persisted(dir.path(), &key);
+    service.tokens.lock().unwrap().as_mut().unwrap().expires_at = 1.0;
+    assert_eq!(
+        service.token().unwrap_err().kind(),
+        OidcErrorKind::InteractionRequired
+    );
+    {
+        let state = service.store_state.lock().unwrap();
+        assert!(
+            !state.load_attempted,
+            "a rejected refresh left the read latched, so a peer sign-in can never be adopted"
+        );
+        assert!(
+            state.next_empty_load_recheck.is_some(),
+            "the re-armed read must be throttled, not repeated per token()"
+        );
+    }
+
+    // An operator signs in again from another process, against the same store.
+    reject_refresh.store(false, Ordering::SeqCst);
+    auth_with_store(&mock, dir.path()).sign_in().unwrap();
+
+    // Let the re-check interval elapse without sleeping in the test.
+    service.store_state.lock().unwrap().next_empty_load_recheck = None;
+    assert_eq!(
+        service.token().unwrap(),
+        "AT-1",
+        "the peer sign-in was not picked up without a restart"
+    );
+}
+
+#[test]
 fn lazy_load_waits_out_peer_refresh_tombstone() {
     let refresh_calls = Arc::new(AtomicUsize::new(0));
     let refresh_entered = Arc::new(Barrier::new(2));
