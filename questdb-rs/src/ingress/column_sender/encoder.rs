@@ -1409,6 +1409,70 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "arrow-ingress")]
+    #[test]
+    fn geohash_deferred_dense_slice_of_sparse_parent_matches_fresh_dense() {
+        use super::super::NumpyDtype;
+        use arrow::array::Int64Array;
+        use arrow::buffer::{BooleanBuffer, NullBuffer};
+        use std::sync::Arc;
+
+        for bits in [8u8, 16, 24, 32, 40, 48, 56] {
+            let max = (1i64 << bits) - 1;
+            let mut values = [0; 24];
+            values[8..17].fill(max);
+            let validity_bits = [0, 0xff, 1];
+            let validity = Validity::from_bitmap(&validity_bits, values.len()).unwrap();
+            let mut numpy = Chunk::new("t");
+            let mut dense = Chunk::new("t");
+            // SAFETY: contiguous values and validity outlive chunks and encoding.
+            unsafe {
+                numpy
+                    .push_numpy_deferred(
+                        "g",
+                        NumpyDtype::GeohashI64 { bits },
+                        values.as_ptr().cast(),
+                        values.len(),
+                        Some(&validity),
+                    )
+                    .unwrap();
+                dense
+                    .push_numpy_deferred(
+                        "g",
+                        NumpyDtype::GeohashI64 { bits },
+                        values[8..].as_ptr().cast(),
+                        9,
+                        None,
+                    )
+                    .unwrap();
+            }
+            numpy.at_now().unwrap();
+            dense.at_now().unwrap();
+            let mut arrow = Chunk::new("t");
+            arrow
+                .push_arrow_deferred(
+                    "g",
+                    arrow_batch::ColumnKind::Geohash(bits),
+                    Arc::new(Int64Array::new(
+                        values.to_vec().into(),
+                        Some(NullBuffer::new(BooleanBuffer::from(
+                            (0..24).map(|i| (8..17).contains(&i)).collect::<Vec<_>>(),
+                        ))),
+                    )),
+                )
+                .unwrap();
+            arrow.at_now().unwrap();
+            let expected = encode_fresh(&dense);
+            for parent in [&numpy, &arrow] {
+                // SAFETY: byte-aligned offset and in-bounds range; parents and
+                // their borrowed storage remain alive through synchronous encode.
+                let sliced = unsafe { parent.slice_rows(8, 9) };
+                assert_eq!(encode_fresh(&sliced), expected, "bits={bits}");
+                assert!(estimate_frame_size(&sliced, 9, &[], 0, &[]) >= expected.len());
+            }
+        }
+    }
+
     #[test]
     fn checked_symbol_slot_rejects_out_of_range_and_negative_codes() {
         // Defence-in-depth for a codes buffer mutated between append and flush

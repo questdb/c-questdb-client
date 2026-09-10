@@ -5635,6 +5635,37 @@ mod tests {
     }
 
     #[test]
+    fn geohash_explicit_validity_and_unaligned_slices_have_exact_bitmap() {
+        use arrow::buffer::BooleanBuffer;
+
+        for bits in [8u8, 16, 24, 32, 40, 48, 56] {
+            let max = (1i64 << bits) - 1;
+            for sparse in [false, true] {
+                let mut valid = vec![false; 15];
+                valid[3..12].fill(true);
+                if sparse {
+                    valid[7] = false;
+                }
+                let parent = Int64Array::new(
+                    vec![max; 15].into(),
+                    Some(NullBuffer::new(BooleanBuffer::from(valid))),
+                );
+                let arr = parent.slice(3, 9);
+                // Slicing preserves an explicit buffer even for a dense slice.
+                assert!(arr.nulls().is_some());
+                assert_eq!(arr.null_count(), usize::from(sparse));
+                let mut out = vec![0xaa];
+                write_arrow_column_body(&mut out, ColumnKind::Geohash(bits), &arr, None).unwrap();
+                let mut expected = vec![0xaa, 1, if sparse { 0x10 } else { 0 }, 0, bits];
+                for _ in 0..9 - usize::from(sparse) {
+                    expected.extend_from_slice(&max.to_le_bytes()[..usize::from(bits / 8)]);
+                }
+                assert_eq!(out, expected, "bits={bits}, sparse={sparse}");
+            }
+        }
+    }
+
+    #[test]
     fn designated_ts_with_null_rejects() {
         let mut payload = Int64Builder::new();
         payload.append_value(1);

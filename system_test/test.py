@@ -2023,6 +2023,53 @@ class TestQwpWsProtocol(QwpWsTestSupport, unittest.TestCase):
                 ['r3', None, 'three'],
             ])
 
+    def test_geohash_maxima_and_omissions_round_trip(self):
+        precisions = (8, 16, 24, 32, 40, 48, 56)
+        table_name = 'qwp_ws_geohash_' + uuid.uuid4().hex[:8]
+        columns = ', '.join(f'g{p} GEOHASH({p}b)' for p in precisions)
+        sql_query(
+            f'CREATE TABLE "{table_name}" '
+            f'(id LONG, {columns}, ts TIMESTAMP) '
+            'TIMESTAMP(ts) PARTITION BY DAY WAL')
+        sender_id = 'proto-geohash-' + uuid.uuid4().hex[:8]
+
+        with tempfile.TemporaryDirectory(prefix='qwp-ws-geohash-') as sf_dir:
+            sender = self._connect_protocol_sender(sender_id, sf_dir)
+            try:
+                # Flush a dense batch first, then reuse the buffer with an omission.
+                for batch in ((0, 1), (2, 3, 4)):
+                    for row_id in batch:
+                        sender.table(table_name).column('id', row_id)
+                        if row_id != 3:
+                            for p in precisions:
+                                value = 0 if row_id == 1 else (1 << p) - 1
+                                sender.column_geohash(f'g{p}', value, p)
+                        sender.at_micros(
+                            self.BASE_TS_US + row_id * self.TS_STEP_US)
+                    sender.flush()
+                sender.close_drain()
+            finally:
+                sender.close(False)
+
+        projection = ', '.join(f'g{p}' for p in precisions)
+        resp = self._retry_query_rows(
+            f'select id, {projection} from "{table_name}" order by id',
+            5,
+            timeout_sec=30)
+        self.assertEqual(
+            resp['columns'],
+            [{'name': 'id', 'type': 'LONG'}] + [
+                {'name': f'g{p}', 'type': (
+                    f'GEOHASH({p // 5}c)' if p % 5 == 0 else f'GEOHASH({p}b)')}
+                for p in precisions])
+        # /exec renders multiples of five bits as base32, other precisions as bits.
+        maxima = ['z' * (p // 5) if p % 5 == 0 else '1' * p for p in precisions]
+        zeros = ['0' * (p // 5 if p % 5 == 0 else p) for p in precisions]
+        self.assertEqual(
+            resp['dataset'],
+            [[0] + maxima, [1] + zeros, [2] + maxima,
+             [3] + [None] * len(precisions), [4] + maxima])
+
     def test_schema_rejection_terminalizes_and_preserves_store(self):
         table_name = 'qwp_ws_reject_' + uuid.uuid4().hex[:8]
         sql_query(

@@ -1604,6 +1604,41 @@ mod tests {
     }
 
     #[test]
+    fn numpy_geohash_explicit_validity_has_exact_bitmap() {
+        for bits in [8u8, 16, 24, 32, 40, 48, 56] {
+            let max = (1i64 << bits) - 1;
+            let values = [max; 9];
+            for sparse in [false, true] {
+                // Unused validity bits are deliberately set, not null rows.
+                let validity_bits = [if sparse { 0xef } else { 0xff }, 0xff];
+                let validity = Validity::from_bitmap(&validity_bits, values.len()).unwrap();
+                let descriptor = ValidityDescriptor {
+                    bits: validity_bits.as_ptr(),
+                    bit_len: values.len(),
+                    non_null_count: validity.non_null_count(),
+                };
+                let mut out = vec![0xaa];
+                // SAFETY: values and validity cover all rows and outlive encode.
+                unsafe {
+                    emit_into_wire(
+                        &mut out,
+                        NumpyDtype::GeohashI64 { bits },
+                        values.as_ptr().cast(),
+                        values.len(),
+                        Some(&descriptor),
+                    )
+                    .unwrap();
+                }
+                let mut expected = vec![0xaa, 1, if sparse { 0x10 } else { 0 }, 0, bits];
+                for _ in 0..9 - usize::from(sparse) {
+                    expected.extend_from_slice(&max.to_le_bytes()[..usize::from(bits / 8)]);
+                }
+                assert_eq!(out, expected, "bits={bits}, sparse={sparse}");
+            }
+        }
+    }
+
+    #[test]
     fn decimal_dtype_rejects_scale_above_width_max() {
         assert!(NumpyDtype::Decimal64 { scale: 18 }.validate().is_ok());
         assert!(NumpyDtype::Decimal128 { scale: 38 }.validate().is_ok());

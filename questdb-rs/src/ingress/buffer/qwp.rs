@@ -4524,8 +4524,16 @@ impl QwpWsColumnBuffer {
     }
 
     fn encode(&self, row_count: usize, globals: &[u64], out: &mut Vec<u8>) -> crate::Result<()> {
-        out.push(u8::from(self.uses_null_bitmap(row_count)));
-        if self.uses_null_bitmap(row_count) {
+        let uses_null_bitmap = self.uses_null_bitmap(row_count);
+        out.push(u8::from(uses_null_bitmap));
+        if uses_null_bitmap && self.non_null_count as usize == row_count {
+            // Dense GEOHASH still needs a bitmap to distinguish maxima from null.
+            // All bits are zero; equality with the u32 count also proves the
+            // row-count bound otherwise checked by encode_null_bitmap.
+            let end =
+                checked_qwp_usize_add(out.len(), bitmap_bytes(row_count), "null bitmap size")?;
+            out.resize(end, 0);
+        } else if uses_null_bitmap {
             self.values.encode_null_bitmap(row_count, out)?;
         }
         self.values.encode(row_count, globals, out)
@@ -7660,8 +7668,13 @@ fn encode_column_from_cells(
 
     out.push(u8::from(uses_null_bitmap));
 
-    // Null bitmap
-    if uses_null_bitmap {
+    // Dense GEOHASH needs the bitmap even for maxima, but every null bit is
+    // known to be zero. Equality with the u32 count also proves GapFillIter's
+    // row-count bound without traversing the cells.
+    if uses_null_bitmap && col.non_null_count as usize == row_count {
+        let end = checked_qwp_usize_add(out.len(), bitmap_bytes(row_count), "null bitmap size")?;
+        out.resize(end, 0);
+    } else if uses_null_bitmap {
         let mut packed = 0u8;
         let mut bit_idx = 0u8;
         for maybe_cell in GapFillIter::new(cells, col.cell_head, row_count)? {
@@ -11167,6 +11180,148 @@ mod tests {
         );
     }
 
+    /// Actual batch size (default one million), not accumulated small batches.
+    /// Run with `cargo test --release --manifest-path questdb-rs/Cargo.toml
+    /// --features sync-sender-qwp-ws,sync-sender-qwp-udp --lib
+    /// qwp_geohash_dense_bitmap_benchmark -- --ignored --nocapture --test-threads=1`.
+    /// QWP_GEOHASH_BENCH_{ROWS,SAMPLES,ITERATIONS} default to 1000000, 9, 10;
+    /// QWP_GEOHASH_BENCH_CASE optionally selects one case below.
+    #[cfg(feature = "_sender-qwp-ws")]
+    #[test]
+    #[ignore = "performance benchmark"]
+    fn qwp_geohash_dense_bitmap_benchmark() {
+        use std::{hint::black_box, time::Instant};
+
+        fn setting(name: &str, default: usize) -> usize {
+            let value = std::env::var(name)
+                .map(|value| value.parse().expect("positive integer benchmark setting"))
+                .unwrap_or(default);
+            assert!(value > 0);
+            value
+        }
+
+        fn measure(
+            case: &str,
+            phase: &str,
+            rows: usize,
+            samples: usize,
+            iterations: usize,
+            mut encode: impl FnMut() -> usize,
+        ) {
+            let expected_bytes = encode(); // Warm output/scratch capacity.
+            for sample in 0..samples {
+                let start = Instant::now();
+                let mut bytes = 0;
+                for _ in 0..iterations {
+                    bytes = black_box(encode());
+                }
+                let ns = start.elapsed().as_nanos() / iterations as u128;
+                assert_eq!(bytes, expected_bytes);
+                let unit = if phase.ends_with("_build") {
+                    "rows"
+                } else {
+                    "bytes"
+                };
+                eprintln!(
+                    "geohash_bench case={case} phase={phase} rows={rows} sample={sample} iterations={iterations} ns={ns} output={bytes} unit={unit}"
+                );
+            }
+        }
+
+        let rows = setting("QWP_GEOHASH_BENCH_ROWS", 1_000_000);
+        let samples = setting("QWP_GEOHASH_BENCH_SAMPLES", 9);
+        let iterations = setting("QWP_GEOHASH_BENCH_ITERATIONS", 10);
+        let filter = std::env::var("QWP_GEOHASH_BENCH_CASE").ok();
+        for (case, bits, value, sparse) in [
+            ("dense8", 8, 42, false),
+            ("max8", 8, 255, false),
+            ("dense16", 16, 65535, false),
+            ("dense56", 56, (1_u64 << 56) - 1, false),
+            ("sparse8", 8, 255, true),
+            ("dense7", 7, 127, false),
+        ] {
+            if filter.as_ref().is_some_and(|filter| filter != case) {
+                continue;
+            }
+            let mut ws = QwpWsColumnarBuffer::new(127);
+            let mut buf = QwpBuffer::new(127);
+            // Measure construction separately, with capacity reuse, so an
+            // encoding improvement cannot conceal work moved to appending.
+            measure(case, "ws_build", rows, samples, 1, || {
+                ws.clear();
+                for row in 0..rows {
+                    ws.table("t").unwrap();
+                    if sparse && row % 8 == 3 {
+                        ws.column_i64("id", row as i64).unwrap();
+                    } else {
+                        ws.column_geohash("g", value, bits).unwrap();
+                    }
+                    ws.at_now().unwrap();
+                }
+                black_box(&ws);
+                ws.row_count()
+            });
+            measure(case, "row_build", rows, samples, 1, || {
+                buf.clear();
+                for row in 0..rows {
+                    buf.table("t").unwrap();
+                    if sparse && row % 8 == 3 {
+                        buf.column_i64("id", row as i64).unwrap();
+                    } else {
+                        buf.column_geohash("g", value, bits).unwrap();
+                    }
+                    buf.at_now().unwrap();
+                }
+                black_box(&buf);
+                buf.row_count()
+            });
+
+            let mut scratch = QwpWsEncodeScratch::new();
+            let mut dict = SymbolGlobalDict::new();
+            measure(case, "ws_message", rows, samples, iterations, || {
+                black_box(&ws)
+                    .encode_ws_replay_message(&mut scratch, &mut dict, QWP_VERSION_1)
+                    .unwrap();
+                black_box(scratch.message.as_slice()).len()
+            });
+
+            // Isolate the second affected encoder from datagram replanning.
+            // This is a column microbenchmark, NOT a million-row UDP packet.
+            let planner = buf.size_hint.segment_planner(0).unwrap();
+            let col = &planner.columns[0];
+            assert_eq!(col.kind, ColumnKind::Geohash);
+            let mut out = Vec::new();
+            measure(case, "cells_column", rows, samples, iterations, || {
+                out.clear();
+                encode_column_from_cells(
+                    black_box(col),
+                    rows,
+                    &planner.cells,
+                    &planner.symbol_dict,
+                    &buf.value_bytes,
+                    &mut out,
+                )
+                .unwrap();
+                black_box(out.as_slice()).len()
+            });
+
+            // Production cap/splitting path, including planner replay but no
+            // network or collected datagram allocations. Sender scratch reused.
+            let cap = 1400;
+            let mut scratch = QwpSendScratch::new(cap);
+            measure(case, "datagrams_1400", rows, samples, 1, || {
+                let mut bytes = 0;
+                buf.flush_to_socket(&mut scratch, cap, &mut |datagram| {
+                    assert!(datagram.len() <= cap);
+                    bytes += black_box(datagram).len();
+                    Ok(())
+                })
+                .unwrap();
+                bytes
+            });
+        }
+    }
+
     #[test]
     fn qwp_single_row_without_designated_timestamp_omits_empty_column() {
         let mut buf = QwpBuffer::new(127);
@@ -13431,6 +13586,269 @@ mod tests {
         assert_eq!(got, expected);
     }
 
+    // Deliberately slow wire oracle: derive every null bit from the input rows,
+    // not the encoders' density counts, bitmap predicates or presence iterators.
+    fn reference_geohash_payload(bits: u8, values: &[Option<u64>]) -> Vec<u8> {
+        let bitmap = bits.is_multiple_of(8) || values.iter().any(Option::is_none);
+        let mut out = vec![u8::from(bitmap)];
+        if bitmap {
+            for rows in values.chunks(8) {
+                let mut byte = 0;
+                for (bit, value) in rows.iter().enumerate() {
+                    if value.is_none() {
+                        byte |= 1 << bit;
+                    }
+                }
+                out.push(byte);
+            }
+        }
+        out.push(bits); // All supported precisions fit in one varint byte.
+        for value in values.iter().flatten() {
+            for byte in 0..usize::from(bits).div_ceil(8) {
+                out.push((value >> (byte * 8)) as u8);
+            }
+        }
+        out
+    }
+
+    fn reset_geohash_output(out: &mut Vec<u8>) {
+        // Poison previously used storage, including the final bitmap byte.
+        out.fill(0xff);
+        out.clear();
+        out.extend_from_slice(b"prefix\xff");
+    }
+
+    fn assert_geohash_payload(out: &[u8], bits: u8, values: &[Option<u64>]) {
+        let reference = reference_geohash_payload(bits, values);
+        assert_eq!(&out[..7], b"prefix\xff");
+        let payload = &out[7..];
+        assert_eq!(payload, reference, "bits={bits}, values={values:?}");
+        let bitmap = bits.is_multiple_of(8) || values.iter().any(Option::is_none);
+        assert_eq!(payload[0], u8::from(bitmap));
+        assert_eq!(
+            payload.len(),
+            2 + if bitmap { values.len().div_ceil(8) } else { 0 }
+                + values.iter().flatten().count() * usize::from(bits).div_ceil(8)
+        );
+        if bitmap && !values.len().is_multiple_of(8) {
+            assert_eq!(payload[values.len().div_ceil(8)] >> (values.len() % 8), 0);
+        }
+
+        // Wrap the actual payload in a single-column datagram to use the
+        // existing independent decoder, including its no-bitmap sentinel rules.
+        let mut datagram = vec![0; QWP_MESSAGE_HEADER_SIZE];
+        write_qwp_bytes(&mut datagram, b"t");
+        write_qwp_varint(&mut datagram, values.len() as u64);
+        write_qwp_varint(&mut datagram, 1);
+        write_qwp_bytes(&mut datagram, b"g");
+        datagram.push(QWP_TYPE_GEOHASH);
+        datagram.extend_from_slice(payload);
+        let header = QwpMessageHeader {
+            magic: *b"QWP1",
+            version: QWP_VERSION_1,
+            flags: 0,
+            table_count: 1,
+            payload_len: (datagram.len() - QWP_MESSAGE_HEADER_SIZE) as u32,
+        };
+        header.write_to(&mut datagram[..QWP_MESSAGE_HEADER_SIZE]);
+        let decoded = decode_datagram(&datagram).unwrap();
+        assert_eq!(decoded.table.columns[0].nullable, bitmap);
+        let expected: Vec<_> = values
+            .iter()
+            .map(|value| {
+                vec![
+                    value.map_or(DecodedValue::Null, |value| DecodedValue::Geohash {
+                        bits: value,
+                        precision_bits: bits,
+                    }),
+                ]
+            })
+            .collect();
+        assert_eq!(decoded.table.rows, expected);
+    }
+
+    #[cfg(feature = "_sender-qwp-ws")]
+    fn assert_ws_geohash_payload(
+        buf: &QwpWsColumnarBuffer,
+        bits: u8,
+        values: &[Option<u64>],
+        out: &mut Vec<u8>,
+    ) {
+        let table = &buf.tables[0];
+        let col = table
+            .columns
+            .iter()
+            .find(|col| col.kind == ColumnKind::Geohash)
+            .unwrap();
+        assert_eq!(table.row_count as usize, values.len());
+        assert_eq!(col.non_null_count as usize, values.iter().flatten().count());
+        reset_geohash_output(out);
+        col.encode(values.len(), &[], out).unwrap();
+        assert_eq!(col.estimated_payload_len(values.len()), out.len() - 7);
+        assert_geohash_payload(out, bits, values);
+    }
+
+    fn check_geohash_row_encoders(bits: u8, values: &[Option<u64>], out: &mut Vec<u8>) {
+        // Both sets of internals are populated via real row producers. Omission
+        // is the scalar GEOHASH null API; an id permits rows without a GEOHASH.
+        let mut buf = QwpBuffer::new(127);
+        #[cfg(feature = "_sender-qwp-ws")]
+        let mut ws = QwpWsColumnarBuffer::new(127);
+        for (row, value) in values.iter().enumerate() {
+            buf.table("t")
+                .unwrap()
+                .column_i64("id", row as i64)
+                .unwrap();
+            if let Some(value) = value {
+                buf.column_geohash("g", *value, bits).unwrap();
+            }
+            buf.at_now().unwrap();
+            #[cfg(feature = "_sender-qwp-ws")]
+            {
+                ws.table("t").unwrap().column_i64("id", row as i64).unwrap();
+                if let Some(value) = value {
+                    ws.column_geohash("g", *value, bits).unwrap();
+                }
+                ws.at_now().unwrap();
+            }
+        }
+        let mut planner = RowGroupPlanner::new();
+        for row in &buf.rows {
+            planner
+                .add_row(
+                    row,
+                    buf.entries_for_row(row),
+                    &buf.name_bytes,
+                    &buf.value_bytes,
+                    1,
+                )
+                .unwrap();
+        }
+        let col = planner
+            .columns
+            .iter()
+            .find(|col| col.kind == ColumnKind::Geohash)
+            .unwrap();
+        assert_eq!(col.non_null_count as usize, values.iter().flatten().count());
+        reset_geohash_output(out);
+        encode_column_from_cells(
+            col,
+            values.len(),
+            &planner.cells,
+            &planner.symbol_dict,
+            &buf.value_bytes,
+            out,
+        )
+        .unwrap();
+        assert_eq!(col.payload_len(values.len()).unwrap(), out.len() - 7);
+        assert_geohash_payload(out, bits, values);
+        #[cfg(feature = "_sender-qwp-ws")]
+        assert_ws_geohash_payload(&ws, bits, values, out);
+    }
+
+    #[test]
+    fn qwp_geohash_row_encoders_reference_precision_sweep() {
+        let mut out = vec![0xff; 256];
+        for bits in 1..=60 {
+            let max = (1_u64 << bits) - 1;
+            check_geohash_row_encoders(bits, &[Some(0), Some(max / 2), Some(max)], &mut out);
+        }
+    }
+
+    #[test]
+    fn qwp_geohash_row_encoders_reference_bitmap_boundaries() {
+        let mut out = vec![0xff; 256];
+        for bits in [8, 16, 24, 32, 40, 48, 56] {
+            for rows in [1, 7, 8, 9, 15, 16, 17] {
+                for pattern in 0..5 {
+                    let values: Vec<_> = (0..rows)
+                        .map(|row| {
+                            let omitted = match pattern {
+                                0 => false,
+                                1 => row == 0,
+                                2 => row == rows / 2,
+                                3 => row == rows - 1,
+                                _ => row % 2 == 1,
+                            };
+                            let max = (1_u64 << bits) - 1;
+                            (!omitted).then_some(match row % 3 {
+                                0 => 0,
+                                1 => max / 2,
+                                _ => max,
+                            })
+                        })
+                        .collect();
+                    // A fresh row buffer has no column at all if every row
+                    // omits it. Retained all-null columns are tested via WS reuse.
+                    if values.iter().any(Option::is_some) {
+                        check_geohash_row_encoders(bits, &values, &mut out);
+                    }
+                }
+            }
+        }
+    }
+
+    #[cfg(feature = "_sender-qwp-ws")]
+    #[test]
+    fn qwp_ws_geohash_reference_lifecycle_clear_repin_and_boundary_rollback() {
+        let mut buf = QwpWsColumnarBuffer::new(127);
+        let mut out = vec![0xff; 256];
+        // Reuse the same retained column: dense -> sparse -> dense -> all-null
+        // -> dense, repinning to a new precision after each clear.
+        for (bits, sparse, all_null) in [
+            (8, false, false),
+            (16, true, false),
+            (24, false, false),
+            (24, false, true),
+            (5, false, false),
+        ] {
+            buf.clear();
+            let mut values = Vec::new();
+            for row in 0..17 {
+                if matches!(row, 7 | 8 | 15 | 16) {
+                    // A type error cancels the pending row after its GEOHASH
+                    // append. Re-add at the same row index, sometimes omitting g.
+                    buf.table("t")
+                        .unwrap()
+                        .column_geohash("g", 1, bits)
+                        .unwrap();
+                    assert_eq!(
+                        buf.column_i64("g", 1).unwrap_err().code(),
+                        ErrorCode::InvalidApiCall
+                    );
+                    assert_ws_geohash_payload(&buf, bits, &values, &mut out);
+                }
+                buf.table("t").unwrap().column_i64("id", row).unwrap();
+                let value = (!all_null && (!sparse || row % 2 == 0)).then_some((1_u64 << bits) - 1);
+                if let Some(value) = value {
+                    buf.column_geohash("g", value, bits).unwrap();
+                }
+                buf.at_now().unwrap();
+                values.push(value);
+                assert_ws_geohash_payload(&buf, bits, &values, &mut out);
+            }
+        }
+        buf.clear();
+        assert_eq!(buf.row_count(), 0);
+        let mut scratch = QwpWsEncodeScratch::new();
+        buf.encode_ws_replay_message(&mut scratch, &mut SymbolGlobalDict::new(), QWP_VERSION_1)
+            .unwrap();
+        assert_eq!(
+            u16::from_le_bytes([scratch.message[6], scratch.message[7]]),
+            0
+        );
+        // Empty row groups are not passed directly to either column encoder.
+        let mut rows = QwpBuffer::new(127);
+        rows.table("t")
+            .unwrap()
+            .column_geohash("g", 255, 8)
+            .unwrap()
+            .at_now()
+            .unwrap();
+        rows.clear();
+        assert!(rows.encode_datagrams(1024).unwrap().is_empty());
+    }
+
     #[test]
     fn qwp_geohash_planner_bitmap_boundaries_rollback_and_datagram_caps() {
         for bits in [8, 16, 24, 32, 40, 48, 56] {
@@ -13478,9 +13896,69 @@ mod tests {
                         first_row_len = actual;
                     }
                 }
+                if sparse {
+                    let parent = planner
+                        .columns
+                        .iter()
+                        .find(|col| col.kind == ColumnKind::Geohash)
+                        .unwrap();
+                    assert!(parent.non_null_count < planner.row_count as u32);
+                    // Rows 2 and 3 are dense despite the omitted rows elsewhere
+                    // in this parent batch. The splitter's planner rebases their
+                    // cell indexes and counts to this encoded group.
+                    let mut subgroup = RowGroupPlanner::new();
+                    for row in &buf.rows[2..4] {
+                        subgroup
+                            .add_row(
+                                row,
+                                buf.entries_for_row(row),
+                                &buf.name_bytes,
+                                &buf.value_bytes,
+                                1,
+                            )
+                            .unwrap();
+                    }
+                    let col = subgroup
+                        .columns
+                        .iter()
+                        .find(|col| col.kind == ColumnKind::Geohash)
+                        .unwrap();
+                    assert_eq!(col.non_null_count as usize, subgroup.row_count);
+                    let mut out = Vec::new();
+                    reset_geohash_output(&mut out);
+                    encode_column_from_cells(
+                        col,
+                        subgroup.row_count,
+                        &subgroup.cells,
+                        &subgroup.symbol_dict,
+                        &buf.value_bytes,
+                        &mut out,
+                    )
+                    .unwrap();
+                    assert_geohash_payload(&out, bits, &[Some((1_u64 << bits) - 1); 2]);
+                    assert_eq!(
+                        subgroup.current_len,
+                        encoded_planner_len(&subgroup, &buf.name_bytes, &buf.value_bytes, "t")
+                    );
+                }
                 let whole = buf.encode_datagrams(64 * 1024).unwrap();
                 assert_eq!(whole.len(), 1);
-                let expected = decode_datagram(&whole[0]).unwrap().table.rows;
+                let expected: Vec<_> = (0..17)
+                    .map(|row| {
+                        vec![
+                            DecodedValue::I64(row),
+                            if sparse && row % 3 == 1 {
+                                DecodedValue::Null
+                            } else {
+                                DecodedValue::Geohash {
+                                    bits: (1_u64 << bits) - 1,
+                                    precision_bits: bits,
+                                }
+                            },
+                        ]
+                    })
+                    .collect();
+                assert_eq!(decode_datagram(&whole[0]).unwrap().table.rows, expected);
                 for cap in [first_row_len, first_row_len + 1, first_row_len + 16] {
                     let datagrams = buf.encode_datagrams(cap).unwrap();
                     assert!(datagrams.len() > 1);
