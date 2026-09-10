@@ -236,12 +236,36 @@ pub struct QuestDb {
     reaper: Option<JoinHandle<()>>,
 }
 
+/// Where a pooled reader's configuration comes from.
+///
+/// One connect string drives both the ingest and the query side, and the two
+/// parsers do not accept the same values: the sender treats the query-side keys
+/// as pass-through (see `QWP_WS_PORTABLE_CONFIG_KEYS`), while `ReaderConfig`
+/// range-checks them. Parsing the query side eagerly is what lets a rotating
+/// token provider be wired into every pooled reader, but making that parse
+/// fatal would refuse a connect string this pool accepted before the parse
+/// moved forward -- breaking an ingest-only deployment on upgrade, over a value
+/// its query side never used.
+#[cfg(feature = "_egress")]
+enum ReaderConfigSource {
+    /// Parsed at connect time, with any rotating token provider already wired
+    /// in and inherited by every pooled reader connection.
+    Ready(Box<ReaderConfig>),
+    /// The connect string carries a query-side value `ReaderConfig` rejects.
+    /// The pool still opens for ingest; the failure is reproduced from the
+    /// original string if and when a reader is actually asked for, which is the
+    /// same point, and the same error, a caller met before the parse was
+    /// hoisted to connect time. A token provider cannot be wired into a config
+    /// that does not parse, but nothing here can produce a reader anyway.
+    Deferred(String),
+}
+
 struct DbInner {
     /// Reusable reader configuration. Kept as a resolved config rather than the
     /// original connect string so programmatic state such as a rotating token
     /// provider is inherited by every pooled reader connection.
     #[cfg(feature = "_egress")]
-    reader_config: ReaderConfig,
+    reader_config: ReaderConfigSource,
     /// Resolved, reusable QWP/WebSocket connect ingredients (endpoint list,
     /// TLS, auth, config). Every sender connection — first-borrow open,
     /// auto-grow, and failover re-borrow — opens through this connector so it rotates
@@ -868,17 +892,35 @@ impl QuestDb {
         let pool_cfg = parsed.pool;
 
         let mut builder = SenderBuilder::from_conf(conf)?;
+        // Tolerated, not fatal: see `ReaderConfigSource`. The sender parser has
+        // already accepted this string, so a query-side rejection here is a
+        // value the ingest path passes through and never reads.
         #[cfg(feature = "_egress")]
-        let mut reader_config = ReaderConfig::from_conf(conf)?;
+        let mut reader_config = match ReaderConfig::from_conf(conf) {
+            Ok(cfg) => Some(cfg),
+            Err(e) => {
+                log::warn!(
+                    "Ignoring the query-side configuration for this connection: {e}. \
+                     Ingestion is unaffected, and this is reported again if a reader \
+                     or query is requested."
+                );
+                None
+            }
+        };
         if let Some(provider) = token_provider {
             let sender_provider = provider.clone();
             builder = builder.qwp_ws_token_provider(move || sender_provider.provide())?;
             #[cfg(feature = "_egress")]
-            {
+            if let Some(cfg) = reader_config.take() {
                 let reader_provider = provider;
-                reader_config = reader_config.token_provider(move || reader_provider.provide())?;
+                reader_config = Some(cfg.token_provider(move || reader_provider.provide())?);
             }
         }
+        #[cfg(feature = "_egress")]
+        let reader_config = match reader_config {
+            Some(cfg) => ReaderConfigSource::Ready(Box::new(cfg)),
+            None => ReaderConfigSource::Deferred(conf.to_string()),
+        };
         if pool_cfg.lazy_connect {
             // Java's lazy_connect injects an async initial connect into the
             // ingest config once; every pooled sender then inherits it.
@@ -1455,7 +1497,12 @@ impl QuestDb {
                 armed: true,
             }
         };
-        let reader = Reader::from_config(&self.inner.reader_config)?;
+        let reader = match &self.inner.reader_config {
+            ReaderConfigSource::Ready(cfg) => Reader::from_config(cfg)?,
+            // Reproduce the parse failure the pool tolerated at connect time,
+            // at the point a caller actually needs the query side.
+            ReaderConfigSource::Deferred(conf) => Reader::from_conf(conf)?,
+        };
         slot.commit();
         Ok(reader)
     }
@@ -3384,6 +3431,38 @@ mod tests {
         let slot = root.join(name);
         fs::create_dir(&slot).unwrap();
         fs::write(slot.join("sf-0.sfa"), b"queued").unwrap();
+    }
+
+    /// Regression: hoisting `ReaderConfig::from_conf` to connect time made the
+    /// query-side parser a gate on opening the pool at all. One connect string
+    /// drives both sides and the sender treats the query-side keys as
+    /// pass-through, so values like `compression=none` or `max_version=2` had
+    /// always been accepted here and simply never read by the ingest path.
+    /// Making them fatal broke ingest-only deployments on upgrade over a query
+    /// side they do not use.
+    #[cfg(all(feature = "_egress", feature = "sync-sender-qwp-ws"))]
+    #[test]
+    fn pool_opens_when_only_the_query_side_config_is_rejected() {
+        for bad in [
+            "compression=none",
+            "max_version=2",
+            "connect_timeout=99999999",
+            "auth_timeout_ms=99999999",
+        ] {
+            let conf = format!("ws::addr=127.0.0.1:19009;lazy_connect=on;{bad};");
+            // The query side rejects it on its own.
+            assert!(
+                crate::egress::ReaderConfig::from_conf(&conf).is_err(),
+                "{bad} is no longer a query-side rejection; pick another value"
+            );
+            // The pool still opens, exactly as it did before the parse moved.
+            let db = crate::QuestDb::connect(&conf)
+                .unwrap_or_else(|e| panic!("{bad} must not block the pool: {e}"));
+            // And the failure is still reported when the query side is asked for.
+            let err = db.borrow_reader().unwrap_err();
+            assert_eq!(err.code(), crate::ErrorCode::ConfigError, "{bad}");
+            db.close();
+        }
     }
 
     #[test]
