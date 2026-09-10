@@ -418,8 +418,9 @@ created, but without raising an error if the table already exists.
 ## Sequential Coupling in the Buffer API
 
 The fluent API of [`Buffer`] has sequential coupling: there's a certain order in
-which you are expected to call the methods. For example, you must write the
-symbols before the columns, and you must terminate each row by calling either
+which you are expected to call the methods. For ILP, you must write the symbols
+before the columns. QWP allows symbols and non-symbol columns in any order. For
+both protocols, you must terminate each row by calling either
 [`at`](Buffer::at) or [`at_now`](Buffer::at_now). Refer to the [`Buffer`] doc
 for the full rules and a flowchart.
 
