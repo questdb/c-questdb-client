@@ -553,7 +553,7 @@ fn provider_error_is_retryable(e: &Error) -> bool {
 }
 
 /// Resolve the `Authorization` header for this flush, re-resolving a
-/// recoverable provider failure until `retry_end`.
+/// recoverable provider failure until the retry budget expires.
 ///
 /// Resolution shares the flush's retry budget rather than sitting outside it. A
 /// failure here has sent nothing, so the batch is still intact and the usual
@@ -566,17 +566,28 @@ fn provider_error_is_retryable(e: &Error) -> bool {
 /// The QWP/WebSocket transport already absorbs the same failure into its
 /// reconnect loop and keeps its queued frames; this brings ILP/HTTP into line.
 ///
+/// The optional deadline in the return value is present when credential
+/// acquisition already entered the retry loop, so request retries can spend
+/// only the remainder of the same budget.
+///
 /// A `Static` or absent credential cannot fail, so this costs those senders one
 /// infallible call and no allocation.
 fn resolve_auth_with_retries(
     state: &SyncHttpHandlerState,
-    retry_end: std::time::Instant,
+    retry_timeout: Duration,
     retry_max_backoff: Duration,
-) -> crate::Result<Option<std::borrow::Cow<'_, str>>> {
+) -> crate::Result<(
+    Option<std::borrow::Cow<'_, str>>,
+    Option<std::time::Instant>,
+)> {
     let mut last = match state.auth.resolve() {
-        Ok(auth) => return Ok(auth),
+        Ok(auth) => return Ok((auth, None)),
         Err(e) => e,
     };
+    // `retry_timeout` is a budget for retries, not for the initial attempt.
+    // Start it only after that attempt fails, then carry the same deadline into
+    // the request retry loop if credential acquisition eventually succeeds.
+    let retry_end = std::time::Instant::now() + retry_timeout;
     let max_backoff_ms = clamp_backoff_ms(retry_max_backoff);
     let mut rng = rand::rng();
     // Same ladder as the request loop: 10ms doubling to `retry_max_backoff`.
@@ -588,7 +599,7 @@ fn resolve_auth_with_retries(
         }
         sleep(to_sleep);
         match state.auth.resolve() {
-            Ok(auth) => return Ok(auth),
+            Ok(auth) => return Ok((auth, Some(retry_end))),
             Err(e) => last = e,
         }
         retry_interval_ms = retry_interval_ms.saturating_mul(2).min(max_backoff_ms);
@@ -603,12 +614,11 @@ pub(super) fn http_send_with_retries(
     retry_timeout: Duration,
     retry_max_backoff: Duration,
 ) -> crate::Result<Response<Body>> {
-    // One deadline for the whole flush, covering credential resolution and every
-    // request attempt. Resolving outside it let a recoverable provider failure
-    // end the flush after zero requests and zero milliseconds of a budget the
-    // caller had set for exactly this kind of transient.
-    let retry_end = std::time::Instant::now() + retry_timeout;
-    let auth = resolve_auth_with_retries(state, retry_end, retry_max_backoff)?;
+    // Start the retry deadline at the first retryable failure. If credential
+    // acquisition fails first, its retries and all later request retries share
+    // one deadline. If the initial credential and request attempts succeed,
+    // neither consumes the documented retry budget.
+    let (auth, retry_end) = resolve_auth_with_retries(state, retry_timeout, retry_max_backoff)?;
     let auth = auth.as_deref();
     let (need_retry, last_rep) = state.send_request(buf, request_timeout, auth);
     // A 401 is not retryable, so this is where a credential that expired
@@ -626,6 +636,7 @@ pub(super) fn http_send_with_retries(
         if !need_retry || retry_timeout.is_zero() {
             return finish_http_send(state, last_rep);
         }
+        let retry_end = retry_end.unwrap_or_else(|| std::time::Instant::now() + retry_timeout);
         return retry_http_send(
             state,
             buf,
@@ -643,6 +654,7 @@ pub(super) fn http_send_with_retries(
         return finish_http_send(state, last_rep);
     }
 
+    let retry_end = retry_end.unwrap_or_else(|| std::time::Instant::now() + retry_timeout);
     retry_http_send(
         state,
         buf,

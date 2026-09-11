@@ -493,10 +493,11 @@ impl Sender {
                     0.0f64
                 };
 
-                // The auth header is resolved inside `http_send_with_retries`,
-                // under the same `retry_timeout` deadline as the request
-                // attempts. A token provider is called there, and a recoverable
-                // provider failure is re-resolved rather than ending the flush:
+                // The auth header is resolved inside `http_send_with_retries`.
+                // Its first retryable failure starts the same `retry_timeout`
+                // deadline later used by request retries. A token provider is
+                // called there, and a recoverable provider failure is
+                // re-resolved rather than ending the flush:
                 // resolving out here returned a `SocketError` after zero
                 // requests, and the bindings clear the sender-owned buffer on any
                 // flush failure, so the batch died on a transient the budget was

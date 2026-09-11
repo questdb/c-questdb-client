@@ -679,6 +679,7 @@ fn test_terminal_provider_failure_does_not_spend_the_retry_budget() -> TestResul
     Ok(())
 }
 
+#[cfg(feature = "_oidc")]
 #[test]
 fn test_interaction_required_fails_the_flush_without_waiting() -> TestResult {
     // `classify_provider_error` keeps `InteractionRequired` retryable so the QWP
