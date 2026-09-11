@@ -458,6 +458,7 @@ impl SfaSegment {
             }
         })?;
         let lock_offset = durable - durable % page_size;
+        #[cfg(unix)]
         let lock_len = published - lock_offset;
         #[cfg(unix)]
         let locked = {

@@ -503,6 +503,10 @@ typedef struct line_sender_utf8
     const char* buf;
 } line_sender_utf8;
 
+/** Maximum accepted byte length for any caller-supplied connection/config
+ * string passed to a `_from_conf` or `questdb_db_connect*` constructor. */
+#define QUESTDB_CONFIG_MAX_BYTES ((size_t)(1 << 20))
+
 /**
  * Check the provided buffer is a valid UTF-8 encoded string.
  *
@@ -1563,6 +1567,7 @@ typedef struct line_sender_opts line_sender_opts;
  *
  * For the full list of keys, search this header for `bool
  * line_sender_opts_`.
+ * The string must not exceed `QUESTDB_CONFIG_MAX_BYTES` bytes.
  */
 QUESTDB_CLIENT_API
 line_sender_opts* line_sender_opts_from_conf(
@@ -1945,6 +1950,7 @@ line_sender* line_sender_build(
  *
  * For the full list of keys, search this header for `bool
  * line_sender_opts_`.
+ * The string must not exceed `QUESTDB_CONFIG_MAX_BYTES` bytes.
  *
  * In the case of TCP, this synchronously establishes the TCP connection,
  * and returns once the connection is fully established. If the connection
@@ -2299,7 +2305,27 @@ int64_t line_sender_now_micros(void);
 #define questdb_connection_event_failed_over 3u
 #define questdb_connection_event_endpoint_attempt_failed 4u
 #define questdb_connection_event_all_endpoints_unreachable 5u
+/** Terminal: the server rejected a credential the client presented.
+ *  `host` / `port` are set. */
 #define questdb_connection_event_auth_failed 6u
+/** The token provider failed, so no credential was ever offered and no
+ *  endpoint was dialled. `host` / `port` are NULL. Read `cause_code` to
+ *  tell a retry from a stop:
+ *
+ *  - `line_sender_error_socket_error` -- the ordinary case, retryable.
+ *    The sender keeps reconnecting and store-and-forward keeps its queued
+ *    frames; only a foreground/initial connect fails fast.
+ *  - `line_sender_error_auth_error` / `line_sender_error_config_error` --
+ *    the provider cannot recover in this process (a permanently closed
+ *    OIDC provider, or a scope that cannot yield the required token kind),
+ *    so the reconnect is TERMINAL and the runner stops. Queued frames are
+ *    not deleted and a disk-backed slot stays drainable by a later
+ *    process, but this process will not send them.
+ *
+ *  A listener that pages on a permanent stop must qualify on `cause_code`,
+ *  not on the kind alone. `questdb_connection_event_auth_failed` remains
+ *  the server-rejected-a-credential signal and is unaffected. */
+#define questdb_connection_event_credential_unavailable 7u
 
 /** One connection-state transition. String fields are borrowed UTF-8
  * slices valid only for the duration of the callback; absent strings are
@@ -2337,9 +2363,14 @@ typedef void (*questdb_connection_event_cb)(
 
 /** Register a connection lifecycle listener on the sender being built.
  * Events are delivered on a dedicated dispatcher thread through a bounded
- * inbox (`inbox_capacity`; 0 = default 64) with a drop-oldest overflow
- * policy. The caller guarantees `user_data` is safe to use from that
- * thread. QWP/WebSocket only; at most one listener per builder. */
+ * inbox (`inbox_capacity`; 0 = default 64, maximum 65536) with a
+ * drop-oldest overflow policy. The caller guarantees `user_data` is safe to
+ * use from that thread. QWP/WebSocket only; at most one listener per builder.
+ *
+ * Returns `false` with a config error when a listener is already registered,
+ * or when `inbox_capacity` exceeds 65536: the capacity reaches an allocation
+ * whose failure aborts the process, so an absurd value is refused here
+ * instead. */
 QUESTDB_CLIENT_API
 bool line_sender_opts_connection_event_handler(
     line_sender_opts* opts,

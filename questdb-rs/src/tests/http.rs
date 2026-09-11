@@ -579,6 +579,323 @@ fn test_two_retries(
     Ok(())
 }
 
+#[test]
+fn test_retryable_provider_failure_is_retried_within_the_budget() -> TestResult {
+    // Regression: the auth header used to be resolved in `Sender::flush_impl`,
+    // outside `http_send_with_retries`, so a provider failure ended the flush
+    // after zero requests and zero milliseconds of `retry_timeout`. The C and
+    // Python bindings clear the sender-owned buffer on any flush failure, and
+    // the retry they document -- `SocketError` means "retry, exactly as you
+    // would any other" -- then re-flushed an empty buffer and reported success,
+    // so a peer holding the OIDC token-store lock for a few seconds destroyed
+    // the batch and the loss looked like a successful write.
+    //
+    // The provider fails twice with a retryable error and then succeeds. The
+    // assertion is that the flush completes, with the rows intact, on the
+    // budget the caller configured.
+    let mut server = MockServer::new()?;
+    let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let seen = calls.clone();
+    let mut sender = server
+        .lsb_http()
+        .protocol_version(ProtocolVersion::V2)?
+        .http_token_provider(move || {
+            if seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst) < 2 {
+                // The shape a token-store lock wait produces: recoverable, and
+                // classified `SocketError` by `classify_provider_error`.
+                return Err(crate::error::fmt!(
+                    SocketError,
+                    "could not acquire the OIDC token-store lock"
+                ));
+            }
+            Ok("tok".to_string())
+        })?
+        .retry_timeout(Duration::from_secs(30))?
+        .build()?;
+    let mut buffer = sender.new_buffer();
+    buffer
+        .table("test")?
+        .symbol("t1", "v1")?
+        .column_f64("f1", 0.5)?
+        .at(TimestampNanos::new(10000000))?;
+    let buffer2 = buffer.clone();
+    let server_thread = std::thread::spawn(move || -> io::Result<MockServer> {
+        server.accept()?;
+        let req = server.recv_http_q()?;
+        // The rows survived the provider failures rather than being dropped.
+        assert_eq!(req.body(), buffer2.as_bytes());
+        assert_eq!(req.header("authorization"), Some("Bearer tok"));
+        server.send_http_response_q(HttpResponse::empty())?;
+        Ok(server)
+    });
+
+    // Assert the flush before joining. On a regression the flush fails without
+    // ever sending, so the server thread is still parked in `accept()` and
+    // joining it first would hang CI instead of failing it.
+    sender.flush_and_keep(&buffer)?;
+    _ = server_thread.join().unwrap()?;
+    assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 3);
+    Ok(())
+}
+
+#[test]
+fn test_terminal_provider_failure_does_not_spend_the_retry_budget() -> TestResult {
+    // The other half of the contract above: only the failures
+    // `classify_provider_error` leaves as `SocketError` are re-resolved. A
+    // caller contract violation arrives as a terminal `ConfigError` and must
+    // fail the flush at once -- retrying it would burn the whole window on
+    // state that no later invocation changes, and (unlike the retryable case)
+    // waiting cannot help.
+    let server = MockServer::new()?;
+    let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let seen = calls.clone();
+    let mut sender = server
+        .lsb_http()
+        .protocol_version(ProtocolVersion::V2)?
+        .http_token_provider(move || {
+            seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Err::<String, _>(crate::error::fmt!(
+                InvalidApiCall,
+                "provider contract violation"
+            ))
+        })?
+        .retry_timeout(Duration::from_secs(30))?
+        .build()?;
+    let mut buffer = sender.new_buffer();
+    buffer
+        .table("test")?
+        .symbol("t1", "v1")?
+        .column_f64("f1", 0.5)?
+        .at(TimestampNanos::new(10000000))?;
+
+    let start = std::time::Instant::now();
+    let err = sender.flush_and_keep(&buffer).unwrap_err();
+    let elapsed = start.elapsed();
+
+    assert_eq!(err.code(), crate::ErrorCode::ConfigError);
+    // Resolved once, not on a ladder, and nowhere near the 30s budget.
+    assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    assert!(elapsed < Duration::from_secs(5), "elapsed: {elapsed:?}");
+    Ok(())
+}
+
+#[cfg(feature = "_oidc")]
+#[test]
+fn test_interaction_required_fails_the_flush_without_waiting() -> TestResult {
+    // `classify_provider_error` keeps `InteractionRequired` retryable so the QWP
+    // drainer does not abandon queued frames on a condition a human can fix. A
+    // single foreground flush has no such horizon: nothing it waits for produces
+    // a sign-in, so re-resolving would only make "nobody has signed in" arrive a
+    // whole `retry_timeout` late, on every flush.
+    let server = MockServer::new()?;
+    let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let seen = calls.clone();
+    let mut sender = server
+        .lsb_http()
+        .protocol_version(ProtocolVersion::V2)?
+        .http_token_provider(move || {
+            seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Err::<String, _>(crate::Error::from(
+                crate::oidc::OidcError::interaction_required("no cached credential"),
+            ))
+        })?
+        .retry_timeout(Duration::from_secs(30))?
+        .build()?;
+    let mut buffer = sender.new_buffer();
+    buffer
+        .table("test")?
+        .symbol("t1", "v1")?
+        .column_f64("f1", 0.5)?
+        .at(TimestampNanos::new(10000000))?;
+
+    let start = std::time::Instant::now();
+    let err = sender.flush_and_keep(&buffer).unwrap_err();
+    let elapsed = start.elapsed();
+
+    // Still classified retryable for callers that key on the code.
+    assert_eq!(err.code(), crate::ErrorCode::SocketError);
+    assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    assert!(elapsed < Duration::from_secs(5), "elapsed: {elapsed:?}");
+    Ok(())
+}
+
+#[test]
+fn test_credential_rotation_budget_is_one_per_flush() -> TestResult {
+    // Regression: the rotation budget is one per FLUSH. `http_send_with_retries`
+    // spends it on the pre-loop 401, then hands off to `retry_http_send`, which
+    // used to start its own `auth_retry_used` at `false` -- so a second 401 later
+    // in the same flush rotated again and replayed the whole buffer a second
+    // time, twice what the C header and this module both promise.
+    //
+    // Script: 401 (rotate) -> 500 (ladder) -> 401. The assertion is that the
+    // second 401 ends the flush instead of buying another replay.
+    let mut server = MockServer::new()?;
+    let provider_seq = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let mut sender = server
+        .lsb_http()
+        .protocol_version(ProtocolVersion::V2)?
+        .http_token_provider(move || {
+            Ok::<_, crate::Error>(format!(
+                "tok{}",
+                provider_seq.fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+            ))
+        })?
+        .retry_timeout(Duration::from_secs(30))?
+        .build()?;
+    let mut buffer = sender.new_buffer();
+    buffer
+        .table("test")?
+        .symbol("t1", "v1")?
+        .column_f64("f1", 0.5)?
+        .at(TimestampNanos::new(10000000))?;
+
+    let server_thread = std::thread::spawn(move || -> io::Result<usize> {
+        server.accept()?;
+        let mut requests = 0usize;
+
+        // 1: the credential resolved for the flush. 401 spends the budget.
+        let req = server.recv_http_q()?;
+        requests += 1;
+        assert_eq!(req.header("authorization"), Some("Bearer tok0"));
+        server.send_http_response_q(
+            HttpResponse::empty()
+                .with_status(401, "Unauthorized")
+                .with_body_str("Unauthorized"),
+        )?;
+
+        // 2: the one rotated replay, answered 5xx so the flush enters
+        // `retry_http_send` with the budget already spent.
+        let req = server.recv_http_q()?;
+        requests += 1;
+        assert_eq!(req.header("authorization"), Some("Bearer tok1"));
+        server.send_http_response_q(
+            HttpResponse::empty()
+                .with_status(500, "Internal Server Error")
+                .with_body_str("client should retry"),
+        )?;
+
+        // 3: a second 401 inside the retry loop. It must be reported, not
+        // rotated: the provider still has fresh values to hand out, so a
+        // surviving budget would show up as a fourth request bearing "tok2".
+        let req = server.recv_http_q()?;
+        requests += 1;
+        assert_eq!(req.header("authorization"), Some("Bearer tok1"));
+        server.send_http_response_q(
+            HttpResponse::empty()
+                .with_status(401, "Unauthorized")
+                .with_body_str("Unauthorized"),
+        )?;
+
+        // Nothing further may arrive. Read with a short deadline so a
+        // regression fails here rather than hanging the suite.
+        Ok(requests)
+    });
+
+    let res = sender.flush_and_keep(&buffer);
+    let requests = server_thread.join().unwrap()?;
+
+    assert_eq!(
+        requests, 3,
+        "one flush must not spend the rotation budget twice"
+    );
+    let err = res.unwrap_err();
+    assert_eq!(err.code(), ErrorCode::AuthError);
+    Ok(())
+}
+
+#[test]
+fn test_credential_rotation_keeps_retry_backoff() -> TestResult {
+    // Regression: `retry_http_send`'s credential-rotation branch used to make
+    // the rotated retry immediate by setting `retry_interval_ms = 0`. That
+    // value is the backoff *ladder*, so every later
+    // `retry_interval_ms.saturating_mul(2)` computed `0 * 2` and a single 401
+    // disabled backoff for the rest of the window: any genuinely retryable
+    // failure after it re-sent the whole buffer with a sub-millisecond gap
+    // until `retry_end`.
+    //
+    // The script is 500 (ladder -> 10ms), 401 (rotate, retried with no wait),
+    // 500 (ladder -> 20ms); the wait before the fourth request is then the
+    // assertion -- with the bug it arrives in ~1ms.
+    let mut server = MockServer::new()?;
+    let provider_seq = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let mut sender = server
+        .lsb_http()
+        .protocol_version(ProtocolVersion::V2)?
+        // A fresh value per call, so the 401 reads as an expiry the provider
+        // can rotate out of rather than a genuine rejection (which is what
+        // `rotated_auth_after_401` returning `None` would mean).
+        .http_token_provider(move || {
+            Ok::<_, crate::Error>(format!(
+                "tok{}",
+                provider_seq.fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+            ))
+        })?
+        .retry_timeout(Duration::from_secs(30))?
+        .build()?;
+    let mut buffer = sender.new_buffer();
+    buffer
+        .table("test")?
+        .symbol("t1", "v1")?
+        .column_f64("f1", 0.5)?
+        .at(TimestampNanos::new(10000000))?;
+
+    let server_thread = std::thread::spawn(move || -> io::Result<MockServer> {
+        server.accept()?;
+
+        // 1: the attempt made before the retry loop. A 5xx starts the ladder.
+        let req = server.recv_http_q()?;
+        assert_eq!(req.header("authorization"), Some("Bearer tok0"));
+        server.send_http_response_q(
+            HttpResponse::empty()
+                .with_status(500, "Internal Server Error")
+                .with_body_str("client should retry"),
+        )?;
+
+        // 2: still the credential resolved for the flush. Answer 401 so the
+        // provider is consulted again and hands back a rotated value.
+        let req = server.recv_http_q()?;
+        assert_eq!(req.header("authorization"), Some("Bearer tok0"));
+        server.send_http_response_q(
+            HttpResponse::empty()
+                .with_status(401, "Unauthorized")
+                .with_body_str("Unauthorized"),
+        )?;
+
+        // 3: carries the rotated credential, which is what proves the
+        // rotation branch ran at all.
+        let req = server.recv_http_q()?;
+        assert_eq!(req.header("authorization"), Some("Bearer tok1"));
+        server.send_http_response_q(
+            HttpResponse::empty()
+                .with_status(500, "Internal Server Error")
+                .with_body_str("client should retry"),
+        )?;
+
+        // 4: the ladder must have survived the rotation and be at ~20ms.
+        let start_time = std::time::Instant::now();
+        let req = server.recv_http_q()?;
+        let elapsed = std::time::Instant::now().duration_since(start_time);
+        assert_eq!(req.header("authorization"), Some("Bearer tok1"));
+        assert!(
+            elapsed > Duration::from_millis(15),
+            "credential rotation disabled the retry backoff: \
+             the next attempt came after {elapsed:?}"
+        );
+
+        server.send_http_response_q(HttpResponse::empty())?;
+
+        Ok(server)
+    });
+
+    let res = sender.flush_and_keep(&buffer);
+
+    _ = server_thread.join().unwrap()?;
+
+    res?;
+
+    Ok(())
+}
+
 #[rstest]
 fn test_one_retry(
     #[values(ProtocolVersion::V1, ProtocolVersion::V2)] version: ProtocolVersion,

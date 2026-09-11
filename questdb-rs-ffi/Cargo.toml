@@ -13,6 +13,7 @@ crate-type = ["cdylib", "staticlib"]
 libc = "0.2"
 questdb-confstr-ffi = { version = "0.1.1", optional = true }
 arrow = { version = ">=58, <60", optional = true, default-features = false, features = ["ffi"] }
+zeroize = { version = "1", features = ["alloc"] }
 
 [dependencies.questdb-rs]
 path = "../questdb-rs"
@@ -29,6 +30,9 @@ features = [
     # always exposes the `qwp_reader_*` surface, so it is hardwired here rather
     # than gated behind a feature. Pulls in the WS reader + zstd decode.
     "sync-reader",
+    # First-class OIDC device-flow handles shared by C/C++ senders, readers,
+    # and pools. This is part of the stable C ABI rather than an opt-in surface.
+    "oidc",
     # Owned (lifetime-free) pool handles + their borrow entry points. C / Python
     # cannot express Rust lifetimes, so the C ABI hands out owned handles via
     # `questdb::ffi_support` instead of the lifetime-bound `Borrowed*` handles.

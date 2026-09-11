@@ -2793,6 +2793,149 @@ fn initial_connect_bails_immediately_on_auth_error() {
 }
 
 #[test]
+fn initial_connect_does_not_replay_a_401_with_an_unchanged_token() {
+    // The other half of `initial_connect_retries_same_endpoint_once_with_
+    // rotated_token`. Only the changed-token branch was covered, so replaying
+    // unconditionally failed nothing -- and a genuine rejection would cost a
+    // second full connect per endpoint on every walk.
+    let srv = MockServer::start(vec![
+        vec![Action::Reject401],
+        happy_script(ServerRole::Standalone, "a"),
+    ]);
+    let calls = Arc::new(AtomicUsize::new(0));
+    let cfg = questdb::egress::ReaderConfig::from_conf(format!("ws::addr={}", srv.url()))
+        .unwrap()
+        .token_provider({
+            let calls = Arc::clone(&calls);
+            // Byte-identical every time, so the 401 is a real rejection rather
+            // than an expiry the provider can rotate out of.
+            move || {
+                calls.fetch_add(1, Ordering::SeqCst);
+                Ok::<_, questdb::Error>("same".to_string())
+            }
+        })
+        .unwrap();
+
+    let err = match Reader::from_config(&cfg) {
+        Err(err) => err,
+        Ok(_) => panic!("an unchanged token must not recover a 401"),
+    };
+    assert_eq!(err.code(), ErrorCode::AuthError, "{err}");
+    // The provider is re-asked once to learn whether the credential rotated; it
+    // is the replay, not the re-resolution, that the guard prevents. The second
+    // scripted script stays untouched.
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
+    assert_eq!(
+        srv.accepts(),
+        1,
+        "the endpoint was replayed after a real reject"
+    );
+}
+
+#[test]
+fn initial_connect_retries_same_endpoint_once_with_rotated_token() {
+    let srv = MockServer::start(vec![
+        vec![Action::Reject401],
+        happy_script(ServerRole::Standalone, "a"),
+    ]);
+    let calls = Arc::new(AtomicUsize::new(0));
+    let cfg = questdb::egress::ReaderConfig::from_conf(format!("ws::addr={}", srv.url()))
+        .unwrap()
+        .token_provider({
+            let calls = Arc::clone(&calls);
+            move || {
+                let n = calls.fetch_add(1, Ordering::SeqCst);
+                Ok::<_, questdb::Error>(if n == 0 { "stale" } else { "fresh" }.to_string())
+            }
+        })
+        .unwrap();
+
+    let _reader = Reader::from_config(&cfg).expect("changed token should recover one 401");
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
+    assert_eq!(srv.accepts(), 2, "the same endpoint must be replayed once");
+}
+
+#[test]
+fn initial_provider_failure_does_not_dial_any_endpoint() {
+    let srv_a = MockServer::start(vec![happy_script(ServerRole::Standalone, "a")]);
+    let srv_b = MockServer::start(vec![happy_script(ServerRole::Standalone, "b")]);
+    let provider_calls = Arc::new(AtomicUsize::new(0));
+    let conf = format!("ws::addr={}", build_addr_list(&[&srv_a, &srv_b]));
+    let cfg = questdb::egress::ReaderConfig::from_conf(&conf)
+        .unwrap()
+        .token_provider({
+            let provider_calls = Arc::clone(&provider_calls);
+            move || {
+                provider_calls.fetch_add(1, Ordering::SeqCst);
+                Err::<String, _>(questdb::Error::new(
+                    ErrorCode::SocketError,
+                    "provider unavailable",
+                ))
+            }
+        })
+        .unwrap();
+
+    let err = match Reader::from_config(&cfg) {
+        Err(err) => err,
+        Ok(_) => panic!("provider failure must abort the initial endpoint walk"),
+    };
+
+    assert_eq!(err.code(), ErrorCode::SocketError);
+    assert!(err.msg().contains("provider unavailable"));
+    assert_eq!(provider_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(srv_a.accepts(), 0, "provider failure must precede A's dial");
+    assert_eq!(srv_b.accepts(), 0, "provider failure must precede B's dial");
+}
+
+#[test]
+fn reconnect_provider_failure_is_resolved_once_per_walk_without_dials() {
+    let srv_a = MockServer::start(vec![drop_after_query_script(ServerRole::Standalone, "a")]);
+    let srv_b = MockServer::start(vec![happy_script(ServerRole::Standalone, "b")]);
+    let provider_calls = Arc::new(AtomicUsize::new(0));
+    let conf = format!(
+        "ws::addr={};failover_max_attempts=3;\
+         failover_backoff_initial_ms=0;failover_backoff_max_ms=0",
+        build_addr_list(&[&srv_a, &srv_b])
+    );
+    let cfg = questdb::egress::ReaderConfig::from_conf(&conf)
+        .unwrap()
+        .token_provider({
+            let provider_calls = Arc::clone(&provider_calls);
+            move || {
+                let call = provider_calls.fetch_add(1, Ordering::SeqCst);
+                if call == 0 {
+                    Ok("initial-token".to_string())
+                } else {
+                    Err(questdb::Error::new(
+                        ErrorCode::SocketError,
+                        "provider unavailable",
+                    ))
+                }
+            }
+        })
+        .unwrap();
+    let mut reader = Reader::from_config(&cfg).expect("initial provider call succeeds");
+    let mut cursor = reader.prepare("select 1").execute().expect("execute");
+
+    match cursor.next_batch() {
+        Err(_) => {}
+        Ok(_) => panic!("reconnect provider failures must exhaust the retry budget"),
+    }
+
+    assert_eq!(
+        provider_calls.load(Ordering::SeqCst),
+        3,
+        "one initial acquisition plus one for each of two reconnect walks"
+    );
+    assert_eq!(srv_a.accepts(), 1, "only the initial connection reaches A");
+    assert_eq!(
+        srv_b.accepts(),
+        0,
+        "failed reconnect acquisitions must not create sockets to B"
+    );
+}
+
+#[test]
 fn initial_connect_auth_terminal_regardless_of_position_in_addr_list() {
     // Counterpart pinning: the bail-on-AuthError invariant holds even
     // when a healthy endpoint precedes the auth-rejecting one in the

@@ -567,6 +567,55 @@ fn qwpws_store_and_forward_config_accepts_and_rejects_java_keys() {
         SenderBuilder::from_conf("ws::addr=localhost:9000;error_inbox_capacity=15;"),
         "error_inbox_capacity must be >= 16: 15",
     );
+    // Upper bound. Only the floor was covered, so deleting the cap failed
+    // nothing -- and the cap is what stands between a caller-supplied capacity
+    // and a `VecDeque::with_capacity` the allocator aborts the host process on.
+    let max = crate::ingress::conf::QWP_WS_MAX_ERROR_INBOX_CAPACITY;
+    SenderBuilder::from_conf(format!(
+        "ws::addr=localhost:9000;error_inbox_capacity={max};"
+    ))
+    .unwrap();
+    assert_conf_err(
+        SenderBuilder::from_conf(format!(
+            "ws::addr=localhost:9000;error_inbox_capacity={};",
+            max + 1
+        )),
+        &format!("error_inbox_capacity must be <= {max}: {}", max + 1)[..],
+    );
+}
+
+/// The listener-side twin of the `error_inbox_capacity` cap above.
+///
+/// Every `connection_listener` callsite in the tree passes 0, so this guard had
+/// no coverage at all -- not even the incidental dead-code lint its sibling gets
+/// from an unused constant. It is reachable from Python as
+/// `Sender(..., connection_event_inbox_capacity=N)` and from C through
+/// `line_sender_opts_connection_event_handler`, which has no check of its own
+/// and depends entirely on this one.
+#[cfg(feature = "sync-sender-qwp-ws")]
+#[test]
+fn connection_listener_bounds_its_inbox_capacity() {
+    use crate::ingress::conn_events::MAX_CONNECTION_EVENT_INBOX_CAPACITY as MAX;
+
+    let noop = || -> crate::ingress::ConnectionListener { std::sync::Arc::new(|_: &_| {}) };
+
+    // The exact cap is accepted: an off-by-one here turns a legal capacity into
+    // a spurious error for a caller who read the documented maximum.
+    SenderBuilder::from_conf("ws::addr=localhost:9000;")
+        .unwrap()
+        .connection_listener(noop(), MAX)
+        .unwrap();
+    let err = SenderBuilder::from_conf("ws::addr=localhost:9000;")
+        .unwrap()
+        .connection_listener(noop(), MAX + 1)
+        .unwrap_err();
+    assert_eq!(err.code(), ErrorCode::ConfigError);
+    assert!(
+        err.msg()
+            .contains(&format!("inbox_capacity must be <= {MAX}")),
+        "{}",
+        err.msg()
+    );
 }
 
 #[cfg(feature = "sync-sender-qwp-ws")]
@@ -1818,4 +1867,46 @@ fn assert_conf_err<T, M: AsRef<str>>(result: Result<T>, expect_msg: M) {
     };
     assert_eq!(err.code(), ErrorCode::ConfigError);
     assert_eq!(err.msg(), expect_msg.as_ref());
+}
+
+#[cfg(feature = "_sender-qwp-ws")]
+#[test]
+fn qwp_ws_token_provider_conflicts_with_static_auth() {
+    // A rotating token provider is mutually exclusive with static auth.
+    let result = SenderBuilder::new(Protocol::Ws, "127.0.0.1", 9000)
+        .username("u")
+        .unwrap()
+        .qwp_ws_token_provider(|| Ok::<_, crate::Error>("provided".to_string()));
+    assert_eq!(result.unwrap_err().code(), ErrorCode::ConfigError);
+}
+
+#[cfg(feature = "_sender-qwp-ws")]
+#[test]
+fn qwp_ws_token_provider_stored_in_config() {
+    // With no static auth, the provider is accepted and stored on the QWP/WS
+    // config, ready to be pulled at each (re)connect.
+    let builder = SenderBuilder::new(Protocol::Ws, "127.0.0.1", 9000)
+        .qwp_ws_token_provider(|| Ok::<_, crate::Error>("tok".to_string()))
+        .unwrap();
+    assert!(builder.qwp_ws.as_ref().unwrap().token_provider.is_some());
+    assert!(builder.has_token_provider_auth());
+}
+
+#[cfg(feature = "sync-sender-qwp-ws")]
+#[test]
+fn qwp_ws_connector_rejects_static_auth_added_after_token_provider() {
+    // The pooled connector bypasses SenderBuilder::build, so its shared
+    // validation must independently catch auth assigned after the provider.
+    let builder = SenderBuilder::new(Protocol::Ws, "127.0.0.1", 9000)
+        .qwp_ws_token_provider(|| Ok::<_, crate::Error>("provided".to_string()))
+        .unwrap()
+        .username("u")
+        .unwrap()
+        .password("p")
+        .unwrap();
+    let Err(err) = builder.build_qwp_ws_connector() else {
+        panic!("expected the pooled connector to reject provider plus static auth");
+    };
+    assert_eq!(err.code(), ErrorCode::ConfigError);
+    assert!(err.msg().contains("qwp_ws_token_provider"));
 }

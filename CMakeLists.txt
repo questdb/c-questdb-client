@@ -293,6 +293,12 @@ if (QUESTDB_TESTS_AND_EXAMPLES)
         line_sender_cpp_example_from_env
         examples/line_sender_cpp_example_from_env.cpp)
     compile_example(
+        oidc_c_example
+        examples/oidc_c_example.c)
+    compile_example(
+        oidc_cpp_example
+        examples/oidc_cpp_example.cpp)
+    compile_example(
         line_sender_cpp_example_udp
         examples/line_sender_cpp_example_udp.cpp)
     compile_example(
@@ -408,6 +414,11 @@ if (QUESTDB_TESTS_AND_EXAMPLES)
         test_line_sender
         cpp_test/mock_server.cpp
         cpp_test/test_line_sender.cpp)
+
+    # Broker-independent OIDC ABI and C++ RAII/error-surface coverage.
+    compile_test(
+        test_oidc
+        cpp_test/test_oidc.cpp)
 
     # Live-broker integration tests for the egress reader. Skips per-test
     # if no broker is reachable on QDB_LIVE_BROKER_HOST:QDB_LIVE_BROKER_HTTP_PORT

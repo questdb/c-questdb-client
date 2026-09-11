@@ -25,6 +25,7 @@
 #pragma once
 
 #include "line_sender.h"
+#include <questdb/oidc.h>
 
 #include <cstddef>
 #include <chrono>
@@ -134,7 +135,8 @@ inline bool operator!=(::line_sender_error_code l, error_code r) noexcept
  *
  * `catch (const questdb::error&)` handles a failure from either direction.
  * The released `questdb::ingress::line_sender_error` subclass additionally
- * exposes `in_doubt()` / `qwp_ws_diagnostic()` for sender operations.
+ * exposes `in_doubt()`, `qwp_ws_diagnostic()`, and `oidc_diagnostic()` for
+ * sender operations.
  */
 class error : public std::runtime_error
 {
@@ -163,6 +165,12 @@ public:
         return error{code, std::string{msg, len}};
     }
 
+    /** Whether a C error carries structured OIDC diagnostics. */
+    static bool has_oidc_detail(const ::questdb_error* c_err) noexcept;
+
+    /** Convert, take ownership of, and throw the most specific C++ error. */
+    [[noreturn]] static void throw_from_c(::questdb_error* c_err);
+
     /** Call a C function whose final argument is `questdb_error**`. */
     template <typename F, typename... Args>
     static auto wrapped_call(F&& f, Args&&... args)
@@ -170,13 +178,147 @@ public:
         ::questdb_error* c_err{nullptr};
         auto result = f(std::forward<Args>(args)..., &c_err);
         if (c_err)
-            throw from_c(c_err);
+            throw_from_c(c_err);
         return result;
     }
 
 private:
     error_code _code;
 };
+
+} // namespace questdb
+
+namespace questdb::oidc
+{
+
+/** Category of a structured OIDC failure. */
+enum class error_kind : int
+{
+    config = QUESTDB_OIDC_ERROR_CONFIG,
+    network = QUESTDB_OIDC_ERROR_NETWORK,
+    device_flow = QUESTDB_OIDC_ERROR_DEVICE_FLOW,
+    timeout = QUESTDB_OIDC_ERROR_TIMEOUT,
+    interaction_required = QUESTDB_OIDC_ERROR_INTERACTION_REQUIRED,
+    cancelled = QUESTDB_OIDC_ERROR_CANCELLED,
+    unknown = QUESTDB_OIDC_ERROR_UNKNOWN,
+};
+
+/**
+ * A QuestDB error carrying the structured OAuth/OIDC response detail
+ * (`kind()`, `idp_error()`, `idp_error_description()`, `status()`,
+ * `retry_after_seconds()`).
+ *
+ * **Which exception type an OIDC failure throws depends on the surface that
+ * raised it.** `questdb::oidc::error` and `questdb::ingress::line_sender_error`
+ * are *sibling* types under `questdb::error`, so a handler for one does not
+ * catch the other:
+ * - **Device API** (`questdb::oidc::device_auth::sign_in`/`token`/`clear`)
+ *   throws `questdb::oidc::error` directly.
+ * - **Query reader** (`questdb::egress::reader{config, auth}` and reader calls)
+ *   throws `questdb::oidc::error` (or a base `questdb::error`).
+ * - **Ingest sender** (`opts::oidc_auth` + `flush()` and other sender calls)
+ *   throws `questdb::ingress::line_sender_error`, **not** this type — reach the
+ *   OIDC detail through its `oidc_diagnostic()` member. This deliberately keeps
+ *   existing sender catch blocks working.
+ *
+ * To handle every surface uniformly, catch the common base
+ * `const questdb::error&`. A `catch (const questdb::oidc::error&)` placed
+ * around a sender `flush()` will **never** match (flush throws
+ * `line_sender_error`); likewise a `catch (const line_sender_error&)` around a
+ * device-API or reader call will miss `questdb::oidc::error`.
+ */
+class error : public ::questdb::error
+{
+public:
+    error(
+        ::questdb::error_code code,
+        std::string message,
+        error_kind kind,
+        std::string idp_error,
+        std::string idp_error_description,
+        std::optional<uint16_t> status,
+        std::optional<uint64_t> retry_after_seconds)
+        : ::questdb::error{code, message}
+        , _kind{kind}
+        , _idp_error{std::move(idp_error)}
+        , _idp_error_description{std::move(idp_error_description)}
+        , _status{status}
+        , _retry_after_seconds{retry_after_seconds}
+    {
+    }
+
+    error_kind kind() const noexcept
+    {
+        return _kind;
+    }
+    const std::string& idp_error() const noexcept
+    {
+        return _idp_error;
+    }
+    const std::string& idp_error_description() const noexcept
+    {
+        return _idp_error_description;
+    }
+    std::optional<uint16_t> status() const noexcept
+    {
+        return _status;
+    }
+    std::optional<uint64_t> retry_after_seconds() const noexcept
+    {
+        return _retry_after_seconds;
+    }
+
+private:
+    error_kind _kind;
+    std::string _idp_error;
+    std::string _idp_error_description;
+    std::optional<uint16_t> _status;
+    std::optional<uint64_t> _retry_after_seconds;
+};
+
+} // namespace questdb::oidc
+
+namespace questdb
+{
+
+inline bool error::has_oidc_detail(const ::questdb_error* c_err) noexcept
+{
+    ::questdb_oidc_error_view view{};
+    view.struct_size = sizeof view;
+    return ::questdb_error_oidc_get_view(c_err, &view);
+}
+
+[[noreturn]] inline void error::throw_from_c(::questdb_error* c_err)
+{
+    const std::unique_ptr<::questdb_error, decltype(&::questdb_error_free)>
+        owned_err{c_err, ::questdb_error_free};
+    const auto code = static_cast<error_code>(
+        static_cast<int>(::questdb_error_get_code(owned_err.get())));
+    size_t message_len{0};
+    const char* message{::questdb_error_msg(owned_err.get(), &message_len)};
+
+    const auto copy = [](const char* data, size_t size) {
+        return data ? std::string{data, size} : std::string{};
+    };
+
+    ::questdb_oidc_error_view view{};
+    view.struct_size = sizeof view;
+    if (!::questdb_error_oidc_get_view(owned_err.get(), &view))
+    {
+        throw error{code, copy(message, message_len)};
+    }
+
+    throw ::questdb::oidc::error{
+        code,
+        copy(message, message_len),
+        static_cast<::questdb::oidc::error_kind>(static_cast<int>(view.kind)),
+        copy(view.idp_error, view.idp_error_len),
+        copy(view.idp_error_description, view.idp_error_description_len),
+        view.has_status ? std::optional<uint16_t>{view.status}
+                        : std::optional<uint16_t>{},
+        view.has_retry_after ? std::optional<uint64_t>{view.retry_after_seconds}
+                             : std::optional<uint64_t>{}};
+}
 
 } // namespace questdb
 
@@ -324,6 +466,12 @@ enum class ca
  * Call `.what()` to obtain the ASCII-encoded error message.
  * For QWP/WebSocket terminal diagnostics, `.qwp_ws_diagnostic()` returns the
  * structured server or protocol error that halted the sender.
+ * When an attached OIDC provider fails, `.oidc_diagnostic()` returns the
+ * structured OAuth detail while the thrown exception remains a
+ * `line_sender_error`, preserving existing sender catch blocks. Note the query
+ * reader and the `questdb::oidc::device_auth` API instead throw
+ * `questdb::oidc::error` directly; see `questdb::oidc::error` for the full
+ * cross-surface exception model.
  */
 class line_sender_error : public ::questdb::error
 {
@@ -332,10 +480,12 @@ public:
         line_sender_error_code code,
         const std::string& what,
         bool in_doubt = false,
-        std::optional<qwp_ws_error> qwp_ws_diagnostic = std::nullopt)
+        std::optional<qwp_ws_error> qwp_ws_diagnostic = std::nullopt,
+        std::optional<::questdb::oidc::error> oidc_diagnostic = std::nullopt)
         : ::questdb::error{code, what}
         , _in_doubt{in_doubt}
         , _qwp_ws_diagnostic{std::move(qwp_ws_diagnostic)}
+        , _oidc_diagnostic{std::move(oidc_diagnostic)}
     {
     }
 
@@ -361,6 +511,13 @@ public:
         return _qwp_ws_diagnostic;
     }
 
+    /** Structured OIDC diagnostic for an attached token-provider failure. */
+    const std::optional<::questdb::oidc::error>& oidc_diagnostic()
+        const noexcept
+    {
+        return _oidc_diagnostic;
+    }
+
 private:
     inline static line_sender_error from_c(::line_sender_error* c_err)
     {
@@ -381,8 +538,41 @@ private:
             qwp_ws_diagnostic = qwp_ws_error_from_view(view);
         }
 
+        std::optional<::questdb::oidc::error> oidc_diagnostic;
+        ::questdb_oidc_error_view oidc_view{};
+        oidc_view.struct_size = sizeof oidc_view;
+        if (::questdb_error_oidc_get_view(owned_err.get(), &oidc_view))
+        {
+            const auto copy = [](const char* data, size_t size) {
+                return data ? std::string{data, size} : std::string{};
+            };
+            oidc_diagnostic.emplace(
+                code,
+                msg,
+                static_cast<::questdb::oidc::error_kind>(
+                    static_cast<int>(oidc_view.kind)),
+                copy(oidc_view.idp_error, oidc_view.idp_error_len),
+                copy(
+                    oidc_view.idp_error_description,
+                    oidc_view.idp_error_description_len),
+                oidc_view.has_status ? std::optional<uint16_t>{oidc_view.status}
+                                     : std::optional<uint16_t>{},
+                oidc_view.has_retry_after
+                    ? std::optional<uint64_t>{oidc_view.retry_after_seconds}
+                    : std::optional<uint64_t>{});
+        }
+
         return line_sender_error{
-            code, msg, in_doubt, std::move(qwp_ws_diagnostic)};
+            code,
+            msg,
+            in_doubt,
+            std::move(qwp_ws_diagnostic),
+            std::move(oidc_diagnostic)};
+    }
+
+    [[noreturn]] inline static void throw_from_c(::line_sender_error* c_err)
+    {
+        throw from_c(c_err);
     }
 
     template <typename F, typename... Args>
@@ -393,7 +583,7 @@ private:
         if (obj)
             return obj;
         else
-            throw from_c(c_err);
+            throw_from_c(c_err);
     }
 
     friend class line_sender;
@@ -412,6 +602,7 @@ private:
 
     bool _in_doubt;
     std::optional<qwp_ws_error> _qwp_ws_diagnostic;
+    std::optional<::questdb::oidc::error> _oidc_diagnostic;
 };
 
 /**

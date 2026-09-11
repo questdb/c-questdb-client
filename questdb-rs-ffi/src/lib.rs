@@ -78,6 +78,28 @@ use questdb::{
 };
 use std::time::Duration;
 
+/// Maximum size accepted for a caller-supplied connection/config string.
+///
+/// Config parsers copy parts of their input and may reserve storage based on
+/// its total length. Bound the C-controlled length before forming a slice so a
+/// hostile or corrupt caller cannot turn a config constructor into an
+/// allocator abort. Keep this in sync with `QUESTDB_CONFIG_MAX_BYTES` in the
+/// public C header.
+pub(crate) const MAX_CONFIG_BYTES: usize = 1024 * 1024;
+
+pub(crate) fn validate_config_len(len: usize) -> questdb::Result<()> {
+    if len <= MAX_CONFIG_BYTES {
+        Ok(())
+    } else {
+        Err(Error::new(
+            ErrorCode::InvalidApiCall,
+            format!(
+                "configuration string is {len} bytes, maximum is {MAX_CONFIG_BYTES} bytes (1 MiB)"
+            ),
+        ))
+    }
+}
+
 macro_rules! bubble_err_to_c {
     ($err_out:expr, $expression:expr) => {
         bubble_err_to_c!($err_out, $expression, false)
@@ -100,6 +122,7 @@ mod ndarr;
 use ndarr::StrideArrayView;
 
 mod egress;
+mod oidc;
 
 pub mod column_sender;
 pub use column_sender::*;
@@ -837,6 +860,27 @@ impl line_sender_utf8 {
     }
 }
 
+/// Validate a `line_sender_utf8` specifically for use as a connection string.
+/// The length check deliberately precedes slice formation / UTF-8 validation.
+pub(crate) fn validated_config_str(config: &line_sender_utf8) -> questdb::Result<&str> {
+    validate_config_len(config.len)?;
+    if config.buf.is_null() && config.len != 0 {
+        return Err(Error::new(
+            ErrorCode::InvalidApiCall,
+            "configuration pointer is NULL with non-zero length".to_string(),
+        ));
+    }
+    config.validated_utf8().map_err(|err| {
+        Error::new(
+            ErrorCode::InvalidUtf8,
+            format!(
+                "configuration string is not valid UTF-8: {err} (at byte {})",
+                err.valid_up_to()
+            ),
+        )
+    })
+}
+
 /// An ASCII-safe description of a binary buffer. Trimmed if too long.
 fn describe_buf(buf: &[u8]) -> String {
     let max_len = 100usize;
@@ -865,7 +909,7 @@ fn describe_buf(buf: &[u8]) -> String {
 }
 
 #[cold]
-unsafe fn set_err_out_from_error(err_out: *mut *mut line_sender_error, err: Error) {
+pub(crate) unsafe fn set_err_out_from_error(err_out: *mut *mut line_sender_error, err: Error) {
     let qwp_ws_error = err.qwp_ws_rejection().cloned();
     unsafe { set_err_out_from_error_with_qwpws(err_out, err, qwp_ws_error) };
 }
@@ -2564,12 +2608,13 @@ impl line_sender_opts {
 /// `line_sender_opts_new`, so there's no function with a matching name.
 ///
 /// For the full list of keys, search this module for `fn line_sender_opts_`.
+/// The string must not exceed [`MAX_CONFIG_BYTES`] bytes.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn line_sender_opts_from_conf(
     config: line_sender_utf8,
     err_out: *mut *mut line_sender_error,
 ) -> *mut line_sender_opts {
-    let config = config.as_str();
+    let config = bubble_err_to_c!(err_out, validated_config_str(&config), ptr::null_mut());
     let builder = bubble_err_to_c!(err_out, SenderBuilder::from_conf(config), ptr::null_mut());
     let builder = with_c_qwp_ws_default_error_handler(builder);
     Box::into_raw(Box::new(line_sender_opts(builder)))
@@ -3440,6 +3485,7 @@ pub unsafe extern "C" fn line_sender_build(
 /// `line_sender_opts_new`, so there's no function with a matching name.
 ///
 /// For the full list of keys, search this header for `bool line_sender_opts_`.
+/// The string must not exceed [`MAX_CONFIG_BYTES`] bytes.
 ///
 /// In the case of TCP, this synchronously establishes the TCP connection, and
 /// returns once the connection is fully established. If the connection
@@ -3452,7 +3498,7 @@ pub unsafe extern "C" fn line_sender_from_conf(
     config: line_sender_utf8,
     err_out: *mut *mut line_sender_error,
 ) -> *mut line_sender {
-    let config = config.as_str();
+    let config = bubble_err_to_c!(err_out, validated_config_str(&config), ptr::null_mut());
     let builder = bubble_err_to_c!(err_out, SenderBuilder::from_conf(config), ptr::null_mut());
     let builder = bubble_err_to_c!(
         err_out,
@@ -5717,6 +5763,142 @@ mod tests {
         );
         unsafe { questdb_error_free(*err) };
         *err = ptr::null_mut();
+    }
+
+    /// Every `questdb_connection_event_*` kind, paired with the Rust constant a
+    /// C caller compares against. Adding a variant means adding it here.
+    fn c_connection_event_abi() -> &'static [(&'static str, u32)] {
+        use crate::column_sender::*;
+        &[
+            ("connected", questdb_connection_event_connected),
+            ("disconnected", questdb_connection_event_disconnected),
+            ("reconnected", questdb_connection_event_reconnected),
+            ("failed_over", questdb_connection_event_failed_over),
+            (
+                "endpoint_attempt_failed",
+                questdb_connection_event_endpoint_attempt_failed,
+            ),
+            (
+                "all_endpoints_unreachable",
+                questdb_connection_event_all_endpoints_unreachable,
+            ),
+            ("auth_failed", questdb_connection_event_auth_failed),
+            (
+                "credential_unavailable",
+                questdb_connection_event_credential_unavailable,
+            ),
+        ]
+    }
+
+    #[test]
+    fn c_header_connection_event_kinds_match_rust() {
+        // These are hand-maintained in two places -- `#define`s in the C header
+        // and `pub const`s here -- and a C listener switches on the header's
+        // value. A drift silently relabels every lifecycle event: most
+        // damagingly a retryable `credential_unavailable` read as the terminal
+        // `auth_failed`, which the header itself says a listener may tear the
+        // pool down on. `c_header_line_sender_enum_matches_rust` guards the
+        // error-code enum the same way; this covers the kinds, which had no
+        // guard when `credential_unavailable` was appended.
+        let header = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../include/questdb/ingress/line_sender.h"
+        ));
+        for (name, value) in c_connection_event_abi() {
+            let needle = format!("#define questdb_connection_event_{name} {value}u");
+            assert!(
+                header.contains(&needle),
+                "C header is missing or disagrees on `{needle}` \
+                 (include/questdb/ingress/line_sender.h vs the Rust constant)",
+            );
+        }
+        // And the header must not declare kinds Rust does not know about.
+        let header_kinds = header
+            .lines()
+            .filter(|l| {
+                l.trim_start()
+                    .starts_with("#define questdb_connection_event_")
+            })
+            .count();
+        assert_eq!(
+            header_kinds,
+            c_connection_event_abi().len(),
+            "C header declares {header_kinds} connection-event kinds but Rust has {} \
+             -- a kind was added on one side only",
+            c_connection_event_abi().len(),
+        );
+        // Ordinals are an ABI: they must stay dense from 0 and, above all, keep
+        // their existing values. An already-compiled C caller holds the old
+        // numbers.
+        let mut values: Vec<u32> = c_connection_event_abi().iter().map(|(_, v)| *v).collect();
+        values.sort_unstable();
+        assert_eq!(
+            values,
+            (0..c_connection_event_abi().len() as u32).collect::<Vec<_>>(),
+            "connection-event ordinals must be dense from 0 and only ever appended"
+        );
+    }
+
+    #[test]
+    fn c_header_callback_inbox_cap_matches_rust() {
+        // Same hand-maintained-mirror hazard, one file over: the header
+        // advertises a cap the library is the one actually enforcing.
+        let header = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../include/questdb/client.h"
+        ));
+        let needle = format!(
+            "#define QUESTDB_DB_MAX_CALLBACK_INBOX_CAPACITY ((size_t){})",
+            crate::column_sender::MAX_DB_CALLBACK_INBOX_CAPACITY
+        );
+        assert!(
+            header.contains(&needle),
+            "public C callback-inbox cap drifted from Rust's {} \
+             (expected `{needle}` in include/questdb/client.h)",
+            crate::column_sender::MAX_DB_CALLBACK_INBOX_CAPACITY,
+        );
+    }
+
+    #[test]
+    fn config_size_cap_matches_public_header() {
+        assert!(validate_config_len(MAX_CONFIG_BYTES).is_ok());
+        assert!(validate_config_len(MAX_CONFIG_BYTES + 1).is_err());
+
+        let header = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../include/questdb/ingress/line_sender.h"
+        ));
+        assert!(
+            header.contains("#define QUESTDB_CONFIG_MAX_BYTES ((size_t)(1 << 20))"),
+            "public C config cap drifted from Rust's {MAX_CONFIG_BYTES}-byte cap"
+        );
+    }
+
+    #[test]
+    fn row_sender_config_apis_reject_oversized_inputs_before_reading_them() {
+        let config = line_sender_utf8 {
+            len: MAX_CONFIG_BYTES + 1,
+            // Deliberately not a `len`-byte allocation: the cap must reject
+            // the declared length before forming or validating a slice.
+            buf: std::ptr::NonNull::<c_char>::dangling().as_ptr(),
+        };
+
+        let mut err = ptr::null_mut();
+        let opts = unsafe { line_sender_opts_from_conf(config, &mut err) };
+        assert!(opts.is_null());
+        assert_line_error_contains(
+            &mut err,
+            line_sender_error_code::line_sender_error_invalid_api_call,
+            "maximum is 1048576 bytes",
+        );
+
+        let sender = unsafe { line_sender_from_conf(config, &mut err) };
+        assert!(sender.is_null());
+        assert_line_error_contains(
+            &mut err,
+            line_sender_error_code::line_sender_error_invalid_api_call,
+            "maximum is 1048576 bytes",
+        );
     }
 
     fn new_udp_sender(err: &mut *mut line_sender_error) -> *mut line_sender {
