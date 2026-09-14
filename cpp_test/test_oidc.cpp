@@ -248,15 +248,13 @@ TEST_CASE("OIDC C++ wrappers preserve ownership and structured errors")
     bool reader_reached_token_acquisition = false;
     try
     {
-        questdb::egress::reader reader{
-            "ws::addr=127.0.0.1:1;", shared_auth};
+        questdb::egress::reader reader{"ws::addr=127.0.0.1:1;", shared_auth};
         FAIL("a never-signed-in provider must not yield a reader");
     }
     catch (const questdb::oidc::error& error)
     {
         reader_reached_token_acquisition = true;
-        CHECK(
-            error.kind() == questdb::oidc::error_kind::interaction_required);
+        CHECK(error.kind() == questdb::oidc::error_kind::interaction_required);
     }
     CHECK(reader_reached_token_acquisition);
 

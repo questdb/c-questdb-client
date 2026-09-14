@@ -204,9 +204,11 @@ impl OidcError {
     /// store with accepted frames still queued — a disproportionate penalty for
     /// a caller mistake that ends the moment the callback returns.
     ///
-    /// Deliberately *not* marked [`acquisition_busy`](Self::acquisition_busy),
-    /// unlike the peer-holds-the-lock case: the blocked caller is the callback
-    /// itself, so no amount of waiting inside this call can release the lock.
+    /// Deliberately does *not* carry the crate-internal acquisition-busy marker
+    /// that [`retryable_interaction_required`](Self::retryable_interaction_required)
+    /// sets, unlike the peer-holds-the-lock case: the blocked caller is the
+    /// callback itself, so no amount of waiting inside this call can release
+    /// the lock.
     /// A transport that would otherwise spend its retry budget re-resolving
     /// must fail this one immediately instead.
     pub fn reentrant_interaction_required(message: impl Into<String>) -> crate::Error {
