@@ -115,8 +115,7 @@
 //! ```no_run
 //! # use questdb::oidc::{OidcDeviceAuth, FileTokenStore};
 //! # fn main() -> questdb::Result<()> {
-//! let store = FileTokenStore::at_default_location()
-//!     .map_err(|e| questdb::Error::new(questdb::ErrorCode::ConfigError, e.to_string()))?;
+//! let store = FileTokenStore::at_default_location()?;
 //! let auth = OidcDeviceAuth::from_questdb("https://questdb.example.com:9000")
 //!     .issuer("https://idp.example.com")
 //!     .token_store(store)

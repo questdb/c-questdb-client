@@ -167,10 +167,11 @@ TEST_CASE("OIDC C++ wrappers preserve ownership and structured errors")
         (questdb::pool{"ws::addr=127.0.0.1:1;lazy_connect=true;", auth}),
         questdb::oidc::error);
 
-    auto moved_from_sender_options =
+    // Live opts; `auth` is the moved-from handle these two cases are about.
+    auto options_for_moved_from_auth =
         questdb::ingress::opts::from_conf("https::addr=127.0.0.1:1;");
     CHECK_THROWS_AS(
-        moved_from_sender_options.oidc_auth(auth), questdb::oidc::error);
+        options_for_moved_from_auth.oidc_auth(auth), questdb::oidc::error);
     CHECK_THROWS_AS(
         (questdb::egress::reader{"ws::addr=127.0.0.1:1;", auth}),
         questdb::oidc::error);
@@ -233,6 +234,31 @@ TEST_CASE("OIDC C++ wrappers preserve ownership and structured errors")
         CHECK(error.oidc_diagnostic()->code() == error.code());
     }
     CHECK(attached_sender_saw_structured_error);
+
+    // The egress reader, with a LIVE handle. The moved-from case above proves
+    // only that `device_auth::raw()` refuses an emptied handle -- it throws
+    // before `qwp_reader_from_conf_with_oidc` is ever called, so on its own it
+    // says nothing about the attach. Distinguishing the two by exception type
+    // is not possible: `qwp_reader.hpp` documents this constructor as throwing
+    // `questdb::oidc::error` for BOTH a moved-from handle and a structured
+    // token-acquisition failure, and `shared_auth` has never signed in, so a
+    // live handle yields `interaction_required` rather than succeeding. The
+    // kind is therefore what separates them: seeing `interaction_required`
+    // proves the attach was reached and the provider was actually consulted.
+    bool reader_reached_token_acquisition = false;
+    try
+    {
+        questdb::egress::reader reader{
+            "ws::addr=127.0.0.1:1;", shared_auth};
+        FAIL("a never-signed-in provider must not yield a reader");
+    }
+    catch (const questdb::oidc::error& error)
+    {
+        reader_reached_token_acquisition = true;
+        CHECK(
+            error.kind() == questdb::oidc::error_kind::interaction_required);
+    }
+    CHECK(reader_reached_token_acquisition);
 
     // Lazy construction performs no network I/O, but exercises ownership and
     // the shared sender/reader provider configuration in the pool FFI.

@@ -86,6 +86,24 @@ fn multiscope_token() -> PersistedToken {
 }
 
 #[test]
+fn persisted_token_zeroizes_every_secret_field() {
+    // Pins the FIELD LIST of `zeroize_secrets`, not the heap scrubbing itself,
+    // which is not observable in safe Rust. A field silently dropped from it
+    // would otherwise fail nothing anywhere in the crate.
+    let mut token = PersistedToken::new(
+        Some("AT-1".to_string()),
+        Some("IT-1".to_string()),
+        Some("RT-1".to_string()),
+        1_700_000_000.0,
+        300.0,
+    );
+    token.zeroize_secrets();
+    assert_eq!(token.access_token(), None);
+    assert_eq!(token.id_token(), None);
+    assert_eq!(token.refresh_token(), None);
+}
+
+#[test]
 fn cancellable_lock_wait_abandons_in_process_contention() {
     let dir = TempDir::new().unwrap();
     let store = Arc::new(FileTokenStore::at(dir.path()));

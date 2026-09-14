@@ -218,15 +218,48 @@ impl TrafficGate {
     }
 
     pub(super) fn shutdown(&self) -> std::io::Result<()> {
-        self.shutdown_with_setup_state().1
+        let mut state = self.state.lock().unwrap_or_else(|err| err.into_inner());
+        self.shutdown_under_guard(&mut state).1
     }
 
-    fn shutdown_with_setup_state(&self) -> (bool, std::io::Result<()>) {
+    /// Shut the gate down and, on Windows, cancel a synchronous operation the
+    /// runner may be blocked in during setup.
+    ///
+    /// `CancelSynchronousIo` is issued while the gate mutex is still held, for
+    /// the same reason the other syscalls are: `setup_in_progress` is the whole
+    /// safety argument for firing it -- during setup the runner cannot be doing
+    /// store-and-forward file I/O -- and `TrafficRegistration::keep` clears that
+    /// flag under this very mutex. Consuming the flag under the lock and then
+    /// cancelling after releasing it left a window in which the runner had
+    /// already left setup and entered publication work, where the cancel can
+    /// abort a non-overlapped `WriteFile` with `ERROR_OPERATION_ABORTED` and an
+    /// unspecified byte count -- a torn durable record. `thread_stop` does not
+    /// close it: it is only observed at the top of the runner loop, not
+    /// mid-`drive_step`.
+    pub(super) fn shutdown_and_cancel_setup_io(
+        &self,
+        thread: Option<&thread::JoinHandle<()>>,
+    ) -> std::io::Result<()> {
+        let mut state = self.state.lock().unwrap_or_else(|err| err.into_inner());
+        let (setup_in_progress, result) = self.shutdown_under_guard(&mut state);
+        #[cfg(not(windows))]
+        let _ = (setup_in_progress, thread);
+        #[cfg(windows)]
+        if setup_in_progress
+            && let Some(thread) = thread
+            && let Err(err) = cancel_synchronous_worker_io(thread)
+        {
+            log::warn!("could not cancel QWP/WebSocket runner I/O: {err}");
+        }
+        drop(state);
+        result
+    }
+
+    fn shutdown_under_guard(&self, state: &mut TrafficGateState) -> (bool, std::io::Result<()>) {
         // The syscalls run under the gate mutex on purpose: every close of
         // the original socket is mutex-ordered behind `clear()`, so while
         // `current` is `Some` the original handle is still open and
         // `CancelIoEx` cannot hit a recycled handle. Cold path only.
-        let mut state = self.state.lock().unwrap_or_else(|err| err.into_inner());
         state.shut = true;
         let setup_in_progress = std::mem::take(&mut state.setup_in_progress);
         #[cfg(windows)]
@@ -2060,18 +2093,11 @@ impl<Q> Drop for SyncQwpWsRunner<Q> {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::Release);
         let thread = self.thread.take();
-        let (setup_in_progress, shutdown_result) = self.traffic_gate.shutdown_with_setup_state();
-        #[cfg(not(windows))]
-        let _ = setup_in_progress;
-        if let Err(err) = shutdown_result {
-            log::warn!("could not shut down QWP/WebSocket runner traffic: {err}");
-        }
-        #[cfg(windows)]
-        if setup_in_progress
-            && let Some(thread) = thread.as_ref()
-            && let Err(err) = cancel_synchronous_worker_io(thread)
+        if let Err(err) = self
+            .traffic_gate
+            .shutdown_and_cancel_setup_io(thread.as_ref())
         {
-            log::warn!("could not cancel QWP/WebSocket runner I/O: {err}");
+            log::warn!("could not shut down QWP/WebSocket runner traffic: {err}");
         }
         if let Some(thread) = thread {
             if wait_for_runner_exit(&thread, self.shutdown_timeout) {

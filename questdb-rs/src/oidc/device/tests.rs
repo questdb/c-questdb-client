@@ -233,6 +233,18 @@ fn sign_in_and_token(auth: &OidcDeviceAuth) -> Result<String> {
 }
 
 #[test]
+fn store_state_zeroizes_every_secret_field() {
+    // Pins the FIELD LIST of `zeroize_secrets`, not the heap scrubbing itself,
+    // which is not observable in safe Rust. `last_persisted_refresh` holds a
+    // copy of the refresh token; dropping it from the scrub would otherwise
+    // fail nothing anywhere in the crate.
+    let mut state = StoreState::default();
+    state.last_persisted_refresh = Some("RT-1".to_string());
+    state.zeroize_secrets();
+    assert_eq!(state.last_persisted_refresh, None);
+}
+
+#[test]
 fn discard_credentials_drops_the_in_memory_token_without_the_acquire_lock() {
     // Regression: the credential teardown used to live only after
     // `lock_acquire()` inside `close()`. Any close that skipped the drain --

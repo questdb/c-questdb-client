@@ -76,6 +76,12 @@ const DEFAULT_INTERVAL: u64 = 5;
 // Match the Java reference client's bounded wait behind a peer's silent
 // refresh. Six request-timeout phases cover connect, TLS, send, await, parse,
 // and drain; short polling slices still notice an interactive sign-in promptly.
+//
+// This is the ONLY bound on that wait, and `token()` is called synchronously
+// from a transport's flush/connect path, so it caps how long a flush can block
+// before its first request: three minutes at DEFAULT_TIMEOUT, twelve at
+// MAX_TIMEOUT. A sender's own `request_timeout` / `retry_timeout` do not apply.
+// Documented on `http_token_provider` and `line_sender_opts_oidc_auth`.
 const ACQUIRE_WAIT_TIMEOUT_MULTIPLE: u32 = 6;
 const ACQUIRE_WAIT_POLL_SLICE: Duration = Duration::from_millis(50);
 
@@ -224,9 +230,17 @@ impl StoreState {
     }
 }
 
+impl StoreState {
+    /// Overwrite every secret-bearing field. Split out of [`Drop`] so a test can
+    /// prove the field list is complete; see `TokenSet::zeroize_secrets`.
+    fn zeroize_secrets(&mut self) {
+        self.last_persisted_refresh.zeroize();
+    }
+}
+
 impl Drop for StoreState {
     fn drop(&mut self) {
-        self.last_persisted_refresh.zeroize();
+        self.zeroize_secrets();
     }
 }
 
@@ -1001,20 +1015,40 @@ impl OidcDeviceAuth {
         self.ensure_open()
     }
 
-    fn wait_between_polls(&self, duration: Duration) -> Result<()> {
+    /// Wait up to `duration` between device-authorization polls.
+    ///
+    /// Returns whether the wait actually ran to completion. `Condvar` permits
+    /// spurious wakeups, and the only deliberate notifiers -- `signal_close` and
+    /// `cancel_sign_in` -- make the `ensure_interactive_flow_active` below
+    /// return `Err`, so an `Ok(false)` means strictly less than `duration`
+    /// elapsed. The caller must not credit the full slice against the poll
+    /// interval in that case: RFC 8628 3.5 requires waiting *at least*
+    /// `interval`, and polling early is what earns a `slow_down` or an HTTP 429.
+    fn wait_between_polls(&self, duration: Duration) -> Result<bool> {
         if self.custom_sleep {
             self.ensure_interactive_flow_active()?;
+            // The test sleep hook is defined to consume the whole duration
+            // (it drives a synthetic clock), so the slice is always served.
             (self.sleep)(duration);
-            self.ensure_interactive_flow_active()
+            self.ensure_interactive_flow_active()?;
+            Ok(true)
         } else {
             self.ensure_interactive_flow_active()?;
             let guard = self.close_wait.lock().unwrap_or_else(|e| e.into_inner());
             self.ensure_interactive_flow_active()?;
-            match self.close_wake.wait_timeout(guard, duration) {
-                Ok((guard, _)) => drop(guard),
-                Err(error) => drop(error.into_inner().0),
-            }
-            self.ensure_interactive_flow_active()
+            let timed_out = match self.close_wake.wait_timeout(guard, duration) {
+                Ok((guard, result)) => {
+                    drop(guard);
+                    result.timed_out()
+                }
+                Err(error) => {
+                    let (guard, result) = error.into_inner();
+                    drop(guard);
+                    result.timed_out()
+                }
+            };
+            self.ensure_interactive_flow_active()?;
+            Ok(timed_out)
         }
     }
 
@@ -1086,7 +1120,12 @@ impl OidcDeviceAuth {
         loop {
             self.ensure_open()?;
             if self.interactive_in_progress.load(AtomicOrdering::Acquire) {
-                return Err(OidcError::interaction_required(
+                // `_busy`: this clears when the peer leaves the acquisition
+                // section, with no human action, so a transport holding an
+                // intact batch must be able to tell it apart from the
+                // "nobody has signed in" InteractionRequired below and spend
+                // its retry budget rather than fail the flush outright.
+                return Err(OidcError::interaction_required_busy(
                     "An interactive OIDC sign-in is in progress on another thread; no token \
                      is available without blocking. Retry once it completes.",
                 ));
@@ -2149,12 +2188,18 @@ impl OidcDeviceAuth {
                 let slice = owed
                     .min(remaining)
                     .min(Duration::from_secs(MAX_POLL_INTERVAL));
-                self.wait_between_polls(slice)?;
-                waited_in_interval = waited_in_interval.saturating_add(slice);
+                // Credit the slice only when it was actually served. A spurious
+                // condvar wakeup returns early, and crediting it anyway would
+                // let the loop believe the interval had elapsed and poll ahead
+                // of the rate the IdP mandates.
+                let served = self.wait_between_polls(slice)?;
+                if served {
+                    waited_in_interval = waited_in_interval.saturating_add(slice);
+                }
                 // Poll only once the whole interval has been served, or once the
                 // device code is about to expire (the deadline check at the top
                 // of the next iteration then reports the expiry).
-                if waited_in_interval >= target || slice >= remaining {
+                if waited_in_interval >= target || (served && slice >= remaining) {
                     poll_now = true;
                     waited_in_interval = Duration::ZERO;
                 }

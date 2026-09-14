@@ -179,10 +179,15 @@ impl OidcBuilderConfig {
                 builder = builder.token_store(FileTokenStore::at(directory.clone()));
             }
             FileStoreConfig::DefaultLocation => {
+                // Already a `ConfigError` carrying a full diagnostic; re-word
+                // it only to name the FFI-level operation that failed.
                 let store = FileTokenStore::at_default_location().map_err(|err| {
                     Error::new(
-                        ErrorCode::ConfigError,
-                        format!("Could not resolve the default OIDC token-store directory: {err}"),
+                        err.code(),
+                        format!(
+                            "Could not resolve the default OIDC token-store directory: {}",
+                            err.msg()
+                        ),
                     )
                 })?;
                 builder = builder.token_store(store);
@@ -286,6 +291,31 @@ impl SharedOidcAuth {
         )
     }
 
+    /// `reentry_error` for the `token()` acquisition path, which must not be
+    /// TERMINAL even though the caller did violate the contract.
+    ///
+    /// The message stays that of `reentry_error` -- the caller genuinely did
+    /// re-enter from its own callback and needs to be told so -- but the
+    /// `InvalidApiCall` class does not: `classify_provider_error` re-carries it
+    /// as a terminal `ConfigError`, which stops an attached transport's
+    /// reconnect loop permanently and terminalizes a store-and-forward
+    /// publication store with accepted frames still queued. That is a
+    /// disproportionate, unrecoverable penalty for a mistake that ends as soon
+    /// as the callback returns, and it is the same mistake `token_busy_error`
+    /// already refuses to terminalize when it is made from another thread.
+    ///
+    /// Unlike `token_busy_error` this is NOT marked as an acquisition-busy
+    /// wait: the caller blocked on the lock IS the callback, so re-resolving
+    /// inside a retry budget can never succeed and must fail fast.
+    fn token_reentry_error() -> Error {
+        OidcError::reentrant_interaction_required(
+            "OIDC authentication cannot be re-entered from its event callback; return from \
+             the callback before calling sign_in, token, clear, or an attached transport. \
+             cancel_sign_in and close are exempt and may be called here."
+                .to_string(),
+        )
+    }
+
     /// Reject an operation that would take the acquisition lock while a
     /// callback holds it.
     ///
@@ -355,7 +385,7 @@ impl SharedOidcAuth {
                 return cached.map_err(Into::into);
             }
             return Err(if self.in_own_event_callback() {
-                Self::reentry_error()
+                Self::token_reentry_error()
             } else {
                 Self::token_busy_error()
             });
@@ -2188,6 +2218,11 @@ mod tests {
         /// class there stops the reconnect permanently over a condition that
         /// clears when the callback returns.
         busy_retryable: AtomicUsize,
+        /// As `rejected`, but from `token()`, which must also be RETRYABLE.
+        /// The caller did re-enter and is told so, but terminalizing an
+        /// attached transport's publication store over a mistake that ends
+        /// when the callback returns is a penalty it can never recover from.
+        rejected_retryable: AtomicUsize,
         unexpected: AtomicUsize,
         closed_ok: AtomicUsize,
     }
@@ -2212,6 +2247,9 @@ mod tests {
         match guard_message.as_deref() {
             Some(message) if message.contains("cannot be re-entered") && is_invalid_api_call => {
                 state.rejected.fetch_add(1, Ordering::SeqCst);
+            }
+            Some(message) if message.contains("cannot be re-entered") && is_socket_error => {
+                state.rejected_retryable.fetch_add(1, Ordering::SeqCst);
             }
             Some(message) if message.contains("is busy") && is_invalid_api_call => {
                 state.busy.fetch_add(1, Ordering::SeqCst);
@@ -2590,6 +2628,11 @@ mod tests {
         }
     }
 
+    /// Pins the ownership-ordering exception documented on
+    /// `questdb_oidc_builder_event_handler` in `include/questdb/oidc.h`: a
+    /// `release` callback that re-registers supersedes the registration this
+    /// call is still installing, so that `user_data` is released before the
+    /// call returns `true`. Each `release` still runs exactly once.
     #[test]
     fn replacing_handler_allows_release_callback_reentry() {
         unsafe {
@@ -2700,7 +2743,12 @@ mod tests {
             // mutex; close must still work.
             CEventRenderer(handler).on_waiting(30.0);
 
-            assert_eq!(state.rejected.load(Ordering::SeqCst), 3);
+            // sign_in and clear are direct user calls and keep the terminal
+            // `InvalidApiCall` the header documents; token() is what an
+            // attached transport calls, so it reports the same re-entry
+            // message under a retryable class instead.
+            assert_eq!(state.rejected.load(Ordering::SeqCst), 2);
+            assert_eq!(state.rejected_retryable.load(Ordering::SeqCst), 1);
             assert_eq!(state.closed_ok.load(Ordering::SeqCst), 1);
             assert_eq!(state.unexpected.load(Ordering::SeqCst), 0);
             questdb_oidc_auth_free(auth);
@@ -2920,7 +2968,8 @@ mod tests {
             assert_eq!(state.busy.load(Ordering::SeqCst), 2);
             assert_eq!(state.busy_retryable.load(Ordering::SeqCst), 1);
             assert_eq!(
-                state.rejected.load(Ordering::SeqCst),
+                state.rejected.load(Ordering::SeqCst)
+                    + state.rejected_retryable.load(Ordering::SeqCst),
                 0,
                 "a thread that never entered a callback was accused of re-entry"
             );

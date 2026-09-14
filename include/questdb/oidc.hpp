@@ -665,6 +665,9 @@ public:
      * An empty std::function is rejected synchronously. Exceptions thrown by
      * the handler are contained at the C boundary and ignored; handle callback
      * failures inside the handler if they need to be observed.
+     *
+     * Installing a second handler supersedes the first and destroys its
+     * captured state before this call returns.
      */
     builder& event_handler(std::function<void(const event_view&)> handler)
     {

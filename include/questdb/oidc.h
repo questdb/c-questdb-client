@@ -103,14 +103,22 @@ typedef struct questdb_oidc_event
  *
  * `token` also fails when no valid cached token is available -- including
  * token acquisition through an attached sender, reader, or pool, which
- * surfaces it through that transport's provider-error path -- but on ANOTHER
- * thread it fails with the RETRYABLE `questdb_error_socket_error`, not
- * `questdb_error_invalid_api_call`. The condition clears as soon as the
- * callback returns, so a transport must retry rather than terminalize: a
- * terminal class here stopped a background reconnect permanently and stranded
- * a store-and-forward queue over a prompt that was still being painted. On the
- * callback's OWN thread `token` still reports `questdb_error_invalid_api_call`,
- * because that is a genuine re-entry the caller controls.
+ * surfaces it through that transport's provider-error path -- but it fails
+ * with the RETRYABLE `questdb_error_socket_error`, not
+ * `questdb_error_invalid_api_call`, on EITHER thread. The condition clears as
+ * soon as the callback returns, so a transport must retry rather than
+ * terminalize: a terminal class here stopped a background reconnect
+ * permanently and stranded a store-and-forward queue over a prompt that was
+ * still being painted, which is as unrecoverable for a caller who re-entered
+ * by mistake as for one that did nothing wrong.
+ *
+ * The two still differ in what a transport does with the retryable failure.
+ * From ANOTHER thread the wait can clear on its own, so a transport holding an
+ * intact batch re-resolves within its retry budget. On the callback's OWN
+ * thread the blocked caller *is* the callback, so no wait inside that call can
+ * release the lock and the operation fails immediately instead of spending the
+ * budget. Either way the error carries the structured OIDC payload, so
+ * `questdb_error_oidc_get_view` answers true.
  *
  * `token` DOES succeed from a valid cache: that path consults no lock the
  * callback holds. The rejection applies to any thread, not only the callback's
@@ -356,6 +364,16 @@ bool questdb_oidc_builder_default_file_token_store(
  * both `user_data` and `release` as NULL. Final release has no thread-affinity
  * guarantee and must return normally without throwing, unwinding, or
  * performing a non-local jump.
+ *
+ * Installing a handler releases the one it replaces, and that `release` runs
+ * after this function's internal borrow of the builder ends, so it MAY call
+ * back into this function on the same builder. One exception to the ordering
+ * above follows: if it does, its own registration supersedes the one this call
+ * just installed, and the superseded `user_data` is therefore released BEFORE
+ * this call returns `true`. Each `release` still runs exactly once, so nothing
+ * leaks or is double-freed, but a caller must not read `true` as a promise
+ * that the `user_data` it just passed is still installed. Re-registering from
+ * a `release` callback is the only way to reach this.
  */
 QUESTDB_CLIENT_API
 bool questdb_oidc_builder_event_handler(
@@ -647,6 +665,15 @@ bool questdb_error_oidc_get_view(
  * `username`/`password` or `token` (whether set through the config string or
  * through `line_sender_opts_username` and friends). Setting both fails with
  * `questdb_error_config_error`.
+ *
+ * A flush or connect that needs a fresh credential resolves it BEFORE its
+ * first request, and that resolution can wait behind a refresh already running
+ * on another thread for up to six times `questdb_oidc_builder_timeout_ms` --
+ * three minutes at the 30000 default, twelve at the 120000 maximum. That wait
+ * is bounded by the OIDC timeout alone: the sender's `request_timeout` and
+ * `retry_timeout` do not cap it, so size `timeout_ms` for the longest stall a
+ * flush may absorb. Calling `questdb_oidc_auth_sign_in` before starting the
+ * sender avoids the first, longest acquisition entirely.
  */
 QUESTDB_CLIENT_API
 bool line_sender_opts_oidc_auth(

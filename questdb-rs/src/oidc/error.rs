@@ -105,6 +105,16 @@ pub struct OidcError {
     /// device-flow polling loop uses this provenance to apply RFC 8628's
     /// mandatory five-second interval increase after connection timeouts.
     request_timed_out: bool,
+    /// True when an `InteractionRequired` was raised only because a peer holds
+    /// this provider's acquisition lock (a `sign_in()` on another thread, or a
+    /// renderer callback mid-paint), rather than because no credential exists.
+    ///
+    /// The kind alone cannot carry that distinction: both conditions are
+    /// `InteractionRequired` and both reach a transport reclassified to a
+    /// retryable `SocketError`. Only this flag separates "wait and it clears on
+    /// its own" from "a human must sign in", which is what lets the ILP/HTTP
+    /// flush spend its retry budget on the former and fail fast on the latter.
+    acquisition_busy: bool,
 }
 
 impl OidcError {
@@ -124,6 +134,7 @@ impl OidcError {
             retry_after: None,
             request_unsent: false,
             request_timed_out: false,
+            acquisition_busy: false,
         }
     }
 
@@ -145,6 +156,14 @@ impl OidcError {
 
     pub(crate) fn interaction_required(message: impl Into<String>) -> Self {
         Self::new(OidcErrorKind::InteractionRequired, message)
+    }
+
+    /// An `InteractionRequired` raised only because a peer holds the
+    /// acquisition lock. See [`acquisition_busy`](Self::acquisition_busy).
+    pub(crate) fn interaction_required_busy(message: impl Into<String>) -> Self {
+        let mut err = Self::interaction_required(message);
+        err.acquisition_busy = true;
+        err
     }
 
     pub(crate) fn cancelled(message: impl Into<String>) -> Self {
@@ -170,6 +189,27 @@ impl OidcError {
     /// this condition is derived from and cannot reach `Error`'s crate-private
     /// constructors.
     pub fn retryable_interaction_required(message: impl Into<String>) -> crate::Error {
+        let message = message.into();
+        crate::Error::from(Self::interaction_required_busy(message.clone()))
+            .reclassified(crate::ErrorCode::SocketError, message)
+    }
+
+    /// The failure a binding reports when a caller re-enters `token()` from
+    /// *its own* event callback, on the thread the callback is running on.
+    ///
+    /// Classified [`SocketError`](crate::ErrorCode::SocketError) for the same
+    /// reason as [`retryable_interaction_required`](Self::retryable_interaction_required):
+    /// `InvalidApiCall` is re-carried as a terminal `ConfigError`, which stops a
+    /// reconnect loop for good and terminalizes a store-and-forward publication
+    /// store with accepted frames still queued — a disproportionate penalty for
+    /// a caller mistake that ends the moment the callback returns.
+    ///
+    /// Deliberately *not* marked [`acquisition_busy`](Self::acquisition_busy),
+    /// unlike the peer-holds-the-lock case: the blocked caller is the callback
+    /// itself, so no amount of waiting inside this call can release the lock.
+    /// A transport that would otherwise spend its retry budget re-resolving
+    /// must fail this one immediately instead.
+    pub fn reentrant_interaction_required(message: impl Into<String>) -> crate::Error {
         let message = message.into();
         crate::Error::from(Self::interaction_required(message.clone()))
             .reclassified(crate::ErrorCode::SocketError, message)
@@ -275,6 +315,18 @@ impl OidcError {
     /// before or after the request was transmitted.
     pub(crate) fn request_timed_out(&self) -> bool {
         self.request_timed_out
+    }
+
+    /// True when an [`InteractionRequired`](OidcErrorKind::InteractionRequired)
+    /// was raised only because a peer holds this provider's acquisition lock —
+    /// an interactive `sign_in()` on another thread, or a renderer callback
+    /// being painted — rather than because no credential is available.
+    ///
+    /// Such a failure clears on its own once the peer releases, with no human
+    /// action, so a transport that is holding an intact batch should re-resolve
+    /// within its retry budget instead of failing the flush.
+    pub(crate) fn acquisition_busy(&self) -> bool {
+        self.acquisition_busy
     }
 }
 

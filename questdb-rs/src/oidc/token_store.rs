@@ -79,6 +79,8 @@ use std::time::{Duration, Instant, SystemTime};
 use serde_json::Value;
 use zeroize::{Zeroize, Zeroizing};
 
+use crate::oidc::OidcError;
+
 /// The environment variable that overrides the default token-store directory.
 ///
 /// Spelled as a conventional environment-variable name so a shell can actually
@@ -225,14 +227,22 @@ impl fmt::Debug for PersistedToken {
     }
 }
 
-impl Drop for PersistedToken {
-    fn drop(&mut self) {
+impl PersistedToken {
+    /// Overwrite every secret-bearing field. Split out of [`Drop`] so a test can
+    /// prove the field list is complete; see `TokenSet::zeroize_secrets`.
+    fn zeroize_secrets(&mut self) {
         // Scrub the persisted secrets from the heap when this carrier is dropped
         // (after a save, or after a load hands the token on to the cache). Each
         // `Option<String>::zeroize()` overwrites the string buffer.
         self.access_token.zeroize();
         self.id_token.zeroize();
         self.refresh_token.zeroize();
+    }
+}
+
+impl Drop for PersistedToken {
+    fn drop(&mut self) {
+        self.zeroize_secrets();
     }
 }
 
@@ -696,19 +706,28 @@ impl FileTokenStore {
     /// (e.g. a distroless container with no `HOME`) — set the environment variable
     /// to an absolute path, or use [`at`](Self::at) explicitly, which applies no
     /// such restriction to a path the caller supplies directly.
-    pub fn at_default_location() -> std::io::Result<Self> {
+    ///
+    /// Both failures are misconfigurations, so they arrive as
+    /// [`ConfigError`](crate::ErrorCode::ConfigError) in the crate's own error
+    /// type rather than as a `std::io::Error`: every other fallible entry point
+    /// on this surface returns [`crate::Result`], and a constructor that did not
+    /// forced each caller to write its own conversion before it could use `?`.
+    pub fn at_default_location() -> crate::Result<Self> {
         if let Some(dir) = std::env::var_os(TOKEN_STORE_DIR_ENV).filter(|v| !v.is_empty()) {
-            return Ok(Self::at(validate_override_dir(PathBuf::from(dir))?));
+            // `crate::Error` carries no `source`, so the io::Error's message is
+            // flattened in rather than chained. It is the whole diagnostic here:
+            // `validate_override_dir` builds a full sentence naming the variable
+            // and the offending path.
+            let dir = validate_override_dir(PathBuf::from(dir))
+                .map_err(|err| OidcError::config(err.to_string()))?;
+            return Ok(Self::at(dir));
         }
         let home = home_dir().ok_or_else(|| {
-            std::io::Error::new(
-                std::io::ErrorKind::NotFound,
-                format!(
-                    "could not resolve the home directory for the default OIDC \
-                     token-store location; set the {TOKEN_STORE_DIR_ENV} environment \
-                     variable to an absolute path, or construct FileTokenStore::at(dir)."
-                ),
-            )
+            OidcError::config(format!(
+                "could not resolve the home directory for the default OIDC \
+                 token-store location; set the {TOKEN_STORE_DIR_ENV} environment \
+                 variable to an absolute path, or construct FileTokenStore::at(dir)."
+            ))
         })?;
         Ok(Self::at(home.join(".questdb").join("oidc-tokens")))
     }

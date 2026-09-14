@@ -131,6 +131,26 @@ impl TokenProvider {
     /// dragged into the terminal set with it. Server authentication rejections
     /// remain separate terminal `AuthError`s because they occur after this
     /// method succeeds.
+    ///
+    /// # Known residual: the credential is not scrubbed past this point
+    ///
+    /// `oidc` zeroizes its own copies (`TokenSet`, `PersistedToken`, the store
+    /// buffers, the `Zeroizing<String>` the FFI hands out), but the token this
+    /// method receives from the provider closure, and the `Bearer …` value it
+    /// returns, are ordinary `String`s dropped unwiped -- once per flush, and
+    /// again per 401 rotation. Accepted deliberately rather than overlooked:
+    ///
+    /// * `TokenProvider` is transport-generic and compiles without the `_oidc`
+    ///   feature, which is what gates the `zeroize` dependency, so `Zeroizing`
+    ///   is not available on this path without cfg-splitting every signature.
+    /// * The value is copied onward into buffers this crate does not own --
+    ///   ureq's request headers, the WebSocket upgrade request, and the
+    ///   `Vec<(&str, String)>` header lists the egress reader builds -- so
+    ///   scrubbing here would narrow the exposure without removing it.
+    ///
+    /// The same applies to `oidc::http::post_form`, whose `form` slice carries
+    /// the refresh token and device code into a URL-encoded body that ureq
+    /// allocates internally.
     pub(crate) fn bearer_header(&self) -> crate::Result<String> {
         // Only reachable in an UNWIND-enabled build. `questdb-rs-ffi` sets
         // `panic = "abort"` in both profiles, and a Cargo profile is chosen by

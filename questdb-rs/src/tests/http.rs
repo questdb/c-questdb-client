@@ -719,6 +719,60 @@ fn test_interaction_required_fails_the_flush_without_waiting() -> TestResult {
     Ok(())
 }
 
+#[cfg(feature = "_oidc")]
+#[test]
+fn test_busy_interaction_required_is_retried_within_the_budget() -> TestResult {
+    // The counterpart to the test above, and the reason the fail-fast rule is
+    // keyed on `acquisition_busy` rather than on the kind. A peer `sign_in()`
+    // holding the acquisition lock -- or a renderer callback mid-paint -- also
+    // raises `InteractionRequired`, but it clears on its own the moment the peer
+    // releases, with no human involved. Failing the flush on it destroyed the
+    // batch: the bindings clear the sender-owned buffer on failure, and the
+    // `SocketError` retry they document then re-flushed an empty buffer and
+    // reported success.
+    let mut server = MockServer::new()?;
+    let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let seen = calls.clone();
+    let mut sender = server
+        .lsb_http()
+        .protocol_version(ProtocolVersion::V2)?
+        .http_token_provider(move || {
+            if seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst) < 2 {
+                return Err(crate::Error::from(
+                    crate::oidc::OidcError::interaction_required_busy(
+                        "An interactive OIDC sign-in is in progress on another thread",
+                    ),
+                ));
+            }
+            Ok("tok".to_string())
+        })?
+        .retry_timeout(Duration::from_secs(30))?
+        .build()?;
+    let mut buffer = sender.new_buffer();
+    buffer
+        .table("test")?
+        .symbol("t1", "v1")?
+        .column_f64("f1", 0.5)?
+        .at(TimestampNanos::new(10000000))?;
+    let buffer2 = buffer.clone();
+    let server_thread = std::thread::spawn(move || -> io::Result<MockServer> {
+        server.accept()?;
+        let req = server.recv_http_q()?;
+        // The rows survived the peer's acquisition rather than being dropped.
+        assert_eq!(req.body(), buffer2.as_bytes());
+        assert_eq!(req.header("authorization"), Some("Bearer tok"));
+        server.send_http_response_q(HttpResponse::empty())?;
+        Ok(server)
+    });
+
+    // Assert the flush before joining: on a regression it fails without ever
+    // sending, leaving the server parked in `accept()`.
+    sender.flush_and_keep(&buffer)?;
+    _ = server_thread.join().unwrap()?;
+    assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 3);
+    Ok(())
+}
+
 #[test]
 fn test_credential_rotation_budget_is_one_per_flush() -> TestResult {
     // Regression: the rotation budget is one per FLUSH. `http_send_with_retries`
@@ -787,7 +841,14 @@ fn test_credential_rotation_budget_is_one_per_flush() -> TestResult {
         )?;
 
         // Nothing further may arrive. Read with a short deadline so a
-        // regression fails here rather than hanging the suite.
+        // regression fails on the `requests` assertion below rather than
+        // hanging the suite: without this read the count is always 3 and that
+        // assertion cannot fail, leaving the regression to surface only
+        // indirectly, as a SocketError from a fourth request hitting a dropped
+        // server.
+        if server.recv_http(1.0).is_ok() {
+            requests += 1;
+        }
         Ok(requests)
     });
 

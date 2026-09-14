@@ -135,8 +135,11 @@ impl Debug for TokenSet {
     }
 }
 
-impl Drop for TokenSet {
-    fn drop(&mut self) {
+impl TokenSet {
+    /// Overwrite every secret-bearing field. Split out of [`Drop`] so a test can
+    /// prove the field list is complete: dropping a value is not observable, so
+    /// a field silently omitted here would otherwise fail nothing anywhere.
+    fn zeroize_secrets(&mut self) {
         // Scrub the bearer secrets (and the PII subject) from the heap when this
         // cached token set is dropped — on rotation, `clear()`, or auth teardown
         // — mirroring the `Zeroizing<String>` the FFI hands to callers. Every
@@ -147,6 +150,12 @@ impl Drop for TokenSet {
         self.id_token.zeroize();
         self.refresh_token.zeroize();
         self.sub.zeroize();
+    }
+}
+
+impl Drop for TokenSet {
+    fn drop(&mut self) {
+        self.zeroize_secrets();
     }
 }
 
@@ -165,6 +174,32 @@ mod tests {
             sub: None,
             issued_at,
         }
+    }
+
+    #[test]
+    fn token_set_zeroizes_every_secret_field() {
+        // Pins the FIELD LIST of `zeroize_secrets`, not the heap scrubbing
+        // itself, which is not observable in safe Rust. Dropping a field from
+        // it -- `sub` is PII, the other three are bearer secrets -- otherwise
+        // fails nothing anywhere in the crate.
+        let mut set = TokenSet {
+            access_token: Some("access".to_string()),
+            id_token: Some("id".to_string()),
+            refresh_token: Some("refresh".to_string()),
+            expires_at: 1000.0,
+            token_type: "Bearer".to_string(),
+            scope: Some("openid".to_string()),
+            sub: Some("subject".to_string()),
+            issued_at: 500.0,
+        };
+        set.zeroize_secrets();
+        assert_eq!(set.access_token, None);
+        assert_eq!(set.id_token, None);
+        assert_eq!(set.refresh_token, None);
+        assert_eq!(set.sub, None);
+        // Not secrets, and deliberately left intact.
+        assert_eq!(set.token_type, "Bearer");
+        assert_eq!(set.scope.as_deref(), Some("openid"));
     }
 
     #[test]

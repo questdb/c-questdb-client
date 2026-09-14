@@ -1614,6 +1614,15 @@ impl SenderBuilder {
     /// [`OidcDeviceAuth::sign_in`](crate::oidc::OidcDeviceAuth::sign_in) on a
     /// suitable UI thread before flushing, and request the `offline_access` scope
     /// so unattended senders can refresh without another explicit sign-in.
+    ///
+    /// Resolution happens **before the first request**, and with
+    /// `OidcDeviceAuth` it can wait behind a refresh already running on another
+    /// thread for up to six times the configured OIDC
+    /// [`timeout`](crate::oidc::OidcDeviceAuthBuilder::timeout) — three minutes
+    /// at the 30s default, twelve at the 120s maximum. Neither
+    /// [`request_timeout`](Self::request_timeout) nor
+    /// [`retry_timeout`](Self::retry_timeout) bounds that wait, so size the OIDC
+    /// timeout for the longest stall a flush may absorb.
     #[cfg(feature = "_sender-http")]
     pub fn http_token_provider<F, E>(mut self, provider: F) -> Result<Self>
     where

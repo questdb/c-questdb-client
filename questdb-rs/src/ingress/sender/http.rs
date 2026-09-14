@@ -75,6 +75,11 @@ impl HttpAuth {
     /// Resolve the `Authorization` header value for one flush, calling the token
     /// provider if present. A `Static` value is borrowed (no per-flush
     /// allocation on the hot path); only the `Provider` case allocates.
+    ///
+    /// The `Cow::Owned` value is dropped unwiped once the flush ends. That is a
+    /// known, accepted residual rather than an oversight -- see the "Known
+    /// residual" section on [`TokenProvider::bearer_header`](crate::token_provider::TokenProvider::bearer_header)
+    /// for why scrubbing here would not remove the exposure.
     pub(crate) fn resolve(&self) -> Result<Option<std::borrow::Cow<'_, str>>, Error> {
         use std::borrow::Cow;
         match self {
@@ -531,22 +536,29 @@ fn finish_http_send(
 /// violation -- arrive as `AuthError` / `ConfigError` and must fail the flush at
 /// once rather than burn the whole window on state that never changes.
 ///
-/// `InteractionRequired` is the one retryable kind excluded here. It is
-/// retryable in the classifier's sense -- a `sign_in()` on another thread clears
-/// it, which is why the QWP store-and-forward drainer must keep retrying it
-/// rather than abandon queued frames -- but nothing *this flush* waits for makes
-/// it clear, because it needs a human. Spending the window on it would turn
-/// "nobody has signed in" from an immediate, actionable error into one
-/// `retry_timeout` late on every flush. The Python foreground gate makes the
-/// same split for `dataframe()`.
+/// `InteractionRequired` is split rather than excluded wholesale, because the
+/// kind covers two conditions with opposite recovery stories:
+///
+/// * No credential exists and only a human can supply one. Nothing *this flush*
+///   waits for makes that clear, so it fails at once: spending the window would
+///   turn "nobody has signed in" from an immediate, actionable error into one
+///   `retry_timeout` late on every flush. The Python foreground gate makes the
+///   same split for `dataframe()`.
+/// * A peer holds the provider's acquisition lock -- a `sign_in()` on another
+///   thread, or a renderer callback mid-paint -- which
+///   [`OidcError::acquisition_busy`] marks. That clears on its own, typically in
+///   milliseconds, so it is retried like any other transient failure. Excluding
+///   it destroyed the batch instead: the C and Python bindings clear the
+///   sender-owned buffer on a flush failure, and the documented `SocketError`
+///   retry then re-flushed an empty buffer and reported success.
 fn provider_error_is_retryable(e: &Error) -> bool {
     if e.code() != crate::ErrorCode::SocketError {
         return false;
     }
     #[cfg(feature = "_oidc")]
-    if e.oidc_error()
-        .is_some_and(|oidc| oidc.kind() == crate::oidc::OidcErrorKind::InteractionRequired)
-    {
+    if e.oidc_error().is_some_and(|oidc| {
+        oidc.kind() == crate::oidc::OidcErrorKind::InteractionRequired && !oidc.acquisition_busy()
+    }) {
         return false;
     }
     true
