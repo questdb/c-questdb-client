@@ -545,11 +545,12 @@ std::thread_local! {
         const { RefCell::new(Vec::new()) };
 }
 
-/// How many times a nested [`CDiagnosticSink::detach`] retries the gate before
-/// giving up on the drain. Bounded because the thread holds another target's
-/// gate, so waiting indefinitely is the inversion itself; a callback that is
+/// How many times a bounded [`CDiagnosticSink`] detach retries the gate before
+/// giving up on the drain. Bounded because the caller cannot safely wait --
+/// it holds either another target's gate or a caller-runtime lock the callback
+/// may need -- so waiting indefinitely is the inversion itself; a callback
 /// mid-flight on another thread normally releases within a few yields.
-const DETACH_NESTED_DRAIN_ROUNDS: usize = 64;
+const DETACH_BOUNDED_DRAIN_ROUNDS: usize = 64;
 
 /// Marks this thread as being inside `target`'s callback for as long as it
 /// lives. Mirrors [`ActiveEventHandler`]'s stack discipline.
@@ -610,14 +611,43 @@ impl CDiagnosticSink {
     /// best-effort and bounded. That case is an AB/BA inversion, not
     /// self-deadlock: this thread holds the other target's gate, so blocking
     /// here while a thread inside this target's callback reaches for that one
-    /// parks both permanently. A binding releases its runtime lock around this
-    /// call (the Python client releases the GIL), so no outer lock serializes
-    /// the pair out of it, and `panic = "abort"` means neither guard is ever
-    /// unwound. Two providers each with a token store are enough to construct
-    /// it. Suppression is still exact in that case -- the flag is published
-    /// before any waiting -- only the "no callback is still running" half is
-    /// downgraded.
+    /// parks both permanently, and `panic = "abort"` means neither guard is
+    /// ever unwound. Two providers each with a token store are enough to
+    /// construct it.
+    ///
+    /// Waiting is therefore only safe when the calling thread holds nothing
+    /// the callback might acquire. Releasing the binding's global runtime lock
+    /// is NOT sufficient evidence of that: the callback runs binding code that
+    /// can take finer-grained locks -- Python's `logging` handler lock is the
+    /// worked example -- and a thread reaching a finalizer may already own
+    /// one. Callers that cannot establish it must use
+    /// [`detach_nowait`](Self::detach_nowait).
+    ///
+    /// Suppression is exact on every path, because the flag is published
+    /// before any waiting; only the "no callback is still running" half is
+    /// downgraded when the drain must be bounded.
     fn detach(&self) {
+        self.detach_inner(true);
+    }
+
+    /// As [`detach`](Self::detach), but never waits for a callback already
+    /// running: it publishes the suppression and drains only best-effort.
+    ///
+    /// For a caller that cannot prove it holds no lock the callback needs.
+    /// Waiting is only safe when nothing the callback might acquire is held by
+    /// the waiting thread, and a binding's finalizer cannot establish that: it
+    /// runs wherever a collection happened to fire. The Python client reaches
+    /// this from `_OidcNativeHandle.__dealloc__`, which a garbage collection
+    /// can run inside a `logging` handler's `emit` -- so the thread owns that
+    /// handler's lock, which is exactly what the diagnostic callback acquires
+    /// when it logs. Blocking there deadlocks the two permanently, and
+    /// releasing the GIL does not help, because the GIL is not the lock in
+    /// contention.
+    fn detach_nowait(&self) {
+        self.detach_inner(false);
+    }
+
+    fn detach_inner(&self, may_block: bool) {
         let target: *const CDiagnosticTarget = Arc::as_ptr(&self.target);
         let (reentrant, nested) = IN_DIAGNOSTIC_CALLBACK.with(|stack| {
             let stack = stack.borrow();
@@ -632,8 +662,8 @@ impl CDiagnosticSink {
         if reentrant {
             return;
         }
-        if nested {
-            for _ in 0..DETACH_NESTED_DRAIN_ROUNDS {
+        if nested || !may_block {
+            for _ in 0..DETACH_BOUNDED_DRAIN_ROUNDS {
                 match self.target.gate.try_lock() {
                     // Acquired: no callback holds the gate, and the published
                     // flag stops any that is waiting for it. Drained.
@@ -1479,6 +1509,27 @@ pub unsafe extern "C" fn questdb_oidc_auth_detach_diagnostics(auth: *const quest
     }
 }
 
+/// As [`questdb_oidc_auth_detach_diagnostics`], but never waits for a callback
+/// that is already running.
+///
+/// Later diagnostics are suppressed exactly as with the waiting form; only the
+/// "no callback is still running on return" guarantee is given up. Use this
+/// from a finalizer, garbage-collection hook, or any context that cannot prove
+/// the calling thread holds no lock the diagnostic callback might acquire --
+/// the waiting form deadlocks against such a lock, and dropping the binding's
+/// global runtime lock does not prevent it.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn questdb_oidc_auth_detach_diagnostics_nowait(
+    auth: *const questdb_oidc_auth,
+) {
+    if auth.is_null() {
+        return;
+    }
+    if let Some(sink) = unsafe { &(*auth).shared.diagnostic } {
+        sink.detach_nowait();
+    }
+}
+
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn questdb_oidc_auth_free(auth: *mut questdb_oidc_auth) {
     if !auth.is_null() {
@@ -2064,6 +2115,77 @@ mod tests {
         assert_eq!(B_ENTERED.load(Ordering::SeqCst), 1);
         *SINK_A.lock().unwrap() = None;
         *SINK_B.lock().unwrap() = None;
+    }
+
+    #[test]
+    fn nowait_detach_returns_while_a_callback_holds_the_gate() {
+        // A finalizer reaches detach wherever a collection fired, so it can
+        // already hold a lock the callback needs -- in the Python client, a
+        // `logging` handler lock taken by the very `emit` the collection ran
+        // inside, which the callback then tries to take when it logs. Waiting
+        // for the gate there parks both threads forever, and releasing the
+        // GIL does not help because the GIL is not the lock in contention.
+        // So this form must return while the gate is held.
+        static NW_ENTERED: AtomicUsize = AtomicUsize::new(0);
+        static NW_RELEASE: AtomicUsize = AtomicUsize::new(0);
+        static NW_DELIVERED: AtomicUsize = AtomicUsize::new(0);
+
+        unsafe extern "C" fn holding_diagnostic(
+            _user_data: *mut c_void,
+            _diagnostic: *const questdb_oidc_diagnostic,
+        ) {
+            NW_DELIVERED.fetch_add(1, Ordering::SeqCst);
+            NW_ENTERED.fetch_add(1, Ordering::SeqCst);
+            while NW_RELEASE.load(Ordering::SeqCst) == 0 {
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+        }
+
+        let sink = CDiagnosticSink {
+            target: Arc::new(CDiagnosticTarget {
+                callback: holding_diagnostic,
+                user_data: 0,
+                release: None,
+                gate: Mutex::new(()),
+            }),
+            state: Arc::new(CDiagnosticState::default()),
+        };
+
+        // Park a callback inside the gate on another thread.
+        let emitter = std::thread::spawn({
+            let sink = sink.clone();
+            move || sink.on_persistence_warning("in flight")
+        });
+        while NW_ENTERED.load(Ordering::SeqCst) == 0 {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+
+        // The gate is held and stays held until this test releases it. The
+        // waiting form blocks here; this one must not. Run it off-thread so a
+        // regression fails this test instead of hanging the entire run: a
+        // parked `Mutex::lock` cannot be interrupted, and cargo applies no
+        // per-test timeout.
+        let (tx, rx) = std::sync::mpsc::channel();
+        let detacher = std::thread::spawn({
+            let sink = sink.clone();
+            move || {
+                sink.detach_nowait();
+                let _ = tx.send(());
+            }
+        });
+        let outcome = rx.recv_timeout(std::time::Duration::from_secs(5));
+
+        // Release before asserting, so even a failure lets both threads exit
+        // and the harness report the failure rather than wedge.
+        NW_RELEASE.store(1, Ordering::SeqCst);
+        outcome.expect("nowait detach must not wait for the gate");
+        detacher.join().unwrap();
+        emitter.join().unwrap();
+
+        // Suppression is still exact for everything after it.
+        assert_eq!(NW_DELIVERED.load(Ordering::SeqCst), 1);
+        sink.on_persistence_warning("after detach");
+        assert_eq!(NW_DELIVERED.load(Ordering::SeqCst), 1);
     }
 
     #[test]

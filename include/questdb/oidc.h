@@ -451,19 +451,43 @@ questdb_oidc_auth* questdb_oidc_auth_clone(
  * this -- a callback that runs managed code can destroy a handle without the
  * user writing such a call.
  *
- * Most callers do not need this: `questdb_oidc_auth_close` also ends
+ * It DOES have to be outside every lock the diagnostic callback itself might
+ * acquire. Releasing the binding's global runtime lock is not sufficient
+ * evidence of that: the callback runs binding code that can take
+ * finer-grained locks -- Python's `logging` handler lock is the worked
+ * example -- and a thread that reaches a finalizer may already own one, since
+ * it runs wherever a collection happened to fire. A caller that cannot
+ * establish this must use `questdb_oidc_auth_detach_diagnostics_nowait`.
+ *
+ * Most callers do not need either form: `questdb_oidc_auth_close` also ends
  * diagnostics, because a closed auth performs no further token-store writes.
- * This is for an owner that is going away without being able to wait for that
- * -- a binding whose callback enters a managed runtime being torn down (a
+ * These are for an owner that is going away without being able to wait for
+ * that -- a binding whose callback enters a managed runtime being torn down (a
  * garbage-collected handle, or an interpreter beginning to shut down) while a
  * background token-provider or transport thread may still hold a clone of this
- * auth and reach a store write. Call it, with any runtime lock released,
- * before the callback stops being callable.
+ * auth and reach a store write.
  *
  * Auths built from the same builder are unaffected and keep delivering.
  */
 QUESTDB_CLIENT_API
 void questdb_oidc_auth_detach_diagnostics(const questdb_oidc_auth* auth);
+
+/**
+ * As `questdb_oidc_auth_detach_diagnostics`, but never waits for a diagnostic
+ * callback that is already running.
+ *
+ * Later diagnostics are suppressed exactly as with the waiting form; only the
+ * "no callback is still running on return" guarantee is given up. Idempotent,
+ * NULL-tolerant, and callable from any thread, including from inside the
+ * callback.
+ *
+ * This is the form for a finalizer or garbage-collection hook: it runs
+ * wherever a collection happened to fire, so it cannot prove which locks the
+ * thread already holds, and the waiting form would deadlock against any of
+ * them that the callback also needs.
+ */
+QUESTDB_CLIENT_API
+void questdb_oidc_auth_detach_diagnostics_nowait(const questdb_oidc_auth* auth);
 
 QUESTDB_CLIENT_API
 void questdb_oidc_auth_free(questdb_oidc_auth* auth);
