@@ -2484,6 +2484,71 @@ fn transport_failures_continue_until_device_code_expiry() {
 }
 
 #[test]
+fn a_stalled_token_response_cannot_outlive_the_device_code() {
+    // The configured timeout bounds one request; the device code bounds the
+    // sign-in as a whole, and is routinely the shorter of the two. An IdP that
+    // accepts a poll and then withholds its response must not hold the caller
+    // for a full request timeout past an expiry that has already passed --
+    // which is what a caller is promised, and what the Python binding
+    // documents on `timeout`.
+    //
+    // Real time deliberately: the overrun being tested is the HTTP layer's,
+    // which a virtual clock cannot reproduce. A 1s device code keeps it quick;
+    // `clamp_lifetime` imposes no floor.
+    let release = Arc::new(AtomicBool::new(false));
+    let polls = Arc::new(AtomicUsize::new(0));
+    let mock = {
+        let release = Arc::clone(&release);
+        let polls = Arc::clone(&polls);
+        MockServer::start(move |_method, path, _body| {
+            match path {
+            "/device" => (
+                200,
+                r#"{"device_code":"DC-1","user_code":"UC-1","verification_uri":"https://idp.example/device","expires_in":1,"interval":1}"#
+                    .to_string(),
+            ),
+            "/token" => {
+                polls.fetch_add(1, Ordering::SeqCst);
+                // Accept the request, then withhold the response.
+                while !release.load(Ordering::SeqCst) {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                (200, r#"{"access_token":"AT-1","expires_in":300}"#.to_string())
+            }
+            _ => (404, "{}".to_string()),
+        }
+        })
+    };
+    let auth = OidcDeviceAuth::builder()
+        .client_id("questdb")
+        .device_authorization_endpoint(mock.url("/device"))
+        .token_endpoint(mock.url("/token"))
+        .scope("openid")
+        .interactive(true)
+        .open_browser(false)
+        .timeout(Duration::from_secs(30))
+        .build()
+        .expect("build");
+
+    let started = Instant::now();
+    let err = auth.sign_in().unwrap_err();
+    let elapsed = started.elapsed();
+    release.store(true, Ordering::SeqCst);
+
+    assert_eq!(err.kind(), OidcErrorKind::Timeout);
+    assert_eq!(err.idp_error(), Some("expired_token"));
+    assert!(
+        polls.load(Ordering::SeqCst) >= 1,
+        "the token endpoint must have been polled"
+    );
+    assert!(
+        elapsed < Duration::from_secs(10),
+        "sign-in must end at the device-code deadline, not the 30s request \
+         timeout (took {elapsed:?})"
+    );
+}
+
+#[test]
 fn connection_timeout_increases_poll_interval() {
     // RFC 8628 requires a five-second increase after a connection timeout. With
     // a six-second code lifetime, increasing 5s -> 10s leaves room for only the

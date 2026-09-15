@@ -33,8 +33,6 @@ use std::sync::Arc;
 #[cfg(feature = "_sender-qwp-ws")]
 use std::sync::atomic::{AtomicUsize, Ordering};
 #[cfg(feature = "_sender-qwp-ws")]
-use std::sync::mpsc::{self, RecvTimeoutError};
-#[cfg(feature = "_sender-qwp-ws")]
 use std::time::Duration;
 
 #[cfg(feature = "_sender-qwp-ws")]
@@ -43,6 +41,26 @@ const ISOLATED_PROVIDER_POLL: Duration = Duration::from_millis(5);
 const MAX_ISOLATED_PROVIDER_WORKERS: usize = 16;
 #[cfg(feature = "_sender-qwp-ws")]
 static ISOLATED_PROVIDER_WORKERS: AtomicUsize = AtomicUsize::new(0);
+
+/// The result of one isolated acquisition, shared by every caller that joined
+/// it.
+#[cfg(feature = "_sender-qwp-ws")]
+#[derive(Default)]
+struct IsolatedResult {
+    done: std::sync::Mutex<Option<crate::Result<String>>>,
+    ready: std::sync::Condvar,
+}
+
+/// Single-flight state for one provider's isolated acquisitions.
+///
+/// Shared by every clone of a [`TokenProvider`], so the repeated reconnect
+/// attempts of one transport coalesce onto one worker instead of each taking
+/// its own slice of the process-global worker budget.
+#[cfg(feature = "_sender-qwp-ws")]
+#[derive(Default)]
+struct IsolatedAcquisition {
+    current: std::sync::Mutex<Option<Arc<IsolatedResult>>>,
+}
 
 #[cfg(feature = "_sender-qwp-ws")]
 #[derive(Debug)]
@@ -96,7 +114,13 @@ pub(crate) type TokenProviderFn = Arc<dyn Fn() -> crate::Result<String> + Send +
 /// A cloneable, thread-safe token provider whose [`Debug`] never renders the
 /// closure (or any captured token).
 #[derive(Clone)]
-pub(crate) struct TokenProvider(pub(crate) TokenProviderFn);
+pub(crate) struct TokenProvider {
+    provide: TokenProviderFn,
+    /// Shared by every clone so one provider never holds more than one
+    /// isolated worker. See [`IsolatedAcquisition`].
+    #[cfg(feature = "_sender-qwp-ws")]
+    isolated: Arc<IsolatedAcquisition>,
+}
 
 impl TokenProvider {
     /// Wrap a caller closure, mapping its error into the crate error type.
@@ -105,7 +129,11 @@ impl TokenProvider {
         F: Fn() -> std::result::Result<String, E> + Send + Sync + 'static,
         E: Into<crate::Error>,
     {
-        TokenProvider(Arc::new(move || provider().map_err(Into::into)))
+        TokenProvider {
+            provide: Arc::new(move || provider().map_err(Into::into)),
+            #[cfg(feature = "_sender-qwp-ws")]
+            isolated: Arc::new(IsolatedAcquisition::default()),
+        }
     }
 
     /// Pull the raw token without transport classification. Used when one
@@ -113,7 +141,7 @@ impl TokenProvider {
     /// reader connection factories; each transport applies its own validation
     /// and retry classification when it formats the Bearer header.
     pub(crate) fn provide(&self) -> crate::Result<String> {
-        (self.0)()
+        (self.provide)()
     }
 
     /// Pull a token and format it as a validated `Authorization: Bearer` value.
@@ -186,9 +214,17 @@ impl TokenProvider {
     /// cancellation-aware for its result.
     ///
     /// A synchronous caller-supplied closure cannot be forcibly cancelled.
-    /// Once `cancelled` becomes true this method abandons the result receiver;
-    /// the provider invocation may finish later, but it retains only this
-    /// provider clone rather than the transport runner or its durable queue.
+    /// Once `cancelled` becomes true this method abandons its wait; the
+    /// provider invocation may finish later, but it retains only this provider
+    /// clone rather than the transport runner or its durable queue.
+    ///
+    /// Acquisitions for one provider are single-flight: a caller arriving while
+    /// a worker is already running joins it instead of starting another. The
+    /// permit is therefore held per provider, not per call. Without that, a
+    /// reconnect loop behind one blocked callback took a fresh permit on every
+    /// attempt until it held all of them, and an unrelated healthy provider --
+    /// which would have returned a token immediately -- was refused one and
+    /// failed its own connect before dialling an endpoint.
     #[cfg(feature = "_sender-qwp-ws")]
     pub(crate) fn bearer_header_isolated_until(
         &self,
@@ -198,44 +234,112 @@ impl TokenProvider {
             return Err(provider_shutdown_error());
         }
 
+        let (slot, lead) = {
+            let mut current = self
+                .isolated
+                .current
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            match current.as_ref() {
+                Some(existing) => (Arc::clone(existing), false),
+                None => {
+                    let fresh = Arc::new(IsolatedResult::default());
+                    *current = Some(Arc::clone(&fresh));
+                    (fresh, true)
+                }
+            }
+        };
+        if lead {
+            self.spawn_isolated_worker(&slot)?;
+        }
+
+        let mut done = slot
+            .done
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        loop {
+            if let Some(result) = done.as_ref() {
+                return result.clone();
+            }
+            let (guard, wait) = slot
+                .ready
+                .wait_timeout(done, ISOLATED_PROVIDER_POLL)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            done = guard;
+            if done.is_none() && wait.timed_out() && cancelled() {
+                return Err(provider_shutdown_error());
+            }
+        }
+    }
+
+    /// Take a worker permit and start the single in-flight acquisition for this
+    /// provider. Every failure is published to `slot` as well as returned, so a
+    /// caller that joined it is never left waiting on a worker that will not
+    /// run.
+    #[cfg(feature = "_sender-qwp-ws")]
+    fn spawn_isolated_worker(&self, slot: &Arc<IsolatedResult>) -> crate::Result<()> {
         // A blocked synchronous callback cannot be killed, but it must not
         // permit repeated sender teardown to grow process-global thread count
         // without bound. The permit lives on the worker and is released on
         // normal return, unwind-enabled panic, or spawn failure.
-        let permit = IsolatedProviderPermit::acquire(
+        let permit = match IsolatedProviderPermit::acquire(
             &ISOLATED_PROVIDER_WORKERS,
             MAX_ISOLATED_PROVIDER_WORKERS,
-        )?;
+        ) {
+            Ok(permit) => permit,
+            Err(err) => {
+                self.publish_isolated(slot, Err(err.clone()));
+                return Err(err);
+            }
+        };
         let provider = self.clone();
-        let (result_tx, result_rx) = mpsc::sync_channel(1);
-        std::thread::Builder::new()
+        let published = Arc::clone(slot);
+        if let Err(err) = std::thread::Builder::new()
             .name("questdb-token-provider".to_string())
             .spawn(move || {
                 let _permit = permit;
-                let _ = result_tx.send(provider.bearer_header());
+                let result = provider.bearer_header();
+                provider.publish_isolated(&published, result);
             })
-            .map_err(|err| {
-                crate::error::fmt!(
-                    SocketError,
-                    "Could not start the isolated token-provider worker: {err}"
-                )
-            })?;
+        {
+            let err = crate::error::fmt!(
+                SocketError,
+                "Could not start the isolated token-provider worker: {err}"
+            );
+            self.publish_isolated(slot, Err(err.clone()));
+            return Err(err);
+        }
+        Ok(())
+    }
 
-        loop {
-            match result_rx.recv_timeout(ISOLATED_PROVIDER_POLL) {
-                Ok(result) => return result,
-                Err(RecvTimeoutError::Timeout) if cancelled() => {
-                    return Err(provider_shutdown_error());
-                }
-                Err(RecvTimeoutError::Timeout) => {}
-                Err(RecvTimeoutError::Disconnected) => {
-                    return Err(crate::error::fmt!(
-                        SocketError,
-                        "The isolated token-provider worker stopped without returning a token"
-                    ));
-                }
+    /// Retire the in-flight slot and wake everyone waiting on it.
+    #[cfg(feature = "_sender-qwp-ws")]
+    fn publish_isolated(&self, slot: &Arc<IsolatedResult>, result: crate::Result<String>) {
+        // Clear the slot before publishing so the next acquisition starts a
+        // fresh worker rather than joining -- and re-reading the result of --
+        // one that has already finished. Compare by identity: a slot retired
+        // earlier must not clear its successor.
+        {
+            let mut current = self
+                .isolated
+                .current
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if current
+                .as_ref()
+                .is_some_and(|existing| Arc::ptr_eq(existing, slot))
+            {
+                *current = None;
             }
         }
+        let mut done = slot
+            .done
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if done.is_none() {
+            *done = Some(result);
+        }
+        slot.ready.notify_all();
     }
 }
 
@@ -524,7 +628,7 @@ mod tests {
     /// the cancellation branches — the whole reason the method exists — were not.
     #[cfg(feature = "_sender-qwp-ws")]
     mod isolated {
-        use super::super::{IsolatedProviderPermit, TokenProvider};
+        use super::super::{IsolatedProviderPermit, MAX_ISOLATED_PROVIDER_WORKERS, TokenProvider};
         use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
         use std::sync::{Arc, Condvar, Mutex};
 
@@ -544,6 +648,10 @@ mod tests {
                 while !*set {
                     set = self.cv.wait(set).unwrap();
                 }
+            }
+
+            fn is_signalled(&self) -> bool {
+                *self.set.lock().unwrap()
             }
         }
 
@@ -629,10 +737,70 @@ mod tests {
             assert_eq!(err.code(), crate::ErrorCode::SocketError);
             assert!(err.msg().contains("shutting down"), "{}", err.msg());
 
-            // Release the abandoned worker so it exits cleanly; its send to the
-            // now-dropped receiver is ignored (no panic, no leak).
+            // Release the abandoned worker so it exits cleanly; publishing to a
+            // slot nobody is waiting on is ignored (no panic, no leak).
             release.signal();
             call.join().unwrap();
+        }
+
+        #[test]
+        fn one_blocked_provider_cannot_starve_another() {
+            // Every cancelled call used to abandon a worker that kept its
+            // permit, so one blocked provider could take the whole global
+            // budget and an unrelated healthy provider was then refused a token
+            // it would have returned immediately -- failing its connect before
+            // it dialled an endpoint.
+            let started = Arc::new(Gate::default());
+            let release = Arc::new(Gate::default());
+            let calls = Arc::new(AtomicUsize::new(0));
+            let blocked = TokenProvider::new({
+                let started = Arc::clone(&started);
+                let release = Arc::clone(&release);
+                let calls = Arc::clone(&calls);
+                move || {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    started.signal();
+                    release.wait();
+                    Ok::<_, crate::Error>("late-token".to_string())
+                }
+            });
+
+            // Each call must get past the entry guard and actually reach
+            // acquisition before it cancels, or it would prove nothing: a
+            // predicate already true on entry short-circuits at the top of
+            // `bearer_header_isolated_until` and takes no permit even without
+            // single-flight. A deadline sampled per call is false on entry and
+            // true only after the wait loop has run.
+            for _ in 0..(MAX_ISOLATED_PROVIDER_WORKERS + 2) {
+                let deadline = std::time::Instant::now() + std::time::Duration::from_millis(30);
+                let err = blocked
+                    .bearer_header_isolated_until(|| std::time::Instant::now() >= deadline)
+                    .unwrap_err();
+                // Without single-flight this becomes the permit-exhaustion
+                // error once the budget is gone, not a cancellation.
+                assert_eq!(err.code(), crate::ErrorCode::SocketError);
+                assert!(err.msg().contains("shutting down"), "{}", err.msg());
+            }
+            assert!(started.is_signalled(), "the worker must have run");
+            assert_eq!(
+                calls.load(Ordering::SeqCst),
+                1,
+                "one provider must coalesce onto a single isolated worker"
+            );
+
+            // The unrelated provider must still be invoked and succeed.
+            let healthy = TokenProvider::new(|| Ok::<_, crate::Error>("tok-b".to_string()));
+            assert_eq!(
+                healthy.bearer_header_isolated_until(|| false).unwrap(),
+                "Bearer tok-b"
+            );
+
+            // Drain the abandoned worker so its permit is released.
+            release.signal();
+            assert_eq!(
+                blocked.bearer_header_isolated_until(|| false).unwrap(),
+                "Bearer late-token"
+            );
         }
     }
 }

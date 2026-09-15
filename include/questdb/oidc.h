@@ -432,6 +432,33 @@ questdb_oidc_auth* questdb_oidc_builder_build(
 QUESTDB_CLIENT_API
 questdb_oidc_auth* questdb_oidc_auth_clone(
     const questdb_oidc_auth* auth, questdb_error** err_out);
+
+/**
+ * Permanently stop delivering this auth's persistence diagnostics.
+ *
+ * Returns once no diagnostic callback is running for this auth and no later
+ * one can start. Idempotent, NULL-tolerant, and callable from any thread.
+ *
+ * Called from inside the diagnostic callback it degrades to suppressing later
+ * diagnostics without waiting, because the only invocation it could wait for
+ * is the caller's own frame. A binding does not have to prove it is outside
+ * the callback before calling this -- a callback that runs managed code can
+ * destroy a handle without the user writing such a call.
+ *
+ * Most callers do not need this: `questdb_oidc_auth_close` also ends
+ * diagnostics, because a closed auth performs no further token-store writes.
+ * This is for an owner that is going away without being able to wait for that
+ * -- a binding whose callback enters a managed runtime being torn down (a
+ * garbage-collected handle, or an interpreter beginning to shut down) while a
+ * background token-provider or transport thread may still hold a clone of this
+ * auth and reach a store write. Call it, with any runtime lock released,
+ * before the callback stops being callable.
+ *
+ * Auths built from the same builder are unaffected and keep delivering.
+ */
+QUESTDB_CLIENT_API
+void questdb_oidc_auth_detach_diagnostics(const questdb_oidc_auth* auth);
+
 QUESTDB_CLIENT_API
 void questdb_oidc_auth_free(questdb_oidc_auth* auth);
 

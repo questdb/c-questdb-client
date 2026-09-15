@@ -117,7 +117,17 @@ impl OidcBuilderConfig {
         }
     }
 
-    fn build(&self) -> Result<(OidcDeviceAuth, Option<Arc<CEventHandler>>), Error> {
+    #[allow(clippy::type_complexity)]
+    fn build(
+        &self,
+    ) -> Result<
+        (
+            OidcDeviceAuth,
+            Option<Arc<CEventHandler>>,
+            Option<CDiagnosticSink>,
+        ),
+        Error,
+    > {
         let mut builder = match &self.source {
             BuilderSource::Explicit => OidcDeviceAuth::builder(),
             BuilderSource::QuestDb(url) => OidcDeviceAuth::from_questdb(url.clone()),
@@ -170,8 +180,14 @@ impl OidcBuilderConfig {
         if let Some(renderer) = &event_handler {
             builder = builder.renderer(CEventRenderer(Arc::clone(renderer)));
         }
-        if let Some(diagnostic) = &self.diagnostic {
-            builder = builder.diagnostic_handler(CDiagnosticSink(Arc::clone(diagnostic)));
+        // The sink's per-auth state is retained alongside the auth so the
+        // binding can detach delivery when its callback stops being callable.
+        let diagnostic_sink = self.diagnostic.as_ref().map(|target| CDiagnosticSink {
+            target: Arc::clone(target),
+            state: Arc::new(CDiagnosticState::default()),
+        });
+        if let Some(sink) = &diagnostic_sink {
+            builder = builder.diagnostic_handler(sink.clone());
         }
         match &self.file_store {
             FileStoreConfig::None => {}
@@ -194,7 +210,7 @@ impl OidcBuilderConfig {
             }
         }
         let auth = builder.build().map_err(Error::from)?;
-        Ok((auth, event_handler))
+        Ok((auth, event_handler, diagnostic_sink))
     }
 }
 
@@ -220,6 +236,7 @@ pub struct questdb_oidc_auth {
 pub(crate) struct SharedOidcAuth {
     inner: Arc<OidcDeviceAuth>,
     event_handler: Option<Arc<CEventHandler>>,
+    diagnostic: Option<CDiagnosticSink>,
 }
 
 impl SharedOidcAuth {
@@ -504,6 +521,52 @@ struct CDiagnosticTarget {
     gate: std::sync::Mutex<()>,
 }
 
+/// Per-auth diagnostic delivery state.
+///
+/// Separate from [`CDiagnosticTarget`], which is shared by every auth built
+/// from one reusable builder: detaching one auth's diagnostics must not silence
+/// its siblings, but it must still serialize against a callback in flight, and
+/// the target's gate is what provides that.
+#[derive(Default)]
+struct CDiagnosticState {
+    detached: AtomicBool,
+}
+
+std::thread_local! {
+    /// The C diagnostic targets this thread is currently inside, innermost last.
+    ///
+    /// Recorded by target identity rather than merely counted: this thread can
+    /// be inside target A's callback while an auth belonging to target B is
+    /// detached, because the callback runs binding code that can destroy an
+    /// unrelated handle. A bare depth counter would skip B's drain on the
+    /// strength of holding A's gate, and B may genuinely have a callback
+    /// running on another thread.
+    static IN_DIAGNOSTIC_CALLBACK: RefCell<Vec<*const CDiagnosticTarget>> =
+        const { RefCell::new(Vec::new()) };
+}
+
+/// Marks this thread as being inside `target`'s callback for as long as it
+/// lives. Mirrors [`ActiveEventHandler`]'s stack discipline.
+struct InDiagnosticCallback(*const CDiagnosticTarget);
+
+impl InDiagnosticCallback {
+    fn enter(target: &Arc<CDiagnosticTarget>) -> Self {
+        let target = Arc::as_ptr(target);
+        IN_DIAGNOSTIC_CALLBACK.with(|stack| stack.borrow_mut().push(target));
+        Self(target)
+    }
+}
+
+impl Drop for InDiagnosticCallback {
+    fn drop(&mut self) {
+        IN_DIAGNOSTIC_CALLBACK.with(|stack| {
+            let mut stack = stack.borrow_mut();
+            let popped = stack.pop();
+            debug_assert_eq!(popped, Some(self.0));
+        });
+    }
+}
+
 impl Drop for CDiagnosticTarget {
     fn drop(&mut self) {
         if let Some(release) = self.release {
@@ -513,10 +576,47 @@ impl Drop for CDiagnosticTarget {
 }
 
 #[derive(Clone)]
-struct CDiagnosticSink(Arc<CDiagnosticTarget>);
+struct CDiagnosticSink {
+    target: Arc<CDiagnosticTarget>,
+    state: Arc<CDiagnosticState>,
+}
+
+impl CDiagnosticSink {
+    /// Stop delivering this auth's diagnostics, waiting out a callback already
+    /// running.
+    ///
+    /// Taking the gate is what makes this a handshake rather than a flag flip:
+    /// on return, no invocation is in progress and no later one can start. A
+    /// binding whose callback enters a managed runtime needs exactly that
+    /// before it stops being able to service one -- publishing the flag alone
+    /// would leave a callback that had already passed the check running into a
+    /// runtime that is going away.
+    ///
+    /// Reached from inside this thread's own callback it degrades to that flag
+    /// flip, which is not a weakening: the gate serializes every invocation of
+    /// this target, so if this thread holds it then the only invocation in
+    /// flight is the caller's own frame, and it is about to return. Taking the
+    /// gate again would deadlock a caller on itself -- reachable without any
+    /// user writing such a call, because a binding's callback can run a
+    /// collection that destroys a handle.
+    fn detach(&self) {
+        let target: *const CDiagnosticTarget = Arc::as_ptr(&self.target);
+        let reentrant = IN_DIAGNOSTIC_CALLBACK.with(|stack| stack.borrow().contains(&target));
+        let _gate = (!reentrant).then(|| {
+            self.target
+                .gate
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+        });
+        self.state.detached.store(true, Ordering::Release);
+    }
+}
 
 impl DiagnosticHandler for CDiagnosticSink {
     fn on_persistence_warning(&self, message: &str) {
+        if self.state.detached.load(Ordering::Acquire) {
+            return;
+        }
         let display = sanitize_display_text(message);
         let (message, message_len) = str_or_null(Some(&display));
         let diagnostic = questdb_oidc_diagnostic {
@@ -526,11 +626,18 @@ impl DiagnosticHandler for CDiagnosticSink {
             message_len,
         };
         let _gate = self
-            .0
+            .target
             .gate
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        unsafe { (self.0.callback)(self.0.user_data as *mut c_void, &diagnostic) };
+        // Re-read under the gate. `detach` publishes the flag while holding it,
+        // so this cannot observe a stale `false` and then invoke a callback the
+        // caller has been told is finished with.
+        if self.state.detached.load(Ordering::Acquire) {
+            return;
+        }
+        let _in_callback = InDiagnosticCallback::enter(&self.target);
+        unsafe { (self.target.callback)(self.target.user_data as *mut c_void, &diagnostic) };
     }
 }
 
@@ -1280,10 +1387,11 @@ pub unsafe extern "C" fn questdb_oidc_builder_build(
     }
     let config = unsafe { &(*builder).config };
     match config.build() {
-        Ok((auth, event_handler)) => Box::into_raw(Box::new(questdb_oidc_auth {
+        Ok((auth, event_handler, diagnostic)) => Box::into_raw(Box::new(questdb_oidc_auth {
             shared: SharedOidcAuth {
                 inner: Arc::new(auth),
                 event_handler,
+                diagnostic,
             },
         })),
         Err(err) => {
@@ -1302,6 +1410,34 @@ pub unsafe extern "C" fn questdb_oidc_auth_clone(
         return ptr::null_mut();
     };
     Box::into_raw(Box::new(questdb_oidc_auth { shared }))
+}
+
+/// Permanently stop delivering this auth's persistence diagnostics.
+///
+/// Returns once no diagnostic callback is running for it and no later one can
+/// start. Idempotent, NULL-tolerant, and safe to call from any thread.
+///
+/// From inside the diagnostic callback it degrades to publishing the flag: the
+/// only invocation it could drain is the caller's own frame. Later diagnostics
+/// are still suppressed.
+///
+/// This exists for a binding whose callback enters a managed runtime it is
+/// about to lose -- a garbage-collected handle being reclaimed, or an
+/// interpreter beginning to shut down -- while a background token-provider or
+/// transport thread may still hold a clone of this auth and reach a token-store
+/// write. Closing an auth also ends its diagnostics, because a closed auth
+/// performs no further store writes; this is the operation for the case where
+/// the owner is going away without being able to wait for that.
+///
+/// Other auths built from the same builder keep delivering.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn questdb_oidc_auth_detach_diagnostics(auth: *const questdb_oidc_auth) {
+    if auth.is_null() {
+        return;
+    }
+    if let Some(sink) = unsafe { &(*auth).shared.diagnostic } {
+        sink.detach();
+    }
 }
 
 #[unsafe(no_mangle)]
@@ -1692,11 +1828,164 @@ mod tests {
             release: None,
             gate: Mutex::new(()),
         });
-        CDiagnosticSink(target).on_persistence_warning("save failed\n\x1b[31m");
+        let sink = CDiagnosticSink {
+            target,
+            state: Arc::new(CDiagnosticState::default()),
+        };
+        sink.on_persistence_warning("save failed\n\x1b[31m");
         let messages = messages.lock().unwrap();
         assert_eq!(messages.len(), 1);
         assert!(!messages[0].contains('\n'));
         assert!(!messages[0].contains('\x1b'));
+    }
+
+    #[test]
+    fn detaching_diagnostics_stops_delivery_without_silencing_siblings() {
+        // A binding detaches when its callback stops being callable -- a
+        // collected handle, or an interpreter shutting down -- while a
+        // detached token-provider worker may still hold a clone of the auth
+        // and reach a store write. After detach, that write must not reach the
+        // callback. The per-auth state keeps a sibling built from the same
+        // reusable builder (which shares the caller-owned `user_data`)
+        // delivering.
+        let messages = Mutex::new(Vec::<String>::new());
+        let target = Arc::new(CDiagnosticTarget {
+            callback: record_diagnostic,
+            user_data: (&messages as *const Mutex<Vec<String>>) as usize,
+            release: None,
+            gate: Mutex::new(()),
+        });
+        let detached = CDiagnosticSink {
+            target: Arc::clone(&target),
+            state: Arc::new(CDiagnosticState::default()),
+        };
+        let sibling = CDiagnosticSink {
+            target,
+            state: Arc::new(CDiagnosticState::default()),
+        };
+
+        detached.on_persistence_warning("before detach");
+        detached.detach();
+        detached.on_persistence_warning("after detach");
+        // Idempotent, and a clone of the same auth's sink is equally detached.
+        detached.detach();
+        detached.clone().on_persistence_warning("via clone");
+        sibling.on_persistence_warning("sibling still delivering");
+
+        let messages = messages.lock().unwrap();
+        assert_eq!(
+            *messages,
+            vec![
+                "before detach".to_string(),
+                "sibling still delivering".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn detaching_diagnostics_from_inside_the_callback_does_not_deadlock() {
+        // A binding reaches this without anyone writing such a call: the
+        // callback enters a managed runtime, and a collection there destroys a
+        // handle, whose teardown detaches. The gate is held across the
+        // callback, so re-acquiring it on this thread would wedge the emitting
+        // thread while still holding the gate -- blocking every later
+        // diagnostic and detach for the target too.
+        static SINK: Mutex<Option<CDiagnosticSink>> = Mutex::new(None);
+        static DETACH_RETURNED: AtomicUsize = AtomicUsize::new(0);
+
+        unsafe extern "C" fn detach_from_within(
+            _user_data: *mut c_void,
+            _diagnostic: *const questdb_oidc_diagnostic,
+        ) {
+            let sink = SINK.lock().unwrap().clone().expect("sink installed");
+            sink.detach();
+            DETACH_RETURNED.fetch_add(1, Ordering::SeqCst);
+        }
+
+        let sink = CDiagnosticSink {
+            target: Arc::new(CDiagnosticTarget {
+                callback: detach_from_within,
+                user_data: 0,
+                release: None,
+                gate: Mutex::new(()),
+            }),
+            state: Arc::new(CDiagnosticState::default()),
+        };
+        *SINK.lock().unwrap() = Some(sink.clone());
+
+        // Emit off-thread so a regression fails the test instead of hanging
+        // the whole run: a deadlock here is unkillable from inside the test.
+        let (tx, rx) = std::sync::mpsc::channel();
+        let emitter = std::thread::spawn({
+            let sink = sink.clone();
+            move || {
+                sink.on_persistence_warning("reentrant");
+                let _ = tx.send(());
+            }
+        });
+        rx.recv_timeout(std::time::Duration::from_secs(5))
+            .expect("detach from inside the callback must not deadlock");
+        emitter.join().unwrap();
+
+        assert_eq!(DETACH_RETURNED.load(Ordering::SeqCst), 1);
+        // The flag was still published, so later diagnostics stay suppressed.
+        sink.on_persistence_warning("after");
+        assert_eq!(DETACH_RETURNED.load(Ordering::SeqCst), 1);
+        // The gate is free: an unrelated detach still completes.
+        sink.detach();
+        *SINK.lock().unwrap() = None;
+    }
+
+    #[test]
+    fn detaching_diagnostics_waits_for_a_callback_in_flight() {
+        // Detach is a handshake, not a flag flip: it must not return while a
+        // callback is still running, or a binding would tear down the runtime
+        // that callback is inside.
+        static ENTERED: AtomicUsize = AtomicUsize::new(0);
+        static RELEASE: AtomicUsize = AtomicUsize::new(0);
+        static RETURNED: AtomicUsize = AtomicUsize::new(0);
+
+        unsafe extern "C" fn blocking_diagnostic(
+            _user_data: *mut c_void,
+            _diagnostic: *const questdb_oidc_diagnostic,
+        ) {
+            ENTERED.fetch_add(1, Ordering::SeqCst);
+            while RELEASE.load(Ordering::SeqCst) == 0 {
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            RETURNED.fetch_add(1, Ordering::SeqCst);
+        }
+
+        let sink = CDiagnosticSink {
+            target: Arc::new(CDiagnosticTarget {
+                callback: blocking_diagnostic,
+                user_data: 0,
+                release: None,
+                gate: Mutex::new(()),
+            }),
+            state: Arc::new(CDiagnosticState::default()),
+        };
+
+        let emitter = std::thread::spawn({
+            let sink = sink.clone();
+            move || sink.on_persistence_warning("in flight")
+        });
+        while ENTERED.load(Ordering::SeqCst) == 0 {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+
+        let detacher = std::thread::spawn(move || {
+            sink.detach();
+            // The callback must have returned before detach did.
+            assert_eq!(RETURNED.load(Ordering::SeqCst), 1);
+        });
+        // Give detach a chance to return early if it were going to.
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        assert_eq!(RETURNED.load(Ordering::SeqCst), 0, "callback still running");
+        RELEASE.store(1, Ordering::SeqCst);
+
+        emitter.join().unwrap();
+        detacher.join().unwrap();
     }
 
     #[test]
@@ -3182,6 +3471,7 @@ mod tests {
             shared: SharedOidcAuth {
                 inner: Arc::new(inner),
                 event_handler: None,
+                diagnostic: None,
             },
         }));
 

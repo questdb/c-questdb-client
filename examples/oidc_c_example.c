@@ -8,22 +8,52 @@ static void oidc_event(void* user_data, const questdb_oidc_event* event)
     if (event->kind == QUESTDB_OIDC_EVENT_PROMPT)
     {
         unsigned long long interval_seconds = 0;
+        const char* browser_target = NULL;
+        size_t browser_target_len = 0;
         if (event->struct_size >=
             offsetof(questdb_oidc_event, interval_seconds) +
                 sizeof(event->interval_seconds))
             interval_seconds = (unsigned long long)event->interval_seconds;
-        /* Prompt fields are display-sanitized. Only browser_target is vetted
-         * for opening or turning into a clickable link. */
-        fprintf(
-            stderr,
-            "Open %.*s and enter code %.*s (valid for %.0f seconds; polling "
-            "every %llu seconds)\n",
-            (int)event->verification_uri_len,
-            event->verification_uri,
-            (int)event->user_code_len,
-            event->user_code,
-            event->expires_in_seconds,
-            interval_seconds);
+        if (event->struct_size >=
+            offsetof(questdb_oidc_event, browser_target_len) +
+                sizeof(event->browser_target_len))
+        {
+            browser_target = event->browser_target;
+            browser_target_len = event->browser_target_len;
+        }
+        /* Prompt fields are display-sanitized, which makes them safe to print
+         * but NOT safe to act on: `verification_uri` may still be a URL the
+         * client refused to vet (userinfo, a confusable IDNA host, plaintext
+         * to a non-loopback IdP). Only `browser_target` is vetted for opening
+         * or turning into a clickable link, and it is absent exactly when
+         * there was nothing safe to offer -- so telling the user to open the
+         * display URI would hand back the value the vetting just rejected.
+         * Many terminals auto-linkify a printed URL, so keep the two cases
+         * textually distinct. */
+        if (browser_target != NULL && browser_target_len > 0)
+            fprintf(
+                stderr,
+                "Open %.*s and enter code %.*s (valid for %.0f seconds; "
+                "polling every %llu seconds)\n",
+                (int)browser_target_len,
+                browser_target,
+                (int)event->user_code_len,
+                event->user_code,
+                event->expires_in_seconds,
+                interval_seconds);
+        else
+            fprintf(
+                stderr,
+                "Enter code %.*s at your identity provider's device page "
+                "(valid for %.0f seconds; polling every %llu seconds). No "
+                "vetted browser target was supplied; for reference only, the "
+                "unverified page was reported as [%.*s]\n",
+                (int)event->user_code_len,
+                event->user_code,
+                event->expires_in_seconds,
+                interval_seconds,
+                (int)event->verification_uri_len,
+                event->verification_uri);
     }
 }
 

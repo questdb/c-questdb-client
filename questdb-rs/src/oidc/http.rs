@@ -104,6 +104,9 @@ pub(crate) fn is_transient_http_status(status: u16) -> bool {
 /// A reusable HTTPS client for the OIDC flow.
 pub(crate) struct HttpClient {
     agent: ureq::Agent,
+    /// The configured per-request timeout, retained so a caller with a shorter
+    /// deadline can narrow one request without ever widening it.
+    timeout: Duration,
 }
 
 /// The OIDC transport permits plaintext HTTP only for local development. Keep
@@ -186,7 +189,7 @@ impl HttpClient {
             .timeout_connect(Some(timeout))
             .build();
         let agent = ureq::Agent::with_parts(config, connector, OidcResolver::default());
-        Ok(HttpClient { agent })
+        Ok(HttpClient { agent, timeout })
     }
 
     /// GET a URL and parse a JSON response, erroring on a non-2xx status.
@@ -230,23 +233,46 @@ impl HttpClient {
         form: &[(&str, &str)],
         allow_insecure: bool,
     ) -> Result<PostResult> {
+        self.post_form_within(url, form, allow_insecure, None)
+    }
+
+    /// As [`post_form`](Self::post_form), but additionally bounds this one
+    /// request by `budget`.
+    ///
+    /// The configured timeout bounds each request, not the operation a caller
+    /// is running. A device-flow poll is bounded by the device code's own
+    /// lifetime, which is routinely shorter: without this, an IdP that accepts
+    /// a poll and then withholds its response holds the caller for the whole
+    /// request timeout past an expiry that had already passed. The budget only
+    /// ever narrows: it is clamped to the configured timeout, so this cannot
+    /// be used to extend a request beyond it.
+    pub(crate) fn post_form_within(
+        &self,
+        url: &str,
+        form: &[(&str, &str)],
+        allow_insecure: bool,
+        budget: Option<Duration>,
+    ) -> Result<PostResult> {
         require_secure(url, allow_insecure)?;
-        let response = self
-            .agent
-            .post(url)
-            .header("Accept", "application/json")
-            .send_form(form.iter().copied())
-            .map_err(|e| {
-                // Record whether the request provably never left the client, so a
-                // refresh caller can safely keep a refresh token that the IdP
-                // cannot have seen (vs. an ambiguous mid-flight drop, where the
-                // parent may have been consumed and rotated).
-                let unsent = request_provably_unsent(&e);
-                let timed_out = request_timed_out(&e);
-                OidcError::network(format!("Failed to reach {url}: {e}"))
-                    .with_request_unsent(unsent)
-                    .with_request_timed_out(timed_out)
-            })?;
+        let request = self.agent.post(url).header("Accept", "application/json");
+        let request = match budget {
+            Some(budget) => request
+                .config()
+                .timeout_global(Some(budget.min(self.timeout)))
+                .build(),
+            None => request,
+        };
+        let response = request.send_form(form.iter().copied()).map_err(|e| {
+            // Record whether the request provably never left the client, so a
+            // refresh caller can safely keep a refresh token that the IdP
+            // cannot have seen (vs. an ambiguous mid-flight drop, where the
+            // parent may have been consumed and rotated).
+            let unsent = request_provably_unsent(&e);
+            let timed_out = request_timed_out(&e);
+            OidcError::network(format!("Failed to reach {url}: {e}"))
+                .with_request_unsent(unsent)
+                .with_request_timed_out(timed_out)
+        })?;
         let status = response.status().as_u16();
         let retry_after = parse_retry_after(response.headers());
         // Keep the raw response allocation under RAII zeroization as well as the

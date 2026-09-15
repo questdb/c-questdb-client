@@ -259,6 +259,14 @@ impl Drop for InteractiveGuard<'_> {
 struct DeviceResponse {
     device_code: Zeroizing<String>,
     challenge: DeviceCodeChallenge,
+    /// When the device code stops being usable.
+    ///
+    /// Anchored where the IdP issued it rather than where polling starts:
+    /// `on_prompt` renders, and a browser may be launched, in between. Deriving
+    /// it in `poll_for_token` instead granted the code a fresh full lifetime
+    /// after that work, so the bound callers are told applies to the sign-in as
+    /// a whole -- the device code's own lifetime -- silently did not.
+    deadline: Instant,
 }
 
 /// Builds an [`OidcDeviceAuth`], either from QuestDB `/settings` discovery
@@ -2018,6 +2026,7 @@ impl OidcDeviceAuth {
                     );
                     return Ok(DeviceResponse {
                         device_code: Zeroizing::new(device_code),
+                        deadline: (self.now)() + Duration::from_secs(expires_in_seconds),
                         challenge: DeviceCodeChallenge {
                             user_code,
                             verification_uri,
@@ -2066,7 +2075,7 @@ impl OidcDeviceAuth {
     fn poll_for_token(&self, resp: &DeviceResponse) -> Result<TokenSet> {
         self.ensure_interactive_flow_active()?;
         let mut interval = resp.challenge.interval_seconds();
-        let deadline = (self.now)() + Duration::from_secs(resp.challenge.expires_in_seconds());
+        let deadline = resp.deadline;
         let form: Vec<(&str, &str)> = vec![
             ("grant_type", DEVICE_CODE_GRANT),
             ("device_code", resp.device_code.as_str()),
@@ -2216,10 +2225,15 @@ impl OidcDeviceAuth {
             pause_outlived_code = None;
             interval_raised = false;
 
-            let result = match self
-                .http
-                .post_form(&self.config.token_endpoint, &form, false)
-            {
+            // Bound the request by whatever is left of the device code: an IdP
+            // that accepts a poll and then withholds its response must not hold
+            // the caller for a whole request timeout past the expiry.
+            let result = match self.http.post_form_within(
+                &self.config.token_endpoint,
+                &form,
+                false,
+                Some(remaining),
+            ) {
                 Ok(result) => {
                     self.ensure_interactive_flow_active()?;
                     reached_token_endpoint = true;
