@@ -2264,6 +2264,11 @@ impl OidcDeviceAuth {
                     // authorize in time".
                     if e.status().is_none() {
                         last_unsent_error = Some(e.to_string());
+                    } else {
+                        // This poll did receive an HTTP response. Do not let a
+                        // stale, earlier transport failure make expiry claim
+                        // that the endpoint was never reachable.
+                        last_unsent_error = None;
                     }
                     if e.request_timed_out() {
                         let previous = interval;

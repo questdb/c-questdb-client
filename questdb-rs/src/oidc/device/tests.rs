@@ -5428,6 +5428,74 @@ fn expiry_names_the_transport_failure_when_no_poll_ever_landed() {
     assert_eq!(err.idp_error(), Some("expired_token"));
 }
 
+/// A later HTTP response invalidates an earlier status-less failure. Otherwise
+/// expiry falsely says that the token endpoint was never reachable and names a
+/// stale first error even though every subsequent poll received a response.
+#[test]
+fn expiry_does_not_report_a_stale_unsent_failure_after_an_http_response() {
+    let polls = Arc::new(AtomicUsize::new(0));
+    let poll_count = Arc::clone(&polls);
+    let mock = MockServer::start(move |method, path, _body| match (method, path) {
+        ("POST", "/device") => (
+            200,
+            serde_json::json!({
+                "device_code": "DEV-CODE-123",
+                "user_code": "WXYZ-1234",
+                "verification_uri": "https://idp.example.com/activate",
+                "expires_in": 6,
+                "interval": 5
+            })
+            .to_string(),
+        ),
+        ("POST", "/token") => {
+            if poll_count.fetch_add(1, Ordering::SeqCst) == 0 {
+                // No HTTP status: remember this only until a later poll lands.
+                (0, String::new())
+            } else {
+                // A transient non-JSON HTTP response proves reachability but
+                // keeps polling until the code expires.
+                (503, "<html>temporarily unavailable</html>".to_string())
+            }
+        }
+        _ => (404, "{}".to_string()),
+    });
+    let base = Instant::now();
+    let virtual_ns = Arc::new(AtomicU64::new(0));
+    let now_ns = Arc::clone(&virtual_ns);
+    let sleep_ns = Arc::clone(&virtual_ns);
+    let auth = OidcDeviceAuth::builder()
+        .client_id("questdb")
+        .device_authorization_endpoint(mock.url("/device"))
+        .token_endpoint(mock.url("/token"))
+        .scope("openid")
+        .interactive(true)
+        .open_browser(false)
+        .now_hook(Arc::new(move || {
+            base + Duration::from_nanos(now_ns.load(Ordering::SeqCst))
+        }))
+        .sleep_hook(Arc::new(move |d: Duration| {
+            sleep_ns.fetch_add(d.as_nanos() as u64, Ordering::SeqCst);
+        }))
+        .build()
+        .expect("build");
+
+    let err = auth.sign_in().unwrap_err();
+    assert!(polls.load(Ordering::SeqCst) >= 2);
+    assert!(
+        err.message()
+            .contains("expired before authorization completed"),
+        "a later HTTP response must discard the stale unsent failure: {}",
+        err.message()
+    );
+    assert!(
+        !err.message().contains("never reachable") && !err.message().contains("last failure"),
+        "expiry must not claim that no poll landed: {}",
+        err.message()
+    );
+    assert_eq!(err.kind(), OidcErrorKind::Timeout);
+    assert_eq!(err.idp_error(), Some("expired_token"));
+}
+
 /// The counterpart: once a poll *has* reached the endpoint, an expiry is a
 /// genuine "nobody authorized" and must keep saying so.
 #[test]

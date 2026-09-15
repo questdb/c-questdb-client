@@ -822,6 +822,55 @@ mod tests {
     }
 
     #[test]
+    fn post_form_budget_cannot_extend_the_configured_request_timeout() {
+        // Accept a loopback request but never answer it. The remaining
+        // device-code lifetime can be much larger than the configured request
+        // timeout; close/cancel rely on each in-flight request retaining the
+        // smaller bound rather than waiting for the whole device-code budget.
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind stalled endpoint");
+        let addr = listener.local_addr().expect("stalled endpoint address");
+        listener
+            .set_nonblocking(true)
+            .expect("set stalled endpoint nonblocking");
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let server_shutdown = Arc::clone(&shutdown);
+        let handle = thread::spawn(move || {
+            let mut held = None;
+            while !server_shutdown.load(Ordering::SeqCst) {
+                if held.is_none() {
+                    match listener.accept() {
+                        Ok((stream, _)) => held = Some(stream),
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+                        Err(_) => return,
+                    }
+                }
+                thread::sleep(Duration::from_millis(1));
+            }
+        });
+
+        let client = HttpClient::new(None, Duration::from_millis(150)).unwrap();
+        let started = std::time::Instant::now();
+        let error = match client.post_form_within(
+            &format!("http://{addr}/token"),
+            &[("grant_type", "refresh_token")],
+            false,
+            Some(Duration::from_secs(3)),
+        ) {
+            Ok(_) => panic!("a server withholding its response must time out"),
+            Err(error) => error,
+        };
+        let elapsed = started.elapsed();
+        shutdown.store(true, Ordering::SeqCst);
+        handle.join().unwrap();
+
+        assert!(error.request_timed_out(), "unexpected error: {error}");
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "the 3s budget overrode the 150ms request timeout: {elapsed:?}"
+        );
+    }
+
+    #[test]
     fn https_post_form_succeeds_with_custom_ca() {
         let server = TlsJsonServer::localhost();
         let client = HttpClient::new(Some(&root_ca_path()), Duration::from_secs(5)).unwrap();

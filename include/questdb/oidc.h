@@ -365,15 +365,18 @@ bool questdb_oidc_builder_default_file_token_store(
  * guarantee and must return normally without throwing, unwinding, or
  * performing a non-local jump.
  *
- * Installing a handler releases the one it replaces, and that `release` runs
- * after this function's internal borrow of the builder ends, so it MAY call
- * back into this function on the same builder. One exception to the ordering
- * above follows: if it does, its own registration supersedes the one this call
- * just installed, and the superseded `user_data` is therefore released BEFORE
- * this call returns `true`. Each `release` still runs exactly once, so nothing
- * leaks or is double-freed, but a caller must not read `true` as a promise
- * that the `user_data` it just passed is still installed. Re-registering from
- * a `release` callback is the only way to reach this.
+ * Installing a handler removes the builder's reference to the one it replaces.
+ * Auth handles/transports already built with the old handler retain it until
+ * their final reference is released; future builds use the replacement. If the
+ * builder held the last reference, `release` runs after this function's
+ * internal borrow of the builder ends, so it MAY call back into this function
+ * on the same builder. One exception to the ordering above follows: if it does,
+ * its own registration supersedes the one this call just installed, and the
+ * superseded `user_data` is therefore released BEFORE this call returns
+ * `true`. Each `release` still runs exactly once, so nothing leaks or is
+ * double-freed, but a caller must not read `true` as a promise that the
+ * `user_data` it just passed is still installed. Re-registering from a
+ * `release` callback is the only way to reach this.
  */
 QUESTDB_CLIENT_API
 bool questdb_oidc_builder_event_handler(

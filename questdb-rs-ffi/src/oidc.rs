@@ -2594,6 +2594,12 @@ mod tests {
 
     unsafe extern "C" fn ignore_event(_user_data: *mut c_void, _event: *const questdb_oidc_event) {}
 
+    unsafe extern "C" fn ignore_diagnostic(
+        _user_data: *mut c_void,
+        _diagnostic: *const questdb_oidc_diagnostic,
+    ) {
+    }
+
     struct FailingClearStore;
 
     impl TokenStore for FailingClearStore {
@@ -3141,6 +3147,65 @@ mod tests {
                 1,
                 "the previously installed state remains owned and is released once"
             );
+        }
+    }
+
+    #[test]
+    fn diagnostic_handler_validates_and_releases_every_transferred_state_once() {
+        unsafe {
+            let releases = Arc::new(AtomicUsize::new(0));
+            let builder = explicit_builder();
+            let mut error = ptr::null_mut();
+
+            // Stateless handlers are valid.
+            assert!(questdb_oidc_builder_diagnostic_handler(
+                builder,
+                Some(ignore_diagnostic),
+                ptr::null_mut(),
+                None,
+                &mut error,
+            ));
+            assert!(error.is_null());
+
+            let first = Box::into_raw(Box::new(Arc::clone(&releases))) as *mut c_void;
+            assert!(questdb_oidc_builder_diagnostic_handler(
+                builder,
+                Some(ignore_diagnostic),
+                first,
+                Some(release_counter),
+                &mut error,
+            ));
+
+            // Non-NULL state without a release callback is rejected without
+            // disturbing or taking ownership of the installed handler.
+            let rejected = Box::into_raw(Box::new(17_u8)) as *mut c_void;
+            assert!(!questdb_oidc_builder_diagnostic_handler(
+                builder,
+                Some(ignore_diagnostic),
+                rejected,
+                None,
+                &mut error,
+            ));
+            assert!(!error.is_null());
+            crate::questdb_error_free(error);
+            error = ptr::null_mut();
+            drop(Box::from_raw(rejected as *mut u8));
+            assert_eq!(releases.load(Ordering::SeqCst), 0);
+
+            // Replacement releases the previous transferred state once; the
+            // final installed state is released once with the builder.
+            let second = Box::into_raw(Box::new(Arc::clone(&releases))) as *mut c_void;
+            assert!(questdb_oidc_builder_diagnostic_handler(
+                builder,
+                Some(ignore_diagnostic),
+                second,
+                Some(release_counter),
+                &mut error,
+            ));
+            assert!(error.is_null());
+            assert_eq!(releases.load(Ordering::SeqCst), 1);
+            questdb_oidc_builder_free(builder);
+            assert_eq!(releases.load(Ordering::SeqCst), 2);
         }
     }
 

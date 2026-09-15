@@ -1566,7 +1566,7 @@ impl SenderBuilder {
     /// Unlike [`token`](Self::token), which captures a fixed token once, the
     /// provider is called on each flush, so a long-lived sender keeps working as
     /// the token silently refreshes / rotates. Pass
-    /// [`OidcDeviceAuth::token`](crate::oidc::OidcDeviceAuth::token) here after an
+    /// `OidcDeviceAuth::token` here after an
     /// explicit sign-in:
     ///
     /// ```no_run
@@ -1606,19 +1606,19 @@ impl SenderBuilder {
     /// meant only for a loopback server during local development.
     ///
     /// The provider runs **synchronously on the flush path**, so it must not
-    /// block indefinitely. [`OidcDeviceAuth::token`](crate::oidc::OidcDeviceAuth::token)
+    /// block indefinitely. `OidcDeviceAuth::token`
     /// returns a cached token or performs a silent refresh, but never starts an
     /// interactive device flow. If no usable cached/persisted token or refresh
     /// token is available, the flush fails as the retryable `SocketError` above,
     /// with the OIDC `InteractionRequired` kind preserved for inspection. Call
-    /// [`OidcDeviceAuth::sign_in`](crate::oidc::OidcDeviceAuth::sign_in) on a
+    /// `OidcDeviceAuth::sign_in` on a
     /// suitable UI thread before flushing, and request the `offline_access` scope
     /// so unattended senders can refresh without another explicit sign-in.
     ///
     /// Resolution happens **before the first request**, and with
     /// `OidcDeviceAuth` it can wait behind a refresh already running on another
     /// thread for up to six times the configured OIDC
-    /// [`timeout`](crate::oidc::OidcDeviceAuthBuilder::timeout) — three minutes
+    /// `OidcDeviceAuthBuilder::timeout` — three minutes
     /// at the 30s default, twelve at the 120s maximum. Neither
     /// [`request_timeout`](Self::request_timeout) nor
     /// [`retry_timeout`](Self::retry_timeout) bounds that wait, so size the OIDC
@@ -1648,7 +1648,7 @@ impl SenderBuilder {
     }
 
     /// Supply a fresh Bearer token on every QWP/WebSocket (re)connect via a
-    /// callback (e.g. [`OidcDeviceAuth::token`](crate::oidc::OidcDeviceAuth::token)).
+    /// callback (e.g. `OidcDeviceAuth::token`).
     ///
     /// Unlike [`token`](Self::token), which captures a fixed token once, the
     /// provider is called once at each connect/reconnect endpoint walk. That

@@ -158,6 +158,10 @@ TEST_CASE("OIDC C++ wrappers preserve ownership and structured errors")
     CHECK_THROWS_AS(auth.token(), questdb::oidc::error);
     CHECK_THROWS_AS(auth.clear(), questdb::oidc::error);
     CHECK_THROWS_AS(auth.config(), questdb::oidc::error);
+    // Diagnostic detach is explicitly NULL-tolerant at the C boundary, so its
+    // noexcept C++ wrappers remain safe on a moved-from handle.
+    CHECK_NOTHROW(auth.detach_diagnostics());
+    CHECK_NOTHROW(auth.detach_diagnostics_nowait());
     // Move-assignment from a moved-from handle is still well defined; the
     // previous copy-assignment check is covered by `auth.share()` above, which
     // is now the only way to take another handle.
@@ -261,6 +265,8 @@ TEST_CASE("OIDC C++ wrappers preserve ownership and structured errors")
     // Lazy construction performs no network I/O, but exercises ownership and
     // the shared sender/reader provider configuration in the pool FFI.
     questdb::pool pool{"ws::addr=127.0.0.1:1;lazy_connect=true;", shared_auth};
+    CHECK_NOTHROW(shared_auth.detach_diagnostics());
+    CHECK_NOTHROW(shared_auth.detach_diagnostics_nowait());
 }
 
 TEST_CASE("OIDC C++ event handler ownership is released exactly once")
@@ -306,5 +312,44 @@ TEST_CASE("OIDC C++ event handler ownership is released exactly once")
         CHECK(releases <= 1);
     }
     // Exactly one release for the one capturing handler: no leak, no double.
+    CHECK(releases == 1);
+}
+
+TEST_CASE("OIDC C++ diagnostic handler ownership is released exactly once")
+{
+    bool empty_handler_rejected = false;
+    try
+    {
+        questdb::oidc::builder{}.diagnostic_handler({});
+    }
+    catch (const questdb::error& error)
+    {
+        empty_handler_rejected = true;
+        CHECK(error.code() == questdb::error_code::invalid_api_call);
+    }
+    CHECK(empty_handler_rejected);
+
+    static int releases = 0;
+    releases = 0;
+    struct tracker
+    {
+        ~tracker()
+        {
+            ++releases;
+        }
+    };
+
+    {
+        questdb::oidc::builder builder{};
+        auto owned = std::make_shared<tracker>();
+        builder.diagnostic_handler(
+            [owned](const questdb::oidc::diagnostic_view&) noexcept {});
+        CHECK(owned.use_count() == 2);
+        CHECK(releases == 0);
+
+        builder.diagnostic_handler(
+            [](const questdb::oidc::diagnostic_view&) noexcept {});
+        CHECK(releases <= 1);
+    }
     CHECK(releases == 1);
 }

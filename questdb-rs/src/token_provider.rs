@@ -26,7 +26,7 @@
 //! for the QWP/WebSocket ingress sender and the egress reader (the ILP/HTTP
 //! sender has its own per-request provider in `ingress::sender::http`).
 //!
-//! Wire [`OidcDeviceAuth::token`](crate::oidc::OidcDeviceAuth::token) here so a
+//! Wire `OidcDeviceAuth::token` here so a
 //! long-lived client keeps working as the OIDC token silently rotates.
 
 use std::sync::Arc;

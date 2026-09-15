@@ -1062,7 +1062,7 @@ impl ReaderConfig {
     }
 
     /// Supply a fresh Bearer token on every (re)connect via a callback (e.g.
-    /// [`OidcDeviceAuth::token`](crate::oidc::OidcDeviceAuth::token)).
+    /// `OidcDeviceAuth::token`).
     ///
     /// Mutually exclusive with the static `username`/`password`/`token` auth set in
     /// the config string — combining them is a configuration error rather than a

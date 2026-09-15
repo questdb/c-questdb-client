@@ -416,6 +416,33 @@ public:
     }
 
     /**
+     * Permanently stop persistence-diagnostic delivery without closing the
+     * provider. Returns after any diagnostic callback already running has
+     * finished, except for callback re-entry and cross-target callback nesting,
+     * where waiting would deadlock and the drain is bounded instead.
+     *
+     * The caller must hold no lock the diagnostic callback might acquire. A
+     * finalizer or garbage-collection hook cannot establish that and must use
+     * `detach_diagnostics_nowait()` instead. Idempotent and safe on a
+     * moved-from handle.
+     */
+    void detach_diagnostics() const noexcept
+    {
+        ::questdb_oidc_auth_detach_diagnostics(_raw);
+    }
+
+    /**
+     * Stop later persistence diagnostics without waiting for a callback that
+     * is already running. This is the safe form for finalizers and collection
+     * hooks, which can run while their thread owns an arbitrary runtime lock.
+     * Idempotent and safe on a moved-from handle.
+     */
+    void detach_diagnostics_nowait() const noexcept
+    {
+        ::questdb_oidc_auth_detach_diagnostics_nowait(_raw);
+    }
+
+    /**
      * The resolved configuration. Each `string_view` borrows from this handle.
      *
      * WARNING: not display-sanitized. With `from_questdb` these values come
@@ -666,8 +693,10 @@ public:
      * the handler are contained at the C boundary and ignored; handle callback
      * failures inside the handler if they need to be observed.
      *
-     * Installing a second handler supersedes the first and destroys its
-     * captured state before this call returns.
+     * Installing a second handler supersedes the first for future builds and
+     * releases the builder's reference to its captured state. Auth objects and
+     * transports already built with the old handler retain it; the capture is
+     * destroyed when their final reference and the builder reference are gone.
      */
     builder& event_handler(std::function<void(const event_view&)> handler)
     {

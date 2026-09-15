@@ -246,7 +246,7 @@ let mut sender = SenderBuilder::new(Protocol::Https, "questdb.example.com", 9000
 
 The provider is any `Fn() -> Result<String, E>`; see
 [`SenderBuilder::http_token_provider`](crate::ingress::SenderBuilder::http_token_provider)
-and the [`oidc`](crate::oidc) module. Prefer this over embedding a token in a
+and the `oidc` module. Prefer this over embedding a token in a
 `from_conf(...)` string, which is easily logged or persisted. Mutually exclusive
 with `username`/`password`/`token`.
 
