@@ -439,11 +439,17 @@ questdb_oidc_auth* questdb_oidc_auth_clone(
  * Returns once no diagnostic callback is running for this auth and no later
  * one can start. Idempotent, NULL-tolerant, and callable from any thread.
  *
- * Called from inside the diagnostic callback it degrades to suppressing later
- * diagnostics without waiting, because the only invocation it could wait for
- * is the caller's own frame. A binding does not have to prove it is outside
- * the callback before calling this -- a callback that runs managed code can
- * destroy a handle without the user writing such a call.
+ * Called from inside this auth's own diagnostic callback it degrades to
+ * suppressing later diagnostics without waiting, because the only invocation
+ * it could wait for is the caller's own frame. Called from inside a DIFFERENT
+ * auth's callback the wait becomes bounded and best-effort, because blocking
+ * there would deadlock two threads against each other's callback gates.
+ * Suppression is exact in both cases; only the "no callback is still running"
+ * guarantee is downgraded.
+ *
+ * A binding does not have to prove it is outside a callback before calling
+ * this -- a callback that runs managed code can destroy a handle without the
+ * user writing such a call.
  *
  * Most callers do not need this: `questdb_oidc_auth_close` also ends
  * diagnostics, because a closed auth performs no further token-store writes.

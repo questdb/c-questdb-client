@@ -545,6 +545,12 @@ std::thread_local! {
         const { RefCell::new(Vec::new()) };
 }
 
+/// How many times a nested [`CDiagnosticSink::detach`] retries the gate before
+/// giving up on the drain. Bounded because the thread holds another target's
+/// gate, so waiting indefinitely is the inversion itself; a callback that is
+/// mid-flight on another thread normally releases within a few yields.
+const DETACH_NESTED_DRAIN_ROUNDS: usize = 64;
+
 /// Marks this thread as being inside `target`'s callback for as long as it
 /// lives. Mirrors [`ActiveEventHandler`]'s stack discipline.
 struct InDiagnosticCallback(*const CDiagnosticTarget);
@@ -599,16 +605,49 @@ impl CDiagnosticSink {
     /// gate again would deadlock a caller on itself -- reachable without any
     /// user writing such a call, because a binding's callback can run a
     /// collection that destroys a handle.
+    ///
+    /// Reached from inside a DIFFERENT target's callback, the drain becomes
+    /// best-effort and bounded. That case is an AB/BA inversion, not
+    /// self-deadlock: this thread holds the other target's gate, so blocking
+    /// here while a thread inside this target's callback reaches for that one
+    /// parks both permanently. A binding releases its runtime lock around this
+    /// call (the Python client releases the GIL), so no outer lock serializes
+    /// the pair out of it, and `panic = "abort"` means neither guard is ever
+    /// unwound. Two providers each with a token store are enough to construct
+    /// it. Suppression is still exact in that case -- the flag is published
+    /// before any waiting -- only the "no callback is still running" half is
+    /// downgraded.
     fn detach(&self) {
         let target: *const CDiagnosticTarget = Arc::as_ptr(&self.target);
-        let reentrant = IN_DIAGNOSTIC_CALLBACK.with(|stack| stack.borrow().contains(&target));
-        let _gate = (!reentrant).then(|| {
-            self.target
-                .gate
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
+        let (reentrant, nested) = IN_DIAGNOSTIC_CALLBACK.with(|stack| {
+            let stack = stack.borrow();
+            (stack.contains(&target), !stack.is_empty())
         });
+        // Publish before any waiting. An emitter that has not yet re-read the
+        // flag under the gate is already suppressed by this store, so the wait
+        // below only has to see out a callback that is genuinely mid-flight --
+        // and every path here leaves later callbacks suppressed even when it
+        // cannot safely wait.
         self.state.detached.store(true, Ordering::Release);
+        if reentrant {
+            return;
+        }
+        if nested {
+            for _ in 0..DETACH_NESTED_DRAIN_ROUNDS {
+                match self.target.gate.try_lock() {
+                    // Acquired: no callback holds the gate, and the published
+                    // flag stops any that is waiting for it. Drained.
+                    Ok(_) | Err(std::sync::TryLockError::Poisoned(_)) => return,
+                    Err(std::sync::TryLockError::WouldBlock) => std::thread::yield_now(),
+                }
+            }
+            return;
+        }
+        let _gate = self
+            .target
+            .gate
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
     }
 }
 
@@ -1934,6 +1973,97 @@ mod tests {
         // The gate is free: an unrelated detach still completes.
         sink.detach();
         *SINK.lock().unwrap() = None;
+    }
+
+    #[test]
+    fn cross_target_detach_from_inside_a_callback_cannot_deadlock() {
+        // Two providers, two independent gates. Each thread is inside its own
+        // target's callback (holding that gate) and detaches the OTHER one --
+        // which is what a binding does when the callback's managed code
+        // reclaims an unrelated handle. Blocking on the foreign gate here is
+        // an AB/BA inversion that parks both threads permanently, and under
+        // `panic = "abort"` neither guard is ever unwound.
+        static A_ENTERED: AtomicUsize = AtomicUsize::new(0);
+        static B_ENTERED: AtomicUsize = AtomicUsize::new(0);
+        static SINK_A: Mutex<Option<CDiagnosticSink>> = Mutex::new(None);
+        static SINK_B: Mutex<Option<CDiagnosticSink>> = Mutex::new(None);
+
+        // Inside A's callback: wait until B is provably inside its own
+        // callback, then detach B. Pre-fix this blocks on B's gate forever.
+        unsafe extern "C" fn a_callback(
+            _user_data: *mut c_void,
+            _diagnostic: *const questdb_oidc_diagnostic,
+        ) {
+            A_ENTERED.fetch_add(1, Ordering::SeqCst);
+            while B_ENTERED.load(Ordering::SeqCst) == 0 {
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            let sink = SINK_B.lock().unwrap().clone().expect("B installed");
+            sink.detach();
+        }
+        unsafe extern "C" fn b_callback(
+            _user_data: *mut c_void,
+            _diagnostic: *const questdb_oidc_diagnostic,
+        ) {
+            B_ENTERED.fetch_add(1, Ordering::SeqCst);
+            while A_ENTERED.load(Ordering::SeqCst) == 0 {
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            let sink = SINK_A.lock().unwrap().clone().expect("A installed");
+            sink.detach();
+        }
+
+        fn sink_with(
+            callback: unsafe extern "C" fn(*mut c_void, *const questdb_oidc_diagnostic),
+        ) -> CDiagnosticSink {
+            CDiagnosticSink {
+                target: Arc::new(CDiagnosticTarget {
+                    callback,
+                    user_data: 0,
+                    release: None,
+                    gate: Mutex::new(()),
+                }),
+                state: Arc::new(CDiagnosticState::default()),
+            }
+        }
+        let a = sink_with(a_callback);
+        let b = sink_with(b_callback);
+        *SINK_A.lock().unwrap() = Some(a.clone());
+        *SINK_B.lock().unwrap() = Some(b.clone());
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let ta = std::thread::spawn({
+            let a = a.clone();
+            let tx = tx.clone();
+            move || {
+                a.on_persistence_warning("a");
+                let _ = tx.send(());
+            }
+        });
+        let tb = std::thread::spawn({
+            let b = b.clone();
+            move || {
+                b.on_persistence_warning("b");
+                let _ = tx.send(());
+            }
+        });
+        for _ in 0..2 {
+            rx.recv_timeout(std::time::Duration::from_secs(10))
+                .expect("cross-target detach must not deadlock");
+        }
+        ta.join().unwrap();
+        tb.join().unwrap();
+
+        // Both were entered exactly once, and suppression still took effect
+        // even though the drain was downgraded to best-effort.
+        assert_eq!(A_ENTERED.load(Ordering::SeqCst), 1);
+        assert_eq!(B_ENTERED.load(Ordering::SeqCst), 1);
+        a.on_persistence_warning("a again");
+        b.on_persistence_warning("b again");
+        assert_eq!(A_ENTERED.load(Ordering::SeqCst), 1);
+        assert_eq!(B_ENTERED.load(Ordering::SeqCst), 1);
+        *SINK_A.lock().unwrap() = None;
+        *SINK_B.lock().unwrap() = None;
     }
 
     #[test]

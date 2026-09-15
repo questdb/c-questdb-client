@@ -2553,9 +2553,23 @@ fn connection_timeout_increases_poll_interval() {
     // RFC 8628 requires a five-second increase after a connection timeout. With
     // a six-second code lifetime, increasing 5s -> 10s leaves room for only the
     // immediate poll; retaining 5s would incorrectly make a second request.
+    //
+    // The poll is made to time out by withholding the response until the flow
+    // has ended, not by sleeping longer than the configured timeout. A sleep
+    // margin has to be tuned against the slowest host that will ever run it:
+    // this test used a 20ms timeout against a 100ms sleep, which also required
+    // the /device request to complete within 20ms, and on a loaded Windows CI
+    // agent that intermittently did not happen -- `request_device_code` then
+    // returned OidcErrorKind::Network and the first assertion failed on a
+    // machine, not on a behaviour. Withholding removes the margin entirely:
+    // the poll times out at whatever the configured timeout is, however slow
+    // the host, and the timeout is now large enough that /device cannot
+    // plausibly miss it.
     let polls = Arc::new(AtomicUsize::new(0));
+    let release = Arc::new(AtomicBool::new(false));
     let mock = {
         let polls = Arc::clone(&polls);
+        let release = Arc::clone(&release);
         MockServer::start(move |method, path, _body| match (method, path) {
             ("POST", "/device") => (
                 200,
@@ -2570,7 +2584,9 @@ fn connection_timeout_increases_poll_interval() {
             ),
             ("POST", "/token") => {
                 polls.fetch_add(1, Ordering::SeqCst);
-                std::thread::sleep(Duration::from_millis(100));
+                while !release.load(Ordering::SeqCst) {
+                    std::thread::sleep(Duration::from_millis(1));
+                }
                 (400, r#"{"error":"authorization_pending"}"#.to_string())
             }
             _ => (404, "{}".to_string()),
@@ -2589,7 +2605,7 @@ fn connection_timeout_increases_poll_interval() {
         .scope("openid")
         .interactive(true)
         .open_browser(false)
-        .timeout(Duration::from_millis(20))
+        .timeout(Duration::from_millis(250))
         .now_hook(Arc::new(move || {
             base + Duration::from_nanos(now_ns.load(Ordering::SeqCst))
         }))
@@ -2601,6 +2617,8 @@ fn connection_timeout_increases_poll_interval() {
         .expect("build");
 
     let err = auth.sign_in().unwrap_err();
+    // Let the withheld poll finish so the mock's accept loop can be joined.
+    release.store(true, Ordering::SeqCst);
     assert_eq!(err.kind(), OidcErrorKind::Timeout);
     assert_eq!(polls.load(Ordering::SeqCst), 1);
     assert_eq!(sleeps.lock().unwrap().as_slice(), &[Duration::from_secs(6)]);
