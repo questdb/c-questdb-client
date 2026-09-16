@@ -584,13 +584,34 @@ pub(crate) unsafe fn emit_into_wire(
 
         // ---- Decimal (scale byte + bitmap-encoded fixed-width) ----
         D::Decimal64 { scale } => unsafe {
-            emit_decimal::<8>(out, scale, data, row_count, validity)
+            emit_decimal::<8>(
+                out,
+                scale,
+                data,
+                row_count,
+                validity,
+                cfg!(target_endian = "little"),
+            )
         },
         D::Decimal128 { scale } => unsafe {
-            emit_decimal::<16>(out, scale, data, row_count, validity)
+            emit_decimal::<16>(
+                out,
+                scale,
+                data,
+                row_count,
+                validity,
+                cfg!(target_endian = "little"),
+            )
         },
         D::Decimal256 { scale } => unsafe {
-            emit_decimal::<32>(out, scale, data, row_count, validity)
+            emit_decimal::<32>(
+                out,
+                scale,
+                data,
+                row_count,
+                validity,
+                cfg!(target_endian = "little"),
+            )
         },
 
         // ---- Geohash (bits byte + bitmap-encoded width-N rows) ----
@@ -1161,12 +1182,13 @@ fn days_from_civil(y: i64, m: u32, d: u32) -> i64 {
 /// count otherwise). Reproduces the arrow-side `write_decimal*_payload`
 /// shape exactly: the scale byte is written **after** the bitmap.
 #[inline]
-unsafe fn emit_decimal<const N: usize>(
+pub(super) unsafe fn emit_decimal<const N: usize>(
     out: &mut Vec<u8>,
     scale: u8,
     data: *const u8,
     row_count: usize,
     validity: Option<&ValidityDescriptor>,
+    little_endian: bool,
 ) {
     match validity.filter(|v| v.has_nulls()) {
         None => {
@@ -1175,7 +1197,13 @@ unsafe fn emit_decimal<const N: usize>(
             out.push(scale);
             if row_count > 0 {
                 let bytes = unsafe { slice::from_raw_parts(data, N * row_count) };
-                out.extend_from_slice(bytes);
+                if little_endian {
+                    out.extend_from_slice(bytes);
+                } else {
+                    for row in bytes.chunks_exact(N) {
+                        out.extend(row.iter().rev().copied());
+                    }
+                }
             }
         }
         Some(v) => {
@@ -1187,7 +1215,11 @@ unsafe fn emit_decimal<const N: usize>(
                 if unsafe { v.is_valid(i) } {
                     let row_start = unsafe { data.add(i * N) };
                     let row = unsafe { slice::from_raw_parts(row_start, N) };
-                    out.extend_from_slice(row);
+                    if little_endian {
+                        out.extend_from_slice(row);
+                    } else {
+                        out.extend(row.iter().rev().copied());
+                    }
                 }
             }
         }
@@ -1383,6 +1415,39 @@ mod tests {
         let mut dict = SymbolGlobalDict::new();
         let mut scratch = EncodeScratch::new();
         encode_chunk_into(&mut out, chunk, &mut dict, &mut scratch, false).unwrap_err()
+    }
+
+    #[test]
+    fn decimal_emitter_converts_big_endian_mantissas_with_and_without_nulls() {
+        let values = [123450000001i128, 0, -123450000001];
+        let source: Vec<u8> = values.iter().flat_map(|v| v.to_be_bytes()).collect();
+        let bits = [0b101];
+        let validity = Validity::from_bitmap(&bits, 3).unwrap();
+        // Use a descriptor produced by the public API so the bitmap follows
+        // the same lifetime and null-count path as normal column writes.
+        let mut chunk = Chunk::new("t");
+        chunk
+            .column_decimal128("d", &values, 9, Some(&validity))
+            .unwrap();
+        for nullable in [false, true] {
+            let mut actual = Vec::new();
+            let valid = if nullable {
+                chunk.columns[0].validity.as_ref()
+            } else {
+                None
+            };
+            // SAFETY: the source holds three complete, big-endian i128 rows.
+            unsafe {
+                emit_decimal::<16>(&mut actual, 9, source.as_ptr(), 3, valid, false);
+            }
+            let mut expected = if nullable { vec![1, 2, 9] } else { vec![0, 9] };
+            for (row, value) in values.iter().enumerate() {
+                if !nullable || row != 1 {
+                    expected.extend_from_slice(&value.to_le_bytes());
+                }
+            }
+            assert_eq!(actual, expected);
+        }
     }
 
     #[test]

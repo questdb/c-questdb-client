@@ -274,6 +274,12 @@ pub(crate) enum ColumnKind {
     Long256 {
         data: *const [u8; 32],
     },
+    Decimal {
+        data: *const u8,
+        byte_width: usize,
+        scale: u8,
+        little_endian: bool,
+    },
 
     // ---- Variable-width text (VARCHAR) ----
     Varchar {
@@ -456,6 +462,17 @@ impl ColumnKind {
                 },
                 ColumnKind::Long256 { data } => ColumnKind::Long256 {
                     data: data.add(row_offset),
+                },
+                ColumnKind::Decimal {
+                    data,
+                    byte_width,
+                    scale,
+                    little_endian,
+                } => ColumnKind::Decimal {
+                    data: data.add(row_offset * byte_width),
+                    byte_width: *byte_width,
+                    scale: *scale,
+                    little_endian: *little_endian,
                 },
                 // Offsets are absolute into `bytes`, so a sub-range of the
                 // offset table still indexes the full (unsliced) byte buffer.
@@ -837,6 +854,199 @@ impl<'a> Chunk<'a> {
             validity,
             row_count,
         )
+    }
+
+    /// Append a decimal column from signed 64-bit mantissas (QWP wire type
+    /// `DECIMAL64`). A value represents `mantissa * 10^(-scale)`, with
+    /// `scale` in `0..=18`. The destination `DECIMAL(p,s)` column determines
+    /// storage precision and checks that values fit. This also writes to
+    /// narrow `DECIMAL8`, `DECIMAL16`, and `DECIMAL32` storage columns.
+    ///
+    /// Nulls come from `validity`; no mantissa is treated as a null sentinel
+    /// by the encoder. No Arrow or decimal crate is required.
+    pub fn column_decimal64(
+        &mut self,
+        name: &str,
+        data: &'a [i64],
+        scale: u8,
+        validity: Option<&Validity<'a>>,
+    ) -> Result<&mut Self> {
+        self.push_decimal(name, data, scale, validity, cfg!(target_endian = "little"))
+    }
+
+    /// Append a decimal column from signed 128-bit mantissas (QWP wire type
+    /// `DECIMAL128`). A value represents `mantissa * 10^(-scale)`; `scale`
+    /// must be in `0..=38`. The destination table determines the column's
+    /// precision and scale and checks that values fit.
+    ///
+    /// Nulls are specified by `validity`, not by a reserved mantissa. This
+    /// method borrows the slice and requires neither Arrow nor a decimal crate.
+    ///
+    /// ```
+    /// use questdb::ingress::column_sender::Chunk;
+    /// let prices = [123_450_000_001_i128, -125_000_000];
+    /// let mut chunk = Chunk::new("trades");
+    /// chunk.column_decimal128("price", &prices, 9, None)?;
+    /// # Ok::<(), questdb::Error>(())
+    /// ```
+    ///
+    /// The backing slice must outlive the chunk:
+    ///
+    /// ```compile_fail
+    /// use questdb::ingress::column_sender::Chunk;
+    /// let mut chunk = Chunk::new("trades");
+    /// {
+    ///     let prices = vec![12345_i128];
+    ///     chunk.column_decimal128("price", &prices, 2, None).unwrap();
+    /// }
+    /// assert_eq!(chunk.row_count(), 1);
+    /// ```
+    pub fn column_decimal128(
+        &mut self,
+        name: &str,
+        data: &'a [i128],
+        scale: u8,
+        validity: Option<&Validity<'a>>,
+    ) -> Result<&mut Self> {
+        self.push_decimal(name, data, scale, validity, cfg!(target_endian = "little"))
+    }
+
+    /// Append a decimal column from 32-byte, little-endian, two's-complement
+    /// mantissas (QWP wire type `DECIMAL256`). `scale` must be in `0..=76`.
+    /// The destination table determines precision and scale and checks that
+    /// values fit. Nulls come from `validity`.
+    ///
+    /// This byte representation matches the QWP decimal reader and avoids
+    /// requiring a 256-bit integer crate. It is little-endian on every host.
+    pub fn column_decimal256(
+        &mut self,
+        name: &str,
+        data: &'a [[u8; 32]],
+        scale: u8,
+        validity: Option<&Validity<'a>>,
+    ) -> Result<&mut Self> {
+        self.push_decimal(name, data, scale, validity, true)
+    }
+
+    #[cfg(feature = "ffi-support")]
+    pub(crate) fn column_decimal128_bytes(
+        &mut self,
+        name: &str,
+        data: &'a [[u8; 16]],
+        scale: u8,
+        validity: Option<&Validity<'a>>,
+    ) -> Result<&mut Self> {
+        self.push_decimal(name, data, scale, validity, true)
+    }
+
+    // Only instantiated with padding-free i64, i128, [u8; 16], and [u8; 32].
+    // Explicit byte order lets the C ABI use unaligned, portable LE byte rows.
+    fn push_decimal<T>(
+        &mut self,
+        name: &str,
+        data: &'a [T],
+        scale: u8,
+        validity: Option<&Validity<'a>>,
+        little_endian: bool,
+    ) -> Result<&mut Self> {
+        let byte_width = std::mem::size_of::<T>();
+        let dtype = match byte_width {
+            8 => numpy_wire::NumpyDtype::Decimal64 { scale },
+            16 => numpy_wire::NumpyDtype::Decimal128 { scale },
+            32 => numpy_wire::NumpyDtype::Decimal256 { scale },
+            _ => unreachable!("decimal mantissas have 8, 16, or 32 bytes"),
+        };
+        dtype.validate()?;
+        let row_count = check_row_count(self.row_count, data.len(), validity)?;
+        self.push_column(
+            name,
+            dtype.wire_type(),
+            ColumnKind::Decimal {
+                data: data.as_ptr().cast(),
+                byte_width,
+                scale,
+                little_endian,
+            },
+            validity,
+            row_count,
+        )
+    }
+
+    /// Append a `DOUBLE` array column from contiguous, row-major values.
+    /// `shape` describes one row's array, excluding the batch's `row_count`;
+    /// every row has the same shape. For example, `shape = [2, 10]` represents
+    /// a `DOUBLE[][]` column with 20 values per row.
+    ///
+    /// The shape must have 1 to [`crate::ingress::MAX_ARRAY_DIMS`] nonzero
+    /// dimensions within the SDK's array size limit. `data.len()` must equal
+    /// `row_count * product(shape)`, including space for null rows. A batch
+    /// with zero rows is allowed. `validity` marks null array rows; `f64::NAN`
+    /// represents a null array element. Ragged and empty arrays are not
+    /// supported by this fixed-shape interface.
+    ///
+    /// The values are borrowed and the shape is copied. No Arrow, NumPy, or
+    /// ndarray dependency is required.
+    ///
+    /// ```
+    /// use questdb::ingress::column_sender::Chunk;
+    /// // Each row: prices, then sizes, in source level order.
+    /// let bids = [100.25, 100.0, 10.0, 20.0, 100.5, 100.25, 15.0, 25.0];
+    /// let mut chunk = Chunk::new("books");
+    /// chunk.column_f64_array("bids", &bids, 2, &[2, 2], None)?;
+    /// # Ok::<(), questdb::Error>(())
+    /// ```
+    ///
+    /// The values cannot be changed while the chunk still uses them:
+    ///
+    /// ```compile_fail
+    /// use questdb::ingress::column_sender::Chunk;
+    /// let mut values = vec![100.25, 10.0];
+    /// let mut chunk = Chunk::new("books");
+    /// chunk.column_f64_array("bid", &values, 1, &[2], None).unwrap();
+    /// values.clear();
+    /// assert_eq!(chunk.row_count(), 1);
+    /// ```
+    pub fn column_f64_array(
+        &mut self,
+        name: &str,
+        data: &'a [f64],
+        row_count: usize,
+        shape: &[u32],
+        validity: Option<&Validity<'a>>,
+    ) -> Result<&mut Self> {
+        if shape.is_empty() || shape.len() > crate::ingress::MAX_ARRAY_DIMS {
+            return Err(error::fmt!(
+                InvalidApiCall,
+                "DOUBLE array dimensions must be in 1..={}, got {}",
+                crate::ingress::MAX_ARRAY_DIMS,
+                shape.len()
+            ));
+        }
+        let mut dims = [0; crate::ingress::MAX_ARRAY_DIMS];
+        dims[..shape.len()].copy_from_slice(shape);
+        let dtype = numpy_wire::NumpyDtype::F64Ndarray {
+            ndim: shape.len() as u8,
+            shape: dims,
+        };
+        dtype.validate()?;
+        check_row_count(self.row_count, row_count, validity)?;
+        let values_per_row = dtype.source_elem_size()? / std::mem::size_of::<f64>();
+        let expected_len = row_count.checked_mul(values_per_row).ok_or_else(|| {
+            error::fmt!(InvalidApiCall, "DOUBLE array element count overflows usize")
+        })?;
+        if data.len() != expected_len {
+            return Err(error::fmt!(
+                InvalidApiCall,
+                "DOUBLE array data length {} does not match {} rows of {} elements ({})",
+                data.len(),
+                row_count,
+                values_per_row,
+                expected_len
+            ));
+        }
+        // SAFETY: f64 matches the dtype's native layout; the checked shape and
+        // row count cover exactly this slice, borrowed for the chunk's lifetime.
+        unsafe { self.push_numpy_deferred(name, dtype, data.as_ptr().cast(), row_count, validity) }
     }
 
     /// Append a boolean column (QWP wire type `BOOLEAN`).
@@ -1755,6 +1965,160 @@ impl Debug for Chunk<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn native_decimals_validate_scale_without_mutating_chunk() {
+        let d64 = [i64::MIN, i64::MAX];
+        let d128 = [i128::MIN, i128::MAX];
+        let d256 = [[0; 32], [255; 32]];
+        let mut chunk = Chunk::new("t");
+        for scale in [19, u8::MAX] {
+            let err = chunk.column_decimal64("d", &d64, scale, None).unwrap_err();
+            assert_eq!(err.code(), crate::ErrorCode::InvalidApiCall);
+            assert!(chunk.is_empty());
+        }
+        for scale in [39, u8::MAX] {
+            assert!(chunk.column_decimal128("d", &d128, scale, None).is_err());
+            assert!(chunk.is_empty());
+        }
+        for scale in [77, u8::MAX] {
+            assert!(chunk.column_decimal256("d", &d256, scale, None).is_err());
+            assert!(chunk.is_empty());
+        }
+        for (label, scale64, scale128, scale256) in [("zero", 0, 0, 0), ("max", 18, 38, 76)] {
+            chunk
+                .column_decimal64(&format!("d64_{label}"), &d64, scale64, None)
+                .unwrap();
+            chunk
+                .column_decimal128(&format!("d128_{label}"), &d128, scale128, None)
+                .unwrap();
+            chunk
+                .column_decimal256(&format!("d256_{label}"), &d256, scale256, None)
+                .unwrap();
+        }
+        assert_eq!(chunk.row_count(), 2);
+    }
+
+    #[test]
+    fn native_array_validates_shape_and_exact_buffer_length() {
+        let data = [0.0; 12];
+        let mut chunk = Chunk::new("t");
+        {
+            let shape = [2, 3];
+            chunk.column_f64_array("v", &data, 2, &shape, None).unwrap();
+        }
+        assert_eq!(chunk.row_count(), 2);
+
+        let too_many_dims = [1; crate::ingress::MAX_ARRAY_DIMS + 1];
+        for shape in [
+            &[][..],
+            &[0],
+            &[2, 0],
+            &too_many_dims,
+            &[u32::MAX, u32::MAX],
+        ] {
+            let mut chunk = Chunk::new("t");
+            let err = chunk
+                .column_f64_array("v", &[], 0, shape, None)
+                .unwrap_err();
+            assert_eq!(err.code(), crate::ErrorCode::InvalidApiCall);
+            assert!(chunk.is_empty());
+        }
+        let bits = [0];
+        let validity = Validity::from_bitmap(&bits, 2).unwrap();
+        // Even null rows occupy a full shape in the source buffer.
+        for len in [0, 5, 7, 11] {
+            let mut chunk = Chunk::new("t");
+            let err = chunk
+                .column_f64_array("v", &data[..len], 2, &[3], Some(&validity))
+                .unwrap_err();
+            assert_eq!(err.code(), crate::ErrorCode::InvalidApiCall);
+            assert!(err.msg().contains("data length"));
+            assert!(chunk.is_empty());
+        }
+        let mut chunk = Chunk::new("t");
+        assert!(
+            chunk
+                .column_f64_array("v", &[], super::super::MAX_CHUNK_ROWS + 1, &[1], None)
+                .is_err()
+        );
+        assert!(chunk.is_empty());
+    }
+
+    #[test]
+    fn native_columns_obey_row_count_validity_and_name_checks() {
+        let ts = [1, 2];
+        let d64 = [1i64, 2];
+        let d128 = [1i128, 2];
+        let d256 = [[1; 32], [2; 32]];
+        let arrays = [1.0, 2.0, 3.0, 4.0];
+        let bits = [1];
+        let wrong_validity = Validity::from_bitmap(&bits, 1).unwrap();
+        let mut chunk = Chunk::new("t");
+        chunk.at_nanos(&ts).unwrap();
+        assert!(chunk.column_decimal64("d64", &d64[..1], 0, None).is_err());
+        assert!(
+            chunk
+                .column_decimal128("d128", &d128[..1], 0, None)
+                .is_err()
+        );
+        assert!(
+            chunk
+                .column_decimal256("d256", &d256[..1], 0, None)
+                .is_err()
+        );
+        assert!(chunk.column_f64_array("a", &arrays, 1, &[4], None).is_err());
+        assert!(
+            chunk
+                .column_decimal64("d64", &d64, 0, Some(&wrong_validity))
+                .is_err()
+        );
+        assert!(
+            chunk
+                .column_decimal128("d128", &d128, 0, Some(&wrong_validity))
+                .is_err()
+        );
+        assert!(
+            chunk
+                .column_decimal256("d256", &d256, 0, Some(&wrong_validity))
+                .is_err()
+        );
+        assert!(
+            chunk
+                .column_f64_array("a", &arrays, 2, &[2], Some(&wrong_validity))
+                .is_err()
+        );
+        assert!(chunk.column_decimal128("bad.name", &d128, 0, None).is_err());
+        assert!(
+            chunk
+                .column_f64_array("bad.name", &arrays, 2, &[2], None)
+                .is_err()
+        );
+        assert!(chunk.columns.is_empty());
+        chunk.column_decimal64("d64", &d64, 0, None).unwrap();
+        chunk.column_decimal128("d128", &d128, 0, None).unwrap();
+        chunk.column_decimal256("d256", &d256, 0, None).unwrap();
+        chunk.column_f64_array("a", &arrays, 2, &[2], None).unwrap();
+        assert!(chunk.column_decimal128("a", &d128, 0, None).is_err());
+        assert!(
+            chunk
+                .column_f64_array("d64", &arrays, 2, &[2], None)
+                .is_err()
+        );
+        assert_eq!(chunk.columns.len(), 4);
+    }
+
+    #[test]
+    fn native_columns_accept_empty_batches() {
+        let mut chunk = Chunk::new("t");
+        chunk.column_decimal64("d64", &[], 0, None).unwrap();
+        chunk.column_decimal128("d128", &[], 9, None).unwrap();
+        chunk.column_decimal256("d256", &[], 76, None).unwrap();
+        chunk.column_f64_array("a", &[], 0, &[2, 10], None).unwrap();
+        chunk.at_nanos(&[]).unwrap();
+        assert_eq!(chunk.row_count(), 0);
+        assert_eq!(chunk.columns.len(), 4);
+    }
 
     #[test]
     fn locks_row_count_on_first_column() {

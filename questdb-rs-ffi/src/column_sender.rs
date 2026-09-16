@@ -1840,6 +1840,159 @@ column_fn!(qwp_chunk_column_f64, f64, column_f64, "f64 column data");
 column_fn!(qwp_chunk_column_ipv4, u32, column_ipv4, "ipv4 column data");
 column_fn!(qwp_chunk_column_date, i64, column_date, "date column data");
 
+macro_rules! decimal_column_fn {
+    ($fn_name:ident, $c_ty:ty, $row_ty:ty, $append:path) => {
+        #[unsafe(no_mangle)]
+        pub unsafe extern "C" fn $fn_name(
+            chunk: *mut qwp_chunk,
+            name: *const c_char,
+            name_len: size_t,
+            data: *const $c_ty,
+            row_count: size_t,
+            scale: u8,
+            validity: *const qwp_validity,
+            err_out: *mut *mut line_sender_error,
+        ) -> bool {
+            if chunk.is_null() {
+                return reject_null_chunk(err_out);
+            }
+            let _guard = match unsafe {
+                InUseGuard::acquire(
+                    chunk,
+                    &raw const (*chunk).1,
+                    stringify!($fn_name),
+                    "qwp_chunk",
+                    err_out,
+                )
+            } {
+                Some(g) => g,
+                None => return false,
+            };
+            let name = match unsafe { name_str(name, name_len, err_out) } {
+                Some(s) => s,
+                None => return false,
+            };
+            // Byte-backed wide decimals require only byte alignment. The row
+            // count is bounded before constructing the borrowed Rust slice.
+            let data = match unsafe {
+                typed_slice(
+                    data.cast::<$row_ty>(),
+                    row_count,
+                    err_out,
+                    "decimal column data",
+                )
+            } {
+                Some(s) => s,
+                None => return false,
+            };
+            let validity = match unsafe { as_validity(validity, err_out) } {
+                Some(v) => v,
+                None => return false,
+            };
+            let inner: &mut Chunk = unsafe { &mut (*chunk).0 };
+            bubble_err_to_c!(
+                err_out,
+                $append(inner, name, data, scale, validity.as_ref())
+            );
+            true
+        }
+    };
+}
+
+decimal_column_fn!(
+    qwp_chunk_column_decimal64,
+    i64,
+    i64,
+    Chunk::column_decimal64
+);
+decimal_column_fn!(
+    qwp_chunk_column_decimal128,
+    u8,
+    [u8; 16],
+    questdb::ffi_support::chunk_column_decimal128
+);
+decimal_column_fn!(
+    qwp_chunk_column_decimal256,
+    u8,
+    [u8; 32],
+    Chunk::column_decimal256
+);
+
+/// Borrow a dense, fixed-shape DOUBLE array column. `data_len` counts f64
+/// elements across the entire batch; `shape` excludes the batch dimension.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn qwp_chunk_column_f64_array(
+    chunk: *mut qwp_chunk,
+    name: *const c_char,
+    name_len: size_t,
+    data: *const f64,
+    data_len: size_t,
+    row_count: size_t,
+    shape: *const u32,
+    ndim: size_t,
+    validity: *const qwp_validity,
+    err_out: *mut *mut line_sender_error,
+) -> bool {
+    if chunk.is_null() {
+        return reject_null_chunk(err_out);
+    }
+    let _guard = match unsafe {
+        InUseGuard::acquire(
+            chunk,
+            &raw const (*chunk).1,
+            "qwp_chunk_column_f64_array",
+            "qwp_chunk",
+            err_out,
+        )
+    } {
+        Some(g) => g,
+        None => return false,
+    };
+    let name = match unsafe { name_str(name, name_len, err_out) } {
+        Some(s) => s,
+        None => return false,
+    };
+    let shape = match unsafe {
+        typed_slice_bounded(
+            shape,
+            ndim,
+            MAX_ARRAY_DIMS,
+            "MAX_ARRAY_DIMS",
+            err_out,
+            "array shape",
+        )
+    } {
+        Some(s) => s,
+        None => return false,
+    };
+    let max_elements = questdb::ingress::column_sender::MAX_CHUNK_ROWS
+        .saturating_mul(MAX_NDARRAY_LEAF_ELEMS)
+        .min(isize::MAX as usize / std::mem::size_of::<f64>());
+    let data = match unsafe {
+        typed_slice_bounded(
+            data,
+            data_len,
+            max_elements,
+            "maximum array batch elements",
+            err_out,
+            "array data",
+        )
+    } {
+        Some(s) => s,
+        None => return false,
+    };
+    let validity = match unsafe { as_validity(validity, err_out) } {
+        Some(v) => v,
+        None => return false,
+    };
+    let inner: &mut Chunk = unsafe { &mut (*chunk).0 };
+    bubble_err_to_c!(
+        err_out,
+        inner.column_f64_array(name, data, row_count, shape, validity.as_ref())
+    );
+    true
+}
+
 /// `TIMESTAMP` / `TIMESTAMP_NANOS` column. `unit` selects the precision:
 /// `qwp_ts_unit_micros` (0) → `TIMESTAMP`,
 /// `qwp_ts_unit_nanos` (1) → `TIMESTAMP_NANOS`. `data` holds

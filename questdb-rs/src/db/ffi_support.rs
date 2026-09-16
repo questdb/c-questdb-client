@@ -54,6 +54,18 @@ pub use super::{OwnedDirectColumnSender, OwnedSender};
 #[cfg(feature = "_egress")]
 pub use super::{OwnedReader, ReaderPoolHandle};
 
+/// Append portable LE decimal128 bytes without imposing i128 alignment or a
+/// compiler-specific C integer type. The slice remains borrowed by the chunk.
+pub fn chunk_column_decimal128<'a, 'c>(
+    chunk: &'c mut crate::ingress::column_sender::Chunk<'a>,
+    name: &str,
+    data: &'a [[u8; 16]],
+    scale: u8,
+    validity: Option<&crate::ingress::column_sender::Validity<'a>>,
+) -> Result<&'c mut crate::ingress::column_sender::Chunk<'a>> {
+    chunk.column_decimal128_bytes(name, data, scale, validity)
+}
+
 /// Borrow the store-and-forward QWP sender as an owned, lifetime-free handle.
 ///
 /// FFI counterpart to [`QuestDb::borrow_sender`]; backs the C ABI's

@@ -11,6 +11,7 @@
 #include "qwp_mock_c.h"
 
 #include <stdbool.h>
+#include <math.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -1480,9 +1481,131 @@ TEST(test_mock_ingress_arrow_release_contract)
     mock_return_close(mock, db, conn);
 }
 
+#define NATIVE_CHECK(expr)                                                     \
+    do                                                                         \
+    {                                                                          \
+        bool pass_ = (expr);                                                   \
+        CHECK(pass_, #expr);                                                   \
+        if (!pass_)                                                            \
+            return;                                                            \
+    } while (0)
+#define NATIVE_OK(expr)                                                        \
+    do                                                                         \
+    {                                                                          \
+        NATIVE_CHECK(expr);                                                    \
+        NATIVE_CHECK(err == NULL);                                             \
+    } while (0)
+#define NATIVE_BAD(expr)                                                       \
+    do                                                                         \
+    {                                                                          \
+        NATIVE_CHECK(!(expr));                                                 \
+        NATIVE_CHECK(err != NULL);                                             \
+        NATIVE_CHECK(                                                          \
+            line_sender_error_get_code(err) ==                                 \
+            line_sender_error_invalid_api_call);                               \
+        line_sender_error_free(err);                                           \
+        err = NULL;                                                            \
+    } while (0)
+
+TEST(test_native_decimal_and_array_columns)
+{
+    line_sender_error* err = NULL;
+    qwp_chunk* chunk = qwp_chunk_new("native_columns", 14, &err);
+    NATIVE_CHECK(chunk != NULL && err == NULL);
+    const int64_t decimals[] = {12345, 0, -12345};
+    /* Offsets deliberately remove any int128 alignment guarantee. */
+    uint8_t wide128[49] = {0};
+    uint8_t wide256[97] = {0};
+    wide128[1] = 1;
+    wide256[1] = 1;
+    memset(wide128 + 33, 0xff, 16);
+    memset(wide256 + 65, 0xff, 32);
+    const uint8_t bits[] = {5};
+    const qwp_validity valid = {bits, 3};
+    const qwp_validity wrong_validity = {bits, 2};
+    const double arrays[] = {
+        100.25, NAN, 10, 20, 0, 0, 0, 0, 101, 100.5, 30, 40};
+    const uint32_t shape[] = {2, 2};
+    const uint32_t zero_shape[] = {2, 0};
+
+    NATIVE_BAD(qwp_chunk_column_decimal64(
+        chunk, "d64", 3, decimals, 3, 19, NULL, &err));
+    NATIVE_BAD(qwp_chunk_column_decimal128(
+        chunk, "d128", 4, wide128 + 1, 3, 39, NULL, &err));
+    NATIVE_BAD(qwp_chunk_column_decimal256(
+        chunk, "d256", 4, wide256 + 1, 3, 77, NULL, &err));
+    NATIVE_BAD(
+        qwp_chunk_column_decimal64(chunk, "d64", 3, NULL, 3, 2, NULL, &err));
+    NATIVE_BAD(
+        qwp_chunk_column_decimal128(chunk, "d128", 4, NULL, 3, 9, NULL, &err));
+    NATIVE_BAD(
+        qwp_chunk_column_decimal256(chunk, "d256", 4, NULL, 3, 76, NULL, &err));
+    NATIVE_BAD(qwp_chunk_column_decimal128(
+        NULL, "d128", 4, wide128 + 1, 3, 9, NULL, &err));
+    NATIVE_BAD(qwp_chunk_column_decimal256(
+        chunk, "d256", 4, wide256 + 1, SIZE_MAX, 0, NULL, &err));
+    NATIVE_BAD(qwp_chunk_column_f64_array(
+        chunk, "a", 1, arrays, 12, 3, shape, 0, NULL, &err));
+    NATIVE_BAD(qwp_chunk_column_f64_array(
+        chunk, "a", 1, arrays, 12, 3, shape, 33, NULL, &err));
+    NATIVE_BAD(qwp_chunk_column_f64_array(
+        chunk, "a", 1, arrays, 12, 3, zero_shape, 2, NULL, &err));
+    NATIVE_BAD(qwp_chunk_column_f64_array(
+        chunk, "a", 1, arrays, 11, 3, shape, 2, NULL, &err));
+    NATIVE_BAD(qwp_chunk_column_f64_array(
+        chunk, "a", 1, NULL, 12, 3, shape, 2, NULL, &err));
+    NATIVE_BAD(qwp_chunk_column_f64_array(
+        chunk, "a", 1, arrays, 12, 3, NULL, 2, NULL, &err));
+    NATIVE_BAD(qwp_chunk_column_f64_array(
+        chunk, "a", 1, arrays, SIZE_MAX, 3, shape, 2, NULL, &err));
+    NATIVE_BAD(qwp_chunk_column_decimal64(
+        chunk, "d64", 3, decimals, 3, 2, &wrong_validity, &err));
+    NATIVE_BAD(qwp_chunk_column_decimal128(
+        chunk, "d128", 4, wide128 + 1, 3, 9, &wrong_validity, &err));
+    NATIVE_BAD(qwp_chunk_column_decimal256(
+        chunk, "d256", 4, wide256 + 1, 3, 76, &wrong_validity, &err));
+    NATIVE_BAD(qwp_chunk_column_f64_array(
+        chunk, "a", 1, arrays, 12, 3, shape, 2, &wrong_validity, &err));
+    NATIVE_CHECK(qwp_chunk_row_count(chunk, &err) == 0 && err == NULL);
+
+    NATIVE_OK(qwp_chunk_column_decimal64(
+        chunk, "d64", 3, decimals, 3, 18, &valid, &err));
+    NATIVE_OK(qwp_chunk_column_decimal128(
+        chunk, "d128", 4, wide128 + 1, 3, 38, &valid, &err));
+    NATIVE_OK(qwp_chunk_column_decimal256(
+        chunk, "d256", 4, wide256 + 1, 3, 76, &valid, &err));
+    NATIVE_OK(qwp_chunk_column_f64_array(
+        chunk, "a", 1, arrays, 12, 3, shape, 2, &valid, &err));
+    NATIVE_CHECK(qwp_chunk_row_count(chunk, &err) == 3 && err == NULL);
+    NATIVE_BAD(qwp_chunk_column_decimal64(
+        chunk, "d64", 3, decimals, 3, 0, NULL, &err));
+    NATIVE_BAD(qwp_chunk_column_decimal128(
+        chunk, "other", 5, wide128 + 1, 2, 0, NULL, &err));
+    NATIVE_BAD(qwp_chunk_column_f64_array(
+        chunk, "other", 5, arrays, 4, 1, shape, 2, NULL, &err));
+    qwp_chunk_free(chunk);
+
+    chunk = qwp_chunk_new("empty", 5, &err);
+    NATIVE_CHECK(chunk != NULL && err == NULL);
+    NATIVE_OK(
+        qwp_chunk_column_decimal64(chunk, "d64", 3, NULL, 0, 0, NULL, &err));
+    NATIVE_OK(
+        qwp_chunk_column_decimal128(chunk, "d128", 4, NULL, 0, 0, NULL, &err));
+    NATIVE_OK(
+        qwp_chunk_column_decimal256(chunk, "d256", 4, NULL, 0, 0, NULL, &err));
+    NATIVE_OK(qwp_chunk_column_f64_array(
+        chunk, "a", 1, NULL, 0, 0, shape, 2, NULL, &err));
+    qwp_chunk_free(chunk);
+}
+
+#undef NATIVE_CHECK
+#undef NATIVE_OK
+#undef NATIVE_BAD
+
 int main(void)
 {
     RUN(test_tristate_egress_enum_values);
+    RUN(test_native_decimal_and_array_columns);
     RUN(test_appended_query_error_codes_have_distinct_values);
     RUN(test_appended_sender_error_codes_exist);
     RUN(test_symbol_dict_full_is_a_distinct_appended_code);

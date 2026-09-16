@@ -291,6 +291,91 @@ public:
         return *this;
     }
 
+    /** Decimal64: native signed mantissas, scale in 0..=18. */
+    column_chunk& column_decimal64(
+        std::string_view name,
+        const int64_t* data,
+        size_t row_count,
+        uint8_t scale,
+        const validity_view* validity = nullptr)
+    {
+        line_sender_error::wrapped_call(
+            ::qwp_chunk_column_decimal64,
+            _raw,
+            name.data(),
+            name.size(),
+            data,
+            row_count,
+            scale,
+            validity ? validity->c_ptr() : nullptr);
+        return *this;
+    }
+
+    /** Decimal128: 16 LE two's-complement bytes per row, scale in 0..=38. */
+    column_chunk& column_decimal128(
+        std::string_view name,
+        const uint8_t* data,
+        size_t row_count,
+        uint8_t scale,
+        const validity_view* validity = nullptr)
+    {
+        line_sender_error::wrapped_call(
+            ::qwp_chunk_column_decimal128,
+            _raw,
+            name.data(),
+            name.size(),
+            data,
+            row_count,
+            scale,
+            validity ? validity->c_ptr() : nullptr);
+        return *this;
+    }
+
+    /** Decimal256: 32 LE two's-complement bytes per row, scale in 0..=76. */
+    column_chunk& column_decimal256(
+        std::string_view name,
+        const uint8_t* data,
+        size_t row_count,
+        uint8_t scale,
+        const validity_view* validity = nullptr)
+    {
+        line_sender_error::wrapped_call(
+            ::qwp_chunk_column_decimal256,
+            _raw,
+            name.data(),
+            name.size(),
+            data,
+            row_count,
+            scale,
+            validity ? validity->c_ptr() : nullptr);
+        return *this;
+    }
+
+    /** Fixed-shape arrays. data_len counts doubles; shape excludes row_count.
+     * Null rows occupy a full shape; NaN represents a null element. */
+    column_chunk& column_f64_array(
+        std::string_view name,
+        const double* data,
+        size_t data_len,
+        size_t row_count,
+        const uint32_t* shape,
+        size_t ndim,
+        const validity_view* validity = nullptr)
+    {
+        line_sender_error::wrapped_call(
+            ::qwp_chunk_column_f64_array,
+            _raw,
+            name.data(),
+            name.size(),
+            data,
+            data_len,
+            row_count,
+            shape,
+            ndim,
+            validity ? validity->c_ptr() : nullptr);
+        return *this;
+    }
+
     /** Bit-packed boolean column (LSB-first). */
     column_chunk& column_bool(
         std::string_view name,
