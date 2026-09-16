@@ -419,11 +419,24 @@ public:
      * Permanently stop renderer-event delivery without closing the provider.
      * Waits for an in-flight event callback except for callback re-entry; a
      * cross-target callback drain is bounded to avoid AB/BA deadlock, while
-     * suppression remains exact. Idempotent and safe on a moved-from handle.
+     * suppression remains exact. The caller must be able to wait for arbitrary
+     * user callback code; finalizers and shutdown hooks must use
+     * `detach_events_nowait()`. Idempotent and safe on a moved-from handle.
      */
     void detach_events() const noexcept
     {
         ::questdb_oidc_auth_detach_events(_raw);
+    }
+
+    /**
+     * Stop later renderer events without waiting for a callback that is already
+     * running. This is the safe form for finalizers and managed-runtime
+     * shutdown hooks. Suppression remains exact; only the callback drain is
+     * best-effort. Idempotent and safe on a moved-from handle.
+     */
+    void detach_events_nowait() const noexcept
+    {
+        ::questdb_oidc_auth_detach_events_nowait(_raw);
     }
 
     /**

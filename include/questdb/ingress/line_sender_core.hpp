@@ -168,10 +168,23 @@ public:
     /** Whether a C error carries structured OIDC diagnostics. */
     static bool has_oidc_detail(const ::questdb_error* c_err) noexcept;
 
-    /** Convert, take ownership of, and throw the most specific C++ error. */
+    /**
+     * Convert, take ownership of, and throw the most specific C++ error.
+     * Throws the derived `questdb::oidc::error` when `c_err` carries structured
+     * OIDC detail; otherwise throws `questdb::error`.
+     */
     [[noreturn]] static void throw_from_c(::questdb_error* c_err);
 
-    /** Call a C function whose final argument is `questdb_error**`. */
+    /**
+     * Call a C function whose final argument is `questdb_error**`.
+     *
+     * @throws questdb::oidc::error when the returned error carries structured
+     *         OIDC detail.
+     * @throws questdb::error for every other returned error.
+     *
+     * Code that handles errors from both OIDC-aware and older call sites should
+     * catch `const questdb::error&`, the common base.
+     */
     template <typename F, typename... Args>
     static auto wrapped_call(F&& f, Args&&... args)
     {

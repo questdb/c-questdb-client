@@ -37,9 +37,13 @@
  * direction includes only that header. Include this one directly to hold or
  * configure a pool in a translation unit that borrows nothing itself.
  *
- * Error reporting follows the convention of `line_sender.h`: `err_out` is
- * optional on every fallible call, and if non-NULL, `*err_out` MUST be NULL on
- * entry.
+ * Pointer arguments follow the convention of `line_sender.h`: every pointer
+ * must be non-NULL unless the function's own documentation explicitly permits
+ * NULL. In particular, an undocumented callback parameter is required; APIs
+ * that accept an omitted callback say so explicitly.
+ *
+ * Error reporting follows the same convention: `err_out` is optional on every
+ * fallible call, and if non-NULL, `*err_out` MUST be NULL on entry.
  */
 
 #pragma once

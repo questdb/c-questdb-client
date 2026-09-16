@@ -452,14 +452,30 @@ questdb_oidc_auth* questdb_oidc_auth_clone(
  * exact. Idempotent, NULL-tolerant, and callable from any thread. Auths built
  * from the same reusable builder are unaffected.
  *
- * This is intended for a managed-runtime shutdown hook: attached transports
- * can keep refreshing tokens after the runtime can no longer service a
- * renderer that enters it. The caller must not delegate this call to another
- * thread and wait for that thread from inside the callback, because the
- * delegate cannot identify itself as the callback's stack.
+ * Use this form only when the caller can wait for arbitrary user callback
+ * code to return. The caller must not delegate this call to another thread and
+ * wait for that thread from inside the callback, because the delegate cannot
+ * identify itself as the callback's stack. A finalizer or managed-runtime
+ * shutdown hook must use `questdb_oidc_auth_detach_events_nowait` instead.
  */
 QUESTDB_CLIENT_API
 void questdb_oidc_auth_detach_events(const questdb_oidc_auth* auth);
+
+/**
+ * As `questdb_oidc_auth_detach_events`, but never waits for a renderer callback
+ * that is already running.
+ *
+ * Later events are suppressed exactly as with the waiting form; only the "no
+ * callback is still running on return" guarantee is given up. Idempotent,
+ * NULL-tolerant, and callable from any thread, including from inside a
+ * renderer callback. This is the safe form for finalizers, garbage-collection
+ * hooks, interpreter shutdown hooks, and other contexts that cannot wait for
+ * arbitrary user callback code.
+ *
+ * Auths built from the same reusable builder are unaffected.
+ */
+QUESTDB_CLIENT_API
+void questdb_oidc_auth_detach_events_nowait(const questdb_oidc_auth* auth);
 
 /**
  * Permanently stop delivering this auth's persistence diagnostics.

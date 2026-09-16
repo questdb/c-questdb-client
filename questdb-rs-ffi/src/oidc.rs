@@ -931,12 +931,24 @@ impl CEventHandler {
     /// managed runtime may need transports to keep refreshing tokens after it
     /// can no longer service presentation callbacks.
     fn detach(&self) {
+        self.detach_inner(true);
+    }
+
+    /// As [`detach`](Self::detach), but never waits for a callback already
+    /// running: it publishes suppression and drains only best-effort.
+    fn detach_nowait(&self) {
+        self.detach_inner(false);
+    }
+
+    fn detach_inner(&self, may_block: bool) {
         let target: *const CEventHandler = self;
         let (reentrant, nested) = IN_EVENT_CALLBACK.with(|stack| {
             let stack = stack.borrow();
             (stack.contains(&target), !stack.is_empty())
         });
         {
+            // Serialize suppression with callback admission. Once this store
+            // completes, no callback that has not already entered can start.
             let _gate = self
                 .target
                 .callback_gate
@@ -948,9 +960,10 @@ impl CEventHandler {
         if reentrant {
             return;
         }
-        if nested {
-            // Do not create an AB/BA inversion between two renderer targets.
-            // Suppression is exact; only the drain is best-effort here.
+        if nested || !may_block {
+            // Do not create an AB/BA inversion between two renderer targets,
+            // or turn a finalizer/shutdown hook into an unbounded wait on user
+            // code. Suppression is exact; only the drain is best-effort here.
             for _ in 0..DETACH_BOUNDED_DRAIN_ROUNDS {
                 let gate = self
                     .target
@@ -1592,6 +1605,23 @@ pub unsafe extern "C" fn questdb_oidc_auth_detach_events(auth: *const questdb_oi
     }
     if let Some(handler) = unsafe { &(*auth).shared.event_handler } {
         handler.detach();
+    }
+}
+
+/// As [`questdb_oidc_auth_detach_events`], but never waits for a renderer
+/// callback that is already running.
+///
+/// Later events are suppressed exactly as with the waiting form; only the "no
+/// callback is still running on return" guarantee is given up. Use this from a
+/// finalizer, garbage-collection hook, interpreter shutdown hook, or any other
+/// context that must not wait for arbitrary user callback code.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn questdb_oidc_auth_detach_events_nowait(auth: *const questdb_oidc_auth) {
+    if auth.is_null() {
+        return;
+    }
+    if let Some(handler) = unsafe { &(*auth).shared.event_handler } {
+        handler.detach_nowait();
     }
 }
 
@@ -2552,6 +2582,29 @@ mod tests {
         )))
     }
 
+    unsafe fn auth_with_event_handler(
+        callback: unsafe extern "C" fn(*mut c_void, *const questdb_oidc_event),
+    ) -> (*mut questdb_oidc_auth, Arc<CEventHandler>) {
+        let builder = unsafe { explicit_builder() };
+        let mut error = ptr::null_mut();
+        assert!(unsafe {
+            questdb_oidc_builder_event_handler(
+                builder,
+                Some(callback),
+                ptr::null_mut(),
+                None,
+                &mut error,
+            )
+        });
+        assert!(error.is_null());
+        let auth = unsafe { questdb_oidc_builder_build(builder, &mut error) };
+        assert!(!auth.is_null());
+        assert!(error.is_null());
+        let handler = Arc::clone(unsafe { (*auth).shared.event_handler.as_ref().unwrap() });
+        unsafe { questdb_oidc_builder_free(builder) };
+        (auth, handler)
+    }
+
     #[test]
     fn detaching_events_suppresses_only_that_auth() {
         unsafe extern "C" fn count_event(
@@ -2578,7 +2631,7 @@ mod tests {
     }
 
     #[test]
-    fn detaching_events_waits_for_an_inflight_callback() {
+    fn detach_events_ffi_waits_for_an_inflight_callback() {
         static ENTERED: AtomicUsize = AtomicUsize::new(0);
         static RELEASE: AtomicUsize = AtomicUsize::new(0);
         static RETURNED: AtomicUsize = AtomicUsize::new(0);
@@ -2597,7 +2650,7 @@ mod tests {
         ENTERED.store(0, Ordering::SeqCst);
         RELEASE.store(0, Ordering::SeqCst);
         RETURNED.store(0, Ordering::SeqCst);
-        let handler = event_handler(blocking_event, 0, None);
+        let (auth, handler) = unsafe { auth_with_event_handler(blocking_event) };
         let renderer = CEventRenderer(Arc::clone(&handler));
         let emitter = std::thread::spawn(move || {
             renderer.invoke(&empty_event(
@@ -2608,13 +2661,20 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(1));
         }
         let (tx, rx) = std::sync::mpsc::channel();
+        let auth_addr = auth as usize;
         let detacher = std::thread::spawn(move || {
-            handler.detach();
+            unsafe { questdb_oidc_auth_detach_events(auth_addr as *const questdb_oidc_auth) };
             let _ = tx.send(RETURNED.load(Ordering::SeqCst));
         });
+        // First prove that the detacher has actually run and published
+        // suppression. Without this synchronization, an empty result channel
+        // could mean only that the detacher had not been scheduled yet, so a
+        // mutation to the nowait implementation could still pass by chance.
+        while !handler.closed.load(Ordering::Acquire) {
+            std::thread::yield_now();
+        }
         assert!(
-            rx.recv_timeout(std::time::Duration::from_millis(20))
-                .is_err(),
+            matches!(rx.try_recv(), Err(std::sync::mpsc::TryRecvError::Empty)),
             "detach returned while the event callback was still active"
         );
         RELEASE.store(1, Ordering::SeqCst);
@@ -2625,6 +2685,72 @@ mod tests {
         );
         emitter.join().unwrap();
         detacher.join().unwrap();
+        unsafe { questdb_oidc_auth_free(auth) };
+    }
+
+    #[test]
+    fn detach_events_nowait_ffi_returns_while_callback_is_parked_and_suppresses_later_events() {
+        static CALLS: AtomicUsize = AtomicUsize::new(0);
+        static ENTERED: AtomicUsize = AtomicUsize::new(0);
+        static RELEASE: AtomicUsize = AtomicUsize::new(0);
+        static RETURNED: AtomicUsize = AtomicUsize::new(0);
+
+        unsafe extern "C" fn blocking_first_event(
+            _user_data: *mut c_void,
+            _event: *const questdb_oidc_event,
+        ) {
+            let call = CALLS.fetch_add(1, Ordering::SeqCst);
+            if call == 0 {
+                ENTERED.store(1, Ordering::SeqCst);
+                while RELEASE.load(Ordering::SeqCst) == 0 {
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
+                RETURNED.store(1, Ordering::SeqCst);
+            }
+        }
+
+        CALLS.store(0, Ordering::SeqCst);
+        ENTERED.store(0, Ordering::SeqCst);
+        RELEASE.store(0, Ordering::SeqCst);
+        RETURNED.store(0, Ordering::SeqCst);
+        let (auth, handler) = unsafe { auth_with_event_handler(blocking_first_event) };
+        let emitter_renderer = CEventRenderer(Arc::clone(&handler));
+        let later_renderer = CEventRenderer(handler);
+        let emitter = std::thread::spawn(move || {
+            emitter_renderer.invoke(&empty_event(
+                questdb_oidc_event_kind::QUESTDB_OIDC_EVENT_WAITING,
+            ));
+        });
+        while ENTERED.load(Ordering::SeqCst) == 0 {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let auth_addr = auth as usize;
+        let detacher = std::thread::spawn(move || {
+            unsafe {
+                questdb_oidc_auth_detach_events_nowait(auth_addr as *const questdb_oidc_auth)
+            };
+            let _ = tx.send(RETURNED.load(Ordering::SeqCst));
+        });
+        let observed = rx.recv_timeout(std::time::Duration::from_secs(1));
+        if observed.is_err() {
+            RELEASE.store(1, Ordering::SeqCst);
+            emitter.join().unwrap();
+            detacher.join().unwrap();
+            unsafe { questdb_oidc_auth_free(auth) };
+            panic!("nowait event detach waited for the parked callback");
+        }
+        assert_eq!(observed.unwrap(), 0, "callback returned before detach");
+
+        RELEASE.store(1, Ordering::SeqCst);
+        emitter.join().unwrap();
+        detacher.join().unwrap();
+        later_renderer.invoke(&empty_event(
+            questdb_oidc_event_kind::QUESTDB_OIDC_EVENT_WAITING,
+        ));
+        assert_eq!(CALLS.load(Ordering::SeqCst), 1, "later event was delivered");
+        unsafe { questdb_oidc_auth_free(auth) };
     }
 
     #[test]
@@ -2664,6 +2790,7 @@ mod tests {
         unsafe {
             questdb_oidc_builder_free(ptr::null_mut());
             questdb_oidc_auth_detach_events(ptr::null());
+            questdb_oidc_auth_detach_events_nowait(ptr::null());
             questdb_oidc_auth_detach_diagnostics(ptr::null());
             questdb_oidc_auth_detach_diagnostics_nowait(ptr::null());
             questdb_oidc_auth_free(ptr::null_mut());

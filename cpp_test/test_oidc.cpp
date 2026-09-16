@@ -164,6 +164,7 @@ TEST_CASE("OIDC C++ wrappers preserve ownership and structured errors")
     // Callback detach is explicitly NULL-tolerant at the C boundary, so its
     // noexcept C++ wrappers remain safe on a moved-from handle.
     CHECK_NOTHROW(auth.detach_events());
+    CHECK_NOTHROW(auth.detach_events_nowait());
     CHECK_NOTHROW(auth.detach_diagnostics());
     CHECK_NOTHROW(auth.detach_diagnostics_nowait());
     // Move-assignment from a moved-from handle is still well defined; the
@@ -269,6 +270,7 @@ TEST_CASE("OIDC C++ wrappers preserve ownership and structured errors")
     // Lazy construction performs no network I/O, but exercises ownership and
     // the shared sender/reader provider configuration in the pool FFI.
     questdb::pool pool{"ws::addr=127.0.0.1:1;lazy_connect=true;", shared_auth};
+    CHECK_NOTHROW(shared_auth.detach_events_nowait());
     CHECK_NOTHROW(shared_auth.detach_events());
     CHECK_NOTHROW(shared_auth.detach_diagnostics());
     CHECK_NOTHROW(shared_auth.detach_diagnostics_nowait());
