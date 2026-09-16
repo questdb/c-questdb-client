@@ -193,9 +193,9 @@ TEST_CASE("column_chunk native decimals and arrays flush through C ABI")
         body.insert(body.end(), {2, 2, 0, 0, 0, 2, 0, 0, 0});
         for (size_t i = 0; i < 4; ++i)
         {
-            uint64_t bits;
-            std::memcpy(&bits, &values[row * 4 + i], sizeof(bits));
-            append_u64_le(body, bits);
+            uint64_t value_bits;
+            std::memcpy(&value_bits, &values[row * 4 + i], sizeof(value_bits));
+            append_u64_le(body, value_bits);
         }
     }
     check_body("a", body);
