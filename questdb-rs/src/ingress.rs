@@ -1678,11 +1678,19 @@ impl SenderBuilder {
     /// token is a bearer credential, sent in cleartext over plain
     /// [`Protocol::Ws`] to a non-loopback host.
     #[cfg(feature = "_sender-qwp-ws")]
-    pub fn qwp_ws_token_provider<F, E>(mut self, provider: F) -> Result<Self>
+    pub fn qwp_ws_token_provider<F, E>(self, provider: F) -> Result<Self>
     where
         F: Fn() -> std::result::Result<String, E> + Send + Sync + 'static,
         E: Into<crate::Error>,
     {
+        self.qwp_ws_token_provider_object(crate::token_provider::TokenProvider::new(provider))
+    }
+
+    #[cfg(feature = "_sender-qwp-ws")]
+    pub(crate) fn qwp_ws_token_provider_object(
+        mut self,
+        provider: crate::token_provider::TokenProvider,
+    ) -> Result<Self> {
         if self.qwp_ws.is_none() {
             return Err(fmt!(
                 ConfigError,
@@ -1697,8 +1705,7 @@ impl SenderBuilder {
                 crate::token_provider::PROVIDER_CONFLICTS_WITH_STATIC_AUTH
             ));
         }
-        self.qwp_ws.as_mut().unwrap().token_provider =
-            Some(crate::token_provider::TokenProvider::new(provider));
+        self.qwp_ws.as_mut().unwrap().token_provider = Some(provider);
         Ok(self)
     }
 
@@ -1733,9 +1740,32 @@ impl SenderBuilder {
         F: Fn() -> std::result::Result<String, E> + Send + Sync + 'static,
         E: Into<crate::Error>,
     {
+        self.bearer_token_provider_with_isolation(
+            provider,
+            crate::TokenProviderIsolation::default(),
+        )
+    }
+
+    /// Binding-only form that lets every QWP attachment of one authentication
+    /// object share its isolated-acquisition single flight.
+    #[cfg(all(feature = "_sender-http", feature = "_sender-qwp-ws"))]
+    #[doc(hidden)]
+    pub fn bearer_token_provider_with_isolation<F, E>(
+        self,
+        provider: F,
+        isolation: crate::TokenProviderIsolation,
+    ) -> Result<Self>
+    where
+        F: Fn() -> std::result::Result<String, E> + Send + Sync + 'static,
+        E: Into<crate::Error>,
+    {
         match self.protocol {
+            // HTTP acquisition is synchronous and does not consume isolated
+            // QWP workers, so no isolation cell is needed on this branch.
             Protocol::Http | Protocol::Https => self.http_token_provider(provider),
-            Protocol::Ws | Protocol::Wss => self.qwp_ws_token_provider(provider),
+            Protocol::Ws | Protocol::Wss => self.qwp_ws_token_provider_object(
+                crate::token_provider::TokenProvider::new_with_isolation(provider, isolation),
+            ),
             #[cfg(feature = "_sender-tcp")]
             Protocol::Tcp | Protocol::Tcps => Err(fmt!(
                 ConfigError,

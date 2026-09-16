@@ -416,6 +416,17 @@ public:
     }
 
     /**
+     * Permanently stop renderer-event delivery without closing the provider.
+     * Waits for an in-flight event callback except for callback re-entry; a
+     * cross-target callback drain is bounded to avoid AB/BA deadlock, while
+     * suppression remains exact. Idempotent and safe on a moved-from handle.
+     */
+    void detach_events() const noexcept
+    {
+        ::questdb_oidc_auth_detach_events(_raw);
+    }
+
+    /**
      * Permanently stop persistence-diagnostic delivery without closing the
      * provider. Returns after any diagnostic callback already running has
      * finished, except for callback re-entry and cross-target callback nesting,
@@ -760,6 +771,24 @@ public:
         return device_auth{
             detail::wrapped_call(::questdb_oidc_builder_build, _raw)};
     }
+
+#if defined(QUESTDB_OIDC_CPP_TEST_HOOKS)
+    // Header-only test seams for the two noexcept C trampolines. Kept out of
+    // production declarations; the C++ test target defines the macro before
+    // including the public umbrella header.
+    static void test_invoke_event_handler(
+        std::function<void(const event_view&)>& handler,
+        const ::questdb_oidc_event* event) noexcept
+    {
+        event_trampoline(&handler, event);
+    }
+    static void test_invoke_diagnostic_handler(
+        std::function<void(const diagnostic_view&)>& handler,
+        const ::questdb_oidc_diagnostic* diagnostic) noexcept
+    {
+        diagnostic_trampoline(&handler, diagnostic);
+    }
+#endif
 
 private:
     explicit builder(::questdb_oidc_builder* raw) noexcept

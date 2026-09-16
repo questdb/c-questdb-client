@@ -519,9 +519,10 @@ pub unsafe extern "C" fn qwp_reader_from_conf_with_oidc(
             return ptr::null_mut();
         };
         let config = reader_bubble!(err_out, ReaderConfig::from_conf(conf), ptr::null_mut());
+        let isolation = auth.token_provider_isolation();
         let config = reader_bubble!(
             err_out,
-            config.token_provider(move || auth.token()),
+            config.token_provider_with_isolation(move || auth.token(), isolation),
             ptr::null_mut()
         );
         let reader = reader_bubble!(err_out, Reader::from_config(&config), ptr::null_mut());

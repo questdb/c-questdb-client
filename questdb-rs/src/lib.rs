@@ -44,6 +44,13 @@ mod ws;
     feature = "_egress"
 ))]
 mod token_provider;
+#[cfg(any(
+    feature = "_sender-http",
+    feature = "_sender-qwp-ws",
+    feature = "_egress"
+))]
+#[doc(hidden)]
+pub use token_provider::TokenProviderIsolation;
 
 // JKS / PKCS#12 trust-store loader for `tls_roots_password`. Pulled
 // in only for the QWP transports — matches the Java reference's

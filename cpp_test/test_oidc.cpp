@@ -1,12 +1,15 @@
 #define DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN
+#define QUESTDB_OIDC_CPP_TEST_HOOKS
 #include "doctest.h"
 
 #include <questdb/client.hpp>
 #include <questdb/egress/qwp_reader.hpp>
 #include <questdb/ingress/line_sender.hpp>
 
+#include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <stdexcept>
 #include <string_view>
 #include <type_traits>
 #include <utility>
@@ -158,8 +161,9 @@ TEST_CASE("OIDC C++ wrappers preserve ownership and structured errors")
     CHECK_THROWS_AS(auth.token(), questdb::oidc::error);
     CHECK_THROWS_AS(auth.clear(), questdb::oidc::error);
     CHECK_THROWS_AS(auth.config(), questdb::oidc::error);
-    // Diagnostic detach is explicitly NULL-tolerant at the C boundary, so its
+    // Callback detach is explicitly NULL-tolerant at the C boundary, so its
     // noexcept C++ wrappers remain safe on a moved-from handle.
+    CHECK_NOTHROW(auth.detach_events());
     CHECK_NOTHROW(auth.detach_diagnostics());
     CHECK_NOTHROW(auth.detach_diagnostics_nowait());
     // Move-assignment from a moved-from handle is still well defined; the
@@ -265,8 +269,55 @@ TEST_CASE("OIDC C++ wrappers preserve ownership and structured errors")
     // Lazy construction performs no network I/O, but exercises ownership and
     // the shared sender/reader provider configuration in the pool FFI.
     questdb::pool pool{"ws::addr=127.0.0.1:1;lazy_connect=true;", shared_auth};
+    CHECK_NOTHROW(shared_auth.detach_events());
     CHECK_NOTHROW(shared_auth.detach_diagnostics());
     CHECK_NOTHROW(shared_auth.detach_diagnostics_nowait());
+}
+
+TEST_CASE(
+    "OIDC C++ callback trampolines contain exceptions and gate event tails")
+{
+    ::questdb_oidc_event legacy{};
+    legacy.struct_size = offsetof(::questdb_oidc_event, browser_target);
+    legacy.kind = QUESTDB_OIDC_EVENT_WAITING;
+    // Invalid sentinels must never be read when struct_size excludes the tail.
+    legacy.browser_target = reinterpret_cast<const char*>(uintptr_t{1});
+    legacy.browser_target_len = 99;
+    legacy.interval_seconds = 77;
+
+    bool event_called = false;
+    std::function<void(const questdb::oidc::event_view&)> event_handler =
+        [&](const questdb::oidc::event_view& event) {
+            event_called = true;
+            CHECK(event.browser_target().empty());
+            CHECK(event.interval_seconds() == 0);
+            throw std::runtime_error{"injected event callback failure"};
+        };
+    CHECK_NOTHROW(
+        questdb::oidc::builder::test_invoke_event_handler(
+            event_handler, &legacy));
+    CHECK(event_called);
+
+    constexpr char message[] = "persistence failed";
+    ::questdb_oidc_diagnostic diagnostic{};
+    diagnostic.struct_size = sizeof diagnostic;
+    diagnostic.kind = QUESTDB_OIDC_DIAGNOSTIC_PERSISTENCE_WARNING;
+    diagnostic.message = message;
+    diagnostic.message_len = sizeof(message) - 1;
+    bool diagnostic_called = false;
+    std::function<void(const questdb::oidc::diagnostic_view&)>
+        diagnostic_handler = [&](const questdb::oidc::diagnostic_view& view) {
+            diagnostic_called = true;
+            CHECK(view.message() == std::string_view{message});
+            throw std::runtime_error{"injected diagnostic callback failure"};
+        };
+    CHECK_NOTHROW(
+        questdb::oidc::builder::test_invoke_diagnostic_handler(
+            diagnostic_handler, &diagnostic));
+    CHECK(diagnostic_called);
+
+    questdb::oidc::builder default_store_builder{};
+    CHECK_NOTHROW(default_store_builder.default_file_token_store());
 }
 
 TEST_CASE("OIDC C++ event handler ownership is released exactly once")
@@ -282,10 +333,8 @@ TEST_CASE("OIDC C++ event handler ownership is released exactly once")
     // implementation detail the header does not promise, so pinning it would
     // make this brittle.
     //
-    // What is NOT covered here, and cannot be from C++ without a live identity
-    // provider, is invoking the callback: the trampoline's catch(...)
-    // containment and the struct_size guards on the appended event fields are
-    // exercised only by the Rust-side tests, which drive a real flow.
+    // Invocation behavior is covered separately through a header-only test
+    // seam; this case is deliberately only about ownership.
     static int releases = 0;
     releases = 0;
 

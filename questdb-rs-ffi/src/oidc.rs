@@ -43,7 +43,7 @@ use questdb::oidc::{
     DeviceCodeChallenge, DiagnosticHandler, FileTokenStore, OidcDeviceAuth, OidcError,
     OidcErrorKind, Renderer, sanitize_display_text,
 };
-use questdb::{Error, ErrorCode};
+use questdb::{Error, ErrorCode, TokenProviderIsolation};
 use zeroize::Zeroizing;
 
 use crate::{line_sender_error, line_sender_opts, questdb_error, set_err_out_from_error};
@@ -237,6 +237,11 @@ pub(crate) struct SharedOidcAuth {
     inner: Arc<OidcDeviceAuth>,
     event_handler: Option<Arc<CEventHandler>>,
     diagnostic: Option<CDiagnosticSink>,
+    /// One isolated-acquisition cell shared by every QWP attachment that uses
+    /// this auth. Without this, attaching the same provider to N transports
+    /// creates N abandoned workers when the synchronous callback blocks and
+    /// can consume the process-wide worker budget by itself.
+    token_provider_isolation: TokenProviderIsolation,
 }
 
 impl SharedOidcAuth {
@@ -383,6 +388,10 @@ impl SharedOidcAuth {
         Ok(())
     }
 
+    pub(crate) fn token_provider_isolation(&self) -> TokenProviderIsolation {
+        self.token_provider_isolation.clone()
+    }
+
     pub(crate) fn token(&self) -> Result<String, Error> {
         // Serve a valid cached token even while a callback runs -- on any
         // thread, including the callback's own. That path consults only the
@@ -426,24 +435,35 @@ impl SharedOidcAuth {
         if let Some(handler) = &self.event_handler {
             handler.close();
         }
+        if let Some(sink) = &self.diagnostic {
+            // A persistence warning is emitted synchronously while token
+            // acquisition still owns the provider's acquisition mutex. If the
+            // callback calls close(), waiting for that mutex on this same stack
+            // self-deadlocks. Publish suppression, then skip the native drain
+            // whenever THIS auth's diagnostic callback is active. Activity is
+            // per auth, so an unrelated sibling callback cannot weaken close.
+            sink.detach_nowait();
+        }
         self.inner.signal_close();
         // A callback may delegate close to a worker and join that worker. The
         // worker is not in callback TLS, but draining there still deadlocks:
-        // sign_in owns the acquisition lock until the callback returns. There
-        // is no way to distinguish a joined delegate from an unrelated closer,
-        // so close is non-draining whenever THIS auth's callback is active on
-        // any thread. The per-auth flag is essential: a sibling sharing the
-        // same callback target must still drain its own unrelated work.
-        if self
+        // sign-in or persistence owns the acquisition lock until the callback
+        // returns. There is no way to distinguish a joined delegate from an
+        // unrelated closer, so close is non-draining whenever THIS auth's event
+        // or diagnostic callback is active on any thread. The per-auth flags
+        // are essential: a sibling sharing the same target must still drain its
+        // own unrelated work.
+        let callback_active = self
             .event_handler
             .as_deref()
             .is_some_and(CEventHandler::is_active)
-        {
-            // The drain is skipped, but the credential teardown is not: it takes
+            || self
+                .diagnostic
+                .as_ref()
+                .is_some_and(|sink| sink.state.active.load(Ordering::Acquire));
+        if callback_active {
+            // The drain is skipped, but credential teardown is not: it takes
             // only the tokens lock, so it is safe inside the critical section.
-            // Without this the tokens stayed resident whenever close ran from a
-            // callback -- including the renderer "cancel" affordance the docs
-            // point users at -- contradicting close's documented contract.
             self.inner.discard_credentials();
         } else {
             self.inner.close();
@@ -530,6 +550,10 @@ struct CDiagnosticTarget {
 #[derive(Default)]
 struct CDiagnosticState {
     detached: AtomicBool,
+    /// True only while this auth's callback body is executing. The target gate
+    /// serializes all siblings, while this per-auth bit lets close distinguish
+    /// its own reentrant diagnostic from an unrelated sibling's callback.
+    active: AtomicBool,
 }
 
 std::thread_local! {
@@ -555,6 +579,23 @@ const DETACH_BOUNDED_DRAIN_ROUNDS: usize = 64;
 /// Marks this thread as being inside `target`'s callback for as long as it
 /// lives. Mirrors [`ActiveEventHandler`]'s stack discipline.
 struct InDiagnosticCallback(*const CDiagnosticTarget);
+
+struct ActiveDiagnosticState<'a>(&'a CDiagnosticState);
+
+impl<'a> ActiveDiagnosticState<'a> {
+    fn enter(state: &'a CDiagnosticState) -> Self {
+        let was_active = state.active.swap(true, Ordering::AcqRel);
+        debug_assert!(!was_active, "one auth cannot overlap its diagnostics");
+        Self(state)
+    }
+}
+
+impl Drop for ActiveDiagnosticState<'_> {
+    fn drop(&mut self) {
+        let was_active = self.0.active.swap(false, Ordering::AcqRel);
+        debug_assert!(was_active, "active diagnostic guard must be balanced");
+    }
+}
 
 impl InDiagnosticCallback {
     fn enter(target: &Arc<CDiagnosticTarget>) -> Self {
@@ -705,6 +746,7 @@ impl DiagnosticHandler for CDiagnosticSink {
         if self.state.detached.load(Ordering::Acquire) {
             return;
         }
+        let _active = ActiveDiagnosticState::enter(&self.state);
         let _in_callback = InDiagnosticCallback::enter(&self.target);
         unsafe { (self.target.callback)(self.target.user_data as *mut c_void, &diagnostic) };
     }
@@ -882,6 +924,59 @@ impl CEventHandler {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         self.closed.store(true, Ordering::Release);
         self.target.callback_ready.notify_all();
+    }
+
+    /// Permanently suppress this auth's renderer and, when safe, wait for an
+    /// invocation already in flight. This does not close the provider: a
+    /// managed runtime may need transports to keep refreshing tokens after it
+    /// can no longer service presentation callbacks.
+    fn detach(&self) {
+        let target: *const CEventHandler = self;
+        let (reentrant, nested) = IN_EVENT_CALLBACK.with(|stack| {
+            let stack = stack.borrow();
+            (stack.contains(&target), !stack.is_empty())
+        });
+        {
+            let _gate = self
+                .target
+                .callback_gate
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            self.closed.store(true, Ordering::Release);
+            self.target.callback_ready.notify_all();
+        }
+        if reentrant {
+            return;
+        }
+        if nested {
+            // Do not create an AB/BA inversion between two renderer targets.
+            // Suppression is exact; only the drain is best-effort here.
+            for _ in 0..DETACH_BOUNDED_DRAIN_ROUNDS {
+                let gate = self
+                    .target
+                    .callback_gate
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                if !gate.held {
+                    return;
+                }
+                drop(gate);
+                std::thread::yield_now();
+            }
+            return;
+        }
+        let mut gate = self
+            .target
+            .callback_gate
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        while gate.held {
+            gate = self
+                .target
+                .callback_ready
+                .wait(gate)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+        }
     }
 }
 
@@ -1461,6 +1556,7 @@ pub unsafe extern "C" fn questdb_oidc_builder_build(
                 inner: Arc::new(auth),
                 event_handler,
                 diagnostic,
+                token_provider_isolation: TokenProviderIsolation::default(),
             },
         })),
         Err(err) => {
@@ -1479,6 +1575,25 @@ pub unsafe extern "C" fn questdb_oidc_auth_clone(
         return ptr::null_mut();
     };
     Box::into_raw(Box::new(questdb_oidc_auth { shared }))
+}
+
+/// Permanently stop delivering this auth's renderer events without closing it.
+///
+/// Returns once no event callback is running for it and no later one can start.
+/// Idempotent and NULL-tolerant. From inside this auth's callback it publishes
+/// suppression and returns without waiting for its own frame. From inside a
+/// different auth's event callback the drain is bounded to avoid a cross-target
+/// AB/BA deadlock; suppression remains exact.
+///
+/// Other auths built from the same reusable builder keep delivering events.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn questdb_oidc_auth_detach_events(auth: *const questdb_oidc_auth) {
+    if auth.is_null() {
+        return;
+    }
+    if let Some(handler) = unsafe { &(*auth).shared.event_handler } {
+        handler.detach();
+    }
 }
 
 /// Permanently stop delivering this auth's persistence diagnostics.
@@ -1850,7 +1965,8 @@ pub unsafe extern "C" fn line_sender_opts_oidc_auth(
         return false;
     };
     let current = unsafe { (*opts).0.clone() };
-    match current.bearer_token_provider(move || auth.token()) {
+    let isolation = auth.token_provider_isolation();
+    match current.bearer_token_provider_with_isolation(move || auth.token(), isolation) {
         Ok(updated) => {
             unsafe { (*opts).0 = updated };
             true
@@ -2437,6 +2553,98 @@ mod tests {
     }
 
     #[test]
+    fn detaching_events_suppresses_only_that_auth() {
+        unsafe extern "C" fn count_event(
+            user_data: *mut c_void,
+            _event: *const questdb_oidc_event,
+        ) {
+            let calls = unsafe { &*(user_data as *const AtomicUsize) };
+            calls.fetch_add(1, Ordering::SeqCst);
+        }
+
+        let calls = AtomicUsize::new(0);
+        let target = event_target(count_event, (&calls as *const AtomicUsize) as usize, None);
+        let detached = Arc::new(CEventHandler::new(Arc::clone(&target)));
+        let sibling = Arc::new(CEventHandler::new(target));
+        let detached_renderer = CEventRenderer(Arc::clone(&detached));
+        let sibling_renderer = CEventRenderer(sibling);
+        let event = empty_event(questdb_oidc_event_kind::QUESTDB_OIDC_EVENT_WAITING);
+
+        detached_renderer.invoke(&event);
+        detached.detach();
+        detached_renderer.invoke(&event);
+        sibling_renderer.invoke(&event);
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn detaching_events_waits_for_an_inflight_callback() {
+        static ENTERED: AtomicUsize = AtomicUsize::new(0);
+        static RELEASE: AtomicUsize = AtomicUsize::new(0);
+        static RETURNED: AtomicUsize = AtomicUsize::new(0);
+
+        unsafe extern "C" fn blocking_event(
+            _user_data: *mut c_void,
+            _event: *const questdb_oidc_event,
+        ) {
+            ENTERED.store(1, Ordering::SeqCst);
+            while RELEASE.load(Ordering::SeqCst) == 0 {
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            RETURNED.store(1, Ordering::SeqCst);
+        }
+
+        ENTERED.store(0, Ordering::SeqCst);
+        RELEASE.store(0, Ordering::SeqCst);
+        RETURNED.store(0, Ordering::SeqCst);
+        let handler = event_handler(blocking_event, 0, None);
+        let renderer = CEventRenderer(Arc::clone(&handler));
+        let emitter = std::thread::spawn(move || {
+            renderer.invoke(&empty_event(
+                questdb_oidc_event_kind::QUESTDB_OIDC_EVENT_WAITING,
+            ));
+        });
+        while ENTERED.load(Ordering::SeqCst) == 0 {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        let (tx, rx) = std::sync::mpsc::channel();
+        let detacher = std::thread::spawn(move || {
+            handler.detach();
+            let _ = tx.send(RETURNED.load(Ordering::SeqCst));
+        });
+        assert!(
+            rx.recv_timeout(std::time::Duration::from_millis(20))
+                .is_err(),
+            "detach returned while the event callback was still active"
+        );
+        RELEASE.store(1, Ordering::SeqCst);
+        assert_eq!(
+            rx.recv_timeout(std::time::Duration::from_secs(5))
+                .expect("event detach did not drain after callback return"),
+            1
+        );
+        emitter.join().unwrap();
+        detacher.join().unwrap();
+    }
+
+    #[test]
+    fn default_file_token_store_entry_point_selects_the_default_location() {
+        unsafe {
+            let builder = explicit_builder();
+            let mut error = ptr::null_mut();
+            assert!(questdb_oidc_builder_default_file_token_store(
+                builder, &mut error,
+            ));
+            assert!(error.is_null());
+            assert!(matches!(
+                (*builder).config.file_store,
+                FileStoreConfig::DefaultLocation
+            ));
+            questdb_oidc_builder_free(builder);
+        }
+    }
+
+    #[test]
     fn null_token_is_an_empty_null_span() {
         let token = ptr::null();
         assert!(unsafe { questdb_oidc_token_data(token) }.is_null());
@@ -2455,6 +2663,9 @@ mod tests {
         // test without aborting is the assertion.
         unsafe {
             questdb_oidc_builder_free(ptr::null_mut());
+            questdb_oidc_auth_detach_events(ptr::null());
+            questdb_oidc_auth_detach_diagnostics(ptr::null());
+            questdb_oidc_auth_detach_diagnostics_nowait(ptr::null());
             questdb_oidc_auth_free(ptr::null_mut());
             questdb_oidc_token_free(ptr::null_mut());
         }
@@ -2624,6 +2835,52 @@ mod tests {
         ) -> TokenStoreResult<()> {
             action()
         }
+    }
+
+    struct FailingSaveStore;
+
+    impl TokenStore for FailingSaveStore {
+        fn load(&self, _key: &TokenStoreKey) -> TokenStoreResult<Option<PersistedToken>> {
+            Ok(None)
+        }
+
+        fn save(&self, _key: &TokenStoreKey, _token: &PersistedToken) -> TokenStoreResult<()> {
+            Err(Box::new(std::io::Error::other(
+                "injected persisted save failure",
+            )))
+        }
+
+        fn clear(&self, _key: &TokenStoreKey) -> TokenStoreResult<()> {
+            Ok(())
+        }
+
+        fn in_lock(
+            &self,
+            _key: &TokenStoreKey,
+            action: &mut dyn FnMut() -> TokenStoreResult<()>,
+        ) -> TokenStoreResult<()> {
+            action()
+        }
+    }
+
+    #[derive(Default)]
+    struct DiagnosticCloseState {
+        auth: Mutex<Option<SharedOidcAuth>>,
+        close_returned: AtomicUsize,
+    }
+
+    unsafe extern "C" fn close_from_diagnostic(
+        user_data: *mut c_void,
+        _diagnostic: *const questdb_oidc_diagnostic,
+    ) {
+        let state = unsafe { &*(user_data as *const Arc<DiagnosticCloseState>) };
+        let auth = state.auth.lock().unwrap().clone().expect("auth installed");
+        auth.close().expect("close from diagnostic");
+        state.close_returned.store(1, Ordering::SeqCst);
+    }
+
+    unsafe extern "C" fn release_diagnostic_close_state(user_data: *mut c_void) {
+        unsafe { drop(Box::from_raw(user_data as *mut Arc<DiagnosticCloseState>)) };
     }
 
     unsafe extern "C" fn release_counter(user_data: *mut c_void) {
@@ -3775,6 +4032,83 @@ mod tests {
     }
 
     #[test]
+    fn close_from_persistence_diagnostic_does_not_self_deadlock() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (device, _) = listener.accept().unwrap();
+            write_json_response(
+                device,
+                r#"{"device_code":"DEV-CODE","user_code":"ABCD-1234","verification_uri":"https://idp.example.com/activate","expires_in":600,"interval":1}"#,
+            );
+            let (token, _) = listener.accept().unwrap();
+            write_json_response(
+                token,
+                r#"{"access_token":"short-lived","refresh_token":"refresh-secret","token_type":"Bearer","expires_in":300}"#,
+            );
+        });
+
+        let state = Arc::new(DiagnosticCloseState::default());
+        let user_data = Box::into_raw(Box::new(Arc::clone(&state))) as *mut c_void;
+        let sink = CDiagnosticSink {
+            target: Arc::new(CDiagnosticTarget {
+                callback: close_from_diagnostic,
+                user_data: user_data as usize,
+                release: Some(release_diagnostic_close_state),
+                gate: Mutex::new(()),
+            }),
+            state: Arc::new(CDiagnosticState::default()),
+        };
+        let inner = OidcDeviceAuth::builder()
+            .client_id("questdb-c")
+            .scope("openid")
+            .token_endpoint(format!("http://{address}/token"))
+            .device_authorization_endpoint(format!("http://{address}/device"))
+            .allow_insecure_transport(true)
+            .interactive(true)
+            .open_browser(false)
+            .token_store(FailingSaveStore)
+            .diagnostic_handler(sink.clone())
+            .build()
+            .unwrap();
+        let auth = SharedOidcAuth {
+            inner: Arc::new(inner),
+            event_handler: None,
+            diagnostic: Some(sink),
+            token_provider_isolation: TokenProviderIsolation::default(),
+        };
+        *state.auth.lock().unwrap() = Some(auth.clone());
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let signer = std::thread::spawn({
+            let auth = auth.clone();
+            move || {
+                let result = auth.sign_in();
+                let _ = tx.send(result);
+            }
+        });
+        let result = rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("diagnostic close waited for its own acquisition stack");
+        if let Err(err) = result {
+            assert_eq!(
+                err.oidc_error().map(OidcError::kind),
+                Some(OidcErrorKind::Cancelled),
+                "close may cancel sign-in, but must not substitute another error: {err}"
+            );
+        }
+        assert_eq!(state.close_returned.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            auth.token().unwrap_err().oidc_error().map(OidcError::kind),
+            Some(OidcErrorKind::Cancelled),
+        );
+        signer.join().unwrap();
+        *state.auth.lock().unwrap() = None; // break target -> state -> auth cycle
+        drop(auth);
+        server.join().unwrap();
+    }
+
+    #[test]
     fn clear_propagates_persisted_deletion_failure() {
         let inner = OidcDeviceAuth::builder()
             .client_id("questdb-c")
@@ -3789,6 +4123,7 @@ mod tests {
                 inner: Arc::new(inner),
                 event_handler: None,
                 diagnostic: None,
+                token_provider_isolation: TokenProviderIsolation::default(),
             },
         }));
 

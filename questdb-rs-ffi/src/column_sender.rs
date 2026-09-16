@@ -1103,8 +1103,15 @@ pub unsafe extern "C" fn questdb_db_connect_ex(
         Some(auth) => {
             // Pool sender/reader connectors may run in the background. The OIDC
             // token path is non-interactive and returns InteractionRequired
-            // rather than starting a device flow on those threads.
-            QuestDb::connect_with_handlers_and_token_provider(conf, handlers, move || auth.token())
+            // rather than starting a device flow on those threads. Preserve the
+            // auth's single-flight identity across every pool attachment.
+            let isolation = auth.token_provider_isolation();
+            QuestDb::connect_with_handlers_and_token_provider_with_isolation(
+                conf,
+                handlers,
+                move || auth.token(),
+                isolation,
+            )
         }
         None => QuestDb::connect_with_handlers(conf, handlers),
     };

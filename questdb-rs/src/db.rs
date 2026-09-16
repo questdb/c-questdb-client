@@ -223,11 +223,11 @@ impl Drop for SenderSlotRelease<'_> {
 pub struct ConnectHandlers {
     /// Connection lifecycle listener; see [`QuestDb::connect_with_listener`].
     pub connection_listener: Option<crate::ingress::ConnectionListener>,
-    /// Listener inbox capacity; `0` selects the default (64).
+    /// Listener inbox capacity; `0` selects the default (64), maximum 65,536.
     pub connection_event_inbox_capacity: usize,
     /// Server-rejection handler; without one every rejection is logged.
     pub error_handler: Option<crate::ingress::QwpWsErrorHandler>,
-    /// Handler inbox capacity; `0` selects the default (64).
+    /// Handler inbox capacity; `0` selects the default (64), maximum 65,536.
     pub error_inbox_capacity: usize,
 }
 
@@ -857,11 +857,46 @@ impl QuestDb {
         )
     }
 
+    /// Binding-only form that shares one authentication object's isolated QWP
+    /// acquisition across every sender and reader attachment in this pool.
+    #[doc(hidden)]
+    pub fn connect_with_handlers_and_token_provider_with_isolation<F, E>(
+        conf: &str,
+        handlers: ConnectHandlers,
+        provider: F,
+        isolation: crate::TokenProviderIsolation,
+    ) -> Result<Self>
+    where
+        F: Fn() -> std::result::Result<String, E> + Send + Sync + 'static,
+        E: Into<crate::Error>,
+    {
+        Self::connect_with_handlers_and_provider(
+            conf,
+            handlers,
+            Some(crate::token_provider::TokenProvider::new_with_isolation(
+                provider, isolation,
+            )),
+        )
+    }
+
     fn connect_with_handlers_and_provider(
         conf: &str,
         handlers: ConnectHandlers,
         token_provider: Option<crate::token_provider::TokenProvider>,
     ) -> Result<Self> {
+        const MAX_CALLBACK_INBOX_CAPACITY: usize = 65_536;
+        if handlers.connection_event_inbox_capacity > MAX_CALLBACK_INBOX_CAPACITY {
+            return Err(error::fmt!(
+                ConfigError,
+                "connection_event_inbox_capacity must be at most {MAX_CALLBACK_INBOX_CAPACITY}"
+            ));
+        }
+        if handlers.error_inbox_capacity > MAX_CALLBACK_INBOX_CAPACITY {
+            return Err(error::fmt!(
+                ConfigError,
+                "error_inbox_capacity must be at most {MAX_CALLBACK_INBOX_CAPACITY}"
+            ));
+        }
         let conn_events = match handlers.connection_listener {
             Some(listener) => conn_events::ConnectionEventSource::new(
                 listener,
@@ -908,12 +943,14 @@ impl QuestDb {
             }
         };
         if let Some(provider) = token_provider {
-            let sender_provider = provider.clone();
-            builder = builder.qwp_ws_token_provider(move || sender_provider.provide())?;
+            // Preserve one isolated-acquisition identity while sharing this
+            // provider across the pool's sender and reader factories. Reboxing
+            // `provide()` in each factory used to create an independent cell
+            // per attachment and defeated the global worker bound.
+            builder = builder.qwp_ws_token_provider_object(provider.clone())?;
             #[cfg(feature = "_egress")]
             if let Some(cfg) = reader_config.take() {
-                let reader_provider = provider;
-                reader_config = Some(cfg.token_provider(move || reader_provider.provide())?);
+                reader_config = Some(cfg.token_provider_object(provider)?);
             }
         }
         #[cfg(feature = "_egress")]
@@ -3422,10 +3459,11 @@ const _: fn() = || {
 #[cfg(test)]
 mod tests {
     use std::fs;
+    use std::sync::Arc;
 
     use tempfile::TempDir;
 
-    use super::{SlotReservations, managed_slot_recovery_scan_from};
+    use super::{ConnectHandlers, QuestDb, SlotReservations, managed_slot_recovery_scan_from};
 
     fn dirty_slot(root: &std::path::Path, name: &str) {
         let slot = root.join(name);
@@ -3463,6 +3501,38 @@ mod tests {
             assert_eq!(err.code(), crate::ErrorCode::ConfigError, "{bad}");
             db.close();
         }
+    }
+
+    #[test]
+    fn callback_inbox_capacities_are_rejected_before_allocation() {
+        let conf = "ws::addr=127.0.0.1:19009;lazy_connect=on;";
+        let listener_err = match QuestDb::connect_with_handlers(
+            conf,
+            ConnectHandlers {
+                connection_listener: Some(Arc::new(|_| {})),
+                connection_event_inbox_capacity: 65_537,
+                ..ConnectHandlers::default()
+            },
+        ) {
+            Ok(_) => panic!("oversized connection event inbox was accepted"),
+            Err(err) => err,
+        };
+        assert_eq!(listener_err.code(), crate::ErrorCode::ConfigError);
+        assert!(listener_err.msg().contains("at most 65536"));
+
+        let rejection_err = match QuestDb::connect_with_handlers(
+            conf,
+            ConnectHandlers {
+                error_handler: Some(crate::ingress::QwpWsErrorHandler::new(|_| {})),
+                error_inbox_capacity: 65_537,
+                ..ConnectHandlers::default()
+            },
+        ) {
+            Ok(_) => panic!("oversized rejection inbox was accepted"),
+            Err(err) => err,
+        };
+        assert_eq!(rejection_err.code(), crate::ErrorCode::ConfigError);
+        assert!(rejection_err.msg().contains("at most 65536"));
     }
 
     #[test]

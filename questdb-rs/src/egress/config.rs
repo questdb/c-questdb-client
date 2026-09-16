@@ -1123,11 +1123,35 @@ impl ReaderConfig {
     /// walk, on the thread inside `next_batch`. That call is not cancellable
     /// and `failover_max_duration_ms` is only checked between attempts, so a
     /// slow provider stalls the reader for as long as it takes to return.
-    pub fn token_provider<F, E>(mut self, provider: F) -> Result<Self>
+    pub fn token_provider<F, E>(self, provider: F) -> Result<Self>
     where
         F: Fn() -> std::result::Result<String, E> + Send + Sync + 'static,
         E: Into<crate::Error>,
     {
+        self.token_provider_object(crate::token_provider::TokenProvider::new(provider))
+    }
+
+    /// Binding-only form that preserves one authentication object's QWP
+    /// isolated-acquisition identity across independently configured clients.
+    #[doc(hidden)]
+    pub fn token_provider_with_isolation<F, E>(
+        self,
+        provider: F,
+        isolation: crate::TokenProviderIsolation,
+    ) -> Result<Self>
+    where
+        F: Fn() -> std::result::Result<String, E> + Send + Sync + 'static,
+        E: Into<crate::Error>,
+    {
+        self.token_provider_object(crate::token_provider::TokenProvider::new_with_isolation(
+            provider, isolation,
+        ))
+    }
+
+    pub(crate) fn token_provider_object(
+        mut self,
+        provider: crate::token_provider::TokenProvider,
+    ) -> Result<Self> {
         if !matches!(self.auth, AuthMode::None) {
             return Err(fmt!(
                 ConfigError,
@@ -1135,7 +1159,7 @@ impl ReaderConfig {
                 crate::token_provider::PROVIDER_CONFLICTS_WITH_STATIC_AUTH
             ));
         }
-        self.token_provider = Some(crate::token_provider::TokenProvider::new(provider));
+        self.token_provider = Some(provider);
         Ok(self)
     }
 

@@ -111,6 +111,20 @@ pub(crate) const PROVIDER_CONFLICTS_WITH_STATIC_AUTH: &str = "A rotating token p
 /// `Bearer` header) or an error that fails the connection attempt.
 pub(crate) type TokenProviderFn = Arc<dyn Fn() -> crate::Result<String> + Send + Sync>;
 
+/// Shared single-flight identity for isolated QWP token acquisition.
+///
+/// This is exposed only so language bindings can attach one authentication
+/// object to multiple senders/readers without letting each attachment consume
+/// a separate process-global worker when its synchronous provider blocks.
+/// Ordinary Rust callers should use the public builder methods, which create an
+/// independent identity for each provider closure.
+#[doc(hidden)]
+#[derive(Clone, Default)]
+pub struct TokenProviderIsolation {
+    #[cfg(feature = "_sender-qwp-ws")]
+    isolated: Arc<IsolatedAcquisition>,
+}
+
 /// A cloneable, thread-safe token provider whose [`Debug`] never renders the
 /// closure (or any captured token).
 #[derive(Clone)]
@@ -129,10 +143,18 @@ impl TokenProvider {
         F: Fn() -> std::result::Result<String, E> + Send + Sync + 'static,
         E: Into<crate::Error>,
     {
+        Self::new_with_isolation(provider, TokenProviderIsolation::default())
+    }
+
+    pub(crate) fn new_with_isolation<F, E>(provider: F, isolation: TokenProviderIsolation) -> Self
+    where
+        F: Fn() -> std::result::Result<String, E> + Send + Sync + 'static,
+        E: Into<crate::Error>,
+    {
         TokenProvider {
             provide: Arc::new(move || provider().map_err(Into::into)),
             #[cfg(feature = "_sender-qwp-ws")]
-            isolated: Arc::new(IsolatedAcquisition::default()),
+            isolated: isolation.isolated,
         }
     }
 
@@ -628,7 +650,10 @@ mod tests {
     /// the cancellation branches — the whole reason the method exists — were not.
     #[cfg(feature = "_sender-qwp-ws")]
     mod isolated {
-        use super::super::{IsolatedProviderPermit, MAX_ISOLATED_PROVIDER_WORKERS, TokenProvider};
+        use super::super::{
+            IsolatedProviderPermit, MAX_ISOLATED_PROVIDER_WORKERS, TokenProvider,
+            TokenProviderIsolation,
+        };
         use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
         use std::sync::{Arc, Condvar, Mutex};
 
@@ -741,6 +766,63 @@ mod tests {
             // slot nobody is waiting on is ignored (no panic, no leak).
             release.signal();
             call.join().unwrap();
+        }
+
+        #[test]
+        fn separately_wrapped_attachments_share_one_isolated_acquisition() {
+            // Language bindings wrap one OIDC auth in a fresh closure for each
+            // sender/reader. Sharing only the callback target is insufficient:
+            // the isolated single-flight identity must cross those wrappers or
+            // one blocked auth can consume the whole global worker budget.
+            let isolation = TokenProviderIsolation::default();
+            let started = Arc::new(Gate::default());
+            let release = Arc::new(Gate::default());
+            let calls = Arc::new(AtomicUsize::new(0));
+
+            for _ in 0..(MAX_ISOLATED_PROVIDER_WORKERS + 2) {
+                let provider = TokenProvider::new_with_isolation(
+                    {
+                        let started = Arc::clone(&started);
+                        let release = Arc::clone(&release);
+                        let calls = Arc::clone(&calls);
+                        move || {
+                            calls.fetch_add(1, Ordering::SeqCst);
+                            started.signal();
+                            release.wait();
+                            Ok::<_, crate::Error>("shared-token".to_string())
+                        }
+                    },
+                    isolation.clone(),
+                );
+                let deadline = std::time::Instant::now() + std::time::Duration::from_millis(30);
+                let err = provider
+                    .bearer_header_isolated_until(|| std::time::Instant::now() >= deadline)
+                    .unwrap_err();
+                assert!(err.msg().contains("shutting down"), "{}", err.msg());
+            }
+            assert!(started.is_signalled());
+            assert_eq!(
+                calls.load(Ordering::SeqCst),
+                1,
+                "all attachments of one auth must join one worker"
+            );
+
+            let healthy = TokenProvider::new(|| Ok::<_, crate::Error>("other-token".to_string()));
+            assert_eq!(
+                healthy.bearer_header_isolated_until(|| false).unwrap(),
+                "Bearer other-token"
+            );
+
+            release.signal();
+            let drained = TokenProvider::new_with_isolation(
+                || Ok::<_, crate::Error>("unused".to_string()),
+                isolation,
+            );
+            let token = drained.bearer_header_isolated_until(|| false).unwrap();
+            assert!(
+                token == "Bearer shared-token" || token == "Bearer unused",
+                "unexpected drained token: {token}"
+            );
         }
 
         #[test]

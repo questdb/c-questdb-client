@@ -437,6 +437,25 @@ questdb_oidc_auth* questdb_oidc_auth_clone(
     const questdb_oidc_auth* auth, questdb_error** err_out);
 
 /**
+ * Permanently stop renderer-event delivery for this auth without closing the
+ * provider. Returns after any event callback already in flight has finished.
+ * From that callback itself it publishes suppression and returns without
+ * waiting for its own frame. From inside a DIFFERENT auth's event callback the
+ * drain is bounded and best-effort, because an exact cross-target drain can
+ * deadlock two threads against each other's callback gates; suppression remains
+ * exact. Idempotent, NULL-tolerant, and callable from any thread. Auths built
+ * from the same reusable builder are unaffected.
+ *
+ * This is intended for a managed-runtime shutdown hook: attached transports
+ * can keep refreshing tokens after the runtime can no longer service a
+ * renderer that enters it. The caller must not delegate this call to another
+ * thread and wait for that thread from inside the callback, because the
+ * delegate cannot identify itself as the callback's stack.
+ */
+QUESTDB_CLIENT_API
+void questdb_oidc_auth_detach_events(const questdb_oidc_auth* auth);
+
+/**
  * Permanently stop delivering this auth's persistence diagnostics.
  *
  * Returns once no diagnostic callback is running for this auth and no later
@@ -525,17 +544,18 @@ bool questdb_oidc_auth_cancel_sign_in(
  * `questdb_oidc_auth_free`, which releases only one handle and does not cancel
  * shared work.
  *
- * Safe to call from any thread, including this auth's own event callback and
- * while that callback is running on another thread. Publishing the close does
- * not wait for the authentication critical section, though it may briefly
- * contend with a waiter registering for cancellation. It ordinarily waits for
- * the running operation to leave the authentication critical section. While
- * this auth's callback is active it instead returns as soon as close is
- * published, regardless of which thread calls it: a callback may delegate close
- * to a worker and join that worker, so draining there would deadlock just as it
- * would on the callback thread itself. Activity on an independent auth built
- * from the same reusable builder does not skip this auth's drain. Unlike
- * `sign_in`, `token` and `clear`, close is never rejected as callback re-entry.
+ * Safe to call from any thread, including this auth's own event or persistence
+ * diagnostic callback and while that callback is running on another thread.
+ * Publishing the close does not wait for the authentication critical section,
+ * though it may briefly contend with a waiter registering for cancellation. It
+ * ordinarily waits for the running operation to leave the authentication
+ * critical section. While this auth's event or diagnostic callback is active
+ * it instead returns as soon as close is published, regardless of which thread
+ * calls it: a callback may delegate close to a worker and join that worker, so
+ * draining there would deadlock just as it would on the callback thread itself.
+ * Activity on an independent auth built from the same reusable builder does not
+ * skip this auth's drain. Unlike `sign_in`, `token` and `clear`, close is never
+ * rejected as callback re-entry.
  *
  * The in-memory credential is dropped on every path, including the
  * skipped-drain one; only the wait is skipped. The persisted entry is
